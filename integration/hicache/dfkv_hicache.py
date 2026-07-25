@@ -1301,7 +1301,29 @@ class DfkvHiCache(HiCacheStorage):
         t0 = time.perf_counter()
         flat = self._put_sg_flat(sks, sp, ss)
         dur = time.perf_counter() - t0
+        self._log_write_keys(sks, flat, len(sks))
         return self._fold(flat, n, sub), nbytes, dur
+
+    def _log_write_keys(self, sks, flat, nmain):
+        """Print the FIRST key actually WRITTEN, throttled to one line/30s.
+
+        Completes the write/exist/read key triangle. Measured 2026-07-25 on one
+        run: 75.0% of pages write OK (47615/63528) yet device reads hit
+        0.0% (0/20746) and exist mostly reports 0/N. Pages that are written but
+        unreadable point at the key, not at capacity — and the write side was the
+        one leg of the triangle never printed. If this first_key does not share
+        the hash space of _log_exist_probe / _log_read_reject, the write path and
+        the exist/read path are hashing the same tokens differently."""
+        if not sks:
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_write_keys_logged", 0.0) < 30.0:
+            return
+        self._write_keys_logged = now
+        ok = sum(1 for i in range(nmain) if flat[i])
+        _log.warning(
+            "dfkv write keys: ok=%d/%d first_key=%s last_key=%s",
+            ok, nmain, sks[0], sks[nmain - 1])
 
     def _kv_device_get(self, keys, device_indices):
         """Core of batch_get_v1_device (device-direct SG get) without the tracing /
