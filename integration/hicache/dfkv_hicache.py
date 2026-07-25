@@ -20,6 +20,7 @@ HiCacheStorage; the test harness supplies a no-torch shim with the same surface.
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import sys
 import time
@@ -35,6 +36,12 @@ import dfkv_hot_config as _hot_config
 from dfkv_metrics import Metrics as _Metrics, ClientStatsPoller as _ClientStatsPoller
 from dfkv_telemetry import metrics as _push_metrics, config as _tcfg
 from dfkv_telemetry import tracing as _tracing
+
+# The module carries no logger of its own historically (observability rides the
+# access log / tracing spans). One is added here for the read-reject diagnostic,
+# which must land in the ENGINE log next to SGLang's "0 pages verified across
+# ranks" line to be readable as a pair.
+_log = logging.getLogger(__name__)
 
 _FLAG_IS_MLA = 0x1
 
@@ -1312,7 +1319,40 @@ class DfkvHiCache(HiCacheStorage):
         hits, lens = self._batch_get_sg(sks, sp, sc)
         dur = time.perf_counter() - t0
         flat_ok = [hits[i] == 1 and lens[i] >= want[i] for i in range(len(sks))]
+        if not all(flat_ok):
+            self._log_read_reject(sks, hits, lens, want, flat_ok, len(sks))
         return self._fold(flat_ok, n, sub), sum(lens), dur
+
+    def _log_read_reject(self, sks, hits, lens, want, flat_ok, nmain):
+        """Say WHY a device read rejected sub-objects, throttled to one line/30s.
+
+        Motivation (2026-07-25): SGLang's promotion drops whole loads with
+        `0 pages verified across ranks` 24-56 times per hot-L3 round even on a
+        clean baseline — exist reports the pages ARE in L3, yet the read is not
+        accepted. Without this line the two candidate causes are indistinguishable
+        from the outside:
+
+          * MISS  (hits[i] != 1)        — the sub-key is not there at all, i.e. an
+                                          exist/read key-scheme disagreement;
+          * SHORT (lens[i] < want[i])   — it is there but returned fewer bytes than
+                                          the destination expects, i.e. a layout /
+                                          @sg-chunking / capacity disagreement.
+
+        Reports the first offender's numbers so `want` vs `got` can be compared
+        directly against the page geometry."""
+        now = time.monotonic()
+        if now - getattr(self, "_read_reject_logged", 0.0) < 30.0:
+            return
+        self._read_reject_logged = now
+        miss = sum(1 for i in range(nmain) if hits[i] != 1)
+        short = sum(1 for i in range(nmain)
+                    if hits[i] == 1 and lens[i] < want[i])
+        first = next(i for i in range(nmain) if not flat_ok[i])
+        _log.warning(
+            "dfkv device read rejected %d/%d sub-objects (%d MISS, %d SHORT); "
+            "first offender: key=%s hit=%s got=%d want=%d",
+            nmain - sum(flat_ok), nmain, miss, short,
+            sks[first], hits[first], lens[first], want[first])
 
     # --- task 4: DSA indexer sidecar device-direct (no host staging) -----------
     def _sidecar_device_set(self, name, keys, device_indices):
