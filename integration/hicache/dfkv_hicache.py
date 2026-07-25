@@ -1148,6 +1148,7 @@ class DfkvHiCache(HiCacheStorage):
                     break
                 n += 1
             r.result = f"prefix={n}/{total}"
+            self._log_exist_probe(sks, n, total)
             if _sp:
                 _sp.hits = n
             return n
@@ -1322,6 +1323,28 @@ class DfkvHiCache(HiCacheStorage):
         if not all(flat_ok):
             self._log_read_reject(sks, hits, lens, want, flat_ok, len(sks))
         return self._fold(flat_ok, n, sub), sum(lens), dur
+
+    def _log_exist_probe(self, sks, n, total):
+        """Print the FIRST key exist actually probed, throttled to one line/30s.
+
+        Pairs with _log_read_reject to settle a sharp contradiction seen on
+        2026-07-25: exist reports prefix=1562/1562 (every candidate page present)
+        while the device GET that follows reports 4686/4686 sub-objects MISS —
+        and 4686 = 1562 x 3 chunks, so the two are talking about the same NUMBER
+        of pages. Same key scheme on both sides (`{model}/{hash}_k@sg0`), so if
+        the strings still differ it can only be the page_hash itself: exist hashes
+        the candidate token sequence, while the GET uses the marker nodes'
+        hash_value. Printing both first-keys makes that comparison direct instead
+        of inferential."""
+        if not sks:
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_exist_probe_logged", 0.0) < 30.0:
+            return
+        self._exist_probe_logged = now
+        _log.warning(
+            "dfkv exist probe: prefix=%d/%d first_key=%s last_key=%s",
+            n, total, sks[0], sks[-1])
 
     def _log_read_reject(self, sks, hits, lens, want, flat_ok, nmain):
         """Say WHY a device read rejected sub-objects, throttled to one line/30s.
