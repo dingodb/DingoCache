@@ -1389,6 +1389,20 @@ class DfkvHiCache(HiCacheStorage):
         if now - getattr(self, "_read_reject_logged", 0.0) < 30.0:
             return
         self._read_reject_logged = now
+        # 整批全 MISS 时把 C 客户端快照一并 dump：服务端侧显示 cache_miss=0、
+        # cache_hit 几乎不涨(失败轮 +196/+3515 vs 成功轮 +799,744)，说明请求很可能
+        # 根本没到服务端。ops served / IO 错误 / peer 健康只存在于 C 客户端快照里，
+        # Prometheus 侧并未导出这些计数器，事后无从追溯 —— 必须当场抓。
+        if all(h != 1 for h in hits[:nmain]):
+            try:
+                snap = _read_snapshot(self._lib, self._h)
+                keep = [ln for ln in snap.splitlines()
+                        if any(k in ln for k in ("ops_served", "io_error", "unhealthy",
+                                                 "peer_", "ring_", "mds_"))]
+                _log.warning("dfkv client snapshot @full-miss: %s",
+                             " | ".join(keep[:12]) or "(快照无相关行)")
+            except Exception as e:
+                _log.warning("dfkv client snapshot @full-miss 读取失败: %r", e)
         miss = sum(1 for i in range(nmain) if hits[i] != 1)
         short = sum(1 for i in range(nmain)
                     if hits[i] == 1 and lens[i] < want[i])
