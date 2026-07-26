@@ -43,7 +43,14 @@ jobs:
         uses: actions/cache@v5
         with:
           path: build/_deps
-          key: deps-${{ runner.os }}-${{ matrix.compiler }}-gtest-1.12.1
+          # Scope the key to the repository: build/_deps holds googletest-subbuild,
+          # a CMake scratch tree that bakes in ABSOLUTE paths under
+          # /home/runner/work/<repo>/<repo>. Restoring it into a differently named
+          # checkout makes CMake refuse to configure ("The current CMakeCache.txt
+          # directory ... is different"), which is exactly what the dfkv ->
+          # DingoCache rename triggered. github.repository fully determines that
+          # path on hosted runners, so keying on it makes the cache rename-proof.
+          key: deps-${{ runner.os }}-${{ matrix.compiler }}-${{ github.repository }}-gtest-1.12.1
 
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
