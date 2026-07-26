@@ -88,7 +88,8 @@ int main(int argc, char** argv) {
                    "--rdma-op-timeout-ms", "--server-uring",
                    "--server-uring-depth", "--ram-flush-threads",
                    "--ram-tier-numa", "--ram-tier-shards", "--slab-table-sync-ms",
-                   "--slab-reclaim-ms", "--ram-reclaim-ms", "--log"});
+                   "--slab-reclaim-ms", "--ram-reclaim-ms", "--log",
+                   "--max-msg"});
   std::string dir = args.Get("--dir", "/tmp/dfkv_node");
   std::string rdma_dev = args.Get("--rdma-dev", "");
   std::string mds = args.Get("--mds", "");
@@ -248,6 +249,16 @@ int main(int argc, char** argv) {
 #endif
 
 #ifdef DFKV_WITH_RDMA
+  // Per-connection RDMA buffers are pinned eagerly at handshake:
+  // qd x (ValueHeader + conn_max). conn_max is min(client declaration, this
+  // cap), and a client that declares nothing gets the cap outright -- so
+  // without a server-side ceiling the server's memory budget is decided
+  // entirely by its clients. Measured on a B200 node at qd=32: ~2 GB per
+  // connection at the 64 MiB default versus 0.34 GB when the client declares
+  // 4 MiB, and one 8-rank inference instance opens ~135 connections. A
+  // declaration ABOVE the cap is refused (see RdmaServer::Serve) rather than
+  // sized down, which would let that client send past our receives.
+  const unsigned long long max_msg = args.GetU64("--max-msg", 64ull << 20);
   std::unique_ptr<dfkv::RdmaServer> rsrv;
   if (rdma_port >= 0) {
     rsrv = std::make_unique<dfkv::RdmaServer>(
@@ -255,7 +266,7 @@ int main(int argc, char** argv) {
                uint64_t len, const char* pl, uint64_t pll, std::string* out) {
           return srv.ProcessRequest(op, id, idx, ks, off, len, pl, pll, out);
         },
-        /*max_msg=*/64u << 20, rdma_dev);
+        /*max_msg=*/max_msg, rdma_dev);
     rsrv->set_range_handler(  // server-side direct GET: disk -> registered dbuf -> RDMA scatter
         [&srv](uint64_t id, uint32_t idx, uint32_t ks, uint64_t off, uint64_t len,
                char* io_buf, size_t cap, const char** out_data, size_t* out_len) {

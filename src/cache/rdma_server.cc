@@ -274,6 +274,27 @@ void RdmaServer::Serve(int boot_fd) {
   // exact old behavior. Never below the control floor so metadata ops and
   // small values always fit.
   const uint64_t declared = rdma::ParseDevFrameCaps(devbuf);
+  // A declaration ABOVE our cap is refused rather than quietly sized down.
+  // The client bounds its own ops by what it declared (RdmaTransport::OpBound),
+  // so sizing this connection smaller than the declaration would leave it
+  // sending past our posted receives -- an RNR/QP break far from the cause.
+  // Refusing here names both ends of the mismatch in one line instead.
+  //
+  // This is what makes --max-msg a usable memory guard: the per-connection
+  // pin is qd x (ValueHeader + conn_max), so an undeclaring client costs the
+  // full worst case (measured on a B200 node: ~2 GB/conn at 64 MiB and qd=32,
+  // against 0.34 GB when the client declares 4 MiB). Without a server-side
+  // ceiling the server's memory budget is decided entirely by its clients,
+  // which are often deployed by someone else and versioned independently.
+  if (declared && declared > static_cast<uint64_t>(max_msg_)) {
+    DFKV_LOG_ERROR("rdma: client declared max block " + std::to_string(declared) +
+                   "B, above this server's cap " + std::to_string(max_msg_) +
+                   "B; refusing the connection (sizing down would let the client "
+                   "send past our receives). Raise --max-msg or lower the client's "
+                   "DFKV_RDMA_MAX_BLOCK_BYTES.");
+    ::close(boot_fd);
+    return;
+  }
   const size_t conn_max =
       declared ? std::max<size_t>(wire_limits::kIoAlign,
                                   std::min<size_t>(declared, max_msg_))

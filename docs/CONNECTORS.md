@@ -81,6 +81,48 @@ tp_rank=..,ver=<lib>`（无 `role`——HiCache 是前缀 L3 缓存，无生产/
 | `DFKV_RDMA_NUMA` | `0` | 多 NUMA 大机 `1` | 绑 buffer/线程到轨的 NUMA 节点 + 建连时按调用线程 NUMA 选本地轨（无本地轨→轮转全轨）。仅新建连接触发，热路径零开销。SGLang/vLLM 通吃 |
 | `DFKV_RDMA_MAX_PAYLOAD_BYTES` | 64 MiB（67108864） | — | 客户端单 value payload 上限（不得超过 server 侧同名上限） |
 
+#### 1.2.1 `DFKV_RDMA_MAX_BLOCK_BYTES` 怎么定（含 L2 / L2-bypass 两套公式）
+
+这个值决定**服务端**每连接 pin 多少内存：`qd × (ValueHeader + 声明值)`，握手时**预先分配**，
+不随实际流量增长。B200 实测（qd=32）：声明 16 MiB → **1.02 GB/连接**；声明 4 MiB → **0.34 GB/连接**；
+不声明（走 64 MiB 兜底）→ **约 2 GB/连接**。一个 8-rank 推理实例对单台服务端开约 **135 条连接**，
+所以这不是微调项，它决定环节点装不装得下。
+
+**块大小取决于走哪条路径**——两条路径的分块规则不同：
+
+| 路径 | 是否 `@sg` 分块 | 公式 | GLM-5.2 实测 |
+|---|---|---|---|
+| **原版 L2**（host 池） | 否，每对象一块连续内存 | `层数 × page_size × 每token每层字节 / sub` | 78×64×576 = **2,875,392 B (2.74 MiB)** |
+| **L2-bypass**（device 直连） | 是，按 SGE 宽度切 | `min(sg段宽, 层数) × page_size × 每token每层字节` | 29×64×576 = **1,069,056 B (1.02 MiB)** |
+
+- `每token每层字节` = MLA 取 `(kv_lora_rank + qk_rope_head_dim) × dtype字节`；GLM-5.2 fp8 = `(512+64)×1 = 576`
+- `sub` = MLA 为 1（latent 单对象）、MHA 为 2（k/v 各一）
+- `sg段宽` = `min(kMaxSge, HCA max_sge) − 1`（SGE0 让给 header）；当前 `kMaxSge=30` 硬编码 → 29
+- 78 层按 29 切成 3 段（29/29/20），最小段 20×36,864 = 737,280 B——两个值均已逐字节实测吻合
+
+**与这些无关**（常见误解）：`BatchGet` 并发（放大的是块的**数量**）、上下文长度（1M 上下文只是页更多，
+每页仍切出同样大小的块）、HCA `max_sge`（被 `kMaxSge=30` 压住，换宽网卡不会变大）。
+
+**会改变它的**：`--page-size`（线性）、kv-cache dtype（fp8→bf16 翻倍）、模型 MLA 维度与层数、
+以及改动 dfkv 的 `kMaxSge`。
+
+**换模型的 tuning 步骤**：
+1. 按上表算出理论值（两条路径都算，取大者——同一集群可能两种都跑）
+2. 起一轮真实负载，读服务端/客户端日志里的 `rdma: max block observed <N>B` 高水位（v1.40+）
+3. 取实测值的 2~4 倍设定，注意**必须同时覆盖原版 L2 路径的整页对象**
+4. 复核服务端日志 `rdma conn caps: declared=…` 确认生效（这行只在客户端真声明时出现）
+
+🔴 **设小了不会报错——这是最危险的部分。** 超声明的块被判 `kInvalid`，而 `kInvalid` 被客户端健康
+计数**刻意忽略**，上层看到的就是 `hits[i] != 1`，与"这页压根没缓存"**完全无法区分**：不崩、不报错、
+不熔断，只有命中率悄悄封顶。v1.40+ 起超限会打 `rdma: block …B exceeds the declared bound …B` 告警
+（首次 + 每 1024 次），在此之前**没有任何信号**。典型踩法：照 L2-bypass 实测的 1.02 MiB 调到 2 MiB，
+切回原版 L2 后 2.74 MiB 的整页对象全部静默失效。
+
+> **服务端侧上限 `--max-msg`（v1.40+）**：默认 64 MiB，即"客户端不声明时给多少"。
+> 它同时是本服务端接受的**上限**：客户端声明**高于**它会被**明确拒绝连接**并打日志，
+> 而不是悄悄按小的开——后者会让客户端按自己声明的大小发包、打爆对端 recv buffer（RNR/QP 断）。
+> 大集群建议显式设定，否则服务端的内存预算完全由客户端决定，而客户端常由别的团队部署、版本不一。
+
 > ⚠️ 旧 `rail_affinity`（extra_config）**已废弃为 no-op**（v1.2.0）：它按 `tp_rank`
 > 收窄选轨，但 DP-attention 下每 rank `tp_rank=0`→塌缩单轨。配了只打 stderr 告警。
 > 用 `rdma_numa` / `DFKV_RDMA_NUMA` 替代。
@@ -275,6 +317,66 @@ HiCache 维持常规路径即可：
   Prometheus 指标）**已在 v1.5.2+ 内**，无需额外动作。
 
 ---
+
+### 2.7 L2-bypass（L1↔L3 device 直连，绕过 host 池）
+
+把 SGLang 的 L2（host pinned 池）从数据路径上摘掉，GPU 显存与 dfkv 之间直接 GPUDirect RDMA。
+省掉一次 device↔host 拷贝和整个 host 池的驻留内存，代价是块被 SGE 宽度切成 `@sg{n}` 子键。
+
+#### 客户端（SGLang 侧）
+
+| env | 值 | 说明 |
+|---|---|---|
+| `SGLANG_HICACHE_L2_BYPASS` | `1` | 总开关。关闭即回到原版 host L2 路径 |
+| `SGLANG_HICACHE_L2_BYPASS_DEDUP` | `1` | 同前缀并发 SG GET 去重：后到的请求 park 等待，不重复拉取 |
+| `SGLANG_HICACHE_L2_BYPASS_FUSE_DRAFT` | `0` | draft（EAGLE）是否与目标层融进同一次 RDMA op。**默认关**——收益未经重复取样确认，单次测量不足以认领 |
+| `DFKV_RDMA_MAX_BLOCK_BYTES` | 见 §1.2.1 | bypass 下块 = `29 × page_size × 每token每层字节`，比原版 L2 小约 2.7× |
+| `DFKV_RDMA_IO_MS` | `30000` | bootstrap 握手超时。**冷连接池场景必须放宽**，理由见下 |
+
+SGLang 启动侧需配合：`--hicache-mem-layout page_first_direct --hicache-io-backend direct`。
+
+#### 🔴 冷连接池：为什么 `DFKV_RDMA_IO_MS` 默认的 10s 不够
+
+服务端每条**新**连接的 `ep.Open()` 要预分配并注册 `qd × (ValueHeader + 声明值)` 的 pin 内存，
+这一步占握手耗时的 **98%**（B200 实测六段计时：`devread=147ms open=9046ms qpx=0 connect=0 poolmr=0`）。
+新实例的**第一次** L3 读时连接池是空的，要一次性建大量连接，每条都付这个代价：
+
+| 配置 | `open` | 总握手 | 对 10s 超时余量 | 结果 |
+|---|---|---|---|---|
+| 未声明块大小（64 MiB 兜底） | 9046 ms | 9194 ms | 1.09× | **首读全盘 IO 错误 → L3 读命中 0%** |
+| 声明 16 MiB | 5180 ms | 5330 ms | 1.88× | 仍偏紧 |
+| 声明 4 MiB | 2837 ms | 2957 ms | 3.4× | — |
+| 声明 4 MiB + `IO_MS=30000` | 2837 ms | 2957 ms | **10×** | 稳定 |
+
+失败形态很有欺骗性：握手在 QP 信息交换处超时（`errno=11 EAGAIN`）→ `Acquire` 返回 nullptr →
+`MarkBad` → 该轮全部 op 报 IO 错误 → 上层判为全 MISS。**只有首读崩，后续轮次复用池中连接不再走
+`Open`，恢复 100% 命中**——这个"只有第一次不行"的形态曾被误判成存储/键方案问题，实际在传输握手。
+
+修复前后（A 构型：新实例 → warmup → seed 写 → flush → 首读）：**8/8 全崩 → 6/6 全 100.0%**，
+32 轮长稳 32/32 无 FAIL、无泄漏。
+
+#### 服务端
+
+L2-bypass 不需要服务端改配置，但两项与内存直接相关：
+
+- `--max-msg`（v1.40+）：见 §1.2.1。客户端不声明时的兜底 = 每连接 ~2 GB，大集群务必显式设定
+- `--rdma-depth`（qd）：每连接内存与它**线性**相关。B200 实测 32→8：内存 +137GB→+34GB（4.03×），
+  握手 `open` 4930→1314ms（3.75×），吞吐中位 −9%（n=4，两臂分布有重叠，只够看方向）。
+  内存不紧张时保持 32；紧张时 8 是机制清晰、收益线性的杠杆
+
+#### 验证清单
+
+```bash
+# 1. bypass 真的开了（数自证日志，别只看 env）
+nerdctl logs <容器> 2>&1 | grep -c 'L2-bypass ENABLED'
+# 2. 声明真的到了服务端（这行只在客户端真声明时出现）
+journalctl -u dfkv-server | grep 'rdma conn caps: declared='
+# 3. 块大小与余量（v1.40+）
+nerdctl logs <容器> 2>&1 | grep 'max block observed'
+nerdctl logs <容器> 2>&1 | grep -c 'exceeds the declared bound'   # 必须为 0
+# 4. 握手耗时（服务端 v1.40+ 诊断构建）
+journalctl -u dfkv-server | grep BOOT-SLOW
+```
 
 ## 3. vLLM 直连 — DfkvStoreConnector
 
