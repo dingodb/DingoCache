@@ -1396,11 +1396,15 @@ class DfkvHiCache(HiCacheStorage):
         if all(h != 1 for h in hits[:nmain]):
             try:
                 snap = _read_snapshot(self._lib, self._h)
+                # 过滤掉 # HELP / # TYPE 注释行 —— 第一版没排除它们，12 个名额被注释
+                # 占满，按 peer 的错误分布和 busy_suppressed 全被截掉了。
                 keep = [ln for ln in snap.splitlines()
-                        if any(k in ln for k in ("ops_served", "io_error", "unhealthy",
-                                                 "peer_", "ring_", "mds_"))]
+                        if not ln.startswith("#")
+                        and any(k in ln for k in ("ops_served", "io_error", "unhealthy",
+                                                  "peer_", "ring_", "mds_", "busy_suppressed",
+                                                  "health_checks"))]
                 _log.warning("dfkv client snapshot @full-miss: %s",
-                             " | ".join(keep[:12]) or "(快照无相关行)")
+                             " | ".join(keep[:16]) or "(快照无相关行)")
             except Exception as e:
                 _log.warning("dfkv client snapshot @full-miss 读取失败: %r", e)
         miss = sum(1 for i in range(nmain) if hits[i] != 1)
