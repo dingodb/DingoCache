@@ -269,6 +269,40 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib
   qp_ = ibv_create_qp(pd_, &qa);
   if (!qp_) { Close(); return false; }
 
+  // ibv_create_qp rewrites qa.cap with what the driver ACTUALLY granted, which
+  // until now was discarded: max_sge_ came from the device attribute we derived
+  // the *request* from, not from the answer. Two reasons to read it back:
+  //
+  //  - Defence. The spec says a grant is >= the request (or the call fails), so
+  //    a smaller grant "cannot happen" -- but if it ever did, every scatter-gather
+  //    post would build an SGL the QP cannot accept and fail at post time, far
+  //    from the cause. Clamping here turns that into one line at Open().
+  //  - Visibility. A grant LARGER than the request is real headroom: fewer @sg
+  //    chunks per page, so bigger blocks and fewer RDMA ops. It was invisible.
+  //
+  // Deliberately NOT adopted when larger. sg_payload_segs_ (= max_sge_ - 1)
+  // selects the "@sg{n}" sub-key chunking, so the width is part of the KEY
+  // LAYOUT, not just a local transport detail: two clients that pick different
+  // widths hash the same page into different sub-keys and can never share a
+  // cache entry. Widening on whatever a particular driver happens to grant would
+  // silently partition the keyspace across a heterogeneous fleet. Raising it is
+  // a deliberate, fleet-wide decision (kMaxSge), so this only reports the room.
+  {
+    const size_t granted = std::min<size_t>(qa.cap.max_send_sge, qa.cap.max_recv_sge);
+    if (granted < max_sge_) {
+      DFKV_LOG_WARN("rdma: QP granted max_sge=" + std::to_string(granted) +
+                    " below the requested " + std::to_string(max_sge_) +
+                    " (device reported more); clamping to the grant");
+      max_sge_ = granted < 2 ? 2 : granted;
+    } else if (granted > max_sge_) {
+      DFKV_LOG_INFO("rdma: QP granted max_sge=" + std::to_string(granted) +
+                    ", above the requested " + std::to_string(max_sge_) +
+                    "; keeping the requested width (it selects the @sg key "
+                    "chunking, so it must stay uniform across the fleet). "
+                    "Raise kMaxSge to use the headroom.");
+    }
+  }
+
   // QP -> INIT
   ibv_qp_attr at{};
   at.qp_state = IBV_QPS_INIT;
