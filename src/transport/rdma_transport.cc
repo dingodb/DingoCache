@@ -551,7 +551,7 @@ std::vector<Status> RdmaTransport::RangeInto(const std::string& node,
   // cost every sibling its cache hit.
   std::vector<char> bad(n, 0);
   for (size_t i = 0; i < n; ++i)
-    if (dsts[i].n > OpBound()) bad[i] = 1;
+    if (NoteBlock(dsts[i].n)) bad[i] = 1;
 
   // 2-attempt loop: retry a stale pooled conn once on a fresh one. Range is a read
   // (idempotent) and the scatter lands in the caller's buffers, so replaying the
@@ -648,7 +648,7 @@ std::vector<Status> RdmaTransport::CacheFrom(const std::string& node,
   std::vector<char> bad(n, 0);
   for (size_t i = 0; i < n; ++i) {
     const CacheSrc& s = srcs[i];
-    if (s.header_len > control_cap_ - kReqPrefix || s.payload_len > OpBound()) bad[i] = 1;
+    if (NoteBlock(s.payload_len) || s.header_len > control_cap_ - kReqPrefix) bad[i] = 1;
   }
 
   // 2-attempt loop: retry a stale pooled conn once on a fresh one. Cache is
@@ -757,7 +757,7 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
       const auto& s = srcs[i];
       size_t total = 0;
       for (const auto& p : s.payloads) total += p.second;
-      if (s.header_len > control_cap_ - kReqPrefix || total > OpBound() ||
+      if (NoteBlock(total) || s.header_len > control_cap_ - kReqPrefix ||
           s.payloads.size() > max_payload_segs) {
         bad[i] = 1;
         res[i] = Status::kInvalid;
@@ -836,6 +836,42 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
   return res;
 }
 
+// Records n as a high-water candidate and reports whether it exceeds the
+// declaration. Two problems this closes, both observed on a B200 node:
+//
+//  1. Sizing DFKV_RDMA_MAX_BLOCK_BYTES was guesswork. The declaration decides
+//     how much the SERVER pins per connection -- qd x (ValueHeader + declared),
+//     ~1 GiB per connection at qd=32/16MiB measured -- so an over-generous
+//     value is not free: it is server memory multiplied by every connection in
+//     the fleet. The only figure an operator could see was the AVERAGE transfer
+//     size (437 KiB there), which says nothing about the peak that must fit.
+//
+//  2. An UNDER-sized declaration failed silently. Oversized blocks become
+//     kInvalid, which the client's health accounting deliberately ignores, so
+//     upstream they are indistinguishable from an ordinary cache miss: no error,
+//     no log, no counter -- just a hit rate quietly capped for large pages.
+//     Anyone tuning this down would have had no signal that they went too far.
+bool RdmaTransport::NoteBlock(size_t n) const {
+  uint64_t prev = max_block_seen_.load(std::memory_order_relaxed);
+  while (n > prev &&
+         !max_block_seen_.compare_exchange_weak(prev, n, std::memory_order_relaxed)) {
+  }
+  if (n > prev) {  // new high-water mark: the number needed to size the declaration
+    DFKV_LOG_INFO("rdma: max block observed " + std::to_string(n) + "B (" +
+                  std::to_string(n / 1024) + " KiB); declared bound " +
+                  std::to_string(OpBound()) + "B");
+  }
+  const size_t bound = OpBound();
+  if (n <= bound) return false;
+  const uint64_t k = oversize_rejects_.fetch_add(1, std::memory_order_relaxed);
+  if (k == 0 || (k & 0x3FFu) == 0)  // first, then every 1024th
+    DFKV_LOG_WARN("rdma: block " + std::to_string(n) + "B exceeds the declared bound " +
+                  std::to_string(bound) + "B -> kInvalid, which reads as a cache MISS "
+                  "upstream (not an error). Raise DFKV_RDMA_MAX_BLOCK_BYTES. rejects=" +
+                  std::to_string(k + 1));
+  return true;
+}
+
 std::vector<Status> RdmaTransport::RangeIntoMulti(
     const std::string& node, const std::vector<BlockKey>& keys,
     const std::vector<RangeDstMulti>& dsts, size_t header_size,
@@ -868,7 +904,7 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
     for (size_t i = 0; i < n; ++i) {
       size_t cap = 0;
       for (const auto& p : dsts[i].payloads) cap += p.second;
-      if (cap > OpBound() || dsts[i].payloads.size() > max_payload_segs) {
+      if (NoteBlock(cap) || dsts[i].payloads.size() > max_payload_segs) {
         bad[i] = 1;
         res[i] = Status::kInvalid;
       }

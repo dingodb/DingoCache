@@ -118,6 +118,18 @@ class RdmaTransport : public Transport {
   size_t OpBound() const {  // per-op payload bound honoring the declaration
     return declared_ ? static_cast<size_t>(declared_) : max_payload_;
   }
+  // Largest block this client has actually handed to the transport. Sizing
+  // DFKV_RDMA_MAX_BLOCK_BYTES is otherwise guesswork: the declaration decides
+  // how much the SERVER pins per connection (qd x (ValueHeader + declared)),
+  // which at qd=32 is ~1 GiB per connection measured on a B200 node -- yet the
+  // only figure available to an operator was the average transfer size. This
+  // reports the actual high-water mark so the declaration can be set from
+  // evidence with a deliberate margin.
+  mutable std::atomic<uint64_t> max_block_seen_{0};
+  mutable std::atomic<uint64_t> oversize_rejects_{0};
+  // Records n as a candidate high-water mark and reports whether it exceeds the
+  // declaration. Returns true for an oversized block (caller marks it kInvalid).
+  bool NoteBlock(size_t n) const;
   size_t control_cap_;
   size_t depth_;
   int connect_ms_ = 3000;             // bootstrap TCP connect timeout (DFKV_RDMA_CONNECT_MS)
