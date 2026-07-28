@@ -144,6 +144,45 @@ class FakeDSAPagedPool(FakeMlaPool):
         return self.kv_buffer if isinstance(self.kv_buffer, list) else [self.kv_buffer]
 
 
+class FakeHybridStatePool:
+    """Stand-in for SGLang's MambaPoolHost (Kimi-K3 KDA/mamba state): one page
+    spans TWO independent tensors -- temporal (SSM) state plus conv state --
+    and get_page_buffer_meta() emits one (ptr, size) pair per component per
+    page in a stable order. Rank-sharded: every TP rank owns different bytes,
+    so unlike the replicated MLA pools every rank must persist its own shard."""
+
+    def __init__(self, num_pages, temporal_bytes, conv_bytes, page_size=64):
+        self.page_size = page_size
+        self.temporal_bytes = temporal_bytes
+        self.conv_bytes = conv_bytes
+        self.tbuf = np.zeros(num_pages * temporal_bytes, dtype=np.uint8)
+        self.cbuf = np.zeros(num_pages * conv_bytes, dtype=np.uint8)
+
+    def get_page_buffer_meta(self, host_indices):
+        ptrs, sizes = [], []
+        for i in range(0, len(host_indices), self.page_size):
+            page_idx = int(host_indices[i]) // self.page_size
+            ptrs.append(self.tbuf.ctypes.data + page_idx * self.temporal_bytes)
+            sizes.append(self.temporal_bytes)
+            ptrs.append(self.cbuf.ctypes.data + page_idx * self.conv_bytes)
+            sizes.append(self.conv_bytes)
+        return ptrs, sizes
+
+    def fill_page(self, page_idx, byte):
+        ts, cs = page_idx * self.temporal_bytes, page_idx * self.conv_bytes
+        self.tbuf[ts:ts + self.temporal_bytes] = byte
+        self.cbuf[cs:cs + self.conv_bytes] = (byte + 1) % 256
+
+    def page_state_at(self, page_idx):
+        ts, cs = page_idx * self.temporal_bytes, page_idx * self.conv_bytes
+        return (bytes(self.tbuf[ts:ts + self.temporal_bytes]),
+                bytes(self.cbuf[cs:cs + self.conv_bytes]))
+
+    def zero(self):
+        self.tbuf[:] = 0
+        self.cbuf[:] = 0
+
+
 class FakeLogicalAnchorPool:
     """Stand-in for SGLang's LogicalHostPool: the primary "kv" pool of a
     V4/DSA-compressed model (e.g. GLM-5.2). Holds NO KV buffer, so its
@@ -465,6 +504,54 @@ class DingoFSHiCacheTest(unittest.TestCase):
         self.assertEqual(m["set_v2_calls"], 0)
         self.assertEqual(m["set_v2_ok_pages"], 0)
         self.assertEqual(m["set_v2_bytes"], 0)
+
+    def test_v2_follower_rank_writes_rank_sharded_pool(self):
+        # Kimi-K3 (hybrid MLA + KDA/mamba): the mamba state pool is rank-sharded,
+        # so a follower rank MUST persist its own shard -- backup_skip applies
+        # only to replicated (single-component) pools. Multi-component pools are
+        # exactly the ones whose keys carry tp_size/tp_rank, so writes from
+        # different ranks never collide, and the v2 set metrics must report this
+        # real I/O instead of being gated wholesale on tp_rank.
+        from sglang.srt.mem_cache.hicache_storage import PoolTransfer
+        T, C = 4096, 512  # temporal / conv bytes per page (shape-agnostic)
+        members, _, _ = self._node("v2ranksharded")
+        cfg = self._cfg(members, model="kimi-k3", tp_rank=3, tp_size=16)
+        st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+        st.register_mem_pool_host(FakeLogicalAnchorPool(self.PAGE_SIZE))
+        mamba = FakeHybridStatePool(2, T, C, self.PAGE_SIZE)
+        st.register_mem_host_pool_v2(mamba, "mamba")
+        # registration probed two components (works in this torch-free env)
+        self.assertEqual(st._pool_components("mamba"), 2)
+        for i in range(2):
+            mamba.fill_page(i, 30 + i)
+        keys = ["m0", "m1"]
+        hi = list(range(2 * self.PAGE_SIZE))
+        res = st.batch_set_v2([PoolTransfer(name="mamba",
+                                            host_indices=hi, keys=keys)])
+        self.assertEqual(res["mamba"], [True, True])
+        # the follower's write is real I/O and must be visible in the metrics
+        m = st._metrics.snapshot()
+        self.assertEqual(m["set_v2_calls"], 1)
+        self.assertEqual(m["set_v2_pages"], 2)
+        self.assertEqual(m["set_v2_ok_pages"], 2)
+        self.assertEqual(m["set_v2_bytes"], 2 * (T + C))
+        # both components round-trip byte-exact on the same rank
+        exp = [mamba.page_state_at(i) for i in range(2)]
+        mamba.zero()
+        g = st.batch_get_v2([PoolTransfer(name="mamba",
+                                          host_indices=hi, keys=keys)])
+        self.assertEqual(g["mamba"], [True, True])
+        for i in range(2):
+            self.assertEqual(mamba.page_state_at(i), exp[i])
+        # keys are sharded per rank: rank 0 sees a MISS for the same page hashes
+        cfg0 = self._cfg(members, model="kimi-k3", tp_rank=0, tp_size=16)
+        st0 = dfkv_hicache.DfkvHiCache(cfg0, cfg0.extra_config)
+        st0.register_mem_pool_host(FakeLogicalAnchorPool(self.PAGE_SIZE))
+        mamba0 = FakeHybridStatePool(2, T, C, self.PAGE_SIZE)
+        st0.register_mem_host_pool_v2(mamba0, "mamba")
+        g0 = st0.batch_get_v2([PoolTransfer(name="mamba",
+                                            host_indices=hi, keys=keys)])
+        self.assertEqual(g0["mamba"], [False, False])
 
     # --- PP key-isolation tests (pure logic, no server/lib needed) ---
     # _keys()/_pool_keys() are pure functions of self.{model,tp_rank,tp_size,
