@@ -342,6 +342,7 @@ class DfkvHiCache(HiCacheStorage):
             # _put_retry_recovered instance-state handoff pattern).
             self._v2_io_bytes = 0
             self._v2_io_seconds = 0.0
+            self._v2_io_pools = ()  # pool names that actually did I/O last _v2_io()
             # self._lib was loaded above (before configure) so the native version
             # could be reported; dfkv_open uses that same handle here.
             flags = _FLAG_IS_MLA if self.is_mla else 0
@@ -1311,6 +1312,7 @@ class DfkvHiCache(HiCacheStorage):
         # `continue`d before appending), so bytes are 0 on a pure skip.
         self._v2_io_bytes = sum(ss)
         self._v2_io_seconds = time.perf_counter() - t0
+        self._v2_io_pools = tuple(seg[0] for seg in segments)
         for name, nkeys, sub, start, end in segments:
             results[name] = self._fold(flat[start:end], nkeys, sub)
         return results
@@ -1326,13 +1328,17 @@ class DfkvHiCache(HiCacheStorage):
                 r.result += f" retry_ok={self._put_retry_recovered}"
             if _sp:
                 _sp.hits = sum(sum(rs) for rs in res.values())
-            # MLA rank!=0 replicated latent is a no-op skip ([True] markers, no
-            # I/O) — don't inflate the write-ok metric with it (mirrors
-            # batch_set_v1, which returns before on_set on backup_skip).
-            if nkeys and not (self.is_mla and self.tp_rank != 0):
+            # Pool-granular metrics: report exactly the pools that performed I/O
+            # (_v2_io_pools). The MLA rank!=0 replicated latent stays a no-op skip
+            # ([True] markers, excluded), but rank-sharded sidecars such as
+            # Kimi-K3's mamba/KDA state do real writes on follower ranks — a
+            # whole-call tp_rank gate here would hide that write bandwidth
+            # entirely from the v2 set metrics.
+            io_pages = sum(len(res[name]) for name in self._v2_io_pools)
+            if io_pages:
                 self._metrics.on_set_v2(
-                    pages=sum(len(rs) for rs in res.values()),
-                    ok_pages=sum(sum(rs) for rs in res.values()),
+                    pages=io_pages,
+                    ok_pages=sum(sum(res[name]) for name in self._v2_io_pools),
                     nbytes=self._v2_io_bytes, seconds=self._v2_io_seconds)
             return res
 
