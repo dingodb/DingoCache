@@ -541,6 +541,40 @@ class DfkvHiCache(HiCacheStorage):
             self.registered_pools = {}
         name = str(host_pool_name)
         self.registered_pools[name] = host_pool
+        # Per-page component count for this pool. A hybrid pool (Kimi-K3's mamba
+        # pool) stores one page across SEVERAL independent tensors -- temporal
+        # (SSM) state plus conv_0..conv_n -- and get_page_buffer_meta() emits one
+        # (ptr, size) pair per component in a stable order, so
+        #   len(ptrs) == npages * components.
+        # Derive the count from that return value rather than from
+        # len(get_hybrid_pool_buffer()): for a conv-only model
+        # (temporal_state_elem_size == 0) get_page_buffer_meta skips the temporal
+        # entry while get_hybrid_pool_buffer still reports it, so the two differ
+        # by one. The meta length is the only self-consistent source.
+        if not hasattr(self, "_pool_component_count"):
+            self._pool_component_count = {}
+        try:
+            _ps = int(getattr(host_pool, "page_size", 1) or 1)
+            try:
+                import torch as _t
+                _idx = _t.arange(_ps, dtype=_t.int64)
+            except ImportError:  # torch-free env (unit tests): pools that accept
+                _idx = list(range(_ps))  # a plain index sequence still probe fine
+            _meta = host_pool.get_page_buffer_meta(_idx)
+            _n = len(_meta[0]) if _meta and _meta[0] is not None else 1
+            self._pool_component_count[name] = max(1, int(_n))
+            _probe = "ok"
+        except Exception as _e:
+            self._pool_component_count[name] = 1
+            _probe = f"failed ({type(_e).__name__})"
+        # Report it: a silently-wrong component count degrades into "the pool is
+        # stored but incomplete", which upstream is indistinguishable from a miss.
+        try:
+            with access_log("pool_components",
+                            lambda: f"{self._alog_tag} {name}") as _r:
+                _r.result = f"components={self._pool_component_count[name]} ({_probe})"
+        except Exception:
+            pass
         with access_log("register_mem_host_pool_v2",
                         lambda: f"{self._alog_tag} {name}") as r:
             n = 0
@@ -1154,18 +1188,37 @@ class DfkvHiCache(HiCacheStorage):
             return n
 
     # --- v2 pool-aware interface (multi-pool models: Mamba/SWA/DeepSeek-V4) ---
+    def _pool_components(self, pool_name: str) -> int:
+        """Per-page component count for a pool (probed at registration; 1 if unknown)."""
+        return int(getattr(self, "_pool_component_count", {}).get(pool_name, 1) or 1)
+
     def _pool_keys(self, pool_name: str, page_hash: str) -> List[str]:
-        # primary KV pool keeps the MLA/MHA split; auxiliary pools are single-object.
+        # primary KV pool keeps the MLA/MHA split; auxiliary pools are single-object
+        # UNLESS the host pool reports several per-page components (hybrid mamba:
+        # temporal + conv), in which case each component needs its own sub-key.
         # Both carry the PP suffix for the same layer-slice reason as _keys().
         pps = self._pp_suffix()
         if pool_name in ("kv", "__default__"):
             return self._keys(page_hash)
+        comps = self._pool_components(pool_name)
+        if comps > 1:
+            # A multi-component auxiliary pool is RANK-SHARDED (mamba/KDA state),
+            # so the key MUST carry tp_size/tp_rank -- otherwise every TP rank
+            # writes the same key and they clobber each other. (The replicated
+            # primary MLA latent does not need it; _keys()'s MHA branch already
+            # carries tp_size_tp_rank for the same reason.)
+            base = f"{self.model}/{page_hash}_{pool_name}_{self.tp_size}_{self.tp_rank}{pps}"
+            # Order mirrors get_page_buffer_meta: temporal first, then conv_0..conv_n.
+            return [f"{base}_c{j}" for j in range(comps)]
         base = f"{self.model}/{page_hash}_{pool_name}{pps}"
         return [base + "_k"] if self.is_mla else [base + "_k", base + "_v"]
 
     def _pool_sub(self, pool_name: str) -> int:
         if pool_name in ("kv", "__default__"):
             return self._sub()
+        comps = self._pool_components(pool_name)
+        if comps > 1:
+            return comps
         return 1 if self.is_mla else 2
 
     def _put_flat(self, sks, sp, ss) -> List[bool]:
@@ -1215,8 +1268,25 @@ class DfkvHiCache(HiCacheStorage):
         for tr in transfers:
             name = str(tr.name)
             keys = tr.keys or []
-            # MLA backup_skip: only tp_rank 0 writes the replicated latent pools.
-            if putting and self.is_mla and self.tp_rank != 0:
+            # MLA backup_skip: only tp_rank 0 writes *replicated* pools.
+            # This is valid for the primary MLA KV pool and for single-component
+            # sidecars (e.g. the DSA indexer), which every TP rank holds an
+            # identical copy of -- but NOT for a rank-sharded sidecar such as
+            # Kimi-K3's mamba/KDA state, where each rank owns different bytes.
+            # SGLang's _page_backup deliberately forwards ONLY the MAMBA transfer
+            # on follower ranks for exactly this reason:
+            #   "On follower ranks, only the rank-sharded Mamba/KDA pool is owned
+            #    by the rank and must be written here."
+            # Skipping it there means 15 of 16 ranks never persist their KDA state,
+            # so a page restored from L3 carries wrong recurrent state and the model
+            # silently produces different output (measured: rank0 spent 5411 us per
+            # mamba write, ranks 1-15 spent 4 us -- a 1353x gap, i.e. no transfer).
+            # The discriminator is _pool_components: multi-component pools are
+            # exactly the ones _pool_keys shards per rank (keys carry
+            # tp_size/tp_rank), so "skip on follower" and "keys collide across
+            # ranks" stay in lockstep by construction.
+            if (putting and self.is_mla and self.tp_rank != 0
+                    and self._pool_components(name) == 1):
                 results[name] = [True] * len(keys)
                 continue
             pool = self.registered_pools[name]
