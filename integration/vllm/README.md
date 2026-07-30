@@ -88,6 +88,13 @@ instead of share, give each a distinct `served-model-name` / `model_hash`.
 - **GPU buffers use the batch path only.** The single `dfkv_get_auto` computes a
   CRC over the destination on the CPU and segfaults on device memory; the batch
   `dfkv_batch_get_auto` is zero-copy and GPU-safe.
+- **DCP (`--decode-context-parallel-size > 1`) needs client >= v1.10.0**.
+  Older builds run the put_step stride under the replicated-KV assumption and
+  store only 1/dcp_size of each rank's shard, so external prefix hits
+  collapse to ~1/dcp (field-reported "low dfkv hit rate with DCP"). v1.10.0
+  (#70) shrinks the stride by dcp_size; coverage under the default
+  token-level interleave is guarded by
+  `tests/test_dcp_lookup_geometry.py`.
 - **GPUDirect needs nvidia-peermem loaded** on the GPU node (`lsmod | grep
   nvidia_peermem`).
 - **First request per DP rank pays a one-time ~2s Triton JIT** (resumed-prefill +
