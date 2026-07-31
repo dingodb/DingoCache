@@ -26,13 +26,38 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 _DUMMY_BLOCK_HASH = BlockHash(b"\x00" * 32)
 
 
+def _unwrap_hit_blocks(res):
+    """vLLM >= 0.26: SingleTypeKVCacheManager.find_longest_cache_hit returns
+    ``(blocks_per_group, hit_length_tokens)``; older versions return just
+    ``blocks_per_group``. Accept both. hit_length is always re-derived from
+    the returned block lists, so the manager-side value is not needed here.
+    """
+    if (
+        isinstance(res, tuple)
+        and len(res) == 2
+        and isinstance(res[0], tuple)
+        and isinstance(res[1], int)
+    ):
+        return res[0]
+    return res
+
+
 class ExternalCachedBlockPool:
     """Duck-typed BlockPool backed by a ``(group_id, hash)`` exists set."""
 
-    def __init__(self, exists: set[tuple[int, bytes]] | None = None) -> None:
+    def __init__(
+        self,
+        exists: set[tuple[int, bytes]] | None = None,
+        hash_block_size: int | None = None,
+    ) -> None:
         # ``exists=None`` is used on the recv side where hit_length is already
         # determined and we just want each spec's manager to apply its own mask.
         self._exists = exists
+        # vLLM >= 0.26: SingleTypeKVCacheManager.find_longest_cache_hit reads
+        # ``block_pool.hash_block_size`` for partial-hash-chain math. None here
+        # means "not yet stamped" -- the coordinator stamps it from its own
+        # scheduler-side value before dispatching into manager code.
+        self.hash_block_size = hash_block_size
         self.null_block = KVCacheBlock(block_id=0)
         # Dummy ID 1 for present block for duck-typing.
         self._present_block = KVCacheBlock(block_id=1)
@@ -131,6 +156,12 @@ class DfkvStoreCoordinator:
         already reflects the eagle-pruned hit length and a second pop would
         leave the trailing block unloaded.
         """
+        # vLLM >= 0.26 compat: the single-type managers consult
+        # ``block_pool.hash_block_size``; stamp it from the scheduler-side
+        # value the coordinator was built with. Idempotent across the
+        # convergence loop and across store_mask's template pool.
+        if getattr(cached_block_pool, "hash_block_size", None) is None:
+            cached_block_pool.hash_block_size = self.hash_block_size
         blocks_per_group, hit_length = self._find_hit_blocks(
             block_hashes, max_length, cached_block_pool, apply_eagle=apply_eagle
         )
@@ -226,7 +257,7 @@ class DfkvStoreCoordinator:
         if len(self.attention_groups) == 1:
             spec, group_ids, manager_cls = self.attention_groups[0]
             hashes = self.block_hashes_for_spec(block_hashes, spec)
-            hit_blocks = manager_cls.find_longest_cache_hit(
+            hit_blocks = _unwrap_hit_blocks(manager_cls.find_longest_cache_hit(
                 block_hashes=hashes,
                 max_length=max_length,
                 kv_cache_group_ids=group_ids,
@@ -234,7 +265,7 @@ class DfkvStoreCoordinator:
                 kv_cache_spec=spec,
                 drop_eagle_block=(0 in eagle_indices),
                 alignment_tokens=spec.block_size,
-            )
+            ))
             num_groups = len(self.kv_cache_groups)
             blocks_by_group: list[list[KVCacheBlock]] = [[] for _ in range(num_groups)]
             for gid, blks in zip(group_ids, hit_blocks, strict=True):
@@ -266,7 +297,7 @@ class DfkvStoreCoordinator:
                 if drop_eagle_block:
                     _max_length = min(curr_hit_length + spec.block_size, max_length)
                 hashes = self.block_hashes_for_spec(block_hashes, spec)
-                hit_blocks = manager_cls.find_longest_cache_hit(
+                hit_blocks = _unwrap_hit_blocks(manager_cls.find_longest_cache_hit(
                     block_hashes=hashes,
                     max_length=_max_length,
                     kv_cache_group_ids=group_ids,
@@ -274,7 +305,7 @@ class DfkvStoreCoordinator:
                     kv_cache_spec=spec,
                     drop_eagle_block=drop_eagle_block,
                     alignment_tokens=self.lcm_block_size,
-                )
+                ))
                 _new_hit_length = len(hit_blocks[0]) * spec.block_size
                 if drop_eagle_block:
                     eagle_verified.add(idx)
