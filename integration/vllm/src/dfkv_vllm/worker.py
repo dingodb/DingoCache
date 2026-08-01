@@ -1082,6 +1082,12 @@ class DfkvStoreWorker:
         registered_ptrs: set[int] = set()
         group_addrs: list[list[int]] = [[] for _ in self.token_dbs]
         group_block_lens: list[list[int]] = [[] for _ in self.token_dbs]
+        # Exact (base, block_stride, block_content) triples per group for
+        # blocks-first layers; deduped because hybrid groups can alias the
+        # same physical slots (DeepSeek-V4 g3 views of g0 blocks).
+        group_seg_layouts: list[list[tuple[int, int, int]]] = [
+            [] for _ in self.token_dbs
+        ]
 
         for layer_name, value in kv_caches.items():
             cache = _repr_tensor(value)
@@ -1102,14 +1108,7 @@ class DfkvStoreWorker:
                     self.client.register_memory(base_addr, region_len)
 
             g_idx = layer_to_group[layer_name]
-            # Address THIS layer's blocks from its own tensor data_ptr (== the
-            # storage base when the view offset is 0, which it is on V4-Flash)
-            # and its own per-block byte stride -- independent of any aliasing.
             layer_addr = cache.data_ptr()
-            # Detect layout via stride: a dim whose byte-stride exceeds
-            # page_size_bytes is an outer segment dim (e.g. the K/V dim of
-            # FlashAttn's (2, num_blocks, ...)). FlashInfer/MLA's blocks-
-            # outermost layout has no such dim and yields a single segment.
             el = cache.element_size()
             page_size_bytes = region_len // self.num_blocks
             outer_dims = [
@@ -1119,12 +1118,37 @@ class DfkvStoreWorker:
                 # Blocks-first layout (FlashInfer / MLA): one segment.
                 group_addrs[g_idx].append(layer_addr)
                 group_block_lens[g_idx].append(page_size_bytes)
+                # Exact per-block geometry for interleaved pools: block
+                # stride = dim0 stride; content = trailing contiguous run
+                # within a block (the bytes this layer actually owns).
+                # With a fully dense per-block layer this collapses to the
+                # legacy packed segment (stride == content).
+                block_stride = cache.stride(0) * el
+                run = 1
+                dense = True
+                for d in range(cache.ndim - 1, 0, -1):
+                    if cache.stride(d) != run:
+                        dense = False
+                        break
+                    run *= cache.shape[d]
+                content = run * el if dense else block_stride
+                if content <= 0 or content > block_stride:
+                    content = block_stride
+                group_seg_layouts[g_idx].append(
+                    (layer_addr, block_stride, content)
+                )
             else:
                 # K/V-first layout (FlashAttn / ROCm): split segments.
                 seg_stride = cache.stride(outer_dims[0]) * el
                 for idx in range(cache.shape[outer_dims[0]]):
                     group_addrs[g_idx].append(layer_addr + idx * seg_stride)
                     group_block_lens[g_idx].append(seg_stride // self.num_blocks)
+                    # Packed triple: per-block dense content equals the
+                    # legacy block_len for K/V-first layouts.
+                    packed = seg_stride // self.num_blocks
+                    group_seg_layouts[g_idx].append(
+                        (layer_addr + idx * seg_stride, packed, packed)
+                    )
 
         logger.info(
             "Registered KV caches: num_groups=%d, segments_per_group=%s, num_blocks=%d",
@@ -1136,6 +1160,13 @@ class DfkvStoreWorker:
         for g_idx, db in enumerate(self.token_dbs):
             db.set_kv_caches_base_addr(group_addrs[g_idx])
             db.set_block_len(group_block_lens[g_idx])
+            # Exact layout wins over the legacy flat tables when present.
+            seen: set[tuple[int, int, int]] = set()
+            seg_layout = [
+                e for e in group_seg_layouts[g_idx] if not (e in seen or seen.add(e))
+            ]
+            if seg_layout:
+                db.set_seg_layout(seg_layout)
 
         # Start transfer threads
         if self.kv_role in ["kv_producer", "kv_both"]:
