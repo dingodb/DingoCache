@@ -5,8 +5,9 @@
 # (vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/).
 """Data classes for DfkvStoreConnector."""
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from itertools import product
 
 import torch
 
@@ -21,6 +22,64 @@ from vllm.v1.core.kv_cache_utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def split_block_contiguous_runs(
+    shape: Sequence[int],
+    strides: Sequence[int],
+    element_size: int,
+) -> tuple[int, list[tuple[int, int]]]:
+    """Return ``(block_stride, [(offset, size), ...])`` in bytes.
+
+    Dimension 0 indexes KV blocks. Expand padded or transposed in-block
+    dimensions into deterministic contiguous runs; overlapping views fail
+    closed instead of transferring the whole block stride.
+    """
+    if len(shape) != len(strides) or not shape:
+        raise ValueError("shape and strides must have the same non-zero rank")
+    if element_size <= 0 or any(int(n) <= 0 for n in shape):
+        raise ValueError("shape dimensions and element_size must be positive")
+    if any(int(s) < 0 for s in strides):
+        raise ValueError("negative KV-cache strides are not supported")
+
+    block_stride = int(strides[0]) * element_size
+    if block_stride <= 0:
+        raise ValueError("KV-cache block stride must be positive")
+
+    run_elems = 1
+    run_start = len(shape)
+    for dim in range(len(shape) - 1, 0, -1):
+        if int(strides[dim]) != run_elems:
+            break
+        run_elems *= int(shape[dim])
+        run_start = dim
+
+    run_size = run_elems * element_size
+    prefix_ranges = [range(int(shape[d])) for d in range(1, run_start)]
+    offsets: list[int] = []
+    seen_offsets: set[int] = set()
+    for indices in product(*prefix_ranges):
+        offset = sum(
+            index * int(strides[dim])
+            for dim, index in enumerate(indices, start=1)
+        ) * element_size
+        if offset not in seen_offsets:
+            seen_offsets.add(offset)
+            offsets.append(offset)
+    if not offsets:
+        offsets.append(0)
+
+    runs = [(offset, run_size) for offset in offsets]
+    previous_end = 0
+    for offset, size in sorted(runs):
+        if offset < previous_end or offset + size > block_stride:
+            raise ValueError(
+                "KV-cache in-block runs overlap or exceed block stride: "
+                f"offset={offset} size={size} block_stride={block_stride}"
+            )
+        previous_end = offset + size
+    return block_stride, runs
+
 
 
 @dataclass
@@ -87,12 +146,9 @@ class ChunkedTokenDatabase:
         self.kv_caches_base_addr: list[int] = []
         self.block_len: list[int] = []
         # Per-layer segment layout: (base_addr, block_stride, block_content).
-        # block_stride is the layer's dim0 byte stride; block_content is the
-        # trailing-dense byte run that actually holds this layer's tokens
-        # within one block. They differ for interleaved pools (DeepSeek-V4
-        # hybrid: all layers live in one pool, each block is a 1MiB page with
-        # per-layer slots inside). A fully-dense layer has stride == content
-        # and stays packed into one segment per chunk (legacy behavior).
+        # Multiple entries may represent disjoint contiguous runs of one
+        # strided layer. prepare_value emits them in canonical layer/run/block
+        # order and always addresses the real physical block IDs.
         self._seg_layout: list[tuple[int, int, int]] | None = None
 
     def _make_key_by_hash(self, chunk_hash: str) -> PoolKey:
@@ -105,57 +161,58 @@ class ChunkedTokenDatabase:
         self.block_len = block_len
 
     def set_seg_layout(self, seg_layout: list[tuple[int, int, int]]):
-        """Install exact per-layer (base, block_stride, block_content).
-
-        When set, prepare_value derives addresses from this layout instead of
-        the legacy flat block_len table, splitting interleaved layers into
-        one segment per block. With stride == content the entry stays packed
-        exactly like the legacy path.
-        """
+        """Install exact per-run ``(base, block_stride, block_content)``."""
         for base, stride, content in seg_layout:
-            if stride <= 0 or content <= 0 or content > stride:
+            if base < 0 or stride <= 0 or content <= 0 or content > stride:
                 raise ValueError(
                     f"invalid seg layout entry: base={base:#x} "
                     f"stride={stride} content={content}"
                 )
-        self._seg_layout = seg_layout
+        self._seg_layout = list(seg_layout)
 
     def prepare_value(
         self, start: int, end: int, block_ids: list[int]
     ) -> tuple[list[int], list[int], int]:
-        """Compute memory addresses and sizes for a token range.
+        """Compute memory addresses and sizes for an aligned token range."""
+        if (
+            start < 0
+            or end <= start
+            or start % self.block_size != 0
+            or (end - start) % self.block_size != 0
+        ):
+            raise ValueError(
+                f"token range [{start}, {end}) must align to "
+                f"block_size={self.block_size}"
+            )
 
-        Returns:
-            (addr_list, size_list, block_id)
-        """
-        addr_list = []
-        size_list = []
-        block_id = block_ids[start // self.block_size]
-        nblocks = cdiv(end - start, self.block_size)
-        if self._seg_layout is not None:
-            for base, stride, content in self._seg_layout:
-                if stride == content:
-                    # Fully dense layer: one packed segment for the chunk.
-                    addr_list.append(base + block_id * stride)
-                    size_list.append(content * nblocks)
-                else:
-                    # Interleaved pool layer: its per-block slot is not
-                    # contiguous with the next block, so one segment per
-                    # block is required. Anything wider would read/write
-                    # bytes owned by other layers (or by the NEXT chunk's
-                    # first block) and corrupt them on load.
-                    for i in range(nblocks):
-                        addr_list.append(base + (block_id + i) * stride)
-                        size_list.append(content)
-            return addr_list, size_list, block_id
-        length = len(self.block_len)
-        for index, base_addr in enumerate(self.kv_caches_base_addr):
-            addr = base_addr + block_id * self.block_len[index % length]
-            assert (end - start) % self.block_size == 0
-            size = self.block_len[index % length] * nblocks
-            addr_list.append(addr)
-            size_list.append(size)
-        return addr_list, size_list, block_id
+        start_block = start // self.block_size
+        nblocks = (end - start) // self.block_size
+        chunk_block_ids = block_ids[start_block:start_block + nblocks]
+        if len(chunk_block_ids) != nblocks:
+            raise ValueError(
+                f"block table has {len(chunk_block_ids)} ids for "
+                f"{nblocks} requested blocks at index {start_block}"
+            )
+
+        if self._seg_layout is None:
+            if len(self.kv_caches_base_addr) != len(self.block_len):
+                raise ValueError("legacy KV base and block-length tables differ")
+            layout = [
+                (base, length, length)
+                for base, length in zip(
+                    self.kv_caches_base_addr, self.block_len, strict=True
+                )
+            ]
+        else:
+            layout = self._seg_layout
+
+        addr_list: list[int] = []
+        size_list: list[int] = []
+        for base, stride, content in layout:
+            for block_id in chunk_block_ids:
+                addr_list.append(base + block_id * stride)
+                size_list.append(content)
+        return addr_list, size_list, chunk_block_ids[0]
 
     def process_tokens(
         self,

@@ -57,10 +57,11 @@ from .coordinator import (
 )
 from .data import (
     ChunkedTokenDatabase,
-    KeyMetadata,
     DfkvStoreConnectorMetadata,
+    KeyMetadata,
     PoolKey,
     ReqMeta,
+    split_block_contiguous_runs,
 )
 from .dfkv_client import DfkvDeviceClient
 from .dfkv_utils import get_dp_engine_index
@@ -1118,25 +1119,17 @@ class DfkvStoreWorker:
                 # Blocks-first layout (FlashInfer / MLA): one segment.
                 group_addrs[g_idx].append(layer_addr)
                 group_block_lens[g_idx].append(page_size_bytes)
-                # Exact per-block geometry for interleaved pools: block
-                # stride = dim0 stride; content = trailing contiguous run
-                # within a block (the bytes this layer actually owns).
-                # With a fully dense per-block layer this collapses to the
-                # legacy packed segment (stride == content).
-                block_stride = cache.stride(0) * el
-                run = 1
-                dense = True
-                for d in range(cache.ndim - 1, 0, -1):
-                    if cache.stride(d) != run:
-                        dense = False
-                        break
-                    run *= cache.shape[d]
-                content = run * el if dense else block_stride
-                if content <= 0 or content > block_stride:
-                    content = block_stride
-                group_seg_layouts[g_idx].append(
-                    (layer_addr, block_stride, content)
+                # Exact geometry for blocks-first layouts. A layer may contain
+                # several disjoint contiguous runs inside one block (padding /
+                # transpose); represent every run explicitly rather than
+                # silently transferring the whole stride and crossing slots.
+                block_stride, runs = split_block_contiguous_runs(
+                    cache.shape, cache.stride(), el
                 )
+                for offset, content in runs:
+                    group_seg_layouts[g_idx].append(
+                        (layer_addr + offset, block_stride, content)
+                    )
             else:
                 # K/V-first layout (FlashAttn / ROCm): split segments.
                 seg_stride = cache.stride(outer_dims[0]) * el
@@ -1153,7 +1146,7 @@ class DfkvStoreWorker:
         logger.info(
             "Registered KV caches: num_groups=%d, segments_per_group=%s, num_blocks=%d",
             len(self.token_dbs),
-            [len(a) for a in group_addrs],
+            [len(a) for a in group_seg_layouts],
             self.num_blocks,
         )
 
