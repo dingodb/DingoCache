@@ -86,6 +86,14 @@ class ChunkedTokenDatabase:
             )
         self.kv_caches_base_addr: list[int] = []
         self.block_len: list[int] = []
+        # Per-layer segment layout: (base_addr, block_stride, block_content).
+        # block_stride is the layer's dim0 byte stride; block_content is the
+        # trailing-dense byte run that actually holds this layer's tokens
+        # within one block. They differ for interleaved pools (DeepSeek-V4
+        # hybrid: all layers live in one pool, each block is a 1MiB page with
+        # per-layer slots inside). A fully-dense layer has stride == content
+        # and stays packed into one segment per chunk (legacy behavior).
+        self._seg_layout: list[tuple[int, int, int]] | None = None
 
     def _make_key_by_hash(self, chunk_hash: str) -> PoolKey:
         return PoolKey(self.metadata, chunk_hash)
@@ -95,6 +103,22 @@ class ChunkedTokenDatabase:
 
     def set_block_len(self, block_len: list[int]):
         self.block_len = block_len
+
+    def set_seg_layout(self, seg_layout: list[tuple[int, int, int]]):
+        """Install exact per-layer (base, block_stride, block_content).
+
+        When set, prepare_value derives addresses from this layout instead of
+        the legacy flat block_len table, splitting interleaved layers into
+        one segment per block. With stride == content the entry stays packed
+        exactly like the legacy path.
+        """
+        for base, stride, content in seg_layout:
+            if stride <= 0 or content <= 0 or content > stride:
+                raise ValueError(
+                    f"invalid seg layout entry: base={base:#x} "
+                    f"stride={stride} content={content}"
+                )
+        self._seg_layout = seg_layout
 
     def prepare_value(
         self, start: int, end: int, block_ids: list[int]
@@ -107,11 +131,28 @@ class ChunkedTokenDatabase:
         addr_list = []
         size_list = []
         block_id = block_ids[start // self.block_size]
+        nblocks = cdiv(end - start, self.block_size)
+        if self._seg_layout is not None:
+            for base, stride, content in self._seg_layout:
+                if stride == content:
+                    # Fully dense layer: one packed segment for the chunk.
+                    addr_list.append(base + block_id * stride)
+                    size_list.append(content * nblocks)
+                else:
+                    # Interleaved pool layer: its per-block slot is not
+                    # contiguous with the next block, so one segment per
+                    # block is required. Anything wider would read/write
+                    # bytes owned by other layers (or by the NEXT chunk's
+                    # first block) and corrupt them on load.
+                    for i in range(nblocks):
+                        addr_list.append(base + (block_id + i) * stride)
+                        size_list.append(content)
+            return addr_list, size_list, block_id
         length = len(self.block_len)
         for index, base_addr in enumerate(self.kv_caches_base_addr):
             addr = base_addr + block_id * self.block_len[index % length]
             assert (end - start) % self.block_size == 0
-            size = self.block_len[index % length] * cdiv(end - start, self.block_size)
+            size = self.block_len[index % length] * nblocks
             addr_list.append(addr)
             size_list.append(size)
         return addr_list, size_list, block_id
