@@ -45,6 +45,15 @@ _log = logging.getLogger(__name__)
 
 _FLAG_IS_MLA = 0x1
 
+# Historical/default SG width: ConnectX-era max_sge=30, SGE[0] carries the
+# request/value header, leaving 29 payload segments per scatter-gather key.
+# The live width comes from dfkv_max_sg_segs (negotiated per HCA); this
+# constant is the fallback AND the key-namespace compat anchor — the default
+# width keeps the historical "@sg{n}" so previously cached data stays
+# reachable. Mirrors integration/vllm worker.py SG_MAX_SEGS (same value,
+# same reasoning).
+SG_DEFAULT_WIDTH = 29
+
 
 def _truthy(v) -> bool:
     if isinstance(v, str):
@@ -919,6 +928,20 @@ class DfkvHiCache(HiCacheStorage):
             self._sg_width_cache = w
         return w
 
+    def _sg_group_key(self, sk: str, ci: int) -> str:
+        """Chunk sub-key for SG group ci. The grouping WIDTH is part of a key's
+        identity: the same "@sg1" under different widths carries different
+        consecutive-layer spans, and a variable-size GET whose total cap happens
+        to fit would scatter the WRONG bytes with no error signal. Non-default
+        widths therefore get their own namespace ("@sgw{W}.{n}"); the default
+        width keeps the historical "@sg{n}" so existing cached data stays
+        reachable across this upgrade. Same policy (and constant) as the vLLM
+        connector's _sg_group_key/SG_MAX_SEGS."""
+        w = self._sg_width()
+        if w == SG_DEFAULT_WIDTH:
+            return f"{sk}@sg{ci}"
+        return f"{sk}@sgw{w}.{ci}"
+
     def _flatten_device(self, keys, seg_ptrs, seg_sizes, keys_fn=None, sub=None):
         """Expand per-page keys into per-sub-object (k[/v]) sub-keys, pairing each
         with its per-layer device segment list. Parallel to _flatten, but every
@@ -930,7 +953,10 @@ class DfkvHiCache(HiCacheStorage):
         the same scheme (and key suffix) the vLLM connector uses. Write and read
         derive the identical deterministic split from (layer count, width), so
         the layer-major bytes reassemble exactly. Chunk count is uniform across
-        pages, so _fold()'s per-page stride is sub * nchunks.
+        pages, so _fold()'s per-page stride is sub * nchunks. The WIDTH is part
+        of a key's identity: non-default widths are namespaced "@sgw{W}.{n}"
+        (see _sg_group_key), so clients that negotiated different widths miss
+        (cold) instead of reading mis-split bytes.
 
         keys_fn/sub default to the main-KV key scheme (self._keys / self._sub); the
         DSA indexer sidecar and the EAGLE draft pool pass their own key builder and
@@ -948,7 +974,7 @@ class DfkvHiCache(HiCacheStorage):
                 s = [int(x) for x in seg_sizes[i * sub + j]]
                 nchunks = max(1, (len(p) + w - 1) // w)
                 for ci in range(nchunks):
-                    sks.append(f"{sk}@sg{ci}")
+                    sks.append(self._sg_group_key(sk, ci))
                     sp.append(p[ci * w:(ci + 1) * w])
                     ss.append(s[ci * w:(ci + 1) * w])
         return sub * nchunks, sks, sp, ss
@@ -1166,14 +1192,15 @@ class DfkvHiCache(HiCacheStorage):
         with _tracing.span("batch_exists", total) as _sp, \
                 access_log("batch_exists", lambda: f"{self._alog_tag} {total} keys") as r:
             # longest contiguous prefix of pages whose every sub-object exists.
-            # Device-direct (L2-bypass) writes store "@sg{n}" chunk sub-keys, so
-            # existence is probed on "@sg0" — the vLLM connector's probe scheme;
-            # the bare sub-key never matches a chunked store. A bypass instance
-            # only ever writes chunked keys (model_hash-isolated), so one probe
-            # form suffices per mode.
+            # Device-direct (L2-bypass) writes store "@sg{n}"/"@sgw{W}.{n}" chunk
+            # sub-keys, so existence is probed on group 0 via _sg_group_key() —
+            # the bare sub-key never matches a chunked store, and a *different*
+            # negotiated width lands in a different namespace (miss, not corrupt).
+            # A bypass instance only ever writes chunked keys (model_hash-
+            # isolated), so one probe form suffices per mode.
             sub = self._sub()
             if getattr(self, "mem_pool_device", None) is not None:
-                sks = [f"{sk}@sg0" for k in keys for sk in self._keys(k)]
+                sks = [self._sg_group_key(sk, 0) for k in keys for sk in self._keys(k)]
             else:
                 sks = [sk for k in keys for sk in self._keys(k)]
             page_ok = self._fold(self._batch_exist_flat(sks), total, sub)
@@ -1746,11 +1773,12 @@ class DfkvHiCache(HiCacheStorage):
                     break
                 name = str(tr.name)
                 sub = self._pool_sub(name)
-                # Device-direct sidecars (task 4) store "@sg{n}" chunk sub-keys, so
-                # probe "@sg0" — the same scheme batch_exists uses for the main KV.
+                # Device-direct sidecars (task 4) store "@sg{n}"/"@sgw{W}.{n}"
+                # chunk sub-keys, so probe group 0 via _sg_group_key() — the
+                # same scheme batch_exists uses for the main KV.
                 # A host sidecar stores the bare sub-key.
                 dev_side = name in getattr(self, "_sidecar_device_pools", {})
-                sks = [(sk + "@sg0") if dev_side else sk
+                sks = [self._sg_group_key(sk, 0) if dev_side else sk
                        for k in keys[:kv_pages]
                        for sk in self._pool_keys(name, k)]
                 present = self._fold(self._batch_exist_flat(sks), kv_pages, sub)
