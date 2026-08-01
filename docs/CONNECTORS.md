@@ -321,7 +321,9 @@ HiCache 维持常规路径即可：
 ### 2.7 L2-bypass（L1↔L3 device 直连，绕过 host 池）
 
 把 SGLang 的 L2（host pinned 池）从数据路径上摘掉，GPU 显存与 dfkv 之间直接 GPUDirect RDMA。
-省掉一次 device↔host 拷贝和整个 host 池的驻留内存，代价是块被 SGE 宽度切成 `@sg{n}` 子键。
+省掉一次 device↔host 拷贝和整个 host 池的驻留内存，代价是块被 SGE 宽度切成 `@sg{n}` 子键
+（非默认宽为独立命名空间 `@sgw{W}.{n}`：宽度进 key 身份，混型 HCA 环上跨宽客户端互相 miss
+而非错读——一宽一空间，与 vLLM 连接器同一策略）。
 
 #### 客户端（SGLang 侧）
 
