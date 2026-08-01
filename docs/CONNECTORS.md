@@ -657,7 +657,11 @@ vllm serve <model> --tensor-parallel-size 8 --no-enable-prefix-caching \
 `adapter_params` 键：`url`（必填，语法同 in-process）、`membership`（`mds` 默认 |`static`）、
 `lib`（否则 `DFKV_LIB`）、`model_name`（隔离命名空间 → 稳定 dfkv `model_hash`）、
 `mds_poll_ms`（3000）、`page_size`（0 = 关几何守卫）、`num_workers`（8）、
-`max_capacity_gb`（0 = 容量交给 dfkv 自管；>0 开 LMCache 聚合 L2 淘汰，见 §4.6.6）。
+`max_capacity_gb`（0 = 容量交给 dfkv 自管；>0 开 LMCache 聚合 L2 淘汰，见 §4.6.6）、
+`mla_canonical_keys`（bool 默认关，MLA 专用 opt-in：折叠 kv_rank 的 rank 字段，
+复制态 KV 共享一把 key 且写前 exists 去重，消除 8x 存储/写膨胀；仅 MLA+PP=1—
+在分片或 PP 模型上开会把不同内容压成同键；后续开关 = 冷启；或环境变量
+`DFKV_L2ADAPTER_MLA_CANONICAL_KEYS=1`）。
 server 的 pinned L1 arena 在 LMCache 传入 `l1_memory_desc` 时自动注册 RDMA 零拷贝。
 
 实现要点：dfkv 无原生 eventfd，`DfkvL2Adapter` 用**后台 asyncio loop + 三个

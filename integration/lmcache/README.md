@@ -87,7 +87,13 @@ vllm serve <model> --tensor-parallel-size 8 --no-enable-prefix-caching \
 `membership` (`mds`|`static`), `lib` (else `DFKV_LIB`), `model_name`
 (isolation namespace → stable dfkv `model_hash`), `mds_poll_ms` (3000),
 `page_size` (0 = geometry guard off), `num_workers` (8), `max_capacity_gb`
-(0 = dfkv manages its own capacity; >0 enables aggregate L2 eviction). The
+(0 = dfkv manages its own capacity; >0 enables aggregate L2 eviction),
+`mla_canonical_keys` (bool, default false): MLA-only opt-in — folds the
+kv_rank rank fields so replicated KV shares one key and stores are
+deduped with an exists probe (fixes the 8x storage/write inflation;
+MLA+PP=1 deployments only — enabling under a sharded or PP model would
+collapse distinct content; flipping later = cold cache; or env
+`DFKV_L2ADAPTER_MLA_CANONICAL_KEYS=1`). The
 server's pinned L1 arena is auto-registered for RDMA zero-copy when LMCache
 passes an `l1_memory_desc`. Validated on GLM-5.2 (vLLM 0.23.0 + LMCache 0.4.7):
 store → restart (L1 wiped) → reload from dfkv with prefill skipped.
