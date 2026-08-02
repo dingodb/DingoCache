@@ -1,7 +1,11 @@
 #include "cache/disk_cache_group.h"
 
 #include <cstdlib>
+#include <charconv>
+#include <cstring>
+#include <limits>
 #include <map>
+#include <unordered_set>
 
 #include "cache/disk_slab_store.h"
 #include "common/config_dump.h"
@@ -10,107 +14,188 @@
 namespace dfkv {
 
 namespace {
-// DFKV_DISK_HASH_WEIGHT: ketama vnode multiplier for the intra-server disk
-// ring, clamped [1, 64]. Default 1 keeps the historical placement (existing
-// cache entries stay routable); raising it re-routes a share of old keys
-// (misses, refilled on demand) in exchange for a much flatter per-disk load.
-int DiskHashWeight() {
-  static const int v = [] {
-    const char* e = std::getenv("DFKV_DISK_HASH_WEIGHT");
-    if (e && *e) {
-      long x = std::strtol(e, nullptr, 10);
-      if (x >= 1 && x <= 64) return static_cast<int>(x);
-    }
-    return 1;
-  }();
-  return v;
+bool ParseUnsigned(const char* text, uint64_t max, uint64_t* out) {
+  if (text == nullptr || *text == '\0') return false;
+  uint64_t value = 0;
+  const char* end = text + std::strlen(text);
+  const auto parsed = std::from_chars(text, end, value);
+  if (parsed.ec != std::errc() || parsed.ptr != end || value > max)
+    return false;
+  *out = value;
+  return true;
+}
+
+bool ResolveDiskHashWeight(int* out) {
+  const char* text = std::getenv("DFKV_DISK_HASH_WEIGHT");
+  if (text == nullptr) {
+    *out = 1;
+    return true;
+  }
+  uint64_t value = 0;
+  if (!ParseUnsigned(text, 64, &value) || value == 0) return false;
+  *out = static_cast<int>(value);
+  return true;
 }
 }  // namespace
 
 DiskCacheGroup::DiskCacheGroup(Options opt) {
-  size_t n = opt.cache_dirs.empty() ? 1 : opt.cache_dirs.size();
-  uint64_t per_disk = opt.capacity_bytes / n;
-  if (per_disk == 0) per_disk = opt.capacity_bytes;  // tiny-cap safety
+  auto fail = [&](std::string error) {
+    healthy_ = false;
+    if (startup_error_.empty()) startup_error_ = std::move(error);
+  };
+  if (opt.cache_dirs.empty()) {
+    fail("no cache directories configured");
+    return;
+  }
+  if (opt.capacity_bytes == 0) {
+    fail("capacity_bytes must be non-zero");
+    return;
+  }
+  std::unordered_set<std::string> unique_dirs;
+  for (const auto& dir : opt.cache_dirs) {
+    if (dir.empty()) {
+      fail("cache directory is empty");
+      return;
+    }
+    if (!unique_dirs.insert(dir).second) {
+      fail("duplicate cache directory: " + dir);
+      return;
+    }
+  }
+
   std::string engine = opt.engine;
   if (engine.empty()) {
-    const char* e = std::getenv("DFKV_STORE_ENGINE");
-    engine = (e && *e) ? e : "file";
+    const char* value = std::getenv("DFKV_STORE_ENGINE");
+    engine = (value && *value) ? value : "file";
   }
-  const bool use_slab = (engine == "slab");
-  engine_ = use_slab ? "slab" : "file";  // resolved truth, reported via EngineName
-  // Slab I/O mode: DIRECT by default -- on GPU nodes the page-cache/dirty
-  // growth of buffered I/O competes with training/inference memory; burst
-  // absorption belongs to the explicit RAM tier (DFKV_RAM_TIER), not the page
-  // cache. DFKV_SLAB_WRITE=buffered opts out (benchmarks / non-GPU boxes).
-  const char* wm = std::getenv("DFKV_SLAB_WRITE");
-  const bool slab_direct = !(wm && std::string(wm) == "buffered");
-  // Slot quantum (DFKV_SLAB_GRANULARITY, bytes): tune DOWN for small-value
-  // workloads (default 1 MiB wastes ~94% on 64 KiB values). Changing it is a
-  // layout change -> meta mismatch -> the store re-inits EMPTY (cold cache):
-  // treat as a migration step, not a routine restart.
+  if (engine != "file" && engine != "slab") {
+    fail("DFKV_STORE_ENGINE must be 'file' or 'slab'");
+    return;
+  }
+  engine_ = engine;
+  const bool use_slab = engine == "slab";
+
+  int disk_weight = 1;
+  if (!ResolveDiskHashWeight(&disk_weight)) {
+    fail("DFKV_DISK_HASH_WEIGHT must be an integer in [1,64]");
+    return;
+  }
+
+  bool slab_direct = true;
+  if (const char* mode = std::getenv("DFKV_SLAB_WRITE")) {
+    if (std::strcmp(mode, "direct") == 0) {
+      slab_direct = true;
+    } else if (std::strcmp(mode, "buffered") == 0) {
+      slab_direct = false;
+    } else if (use_slab) {
+      fail("DFKV_SLAB_WRITE must be 'direct' or 'buffered'");
+      return;
+    }
+  }
   uint64_t slab_gran = 0;
-  if (const char* g = std::getenv("DFKV_SLAB_GRANULARITY")) {
-    unsigned long long v = std::strtoull(g, nullptr, 10);
-    if (v > 0) slab_gran = v;
+  if (const char* value = std::getenv("DFKV_SLAB_GRANULARITY")) {
+    if (!ParseUnsigned(value, std::numeric_limits<uint32_t>::max(),
+                       &slab_gran) ||
+        slab_gran == 0) {
+      if (use_slab) {
+        fail("DFKV_SLAB_GRANULARITY must be a positive uint32");
+        return;
+      }
+      slab_gran = 0;
+    }
   }
-  // slots.tbl fdatasync cadence override (ms; 0 disables). Default 100.
+  uint64_t parsed = 0;
   uint32_t sync_ms = 100;
-  if (const char* t = std::getenv("DFKV_SLAB_TABLE_SYNC_MS"))
-    sync_ms = static_cast<uint32_t>(std::strtoul(t, nullptr, 10));
-  // Background free-slot reclaimer cadence override (ms; 0 disables). Default 50.
+  if (const char* value = std::getenv("DFKV_SLAB_TABLE_SYNC_MS")) {
+    if (!ParseUnsigned(value, std::numeric_limits<uint32_t>::max(), &parsed)) {
+      if (use_slab) {
+        fail("DFKV_SLAB_TABLE_SYNC_MS must be a uint32");
+        return;
+      }
+    } else {
+      sync_ms = static_cast<uint32_t>(parsed);
+    }
+  }
   uint32_t reclaim_ms = 50;
-  if (const char* r = std::getenv("DFKV_SLAB_RECLAIM_MS"))
-    reclaim_ms = static_cast<uint32_t>(std::strtoul(r, nullptr, 10));
-  // Effective values into the startup config dump (defaults included).
+  if (const char* value = std::getenv("DFKV_SLAB_RECLAIM_MS")) {
+    if (!ParseUnsigned(value, std::numeric_limits<uint32_t>::max(), &parsed)) {
+      if (use_slab) {
+        fail("DFKV_SLAB_RECLAIM_MS must be a uint32");
+        return;
+      }
+    } else {
+      reclaim_ms = static_cast<uint32_t>(parsed);
+    }
+  }
+
   config_dump::RecordResolved("DFKV_STORE_ENGINE", engine_);
-  config_dump::RecordResolved("DFKV_DISK_HASH_WEIGHT", std::to_string(DiskHashWeight()));
-  config_dump::RecordResolved("DFKV_SLAB_WRITE", slab_direct ? "direct" : "buffered");
-  config_dump::RecordResolved("DFKV_SLAB_GRANULARITY",
-                              slab_gran ? std::to_string(slab_gran) : std::string("1048576"));
-  config_dump::RecordResolved("DFKV_SLAB_TABLE_SYNC_MS", std::to_string(sync_ms));
-  config_dump::RecordResolved("DFKV_SLAB_RECLAIM_MS", std::to_string(reclaim_ms));
-  for (const auto& dir : opt.cache_dirs) {
+  config_dump::RecordResolved("DFKV_DISK_HASH_WEIGHT",
+                              std::to_string(disk_weight));
+  config_dump::RecordResolved("DFKV_SLAB_WRITE",
+                              slab_direct ? "direct" : "buffered");
+  config_dump::RecordResolved(
+      "DFKV_SLAB_GRANULARITY",
+      slab_gran ? std::to_string(slab_gran) : std::string("1048576"));
+  config_dump::RecordResolved("DFKV_SLAB_TABLE_SYNC_MS",
+                              std::to_string(sync_ms));
+  config_dump::RecordResolved("DFKV_SLAB_RECLAIM_MS",
+                              std::to_string(reclaim_ms));
+
+  const size_t n = opt.cache_dirs.size();
+  const uint64_t base_capacity = opt.capacity_bytes / n;
+  const uint64_t capacity_remainder = opt.capacity_bytes % n;
+  write_mode_ = use_slab ? "direct" : "";
+  for (size_t i = 0; i < n; ++i) {
+    const std::string& dir = opt.cache_dirs[i];
+    const uint64_t disk_capacity =
+        base_capacity + (i < capacity_remainder ? 1 : 0);
     std::unique_ptr<StoreEngine> store;
     if (use_slab) {
       DiskSlabStore::Options so;
       so.dir = dir;
-      so.capacity_bytes = per_disk;
+      so.capacity_bytes = disk_capacity;
       so.direct_writes = slab_direct;
       if (slab_gran) so.slot_granularity = slab_gran;
       so.table_sync_ms = sync_ms;
       so.reclaim_interval_ms = reclaim_ms;
       auto slab = std::make_unique<DiskSlabStore>(so);
       slabs_.push_back(slab.get());
-      // Resolved truth (an fs that rejects O_DIRECT demotes to buffered).
-      write_mode_ = slab->DirectWritesActive() ? "direct" : "buffered";
+      if (!slab->DirectWritesActive()) write_mode_ = "buffered";
       store = std::move(slab);
     } else {
-      store = std::make_unique<KVStore>(KVStore::Options{dir, per_disk});
+      store =
+          std::make_unique<KVStore>(KVStore::Options{dir, disk_capacity});
+    }
+    if (!store->Healthy()) {
+      fail(dir + ": " + store->StartupError());
+      DFKV_LOG_ERROR("disk store startup failed: " + dir + ": " +
+                     store->StartupError());
     }
     by_id_[dir] = store.get();
     disks_.push_back(std::move(store));
-    // Disk id = its dir path. The hash weight multiplies ketama vnodes
-    // (160/weight-unit): at the default weight 1 the realized per-disk key
-    // share on a 6-disk group varies ±20%, so the hottest disk saturates at
-    // ~83% of aggregate disk bandwidth (measured: one disk at aqu-sz 600+
-    // while its five peers idle at 20-50, capping a 6x6.9GB/s server at
-    // ~33GB/s cold-read). Weight 10 (1600 vnodes/disk) shrinks the share
-    // spread to ~±6%. Env-tunable; NOTE changing it re-routes existing keys
-    // (cache semantics: old entries become misses, not corruption).
-    ring_.AddNode(dir, DiskHashWeight());
+    ring_.AddNode(dir, disk_weight);
   }
   ring_.Build();
   if (disks_.size() > 1) {
-    // Realized routing-share spread (min/max ring points per disk): the ops
-    // signal for placement skew — a hot disk saturates first and gates the
-    // whole group's cold-read throughput.
-    auto pts = ring_.NodePointCounts();
-    size_t mn = SIZE_MAX, mx = 0;
-    for (const auto& [_, c] : pts) { if (c < mn) mn = c; if (c > mx) mx = c; }
-    DFKV_LOG_INFO("disk ring: " + std::to_string(disks_.size()) + " disks, weight=" +
-                  std::to_string(DiskHashWeight()) + ", points min=" + std::to_string(mn) +
-                  " max=" + std::to_string(mx));
+    auto points = ring_.NodePointCounts();
+    size_t min_points = SIZE_MAX;
+    size_t max_points = 0;
+    for (const auto& [_, count] : points) {
+      if (count < min_points) min_points = count;
+      if (count > max_points) max_points = count;
+    }
+    DFKV_LOG_INFO("disk ring: " + std::to_string(disks_.size()) +
+                  " disks, weight=" + std::to_string(disk_weight) +
+                  ", points min=" + std::to_string(min_points) +
+                  " max=" + std::to_string(max_points));
   }
+}
+
+bool DiskCacheGroup::Healthy() const {
+  if (!healthy_) return false;
+  for (const auto& disk : disks_)
+    if (!disk->Healthy()) return false;
+  return true;
 }
 
 StoreEngine* DiskCacheGroup::Route(const BlockKey& key) const {
@@ -209,18 +294,35 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.dio_write_fallbacks += st.dio_write_fallbacks;
     sum.dio_read_fallbacks += st.dio_read_fallbacks;
     sum.table_syncs += st.table_syncs;
+    sum.bind_wipes += st.bind_wipes;
     sum.steals += st.steals;
+    sum.cold_steals += st.cold_steals;
+    sum.watermark_evictions += st.watermark_evictions;
     sum.extent_returns += st.extent_returns;
     sum.deferred_removes += st.deferred_removes;
     sum.inflight += st.inflight;
     sum.prep_holds += st.prep_holds;
     sum.reclaimed_slots += st.reclaimed_slots;
-    // rebalanced_extents was MISSING from this sum since its introduction --
-    // dfkv_slab_rebalanced_total silently read 0 fleet-wide (found while adding
-    // the batch counters; canary data showed 0 despite active rebalances).
     sum.rebalanced_extents += st.rebalanced_extents;
     sum.batched_writes += st.batched_writes;
     sum.uring_write_batches += st.uring_write_batches;
+    sum.metadata_io_errors += st.metadata_io_errors;
+    sum.unclean_resets += st.unclean_resets;
+    sum.eviction_record_clears += st.eviction_record_clears;
+    sum.record_writes += st.record_writes;
+    sum.table_rebuilt += st.table_rebuilt;
+    sum.rebuild_corrupt_records += st.rebuild_corrupt_records;
+    sum.rebuild_rejected_records += st.rebuild_rejected_records;
+    sum.capacity_bytes += st.capacity_bytes;
+    sum.allocated_bytes += st.allocated_bytes;
+    sum.payload_bytes += st.payload_bytes;
+    sum.allocator_objects += st.allocator_objects;
+    sum.committed_objects += st.committed_objects;
+    sum.class_count += st.class_count;
+    sum.bound_extents += st.bound_extents;
+    sum.pool_extents += st.pool_extents;
+    sum.failed_disks += st.failed_disks;
+    sum.failed = sum.failed || st.failed;
   }
   return sum;
 }

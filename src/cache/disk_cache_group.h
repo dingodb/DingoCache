@@ -32,6 +32,8 @@ class DiskCacheGroup {
   };
 
   explicit DiskCacheGroup(Options opt);
+  bool Healthy() const;
+  const std::string& StartupError() const { return startup_error_; }
 
   Status Cache(const BlockKey& key, const void* data, size_t len);
   Status CacheDirect(const BlockKey& key, char* data, size_t len, size_t cap);
@@ -80,6 +82,8 @@ class DiskCacheGroup {
 
   StoreEngine* Route(const BlockKey& key) const;
 
+  bool healthy_ = true;
+  std::string startup_error_;
   std::string engine_;      // resolved backend name (see EngineName)
   std::string write_mode_;  // resolved slab I/O mode (see WriteMode)
   std::vector<std::unique_ptr<StoreEngine>> disks_;

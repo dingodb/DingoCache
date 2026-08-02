@@ -43,6 +43,8 @@ class KVStore : public StoreEngine {
   };
 
   explicit KVStore(Options opt);
+  bool Healthy() const override { return healthy_; }
+  const std::string& StartupError() const override { return startup_error_; }
 
   // Synchronous, idempotent (skips if already present). No S3 upload.
   Status Cache(const BlockKey& key, const void* data, size_t len) override;
@@ -141,9 +143,11 @@ class KVStore : public StoreEngine {
   void ForceEvictLocked(Shard& sh, uint64_t target,
                         std::vector<std::string>* trash);  // ENOSPC self-heal
   std::string RenameToTrash(const std::string& path);  // fast in-lock; unlink deferred
-  void RebuildIndex();
+  bool RebuildIndex();
 
   Options opt_;
+  bool healthy_ = false;
+  std::string startup_error_;
   std::vector<std::unique_ptr<Shard>> shards_;  // fixed after construction
   std::atomic<uint64_t> tmp_seq_{0};  // unique suffix for concurrent lock-free writes
   // Eviction counters (relaxed): incremented in EvictLocked across shards.

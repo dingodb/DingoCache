@@ -47,11 +47,11 @@ TEST(SlabAllocator, PutGetRemoveRoundTrip) {
   EXPECT_EQ(g.slot, r.slot);
   EXPECT_FALSE(a.Get("absent", &g));
 
-  EXPECT_TRUE(a.Remove("k"));
+  EXPECT_EQ(a.Remove("k"), SlabAllocator::RemoveResult::kRemoved);
   EXPECT_FALSE(a.Contains("k"));
   EXPECT_EQ(a.Count(), 0u);
   EXPECT_EQ(a.UsedBytes(), 0u);
-  EXPECT_FALSE(a.Remove("k"));  // idempotent
+  EXPECT_EQ(a.Remove("k"), SlabAllocator::RemoveResult::kNotFound);
 }
 
 TEST(SlabAllocator, PutIsIdempotentKeepsSameSlot) {
@@ -369,19 +369,30 @@ TEST(SlabAllocator, FullyFreeExtentReturnsToPool) {
   EXPECT_EQ(b.Steals(), 0u);
 }
 
-// The REAL Remove contract (an earlier doc promised deferred reuse; the
-// implementation never did that): a pinned key's slot is freed for reuse
-// immediately -- which is exactly why DiskSlabStore/RamTier must (and do)
-// guard in-flight keys at their own layer before calling Remove.
-TEST(SlabAllocator, RemoveFreesPinnedSlotImmediately) {
+// Explicit Remove is logically immediate but physical reuse waits for the last
+// pin: an unlocked reader/writer can never observe a recycled slot.
+TEST(SlabAllocator, RemoveDefersPinnedSlotUntilLastUnpin) {
   SlabAllocator a(Opts(4096, 1));  // one slot total
   std::vector<std::string> ev;
   SlotRef r1, r2;
   ASSERT_TRUE(a.Put("k", 4096, &r1, &ev));
   ASSERT_TRUE(a.Pin("k"));
-  ASSERT_TRUE(a.Remove("k"));  // logs a WARN; slot is free NOW
+  ASSERT_TRUE(a.Pin("k"));
+  EXPECT_EQ(a.Remove("k"), SlabAllocator::RemoveResult::kDeferred);
+  EXPECT_FALSE(a.Contains("k"));
+  EXPECT_FALSE(a.Get("k", &r2));
+  EXPECT_FALSE(a.Pin("k"));
+  EXPECT_EQ(a.Count(), 1u);
+  EXPECT_EQ(a.UsedBytes(), 4096u);
+  EXPECT_FALSE(a.Put("k2", 4096, &r2, &ev));
+  ASSERT_TRUE(a.Unpin("k"));
+  EXPECT_EQ(a.Count(), 1u);
+  EXPECT_FALSE(a.Put("k2", 4096, &r2, &ev));
+  ASSERT_TRUE(a.Unpin("k"));
+  EXPECT_EQ(a.Count(), 0u);
+  EXPECT_EQ(a.UsedBytes(), 0u);
   ASSERT_TRUE(a.Put("k2", 4096, &r2, &ev));
-  EXPECT_TRUE(ev.empty()) << "reused the freed slot, no eviction needed";
+  EXPECT_TRUE(ev.empty());
   EXPECT_EQ(r2.extent, r1.extent);
   EXPECT_EQ(r2.slot, r1.slot);
 }
@@ -560,6 +571,78 @@ TEST(SlabAllocator, StealFromMovesOneExtentDonorToTarget) {
   for (int i = 0; i < 12; ++i) alive += a.Contains("k" + std::to_string(i));
   EXPECT_EQ(alive, 4u);
   EXPECT_TRUE(a.Contains("big0"));
+}
+
+TEST(SlabAllocator, BindPersistenceFailurePublishesNoSlots) {
+  bool allow_bind = false;
+  auto o = Opts(4 * 4096, 2);
+  o.on_extent_bind = [&](uint32_t) { return allow_bind; };
+  SlabAllocator a(o);
+  std::vector<std::string> ev;
+  SlotRef ref;
+
+  EXPECT_FALSE(a.Put("k", 4096, &ref, &ev));
+  EXPECT_TRUE(ev.empty());
+  EXPECT_EQ(a.Count(), 0u);
+  EXPECT_EQ(a.UsedBytes(), 0u);
+  EXPECT_EQ(a.BoundExtents(), 0u);
+  EXPECT_EQ(a.PoolExtents(), 2u);
+
+  allow_bind = true;
+  ASSERT_TRUE(a.Put("k", 4096, &ref, &ev));
+  EXPECT_EQ(a.Count(), 1u);
+  EXPECT_EQ(a.BoundExtents(), 2u);
+}
+
+TEST(SlabAllocator, EvictionPersistenceFailurePreservesResidentSlot) {
+  bool allow_evict = false;
+  auto options = Opts(4 * 4096, 1);
+  options.on_slot_evict =
+      [&](const SlotRef&) { return allow_evict; };
+  SlabAllocator allocator(options);
+  std::vector<std::string> evicted;
+  SlotRef ref;
+  for (int i = 0; i < 4; ++i)
+    ASSERT_TRUE(allocator.Put("k" + std::to_string(i), 4096, &ref,
+                              &evicted));
+
+  evicted.clear();
+  EXPECT_FALSE(allocator.Put("blocked", 4096, &ref, &evicted));
+  EXPECT_TRUE(evicted.empty());
+  EXPECT_EQ(allocator.Count(), 4u);
+  for (int i = 0; i < 4; ++i)
+    EXPECT_TRUE(allocator.Contains("k" + std::to_string(i)));
+
+  allow_evict = true;
+  ASSERT_TRUE(allocator.Put("landed", 4096, &ref, &evicted));
+  EXPECT_EQ(evicted.size(), 1u);
+  EXPECT_TRUE(allocator.Contains("landed"));
+  EXPECT_EQ(allocator.Count(), 4u);
+}
+
+TEST(SlabAllocator, RebindPersistenceFailurePreservesDonorExtent) {
+  bool allow_bind = true;
+  auto o = Opts(4 * 4096, 2);
+  o.on_extent_bind = [&](uint32_t) { return allow_bind; };
+  SlabAllocator a(o);
+  std::vector<std::string> ev;
+  SlotRef ref;
+  for (int i = 0; i < 8; ++i)
+    ASSERT_TRUE(a.Put("a" + std::to_string(i), 4096, &ref, &ev));
+
+  allow_bind = false;
+  ev.clear();
+  EXPECT_FALSE(a.Put("big", 8192, &ref, &ev));
+  EXPECT_TRUE(ev.empty());
+  EXPECT_EQ(a.Count(), 8u);
+  EXPECT_EQ(a.BoundExtents(), 2u);
+  for (int i = 0; i < 8; ++i)
+    EXPECT_TRUE(a.Contains("a" + std::to_string(i)));
+
+  allow_bind = true;
+  ASSERT_TRUE(a.Put("big", 8192, &ref, &ev));
+  EXPECT_EQ(ev.size(), 4u);
+  EXPECT_TRUE(a.Contains("big"));
 }
 
 // StealFrom refuses: donor == target, bad indices, oversized target class, and

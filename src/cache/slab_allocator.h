@@ -45,22 +45,30 @@ class SlabAllocator {
     bool valid() const { return slot_size != 0; }
   };
 
+  enum class RemoveResult {
+    kRemoved,
+    kDeferred,
+    kNotFound,
+  };
+
   struct Options {
     uint64_t extent_bytes = (1ull << 30);  // bytes per extent (e.g. 1 GiB)
     uint32_t num_extents = 8;              // total extents in the pool
-    uint32_t align = 4096;                 // slot-size alignment (O_DIRECT friendly)
-    // Reuse an existing (larger) class instead of creating a new one when the
-    // internal waste (slot_size - aligned_len) stays under this fraction.
-    double max_waste = 0.25;
-    // Fired (under the allocator lock) whenever a RUNTIME bind hands extent E to
-    // a class -- initial bind, steal, or pool re-bind. A persistent caller MUST
-    // wipe E's stale metadata here: records left by a PREVIOUS class survive a
-    // rebind (they sit at slot-grid positions the new class never overwrites),
-    // and a later rebuild can resurrect an old key pointing at the new
-    // occupant's bytes. NOT fired on Restore's rebuild-time binds (those records
-    // are the source of truth being read). Optional; RamTier (no persistence)
-    // leaves it empty.
-    std::function<void(uint32_t extent)> on_extent_bind;
+    uint32_t align = 4096;                 // slot-size alignment
+    double max_waste = 0.25;               // tolerated internal fragmentation
+    // Fired (under the allocator lock) before a RUNTIME bind exposes extent E
+    // to a class -- initial bind, steal, or pool re-bind. A persistent caller
+    // MUST durably wipe E's stale metadata here: records left by a previous
+    // class can otherwise resurrect over a new occupant after restart.
+    // Return false on any write/sync failure; the allocator then publishes no
+    // slots from that extent and the triggering Put fails. NOT fired on
+    // Restore's rebuild-time binds (those records are the source of truth).
+    // Optional; RamTier (no persistence) leaves it empty.
+    std::function<bool(uint32_t extent)> on_extent_bind;
+    // Fired before a single resident is evicted without rebinding its extent.
+    // Persistent callers invalidate that slot's record before allocator state
+    // forgets its placement. Failure leaves the resident intact.
+    std::function<bool(const SlotRef&)> on_slot_evict;
   };
 
   // Target write-parallelism per class: Put keeps up to this many extents open
@@ -97,21 +105,15 @@ class SlabAllocator {
   bool Restore(const std::string& key, uint32_t slot_size, uint32_t extent,
                uint32_t slot);
 
-  // Drop `key`. true if present. CONTRACT: the slot is freed for reuse
-  // IMMEDIATELY, even if the key is pinned -- pins only block EVICTION, not an
-  // explicit Remove. Callers that do I/O against a slot outside their own lock
-  // must therefore never Remove an in-flight key: DiskSlabStore defers such
-  // Removes to the last releaser (inflight_/deferred_remove_), and RamTier's
-  // Remove declines while a flush-pin or send-pin is held. (An earlier version
-  // of this comment promised deferred reuse; the implementation never did that,
-  // and the guards belong at the caller layer, where in-flight state lives.)
-  // A pinned Remove logs a WARN: in-tree callers make it unreachable, so one
-  // firing means a new caller is missing its guard.
-  bool Remove(const std::string& key);
+  // Logically drop `key`. An unpinned slot is freed immediately. A pinned slot
+  // is marked remove-pending and remains physically occupied until the final
+  // Unpin, preventing reuse while an unlocked I/O still references its bytes.
+  // Pending keys are invisible to Get/Contains/Pin and reject Put until release.
+  RemoveResult Remove(const std::string& key);
 
-  // Pin/unpin a resident key: a pinned slot is never chosen for eviction (used
-  // while an RDMA send reads the slot). Balanced calls; Pin on an absent key is
-  // a no-op returning false.
+  // Pin/unpin a resident key: a pinned slot is never chosen for eviction or
+  // explicit-remove reuse. Balanced calls; Pin on an absent or remove-pending
+  // key is a no-op returning false. The final Unpin frees a pending removal.
   bool Pin(const std::string& key);
   bool Unpin(const std::string& key);
 
@@ -177,12 +179,18 @@ class SlabAllocator {
 
  private:
   static constexpr int kUnbound = -1;
+  enum class ExtentBindResult {
+    kBound,
+    kUnavailable,
+    kPersistenceError,
+  };
 
   struct Slot { uint32_t extent; uint32_t slot; };
   struct Entry {
     SlotRef ref;
     uint32_t refs = 0;                       // pin count
     bool referenced = false;                 // CLOCK bit
+    bool remove_pending = false;              // logical remove; free on final Unpin
     uint64_t put_seq = 0;                    // monotonic insert order (global recency)
     std::list<std::string>::iterator ring_it;  // this key's node in its class ring
     // This key's node in its extent's resident list (points at the index_ map
@@ -223,29 +231,30 @@ class SlabAllocator {
   };
 
   size_t ClassForLen(size_t aligned_len);  // returns class index (creates if needed)
-  size_t ClassForExactSize(uint32_t slot_size);  // find/create a class of exactly slot_size
-  bool BindFreeExtent(size_t cls);         // bind a pool extent to cls; false if none
+  size_t ClassForExactSize(uint32_t slot_size);
+  ExtentBindResult BindExtentLocked(size_t cls, uint32_t extent,
+                                    bool metadata_prepared);
+  ExtentBindResult BindFreeExtent(size_t cls);
   bool EvictOneFrom(size_t cls, std::vector<std::string>* evicted);  // CLOCK evict 1
   // Steal an entirely-unpinned extent from another class and rebind it to cls.
   // min_donor_extents > 0 restricts donors to classes holding MORE than that
-  // many extents (the growth-first path uses kStripeWays: two under-provisioned
-  // classes must not ping-pong extents off each other). 0 = any donor (the
-  // last-resort semantics this function always had).
-  bool StealExtentFor(size_t cls, std::vector<std::string>* evicted,
-                      size_t min_donor_extents = 0); // rebind a full extent
+  // many extents. Zero preserves the last-resort any-donor behavior.
+  ExtentBindResult StealExtentFor(
+      size_t cls, std::vector<std::string>* evicted,
+      size_t min_donor_extents = 0);
   // Cross-class eviction of GLOBALLY cold data: steal a fully-unpinned donor
   // extent (from another class) whose newest resident predates put_seq_ minus
   // the protect window — i.e. nothing in it has been written for ~a full pool
   // cycle. Preferred over self-eviction so a single-size-class working set that
   // fills the ring reclaims stale OTHER-class extents instead of cannibalizing
-  // its own just-written pages (the phase-8 hit-rate probe measured that
-  // self-thrash as a 0% hot-round hit rate once the ring was full). Returns
-  // false when no donor is cold enough — the caller then self-evicts as before.
-  bool StealColdExtentFor(size_t cls, std::vector<std::string>* evicted);
-  // Shared steal core: evict extent E's residents, unbind E, re-bind a pool
-  // extent to target_cls. E must be fully unpinned. With mu_ held.
-  bool StealExtentLocked(uint32_t E, size_t target_cls,
-                         std::vector<std::string>* evicted);
+  // its own just-written pages. Returns the bind result so persistence failure
+  // cannot be mistaken for ordinary capacity pressure.
+  ExtentBindResult StealColdExtentFor(
+      size_t cls, std::vector<std::string>* evicted);
+  // Shared steal core: persistently prepare extent E, then evict its residents
+  // and re-bind that exact extent to target_cls. E must be fully unpinned.
+  ExtentBindResult StealExtentLocked(
+      uint32_t E, size_t target_cls, std::vector<std::string>* evicted);
   void FreeSlotLocked(const std::string& key, Entry& e);  // internal removal
   // Per-extent free-slot bookkeeping (all with mu_ held).
   void PushFreeLocked(Class& C, uint32_t ext, uint32_t slot);

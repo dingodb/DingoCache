@@ -1,19 +1,23 @@
 // DiskSlabStore: extent-file slab store on SlabAllocator + slots.tbl rebuild.
-// Covers: put/get/remove, idempotency, eviction, restart WARMTH (rebuild from
-// slots.tbl), crash safety (a torn table record reads as free / not resurrected),
-// meta mismatch -> clean re-init, oversize rejection.
+// Covers data-path semantics, restart warmth, crash/torn-record handling,
+// strict startup geometry, fail-closed metadata I/O, and reclaimer safety.
 #include "cache/disk_slab_store.h"
 
 #include <gtest/gtest.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <functional>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -21,6 +25,50 @@ using dfkv::BlockKey;
 using dfkv::DiskSlabStore;
 using dfkv::Status;
 namespace fs = std::filesystem;
+
+namespace dfkv {
+class DiskSlabStoreTestPeer {
+ public:
+  static void ReclaimNow(DiskSlabStore* store,
+                         const std::function<void()>& after_watermark_evict) {
+    store->ReclaimTick(after_watermark_evict);
+  }
+  static void BreakTableFd(DiskSlabStore* store) {
+    if (store->table_fd_ >= 0) ::close(store->table_fd_);
+    store->table_fd_ = -1;
+  }
+
+  static bool SyncTableNow(DiskSlabStore* store) {
+    return store->SyncTable(
+        store->record_writes_.load(std::memory_order_relaxed));
+  }
+  static bool WriteCrashStage(DiskSlabStore* store, const BlockKey& key,
+                              const std::string& value,
+                              bool include_record) {
+    const std::string filename = key.Filename();
+    SlabAllocator::SlotRef ref;
+    {
+      std::lock_guard<std::mutex> lock(store->mu_);
+      std::vector<std::string> evicted;
+      if (!store->alloc_->Put(filename, value.size(), &ref, &evicted))
+        return false;
+      if (!store->alloc_->Pin(filename)) return false;
+      store->inflight_[filename]++;
+    }
+    if (!store->WritePayload(ref, value.data(), value.size())) return false;
+    return !include_record ||
+           store->WriteRecord(ref, key,
+                              static_cast<uint32_t>(value.size()), true);
+  }
+  static void BreakStateFd(DiskSlabStore* store) {
+    if (store->state_fd_ >= 0) ::close(store->state_fd_);
+    store->state_fd_ = -1;
+  }
+  static bool MarkCleanNow(DiskSlabStore* store) {
+    return store->MarkCleanEpoch();
+  }
+};
+}  // namespace dfkv
 
 namespace {
 class DiskSlabTest : public ::testing::Test {
@@ -74,6 +122,33 @@ TEST_F(DiskSlabTest, PutGetRemoveRoundTrip) {
   ASSERT_EQ(s.Remove(K(1)), Status::kOk);
   EXPECT_FALSE(s.IsCached(K(1)));
   EXPECT_EQ(s.Remove(K(1)), Status::kNotFound);
+}
+
+TEST_F(DiskSlabTest, StatsTrackPhysicalAndLogicalOccupancy) {
+  bool ok = false;
+  DiskSlabStore store(Opts(1 << 20, 1 << 20, 4096), &ok);
+  ASSERT_TRUE(ok);
+  std::string value(3000, 's');
+  ASSERT_EQ(store.Cache(K(1), value.data(), value.size()), Status::kOk);
+
+  auto stats = store.GetStats();
+  EXPECT_EQ(stats.capacity_bytes, 1u << 20);
+  EXPECT_EQ(stats.allocated_bytes, 4096u);
+  EXPECT_EQ(stats.payload_bytes, value.size());
+  EXPECT_EQ(stats.allocator_objects, 1u);
+  EXPECT_EQ(stats.committed_objects, 1u);
+  EXPECT_EQ(stats.class_count, 1u);
+  EXPECT_EQ(stats.bound_extents, 1u);
+  EXPECT_EQ(stats.pool_extents, 0u);
+  EXPECT_EQ(stats.failed_disks, 0u);
+  EXPECT_FALSE(stats.failed);
+
+  ASSERT_EQ(store.Remove(K(1)), Status::kOk);
+  stats = store.GetStats();
+  EXPECT_EQ(stats.allocated_bytes, 0u);
+  EXPECT_EQ(stats.payload_bytes, 0u);
+  EXPECT_EQ(stats.allocator_objects, 0u);
+  EXPECT_EQ(stats.committed_objects, 0u);
 }
 
 TEST_F(DiskSlabTest, EvictsUnderCapacity) {
@@ -155,23 +230,234 @@ TEST_F(DiskSlabTest, TornTableRecordReadsAsFreeNotResurrected) {
   ASSERT_TRUE(ok);
   EXPECT_EQ(s2.TableRebuilt(), 1u) << "the torn record must be skipped";
   EXPECT_EQ(s2.Count(), 1u);
+  EXPECT_EQ(s2.GetStats().rebuild_corrupt_records, 1u);
 }
 
-TEST_F(DiskSlabTest, MetaMismatchReinitsFresh) {
+TEST_F(DiskSlabTest, LayoutMismatchRefusesAndPreservesExistingData) {
+  std::string value(50, 'q');
   {
     bool ok = false;
     DiskSlabStore s(Opts(1 << 20, 1 << 20, 4096), &ok);
     ASSERT_TRUE(ok);
-    std::string v(50, 'q');
-    ASSERT_EQ(s.Cache(K(5), v.data(), v.size()), Status::kOk);
+    ASSERT_EQ(s.Cache(K(5), value.data(), value.size()), Status::kOk);
   }
-  // Reopen with a DIFFERENT slot_granularity: the layout can't be reused, so the
-  // store must re-init fresh (empty) rather than mis-read the old table.
+  {
+    bool ok = true;
+    DiskSlabStore mismatched(Opts(1 << 20, 1 << 20, 8192), &ok);
+    EXPECT_FALSE(ok);
+    EXPECT_FALSE(mismatched.Healthy());
+    EXPECT_FALSE(mismatched.StartupError().empty());
+  }
   bool ok = false;
-  DiskSlabStore s2(Opts(1 << 20, 1 << 20, 8192), &ok);
+  DiskSlabStore reopened(Opts(1 << 20, 1 << 20, 4096), &ok);
   ASSERT_TRUE(ok);
-  EXPECT_EQ(s2.Count(), 0u);
-  EXPECT_FALSE(s2.IsCached(K(5)));
+  std::string out;
+  ASSERT_EQ(reopened.Range(K(5), 0, 0, &out), Status::kOk);
+  EXPECT_EQ(out, value);
+}
+
+TEST_F(DiskSlabTest, InvalidGeometryIsRejectedBeforeCreatingFiles) {
+  auto invalid = [&](DiskSlabStore::Options options) {
+    bool ok = true;
+    DiskSlabStore store(options, &ok);
+    EXPECT_FALSE(ok);
+    EXPECT_FALSE(store.Healthy());
+    EXPECT_FALSE(store.StartupError().empty());
+  };
+
+  auto zero_capacity = Opts(1 << 20, 1 << 20, 4096);
+  zero_capacity.capacity_bytes = 0;
+  invalid(zero_capacity);
+
+  auto partial_extent = Opts(1 << 20, 1 << 20, 4096);
+  partial_extent.dir = (dir_.string() + "_partial");
+  partial_extent.capacity_bytes += 4096;
+  invalid(partial_extent);
+
+  auto unaligned_granularity = Opts(1 << 20, 1 << 20, 4096);
+  unaligned_granularity.dir = (dir_.string() + "_granularity");
+  unaligned_granularity.slot_granularity = 6000;
+  invalid(unaligned_granularity);
+}
+
+TEST_F(DiskSlabTest, RegularFileCannotMasqueradeAsStoreDirectory) {
+  fs::create_directories(dir_.parent_path());
+  int fd = ::open(dir_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::write(fd, "x", 1), 1);
+  ::close(fd);
+
+  bool ok = true;
+  DiskSlabStore store(Opts(1 << 20, 1 << 20, 4096), &ok);
+  EXPECT_FALSE(ok);
+  EXPECT_FALSE(store.StartupError().empty());
+}
+
+TEST_F(DiskSlabTest, CorruptMetaIsRefusedWithoutReinitializing) {
+  {
+    bool ok = false;
+    DiskSlabStore store(Opts(1 << 20, 1 << 20, 4096), &ok);
+    ASSERT_TRUE(ok);
+  }
+  const fs::path meta = dir_ / "slab_meta";
+  int fd = ::open(meta.c_str(), O_RDWR);
+  ASSERT_GE(fd, 0);
+  const uint32_t bad_magic = 0;
+  ASSERT_EQ(::pwrite(fd, &bad_magic, sizeof(bad_magic), 0),
+            static_cast<ssize_t>(sizeof(bad_magic)));
+  ASSERT_EQ(::fdatasync(fd), 0);
+  ::close(fd);
+
+  bool ok = true;
+  DiskSlabStore store(Opts(1 << 20, 1 << 20, 4096), &ok);
+  EXPECT_FALSE(ok);
+  EXPECT_NE(store.StartupError().find("magic"), std::string::npos);
+  fd = ::open(meta.c_str(), O_RDONLY);
+  ASSERT_GE(fd, 0);
+  uint32_t persisted_magic = 1;
+  ASSERT_EQ(::read(fd, &persisted_magic, sizeof(persisted_magic)),
+            static_cast<ssize_t>(sizeof(persisted_magic)));
+  ::close(fd);
+  EXPECT_EQ(persisted_magic, 0u);
+}
+
+TEST_F(DiskSlabTest, TruncatedSlotTableIsRefusedWithoutResizing) {
+  {
+    bool ok = false;
+    DiskSlabStore store(Opts(1 << 20, 1 << 20, 4096), &ok);
+    ASSERT_TRUE(ok);
+  }
+  const fs::path table = dir_ / "slots.tbl";
+  const off_t truncated_size = 255 * 64;
+  ASSERT_EQ(::truncate(table.c_str(), truncated_size), 0);
+
+  bool ok = true;
+  DiskSlabStore store(Opts(1 << 20, 1 << 20, 4096), &ok);
+  EXPECT_FALSE(ok);
+  EXPECT_NE(store.StartupError().find("size"), std::string::npos);
+  struct stat st {};
+  ASSERT_EQ(::stat(table.c_str(), &st), 0);
+  EXPECT_EQ(st.st_size, truncated_size);
+}
+
+TEST_F(DiskSlabTest, DirtyEpochColdResetsAfterProcessCrash) {
+  auto options = Opts(1 << 20, 1 << 20, 4096);
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    bool ok = false;
+    DiskSlabStore store(options, &ok);
+    std::string value(4096, 'c');
+    const bool cached =
+        ok &&
+        store.Cache(K(70), value.data(), value.size()) == Status::kOk;
+    ::_exit(cached ? 0 : 1);  // bypass destructors: process-crash semantics
+  }
+  int child_status = 0;
+  ASSERT_EQ(::waitpid(child, &child_status, 0), child);
+  ASSERT_TRUE(WIFEXITED(child_status));
+  ASSERT_EQ(WEXITSTATUS(child_status), 0);
+
+  std::string survivor(4096, 's');
+  {
+    bool ok = false;
+    DiskSlabStore recovered(options, &ok);
+    ASSERT_TRUE(ok);
+    EXPECT_EQ(recovered.GetStats().unclean_resets, 1u);
+    EXPECT_EQ(recovered.Count(), 0u);
+    std::string out;
+    EXPECT_EQ(recovered.Range(K(70), 0, survivor.size(), &out),
+              Status::kNotFound);
+    ASSERT_EQ(recovered.Cache(K(71), survivor.data(), survivor.size()),
+              Status::kOk);
+  }
+
+  bool ok = false;
+  DiskSlabStore clean_reopen(options, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(clean_reopen.GetStats().unclean_resets, 0u);
+  EXPECT_EQ(clean_reopen.Count(), 1u);
+  std::string out;
+  ASSERT_EQ(clean_reopen.Range(K(71), 0, survivor.size(), &out),
+            Status::kOk);
+  EXPECT_EQ(out, survivor);
+}
+
+TEST_F(DiskSlabTest, CorruptEpochStateFailsClosed) {
+  auto options = Opts(1 << 20, 1 << 20, 4096);
+  {
+    bool ok = false;
+    DiskSlabStore store(options, &ok);
+    ASSERT_TRUE(ok);
+  }
+  const fs::path state = dir_ / "slab_state";
+  int fd = ::open(state.c_str(), O_RDWR);
+  ASSERT_GE(fd, 0);
+  uint8_t bad = 0;
+  ASSERT_EQ(::pwrite(fd, &bad, sizeof(bad), 0),
+            static_cast<ssize_t>(sizeof(bad)));
+  ASSERT_EQ(::fdatasync(fd), 0);
+  ::close(fd);
+
+  bool ok = true;
+  DiskSlabStore reopened(options, &ok);
+  EXPECT_FALSE(ok);
+  EXPECT_FALSE(reopened.Healthy());
+  EXPECT_NE(reopened.StartupError().find("slab_state"), std::string::npos);
+}
+
+TEST_F(DiskSlabTest, MissingEpochStateMigratesConservativelyToCold) {
+  auto options = Opts(1 << 20, 1 << 20, 4096);
+  {
+    bool ok = false;
+    DiskSlabStore store(options, &ok);
+    ASSERT_TRUE(ok);
+    std::string value(4096, 'm');
+    ASSERT_EQ(store.Cache(K(75), value.data(), value.size()), Status::kOk);
+  }
+  ASSERT_TRUE(fs::remove(dir_ / "slab_state"));
+
+  bool ok = false;
+  DiskSlabStore migrated(options, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(migrated.GetStats().unclean_resets, 1u);
+  EXPECT_EQ(migrated.Count(), 0u);
+  EXPECT_FALSE(migrated.IsCached(K(75)));
+}
+
+TEST_F(DiskSlabTest, PayloadAndRecordCrashPointsRecoverAsColdMisses) {
+  for (bool include_record : {false, true}) {
+    fs::remove_all(dir_);
+    auto options = Opts(1 << 20, 1 << 20, 4096);
+    options.table_sync_ms = 0;
+    options.reclaim_interval_ms = 0;
+    const pid_t child = ::fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+      bool ok = false;
+      DiskSlabStore store(options, &ok);
+      const std::string value(4096, include_record ? 'r' : 'p');
+      const bool staged =
+          ok && dfkv::DiskSlabStoreTestPeer::WriteCrashStage(
+                    &store, K(80), value, include_record);
+      ::_exit(staged ? 0 : 1);
+    }
+    int child_status = 0;
+    ASSERT_EQ(::waitpid(child, &child_status, 0), child);
+    ASSERT_TRUE(WIFEXITED(child_status));
+    ASSERT_EQ(WEXITSTATUS(child_status), 0);
+
+    bool ok = false;
+    DiskSlabStore recovered(options, &ok);
+    ASSERT_TRUE(ok);
+    EXPECT_EQ(recovered.GetStats().unclean_resets, 1u);
+    EXPECT_EQ(recovered.Count(), 0u);
+    std::string out;
+    EXPECT_EQ(recovered.Range(K(80), 0, 4096, &out),
+              Status::kNotFound);
+  }
 }
 
 TEST_F(DiskSlabTest, OversizeValueRejected) {
@@ -375,12 +661,88 @@ TEST_F(DiskSlabTest, TableSyncCadenceCountsCycles) {
   EXPECT_EQ(s.GetStats().table_syncs, after);
 }
 
+TEST_F(DiskSlabTest, RecordWriteFailureFailsStoreClosed) {
+  auto opts = Opts(1 << 20, 1 << 20, 4096);
+  opts.table_sync_ms = 0;
+  opts.reclaim_interval_ms = 0;
+  bool ok = false;
+  DiskSlabStore s(opts, &ok);
+  ASSERT_TRUE(ok);
+  std::string value(3000, 'r');
+  ASSERT_EQ(s.Cache(K(1), value.data(), value.size()), Status::kOk);
+
+  dfkv::DiskSlabStoreTestPeer::BreakTableFd(&s);
+  EXPECT_EQ(s.Cache(K(2), value.data(), value.size()), Status::kIOError);
+  EXPECT_FALSE(s.Healthy());
+  EXPECT_TRUE(s.GetStats().failed);
+  EXPECT_EQ(s.GetStats().metadata_io_errors, 1u);
+  EXPECT_EQ(s.Count(), 1u);
+  std::string out;
+  EXPECT_EQ(s.Range(K(1), 0, 0, &out), Status::kIOError);
+  EXPECT_EQ(s.Remove(K(1)), Status::kIOError);
+}
+
+TEST_F(DiskSlabTest, TombstoneWriteFailureKeepsSlotAndFailsClosed) {
+  auto opts = Opts(1 << 20, 1 << 20, 4096);
+  opts.table_sync_ms = 0;
+  opts.reclaim_interval_ms = 0;
+  bool ok = false;
+  DiskSlabStore s(opts, &ok);
+  ASSERT_TRUE(ok);
+  std::string value(3000, 't');
+  ASSERT_EQ(s.Cache(K(1), value.data(), value.size()), Status::kOk);
+
+  dfkv::DiskSlabStoreTestPeer::BreakTableFd(&s);
+  EXPECT_EQ(s.Remove(K(1)), Status::kIOError);
+  EXPECT_FALSE(s.Healthy());
+  EXPECT_EQ(s.Count(), 1u);
+  EXPECT_EQ(s.GetStats().metadata_io_errors, 1u);
+}
+
+TEST_F(DiskSlabTest, TableSyncFailureFailsStoreClosed) {
+  auto opts = Opts(1 << 20, 1 << 20, 4096);
+  opts.table_sync_ms = 0;
+  opts.reclaim_interval_ms = 0;
+  bool ok = false;
+  DiskSlabStore s(opts, &ok);
+  ASSERT_TRUE(ok);
+  std::string value(3000, 's');
+  ASSERT_EQ(s.Cache(K(1), value.data(), value.size()), Status::kOk);
+
+  dfkv::DiskSlabStoreTestPeer::BreakTableFd(&s);
+  EXPECT_FALSE(dfkv::DiskSlabStoreTestPeer::SyncTableNow(&s));
+  EXPECT_FALSE(s.Healthy());
+  EXPECT_EQ(s.GetStats().table_syncs, 0u);
+  EXPECT_EQ(s.GetStats().metadata_io_errors, 1u);
+  EXPECT_EQ(s.Cache(K(2), value.data(), value.size()), Status::kIOError);
+}
+
+TEST_F(DiskSlabTest, EvictionRecordClearFailurePreservesResidents) {
+  auto options = Opts(4 * 4096, 4 * 4096, 4096);
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  bool ok = false;
+  DiskSlabStore store(options, &ok);
+  ASSERT_TRUE(ok);
+  std::string value(4000, 'e');
+  for (uint64_t i = 0; i < 4; ++i)
+    ASSERT_EQ(store.Cache(K(i), value.data(), value.size()), Status::kOk);
+
+  dfkv::DiskSlabStoreTestPeer::BreakTableFd(&store);
+  EXPECT_EQ(store.Cache(K(4), value.data(), value.size()),
+            Status::kIOError);
+  EXPECT_FALSE(store.Healthy());
+  EXPECT_EQ(store.Count(), 4u);
+  EXPECT_EQ(store.GetStats().metadata_io_errors, 1u);
+}
+
 // R2: in direct mode an UNALIGNED CacheDirect payload falls back to the
 // buffered path -- and the fallback is counted (the "page cache crept back
 // in" signal for direct deployments).
 TEST_F(DiskSlabTest, DioFallbackIsCounted) {
   auto opts = Opts(1 << 20, 1 << 20, 4096);
   opts.direct_writes = true;
+
   bool ok = false;
   DiskSlabStore s(opts, &ok);
   ASSERT_TRUE(ok);
@@ -389,11 +751,22 @@ TEST_F(DiskSlabTest, DioFallbackIsCounted) {
   ASSERT_EQ(s.CacheDirect(K(1), &v[0], v.size(), v.size()), Status::kOk);
   EXPECT_EQ(s.GetStats().dio_write_fallbacks, 1u);
 }
+TEST_F(DiskSlabTest, CleanEpochWriteFailureLeavesStoreFailed) {
+  auto options = Opts(1 << 20, 1 << 20, 4096);
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  bool ok = false;
+  DiskSlabStore store(options, &ok);
+  ASSERT_TRUE(ok);
+  dfkv::DiskSlabStoreTestPeer::BreakStateFd(&store);
+  EXPECT_FALSE(dfkv::DiskSlabStoreTestPeer::MarkCleanNow(&store));
+  EXPECT_FALSE(store.Healthy());
+  EXPECT_EQ(store.GetStats().metadata_io_errors, 1u);
+}
 
-// An extent STOLEN to a new class must not let the old class's stale records
-// (eviction leaves them CRC-valid by design) survive to the next rebuild --
-// pre-fix they could win the first-record scan and resurrect an old key
-// pointing at the NEW class's bytes (cross-class poisoning).
+// A whole extent stolen to a new class must durably wipe its prior slot-grid
+// before the allocator publishes the new class. Individual eviction tombstones
+// cannot describe grid positions the new class never uses.
 TEST_F(DiskSlabTest, RebindWipesStaleRecordsNoResurrectionAcrossRestart) {
   std::vector<int> absent_after_steal;
   std::string bval(8000, 'B');
@@ -413,8 +786,8 @@ TEST_F(DiskSlabTest, RebindWipesStaleRecordsNoResurrectionAcrossRestart) {
     for (int i = 0; i < 8; ++i)
       ASSERT_EQ(s.Cache(K(100 + i), a.data(), a.size()), Status::kOk);
     ASSERT_EQ(s.Count(), 8u);
-    // Class B (8192): pool empty -> STEAL an A extent (evicts its 4 residents,
-    // records left stale) -> with the fix, the rebind wipes that table region.
+    // Class B (8192): pool empty -> steal an A extent, durably wipe its
+    // prior slot grid, evict four residents, then bind it to B.
     ASSERT_EQ(s.Cache(K(500), bval.data(), bval.size()), Status::kOk);
     EXPECT_GE(s.GetStats().bind_wipes, 1u) << "steal rebind must wipe the region";
     for (int i = 0; i < 8; ++i)
@@ -456,6 +829,93 @@ TEST_F(DiskSlabTest, BackgroundReclaimerFreesSlotsOnFullStore) {
   // extents before the ring hits 100% — the latter now handles the common case.
   const auto st = s.GetStats();
   EXPECT_GT(st.reclaimed_slots + st.watermark_evictions, 0u) << "reclaimer never ran";
+}
+
+TEST_F(DiskSlabTest, WatermarkEvictionCannotEraseConcurrentRewriteCommit) {
+  setenv("DFKV_SLAB_EVICT_HIGH_PCT", "50", 1);
+  setenv("DFKV_SLAB_EVICT_LOW_PCT", "25", 1);
+  auto o = Opts(4 * 4096, 4 * 4096, 4096);
+  o.reclaim_interval_ms = 0;
+  o.table_sync_ms = 0;
+  bool ok = false;
+  DiskSlabStore s(o, &ok);
+  unsetenv("DFKV_SLAB_EVICT_HIGH_PCT");
+  unsetenv("DFKV_SLAB_EVICT_LOW_PCT");
+  ASSERT_TRUE(ok);
+
+  std::string old_value(4000, 'o');
+  for (uint64_t i = 1; i <= 4; ++i) {
+    ASSERT_EQ(s.Cache(K(i), old_value.data(), old_value.size()), Status::kOk);
+  }
+
+  std::string fresh_value(4000, 'n');
+  std::mutex done_mu;
+  std::condition_variable done_cv;
+  bool writer_started = false;
+  bool writer_done = false;
+  bool completed_during_eviction_window = false;
+  Status writer_status = Status::kIOError;
+  std::thread writer;
+
+  dfkv::DiskSlabStoreTestPeer::ReclaimNow(&s, [&] {
+    writer = std::thread([&] {
+      {
+        std::lock_guard<std::mutex> lk(done_mu);
+        writer_started = true;
+      }
+      done_cv.notify_all();
+      const Status st =
+          s.Cache(K(1), fresh_value.data(), fresh_value.size());
+      {
+        std::lock_guard<std::mutex> lk(done_mu);
+        writer_status = st;
+        writer_done = true;
+      }
+      done_cv.notify_all();
+    });
+
+    std::unique_lock<std::mutex> lk(done_mu);
+    ASSERT_TRUE(done_cv.wait_for(lk, std::chrono::seconds(2),
+                                 [&] { return writer_started; }));
+    completed_during_eviction_window = done_cv.wait_for(
+        lk, std::chrono::milliseconds(250), [&] { return writer_done; });
+  });
+
+  ASSERT_TRUE(writer.joinable());
+  writer.join();
+  EXPECT_FALSE(completed_during_eviction_window);
+  EXPECT_EQ(writer_status, Status::kOk);
+
+  std::string out;
+  ASSERT_EQ(s.Range(K(1), 0, fresh_value.size(), &out), Status::kOk);
+  EXPECT_EQ(out, fresh_value);
+}
+
+TEST_F(DiskSlabTest, WatermarkEvictionsStayDeadAcrossCleanRestart) {
+  ::setenv("DFKV_SLAB_EVICT_HIGH_PCT", "50", 1);
+  ::setenv("DFKV_SLAB_EVICT_LOW_PCT", "25", 1);
+  auto options = Opts(4 * 4096, 4 * 4096, 4096);
+  options.reclaim_interval_ms = 0;
+  options.table_sync_ms = 0;
+  {
+    bool ok = false;
+    DiskSlabStore store(options, &ok);
+    ::unsetenv("DFKV_SLAB_EVICT_HIGH_PCT");
+    ::unsetenv("DFKV_SLAB_EVICT_LOW_PCT");
+    ASSERT_TRUE(ok);
+    std::string value(4000, 'e');
+    for (uint64_t i = 0; i < 4; ++i)
+      ASSERT_EQ(store.Cache(K(i), value.data(), value.size()), Status::kOk);
+    dfkv::DiskSlabStoreTestPeer::ReclaimNow(&store, {});
+    EXPECT_EQ(store.Count(), 0u);
+    EXPECT_EQ(store.GetStats().eviction_record_clears, 4u);
+  }
+
+  bool ok = false;
+  DiskSlabStore reopened(options, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(reopened.Count(), 0u);
+  for (uint64_t i = 0; i < 4; ++i) EXPECT_FALSE(reopened.IsCached(K(i)));
 }
 
 // Class rebalance regression (the "new value size retains only a sliver of its

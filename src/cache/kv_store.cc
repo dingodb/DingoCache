@@ -206,60 +206,121 @@ bool PreadRangeDirect(int fd, uint64_t offset, size_t n, char* dst) {
 }  // namespace
 
 KVStore::KVStore(Options opt) : opt_(std::move(opt)) {
+  if (opt_.cache_dir.empty()) {
+    startup_error_ = "cache directory is empty";
+    return;
+  }
+  if (opt_.capacity_bytes == 0) {
+    startup_error_ = "capacity_bytes must be non-zero";
+    return;
+  }
+
   // Adapt the shard count to capacity: each shard should own a meaningful slice
-  // (>= kMinShardBytes) so a single value can't exceed its shard's capacity (which
-  // would make it un-cacheable). A tiny cache collapses to 1 shard; a large one
-  // uses the full requested fan-out. opt_.shards==1 is honored exactly.
-  constexpr uint64_t kMinShardBytes = 64ull << 20;  // 64 MiB per shard floor
+  // (>= kMinShardBytes) so a single value can't exceed its shard's capacity.
+  constexpr uint64_t kMinShardBytes = 64ull << 20;
   const size_t want = opt_.shards ? opt_.shards : 1;
   size_t fit = static_cast<size_t>(opt_.capacity_bytes / kMinShardBytes);
   if (fit < 1) fit = 1;
   const size_t n = want < fit ? want : fit;
   shards_.reserve(n);
-  const uint64_t base = opt_.capacity_bytes / n, rem = opt_.capacity_bytes % n;
+  const uint64_t base = opt_.capacity_bytes / n;
+  const uint64_t rem = opt_.capacity_bytes % n;
   for (size_t i = 0; i < n; ++i) {
     auto sh = std::make_unique<Shard>();
-    sh->capacity = base + (i < rem ? 1 : 0);  // spread remainder so the sum == capacity
+    sh->capacity = base + (i < rem ? 1 : 0);
     shards_.push_back(std::move(sh));
   }
-  fs::create_directories(opt_.cache_dir);
-  RebuildIndex();
+
+  std::error_code ec;
+  fs::create_directories(opt_.cache_dir, ec);
+  if (ec || !fs::is_directory(opt_.cache_dir, ec)) {
+    startup_error_ = "cannot create or access cache directory";
+    return;
+  }
+  healthy_ = RebuildIndex();
 }
 
 KVStore::Shard& KVStore::ShardFor(const std::string& fname) const {
   return *shards_[std::hash<std::string>{}(fname) % shards_.size()];
 }
 
-void KVStore::RebuildIndex() {  // constructor-time, single-threaded: no locks
+bool KVStore::RebuildIndex() {  // constructor-time, single-threaded: no locks
   std::error_code ec;
-  if (!fs::exists(opt_.cache_dir, ec)) return;
-  // A crash between WriteFileDirect and the atomic rename (every rolling upgrade
-  // kills a process mid-flight) leaves an orphan ".tmp": it is never indexed,
-  // never counted toward capacity, and thus never evicted -- a permanent disk
-  // leak that accumulates across restarts. Delete them on startup instead of
-  // just skipping. A published block's name is purely digits ("id_index_size")
-  // and never contains '.', so ".tmp" can only be an orphan -- no false delete.
+  const fs::path root(opt_.cache_dir);
+  if (!fs::exists(root, ec) || ec) {
+    startup_error_ = "cache directory disappeared during startup";
+    return false;
+  }
+
   std::vector<fs::path> orphans;
-  for (auto it = fs::recursive_directory_iterator(opt_.cache_dir, ec);
-       !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
-    if (!it->is_regular_file(ec)) continue;
-    std::string fname = it->path().filename().string();
-    if (fname.size() >= 4 && fname.substr(fname.size() - 4) == ".tmp") {
+  fs::recursive_directory_iterator it(root, ec);
+  if (ec) {
+    startup_error_ = "cannot traverse cache directory";
+    return false;
+  }
+  for (; it != fs::recursive_directory_iterator(); it.increment(ec)) {
+    if (ec) {
+      startup_error_ = "cannot traverse cache directory";
+      return false;
+    }
+    const fs::file_status symlink_status = it->symlink_status(ec);
+    if (ec || fs::is_symlink(symlink_status)) {
+      startup_error_ = "cache directory contains an unreadable entry or symlink";
+      return false;
+    }
+    const fs::path rel = it->path().lexically_relative(root);
+    if (rel.empty()) {
+      startup_error_ = "cannot resolve cache directory entry";
+      return false;
+    }
+    const bool regular = fs::is_regular_file(symlink_status);
+    const std::string fname = it->path().filename().string();
+    if (regular && fname.size() >= 4 &&
+        fname.substr(fname.size() - 4) == ".tmp") {
       orphans.push_back(it->path());
       continue;
     }
-    uint64_t sz = static_cast<uint64_t>(fs::file_size(it->path(), ec));
+    if (*rel.begin() != fs::path("blocks")) {
+      startup_error_ =
+          "cache directory contains a different store layout: " + rel.string();
+      return false;
+    }
+    if (!regular) {
+      if (!fs::is_directory(symlink_status)) {
+        startup_error_ = "cache layout contains a non-file entry";
+        return false;
+      }
+      continue;
+    }
+    const uint64_t sz = static_cast<uint64_t>(fs::file_size(it->path(), ec));
+    if (ec) {
+      startup_error_ = "cannot stat cached block";
+      return false;
+    }
     Shard& sh = ShardFor(fname);
+    auto [entry, inserted] =
+        sh.index.try_emplace(fname, it->path().string(), sz);
+    if (!inserted) {
+      startup_error_ = "duplicate cached block filename: " + fname;
+      return false;
+    }
     sh.ring.push_front(fname);
-    auto res = sh.index.try_emplace(fname, it->path().string(), sz);
-    res.first->second.it = sh.ring.begin();  // O(1) removal handle
+    entry->second.it = sh.ring.begin();
     sh.used_bytes += sz;
   }
-  // Reclaim outside the iteration so removal can't perturb the directory walk.
-  for (const auto& p : orphans) {
-    std::error_code rc;
-    if (fs::remove(p, rc)) tmp_reclaimed_.fetch_add(1, std::memory_order_relaxed);
+  if (ec) {
+    startup_error_ = "cannot traverse cache directory";
+    return false;
   }
+  for (const auto& path : orphans) {
+    ec.clear();
+    if (!fs::remove(path, ec) || ec) {
+      startup_error_ = "cannot reclaim orphan temporary file";
+      return false;
+    }
+    tmp_reclaimed_.fetch_add(1, std::memory_order_relaxed);
+  }
+  return true;
 }
 
 // Advance the CLOCK hand one step toward the front (newer). Past the front,
@@ -359,6 +420,7 @@ void KVStore::ForceEvictLocked(Shard& sh, uint64_t target,
 }
 
 Status KVStore::Cache(const BlockKey& key, const void* data, size_t len) {
+  if (!healthy_) return Status::kIOError;
   if (data == nullptr && len != 0) return Status::kInvalid;
   const std::string fname = key.Filename();
   Shard& sh = ShardFor(fname);
@@ -415,6 +477,7 @@ Status KVStore::Cache(const BlockKey& key, const void* data, size_t len) {
 }
 
 Status KVStore::Remove(const BlockKey& key) {
+  if (!healthy_) return Status::kIOError;
   const std::string fname = key.Filename();
   Shard& sh = ShardFor(fname);
   std::string trash;
@@ -438,6 +501,7 @@ Status KVStore::Remove(const BlockKey& key) {
 
 Status KVStore::CacheDirect(const BlockKey& key, char* data, size_t len,
                             size_t cap) {
+  if (!healthy_) return Status::kIOError;
   if (data == nullptr && len != 0) return Status::kInvalid;
   const std::string fname = key.Filename();
   Shard& sh = ShardFor(fname);
@@ -473,6 +537,7 @@ Status KVStore::CacheDirect(const BlockKey& key, char* data, size_t len,
 
 Status KVStore::Range(const BlockKey& key, uint64_t offset, uint64_t length,
                       std::string* out) {
+  if (!healthy_) return Status::kIOError;
   // The lock protects the in-memory index/ring, NOT the bulk file read. The GET
   // hot path takes a SHARED lock (concurrent reads per shard) and only flips the
   // entry's CLOCK bit; it opens the file under the lock so a concurrent eviction
@@ -506,6 +571,7 @@ Status KVStore::Range(const BlockKey& key, uint64_t offset, uint64_t length,
 Status KVStore::RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,
                           char* dst, size_t dst_cap, size_t* out_len) {
   *out_len = 0;
+  if (!healthy_) return Status::kIOError;
   Fd fd;
   uint64_t fsize = 0;
   {  // index lookup + open under a SHARED lock; bulk read outside (see Range)
@@ -534,6 +600,7 @@ Status KVStore::RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,
 Status KVStore::RangeDirect(const BlockKey& key, uint64_t offset, uint64_t length,
                             char* io_buf, size_t io_cap, const char** out_data,
                             size_t* out_len) {
+  if (!healthy_) return Status::kIOError;
   *out_data = nullptr;
   *out_len = 0;
   Fd fd;
@@ -567,6 +634,7 @@ Status KVStore::RangeDirect(const BlockKey& key, uint64_t offset, uint64_t lengt
 Status KVStore::RangeDirectPrep(const BlockKey& key, uint64_t offset,
                                 uint64_t length, size_t io_cap,
                                 RangePrep* out) {
+  if (!healthy_) return Status::kIOError;
   *out = RangePrep{};
   int raw_fd = -1;  // released to the caller on kOk; closed here on every error
   uint64_t fsize = 0;
@@ -609,6 +677,7 @@ Status KVStore::RangeDirectPrep(const BlockKey& key, uint64_t offset,
 }
 
 bool KVStore::IsCached(const BlockKey& key) const {
+  if (!healthy_) return false;
   const std::string fname = key.Filename();
   Shard& sh = ShardFor(fname);
   std::shared_lock<std::shared_mutex> rl(sh.mu);

@@ -43,6 +43,10 @@ struct RangePrep {
 class StoreEngine {
  public:
   virtual ~StoreEngine() = default;
+  // Construction cannot return a Status; startup health is therefore explicit.
+  // A node must refuse readiness when any configured engine is unhealthy.
+  virtual bool Healthy() const = 0;
+  virtual const std::string& StartupError() const = 0;
 
   virtual Status Cache(const BlockKey& key, const void* data, size_t len) = 0;
   virtual Status CacheDirect(const BlockKey& key, char* data, size_t len,
