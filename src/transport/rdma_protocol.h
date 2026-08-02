@@ -70,6 +70,15 @@ inline size_t V2SlotSize(uint64_t max_block_bytes) {
                  kV2DataOffset);
 }
 
+// A server is not ready unless its process-wide segment can accept at least
+// one depth-1 connection at the maximum block size it advertises. Starting
+// with less capacity turns every valid data handshake into a late rejection.
+inline bool V2RecvSegmentFitsOneSlot(size_t segment_bytes,
+                                     uint64_t max_block_bytes) {
+  const size_t slot_size = V2SlotSize(max_block_bytes);
+  return slot_size != 0 && segment_bytes >= slot_size;
+}
+
 // WRITE_WITH_IMM completion length is the only proof that the peer overwrote
 // the whole v2 PUT frame in its leased slot. Require an exact frame; accepting a
 // short write would expose stale bytes from the slot's previous generation.

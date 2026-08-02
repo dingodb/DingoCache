@@ -133,8 +133,21 @@ Status RdmaServer::Start(int port) {
   config_dump::RecordResolved("DFKV_RDMA_DEV", resolved_devices);
   // Allocate the mandatory process-wide receive segment before opening anchors.
   recv_segment_bytes_ = RecvSegmentBytes();
-  if (recv_segment_bytes_ == 0 ||
-      !recv_segment_.Init(recv_segment_bytes_, rdma::kV2DataOffset)) {
+  const size_t min_slot_bytes = rdma::V2SlotSize(max_msg_);
+  if (!rdma::V2RecvSegmentFitsOneSlot(recv_segment_bytes_, max_msg_)) {
+    DFKV_LOG_ERROR(
+        "rdma: configured v2 receive segment (" +
+        std::to_string(recv_segment_bytes_) +
+        " bytes) cannot fit one complete slot (" +
+        std::to_string(min_slot_bytes) + " bytes) at server max block " +
+        std::to_string(max_msg_) +
+        " bytes; raise DFKV_RDMA_RECV_SEGMENT_SIZE or lower --max-msg");
+    recv_segment_bytes_ = 0;
+    ::close(listen_fd_);
+    listen_fd_ = -1;
+    return Status::kIOError;
+  }
+  if (!recv_segment_.Init(recv_segment_bytes_, rdma::kV2DataOffset)) {
     DFKV_LOG_ERROR("rdma: unable to allocate required v2 receive segment (" +
                    std::to_string(recv_segment_bytes_) + " bytes)");
     recv_segment_bytes_ = 0;
@@ -688,7 +701,7 @@ void RdmaServer::Serve(int boot_fd) {
     if (fields.op == static_cast<uint8_t>(WireOp::kCache) &&
         cache_direct_handler_) {
       if (!direct_buffer(request.data_slot) ||
-          !direct_mr(request.data_slot) ||
+          !direct_mr(request.data_slot) || fields.payload_len == 0 ||
           fields.payload_len > static_cast<uint64_t>(logical_data_cap))
         return invalid_reply();
 
