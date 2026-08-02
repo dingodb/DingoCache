@@ -523,6 +523,12 @@ GpuNodeDedup::Role GpuNodeDedup::ClaimSg(const BlockKey& key, const Seg* segs,
     }
   }
   if (Slot* mine = Reserve(key)) {
+    // Concurrent lockstep claimers can reserve two slots for one key when the
+    // second Find races the first identity write (a roughly 100 ns window,
+    // observed live as exactly twice as many server reads as unique keys).
+    // Re-scan immediately and after a short settle spin. The lowest probe
+    // position is canonical because it is what every waiter finds; a
+    // non-canonical winner releases its slot and waits.
     for (int pass = 0; pass < 2; ++pass) {
       Slot* first = Find(key);
       if (first && first != mine) {
@@ -555,6 +561,8 @@ void GpuNodeDedup::PublishSg(const BlockKey& key, uint64_t token,
   auto abandon = [&] { s->state.store(kStateEmpty, std::memory_order_release); };
   if (n == 0 || n > arena_bytes_ / 2) return abandon();
   ProcEntry& e = reg_[self_idx_];
+  // Ring-allocate on this process's arena cursor. Skip the tail remainder when
+  // a lap boundary would split one payload, matching the host rendezvous.
   uint64_t cur = e.alloc_cursor.load(std::memory_order_relaxed);
   uint64_t off, seq;
   for (;;) {
@@ -568,7 +576,10 @@ void GpuNodeDedup::PublishSg(const BlockKey& key, uint64_t token,
       break;
     }
   }
-  // Gather on the rendezvous stream and synchronize before READY.
+  // Gather caller-owned device segments into the rendezvous arena on its
+  // private CUDA stream, then synchronize before publishing READY. Without the
+  // synchronization, peers can copy stale arena bytes; this was observed as
+  // silently corrupted KV payloads rather than a transport error.
   CUstream st = Stream();
   if (!st) return abandon();
   size_t done = 0;

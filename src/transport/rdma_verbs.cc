@@ -239,6 +239,9 @@ QpInfo ParseQpInfo(const char in[kQpInfoBytes]) {
   q.psn = net::GetU32(in + 4);
   std::memcpy(&q.lid, in + 8, 2);
   std::memcpy(q.gid, in + 10, 16);
+  // The six-byte pad was deterministic zero before negotiation metadata
+  // existed. DPQ1 plus the depth high bit therefore provides an exact v2
+  // signal without changing the fixed bootstrap frame length.
   if (net::GetU32(in + 26) == kQpDepthMagic) {
     uint16_t depth = 0;
     std::memcpy(&depth, in + 30, 2);
@@ -555,6 +558,10 @@ bool RcEndpoint::StagePoolMr(void* base, size_t size, bool remote_write,
       return true;
     }
   }
+  // Register on the process-wide shared PD, then cache the shared MR in this
+  // endpoint for lock-free datapath range lookup. New entries go first because
+  // an access upgrade covering the same range must win over an older
+  // LOCAL_WRITE-only registration.
   ibv_mr* mr = SharedAddPoolMr(ctx_, pd_, base, size, access);
   if (!mr) return false;
   pool_mr_.insert(pool_mr_.begin(), PoolMr{b, size, access, mr});

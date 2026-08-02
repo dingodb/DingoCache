@@ -75,10 +75,13 @@ class UringReader {
   // The caller keeps the connection alive on the synchronous fallback instead.
   bool poisoned() const { return poisoned_; }
 
-  // Reap-and-discard every read the kernel has accepted. A non-negative timeout
-  // bounds each wait and lets the serve loop abandon a connection promptly.
-  // timeout_ms < 0 blocks without a deadline and is used by the destructor so
-  // destination staging is never released while the kernel still owns it.
+  // Reap and discard every read the kernel accepted. This is mandatory after a
+  // failed BatchRead before any destination is touched, reused or freed: an
+  // in-flight read still owns the buffer and can write into it. A non-negative
+  // timeout bounds each wait so the serve loop can abandon the connection; if
+  // it expires, registered destinations must remain alive through endpoint
+  // teardown. timeout_ms < 0 blocks without a deadline and is used by the
+  // destructor so staging memory is never released while the kernel owns it.
   bool Drain(int timeout_ms = 5000) {
     if (!ok_) return true;
     while (inflight_ > 0) {

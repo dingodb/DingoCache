@@ -32,10 +32,14 @@ namespace rdma {
 
 // QP connection info exchanged over the TCP bootstrap channel (fixed 32 bytes,
 // little-endian). lid==0 selects GRH/GID routing; otherwise IB LID routing.
-// The final six bytes are mandatory v2 negotiation metadata:
-// DPQ1 magic at [26,30), followed by a u16 depth with its high bit set.
-// depth advertises how many in-flight requests the peer's posted receives can
-// absorb; zero or a missing v2 bit is a protocol mismatch.
+//
+// Wire layout: qpn u32 | psn u32 | lid u16 | gid[16] | pad[6]. The frame length
+// cannot grow without breaking bootstrap framing, so v2 reuses the historically
+// zeroed pad: DPQ1 magic at [26,30), then a u16 receive depth whose high bit is
+// the mandatory v2 marker. The depth is how many in-flight requests the peer's
+// posted receives can absorb. Posting beyond it causes RNR retries and silent
+// throughput collapse; zero, absent magic or a missing high bit is therefore a
+// protocol mismatch, not a legacy default.
 struct QpInfo {
   uint32_t qpn = 0;
   uint32_t psn = 0;

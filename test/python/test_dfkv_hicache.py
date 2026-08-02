@@ -518,11 +518,12 @@ class DingoFSHiCacheTest(unittest.TestCase):
         self.assertEqual(m["set_v2_bytes"], 0)
 
     def test_v2_follower_rank_writes_rank_sharded_pool(self):
-        # Kimi-K3 (hybrid MLA + KDA/mamba): the mamba state pool is rank-sharded,
-        # so a follower rank MUST persist its own shard -- backup_skip applies
-        # only to replicated pools. Component coordinates and sharding are
-        # inferred from the physical host-pool layout, not model names.
-        # real I/O instead of being gated wholesale on tp_rank.
+        # Kimi-K3 hybrid recurrent state is rank-sharded, so every follower rank
+        # must persist its own temporal/conv bytes. backup_skip applies only to
+        # physically replicated pools. Component coordinates and sharding are
+        # inferred from the registered host layout rather than model names; the
+        # v2 metrics must therefore record real follower I/O instead of gating
+        # every nonzero TP rank.
         from sglang.srt.mem_cache.hicache_storage import PoolTransfer
         T, C = 4096, 512  # temporal / conv bytes per page (shape-agnostic)
         members, _, _ = self._node("v2ranksharded")

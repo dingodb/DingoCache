@@ -269,7 +269,11 @@ class Transport {
   }
 
   // Scatter-gather read: raw stored bytes are split across each key's caller
-  // buffers in order. out_lens[i] receives the authoritative stored size.
+  // buffers in order. The default implementation reads once into a contiguous
+  // scratch value and split-copies it, so every transport is correct without
+  // scatter support. RDMA overrides this with a multi-SGE receive directly into
+  // registered destinations. out_lens[i] is the authoritative stored length
+  // (zero on miss), independent of destination capacity.
   virtual std::vector<Status> RangeIntoMulti(
       const std::string& node, const std::vector<BlockKey>& keys,
       const std::vector<RangeDstMulti>& dsts,

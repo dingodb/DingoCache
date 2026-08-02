@@ -431,6 +431,8 @@ TEST_F(DiskSlabTest, LayoutMismatchRefusesAndPreservesExistingData) {
     EXPECT_FALSE(mismatched.Healthy());
     EXPECT_FALSE(mismatched.StartupError().empty());
   }
+  // The failed mismatched open must be read-only: the original geometry and
+  // payload remain available when reopened with the matching contract.
   bool ok = false;
   DiskSlabStore reopened(Opts(1 << 20, 1 << 20, 4096), &ok);
   ASSERT_TRUE(ok);

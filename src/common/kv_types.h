@@ -59,6 +59,8 @@ struct BlockKey {
     return true;
   }
 
+  // Hierarchical object path: blocks/{first byte}/{first two bytes}/{filename}.
+  // The deterministic prefix buckets match the production object-store layout.
   std::string StoreKey() const {
     const std::string filename = Filename();
     return "blocks/" + filename.substr(0, 2) + "/" +

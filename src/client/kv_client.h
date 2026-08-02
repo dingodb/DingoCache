@@ -208,6 +208,9 @@ class KVClient {
   std::vector<bool> BatchExistDirect(const std::vector<std::string>& keys,
                                      std::vector<Status>* statuses);
   GpuNodeDedup* GpuDedup(const void* device_dst_hint);
+  // Record one public batch operation (hits are the true flags) and return the
+  // item results. Centralizing this at each public return point prevents direct
+  // and same-host-rendezvous paths from double-counting or escaping metrics.
   std::vector<bool> RecordBatch(OpMetrics::Op op,
                                 std::chrono::steady_clock::time_point t0,
                                 std::vector<bool> flags, uint64_t bytes);

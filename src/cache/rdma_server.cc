@@ -375,6 +375,9 @@ void RdmaServer::Serve(int boot_fd) {
     return;
   }
 
+  // The client sends QpInfo first. Read and validate its mandatory v2 depth
+  // before allocating per-connection control slots or leasing shared receive
+  // space; a client advertising depth 1 must consume one slot, not ServerDepth.
   char peer[rdma::kQpInfoBytes];
   if (!net::ReadAll(boot_fd, peer, sizeof(peer))) {
     ::close(boot_fd);
@@ -429,6 +432,9 @@ void RdmaServer::Serve(int boot_fd) {
                 " qd=" + std::to_string(K));
   numa::PinThreadToNode(ep.numa_node());
 
+  // QP bootstrap: the peer geometry was consumed before allocation above.
+  // Advertise this endpoint's clamped depth, then connect the correctly sized
+  // QP; neither side may infer legacy defaults.
   char mine[rdma::kQpInfoBytes];
   rdma::QpInfo my = ep.Local();
   my.depth = static_cast<uint16_t>(std::min<size_t>(K, 256));
@@ -452,6 +458,9 @@ void RdmaServer::Serve(int boot_fd) {
     ::close(boot_fd);
     return;
   }
+  // Receives must be posted before readiness becomes visible. Publish the
+  // leased receive-segment address, rkey and slot geometry only after the QP is
+  // armed, so the client cannot issue a one-sided write into an unready slot.
   char ready = 1;
   const rdma::RecvSegmentInfo info{
       reinterpret_cast<uint64_t>(recv_lease.data()),

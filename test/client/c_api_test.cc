@@ -1,3 +1,7 @@
+// C ABI guard tests: the FFI boundary must reject null handles and arrays and
+// must never pass a null pointer to std::string (undefined behavior). They use
+// a discovery-only client with an empty ring, so routing fails locally and no
+// cache server is required.
 #include "client/dfkv_c_api.h"
 #include "client/key_map.h"
 #include "client/kv_client.h"

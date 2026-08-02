@@ -50,8 +50,12 @@ _log = logging.getLogger(__name__)
 
 _FLAG_IS_MLA = 0x1
 
-# Scatter width is an explicit physical-key field; clients with different HCA
-# limits safely miss instead of interpreting a different layer grouping.
+# Historical/default width: ConnectX-era max_sge=30 and SGE[0] carries the wire
+# prefix, leaving 29 payload segments. The live width comes from
+# dfkv_max_sg_segs and is encoded in the binary physical key. It is therefore a
+# compatibility boundary, not just a local batching knob: clients with
+# different HCA limits safely miss instead of interpreting a different layer
+# grouping. Mirrors the vLLM connector's default and reasoning.
 SG_DEFAULT_WIDTH = 29
 
 
@@ -716,6 +720,10 @@ class DfkvHiCache(HiCacheStorage):
         if max_segs < 1:
             return False
         if max_segs < layer_num:
+            # A page is split into ceil(layer_num/max_segs) physical scatter
+            # groups by _flatten_device. This is the same grouping used by the
+            # vLLM connector, so a narrower HCA costs extra keys and operations
+            # per page without disabling device-direct transfer.
             print(f"[dfkv] L2-bypass: max_sg_segs={max_segs} < layer_num="
                   f"{layer_num}; chunking each page into "
                   f"{(layer_num + max_segs - 1) // max_segs} scatter groups.",
@@ -1387,9 +1395,15 @@ class DfkvHiCache(HiCacheStorage):
         for tr in transfers:
             name = str(tr.name)
             keys = tr.keys or []
-            # Only rank 0 writes replicated pools. Sharded pools are inferred
-            # from their physical host layout at registration (MHA K/V or
-            # recurrent temporal/conv state), not from model names.
+            # Only rank 0 writes physically replicated pools. A follower must
+            # still write rank-sharded state: MHA K/V shards and recurrent
+            # temporal/conv components hold different bytes on every rank.
+            # Skipping those writes loses 15/16 of a TP16 Kimi-K3 recurrent
+            # state and can silently change generated output after an L3 hit.
+            # Replication is inferred from the registered host layout, not a
+            # model-name allowlist, and _pool_keys carries the matching
+            # component/rank coordinates. Thus the write gate and collision
+            # isolation derive from the same physical contract.
             if (putting and self.is_mla and self.tp_rank != 0
                     and self._pool_is_replicated(name)):
                 results[name] = [True] * len(keys)
@@ -1538,6 +1552,11 @@ class DfkvHiCache(HiCacheStorage):
         if now - getattr(self, "_read_reject_logged", 0.0) < 30.0:
             return
         self._read_reject_logged = now
+        # On an all-page miss, capture the native client snapshot immediately.
+        # Server cache counters cannot distinguish "objects absent" from
+        # "requests never reached the server"; served-op, I/O-error and peer
+        # health evidence exists only in this per-client snapshot and is not
+        # recoverable from the server's Prometheus metrics after the fact.
         if all(h != 1 for h in hits[:nmain]):
             try:
                 snap = _read_snapshot(self._lib, self._h)

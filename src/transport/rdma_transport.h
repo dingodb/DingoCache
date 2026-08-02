@@ -147,8 +147,11 @@ class RdmaTransport : public Transport {
   // min over rails of (negotiated max_sge) - 1; set once in the ctor.
   size_t sg_payload_segs_ = 29;
   size_t max_payload_;
-  // Maximum block declared during v2 negotiation. The shared receive-segment
-  // geometry requires this declaration to be exact and nonzero.
+  // Maximum block declared during mandatory v2 negotiation. It is both a
+  // protocol bound and receive-segment geometry: each data connection leases
+  // queue_depth * aligned_slot_size from one fixed pinned segment. Inflating
+  // this value reduces connection capacity; understating it deterministically
+  // rejects larger operations. It must therefore be exact and nonzero.
   uint64_t declared_ = 0;
   size_t OpBound() const {  // per-op payload bound honoring the declaration
     return declared_ ? static_cast<size_t>(declared_) : max_payload_;
@@ -165,10 +168,12 @@ class RdmaTransport : public Transport {
   size_t depth_;
   int connect_ms_ = 3000;             // bootstrap TCP connect timeout (DFKV_RDMA_CONNECT_MS)
   int io_ms_ = 10000;                 // bootstrap TCP IO timeout (DFKV_RDMA_IO_MS)
-  // Per-window datapath completion deadline (DFKV_RDMA_OP_TIMEOUT_MS). A finite
-  // timeout prevents a stalled QP from freezing the caller indefinitely; the
-  // failed connection is destroyed and charged to its rail policy. An explicit
-  // non-positive value disables the deadline.
+  // Per-window datapath completion deadline (DFKV_RDMA_OP_TIMEOUT_MS).
+  // WaitComp otherwise blocks forever when an RC peer disappears without a
+  // completion or a QP stalls in retries. On timeout the entire connection is
+  // destroyed before transient MRs are released, the failed window is reported,
+  // and the public operation may retry once on a fresh connection. An explicit
+  // non-positive value restores the unbounded wait as an operator escape hatch.
   int op_timeout_ms_ = 5000;          // datapath completion timeout (DFKV_RDMA_OP_TIMEOUT_MS)
   // Batch-window override (DFKV_RDMA_BATCH_OP_TIMEOUT_MS) used by every
   // multi-item window: CacheMany, RangeMany, ExistMany, CacheFrom, RangeInto,

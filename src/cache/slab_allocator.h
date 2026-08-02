@@ -1,4 +1,22 @@
-/* SlabAllocator — media-agnostic slot lifecycle manager for the slab store. */
+/* SlabAllocator — media-agnostic slot lifecycle manager for the slab store.
+ *
+ * It owns the LAYOUT (extent, slot and byte offset) of fixed-size slots, not
+ * the bytes themselves. DiskSlabStore and RamTier map each returned SlotRef to
+ * their own physical medium and perform I/O outside this class. Keeping the
+ * allocator pure logic makes its lifecycle, reclaim and recovery invariants
+ * hermetically testable while sharing one policy across disk and RAM.
+ *
+ * The pool consists of equal-size extents. Each bound extent belongs to one
+ * size class and is carved into uniform slots. A value is placed in the
+ * smallest existing class that can hold its aligned length without exceeding
+ * max_waste; otherwise a canonical class is created. Full pools reclaim with
+ * CLOCK second chance and may rebind an entirely unpinned cold extent to a
+ * needy class. A pinned slot is never evicted.
+ *
+ * Concurrency: one mutex protects the allocator's dense metadata, intrusive
+ * rings and native BlockKey index. Medium I/O and persistence callbacks run
+ * under the caller's lifecycle protocol; they must not create a second source
+ * of truth for residency. */
 #ifndef DFKV_SLAB_ALLOCATOR_H_
 #define DFKV_SLAB_ALLOCATOR_H_
 
@@ -15,6 +33,7 @@ namespace dfkv {
 
 class SlabAllocator {
  public:
+  // Physical placement of a key's value. `offset` is within extent `extent`.
   struct SlotRef {
     uint32_t cls = 0;
     uint32_t extent = 0;
@@ -30,11 +49,17 @@ class SlabAllocator {
     uint64_t extent_bytes = (1ull << 30);
     uint32_t num_extents = 8;
     uint32_t align = 4096;
+    // Reuse an existing larger class when its internal waste
+    // (slot_size - aligned_len) stays below this fraction.
     double max_waste = 0.25;
     std::function<bool(uint32_t extent)> on_extent_bind;
     std::function<bool(const SlotRef&)> on_slot_evict;
   };
 
+  // Target write parallelism per class: Put keeps up to this many extents with
+  // free slots so concurrent writers stripe across inodes. This is also the
+  // per-class capacity floor for rebalance: a donor is never shrunk below its
+  // striping width.
   static constexpr size_t kStripeWays = 8;
 
   explicit SlabAllocator(Options opt);
@@ -77,6 +102,13 @@ class SlabAllocator {
   std::vector<ClassStat> Classes() const;
   uint32_t PoolExtents() const;
 
+  // Evict up to `max_victims` unpinned entries from `cls_index` in CLOCK order
+  // until the class has at least `target_free` slots. The bounded background
+  // sweep keeps Put on the pop-free-slot fast path. It is a no-op while an
+  // unbound extent remains, because binding grows capacity without losing
+  // residency. If reclaim frees an entire extent, stop before cascading into a
+  // second class shrink. Evicted keys are returned so the caller can remove its
+  // payload index in the same lifecycle transaction.
   size_t ReclaimClass(size_t cls_index, size_t target_free, size_t max_victims,
                       std::vector<BlockKey>* evicted);
   bool StealFrom(size_t donor_cls, size_t target_cls,
@@ -89,6 +121,11 @@ class SlabAllocator {
   uint64_t Steals() const;
   uint64_t ColdSteals() const;
   uint64_t WatermarkEvictions() const;
+  // Proactive watermark eviction: while useful bytes exceed `target_bytes`,
+  // return the globally coldest fully unpinned extent, ordered by decayed read
+  // heat and then recency. Each call is bounded by `max_extents` so the
+  // reclaimer never monopolizes the allocator lock. Keeping headroom ahead of
+  // demand prevents a write burst from synchronously self-evicting a full pool.
   size_t EvictColdToTarget(uint64_t target_bytes, size_t max_extents,
                            std::vector<BlockKey>* evicted);
   uint64_t ExtentReturns() const;
@@ -139,6 +176,10 @@ class SlabAllocator {
   struct Class {
     uint32_t slot_size = 0;
     uint32_t slots_per_extent = 0;
+    // Free slots are bucketed per extent and selected round-robin, so
+    // consecutive Puts land on different files. A single free stack would hand
+    // out one extent back-to-back and serialize buffered writes on the
+    // filesystem's per-inode lock (measured 2.1 vs 18.2 GB/s at 8 writers).
     std::unordered_map<uint32_t, std::vector<uint32_t>> free_by_ext;
     std::vector<uint32_t> ext_rr;
     size_t rr_next = 0;
@@ -159,6 +200,9 @@ class SlabAllocator {
     uint32_t free_slots = 0;
     uint32_t total_slots = 0;
     uint32_t pinned = 0;
+    // Newest insert sequence among residents (0 means empty). Freeing a slot
+    // never lowers it: the conservative age prevents an extent from appearing
+    // colder than a recently inserted survivor.
     uint64_t youngest_seq = 0;
     uint64_t useful_bytes = 0;
     uint64_t read_heat = 0;
