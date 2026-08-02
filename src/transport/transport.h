@@ -147,7 +147,7 @@ class Transport {
     std::vector<Status> r;
     r.reserve(items.size());
     for (const auto& it : items) {
-      r.push_back(ValidBuffer(it.data, it.len)
+      r.push_back(it.len != 0 && ValidBuffer(it.data, it.len)
                       ? Cache(node, it.key, it.data, it.len)
                       : Status::kInvalid);
     }
@@ -251,7 +251,7 @@ class Transport {
         }
         total = next;
       }
-      if (!valid) continue;
+      if (!valid || total == 0) continue;
       bufs[i].resize(total);
       size_t off = 0;
       for (const auto& p : srcs[i].payloads) {

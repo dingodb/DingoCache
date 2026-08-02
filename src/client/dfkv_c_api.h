@@ -39,6 +39,7 @@ typedef struct dfkv_client_options_v2 {
 
 dfkv_client_t dfkv_open_v2(const dfkv_client_options_v2* options);
 
+// PUT values must be non-empty. A zero byte count fails before routing.
 int dfkv_put(dfkv_client_t c, const void* key, uint64_t key_len,
              const void* ptr, uint64_t n);  // 0=ok,-1=failure
 int dfkv_get(dfkv_client_t c, const void* key, uint64_t key_len,
@@ -69,6 +70,7 @@ const char* dfkv_transport_mode(dfkv_client_t c);
 
 // Batched, concurrently fanned out. Keys are binary spans
 // (keys[i], key_lens[i]); zero-length/null/overflow keys fail their slot.
+// PUT slots with a zero-length value also fail without affecting valid siblings.
 // out_* arrays (len n) receive per-item results. Return 0 on call success.
 int dfkv_batch_put(dfkv_client_t c, const void* const* keys,
                    const uint64_t* key_lens, const void** ptrs,
@@ -89,8 +91,9 @@ int dfkv_batch_remove(dfkv_client_t c, const void* const* keys,
 // source buffers (ptrs[i][0..num_bufs[i]-1], sizes[i][...]) into one stored blob
 // (the in-order concatenation; segment boundaries are client-side only). Coalesces
 // many tiny KV chunks into one key + one transport SG op. A key exceeding
-// dfkv_max_sg_segs(c), or whose total byte length overflows size_t, reports
-// out_ok[i]=0 without affecting valid siblings. Return 0 on call success.
+// dfkv_max_sg_segs(c), whose total byte length is zero, or whose total overflows
+// size_t reports out_ok[i]=0 without affecting valid siblings. Return 0 on call
+// success.
 int dfkv_batch_put_sg(dfkv_client_t c, const void* const* keys,
                       const uint64_t* key_lens, const void*** ptrs,
                       const uint64_t** sizes, const int* num_bufs, int n,

@@ -455,8 +455,8 @@ class DingoFSHiCacheTest(unittest.TestCase):
 
     def test_client_metrics_count_v2_set_get_exists(self):
         # v2 (DSA side-pool) path metrics. For a V4/DSA model (GLM-5.2) the real
-        # KV rides batch_set_v2/get_v2 while batch_set_v1 only writes empty anchor
-        # markers, so the *_v1 counters stay blind — the *_v2 counters are what
+        # KV rides batch_set_v2/get_v2 while batch_set_v1 only writes one-byte
+        # anchor markers, so the *_v1 counters stay blind — the *_v2 counters
         # express the L3 write/hit rate. Mirrors the anchor+side-pool v2 flow.
         from sglang.srt.mem_cache.hicache_storage import PoolTransfer
         members, _, _ = self._node("metricsv2")
@@ -467,7 +467,7 @@ class DingoFSHiCacheTest(unittest.TestCase):
         st.register_mem_host_pool_v2(side, "deepseek_v4_c4")
         keys = ["v0", "v1", "v2"]
         hi = list(range(3 * self.PAGE_SIZE))
-        st.batch_set_v1(keys, hi)  # empty anchor markers -> v1 write counter inert
+        st.batch_set_v1(keys, hi)  # one-byte anchor markers -> v1 counter inert
         st.batch_set_v2([PoolTransfer(name="deepseek_v4_c4",
                                       host_indices=hi, keys=keys)])
         st.batch_get_v2([PoolTransfer(name="deepseek_v4_c4",
@@ -856,7 +856,7 @@ class DingoFSHiCacheTest(unittest.TestCase):
     def test_v1_logical_anchor_writes_markers_no_crash(self):
         # V4/DSA models (e.g. GLM-5.2): the primary "kv" pool is a logical anchor
         # whose get_page_buffer_meta() returns None. batch_set_v1 must not crash
-        # (was: TypeError unpacking None); it writes an empty "kv" marker per page
+        # (was: TypeError unpacking None); it writes a one-byte "kv" marker per page
         # so batch_exists can find the primary prefix, and batch_get_v1 no-ops
         # (all pages "present" so the hybrid controller loads the real side pools).
         members, _, ndir = self._node("anchor")

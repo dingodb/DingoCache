@@ -150,6 +150,41 @@ TEST(CApiGuard, AcceptsLengthDelimitedBinaryNamespaceAndObjectKeys) {
   dfkv_close(client);
 }
 
+TEST(CApiGuard, RejectsZeroLengthPutsPerItem) {
+  CApiTransport transport;
+  dfkv_client_t client = Injected(&transport);
+  char byte = 'v';
+
+  EXPECT_EQ(dfkv_put(client, "zero", 4, &byte, 0), -1);
+  EXPECT_TRUE(transport.cached.empty());
+
+  const void* keys[] = {"zero", "valid"};
+  const uint64_t key_lens[] = {4, 5};
+  const void* ptrs[] = {&byte, &byte};
+  const uint64_t sizes[] = {0, 1};
+  int out[] = {9, 9};
+  EXPECT_EQ(dfkv_batch_put(client, keys, key_lens, ptrs, sizes, 2, out), 0);
+  EXPECT_EQ(out[0], 0);
+  EXPECT_EQ(out[1], 1);
+  ASSERT_EQ(transport.cached.size(), 1u);
+
+  const void* zero_segments[] = {&byte};
+  const void* valid_segments[] = {&byte};
+  const void** segments[] = {zero_segments, valid_segments};
+  const uint64_t zero_sizes[] = {0};
+  const uint64_t valid_sizes[] = {1};
+  const uint64_t* segment_sizes[] = {zero_sizes, valid_sizes};
+  const int segment_counts[] = {1, 1};
+  out[0] = out[1] = 9;
+  EXPECT_EQ(dfkv_batch_put_sg(client, keys, key_lens, segments,
+                              segment_sizes, segment_counts, 2, out),
+            0);
+  EXPECT_EQ(out[0], 0);
+  EXPECT_EQ(out[1], 1);
+  EXPECT_EQ(transport.cached.size(), 2u);
+  dfkv_close(client);
+}
+
 TEST(CApiGuard, NullAndZeroLengthInputsFailClosedWithSafeOutputs) {
   EXPECT_EQ(dfkv_put(nullptr, "k", 1, "v", 1), -1);
   EXPECT_EQ(dfkv_get(nullptr, "k", 1, nullptr, 0), 0);

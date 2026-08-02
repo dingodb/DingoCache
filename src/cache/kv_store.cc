@@ -470,7 +470,7 @@ uint64_t KVStore::ForceEvictLocked(Shard& sh, uint64_t target,
 
 Status KVStore::Cache(const BlockKey& key, const void* data, size_t len) {
   if (!healthy_) return Status::kIOError;
-  if (data == nullptr && len != 0) return Status::kInvalid;
+  if (len == 0 || data == nullptr) return Status::kInvalid;
   const std::string fname = key.Filename();
   Shard& sh = ShardFor(fname);
   {  // best-effort early idempotent skip (avoids a needless 2.74 MiB write)
@@ -579,7 +579,7 @@ Status KVStore::Remove(const BlockKey& key) {
 Status KVStore::CacheDirect(const BlockKey& key, char* data, size_t len,
                             size_t cap) {
   if (!healthy_) return Status::kIOError;
-  if (data == nullptr && len != 0) return Status::kInvalid;
+  if (len == 0 || data == nullptr) return Status::kInvalid;
   const std::string fname = key.Filename();
   Shard& sh = ShardFor(fname);
   {

@@ -329,7 +329,7 @@ void DiskCacheGroup::RecordQuotaRejectionLocked(uint64_t tenant_hash) {
 
 
 Status DiskCacheGroup::Cache(const BlockKey& key, const void* data, size_t len) {
-  if (data == nullptr && len != 0) return Status::kInvalid;
+  if (len == 0 || data == nullptr) return Status::kInvalid;
   StoreEngine* d = Route(key);
   if (d == nullptr) return Status::kInvalid;
   std::lock_guard<std::mutex> tenant_lock(
@@ -362,7 +362,7 @@ Status DiskCacheGroup::Lookup(const BlockKey& key, ValueMetadata* out) const {
 
 Status DiskCacheGroup::CacheDirect(const BlockKey& key, char* data, size_t len,
                                    size_t cap) {
-  if (data == nullptr && len != 0) return Status::kInvalid;
+  if (len == 0 || data == nullptr) return Status::kInvalid;
   StoreEngine* d = Route(key);
   if (d == nullptr) return Status::kInvalid;
   std::lock_guard<std::mutex> tenant_lock(
@@ -434,7 +434,7 @@ std::vector<Status> DiskCacheGroup::CacheDirectBatch(
   for (size_t i = 0; i < items.size(); ++i) {
     const auto& item = items[i];
     const size_t disk = RouteIndex(item.key);
-    if (disk == kInvalidDisk || (item.data == nullptr && item.len != 0))
+    if (disk == kInvalidDisk || item.len == 0 || item.data == nullptr)
       continue;
     ValueMetadata metadata;
     const Status lookup = disks_[disk]->Lookup(item.key, &metadata);

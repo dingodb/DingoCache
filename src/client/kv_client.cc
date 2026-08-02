@@ -448,6 +448,7 @@ bool KVClient::Put(const std::string& key, const void* value, size_t n) {
 }
 
 bool KVClient::PutDirect(const std::string& key, const void* value, size_t n) {
+  if (key.empty() || n == 0 || value == nullptr) return false;
   std::string node = Route(key);
   if (node.empty()) return false;
   uint64_t now = NowMs();
@@ -643,6 +644,9 @@ std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
   // RDMA: group by node and scatter-send raw caller values without copying.
   std::map<std::string, std::vector<size_t>> by_node;
   for (size_t i = 0; i < N; ++i) {
+    if (items[i].key.empty() || items[i].n == 0 ||
+        items[i].value == nullptr)
+      continue;
     std::string node = Route(items[i].key);
     if (node.empty()) continue;
     by_node[node].push_back(i);
@@ -1120,16 +1124,24 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
   const size_t N = items.size();
   std::vector<char> ok(N, 0);  // char (not vector<bool>) for thread-safe writes
 
-  // Reject keys exceeding the active transport's runtime segment capability.
-  // Apply this transport-independently so every backend exposes the same
-  // per-item failure contract. Empty-segment values are valid.
+  // Reject malformed writes and zero-total values before routing. Individual
+  // empty SG segments are harmless when the complete object is non-empty.
   std::vector<char> over(N, 0);
   std::vector<size_t> total_bytes(N, 0);
   for (size_t i = 0; i < N; ++i) {
+    bool invalid_buffer = false;
+    for (size_t j = 0; j < items[i].ptrs.size(); ++j) {
+      if (j < items[i].sizes.size() && items[i].sizes[j] != 0 &&
+          items[i].ptrs[j] == nullptr) {
+        invalid_buffer = true;
+        break;
+      }
+    }
     if (items[i].key.empty() ||
         items[i].ptrs.size() != items[i].sizes.size() ||
         items[i].ptrs.size() > t_->MaxSgPayloadSegs() ||
-        !CheckedSizeSum(items[i].sizes, &total_bytes[i]))
+        !CheckedSizeSum(items[i].sizes, &total_bytes[i]) ||
+        total_bytes[i] == 0 || invalid_buffer)
       over[i] = 1;
   }
 

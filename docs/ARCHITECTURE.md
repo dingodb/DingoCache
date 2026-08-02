@@ -84,11 +84,13 @@ mutators and no model-hash or geometry arguments.
 
 Every scalar and batch/SG operation passes object keys as `(const void*, uint64_t)`
 binary spans (batch APIs add a parallel `key_lens[]` array); embedded NUL bytes
-are identity bytes, not terminators. Null, zero-length, or unrepresentable spans
-fail closed. Every exported `extern C` function is a no-throw boundary: output
-slots are initialized to failure and C++ exceptions translate to the function's
-documented failure result. MDS group and registration client IDs are validated
-synchronously by `dfkv_open_v2` before either background worker starts.
+are identity bytes, not terminators. Null, zero-length, or unrepresentable key
+spans fail closed. PUT values must also be non-empty: scalar, batch, SG, TCP,
+RDMA, RAM-tier, and persistent-store admission all reject zero-byte objects.
+Every exported `extern C` function is a no-throw boundary: output slots are
+initialized to failure and C++ exceptions translate to the documented result.
+MDS group and registration client IDs are validated synchronously by
+`dfkv_open_v2` before either background worker starts.
 
 Connectors construct a binary namespace in one of two disjoint forms:
 

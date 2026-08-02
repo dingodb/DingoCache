@@ -319,13 +319,14 @@ TEST(SlabAllocator, OversizeValueRejected) {
   EXPECT_FALSE(a.Put(Key("overflow"), std::numeric_limits<size_t>::max(), &r, &ev));
 }
 
-TEST(SlabAllocator, ZeroLenGetsAMinimalSlot) {
+TEST(SlabAllocator, ZeroLenIsRejectedWithoutAllocatingSlot) {
   SlabAllocator a(Opts(64 * 1024, 2));
   std::vector<BlockKey> ev;
   SlotRef r;
-  ASSERT_TRUE(a.Put(Key("z"), 0, &r, &ev));  // 0-byte anchor -> one aligned slot
-  EXPECT_EQ(r.slot_size, 4096u);
-  EXPECT_TRUE(a.Contains(Key("z")));
+  EXPECT_FALSE(a.Put(Key("z"), 0, &r, &ev));
+  EXPECT_FALSE(a.Contains(Key("z")));
+  EXPECT_EQ(a.Count(), 0u);
+  EXPECT_EQ(a.UsedBytes(), 0u);
 }
 
 TEST(SlabAllocator, ConcurrentPutGetRemoveIsRaceFree) {

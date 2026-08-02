@@ -171,7 +171,9 @@ dfkv_client_t dfkv_open_v2(const dfkv_client_options_v2* options) {
 int dfkv_put(dfkv_client_t c, const void* key, uint64_t key_len,
              const void* ptr, uint64_t n) {
   return NoThrow(-1, [&] {
-    if (!c || !ValidKey(key, key_len) || !ValidBuffer(ptr, n)) return -1;
+    if (!c || !ValidKey(key, key_len) || n == 0 ||
+        !ValidBuffer(ptr, n))
+      return -1;
     return static_cast<KVClient*>(c)->Put(
                CopyKey(key, key_len), ptr, static_cast<size_t>(n))
                ? 0
@@ -249,7 +251,7 @@ int dfkv_batch_put(dfkv_client_t c, const void* const* keys,
     items.reserve(static_cast<size_t>(n));
     positions.reserve(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
-      if (!ValidKey(keys[i], key_lens[i]) ||
+      if (!ValidKey(keys[i], key_lens[i]) || sizes[i] == 0 ||
           !ValidBuffer(ptrs[i], sizes[i]))
         continue;
       positions.push_back(static_cast<size_t>(i));
@@ -395,7 +397,7 @@ int dfkv_batch_put_sg(dfkv_client_t c, const void* const* keys,
           break;
         }
       }
-      if (!valid) continue;
+      if (!valid || total == 0) continue;
       dfkv::KvPutItemSg item;
       item.key = CopyKey(keys[i], key_lens[i]);
       item.ptrs.reserve(static_cast<size_t>(count));

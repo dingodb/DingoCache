@@ -802,9 +802,9 @@ TEST(RdmaLoopback, RegisterMemoryRoundtrip) {
   }
 }
 
-// An empty (n==0) value in a batch exercises the PostSendScatter 1-SGE degrade
-// (no payload SGE / no MR registration) alongside non-empty items.
-TEST(RdmaLoopback, BatchPutEmptyValue) {
+// A zero-length item in a mixed RDMA batch fails independently; the valid
+// neighbor still completes and no empty object reaches the server.
+TEST(RdmaLoopback, BatchPutRejectsEmptyValue) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   RdmaNode node("bev");
   RdmaTransport rt(kMaxMsg);
@@ -813,18 +813,16 @@ TEST(RdmaLoopback, BatchPutEmptyValue) {
   std::string nonempty(2048, 'x');
   std::vector<KvPutItem> puts = {
       {"e_full", nonempty.data(), nonempty.size()},
-      {"e_empty", nullptr, 0},
+      {"e_empty", nonempty.data(), 0},
   };
   auto pr = c.BatchPut(puts);
   ASSERT_TRUE(pr[0]);
-  ASSERT_TRUE(pr[1]);
+  EXPECT_FALSE(pr[1]);
 
-  EXPECT_TRUE(c.Exist("e_empty"));
+  EXPECT_FALSE(c.Exist("e_empty"));
   std::string out(nonempty.size(), '\0');
   ASSERT_TRUE(c.Get("e_full", &out[0], out.size()));
   EXPECT_EQ(out, nonempty);
-  // Empty value round-trips: a 0-byte Get is a hit.
-  EXPECT_TRUE(c.Get("e_empty", nullptr, 0));
 }
 
 // Scatter-gather over RDMA: BatchPutSg gathers N caller buffers into one stored
