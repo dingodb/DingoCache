@@ -1,5 +1,14 @@
 # DfkvStoreConnector Implementation Plan
 
+> **OBSOLETE HISTORICAL PLAN — do not use as current API guidance.** The
+> implementation now opens with
+> `dfkv_open(members, namespace_bytes, namespace_len)`, uses canonical
+> `dfkv/pool/v2|...` object keys, and stores opaque raw values. References below
+> to the retired identity, geometry arguments, and value format are intentionally
+> preserved as a record of the June 2026 plan. Current guidance:
+> [CONNECTORS.md](../../CONNECTORS.md) and
+> [ARCHITECTURE.md](../../ARCHITECTURE.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a direct vLLM KV connector (`DfkvStoreConnector`, implementing vLLM 0.23.0's `KVConnectorBase_V1`) that stores/loads KV cache to/from a dfkv cluster over GPUDirect RDMA, bypassing LMCache — a drop-in for the `--kv-transfer-config` slot Mooncake occupies today.

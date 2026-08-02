@@ -99,8 +99,11 @@ int main(int argc, char** argv) {
   std::unique_ptr<dfkv::MetricsHttpServer> mhttp;
   if (metrics_port >= 0) {
     mhttp = std::make_unique<dfkv::MetricsHttpServer>([&srv] { return srv.MetricsText(); });
-    // /healthz reflects live etcd reachability (503 when a probe fails).
+    // Both liveness dependency reporting and scheduler readiness are live etcd
+    // probes. A running MDS cannot serve membership correctly without etcd, so
+    // it must be removed from routing during an outage and recover in place.
     mhttp->set_health_check([&srv] { return srv.ProbeEtcd(); });
+    mhttp->set_ready_check([&srv] { return srv.ProbeEtcd(); });
     if (mhttp->Start(metrics_port, metrics_bind) == dfkv::Status::kOk)
       std::printf("dfkv_mds /metrics on port %d\n", mhttp->port());
     std::fflush(stdout);

@@ -9,12 +9,11 @@ where <endpoint> is interpreted by the membership mode (passed in from the
 adapter via extra_config, default "mds"):
 
   - membership="mds"    (default): <endpoint> is a comma-separated MDS host:port
-                                   list. dfkv_open() gets an empty member list and
-                                   the ring is populated by background MDS
-                                   discovery against <endpoint> for <group>.
+                                   list stored in dfkv_client_options_v2; discovery
+                                   starts as part of dfkv_open_v2().
   - membership="static":           <endpoint> is a literal dfkv member string
-                                   "name=ip:port,name2=ip:port2" passed straight to
-                                   dfkv_open(); <group> is unused.
+                                   "name=ip:port,name2=ip:port2" stored in the same
+                                   options descriptor; <group> is unused.
 
 Anything else — the libdfkv.so path, MDS poll interval, connector knobs — goes
 through the LMCache yaml's ``extra_config`` (see adapter.py). URLs carrying a

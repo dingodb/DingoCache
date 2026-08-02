@@ -17,11 +17,8 @@ using namespace dfkv;  // NOLINT
 
 namespace {
 
-ValueHeader SelfHdr(uint32_t page_size = 64) {
-  return ValueHeader::Make(/*model=*/0x51ULL, page_size,
-                           /*dtype=*/0x46384534u, ValueHeader::kFlagIsMla,
-                           /*tp_size=*/8, /*tp_rank=*/0, /*layer=*/78,
-                           /*head=*/1, /*head_dim=*/576);
+std::string KeyNamespace(uint32_t page_size = 64) {
+  return "test/model/page=" + std::to_string(page_size);
 }
 
 struct Node {
@@ -54,7 +51,7 @@ class GetAutoTest : public ::testing::Test {
 
 TEST_F(GetAutoTest, ReadsBackTrueLengthWhenCapIsLarger) {
   nodes_.push_back(StartNode("a1"));
-  KVClient c({{ "a", nodes_[0]->addr }}, SelfHdr());
+  KVClient c({{ "a", nodes_[0]->addr }}, KeyNamespace());
   std::string v(3000, 'q'); v[1500] = 'Z';
   ASSERT_TRUE(c.Put("k_partial", v.data(), v.size()));
 
@@ -69,7 +66,7 @@ TEST_F(GetAutoTest, ReadsBackTrueLengthWhenCapIsLarger) {
 
 TEST_F(GetAutoTest, ExactCapWorks) {
   nodes_.push_back(StartNode("a2"));
-  KVClient c({{ "a", nodes_[0]->addr }}, SelfHdr());
+  KVClient c({{ "a", nodes_[0]->addr }}, KeyNamespace());
   std::string v(2048, 'x');
   ASSERT_TRUE(c.Put("k_exact", v.data(), v.size()));
   std::string buf(v.size(), '\0');
@@ -81,7 +78,7 @@ TEST_F(GetAutoTest, ExactCapWorks) {
 
 TEST_F(GetAutoTest, CapSmallerThanPayloadIsMiss) {
   nodes_.push_back(StartNode("a3"));
-  KVClient c({{ "a", nodes_[0]->addr }}, SelfHdr());
+  KVClient c({{ "a", nodes_[0]->addr }}, KeyNamespace());
   std::string v(4096, 'y');
   ASSERT_TRUE(c.Put("k_big", v.data(), v.size()));
   std::string buf(1024, '\0');  // too small to hold the 4096B payload
@@ -89,9 +86,9 @@ TEST_F(GetAutoTest, CapSmallerThanPayloadIsMiss) {
   EXPECT_FALSE(c.GetAuto("k_big", &buf[0], buf.size(), &got));
 }
 
-TEST_F(GetAutoTest, MissAndHeaderMismatch) {
+TEST_F(GetAutoTest, MissAndNamespaceMismatch) {
   nodes_.push_back(StartNode("a4"));
-  KVClient writer({{ "a", nodes_[0]->addr }}, SelfHdr(/*page=*/64));
+  KVClient writer({{ "a", nodes_[0]->addr }}, KeyNamespace(/*page=*/64));
   std::string v(512, 'z');
   ASSERT_TRUE(writer.Put("k_geo", v.data(), v.size()));
 
@@ -100,8 +97,8 @@ TEST_F(GetAutoTest, MissAndHeaderMismatch) {
   size_t got = 0;
   EXPECT_FALSE(writer.GetAuto("never_written", &buf[0], buf.size(), &got));
 
-  // geometry drift => safe miss
-  KVClient reader({{ "a", nodes_[0]->addr }}, SelfHdr(/*page=*/32));
+  // A different canonical namespace maps to a different key and misses.
+  KVClient reader({{ "a", nodes_[0]->addr }}, KeyNamespace(/*page=*/32));
   EXPECT_FALSE(reader.GetAuto("k_geo", &buf[0], buf.size(), &got));
 }
 
@@ -110,7 +107,7 @@ TEST_F(GetAutoTest, BatchMixedFullAndPartial) {
   nodes_.push_back(StartNode("n2"));
   std::vector<std::pair<std::string, std::string>> members = {
       {"n1", nodes_[0]->addr}, {"n2", nodes_[1]->addr}};
-  KVClient c(members, SelfHdr());
+  KVClient c(members, KeyNamespace());
 
   const size_t kCap = 4096;  // uniform buffer capacity (== full chunk size)
   std::vector<std::string> keys;

@@ -26,8 +26,10 @@ from dfkv_vllm.dfkv_client import DfkvDeviceClient  # noqa: E402
 
 def main() -> int:
     members = os.environ.get("DFKV_MEMBERS", "c1=127.0.0.1:18901")
-    client = DfkvDeviceClient(members=members, model_hash=0xABCDEF,
-                              lib_path=os.environ.get("DFKV_LIB"))
+    client = DfkvDeviceClient(
+        members=members,
+        key_namespace=b"dfkv/model/v1/test/gpudirect",
+        lib_path=os.environ.get("DFKV_LIB"))
     assert client.transport_mode == "rdma", (
         f"transport={client.transport_mode}; set DFKV_RDMA=1 + DFKV_RDMA_DEV "
         "(GPU pointers require RDMA)")
@@ -41,8 +43,8 @@ def main() -> int:
     client.register_memory(dst.data_ptr(), n)
     print("register_memory on GPU pointers: OK (GPUDirect MR created)")
 
-    assert client.batch_put(["p0/probe"], [src.data_ptr()], [n]) == [0]
-    hits, lens = client.batch_get(["p0/probe"], [dst.data_ptr()], [n])
+    assert client.batch_put([b"p0/probe"], [src.data_ptr()], [n]) == [0]
+    hits, lens = client.batch_get([b"p0/probe"], [dst.data_ptr()], [n])
     assert hits == [1] and lens == [n], f"hits={hits} lens={lens}"
 
     torch.cuda.synchronize()

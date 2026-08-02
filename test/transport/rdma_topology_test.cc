@@ -9,6 +9,7 @@ namespace {
 
 using dfkv::rdma::RdmaDevInfo;
 using dfkv::rdma::RdmaTopology;
+using dfkv::rdma::RailLocality;
 
 RdmaDevInfo Device(std::string name, bool active, int numa_node = -1) {
   RdmaDevInfo info;
@@ -81,6 +82,36 @@ TEST(RdmaTopology, DisabledRailIsNotSelectedAgain) {
   for (int i = 0; i < 4; ++i) EXPECT_EQ(topology.SelectDevice(0, true), 1);
   topology.DisableDevice("ib1");
   EXPECT_EQ(topology.SelectDevice(0, true), -1);
+}
+
+TEST(RdmaTopology, CandidateMaskContainsOnlyCallerLocalRails) {
+  RdmaTopology topology({Device("ib0", true, 0), Device("ib1", true, 1),
+                         Device("ib2", true, 1)});
+
+  const auto candidates = topology.CandidatesFor(1, true);
+
+  EXPECT_EQ(candidates.locality, RailLocality::kLocal);
+  EXPECT_EQ(candidates.allowed, (std::vector<uint8_t>{0, 1, 1}));
+}
+
+TEST(RdmaTopology, UnknownCallerFallsBackToAllEnabledRails) {
+  RdmaTopology topology({Device("ib0", true, 0), Device("ib1", true, 1)});
+  topology.DisableDevice("ib1");
+
+  const auto candidates = topology.CandidatesFor(-1, true);
+
+  EXPECT_EQ(candidates.locality, RailLocality::kCallerUnknown);
+  EXPECT_EQ(candidates.allowed, (std::vector<uint8_t>{1, 0}));
+}
+
+TEST(RdmaTopology, NoLocalRailFallsBackToAllEnabledRails) {
+  RdmaTopology topology(
+      {Device("ib0", true, 0), Device("ib1", true, -1)});
+
+  const auto candidates = topology.CandidatesFor(1, true);
+
+  EXPECT_EQ(candidates.locality, RailLocality::kNoLocal);
+  EXPECT_EQ(candidates.allowed, (std::vector<uint8_t>{1, 1}));
 }
 
 }  // namespace

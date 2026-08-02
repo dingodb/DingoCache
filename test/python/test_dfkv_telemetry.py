@@ -765,87 +765,14 @@ class RequiredConfigValidationTest(unittest.TestCase):
     """Startup validation of required connector config (isolation identity +
     ring endpoint). Pure config logic — no server / libdfkv.so."""
 
-    _KEYS = (config.ENV_MODEL_HASH, config.ENV_ALLOW_SHARED_KEYSPACE)
-
-    def setUp(self):
-        self._saved = {k: os.environ.get(k) for k in self._KEYS}
-        for k in self._KEYS:
-            os.environ.pop(k, None)
-
-    def tearDown(self):
-        for k, v in self._saved.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-
-    # --- model_hash: the missing/zero/illegal cases all abort ---------------
-    def test_model_hash_missing_raises(self):
-        with self.assertRaises(config.DfkvConfigError):
-            config.require_model_hash({})              # not passed
-        with self.assertRaises(config.DfkvConfigError):
-            config.require_model_hash(None)
-
-    def test_model_hash_zero_raises(self):
-        # the exact bug: cfg.get('model_hash', 0) used to accept a forgotten
-        # param as the shared keyspace.
-        with self.assertRaises(config.DfkvConfigError):
-            config.require_model_hash({"model_hash": 0})
-
-    def test_model_hash_illegal_values_raise(self):
-        for bad in ("", "   ", "abc", -1, 1 << 64, True, 1.5):
-            with self.assertRaises(config.DfkvConfigError, msg=repr(bad)):
-                config.require_model_hash({"model_hash": bad})
-
-    def test_model_hash_valid_returned_as_uint64(self):
-        self.assertEqual(config.require_model_hash({"model_hash": 0x51}), 0x51)
-        # string (env-style) incl. hex is accepted and coerced
-        self.assertEqual(config.require_model_hash({"model_hash": "129"}), 129)
-        self.assertEqual(config.require_model_hash({"model_hash": "0x51"}), 0x51)
-        self.assertEqual(
-            config.require_model_hash({"model_hash": config._UINT64_MAX}),
-            config._UINT64_MAX)
-
-    def test_model_hash_from_env(self):
-        os.environ[config.ENV_MODEL_HASH] = "0x1234"
-        self.assertEqual(config.require_model_hash({}), 0x1234)
-
-    def test_model_hash_cfg_wins_over_env(self):
-        os.environ[config.ENV_MODEL_HASH] = "0x1234"
-        self.assertEqual(config.require_model_hash({"model_hash": 0x51}), 0x51)
-
-    # --- shared-keyspace opt-in --------------------------------------------
-    def test_shared_keyspace_opt_in_allows_missing_and_zero(self):
-        self.assertEqual(
-            config.require_model_hash({"allow_shared_keyspace": True}), 0)
-        self.assertEqual(
-            config.require_model_hash(
-                {"model_hash": 0, "allow_shared_keyspace": 1}), 0)
-
-    def test_shared_keyspace_opt_in_via_env(self):
-        os.environ[config.ENV_ALLOW_SHARED_KEYSPACE] = "1"
-        self.assertEqual(config.require_model_hash({}), 0)
-
-    def test_shared_keyspace_still_rejects_illegal(self):
-        # opt-in permits 0/missing, but a genuinely malformed value still fails.
-        with self.assertRaises(config.DfkvConfigError):
-            config.require_model_hash(
-                {"model_hash": "abc", "allow_shared_keyspace": True})
-
-    # --- isolation name (lmcache model_name) --------------------------------
     def test_isolation_name_empty_raises(self):
         for bad in ("", "   ", None, 123):
             with self.assertRaises(config.DfkvConfigError, msg=repr(bad)):
                 config.require_isolation_name(bad)
 
-    def test_isolation_name_valid_returned(self):
-        self.assertEqual(config.require_isolation_name("glm-5.2"), "glm-5.2")
-
-    def test_isolation_name_shared_opt_in(self):
-        self.assertEqual(
-            config.require_isolation_name("", cfg={"allow_shared_keyspace": 1}), "")
-        os.environ[config.ENV_ALLOW_SHARED_KEYSPACE] = "1"
-        self.assertEqual(config.require_isolation_name(""), "")
+    def test_isolation_name_preserved_losslessly(self):
+        identity = "org/model@rev:2026-08-02"
+        self.assertEqual(config.require_isolation_name(identity), identity)
 
     # --- ring endpoint ------------------------------------------------------
     def test_ring_endpoint_requires_members_or_mds(self):

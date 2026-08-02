@@ -26,6 +26,7 @@ import hashlib
 import os
 from typing import Any, List, Optional, Tuple
 
+from dfkv_common import LMCACHE_RAW_V1, canonical_namespace
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_management import MemoryObj
@@ -36,12 +37,11 @@ from ._telemetry import config as _tcfg
 from .access_log import access_log
 from .config import parse_dfkv_url
 from .exists_cache import ExistsLRU
-from .key_mapper import cache_engine_key_to_dfkv_str
+from .key_mapper import cache_engine_key_to_dfkv_key
 from .native_client import DfkvNativeClient
 
 logger = init_logger(__name__)
 
-_FLAG_IS_MLA = 0x1
 
 
 def _fmt_bytes(n: int) -> str:
@@ -51,39 +51,10 @@ def _fmt_bytes(n: int) -> str:
         return f"{n / 1024:.2f}KiB"
     return f"{n / 1024 / 1024:.2f}MiB"
 
-
-def _stable_model_hash(model_name: str) -> int:
-    """Deterministic 64-bit hash of the model name (NOT Python's salted hash —
-    the value goes into the dfkv geometry header and must be stable across
-    process restarts so a cache written before a restart is still readable)."""
-    digest = hashlib.blake2b((model_name or "").encode(), digest_size=8).digest()
-    return int.from_bytes(digest, "little")
+def _key_label(key: bytes) -> str:
+    return f"len={len(key)} sha256={hashlib.sha256(key).hexdigest()[:16]}"
 
 
-def _geometry_from_metadata(md: Any) -> dict:
-    """Map LMCache metadata to dfkv_open() geometry. These fields only need to be
-    self-consistent within one deployment (the value header always matches itself
-    on read), so they are pure identity tags derived deterministically."""
-    kv_shape = tuple(getattr(md, "kv_shape", None) or (0, 0, 0, 0, 0))
-    layer_num = int(kv_shape[0]) if len(kv_shape) > 0 else 0
-    head_num = int(kv_shape[3]) if len(kv_shape) > 3 else 0
-    head_dim = int(kv_shape[4]) if len(kv_shape) > 4 else 0
-    # model_name is the isolation namespace (derives model_hash); an empty one
-    # makes every deployment collide on blake2b("") — refuse to start unless the
-    # shared keyspace is opted in via env DFKV_ALLOW_SHARED_KEYSPACE=1.
-    model_name = getattr(md, "model_name", "")
-    _tcfg.require_isolation_name(model_name)
-    return {
-        "model_hash": _stable_model_hash(model_name),
-        "page_size": int(getattr(md, "chunk_size", 0)),
-        "dtype_tag": 0,
-        "flags": _FLAG_IS_MLA if getattr(md, "use_mla", False) else 0,
-        "tp_size": int(getattr(md, "world_size", 1)),
-        "tp_rank": int(getattr(md, "worker_id", 0)),
-        "layer_num": layer_num & 0xFFFF,
-        "head_num": head_num & 0xFFFF,
-        "head_dim": head_dim & 0xFFFF,
-    }
 
 
 class DfkvConnector(RemoteConnector):
@@ -102,8 +73,10 @@ class DfkvConnector(RemoteConnector):
         local_cpu_backend: LocalCPUBackend,
         exists_cache_capacity: int = 1_000_000,
         lib_path: Optional[str] = None,
+        key_namespace: Optional[str] = None,
         membership: str = "mds",
         mds_poll_ms: int = 3000,
+        mla_canonical_keys: Optional[bool] = None,
     ) -> None:
         with access_log("__init__", lambda: f"url={url}") as r:
             super().__init__(local_cpu_backend.config, local_cpu_backend.metadata)
@@ -118,31 +91,57 @@ class DfkvConnector(RemoteConnector):
             self._assume_exists = self._resolve_bool_env(self._ENV_ASSUME_EXISTS)
 
             rdma_pools = self._collect_rdma_pools(local_cpu_backend)
-            geometry = _geometry_from_metadata(local_cpu_backend.metadata)
+            _md = local_cpu_backend.metadata
+            self._use_mla = bool(getattr(_md, "use_mla", False))
+            self._world_size = max(
+                1, int(getattr(_md, "world_size", 1)))
+            self._worker_id = int(getattr(_md, "worker_id", 0))
+            model_identity = str(getattr(_md, "model_name", ""))
+            _dtype_identity = ",".join(
+                str(dtype) for dtype in self.meta_dtypes)
+            _shape_identity = "|".join(
+                str(tuple(shape)) for shape in self.meta_shapes)
+            namespace = canonical_namespace(
+                model_identity,
+                LMCACHE_RAW_V1,
+                key_namespace,
+                tenant_id=str(getattr(_md, "tenant_id", "default")),
+                model_revision=str(
+                    getattr(_md, "model_revision", model_identity)),
+                dtype=_dtype_identity or "unknown",
+                block_tokens=max(
+                    1, int(getattr(_md, "chunk_size", 1))),
+                layer_count=max(1, len(self.meta_shapes)),
+                tp_size=self._world_size,
+                layout_fields={
+                    "meta_shapes": _shape_identity,
+                    "meta_dtypes": _dtype_identity,
+                    "meta_format": str(self.meta_fmt),
+                    "full_chunk_size_bytes": int(
+                        self.full_chunk_size_bytes),
+                    "use_mla": self._use_mla,
+                },
+            )
 
             # Phase 9: canonical (rank-agnostic) keys for MLA. LMCache embeds
             # worker_id in every key although MLA KV is replicated across TP
             # ranks — 8x storage/writes/reads at TP8, and the same-host
             # rendezvous can never match (different keys). With canonical keys
             # all ranks share one keyspace; writes are striped to a single
-            # deterministic owner per chunk (see _stripe_owner). Default ON
-            # for MLA+world>1; DFKV_CONNECTOR_MLA_CANONICAL_KEYS=0 restores
-            # the per-rank legacy keyspace (note: flipping = cold cache).
-            _md = local_cpu_backend.metadata
-            self._use_mla = bool(getattr(_md, "use_mla", False))
-            self._world_size = max(1, int(getattr(_md, "world_size", 1)))
-            self._worker_id = int(getattr(_md, "worker_id", 0))
-            _canon_env = os.environ.get("DFKV_CONNECTOR_MLA_CANONICAL_KEYS")
+            # deterministic owner per chunk (see _stripe_owner). The decision
+            # comes from runtime metadata or this explicit constructor option;
+            # environment variables may not alter cache identity/key geometry.
+            auto_canonical = self._use_mla and self._world_size > 1
             self._canonical_keys = (
-                self._use_mla and self._world_size > 1
-                and (_canon_env is None or _canon_env.strip().lower()
-                     not in ("0", "false", "no", "off")))
+                auto_canonical
+                if mla_canonical_keys is None
+                else auto_canonical and bool(mla_canonical_keys)
+            )
             if self._canonical_keys:
                 logger.info(
                     "dfkv canonical MLA keys enabled (world=%d): shared "
-                    "keyspace + single-writer striping; set "
-                    "DFKV_CONNECTOR_MLA_CANONICAL_KEYS=0 for legacy per-rank "
-                    "keys", self._world_size)
+                    "keyspace + single-writer striping",
+                    self._world_size)
 
             self._local_cpu_backend = local_cpu_backend
             self._exists_lru = ExistsLRU(capacity=exists_cache_capacity)
@@ -150,7 +149,9 @@ class DfkvConnector(RemoteConnector):
                 raw_endpoint=endpoint.raw_endpoint,
                 group=endpoint.group,
                 membership=endpoint.membership,
-                geometry=geometry,
+                key_namespace=namespace,
+                tp_size=self._world_size,
+                tp_rank=self._worker_id,
                 lib_path=lib_path,
                 mds_poll_ms=mds_poll_ms,
                 rdma_pools=rdma_pools,
@@ -161,19 +162,19 @@ class DfkvConnector(RemoteConnector):
             total_pool_mib = sum(length for _, length in rdma_pools) / (1024 * 1024)
             logger.info(
                 "DfkvConnector ready: membership=%s endpoint=%s group=%s "
-                "full_chunk=%d (%.2f MiB) geometry=%s rdma_pools=%d (%.1f MiB) "
+                "full_chunk=%d (%.2f MiB) namespace=%s rdma_pools=%d (%.1f MiB) "
                 "batch_max_keys=%d get_parallelism=%d assume_exists=%s transport=%s",
                 endpoint.membership, endpoint.raw_endpoint, endpoint.group,
                 self.full_chunk_size_bytes,
                 self.full_chunk_size_bytes / (1024 * 1024),
-                geometry, len(rdma_pools), total_pool_mib,
+                namespace.hex(), len(rdma_pools), total_pool_mib,
                 self._batch_max_keys, self._get_parallelism, self._assume_exists,
                 getattr(self._client, "transport_mode", "unknown"),
             )
             r.result = f"endpoint={endpoint.raw_endpoint} group={endpoint.group}"
 
-    def _kstr(self, key: CacheEngineKey) -> str:
-        return cache_engine_key_to_dfkv_str(key, self._canonical_keys)
+    def _key(self, key: CacheEngineKey) -> bytes:
+        return cache_engine_key_to_dfkv_key(key, self._canonical_keys)
 
     def _stripe_owner(self, key: CacheEngineKey) -> bool:
         """With canonical keys every rank would redundantly PUT the same key;
@@ -244,33 +245,34 @@ class DfkvConnector(RemoteConnector):
     # ------------------------------------------------------------------
 
     async def exists(self, key: CacheEngineKey) -> bool:
-        key_str = self._kstr(key)
-        with access_log("exists", lambda: key_str) as r:
-            if self._exists_lru.has(key_str):
+        key_bytes = self._key(key)
+        with access_log("exists", lambda: _key_label(key_bytes)) as r:
+            if self._exists_lru.has(key_bytes):
                 r.result = "lru_hit"
                 return True
-            per_key = await self._client.batch_exists([key_str])
+            per_key = await self._client.batch_exists([key_bytes])
             found = bool(per_key) and bool(per_key[0])
             r.result = "found" if found else "not_found"
             if found:
-                self._exists_lru.add(key_str)
+                self._exists_lru.add(key_bytes)
             return found
 
     def exists_sync(self, key: CacheEngineKey) -> bool:
-        key_str = self._kstr(key)
-        with access_log("exists_sync", lambda: key_str) as r:
-            if self._exists_lru.has(key_str):
+        key_bytes = self._key(key)
+        with access_log("exists_sync", lambda: _key_label(key_bytes)) as r:
+            if self._exists_lru.has(key_bytes):
                 r.result = "lru_hit"
                 return True
             try:
-                found = self._client.exists_sync(key_str)
+                found = self._client.exists_sync(key_bytes)
             except Exception as e:
-                logger.warning("exists_sync failed for %s: %s", key_str, e)
+                logger.warning(
+                    "exists_sync failed for %s: %s", _key_label(key_bytes), e)
                 r.result = f"error: {e}"
                 return False
             r.result = "found" if found else "not_found"
             if found:
-                self._exists_lru.add(key_str)
+                self._exists_lru.add(key_bytes)
             return found
 
     def support_batched_async_contains(self) -> bool:
@@ -291,13 +293,13 @@ class DfkvConnector(RemoteConnector):
             if self._assume_exists:
                 r.result = f"prefix={n} (assume_exists)"
                 return n
-            key_strs = [self._kstr(k) for k in keys]
-            i = self._exists_lru.prefix_len(key_strs)
+            binary_keys = [self._key(k) for k in keys]
+            i = self._exists_lru.prefix_len(binary_keys)
             if i == n:
                 r.result = f"prefix={n} (all lru hit)"
                 return n
 
-            remaining = key_strs[i:]
+            remaining = binary_keys[i:]
             for start, end in self._batch_slices(len(remaining)):
                 chunk = remaining[start:end]
                 per_key = await self._client.batch_exists(chunk)
@@ -305,7 +307,7 @@ class DfkvConnector(RemoteConnector):
                     r.result = (f"prefix={i + start} (lru={i}, "
                                 f"remote={start} +0 no resp)")
                     return i + start
-                hit_keys: List[str] = []
+                hit_keys: List[bytes] = []
                 for j, found in enumerate(per_key):
                     if not found:
                         if hit_keys:
@@ -327,8 +329,8 @@ class DfkvConnector(RemoteConnector):
     # ------------------------------------------------------------------
 
     async def get(self, key: CacheEngineKey) -> Optional[MemoryObj]:
-        key_str = self._kstr(key)
-        with access_log("get", lambda: key_str) as r:
+        key_bytes = self._key(key)
+        with access_log("get", lambda: _key_label(key_bytes)) as r:
             memory_obj = self._allocate_chunk()
             if memory_obj is None:
                 r.result = "alloc_failed"
@@ -337,12 +339,12 @@ class DfkvConnector(RemoteConnector):
             handed_off = False
             try:
                 _ok, per_key, lengths = await self._client.batch_get(
-                    [key_str], [memory_obj.byte_array]
+                    [key_bytes], [memory_obj.byte_array]
                 )
                 if per_key and per_key[0]:
                     reshaped = self._reshape_hit(memory_obj, lengths[0])
                     if reshaped is not None:
-                        self._exists_lru.add(key_str)
+                        self._exists_lru.add(key_bytes)
                         handed_off = True
                         r.result = f"ok {_fmt_bytes(lengths[0])}"
                         return reshaped
@@ -358,18 +360,21 @@ class DfkvConnector(RemoteConnector):
         # NOTE: we do NOT ref_count_down memory_obj here. The caller hands us a
         # serialized compressed_memory_obj whose lifetime it manages. Mirrors
         # RedisConnector.put / the dingofs connector.
-        key_str = self._kstr(key)
+        key_bytes = self._key(key)
         size = len(memory_obj.byte_array)
-        with access_log("put", lambda: f"{key_str}, {_fmt_bytes(size)}") as r:
+        with access_log(
+            "put",
+            lambda: f"{_key_label(key_bytes)}, {_fmt_bytes(size)}",
+        ) as r:
             if not self._stripe_owner(key):
                 # canonical keys: the owning rank writes this chunk; treating
                 # it as stored here prevents this rank from ever re-putting.
-                self._exists_lru.add(key_str)
+                self._exists_lru.add(key_bytes)
                 r.result = "striped_skip"
                 return
-            ok, _ = await self._client.batch_set([key_str], [memory_obj.byte_array])
+            ok, _ = await self._client.batch_set([key_bytes], [memory_obj.byte_array])
             if ok:
-                self._exists_lru.add(key_str)
+                self._exists_lru.add(key_bytes)
             r.result = "ok" if ok else "partial_fail"
 
     # ------------------------------------------------------------------
@@ -399,7 +404,7 @@ class DfkvConnector(RemoteConnector):
                 # owns; the rest are (being) written by their owners and are
                 # remembered as stored so this rank never re-puts them.
                 owned = [i for i, k in enumerate(keys) if self._stripe_owner(k)]
-                skipped = [self._kstr(keys[i]) for i in range(n)
+                skipped = [self._key(keys[i]) for i in range(n)
                            if i not in set(owned)]
                 if skipped:
                     self._exists_lru.add_many(skipped)
@@ -409,23 +414,23 @@ class DfkvConnector(RemoteConnector):
                 keys = [keys[i] for i in owned]
                 memory_objs = [memory_objs[i] for i in owned]
                 n = len(keys)
-            key_strs = [self._kstr(k) for k in keys]
+            binary_keys = [self._key(k) for k in keys]
             views = [obj.byte_array for obj in memory_objs]
             ok_all = True
-            stored_keys: List[str] = []
+            stored_keys: List[bytes] = []
             chunks = 0
             for start, end in self._batch_slices(n):
                 chunks += 1
                 ok, per_key = await self._client.batch_set(
-                    key_strs[start:end], views[start:end]
+                    binary_keys[start:end], views[start:end]
                 )
                 if ok and per_key is None:
-                    stored_keys.extend(key_strs[start:end])
+                    stored_keys.extend(binary_keys[start:end])
                     continue
                 per_key_list = list(per_key or [])
                 for i, found in enumerate(per_key_list):
                     if found:
-                        stored_keys.append(key_strs[start + i])
+                        stored_keys.append(binary_keys[start + i])
                 if not ok or len(per_key_list) < (end - start) or not all(per_key_list):
                     ok_all = False
             if stored_keys:
@@ -446,7 +451,7 @@ class DfkvConnector(RemoteConnector):
             if not keys:
                 r.result = "empty"
                 return []
-            key_strs = [self._kstr(k) for k in keys]
+            binary_keys = [self._key(k) for k in keys]
 
             objs: List[MemoryObj] = []
             for _ in keys:
@@ -460,10 +465,10 @@ class DfkvConnector(RemoteConnector):
 
             views = [o.byte_array for o in objs]
             out: List[Optional[MemoryObj]] = [None] * n
-            hit_keys: List[str] = []
+            hit_keys: List[bytes] = []
             try:
                 for start, _end, per_key_list, lengths in await self._batch_get_chunks(
-                    key_strs, views
+                    binary_keys, views
                 ):
                     for local_i, found in enumerate(per_key_list):
                         i = start + local_i
@@ -471,7 +476,7 @@ class DfkvConnector(RemoteConnector):
                             reshaped = self._reshape_hit(objs[i], lengths[local_i])
                             if reshaped is not None:
                                 out[i] = reshaped
-                                hit_keys.append(key_strs[i])
+                                hit_keys.append(binary_keys[i])
             except Exception:
                 for o in objs:
                     o.ref_count_down()
@@ -547,7 +552,7 @@ class DfkvConnector(RemoteConnector):
                 r.result = "empty"
                 return []
 
-            key_strs = [self._kstr(k) for k in keys]
+            binary_keys = [self._key(k) for k in keys]
             out: List[MemoryObj] = []
             ranges = list(self._batch_slices(n))
             chunks = len(ranges)
@@ -574,7 +579,7 @@ class DfkvConnector(RemoteConnector):
                 try:
                     results = await asyncio.gather(
                         *(
-                            self._client.batch_get(key_strs[start:end], views)
+                            self._client.batch_get(binary_keys[start:end], views)
                             for (start, end), views in zip(group, group_views)
                         )
                     )
@@ -604,7 +609,7 @@ class DfkvConnector(RemoteConnector):
 
                     if local_prefix:
                         self._exists_lru.add_many(
-                            key_strs[start:start + local_prefix]
+                            binary_keys[start:start + local_prefix]
                         )
                         out.extend(objs[:local_prefix])
 
@@ -621,21 +626,22 @@ class DfkvConnector(RemoteConnector):
             return out
 
     def remove_sync(self, key: CacheEngineKey) -> bool:
-        key_str = self._kstr(key)
-        with access_log("remove_sync", lambda: key_str) as r:
+        key_bytes = self._key(key)
+        with access_log("remove_sync", lambda: _key_label(key_bytes)) as r:
             if not self._client.supports_remove():
                 r.result = "FAIL no remove RPC"
                 raise NotImplementedError(
                     "libdfkv.so has no remove RPC (rebuild dfkv with it)"
                 )
             try:
-                ok = self._client.remove_sync(key_str)
+                ok = self._client.remove_sync(key_bytes)
             except Exception as e:
-                logger.warning("remove_sync failed for %s: %s", key_str, e)
+                logger.warning(
+                    "remove_sync failed for %s: %s", _key_label(key_bytes), e)
                 r.result = f"error: {e}"
                 return False
             if ok:
-                self._exists_lru.discard(key_str)
+                self._exists_lru.discard(key_bytes)
             r.result = "ok" if ok else "fail"
             return ok
 
@@ -666,14 +672,14 @@ class DfkvConnector(RemoteConnector):
         for start in range(0, n, step):
             yield start, min(start + step, n)
 
-    async def _batch_get_chunks(self, key_strs, views):
-        ranges = list(self._batch_slices(len(key_strs)))
+    async def _batch_get_chunks(self, binary_keys, views):
+        ranges = list(self._batch_slices(len(binary_keys)))
         out = []
         for group_start in range(0, len(ranges), self._get_parallelism):
             group = ranges[group_start:group_start + self._get_parallelism]
             results = await asyncio.gather(
                 *(
-                    self._client.batch_get(key_strs[start:end], views[start:end])
+                    self._client.batch_get(binary_keys[start:end], views[start:end])
                     for start, end in group
                 )
             )

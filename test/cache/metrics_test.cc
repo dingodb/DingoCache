@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 
@@ -57,14 +58,14 @@ TEST(Metrics, CountersTrackOps) {
   auto s = Start(dir, &addr);
   TcpTransport t;
   std::string v(100, 'm');
-  ASSERT_EQ(t.Cache(addr, ToBlockKey("a"), v.data(), v.size()), Status::kOk);
-  ASSERT_EQ(t.Cache(addr, ToBlockKey("b"), v.data(), v.size()), Status::kOk);
+  ASSERT_EQ(t.Cache(addr, ToBlockKey("test/model", "a"), v.data(), v.size()), Status::kOk);
+  ASSERT_EQ(t.Cache(addr, ToBlockKey("test/model", "b"), v.data(), v.size()), Status::kOk);
   std::string out;
-  ASSERT_EQ(t.Range(addr, ToBlockKey("a"), 0, v.size(), &out), Status::kOk);   // hit
-  ASSERT_EQ(t.Range(addr, ToBlockKey("zzz"), 0, 8, &out), Status::kNotFound);  // miss
+  ASSERT_EQ(t.Range(addr, ToBlockKey("test/model", "a"), 0, v.size(), &out), Status::kOk);   // hit
+  ASSERT_EQ(t.Range(addr, ToBlockKey("test/model", "zzz"), 0, 8, &out), Status::kNotFound);  // miss
   bool e = false;
-  ASSERT_EQ(t.Exist(addr, ToBlockKey("a"), &e), Status::kOk); EXPECT_TRUE(e);   // exist hit
-  ASSERT_EQ(t.Exist(addr, ToBlockKey("nope"), &e), Status::kOk); EXPECT_FALSE(e); // exist miss
+  ASSERT_EQ(t.Exist(addr, ToBlockKey("test/model", "a"), &e), Status::kOk); EXPECT_TRUE(e);   // exist hit
+  ASSERT_EQ(t.Exist(addr, ToBlockKey("test/model", "nope"), &e), Status::kOk); EXPECT_FALSE(e); // exist miss
 
   EXPECT_EQ(s->m_cache_put(), 2u);
   EXPECT_EQ(s->m_cache_hit(), 1u);
@@ -79,6 +80,33 @@ TEST(Metrics, CountersTrackOps) {
   s->Stop();
 }
 
+TEST(Metrics, TenantQuotaSeriesAreBoundedToConfiguredHashes) {
+  const fs::path quota_file =
+      fs::temp_directory_path() / "dfkv_metrics_tenant_quotas";
+  std::ofstream(quota_file) << "fa1cde78082f951e 4\n";
+  ScopedEnv quotas("DFKV_TENANT_QUOTAS_FILE", quota_file.c_str());
+  ScopedEnv default_quota("DFKV_TENANT_DEFAULT_QUOTA_BYTES", "0");
+  std::string addr;
+  auto dir = fs::temp_directory_path() / "dfkv_metrics_quota";
+  auto server = Start(dir, &addr);
+  TcpTransport transport;
+  const BlockKey key = ToBlockKey("test/model", "too-large");
+  ASSERT_EQ(key.tenant_hash, 0xfa1cde78082f951eULL);
+  EXPECT_EQ(transport.Cache(addr, key, "12345", 5),
+            Status::kQuotaExceeded);
+  const std::string text = server->MetricsText();
+  EXPECT_NE(text.find("dfkv_tenant_default_quota_bytes 0"),
+            std::string::npos) << text;
+  EXPECT_NE(text.find(
+                "dfkv_tenant_quota_limit_bytes{tenant_hash=\""
+                "fa1cde78082f951e\"} 4"),
+            std::string::npos) << text;
+  EXPECT_NE(text.find("dfkv_tenant_quota_rejections_total 1"),
+            std::string::npos) << text;
+  server->Stop();
+  fs::remove(quota_file);
+}
+
 TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
   ScopedEnv engine("DFKV_STORE_ENGINE", "slab");
   ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
@@ -89,7 +117,7 @@ TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
   auto s = Start(dir, &addr);
   TcpTransport t;
   std::string value(3000, 's');
-  ASSERT_EQ(t.Cache(addr, ToBlockKey("slab-key"), value.data(), value.size()),
+  ASSERT_EQ(t.Cache(addr, ToBlockKey("test/model", "slab-key"), value.data(), value.size()),
             Status::kOk);
 
   const std::string text = s->MetricsText();
@@ -114,15 +142,29 @@ TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
       << text;
   EXPECT_NE(text.find("dfkv_slab_pool_extents 0"), std::string::npos)
       << text;
+  EXPECT_NE(text.find(
+                "dfkv_slab_class_extents{slot_size=\"4096\"} 1"),
+            std::string::npos)
+      << text;
+  EXPECT_NE(text.find(
+                "dfkv_slab_class_resident_objects{slot_size=\"4096\"} 1"),
+            std::string::npos)
+      << text;
+  EXPECT_NE(text.find(
+                "dfkv_slab_class_fragmentation_bytes{slot_size=\"4096\"} 1096"),
+            std::string::npos)
+      << text;
   EXPECT_NE(text.find("dfkv_slab_failed_disks 0"), std::string::npos)
       << text;
   EXPECT_NE(text.find("dfkv_slab_healthy 1"), std::string::npos) << text;
+  EXPECT_NE(text.find("dfkv_storage_healthy 1"), std::string::npos) << text;
   s->Stop();
   s.reset();
   fs::remove_all(dir);
 }
 
 TEST(Metrics, PrometheusFormatAndIdentity) {
+  ScopedEnv engine("DFKV_STORE_ENGINE", "slab");
   std::string addr;
   auto dir = fs::temp_directory_path() / "dfkv_metrics_c";
   auto s = Start(dir, &addr);
@@ -136,8 +178,25 @@ TEST(Metrics, PrometheusFormatAndIdentity) {
   // build_info + uptime present
   EXPECT_NE(text.find("dfkv_build_info{"), std::string::npos) << text;
   EXPECT_NE(text.find("version=\""), std::string::npos) << text;
+  EXPECT_NE(text.find(",engine=\"slab\",write_mode=\""),
+            std::string::npos) << text;
+  EXPECT_EQ(text.find(",engine=\"file\""), std::string::npos) << text;
   EXPECT_NE(text.find("dfkv_uptime_seconds"), std::string::npos) << text;
   s->Stop();
+}
+
+TEST(Metrics, BuildInfoReportsExplicitFileDiagnosticBackend) {
+  ScopedEnv engine("DFKV_STORE_ENGINE", "file");
+  std::string addr;
+  auto dir = fs::temp_directory_path() / "dfkv_metrics_file";
+  auto server = Start(dir, &addr);
+  const std::string text = server->MetricsText();
+  EXPECT_NE(text.find(",engine=\"file\",write_mode=\"n/a\""),
+            std::string::npos) << text;
+  EXPECT_EQ(text.find("dfkv_slab_capacity_bytes"), std::string::npos) << text;
+  server->Stop();
+  server.reset();
+  fs::remove_all(dir);
 }
 
 TEST(Metrics, LabelValuesAreEscaped) {
@@ -168,9 +227,9 @@ TEST(Metrics, DepthSeriesPresent) {
   auto s = Start(dir, &addr);
   TcpTransport t;
   std::string v(100, 'q');
-  ASSERT_EQ(t.Cache(addr, ToBlockKey("a"), v.data(), v.size()), Status::kOk);
+  ASSERT_EQ(t.Cache(addr, ToBlockKey("test/model", "a"), v.data(), v.size()), Status::kOk);
   std::string out;
-  ASSERT_EQ(t.Range(addr, ToBlockKey("a"), 0, v.size(), &out), Status::kOk);
+  ASSERT_EQ(t.Range(addr, ToBlockKey("test/model", "a"), 0, v.size(), &out), Status::kOk);
   std::string text = s->MetricsText();
   EXPECT_NE(text.find("# TYPE dfkv_op_latency_seconds histogram"), std::string::npos) << text;
   EXPECT_NE(text.find("dfkv_op_latency_seconds_count{op=\"get\"}"), std::string::npos) << text;
@@ -189,7 +248,7 @@ TEST(Metrics, OpenConnectionsTracksLiveConn) {
   {
     TcpTransport t;  // pooled keep-alive connection held open for this scope
     std::string out;
-    ASSERT_EQ(t.Range(addr, ToBlockKey("x"), 0, 1, &out), Status::kNotFound);
+    ASSERT_EQ(t.Range(addr, ToBlockKey("test/model", "x"), 0, 1, &out), Status::kNotFound);
     // a connection is open while the pooled fd lives
     EXPECT_NE(s->MetricsText().find("dfkv_open_connections"), std::string::npos);
   }  // transport destructor closes the pooled fd; server-side handler exits
@@ -227,7 +286,7 @@ TEST(Metrics, RemoteStatsOp) {
   auto s = Start(dir, &addr);
   TcpTransport t;
   std::string v(50, 'x');
-  ASSERT_EQ(t.Cache(addr, ToBlockKey("k"), v.data(), v.size()), Status::kOk);
+  ASSERT_EQ(t.Cache(addr, ToBlockKey("test/model", "k"), v.data(), v.size()), Status::kOk);
   std::string text;
   ASSERT_EQ(t.Stats(addr, &text), Status::kOk);
   EXPECT_NE(text.find("dfkv_cache_put_total 1"), std::string::npos) << text;
@@ -244,12 +303,12 @@ TEST(Metrics, ExistLatencyHistogramPresent) {
   auto s = Start(dir, &addr);
   TcpTransport t;
   std::string v(100, 'x');
-  ASSERT_EQ(t.Cache(addr, ToBlockKey("k"), v.data(), v.size()), Status::kOk);
+  ASSERT_EQ(t.Cache(addr, ToBlockKey("test/model", "k"), v.data(), v.size()), Status::kOk);
   // Drive enough exist probes that the sampler (1/64) records at least one.
   bool e = false;
   for (int i = 0; i < 4096; ++i) {
-    ASSERT_EQ(t.Exist(addr, ToBlockKey("k"), &e), Status::kOk);
-    ASSERT_EQ(t.Exist(addr, ToBlockKey("absent"), &e), Status::kOk);
+    ASSERT_EQ(t.Exist(addr, ToBlockKey("test/model", "k"), &e), Status::kOk);
+    ASSERT_EQ(t.Exist(addr, ToBlockKey("test/model", "absent"), &e), Status::kOk);
   }
   std::string text = s->MetricsText();
   // The op="exist" latency series exists and is distinct from get/put.

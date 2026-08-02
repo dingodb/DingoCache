@@ -70,9 +70,9 @@ class GpuNodeDedup {
   // pure-Python transfer threads never touched CUDA), the hint's device
   // selects which PRIMARY context to bind — the framework already holds it,
   // so this never creates a context, only makes it current here.
-  static std::unique_ptr<GpuNodeDedup> FromEnv(uint64_t model_hash,
+  static std::unique_ptr<GpuNodeDedup> FromEnv(uint64_t namespace_hash,
                                                const void* device_dst_hint);
-  static std::string EnvSegmentName(uint64_t model_hash);
+  static std::string EnvSegmentName(uint64_t namespace_hash);
   static std::unique_ptr<GpuNodeDedup> Open(const Options& opt);
   ~GpuNodeDedup();
 
@@ -81,9 +81,10 @@ class GpuNodeDedup {
 
   // Variable-size SG semantics (BatchGetAutoSg): a published payload hits iff
   // its length fits sum(caps); it is scattered across segs in order. *got
-  // receives the payload length. kFetch obliges PublishSg or Abort.
+  // receives the payload length. kFetch returns an ownership token that must
+  // be passed to PublishSg/Abort so Remove can fence late publishers.
   Role ClaimSg(const BlockKey& key, const Seg* segs, size_t nsegs,
-               size_t total_cap, size_t* got);
+               size_t total_cap, size_t* got, uint64_t* token);
   bool WaitSg(const BlockKey& key, const Seg* segs, size_t nsegs,
               size_t total_cap, size_t* got);
 
@@ -108,8 +109,11 @@ class GpuNodeDedup {
   void WaitManySg(WaitItem* items, size_t n);
   // Gathers the fetched segments (total payload = len bytes) into this
   // process' arena and flips the slot READY.
-  void PublishSg(const BlockKey& key, const Seg* segs, size_t nsegs, size_t len);
-  void Abort(const BlockKey& key);
+  void PublishSg(const BlockKey& key, uint64_t token, const Seg* segs,
+                 size_t nsegs, size_t len);
+  void Abort(const BlockKey& key, uint64_t token);
+  // Eviction barrier for READY and in-flight entries.
+  void Invalidate(const BlockKey& key);
 
   int wait_ms() const { return wait_ms_; }
 

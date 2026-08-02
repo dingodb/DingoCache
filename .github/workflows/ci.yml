@@ -233,11 +233,48 @@ jobs:
           # 共享遥测包：dfkv_hicache.py 顶部 `from dfkv_telemetry import ...`，
           # 不一起打包则 SGLang 插件加载即 ImportError。
           cp -r integration/hicache/dfkv_telemetry "$PKG/python/"
-          # vLLM / LMCache 连接器（源码 Python 包，随 release 一起发，便于免源码直接 pip install 对接）
+          # 共享 identity/C ABI 包 + vLLM / LMCache 连接器（源码 Python 包，随 release
+          # 一起发；三个 sibling root 可从解压后的 tarball 直接 pip install）。
           mkdir -p "$PKG/integration"
-          cp -r integration/vllm integration/lmcache "$PKG/integration/"
+          cp -r integration/common integration/vllm integration/lmcache "$PKG/integration/"
           find "$PKG/python" "$PKG/integration" -type d \( -name '__pycache__' -o -name '*.egg-info' -o -name '.pytest_cache' \) -prune -exec rm -rf {} + 2>/dev/null || true
           cp README.md VERSION LICENSE "$PKG/"
+          # Python 包闭包也必须纯 shell 验证：portable 构建容器刻意不安装 python3，
+          # 更不能用临时 wheel 掩盖 tarball 内缺少 sibling source root 的问题。
+          for spec in \
+            "common:dfkv-common:dfkv_common" \
+            "vllm:dfkv-vllm:dfkv_vllm" \
+            "lmcache:dfkv-connector:dfkv_connector"; do
+            package=${spec%%:*}
+            rest=${spec#*:}
+            distribution=${rest%%:*}
+            module=${rest##*:}
+            root="$PKG/integration/$package"
+            if [ ! -f "$root/pyproject.toml" ] || [ ! -d "$root/src/$module" ]; then
+              echo "ERROR: packaged integration/$package is not an installable source root"
+              exit 1
+            fi
+            if ! grep -Eq "^[[:space:]]*name[[:space:]]*=[[:space:]]*\"$distribution\"[[:space:]]*$" \
+                 "$root/pyproject.toml"; then
+              echo "ERROR: packaged integration/$package has wrong project name (expected $distribution)"
+              exit 1
+            fi
+          done
+          common_version=$(sed -nE \
+            's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"([^"]+)"[[:space:]]*$/\1/p' \
+            "$PKG/integration/common/pyproject.toml")
+          if [ -z "$common_version" ]; then
+            echo "ERROR: packaged integration/common has no project version"
+            exit 1
+          fi
+          for package in vllm lmcache; do
+            if ! grep -Fq "\"dfkv-common==$common_version\"" \
+                 "$PKG/integration/$package/pyproject.toml"; then
+              echo "ERROR: packaged integration/$package does not pin local dfkv-common==$common_version"
+              exit 1
+            fi
+          done
+          echo "package source-root closure check OK (common=$common_version, vllm, lmcache)"
           # 打包自检：静态解析 python/ 内所有本地 dfkv_* import，缺一个文件就 fail。
           # （sglang 不在 runner 里装不了，真 import 跑不了；容器也没有 python3——
           #   用纯 shell 做依赖闭包检查，正是这道门能拦住 v1.31.0 漏 dfkv_hot_config.py 这类事故。）

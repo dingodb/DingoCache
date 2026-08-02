@@ -64,6 +64,7 @@ class DfkvStoreScheduler:
             "load_async", True
         )
         self.client = LookupKeyClient(vllm_config)
+        self._closed = False
 
         # Align with the engine's own scheduler_block_size and hash_block_size.
         self._block_size, self._hash_block_size = resolve_kv_cache_block_sizes(
@@ -376,6 +377,13 @@ class DfkvStoreScheduler:
                 request.request_id,
             )
         return delay_free_blocks, None
+
+    def close(self) -> None:
+        """Close the scheduler-side lookup channel once."""
+        if self._closed:
+            return
+        self._closed = True
+        self.client.close()
 
     def reset_store(self) -> bool:
         """Request a global store reset via worker rank 0.

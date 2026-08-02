@@ -16,7 +16,6 @@
 #include <cstdlib>
 #include <limits>
 
-#include "common/value_header.h"
 
 namespace dfkv {
 namespace wire_limits {
@@ -26,9 +25,9 @@ namespace wire_limits {
 constexpr size_t kIoAlign = 4096;
 
 // dbuf/SGE length is uint32, so a payload must stay under
-// uint32max - header - 2*align or registered lengths silently overflow.
+// Keep room for direct-I/O alignment rounding inside uint32_t SGE lengths.
 constexpr size_t kPayloadHardCap = static_cast<size_t>(
-    std::numeric_limits<uint32_t>::max() - ValueHeader::kSize - 2 * kIoAlign);
+    std::numeric_limits<uint32_t>::max() - 2 * kIoAlign);
 
 inline size_t EnvBytes(const char* name, size_t dflt) {
   const char* v = std::getenv(name);
@@ -42,21 +41,19 @@ inline size_t EnvBytes(const char* name, size_t dflt) {
 }
 
 // The server's max value payload: configured (0 = 64 MiB default), then the
-// env overrides (DFKV_RDMA_MAX_PAYLOAD_BYTES / DFKV_RDMA_MAX_MSG_BYTES, in
-// that order), clamped to the uint32 hard cap. Same math the RDMA server
-// applies; a PUT larger than this is rejected on every transport.
+// DFKV_RDMA_MAX_PAYLOAD_BYTES override, clamped to the uint32 hard cap. Same
+// math the RDMA server applies; a PUT larger than this is rejected on every
+// transport.
 inline size_t ResolveMaxPayload(size_t configured) {
   size_t n = configured ? configured : (64u << 20);
   n = EnvBytes("DFKV_RDMA_MAX_PAYLOAD_BYTES", n);
-  n = EnvBytes("DFKV_RDMA_MAX_MSG_BYTES", n);
   if (n > kPayloadHardCap) n = kPayloadHardCap;
   return n;
 }
 
-// Bound for a full PUT request frame's payload (value header + value bytes).
+// Bound for the raw value bytes carried by a PUT request.
 inline uint64_t MaxRequestPayload(size_t configured_max_value = 0) {
-  return static_cast<uint64_t>(ValueHeader::kSize) +
-         static_cast<uint64_t>(ResolveMaxPayload(configured_max_value));
+  return static_cast<uint64_t>(ResolveMaxPayload(configured_max_value));
 }
 
 // MDS request frames carry a group name + one MemberInfo (well under 1 KiB);

@@ -16,10 +16,11 @@
 namespace dfkv {
 
 namespace {
-constexpr uint32_t kMagic = 0x44445633u;  // "DDV3" (128-bit identity)
+constexpr uint32_t kMagic = 0x44445634u;  // "DDV4" (publisher ownership tokens)
 constexpr uint32_t kStateEmpty = 0;
 constexpr uint32_t kStateFetching = 1;
 constexpr uint32_t kStateReady = 2;
+constexpr uint32_t kStatePublishing = 3;
 constexpr size_t kAnyLen = SIZE_MAX;  // CopyOut strict_n wildcard
 
 uint64_t EnvU64(const char* name, uint64_t dflt) {
@@ -67,20 +68,20 @@ uint64_t NodeDedup::NowMs() {
       std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
-std::string NodeDedup::EnvSegmentName(uint64_t model_hash) {
+std::string NodeDedup::EnvSegmentName(uint64_t namespace_hash) {
   char name[128];
   // Layout version FIRST: a layout bump gets a fresh name and can never be
   // silently disabled by (or corrupt) a segment an older lib left behind —
   // old and new processes each rendezvous within their own generation during
   // a rolling upgrade, then the old segment ages out with its processes.
-  // uid-scoped so unrelated users on one host can't share (or collide on) a
-  // segment; model_hash separates keyspaces (same salting as the block keys).
-  std::snprintf(name, sizeof(name), "/dfkv-dedup-v3-%u-%016llx", ::getuid(),
-                static_cast<unsigned long long>(model_hash));
+  // uid-scoped so unrelated users on one host cannot share a segment; the
+  // canonical namespace digest separates independent keyspaces.
+  std::snprintf(name, sizeof(name), "/dfkv-dedup-v4-%u-%016llx", ::getuid(),
+                static_cast<unsigned long long>(namespace_hash));
   return name;
 }
 
-std::unique_ptr<NodeDedup> NodeDedup::FromEnv(uint64_t model_hash) {
+std::unique_ptr<NodeDedup> NodeDedup::FromEnv(uint64_t namespace_hash) {
   const char* on = std::getenv("DFKV_CLIENT_NODE_DEDUP");
   if (!on || std::strcmp(on, "1") != 0) return nullptr;
   Options o;
@@ -89,7 +90,7 @@ std::unique_ptr<NodeDedup> NodeDedup::FromEnv(uint64_t model_hash) {
   o.wait_ms = static_cast<int>(EnvU64("DFKV_NODE_DEDUP_WAIT_MS", 500));
   o.takeover_ms = static_cast<int>(EnvU64("DFKV_NODE_DEDUP_TAKEOVER_MS", 2000));
   o.ttl_ms = static_cast<int>(EnvU64("DFKV_NODE_DEDUP_TTL_MS", 5000));
-  o.name = EnvSegmentName(model_hash);
+  o.name = EnvSegmentName(namespace_hash);
   return Open(o);
 }
 
@@ -251,8 +252,10 @@ bool NodeDedup::CopyOut(Slot* s, size_t cap, size_t strict_n, char* dst,
 }
 
 NodeDedup::Role NodeDedup::ClaimImpl(const BlockKey& key, Kind kind, size_t cap,
-                                     size_t strict_n, char* dst, size_t* got) {
-  if (cap == 0 || cap > arena_bytes_ / 2) return Role::kFetch;  // oversize: no dedup
+                                     size_t strict_n, char* dst, size_t* got,
+                                     uint64_t* token) {
+  if (token) *token = 0;
+  if (cap == 0 || cap > arena_bytes_ / 2) return Role::kFetch;
   const uint64_t now = NowMs();
   if (Slot* s = Find(key, kind)) {
     const uint32_t st = s->state.load(std::memory_order_acquire);
@@ -263,28 +266,30 @@ NodeDedup::Role NodeDedup::ClaimImpl(const BlockKey& key, Kind kind, size_t cap,
         hits_.fetch_add(1, std::memory_order_relaxed);
         return Role::kHit;
       }
-      // Expired/torn/size-mismatch: fall through to Reserve (may recycle it).
     } else if (st == kStateFetching) {
       const uint64_t started = s->fetch_start_ms.load(std::memory_order_relaxed);
-      if (now - started <= static_cast<uint64_t>(takeover_ms_)) return Role::kWait;
-      // Fetcher looks dead: take the fetch over (CAS on fetch_start_ms so
-      // exactly one waiter wins; the losers keep waiting on the winner).
-      uint64_t expect = started;
-      if (s->fetch_start_ms.compare_exchange_strong(expect, now,
-                                                    std::memory_order_acq_rel)) {
+      if (now - started <= static_cast<uint64_t>(takeover_ms_))
+        return Role::kWait;
+      uint32_t expect = kStateFetching;
+      if (s->state.compare_exchange_strong(expect, kStatePublishing,
+                                           std::memory_order_acq_rel)) {
+        s->gen.fetch_add(1, std::memory_order_acq_rel);
+        s->fetch_start_ms.store(now, std::memory_order_relaxed);
+        const uint64_t mine = s->gen.fetch_add(1, std::memory_order_release) + 1;
+        s->state.store(kStateFetching, std::memory_order_release);
+        if (token) *token = mine;
         fetches_.fetch_add(1, std::memory_order_relaxed);
         return Role::kFetch;
       }
+      return Role::kWait;
+    } else if (st == kStatePublishing) {
       return Role::kWait;
     }
   }
   if (Slot* mine = Reserve(key, kind)) {
     // Concurrent claimers can reserve TWO slots for one key when the second
-    // claimer's Find() races the first's identity write (near-synchronous
-    // claim loops hit that window almost every key; found live on the GPU
-    // flavor as exactly-2x server reads). Re-scan twice — immediately and
-    // after a ~1 us settle spin — and keep only the LOWEST probe position
-    // (what every waiter's Find returns); other winners release and wait.
+    // claimer's Find() races the first's identity write. Keep only the first
+    // probe position, which is the slot every waiter finds.
     for (int pass = 0; pass < 2; ++pass) {
       Slot* first = Find(key, kind);
       if (first && first != mine) {
@@ -296,63 +301,99 @@ NodeDedup::Role NodeDedup::ClaimImpl(const BlockKey& key, Kind kind, size_t cap,
       if (pass == 0)
         for (volatile int spin = 0; spin < 2000; ++spin) {}
     }
+    if (token) *token = mine->gen.load(std::memory_order_acquire);
     fetches_.fetch_add(1, std::memory_order_relaxed);
     return Role::kFetch;
   }
-  return Role::kFetch;  // no slot available: plain fetch, nothing to publish
+  return Role::kFetch;
 }
 
-NodeDedup::Role NodeDedup::Claim(const BlockKey& key, size_t n, char* dst) {
-  return ClaimImpl(key, Kind::kData, n, n, dst, nullptr);
+NodeDedup::Role NodeDedup::Claim(const BlockKey& key, size_t n, char* dst,
+                                 uint64_t* token) {
+  return ClaimImpl(key, Kind::kData, n, n, dst, nullptr, token);
 }
 
 NodeDedup::Role NodeDedup::ClaimAuto(const BlockKey& key, size_t cap, char* dst,
-                                     size_t* got) {
-  return ClaimImpl(key, Kind::kData, cap, kAnyLen, dst, got);
+                                     size_t* got, uint64_t* token) {
+  return ClaimImpl(key, Kind::kData, cap, kAnyLen, dst, got, token);
 }
 
-NodeDedup::Role NodeDedup::ClaimExist(const BlockKey& key, bool* val) {
+NodeDedup::Role NodeDedup::ClaimExist(const BlockKey& key, bool* val,
+                                      uint64_t* token) {
   char b = 0;
-  const Role r = ClaimImpl(key, Kind::kExist, 1, 1, &b, nullptr);
+  const Role r = ClaimImpl(key, Kind::kExist, 1, 1, &b, nullptr, token);
   if (r == Role::kHit && val) *val = (b != 0);
   return r;
 }
 
-void NodeDedup::Publish(const BlockKey& key, Kind kind, const char* data, size_t n) {
+void NodeDedup::Publish(const BlockKey& key, Kind kind, uint64_t token,
+                        const char* data, size_t n) {
+  if (token == 0) return;
   Slot* s = Find(key, kind);
-  if (!s || s->state.load(std::memory_order_acquire) != kStateFetching) return;
+  if (!s || s->gen.load(std::memory_order_acquire) != token) return;
+  uint32_t st = kStateFetching;
+  if (!s->state.compare_exchange_strong(st, kStatePublishing,
+                                        std::memory_order_acq_rel))
+    return;
   // Ring-allocate: reserve [cur, cur+n) contiguously; skip the tail remainder
   // when a lap boundary would split the payload.
   uint64_t cur = hdr_->alloc_cursor.load(std::memory_order_relaxed);
   uint64_t off, seq;
   for (;;) {
     const uint64_t in_lap = cur % arena_bytes_;
-    const uint64_t need = (in_lap + n > arena_bytes_) ? (arena_bytes_ - in_lap) + n : n;
+    const uint64_t need =
+        (in_lap + n > arena_bytes_) ? (arena_bytes_ - in_lap) + n : n;
     if (hdr_->alloc_cursor.compare_exchange_weak(cur, cur + need,
                                                  std::memory_order_acq_rel)) {
-      seq = cur + need;                       // cursor AFTER this allocation
-      off = (cur + need - n) % arena_bytes_;  // payload sits at the end of the grab
+      seq = cur + need;
+      off = (cur + need - n) % arena_bytes_;
       break;
     }
   }
   std::memcpy(arena_ + off, data, n);
-  s->gen.fetch_add(1, std::memory_order_acq_rel);   // odd: mutating
+  s->gen.fetch_add(1, std::memory_order_acq_rel);
   s->len = static_cast<uint32_t>(n);
   s->payload_off = off;
   s->alloc_seq = seq;
-  s->fetch_start_ms.store(NowMs(), std::memory_order_relaxed);  // TTL from publish
-  s->gen.fetch_add(1, std::memory_order_release);   // even: coherent
+  s->fetch_start_ms.store(NowMs(), std::memory_order_relaxed);
+  s->gen.fetch_add(1, std::memory_order_release);
   s->state.store(kStateReady, std::memory_order_release);
 }
 
-void NodeDedup::Abort(const BlockKey& key, Kind kind) {
+void NodeDedup::Abort(const BlockKey& key, Kind kind, uint64_t token) {
+  if (token == 0) return;
   Slot* s = Find(key, kind);
-  if (!s) return;
-  // Only the fetcher aborts. Freeing the slot immediately (instead of letting
-  // it age into a takeover) lets a falling-back waiter re-claim at once; CAS
-  // so a concurrent takeover winner isn't clobbered.
+  if (!s || s->gen.load(std::memory_order_acquire) != token) return;
   uint32_t st = kStateFetching;
   s->state.compare_exchange_strong(st, kStateEmpty, std::memory_order_acq_rel);
+}
+
+void NodeDedup::InvalidateKind(const BlockKey& key, Kind kind) {
+  for (;;) {
+    Slot* s = Find(key, kind);
+    if (!s) return;
+    uint32_t st = s->state.load(std::memory_order_acquire);
+    if (st == kStatePublishing) {
+      std::this_thread::yield();
+      continue;
+    }
+    if (st != kStateFetching && st != kStateReady) return;
+    if (!s->state.compare_exchange_weak(st, kStatePublishing,
+                                        std::memory_order_acq_rel))
+      continue;
+    // Supersede every outstanding ownership token before making the slot
+    // reusable. A late publisher can find a newly claimed slot for this key,
+    // but its old token can never publish into that generation.
+    s->gen.fetch_add(1, std::memory_order_acq_rel);
+    s->gen.fetch_add(1, std::memory_order_release);
+    s->state.store(kStateEmpty, std::memory_order_release);
+    return;
+  }
+}
+
+void NodeDedup::Invalidate(const BlockKey& key) {
+  InvalidateKind(key, Kind::kData);
+  InvalidateKind(key, Kind::kExist);
 }
 
 bool NodeDedup::WaitImpl(const BlockKey& key, Kind kind, size_t cap,

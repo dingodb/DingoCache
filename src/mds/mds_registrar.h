@@ -28,9 +28,18 @@ namespace dfkv {
 // within kTtlSeconds with no explicit deregister.
 class MdsRegistrar {
  public:
+  // An MDS register/heartbeat may spend up to three sequential 2 s etcd
+  // request budgets (failed keepalive, lease grant, Put). Leave one second for
+  // TCP framing/scheduling so a valid slow MDS operation cannot self-timeout.
+  static constexpr int kDefaultIoTimeoutMs = 7000;
+  // first_registration_timeout_ms == 0 preserves an unbounded registration
+  // loop for non-daemon consumers. Cache-node startup supplies its mandatory,
+  // bounded deadline and exits fail-closed when it expires.
   MdsRegistrar(std::vector<std::string> mds_eps, std::string group, MemberInfo self,
-               int heartbeat_ms = 10000, int io_timeout_ms = 2000,
-               bool is_client = false);
+               int heartbeat_ms = 10000,
+               int io_timeout_ms = kDefaultIoTimeoutMs,
+               bool is_client = false,
+               int first_registration_timeout_ms = 0);
   ~MdsRegistrar();
 
   void Start();
@@ -42,23 +51,59 @@ class MdsRegistrar {
   using StatsFn = std::function<MemberStats()>;
   void set_stats_provider(StatsFn fn) { stats_fn_ = std::move(fn); }
 
+  // Called once after the first successful registration. Configure before
+  // Start(); heartbeat failures after that success do not clear the latch.
+  using RegisteredFn = std::function<void()>;
+  void set_registered_callback(RegisteredFn fn) {
+    registered_fn_ = std::move(fn);
+  }
+  bool registered() const {
+    return registered_.load(std::memory_order_acquire);
+  }
+  bool first_registration_timed_out() const {
+    return first_registration_timed_out_.load(std::memory_order_acquire);
+  }
+
+  uint64_t heartbeat_failures_consecutive() const {
+    return heartbeat_failures_consecutive_.load(std::memory_order_relaxed);
+  }
+  uint64_t heartbeat_failures_total() const {
+    return heartbeat_failures_total_.load(std::memory_order_relaxed);
+  }
+  uint64_t last_success_age_seconds() const;
+  bool heartbeat_healthy() const {
+    return registered() && heartbeat_failures_consecutive() == 0;
+  }
+  std::string MetricsText() const;
+
   bool RegisterOnce();
   bool HeartbeatOnce();
 
  private:
-  bool SendOnce(uint8_t op);
+  bool SendOnce(uint8_t op, int io_timeout_ms, uint64_t deadline_ms);
+  bool RegisterOnceBefore(int io_timeout_ms, uint64_t deadline_ms);
+  void MarkFirstRegistrationTimedOut();
+  void ReportHeartbeatResult(bool ok);
   void Loop();
   bool WaitMs(int ms);
   uint64_t NowMs() const;
-
   MdsEndpoints eps_;
   std::string group_;
   MemberInfo self_;
   StatsFn stats_fn_;
+  RegisteredFn registered_fn_;
   int hb_ms_;
   int io_ms_;
   bool is_client_;
+  int first_registration_timeout_ms_;
   std::atomic<bool> running_{false};
+  std::atomic<bool> registered_{false};
+  std::atomic<bool> first_registration_timed_out_{false};
+  std::atomic<uint64_t> heartbeat_failures_consecutive_{0};
+  std::atomic<uint64_t> heartbeat_failures_total_{0};
+  std::atomic<uint64_t> last_success_ms_{0};
+  std::atomic<uint64_t> last_failure_log_ms_{0};
+  static constexpr uint64_t kFailureLogIntervalMs = 30000;
   std::thread th_;
   std::mutex mu_;
   std::condition_variable cv_;

@@ -6,6 +6,7 @@
 """Data classes for DfkvStoreConnector."""
 
 from collections.abc import Iterable, Sequence
+from dfkv_common import pool_key
 from dataclasses import dataclass
 from itertools import product
 
@@ -87,9 +88,15 @@ class KeyMetadata:
     """Metadata for constructing pool keys."""
 
     model_name: str
+    dp_size: int
+    dp_rank: int
+    tp_size: int
     tp_rank: int
+    pcp_size: int
     pcp_rank: int
+    dcp_size: int
     dcp_rank: int
+    pp_size: int
     pp_rank: int
     group_id: int = 0
 
@@ -99,30 +106,43 @@ class PoolKey:
     """Key for addressing KV cache blocks in the distributed store."""
 
     key_metadata: KeyMetadata
-    chunk_hash: str
+    chunk_hash: str | bytes
 
     def __hash__(self):
         return hash(
             (
                 self.key_metadata.model_name,
+                self.key_metadata.dp_size,
+                self.key_metadata.dp_rank,
+                self.key_metadata.tp_size,
                 self.key_metadata.tp_rank,
+                self.key_metadata.pcp_size,
                 self.key_metadata.pcp_rank,
+                self.key_metadata.dcp_size,
                 self.key_metadata.dcp_rank,
+                self.key_metadata.pp_size,
                 self.key_metadata.pp_rank,
                 self.key_metadata.group_id,
                 self.chunk_hash,
             )
         )
 
-    def to_string(self) -> str:
-        return (
-            f"{self.key_metadata.model_name}"
-            f"@tp_rank:{self.key_metadata.tp_rank}"
-            f"@pcp{self.key_metadata.pcp_rank}"
-            f"@dcp{self.key_metadata.dcp_rank}"
-            f"@pp_rank:{self.key_metadata.pp_rank}"
-            f"@group:{self.key_metadata.group_id}"
-            f"@{self.chunk_hash}"
+    def to_bytes(self) -> bytes:
+        return pool_key(
+            self.chunk_hash,
+            pool="kv",
+            dp_size=self.key_metadata.dp_size,
+            dp_rank=self.key_metadata.dp_rank,
+            tp_size=self.key_metadata.tp_size,
+            tp_rank=self.key_metadata.tp_rank,
+            pcp_size=self.key_metadata.pcp_size,
+            pcp_rank=self.key_metadata.pcp_rank,
+            dcp_size=self.key_metadata.dcp_size,
+            dcp_rank=self.key_metadata.dcp_rank,
+            pp_size=self.key_metadata.pp_size,
+            pp_rank=self.key_metadata.pp_rank,
+            group_id=self.key_metadata.group_id,
+            component="all",
         )
 
 
@@ -151,7 +171,7 @@ class ChunkedTokenDatabase:
         # order and always addresses the real physical block IDs.
         self._seg_layout: list[tuple[int, int, int]] | None = None
 
-    def _make_key_by_hash(self, chunk_hash: str) -> PoolKey:
+    def _make_key_by_hash(self, chunk_hash: str | bytes) -> PoolKey:
         return PoolKey(self.metadata, chunk_hash)
 
     def set_kv_caches_base_addr(self, kv_caches_base_addr: list[int]):

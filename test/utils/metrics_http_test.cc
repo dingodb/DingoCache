@@ -110,7 +110,7 @@ TEST(MetricsHttp, HealthCheckPredicateGates503) {
   srv.Stop();
 }
 
-TEST(MetricsHttp, ReadyCheckPredicateGates503) {
+TEST(MetricsHttp, ReadyCheckRecoversAcrossLiveDependencyLoss) {
   std::atomic<bool> ready{false};
   MetricsHttpServer srv([] { return std::string("dfkv_x 1\n"); });
   srv.set_ready_check([&] { return ready.load(); });
@@ -130,11 +130,47 @@ TEST(MetricsHttp, ReadyCheckPredicateGates503) {
   EXPECT_NE(ok.find("200"), std::string::npos) << ok;
   EXPECT_NE(ok.find("ready"), std::string::npos) << ok;
 
+  // Runtime dependency loss must remove scheduler readiness, and restoring the
+  // dependency must recover in place: 200 -> 503 -> 200.
+  ready.store(false);
+  std::string lost = HttpGet(port, "/readyz");
+  EXPECT_NE(lost.find("503"), std::string::npos) << lost;
+  ready.store(true);
+  std::string recovered = HttpGet(port, "/readyz");
+  EXPECT_NE(recovered.find("200"), std::string::npos) << recovered;
   // Unset predicate mirrors the always-200 behavior.
   MetricsHttpServer plain([] { return std::string(); });
   ASSERT_EQ(plain.Start(0), Status::kOk);
   std::string dflt = HttpGet(plain.port(), "/readyz");
   EXPECT_NE(dflt.find("200"), std::string::npos) << dflt;
   plain.Stop();
+  srv.Stop();
+}
+
+TEST(MetricsHttp, StorageHealthDynamicallyRemovesReadiness) {
+  std::atomic<bool> startup{false};
+  std::atomic<bool> first_registration{false};
+  std::atomic<bool> storage_healthy{true};
+  MetricsHttpServer srv([] { return std::string("dfkv_x 1\n"); });
+  srv.set_health_check([&] { return storage_healthy.load(); });
+  srv.set_ready_check([&] {
+    return startup.load() && first_registration.load() &&
+           storage_healthy.load();
+  });
+  ASSERT_EQ(srv.Start(0), Status::kOk);
+
+  EXPECT_NE(HttpGet(srv.port(), "/readyz").find("503"), std::string::npos);
+  startup.store(true);
+  EXPECT_NE(HttpGet(srv.port(), "/readyz").find("503"), std::string::npos);
+  first_registration.store(true);
+  EXPECT_NE(HttpGet(srv.port(), "/readyz").find("200"), std::string::npos);
+
+  // A terminal local store failure affects both endpoints dynamically.
+  storage_healthy.store(false);
+  EXPECT_NE(HttpGet(srv.port(), "/healthz").find("503"), std::string::npos);
+  EXPECT_NE(HttpGet(srv.port(), "/readyz").find("503"), std::string::npos);
+
+  storage_healthy.store(true);
+  EXPECT_NE(HttpGet(srv.port(), "/readyz").find("200"), std::string::npos);
   srv.Stop();
 }

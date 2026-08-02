@@ -35,17 +35,8 @@ DfkvNativeClient = importlib.import_module(
     "dfkv_connector.native_client"
 ).DfkvNativeClient
 
-GEOMETRY = {
-    "model_hash": 0x1234_5678_9ABC_DEF0,
-    "page_size": 16,
-    "dtype_tag": 0,
-    "flags": 0,
-    "tp_size": 1,
-    "tp_rank": 0,
-    "layer_num": 64,
-    "head_num": 8,
-    "head_dim": 128,
-}
+PAGE_SIZE = 16
+KEY_NAMESPACE = b"dfkv/model/v1/test/lmcache-native-smoke"
 
 
 def _start_server(server_bin, cache_dir):
@@ -63,7 +54,7 @@ def _start_server(server_bin, cache_dir):
 
 
 async def _run(client):
-    full = GEOMETRY["page_size"] * 4096  # arbitrary "full chunk" byte size
+    full = PAGE_SIZE * 4096  # arbitrary "full chunk" byte size
     part = full // 2                     # an "unfull" chunk (variable size)
 
     keys = [f"smoke@1@0@{i:x}" for i in range(6)]
@@ -98,8 +89,8 @@ async def _run(client):
 
     # A miss in the batch reports hit=False, length=0.
     mbuf = [bytearray(full)]
-    ok, per_key, lengths = await client.batch_get(["absent@1@0@deadbeef"],
-                                                  [memoryview(mbuf[0])])
+    ok, per_key, lengths = await client.batch_get(
+        [b"absent@1@0@deadbeef"], [memoryview(mbuf[0])])
     assert per_key == [False] and lengths == [0], (per_key, lengths)
     print("[ok] batch_get miss: hit=False, length=0")
 
@@ -124,7 +115,7 @@ def main():
                     raw_endpoint=f"n1=127.0.0.1:{port}",
                     group="",
                     membership="static",
-                    geometry=GEOMETRY,
+                    key_namespace=KEY_NAMESPACE,
                     lib_path=lib,
                     get_parallelism=4,
                     loop=asyncio.get_running_loop(),

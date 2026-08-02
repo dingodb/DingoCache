@@ -100,14 +100,14 @@ if (!FLAGS_kv_cache_only && !FLAGS_enable_stage) { ...return -1; }
 ## 5. DingofsTransport (route via dingofs PeerGroup, reuse the portable KVClient)
 New `src/cache/kvclient/dingofs_transport.{h,cc}` implementing
 `dingofs::cache::kv::Transport` over `remotecache::RemoteBlockCacheImpl`. It
-translates the portable `BlockKey`→`pb::cache::BlockContext`, wraps the value
-bytes in an `IOBuffer` (zero-copy via `AppendUserData`), and **ignores the `node`
-arg** (RemoteBlockCacheImpl re-derives the peer from the BlockKey via the MDS
-PeerGroup Ketama — so client-side `ConHash` is harness-only; pass a single
-placeholder member to `KVClient`). Maps: Put→`SyncCache`, Get→`Range`+`CopyTo`,
-Exist→`Exist`. The value_header / key_map / `dfkv_hicache.py` are reused
-unchanged. (The C-ABI/`libdfkv.so` stays for the ctypes plugin; or build the
-nanobind module below.)
+translates the portable `BlockKey`→`pb::cache::BlockContext` and wraps the raw
+value bytes in an `IOBuffer` (zero-copy via `AppendUserData`). It **ignores the
+`node` arg** because `RemoteBlockCacheImpl` re-derives the peer from the
+`BlockKey` via the MDS PeerGroup Ketama; client-side `ConHash` is harness-only,
+so pass a single placeholder member to `KVClient`. Put→`SyncCache`,
+Get→`Range`+`CopyTo`, Exist→`Exist`. The explicit namespace/object-key codec and
+raw-value contract are shared with `dfkv_hicache.py`. The C ABI remains
+`libdfkv.so`; a nanobind module is the optional alternative below.
 
 ## 6. nanobind module (optional alt to ctypes) — mirror `sdk/python/CMakeLists.txt`
 ```cmake
@@ -125,7 +125,6 @@ from the portable `.cc` + `dingofs_transport.cc`, linking
 
 ## 8. RDMA (deferred for the dingo-cache fusion path)
 Out of scope for the brpc/dingo-cache fusion path (no env). The standalone
-`dfkv_server` already has a production-validated native-verbs RDMA transport
-(built with `-DDFKV_WITH_RDMA=ON`, validated at 400G InfiniBand). For the fusion
-path, an RDMA `Transport` can be added later (brpc rdma or ibverbs one-sided +
-GPUDirect, mirroring Mooncake), keeping value_header/key_map/plugin unchanged.
+`dfkv_server` already has a native-verbs RDMA transport. A future fusion-path
+transport must preserve the same explicit namespace, canonical object key, and
+opaque raw-value contract.

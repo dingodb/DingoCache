@@ -404,3 +404,31 @@ TEST(MdsServer, SilentPeerReleasedByIoTimeout) {
   srv.Stop();
   ::unsetenv("DFKV_MDS_IO_TIMEOUT_S");
 }
+
+TEST(LocalLeaseMap, ChurnIsBoundedByIdleWindow) {
+  LocalLeaseMap leases;
+  constexpr uint64_t kStaleMs = 120000;
+  size_t pruned = 0;
+  for (uint64_t i = 0; i < 10000; ++i) {
+    const uint64_t now_ms = i * 1000;
+    pruned += leases.MaybePrune(now_ms, kStaleMs);
+    leases.Store("member-" + std::to_string(i), static_cast<int64_t>(i + 1),
+                 now_ms);
+  }
+  EXPECT_LE(leases.Size(), 150u);
+  EXPECT_GT(pruned, 9800u);
+}
+
+TEST(LocalLeaseMap, RecentUseSurvivesWhileStaleEntryIsForgotten) {
+  LocalLeaseMap leases;
+  leases.Store("cold", 1, 1000);
+  leases.Store("hot", 2, 1000);
+  int64_t lease_id = 0;
+  ASSERT_TRUE(leases.LookupAndTouch("hot", 100000, &lease_id));
+  EXPECT_EQ(lease_id, 2);
+
+  EXPECT_EQ(leases.Prune(122000, 120000), 1u);
+  EXPECT_EQ(leases.Size(), 1u);
+  EXPECT_FALSE(leases.LookupAndTouch("cold", 122000, &lease_id));
+  EXPECT_TRUE(leases.LookupAndTouch("hot", 122000, &lease_id));
+}

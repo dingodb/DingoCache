@@ -1,11 +1,9 @@
-// TDD R4 — KVClient end-to-end over a REAL TCP loopback transport + cache-node
-// servers (no brpc/GPU). Exercises: header-wrapped Put(SyncCache)/Get/Exist,
-// immediate read-after-write visibility, header-mismatch & CRC-corruption =>
-// safe miss, and 2-node consistent-hash cross-node read.
+// KVClient end-to-end over real TCP loopback cache nodes. Exercises raw-value
+// Put/Get/Exist, immediate visibility, namespace isolation, and two-node
+// consistent-hash cross-node reads.
 #include "client/kv_client.h"
 #include "cache/kv_node_server.h"
 #include "client/key_map.h"
-#include "common/value_header.h"
 
 #include <gtest/gtest.h>
 
@@ -22,11 +20,8 @@ using namespace dfkv;  // NOLINT
 
 namespace {
 
-ValueHeader SelfHdr(uint32_t page_size = 64) {
-  return ValueHeader::Make(/*model=*/0x51ULL, page_size,
-                           /*dtype=*/0x46384534u, ValueHeader::kFlagIsMla,
-                           /*tp_size=*/8, /*tp_rank=*/0, /*layer=*/78,
-                           /*head=*/1, /*head_dim=*/576);
+std::string SelfHdr(uint32_t page_size = 64) {
+  return "test/model/page=" + std::to_string(page_size);
 }
 
 struct Node {
@@ -149,32 +144,49 @@ TEST_F(KVClientTest, MissReturnsFalseNotError) {
   EXPECT_FALSE(c.Get("never/written_k", &out[0], out.size()));
 }
 
-TEST_F(KVClientTest, HeaderMismatchTreatedAsMiss) {
+TEST_F(KVClientTest, NamespaceMismatchTreatedAsMiss) {
   nodes_.push_back(StartNode("a3"));
   std::string v(512, 'x');
   KVClient writer({{ "a", nodes_[0]->addr }}, SelfHdr(/*page=*/64));
   ASSERT_TRUE(writer.Put("k_shared", v.data(), v.size()));
-  // reader with a different geometry (page_size 32) must NOT read wrong bytes
+  // The layout belongs in the canonical namespace; a different page geometry
+  // maps to a different native key and safely misses.
   KVClient reader({{ "a", nodes_[0]->addr }}, SelfHdr(/*page=*/32));
   std::string out(v.size(), '\0');
   EXPECT_FALSE(reader.Get("k_shared", &out[0], out.size()));
 }
 
-TEST_F(KVClientTest, PayloadCorruptionNotDetectedAfterV3) {
-  // v3 dropped the payload checksum (integrity is left to the RC RDMA/RoCE ICRC),
-  // so a corrupted payload byte under an INTACT geometry header now comes back as
-  // a HIT. The header still guards model/page/dtype/layer drift (other tests),
-  // just not bit-level corruption — a deliberate zero-touch tradeoff.
+TEST_F(KVClientTest, RawPayloadRoundTripAddsNoEnvelope) {
+  nodes_.push_back(StartNode("raw"));
+  KVClient c({{"a", nodes_[0]->addr}}, SelfHdr());
+  const char bytes[] = {'D', 'F', 'K', 'V', '\0', '\x01',
+                        static_cast<char>(0xff), 'x'};
+  const std::string value(bytes, sizeof(bytes));
+  ASSERT_TRUE(c.Put("raw/object", value.data(), value.size()));
+
+  const BlockKey key = ToBlockKey(SelfHdr(), "raw/object");
+  const fs::path stored = nodes_[0]->dir / key.StoreKey();
+  ASSERT_TRUE(fs::exists(stored));
+  EXPECT_EQ(fs::file_size(stored), value.size());
+
+  std::string output(value.size(), '\0');
+  ASSERT_TRUE(c.Get("raw/object", output.data(), output.size()));
+  EXPECT_EQ(output, value);
+}
+
+TEST_F(KVClientTest, RawPayloadCorruptionIsReturned) {
+  // Values are deliberately opaque raw bytes. Transport/disk integrity is below
+  // this API; the client does not prepend or validate a checksum envelope.
   nodes_.push_back(StartNode("a4"));
   KVClient c({{ "a", nodes_[0]->addr }}, SelfHdr());
   std::string v(1024, 'y');
   ASSERT_TRUE(c.Put("k_crc", v.data(), v.size()));
-  // corrupt a payload byte on disk (after the 48B header)
-  BlockKey bk = ToBlockKey("k_crc", 0x51ULL);
+  // Corrupt one raw payload byte on disk.
+  BlockKey bk = ToBlockKey(SelfHdr(), "k_crc");
   fs::path f = nodes_[0]->dir / bk.StoreKey();
   ASSERT_TRUE(fs::exists(f));
   { std::fstream io(f, std::ios::in | std::ios::out | std::ios::binary);
-    io.seekp(48 + 100); char b = '!'; io.write(&b, 1); }
+    io.seekp(100); char b = '!'; io.write(&b, 1); }
   std::string out(v.size(), '\0');
   EXPECT_TRUE(c.Get("k_crc", &out[0], out.size()));  // no checksum -> still a hit
   EXPECT_EQ(out[100], '!');                           // the corrupted byte is returned

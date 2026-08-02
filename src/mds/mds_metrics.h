@@ -26,6 +26,10 @@ struct MdsMetrics {
   std::atomic<uint64_t> client_keepalives{0};
   std::atomic<uint64_t> client_list_requests{0};
   std::atomic<uint64_t> clients_last_list{0};  // clients returned by the last ListClients
+  std::atomic<uint64_t> local_member_leases{0};
+  std::atomic<uint64_t> local_client_leases{0};
+  std::atomic<uint64_t> local_member_leases_pruned{0};
+  std::atomic<uint64_t> local_client_leases_pruned{0};
 
   std::string Render() const {
     std::string s;
@@ -52,6 +56,10 @@ struct MdsMetrics {
     m("dfkv_mds_client_keepalives_total", "counter", "Client heartbeat ops received", ld(client_keepalives));
     m("dfkv_mds_client_list_requests_total", "counter", "ListClients ops served", ld(client_list_requests));
     m("dfkv_mds_clients", "gauge", "Clients returned by the last ListClients", ld(clients_last_list));
+    m("dfkv_mds_local_member_leases", "gauge", "Member lease shortcuts currently cached in this MDS process", ld(local_member_leases));
+    m("dfkv_mds_local_client_leases", "gauge", "Client lease shortcuts currently cached in this MDS process", ld(local_client_leases));
+    m("dfkv_mds_local_member_leases_pruned_total", "counter", "Idle member lease shortcuts discarded locally", ld(local_member_leases_pruned));
+    m("dfkv_mds_local_client_leases_pruned_total", "counter", "Idle client lease shortcuts discarded locally", ld(local_client_leases_pruned));
     return s;
   }
 };

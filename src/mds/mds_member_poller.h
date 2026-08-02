@@ -46,8 +46,11 @@ class MemberViewGuard {
       return false;
     }
     empty_streak_ = 0;
+    using Wide = unsigned __int128;
     if (shrink_pct_ > 0 && baseline_ > 0 &&
-        incoming < baseline_ * static_cast<size_t>(100 - shrink_pct_) / 100) {
+        static_cast<Wide>(incoming) * 100 <
+            static_cast<Wide>(baseline_) *
+                static_cast<unsigned>(100 - shrink_pct_)) {
       if (++shrink_streak_ >= views_to_accept_) {
         baseline_ = incoming; shrink_streak_ = 0;
         return true;  // persisted: real mass drain
@@ -74,9 +77,9 @@ class MemberViewGuard {
   uint64_t rejected_shrink_ = 0;
 };
 
-// Client-side discovery: periodically polls the MDS for a group's member view and
-// invokes on_change(members) whenever the epoch (etcd revision) changes. Endpoint
-// selection + failover via MdsEndpoints. One background thread.
+// Client-side discovery: periodically polls the MDS for a group's member view
+// and invokes on_change(members) whenever its placement-content epoch changes.
+// Endpoint selection + failover via MdsEndpoints. One background thread.
 class MdsMemberPoller {
  public:
   using OnChange = std::function<void(const std::vector<MemberInfo>&)>;

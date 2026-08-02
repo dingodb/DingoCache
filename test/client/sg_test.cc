@@ -6,12 +6,12 @@
 // is what the build env provides when RDMA is unavailable.
 #include "client/kv_client.h"
 #include "cache/kv_node_server.h"
-#include "common/value_header.h"
 
 #include <gtest/gtest.h>
 
 #include <filesystem>
 #include <memory>
+#include <limits>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -20,9 +20,7 @@ namespace fs = std::filesystem;
 using namespace dfkv;  // NOLINT
 
 namespace {
-ValueHeader Hdr() {
-  return ValueHeader::Make(0x51, 64, 0x46384534u, ValueHeader::kFlagIsMla, 8, 0, 78, 1, 576);
-}
+std::string Hdr() { return "test/model"; }
 struct Node { fs::path dir; std::unique_ptr<KvNodeServer> srv; std::string addr; };
 std::unique_ptr<Node> Start(const std::string& tag) {
   auto n = std::make_unique<Node>();
@@ -143,6 +141,38 @@ TEST(Sg, OverLimitGuard) {
   std::vector<size_t> lens;
   auto gr = c.BatchGetAutoSg({get}, &lens);
   EXPECT_FALSE(gr[0]) << "30-segment get must be rejected by the guard";
+  a->srv->Stop();
+}
+
+TEST(Sg, SizeMaxSumOverflowFailsOnlyOffendingItem) {
+  auto a = Start("sum_overflow");
+  KVClient c({{"a", a->addr}}, Hdr());
+  char byte = 'v';
+  KvPutItemSg overflow_put{
+      "overflow", {&byte, &byte},
+      {std::numeric_limits<size_t>::max(), size_t{1}}};
+  KvPutItemSg valid_put{"valid", {&byte}, {size_t{1}}};
+  const auto put = c.BatchPutSg({overflow_put, valid_put});
+  ASSERT_EQ(put.size(), 2u);
+  EXPECT_FALSE(put[0]);
+  EXPECT_TRUE(put[1]);
+
+  char overflow_dst = 'x';
+  char valid_dst = '\0';
+  KvGetItemSg overflow_get{
+      "overflow", {&overflow_dst, &overflow_dst},
+      {std::numeric_limits<size_t>::max(), size_t{1}}};
+  KvGetItemSg valid_get{"valid", {&valid_dst}, {size_t{1}}};
+  std::vector<size_t> lengths = {99, 99};
+  const auto get = c.BatchGetAutoSg({overflow_get, valid_get}, &lengths);
+  ASSERT_EQ(get.size(), 2u);
+  ASSERT_EQ(lengths.size(), 2u);
+  EXPECT_FALSE(get[0]);
+  EXPECT_EQ(lengths[0], 0u);
+  EXPECT_EQ(overflow_dst, 'x');
+  EXPECT_TRUE(get[1]);
+  EXPECT_EQ(lengths[1], 1u);
+  EXPECT_EQ(valid_dst, byte);
   a->srv->Stop();
 }
 

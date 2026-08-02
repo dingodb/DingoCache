@@ -10,12 +10,12 @@
 #include <string>
 
 #include <atomic>
+#include <charconv>
 #include <memory>
 #include <vector>
 
 #include "utils/args.h"
 #include "cache/kv_node_server.h"
-#include "compat/sgengine_tcp_frontend.h"
 #include "utils/wire_limits.h"
 #include "utils/log.h"
 #include "common/config_dump.h"
@@ -24,7 +24,6 @@
 #include "common/version.h"
 #ifdef DFKV_WITH_RDMA
 #include "cache/rdma_server.h"
-#include "compat/sgengine_rdma_frontend.h"
 #endif
 
 using dfkv::KvNodeServer;
@@ -47,20 +46,21 @@ int main(int argc, char** argv) {
       "  --cap <bytes>        total cache capacity (LRU self-limits)\n"
       "  --port <p>           TCP bootstrap/data port (0 = ephemeral)\n"
       "  --rdma-port <p>      RDMA QP-bootstrap port (RDMA build only; enables data path)\n"
-      "  --sgengine-tcp-port <p> isolated SGEngine v1 compatibility TCP port (omit = off)\n"
-      "  --sgengine-rdma-port <p> isolated SGEngine v1 compatibility RDMA bootstrap port (omit = off)\n"
       "  --rdma-dev <names>   HCA whitelist; default first ACTIVE local HCA (RDMA build only)\n"
       "  --mds <ip:port,...>  MDS endpoints to register into (with --group/--id/--advertise)\n"
       "  --group <g>          membership group name (default \"default\")\n"
       "  --id <id>            node id; --advertise <ip:port>  address peers reach (rdma-port)\n"
       "  --weight <n>         consistent-hash weight (default 1)\n"
       "  --metrics-port <p>   enable Prometheus /metrics (omit = off); --metrics-bind <addr>\n"
-      "  --store-engine <e>   storage backend: file | slab (default file)\n"
+      "  --mds-registration-timeout-ms <n>  first MDS registration deadline (default 60000; env DFKV_MDS_REGISTRATION_TIMEOUT_MS)\n"
+      "  --store-engine <e>   storage backend: slab | file (default slab)\n"
       "  --slab-write <m>     slab I/O mode: direct | buffered (default direct)\n"
       "  --ram-tier <on|off>  RAM hot tier: write-through arena + RDMA zero-copy GET (default off)\n"
       "  --ram-tier-bytes <n> RAM arena size in bytes (default 4 GiB; pinned once registered)\n"
-      "  --slab-granularity <n>  slab slot quantum bytes (default 1 MiB; CHANGING IT COLD-STARTS the store)\n"
+      "  --slab-granularity <n>  slab slot quantum bytes (default 1 MiB; existing mismatched geometry fails startup)\n"
       "  --put-inflight-limit <n>  cap concurrent disk PUTs; excess fast-fail kCacheFull (0 = off)\n"
+      "  --tcp-max-conns <n> cap cache TCP handlers (default 512, hard max 4096)\n"
+      "  --tcp-io-timeout-s <n>  per-socket TCP read/write timeout seconds (default 60, hard max 3600)\n"
       "  --rdma-depth <n>     RDMA write pipeline depth (must be <= client's; env DFKV_RDMA_DEPTH)\n"
       "  --rdma-numa <0|1>    NUMA-local rail selection per connection (env DFKV_RDMA_NUMA)\n"
       "  --rdma-idle-ms <n>   idle connection reaper interval ms (env DFKV_RDMA_IDLE_MS)\n"
@@ -68,7 +68,7 @@ int main(int argc, char** argv) {
       "  --server-uring <0|1> enable io_uring async-GET path (env DFKV_SERVER_URING; needs -DDFKV_WITH_URING)\n"
       "  --server-uring-depth <n>  io_uring SQ depth (env DFKV_SERVER_URING_DEPTH)\n"
       "  --ram-flush-threads <n>   RAM tier flush thread count (env DFKV_RAM_FLUSH_THREADS)\n"
-      "  --ram-tier-numa <n>  RAM tier NUMA node (env DFKV_RAM_TIER_NUMA)\n"
+      "  --ram-tier-numa <m>  RAM arena policy: interleave | off (env DFKV_RAM_TIER_NUMA)\n"
       "  --ram-tier-shards <n>  RAM tier lock shards, 1-64 (env DFKV_RAM_TIER_SHARDS; default 8)\n"
       "  --slab-table-sync-ms <n>  slab table sync cadence ms (env DFKV_SLAB_TABLE_SYNC_MS)\n"
       "  --slab-reclaim-ms <n>  slab background free-slot reclaimer cadence ms, 0 = off (env DFKV_SLAB_RECLAIM_MS)\n"
@@ -76,26 +76,26 @@ int main(int argc, char** argv) {
       "  --log <level>        log level: INFO|DEBUG|WARN|ERROR (env DFKV_LOG)\n"
       "  --version, -V        print version and exit\n"
       "  --help, -h           print this help and exit\n"
-      "Behavior flags are facades over their DFKV_* env twins (see docs/CONFIG.md\n"
-      "for the full matrix); a flag always overrides a pre-set env value.\n"
+      "Behavior flags are facades over their DFKV_* env twins; see DEPLOY.md and\n"
+      "METRICS.md for the current server matrix. A flag overrides a pre-set env.\n"
       "--rdma-dev is passed directly to the RDMA server (param wins over env).\n",
       dfkv::Version());
     return help ? 0 : 1;
   }
   dfkv::Args args(argc, argv,
-                  {"--dir", "--port", "--cap", "--rdma-port",
-                   "--sgengine-tcp-port", "--sgengine-rdma-port",
-                   "--rdma-dev", "--mds", "--group",
+                  {"--dir", "--port", "--cap", "--rdma-port", "--rdma-dev",
+                   "--mds", "--group",
                    "--id", "--advertise", "--weight",
                    "--metrics-port", "--metrics-bind", "--store-engine",
                    "--slab-write", "--ram-tier", "--ram-tier-bytes",
                    "--slab-granularity", "--put-inflight-limit",
+                   "--tcp-max-conns", "--tcp-io-timeout-s",
                    "--rdma-depth", "--rdma-numa", "--rdma-idle-ms",
                    "--rdma-op-timeout-ms", "--server-uring",
                    "--server-uring-depth", "--ram-flush-threads",
                    "--ram-tier-numa", "--ram-tier-shards", "--slab-table-sync-ms",
                    "--slab-reclaim-ms", "--ram-reclaim-ms", "--log",
-                   "--max-msg"});
+                   "--mds-registration-timeout-ms", "--max-msg"});
   std::string dir = args.Get("--dir", "/tmp/dfkv_node");
   std::string rdma_dev = args.Get("--rdma-dev", "");
   std::string mds = args.Get("--mds", "");
@@ -106,15 +106,13 @@ int main(int argc, char** argv) {
   int weight = args.GetInt("--weight", 1);
   int port = args.GetInt("--port", 0);
   int rdma_port = args.GetInt("--rdma-port", -1);
-  int sgengine_tcp_port = args.GetInt("--sgengine-tcp-port", -1);
-  int sgengine_rdma_port = args.GetInt("--sgengine-rdma-port", -1);
   int metrics_port = args.GetInt("--metrics-port", -1);
   unsigned long long cap = args.GetU64("--cap", 1ull << 30);
-  // Storage backend: "file" (default) or "slab". Propagated via env so the
-  // DiskCacheGroup (constructed inside KvNodeServer) picks it up; --store-engine
-  // wins over a pre-set DFKV_STORE_ENGINE.
+  // The explicit flag wins over DFKV_STORE_ENGINE. With neither present,
+  // DiskCacheGroup resolves the single production default, "slab".
   std::string store_engine = args.Get("--store-engine", "");
-  if (!store_engine.empty()) ::setenv("DFKV_STORE_ENGINE", store_engine.c_str(), 1);
+  if (!store_engine.empty())
+    ::setenv("DFKV_STORE_ENGINE", store_engine.c_str(), 1);
   // Slab write mode: "direct" (default; page-cache-free) | "buffered" opt-out.
   std::string slab_write = args.Get("--slab-write", "");
   if (!slab_write.empty()) ::setenv("DFKV_SLAB_WRITE", slab_write.c_str(), 1);
@@ -126,8 +124,8 @@ int main(int argc, char** argv) {
   std::string ram_tier_bytes = args.Get("--ram-tier-bytes", "");
   if (!ram_tier_bytes.empty())
     ::setenv("DFKV_RAM_TIER_BYTES", ram_tier_bytes.c_str(), 1);
-  // Slot quantum: a LAYOUT parameter -- changing it re-inits the store EMPTY
-  // (meta mismatch). Facade for small-value deployments (default 1 MiB).
+  // Slot quantum is persistent geometry. An existing store with a different
+  // value is rejected fail-closed; operators must explicitly use an empty dir.
   std::string slab_gran = args.Get("--slab-granularity", "");
   if (!slab_gran.empty()) ::setenv("DFKV_SLAB_GRANULARITY", slab_gran.c_str(), 1);
   // PUT admission gate: cap concurrent disk writes; excess PUTs fast-fail with
@@ -135,9 +133,15 @@ int main(int argc, char** argv) {
   // a deep device queue. 0 = off (default).
   std::string put_limit = args.Get("--put-inflight-limit", "");
   if (!put_limit.empty()) ::setenv("DFKV_PUT_INFLIGHT_LIMIT", put_limit.c_str(), 1);
+  std::string tcp_max_conns = args.Get("--tcp-max-conns", "");
+  if (!tcp_max_conns.empty())
+    ::setenv("DFKV_TCP_MAX_CONNS", tcp_max_conns.c_str(), 1);
+  std::string tcp_io_timeout_s = args.Get("--tcp-io-timeout-s", "");
+  if (!tcp_io_timeout_s.empty())
+    ::setenv("DFKV_TCP_IO_TIMEOUT_S", tcp_io_timeout_s.c_str(), 1);
   // --- Remaining env-only knobs: same flag→env facade pattern. Each flag is
   // an empty-by-default string; when set it wins over a pre-set DFKV_* env via
-  // setenv(overwrite=1). See docs/CONFIG.md for the full matrix.
+  // setenv(overwrite=1). See DEPLOY.md and METRICS.md for the current matrix.
   // RDMA transport knobs (DFKV_RDMA_DEV already handled via --rdma-dev above,
   // which the RdmaServer constructor takes as a direct arg, so no setenv here).
   std::string rdma_depth = args.Get("--rdma-depth", "");
@@ -160,7 +164,14 @@ int main(int argc, char** argv) {
   if (!ram_flush_threads.empty())
     ::setenv("DFKV_RAM_FLUSH_THREADS", ram_flush_threads.c_str(), 1);
   std::string ram_tier_numa = args.Get("--ram-tier-numa", "");
-  if (!ram_tier_numa.empty()) ::setenv("DFKV_RAM_TIER_NUMA", ram_tier_numa.c_str(), 1);
+  if (!ram_tier_numa.empty()) {
+    if (ram_tier_numa != "off" && ram_tier_numa != "interleave") {
+      std::fprintf(stderr,
+                   "--ram-tier-numa must be 'off' or 'interleave'\n");
+      return 1;
+    }
+    ::setenv("DFKV_RAM_TIER_NUMA", ram_tier_numa.c_str(), 1);
+  }
   // RAM tier lock shards (1-64; the tier halves it while a shard would hold
   // <32 extents, so small arenas degrade to fewer shards).
   std::string ram_tier_shards = args.Get("--ram-tier-shards", "");
@@ -180,6 +191,57 @@ int main(int argc, char** argv) {
   // Log level (DFKV_LOG: e.g. "INFO", "DEBUG", "WARN").
   std::string log_level = args.Get("--log", "");
   if (!log_level.empty()) ::setenv("DFKV_LOG", log_level.c_str(), 1);
+  // A configured cache node must never remain active-but-unregistered forever.
+  // The flag wins over the env twin; both parse strictly and stay inside a hard
+  // operational envelope so typos cannot silently disable the fail-closed exit.
+  constexpr int kDefaultMdsRegistrationTimeoutMs = 60000;
+  constexpr int kMinMdsRegistrationTimeoutMs = 1000;
+  constexpr int kMaxMdsRegistrationTimeoutMs = 600000;
+  int mds_registration_timeout_ms = kDefaultMdsRegistrationTimeoutMs;
+  dfkv::config_dump::Source mds_registration_timeout_source =
+      dfkv::config_dump::Source::kDefault;
+  if (args.Has("--mds-registration-timeout-ms")) {
+    const std::string value =
+        args.Get("--mds-registration-timeout-ms", "");
+    const auto parsed = std::from_chars(
+        value.data(), value.data() + value.size(),
+        mds_registration_timeout_ms);
+    if (parsed.ec != std::errc{} ||
+        parsed.ptr != value.data() + value.size()) {
+      std::fprintf(
+          stderr,
+          "dfkv_server: --mds-registration-timeout-ms must be an integer "
+          "in [%d,%d], got '%s'\n",
+          kMinMdsRegistrationTimeoutMs, kMaxMdsRegistrationTimeoutMs,
+          value.c_str());
+      return 2;
+    }
+    mds_registration_timeout_source = dfkv::config_dump::Source::kFlag;
+  } else if (const char* value =
+                 std::getenv("DFKV_MDS_REGISTRATION_TIMEOUT_MS")) {
+    const char* end = value + std::strlen(value);
+    const auto parsed =
+        std::from_chars(value, end, mds_registration_timeout_ms);
+    if (parsed.ec != std::errc{} || parsed.ptr != end) {
+      std::fprintf(
+          stderr,
+          "dfkv_server: DFKV_MDS_REGISTRATION_TIMEOUT_MS must be an integer "
+          "in [%d,%d], got '%s'\n",
+          kMinMdsRegistrationTimeoutMs, kMaxMdsRegistrationTimeoutMs, value);
+      return 2;
+    }
+    mds_registration_timeout_source = dfkv::config_dump::Source::kEnv;
+  }
+  if (args.ok() &&
+      (mds_registration_timeout_ms < kMinMdsRegistrationTimeoutMs ||
+       mds_registration_timeout_ms > kMaxMdsRegistrationTimeoutMs)) {
+    std::fprintf(
+        stderr,
+        "dfkv_server: MDS registration timeout must be in [%d,%d] ms, got %d\n",
+        kMinMdsRegistrationTimeoutMs, kMaxMdsRegistrationTimeoutMs,
+        mds_registration_timeout_ms);
+    return 2;
+  }
   if (!args.ok()) {
     std::fprintf(stderr, "dfkv_server: %s\n(run with --help for usage)\n",
                  args.error().c_str());
@@ -207,18 +269,6 @@ int main(int argc, char** argv) {
     cd::Record("port", std::to_string(port), src("--port"));
     cd::Record("cap", std::to_string(cap), src("--cap"));
     cd::Record("rdma_dev", rdma_dev.empty() ? "(unset)" : rdma_dev, src("--rdma-dev"));
-    cd::Record("sgengine_tcp_port", std::to_string(sgengine_tcp_port),
-               src("--sgengine-tcp-port"));
-    cd::Record("sgengine_rdma_port", std::to_string(sgengine_rdma_port),
-               src("--sgengine-rdma-port"));
-    cd::Record("sgengine_tcp_protocol",
-               sgengine_tcp_port >= 0 ? "wire-v1/domain-sgengine-v1"
-                                      : "(off)",
-               src("--sgengine-tcp-port"));
-    cd::Record("sgengine_rdma_protocol",
-               sgengine_rdma_port >= 0 ? "rdma-v1/domain-sgengine-v1"
-                                       : "(off)",
-               src("--sgengine-rdma-port"));
     cd::Record("mds", mds.empty() ? "(none)" : mds, src("--mds"));
     cd::Record("group", group, src("--group"));
     cd::Record("id", node_id.empty() ? "(auto)" : node_id, src("--id"));
@@ -226,6 +276,9 @@ int main(int argc, char** argv) {
     cd::Record("weight", std::to_string(weight), src("--weight"));
     cd::Record("metrics_port", std::to_string(metrics_port), src("--metrics-port"));
     cd::Record("metrics_bind", metrics_bind.empty() ? "(any)" : metrics_bind, src("--metrics-bind"));
+    cd::Record("DFKV_MDS_REGISTRATION_TIMEOUT_MS",
+               std::to_string(mds_registration_timeout_ms),
+               mds_registration_timeout_source);
   }
   std::signal(SIGINT, OnSig);
   std::signal(SIGTERM, OnSig);
@@ -252,24 +305,6 @@ int main(int argc, char** argv) {
   std::printf("PORT %d\n", srv.port());
   std::fflush(stdout);
 
-  std::unique_ptr<dfkv::compat::SgEngineTcpFrontend> sgengine_tcp;
-  if (sgengine_tcp_port >= 0) {
-    sgengine_tcp =
-        std::make_unique<dfkv::compat::SgEngineTcpFrontend>(srv);
-    sgengine_tcp->set_max_request_payload(
-        dfkv::wire_limits::MaxRequestPayload());
-    if (sgengine_tcp->Start(sgengine_tcp_port) != Status::kOk) {
-      std::fprintf(stderr,
-                   "failed to start SGEngine compatibility TCP port %d\n",
-                   sgengine_tcp_port);
-      srv.Stop();
-      return 1;
-    }
-    std::printf("SGENGINE_TCP_PORT %d\n", sgengine_tcp->port());
-    std::fflush(stdout);
-    DFKV_LOG_INFO("SGEngine v1 compatibility TCP listening on port " +
-                  std::to_string(sgengine_tcp->port()));
-  }
 
   // Optional Prometheus /metrics endpoint (declared here, started after the RDMA
   // server below so its render callback can fold in the RDMA server counters).
@@ -279,13 +314,13 @@ int main(int argc, char** argv) {
   // Announce the transport build mode loudly so a TCP-only binary (built without
   // -DDFKV_WITH_RDMA=ON) can never be mistaken for an RDMA one at deploy time.
 #ifdef DFKV_WITH_RDMA
-  DFKV_LOG_INFO("dfkv build: transport=RDMA (libibverbs) + TCP fallback");
+  DFKV_LOG_INFO("dfkv build: transport=RDMA v2 (libibverbs) + native TCP");
 #else
   DFKV_LOG_INFO("dfkv build: transport=TCP-only (built WITHOUT -DDFKV_WITH_RDMA=ON)");
-  if (rdma_port >= 0 || sgengine_rdma_port >= 0) {
+  if (rdma_port >= 0) {
     DFKV_LOG_ERROR(
-        "--rdma-port/--sgengine-rdma-port require an RDMA-enabled binary; "
-        "rebuild with -DDFKV_WITH_RDMA=ON (needs libibverbs-dev)");
+        "--rdma-port requires an RDMA-enabled binary; rebuild with "
+        "-DDFKV_WITH_RDMA=ON (needs libibverbs-dev)");
     srv.Stop();
     return 1;
   }
@@ -294,74 +329,39 @@ int main(int argc, char** argv) {
 #endif
 
 #ifdef DFKV_WITH_RDMA
-  // --max-msg is the hard payload ceiling for both protocols. V2 leases slots
-  // from one process-wide receive segment, sized independently by
-  // DFKV_RDMA_RECV_SEGMENT_SIZE. Automatic v1 fallback retains the legacy
-  // per-connection depth * (ValueHeader + max_msg) registered-buffer geometry;
-  // clients with an explicit smaller declaration retain that smaller v1 cap.
+  // --max-msg is the hard payload ceiling. RDMA v2 leases slots from one
+  // process-wide receive segment sized by DFKV_RDMA_RECV_SEGMENT_SIZE.
   const unsigned long long max_msg = args.GetU64("--max-msg", 64ull << 20);
   std::unique_ptr<dfkv::RdmaServer> rsrv;
   if (rdma_port >= 0) {
     rsrv = std::make_unique<dfkv::RdmaServer>(
         [&srv](uint8_t op, const dfkv::BlockKey& key, uint64_t off,
-               uint64_t len, const char* pl, uint64_t pll, std::string* out) {
-          return srv.ProcessRequestForKey(op, key, off, len, pl, pll, out);
+               uint64_t len, const char* pl, uint64_t pll, std::string* out,
+               size_t* value_len) {
+          return srv.ProcessRequestForKey(op, key, off, len, pl, pll, out,
+                                          value_len);
         },
         /*max_msg=*/max_msg, rdma_dev);
-    rsrv->set_range_handler(  // server-side direct GET: disk -> registered dbuf -> RDMA scatter
+    rsrv->set_range_handler(  // disk -> registered dbuf -> RDMA scatter
         [&srv](const dfkv::BlockKey& key, uint64_t off, uint64_t len,
                char* io_buf, size_t cap, const char** out_data,
-               size_t* out_len) {
+               size_t* out_len, size_t* value_len) {
           return srv.RangeDirectForKey(key, off, len, io_buf, cap, out_data,
-                                       out_len);
+                                       out_len, value_len);
         });
     rsrv->set_cache_direct_handler(  // server-side direct PUT: RDMA dbuf -> O_DIRECT write
         [&srv](const dfkv::BlockKey& key, char* data, size_t len, size_t cap) {
           return srv.CacheDirectForKey(key, data, len, cap);
         });
-    // Async-GET hooks (used only when built -DDFKV_WITH_URING and started with
-    // DFKV_SERVER_URING=1; otherwise the serve loop ignores these and uses the
-    // synchronous range_handler above verbatim).
-    rsrv->set_range_prep_handler(
+    rsrv->set_prepare_read_handler(
         [&srv](const dfkv::BlockKey& key, uint64_t off, uint64_t len,
-               size_t cap, dfkv::RdmaServer::RangePrepResult* out) {
-          dfkv::KVStore::RangePrep p;
-          Status st = srv.RangeDirectPrepForKey(key, off, len, cap, &p,
-                                                &out->flight);
-          if (st == Status::kOk) {
-            out->fd = p.fd;
-            out->aligned_off = p.aligned_off;
-            out->aligned_len = p.aligned_len;
-            out->head = p.head;
-            out->payload_len = p.payload_len;
-            // Slab slot hold (0 on the file engine). Dropping this token was a
-            // real leak: the serve loop can only release what it was handed,
-            // so every uring GET left its slot pinned+inflight forever.
-            out->release_token = p.token;
-          }
-          return st;
+               char* staging, size_t cap) {
+          return srv.PrepareReadForKey(key, off, len, staging, cap);
         });
-    rsrv->set_range_release_handler(
-        [&srv](uint64_t tok) { srv.RangePrepRelease(tok); });
-    rsrv->set_range_complete_handler(
-        [&srv](bool ok, size_t bytes_read, double elapsed_sec, uint64_t flight,
-               const char* data) {
-          srv.RangeDirectComplete(ok, bytes_read, elapsed_sec, flight, data);
-        });
-    rsrv->set_range_flight_abort_handler(
-        [&srv](uint64_t flight) { srv.RangeFlightAbort(flight); });
-    // RAM hot tier (P3 B5-3): when enabled, register the arena as a pool MR and
-    // wire the zero-copy serve hooks so a RAM hit is scatter-sent straight from
-    // the arena (no copy into the connection buffer, no disk). No-op if off.
+    // RAM arena registration remains transport setup, not per-read ownership.
+    // Arena send pins are carried by PreparedRead through SEND completion.
     if (srv.ram_enabled()) {
       rsrv->RegisterMemory(srv.ram_arena(), srv.ram_arena_bytes());
-      rsrv->set_ram_range_handler(
-          [&srv](const dfkv::BlockKey& key, uint64_t off, uint64_t len,
-                 const char** out_ptr, size_t* out_len, uint64_t* out_token) {
-            return srv.RamRangePrepForKey(key, off, len, out_ptr, out_len,
-                                          out_token);
-          });
-      rsrv->set_ram_release_handler([&srv](uint64_t tok) { srv.RamRelease(tok); });
       DFKV_LOG_INFO("dfkv_server RAM hot tier: RDMA zero-copy serve enabled (arena " +
                     std::to_string(srv.ram_arena_bytes()) + " bytes)");
     }
@@ -382,48 +382,34 @@ int main(int argc, char** argv) {
     (void)rsrv->UseUringPath();
   }
 
-  std::unique_ptr<dfkv::compat::SgEngineRdmaFrontend> sgengine_rdma;
-  if (sgengine_rdma_port >= 0) {
-    sgengine_rdma =
-        std::make_unique<dfkv::compat::SgEngineRdmaFrontend>(
-            srv, max_msg, rdma_dev);
-    if (sgengine_rdma->Start(sgengine_rdma_port) != Status::kOk) {
-      DFKV_LOG_ERROR(
-          "SGEngine compatibility RDMA listener failed to start; refusing "
-          "readiness");
-      if (rsrv) rsrv->Stop();
-      srv.Stop();
-      return 1;
-    }
-    std::printf("SGENGINE_RDMA_PORT %d\n", sgengine_rdma->port());
-    std::fflush(stdout);
-    DFKV_LOG_INFO(
-        "SGEngine v1 compatibility RDMA listening (TCP bootstrap) on port " +
-        std::to_string(sgengine_rdma->port()) +
-        (rdma_dev.empty() ? "" : ", dev=" + rdma_dev));
-    (void)sgengine_rdma->PipelineDepth();
-    (void)sgengine_rdma->UseUringPath();
-  }
 #endif
 
   // Start /metrics now that the (optional) RDMA server exists: the render
   // callback combines the cache-node metrics with the RDMA server counters.
-  // ready_flag flips once EVERY startup stage below has finished (RDMA
-  // listener + MR anchor are already up at this point; MDS registration is
-  // still ahead) — /readyz answers 503 until then so rolling upgrades wait
-  // for a servable node, not merely an open metrics port.
+  // /readyz requires startup completion, first successful MDS registration
+  // (when configured), and CURRENT local storage health. Later transient MDS
+  // heartbeat loss does not erase first-registration history, while a terminal
+  // metadata/store/RAM failure immediately removes readiness.
   auto ready_flag = std::make_shared<std::atomic<bool>>(false);
+  auto mds_ready =
+      std::make_shared<std::atomic<bool>>(mds.empty());
+  auto registrar_metrics =
+      std::make_shared<std::atomic<dfkv::MdsRegistrar*>>(nullptr);
   if (metrics_port >= 0) {
     mhttp = std::make_unique<dfkv::MetricsHttpServer>([&] {
       std::string s = srv.MetricsText();
-      if (sgengine_tcp) s += sgengine_tcp->MetricsText();
 #ifdef DFKV_WITH_RDMA
       if (rsrv) s += rsrv->MetricsText();
-      if (sgengine_rdma) s += sgengine_rdma->MetricsText();
 #endif
+      if (auto* r = registrar_metrics->load(std::memory_order_acquire))
+        s += r->MetricsText();
       return s;
     });
-    mhttp->set_ready_check([ready_flag] { return ready_flag->load(std::memory_order_acquire); });
+    mhttp->set_health_check([&srv] { return srv.Healthy(); });
+    mhttp->set_ready_check([ready_flag, mds_ready, &srv] {
+      return ready_flag->load(std::memory_order_acquire) &&
+             mds_ready->load(std::memory_order_acquire) && srv.Healthy();
+    });
     if (mhttp->Start(metrics_port, metrics_bind) == Status::kOk)
       DFKV_LOG_INFO("dfkv_server /metrics on port " + std::to_string(mhttp->port()));
     else
@@ -474,7 +460,11 @@ int main(int argc, char** argv) {
 #endif
       self.info = std::move(info);
     }
-    registrar = std::make_unique<dfkv::MdsRegistrar>(std::move(eps), group, self);
+    registrar = std::make_unique<dfkv::MdsRegistrar>(
+        std::move(eps), group, self, /*heartbeat_ms=*/10000,
+        dfkv::MdsRegistrar::kDefaultIoTimeoutMs, /*is_client=*/false,
+        mds_registration_timeout_ms);
+    registrar_metrics->store(registrar.get(), std::memory_order_release);
     // Dynamic stats ride every heartbeat (STA1): ring-level capacity/health
     // becomes answerable from the MDS alone (dfkvctl stats / dfkv_mds_group_*),
     // no per-node scrape. All reads are relaxed atomics -- negligible cost.
@@ -494,24 +484,41 @@ int main(int argc, char** argv) {
       st.ram_hits_total = srv.RamHits();
       return st;
     });
+    registrar->set_registered_callback([mds_ready, group, node_id] {
+      mds_ready->store(true, std::memory_order_release);
+      DFKV_LOG_INFO("dfkv_server registered with MDS group=" + group +
+                    " id=" + node_id);
+    });
     registrar->Start();
-    DFKV_LOG_INFO("dfkv_server registered with MDS group=" + group + " id=" + node_id +
-                  " advertise=" + advertise);
+    DFKV_LOG_INFO("dfkv_server MDS registration loop started group=" + group +
+                  " id=" + node_id + " advertise=" + advertise);
   }
 
   dfkv::config_dump::Emit("server");
   ready_flag->store(true, std::memory_order_release);
-  DFKV_LOG_INFO("dfkv_server ready (all startup stages complete)");
+  DFKV_LOG_INFO(mds.empty()
+                    ? "dfkv_server ready (all startup stages complete)"
+                    : "dfkv_server initialized; readiness awaits initial MDS registration");
 
-  while (!g_stop) { struct timespec ts{0, 50 * 1000 * 1000}; nanosleep(&ts, nullptr); }
-  DFKV_LOG_INFO("dfkv_server shutting down");
+  while (!g_stop &&
+         !(registrar && registrar->first_registration_timed_out())) {
+    struct timespec ts{0, 50 * 1000 * 1000};
+    nanosleep(&ts, nullptr);
+  }
+  const bool registration_timed_out =
+      registrar && registrar->first_registration_timed_out();
+  if (registration_timed_out) {
+    DFKV_LOG_ERROR(
+        "dfkv_server shutting down after first MDS registration deadline");
+  } else {
+    DFKV_LOG_INFO("dfkv_server shutting down");
+  }
   if (mhttp) mhttp->Stop();
+  registrar_metrics->store(nullptr, std::memory_order_release);
   if (registrar) registrar->Stop();
 #ifdef DFKV_WITH_RDMA
   if (rsrv) rsrv->Stop();
-  if (sgengine_rdma) sgengine_rdma->Stop();
 #endif
-  if (sgengine_tcp) sgengine_tcp->Stop();
   srv.Stop();
-  return 0;
+  return registration_timed_out ? 1 : 0;
 }

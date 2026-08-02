@@ -126,9 +126,13 @@ bool WriteFileDirect(const std::string& path, const void* data, size_t len,
 // Same as WriteFileDirect(), but writes directly from a caller-owned aligned
 // buffer. The caller allows us to zero the O_DIRECT padding bytes in-place.
 bool WriteFileDirectAligned(const std::string& path, char* data, size_t len,
-                            size_t cap) {
+                            size_t cap, int* out_errno) {
+  if (out_errno) *out_errno = 0;
   Fd fd(::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0644));
-  if (!fd.valid()) return false;
+  if (!fd.valid()) {
+    if (out_errno) *out_errno = errno;
+    return false;
+  }
   if (len == 0) return true;
   if (!data) return false;
   if ((reinterpret_cast<uintptr_t>(data) & (kDioAlign - 1)) != 0) return false;
@@ -140,6 +144,7 @@ bool WriteFileDirectAligned(const std::string& path, char* data, size_t len,
 
   if (::fallocate(fd.get(), 0, 0, static_cast<off_t>(alen)) != 0 &&
       errno != EOPNOTSUPP && errno != ENOSYS && errno != EINVAL) {
+    if (out_errno) *out_errno = errno;
     return false;
   }
 
@@ -148,13 +153,20 @@ bool WriteFileDirectAligned(const std::string& path, char* data, size_t len,
   while (done < alen) {
     ssize_t w = ::pwrite(fd.get(), data + done, alen - done,
                          static_cast<off_t>(done));
-    if (w < 0) { if (errno == EINTR) continue; return false; }
+    if (w < 0) {
+      if (errno == EINTR) continue;
+      if (out_errno) *out_errno = errno;
+      return false;
+    }
     if (w == 0) return false;
     done += static_cast<size_t>(w);
     if (done < alen && (done % kDioAlign) != 0) return false;
   }
 
-  if (::ftruncate(fd.get(), static_cast<off_t>(len)) != 0) return false;
+  if (::ftruncate(fd.get(), static_cast<off_t>(len)) != 0) {
+    if (out_errno) *out_errno = errno;
+    return false;
+  }
   return true;
 }
 
@@ -283,11 +295,7 @@ bool KVStore::RebuildIndex() {  // constructor-time, single-threaded: no locks
     const std::string rel_text = rel.generic_string();
     const bool native_layout =
         rel_text == "blocks" || rel_text.rfind("blocks/", 0) == 0;
-    const bool compatibility_layout =
-        rel_text == "compat" || rel_text == "compat/sgengine-v1" ||
-        rel_text == "compat/sgengine-v1/blocks" ||
-        rel_text.rfind("compat/sgengine-v1/blocks/", 0) == 0;
-    if (!native_layout && !compatibility_layout) {
+    if (!native_layout) {
       startup_error_ =
           "cache directory contains a different store layout: " + rel_text;
       return false;
@@ -299,14 +307,21 @@ bool KVStore::RebuildIndex() {  // constructor-time, single-threaded: no locks
       }
       continue;
     }
+    BlockKey parsed_key;
+    if (!BlockKey::ParseFilename(fname, &parsed_key) ||
+        rel_text != parsed_key.StoreKey()) {
+      startup_error_ = "cache layout contains an invalid block path: " +
+                       rel_text;
+      return false;
+    }
     const uint64_t sz = static_cast<uint64_t>(fs::file_size(it->path(), ec));
     if (ec) {
       startup_error_ = "cannot stat cached block";
       return false;
     }
     Shard& sh = ShardFor(fname);
-    auto [entry, inserted] =
-        sh.index.try_emplace(fname, it->path().string(), sz);
+    auto [entry, inserted] = sh.index.try_emplace(
+        fname, it->path().string(), sz, parsed_key.tenant_hash);
     if (!inserted) {
       startup_error_ = "duplicate cached block filename: " + fname;
       return false;
@@ -314,6 +329,7 @@ bool KVStore::RebuildIndex() {  // constructor-time, single-threaded: no locks
     sh.ring.push_front(fname);
     entry->second.it = sh.ring.begin();
     sh.used_bytes += sz;
+    sh.tenant_used_bytes[parsed_key.tenant_hash] += sz;
   }
   if (ec) {
     startup_error_ = "cannot traverse cache directory";
@@ -348,22 +364,30 @@ static std::list<std::string>::iterator HandNext(
 // current victim is evicted regardless of its bit, guaranteeing forward progress
 // and termination even under ring/index drift.
 // Rename a victim block to a unique sibling ".tmp" name: a fast metadata-only
-// op, so the slow block-freeing unlink can run OUTSIDE the shard lock. The
-// original path is immediately free for a concurrent re-insert, and the trash
-// name is unique (shared tmp_seq_), so the deferred unlink can never hit the
-// re-inserted file. Orphan trash (crash before the deferred unlink) is a
-// standard ".tmp" that RebuildIndex reclaims. Returns "" if nothing to defer.
-std::string KVStore::RenameToTrash(const std::string& path) {
-  std::string trash =
-      path + "." + std::to_string(tmp_seq_.fetch_add(1, std::memory_order_relaxed)) +
-      ".tmp";
+// op, so the slow block-freeing unlink can run OUTSIDE the shard lock. A failed
+// rename is an I/O failure: callers retain the original index/accounting entry.
+bool KVStore::RenameToTrash(const std::string& path, std::string* trash) {
+  if (trash == nullptr) return false;
+  *trash = path + "." +
+           std::to_string(tmp_seq_.fetch_add(1, std::memory_order_relaxed)) +
+           ".tmp";
+  if (rename_fn_override_) {
+    if (!rename_fn_override_(path, *trash)) {
+      trash->clear();
+      return false;
+    }
+    return true;
+  }
   std::error_code ec;
-  fs::rename(path, trash, ec);
-  if (ec) return {};  // already gone / rename failed: nothing to unlink later
-  return trash;
+  fs::rename(path, *trash, ec);
+  if (ec) {
+    trash->clear();
+    return false;
+  }
+  return true;
 }
 
-void KVStore::EvictLocked(Shard& sh, std::vector<std::string>* trash) {
+bool KVStore::EvictLocked(Shard& sh, std::vector<std::string>* trash) {
   // size() > 1 (not !empty()): never evict a shard's last entry, so a value larger
   // than the per-shard capacity still stays cached (it just keeps the shard over).
   size_t spins = 0;
@@ -382,15 +406,22 @@ void KVStore::EvictLocked(Shard& sh, std::vector<std::string>* trash) {
       sh.hand = HandNext(sh.ring, cur);
       continue;
     }
-    sh.hand = HandNext(sh.ring, cur);  // move off the victim before erasing it
-    std::string t = RenameToTrash(it->second.path);  // fast rename in-lock
-    if (!t.empty()) trash->push_back(std::move(t));   // slow unlink deferred off-lock
+    std::string renamed;
+    if (!RenameToTrash(it->second.path, &renamed)) return false;
+    sh.hand = HandNext(sh.ring, cur);  // move off only after durable namespace detach
+    trash->push_back(std::move(renamed));  // slow unlink deferred off-lock
     sh.used_bytes -= it->second.size;
+    auto tenant = sh.tenant_used_bytes.find(it->second.tenant_hash);
+    if (tenant != sh.tenant_used_bytes.end()) {
+      tenant->second -= it->second.size;
+      if (tenant->second == 0) sh.tenant_used_bytes.erase(tenant);
+    }
     evictions_.fetch_add(1, std::memory_order_relaxed);
     evicted_bytes_.fetch_add(it->second.size, std::memory_order_relaxed);
     sh.ring.erase(cur);
     sh.index.erase(it);
   }
+  return true;
 }
 
 // Reclaim up to `target` bytes from one shard regardless of the capacity
@@ -399,7 +430,9 @@ void KVStore::EvictLocked(Shard& sh, std::vector<std::string>* trash) {
 // one object per shard can otherwise prevent any space from being reclaimed.
 // Returns the logical bytes detached; the caller drains `trash` after unlocking.
 uint64_t KVStore::ForceEvictLocked(Shard& sh, uint64_t target,
-                                   std::vector<std::string>* trash) {
+                                   std::vector<std::string>* trash,
+                                   bool* io_error) {
+  if (io_error) *io_error = false;
   uint64_t freed = 0;
   size_t swept = 0;
   const size_t budget = 3 * sh.ring.size() + 4;  // bounded sweep (progress guarantee)
@@ -413,10 +446,19 @@ uint64_t KVStore::ForceEvictLocked(Shard& sh, uint64_t target,
       continue;
     }
     // Under real pressure we don't grant second chances (we need bytes now).
+    std::string renamed;
+    if (!RenameToTrash(it->second.path, &renamed)) {
+      if (io_error) *io_error = true;
+      break;
+    }
     sh.hand = HandNext(sh.ring, cur);
-    std::string t = RenameToTrash(it->second.path);
-    if (!t.empty()) trash->push_back(std::move(t));
+    trash->push_back(std::move(renamed));
     sh.used_bytes -= it->second.size;
+    auto tenant = sh.tenant_used_bytes.find(it->second.tenant_hash);
+    if (tenant != sh.tenant_used_bytes.end()) {
+      tenant->second -= it->second.size;
+      if (tenant->second == 0) sh.tenant_used_bytes.erase(tenant);
+    }
     freed += it->second.size;
     evictions_.fetch_add(1, std::memory_order_relaxed);
     evicted_bytes_.fetch_add(it->second.size, std::memory_order_relaxed);
@@ -458,23 +500,28 @@ Status KVStore::Cache(const BlockKey& key, const void* data, size_t len) {
     // fires and PUTs would fail forever. Force-evict this shard and retry once.
     if (werr == ENOSPC) {
       uint64_t remaining = std::max<uint64_t>(2 * len, 64ull << 20);
+      bool eviction_error = false;
       {
         std::lock_guard<std::shared_mutex> wl(sh.mu);
-        const uint64_t freed = ForceEvictLocked(sh, remaining, &trash);
+        const uint64_t freed =
+            ForceEvictLocked(sh, remaining, &trash, &eviction_error);
         remaining = freed >= remaining ? 0 : remaining - freed;
       }
       for (const auto& candidate : shards_) {
-        if (remaining == 0) break;
+        if (remaining == 0 || eviction_error) break;
         if (candidate.get() == &sh) continue;
+        bool failed = false;
         std::lock_guard<std::shared_mutex> wl(candidate->mu);
         const uint64_t freed =
-            ForceEvictLocked(*candidate, remaining, &trash);
+            ForceEvictLocked(*candidate, remaining, &trash, &failed);
+        eviction_error = eviction_error || failed;
         remaining = freed >= remaining ? 0 : remaining - freed;
       }
       for (auto& t : trash) {
         std::error_code e2;
         fs::remove(t, e2);
       }
+      if (eviction_error) return Status::kIOError;
       werr = 0;
       if (!write_tmp(&tmp, &werr)) { fs::remove(tmp, ec); return Status::kIOError; }
       enospc_evictions_.fetch_add(1, std::memory_order_relaxed);
@@ -482,19 +529,22 @@ Status KVStore::Cache(const BlockKey& key, const void* data, size_t len) {
       return Status::kIOError;
     }
   }
+  bool eviction_ok = true;
   {
     std::lock_guard<std::shared_mutex> wl(sh.mu);  // exclusive
     if (sh.index.count(fname)) { fs::remove(tmp, ec); return Status::kOk; }  // lost the race; keep first
     fs::rename(tmp, full, ec);  // atomic publish
     if (ec) { fs::remove(tmp, ec); return Status::kIOError; }
     sh.ring.push_front(fname);
-    auto res = sh.index.try_emplace(fname, full.string(), len);
+    auto res =
+        sh.index.try_emplace(fname, full.string(), len, key.tenant_hash);
     res.first->second.it = sh.ring.begin();  // O(1) removal handle
     sh.used_bytes += len;
-    EvictLocked(sh, &trash);
+    sh.tenant_used_bytes[key.tenant_hash] += len;
+    eviction_ok = EvictLocked(sh, &trash);
   }
   for (auto& t : trash) { std::error_code e2; fs::remove(t, e2); }  // slow unlink off-lock
-  return Status::kOk;
+  return eviction_ok ? Status::kOk : Status::kIOError;
 }
 
 Status KVStore::Remove(const BlockKey& key) {
@@ -506,8 +556,14 @@ Status KVStore::Remove(const BlockKey& key) {
     std::lock_guard<std::shared_mutex> wl(sh.mu);  // exclusive
     auto it = sh.index.find(fname);
     if (it == sh.index.end()) return Status::kNotFound;
-    trash = RenameToTrash(it->second.path);  // fast rename; slow unlink deferred
+    if (!RenameToTrash(it->second.path, &trash))
+      return Status::kIOError;  // retain index/ring/tenant accounting
     sh.used_bytes -= it->second.size;
+    auto tenant = sh.tenant_used_bytes.find(it->second.tenant_hash);
+    if (tenant != sh.tenant_used_bytes.end()) {
+      tenant->second -= it->second.size;
+      if (tenant->second == 0) sh.tenant_used_bytes.erase(tenant);
+    }
     // O(1) ring drop via the entry's own iterator (was an O(n) scan, O(n^2)
     // under RemoveMany while holding the exclusive lock). If the CLOCK hand
     // points at the victim, advance it off first (same discipline as eviction).
@@ -534,30 +590,80 @@ Status KVStore::CacheDirect(const BlockKey& key, char* data, size_t len,
   fs::path full = fs::path(opt_.cache_dir) / key.StoreKey();
   std::error_code ec;
   fs::create_directories(full.parent_path(), ec);
-  fs::path tmp = full;
-  tmp += "." + std::to_string(tmp_seq_.fetch_add(1, std::memory_order_relaxed)) + ".tmp";
-  if (!WriteFileDirectAligned(tmp.string(), data, len, cap)) {
-    fs::remove(tmp, ec);
-    return Status::kIOError;
-  }
+  auto write_tmp = [&](fs::path* tmp, int* werr) {
+    *tmp = full;
+    *tmp += "." +
+            std::to_string(tmp_seq_.fetch_add(1, std::memory_order_relaxed)) +
+            ".tmp";
+    return write_fn_override_
+               ? write_fn_override_(tmp->string(), data, len, werr)
+               : WriteFileDirectAligned(tmp->string(), data, len, cap, werr);
+  };
+  fs::path tmp;
+  int werr = 0;
   std::vector<std::string> trash;
+  if (!write_tmp(&tmp, &werr)) {
+    fs::remove(tmp, ec);
+    if (werr != ENOSPC) return Status::kIOError;
+    uint64_t remaining = std::max<uint64_t>(2 * len, 64ull << 20);
+    bool eviction_error = false;
+    {
+      std::lock_guard<std::shared_mutex> wl(sh.mu);
+      const uint64_t freed =
+          ForceEvictLocked(sh, remaining, &trash, &eviction_error);
+      remaining = freed >= remaining ? 0 : remaining - freed;
+    }
+    for (const auto& candidate : shards_) {
+      if (remaining == 0 || eviction_error) break;
+      if (candidate.get() == &sh) continue;
+      bool failed = false;
+      std::lock_guard<std::shared_mutex> wl(candidate->mu);
+      const uint64_t freed =
+          ForceEvictLocked(*candidate, remaining, &trash, &failed);
+      eviction_error = eviction_error || failed;
+      remaining = freed >= remaining ? 0 : remaining - freed;
+    }
+    for (auto& path : trash) {
+      std::error_code remove_error;
+      fs::remove(path, remove_error);
+    }
+    if (eviction_error) return Status::kIOError;
+    werr = 0;
+    if (!write_tmp(&tmp, &werr)) {
+      fs::remove(tmp, ec);
+      return Status::kIOError;
+    }
+    enospc_evictions_.fetch_add(1, std::memory_order_relaxed);
+  }
+  bool direct_eviction_ok = true;
   {
     std::lock_guard<std::shared_mutex> wl(sh.mu);
-    if (sh.index.count(fname)) { fs::remove(tmp, ec); return Status::kOk; }
+    if (sh.index.count(fname)) {
+      fs::remove(tmp, ec);
+      return Status::kOk;
+    }
     fs::rename(tmp, full, ec);
-    if (ec) { fs::remove(tmp, ec); return Status::kIOError; }
+    if (ec) {
+      fs::remove(tmp, ec);
+      return Status::kIOError;
+    }
     sh.ring.push_front(fname);
-    auto res = sh.index.try_emplace(fname, full.string(), len);
-    res.first->second.it = sh.ring.begin();  // O(1) removal handle
+    auto res =
+        sh.index.try_emplace(fname, full.string(), len, key.tenant_hash);
+    res.first->second.it = sh.ring.begin();
     sh.used_bytes += len;
-    EvictLocked(sh, &trash);
+    sh.tenant_used_bytes[key.tenant_hash] += len;
+    direct_eviction_ok = EvictLocked(sh, &trash);
   }
-  for (auto& t : trash) { std::error_code e2; fs::remove(t, e2); }  // slow unlink off-lock
-  return Status::kOk;
+  for (auto& path : trash) {
+    std::error_code remove_error;
+    fs::remove(path, remove_error);
+  }
+  return direct_eviction_ok ? Status::kOk : Status::kIOError;
 }
 
 Status KVStore::Range(const BlockKey& key, uint64_t offset, uint64_t length,
-                      std::string* out) {
+                      std::string* out, size_t* value_len) {
   if (!healthy_) return Status::kIOError;
   // The lock protects the in-memory index/ring, NOT the bulk file read. The GET
   // hot path takes a SHARED lock (concurrent reads per shard) and only flips the
@@ -579,9 +685,11 @@ Status KVStore::Range(const BlockKey& key, uint64_t offset, uint64_t length,
     it->second.referenced.store(true, std::memory_order_relaxed);  // CLOCK touch (read lock OK)
   }
   if (offset > fsize) return Status::kInvalid;
-  // Clamp by subtraction so offset + length can't overflow uint64_t.
-  uint64_t n = length;
-  if (n > fsize - offset) n = fsize - offset;
+  if (value_len) *value_len = static_cast<size_t>(fsize);
+  // length==0 means the entire remainder. Clamp by subtraction so offset +
+  // length cannot overflow.
+  const uint64_t remainder = fsize - offset;
+  const uint64_t n = std::min(length == 0 ? remainder : length, remainder);
   out->resize(n);
   if (n == 0) return Status::kOk;
   if (!PreadRangeDirect(fd.get(), offset, static_cast<size_t>(n), &(*out)[0]))
@@ -590,7 +698,8 @@ Status KVStore::Range(const BlockKey& key, uint64_t offset, uint64_t length,
 }
 
 Status KVStore::RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,
-                          char* dst, size_t dst_cap, size_t* out_len) {
+                          char* dst, size_t dst_cap, size_t* out_len,
+                          size_t* value_len) {
   *out_len = 0;
   if (!healthy_) return Status::kIOError;
   Fd fd;
@@ -607,9 +716,10 @@ Status KVStore::RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,
     it->second.referenced.store(true, std::memory_order_relaxed);  // CLOCK touch
   }
   if (offset > fsize) return Status::kInvalid;
-  // Clamp by subtraction so offset + length can't overflow uint64_t.
-  uint64_t n = length;
-  if (n > fsize - offset) n = fsize - offset;
+  if (value_len) *value_len = static_cast<size_t>(fsize);
+  // length==0 means remainder, still bounded by the destination capacity.
+  const uint64_t remainder = fsize - offset;
+  uint64_t n = std::min(length == 0 ? remainder : length, remainder);
   if (n > dst_cap) n = dst_cap;
   if (n == 0) return Status::kOk;  // *out_len already 0
   if (!PreadRangeDirect(fd.get(), offset, static_cast<size_t>(n), dst))
@@ -618,9 +728,10 @@ Status KVStore::RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,
   return Status::kOk;
 }
 
-Status KVStore::RangeDirect(const BlockKey& key, uint64_t offset, uint64_t length,
-                            char* io_buf, size_t io_cap, const char** out_data,
-                            size_t* out_len) {
+Status KVStore::RangeDirect(const BlockKey& key, uint64_t offset,
+                            uint64_t length, char* io_buf, size_t io_cap,
+                            const char** out_data, size_t* out_len,
+                            size_t* value_len) {
   if (!healthy_) return Status::kIOError;
   *out_data = nullptr;
   *out_len = 0;
@@ -638,8 +749,10 @@ Status KVStore::RangeDirect(const BlockKey& key, uint64_t offset, uint64_t lengt
     it->second.referenced.store(true, std::memory_order_relaxed);  // CLOCK touch
   }
   if (offset > fsize) return Status::kInvalid;
-  uint64_t n = length;
-  if (n > fsize - offset) n = fsize - offset;
+  if (value_len) *value_len = static_cast<size_t>(fsize);
+  const uint64_t remainder = fsize - offset;
+  const uint64_t n =
+      std::min(length == 0 ? remainder : length, remainder);
   if (n == 0) {
     *out_data = io_buf;
     return Status::kOk;
@@ -654,10 +767,11 @@ Status KVStore::RangeDirect(const BlockKey& key, uint64_t offset, uint64_t lengt
 
 Status KVStore::RangeDirectPrep(const BlockKey& key, uint64_t offset,
                                 uint64_t length, size_t io_cap,
-                                RangePrep* out) {
+                                ReadLease* out) {
+  if (out == nullptr) return Status::kInvalid;
+  *out = ReadLease{};
   if (!healthy_) return Status::kIOError;
-  *out = RangePrep{};
-  int raw_fd = -1;  // released to the caller on kOk; closed here on every error
+  ReadLease lease;
   uint64_t fsize = 0;
   {  // index lookup + open under a SHARED lock; bulk read happens in the caller
     const std::string fname = key.Filename();
@@ -665,35 +779,35 @@ Status KVStore::RangeDirectPrep(const BlockKey& key, uint64_t offset,
     std::shared_lock<std::shared_mutex> rl(sh.mu);
     auto it = sh.index.find(fname);
     if (it == sh.index.end()) return Status::kNotFound;
-    raw_fd = ::open(it->second.path.c_str(), O_RDONLY | O_DIRECT);
-    if (raw_fd < 0) return Status::kIOError;
+    int fd = ::open(it->second.path.c_str(), O_RDONLY | O_DIRECT);
+    if (fd < 0) return Status::kIOError;
+    lease = ReadLease::Adopt(fd);
     fsize = it->second.size;
     it->second.referenced.store(true, std::memory_order_relaxed);  // CLOCK touch
   }
-  // From here a failure must close raw_fd (the caller only owns it on kOk).
-  auto fail = [&](Status s) { ::close(raw_fd); return s; };
-  if (offset > fsize) return fail(Status::kInvalid);
-  out->value_len = static_cast<size_t>(fsize);
-  uint64_t n = length;
-  if (n > fsize - offset) n = fsize - offset;
-  if (n == 0) {  // valid zero-length hit: nothing to read, no fd to keep
-    ::close(raw_fd);
-    out->fd = -1;
-    out->payload_len = 0;
+  if (offset > fsize) return Status::kInvalid;
+  lease.value_len = static_cast<size_t>(fsize);
+  const uint64_t remainder = fsize - offset;
+  const uint64_t n =
+      std::min(length == 0 ? remainder : length, remainder);
+  if (n == 0) {
+    lease = ReadLease{};
+    lease.value_len = static_cast<size_t>(fsize);
+    *out = std::move(lease);
     return Status::kOk;
   }
   // Mirror PreadRangeDirectTo's aligned-superset math so the caller's read covers
   // exactly the bytes the synchronous path would have read.
   const uint64_t astart = AlignDown(offset);
   uint64_t aend = 0;
-  if (!AlignUp(offset + n, &aend)) return fail(Status::kIOError);
+  if (!AlignUp(offset + n, &aend)) return Status::kIOError;
   const size_t alen = static_cast<size_t>(aend - astart);
-  if (alen > io_cap) return fail(Status::kIOError);
-  out->fd = raw_fd;  // ownership transferred to caller
-  out->aligned_off = astart;
-  out->aligned_len = alen;
-  out->head = static_cast<size_t>(offset - astart);
-  out->payload_len = static_cast<size_t>(n);
+  if (alen > io_cap) return Status::kIOError;
+  lease.aligned_off = astart;
+  lease.aligned_len = alen;
+  lease.head = static_cast<size_t>(offset - astart);
+  lease.payload_len = static_cast<size_t>(n);
+  *out = std::move(lease);
   return Status::kOk;
 }
 
@@ -704,6 +818,18 @@ bool KVStore::IsCached(const BlockKey& key) const {
   std::shared_lock<std::shared_mutex> rl(sh.mu);
   return sh.index.count(fname) != 0;
 }
+Status KVStore::Lookup(const BlockKey& key, ValueMetadata* out) const {
+  if (!healthy_) return Status::kIOError;
+  if (out == nullptr) return Status::kInvalid;
+  const std::string fname = key.Filename();
+  Shard& sh = ShardFor(fname);
+  std::shared_lock<std::shared_mutex> rl(sh.mu);
+  auto it = sh.index.find(fname);
+  if (it == sh.index.end()) return Status::kNotFound;
+  out->value_len = it->second.size;
+  return Status::kOk;
+}
+
 
 uint64_t KVStore::UsedBytes() const {
   uint64_t total = 0;
@@ -713,6 +839,16 @@ uint64_t KVStore::UsedBytes() const {
   }
   return total;
 }
+uint64_t KVStore::TenantUsedBytes(uint64_t tenant_hash) const {
+  uint64_t total = 0;
+  for (const auto& sh : shards_) {
+    std::shared_lock<std::shared_mutex> rl(sh->mu);
+    const auto it = sh->tenant_used_bytes.find(tenant_hash);
+    if (it != sh->tenant_used_bytes.end()) total += it->second;
+  }
+  return total;
+}
+
 
 size_t KVStore::Count() const {
   size_t n = 0;

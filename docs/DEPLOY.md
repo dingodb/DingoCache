@@ -14,10 +14,10 @@
 
 dfkv 把**控制面**与**数据面**解耦：
 
-- **控制面 = TCP + 两边 SEND/RECV**：bootstrap TCP 只交换设备/QP/receive-segment 描述；RDMA QP 上每个请求只发送 4-KiB 内的 descriptor、status 和小 header。
+- **控制面 = TCP + 两边 SEND/RECV**：bootstrap TCP 只交换设备/QP/receive-segment 描述；RDMA QP 的 request descriptor 有界，response buffer 显式预留 `18-byte prefix + 32 KiB`，使 32-KiB `Members` 在 control lane 完整返回；更大响应直接失败、不截断。
 - **payload = one-sided RDMA**：v2 PUT 用 `RDMA_WRITE_WITH_IMM` 直落 server 共享 receive-segment slot，GET 由 server `RDMA_WRITE` 到 client 提交的 `{addr,rkey,len}`。数据 fabric 无需 IP。
 - **设备发现**：留空时两端各选本地首个 port 1 `ACTIVE` HCA；显式逗号白名单才开启多轨轮转，多 fabric 节点须过滤到两端同名且互通的 fabric。
-- **回退**：未设 `DFKV_RDMA` 走 TCP；RDMA client 默认探测 v2，老 server、强制 v1 或共享 segment 暂无 slot 时按连接回退 v1 SEND/RECV。
+- **失败策略**：未设 `DFKV_RDMA` 时选择 TCP；一旦选择 RDMA，client/server 必须完成 v2 协商和共享 segment 注册，失败即拒绝启动或连接。
 
 发现：默认走 **MDS 动态发现**（etcd + dfkv_mds，见 §2b）；静态成员表仍作为遗留/单节点备用路径（见 §4-legacy）。无副本（一致性哈希单属主，节点挂 = 该分片 miss → 重算）。
 
@@ -39,6 +39,10 @@ ldd build/dfkv_server | grep ibverbs                      # 确认链接了 RDMA
 ```
 依赖：`libibverbs-dev`（构建期）+ 运行节点装 `rdma-core`。无 RDMA 也可去掉 `-DDFKV_WITH_RDMA` 构建纯 TCP 版。
 > QP 信息走 TCP bootstrap 交换（非 librdmacm），所以只依赖 libibverbs，不需要 librdmacm。
+> CacheLib/Navy 不是 v2.0.0 的构建依赖，也没有占位 backend/CMake 开关；
+> 评估结论、兼容性差距和重开条件见
+> [CACHELIB_EVALUATION.md](CACHELIB_EVALUATION.md)。
+
 
 > ⚠️ **glibc 下限 = 构建机的 glibc**。在新发行版（如 Ubuntu 24.04 / glibc 2.39）上构建的二进制，拿到老节点（glibc 2.35）会 `version GLIBC_2.3x not found` 起不来。
 > **要部署到 glibc 2.35 的节点（如目标 GPU 节点），就在 glibc ≤ 2.35 的环境构建**（Ubuntu 22.04 / RHEL9）。仓库根的 `Dockerfile` 已固定 `ubuntu:22.04` + RDMA + 静态 libstdc++，**一次构建、glibc≥2.35 处处可跑**：
@@ -80,7 +84,7 @@ After=network-online.target
 Type=simple
 # --listen: TCP 监听端口（与 dfkv_server 端口段错开）
 # --etcd:   etcd 地址（默认 127.0.0.1:2379）
-# --metrics-port: 可选，开 Prometheus /metrics（缺省=不开端口，见 §8 / docs/METRICS.md）
+# --metrics-port: 可选，开 Prometheus /metrics（缺省=不开端口，见 §7 / docs/METRICS.md）
 ExecStart=/usr/local/bin/dfkv_mds --listen 9400 --etcd 127.0.0.1:2379 --metrics-port 9410
 Restart=on-failure
 RestartSec=2
@@ -92,11 +96,29 @@ systemctl daemon-reload && systemctl enable --now dfkv_mds
 journalctl -u dfkv_mds -n 5 --no-pager   # 应见 "dfkv_mds listening on 9400, etcd=..."
 ```
 
-> **无状态**：dfkv_mds 自身不持久化任何数据，状态全在 etcd。重启/增减副本无需协调；
+> **无状态**：dfkv_mds 不持久化私有状态，权威状态全在 etcd；进程内 lease
+> shortcut 只保留最近使用项，闲置多个 TTL 后可丢弃。重启/增减副本无需协调；
 > 节点和客户端各持一份 MDS 端点列表，自动故障转移，无需负载均衡器。
-> etcd member key 路径：`/dfkv/v1/groups/<group>/members/<id>`；epoch = etcd revision。
+> etcd member key 为 `/dfkv/v1/groups/<group>/members/<id>`。客户端看到的 epoch
+> 是**成员放置内容的 hash**，不是 etcd 全局 revision；无关 group 写入和纯统计
+> 心跳不会触发环重建。
+> MDS 的默认 etcd request timeout 为 2s；一次 heartbeat 的最慢有效顺序路径是
+> failed keepalive → lease grant → Put，共 3×2s。node/client registrar 的默认
+> socket I/O timeout 为 7s，组合上覆盖这 6s server budget；不要把 caller timeout
+> 调到单个 etcd timeout。
+> MDS 的 `/readyz` 与 `/healthz` 都执行现场 etcd probe：运行期 etcd 不可达时
+> 立即返回 503，使 scheduler 摘除该 MDS；etcd 恢复后同一进程自动回到 200。
+> `dfkv_mds` 不因运行期 etcd 短暂故障退出。
+
 
 ## 3. 每节点：systemd unit
+如启用示例 quota 文件，先创建（已存在时绝不覆盖）：
+```bash
+install -d -m0755 /etc/dfkv
+test -e /etc/dfkv/tenant-quotas ||
+  install -m0644 /dev/null /etc/dfkv/tenant-quotas
+```
+
 
 `/etc/systemd/system/dfkv.service`：
 ```ini
@@ -107,17 +129,21 @@ After=network-online.target
 Type=simple
 # v2 shared segment 示例：server 上限 4 MiB、depth=4、2 GiB segment。
 # 按所有 rank/process 的 peak live + pooled QP 公式复算，见 CONNECTORS §1.2.1。
-Environment=DFKV_RDMA_SERVER_PROTOCOL=auto-v2
 Environment=DFKV_RDMA_DEPTH=4
 Environment=DFKV_RDMA_RECV_SEGMENT_SIZE=2147483648
+# 0/unset = unlimited. If FILE is configured it must exist and parse strictly.
+Environment=DFKV_TENANT_QUOTAS_FILE=/etc/dfkv/tenant-quotas
+Environment=DFKV_TENANT_DEFAULT_QUOTA_BYTES=0
 # --port = TCP(bootstrap+TCP数据) 端口; --rdma-port = RDMA bootstrap 端口; --rdma-dev = 数据面 400G 口
 # --metrics-port = 可选 Prometheus /metrics（缺省=不开端口；--id/--group 成为指标标签）
+# 此生产示例故意不设置 --store-engine/DFKV_STORE_ENGINE：resolved 默认即 slab。
 ExecStart=/usr/local/bin/dfkv_server \
   --dir /mnt/disk1/dfkv,/mnt/disk2/dfkv,/mnt/disk3/dfkv \
   --port 28000 --rdma-port 28001 --rdma-dev ib7s400p0 --max-msg 4194304 \
   --cap 6597069766656 --mds 10.0.0.1:9400,10.0.0.2:9400 \
   --metrics-port 28010 --group default --id n57 \
-  --advertise 192.168.1.57:28001
+  --advertise 192.168.1.57:28001 \
+  --mds-registration-timeout-ms 60000
 Restart=on-failure
 RestartSec=2
 CPUQuota=1600%
@@ -132,52 +158,128 @@ WantedBy=multi-user.target
 > `DFKV_RDMA_MAX_BLOCK_BYTES=4194304` 是 **client-only DCP2 声明**，须注入每个
 > SGLang/vLLM/LMCache inference client 进程；server 用 `--max-msg 4194304`
 > 验证上限，不读取该 client env。
+>
+> Completion timeout：`DFKV_RDMA_OP_TIMEOUT_MS`（默认 5000）约束单操作；
+> `DFKV_RDMA_BATCH_OP_TIMEOUT_MS`（unset/0 = 跟随前者）覆盖 **所有** multi-item
+> Cache/Range/Exist、zero-copy 与 SG 窗口。一个窗口共用一个绝对 deadline，
+> 部分 CQ completion 不会续期。调用方临时 buffer 在方法返回后即可释放；
+> pool 外 MR 已在成功 completion 后解除，失败路径先销毁 QP 再解除。
 
-> **原 SGEngine store 迁移窗口（默认不开）**：按需追加
-> `--sgengine-tcp-port <p>` 和/或 `--sgengine-rdma-port <p>`，两者独立开关。
-> 兼容 RDMA 固定为旧 v1/DCP1，不占 DCP2 receive segment；兼容 key 写入独立
-> `sgengine-v1` domain。不要把兼容端口写进 native `--advertise`/MDS 成员表，
-> 旧客户端使用独立静态 endpoint 列表；协议矩阵和验收指标见
-> [CONNECTORS.md](CONNECTORS.md) §0.1 / [METRICS.md](METRICS.md) §3.1。
 
-> **可选存储/加速开关（见 [ARCHITECTURE.md](ARCHITECTURE.md) §5–7）。行为开关均为「门面 flag + `DFKV_*` env 双生」，flag 覆盖预设 env；运行时真值经 `dfkvctl ring` INFO 列审计（`engine=`/`wr=`/`ram=`）。**
-> - `--store-engine file|slab`（默认 `file`）：`slab` = extent 池 + slots.tbl 重启保温，消除"每块一文件"隐患。**切 slab 需清盘冷启**（旧 blocks/ 布局不复用），属独立迁移动作。
-> - `--slab-write direct|buffered`（**默认 `direct`**）：slab 数据面全程 O_DIRECT（写+对齐读+异步 prep），零 page cache/脏页占用——GPU 节点上突发吸收交给显式 RAM 热层而非内核缓存；extent 在 direct 模式下 fallocate 实体化（升级后 df 显示预分配为预期行为）。文件系统拒绝 O_DIRECT（如 tmpfs）时整店回退 buffered，以 `wr=` 上报真值。
-> - `--ram-tier on`（默认关）：写直通 RAM 热层 + RDMA arena 零拷贝 GET；`--ram-tier-bytes <bytes>` 定 arena 大小（预注册即 pin 内存，须核 `MemoryMax` 有余量）。开后观测 `dfkv_ram_hit_total` / `dfkv_ram_put_bypass_total`（见 METRICS.md §3.1）。**direct 模式下 flusher 经 CacheDirect DIO 落盘，RAM 池写入量不过 page cache。**
-> - 微调项（env only）：`DFKV_SLAB_TABLE_SYNC_MS`（slots.tbl fdatasync 节奏，默认 100，0=关；限定崩溃复活窗口）、`DFKV_RAM_FLUSH_THREADS`（RAM 落盘 worker 数，**默认=4×盘数、上限 16**——小对象落盘是 IOPS 型负载，实测 3 盘节点 64KB 饱和写 3 worker 6.8k → 16 worker 11.7k ops/s；旧"=盘数"默认源自写入路径锁竞争尚未修复的年代）。
-> - `--slab-reclaim-ms <n>` / `--ram-reclaim-ms <n>`（env `DFKV_SLAB_RECLAIM_MS` / `DFKV_RAM_RECLAIM_MS`；默认 50 / 10，`0`=关）：后台空槽回收节奏。回收线程按需求水位（上个周期插入量的 2 倍，上限 = 该 class 容量的 1/4）小批量预驱逐，使满店/满 arena 下 PUT 的分配走"摘现成空槽"快路径，不再内联跑 CLOCK 扫描（满 5 TiB 店实测：冷数据集 PUT 6.0→43.2 GB/s、稳态 12.7→29.9 GB/s、class 迁移期 p99 501→73 ms）。**默认值即推荐值，正常无需调**：池有未绑 extent 时不驱逐（Put 免费绑新 extent，驻留无损）、flush 积压深时 RAM 侧自动歇拍（那时瓶颈在落盘不在空槽），所以开着不伤命中率；仅在排查回收线程本身时才设 0 关闭对照。观测：`dfkv_slab_reclaimed_total` / `dfkv_ram_reclaimed_total`（见 METRICS.md）。
->   回收线程同时承担**类再平衡**：满店/满 arena 上出现新 value 尺寸（换模型/改 page 几何）时，热 class 按需从最冷 donor class（本周期零写入或需求 <1/4，且容量高于 8-extent 条带下限=类配额保护）搬 extent 扩容，而不是像内联路径那样"自噬"（新类永远长不大、写后读回大量 miss）。每 tick 限速（盘 2 / RAM 8 个 extent），秒级收敛；观测 `dfkv_slab_rebalanced_total` / `dfkv_ram_rebalanced_total`。
-> - `--slab-granularity <bytes>`（默认 1 MiB）：slot 量子，小值负载调小（64KB 值在 1MiB 粒度下浪费 94%）。**改动 = 布局变化 = 该店清空冷启**，按迁移动作对待。
+> **存储/加速开关（见 [ARCHITECTURE.md](ARCHITECTURE.md) §5–7）。解析顺序为 flag > 环境变量 > `slab`；运行时真值经 `dfkvctl ring` INFO 列（`engine=`/`wr=`/`ram=`）和 `dfkv_build_info{engine,write_mode}` 审计。**
+> - `--store-engine slab|file`：不设置 flag/env 时所有 store/server 路径默认 `slab`。slab = extent 池 + sparse `slots.tbl` + dirty/clean epoch。**早期格式→v3 tenant-scoped slab 必须使用空缓存目录**；容量、格式或几何不符会拒绝启动而不会改写原数据，也绝不会静默改用 file。`file` 的 48 字符 tenant+object 文件名同样不读取旧 cache，仅作显式诊断/回滚。
+> - `--slab-write direct|buffered`（默认 `direct`）：slab 数据面使用 O_DIRECT；文件系统不支持时整店回退 bounded buffered，以 `wr=` 上报真值。
+> - `--ram-tier on`（默认关）：RAM 准入立即可读，但 server PUT 等真实落盘结果后才返回 `kOk`；同键在飞请求共享 leader 结果。arena 内对象走 RDMA 零拷贝，超 extent 大对象走同预算的 dedicated allocation + bounded copy。`--ram-tier-bytes <bytes>` 定总预算；显式请求 RAM 时 allocation 或不支持的 NUMA mode 会拒绝启动，不能静默退成 disk-only。
+> - `--ram-tier-numa interleave|off`（默认 `interleave`）：这是当前完整 mode 集；不接受数字 node ID。arena 预触并绑策略，须核 `MemoryMax`。
+> - `--ram-flush-threads <n>` / `DFKV_RAM_FLUSH_THREADS`：请求值会提高到至少 shard 数；实际值由 `dfkv_ram_flush_threads` 报告（默认请求=4×盘数，上限 16）。
+> - 微调项（env only）：`DFKV_SLAB_TABLE_SYNC_MS` 控制 table sync 节奏（默认 100 ms，0=关；dirty epoch 重启仍无条件冷重置）。
+> - `--slab-reclaim-ms <n>` / `--ram-reclaim-ms <n>`（默认 50 / 10，`0`=关）：后台预回收和类再平衡。allocator 按 useful bytes + decayed read heat 选择 donor，跳过 pinned extent；通常保留默认。
+> - `--slab-granularity <bytes>`（默认 1 MiB）：最小 slot 量子。现有 `slots.tbl` 的 format/geometry 不匹配会 fail closed；修改必须换空目录，服务不会原地冷重建或忽略旧数据。
 > - `--put-inflight-limit <n>`（默认 0=关）：并发盘写超过 n 的 PUT 以 kCacheFull 快速拒绝（客户端视为普通 put 失败、不进 cooldown）= 用受控 miss 换掉过载排队尾延迟。RDMA 与 TCP 两条数据路径同受此门约束；RAM 热层的异步 flusher 落盘**不受**此门限制（否则背压会放大为 flush 丢弃）。
+> - `--tcp-max-conns <n>` / `DFKV_TCP_MAX_CONNS`（默认 512，硬上限 4096）限制
+>   TCP handler/FD；`--tcp-io-timeout-s <n>` / `DFKV_TCP_IO_TIMEOUT_S`（默认
+>   60s，硬上限 3600s）回收 silent/半帧连接。达到上限的新连接会被立即拒绝，
+>   pooled TCP 客户端重连；监控 §7 的 reject counter。
 > - RAM 热层 arena 预触 + RDMA MR 注册都在启动期走页：**arena 每 16 GiB 约 +5-10s 启动时间**，配大 arena（≥64 GiB）时同步调大 systemd `TimeoutStartSec`（默认 90s）并让就绪探测等待 metrics 端口。
-> GPU 节点推荐组合：`--store-engine slab`（direct 已默认）+ `--ram-tier on` + 按节点突发画像定 `--ram-tier-bytes`。
+> GPU 节点推荐：保留默认 slab/direct，按节点突发画像启用 RAM tier 并设置总预算。
 ```bash
 systemctl daemon-reload && systemctl enable --now dfkv
 journalctl -u dfkv -n 10 --no-pager
 # 应见 "PORT 28000" + "RDMA listening (TCP bootstrap) on port 28001, dev=ib7s400p0"
-#      + "dfkv_server registered with MDS group=default id=n57 advertise=192.168.1.57:28001"
+#      + "dfkv_server MDS registration loop started group=default id=n57 advertise=192.168.1.57:28001"
+# 首次成功后另见 "dfkv_server registered with MDS group=default id=n57"
 ```
+> `--mds-registration-timeout-ms` / `DFKV_MDS_REGISTRATION_TIMEOUT_MS` 是首次
+> MDS 注册硬截止时间（默认 60000 ms，合法范围 1000–600000 ms，flag 优先）。
+> 非整数、越界值均以配置错误退出 2；截止前仍未注册则停止所有 listener 并退出
+> 1，由 `Restart=on-failure` 重试，节点不会无限保持 active-but-unregistered。
+> `GET /healthz` 反映当前 store/RAM terminal health；`GET /readyz` 还要求本地
+> startup 和首次 MDS 注册完成。首次成功后 readiness latch 不因瞬时 heartbeat
+> 失败清零，已注册节点继续运行并在 MDS 恢复后续租；必须同时监控
+> [METRICS.md](METRICS.md) 的 registrar heartbeat 指标。
 > server 的 bootstrap 监听 `0.0.0.0`，靠防火墙限制在内网。优雅关闭已修（`systemctl stop` 约 1s 退出）。
-> **多轨**：server 启动时 anchor 白名单内全部 active rail；client 新 QP 轮转健康轨。留空时两端各选本地首个 ACTIVE HCA，适合 local device 名不同的单 fabric 主机；显式 `--rdma-dev` / `DFKV_RDMA_DEV` 会把设备选择发给 peer，故生产多 fabric 主机必须在两端过滤到**同名且互通**的一组设备。`DFKV_RDMA_NUMA=1` 只改变 QP 选轨与 serve 线程亲和；当前 receive segment 是单块 process-wide 分配，不是 per-NUMA/per-rail 分片。
+> **多轨与 NUMA**：server 启动时 anchor 白名单内全部 active rail；client 以
+> `DFKV_RDMA_RAIL_CREDITS` 的 per-rail credit、归一化 inflight、延迟和本地
+> rail 错误分数选轨（分数相同时按发现顺序稳定选择）。留空时两端各选本地首个
+> ACTIVE HCA，适合 local device 名不同的单 fabric 主机；显式
+> `--rdma-dev` / `DFKV_RDMA_DEV` 是权威白名单并把具体设备选择发给 peer，故
+> 生产多 fabric 主机必须在两端过滤到**同名且互通**的一组设备。
+> `DFKV_RDMA_NUMA=1` 在每次 Acquire 读取 caller NUMA；只要白名单内存在
+> local rail 就只在 local mask 内准入（local credit 忙时不会越级借 remote
+> rail）。caller NUMA 未知或没有 local rail 才回退全部白名单，保证进度。
+> receive segment 仍是单块 process-wide 分配，不是 per-NUMA/per-rail 分片。
 >
-> **v2 segment 预算**：`slot=align4K(4096 + sizeof(ValueHeader) + max(max_block,4096))`；
+> **失败域隔离**：TCP bootstrap、peer 不可达、epoch/QP frame/receive-segment
+> 不兼容属于 endpoint 失败：立即归还 rail credit，由 client `PeerHealth` 对该
+> node 做 bounded cooldown，不增加共享 HCA 的 consecutive failure，也不会让
+> node A 隔离 node B 的健康 rail。只有本地 device open、verbs/QP transition、
+> post 或 CQ 失败才按 `DFKV_RDMA_RAIL_ERROR_THRESHOLD` 隔离 rail
+> `DFKV_RDMA_RAIL_COOLDOWN_MS`；cooldown 到期仍以单 probe 成功恢复，endpoint
+> 失败既不误恢复也不重新惩罚 rail。
+>
+> **v2 segment 预算**：`slot=align4K(4096 + max_raw_payload)`；
 > `segment >= Σ(live + client-pool-idle data/control QP × depth × slot)`。lease
 > 保留到 QP 销毁或 idle reclaim，不能只数在飞请求。4 MiB/depth=4/2 GiB
 > 约容纳 127 条 data QP（未扣 control lease）。上线先看
-> `dfkv_rdma_recv_segment_free_bytes`、`dfkv_rdma_v2_ready`、
-> `dfkv_rdma_{v1,v2}_conns_opened_total`；free 接近 0 会让新连接回退 v1。
+> `dfkv_rdma_recv_segment_free_bytes`、`dfkv_rdma_v2_ready` 和
+> `dfkv_rdma_v2_conns_opened_total`；free 接近 0 会使新连接被拒绝。
+
+### 3a. 每节点 tenant quota
+
+quota 是**每个 cache node 的物理容量边界**，不是同步的集群全局 reservation。
+server 启动时一次性读取（运行期不热加载）：
+
+```text
+# /etc/dfkv/tenant-quotas
+# <16-lowercase-hex-hash> <uint64-bytes>
+6164af84acbc9ade 1099511627776
+```
+
+`DFKV_TENANT_DEFAULT_QUOTA_BYTES=0` 或 unset 表示未列出的 tenant 无限；
+文件内 limit `0` 也表示该 hash 无限。配置了
+`DFKV_TENANT_QUOTAS_FILE` 时，文件缺失、hash 非 16 位小写 hex、非 uint64、
+重复 hash 或多余字段都会令节点 fail closed。hash 算法由
+`dfkv_common.identity.tenant_hash` 与 native client 共用。原子管理工具不会删除
+cache data：
+
+```bash
+deploy/dfkv_tenant_quota.py --file /etc/dfkv/tenant-quotas \
+  set --tenant tenant-a 1099511627776
+deploy/dfkv_tenant_quota.py --file /etc/dfkv/tenant-quotas list
+deploy/dfkv_tenant_quota.py --file /etc/dfkv/tenant-quotas \
+  remove --hash 6164af84acbc9ade
+# 文件在 server 生命周期内 immutable；修改后逐节点 restart 生效。
+```
+
+按目标 tenant 的去重后逻辑 working set `B`、写复制因子 `R`、有效 cache 节点数
+`N`、实测 Ketama 最大偏斜 `S>=1`、同一 tenant 最大并发新写余量 `W` bytes，
+起始值：
+
+```
+Q_node = ceil(B * R / N * S) + W
+```
+
+quota 计 committed payload bytes；slab slot 内碎片另占物理空间，因此还要满足
+`sum(active Q_node × slot_size/payload_size) + 运维预留 <= --cap`。各 quota 是
+上限而非预留，超额返回 `kQuotaExceeded`，与全盘/写入门的 `kCacheFull` 分开。
+REMOVE 和 store eviction 立即释放 usage；重启从 file 名或 v3 slab record 重建。
+受限 tenant 为保证 PUT 的同步 admission 语义会绕过异步 RAM write-back。
 
 ## 4. 集群成员管理
 
 ### 4a. MDS 动态发现（推荐）
 
-节点通过 `--mds` + `--group` + `--id` + `--advertise` 向 MDS 自注册，客户端调用
-`dfkv_start_mds_discovery(c, "mds1:9400,mds2:9400", "default", 3000)` 周期轮询
-MDS（默认间隔 3000 ms）。epoch（etcd revision）变化时自动重建加权 Ketama 环。
-增减节点只需启停 `dfkv_server`，无需改客户端配置。
+节点通过 `--mds` + `--group` + `--id` + `--advertise` 向 MDS 自注册。客户端在
+调用 `dfkv_open_v2` 前，把 endpoints、group、poll interval 和可选客户端注册身份
+一次性写入 `dfkv_client_options_v2`；构造成功后自动轮询 MDS。epoch（etcd
+revision）变化时自动重建加权 Ketama 环。增减节点只需启停 `dfkv_server`，
+无需修改已运行客户端的配置。
 
 两层离线检测：
-- **层 2（权威）**：etcd lease 到期 → MDS 视图变更 → 客户端 epoch 推进 → 环重建（≤ 30 s）
+- **层 2（权威）**：etcd lease 到期（TTL 30s）→ 下次 MDS poll（默认 3s）→
+  placement-content epoch 推进 → 环重建。小幅缩容通常约 TTL+一次 poll；
+  超过 shrink guard 百分比的批量缩容还须连续 3 次成功 poll 通过 hysteresis，
+  默认最坏约 30s+3×3s，而不是固定“≤30s”。
 - **层 1（快速）**：`PeerHealth` 传输 IO 失败即短路该节点为 miss 并进入 cooldown，不触发环重建
 
 ### 4b. 静态成员表（遗留/单节点备用）<a name="4-legacy"></a>
@@ -190,6 +292,66 @@ n57=192.168.1.57:28001,n58=192.168.1.58:28001,...
 增减节点 = 改成员字符串并重载 SGLang 端。`dfkv_server` 此时不带 `--mds` 启动。
 建议 N≥4 降低单点 miss 影响。
 
+### 4c. 节点排空 / 替换（生产自动化）
+
+`deploy/dfkv_node_replace.py` 把无副本缓存环的替换顺序固化为：读取 MDS + 已注册
+client 基线 → 新节点入环 → `dfkvctl stat --all` 就绪 → 连续稳定环观测 → 停旧
+节点 → 等 lease expiry、客户端 poll 与（批量缩容时）hysteresis 全部收敛 → 再验
+新节点和 client。它不会直接删 etcd key；旧节点由正常 service stop 和 lease
+expiry 退出权威视图。停旧之后任一步失败或收到中断，脚本会先重启旧 service、
+等待其重新入环/就绪，再非零退出；新节点保留在线，避免回滚再制造一次环缩容。
+重复执行时若旧节点已退出且新节点健康会直接成功。
+
+```bash
+# 先做只读预检并打印会执行的 SSH/systemctl 动作
+deploy/dfkv_node_replace.py --mds 10.0.0.1:9400,10.0.0.2:9400 --group glm \
+  --old-id n57 --old-host 10.0.0.57 --new-id n70 --new-host 10.0.0.70 \
+  --timeout 180 --command-timeout 10 --min-clients 1 --dry-run
+
+# 执行；state 文件是原子更新的事件审计记录
+deploy/dfkv_node_replace.py --mds 10.0.0.1:9400,10.0.0.2:9400 --group glm \
+  --old-id n57 --old-host 10.0.0.57 --new-id n70 --new-host 10.0.0.70 \
+  --timeout 180 --command-timeout 10 --min-clients 1 \
+  --state-file /var/lib/dfkv/node-replace.json
+```
+
+前提：目标机已安装并配置同名 `dfkv.service`，执行机可 BatchMode SSH；新旧节点 ID
+必须不同（同 ID 会争抢 etcd lease，脚本拒绝）。`--timeout` 是**每个状态迁移**的
+上限而不是无限等待；`--min-clients 0` 允许还未升级客户端注册能力的旧车队，但脚本
+仍会调用 `dfkvctl clients`，并保证执行前已观察到的 client 在切换后没有消失。
+
+### 4d. 成员漂移 / split-brain 巡检
+
+`deploy/dfkv_membership_audit.py` 分别查询每个 MDS（不是把 endpoints 当故障转移
+列表只取一个），并从 etcd v3 gateway 只读 `/dfkv/v1/groups/<g>/members/`：
+比较 placement view、节点注册值中的自报 INFO、etcd registration `mod_revision`
+和按 C++ 同算法计算的 ring content epoch。任一 MDS 不可达、视图分裂、MDS/etcd
+成员或自报不一致均退出 `2`；工具/解析错误退出 `1`；健康退出 `0`。
+
+```bash
+deploy/dfkv_membership_audit.py \
+  --mds 10.0.0.1:9400,10.0.0.2:9400,10.0.0.3:9400 \
+  --etcd http://10.0.0.4:2379 --group glm --timeout 5 \
+  --output /var/lib/dfkv/membership.json \
+  --prom-output /var/lib/node_exporter/textfile/dfkv_membership.prom
+```
+
+JSON 中保留每个 MDS 的 ring epoch、完整成员自报和每节点 registration revision，
+适合定时任务留档；Prometheus textfile 指标与告警建议见
+[METRICS.md](METRICS.md)。etcd gateway 和 MDS 都是无鉴权内网接口，巡检机只开
+只读网络访问，不向公网暴露。
+
+### 4e. F10 clean epoch cutover warning
+
+Tenant identity changes all persistent and transport identity: native TCP epoch
+6, RDMA epoch 7, 50-byte request prefix, 48-hex file names, and slab format v3.
+There is no old wire/disk decoder, dual write, or cache migration. **Do not put
+old and new servers in one client-visible ring during a rolling upgrade.**
+Create an isolated candidate MDS group/ports, start v3 nodes on empty cache
+directories, verify them, then move a compatible client cohort atomically.
+Drain the old group afterwards. A per-node rolling restart is safe only after
+every client that can route to that node speaks the new epochs.
+
 ## 5. 上线顺序 + 冒烟（无需 GPU）
 
 1. （MDS 路径）起 etcd，再起所有 `dfkv_mds` 副本（§2b），确认日志 "listening"。
@@ -197,7 +359,7 @@ n57=192.168.1.57:28001,n58=192.168.1.58:28001,...
 3. 冒烟（任一能访问内网的机器）：
    ```bash
    dfkv_smoke --members n57=192.168.1.57:28000 --size 2752512                          # TCP
-   DFKV_RDMA=1 DFKV_RDMA_PROTOCOL=auto-v2 DFKV_RDMA_MAX_BLOCK_BYTES=4194304 \
+   DFKV_RDMA=1 DFKV_RDMA_MAX_BLOCK_BYTES=4194304 \
      DFKV_RDMA_DEV=ib7s400p0 dfkv_smoke --members n57=192.168.1.57:28001 --size 2752512
    ```
 4. 端到端零拷贝校验（插件 → libdfkv → RDMA → server，验证 payload 直落缓冲）：
@@ -209,8 +371,38 @@ n57=192.168.1.57:28001,n58=192.168.1.58:28001,...
 5. 压测（可选）：`DFKV_RDMA=1 DFKV_RDMA_DEV=ib7s400p0 dfkv_bench --members ... --size 2752512 --count 8000 --threads 64`。
 6. 在**一个受控 SGLang 副本**上切 `dynamic` 后端，发共享长前缀请求看命中上涨，确认后推广。
 
+### 5b. 候选版本负载回归门
+
+`deploy/dfkv_load_regression.py` 对 baseline/candidate 使用完全相同的 size/count/
+threads/batch/transport 环境，先 warmup，再各跑多轮 `dfkv_bench --op both`。吞吐对
+trial 汇总 median/p95/p99；延迟从 workload 前后的 server
+`dfkv_op_latency_seconds` histogram **差值**计算 median/p95/p99（不是从终身累计
+值猜测）；错误率来自 bench `fails/count`。因此两套目标都必须开启 metrics port，
+并在隔离压测窗口执行，避免其它流量混入 histogram delta。
+
+```bash
+DFKV_RDMA=1 DFKV_RDMA_DEV=ib7s400p0 DFKV_RDMA_DEPTH=4 \
+deploy/dfkv_load_regression.py \
+  --baseline-mds 10.0.1.1:9400 --baseline-group glm \
+  --baseline-metrics 10.0.1.11:28010,10.0.1.12:28010 \
+  --candidate-mds 10.0.2.1:9400 --candidate-group glm \
+  --candidate-metrics 10.0.2.11:28010,10.0.2.12:28010 \
+  --size 2752512 --count 8000 --threads 64 --batch 1 --bc 1 \
+  --warmup-runs 1 --warmup-count 512 --runs 5 \
+  --ready-timeout 30 --run-timeout 600 --metrics-timeout 5 \
+  --max-throughput-regression 10 --max-latency-regression 20 \
+  --max-error-rate 0.01 --output load-regression.json
+```
+
+静态环可分别改用 `--baseline-members` / `--candidate-members`；两侧二进制不同时用
+`--baseline-bench` / `--candidate-bench`。每次 measured run 使用新 key seed，
+避免 write-once cache 把重复 PUT 误算成性能。任一命令超时、metrics reset、无采样
+或 baseline 本身错误率越界时 fail closed（退出 `1`）；candidate 越阈值退出 `3`；
+通过退出 `0`。无论通过、回归或运行错误，`--output` 都原子写 JSON artifact。
+
 ## 6. 回滚（秒级）
-- 仅回滚 RDMA v2（保留 dfkv）：在**每个推理 client 进程**设置 `DFKV_RDMA_PROTOCOL=1` 并重启；需要 server 同时禁用时，在**每个 dfkv server 进程**设置 `DFKV_RDMA_SERVER_PROTOCOL=1` 并重启。变量只在 transport/server 构造时读取，已有连接池 QP 不会重新协商；恢复自动探测时也必须删除对应变量并再次重启所有受影响的 client/server。每次切换后用 v1/v2 connection counters 验证实际协议。
+- RDMA v2 不提供协议内降级。需要回滚数据面时，停止受影响副本并显式切换到
+  TCP 或上一完整发行版；不要设置已删除的协议变量。
 - SGLang：`--hicache-storage-backend` 改回原后端（mooncake 等）重启该副本，与 dfkv 解耦。
 - dfkv 节点：`systemctl stop dfkv`；缓存可丢（KV 可重算），彻底清理删 `/mnt/diskX/dfkv`。
 - dfkv MDS：`systemctl stop dfkv_mds`；无状态，etcd 数据可保留也可清除（`etcdctl del /dfkv --prefix`）。
@@ -218,9 +410,9 @@ n57=192.168.1.57:28001,n58=192.168.1.58:28001,...
 
 ## 7. 监控 / 边界
 **完整指标/CLI 参考见 [METRICS.md](METRICS.md)。** 要点：
-- **Prometheus 抓取**（opt-in）：`dfkv_server`/`dfkv_mds` 加 `--metrics-port <p>` → `GET /metrics`、`/healthz`。`--id/--group` 成为 `{node,group}` 标签（不设=无标签，向后兼容）。**缺省不开端口 → 行为与旧版一致、对数据面零影响**。Prometheus 直接抓每节点 `:<p>/metrics`。
-  - 服务端含：put/hit/miss、bytes、淘汰、错误分型、`open_connections`、per-disk、**采样延迟直方图 `dfkv_op_latency_seconds{op}`**、RDMA 完成/错误/活跃连接。
-  - MDS 含：register/keepalive/list/lease/etcd-error + members gauge。
+- **Prometheus 抓取**（opt-in）：`dfkv_server`/`dfkv_mds` 加 `--metrics-port <p>` → `GET /metrics`、`/healthz`、`/readyz`。MDS 的两个 probe 均反映**现场 etcd 可达性**，运行期故障时 `/readyz` 503、恢复后 200，scheduler 必须用它摘流。cache `/healthz` 反映当前 store/RAM terminal health；`/readyz` 还要求本地启动完成且（配置 MDS 时）**首次 MDS 注册成功**。首次注册在有界 deadline 内失败会退出 1；成功后的 heartbeat 丢失不清 startup-ready latch，须用 registrar heartbeat 指标独立告警。`--id/--group` 成为 `{node,group}` 标签（不设=无标签，向后兼容）。**缺省不开端口 → 行为与旧版一致、对数据面零影响**。Prometheus 直接抓每节点 `:<p>/metrics`。
+  - 服务端含：put/hit/miss、bytes、淘汰、quota limit/usage/rejection、错误分型、TCP handler limit/timeout/reject、registrar heartbeat/deadline、`open_connections`、per-disk、**采样延迟直方图 `dfkv_op_latency_seconds{op}`**、RDMA 完成/错误/活跃连接。
+  - MDS 含：register/keepalive/list/lease/etcd-error、local lease current/pruned + members gauge。
   - 客户端（SGLang 插件 `/metrics`）：`dfkv_client_*{tp_rank}`，见 [CONNECTORS.md](CONNECTORS.md) §2.4 / METRICS.md §3.3。
 - **集群/环视图**（CLI，无需开端口）：
   - `dfkvctl ring --mds <eps> --group <g>` — 成员表 + 一致性哈希环每节点 vnode 占比。
@@ -228,4 +420,4 @@ n57=192.168.1.57:28001,n58=192.168.1.58:28001,...
   - `dfkvctl stat <ip:port>` — 单节点原始 Prometheus 文本（旧用法不变）。
 - SGLang `--enable-cache-report` 的 HiCache storage hit/miss、TTFT。
 - 生产只读：不改现网组件；dfkv 端口（含 `/metrics`）仅内网开放、无鉴权勿暴露公网。
-- RDMA v1/v2 frame 均带显式版本；新 client 先做能力 probe，滚动升级中的新旧 client/server 组合自动选择共同的 v1，不会把另一版本静默错读。`dfkv_rdma_{v1,v2}_conns_opened_total` 可审计实际路径。
+- RDMA 只接受显式 v2 frame；能力 probe、QP 标记或共享 segment 信息不匹配时连接失败，不会把输入按其他版本解码。

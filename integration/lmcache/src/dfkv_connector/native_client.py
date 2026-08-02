@@ -19,10 +19,17 @@ RDMA zero-copy datapath.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, List, Optional, Sequence, Tuple
+from dfkv_common import (
+    DfkvClientOptionsV2,
+    make_client_options_v2,
+    make_key_array,
+    make_key_buffer,
+)
 
 from . import access_log as _alog
 from .access_log import access_log
@@ -38,7 +45,6 @@ logger = logging.getLogger(__name__)
 c_void_p = ctypes.c_void_p
 c_char_p = ctypes.c_char_p
 c_uint64 = ctypes.c_uint64
-c_uint32 = ctypes.c_uint32
 c_int = ctypes.c_int
 POINTER = ctypes.POINTER
 
@@ -47,59 +53,55 @@ def load_lib(path: Optional[str] = None) -> ctypes.CDLL:
     """Load libdfkv.so and declare the C ABI signatures.
 
     Path precedence: explicit ``path`` arg → env ``DFKV_LIB`` →
-    ``$DFKV_BUILD/libdfkv.so`` → ``./build/libdfkv.so`` relative to cwd.
+    ``$DFKV_BUILD/libdfkv.so`` → the system dynamic-loader path.
     """
+    build = os.environ.get("DFKV_BUILD")
     lib_path = (
         path
         or os.environ.get("DFKV_LIB")
-        or os.path.join(os.environ.get("DFKV_BUILD", "build"), "libdfkv.so")
+        or (os.path.join(build, "libdfkv.so") if build else "libdfkv.so")
     )
     lib = ctypes.CDLL(lib_path)
-    lib.dfkv_open.restype = c_void_p
-    lib.dfkv_open.argtypes = [c_char_p, c_uint64, c_uint32, c_uint32, c_uint32,
-                              c_uint32, c_uint32, c_uint32, c_uint32, c_uint32]
+    lib.dfkv_open_v2.restype = c_void_p
+    lib.dfkv_open_v2.argtypes = [POINTER(DfkvClientOptionsV2)]
     lib.dfkv_put.restype = c_int
-    lib.dfkv_put.argtypes = [c_void_p, c_char_p, c_void_p, c_uint64]
+    lib.dfkv_put.argtypes = [
+        c_void_p, c_void_p, c_uint64, c_void_p, c_uint64]
     lib.dfkv_get.restype = c_int
-    lib.dfkv_get.argtypes = [c_void_p, c_char_p, c_void_p, c_uint64]
+    lib.dfkv_get.argtypes = lib.dfkv_put.argtypes
     lib.dfkv_get_auto.restype = c_int
-    lib.dfkv_get_auto.argtypes = [c_void_p, c_char_p, c_void_p, c_uint64,
-                                  POINTER(c_uint64)]
+    lib.dfkv_get_auto.argtypes = [
+        c_void_p, c_void_p, c_uint64, c_void_p, c_uint64,
+        POINTER(c_uint64)]
     lib.dfkv_exist.restype = c_int
-    lib.dfkv_exist.argtypes = [c_void_p, c_char_p]
+    lib.dfkv_exist.argtypes = [c_void_p, c_void_p, c_uint64]
     lib.dfkv_register_memory.restype = c_int
     lib.dfkv_register_memory.argtypes = [c_void_p, c_void_p, c_uint64]
     lib.dfkv_batch_put.restype = c_int
-    lib.dfkv_batch_put.argtypes = [c_void_p, POINTER(c_char_p), POINTER(c_void_p),
-                                   POINTER(c_uint64), c_int, POINTER(c_int)]
+    lib.dfkv_batch_put.argtypes = [
+        c_void_p, POINTER(c_void_p), POINTER(c_uint64),
+        POINTER(c_void_p), POINTER(c_uint64), c_int, POINTER(c_int)]
     lib.dfkv_batch_get.restype = c_int
     lib.dfkv_batch_get.argtypes = lib.dfkv_batch_put.argtypes
     lib.dfkv_batch_get_auto.restype = c_int
-    lib.dfkv_batch_get_auto.argtypes = [c_void_p, POINTER(c_char_p),
-                                        POINTER(c_void_p), POINTER(c_uint64),
-                                        c_int, POINTER(c_int), POINTER(c_uint64)]
+    lib.dfkv_batch_get_auto.argtypes = [
+        c_void_p, POINTER(c_void_p), POINTER(c_uint64),
+        POINTER(c_void_p), POINTER(c_uint64),
+        c_int, POINTER(c_int), POINTER(c_uint64)]
     lib.dfkv_batch_exist.restype = c_int
-    lib.dfkv_batch_exist.argtypes = [c_void_p, POINTER(c_char_p), c_int,
-                                     POINTER(c_int)]
-    # dfkv_remove / dfkv_batch_remove are additive (>= dfkv with the remove RPC).
-    # Declared unconditionally; guarded at call sites for older libdfkv.so.
+    lib.dfkv_batch_exist.argtypes = [
+        c_void_p, POINTER(c_void_p), POINTER(c_uint64),
+        c_int, POINTER(c_int)]
+    # Remove support remains capability-detected for deployments that omit the
+    # optional eviction RPC; when present it uses the binary-key v2 ABI.
     if hasattr(lib, "dfkv_remove"):
         lib.dfkv_remove.restype = c_int
-        lib.dfkv_remove.argtypes = [c_void_p, c_char_p]
+        lib.dfkv_remove.argtypes = [c_void_p, c_void_p, c_uint64]
     if hasattr(lib, "dfkv_batch_remove"):
         lib.dfkv_batch_remove.restype = c_int
-        lib.dfkv_batch_remove.argtypes = [c_void_p, POINTER(c_char_p), c_int,
-                                          POINTER(c_int)]
-    lib.dfkv_set_members.restype = c_int
-    lib.dfkv_set_members.argtypes = [c_void_p, c_char_p]
-    lib.dfkv_start_mds_discovery.restype = c_int
-    lib.dfkv_start_mds_discovery.argtypes = [c_void_p, c_char_p, c_char_p, c_int]
-    # Client registration (additive >= dfkv with the /clients/<id> lease). Guarded
-    # at the call site for older libdfkv.so without the symbol.
-    if hasattr(lib, "dfkv_start_client_registration"):
-        lib.dfkv_start_client_registration.restype = c_int
-        lib.dfkv_start_client_registration.argtypes = [
-            c_void_p, c_char_p, c_char_p, c_char_p, c_char_p, c_int]
+        lib.dfkv_batch_remove.argtypes = [
+            c_void_p, POINTER(c_void_p), POINTER(c_uint64),
+            c_int, POINTER(c_int)]
     lib.dfkv_transport_mode.restype = c_char_p
     lib.dfkv_transport_mode.argtypes = [c_void_p]
     lib.dfkv_version.restype = c_char_p
@@ -137,6 +139,10 @@ def _total_size(bufs: Sequence[memoryview]) -> int:
     return sum(mv.nbytes for mv in bufs)
 
 
+def _key_label(key: bytes) -> str:
+    """Safe deterministic object-key representation for text/JSON logs."""
+    return f"len={len(key)} sha256={hashlib.sha256(key).hexdigest()[:16]}"
+
 class DfkvNativeClient:
     """Awaitable interface over libdfkv.so (ctypes + thread-pool executor)."""
 
@@ -145,7 +151,9 @@ class DfkvNativeClient:
         raw_endpoint: str,
         group: str,
         membership: str,
-        geometry: dict,
+        key_namespace: bytes,
+        tp_size: int = 1,
+        tp_rank: int = 0,
         lib_path: Optional[str] = None,
         mds_poll_ms: int = 3000,
         rdma_pools: Optional[Sequence[Tuple[int, int]]] = None,
@@ -163,72 +171,56 @@ class DfkvNativeClient:
             self._lib = load_lib(lib_path)
             self._loop = loop or asyncio.get_running_loop()
             self._closed = False
-            g = geometry
-
+            if not key_namespace:
+                raise ValueError(
+                    "DfkvNativeClient requires a non-empty key namespace")
+            self._key_namespace = bytes(key_namespace)
             members = raw_endpoint if membership == "static" else ""
-            self._h = self._lib.dfkv_open(
-                members.encode(),
-                c_uint64(int(g["model_hash"]) & 0xFFFFFFFFFFFFFFFF),
-                int(g["page_size"]) & 0xFFFFFFFF,
-                int(g["dtype_tag"]) & 0xFFFFFFFF,
-                int(g["flags"]) & 0xFFFFFFFF,
-                int(g["tp_size"]) & 0xFFFFFFFF,
-                int(g["tp_rank"]) & 0xFFFFFFFF,
-                int(g["layer_num"]) & 0xFFFFFFFF,
-                int(g["head_num"]) & 0xFFFFFFFF,
-                int(g["head_dim"]) & 0xFFFFFFFF,
+            register_client = (
+                membership == "mds"
+                and _tcfg.truthy(
+                    os.environ.get("DFKV_CLIENT_REGISTER", "1"))
             )
+            client_id = (
+                _tcfg.resolve_connector_id({}, tp_rank=int(tp_rank))
+                if register_client
+                else ""
+            )
+            client_info = (
+                f"type={_tcfg.TYPE_LMCACHE},"
+                f"tp_size={int(tp_size)},"
+                f"tp_rank={int(tp_rank)},"
+                f"ver={_tcfg.dist_version('dfkv-connector')}"
+                if register_client
+                else ""
+            )
+            options = make_client_options_v2(
+                self._key_namespace,
+                members=members,
+                mds_endpoints=(
+                    raw_endpoint if membership == "mds" else ""),
+                mds_group=group,
+                mds_poll_ms=mds_poll_ms,
+                register_client=register_client,
+                client_id=client_id,
+                client_info=client_info,
+                client_heartbeat_ms=10000,
+            )
+            self._h = self._lib.dfkv_open_v2(ctypes.byref(options))
             if not self._h:
-                raise RuntimeError("dfkv_open failed")
+                raise RuntimeError("dfkv_open_v2 failed")
             mode_b = self._lib.dfkv_transport_mode(self._h)
             self.transport_mode = (
                 mode_b.decode("utf-8", errors="replace") if mode_b else "unknown"
             )
-
-            if membership == "mds":
-                rc = self._lib.dfkv_start_mds_discovery(
-                    self._h, raw_endpoint.encode(), group.encode(),
-                    int(mds_poll_ms),
-                )
-                if rc != 0:
-                    self._lib.dfkv_close(self._h)
-                    self._h = None
-                    raise RuntimeError(
-                        f"dfkv_start_mds_discovery failed (rc={rc})"
-                    )
-                # Register this LMCache connector as a cache consumer so
-                # `dfkvctl clients` can list it. Best-effort: a missing symbol
-                # (older libdfkv.so) or failure is logged, never fatal — the data
-                # path is already up via discovery above. Default on; opt out with
-                # DFKV_CLIENT_REGISTER=0.
-                if _tcfg.truthy(os.environ.get("DFKV_CLIENT_REGISTER", "1")):
-                    tp_rank = int(g.get("tp_rank", 0))
-                    cid = _tcfg.resolve_connector_id({}, tp_rank=tp_rank)
-                    info = (
-                        f"type={_tcfg.TYPE_LMCACHE},"
-                        f"tp_size={int(g.get('tp_size', 0))},"
-                        f"tp_rank={tp_rank},"
-                        f"ver={_tcfg.dist_version('dfkv-connector')}"
-                    )
-                    try:
-                        rc2 = self._lib.dfkv_start_client_registration(
-                            self._h, raw_endpoint.encode(), group.encode(),
-                            cid.encode(), info.encode(), 10000)
-                        if rc2 != 0:
-                            raise RuntimeError(f"rc={rc2}")
-                    except AttributeError:
-                        pass  # older libdfkv.so without the symbol
-                    except Exception as e:  # noqa: BLE001
-                        logger.warning("dfkv client registration skipped: %s", e)
-
             # Register the host arena(s) once so RDMA Put/Get into any slice of
             # them skips per-op MR registration. No-op on TCP.
             regs = 0
             for base, size in (rdma_pools or []):
-                if base and size and self._lib.dfkv_register_memory(
-                    self._h, c_void_p(int(base)), c_uint64(int(size))
-                ) == 0:
-                    regs += 1
+                if not base or not size:
+                    continue
+                self._register_memory(int(base), int(size))
+                regs += 1
 
             self._executor = ThreadPoolExecutor(
                 max_workers=max(1, int(get_parallelism)),
@@ -239,33 +231,40 @@ class DfkvNativeClient:
             # before — this gives it parity with the SGLang/vLLM connectors. Report
             # the connector package + libdfkv.so versions for fleet skew tracking.
             _push_metrics.configure(
-                {}, connector_type=_tcfg.TYPE_LMCACHE, tp_rank=int(g["tp_rank"]),
+                {}, connector_type=_tcfg.TYPE_LMCACHE, tp_rank=int(tp_rank),
                 version=_tcfg.dist_version("dfkv-connector"),
                 native_version=_native_version(self._lib))
             # Connector-side request tracing (off by default; zero cost when off).
             # Spans for slow / sampled / failed ops pushed over OTLP /v1/traces.
             _push_tracing.configure(
-                {}, connector_type=_tcfg.TYPE_LMCACHE, tp_rank=int(g["tp_rank"]),
+                {}, connector_type=_tcfg.TYPE_LMCACHE, tp_rank=int(tp_rank),
                 version=_tcfg.dist_version("dfkv-connector"),
                 native_version=_native_version(self._lib))
             # Access log: parse the launch baseline (env-driven), then let a
             # control file toggle it at runtime without restarting LMCache
             # (opt-in via DFKV_HOT_CONFIG). docs/access_log.md -> 运行时热开关.
-            _alog.configure({}, tp_rank=int(g["tp_rank"]))
+            _alog.configure({}, tp_rank=int(tp_rank))
             _hot_config.register("access_log", _alog.apply_hot)
-            _hot_config.start({}, tp_rank=int(g["tp_rank"]))
+            _hot_config.start({}, tp_rank=int(tp_rank))
             r.result = f"ok regs={regs} transport={self.transport_mode}"
+
+    def _register_memory(self, base: int, size: int) -> None:
+        """Register one MR or fail startup rather than claiming zero-copy."""
+        rc = self._lib.dfkv_register_memory(
+            self._h, c_void_p(base), c_uint64(size))
+        if rc != 0:
+            raise RuntimeError(
+                f"dfkv_register_memory(base={base:#x}, size={size}) rc={rc}")
 
     # ------------------------------------------------------------------
     # blocking ctypes helpers (run in the executor)
     # ------------------------------------------------------------------
 
     def _batch_set_blocking(
-        self, keys: List[str], bufs: List[memoryview]
+        self, keys: List[bytes], bufs: List[memoryview]
     ) -> Tuple[bool, List[bool]]:
         n = len(keys)
-        kbuf = [k.encode() for k in keys]
-        karr = (c_char_p * n)(*kbuf)
+        karr, klens, key_owners = make_key_array(keys)
         ptrs: List[int] = []
         keepalive: List[Any] = []
         for mv in bufs:
@@ -275,19 +274,19 @@ class DfkvNativeClient:
         parr = (c_void_p * n)(*[c_void_p(p) for p in ptrs])
         sarr = (c_uint64 * n)(*[mv.nbytes for mv in bufs])
         out = (c_int * n)()
-        rc = self._lib.dfkv_batch_put(self._h, karr, parr, sarr, n, out)
+        rc = self._lib.dfkv_batch_put(
+            self._h, karr, klens, parr, sarr, n, out)
         if rc != 0:
             raise RuntimeError(f"dfkv_batch_put rc={rc}")
         per_key = [out[i] == 1 for i in range(n)]
-        del keepalive  # C is done reading the source buffers
+        del keepalive, key_owners  # native call has returned
         return all(per_key), per_key
 
     def _batch_get_blocking(
-        self, keys: List[str], bufs: List[memoryview]
+        self, keys: List[bytes], bufs: List[memoryview]
     ) -> Tuple[bool, List[bool], List[int]]:
         n = len(keys)
-        kbuf = [k.encode() for k in keys]
-        karr = (c_char_p * n)(*kbuf)
+        karr, klens, key_owners = make_key_array(keys)
         ptrs: List[int] = []
         keepalive: List[Any] = []
         for mv in bufs:
@@ -299,31 +298,35 @@ class DfkvNativeClient:
         out_hit = (c_int * n)()
         out_len = (c_uint64 * n)()
         rc = self._lib.dfkv_batch_get_auto(
-            self._h, karr, parr, caps, n, out_hit, out_len
+            self._h, karr, klens, parr, caps, n, out_hit, out_len
         )
         if rc != 0:
             raise RuntimeError(f"dfkv_batch_get_auto rc={rc}")
         per_key = [out_hit[i] == 1 for i in range(n)]
         lengths = [int(out_len[i]) for i in range(n)]
-        del keepalive  # C has finished writing the destination buffers
+        del keepalive, key_owners  # native call has returned
         return all(per_key), per_key, lengths
 
-    def _batch_exists_blocking(self, keys: List[str]) -> List[bool]:
+    def _batch_exists_blocking(self, keys: List[bytes]) -> List[bool]:
         n = len(keys)
-        karr = (c_char_p * n)(*[k.encode() for k in keys])
+        karr, klens, key_owners = make_key_array(keys)
         out = (c_int * n)()
-        rc = self._lib.dfkv_batch_exist(self._h, karr, n, out)
+        rc = self._lib.dfkv_batch_exist(
+            self._h, karr, klens, n, out)
         if rc != 0:
             raise RuntimeError(f"dfkv_batch_exist rc={rc}")
+        del key_owners
         return [out[i] == 1 for i in range(n)]
 
-    def _batch_remove_blocking(self, keys: List[str]) -> List[bool]:
+    def _batch_remove_blocking(self, keys: List[bytes]) -> List[bool]:
         n = len(keys)
-        karr = (c_char_p * n)(*[k.encode() for k in keys])
+        karr, klens, key_owners = make_key_array(keys)
         out = (c_int * n)()
-        rc = self._lib.dfkv_batch_remove(self._h, karr, n, out)
+        rc = self._lib.dfkv_batch_remove(
+            self._h, karr, klens, n, out)
         if rc != 0:
             raise RuntimeError(f"dfkv_batch_remove rc={rc}")
+        del key_owners
         return [out[i] == 1 for i in range(n)]
 
     # ------------------------------------------------------------------
@@ -331,7 +334,7 @@ class DfkvNativeClient:
     # ------------------------------------------------------------------
 
     async def batch_set(
-        self, keys: Sequence[str], bufs: Sequence[memoryview]
+        self, keys: Sequence[bytes], bufs: Sequence[memoryview]
     ) -> Tuple[bool, Optional[List[bool]]]:
         n = len(keys)
         with _push_metrics.op("put", num_keys=n) as _m, \
@@ -351,7 +354,7 @@ class DfkvNativeClient:
             return ok, per_key
 
     async def batch_get(
-        self, keys: Sequence[str], bufs: Sequence[memoryview]
+        self, keys: Sequence[bytes], bufs: Sequence[memoryview]
     ) -> Tuple[bool, Optional[List[bool]], List[int]]:
         n = len(keys)
         with _push_metrics.op("get", num_keys=n) as _m, \
@@ -371,7 +374,7 @@ class DfkvNativeClient:
             return ok, per_key, lengths
 
     async def batch_exists(
-        self, keys: Sequence[str]
+        self, keys: Sequence[bytes]
     ) -> Optional[List[bool]]:
         n = len(keys)
         with _push_metrics.op("exist", num_keys=n), \
@@ -391,7 +394,7 @@ class DfkvNativeClient:
         return hasattr(self._lib, "dfkv_batch_remove")
 
     async def batch_remove(
-        self, keys: Sequence[str]
+        self, keys: Sequence[bytes]
     ) -> List[bool]:
         """Drop keys from the ring. per_key[i] = the owning node confirmed the op
         (removed or already absent). Raises if the lib has no remove RPC."""
@@ -413,19 +416,25 @@ class DfkvNativeClient:
                 _sp.hits = ok
             return per_key
 
-    def exists_sync(self, key: str) -> bool:
-        with access_log("native.exists_sync", lambda: key) as r:
-            found = self._lib.dfkv_exist(self._h, key.encode()) == 1
+    def exists_sync(self, key: bytes) -> bool:
+        with access_log("native.exists_sync", lambda: _key_label(key)) as r:
+            key_ptr, key_owner = make_key_buffer(key)
+            found = self._lib.dfkv_exist(
+                self._h, key_ptr, c_uint64(len(key))) == 1
+            del key_owner
             r.result = "found" if found else "not_found"
             return found
 
-    def remove_sync(self, key: str) -> bool:
+    def remove_sync(self, key: bytes) -> bool:
         """Drop one key synchronously. True iff the owning node confirmed the op
         (removed or already absent). Raises if the lib has no remove RPC."""
         if not self.supports_remove():
             raise RuntimeError("libdfkv.so has no dfkv_remove")
-        with access_log("native.remove_sync", lambda: key) as r:
-            ok = self._lib.dfkv_remove(self._h, key.encode()) == 1
+        with access_log("native.remove_sync", lambda: _key_label(key)) as r:
+            key_ptr, key_owner = make_key_buffer(key)
+            ok = self._lib.dfkv_remove(
+                self._h, key_ptr, c_uint64(len(key))) == 1
+            del key_owner
             r.result = "ok" if ok else "fail"
             return ok
 
@@ -446,7 +455,7 @@ class DfkvNativeClient:
         with access_log("native.close", lambda: ""):
             self._closed = True
             try:
-                self._executor.shutdown(wait=False)
+                self._executor.shutdown(wait=True)
             except Exception:  # pragma: no cover
                 pass
             try:

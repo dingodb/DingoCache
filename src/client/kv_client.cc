@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <climits>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -10,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <limits>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -18,6 +20,7 @@
 #include "client/key_map.h"
 #include "utils/log.h"
 #include "utils/thread_name.h"
+#include "utils/parallel_for.h"
 #include "transport/transport_factory.h"
 #include "common/config_dump.h"
 
@@ -45,140 +48,38 @@ std::string MembershipDelta(const std::map<std::string, std::string>& old_m,
   return s;
 }
 
-// Max payload segments per scatter-gather key: the guards below use the LIVE
-// Transport::MaxSgPayloadSegs() (negotiated max_sge - 1 on RDMA; 29 on TCP),
-// and the connector reads the same value through dfkv_max_sg_segs, so its
-// chunking matches whatever HCA the client actually opened. A key exceeding
-// the guard is reported failed up front instead of corrupted; a stale caller
-// still hard-coding 29 on a smaller-max_sge device degrades per-item (the
-// transport's window check fails only the offending key), never per-batch.
+// Max payload segments per scatter-gather key: the guards below use the active
+// transport's runtime capability, and the connector reads that same value
+// through dfkv_max_sg_segs. A key exceeding the reported limit, or whose
+// aggregate byte count cannot be represented by size_t, fails independently
+// before routing; valid siblings in the same batch still run.
 
-// Shared fan-out pool for the Batch* paths. The old RunParallel created and
-// joined up to 32 std::threads PER CALL; a connector issuing batches at high
-// rate paid ~10-30 us of thread create/teardown per worker on every batch,
-// plus the scheduler churn. Workers here are created lazily once (cap 32,
-// process lifetime) and assist parallel-for jobs; the caller thread always
-// participates, so a job never waits on pool availability to start.
-class FanoutPool {
- public:
-  // Leaky singleton: workers block in cv-wait at process exit; a static
-  // destructor joining them would hang shutdown, so the pool is never
-  // destroyed (threads are detached and die with the process).
-  static FanoutPool& Instance() {
-    static FanoutPool* p = new FanoutPool();
-    return *p;
+bool CheckedSizeSum(const std::vector<size_t>& values, size_t* total) {
+  size_t sum = 0;
+  for (size_t value : values) {
+    size_t next = 0;
+    if (!CheckedAddSize(sum, value, &next)) {
+      *total = 0;
+      return false;
+    }
+    sum = next;
   }
+  *total = sum;
+  return true;
+}
 
-  void Run(size_t n, size_t workers, const std::function<void(size_t)>& fn) {
-    if (n == 0) return;
-    if (workers > n) workers = n;
-    if (workers > MaxThreads()) workers = MaxThreads();
-    if (workers <= 1) {  // serial path: exceptions propagate as before
-      for (size_t i = 0; i < n; ++i) fn(i);
+void AddMetricBytes(size_t value, uint64_t* total) {
+  if constexpr (sizeof(size_t) > sizeof(uint64_t)) {
+    if (value > std::numeric_limits<uint64_t>::max()) {
+      *total = std::numeric_limits<uint64_t>::max();
       return;
     }
-    auto job = std::make_shared<Job>();
-    job->n = n;
-    job->fn = fn;  // one std::function copy per batch (vs a thread per worker)
-    const size_t helpers = workers - 1;
-    size_t want;
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      for (size_t i = 0; i < helpers; ++i) queue_.push_back(job);
-      want = queue_.size();
-    }
-    // Demand-aware sizing: grow toward the OUTSTANDING helper-job backlog, not
-    // this call's helper count. The old EnsureThreads(helpers) meant the pool
-    // never exceeded workers-1 threads (~4 for a 5-node ring) no matter how
-    // many callers ran concurrently — helper jobs queued behind each other,
-    // arrived late, found no indices and dropped out, and every caller
-    // processed its node groups nearly serially (per-call latency = sum of
-    // groups instead of max). Capped at MaxThreads().
-    EnsureThreads(want);
-    cv_.notify_all();
-    Work(*job);  // caller participates; late helpers find no indices and drop out
-    std::unique_lock<std::mutex> lk(job->m);
-    job->done_cv.wait(lk, [&] { return job->done.load(std::memory_order_acquire) == job->n; });
   }
-
- private:
-  struct Job {
-    size_t n = 0;
-    std::function<void(size_t)> fn;
-    std::atomic<size_t> next{0};
-    std::atomic<size_t> done{0};
-    std::mutex m;
-    std::condition_variable done_cv;
-  };
-
-  static void Work(Job& j) {
-    for (size_t i = j.next.fetch_add(1); i < j.n; i = j.next.fetch_add(1)) {
-      // An escaping exception previously hit the std::thread entry and called
-      // std::terminate (while the serial path propagated it) — a cache client
-      // must degrade the ITEM, not kill the process. The item's slot keeps its
-      // pre-initialized failure value (miss/failed-put), which the connector
-      // already handles.
-      try { j.fn(i); } catch (...) {}
-      if (j.done.fetch_add(1, std::memory_order_acq_rel) + 1 == j.n) {
-        std::lock_guard<std::mutex> lk(j.m);  // pairs with the waiter's wait
-        j.done_cv.notify_all();
-      }
-    }
-  }
-
-  void EnsureThreads(size_t want) {
-    std::lock_guard<std::mutex> lk(mu_);
-    while (threads_ < want && threads_ < MaxThreads()) {
-      std::thread([this, i = threads_] { NameThisThread("kv-fan-", i); Loop(); }).detach();
-      ++threads_;
-    }
-  }
-
-  void Loop() {
-    for (;;) {
-      std::shared_ptr<Job> j;
-      {
-        std::unique_lock<std::mutex> lk(mu_);
-        cv_.wait(lk, [this] { return !queue_.empty(); });
-        j = std::move(queue_.front());
-        queue_.pop_front();
-      }
-      Work(*j);
-    }
-  }
-
-  // Pool ceiling. The old constexpr 32 quietly serialized wide fan-out under
-  // many concurrent Batch* callers (callers × node-groups >> 32: helpers queue
-  // behind other jobs, groups fall back to caller-serial and per-call latency
-  // grows from max(group) to sum(group)). Env-tunable (DFKV_FANOUT_THREADS,
-  // clamped [1, 1024]) so high-concurrency clients can raise it; default
-  // unchanged at 32.
- public:
-  static size_t MaxThreads() {
-    static const size_t v = [] {
-      size_t out = 32;
-      const char* e = std::getenv("DFKV_FANOUT_THREADS");
-      if (e && *e) {
-        long x = std::strtol(e, nullptr, 10);
-        if (x >= 1 && x <= 1024) out = static_cast<size_t>(x);
-      }
-      config_dump::RecordResolved("DFKV_FANOUT_THREADS", std::to_string(out));
-      return out;
-    }();
-    return v;
-  }
-
- private:
-  std::mutex mu_;
-  std::condition_variable cv_;
-  std::deque<std::shared_ptr<Job>> queue_;
-  size_t threads_ = 0;  // guarded by mu_
-};
-
-// Run fn(i) for i in [0,n) across up to `workers` threads (atomic work-steal,
-// shared persistent pool).
-void RunParallel(size_t n, size_t workers, const std::function<void(size_t)>& fn) {
-  FanoutPool::Instance().Run(n, workers, fn);
+  const uint64_t bytes = static_cast<uint64_t>(value);
+  if (bytes > std::numeric_limits<uint64_t>::max() - *total)
+    *total = std::numeric_limits<uint64_t>::max();
+  else
+    *total += bytes;
 }
 
 size_t EnvSize(const char* name, size_t dflt) {
@@ -189,6 +90,38 @@ size_t EnvSize(const char* name, size_t dflt) {
     char* end = nullptr;
     unsigned long long x = std::strtoull(v, &end, 10);
     if (end != v && x > 0) { out = static_cast<size_t>(x); from_env = true; }
+  }
+  config_dump::Record(name, std::to_string(out),
+                      from_env ? config_dump::Source::kEnv
+                               : config_dump::Source::kDefault);
+  return out;
+}
+
+int EnvNonnegativeInt(const char* name, int dflt) {
+  const char* text = std::getenv(name);
+  int out = dflt;
+  bool from_env = false;
+  if (text && *text) {
+    unsigned int value = 0;
+    bool valid = true;
+    for (const unsigned char* p =
+             reinterpret_cast<const unsigned char*>(text);
+         *p; ++p) {
+      if (*p < '0' || *p > '9') {
+        valid = false;
+        break;
+      }
+      const unsigned int digit = *p - '0';
+      if (value > (static_cast<unsigned int>(INT_MAX) - digit) / 10) {
+        valid = false;
+        break;
+      }
+      value = value * 10 + digit;
+    }
+    if (valid) {
+      out = static_cast<int>(value);
+      from_env = true;
+    }
   }
   config_dump::Record(name, std::to_string(out),
                       from_env ? config_dump::Source::kEnv
@@ -212,8 +145,10 @@ GroupVec ShardReadGroups(GroupVec groups) {
 }  // namespace
 
 KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
-                   ValueHeader self_hdr, Transport* transport)
-    : self_hdr_(self_hdr),
+                   std::string key_namespace, Transport* transport,
+                   std::optional<size_t> batch_concurrency_override)
+    : key_namespace_(std::move(key_namespace)),
+      namespace_hash_(ToBlockKey(key_namespace_, "").digest_hi),
       health_(EnvSize("DFKV_PEER_COOLDOWN_MS", 2000),
               EnvSize("DFKV_PEER_COOLDOWN_MAX_MS", 30000),
               EnvSize("DFKV_PEER_BAD_GRACE_MS", 1000)) {
@@ -232,13 +167,24 @@ KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
     t_ = owned_.get();
     DFKV_LOG_INFO("dfkv client transport=" + transport_reason_);
   }
-  // Same-host GET rendezvous (phase 5). Off unless DFKV_CLIENT_NODE_DEDUP=1;
-  // namespaced by model_hash so distinct keyspaces never share entries.
-  dedup_ = NodeDedup::FromEnv(self_hdr_.model_hash);
-  // Batch fan-out workers override (0/unset = auto; see set_batch_concurrency).
-  if (const char* bc = std::getenv("DFKV_BATCH_CONCURRENCY")) {
-    long x = std::strtol(bc, nullptr, 10);
-    if (x > 0) batch_concurrency_.store(static_cast<size_t>(x), std::memory_order_relaxed);
+  // Same-host GET rendezvous. The namespace digest prevents independent
+  // model/raw-layout domains from sharing process-local entries.
+  dedup_ = NodeDedup::FromEnv(namespace_hash_);
+  get_miss_retries_ = EnvNonnegativeInt("DFKV_GET_MISS_RETRIES", 1);
+  // An ABI descriptor value (including 0=auto) supersedes the environment.
+  if (batch_concurrency_override) {
+    batch_concurrency_.store(*batch_concurrency_override,
+                             std::memory_order_relaxed);
+    config_dump::Record("DFKV_BATCH_CONCURRENCY",
+                        std::to_string(*batch_concurrency_override),
+                        config_dump::Source::kArg);
+  } else if (const char* bc = std::getenv("DFKV_BATCH_CONCURRENCY")) {
+    char* end = nullptr;
+    const unsigned long long x = std::strtoull(bc, &end, 10);
+    if (end != bc && *end == '\0' && x > 0 &&
+        x <= std::numeric_limits<size_t>::max())
+      batch_concurrency_.store(static_cast<size_t>(x),
+                               std::memory_order_relaxed);
   }
   // Opt-in active per-peer latency probe. Off unless DFKV_PROBE_INTERVAL_MS>0,
   // so default behavior is unchanged (no background traffic).
@@ -249,31 +195,20 @@ KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
   // lazy static, so force it now rather than wait for the first fan-out.
   {
     namespace cd = dfkv::config_dump;
-    (void)FanoutPool::MaxThreads();  // records DFKV_FANOUT_THREADS
-    cd::RecordResolved("DFKV_BATCH_CONCURRENCY",
-                       std::to_string(batch_concurrency_.load(std::memory_order_relaxed)));
+    (void)ParallelExecutor::MaxThreads();  // records DFKV_FANOUT_THREADS
+    if (!batch_concurrency_override)
+      cd::RecordResolved(
+          "DFKV_BATCH_CONCURRENCY",
+          std::to_string(batch_concurrency_.load(std::memory_order_relaxed)));
     cd::RecordResolved("DFKV_PROBE_INTERVAL_MS", std::to_string(probe_ms));
     cd::RecordResolved("DFKV_CLIENT_NODE_DEDUP", dedup_ ? "on" : "off");
   }
-  // Startup config dump: once per process (a process usually opens one client;
-  // env knobs are the same for any others, and Emit clears the registry). Shows
-  // the opened geometry — model_hash above all, the isolation identity — plus
-  // the transport and every set DFKV_* env knob (folded in by Emit).
+  // Log only the namespace digest; raw model/tenant names may be sensitive.
   static std::once_flag dump_once;
   std::call_once(dump_once, [this] {
     namespace cd = dfkv::config_dump;
-    // Geometry is caller-provided (dfkv_open args / the ValueHeader a tool
-    // builds) — externally specified, but not a CLI flag; label it arg. The
-    // client cannot see whether the caller in turn defaulted a field.
-    cd::Record("model_hash", std::to_string(self_hdr_.model_hash), cd::Source::kArg);
-    cd::Record("page_size", std::to_string(self_hdr_.page_size), cd::Source::kArg);
-    cd::Record("dtype_tag", std::to_string(self_hdr_.dtype_tag), cd::Source::kArg);
-    cd::Record("tp_size", std::to_string(self_hdr_.tp_size), cd::Source::kArg);
-    cd::Record("tp_rank", std::to_string(self_hdr_.tp_rank), cd::Source::kArg);
-    cd::Record("layer_num", std::to_string(self_hdr_.layer_num), cd::Source::kArg);
-    cd::Record("head_num", std::to_string(self_hdr_.head_num), cd::Source::kArg);
-    cd::Record("head_dim", std::to_string(self_hdr_.head_dim), cd::Source::kArg);
-    cd::Record("is_mla", self_hdr_.is_mla() ? "1" : "0", cd::Source::kArg);
+    cd::Record("key_namespace_digest",
+               ToBlockKey(key_namespace_, "").DigestHex(), cd::Source::kArg);
     cd::Record("transport", transport_reason_, cd::Source::kArg);
     cd::Emit("client");
   });
@@ -343,7 +278,8 @@ void KVClient::StartClientRegistration(std::vector<std::string> mds_eps,
   // which the MDS writes under /clients/<id> (never the placement ring). No
   // stats provider: a consumer has no ring-level stats to report.
   client_registrar_ = std::make_unique<MdsRegistrar>(
-      std::move(mds_eps), group, self, heartbeat_ms, /*io_timeout_ms=*/2000,
+      std::move(mds_eps), group, self, heartbeat_ms,
+      MdsRegistrar::kDefaultIoTimeoutMs,
       /*is_client=*/true);
   client_registrar_->Start();
 }
@@ -370,7 +306,7 @@ void KVClient::StopProbe() {
 void KVClient::ProbeLoop() {
   // A sentinel key that no real workload writes; kExist of it is a cheap round
   // trip that measures the node's responsiveness (kNotFound is a healthy reply).
-  const BlockKey probe = ToBlockKey("__dfkv_probe__", self_hdr_.model_hash);
+  const BlockKey probe = ToBlockKey(key_namespace_, "__dfkv_probe__");
   while (probe_running_.load(std::memory_order_relaxed)) {
     std::vector<std::string> addrs;
     {
@@ -403,7 +339,7 @@ void KVClient::ProbeLoop() {
 
 std::string KVClient::MetricsSnapshot() const {
   std::string s;
-  s += "# HELP dfkv_client_transport_info Client transport selected by dfkv_open\n";
+  s += "# HELP dfkv_client_transport_info Client transport selected by dfkv_open_v2\n";
   s += "# TYPE dfkv_client_transport_info gauge\n";
   s += "dfkv_client_transport_info{transport=\"" + transport_reason_ + "\"} 1\n";
   s += health_.Render();
@@ -460,16 +396,15 @@ std::string KVClient::MetricsSnapshot() const {
   return s;
 }
 
-std::vector<bool> KVClient::RecordBatch(OpMetrics::Op op,
-                                        std::chrono::steady_clock::time_point t0,
-                                        const std::vector<char>& flags,
-                                        uint64_t bytes) {
+std::vector<bool> KVClient::RecordBatch(
+    OpMetrics::Op op, std::chrono::steady_clock::time_point t0,
+    std::vector<bool> flags, uint64_t bytes) {
   uint64_t hits = 0;
-  for (char c : flags) if (c) ++hits;
-  double s = std::chrono::duration<double>(
-                 std::chrono::steady_clock::now() - t0).count();
-  op_stats_.Record(op, flags.size(), hits, bytes, s);
-  return std::vector<bool>(flags.begin(), flags.end());
+  for (bool value : flags) if (value) ++hits;
+  const double seconds = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - t0).count();
+  op_stats_.Record(op, flags.size(), hits, bytes, seconds);
+  return flags;
 }
 
 uint64_t KVClient::NowMs() const {
@@ -505,239 +440,211 @@ std::string KVClient::Route(const std::string& key) const {
 }
 
 bool KVClient::Put(const std::string& key, const void* value, size_t n) {
+  auto metric = op_stats_.Begin(OpMetrics::kPut);
+  const bool ok = PutDirect(key, value, n);
+  metric.hits = ok ? 1 : 0;
+  metric.bytes = ok ? n : 0;
+  return ok;
+}
+
+bool KVClient::PutDirect(const std::string& key, const void* value, size_t n) {
   std::string node = Route(key);
   if (node.empty()) return false;
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
-
-  ValueHeader h = self_hdr_;
-  h.payload_len = n;  // geometry comes from self_hdr_; no payload checksum (v3)
-  BlockKey bk = ToBlockKey(key, self_hdr_.model_hash);
+  const BlockKey bk = ToBlockKey(key_namespace_, key);
   Status st;
   if (t_->pipelined()) {
-    // Zero copy: build only the 48B header, scatter-send [header|value] with the
-    // value gathered straight from the caller's registered buffer. `value` must
-    // stay stable until this returns (CacheFrom is synchronous). For a buffer in a
-    // RegisterMemory'd pool this does no per-op MR registration.
-    std::array<char, ValueHeader::kSize> hdr;
-    h.Serialize(hdr.data());
-    std::vector<CacheSrc> srcs{CacheSrc{bk, hdr.data(), ValueHeader::kSize, value, n}};
+    std::vector<CacheSrc> srcs{CacheSrc{bk, value, n}};
     st = t_->CacheFrom(node, srcs)[0];
   } else {
-    // TCP (non-pipelined): wrap into one buffer and Cache.
-    std::vector<char> buf(ValueHeader::kSize + n);
-    h.Serialize(buf.data());
-    if (n) std::memcpy(buf.data() + ValueHeader::kSize, value, n);
-    st = t_->Cache(node, bk, buf.data(), buf.size());
+    st = t_->Cache(node, bk, value, n);
   }
-  // Fresh clock: `now` was taken before a round trip that can burn the whole
-  // io_timeout, which would shorten (or void) the cooldown this MarkBad sets.
-  if (st == Status::kIOError) { health_.MarkBad(node, NowMs()); return false; }
-  // Only a real reply (hit or logical miss) is "good"; kInvalid/kCacheFull are
-  // client-side/oversize outcomes that must not clear a peer's cooldown.
-  if (st == Status::kOk || st == Status::kNotFound) health_.MarkGood(node, NowMs());
+  if (st == Status::kIOError) {
+    health_.MarkBad(node, NowMs());
+    return false;
+  }
+  if (st == Status::kOk || st == Status::kNotFound)
+    health_.MarkGood(node, NowMs());
   return st == Status::kOk;
 }
 
 bool KVClient::Get(const std::string& key, void* out, size_t n) {
+  auto metric = op_stats_.Begin(OpMetrics::kGet);
+  const bool hit = GetDirect(key, out, n);
+  metric.hits = hit ? 1 : 0;
+  metric.bytes = hit ? n : 0;
+  return hit;
+}
+
+bool KVClient::GetDirect(const std::string& key, void* out, size_t n) {
   std::string node = Route(key);
   if (node.empty()) return false;
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
-
-  BlockKey bk = ToBlockKey(key, self_hdr_.model_hash);
-  if (t_->pipelined()) {
-    // Zero copy AND zero touch: the payload scatters straight into `out` and the
-    // CPU never reads it; only the 48B header comes back (hdrs[0]) for geometry verify.
-    std::vector<BlockKey> keys{bk};
-    std::vector<RangeDst> dsts{RangeDst{out, n}};
-    std::vector<std::string> hdrs;
-    Status st = t_->RangeInto(node, keys, dsts, ValueHeader::kSize, &hdrs)[0];
-    // A miss decodes to kNotFound (a healthy response), not kIOError — only a
-    // real transport error marks the node bad.
-    if (st == Status::kIOError) { health_.MarkBad(node, now); return false; }
+  const BlockKey bk = ToBlockKey(key_namespace_, key);
+  uint64_t value_len = 0;
+  std::vector<BlockKey> keys{bk};
+  std::vector<RangeDst> dsts{RangeDst{n ? out : nullptr, n}};
+  std::vector<uint64_t> value_lens;
+  const Status st = t_->RangeInto(node, keys, dsts, &value_lens)[0];
+  if (!value_lens.empty()) value_len = value_lens[0];
+  if (st == Status::kIOError) {
+    health_.MarkBad(node, NowMs());
+    return false;
+  }
+  if (st == Status::kOk || st == Status::kNotFound)
     health_.MarkGood(node, NowMs());
-    if (st != Status::kOk || hdrs[0].size() < ValueHeader::kSize) return false;
-    ValueHeader h;
-    if (!ValueHeader::Parse(hdrs[0].data(), hdrs[0].size(), &h)) return false;
-    if (!HeaderMatches(self_hdr_, h)) return false;        // geometry drift => miss
-    if (h.payload_len != n) return false;
-    return true;
-  }
-
-  // TCP (non-pipelined): response into a string, then copy to out.
-  std::string raw;
-  Status st = t_->Range(node, bk, 0, ValueHeader::kSize + n, &raw);
-  // Fresh clock: `now` was taken before a round trip that can burn the whole
-  // io_timeout, which would shorten (or void) the cooldown this MarkBad sets.
-  if (st == Status::kIOError) { health_.MarkBad(node, NowMs()); return false; }
-  // Only a real reply (hit or logical miss) is "good"; kInvalid/kCacheFull are
-  // client-side/oversize outcomes that must not clear a peer's cooldown.
-  if (st == Status::kOk || st == Status::kNotFound) health_.MarkGood(node, NowMs());
-  if (st != Status::kOk) return false;
-  if (raw.size() < ValueHeader::kSize) return false;
-
-  ValueHeader h;
-  if (!ValueHeader::Parse(raw.data(), raw.size(), &h)) return false;
-  if (!HeaderMatches(self_hdr_, h)) return false;          // geometry drift => miss
-  if (h.payload_len != n) return false;
-  if (raw.size() < ValueHeader::kSize + n) return false;
-
-  const char* payload = raw.data() + ValueHeader::kSize;
-  std::memcpy(out, payload, n);
-  return true;
+  return st == Status::kOk && value_len == n;
 }
 
-bool KVClient::GetAuto(const std::string& key, std::string* out, size_t max_bytes) {
+bool KVClient::GetAuto(const std::string& key, std::string* out,
+                       size_t max_bytes) {
+  auto metric = op_stats_.Begin(OpMetrics::kGet);
+  const bool hit = GetAutoDirect(key, out, max_bytes);
+  metric.hits = hit ? 1 : 0;
+  metric.bytes = hit ? out->size() : 0;
+  return hit;
+}
+
+bool KVClient::GetAutoDirect(const std::string& key, std::string* out,
+                             size_t max_bytes) {
   std::string node = Route(key);
   if (node.empty()) return false;
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
-  BlockKey bk = ToBlockKey(key, self_hdr_.model_hash);
-
-  if (t_->pipelined()) {
-    // Zero-copy via RangeInto (a 1-element batch), matching Get(): the payload
-    // scatters straight into `out`'s buffer. This also lifts the limit from the
-    // single-Range control_cap (8 MiB) to the batch max_payload (64 MiB) — a
-    // value in (8 MiB, 64 MiB] used to "miss on single read, hit on batch read".
-    out->resize(max_bytes);
-    std::vector<BlockKey> keys{bk};
-    std::vector<RangeDst> dsts{RangeDst{max_bytes ? &(*out)[0] : nullptr, max_bytes}};
-    std::vector<std::string> hdrs;
-    Status st = t_->RangeInto(node, keys, dsts, ValueHeader::kSize, &hdrs)[0];
-    if (st == Status::kIOError) { health_.MarkBad(node, NowMs()); out->clear(); return false; }
-    if (st == Status::kOk || st == Status::kNotFound) health_.MarkGood(node, NowMs());
-    if (st != Status::kOk || hdrs[0].size() < ValueHeader::kSize) { out->clear(); return false; }
-    ValueHeader h;
-    if (!ValueHeader::Parse(hdrs[0].data(), hdrs[0].size(), &h) ||
-        !HeaderMatches(self_hdr_, h) || h.payload_len > max_bytes) {
-      out->clear();
-      return false;
-    }
-    out->resize(h.payload_len);  // trim the receive buffer to the true stored length
-    return true;
+  const BlockKey bk = ToBlockKey(key_namespace_, key);
+  uint64_t value_len = 0;
+  out->resize(max_bytes);
+  std::vector<BlockKey> keys{bk};
+  std::vector<RangeDst> dsts{
+      RangeDst{max_bytes ? &(*out)[0] : nullptr, max_bytes}};
+  std::vector<uint64_t> value_lens;
+  const Status st = t_->RangeInto(node, keys, dsts, &value_lens)[0];
+  if (!value_lens.empty()) value_len = value_lens[0];
+  if (st == Status::kIOError) {
+    health_.MarkBad(node, NowMs());
+    out->clear();
+    return false;
   }
-
-  // TCP (non-pipelined): response into a string, then copy out.
-  std::string raw;
-  Status st = t_->Range(node, bk, 0, ValueHeader::kSize + max_bytes, &raw);
-  // Fresh clock: `now` was taken before a round trip that can burn the whole
-  // io_timeout, which would shorten (or void) the cooldown this MarkBad sets.
-  if (st == Status::kIOError) { health_.MarkBad(node, NowMs()); return false; }
-  // Only a real reply (hit or logical miss) is "good"; kInvalid/kCacheFull are
-  // client-side/oversize outcomes that must not clear a peer's cooldown.
-  if (st == Status::kOk || st == Status::kNotFound) health_.MarkGood(node, NowMs());
-  if (st != Status::kOk) return false;
-  if (raw.size() < ValueHeader::kSize) return false;
-  ValueHeader h;
-  if (!ValueHeader::Parse(raw.data(), raw.size(), &h)) return false;
-  if (!HeaderMatches(self_hdr_, h)) return false;
-  if (raw.size() < ValueHeader::kSize + h.payload_len) return false;
-  const char* p = raw.data() + ValueHeader::kSize;
-  out->assign(p, h.payload_len);
+  if (st == Status::kOk || st == Status::kNotFound)
+    health_.MarkGood(node, NowMs());
+  if (st != Status::kOk || value_len > max_bytes ||
+      out->size() < value_len) {
+    out->clear();
+    return false;
+  }
+  out->resize(static_cast<size_t>(value_len));
   return true;
 }
 
-bool KVClient::GetAuto(const std::string& key, void* out, size_t cap, size_t* out_len) {
+bool KVClient::GetAuto(const std::string& key, void* out, size_t cap,
+                       size_t* out_len) {
+  auto metric = op_stats_.Begin(OpMetrics::kGet);
+  size_t got = 0;
+  const bool hit = GetAutoDirect(key, out, cap, &got);
+  if (out_len) *out_len = hit ? got : 0;
+  metric.hits = hit ? 1 : 0;
+  metric.bytes = hit ? got : 0;
+  return hit;
+}
+
+bool KVClient::GetAutoDirect(const std::string& key, void* out, size_t cap,
+                             size_t* out_len) {
+  if (out_len) *out_len = 0;
   std::string node = Route(key);
   if (node.empty()) return false;
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
-  BlockKey bk = ToBlockKey(key, self_hdr_.model_hash);
-
-  if (t_->pipelined()) {
-    // Zero-copy: the payload scatters straight into the caller's buffer and the
-    // header (true payload_len) comes back separately. Lifts the 8 MiB
-    // single-Range cap to the 64 MiB batch max_payload, like Get()/GetAuto(str).
-    std::vector<BlockKey> keys{bk};
-    std::vector<RangeDst> dsts{RangeDst{cap ? out : nullptr, cap}};
-    std::vector<std::string> hdrs;
-    Status st = t_->RangeInto(node, keys, dsts, ValueHeader::kSize, &hdrs)[0];
-    if (st == Status::kIOError) { health_.MarkBad(node, NowMs()); return false; }
-    if (st == Status::kOk || st == Status::kNotFound) health_.MarkGood(node, NowMs());
-    if (st != Status::kOk || hdrs[0].size() < ValueHeader::kSize) return false;
-    ValueHeader h;
-    if (!ValueHeader::Parse(hdrs[0].data(), hdrs[0].size(), &h)) return false;
-    if (!HeaderMatches(self_hdr_, h)) return false;        // geometry drift => miss
-    if (h.payload_len > cap) return false;                 // won't fit caller buffer
-    if (out_len) *out_len = h.payload_len;
-    return true;
+  const BlockKey bk = ToBlockKey(key_namespace_, key);
+  uint64_t value_len = 0;
+  std::vector<BlockKey> keys{bk};
+  std::vector<RangeDst> dsts{RangeDst{cap ? out : nullptr, cap}};
+  std::vector<uint64_t> value_lens;
+  const Status st = t_->RangeInto(node, keys, dsts, &value_lens)[0];
+  if (!value_lens.empty()) value_len = value_lens[0];
+  if (st == Status::kIOError) {
+    health_.MarkBad(node, NowMs());
+    return false;
   }
-
-  // TCP: read [header | up-to-cap payload]; the header tells us the true payload_len.
-  std::string raw;
-  Status st = t_->Range(node, bk, 0, ValueHeader::kSize + cap, &raw);
-  // Fresh clock: `now` was taken before a round trip that can burn the whole
-  // io_timeout, which would shorten (or void) the cooldown this MarkBad sets.
-  if (st == Status::kIOError) { health_.MarkBad(node, NowMs()); return false; }
-  // Only a real reply (hit or logical miss) is "good"; kInvalid/kCacheFull are
-  // client-side/oversize outcomes that must not clear a peer's cooldown.
-  if (st == Status::kOk || st == Status::kNotFound) health_.MarkGood(node, NowMs());
-  if (st != Status::kOk) return false;
-  if (raw.size() < ValueHeader::kSize) return false;
-  ValueHeader h;
-  if (!ValueHeader::Parse(raw.data(), raw.size(), &h)) return false;
-  if (!HeaderMatches(self_hdr_, h)) return false;        // geometry drift => miss
-  if (h.payload_len > cap) return false;                 // won't fit caller buffer
-  if (raw.size() < ValueHeader::kSize + h.payload_len) return false;
-  if (h.payload_len) std::memcpy(out, raw.data() + ValueHeader::kSize, h.payload_len);
-  if (out_len) *out_len = h.payload_len;
+  if (st == Status::kOk || st == Status::kNotFound)
+    health_.MarkGood(node, NowMs());
+  if (st != Status::kOk || value_len > cap) return false;
+  if (out_len) *out_len = static_cast<size_t>(value_len);
   return true;
 }
 
 bool KVClient::Exist(const std::string& key) {
+  auto metric = op_stats_.Begin(OpMetrics::kExist);
+  Status status = Status::kInvalid;
+  const bool exists = ExistDirect(key, &status);
+  metric.hits = exists ? 1 : 0;
+  return exists;
+}
+
+bool KVClient::ExistDirect(const std::string& key, Status* status) {
+  if (status) *status = Status::kInvalid;
   std::string node = Route(key);
   if (node.empty()) return false;
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
-  bool e = false;
-  Status st = t_->Exist(node, ToBlockKey(key, self_hdr_.model_hash), &e);
-  // Fresh clock: `now` was taken before a round trip that can burn the whole
-  // io_timeout, which would shorten (or void) the cooldown this MarkBad sets.
-  if (st == Status::kIOError) { health_.MarkBad(node, NowMs()); return false; }
-  // Only a real reply (hit or logical miss) is "good"; kInvalid/kCacheFull are
-  // client-side/oversize outcomes that must not clear a peer's cooldown.
-  if (st == Status::kOk || st == Status::kNotFound) health_.MarkGood(node, NowMs());
-  return st == Status::kOk && e;
+  bool exists = false;
+  const Status st = t_->Exist(node, ToBlockKey(key_namespace_, key), &exists);
+  if (status) *status = st;
+  if (st == Status::kIOError) {
+    health_.MarkBad(node, NowMs());
+    return false;
+  }
+  if (st == Status::kOk || st == Status::kNotFound)
+    health_.MarkGood(node, NowMs());
+  return st == Status::kOk && exists;
 }
 
 bool KVClient::Remove(const std::string& key) {
+  auto metric = op_stats_.Begin(OpMetrics::kRemove);
+  const bool ok = RemoveDirect(key);
+  metric.hits = ok ? 1 : 0;
+  return ok;
+}
+
+void KVClient::InvalidateRendezvous(const BlockKey& key) {
+  if (dedup_) dedup_->Invalidate(key);
+  if (GpuNodeDedup* gd = gpu_dedup_raw_.load(std::memory_order_acquire))
+    gd->Invalidate(key);
+}
+
+bool KVClient::RemoveDirect(const std::string& key) {
   std::string node = Route(key);
   if (node.empty()) return false;
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
-  Status st = t_->Remove(node, ToBlockKey(key, self_hdr_.model_hash));
-  // Fresh clock: `now` was taken before a round trip that can burn the whole
-  // io_timeout, which would shorten (or void) the cooldown this MarkBad sets.
-  if (st == Status::kIOError) { health_.MarkBad(node, NowMs()); return false; }
-  // Only a real reply (hit or logical miss) is "good"; kInvalid/kCacheFull are
-  // client-side/oversize outcomes that must not clear a peer's cooldown.
-  if (st == Status::kOk || st == Status::kNotFound) health_.MarkGood(node, NowMs());
-  // kNotFound is a success for the caller: the goal (key not present) holds.
-  return st == Status::kOk || st == Status::kNotFound;
+  const BlockKey block_key = ToBlockKey(key_namespace_, key);
+  const Status st = t_->Remove(node, block_key);
+  if (st == Status::kIOError) {
+    health_.MarkBad(node, NowMs());
+    return false;
+  }
+  if (st == Status::kOk || st == Status::kNotFound)
+    health_.MarkGood(node, NowMs());
+  const bool ok = st == Status::kOk || st == Status::kNotFound;
+  if (ok) InvalidateRendezvous(block_key);
+  return ok;
 }
 
 std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
   auto t0 = std::chrono::steady_clock::now();
   const size_t N = items.size();
   std::vector<char> ok(N, 0);  // char (not vector<bool>) for thread-safe writes
-  if (!t_->pipelined()) {  // TCP: parallelize across items with our own threads
+  if (!t_->pipelined()) {  // TCP fan-out uses scalar bodies, not scalar metrics.
     RunParallel(N, BatchWorkers(N), [&](size_t i) {
-      ok[i] = Put(items[i].key, items[i].value, items[i].n) ? 1 : 0;
+      ok[i] = PutDirect(items[i].key, items[i].value, items[i].n) ? 1 : 0;
     });
-    return std::vector<bool>(ok.begin(), ok.end());
-  }
-  // RDMA: group by node and scatter-send [header|value] — zero copy of the value.
-  // Build only the 48B header per item (just stamps payload_len; no payload pass);
-  // hdrs must outlive the RunParallel lambdas that reference it.
-  std::vector<std::array<char, ValueHeader::kSize>> hdrs(N);
+  } else {
+  // RDMA: group by node and scatter-send raw caller values without copying.
   std::map<std::string, std::vector<size_t>> by_node;
   for (size_t i = 0; i < N; ++i) {
     std::string node = Route(items[i].key);
     if (node.empty()) continue;
-    ValueHeader h = self_hdr_;
-    h.payload_len = items[i].n;
-    h.Serialize(hdrs[i].data());
     by_node[node].push_back(i);
   }
   std::vector<std::pair<std::string, std::vector<size_t>>> groups(by_node.begin(), by_node.end());
@@ -749,8 +656,8 @@ std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
     std::vector<CacheSrc> srcs;
     srcs.reserve(idx.size());
     for (size_t k : idx)
-      srcs.push_back(CacheSrc{ToBlockKey(items[k].key, self_hdr_.model_hash), hdrs[k].data(),
-                              ValueHeader::kSize, items[k].value, items[k].n});
+      srcs.push_back(CacheSrc{ToBlockKey(key_namespace_, items[k].key),
+                              items[k].value, items[k].n});
     std::vector<Status> sts = t_->CacheFrom(node, srcs);
     for (size_t m = 0; m < idx.size(); ++m) ok[idx[m]] = (sts[m] == Status::kOk) ? 1 : 0;
     bool resp = false, ioerr = false;
@@ -762,24 +669,30 @@ std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
     }
     if (resp) health_.MarkGood(node, NowMs()); else if (ioerr) health_.MarkBad(node, NowMs());
   });
-  // RDMA path records the batch once (TCP path above is counted per-key by Put()).
+  }
   uint64_t bytes = 0;
   for (size_t i = 0; i < N; ++i) if (ok[i]) bytes += items[i].n;
-  return RecordBatch(OpMetrics::kPut, t0, ok, bytes);
+  return RecordBatch(OpMetrics::kPut, t0,
+                     std::vector<bool>(ok.begin(), ok.end()), bytes);
 }
 
 std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
-  if (!dedup_) return BatchGetDirect(items);
-  // Same-host rendezvous (phase 5): first arrival fetches a key, peers copy
-  // the published payload from shm — TP-replicated KV otherwise multiplies
-  // every load by the rank count. Every dedup outcome degrades to the plain
-  // remote path, so correctness never depends on the shm state.
+  const auto t0 = std::chrono::steady_clock::now();
+  if (!dedup_) {
+    auto result = BatchGetDirect(items);
+    uint64_t bytes = 0;
+    for (size_t i = 0; i < result.size(); ++i)
+      if (result[i]) bytes += items[i].n;
+    return RecordBatch(OpMetrics::kGet, t0, std::move(result), bytes);
+  }
+  // Same-host rendezvous: metrics wrap the whole public call, including shm
+  // hits, waits, direct fetches, and fallback reads.
   const size_t N = items.size();
   std::vector<bool> res(N, false);
   std::vector<BlockKey> bks(N);
   std::vector<KvGetItem> fetch_items;
   std::vector<size_t> fetch_map, wait_list;
-  std::vector<char> fetch_claimed;  // 1 = we own a FETCHING slot
+  std::vector<uint64_t> tokens(N, 0);
   fetch_items.reserve(N);
   // Host rendezvous can't serve device destinations (memcpy to a device VA);
   // route those straight to the fetch list unclaimed instead of crashing when
@@ -789,18 +702,19 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
     if (cu && cu->IsDevicePtr(items[i].out)) {
       fetch_map.push_back(i);
       fetch_items.push_back(items[i]);
-      fetch_claimed.push_back(0);
+      // token remains zero: this direct fetch has no publish obligation.
       continue;
     }
-    bks[i] = ToBlockKey(items[i].key, self_hdr_.model_hash);
-    switch (dedup_->Claim(bks[i], items[i].n, static_cast<char*>(items[i].out))) {
+    bks[i] = ToBlockKey(key_namespace_, items[i].key);
+    switch (dedup_->Claim(bks[i], items[i].n,
+                          static_cast<char*>(items[i].out), &tokens[i])) {
       case NodeDedup::Role::kHit:
         res[i] = true;
         break;
       case NodeDedup::Role::kFetch:
         fetch_map.push_back(i);
         fetch_items.push_back(items[i]);
-        fetch_claimed.push_back(1);
+        // token identifies the claimed slot (or zero for an unclaimed fetch).
         break;
       case NodeDedup::Role::kWait:
         wait_list.push_back(i);
@@ -812,30 +726,30 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
     for (size_t m = 0; m < fetch_map.size(); ++m) {
       const size_t i = fetch_map[m];
       res[i] = r[m];
-      if (!fetch_claimed[m]) continue;
       if (r[m])
-        dedup_->Publish(bks[i], NodeDedup::Kind::kData,
+        dedup_->Publish(bks[i], NodeDedup::Kind::kData, tokens[i],
                         static_cast<const char*>(items[i].out), items[i].n);
       else
-        dedup_->Abort(bks[i], NodeDedup::Kind::kData);
+        dedup_->Abort(bks[i], NodeDedup::Kind::kData, tokens[i]);
     }
   }
   for (size_t i : wait_list) {
     if (dedup_->WaitCopy(bks[i], items[i].n, static_cast<char*>(items[i].out)))
       res[i] = true;
     else  // fetcher failed/slow: bounded fallback to a direct read
-      res[i] = Get(items[i].key, items[i].out, items[i].n);
+      res[i] = GetDirect(items[i].key, items[i].out, items[i].n);
   }
-  return res;
+  uint64_t bytes = 0;
+  for (size_t i = 0; i < N; ++i) if (res[i]) bytes += items[i].n;
+  return RecordBatch(OpMetrics::kGet, t0, std::move(res), bytes);
 }
 
 std::vector<bool> KVClient::BatchGetDirect(const std::vector<KvGetItem>& items) {
-  auto t0 = std::chrono::steady_clock::now();
   const size_t N = items.size();
   std::vector<char> hit(N, 0);
   if (!t_->pipelined()) {  // TCP: parallelize across items with our own threads
     RunParallel(N, BatchWorkers(N), [&](size_t i) {
-      hit[i] = Get(items[i].key, items[i].out, items[i].n) ? 1 : 0;
+      hit[i] = GetDirect(items[i].key, items[i].out, items[i].n) ? 1 : 0;
     });
     return std::vector<bool>(hit.begin(), hit.end());
   }
@@ -860,13 +774,13 @@ std::vector<bool> KVClient::BatchGetDirect(const std::vector<KvGetItem>& items) 
       keys.reserve(idx.size());
       dsts.reserve(idx.size());
       for (size_t k : idx) {
-        keys.push_back(ToBlockKey(items[k].key, self_hdr_.model_hash));
+        keys.push_back(ToBlockKey(key_namespace_, items[k].key));
         dsts.push_back(RangeDst{items[k].out, n});
       }
-      // Zero-copy + zero-touch: the payload lands straight in items[].out (CPU never
-      // reads it); hdrs[] gets the value header for geometry verification only.
-      std::vector<std::string> hdrs;
-      std::vector<Status> sts = t_->RangeInto(node, keys, dsts, ValueHeader::kSize, &hdrs);
+      // Raw payload lands straight in items[].out; authoritative stored sizes
+      // return in the response prefix.
+      std::vector<uint64_t> value_lens;
+      std::vector<Status> sts = t_->RangeInto(node, keys, dsts, &value_lens);
       bool resp = false, ioerr = false;
       // kInvalid (oversize/per-item guard) is neither: it must not clear the
       // peer cooldown (resp) nor trip MarkBad (ioerr).
@@ -876,12 +790,9 @@ std::vector<bool> KVClient::BatchGetDirect(const std::vector<KvGetItem>& items) 
       }
       if (resp) health_.MarkGood(node, NowMs()); else if (ioerr) health_.MarkBad(node, NowMs());
       for (size_t m = 0; m < idx.size(); ++m) {
-        if (sts[m] != Status::kOk || hdrs[m].size() < ValueHeader::kSize) continue;
-        ValueHeader h;
-        if (!ValueHeader::Parse(hdrs[m].data(), hdrs[m].size(), &h)) continue;
-        if (!HeaderMatches(self_hdr_, h)) continue;
-        if (h.payload_len != n) continue;
-        hit[idx[m]] = 1;
+        if (sts[m] == Status::kOk && m < value_lens.size() &&
+            value_lens[m] == n)
+          hit[idx[m]] = 1;
       }
     });
   };
@@ -896,43 +807,47 @@ std::vector<bool> KVClient::BatchGetDirect(const std::vector<KvGetItem>& items) 
   // of the batch so a genuinely cold batch (mostly missing) is not re-fetched
   // wholesale -- the transient is a sprinkle in an otherwise-hit batch. Off with
   // DFKV_GET_MISS_RETRIES=0.
-  static const int kGetMissRetries =
-      static_cast<int>(EnvSize("DFKV_GET_MISS_RETRIES", 1));
-  for (int r = 0; r < kGetMissRetries; ++r) {
+  for (int r = 0; r < get_miss_retries_; ++r) {
     std::vector<size_t> missed;
     for (size_t i = 0; i < N; ++i) if (!hit[i]) missed.push_back(i);
     if (missed.empty() || missed.size() > N / 2) break;  // none, or a cold batch
     run_pass(missed);
   }
-  uint64_t bytes = 0;
-  for (size_t i = 0; i < N; ++i) if (hit[i]) bytes += items[i].n;
-  return RecordBatch(OpMetrics::kGet, t0, hit, bytes);
+  return std::vector<bool>(hit.begin(), hit.end());
 }
 
 std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
                                          std::vector<size_t>* out_lens) {
-  if (!dedup_) return BatchGetAutoDirect(items, out_lens);
-  // Same-host rendezvous, variable-size flavor: identity is the key; a
-  // published payload hits any reader whose cap fits it (see node_dedup.h).
+  const auto t0 = std::chrono::steady_clock::now();
+  if (!dedup_) {
+    std::vector<size_t> lengths;
+    auto result = BatchGetAutoDirect(items, &lengths);
+    uint64_t bytes = 0;
+    for (size_t length : lengths) bytes += length;
+    if (out_lens) *out_lens = std::move(lengths);
+    return RecordBatch(OpMetrics::kGet, t0, std::move(result), bytes);
+  }
   const size_t N = items.size();
   std::vector<bool> res(N, false);
   std::vector<size_t> lens(N, 0);
   std::vector<BlockKey> bks(N);
   std::vector<KvGetItem> fetch_items;
   std::vector<size_t> fetch_map, wait_list;
-  std::vector<char> fetch_claimed;  // 1 = we own a FETCHING slot
+  std::vector<uint64_t> tokens(N, 0);
   fetch_items.reserve(N);
   const CudaLib* cu = CudaLib::Get();  // device destinations bypass (see BatchGet)
   for (size_t i = 0; i < N; ++i) {
     if (cu && cu->IsDevicePtr(items[i].out)) {
       fetch_map.push_back(i);
       fetch_items.push_back(items[i]);
-      fetch_claimed.push_back(0);
+      // Unclaimed device fetch: token remains zero.
       continue;
     }
-    bks[i] = ToBlockKey(items[i].key, self_hdr_.model_hash);
+    bks[i] = ToBlockKey(key_namespace_, items[i].key);
     size_t got = 0;
-    switch (dedup_->ClaimAuto(bks[i], items[i].n, static_cast<char*>(items[i].out), &got)) {
+    switch (dedup_->ClaimAuto(bks[i], items[i].n,
+                              static_cast<char*>(items[i].out), &got,
+                              &tokens[i])) {
       case NodeDedup::Role::kHit:
         res[i] = true;
         lens[i] = got;
@@ -940,7 +855,7 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
       case NodeDedup::Role::kFetch:
         fetch_map.push_back(i);
         fetch_items.push_back(items[i]);
-        fetch_claimed.push_back(1);
+        // token identifies the fetch generation (zero means direct-only).
         break;
       case NodeDedup::Role::kWait:
         wait_list.push_back(i);
@@ -954,12 +869,11 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
       const size_t i = fetch_map[m];
       res[i] = r[m];
       if (r[m]) lens[i] = flens[m];
-      if (!fetch_claimed[m]) continue;
       if (r[m]) {
-        dedup_->Publish(bks[i], NodeDedup::Kind::kData,
+        dedup_->Publish(bks[i], NodeDedup::Kind::kData, tokens[i],
                         static_cast<const char*>(items[i].out), flens[m]);
       } else {
-        dedup_->Abort(bks[i], NodeDedup::Kind::kData);
+        dedup_->Abort(bks[i], NodeDedup::Kind::kData, tokens[i]);
       }
     }
   }
@@ -970,24 +884,28 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
       lens[i] = got;
     } else {  // fetcher failed/slow: bounded fallback to a direct read
       size_t got2 = 0;
-      res[i] = GetAuto(items[i].key, items[i].out, items[i].n, &got2);
+      res[i] = GetAutoDirect(items[i].key, items[i].out, items[i].n, &got2);
       if (res[i]) lens[i] = got2;
     }
   }
+  uint64_t bytes = 0;
+  for (size_t length : lens) bytes += length;
   if (out_lens) *out_lens = std::move(lens);
-  return res;
+  return RecordBatch(OpMetrics::kGet, t0, std::move(res), bytes);
 }
 
 std::vector<bool> KVClient::BatchGetAutoDirect(const std::vector<KvGetItem>& items,
                                          std::vector<size_t>* out_lens) {
-  auto t0 = std::chrono::steady_clock::now();
   const size_t N = items.size();
   std::vector<char> hit(N, 0);
   std::vector<size_t> lens(N, 0);  // distinct indices => thread-safe writes
   if (!t_->pipelined()) {  // TCP: parallelize per item with our own threads.
     RunParallel(N, BatchWorkers(N), [&](size_t i) {
       size_t got = 0;
-      if (GetAuto(items[i].key, items[i].out, items[i].n, &got)) { hit[i] = 1; lens[i] = got; }
+      if (GetAutoDirect(items[i].key, items[i].out, items[i].n, &got)) {
+        hit[i] = 1;
+        lens[i] = got;
+      }
     });
     if (out_lens) *out_lens = std::move(lens);
     return std::vector<bool>(hit.begin(), hit.end());
@@ -1013,11 +931,11 @@ std::vector<bool> KVClient::BatchGetAutoDirect(const std::vector<KvGetItem>& ite
     keys.reserve(idx.size());
     dsts.reserve(idx.size());
     for (size_t k : idx) {
-      keys.push_back(ToBlockKey(items[k].key, self_hdr_.model_hash));
+      keys.push_back(ToBlockKey(key_namespace_, items[k].key));
       dsts.push_back(RangeDst{items[k].out, cap});
     }
-    std::vector<std::string> hdrs;
-    std::vector<Status> sts = t_->RangeInto(node, keys, dsts, ValueHeader::kSize, &hdrs);
+    std::vector<uint64_t> value_lens;
+    std::vector<Status> sts = t_->RangeInto(node, keys, dsts, &value_lens);
     bool resp = false, ioerr = false;
     // kInvalid (oversize/per-item guard) is neither: it must not clear the
     // peer cooldown (resp) nor trip MarkBad (ioerr).
@@ -1027,37 +945,37 @@ std::vector<bool> KVClient::BatchGetAutoDirect(const std::vector<KvGetItem>& ite
     }
     if (resp) health_.MarkGood(node, NowMs()); else if (ioerr) health_.MarkBad(node, NowMs());
     for (size_t m = 0; m < idx.size(); ++m) {
-      if (sts[m] != Status::kOk || hdrs[m].size() < ValueHeader::kSize) continue;
-      ValueHeader h;
-      if (!ValueHeader::Parse(hdrs[m].data(), hdrs[m].size(), &h)) continue;
-      if (!HeaderMatches(self_hdr_, h)) continue;
-      if (h.payload_len > cap) continue;  // doesn't fit caller buffer => miss
-      lens[idx[m]] = h.payload_len;
+      if (sts[m] != Status::kOk || m >= value_lens.size() ||
+          value_lens[m] > cap)
+        continue;
+      lens[idx[m]] = static_cast<size_t>(value_lens[m]);
       hit[idx[m]] = 1;
     }
   });
-  uint64_t bytes = 0;
-  for (size_t x : lens) bytes += x;
   if (out_lens) *out_lens = std::move(lens);
-  return RecordBatch(OpMetrics::kGet, t0, hit, bytes);
+  return std::vector<bool>(hit.begin(), hit.end());
 }
 
 std::vector<bool> KVClient::BatchExist(const std::vector<std::string>& keys) {
-  if (!dedup_) return BatchExistDirect(keys);
-  // Exist probes ride the rendezvous with a 1-byte answer. NEGATIVE answers
-  // are published too (a valid result, unlike a failed GET); staleness is
-  // bounded by the TTL and safe both ways (stale absent -> recompute, stale
-  // present -> the GET misses and recomputes).
+  const auto t0 = std::chrono::steady_clock::now();
+  if (!dedup_) {
+    auto result = BatchExistDirect(keys, nullptr);
+    return RecordBatch(OpMetrics::kExist, t0, std::move(result), 0);
+  }
+  // Only authoritative native outcomes are published. A transient route,
+  // cooldown, invalid, or I/O failure aborts the slot and retries directly on
+  // the next public call rather than masquerading as cached absence.
   const size_t N = keys.size();
   std::vector<bool> res(N, false);
   std::vector<BlockKey> bks(N);
   std::vector<std::string> fetch_keys;
   std::vector<size_t> fetch_map, wait_list;
+  std::vector<uint64_t> tokens(N, 0);
   fetch_keys.reserve(N);
   for (size_t i = 0; i < N; ++i) {
-    bks[i] = ToBlockKey(keys[i], self_hdr_.model_hash);
+    bks[i] = ToBlockKey(key_namespace_, keys[i]);
     bool val = false;
-    switch (dedup_->ClaimExist(bks[i], &val)) {
+    switch (dedup_->ClaimExist(bks[i], &val, &tokens[i])) {
       case NodeDedup::Role::kHit:
         res[i] = val;
         break;
@@ -1071,30 +989,45 @@ std::vector<bool> KVClient::BatchExist(const std::vector<std::string>& keys) {
     }
   }
   if (!fetch_keys.empty()) {
-    auto r = BatchExistDirect(fetch_keys);
+    std::vector<Status> statuses;
+    auto r = BatchExistDirect(fetch_keys, &statuses);
     for (size_t m = 0; m < fetch_map.size(); ++m) {
       const size_t i = fetch_map[m];
       res[i] = r[m];
-      const char b = r[m] ? 1 : 0;
-      dedup_->Publish(bks[i], NodeDedup::Kind::kExist, &b, 1);
+      if (statuses[m] == Status::kOk && r[m]) {
+        const char present = 1;
+        dedup_->Publish(bks[i], NodeDedup::Kind::kExist, tokens[i],
+                        &present, 1);
+      } else if (statuses[m] == Status::kNotFound) {
+        const char absent = 0;
+        dedup_->Publish(bks[i], NodeDedup::Kind::kExist, tokens[i],
+                        &absent, 1);
+      } else {
+        dedup_->Abort(bks[i], NodeDedup::Kind::kExist, tokens[i]);
+      }
     }
   }
   for (size_t i : wait_list) {
     bool val = false;
     if (dedup_->WaitExist(bks[i], &val)) res[i] = val;
-    else res[i] = Exist(keys[i]);  // bounded fallback
+    else {
+      Status status = Status::kInvalid;
+      res[i] = ExistDirect(keys[i], &status);
+    }
   }
-  return res;
+  return RecordBatch(OpMetrics::kExist, t0, std::move(res), 0);
 }
 
-std::vector<bool> KVClient::BatchExistDirect(const std::vector<std::string>& keys) {
-  auto t0 = std::chrono::steady_clock::now();
+std::vector<bool> KVClient::BatchExistDirect(
+    const std::vector<std::string>& keys, std::vector<Status>* statuses) {
   const size_t N = keys.size();
   std::vector<char> e(N, 0);
+  std::vector<Status> raw(N, Status::kInvalid);
   if (!t_->pipelined()) {  // TCP: parallelize across items with our own threads
     RunParallel(N, BatchWorkers(N), [&](size_t i) {
-      e[i] = Exist(keys[i]) ? 1 : 0;
+      e[i] = ExistDirect(keys[i], &raw[i]) ? 1 : 0;
     });
+    if (statuses) *statuses = std::move(raw);
     return std::vector<bool>(e.begin(), e.end());
   }
   // RDMA: group by node so each node's keys pipeline kExist on a single pooled
@@ -1114,7 +1047,7 @@ std::vector<bool> KVClient::BatchExistDirect(const std::vector<std::string>& key
     const std::vector<size_t>& idx = groups[g].second;
     std::vector<BlockKey> bkeys;
     bkeys.reserve(idx.size());
-    for (size_t k : idx) bkeys.push_back(ToBlockKey(keys[k], self_hdr_.model_hash));
+    for (size_t k : idx) bkeys.push_back(ToBlockKey(key_namespace_, keys[k]));
     std::vector<char> ex;
     std::vector<Status> sts = t_->ExistMany(node, bkeys, &ex);
     bool resp = false, ioerr = false;
@@ -1125,20 +1058,24 @@ std::vector<bool> KVClient::BatchExistDirect(const std::vector<std::string>& key
       else if (s == Status::kOk || s == Status::kNotFound) resp = true;
     }
     if (resp) health_.MarkGood(node, NowMs()); else if (ioerr) health_.MarkBad(node, NowMs());
-    for (size_t m = 0; m < idx.size(); ++m) e[idx[m]] = (m < ex.size() && ex[m]) ? 1 : 0;
+    for (size_t m = 0; m < idx.size(); ++m) {
+      if (m < sts.size()) raw[idx[m]] = sts[m];
+      e[idx[m]] = (m < ex.size() && ex[m]) ? 1 : 0;
+    }
   });
-  return RecordBatch(OpMetrics::kExist, t0, e, 0);
+  if (statuses) *statuses = std::move(raw);
+  return std::vector<bool>(e.begin(), e.end());
 }
 
 std::vector<bool> KVClient::BatchRemove(const std::vector<std::string>& keys) {
+  const auto t0 = std::chrono::steady_clock::now();
   const size_t N = keys.size();
   std::vector<char> ok(N, 0);
-  if (!t_->pipelined()) {  // TCP: parallelize across items with our own threads
+  if (!t_->pipelined()) {
     RunParallel(N, BatchWorkers(N), [&](size_t i) {
-      ok[i] = Remove(keys[i]) ? 1 : 0;
+      ok[i] = RemoveDirect(keys[i]) ? 1 : 0;
     });
-    return std::vector<bool>(ok.begin(), ok.end());
-  }
+  } else {
   // RDMA: group by node and RemoveMany per node (sequential within a node since
   // eviction is off the hot path; nodes still fan out in parallel).
   std::map<std::string, std::vector<size_t>> by_node;
@@ -1155,7 +1092,7 @@ std::vector<bool> KVClient::BatchRemove(const std::vector<std::string>& keys) {
     const std::vector<size_t>& idx = groups[g].second;
     std::vector<BlockKey> bkeys;
     bkeys.reserve(idx.size());
-    for (size_t k : idx) bkeys.push_back(ToBlockKey(keys[k], self_hdr_.model_hash));
+    for (size_t k : idx) bkeys.push_back(ToBlockKey(key_namespace_, keys[k]));
     std::vector<Status> sts = t_->RemoveMany(node, bkeys);
     bool resp = false, ioerr = false;
     // kInvalid (oversize/per-item guard) is neither: it must not clear the
@@ -1165,11 +1102,17 @@ std::vector<bool> KVClient::BatchRemove(const std::vector<std::string>& keys) {
       else if (s == Status::kOk || s == Status::kNotFound) resp = true;
     }
     if (resp) health_.MarkGood(node, NowMs()); else if (ioerr) health_.MarkBad(node, NowMs());
-    for (size_t m = 0; m < idx.size(); ++m)
-      ok[idx[m]] = (m < sts.size() &&
-                    (sts[m] == Status::kOk || sts[m] == Status::kNotFound)) ? 1 : 0;
+    for (size_t m = 0; m < idx.size(); ++m) {
+      const bool removed =
+          m < sts.size() &&
+          (sts[m] == Status::kOk || sts[m] == Status::kNotFound);
+      ok[idx[m]] = removed ? 1 : 0;
+      if (removed) InvalidateRendezvous(bkeys[m]);
+    }
   });
-  return std::vector<bool>(ok.begin(), ok.end());
+  }
+  return RecordBatch(OpMetrics::kRemove, t0,
+                     std::vector<bool>(ok.begin(), ok.end()), 0);
 }
 
 std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
@@ -1177,40 +1120,32 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
   const size_t N = items.size();
   std::vector<char> ok(N, 0);  // char (not vector<bool>) for thread-safe writes
 
-  // Guard: a key with more payload segments than one RDMA work request can carry
-  // (max_sge-1) is reported failed up front and excluded from the wire (so it
-  // never corrupts a shared connection). Done transport-independently so the
-  // contract holds on TCP too. Empty-segment keys are valid (header-only).
+  // Reject keys exceeding the active transport's runtime segment capability.
+  // Apply this transport-independently so every backend exposes the same
+  // per-item failure contract. Empty-segment values are valid.
   std::vector<char> over(N, 0);
+  std::vector<size_t> total_bytes(N, 0);
   for (size_t i = 0; i < N; ++i) {
-    if (items[i].key.empty() ||  // null/empty key: skip (no header-only blob written)
+    if (items[i].key.empty() ||
         items[i].ptrs.size() != items[i].sizes.size() ||
-        items[i].ptrs.size() > t_->MaxSgPayloadSegs())
+        items[i].ptrs.size() > t_->MaxSgPayloadSegs() ||
+        !CheckedSizeSum(items[i].sizes, &total_bytes[i]))
       over[i] = 1;
   }
 
-  // Header per item (stamps total payload_len = sum of segment sizes). hdrs must
-  // outlive the RunParallel lambdas that reference it.
-  std::vector<std::array<char, ValueHeader::kSize>> hdrs(N);
   std::map<std::string, std::vector<size_t>> by_node;
   for (size_t i = 0; i < N; ++i) {
     if (over[i]) continue;
     std::string node = Route(items[i].key);
     if (node.empty()) continue;
-    size_t total = 0;
-    for (size_t s : items[i].sizes) total += s;
-    ValueHeader h = self_hdr_;
-    h.payload_len = total;
-    h.Serialize(hdrs[i].data());
     by_node[node].push_back(i);
   }
   // Shard each per-node put group the same way the read path does (shared knobs
   // DFKV_READ_SHARD_KEYS / DFKV_READ_MAX_CONNS): a single-node ring otherwise
   // gathers the whole SG batch into one group -> one worker -> one QP that the
   // server drains key-by-key. Sharding fans it across up to DFKV_READ_MAX_CONNS
-  // connections. Each shard keeps its node and a contiguous slice of the original
-  // indices, so hdrs[k]/ok[k] stay addressed by original index and per-key results
-  // are unchanged.
+  // connections. Each shard keeps original item indices, so result addressing
+  // is unchanged.
   std::vector<std::pair<std::string, std::vector<size_t>>> groups =
       ShardReadGroups(std::vector<std::pair<std::string, std::vector<size_t>>>(
           by_node.begin(), by_node.end()));
@@ -1223,9 +1158,7 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
     srcs.reserve(idx.size());
     for (size_t k : idx) {
       CacheSrcMulti s;
-      s.key = ToBlockKey(items[k].key, self_hdr_.model_hash);
-      s.header = hdrs[k].data();
-      s.header_len = ValueHeader::kSize;
+      s.key = ToBlockKey(key_namespace_, items[k].key);
       s.payloads.reserve(items[k].ptrs.size());
       for (size_t j = 0; j < items[k].ptrs.size(); ++j)
         s.payloads.emplace_back(items[k].ptrs[j], items[k].sizes[j]);
@@ -1243,13 +1176,15 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
     if (resp) health_.MarkGood(node, NowMs()); else if (ioerr) health_.MarkBad(node, NowMs());
   });
   uint64_t bytes = 0;
-  for (size_t i = 0; i < N; ++i) if (ok[i]) for (size_t s : items[i].sizes) bytes += s;
-  return RecordBatch(OpMetrics::kPut, t0, ok, bytes);
+  for (size_t i = 0; i < N; ++i)
+    if (ok[i]) AddMetricBytes(total_bytes[i], &bytes);
+  return RecordBatch(OpMetrics::kPut, t0,
+                     std::vector<bool>(ok.begin(), ok.end()), bytes);
 }
 
 GpuNodeDedup* KVClient::GpuDedup(const void* device_dst_hint) {
   std::call_once(gpu_dedup_once_, [this, device_dst_hint] {
-    gpu_dedup_ = GpuNodeDedup::FromEnv(self_hdr_.model_hash, device_dst_hint);
+    gpu_dedup_ = GpuNodeDedup::FromEnv(namespace_hash_, device_dst_hint);
     gpu_dedup_raw_.store(gpu_dedup_.get(), std::memory_order_release);
   });
   return gpu_dedup_.get();
@@ -1257,6 +1192,7 @@ GpuNodeDedup* KVClient::GpuDedup(const void* device_dst_hint) {
 
 std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items,
                                            std::vector<size_t>* out_lens) {
+  const auto t0 = std::chrono::steady_clock::now();
   // Init the GPU rendezvous only once a DEVICE destination shows up: its
   // pointer picks the primary context to bind when this (transfer) thread
   // has none, and host-only callers never pay for an arena.
@@ -1267,7 +1203,15 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
       if (!it.dsts.empty() && cu0->IsDevicePtr(it.dsts[0])) { hint = it.dsts[0]; break; }
     if (hint) gd = GpuDedup(hint);
   }
-  if (!gd || items.empty()) return BatchGetAutoSgDirect(items, out_lens);
+  if (!gd || items.empty()) {
+    std::vector<size_t> lengths;
+    auto result = BatchGetAutoSgDirect(items, &lengths);
+    uint64_t bytes = 0;
+    for (size_t length : lengths)
+      AddMetricBytes(length, &bytes);
+    if (out_lens) *out_lens = std::move(lengths);
+    return RecordBatch(OpMetrics::kGet, t0, std::move(result), bytes);
+  }
   // Same-host rendezvous for GPU destinations (phase 2b, see node_dedup_gpu.h):
   // the vLLM connector's SG gets land in device memory, where lockstep TP
   // ranks re-fetch identical TP-replicated KV. Payloads rendezvous through
@@ -1280,7 +1224,7 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
   std::vector<BlockKey> bks(N);
   std::vector<KvGetItemSg> fetch_items;
   std::vector<size_t> fetch_map, wait_list;
-  std::vector<char> fetch_claimed;  // 1 = we own a FETCHING slot (must publish/abort)
+  std::vector<uint64_t> tokens(N, 0);
   std::vector<GpuNodeDedup::Seg> segs;
   auto segs_of = [&segs](const KvGetItemSg& it) {
     segs.clear();
@@ -1288,28 +1232,29 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
     for (size_t j = 0; j < it.dsts.size(); ++j)
       segs.push_back(GpuNodeDedup::Seg{it.dsts[j], it.caps[j]});
   };
-  auto total_cap = [](const KvGetItemSg& it) {
-    size_t c = 0;
-    for (size_t x : it.caps) c += x;
-    return c;
-  };
+  std::vector<size_t> total_caps(N, 0);
+  std::vector<char> totals_valid(N, 0);
+  for (size_t i = 0; i < N; ++i)
+    totals_valid[i] = CheckedSizeSum(items[i].caps, &total_caps[i]) ? 1 : 0;
   for (size_t i = 0; i < N; ++i) {
     // Eligible = well-shaped AND device-memory destination. Host-destination
     // SG items (or malformed ones the Direct guard rejects) skip the
     // rendezvous entirely — an unclaimed fetch has no publish obligation.
     const bool eligible = !items[i].key.empty() && !items[i].dsts.empty() &&
                           items[i].dsts.size() == items[i].caps.size() &&
-                          cu->IsDevicePtr(items[i].dsts[0]);
+                          items[i].dsts.size() <= t_->MaxSgPayloadSegs() &&
+                          totals_valid[i] && cu->IsDevicePtr(items[i].dsts[0]);
     if (!eligible) {
       fetch_map.push_back(i);
       fetch_items.push_back(items[i]);
-      fetch_claimed.push_back(0);
+      // token remains zero: no rendezvous publish obligation.
       continue;
     }
-    bks[i] = ToBlockKey(items[i].key, self_hdr_.model_hash);
+    bks[i] = ToBlockKey(key_namespace_, items[i].key);
     segs_of(items[i]);
     size_t got = 0;
-    switch (gd->ClaimSg(bks[i], segs.data(), segs.size(), total_cap(items[i]), &got)) {
+    switch (gd->ClaimSg(bks[i], segs.data(), segs.size(),
+                        total_caps[i], &got, &tokens[i])) {
       case GpuNodeDedup::Role::kHit:
         res[i] = true;
         lens[i] = got;
@@ -1317,7 +1262,7 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
       case GpuNodeDedup::Role::kFetch:
         fetch_map.push_back(i);
         fetch_items.push_back(items[i]);
-        fetch_claimed.push_back(1);
+        // token identifies this fetch generation.
         break;
       case GpuNodeDedup::Role::kWait:
         wait_list.push_back(i);
@@ -1331,12 +1276,11 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
       const size_t i = fetch_map[m];
       res[i] = r[m];
       if (r[m]) lens[i] = flens[m];
-      if (!fetch_claimed[m]) continue;
       if (r[m]) {
         segs_of(items[i]);
-        gd->PublishSg(bks[i], segs.data(), segs.size(), flens[m]);
+        gd->PublishSg(bks[i], tokens[i], segs.data(), segs.size(), flens[m]);
       } else {
-        gd->Abort(bks[i]);
+        gd->Abort(bks[i], tokens[i]);
       }
     }
   }
@@ -1355,7 +1299,7 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
     for (size_t j = 0; j < items[i].dsts.size(); ++j)
       wsegs[m].push_back(GpuNodeDedup::Seg{items[i].dsts[j], items[i].caps[j]});
     wits[m] = GpuNodeDedup::WaitItem{bks[i], wsegs[m].data(), wsegs[m].size(),
-                                     total_cap(items[i]), false, 0};
+                                     total_caps[i], false, 0};
   }
   gd->WaitManySg(wits.data(), wits.size());
   for (size_t m = 0; m < wait_list.size(); ++m) {
@@ -1399,24 +1343,28 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
                   ",wh=" + std::to_string(gd->wait_hits()) +
                   ",wt=" + std::to_string(gd->wait_timeouts()) + ")");
   }
+  uint64_t bytes = 0;
+  for (size_t length : lens)
+    AddMetricBytes(length, &bytes);
   if (out_lens) *out_lens = std::move(lens);
-  return res;
+  return RecordBatch(OpMetrics::kGet, t0, std::move(res), bytes);
 }
 
 std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>& items,
                                                  std::vector<size_t>* out_lens) {
-  auto t0 = std::chrono::steady_clock::now();
   const size_t N = items.size();
   std::vector<char> hit(N, 0);
   std::vector<size_t> lens(N, 0);  // distinct indices => thread-safe writes
 
-  // Guard (same as put): a key with more destination segments than one RDMA work
-  // request can scatter into is reported a miss up front.
+  // Guard (same as put): an item exceeding the active transport's runtime
+  // destination-segment capability is reported a miss up front.
   std::vector<char> over(N, 0);
+  std::vector<size_t> total_caps(N, 0);
   for (size_t i = 0; i < N; ++i) {
     if (items[i].key.empty() ||  // null/empty key: skip (no wasted GET issued)
         items[i].dsts.size() != items[i].caps.size() ||
-        items[i].dsts.size() > t_->MaxSgPayloadSegs())
+        items[i].dsts.size() > t_->MaxSgPayloadSegs() ||
+        !CheckedSizeSum(items[i].caps, &total_caps[i]))
       over[i] = 1;
   }
 
@@ -1427,9 +1375,7 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
     if (over[i]) continue;
     std::string node = Route(items[i].key);
     if (node.empty()) continue;
-    size_t cap = 0;
-    for (size_t c : items[i].caps) cap += c;
-    by[{node, cap}].push_back(i);
+    by[{node, total_caps[i]}].push_back(i);
   }
   std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>> groups = ShardReadGroups(std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>>(by.begin(), by.end()));
   RunParallel(groups.size(), BatchWorkers(groups.size()), [&](size_t g) {
@@ -1442,17 +1388,16 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
     keys.reserve(idx.size());
     dsts.reserve(idx.size());
     for (size_t k : idx) {
-      keys.push_back(ToBlockKey(items[k].key, self_hdr_.model_hash));
+      keys.push_back(ToBlockKey(key_namespace_, items[k].key));
       RangeDstMulti d;
       d.payloads.reserve(items[k].dsts.size());
       for (size_t j = 0; j < items[k].dsts.size(); ++j)
         d.payloads.emplace_back(items[k].dsts[j], items[k].caps[j]);
       dsts.push_back(std::move(d));
     }
-    std::vector<std::string> hdrs;
-    std::vector<size_t> tlens;
+    std::vector<size_t> value_lens;
     std::vector<Status> sts =
-        t_->RangeIntoMulti(node, keys, dsts, ValueHeader::kSize, &hdrs, &tlens);
+        t_->RangeIntoMulti(node, keys, dsts, &value_lens);
     bool resp = false, ioerr = false;
     // kInvalid (oversize/per-item guard) is neither: it must not clear the
     // peer cooldown (resp) nor trip MarkBad (ioerr).
@@ -1463,19 +1408,15 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
     if (resp) health_.MarkGood(node, NowMs()); else if (ioerr) health_.MarkBad(node, NowMs());
     for (size_t m = 0; m < idx.size(); ++m) {
       size_t cap = groups[g].first.second;
-      if (sts[m] != Status::kOk || hdrs[m].size() < ValueHeader::kSize) continue;
-      ValueHeader h;
-      if (!ValueHeader::Parse(hdrs[m].data(), hdrs[m].size(), &h)) continue;
-      if (!HeaderMatches(self_hdr_, h)) continue;
-      if (h.payload_len > cap) continue;  // doesn't fit caller buffers => miss
-      lens[idx[m]] = h.payload_len;       // authoritative length from header
+      if (sts[m] != Status::kOk || m >= value_lens.size() ||
+          value_lens[m] > cap)
+        continue;
+      lens[idx[m]] = static_cast<size_t>(value_lens[m]);
       hit[idx[m]] = 1;
     }
   });
-  uint64_t bytes = 0;
-  for (size_t x : lens) bytes += x;
   if (out_lens) *out_lens = std::move(lens);
-  return RecordBatch(OpMetrics::kGet, t0, hit, bytes);
+  return std::vector<bool>(hit.begin(), hit.end());
 }
 
 }  // namespace dfkv

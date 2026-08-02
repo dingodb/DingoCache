@@ -53,7 +53,7 @@ TEST(Timeout, SilentNodeFailsWithinBoundedTime) {
 
   auto t0 = std::chrono::steady_clock::now();
   std::string out;
-  Status st = t.Range(node, ToBlockKey("k"), 0, 16, &out);
+  Status st = t.Range(node, ToBlockKey("test/model", "k"), 0, 16, &out);
   auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t0).count();
 

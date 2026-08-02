@@ -7,11 +7,11 @@
  * each slot so the index rebuilds on restart -- keeping cache warmth across a
  * rolling upgrade without the per-block file churn.
  *
- * I/O is buffered (page cache) for simplicity and correctness; extent fds are
- * kept resident (no open()-per-GET). O_DIRECT is a future flag. Cache semantics:
- * a miss is a clean NotFound (upper layer recomputes), so a crash that loses the
- * last few unsynced table records only costs those keys a recompute -- never
- * corruption (each record is CRC-checked; a torn record reads as free). */
+ * Payload I/O defaults to O_DIRECT in the production daemon; the aligned
+ * transport paths avoid the page cache and a bounded buffered mode remains an
+ * explicit diagnostic option. Extent descriptors stay open for the store
+ * lifetime. Each table record is CRC-checked and dirty-epoch recovery fails
+ * safe by discarding uncommitted cache warmth rather than serving torn bytes. */
 #ifndef DFKV_DISK_SLAB_STORE_H_
 #define DFKV_DISK_SLAB_STORE_H_
 
@@ -96,6 +96,11 @@ class DiskSlabStore : public StoreEngine {
     uint64_t table_rebuilt = 0;
     uint64_t rebuild_corrupt_records = 0;
     uint64_t rebuild_rejected_records = 0;
+    uint64_t rebuild_scanned_bytes = 0;
+    uint64_t rebuild_scan_chunks = 0;
+    uint64_t rebuild_sparse_ranges = 0;
+    uint64_t rebuild_sequential_fallbacks = 0;
+    uint64_t rebuild_mmap_scans = 0;
     uint64_t capacity_bytes = 0;
     uint64_t allocated_bytes = 0;
     uint64_t payload_bytes = 0;
@@ -118,33 +123,36 @@ class DiskSlabStore : public StoreEngine {
   DiskSlabStore& operator=(const DiskSlabStore&) = delete;
 
   Status Cache(const BlockKey& key, const void* data, size_t len) override;
-  // Buffered engine: the aligned direct-PUT buffer is just written as bytes.
-  Status CacheDirect(const BlockKey& key, char* data, size_t len, size_t cap) override;
+  // Writes an already aligned transport buffer without a value envelope.
+  // Direct mode uses O_DIRECT; the bounded fallback preserves raw bytes.
+  Status CacheDirect(const BlockKey& key, char* data, size_t len,
+                     size_t cap) override;
   // Batched CacheDirect: ONE lock hold allocates every slot, payloads go out
   // unlocked (io_uring one-submit when built+enabled, else a sequential loop),
   // ONE lock hold commits. Per-item semantics identical to CacheDirect.
   std::vector<Status> CacheDirectBatch(const std::vector<CacheBatchItem>& items) override;
   Status Range(const BlockKey& key, uint64_t offset, uint64_t length,
-               std::string* out) override;
+               std::string* out, size_t* value_len = nullptr) override;
   Status RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,
-                   char* dst, size_t dst_cap, size_t* out_len) override;
-  // Buffered engine: read straight into io_buf and point out_data at it (no
-  // O_DIRECT alignment head); the RDMA server scatter-sends from io_buf.
+                   char* dst, size_t dst_cap, size_t* out_len,
+                   size_t* value_len = nullptr) override;
+  // Reads into the caller's bounded registered buffer and returns the payload
+  // slice directly; direct mode uses its aligned O_DIRECT window.
   Status RangeDirect(const BlockKey& key, uint64_t offset, uint64_t length,
                      char* io_buf, size_t io_cap, const char** out_data,
-                     size_t* out_len) override;
-  // Async prep: read-acquire the slot (pin + inflight, held via RangePrep::token
-  // until RangeRelease) and hand back a dup'd extent fd + slot-absolute aligned
-  // window. The dup is BUFFERED, so a hot page-cache slot completes the uring
-  // read without touching the device.
+                     size_t* out_len, size_t* value_len = nullptr) override;
+  // Async prep pins the resolved slot and returns a move-only lease over both
+  // the dup'd extent descriptor and that pin. Abandoning or completing the read
+  // destroys the lease and balances the hold without a manual release protocol.
   Status RangeDirectPrep(const BlockKey& key, uint64_t offset, uint64_t length,
-                         size_t io_cap, RangePrep* out) override;
-  void RangeRelease(uint64_t token) override;
+                         size_t io_cap, ReadLease* out) override;
   bool IsCached(const BlockKey& key) const override;
+  Status Lookup(const BlockKey& key, ValueMetadata* out) const override;
   Status Remove(const BlockKey& key) override;
 
   size_t Count() const override;
   uint64_t UsedBytes() const override;
+  uint64_t TenantUsedBytes(uint64_t tenant_hash) const override;
   uint64_t Capacity() const;
   uint64_t Evictions() const override;
   uint64_t EvictedBytes() const override;
@@ -153,6 +161,7 @@ class DiskSlabStore : public StoreEngine {
   // Resolved I/O mode: direct_writes requested AND the filesystem took O_DIRECT.
   bool DirectWritesActive() const { return !extent_dio_fds_.empty(); }
   Stats GetStats() const;
+  std::vector<SlabAllocator::ClassStat> ClassStats() const;
   bool Healthy() const override {
     return ok_ && !metadata_failed_.load(std::memory_order_acquire);
   }
@@ -187,16 +196,28 @@ class DiskSlabStore : public StoreEngine {
   // Cache/CacheDirect; `write_payload` does just the payload I/O for the slot.
   template <typename WriteFn>
   Status CacheImpl(const BlockKey& key, size_t len, const WriteFn& write_payload);
+  struct PutFlight {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool done = false;
+    Status result = Status::kIOError;
+  };
+  static void CompletePut(const std::shared_ptr<PutFlight>& flight,
+                          Status result);
+  static Status WaitPut(const std::shared_ptr<PutFlight>& flight);
   // Resolve fn's slot + committed payload length and acquire it for an unlocked
   // read (pin + inflight count, under mu_). False = miss (absent, or a write
   // still in flight). Balanced by a Release{...}Locked call.
-  bool AcquireForRead(const std::string& fn, SlabAllocator::SlotRef* ref, uint32_t* plen);
+  bool AcquireForRead(const BlockKey& key, const std::string& fn,
+                      SlabAllocator::SlotRef* ref, uint32_t* plen);
   // Drop one in-flight hold on fn (unpin + count). The LAST releaser performs
   // the durable invalidation for a Remove that arrived while I/O was active.
   // SlabAllocator itself also defers pinned removal, but this caller-level state
   // is still required to order the slots.tbl record before physical reuse.
   // Call with mu_ held.
   bool ReleaseInflightLocked(const BlockKey& key, const std::string& fn);
+  static void ReleaseReadLeaseThunk(void* owner, uint64_t token) noexcept;
+  void ReleaseReadLease(uint64_t token) noexcept;
   uint64_t TableOffset(uint32_t extent, uint32_t slot) const {
     return static_cast<uint64_t>(extent) * max_slots_per_extent_ * kRecBytes +
            static_cast<uint64_t>(slot) * kRecBytes;
@@ -212,17 +233,22 @@ class DiskSlabStore : public StoreEngine {
   int state_fd_ = -1;                // slab_state clean/dirty epoch marker
   uint64_t run_epoch_ = 0;
   bool unclean_start_ = false;
-  // Outstanding async-prep holds: token -> the key to release (see RangeRelease).
+  // Outstanding asynchronous leases. The opaque id remains entirely internal:
+  // ReadLease destruction routes it back through ReleaseReadLeaseThunk.
   struct PrepHold { BlockKey key; std::string fn; };
   std::unordered_map<uint64_t, PrepHold> prep_holds_;
   uint64_t prep_token_seq_ = 0;
   // key.Filename() -> its true payload length (slot_size >= this). Rebuilt on
   // open from the table; the allocator only tracks slot size.
   std::unordered_map<std::string, uint32_t> payload_len_;
+  std::unordered_map<uint64_t, uint64_t> tenant_used_bytes_;
   // Keys with an unlocked pread/pwrite in flight (value = op count), and keys
   // whose Remove arrived during that window (executed by the last releaser).
   std::unordered_map<std::string, uint32_t> inflight_;
   std::unordered_set<std::string> deferred_remove_;
+  // A reserved-but-uncommitted key has exactly one leader. Scalar and batch
+  // duplicates join this flight and observe its real commit result.
+  std::unordered_map<std::string, std::shared_ptr<PutFlight>> put_flights_;
   // Guards the in-memory maps and the allocate/lookup+pin step ONLY -- never
   // held across payload I/O (a pin protects the slot from eviction in the
   // unlocked window, inflight_/deferred_remove_ protect it from Remove;
@@ -240,11 +266,18 @@ class DiskSlabStore : public StoreEngine {
   std::atomic<uint64_t> table_syncs_{0};
   std::atomic<uint64_t> bind_wipes_{0};
   std::atomic<uint64_t> metadata_io_errors_{0};
+  std::function<bool()> payload_write_hook_for_test_;
+  std::function<bool()> record_write_hook_for_test_;
   std::atomic<uint64_t> unclean_resets_{0};
   std::atomic<uint64_t> eviction_record_clears_{0};
   // slots.tbl sync thread (see Options::table_sync_ms): fdatasync only when
   uint64_t rebuild_corrupt_records_ = 0;
   uint64_t rebuild_rejected_records_ = 0;
+  uint64_t rebuild_scanned_bytes_ = 0;
+  uint64_t rebuild_scan_chunks_ = 0;
+  uint64_t rebuild_sparse_ranges_ = 0;
+  uint64_t rebuild_mmap_scans_ = 0;
+  uint64_t rebuild_sequential_fallbacks_ = 0;
   // records were written since the last cycle.
   std::atomic<uint64_t> record_writes_{0};
   uint64_t synced_marker_ = 0;  // sync-thread-local snapshot of record_writes_

@@ -44,12 +44,19 @@ class KvNodeServer {
   // Upper bound for a request frame's declared payload_len. The TCP handler
   // allocates payload_len BEFORE reading the payload bytes, so without a real
   // bound a 42-byte forged prefix triggers a 16 GiB allocation (one-frame OOM
-  // DoS). Defaults to value-header + the env-resolved max value size — the
-  // SAME bound the RDMA server enforces (utils/wire_limits.h).
+  // DoS). Defaults to the env-resolved raw-value ceiling — the same bound the
+  // RDMA server enforces (utils/wire_limits.h).
   void set_max_request_payload(uint64_t n) { max_request_payload_ = n; }
   int port() const { return port_; }
   size_t Count() const { return group_.Count(); }
   uint64_t UsedBytes() const { return group_.UsedBytes(); }
+  // Dynamic storage health used by /healthz and /readyz. MDS heartbeat state is
+  // intentionally excluded: only the first successful registration gates
+  // readiness; terminal local store/RAM failures remove it.
+  bool Healthy() const {
+    return group_.Healthy() && !ram_required_failed_ &&
+           (!ram_ || ram_->healthy());
+  }
   // Accessors for the MDS heartbeat stats provider (STA1) -- all cheap reads.
   uint64_t Evictions() const { return group_.Evictions(); }
   uint64_t PutBusyTotal() const { return put_busy_.load(std::memory_order_relaxed); }
@@ -63,6 +70,11 @@ class KvNodeServer {
   size_t DiskCount() const { return group_.DiskCount(); }
   size_t AcceptCount() const { return accept_count_.load(std::memory_order_relaxed); }
   size_t live_conn_count();  // handler threads not yet reaped (test/diagnostic)
+  size_t TcpRejectedConnections() const {
+    return tcp_rejected_connections_.load(std::memory_order_relaxed);
+  }
+  size_t TcpMaxConnections() const { return tcp_max_connections_; }
+  int TcpIoTimeoutSeconds() const { return tcp_io_timeout_seconds_; }
 
   // metrics (relaxed atomics)
   size_t m_cache_put() const { return cache_put_.load(std::memory_order_relaxed); }
@@ -75,25 +87,29 @@ class KvNodeServer {
   std::string MetricsText() const;  // Prometheus text format
 
   // Transport-agnostic request processing (shared by the TCP handler and, when
-  // built with DFKV_WITH_RDMA, the RDMA handler). Returns status; fills out_data.
-  // Every frontend supplies a fully formed, domain-tagged identity. Native
-  // TCP/RDMA decoders construct kNative; compatibility ports construct their
-  // isolated domain before calling this boundary.
+  // built with DFKV_WITH_RDMA, the RDMA handler). Returns status and raw bytes;
+  // `value_len` comes from the same pinned storage/RAM snapshot as those bytes.
+  // Every frontend supplies the authoritative native digest identity.
   Status ProcessRequestForKey(uint8_t op, const BlockKey& key,
                               uint64_t offset, uint64_t length,
                               const char* payload, uint64_t payload_len,
-                              std::string* out_data);
+                              std::string* out_data,
+                              size_t* value_len = nullptr);
+  // Payload-free lookup used by protocol response framing and connector
+  // descriptor validation. RAM is authoritative while a write-through value
+  // is visible but not yet committed to disk.
+  Status LookupForKey(const BlockKey& key, ValueMetadata* out) const;
+
 
   // Zero-copy server-side GET: read the block straight into `dst` (e.g. the RDMA
   // send buffer), no intermediate std::string. *out_len = bytes read. Updates
   // hit/miss + bytes_read metrics like a Range.
   Status RangeIntoForKey(const BlockKey& key, uint64_t offset,
                          uint64_t length, char* dst, size_t dst_cap,
-                         size_t* out_len);
+                         size_t* out_len, size_t* value_len = nullptr);
 
-  // RDMA direct PUT: `data` is an O_DIRECT-aligned [ValueHeader|payload] buffer
-  // owned by the RDMA receive slot. Writes it to disk without a payload-sized
-  // CPU copy and updates PUT metrics like ProcessRequest(kCache).
+  // RDMA direct PUT: `data` is an aligned registered buffer containing raw
+  // value bytes. Writes without a payload-sized CPU copy.
   Status CacheDirectForKey(const BlockKey& key, char* data, size_t len,
                            size_t cap);
 
@@ -102,62 +118,36 @@ class KvNodeServer {
   // can scatter-send it without copying into sbuf.
   Status RangeDirectForKey(const BlockKey& key, uint64_t offset,
                            uint64_t length, char* io_buf, size_t io_cap,
-                           const char** out_data, size_t* out_len);
+                           const char** out_data, size_t* out_len,
+                           size_t* value_len = nullptr);
 
-  // Async-friendly prep half of RangeDirect: index lookup + O_DIRECT open +
-  // alignment math, NO disk read (see KVStore::RangeDirectPrep). The caller
-  // issues the pread (io_uring) into its io_buf and closes out->fd afterward.
-  // Updates miss/io-error counters; the hit/bytes-read counters are bumped by
-  // RangeDirectComplete once the read result is known.
-  // On a deferrable hit with read-coalescing enabled, registers the read as an
-  // async flight and returns its token via *out_flight (0 = none): the caller
-  // MUST route the token to RangeDirectComplete (read finished, ok or not) or
-  // RangeFlightAbort (read never ran). A prep that loses the registration race
-  // to an identical in-flight read declines with kInvalid so the serve loop
-  // falls back to the sync path, which joins the flight.
-  Status RangeDirectPrepForKey(const BlockKey& key, uint64_t offset,
-                               uint64_t length, size_t io_cap,
-                               KVStore::RangePrep* out,
-                               uint64_t* out_flight = nullptr);
-  // Account a completed prep-based GET (called after the async read finishes).
-  // elapsed_sec = submit->completion wall time; sampled into get_lat_ so the
-  // default (uring) read path is no longer absent from op="get" latency.
-  // `data` = payload bytes in the caller's direct buffer (nullptr on failure),
-  // valid only during the call: completes the flight (waiters copy from it)
-  // and, when the flight had fan-in AND covered the whole value, promotes the
-  // page into the RAM tier as a durable resident.
-  void RangeDirectComplete(bool ok, size_t bytes_read, double elapsed_sec,
-                           uint64_t flight, const char* data);
-  // Abort a flight whose read never completed (connection teardown): waiters
-  // fall back to their own reads immediately.
-  void RangeFlightAbort(uint64_t flight);
-  // Balance a prep whose RangePrep::token != 0 (slab pins the slot across the
-  // async read); routed to the owning engine via the token's disk-index byte.
-  void RangePrepRelease(uint64_t token) { group_.RangeRelease(token); }
+  // Prepare one RDMA read against its registered staging destination. The
+  // returned move-only transaction owns every disk/RAM/coalescer obligation;
+  // Commit(), Abort(), or destruction is the only terminal protocol.
+  PreparedRead PrepareReadForKey(const BlockKey& key, uint64_t offset,
+                                 uint64_t length, char* staging,
+                                 size_t staging_cap);
 
-  // --- RAM hot tier zero-copy serve hooks (P3 B5-3) ----------------------------
-  // These let the RDMA server send a RAM hit STRAIGHT from the arena MR (no copy
-  // into the connection buffer). All no-ops / false when the RAM tier is off.
   bool ram_enabled() const { return ram_ != nullptr; }
   // Resolved storage backend name ("file"|"slab"), for self-description reporting.
   const std::string& engine_name() const { return group_.EngineName(); }
   const std::string& write_mode() const { return group_.WriteMode(); }
   char* ram_arena() const { return ram_ ? ram_->arena() : nullptr; }
   uint64_t ram_arena_bytes() const { return ram_ ? ram_->arena_bytes() : 0; }
-  // On a RAM hit, pins the slot and returns its arena pointer + length + a token;
-  // the caller MUST call RamRelease(token) once the RDMA send completes (the NIC
-  // reads the shared arena in place -- gap 10.1). Bumps hit/miss + bytes-read.
-  bool RamRangePrepForKey(const BlockKey& key, uint64_t offset,
-                          uint64_t length, const char** out_ptr,
-                          size_t* out_len, uint64_t* out_token);
-  void RamRelease(uint64_t token);
 
  private:
+  static void FinishDiskRead(void* owner, uint64_t flight, bool committed,
+                             Status result, size_t bytes_read,
+                             double elapsed_sec, const char* data) noexcept;
+  static void FinishRamRead(void* owner, uint64_t token, bool committed,
+                            Status result, size_t bytes_read,
+                            double elapsed_sec, const char* data) noexcept;
   void AcceptLoop();
   void Handle(int fd);
   void InitRamTier();     // construct ram_ if DFKV_RAM_TIER is enabled (env)
   void InitAdmission();   // read DFKV_PUT_INFLIGHT_LIMIT (0 = gate off)
   void ReapDoneLocked();  // join+erase finished handler threads; conn_mu_ held
+  void InitTcpListenerConfig();
   std::atomic<size_t> cache_put_{0}, cache_hit_{0}, cache_miss_{0};
   std::atomic<size_t> exist_hit_{0}, exist_miss_{0};
   std::atomic<size_t> remove_ok_{0}, remove_miss_{0};
@@ -176,6 +166,13 @@ class KvNodeServer {
   std::atomic<size_t> disk_put_inflight_{0};
   std::atomic<size_t> put_busy_{0};
   std::atomic<size_t> open_connections_{0};
+  static constexpr size_t kDefaultTcpMaxConnections = 512;
+  static constexpr size_t kHardTcpMaxConnections = 4096;
+  static constexpr int kDefaultTcpIoTimeoutSeconds = 60;
+  static constexpr int kHardTcpIoTimeoutSeconds = 3600;
+  size_t tcp_max_connections_ = kDefaultTcpMaxConnections;
+  int tcp_io_timeout_seconds_ = kDefaultTcpIoTimeoutSeconds;
+  std::atomic<size_t> tcp_rejected_connections_{0};
   Sampler lat_sampler_{64};        // 1-in-64 latency sampling (near-zero hot-path cost)
   LatencyHist get_lat_, put_lat_;  // server-side op latency (sampled)
   // Exist HANDLER latency (Contains + IsCached under the shard/reclaim locks).
@@ -198,6 +195,7 @@ class KvNodeServer {
   // PUT lands in RAM (sync-visible) + async-flushes to group_; GET checks RAM
   // first (served from the arena) then falls back to group_.
   std::unique_ptr<RamTier> ram_;
+  bool ram_required_failed_ = false;
   int listen_fd_ = -1;
   int port_ = 0;
   std::atomic<bool> running_{false};

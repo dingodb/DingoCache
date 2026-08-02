@@ -2,7 +2,6 @@
 // Covers data-path semantics, restart warmth, crash/torn-record handling,
 // strict startup geometry, fail-closed metadata I/O, and reclaimer safety.
 #include "cache/disk_slab_store.h"
-#include "compat/sgengine_key_adapter.h"
 
 #include <gtest/gtest.h>
 #include <fcntl.h>
@@ -10,6 +9,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 
+#include <cerrno>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -50,16 +50,24 @@ class DiskSlabStoreTestPeer {
     SlabAllocator::SlotRef ref;
     {
       std::lock_guard<std::mutex> lock(store->mu_);
-      std::vector<std::string> evicted;
-      if (!store->alloc_->Put(filename, value.size(), &ref, &evicted))
+      std::vector<BlockKey> evicted;
+      if (!store->alloc_->Put(key, value.size(), &ref, &evicted))
         return false;
-      if (!store->alloc_->Pin(filename)) return false;
+      if (!store->alloc_->Pin(key)) return false;
       store->inflight_[filename]++;
     }
     if (!store->WritePayload(ref, value.data(), value.size())) return false;
     return !include_record ||
            store->WriteRecord(ref, key,
                               static_cast<uint32_t>(value.size()), true);
+  }
+  static void SetPayloadWriteHook(DiskSlabStore* store,
+                                  std::function<bool()> hook) {
+    store->payload_write_hook_for_test_ = std::move(hook);
+  }
+  static void SetRecordWriteHook(DiskSlabStore* store,
+                                 std::function<bool()> hook) {
+    store->record_write_hook_for_test_ = std::move(hook);
   }
   static void BreakStateFd(DiskSlabStore* store) {
     if (store->state_fd_ >= 0) ::close(store->state_fd_);
@@ -93,6 +101,32 @@ class DiskSlabTest : public ::testing::Test {
   fs::path dir_;
 };
 BlockKey K(uint64_t id) { return BlockKey{id, 0}; }
+struct HookGate {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool entered = false;
+  bool open = false;
+  bool result = true;
+  bool Run() {
+    std::unique_lock<std::mutex> lk(mu);
+    entered = true;
+    cv.notify_all();
+    cv.wait(lk, [this] { return open; });
+    return result;
+  }
+  void WaitEntered() {
+    std::unique_lock<std::mutex> lk(mu);
+    cv.wait(lk, [this] { return entered; });
+  }
+  void Release(bool value) {
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      result = value;
+      open = true;
+    }
+    cv.notify_all();
+  }
+};
 }  // namespace
 
 TEST_F(DiskSlabTest, PutGetRemoveRoundTrip) {
@@ -103,6 +137,10 @@ TEST_F(DiskSlabTest, PutGetRemoveRoundTrip) {
   ASSERT_EQ(s.Cache(K(1), v.data(), v.size()), Status::kOk);
   EXPECT_TRUE(s.IsCached(K(1)));
   EXPECT_EQ(s.Count(), 1u);
+  dfkv::ValueMetadata metadata;
+  ASSERT_EQ(s.Lookup(K(1), &metadata), Status::kOk);
+  EXPECT_EQ(metadata.value_len, v.size());
+  EXPECT_EQ(s.Lookup(K(999), &metadata), Status::kNotFound);
 
   std::string out;
   ASSERT_EQ(s.Range(K(1), 0, v.size(), &out), Status::kOk);
@@ -125,10 +163,37 @@ TEST_F(DiskSlabTest, PutGetRemoveRoundTrip) {
   EXPECT_EQ(s.Remove(K(1)), Status::kNotFound);
 }
 
+TEST_F(DiskSlabTest, TenantUsageSurvivesRestartAndRemove) {
+  const BlockKey a{1, 0, 0x1111};
+  const BlockKey b{2, 0, 0x1111};
+  const BlockKey other{3, 0, 0x2222};
+  {
+    bool ok = false;
+    DiskSlabStore store(Opts(1 << 20, 1 << 20, 4096), &ok);
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(store.Cache(a, "aaaa", 4), Status::kOk);
+    ASSERT_EQ(store.Cache(b, "bbbbbb", 6), Status::kOk);
+    ASSERT_EQ(store.Cache(other, "ccc", 3), Status::kOk);
+    EXPECT_EQ(store.TenantUsedBytes(0x1111), 10u);
+    EXPECT_EQ(store.TenantUsedBytes(0x2222), 3u);
+    ASSERT_EQ(store.Cache(a, "ignored", 7), Status::kOk);
+    EXPECT_EQ(store.TenantUsedBytes(0x1111), 10u);
+  }
+  bool ok = false;
+  DiskSlabStore reopened(Opts(1 << 20, 1 << 20, 4096), &ok);
+  ASSERT_TRUE(ok) << reopened.StartupError();
+  EXPECT_EQ(reopened.TenantUsedBytes(0x1111), 10u);
+  EXPECT_EQ(reopened.TenantUsedBytes(0x2222), 3u);
+  ASSERT_EQ(reopened.Remove(a), Status::kOk);
+  EXPECT_EQ(reopened.TenantUsedBytes(0x1111), 6u);
+}
+
 TEST_F(DiskSlabTest, StatsTrackPhysicalAndLogicalOccupancy) {
   bool ok = false;
   DiskSlabStore store(Opts(1 << 20, 1 << 20, 4096), &ok);
   ASSERT_TRUE(ok);
+  const uint64_t startup_class_count = store.GetStats().class_count;
+  ASSERT_GT(startup_class_count, 1u);
   std::string value(3000, 's');
   ASSERT_EQ(store.Cache(K(1), value.data(), value.size()), Status::kOk);
 
@@ -138,7 +203,7 @@ TEST_F(DiskSlabTest, StatsTrackPhysicalAndLogicalOccupancy) {
   EXPECT_EQ(stats.payload_bytes, value.size());
   EXPECT_EQ(stats.allocator_objects, 1u);
   EXPECT_EQ(stats.committed_objects, 1u);
-  EXPECT_EQ(stats.class_count, 1u);
+  EXPECT_EQ(stats.class_count, startup_class_count);
   EXPECT_EQ(stats.bound_extents, 1u);
   EXPECT_EQ(stats.pool_extents, 0u);
   EXPECT_EQ(stats.failed_disks, 0u);
@@ -164,6 +229,50 @@ TEST_F(DiskSlabTest, EvictsUnderCapacity) {
   EXPECT_EQ(s.Count(), 4u);
   EXPECT_EQ(s.Evictions(), 1u);
   EXPECT_TRUE(s.IsCached(K(4)));
+}
+
+TEST_F(DiskSlabTest, FreshSparseTableAvoidsLogicalCapacityScanWhenSupported) {
+  auto options = Opts(1ull << 30, 1ull << 30, 4096);
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  bool ok = false;
+  DiskSlabStore store(options, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(store.Count(), 0u);
+  EXPECT_EQ(store.TableRebuilt(), 0u);
+
+  const fs::path table = dir_ / "slots.tbl";
+  struct stat table_stat {};
+  ASSERT_EQ(::stat(table.c_str(), &table_stat), 0);
+  ASSERT_GT(table_stat.st_size, 1 << 20);
+  const auto stats = store.GetStats();
+  EXPECT_EQ(stats.rebuild_mmap_scans, 1u);
+  EXPECT_LE(stats.rebuild_scanned_bytes,
+            static_cast<uint64_t>(table_stat.st_size));
+
+  int fd = ::open(table.c_str(), O_RDONLY);
+  ASSERT_GE(fd, 0);
+#if defined(SEEK_DATA)
+  errno = 0;
+  const off_t first_data = ::lseek(fd, 0, SEEK_DATA);
+  const bool sparse_seek_reports_empty = first_data < 0 && errno == ENXIO;
+  if (sparse_seek_reports_empty) {
+    EXPECT_EQ(stats.rebuild_sequential_fallbacks, 0u);
+    EXPECT_EQ(stats.rebuild_sparse_ranges, 0u);
+    EXPECT_EQ(stats.rebuild_scan_chunks, 0u);
+    EXPECT_EQ(stats.rebuild_scanned_bytes, 0u);
+  } else if (stats.rebuild_sequential_fallbacks != 0) {
+    EXPECT_EQ(stats.rebuild_scanned_bytes,
+              static_cast<uint64_t>(table_stat.st_size));
+    EXPECT_GT(stats.rebuild_scan_chunks, 1u);
+  }
+#else
+  EXPECT_EQ(stats.rebuild_sequential_fallbacks, 1u);
+  EXPECT_EQ(stats.rebuild_scanned_bytes,
+            static_cast<uint64_t>(table_stat.st_size));
+  EXPECT_GT(stats.rebuild_scan_chunks, 1u);
+#endif
+  ::close(fd);
 }
 
 TEST_F(DiskSlabTest, RestartRebuildsIndexKeepingWarmth) {
@@ -193,30 +302,77 @@ TEST_F(DiskSlabTest, RestartRebuildsIndexKeepingWarmth) {
   }
 }
 
-TEST_F(DiskSlabTest, CompatibilityDomainSurvivesRestartWithoutNativeAlias) {
-  const BlockKey native{4242, (uint64_t{4096} << 32) | 9};
-  const BlockKey legacy = dfkv::compat::SgEngineV1Key(4242, 9, 4096);
-  const std::string native_value(3000, 'n');
-  const std::string legacy_value(3000, 'l');
+TEST_F(DiskSlabTest, PopulatedRestartUsesChunkedRebuildScan) {
+  auto options = Opts(1 << 20, 1 << 20, 4096);
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  const std::string first(3000, 'a');
+  const std::string second(3500, 'b');
+  {
+    bool ok = false;
+    DiskSlabStore store(options, &ok);
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(store.Cache(K(501), first.data(), first.size()), Status::kOk);
+    ASSERT_EQ(store.Cache(K(502), second.data(), second.size()), Status::kOk);
+  }
+
+  bool ok = false;
+  DiskSlabStore reopened(options, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(reopened.TableRebuilt(), 2u);
+  EXPECT_EQ(reopened.Count(), 2u);
+  const auto stats = reopened.GetStats();
+  EXPECT_GT(stats.rebuild_scan_chunks, 0u);
+  EXPECT_GT(stats.rebuild_scanned_bytes, 0u);
+  struct stat table_stat {};
+  ASSERT_EQ(::stat((dir_ / "slots.tbl").c_str(), &table_stat), 0);
+  EXPECT_LE(stats.rebuild_scanned_bytes,
+            static_cast<uint64_t>(table_stat.st_size));
+
+  std::string out;
+  ASSERT_EQ(reopened.Range(K(501), 0, 0, &out), Status::kOk);
+  EXPECT_EQ(out, first);
+  ASSERT_EQ(reopened.Range(K(502), 0, 0, &out), Status::kOk);
+  EXPECT_EQ(out, second);
+}
+
+TEST_F(DiskSlabTest, HistoricalRecordIsRejectedOnRestart) {
+  const BlockKey key{4242, 9};
+  const std::string value(3000, 'n');
   {
     bool ok = false;
     DiskSlabStore store(Opts(1 << 20, 1 << 20, 4096), &ok);
     ASSERT_TRUE(ok);
-    ASSERT_EQ(store.Cache(native, native_value.data(), native_value.size()),
-              Status::kOk);
-    ASSERT_EQ(store.Cache(legacy, legacy_value.data(), legacy_value.size()),
-              Status::kOk);
+    ASSERT_EQ(store.Cache(key, value.data(), value.size()), Status::kOk);
   }
+
+  const std::string table = (dir_ / "slots.tbl").string();
+  int fd = ::open(table.c_str(), O_RDWR);
+  ASSERT_GE(fd, 0);
+  const off_t size = ::lseek(fd, 0, SEEK_END);
+  bool replaced = false;
+  for (off_t offset = 0; offset + 64 <= size; offset += 64) {
+    uint32_t magic = 0;
+    ASSERT_EQ(::pread(fd, &magic, sizeof(magic), offset),
+              static_cast<ssize_t>(sizeof(magic)));
+    if (magic == 0x334C5453u) {
+      const uint32_t old_magic = 0x324C5453u;
+      ASSERT_EQ(::pwrite(fd, &old_magic, sizeof(old_magic), offset),
+                static_cast<ssize_t>(sizeof(old_magic)));
+      replaced = true;
+      break;
+    }
+  }
+  ::close(fd);
+  ASSERT_TRUE(replaced);
 
   bool ok = false;
   DiskSlabStore reopened(Opts(1 << 20, 1 << 20, 4096), &ok);
   ASSERT_TRUE(ok);
-  EXPECT_EQ(reopened.TableRebuilt(), 2u);
+  EXPECT_EQ(reopened.TableRebuilt(), 0u);
+  EXPECT_EQ(reopened.GetStats().rebuild_rejected_records, 1u);
   std::string out;
-  ASSERT_EQ(reopened.Range(native, 0, 0, &out), Status::kOk);
-  EXPECT_EQ(out, native_value);
-  ASSERT_EQ(reopened.Range(legacy, 0, 0, &out), Status::kOk);
-  EXPECT_EQ(out, legacy_value);
+  EXPECT_EQ(reopened.Range(key, 0, 0, &out), Status::kNotFound);
 }
 
 TEST_F(DiskSlabTest, TornTableRecordReadsAsFreeNotResurrected) {
@@ -228,9 +384,9 @@ TEST_F(DiskSlabTest, TornTableRecordReadsAsFreeNotResurrected) {
     ASSERT_EQ(s.Cache(K(7), v.data(), v.size()), Status::kOk);
     ASSERT_EQ(s.Cache(K(8), v.data(), v.size()), Status::kOk);
   }
-  // Corrupt the BODY of a real (valid) record so its CRC no longer matches -- a
-  // torn write. Records land in high slots (LIFO alloc), so scan for the first
-  // "SLTB" magic, then flip a body byte (offset +12, inside the CRC'd region).
+  // Corrupt the BODY of a real (valid) v3 record so its CRC no longer
+  // matches. Records land in high slots (LIFO alloc), so scan for the first
+  // "STL3" magic, then flip a body byte (offset +12, inside the CRC'd region).
   const std::string tbl = (dir_ / "slots.tbl").string();
   int fd = ::open(tbl.c_str(), O_RDWR);
   ASSERT_GE(fd, 0);
@@ -239,8 +395,8 @@ TEST_F(DiskSlabTest, TornTableRecordReadsAsFreeNotResurrected) {
   for (off_t o = 0; o + 64 <= fsz; o += 64) {
     uint8_t m[4];
     if (::pread(fd, m, 4, o) != 4) break;
-    // "SLTB" little-endian = 53 54 4C 42
-    if (m[0] == 0x53 && m[1] == 0x54 && m[2] == 0x4C && m[3] == 0x42) {
+    // "STL3" little-endian = 53 54 4C 33.
+    if (m[0] == 0x53 && m[1] == 0x54 && m[2] == 0x4C && m[3] == 0x33) {
       uint8_t byte = 0;
       ASSERT_EQ(::pread(fd, &byte, 1, o + 12), 1);
       byte ^= 0xFF;
@@ -346,6 +502,34 @@ TEST_F(DiskSlabTest, CorruptMetaIsRefusedWithoutReinitializing) {
             static_cast<ssize_t>(sizeof(persisted_magic)));
   ::close(fd);
   EXPECT_EQ(persisted_magic, 0u);
+}
+
+TEST_F(DiskSlabTest, V1FormatIsRejectedWithoutRewritingMetadata) {
+  {
+    bool ok = false;
+    DiskSlabStore store(Opts(1 << 20, 1 << 20, 4096), &ok);
+    ASSERT_TRUE(ok);
+  }
+  const fs::path meta = dir_ / "slab_meta";
+  int fd = ::open(meta.c_str(), O_RDWR);
+  ASSERT_GE(fd, 0);
+  const uint32_t old_version = 1;
+  ASSERT_EQ(::pwrite(fd, &old_version, sizeof(old_version), 4),
+            static_cast<ssize_t>(sizeof(old_version)));
+  ASSERT_EQ(::fdatasync(fd), 0);
+  ::close(fd);
+
+  bool ok = true;
+  DiskSlabStore store(Opts(1 << 20, 1 << 20, 4096), &ok);
+  EXPECT_FALSE(ok);
+  EXPECT_NE(store.StartupError().find("layout"), std::string::npos);
+  fd = ::open(meta.c_str(), O_RDONLY);
+  ASSERT_GE(fd, 0);
+  uint32_t persisted_version = 0;
+  ASSERT_EQ(::pread(fd, &persisted_version, sizeof(persisted_version), 4),
+            static_cast<ssize_t>(sizeof(persisted_version)));
+  ::close(fd);
+  EXPECT_EQ(persisted_version, old_version);
 }
 
 TEST_F(DiskSlabTest, TruncatedSlotTableIsRefusedWithoutResizing) {
@@ -601,40 +785,63 @@ TEST_F(DiskSlabTest, DirectWriteModeRoundTrip) {
   free(mem);
 }
 
-// Async prep hands back a dup'd fd + slot-absolute aligned window and HOLDS the
-// slot (pin + inflight) until RangeRelease: a Remove landing mid-hold defers,
-// and the release both frees the slot and survives a double call.
-TEST_F(DiskSlabTest, RangeDirectPrepHoldsSlotUntilRelease) {
+TEST_F(DiskSlabTest, ReadLeaseMovesAndReleasesOnDestructionAndError) {
   bool ok = false;
   DiskSlabStore s(Opts(1 << 20, 1 << 20, 4096), &ok);
   ASSERT_TRUE(ok);
   std::string v(5000, 'p');
   ASSERT_EQ(s.Cache(K(1), v.data(), v.size()), Status::kOk);
 
-  dfkv::RangePrep p;
-  ASSERT_EQ(s.RangeDirectPrep(K(1), 0, 0, 1 << 20, &p), Status::kOk);
-  ASSERT_GE(p.fd, 0);
-  ASSERT_NE(p.token, 0u);
-  EXPECT_EQ(p.payload_len, v.size());
-  EXPECT_EQ(p.aligned_off % 4096, 0u);
-  EXPECT_EQ(p.aligned_len % 4096, 0u);
-  // The caller's read: aligned pread on the dup'd fd, payload at [head, +len).
-  std::vector<char> rbuf(p.aligned_len);
-  ASSERT_EQ(::pread(p.fd, rbuf.data(), p.aligned_len,
-                    static_cast<off_t>(p.aligned_off)),
-            static_cast<ssize_t>(p.aligned_len));
-  EXPECT_EQ(std::string(rbuf.data() + p.head, p.payload_len), v);
-  ::close(p.fd);
+  int owned_fd = -1;
+  {
+    dfkv::ReadLease lease;
+    ASSERT_EQ(s.RangeDirectPrep(K(1), 0, 0, 1 << 20, &lease),
+              Status::kOk);
+    ASSERT_GE(lease.fd(), 0);
+    owned_fd = lease.fd();
+    EXPECT_EQ(lease.payload_len, v.size());
+    EXPECT_EQ(lease.aligned_off % 4096, 0u);
+    EXPECT_EQ(lease.aligned_len % 4096, 0u);
 
-  // Remove during the hold: deferred -- reads gate off, slot not yet freed.
-  EXPECT_EQ(s.Remove(K(1)), Status::kOk);
-  EXPECT_FALSE(s.IsCached(K(1)));
-  EXPECT_EQ(s.Count(), 1u) << "slot must stay held until the release";
-  s.RangeRelease(p.token);
-  EXPECT_EQ(s.Count(), 0u) << "release must execute the deferred remove";
-  s.RangeRelease(p.token);  // double release: no-op
-  // Miss and zero-length behave like the sync path.
-  EXPECT_EQ(s.RangeDirectPrep(K(9), 0, 0, 1 << 20, &p), Status::kNotFound);
+    dfkv::ReadLease moved(std::move(lease));
+    EXPECT_EQ(lease.fd(), -1);
+    EXPECT_EQ(moved.fd(), owned_fd);
+    std::vector<char> rbuf(moved.aligned_len);
+    ASSERT_EQ(::pread(moved.fd(), rbuf.data(), moved.aligned_len,
+                     static_cast<off_t>(moved.aligned_off)),
+              static_cast<ssize_t>(moved.aligned_len));
+    EXPECT_EQ(std::string(rbuf.data() + moved.head, moved.payload_len), v);
+
+    EXPECT_EQ(s.Remove(K(1)), Status::kOk);
+    EXPECT_FALSE(s.IsCached(K(1)));
+    EXPECT_EQ(s.Count(), 1u) << "moved lease must retain the slot pin";
+  }
+  EXPECT_EQ(s.Count(), 0u) << "destruction executes the deferred remove";
+  errno = 0;
+  EXPECT_EQ(::fcntl(owned_fd, F_GETFD), -1);
+  EXPECT_EQ(errno, EBADF);
+
+  // Reusing an output for an error destroys its prior lease first, balancing
+  // both descriptor and storage hold without an explicit release call.
+  ASSERT_EQ(s.Cache(K(2), v.data(), v.size()), Status::kOk);
+  dfkv::ReadLease lease;
+  ASSERT_EQ(s.RangeDirectPrep(K(2), 0, 0, 1 << 20, &lease), Status::kOk);
+  EXPECT_EQ(s.Remove(K(2)), Status::kOk);
+  EXPECT_EQ(s.Count(), 1u);
+  EXPECT_EQ(s.RangeDirectPrep(K(9), 0, 0, 1 << 20, &lease),
+            Status::kNotFound);
+  EXPECT_EQ(lease.fd(), -1);
+  EXPECT_EQ(s.Count(), 0u);
+
+  // Acquire succeeds before the aligned-window cap check fails. That early
+  // error must still balance the pin/inflight hold.
+  ASSERT_EQ(s.Cache(K(3), v.data(), v.size()), Status::kOk);
+  EXPECT_EQ(s.RangeDirectPrep(K(3), 0, 0, 1, &lease), Status::kInvalid);
+  const auto stats = s.GetStats();
+  EXPECT_EQ(stats.prep_holds, 0u);
+  EXPECT_EQ(stats.inflight, 0u);
+  EXPECT_EQ(s.Remove(K(3)), Status::kOk);
+  EXPECT_EQ(s.Count(), 0u);
 }
 
 // Direct-mode RangeDirect: O_DIRECT aligned-window read with head trim -- the
@@ -686,6 +893,109 @@ TEST_F(DiskSlabTest, TableSyncCadenceCountsCycles) {
   const uint64_t after = s.GetStats().table_syncs;
   std::this_thread::sleep_for(std::chrono::milliseconds(120));
   EXPECT_EQ(s.GetStats().table_syncs, after);
+}
+
+TEST_F(DiskSlabTest, BatchDuplicateWaitsForScalarLeaderCommit) {
+  auto opts = Opts(1 << 20, 1 << 20, 4096);
+  opts.table_sync_ms = 0;
+  opts.reclaim_interval_ms = 0;
+  bool ok = false;
+  DiskSlabStore s(opts, &ok);
+  ASSERT_TRUE(ok);
+  HookGate gate;
+  dfkv::DiskSlabStoreTestPeer::SetPayloadWriteHook(
+      &s, [&gate] { return gate.Run(); });
+  std::string leader_value(3000, 'a');
+  std::string follower_value(3000, 'b');
+  Status leader = Status::kInvalid;
+  std::vector<Status> follower;
+  std::atomic<bool> follower_done{false};
+  std::thread first([&] {
+    leader = s.Cache(K(70), leader_value.data(), leader_value.size());
+  });
+  gate.WaitEntered();
+  std::thread second([&] {
+    follower = s.CacheDirectBatch(
+        {{K(70), follower_value.data(), follower_value.size(),
+          follower_value.size()}});
+    follower_done.store(true, std::memory_order_release);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  EXPECT_FALSE(follower_done.load(std::memory_order_acquire));
+  gate.Release(true);
+  first.join();
+  second.join();
+  ASSERT_EQ(leader, Status::kOk);
+  ASSERT_EQ(follower.size(), 1u);
+  EXPECT_EQ(follower[0], Status::kOk);
+  std::string out;
+  ASSERT_EQ(s.Range(K(70), 0, 0, &out), Status::kOk);
+  EXPECT_EQ(out, leader_value);
+}
+
+TEST_F(DiskSlabTest, DuplicateSharesLeaderPayloadFailure) {
+  auto opts = Opts(1 << 20, 1 << 20, 4096);
+  opts.table_sync_ms = 0;
+  opts.reclaim_interval_ms = 0;
+  bool ok = false;
+  DiskSlabStore s(opts, &ok);
+  ASSERT_TRUE(ok);
+  HookGate gate;
+  dfkv::DiskSlabStoreTestPeer::SetPayloadWriteHook(
+      &s, [&gate] { return gate.Run(); });
+  std::string value(3000, 'p');
+  Status leader = Status::kInvalid;
+  Status follower = Status::kInvalid;
+  std::atomic<bool> follower_done{false};
+  std::thread first([&] {
+    leader = s.Cache(K(71), value.data(), value.size());
+  });
+  gate.WaitEntered();
+  std::thread second([&] {
+    follower = s.Cache(K(71), value.data(), value.size());
+    follower_done.store(true, std::memory_order_release);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  EXPECT_FALSE(follower_done.load(std::memory_order_acquire));
+  gate.Release(false);
+  first.join();
+  second.join();
+  EXPECT_EQ(leader, Status::kIOError);
+  EXPECT_EQ(follower, Status::kIOError);
+  EXPECT_FALSE(s.IsCached(K(71)));
+}
+
+TEST_F(DiskSlabTest, DuplicateSharesLeaderMetadataFailure) {
+  auto opts = Opts(1 << 20, 1 << 20, 4096);
+  opts.table_sync_ms = 0;
+  opts.reclaim_interval_ms = 0;
+  bool ok = false;
+  DiskSlabStore s(opts, &ok);
+  ASSERT_TRUE(ok);
+  HookGate gate;
+  dfkv::DiskSlabStoreTestPeer::SetRecordWriteHook(
+      &s, [&gate] { return gate.Run(); });
+  std::string value(3000, 'm');
+  Status leader = Status::kInvalid;
+  Status follower = Status::kInvalid;
+  std::atomic<bool> follower_done{false};
+  std::thread first([&] {
+    leader = s.Cache(K(72), value.data(), value.size());
+  });
+  gate.WaitEntered();
+  std::thread second([&] {
+    follower = s.Cache(K(72), value.data(), value.size());
+    follower_done.store(true, std::memory_order_release);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  EXPECT_FALSE(follower_done.load(std::memory_order_acquire));
+  gate.Release(false);
+  first.join();
+  second.join();
+  EXPECT_EQ(leader, Status::kIOError);
+  EXPECT_EQ(follower, Status::kIOError);
+  EXPECT_FALSE(s.Healthy());
+  EXPECT_FALSE(s.IsCached(K(72)));
 }
 
 TEST_F(DiskSlabTest, RecordWriteFailureFailsStoreClosed) {

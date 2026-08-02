@@ -54,33 +54,28 @@ class KVStore : public StoreEngine {
   Status CacheDirect(const BlockKey& key, char* data, size_t len, size_t cap) override;
   // [offset, offset+length) from the local block; NotFound if absent.
   Status Range(const BlockKey& key, uint64_t offset, uint64_t length,
-               std::string* out) override;
+               std::string* out, size_t* value_len = nullptr) override;
   // Like Range but reads straight into a caller buffer (no std::string), saving a
   // copy on the server GET path. Reads up to min(length, file-offset, dst_cap)
   // bytes into dst; *out_len = bytes read. NotFound if absent.
   Status RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,
-                   char* dst, size_t dst_cap, size_t* out_len) override;
+                   char* dst, size_t dst_cap, size_t* out_len,
+                   size_t* value_len = nullptr) override;
   // O_DIRECT range read into a caller-provided aligned buffer. The disk read may
   // cover an aligned superset of the requested range; *out_data points inside
   // io_buf at the exact requested bytes and can be scatter-sent directly.
   Status RangeDirect(const BlockKey& key, uint64_t offset, uint64_t length,
                      char* io_buf, size_t io_cap, const char** out_data,
-                     size_t* out_len) override;
+                     size_t* out_len, size_t* value_len = nullptr) override;
 
-  // Async-friendly split of RangeDirect. Does ONLY the cheap, lock-protected
-  // prep: index lookup, O_DIRECT open, range clamp, and O_DIRECT alignment math.
-  // It performs NO disk read — the caller issues the (slow) pread itself (e.g.
-  // via io_uring) and then trims the slice. On kOk the caller MUST ::close(out->fd)
-  // after the read completes (the fd pins the inode against eviction meanwhile).
-  // Output (kOk only): {fd, aligned_off, aligned_len, head, payload_len}.
-  //   read aligned_len bytes at aligned_off into io_buf, then the requested bytes
-  //   are at io_buf+head for payload_len bytes. payload_len==0 is a valid zero-len
-  //   hit (fd<0, nothing to read). io_cap must be >= aligned_len.
-  using RangePrep = ::dfkv::RangePrep;  // shared with StoreEngine
+  // Async-friendly split of RangeDirect. Performs the cheap lookup/open/range
+  // alignment half only; the returned move-only lease owns the descriptor until
+  // the caller's asynchronous read completes or is abandoned.
   Status RangeDirectPrep(const BlockKey& key, uint64_t offset, uint64_t length,
-                         size_t io_cap, RangePrep* out) override;
+                         size_t io_cap, ReadLease* out) override;
 
   bool IsCached(const BlockKey& key) const override;
+  Status Lookup(const BlockKey& key, ValueMetadata* out) const override;
 
   // Explicitly drop a cached block: deletes the file, removes it from the
   // shard index + CLOCK ring, and reclaims its bytes (exclusive shard lock).
@@ -90,6 +85,7 @@ class KVStore : public StoreEngine {
   Status Remove(const BlockKey& key) override;
 
   uint64_t UsedBytes() const override;
+  uint64_t TenantUsedBytes(uint64_t tenant_hash) const override;
   size_t Count() const override;
   uint64_t Evictions() const override { return evictions_.load(std::memory_order_relaxed); }
   uint64_t EvictedBytes() const override { return evicted_bytes_.load(std::memory_order_relaxed); }
@@ -101,30 +97,35 @@ class KVStore : public StoreEngine {
   uint64_t EnospcEvictions() const { return enospc_evictions_.load(std::memory_order_relaxed); }
   const std::string& Dir() const override { return opt_.cache_dir; }
 
-  // Test-only: override the disk write for the Cache() path so a test can
-  // inject a transient ENOSPC (returning false with *out_errno=ENOSPC once,
-  // then succeeding) and exercise the force-evict + retry self-heal.
+  // Test-only write override shared by Cache and CacheDirect. It reports errno
+  // so both paths can exercise the same bounded ENOSPC force-evict + retry.
   using WriteFn = std::function<bool(const std::string& path, const void* data,
                                      size_t len, int* out_errno)>;
   void SetWriteFnForTest(WriteFn fn) { write_fn_override_ = std::move(fn); }
+  using RenameFn =
+      std::function<bool(const std::string& from, const std::string& to)>;
+  void SetRenameFnForTest(RenameFn fn) { rename_fn_override_ = std::move(fn); }
 
  private:
   struct Entry {
     std::string path;
     uint64_t size = 0;
+    uint64_t tenant_hash = 0;
     std::atomic<bool> referenced{false};  // CLOCK bit: set on access (read lock)
     // This entry's own node in Shard::ring. std::list iterators are stable
     // across other insert/erase, so Remove() drops the ring node in O(1)
     // instead of scanning the whole ring (the old O(n), O(n^2) under RemoveMany
     // while holding the exclusive lock). Set right after the ring push_front.
     std::list<std::string>::iterator it{};
-    Entry(std::string p, uint64_t s) : path(std::move(p)), size(s) {}
+    Entry(std::string p, uint64_t s, uint64_t tenant)
+        : path(std::move(p)), size(s), tenant_hash(tenant) {}
   };
   struct Shard {
     mutable std::shared_mutex mu;
     std::unordered_map<std::string, Entry> index;  // filename -> entry
     std::list<std::string> ring;                    // CLOCK ring, front = newest
     uint64_t used_bytes = 0;
+    std::unordered_map<uint64_t, uint64_t> tenant_used_bytes;
     uint64_t capacity = 0;
     // Persistent CLOCK hand: the next eviction candidate, swept tail->front and
     // wrapped. Carrying it across Cache() calls amortizes the second-chance scan
@@ -139,10 +140,11 @@ class KVStore : public StoreEngine {
   // only RENAMES their files to a unique sibling (a fast metadata op); the slow
   // block-freeing unlink is deferred to `*trash`, which the caller drains AFTER
   // releasing the lock so an eviction storm can't stall concurrent GETs.
-  void EvictLocked(Shard& sh, std::vector<std::string>* trash);  // CLOCK 2nd-chance
+  bool EvictLocked(Shard& sh,
+                   std::vector<std::string>* trash);  // CLOCK 2nd-chance
   uint64_t ForceEvictLocked(Shard& sh, uint64_t target,
-                            std::vector<std::string>* trash);
-  std::string RenameToTrash(const std::string& path);  // fast in-lock; unlink deferred
+                            std::vector<std::string>* trash, bool* io_error);
+  bool RenameToTrash(const std::string& path, std::string* trash);
   bool RebuildIndex();
 
   Options opt_;
@@ -154,7 +156,8 @@ class KVStore : public StoreEngine {
   std::atomic<uint64_t> evictions_{0}, evicted_bytes_{0};
   std::atomic<uint64_t> tmp_reclaimed_{0};   // orphan .tmp removed at startup
   std::atomic<uint64_t> enospc_evictions_{0};  // ENOSPC force-evict + retry succeeded
-  WriteFn write_fn_override_;                // test-only Cache() write injection
+  WriteFn write_fn_override_;   // test-only Cache/CacheDirect write injection
+  RenameFn rename_fn_override_; // test-only metadata failure injection
 };
 
 }  // namespace dfkv

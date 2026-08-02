@@ -2,6 +2,7 @@
 #include "mds/mds_server.h"
 
 #include <cstdlib>
+#include <chrono>
 #include <map>
 
 #include <netinet/in.h>
@@ -17,6 +18,64 @@
 #include "transport/wire.h"
 
 namespace dfkv {
+
+namespace {
+uint64_t SteadyNowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+}  // namespace
+
+bool LocalLeaseMap::LookupAndTouch(const std::string& key, uint64_t now_ms,
+                                   int64_t* lease_id) {
+  std::lock_guard<std::mutex> lk(mu_);
+  auto it = entries_.find(key);
+  if (it == entries_.end()) return false;
+  it->second.last_use_ms = now_ms;
+  *lease_id = it->second.lease_id;
+  return true;
+}
+
+void LocalLeaseMap::Store(const std::string& key, int64_t lease_id,
+                          uint64_t now_ms) {
+  std::lock_guard<std::mutex> lk(mu_);
+  entries_[key] = Entry{lease_id, now_ms};
+}
+
+size_t LocalLeaseMap::PruneLocked(uint64_t now_ms, uint64_t stale_after_ms) {
+  size_t pruned = 0;
+  for (auto it = entries_.begin(); it != entries_.end();) {
+    const uint64_t last = it->second.last_use_ms;
+    if (now_ms >= last && now_ms - last > stale_after_ms) {
+      it = entries_.erase(it);
+      ++pruned;
+    } else {
+      ++it;
+    }
+  }
+  return pruned;
+}
+
+size_t LocalLeaseMap::MaybePrune(uint64_t now_ms, uint64_t stale_after_ms) {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (now_ms < next_prune_ms_) return 0;
+  next_prune_ms_ =
+      now_ms > UINT64_MAX - kPruneIntervalMs
+          ? UINT64_MAX
+          : now_ms + kPruneIntervalMs;
+  return PruneLocked(now_ms, stale_after_ms);
+}
+
+size_t LocalLeaseMap::Prune(uint64_t now_ms, uint64_t stale_after_ms) {
+  std::lock_guard<std::mutex> lk(mu_);
+  return PruneLocked(now_ms, stale_after_ms);
+}
+
+size_t LocalLeaseMap::Size() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return entries_.size();
+}
 
 MdsServer::~MdsServer() { Stop(); }
 
@@ -140,37 +199,41 @@ Status MdsServer::Upsert(const std::string& group, const MemberInfo& m) {
   // Reject before the id/group reach the etcd key: an unrestricted token can
   // contain '/' and escape its own key subtree (phantom-member injection).
   if (!IsValidGroupOrId(group) || !IsValidGroupOrId(m.id)) return Status::kInvalid;
-  return UpsertLeased(MemberKey(group, m.id), m, leases_, lease_mu_);
+  return UpsertLeased(MemberKey(group, m.id), m, leases_, false);
 }
 
 Status MdsServer::UpsertClient(const std::string& group, const MemberInfo& m) {
   // Same path-traversal guard as Upsert; clients live under a parallel prefix
   // (/clients/<id>) so a malformed id can't escape into /members/ either.
   if (!IsValidGroupOrId(group) || !IsValidGroupOrId(m.id)) return Status::kInvalid;
-  return UpsertLeased(ClientKey(group, m.id), m, client_leases_, client_lease_mu_);
+  return UpsertLeased(ClientKey(group, m.id), m, client_leases_, true);
 }
 
-// Shared lease keepalive + re-Put for both members and clients. The two maps
-// are identical in shape; only the etcd key prefix differs. Keeping one
-// implementation guarantees the client path inherits the lease-drift fix
-// (every heartbeat re-Puts the value under the registrar's own lease -- see
-// the long comment in the former Upsert below).
+// Shared lease keepalive + re-Put for both members and clients. Local entries
+// are discarded after four etcd TTLs without local use. That is deliberately
+// conservative for rotating multi-MDS registrars, while bounding process memory
+// under ID churn. etcd remains authoritative; a cache miss grants and Puts.
 Status MdsServer::UpsertLeased(const std::string& key, const MemberInfo& m,
-                               std::map<std::string, int64_t>& leases,
-                               std::mutex& mu) {
+                               LocalLeaseMap& leases, bool client) {
   std::string val = EncodeMembers({m}, 0);
   // Look up this member's known lease under the lock, then do the BLOCKING etcd
   // calls OUTSIDE it. Previously lease_mu_ was held across LeaseKeepAlive/Grant/Put,
   // so every member's heartbeat serialized on one mutex held across network I/O —
   // a slow etcd stalled all members' liveness. Now heartbeats for distinct members
   // run in parallel; the lock only guards the in-memory {key->leaseID} map.
+  constexpr uint64_t kLocalLeaseStaleMs =
+      static_cast<uint64_t>(kTtlSeconds) * 4 * 1000;
+  const uint64_t now_ms = SteadyNowMs();
+  const size_t pruned = leases.MaybePrune(now_ms, kLocalLeaseStaleMs);
+  auto& current_metric =
+      client ? metrics_.local_client_leases : metrics_.local_member_leases;
+  auto& pruned_metric = client ? metrics_.local_client_leases_pruned
+                               : metrics_.local_member_leases_pruned;
+  if (pruned != 0)
+    pruned_metric.fetch_add(pruned, std::memory_order_relaxed);
+  current_metric.store(leases.Size(), std::memory_order_relaxed);
   int64_t existing = 0;
-  bool have = false;
-  {
-    std::lock_guard<std::mutex> lk(mu);
-    auto it = leases.find(key);
-    if (it != leases.end()) { existing = it->second; have = true; }
-  }
+  const bool have = leases.LookupAndTouch(key, now_ms, &existing);
   // Fast path: refresh the lease AND re-write the key under it. The Put is
   // load-bearing, not redundant: with several MDS instances behind a rotating
   // registrar, a slow path on ANOTHER MDS re-attaches the key to that MDS's
@@ -194,10 +257,8 @@ Status MdsServer::UpsertLeased(const std::string& key, const MemberInfo& m,
   if (!lid) { metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed); return Status::kIOError; }
   metrics_.lease_grants.fetch_add(1, std::memory_order_relaxed);
   if (!etcd_.Put(key, val, *lid)) { metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed); return Status::kIOError; }
-  {
-    std::lock_guard<std::mutex> lk(mu);
-    leases[key] = *lid;
-  }
+  leases.Store(key, *lid, SteadyNowMs());
+  current_metric.store(leases.Size(), std::memory_order_relaxed);
   return Status::kOk;
 }
 

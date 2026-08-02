@@ -9,7 +9,7 @@
  * wrong-bytes rendezvous fails loudly here rather than as garbage KV.
  *
  *   dfkv_gpu_dedup_repro --members node=ip:port [--keys 1024] [--size 1048576]
- *                        [--ranks 4] [--model-hash 999001]
+ *                        [--ranks 4] [--namespace schema-id]
  *
  * Master PUTs the keys (host buffers), then forks+execs one child per rank
  * (CUDA does not survive fork). Children barrier on a shared file so their
@@ -31,7 +31,6 @@
 
 #include "client/cuda_ipc.h"
 #include "client/kv_client.h"
-#include "common/value_header.h"
 
 using namespace dfkv;
 
@@ -42,7 +41,7 @@ struct Args {
   size_t keys = 1024;
   size_t size = 1 << 20;
   int ranks = 4;
-  uint64_t model_hash = 999001;
+  std::string key_namespace = "dfkv/gpu-dedup-repro";
   int rank = -1;  // >=0: child mode
   std::string barrier;
 };
@@ -53,16 +52,6 @@ char PatByte(size_t key, size_t off) {
   return static_cast<char>((key * 131 + off * 7 + 3) & 0xFF);
 }
 
-ValueHeader Hdr(uint64_t mh) {
-  ValueHeader h{};
-  h.model_hash = mh;
-  h.page_size = 1;
-  h.dtype_tag = 1;
-  h.tp_size = 1;
-  h.tp_rank = 0;
-  h.layer_num = 1;
-  return h;
-}
 
 int Child(const Args& a) {
   const CudaLib* cu = CudaLib::Get();
@@ -82,8 +71,11 @@ int Child(const Args& a) {
     size_t eq = m.find('=');
     members.emplace_back(m.substr(0, eq), m.substr(eq + 1));
   }
-  KVClient c(members, Hdr(a.model_hash));
-  c.RegisterMemory(reinterpret_cast<void*>(pool), pool_bytes);
+  KVClient c(members, a.key_namespace);
+  if (!c.RegisterMemory(reinterpret_cast<void*>(pool), pool_bytes)) {
+    std::fprintf(stderr, "rank %d: RDMA memory registration failed\n", a.rank);
+    return 2;
+  }
 
   std::vector<KvGetItemSg> items(a.keys);
   for (size_t i = 0; i < a.keys; ++i) {
@@ -147,7 +139,7 @@ int main(int argc, char** argv) {
     else if (s == "--keys") a.keys = std::stoull(next());
     else if (s == "--size") a.size = std::stoull(next());
     else if (s == "--ranks") a.ranks = std::stoi(next());
-    else if (s == "--model-hash") a.model_hash = std::stoull(next());
+    else if (s == "--namespace") a.key_namespace = next();
     else if (s == "--rank") a.rank = std::stoi(next());
     else if (s == "--barrier") a.barrier = next();
   }
@@ -163,7 +155,7 @@ int main(int argc, char** argv) {
     std::vector<std::pair<std::string, std::string>> members;
     size_t eq = a.members.find('=');
     members.emplace_back(a.members.substr(0, eq), a.members.substr(eq + 1));
-    KVClient c(members, Hdr(a.model_hash));
+    KVClient c(members, a.key_namespace);
     std::vector<std::string> bufs(a.keys);
     std::vector<KvPutItemSg> puts(a.keys);
     for (size_t i = 0; i < a.keys; ++i) {
@@ -192,7 +184,7 @@ int main(int argc, char** argv) {
               "--keys", std::to_string(a.keys).c_str(),
               "--size", std::to_string(a.size).c_str(),
               "--ranks", std::to_string(a.ranks).c_str(),
-              "--model-hash", std::to_string(a.model_hash).c_str(),
+              "--namespace", a.key_namespace.c_str(),
               "--rank", std::to_string(r).c_str(),
               "--barrier", bar, static_cast<char*>(nullptr));
       _exit(97);

@@ -7,40 +7,49 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "common/status.h"
 #include "common/kv_types.h"
-#include "common/value_header.h"  // ValueHeader (for true stored-length in RangeIntoMulti)
 #include "transport/wire.h"       // WireOp, kReqPrefix, kRespPrefix, Encode/DecodeReq/Resp
 
 namespace dfkv {
+inline bool ValidBuffer(const void* data, size_t size) {
+  return size == 0 || data != nullptr;
+}
+
+inline bool CheckedAddSize(size_t value, size_t add, size_t* out) {
+  if (add > std::numeric_limits<size_t>::max() - value) return false;
+  *out = value + add;
+  return true;
+}
+
+inline std::vector<Status> InvalidStatuses(size_t count) {
+  return std::vector<Status>(count, Status::kInvalid);
+}
+
 
 // One write in a batch (data must outlive the CacheMany call).
 struct CacheItem { BlockKey key; const void* data; size_t len; };
-// One zero-copy read target: `n` payload bytes are written straight into `payload`.
+// One zero-copy read target: up to `n` bytes are written into `payload`.
+// The authoritative stored length is returned separately by the read call.
 struct RangeDst { void* payload; size_t n; };
-// One zero-copy write source: `header` (e.g. the 48B ValueHeader) and `payload`
-// live in separate buffers; the transport gathers [header|payload] on the wire
-// without a client-side concat copy (RDMA scatter-send). Both must outlive the
-// CacheFrom call and `payload` must stay unmodified until it returns.
+// One zero-copy write source. The raw value is gathered directly from payload.
+// The buffer must outlive CacheFrom and remain unmodified until it returns.
 struct CacheSrc {
   BlockKey key;
-  const void* header; size_t header_len;
-  const void* payload; size_t payload_len;
+  const void* payload;
+  size_t payload_len;
 };
 
-// Scatter-gather write source: one dfkv key whose stored payload is the in-order
-// concatenation of N non-contiguous caller buffers. The transport gathers
-// [header | payload[0] | payload[1] | ...] on the wire via a multi-SGE RDMA SEND
-// without a client-side concat copy. All buffers must outlive the CacheFromMulti
-// call and stay unmodified until it returns. payload_len = sum of segment sizes.
+// Scatter-gather write source: one raw value formed by concatenating N caller
+// buffers in order. RDMA gathers them without a client-side concat copy.
 struct CacheSrcMulti {
   BlockKey key;
-  const void* header; size_t header_len;
-  std::vector<std::pair<const void*, size_t>> payloads;  // (ptr, size) in order
+  std::vector<std::pair<const void*, size_t>> payloads;
 };
 // Scatter-gather read target: the stored payload (one concatenated blob) is
 // scattered across N caller buffers in order, each receiving its own size worth
@@ -48,6 +57,20 @@ struct CacheSrcMulti {
 struct RangeDstMulti {
   std::vector<std::pair<void*, size_t>> payloads;  // (ptr, size) in order
 };
+// Common per-endpoint connection-pool policy. A transport may ignore it when
+// its connection lifecycle is protocol-defined, but pooled transports use the
+// same bounded defaults so client fan-out cannot create an unbounded number of
+// sockets/QPs. Connections are always scoped to one routed endpoint: selecting
+// a connection must never change the cache node chosen for a key.
+struct EndpointPoolOptions {
+  size_t min_connections = 1;
+  size_t max_connections = 8;
+  uint64_t idle_timeout_ms = 30000;
+  uint64_t backoff_base_ms = 50;
+  uint64_t backoff_max_ms = 5000;
+  uint64_t acquire_timeout_ms = 10000;
+};
+
 
 class Transport {
  public:
@@ -56,7 +79,10 @@ class Transport {
   virtual Status Cache(const std::string& node, const BlockKey& key,
                        const void* data, size_t len) = 0;
   virtual Status Range(const std::string& node, const BlockKey& key,
-                       uint64_t offset, uint64_t length, std::string* out) = 0;
+                       uint64_t offset, uint64_t length, std::string* out,
+                       uint64_t* value_len = nullptr) = 0;
+  virtual Status Lookup(const std::string& node, const BlockKey& key,
+                        uint64_t* value_len) = 0;
   virtual Status Exist(const std::string& node, const BlockKey& key,
                        bool* exist) = 0;
 
@@ -84,17 +110,22 @@ class Transport {
     return r;
   }
 
-  // Transport-level Prometheus metrics (e.g. RDMA per-rail connections, MR
-  // registrations). Default empty; the RDMA transport overrides it. Folded into
-  // the client snapshot. Off the datapath (rendered on demand).
+  // Transport-level Prometheus metrics (e.g. pooled connection load/lifecycle,
+  // RDMA per-rail state, MR registrations). Default empty; concrete transports
+  // override it. Folded into the client snapshot, rendered off the datapath.
   virtual std::string MetricsText() const { return ""; }
 
-  // Register a large caller memory region (e.g. the whole SGLang host KV pool) for
-  // zero-copy transfer. A pipelined (RDMA) transport registers it once per
-  // connection so the Get/Put datapath never does a per-op MR registration —
-  // every buffer inside the region is resolved by range lookup. Default: no-op
-  // (TCP copies, so it needs no registration). Call before traffic for best effect.
-  virtual void RegisterMemory(void* base, size_t size) { (void)base; (void)size; }
+  // Register a caller-owned stable memory region (for example the whole host KV
+  // pool) for zero-copy transfer. RDMA registers it once per shared device PD;
+  // buffers inside resolve by range lookup without per-op registration. Calling
+  // again with the same base and a larger size grows the declaration. Returns
+  // true only when the requested range is ready for use; default copying
+  // transports such as TCP need no registration and always succeed.
+  virtual bool RegisterMemory(void* base, size_t size) {
+    (void)base;
+    (void)size;
+    return true;
+  }
 
   // True if CacheMany/RangeMany pipeline requests on one connection (RDMA). When
   // false (TCP), the client parallelizes batches across items with its own
@@ -115,18 +146,28 @@ class Transport {
                                         const std::vector<CacheItem>& items) {
     std::vector<Status> r;
     r.reserve(items.size());
-    for (const auto& it : items) r.push_back(Cache(node, it.key, it.data, it.len));
+    for (const auto& it : items) {
+      r.push_back(ValidBuffer(it.data, it.len)
+                      ? Cache(node, it.key, it.data, it.len)
+                      : Status::kInvalid);
+    }
     return r;
   }
-  virtual std::vector<Status> RangeMany(const std::string& node,
-                                        const std::vector<BlockKey>& keys,
-                                        uint64_t offset, uint64_t length,
-                                        std::vector<std::string>* outs) {
+  virtual std::vector<Status> RangeMany(
+      const std::string& node, const std::vector<BlockKey>& keys,
+      uint64_t offset, uint64_t length, std::vector<std::string>* outs,
+      std::vector<uint64_t>* value_lens = nullptr) {
+    if (outs == nullptr) {
+      if (value_lens) value_lens->assign(keys.size(), 0);
+      return InvalidStatuses(keys.size());
+    }
     outs->assign(keys.size(), std::string());
+    if (value_lens) value_lens->assign(keys.size(), 0);
     std::vector<Status> r;
     r.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i)
-      r.push_back(Range(node, keys[i], offset, length, &(*outs)[i]));
+      r.push_back(Range(node, keys[i], offset, length, &(*outs)[i],
+                        value_lens ? &(*value_lens)[i] : nullptr));
     return r;
   }
 
@@ -138,6 +179,7 @@ class Transport {
   virtual std::vector<Status> ExistMany(const std::string& node,
                                         const std::vector<BlockKey>& keys,
                                         std::vector<char>* exists) {
+    if (exists == nullptr) return InvalidStatuses(keys.size());
     exists->assign(keys.size(), 0);
     std::vector<Status> r;
     r.reserve(keys.size());
@@ -150,48 +192,38 @@ class Transport {
     return r;
   }
 
-  // Zero-copy read: the payload for keys[i] lands directly in dsts[i].payload
-  // (RDMA scatters [resp-prefix | first header_size bytes] into a scratch and the
-  // rest into the caller buffer). hdrs[i] gets the first header_size value-header
-  // bytes for the caller to verify. Default: a Range + split-copy (no zero-copy).
-  virtual std::vector<Status> RangeInto(const std::string& node,
-                                        const std::vector<BlockKey>& keys,
-                                        const std::vector<RangeDst>& dsts,
-                                        size_t header_size,
-                                        std::vector<std::string>* hdrs) {
-    hdrs->assign(keys.size(), std::string());
-    std::vector<Status> r;
-    r.reserve(keys.size());
+  // Zero-copy read: up to dsts[i].n raw stored bytes land directly in
+  // dsts[i].payload. value_lens[i] is the authoritative full stored size.
+  // Default: Range + copy; RDMA overrides with direct writes.
+  virtual std::vector<Status> RangeInto(
+      const std::string& node, const std::vector<BlockKey>& keys,
+      const std::vector<RangeDst>& dsts,
+      std::vector<uint64_t>* value_lens) {
+    if (value_lens) value_lens->assign(keys.size(), 0);
+    if (dsts.size() != keys.size()) return InvalidStatuses(keys.size());
+    std::vector<Status> r(keys.size(), Status::kInvalid);
     for (size_t i = 0; i < keys.size(); ++i) {
+      if (!ValidBuffer(dsts[i].payload, dsts[i].n)) continue;
       std::string raw;
-      Status st = Range(node, keys[i], 0, header_size + dsts[i].n, &raw);
-      r.push_back(st);
-      if (st != Status::kOk || raw.size() < header_size) continue;
-      (*hdrs)[i].assign(raw.data(), header_size);
-      size_t pn = raw.size() - header_size;
-      if (pn > dsts[i].n) pn = dsts[i].n;
-      std::memcpy(dsts[i].payload, raw.data() + header_size, pn);
+      uint64_t stored = 0;
+      Status st = Range(node, keys[i], 0, dsts[i].n, &raw, &stored);
+      r[i] = st;
+      if (value_lens) (*value_lens)[i] = stored;
+      if (st != Status::kOk) continue;
+      size_t n = std::min(raw.size(), dsts[i].n);
+      if (n) std::memcpy(dsts[i].payload, raw.data(), n);
     }
     return r;
   }
 
-  // Zero-copy batched write: gathers [srcs[i].header | srcs[i].payload] for
-  // keys[i] without a client concat copy (RDMA scatter-send). Default: concat
-  // each into a temp buffer and route through CacheMany (no zero-copy) so TCP
-  // and any non-pipelined transport stay correct. RDMA's override also falls
-  // back here (which re-materializes the contiguous buffer) on oversize/reg failure.
+  // Zero-copy batched write. Default transports route caller buffers directly
+  // through CacheMany; RDMA overrides with registered scatter sends.
   virtual std::vector<Status> CacheFrom(const std::string& node,
                                         const std::vector<CacheSrc>& srcs) {
-    std::vector<std::vector<char>> bufs(srcs.size());
     std::vector<CacheItem> items;
     items.reserve(srcs.size());
-    for (size_t i = 0; i < srcs.size(); ++i) {
-      bufs[i].resize(srcs[i].header_len + srcs[i].payload_len);
-      if (srcs[i].header_len) std::memcpy(bufs[i].data(), srcs[i].header, srcs[i].header_len);
-      if (srcs[i].payload_len)
-        std::memcpy(bufs[i].data() + srcs[i].header_len, srcs[i].payload, srcs[i].payload_len);
-      items.push_back(CacheItem{srcs[i].key, bufs[i].data(), bufs[i].size()});
-    }
+    for (const auto& src : srcs)
+      items.push_back(CacheItem{src.key, src.payload, src.payload_len});
     return CacheMany(node, items);
   }
 
@@ -201,72 +233,100 @@ class Transport {
   // RDMA transport overrides this to gather the segments via a multi-SGE SEND.
   virtual std::vector<Status> CacheFromMulti(
       const std::string& node, const std::vector<CacheSrcMulti>& srcs) {
+    std::vector<Status> result(srcs.size(), Status::kInvalid);
     std::vector<std::vector<char>> bufs(srcs.size());
     std::vector<CacheSrc> flat;
+    std::vector<size_t> indices;
     flat.reserve(srcs.size());
+    indices.reserve(srcs.size());
     for (size_t i = 0; i < srcs.size(); ++i) {
       size_t total = 0;
-      for (const auto& p : srcs[i].payloads) total += p.second;
+      bool valid = true;
+      for (const auto& p : srcs[i].payloads) {
+        size_t next = 0;
+        if (!ValidBuffer(p.first, p.second) ||
+            !CheckedAddSize(total, p.second, &next)) {
+          valid = false;
+          break;
+        }
+        total = next;
+      }
+      if (!valid) continue;
       bufs[i].resize(total);
       size_t off = 0;
       for (const auto& p : srcs[i].payloads) {
         if (p.second) std::memcpy(bufs[i].data() + off, p.first, p.second);
         off += p.second;
       }
-      flat.push_back(CacheSrc{srcs[i].key, srcs[i].header, srcs[i].header_len,
-                              bufs[i].data(), total});
+      indices.push_back(i);
+      flat.push_back(CacheSrc{srcs[i].key,
+                              total ? bufs[i].data() : nullptr, total});
     }
-    return CacheFrom(node, flat);
+    const auto valid_result = CacheFrom(node, flat);
+    for (size_t i = 0; i < indices.size() && i < valid_result.size(); ++i)
+      result[indices[i]] = valid_result[i];
+    return result;
   }
 
-  // Scatter-gather read: the stored payload is split across each key's N caller
-  // segments in order. Default: RangeInto a single contiguous scratch buffer, then
-  // split-copy it into the caller segments by their sizes (no zero-copy, but
-  // correct on any transport). out_lens[i] (if non-null) = total payload bytes for
-  // key[i] (0 on miss). The RDMA transport overrides this to scatter via multi-SGE
-  // RECV directly into the caller segments. hdrs[i] gets the value-header bytes.
+  // Scatter-gather read: raw stored bytes are split across each key's caller
+  // buffers in order. out_lens[i] receives the authoritative stored size.
   virtual std::vector<Status> RangeIntoMulti(
       const std::string& node, const std::vector<BlockKey>& keys,
-      const std::vector<RangeDstMulti>& dsts, size_t header_size,
-      std::vector<std::string>* hdrs, std::vector<size_t>* out_lens) {
+      const std::vector<RangeDstMulti>& dsts,
+      std::vector<size_t>* out_lens) {
     const size_t n = keys.size();
-    hdrs->assign(n, std::string());
     if (out_lens) out_lens->assign(n, 0);
-    // Concatenate each key's segments into one contiguous scratch RangeDst, run
-    // the existing RangeInto, then split the scratch back into the segments.
+    if (dsts.size() != n) return InvalidStatuses(n);
+    std::vector<Status> result(n, Status::kInvalid);
     std::vector<std::vector<char>> scratch(n);
-    std::vector<RangeDst> flat(n);
+    std::vector<BlockKey> valid_keys;
+    std::vector<RangeDst> flat;
+    std::vector<size_t> indices;
+    valid_keys.reserve(n);
+    flat.reserve(n);
+    indices.reserve(n);
     for (size_t i = 0; i < n; ++i) {
       size_t cap = 0;
-      for (const auto& p : dsts[i].payloads) cap += p.second;
+      bool valid = true;
+      for (const auto& p : dsts[i].payloads) {
+        size_t next = 0;
+        if (!ValidBuffer(p.first, p.second) ||
+            !CheckedAddSize(cap, p.second, &next)) {
+          valid = false;
+          break;
+        }
+        cap = next;
+      }
+      if (!valid) continue;
       scratch[i].resize(cap);
-      flat[i] = RangeDst{cap ? scratch[i].data() : nullptr, cap};
+      indices.push_back(i);
+      valid_keys.push_back(keys[i]);
+      flat.push_back(RangeDst{cap ? scratch[i].data() : nullptr, cap});
     }
-    std::vector<Status> r = RangeInto(node, keys, flat, header_size, hdrs);
-    for (size_t i = 0; i < n; ++i) {
-      if (r[i] != Status::kOk || (*hdrs)[i].size() < header_size) continue;
-      // The stored payload length is carried by the value header; the caller
-      // (KVClient) verifies geometry. Here we split exactly the bytes we received
-      // across the segments. The RangeInto fallback copied min(stored, cap) bytes
-      // into scratch; replay that across the segments honoring each segment size.
+    std::vector<uint64_t> stored;
+    const auto valid_result = RangeInto(node, valid_keys, flat, &stored);
+    for (size_t valid_i = 0;
+         valid_i < indices.size() && valid_i < valid_result.size(); ++valid_i) {
+      const size_t i = indices[valid_i];
+      result[i] = valid_result[valid_i];
+      if (result[i] != Status::kOk || valid_i >= stored.size()) continue;
+      if (stored[valid_i] > std::numeric_limits<size_t>::max()) {
+        result[i] = Status::kInvalid;
+        continue;
+      }
+      size_t remaining =
+          std::min<size_t>(static_cast<size_t>(stored[valid_i]),
+                           scratch[i].size());
       size_t off = 0;
       for (const auto& p : dsts[i].payloads) {
-        if (p.second) std::memcpy(p.first, scratch[i].data() + off, p.second);
-        off += p.second;
+        const size_t copy = std::min(p.second, remaining);
+        if (copy) std::memcpy(p.first, scratch[i].data() + off, copy);
+        off += copy;
+        remaining -= copy;
       }
-      // out_lens = the TRUE received payload length (matching the RDMA override,
-      // which reports received_bytes - header), not the sum-of-caps `off`. The
-      // stored length lives in the value header; RangeInto delivered min(stored,cap).
-      if (out_lens) {
-        size_t stored = off;  // fall back to caps if the header can't be parsed
-        ValueHeader vh;
-        if (header_size >= ValueHeader::kSize &&
-            ValueHeader::Parse((*hdrs)[i].data(), (*hdrs)[i].size(), &vh))
-          stored = std::min<size_t>(vh.payload_len, off);
-        (*out_lens)[i] = stored;
-      }
+      if (out_lens) (*out_lens)[i] = static_cast<size_t>(stored[valid_i]);
     }
-    return r;
+    return result;
   }
 };
 

@@ -1,19 +1,15 @@
-/* OpMetrics — per-op (put/get/exist) client-side counters + latency histogram,
- * rendered as dfkv_client_op_* in KVClient::MetricsSnapshot().
+/* OpMetrics — per-op client-side counters + latency histogram, rendered as
+ * dfkv_client_op_* in KVClient::MetricsSnapshot().
  *
- * This is the convergent request view: every connector (SGLang/vLLM/LMCache)
- * funnels through the KVClient batch + single ops, so the op accounting lives
- * here ONCE instead of being re-instrumented in each connector. The Python
- * telemetry
- * poller reads the snapshot and re-emits these (with connector identity) over
- * OTLP, so all connectors get the fleet dashboard for free.
+ * This is the convergent request view: every connector funnels through the
+ * KVClient public batch + scalar ops. Each public call records exactly one
+ * request and its submitted key count, regardless of transport, retry,
+ * rendezvous hit, or early route/health failure.
  *
  * Lock-free: relaxed atomics + the lock-free LatencyHist. `hits` is op-specific
- * (put: pages written ok; get: cache hits; exist: pages present) so the dashboard
- * derives hit/fail ratio = hits/keys. `keys - hits` is failed writes for put
- * (the signal behind SGLang's "Write page to storage: N pages failed") and misses
- * for get/exist. Latency captures the tail (the batch_exist stalls): avg via
- * rate(sum)/rate(count), p99 via buckets (saturates >100ms), peak via op_max. */
+ * (put/remove: keys confirmed; get: cache hits; exist: keys present), so the
+ * dashboard derives hit/fail ratio = hits/keys. Latency captures the public
+ * call, including rendezvous waits and any bounded native retries. */
 #ifndef DFKV_OP_METRICS_H_
 #define DFKV_OP_METRICS_H_
 
@@ -29,7 +25,7 @@ namespace dfkv {
 
 class OpMetrics {
  public:
-  enum Op { kPut = 0, kGet = 1, kExist = 2, kNumOps = 3 };
+  enum Op { kPut = 0, kGet = 1, kExist = 2, kRemove = 3, kNumOps = 4 };
 
   void Record(Op op, uint64_t keys, uint64_t hits, uint64_t bytes,
               double seconds) {
@@ -65,14 +61,14 @@ class OpMetrics {
   Scope Begin(Op op) { return Scope(this, op); }
 
   std::string Render() const {
-    static const char* kName[kNumOps] = {"put", "get", "exist"};
+    static const char* kName[kNumOps] = {"put", "get", "exist", "remove"};
     std::string s;
     Counter(s, "dfkv_client_op_requests_total", "client ops issued, by op",
             [](const M& m) { return m.requests.load(std::memory_order_relaxed); });
     Counter(s, "dfkv_client_op_keys_total", "keys submitted, by op",
             [](const M& m) { return m.keys.load(std::memory_order_relaxed); });
     Counter(s, "dfkv_client_op_hits_total",
-            "keys that hit (get) / wrote ok (put) / were present (exist), by op",
+            "keys confirmed (put/remove) / hit (get) / present (exist), by op",
             [](const M& m) { return m.hits.load(std::memory_order_relaxed); });
     Counter(s, "dfkv_client_op_bytes_total", "bytes moved, by op",
             [](const M& m) { return m.bytes.load(std::memory_order_relaxed); });
@@ -98,7 +94,7 @@ class OpMetrics {
   template <class Pick>
   void Counter(std::string& s, const char* name, const char* help,
                Pick pick) const {
-    static const char* kName[kNumOps] = {"put", "get", "exist"};
+    static const char* kName[kNumOps] = {"put", "get", "exist", "remove"};
     s += "# HELP "; s += name; s += " "; s += help; s += "\n";
     s += "# TYPE "; s += name; s += " counter\n";
     for (int o = 0; o < kNumOps; ++o)

@@ -1,8 +1,9 @@
 // TDD R3 — KVStore: the cache-node local store (disk + LRU + cache-only/no-S3).
 #include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
 #include <fstream>
 #include "cache/kv_store.h"
-#include "compat/sgengine_key_adapter.h"
 
 #include <gtest/gtest.h>
 
@@ -44,37 +45,49 @@ TEST_F(KVStoreTest, CacheThenRangeRoundTripAndImmediateVisibility) {
   ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);
   // sync visibility: cached immediately after Cache() returns
   EXPECT_TRUE(s.IsCached(k));
+  dfkv::ValueMetadata metadata;
+  ASSERT_EQ(s.Lookup(k, &metadata), Status::kOk);
+  EXPECT_EQ(metadata.value_len, v.size());
+  EXPECT_EQ(s.Lookup(BlockKey{999, 0}, &metadata), Status::kNotFound);
   std::string out;
-  ASSERT_EQ(s.Range(k, 0, v.size(), &out), Status::kOk);
+  size_t value_len = 0;
+  ASSERT_EQ(s.Range(k, 0, v.size(), &out, &value_len), Status::kOk);
   EXPECT_EQ(out, v);
+  EXPECT_EQ(value_len, v.size());
 }
 
-TEST_F(KVStoreTest, SgEngineCompatibilityDomainCannotAliasNativeKey) {
-  KVStore s(Opts());
-  const BlockKey native{111, (uint64_t{4096} << 32) | 7};
-  const BlockKey legacy = dfkv::compat::SgEngineV1Key(111, 7, 4096);
-  ASSERT_FALSE(native == legacy);
-  EXPECT_EQ(native.Filename(), "000000000000006f0000100000000007");
-  EXPECT_EQ(legacy.Filename(),
-            "sgengine-v1_000000000000006f0000100000000007");
-  EXPECT_EQ(native.StoreKey(),
-            "blocks/00/0000/000000000000006f0000100000000007");
-  EXPECT_EQ(legacy.StoreKey(),
-            "compat/sgengine-v1/blocks/00/0000/"
-            "sgengine-v1_000000000000006f0000100000000007");
+TEST_F(KVStoreTest, TenantUsageSurvivesRestartAndRemove) {
+  const BlockKey a{1, 0, 0x1111};
+  const BlockKey b{2, 0, 0x1111};
+  const BlockKey other{3, 0, 0x2222};
+  {
+    KVStore store(Opts());
+    ASSERT_EQ(store.Cache(a, "aaaa", 4), Status::kOk);
+    ASSERT_EQ(store.Cache(b, "bbbbbb", 6), Status::kOk);
+    ASSERT_EQ(store.Cache(other, "ccc", 3), Status::kOk);
+    EXPECT_EQ(store.TenantUsedBytes(0x1111), 10u);
+    EXPECT_EQ(store.TenantUsedBytes(0x2222), 3u);
+    ASSERT_EQ(store.Cache(a, "ignored", 7), Status::kOk);
+    EXPECT_EQ(store.TenantUsedBytes(0x1111), 10u);
+  }
+  KVStore reopened(Opts());
+  ASSERT_TRUE(reopened.Healthy()) << reopened.StartupError();
+  EXPECT_EQ(reopened.TenantUsedBytes(0x1111), 10u);
+  EXPECT_EQ(reopened.TenantUsedBytes(0x2222), 3u);
+  ASSERT_EQ(reopened.Remove(a), Status::kOk);
+  EXPECT_EQ(reopened.TenantUsedBytes(0x1111), 6u);
+}
 
-  const std::string native_value = "native";
-  const std::string legacy_value = "legacy";
-  ASSERT_EQ(s.Cache(native, native_value.data(), native_value.size()),
-            Status::kOk);
-  ASSERT_EQ(s.Cache(legacy, legacy_value.data(), legacy_value.size()),
-            Status::kOk);
+TEST_F(KVStoreTest, HistoricalNamespaceLayoutIsRejected) {
+  const fs::path old_dir = dir_ / "compat" / "format-v1" / "blocks";
+  fs::create_directories(old_dir);
+  std::ofstream(old_dir / "record", std::ios::binary) << "old";
 
-  std::string out;
-  ASSERT_EQ(s.Range(native, 0, native_value.size(), &out), Status::kOk);
-  EXPECT_EQ(out, native_value);
-  ASSERT_EQ(s.Range(legacy, 0, legacy_value.size(), &out), Status::kOk);
-  EXPECT_EQ(out, legacy_value);
+  KVStore store(Opts());
+  EXPECT_FALSE(store.Healthy());
+  EXPECT_NE(store.StartupError().find("different store layout"),
+            std::string::npos);
+  EXPECT_EQ(store.Cache(BlockKey{111, 7}, "value", 5), Status::kIOError);
 }
 
 TEST_F(KVStoreTest, RangeIntoReadsStraightIntoCallerBuffer) {
@@ -91,9 +104,12 @@ TEST_F(KVStoreTest, RangeIntoReadsStraightIntoCallerBuffer) {
   got = 12345;
   EXPECT_EQ(s.RangeInto(BlockKey{999, 0}, 0, 64, buf, sizeof(buf), &got), Status::kNotFound);
   EXPECT_EQ(got, 0u);
-  // dst_cap caps the read
-  ASSERT_EQ(s.RangeInto(k, 0, v.size(), buf, 4, &got), Status::kOk);
+  // dst_cap caps returned bytes without losing the same-snapshot stored length.
+  size_t value_len = 0;
+  ASSERT_EQ(s.RangeInto(k, 0, v.size(), buf, 4, &got, &value_len),
+            Status::kOk);
   EXPECT_EQ(got, 4u);
+  EXPECT_EQ(value_len, v.size());
   EXPECT_EQ(std::string(buf, 4), v.substr(0, 4));
 }
 
@@ -109,13 +125,47 @@ TEST_F(KVStoreTest, RangeDirectReturnsSliceInsideAlignedBuffer) {
   char* io = static_cast<char*>(raw);
   const char* data = nullptr;
   size_t got = 0;
-  ASSERT_EQ(s.RangeDirect(k, 123, 5000, io, 16 * 1024, &data, &got), Status::kOk);
+  size_t value_len = 0;
+  ASSERT_EQ(s.RangeDirect(k, 123, 5000, io, 16 * 1024, &data, &got,
+                          &value_len),
+            Status::kOk);
   EXPECT_EQ(got, 5000u);
+  EXPECT_EQ(value_len, v.size());
   EXPECT_GE(data, io);
   EXPECT_LT(data, io + 16 * 1024);
   EXPECT_EQ(std::string(data, got), v.substr(123, 5000));
   std::free(raw);
 }
+TEST_F(KVStoreTest, ReadLeaseClosesDescriptorOnSuccessAndErrorReplacement) {
+  KVStore s(Opts());
+  const BlockKey key{335, 0};
+  const std::string value(7000, 'r');
+  ASSERT_EQ(s.Cache(key, value.data(), value.size()), Status::kOk);
+
+  int fd = -1;
+  {
+    dfkv::ReadLease lease;
+    ASSERT_EQ(s.RangeDirectPrep(key, 123, 4096, 8192, &lease), Status::kOk);
+    ASSERT_GE(lease.fd(), 0);
+    fd = lease.fd();
+    EXPECT_EQ(lease.payload_len, 4096u);
+    EXPECT_EQ(lease.value_len, value.size());
+  }
+  errno = 0;
+  EXPECT_EQ(::fcntl(fd, F_GETFD), -1);
+  EXPECT_EQ(errno, EBADF);
+
+  dfkv::ReadLease lease;
+  ASSERT_EQ(s.RangeDirectPrep(key, 0, 4096, 8192, &lease), Status::kOk);
+  fd = lease.fd();
+  EXPECT_EQ(s.RangeDirectPrep(BlockKey{999, 0}, 0, 4096, 8192, &lease),
+            Status::kNotFound);
+  EXPECT_EQ(lease.fd(), -1);
+  errno = 0;
+  EXPECT_EQ(::fcntl(fd, F_GETFD), -1);
+  EXPECT_EQ(errno, EBADF);
+}
+
 
 TEST_F(KVStoreTest, CacheDirectWritesAlignedBuffer) {
   KVStore s(Opts());
@@ -425,6 +475,76 @@ TEST_F(KVStoreTest, PersistentEnospcReturnsIoErrorWithoutInfiniteLoop) {
   std::string v(4096, 'Q');
   EXPECT_EQ(s.Cache(BlockKey{4000, 0}, v.data(), v.size()), Status::kIOError);
   EXPECT_EQ(s.EnospcEvictions(), 0u);  // retry did not succeed -> not counted
+}
+
+TEST_F(KVStoreTest, CacheDirectRetriesOnceAfterEnospc) {
+  KVStore s(Opts(/*cap=*/1ull << 30));
+  std::string resident(4096, 'r');
+  for (uint64_t i = 0; i < 4; ++i)
+    ASSERT_EQ(s.Cache(BlockKey{5000 + i, 0}, resident.data(),
+                      resident.size()),
+              Status::kOk);
+
+  int calls = 0;
+  s.SetWriteFnForTest([&](const std::string& path, const void* data, size_t len,
+                          int* out_errno) {
+    if (++calls == 1) {
+      *out_errno = ENOSPC;
+      return false;
+    }
+    std::ofstream(path, std::ios::binary)
+        .write(static_cast<const char*>(data),
+               static_cast<std::streamsize>(len));
+    return true;
+  });
+  void* allocation = nullptr;
+  ASSERT_EQ(::posix_memalign(&allocation, 4096, 4096), 0);
+  std::memset(allocation, 'd', 4096);
+  EXPECT_EQ(s.CacheDirect(BlockKey{6000, 0}, static_cast<char*>(allocation),
+                          4096, 4096),
+            Status::kOk);
+  std::free(allocation);
+  EXPECT_EQ(calls, 2);
+  EXPECT_EQ(s.EnospcEvictions(), 1u);
+  EXPECT_TRUE(s.IsCached(BlockKey{6000, 0}));
+}
+
+TEST_F(KVStoreTest, RenameFailurePreservesIndexAndTenantAccounting) {
+  KVStore s(Opts());
+  const BlockKey key{7000, 1, 0xabc};
+  const std::string value(4096, 'x');
+  ASSERT_EQ(s.Cache(key, value.data(), value.size()), Status::kOk);
+  const size_t count = s.Count();
+  const uint64_t used = s.UsedBytes();
+  const uint64_t tenant_used = s.TenantUsedBytes(key.tenant_hash);
+  s.SetRenameFnForTest(
+      [](const std::string&, const std::string&) { return false; });
+
+  EXPECT_EQ(s.Remove(key), Status::kIOError);
+  EXPECT_EQ(s.Count(), count);
+  EXPECT_EQ(s.UsedBytes(), used);
+  EXPECT_EQ(s.TenantUsedBytes(key.tenant_hash), tenant_used);
+  EXPECT_TRUE(s.IsCached(key));
+  std::string out;
+  EXPECT_EQ(s.Range(key, 0, 0, &out), Status::kOk);
+  EXPECT_EQ(out, value);
+}
+
+TEST_F(KVStoreTest, EvictionRenameFailureIsNotReportedAsSuccess) {
+  KVStore s(Opts(/*cap=*/4096, /*shards=*/1));
+  const std::string value(4096, 'e');
+  const BlockKey first{7100, 0, 1};
+  const BlockKey second{7101, 0, 2};
+  ASSERT_EQ(s.Cache(first, value.data(), value.size()), Status::kOk);
+  s.SetRenameFnForTest(
+      [](const std::string&, const std::string&) { return false; });
+  EXPECT_EQ(s.Cache(second, value.data(), value.size()), Status::kIOError);
+  EXPECT_TRUE(s.IsCached(first));
+  EXPECT_TRUE(s.IsCached(second));
+  EXPECT_EQ(s.Count(), 2u);
+  EXPECT_EQ(s.UsedBytes(), 2 * value.size());
+  EXPECT_EQ(s.TenantUsedBytes(first.tenant_hash), value.size());
+  EXPECT_EQ(s.TenantUsedBytes(second.tenant_hash), value.size());
 }
 
 TEST_F(KVStoreTest, EvictionAndRemoveLeaveNoTmpOrphansOnDisk) {

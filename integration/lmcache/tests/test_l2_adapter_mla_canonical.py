@@ -33,7 +33,7 @@ from dfkv_connector.l2_adapter import (  # noqa: E402
     DfkvL2Adapter,
     DfkvL2AdapterConfig,
     _canonical_kv_rank,
-    _object_key_to_string,
+    _object_key_to_bytes,
 )
 from lmcache.v1.distributed.api import ObjectKey  # noqa: E402
 
@@ -63,8 +63,8 @@ class _FakeDfkvClient:
 
     def __init__(self, **kwargs):
         self.transport_mode = "fake"
-        self.store: dict[str, bytes] = {}
-        self.set_calls: list[list[str]] = []
+        self.store: dict[bytes, bytes] = {}
+        self.set_calls: list[list[bytes]] = []
         self.set_bytes = 0
 
     async def batch_set(self, keys, bufs):
@@ -111,6 +111,7 @@ def _kv_rank(ws: int, grank: int, lws: int, lrank: int) -> int:
 
 
 def _mk_adapter(canonical: bool) -> DfkvL2Adapter:
+    _install_fake_client()
     cfg = DfkvL2AdapterConfig.from_dict(
         {
             "url": "dfkv://127.0.0.1:28150/glm",
@@ -166,24 +167,18 @@ class TestConfigGating(unittest.TestCase):
         )
         self.assertTrue(cfg.mla_canonical_keys)
 
-    def test_opt_in_via_env(self):
+    def test_environment_cannot_change_key_geometry(self):
         os.environ["DFKV_L2ADAPTER_MLA_CANONICAL_KEYS"] = "1"
         try:
-            cfg = DfkvL2AdapterConfig.from_dict(
+            implicit = DfkvL2AdapterConfig.from_dict(
                 {"url": "dfkv://127.0.0.1:1/g", "model_name": "m"}
             )
-            self.assertTrue(cfg.mla_canonical_keys)
-        finally:
-            del os.environ["DFKV_L2ADAPTER_MLA_CANONICAL_KEYS"]
-
-    def test_dict_beats_env(self):
-        os.environ["DFKV_L2ADAPTER_MLA_CANONICAL_KEYS"] = "1"
-        try:
-            cfg = DfkvL2AdapterConfig.from_dict(
+            explicit = DfkvL2AdapterConfig.from_dict(
                 {"url": "dfkv://127.0.0.1:1/g", "model_name": "m",
-                 "mla_canonical_keys": False}
+                 "mla_canonical_keys": True}
             )
-            self.assertFalse(cfg.mla_canonical_keys)
+            self.assertFalse(implicit.mla_canonical_keys)
+            self.assertTrue(explicit.mla_canonical_keys)
         finally:
             del os.environ["DFKV_L2ADAPTER_MLA_CANONICAL_KEYS"]
 
@@ -201,7 +196,7 @@ class TestCanonicalKeyForm(unittest.TestCase):
             k5 = a._canon(_rank_key(1, grank=5))
             self.assertEqual(k3, k5)
             self.assertEqual(
-                _object_key_to_string(k3), _object_key_to_string(k5))
+                _object_key_to_bytes(k3), _object_key_to_bytes(k5))
         finally:
             a.close()
 
@@ -212,7 +207,7 @@ class TestCanonicalKeyForm(unittest.TestCase):
             k5 = a._canon(_rank_key(1, grank=5))
             self.assertNotEqual(k3, k5)
             self.assertNotEqual(
-                _object_key_to_string(k3), _object_key_to_string(k5))
+                _object_key_to_bytes(k3), _object_key_to_bytes(k5))
         finally:
             a.close()
 
@@ -223,7 +218,7 @@ class TestCanonicalKeyForm(unittest.TestCase):
             k4 = a._canon(_rank_key(1, grank=3, ws=4))
             k8 = a._canon(_rank_key(1, grank=3, ws=8))
             self.assertNotEqual(
-                _object_key_to_string(k4), _object_key_to_string(k8))
+                _object_key_to_bytes(k4), _object_key_to_bytes(k8))
         finally:
             a.close()
 
@@ -236,15 +231,15 @@ class TestCanonicalKeyForm(unittest.TestCase):
             a.close()
 
     def test_flip_is_cold_cache(self):
-        """Canonical on/off produce different key strings — flipping the flag
+        """Canonical on/off produce different key bytes; flipping the flag
         for a live ring must be understood as a cache reset (documented)."""
         on = _mk_adapter(True)
         off = _mk_adapter(False)
         try:
             k = _rank_key(1, grank=3)
             self.assertNotEqual(
-                _object_key_to_string(on._canon(k)),
-                _object_key_to_string(off._canon(k)),
+                _object_key_to_bytes(on._canon(k)),
+                _object_key_to_bytes(off._canon(k)),
             )
         finally:
             on.close()
@@ -294,8 +289,9 @@ class TestStoreDedup(unittest.TestCase):
             self.assertEqual(len(a._client.set_calls), 2)
             # the second set call carried exactly one key (the missing k1)
             self.assertEqual(len(a._client.set_calls[1]), 1)
-            self.assertIn(_object_key_to_string(a._canon(k1)),
-                          a._client.set_calls[1][0])
+            self.assertEqual(
+                _object_key_to_bytes(a._canon(k1), replicated=True),
+                a._client.set_calls[1][0])
         finally:
             a.close()
 

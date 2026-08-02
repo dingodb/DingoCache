@@ -20,10 +20,11 @@
 namespace dfkv {
 
 namespace {
-constexpr uint32_t kMagic = 0x44444732u;  // "DDG2" (128-bit identity)
+constexpr uint32_t kMagic = 0x44444733u;  // "DDG3" (publisher ownership tokens)
 constexpr uint32_t kStateEmpty = 0;
 constexpr uint32_t kStateFetching = 1;
 constexpr uint32_t kStateReady = 2;
+constexpr uint32_t kStatePublishing = 3;
 
 uint64_t EnvU64(const char* name, uint64_t dflt) {
   const char* v = std::getenv(name);
@@ -92,17 +93,17 @@ uint64_t GpuNodeDedup::NowMs() {
       std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
-std::string GpuNodeDedup::EnvSegmentName(uint64_t model_hash) {
+std::string GpuNodeDedup::EnvSegmentName(uint64_t namespace_hash) {
   char name[128];
   // Layout version FIRST in the name (v1.23.0 lesson, see node_dedup.h):
   // a layout bump must never meet a segment an older lib left behind.
-  std::snprintf(name, sizeof(name), "/dfkv-dedup-gpuv2-%u-%016llx", ::getuid(),
-                static_cast<unsigned long long>(model_hash));
+  std::snprintf(name, sizeof(name), "/dfkv-dedup-gpuv3-%u-%016llx", ::getuid(),
+                static_cast<unsigned long long>(namespace_hash));
   return name;
 }
 
-std::unique_ptr<GpuNodeDedup> GpuNodeDedup::FromEnv(uint64_t model_hash,
-                                                    const void* device_dst_hint) {
+std::unique_ptr<GpuNodeDedup> GpuNodeDedup::FromEnv(
+    uint64_t namespace_hash, const void* device_dst_hint) {
   const char* on = std::getenv("DFKV_CLIENT_NODE_DEDUP");
   if (!on || std::strcmp(on, "1") != 0) return nullptr;
   const char* gpu = std::getenv("DFKV_CLIENT_NODE_DEDUP_GPU");
@@ -127,7 +128,7 @@ std::unique_ptr<GpuNodeDedup> GpuNodeDedup::FromEnv(uint64_t model_hash,
   o.wait_ms = static_cast<int>(EnvU64("DFKV_NODE_DEDUP_WAIT_MS", 500));
   o.takeover_ms = static_cast<int>(EnvU64("DFKV_NODE_DEDUP_TAKEOVER_MS", 2000));
   o.ttl_ms = static_cast<int>(EnvU64("DFKV_NODE_DEDUP_TTL_MS", 5000));
-  o.name = EnvSegmentName(model_hash);
+  o.name = EnvSegmentName(namespace_hash);
   return Open(o);
 }
 
@@ -487,7 +488,8 @@ void GpuNodeDedup::WaitManySg(WaitItem* items, size_t n) {
 
 GpuNodeDedup::Role GpuNodeDedup::ClaimSg(const BlockKey& key, const Seg* segs,
                                          size_t nsegs, size_t total_cap,
-                                         size_t* got) {
+                                         size_t* got, uint64_t* token) {
+  if (token) *token = 0;
   if (total_cap == 0 || total_cap > arena_bytes_ / 2) return Role::kFetch;
   EnsureThreadCtx();
   const uint64_t now = NowMs();
@@ -502,25 +504,25 @@ GpuNodeDedup::Role GpuNodeDedup::ClaimSg(const BlockKey& key, const Seg* segs,
       }
     } else if (st == kStateFetching) {
       const uint64_t started = s->fetch_start_ms.load(std::memory_order_relaxed);
-      if (now - started <= static_cast<uint64_t>(takeover_ms_)) return Role::kWait;
-      uint64_t expect = started;
-      if (s->fetch_start_ms.compare_exchange_strong(expect, now,
-                                                    std::memory_order_acq_rel)) {
+      if (now - started <= static_cast<uint64_t>(takeover_ms_))
+        return Role::kWait;
+      uint32_t expect = kStateFetching;
+      if (s->state.compare_exchange_strong(expect, kStatePublishing,
+                                           std::memory_order_acq_rel)) {
+        s->gen.fetch_add(1, std::memory_order_acq_rel);
+        s->fetch_start_ms.store(now, std::memory_order_relaxed);
+        const uint64_t mine = s->gen.fetch_add(1, std::memory_order_release) + 1;
+        s->state.store(kStateFetching, std::memory_order_release);
+        if (token) *token = mine;
         fetches_.fetch_add(1, std::memory_order_relaxed);
         return Role::kFetch;
       }
       return Role::kWait;
+    } else if (st == kStatePublishing) {
+      return Role::kWait;
     }
   }
   if (Slot* mine = Reserve(key)) {
-    // Concurrent lockstep claimers can reserve TWO slots for one key: the
-    // second claimer's Find() raced the first's identity write (a ~100 ns
-    // window that near-synchronous claim loops hit almost every key —
-    // observed live as server reads of exactly 2x the uniques). Re-scan the
-    // probe window TWICE — immediately, and after a ~1 us settle spin so a
-    // truly simultaneous peer's identity write has landed. The LOWEST probe
-    // position is canonical (it is what every waiter's Find returns); a
-    // non-canonical winner releases its slot and waits.
     for (int pass = 0; pass < 2; ++pass) {
       Slot* first = Find(key);
       if (first && first != mine) {
@@ -532,31 +534,33 @@ GpuNodeDedup::Role GpuNodeDedup::ClaimSg(const BlockKey& key, const Seg* segs,
       if (pass == 0)
         for (volatile int spin = 0; spin < 2000; ++spin) {}
     }
+    if (token) *token = mine->gen.load(std::memory_order_acquire);
     fetches_.fetch_add(1, std::memory_order_relaxed);
     return Role::kFetch;
   }
-  return Role::kFetch;  // probe window full: plain fetch, nothing to publish
+  return Role::kFetch;
 }
 
-void GpuNodeDedup::PublishSg(const BlockKey& key, const Seg* segs, size_t nsegs,
-                             size_t len) {
+void GpuNodeDedup::PublishSg(const BlockKey& key, uint64_t token,
+                             const Seg* segs, size_t nsegs, size_t len) {
+  if (token == 0) return;
   EnsureThreadCtx();
   Slot* s = Find(key);
-  if (!s || s->state.load(std::memory_order_acquire) != kStateFetching) return;
+  if (!s || s->gen.load(std::memory_order_acquire) != token) return;
+  uint32_t state = kStateFetching;
+  if (!s->state.compare_exchange_strong(state, kStatePublishing,
+                                        std::memory_order_acq_rel))
+    return;
   const size_t n = len;
-  auto abandon = [&] {  // free the slot so a falling-back waiter can re-claim
-    uint32_t st = kStateFetching;
-    s->state.compare_exchange_strong(st, kStateEmpty, std::memory_order_acq_rel);
-  };
+  auto abandon = [&] { s->state.store(kStateEmpty, std::memory_order_release); };
   if (n == 0 || n > arena_bytes_ / 2) return abandon();
   ProcEntry& e = reg_[self_idx_];
-  // Ring-allocate on OUR arena cursor; skip the tail remainder when a lap
-  // boundary would split the payload (same scheme as the host flavor).
   uint64_t cur = e.alloc_cursor.load(std::memory_order_relaxed);
   uint64_t off, seq;
   for (;;) {
     const uint64_t in_lap = cur % arena_bytes_;
-    const uint64_t need = (in_lap + n > arena_bytes_) ? (arena_bytes_ - in_lap) + n : n;
+    const uint64_t need =
+        (in_lap + n > arena_bytes_) ? (arena_bytes_ - in_lap) + n : n;
     if (e.alloc_cursor.compare_exchange_weak(cur, cur + need,
                                              std::memory_order_acq_rel)) {
       seq = cur + need;
@@ -564,9 +568,7 @@ void GpuNodeDedup::PublishSg(const BlockKey& key, const Seg* segs, size_t nsegs,
       break;
     }
   }
-  // Gather the caller's segments (device VAs, D2D) into the arena on our own
-  // stream, and SYNC before flipping READY: an unsynchronized gather let
-  // peers copy stale arena bytes (garbage KV, observed live).
+  // Gather on the rendezvous stream and synchronize before READY.
   CUstream st = Stream();
   if (!st) return abandon();
   size_t done = 0;
@@ -586,16 +588,37 @@ void GpuNodeDedup::PublishSg(const BlockKey& key, const Seg* segs, size_t nsegs,
   s->alloc_seq = seq;
   s->owner_idx = self_idx_;
   s->owner_gen32 = static_cast<uint32_t>(self_gen_);
-  s->fetch_start_ms.store(NowMs(), std::memory_order_relaxed);  // TTL from publish
+  s->fetch_start_ms.store(NowMs(), std::memory_order_relaxed);
   s->gen.fetch_add(1, std::memory_order_release);
   s->state.store(kStateReady, std::memory_order_release);
 }
 
-void GpuNodeDedup::Abort(const BlockKey& key) {
+void GpuNodeDedup::Abort(const BlockKey& key, uint64_t token) {
+  if (token == 0) return;
   Slot* s = Find(key);
-  if (!s) return;
+  if (!s || s->gen.load(std::memory_order_acquire) != token) return;
   uint32_t st = kStateFetching;
   s->state.compare_exchange_strong(st, kStateEmpty, std::memory_order_acq_rel);
+}
+
+void GpuNodeDedup::Invalidate(const BlockKey& key) {
+  for (;;) {
+    Slot* s = Find(key);
+    if (!s) return;
+    uint32_t st = s->state.load(std::memory_order_acquire);
+    if (st == kStatePublishing) {
+      std::this_thread::yield();
+      continue;
+    }
+    if (st != kStateFetching && st != kStateReady) return;
+    if (!s->state.compare_exchange_weak(st, kStatePublishing,
+                                        std::memory_order_acq_rel))
+      continue;
+    s->gen.fetch_add(1, std::memory_order_acq_rel);
+    s->gen.fetch_add(1, std::memory_order_release);
+    s->state.store(kStateEmpty, std::memory_order_release);
+    return;
+  }
 }
 
 bool GpuNodeDedup::WaitSg(const BlockKey& key, const Seg* segs, size_t nsegs,

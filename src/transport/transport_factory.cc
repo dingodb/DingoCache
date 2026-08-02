@@ -20,11 +20,12 @@ bool EnvTruthy(const char* name) {
          std::strcmp(v, "false") != 0 && std::strcmp(v, "no") != 0;
 }
 
-bool RequireRdma() { return EnvTruthy("DFKV_REQUIRE_RDMA"); }
+#ifdef DFKV_WITH_RDMA
 bool DeviceFilterConfigured() {
   const char* devices = std::getenv("DFKV_RDMA_DEV");
   return devices && *devices;
 }
+#endif
 }  // namespace
 
 std::unique_ptr<Transport> MakeClientTransport(std::string* reason) {
@@ -32,45 +33,29 @@ std::unique_ptr<Transport> MakeClientTransport(std::string* reason) {
   if (EnvTruthy("DFKV_RDMA")) {
     if (RdmaTransport::Available()) {  // native verbs (device-by-name, 400G)
       // Availability and construction both discover live HCAs. A link can drop
-      // between those probes, so construction failure must follow the same
-      // fail-closed/fallback policy instead of escaping through dfkv_open.
+      // between those probes, so construction failure is a hard error.
       try {
         auto transport = std::make_unique<RdmaTransport>();
         if (reason) *reason = "rdma";
         return transport;
       } catch (const std::exception&) {
-        // Fall through to the common policy below.
+        // Report the same failure policy below.
       }
     }
-    if (RequireRdma() || DeviceFilterConfigured()) {
-      if (reason) {
-        *reason = DeviceFilterConfigured()
-                      ? "rdma-configured-devices-not-active"
-                      : "rdma-required-but-no-active-device";
-      }
-      return nullptr;
+    if (reason) {
+      *reason = DeviceFilterConfigured()
+                    ? "rdma-configured-devices-not-active"
+                    : "rdma-requested-but-unavailable";
     }
-    if (reason) *reason = "tcp(rdma-requested-but-no-device)";
-    return std::make_unique<TcpTransport>();
-  }
-  if (RequireRdma()) {
-    if (reason) *reason = "rdma-required-but-DFKV_RDMA-not-set";
     return nullptr;
   }
   if (reason) *reason = "tcp(rdma-not-requested)";
 #else
-  if (EnvTruthy("DFKV_RDMA") && DeviceFilterConfigured()) {
-    if (reason) *reason = "rdma-configured-devices-but-rdma-not-built";
+  if (EnvTruthy("DFKV_RDMA")) {
+    if (reason) *reason = "rdma-requested-but-not-built";
     return nullptr;
   }
-  if (RequireRdma()) {
-    if (reason) {
-      *reason = EnvTruthy("DFKV_RDMA") ? "rdma-required-but-not-built"
-                                       : "rdma-required-but-DFKV_RDMA-not-set";
-    }
-    return nullptr;
-  }
-  if (reason) *reason = EnvTruthy("DFKV_RDMA") ? "tcp(rdma-not-built)" : "tcp";
+  if (reason) *reason = "tcp(rdma-not-requested)";
 #endif
   return std::make_unique<TcpTransport>();
 }

@@ -22,6 +22,7 @@ os.environ.setdefault("DFKV_CLIENT_NODE_DEDUP", "0")
 import ctypes  # noqa: E402
 import subprocess  # noqa: E402
 import tempfile  # noqa: E402
+import shutil  # noqa: E402
 
 import numpy as np  # noqa: E402
 
@@ -42,7 +43,23 @@ def _bare(**attrs):
     obj.pp_rank = 0
     obj.pp_size = 1
     obj.enable_pp = False
+    obj.pcp_size = 1
+    obj.pcp_rank = 0
+    obj.dcp_size = 1
+    obj.dcp_rank = 0
+    obj._device_direct_requested = False
+    obj._device_registration_failed = False
+    obj._registered_regions = set()
+    obj._pool_component_names = {
+        "indexer": ("all",),
+        "draft_indexer": ("all",),
+    }
+    obj._pool_replicated = {
+        "indexer": True,
+        "draft_indexer": True,
+    }
     obj._put_retry_recovered = 0
+    obj.transport_mode = "rdma"
     obj._backup_exist_gate = True
     for k, v in attrs.items():
         setattr(obj, k, v)
@@ -69,7 +86,11 @@ class TestFlattenDevice(unittest.TestCase):
         seg_sizes = [[100, 100, 100], [100, 100, 100]]
         sub, sks, sp, ss = obj._flatten_device(keys, seg_ptrs, seg_sizes)
         self.assertEqual(sub, 1)
-        self.assertEqual(sks, ["m/h0_k@sg0", "m/h1_k@sg0"])
+        self.assertEqual(
+            sks,
+            [obj._sg_group_key(obj._keys("h0")[0], 0),
+             obj._sg_group_key(obj._keys("h1")[0], 0)],
+        )
         self.assertEqual(sp, [[10, 11, 12], [20, 21, 22]])
         self.assertEqual(ss, [[100, 100, 100], [100, 100, 100]])
 
@@ -80,7 +101,11 @@ class TestFlattenDevice(unittest.TestCase):
         seg_sizes = [[8, 8], [8, 8]]
         sub, sks, sp, ss = obj._flatten_device(keys, seg_ptrs, seg_sizes)
         self.assertEqual(sub, 2)
-        self.assertEqual(sks, ["m/h0_2_1_k@sg0", "m/h0_2_1_v@sg0"])
+        self.assertEqual(
+            sks,
+            [obj._sg_group_key(obj._keys("h0")[0], 0),
+             obj._sg_group_key(obj._keys("h0")[1], 0)],
+        )
         self.assertEqual(sp, [[1, 2], [3, 4]])
 
     def test_chunk_split_when_width_below_layers(self):
@@ -91,7 +116,10 @@ class TestFlattenDevice(unittest.TestCase):
         seg_sizes = [[1, 2, 3, 4, 5]]
         sub, sks, sp, ss = obj._flatten_device(["h0"], seg_ptrs, seg_sizes)
         self.assertEqual(sub, 3)
-        self.assertEqual(sks, ["m/h0_k@sg0", "m/h0_k@sg1", "m/h0_k@sg2"])
+        self.assertEqual(
+            sks,
+            [obj._sg_group_key(obj._keys("h0")[0], i) for i in range(3)],
+        )
         self.assertEqual(sp, [[10, 11], [12, 13], [14]])
         self.assertEqual(ss, [[1, 2], [3, 4], [5]])
 
@@ -143,6 +171,15 @@ class TestSupportsDeviceTransfer(unittest.TestCase):
         obj = _bare(cfg={"layer_num": 32}, _lib=FakeLib(max_segs=32), _h=1)
         self.assertTrue(obj.supports_device_transfer())
 
+    def test_declined_on_tcp_even_with_sg_symbols(self):
+        obj = _bare(
+            cfg={"layer_num": 32},
+            _lib=FakeLib(max_segs=32),
+            _h=1,
+            transport_mode="tcp",
+        )
+        self.assertFalse(obj.supports_device_transfer())
+
     def test_chunked_when_width_too_small(self):
         # Narrow HCA no longer declines: pages chunk into @sg{n} sub-keys.
         obj = _bare(cfg={"layer_num": 61}, _lib=FakeLib(max_segs=29), _h=1)
@@ -165,6 +202,35 @@ class TestSupportsDeviceTransfer(unittest.TestCase):
     def test_declined_without_layer_num(self):
         obj = _bare(cfg={}, _lib=FakeLib(), _h=1)
         self.assertFalse(obj.supports_device_transfer())
+
+    def test_required_mr_failure_raises_and_revokes_capability(self):
+        obj = _bare(
+            cfg={"layer_num": 4},
+            _lib=FakeLib(max_segs=4),
+            _h=1,
+            _device_direct_requested=True,
+        )
+        obj.register_memory = lambda _base, _size: False
+        self.assertTrue(obj.supports_device_transfer())
+        with self.assertRaisesRegex(
+                RuntimeError, "required primary GPU MR registration failed"):
+            obj._register_device_regions(lambda: [(0x1000, 4096)], "primary")
+        self.assertTrue(obj._device_registration_failed)
+        self.assertFalse(obj.supports_device_transfer())
+
+    def test_optional_registration_failure_stays_best_effort(self):
+        obj = _bare(
+            cfg={"layer_num": 4},
+            _lib=FakeLib(max_segs=4),
+            _h=1,
+        )
+        obj.register_memory = lambda _base, _size: False
+        self.assertEqual(
+            obj._register_device_regions(lambda: [(0x1000, 4096)], "optional"),
+            0,
+        )
+        self.assertFalse(obj._device_registration_failed)
+        self.assertTrue(obj.supports_device_transfer())
 
 
 class TestBatchGetV1DeviceFold(unittest.TestCase):
@@ -388,6 +454,7 @@ class TestDeviceDirectEndToEnd(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.procs = []
+        cls.dirs = []
 
     @classmethod
     def tearDownClass(cls):
@@ -397,6 +464,8 @@ class TestDeviceDirectEndToEnd(unittest.TestCase):
                 p.wait(timeout=5)
             except Exception:
                 p.kill()
+        for d in cls.dirs:
+            shutil.rmtree(d, ignore_errors=True)
 
     def _node(self, tag):
         d = tempfile.mkdtemp(prefix=f"dfkv_dd_{tag}_")
@@ -406,6 +475,7 @@ class TestDeviceDirectEndToEnd(unittest.TestCase):
         line = p.stdout.readline().strip()
         assert line.startswith("PORT "), f"bad server greeting: {line!r}"
         self.procs.append(p)
+        self.dirs.append(d)
         return f"{tag}=127.0.0.1:{int(line.split()[1])}"
 
     def _plugin(self, members):
@@ -413,11 +483,15 @@ class TestDeviceDirectEndToEnd(unittest.TestCase):
             tp_rank=0, tp_size=1, is_mla_model=True, is_page_first_layout=False,
             model_name="dd-mla", pp_rank=0, pp_size=1,
             extra_config={
-                "members": members, "model_hash": 0x51, "dtype_tag": 0,
+                "members": members, "dtype_tag": 0,
                 "page_size": self.PAGE_SIZE, "layer_num": self.LAYER_NUM,
                 "head_num": 1, "head_dim": self.KV_DIM, "interface_v1": 1,
             })
-        return dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+        st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+        if not st.supports_device_transfer():
+            self.skipTest(
+                f"device-direct requires RDMA; transport={st.transport_mode}")
+        return st
 
     def test_sg_write_stores_layer_major_blob(self):
         st = self._plugin(self._node("dd"))
@@ -432,14 +506,15 @@ class TestDeviceDirectEndToEnd(unittest.TestCase):
         res = st.batch_set_v1_device([page_hash], device_indices)
         self.assertEqual(res, [True])
 
-        # Read the stored blob back contiguously (what the stock host get does).
-        # Device-direct sub-keys carry the "@sg{n}" chunk suffix; LAYER_NUM=3
-        # fits one chunk on this fake lib, so the whole page is under @sg0.
-        sk = st._keys(page_hash)[0] + "@sg0"
+        # Read the stored blob back contiguously using the exact binary SG key.
+        sk = st._sg_group_key(st._keys(page_hash)[0], 0)
         cap = self.LAYER_NUM * self.PAGE_SIZE * self.KV_DIM
         buf = ctypes.create_string_buffer(cap)
-        rc = st._lib.dfkv_get(st._h, sk.encode(), ctypes.cast(buf, ctypes.c_void_p),
-                              ctypes.c_uint64(cap))
+        key_ptr, key_owner = dfkv_hicache.make_key_buffer(sk)
+        rc = st._lib.dfkv_get(
+            st._h, key_ptr, ctypes.c_uint64(len(sk)),
+            ctypes.cast(buf, ctypes.c_void_p), ctypes.c_uint64(cap))
+        del key_owner
         self.assertEqual(rc, 1, "device-direct page must be retrievable")
         blob = bytes(buf.raw[:cap])
 
@@ -580,18 +655,19 @@ class TestDeviceDirectEndToEnd(unittest.TestCase):
         so they never overwrite each other: main KV under the @sg-chunked v1-style
         'kv' keys, the indexer under its own '_indexer_k' key. A cross-namespace
         collision would corrupt one component."""
-        st = self._plugin(self._node("dsakeys"))
+        st = _bare(is_mla=True, tp_size=1, tp_rank=0, pp_rank=0, pp_size=1,
+                   enable_pp=False, model="m")
         h = "feedface"
-        kv_sub = st._keys(h)[0] + "@sg0"          # device-direct main KV sub-key
+        kv_sub = st._sg_group_key(st._keys(h)[0], 0)
         side_sub = st._pool_keys("indexer", h)[0]  # host v2 indexer sub-key
         self.assertNotEqual(kv_sub, side_sub)
-        self.assertNotIn("indexer", kv_sub)
-        self.assertIn("indexer", side_sub)
+        self.assertNotIn(b"indexer", kv_sub)
+        self.assertIn(b"indexer", side_sub)
         # Task 4: the device-direct sidecar stores an "@sg0"-chunked indexer key —
         # still its own namespace, distinct from the main KV.
-        side_sub_dev = st._pool_keys("indexer", h)[0] + "@sg0"
+        side_sub_dev = st._sg_group_key(st._pool_keys("indexer", h)[0], 0)
         self.assertNotEqual(kv_sub, side_sub_dev)
-        self.assertIn("indexer", side_sub_dev)
+        self.assertIn(b"indexer", side_sub_dev)
 
     # Task 4: DSA split-value with the indexer sidecar ALSO device-direct.
     SIDE_DEV_BYTES = 6  # indexer page-row bytes (page_size * indexer bytes/token-ish)
@@ -708,11 +784,22 @@ class TestDeviceDirectEndToEnd(unittest.TestCase):
         st = _bare(is_mla=True, tp_size=2, tp_rank=1, pp_rank=0, pp_size=1,
                    enable_pp=False, model="m")
         h = "abc123"
-        self.assertNotIn(".draft", st._keys(h)[0])
+        self.assertNotEqual(st._keys(h)[0], st._draft_keys(h, 1)[0])
         mla_draft = st._draft_keys(h, 1)
-        self.assertEqual(mla_draft, ["m/abc123.draft_k"])
+        self.assertEqual(
+            mla_draft,
+            [dfkv_hicache.pool_key(
+                h, pool="draft", tp_size=2, tp_rank=-1,
+                pp_size=1, pp_rank=0, component="all")],
+        )
         mha_draft = st._draft_keys(h, 2)
-        self.assertEqual(mha_draft, ["m/abc123.draft_2_1_k", "m/abc123.draft_2_1_v"])
+        self.assertEqual(
+            mha_draft,
+            [dfkv_hicache.pool_key(
+                 h, pool="draft", tp_size=2, tp_rank=1,
+                 pp_size=1, pp_rank=0, component=component)
+             for component in ("k", "v")],
+        )
 
     # DSA draft (GLM-5.2 MTP): draft main latent + draft indexer sidecar, both device.
     def test_dsa_draft_device_direct_latent_and_indexer_roundtrip(self):
@@ -795,7 +882,12 @@ class TestDeviceDirectEndToEnd(unittest.TestCase):
         st = _bare(is_mla=True, tp_size=1, tp_rank=0, pp_rank=0, pp_size=1,
                    enable_pp=False, model="m")
         h = "abc123"
-        self.assertEqual(st._pool_keys("draft_indexer", h), ["m/abc123_draft_indexer_k"])
+        self.assertEqual(
+            st._pool_keys("draft_indexer", h),
+            [dfkv_hicache.pool_key(
+                h, pool="draft_indexer", tp_size=1, tp_rank=-1,
+                pp_size=1, pp_rank=0, component="all")],
+        )
         self.assertNotEqual(st._pool_keys("draft_indexer", h), st._draft_keys(h, 1))
         self.assertNotEqual(st._pool_keys("draft_indexer", h), st._pool_keys("indexer", h))
 

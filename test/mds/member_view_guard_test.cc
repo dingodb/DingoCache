@@ -4,6 +4,8 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
+
 using dfkv::MemberViewGuard;
 
 TEST(MemberViewGuard, FirstViewAdoptedAsIs) {
@@ -73,4 +75,42 @@ TEST(MemberViewGuard, EmptyThenShrunkenRecoveryIsNotDoubleCounted) {
   EXPECT_FALSE(g.Admit(20));  // partial recovery: shrink hysteresis
   EXPECT_FALSE(g.Admit(20));
   EXPECT_TRUE(g.Admit(20));   // persisted partial view adopted
+}
+
+TEST(MemberViewGuard, OddAndSmallRingsUseExactPercentage) {
+  MemberViewGuard three(3, 50);
+  EXPECT_TRUE(three.Admit(3));
+  EXPECT_FALSE(three.Admit(1)) << "3->1 drops more than 50%";
+  EXPECT_FALSE(three.Admit(1));
+  EXPECT_TRUE(three.Admit(1));
+
+  MemberViewGuard five(3, 50);
+  EXPECT_TRUE(five.Admit(5));
+  EXPECT_FALSE(five.Admit(2)) << "5->2 retains only 40%";
+
+  MemberViewGuard boundary(3, 50);
+  EXPECT_TRUE(boundary.Admit(2));
+  EXPECT_TRUE(boundary.Admit(1)) << "exactly 50% shrink is not over threshold";
+}
+
+TEST(MemberViewGuard, NonHalfBoundaryIsExact) {
+  MemberViewGuard boundary(3, 33);
+  EXPECT_TRUE(boundary.Admit(100));
+  EXPECT_TRUE(boundary.Admit(67)) << "exactly 33% shrink is not over threshold";
+
+  MemberViewGuard odd(3, 34);
+  EXPECT_TRUE(odd.Admit(3));
+  EXPECT_TRUE(odd.Admit(2));
+  EXPECT_FALSE(odd.Admit(1));
+}
+
+TEST(MemberViewGuard, CrossMultiplicationDoesNotOverflowSizeT) {
+  const size_t max = std::numeric_limits<size_t>::max();
+  MemberViewGuard guarded(3, 50);
+  EXPECT_TRUE(guarded.Admit(max));
+  EXPECT_FALSE(guarded.Admit(max / 2));
+
+  MemberViewGuard boundary(3, 50);
+  EXPECT_TRUE(boundary.Admit(max - 1));
+  EXPECT_TRUE(boundary.Admit((max - 1) / 2));
 }

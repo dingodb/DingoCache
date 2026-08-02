@@ -8,7 +8,6 @@ Run: python3 -m unittest test_determinism_guard  (from this directory)
 """
 
 import importlib.util
-import os
 import pathlib
 import types
 import unittest
@@ -30,39 +29,21 @@ def _cfg(algo):
 
 
 class DeterminismGuardTest(unittest.TestCase):
-    def setUp(self):
-        self._saved = os.environ.get("PYTHONHASHSEED")
 
-    def tearDown(self):
-        if self._saved is None:
-            os.environ.pop("PYTHONHASHSEED", None)
-        else:
-            os.environ["PYTHONHASHSEED"] = self._saved
+    def test_builtin_raises(self):
+        with self.assertRaisesRegex(RuntimeError, "sha256"):
+            ensure_deterministic_block_hashing(_cfg("builtin"))
 
-    def test_builtin_without_seed_raises(self):
-        os.environ.pop("PYTHONHASHSEED", None)
+    def test_builtin_rejects_pinned_python_seed(self):
         with self.assertRaisesRegex(RuntimeError, "PYTHONHASHSEED"):
             ensure_deterministic_block_hashing(_cfg("builtin"))
 
-    def test_builtin_with_seed_random_raises(self):
-        os.environ["PYTHONHASHSEED"] = "random"
-        with self.assertRaises(RuntimeError):
-            ensure_deterministic_block_hashing(_cfg("builtin"))
-
-    def test_builtin_with_pinned_seed_passes(self):
-        os.environ["PYTHONHASHSEED"] = "0"
-        ensure_deterministic_block_hashing(_cfg("builtin"))
-        os.environ["PYTHONHASHSEED"] = "42"
-        ensure_deterministic_block_hashing(_cfg("builtin"))
-
-    def test_sha256_family_passes_without_seed(self):
-        os.environ.pop("PYTHONHASHSEED", None)
+    def test_sha256_family_passes(self):
         ensure_deterministic_block_hashing(_cfg("sha256"))
         ensure_deterministic_block_hashing(_cfg("sha256_cbor_64bit"))
 
     def test_enum_like_algo_value_passes(self):
         # vLLM may hand an enum whose str() embeds the name.
-        os.environ.pop("PYTHONHASHSEED", None)
 
         class Algo:
             def __str__(self):
@@ -71,7 +52,6 @@ class DeterminismGuardTest(unittest.TestCase):
         ensure_deterministic_block_hashing(_cfg(Algo()))
 
     def test_missing_attr_defaults_to_builtin(self):
-        os.environ.pop("PYTHONHASHSEED", None)
         with self.assertRaises(RuntimeError):
             ensure_deterministic_block_hashing(types.SimpleNamespace())
 

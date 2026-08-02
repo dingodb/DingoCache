@@ -26,8 +26,11 @@ implementation, and deployment guide.
 make lib                       # -> ../../build-rdma/libdfkv.so
 export DFKV_LIB=$(pwd)/../../build-rdma/libdfkv.so
 
-# 2) Install the connector into the same venv as vLLM + LMCache.
-make install                   # or: make install-dev   (editable)
+# 2) Install the exact local dfkv-common dependency and connector into the same
+#    venv as vLLM + LMCache.
+python -m pip install ../common .
+# Editable development install:
+# python -m pip install -e ../common -e .
 ```
 
 ## Configure LMCache (plugin mode)
@@ -43,6 +46,8 @@ extra_config:
   remote_storage_plugin.dfkv.url:         dfkv://<mds_ip:port,...>/<group>
   remote_storage_plugin.dfkv.membership:  mds            # or "static"
   remote_storage_plugin.dfkv.lib:         /path/to/libdfkv.so
+  # Optional explicit schema override; normally omit
+  remote_storage_plugin.dfkv.key_namespace: <coordinated-schema-override>
 ```
 
 - **mds membership** (default): the URL host part is a comma-separated list of
@@ -74,7 +79,8 @@ lmcache server --port 6555 --max-workers 8 --l1-size-gb 80 \
       "url":"dfkv://<mds_ip:port,...>/<group>",
       "membership":"mds",
       "lib":"/path/to/libdfkv.so",
-      "model_name":"<deployment-name>"}}'
+      "model_name":"<exact-model-or-deployment-identity>",
+      "key_namespace":"<optional-coordinated-schema-override>"}}'
 
 # 2) Point vLLM at the MP server (NOTE: --no-enable-prefix-caching routes all
 #    KV reuse through LMCache):
@@ -84,19 +90,45 @@ vllm serve <model> --tensor-parallel-size 8 --no-enable-prefix-caching \
 ```
 
 `adapter_params` keys: `url` (required, same grammar as in-process),
-`membership` (`mds`|`static`), `lib` (else `DFKV_LIB`), `model_name`
-(isolation namespace → stable dfkv `model_hash`), `mds_poll_ms` (3000),
-`page_size` (0 = geometry guard off), `num_workers` (8), `max_capacity_gb`
-(0 = dfkv manages its own capacity; >0 enables aggregate L2 eviction),
-`mla_canonical_keys` (bool, default false): MLA-only opt-in — folds the
-kv_rank rank fields so replicated KV shares one key and stores are
-deduped with an exists probe (fixes the 8x storage/write inflation;
-MLA+PP=1 deployments only — enabling under a sharded or PP model would
-collapse distinct content; flipping later = cold cache; or env
-`DFKV_L2ADAPTER_MLA_CANONICAL_KEYS=1`). The
-server's pinned L1 arena is auto-registered for RDMA zero-copy when LMCache
-passes an `l1_memory_desc`. Validated on GLM-5.2 (vLLM 0.23.0 + LMCache 0.4.7):
+`membership` (`mds`|`static`), `lib` (else `DFKV_LIB`), required `model_name`
+(MP-server does not supply runtime model metadata), optional `key_namespace`
+(explicit schema override), `mds_poll_ms` (3000), `num_workers` (8),
+`max_capacity_gb` (0 = dfkv manages capacity; >0 enables aggregate L2
+eviction), and `mla_canonical_keys` (bool, default false). The latter is an
+MLA+PP=1-only opt-in: it marks replicated kv_rank coordinates as shared and
+deduplicates stores with an exists probe. Enabling it for sharded/PP KV aliases
+different content; changing it later produces a cold cache. The equivalent env
+is `DFKV_L2ADAPTER_MLA_CANONICAL_KEYS=1`.
+The server's pinned L1 arena is auto-registered for RDMA zero-copy when LMCache
+passes an `l1_memory_desc`. Only `dfkv_register_memory` return code `0` counts
+as registered; any native MR rejection fails startup instead of silently using
+the arena. Validated on GLM-5.2 (vLLM 0.23.0 + LMCache 0.4.7):
 store → restart (L1 wiped) → reload from dfkv with prefill skipped.
+
+## Identity and raw-value contract
+
+The in-process path gets the exact `model_name` from LMCache runtime metadata;
+the MP-server path gets it from `adapter_params`. With no override, the binary
+namespace binds that identity to `lmcache/raw-v1`. `key_namespace` selects a
+separate explicit namespace and should include a coordinated schema revision.
+
+Object keys use the shared self-delimiting binary form: `DFKVPOOL\x02`,
+uint32-LE length-framed pool/hash, fixed uint32-size/int32-rank pairs for
+DP/TP/PCP/DCP/PP, uint32 group, and a length-framed component. Fields may
+contain NUL, delimiters, and non-UTF-8 bytes. SG users append `DFKVSG\x02` plus
+uint32-LE width/group. The namespace is separate binary identity.
+
+All scalar calls pass `(key pointer, exact uint64 length)` and batch calls keep
+parallel pointer/length arrays aligned and alive through native return. There
+is no C-string truncation, text decode/re-encode, delimiter/Python-hash
+identity, or legacy ABI fallback.
+
+dfkv stores exactly the LMCache chunk bytes and returns the stored length
+separately; it adds no geometry/dtype envelope. A namespace or object-key
+difference is a cold miss. Reusing the same namespace+key for a different
+dtype, chunk shape, serialization order, or layout is operator error: publish
+a new schema `key_namespace`. Cross-runtime sharing additionally requires
+byte-compatible object keys and payloads.
 
 ## Environment variables
 
