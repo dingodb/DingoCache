@@ -1,30 +1,61 @@
-/* Portable KV types mirroring dingofs BlockKey identity/layout (no brpc deps).
- * In the real build the SDK adapts these to the production DingoFS BlockKey; the Filename()/
- * StoreKey() formats match src/common/block/block_key.h. */
+/* Portable KV identity shared by clients, transports, RAM, and disk stores.
+ * Native identity is a full 128-bit digest. Compatibility frontends map their
+ * legacy tuples into the same width but retain an isolated KeyDomain.
+ */
 #ifndef DFKV_KV_TYPES_H_
 #define DFKV_KV_TYPES_H_
 
 #include <cstdint>
+#include <cstdio>
 #include <string>
 
 namespace dfkv {
 
+enum class KeyDomain : uint32_t {
+  kNative = 0,
+  kSgEngineV1 = 1,
+};
+
 struct BlockKey {
-  uint64_t id = 0;
-  uint32_t index = 0;
-  uint32_t size = 0;
+  uint64_t digest_hi = 0;
+  uint64_t digest_lo = 0;
+  KeyDomain domain = KeyDomain::kNative;
+
+  static std::string Hex64(uint64_t value) {
+    char out[17];
+    std::snprintf(out, sizeof(out), "%016llx",
+                  static_cast<unsigned long long>(value));
+    return std::string(out, 16);
+  }
+
+  std::string DigestHex() const {
+    return Hex64(digest_hi) + Hex64(digest_lo);
+  }
 
   std::string Filename() const {
-    return std::to_string(id) + "_" + std::to_string(index) + "_" +
-           std::to_string(size);
+    const std::string native = DigestHex();
+    if (domain == KeyDomain::kNative) return native;
+    if (domain == KeyDomain::kSgEngineV1) return "sgengine-v1_" + native;
+    return "domain-" + std::to_string(static_cast<uint32_t>(domain)) + "_" +
+           native;
   }
-  // blocks/{id/1e6}/{id/1e3}/{filename} — matches dingofs StoreKey buckets.
+
   std::string StoreKey() const {
-    return "blocks/" + std::to_string(id / 1000000) + "/" +
-           std::to_string(id / 1000) + "/" + Filename();
+    const std::string digest = DigestHex();
+    const std::string buckets = digest.substr(0, 2) + "/" +
+                                digest.substr(0, 4) + "/";
+    if (domain == KeyDomain::kNative)
+      return "blocks/" + buckets + Filename();
+    if (domain == KeyDomain::kSgEngineV1)
+      return "compat/sgengine-v1/blocks/" + buckets + Filename();
+    return "compat/domain-" +
+           std::to_string(static_cast<uint32_t>(domain)) + "/blocks/" +
+           buckets + Filename();
   }
-  bool operator==(const BlockKey& o) const {
-    return id == o.id && index == o.index && size == o.size;
+
+  bool operator==(const BlockKey& other) const {
+    return digest_hi == other.digest_hi && digest_lo == other.digest_lo &&
+           domain == other.domain;
   }
 };
 

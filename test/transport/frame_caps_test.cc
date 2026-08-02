@@ -33,7 +33,7 @@ bool ServerDropsOversizeFrame(int port, uint64_t payload_len) {
   int fd = net::Dial("127.0.0.1:" + std::to_string(port), 2000, 2000);
   if (fd < 0) return false;
   char prefix[kReqPrefix];
-  EncodeReq(prefix, WireOp::kCache, BlockKey{1, 2, 3}, 0, 0, payload_len);
+  EncodeReq(prefix, WireOp::kCache, BlockKey{1, 2}, 0, 0, payload_len);
   if (!net::WriteAll(fd, prefix, kReqPrefix)) { ::close(fd); return false; }
   char c;
   ssize_t r = ::recv(fd, &c, 1, 0);  // 0 = orderly close, <0 = timeout/err
@@ -103,10 +103,10 @@ TEST(FrameCaps, KvNodeServerDropsOversizeRequestAndStaysAlive) {
   TcpTransport t;
   std::string node = "127.0.0.1:" + std::to_string(srv.port());
   std::string blob(1024, 'x');
-  EXPECT_EQ(t.Cache(node, BlockKey{7, 0, 1}, blob.data(), blob.size()),
+  EXPECT_EQ(t.Cache(node, BlockKey{7, 0}, blob.data(), blob.size()),
             Status::kOk);
   bool exist = false;
-  EXPECT_EQ(t.Exist(node, BlockKey{7, 0, 1}, &exist), Status::kOk);
+  EXPECT_EQ(t.Exist(node, BlockKey{7, 0}, &exist), Status::kOk);
   EXPECT_TRUE(exist);
   srv.Stop();
   fs::remove_all(dir);
@@ -140,7 +140,7 @@ TEST(FrameCaps, ClientRejectsOversizeStatusResponse) {
   std::string node = "127.0.0.1:" + std::to_string(fake.port());
   bool exist = false;
   // Status-only op: a peer declaring an 8 GiB body is a protocol violation.
-  EXPECT_EQ(t.Exist(node, BlockKey{1, 0, 1}, &exist), Status::kIOError);
+  EXPECT_EQ(t.Exist(node, BlockKey{1, 0}, &exist), Status::kIOError);
 }
 
 TEST(FrameCaps, ClientRejectsRangeResponseLargerThanAsked) {
@@ -148,7 +148,7 @@ TEST(FrameCaps, ClientRejectsRangeResponseLargerThanAsked) {
   TcpTransport t;
   std::string node = "127.0.0.1:" + std::to_string(fake.port());
   std::string out;
-  EXPECT_EQ(t.Range(node, BlockKey{1, 0, 1}, 0, 4096, &out), Status::kIOError);
+  EXPECT_EQ(t.Range(node, BlockKey{1, 0}, 0, 4096, &out), Status::kIOError);
 }
 
 TEST(FrameCaps, PollerRejectsOversizeMemberList) {

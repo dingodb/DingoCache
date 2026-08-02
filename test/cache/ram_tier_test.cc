@@ -21,7 +21,7 @@ using dfkv::RamTier;
 using namespace std::chrono_literals;
 
 namespace {
-BlockKey K(uint64_t id) { return BlockKey{id, 0, 1}; }
+BlockKey K(uint64_t id) { return BlockKey{id, 0}; }
 
 // A controllable flush sink: records flushed keys, can be gated (block until
 // opened) and can be made to fail.
@@ -315,7 +315,10 @@ TEST(RamTier, BatchFlushDrainsQueueAndRetriesPerItem) {
     batch_sizes.push_back(items.size());
     std::vector<bool> ok(items.size(), true);
     for (size_t i = 0; i < items.size(); ++i)
-      if (fail_key >= 0 && items[i].key.id == static_cast<uint64_t>(fail_key.load())) ok[i] = false;
+      if (fail_key >= 0 &&
+          items[i].key.digest_hi ==
+              static_cast<uint64_t>(fail_key.load()))
+        ok[i] = false;
     return ok;
   });
   ASSERT_TRUE(rt.ok());

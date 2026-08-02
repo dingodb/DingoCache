@@ -140,8 +140,8 @@ class KVStore : public StoreEngine {
   // block-freeing unlink is deferred to `*trash`, which the caller drains AFTER
   // releasing the lock so an eviction storm can't stall concurrent GETs.
   void EvictLocked(Shard& sh, std::vector<std::string>* trash);  // CLOCK 2nd-chance
-  void ForceEvictLocked(Shard& sh, uint64_t target,
-                        std::vector<std::string>* trash);  // ENOSPC self-heal
+  uint64_t ForceEvictLocked(Shard& sh, uint64_t target,
+                            std::vector<std::string>* trash);
   std::string RenameToTrash(const std::string& path);  // fast in-lock; unlink deferred
   bool RebuildIndex();
 

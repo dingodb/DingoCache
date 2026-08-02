@@ -2,6 +2,7 @@
 // Covers data-path semantics, restart warmth, crash/torn-record handling,
 // strict startup geometry, fail-closed metadata I/O, and reclaimer safety.
 #include "cache/disk_slab_store.h"
+#include "compat/sgengine_key_adapter.h"
 
 #include <gtest/gtest.h>
 #include <fcntl.h>
@@ -91,7 +92,7 @@ class DiskSlabTest : public ::testing::Test {
   }
   fs::path dir_;
 };
-BlockKey K(uint64_t id) { return BlockKey{id, 0, 1}; }
+BlockKey K(uint64_t id) { return BlockKey{id, 0}; }
 }  // namespace
 
 TEST_F(DiskSlabTest, PutGetRemoveRoundTrip) {
@@ -190,6 +191,32 @@ TEST_F(DiskSlabTest, RestartRebuildsIndexKeepingWarmth) {
     ASSERT_EQ(s2.Range(K(1000 + i), 0, vals[i].size(), &out), Status::kOk) << i;
     EXPECT_EQ(out, vals[i]) << i;
   }
+}
+
+TEST_F(DiskSlabTest, CompatibilityDomainSurvivesRestartWithoutNativeAlias) {
+  const BlockKey native{4242, (uint64_t{4096} << 32) | 9};
+  const BlockKey legacy = dfkv::compat::SgEngineV1Key(4242, 9, 4096);
+  const std::string native_value(3000, 'n');
+  const std::string legacy_value(3000, 'l');
+  {
+    bool ok = false;
+    DiskSlabStore store(Opts(1 << 20, 1 << 20, 4096), &ok);
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(store.Cache(native, native_value.data(), native_value.size()),
+              Status::kOk);
+    ASSERT_EQ(store.Cache(legacy, legacy_value.data(), legacy_value.size()),
+              Status::kOk);
+  }
+
+  bool ok = false;
+  DiskSlabStore reopened(Opts(1 << 20, 1 << 20, 4096), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(reopened.TableRebuilt(), 2u);
+  std::string out;
+  ASSERT_EQ(reopened.Range(native, 0, 0, &out), Status::kOk);
+  EXPECT_EQ(out, native_value);
+  ASSERT_EQ(reopened.Range(legacy, 0, 0, &out), Status::kOk);
+  EXPECT_EQ(out, legacy_value);
 }
 
 TEST_F(DiskSlabTest, TornTableRecordReadsAsFreeNotResurrected) {

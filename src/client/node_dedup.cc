@@ -16,7 +16,7 @@
 namespace dfkv {
 
 namespace {
-constexpr uint32_t kMagic = 0x44445632u;  // "DDV2" (v2: identity = key+kind)
+constexpr uint32_t kMagic = 0x44445633u;  // "DDV3" (128-bit identity)
 constexpr uint32_t kStateEmpty = 0;
 constexpr uint32_t kStateFetching = 1;
 constexpr uint32_t kStateReady = 2;
@@ -43,13 +43,14 @@ struct NodeDedup::Slot {
   std::atomic<uint64_t> gen;
   std::atomic<uint32_t> state;
   uint32_t len;                        // payload byte count (attribute, not identity)
-  uint64_t key_id;
-  uint32_t key_index;
+  uint64_t key_hi;
+  uint64_t key_lo;
   uint32_t kind;                       // Kind: data vs exist namespace
+  uint32_t pad;
   std::atomic<uint64_t> fetch_start_ms;
   uint64_t payload_off;                // absolute offset into the arena
   uint64_t alloc_seq;                  // arena cursor value at allocation (lap check)
-  uint64_t pad1;                       // -> 64 B (cache line / cross-process ABI)
+  // exactly 64 B (cache line / cross-process ABI)
 };
 
 struct NodeDedup::Header {
@@ -74,7 +75,7 @@ std::string NodeDedup::EnvSegmentName(uint64_t model_hash) {
   // a rolling upgrade, then the old segment ages out with its processes.
   // uid-scoped so unrelated users on one host can't share (or collide on) a
   // segment; model_hash separates keyspaces (same salting as the block keys).
-  std::snprintf(name, sizeof(name), "/dfkv-dedup-v2-%u-%016llx", ::getuid(),
+  std::snprintf(name, sizeof(name), "/dfkv-dedup-v3-%u-%016llx", ::getuid(),
                 static_cast<unsigned long long>(model_hash));
   return name;
 }
@@ -175,12 +176,13 @@ NodeDedup::~NodeDedup() {
 
 NodeDedup::Slot* NodeDedup::Find(const BlockKey& key, Kind kind) const {
   const uint32_t mask = nslots_ - 1;
-  uint32_t idx = static_cast<uint32_t>(key.id ^ (key.id >> 32) ^ key.index ^
-                                       (static_cast<uint32_t>(kind) << 13)) & mask;
+  uint32_t idx = static_cast<uint32_t>(
+      key.digest_hi ^ (key.digest_hi >> 32) ^ key.digest_lo ^
+      (key.digest_lo >> 32) ^ (static_cast<uint32_t>(kind) << 13)) & mask;
   for (int probe = 0; probe < 8; ++probe, idx = (idx + 1) & mask) {
     Slot& s = slots_[idx];
     if (s.state.load(std::memory_order_acquire) == kStateEmpty) continue;
-    if (s.key_id == key.id && s.key_index == key.index &&
+    if (s.key_hi == key.digest_hi && s.key_lo == key.digest_lo &&
         s.kind == static_cast<uint32_t>(kind))
       return &s;
   }
@@ -190,8 +192,9 @@ NodeDedup::Slot* NodeDedup::Find(const BlockKey& key, Kind kind) const {
 NodeDedup::Slot* NodeDedup::Reserve(const BlockKey& key, Kind kind) {
   const uint64_t now = NowMs();
   const uint32_t mask = nslots_ - 1;
-  uint32_t idx = static_cast<uint32_t>(key.id ^ (key.id >> 32) ^ key.index ^
-                                       (static_cast<uint32_t>(kind) << 13)) & mask;
+  uint32_t idx = static_cast<uint32_t>(
+      key.digest_hi ^ (key.digest_hi >> 32) ^ key.digest_lo ^
+      (key.digest_lo >> 32) ^ (static_cast<uint32_t>(kind) << 13)) & mask;
   for (int probe = 0; probe < 8; ++probe, idx = (idx + 1) & mask) {
     Slot& s = slots_[idx];
     uint32_t st = s.state.load(std::memory_order_acquire);
@@ -209,8 +212,8 @@ NodeDedup::Slot* NodeDedup::Reserve(const BlockKey& key, Kind kind) {
     // Slot reserved: mutate identity under an odd generation so a concurrent
     // Find/CopyOut on the OLD occupant tears predictably (gen mismatch).
     s.gen.fetch_add(1, std::memory_order_acq_rel);  // -> odd
-    s.key_id = key.id;
-    s.key_index = key.index;
+    s.key_hi = key.digest_hi;
+    s.key_lo = key.digest_lo;
     s.kind = static_cast<uint32_t>(kind);
     s.len = 0;
     s.payload_off = 0;

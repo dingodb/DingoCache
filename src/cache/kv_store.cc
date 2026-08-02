@@ -280,9 +280,16 @@ bool KVStore::RebuildIndex() {  // constructor-time, single-threaded: no locks
       orphans.push_back(it->path());
       continue;
     }
-    if (*rel.begin() != fs::path("blocks")) {
+    const std::string rel_text = rel.generic_string();
+    const bool native_layout =
+        rel_text == "blocks" || rel_text.rfind("blocks/", 0) == 0;
+    const bool compatibility_layout =
+        rel_text == "compat" || rel_text == "compat/sgengine-v1" ||
+        rel_text == "compat/sgengine-v1/blocks" ||
+        rel_text.rfind("compat/sgengine-v1/blocks/", 0) == 0;
+    if (!native_layout && !compatibility_layout) {
       startup_error_ =
-          "cache directory contains a different store layout: " + rel.string();
+          "cache directory contains a different store layout: " + rel_text;
       return false;
     }
     if (!regular) {
@@ -386,18 +393,17 @@ void KVStore::EvictLocked(Shard& sh, std::vector<std::string>* trash) {
   }
 }
 
-// Reclaim at least `target` bytes from this shard regardless of the capacity
-// watermark, for the ENOSPC self-heal path: the disk filled before the logical
-// capacity did (tmp/FS-metadata overhead, a shared-disk tenant), so a normal
-// capacity-triggered eviction never fires and every PUT would fail forever.
-// Same CLOCK mechanics as EvictLocked; bounded by a full ring sweep so it
-// terminates even if `target` exceeds what the shard holds. Exclusive lock held.
-void KVStore::ForceEvictLocked(Shard& sh, uint64_t target,
-                               std::vector<std::string>* trash) {
+// Reclaim up to `target` bytes from one shard regardless of the capacity
+// watermark, for the ENOSPC self-heal path. Unlike normal capacity eviction,
+// this may remove a shard's last entry: ENOSPC is filesystem-wide and retaining
+// one object per shard can otherwise prevent any space from being reclaimed.
+// Returns the logical bytes detached; the caller drains `trash` after unlocking.
+uint64_t KVStore::ForceEvictLocked(Shard& sh, uint64_t target,
+                                   std::vector<std::string>* trash) {
   uint64_t freed = 0;
   size_t swept = 0;
   const size_t budget = 3 * sh.ring.size() + 4;  // bounded sweep (progress guarantee)
-  while (freed < target && sh.ring.size() > 1 && swept++ < budget) {
+  while (freed < target && !sh.ring.empty() && swept++ < budget) {
     if (sh.hand == sh.ring.end()) sh.hand = std::prev(sh.ring.end());
     auto cur = sh.hand;
     auto it = sh.index.find(*cur);
@@ -417,6 +423,7 @@ void KVStore::ForceEvictLocked(Shard& sh, uint64_t target,
     sh.ring.erase(cur);
     sh.index.erase(it);
   }
+  return freed;
 }
 
 Status KVStore::Cache(const BlockKey& key, const void* data, size_t len) {
@@ -443,16 +450,31 @@ Status KVStore::Cache(const BlockKey& key, const void* data, size_t len) {
   };
   fs::path tmp;
   int werr = 0;
+  std::vector<std::string> trash;
   if (!write_tmp(&tmp, &werr)) {
     fs::remove(tmp, ec);
     // ENOSPC self-heal: the disk filled before logical capacity did (tmp/FS
     // overhead / shared-disk tenant), so capacity-triggered eviction never
     // fires and PUTs would fail forever. Force-evict this shard and retry once.
     if (werr == ENOSPC) {
-      std::vector<std::string> trash;
-      { std::lock_guard<std::shared_mutex> wl(sh.mu);
-        ForceEvictLocked(sh, std::max<uint64_t>(2 * len, 64ull << 20), &trash); }
-      for (auto& t : trash) { std::error_code e2; fs::remove(t, e2); }  // off-lock
+      uint64_t remaining = std::max<uint64_t>(2 * len, 64ull << 20);
+      {
+        std::lock_guard<std::shared_mutex> wl(sh.mu);
+        const uint64_t freed = ForceEvictLocked(sh, remaining, &trash);
+        remaining = freed >= remaining ? 0 : remaining - freed;
+      }
+      for (const auto& candidate : shards_) {
+        if (remaining == 0) break;
+        if (candidate.get() == &sh) continue;
+        std::lock_guard<std::shared_mutex> wl(candidate->mu);
+        const uint64_t freed =
+            ForceEvictLocked(*candidate, remaining, &trash);
+        remaining = freed >= remaining ? 0 : remaining - freed;
+      }
+      for (auto& t : trash) {
+        std::error_code e2;
+        fs::remove(t, e2);
+      }
       werr = 0;
       if (!write_tmp(&tmp, &werr)) { fs::remove(tmp, ec); return Status::kIOError; }
       enospc_evictions_.fetch_add(1, std::memory_order_relaxed);
@@ -460,7 +482,6 @@ Status KVStore::Cache(const BlockKey& key, const void* data, size_t len) {
       return Status::kIOError;
     }
   }
-  std::vector<std::string> trash;
   {
     std::lock_guard<std::shared_mutex> wl(sh.mu);  // exclusive
     if (sh.index.count(fname)) { fs::remove(tmp, ec); return Status::kOk; }  // lost the race; keep first

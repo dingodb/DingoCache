@@ -20,11 +20,10 @@
 namespace dfkv {
 
 namespace {
-constexpr uint32_t kMagic = 0x44444731u;  // "DDG1"
+constexpr uint32_t kMagic = 0x44444732u;  // "DDG2" (128-bit identity)
 constexpr uint32_t kStateEmpty = 0;
 constexpr uint32_t kStateFetching = 1;
 constexpr uint32_t kStateReady = 2;
-constexpr uint32_t kKindData = 1;  // single namespace (exist rides the host segment)
 
 uint64_t EnvU64(const char* name, uint64_t dflt) {
   const char* v = std::getenv(name);
@@ -51,9 +50,8 @@ struct GpuNodeDedup::Slot {
   std::atomic<uint64_t> gen;
   std::atomic<uint32_t> state;
   uint32_t len;
-  uint64_t key_id;
-  uint32_t key_index;
-  uint32_t kind;
+  uint64_t key_hi;
+  uint64_t key_lo;
   std::atomic<uint64_t> fetch_start_ms;
   uint64_t payload_off;   // offset into the OWNER's GPU arena
   uint64_t alloc_seq;     // owner's arena cursor value at allocation (lap check)
@@ -98,7 +96,7 @@ std::string GpuNodeDedup::EnvSegmentName(uint64_t model_hash) {
   char name[128];
   // Layout version FIRST in the name (v1.23.0 lesson, see node_dedup.h):
   // a layout bump must never meet a segment an older lib left behind.
-  std::snprintf(name, sizeof(name), "/dfkv-dedup-gpuv1-%u-%016llx", ::getuid(),
+  std::snprintf(name, sizeof(name), "/dfkv-dedup-gpuv2-%u-%016llx", ::getuid(),
                 static_cast<unsigned long long>(model_hash));
   return name;
 }
@@ -276,12 +274,13 @@ CUstream GpuNodeDedup::Stream() {
 
 GpuNodeDedup::Slot* GpuNodeDedup::Find(const BlockKey& key) const {
   const uint32_t mask = nslots_ - 1;
-  uint32_t idx = static_cast<uint32_t>(key.id ^ (key.id >> 32) ^ key.index) & mask;
+  uint32_t idx = static_cast<uint32_t>(
+      key.digest_hi ^ (key.digest_hi >> 32) ^ key.digest_lo ^
+      (key.digest_lo >> 32)) & mask;
   for (int probe = 0; probe < 8; ++probe, idx = (idx + 1) & mask) {
     Slot& s = slots_[idx];
     if (s.state.load(std::memory_order_acquire) == kStateEmpty) continue;
-    if (s.key_id == key.id && s.key_index == key.index && s.kind == kKindData)
-      return &s;
+    if (s.key_hi == key.digest_hi && s.key_lo == key.digest_lo) return &s;
   }
   return nullptr;
 }
@@ -289,7 +288,9 @@ GpuNodeDedup::Slot* GpuNodeDedup::Find(const BlockKey& key) const {
 GpuNodeDedup::Slot* GpuNodeDedup::Reserve(const BlockKey& key) {
   const uint64_t now = NowMs();
   const uint32_t mask = nslots_ - 1;
-  uint32_t idx = static_cast<uint32_t>(key.id ^ (key.id >> 32) ^ key.index) & mask;
+  uint32_t idx = static_cast<uint32_t>(
+      key.digest_hi ^ (key.digest_hi >> 32) ^ key.digest_lo ^
+      (key.digest_lo >> 32)) & mask;
   for (int probe = 0; probe < 8; ++probe, idx = (idx + 1) & mask) {
     Slot& s = slots_[idx];
     uint32_t st = s.state.load(std::memory_order_acquire);
@@ -305,9 +306,8 @@ GpuNodeDedup::Slot* GpuNodeDedup::Reserve(const BlockKey& key) {
     }
     if (!claim) continue;
     s.gen.fetch_add(1, std::memory_order_acq_rel);  // odd: mutating identity
-    s.key_id = key.id;
-    s.key_index = key.index;
-    s.kind = kKindData;
+    s.key_hi = key.digest_hi;
+    s.key_lo = key.digest_lo;
     s.len = 0;
     s.payload_off = 0;
     s.alloc_seq = 0;

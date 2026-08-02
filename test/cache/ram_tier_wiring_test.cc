@@ -186,8 +186,9 @@ TEST(RamTierWiring, PutAdmissionGateRejectsWithCacheFull) {
       char* buf = static_cast<char*>(mem);
       std::memset(buf, 'a' + t, 4 << 20);
       for (int i = 0; i < N; ++i) {
-        Status st = s->CacheDirect(1000 + t * N + i, 0, 1, buf,
-                                   4 << 20, 4 << 20);
+        Status st = s->CacheDirectForKey(
+            BlockKey{static_cast<uint64_t>(1000 + t * N + i), 0}, buf,
+            4 << 20, 4 << 20);
         if (st == Status::kOk) ok.fetch_add(1);
         else if (st == Status::kCacheFull) busy.fetch_add(1);
         else other.fetch_add(1);
@@ -228,13 +229,13 @@ TEST(RamTierWiring, UringPrepPathCountsRamMisses) {
   // RAM-resident: prep declines so the serve loop falls back to the arena.
   // Consulted-and-present is NOT a miss.
   const long miss0 = MetricVal(s->MetricsText(), "dfkv_ram_miss_total");
-  EXPECT_EQ(s->RangeDirectPrep(rk.id, rk.index, rk.size, 0, v.size(), 1 << 20, &prep),
+  EXPECT_EQ(s->RangeDirectPrepForKey(rk, 0, v.size(), 1 << 20, &prep),
             Status::kInvalid);
   EXPECT_EQ(MetricVal(s->MetricsText(), "dfkv_ram_miss_total"), miss0);
 
   // Absent everywhere: RAM consulted and absent -> exactly one RAM miss,
   // regardless of the disk outcome (kNotFound here).
-  EXPECT_EQ(s->RangeDirectPrep(ak.id, ak.index, ak.size, 0, 16, 1 << 20, &prep),
+  EXPECT_EQ(s->RangeDirectPrepForKey(ak, 0, 16, 1 << 20, &prep),
             Status::kNotFound);
   EXPECT_EQ(MetricVal(s->MetricsText(), "dfkv_ram_miss_total"), miss0 + 1);
 

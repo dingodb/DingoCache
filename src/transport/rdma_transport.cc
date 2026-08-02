@@ -125,10 +125,10 @@ bool RunWindow(rdma::RcEndpoint& ep, const std::vector<size_t>& slen,
 
 struct RdmaTransport::Conn {
   rdma::RcEndpoint ep;
-  uint8_t protocol_version = kProtoVersionV1;
+  uint8_t protocol_version = kNativeProtoBase;
   rdma::RecvSegmentInfo recv_segment;
 
-  bool v2() const { return protocol_version == kProtoVersionV2; }
+  bool v2() const { return protocol_version == kNativeProtoRdmaV2; }
   void Encode(char* out, WireOp op, const BlockKey& key, uint64_t offset,
               uint64_t length, uint64_t payload_len) const {
     EncodeReqVersion(out, protocol_version, op, key, offset, length,
@@ -280,7 +280,7 @@ RdmaTransport::Conn* RdmaTransport::Acquire(const std::string& node, Lane lane,
   }
   if (pooled) {
     pooled->ep.EnsurePoolMrs(
-        pools, pooled->protocol_version == kProtoVersionV2);
+        pools, pooled->protocol_version == kNativeProtoRdmaV2);
     *from_pool = true;
     return pooled;
   }
@@ -375,7 +375,9 @@ RdmaTransport::Conn* RdmaTransport::Acquire(const std::string& node, Lane lane,
       }
     }
     ::close(fd);
-    conn->protocol_version = expected;
+    // Bootstrap/QP capability numbers remain 1/2; wire identity epochs are 3/4.
+    conn->protocol_version =
+        protocol_v2 ? kNativeProtoRdmaV2 : kNativeProtoBase;
     conn->ep.EnsurePoolMrs(pools, protocol_v2);
     return conn;
   };
@@ -399,7 +401,7 @@ RdmaTransport::Conn* RdmaTransport::Acquire(const std::string& node, Lane lane,
   }
 
   conns_opened_.fetch_add(1, std::memory_order_relaxed);
-  if (conn->protocol_version == kProtoVersionV2)
+  if (conn->protocol_version == kNativeProtoRdmaV2)
     v2_conns_opened_.fetch_add(1, std::memory_order_relaxed);
   else
     v1_conns_opened_.fetch_add(1, std::memory_order_relaxed);
