@@ -341,16 +341,58 @@ JSON 中保留每个 MDS 的 ring epoch、完整成员自报和每节点 registr
 [METRICS.md](METRICS.md)。etcd gateway 和 MDS 都是无鉴权内网接口，巡检机只开
 只读网络访问，不向公网暴露。
 
-### 4e. F10 clean epoch cutover warning
+### 4e. F10 clean-epoch cutover and rollback boundary
 
-Tenant identity changes all persistent and transport identity: native TCP epoch
-6, RDMA epoch 7, 50-byte request prefix, 48-hex file names, and slab format v3.
-There is no old wire/disk decoder, dual write, or cache migration. **Do not put
-old and new servers in one client-visible ring during a rolling upgrade.**
-Create an isolated candidate MDS group/ports, start v3 nodes on empty cache
-directories, verify them, then move a compatible client cohort atomically.
-Drain the old group afterwards. A per-node rolling restart is safe only after
-every client that can route to that node speaks the new epochs.
+Tenant identity changes every persistent and transport boundary: native TCP
+epoch 6, RDMA epoch 7, the 50-byte request prefix, 48-hex file names, and slab
+format v3. There is no old wire/disk decoder, dual write, or cache migration.
+Old and v2 servers therefore **must never share a client-visible ring**.
+
+Hard invariants:
+
+- Give the candidate distinct MDS endpoints/group, cache/RAM directories,
+  service names, data ports, and metrics ports. Never start v2 against an old
+  cache directory, and never clear or rewrite that directory in place.
+- Switch a drained, compatible client cohort as one unit: connector package,
+  `libdfkv.so`, namespace/layout code, and MDS/member endpoints. A mixed client
+  artifact can speak the wrong epoch even if its endpoint is correct.
+- Keep the old binaries, unit files, endpoint configuration, and cache
+  directories unchanged until the rollback window closes. Cache data is
+  disposable operationally, but deleting it destroys the only fast rollback.
+
+Cutover procedure:
+
+1. Record the old binary/package hashes, unit files, environment, MDS group,
+   endpoints, ring/client snapshots, and cache directories. Freeze changes to
+   that cohort for the duration of the cutover.
+2. Allocate candidate-only endpoints and **new, initially empty directories**.
+   Start candidate etcd/MDS/server services without stopping the old group.
+3. Pass `/readyz`, ring/client audit, TCP and RDMA byte-roundtrip, connector
+   cold-write/restart-hot-read, and output-correctness gates against only the
+   candidate group. A format rejection or unexpected old object is a hard stop.
+4. Drain one compatible client cohort, atomically replace its complete client
+   artifact/config, point it at the candidate group, then restart it. Do not
+   make old and candidate endpoints simultaneous failover peers.
+5. Observe readiness, errors, miss/refill convergence, output equality, and
+   registered-client membership. Promote further cohorts only after the
+   observation window passes.
+6. Drain and stop the old cohort only after every routable client has moved.
+   Retain its stopped services and directories through the rollback window.
+
+Rollback trigger and procedure:
+
+1. Trigger rollback on protocol/format rejection, byte mismatch, inference
+   output mismatch, persistent readiness loss, or a breached load/error gate.
+2. Stop new requests to the affected cohort and drain/terminate its candidate
+   clients. Do not route an old client to v2 or a v2 client to the old group.
+3. Restore the old connector, `libdfkv.so`, namespace code, and old endpoints
+   together; restart the old services if they were stopped. Verify their saved
+   hashes, ring, registered clients, and an old-format hot read.
+4. Stop only the isolated candidate services. Preserve their directories,
+   logs, audit artifacts, and etcd prefix for diagnosis; never copy v3
+   files/slab metadata into the old directories.
+5. After the retention decision, move the retired cohort to an archive path.
+   Directory reuse always means a new empty path, never an in-place downgrade.
 
 ## 5. 上线顺序 + 冒烟（无需 GPU）
 
@@ -400,13 +442,19 @@ deploy/dfkv_load_regression.py \
 或 baseline 本身错误率越界时 fail closed（退出 `1`）；candidate 越阈值退出 `3`；
 通过退出 `0`。无论通过、回归或运行错误，`--output` 都原子写 JSON artifact。
 
-## 6. 回滚（秒级）
-- RDMA v2 不提供协议内降级。需要回滚数据面时，停止受影响副本并显式切换到
-  TCP 或上一完整发行版；不要设置已删除的协议变量。
-- SGLang：`--hicache-storage-backend` 改回原后端（mooncake 等）重启该副本，与 dfkv 解耦。
-- dfkv 节点：`systemctl stop dfkv`；缓存可丢（KV 可重算），彻底清理删 `/mnt/diskX/dfkv`。
-- dfkv MDS：`systemctl stop dfkv_mds`；无状态，etcd 数据可保留也可清除（`etcdctl del /dfkv --prefix`）。
-- 全程不影响 dingo-cache / dingofs / 生产 MDS / 对象存储。
+## 6. 回滚（路由可秒级，数据面按 §4e 完整回切）
+
+- RDMA v2 没有协议内降级。切 TCP 仍是 v2 格式，不等于回到旧版本；回退上一发行版
+  必须把 client artifact、namespace code 和旧 endpoint/group 作为一个原子单元恢复。
+- 只要 §4e 要求的旧服务/目录仍保留，先摘 candidate client 流量，再恢复旧 client
+  配置并启动旧服务即可；不得把新旧 endpoint 放进同一 failover 列表。
+- SGLang 可将受控副本完整切回原 backend（如 Mooncake）并重启；先校验模型输出，
+  再恢复流量。
+- 停止使用 candidate 专属 unit（例如 `dfkv-v2-candidate-*`），不要执行模糊的
+  `systemctl stop dfkv*`，以免误停共机旧服务。
+- 保留 candidate cache 目录、etcd prefix、日志与验收 artifact 供定位；不执行
+  `rm -rf` 或 `etcdctl del --prefix`。确认退役后只迁入归档路径。
+- 全程不修改 dingo-cache / dingofs / 生产 MDS / 对象存储。
 
 ## 7. 监控 / 边界
 **完整指标/CLI 参考见 [METRICS.md](METRICS.md)。** 要点：
