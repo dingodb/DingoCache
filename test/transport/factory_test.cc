@@ -60,3 +60,18 @@ TEST(Factory, RequireRdmaRejectsImplicitTcpFallback) {
   EXPECT_EQ(t, nullptr);
   EXPECT_NE(reason.find("rdma-required"), std::string::npos) << reason;
 }
+
+TEST(Factory, ExplicitDeviceFilterNeverFallsBackToTcp) {
+  EnvSave save_require("DFKV_REQUIRE_RDMA");
+  EnvSave save_rdma("DFKV_RDMA");
+  EnvSave save_dev("DFKV_RDMA_DEV");
+  ::unsetenv("DFKV_REQUIRE_RDMA");
+  ::setenv("DFKV_RDMA", "1", 1);
+  ::setenv("DFKV_RDMA_DEV", "dfkv-no-such-rdma-device", 1);
+
+  std::string reason;
+  auto t = MakeClientTransport(&reason);
+  EXPECT_EQ(t, nullptr);
+  EXPECT_NE(reason.find("rdma-configured-devices"), std::string::npos)
+      << reason;
+}

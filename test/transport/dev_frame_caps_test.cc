@@ -1,4 +1,4 @@
-// DCP1 device-frame caps declaration: codec round-trip + every legacy /
+// DCP1/DCP2 device-frame capability declarations and every legacy /
 // degenerate shape an old peer can produce. Hermetic (no RDMA device).
 #include <gtest/gtest.h>
 
@@ -13,6 +13,30 @@ TEST(DevFrameCaps, RoundTrip) {
   EncodeDevFrame("ib7s400p0", 4u << 20, f);
   EXPECT_STREQ(f, "ib7s400p0");            // name intact for old servers
   EXPECT_EQ(ParseDevFrameCaps(f), 4u << 20);
+}
+
+TEST(DevFrameCaps, V2RoundTripAndLegacyName) {
+  char f[kDevNameBytes];
+  EncodeDevFrame("ib7s400p0", 4u << 20, f, kDevProtoV2);
+  EXPECT_STREQ(f, "ib7s400p0");
+  EXPECT_EQ(ParseDevFrameCaps(f), 4u << 20);
+  EXPECT_EQ(ParseDevFrameProtocol(f), kDevProtoV2);
+}
+
+TEST(DevFrameCaps, V2RequiresDeclarationAndTailRoom) {
+  char f[kDevNameBytes];
+  EncodeDevFrame("ib7s400p0", 0, f, kDevProtoV2);
+  EXPECT_EQ(ParseDevFrameProtocol(f), kDevProtoV1);
+
+  std::string too_long(19, 'x');
+  EncodeDevFrame(too_long, 4u << 20, f, kDevProtoV2);
+  EXPECT_EQ(ParseDevFrameCaps(f), 0u);
+  EXPECT_EQ(ParseDevFrameProtocol(f), kDevProtoV1);
+
+  std::string edge(18, 'y');
+  EncodeDevFrame(edge, 4u << 20, f, kDevProtoV2);
+  EXPECT_EQ(ParseDevFrameCaps(f), 4u << 20);
+  EXPECT_EQ(ParseDevFrameProtocol(f), kDevProtoV2);
 }
 
 TEST(DevFrameCaps, LegacyZeroTailParsesAsUndeclared) {

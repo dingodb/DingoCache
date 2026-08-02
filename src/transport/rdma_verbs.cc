@@ -1,4 +1,6 @@
 #include "transport/rdma_verbs.h"
+#include "transport/rdma_protocol.h"
+#include <arpa/inet.h>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -9,6 +11,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <random>
 #include <string>
@@ -35,7 +38,12 @@ namespace {
 // to any one connection, so it is registered ONCE per device and shared by all
 // endpoints — previously each new connection re-ran ibv_reg_mr over the whole
 // (tens-to-hundreds-of-GB) region, a registration storm at reconnect time.
-struct SharedPoolMr { uintptr_t base; size_t size; ibv_mr* mr; };
+struct SharedPoolMr {
+  uintptr_t base;
+  size_t size;
+  int access;
+  ibv_mr* mr;
+};
 struct SharedDevice {
   ibv_context* ctx;
   ibv_pd* pd;
@@ -77,7 +85,7 @@ std::pair<ibv_context*, ibv_pd*> AcquireSharedDevice(const char* dev_name) {
   if (!ctx) return {nullptr, nullptr};
   ibv_pd* pd = ibv_alloc_pd(ctx);
   if (!pd) { ibv_close_device(ctx); return {nullptr, nullptr}; }
-  g_devs.emplace(key, SharedDevice{ctx, pd, 1});
+  g_devs.emplace(key, SharedDevice{ctx, pd, 1, {}});
   return {ctx, pd};
 }
 
@@ -104,15 +112,19 @@ void ReleaseSharedDevice(ibv_context* ctx) {
 // lkey is valid for any QP on this PD, so callers may cache the pointer locally
 // for lock-free lookup. Only called at connection setup (not the datapath), so
 // taking g_dev_mu here is fine.
-ibv_mr* SharedAddPoolMr(ibv_context* ctx, ibv_pd* pd, void* base, size_t size) {
+ibv_mr* SharedAddPoolMr(ibv_context* ctx, ibv_pd* pd, void* base, size_t size,
+                        int access) {
   auto b = reinterpret_cast<uintptr_t>(base);
   std::lock_guard<std::mutex> lk(g_dev_mu);
   for (auto& d : g_devs) {
     if (d.second.ctx != ctx) continue;
-    for (const auto& p : d.second.pool_mrs)
-      if (p.base == b && p.size >= size) return p.mr;  // already registered on this PD
+    for (const auto& p : d.second.pool_mrs) {
+      if (p.base == b && p.size >= size && (p.access & access) == access) {
+        return p.mr;
+      }
+    }
     const auto t0 = std::chrono::steady_clock::now();
-    ibv_mr* mr = ibv_reg_mr(pd, base, size, IBV_ACCESS_LOCAL_WRITE);
+    ibv_mr* mr = ibv_reg_mr(pd, base, size, access);
     if (!mr) return nullptr;
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - t0).count();
@@ -123,11 +135,11 @@ ibv_mr* SharedAddPoolMr(ibv_context* ctx, ibv_pd* pd, void* base, size_t size) {
     if (ms > 100)
       DFKV_LOG_INFO("pool MR registered: " + std::to_string(size >> 20) +
                     " MiB in " + std::to_string(ms) + " ms");
-    g_pool_mr_regs.fetch_add(1, std::memory_order_relaxed);  // one actual registration
-    d.second.pool_mrs.push_back(SharedPoolMr{b, size, mr});
+    g_pool_mr_regs.fetch_add(1, std::memory_order_relaxed);
+    d.second.pool_mrs.push_back(SharedPoolMr{b, size, access, mr});
     return mr;
   }
-  return nullptr;  // device not found (shouldn't happen for a live endpoint)
+  return nullptr;
 }
 }  // namespace
 
@@ -158,9 +170,10 @@ void SerializeQpInfo(const QpInfo& in, char out[kQpInfoBytes]) {
   net::PutU32(out + 4, in.psn);
   std::memcpy(out + 8, &in.lid, 2);   // host LE; both ends x86_64
   std::memcpy(out + 10, in.gid, 16);
-  if (in.depth > 0) {                 // depth advertisement rides the pad (DPQ1)
+  if (in.depth > 0 || in.protocol_version >= 2) {
     net::PutU32(out + 26, kQpDepthMagic);
-    const uint16_t d = in.depth;
+    uint16_t d = in.depth;
+    if (in.protocol_version >= 2) d |= 0x8000u;
     std::memcpy(out + 30, &d, 2);
   }
 }
@@ -175,7 +188,11 @@ QpInfo ParseQpInfo(const char in[kQpInfoBytes]) {
   if (net::GetU32(in + 26) == kQpDepthMagic) {
     uint16_t d = 0;
     std::memcpy(&d, in + 30, 2);
-    if (d >= 1 && d <= 256) q.depth = d;  // out-of-range = treat as absent
+    if ((d & 0x8000u) != 0) {
+      q.protocol_version = 2;
+      d &= 0x7FFFu;
+    }
+    if (d >= 1 && d <= 256) q.depth = d;
   }
   return q;
 }
@@ -190,6 +207,8 @@ void RcEndpoint::Close() {
   for (auto& [addr, e] : user_mr_) if (e.first) ibv_dereg_mr(e.first);
   user_mr_.clear();
   user_lru_.clear();
+  for (auto* mr : transient_mr_) if (mr) ibv_dereg_mr(mr);
+  transient_mr_.clear();
   // pool_mr_ holds SHARED, PD-owned MRs (SharedAddPoolMr); the SharedDevice
   // frees them on the last device ref (ReleaseSharedDevice). Just drop the local
   // lookup cache — do NOT dereg here (that would free an MR other live endpoints
@@ -210,8 +229,9 @@ void RcEndpoint::Close() {
   if (wake_wfd_ >= 0) { ::close(wake_wfd_); wake_wfd_ = -1; }
 }
 
-bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib_port,
-                      bool direct_io_buffers, size_t direct_io_cap) {
+bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
+                      uint8_t ib_port, bool direct_io_buffers,
+                      size_t direct_io_cap, bool v2_responder) {
   cap_ = cap; depth_ = depth; ib_port_ = ib_port;
 
   int wp[2];
@@ -239,14 +259,16 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib
   // header; the rest carry payload segments for the scatter-gather datapath. The
   // legacy [hdr | payload] path only ever uses 2, so raising the cap is additive.
   max_sge_ = 2;
+  uint32_t max_qp_wr = 0;
   {
     ibv_device_attr dev_attr{};
     if (ibv_query_device(ctx_, &dev_attr) == 0 && dev_attr.max_sge > 0) {
-      size_t cap_sge = static_cast<size_t>(dev_attr.max_sge);
+      const size_t cap_sge = static_cast<size_t>(dev_attr.max_sge);
       max_sge_ = std::min(kMaxSge, cap_sge);
       if (max_sge_ < 2) max_sge_ = 2;
+      max_qp_wr = dev_attr.max_qp_wr;
     } else {
-      max_sge_ = kMaxSge;  // query failed: trust the documented device cap
+      max_sge_ = kMaxSge;  // query failed: let ibv_create_qp validate the caps
     }
   }
   // The ad-hoc MR cache must never evict an MR another slot of the SAME window
@@ -258,14 +280,35 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib
   // and on the RECV side a completion scattering into freed memory.
   user_mr_cap_ = std::max(kMinUserMr, depth_ * max_sge_);
 
+  // A v2 server GET may chain one unsignaled RDMA WRITE per protocol target
+  // plus one signaled status SEND. Target count is fleet-wide and independent
+  // of either HCA's max_sge because every WRITE itself has one SGE.
+  static_assert(kV2MaxGetTargets == kMaxSge - 1);
+  const size_t wr_per_slot =
+      v2_responder ? kV2MaxGetTargets + 1 : 1;
+  if (depth_ > (std::numeric_limits<uint32_t>::max() - 1) / wr_per_slot) {
+    DFKV_LOG_ERROR("rdma: requested send queue depth overflows uint32");
+    Close();
+    return false;
+  }
+  const uint32_t send_wr =
+      static_cast<uint32_t>(depth_ * wr_per_slot + 1);
+  if (max_qp_wr != 0 && send_wr > max_qp_wr) {
+    DFKV_LOG_ERROR("rdma: required send WRs " + std::to_string(send_wr) +
+                   " exceed device max_qp_wr " +
+                   std::to_string(max_qp_wr));
+    Close();
+    return false;
+  }
   ibv_qp_init_attr qa{};
-  qa.send_cq = cq_; qa.recv_cq = cq_;
-  qa.cap.max_send_wr = static_cast<uint32_t>(depth_ + 1);
+  qa.send_cq = cq_;
+  qa.recv_cq = cq_;
+  qa.cap.max_send_wr = send_wr;
   qa.cap.max_recv_wr = static_cast<uint32_t>(depth_ + 1);
   qa.cap.max_send_sge = static_cast<uint32_t>(max_sge_);  // SGE0=hdr, rest=payload segs
   qa.cap.max_recv_sge = static_cast<uint32_t>(max_sge_);
   qa.qp_type = IBV_QPT_RC;
-  qa.sq_sig_all = 1;
+  qa.sq_sig_all = 0;
   qp_ = ibv_create_qp(pd_, &qa);
   if (!qp_) { Close(); return false; }
 
@@ -308,7 +351,7 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib
   at.qp_state = IBV_QPS_INIT;
   at.pkey_index = 0;
   at.port_num = ib_port_;
-  at.qp_access_flags = IBV_ACCESS_LOCAL_WRITE;
+  at.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
   if (ibv_modify_qp(qp_, &at,
         IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) != 0) {
     Close(); return false;
@@ -447,29 +490,48 @@ bool RcEndpoint::PostSend(size_t slot, size_t len) {
   return ibv_post_send(qp_, &wr, &bad) == 0;
 }
 
-bool RcEndpoint::AddPoolMr(void* base, size_t size) {
-  auto b = reinterpret_cast<uintptr_t>(base);
-  for (const auto& p : pool_mr_) if (p.base == b) return true;  // local cache hit
+bool RcEndpoint::AddPoolMr(void* base, size_t size, bool remote_write) {
+  const auto b = reinterpret_cast<uintptr_t>(base);
+  const int access = IBV_ACCESS_LOCAL_WRITE |
+                     (remote_write ? IBV_ACCESS_REMOTE_WRITE : 0);
+  for (const auto& p : pool_mr_) {
+    if (p.base == b && p.size >= size && (p.access & access) == access)
+      return true;
+  }
   // Register on the shared PD (deduped across all endpoints on this device), then
   // cache the (shared) MR locally so the datapath RegisterUser lookup stays
-  // lock-free. The MR is owned by the SharedDevice and freed on the last ref, so
-  // this endpoint must NOT dereg it in Close().
-  ibv_mr* mr = SharedAddPoolMr(ctx_, pd_, base, size);
+  // lock-free. New entries go first: an access upgrade for an already-covered
+  // range must win over the older LOCAL_WRITE-only entry.
+  ibv_mr* mr = SharedAddPoolMr(ctx_, pd_, base, size, access);
   if (!mr) return false;
-  pool_mr_.push_back(PoolMr{b, size, mr});
+  pool_mr_.insert(pool_mr_.begin(), PoolMr{b, size, access, mr});
   return true;
 }
 
-void RcEndpoint::EnsurePoolMrs(const std::vector<std::pair<void*, size_t>>& regions) {
-  for (const auto& [base, size] : regions) AddPoolMr(base, size);
+void RcEndpoint::EnsurePoolMrs(
+    const std::vector<std::pair<void*, size_t>>& regions, bool remote_write) {
+  for (const auto& [base, size] : regions) AddPoolMr(base, size, remote_write);
+}
+
+ibv_mr* RcEndpoint::RegisterRemoteRegion(void* base, size_t size) {
+  const int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
+  if (!AddPoolMr(base, size, /*remote_write=*/true)) return nullptr;
+  const auto b = reinterpret_cast<uintptr_t>(base);
+  for (const auto& p : pool_mr_) {
+    if (p.base == b && p.size >= size && (p.access & access) == access)
+      return p.mr;
+  }
+  return nullptr;
 }
 
 ibv_mr* RcEndpoint::RegisterUser(void* addr, size_t len) {
   // Fast path: addr fully inside a pre-registered pool region -> reuse its MR
   // (the SGE uses `addr` with this MR's lkey; valid anywhere in the MR's range).
-  auto a = reinterpret_cast<uintptr_t>(addr);
-  for (const auto& p : pool_mr_)
-    if (a >= p.base && a + len <= p.base + p.size) return p.mr;
+  const auto a = reinterpret_cast<uintptr_t>(addr);
+  for (const auto& p : pool_mr_) {
+    if (a >= p.base && len <= p.size && a - p.base <= p.size - len)
+      return p.mr;
+  }
 
   auto key = reinterpret_cast<uintptr_t>(addr);
   auto it = user_mr_.find(key);
@@ -490,13 +552,43 @@ ibv_mr* RcEndpoint::RegisterUser(void* addr, size_t len) {
     if (vit != user_mr_.end()) { ibv_dereg_mr(vit->second.first); user_mr_.erase(vit); }
     user_lru_.pop_back();
   }
-  ibv_mr* mr = ibv_reg_mr(pd_, addr, len, IBV_ACCESS_LOCAL_WRITE);
+  ibv_mr* mr = ibv_reg_mr(
+      pd_, addr, len, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
   if (mr) {
     g_adhoc_user_mr.fetch_add(1, std::memory_order_relaxed);  // out-of-pool: should be 0 in prod
     user_lru_.push_front(key);
     user_mr_[key] = {mr, user_lru_.begin()};
   }
   return mr;
+}
+
+ibv_mr* RcEndpoint::RegisterTransient(void* addr, size_t len,
+                                      bool remote_write) {
+  if (!addr || len == 0) return nullptr;
+  const auto a = reinterpret_cast<uintptr_t>(addr);
+  const int access = remote_write
+                         ? IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE
+                         : 0;
+  for (const auto& p : pool_mr_) {
+    if (a >= p.base && len <= p.size && a - p.base <= p.size - len &&
+        (p.access & access) == access) {
+      return p.mr;
+    }
+  }
+  ibv_mr* mr = ibv_reg_mr(pd_, addr, len, access);
+  if (mr) {
+    transient_mr_.push_back(mr);
+    g_adhoc_user_mr.fetch_add(1, std::memory_order_relaxed);
+  }
+  return mr;
+}
+
+void RcEndpoint::ReleaseTransient(ibv_mr* mr) {
+  if (!mr) return;
+  const auto it = std::find(transient_mr_.begin(), transient_mr_.end(), mr);
+  if (it == transient_mr_.end()) return;
+  ibv_dereg_mr(mr);
+  transient_mr_.erase(it);
 }
 
 bool RcEndpoint::PostSendScatter(size_t slot, size_t hdr_len, const void* payload,
@@ -576,6 +668,113 @@ bool RcEndpoint::PostRecvScatterMulti(
   wr.wr_id = slot; wr.sg_list = sge.data();
   wr.num_sge = static_cast<int>(sge.size());
   return ibv_post_recv(qp_, &wr, &bad) == 0;
+}
+
+bool RcEndpoint::PostWrite(size_t slot, const void* source, size_t length,
+                           ibv_mr* source_mr, uint64_t remote_addr,
+                           uint32_t remote_rkey) {
+  if (slot >= depth_ || length > std::numeric_limits<uint32_t>::max() ||
+      (length != 0 && (!source || !source_mr)) ||
+      remote_addr == 0 || remote_rkey == 0) {
+    return false;
+  }
+  ibv_sge sge{};
+  sge.addr = reinterpret_cast<uintptr_t>(source);
+  sge.length = static_cast<uint32_t>(length);
+  sge.lkey = length ? source_mr->lkey : 0;
+  ibv_send_wr wr{}, *bad = nullptr;
+  wr.wr_id = slot;
+  wr.sg_list = &sge;
+  wr.num_sge = length ? 1 : 0;
+  wr.opcode = IBV_WR_RDMA_WRITE;
+  wr.send_flags = 0;
+  wr.wr.rdma.remote_addr = remote_addr;
+  wr.wr.rdma.rkey = remote_rkey;
+  return ibv_post_send(qp_, &wr, &bad) == 0;
+}
+
+bool RcEndpoint::PostWriteImm(size_t slot, size_t length,
+                              uint64_t remote_addr, uint32_t remote_rkey,
+                              uint32_t immediate) {
+  if (slot >= depth_ || length > cap_ ||
+      length > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+  ibv_sge sge{};
+  sge.addr = reinterpret_cast<uintptr_t>(sbuf_[slot]);
+  sge.length = static_cast<uint32_t>(length);
+  sge.lkey = smr_[slot]->lkey;
+  ibv_send_wr wr{}, *bad = nullptr;
+  wr.wr_id = slot;
+  wr.sg_list = &sge;
+  wr.num_sge = 1;
+  wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+  wr.send_flags = IBV_SEND_SIGNALED;
+  wr.imm_data = htonl(immediate);
+  wr.wr.rdma.remote_addr = remote_addr;
+  wr.wr.rdma.rkey = remote_rkey;
+  return ibv_post_send(qp_, &wr, &bad) == 0;
+}
+
+bool RcEndpoint::PostWriteImmScatter(
+    size_t slot, size_t header_len, const void* payload, size_t payload_len,
+    ibv_mr* payload_mr, uint64_t remote_addr, uint32_t remote_rkey,
+    uint32_t immediate) {
+  if (slot >= depth_ || header_len > cap_ ||
+      header_len > std::numeric_limits<uint32_t>::max() ||
+      payload_len > std::numeric_limits<uint32_t>::max() ||
+      (payload_len != 0 && (!payload || !payload_mr))) {
+    return false;
+  }
+  ibv_sge sge[2]{};
+  sge[0].addr = reinterpret_cast<uintptr_t>(sbuf_[slot]);
+  sge[0].length = static_cast<uint32_t>(header_len);
+  sge[0].lkey = smr_[slot]->lkey;
+  sge[1].addr = reinterpret_cast<uintptr_t>(payload);
+  sge[1].length = static_cast<uint32_t>(payload_len);
+  sge[1].lkey = payload_len ? payload_mr->lkey : 0;
+  ibv_send_wr wr{}, *bad = nullptr;
+  wr.wr_id = slot;
+  wr.sg_list = sge;
+  wr.num_sge = payload_len ? 2 : 1;
+  wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+  wr.send_flags = IBV_SEND_SIGNALED;
+  wr.imm_data = htonl(immediate);
+  wr.wr.rdma.remote_addr = remote_addr;
+  wr.wr.rdma.rkey = remote_rkey;
+  return ibv_post_send(qp_, &wr, &bad) == 0;
+}
+
+bool RcEndpoint::PostWriteImmScatterMulti(
+    size_t slot, size_t header_len,
+    const std::vector<std::pair<const void*, uint32_t>>& segs,
+    const std::vector<ibv_mr*>& mrs, uint64_t remote_addr,
+    uint32_t remote_rkey, uint32_t immediate) {
+  if (slot >= depth_ || segs.size() != mrs.size() ||
+      1 + segs.size() > max_sge_ || header_len > cap_ ||
+      header_len > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+  std::vector<ibv_sge> sge(1 + segs.size());
+  sge[0].addr = reinterpret_cast<uintptr_t>(sbuf_[slot]);
+  sge[0].length = static_cast<uint32_t>(header_len);
+  sge[0].lkey = smr_[slot]->lkey;
+  for (size_t i = 0; i < segs.size(); ++i) {
+    if (segs[i].second != 0 && (!segs[i].first || !mrs[i])) return false;
+    sge[i + 1].addr = reinterpret_cast<uintptr_t>(segs[i].first);
+    sge[i + 1].length = segs[i].second;
+    sge[i + 1].lkey = segs[i].second ? mrs[i]->lkey : 0;
+  }
+  ibv_send_wr wr{}, *bad = nullptr;
+  wr.wr_id = slot;
+  wr.sg_list = sge.data();
+  wr.num_sge = static_cast<int>(sge.size());
+  wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+  wr.send_flags = IBV_SEND_SIGNALED;
+  wr.imm_data = htonl(immediate);
+  wr.wr.rdma.remote_addr = remote_addr;
+  wr.wr.rdma.rkey = remote_rkey;
+  return ibv_post_send(qp_, &wr, &bad) == 0;
 }
 
 int RcEndpoint::WaitComp(ibv_wc* out, int max, int timeout_ms) {

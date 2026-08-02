@@ -55,6 +55,7 @@ struct QpInfo {
   uint8_t gid[16] = {0};
   uint8_t pad[6] = {0};
   uint16_t depth = 0;  // not a standalone wire field: rides the pad (see above)
+  uint8_t protocol_version = 1;  // v2 is encoded in the depth field's high bit
 };
 constexpr size_t kQpInfoBytes = 32;
 constexpr uint32_t kQpDepthMagic = 0x31515044u;  // ASCII DPQ1 (LE)
@@ -91,13 +92,16 @@ class RcEndpoint {
   RcEndpoint& operator=(const RcEndpoint&) = delete;
 
   // Open device `dev_name` (nullptr/"" = first device), create RC QP in INIT,
-  // allocate+register `depth` send & recv buffers of `cap` bytes. When
+  // allocate+register `depth` send and receive buffers of `cap` bytes. When
   // direct_io_buffers is true, also allocate one 4096-aligned registered buffer
   // per slot for O_DIRECT reads/writes that are scatter-transferred without a
   // payload copy. direct_io_cap lets that buffer be larger than the ordinary
-  // control send/recv buffers.
+  // control buffers. v2_responder reserves enough SQ WRs for a server to chain
+  // several one-sided GET writes before its signaled status SEND; client and v1
+  // endpoints retain the legacy depth+1 SQ geometry.
   bool Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib_port = 1,
-            bool direct_io_buffers = false, size_t direct_io_cap = 0);
+            bool direct_io_buffers = false, size_t direct_io_cap = 0,
+            bool v2_responder = false);
 
   QpInfo Local() const { return local_; }              // my QP info (after Open)
   bool Connect(const QpInfo& remote);                  // INIT -> RTR -> RTS
@@ -128,11 +132,16 @@ class RcEndpoint {
   // Register a large caller memory region (e.g. the WHOLE SGLang host KV pool)
   // once on this PD. After this, RegisterUser() for any buffer inside the region
   // returns this MR by range lookup with NO per-op ibv_reg_mr — registration is a
-  // one-time connection-setup cost, not a per-transfer cost. Idempotent per base.
-  bool AddPoolMr(void* base, size_t size);
+  // one-time connection-setup cost, not a per-transfer cost. Client destination
+  // pools set remote_write=true so a v2 server can RDMA-WRITE GET data into them.
+  bool AddPoolMr(void* base, size_t size, bool remote_write = false);
   // Register every region not yet present as a pool MR. Called when a connection
   // is acquired so regions declared at any time land on every connection's PD.
-  void EnsurePoolMrs(const std::vector<std::pair<void*, size_t>>& regions);
+  void EnsurePoolMrs(const std::vector<std::pair<void*, size_t>>& regions,
+                     bool remote_write = false);
+  // Register a shared server receive segment for remote PUT writes and return
+  // the MR carrying both the local lkey and peer-visible rkey.
+  ibv_mr* RegisterRemoteRegion(void* base, size_t size);
 
   // Process-wide count of ad-hoc user MRs registered OUTSIDE any pool region
   // (RegisterUser slow path). Should stay 0 in correct deployments where every
@@ -150,6 +159,14 @@ class RcEndpoint {
   // buffers stay cached). Valid as a recv target AND a send source (LOCAL_WRITE is
   // a superset of the no-flag local read a SEND does). nullptr on failure.
   ibv_mr* RegisterUser(void* addr, size_t len);
+  // One-shot MR for API-owned buffers whose lifetime ends or may move after the
+  // current operation. `remote_write=true` is for receive targets; false keeps
+  // const/read-only send sources valid. Registered pool MRs with sufficient
+  // access are reused. The endpoint owns ad-hoc MRs until ReleaseTransient() or
+  // Close(), so a failed/timed-out QP tears down before deregistration.
+  ibv_mr* RegisterTransient(void* addr, size_t len,
+                            bool remote_write = true);
+  void ReleaseTransient(ibv_mr* mr);
   // Scatter recv: first `hdr_bytes` of the message land in rbuf_[slot] (resp
   // prefix + value header), the remaining payload lands directly in `payload`
   // (must belong to `payload_mr` from RegisterUser) — zero copy into the caller.
@@ -179,6 +196,25 @@ class RcEndpoint {
   bool PostRecvScatterMulti(
       size_t slot, const std::vector<std::pair<void*, uint32_t>>& segs,
       const std::vector<ibv_mr*>& mrs, size_t hdr_bytes);
+
+  // RDMA v2 one-sided primitives. PostWrite is intentionally UNSIGNALED: a
+  // following signaled status SEND on the same RC QP fences its source buffer
+  // lifetime and produces the sole server-side completion. WRITE_WITH_IMM is
+  // signaled because it is the client's request operation.
+  bool PostWrite(size_t slot, const void* source, size_t length,
+                 ibv_mr* source_mr, uint64_t remote_addr,
+                 uint32_t remote_rkey);
+  bool PostWriteImm(size_t slot, size_t length, uint64_t remote_addr,
+                    uint32_t remote_rkey, uint32_t immediate);
+  bool PostWriteImmScatter(
+      size_t slot, size_t header_len, const void* payload,
+      size_t payload_len, ibv_mr* payload_mr, uint64_t remote_addr,
+      uint32_t remote_rkey, uint32_t immediate);
+  bool PostWriteImmScatterMulti(
+      size_t slot, size_t header_len,
+      const std::vector<std::pair<const void*, uint32_t>>& segs,
+      const std::vector<ibv_mr*>& mrs, uint64_t remote_addr,
+      uint32_t remote_rkey, uint32_t immediate);
 
   // QP scatter-gather capability negotiated in Open() = min(kMaxSge, device cap).
   // The SG datapath caps payload segments at max_sge()-1 (SGE0 is the header).
@@ -217,7 +253,12 @@ class RcEndpoint {
   std::vector<ibv_mr*> smr_, rmr_, dmr_;
   // Big pre-registered caller regions (the host KV pool). Registered once at
   // connection setup, never evicted; RegisterUser range-looks-up into these.
-  struct PoolMr { uintptr_t base; size_t size; ibv_mr* mr; };
+  struct PoolMr {
+    uintptr_t base;
+    size_t size;
+    int access;
+    ibv_mr* mr;
+  };
   std::vector<PoolMr> pool_mr_;
   // LRU-capped cache of caller-buffer MRs (addr -> {mr, lru-iterator}); front of
   // user_lru_ is MRU. Bounded so a workload with many distinct buffers can't leak
@@ -232,6 +273,7 @@ class RcEndpoint {
   size_t user_mr_cap_ = kMinUserMr;
   std::list<uintptr_t> user_lru_;
   std::unordered_map<uintptr_t, std::pair<ibv_mr*, std::list<uintptr_t>::iterator>> user_mr_;
+  std::vector<ibv_mr*> transient_mr_;
   QpInfo local_;
 };
 

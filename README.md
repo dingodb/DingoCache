@@ -38,7 +38,8 @@ three engines through thin adapters over one portable core:
   object per page, no tp_rank suffix, `backup_skip` (only tp_rank 0 writes).
 
 ## Design in one breath
-SGLang HiCache (zero-copy v1) → `dfkv_hicache.py` (ctypes) → `libdfkv` client
+SGLang HiCache (zero-copy `interface_v1`) → `dfkv_hicache.py` (ctypes) →
+`libdfkv` client
 (Ketama route + header wrap/verify) → TCP/RDMA → `dfkv_server` → optional RAM hot
 tier → DiskCacheGroup over N NVMe (per-disk `StoreEngine`: `file` or `slab`), LRU.
 Distributed = client-side consistent hashing; no replication (regenerable KV →
@@ -175,23 +176,29 @@ docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire p
   share + each node's **self-reported version/config** — engine, capacity, RAM tier,
   RDMA dev — carried on register/heartbeat, so fleet-wide version/config audit is one
   command, no per-node ssh) and `dfkvctl stat --all` (per-node metrics + aggregate) via MDS.
-- **RDMA transport** (gated `-DDFKV_WITH_RDMA=ON`, native libibverbs RC): device
-  selected **by name** (`DFKV_RDMA_DEV=ib7s400p0`, comma-list = multi-rail), QP
-  bootstrapped over a tiny TCP channel so the 400G data fabric needs no IP and may
-  be separate from the IP network. **Automatic TCP fallback** when no device or
-  `DFKV_RDMA` unset. Validated on 400G InfiniBand.
-- **Zero-copy GET both ends**: the server reads the block straight into the send
-  buffer; the client scatters the payload directly into the caller's buffer (e.g.
-  a SGLang HiCache registered host page) — no intermediate copies.
+- **RDMA transport v2** (gated `-DDFKV_WITH_RDMA=ON`, native libibverbs RC):
+  with no device override each host chooses its first `ACTIVE` local HCA and
+  sends an empty device selector to its peer. An explicit comma whitelist opts
+  into multi-rail round-robin and therefore must name the intended fabric on
+  both hosts. QPs bootstrap over a tiny TCP channel, so the data fabric needs no
+  IP. A v2 capability probe falls back connection-by-connection to the v1
+  SEND/RECV path for rolling upgrades; unset `DFKV_RDMA` still selects TCP.
+- **Mixed zero-copy data plane**: control descriptors/status use small 4-KiB
+  SEND/RECV buffers. PUT payloads RDMA-WRITE into leases from one process-wide,
+  pre-registered receive segment; GET payloads RDMA-WRITE directly into the
+  caller's registered buffer. No connection-sized block buffers or payload copy
+  remain on v2.
 - **Optional pipelining** (`DFKV_RDMA_DEPTH=K`): K requests in flight per connection.
   A network-latency hider, **not a throughput knob** — GET and PUT are both
   depth-flat (the per-connection serve loop is in-order; benchmarked GET ~1.24 GB/s at
   depth 1 == 32). The throughput levers are **multi-connection fan-out**
   (`batch_concurrency`) and **fewer/larger keys**. See `docs/datapath-perf-notes.md`.
-- **NUMA-aware rail selection** (`DFKV_RDMA_NUMA=1`): pins buffers/serve-threads to
-  the rail's NUMA node AND, with a multi-rail `DFKV_RDMA_DEV`, picks a NUMA-local
-  rail per connection (falls back to round-robin over all rails when no local rail
-  exists). Off by default; vendor-neutral (sysfs + `sched_getcpu`, no libnuma/CUDA).
+- **NUMA-aware rail selection** (`DFKV_RDMA_NUMA=1`): with an explicit
+  multi-rail whitelist, prefers an `ACTIVE` rail local to the calling thread,
+  then round-robins the listed healthy rails. Server threads follow their QP's
+  rail NUMA node; the single shared receive segment is registered on each
+  selected rail but is not separately NUMA-allocated per rail. Off by default;
+  vendor-neutral (sysfs + `sched_getcpu`, no libnuma/CUDA).
 - **HiCache v2** (PoolTransfer) for multi-pool models (Mamba/SWA/DeepSeek-V4).
 - **Packaging**: CPack (deb/rpm/tgz) + Dockerfile; **graceful shutdown**; leveled logging.
 
@@ -200,16 +207,16 @@ docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire p
 Validated on a 5-node ring (8×B200 hosts, 6× Gen4 NVMe + 8×400G IB per node,
 128 GiB RAM arena): cold read 97 → **156 GB/s**, hot read 48 → **97 GB/s**
 single-pair / **147 GB/s** mesh, cold-read p99 0.9–2.2 s → **~50 ms**.
-Every knob below defaults to the historical behavior — this section is what to
-*change*, not what happens out of the box.
+Defaults are safe for a single-fabric node; production overrides below make
+fabric selection and capacity explicit.
 
 **Server** (per cache node):
 
 | Knob | Recommended | Why |
 |---|---|---|
-| `--rdma-dev` | comma list of **all** local rails (e.g. `ib7s400p0,...,ib7s400p7`) | v1.34 pins one anchor per listed device at startup (arena MRs registered once, logged); without it, idle reclaim of a rail's last connection drops the device and the next burst pays a serialized re-registration storm. First entry = default for legacy clients. Startup pays N× arena registration (~8 s each for 128 GiB). |
+| `--rdma-dev` | leave unset for one local HCA; list the fabric explicitly for multi-rail | Unset selects the first `ACTIVE` local HCA (peer names may differ). A comma list opts into multi-rail, anchors only listed active devices, and requires compatible names/fabric on both hosts; inactive entries are rejected. |
 | `DFKV_DISK_HASH_WEIGHT` | `10` | Flattens the intra-server disk ring share from ±20 % to ±3 % so the hottest disk stops gating the whole node (+5–6 % cold read, ~2× lower p99). **Re-routes existing keys** (cache miss + refill) — flip together with a restart/upgrade window. |
-| `--rdma-depth` | `4` (keep) | Deeper is not a throughput knob (see datapath notes); it only grows pinned memory. |
+| `--rdma-depth` | `4` (keep) | Deeper is not itself a throughput knob. On v2 it consumes more slots from the fixed shared receive segment; on v1 fallback it also grows per-connection pinned buffers. |
 | `--ram-tier` / `--ram-tier-bytes` / `--ram-tier-shards` | on / sized to the node / `16` for ≥100 GiB arenas | Large arenas contend on the shard locks under mixed load (+40 % mixed R/W at 16 shards on a 128 GiB arena); small (≤16 GiB) arenas are fine at the default 8. |
 | `--store-engine` | `slab` | Index rebuilds on restart; removes file-per-block hazards. |
 
@@ -217,7 +224,7 @@ Every knob below defaults to the historical behavior — this section is what to
 
 | Knob | Recommended | Why |
 |---|---|---|
-| `DFKV_RDMA_DEV` | best: **rail affinity per rank** — inject `ib7s400p{local_rank}` per process; simpler: the full comma list + `DFKV_RDMA_NUMA=1` | Each rank uses the NIC closest to its GPU; the bootstrap dev frame makes the server answer on the same rail automatically. Verify the device names exist inside the container first. |
+| `DFKV_RDMA_DEV` | best: **rail affinity per rank** — inject the matching local/server HCA name per process; simpler on symmetric hosts: the full comma list + `DFKV_RDMA_NUMA=1` | Explicit values are sent to the peer, so verify those names exist on both hosts/containers. Leave unset to let each host select its own first ACTIVE HCA when names differ. |
 | `DFKV_RDMA_DEPTH` | `4` | Pairs with the server's posted depth (window = min of both, negotiated). |
 | `DFKV_FANOUT_THREADS` | unset (default 32) | Only wide single-process clients (benchmarks, many concurrent Batch* callers) need more. |
 

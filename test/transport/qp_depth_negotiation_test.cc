@@ -42,6 +42,24 @@ TEST(QpDepthNegotiation, DepthRoundTrips) {
   EXPECT_EQ(out.depth, 32);
 }
 
+TEST(QpDepthNegotiation, V2FlagSharesDepthFieldWithoutTouchingLegacyFields) {
+  QpInfo v2 = Sample(32);
+  v2.protocol_version = 2;
+  char encoded[kQpInfoBytes], legacy[kQpInfoBytes];
+  SerializeQpInfo(v2, encoded);
+  SerializeQpInfo(Sample(32), legacy);
+  EXPECT_EQ(std::memcmp(encoded, legacy, 30), 0);
+
+  QpInfo parsed = ParseQpInfo(encoded);
+  ExpectLegacyFieldsEqual(parsed, v2);
+  EXPECT_EQ(parsed.depth, 32);
+  EXPECT_EQ(parsed.protocol_version, 2);
+
+  uint16_t raw_depth = 0;
+  std::memcpy(&raw_depth, encoded + 30, 2);
+  EXPECT_GT(raw_depth, 256u);  // an old parser safely treats it as absent
+}
+
 TEST(QpDepthNegotiation, LegacyZeroPadMeansNoAdvertisement) {
   // A legacy peer's serializer memsets the blob and writes only the fields:
   // emulate it by serializing WITHOUT depth (writer skips the magic).

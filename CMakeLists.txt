@@ -48,6 +48,7 @@ list(FILTER DFKV_SRCS EXCLUDE REGEX "_main\\.cc$")
 if(NOT DFKV_WITH_RDMA)
   list(REMOVE_ITEM DFKV_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/rdma_verbs.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/rdma_topology.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/rdma_transport.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/cache/rdma_server.cc)
 endif()
@@ -138,6 +139,7 @@ if(DFKV_BUILD_TESTS)
   # rdma_loopback_test needs the RDMA transport/server symbols -> RDMA build only.
   list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_loopback_test.cc)
   list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/qp_depth_negotiation_test.cc)
+  list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_topology_test.cc)
   foreach(t ${DFKV_TESTS})
     get_filename_component(name ${t} NAME_WE)
     add_executable(${name} ${t})
@@ -161,6 +163,9 @@ if(DFKV_BUILD_TESTS)
     add_executable(qp_depth_negotiation_test ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/qp_depth_negotiation_test.cc)
     target_link_libraries(qp_depth_negotiation_test PRIVATE dfkv_core GTest::gtest_main)
     gtest_discover_tests(qp_depth_negotiation_test)
+    add_executable(rdma_topology_test ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_topology_test.cc)
+    target_link_libraries(rdma_topology_test PRIVATE dfkv_core GTest::gtest_main)
+    gtest_discover_tests(rdma_topology_test)
   endif()
 
   # Python plugin test (ctypes -> libdfkv.so -> dfkv_server). No GPU/torch.

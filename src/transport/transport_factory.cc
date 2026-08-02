@@ -1,6 +1,7 @@
 #include "transport/transport_factory.h"
 
 #include <cstdlib>
+#include <exception>
 #include <cstring>
 #include <string>
 
@@ -20,17 +21,33 @@ bool EnvTruthy(const char* name) {
 }
 
 bool RequireRdma() { return EnvTruthy("DFKV_REQUIRE_RDMA"); }
+bool DeviceFilterConfigured() {
+  const char* devices = std::getenv("DFKV_RDMA_DEV");
+  return devices && *devices;
+}
 }  // namespace
 
 std::unique_ptr<Transport> MakeClientTransport(std::string* reason) {
 #ifdef DFKV_WITH_RDMA
   if (EnvTruthy("DFKV_RDMA")) {
     if (RdmaTransport::Available()) {  // native verbs (device-by-name, 400G)
-      if (reason) *reason = "rdma";
-      return std::make_unique<RdmaTransport>();
+      // Availability and construction both discover live HCAs. A link can drop
+      // between those probes, so construction failure must follow the same
+      // fail-closed/fallback policy instead of escaping through dfkv_open.
+      try {
+        auto transport = std::make_unique<RdmaTransport>();
+        if (reason) *reason = "rdma";
+        return transport;
+      } catch (const std::exception&) {
+        // Fall through to the common policy below.
+      }
     }
-    if (RequireRdma()) {
-      if (reason) *reason = "rdma-required-but-no-device";
+    if (RequireRdma() || DeviceFilterConfigured()) {
+      if (reason) {
+        *reason = DeviceFilterConfigured()
+                      ? "rdma-configured-devices-not-active"
+                      : "rdma-required-but-no-active-device";
+      }
       return nullptr;
     }
     if (reason) *reason = "tcp(rdma-requested-but-no-device)";
@@ -42,6 +59,10 @@ std::unique_ptr<Transport> MakeClientTransport(std::string* reason) {
   }
   if (reason) *reason = "tcp(rdma-not-requested)";
 #else
+  if (EnvTruthy("DFKV_RDMA") && DeviceFilterConfigured()) {
+    if (reason) *reason = "rdma-configured-devices-but-rdma-not-built";
+    return nullptr;
+  }
   if (RequireRdma()) {
     if (reason) {
       *reason = EnvTruthy("DFKV_RDMA") ? "rdma-required-but-not-built"
