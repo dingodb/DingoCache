@@ -1,5 +1,7 @@
 #include "transport/rdma_protocol.h"
 
+#include <limits>
+
 #include <gtest/gtest.h>
 
 namespace dfkv::rdma {
@@ -23,6 +25,18 @@ TEST(RdmaProtocol, SlotGeometryKeepsPayloadAligned) {
   EXPECT_GE(slot - kV2DataOffset, 4u << 20);
   EXPECT_EQ(kV2PutPrefixOffset + kReqPrefix, kV2DataOffset);
   EXPECT_EQ(kV2MaxGetTargets, 29u);
+}
+
+TEST(RdmaProtocol, ReceiveSegmentMustFitOneAdvertisedSlot) {
+  constexpr uint64_t max_block = 4u << 20;
+  const size_t slot = V2SlotSize(max_block);
+  ASSERT_NE(slot, 0u);
+  EXPECT_FALSE(V2RecvSegmentFitsOneSlot(slot - 1, max_block));
+  EXPECT_TRUE(V2RecvSegmentFitsOneSlot(slot, max_block));
+  EXPECT_TRUE(V2RecvSegmentFitsOneSlot(slot + kV2DataOffset, max_block));
+  EXPECT_FALSE(V2RecvSegmentFitsOneSlot(
+      std::numeric_limits<size_t>::max(),
+      std::numeric_limits<uint64_t>::max()));
 }
 
 TEST(RdmaProtocol, MembersControlResponseHasExactBoundedCapacity) {
