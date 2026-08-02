@@ -25,7 +25,12 @@ from collections.abc import Callable
 from typing import Any, TypeVar
 
 import torch
-from dfkv_common import VLLM_RAW_V1, canonical_namespace, sg_key
+from dfkv_common import (
+    VLLM_RAW_V1,
+    canonical_namespace,
+    reject_namespace_override,
+    sg_key,
+)
 import zmq
 
 import vllm.envs as envs
@@ -1000,15 +1005,13 @@ class DfkvStoreWorker:
                 f"role={self.kv_role},tp_size={self.tp_size},"
                 f"tp_rank={self.tp_rank},ver={_tcfg.dist_version('dfkv-vllm')}"
             )
-        # The automatic binary namespace captures model revision, runtime
-        # layout contract, cache dtype/block geometry and topology. Pool/rank
-        # scope remains in each object key. key_namespace is an explicit
-        # byte-compatibility override across runtimes.
+        # Namespace aliases are not configurable: this binary identity is the
+        # payload type boundary and must follow the connector schema.
         _tcfg.require_ring_endpoint(extra.get("members", ""), mds_endpoints)
+        reject_namespace_override(extra)
         model_identity = str(model_config.model)
-        if not extra.get("key_namespace"):
-            _tcfg.require_isolation_name(
-                model_identity, field="model_name")
+        _tcfg.require_isolation_name(
+            model_identity, field="model_name")
         _hf_config = getattr(model_config, "hf_config", None)
         _model_revision = (
             extra.get("model_revision")
@@ -1027,7 +1030,6 @@ class DfkvStoreWorker:
         key_namespace = canonical_namespace(
             model_identity,
             VLLM_RAW_V1,
-            extra.get("key_namespace"),
             tenant_id=str(extra.get("tenant_id", "default")),
             model_revision=str(_model_revision),
             dtype=_cache_dtype,

@@ -92,20 +92,18 @@ initialized to failure and C++ exceptions translate to the documented result.
 MDS group and registration client IDs are validated synchronously by
 `dfkv_open_v2` before either background worker starts.
 
-Connectors construct a binary namespace in one of two disjoint forms:
+Connectors construct one automatic cross-language `NamespaceDescriptor`
+encoding beginning with `b"DFKVNS\x00\x02"`. Length-framed fields bind tenant,
+exact model ID and revision, connector raw-layout ID, dtype, layout fingerprint,
+block-token and layer geometry, group, and replicated topology sizes.
+Connector-specific shape/stride fields feed the deterministic 64-bit layout
+fingerprint.
 
-- automatic: the cross-language `NamespaceDescriptor` encoding beginning with
-  `b"DFKVNS\x00\x02"`. Length-framed fields bind tenant, exact model ID and
-  revision, connector raw-layout ID, dtype, layout fingerprint, block-token and
-  layer geometry, group, and replicated topology sizes. Connector-specific
-  shape/stride fields feed the deterministic 64-bit layout fingerprint.
-- explicit `key_namespace` override:
-  `b"DFKVNS\x00\xff" + u32le(len(override_utf8)) + override_utf8`.
-
-The automatic layout IDs are `sglang-hicache/raw-v1`, `vllm/raw-v1`, and
-`lmcache/raw-v1`. Model/revision strings are preserved verbatim. The disjoint
-magic bytes prevent an explicit override from accidentally aliasing an
-automatic namespace. Python and C++ serializers share a checked golden vector.
+The source-controlled layout IDs are `sglang-hicache/raw-v1`, `vllm/raw-v1`,
+and `lmcache/raw-v1`. Model/revision strings are preserved verbatim. Operators
+cannot alias namespaces through configuration: an identity-bearing schema
+change requires code review and a layout-ID bump, which deliberately starts a
+cold cache. Python and C++ serializers share a checked golden vector.
 
 Every connector renders an object key as:
 
@@ -134,11 +132,11 @@ Identity ownership is strict:
   geometry, dtype, checksum, or model tag in the value
 
 Different namespace or key bytes produce a cold miss. Reusing the same
-namespace and key for a different byte layout is an operator error, not a
+namespace and key for a different byte layout is a type-safety violation, not a
 guarded miss: encode every identity-bearing geometry/layout change in the
-namespace or object key, and coordinate an explicit override only among
-byte-compatible producers and consumers. This is a clean cutover: native
-clients do not read old keys or dual-write the retired identity/value format.
+namespace or object key and bump the connector's source-controlled layout ID.
+This is a clean cutover: native clients do not read old keys or dual-write the
+retired identity/value format.
 
 ---
 

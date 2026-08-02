@@ -26,6 +26,7 @@ from dfkv_common import (
     DfkvClientOptionsV2,
     SGLANG_HICACHE_RAW_V1,
     canonical_namespace,
+    reject_namespace_override,
     make_client_options_v2,
     make_key_array,
     make_key_buffer,
@@ -394,11 +395,11 @@ class DfkvHiCache(HiCacheStorage):
             self._v2_io_pools = ()  # pool names that actually did I/O last _v2_io()
             # self._lib was loaded above (before configure) so the native version
             # could be reported; dfkv_open uses that same handle here.
-            # The native namespace is explicit binary identity. key_namespace
-            # aligns runtimes only when their object keys and raw layouts agree.
-            if not cfg.get("key_namespace"):
-                _tcfg.require_isolation_name(
-                    self.model_identity, field="model_name")
+            # Namespace aliases are not configurable: this binary identity is
+            # the payload type boundary and must follow the connector schema.
+            reject_namespace_override(cfg)
+            _tcfg.require_isolation_name(
+                self.model_identity, field="model_name")
             _page_size = int(cfg.get("page_size", 64))
             _layer_num = int(cfg.get("layer_num", 0))
             _dtype = str(cfg.get(
@@ -406,7 +407,6 @@ class DfkvHiCache(HiCacheStorage):
             self._key_namespace = canonical_namespace(
                 self.model_identity,
                 SGLANG_HICACHE_RAW_V1,
-                cfg.get("key_namespace"),
                 tenant_id=str(cfg.get("tenant_id", "default")),
                 model_revision=str(
                     cfg.get("model_revision", self.model_identity)),

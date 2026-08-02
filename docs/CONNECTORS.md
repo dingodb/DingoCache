@@ -179,13 +179,13 @@ capability；HCA `max_sge` 低于 dfkv 上限时会缩小宽度，高于上限�
 ### 1.4 原生 namespace、对象 key 与 raw value
 
 `dfkv_open_v2(&options)` receives one immutable, size-delimited construction
-descriptor. It contains either static members or MDS discovery settings,
-explicit binary namespace bytes, batch concurrency, and optional client
-registration identity. Unknown flags/version/short structs fail closed.
-There are no post-open membership mutators or geometry parameters. Automatic
-namespace binds the exact runtime model identity and connector raw-layout ID
-(`sglang-hicache/raw-v1`, `vllm/raw-v1`, `lmcache/raw-v1`);
-`key_namespace` is an explicit override whose encoding domain cannot collide.
+descriptor. It contains either static members or MDS discovery settings, the
+connector-produced binary namespace bytes, batch concurrency, and optional
+client registration identity. Unknown flags/version/short structs fail closed.
+There are no post-open membership mutators, operator namespace aliases, or
+geometry parameters. The namespace binds the exact runtime model identity and
+connector raw-layout ID (`sglang-hicache/raw-v1`, `vllm/raw-v1`,
+`lmcache/raw-v1`).
 
 所有 connector 的对象 key 都是 self-delimiting binary bytes，编码顺序为：
 
@@ -323,8 +323,7 @@ sglang serve ... \
     "backend_name":"dfkv","module_path":"dfkv_hicache","class_name":"DfkvHiCache",
     "interface_v1":1,
     "mds_endpoints":"10.0.0.1:9400,10.0.0.2:9400",
-    "mds_group":"default",
-    "key_namespace":"<optional-coordinated-schema-override>" }'
+    "mds_group":"default" }'
 ```
 
 **方案 B — 静态成员表（遗留）**：无 MDS 时用 `members` 字段，节点增减需重启 SGLang：
@@ -333,13 +332,13 @@ sglang serve ... \
 "members":"n57=192.168.1.57:28001,n58=192.168.1.58:28001"
 ```
 
-（其余字段同方案 A，去掉 `mds_endpoints`/`mds_group`；不需要显式共享时也去掉 `key_namespace`。）
+（其余字段同方案 A，去掉 `mds_endpoints`/`mds_group`。）
 
 **extra_config 全部键**（源 `dfkv_hicache.py`）：`interface_v1`（必填）、
 `mds_endpoints`/`mds_group`（默认 `default`）/`mds_poll_ms`（3000）或 `members`、
-可选 `key_namespace`、`pcp_size`/`pcp_rank`、`dcp_size`/`dcp_rank`、
-`layer_num`（仅 L2-bypass 的 SG 分组控制，不进 namespace/value）、
-`lib_path`、`batch_concurrency`、`rdma_depth`/`require_rdma`/`rdma_numa`、
+`pcp_size`/`pcp_rank`、`dcp_size`/`dcp_rank`、`layer_num`（仅 L2-bypass 的 SG
+分组控制，不进 namespace/value）、`lib_path`、`batch_concurrency`、
+`rdma_depth`/`require_rdma`/`rdma_numa`、
 `client_stats_poll_s`（10s，`0`=关）、
 访问日志/telemetry 键（`access_log`、`access_log_path`、`metrics`、`tracing`、
 `otlp_endpoint`、`trace_slow_request_ms`、`trace_sample_percent` 等，env 同义项见
@@ -376,13 +375,13 @@ sglang serve ... \
 - **多池模型**（Mamba/SWA/DeepSeek-V4）用 v2 PoolTransfer 接口（插件已实现）。
   DSA/DeepSeekV4 主 `kv` 池是无数据的 LogicalHostPool（`get_page_buffer_meta→None`），
   插件对其 `batch_set_v1` 写空 marker 锚定命中前缀、`batch_get_v1` no-op，真实 KV 走 v2 侧池。
-- **identity/layout 必须协同发布。** 默认 namespace 使用 SGLang runtime 给出的
-  精确 `model_name` + `sglang-hicache/raw-v1`；同一模型的 pool/hash/并行坐标/
-  component 进入 canonical object key。dfkv value 只有 raw bytes，不会检查
-  page size、dtype、shape 或层顺序。若这些布局在同一 `model_name` 下发生变化，
-  给所有 writer/reader 同时切到含 schema revision 的新 `key_namespace` 并接受
-  一次冷缓存。namespace/key 不一致只会 cold miss；相同 namespace+key 下布局
-  不一致是 operator error。
+- **identity/layout 必须协同发布。** namespace 使用 SGLang runtime 给出的精确
+  `model_name` + `sglang-hicache/raw-v1`；同一模型的 pool/hash/并行坐标/component
+  进入 canonical object key。dfkv value 只有 raw bytes，不会检查 page size、
+  dtype、shape 或层顺序。若这些布局在同一 `model_name` 下发生变化，先在代码中
+  bump source-controlled raw-layout ID，再同时发布所有 writer/reader，并接受一次
+  冷缓存。namespace/key 不一致只会 cold miss；相同 namespace+key 下布局不一致
+  是 type-safety violation。
 - **客户端指标（pull）**：插件自动在 SGLang 自带 `/metrics` 上暴露
   `dfkv_client_*{tp_rank}`（set/get 量、命中、IO 错误、peer 熔断切换、延迟直方图）。
   后台轮询线程读 C 客户端快照，间隔 extra_config `client_stats_poll_s`（默认 10s，
@@ -527,15 +526,14 @@ vllm serve <model> \
     "kv_connector_extra_config": {
       "mds_endpoints": "192.168.0.8:28150,192.168.0.9:28150,192.168.0.10:28150",
       "mds_group": "glm",
-      "key_namespace": "<optional-coordinated-schema-override>",
       "batch_concurrency": "8"
     }
   }'
 ```
 
 `model_name` 取 vLLM 的精确 `model_config.model`（即上面的 `<model>`），不是
-extra-config 键。通常不设 `key_namespace`，让默认 namespace 同时绑定该 model
-identity 与 `vllm/raw-v1`；只有协调 schema/跨 runtime 共享时才用 override。
+extra-config 键。namespace 始终绑定该 model identity 与 `vllm/raw-v1`；没有可配置
+的 namespace alias。
 
 **备选（单节点/简单部署）：静态成员表** —— 无 MDS 时改用 `members`，节点增减需重启：
 
@@ -590,7 +588,6 @@ namespace/key 不一致是预期 cold miss。**空环 / MDS 不可达**可直接
 | `mds_group` | `default` | 如 `glm` | MDS 成员组名，= `dfkv_server --group` |
 | `mds_poll_ms` | `3000` | 默认即可 | MDS 轮询间隔（ms） |
 | `members` | —（与 mds_endpoints 二选一） | `n=ip:rdma-port,...` | **端口 = server `--rdma-port`** |
-| `key_namespace` | 未设（自动） | 通常不设 | 显式 schema override；共享双方必须产生相同对象 key 且 raw layout byte-compatible（§1.4/§5） |
 | `lib` | env 兜底 | so 绝对路径 | |
 | `batch_concurrency` | `8` | **大池可调高到 ≈ 节点数** | 跨节点 fan-out，**真正的吞吐杠杆**（depth 是平的） |
 | `load_async` | `True` | 保持 True | 异步 load，走 `WAITING_FOR_REMOTE_KVS`、不占关键路径 |
@@ -628,7 +625,7 @@ daemon 线程或进程终止；过载和退出期间都不会静默留下永久�
 | 现象 | 原因 / 解 |
 |---|---|
 | 写成功但**读永不命中** | 未使用 `--prefix-caching-hash-algo sha256`（当前连接器会启动失败）；或 effective namespace / canonical object key 不一致（后两者表现为 cold miss） |
-| 命中后输出/shape 错误 | 同一 namespace+key 被不同 dtype/page/shape/layout 复用；这是 operator error。停写并发布新的 schema `key_namespace` |
+| 命中后输出/shape 错误 | 同一 namespace+key 被不同 dtype/page/shape/layout 复用；这是 type-safety violation。停写，bump source-controlled raw-layout ID 并同时发布所有 writer/reader |
 | 每个 RDMA `put` 失败 `rc=-1` | `members` 指了 `--port` 而非 `--rdma-port` |
 | `ibv_reg_mr` 失败 / 无 GPUDirect | GPU 节点没加载 `nvidia-peermem` |
 | 首 token 偶发慢 ~2s | 每 DP rank 一次性 Triton JIT（非 bug）；预热可消 |
@@ -677,8 +674,6 @@ extra_config:
   remote_storage_plugin.dfkv.url:         dfkv://c1=<CACHE1_IP>:18800,c2=<CACHE2_IP>:18800/g1
   remote_storage_plugin.dfkv.membership:  static
   remote_storage_plugin.dfkv.lib:         <LIBDFKV>
-  # 可选；通常不设。跨 runtime 共享前必须确认 raw layout 与 object key 完全兼容
-  remote_storage_plugin.dfkv.key_namespace: <coordinated-schema-override>
 ```
 
 **RDMA 版**：URL 用 **RDMA 端口**（server `--rdma-port`），并给 vLLM
@@ -734,7 +729,6 @@ vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
 | `url` | 是 | `dfkv://<endpoint>/<group>`。static 模式 endpoint=`name=ip:port,...`；mds 模式 endpoint=MDS `ip:port` 列表 |
 | `membership` | 否 | **`mds`（默认）** 或 `static` |
 | `lib` | 否 | `libdfkv.so` 路径（覆盖 `DFKV_LIB`） |
-| `key_namespace` | 否 | 显式 schema override；通常使用 runtime model identity + `lmcache/raw-v1` 的自动 namespace |
 | `mds_poll_ms` | 否 | mds 模式轮询间隔，默认 3000 |
 
 也支持简写 URL 直连（`plugin://dfkv` 场景 URL 即成员串），此时 knob 全走默认
@@ -766,8 +760,7 @@ lmcache server --port 6555 --max-workers 8 --l1-size-gb 80 \
       "url":"dfkv://<mds_ip:port,...>/<group>",
       "membership":"mds",
       "lib":"/path/to/libdfkv.so",
-      "model_name":"<exact-model-or-deployment-identity>",
-      "key_namespace":"<optional-coordinated-schema-override>"}}'
+      "model_name":"<exact-model-or-deployment-identity>"}}'
 
 # 2) vLLM 指向 MP server（注意 --no-enable-prefix-caching 把全部 KV 复用交给 LMCache）：
 vllm serve <model> --tensor-parallel-size 8 --no-enable-prefix-caching \
@@ -892,9 +885,8 @@ get 分配满块 buffer、变长 get 拿回 `(per_key, lengths)`，命中后满�
 #### 4.6.5 namespace、object key 与 raw layout
 
 in-process connector 从 LMCache runtime metadata 取精确 `model_name`；MP-server
-路径要求 `adapter_params.model_name`。未设 override 时，namespace 绑定该 identity
-与 `lmcache/raw-v1`。`key_namespace` 会切到显式 namespace 域，适合发布带 schema
-revision 的新 layout，或在严格验证 byte compatibility 后协调跨 runtime 共享。
+路径要求 `adapter_params.model_name`。namespace 始终绑定该 identity 与
+`lmcache/raw-v1`，不接受 operator alias。
 
 LMCache 的 `CacheEngineKey` / `ObjectKey` 统一编码为 §1.4 的
 self-delimiting binary pool key。完整 hash、world size/rank、cache group 和
@@ -986,13 +978,14 @@ runtime 默认也隔离。object key 再编码 pool、完整内容 hash、DP/TP/
 坐标、cache group、component 和可选 binary SG 坐标。
 
 **不一致的 namespace 或 object key = cold miss。** 这适用于 model identity、
-parallel coordinates、component、scatter width 或显式 override 的任何差异。
+parallel coordinates、component 或 scatter width 的任何差异。
 
 **相同 namespace+key = 相同 raw payload layout 的强约定。** dfkv 不在 value 中
 保存或校验 dtype、page/chunk size、shape、层顺序或 geometry。用相同 identity
-写入不同布局是 operator error，可能覆盖成可命中但不可解释的 bytes。布局变化时
-发布新的 schema `key_namespace`；跨 runtime 共享则必须显式使用同一 override，
-并同时证明 canonical object key 和 payload bytes 完全兼容。
+写入不同布局是 type-safety violation，可能覆盖成可命中但不可解释的 bytes。
+布局变化时必须 bump connector 的 source-controlled layout ID；跨 runtime 共享
+只允许代码级、可审查的相同 namespace 与 canonical object-key schema，并须证明
+payload bytes 完全兼容。
 
 共池铁律：**control plane 可共享；identity 不同是冷缓存；identity 相同必须 byte-compatible。**
 

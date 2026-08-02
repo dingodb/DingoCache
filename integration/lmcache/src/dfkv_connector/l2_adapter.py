@@ -42,7 +42,13 @@ import os
 import threading
 from concurrent.futures import Future as _CFuture
 from typing import TYPE_CHECKING, List, Optional
-from dfkv_common import LMCACHE_RAW_V1, canonical_namespace, pool_key
+
+from dfkv_common import (
+    LMCACHE_RAW_V1,
+    canonical_namespace,
+    pool_key,
+    reject_namespace_override,
+)
 
 from lmcache.logging import init_logger
 from lmcache.native_storage_ops import Bitmap
@@ -53,7 +59,6 @@ from lmcache.v1.distributed.l2_adapters.config import L2AdapterConfigBase
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.platform import create_event_notifier
 
-from ._telemetry import config as _tcfg
 from .config import parse_dfkv_url
 from .native_client import DfkvNativeClient
 
@@ -128,7 +133,6 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
       - lib (str): path to ``libdfkv.so`` (else env ``DFKV_LIB`` /
         ``$DFKV_BUILD/libdfkv.so``).
       - model_name (str): model identity used to derive the binary namespace.
-      - key_namespace (str): optional cross-runtime namespace override.
       - mds_poll_ms (int): MDS ring re-discovery interval (default 3000).
       - tenant_id (str): explicit tenant identity (default ``"default"``).
       - model_revision (str): explicit model revision (default ``model_name``).
@@ -143,7 +147,6 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
         membership: str = "mds",
         lib: Optional[str] = None,
         model_name: str = "",
-        key_namespace: Optional[str] = None,
         tenant_id: str = "default",
         model_revision: Optional[str] = None,
         mds_poll_ms: int = 3000,
@@ -155,7 +158,6 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
         self.membership = membership
         self.lib = lib
         self.model_name = model_name
-        self.key_namespace = key_namespace
         self.tenant_id = tenant_id
         self.model_revision = model_revision or model_name
         self.mds_poll_ms = mds_poll_ms
@@ -178,31 +180,22 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
             raise ValueError("dfkv L2 adapter: 'lib' must be a string")
 
         model_name = d.get("model_name", "")
-        if not isinstance(model_name, str):
-            raise ValueError("dfkv L2 adapter: 'model_name' must be a string")
-        key_namespace = d.get("key_namespace")
-        if key_namespace is not None and (
-                not isinstance(key_namespace, str) or not key_namespace):
+        if not isinstance(model_name, str) or not model_name:
             raise ValueError(
-                "dfkv L2 adapter: 'key_namespace' must be a non-empty string")
-        if not model_name and key_namespace is None:
-            raise ValueError(
-                "dfkv L2 adapter: provide non-empty 'model_name' or "
-                "'key_namespace'")
+                "dfkv L2 adapter: 'model_name' must be a non-empty string")
+        reject_namespace_override(d)
         tenant_id = d.get("tenant_id", "default")
         if not isinstance(tenant_id, str) or not tenant_id:
             raise ValueError(
                 "dfkv L2 adapter: 'tenant_id' must be a non-empty string")
         model_revision = d.get("model_revision", model_name)
-        if not isinstance(model_revision, str) or (
-                not model_revision and key_namespace is None):
+        if not isinstance(model_revision, str) or not model_revision:
             raise ValueError(
                 "dfkv L2 adapter: 'model_revision' must be a non-empty string")
 
         mds_poll_ms = d.get("mds_poll_ms", 3000)
         if not isinstance(mds_poll_ms, int) or mds_poll_ms <= 0:
             raise ValueError("dfkv L2 adapter: 'mds_poll_ms' must be a positive int")
-
 
         num_workers = d.get("num_workers", 8)
         if isinstance(num_workers, bool) or not isinstance(num_workers, int) \
@@ -227,7 +220,6 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
             membership=membership,
             lib=lib,
             model_name=model_name,
-            key_namespace=key_namespace,
             tenant_id=tenant_id,
             model_revision=model_revision,
             mds_poll_ms=mds_poll_ms,
@@ -244,7 +236,6 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
             "- membership (str): 'mds' (default) or 'static'\n"
             "- lib (str): path to libdfkv.so (else env DFKV_LIB)\n"
             "- model_name (str): model identity for namespace derivation\n"
-            "- key_namespace (str): optional cross-runtime namespace override\n"
             "- tenant_id (str): explicit tenant identity (default 'default')\n"
             "- model_revision (str): explicit revision (default model_name)\n"
             "- mds_poll_ms (int): MDS rediscovery interval (default 3000)\n"
@@ -318,7 +309,6 @@ class DfkvL2Adapter(L2AdapterInterface):
         namespace = canonical_namespace(
             config.model_name,
             LMCACHE_RAW_V1,
-            config.key_namespace,
             tenant_id=config.tenant_id,
             model_revision=config.model_revision,
             dtype="opaque-lmcache-l2",

@@ -65,15 +65,14 @@ sglang serve ... \
     "backend_name":"dfkv","module_path":"dfkv_hicache","class_name":"DfkvHiCache",
     "interface_v1":1,
     "mds_endpoints":"10.0.0.1:9400,10.0.0.2:9400","mds_group":"default",
-    "key_namespace":"<optional-coordinated-schema-override>",
     "otlp_endpoint":"http://collector:4318",
     "tracing":1,
     "trace_slow_request_ms":1000,
     "trace_sample_percent":1 }'
 ```
 
-SGLang supplies `model_name` from the runtime. Omit `key_namespace` to use the
-safe automatic model + `sglang-hicache/raw-v1` namespace.
+SGLang supplies `model_name` from the runtime and combines it with the
+source-controlled `sglang-hicache/raw-v1` namespace.
 
 ### 方式 B — 环境变量（三连接器通用；vLLM / LMCache 只支持这种）
 

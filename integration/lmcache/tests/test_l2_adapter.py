@@ -138,6 +138,19 @@ def _wait_for(fn, timeout: float = 5.0):
 # Tests
 # --------------------------------------------------------------------------
 
+def test_operator_namespace_override_is_rejected():
+    try:
+        DfkvL2AdapterConfig.from_dict({
+            "url": "dfkv://127.0.0.1:28150/glm",
+            "model_name": "unit-test",
+            "key_namespace": "unreviewed-layout-alias",
+        })
+    except ValueError as exc:
+        assert "namespace identity is derived automatically" in str(exc)
+    else:
+        raise AssertionError("key_namespace must fail closed")
+
+
 
 def test_distinct_event_fds():
     a = _mk_adapter()

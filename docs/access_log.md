@@ -66,15 +66,14 @@ sglang serve ... \
     "backend_name":"dfkv","module_path":"dfkv_hicache","class_name":"DfkvHiCache",
     "interface_v1":1,
     "mds_endpoints":"10.0.0.1:9400,10.0.0.2:9400","mds_group":"default",
-    "key_namespace":"<optional-coordinated-schema-override>",
     "access_log":1,
     "access_log_path":"/var/log/dfkv/access.log",
     "access_log_threshold_us":0,
     "access_log_max_bytes":134217728, "access_log_backup_count":5 }'
 ```
 
-SGLang supplies `model_name` from the runtime. Omit `key_namespace` to use the
-safe automatic model + `sglang-hicache/raw-v1` namespace.
+SGLang supplies `model_name` from the runtime and combines it with the
+source-controlled `sglang-hicache/raw-v1` namespace.
 
 ### 方式 B — 环境变量（不想改启动 JSON 时，运维临时开启）
 
