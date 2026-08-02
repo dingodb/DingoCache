@@ -276,14 +276,12 @@ class DingoFSHiCacheTest(unittest.TestCase):
         with self.assertRaises(dfkv_hicache._tcfg.DfkvConfigError):
             dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
 
-    def test_explicit_namespace_can_align_different_model_labels(self):
-        a = self._cfg("n=127.0.0.1:1", model="runtime-a/model")
-        b = self._cfg("n=127.0.0.1:1", model="runtime-b/model")
-        a.extra_config["key_namespace"] = "shared/model"
-        b.extra_config["key_namespace"] = "shared/model"
-        sa = dfkv_hicache.DfkvHiCache(a, a.extra_config)
-        sb = dfkv_hicache.DfkvHiCache(b, b.extra_config)
-        self.assertEqual(sa._key_namespace, sb._key_namespace)
+    def test_operator_namespace_override_is_rejected(self):
+        cfg = self._cfg("n=127.0.0.1:1")
+        cfg.extra_config["key_namespace"] = "shared/model"
+        with self.assertRaisesRegex(
+                ValueError, "namespace identity is derived automatically"):
+            dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
 
     def test_requires_ring_endpoint(self):
         # Neither members nor mds_endpoints => no ring to connect to.
@@ -787,13 +785,11 @@ class DingoFSHiCacheTest(unittest.TestCase):
         members, _, _ = self._node("namespace-miss")
         pool_w = FakeMlaPool(1, self.PAGE_BYTES, self.PAGE_SIZE)
         pool_w.fill_page(0, 7)
-        writer_cfg = self._cfg(members)
-        writer_cfg.extra_config["key_namespace"] = "model/layout-a"
+        writer_cfg = self._cfg(members, model="model/layout-a")
         writer = self._plugin(writer_cfg, pool_w)
         writer.batch_set_v1(["h0"], list(range(self.PAGE_SIZE)))
         pool_r = FakeMlaPool(1, self.PAGE_BYTES, self.PAGE_SIZE)
-        reader_cfg = self._cfg(members)
-        reader_cfg.extra_config["key_namespace"] = "model/layout-b"
+        reader_cfg = self._cfg(members, model="model/layout-b")
         reader = self._plugin(reader_cfg, pool_r)
         self.assertEqual(
             reader.batch_get_v1(["h0"], list(range(self.PAGE_SIZE))), [False])

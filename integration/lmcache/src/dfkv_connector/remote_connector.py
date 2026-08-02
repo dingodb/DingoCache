@@ -73,7 +73,6 @@ class DfkvConnector(RemoteConnector):
         local_cpu_backend: LocalCPUBackend,
         exists_cache_capacity: int = 1_000_000,
         lib_path: Optional[str] = None,
-        key_namespace: Optional[str] = None,
         membership: str = "mds",
         mds_poll_ms: int = 3000,
         mla_canonical_keys: Optional[bool] = None,
@@ -104,7 +103,6 @@ class DfkvConnector(RemoteConnector):
             namespace = canonical_namespace(
                 model_identity,
                 LMCACHE_RAW_V1,
-                key_namespace,
                 tenant_id=str(getattr(_md, "tenant_id", "default")),
                 model_revision=str(
                     getattr(_md, "model_revision", model_identity)),

@@ -15,6 +15,7 @@ from dfkv_common import (
     canonical_namespace,
     layout_fingerprint,
     namespace_tenant_hash,
+    reject_namespace_override,
     make_client_options_v2,
     make_key_array,
     make_key_buffer,
@@ -176,15 +177,18 @@ class CanonicalIdentityTest(unittest.TestCase):
             canonical_namespace("same-model", "sglang-hicache/raw-v1"),
         )
 
-    def test_explicit_override_aligns_runtime_names_and_layouts(self):
-        shared = "org/model@revision|layout=shared-raw-v1"
-        vllm = canonical_namespace("vllm-name", "vllm/raw-v1", shared)
-        sglang = canonical_namespace(
-            "sglang-name", "sglang-hicache/raw-v1", shared)
-        self.assertEqual(vllm, sglang)
-        self.assertTrue(vllm.startswith(b"DFKVNS\x00\xff"))
-        self.assertNotEqual(
-            vllm, canonical_namespace(shared, "vllm/raw-v1"))
+    def test_operator_namespace_override_is_rejected(self):
+        with self.assertRaisesRegex(
+                ValueError, "namespace identity is derived automatically"):
+            reject_namespace_override(
+                {"key_namespace": "org/model@layout=unreviewed"})
+
+        with self.assertRaisesRegex(
+                ValueError, "remote_storage_plugin.dfkv.key_namespace"):
+            reject_namespace_override(
+                {"remote_storage_plugin.dfkv.key_namespace": ""},
+                key="remote_storage_plugin.dfkv.key_namespace",
+            )
 
     def test_pool_key_matches_binary_length_framed_contract(self):
         page_hash = b"\xffhash\x00|="

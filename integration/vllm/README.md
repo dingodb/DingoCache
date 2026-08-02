@@ -28,7 +28,6 @@ one per layer-segment), cutting key/disk-read count ~20x.
   "kv_role": "kv_both",
   "kv_connector_extra_config": {
     "members": "c1=<server-ip>:<rdma-port>",
-    "key_namespace": "<optional-coordinated-schema-override>",
     "lib": "/path/to/libdfkv.so"
   }
 }'
@@ -74,7 +73,6 @@ LMCache connector access logs, so one setting covers every integration. Format:
 | key | default | meaning |
 |---|---|---|
 | `members` | (required) | dfkv member string. **The port MUST be the server's `--rdma-port`** (the RDMA bootstrap listener), not the main `--port`, when RDMA is enabled. |
-| `key_namespace` | unset (automatic) | optional explicit schema override; all sharers must produce identical canonical object keys and byte-compatible raw payloads. |
 | `lib` | env `DFKV_LIB` / `$DFKV_BUILD/libdfkv.so` | path to `libdfkv.so`. |
 | `batch_concurrency` | `8` | client fan-out across nodes for batch ops; the real throughput lever (depth is flat). Raise toward the cluster's node count for wider pools. |
 | `load_async` | `True` | async KV load: the scheduler returns `WAITING_FOR_REMOTE_KVS` and the load runs off the critical path. Keep `True`. |
@@ -93,9 +91,8 @@ shutdown behind an accumulated queue.
 ## Identity and raw-value contract
 
 `model_name` is the exact vLLM `model_config.model`, not an extra-config key.
-By default the binary namespace binds it to `vllm/raw-v1`; normally omit
-`key_namespace`. An explicit override is for a coordinated schema revision or
-deliberate cross-runtime sharing.
+The binary namespace always binds it to the source-controlled `vllm/raw-v1`
+layout ID; operator-supplied aliases are rejected.
 
 Object keys are self-delimiting binary bytes: `DFKVPOOL\x02`, uint32-LE
 length-framed pool and full page hash, fixed `(uint32 size, int32 rank)` pairs
@@ -108,10 +105,11 @@ The namespace remains separate binary identity. dfkv stores only the raw GPU
 bytes and returns their length separately; it has no geometry/dtype envelope.
 
 Different namespace/key bytes are a cold miss. The same namespace+key with a
-different dtype, page/block size, shape, layer order, or KV memory layout is an
-operator error, not a guarded miss. Publish a new schema `key_namespace` for
-such changes. Cross-runtime sharing requires both identical object keys and
-byte-compatible payload layouts.
+different dtype, page/block size, shape, layer order, or KV memory layout is a
+type-safety violation, not a guarded miss. Such changes require a
+source-controlled layout-ID bump and coordinated writer/reader deployment.
+Cross-runtime sharing requires both identical object keys and byte-compatible
+payload layouts.
 
 ## Gotchas (validated on hd04 H100 + IB)
 
@@ -122,7 +120,7 @@ byte-compatible payload layouts.
   accepted as a fleet identity contract.
 - **Identity mismatches are cold misses.** If a read hits but the decoded
   shape/content is wrong, stop mixed writers: the same namespace+key has been
-  reused for incompatible raw layouts. Roll to a new schema `key_namespace`.
+  reused for incompatible raw layouts. Bump the source-controlled layout ID.
 - **DCP (`--decode-context-parallel-size > 1`) needs client >= v1.10.0**.
   Older builds run the put_step stride under the replicated-KV assumption and
   store only 1/dcp_size of each rank's shard, so external prefix hits

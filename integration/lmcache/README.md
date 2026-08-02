@@ -46,8 +46,6 @@ extra_config:
   remote_storage_plugin.dfkv.url:         dfkv://<mds_ip:port,...>/<group>
   remote_storage_plugin.dfkv.membership:  mds            # or "static"
   remote_storage_plugin.dfkv.lib:         /path/to/libdfkv.so
-  # Optional explicit schema override; normally omit
-  remote_storage_plugin.dfkv.key_namespace: <coordinated-schema-override>
 ```
 
 - **mds membership** (default): the URL host part is a comma-separated list of
@@ -79,8 +77,7 @@ lmcache server --port 6555 --max-workers 8 --l1-size-gb 80 \
       "url":"dfkv://<mds_ip:port,...>/<group>",
       "membership":"mds",
       "lib":"/path/to/libdfkv.so",
-      "model_name":"<exact-model-or-deployment-identity>",
-      "key_namespace":"<optional-coordinated-schema-override>"}}'
+      "model_name":"<exact-model-or-deployment-identity>"}}'
 
 # 2) Point vLLM at the MP server (NOTE: --no-enable-prefix-caching routes all
 #    KV reuse through LMCache):
@@ -108,9 +105,8 @@ store → restart (L1 wiped) → reload from dfkv with prefill skipped.
 ## Identity and raw-value contract
 
 The in-process path gets the exact `model_name` from LMCache runtime metadata;
-the MP-server path gets it from `adapter_params`. With no override, the binary
-namespace binds that identity to `lmcache/raw-v1`. `key_namespace` selects a
-separate explicit namespace and should include a coordinated schema revision.
+the MP-server path gets it from `adapter_params`. The binary namespace always
+binds that identity to the source-controlled `lmcache/raw-v1` layout ID.
 
 Object keys use the shared self-delimiting binary form: `DFKVPOOL\x02`,
 uint32-LE length-framed pool/hash, fixed uint32-size/int32-rank pairs for
@@ -126,9 +122,10 @@ identity, or legacy ABI fallback.
 dfkv stores exactly the LMCache chunk bytes and returns the stored length
 separately; it adds no geometry/dtype envelope. A namespace or object-key
 difference is a cold miss. Reusing the same namespace+key for a different
-dtype, chunk shape, serialization order, or layout is operator error: publish
-a new schema `key_namespace`. Cross-runtime sharing additionally requires
-byte-compatible object keys and payloads.
+dtype, chunk shape, serialization order, or layout is a type-safety violation:
+bump the source-controlled layout ID and deploy every writer/reader together.
+Cross-runtime sharing additionally requires byte-compatible object keys and
+payloads.
 
 ## Environment variables
 

@@ -17,7 +17,6 @@ from typing import Union
 _MAX_FIELD_BYTES = 1 << 20
 _MAX_COMPONENT_BYTES = 256
 _NAMESPACE_MAGIC = b"DFKVNS\x00\x02"
-_OVERRIDE_NAMESPACE_MAGIC = b"DFKVNS\x00\xff"
 _OBJECT_MAGIC = b"DFKVOBJ2"
 _LAYOUT_MAGIC = b"DFKVLAYOUT1"
 _POOL_MAGIC = b"DFKVPOOL\x02"
@@ -297,10 +296,29 @@ def layout_fingerprint(
     return value or 1
 
 
+def reject_namespace_override(
+    config: Mapping[str, object],
+    *,
+    key: str = "key_namespace",
+) -> None:
+    """Reject operator-controlled namespace aliases.
+
+    The namespace is a payload type boundary, not a deployment label. Allowing
+    a free-form alias lets incompatible model revisions or raw layouts resolve
+    to the same stored bytes. Schema changes must instead bump the
+    source-controlled layout ID used by ``canonical_namespace``.
+    """
+    if key in config:
+        raise ValueError(
+            f"dfkv does not support '{key}': namespace identity is derived "
+            "automatically from model revision and raw-layout geometry; bump "
+            "the connector's source-controlled layout ID for a schema change"
+        )
+
+
 def canonical_namespace(
     model_identity: str,
     layout_id: str,
-    override: str | None = None,
     *,
     tenant_id: str = "default",
     model_revision: str | None = None,
@@ -316,19 +334,12 @@ def canonical_namespace(
 ) -> bytes:
     """Build the binary namespace passed to ``dfkv_open_v2``.
 
-    The automatic form is the cross-language ``NamespaceDescriptor`` contract:
-    tenant, exact model/revision, runtime raw-layout contract, dtype, token and
-    layer geometry, topology sizes, and a deterministic fingerprint of any
-    connector-specific layout fields. Rank stays replicated here because the
-    per-object pool key carries rank scope.
-
-    An explicit override is deliberately a disjoint namespace form. It is the
-    operator's assertion that all producers and consumers using that exact
-    override store byte-compatible payloads.
+    The namespace is the cross-language ``NamespaceDescriptor`` contract:
+    tenant, exact model/revision, source-controlled raw-layout contract, dtype,
+    token and layer geometry, topology sizes, and a deterministic fingerprint
+    of connector-specific layout fields. Rank stays replicated here because
+    the per-object pool key carries rank scope.
     """
-    if override is not None:
-        return _OVERRIDE_NAMESPACE_MAGIC + _field(
-            _required_bytes(override, "key_namespace override"))
     descriptor = NamespaceDescriptor(
         tenant_id=tenant_id,
         model_id=model_identity,

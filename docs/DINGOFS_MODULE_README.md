@@ -53,8 +53,6 @@ cd test/unit/cache/kvclient/python && python3 -m unittest test_dingofs_hicache  
 - Launch SGLang with `--hicache-storage-backend dynamic` +
   `--hicache-storage-backend-extra-config '{"backend_name":"dfkv",
   "module_path":"dfkv_hicache","class_name":"DfkvHiCache","interface_v1":1,
-  "members":"n1=ip:port,...",
-  "key_namespace":"<optional-coordinated-schema-override>"}'` and
-  `PYTHONPATH`/`DFKV_LIB` set. SGLang supplies the exact runtime `model_name`;
-  omit `key_namespace` for the safe automatic model + `sglang-hicache/raw-v1`
-  namespace.
+  "members":"n1=ip:port,..."}'` and `PYTHONPATH`/`DFKV_LIB` set. SGLang
+  supplies the exact runtime `model_name`; the connector combines it with the
+  source-controlled `sglang-hicache/raw-v1` layout ID.

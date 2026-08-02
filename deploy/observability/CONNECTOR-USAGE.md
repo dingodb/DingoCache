@@ -90,11 +90,11 @@ vllm serve <model> \
     "kv_connector_module_path":"dfkv_vllm.connector",
     "kv_role":"kv_both",
     "kv_connector_extra_config":{"members":"c1=<ip>:<rdma-port>",
-      "key_namespace":"<optional-coordinated-schema-override>","lib":"/path/to/libdfkv.so"}}'
+      "lib":"/path/to/libdfkv.so"}}'
 ```
 
-vLLM supplies the exact runtime `model_name`; omit `key_namespace` for the safe
-automatic model + `vllm/raw-v1` namespace.
+vLLM supplies the exact runtime `model_name` and combines it with the
+source-controlled `vllm/raw-v1` namespace.
 
 ### 2.2 打开 telemetry
 **只认环境变量**(连接器内部 `configure({})`,**不会**去读 `kv_connector_extra_config`),
@@ -123,8 +123,6 @@ extra_config:
   remote_storage_plugin.dfkv.module_path: dfkv_connector.adapter
   remote_storage_plugin.dfkv.class_name:  DfkvConnectorAdapter
   remote_storage_plugin.dfkv.url:         dfkv://mds1:6700,mds2:6700/group-1
-  # Optional explicit schema override; normally use runtime model + lmcache/raw-v1
-  remote_storage_plugin.dfkv.key_namespace: <coordinated-schema-override>
   # Other optional control metadata: membership(mds|static)、lib、mds_poll_ms
 ```
 
@@ -153,14 +151,13 @@ SGLang 通过 `--hicache-storage-backend dynamic` 加载,**所有配置走 `extr
 {
   "interface_v1": 1,                       // 必须,选 zero-copy v1 RDMA 路径
   "mds_endpoints": "mds1:6700,mds2:6700",  // 或 "members": "c1=<ip>:<port>"
-  "key_namespace": "<optional-coordinated-schema-override>",
   "lib_path": "/path/to/libdfkv.so"
   // ... 其它 dfkv 连接参数
 }
 ```
 
-SGLang supplies the exact runtime `model_name`; omit `key_namespace` for the
-safe automatic model + `sglang-hicache/raw-v1` namespace.
+SGLang supplies the exact runtime `model_name` and combines it with the
+source-controlled `sglang-hicache/raw-v1` namespace.
 
 ### 4.2 打开 telemetry —— 两种写法,二选一
 HiCache 连接器把 `extra_config` 传进了 telemetry(`configure(cfg)`),所以

@@ -8,8 +8,8 @@
       "kv_connector_extra_config":{"members":"c1=<ip>:<rdma-port>",
         "lib":"/path/to/libdfkv.so"}}'
 
-The exact model identity comes from vLLM. ``key_namespace`` is an optional
-explicit schema override; omit it for the safe ``vllm/raw-v1`` default.
+The exact model identity comes from vLLM and is bound to the source-controlled
+``vllm/raw-v1`` layout ID; operator namespace aliases are rejected.
 """
 from .dfkv_client import DfkvDeviceClient
 
