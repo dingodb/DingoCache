@@ -9,6 +9,7 @@
 #include "client/key_map.h"
 #include "cache/kv_node_server.h"
 #include "cache/rdma_server.h"
+#include "compat/sgengine_rdma_frontend.h"
 #include "transport/rdma_transport.h"
 #include "transport/rdma_verbs.h"
 #include "common/value_header.h"
@@ -99,6 +100,46 @@ long CounterVal(const std::string& text, const std::string& name) {
 }
 
 }  // namespace
+
+TEST(RdmaLoopback, SgEngineV1PortIsolatedFromNativeKeyDomain) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ::setenv("DFKV_RDMA_RECV_SEGMENT_SIZE", "8388608", 1);
+  RdmaNode node("sgengine-domain");
+  compat::SgEngineRdmaFrontend legacy(*node.srv, kMaxMsg);
+  ASSERT_EQ(legacy.Start(0), Status::kOk);
+  const std::string legacy_address =
+      "127.0.0.1:" + std::to_string(legacy.port());
+
+  // Force the old SGEngine protocol: no DCP2 probe or one-sided payload path.
+  ::setenv("DFKV_RDMA_PROTOCOL", "1", 1);
+  auto transport = std::make_unique<RdmaTransport>(kMaxMsg);
+  ::unsetenv("DFKV_RDMA_PROTOCOL");
+
+  const BlockKey wire_key{73, 4, 4096};
+  const std::string native_value = "native-rdma";
+  const std::string legacy_value = "legacy-rdma";
+  ASSERT_EQ(transport->Cache(node.addr, wire_key, native_value.data(),
+                             native_value.size()),
+            Status::kOk);
+  ASSERT_EQ(transport->Cache(legacy_address, wire_key, legacy_value.data(),
+                             legacy_value.size()),
+            Status::kOk);
+
+  std::string out;
+  ASSERT_EQ(transport->Range(node.addr, wire_key, 0, native_value.size(), &out),
+            Status::kOk);
+  EXPECT_EQ(out, native_value);
+  ASSERT_EQ(transport->Range(legacy_address, wire_key, 0,
+                             legacy_value.size(), &out),
+            Status::kOk);
+  EXPECT_EQ(out, legacy_value);
+
+  std::string members;
+  EXPECT_EQ(transport->Members(legacy_address, &members), Status::kInvalid);
+  EXPECT_EQ(legacy.RejectedOps(), 1u);
+  transport.reset();
+  legacy.Stop();
+}
 
 // Direct transport ExistMany: windowed batch existence probe on one connection.
 // Must be correct across multiple send windows (N > depth) with mixed hit/miss.

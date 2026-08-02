@@ -72,7 +72,7 @@ GpuNodeDedup::Options Opts(const std::string& name) {
   return o;
 }
 
-BlockKey K(uint64_t id) { return BlockKey{id, 0, 1}; }
+BlockKey K(uint64_t id) { return BlockKey{id, 0}; }
 
 std::string Val(uint64_t id, size_t n) {
   std::string v(n, '\0');

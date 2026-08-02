@@ -25,8 +25,12 @@ namespace fs = std::filesystem;
 namespace dfkv {
 
 namespace {
-// Table-record + meta magics.
-constexpr uint32_t kRecMagic = 0x424C5453u;   // "SLTB"
+// Native digest records use a distinct magic. v1 native records are never
+// reinterpreted as SHA-256 identities; compatibility records remain readable
+// because their complete legacy tuple maps bijectively into the two words.
+constexpr uint32_t kRecMagic = 0x324C5453u;  // "STL2"
+constexpr uint32_t kLegacyNativeRecMagic = 0x424C5453u;
+constexpr uint32_t kCompatRecMagic = 0x434C5453u;
 constexpr uint32_t kMetaMagic = 0x424C534Du;  // "SLBM"
 constexpr uint32_t kFormatVersion = 1;
 constexpr uint32_t kStateMagic = 0x53424C53u;  // "SLBS"
@@ -482,7 +486,12 @@ bool DiskSlabStore::Rebuild() {
       }
       const uint32_t magic =
           net::GetU32(reinterpret_cast<char*>(rec));
-      if (magic != kRecMagic) {
+      const bool compat = magic == kCompatRecMagic;
+      if (magic == kLegacyNativeRecMagic) {
+        ++rebuild_rejected_records_;
+        continue;
+      }
+      if (magic != kRecMagic && !compat) {
         if (magic != 0) ++rebuild_corrupt_records_;
         continue;
       }
@@ -495,12 +504,16 @@ bool DiskSlabStore::Rebuild() {
       const uint32_t slot_size =
           net::GetU32(reinterpret_cast<char*>(rec) + 12);
       BlockKey key;
-      key.id = net::GetU64(reinterpret_cast<char*>(rec) + 16);
-      key.index = net::GetU32(reinterpret_cast<char*>(rec) + 24);
-      key.size = net::GetU32(reinterpret_cast<char*>(rec) + 28);
+      key.digest_hi = net::GetU64(reinterpret_cast<char*>(rec) + 16);
+      key.digest_lo = net::GetU64(reinterpret_cast<char*>(rec) + 24);
+      key.domain = compat
+                       ? static_cast<KeyDomain>(
+                             net::GetU32(reinterpret_cast<char*>(rec) + 36))
+                       : KeyDomain::kNative;
       const uint32_t payload_len =
           net::GetU32(reinterpret_cast<char*>(rec) + 32);
       const bool geometry_ok =
+          (!compat || key.domain == KeyDomain::kSgEngineV1) &&
           slot_size >= opt_.slot_granularity &&
           (slot_size % opt_.slot_granularity) == 0 &&
           slot_size <= opt_.extent_bytes && payload_len <= slot_size &&
@@ -545,15 +558,21 @@ bool DiskSlabStore::WriteRecord(const SlabAllocator::SlotRef& r,
                                 const BlockKey& key, uint32_t payload_len,
                                 bool valid) {
   if (!Healthy()) return false;
+  if (key.domain != KeyDomain::kNative &&
+      key.domain != KeyDomain::kSgEngineV1)
+    return false;
   uint8_t rec[kRecBytes];
   std::memset(rec, 0, sizeof(rec));
-  net::PutU32(reinterpret_cast<char*>(rec), kRecMagic);
+  net::PutU32(reinterpret_cast<char*>(rec),
+              key.domain == KeyDomain::kNative ? kRecMagic
+                                               : kCompatRecMagic);
   rec[8] = valid ? 1 : 0;
   net::PutU32(reinterpret_cast<char*>(rec) + 12, r.slot_size);
-  net::PutU64(reinterpret_cast<char*>(rec) + 16, key.id);
-  net::PutU32(reinterpret_cast<char*>(rec) + 24, key.index);
-  net::PutU32(reinterpret_cast<char*>(rec) + 28, key.size);
+  net::PutU64(reinterpret_cast<char*>(rec) + 16, key.digest_hi);
+  net::PutU64(reinterpret_cast<char*>(rec) + 24, key.digest_lo);
   net::PutU32(reinterpret_cast<char*>(rec) + 32, payload_len);
+  net::PutU32(reinterpret_cast<char*>(rec) + 36,
+              static_cast<uint32_t>(key.domain));
   const uint32_t crc = Crc32(rec + 8, kRecBytes - 8);
   net::PutU32(reinterpret_cast<char*>(rec) + 4, crc);
   if (!PwriteAll(table_fd_, rec, kRecBytes, TableOffset(r.extent, r.slot)))

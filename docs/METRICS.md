@@ -63,6 +63,16 @@ RDMA 构建额外（折叠进同一 /metrics）：
 | `dfkv_uring_reads_total` / `dfkv_uring_init_fallbacks_total` | counter | io_uring 路径真实提交的读数（**>0 = 路径确实激活**，外部可证）/ 想用 uring 但 ring 初始化失败静默回退同步的连接数（>0 = 配了没生效，查内核/权限） |
 | `dfkv_rdma_idle_reclaims_total` | counter | 空闲超时回收的连接数 |
 
+SGEngine 兼容入口（对应 flag 未启用时整组不存在）：
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `dfkv_sgengine_tcp_info{wire="v1",key_domain="sgengine-v1"}` | gauge | 旧 TCP frontend 已启用，恒为 1 |
+| `dfkv_sgengine_tcp_accepts_total` / `open_connections` / `requests_total` | counter / gauge | 旧 TCP 连接与请求流量 |
+| `dfkv_sgengine_tcp_rejected_ops_total` | counter | 在隔离边界拒绝的 discovery/MDS/control op |
+| `dfkv_sgengine_rdma_info{wire="v1",key_domain="sgengine-v1"}` | gauge | 旧 RDMA frontend 已启用且强制 v1，恒为 1 |
+| `dfkv_sgengine_rdma_*` / `dfkv_sgengine_uring_*` | 与 native 同名尾缀 | 兼容 RDMA listener 的独立连接、完成、错误和 read-path 指标；不会与 native `dfkv_rdma_*` 混算 |
+| `dfkv_sgengine_rdma_rejected_ops_total` | counter | 在旧 RDMA 边界拒绝的 discovery/MDS/control op |
+
 > **v2 上线判据**：新 client + 新 server 车队应看到 client/server 两侧
 > `v2_conns_opened_total` 增长，PUT/GET write counter 随负载增长，
 > `v2_ready=1` 且 `recv_segment_free_bytes` 有容量余量。若 server 的

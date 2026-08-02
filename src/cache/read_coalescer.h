@@ -63,29 +63,36 @@ class ReadCoalescer {
   static void RecordConfig() { (void)WaitMs(); (void)RecurMs(); }
 
   struct Key {
-    uint64_t id;
-    uint32_t index, ksize;
-    uint64_t offset, length;
-    bool operator==(const Key& o) const {
-      return id == o.id && index == o.index && ksize == o.ksize &&
-             offset == o.offset && length == o.length;
+    uint64_t digest_hi;
+    uint64_t digest_lo;
+    uint32_t domain;
+    uint64_t offset;
+    uint64_t length;
+    bool operator==(const Key& other) const {
+      return digest_hi == other.digest_hi && digest_lo == other.digest_lo &&
+             domain == other.domain && offset == other.offset &&
+             length == other.length;
     }
   };
   struct KeyHash {
-    size_t operator()(const Key& k) const {
-      size_t h = std::hash<uint64_t>()(k.id);
-      h ^= std::hash<uint64_t>()((static_cast<uint64_t>(k.index) << 32) ^ k.ksize) +
-           0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-      h ^= std::hash<uint64_t>()(k.offset ^ (k.length << 1)) + 0x9e3779b97f4a7c15ULL +
-           (h << 6) + (h >> 2);
-      return h;
+    size_t operator()(const Key& key) const {
+      size_t hash = std::hash<uint64_t>()(key.digest_hi);
+      auto combine = [&hash](size_t value) {
+        hash ^= value + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+      };
+      combine(std::hash<uint64_t>()(key.digest_lo));
+      combine(std::hash<uint32_t>()(key.domain));
+      combine(std::hash<uint64_t>()(key.offset));
+      combine(std::hash<uint64_t>()(key.length));
+      return hash;
     }
   };
 
   // True if an identical read is currently in flight (used by the async-prep
   // path as a cheap early decline, before the index lookup + fd open).
   bool InFlight(const BlockKey& bk, uint64_t offset, uint64_t length) {
-    Key k{bk.id, bk.index, bk.size, offset, length};
+    Key k{bk.digest_hi, bk.digest_lo, static_cast<uint32_t>(bk.domain),
+          offset, length};
     std::lock_guard<std::mutex> lk(mu_);
     return map_.find(k) != map_.end();
   }
@@ -97,7 +104,8 @@ class ReadCoalescer {
   // (offset 0, full length): only such reads are eligible for RAM promotion.
   uint64_t TryRegisterAsync(const BlockKey& bk, uint64_t offset, uint64_t length,
                             bool whole_value) {
-    Key k{bk.id, bk.index, bk.size, offset, length};
+    Key k{bk.digest_hi, bk.digest_lo, static_cast<uint32_t>(bk.domain),
+          offset, length};
     std::lock_guard<std::mutex> lk(mu_);
     if (map_.find(k) != map_.end()) return 0;
     auto f = std::make_shared<Flight>();
@@ -183,7 +191,9 @@ class ReadCoalescer {
     }
     f->cv.notify_all();
     leaders_.fetch_add(1, std::memory_order_relaxed);
-    if (key) *key = BlockKey{f->key.id, f->key.index, f->key.ksize};
+    if (key)
+      *key = BlockKey{f->key.digest_hi, f->key.digest_lo,
+                      static_cast<KeyDomain>(f->key.domain)};
     if (whole) *whole = f->whole;
     if (recurrent) *recurrent = f->recurrent;
     return waiters;
@@ -204,7 +214,8 @@ class ReadCoalescer {
               size_t dst_cap, size_t* out_len,
               const std::function<Status(char*, size_t, size_t*)>& fill,
               Outcome* oc = nullptr) {
-    Key k{bk.id, bk.index, bk.size, offset, length};
+    Key k{bk.digest_hi, bk.digest_lo, static_cast<uint32_t>(bk.domain),
+          offset, length};
     std::shared_ptr<Flight> f;
     bool leader = false;
     {

@@ -66,7 +66,9 @@ size_t RecvSegmentBytes() {
 }
 }  // namespace
 
-RdmaServer::RdmaServer(Handler handler, size_t max_msg, const std::string& dev_name)
+RdmaServer::RdmaServer(Handler handler, size_t max_msg,
+                       const std::string& dev_name,
+                       ProtocolMode protocol_mode)
     : handler_(std::move(handler)),
       max_msg_(ResolveMaxPayload(max_msg)),
       control_cap_(ControlCapFor(max_msg_)),
@@ -76,11 +78,18 @@ RdmaServer::RdmaServer(Handler handler, size_t max_msg, const std::string& dev_n
     if (e && *e) dev_name_ = e;
   }
   auto_device_ = dev_name_.empty();
-  config_dump::RecordResolved("DFKV_RDMA_DEV", dev_name_.empty() ? "(auto)" : dev_name_);
-  const char* protocol = std::getenv("DFKV_RDMA_SERVER_PROTOCOL");
-  v2_enabled_ = !(protocol && std::strcmp(protocol, "1") == 0);
-  config_dump::RecordResolved("DFKV_RDMA_SERVER_PROTOCOL",
-                              v2_enabled_ ? "auto-v2" : "v1");
+  config_dump::RecordResolved("DFKV_RDMA_DEV",
+                              dev_name_.empty() ? "(auto)" : dev_name_);
+  if (protocol_mode == ProtocolMode::kSgEngineV1) {
+    legacy_wire_ = true;
+    v2_enabled_ = false;
+    config_dump::RecordResolved("DFKV_RDMA_SERVER_PROTOCOL", "sgengine-v1");
+  } else {
+    const char* protocol = std::getenv("DFKV_RDMA_SERVER_PROTOCOL");
+    v2_enabled_ = !(protocol && std::strcmp(protocol, "1") == 0);
+    config_dump::RecordResolved("DFKV_RDMA_SERVER_PROTOCOL",
+                                v2_enabled_ ? "auto-v2" : "v1");
+  }
   // --rdma-dev accepts a comma list (multi-rail): every listed device gets a
   // lifetime anchor in Start(); the FIRST entry stays the default for legacy
   // clients whose bootstrap dev frame is empty.
@@ -359,6 +368,14 @@ void RdmaServer::Serve(int boot_fd) {
   const bool use_v2 =
       v2_enabled_ && requested_protocol >= rdma::kDevProtoV2 &&
       declared != 0;
+  const uint8_t wire_epoch =
+      legacy_wire_ ? kSgEngineProtoV1
+                   : (use_v2 ? kNativeProtoRdmaV2 : kNativeProtoBase);
+  auto request_key = [this](const ReqFields& fields) {
+    return BlockKey{fields.digest_hi, fields.digest_lo,
+                    legacy_wire_ ? KeyDomain::kSgEngineV1
+                                 : KeyDomain::kNative};
+  };
   if (declared && declared > static_cast<uint64_t>(max_msg_)) {
     DFKV_LOG_ERROR("rdma: client declared max block " + std::to_string(declared) +
                    "B, above this server's cap " + std::to_string(max_msg_) +
@@ -559,7 +576,7 @@ void RdmaServer::Serve(int boot_fd) {
       const char* frame = recv_lease.data() + data_slot * slot_size +
                           rdma::kV2PutPrefixOffset;
       if (!DecodeReqVersion(
-              frame, kProtoVersionV2, &request->fields,
+              frame, kNativeProtoRdmaV2, &request->fields,
               static_cast<uint64_t>(logical_data_cap)) ||
           request->fields.op != static_cast<uint8_t>(WireOp::kCache) ||
           !rdma::V2PutCompletionIsValid(
@@ -575,10 +592,9 @@ void RdmaServer::Serve(int boot_fd) {
 
     const char* frame = ep.rbuf(recv_slot);
     if (completion.byte_len < kReqPrefix ||
-        !DecodeReqVersion(
-            frame, use_v2 ? kProtoVersionV2 : kProtoVersionV1,
-            &request->fields,
-            static_cast<uint64_t>(ValueHeader::kSize + conn_max))) {
+        !DecodeReqVersion(frame, wire_epoch, &request->fields,
+                          static_cast<uint64_t>(ValueHeader::kSize +
+                                                conn_max))) {
       return false;
     }
     if (use_v2 &&
@@ -647,11 +663,10 @@ void RdmaServer::Serve(int boot_fd) {
   auto build_reply = [&](size_t send_slot, const Request& request,
                          Reply* reply) -> bool {
     const ReqFields& fields = request.fields;
+    const BlockKey key = request_key(fields);
     char* send_buffer = ep.sbuf(send_slot);
     auto encode_status = [&](Status status, uint64_t data_len) {
-      EncodeRespVersion(send_buffer,
-                        use_v2 ? kProtoVersionV2 : kProtoVersionV1,
-                        status, data_len);
+      EncodeRespVersion(send_buffer, wire_epoch, status, data_len);
     };
     auto invalid_reply = [&] {
       encode_status(Status::kInvalid, 0);
@@ -730,9 +745,8 @@ void RdmaServer::Serve(int boot_fd) {
         const char* ram_data = nullptr;
         size_t ram_len = 0;
         uint64_t token = 0;
-        if (ram_range_handler_(
-                fields.id, fields.index, fields.size, fields.offset,
-                fields.length, &ram_data, &ram_len, &token)) {
+        if (ram_range_handler_(key, fields.offset, fields.length, &ram_data,
+                               &ram_len, &token)) {
           ibv_mr* ram_mr =
               ram_len ? ep.RegisterUser(const_cast<char*>(ram_data), ram_len)
                       : nullptr;
@@ -746,9 +760,8 @@ void RdmaServer::Serve(int boot_fd) {
       const char* output = nullptr;
       size_t output_len = 0;
       const Status status = range_handler_(
-          fields.id, fields.index, fields.size, fields.offset, fields.length,
-          direct_buffer(request.data_slot), direct_buffer_cap, &output,
-          &output_len);
+          key, fields.offset, fields.length, direct_buffer(request.data_slot),
+          direct_buffer_cap, &output, &output_len);
       return data_reply(status, output, output_len,
                         direct_mr(request.data_slot),
                         /*source_uses_slot=*/true, 0);
@@ -778,8 +791,8 @@ void RdmaServer::Serve(int boot_fd) {
         }
       }
       const Status status = cache_direct_handler_(
-          fields.id, fields.index, fields.size, cache_data,
-          static_cast<size_t>(fields.payload_len), direct_buffer_cap);
+          key, cache_data, static_cast<size_t>(fields.payload_len),
+          direct_buffer_cap);
       encode_status(status, 0);
       reply->first_len = kRespPrefix;
       return true;
@@ -797,9 +810,9 @@ void RdmaServer::Serve(int boot_fd) {
       }
     }
     std::string data;
-    const Status status = handler_(
-        fields.op, fields.id, fields.index, fields.size, fields.offset,
-        fields.length, payload, fields.payload_len, &data);
+    const Status status =
+        handler_(fields.op, key, fields.offset, fields.length, payload,
+                 fields.payload_len, &data);
     if (use_v2 &&
         fields.op == static_cast<uint8_t>(WireOp::kRange)) {
       if (data.size() > direct_buffer_cap) return invalid_reply();
@@ -967,8 +980,8 @@ void RdmaServer::Serve(int boot_fd) {
               direct_mr(request.data_slot) &&
               rq.length <= static_cast<uint64_t>(ValueHeader::kSize + conn_max)) {
             RangePrepResult pr;
-            Status pst = range_prep_handler_(rq.id, rq.index, rq.size, rq.offset,
-                                             rq.length, direct_buffer_cap, &pr);
+            Status pst = range_prep_handler_(
+                request_key(rq), rq.offset, rq.length, direct_buffer_cap, &pr);
             if (pst == Status::kOk && pr.fd >= 0 && pr.payload_len != 0 &&
                 pr.aligned_len <= direct_buffer_cap &&
                 pr.aligned_len <= std::numeric_limits<unsigned>::max()) {
@@ -1082,7 +1095,7 @@ void RdmaServer::Serve(int boot_fd) {
             if (header_len > qd.payload_len ||
                 kRespPrefix + header_len > ep.cap() ||
                 remote_len > qd.get.Capacity()) {
-              EncodeRespVersion(sb, kProtoVersionV2, Status::kInvalid, 0);
+              EncodeRespVersion(sb, kNativeProtoRdmaV2, Status::kInvalid, 0);
               if (!post_request_recv(qd.recv_slot) ||
                   !ep.PostSend(qd.send_slot, kRespPrefix)) {
                 fail = true;
@@ -1090,7 +1103,7 @@ void RdmaServer::Serve(int boot_fd) {
               }
               continue;
             }
-            EncodeRespVersion(sb, kProtoVersionV2, Status::kOk,
+            EncodeRespVersion(sb, kNativeProtoRdmaV2, Status::kOk,
                               qd.payload_len);
             if (header_len)
               std::memcpy(sb + kRespPrefix, out_data, header_len);
@@ -1114,8 +1127,7 @@ void RdmaServer::Serve(int boot_fd) {
               break;
             }
           } else if (ok) {
-            EncodeRespVersion(sb, kProtoVersionV1, Status::kOk,
-                              qd.payload_len);
+            EncodeRespVersion(sb, wire_epoch, Status::kOk, qd.payload_len);
             // Defer recv rearm until this scatter SEND completes (read target reuse).
             rearm_on_send[qd.send_slot] = qd.recv_slot;
             if (!ep.PostSendScatter(qd.send_slot, kRespPrefix, out_data,
@@ -1125,9 +1137,7 @@ void RdmaServer::Serve(int boot_fd) {
               break;
             }
           } else {
-            EncodeRespVersion(sb,
-                              use_v2 ? kProtoVersionV2 : kProtoVersionV1,
-                              Status::kIOError, 0);
+            EncodeRespVersion(sb, wire_epoch, Status::kIOError, 0);
             if (!post_request_recv(qd.recv_slot) ||
                 !ep.PostSend(qd.send_slot, kRespPrefix)) {
               fail = true;

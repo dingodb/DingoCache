@@ -21,33 +21,37 @@
 #include <utility>
 #include <vector>
 
+#include "common/kv_types.h"
 #include "common/status.h"
-#include "transport/rdma_verbs.h"  // rdma::RcEndpoint
 #include "transport/rdma_recv_segment.h"
+#include "transport/rdma_verbs.h"  // rdma::RcEndpoint
 
 namespace dfkv {
 
 class RdmaServer {
  public:
+  enum class ProtocolMode {
+    kAuto,
+    // Isolated SGEngine v1 compatibility: QP protocol 1, wire epoch 1, and
+    // every request key tagged kSgEngineV1 before it reaches the handler.
+    kSgEngineV1,
+  };
   using Handler = std::function<Status(
-      uint8_t op, uint64_t id, uint32_t index, uint32_t ksize, uint64_t offset,
-      uint64_t length, const char* payload, uint64_t payload_len,
-      std::string* out_data)>;
+      uint8_t op, const BlockKey& key, uint64_t offset, uint64_t length,
+      const char* payload, uint64_t payload_len, std::string* out_data)>;
   // Optional direct GET handler: read an O_DIRECT-aligned superset into `io_buf`
   // and return *out_data pointing inside that same registered buffer at the exact
   // requested range. When set, kRange replies scatter-send [resp | *out_data]
   // without copying the payload into sbuf.
   using RangeHandler = std::function<Status(
-      uint64_t id, uint32_t index, uint32_t ksize, uint64_t offset,
-      uint64_t length, char* io_buf, size_t io_cap, const char** out_data,
-      size_t* out_len)>;
+      const BlockKey& key, uint64_t offset, uint64_t length, char* io_buf,
+      size_t io_cap, const char** out_data, size_t* out_len)>;
   // Optional direct PUT handler: `data` points at a 4096-aligned registered
   // buffer containing the full stored blob [ValueHeader|payload]. `cap` is the
   // usable direct-buffer capacity. The handler may zero O_DIRECT padding bytes
   // after len and write data directly to disk.
   using CacheDirectHandler = std::function<Status(
-      uint64_t id, uint32_t index, uint32_t ksize, char* data, size_t len,
-      size_t cap)>;
+      const BlockKey& key, char* data, size_t len, size_t cap)>;
 
   // Optional async-GET prep handler (ADDITIVE, used only by the io_uring serve
   // path when DFKV_SERVER_URING=1). Does the cheap, lock-protected half of a
@@ -73,8 +77,8 @@ class RdmaServer {
     uint64_t flight = 0;
   };
   using RangePrepHandler = std::function<Status(
-      uint64_t id, uint32_t index, uint32_t ksize, uint64_t offset,
-      uint64_t length, size_t io_cap, RangePrepResult* out)>;
+      const BlockKey& key, uint64_t offset, uint64_t length, size_t io_cap,
+      RangePrepResult* out)>;
   // Optional accounting hook invoked once an async read completes (mirrors the
   // hit/io-error counters the synchronous RangeDirect bumps).
   // elapsed_sec = wall time from prep (read submit) to completion, so the
@@ -101,7 +105,8 @@ class RdmaServer {
   // dev_name empty => env DFKV_RDMA_DEV; both empty => first ACTIVE local HCA
   // (legacy host-local semantics). An explicit comma list enables multi-rail.
   explicit RdmaServer(Handler handler, size_t max_msg = (64u << 20),
-                      const std::string& dev_name = "");
+                      const std::string& dev_name = "",
+                      ProtocolMode protocol_mode = ProtocolMode::kAuto);
   void set_range_handler(RangeHandler h) { range_handler_ = std::move(h); }
   void set_cache_direct_handler(CacheDirectHandler h) {
     cache_direct_handler_ = std::move(h);
@@ -133,8 +138,8 @@ class RdmaServer {
   // arena registered via RegisterMemory for the path to activate; otherwise the
   // existing range_handler_ (copy-out) path runs unchanged.
   using RamRangeHandler = std::function<bool(
-      uint64_t id, uint32_t index, uint32_t ksize, uint64_t offset,
-      uint64_t length, const char** out_ptr, size_t* out_len, uint64_t* out_token)>;
+      const BlockKey& key, uint64_t offset, uint64_t length,
+      const char** out_ptr, size_t* out_len, uint64_t* out_token)>;
   using RamReleaseHandler = std::function<void(uint64_t token)>;
   void set_ram_range_handler(RamRangeHandler h) { ram_range_handler_ = std::move(h); }
   void set_ram_release_handler(RamReleaseHandler h) { ram_release_handler_ = std::move(h); }
@@ -214,6 +219,7 @@ class RdmaServer {
   size_t control_cap_;
   std::string dev_name_;
   bool v2_enabled_ = true;
+  bool legacy_wire_ = false;
   bool auto_device_ = true;
   int listen_fd_ = -1;
   int port_ = 0;

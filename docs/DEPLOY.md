@@ -133,6 +133,13 @@ WantedBy=multi-user.target
 > SGLang/vLLM/LMCache inference client 进程；server 用 `--max-msg 4194304`
 > 验证上限，不读取该 client env。
 
+> **原 SGEngine store 迁移窗口（默认不开）**：按需追加
+> `--sgengine-tcp-port <p>` 和/或 `--sgengine-rdma-port <p>`，两者独立开关。
+> 兼容 RDMA 固定为旧 v1/DCP1，不占 DCP2 receive segment；兼容 key 写入独立
+> `sgengine-v1` domain。不要把兼容端口写进 native `--advertise`/MDS 成员表，
+> 旧客户端使用独立静态 endpoint 列表；协议矩阵和验收指标见
+> [CONNECTORS.md](CONNECTORS.md) §0.1 / [METRICS.md](METRICS.md) §3.1。
+
 > **可选存储/加速开关（见 [ARCHITECTURE.md](ARCHITECTURE.md) §5–7）。行为开关均为「门面 flag + `DFKV_*` env 双生」，flag 覆盖预设 env；运行时真值经 `dfkvctl ring` INFO 列审计（`engine=`/`wr=`/`ram=`）。**
 > - `--store-engine file|slab`（默认 `file`）：`slab` = extent 池 + slots.tbl 重启保温，消除"每块一文件"隐患。**切 slab 需清盘冷启**（旧 blocks/ 布局不复用），属独立迁移动作。
 > - `--slab-write direct|buffered`（**默认 `direct`**）：slab 数据面全程 O_DIRECT（写+对齐读+异步 prep），零 page cache/脏页占用——GPU 节点上突发吸收交给显式 RAM 热层而非内核缓存；extent 在 direct 模式下 fallocate 实体化（升级后 df 显示预分配为预期行为）。文件系统拒绝 O_DIRECT（如 tmpfs）时整店回退 buffered，以 `wr=` 上报真值。

@@ -46,6 +46,30 @@ probe，新 server 同时接 v1/v2；新旧组合按连接回到 v1。只有新 
 server 才使用共享 receive segment 与 one-sided payload。实际路径以
 `dfkv_rdma_{v1,v2}_conns_opened_total` 为准，不能只看环境变量。
 
+### 0.1 原 SGEngine store 兼容矩阵
+
+兼容入口是**独立端口 + 独立 key domain**，默认关闭；不是在 native handler
+里加旧 key 分支。四个入口可按需组合，其中两个 SGEngine 入口可分别开关：
+
+| 服务端入口 | 客户端/协议 | 内部 key domain | 发现能力 | 默认 |
+|---|---|---|---|---|
+| `--port` | dfkv native TCP wire v1 | `native` | `Stats` + `Members` | 开（`0`=临时端口） |
+| `--rdma-port` | dfkv RDMA DCP1/DCP2 自动协商 | `native` | `Stats` + `Members` | 关 |
+| `--sgengine-tcp-port` | 原 SGEngine store TCP wire v1 | `sgengine-v1` | data ops + `Stats`；拒绝 `Members`/MDS ops | 关 |
+| `--sgengine-rdma-port` | 原 SGEngine store RDMA v1（强制 DCP1，不分配 DCP2 receive segment） | `sgengine-v1` | data ops + `Stats`；拒绝 `Members`/MDS ops | 关 |
+
+例如只开旧 TCP：`--sgengine-tcp-port 28100`；只开旧 RDMA：
+`--sgengine-rdma-port 28101`；两者并存则同时给出两个 flag。旧入口必须使用静态
+endpoint 配置；兼容端口故意不返回 native `Members`，否则旧客户端会跳到 native
+端口并绕过 domain 隔离。两域共享节点容量与淘汰策略，但同一
+`{id,index,size}` 在文件、slab、RAM 和读合并器中均是两个对象；禁止把旧端口与
+native 端口混在同一客户端成员表。
+
+运行时判据：TCP 看 `dfkv_sgengine_tcp_info` /
+`dfkv_sgengine_tcp_requests_total`，RDMA 看 `dfkv_sgengine_rdma_info` /
+`dfkv_sgengine_rdma_v1_conns_opened_total`。`*_rejected_ops_total` 增长说明旧
+客户端仍在尝试 discovery/control op，应修成静态兼容 endpoint。
+
 ---
 
 ## 1. 通用客户端配置（跨连接器 env / config 总表）

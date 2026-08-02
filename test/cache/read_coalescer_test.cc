@@ -22,7 +22,7 @@ using namespace std::chrono_literals;
 
 namespace {
 
-BlockKey K(uint64_t id) { return BlockKey{id, 0, 1}; }
+BlockKey K(uint64_t id) { return BlockKey{id, 0}; }
 
 // The wait bound is latched on first use (function-local static); pin it to a
 // test-friendly value before any test can latch the 500ms default.
@@ -54,14 +54,14 @@ TEST(ReadCoalescer, AsyncFlightHandsPayloadToFollower) {
   });
   // Give the follower time to join the flight, then complete it.
   std::this_thread::sleep_for(50ms);
-  BlockKey key{0, 0, 0};
+  BlockKey key{};
   bool whole = false;
   EXPECT_TRUE(c.CompleteAsync(t, Status::kOk, v.data(), v.size(), &key, &whole));
   follower.join();
   EXPECT_EQ(own_reads.load(), 0);  // served from the flight, no duplicate read
   EXPECT_EQ(got, v);
   EXPECT_EQ(got_len, v.size());
-  EXPECT_EQ(key.id, 1u);
+  EXPECT_EQ(key.digest_hi, 1u);
   EXPECT_TRUE(whole);
   EXPECT_EQ(c.coalesced(), 1u);
 }
@@ -207,7 +207,7 @@ TEST(ReadCoalescer, RecurrenceTombstoneReportsOnReRead) {
   uint64_t t1 = c.TryRegisterAsync(K(20), 0, 8, /*whole=*/true);
   ASSERT_NE(t1, 0u);
   EXPECT_FALSE(c.CompleteAsync(t1, Status::kOk, v, 8));  // lone read: tombstone laid
-  BlockKey key{0, 0, 0};
+  BlockKey key{};
   bool whole = false, recur = false;
   uint64_t t2 = c.TryRegisterAsync(K(20), 0, 8, true);   // re-read inside window
   ASSERT_NE(t2, 0u);
@@ -215,7 +215,7 @@ TEST(ReadCoalescer, RecurrenceTombstoneReportsOnReRead) {
   c.CompleteAsync(t2, Status::kOk, v, 8, &key, &whole, &recur);
   EXPECT_TRUE(recur);      // promotion evidence without any in-flight waiter
   EXPECT_TRUE(whole);
-  EXPECT_EQ(key.id, 20u);
+  EXPECT_EQ(key.digest_hi, 20u);
   // The hit consumed the tombstone, and a recurrent completion lays none
   // (promotion put the page in RAM): a third read reports no recurrence.
   uint64_t t3 = c.TryRegisterAsync(K(20), 0, 8, true);

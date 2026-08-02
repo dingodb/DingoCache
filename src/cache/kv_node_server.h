@@ -76,28 +76,33 @@ class KvNodeServer {
 
   // Transport-agnostic request processing (shared by the TCP handler and, when
   // built with DFKV_WITH_RDMA, the RDMA handler). Returns status; fills out_data.
-  Status ProcessRequest(uint8_t op, uint64_t id, uint32_t index, uint32_t ksize,
-                        uint64_t offset, uint64_t length, const char* payload,
-                        uint64_t payload_len, std::string* out_data);
+  // Every frontend supplies a fully formed, domain-tagged identity. Native
+  // TCP/RDMA decoders construct kNative; compatibility ports construct their
+  // isolated domain before calling this boundary.
+  Status ProcessRequestForKey(uint8_t op, const BlockKey& key,
+                              uint64_t offset, uint64_t length,
+                              const char* payload, uint64_t payload_len,
+                              std::string* out_data);
 
   // Zero-copy server-side GET: read the block straight into `dst` (e.g. the RDMA
   // send buffer), no intermediate std::string. *out_len = bytes read. Updates
   // hit/miss + bytes_read metrics like a Range.
-  Status RangeInto(uint64_t id, uint32_t index, uint32_t ksize, uint64_t offset,
-                   uint64_t length, char* dst, size_t dst_cap, size_t* out_len);
+  Status RangeIntoForKey(const BlockKey& key, uint64_t offset,
+                         uint64_t length, char* dst, size_t dst_cap,
+                         size_t* out_len);
 
   // RDMA direct PUT: `data` is an O_DIRECT-aligned [ValueHeader|payload] buffer
   // owned by the RDMA receive slot. Writes it to disk without a payload-sized
   // CPU copy and updates PUT metrics like ProcessRequest(kCache).
-  Status CacheDirect(uint64_t id, uint32_t index, uint32_t ksize, char* data,
-                     size_t len, size_t cap);
+  Status CacheDirectForKey(const BlockKey& key, char* data, size_t len,
+                           size_t cap);
 
   // RDMA direct GET: read an O_DIRECT-aligned superset into `io_buf`; *out_data
   // points inside that same buffer at the exact requested range so the RDMA layer
   // can scatter-send it without copying into sbuf.
-  Status RangeDirect(uint64_t id, uint32_t index, uint32_t ksize, uint64_t offset,
-                     uint64_t length, char* io_buf, size_t io_cap,
-                     const char** out_data, size_t* out_len);
+  Status RangeDirectForKey(const BlockKey& key, uint64_t offset,
+                           uint64_t length, char* io_buf, size_t io_cap,
+                           const char** out_data, size_t* out_len);
 
   // Async-friendly prep half of RangeDirect: index lookup + O_DIRECT open +
   // alignment math, NO disk read (see KVStore::RangeDirectPrep). The caller
@@ -110,10 +115,10 @@ class KvNodeServer {
   // RangeFlightAbort (read never ran). A prep that loses the registration race
   // to an identical in-flight read declines with kInvalid so the serve loop
   // falls back to the sync path, which joins the flight.
-  Status RangeDirectPrep(uint64_t id, uint32_t index, uint32_t ksize,
-                         uint64_t offset, uint64_t length, size_t io_cap,
-                         KVStore::RangePrep* out,
-                         uint64_t* out_flight = nullptr);
+  Status RangeDirectPrepForKey(const BlockKey& key, uint64_t offset,
+                               uint64_t length, size_t io_cap,
+                               KVStore::RangePrep* out,
+                               uint64_t* out_flight = nullptr);
   // Account a completed prep-based GET (called after the async read finishes).
   // elapsed_sec = submit->completion wall time; sampled into get_lat_ so the
   // default (uring) read path is no longer absent from op="get" latency.
@@ -142,9 +147,9 @@ class KvNodeServer {
   // On a RAM hit, pins the slot and returns its arena pointer + length + a token;
   // the caller MUST call RamRelease(token) once the RDMA send completes (the NIC
   // reads the shared arena in place -- gap 10.1). Bumps hit/miss + bytes-read.
-  bool RamRangePrep(uint64_t id, uint32_t index, uint32_t ksize, uint64_t offset,
-                    uint64_t length, const char** out_ptr, size_t* out_len,
-                    uint64_t* out_token);
+  bool RamRangePrepForKey(const BlockKey& key, uint64_t offset,
+                          uint64_t length, const char** out_ptr,
+                          size_t* out_len, uint64_t* out_token);
   void RamRelease(uint64_t token);
 
  private:

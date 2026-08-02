@@ -2,6 +2,7 @@
 #include <cerrno>
 #include <fstream>
 #include "cache/kv_store.h"
+#include "compat/sgengine_key_adapter.h"
 
 #include <gtest/gtest.h>
 
@@ -38,7 +39,7 @@ class KVStoreTest : public ::testing::Test {
 
 TEST_F(KVStoreTest, CacheThenRangeRoundTripAndImmediateVisibility) {
   KVStore s(Opts());
-  BlockKey k{111, 0, 1};
+  BlockKey k{111, 0};
   std::string v = "the-kv-bytes-0123456789";
   ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);
   // sync visibility: cached immediately after Cache() returns
@@ -48,9 +49,37 @@ TEST_F(KVStoreTest, CacheThenRangeRoundTripAndImmediateVisibility) {
   EXPECT_EQ(out, v);
 }
 
+TEST_F(KVStoreTest, SgEngineCompatibilityDomainCannotAliasNativeKey) {
+  KVStore s(Opts());
+  const BlockKey native{111, (uint64_t{4096} << 32) | 7};
+  const BlockKey legacy = dfkv::compat::SgEngineV1Key(111, 7, 4096);
+  ASSERT_FALSE(native == legacy);
+  EXPECT_EQ(native.Filename(), "000000000000006f0000100000000007");
+  EXPECT_EQ(legacy.Filename(),
+            "sgengine-v1_000000000000006f0000100000000007");
+  EXPECT_EQ(native.StoreKey(),
+            "blocks/00/0000/000000000000006f0000100000000007");
+  EXPECT_EQ(legacy.StoreKey(),
+            "compat/sgengine-v1/blocks/00/0000/"
+            "sgengine-v1_000000000000006f0000100000000007");
+
+  const std::string native_value = "native";
+  const std::string legacy_value = "legacy";
+  ASSERT_EQ(s.Cache(native, native_value.data(), native_value.size()),
+            Status::kOk);
+  ASSERT_EQ(s.Cache(legacy, legacy_value.data(), legacy_value.size()),
+            Status::kOk);
+
+  std::string out;
+  ASSERT_EQ(s.Range(native, 0, native_value.size(), &out), Status::kOk);
+  EXPECT_EQ(out, native_value);
+  ASSERT_EQ(s.Range(legacy, 0, legacy_value.size(), &out), Status::kOk);
+  EXPECT_EQ(out, legacy_value);
+}
+
 TEST_F(KVStoreTest, RangeIntoReadsStraightIntoCallerBuffer) {
   KVStore s(Opts());
-  BlockKey k{222, 0, 1};
+  BlockKey k{222, 0};
   std::string v = "zero-copy-server-side-payload-bytes";
   ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);
   char buf[64];
@@ -60,7 +89,7 @@ TEST_F(KVStoreTest, RangeIntoReadsStraightIntoCallerBuffer) {
   EXPECT_EQ(std::string(buf, got), v);
   // miss => NotFound, out_len 0
   got = 12345;
-  EXPECT_EQ(s.RangeInto(BlockKey{999, 0, 1}, 0, 64, buf, sizeof(buf), &got), Status::kNotFound);
+  EXPECT_EQ(s.RangeInto(BlockKey{999, 0}, 0, 64, buf, sizeof(buf), &got), Status::kNotFound);
   EXPECT_EQ(got, 0u);
   // dst_cap caps the read
   ASSERT_EQ(s.RangeInto(k, 0, v.size(), buf, 4, &got), Status::kOk);
@@ -70,7 +99,7 @@ TEST_F(KVStoreTest, RangeIntoReadsStraightIntoCallerBuffer) {
 
 TEST_F(KVStoreTest, RangeDirectReturnsSliceInsideAlignedBuffer) {
   KVStore s(Opts());
-  BlockKey k{333, 0, 1};
+  BlockKey k{333, 0};
   std::string v(9000, '\0');
   for (size_t i = 0; i < v.size(); ++i) v[i] = static_cast<char>((i * 13 + 5) & 0xFF);
   ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);
@@ -90,7 +119,7 @@ TEST_F(KVStoreTest, RangeDirectReturnsSliceInsideAlignedBuffer) {
 
 TEST_F(KVStoreTest, CacheDirectWritesAlignedBuffer) {
   KVStore s(Opts());
-  BlockKey k{334, 0, 1};
+  BlockKey k{334, 0};
   std::string v(7000, '\0');
   for (size_t i = 0; i < v.size(); ++i) v[i] = static_cast<char>((i * 17 + 9) & 0xFF);
 
@@ -109,13 +138,13 @@ TEST_F(KVStoreTest, CacheDirectWritesAlignedBuffer) {
 TEST_F(KVStoreTest, RangeMissReturnsNotFoundNoS3) {
   KVStore s(Opts());
   std::string out;
-  EXPECT_EQ(s.Range(BlockKey{404, 0, 1}, 0, 16, &out), Status::kNotFound);
-  EXPECT_FALSE(s.IsCached(BlockKey{404, 0, 1}));
+  EXPECT_EQ(s.Range(BlockKey{404, 0}, 0, 16, &out), Status::kNotFound);
+  EXPECT_FALSE(s.IsCached(BlockKey{404, 0}));
 }
 
 TEST_F(KVStoreTest, IdempotentCacheSkipsRewrite) {
   KVStore s(Opts());
-  BlockKey k{7, 0, 1};
+  BlockKey k{7, 0};
   std::string v = "abc";
   ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);
   ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);  // second is a no-op skip
@@ -124,7 +153,7 @@ TEST_F(KVStoreTest, IdempotentCacheSkipsRewrite) {
 
 TEST_F(KVStoreTest, PartialRange) {
   KVStore s(Opts());
-  BlockKey k{9, 0, 1};
+  BlockKey k{9, 0};
   std::string v = "0123456789";
   ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);
   std::string out;
@@ -134,7 +163,7 @@ TEST_F(KVStoreTest, PartialRange) {
 
 TEST_F(KVStoreTest, LargeObjectOver128KiBLocalRead) {
   KVStore s(Opts());
-  BlockKey k{42, 0, 1};
+  BlockKey k{42, 0};
   std::string v(300 * 1024, 'x');  // >128KiB: no max_range_size cap on local path
   v[123456] = 'Z';
   ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);
@@ -151,16 +180,16 @@ TEST_F(KVStoreTest, LruEvictsLeastRecentlyUsedWhenOverCapacity) {
   KVStore s(Opts(/*cap=*/2200, /*shards=*/1));
   auto put = [&](uint64_t id) {
     std::string v(1000, char('a' + (id % 20)));
-    return s.Cache(BlockKey{id, 0, 1}, v.data(), v.size());
+    return s.Cache(BlockKey{id, 0}, v.data(), v.size());
   };
   ASSERT_EQ(put(1), Status::kOk);
   ASSERT_EQ(put(2), Status::kOk);
   // touch #1 so #2 becomes LRU
-  std::string out; ASSERT_EQ(s.Range(BlockKey{1,0,1}, 0, 10, &out), Status::kOk);
+  std::string out; ASSERT_EQ(s.Range(BlockKey{1, 0}, 0, 10, &out), Status::kOk);
   ASSERT_EQ(put(3), Status::kOk);  // over capacity -> evict LRU (#2)
-  EXPECT_TRUE(s.IsCached(BlockKey{1, 0, 1}));
-  EXPECT_FALSE(s.IsCached(BlockKey{2, 0, 1}));
-  EXPECT_TRUE(s.IsCached(BlockKey{3, 0, 1}));
+  EXPECT_TRUE(s.IsCached(BlockKey{1, 0}));
+  EXPECT_FALSE(s.IsCached(BlockKey{2, 0}));
+  EXPECT_TRUE(s.IsCached(BlockKey{3, 0}));
   EXPECT_LE(s.UsedBytes(), 2200u);
   // eviction counters tracked the one evicted 1000-byte object
   EXPECT_EQ(s.Evictions(), 1u);
@@ -177,22 +206,22 @@ TEST_F(KVStoreTest, EvictsUnderAllReferencedPressure) {
   KVStore s(Opts(cap, /*shards=*/1));
   auto put = [&](uint64_t id) {
     std::string v(obj, char('a' + (id % 20)));
-    return s.Cache(BlockKey{id, 0, 1}, v.data(), v.size());
+    return s.Cache(BlockKey{id, 0}, v.data(), v.size());
   };
   auto touch = [&](uint64_t id) {
     std::string out;
-    s.Range(BlockKey{id, 0, 1}, 0, 8, &out);  // sets the CLOCK bit if resident
+    s.Range(BlockKey{id, 0}, 0, 8, &out);  // sets the CLOCK bit if resident
   };
   for (uint64_t id = 1; id <= 40; ++id) {
     for (uint64_t j = (id > 8 ? id - 8 : 1); j < id; ++j) touch(j);  // make all hot
     ASSERT_EQ(put(id), Status::kOk) << "id=" << id;
     EXPECT_LE(s.UsedBytes(), cap) << "id=" << id;  // eviction kept usage bounded
   }
-  EXPECT_TRUE(s.IsCached(BlockKey{40, 0, 1}));  // the newest insert survives
+  EXPECT_TRUE(s.IsCached(BlockKey{40, 0}));  // the newest insert survives
 }
 
 TEST_F(KVStoreTest, ReloadFromDiskRebuildsIndex) {
-  BlockKey k{55, 0, 1};
+  BlockKey k{55, 0};
   std::string v = "persisted";
   {
     KVStore s(Opts());
@@ -221,7 +250,7 @@ TEST_F(KVStoreTest, ConcurrentShardedReadWrite) {
       ts.emplace_back([&, t] {
         for (int i = t; i < N; i += 8) {
           std::string v = val(i);
-          EXPECT_EQ(s.Cache(BlockKey{static_cast<uint64_t>(i), 0, 1}, v.data(), v.size()),
+          EXPECT_EQ(s.Cache(BlockKey{static_cast<uint64_t>(i), 0}, v.data(), v.size()),
                     Status::kOk);
         }
       });
@@ -236,7 +265,7 @@ TEST_F(KVStoreTest, ConcurrentShardedReadWrite) {
       ts.emplace_back([&] {
         for (int i = 0; i < N; ++i) {
           std::string out;
-          if (s.Range(BlockKey{static_cast<uint64_t>(i), 0, 1}, 0, 300, &out) == Status::kOk &&
+          if (s.Range(BlockKey{static_cast<uint64_t>(i), 0}, 0, 300, &out) == Status::kOk &&
               out == val(i))
             hits.fetch_add(1, std::memory_order_relaxed);
         }
@@ -248,7 +277,7 @@ TEST_F(KVStoreTest, ConcurrentShardedReadWrite) {
 
 TEST_F(KVStoreTest, RemoveDropsBlockReclaimsBytesAndIsIdempotent) {
   KVStore s(Opts());
-  BlockKey k{555, 0, 1};
+  BlockKey k{555, 0};
   std::string v = "remove-me-payload-bytes";
   ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);
   ASSERT_TRUE(s.IsCached(k));
@@ -261,7 +290,7 @@ TEST_F(KVStoreTest, RemoveDropsBlockReclaimsBytesAndIsIdempotent) {
 
   // Removing an absent key is a clean kNotFound (idempotent re-remove too).
   EXPECT_EQ(s.Remove(k), Status::kNotFound);
-  EXPECT_EQ(s.Remove(BlockKey{556, 0, 1}), Status::kNotFound);
+  EXPECT_EQ(s.Remove(BlockKey{556, 0}), Status::kNotFound);
 
   // Eviction counters are untouched by an explicit Remove (distinct from
   // capacity eviction).
@@ -280,20 +309,20 @@ TEST_F(KVStoreTest, RemoveKeepsClockHandValidUnderManyKeys) {
   KVStore s(Opts(1ull << 30, 1));
   std::string v(64, 'x');
   for (uint64_t i = 0; i < 64; ++i)
-    ASSERT_EQ(s.Cache(BlockKey{i, 0, 1}, v.data(), v.size()), Status::kOk);
+    ASSERT_EQ(s.Cache(BlockKey{i, 0}, v.data(), v.size()), Status::kOk);
   ASSERT_EQ(s.Count(), 64u);
   for (uint64_t i = 0; i < 64; i += 2)  // remove every other key
-    EXPECT_EQ(s.Remove(BlockKey{i, 0, 1}), Status::kOk);
+    EXPECT_EQ(s.Remove(BlockKey{i, 0}), Status::kOk);
   EXPECT_EQ(s.Count(), 32u);
   for (uint64_t i = 0; i < 64; ++i)
-    EXPECT_EQ(s.IsCached(BlockKey{i, 0, 1}), (i % 2 == 1));
+    EXPECT_EQ(s.IsCached(BlockKey{i, 0}), (i % 2 == 1));
   // The survivors are still readable and a fresh cache still evicts correctly.
   std::string out;
-  EXPECT_EQ(s.Range(BlockKey{1, 0, 1}, 0, 64, &out), Status::kOk);
+  EXPECT_EQ(s.Range(BlockKey{1, 0}, 0, 64, &out), Status::kOk);
 }
 
 TEST_F(KVStoreTest, RebuildIndexReclaimsOrphanTmpAndKeepsPublishedBlocks) {
-  BlockKey k{555, 0, 1};
+  BlockKey k{555, 0};
   std::string v = "durable-value-0123456789";
   {
     KVStore s(Opts());
@@ -333,9 +362,9 @@ TEST_F(KVStoreTest, ForeignLayoutFailsClosed) {
   EXPECT_NE(store.StartupError().find("different store layout"),
             std::string::npos);
   std::string value(16, 'x');
-  EXPECT_EQ(store.Cache(BlockKey{1, 0, 1}, value.data(), value.size()),
+  EXPECT_EQ(store.Cache(BlockKey{1, 0}, value.data(), value.size()),
             Status::kIOError);
-  EXPECT_FALSE(store.IsCached(BlockKey{1, 0, 1}));
+  EXPECT_FALSE(store.IsCached(BlockKey{1, 0}));
 }
 
 TEST_F(KVStoreTest, InvalidDirectoryAndCapacityFailClosed) {
@@ -358,7 +387,7 @@ TEST_F(KVStoreTest, EnospcTriggersForceEvictAndRetrySucceeds) {
   KVStore s(Opts(/*cap=*/1ull << 30));
   for (int i = 0; i < 8; ++i) {
     std::string v(4096, 'a' + i);
-    ASSERT_EQ(s.Cache(BlockKey{static_cast<uint64_t>(1000 + i), 0, 1},
+    ASSERT_EQ(s.Cache(BlockKey{static_cast<uint64_t>(1000 + i), 0},
                       v.data(), v.size()), Status::kOk);
   }
   ASSERT_GE(s.Count(), 8u);
@@ -374,7 +403,7 @@ TEST_F(KVStoreTest, EnospcTriggersForceEvictAndRetrySucceeds) {
   });
 
   std::string v(4096, 'Z');
-  BlockKey nk{2000, 0, 1};
+  BlockKey nk{2000, 0};
   EXPECT_EQ(s.Cache(nk, v.data(), v.size()), Status::kOk);
   EXPECT_EQ(calls, 2) << "must retry exactly once after the injected ENOSPC";
   EXPECT_EQ(s.EnospcEvictions(), 1u);
@@ -386,7 +415,7 @@ TEST_F(KVStoreTest, PersistentEnospcReturnsIoErrorWithoutInfiniteLoop) {
   KVStore s(Opts());
   for (int i = 0; i < 4; ++i) {
     std::string v(4096, 'a' + i);
-    ASSERT_EQ(s.Cache(BlockKey{static_cast<uint64_t>(3000 + i), 0, 1},
+    ASSERT_EQ(s.Cache(BlockKey{static_cast<uint64_t>(3000 + i), 0},
                       v.data(), v.size()), Status::kOk);
   }
   s.SetWriteFnForTest([&](const std::string&, const void*, size_t, int* werr) -> bool {
@@ -394,7 +423,7 @@ TEST_F(KVStoreTest, PersistentEnospcReturnsIoErrorWithoutInfiniteLoop) {
     return false;
   });
   std::string v(4096, 'Q');
-  EXPECT_EQ(s.Cache(BlockKey{4000, 0, 1}, v.data(), v.size()), Status::kIOError);
+  EXPECT_EQ(s.Cache(BlockKey{4000, 0}, v.data(), v.size()), Status::kIOError);
   EXPECT_EQ(s.EnospcEvictions(), 0u);  // retry did not succeed -> not counted
 }
 
@@ -420,9 +449,9 @@ TEST_F(KVStoreTest, EvictionAndRemoveLeaveNoTmpOrphansOnDisk) {
   KVStore s(Opts(/*cap=*/64 * 4096, /*shards=*/4));
   std::string v(4096, 'e');
   for (uint64_t i = 0; i < 400; ++i)
-    ASSERT_EQ(s.Cache(BlockKey{i, 0, 1}, v.data(), v.size()), Status::kOk);
+    ASSERT_EQ(s.Cache(BlockKey{i, 0}, v.data(), v.size()), Status::kOk);
   EXPECT_GT(s.Evictions(), 0u) << "the workload must have forced evictions";
-  for (uint64_t i = 350; i < 400; ++i) s.Remove(BlockKey{i, 0, 1});  // some Removes too
+  for (uint64_t i = 350; i < 400; ++i) s.Remove(BlockKey{i, 0});  // some Removes too
 
   EXPECT_EQ(count_disk(".tmp"), 0u) << "deferred unlink must leave no .tmp orphans";
   EXPECT_EQ(count_disk(nullptr), s.Count())

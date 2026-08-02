@@ -15,6 +15,7 @@
 
 #include "utils/args.h"
 #include "cache/kv_node_server.h"
+#include "compat/sgengine_tcp_frontend.h"
 #include "utils/wire_limits.h"
 #include "utils/log.h"
 #include "common/config_dump.h"
@@ -23,6 +24,7 @@
 #include "common/version.h"
 #ifdef DFKV_WITH_RDMA
 #include "cache/rdma_server.h"
+#include "compat/sgengine_rdma_frontend.h"
 #endif
 
 using dfkv::KvNodeServer;
@@ -45,6 +47,8 @@ int main(int argc, char** argv) {
       "  --cap <bytes>        total cache capacity (LRU self-limits)\n"
       "  --port <p>           TCP bootstrap/data port (0 = ephemeral)\n"
       "  --rdma-port <p>      RDMA QP-bootstrap port (RDMA build only; enables data path)\n"
+      "  --sgengine-tcp-port <p> isolated SGEngine v1 compatibility TCP port (omit = off)\n"
+      "  --sgengine-rdma-port <p> isolated SGEngine v1 compatibility RDMA bootstrap port (omit = off)\n"
       "  --rdma-dev <names>   HCA whitelist; default first ACTIVE local HCA (RDMA build only)\n"
       "  --mds <ip:port,...>  MDS endpoints to register into (with --group/--id/--advertise)\n"
       "  --group <g>          membership group name (default \"default\")\n"
@@ -79,8 +83,10 @@ int main(int argc, char** argv) {
     return help ? 0 : 1;
   }
   dfkv::Args args(argc, argv,
-                  {"--dir", "--port", "--cap", "--rdma-port", "--rdma-dev",
-                   "--mds", "--group", "--id", "--advertise", "--weight",
+                  {"--dir", "--port", "--cap", "--rdma-port",
+                   "--sgengine-tcp-port", "--sgengine-rdma-port",
+                   "--rdma-dev", "--mds", "--group",
+                   "--id", "--advertise", "--weight",
                    "--metrics-port", "--metrics-bind", "--store-engine",
                    "--slab-write", "--ram-tier", "--ram-tier-bytes",
                    "--slab-granularity", "--put-inflight-limit",
@@ -100,6 +106,8 @@ int main(int argc, char** argv) {
   int weight = args.GetInt("--weight", 1);
   int port = args.GetInt("--port", 0);
   int rdma_port = args.GetInt("--rdma-port", -1);
+  int sgengine_tcp_port = args.GetInt("--sgengine-tcp-port", -1);
+  int sgengine_rdma_port = args.GetInt("--sgengine-rdma-port", -1);
   int metrics_port = args.GetInt("--metrics-port", -1);
   unsigned long long cap = args.GetU64("--cap", 1ull << 30);
   // Storage backend: "file" (default) or "slab". Propagated via env so the
@@ -199,6 +207,18 @@ int main(int argc, char** argv) {
     cd::Record("port", std::to_string(port), src("--port"));
     cd::Record("cap", std::to_string(cap), src("--cap"));
     cd::Record("rdma_dev", rdma_dev.empty() ? "(unset)" : rdma_dev, src("--rdma-dev"));
+    cd::Record("sgengine_tcp_port", std::to_string(sgengine_tcp_port),
+               src("--sgengine-tcp-port"));
+    cd::Record("sgengine_rdma_port", std::to_string(sgengine_rdma_port),
+               src("--sgengine-rdma-port"));
+    cd::Record("sgengine_tcp_protocol",
+               sgengine_tcp_port >= 0 ? "wire-v1/domain-sgengine-v1"
+                                      : "(off)",
+               src("--sgengine-tcp-port"));
+    cd::Record("sgengine_rdma_protocol",
+               sgengine_rdma_port >= 0 ? "rdma-v1/domain-sgengine-v1"
+                                       : "(off)",
+               src("--sgengine-rdma-port"));
     cd::Record("mds", mds.empty() ? "(none)" : mds, src("--mds"));
     cd::Record("group", group, src("--group"));
     cd::Record("id", node_id.empty() ? "(auto)" : node_id, src("--id"));
@@ -232,6 +252,25 @@ int main(int argc, char** argv) {
   std::printf("PORT %d\n", srv.port());
   std::fflush(stdout);
 
+  std::unique_ptr<dfkv::compat::SgEngineTcpFrontend> sgengine_tcp;
+  if (sgengine_tcp_port >= 0) {
+    sgengine_tcp =
+        std::make_unique<dfkv::compat::SgEngineTcpFrontend>(srv);
+    sgengine_tcp->set_max_request_payload(
+        dfkv::wire_limits::MaxRequestPayload());
+    if (sgengine_tcp->Start(sgengine_tcp_port) != Status::kOk) {
+      std::fprintf(stderr,
+                   "failed to start SGEngine compatibility TCP port %d\n",
+                   sgengine_tcp_port);
+      srv.Stop();
+      return 1;
+    }
+    std::printf("SGENGINE_TCP_PORT %d\n", sgengine_tcp->port());
+    std::fflush(stdout);
+    DFKV_LOG_INFO("SGEngine v1 compatibility TCP listening on port " +
+                  std::to_string(sgengine_tcp->port()));
+  }
+
   // Optional Prometheus /metrics endpoint (declared here, started after the RDMA
   // server below so its render callback can fold in the RDMA server counters).
   std::unique_ptr<dfkv::MetricsHttpServer> mhttp;
@@ -243,9 +282,10 @@ int main(int argc, char** argv) {
   DFKV_LOG_INFO("dfkv build: transport=RDMA (libibverbs) + TCP fallback");
 #else
   DFKV_LOG_INFO("dfkv build: transport=TCP-only (built WITHOUT -DDFKV_WITH_RDMA=ON)");
-  if (rdma_port >= 0) {
-    DFKV_LOG_ERROR("--rdma-port requires an RDMA-enabled binary; rebuild with "
-                   "-DDFKV_WITH_RDMA=ON (needs libibverbs-dev)");
+  if (rdma_port >= 0 || sgengine_rdma_port >= 0) {
+    DFKV_LOG_ERROR(
+        "--rdma-port/--sgengine-rdma-port require an RDMA-enabled binary; "
+        "rebuild with -DDFKV_WITH_RDMA=ON (needs libibverbs-dev)");
     srv.Stop();
     return 1;
   }
@@ -263,30 +303,31 @@ int main(int argc, char** argv) {
   std::unique_ptr<dfkv::RdmaServer> rsrv;
   if (rdma_port >= 0) {
     rsrv = std::make_unique<dfkv::RdmaServer>(
-        [&srv](uint8_t op, uint64_t id, uint32_t idx, uint32_t ks, uint64_t off,
+        [&srv](uint8_t op, const dfkv::BlockKey& key, uint64_t off,
                uint64_t len, const char* pl, uint64_t pll, std::string* out) {
-          return srv.ProcessRequest(op, id, idx, ks, off, len, pl, pll, out);
+          return srv.ProcessRequestForKey(op, key, off, len, pl, pll, out);
         },
         /*max_msg=*/max_msg, rdma_dev);
     rsrv->set_range_handler(  // server-side direct GET: disk -> registered dbuf -> RDMA scatter
-        [&srv](uint64_t id, uint32_t idx, uint32_t ks, uint64_t off, uint64_t len,
-               char* io_buf, size_t cap, const char** out_data, size_t* out_len) {
-          return srv.RangeDirect(id, idx, ks, off, len, io_buf, cap, out_data, out_len);
+        [&srv](const dfkv::BlockKey& key, uint64_t off, uint64_t len,
+               char* io_buf, size_t cap, const char** out_data,
+               size_t* out_len) {
+          return srv.RangeDirectForKey(key, off, len, io_buf, cap, out_data,
+                                       out_len);
         });
     rsrv->set_cache_direct_handler(  // server-side direct PUT: RDMA dbuf -> O_DIRECT write
-        [&srv](uint64_t id, uint32_t idx, uint32_t ks, char* data, size_t len,
-               size_t cap) {
-          return srv.CacheDirect(id, idx, ks, data, len, cap);
+        [&srv](const dfkv::BlockKey& key, char* data, size_t len, size_t cap) {
+          return srv.CacheDirectForKey(key, data, len, cap);
         });
     // Async-GET hooks (used only when built -DDFKV_WITH_URING and started with
     // DFKV_SERVER_URING=1; otherwise the serve loop ignores these and uses the
     // synchronous range_handler above verbatim).
     rsrv->set_range_prep_handler(
-        [&srv](uint64_t id, uint32_t idx, uint32_t ks, uint64_t off, uint64_t len,
+        [&srv](const dfkv::BlockKey& key, uint64_t off, uint64_t len,
                size_t cap, dfkv::RdmaServer::RangePrepResult* out) {
           dfkv::KVStore::RangePrep p;
-          Status st = srv.RangeDirectPrep(id, idx, ks, off, len, cap, &p,
-                                          &out->flight);
+          Status st = srv.RangeDirectPrepForKey(key, off, len, cap, &p,
+                                                &out->flight);
           if (st == Status::kOk) {
             out->fd = p.fd;
             out->aligned_off = p.aligned_off;
@@ -315,9 +356,10 @@ int main(int argc, char** argv) {
     if (srv.ram_enabled()) {
       rsrv->RegisterMemory(srv.ram_arena(), srv.ram_arena_bytes());
       rsrv->set_ram_range_handler(
-          [&srv](uint64_t id, uint32_t idx, uint32_t ks, uint64_t off, uint64_t len,
+          [&srv](const dfkv::BlockKey& key, uint64_t off, uint64_t len,
                  const char** out_ptr, size_t* out_len, uint64_t* out_token) {
-            return srv.RamRangePrep(id, idx, ks, off, len, out_ptr, out_len, out_token);
+            return srv.RamRangePrepForKey(key, off, len, out_ptr, out_len,
+                                          out_token);
           });
       rsrv->set_ram_release_handler([&srv](uint64_t tok) { srv.RamRelease(tok); });
       DFKV_LOG_INFO("dfkv_server RAM hot tier: RDMA zero-copy serve enabled (arena " +
@@ -339,6 +381,29 @@ int main(int argc, char** argv) {
     (void)rsrv->PipelineDepth();
     (void)rsrv->UseUringPath();
   }
+
+  std::unique_ptr<dfkv::compat::SgEngineRdmaFrontend> sgengine_rdma;
+  if (sgengine_rdma_port >= 0) {
+    sgengine_rdma =
+        std::make_unique<dfkv::compat::SgEngineRdmaFrontend>(
+            srv, max_msg, rdma_dev);
+    if (sgengine_rdma->Start(sgengine_rdma_port) != Status::kOk) {
+      DFKV_LOG_ERROR(
+          "SGEngine compatibility RDMA listener failed to start; refusing "
+          "readiness");
+      if (rsrv) rsrv->Stop();
+      srv.Stop();
+      return 1;
+    }
+    std::printf("SGENGINE_RDMA_PORT %d\n", sgengine_rdma->port());
+    std::fflush(stdout);
+    DFKV_LOG_INFO(
+        "SGEngine v1 compatibility RDMA listening (TCP bootstrap) on port " +
+        std::to_string(sgengine_rdma->port()) +
+        (rdma_dev.empty() ? "" : ", dev=" + rdma_dev));
+    (void)sgengine_rdma->PipelineDepth();
+    (void)sgengine_rdma->UseUringPath();
+  }
 #endif
 
   // Start /metrics now that the (optional) RDMA server exists: the render
@@ -351,8 +416,10 @@ int main(int argc, char** argv) {
   if (metrics_port >= 0) {
     mhttp = std::make_unique<dfkv::MetricsHttpServer>([&] {
       std::string s = srv.MetricsText();
+      if (sgengine_tcp) s += sgengine_tcp->MetricsText();
 #ifdef DFKV_WITH_RDMA
       if (rsrv) s += rsrv->MetricsText();
+      if (sgengine_rdma) s += sgengine_rdma->MetricsText();
 #endif
       return s;
     });
@@ -442,7 +509,9 @@ int main(int argc, char** argv) {
   if (registrar) registrar->Stop();
 #ifdef DFKV_WITH_RDMA
   if (rsrv) rsrv->Stop();
+  if (sgengine_rdma) sgengine_rdma->Stop();
 #endif
+  if (sgengine_tcp) sgengine_tcp->Stop();
   srv.Stop();
   return 0;
 }

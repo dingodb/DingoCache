@@ -429,12 +429,11 @@ void KvNodeServer::AcceptLoop() {
 }
 
 // Transport-agnostic request processing + metrics (shared by TCP and RDMA).
-Status KvNodeServer::ProcessRequest(uint8_t op_raw, uint64_t id, uint32_t index,
-                                    uint32_t ksize, uint64_t offset,
-                                    uint64_t length, const char* payload,
-                                    uint64_t payload_len, std::string* out_data) {
+
+Status KvNodeServer::ProcessRequestForKey(
+    uint8_t op_raw, const BlockKey& key, uint64_t offset, uint64_t length,
+    const char* payload, uint64_t payload_len, std::string* out_data) {
   WireOp op = static_cast<WireOp>(op_raw);
-  BlockKey key{id, index, ksize};
   Status st = Status::kInvalid;
   switch (op) {
     case WireOp::kCache: {
@@ -575,10 +574,10 @@ Status KvNodeServer::ProcessRequest(uint8_t op_raw, uint64_t id, uint32_t index,
   return st;
 }
 
-Status KvNodeServer::RangeInto(uint64_t id, uint32_t index, uint32_t ksize,
-                               uint64_t offset, uint64_t length, char* dst,
-                               size_t dst_cap, size_t* out_len) {
-  BlockKey key{id, index, ksize};
+
+Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
+                                     uint64_t length, char* dst,
+                                     size_t dst_cap, size_t* out_len) {
   bool samp = lat_sampler_.ShouldSample();
   double t0 = samp ? NowSec() : 0.0;
   if (ram_) {
@@ -615,9 +614,9 @@ Status KvNodeServer::RangeInto(uint64_t id, uint32_t index, uint32_t ksize,
   return st;
 }
 
-Status KvNodeServer::CacheDirect(uint64_t id, uint32_t index, uint32_t ksize,
-                                 char* data, size_t len, size_t cap) {
-  BlockKey key{id, index, ksize};
+
+Status KvNodeServer::CacheDirectForKey(const BlockKey& key, char* data,
+                                       size_t len, size_t cap) {
   bool samp = lat_sampler_.ShouldSample();
   double t0 = samp ? NowSec() : 0.0;
   // RAM write-through (same [ValueHeader|payload] blob GET returns); backpressure
@@ -654,11 +653,10 @@ Status KvNodeServer::CacheDirect(uint64_t id, uint32_t index, uint32_t ksize,
   return st;
 }
 
-Status KvNodeServer::RangeDirect(uint64_t id, uint32_t index, uint32_t ksize,
-                                 uint64_t offset, uint64_t length, char* io_buf,
-                                 size_t io_cap, const char** out_data,
-                                 size_t* out_len) {
-  BlockKey key{id, index, ksize};
+
+Status KvNodeServer::RangeDirectForKey(
+    const BlockKey& key, uint64_t offset, uint64_t length, char* io_buf,
+    size_t io_cap, const char** out_data, size_t* out_len) {
   bool samp = lat_sampler_.ShouldSample();
   double t0 = samp ? NowSec() : 0.0;
   if (ram_) {
@@ -706,11 +704,10 @@ Status KvNodeServer::RangeDirect(uint64_t id, uint32_t index, uint32_t ksize,
   return st;
 }
 
-Status KvNodeServer::RangeDirectPrep(uint64_t id, uint32_t index, uint32_t ksize,
-                                     uint64_t offset, uint64_t length,
-                                     size_t io_cap, KVStore::RangePrep* out,
-                                     uint64_t* out_flight) {
-  BlockKey key{id, index, ksize};
+
+Status KvNodeServer::RangeDirectPrepForKey(
+    const BlockKey& key, uint64_t offset, uint64_t length, size_t io_cap,
+    KVStore::RangePrep* out, uint64_t* out_flight) {
   if (out_flight) *out_flight = 0;
   // A RAM-resident key has no fd to hand io_uring (and may be RAM-only, not yet
   // on disk). Decline the async prep (kInvalid) WITHOUT counting a miss so the
@@ -779,7 +776,7 @@ void KvNodeServer::RangeDirectComplete(bool ok, size_t bytes_read,
     get_io_err_.fetch_add(1, std::memory_order_relaxed);
   }
   if (flight) {
-    BlockKey key{0, 0, 0};
+    BlockKey key;
     bool whole = false;
     bool recurrent = false;
     const bool had_waiters = read_coalescer_.CompleteAsync(
@@ -804,13 +801,13 @@ void KvNodeServer::RangeFlightAbort(uint64_t flight) {
   read_coalescer_.CompleteAsync(flight, Status::kIOError, nullptr, 0);
 }
 
-bool KvNodeServer::RamRangePrep(uint64_t id, uint32_t index, uint32_t ksize,
-                                uint64_t offset, uint64_t length,
-                                const char** out_ptr, size_t* out_len,
-                                uint64_t* out_token) {
+
+bool KvNodeServer::RamRangePrepForKey(
+    const BlockKey& key, uint64_t offset, uint64_t length,
+    const char** out_ptr, size_t* out_len, uint64_t* out_token) {
   if (!ram_) return false;
   RamTier::Hit h;
-  if (!ram_->GetPrep(BlockKey{id, index, ksize}, offset, length, &h)) return false;
+  if (!ram_->GetPrep(key, offset, length, &h)) return false;
   if (out_ptr) *out_ptr = h.ptr;
   if (out_len) *out_len = h.len;
   if (out_token) *out_token = h.token;
@@ -840,8 +837,9 @@ void KvNodeServer::Handle(int fd) {
     if (rq.payload_len && !net::ReadAll(fd, payload.data(), rq.payload_len)) return;
 
     std::string data;
-    Status st = ProcessRequest(rq.op, rq.id, rq.index, rq.size, rq.offset,
-                               rq.length, payload.data(), rq.payload_len, &data);
+    Status st = ProcessRequestForKey(
+        rq.op, rq.Key(), rq.offset, rq.length, payload.data(), rq.payload_len,
+        &data);
 
     char rp[kRespPrefix];
     EncodeResp(rp, st, data.size());

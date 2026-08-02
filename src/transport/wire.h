@@ -1,8 +1,9 @@
-/* dfkv wire protocol — the single place that defines the request/response frame.
- * Both prefixes start with a 1-byte protocol version so a mixed-version deploy
- * fails fast (the server rejects an unknown version) instead of mis-parsing.
- * Centralizing encode/decode here keeps the byte offsets in one spot rather than
- * scattered across the TCP and RDMA transports + the server. */
+/* dfkv native wire protocol — the single request/response framing contract.
+ * Every frame carries a native epoch byte. Epoch 3 introduced full 128-bit
+ * BlockKey digests; RDMA scatter/gather uses epoch 4. Older native clients are
+ * rejected before any field is decoded. SGEngine v1 uses isolated frontends
+ * and never enters this codec.
+ */
 #ifndef DFKV_WIRE_H_
 #define DFKV_WIRE_H_
 
@@ -33,11 +34,10 @@ enum class WireOp : uint8_t {
   kClientRegister = 11, kClientHeartbeat = 12, kListClients = 13
 };
 
-constexpr uint8_t kProtoVersionV1 = 1;
-constexpr uint8_t kProtoVersionV2 = 2;
-// The TCP/MDS protocol remains v1.  RDMA peers negotiate v2 explicitly during
-// bootstrap; the legacy helpers below intentionally continue to emit v1.
-constexpr uint8_t kProtoVersion = kProtoVersionV1;
+constexpr uint8_t kSgEngineProtoV1 = 1;
+constexpr uint8_t kNativeProtoBase = 3;
+constexpr uint8_t kNativeProtoRdmaV2 = 4;
+constexpr uint8_t kProtoVersion = kNativeProtoBase;
 
 // Hard ceiling on a single wire frame's variable payload. Decode rejects any
 // frame whose declared length exceeds this, so a garbage/hostile 64-bit length
@@ -47,8 +47,9 @@ constexpr uint8_t kProtoVersion = kProtoVersionV1;
 // anywhere near 16 GiB; callers that know a tighter bound pass it explicitly.
 constexpr uint64_t kMaxFrameLen = 1ull << 34;  // 16 GiB
 
-// Request prefix: ver(1) op(1) id(8) index(4) size(4) offset(8) length(8) payload_len(8)
-constexpr size_t kReqPrefix = 1 + 1 + 8 + 4 + 4 + 8 + 8 + 8;  // = 42
+// Request prefix: ver(1) op(1) digest_hi(8) digest_lo(8)
+//                 offset(8) length(8) payload_len(8)
+constexpr size_t kReqPrefix = 1 + 1 + 8 + 8 + 8 + 8 + 8;  // = 42
 // Response prefix: ver(1) status(1) data_len(8)
 constexpr size_t kRespPrefix = 1 + 1 + 8;  // = 10
 
@@ -57,9 +58,8 @@ inline void EncodeReqVersion(char* p, uint8_t version, WireOp op,
                              uint64_t length, uint64_t payload_len) {
   p[0] = static_cast<char>(version);
   p[1] = static_cast<char>(op);
-  net::PutU64(p + 2, k.id);
-  net::PutU32(p + 10, k.index);
-  net::PutU32(p + 14, k.size);
+  net::PutU64(p + 2, k.digest_hi);
+  net::PutU64(p + 10, k.digest_lo);
   net::PutU64(p + 18, offset);
   net::PutU64(p + 26, length);
   net::PutU64(p + 34, payload_len);
@@ -67,17 +67,18 @@ inline void EncodeReqVersion(char* p, uint8_t version, WireOp op,
 
 inline void EncodeReq(char* p, WireOp op, const BlockKey& k, uint64_t offset,
                       uint64_t length, uint64_t payload_len) {
-  EncodeReqVersion(p, kProtoVersionV1, op, k, offset, length, payload_len);
+  EncodeReqVersion(p, kNativeProtoBase, op, k, offset, length, payload_len);
 }
 
 struct ReqFields {
   uint8_t op;
-  uint64_t id;
-  uint32_t index;
-  uint32_t size;
+  uint64_t digest_hi;
+  uint64_t digest_lo;
   uint64_t offset;
   uint64_t length;
   uint64_t payload_len;
+
+  BlockKey Key() const { return BlockKey{digest_hi, digest_lo}; }
 };
 
 // False on a version mismatch or an oversized declared payload (> max_payload)
@@ -87,9 +88,8 @@ inline bool DecodeReqVersion(const char* p, uint8_t expected_version,
                              uint64_t max_payload = kMaxFrameLen) {
   if (static_cast<uint8_t>(p[0]) != expected_version) return false;
   o->op = static_cast<uint8_t>(p[1]);
-  o->id = net::GetU64(p + 2);
-  o->index = net::GetU32(p + 10);
-  o->size = net::GetU32(p + 14);
+  o->digest_hi = net::GetU64(p + 2);
+  o->digest_lo = net::GetU64(p + 10);
   o->offset = net::GetU64(p + 18);
   o->length = net::GetU64(p + 26);
   o->payload_len = net::GetU64(p + 34);
@@ -98,7 +98,7 @@ inline bool DecodeReqVersion(const char* p, uint8_t expected_version,
 
 inline bool DecodeReq(const char* p, ReqFields* o,
                       uint64_t max_payload = kMaxFrameLen) {
-  return DecodeReqVersion(p, kProtoVersionV1, o, max_payload);
+  return DecodeReqVersion(p, kNativeProtoBase, o, max_payload);
 }
 
 inline void EncodeRespVersion(char* p, uint8_t version, Status st,
@@ -109,7 +109,7 @@ inline void EncodeRespVersion(char* p, uint8_t version, Status st,
 }
 
 inline void EncodeResp(char* p, Status st, uint64_t data_len) {
-  EncodeRespVersion(p, kProtoVersionV1, st, data_len);
+  EncodeRespVersion(p, kNativeProtoBase, st, data_len);
 }
 
 // False on version mismatch or an oversized declared data_len (> max_data).
@@ -124,7 +124,7 @@ inline bool DecodeRespVersion(const char* p, uint8_t expected_version,
 
 inline bool DecodeResp(const char* p, Status* st, uint64_t* data_len,
                        uint64_t max_data = kMaxFrameLen) {
-  return DecodeRespVersion(p, kProtoVersionV1, st, data_len, max_data);
+  return DecodeRespVersion(p, kNativeProtoBase, st, data_len, max_data);
 }
 
 // RDMA v2 GET carries one or more client destinations after the unchanged
@@ -169,7 +169,8 @@ inline bool EncodeRdmaGetReq(char* p, size_t cap, const BlockKey& key,
       targets.size() > std::numeric_limits<uint32_t>::max()) {
     return false;
   }
-  EncodeReqVersion(p, kProtoVersionV2, WireOp::kRange, key, offset, length, 0);
+  EncodeReqVersion(p, kNativeProtoRdmaV2, WireOp::kRange, key, offset, length,
+                   0);
   net::PutU32(p + kReqPrefix, header_len);
   net::PutU32(p + kReqPrefix + 4, static_cast<uint32_t>(targets.size()));
   char* out = p + kReqPrefix + kRdmaGetFixed;
@@ -187,7 +188,7 @@ inline bool DecodeRdmaGetReq(const char* p, size_t frame_len, ReqFields* req,
                              RdmaGetFields* get,
                              uint64_t max_payload = kMaxFrameLen) {
   if (frame_len < kReqPrefix + kRdmaGetFixed ||
-      !DecodeReqVersion(p, kProtoVersionV2, req, max_payload) ||
+      !DecodeReqVersion(p, kNativeProtoRdmaV2, req, max_payload) ||
       req->op != static_cast<uint8_t>(WireOp::kRange) ||
       req->payload_len != 0) {
     return false;

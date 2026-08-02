@@ -52,25 +52,25 @@ class EngineTest : public ::testing::Test {
 void ExerciseGroup(DiskCacheGroup& g) {
   for (uint64_t i = 0; i < 40; ++i) {
     std::string v = "val-" + std::to_string(i) + std::string(50, 'x');
-    ASSERT_EQ(g.Cache(BlockKey{i, 0, 1}, v.data(), v.size()), Status::kOk) << i;
+    ASSERT_EQ(g.Cache(BlockKey{i, 0}, v.data(), v.size()), Status::kOk) << i;
   }
   EXPECT_EQ(g.Count(), 40u);
   for (uint64_t i = 0; i < 40; ++i) {
     std::string v = "val-" + std::to_string(i) + std::string(50, 'x');
     std::string out;
-    ASSERT_EQ(g.Range(BlockKey{i, 0, 1}, 0, v.size(), &out), Status::kOk) << i;
+    ASSERT_EQ(g.Range(BlockKey{i, 0}, 0, v.size(), &out), Status::kOk) << i;
     EXPECT_EQ(out, v) << i;
-    EXPECT_TRUE(g.IsCached(BlockKey{i, 0, 1}));
+    EXPECT_TRUE(g.IsCached(BlockKey{i, 0}));
     char buf[128];
     size_t got = 0;
-    ASSERT_EQ(g.RangeInto(BlockKey{i, 0, 1}, 0, sizeof(buf), buf, sizeof(buf), &got),
+    ASSERT_EQ(g.RangeInto(BlockKey{i, 0}, 0, sizeof(buf), buf, sizeof(buf), &got),
               Status::kOk) << i;
     EXPECT_EQ(std::string(buf, got), v) << i;
   }
-  ASSERT_EQ(g.Remove(BlockKey{0, 0, 1}), Status::kOk);
-  EXPECT_FALSE(g.IsCached(BlockKey{0, 0, 1}));
+  ASSERT_EQ(g.Remove(BlockKey{0, 0}), Status::kOk);
+  EXPECT_FALSE(g.IsCached(BlockKey{0, 0}));
   std::string miss;
-  EXPECT_EQ(g.Range(BlockKey{9999, 0, 1}, 0, 10, &miss), Status::kNotFound);
+  EXPECT_EQ(g.Range(BlockKey{9999, 0}, 0, 10, &miss), Status::kNotFound);
 }
 }  // namespace
 
@@ -100,7 +100,7 @@ TEST_F(EngineTest, DefaultIsFileEngine) {
   o.capacity_bytes = 1ull << 30;
   DiskCacheGroup g(o);
   std::string v(64, 'f');
-  ASSERT_EQ(g.Cache(BlockKey{7, 0, 1}, v.data(), v.size()), Status::kOk);
+  ASSERT_EQ(g.Cache(BlockKey{7, 0}, v.data(), v.size()), Status::kOk);
   // The file engine writes blocks/<bucket>/... ; the slab engine writes
   // extents/ + slots.tbl. Presence of "blocks" proves the default is file.
   EXPECT_TRUE(fs::exists(fs::path(o.cache_dirs[0]) / "blocks"));
@@ -115,7 +115,7 @@ TEST_F(EngineTest, EnvSelectsSlabWhenOptionEmpty) {
   // Options.engine empty -> read the env.
   DiskCacheGroup g(o);
   std::string v(64, 's');
-  ASSERT_EQ(g.Cache(BlockKey{8, 0, 1}, v.data(), v.size()), Status::kOk);
+  ASSERT_EQ(g.Cache(BlockKey{8, 0}, v.data(), v.size()), Status::kOk);
   EXPECT_TRUE(fs::exists(fs::path(o.cache_dirs[0]) / "slots.tbl"));  // slab layout
   EXPECT_FALSE(fs::exists(fs::path(o.cache_dirs[0]) / "blocks"));
 }
@@ -156,7 +156,7 @@ TEST_F(EngineTest, BackendSwitchRequiresExplicitMigration) {
   {
     DiskCacheGroup file(options);
     ASSERT_TRUE(file.Healthy());
-    ASSERT_EQ(file.Cache(BlockKey{9, 0, 1}, value.data(), value.size()),
+    ASSERT_EQ(file.Cache(BlockKey{9, 0}, value.data(), value.size()),
               Status::kOk);
   }
   options.engine = "slab";
@@ -169,7 +169,7 @@ TEST_F(EngineTest, BackendSwitchRequiresExplicitMigration) {
   DiskCacheGroup reopened(options);
   ASSERT_TRUE(reopened.Healthy());
   std::string out;
-  ASSERT_EQ(reopened.Range(BlockKey{9, 0, 1}, 0, value.size(), &out),
+  ASSERT_EQ(reopened.Range(BlockKey{9, 0}, 0, value.size(), &out),
             Status::kOk);
   EXPECT_EQ(out, value);
 }
