@@ -266,6 +266,8 @@ NodeDedup::Role NodeDedup::ClaimImpl(const BlockKey& key, Kind kind, size_t cap,
         hits_.fetch_add(1, std::memory_order_relaxed);
         return Role::kHit;
       }
+      // Expired, torn or size-mismatched READY data falls through to Reserve;
+      // the stale slot may be recycled but is never returned as a hit.
     } else if (st == kStateFetching) {
       const uint64_t started = s->fetch_start_ms.load(std::memory_order_relaxed);
       if (now - started <= static_cast<uint64_t>(takeover_ms_))
@@ -287,9 +289,11 @@ NodeDedup::Role NodeDedup::ClaimImpl(const BlockKey& key, Kind kind, size_t cap,
     }
   }
   if (Slot* mine = Reserve(key, kind)) {
-    // Concurrent claimers can reserve TWO slots for one key when the second
-    // claimer's Find() races the first's identity write. Keep only the first
-    // probe position, which is the slot every waiter finds.
+    // Concurrent lockstep claimers can reserve two slots for one key when the
+    // second Find races the first identity write; this was observed live as
+    // exactly twice as many server reads as unique keys. Re-scan immediately
+    // and after a short settle spin, retaining only the lowest probe position
+    // because that is the canonical slot every waiter finds.
     for (int pass = 0; pass < 2; ++pass) {
       Slot* first = Find(key, kind);
       if (first && first != mine) {

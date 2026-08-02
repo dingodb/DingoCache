@@ -780,7 +780,8 @@ TEST(RdmaLoopback, PoolMrRegisteredOncePerDeviceNotPerConnection) {
   ASSERT_TRUE(again.AddPoolMr(region.data(), region.size()));
 }
 
-// End-to-end: register the host pool once, then Put from / Get into sub-buffers
+// End-to-end: register one host pool, then PUT from and GET into sub-buffers.
+// Every transfer must use the pool MR; no per-operation registration is legal.
 TEST(RdmaLoopback, RegisterMemoryRoundtrip) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   RdmaNode node("rmr");

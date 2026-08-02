@@ -849,6 +849,10 @@ size_t SlabAllocator::EvictColdToTarget(uint64_t target_bytes,
   std::lock_guard<std::mutex> lock(mu_);
   size_t freed = 0;
   while (used_bytes_ > target_bytes && freed < max_extents) {
+    // Select the globally coldest fully unpinned extent across all classes.
+    // Read heat wins, then insertion recency and useful bytes break ties. This
+    // class-agnostic choice keeps headroom ahead of demand without evicting a
+    // hotter donor merely because its class was examined first.
     int best = -1;
     uint64_t best_heat = std::numeric_limits<uint64_t>::max();
     uint64_t best_seq = std::numeric_limits<uint64_t>::max();

@@ -220,6 +220,8 @@ class TestFlattenDeviceKeyNames(unittest.TestCase):
         self.assertEqual(
             sks, [H.sg_key(base, 4, group) for group in range(4)])
         self.assertEqual(stride, 4)
+        # Segment slicing and the physical-key width coordinate must use the
+        # same runtime limit; otherwise readers address different groups.
         self.assertEqual([len(p) for p in sp], [4, 4, 4, 1])
         self.assertEqual(sp[0], ptrs[0:4])
         self.assertEqual(sp[3], ptrs[12:13])

@@ -536,6 +536,9 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.inflight += st.inflight;
     sum.prep_holds += st.prep_holds;
     sum.reclaimed_slots += st.reclaimed_slots;
+    // Keep every backend counter in this aggregation. Omitting
+    // rebalanced_extents once made dfkv_slab_rebalanced_total read zero
+    // fleet-wide despite observed extent movement.
     sum.rebalanced_extents += st.rebalanced_extents;
     sum.batched_writes += st.batched_writes;
     sum.uring_write_batches += st.uring_write_batches;

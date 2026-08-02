@@ -82,9 +82,11 @@ RamTier::RamTier(Options opt, FlushFn flush)
   // a granularity multiple) are O_DIRECT-aligned for the flusher.
   if (posix_memalign(&p, 4096, arena_size) != 0 || p == nullptr) return;
   arena_ = static_cast<char*>(p);
-  // NUMA: interleave the fixed-slot arena BEFORE first touch. Dedicated large
-  // allocations remain ordinary aligned heap allocations and are bounded by
-  // large_budget_bytes_.
+  // Interleave the fixed-slot arena across NUMA nodes before first touch. A
+  // single prefaulting thread would otherwise place every page on its socket,
+  // charging remote CPU workers and NIC rails an interconnect hop on every
+  // access. Dedicated oversize allocations remain ordinary aligned heap
+  // allocations and are independently bounded by large_budget_bytes_.
   const char* nm = std::getenv("DFKV_RAM_TIER_NUMA");
   const std::string numa_mode = (nm && *nm) ? nm : "interleave";
   if (numa_mode != "off" && numa_mode != "interleave") {

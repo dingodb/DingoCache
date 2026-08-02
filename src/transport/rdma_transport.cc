@@ -1527,10 +1527,12 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
 // Records n as a high-water candidate and reports whether it exceeds the
 // declaration. Two problems this closes, both observed on a B200 node:
 //
-//  1. Sizing DFKV_RDMA_MAX_BLOCK_BYTES was guesswork. The declaration decides
-//     how much the server pins per connection: qd * declared bytes, so an
-//     over-generous value is not free.
-//     size (437 KiB there), which says nothing about the peak that must fit.
+//  1. The declaration determines receive-segment capacity reserved for every
+//     data connection: queue depth multiplied by the aligned slot size. An
+//     over-generous value consumes scarce pinned memory across the fleet. The
+//     average transfer size (437 KiB on the incident host) says nothing about
+//     the peak block that must fit, so the observed high-water mark is the
+//     actionable sizing signal.
 //
 //  2. An UNDER-sized declaration failed silently. Oversized blocks become
 //     kInvalid, which the client's health accounting deliberately ignores, so

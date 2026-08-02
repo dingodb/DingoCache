@@ -646,6 +646,9 @@ Status KvNodeServer::ProcessRequestForKey(
       if (needs_disk && put_busy_limit_ > 0 &&
           disk_put_inflight_.load(std::memory_order_relaxed) >=
               put_busy_limit_) {
+        // Apply the same admission gate as the RDMA CacheDirect path. TCP is a
+        // diagnostic datapath, not an ungated side door around disk-write
+        // concurrency and backpressure.
         st = Status::kCacheFull;
         put_busy_.fetch_add(1, std::memory_order_relaxed);
         needs_disk = false;
@@ -732,6 +735,9 @@ Status KvNodeServer::ProcessRequestForKey(
       } else if (st == Status::kNotFound) {
         exist_miss_.fetch_add(1, std::memory_order_relaxed);
       }
+      // Handler-body latency includes the RAM shard and disk cached-set locks.
+      // A reclaim or flush can hold either lock, so this tail is intentionally
+      // a lock-contention signal rather than only a transport measurement.
       if (samp) exist_lat_.Observe(NowSec() - t0);
       break;
     }

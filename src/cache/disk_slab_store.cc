@@ -342,6 +342,7 @@ bool DiskSlabStore::OpenOrInit() {
       return SetStartupError("slots.tbl size differs from slab geometry");
   }
 
+  // Open every extent file once and keep its descriptor resident.
   extent_fds_.assign(num_extents_, -1);
   if (opt_.direct_writes) extent_dio_fds_.assign(num_extents_, -1);
   for (uint32_t e = 0; e < num_extents_; ++e) {
@@ -364,6 +365,10 @@ bool DiskSlabStore::OpenOrInit() {
       ::close(fd);
       return SetStartupError("extent size differs from slab geometry: " + ep);
     }
+    // Materialize each fresh extent idempotently. Direct overwrites of allocated
+    // unwritten ranges parallelize on XFS; allocating writes into ftruncate
+    // holes serialize on the exclusive inode lock (measured 4.2 vs 2.0 GB/s at
+    // 8 writers).
     if (opt_.direct_writes && !extent_dio_fds_.empty() &&
         ::fallocate(fd, 0, 0, static_cast<off_t>(opt_.extent_bytes)) != 0 &&
         errno != EOPNOTSUPP && errno != ENOSYS && errno != EINVAL) {
@@ -372,6 +377,10 @@ bool DiskSlabStore::OpenOrInit() {
     }
     extent_fds_[e] = fd;
     if (opt_.direct_writes && !extent_dio_fds_.empty()) {
+      // O_RDWR because this descriptor serves direct writes and aligned
+      // RangeDirect/prepared reads. If the filesystem rejects O_DIRECT (for
+      // example tmpfs), demote the whole store to buffered I/O; callers observe
+      // the resolved mode through DirectWritesActive().
       int dfd = ::open(ep.c_str(), O_RDWR | O_DIRECT);
       if (dfd < 0) {
         for (int direct_fd : extent_dio_fds_)
@@ -872,6 +881,9 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
   Status result = Status::kIOError;
   {
     std::lock_guard<std::mutex> lk(mu_);
+    // A Remove that arrived during the write was deferred to the sole in-flight
+    // owner. ReleaseInflightLocked executes it, so this writer must not publish
+    // the key afterwards.
     const bool removed_while_writing = deferred_remove_.count(fn) > 0;
     const bool release_ok = ReleaseInflightLocked(key, fn);
     if (!io_ok || !release_ok || !Healthy()) {
@@ -967,6 +979,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
       for (const BlockKey& ev : evicted)
         evicted_bytes_ += ErasePayloadLocked(ev.Filename());
       st[i].active = true;
+      // Use the same alignment and padded-capacity eligibility as CacheDirect.
       const size_t alen = (it.len + 4095) & ~static_cast<size_t>(4095);
       st[i].direct = !extent_dio_fds_.empty() && it.len != 0 &&
                      (reinterpret_cast<uintptr_t>(it.data) & 4095) == 0 &&

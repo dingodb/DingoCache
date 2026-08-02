@@ -141,14 +141,18 @@ class RdmaServer {
   std::mutex conn_mu_;
   std::vector<Conn> conns_;
   std::unordered_set<rdma::RcEndpoint*> live_eps_;
-  // One process-wide receive segment replaces per-connection payload buffers.
-  // Each connection leases depth*slot_size; its MR is shared per device PD.
+  // One process-wide pinned receive segment replaces per-connection payload
+  // buffers. Each v2 connection leases depth * aligned_slot_size bytes, and
+  // each rail's shared PD registers the segment once. This makes connection
+  // admission an explicit bounded resource instead of multiplying max payload
+  // buffers by every connection.
   rdma::RecvSegment recv_segment_;
   size_t recv_segment_bytes_ = 0;
   size_t recv_segment_registered_rails_ = 0;
-  // One anchor per resolved ACTIVE rail holds a lifetime shared-device ref and
-  // registers the receive segment / caller pools once on that rail's shared PD.
-  // With no explicit device filter only the first ACTIVE local rail is anchored.
+  // One anchor per explicitly resolved ACTIVE rail holds a lifetime shared
+  // device reference and registers the receive segment and caller pools on
+  // that rail's PD. With no filter, only the first ACTIVE local rail is
+  // anchored: HCA names are host-local configuration, never peer identities.
   std::vector<std::unique_ptr<rdma::RcEndpoint>> anchors_;
   std::vector<std::string> anchor_devs_;  // configured filter, then active rails
   std::atomic<uint64_t> uring_reads_{0}, uring_init_fallbacks_{0};
