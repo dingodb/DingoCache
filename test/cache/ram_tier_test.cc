@@ -549,10 +549,17 @@ TEST(RamTier, BatchFlushDrainsQueueAndRetriesPerItem) {
   std::mutex m;
   std::vector<size_t> batch_sizes;
   std::atomic<int> fail_key{-1};
+  std::mutex gate_mu;
+  std::condition_variable gate_cv;
+  bool gate_open = false;
   RamTier::Options o = Opts(256 * 4096);
   o.flush_threads = 1;  // single worker => deterministic batching
   RamTier rt(o, nullptr);
   rt.set_flush_batch([&](const std::vector<RamTier::FlushItem>& items) {
+    {
+      std::unique_lock<std::mutex> lk(gate_mu);
+      gate_cv.wait(lk, [&] { return gate_open; });
+    }
     std::lock_guard<std::mutex> lk(m);
     batch_sizes.push_back(items.size());
     std::vector<bool> ok(items.size(), true);
@@ -565,7 +572,15 @@ TEST(RamTier, BatchFlushDrainsQueueAndRetriesPerItem) {
   });
   ASSERT_TRUE(rt.ok());
   std::string v(4000, 'b');
-  for (uint64_t i = 0; i < 40; ++i) ASSERT_TRUE(rt.Put(K(700 + i), v.data(), v.size()));
+  bool queued = true;
+  for (uint64_t i = 0; i < 40; ++i)
+    queued = rt.Put(K(700 + i), v.data(), v.size()) && queued;
+  {
+    std::lock_guard<std::mutex> lk(gate_mu);
+    gate_open = true;
+  }
+  gate_cv.notify_one();
+  ASSERT_TRUE(queued);
   ASSERT_TRUE(WaitFor([&] { return rt.Flushed() == 40u; }));
   {
     std::lock_guard<std::mutex> lk(m);
