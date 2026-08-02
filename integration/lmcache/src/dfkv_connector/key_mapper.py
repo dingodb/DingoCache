@@ -13,14 +13,13 @@ from dfkv_common import pool_key
 __all__ = ["cache_engine_key_to_dfkv_key"]
 
 
-def cache_engine_key_to_dfkv_key(
-    key: CacheEngineKey,
-    canonicalize_worker: bool = False,
-) -> bytes:
+def cache_engine_key_to_dfkv_key(key: CacheEngineKey) -> bytes:
     """Encode a CacheEngineKey without duplicating model identity.
 
-    Replicated MLA uses ``tp=-1``; sharded layouts retain the worker rank.
-    Layerwise LMCache objects use an explicit component coordinate.
+    ``world_size`` and ``worker_id`` are preserved exactly. LMCache owns
+    replicated-layout detection and writer selection; rewriting rank identity
+    in this connector could alias non-equivalent pipeline stages. Layerwise
+    objects use an explicit component coordinate.
     """
     layer_id = getattr(key, "layer_id", None)
     component = "all" if layer_id is None else f"layer{int(layer_id)}"
@@ -28,6 +27,6 @@ def cache_engine_key_to_dfkv_key(
         f"{int(key.chunk_hash):x}",
         pool="kv",
         tp_size=max(1, int(key.world_size)),
-        tp_rank=-1 if canonicalize_worker else int(key.worker_id),
+        tp_rank=int(key.worker_id),
         component=component,
     )
