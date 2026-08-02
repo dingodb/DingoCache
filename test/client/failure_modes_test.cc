@@ -1,5 +1,5 @@
 // Boundary and robustness: unreachable node, namespace isolation, real MLA
-// page size (2.74 MiB), zero-length values, and capacity-bounded server.
+// page size (2.74 MiB), zero-length rejection, and capacity-bounded server.
 #include "client/kv_client.h"
 #include "cache/kv_node_server.h"
 
@@ -85,12 +85,13 @@ TEST(FailureModes, RealMlaPageSizeRoundTrip) {
   n->srv->Stop();
 }
 
-TEST(FailureModes, ZeroLengthValueRoundTrip) {
+TEST(FailureModes, ZeroLengthValueIsRejectedWithoutAllocation) {
   auto n = Start("zero");
   KVClient c({{"a", n->addr}}, KeyNamespace());
-  ASSERT_TRUE(c.Put("empty", nullptr, 0));
-  EXPECT_TRUE(c.Exist("empty"));
-  ASSERT_TRUE(c.Get("empty", nullptr, 0));  // hit, no bytes
+  char marker = 0;
+  EXPECT_FALSE(c.Put("empty", &marker, 0));
+  EXPECT_FALSE(c.Exist("empty"));
+  EXPECT_EQ(n->srv->UsedBytes(), 0u);
   n->srv->Stop();
 }
 

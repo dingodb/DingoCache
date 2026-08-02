@@ -337,6 +337,7 @@ Status TcpTransport::RoundTripInto(const std::string& node,
 
 Status TcpTransport::Cache(const std::string& node, const BlockKey& key,
                            const void* data, size_t len) {
+  if (len == 0 || data == nullptr) return Status::kInvalid;
   return RoundTrip(node, WireOp::kCache, key, 0, 0, data, len, nullptr,
                    wire_limits::kStatusMaxRespData);
 }

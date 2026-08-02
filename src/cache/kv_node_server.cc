@@ -626,6 +626,10 @@ Status KvNodeServer::ProcessRequestForKey(
   Status st = Status::kInvalid;
   switch (op) {
     case WireOp::kCache: {
+      if (payload_len == 0 || payload == nullptr) {
+        st = Status::kInvalid;
+        break;
+      }
       bool samp = lat_sampler_.ShouldSample();
       double t0 = samp ? NowSec() : 0.0;
       // A server PUT cannot acknowledge an arena admission: it waits for the
@@ -835,6 +839,10 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
 
 Status KvNodeServer::CacheDirectForKey(const BlockKey& key, char* data,
                                        size_t len, size_t cap) {
+  if (len == 0 || data == nullptr) {
+    invalid_ops_.fetch_add(1, std::memory_order_relaxed);
+    return Status::kInvalid;
+  }
   bool samp = lat_sampler_.ShouldSample();
   double t0 = samp ? NowSec() : 0.0;
   // RAM admission is not success: wait for the leader's disk commit. Only

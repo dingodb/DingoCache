@@ -900,7 +900,7 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
 }
 
 Status DiskSlabStore::Cache(const BlockKey& key, const void* data, size_t len) {
-  if (data == nullptr && len != 0) return Status::kInvalid;
+  if (len == 0 || data == nullptr) return Status::kInvalid;
   return CacheImpl(key, len, [&](const SlabAllocator::SlotRef& r) {
     return WritePayload(r, data, len);
   });
@@ -908,7 +908,7 @@ Status DiskSlabStore::Cache(const BlockKey& key, const void* data, size_t len) {
 
 Status DiskSlabStore::CacheDirect(const BlockKey& key, char* data, size_t len,
                                   size_t cap) {
-  if (data == nullptr && len != 0) return Status::kInvalid;
+  if (len == 0 || data == nullptr) return Status::kInvalid;
   return CacheImpl(key, len, [&](const SlabAllocator::SlotRef& r) {
     // O_DIRECT when enabled and the caller's buffer qualifies (RDMA recv buffers
     // are 4 KiB-aligned with padded cap); anything else falls back to buffered.
@@ -951,7 +951,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
     std::lock_guard<std::mutex> lk(mu_);
     for (size_t i = 0; i < N; ++i) {
       const auto& it = items[i];
-      if (it.data == nullptr && it.len != 0) {
+      if (it.len == 0 || it.data == nullptr) {
         out[i] = Status::kInvalid;
         continue;
       }

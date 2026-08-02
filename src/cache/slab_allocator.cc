@@ -672,8 +672,8 @@ bool SlabAllocator::Put(const BlockKey& key, size_t len, SlotRef* out,
     if (out) *out = meta.ref;
     return true;
   }
-  if (len > opt_.extent_bytes || len > UINT32_MAX) return false;
-  uint64_t aligned = len == 0 ? opt_.align : AlignUp(len, opt_.align);
+  if (len == 0 || len > opt_.extent_bytes || len > UINT32_MAX) return false;
+  uint64_t aligned = AlignUp(len, opt_.align);
   if (aligned == 0 || aligned > opt_.extent_bytes) return false;
 
   const size_t cls_index = ClassForLen(static_cast<size_t>(aligned));

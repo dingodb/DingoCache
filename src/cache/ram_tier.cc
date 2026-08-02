@@ -408,7 +408,7 @@ RamTier::Admission RamTier::Admit(
     const BlockKey& key, const void* data, size_t len,
     std::shared_ptr<PutCompletion>* out_completion) {
   if (out_completion) out_completion->reset();
-  if (!arena_ || (data == nullptr && len != 0)) return Admission::kBypass;
+  if (!arena_ || len == 0 || data == nullptr) return Admission::kBypass;
   uint64_t requested_cap = 0;
   if (!AlignCapacity(len, opt_.slot_granularity, &requested_cap) ||
       requested_cap > opt_.bytes) {
@@ -546,6 +546,7 @@ bool RamTier::Put(const BlockKey& key, const void* data, size_t len) {
 }
 
 Status RamTier::PutCommitted(const BlockKey& key, const void* data, size_t len) {
+  if (len == 0 || data == nullptr) return Status::kInvalid;
   std::shared_ptr<PutCompletion> completion;
   const Admission admission = Admit(key, data, len, &completion);
   if (admission == Admission::kBypass) return Status::kCacheFull;
@@ -553,7 +554,7 @@ Status RamTier::PutCommitted(const BlockKey& key, const void* data, size_t len) 
 }
 
 bool RamTier::PutDurable(const BlockKey& key, const void* data, size_t len) {
-  if (!arena_ || (data == nullptr && len != 0)) return false;
+  if (!arena_ || len == 0 || data == nullptr) return false;
   uint64_t requested_cap = 0;
   if (!AlignCapacity(len, opt_.slot_granularity, &requested_cap) ||
       requested_cap > opt_.bytes)

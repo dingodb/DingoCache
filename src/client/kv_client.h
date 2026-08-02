@@ -69,6 +69,7 @@ class KVClient {
            std::optional<size_t> batch_concurrency_override = std::nullopt);
   ~KVClient();
 
+  // PUT values must be non-empty; zero-length values fail before routing.
   bool Put(const std::string& key, const void* value, size_t n);
   bool Get(const std::string& key, void* out, size_t n);  // true = hit (exact n)
   // Variable-size get. The authoritative full stored size comes from the
@@ -83,7 +84,8 @@ class KVClient {
   // block was removed OR was already absent); false on route/health/IO failure.
   bool Remove(const std::string& key);
 
-  // Batched, concurrently fanned out across owning nodes. Per-item results.
+  // Batched, concurrently fanned out across owning nodes. Per-item results;
+  // zero-length PUT values fail independently before routing.
   std::vector<bool> BatchPut(const std::vector<KvPutItem>& items);
   std::vector<bool> BatchGet(const std::vector<KvGetItem>& items);  // hit/miss
   // Variable-size batched get. items[i].n is the buffer CAPACITY (not the exact
@@ -102,8 +104,9 @@ class KVClient {
   // Scatter-gather batch put: each key gathers its N source segments into one
   // stored blob (sum of sizes). Mirrors BatchPut (consistent-hash routing per key,
   // group by node, zero-copy multi-SGE gather where supported). Per-item result.
-  // A key exceeding the active transport's runtime segment limit, or whose byte
-  // sum overflows size_t, is reported failed rather than routed.
+  // A key exceeding the active transport's runtime segment limit, whose total
+  // value size is zero, or whose byte sum overflows size_t is reported failed
+  // rather than routed.
   std::vector<bool> BatchPutSg(const std::vector<KvPutItemSg>& items);
   // Scatter-gather variable-size batch get: each key's stored blob is scattered
   // across its N destination segments in order. Mirrors BatchGetAuto: accepts a

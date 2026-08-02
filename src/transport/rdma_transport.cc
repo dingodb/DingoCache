@@ -809,7 +809,7 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
                                 uint64_t* value_len) {
   const uint64_t value_bound = static_cast<uint64_t>(OpBound());
   if ((op == WireOp::kCache &&
-       (payload_len > value_bound ||
+       (payload_len == 0 || payload_len > value_bound ||
         payload_len > std::numeric_limits<size_t>::max() ||
         !ValidBuffer(payload, static_cast<size_t>(payload_len)))) ||
       (op == WireOp::kRange && (length > value_bound || out == nullptr)) ||
@@ -992,7 +992,8 @@ std::vector<Status> RdmaTransport::CacheMany(
   std::vector<char> bad(count, 0);
   size_t valid_count = 0;
   for (size_t i = 0; i < count; ++i) {
-    if (!ValidBuffer(items[i].data, items[i].len) ||
+    if (items[i].len == 0 ||
+        !ValidBuffer(items[i].data, items[i].len) ||
         NoteBlock(items[i].len)) {
       bad[i] = 1;
       result[i] = Status::kInvalid;
@@ -1421,7 +1422,7 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
       }
       total = next;
     }
-    if (!invalid && NoteBlock(total)) invalid = true;
+    if (!invalid && (total == 0 || NoteBlock(total))) invalid = true;
     totals[i] = total;
     if (invalid) {
       bad[i] = 1;

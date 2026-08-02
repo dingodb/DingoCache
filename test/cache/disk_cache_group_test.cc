@@ -231,6 +231,25 @@ TEST_F(DiskGroupTest, ReloadFromDisksRebuilds) {
   EXPECT_EQ(out, "persisted");
 }
 
+TEST_F(DiskGroupTest, ZeroLengthWritesNeverAllocateObjects) {
+  auto dirs = Dirs(1);
+  DiskCacheGroup group({dirs, 1ull << 30, "file"});
+  ASSERT_TRUE(group.Healthy());
+  char marker = 0;
+
+  EXPECT_EQ(group.Cache(BlockKey{1, 0}, &marker, 0), Status::kInvalid);
+  EXPECT_EQ(group.CacheDirect(BlockKey{2, 0}, &marker, 0, 1),
+            Status::kInvalid);
+  std::vector<StoreEngine::CacheBatchItem> items;
+  for (uint64_t i = 0; i < 64; ++i)
+    items.push_back({BlockKey{3 + i, 0}, &marker, 0, 1});
+  const auto statuses = group.CacheDirectBatch(items);
+  ASSERT_EQ(statuses.size(), items.size());
+  for (Status status : statuses) EXPECT_EQ(status, Status::kInvalid);
+  EXPECT_EQ(group.Count(), 0u);
+  EXPECT_EQ(group.UsedBytes(), 0u);
+}
+
 TEST_F(DiskGroupTest, CacheDirectBatchOverlapsDisksAndPreservesOrder) {
   auto dirs = Dirs(3);
   auto probe = std::make_shared<BatchProbe>();
@@ -249,10 +268,11 @@ TEST_F(DiskGroupTest, CacheDirectBatchOverlapsDisksAndPreservesOrder) {
   DiskCacheGroup group(std::move(options));
   ASSERT_TRUE(group.Healthy());
 
+  char value = 'x';
   std::vector<StoreEngine::CacheBatchItem> items;
   items.reserve(256);
   for (uint64_t i = 0; i < 256; ++i)
-    items.push_back({BlockKey{0, i}, nullptr, 0, 0});
+    items.push_back({BlockKey{0, i}, &value, 1, 1});
   const std::vector<Status> statuses = group.CacheDirectBatch(items);
 
   ASSERT_EQ(statuses.size(), items.size());
@@ -281,9 +301,10 @@ TEST_F(DiskGroupTest, SingleDiskBatchRunsInline) {
         return std::make_unique<ProbeEngine>(dir, 0, probe);
       };
   DiskCacheGroup group(std::move(options));
+  char value = 'x';
   std::vector<StoreEngine::CacheBatchItem> items{
-      {BlockKey{0, 2}, nullptr, 0, 0},
-      {BlockKey{0, 3}, nullptr, 0, 0}};
+      {BlockKey{0, 2}, &value, 1, 1},
+      {BlockKey{0, 3}, &value, 1, 1}};
   const std::thread::id caller = std::this_thread::get_id();
   const auto statuses = group.CacheDirectBatch(items);
   ASSERT_EQ(statuses.size(), 2u);

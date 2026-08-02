@@ -215,10 +215,9 @@ def _read_snapshot(lib, h) -> str:
     return buf.value.decode("utf-8", "replace")
 
 
-# A valid non-null pointer for zero-length "marker" puts (the logical-anchor
-# "kv" pool of V4/DSA models). The payload is 0 bytes, so the pointer is never
-# dereferenced, but it must be non-null so the batch slot isn't treated as a
-# failed (null-key) entry by the C ABI.
+# One-byte marker for the logical-anchor "kv" pool of V4/DSA models. Native
+# dfkv rejects zero-length PUTs because they allocate objects without consuming
+# byte quota; charging one byte preserves the existence-marker semantics.
 _MARKER_BUF = ctypes.create_string_buffer(1)
 _MARKER_PTR = ctypes.addressof(_MARKER_BUF)
 
@@ -933,10 +932,10 @@ class DfkvHiCache(HiCacheStorage):
         SGLang builds a *logical anchor* (LogicalHostPool) as the primary "kv"
         pool for V4/DSA multi-pool models such as GLM-5.2 — it carries no KV
         tensor, so get_page_buffer_meta() returns None. The real KV rides the v2
-        side-pool path (batch_set_v2/batch_get_v2); the v1 anchor only writes an
-        empty "kv" marker so the v2 existence check can anchor the hit prefix
-        (mirrors SGLang's reference backend). Informational, not an error — the
-        path works, but it is newly enabled, so surface it once for ops to
+        side-pool path (batch_set_v2/batch_get_v2); the v1 anchor writes a
+        one-byte "kv" marker so the v2 existence check can anchor the hit prefix.
+        This mirrors the reference backend's logical marker semantics.
+        Informational, not an error — the path works, but it is newly enabled,
         confirm the hit rate via metrics."""
         if self._anchor_noop_warned:
             return
@@ -944,20 +943,20 @@ class DfkvHiCache(HiCacheStorage):
         import sys as _sys
         print("[dfkv] NOTE: primary KV pool is a logical anchor "
               "(get_page_buffer_meta -> None) — a V4/DSA multi-pool model "
-              f"(model={self.model!r}, e.g. GLM-5.2). The v1 anchor writes an "
-              "empty 'kv' marker; real KV rides the v2 side-pool path. Verify L3 "
+              f"(model={self.model!r}, e.g. GLM-5.2). The v1 anchor writes a "
+              "one-byte 'kv' marker; real KV rides the v2 side-pool path. Verify L3 "
               "hit rate via metrics; if low, the LMCache MP connector "
               "(docs/CONNECTORS.md #4.5) is the alternative path for GLM-5.x DSA.",
               file=_sys.stderr, flush=True)
 
     def _write_anchor_markers(self, keys) -> List[bool]:
-        """Write an empty (0-byte) marker object per "kv" sub-key so a later
+        """Write a one-byte marker object per "kv" sub-key so a later
         batch_exists / batch_exists_v2 can find the primary-pool prefix.
 
         Used only for the logical-anchor case (V4/DSA, e.g. GLM-5.2): the anchor
-        pool holds no KV buffer, so there is nothing to zero-copy — but SGLang's
-        v2 existence check still gates the hit prefix on the primary "kv" keys,
-        exactly as its reference backend does by writing an empty get_data_page().
+        pool holds no KV buffer, so there is nothing to zero-copy. The marker is
+        non-empty so native dfkv charges tenant byte quota for every allocated
+        object while preserving SGLang's logical-anchor existence semantics.
         Namespace and object-key identity isolate incompatible writers; the
         matching read (batch_get_v1) is a no-op. Returns a per-page success list
         (a page succeeds iff all its sub-object markers were written)."""
@@ -966,7 +965,7 @@ class DfkvHiCache(HiCacheStorage):
         if not sks:
             return []
         karr, klens, parr, sarr, out, key_owners = _arrays(
-            sks, [_MARKER_PTR] * len(sks), [0] * len(sks))
+            sks, [_MARKER_PTR] * len(sks), [1] * len(sks))
         self._lib.dfkv_batch_put(
             self._h, karr, klens, parr, sarr, len(sks), out)
         del key_owners
@@ -991,10 +990,9 @@ class DfkvHiCache(HiCacheStorage):
                 # LogicalHostPool whose get_page_buffer_meta() returns None). The
                 # real KV lives in compressed side-pools written via batch_set_v2;
                 # there is nothing to zero-copy on the anchor, but we still write
-                # an empty "kv" marker per page so the v2 existence check can
-                # anchor the hit prefix (SGLang's reference backend does the same
-                # with an empty get_data_page()). Single-pool models (MLA/MHA)
-                # never return None, so this branch is inert for them.
+                # a one-byte "kv" marker per page so the v2 existence check can
+                # anchor the hit prefix. Single-pool models (MLA/MHA) never
+                # return None, so this branch is inert for them.
                 self._note_logical_anchor_once()
                 res = self._write_anchor_markers(keys)
                 r.result = f"anchor_marker {sum(res)}/{n}"
@@ -1255,8 +1253,8 @@ class DfkvHiCache(HiCacheStorage):
             if meta is None:
                 # Logical anchor pool, no buffer to scatter into (V4/DSA models,
                 # e.g. GLM-5.2). The "kv" prefix was already confirmed present by
-                # batch_exists_v2 (via the empty markers written on backup); there
-                # is no anchor payload to load. Report all pages present so
+                # batch_exists_v2 (via the one-byte markers written on backup);
+                # there is no anchor payload to load. Report all pages present so
                 # _page_get_zero_copy counts the anchor prefix complete and the
                 # hybrid controller then loads the real KV from side-pools via
                 # batch_get_v2. Returning False here would make kv_completed_pages
