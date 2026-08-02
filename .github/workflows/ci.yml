@@ -233,6 +233,9 @@ jobs:
           # 共享遥测包：dfkv_hicache.py 顶部 `from dfkv_telemetry import ...`，
           # 不一起打包则 SGLang 插件加载即 ImportError。
           cp -r integration/hicache/dfkv_telemetry "$PKG/python/"
+          # Standalone HiCache deployment adds only python/ to PYTHONPATH, so its
+          # shared identity dependency must live beside the plugin as well.
+          cp -r integration/common/src/dfkv_common "$PKG/python/"
           # 共享 identity/C ABI 包 + vLLM / LMCache 连接器（源码 Python 包，随 release
           # 一起发；三个 sibling root 可从解压后的 tarball 直接 pip install）。
           mkdir -p "$PKG/integration"
