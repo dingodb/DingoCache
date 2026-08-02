@@ -41,6 +41,11 @@ README "Recommended tuning"）：TP-N 各 rank 独立进程重复读同页时，
 合并/晋升——客户端观察到的效果是**同页重复冷读与重放显著变快**（xb01 实测每重复页盘读
 8→~2.4 次、晋升页复读零盘），无任何客户端配置或行为变化。
 
+**RDMA transport v2（本轮 Phase 2）**是另一类兼容性变更：新 client 先做能力
+probe，新 server 同时接 v1/v2；新旧组合按连接回到 v1。只有新 client + 新
+server 才使用共享 receive segment 与 one-sided payload。实际路径以
+`dfkv_rdma_{v1,v2}_conns_opened_total` 为准，不能只看环境变量。
+
 ---
 
 ## 1. 通用客户端配置（跨连接器 env / config 总表）
@@ -74,19 +79,49 @@ tp_rank=..,ver=<lib>`（无 `role`——HiCache 是前缀 L3 缓存，无生产/
 | env | 默认 | 推荐 | 说明 |
 |-----|------|------|------|
 | `DFKV_RDMA` | 未设 = TCP | `1` | 选 native-verbs RDMA 传输；未设则 TCP 回退 |
-| `DFKV_RDMA_DEV` | — | 最佳：**按 rank 轨亲和**（每进程注入 `ib7s400p{local_rank}`）；简化：本机所有 400G 口逗号列表 + `DFKV_RDMA_NUMA=1` | RDMA 轨；逗号列表 = 多轨。🔴 **必须显式设置且与 server 服务轨同一 IB fabric**。留空 = 客户端拿本机**枚举第一个**设备——多 fabric 主机（计算轨 + 存储轨共存）上第一个设备常是另一张网（如 200G 存储卡 `ib6s200p0`），与 server 的 400G 轨物理不通 → **跨轨 RC 黑洞**：bootstrap/QP 建连全部成功，数据 op 秒级重传超时死亡、连接池熔断后续秒拒（2026-07-20 xb01 实测签名：服务端 conn+1 但零完成、客户端首 op ~3.7s 失败后批量瞬败）。设备名不同的异构场景也一样：选一个**确认在 server fabric 上**的本机设备显式写上，不要赌枚举顺序 |
+| `DFKV_RDMA_DEV` | 首个 `ACTIVE` 本地 HCA | 留空让两端各自选本地首口；多轨才显式写同 fabric 白名单 | 留空时 bootstrap 不发送设备名，client/server 可使用不同本地命名。逗号列表显式开启多轨，新连接在健康轨间轮转；显式设备名会发给 peer，故两端必须存在同名且互通的 fabric。 |
 | `DFKV_REQUIRE_RDMA` | `0` | 生产 `1` | 无 RDMA 设备时启动失败，禁止静默 TCP fallback |
-| `DFKV_RDMA_DEPTH` | `1` | **两侧一致** | 单连接在途请求数。🔴 **契约：客户端 depth 必须 ≤ 服务端 depth（同名 env，各读各的）**——超出的在途请求撞 RNR 重试，表现为**静默 3-4 倍劣化而非报错**（2026-07-04 hd05 实测：两侧=32 时单连接 batch GET 1.39→4.42 GB/s、batch32 1.31→5.81）。⚠️ 历史"depth-flat（1≈8≈16≈32）"结论即此错配的假象（当时服务端恒为默认 1），作废。服务端每连接 pinned 内存 ≈ 2×control_cap×depth，抬 depth 前核内存；多连接 fan-out（`batch_concurrency`）仍是首选吞吐杠杆。服务端现值经 `dfkvctl ring` INFO `qd=` 可查 |
-| `DFKV_RDMA_MAX_BLOCK_BYTES` | 0(不声明) | **DCP1 容量声明**（v1.11.0+，issue #110）：本进程在此连接上会 PUT/GET 的最大块字节数。客户端把它藏进 bootstrap 设备名帧的确定性零尾部；新服务端按声明精确分配该连接的 per-slot 缓冲（不再按全局最坏 64MiB），GLM 4MiB 块连接 ≈ **6.7× 内存↓**。连接器可按块几何自动推导后 setenv。超声明的 op 客户端侧直接返回失败（不上 wire）。四配对兼容：不声明/老版本=旧行为。服务端日志 `rdma conn caps: declared=…` 是生效凭证。 |
-| `DFKV_RDMA_NUMA` | `0` | 多 NUMA 大机 `1` | 绑 buffer/线程到轨的 NUMA 节点 + 建连时按调用线程 NUMA 选本地轨（无本地轨→轮转全轨）。仅新建连接触发，热路径零开销。SGLang/vLLM 通吃 |
+| `DFKV_RDMA_DEPTH` | `1` | 两侧可不同，按容量选 | 握手协商 `min(client,server)` 作为安全窗口，不再因 client 深于 server 触发 RNR。v2 每连接只占 `2 × depth × 4 KiB` 量级控制 buffer，并从共享 receive segment 租 `depth` 个 slot；v1 fallback 仍分配 per-connection block buffer。 |
+| `DFKV_RDMA_MAX_BLOCK_BYTES` | 64 MiB 安全上限 | 按连接器块几何精确设置 | DCP2 声明本连接最大 PUT/GET block，决定共享 segment 的 slot 大小；超声明请求在客户端失败且不上 wire。声明越准，同一 segment 可容纳的 live/pooled v2 连接越多。 |
+| `DFKV_RDMA_PROTOCOL` | `auto-v2` | `auto-v2` | 客户端先探测 v2；老 server 或 v2 segment 暂时无 lease 时自动重连 v1。设 `1` 强制旧 SEND/RECV 路径；构造后不热切换，改值必须重启每个 client 进程。 |
+| `DFKV_RDMA_SERVER_PROTOCOL` | `auto-v2` | `auto-v2` | server 接受 v2 和 v1；设 `1` 禁用 v2。构造后不热切换，改值必须重启 server。 |
+| `DFKV_RDMA_RECV_SEGMENT_SIZE` | 2 GiB | 按下文 live/pooled 连接公式设置 | server 启动时申请，并在每个**显式选中** rail 的共享 PD 上注册一次；v2 连接只租 offset。segment 满时新 data QP 自动回退 v1。 |
+| `DFKV_RDMA_NUMA` | `0` | 显式多轨的大机可设 `1` | 建连时按调用线程 NUMA 选本地 rail（无本地 rail→轮转白名单），server serve 线程跟随 QP rail。单块共享 receive segment 不做 per-rail NUMA 分配；仅保证选轨/线程亲和。 |
 | `DFKV_RDMA_MAX_PAYLOAD_BYTES` | 64 MiB（67108864） | — | 客户端单 value payload 上限（不得超过 server 侧同名上限） |
+
+**v2 数据面**：PUT 把 `[request prefix | ValueHeader | payload]` 以
+`RDMA_WRITE_WITH_IMM` 直接写入 server 租出的 slot；GET 先用 SEND 提交
+`{addr,rkey,len}` 目标描述符，server 再以 RDMA WRITE 直接散射到调用方
+buffer，最后只 SEND 状态和小 header。两向 payload 都不经过 QP 的 4-KiB
+控制 buffer。新 client→老 server、老 client→新 server、v2 segment 临时满
+三种情况均回到 v1，不混读两种 frame。
+
+`kMembers` 遗留静态成员查询是例外：成员列表可能超过 4 KiB，client 使用独立
+v1 control QP；生产 MDS 发现不走该路径。
 
 #### 1.2.1 `DFKV_RDMA_MAX_BLOCK_BYTES` 怎么定（含 L2 / L2-bypass 两套公式）
 
-这个值决定**服务端**每连接 pin 多少内存：`qd × (ValueHeader + 声明值)`，握手时**预先分配**，
-不随实际流量增长。B200 实测（qd=32）：声明 16 MiB → **1.02 GB/连接**；声明 4 MiB → **0.34 GB/连接**；
-不声明（走 64 MiB 兜底）→ **约 2 GB/连接**。一个 8-rank 推理实例对单台服务端开约 **135 条连接**，
-所以这不是微调项，它决定环节点装不装得下。
+这个值在 **v2** 决定共享 receive segment 的 slot 大小：
+`align4K(4 KiB + ValueHeader + max(声明值, 4 KiB))`。每条数据连接租 `depth` 个 slot，
+但所有连接共享一块启动期注册的 `DFKV_RDMA_RECV_SEGMENT_SIZE`，不再各自
+注册 `depth × block` 的收发 buffer。强制 v1 或自动 fallback 时仍沿用旧的
+per-connection 分配，因此声明保持精确仍有价值。
+
+**共享 segment 容量必须按连接寿命算，不是按同时在飞请求算。** 数据 QP 的
+slot 为
+
+```
+S_data = align4K(4096 + sizeof(ValueHeader) + max(DFKV_RDMA_MAX_BLOCK_BYTES, 4096))
+B_required >= N_data × depth × S_data + N_control × depth × S_control
+```
+
+`N_data` / `N_control` 是该 server 上所有 rank、进程的**峰值 live + client
+pool 中空闲连接**；lease 一直保留到 QP 被销毁或 `DFKV_RDMA_IDLE_MS` 回收，
+线程峰值留下的 pooled QP 也要计入。4 MiB 声明、depth=4 时
+`S_data=4,202,496 B`，2 GiB segment 最多约 127 条 data QP（未扣 control
+lease）；depth=8 时约 63 条。上线同时观察
+`dfkv_rdma_recv_segment_free_bytes`、`dfkv_rdma_v2_ready` 与 v1 fallback
+连接计数，free 接近 0 即扩容或缩小声明/depth/pool。
 
 **块大小取决于走哪条路径**——两条路径的分块规则不同：
 
@@ -110,13 +145,14 @@ tp_rank=..,ver=<lib>`（无 `role`——HiCache 是前缀 L3 缓存，无生产/
 1. 按上表算出理论值（两条路径都算，取大者——同一集群可能两种都跑）
 2. 起一轮真实负载，读服务端/客户端日志里的 `rdma: max block observed <N>B` 高水位（v1.40+）
 3. 取实测值的 2~4 倍设定，注意**必须同时覆盖原版 L2 路径的整页对象**
-4. 复核服务端日志 `rdma conn caps: declared=…` 确认生效（这行只在客户端真声明时出现）
+4. 复核服务端日志 `rdma conn: protocol=v2 declared=… control=… shared-slot=… qd=…` 确认生效
 
-🔴 **设小了不会报错——这是最危险的部分。** 超声明的块被判 `kInvalid`，而 `kInvalid` 被客户端健康
-计数**刻意忽略**，上层看到的就是 `hits[i] != 1`，与"这页压根没缓存"**完全无法区分**：不崩、不报错、
-不熔断，只有命中率悄悄封顶。v1.40+ 起超限会打 `rdma: block …B exceeds the declared bound …B` 告警
-（首次 + 每 1024 次），在此之前**没有任何信号**。典型踩法：照 L2-bypass 实测的 1.02 MiB 调到 2 MiB，
-切回原版 L2 后 2.74 MiB 的整页对象全部静默失效。
+🔴 **设小后上层仍只看到 miss——这是最危险的部分。** 超声明的块被判 `kInvalid`，
+而 `kInvalid` 被客户端健康计数刻意忽略，上层 `hits[i] != 1` 与“这页压根没缓存”
+无法区分：不崩、不熔断。v1.40+ 会打 `rdma: block …B exceeds the declared bound
+…B` 告警（首次 + 每 1024 次），所以必须纳入日志告警。
+典型踩法：照 L2-bypass 实测的 1.02 MiB 调到 2 MiB，切回原版 L2 后
+2.74 MiB 的整页对象全部静默失效。
 
 > **服务端侧上限 `--max-msg`（v1.40+）**：默认 64 MiB，即"客户端不声明时给多少"。
 > 它同时是本服务端接受的**上限**：客户端声明**高于**它会被**明确拒绝连接**并打日志，
@@ -129,10 +165,13 @@ tp_rank=..,ver=<lib>`（无 `role`——HiCache 是前缀 L3 缓存，无生产/
 
 ### 1.3 wire 协议版本
 
-wire 协议为 **v1 单版本**（版本字节在帧首，未知版本 fail-fast 断连）。
-v1.7.0/v1.7.1 曾附带实验性 opt-in "wire v2"（`DFKV_WIRE_VERSION=2`，请求 seq 回显校验），
-**v1.7.2 起已移除**：生产数据面走 RDMA（RC 硬件已保证按序 + ICRC，v2 冗余且从未在 RDMA
-生效），TCP 侧也无部署使用。设置 `DFKV_WIRE_VERSION` 现在无任何效果，可从环境中清理。
+当前有两个不同概念，禁止混称：
+- **TCP / RDMA fallback v1**：42-byte request prefix、10-byte response prefix，RDMA payload 走 SEND/RECV。
+- **RDMA transport v2**：bootstrap 显式协商版本 2；GET request 在固定 prefix 后携带目标 MR，payload 走 one-sided WRITE。
+
+v1.7.0/v1.7.1 的 `DFKV_WIRE_VERSION=2` 是已删除的 **TCP seq 回显实验**，
+与当前 RDMA v2 无关；v1.7.2 起该变量无效，应从环境清理。详见
+[ARCHITECTURE.md](ARCHITECTURE.md) §4。
 
 ### 1.4 块身份（96-bit，无需配置，仅需知道）
 
@@ -208,7 +247,7 @@ export DFKV_REQUIRE_RDMA=1               # 可选：禁止悄悄 TCP fallback
 export DFKV_RDMA_DEV=ib7s400p0,ib7s400p1,ib7s400p2,ib7s400p3,ib7s400p4,ib7s400p5,ib7s400p6,ib7s400p7
 export DFKV_RDMA_NUMA=1                   # 可选：多 NUMA 大机 NUMA 选轨（§1.2）
 export DFKV_RDMA_MAX_PAYLOAD_BYTES=67108864  # 可选：单 chunk payload 上限，默认 64MiB
-# DFKV_RDMA_DEPTH 两侧一致（§1.2：客户端 > 服务端 = RNR 静默劣化）
+# DFKV_RDMA_DEPTH 可按容量分别设置；握手自动取两侧最小安全窗口
 ```
 
 > ⚠️ hd04 当前只有 `ib7s400p0,ib7s400p1` 两轨 up，但标准训练计算网节点是 8×400G，
@@ -269,11 +308,12 @@ env 同义项见 §1.6）、`rail_affinity`（已废弃 no-op）。
 
 - **`interface_v1:1` 必填**，插件 `__init__` 强校验：缺失即 `raise ValueError` 启动失败。
   原因——对 `dynamic` 后端，SGLang 仅在 `interface_v1` 为真时才走零拷贝
-  `batch_set_v1/get_v1`；否则退回 generic `set/get`，而 dfkv 的 generic `get/batch_get`
-  是未实现的桩 → **写成功、L3 读静默失败**（线上踩过：launch 脚本漏配，14GB 写入但
-  prefetch 全 miss）。`interface_v1:1` 下 GET payload 经 RDMA 散射**直落 HiCache 宿主页**
-  （client 零拷贝），server O_DIRECT 直读入已注册 direct buffer 并 scatter-send
-  （server 无 payload memcpy），两端零拷贝。
+  `batch_set_v1/get_v1`；否则退回 generic `set/get`，而 dfkv 的 generic
+  `get/batch_get` 是未实现的桩 → **写成功、L3 读静默失败**（线上踩过：
+  launch 脚本漏配，14GB 写入但 prefetch 全 miss）。`interface_v1:1` 下 GET
+  payload 经 RDMA 直落 HiCache 宿主页（client 零拷贝）；server O_DIRECT /
+  io_uring 直读入注册 buffer，RDMA v2 以 one-sided WRITE 直落 client 目标
+  MR（v1 fallback 用 scatter SEND），均无 payload memcpy。
 - MLA 下插件自动单对象、无 rank 后缀、`backup_skip`（仅 tp_rank0 写）。decode 共享前缀配同 members。
 - **多池模型**（Mamba/SWA/DeepSeek-V4）用 v2 PoolTransfer 接口（插件已实现）。
   DSA/DeepSeekV4 主 `kv` 池是无数据的 LogicalHostPool（`get_page_buffer_meta→None`），
@@ -301,20 +341,21 @@ env 同义项见 §1.6）、`rail_affinity`（已废弃 no-op）。
   （见 [DEPLOY.md](DEPLOY.md) §监控）。
 - 回滚：`--hicache-storage-backend` 改回原后端（mooncake 等）重启该副本，与 dfkv 解耦。
 
-### 2.6 特性边界（HiCache 侧不适用的 vLLM 特性）
+### 2.6 HiCache 特性边界
 
-后续给 vLLM 连接器加的几个特性**不适用于 HiCache 侧**——不是漏配，是数据形状不匹配，
-HiCache 维持常规路径即可：
+以下是 HiCache 的实际适用范围，不能照搬 vLLM 连接器的数据形状或旧 RDMA
+路径经验：
 
 - **scatter-gather（SG，合并 key）— HiCache 不用。** SG 把"一个 chunk 的多个层段"合成
   一个多-SGE RDMA key，是为 vLLM 连接器的变长 chunk × 多层段做的。HiCache MLA **每页就是
   一个打包 latent 对象（~2.74 MiB）**，本来一页一 key、无碎段可合，SG 无收益。
   （仅 MHA 的 `_k`/`_v` 对或未来多池 HiCache v2 才理论上有边际收益，且需改插件代码、非开关。）
-- **io_uring async GET（`DFKV_SERVER_URING`，server 侧）— 不要开。** 实测单盘对吞吐
-  **flat/无收益**（瓶颈是盘不是读提交），默认关。
-- **`DFKV_RDMA_DEPTH` — 两侧保持一致**（§1.2：客户端超过服务端 = RNR 静默劣化；历史 depth-flat 结论已作废）。
-- HiCache 真正需要的硬化与可观测性（RDMA 空闲回收、CLOCK 持久指针、MDS 硬化、
-  Prometheus 指标）**已在 v1.5.2+ 内**，无需额外动作。
+- **io_uring async GET（server 侧）— RDMA v1/v2 都支持。** 构建启用
+  `DFKV_WITH_URING` 时默认开，`DFKV_SERVER_URING=0` 才关闭；多连接场景实测
+  neutral，少连接深 pipeline 约 +6%，失败自动回同步并有指标。
+- **`DFKV_RDMA_DEPTH` — 两侧无需强制相等。** 握手取最小值，按共享 segment
+  容量和连接 fan-out 分别配置即可。
+- **HiCache 命中/吞吐/延迟与 client 注册指标**已在 v1.5.2+ 内，无需额外动作。
 
 ---
 
@@ -333,38 +374,37 @@ HiCache 维持常规路径即可：
 | `SGLANG_HICACHE_L2_BYPASS_DEDUP` | `1` | 同前缀并发 SG GET 去重：后到的请求 park 等待，不重复拉取 |
 | `SGLANG_HICACHE_L2_BYPASS_FUSE_DRAFT` | `0` | draft（EAGLE）是否与目标层融进同一次 RDMA op。**默认关**——收益未经重复取样确认，单次测量不足以认领 |
 | `DFKV_RDMA_MAX_BLOCK_BYTES` | 见 §1.2.1 | bypass 下块 = `29 × page_size × 每token每层字节`，比原版 L2 小约 2.7× |
-| `DFKV_RDMA_IO_MS` | `30000` | bootstrap 握手超时。**冷连接池场景必须放宽**，理由见下 |
+| `DFKV_RDMA_IO_MS` | 默认 `10000` | v2 只建小 control QP + 租共享 slot；通常保持默认。只有指标确认回到 v1 且旧 per-connection pin 握手超时，才临时放宽到 `30000` |
 
 SGLang 启动侧需配合：`--hicache-mem-layout page_first_direct --hicache-io-backend direct`。
 
-#### 🔴 冷连接池：为什么 `DFKV_RDMA_IO_MS` 默认的 10s 不够
+#### 冷连接池：v2 与 v1 fallback 的握手成本不同
 
-服务端每条**新**连接的 `ep.Open()` 要预分配并注册 `qd × (ValueHeader + 声明值)` 的 pin 内存，
-这一步占握手耗时的 **98%**（B200 实测六段计时：`devread=147ms open=9046ms qpx=0 connect=0 poolmr=0`）。
-新实例的**第一次** L3 读时连接池是空的，要一次性建大量连接，每条都付这个代价：
+RDMA v2 的 server 启动期已注册 process-wide receive segment；新 data QP
+只创建小 control buffers 并租 `depth × slot` 的 offset，不再为每连接注册
+`qd × block`。因此下面 9s `Open()` 数据只描述 **v1 SEND/RECV fallback**，
+不能用于估算 v2：
 
-| 配置 | `open` | 总握手 | 对 10s 超时余量 | 结果 |
-|---|---|---|---|---|
-| 未声明块大小（64 MiB 兜底） | 9046 ms | 9194 ms | 1.09× | **首读全盘 IO 错误 → L3 读命中 0%** |
-| 声明 16 MiB | 5180 ms | 5330 ms | 1.88× | 仍偏紧 |
-| 声明 4 MiB | 2837 ms | 2957 ms | 3.4× | — |
-| 声明 4 MiB + `IO_MS=30000` | 2837 ms | 2957 ms | **10×** | 稳定 |
+| v1 fallback 配置（历史实测） | `open` | 总握手 | 对 10s 超时余量 |
+|---|---:|---:|---:|
+| 未声明块大小（64 MiB） | 9046 ms | 9194 ms | 1.09× |
+| 声明 16 MiB | 5180 ms | 5330 ms | 1.88× |
+| 声明 4 MiB | 2837 ms | 2957 ms | 3.4× |
 
-失败形态很有欺骗性：握手在 QP 信息交换处超时（`errno=11 EAGAIN`）→ `Acquire` 返回 nullptr →
-`MarkBad` → 该轮全部 op 报 IO 错误 → 上层判为全 MISS。**只有首读崩，后续轮次复用池中连接不再走
-`Open`，恢复 100% 命中**——这个"只有第一次不行"的形态曾被误判成存储/键方案问题，实际在传输握手。
-
-修复前后（A 构型：新实例 → warmup → seed 写 → flush → 首读）：**8/8 全崩 → 6/6 全 100.0%**，
-32 轮长稳 32/32 无 FAIL、无泄漏。
+若首轮仍超时，先用 `dfkv_rdma_client_v2_conns_opened_total`、
+`dfkv_rdma_v2_ready` 和 server 连接日志确认是否实际 fallback 到 v1；不要
+直接把旧 30s 经验套到 v2。v1 冷池确实存在时可临时设
+`DFKV_RDMA_IO_MS=30000`，同时修复 v2 segment 容量/注册失败根因。
 
 #### 服务端
 
-L2-bypass 不需要服务端改配置，但两项与内存直接相关：
+L2-bypass 不需要独立 server 协议，但两项决定 v2 容量：
 
-- `--max-msg`（v1.40+）：见 §1.2.1。客户端不声明时的兜底 = 每连接 ~2 GB，大集群务必显式设定
-- `--rdma-depth`（qd）：每连接内存与它**线性**相关。B200 实测 32→8：内存 +137GB→+34GB（4.03×），
-  握手 `open` 4930→1314ms（3.75×），吞吐中位 −9%（n=4，两臂分布有重叠，只够看方向）。
-  内存不紧张时保持 32；紧张时 8 是机制清晰、收益线性的杠杆
+- `DFKV_RDMA_RECV_SEGMENT_SIZE`：按 §1.2.1 的 peak live/pooled QP 公式；
+  观察 `dfkv_rdma_recv_segment_free_bytes` 和 `dfkv_rdma_v2_ready`
+- `DFKV_RDMA_MAX_BLOCK_BYTES` + `DFKV_RDMA_DEPTH`：共同决定每 QP 的 lease；
+  声明要覆盖原版 L2 的较大整页对象。只有 v1 fallback 仍承担
+  per-connection `depth × block` pin 内存与旧握手成本
 
 #### 验证清单
 
@@ -372,7 +412,7 @@ L2-bypass 不需要服务端改配置，但两项与内存直接相关：
 # 1. bypass 真的开了（数自证日志，别只看 env）
 nerdctl logs <容器> 2>&1 | grep -c 'L2-bypass ENABLED'
 # 2. 声明真的到了服务端（这行只在客户端真声明时出现）
-journalctl -u dfkv-server | grep 'rdma conn caps: declared='
+journalctl -u dfkv-server | grep 'rdma conn: protocol=v2 declared=.*shared-slot='
 # 3. 块大小与余量（v1.40+）
 nerdctl logs <容器> 2>&1 | grep 'max block observed'
 nerdctl logs <容器> 2>&1 | grep -c 'exceeds the declared bound'   # 必须为 0
@@ -562,10 +602,10 @@ extra_config:
   remote_storage_plugin.dfkv.lib:         <LIBDFKV>
 ```
 
-**RDMA 版**：只改两点 —— URL 用 **RDMA 端口**（server `--rdma-port`），并给 vLLM 进程加
-`export DFKV_RDMA=1`。`DFKV_RDMA_DEV` **必须显式设为与缓存节点服务轨同 fabric 的本机
-设备**（同型号节点逗号列全 8 轨；异构/多 fabric 主机严禁留空——留空取枚举第一个设备，
-撞上另一张网就是跨轨 RC 黑洞，见 §1.2 🔴）。
+**RDMA 版**：URL 用 **RDMA 端口**（server `--rdma-port`），并给 vLLM
+进程加 `export DFKV_RDMA=1`。单 fabric 节点可直接使用自动 active-HCA 发现；
+生产多 fabric 节点必须用 `DFKV_RDMA_DEV` 过滤出与 cache server 同 fabric
+的本机设备（同型号节点可逗号列全轨，见 §1.2）。
 
 **生产推荐 MDS 动态发现**（节点增减自动生效）：`membership` 改 `mds`，URL endpoint 改成
 dfkv_mds 层 `ip:port` 列表，组名走 URL 末尾 `/<group>`：

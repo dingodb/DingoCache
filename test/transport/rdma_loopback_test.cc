@@ -39,6 +39,11 @@ ValueHeader SelfHdr() {
   return ValueHeader::Make(0x51ULL, 64, 0x46384534u, ValueHeader::kFlagIsMla,
                            8, 0, 78, 1, 576);
 }
+void ConfigureTestRecvSegment() {
+  // Keep Soft-RoCE CI below modest RLIMIT_MEMLOCK. Production defaults to
+  // 2 GiB, but these fixtures use 256-KiB blocks and need only a small segment.
+  ::setenv("DFKV_RDMA_RECV_SEGMENT_SIZE", "33554432", 0);
+}
 
 // A cache node serving RDMA: KvNodeServer owns the DiskCacheGroup; RdmaServer
 // bootstraps QPs and routes requests to it (generic handler + zero-copy range).
@@ -49,6 +54,7 @@ struct RdmaNode {
   std::string addr;  // bootstrap "ip:port" for the client member list
 
   explicit RdmaNode(const std::string& tag, size_t max_msg = kMaxMsg) {
+    ConfigureTestRecvSegment();
     dir = fs::temp_directory_path() / ("dfkv_rdma_" + tag);
     fs::remove_all(dir);
     fs::create_directories(dir);
@@ -272,17 +278,146 @@ TEST(RdmaLoopback, MetricsCountersTrackOps) {
   EXPECT_GE(node.rsrv->Completions(), 2u);
   std::string srv_text = node.rsrv->MetricsText();
   EXPECT_NE(srv_text.find("dfkv_rdma_completions_total"), std::string::npos) << srv_text;
+  EXPECT_GE(CounterVal(srv_text, "dfkv_rdma_v2_conns_opened_total"), 1);
+  EXPECT_GE(CounterVal(srv_text, "dfkv_rdma_v2_put_writes_total"), 1);
+  EXPECT_GE(CounterVal(srv_text, "dfkv_rdma_v2_get_writes_total"), 1);
+  EXPECT_GT(CounterVal(srv_text, "dfkv_rdma_recv_segment_bytes"), 0);
 
   // client transport: a connection was opened and the MR region declared
   std::string cli_text = rt.MetricsText();
   EXPECT_NE(cli_text.find("dfkv_rdma_client_conns_opened_total"), std::string::npos) << cli_text;
   EXPECT_NE(cli_text.find("dfkv_rdma_client_rail_conns_total{dev="), std::string::npos) << cli_text;
   EXPECT_NE(cli_text.find("dfkv_rdma_client_mr_regions 1"), std::string::npos) << cli_text;
+  EXPECT_GE(CounterVal(cli_text, "dfkv_rdma_client_v2_conns_opened_total"), 1);
+  EXPECT_GE(CounterVal(cli_text, "dfkv_rdma_client_v2_put_writes_total"), 1);
+  EXPECT_GE(CounterVal(cli_text, "dfkv_rdma_client_v2_get_writes_total"), 1);
 
   // and the client snapshot folds transport metrics in after the health metrics
   std::string snap = c.MetricsSnapshot();
   EXPECT_NE(snap.find("dfkv_client_ops_served_total"), std::string::npos) << snap;
   EXPECT_NE(snap.find("dfkv_rdma_client_conns_opened_total"), std::string::npos) << snap;
+}
+TEST(RdmaLoopback, AutoFallsBackWhenServerForcesV1) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ::setenv("DFKV_RDMA_SERVER_PROTOCOL", "1", 1);
+  RdmaNode node("v1-fallback");
+  ::unsetenv("DFKV_RDMA_SERVER_PROTOCOL");
+
+  RdmaTransport transport(kMaxMsg);
+  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+  std::string value(4096, 'f');
+  ASSERT_TRUE(client.Put("fallback", value.data(), value.size()));
+  std::string output(value.size(), '\0');
+  ASSERT_TRUE(client.Get("fallback", output.data(), output.size()));
+  EXPECT_EQ(output, value);
+
+  EXPECT_GE(node.rsrv->V1Conns(), 1u);
+  EXPECT_EQ(node.rsrv->V2Conns(), 0u);
+  EXPECT_GE(CounterVal(transport.MetricsText(),
+                       "dfkv_rdma_client_v1_conns_opened_total"),
+            1);
+}
+
+TEST(RdmaLoopback, AutoFallbackPreservesLegacyUndeclaredFrame) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  // Before v2, an unset block declaration produced a plain legacy frame. The
+  // fallback must not invent the client's larger max as DCP1: an older server
+  // with a smaller --max-msg would reject it even when the real value fits.
+  ::unsetenv("DFKV_RDMA_MAX_BLOCK_BYTES");
+  ::setenv("DFKV_RDMA_SERVER_PROTOCOL", "1", 1);
+  constexpr size_t kSmallerOldServerCap = 64 * 1024;
+  RdmaNode node("v1-undeclared-fallback", kSmallerOldServerCap);
+  ::unsetenv("DFKV_RDMA_SERVER_PROTOCOL");
+
+  RdmaTransport transport(kMaxMsg);
+  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+  std::string value(4096, 'u');
+  ASSERT_TRUE(client.Put("undeclared-fallback", value.data(), value.size()));
+  std::string output(value.size(), '\0');
+  ASSERT_TRUE(
+      client.Get("undeclared-fallback", output.data(), output.size()));
+  EXPECT_EQ(output, value);
+  EXPECT_GE(node.rsrv->V1Conns(), 1u);
+  EXPECT_EQ(node.rsrv->V2Conns(), 0u);
+}
+
+TEST(RdmaLoopback, LargeMembersReplyUsesDedicatedV1ControlLane) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaNode node("large-members");
+  const std::string members(32u << 10, 'm');
+  node.srv->set_members(members);
+
+  RdmaTransport transport(kMaxMsg);
+  std::string output;
+  ASSERT_EQ(transport.Members(node.addr, &output), Status::kOk);
+  EXPECT_EQ(output, members);
+  EXPECT_GE(node.rsrv->V1Conns(), 1u);
+  EXPECT_EQ(node.rsrv->V2Conns(), 0u);
+}
+
+TEST(RdmaLoopback, AutoFallsBackWhenSharedSegmentHasNoLease) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ::setenv("DFKV_RDMA_RECV_SEGMENT_SIZE", "4096", 1);
+  RdmaNode node("segment-fallback");
+  ::unsetenv("DFKV_RDMA_RECV_SEGMENT_SIZE");
+
+  RdmaTransport transport(kMaxMsg);
+  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+  std::string value(4096, 's');
+  ASSERT_TRUE(client.Put("segment-fallback", value.data(), value.size()));
+  std::string output(value.size(), '\0');
+  ASSERT_TRUE(
+      client.Get("segment-fallback", output.data(), output.size()));
+  EXPECT_EQ(output, value);
+  EXPECT_GE(node.rsrv->V1Conns(), 1u);
+  EXPECT_EQ(node.rsrv->V2Conns(), 0u);
+}
+
+
+TEST(RdmaLoopback, V2CacheAcceptsReadOnlySourceMemory) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaNode node("readonly-v2");
+  RdmaTransport transport(kMaxMsg);
+  const BlockKey key = ToBlockKey("readonly-v2", SelfHdr().model_hash);
+  constexpr size_t kPayload = 512;
+  const size_t stored_len = ValueHeader::kSize + kPayload;
+  void* mapping =
+      ::mmap(nullptr, 4096, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  ASSERT_NE(mapping, MAP_FAILED);
+  const ValueHeader header = SelfHdr();
+  std::memcpy(mapping, &header, ValueHeader::kSize);
+  std::memset(static_cast<char*>(mapping) + ValueHeader::kSize, 'r', kPayload);
+  ASSERT_EQ(::mprotect(mapping, 4096, PROT_READ), 0);
+
+  ASSERT_EQ(transport.Cache(node.addr, key, mapping, stored_len), Status::kOk);
+  std::string output;
+  ASSERT_EQ(transport.Range(node.addr, key, 0, stored_len, &output),
+            Status::kOk);
+  ASSERT_EQ(output.size(), stored_len);
+  EXPECT_EQ(std::memcmp(output.data(), mapping, stored_len), 0);
+  EXPECT_EQ(::munmap(mapping, 4096), 0);
+}
+
+TEST(RdmaLoopback, DirectSingleCacheRangeUsesV2Writes) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaNode node("direct-v2");
+  RdmaTransport transport(kMaxMsg);
+  const BlockKey key = ToBlockKey("direct-v2", SelfHdr().model_hash);
+  std::string stored(ValueHeader::kSize + 4096, '\0');
+  const ValueHeader header = SelfHdr();
+  std::memcpy(stored.data(), &header, ValueHeader::kSize);
+  for (size_t i = ValueHeader::kSize; i < stored.size(); ++i)
+    stored[i] = static_cast<char>((i * 29 + 3) & 0xff);
+
+  ASSERT_EQ(transport.Cache(node.addr, key, stored.data(), stored.size()),
+            Status::kOk);
+  std::string output;
+  ASSERT_EQ(transport.Range(node.addr, key, 0, stored.size(), &output),
+            Status::kOk);
+  EXPECT_EQ(output, stored);
+  EXPECT_GE(node.rsrv->V2PutWrites(), 1u);
+  EXPECT_GE(node.rsrv->V2GetWrites(), 1u);
 }
 
 TEST(RdmaLoopback, BatchZeroCopyRoundtrip) {
@@ -379,11 +514,14 @@ TEST(RdmaLoopback, UserMrCapTracksDepth) {
   EXPECT_GE(shallow.user_mr_cap(), 64u);            // floor
   EXPECT_GE(shallow.user_mr_cap(), shallow.depth());
   rdma::RcEndpoint deep;
-  ASSERT_TRUE(deep.Open(nullptr, 16 * 1024, 100));  // depth > default cap of 64
+  // v2 reserves up to max_sge+1 SQ WRs per request. Keep this above the
+  // historical 64-MR floor without asking the NIC for a pathological QP.
+  constexpr size_t kDeepDepth = 65;
+  ASSERT_TRUE(deep.Open(nullptr, 16 * 1024, kDeepDepth));
   // The SG multi paths register up to max_sge-1 out-of-pool segments per slot
   // and post only after the whole window is registered: the cap must cover
   // depth * max_sge or a same-window LRU eviction hands a freed MR to a WR.
-  EXPECT_GE(deep.user_mr_cap(), 100u * deep.max_sge())
+  EXPECT_GE(deep.user_mr_cap(), kDeepDepth * deep.max_sge())
       << "cap below depth*max_sge -> in-window MR eviction risk on SG batches";
 }
 
@@ -415,6 +553,22 @@ TEST(RdmaLoopback, PoolMrSharedAcrossBuffers) {
   ibv_mr* c = ep.RegisterUser(outside.data(), outside.size());
   ASSERT_NE(c, nullptr);
   EXPECT_NE(c, a);  // outside the pool -> ad-hoc registration
+}
+
+TEST(RdmaLoopback, PoolMrAccessUpgradeWinsRangeLookup) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  rdma::RcEndpoint ep;
+  ASSERT_TRUE(ep.Open(nullptr, 64 * 1024, 1));
+  std::vector<char> region(256 * 1024);
+  ASSERT_TRUE(ep.AddPoolMr(region.data(), region.size()));
+  ibv_mr* local_only = ep.RegisterUser(region.data() + 4096, 4096);
+  ASSERT_NE(local_only, nullptr);
+  ibv_mr* remote_write =
+      ep.RegisterRemoteRegion(region.data(), region.size());
+  ASSERT_NE(remote_write, nullptr);
+  EXPECT_NE(remote_write, local_only);
+  EXPECT_EQ(ep.RegisterUser(region.data() + 4096, 4096), remote_write)
+      << "range lookup must prefer the remote-write access upgrade";
 }
 
 // The host KV pool belongs to the PD, not to a connection: many endpoints on
@@ -930,6 +1084,7 @@ TEST(RdmaLoopback, UringAsyncGetManyConcurrentInOrder) {
   ::setenv("DFKV_SERVER_URING", "1", 0);
   ::setenv("DFKV_SERVER_URING_DEPTH", "32", 1);
   ::setenv("DFKV_RDMA_DEPTH", "8", 1);      // K=8 in-flight => multi-read batches
+  ::setenv("DFKV_RDMA_RECV_SEGMENT_SIZE", "4194304", 1);
   // Small per-buffer cap so K=8 slots (rbuf+sbuf+dbuf each) stay under an 8 MiB
   // RLIMIT_MEMLOCK (CI default). Values below are <= 12 KiB, well within 64 KiB.
   constexpr size_t kUringMsg = 64 * 1024;
@@ -1014,10 +1169,20 @@ TEST(RdmaLoopback, UringAsyncGetManyConcurrentInOrder) {
   long gcnt = std::stol(mtext.substr(
       gp + std::string("dfkv_op_latency_seconds_count{op=\"get\"}").size()));
   EXPECT_GT(gcnt, 0) << "uring GET path recorded no op=\"get\" latency sample";
+#ifdef DFKV_WITH_URING
+  const char* uring_enabled = std::getenv("DFKV_SERVER_URING");
+  if (!uring_enabled || std::strcmp(uring_enabled, "0") != 0) {
+    EXPECT_GT(node.rsrv->UringReads(), 0u)
+        << "auto-v2 silently bypassed the io_uring read path";
+    EXPECT_GT(node.rsrv->V2Conns(), 0u)
+        << "test did not exercise the v2 async-GET response path";
+  }
+#endif
 
   ::unsetenv("DFKV_SERVER_URING");
   ::unsetenv("DFKV_SERVER_URING_DEPTH");
   ::unsetenv("DFKV_RDMA_DEPTH");
+  ::unsetenv("DFKV_RDMA_RECV_SEGMENT_SIZE");
 }
 
 // --- P3 B5-3: RAM hot-tier zero-copy RDMA serve --------------------------------
@@ -1033,6 +1198,7 @@ struct RamRdmaNode {
   std::string addr;
 
   explicit RamRdmaNode(const std::string& tag, size_t max_msg = kMaxMsg) {
+    ConfigureTestRecvSegment();
     ::setenv("DFKV_RAM_TIER", "1", 1);
     ::setenv("DFKV_RAM_TIER_BYTES", "8388608", 1);  // 8 MiB arena
     dir = fs::temp_directory_path() / ("dfkv_ramrdma_" + tag);
@@ -1110,10 +1276,9 @@ TEST(RdmaLoopback, RamTierZeroCopyServe) {
   EXPECT_EQ(out2, vals[0]);
 }
 
-// DCP1 declared caps (issue #110): a client that declares its max block size
-// gets right-sized server buffers and must still complete every op within the
-// declaration; oversized ops must fail CLIENT-side with kInvalid (never
-// reaching the wire, where the under-sized recv would hard-break the QP).
+// DCP2 declared caps: a client that tightens its max block size gets smaller
+// shared slots and must still complete every op within the declaration;
+// oversized ops fail client-side with kInvalid without touching the wire.
 TEST(RdmaLoopback, DeclaredCapsRoundTripAndClientSideBound) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   RdmaNode node("caps");
@@ -1137,9 +1302,9 @@ TEST(RdmaLoopback, DeclaredCapsRoundTripAndClientSideBound) {
   EXPECT_EQ(got, v);
 }
 
-// Undeclared client (legacy frame) against the same server keeps worst-case
-// sizing: blocks right up to the transport max still round-trip.
-TEST(RdmaLoopback, UndeclaredClientKeepsWorstCase) {
+// With no explicit override, DCP2 declares the transport's safe global cap;
+// blocks right up to that bound still round-trip.
+TEST(RdmaLoopback, DefaultDeclarationKeepsGlobalCap) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   RdmaNode node("nocaps");
   RdmaTransport rt(kMaxMsg);

@@ -1,12 +1,11 @@
-/* RDMA cache-node listener — native libibverbs RC. Built only when
- * DFKV_WITH_RDMA is defined. Reuses the wire frames + a request handler so the
- * cache logic (DiskCacheGroup + metrics) is shared with the TCP server.
+/* RDMA cache-node listener — native libibverbs RC. Mixed v2 uses small
+ * per-QP control buffers plus leases from one process-wide registered receive
+ * segment; legacy v1 remains available per connection.
  *
- * The "listener" is a plain TCP accept socket used only to bootstrap QPs
- * (exchange LID/GID/QPN over a few bytes). Each accepted connection opens an RC
- * QP on the named RDMA device (--rdma-dev / DFKV_RDMA_DEV) and serves requests
- * over RDMA. Using TCP accept (not rdma_get_request) makes Stop() interruptible:
- * shutdown(listen_fd) wakes accept() instantly — no shutdown hang. */
+ * The listener is a TCP socket used only for capability/QP bootstrap. Startup
+ * discovers ACTIVE HCAs (or applies the configured whitelist), anchors their
+ * shared PD/MRs, and each accepted connection opens an RC QP on its requested
+ * rail. shutdown(listen_fd) keeps Stop() interruptible. */
 #ifndef DFKV_RDMA_SERVER_H_
 #define DFKV_RDMA_SERVER_H_
 
@@ -24,6 +23,7 @@
 
 #include "common/status.h"
 #include "transport/rdma_verbs.h"  // rdma::RcEndpoint
+#include "transport/rdma_recv_segment.h"
 
 namespace dfkv {
 
@@ -98,7 +98,8 @@ class RdmaServer {
   // their own reads instead of hanging until timeout.
   using RangeFlightAbortHandler = std::function<void(uint64_t flight)>;
 
-  // dev_name empty => env DFKV_RDMA_DEV, else first device.
+  // dev_name empty => env DFKV_RDMA_DEV; both empty => first ACTIVE local HCA
+  // (legacy host-local semantics). An explicit comma list enables multi-rail.
   explicit RdmaServer(Handler handler, size_t max_msg = (64u << 20),
                       const std::string& dev_name = "");
   void set_range_handler(RangeHandler h) { range_handler_ = std::move(h); }
@@ -165,6 +166,14 @@ class RdmaServer {
   // otherwise silent by design, correctness-first).
   uint64_t UringReads() const { return uring_reads_.load(std::memory_order_relaxed); }
   uint64_t UringInitFallbacks() const { return uring_init_fallbacks_.load(std::memory_order_relaxed); }
+  uint64_t V1Conns() const { return v1_conns_.load(std::memory_order_relaxed); }
+  uint64_t V2Conns() const { return v2_conns_.load(std::memory_order_relaxed); }
+  uint64_t V2PutWrites() const {
+    return v2_put_writes_.load(std::memory_order_relaxed);
+  }
+  uint64_t V2GetWrites() const {
+    return v2_get_writes_.load(std::memory_order_relaxed);
+  }
   // The server-side pipeline depth (env DFKV_RDMA_DEPTH, default 1) -- surfaced
   // in ring INFO because the CLIENT's depth must not exceed it: excess in-flight
   // requests hit receiver-not-ready retries and degrade SILENTLY (measured 3-4x
@@ -204,6 +213,8 @@ class RdmaServer {
   size_t max_msg_;
   size_t control_cap_;
   std::string dev_name_;
+  bool v2_enabled_ = true;
+  bool auto_device_ = true;
   int listen_fd_ = -1;
   int port_ = 0;
   std::atomic<bool> running_{false};
@@ -214,13 +225,21 @@ class RdmaServer {
   std::mutex conn_mu_;
   std::vector<Conn> conns_;
   std::unordered_set<rdma::RcEndpoint*> live_eps_;
-  // Lifetime device ref + one-time pool-MR registration (see Start()).
-  // One anchor per configured rail (--rdma-dev comma list): each holds a
-  // lifetime device ref + the pool-region MRs, so neither first-touch nor
-  // idle-reclaim of the last data connection ever re-pins the arena.
+  // One process-wide receive segment replaces per-connection multi-MiB
+  // request/direct-I/O buffers for v2. Each connection leases depth*slot_size;
+  // the segment MR is shared per PD through RcEndpoint's device registry.
+  rdma::RecvSegment recv_segment_;
+  size_t recv_segment_bytes_ = 0;
+  size_t recv_segment_registered_rails_ = 0;
+  // One anchor per resolved ACTIVE rail holds a lifetime shared-device ref and
+  // registers the receive segment / caller pools once on that rail's shared PD.
+  // With no explicit device filter only the first ACTIVE local rail is anchored,
+  // preserving the legacy rule that HCA names are host-local, not peer IDs.
   std::vector<std::unique_ptr<rdma::RcEndpoint>> anchors_;
-  std::vector<std::string> anchor_devs_;  // parsed from dev_name_ (>=1 entries)
+  std::vector<std::string> anchor_devs_;  // configured filter, then active rails
   std::atomic<uint64_t> uring_reads_{0}, uring_init_fallbacks_{0};
+  std::atomic<uint64_t> v1_conns_{0}, v2_conns_{0}, v2_put_writes_{0},
+      v2_get_writes_{0};
   std::atomic<uint64_t> completions_{0}, completion_errors_{0}, active_conns_{0},
       idle_reclaims_{0};
 };

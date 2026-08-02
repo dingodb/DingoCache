@@ -14,9 +14,10 @@
 
 dfkv 把**控制面**与**数据面**解耦：
 
-- **控制面 = TCP**：客户端用一份静态成员表 `name=ip:port` 连到各节点的 **bootstrap TCP 端口**，只交换 ~32B 的 QP 信息（LID/GID/QPN/PSN）。这条 IP 走任意两端可达的网（如 200G 存储网或管理网 bond0）。
-- **数据面 = RDMA**：按**设备名**选 RDMA 口（`DFKV_RDMA_DEV=ib7s400p0`），数据走该 IB fabric，**无需该网有 IP**。因此 **400G 计算网（无 IP）与 200G 存储网（有 IP）即便是两张互不通的 IB 网也支持**：控制面走 200G、数据面走 400G。
-- TCP 回退：未设 `DFKV_RDMA` 或无 RDMA 设备时自动用 TCP 传输（控制面那条连接直接当数据通道）。
+- **控制面 = TCP + 两边 SEND/RECV**：bootstrap TCP 只交换设备/QP/receive-segment 描述；RDMA QP 上每个请求只发送 4-KiB 内的 descriptor、status 和小 header。
+- **payload = one-sided RDMA**：v2 PUT 用 `RDMA_WRITE_WITH_IMM` 直落 server 共享 receive-segment slot，GET 由 server `RDMA_WRITE` 到 client 提交的 `{addr,rkey,len}`。数据 fabric 无需 IP。
+- **设备发现**：留空时两端各选本地首个 port 1 `ACTIVE` HCA；显式逗号白名单才开启多轨轮转，多 fabric 节点须过滤到两端同名且互通的 fabric。
+- **回退**：未设 `DFKV_RDMA` 走 TCP；RDMA client 默认探测 v2，老 server、强制 v1 或共享 segment 暂无 slot 时按连接回退 v1 SEND/RECV。
 
 发现：默认走 **MDS 动态发现**（etcd + dfkv_mds，见 §2b）；静态成员表仍作为遗留/单节点备用路径（见 §4-legacy）。无副本（一致性哈希单属主，节点挂 = 该分片 miss → 重算）。
 
@@ -104,13 +105,19 @@ Description=dfkv KV cache node (SGLang HiCache L3)
 After=network-online.target
 [Service]
 Type=simple
+# v2 shared segment 示例：server 上限 4 MiB、depth=4、2 GiB segment。
+# 按所有 rank/process 的 peak live + pooled QP 公式复算，见 CONNECTORS §1.2.1。
+Environment=DFKV_RDMA_SERVER_PROTOCOL=auto-v2
+Environment=DFKV_RDMA_DEPTH=4
+Environment=DFKV_RDMA_RECV_SEGMENT_SIZE=2147483648
 # --port = TCP(bootstrap+TCP数据) 端口; --rdma-port = RDMA bootstrap 端口; --rdma-dev = 数据面 400G 口
 # --metrics-port = 可选 Prometheus /metrics（缺省=不开端口；--id/--group 成为指标标签）
 ExecStart=/usr/local/bin/dfkv_server \
   --dir /mnt/disk1/dfkv,/mnt/disk2/dfkv,/mnt/disk3/dfkv \
-  --port 28000 --rdma-port 28001 --rdma-dev ib7s400p0 --cap 6597069766656 \
-  --mds 10.0.0.1:9400,10.0.0.2:9400 --metrics-port 28010 \
-  --group default --id n57 --advertise 192.168.1.57:28001
+  --port 28000 --rdma-port 28001 --rdma-dev ib7s400p0 --max-msg 4194304 \
+  --cap 6597069766656 --mds 10.0.0.1:9400,10.0.0.2:9400 \
+  --metrics-port 28010 --group default --id n57 \
+  --advertise 192.168.1.57:28001
 Restart=on-failure
 RestartSec=2
 CPUQuota=1600%
@@ -121,6 +128,10 @@ LimitMEMLOCK=infinity        # RDMA 需要锁页内存
 [Install]
 WantedBy=multi-user.target
 ```
+
+> `DFKV_RDMA_MAX_BLOCK_BYTES=4194304` 是 **client-only DCP2 声明**，须注入每个
+> SGLang/vLLM/LMCache inference client 进程；server 用 `--max-msg 4194304`
+> 验证上限，不读取该 client env。
 
 > **可选存储/加速开关（见 [ARCHITECTURE.md](ARCHITECTURE.md) §5–7）。行为开关均为「门面 flag + `DFKV_*` env 双生」，flag 覆盖预设 env；运行时真值经 `dfkvctl ring` INFO 列审计（`engine=`/`wr=`/`ram=`）。**
 > - `--store-engine file|slab`（默认 `file`）：`slab` = extent 池 + slots.tbl 重启保温，消除"每块一文件"隐患。**切 slab 需清盘冷启**（旧 blocks/ 布局不复用），属独立迁移动作。
@@ -140,8 +151,14 @@ journalctl -u dfkv -n 10 --no-pager
 #      + "dfkv_server registered with MDS group=default id=n57 advertise=192.168.1.57:28001"
 ```
 > server 的 bootstrap 监听 `0.0.0.0`，靠防火墙限制在内网。优雅关闭已修（`systemctl stop` 约 1s 退出）。
-> **多轨**：让客户端在多张 400G 口间分散即可（客户端 `DFKV_RDMA_DEV` 逗号列表，见 [CONNECTORS.md](CONNECTORS.md) §1.2）；server 会按客户端请求的设备名在同轨开 QP，无需为多轨改 server 配置（保留 `--rdma-dev` 作默认）。
-> ⚠️ 同机 8×400G 多轨受 NUMA 限制（NIC 跨双 socket，单内存域）；单口已近线速，多轨叠加需 NUMA 感知，暂不必配。
+> **多轨**：server 启动时 anchor 白名单内全部 active rail；client 新 QP 轮转健康轨。留空时两端各选本地首个 ACTIVE HCA，适合 local device 名不同的单 fabric 主机；显式 `--rdma-dev` / `DFKV_RDMA_DEV` 会把设备选择发给 peer，故生产多 fabric 主机必须在两端过滤到**同名且互通**的一组设备。`DFKV_RDMA_NUMA=1` 只改变 QP 选轨与 serve 线程亲和；当前 receive segment 是单块 process-wide 分配，不是 per-NUMA/per-rail 分片。
+>
+> **v2 segment 预算**：`slot=align4K(4096 + sizeof(ValueHeader) + max(max_block,4096))`；
+> `segment >= Σ(live + client-pool-idle data/control QP × depth × slot)`。lease
+> 保留到 QP 销毁或 idle reclaim，不能只数在飞请求。4 MiB/depth=4/2 GiB
+> 约容纳 127 条 data QP（未扣 control lease）。上线先看
+> `dfkv_rdma_recv_segment_free_bytes`、`dfkv_rdma_v2_ready`、
+> `dfkv_rdma_{v1,v2}_conns_opened_total`；free 接近 0 会让新连接回退 v1。
 
 ## 4. 集群成员管理
 
@@ -173,17 +190,20 @@ n57=192.168.1.57:28001,n58=192.168.1.58:28001,...
 3. 冒烟（任一能访问内网的机器）：
    ```bash
    dfkv_smoke --members n57=192.168.1.57:28000 --size 2752512                          # TCP
-   DFKV_RDMA=1 DFKV_RDMA_DEV=ib7s400p0 dfkv_smoke --members n57=192.168.1.57:28001 --size 2752512  # RDMA 400G
+   DFKV_RDMA=1 DFKV_RDMA_PROTOCOL=auto-v2 DFKV_RDMA_MAX_BLOCK_BYTES=4194304 \
+     DFKV_RDMA_DEV=ib7s400p0 dfkv_smoke --members n57=192.168.1.57:28001 --size 2752512
    ```
 4. 端到端零拷贝校验（插件 → libdfkv → RDMA → server，验证 payload 直落缓冲）：
    ```bash
    DFKV_RDMA=1 DFKV_RDMA_DEV=ib7s400p0 DFKV_MEMBERS='n=192.168.1.57:28001' \
      python3 test/python/rdma_e2e_validate.py    # 期望 RESULT: ZERO-COPY RDMA E2E OK
+   # 随后在 server /metrics 确认 v2_ready=1、v2_conns_opened_total 增长且 free_bytes 有余量
    ```
 5. 压测（可选）：`DFKV_RDMA=1 DFKV_RDMA_DEV=ib7s400p0 dfkv_bench --members ... --size 2752512 --count 8000 --threads 64`。
 6. 在**一个受控 SGLang 副本**上切 `dynamic` 后端，发共享长前缀请求看命中上涨，确认后推广。
 
 ## 6. 回滚（秒级）
+- 仅回滚 RDMA v2（保留 dfkv）：在**每个推理 client 进程**设置 `DFKV_RDMA_PROTOCOL=1` 并重启；需要 server 同时禁用时，在**每个 dfkv server 进程**设置 `DFKV_RDMA_SERVER_PROTOCOL=1` 并重启。变量只在 transport/server 构造时读取，已有连接池 QP 不会重新协商；恢复自动探测时也必须删除对应变量并再次重启所有受影响的 client/server。每次切换后用 v1/v2 connection counters 验证实际协议。
 - SGLang：`--hicache-storage-backend` 改回原后端（mooncake 等）重启该副本，与 dfkv 解耦。
 - dfkv 节点：`systemctl stop dfkv`；缓存可丢（KV 可重算），彻底清理删 `/mnt/diskX/dfkv`。
 - dfkv MDS：`systemctl stop dfkv_mds`；无状态，etcd 数据可保留也可清除（`etcdctl del /dfkv --prefix`）。
@@ -201,4 +221,4 @@ n57=192.168.1.57:28001,n58=192.168.1.58:28001,...
   - `dfkvctl stat <ip:port>` — 单节点原始 Prometheus 文本（旧用法不变）。
 - SGLang `--enable-cache-report` 的 HiCache storage hit/miss、TTFT。
 - 生产只读：不改现网组件；dfkv 端口（含 `/metrics`）仅内网开放、无鉴权勿暴露公网。
-- 线协议带 1B 版本号，混版本部署会被 server 拒（不静默错读）；升级时整集群同版本。**指标均为新增、不改 wire，v1.3.0 节点与 v1.4.0 客户端互通。**
+- RDMA v1/v2 frame 均带显式版本；新 client 先做能力 probe，滚动升级中的新旧 client/server 组合自动选择共同的 v1，不会把另一版本静默错读。`dfkv_rdma_{v1,v2}_conns_opened_total` 可审计实际路径。

@@ -1,12 +1,11 @@
-/* RDMA client transport — native libibverbs RC, two-sided SEND/RECV.
- * Built only when DFKV_WITH_RDMA is defined. Mirrors the TCP wire frames so the
- * server request logic is shared. Connection-pooled per node.
+/* RDMA client transport — native libibverbs RC. Mixed v2 keeps request/status
+ * on small SEND/RECV control buffers while PUT/GET payloads move with one-sided
+ * RDMA WRITEs; connection-level probing falls back to legacy v1 SEND/RECV.
  *
- * Device is selected BY NAME (env DFKV_RDMA_DEV, e.g. "ib7s400p0"), not by IP,
- * so the data plane can ride a 400G IB fabric that has no IP and is separate
- * from the IP network. The QP is bootstrapped over a small TCP channel to the
- * node's member address (an IP on the shared 200G/bond0 network). See
- * rdma_verbs.h for the control-plane/data-plane split rationale. */
+ * An empty DFKV_RDMA_DEV discovers every ACTIVE HCA; an explicit comma list is
+ * a whitelist. Device names, not IPs, select the data fabric. QPs bootstrap over
+ * a small TCP channel to the node's member address, so the RDMA fabric itself
+ * needs no IP. */
 #ifndef DFKV_RDMA_TRANSPORT_H_
 #define DFKV_RDMA_TRANSPORT_H_
 
@@ -22,15 +21,20 @@
 #include "transport/transport.h"
 
 namespace dfkv {
-namespace rdma { class RcEndpoint; }
+namespace rdma {
+class RcEndpoint;
+class RdmaTopology;
+}
 
 class RdmaTransport : public Transport {
  public:
-  static bool Available();  // true if at least one RDMA device is present
+  static bool Available();  // true if at least one ACTIVE RDMA port is present
 
-  // dev_name empty => env DFKV_RDMA_DEV (comma-separated list = multi-rail; each
-  // new connection round-robins across the devices), else first device.
-  explicit RdmaTransport(size_t max_msg = (64u << 20), const std::string& dev_name = "");
+  // dev_name empty => env DFKV_RDMA_DEV. A comma-separated explicit value is a
+  // whitelist and opts into multi-rail. With neither, use the first ACTIVE local
+  // HCA and send no device name to the peer, preserving host-local selection.
+  explicit RdmaTransport(size_t max_msg = (64u << 20),
+                         const std::string& dev_name = "");
   ~RdmaTransport() override;
 
   Status Cache(const std::string& node, const BlockKey& key, const void* data,
@@ -85,7 +89,7 @@ class RdmaTransport : public Transport {
   // share a connection, so a lookup storm can't queue behind in-flight 1 MB
   // GETs on the same QP — the hot-round exist p99 of ~800 s the phase-8
   // hit-rate probe measured was exactly that head-of-line blocking.
-  enum class Lane { kData, kControl };
+  enum class Lane { kData, kControl, kLegacyControl };
   Conn* Acquire(const std::string& node, Lane lane, bool* from_pool,
                 bool force_new = false);
   void Release(const std::string& node, Lane lane, Conn* c);
@@ -93,12 +97,16 @@ class RdmaTransport : public Transport {
   Status RoundTrip(const std::string& node, WireOp op, const BlockKey& key,
                    uint64_t offset, uint64_t length, const void* payload,
                    uint64_t payload_len, std::string* out);
+  bool ProbeV2(const std::string& node) const;
 
   std::mutex mu_;
   std::unordered_map<std::string, std::vector<Conn*>> pool_;
   // Separate idle-conn pool for control-lane ops (Exist/Remove/Members), so
   // small key-only round trips never share a QP with payload transfers.
   std::unordered_map<std::string, std::vector<Conn*>> control_pool_;
+  // Members replies can exceed the 4-KiB v2 control frame. Keep a dedicated
+  // legacy pool so discovery does not mix with v2 Exist/Remove connections.
+  std::unordered_map<std::string, std::vector<Conn*>> legacy_control_pool_;
   // Caller memory regions to register on every connection (the host KV pool).
   // Guarded by mu_; snapshotted in Acquire and registered on the connection.
   std::vector<std::pair<void*, size_t>> pools_;
@@ -108,23 +116,22 @@ class RdmaTransport : public Transport {
   // min over rails of (negotiated max_sge) - 1; set once in the ctor.
   size_t sg_payload_segs_ = 29;
   size_t max_payload_;
-  // DCP1 declared max block bytes (DFKV_RDMA_MAX_BLOCK_BYTES, clamped to
-  // max_payload_). 0 = undeclared: worst-case buffers both sides, old wire
-  // behavior. When set it also shrinks OUR control buffers and bounds ops
-  // client-side (oversize -> kInvalid before touching the wire, because the
-  // server sized this conn's recv buffers to the declaration and a bigger
-  // send would hard-break the QP).
+  // DCP2 max block bytes. An explicit DFKV_RDMA_MAX_BLOCK_BYTES is honored;
+  // otherwise v2 declares max_payload_ because its shared-slot geometry requires
+  // an exact nonzero bound. legacy_declared_ deliberately stays 0 when the env is
+  // absent: automatic v1 fallback must preserve the old plain-frame behavior,
+  // or an older server with a smaller --max-msg would reject a synthetic 64-MiB
+  // DCP1 declaration before seeing the actual (small) request.
   uint64_t declared_ = 0;
+  uint64_t legacy_declared_ = 0;
+  bool v2_enabled_ = true;
   size_t OpBound() const {  // per-op payload bound honoring the declaration
     return declared_ ? static_cast<size_t>(declared_) : max_payload_;
   }
-  // Largest block this client has actually handed to the transport. Sizing
-  // DFKV_RDMA_MAX_BLOCK_BYTES is otherwise guesswork: the declaration decides
-  // how much the SERVER pins per connection (qd x (ValueHeader + declared)),
-  // which at qd=32 is ~1 GiB per connection measured on a B200 node -- yet the
-  // only figure available to an operator was the average transfer size. This
-  // reports the actual high-water mark so the declaration can be set from
-  // evidence with a deliberate margin.
+  // Largest block this client has actually handed to the transport. Operators
+  // use the high-water mark to choose a tight DCP2 declaration: smaller slots
+  // admit more concurrent v2 connections into the fixed shared segment, while
+  // oversize operations must remain a deterministic client-side rejection.
   mutable std::atomic<uint64_t> max_block_seen_{0};
   mutable std::atomic<uint64_t> oversize_rejects_{0};
   // Records n as a candidate high-water mark and reports whether it exceeds the
@@ -152,12 +159,14 @@ class RdmaTransport : public Transport {
   int batch_op_timeout_ms_ = 0;
   int BatchTimeout() const { return batch_op_timeout_ms_ > 0 ? batch_op_timeout_ms_ : op_timeout_ms_; }
   size_t pool_max_ = 256;             // idle conns kept per node (DFKV_RDMA_POOL_MAX)
-  std::vector<std::string> devs_;     // RDMA devices (multi-rail); "" = first
-  std::vector<int> dev_node_;         // NUMA node per devs_ entry (-1 unknown)
-  std::atomic<size_t> rr_{0};         // round-robin selector across devs_
+  std::unique_ptr<rdma::RdmaTopology> topology_;
+  std::vector<std::string> devs_;  // stable discovered ACTIVE rail order
+  bool auto_device_ = true;
   // observability (relaxed): connections opened total + per-rail breakdown +
   // declared MR regions. Connection opens are infrequent (pooled), off the op path.
   std::atomic<uint64_t> conns_opened_{0};
+  std::atomic<uint64_t> v1_conns_opened_{0}, v2_conns_opened_{0};
+  std::atomic<uint64_t> v2_put_writes_{0}, v2_get_writes_{0};
   std::atomic<uint64_t> mr_regions_{0};
   std::unique_ptr<std::atomic<uint64_t>[]> rail_conns_;  // sized to devs_.size()
 };

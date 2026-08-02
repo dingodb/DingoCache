@@ -44,8 +44,8 @@ int main(int argc, char** argv) {
       "  --dir <paths>        comma-separated NVMe paths; --cap is the TOTAL, split evenly\n"
       "  --cap <bytes>        total cache capacity (LRU self-limits)\n"
       "  --port <p>           TCP bootstrap/data port (0 = ephemeral)\n"
-      "  --rdma-port <p>      RDMA QP-bootstrap port (enables RDMA data path)\n"
-      "  --rdma-dev <name>    RDMA device by name (comma list = multi-rail)\n"
+      "  --rdma-port <p>      RDMA QP-bootstrap port (RDMA build only; enables data path)\n"
+      "  --rdma-dev <names>   HCA whitelist; default first ACTIVE local HCA (RDMA build only)\n"
       "  --mds <ip:port,...>  MDS endpoints to register into (with --group/--id/--advertise)\n"
       "  --group <g>          membership group name (default \"default\")\n"
       "  --id <id>            node id; --advertise <ip:port>  address peers reach (rdma-port)\n"
@@ -243,21 +243,22 @@ int main(int argc, char** argv) {
   DFKV_LOG_INFO("dfkv build: transport=RDMA (libibverbs) + TCP fallback");
 #else
   DFKV_LOG_INFO("dfkv build: transport=TCP-only (built WITHOUT -DDFKV_WITH_RDMA=ON)");
-  if (rdma_port >= 0 || !rdma_dev.empty())
-    DFKV_LOG_WARN("--rdma-port/--rdma-dev IGNORED: this binary has no RDMA support; "
-                  "rebuild with -DDFKV_WITH_RDMA=ON (needs libibverbs-dev)");
+  if (rdma_port >= 0) {
+    DFKV_LOG_ERROR("--rdma-port requires an RDMA-enabled binary; rebuild with "
+                   "-DDFKV_WITH_RDMA=ON (needs libibverbs-dev)");
+    srv.Stop();
+    return 1;
+  }
+  if (!rdma_dev.empty())
+    DFKV_LOG_WARN("--rdma-dev ignored: this binary has no RDMA support");
 #endif
 
 #ifdef DFKV_WITH_RDMA
-  // Per-connection RDMA buffers are pinned eagerly at handshake:
-  // qd x (ValueHeader + conn_max). conn_max is min(client declaration, this
-  // cap), and a client that declares nothing gets the cap outright -- so
-  // without a server-side ceiling the server's memory budget is decided
-  // entirely by its clients. Measured on a B200 node at qd=32: ~2 GB per
-  // connection at the 64 MiB default versus 0.34 GB when the client declares
-  // 4 MiB, and one 8-rank inference instance opens ~135 connections. A
-  // declaration ABOVE the cap is refused (see RdmaServer::Serve) rather than
-  // sized down, which would let that client send past our receives.
+  // --max-msg is the hard payload ceiling for both protocols. V2 leases slots
+  // from one process-wide receive segment, sized independently by
+  // DFKV_RDMA_RECV_SEGMENT_SIZE. Automatic v1 fallback retains the legacy
+  // per-connection depth * (ValueHeader + max_msg) registered-buffer geometry;
+  // clients with an explicit smaller declaration retain that smaller v1 cap.
   const unsigned long long max_msg = args.GetU64("--max-msg", 64ull << 20);
   std::unique_ptr<dfkv::RdmaServer> rsrv;
   if (rdma_port >= 0) {
@@ -322,12 +323,17 @@ int main(int argc, char** argv) {
       DFKV_LOG_INFO("dfkv_server RAM hot tier: RDMA zero-copy serve enabled (arena " +
                     std::to_string(srv.ram_arena_bytes()) + " bytes)");
     }
-    if (rsrv->Start(rdma_port) == Status::kOk)
-      DFKV_LOG_INFO("dfkv_server RDMA listening (TCP bootstrap) on port " +
-                    std::to_string(rsrv->port()) +
-                    (rdma_dev.empty() ? "" : ", dev=" + rdma_dev));
-    else
-      DFKV_LOG_WARN("dfkv_server RDMA listener failed to start (no device?)");
+    const Status rdma_status = rsrv->Start(rdma_port);
+    if (rdma_status != Status::kOk) {
+      DFKV_LOG_ERROR(
+          "dfkv_server RDMA listener failed to start; refusing readiness and "
+          "MDS registration");
+      srv.Stop();
+      return 1;
+    }
+    DFKV_LOG_INFO("dfkv_server RDMA listening (TCP bootstrap) on port " +
+                  std::to_string(rsrv->port()) +
+                  (rdma_dev.empty() ? "" : ", dev=" + rdma_dev));
     // Force-resolve the RDMA depth/uring knobs so their defaults land in the
     // config dump (they are otherwise read lazily on the serve path, after Emit).
     (void)rsrv->PipelineDepth();

@@ -55,8 +55,19 @@ dfkvctl stat <ip:port>                        # 单节点原始 /metrics 文本�
 RDMA 构建额外（折叠进同一 /metrics）：
 | `dfkv_rdma_completions_total` / `completion_errors_total` | counter | RDMA 请求完成 / 错误完成 |
 | `dfkv_rdma_active_conns` | gauge | 当前服务中的 RDMA 连接 |
+| `dfkv_rdma_v1_conns_opened_total` / `v2_conns_opened_total` | counter | server 累计打开的 v1 / v2 连接；滚动升级和回滚验收的路径真值 |
+| `dfkv_rdma_v2_put_writes_total` / `v2_get_writes_total` | counter | server 实际收到的 `WRITE_WITH_IMM` PUT / 实际发出的 RDMA WRITE GET payload |
+| `dfkv_rdma_recv_segment_bytes` / `dfkv_rdma_recv_segment_free_bytes` | gauge | v2 process-wide receive segment 总字节 / 当前未租 lease 字节；free 持续接近 0 = 新 data QP 将回退 v1 |
+| `dfkv_rdma_recv_segment_registered_rails` | gauge | 成功把共享 segment 注册到共享 PD 的 rail 数；应等于显式白名单内可用 rail 数 |
+| `dfkv_rdma_v2_ready` | gauge | 至少一个 rail 完成共享 segment 注册；0 = 本进程只能接 v1 |
 | `dfkv_uring_reads_total` / `dfkv_uring_init_fallbacks_total` | counter | io_uring 路径真实提交的读数（**>0 = 路径确实激活**，外部可证）/ 想用 uring 但 ring 初始化失败静默回退同步的连接数（>0 = 配了没生效，查内核/权限） |
 | `dfkv_rdma_idle_reclaims_total` | counter | 空闲超时回收的连接数 |
+
+> **v2 上线判据**：新 client + 新 server 车队应看到 client/server 两侧
+> `v2_conns_opened_total` 增长，PUT/GET write counter 随负载增长，
+> `v2_ready=1` 且 `recv_segment_free_bytes` 有容量余量。若 server 的
+> `v1_conns_opened_total` 在全新车队仍增长，先查 free bytes、segment 注册日志、
+> client/server 强制协议 env 和旧二进制；不要只凭 `DFKV_RDMA=1` 认定走了 v2。
 
 读侧 convoy 合并（v1.35+，`DFKV_READ_COALESCE=1` 时才有增量；恒零 = 开关没生效）：
 | `dfkv_read_coalesce_leaders_total` | counter | 经 coalescer 登记并执行的读（同步 leader + uring flight 完成各计一次;>0 = 合并路径确实在环内） |
@@ -134,7 +145,13 @@ RAM 热层（**仅 `DFKV_RAM_TIER=1` 时输出**；关时无此系列，向后�
 | `dfkv_client_get_calls/pages/hit_pages/bytes_total{tp_rank}` | get 量 |
 | `dfkv_client_set_seconds{tp_rank}` / `get_seconds{tp_rank}` | batch 调用耗时直方图 |
 
-C 客户端快照里还含传输级（RDMA 构建）：`dfkv_rdma_client_conns_opened_total`、`mr_regions`、`rail_conns_total{dev}`（NUMA 选轨分布）。
+C 客户端快照里还含传输级（RDMA 构建）：
+`dfkv_rdma_client_conns_opened_total`、
+`dfkv_rdma_client_v1_conns_opened_total` / `dfkv_rdma_client_v2_conns_opened_total`、
+`dfkv_rdma_client_v2_put_writes_total` / `dfkv_rdma_client_v2_get_writes_total`、
+`dfkv_rdma_client_mr_regions`、
+`dfkv_rdma_client_adhoc_user_mr_total`（生产注册池路径应稳定为 0）和
+`dfkv_rdma_client_rail_conns_total{dev}`（NUMA/轮转选轨分布）。
 
 ### 3.4 连接器车队指标（三连接器 OTLP **push**，opt-in）
 §3.3 是 SGLang 插件本地 `/metrics`（**pull**）。此外三个连接器（vLLM `dfkv-vllm` / LMCache `dfkv-connector` / SGLang HiCache `dfkv_hicache.py`）可把聚合后的运行指标经 **OTLP 主动推送**到中心 Collector→Prometheus→Grafana，用于"车队级"按实例/类型观测。

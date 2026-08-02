@@ -86,3 +86,52 @@ TEST(Wire, RespRejectsOversizedData) {
   EXPECT_EQ(dlen, kMaxFrameLen + 1);
 }
 
+TEST(Wire, V2GetScatterRoundTrip) {
+  char buf[512];
+  const BlockKey key{0x1122, 7, 4096};
+  const std::vector<RdmaWriteTarget> targets{
+      {0x100000, 0xA1, 1024}, {0x200000, 0xB2, 3024}};
+  size_t encoded = 0;
+  ASSERT_TRUE(EncodeRdmaGetReq(buf, sizeof(buf), key, 0, 4096, 48, targets,
+                               &encoded));
+  EXPECT_EQ(encoded, RdmaGetFrameSize(2));
+
+  ReqFields req{};
+  RdmaGetFields get;
+  ASSERT_TRUE(DecodeRdmaGetReq(buf, encoded, &req, &get));
+  EXPECT_EQ(req.op, static_cast<uint8_t>(WireOp::kRange));
+  EXPECT_EQ(req.id, key.id);
+  EXPECT_EQ(req.length, 4096u);
+  EXPECT_EQ(get.header_len, 48u);
+  ASSERT_EQ(get.targets.size(), 2u);
+  EXPECT_EQ(get.targets[0].addr, targets[0].addr);
+  EXPECT_EQ(get.targets[1].rkey, targets[1].rkey);
+  EXPECT_EQ(get.Capacity(), 4048u);
+}
+
+TEST(Wire, V2GetRejectsShortCapacityAndMalformedTarget) {
+  char buf[256];
+  size_t encoded = 0;
+  ASSERT_TRUE(EncodeRdmaGetReq(
+      buf, sizeof(buf), BlockKey{1, 2, 3}, 0, 4096, 48,
+      std::vector<RdmaWriteTarget>{{0x1000, 7, 1024}}, &encoded));
+  ReqFields req{};
+  RdmaGetFields get;
+  EXPECT_FALSE(DecodeRdmaGetReq(buf, encoded, &req, &get));
+
+  ASSERT_TRUE(EncodeRdmaGetReq(
+      buf, sizeof(buf), BlockKey{1, 2, 3}, 0, 48, 0,
+      std::vector<RdmaWriteTarget>{{0, 0, 48}}, &encoded));
+  EXPECT_FALSE(DecodeRdmaGetReq(buf, encoded, &req, &get));
+}
+
+TEST(Wire, VersionedResponseRequiresNegotiatedVersion) {
+  char buf[kRespPrefix];
+  EncodeRespVersion(buf, kProtoVersionV2, Status::kOk, 99);
+  Status status = Status::kInvalid;
+  uint64_t data_len = 0;
+  EXPECT_FALSE(DecodeResp(buf, &status, &data_len));
+  ASSERT_TRUE(DecodeRespVersion(buf, kProtoVersionV2, &status, &data_len));
+  EXPECT_EQ(status, Status::kOk);
+  EXPECT_EQ(data_len, 99u);
+}
