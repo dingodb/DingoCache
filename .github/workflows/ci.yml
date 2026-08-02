@@ -87,7 +87,7 @@ jobs:
             -DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=thread
           cmake --build build-tsan -j
       - name: Run C++ suites under TSan (python excluded — ctypes dlopen)
-        run: TSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-tsan -E python_plugin --output-on-failure
+        run: TSAN_OPTIONS=halt_on_error=1:allocator_may_return_null=1 ctest --test-dir build-tsan -E python_plugin --output-on-failure
 
   rdma-compile:
     name: RDMA build (compile-check)
