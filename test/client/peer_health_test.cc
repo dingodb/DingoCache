@@ -98,3 +98,28 @@ TEST(PeerHealth, MarkProbeAliveRecoversWithoutCountingServed) {
   h.MarkBad("p", 1000);
   EXPECT_TRUE(h.Healthy("p", 2000));
 }
+
+TEST(PeerHealth, UniqueFailingAddressFloodBoundsEveryMapAndEvictsLru) {
+  PeerHealth h(/*base=*/1000, /*max=*/30000);
+  for (int i = 0; i < 5000; ++i)
+    h.MarkBad("peer-" + std::to_string(i), 0);
+
+  EXPECT_EQ(h.tracked_peers_for_test(), 4096u);
+  EXPECT_EQ(h.cooldown_peers_for_test(), 4096u);
+  EXPECT_EQ(h.failure_streak_peers_for_test(), 4096u);
+  EXPECT_EQ(h.error_peers_for_test(), 4096u);
+  EXPECT_LE(h.last_good_peers_for_test(), 4096u);
+  EXPECT_EQ(h.errors(), 5000u);
+
+  // Refresh one retained peer, then insert a new address. The oldest retained
+  // peer is evicted from cooldown and streak state; the refreshed peer stays.
+  h.MarkBad("peer-1000", 0);
+  h.MarkBad("peer-new", 0);
+  EXPECT_TRUE(h.Healthy("peer-904", 0));
+  EXPECT_FALSE(h.Healthy("peer-1000", 0));
+  EXPECT_FALSE(h.Healthy("peer-new", 0));
+  EXPECT_EQ(h.tracked_peers_for_test(), 4096u);
+  EXPECT_EQ(h.cooldown_peers_for_test(), 4096u);
+  EXPECT_EQ(h.failure_streak_peers_for_test(), 4096u);
+  EXPECT_EQ(h.error_peers_for_test(), 4096u);
+}

@@ -24,10 +24,10 @@ class ExistsLRU:
         if capacity <= 0:
             raise ValueError("capacity must be positive")
         self._capacity = capacity
-        self._entries: "OrderedDict[str, None]" = OrderedDict()
+        self._entries: "OrderedDict[bytes, None]" = OrderedDict()
         self._lock = threading.Lock()
 
-    def _touch_unlocked(self, key: str) -> None:
+    def _touch_unlocked(self, key: bytes) -> None:
         if key in self._entries:
             self._entries.move_to_end(key)
             return
@@ -35,29 +35,29 @@ class ExistsLRU:
         if len(self._entries) > self._capacity:
             self._entries.popitem(last=False)
 
-    def add(self, key: str) -> None:
+    def add(self, key: bytes) -> None:
         with self._lock:
             self._touch_unlocked(key)
 
-    def add_many(self, keys: Iterable[str]) -> None:
+    def add_many(self, keys: Iterable[bytes]) -> None:
         with self._lock:
             for key in keys:
                 self._touch_unlocked(key)
 
-    def discard(self, key: str) -> None:
+    def discard(self, key: bytes) -> None:
         """Forget a key (e.g. after remove) so a later has() doesn't report a
         stale hit. No-op if absent."""
         with self._lock:
             self._entries.pop(key, None)
 
-    def has(self, key: str) -> bool:
+    def has(self, key: bytes) -> bool:
         with self._lock:
             if key not in self._entries:
                 return False
             self._entries.move_to_end(key)
             return True
 
-    def prefix_len(self, keys: Sequence[str]) -> int:
+    def prefix_len(self, keys: Sequence[bytes]) -> int:
         """Return the longest prefix already known to exist.
 
         This is the batched form of ``has()`` for LMCache's prefetch path.

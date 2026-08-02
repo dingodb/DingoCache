@@ -56,7 +56,7 @@ class UringReader {
       // Never let the kernel finish an async read into a buffer after we are
       // gone: queue_exit does NOT cancel in-flight requests, so an undrained
       // read would DMA into whatever lives at the (freed/reused) buffer later.
-      Drain();
+      Drain(/*timeout_ms=*/-1);
       io_uring_queue_exit(&ring_);
     }
   }
@@ -75,23 +75,25 @@ class UringReader {
   // The caller keeps the connection alive on the synchronous fallback instead.
   bool poisoned() const { return poisoned_; }
 
-  // Reap-and-discard every read the kernel has accepted, blocking until the
-  // buffers are quiescent. MUST be called (and must succeed) after a failed
-  // BatchRead before the caller touches, reuses, or frees any buffer a desc
-  // pointed at — the in-flight reads still write into them. Returns false if
-  // the kernel did not complete them within timeout_ms per wait (the buffers
-  // must then be treated as still owned by the kernel; the only safe move is
-  // to tear the connection down and let the endpoint's registered buffers
-  // outlive the reads). No-op (true) when nothing is in flight.
+  // Reap-and-discard every read the kernel has accepted. A non-negative timeout
+  // bounds each wait and lets the serve loop abandon a connection promptly.
+  // timeout_ms < 0 blocks without a deadline and is used by the destructor so
+  // destination staging is never released while the kernel still owns it.
   bool Drain(int timeout_ms = 5000) {
     if (!ok_) return true;
     while (inflight_ > 0) {
-      struct __kernel_timespec ts{timeout_ms / 1000,
-                                  static_cast<long long>(timeout_ms % 1000) * 1000000LL};
       struct io_uring_cqe* cqe = nullptr;
-      int w = io_uring_wait_cqe_timeout(&ring_, &cqe, &ts);
+      int w;
+      if (timeout_ms < 0) {
+        w = io_uring_wait_cqe(&ring_, &cqe);
+      } else {
+        struct __kernel_timespec ts{
+            timeout_ms / 1000,
+            static_cast<long long>(timeout_ms % 1000) * 1000000LL};
+        w = io_uring_wait_cqe_timeout(&ring_, &cqe, &ts);
+      }
       if (w == -EINTR) continue;
-      if (w < 0 || cqe == nullptr) return false;  // -ETIME: reads still in flight
+      if (w < 0 || cqe == nullptr) return false;
       io_uring_cqe_seen(&ring_, cqe);
       --inflight_;
     }

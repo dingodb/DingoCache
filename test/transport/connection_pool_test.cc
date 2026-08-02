@@ -7,9 +7,19 @@
 
 #include <gtest/gtest.h>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace fs = std::filesystem;
 using namespace dfkv;  // NOLINT
@@ -30,6 +40,29 @@ std::unique_ptr<Node> Start(const std::string& tag) {
   n->addr = "127.0.0.1:" + std::to_string(n->srv->port());
   return n;
 }
+
+uint64_t MetricValue(const std::string& text, const std::string& name) {
+  const std::string marker = "\n" + name + " ";
+  const size_t pos = text.find(marker);
+  EXPECT_NE(pos, std::string::npos) << text;
+  if (pos == std::string::npos) return 0;
+  return std::stoull(text.substr(pos + marker.size()));
+}
+
+int UnusedLoopbackPort() {
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  EXPECT_GE(fd, 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0;
+  EXPECT_EQ(::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+  socklen_t len = sizeof(addr);
+  EXPECT_EQ(::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len), 0);
+  const int port = ntohs(addr.sin_port);
+  ::close(fd);
+  return port;
+}
 }  // namespace
 
 TEST(ConnectionPool, SequentialRequestsReuseOneConnection) {
@@ -38,11 +71,11 @@ TEST(ConnectionPool, SequentialRequestsReuseOneConnection) {
   std::string v(256, 'p');
   const int N = 100;
   for (int i = 0; i < N; ++i) {
-    BlockKey bk = ToBlockKey("k" + std::to_string(i));
+    BlockKey bk = ToBlockKey("test/model", "k" + std::to_string(i));
     ASSERT_EQ(t.Cache(n->addr, bk, v.data(), v.size()), Status::kOk);
   }
   for (int i = 0; i < N; ++i) {
-    BlockKey bk = ToBlockKey("k" + std::to_string(i));
+    BlockKey bk = ToBlockKey("test/model", "k" + std::to_string(i));
     std::string out;
     ASSERT_EQ(t.Range(n->addr, bk, 0, v.size(), &out), Status::kOk);
     ASSERT_EQ(out, v);
@@ -56,12 +89,12 @@ TEST(ConnectionPool, CorrectnessAcrossManyKeys) {
   auto n = Start("correct");
   TcpTransport t;
   for (int i = 0; i < 50; ++i) {
-    BlockKey bk = ToBlockKey("c" + std::to_string(i));
+    BlockKey bk = ToBlockKey("test/model", "c" + std::to_string(i));
     std::string v = "val_" + std::to_string(i);
     ASSERT_EQ(t.Cache(n->addr, bk, v.data(), v.size()), Status::kOk);
   }
   for (int i = 0; i < 50; ++i) {
-    BlockKey bk = ToBlockKey("c" + std::to_string(i));
+    BlockKey bk = ToBlockKey("test/model", "c" + std::to_string(i));
     bool e = false;
     ASSERT_EQ(t.Exist(n->addr, bk, &e), Status::kOk);
     EXPECT_TRUE(e);
@@ -77,7 +110,7 @@ TEST(ConnectionPool, SurvivesStalePooledConnection) {
   // new request must transparently reconnect (retry once) — not hard-fail.
   auto n = Start("stale");
   TcpTransport t;
-  BlockKey bk = ToBlockKey("warm");
+  BlockKey bk = ToBlockKey("test/model", "warm");
   std::string v(64, 'w');
   ASSERT_EQ(t.Cache(n->addr, bk, v.data(), v.size()), Status::kOk);  // pools a conn
   // bounce the server on the SAME port to invalidate the pooled connection
@@ -89,5 +122,120 @@ TEST(ConnectionPool, SurvivesStalePooledConnection) {
   std::string out;
   EXPECT_EQ(t.Range(n->addr, bk, 0, v.size(), &out), Status::kOk);
   EXPECT_EQ(out, v);
+  EXPECT_EQ(
+      MetricValue(
+          t.MetricsText(),
+          "dfkv_transport_pool_retirements_total{reason=\"error\"}"),
+      1u);
   n->srv->Stop();
+}
+
+TEST(ConnectionPool, ConcurrentLoadGrowsToBoundThenReusesAndShrinks) {
+  auto n = Start("adaptive");
+  EndpointPoolOptions options;
+  options.min_connections = 1;
+  options.max_connections = 3;
+  options.idle_timeout_ms = 2;
+  options.acquire_timeout_ms = 10000;
+  TcpTransport t(options);
+
+  constexpr size_t kCalls = 12;
+  std::string value(4u << 20, 'a');
+  std::vector<Status> statuses(kCalls, Status::kIOError);
+  std::mutex start_mu;
+  std::condition_variable start_cv;
+  size_t ready = 0;
+  bool go = false;
+  std::vector<std::thread> threads;
+  threads.reserve(kCalls);
+  for (size_t i = 0; i < kCalls; ++i) {
+    threads.emplace_back([&, i] {
+      {
+        std::unique_lock<std::mutex> lk(start_mu);
+        ++ready;
+        start_cv.notify_all();
+        start_cv.wait(lk, [&] { return go; });
+      }
+      const BlockKey key =
+          ToBlockKey("test/model", "parallel-" + std::to_string(i));
+      statuses[i] = t.Cache(n->addr, key, value.data(), value.size());
+    });
+  }
+  {
+    std::unique_lock<std::mutex> lk(start_mu);
+    start_cv.wait(lk, [&] { return ready == kCalls; });
+    go = true;
+  }
+  start_cv.notify_all();
+  for (auto& thread : threads) thread.join();
+  for (Status status : statuses) EXPECT_EQ(status, Status::kOk);
+
+  const size_t accepts_after_burst = n->srv->AcceptCount();
+  EXPECT_GE(accepts_after_burst, 2u);
+  EXPECT_LE(accepts_after_burst, options.max_connections);
+  std::string metrics = t.MetricsText();
+  EXPECT_GE(MetricValue(metrics, "dfkv_transport_pool_connections"), 2u);
+  EXPECT_LE(MetricValue(metrics, "dfkv_transport_pool_connections"),
+            options.max_connections);
+  EXPECT_EQ(MetricValue(metrics, "dfkv_transport_pool_inflight"), 0u);
+  EXPECT_EQ(MetricValue(metrics, "dfkv_transport_pool_selections_total"),
+            kCalls);
+
+  // Steady-state calls reuse existing sockets: no connection per operation.
+  for (size_t i = 0; i < 20; ++i) {
+    bool exists = false;
+    EXPECT_EQ(t.Exist(n->addr,
+                      ToBlockKey("test/model",
+                                 "parallel-" + std::to_string(i % kCalls)),
+                      &exists),
+              Status::kOk);
+    EXPECT_TRUE(exists);
+  }
+  EXPECT_EQ(n->srv->AcceptCount(), accepts_after_burst);
+
+  // The next acquisition performs opportunistic idle retirement, retaining the
+  // configured warm minimum rather than the burst-sized pool.
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  bool exists = false;
+  EXPECT_EQ(t.Exist(n->addr, ToBlockKey("test/model", "parallel-0"), &exists),
+            Status::kOk);
+  EXPECT_TRUE(exists);
+  metrics = t.MetricsText();
+  EXPECT_EQ(MetricValue(metrics, "dfkv_transport_pool_connections"), 1u);
+  EXPECT_EQ(
+      MetricValue(
+          metrics,
+          "dfkv_transport_pool_retirements_total{reason=\"idle\"}"),
+      accepts_after_burst - options.min_connections);
+  n->srv->Stop();
+}
+
+TEST(ConnectionPool, FailedDialEntersBackoffAndSuppressesImmediateRetry) {
+  EndpointPoolOptions options;
+  options.max_connections = 4;
+  options.backoff_base_ms = 5;
+  options.backoff_max_ms = 20;
+  TcpTransport t(options);
+  t.set_timeouts(50, 50);
+  const std::string node =
+      "127.0.0.1:" + std::to_string(UnusedLoopbackPort());
+  bool exists = false;
+  EXPECT_EQ(t.Exist(node, ToBlockKey("test/model", "down"), &exists),
+            Status::kIOError);
+  EXPECT_EQ(t.Exist(node, ToBlockKey("test/model", "down"), &exists),
+            Status::kIOError);
+  std::this_thread::sleep_for(std::chrono::milliseconds(8));
+  EXPECT_EQ(t.Exist(node, ToBlockKey("test/model", "down"), &exists),
+            Status::kIOError);
+  EXPECT_EQ(t.Exist(node, ToBlockKey("test/model", "down"), &exists),
+            Status::kIOError);
+
+  const std::string metrics = t.MetricsText();
+  EXPECT_EQ(MetricValue(metrics, "dfkv_transport_pool_connections"), 0u);
+  EXPECT_EQ(MetricValue(metrics, "dfkv_transport_pool_backoff_endpoints"), 1u);
+  EXPECT_EQ(MetricValue(metrics, "dfkv_transport_pool_backoff_events_total"),
+            2u);
+  EXPECT_EQ(
+      MetricValue(metrics, "dfkv_transport_pool_backoff_suppressed_total"),
+      2u);
 }

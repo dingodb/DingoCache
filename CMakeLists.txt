@@ -77,6 +77,9 @@ target_include_directories(dfkv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(dfkv PRIVATE _GNU_SOURCE  # O_DIRECT/fallocate in src/cache/kv_store.cc
   DFKV_VERSION="${PROJECT_VERSION}")
 target_link_libraries(dfkv PUBLIC Threads::Threads ${CMAKE_DL_LIBS} rt)  # cuda_ipc dlopen->libdl, node_dedup shm_*->librt
+set_target_properties(dfkv PROPERTIES
+  VERSION "${PROJECT_VERSION}"
+  SOVERSION 2)
 if(DFKV_WITH_RDMA)
   target_compile_definitions(dfkv PUBLIC DFKV_WITH_RDMA)
   target_link_libraries(dfkv PUBLIC ibverbs)
@@ -111,15 +114,18 @@ install(TARGETS dfkv dfkv_server dfkv_mds dfkv_smoke dfkvctl dfkv_bench dfkv_dis
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY src/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/dfkv FILES_MATCHING PATTERN "*.h")
-# dfkv_hicache.py imports dfkv_access_log and dfkv_metrics at module load, so all
-# three must ship together or an installed plugin fails with ImportError.
+# The standalone HiCache plugin imports these sibling modules at import time.
 install(FILES
   integration/hicache/dfkv_hicache.py
   integration/hicache/dfkv_access_log.py
+  integration/hicache/dfkv_hot_config.py
   integration/hicache/dfkv_metrics.py
   DESTINATION ${CMAKE_INSTALL_DATADIR}/dfkv/python)
-# Shared telemetry package (push-metrics now; tracing later). Canonical source;
-# the vLLM/LMCache pip connectors vendor a byte-identical copy (drift-guarded).
+# Canonical binary namespace/client ABI package shared by every connector.
+install(DIRECTORY integration/common/src/dfkv_common
+  DESTINATION ${CMAKE_INSTALL_DATADIR}/dfkv/python
+  FILES_MATCHING PATTERN "*.py")
+# Shared telemetry package (push metrics and tracing).
 install(DIRECTORY integration/hicache/dfkv_telemetry
   DESTINATION ${CMAKE_INSTALL_DATADIR}/dfkv/python
   FILES_MATCHING PATTERN "*.py")
@@ -140,6 +146,11 @@ if(DFKV_BUILD_TESTS)
   list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_loopback_test.cc)
   list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/qp_depth_negotiation_test.cc)
   list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_topology_test.cc)
+  # Backend semantics have dedicated tests below. Keep unrelated functional
+  # tests on the explicit file backend so a full CTest run does not accumulate
+  # 1 GiB production extents in /tmp and become order/host-capacity dependent.
+  set(DFKV_UNIT_TEST_ENV
+      "DFKV_STORE_ENGINE=file;DFKV_SLAB_WRITE=buffered")
   foreach(t ${DFKV_TESTS})
     get_filename_component(name ${t} NAME_WE)
     add_executable(${name} ${t})
@@ -151,31 +162,38 @@ if(DFKV_BUILD_TESTS)
     # even with GPUs otherwise free). A shared RESOURCE_LOCK serializes every
     # GPU/RDMA-touching test against each other while the rest still parallelize.
     if(name STREQUAL "node_dedup_gpu_test")
-      gtest_discover_tests(${name} PROPERTIES RESOURCE_LOCK gpu_rdma_hw)
+      gtest_discover_tests(${name} PROPERTIES
+        RESOURCE_LOCK gpu_rdma_hw
+        ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")
     else()
-      gtest_discover_tests(${name})
+      gtest_discover_tests(${name} PROPERTIES
+        ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")
     endif()
   endforeach()
   if(DFKV_WITH_RDMA)  # exercised in CI under Soft-RoCE (rdma_rxe); skips if no device
     add_executable(rdma_loopback_test ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_loopback_test.cc)
     target_link_libraries(rdma_loopback_test PRIVATE dfkv_core GTest::gtest_main)
-    gtest_discover_tests(rdma_loopback_test PROPERTIES RESOURCE_LOCK gpu_rdma_hw)
+    gtest_discover_tests(rdma_loopback_test PROPERTIES
+      RESOURCE_LOCK gpu_rdma_hw
+      ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")
     add_executable(qp_depth_negotiation_test ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/qp_depth_negotiation_test.cc)
     target_link_libraries(qp_depth_negotiation_test PRIVATE dfkv_core GTest::gtest_main)
-    gtest_discover_tests(qp_depth_negotiation_test)
+    gtest_discover_tests(qp_depth_negotiation_test PROPERTIES
+      ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")
     add_executable(rdma_topology_test ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_topology_test.cc)
     target_link_libraries(rdma_topology_test PRIVATE dfkv_core GTest::gtest_main)
-    gtest_discover_tests(rdma_topology_test)
+    gtest_discover_tests(rdma_topology_test PROPERTIES
+      ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")
   endif()
 
   # Python plugin test (ctypes -> libdfkv.so -> dfkv_server). No GPU/torch.
   find_program(PYTHON3 python3)
   if(PYTHON3)
     add_test(NAME python_plugin
-      COMMAND ${PYTHON3} -m unittest test_dfkv_hicache
+      COMMAND ${PYTHON3} -m unittest test_dfkv_identity test_dfkv_hicache
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
     set_tests_properties(python_plugin PROPERTIES
-      ENVIRONMENT "DFKV_BUILD=${CMAKE_BINARY_DIR};DFKV_LIB=${CMAKE_BINARY_DIR}/libdfkv.so")
+      ENVIRONMENT "DFKV_BUILD=${CMAKE_BINARY_DIR};DFKV_LIB=${CMAKE_BINARY_DIR}/libdfkv.so;DFKV_STORE_ENGINE=file;DFKV_SLAB_WRITE=buffered;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
     # Shared telemetry layer: pure-python, no build/lib needed (OTel-push test
     # self-skips when the SDK is absent). Includes the vendored-copy drift guard.
     add_test(NAME python_telemetry

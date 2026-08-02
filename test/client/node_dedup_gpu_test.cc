@@ -104,10 +104,10 @@ struct DevBuf {
 
 TEST(GpuNodeDedup, EnvSegmentNameCarriesLayoutVersion) {
   const std::string n = GpuNodeDedup::EnvSegmentName(0xabcdef);
-  EXPECT_NE(n.find("/dfkv-dedup-gpuv1-"), std::string::npos);
+  EXPECT_NE(n.find("/dfkv-dedup-gpuv3-"), std::string::npos);
   EXPECT_NE(n.find("0000000000abcdef"), std::string::npos);
   // distinct from the host segment namespace
-  EXPECT_EQ(n.find("/dfkv-dedup-v2-"), std::string::npos);
+  EXPECT_EQ(n.find("/dfkv-dedup-v4-"), std::string::npos);
 }
 
 TEST(GpuNodeDedup, FromEnvNeedsBothSwitches) {
@@ -136,15 +136,18 @@ TEST(GpuNodeDedup, FetchPublishThenPeerHitsScattered) {
   GpuNodeDedup::Seg src[2] = {{reinterpret_cast<void*>(s0.p), 4096},
                               {reinterpret_cast<void*>(s1.p), 4096}};
   size_t got = 0;
-  ASSERT_EQ(a->ClaimSg(K(1), src, 2, 8192, &got), GpuNodeDedup::Role::kFetch);
-  a->PublishSg(K(1), src, 2, v.size());
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->ClaimSg(K(1), src, 2, 8192, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  a->PublishSg(K(1), token, src, 2, v.size());
 
   // Peer scatters into a DIFFERENT segment split (3000 + 5192).
   DevBuf d0(3000), d1(5192);
   GpuNodeDedup::Seg dst[2] = {{reinterpret_cast<void*>(d0.p), 3000},
                               {reinterpret_cast<void*>(d1.p), 5192}};
   got = 0;
-  ASSERT_EQ(b->ClaimSg(K(1), dst, 2, 8192, &got), GpuNodeDedup::Role::kHit);
+  ASSERT_EQ(b->ClaimSg(K(1), dst, 2, 8192, &got, &ignored),
+            GpuNodeDedup::Role::kHit);
   EXPECT_EQ(got, v.size());
   EXPECT_EQ(d0.Down(3000), v.substr(0, 3000));
   EXPECT_EQ(d1.Down(3000), v.substr(3000));  // 6000-3000 used of 5192 cap
@@ -164,12 +167,15 @@ TEST(GpuNodeDedup, WaiterCopiesAfterPublish) {
   GpuNodeDedup::Seg ds{reinterpret_cast<void*>(dst.p), 65536};
 
   size_t got = 0;
-  ASSERT_EQ(a->ClaimSg(K(2), &ss, 1, 65536, &got), GpuNodeDedup::Role::kFetch);
-  ASSERT_EQ(b->ClaimSg(K(2), &ds, 1, 65536, &got), GpuNodeDedup::Role::kWait);
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->ClaimSg(K(2), &ss, 1, 65536, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  ASSERT_EQ(b->ClaimSg(K(2), &ds, 1, 65536, &got, &ignored),
+            GpuNodeDedup::Role::kWait);
   std::thread pub([&] {
-    ASSERT_TRUE(EnsureCudaCtx());  // publish thread needs its own current ctx
+    ASSERT_TRUE(EnsureCudaCtx());
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
-    a->PublishSg(K(2), &ss, 1, v.size());
+    a->PublishSg(K(2), token, &ss, 1, v.size());
   });
   EXPECT_TRUE(b->WaitSg(K(2), &ds, 1, 65536, &got));
   pub.join();
@@ -193,12 +199,16 @@ TEST(GpuNodeDedup, ThreadWithoutCtxIsServed) {
   GpuNodeDedup::Seg ds{reinterpret_cast<void*>(dst.p), 32768};
   std::thread t([&] {  // deliberately NO EnsureCudaCtx here
     size_t got = 0;
-    ASSERT_EQ(a->ClaimSg(K(9), &ss, 1, 32768, &got), GpuNodeDedup::Role::kFetch);
-    a->PublishSg(K(9), &ss, 1, v.size());
+    uint64_t token = 0;
+    ASSERT_EQ(a->ClaimSg(K(9), &ss, 1, 32768, &got, &token),
+              GpuNodeDedup::Role::kFetch);
+    a->PublishSg(K(9), token, &ss, 1, v.size());
   });
   t.join();
   size_t got = 0;
-  ASSERT_EQ(a->ClaimSg(K(9), &ds, 1, 32768, &got), GpuNodeDedup::Role::kHit);
+  uint64_t ignored = 0;
+  ASSERT_EQ(a->ClaimSg(K(9), &ds, 1, 32768, &got, &ignored),
+            GpuNodeDedup::Role::kHit);
   EXPECT_EQ(got, v.size());
   EXPECT_EQ(dst.Down(32768), v);
 }
@@ -215,6 +225,8 @@ TEST(GpuNodeDedup, WaitManyAmortizedSync) {
   std::vector<GpuNodeDedup::Seg> ssegs(kN), dsegs(kN);
   std::vector<GpuNodeDedup::WaitItem> wits(kN);
   size_t got = 0;
+  std::vector<uint64_t> tokens(kN, 0);
+  uint64_t ignored = 0;
   for (size_t i = 0; i < kN; ++i) {
     vals.push_back(Val(100 + i, 8192));
     srcs.push_back(std::make_unique<DevBuf>(8192));
@@ -222,9 +234,10 @@ TEST(GpuNodeDedup, WaitManyAmortizedSync) {
     srcs[i]->Up(vals[i]);
     ssegs[i] = {reinterpret_cast<void*>(srcs[i]->p), 8192};
     dsegs[i] = {reinterpret_cast<void*>(dsts[i]->p), 8192};
-    ASSERT_EQ(a->ClaimSg(K(100 + i), &ssegs[i], 1, 8192, &got),
+    ASSERT_EQ(a->ClaimSg(K(100 + i), &ssegs[i], 1, 8192, &got,
+                         &tokens[i]),
               GpuNodeDedup::Role::kFetch);
-    ASSERT_EQ(b->ClaimSg(K(100 + i), &dsegs[i], 1, 8192, &got),
+    ASSERT_EQ(b->ClaimSg(K(100 + i), &dsegs[i], 1, 8192, &got, &ignored),
               GpuNodeDedup::Role::kWait);
     wits[i] = GpuNodeDedup::WaitItem{K(100 + i), &dsegs[i], 1, 8192, false, 0};
   }
@@ -232,7 +245,8 @@ TEST(GpuNodeDedup, WaitManyAmortizedSync) {
     ASSERT_TRUE(EnsureCudaCtx());
     for (size_t i = 0; i < kN; ++i) {
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
-      a->PublishSg(K(100 + i), &ssegs[i], 1, vals[i].size());
+      a->PublishSg(K(100 + i), tokens[i], &ssegs[i], 1,
+                   vals[i].size());
     }
   });
   b->WaitManySg(wits.data(), kN);
@@ -253,10 +267,13 @@ TEST(GpuNodeDedup, AbortFreesSlotForWaiterFallback) {
   DevBuf d(4096);
   GpuNodeDedup::Seg s{reinterpret_cast<void*>(d.p), 4096};
   size_t got = 0;
-  ASSERT_EQ(a->ClaimSg(K(3), &s, 1, 4096, &got), GpuNodeDedup::Role::kFetch);
-  a->Abort(K(3));
+  uint64_t token = 0;
+  ASSERT_EQ(a->ClaimSg(K(3), &s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  a->Abort(K(3), token);
   // Slot freed: the next claimant fetches (no stuck FETCHING until takeover).
-  ASSERT_EQ(a->ClaimSg(K(3), &s, 1, 4096, &got), GpuNodeDedup::Role::kFetch);
+  ASSERT_EQ(a->ClaimSg(K(3), &s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
 }
 
 TEST(GpuNodeDedup, OversizePayloadSkipsRendezvous) {
@@ -267,12 +284,42 @@ TEST(GpuNodeDedup, OversizePayloadSkipsRendezvous) {
   DevBuf d(4096);
   GpuNodeDedup::Seg s{reinterpret_cast<void*>(d.p), 4096};
   size_t got = 0;
+  uint64_t token = 0;
   // cap > arena/2: no slot is claimed, so no publish obligation either.
-  EXPECT_EQ(a->ClaimSg(K(4), &s, 1, (32ull << 20), &got),
+  EXPECT_EQ(a->ClaimSg(K(4), &s, 1, (32ull << 20), &got, &token),
             GpuNodeDedup::Role::kFetch);
-  a->Abort(K(4));  // must be a harmless no-op (nothing was reserved)
-  EXPECT_EQ(a->ClaimSg(K(4), &s, 1, (32ull << 20), &got),
+  a->Abort(K(4), token);
+  EXPECT_EQ(a->ClaimSg(K(4), &s, 1, (32ull << 20), &got, &token),
             GpuNodeDedup::Role::kFetch);
+}
+
+TEST(GpuNodeDedup, InvalidateDropsReadyAndFencesLatePublisher) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("invalidate");
+  auto a = GpuNodeDedup::Open(Opts(g.name));
+  auto b = GpuNodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  const std::string value = Val(5, 4096);
+  DevBuf src(4096), dst(4096);
+  src.Up(value);
+  GpuNodeDedup::Seg source{reinterpret_cast<void*>(src.p), 4096};
+  GpuNodeDedup::Seg target{reinterpret_cast<void*>(dst.p), 4096};
+  size_t got = 0;
+  uint64_t token = 0, ignored = 0;
+
+  ASSERT_EQ(a->ClaimSg(K(5), &source, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  a->PublishSg(K(5), token, &source, 1, value.size());
+  a->Invalidate(K(5));
+  EXPECT_NE(b->ClaimSg(K(5), &target, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kHit);
+
+  ASSERT_EQ(a->ClaimSg(K(6), &source, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  a->Invalidate(K(6));
+  a->PublishSg(K(6), token, &source, 1, value.size());
+  EXPECT_NE(b->ClaimSg(K(6), &target, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kHit);
 }
 
 // Child half of the cross-process test: skipped unless the parent exec'd us
@@ -289,7 +336,9 @@ TEST(GpuDedupChild, ReadsPeerPublish) {
   GpuNodeDedup::Seg dst[2] = {{reinterpret_cast<void*>(d0.p), 20000},
                               {reinterpret_cast<void*>(d1.p), 20000}};
   size_t got = 0;
-  ASSERT_EQ(d->ClaimSg(K(7), dst, 2, 40000, &got), GpuNodeDedup::Role::kHit);
+  uint64_t ignored = 0;
+  ASSERT_EQ(d->ClaimSg(K(7), dst, 2, 40000, &got, &ignored),
+            GpuNodeDedup::Role::kHit);
   ASSERT_EQ(got, v.size());
   EXPECT_EQ(d0.Down(20000), v.substr(0, 20000));
   EXPECT_EQ(d1.Down(20000), v.substr(20000));
@@ -305,8 +354,10 @@ TEST(GpuNodeDedup, CrossProcessIpcHit) {
   src.Up(v);
   GpuNodeDedup::Seg s{reinterpret_cast<void*>(src.p), 40000};
   size_t got = 0;
-  ASSERT_EQ(a->ClaimSg(K(7), &s, 1, 40000, &got), GpuNodeDedup::Role::kFetch);
-  a->PublishSg(K(7), &s, 1, v.size());
+  uint64_t token = 0;
+  ASSERT_EQ(a->ClaimSg(K(7), &s, 1, 40000, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  a->PublishSg(K(7), token, &s, 1, v.size());
 
   // CUDA does not survive fork; exec this binary so the child initializes its
   // own driver state and pulls the payload across processes via cuIpc*.

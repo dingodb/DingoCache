@@ -2,17 +2,11 @@
 dynamic). Zero-copy v1 path: hands raw host-buffer pointers from
 mem_pool_host.get_page_buffer_meta() straight to the DingoFS KV client (C ABI).
 
-Key scheme:
-- MLA (GLM-5.1): one packed-latent object per page. The latent is replicated
-  across *TP*, so the key has NO tp_rank suffix and only tp_rank 0 writes
-  (backup_skip). PP splits the model by *layer*, so the latent is NOT replicated
-  across PP stages — when pp_size > 1 every key carries _pp{pp_rank} (including
-  MLA) so stages holding different layer-slices do not collide.
-- MHA: two objects (_k/_v) per page, suffixed by tp_size/tp_rank (+ _pp{pp_rank}
-  when PP is on).
-
-This mirrors SGLang's reference HiCacheFile suffix (hicache_storage.py), where
-`enable_pp` appends `_{pp_size}_{pp_rank}` unconditionally — including MLA.
+Object keys use the shared binary, length-framed pool-key schema. MLA stores one
+replicated packed-latent object per page (only TP rank 0 writes); MHA stores
+separate K/V components per TP rank. Pipeline-parallel rank is always an
+explicit coordinate when enabled, so stages holding different layer slices do
+not collide. No delimiter rendering participates in storage identity.
 
 This file is the production plugin. On a GPU host it imports the real SGLang
 HiCacheStorage; the test harness supplies a no-torch shim with the same surface.
@@ -20,6 +14,7 @@ HiCacheStorage; the test harness supplies a no-torch shim with the same surface.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import logging
 import os
 import sys
@@ -27,6 +22,16 @@ import time
 from typing import List, Optional
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
+from dfkv_common import (
+    DfkvClientOptionsV2,
+    SGLANG_HICACHE_RAW_V1,
+    canonical_namespace,
+    make_client_options_v2,
+    make_key_array,
+    make_key_buffer,
+    pool_key,
+    sg_key,
+)
 
 from dfkv_access_log import (access_log, configure as _configure_access_log,
                             apply_hot as _access_log_apply_hot,
@@ -45,13 +50,8 @@ _log = logging.getLogger(__name__)
 
 _FLAG_IS_MLA = 0x1
 
-# Historical/default SG width: ConnectX-era max_sge=30, SGE[0] carries the
-# request/value header, leaving 29 payload segments per scatter-gather key.
-# The live width comes from dfkv_max_sg_segs (negotiated per HCA); this
-# constant is the fallback AND the key-namespace compat anchor — the default
-# width keeps the historical "@sg{n}" so previously cached data stays
-# reachable. Mirrors integration/vllm worker.py SG_MAX_SEGS (same value,
-# same reasoning).
+# Scatter width is an explicit physical-key field; clients with different HCA
+# limits safely miss instead of interpreting a different layer grouping.
 SG_DEFAULT_WIDTH = 29
 
 
@@ -59,6 +59,35 @@ def _truthy(v) -> bool:
     if isinstance(v, str):
         return v.strip().lower() not in ("", "0", "false", "no", "off")
     return bool(v)
+
+def _physical_axis(cfg: dict, name: str) -> tuple[int, int]:
+    """Parse one physical sharding axis without accepting lossy coercions."""
+    size_key = f"{name}_size"
+    rank_key = f"{name}_rank"
+
+    def _integer(value, field):
+        if isinstance(value, bool):
+            raise ValueError(f"{field} must be an integer")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            if text and text.isascii() and text.isdecimal():
+                return int(text)
+        raise ValueError(f"{field} must be an integer")
+
+    size = _integer(cfg.get(size_key, 1), size_key)
+    if size < 1 or size > 0xFFFFFFFF:
+        raise ValueError(f"{size_key} must be in [1, 4294967295]")
+    if rank_key not in cfg:
+        if size > 1:
+            raise ValueError(
+                f"{rank_key} is required when {size_key} is greater than 1")
+        return size, 0
+    rank = _integer(cfg[rank_key], rank_key)
+    if rank < 0 or rank >= size:
+        raise ValueError(f"{rank_key} must be in [0, {size})")
+    return size, rank
 
 
 def resolve_node_dedup(cfg_value, env_value, is_mla: bool, tp_size: int):
@@ -86,33 +115,39 @@ def resolve_node_dedup(cfg_value, env_value, is_mla: bool, tp_size: int):
 
 
 def _load_lib(path: Optional[str] = None) -> ctypes.CDLL:
-    lib_path = (path or os.environ.get("DFKV_LIB")
-                or os.path.join(os.environ.get("DFKV_BUILD", "/home/ketor/dfkv-dev/build"),
-                                "libdfkv.so"))
+    build = os.environ.get("DFKV_BUILD")
+    lib_path = (
+        path
+        or os.environ.get("DFKV_LIB")
+        or (os.path.join(build, "libdfkv.so") if build else "libdfkv.so")
+    )
     lib = ctypes.CDLL(lib_path)
-    lib.dfkv_open.restype = ctypes.c_void_p
-    lib.dfkv_open.argtypes = [ctypes.c_char_p, ctypes.c_uint64, ctypes.c_uint32,
-                              ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
-                              ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
-                              ctypes.c_uint32]
+    lib.dfkv_open_v2.restype = ctypes.c_void_p
+    lib.dfkv_open_v2.argtypes = [ctypes.POINTER(DfkvClientOptionsV2)]
     lib.dfkv_put.restype = ctypes.c_int
-    lib.dfkv_put.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_uint64]
+    lib.dfkv_put.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64,
+        ctypes.c_void_p, ctypes.c_uint64]
     lib.dfkv_get.restype = ctypes.c_int
-    lib.dfkv_get.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_uint64]
+    lib.dfkv_get.argtypes = lib.dfkv_put.argtypes
     lib.dfkv_exist.restype = ctypes.c_int
-    lib.dfkv_exist.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    lib.dfkv_exist.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64]
     lib.dfkv_register_memory.restype = ctypes.c_int
     lib.dfkv_register_memory.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64]
     lib.dfkv_batch_put.restype = ctypes.c_int
-    lib.dfkv_batch_put.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p),
-                                   ctypes.POINTER(ctypes.c_void_p),
-                                   ctypes.POINTER(ctypes.c_uint64), ctypes.c_int,
-                                   ctypes.POINTER(ctypes.c_int)]
+    lib.dfkv_batch_put.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_uint64), ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int)]
     lib.dfkv_batch_get.restype = ctypes.c_int
     lib.dfkv_batch_get.argtypes = lib.dfkv_batch_put.argtypes
     lib.dfkv_batch_exist.restype = ctypes.c_int
-    lib.dfkv_batch_exist.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p),
-                                     ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+    lib.dfkv_batch_exist.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_uint64), ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int)]
     # Scatter-gather put + live SG width, for the HiCache L2-bypass (device-direct
     # write) path. Each key gathers num_bufs[i] non-contiguous source buffers
     # (a page's per-layer GPU segments) into one stored blob. Guarded like the
@@ -120,10 +155,12 @@ def _load_lib(path: Optional[str] = None) -> ctypes.CDLL:
     if hasattr(lib, "dfkv_batch_put_sg"):
         lib.dfkv_batch_put_sg.restype = ctypes.c_int
         lib.dfkv_batch_put_sg.argtypes = [
-            ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p),
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_uint64),
             ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)),
             ctypes.POINTER(ctypes.POINTER(ctypes.c_uint64)),
-            ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+            ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int)]
     # Scatter-gather GET, the read-side mirror of dfkv_batch_put_sg for the
     # HiCache L2-bypass (device-direct read) path. Key i's stored blob is
     # scattered in order across num_dsts[i] destination buffers (a page's
@@ -134,7 +171,8 @@ def _load_lib(path: Optional[str] = None) -> ctypes.CDLL:
     if hasattr(lib, "dfkv_batch_get_auto_sg"):
         lib.dfkv_batch_get_auto_sg.restype = ctypes.c_int
         lib.dfkv_batch_get_auto_sg.argtypes = [
-            ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p),
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_uint64),
             ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)),
             ctypes.POINTER(ctypes.POINTER(ctypes.c_uint64)),
             ctypes.POINTER(ctypes.c_int), ctypes.c_int,
@@ -142,24 +180,8 @@ def _load_lib(path: Optional[str] = None) -> ctypes.CDLL:
     if hasattr(lib, "dfkv_max_sg_segs"):
         lib.dfkv_max_sg_segs.restype = ctypes.c_uint32
         lib.dfkv_max_sg_segs.argtypes = [ctypes.c_void_p]
-    lib.dfkv_set_members.restype = ctypes.c_int
-    lib.dfkv_set_members.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-    lib.dfkv_refresh_members.restype = ctypes.c_int
-    lib.dfkv_refresh_members.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-    lib.dfkv_start_mds_discovery.restype = ctypes.c_int
-    lib.dfkv_start_mds_discovery.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
-    # Client registration (additive >= dfkv with the /clients/<id> lease). Guarded
-    # at the call site for older libdfkv.so without the symbol (same pattern as the
-    # vLLM/LMCache connectors — see integration/vllm + integration/lmcache).
-    if hasattr(lib, "dfkv_start_client_registration"):
-        lib.dfkv_start_client_registration.restype = ctypes.c_int
-        lib.dfkv_start_client_registration.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
-                                                       ctypes.c_char_p, ctypes.c_char_p,
-                                                       ctypes.c_char_p, ctypes.c_int]
     lib.dfkv_transport_mode.restype = ctypes.c_char_p
     lib.dfkv_transport_mode.argtypes = [ctypes.c_void_p]
-    lib.dfkv_set_batch_concurrency.restype = ctypes.c_int
-    lib.dfkv_set_batch_concurrency.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
     lib.dfkv_stats_snapshot.restype = ctypes.c_uint64
     lib.dfkv_stats_snapshot.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64]
     lib.dfkv_version.restype = ctypes.c_char_p
@@ -206,14 +228,17 @@ def _is_device_transfer(tr) -> bool:
 
 
 def _arrays(subkeys, ptrs, sizes):
-    """Build parallel C arrays (keys, ptrs, sizes) for a batch call."""
+    """Build aligned key/length/payload arrays for one batch call."""
     n = len(subkeys)
-    kbuf = [k.encode() for k in subkeys]
-    karr = (ctypes.c_char_p * n)(*kbuf)
+    karr, klens, key_owners = make_key_array(subkeys)
     parr = (ctypes.c_void_p * n)(*[ctypes.c_void_p(int(p)) for p in ptrs])
     sarr = (ctypes.c_uint64 * n)(*[int(s) for s in sizes])
     out = (ctypes.c_int * n)()
-    return karr, parr, sarr, out, kbuf
+    return karr, klens, parr, sarr, out, key_owners
+
+
+def _key_label(key: bytes) -> str:
+    return f"len={len(key)} sha256={hashlib.sha256(key).hexdigest()[:16]}"
 
 
 class DfkvHiCache(HiCacheStorage):
@@ -233,10 +258,19 @@ class DfkvHiCache(HiCacheStorage):
                 "v1 RDMA path. Omitting it falls back to the generic copy path "
                 "(slower; MLA writes redundant per-rank copies)."
             )
-        self.model = (storage_config.model_name or "").replace("/", "-")
+        self.model_identity = storage_config.model_name or ""
+        self.model = self.model_identity.replace("/", "-")
         self.tp_rank = int(storage_config.tp_rank)
         self.tp_size = int(storage_config.tp_size)
         self.is_mla = bool(storage_config.is_mla_model)
+        # PCP and DCP split one logical page into distinct physical shards.
+        # A guessed rank would alias those shards, so multi-rank axes require an
+        # explicit bounded coordinate before the native client is opened.
+        self.pcp_size, self.pcp_rank = _physical_axis(cfg, "pcp")
+        self.dcp_size, self.dcp_rank = _physical_axis(cfg, "dcp")
+        self._device_direct_requested = _truthy(
+            os.environ.get("SGLANG_HICACHE_L2_BYPASS"))
+        self._device_registration_failed = False
         # Pipeline-parallel rank/size. PP splits the model across stages by
         # layer, so each pp_rank holds a *different* slice of KV (unlike TP,
         # where MLA latent is replicated). Storage keys MUST therefore carry
@@ -289,8 +323,12 @@ class DfkvHiCache(HiCacheStorage):
             os.environ["DFKV_PROBE_INTERVAL_MS"] = str(probe_ms)
         # Log the open/discovery setup (the access log is live from here on; the
         # earlier interface_v1 check raises before config is resolved).
-        with access_log("init", lambda: f"{self._alog_tag} {self.model} "
-                        f"tp={self.tp_rank}/{self.tp_size} mla={int(self.is_mla)}") as r:
+        with access_log("init", lambda: (
+                f"{self._alog_tag} {self.model} "
+                f"tp={self.tp_rank}/{self.tp_size} "
+                f"pcp={self.pcp_rank}/{self.pcp_size} "
+                f"dcp={self.dcp_rank}/{self.dcp_size} "
+                f"mla={int(self.is_mla)}")) as r:
             mds = cfg.get("mds_endpoints", "")
             members = cfg.get("members", "")
             _tcfg.require_ring_endpoint(members, mds)
@@ -303,7 +341,6 @@ class DfkvHiCache(HiCacheStorage):
             if cfg.get("rdma_depth"):
                 os.environ["DFKV_RDMA_DEPTH"] = str(int(cfg["rdma_depth"]))
             if _truthy(cfg.get("require_rdma")):
-                os.environ["DFKV_REQUIRE_RDMA"] = "1"
                 if not _truthy(os.environ.get("DFKV_RDMA")):
                     os.environ["DFKV_RDMA"] = "1"
             # rail_affinity (per-tp_rank narrowing) is DEPRECATED and now a no-op:
@@ -354,19 +391,79 @@ class DfkvHiCache(HiCacheStorage):
             self._v2_io_pools = ()  # pool names that actually did I/O last _v2_io()
             # self._lib was loaded above (before configure) so the native version
             # could be reported; dfkv_open uses that same handle here.
-            flags = _FLAG_IS_MLA if self.is_mla else 0
-            # Refuse to start on a missing/invalid isolation identity (ring
-            # endpoint already validated above). Opt out with
-            # allow_shared_keyspace=1 for a single-model shared keyspace.
-            model_hash = _tcfg.require_model_hash(cfg)
-            self._h = self._lib.dfkv_open(
-                members.encode(), model_hash,
-                int(cfg.get("page_size", 64)), int(cfg.get("dtype_tag", 0)), flags,
-                self.tp_size, self.tp_rank,
-                int(cfg.get("layer_num", 0)), int(cfg.get("head_num", 0)),
-                int(cfg.get("head_dim", 0)))
+            # The native namespace is explicit binary identity. key_namespace
+            # aligns runtimes only when their object keys and raw layouts agree.
+            if not cfg.get("key_namespace"):
+                _tcfg.require_isolation_name(
+                    self.model_identity, field="model_name")
+            _page_size = int(cfg.get("page_size", 64))
+            _layer_num = int(cfg.get("layer_num", 0))
+            _dtype = str(cfg.get(
+                "kv_cache_dtype", cfg.get("dtype_tag", "unknown")))
+            self._key_namespace = canonical_namespace(
+                self.model_identity,
+                SGLANG_HICACHE_RAW_V1,
+                cfg.get("key_namespace"),
+                tenant_id=str(cfg.get("tenant_id", "default")),
+                model_revision=str(
+                    cfg.get("model_revision", self.model_identity)),
+                dtype=_dtype,
+                block_tokens=max(1, _page_size),
+                layer_count=max(1, _layer_num),
+                tp_size=self.tp_size,
+                dp_size=max(1, int(cfg.get("dp_size", 1))),
+                pp_size=self.pp_size,
+                layout_fields={
+                    "page_size": _page_size,
+                    "dtype": _dtype,
+                    "dtype_tag": int(cfg.get("dtype_tag", 0)),
+                    "is_mla": self.is_mla,
+                    "layer_num": _layer_num,
+                    "head_num": int(cfg.get("head_num", 0)),
+                    "head_dim": int(cfg.get("head_dim", 0)),
+                    "pcp_size": self.pcp_size,
+                    "dcp_size": self.dcp_size,
+                },
+            )
+            group = cfg.get("mds_group", "default")
+            poll_ms = int(cfg.get("mds_poll_ms", 3000))
+            register_client = bool(
+                mds and _truthy(
+                    cfg.get(
+                        "client_register",
+                        os.environ.get("DFKV_CLIENT_REGISTER", "1"),
+                    )
+                )
+            )
+            client_id = (
+                _tcfg.resolve_connector_id(cfg, tp_rank=self.tp_rank)
+                if register_client
+                else ""
+            )
+            client_info = (
+                f"type={_tcfg.TYPE_HICACHE},model={self.model},"
+                f"tp_size={self.tp_size},tp_rank={self.tp_rank},"
+                f"pcp_size={self.pcp_size},pcp_rank={self.pcp_rank},"
+                f"dcp_size={self.dcp_size},dcp_rank={self.dcp_rank},"
+                f"ver={native_ver}"
+                if register_client
+                else ""
+            )
+            options = make_client_options_v2(
+                self._key_namespace,
+                members=members,
+                batch_concurrency=int(cfg.get("batch_concurrency", 0)),
+                mds_endpoints=mds,
+                mds_group=group,
+                mds_poll_ms=poll_ms,
+                register_client=register_client,
+                client_id=client_id,
+                client_info=client_info,
+                client_heartbeat_ms=10000,
+            )
+            self._h = self._lib.dfkv_open_v2(ctypes.byref(options))
             if not self._h:
-                raise RuntimeError("dfkv_open failed")
+                raise RuntimeError("dfkv_open_v2 failed")
             # (base, size) of host regions already handed to dfkv_register_memory,
             # so a buffer shared across multiple hybrid pools (DSA registers the
             # KV anchor plus several sidecar pools) is registered exactly once.
@@ -375,8 +472,7 @@ class DfkvHiCache(HiCacheStorage):
             self.transport_mode = (
                 mode_b.decode("utf-8", errors="replace") if mode_b else "unknown"
             )
-            if (_truthy(cfg.get("require_rdma")) or
-                    _truthy(os.environ.get("DFKV_REQUIRE_RDMA"))):
+            if _truthy(cfg.get("require_rdma")):
                 if self.transport_mode != "rdma":
                     self._lib.dfkv_close(self._h)
                     self._h = None
@@ -384,43 +480,13 @@ class DfkvHiCache(HiCacheStorage):
                         "dfkv requires RDMA zero-copy transport, "
                         f"got {self.transport_mode}"
                     )
-            if cfg.get("batch_concurrency"):
-                self._lib.dfkv_set_batch_concurrency(
-                    self._h, ctypes.c_uint64(int(cfg["batch_concurrency"])))
-            if mds:
-                group = cfg.get("mds_group", "default")
-                poll_ms = int(cfg.get("mds_poll_ms", 3000))
-                rc = self._lib.dfkv_start_mds_discovery(self._h, mds.encode(), group.encode(), poll_ms)
-                if rc != 0:
-                    raise RuntimeError("dfkv_start_mds_discovery failed")
-                # Register this SGLang HiCache connector as a cache consumer so
-                # `dfkvctl clients` can answer "who is using dfkv" (parity with the
-                # vLLM/LMCache connectors added in v1.15.0). Best-effort: a missing
-                # symbol (older libdfkv.so) or a registration failure is logged,
-                # never fatal — the data path is already up via discovery above.
-                # Default on; opt out with extra_config client_register=0 or
-                # DFKV_CLIENT_REGISTER=0. SGLang HiCache is a prefix L3 cache with
-                # no producer/consumer split, so no 'role' field (the CLI shows '-'
-                # for it, same as LMCache which has no role either).
-                if _truthy(cfg.get("client_register",
-                                    os.environ.get("DFKV_CLIENT_REGISTER", "1"))):
-                    cid = _tcfg.resolve_connector_id(cfg, tp_rank=self.tp_rank)
-                    info = (f"type={_tcfg.TYPE_HICACHE},model={self.model},"
-                            f"tp_size={self.tp_size},tp_rank={self.tp_rank},"
-                            f"ver={native_ver}")
-                    try:
-                        rc2 = self._lib.dfkv_start_client_registration(
-                            self._h, mds.encode(), group.encode(), cid.encode(),
-                            info.encode(), 10000)
-                        if rc2 != 0:
-                            raise RuntimeError(f"rc={rc2}")
-                    except AttributeError:
-                        pass  # older libdfkv.so without the symbol — skip silently
-                    except Exception as e:  # noqa: BLE001 — never block startup
-                        import warnings
-                        warnings.warn(
-                            f"dfkv client registration skipped (mds={mds!r}): {e}",
-                            stacklevel=2)
+            if (self._device_direct_requested
+                    and not self.supports_device_transfer()):
+                self._lib.dfkv_close(self._h)
+                self._h = None
+                raise RuntimeError(
+                    "SGLANG_HICACHE_L2_BYPASS=1 requires RDMA, device SG "
+                    "put/get support, a positive layer_num, and a valid SG width")
             self.mem_pool_host = None
             mode = f" transport={self.transport_mode}"
             r.result = ("ok mds-discovery" if mds else "ok static") + mode
@@ -473,13 +539,17 @@ class DfkvHiCache(HiCacheStorage):
             pass
 
     def register_memory(self, base: int, size: int) -> bool:
-        """Register a host memory region for RDMA zero-copy (registered once per
-        connection; buffers inside it then transfer with no per-op MR register).
-        No-op on TCP. Returns True on success."""
+        """Register one host/device MR, returning False on native rejection."""
         if not base or not size:
             return False
-        return self._lib.dfkv_register_memory(
-            self._h, ctypes.c_void_p(int(base)), ctypes.c_uint64(int(size))) == 0
+        rc = self._lib.dfkv_register_memory(
+            self._h, ctypes.c_void_p(int(base)), ctypes.c_uint64(int(size)))
+        if rc != 0:
+            _log.warning(
+                "dfkv_register_memory rejected base=%#x size=%d rc=%d",
+                int(base), int(size), rc)
+            return False
+        return True
 
     def _pool_backing_tensors(self, pool):
         """Yield a host pool's backing tensor(s) for RDMA registration.
@@ -550,197 +620,232 @@ class DfkvHiCache(HiCacheStorage):
         if not hasattr(self, "registered_pools"):
             self.registered_pools = {}
         name = str(host_pool_name)
-        self.registered_pools[name] = host_pool
-        # Per-page component count for this pool. A hybrid pool (Kimi-K3's mamba
-        # pool) stores one page across SEVERAL independent tensors -- temporal
-        # (SSM) state plus conv_0..conv_n -- and get_page_buffer_meta() emits one
-        # (ptr, size) pair per component in a stable order, so
-        #   len(ptrs) == npages * components.
-        # Derive the count from that return value rather than from
-        # len(get_hybrid_pool_buffer()): for a conv-only model
-        # (temporal_state_elem_size == 0) get_page_buffer_meta skips the temporal
-        # entry while get_hybrid_pool_buffer still reports it, so the two differ
-        # by one. The meta length is the only self-consistent source.
-        if not hasattr(self, "_pool_component_count"):
-            self._pool_component_count = {}
+        # Per-page component count for this pool. Multi-pool layouts are never
+        # guessed: a bad probe would otherwise collapse independent components
+        # into one replicated "all" object and serve corrupt/incomplete state.
+        if not hasattr(self, "_pool_component_names"):
+            self._pool_component_names = {}
+        if not hasattr(self, "_pool_replicated"):
+            self._pool_replicated = {}
         try:
-            _ps = int(getattr(host_pool, "page_size", 1) or 1)
+            page_size = int(getattr(host_pool, "page_size", 1))
+            if page_size <= 0:
+                raise RuntimeError("pool page_size must be positive")
             try:
                 import torch as _t
-                _idx = _t.arange(_ps, dtype=_t.int64)
-            except ImportError:  # torch-free env (unit tests): pools that accept
-                _idx = list(range(_ps))  # a plain index sequence still probe fine
-            _meta = host_pool.get_page_buffer_meta(_idx)
-            _n = len(_meta[0]) if _meta and _meta[0] is not None else 1
-            self._pool_component_count[name] = max(1, int(_n))
-            _probe = "ok"
-        except Exception as _e:
-            self._pool_component_count[name] = 1
-            _probe = f"failed ({type(_e).__name__})"
-        # Report it: a silently-wrong component count degrades into "the pool is
-        # stored but incomplete", which upstream is indistinguishable from a miss.
-        try:
-            with access_log("pool_components",
-                            lambda: f"{self._alog_tag} {name}") as _r:
-                _r.result = f"components={self._pool_component_count[name]} ({_probe})"
-        except Exception:
-            pass
+                indices = _t.arange(page_size, dtype=_t.int64)
+            except ImportError:
+                indices = list(range(page_size))
+            meta = host_pool.get_page_buffer_meta(indices)
+            if (not isinstance(meta, (tuple, list)) or len(meta) != 2
+                    or meta[0] is None or meta[1] is None):
+                raise RuntimeError("pool component probe returned no layout")
+            ptrs, sizes = meta
+            count = len(ptrs)
+            if count == 0 or len(sizes) != count:
+                raise RuntimeError("pool component probe returned empty/mismatched layout")
+            if hasattr(host_pool, "conv_state_elem_sizes"):
+                names = [f"conv{i}" for i in range(
+                    len(getattr(host_pool, "conv_state_elem_sizes") or []))]
+                if int(getattr(host_pool, "temporal_state_elem_size", 0)) > 0:
+                    names.insert(0, "temporal")
+                replicated = False
+            elif hasattr(host_pool, "v_buffer"):
+                if count != 2:
+                    raise RuntimeError(
+                        f"K/V pool must expose exactly 2 components, got {count}")
+                names = ["k", "v"]
+                replicated = False
+            elif count == 1:
+                # The metadata API itself proves the legacy packed single-buffer
+                # layout. This is the only safe replicated fallback.
+                names = ["all"]
+                replicated = True
+            else:
+                raise RuntimeError(
+                    f"ambiguous {count}-component pool without layout metadata")
+            if len(names) != count:
+                raise RuntimeError(
+                    f"pool component metadata mismatch: {len(names)} != {count}")
+        except Exception as exc:
+            self.registered_pools.pop(name, None)
+            self._pool_component_names.pop(name, None)
+            self._pool_replicated.pop(name, None)
+            raise RuntimeError(
+                f"cannot discover physical layout for pool {name!r}") from exc
+
+        self._pool_component_names[name] = tuple(names)
+        self._pool_replicated[name] = replicated
+        self.registered_pools[name] = host_pool
+        with access_log("pool_components",
+                        lambda: f"{self._alog_tag} {name}") as result:
+            result.result = (
+                f"components={self._pool_component_names[name]} "
+                f"replicated={self._pool_replicated[name]} (ok)")
         with access_log("register_mem_host_pool_v2",
-                        lambda: f"{self._alog_tag} {name}") as r:
-            n = 0
+                        lambda: f"{self._alog_tag} {name}") as result:
             try:
-                n = self._register_pool_buffers(host_pool)
-            except Exception as e:
-                r.result = f"skip ({type(e).__name__})"
+                registered = self._register_pool_buffers(host_pool)
+            except Exception as exc:
+                result.result = f"skip ({type(exc).__name__})"
                 return
-            r.result = f"registered {n} region(s)" if n else "no backing buffer found"
+            result.result = (
+                f"registered {registered} region(s)"
+                if registered else "no backing buffer found")
 
     # --- L2-bypass (device-direct write) -------------------------------------
     def supports_device_transfer(self) -> bool:
-        """True iff this backend can RDMA a page straight from GPU KV slots to L3.
-
-        Requires the scatter-gather put AND get ABIs (dfkv_batch_put_sg /
-        dfkv_batch_get_auto_sg) plus a negotiated SG width big enough to hold a
-        page's per-layer device segments in ONE key (layer_num segments/key — the
-        GPU pool is layer-first, so a page's KV is scattered across layer_num
-        non-contiguous buffers). The get symbol is required too: increment 2 reads
-        device-direct-written pages back via SG GET, and a page written with no
-        matching reader is dead. Older libdfkv.so without the symbols, or an HCA
-        whose max_sge is too small, keep the stock host (D2H) path. Checked by the
-        SGLang controller's capability gate; never raises."""
+        """Return whether required device-direct transfer remains safe to use."""
+        if getattr(self, "_device_registration_failed", False):
+            return False
+        if self.transport_mode != "rdma":
+            return False
         if not (hasattr(self._lib, "dfkv_batch_put_sg")
                 and hasattr(self._lib, "dfkv_batch_get_auto_sg")
                 and hasattr(self._lib, "dfkv_max_sg_segs")):
             return False
-        layer_num = int(self.cfg.get("layer_num", 0))
-        if layer_num <= 0:
-            return False
         try:
+            layer_num = int(self.cfg.get("layer_num", 0))
             max_segs = int(self._lib.dfkv_max_sg_segs(self._h))
+        except (TypeError, ValueError, OverflowError):
+            return False
         except Exception:
+            return False
+        if layer_num <= 0:
             return False
         if max_segs < 1:
             return False
         if max_segs < layer_num:
-            # Pages split into ceil(layer_num/max_segs) "@sg{n}" sub-keys
-            # (_flatten_device) — same chunking the vLLM connector uses, so a
-            # narrow HCA costs extra keys per page, not the bypass itself.
             print(f"[dfkv] L2-bypass: max_sg_segs={max_segs} < layer_num="
                   f"{layer_num}; chunking each page into "
-                  f"{(layer_num + max_segs - 1) // max_segs} @sg sub-keys.",
+                  f"{(layer_num + max_segs - 1) // max_segs} scatter groups.",
                   file=sys.stderr, flush=True)
         return True
 
+    def _register_device_regions(self, regions, label: str) -> int:
+        """Register GPU regions, failing closed when bypass was requested."""
+        required = getattr(self, "_device_direct_requested", False)
+        try:
+            discovered = list(regions())
+            if required and not discovered:
+                raise RuntimeError("no device regions discovered")
+            registered = 0
+            for base, size in discovered:
+                region = (int(base), int(size))
+                if not region[0] or not region[1]:
+                    if required:
+                        raise RuntimeError(f"invalid device region {region!r}")
+                    continue
+                if region in self._registered_regions:
+                    continue
+                if not self.register_memory(*region):
+                    if required:
+                        raise RuntimeError(
+                            f"native MR registration rejected {region!r}")
+                    continue
+                self._registered_regions.add(region)
+                registered += 1
+            return registered
+        except Exception as exc:
+            if required:
+                self._device_registration_failed = True
+                raise RuntimeError(
+                    f"required {label} GPU MR registration failed") from exc
+            _log.warning(
+                "optional %s GPU MR registration skipped: %s",
+                label, exc)
+            return 0
+
     def register_mem_pool_device(self, mem_pool_device):
-        """Register the GPU KV pool's per-layer buffers for RDMA (GPUDirect MR;
-        dfkv_register_memory accepts device pointers — same call the vLLM connector
-        uses). Deduped against host regions already registered."""
-        self.mem_pool_device = mem_pool_device
+        """Register the primary GPU KV pool; bypass makes every MR required."""
         from sglang.srt.mem_cache.device_page_meta import device_pool_regions
 
         with access_log("register_mem_pool_device",
-                        lambda: f"{self._alog_tag}") as r:
-            n = 0
+                        lambda: f"{self._alog_tag}") as result:
             try:
-                for base, size in device_pool_regions(mem_pool_device):
-                    region = (base, size)
-                    if not base or not size or region in self._registered_regions:
-                        continue
-                    if self.register_memory(base, size):
-                        self._registered_regions.add(region)
-                        n += 1
-            except Exception as e:  # never fail setup over an optimization
-                r.result = f"skip ({type(e).__name__})"
-                return
-            r.result = (f"registered {n} device region(s)" if n
-                        else "no device buffer found")
+                registered = self._register_device_regions(
+                    lambda: device_pool_regions(mem_pool_device), "primary")
+            except Exception as exc:
+                result.result = f"failed ({type(exc).__name__})"
+                raise
+            self.mem_pool_device = mem_pool_device
+            result.result = (
+                f"registered {registered} device region(s)"
+                if registered else "no device buffer registered")
 
     def register_mem_pool_device_sidecar(self, name, device_pool):
-        """Task 4: register the DSA indexer sidecar's per-layer GPU buffers for
-        RDMA (GPUDirect MR), so the indexer RDMAs straight from/into its device
-        buffer instead of a host staging slot. `name` is the sidecar PoolName (e.g.
-        'indexer'); `device_pool` is the DeepSeekV4IndexerPool holding
-        index_k_with_scale_buffer. Deduped against regions already registered."""
-        if not hasattr(self, "_sidecar_device_pools"):
-            self._sidecar_device_pools = {}
-        key = str(name)
-        self._sidecar_device_pools[key] = device_pool
+        """Register a DSA sidecar GPU pool, strictly in requested bypass mode."""
         from sglang.srt.mem_cache.device_page_meta import sidecar_device_pool_regions
 
+        key = str(name)
         with access_log("register_mem_pool_device_sidecar",
-                        lambda: f"{self._alog_tag} {key}") as r:
-            n = 0
+                        lambda: f"{self._alog_tag} {key}") as result:
             try:
-                for base, size in sidecar_device_pool_regions(device_pool):
-                    region = (base, size)
-                    if not base or not size or region in self._registered_regions:
-                        continue
-                    if self.register_memory(base, size):
-                        self._registered_regions.add(region)
-                        n += 1
-            except Exception as e:  # never fail setup over an optimization
-                r.result = f"skip ({type(e).__name__})"
-                return
-            r.result = (f"registered {n} sidecar device region(s)" if n
-                        else "no sidecar device buffer found")
+                registered = self._register_device_regions(
+                    lambda: sidecar_device_pool_regions(device_pool), f"sidecar {key}")
+            except Exception as exc:
+                result.result = f"failed ({type(exc).__name__})"
+                raise
+            if not hasattr(self, "_sidecar_device_pools"):
+                self._sidecar_device_pools = {}
+            self._sidecar_device_pools[key] = device_pool
+            # The sidecar metadata API returns one logical object per page; its
+            # layers are SG segments, not independent pool components.
+            if not hasattr(self, "_pool_component_names"):
+                self._pool_component_names = {}
+            if not hasattr(self, "_pool_replicated"):
+                self._pool_replicated = {}
+            self._pool_component_names[key] = ("all",)
+            self._pool_replicated[key] = True
+            result.result = (
+                f"registered {registered} sidecar device region(s)"
+                if registered else "no sidecar device buffer registered")
 
     def register_mem_pool_device_draft(self, mem_pool_device_draft):
-        """Task 6: register the EAGLE draft model's GPU KV pool for RDMA so draft KV
-        pages RDMA straight from/into their GPU slots (device-direct draft L3),
-        mirroring register_mem_pool_device for the target pool. Deduped against
-        regions already registered."""
-        self.mem_pool_device_draft = mem_pool_device_draft
+        """Register the draft GPU KV pool, strictly in requested bypass mode."""
         from sglang.srt.mem_cache.device_page_meta import device_pool_regions
 
         with access_log("register_mem_pool_device_draft",
-                        lambda: f"{self._alog_tag}") as r:
-            n = 0
+                        lambda: f"{self._alog_tag}") as result:
             try:
-                for base, size in device_pool_regions(mem_pool_device_draft):
-                    region = (base, size)
-                    if not base or not size or region in self._registered_regions:
-                        continue
-                    if self.register_memory(base, size):
-                        self._registered_regions.add(region)
-                        n += 1
-            except Exception as e:  # never fail setup over an optimization
-                r.result = f"skip ({type(e).__name__})"
-                return
-            r.result = (f"registered {n} draft device region(s)" if n
-                        else "no draft device buffer found")
+                registered = self._register_device_regions(
+                    lambda: device_pool_regions(mem_pool_device_draft), "draft")
+            except Exception as exc:
+                result.result = f"failed ({type(exc).__name__})"
+                raise
+            self.mem_pool_device_draft = mem_pool_device_draft
+            result.result = (
+                f"registered {registered} draft device region(s)"
+                if registered else "no draft device buffer registered")
 
     def register_mem_pool_device_draft_sidecar(self, mem_pool_device_draft):
-        """DSA-draft extension of task 6: register the draft model's DSA indexer
-        sidecar (index_k_with_scale_buffer) GPU buffers for RDMA so the draft indexer
-        RDMAs device-direct alongside the draft main latent, keeping a DSA draft's KV
-        coherent (latent + indexer) on an L3 hit. The draft pool object IS the
-        DSATokenToKVPool (it carries both kv_buffer and index_k_with_scale_buffer), so
-        we register the same object as a sidecar device pool under a distinct name and
-        drive it through the shared _sidecar_device_set/get machinery (its own
-        `draft_indexer` key namespace, layer-first @sg chunking). Deduped against
-        regions already registered."""
-        if not hasattr(self, "_sidecar_device_pools"):
-            self._sidecar_device_pools = {}
-        self._draft_sidecar_name = "draft_indexer"
-        self._sidecar_device_pools[self._draft_sidecar_name] = mem_pool_device_draft
+        """Register the draft DSA indexer GPU pool in device-direct mode."""
         from sglang.srt.mem_cache.device_page_meta import sidecar_device_pool_regions
 
+        name = "draft_indexer"
         with access_log("register_mem_pool_device_draft_sidecar",
-                        lambda: f"{self._alog_tag}") as r:
-            n = 0
+                        lambda: f"{self._alog_tag}") as result:
             try:
-                for base, size in sidecar_device_pool_regions(mem_pool_device_draft):
-                    region = (base, size)
-                    if not base or not size or region in self._registered_regions:
-                        continue
-                    if self.register_memory(base, size):
-                        self._registered_regions.add(region)
-                        n += 1
-            except Exception as e:  # never fail setup over an optimization
-                r.result = f"skip ({type(e).__name__})"
-                return
-            r.result = (f"registered {n} draft indexer region(s)" if n
-                        else "no draft indexer buffer found")
+                registered = self._register_device_regions(
+                    lambda: sidecar_device_pool_regions(mem_pool_device_draft),
+                    "draft indexer")
+            except Exception as exc:
+                result.result = f"failed ({type(exc).__name__})"
+                raise
+            if not hasattr(self, "_sidecar_device_pools"):
+                self._sidecar_device_pools = {}
+            self._draft_sidecar_name = name
+            self._sidecar_device_pools[name] = mem_pool_device_draft
+            # Same API-proven one-object layout as the target indexer sidecar.
+            if not hasattr(self, "_pool_component_names"):
+                self._pool_component_names = {}
+            if not hasattr(self, "_pool_replicated"):
+                self._pool_replicated = {}
+            self._pool_component_names[name] = ("all",)
+            self._pool_replicated[name] = True
+            result.result = (
+                f"registered {registered} draft indexer region(s)"
+                if registered else "no draft indexer buffer registered")
 
     def _draft_sidecar_device_set(self, keys, device_indices):
         """Best-effort device-direct SG put of the DSA draft's indexer sidecar (the
@@ -769,34 +874,21 @@ class DfkvHiCache(HiCacheStorage):
         except Exception:
             return [False] * len(keys)
 
-    def set_members(self, members: str):
-        """Hot-swap cluster membership, e.g. 'n1=ip:12000,n2=ip:12000'."""
-        self._lib.dfkv_set_members(self._h, members.encode())
 
-    def refresh_members(self, seed: str) -> bool:
-        """Discover cluster membership from a seed node ('ip:port') and apply it.
-        Lets the cluster grow/shrink without restarting clients. Returns True on
-        success (seed reachable and returned a non-empty member list)."""
-        return self._lib.dfkv_refresh_members(self._h, seed.encode()) == 0
-
-    def start_mds_discovery(self, mds_endpoints: str, group: str = "default", poll_ms: int = 3000) -> bool:
-        """Start background MDS-based discovery. mds_endpoints: comma-separated 'ip:port' list.
-        Returns True on success."""
-        return self._lib.dfkv_start_mds_discovery(self._h, mds_endpoints.encode(), group.encode(), poll_ms) == 0
-
-    # --- key scheme: MLA single object (no tp_rank suffix); MHA two objects ---
-    # PP note: when pp_size > 1, every path appends _pp{pp_rank} so stages
-    # holding different layer-slices of KV do not collide on the same key.
-    # This applies to MLA too — PP splits by layer, the latent is NOT
-    # replicated across PP stages (only across TP). See __init__.
-    def _pp_suffix(self) -> str:
-        return f"_pp{self.pp_rank}" if self.enable_pp else ""
-
-    def _keys(self, page_hash: str) -> List[str]:
-        if self.is_mla:
-            return [f"{self.model}/{page_hash}_k{self._pp_suffix()}"]
-        base = f"{self.model}/{page_hash}_{self.tp_size}_{self.tp_rank}{self._pp_suffix()}"
-        return [base + "_k", base + "_v"]
+    # --- canonical pool-key schema -----------------------------------------
+    def _keys(self, page_hash: str | bytes) -> List[bytes]:
+        tp = -1 if self.is_mla else self.tp_rank
+        pp = self.pp_rank if self.enable_pp else 0
+        components = ["all"] if self.is_mla else ["k", "v"]
+        return [
+            pool_key(page_hash, pool="kv",
+                     tp_size=self.tp_size, tp_rank=tp,
+                     pcp_size=self.pcp_size, pcp_rank=self.pcp_rank,
+                     dcp_size=self.dcp_size, dcp_rank=self.dcp_rank,
+                     pp_size=self.pp_size if self.enable_pp else 1, pp_rank=pp,
+                     component=component)
+            for component in components
+        ]
 
     def _sub(self) -> int:
         return 1 if self.is_mla else 2
@@ -818,13 +910,14 @@ class DfkvHiCache(HiCacheStorage):
     def _batch_exist_flat(self, subkeys) -> List[bool]:
         if not subkeys:
             return []
-        kbuf = [s.encode() for s in subkeys]
-        karr = (ctypes.c_char_p * len(kbuf))(*kbuf)
-        out = (ctypes.c_int * len(kbuf))()
-        rc = self._lib.dfkv_batch_exist(self._h, karr, len(kbuf), out)
+        karr, klens, key_owners = make_key_array(subkeys)
+        out = (ctypes.c_int * len(subkeys))()
+        rc = self._lib.dfkv_batch_exist(
+            self._h, karr, klens, len(subkeys), out)
         if rc != 0:
-            return [False] * len(kbuf)
-        return [out[i] == 1 for i in range(len(kbuf))]
+            return [False] * len(subkeys)
+        del key_owners
+        return [out[i] == 1 for i in range(len(subkeys))]
 
     def _note_logical_anchor_once(self):
         """One-time notice that the primary KV pool is a logical anchor.
@@ -857,18 +950,20 @@ class DfkvHiCache(HiCacheStorage):
         pool holds no KV buffer, so there is nothing to zero-copy — but SGLang's
         v2 existence check still gates the hit prefix on the primary "kv" keys,
         exactly as its reference backend does by writing an empty get_data_page().
-        The marker carries the connector's geometry header (so a cross-geometry
-        reader still misses); the matching read (batch_get_v1) is a no-op. Returns
-        a per-page success list (a page succeeds iff all its sub-object markers
-        were written)."""
+        Namespace and object-key identity isolate incompatible writers; the
+        matching read (batch_get_v1) is a no-op. Returns a per-page success list
+        (a page succeeds iff all its sub-object markers were written)."""
         sub = self._sub()
         sks = [sk for k in keys for sk in self._keys(k)]
         if not sks:
             return []
-        karr, parr, sarr, out, _ = _arrays(sks, [_MARKER_PTR] * len(sks),
-                                           [0] * len(sks))
-        self._lib.dfkv_batch_put(self._h, karr, parr, sarr, len(sks), out)
-        return self._fold([out[i] == 1 for i in range(len(sks))], len(keys), sub)
+        karr, klens, parr, sarr, out, key_owners = _arrays(
+            sks, [_MARKER_PTR] * len(sks), [0] * len(sks))
+        self._lib.dfkv_batch_put(
+            self._h, karr, klens, parr, sarr, len(sks), out)
+        del key_owners
+        return self._fold(
+            [out[i] == 1 for i in range(len(sks))], len(keys), sub)
 
     # --- zero-copy v1 batch path (the one the controller calls) ---
     def batch_set_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
@@ -928,19 +1023,8 @@ class DfkvHiCache(HiCacheStorage):
             self._sg_width_cache = w
         return w
 
-    def _sg_group_key(self, sk: str, ci: int) -> str:
-        """Chunk sub-key for SG group ci. The grouping WIDTH is part of a key's
-        identity: the same "@sg1" under different widths carries different
-        consecutive-layer spans, and a variable-size GET whose total cap happens
-        to fit would scatter the WRONG bytes with no error signal. Non-default
-        widths therefore get their own namespace ("@sgw{W}.{n}"); the default
-        width keeps the historical "@sg{n}" so existing cached data stays
-        reachable across this upgrade. Same policy (and constant) as the vLLM
-        connector's _sg_group_key/SG_MAX_SEGS."""
-        w = self._sg_width()
-        if w == SG_DEFAULT_WIDTH:
-            return f"{sk}@sg{ci}"
-        return f"{sk}@sgw{w}.{ci}"
+    def _sg_group_key(self, sk: bytes, ci: int) -> bytes:
+        return sg_key(sk, self._sg_width(), ci)
 
     def _flatten_device(self, keys, seg_ptrs, seg_sizes, keys_fn=None, sub=None):
         """Expand per-page keys into per-sub-object (k[/v]) sub-keys, pairing each
@@ -949,19 +1033,18 @@ class DfkvHiCache(HiCacheStorage):
 
         A page's layer_num segments can exceed the HCA's per-key SG budget
         (max_sge-1, e.g. 29 on ConnectX < 36/61 layers), so each sub-object is
-        chunked into "@sg{n}" sub-keys of <= _sg_width() consecutive layers —
-        the same scheme (and key suffix) the vLLM connector uses. Write and read
-        derive the identical deterministic split from (layer count, width), so
-        the layer-major bytes reassemble exactly. Chunk count is uniform across
-        pages, so _fold()'s per-page stride is sub * nchunks. The WIDTH is part
-        of a key's identity: non-default widths are namespaced "@sgw{W}.{n}"
-        (see _sg_group_key), so clients that negotiated different widths miss
-        (cold) instead of reading mis-split bytes.
+        chunked into binary SG-coordinate keys of at most _sg_width()
+        consecutive layers. Write and read derive the identical deterministic
+        split from (layer count, width), so layer-major bytes reassemble exactly.
+        Chunk count is uniform across pages, so _fold()'s per-page stride is
+        sub * nchunks. Width is always part of key identity, so clients that
+        negotiate different widths miss (cold) instead of reading mis-split
+        bytes.
 
-        keys_fn/sub default to the main-KV key scheme (self._keys / self._sub); the
-        DSA indexer sidecar and the EAGLE draft pool pass their own key builder and
-        object count so they reuse the identical @sg chunking under a distinct
-        namespace (task 4: device-direct sidecar; task 6: device-direct draft)."""
+        keys_fn/sub default to the main-KV key scheme (self._keys / self._sub);
+        DSA indexer and EAGLE draft sidecars pass their own key builder and
+        object count while reusing the same SG chunking.
+        """
         keys_fn = keys_fn or self._keys
         sub = self._sub() if sub is None else sub
         assert len(seg_ptrs) == len(keys) * sub, (len(seg_ptrs), len(keys), sub)
@@ -986,7 +1069,7 @@ class DfkvHiCache(HiCacheStorage):
         n = len(sks)
         if n == 0:
             return []
-        karr = (ctypes.c_char_p * n)(*[k.encode() for k in sks])
+        karr, klens, key_owners = make_key_array(sks)
         # Keep the per-key inner arrays alive for the whole call (mirrors the vLLM
         # connector's batch_put_sg): the outer arrays hold casts of these.
         inner_p = [(ctypes.c_void_p * len(p))(*[ctypes.c_void_p(int(x)) for x in p])
@@ -999,9 +1082,11 @@ class DfkvHiCache(HiCacheStorage):
             *[ctypes.cast(a, ctypes.POINTER(ctypes.c_uint64)) for a in inner_s])
         narr = (ctypes.c_int * n)(*[len(p) for p in seg_ptrs])
         out = (ctypes.c_int * n)()
-        rc = self._lib.dfkv_batch_put_sg(self._h, karr, parr, sarr, narr, n, out)
+        rc = self._lib.dfkv_batch_put_sg(
+            self._h, karr, klens, parr, sarr, narr, n, out)
         if rc != 0:
             return [False] * n
+        del key_owners
         return [out[i] == 1 for i in range(n)]
 
     def _put_sg_flat(self, sks, seg_ptrs, seg_sizes) -> List[bool]:
@@ -1086,7 +1171,7 @@ class DfkvHiCache(HiCacheStorage):
         n = len(sks)
         if n == 0:
             return [], []
-        karr = (ctypes.c_char_p * n)(*[k.encode() for k in sks])
+        karr, klens, key_owners = make_key_array(sks)
         # Keep the per-key inner arrays alive for the whole call (the outer arrays
         # hold casts of these) — same lifetime discipline as _batch_put_sg.
         inner_p = [(ctypes.c_void_p * len(p))(*[ctypes.c_void_p(int(x)) for x in p])
@@ -1101,9 +1186,10 @@ class DfkvHiCache(HiCacheStorage):
         out_hit = (ctypes.c_int * n)()
         out_len = (ctypes.c_uint64 * n)()
         rc = self._lib.dfkv_batch_get_auto_sg(
-            self._h, karr, parr, carr, narr, n, out_hit, out_len)
+            self._h, karr, klens, parr, carr, narr, n, out_hit, out_len)
         if rc != 0:
             return [0] * n, [0] * n
+        del key_owners
         return [out_hit[i] for i in range(n)], [int(out_len[i]) for i in range(n)]
 
     def batch_get_v1_device(self, keys, device_indices, extra_info=None) -> List[bool]:
@@ -1175,11 +1261,14 @@ class DfkvHiCache(HiCacheStorage):
                 return [True] * n
             ptrs, sizes = meta
             sub, sks, sp, ss = self._flatten(keys, ptrs, sizes)
-            karr, parr, sarr, out, _kb = _arrays(sks, sp, ss)
+            karr, klens, parr, sarr, out, key_owners = _arrays(sks, sp, ss)
             t0 = time.perf_counter()
-            self._lib.dfkv_batch_get(self._h, karr, parr, sarr, len(sks), out)
+            self._lib.dfkv_batch_get(
+                self._h, karr, klens, parr, sarr, len(sks), out)
             dur = time.perf_counter() - t0
-            res = self._fold([out[i] == 1 for i in range(len(sks))], n, sub)
+            del key_owners
+            res = self._fold(
+                [out[i] == 1 for i in range(len(sks))], n, sub)
             r.result = f"hits={sum(res)}/{n}"
             if _sp:
                 _sp.hits = sum(res); _sp.bytes = sum(ss)
@@ -1192,12 +1281,10 @@ class DfkvHiCache(HiCacheStorage):
         with _tracing.span("batch_exists", total) as _sp, \
                 access_log("batch_exists", lambda: f"{self._alog_tag} {total} keys") as r:
             # longest contiguous prefix of pages whose every sub-object exists.
-            # Device-direct (L2-bypass) writes store "@sg{n}"/"@sgw{W}.{n}" chunk
-            # sub-keys, so existence is probed on group 0 via _sg_group_key() —
-            # the bare sub-key never matches a chunked store, and a *different*
-            # negotiated width lands in a different namespace (miss, not corrupt).
-            # A bypass instance only ever writes chunked keys (model_hash-
-            # isolated), so one probe form suffices per mode.
+            # Device-direct writes use explicit binary SG coordinates, so
+            # existence probes group 0. The bare object key
+            # cannot match a chunked store; a different negotiated width is a
+            # cold miss rather than a corrupt read. One probe form suffices.
             sub = self._sub()
             if getattr(self, "mem_pool_device", None) is not None:
                 sks = [self._sg_group_key(sk, 0) for k in keys for sk in self._keys(k)]
@@ -1216,38 +1303,41 @@ class DfkvHiCache(HiCacheStorage):
             return n
 
     # --- v2 pool-aware interface (multi-pool models: Mamba/SWA/DeepSeek-V4) ---
-    def _pool_components(self, pool_name: str) -> int:
-        """Per-page component count for a pool (probed at registration; 1 if unknown)."""
-        return int(getattr(self, "_pool_component_count", {}).get(pool_name, 1) or 1)
+    def _pool_components(self, pool_name: str) -> tuple[str, ...]:
+        """Return a registered, positively discovered physical pool layout."""
+        layouts = getattr(self, "_pool_component_names", {})
+        if pool_name not in layouts:
+            raise RuntimeError(f"pool {pool_name!r} has no discovered layout")
+        return tuple(layouts[pool_name])
 
-    def _pool_keys(self, pool_name: str, page_hash: str) -> List[str]:
-        # primary KV pool keeps the MLA/MHA split; auxiliary pools are single-object
-        # UNLESS the host pool reports several per-page components (hybrid mamba:
-        # temporal + conv), in which case each component needs its own sub-key.
-        # Both carry the PP suffix for the same layer-slice reason as _keys().
-        pps = self._pp_suffix()
+    def _pool_is_replicated(self, pool_name: str) -> bool:
+        layouts = getattr(self, "_pool_replicated", {})
+        if pool_name not in layouts:
+            raise RuntimeError(f"pool {pool_name!r} has no discovered layout")
+        return bool(layouts[pool_name])
+
+    def _pool_keys(
+        self, pool_name: str | bytes, page_hash: str | bytes,
+    ) -> List[bytes]:
         if pool_name in ("kv", "__default__"):
             return self._keys(page_hash)
-        comps = self._pool_components(pool_name)
-        if comps > 1:
-            # A multi-component auxiliary pool is RANK-SHARDED (mamba/KDA state),
-            # so the key MUST carry tp_size/tp_rank -- otherwise every TP rank
-            # writes the same key and they clobber each other. (The replicated
-            # primary MLA latent does not need it; _keys()'s MHA branch already
-            # carries tp_size_tp_rank for the same reason.)
-            base = f"{self.model}/{page_hash}_{pool_name}_{self.tp_size}_{self.tp_rank}{pps}"
-            # Order mirrors get_page_buffer_meta: temporal first, then conv_0..conv_n.
-            return [f"{base}_c{j}" for j in range(comps)]
-        base = f"{self.model}/{page_hash}_{pool_name}{pps}"
-        return [base + "_k"] if self.is_mla else [base + "_k", base + "_v"]
+        components = self._pool_components(pool_name)
+        pp = self.pp_rank if self.enable_pp else 0
+        tp = -1 if self._pool_is_replicated(pool_name) else self.tp_rank
+        return [
+            pool_key(page_hash, pool=pool_name,
+                     tp_size=self.tp_size, tp_rank=tp,
+                     pcp_size=self.pcp_size, pcp_rank=self.pcp_rank,
+                     dcp_size=self.dcp_size, dcp_rank=self.dcp_rank,
+                     pp_size=self.pp_size if self.enable_pp else 1, pp_rank=pp,
+                     component=component)
+            for component in components
+        ]
 
     def _pool_sub(self, pool_name: str) -> int:
         if pool_name in ("kv", "__default__"):
             return self._sub()
-        comps = self._pool_components(pool_name)
-        if comps > 1:
-            return comps
-        return 1 if self.is_mla else 2
+        return len(self._pool_components(pool_name))
 
     def _put_flat(self, sks, sp, ss) -> List[bool]:
         """batch_put with the phase-9 exist gate (sub-objects already in L3
@@ -1274,11 +1364,12 @@ class DfkvHiCache(HiCacheStorage):
                 break
             if attempt:
                 time.sleep(0.01)  # let the write burst drain first
-            karr, parr, sarr, out, _kb = _arrays(
+            karr, klens, parr, sarr, out, key_owners = _arrays(
                 [sks[i] for i in todo], [sp[i] for i in todo],
                 [ss[i] for i in todo])
-            self._lib.dfkv_batch_put(self._h, karr, parr, sarr,
-                                     len(todo), out)
+            self._lib.dfkv_batch_put(
+                self._h, karr, klens, parr, sarr, len(todo), out)
+            del key_owners
             failed = []
             for m, i in enumerate(todo):
                 present[i] = out[m] == 1
@@ -1296,25 +1387,11 @@ class DfkvHiCache(HiCacheStorage):
         for tr in transfers:
             name = str(tr.name)
             keys = tr.keys or []
-            # MLA backup_skip: only tp_rank 0 writes *replicated* pools.
-            # This is valid for the primary MLA KV pool and for single-component
-            # sidecars (e.g. the DSA indexer), which every TP rank holds an
-            # identical copy of -- but NOT for a rank-sharded sidecar such as
-            # Kimi-K3's mamba/KDA state, where each rank owns different bytes.
-            # SGLang's _page_backup deliberately forwards ONLY the MAMBA transfer
-            # on follower ranks for exactly this reason:
-            #   "On follower ranks, only the rank-sharded Mamba/KDA pool is owned
-            #    by the rank and must be written here."
-            # Skipping it there means 15 of 16 ranks never persist their KDA state,
-            # so a page restored from L3 carries wrong recurrent state and the model
-            # silently produces different output (measured: rank0 spent 5411 us per
-            # mamba write, ranks 1-15 spent 4 us -- a 1353x gap, i.e. no transfer).
-            # The discriminator is _pool_components: multi-component pools are
-            # exactly the ones _pool_keys shards per rank (keys carry
-            # tp_size/tp_rank), so "skip on follower" and "keys collide across
-            # ranks" stay in lockstep by construction.
+            # Only rank 0 writes replicated pools. Sharded pools are inferred
+            # from their physical host layout at registration (MHA K/V or
+            # recurrent temporal/conv state), not from model names.
             if (putting and self.is_mla and self.tp_rank != 0
-                    and self._pool_components(name) == 1):
+                    and self._pool_is_replicated(name)):
                 results[name] = [True] * len(keys)
                 continue
             pool = self.registered_pools[name]
@@ -1329,8 +1406,10 @@ class DfkvHiCache(HiCacheStorage):
         if sks and putting:
             flat = self._put_flat(sks, sp, ss)
         elif sks:
-            karr, parr, sarr, out, _ = _arrays(sks, sp, ss)
-            self._lib.dfkv_batch_get(self._h, karr, parr, sarr, len(sks), out)
+            karr, klens, parr, sarr, out, key_owners = _arrays(sks, sp, ss)
+            self._lib.dfkv_batch_get(
+                self._h, karr, klens, parr, sarr, len(sks), out)
+            del key_owners
             flat = [out[i] == 1 for i in range(len(sks))]
         else:
             flat = []
@@ -1408,15 +1487,7 @@ class DfkvHiCache(HiCacheStorage):
         return self._fold(flat, n, sub), nbytes, dur
 
     def _log_write_keys(self, sks, flat, nmain):
-        """Print the FIRST key actually WRITTEN, throttled to one line/30s.
-
-        Completes the write/exist/read key triangle. Measured 2026-07-25 on one
-        run: 75.0% of pages write OK (47615/63528) yet device reads hit
-        0.0% (0/20746) and exist mostly reports 0/N. Pages that are written but
-        unreadable point at the key, not at capacity — and the write side was the
-        one leg of the triangle never printed. If this first_key does not share
-        the hash space of _log_exist_probe / _log_read_reject, the write path and
-        the exist/read path are hashing the same tokens differently."""
+        """Log deterministic digests for the first and last written keys."""
         if not sks:
             return
         now = time.monotonic()
@@ -1426,7 +1497,7 @@ class DfkvHiCache(HiCacheStorage):
         ok = sum(1 for i in range(nmain) if flat[i])
         _log.warning(
             "dfkv write keys: ok=%d/%d first_key=%s last_key=%s",
-            ok, nmain, sks[0], sks[nmain - 1])
+            ok, nmain, _key_label(sks[0]), _key_label(sks[nmain - 1]))
 
     def _kv_device_get(self, keys, device_indices):
         """Core of batch_get_v1_device (device-direct SG get) without the tracing /
@@ -1450,17 +1521,7 @@ class DfkvHiCache(HiCacheStorage):
         return self._fold(flat_ok, n, sub), sum(lens), dur
 
     def _log_exist_probe(self, sks, n, total):
-        """Print the FIRST key exist actually probed, throttled to one line/30s.
-
-        Pairs with _log_read_reject to settle a sharp contradiction seen on
-        2026-07-25: exist reports prefix=1562/1562 (every candidate page present)
-        while the device GET that follows reports 4686/4686 sub-objects MISS —
-        and 4686 = 1562 x 3 chunks, so the two are talking about the same NUMBER
-        of pages. Same key scheme on both sides (`{model}/{hash}_k@sg0`), so if
-        the strings still differ it can only be the page_hash itself: exist hashes
-        the candidate token sequence, while the GET uses the marker nodes'
-        hash_value. Printing both first-keys makes that comparison direct instead
-        of inferential."""
+        """Log deterministic digests for the first and last existence probes."""
         if not sks:
             return
         now = time.monotonic()
@@ -1469,61 +1530,53 @@ class DfkvHiCache(HiCacheStorage):
         self._exist_probe_logged = now
         _log.warning(
             "dfkv exist probe: prefix=%d/%d first_key=%s last_key=%s",
-            n, total, sks[0], sks[-1])
+            n, total, _key_label(sks[0]), _key_label(sks[-1]))
 
     def _log_read_reject(self, sks, hits, lens, want, flat_ok, nmain):
-        """Say WHY a device read rejected sub-objects, throttled to one line/30s.
-
-        Motivation (2026-07-25): SGLang's promotion drops whole loads with
-        `0 pages verified across ranks` 24-56 times per hot-L3 round even on a
-        clean baseline — exist reports the pages ARE in L3, yet the read is not
-        accepted. Without this line the two candidate causes are indistinguishable
-        from the outside:
-
-          * MISS  (hits[i] != 1)        — the sub-key is not there at all, i.e. an
-                                          exist/read key-scheme disagreement;
-          * SHORT (lens[i] < want[i])   — it is there but returned fewer bytes than
-                                          the destination expects, i.e. a layout /
-                                          @sg-chunking / capacity disagreement.
-
-        Reports the first offender's numbers so `want` vs `got` can be compared
-        directly against the page geometry."""
+        """Log why a device read rejected sub-objects, at most once per 30s."""
         now = time.monotonic()
         if now - getattr(self, "_read_reject_logged", 0.0) < 30.0:
             return
         self._read_reject_logged = now
-        # 整批全 MISS 时把 C 客户端快照一并 dump：服务端侧显示 cache_miss=0、
-        # cache_hit 几乎不涨(失败轮 +196/+3515 vs 成功轮 +799,744)，说明请求很可能
-        # 根本没到服务端。ops served / IO 错误 / peer 健康只存在于 C 客户端快照里，
-        # Prometheus 侧并未导出这些计数器，事后无从追溯 —— 必须当场抓。
         if all(h != 1 for h in hits[:nmain]):
             try:
                 snap = _read_snapshot(self._lib, self._h)
-                # 过滤掉 # HELP / # TYPE 注释行 —— 第一版没排除它们，12 个名额被注释
-                # 占满，按 peer 的错误分布和 busy_suppressed 全被截掉了。
-                keep = [ln for ln in snap.splitlines()
-                        if not ln.startswith("#")
-                        and any(k in ln for k in ("ops_served", "io_error", "unhealthy",
-                                                  "peer_", "ring_", "mds_", "busy_suppressed",
-                                                  "health_checks"))]
-                _log.warning("dfkv client snapshot @full-miss: %s",
-                             " | ".join(keep[:16]) or "(快照无相关行)")
-            except Exception as e:
-                _log.warning("dfkv client snapshot @full-miss 读取失败: %r", e)
+                keep = [
+                    line for line in snap.splitlines()
+                    if not line.startswith("#")
+                    and any(
+                        token in line
+                        for token in (
+                            "ops_served", "io_error", "unhealthy", "peer_",
+                            "ring_", "mds_", "busy_suppressed",
+                        )
+                    )
+                ]
+                _log.warning(
+                    "dfkv client snapshot @full-miss:\n%s",
+                    "\n".join(keep[:12]) or "(empty)",
+                )
+            except Exception as exc:
+                _log.warning(
+                    "dfkv client snapshot @full-miss failed: %r", exc)
         miss = sum(1 for i in range(nmain) if hits[i] != 1)
-        short = sum(1 for i in range(nmain)
-                    if hits[i] == 1 and lens[i] < want[i])
+        short = sum(
+            1 for i in range(nmain)
+            if hits[i] == 1 and lens[i] < want[i]
+        )
         first = next(i for i in range(nmain) if not flat_ok[i])
         _log.warning(
-            "dfkv device read rejected %d/%d sub-objects (%d MISS, %d SHORT); "
-            "first offender: key=%s hit=%s got=%d want=%d",
+            "dfkv device read rejected %d/%d sub-objects "
+            "(%d MISS, %d SHORT); first offender: "
+            "key=%s hit=%s got=%d want=%d",
             nmain - sum(flat_ok), nmain, miss, short,
-            sks[first], hits[first], lens[first], want[first])
+            _key_label(sks[first]), hits[first], lens[first], want[first],
+        )
 
     # --- task 4: DSA indexer sidecar device-direct (no host staging) -----------
     def _sidecar_device_set(self, name, keys, device_indices):
-        """Device-direct SG put of the DSA indexer sidecar `name` (its own key
-        namespace, _pool_keys(name, hash), @sg-chunked like the main KV). The
+        """Device-direct SG put of the DSA indexer sidecar ``name`` using its
+        own binary pool/SG identity. The
         indexer is layer-first & PAGE-indexed; get_device_sidecar_page_buffer_meta
         yields its per-layer page-row segments from the registered sidecar device
         pool. Returns (per_page_bools, nbytes, seconds)."""
@@ -1566,17 +1619,21 @@ class DfkvHiCache(HiCacheStorage):
         return self._fold(flat_ok, n, stride), sum(lens), dur
 
     # --- task 6: EAGLE draft KV device-direct (best-effort L3) ------------------
-    def _draft_keys(self, page_hash: str, sub: int) -> List[str]:
-        """Draft-model KV sub-keys, a distinct namespace from the target pages
-        (`.draft` infix, PP-aware). The draft model may be MLA or MHA INDEPENDENT of
-        the target, so the key scheme follows the DRAFT pool shape (sub), mirroring
-        _keys: MLA draft (sub=1) is TP-replicated -> no tp_rank suffix; MHA draft
-        (sub=2) is TP-sharded -> tp_size/tp_rank suffix so ranks do not collide."""
-        pps = self._pp_suffix()
-        if sub == 1:
-            return [f"{self.model}/{page_hash}.draft_k{pps}"]
-        base = f"{self.model}/{page_hash}.draft_{self.tp_size}_{self.tp_rank}{pps}"
-        return [base + "_k", base + "_v"]
+    def _draft_keys(
+        self, page_hash: str | bytes, sub: int,
+    ) -> List[bytes]:
+        pp = self.pp_rank if self.enable_pp else 0
+        tp = -1 if sub == 1 else self.tp_rank
+        components = ["all"] if sub == 1 else ["k", "v"]
+        return [
+            pool_key(page_hash, pool="draft",
+                     tp_size=self.tp_size, tp_rank=tp,
+                     pcp_size=self.pcp_size, pcp_rank=self.pcp_rank,
+                     dcp_size=self.dcp_size, dcp_rank=self.dcp_rank,
+                     pp_size=self.pp_size if self.enable_pp else 1, pp_rank=pp,
+                     component=component)
+            for component in components
+        ]
 
     def batch_set_v1_device_draft(self, keys, device_indices, extra_info=None) -> List[bool]:
         """Best-effort device-direct SG put of the EAGLE draft KV pages (task 6):
@@ -1651,13 +1708,10 @@ class DfkvHiCache(HiCacheStorage):
         sidecar transfer still rides the stock host v2 path. One logical op so the
         split value is written atomically-per-page.
 
-        VALUE LAYOUT (explicit): the main KV is stored under the v1-style keys
-        (_keys(hash) -> "model/hash_k"), byte-for-byte the same key scheme
-        batch_set_v1_device / batch_exists use — so an unchanged batch_exists_v2
-        anchors the hit prefix on the SAME "kv" keys with no change. The sidecar
-        rides its own keys (_pool_keys('indexer', hash) -> "model/hash_indexer_k",
-        @sg-chunked when device-direct). The two components never collide; the
-        composite is split honestly across two key namespaces, isolated by model_hash.
+        VALUE LAYOUT: the main KV uses the canonical ``pool=kv`` object keys
+        shared by batch_set_v1_device and batch_exists_v2. The indexer uses
+        ``pool=indexer`` keys. Each physical component has its own coordinate,
+        and every key is scoped by the binary model namespace passed at open.
 
         METRICS: the anchor device SG put reports on_set (a v1-device physical
         transfer, identical attribution to stock DSA whose anchor rides batch_set_v1),
@@ -1773,10 +1827,9 @@ class DfkvHiCache(HiCacheStorage):
                     break
                 name = str(tr.name)
                 sub = self._pool_sub(name)
-                # Device-direct sidecars (task 4) store "@sg{n}"/"@sgw{W}.{n}"
-                # chunk sub-keys, so probe group 0 via _sg_group_key() — the
-                # same scheme batch_exists uses for the main KV.
-                # A host sidecar stores the bare sub-key.
+                # Device-direct sidecars store explicit scatter-group keys, so
+                # probe group 0 just as batch_exists does for the main KV. A
+                # host sidecar stores the bare pool key.
                 dev_side = name in getattr(self, "_sidecar_device_pools", {})
                 sks = [self._sg_group_key(sk, 0) if dev_side else sk
                        for k in keys[:kv_pages]
@@ -1818,57 +1871,73 @@ class DfkvHiCache(HiCacheStorage):
 
     # --- required abstract methods (non zero-copy / introspection) ---
     def exists(self, key) -> bool:
-        with access_log("exists", lambda: f"{self._alog_tag} {key}") as r:
-            found = all(self._lib.dfkv_exist(self._h, sk.encode()) == 1
-                        for sk in self._keys(key))
+        subkeys = self._keys(key)
+        with access_log(
+            "exists",
+            lambda: f"{self._alog_tag} {_key_label(subkeys[0])}",
+        ) as r:
+            found = True
+            for subkey in subkeys:
+                key_ptr, key_owner = make_key_buffer(subkey)
+                found = self._lib.dfkv_exist(
+                    self._h, key_ptr,
+                    ctypes.c_uint64(len(subkey))) == 1
+                del key_owner
+                if not found:
+                    break
             r.result = "found" if found else "not_found"
             return found
 
     def set(self, key, value=None, target_location=None, target_sizes=None) -> bool:
         nbytes = 0
-        with access_log("set",
-                        lambda: f"{self._alog_tag} {key}, {_fmt_bytes(nbytes)}") as r:
+        sk = self._keys(key)[0]
+        with access_log(
+            "set",
+            lambda: (
+                f"{self._alog_tag} {_key_label(sk)}, {_fmt_bytes(nbytes)}"),
+        ) as r:
             if value is None:
                 r.result = "fail none"
                 return False
-            sk = self._keys(key)[0]
-            # SGLang's L3 backup path (_generic_page_set -> batch_set) passes torch
-            # Tensors, not bytes. Take the raw tensor bytes via data_ptr (dtype-
-            # agnostic, works for fp8 which numpy can't represent). Tensor must stay
-            # alive across the call (local `t`).
+            key_ptr, key_owner = make_key_buffer(sk)
             if hasattr(value, "data_ptr"):
-                t = value.detach().cpu().contiguous()
-                nbytes = t.numel() * t.element_size()
-                ok = self._lib.dfkv_put(self._h, sk.encode(),
-                                        ctypes.c_void_p(t.data_ptr()),
-                                        ctypes.c_uint64(nbytes)) == 0
+                tensor = value.detach().cpu().contiguous()
+                nbytes = tensor.numel() * tensor.element_size()
+                ok = self._lib.dfkv_put(
+                    self._h, key_ptr, ctypes.c_uint64(len(sk)),
+                    ctypes.c_void_p(tensor.data_ptr()),
+                    ctypes.c_uint64(nbytes)) == 0
             else:
-                mv = memoryview(value).cast("B")
-                nbytes = len(mv)
-                buf = (ctypes.c_char * nbytes).from_buffer_copy(mv)
-                ok = self._lib.dfkv_put(self._h, sk.encode(),
-                                        ctypes.cast(buf, ctypes.c_void_p),
-                                        ctypes.c_uint64(nbytes)) == 0
+                view = memoryview(value).cast("B")
+                nbytes = len(view)
+                buf = (ctypes.c_char * nbytes).from_buffer_copy(view)
+                ok = self._lib.dfkv_put(
+                    self._h, key_ptr, ctypes.c_uint64(len(sk)),
+                    ctypes.cast(buf, ctypes.c_void_p),
+                    ctypes.c_uint64(nbytes)) == 0
+            del key_owner
             r.result = "ok" if ok else "fail"
             return ok
 
     def get(self, key, target_location=None, target_sizes=None):
-        # Generic (non zero-copy) read: dfkv_get reads the page bytes straight
-        # into target_location's buffer (a host flat-page tensor). Symmetric with
-        # set() (whole page under _keys[0]). Returns target_location on hit, None
-        # on miss. SGLang's prod path uses batch_get_v1; this serves the generic
-        # path + direct/test callers.
+        """Read a generic host page using the exact binary object key."""
         nbytes = 0
-        with access_log("get",
-                        lambda: f"{self._alog_tag} {key}, {_fmt_bytes(nbytes)}") as r:
+        sk = self._keys(key)[0]
+        with access_log(
+            "get",
+            lambda: (
+                f"{self._alog_tag} {_key_label(sk)}, {_fmt_bytes(nbytes)}"),
+        ) as r:
             if target_location is None:
                 r.result = "miss no_target"
                 return None
-            sk = self._keys(key)[0]
             nbytes = target_location.numel() * target_location.element_size()
-            rc = self._lib.dfkv_get(self._h, sk.encode(),
-                                    ctypes.c_void_p(target_location.data_ptr()),
-                                    ctypes.c_uint64(nbytes))
+            key_ptr, key_owner = make_key_buffer(sk)
+            rc = self._lib.dfkv_get(
+                self._h, key_ptr, ctypes.c_uint64(len(sk)),
+                ctypes.c_void_p(target_location.data_ptr()),
+                ctypes.c_uint64(nbytes))
+            del key_owner
             r.result = "hit" if rc == 1 else "miss"
             return target_location if rc == 1 else None
 

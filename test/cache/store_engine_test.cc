@@ -1,15 +1,19 @@
-// StoreEngine wiring: DiskCacheGroup runs either the file (KVStore, default) or
-// slab (DiskSlabStore) backend, selected by Options.engine / DFKV_STORE_ENGINE.
-// The refactor must keep the file path a byte-for-byte drop-in and make slab a
-// working alternative; both must round-trip and route across disks identically.
+// StoreEngine wiring: DiskCacheGroup defaults to the production slab backend;
+// file-per-block KVStore remains an explicit diagnostic choice. Options.engine
+// overrides DFKV_STORE_ENGINE, which in turn overrides the slab default. Both
+// engines must round-trip and route across disks identically.
 #include "cache/disk_cache_group.h"
+#include "cache/ram_tier.h"
 #include "cache/kv_node_server.h"
 
 #include <gtest/gtest.h>
 
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
+#include <functional>
+#include <memory>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -33,7 +37,11 @@ class EngineTest : public ::testing::Test {
     for (const char* name :
          {"DFKV_STORE_ENGINE", "DFKV_DISK_HASH_WEIGHT", "DFKV_SLAB_WRITE",
           "DFKV_SLAB_GRANULARITY", "DFKV_SLAB_TABLE_SYNC_MS",
-          "DFKV_SLAB_RECLAIM_MS"})
+          "DFKV_SLAB_RECLAIM_MS", "DFKV_RAM_TIER",
+          "DFKV_RAM_TIER_BYTES", "DFKV_RAM_FLUSH_THREADS",
+          "DFKV_RAM_TIER_EXTENT_BYTES",
+          "DFKV_RAM_TIER_LARGE_RESERVE_BYTES", "DFKV_RAM_TIER_NUMA",
+          "DFKV_RAM_TIER_SHARDS"})
       ::unsetenv(name);
   }
   std::vector<std::string> Dirs(int n) {
@@ -72,6 +80,42 @@ void ExerciseGroup(DiskCacheGroup& g) {
   std::string miss;
   EXPECT_EQ(g.Range(BlockKey{9999, 0}, 0, 10, &miss), Status::kNotFound);
 }
+
+struct RangeAnswer {
+  Status status = Status::kInvalid;
+  std::string bytes;
+  size_t value_len = 0;
+  bool exact_bytes = true;
+};
+using RangeCall = std::function<RangeAnswer(uint64_t, uint64_t)>;
+
+void ExpectSharedRangeContract(const std::string& backend,
+                               const RangeCall& call) {
+  struct Example {
+    uint64_t offset;
+    uint64_t length;
+    Status status;
+    const char* bytes;
+  };
+  const Example examples[] = {
+      {3, 0, Status::kOk, "3456789"},
+      {10, 4, Status::kOk, ""},
+      {11, 4, Status::kInvalid, ""},
+      {3, 100, Status::kOk, "3456789"},
+  };
+  for (const auto& example : examples) {
+    const RangeAnswer answer = call(example.offset, example.length);
+    EXPECT_EQ(answer.status, example.status)
+        << backend << " offset=" << example.offset
+        << " length=" << example.length;
+    if (answer.status == Status::kOk) {
+      EXPECT_EQ(answer.bytes.size(), std::strlen(example.bytes)) << backend;
+      if (answer.exact_bytes)
+        EXPECT_EQ(answer.bytes, example.bytes) << backend;
+      EXPECT_EQ(answer.value_len, 10u) << backend;
+    }
+  }
+}
 }  // namespace
 
 TEST_F(EngineTest, FileEngineRoundTripsAcrossDisks) {
@@ -93,31 +137,143 @@ TEST_F(EngineTest, SlabEngineRoundTripsAcrossDisks) {
   EXPECT_GT(g.UsedBytes(), 0u);
 }
 
-TEST_F(EngineTest, DefaultIsFileEngine) {
-  // No Options.engine and no env -> file backend, which lays out blocks/ dirs.
+TEST_F(EngineTest, BackendRangeConformanceTable) {
+  const BlockKey key{0x1234, 0x5678, 0x9abc};
+  const std::string value = "0123456789";
+  std::vector<std::unique_ptr<DiskCacheGroup>> groups;
+  std::vector<std::pair<std::string, RangeCall>> table;
+
+  auto add_disk_backend = [&](const std::string& engine,
+                              const fs::path& path) {
+    fs::create_directories(path);
+    DiskCacheGroup::Options options;
+    options.cache_dirs = {path.string()};
+    options.capacity_bytes = 1ull << 30;
+    options.engine = engine;
+    auto group = std::make_unique<DiskCacheGroup>(options);
+    ASSERT_TRUE(group->Healthy()) << engine;
+    ASSERT_EQ(group->Cache(key, value.data(), value.size()), Status::kOk);
+    DiskCacheGroup* store = group.get();
+
+    table.push_back({engine + "/Range", [store, key](uint64_t off,
+                                                     uint64_t len) {
+      RangeAnswer answer;
+      answer.status =
+          store->Range(key, off, len, &answer.bytes, &answer.value_len);
+      return answer;
+    }});
+    table.push_back({engine + "/RangeInto",
+                     [store, key](uint64_t off, uint64_t len) {
+      RangeAnswer answer;
+      char buffer[32] = {};
+      size_t out_len = 0;
+      answer.status = store->RangeInto(key, off, len, buffer, sizeof(buffer),
+                                       &out_len, &answer.value_len);
+      if (answer.status == Status::kOk)
+        answer.bytes.assign(buffer, out_len);
+      return answer;
+    }});
+    table.push_back({engine + "/RangeDirect",
+                     [store, key](uint64_t off, uint64_t len) {
+      RangeAnswer answer;
+      void* allocation = nullptr;
+      if (::posix_memalign(&allocation, 4096, 8192) != 0)
+        return answer;
+      const char* data = nullptr;
+      size_t out_len = 0;
+      answer.status =
+          store->RangeDirect(key, off, len, static_cast<char*>(allocation),
+                             8192, &data, &out_len, &answer.value_len);
+      if (answer.status == Status::kOk && out_len != 0)
+        answer.bytes.assign(data, out_len);
+      std::free(allocation);
+      return answer;
+    }});
+    table.push_back({engine + "/RangeDirectPrep",
+                     [store, key](uint64_t off, uint64_t len) {
+      RangeAnswer answer;
+      ReadLease lease;
+      answer.status =
+          store->RangeDirectPrep(key, off, len, 8192, &lease);
+      if (answer.status == Status::kOk) {
+        answer.bytes.assign(lease.payload_len, '?');
+        answer.value_len = lease.value_len;
+        answer.exact_bytes = false;
+      }
+      return answer;
+    }});
+    groups.push_back(std::move(group));
+  };
+
+  add_disk_backend("file", base_ / "file");
+  add_disk_backend("slab", base_ / "slab");
+
+  RamTier::Options ram_options;
+  ram_options.bytes = 8ull << 20;
+  ram_options.large_reserve_bytes = 0;
+  auto ram = std::make_unique<RamTier>(
+      ram_options, [](const BlockKey&, char*, size_t, size_t) { return true; });
+  ASSERT_TRUE(ram->ok());
+  ASSERT_EQ(ram->PutCommitted(key, value.data(), value.size()), Status::kOk);
+  RamTier* ram_store = ram.get();
+  table.push_back({"ram/GetPrep", [ram_store, key](uint64_t off, uint64_t len) {
+    RangeAnswer answer;
+    RamTier::Hit hit;
+    if (ram_store->GetPrep(key, off, len, &hit)) {
+      answer.status = Status::kOk;
+      answer.bytes.assign(hit.ptr, hit.len);
+      answer.value_len = hit.value_len;
+    } else {
+      answer.status =
+          ram_store->Contains(key) ? Status::kInvalid : Status::kNotFound;
+    }
+    return answer;
+  }});
+
+  for (const auto& backend : table)
+    ExpectSharedRangeContract(backend.first, backend.second);
+}
+
+TEST_F(EngineTest, NoOptionOrEnvironmentDefaultsToSlab) {
   DiskCacheGroup::Options o;
   o.cache_dirs = Dirs(1);
   o.capacity_bytes = 1ull << 30;
   DiskCacheGroup g(o);
-  std::string v(64, 'f');
+  ASSERT_TRUE(g.Healthy()) << g.StartupError();
+  EXPECT_EQ(g.EngineName(), "slab");
+  std::string v(64, 's');
   ASSERT_EQ(g.Cache(BlockKey{7, 0}, v.data(), v.size()), Status::kOk);
-  // The file engine writes blocks/<bucket>/... ; the slab engine writes
-  // extents/ + slots.tbl. Presence of "blocks" proves the default is file.
+  EXPECT_TRUE(fs::exists(fs::path(o.cache_dirs[0]) / "slots.tbl"));
+  EXPECT_FALSE(fs::exists(fs::path(o.cache_dirs[0]) / "blocks"));
+}
+
+TEST_F(EngineTest, EnvironmentOverridesSlabDefaultWhenOptionEmpty) {
+  ::setenv("DFKV_STORE_ENGINE", "file", 1);
+  DiskCacheGroup::Options o;
+  o.cache_dirs = Dirs(1);
+  o.capacity_bytes = 1ull << 30;
+  DiskCacheGroup g(o);
+  ASSERT_TRUE(g.Healthy()) << g.StartupError();
+  EXPECT_EQ(g.EngineName(), "file");
+  std::string v(64, 'f');
+  ASSERT_EQ(g.Cache(BlockKey{8, 0}, v.data(), v.size()), Status::kOk);
   EXPECT_TRUE(fs::exists(fs::path(o.cache_dirs[0]) / "blocks"));
   EXPECT_FALSE(fs::exists(fs::path(o.cache_dirs[0]) / "slots.tbl"));
 }
 
-TEST_F(EngineTest, EnvSelectsSlabWhenOptionEmpty) {
+TEST_F(EngineTest, ExplicitFileOptionOverridesSlabEnvironment) {
   ::setenv("DFKV_STORE_ENGINE", "slab", 1);
   DiskCacheGroup::Options o;
   o.cache_dirs = Dirs(1);
   o.capacity_bytes = 1ull << 30;
-  // Options.engine empty -> read the env.
+  o.engine = "file";
   DiskCacheGroup g(o);
-  std::string v(64, 's');
-  ASSERT_EQ(g.Cache(BlockKey{8, 0}, v.data(), v.size()), Status::kOk);
-  EXPECT_TRUE(fs::exists(fs::path(o.cache_dirs[0]) / "slots.tbl"));  // slab layout
-  EXPECT_FALSE(fs::exists(fs::path(o.cache_dirs[0]) / "blocks"));
+  ASSERT_TRUE(g.Healthy()) << g.StartupError();
+  EXPECT_EQ(g.EngineName(), "file");
+  std::string v(64, 'f');
+  ASSERT_EQ(g.Cache(BlockKey{9, 0}, v.data(), v.size()), Status::kOk);
+  EXPECT_TRUE(fs::exists(fs::path(o.cache_dirs[0]) / "blocks"));
+  EXPECT_FALSE(fs::exists(fs::path(o.cache_dirs[0]) / "slots.tbl"));
 }
 
 TEST_F(EngineTest, InvalidEngineAndSlabConfigurationFailClosed) {
@@ -137,14 +293,23 @@ TEST_F(EngineTest, InvalidEngineAndSlabConfigurationFailClosed) {
             std::string::npos);
 }
 
-TEST_F(EngineTest, SlabCapacityMustResolveToWholeExtentsPerDisk) {
+TEST_F(EngineTest, InvalidDefaultSlabCapacityRefusesStartup) {
+  const auto dirs = Dirs(1);
   DiskCacheGroup::Options options;
-  options.cache_dirs = Dirs(1);
+  options.cache_dirs = dirs;
   options.capacity_bytes = (1ull << 30) + 1;
-  options.engine = "slab";
   DiskCacheGroup group(options);
+  EXPECT_EQ(group.EngineName(), "slab");
   EXPECT_FALSE(group.Healthy());
   EXPECT_NE(group.StartupError().find("multiple"), std::string::npos);
+  EXPECT_FALSE(fs::exists(fs::path(dirs[0]) / "blocks"));
+
+  KvNodeServer server(dirs[0], options.capacity_bytes);
+  EXPECT_EQ(server.engine_name(), "slab");
+  EXPECT_FALSE(server.Healthy());
+  EXPECT_EQ(server.Start(0), Status::kIOError);
+  EXPECT_EQ(server.port(), 0);
+  EXPECT_FALSE(fs::exists(fs::path(dirs[0]) / "blocks"));
 }
 
 TEST_F(EngineTest, BackendSwitchRequiresExplicitMigration) {
@@ -191,6 +356,21 @@ TEST_F(EngineTest, NodeRefusesToListenWhenDiskStoreIsUnhealthy) {
   const auto dirs = Dirs(1);
   ::setenv("DFKV_STORE_ENGINE", "not-an-engine", 1);
   KvNodeServer server(dirs[0], 1ull << 30);
+  EXPECT_EQ(server.Start(0), Status::kIOError);
+  EXPECT_EQ(server.port(), 0);
+}
+
+TEST_F(EngineTest, RequestedRamTierFailureRefusesDiskOnlyStartup) {
+  const auto dirs = Dirs(1);
+  ::setenv("DFKV_STORE_ENGINE", "file", 1);
+  ::setenv("DFKV_RAM_TIER", "1", 1);
+  // Larger than the userspace virtual address range: posix_memalign must fail
+  // before any page touch, independent of host free memory or overcommit.
+  ::setenv("DFKV_RAM_TIER_BYTES", "9223372036854775808", 1);
+  ::setenv("DFKV_RAM_TIER_NUMA", "off", 1);
+  KvNodeServer server(dirs[0], 1ull << 30);
+  EXPECT_FALSE(server.ram_enabled());
+  EXPECT_FALSE(server.Healthy());
   EXPECT_EQ(server.Start(0), Status::kIOError);
   EXPECT_EQ(server.port(), 0);
 }

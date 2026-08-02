@@ -1,7 +1,6 @@
 /* Client transport selection: RDMA when built with DFKV_WITH_RDMA, requested
- * (env DFKV_RDMA=1), and an RDMA device is usable; otherwise TCP. By default it
- * falls back to TCP; with DFKV_REQUIRE_RDMA=1 it returns nullptr instead of
- * silently falling back. */
+ * (DFKV_RDMA=1), and an RDMA device is usable; TCP when RDMA is not requested.
+ * A requested but unavailable RDMA transport fails closed. */
 #ifndef DFKV_TRANSPORT_FACTORY_H_
 #define DFKV_TRANSPORT_FACTORY_H_
 
@@ -11,8 +10,8 @@
 
 namespace dfkv {
 
-// reason (optional) receives "rdma", "tcp(...)", or "rdma-required-..."
-// describing what was chosen or why no transport was returned.
+// reason (optional) receives "rdma", "tcp(rdma-not-requested)", or an
+// "rdma-requested-..." failure description.
 std::unique_ptr<Transport> MakeClientTransport(std::string* reason = nullptr);
 
 }  // namespace dfkv

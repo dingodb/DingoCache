@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <limits>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <vector>
 
 #include "utils/net_util.h"
@@ -25,14 +26,11 @@ namespace fs = std::filesystem;
 namespace dfkv {
 
 namespace {
-// Native digest records use a distinct magic. v1 native records are never
-// reinterpreted as SHA-256 identities; compatibility records remain readable
-// because their complete legacy tuple maps bijectively into the two words.
-constexpr uint32_t kRecMagic = 0x324C5453u;  // "STL2"
-constexpr uint32_t kLegacyNativeRecMagic = 0x424C5453u;
-constexpr uint32_t kCompatRecMagic = 0x434C5453u;
+// Production records use only the v3 tenant-scoped native-digest magic. Any
+// other nonzero record magic is rejected during rebuild rather than decoded.
+constexpr uint32_t kRecMagic = 0x334C5453u;  // "STL3"
 constexpr uint32_t kMetaMagic = 0x424C534Du;  // "SLBM"
-constexpr uint32_t kFormatVersion = 1;
+constexpr uint32_t kFormatVersion = 3;
 constexpr uint32_t kStateMagic = 0x53424C53u;  // "SLBS"
 constexpr uint32_t kStateClean = 1;
 constexpr uint32_t kStateDirty = 2;
@@ -72,11 +70,20 @@ bool PreadAll(int fd, void* buf, size_t n, uint64_t off) {
 }
 
 #ifdef DFKV_WITH_URING
-// Per-thread batched-write submission ring (see the long comment at the use
-// site in CacheDirectBatch). Store-agnostic: fds ride in the SQEs. Leaked at
-// thread exit by design (flush workers are process-lifetime; retiring on the
-// hygiene path recreates it lazily).
-thread_local io_uring* tls_uring_w = nullptr;
+// Per-thread batched-write submission ring. DiskCacheGroup may invoke batches
+// from transient per-disk workers, so thread exit must retire the ring instead
+// of leaking its mappings and descriptor.
+struct ThreadUring {
+  ~ThreadUring() { Reset(); }
+  void Reset() noexcept {
+    if (ring == nullptr) return;
+    io_uring_queue_exit(ring);
+    delete ring;
+    ring = nullptr;
+  }
+  io_uring* ring = nullptr;
+};
+thread_local ThreadUring tls_uring_w;
 #endif
 }  // namespace
 
@@ -476,64 +483,232 @@ bool DiskSlabStore::SyncPayloads() {
 }
 
 bool DiskSlabStore::Rebuild() {
-  uint8_t rec[kRecBytes];
-  bool repaired = false;
-  for (uint32_t e = 0; e < num_extents_; ++e) {
-    for (uint32_t s = 0; s < max_slots_per_extent_; ++s) {
-      if (!PreadAll(table_fd_, rec, kRecBytes, TableOffset(e, s))) {
-        FailMetadata();
-        return SetStartupError("cannot read slots.tbl during rebuild");
+  constexpr size_t kScanChunkBytes = 1u << 20;
+  enum class ScanResult { kDone, kUnsupported, kError };
+
+  std::vector<SlabAllocator::RestoreEntry> entries;
+  std::vector<std::pair<uint32_t, uint32_t>> rejected;
+  // Startup memory follows live metadata, never the configured table geometry.
+  // These small reserves avoid churn for ordinary stores without materializing
+  // capacity-sized vectors on a fresh sparse table.
+  entries.reserve(4096);
+  rejected.reserve(256);
+
+  const uint64_t table_slots =
+      static_cast<uint64_t>(num_extents_) * max_slots_per_extent_;
+  const uint64_t table_bytes = table_slots * kRecBytes;
+  struct Mapping {
+    void* data = MAP_FAILED;
+    size_t bytes = 0;
+    ~Mapping() {
+      if (data != MAP_FAILED) ::munmap(data, bytes);
+    }
+  } mapping;
+  if (table_bytes <= std::numeric_limits<size_t>::max()) {
+    mapping.bytes = static_cast<size_t>(table_bytes);
+    mapping.data =
+        ::mmap(nullptr, mapping.bytes, PROT_READ, MAP_SHARED, table_fd_, 0);
+  }
+  const auto* mapped =
+      mapping.data == MAP_FAILED
+          ? nullptr
+          : static_cast<const uint8_t*>(mapping.data);
+  rebuild_mmap_scans_ = mapped == nullptr ? 0 : 1;
+  std::vector<uint8_t> buffer;
+  if (mapped == nullptr) {
+    buffer.resize(
+        static_cast<size_t>(std::min<uint64_t>(table_bytes, kScanChunkBytes)));
+  }
+
+  uint64_t corrupt_records = 0;
+  uint64_t rejected_records = 0;
+  uint64_t scanned_bytes = 0;
+  uint64_t scan_chunks = 0;
+  uint64_t sparse_ranges = 0;
+  bool read_failed = false;
+  bool seek_failed = false;
+
+  auto parse_record = [&](const uint8_t* rec, uint64_t record_offset) {
+    const uint64_t record_index = record_offset / kRecBytes;
+    const uint32_t e =
+        static_cast<uint32_t>(record_index / max_slots_per_extent_);
+    const uint32_t s =
+        static_cast<uint32_t>(record_index % max_slots_per_extent_);
+    const uint32_t magic = net::GetU32(reinterpret_cast<const char*>(rec));
+    if (magic != kRecMagic) {
+      if (magic != 0) {
+        ++rejected_records;
+        rejected.emplace_back(e, s);
       }
-      const uint32_t magic =
-          net::GetU32(reinterpret_cast<char*>(rec));
-      const bool compat = magic == kCompatRecMagic;
-      if (magic == kLegacyNativeRecMagic) {
-        ++rebuild_rejected_records_;
-        continue;
+      return;
+    }
+    const uint32_t crc =
+        net::GetU32(reinterpret_cast<const char*>(rec) + 4);
+    if (Crc32(rec + 8, kRecBytes - 8) != crc) {
+      ++corrupt_records;
+      rejected.emplace_back(e, s);
+      return;
+    }
+    if (rec[8] != 1) return;
+    const uint32_t slot_size =
+        net::GetU32(reinterpret_cast<const char*>(rec) + 12);
+    BlockKey key;
+    key.digest_hi = net::GetU64(reinterpret_cast<const char*>(rec) + 16);
+    key.digest_lo = net::GetU64(reinterpret_cast<const char*>(rec) + 24);
+    key.tenant_hash = net::GetU64(reinterpret_cast<const char*>(rec) + 36);
+    const uint32_t payload_len =
+        net::GetU32(reinterpret_cast<const char*>(rec) + 32);
+    const bool geometry_ok =
+        slot_size >= opt_.slot_granularity &&
+        (slot_size % opt_.slot_granularity) == 0 &&
+        slot_size <= opt_.extent_bytes && payload_len <= slot_size &&
+        s < opt_.extent_bytes / slot_size;
+    if (!geometry_ok) {
+      ++rejected_records;
+      rejected.emplace_back(e, s);
+      return;
+    }
+    entries.push_back({key, slot_size, e, s, payload_len});
+  };
+
+  auto scan_range = [&](uint64_t begin, uint64_t end) {
+    begin -= begin % kRecBytes;
+    end = std::min<uint64_t>(
+        table_bytes, ((end + kRecBytes - 1) / kRecBytes) * kRecBytes);
+    for (uint64_t offset = begin; offset < end;) {
+      const size_t n = static_cast<size_t>(std::min<uint64_t>(
+          mapped == nullptr ? buffer.size() : kScanChunkBytes, end - offset));
+      const uint8_t* chunk = nullptr;
+      if (mapped != nullptr) {
+        chunk = mapped + static_cast<size_t>(offset);
+      } else {
+        if (!PreadAll(table_fd_, buffer.data(), n, offset)) {
+          read_failed = true;
+          return false;
+        }
+        chunk = buffer.data();
       }
-      if (magic != kRecMagic && !compat) {
-        if (magic != 0) ++rebuild_corrupt_records_;
-        continue;
+      ++scan_chunks;
+      scanned_bytes += n;
+      for (size_t pos = 0; pos < n; pos += kRecBytes)
+        parse_record(chunk + pos, offset + pos);
+      offset += n;
+    }
+    return true;
+  };
+
+  auto seek_unsupported = [](int error) {
+    return error == EINVAL || error == ENOTSUP || error == EOPNOTSUPP ||
+           error == ENOSYS;
+  };
+
+  auto sparse_scan = [&]() {
+#if defined(SEEK_DATA) && defined(SEEK_HOLE)
+    uint64_t cursor = 0;
+    uint64_t scanned_until = 0;
+    while (cursor < table_bytes) {
+      errno = 0;
+      const off_t data =
+          ::lseek(table_fd_, static_cast<off_t>(cursor), SEEK_DATA);
+      if (data < 0) {
+        if (errno == ENXIO) return ScanResult::kDone;
+        if (seek_unsupported(errno)) return ScanResult::kUnsupported;
+        seek_failed = true;
+        return ScanResult::kError;
       }
-      const uint32_t crc = net::GetU32(reinterpret_cast<char*>(rec) + 4);
-      if (Crc32(rec + 8, kRecBytes - 8) != crc) {
-        ++rebuild_corrupt_records_;
-        continue;
+      if (static_cast<uint64_t>(data) >= table_bytes)
+        return ScanResult::kDone;
+
+      errno = 0;
+      off_t hole = ::lseek(table_fd_, data, SEEK_HOLE);
+      if (hole < 0) {
+        if (errno == ENXIO) {
+          hole = static_cast<off_t>(table_bytes);
+        } else if (seek_unsupported(errno)) {
+          return ScanResult::kUnsupported;
+        } else {
+          seek_failed = true;
+          return ScanResult::kError;
+        }
       }
-      if (rec[8] != 1) continue;
-      const uint32_t slot_size =
-          net::GetU32(reinterpret_cast<char*>(rec) + 12);
-      BlockKey key;
-      key.digest_hi = net::GetU64(reinterpret_cast<char*>(rec) + 16);
-      key.digest_lo = net::GetU64(reinterpret_cast<char*>(rec) + 24);
-      key.domain = compat
-                       ? static_cast<KeyDomain>(
-                             net::GetU32(reinterpret_cast<char*>(rec) + 36))
-                       : KeyDomain::kNative;
-      const uint32_t payload_len =
-          net::GetU32(reinterpret_cast<char*>(rec) + 32);
-      const bool geometry_ok =
-          (!compat || key.domain == KeyDomain::kSgEngineV1) &&
-          slot_size >= opt_.slot_granularity &&
-          (slot_size % opt_.slot_granularity) == 0 &&
-          slot_size <= opt_.extent_bytes && payload_len <= slot_size &&
-          s < opt_.extent_bytes / slot_size;
-      const std::string fn = key.Filename();
-      if (geometry_ok && alloc_->Restore(fn, slot_size, e, s)) {
-        CommitPayloadLocked(fn, payload_len);
-        ++table_rebuilt_;
-        continue;
+      if (hole <= data) {
+        seek_failed = true;
+        return ScanResult::kError;
       }
-      ++rebuild_rejected_records_;
-      uint8_t zero[kRecBytes] = {0};
-      if (!PwriteAll(table_fd_, zero, kRecBytes, TableOffset(e, s))) {
-        FailMetadata();
-        return SetStartupError("cannot clear rejected slots.tbl record");
+
+      uint64_t begin =
+          static_cast<uint64_t>(data) -
+          static_cast<uint64_t>(data) % kRecBytes;
+      begin = std::max(begin, scanned_until);
+      const uint64_t hole_offset =
+          std::min<uint64_t>(static_cast<uint64_t>(hole), table_bytes);
+      const uint64_t end = std::min<uint64_t>(
+          table_bytes,
+          ((hole_offset + kRecBytes - 1) / kRecBytes) * kRecBytes);
+      if (begin < end) {
+        if (!scan_range(begin, end)) return ScanResult::kError;
+        ++sparse_ranges;
+        scanned_until = end;
       }
-      repaired = true;
+      cursor = static_cast<uint64_t>(hole);
+    }
+    return ScanResult::kDone;
+#else
+    return ScanResult::kUnsupported;
+#endif
+  };
+
+  ScanResult result = sparse_scan();
+  if (result == ScanResult::kUnsupported) {
+    // A filesystem can reject either sparse-seek operation. Discard any partial
+    // pass and restart from byte zero so validation counters and RestoreBulk
+    // input remain identical to a single sequential scan.
+    entries.clear();
+    rejected.clear();
+    corrupt_records = 0;
+    rejected_records = 0;
+    scanned_bytes = 0;
+    scan_chunks = 0;
+    sparse_ranges = 0;
+    read_failed = false;
+    ++rebuild_sequential_fallbacks_;
+    if (mapping.data != MAP_FAILED)
+      ::madvise(mapping.data, mapping.bytes, MADV_SEQUENTIAL);
+    if (!scan_range(0, table_bytes)) result = ScanResult::kError;
+    else result = ScanResult::kDone;
+  }
+  if (result == ScanResult::kError) {
+    FailMetadata();
+    if (read_failed)
+      return SetStartupError("cannot read slots.tbl during rebuild");
+    if (seek_failed)
+      return SetStartupError("cannot seek slots.tbl during rebuild");
+    return SetStartupError("cannot scan slots.tbl during rebuild");
+  }
+
+  rebuild_scanned_bytes_ = scanned_bytes;
+  rebuild_scan_chunks_ = scan_chunks;
+  rebuild_sparse_ranges_ = sparse_ranges;
+  rebuild_corrupt_records_ = corrupt_records;
+  rebuild_rejected_records_ = rejected_records;
+
+  if (!alloc_->RestoreBulk(entries))
+    return SetStartupError("inconsistent slots.tbl records during bulk rebuild");
+
+  for (const auto& entry : entries)
+    CommitPayloadLocked(entry.key.Filename(),
+                        static_cast<uint32_t>(entry.value_bytes));
+  table_rebuilt_ += entries.size();
+
+  uint8_t zero[kRecBytes] = {0};
+  for (const auto& location : rejected) {
+    if (!PwriteAll(table_fd_, zero, kRecBytes,
+                   TableOffset(location.first, location.second))) {
+      FailMetadata();
+      return SetStartupError("cannot clear rejected slots.tbl record");
     }
   }
-  if (repaired && ::fdatasync(table_fd_) != 0) {
+  if (!rejected.empty() && ::fdatasync(table_fd_) != 0) {
     FailMetadata();
     return SetStartupError("cannot persist slots.tbl rebuild repairs");
   }
@@ -558,21 +733,17 @@ bool DiskSlabStore::WriteRecord(const SlabAllocator::SlotRef& r,
                                 const BlockKey& key, uint32_t payload_len,
                                 bool valid) {
   if (!Healthy()) return false;
-  if (key.domain != KeyDomain::kNative &&
-      key.domain != KeyDomain::kSgEngineV1)
-    return false;
+  if (record_write_hook_for_test_ && !record_write_hook_for_test_())
+    return FailMetadata();
   uint8_t rec[kRecBytes];
   std::memset(rec, 0, sizeof(rec));
-  net::PutU32(reinterpret_cast<char*>(rec),
-              key.domain == KeyDomain::kNative ? kRecMagic
-                                               : kCompatRecMagic);
+  net::PutU32(reinterpret_cast<char*>(rec), kRecMagic);
   rec[8] = valid ? 1 : 0;
   net::PutU32(reinterpret_cast<char*>(rec) + 12, r.slot_size);
   net::PutU64(reinterpret_cast<char*>(rec) + 16, key.digest_hi);
   net::PutU64(reinterpret_cast<char*>(rec) + 24, key.digest_lo);
   net::PutU32(reinterpret_cast<char*>(rec) + 32, payload_len);
-  net::PutU32(reinterpret_cast<char*>(rec) + 36,
-              static_cast<uint32_t>(key.domain));
+  net::PutU64(reinterpret_cast<char*>(rec) + 36, key.tenant_hash);
   const uint32_t crc = Crc32(rec + 8, kRecBytes - 8);
   net::PutU32(reinterpret_cast<char*>(rec) + 4, crc);
   if (!PwriteAll(table_fd_, rec, kRecBytes, TableOffset(r.extent, r.slot)))
@@ -583,12 +754,16 @@ bool DiskSlabStore::WriteRecord(const SlabAllocator::SlotRef& r,
 
 bool DiskSlabStore::WritePayload(const SlabAllocator::SlotRef& r, const void* data,
                                  size_t len) {
+  if (payload_write_hook_for_test_ && !payload_write_hook_for_test_())
+    return false;
   if (len == 0) return true;
   return PwriteAll(extent_fds_[r.extent], data, len, r.offset);
 }
 
 bool DiskSlabStore::WritePayloadDirect(const SlabAllocator::SlotRef& r, char* data,
                                        size_t len) {
+  if (payload_write_hook_for_test_ && !payload_write_hook_for_test_())
+    return false;
   const size_t alen = (len + 4095) & ~static_cast<size_t>(4095);
   std::memset(data + len, 0, alen - len);  // caller's cap covers the padding
   // Slot offsets are slot_granularity (>= 4 KiB) aligned, so offset + alen stay
@@ -601,7 +776,15 @@ void DiskSlabStore::CommitPayloadLocked(const std::string& key,
   auto [it, inserted] = payload_len_.try_emplace(key, payload_len);
   if (inserted) {
     committed_payload_bytes_ += payload_len;
+    BlockKey parsed;
+    if (BlockKey::ParseFilename(key, &parsed))
+      tenant_used_bytes_[parsed.tenant_hash] += payload_len;
     return;
+  }
+  BlockKey parsed;
+  if (BlockKey::ParseFilename(key, &parsed)) {
+    tenant_used_bytes_[parsed.tenant_hash] -= it->second;
+    tenant_used_bytes_[parsed.tenant_hash] += payload_len;
   }
   committed_payload_bytes_ -= it->second;
   it->second = payload_len;
@@ -613,8 +796,33 @@ uint32_t DiskSlabStore::ErasePayloadLocked(const std::string& key) {
   if (it == payload_len_.end()) return 0;
   const uint32_t payload_len = it->second;
   committed_payload_bytes_ -= payload_len;
+  BlockKey parsed;
+  if (BlockKey::ParseFilename(key, &parsed)) {
+    auto tenant = tenant_used_bytes_.find(parsed.tenant_hash);
+    if (tenant != tenant_used_bytes_.end()) {
+      tenant->second -= payload_len;
+      if (tenant->second == 0) tenant_used_bytes_.erase(tenant);
+    }
+  }
   payload_len_.erase(it);
   return payload_len;
+}
+
+void DiskSlabStore::CompletePut(const std::shared_ptr<PutFlight>& flight,
+                                Status result) {
+  {
+    std::lock_guard<std::mutex> lk(flight->mu);
+    if (flight->done) return;
+    flight->result = result;
+    flight->done = true;
+  }
+  flight->cv.notify_all();
+}
+
+Status DiskSlabStore::WaitPut(const std::shared_ptr<PutFlight>& flight) {
+  std::unique_lock<std::mutex> lk(flight->mu);
+  flight->cv.wait(lk, [&flight] { return flight->done; });
+  return flight->result;
 }
 
 // mu_ guards only the in-memory maps; the MB-scale payload I/O runs OUTSIDE it
@@ -630,38 +838,53 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
   if (!Healthy()) return Status::kIOError;
   const std::string fn = key.Filename();
   SlabAllocator::SlotRef ref;
+  std::shared_ptr<PutFlight> flight;
+  bool leader = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
     if (!Healthy()) return Status::kIOError;
-    // Idempotent: committed, or mid-write by another thread (which will commit).
-    if (alloc_->Contains(fn)) return Status::kOk;
-    std::vector<std::string> evicted;
-    if (!alloc_->Put(fn, len, &ref, &evicted)) return Status::kIOError;  // too big / all pinned
-    alloc_->Pin(fn);  // write-pin for the unlocked I/O below
-    inflight_[fn]++;  // guards the slot against a concurrent Remove (see ReleaseInflightLocked)
-    // The allocator has already invalidated every evicted slot record through
-    // on_slot_evict (or wiped the whole extent before a rebind). Remove the
-    // corresponding runtime commit metadata in the same store critical section.
-    for (const auto& ev : evicted)
-      evicted_bytes_ += ErasePayloadLocked(ev);
+    if (payload_len_.count(fn) != 0) return Status::kOk;
+    auto existing = put_flights_.find(fn);
+    if (existing != put_flights_.end()) {
+      flight = existing->second;
+    } else {
+      flight = std::make_shared<PutFlight>();
+      put_flights_.emplace(fn, flight);
+      leader = true;
+      std::vector<BlockKey> evicted;
+      if (alloc_->Contains(key) || !alloc_->Put(key, len, &ref, &evicted)) {
+        put_flights_.erase(fn);
+        CompletePut(flight, Status::kIOError);
+        return Status::kIOError;
+      }
+      alloc_->Pin(key);  // write-pin for the unlocked I/O below
+      inflight_[fn]++;
+      for (const BlockKey& ev : evicted)
+        evicted_bytes_ += ErasePayloadLocked(ev.Filename());
+    }
   }
+  if (!leader) return WaitPut(flight);
 
   const bool io_ok = write_payload(ref) &&
-                     WriteRecord(ref, key, static_cast<uint32_t>(len), /*valid=*/true);
+                     WriteRecord(ref, key, static_cast<uint32_t>(len),
+                                 /*valid=*/true);
 
-  std::lock_guard<std::mutex> lk(mu_);
-  // A Remove that arrived while we wrote was deferred to us (the sole in-flight
-  // holder of an uncommitted key): ReleaseInflightLocked executes it, so the key
-  // must not be committed afterwards.
-  const bool removed_while_writing = deferred_remove_.count(fn) > 0;
-  const bool release_ok = ReleaseInflightLocked(key, fn);
-  if (!io_ok || !release_ok) {
-    if (!removed_while_writing) alloc_->Remove(fn);  // roll back the reservation
-    return Status::kIOError;
+  Status result = Status::kIOError;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    const bool removed_while_writing = deferred_remove_.count(fn) > 0;
+    const bool release_ok = ReleaseInflightLocked(key, fn);
+    if (!io_ok || !release_ok || !Healthy()) {
+      if (!removed_while_writing) alloc_->Remove(key);
+    } else {
+      if (!removed_while_writing)
+        CommitPayloadLocked(fn, static_cast<uint32_t>(len));
+      result = Status::kOk;
+    }
+    put_flights_.erase(fn);
   }
-  if (removed_while_writing) return Status::kOk;  // acked put, then removed: a miss later is correct
-  CommitPayloadLocked(fn, static_cast<uint32_t>(len));
-  return Status::kOk;
+  CompletePut(flight, result);
+  return result;
 }
 
 Status DiskSlabStore::Cache(const BlockKey& key, const void* data, size_t len) {
@@ -702,24 +925,48 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
   const size_t N = items.size();
   std::vector<Status> out(N, Status::kIOError);
   if (!Healthy() || N == 0) return out;
-  struct Slot { std::string fn; SlabAllocator::SlotRef ref; bool active = false; bool io_ok = false; bool direct = false; };
+  struct Slot {
+    std::string fn;
+    SlabAllocator::SlotRef ref;
+    std::shared_ptr<PutFlight> flight;
+    bool active = false;
+    bool io_ok = false;
+    bool direct = false;
+  };
   std::vector<Slot> st(N);
-  // -- L1: allocate under one lock --
+  // -- L1: allocate leaders and attach followers under one lock --
   {
     std::lock_guard<std::mutex> lk(mu_);
     for (size_t i = 0; i < N; ++i) {
       const auto& it = items[i];
-      if (it.data == nullptr && it.len != 0) { out[i] = Status::kInvalid; continue; }
+      if (it.data == nullptr && it.len != 0) {
+        out[i] = Status::kInvalid;
+        continue;
+      }
       st[i].fn = it.key.Filename();
-      if (alloc_->Contains(st[i].fn)) { out[i] = Status::kOk; continue; }  // idempotent (incl. batch-internal dup)
-      std::vector<std::string> evicted;
-      if (!alloc_->Put(st[i].fn, it.len, &st[i].ref, &evicted)) { out[i] = Status::kIOError; continue; }
-      alloc_->Pin(st[i].fn);
+      if (payload_len_.count(st[i].fn) != 0) {
+        out[i] = Status::kOk;
+        continue;
+      }
+      auto existing = put_flights_.find(st[i].fn);
+      if (existing != put_flights_.end()) {
+        st[i].flight = existing->second;  // follower: wait after leader L2
+        continue;
+      }
+      st[i].flight = std::make_shared<PutFlight>();
+      put_flights_.emplace(st[i].fn, st[i].flight);
+      std::vector<BlockKey> evicted;
+      if (alloc_->Contains(it.key) ||
+          !alloc_->Put(it.key, it.len, &st[i].ref, &evicted)) {
+        put_flights_.erase(st[i].fn);
+        CompletePut(st[i].flight, Status::kIOError);
+        continue;
+      }
+      alloc_->Pin(it.key);
       inflight_[st[i].fn]++;
-      for (const auto& ev : evicted)
-        evicted_bytes_ += ErasePayloadLocked(ev);
+      for (const BlockKey& ev : evicted)
+        evicted_bytes_ += ErasePayloadLocked(ev.Filename());
       st[i].active = true;
-      // Same eligibility test as CacheDirect: aligned buffer + padded cap.
       const size_t alen = (it.len + 4095) & ~static_cast<size_t>(4095);
       st[i].direct = !extent_dio_fds_.empty() && it.len != 0 &&
                      (reinterpret_cast<uintptr_t>(it.data) & 4095) == 0 &&
@@ -737,17 +984,18 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
     // CQE wait — at any instant only one worker was doing uring IO, which
     // capped the batched path's gain over plain pwrite at ~10% (measured
     // 45.0k -> 50.6k ops/s saturated 64 KiB PUT, 16 workers, B200 3xNVMe). A
-    // ring is only a submission channel (the fds ride in each SQE), so it can
-    // be thread-local and store-agnostic: no lock, no cross-worker convoy.
-    // The batch-hygiene invariant is per-ring and unchanged (a batch fully
-    // reaps its completions or the ring is retired). Rings leak at thread
-    // exit by design — flush workers live for the process.
-    if (!tls_uring_w) {
+    // ring is only a submission channel (fds ride in SQEs), so it is
+    // thread-local and store-agnostic: no lock and no cross-disk convoy.
+    // ThreadUring retires it when a transient disk worker exits.
+    if (!tls_uring_w.ring) {
       auto* r = new io_uring;
-      if (io_uring_queue_init(256, r, 0) == 0) tls_uring_w = r; else delete r;
+      if (io_uring_queue_init(256, r, 0) == 0)
+        tls_uring_w.ring = r;
+      else
+        delete r;
     }
-    if (tls_uring_w) {
-      auto* ring = tls_uring_w;
+    if (tls_uring_w.ring) {
+      auto* ring = tls_uring_w.ring;
       size_t submitted = 0;
       for (size_t i = 0; i < N; ++i) {
         if (!st[i].active || !st[i].direct) continue;
@@ -799,9 +1047,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
           // affected items keep io_ok=false and are rewritten by the
           // sequential path below (their slots are exclusively owned by this
           // flush, so the rewrite is idempotent).
-          io_uring_queue_exit(ring);
-          delete ring;
-          tls_uring_w = nullptr;
+          tls_uring_w.Reset();
         }
         did_uring = true;
         size_t batch_ok = 0;
@@ -836,7 +1082,8 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
     if (st[i].io_ok)
       st[i].io_ok = WriteRecord(st[i].ref, it.key, static_cast<uint32_t>(it.len), /*valid=*/true);
   }
-  // -- L2: commit under one lock --
+  // -- L2: commit leaders under one lock, publish their exact result, then let
+  // followers observe it without holding the store mutex.
   {
     std::lock_guard<std::mutex> lk(mu_);
     for (size_t i = 0; i < N; ++i) {
@@ -845,22 +1092,30 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
       const bool release_ok =
           ReleaseInflightLocked(items[i].key, st[i].fn);
       if (!st[i].io_ok || !release_ok || !Healthy()) {
-        if (!removed) alloc_->Remove(st[i].fn);
+        if (!removed) alloc_->Remove(items[i].key);
         out[i] = Status::kIOError;
-        continue;
+      } else {
+        if (!removed)
+          CommitPayloadLocked(st[i].fn,
+                              static_cast<uint32_t>(items[i].len));
+        out[i] = Status::kOk;
       }
-      if (!removed)
-        CommitPayloadLocked(st[i].fn,
-                            static_cast<uint32_t>(items[i].len));
-      out[i] = Status::kOk;
+      put_flights_.erase(st[i].fn);
+      CompletePut(st[i].flight, out[i]);
     }
+  }
+  for (size_t i = 0; i < N; ++i) {
+    if (!st[i].active && st[i].flight)
+      out[i] = WaitPut(st[i].flight);
   }
   return out;
 }
 
-Status DiskSlabStore::RangeDirect(const BlockKey& key, uint64_t offset,
-                                  uint64_t length, char* io_buf, size_t io_cap,
-                                  const char** out_data, size_t* out_len) {
+Status DiskSlabStore::RangeDirect(
+    const BlockKey& key, uint64_t offset, uint64_t length, char* io_buf,
+    size_t io_cap, const char** out_data, size_t* out_len, size_t* value_len) {
+  if (out_data) *out_data = nullptr;
+  if (out_len) *out_len = 0;
   // Direct mode + aligned io_buf (the RDMA path's contract): O_DIRECT read of
   // the slot-absolute aligned window, payload pointer trimmed by head -- the
   // GET path stays page-cache-free. Anything else: buffered RangeInto.
@@ -869,11 +1124,13 @@ Status DiskSlabStore::RangeDirect(const BlockKey& key, uint64_t offset,
     const std::string fn = key.Filename();
     SlabAllocator::SlotRef ref;
     uint32_t plen = 0;
-    if (!AcquireForRead(fn, &ref, &plen))
+    if (!AcquireForRead(key, fn, &ref, &plen))
       return Healthy() ? Status::kNotFound : Status::kIOError;
     Status st = Status::kOk;
     size_t got = 0, head = 0;
-    if (offset < plen) {
+    if (offset > plen) {
+      st = Status::kInvalid;
+    } else if (offset < plen) {
       const uint64_t n = std::min(length ? length : (plen - offset),
                                   static_cast<uint64_t>(plen - offset));
       const uint64_t abs = ref.offset + offset;
@@ -900,6 +1157,7 @@ Status DiskSlabStore::RangeDirect(const BlockKey& key, uint64_t offset,
       if (!ReleaseInflightLocked(key, fn)) st = Status::kIOError;
     }
     if (st != Status::kOk) return st;
+    if (value_len) *value_len = plen;
     if (out_data) *out_data = io_buf + head;
     if (out_len) *out_len = got;
     return Status::kOk;
@@ -907,57 +1165,74 @@ Status DiskSlabStore::RangeDirect(const BlockKey& key, uint64_t offset,
   if (!extent_dio_fds_.empty() && Healthy())
     dio_read_fallbacks_.fetch_add(1, std::memory_order_relaxed);  // unaligned io_buf
   size_t got = 0;
-  Status st = RangeInto(key, offset, length, io_buf, io_cap, &got);
+  Status st = RangeInto(key, offset, length, io_buf, io_cap, &got, value_len);
   if (st == Status::kOk) { if (out_data) *out_data = io_buf; if (out_len) *out_len = got; }
   return st;
 }
 
 Status DiskSlabStore::RangeDirectPrep(const BlockKey& key, uint64_t offset,
                                       uint64_t length, size_t io_cap,
-                                      RangePrep* out) {
-  if (out) *out = RangePrep{};
+                                      ReadLease* out) {
+  if (out == nullptr) return Status::kInvalid;
+  *out = ReadLease{};
   if (!Healthy()) return Status::kIOError;
   const std::string fn = key.Filename();
   SlabAllocator::SlotRef ref;
   uint32_t plen = 0;
-  if (!AcquireForRead(fn, &ref, &plen))
+  if (!AcquireForRead(key, fn, &ref, &plen))
     return Healthy() ? Status::kNotFound : Status::kIOError;
   auto bail = [&](Status status) {
     std::lock_guard<std::mutex> lk(mu_);
     return ReleaseInflightLocked(key, fn) ? status : Status::kIOError;
   };
-  out->value_len = plen;
-  if (offset >= plen) { out->payload_len = 0; return bail(Status::kOk); }  // zero-len hit, fd=-1
+  if (offset > plen) return bail(Status::kInvalid);
+  if (offset == plen) {
+    ReadLease lease;
+    lease.value_len = plen;
+    *out = std::move(lease);
+    return bail(Status::kOk);
+  }
   const uint64_t n = std::min(length ? length : (plen - offset),
                               static_cast<uint64_t>(plen - offset));
-  const uint64_t abs = ref.offset + offset;  // slot-absolute within the extent
+  const uint64_t abs = ref.offset + offset;
   const uint64_t aoff = abs & ~static_cast<uint64_t>(4095);
   const size_t head = static_cast<size_t>(abs - aoff);
-  const size_t alen = (head + static_cast<size_t>(n) + 4095) & ~static_cast<size_t>(4095);
-  if (alen > io_cap) return bail(Status::kInvalid);  // caller uses sync RangeDirect
-  // Direct mode dups the DIO twin (page-cache-free); buffered mode dups the
-  // buffered fd so a page-cache-hot slot completes the read in memory. The dup
-  // is the caller's to close; the PIN (not the fd) is what keeps the slot's
-  // bytes intact -- extents are shared files, so an open fd pins nothing.
+  const size_t alen =
+      (head + static_cast<size_t>(n) + 4095) & ~static_cast<size_t>(4095);
+  if (alen > io_cap) return bail(Status::kInvalid);
+  // Install the internal hold first, then immediately bind it to a storage-only
+  // lease. From that point every descriptor-open error is destructor-safe.
+  uint64_t token = 0;
+  try {
+    std::lock_guard<std::mutex> lk(mu_);
+    do {
+      token = ++prep_token_seq_;
+    } while (token == 0 || prep_holds_.count(token) != 0);
+    prep_holds_.emplace(token, PrepHold{key, fn});
+  } catch (...) {
+    return bail(Status::kIOError);
+  }
+  ReadLease lease = ReadLease::Adopt(
+      -1, this, token, &DiskSlabStore::ReleaseReadLeaseThunk);
   int fd = ::dup(extent_dio_fds_.empty() ? extent_fds_[ref.extent]
                                          : extent_dio_fds_[ref.extent]);
-  if (fd < 0) return bail(Status::kIOError);
-  uint64_t tok;
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    tok = ++prep_token_seq_;
-    prep_holds_.emplace(tok, PrepHold{key, fn});
-  }
-  out->fd = fd;
-  out->aligned_off = aoff;
-  out->aligned_len = alen;
-  out->head = head;
-  out->payload_len = static_cast<size_t>(n);
-  out->token = tok;
+  if (fd < 0) return Status::kIOError;
+  lease.AdoptDescriptor(fd);
+  lease.aligned_off = aoff;
+  lease.aligned_len = alen;
+  lease.head = head;
+  lease.payload_len = static_cast<size_t>(n);
+  lease.value_len = plen;
+  *out = std::move(lease);
   return Status::kOk;
 }
 
-void DiskSlabStore::RangeRelease(uint64_t token) {
+void DiskSlabStore::ReleaseReadLeaseThunk(void* owner,
+                                         uint64_t token) noexcept {
+  static_cast<DiskSlabStore*>(owner)->ReleaseReadLease(token);
+}
+
+void DiskSlabStore::ReleaseReadLease(uint64_t token) noexcept {
   std::lock_guard<std::mutex> lk(mu_);
   auto it = prep_holds_.find(token);
   if (it == prep_holds_.end()) return;
@@ -969,13 +1244,14 @@ void DiskSlabStore::RangeRelease(uint64_t token) {
 // key (pin + inflight count), then pread OUTSIDE the lock. The pin keeps the
 // slot away from eviction or explicit-remove reuse; the inflight count orders a
 // concurrent Remove's durable invalidation before the slot becomes reusable.
-bool DiskSlabStore::AcquireForRead(const std::string& fn, SlabAllocator::SlotRef* ref,
+bool DiskSlabStore::AcquireForRead(const BlockKey& key, const std::string& fn,
+                                   SlabAllocator::SlotRef* ref,
                                    uint32_t* plen) {
   if (!Healthy()) return false;
   std::lock_guard<std::mutex> lk(mu_);
   auto it = payload_len_.find(fn);
   if (it == payload_len_.end()) return false;  // in-flight write / removed: no commit
-  if (!alloc_->GetAndPin(fn, ref)) return false;
+  if (!alloc_->GetAndPin(key, ref)) return false;
   *plen = it->second;
   inflight_[fn]++;
   return true;
@@ -983,34 +1259,38 @@ bool DiskSlabStore::AcquireForRead(const std::string& fn, SlabAllocator::SlotRef
 
 bool DiskSlabStore::ReleaseInflightLocked(const BlockKey& key,
                                           const std::string& fn) {
-  alloc_->Unpin(fn);
+  alloc_->Unpin(key);
   auto it = inflight_.find(fn);
   if (it == inflight_.end()) return true;
   if (--it->second > 0) return true;
   inflight_.erase(it);
   if (!deferred_remove_.erase(fn)) return true;
   SlabAllocator::SlotRef ref;
-  if (alloc_->Get(fn, &ref)) {
+  if (alloc_->Get(key, &ref)) {
     if (!WriteRecord(ref, key, 0, /*valid=*/false)) {
       ErasePayloadLocked(fn);
       return false;
     }
-    alloc_->Remove(fn);
+    alloc_->Remove(key);
   }
   ErasePayloadLocked(fn);
   return true;
 }
 
-Status DiskSlabStore::Range(const BlockKey& key, uint64_t offset, uint64_t length,
-                            std::string* out) {
+Status DiskSlabStore::Range(const BlockKey& key, uint64_t offset,
+                            uint64_t length, std::string* out,
+                            size_t* value_len) {
   if (!Healthy()) return Status::kIOError;
   const std::string fn = key.Filename();
   SlabAllocator::SlotRef ref;
   uint32_t plen = 0;
-  if (!AcquireForRead(fn, &ref, &plen))
+  if (!AcquireForRead(key, fn, &ref, &plen))
     return Healthy() ? Status::kNotFound : Status::kIOError;
   Status st = Status::kOk;
-  if (offset >= plen) {
+  if (offset > plen) {
+    st = Status::kInvalid;
+    out->clear();
+  } else if (offset == plen) {
     out->clear();
   } else {
     const uint64_t avail = plen - offset;
@@ -1022,20 +1302,25 @@ Status DiskSlabStore::Range(const BlockKey& key, uint64_t offset, uint64_t lengt
   }
   std::lock_guard<std::mutex> lk(mu_);
   if (!ReleaseInflightLocked(key, fn)) st = Status::kIOError;
+  if (st == Status::kOk && value_len) *value_len = plen;
   return st;
 }
 
-Status DiskSlabStore::RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,
-                                char* dst, size_t dst_cap, size_t* out_len) {
+Status DiskSlabStore::RangeInto(const BlockKey& key, uint64_t offset,
+                                uint64_t length, char* dst, size_t dst_cap,
+                                size_t* out_len, size_t* value_len) {
+  if (out_len) *out_len = 0;
   if (!Healthy()) return Status::kIOError;
   const std::string fn = key.Filename();
   SlabAllocator::SlotRef ref;
   uint32_t plen = 0;
-  if (!AcquireForRead(fn, &ref, &plen))
+  if (!AcquireForRead(key, fn, &ref, &plen))
     return Healthy() ? Status::kNotFound : Status::kIOError;
   Status st = Status::kOk;
   size_t got = 0;
-  if (offset < plen) {
+  if (offset > plen) {
+    st = Status::kInvalid;
+  } else if (offset < plen) {
     uint64_t n = std::min(length ? length : (plen - offset), static_cast<uint64_t>(plen - offset));
     if (n > dst_cap) n = dst_cap;
     if (n && !PreadAll(extent_fds_[ref.extent], dst, static_cast<size_t>(n), ref.offset + offset))
@@ -1047,6 +1332,7 @@ Status DiskSlabStore::RangeInto(const BlockKey& key, uint64_t offset, uint64_t l
     if (!ReleaseInflightLocked(key, fn)) st = Status::kIOError;
   }
   if (st == Status::kOk && out_len) *out_len = got;
+  if (st == Status::kOk && value_len) *value_len = plen;
   return st;
 }
 
@@ -1057,13 +1343,23 @@ bool DiskSlabStore::IsCached(const BlockKey& key) const {
   // deferred-removed key reads as absent.
   return payload_len_.count(key.Filename()) > 0;
 }
+Status DiskSlabStore::Lookup(const BlockKey& key, ValueMetadata* out) const {
+  if (!Healthy()) return Status::kIOError;
+  if (out == nullptr) return Status::kInvalid;
+  std::lock_guard<std::mutex> lk(mu_);
+  auto it = payload_len_.find(key.Filename());
+  if (it == payload_len_.end()) return Status::kNotFound;
+  out->value_len = it->second;
+  return Status::kOk;
+}
+
 
 Status DiskSlabStore::Remove(const BlockKey& key) {
   if (!Healthy()) return Status::kIOError;
   const std::string fn = key.Filename();
   std::lock_guard<std::mutex> lk(mu_);
   SlabAllocator::SlotRef ref;
-  if (!alloc_->Get(fn, &ref)) return Status::kNotFound;
+  if (!alloc_->Get(key, &ref)) return Status::kNotFound;
   if (inflight_.count(fn)) {
     // An unlocked pread/pwrite holds this slot. Defer durable invalidation and
     // physical removal to the last releaser; readers gate off immediately via
@@ -1076,7 +1372,7 @@ Status DiskSlabStore::Remove(const BlockKey& key) {
   }
   if (!WriteRecord(ref, key, 0, /*valid=*/false))
     return Status::kIOError;
-  alloc_->Remove(fn);
+  alloc_->Remove(key);
   ErasePayloadLocked(fn);
   return Status::kOk;
 }
@@ -1084,6 +1380,11 @@ Status DiskSlabStore::Remove(const BlockKey& key) {
 size_t DiskSlabStore::Count() const { return alloc_ ? alloc_->Count() : 0; }
 uint64_t DiskSlabStore::UsedBytes() const {
   return alloc_ ? alloc_->UsedBytes() : 0;
+}
+uint64_t DiskSlabStore::TenantUsedBytes(uint64_t tenant_hash) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  const auto it = tenant_used_bytes_.find(tenant_hash);
+  return it == tenant_used_bytes_.end() ? 0 : it->second;
 }
 uint64_t DiskSlabStore::Capacity() const {
   return alloc_ ? alloc_->Capacity() : 0;
@@ -1120,12 +1421,12 @@ void DiskSlabStore::ReclaimTick(
   if (evict_high_bytes_ != 0 && alloc_->UsedBytes() > evict_high_bytes_) {
     std::lock_guard<std::mutex> lk(mu_);
     if (alloc_->UsedBytes() > evict_high_bytes_) {
-      std::vector<std::string> evicted;
+      std::vector<BlockKey> evicted;
       alloc_->EvictColdToTarget(evict_low_bytes_, /*max_extents=*/64,
                                &evicted);
       if (!evicted.empty()) {
         if (after_watermark_evict) after_watermark_evict();
-        for (const auto& fn : evicted) ErasePayloadLocked(fn);
+        for (const BlockKey& key : evicted) ErasePayloadLocked(key.Filename());
       }
     }
   }
@@ -1160,13 +1461,13 @@ void DiskSlabStore::ReclaimTick(
             donor = d;
         }
         if (donor == classes.size()) break;
-        std::vector<std::string> evicted;
+        std::vector<BlockKey> evicted;
         bool ok;
         {
           std::lock_guard<std::mutex> lk(mu_);
           ok = alloc_->StealFrom(donor, i, &evicted);
-          for (const auto& ev : evicted)
-            evicted_bytes_ += ErasePayloadLocked(ev);
+          for (const BlockKey& key : evicted)
+            evicted_bytes_ += ErasePayloadLocked(key.Filename());
         }
         if (!ok) { extents[donor] = 0; continue; }  // donor all pinned: try next
         extents[donor]--;
@@ -1181,14 +1482,14 @@ void DiskSlabStore::ReclaimTick(
     if (free_now >= target) continue;
     size_t budget = 4096;  // per-tick per-class bound
     for (;;) {
-      std::vector<std::string> evicted;
+      std::vector<BlockKey> evicted;
       const size_t batch = std::min<size_t>(128, budget);
       size_t got;
       {
         std::lock_guard<std::mutex> lk(mu_);
         got = alloc_->ReclaimClass(i, target, batch, &evicted);
-        for (const auto& ev : evicted)
-          evicted_bytes_ += ErasePayloadLocked(ev);
+        for (const BlockKey& key : evicted)
+          evicted_bytes_ += ErasePayloadLocked(key.Filename());
       }
       if (got > 0) reclaimed_.fetch_add(got, std::memory_order_relaxed);
       budget -= std::min(budget, got);
@@ -1198,6 +1499,11 @@ void DiskSlabStore::ReclaimTick(
       if (got < batch || budget == 0) break;
     }
   }
+}
+
+std::vector<SlabAllocator::ClassStat> DiskSlabStore::ClassStats() const {
+  return alloc_ ? alloc_->Classes()
+                : std::vector<SlabAllocator::ClassStat>{};
 }
 
 DiskSlabStore::Stats DiskSlabStore::GetStats() const {
@@ -1217,6 +1523,11 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   st.table_rebuilt = table_rebuilt_;
   st.rebuild_corrupt_records = rebuild_corrupt_records_;
   st.rebuild_rejected_records = rebuild_rejected_records_;
+  st.rebuild_scanned_bytes = rebuild_scanned_bytes_;
+  st.rebuild_scan_chunks = rebuild_scan_chunks_;
+  st.rebuild_sparse_ranges = rebuild_sparse_ranges_;
+  st.rebuild_sequential_fallbacks = rebuild_sequential_fallbacks_;
+  st.rebuild_mmap_scans = rebuild_mmap_scans_;
   st.capacity_bytes =
       static_cast<uint64_t>(opt_.extent_bytes) * num_extents_;
   st.failed = !Healthy();

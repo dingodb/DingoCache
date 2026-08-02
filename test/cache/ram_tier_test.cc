@@ -18,6 +18,7 @@
 
 using dfkv::BlockKey;
 using dfkv::RamTier;
+using dfkv::Status;
 using namespace std::chrono_literals;
 
 namespace {
@@ -77,8 +78,9 @@ TEST(RamTier, ReadAfterWriteBeforeFlush) {
   RamTier::Hit h;
   ASSERT_TRUE(rt.GetPrep(K(1), 0, v.size(), &h));
   EXPECT_EQ(std::string(h.ptr, h.len), v);
+  EXPECT_TRUE(h.in_arena);
   EXPECT_EQ(rt.Hits(), 1u);
-  rt.Release(h.token);
+  h = RamTier::Hit{};
   sink.open();
 }
 
@@ -129,7 +131,7 @@ TEST(RamTier, VaryingSizesCoexistNoChurn) {
     EXPECT_EQ(h.len, sz);
     EXPECT_EQ(static_cast<unsigned char>(h.ptr[0]),
               static_cast<unsigned char>((id - 1000) + 1));
-    rt.Release(h.token);
+    h = RamTier::Hit{};
   }
   ::unsetenv("DFKV_RAM_TIER_EXTENT_BYTES");
 }
@@ -142,19 +144,29 @@ TEST(RamTier, MissReturnsFalse) {
   EXPECT_EQ(rt.Misses(), 1u);
 }
 
-TEST(RamTier, SubRangeGetPrep) {
+TEST(RamTier, SharedRangeContract) {
   FlushSink sink;
   RamTier rt(Opts(64 * 4096), sink.fn());
-  std::string v = "0123456789";
+  const std::string v = "0123456789";
   ASSERT_TRUE(rt.Put(K(3), v.data(), v.size()));
   RamTier::Hit h;
-  ASSERT_TRUE(rt.GetPrep(K(3), 3, 4, &h));
-  EXPECT_EQ(std::string(h.ptr, h.len), "3456");
-  rt.Release(h.token);
-  // offset past end -> zero-length hit (still a hit)
-  ASSERT_TRUE(rt.GetPrep(K(3), 100, 10, &h));
+
+  ASSERT_TRUE(rt.GetPrep(K(3), 3, 0, &h));
+  EXPECT_EQ(std::string(h.ptr, h.len), "3456789");
+  EXPECT_EQ(h.value_len, v.size());
+  h = RamTier::Hit{};
+
+  ASSERT_TRUE(rt.GetPrep(K(3), v.size(), 4, &h));
   EXPECT_EQ(h.len, 0u);
-  rt.Release(h.token);
+  EXPECT_EQ(h.value_len, v.size());
+  h = RamTier::Hit{};
+
+  EXPECT_FALSE(rt.GetPrep(K(3), v.size() + 1, 4, &h));
+
+  ASSERT_TRUE(rt.GetPrep(K(3), 3, 100, &h));
+  EXPECT_EQ(std::string(h.ptr, h.len), "3456789");
+  EXPECT_EQ(h.value_len, v.size());
+  h = RamTier::Hit{};
 }
 
 TEST(RamTier, SendPinBlocksEvictionUntilRelease) {
@@ -174,7 +186,7 @@ TEST(RamTier, SendPinBlocksEvictionUntilRelease) {
   EXPECT_TRUE(rt.Contains(K(12)));
   EXPECT_FALSE(rt.Contains(K(11)));
   EXPECT_GE(rt.Evictions(), 1u);
-  rt.Release(h.token);
+  h = RamTier::Hit{};
 }
 
 TEST(RamTier, BackpressureBypassWhenFlushStalls) {
@@ -209,22 +221,251 @@ TEST(RamTier, FlushFailureRetriesThenDrops) {
     EXPECT_GE(sink.calls, 3);
   }
 }
+TEST(RamTier, InflightDuplicateWaitsForLeaderCommit) {
+  FlushSink sink;
+  sink.close();
+  RamTier rt(Opts(8 * 4096), sink.fn());
+  const std::string leader(500, 'a');
+  const std::string follower(500, 'b');
+  Status first = Status::kInvalid;
+  Status second = Status::kInvalid;
+  std::atomic<bool> second_done{false};
+  std::thread t1([&] {
+    first = rt.PutCommitted(K(31), leader.data(), leader.size());
+  });
+  ASSERT_TRUE(WaitFor([&] {
+    std::lock_guard<std::mutex> lk(sink.m);
+    return sink.calls == 1;
+  }));
+  std::thread t2([&] {
+    second = rt.PutCommitted(K(31), follower.data(), follower.size());
+    second_done.store(true, std::memory_order_release);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  EXPECT_FALSE(second_done.load(std::memory_order_acquire));
+  sink.open();
+  t1.join();
+  t2.join();
+  EXPECT_EQ(first, Status::kOk);
+  EXPECT_EQ(second, Status::kOk);
+  RamTier::Hit h;
+  ASSERT_TRUE(rt.GetPrep(K(31), 0, 0, &h));
+  EXPECT_EQ(std::string(h.ptr, h.len), leader);
+  h = RamTier::Hit{};
+}
 
-TEST(RamTier, RemoveOnlyDropsDurableIdle) {
+TEST(RamTier, InflightDuplicateSharesTerminalLeaderFailure) {
+  FlushSink sink;
+  sink.close();
+  sink.fail = true;
+  RamTier::Options o = Opts(8 * 4096);
+  o.flush_retries = 1;
+  RamTier rt(o, sink.fn());
+  const std::string value(500, 'f');
+  Status first = Status::kInvalid;
+  Status second = Status::kInvalid;
+  std::atomic<bool> second_done{false};
+  std::thread t1([&] {
+    first = rt.PutCommitted(K(32), value.data(), value.size());
+  });
+  ASSERT_TRUE(WaitFor([&] {
+    std::lock_guard<std::mutex> lk(sink.m);
+    return sink.calls == 1;
+  }));
+  std::thread t2([&] {
+    second = rt.PutCommitted(K(32), value.data(), value.size());
+    second_done.store(true, std::memory_order_release);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  EXPECT_FALSE(second_done.load(std::memory_order_acquire));
+  sink.open();
+  t1.join();
+  t2.join();
+  EXPECT_EQ(first, Status::kIOError);
+  EXPECT_EQ(second, Status::kIOError);
+  EXPECT_FALSE(rt.healthy());
+  EXPECT_FALSE(rt.Contains(K(32)));
+}
+
+TEST(RamTier, RemoveCancelsQueuedEntry) {
+  FlushSink sink;
+  sink.close();
+  RamTier rt(Opts(8 * 4096), sink.fn());
+  const std::string value(500, 'q');
+  ASSERT_TRUE(rt.Put(K(33), value.data(), value.size()));
+  ASSERT_TRUE(WaitFor([&] {
+    std::lock_guard<std::mutex> lk(sink.m);
+    return sink.calls == 1;
+  }));
+  ASSERT_TRUE(rt.Put(K(34), value.data(), value.size()));
+  EXPECT_TRUE(rt.Remove(K(34)));
+  EXPECT_FALSE(rt.Contains(K(34)));
+  sink.open();
+}
+
+TEST(RamTier, RemoveHidesActiveFlushAndDefersPinnedRelease) {
   FlushSink sink;
   sink.close();
   RamTier rt(Opts(8 * 4096), sink.fn());
   std::string v(200, 'r');
   ASSERT_TRUE(rt.Put(K(40), v.data(), v.size()));
-  EXPECT_FALSE(rt.Remove(K(40))) << "non-durable (flushing) -> declined";
-  sink.open();
-  EXPECT_TRUE(WaitFor([&] { return rt.Flushed() == 1u; }));
+  EXPECT_TRUE(WaitFor([&] {
+    std::lock_guard<std::mutex> lk(sink.m);
+    return sink.calls == 1;
+  }));
+
   RamTier::Hit h;
-  ASSERT_TRUE(rt.GetPrep(K(40), 0, v.size(), &h));  // now send-in-flight
-  EXPECT_FALSE(rt.Remove(K(40))) << "in-flight -> declined";
-  rt.Release(h.token);
-  EXPECT_TRUE(rt.Remove(K(40))) << "durable + idle -> removed";
+  ASSERT_TRUE(rt.GetPrep(K(40), 0, v.size(), &h));
+  std::atomic<bool> removed{false};
+  std::thread remover([&] {
+    removed.store(rt.Remove(K(40)), std::memory_order_release);
+  });
+  EXPECT_TRUE(WaitFor([&] { return !rt.Contains(K(40)); }));
+  EXPECT_FALSE(removed.load(std::memory_order_acquire));
+  EXPECT_EQ(std::string(h.ptr, h.len), v);
+  sink.open();
+  remover.join();
+  EXPECT_TRUE(removed.load(std::memory_order_acquire));
   EXPECT_FALSE(rt.Contains(K(40)));
+  h = RamTier::Hit{};
+  EXPECT_EQ(rt.Count(), 0u);
+}
+
+TEST(RamTier, LargeValueReadRangeFlushAndRemoveIsByteExact) {
+  ::setenv("DFKV_RAM_TIER_EXTENT_BYTES", "1048576", 1);
+  std::mutex m;
+  std::string flushed;
+  size_t flushed_len = 0;
+  size_t flushed_cap = 0;
+  RamTier rt(Opts(4ull << 20),
+             [&](const BlockKey&, char* data, size_t len, size_t cap) {
+               std::lock_guard<std::mutex> lk(m);
+               flushed.assign(data, len);
+               flushed_len = len;
+               flushed_cap = cap;
+               return true;
+             });
+  ::unsetenv("DFKV_RAM_TIER_EXTENT_BYTES");
+  ASSERT_TRUE(rt.ok());
+  EXPECT_EQ(rt.arena_bytes() + rt.large_budget_bytes(), 4ull << 20);
+  EXPECT_EQ(rt.large_budget_bytes(), 2ull << 20);
+  EXPECT_LE(rt.arena_bytes(), rt.budget_bytes());
+  int fake_mr = 0;
+  rt.SetArenaMr(&fake_mr);
+
+  std::string value((1ull << 20) + 137, '\0');
+  for (size_t i = 0; i < value.size(); ++i)
+    value[i] = static_cast<char>((i * 131 + 17) & 0xff);
+  ASSERT_TRUE(rt.Put(K(50), value.data(), value.size()));
+  EXPECT_EQ(rt.UsedBytes(), ((value.size() + 4095) / 4096) * 4096);
+  EXPECT_EQ(rt.large_used_bytes(), rt.UsedBytes());
+  EXPECT_LE(rt.arena_bytes() + rt.large_used_bytes(), rt.budget_bytes());
+
+  RamTier::Hit whole;
+  ASSERT_TRUE(rt.GetPrep(K(50), 0, 0, &whole));
+  EXPECT_FALSE(whole.in_arena);
+  EXPECT_EQ(whole.mr, nullptr);
+  EXPECT_EQ(whole.value_len, value.size());
+  EXPECT_EQ(std::string(whole.ptr, whole.len), value);
+  whole = RamTier::Hit{};
+
+  RamTier::Hit range;
+  ASSERT_TRUE(rt.GetPrep(K(50), (1ull << 20) - 19, 91, &range));
+  EXPECT_FALSE(range.in_arena);
+  EXPECT_EQ(std::string(range.ptr, range.len),
+            value.substr((1ull << 20) - 19, 91));
+  range = RamTier::Hit{};
+
+  ASSERT_TRUE(WaitFor([&] { return rt.Flushed() == 1; }));
+  {
+    std::lock_guard<std::mutex> lk(m);
+    EXPECT_EQ(flushed_len, value.size());
+    EXPECT_GE(flushed_cap, flushed_len);
+    EXPECT_EQ(flushed, value);
+  }
+  EXPECT_TRUE(rt.Remove(K(50)));
+  EXPECT_FALSE(rt.Contains(K(50)));
+  EXPECT_EQ(rt.UsedBytes(), 0u);
+  EXPECT_EQ(rt.large_used_bytes(), 0u);
+}
+
+TEST(RamTier, LargeValueSendPinDefersPhysicalRemovalAndCapacityRelease) {
+  ::setenv("DFKV_RAM_TIER_EXTENT_BYTES", "1048576", 1);
+  FlushSink sink;
+  RamTier rt(Opts(2ull << 20), sink.fn());
+  ::unsetenv("DFKV_RAM_TIER_EXTENT_BYTES");
+  const std::string first((1ull << 20) + 1, 'a');
+  const std::string second((1ull << 20) + 1, 'b');
+  ASSERT_TRUE(rt.Put(K(51), first.data(), first.size()));
+  ASSERT_TRUE(WaitFor([&] { return rt.Flushed() == 1; }));
+
+  RamTier::Hit pinned;
+  ASSERT_TRUE(rt.GetPrep(K(51), 0, 0, &pinned));
+  ASSERT_FALSE(pinned.in_arena);
+  EXPECT_TRUE(rt.Remove(K(51)));
+  EXPECT_FALSE(rt.Contains(K(51)));
+  EXPECT_FALSE(rt.Put(K(52), second.data(), second.size()))
+      << "pinned durable large value must not be reclaimed";
+  EXPECT_LE(rt.UsedBytes(), 2ull << 20);
+
+  EXPECT_EQ(std::string(pinned.ptr, pinned.len), first)
+      << "logical removal must not invalidate an in-flight pointer";
+  pinned = RamTier::Hit{};
+  EXPECT_TRUE(rt.Put(K(52), second.data(), second.size()))
+      << "final send release must make the physical capacity reusable";
+  EXPECT_FALSE(rt.Contains(K(51)));
+  EXPECT_TRUE(rt.Contains(K(52)));
+  EXPECT_LE(rt.UsedBytes(), 2ull << 20);
+}
+
+TEST(RamTier, LargeValueFlushFailureDropsAndReleasesBudget) {
+  ::setenv("DFKV_RAM_TIER_EXTENT_BYTES", "1048576", 1);
+  FlushSink sink;
+  sink.close();
+  RamTier::Options o = Opts(2ull << 20);
+  o.flush_retries = 1;
+  RamTier rt(o, sink.fn());
+  ::unsetenv("DFKV_RAM_TIER_EXTENT_BYTES");
+  const std::string value((1ull << 20) + 1, 'f');
+  ASSERT_TRUE(rt.Put(K(53), value.data(), value.size()));
+  RamTier::Hit pinned;
+  ASSERT_TRUE(rt.GetPrep(K(53), 0, 0, &pinned));
+  ASSERT_FALSE(pinned.in_arena);
+  EXPECT_FALSE(rt.Put(K(54), value.data(), value.size()))
+      << "non-durable large allocation applies byte-budget backpressure";
+  EXPECT_EQ(rt.PutBypass(), 1u);
+
+  {
+    std::lock_guard<std::mutex> lk(sink.m);
+    sink.fail = true;
+  }
+  sink.open();
+  ASSERT_TRUE(WaitFor([&] { return rt.FlushDropped() == 1; }));
+  EXPECT_FALSE(rt.Contains(K(53)));
+  EXPECT_GT(rt.UsedBytes(), 0u)
+      << "remove-pending allocation stays owned while a reader holds it";
+  EXPECT_EQ(std::string(pinned.ptr, pinned.len), value);
+  pinned = RamTier::Hit{};
+  EXPECT_EQ(rt.UsedBytes(), 0u);
+
+  {
+    std::lock_guard<std::mutex> lk(sink.m);
+    sink.fail = false;
+  }
+  EXPECT_TRUE(rt.Put(K(54), value.data(), value.size()));
+  EXPECT_LE(rt.UsedBytes(), 2ull << 20);
+}
+
+TEST(RamTier, ValueAboveTotalBudgetBypassesWithoutAccountingLeak) {
+  ::setenv("DFKV_RAM_TIER_EXTENT_BYTES", "1048576", 1);
+  FlushSink sink;
+  RamTier rt(Opts(2ull << 20), sink.fn());
+  ::unsetenv("DFKV_RAM_TIER_EXTENT_BYTES");
+  const std::string too_large((2ull << 20) + 1, 'x');
+  EXPECT_FALSE(rt.Put(K(55), too_large.data(), too_large.size()));
+  EXPECT_EQ(rt.PutBypass(), 1u);
+  EXPECT_EQ(rt.UsedBytes(), 0u);
+  EXPECT_EQ(rt.Count(), 0u);
 }
 
 TEST(RamTier, ConcurrentPutGetReleaseIsRaceFree) {
@@ -242,7 +483,7 @@ TEST(RamTier, ConcurrentPutGetReleaseIsRaceFree) {
         RamTier::Hit h;
         if (rt.GetPrep(k, 0, v.size(), &h)) {
           hits.fetch_add(1);
-          rt.Release(h.token);
+          h = RamTier::Hit{};
         }
       }
     });
@@ -280,6 +521,7 @@ TEST(RamTier, ReclaimTickGrowsHotClassFromColdDonor) {
   FlushSink sink;
   RamTier::Options o;
   o.bytes = 16ull << 20;  // 16 MiB arena
+  o.large_reserve_bytes = 0;  // isolate fixed-slot rebalance capacity
   o.slot_granularity = 4096;
   o.reclaim_interval_ms = 1;
   setenv("DFKV_RAM_TIER_EXTENT_BYTES", "1048576", 1);  // 16 extents x 1 MiB
@@ -349,11 +591,13 @@ TEST(RamTier, ShardedLifecycleAcrossShards) {
   FlushSink sink;  // gate open by default
   RamTier::Options o;
   o.bytes = 256ull << 20;  // 256 extents -> 32/shard, keeps 8 shards
+  o.large_reserve_bytes = 0;  // this test exercises arena sharding only
   o.slot_granularity = 4096;
   o.flush_threads = 8;
   RamTier t(o, sink.fn());
   ASSERT_TRUE(t.ok());
   EXPECT_EQ(t.shards(), 8u);
+  EXPECT_EQ(t.flusher_count(), 8u);
 
   const int N = 512;  // hash spreads these across all shards
   std::string v(8000, 'x');
@@ -371,7 +615,7 @@ TEST(RamTier, ShardedLifecycleAcrossShards) {
     ASSERT_TRUE(t.GetPrep(K(1000 + i), 0, 0, &h)) << i;
     EXPECT_EQ(h.len, v.size());
     EXPECT_EQ(std::string(h.ptr, 16), v.substr(0, 16));
-    t.Release(h.token);
+    h = RamTier::Hit{};
   }
   // Durable + idle -> removable, on whichever shard the key lives.
   for (int i = 0; i < N; i += 7) EXPECT_TRUE(t.Remove(K(1000 + i))) << i;
@@ -379,18 +623,27 @@ TEST(RamTier, ShardedLifecycleAcrossShards) {
   ::unsetenv("DFKV_RAM_TIER_EXTENT_BYTES");
 }
 
+TEST(RamTier, RejectsUnsupportedNumaMode) {
+  ::setenv("DFKV_RAM_TIER_NUMA", "2", 1);
+  FlushSink sink;
+  RamTier rt(Opts(8 * 4096), sink.fn());
+  EXPECT_FALSE(rt.ok());
+  ::unsetenv("DFKV_RAM_TIER_NUMA");
+}
+
 TEST(RamTier, ShardCountCanExceedLegacyCapOf16) {
   // Phase 10: kTokenShardBits 4->6 lifts the cap 16->64 so read/write-heavy
   // multi-connection deployments can shard past the old ceiling. 32 shards must
   // be honored (not clamped to 16), and shard-encoded tokens still round-trip.
-  // 1 MiB extents (the floor) x 1 GiB = 1024 extents => 32 shards sustains the
-  // >=32 extents/shard rule (32*32=1024). The arena is mmap'd lazily and the
-  // test touches only ~2 MiB, so physical RAM stays tiny despite the 1 GiB size.
+  // 1 MiB extents x 1 GiB = 1024 extents => 32 shards sustains the
+  // >=32 extents/shard rule. Dedicated residency is disabled here so the test
+  // isolates token routing and fixed-arena shard geometry.
   ::setenv("DFKV_RAM_TIER_EXTENT_BYTES", "1048576", 1);
   ::setenv("DFKV_RAM_TIER_SHARDS", "32", 1);
   FlushSink sink;
   RamTier::Options o;
   o.bytes = 1024ull << 20;   // 1024 x 1 MiB extents
+  o.large_reserve_bytes = 0;  // preserve all 1024 arena extents for 32 shards
   o.slot_granularity = 4096;
   o.flush_threads = 8;
   RamTier t(o, sink.fn());
@@ -402,7 +655,7 @@ TEST(RamTier, ShardCountCanExceedLegacyCapOf16) {
     RamTier::Hit h;
     ASSERT_TRUE(t.GetPrep(K(5000 + i), 0, 0, &h)) << i;  // token from a high shard
     EXPECT_EQ(h.len, v.size());
-    t.Release(h.token);
+    h = RamTier::Hit{};
   }
   ::unsetenv("DFKV_RAM_TIER_SHARDS");
   ::unsetenv("DFKV_RAM_TIER_EXTENT_BYTES");
@@ -427,7 +680,7 @@ TEST(RamTier, PutDurableNoFlushIOAndImmediatelyEvictable) {
   RamTier::Hit h;
   ASSERT_TRUE(rt.GetPrep(K(90), 0, v.size(), &h));
   EXPECT_EQ(std::string(h.ptr, h.len), v);
-  rt.Release(h.token);
+  h = RamTier::Hit{};
   // No flush-pin held: Remove (which declines on any pin) succeeds at once.
   EXPECT_TRUE(rt.Remove(K(90)));
   EXPECT_FALSE(rt.Contains(K(90)));

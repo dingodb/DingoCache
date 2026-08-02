@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <list>
 #include <map>
 #include <mutex>
 #include <string>
@@ -55,6 +56,7 @@ class PeerHealth {
   void MarkBad(const std::string& peer, uint64_t now_ms) {
     std::lock_guard<std::mutex> lk(mu_);
     errors_.fetch_add(1, std::memory_order_relaxed);
+    TrackLocked(peer);
     // Alive-busy: the peer served a response within the grace window, so this
     // failure is one slow/failed op on a live node, not a dead peer. Count the
     // error but do NOT engage the cooldown (which would instant-fail every
@@ -73,10 +75,9 @@ class PeerHealth {
     if (cd > max_cooldown_ms_ || cd < base_cooldown_ms_ /*overflow*/) cd = max_cooldown_ms_;
     until_[peer] = now_ms + cd;
     if (was_ok) marked_bad_.fetch_add(1, std::memory_order_relaxed);  // healthy->bad edge
-    // Bound per-peer cardinality: only track a new peer while under the cap, so a
-    // long-lived client churning through many distinct addresses can't grow the
-    // map (and its scrape series) without bound. Aggregate errors_ still counts.
-    if (peer_errors_.size() < kMaxPeers || peer_errors_.count(peer)) peer_errors_[peer]++;
+    // Per-peer errors share the same bounded peer index as every other
+    // address-keyed state map. Aggregate errors_ still counts evicted peers.
+    ++peer_errors_[peer];
   }
   // Data-path success: clears the cooldown and the backoff streak, and stamps
   // the peer's last-served time (the busy-vs-dead grace signal). Bumps the
@@ -84,8 +85,8 @@ class PeerHealth {
   void MarkGood(const std::string& peer, uint64_t now_ms) {
     std::lock_guard<std::mutex> lk(mu_);
     served_.fetch_add(1, std::memory_order_relaxed);
-    if (last_good_.size() < kMaxPeers || last_good_.count(peer))
-      last_good_[peer] = now_ms;
+    TrackLocked(peer);
+    last_good_[peer] = now_ms;
     ClearLocked(peer);
   }
   // Probe-driven recovery (off the data path): the background prober reached
@@ -94,6 +95,10 @@ class PeerHealth {
   // dead peer inside its (now backed-off) cooldown.
   void MarkProbeAlive(const std::string& peer) {
     std::lock_guard<std::mutex> lk(mu_);
+    auto tracked = tracked_.find(peer);
+    if (tracked != tracked_.end()) {
+      peer_lru_.splice(peer_lru_.end(), peer_lru_, tracked->second);
+    }
     ClearLocked(peer);
   }
 
@@ -141,15 +146,59 @@ class PeerHealth {
   uint64_t marked_bad() const { return marked_bad_.load(std::memory_order_relaxed); }
   uint64_t recovered() const { return recovered_.load(std::memory_order_relaxed); }
   uint64_t busy_suppressed() const { return busy_suppressed_.load(std::memory_order_relaxed); }
+  size_t tracked_peers_for_test() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return tracked_.size();
+  }
+  size_t cooldown_peers_for_test() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return until_.size();
+  }
+  size_t failure_streak_peers_for_test() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return fail_streak_.size();
+  }
+  size_t error_peers_for_test() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return peer_errors_.size();
+  }
+  size_t last_good_peers_for_test() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return last_good_.size();
+  }
 
  private:
+  // Admit or refresh one peer in the shared LRU. Eviction is deterministic for
+  // a given call order and removes the victim from every address-indexed map,
+  // so no map can outgrow the single global cardinality bound. Caller holds mu_.
+  void TrackLocked(const std::string& peer) {
+    auto tracked = tracked_.find(peer);
+    if (tracked != tracked_.end()) {
+      peer_lru_.splice(peer_lru_.end(), peer_lru_, tracked->second);
+      return;
+    }
+    if (tracked_.size() == kMaxPeers) {
+      const std::string victim = peer_lru_.front();
+      until_.erase(victim);
+      fail_streak_.erase(victim);
+      peer_errors_.erase(victim);
+      last_good_.erase(victim);
+      tracked_.erase(victim);
+      peer_lru_.pop_front();
+    }
+    peer_lru_.push_back(peer);
+    auto pos = peer_lru_.end();
+    --pos;
+    tracked_.emplace(peer, pos);
+  }
+
   // Clear a peer's cooldown + backoff streak (recovery). Caller holds mu_.
   void ClearLocked(const std::string& peer) {
     fail_streak_.erase(peer);
     if (until_.erase(peer)) recovered_.fetch_add(1, std::memory_order_relaxed);  // bad->good edge
   }
 
-  static constexpr size_t kMaxPeers = 4096;  // per-peer error-map cardinality cap
+  static constexpr size_t kMaxPeers = 4096;  // global address-state cardinality cap
   mutable std::mutex mu_;
   uint64_t base_cooldown_ms_;
   uint64_t max_cooldown_ms_;
@@ -157,6 +206,8 @@ class PeerHealth {
   std::unordered_map<std::string, uint64_t> until_;        // peer -> unhealthy-until (ms)
   std::unordered_map<std::string, uint32_t> fail_streak_;  // peer -> consecutive failures
   std::unordered_map<std::string, uint64_t> peer_errors_;  // peer -> cumulative IO errors
+  std::list<std::string> peer_lru_;  // oldest at front
+  std::unordered_map<std::string, std::list<std::string>::iterator> tracked_;
   std::unordered_map<std::string, uint64_t> last_good_;    // peer -> last served-at (ms)
   mutable std::atomic<uint64_t> checks_{0}, unhealthy_skips_{0}, errors_{0},
       marked_bad_{0}, served_{0}, recovered_{0}, busy_suppressed_{0};

@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import select
 import sys
+import struct
 import time
 
 # Make ``import dfkv_connector`` work when run from the repo without install.
@@ -28,7 +29,7 @@ import dfkv_connector.l2_adapter as l2mod  # noqa: E402
 from dfkv_connector.l2_adapter import (  # noqa: E402
     DfkvL2Adapter,
     DfkvL2AdapterConfig,
-    _object_key_to_string,
+    _object_key_to_bytes,
 )
 from lmcache.v1.distributed.api import ObjectKey  # noqa: E402
 
@@ -56,12 +57,12 @@ class _FakeObj:
 
 
 class _FakeDfkvClient:
-    """In-memory async stand-in for DfkvNativeClient (key_str -> bytes)."""
+    """In-memory async stand-in for DfkvNativeClient (binary key -> bytes)."""
 
     def __init__(self, **kwargs):
         self.transport_mode = "fake"
         self.closed = False
-        self._store: dict[str, bytes] = {}
+        self._store: dict[bytes, bytes] = {}
 
     async def batch_set(self, keys, bufs):
         for k, b in zip(keys, bufs):
@@ -153,13 +154,16 @@ def test_distinct_event_fds():
 
 def test_object_key_serialization_stable_and_salted():
     k = ObjectKey(chunk_hash=b"\x01\x02\x03", model_name="m", kv_rank=5)
-    s1 = _object_key_to_string(k)
-    assert s1 == _object_key_to_string(k), "serialization must be deterministic"
-    assert s1.startswith("m@00000005@0@010203")
+    s1 = _object_key_to_bytes(k)
+    assert s1 == _object_key_to_bytes(k), "serialization must be deterministic"
+    assert s1.startswith(b"DFKVPOOL\x02")
+    assert struct.pack("<I", 6) + b"010203" in s1
+    assert s1.endswith(struct.pack("<I", 3) + b"all")
     ks = ObjectKey(
         chunk_hash=b"\x01", model_name="m", kv_rank=0, cache_salt="userA"
     )
-    assert _object_key_to_string(ks).endswith("@userA")
+    assert _object_key_to_bytes(ks).endswith(
+        struct.pack("<I", 10) + b"salt-userA")
 
 
 def test_store_then_lookup_then_load_roundtrip():

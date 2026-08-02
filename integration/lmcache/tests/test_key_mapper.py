@@ -1,41 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for dfkv LMCache key_mapper (cache_engine_key_to_dfkv_str).
-
-Exercises the LMCache ``CacheEngineKey`` → dfkv key string serialization with
-fake key objects (``types.SimpleNamespace``), so it needs NEITHER lmcache/torch
-NOR a real dfkv ring / libdfkv.so. The ``key_mapper`` module's only external
-dependency is the ``CacheEngineKey`` *type* used in its annotation, which we
-substitute via ``sys.modules`` so the import succeeds without lmcache installed.
-
-Covers:
-  - Non-layerwise (base CacheEngineKey): legacy format, byte-identical to before.
-  - Layerwise (LayerCacheEngineKey): ``@{layer_id}`` appended; N layers of the
-    same chunk_hash + worker produce N distinct dfkv keys (no collision).
-
-Run:
-    python3 integration/lmcache/tests/test_key_mapper.py
-or with pytest:
-    python3 -m pytest integration/lmcache/tests/test_key_mapper.py -v
-"""
+"""Unit tests for LMCache's binary dfkv object-key mapping."""
 
 from __future__ import annotations
 
 import importlib.util
+import struct
 import os
 import sys
 import types
 
-# --- Stub lmcache.utils so key_mapper imports without lmcache/torch installed.
-# The real CacheEngineKey lives in lmcache.utils; key_mapper references it only
-# in an annotation (a bare name lookup at import time), so a module object with
-# the attribute set is enough. The tests use SimpleNamespace fake keys, not the
-# real class, so no torch is needed.
-if "lmcache" not in sys.modules:
-    sys.modules["lmcache"] = types.ModuleType("lmcache")
-if "lmcache.utils" not in sys.modules:
+# Stub lmcache.utils only when LMCache is genuinely unavailable. Keeping an
+# installed package intact makes this module safe to collect with the adapter
+# tests in one pytest process.
+try:
+    _HAS_LMCACHE = importlib.util.find_spec("lmcache.utils") is not None
+except (ImportError, ModuleNotFoundError, ValueError):
+    _HAS_LMCACHE = False
+
+if not _HAS_LMCACHE:
+    sys.modules.setdefault("lmcache", types.ModuleType("lmcache"))
     _stub = types.ModuleType("lmcache.utils")
 
-    class CacheEngineKey:  # minimal stand-in for the annotation target
+    class CacheEngineKey:
         pass
 
     _stub.CacheEngineKey = CacheEngineKey
@@ -51,7 +37,7 @@ _SPEC = importlib.util.spec_from_file_location(
 )
 _MOD = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MOD)
-cache_engine_key_to_dfkv_str = _MOD.cache_engine_key_to_dfkv_str
+cache_engine_key_to_dfkv_key = _MOD.cache_engine_key_to_dfkv_key
 
 
 def _base_key(model="glm-5.1", world_size=8, worker_id=0, chunk_hash=0xABCDEF):
@@ -71,25 +57,49 @@ def _layer_key(model="glm-5.1", world_size=8, worker_id=0, chunk_hash=0xABCDEF,
     k.layer_id = layer_id
     return k
 
+def _decode_key(key: bytes):
+    assert key.startswith(b"DFKVPOOL\x02")
+    offset = len(b"DFKVPOOL\x02")
 
-def test_base_key_legacy_format():
-    # Non-layerwise: format must be unchanged (back-compat with deployments
-    # running use_layerwise=False, the default).
-    k = _base_key(worker_id=2, chunk_hash=0x1234)
-    assert cache_engine_key_to_dfkv_str(k) == "glm-5.1@8@2@1234"
+    def field():
+        nonlocal offset
+        size = struct.unpack_from("<I", key, offset)[0]
+        offset += 4
+        value = key[offset:offset + size]
+        offset += size
+        return value
+
+    pool = field()
+    page_hash = field()
+    axes = struct.unpack_from("<IiIiIiIiIi", key, offset)
+    offset += struct.calcsize("<IiIiIiIiIi")
+    group = struct.unpack_from("<I", key, offset)[0]
+    offset += 4
+    component = field()
+    assert offset == len(key)
+    return pool, page_hash, axes, group, component
+
+
+def test_base_key_canonical_golden_format():
+    key = cache_engine_key_to_dfkv_key(
+        _base_key(worker_id=2, chunk_hash=0x1234))
+    assert _decode_key(key) == (
+        b"kv", b"1234",
+        (1, -1, 8, 2, 1, 0, 1, 0, 1, 0),
+        0, b"all",
+    )
 
 
 def test_base_key_full_hash_preserved():
-    # chunk_hash is rendered as full hex (not truncated).
-    k = _base_key(chunk_hash=0xDEADBEEFCAFE)
-    assert cache_engine_key_to_dfkv_str(k) == "glm-5.1@8@0@deadbeefcafe"
+    key = cache_engine_key_to_dfkv_key(
+        _base_key(chunk_hash=0xDEADBEEFCAFE))
+    assert _decode_key(key)[1] == b"deadbeefcafe"
 
 
-def test_layer_key_appends_layer_id():
-    # Layerwise: @layer_id appended, mirroring LMCache's LayerCacheEngineKey
-    # .to_string() which emits "...@{dtype}@{layer_id}".
-    k = _layer_key(chunk_hash=0x99, layer_id=7)
-    assert cache_engine_key_to_dfkv_str(k) == "glm-5.1@8@0@99@7"
+def test_layer_key_has_explicit_component():
+    key = cache_engine_key_to_dfkv_key(
+        _layer_key(chunk_hash=0x99, layer_id=7))
+    assert _decode_key(key)[4] == b"layer7"
 
 
 def test_layer_keys_same_chunk_different_layers_distinct():
@@ -98,11 +108,11 @@ def test_layer_keys_same_chunk_different_layers_distinct():
     # layer_id). Before the fix, these all collapsed to one dfkv key and
     # overwrote each other. They must now be distinct.
     keys = [_layer_key(chunk_hash=0x100, layer_id=L) for L in range(8)]
-    strs = [cache_engine_key_to_dfkv_str(k) for k in keys]
-    assert len(set(strs)) == 8, f"layer keys collided: {strs}"
-    # And each carries its own layer_id.
-    for L, s in enumerate(keys):
-        assert cache_engine_key_to_dfkv_str(s).endswith(f"@{L}")
+    binary_keys = [cache_engine_key_to_dfkv_key(k) for k in keys]
+    assert len(set(binary_keys)) == 8
+    for layer, key in enumerate(keys):
+        assert _decode_key(cache_engine_key_to_dfkv_key(key))[4] == (
+            f"layer{layer}".encode())
 
 
 def test_base_and_layer_zero_distinct():
@@ -112,43 +122,43 @@ def test_base_and_layer_zero_distinct():
     # them distinct, which is correct — they are different objects.
     base = _base_key(chunk_hash=0x200)
     layer0 = _layer_key(chunk_hash=0x200, layer_id=0)
-    assert cache_engine_key_to_dfkv_str(base) == "glm-5.1@8@0@200"
-    assert cache_engine_key_to_dfkv_str(layer0) == "glm-5.1@8@0@200@0"
-    assert cache_engine_key_to_dfkv_str(base) != cache_engine_key_to_dfkv_str(layer0)
+    assert base.chunk_hash == layer0.chunk_hash
+    assert _decode_key(cache_engine_key_to_dfkv_key(base))[4] == b"all"
+    assert _decode_key(cache_engine_key_to_dfkv_key(layer0))[4] == b"layer0"
+    assert cache_engine_key_to_dfkv_key(base) != cache_engine_key_to_dfkv_key(layer0)
 
 
 def test_layer_id_zero_is_encoded():
-    # layer_id=0 is a real layer, not "absent" — must be encoded (otherwise
-    # layer 0 collides with the non-layerwise base key, and with the chunk
-    # itself). getattr(..., None) returns 0 (not None) so the @0 suffix is added.
-    k = _layer_key(layer_id=0)
-    assert cache_engine_key_to_dfkv_str(k).endswith("@0")
+    key = cache_engine_key_to_dfkv_key(_layer_key(layer_id=0))
+    assert _decode_key(key)[4] == b"layer0"
 
 
 
-def test_canonical_worker_zeroes_rank():
-    # Phase 9: MLA shared keyspace — worker_id renders as 0.
-    k = _base_key(worker_id=5, chunk_hash=0xABC)
-    assert cache_engine_key_to_dfkv_str(k, canonicalize_worker=True) == \
-        "glm-5.1@8@0@abc"
+def test_canonical_worker_uses_replicated_rank():
+    key = cache_engine_key_to_dfkv_key(
+        _base_key(worker_id=5, chunk_hash=0xABC),
+        canonicalize_worker=True)
+    assert _decode_key(key)[2][3] == -1
 
 
-def test_canonical_default_off_keeps_legacy():
-    k = _base_key(worker_id=5, chunk_hash=0xABC)
-    assert cache_engine_key_to_dfkv_str(k) == "glm-5.1@8@5@abc"
+def test_sharded_default_keeps_worker_rank():
+    key = cache_engine_key_to_dfkv_key(
+        _base_key(worker_id=5, chunk_hash=0xABC))
+    assert _decode_key(key)[2][3] == 5
 
 
 def test_canonical_all_ranks_converge():
-    rendered = {cache_engine_key_to_dfkv_str(
-        _base_key(worker_id=w, chunk_hash=0xDEAD), canonicalize_worker=True)
+    rendered = {cache_engine_key_to_dfkv_key(_base_key(worker_id=w, chunk_hash=0xDEAD), canonicalize_worker=True)
         for w in range(8)}
     assert len(rendered) == 1
 
 
 def test_canonical_layerwise_keeps_layer_id():
-    k = _layer_key(worker_id=3, chunk_hash=0x1, layer_id=7)
-    assert cache_engine_key_to_dfkv_str(k, canonicalize_worker=True) == \
-        "glm-5.1@8@0@1@7"
+    key = cache_engine_key_to_dfkv_key(
+        _layer_key(worker_id=3, chunk_hash=0x1, layer_id=7),
+        canonicalize_worker=True)
+    assert _decode_key(key)[2][3] == -1
+    assert _decode_key(key)[4] == b"layer7"
 
 
 def _run_all():

@@ -1,6 +1,5 @@
 #include "client/kv_client.h"
 #include "transport/transport.h"
-#include "common/value_header.h"
 #include <gtest/gtest.h>
 #include <map>
 #include <mutex>
@@ -8,21 +7,25 @@
 using namespace dfkv;  // NOLINT
 
 namespace {
-ValueHeader Hdr() {
-  return ValueHeader::Make(0x51ULL, 64, 0x46384534u, ValueHeader::kFlagIsMla, 8, 0, 78, 1, 576);
-}
+std::string Hdr() { return "test/model"; }
 struct CountingTransport : Transport {
   std::string dead;
   std::mutex mu;
   std::map<std::string, int> range_calls, cache_calls;
   bool pipelined() const override { return false; }
-  Status Range(const std::string& node, const BlockKey&, uint64_t, uint64_t, std::string*) override {
+  Status Range(const std::string& node, const BlockKey&, uint64_t, uint64_t,
+               std::string*, uint64_t*) override {
     { std::lock_guard<std::mutex> lk(mu); range_calls[node]++; }
     return node == dead ? Status::kIOError : Status::kNotFound;
   }
   Status Cache(const std::string& node, const BlockKey&, const void*, size_t) override {
     { std::lock_guard<std::mutex> lk(mu); cache_calls[node]++; }
     return node == dead ? Status::kIOError : Status::kOk;
+  }
+  Status Lookup(const std::string& node, const BlockKey&,
+                uint64_t* value_len) override {
+    *value_len = 0;
+    return node == dead ? Status::kIOError : Status::kNotFound;
   }
   Status Exist(const std::string& node, const BlockKey&, bool* e) override {
     *e = false;

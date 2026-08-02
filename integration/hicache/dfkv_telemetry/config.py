@@ -66,93 +66,20 @@ def resolve(cfg: Optional[dict], key: str, env: str, default: Any) -> Any:
 
 
 # --- required-config validation --------------------------------------------
-# Important connector parameters (the per-model isolation identity, and the ring
-# to connect to) are checked at startup so the inference service refuses to
-# START rather than serve with a silently-wrong config. The isolation identity
-# is the sharpest case: a forgotten model_hash used to default to 0 (the shared
-# keyspace), which reads as valid but lets two models collide/share KV. The
-# checks distinguish "not passed" from "passed 0" and abort on either, unless
-# the operator explicitly opts into the shared keyspace.
-ENV_MODEL_HASH = "DFKV_MODEL_HASH"
-ENV_ALLOW_SHARED_KEYSPACE = "DFKV_ALLOW_SHARED_KEYSPACE"
-
-_UINT64_MAX = 0xFFFFFFFFFFFFFFFF
-_MISSING = object()
+# Model identity and ring reachability are checked at startup. The model
+# identity is carried losslessly as binary namespace bytes into dfkv_open.
 
 
 class DfkvConfigError(ValueError):
-    """A required dfkv connector config value is missing or invalid.
-
-    Raised at connector startup so the inference service refuses to start
-    instead of serving with a broken isolation identity (silently sharing or
-    colliding KV across models) or with no ring to connect to. Messages name the
-    offending parameter and how to set it, including the explicit
-    shared-keyspace opt-in.
-    """
+    """A required dfkv connector config value is missing or invalid."""
 
 
-def allow_shared_keyspace(cfg: Optional[dict] = None, override: Optional[bool] = None) -> bool:
-    """Whether the operator EXPLICITLY opted into the shared (no-isolation)
-    keyspace via allow_shared_keyspace=1 / DFKV_ALLOW_SHARED_KEYSPACE=1.
-    `override` (when not None) wins, for callers that resolved it themselves."""
-    if override is not None:
-        return bool(override)
-    return truthy(resolve(cfg, "allow_shared_keyspace",
-                          ENV_ALLOW_SHARED_KEYSPACE, False))
-
-
-def require_model_hash(cfg: Optional[dict] = None, *, allow_shared: Optional[bool] = None) -> int:
-    """Return a validated nonzero uint64 model_hash, or raise DfkvConfigError.
-
-    model_hash is the per-model isolation identity of the dfkv keyspace and is
-    REQUIRED: a missing / zero / non-integer / out-of-uint64 value aborts
-    startup, UNLESS the operator opts into the shared keyspace (returns 0 then).
-    The missing-vs-zero distinction is intentional — ``cfg.get('model_hash', 0)``
-    used to mask a forgotten param as the shared keyspace."""
-    shared = allow_shared_keyspace(cfg, allow_shared)
-    raw = resolve(cfg, "model_hash", ENV_MODEL_HASH, _MISSING)
-    if raw is _MISSING or (isinstance(raw, str) and not raw.strip()):
-        if shared:
-            return 0
-        raise DfkvConfigError(
-            "model_hash is required as the per-model isolation identity but was "
-            "not set. Set a nonzero per-model value (extra_config 'model_hash' or "
-            "env DFKV_MODEL_HASH), or allow_shared_keyspace=1 to opt into the "
-            "shared keyspace (no cross-model isolation).")
-    if isinstance(raw, bool):  # bool is an int subclass; reject it explicitly
-        raise DfkvConfigError("model_hash must be an integer (uint64), not a bool.")
-    try:
-        v = raw if isinstance(raw, int) else int(str(raw), 0)
-    except (TypeError, ValueError):
-        raise DfkvConfigError(
-            "model_hash must be an integer (uint64); got {!r}.".format(raw))
-    if v < 0 or v > _UINT64_MAX:
-        raise DfkvConfigError(
-            "model_hash out of uint64 range [0, 2^64): {}.".format(v))
-    if v == 0:
-        if shared:
-            return 0
-        raise DfkvConfigError(
-            "model_hash=0 is the shared keyspace (no cross-model isolation). Set "
-            "a nonzero per-model value, or allow_shared_keyspace=1 to opt in.")
-    return v
-
-
-def require_isolation_name(name: Any, *, field: str = "model_name",
-                           cfg: Optional[dict] = None,
-                           allow_shared: Optional[bool] = None) -> str:
-    """Validate an isolation-namespace string (the source a connector hashes into
-    model_hash, e.g. LMCache's model_name). Empty / blank / non-string makes
-    every deployment collide on one derived keyspace, so it aborts startup unless
-    the shared keyspace is explicitly allowed."""
+def require_isolation_name(name: Any, *, field: str = "model_name") -> str:
+    """Return a non-empty model identity suitable for canonical_namespace."""
     if isinstance(name, str) and name.strip():
         return name
-    if allow_shared_keyspace(cfg, allow_shared):
-        return name if isinstance(name, str) else ""
     raise DfkvConfigError(
-        "{0} is required as the isolation namespace (it derives the dfkv "
-        "model_hash); an empty {0} makes every deployment share one keyspace. "
-        "Set {0}, or allow_shared_keyspace=1 to opt in.".format(field))
+        f"{field} is required as the dfkv model namespace and must be non-empty")
 
 
 def require_ring_endpoint(members: Any = None, mds_endpoints: Any = None) -> None:

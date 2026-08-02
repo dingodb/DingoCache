@@ -18,53 +18,56 @@ three engines through thin adapters over one portable core:
 > production `dingo-cache` (brpc + MDS), see `docs/INTEGRATION.md`.
 
 ## What it is
-- **`dfkv_server`** — a cache-node daemon. Disk + LRU, **cache-only** (a miss is
-  a clean NotFound; no object-store fallback), synchronous durable-visible writes.
-  Supports **multiple NVMe SSDs per node** (`--dir d1,d2,d3`, intra-node Ketama).
-  With `--mds`, `--group`, `--id`, `--advertise`, `--weight` it registers into the
-  MDS tier; the old static `--members` flag has been removed. Pluggable storage
-  backend `--store-engine=file|slab` (default `file`) and an optional
-  write-through **RAM hot tier** (`DFKV_RAM_TIER=1`) — see
+- **`dfkv_server`** — a cache-node daemon. Disk + bounded eviction,
+  **cache-only** (a miss is a clean NotFound; no object-store fallback),
+  synchronous durable-visible writes. Supports **multiple NVMe SSDs per node**
+  (`--dir d1,d2,d3`, intra-node Ketama). With `--mds`, `--group`, `--id`,
+  `--advertise`, `--weight` it registers into the MDS tier. With neither a
+  `--store-engine` option nor `DFKV_STORE_ENGINE`, every server/store path
+  selects the restart-safe slab backend. `file` remains an explicit
+  diagnostic/rollback choice; invalid slab capacity/geometry refuses startup
+  rather than falling back. An optional write-through **RAM hot tier**
+  (`DFKV_RAM_TIER=1`) serves registered-memory hits without disk I/O — see
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **`dfkv_mds`** — stateless Membership Directory Service daemon. Flags:
   `--listen <port>` and `--etcd <host:port>` (default `127.0.0.1:2379`). The only
   etcd client in the system; holds each node's etcd lease on its behalf. Deploy as
   N replicas — no load-balancer needed; nodes and clients each pick any reachable
   MDS and fail over automatically.
-- **`libdfkv.so`** — C ABI client (key→consistent-hash routing, value header with
-  CRC + model/page/dtype/layer geometry guard, Put/Get/Exist).
+- **`libdfkv.so`** — C ABI client (canonical namespace + object-key hashing,
+  Ketama routing, opaque raw-value Put/Get/Exist).
 - **`integration/hicache/dfkv_hicache.py`** — SGLang `HiCacheStorage` plugin loaded via
   `--hicache-storage-backend dynamic` (no SGLang fork). MLA: one packed-latent
   object per page, no tp_rank suffix, `backup_skip` (only tp_rank 0 writes).
 
 ## Design in one breath
 SGLang HiCache (zero-copy `interface_v1`) → `dfkv_hicache.py` (ctypes) →
-`libdfkv` client
-(Ketama route + header wrap/verify) → TCP/RDMA → `dfkv_server` → optional RAM hot
-tier → DiskCacheGroup over N NVMe (per-disk `StoreEngine`: `file` or `slab`), LRU.
+`libdfkv` v2 client (length-framed namespace/object identity + Ketama route) →
+TCP/RDMA → `dfkv_server` → optional RAM hot tier → DiskCacheGroup over N NVMe
+(production slab extents; explicit file fallback).
 Distributed = client-side consistent hashing; no replication (regenerable KV →
 node loss = miss → recompute). Full architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 **Membership** is managed by the MDS tier (`dfkv_mds` + etcd). Nodes register
 with the MDS on startup and send periodic heartbeats; etcd leases (TTL 30 s)
-are the liveness signal. Clients call `dfkv_start_mds_discovery(c, "ep1,ep2",
-group, poll_ms)` to poll the MDS and rebuild the weighted consistent-hash ring
-whenever the epoch (etcd revision) advances. Two-layer offline detection:
-**layer-2** — etcd lease expiry → MDS view changes → client epoch → ring rebuild
-(authoritative removal, ≤ 30 s); **layer-1** — `PeerHealth` fast avoidance: a
-peer that fails transport IO is short-circuited to miss for a cooldown period
-without any ring change. The legacy static path (`dfkv_open(members=...)` /
-`dfkv_set_members`) still exists for simple or single-node setups.
+are the liveness signal. Native clients use the single immutable
+`dfkv_client_options_v2` constructor: set either static `members` or
+`mds_endpoints` + `mds_group`. MDS mode polls the directory and rebuilds the
+weighted consistent-hash ring whenever its epoch advances. Two-layer offline
+detection: **layer-2** — etcd lease expiry → MDS view changes → client epoch →
+ring rebuild (authoritative removal, ≤ 30 s); **layer-1** — `PeerHealth` fast
+avoidance short-circuits transport failures to misses during a cooldown. There
+is no post-open membership mutation API in v2.
 
 **Client registration** (who is using dfkv): cache *consumers* (inference
 connector instances — vLLM / LMCache / SGLang HiCache) register themselves with
 the MDS under a disjoint etcd prefix (`/dfkv/v1/groups/<g>/clients/<id>`) so
 they never enter the placement ring. The same lease/heartbeat contract as nodes
 applies — a dead connector's key expires out of etcd within the TTL, no explicit
-deregister, no stale keys. `dfkv_start_client_registration(c, mds, group,
-client_id, client_info, heartbeat_ms)` is the C entry point; the
-vLLM/LMCache/SGLang connectors call it automatically when MDS discovery is in
-use (opt out with `DFKV_CLIENT_REGISTER=0`).
+deregister, no stale keys. Connectors set
+`DFKV_CLIENT_OPT_REGISTER_WITH_MDS`, `client_id`, `client_info`, and heartbeat
+fields in `dfkv_client_options_v2` when MDS discovery is used (opt out with
+`DFKV_CLIENT_REGISTER=0`).
 Observe with `dfkvctl clients --mds <ep,...> --group <g>` or the
 `dfkv_mds_group_clients` gauge. Only upgraded clients register, so an empty list
 means "none of the current consumers are registered," not "no one is using dfkv."
@@ -90,11 +93,11 @@ dfkv_server --dir /mnt/disk1/dfkv,/mnt/disk2/dfkv,/mnt/disk3/dfkv \
             --mds 10.0.0.1:9400,10.0.0.2:9400 \
             --group default --id n1 --advertise 10.0.0.10:12000
 
-# 4. Client: MDS-based discovery (recommended)
-#    dfkv_start_mds_discovery(c, "10.0.0.1:9400,10.0.0.2:9400", "default", 3000);
-#    (connectors also auto-register as consumers; see "Client registration" above)
-# OR legacy static path (single-node / simple setups)
-#    dfkv_open("n1=10.0.0.10:12000,...", ...)
+# 4. Client: one immutable v2 construction descriptor (recommended MDS mode)
+#    dfkv_client_options_v2 o = { ... .mds_endpoints = "10.0.0.1:9400,10.0.0.2:9400",
+#                                 .mds_group = "default" };
+#    dfkv_client_t c = dfkv_open_v2(&o);
+# Static single-node mode sets o.members instead; no mutable follow-up calls.
 ```
 
 ## Observe the cluster
@@ -115,12 +118,14 @@ src/        portable C++ core: common/ (shared types) · utils/ (generic helpers
             client/ (KV client + C ABI) · mds/ (membership service + dfkv_mds) · tools/ (CLIs)
 integration/hicache/  dfkv_hicache.py (SGLang dynamic backend plugin) + dfkv_telemetry/
                       (canonical shared telemetry pkg, vendored by the other connectors)
+integration/common/   dfkv_common shared identity and C ABI schema package
 integration/lmcache/  dfkv_connector  (LMCache RemoteConnector, ctypes over libdfkv.so)
 integration/vllm/     dfkv_vllm       (vLLM KVConnectorBase_V1, GPUDirect RDMA, bypass LMCache)
 test/       gtest suites + test/python (unittest + no-torch sglang shim)
 docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire protocol) ·
             CONNECTORS.md (engine connectors: HiCache · vLLM · LMCache + client env/config reference) ·
             DEPLOY.md (dfkv CLUSTER deploy: etcd + MDS + server + systemd) · INTEGRATION.md (fuse into dingo-cache)
+            CACHELIB_EVALUATION.md (F25 decision: no CacheLib/Navy backend in v2.0.0)
 ```
 
 ## Engine integrations
@@ -137,25 +142,31 @@ docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire p
   reference + recommended settings) and `integration/vllm/README.md`.
 
 ## Operability & performance features
-- **Pluggable storage engine** (`--store-engine=file|slab`, default `file`): the
-  `file` engine is one file per block (battle-tested); the `slab` engine is a
-  fixed pool of pre-allocated **extent files** carved into slots by a media-agnostic
-  size-class allocator, with a compact `slots.tbl` so the index **rebuilds on
-  restart** (cache warmth across a rolling upgrade) — removing the one-file-per-block
-  hazards (tmp leak / ENOSPC dead-end / unbounded inodes / lock-held unlink /
-  open-per-GET). Crash-safe (CRC32 per slot record). Off by default.
-- **RAM hot tier** (`DFKV_RAM_TIER=1`, off by default): a pre-registered RAM arena
+- **Slab-first storage** (no flag/env required; `--store-engine=slab` may pin it
+  explicitly): a fixed pool of pre-allocated extent files carved into
+  deterministic size classes. Sparse `slots.tbl` metadata is rebuilt in bulk
+  after restart, preserving cache warmth without directory walks, per-object
+  opens, or file-per-block inode pressure. CRC-protected records, dirty-epoch
+  cold reset, deferred removal, O_DIRECT payload I/O, and byte-aware eviction
+  keep failures fail-closed. `--store-engine=file` is an explicit diagnostic
+  fallback, not a silent recovery path or the production default.
+- **RAM hot tier** (`DFKV_RAM_TIER=1`, off by default): a pre-registered arena
   fronting the disk — PUT is **write-through** (synchronously visible, async-flushed
   to disk) and a warm GET is served **straight from the arena over RDMA** (zero-copy
   scatter-send from the arena MR, no open/pread/disk), removing the disk-bound COLD
   load bottleneck. Send-in-flight slot pinning + flush backpressure keep it correct;
   `dfkv_ram_*` metrics expose hit-rate + backpressure. See
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §5–6.
-- **96-bit block identity** (id + index from MD5): makes same-model hash
-  collisions — a silent cross-key read — vanishingly unlikely. Automatic in the
-  v1.7.x client, no config. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §3.
+- **128-bit native block identity**: SHA-256 of length-framed canonical
+  namespace + object-key bytes, truncated to 128 bits for wire/storage identity.
+  Connector object keys are self-delimiting binary bytes encoding pool, full
+  chunk hash, DP/TP/PCP/DCP/PP coordinates, cache-group/component, and optional
+  scatter geometry; namespace remains separate binary identity. C ABI v2 passes
+  every key as pointer + exact length (parallel arrays for batch/SG), so embedded
+  NUL and non-UTF-8 bytes are preserved. Values remain opaque raw bytes with no
+  hidden header or compatibility unwrap.
 - **Connection pooling + keep-alive** (TCP_NODELAY): ~250× lower latency vs dial-per-call.
-- **Batch APIs** with concurrent fan-out across nodes (`BatchPut/Get/Exist`, C ABI + plugin).
+- **Batch APIs** with concurrent fan-out across nodes and local NVMe disks.
 - **Connect/IO timeouts + stale-connection retry**: a hung node fails fast, never hangs.
 - **Observability** ([docs/METRICS.md](docs/METRICS.md)): opt-in embedded Prometheus
   `/metrics` on `dfkv_server` and `dfkv_mds` (`--metrics-port`); sampled op-latency
@@ -167,10 +178,10 @@ docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire p
   Collector → Grafana — opt-in via `DFKV_METRICS_ENABLED=1`, **zero-dependency stdlib
   exporter by default**; see [deploy/observability/CONNECTOR-USAGE.md](deploy/observability/CONNECTOR-USAGE.md)
   and [docs/METRICS.md](docs/METRICS.md) §3.4.
-- **Dynamic membership**: MDS discovery (`dfkv_start_mds_discovery`) polls the MDS
-  tier and rebuilds the weighted Ketama ring on each etcd-epoch change. Legacy
-  `SetMembers()` hot-swap and `dfkv_refresh_members` (single-seed query) are still
-  supported.
+- **Dynamic membership**: the immutable `dfkv_client_options_v2` descriptor
+  selects MDS discovery at construction; the client polls MDS and atomically
+  rebuilds its weighted Ketama ring on etcd-epoch changes. No mutable
+  membership or post-open discovery API is exported.
 - **CLI tools**: `dfkv_smoke` (roundtrip check), `dfkvctl` — per-node ops
   (`put/get/exist/stat`) plus cluster views: `dfkvctl ring` (membership + ring vnode
   share + each node's **self-reported version/config** — engine, capacity, RAM tier,
@@ -181,13 +192,14 @@ docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire p
   sends an empty device selector to its peer. An explicit comma whitelist opts
   into multi-rail round-robin and therefore must name the intended fabric on
   both hosts. QPs bootstrap over a tiny TCP channel, so the data fabric needs no
-  IP. A v2 capability probe falls back connection-by-connection to the v1
-  SEND/RECV path for rolling upgrades; unset `DFKV_RDMA` still selects TCP.
-- **Mixed zero-copy data plane**: control descriptors/status use small 4-KiB
+  IP. A v2 capability probe is mandatory; protocol, QP, receive-segment, or
+  registration mismatch rejects the connection. Unset `DFKV_RDMA` selects TCP;
+  once RDMA is requested it never switches transports.
+- **One-sided zero-copy data plane**: control descriptors/status use small 4-KiB
   SEND/RECV buffers. PUT payloads RDMA-WRITE into leases from one process-wide,
   pre-registered receive segment; GET payloads RDMA-WRITE directly into the
   caller's registered buffer. No connection-sized block buffers or payload copy
-  remain on v2.
+  are used.
 - **Optional pipelining** (`DFKV_RDMA_DEPTH=K`): K requests in flight per connection.
   A network-latency hider, **not a throughput knob** — GET and PUT are both
   depth-flat (the per-connection serve loop is in-order; benchmarked GET ~1.24 GB/s at
@@ -202,7 +214,7 @@ docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire p
 - **HiCache v2** (PoolTransfer) for multi-pool models (Mamba/SWA/DeepSeek-V4).
 - **Packaging**: CPack (deb/rpm/tgz) + Dockerfile; **graceful shutdown**; leveled logging.
 
-## Recommended tuning (v1.34+)
+## Recommended tuning (v2.0)
 
 Validated on a 5-node ring (8×B200 hosts, 6× Gen4 NVMe + 8×400G IB per node,
 128 GiB RAM arena): cold read 97 → **156 GB/s**, hot read 48 → **97 GB/s**
@@ -216,7 +228,7 @@ fabric selection and capacity explicit.
 |---|---|---|
 | `--rdma-dev` | leave unset for one local HCA; list the fabric explicitly for multi-rail | Unset selects the first `ACTIVE` local HCA (peer names may differ). A comma list opts into multi-rail, anchors only listed active devices, and requires compatible names/fabric on both hosts; inactive entries are rejected. |
 | `DFKV_DISK_HASH_WEIGHT` | `10` | Flattens the intra-server disk ring share from ±20 % to ±3 % so the hottest disk stops gating the whole node (+5–6 % cold read, ~2× lower p99). **Re-routes existing keys** (cache miss + refill) — flip together with a restart/upgrade window. |
-| `--rdma-depth` | `4` (keep) | Deeper is not itself a throughput knob. On v2 it consumes more slots from the fixed shared receive segment; on v1 fallback it also grows per-connection pinned buffers. |
+| `--rdma-depth` | `4` (keep) | Deeper is not itself a throughput knob. It consumes more slots from the fixed shared receive segment. |
 | `--ram-tier` / `--ram-tier-bytes` / `--ram-tier-shards` | on / sized to the node / `16` for ≥100 GiB arenas | Large arenas contend on the shard locks under mixed load (+40 % mixed R/W at 16 shards on a 128 GiB arena); small (≤16 GiB) arenas are fine at the default 8. |
 | `--store-engine` | `slab` | Index rebuilds on restart; removes file-per-block hazards. |
 
@@ -228,7 +240,7 @@ fabric selection and capacity explicit.
 | `DFKV_RDMA_DEPTH` | `4` | Pairs with the server's posted depth (window = min of both, negotiated). |
 | `DFKV_FANOUT_THREADS` | unset (default 32) | Only wide single-process clients (benchmarks, many concurrent Batch* callers) need more. |
 
-**Read-side convoy collapse (v1.35+, opt-in)** — for MLA + TP-N inference
+**Read-side convoy collapse (v2.0, opt-in)** — for MLA + TP-N inference
 rings, where every rank is a separate process fetching the SAME page and the
 NVMe otherwise eats N identical reads per page (measured 1:1 disk:wire on a
 TP8 replay; with the knobs below: **~2.4 device reads per duplicated page,
@@ -256,7 +268,9 @@ silently measures TCP), 8-rail `DFKV_RDMA_DEV`, `DFKV_RDMA_DEPTH=4`,
 `DFKV_FANOUT_THREADS=256`; cold-read sweet spot `--threads 16 --batch 8
 --size 4194304` per client node. Keep `--count` ≤ the seed's written key count,
 and let the drives settle ~10 min after bulk writes before cold-read A/Bs (FTL
-GC depresses cold reads ~25 %).
+GC depresses cold reads ~25 %). The command prints every requested phase report,
+then exits `1` if any PUT/GET failed, `2` for invalid CLI usage, and `0` only
+when every requested operation succeeded.
 
 ## Status
 TDD; **264 C++ ctest entries (default) / 288 (RDMA+io_uring) + Python plugin &

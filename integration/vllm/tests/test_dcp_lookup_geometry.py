@@ -53,8 +53,14 @@ DCP = 8
 
 _METADATA = {
     "model_name": "m",
+    "dp_size": 1,
+    "dp_rank": -1,
+    "tp_size": 8,
     "tp_rank": 0,
+    "pcp_size": 1,
     "pcp_rank": 0,
+    "dcp_size": DCP,
+    "pp_size": 1,
     "pp_rank": 0,
     "group_id": 0,
 }
@@ -66,11 +72,11 @@ def _md(dcp_rank: int) -> KeyMetadata:
 
 def _onewire_key(md: KeyMetadata, h: BlockHash) -> str:
     # Same on-wire form lookup probes and the save path store: group-0 SG key.
-    return _sg_group_key(PoolKey(md, h.hex()).to_string(), 0, SG_MAX_SEGS)
+    return _sg_group_key(PoolKey(md, h.hex()).to_bytes(), 0, SG_MAX_SEGS)
 
 
-def _make_store(geometry: str, hashes: list[BlockHash]) -> set[str]:
-    store: set[str] = set()
+def _make_store(geometry: str, hashes: list[BlockHash]) -> set[bytes]:
+    store: set[bytes] = set()
     for r in range(DCP):
         for c, h in enumerate(hashes):
             if geometry == "A" or (geometry == "B" and r == c % DCP):
@@ -78,11 +84,11 @@ def _make_store(geometry: str, hashes: list[BlockHash]) -> set[str]:
     return store
 
 
-def _lookup_hit_tokens(store: set[str], hashes: list[BlockHash]) -> int:
+def _lookup_hit_tokens(store: set[bytes], hashes: list[BlockHash]) -> int:
     class _FakeClient:
         _sg_segs_cache = SG_MAX_SEGS
 
-        def __init__(self, present: set[str]):
+        def __init__(self, present: set[bytes]):
             self._present = present
 
         def batch_exist(self, keys):

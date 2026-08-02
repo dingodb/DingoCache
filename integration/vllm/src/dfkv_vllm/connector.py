@@ -314,6 +314,13 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
             return None
         return self.connector_worker.get_kv_connector_stats()
 
+    def shutdown(self) -> None:
+        """vLLM lifecycle hook: release connector resources deterministically."""
+        if self.connector_worker is not None:
+            self.connector_worker.close()
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.close()
+
     @classmethod
     def build_kv_connector_stats(
         cls, data: dict[str, Any] | None = None

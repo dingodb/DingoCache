@@ -38,9 +38,7 @@ def _cfg():
     return HiCacheStorageConfig(
         tp_rank=0, tp_size=8, is_mla_model=True, is_page_first_layout=False,
         model_name="glm-5.1",
-        extra_config={"members": MEMBERS, "model_hash": 0x51, "dtype_tag": 0x46384534,
-                      "page_size": PAGE_SIZE, "layer_num": 78, "head_num": 1, "head_dim": 576,
-                      "interface_v1": 1})
+        extra_config={"members": MEMBERS, "interface_v1": 1})
 
 
 def main():

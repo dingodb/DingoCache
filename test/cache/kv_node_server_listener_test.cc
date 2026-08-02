@@ -1,0 +1,169 @@
+#include "cache/kv_node_server.h"
+#include "client/key_map.h"
+#include "transport/tcp_transport.h"
+#include "utils/net_util.h"
+
+#include <gtest/gtest.h>
+
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <functional>
+#include <memory>
+#include <string>
+#include <thread>
+
+namespace fs = std::filesystem;
+using namespace dfkv;  // NOLINT
+
+namespace {
+class ScopedEnv {
+ public:
+  ScopedEnv(const char* name, const char* value) : name_(name) {
+    if (const char* old = std::getenv(name)) {
+      had_old_ = true;
+      old_ = old;
+    }
+    ::setenv(name, value, 1);
+  }
+  ~ScopedEnv() {
+    if (had_old_)
+      ::setenv(name_.c_str(), old_.c_str(), 1);
+    else
+      ::unsetenv(name_.c_str());
+  }
+
+ private:
+  std::string name_;
+  std::string old_;
+  bool had_old_ = false;
+};
+
+std::unique_ptr<KvNodeServer> StartServer(const char* suffix) {
+  const fs::path dir = fs::temp_directory_path() /
+      (std::string("dfkv_tcp_listener_") + suffix + "_" +
+       std::to_string(::getpid()));
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  auto server = std::make_unique<KvNodeServer>(dir.string(), 1ull << 20);
+  EXPECT_EQ(server->Start(0), Status::kOk);
+  return server;
+}
+
+bool WaitFor(const std::function<bool()>& predicate, int timeout_ms) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(timeout_ms);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (predicate()) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return predicate();
+}
+
+int Dial(const KvNodeServer& server) {
+  return net::Dial("127.0.0.1:" + std::to_string(server.port()), 1000, 1000);
+}
+}  // namespace
+
+TEST(KvNodeServerListener, SaturationRejectsBeyondHandlerLimit) {
+  ScopedEnv engine("DFKV_STORE_ENGINE", "file");
+  ScopedEnv max_connections("DFKV_TCP_MAX_CONNS", "2");
+  ScopedEnv io_timeout("DFKV_TCP_IO_TIMEOUT_S", "10");
+  auto server = StartServer("saturation");
+
+  int first = Dial(*server);
+  int second = Dial(*server);
+  ASSERT_GE(first, 0);
+  ASSERT_GE(second, 0);
+  ASSERT_TRUE(WaitFor([&] { return server->live_conn_count() == 2; }, 1000));
+
+  int rejected = Dial(*server);
+  ASSERT_GE(rejected, 0);
+  ASSERT_TRUE(WaitFor(
+      [&] { return server->TcpRejectedConnections() == 1; }, 1000));
+  EXPECT_EQ(server->live_conn_count(), 2u);
+
+  timeval timeout{1, 0};
+  ::setsockopt(rejected, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  char byte = 0;
+  EXPECT_LE(::recv(rejected, &byte, 1, 0), 0);
+  ::close(rejected);
+  ::close(first);
+  ::close(second);
+  server->Stop();
+}
+
+TEST(KvNodeServerListener, SilentPeerIsReleasedBySocketTimeout) {
+  ScopedEnv engine("DFKV_STORE_ENGINE", "file");
+  ScopedEnv max_connections("DFKV_TCP_MAX_CONNS", "4");
+  ScopedEnv io_timeout("DFKV_TCP_IO_TIMEOUT_S", "1");
+  auto server = StartServer("silent");
+
+  int fd = Dial(*server);
+  ASSERT_GE(fd, 0);
+  ASSERT_TRUE(WaitFor([&] { return server->live_conn_count() == 1; }, 1000));
+  EXPECT_TRUE(WaitFor([&] { return server->live_conn_count() == 0; }, 3000));
+  ::close(fd);
+  server->Stop();
+}
+
+TEST(KvNodeServerListener, ShutdownInterruptsSilentHandlersPromptly) {
+  ScopedEnv engine("DFKV_STORE_ENGINE", "file");
+  ScopedEnv max_connections("DFKV_TCP_MAX_CONNS", "4");
+  ScopedEnv io_timeout("DFKV_TCP_IO_TIMEOUT_S", "60");
+  auto server = StartServer("shutdown");
+
+  int fd = Dial(*server);
+  ASSERT_GE(fd, 0);
+  ASSERT_TRUE(WaitFor([&] { return server->live_conn_count() == 1; }, 1000));
+  const auto start = std::chrono::steady_clock::now();
+  server->Stop();
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  EXPECT_LT(elapsed, std::chrono::seconds(2));
+  ::close(fd);
+}
+
+TEST(KvNodeServerListener, NormalPooledTcpRemainsFunctionalAtLimit) {
+  ScopedEnv engine("DFKV_STORE_ENGINE", "file");
+  ScopedEnv max_connections("DFKV_TCP_MAX_CONNS", "1");
+  ScopedEnv io_timeout("DFKV_TCP_IO_TIMEOUT_S", "5");
+  auto server = StartServer("pooled");
+  const std::string endpoint =
+      "127.0.0.1:" + std::to_string(server->port());
+  TcpTransport transport;
+  const BlockKey key = ToBlockKey("listener/model", "pooled-key");
+  const std::string value = "normal pooled payload";
+
+  ASSERT_EQ(transport.Cache(endpoint, key, value.data(), value.size()),
+            Status::kOk);
+  bool exists = false;
+  ASSERT_EQ(transport.Exist(endpoint, key, &exists), Status::kOk);
+  EXPECT_TRUE(exists);
+  std::string got;
+  ASSERT_EQ(transport.Range(endpoint, key, 0, value.size(), &got), Status::kOk);
+  EXPECT_EQ(got, value);
+  EXPECT_EQ(server->TcpRejectedConnections(), 0u);
+  EXPECT_EQ(server->AcceptCount(), 1u);
+  server->Stop();
+}
+
+TEST(KvNodeServerListener, ConfigIsHardBoundedAndExported) {
+  ScopedEnv engine("DFKV_STORE_ENGINE", "file");
+  ScopedEnv max_connections("DFKV_TCP_MAX_CONNS", "999999");
+  ScopedEnv io_timeout("DFKV_TCP_IO_TIMEOUT_S", "999999");
+  auto server = StartServer("config");
+
+  EXPECT_EQ(server->TcpMaxConnections(), 4096u);
+  EXPECT_EQ(server->TcpIoTimeoutSeconds(), 3600);
+  const std::string metrics = server->MetricsText();
+  EXPECT_NE(metrics.find("dfkv_tcp_max_connections 4096"), std::string::npos)
+      << metrics;
+  EXPECT_NE(metrics.find("dfkv_tcp_io_timeout_seconds 3600"),
+            std::string::npos) << metrics;
+  EXPECT_NE(metrics.find("dfkv_tcp_rejected_connections_total 0"),
+            std::string::npos) << metrics;
+  server->Stop();
+}

@@ -1,12 +1,17 @@
 #include "cache/kv_node_server.h"
 
 #include <chrono>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <string>
 
 #include <vector>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "common/config_dump.h"
 #include "utils/log.h"
@@ -26,6 +31,43 @@ inline double NowSec() {
              std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 }  // namespace
+
+void KvNodeServer::InitTcpListenerConfig() {
+  auto bounded = [](const char* name, uint64_t fallback,
+                    uint64_t hard_max) -> uint64_t {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') return fallback;
+    if (*value < '0' || *value > '9') {
+      DFKV_LOG_WARN(std::string("invalid ") + name + "='" + value +
+                    "'; using " + std::to_string(fallback));
+      return fallback;
+    }
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed == 0) {
+      DFKV_LOG_WARN(std::string("invalid ") + name + "='" + value +
+                    "'; using " + std::to_string(fallback));
+      return fallback;
+    }
+    if (parsed > hard_max) {
+      DFKV_LOG_WARN(std::string(name) + " clamped to hard maximum " +
+                    std::to_string(hard_max));
+      return hard_max;
+    }
+    return parsed;
+  };
+  tcp_max_connections_ = static_cast<size_t>(
+      bounded("DFKV_TCP_MAX_CONNS", kDefaultTcpMaxConnections,
+              kHardTcpMaxConnections));
+  tcp_io_timeout_seconds_ = static_cast<int>(
+      bounded("DFKV_TCP_IO_TIMEOUT_S", kDefaultTcpIoTimeoutSeconds,
+              kHardTcpIoTimeoutSeconds));
+  config_dump::RecordResolved("DFKV_TCP_MAX_CONNS",
+                              std::to_string(tcp_max_connections_));
+  config_dump::RecordResolved("DFKV_TCP_IO_TIMEOUT_S",
+                              std::to_string(tcp_io_timeout_seconds_));
+}
 
 KvNodeServer::KvNodeServer(const std::string& cache_dir,
                            uint64_t capacity_bytes)
@@ -93,7 +135,6 @@ void KvNodeServer::InitRamTier() {
   if (const char* r = std::getenv("DFKV_RAM_RECLAIM_MS"))
     o.reclaim_interval_ms = static_cast<uint32_t>(std::strtoul(r, nullptr, 10));
   config_dump::RecordResolved("DFKV_RAM_TIER_BYTES", std::to_string(o.bytes));
-  config_dump::RecordResolved("DFKV_RAM_FLUSH_THREADS", std::to_string(o.flush_threads));
   config_dump::RecordResolved("DFKV_RAM_RECLAIM_MS", std::to_string(o.reclaim_interval_ms));
   // Flusher persists a RAM slot to the disk group. CacheDirect (not Cache): the
   // arena slot is 4 KiB-aligned with cap slack, so a direct-mode slab lands it
@@ -116,14 +157,21 @@ void KvNodeServer::InitRamTier() {
     for (size_t i = 0; i < sts.size(); ++i) ok[i] = (sts[i] == Status::kOk);
     return ok;
   });
-  if (tier->ok()) ram_ = std::move(tier);  // arena alloc failed => stay disk-only
+  if (tier->ok()) {
+    ram_ = std::move(tier);
+  } else {
+    ram_required_failed_ = true;
+    DFKV_LOG_ERROR(
+        "requested RAM tier initialization failed; refusing disk-only startup");
+  }
 }
 
 Status KvNodeServer::Start(int port) {
-  if (!group_.Healthy()) {
-    DFKV_LOG_ERROR("refusing startup: " + group_.StartupError());
+  if (!Healthy()) {
+    DFKV_LOG_ERROR("refusing startup: local storage initialization failed");
     return Status::kIOError;
   }
+  InitTcpListenerConfig();
   listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
   if (listen_fd_ < 0) return Status::kIOError;
   int one = 1;
@@ -182,6 +230,7 @@ void KvNodeServer::ReapDoneLocked() {
 
 size_t KvNodeServer::live_conn_count() {
   std::lock_guard<std::mutex> lk(conn_mu_);
+  ReapDoneLocked();
   return conns_.size();
 }
 
@@ -220,7 +269,10 @@ std::string KvNodeServer::MetricsText() const {
   s += "# HELP dfkv_build_info Build and version info (constant 1)\n";
   s += "# TYPE dfkv_build_info gauge\n";
   s += std::string("dfkv_build_info{version=\"") + DFKV_VERSION +
-       "\",transport=\"" DFKV_BUILD_TRANSPORT "\"";
+       "\",transport=\"" DFKV_BUILD_TRANSPORT "\",engine=\"" +
+       PromLabelEscape(group_.EngineName()) + "\",write_mode=\"" +
+       PromLabelEscape(group_.WriteMode().empty() ? "n/a" :
+                                                group_.WriteMode()) + "\"";
   if (!node_id_.empty() || !node_group_.empty())
     s += ",node=\"" + PromLabelEscape(node_id_) + "\",group=\"" +
          PromLabelEscape(node_group_) + "\"";
@@ -229,6 +281,9 @@ std::string KvNodeServer::MetricsText() const {
                     std::chrono::steady_clock::now() - start_time_).count();
   metric("dfkv_uptime_seconds", "gauge", "Seconds since node start", up);
   // counters
+  metric("dfkv_storage_healthy", "gauge",
+         "Current local disk and requested RAM-tier health (readiness input)",
+         Healthy() ? 1 : 0);
   metric("dfkv_cache_put_total", "counter", "Cache (PUT) ops accepted", m_cache_put());
   metric("dfkv_cache_hit_total", "counter", "Range (GET) ops that hit", m_cache_hit());
   metric("dfkv_cache_miss_total", "counter", "Range (GET) ops that missed", m_cache_miss());
@@ -258,8 +313,45 @@ std::string KvNodeServer::MetricsText() const {
   metric("dfkv_objects", "gauge", "Cached objects on this node", group_.Count());
   metric("dfkv_used_bytes", "gauge", "Bytes used on disk", group_.UsedBytes());
   metric("dfkv_disks", "gauge", "Backing NVMe disks", group_.DiskCount());
+  metric("dfkv_tenant_default_quota_bytes", "gauge",
+         "Default per-node tenant quota bytes (0 means unlimited)",
+         group_.TenantDefaultQuotaBytes());
+  metric("dfkv_tenant_quota_rejections_total", "counter",
+         "PUT items rejected by per-node tenant quotas",
+         group_.TenantQuotaRejections());
+  const auto tenant_quotas = group_.ConfiguredTenantQuotaMetrics();
+  auto tenant_metric = [&](const char* name, const char* type,
+                           const char* help, auto value) {
+    s += "# HELP "; s += name; s += " "; s += help; s += "\n";
+    s += "# TYPE "; s += name; s += " "; s += type; s += "\n";
+    for (const auto& tenant : tenant_quotas) {
+      const std::string labels =
+          braces("tenant_hash=\"" +
+                 BlockKey::Hex64(tenant.tenant_hash) + "\"");
+      s += name; s += labels; s += " ";
+      s += std::to_string(value(tenant)); s += "\n";
+    }
+  };
+  tenant_metric("dfkv_tenant_quota_limit_bytes", "gauge",
+                "Configured per-node quota for this tenant hash",
+                [](const auto& tenant) { return tenant.limit_bytes; });
+  tenant_metric("dfkv_tenant_used_bytes", "gauge",
+                "Committed payload bytes for this configured tenant hash",
+                [](const auto& tenant) { return tenant.used_bytes; });
+  tenant_metric("dfkv_tenant_quota_rejections_by_hash_total", "counter",
+                "PUT items rejected for this configured tenant hash",
+                [](const auto& tenant) { return tenant.rejections; });
   metric("dfkv_open_connections", "gauge", "Currently open client connections",
          rd(open_connections_));
+  metric("dfkv_tcp_max_connections", "gauge",
+         "Configured cache TCP handler admission limit",
+         tcp_max_connections_);
+  metric("dfkv_tcp_io_timeout_seconds", "gauge",
+         "Configured cache TCP per-socket receive/send timeout",
+         tcp_io_timeout_seconds_);
+  metric("dfkv_tcp_rejected_connections_total", "counter",
+         "Cache TCP connections rejected at the handler admission limit",
+         rd(tcp_rejected_connections_));
   // errors by op+status (one HELP/TYPE, multiple labeled series)
   s += "# HELP dfkv_errors_total Failed ops by op and status\n";
   s += "# TYPE dfkv_errors_total counter\n";
@@ -350,6 +442,21 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_rebuild_rejected_records_total", "counter",
            "Valid records rejected and cleared for unsafe geometry or conflict",
            ss.rebuild_rejected_records);
+    metric("dfkv_slab_rebuild_scanned_bytes", "gauge",
+           "slots.tbl bytes read during the last startup rebuild",
+           ss.rebuild_scanned_bytes);
+    metric("dfkv_slab_rebuild_scan_chunks", "gauge",
+           "Bounded chunks visited by the last startup rebuild",
+           ss.rebuild_scan_chunks);
+    metric("dfkv_slab_rebuild_sparse_ranges", "gauge",
+           "Allocated sparse ranges visited by the last startup rebuild",
+           ss.rebuild_sparse_ranges);
+    metric("dfkv_slab_rebuild_sequential_fallbacks_total", "counter",
+           "Startup rebuilds that fell back from sparse seek to sequential scan",
+           ss.rebuild_sequential_fallbacks);
+    metric("dfkv_slab_rebuild_mmap_scans", "gauge",
+           "Slab tables mapped for the last startup rebuild",
+           ss.rebuild_mmap_scans);
     metric("dfkv_slab_capacity_bytes", "gauge",
            "Configured physical slab payload capacity", ss.capacity_bytes);
     metric("dfkv_slab_allocated_bytes", "gauge",
@@ -372,6 +479,46 @@ std::string KvNodeServer::MetricsText() const {
            "Extents assigned to active slab classes", ss.bound_extents);
     metric("dfkv_slab_pool_extents", "gauge",
            "Unbound extents available to new classes", ss.pool_extents);
+    const auto classes = group_.SlabClasses();
+    auto class_metric = [&](const char* name, const char* type,
+                            const char* help, auto value) {
+      s += "# HELP "; s += name; s += " "; s += help; s += "\n";
+      s += "# TYPE "; s += name; s += " "; s += type; s += "\n";
+      for (const auto& cls : classes) {
+        const std::string labels =
+            braces("slot_size=\"" + std::to_string(cls.slot_size) + "\"");
+        s += name; s += labels; s += " ";
+        s += std::to_string(value(cls)); s += "\n";
+      }
+    };
+    class_metric("dfkv_slab_class_extents", "gauge",
+                 "Bound extents in this live slab size class",
+                 [](const auto& cls) { return cls.extents; });
+    class_metric("dfkv_slab_class_resident_objects", "gauge",
+                 "Resident objects in this live slab size class",
+                 [](const auto& cls) { return cls.resident; });
+    class_metric("dfkv_slab_class_free_slots", "gauge",
+                 "Immediately allocatable slots in this live slab size class",
+                 [](const auto& cls) { return cls.free_slots; });
+    class_metric("dfkv_slab_class_allocated_bytes", "gauge",
+                 "Occupied slot bytes in this live slab size class",
+                 [](const auto& cls) { return cls.allocated_bytes; });
+    class_metric("dfkv_slab_class_useful_bytes", "gauge",
+                 "Caller payload bytes in this live slab size class",
+                 [](const auto& cls) { return cls.useful_bytes; });
+    class_metric("dfkv_slab_class_fragmentation_bytes", "gauge",
+                 "Occupied slot bytes not carrying caller payload",
+                 [](const auto& cls) {
+                   return cls.allocated_bytes >= cls.useful_bytes
+                              ? cls.allocated_bytes - cls.useful_bytes
+                              : 0;
+                 });
+    class_metric("dfkv_slab_class_read_heat", "gauge",
+                 "Operation-decayed read heat for this live slab size class",
+                 [](const auto& cls) { return cls.read_heat; });
+    class_metric("dfkv_slab_class_put_total", "counter",
+                 "Cumulative puts admitted to this slab size class",
+                 [](const auto& cls) { return cls.puts; });
     metric("dfkv_slab_failed_disks", "gauge",
            "Slab disks in fail-closed state", ss.failed_disks);
     metric("dfkv_slab_healthy", "gauge",
@@ -399,6 +546,27 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_ram_rebalanced_total", "counter", "RAM extents moved from cold classes to hot ones by the reclaimer", ram_->Rebalanced());
     metric("dfkv_ram_objects", "gauge", "Blocks currently resident in the RAM hot tier", ram_->Count());
     metric("dfkv_ram_flush_backlog", "gauge", "RAM slots queued for flush (not yet durable)", ram_->FlushBacklog());
+    metric("dfkv_ram_budget_bytes", "gauge",
+           "Hard total RAM-tier budget across arena and dedicated values",
+           ram_->budget_bytes());
+    metric("dfkv_ram_arena_bytes", "gauge",
+           "Fixed registered arena bytes reserved from the total budget",
+           ram_->arena_bytes());
+    metric("dfkv_ram_large_budget_bytes", "gauge",
+           "Dedicated oversized-value reserve within the total budget",
+           ram_->large_budget_bytes());
+    metric("dfkv_ram_used_bytes", "gauge",
+           "Resident slot plus dedicated allocation bytes",
+           ram_->UsedBytes());
+    metric("dfkv_ram_large_used_bytes", "gauge",
+           "Resident dedicated oversized allocation bytes",
+           ram_->large_used_bytes());
+    metric("dfkv_ram_healthy", "gauge",
+           "Whether the RAM tier has avoided a terminal flush failure",
+           ram_->healthy() ? 1 : 0);
+    metric("dfkv_ram_flush_threads", "gauge",
+           "Actual RAM flusher count after the per-shard minimum adjustment",
+           ram_->flusher_count());
   }
   return s;
 }
@@ -408,12 +576,20 @@ void KvNodeServer::AcceptLoop() {
     int fd = ::accept(listen_fd_, nullptr, nullptr);
     if (fd < 0) { if (!running_) break; continue; }
     int one = 1;
-    ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));  // avoid Nagle stalls
+    ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    timeval timeout{tcp_io_timeout_seconds_, 0};
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
     accept_count_.fetch_add(1, std::memory_order_relaxed);
-    open_connections_.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(conn_mu_);
-    if (!running_) { open_connections_.fetch_sub(1, std::memory_order_relaxed); ::close(fd); break; }
-    ReapDoneLocked();  // join handlers that finished since the last accept
+    if (!running_) { ::close(fd); break; }
+    ReapDoneLocked();
+    if (conns_.size() >= tcp_max_connections_) {
+      tcp_rejected_connections_.fetch_add(1, std::memory_order_relaxed);
+      ::close(fd);
+      continue;
+    }
+    open_connections_.fetch_add(1, std::memory_order_relaxed);
     conn_fds_.insert(fd);
     auto done = std::make_shared<std::atomic<bool>>(false);
     conns_.push_back({std::thread([this, fd, done] {
@@ -429,33 +605,52 @@ void KvNodeServer::AcceptLoop() {
 }
 
 // Transport-agnostic request processing + metrics (shared by TCP and RDMA).
+Status KvNodeServer::LookupForKey(const BlockKey& key,
+                                  ValueMetadata* out) const {
+  if (out == nullptr) return Status::kInvalid;
+  size_t ram_len = 0;
+  if (ram_ && ram_->Lookup(key, &ram_len)) {
+    out->value_len = ram_len;
+    return Status::kOk;
+  }
+  return group_.Lookup(key, out);
+}
+
 
 Status KvNodeServer::ProcessRequestForKey(
     uint8_t op_raw, const BlockKey& key, uint64_t offset, uint64_t length,
-    const char* payload, uint64_t payload_len, std::string* out_data) {
+    const char* payload, uint64_t payload_len, std::string* out_data,
+    size_t* out_value_len) {
+  if (out_value_len) *out_value_len = 0;
   WireOp op = static_cast<WireOp>(op_raw);
   Status st = Status::kInvalid;
   switch (op) {
     case WireOp::kCache: {
       bool samp = lat_sampler_.ShouldSample();
       double t0 = samp ? NowSec() : 0.0;
-      // Write-through RAM tier: on acceptance the value is synchronously visible
-      // in RAM (read-after-write) and flushed to disk in the background. On
-      // backpressure (arena full of un-flushed slots) Put declines and we take
-      // the normal disk path.
-      if (ram_ && ram_->Put(key, payload, payload_len)) {
-        st = Status::kOk;
-        cache_put_.fetch_add(1, std::memory_order_relaxed);
-        bytes_written_.fetch_add(payload_len, std::memory_order_relaxed);
-      } else if (put_busy_limit_ > 0 &&
-                 disk_put_inflight_.load(std::memory_order_relaxed) >=
-                     put_busy_limit_) {
-        // Same admission gate as the RDMA CacheDirect path (see there): the TCP
-        // data path is non-production but must not become an ungated side door
-        // around the disk-write cap.
+      // A server PUT cannot acknowledge an arena admission: it waits for the
+      // actual disk commit. Only genuine RAM capacity backpressure falls through
+      // to a separate synchronous disk write; an in-flight duplicate shares its
+      // leader's final result.
+      bool needs_disk = true;
+      if (ram_ && group_.TenantQuotaBytes(key.tenant_hash) == 0) {
+        st = ram_->PutCommitted(key, payload, payload_len);
+        needs_disk = st == Status::kCacheFull;
+        if (st == Status::kOk) {
+          cache_put_.fetch_add(1, std::memory_order_relaxed);
+          bytes_written_.fetch_add(payload_len, std::memory_order_relaxed);
+        } else if (!needs_disk && st == Status::kIOError) {
+          put_io_err_.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+      if (needs_disk && put_busy_limit_ > 0 &&
+          disk_put_inflight_.load(std::memory_order_relaxed) >=
+              put_busy_limit_) {
         st = Status::kCacheFull;
         put_busy_.fetch_add(1, std::memory_order_relaxed);
-      } else {
+        needs_disk = false;
+      }
+      if (needs_disk) {
         disk_put_inflight_.fetch_add(1, std::memory_order_relaxed);
         st = group_.Cache(key, payload, payload_len);
         disk_put_inflight_.fetch_sub(1, std::memory_order_relaxed);
@@ -477,7 +672,7 @@ Status KvNodeServer::ProcessRequestForKey(
         RamTier::Hit h;
         if (ram_->GetPrep(key, offset, length, &h)) {
           out_data->assign(h.ptr, h.len);
-          ram_->Release(h.token);
+          if (out_value_len) *out_value_len = h.value_len;
           st = Status::kOk;
           cache_hit_.fetch_add(1, std::memory_order_relaxed);
           bytes_read_.fetch_add(out_data->size(), std::memory_order_relaxed);
@@ -494,10 +689,14 @@ Status KvNodeServer::ProcessRequestForKey(
           const size_t cap = length;
           out_data->resize(cap);
           size_t n = 0;
-          st = read_coalescer_.Read(key, offset, length, out_data->empty() ? nullptr : &(*out_data)[0], cap, &n,
-              [&](char* buf, size_t bcap, size_t* on) {
+          st = read_coalescer_.Read(
+              key, offset, length,
+              out_data->empty() ? nullptr : &(*out_data)[0], cap, &n,
+              out_value_len,
+              [&](char* buf, size_t bcap, size_t* on, size_t* value_len) {
                 std::string tmp;
-                Status s = group_.Range(key, offset, length, &tmp);
+                Status s =
+                    group_.Range(key, offset, length, &tmp, value_len);
                 if (s == Status::kOk) {
                   size_t m = tmp.size() < bcap ? tmp.size() : bcap;
                   std::memcpy(buf, tmp.data(), m);
@@ -507,7 +706,7 @@ Status KvNodeServer::ProcessRequestForKey(
               });
           out_data->resize(st == Status::kOk ? n : 0);
         } else {
-          st = group_.Range(key, offset, length, out_data);
+          st = group_.Range(key, offset, length, out_data, out_value_len);
         }
         if (st == Status::kOk) {
           cache_hit_.fetch_add(1, std::memory_order_relaxed);
@@ -524,31 +723,40 @@ Status KvNodeServer::ProcessRequestForKey(
     case WireOp::kExist: {
       bool samp = lat_sampler_.ShouldSample();
       double t0 = samp ? NowSec() : 0.0;
-      // A RAM-resident block (possibly RAM-only, not yet flushed) must count as
-      // present, else Exist would report absent for a just-written key.
-      if ((ram_ && ram_->Contains(key)) || group_.IsCached(key)) {
-        st = Status::kOk; exist_hit_.fetch_add(1, std::memory_order_relaxed);
-      } else {
-        st = Status::kNotFound; exist_miss_.fetch_add(1, std::memory_order_relaxed);
+      ValueMetadata metadata;
+      st = LookupForKey(key, &metadata);
+      if (st == Status::kOk) {
+        if (out_value_len)
+          *out_value_len = static_cast<size_t>(metadata.value_len);
+        exist_hit_.fetch_add(1, std::memory_order_relaxed);
+      } else if (st == Status::kNotFound) {
+        exist_miss_.fetch_add(1, std::memory_order_relaxed);
       }
-      // Handler-body latency: both branches take the RAM shard lock (Contains)
-      // and/or the disk group's cached-set lock (IsCached), which a slab reclaim
-      // or flush can hold — the tail here is a lock-contention signal.
       if (samp) exist_lat_.Observe(NowSec() - t0);
       break;
     }
+    case WireOp::kLookup: {
+      ValueMetadata metadata;
+      st = LookupForKey(key, &metadata);
+      if (st == Status::kOk && out_value_len)
+        *out_value_len = static_cast<size_t>(metadata.value_len);
+      break;
+    }
     case WireOp::kRemove: {
-      // Drop from both tiers. RamTier::Remove is best-effort (a still-flushing or
-      // in-flight slot declines and is reclaimed later under pressure); the L2
-      // eviction this backs targets durable blocks, which drop cleanly.
-      bool ram_had = ram_ && ram_->Remove(key);
-      Status ds = group_.Remove(key);
-      if (ram_had || ds == Status::kOk) {
-        st = Status::kOk; remove_ok_.fetch_add(1, std::memory_order_relaxed);
-      } else if (ds == Status::kNotFound) {
-        st = Status::kNotFound; remove_miss_.fetch_add(1, std::memory_order_relaxed);
+      // RamTier hides the key first and waits out/cancels any flush. The disk
+      // remove therefore compensates a flush that reached durable storage just
+      // before the fence; after it returns no later RAM worker can republish.
+      const bool ram_had = ram_ && ram_->Remove(key);
+      const Status disk_status = group_.Remove(key);
+      if (disk_status == Status::kOk ||
+          (disk_status == Status::kNotFound && ram_had)) {
+        st = Status::kOk;
+        remove_ok_.fetch_add(1, std::memory_order_relaxed);
+      } else if (disk_status == Status::kNotFound) {
+        st = Status::kNotFound;
+        remove_miss_.fetch_add(1, std::memory_order_relaxed);
       } else {
-        st = ds;
+        st = disk_status;
       }
       break;
     }
@@ -577,7 +785,8 @@ Status KvNodeServer::ProcessRequestForKey(
 
 Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
                                      uint64_t length, char* dst,
-                                     size_t dst_cap, size_t* out_len) {
+                                     size_t dst_cap, size_t* out_len,
+                                     size_t* value_len) {
   bool samp = lat_sampler_.ShouldSample();
   double t0 = samp ? NowSec() : 0.0;
   if (ram_) {
@@ -585,8 +794,8 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
     if (ram_->GetPrep(key, offset, length, &h)) {  // RAM hit: copy out, no disk
       size_t n = h.len < dst_cap ? h.len : dst_cap;
       std::memcpy(dst, h.ptr, n);
-      ram_->Release(h.token);
       if (out_len) *out_len = n;
+      if (value_len) *value_len = h.value_len;
       cache_hit_.fetch_add(1, std::memory_order_relaxed);
       bytes_read_.fetch_add(n, std::memory_order_relaxed);
       if (samp) get_lat_.Observe(NowSec() - t0);
@@ -595,12 +804,15 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
   }
   Status st;
   if (coalesce_enabled_) {
-    st = read_coalescer_.Read(key, offset, length, dst, dst_cap, out_len,
-        [&](char* buf, size_t cap, size_t* n) {
-          return group_.RangeInto(key, offset, length, buf, cap, n);
+    st = read_coalescer_.Read(
+        key, offset, length, dst, dst_cap, out_len, value_len,
+        [&](char* buf, size_t cap, size_t* n, size_t* stored_len) {
+          return group_.RangeInto(key, offset, length, buf, cap, n,
+                                  stored_len);
         });
   } else {
-    st = group_.RangeInto(key, offset, length, dst, dst_cap, out_len);
+    st = group_.RangeInto(key, offset, length, dst, dst_cap, out_len,
+                          value_len);
   }
   if (st == Status::kOk) {
     cache_hit_.fetch_add(1, std::memory_order_relaxed);
@@ -619,24 +831,28 @@ Status KvNodeServer::CacheDirectForKey(const BlockKey& key, char* data,
                                        size_t len, size_t cap) {
   bool samp = lat_sampler_.ShouldSample();
   double t0 = samp ? NowSec() : 0.0;
-  // RAM write-through (same [ValueHeader|payload] blob GET returns); backpressure
-  // or disabled falls through to the O_DIRECT disk write.
-  Status st;
-  if (ram_ && ram_->Put(key, data, len)) {
-    st = Status::kOk;
-    cache_put_.fetch_add(1, std::memory_order_relaxed);
-    bytes_written_.fetch_add(len, std::memory_order_relaxed);
-  } else if (put_busy_limit_ > 0 &&
-             disk_put_inflight_.load(std::memory_order_relaxed) >=
-                 put_busy_limit_) {
-    // Admission gate (opt-in, --put-inflight-limit): the disk write queue is
-    // already `limit` deep -- fast-fail with kCacheFull instead of joining a
-    // 100ms+ device queue. Clients treat kCacheFull as a plain put-failure
-    // WITHOUT a peer cooldown (unlike kIOError), so the block is simply
-    // recomputed later: a controlled miss instead of a latency tail.
+  // RAM admission is not success: wait for the leader's disk commit. Only
+  // kCacheFull means genuine arena backpressure and may take the direct disk
+  // fallback; an admitted failure and every duplicate return the shared result.
+  Status st = Status::kCacheFull;
+  bool needs_disk = true;
+  if (ram_ && group_.TenantQuotaBytes(key.tenant_hash) == 0) {
+    st = ram_->PutCommitted(key, data, len);
+    needs_disk = st == Status::kCacheFull;
+    if (st == Status::kOk) {
+      cache_put_.fetch_add(1, std::memory_order_relaxed);
+      bytes_written_.fetch_add(len, std::memory_order_relaxed);
+    } else if (!needs_disk && st == Status::kIOError) {
+      put_io_err_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  if (needs_disk && put_busy_limit_ > 0 &&
+      disk_put_inflight_.load(std::memory_order_relaxed) >= put_busy_limit_) {
     st = Status::kCacheFull;
     put_busy_.fetch_add(1, std::memory_order_relaxed);
-  } else {
+    needs_disk = false;
+  }
+  if (needs_disk) {
     disk_put_inflight_.fetch_add(1, std::memory_order_relaxed);
     st = group_.CacheDirect(key, data, len, cap);
     disk_put_inflight_.fetch_sub(1, std::memory_order_relaxed);
@@ -656,7 +872,7 @@ Status KvNodeServer::CacheDirectForKey(const BlockKey& key, char* data,
 
 Status KvNodeServer::RangeDirectForKey(
     const BlockKey& key, uint64_t offset, uint64_t length, char* io_buf,
-    size_t io_cap, const char** out_data, size_t* out_len) {
+    size_t io_cap, const char** out_data, size_t* out_len, size_t* value_len) {
   bool samp = lat_sampler_.ShouldSample();
   double t0 = samp ? NowSec() : 0.0;
   if (ram_) {
@@ -667,9 +883,9 @@ Status KvNodeServer::RangeDirectForKey(
       // zero-copy (send straight from the arena MR) is B5-3.
       size_t n = h.len < io_cap ? h.len : io_cap;
       std::memcpy(io_buf, h.ptr, n);
-      ram_->Release(h.token);
       if (out_data) *out_data = io_buf;
       if (out_len) *out_len = n;
+      if (value_len) *value_len = h.value_len;
       cache_hit_.fetch_add(1, std::memory_order_relaxed);
       bytes_read_.fetch_add(n, std::memory_order_relaxed);
       if (samp) get_lat_.Observe(NowSec() - t0);
@@ -680,17 +896,20 @@ Status KvNodeServer::RangeDirectForKey(
   if (coalesce_enabled_) {
     // Leader reads into the shared scratch, every rank's convoy copy lands in
     // its own registered io_buf; *out_data must point at io_buf either way.
-    st = read_coalescer_.Read(key, offset, length, io_buf, io_cap, out_len,
-        [&](char* buf, size_t cap, size_t* n) {
+    st = read_coalescer_.Read(
+        key, offset, length, io_buf, io_cap, out_len, value_len,
+        [&](char* buf, size_t cap, size_t* n, size_t* stored_len) {
           const char* p = nullptr;
-          Status s = group_.RangeDirect(key, offset, length, buf, cap, &p, n);
+          Status s = group_.RangeDirect(key, offset, length, buf, cap, &p, n,
+                                        stored_len);
           if (s == Status::kOk && p && p != buf && *n > 0)
             std::memcpy(buf, p, *n < cap ? *n : cap);
           return s;
         });
     if (st == Status::kOk && out_data) *out_data = io_buf;
   } else {
-    st = group_.RangeDirect(key, offset, length, io_buf, io_cap, out_data, out_len);
+    st = group_.RangeDirect(key, offset, length, io_buf, io_cap, out_data,
+                            out_len, value_len);
   }
   if (st == Status::kOk) {
     cache_hit_.fetch_add(1, std::memory_order_relaxed);
@@ -705,119 +924,110 @@ Status KvNodeServer::RangeDirectForKey(
 }
 
 
-Status KvNodeServer::RangeDirectPrepForKey(
-    const BlockKey& key, uint64_t offset, uint64_t length, size_t io_cap,
-    KVStore::RangePrep* out, uint64_t* out_flight) {
-  if (out_flight) *out_flight = 0;
-  // A RAM-resident key has no fd to hand io_uring (and may be RAM-only, not yet
-  // on disk). Decline the async prep (kInvalid) WITHOUT counting a miss so the
-  // RDMA serve loop falls back to the synchronous RangeDirect, which serves it
-  // from the arena. (Only reached when the RAM tier is enabled.)
-  if (ram_ && ram_->Contains(key)) {
-    if (out) *out = KVStore::RangePrep{};
-    return Status::kInvalid;
+PreparedRead KvNodeServer::PrepareReadForKey(
+    const BlockKey& key, uint64_t offset, uint64_t length, char* staging,
+    size_t staging_cap) {
+  if (staging == nullptr) return PreparedRead::Result(Status::kInvalid);
+
+  // RAM preparation is part of the same owner as disk preparation. Arena hits
+  // keep their send pin until SEND completion; dedicated allocations copy into
+  // the registered staging buffer but retain the pin until the same terminal
+  // action, so every exit follows one ownership protocol.
+  if (ram_) {
+    RamTier::Hit hit;
+    if (ram_->GetPrep(key, offset, length, &hit)) {
+      const uint64_t token = hit.TransferToken();
+      PreparedRead read = PreparedRead::Ready(
+          hit.in_arena ? hit.ptr : staging, hit.len, hit.value_len,
+          hit.in_arena, staging, staging_cap, this, token, &FinishRamRead);
+      if (hit.len > staging_cap || (hit.len != 0 && hit.ptr == nullptr)) {
+        read.Abort();
+        return PreparedRead::Result(Status::kInvalid);
+      }
+      if (!hit.in_arena && hit.len != 0)
+        std::memcpy(staging, hit.ptr, hit.len);
+      cache_hit_.fetch_add(1, std::memory_order_relaxed);
+      bytes_read_.fetch_add(hit.len, std::memory_order_relaxed);
+      return read;
+    }
   }
-  // An identical read is already on the disk: decline the async prep so the
-  // serve loop falls back to the synchronous RangeDirect, which joins the
-  // in-flight read instead of issuing a duplicate NVMe fetch.
-  if (coalesce_enabled_ && read_coalescer_.InFlight(key, offset, length)) {
-    if (out) *out = KVStore::RangePrep{};
-    return Status::kInvalid;
-  }
-  // RAM consulted and absent -> this GET is a RAM-tier miss regardless of the
-  // disk outcome (mirrors GetPrep's accounting on the sync path). Without this
-  // the uring path -- the default since v1.20.0 opt-in / v1.27.0 default-on --
-  // reports dfkv_ram_miss_total == 0 forever while hits accumulate, so
-  // hit/(hit+miss) reads as a fake 100%.
-  if (ram_) ram_->CountMiss();
-  Status st = group_.RangeDirectPrep(key, offset, length, io_cap, out);
-  // Only miss/io-error are final here; a kOk prep is accounted on read completion
-  // (RangeDirectComplete) because the async read can still fail.
+
+  // An existing identical flight must be joined by the synchronous coalescer
+  // path; declining here avoids opening a descriptor that would be discarded.
+  if (coalesce_enabled_ && read_coalescer_.InFlight(key, offset, length))
+    return PreparedRead::Result(Status::kInvalid);
+
+  ReadLease lease;
+  const Status st =
+      group_.RangeDirectPrep(key, offset, length, staging_cap, &lease);
   if (st == Status::kNotFound) {
     cache_miss_.fetch_add(1, std::memory_order_relaxed);
   } else if (st == Status::kIOError) {
     get_io_err_.fetch_add(1, std::memory_order_relaxed);
   }
-  // Register the flight ONLY under the exact conditions the RDMA serve loop
-  // defers on (readable fd, non-zero payload, fits the connection buffer):
-  // any other prep outcome is served by the sync fallback, which joins flights
-  // itself — registering one here that no async read will ever complete would
-  // strand its waiters.
-  if (st == Status::kOk && coalesce_enabled_ && out_flight && out->fd >= 0 &&
-      out->payload_len != 0 && out->aligned_len <= io_cap &&
-      out->aligned_len <= std::numeric_limits<unsigned>::max()) {
-    // Whole-value reads only are promotable: RAM-tier entries are full
-    // [ValueHeader|payload] blobs, so installing a sub-range would corrupt
-    // every later reader of the key.
-    const bool whole = offset == 0 && out->value_len != 0 &&
-                       out->payload_len == out->value_len;
-    uint64_t t = read_coalescer_.TryRegisterAsync(key, offset, length, whole);
-    if (t == 0) {
-      // Lost the race to an identical read registered since the InFlight()
-      // check above: decline the async prep; the sync fallback joins the
-      // flight instead of issuing a duplicate NVMe fetch.
-      ::close(out->fd);
-      if (out->token) group_.RangeRelease(out->token);
-      *out = KVStore::RangePrep{};
-      return Status::kInvalid;
+  if (st != Status::kOk) return PreparedRead::Result(st);
+
+  uint64_t flight = 0;
+  if (coalesce_enabled_ && lease.fd() >= 0 && lease.payload_len != 0 &&
+      lease.aligned_len <= staging_cap &&
+      lease.aligned_len <= std::numeric_limits<unsigned>::max()) {
+    const bool whole = offset == 0 && lease.value_len != 0 &&
+                       lease.payload_len == lease.value_len;
+    flight = read_coalescer_.TryRegisterAsync(
+        key, offset, length, whole, lease.value_len);
+    if (flight == 0) {
+      // The lease remains local and releases its descriptor/pin on return.
+      return PreparedRead::Result(Status::kInvalid);
     }
-    *out_flight = t;
   }
-  return st;
+  return PreparedRead::Storage(std::move(lease), staging, staging_cap, this,
+                               flight, &FinishDiskRead);
 }
 
-void KvNodeServer::RangeDirectComplete(bool ok, size_t bytes_read,
-                                       double elapsed_sec, uint64_t flight,
-                                       const char* data) {
+void KvNodeServer::FinishDiskRead(
+    void* owner, uint64_t flight, bool committed, Status result,
+    size_t bytes_read, double elapsed_sec, const char* data) noexcept {
+  KvNodeServer* server = static_cast<KvNodeServer*>(owner);
+  if (server == nullptr) return;
+  if (!committed) {
+    if (flight)
+      server->read_coalescer_.CompleteAsync(flight, Status::kIOError, nullptr,
+                                            0);
+    return;
+  }
+  const bool ok = result == Status::kOk;
   if (ok) {
-    cache_hit_.fetch_add(1, std::memory_order_relaxed);
-    bytes_read_.fetch_add(bytes_read, std::memory_order_relaxed);
+    server->cache_hit_.fetch_add(1, std::memory_order_relaxed);
+    server->bytes_read_.fetch_add(bytes_read, std::memory_order_relaxed);
   } else {
-    get_io_err_.fetch_add(1, std::memory_order_relaxed);
+    server->get_io_err_.fetch_add(1, std::memory_order_relaxed);
   }
   if (flight) {
     BlockKey key;
     bool whole = false;
     bool recurrent = false;
-    const bool had_waiters = read_coalescer_.CompleteAsync(
+    const bool had_waiters = server->read_coalescer_.CompleteAsync(
         flight, ok ? Status::kOk : Status::kIOError, data, bytes_read, &key,
         &whole, &recurrent);
-    // Admission gate: promote ONLY pages with convoy evidence — an in-flight
-    // waiter (overlap) or a recurrence-tombstone hit (same range re-read
-    // within the drift window; v2). A convoy page's laggard ranks, repeat
-    // cold reads and post-restart replays are then served from the arena; a
-    // one-off cold read never pollutes the RAM tier (the num_extents churn
-    // lesson). Durable install: costs no flush bandwidth, evictable at once.
-    if (ok && (had_waiters || recurrent) && whole && ram_ && data && bytes_read)
-      ram_->PutDurable(key, data, bytes_read);
+    if (ok && (had_waiters || recurrent) && whole && server->ram_ && data &&
+        bytes_read) {
+      server->ram_->PutDurable(key, data, bytes_read);
+    }
   }
-  // Sample the async (uring) read latency into the SAME op="get" histogram the
-  // synchronous RangeDirect feeds — before this the default read path since
-  // v1.27.0 contributed no latency samples at all.
-  if (lat_sampler_.ShouldSample()) get_lat_.Observe(elapsed_sec);
+  if (server->lat_sampler_.ShouldSample())
+    server->get_lat_.Observe(elapsed_sec);
 }
 
-void KvNodeServer::RangeFlightAbort(uint64_t flight) {
-  read_coalescer_.CompleteAsync(flight, Status::kIOError, nullptr, 0);
-}
-
-
-bool KvNodeServer::RamRangePrepForKey(
-    const BlockKey& key, uint64_t offset, uint64_t length,
-    const char** out_ptr, size_t* out_len, uint64_t* out_token) {
-  if (!ram_) return false;
-  RamTier::Hit h;
-  if (!ram_->GetPrep(key, offset, length, &h)) return false;
-  if (out_ptr) *out_ptr = h.ptr;
-  if (out_len) *out_len = h.len;
-  if (out_token) *out_token = h.token;
-  cache_hit_.fetch_add(1, std::memory_order_relaxed);
-  bytes_read_.fetch_add(h.len, std::memory_order_relaxed);
-  return true;
-}
-
-void KvNodeServer::RamRelease(uint64_t token) {
-  if (ram_) ram_->Release(token);
+void KvNodeServer::FinishRamRead(
+    void* owner, uint64_t token, bool committed, Status result,
+    size_t bytes_read, double elapsed_sec, const char* data) noexcept {
+  (void)committed;
+  (void)result;
+  (void)bytes_read;
+  (void)elapsed_sec;
+  (void)data;
+  KvNodeServer* server = static_cast<KvNodeServer*>(owner);
+  if (server != nullptr && server->ram_) server->ram_->ReleaseToken(token);
 }
 
 // Keep-alive: serve requests on this connection until the peer closes it.
@@ -837,13 +1047,13 @@ void KvNodeServer::Handle(int fd) {
     if (rq.payload_len && !net::ReadAll(fd, payload.data(), rq.payload_len)) return;
 
     std::string data;
+    size_t value_len = 0;
     Status st = ProcessRequestForKey(
         rq.op, rq.Key(), rq.offset, rq.length, payload.data(), rq.payload_len,
-        &data);
-
+        &data, &value_len);
     char rp[kRespPrefix];
-    EncodeResp(rp, st, data.size());
-    if (!net::WriteAll(fd, rp, kRespPrefix)) return;
+    EncodeResp(rp, st, data.size(), static_cast<uint64_t>(value_len));
+    if (!net::WriteAll(fd, rp, sizeof(rp))) return;
     if (!data.empty() && !net::WriteAll(fd, data.data(), data.size())) return;
   }
 }

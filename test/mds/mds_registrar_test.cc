@@ -5,12 +5,17 @@
 #include "transport/wire.h"
 #include "utils/net_util.h"
 #include <gtest/gtest.h>
+#include <atomic>
 #include <unistd.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <chrono>
 #include <cstdlib>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <vector>
+#include <mutex>
 using namespace dfkv;  // NOLINT
 
 namespace {
@@ -75,6 +80,72 @@ bool WaitForMember(int port, const std::string& group, const MemberInfo& m, int 
   }
   return false;
 }
+
+class DelayedFakeMds {
+ public:
+  explicit DelayedFakeMds(std::vector<int> delays_ms)
+      : delays_ms_(std::move(delays_ms)) {
+    listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd_ < 0) throw std::runtime_error("socket failed");
+    sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t sl = sizeof(sa);
+    if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0 ||
+        ::listen(listen_fd_, 8) != 0 ||
+        ::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&sa), &sl) != 0) {
+      ::close(listen_fd_);
+      listen_fd_ = -1;
+      throw std::runtime_error("fake MDS listener setup failed");
+    }
+    port_ = ntohs(sa.sin_port);
+    thread_ = std::thread([this] { Serve(); });
+  }
+
+  ~DelayedFakeMds() {
+    ::shutdown(listen_fd_, SHUT_RDWR);
+    ::close(listen_fd_);
+    if (thread_.joinable()) thread_.join();
+  }
+
+  std::string endpoint() const {
+    return "127.0.0.1:" + std::to_string(port_);
+  }
+
+ private:
+  void Serve() {
+    for (int delay_ms : delays_ms_) {
+      int fd = ::accept(listen_fd_, nullptr, nullptr);
+      if (fd < 0) return;
+      char pre[kReqPrefix];
+      ReqFields req;
+      if (!net::ReadAll(fd, pre, sizeof(pre)) || !DecodeReq(pre, &req)) {
+        ::close(fd);
+        continue;
+      }
+      std::string payload(req.payload_len, '\0');
+      if (req.payload_len != 0 &&
+          !net::ReadAll(fd, &payload[0], payload.size())) {
+        ::close(fd);
+        continue;
+      }
+      if (delay_ms < 0) {
+        ::close(fd);
+        continue;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+      char response[kRespPrefix];
+      EncodeResp(response, Status::kOk, 0);
+      net::WriteAll(fd, response, sizeof(response));
+      ::close(fd);
+    }
+  }
+
+  std::vector<int> delays_ms_;
+  int listen_fd_ = -1;
+  int port_ = 0;
+  std::thread thread_;
+};
 }  // namespace
 
 TEST(MdsRegistrar, RegisterOnceMakesNodeVisible) {
@@ -85,8 +156,15 @@ TEST(MdsRegistrar, RegisterOnceMakesNodeVisible) {
   std::string group = "m2-grp-" + std::to_string(mds.port());
   MemberInfo self{"node-x", "10.9.9.9", 28000, 2};
   MdsRegistrar reg({"127.0.0.1:" + std::to_string(mds.port())}, group, self);
+  std::atomic<int> registered_callbacks{0};
+  reg.set_registered_callback(
+      [&] { registered_callbacks.fetch_add(1, std::memory_order_relaxed); });
+  EXPECT_FALSE(reg.registered());
   ASSERT_TRUE(reg.RegisterOnce());
+  EXPECT_TRUE(reg.registered());
+  EXPECT_EQ(registered_callbacks.load(std::memory_order_relaxed), 1);
   ASSERT_TRUE(reg.HeartbeatOnce());
+  EXPECT_EQ(registered_callbacks.load(std::memory_order_relaxed), 1);
   std::vector<MemberInfo> ms;
   ASSERT_TRUE(ListMembers(mds.port(), group, &ms));
   ASSERT_EQ(ms.size(), 1u);
@@ -169,4 +247,88 @@ TEST(MdsRegistrar, ClientBackgroundLoopKeepsAlive) {
   EXPECT_TRUE(WaitForClient(mds.port(), group, self, /*timeout_ms=*/5000));
   reg.Stop();
   mds.Stop();
+}
+
+TEST(MdsRegistrar, DefaultTimeoutAllowsValidSequentialMdsBudget) {
+  // A valid MDS upsert can consume three sequential 2 s etcd budgets. Delay
+  // just beyond the full 6 s composed server budget; the registrar's 7 s
+  // default must still accept the successful response.
+  static_assert(MdsRegistrar::kDefaultIoTimeoutMs > 3 * 2000,
+                "registrar timeout must exceed composed MDS etcd budget");
+  DelayedFakeMds fake({6100});
+  MemberInfo self{"slow-node", "10.9.9.12", 28000, 1};
+  MdsRegistrar reg({fake.endpoint()}, "slow-group", self);
+  const auto start = std::chrono::steady_clock::now();
+  EXPECT_TRUE(reg.RegisterOnce());
+  EXPECT_GE(std::chrono::steady_clock::now() - start,
+            std::chrono::milliseconds(6000));
+  EXPECT_TRUE(reg.registered());
+}
+
+TEST(MdsRegistrar, HeartbeatDegradationIsObservableWithoutClearingReadiness) {
+  DelayedFakeMds fake({0, -1, -1, 0});
+  MemberInfo self{"health-node", "10.9.9.13", 28000, 1};
+  MdsRegistrar reg({fake.endpoint()}, "health-group", self);
+  std::atomic<int> callbacks{0};
+  reg.set_registered_callback(
+      [&] { callbacks.fetch_add(1, std::memory_order_relaxed); });
+
+  ASSERT_TRUE(reg.RegisterOnce());
+  EXPECT_EQ(callbacks.load(std::memory_order_relaxed), 1);
+  EXPECT_TRUE(reg.registered());
+  EXPECT_FALSE(reg.HeartbeatOnce());
+  EXPECT_FALSE(reg.HeartbeatOnce());
+  EXPECT_TRUE(reg.registered()) << "startup readiness must remain latched";
+  EXPECT_EQ(callbacks.load(std::memory_order_relaxed), 1);
+  EXPECT_EQ(reg.heartbeat_failures_consecutive(), 2u);
+  EXPECT_EQ(reg.heartbeat_failures_total(), 2u);
+  EXPECT_FALSE(reg.heartbeat_healthy());
+  EXPECT_LE(reg.last_success_age_seconds(), 1u);
+  const std::string degraded = reg.MetricsText();
+  EXPECT_NE(degraded.find("dfkv_mds_registration_latched{group=\"health-group\",node=\"health-node\"} 1"),
+            std::string::npos) << degraded;
+  EXPECT_NE(degraded.find("dfkv_mds_heartbeat_healthy{group=\"health-group\",node=\"health-node\"} 0"),
+            std::string::npos) << degraded;
+
+  EXPECT_NE(degraded.find("dfkv_mds_last_success_age_seconds{group=\"health-group\",node=\"health-node\"}"),
+            std::string::npos) << degraded;
+  ASSERT_TRUE(reg.HeartbeatOnce());
+  EXPECT_TRUE(reg.heartbeat_healthy());
+  EXPECT_EQ(reg.heartbeat_failures_consecutive(), 0u);
+  EXPECT_EQ(reg.heartbeat_failures_total(), 2u);
+  EXPECT_EQ(callbacks.load(std::memory_order_relaxed), 1);
+}
+
+TEST(MdsRegistrar, FirstRegistrationDeadlineStopsRetryLoop) {
+  MemberInfo self{"deadline-node", "10.9.9.14", 28000, 1};
+  MdsRegistrar reg({"127.0.0.1:1"}, "deadline-group", self,
+                   /*heartbeat_ms=*/10000, /*io_timeout_ms=*/50,
+                   /*is_client=*/false,
+                   /*first_registration_timeout_ms=*/150);
+
+  const auto started = std::chrono::steady_clock::now();
+  reg.Start();
+  const auto wait_limit = started + std::chrono::seconds(2);
+  while (!reg.first_registration_timed_out() &&
+         std::chrono::steady_clock::now() < wait_limit) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  EXPECT_TRUE(reg.first_registration_timed_out());
+  EXPECT_FALSE(reg.registered());
+  EXPECT_LT(std::chrono::steady_clock::now() - started,
+            std::chrono::seconds(1))
+      << "unreachable MDS left the initial registration loop running";
+  const std::string metrics = reg.MetricsText();
+  EXPECT_NE(metrics.find(
+                "dfkv_mds_first_registration_timeout_ms"
+                "{group=\"deadline-group\",node=\"deadline-node\"} 150"),
+            std::string::npos)
+      << metrics;
+  EXPECT_NE(metrics.find(
+                "dfkv_mds_first_registration_timed_out"
+                "{group=\"deadline-group\",node=\"deadline-node\"} 1"),
+            std::string::npos)
+      << metrics;
+  reg.Stop();
 }

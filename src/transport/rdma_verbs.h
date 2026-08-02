@@ -10,21 +10,20 @@
  * thus decoupled: the QP handshake (LID/GID/QPN/PSN, ~32 B) goes over TCP, the
  * data rides the 400G fabric by LID. This is exactly perftest's non-`-R` mode.
  *
- * A connection uses RC two-sided SEND/RECV with a ring of `depth` slots so the
- * caller can keep multiple requests in flight (pipelining). Completions are
- * reaped via a completion channel (blocking, no busy-spin). */
+ * A connection uses RC SEND/RECV for v2 control frames and one-sided WRITEs for
+ * payloads, with a ring of `depth` slots for pipelining. Completions are reaped
+ * via a completion channel (blocking, no busy-spin). */
 #ifndef DFKV_RDMA_VERBS_H_
 #define DFKV_RDMA_VERBS_H_
 
 #include <infiniband/verbs.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <list>
 #include <string>
 
 #include "transport/dev_frame.h"
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -32,22 +31,11 @@ namespace dfkv {
 namespace rdma {
 
 // QP connection info exchanged over the TCP bootstrap channel (fixed 32 bytes,
-// little-endian). lid==0 => use GRH/GID routing (RoCE); else IB LID routing.
-//
-// Wire layout: qpn u32 | psn u32 | lid u16 | gid[16] | pad[6]. Peers before the
-// depth negotiation MEMSET the whole 32 bytes and never read the pad, so the
-// pad is a deterministic-zero extension area: a non-zero magic there can ONLY
-// come from a peer that wrote it on purpose -- exact detection, no length
-// change, and every old/new pairing keeps connecting (a rolling-upgrade
-// requirement; contrast the MDS member codec, which was born with tagged
-// trailing extensions, while this blob was not).
-//
-// Extension DPQ1 (pad bytes [26,30) = magic, [30,32) = depth u16): each side
-// advertises its pipeline depth -- how many in-flight requests its posted
-// receives absorb. The CLIENT acts on it: pipelining past the server's posted
-// receives hits RNR retries and degrades silently 3-4x (measured on hd05), so
-// the client clamps its batching window to the advertised value
-// (RcEndpoint::window()). depth==0 = legacy peer / no advertisement.
+// little-endian). lid==0 selects GRH/GID routing; otherwise IB LID routing.
+// The final six bytes are mandatory v2 negotiation metadata:
+// DPQ1 magic at [26,30), followed by a u16 depth with its high bit set.
+// depth advertises how many in-flight requests the peer's posted receives can
+// absorb; zero or a missing v2 bit is a protocol mismatch.
 struct QpInfo {
   uint32_t qpn = 0;
   uint32_t psn = 0;
@@ -55,7 +43,7 @@ struct QpInfo {
   uint8_t gid[16] = {0};
   uint8_t pad[6] = {0};
   uint16_t depth = 0;  // not a standalone wire field: rides the pad (see above)
-  uint8_t protocol_version = 1;  // v2 is encoded in the depth field's high bit
+  uint8_t protocol_version = 0;  // v2 is encoded in depth's high bit
 };
 constexpr size_t kQpInfoBytes = 32;
 constexpr uint32_t kQpDepthMagic = 0x31515044u;  // ASCII DPQ1 (LE)
@@ -65,10 +53,10 @@ QpInfo ParseQpInfo(const char in[kQpInfoBytes]);
 // Fixed-size device-name field the client sends first in the bootstrap so the
 // server opens its QP on the matching device (same rail) for multi-rail setups.
 
-// Target QP scatter-gather entries. SGE0 is the header (req/resp prefix + value
-// header); the remaining kMaxSge-1 carry payload segments, so a scatter-gather
-// key may hold up to kMaxSge-1 (=29) non-contiguous buffers. Open() clamps this
-// to the device's reported max_sge (ConnectX-* on hd04 reports 30).
+// Target QP scatter-gather entries. SGE0 carries the request/response wire
+// prefix; the remaining kMaxSge-1 carry raw-payload segments, so one
+// scatter-group object may hold up to kMaxSge-1 (=29) non-contiguous buffers.
+// Open() clamps this to the device's reported max_sge.
 constexpr size_t kMaxSge = 30;
 
 // The SG width Open() would negotiate on dev_name (min(kMaxSge, device
@@ -81,6 +69,22 @@ size_t QueryMaxSge(const char* dev_name);
 // Alignment used for server-side O_DIRECT read buffers. NVMe/xfs are happy with
 // 4096, and it is a safe superset for 512-byte logical-sector devices.
 constexpr size_t kDirectIoAlign = 4096;
+// Run one declaration attempt across every active rail. A failed Stage on rail
+// N must not mutate that rail; the helper rolls back rails [0,N) in reverse
+// order. Commit is called only after every Stage succeeds.
+template <typename Stage, typename Commit, typename Rollback>
+bool RunPoolMrTransaction(size_t rail_count, Stage stage, Commit commit,
+                          Rollback rollback) {
+  size_t staged = 0;
+  for (; staged < rail_count; ++staged) {
+    if (stage(staged)) continue;
+    while (staged != 0) rollback(--staged);
+    return false;
+  }
+  for (size_t rail = 0; rail < rail_count; ++rail) commit(rail);
+  return true;
+}
+
 
 // One RC connection: device context + PD + CQ(+channel) + QP + a ring of
 // `depth` send and recv buffers (each `cap` bytes, registered once).
@@ -97,8 +101,8 @@ class RcEndpoint {
   // per slot for O_DIRECT reads/writes that are scatter-transferred without a
   // payload copy. direct_io_cap lets that buffer be larger than the ordinary
   // control buffers. v2_responder reserves enough SQ WRs for a server to chain
-  // several one-sided GET writes before its signaled status SEND; client and v1
-  // endpoints retain the legacy depth+1 SQ geometry.
+  // several one-sided GET writes before its signaled status SEND; initiators
+  // need only the depth+1 SQ geometry.
   bool Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib_port = 1,
             bool direct_io_buffers = false, size_t direct_io_cap = 0,
             bool v2_responder = false);
@@ -107,17 +111,14 @@ class RcEndpoint {
   bool Connect(const QpInfo& remote);                  // INIT -> RTR -> RTS
 
   size_t depth() const { return depth_; }
-  // Depth negotiation (DPQ1): the peer's advertised pipeline depth (0 = legacy
-  // peer, unknown). window() is the SAFE batching window -- never pipeline more
-  // requests than the peer's posted receives, or they RNR-retry and the whole
-  // window degrades silently. Falls back to the local depth against legacy
-  // peers (the pre-negotiation behavior: an ops-level contract).
+  // The peer's required nonzero advertised depth clamps the local posting
+  // window. Never pipeline more requests than the peer's posted receives, or
+  // they RNR-retry and silently degrade the whole window.
   void set_remote_depth(uint16_t d) { remote_depth_ = d; }
   uint16_t remote_depth() const { return remote_depth_; }
   size_t window() const {
-    return (remote_depth_ > 0 && remote_depth_ < depth_) ? remote_depth_ : depth_;
+    return std::min<size_t>(remote_depth_, depth_);
   }
-  size_t user_mr_cap() const { return user_mr_cap_; }  // >= depth (test/diagnostic)
   size_t cap() const { return cap_; }
   int numa_node() const { return numa_node_; }  // device's NUMA node, or -1
   char* sbuf(size_t slot) { return sbuf_[slot]; }
@@ -129,35 +130,55 @@ class RcEndpoint {
   bool PostRecv(size_t slot);                          // arm recv into rbuf_[slot]
   bool PostSend(size_t slot, size_t len);              // SEND sbuf_[slot][0,len)
 
-  // Register a large caller memory region (e.g. the WHOLE SGLang host KV pool)
-  // once on this PD. After this, RegisterUser() for any buffer inside the region
-  // returns this MR by range lookup with NO per-op ibv_reg_mr — registration is a
-  // one-time connection-setup cost, not a per-transfer cost. Client destination
-  // pools set remote_write=true so a v2 server can RDMA-WRITE GET data into them.
+  // Pool registration has an explicit stage/commit/rollback lifecycle so a
+  // multi-rail declaration can be published atomically. A staged registration
+  // is immediately usable only by this idle endpoint; Commit retires any
+  // same-base generation it supersedes, while Rollback removes exactly the
+  // cache/reference created by this attempt.
+  struct PoolMrRegistration {
+    uintptr_t base = 0;
+    size_t size = 0;
+    int access = 0;
+    ibv_mr* mr = nullptr;
+    bool added = false;
+  };
+  bool StagePoolMr(void* base, size_t size, bool remote_write,
+                   PoolMrRegistration* registration);
+  void CommitPoolMr(PoolMrRegistration* registration);
+  void RollbackPoolMr(PoolMrRegistration* registration);
+  // Single-endpoint convenience wrapper, primarily used by server regions.
   bool AddPoolMr(void* base, size_t size, bool remote_write = false);
-  // Register every region not yet present as a pool MR. Called when a connection
-  // is acquired so regions declared at any time land on every connection's PD.
-  void EnsurePoolMrs(const std::vector<std::pair<void*, size_t>>& regions,
+  // Atomically ensure all declarations on this endpoint. False leaves its
+  // lookup cache exactly as it was before the call.
+  bool EnsurePoolMrs(const std::vector<std::pair<void*, size_t>>& regions,
                      bool remote_write = false);
   // Register a shared server receive segment for remote PUT writes and return
   // the MR carrying both the local lkey and peer-visible rkey.
   ibv_mr* RegisterRemoteRegion(void* base, size_t size);
 
-  // Process-wide count of ad-hoc user MRs registered OUTSIDE any pool region
-  // (RegisterUser slow path). Should stay 0 in correct deployments where every
-  // datapath buffer lives inside a RegisterMemory pool; a rising value flags a
-  // pool-registration gap. Diagnostic; surfaced in the transport MetricsText.
+  // Cumulative one-shot user MRs registered outside explicit pool regions.
+  // These are never cached; TransientUserMrActive is the lifetime invariant.
   static uint64_t AdhocUserMrTotal();
   // Process-wide count of actual ibv_reg_mr calls for pool regions. With the
   // shared per-PD registry this counts distinct (device,region) pairs, not
   // connections (the pre-fix per-connection storm). Diagnostic/test.
   static uint64_t PoolMrRegistrations();
+  static uint64_t PoolMrRegistrationFailures();
+  // Process-wide number of currently retained shared-PD pool MR generations.
+  // Superseded generations remain only while an endpoint still references them.
+  static uint64_t PoolMrActiveRegistrations();
+  // Currently live one-shot out-of-pool registrations. Must return to its
+  // baseline before a public transport call returns.
+  static uint64_t TransientUserMrActive();
+  // Process-wide CQ observations, incremented at the single WaitComp polling
+  // seam. MetricsText exposes these without adding bookkeeping to each posting
+  // path; errors include CQ poll/notification failures and failed WC statuses.
+  static uint64_t CqCompletions();
+  static uint64_t CqErrors();
 
-  // Resolve a caller buffer to an MR for zero-copy transfer. Fast path: a buffer
-  // inside a registered pool region (AddPoolMr) returns that MR with no syscall.
-  // Otherwise it is registered ad-hoc and kept in a small LRU cache (stable repeat
-  // buffers stay cached). Valid as a recv target AND a send source (LOCAL_WRITE is
-  // a superset of the no-flag local read a SEND does). nullptr on failure.
+  // Resolve a buffer only inside an explicitly registered pool region. Public
+  // operation-owned buffers use RegisterTransient; an out-of-pool lookup fails
+  // closed rather than creating a cached MR that could outlive its allocation.
   ibv_mr* RegisterUser(void* addr, size_t len);
   // One-shot MR for API-owned buffers whose lifetime ends or may move after the
   // current operation. `remote_write=true` is for receive targets; false keeps
@@ -167,15 +188,14 @@ class RcEndpoint {
   ibv_mr* RegisterTransient(void* addr, size_t len,
                             bool remote_write = true);
   void ReleaseTransient(ibv_mr* mr);
-  // Scatter recv: first `hdr_bytes` of the message land in rbuf_[slot] (resp
-  // prefix + value header), the remaining payload lands directly in `payload`
+  // Scatter recv: first `hdr_bytes` of the message land in rbuf_[slot]
+  // (response wire prefix); the raw payload lands directly in `payload`
   // (must belong to `payload_mr` from RegisterUser) — zero copy into the caller.
   bool PostRecvScatter(size_t slot, void* payload, size_t payload_len,
                        ibv_mr* payload_mr, size_t hdr_bytes);
-  // Scatter send: SGE0 = sbuf_[slot][0,hdr_len), SGE1 = `payload` (must belong to
-  // `payload_mr`). Used by client PUT and server GET to gather a tiny header plus
-  // a registered payload into one wire SEND with zero copy of the payload. Degrades
-  // to a 1-SGE send when payload_len==0, so payload_mr may be null.
+  // Scatter send: SGE0 = wire prefix in sbuf_[slot], SGE1 = raw `payload`
+  // (must belong to `payload_mr`). Used by client PUT and server GET without
+  // copying the payload; payload_len==0 degrades to a prefix-only 1-SGE send.
   bool PostSendScatter(size_t slot, size_t hdr_len, const void* payload,
                        size_t payload_len, ibv_mr* payload_mr);
 
@@ -217,7 +237,7 @@ class RcEndpoint {
       uint32_t remote_rkey, uint32_t immediate);
 
   // QP scatter-gather capability negotiated in Open() = min(kMaxSge, device cap).
-  // The SG datapath caps payload segments at max_sge()-1 (SGE0 is the header).
+  // The SG datapath caps raw-payload segments at max_sge()-1 (SGE0 is the wire prefix).
   size_t max_sge() const { return max_sge_; }
 
   // Block until at least one completion, drain up to `max` into out[]; returns
@@ -247,12 +267,14 @@ class RcEndpoint {
   unsigned cq_armed_unacked_ = 0;
 
   size_t cap_ = 0, depth_ = 0, dbuf_cap_ = 0;
-  uint16_t remote_depth_ = 0;  // DPQ1 advertisement from the peer (0 = legacy)
+  uint16_t remote_depth_ = 0;  // Set from the required v2 QP advertisement.
   size_t max_sge_ = 2;  // QP max_send_sge/max_recv_sge = min(kMaxSge, device cap)
   std::vector<char*> sbuf_, rbuf_, dbuf_;
   std::vector<ibv_mr*> smr_, rmr_, dmr_;
-  // Big pre-registered caller regions (the host KV pool). Registered once at
-  // connection setup, never evicted; RegisterUser range-looks-up into these.
+  // Big pre-registered caller regions (the host KV pool). Each cache entry owns
+  // one shared-registry reference. Successful growth replaces the idle
+  // endpoint's older same-base generation; endpoints with an in-flight user
+  // retain their old generation until their next EnsurePoolMrs or Close.
   struct PoolMr {
     uintptr_t base;
     size_t size;
@@ -260,19 +282,8 @@ class RcEndpoint {
     ibv_mr* mr;
   };
   std::vector<PoolMr> pool_mr_;
-  // LRU-capped cache of caller-buffer MRs (addr -> {mr, lru-iterator}); front of
-  // user_lru_ is MRU. Bounded so a workload with many distinct buffers can't leak
-  // registrations (a stable HiCache pool stays fully cached and always hits). The
-  // cap MUST cover every MR one window can hold in flight before posting: the
-  // legacy paths register 1 buffer per slot (depth total), but the SG multi
-  // paths register up to max_sge-1 segment buffers PER SLOT and only then post
-  // the whole window — a smaller cap could evict (ibv_dereg_mr) an MR still
-  // referenced in mrs_per (use-after-dereg). Set to
-  // max(kMinUserMr, depth * max_sge) in Open() after max_sge_ is negotiated.
-  static constexpr size_t kMinUserMr = 64;
-  size_t user_mr_cap_ = kMinUserMr;
-  std::list<uintptr_t> user_lru_;
-  std::unordered_map<uintptr_t, std::pair<ibv_mr*, std::list<uintptr_t>::iterator>> user_mr_;
+  // Operation-scoped out-of-pool MRs. These are released after completion, or
+  // after QP teardown on every failure/timeout path.
   std::vector<ibv_mr*> transient_mr_;
   QpInfo local_;
 };

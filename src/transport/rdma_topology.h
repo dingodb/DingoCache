@@ -25,6 +25,20 @@ struct RdmaDevInfo {
   bool active = false;
 };
 
+enum class RailLocality : uint8_t {
+  kDisabled,
+  kLocal,
+  kCallerUnknown,
+  kNoLocal,
+};
+
+struct RailCandidates {
+  // Stable device-index mask. A non-empty mask prevents the admission policy's
+  // empty-mask "all rails" convention from reviving a disabled topology rail.
+  std::vector<uint8_t> allowed;
+  RailLocality locality = RailLocality::kDisabled;
+};
+
 class RdmaTopology {
  public:
   explicit RdmaTopology(std::vector<RdmaDevInfo> devices);
@@ -47,6 +61,12 @@ class RdmaTopology {
   // retry_count rotates the choice further for callers retrying a failed open.
   int SelectDevice(int numa_node, bool numa_aware,
                    size_t retry_count = 0) const;
+
+  // Build the production admission mask from discovered device NUMA metadata.
+  // With NUMA disabled every enabled rail is allowed. With it enabled, local
+  // rails are exclusive when known; unknown caller/no-local topology falls back
+  // to every enabled rail so locality can never prevent progress.
+  RailCandidates CandidatesFor(int numa_node, bool numa_aware) const;
 
   // Exclude a rail after a runtime local-device failure. Existing connections
   // remain valid; only subsequent selections are affected.

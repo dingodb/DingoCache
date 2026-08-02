@@ -7,7 +7,6 @@
 #include <vector>
 
 #include "client/kv_client.h"
-#include "common/value_header.h"
 #include "common/version.h"
 
 using namespace dfkv;  // NOLINT
@@ -38,9 +37,7 @@ int main(int argc, char** argv) {
   auto mem = ParseMembers(members);
   if (mem.empty()) { std::fprintf(stderr, "need --members name=ip:port,...\n"); return 2; }
 
-  ValueHeader hdr = ValueHeader::Make(0x51, 64, 0x46384534u, ValueHeader::kFlagIsMla,
-                                      8, 0, 78, 1, 576);
-  KVClient c(mem, hdr);
+  KVClient c(mem, "dfkv/smoke");
   std::string v(size, '\0');
   for (size_t i = 0; i < size; ++i) v[i] = static_cast<char>(i & 0xFF);
   // Salt the key with the payload size: on a persistent write-once ring, a

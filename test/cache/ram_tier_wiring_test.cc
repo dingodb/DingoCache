@@ -8,12 +8,14 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <cstring>
 #include <chrono>
 #include <filesystem>
 #include <memory>
 #include <string>
 #include <atomic>
 #include <thread>
+#include <vector>
 
 namespace fs = std::filesystem;
 using namespace dfkv;  // NOLINT
@@ -70,13 +72,13 @@ TEST(RamTierWiring, WriteThroughAndServeFromRam) {
   // PUT 20 blocks, then GET each back -- read-after-write straight from RAM.
   for (int i = 0; i < 20; ++i) {
     std::string v = "ram-block-" + std::to_string(i) + std::string(200, 'z');
-    ASSERT_EQ(t.Cache(addr, ToBlockKey("k" + std::to_string(i)), v.data(), v.size()),
+    ASSERT_EQ(t.Cache(addr, ToBlockKey("test/model", "k" + std::to_string(i)), v.data(), v.size()),
               Status::kOk) << i;
   }
   for (int i = 0; i < 20; ++i) {
     std::string v = "ram-block-" + std::to_string(i) + std::string(200, 'z');
     std::string out;
-    ASSERT_EQ(t.Range(addr, ToBlockKey("k" + std::to_string(i)), 0, v.size(), &out),
+    ASSERT_EQ(t.Range(addr, ToBlockKey("test/model", "k" + std::to_string(i)), 0, v.size(), &out),
               Status::kOk) << i;
     EXPECT_EQ(out, v) << i;
   }
@@ -102,12 +104,12 @@ TEST(RamTierWiring, SurvivesAsMissWhenRangePastEnd) {
   auto s = Start(dir, &addr);
   TcpTransport t;
   std::string v = "0123456789";
-  ASSERT_EQ(t.Cache(addr, ToBlockKey("p"), v.data(), v.size()), Status::kOk);
+  ASSERT_EQ(t.Cache(addr, ToBlockKey("test/model", "p"), v.data(), v.size()), Status::kOk);
   std::string out;
-  ASSERT_EQ(t.Range(addr, ToBlockKey("p"), 3, 4, &out), Status::kOk);  // RAM sub-range
+  ASSERT_EQ(t.Range(addr, ToBlockKey("test/model", "p"), 3, 4, &out), Status::kOk);  // RAM sub-range
   EXPECT_EQ(out, "3456");
   // absent key -> miss even with RAM on
-  EXPECT_EQ(t.Range(addr, ToBlockKey("absent"), 0, 4, &out), Status::kNotFound);
+  EXPECT_EQ(t.Range(addr, ToBlockKey("test/model", "absent"), 0, 4, &out), Status::kNotFound);
   EXPECT_GE(MetricVal(s->MetricsText(), "dfkv_ram_miss_total"), 1);
 
   s.reset();  // stop the flusher before removing the dir (no write race)
@@ -124,17 +126,17 @@ TEST(RamTierWiring, ExistAndRemoveSeeRam) {
   auto s = Start(dir, &addr);
   TcpTransport t;
   std::string v(300, 'e');
-  ASSERT_EQ(t.Cache(addr, ToBlockKey("live"), v.data(), v.size()), Status::kOk);
+  ASSERT_EQ(t.Cache(addr, ToBlockKey("test/model", "live"), v.data(), v.size()), Status::kOk);
   bool e = false;
-  ASSERT_EQ(t.Exist(addr, ToBlockKey("live"), &e), Status::kOk);
+  ASSERT_EQ(t.Exist(addr, ToBlockKey("test/model", "live"), &e), Status::kOk);
   EXPECT_TRUE(e) << "a RAM-resident block must report as existing";
   // Let it flush to disk so Remove targets a durable block, then remove it.
   EXPECT_TRUE(WaitFor([&] { return MetricVal(s->MetricsText(), "dfkv_ram_flushed_total") >= 1; }));
-  ASSERT_EQ(t.Remove(addr, ToBlockKey("live")), Status::kOk);
-  ASSERT_EQ(t.Exist(addr, ToBlockKey("live"), &e), Status::kOk);
+  ASSERT_EQ(t.Remove(addr, ToBlockKey("test/model", "live")), Status::kOk);
+  ASSERT_EQ(t.Exist(addr, ToBlockKey("test/model", "live"), &e), Status::kOk);
   EXPECT_FALSE(e) << "after Remove the block is gone from both tiers";
   std::string out;
-  EXPECT_EQ(t.Range(addr, ToBlockKey("live"), 0, v.size(), &out), Status::kNotFound);
+  EXPECT_EQ(t.Range(addr, ToBlockKey("test/model", "live"), 0, v.size(), &out), Status::kNotFound);
 
   s.reset();  // stop the flusher before removing the dir (no write race)
   ::unsetenv("DFKV_RAM_TIER");
@@ -149,9 +151,9 @@ TEST(RamTierWiring, DisabledByDefaultNoRamMetrics) {
   auto s = Start(dir, &addr);
   TcpTransport t;
   std::string v(128, 'd');
-  ASSERT_EQ(t.Cache(addr, ToBlockKey("x"), v.data(), v.size()), Status::kOk);
+  ASSERT_EQ(t.Cache(addr, ToBlockKey("test/model", "x"), v.data(), v.size()), Status::kOk);
   std::string out;
-  ASSERT_EQ(t.Range(addr, ToBlockKey("x"), 0, v.size(), &out), Status::kOk);  // via disk
+  ASSERT_EQ(t.Range(addr, ToBlockKey("test/model", "x"), 0, v.size(), &out), Status::kOk);  // via disk
   EXPECT_EQ(out, v);
   std::string m = s->MetricsText();
   EXPECT_EQ(MetricVal(m, "dfkv_ram_hit_total"), -1) << "no RAM metrics when disabled";
@@ -206,13 +208,10 @@ TEST(RamTierWiring, PutAdmissionGateRejectsWithCacheFull) {
   fs::remove_all(dir);
 }
 
-// The uring prep path partitions keys up front: RAM-resident -> decline
-// (kInvalid, sync arena serve), absent -> async disk read. The absent branch
-// never reaches GetPrep, so it must count the RAM miss itself — without that,
-// the default read path reports dfkv_ram_miss_total == 0 forever while hits
-// accumulate, and hit/(hit+miss) reads as a fake 100% (seen in production:
-// 985k hits / 0 misses across a 15TB read campaign).
-TEST(RamTierWiring, UringPrepPathCountsRamMisses) {
+// PreparedRead unifies RAM and disk ownership. A RAM-resident value is returned
+// ready with a send pin; an absent key proceeds to disk after exactly one RAM
+// miss. Destroying the ready owner exercises connection-abort cleanup.
+TEST(RamTierWiring, PreparedReadCountsRamMissesAndOwnsRamPin) {
   ::setenv("DFKV_RAM_TIER", "1", 1);
   ::setenv("DFKV_RAM_TIER_BYTES", "8388608", 1);
   std::string addr;
@@ -220,23 +219,41 @@ TEST(RamTierWiring, UringPrepPathCountsRamMisses) {
   auto s = Start(dir, &addr);
   TcpTransport t;
   std::string v(4096, 'q');
-  ASSERT_EQ(t.Cache(addr, ToBlockKey("resident"), v.data(), v.size()), Status::kOk);
+  ASSERT_EQ(t.Cache(addr, ToBlockKey("test/model", "resident"), v.data(), v.size()), Status::kOk);
 
-  const BlockKey rk = ToBlockKey("resident");
-  const BlockKey ak = ToBlockKey("absent-key");
-  KVStore::RangePrep prep;
+  const BlockKey rk = ToBlockKey("test/model", "resident");
+  const BlockKey ak = ToBlockKey("test/model", "absent-key");
+  std::vector<char> staging(1 << 20);
 
-  // RAM-resident: prep declines so the serve loop falls back to the arena.
-  // Consulted-and-present is NOT a miss.
+  // Consulted-and-present is not a miss and returns one live transaction.
   const long miss0 = MetricVal(s->MetricsText(), "dfkv_ram_miss_total");
-  EXPECT_EQ(s->RangeDirectPrepForKey(rk, 0, v.size(), 1 << 20, &prep),
-            Status::kInvalid);
+  {
+    PreparedRead prep =
+        s->PrepareReadForKey(rk, 0, v.size(), staging.data(), staging.size());
+    EXPECT_EQ(prep.status(), Status::kOk);
+    EXPECT_TRUE(prep.owns_cleanup());
+    EXPECT_FALSE(prep.needs_io());
+    EXPECT_EQ(prep.payload_len(), v.size());
+  }  // destructor-abort releases the RAM send pin
   EXPECT_EQ(MetricVal(s->MetricsText(), "dfkv_ram_miss_total"), miss0);
 
-  // Absent everywhere: RAM consulted and absent -> exactly one RAM miss,
-  // regardless of the disk outcome (kNotFound here).
-  EXPECT_EQ(s->RangeDirectPrepForKey(ak, 0, 16, 1 << 20, &prep),
-            Status::kNotFound);
+  // Failure to resolve the arena MR falls back to the owned staging buffer
+  // without splitting cleanup ownership or releasing the pin early.
+  PreparedRead staged =
+      s->PrepareReadForKey(rk, 0, v.size(), staging.data(), staging.size());
+  ASSERT_EQ(staged.status(), Status::kOk);
+  ASSERT_TRUE(staged.source_registered());
+  ASSERT_TRUE(staged.Stage());
+  EXPECT_FALSE(staged.source_registered());
+  EXPECT_EQ(std::memcmp(staged.data(), v.data(), v.size()), 0);
+  EXPECT_TRUE(staged.Commit(Status::kOk, staged.payload_len(), 0.0));
+  EXPECT_FALSE(staged.Abort());
+
+  // Absent everywhere: RAM consulted and absent -> exactly one RAM miss.
+  PreparedRead absent =
+      s->PrepareReadForKey(ak, 0, 16, staging.data(), staging.size());
+  EXPECT_EQ(absent.status(), Status::kNotFound);
+  EXPECT_FALSE(absent.owns_cleanup());
   EXPECT_EQ(MetricVal(s->MetricsText(), "dfkv_ram_miss_total"), miss0 + 1);
 
   s.reset();

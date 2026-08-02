@@ -3,6 +3,9 @@
 #include <gtest/gtest.h>
 
 using dfkv::rdma::PickRail;
+using dfkv::rdma::RailCompletion;
+using dfkv::rdma::RailPolicy;
+using dfkv::rdma::RailPolicyConfig;
 
 TEST(PickRail, NumaOffRoundRobinsAll) {
   std::vector<int> dn{0, 0, 1, 1};
@@ -54,4 +57,167 @@ TEST(PickRail, EmptyDeviceListReturnsZero) {
   std::vector<int> dn{};
   EXPECT_EQ(PickRail(dn, 0, true, 5), 0u);
   EXPECT_EQ(PickRail(dn, -1, false, 0), 0u);
+}
+
+TEST(RailPolicy, LeastInflightSpreadsConcurrentOperationsDeterministically) {
+  RailPolicy policy(3, RailPolicyConfig{4, 3, 1000, 1, 100});
+  const auto first = policy.TryAcquire(1, 10);
+  const auto second = policy.TryAcquire(1, 10);
+  const auto third = policy.TryAcquire(1, 10);
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(second);
+  ASSERT_TRUE(third);
+  EXPECT_EQ(first->rail, 0u);
+  EXPECT_EQ(second->rail, 1u);
+  EXPECT_EQ(third->rail, 2u);
+  const auto stats = policy.Snapshot(10);
+  ASSERT_EQ(stats.size(), 3u);
+  for (const auto& rail : stats) {
+    EXPECT_EQ(rail.inflight, 1u);
+    EXPECT_EQ(rail.selections, 1u);
+  }
+}
+
+TEST(RailPolicy, CreditsBoundOutstandingAndExposeExhaustion) {
+  RailPolicy policy(1, RailPolicyConfig{2, 3, 1000, 1, 100});
+  const auto full = policy.TryAcquire(2, 10);
+  ASSERT_TRUE(full);
+  EXPECT_EQ(full->credits, 2u);
+  EXPECT_FALSE(policy.TryAcquire(1, 10));
+  auto stats = policy.Snapshot(10);
+  EXPECT_FALSE(policy.Acquire(1, 0));
+  ASSERT_EQ(stats.size(), 1u);
+  EXPECT_EQ(stats[0].inflight, 2u);
+  EXPECT_EQ(stats[0].credits, 2u);
+  EXPECT_EQ(stats[0].credits_exhausted, 1u);
+
+  policy.Complete(*full, 20, RailCompletion::kSuccess, 30);
+  const auto next = policy.TryAcquire(3, 31);
+  ASSERT_TRUE(next);
+  EXPECT_EQ(next->credits, 2u);
+  EXPECT_EQ(policy.Snapshot(31)[0].inflight, 2u);
+}
+
+TEST(RailPolicy, FailureQuarantinesThenSuccessfulProbeRecovers) {
+  RailPolicy policy(2, RailPolicyConfig{2, 1, 1000, 1, 100});
+  const auto degraded = policy.TryAcquire(1, 100);
+  ASSERT_TRUE(degraded);
+  ASSERT_EQ(degraded->rail, 0u);
+  policy.Complete(*degraded, 50, RailCompletion::kRailFailure, 200);
+
+  const auto healthy = policy.TryAcquire(1, 201);
+  ASSERT_TRUE(healthy);
+  EXPECT_EQ(healthy->rail, 1u);
+  auto during = policy.Snapshot(201);
+  EXPECT_EQ(during[0].quarantines, 1u);
+  EXPECT_GT(during[0].quarantined_until_us, 201u);
+
+  policy.Complete(*healthy, 25, RailCompletion::kSuccess, 300);
+  const auto probe = policy.TryAcquire(1, 1200);
+  ASSERT_TRUE(probe);
+  EXPECT_EQ(probe->rail, 0u);
+  const auto while_probing = policy.TryAcquire(1, 1201);
+  ASSERT_TRUE(while_probing);
+  EXPECT_EQ(while_probing->rail, 1u);
+  const auto probing = policy.Snapshot(1201);
+  EXPECT_TRUE(probing[0].quarantined);
+  EXPECT_TRUE(probing[0].recovery_probe);
+  policy.Complete(*probe, 30, RailCompletion::kSuccess, 1230);
+  const auto after = policy.Snapshot(1230);
+  EXPECT_EQ(after[0].recoveries, 1u);
+  policy.Complete(*while_probing, 25, RailCompletion::kSuccess, 1230);
+  EXPECT_EQ(after[0].consecutive_errors, 0u);
+  EXPECT_EQ(after[0].quarantined_until_us, 0u);
+}
+
+TEST(RailPolicy, ErrorAndLatencyPenaltySteerEqualInflightAway) {
+  RailPolicy policy(2, RailPolicyConfig{4, 3, 1000, 10, 10000});
+  const auto slow = policy.TryAcquire(1, 10);
+  ASSERT_TRUE(slow);
+  ASSERT_EQ(slow->rail, 0u);
+  policy.Complete(*slow, 500, RailCompletion::kSuccess, 510);
+
+  const auto fast = policy.TryAcquire(1, 511);
+  ASSERT_TRUE(fast);
+  EXPECT_EQ(fast->rail, 1u);
+  policy.Complete(*fast, 10, RailCompletion::kRailFailure, 521);
+
+  const auto penalized = policy.TryAcquire(1, 522);
+  ASSERT_TRUE(penalized);
+  EXPECT_EQ(penalized->rail, 0u);
+}
+
+TEST(RailPolicy, CandidateMaskRestrictsNumaSelection) {
+  RailPolicy policy(3);
+  const std::vector<uint8_t> local{0, 1, 1};
+  const auto first = policy.TryAcquire(1, 10, local);
+  const auto second = policy.TryAcquire(1, 10, local);
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(second);
+  EXPECT_EQ(first->rail, 1u);
+  EXPECT_EQ(second->rail, 2u);
+}
+
+TEST(RailPolicy, LocalMaskDoesNotEscapeWhenLocalCreditsAreBusy) {
+  RailPolicy policy(2, RailPolicyConfig{1, 3, 1000, 1, 100});
+  const std::vector<uint8_t> local{1, 0};
+  const auto held = policy.TryAcquire(1, 10, local);
+  ASSERT_TRUE(held);
+  EXPECT_FALSE(policy.TryAcquire(1, 11, local));
+  EXPECT_EQ(policy.Snapshot(11)[1].inflight, 0u);
+
+  policy.Complete(*held, 20, RailCompletion::kSuccess, 30);
+  const auto next = policy.TryAcquire(1, 31, local);
+  ASSERT_TRUE(next);
+  EXPECT_EQ(next->rail, 0u);
+}
+
+TEST(RailPolicy, EndpointFailuresReturnCreditsWithoutPenalizingRail) {
+  RailPolicy policy(2, RailPolicyConfig{1, 1, 1000, 1, 100});
+  const std::vector<uint8_t> first_rail{1, 0};
+
+  for (uint64_t now = 10; now < 15; ++now) {
+    const auto failed_endpoint = policy.TryAcquire(1, now, first_rail);
+    ASSERT_TRUE(failed_endpoint);
+    ASSERT_EQ(failed_endpoint->rail, 0u);
+    policy.Complete(*failed_endpoint, 20, RailCompletion::kEndpointFailure,
+                    now + 1);
+  }
+
+  const auto stats = policy.Snapshot(20);
+  EXPECT_EQ(stats[0].inflight, 0u);
+  EXPECT_EQ(stats[0].endpoint_errors, 5u);
+  EXPECT_EQ(stats[0].errors, 0u);
+  EXPECT_EQ(stats[0].consecutive_errors, 0u);
+  EXPECT_EQ(stats[0].quarantines, 0u);
+  const auto unrelated_node = policy.TryAcquire(1, 21, first_rail);
+  ASSERT_TRUE(unrelated_node);
+  EXPECT_EQ(unrelated_node->rail, 0u);
+}
+
+TEST(RailPolicy, EndpointFailureDoesNotConsumeRecoveryProbe) {
+  RailPolicy policy(2, RailPolicyConfig{1, 1, 1000, 1, 100});
+  const auto failed_rail = policy.TryAcquire(1, 10);
+  ASSERT_TRUE(failed_rail);
+  policy.Complete(*failed_rail, 20, RailCompletion::kRailFailure, 20);
+
+  const auto endpoint_failed_probe = policy.TryAcquire(1, 1020);
+  ASSERT_TRUE(endpoint_failed_probe);
+  ASSERT_EQ(endpoint_failed_probe->rail, failed_rail->rail);
+  policy.Complete(*endpoint_failed_probe, 20,
+                  RailCompletion::kEndpointFailure, 1030);
+
+  auto stats = policy.Snapshot(1030);
+  EXPECT_EQ(stats[failed_rail->rail].endpoint_errors, 1u);
+  EXPECT_EQ(stats[failed_rail->rail].recoveries, 0u);
+  EXPECT_TRUE(stats[failed_rail->rail].quarantined);
+  EXPECT_FALSE(stats[failed_rail->rail].recovery_probe);
+  const auto genuine_probe = policy.TryAcquire(1, 1031);
+  ASSERT_TRUE(genuine_probe);
+  ASSERT_EQ(genuine_probe->rail, failed_rail->rail);
+  policy.Complete(*genuine_probe, 20, RailCompletion::kSuccess, 1051);
+  stats = policy.Snapshot(1051);
+  EXPECT_EQ(stats[failed_rail->rail].recoveries, 1u);
+  EXPECT_EQ(stats[failed_rail->rail].quarantined_until_us, 0u);
+  EXPECT_FALSE(stats[failed_rail->rail].quarantined);
 }

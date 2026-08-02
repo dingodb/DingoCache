@@ -59,9 +59,8 @@ class NodeDedup {
   enum class Kind : uint32_t { kData = 1, kExist = 2 };
 
   // Builds Options from the environment; returns nullptr (feature off) unless
-  // DFKV_CLIENT_NODE_DEDUP=1. model_hash namespaces the segment so distinct
-  // keyspaces on one host never share entries.
-  static std::unique_ptr<NodeDedup> FromEnv(uint64_t model_hash);
+  // DFKV_CLIENT_NODE_DEDUP=1. namespace_hash isolates shared-memory segments.
+  static std::unique_ptr<NodeDedup> FromEnv(uint64_t namespace_hash);
   // The env-derived segment name. The shm LAYOUT VERSION is part of the name:
   // a layout change must never collide with a segment an older lib left
   // behind — v1.23.0 shipped a layout bump behind the same name, the header
@@ -69,7 +68,7 @@ class NodeDedup {
   // disabled itself across the whole upgrade (canary re-measured 8x). The
   // header magic stays as a backstop only. Exposed so tests clean up the
   // exact segment FromEnv would use.
-  static std::string EnvSegmentName(uint64_t model_hash);
+  static std::string EnvSegmentName(uint64_t namespace_hash);
   // Opens (or creates) the shm segment. Returns nullptr on any failure — the
   // caller just runs without dedup. A parameter mismatch with an existing
   // segment also returns nullptr (never reinterpret another config's layout).
@@ -79,7 +78,9 @@ class NodeDedup {
   NodeDedup(const NodeDedup&) = delete;
   NodeDedup& operator=(const NodeDedup&) = delete;
 
-  // Per-key verdict for a batch pass.
+  // Per-key verdict for a batch pass. A kFetch claim also returns an opaque
+  // ownership token. The caller MUST pass that token to Publish/Abort; it
+  // fences a late fetcher after Remove invalidates or a takeover supersedes it.
   enum class Role {
     kHit,    // result delivered (skip the remote op)
     kFetch,  // caller owns the remote op; MUST call Publish or Abort afterwards
@@ -88,23 +89,28 @@ class NodeDedup {
 
   // Strict GET (BatchGet semantics: exact n bytes). A published payload of a
   // different length is not a hit (lockstep peers request the same n).
-  Role Claim(const BlockKey& key, size_t n, char* dst);
+  Role Claim(const BlockKey& key, size_t n, char* dst, uint64_t* token);
   bool WaitCopy(const BlockKey& key, size_t n, char* dst);
 
   // Variable-size GET (BatchGetAuto semantics): hit iff published len <= cap;
   // *got receives the payload length.
-  Role ClaimAuto(const BlockKey& key, size_t cap, char* dst, size_t* got);
+  Role ClaimAuto(const BlockKey& key, size_t cap, char* dst, size_t* got,
+                 uint64_t* token);
   bool WaitCopyAuto(const BlockKey& key, size_t cap, char* dst, size_t* got);
 
-  // EXIST probe (1-byte answer). Stale answers are bounded by ttl_ms and safe
-  // in both directions (miss -> recompute; false present -> GET miss).
-  Role ClaimExist(const BlockKey& key, bool* val);
+  // EXIST probe (1-byte answer). Only authoritative native outcomes may be
+  // published by the caller (kOk/present or kNotFound/absent).
+  Role ClaimExist(const BlockKey& key, bool* val, uint64_t* token);
   bool WaitExist(const BlockKey& key, bool* val);
 
   // Fetch outcomes for keys claimed as kFetch (kind selects the namespace;
-  // exist publishes a 1-byte payload).
-  void Publish(const BlockKey& key, Kind kind, const char* data, size_t n);
-  void Abort(const BlockKey& key, Kind kind);
+  // exist publishes a 1-byte payload). token=0 is an unclaimed/direct fetch.
+  void Publish(const BlockKey& key, Kind kind, uint64_t token,
+               const char* data, size_t n);
+  void Abort(const BlockKey& key, Kind kind, uint64_t token);
+  // Eviction barrier: removes READY data/exist answers and supersedes any
+  // FETCHING owner. A publisher already copying is joined before return.
+  void Invalidate(const BlockKey& key);
 
   // diagnostics (relaxed; process-local)
   uint64_t hits() const { return hits_.load(std::memory_order_relaxed); }
@@ -123,9 +129,10 @@ class NodeDedup {
   // Returns payload length via *got on success.
   bool CopyOut(Slot* s, size_t cap, size_t strict_n, char* dst, size_t* got) const;
   Role ClaimImpl(const BlockKey& key, Kind kind, size_t cap, size_t strict_n,
-                 char* dst, size_t* got);
+                 char* dst, size_t* got, uint64_t* token);
   bool WaitImpl(const BlockKey& key, Kind kind, size_t cap, size_t strict_n,
                 char* dst, size_t* got);
+  void InvalidateKind(const BlockKey& key, Kind kind);
   static uint64_t NowMs();
 
   Header* hdr_ = nullptr;

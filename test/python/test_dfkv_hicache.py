@@ -8,6 +8,7 @@ import ctypes
 import logging
 import os
 import subprocess
+import shutil
 import sys
 import tempfile
 import time
@@ -27,12 +28,9 @@ BUILD = os.environ.get("DFKV_BUILD", os.path.join(HERE, "..", "..", "build"))
 SERVER_BIN = os.path.join(BUILD, "dfkv_server")
 
 # These plugin tests are single-rank in one process, so the same-host
-# rendezvous (auto-enabled since phase 9 for mla+tp>1, which most fixtures
-# are) has no peer to dedup and only adds a persistent /dev/shm segment whose
-# published exist answers leak ACROSS tests (synthetic keys + model_hash 0 +
-# sub-second timing collide inside the TTL). Pin it off so the datapath is
-# exercised deterministically; the rendezvous has its own coverage in
-# node_dedup_test.cc. resolve_node_dedup honors this explicit env over auto.
+# rendezvous can leak published exist answers across tests when synthetic keys
+# and namespaces collide inside the TTL. Pin it off so the datapath is
+# deterministic; rendezvous behavior has dedicated node_dedup coverage.
 os.environ.setdefault("DFKV_CLIENT_NODE_DEDUP", "0")
 
 
@@ -155,6 +153,8 @@ class FakeHybridStatePool:
         self.page_size = page_size
         self.temporal_bytes = temporal_bytes
         self.conv_bytes = conv_bytes
+        self.temporal_state_elem_size = temporal_bytes
+        self.conv_state_elem_sizes = [conv_bytes]
         self.tbuf = np.zeros(num_pages * temporal_bytes, dtype=np.uint8)
         self.cbuf = np.zeros(num_pages * conv_bytes, dtype=np.uint8)
 
@@ -198,8 +198,10 @@ class FakeLogicalAnchorPool:
 
 def _spawn_node(tag):
     d = tempfile.mkdtemp(prefix=f"dfkv_py_{tag}_")
-    p = subprocess.Popen([SERVER_BIN, "--dir", d, "--port", "0", "--cap", str(1 << 30)],
-                         stdout=subprocess.PIPE, text=True)
+    p = subprocess.Popen(
+        [SERVER_BIN, "--dir", d, "--port", "0", "--cap", str(1 << 30),
+         "--store-engine", "file"],
+        stdout=subprocess.PIPE, text=True)
     line = p.stdout.readline().strip()
     assert line.startswith("PORT "), f"bad server greeting: {line!r}"
     port = int(line.split()[1])
@@ -220,6 +222,7 @@ class DingoFSHiCacheTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.procs = []
+        cls.dirs = []
 
     @classmethod
     def tearDownClass(cls):
@@ -229,10 +232,13 @@ class DingoFSHiCacheTest(unittest.TestCase):
                 p.wait(timeout=5)
             except Exception:
                 p.kill()
+        for d in cls.dirs:
+            shutil.rmtree(d, ignore_errors=True)
 
     def _node(self, tag):
         p, d, port = _spawn_node(tag)
         self.procs.append(p)
+        self.dirs.append(d)
         return f"{tag}=127.0.0.1:{port}", port, d
 
     def _cfg(self, members, tp_rank=0, tp_size=8, page_size=64, model="glm-5.1",
@@ -242,9 +248,7 @@ class DingoFSHiCacheTest(unittest.TestCase):
             is_page_first_layout=False, model_name=model,
             pp_rank=pp_rank, pp_size=pp_size,
             extra_config={
-                "members": members, "model_hash": 0x51,
-                "dtype_tag": 0x46384534, "page_size": page_size,
-                "layer_num": 78, "head_num": 1, "head_dim": 576,
+                "members": members,
                 "interface_v1": 1,
             })
 
@@ -267,20 +271,19 @@ class DingoFSHiCacheTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
 
-    def test_requires_model_hash(self):
-        # A forgotten model_hash (the per-model isolation identity) must abort
-        # startup, not silently fall back to the shared keyspace. Raises before
-        # any server connection, so a fake member is fine.
-        cfg = self._cfg("n=127.0.0.1:1")
-        cfg.extra_config.pop("model_hash")
+    def test_requires_model_identity(self):
+        cfg = self._cfg("n=127.0.0.1:1", model="")
         with self.assertRaises(dfkv_hicache._tcfg.DfkvConfigError):
             dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
 
-    def test_rejects_zero_model_hash(self):
-        cfg = self._cfg("n=127.0.0.1:1")
-        cfg.extra_config["model_hash"] = 0
-        with self.assertRaises(dfkv_hicache._tcfg.DfkvConfigError):
-            dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+    def test_explicit_namespace_can_align_different_model_labels(self):
+        a = self._cfg("n=127.0.0.1:1", model="runtime-a/model")
+        b = self._cfg("n=127.0.0.1:1", model="runtime-b/model")
+        a.extra_config["key_namespace"] = "shared/model"
+        b.extra_config["key_namespace"] = "shared/model"
+        sa = dfkv_hicache.DfkvHiCache(a, a.extra_config)
+        sb = dfkv_hicache.DfkvHiCache(b, b.extra_config)
+        self.assertEqual(sa._key_namespace, sb._key_namespace)
 
     def test_requires_ring_endpoint(self):
         # Neither members nor mds_endpoints => no ring to connect to.
@@ -288,16 +291,31 @@ class DingoFSHiCacheTest(unittest.TestCase):
         with self.assertRaises(dfkv_hicache._tcfg.DfkvConfigError):
             dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
 
-    def test_shared_keyspace_opt_in_allows_missing_model_hash(self):
-        # Explicit opt-in lets a single-model deployment start with the shared
-        # keyspace (model_hash 0) — this is the escape hatch that keeps the
-        # strict default from breaking legitimate single-model fleets.
-        members, _, _ = self._node("sharedok")
-        cfg = self._cfg(members)
-        cfg.extra_config.pop("model_hash")
-        cfg.extra_config["allow_shared_keyspace"] = 1
+    def test_namespace_is_derived_from_model_identity_and_layout(self):
+        members, _, _ = self._node("namespace")
+        cfg = self._cfg(members, model="org/model")
         st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
-        self.assertTrue(hasattr(st, "get"))
+        self.assertEqual(
+            st._key_namespace,
+            dfkv_hicache.canonical_namespace(
+                "org/model",
+                dfkv_hicache.SGLANG_HICACHE_RAW_V1,
+                dtype="unknown",
+                block_tokens=64,
+                tp_size=8,
+                layout_fields={
+                    "page_size": 64,
+                    "dtype": "unknown",
+                    "dtype_tag": 0,
+                    "is_mla": True,
+                    "layer_num": 0,
+                    "head_num": 0,
+                    "head_dim": 0,
+                    "pcp_size": 1,
+                    "dcp_size": 1,
+                },
+            ),
+        )
 
     def test_rdma_depth_extra_config_sets_env(self):
         # extra_config rdma_depth must propagate to DFKV_RDMA_DEPTH so the C client
@@ -362,9 +380,7 @@ class DingoFSHiCacheTest(unittest.TestCase):
     def test_transport_mode_recorded(self):
         members, _, _ = self._node("tmode")
         saved_rdma = os.environ.get("DFKV_RDMA")
-        saved_req = os.environ.get("DFKV_REQUIRE_RDMA")
         os.environ.pop("DFKV_RDMA", None)
-        os.environ.pop("DFKV_REQUIRE_RDMA", None)
         try:
             cfg = self._cfg(members)
             st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
@@ -374,10 +390,6 @@ class DingoFSHiCacheTest(unittest.TestCase):
                 os.environ.pop("DFKV_RDMA", None)
             else:
                 os.environ["DFKV_RDMA"] = saved_rdma
-            if saved_req is None:
-                os.environ.pop("DFKV_REQUIRE_RDMA", None)
-            else:
-                os.environ["DFKV_REQUIRE_RDMA"] = saved_req
 
     def test_generic_get_roundtrip(self):
         # Generic (non zero-copy) set/get round-trips a page through dfkv.
@@ -508,9 +520,8 @@ class DingoFSHiCacheTest(unittest.TestCase):
     def test_v2_follower_rank_writes_rank_sharded_pool(self):
         # Kimi-K3 (hybrid MLA + KDA/mamba): the mamba state pool is rank-sharded,
         # so a follower rank MUST persist its own shard -- backup_skip applies
-        # only to replicated (single-component) pools. Multi-component pools are
-        # exactly the ones whose keys carry tp_size/tp_rank, so writes from
-        # different ranks never collide, and the v2 set metrics must report this
+        # only to replicated pools. Component coordinates and sharding are
+        # inferred from the physical host-pool layout, not model names.
         # real I/O instead of being gated wholesale on tp_rank.
         from sglang.srt.mem_cache.hicache_storage import PoolTransfer
         T, C = 4096, 512  # temporal / conv bytes per page (shape-agnostic)
@@ -520,8 +531,9 @@ class DingoFSHiCacheTest(unittest.TestCase):
         st.register_mem_pool_host(FakeLogicalAnchorPool(self.PAGE_SIZE))
         mamba = FakeHybridStatePool(2, T, C, self.PAGE_SIZE)
         st.register_mem_host_pool_v2(mamba, "mamba")
-        # registration probed two components (works in this torch-free env)
-        self.assertEqual(st._pool_components("mamba"), 2)
+        self.assertEqual(
+            st._pool_components("mamba"), ("temporal", "conv0"))
+        self.assertFalse(st._pool_is_replicated("mamba"))
         for i in range(2):
             mamba.fill_page(i, 30 + i)
         keys = ["m0", "m1"]
@@ -566,48 +578,170 @@ class DingoFSHiCacheTest(unittest.TestCase):
         st.pp_rank = kw.get("pp_rank", 0)
         st.pp_size = kw.get("pp_size", 1)
         st.enable_pp = st.pp_size > 1
+        st.pcp_size = kw.get("pcp_size", 1)
+        st.pcp_rank = kw.get("pcp_rank", 0)
+        st.dcp_size = kw.get("dcp_size", 1)
+        st.dcp_rank = kw.get("dcp_rank", 0)
+        st._pool_component_names = {"extra": ("all",)}
+        st._pool_replicated = {"extra": True}
         return st
 
-    def test_keys_pp_off_matches_legacy_format(self):
-        # PP disabled: key format must be unchanged (back-compat with existing
-        # clusters running pp_size=1).
+    def test_keys_use_canonical_binary_pool_schema(self):
         mla = self._keyonly(is_mla=True)
-        self.assertEqual(mla._keys("abc"), ["glm-5.1/abc_k"])
+        self.assertEqual(
+            mla._keys(b"abc\x00\xff"),
+            [
+                dfkv_hicache.pool_key(
+                    b"abc\x00\xff", pool="kv", tp_size=8, tp_rank=-1,
+                    component="all")
+            ],
+        )
+        self.assertNotEqual(mla._keys(b"abc\x00\xff"), mla._keys(b"abc"))
         mha = self._keyonly(is_mla=False, tp_rank=2, tp_size=8)
-        self.assertEqual(mha._keys("abc"),
-                         ["glm-5.1/abc_8_2_k", "glm-5.1/abc_8_2_v"])
+        self.assertEqual(
+            mha._keys("abc"),
+            [
+                dfkv_hicache.pool_key(
+                    "abc", pool="kv", tp_size=8, tp_rank=2, component="k"),
+                dfkv_hicache.pool_key(
+                    "abc", pool="kv", tp_size=8, tp_rank=2, component="v"),
+            ],
+        )
 
-    def test_keys_mha_pp_on_appends_pp_rank(self):
-        # PP on: MHA keys carry _pp{rank}; different pp_rank -> different keys.
-        pp0 = self._keyonly(is_mla=False, tp_rank=0, tp_size=8, pp_rank=0, pp_size=4)
-        pp1 = self._keyonly(is_mla=False, tp_rank=0, tp_size=8, pp_rank=1, pp_size=4)
-        self.assertEqual(pp0._keys("xyz"),
-                         ["glm-5.1/xyz_8_0_pp0_k", "glm-5.1/xyz_8_0_pp0_v"])
-        self.assertEqual(pp1._keys("xyz"),
-                         ["glm-5.1/xyz_8_0_pp1_k", "glm-5.1/xyz_8_0_pp1_v"])
-        # The whole point: PP0 and PP1 must not share a key.
+    def test_keys_separate_pcp_and_dcp_physical_ranks(self):
+        page_hash = b"same-page\x00hash"
+        for axis in ("pcp", "dcp"):
+            rank0 = self._keyonly(**{
+                f"{axis}_size": 2, f"{axis}_rank": 0})
+            rank1 = self._keyonly(**{
+                f"{axis}_size": 2, f"{axis}_rank": 1})
+            key0 = rank0._keys(page_hash)[0]
+            key1 = rank1._keys(page_hash)[0]
+            self.assertNotEqual(key0, key1)
+            expected = {
+                "pcp_size": 2 if axis == "pcp" else 1,
+                "pcp_rank": 1 if axis == "pcp" else 0,
+                "dcp_size": 2 if axis == "dcp" else 1,
+                "dcp_rank": 1 if axis == "dcp" else 0,
+            }
+            self.assertEqual(
+                key1,
+                dfkv_hicache.pool_key(
+                    page_hash, pool="kv", tp_size=8, tp_rank=-1,
+                    component="all", **expected))
+
+    def test_multirank_pcp_dcp_require_explicit_in_range_rank(self):
+        for axis in ("pcp", "dcp"):
+            missing = self._cfg("n=127.0.0.1:1")
+            missing.extra_config[f"{axis}_size"] = 2
+            with self.assertRaisesRegex(
+                    ValueError, f"{axis}_rank is required"):
+                dfkv_hicache.DfkvHiCache(
+                    missing, missing.extra_config)
+
+            invalid = self._cfg("n=127.0.0.1:1")
+            invalid.extra_config.update({
+                f"{axis}_size": 2,
+                f"{axis}_rank": 2,
+            })
+            with self.assertRaisesRegex(ValueError, f"{axis}_rank"):
+                dfkv_hicache.DfkvHiCache(
+                    invalid, invalid.extra_config)
+
+    def test_multi_pool_probe_failures_do_not_register_replicated_fallback(self):
+        class BrokenPool:
+            page_size = 64
+
+            def get_page_buffer_meta(self, _indices):
+                raise RuntimeError("probe failed")
+
+        class EmptyPool:
+            page_size = 64
+
+            def get_page_buffer_meta(self, _indices):
+                return [], []
+
+        class AmbiguousPool:
+            page_size = 64
+
+            def get_page_buffer_meta(self, _indices):
+                return [1, 2], [4, 4]
+
+        for pool in (BrokenPool(), EmptyPool(), AmbiguousPool()):
+            st = self._keyonly()
+            st.registered_pools = {}
+            st._pool_component_names = {}
+            st._pool_replicated = {}
+            with self.assertRaisesRegex(
+                    RuntimeError, "cannot discover physical layout"):
+                st.register_mem_host_pool_v2(pool, "unsafe")
+            self.assertNotIn("unsafe", st.registered_pools)
+            self.assertNotIn("unsafe", st._pool_component_names)
+            with self.assertRaisesRegex(RuntimeError, "no discovered layout"):
+                st._pool_keys("unsafe", "page")
+
+    def test_keys_mha_pp_on_encodes_pp_rank(self):
+        pp0 = self._keyonly(
+            is_mla=False, tp_rank=0, tp_size=8, pp_rank=0, pp_size=4)
+        pp1 = self._keyonly(
+            is_mla=False, tp_rank=0, tp_size=8, pp_rank=1, pp_size=4)
+        self.assertEqual(
+            pp0._keys("xyz"),
+            [
+                dfkv_hicache.pool_key(
+                    "xyz", tp_size=8, tp_rank=0,
+                    pp_size=4, pp_rank=0, component="k"),
+                dfkv_hicache.pool_key(
+                    "xyz", tp_size=8, tp_rank=0,
+                    pp_size=4, pp_rank=0, component="v"),
+            ],
+        )
+        self.assertEqual(
+            pp1._keys("xyz"),
+            [
+                dfkv_hicache.pool_key(
+                    "xyz", tp_size=8, tp_rank=0,
+                    pp_size=4, pp_rank=1, component="k"),
+                dfkv_hicache.pool_key(
+                    "xyz", tp_size=8, tp_rank=0,
+                    pp_size=4, pp_rank=1, component="v"),
+            ],
+        )
         self.assertNotEqual(set(pp0._keys("xyz")), set(pp1._keys("xyz")))
 
-    def test_keys_mla_pp_on_appends_pp_rank(self):
-        # PP on: MLA keys ALSO carry _pp{rank}. PP splits by layer, the MLA
-        # latent is NOT replicated across PP stages (only across TP), so PP0
-        # and PP1 must not collide on the same MLA object.
+    def test_keys_mla_pp_on_encodes_pp_rank(self):
         pp0 = self._keyonly(is_mla=True, pp_rank=0, pp_size=2)
         pp1 = self._keyonly(is_mla=True, pp_rank=1, pp_size=2)
-        self.assertEqual(pp0._keys("h"), ["glm-5.1/h_k_pp0"])
-        self.assertEqual(pp1._keys("h"), ["glm-5.1/h_k_pp1"])
+        self.assertEqual(
+            pp0._keys("h"),
+            [dfkv_hicache.pool_key(
+                "h", tp_size=8, tp_rank=-1,
+                pp_size=2, pp_rank=0, component="all")],
+        )
+        self.assertEqual(
+            pp1._keys("h"),
+            [dfkv_hicache.pool_key(
+                "h", tp_size=8, tp_rank=-1,
+                pp_size=2, pp_rank=1, component="all")],
+        )
         self.assertNotEqual(pp0._keys("h"), pp1._keys("h"))
 
-    def test_pool_keys_aux_pool_carries_pp_suffix(self):
-        # Auxiliary pools (e.g. SWA/INDEXER side-pools) must also isolate by PP.
+    def test_pool_keys_aux_pool_carries_pp_coordinate(self):
         pp0 = self._keyonly(is_mla=True, pp_rank=0, pp_size=2)
         pp1 = self._keyonly(is_mla=True, pp_rank=1, pp_size=2)
-        self.assertEqual(pp0._pool_keys("extra", "p"),
-                         ["glm-5.1/p_extra_pp0_k"])
-        self.assertEqual(pp1._pool_keys("extra", "p"),
-                         ["glm-5.1/p_extra_pp1_k"])
-        # primary "kv" pool routes through _keys (already covered above).
-        self.assertEqual(pp0._pool_keys("kv", "p"), ["glm-5.1/p_k_pp0"])
+        self.assertEqual(
+            pp0._pool_keys("extra", "p"),
+            [dfkv_hicache.pool_key(
+                "p", pool="extra", tp_size=8, tp_rank=-1,
+                pp_size=2, pp_rank=0, component="all")],
+        )
+        self.assertEqual(
+            pp1._pool_keys("extra", "p"),
+            [dfkv_hicache.pool_key(
+                "p", pool="extra", tp_size=8, tp_rank=-1,
+                pp_size=2, pp_rank=1, component="all")],
+        )
+        self.assertEqual(pp0._pool_keys("kv", "p"), pp0._keys("p"))
 
     def test_keys_pp_isolates_across_full_tp_pp_matrix(self):
         # Exhaustive: no two (tp_rank, pp_rank) pairs may produce the same key
@@ -648,17 +782,20 @@ class DingoFSHiCacheTest(unittest.TestCase):
         n = st.batch_exists(["e0", "e1", "e2"])
         self.assertEqual(n, 2)
 
-    def test_header_mismatch_is_miss(self):
-        members, _, _ = self._node("hdr")
+    def test_namespace_mismatch_is_miss(self):
+        members, _, _ = self._node("namespace-miss")
         pool_w = FakeMlaPool(1, self.PAGE_BYTES, self.PAGE_SIZE)
         pool_w.fill_page(0, 7)
-        writer = self._plugin(self._cfg(members, page_size=64), pool_w)
+        writer_cfg = self._cfg(members)
+        writer_cfg.extra_config["key_namespace"] = "model/layout-a"
+        writer = self._plugin(writer_cfg, pool_w)
         writer.batch_set_v1(["h0"], list(range(self.PAGE_SIZE)))
-        # reader with different geometry (page_size 32) must MISS, not read garbage
         pool_r = FakeMlaPool(1, self.PAGE_BYTES, self.PAGE_SIZE)
-        reader = self._plugin(self._cfg(members, page_size=32), pool_r)
-        self.assertEqual(reader.batch_get_v1(["h0"], list(range(self.PAGE_SIZE))),
-                         [False])
+        reader_cfg = self._cfg(members)
+        reader_cfg.extra_config["key_namespace"] = "model/layout-b"
+        reader = self._plugin(reader_cfg, pool_r)
+        self.assertEqual(
+            reader.batch_get_v1(["h0"], list(range(self.PAGE_SIZE))), [False])
 
     def test_pp_stages_isolate_on_same_page_hash(self):
         # Two PP stages (pp_rank 0 and 1) writing the SAME page_hash must land
@@ -912,6 +1049,7 @@ class DfkvAccessLogTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.procs = []
+        cls.dirs = []
 
     @classmethod
     def tearDownClass(cls):
@@ -921,6 +1059,8 @@ class DfkvAccessLogTest(unittest.TestCase):
                 p.wait(timeout=5)
             except Exception:
                 p.kill()
+        for d in cls.dirs:
+            shutil.rmtree(d, ignore_errors=True)
 
     def setUp(self):
         _reset_access_log()
@@ -928,15 +1068,17 @@ class DfkvAccessLogTest(unittest.TestCase):
 
     def tearDown(self):
         _reset_access_log()
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _node(self, tag):
         p, d, port = _spawn_node(tag)
         self.procs.append(p)
+        self.dirs.append(d)
         return f"{tag}=127.0.0.1:{port}"
 
     def _cfg(self, members, alog_extra, tp_rank=0):
         ec = {
-            "members": members, "model_hash": 0x51,
+            "members": members,
             "dtype_tag": 0x46384534, "page_size": self.PAGE_SIZE,
             "layer_num": 78, "head_num": 1, "head_dim": 576,
             "interface_v1": 1,
@@ -987,7 +1129,9 @@ class DfkvAccessLogTest(unittest.TestCase):
         st.batch_exists(["w0", "w1", "w_miss"])  # 2 present, 1 missing
         self._flush()
         txt = self._read(os.path.join(self.tmp, "acc.0.log"))
-        self.assertIn("init(r0 glm-5.1 tp=0/8 mla=1) : ok static", txt)
+        self.assertIn(
+            "init(r0 glm-5.1 tp=0/8 pcp=0/1 dcp=0/1 mla=1) : ok static", txt
+        )
         self.assertIn("batch_set_v1(r0 2 keys) : ok 2/2", txt)
         self.assertIn("batch_get_v1(r0 2 keys) : hits=2/2", txt)
         self.assertIn("batch_exists(r0 3 keys) : prefix=2/3", txt)
@@ -1006,11 +1150,13 @@ class DfkvAccessLogTest(unittest.TestCase):
         self.assertIsNone(st.get("g_missing", FlatBuf(self.PAGE_BYTES)))
         self._flush()
         txt = self._read(os.path.join(self.tmp, "acc.0.log"))
-        self.assertIn("set(r0 g0, 4.00KiB) : ok", txt)
+        g0 = dfkv_hicache._key_label(st._keys("g0")[0])
+        missing = dfkv_hicache._key_label(st._keys("g_missing")[0])
+        self.assertIn(f"set(r0 {g0}, 4.00KiB) : ok", txt)
         self.assertIn(": hit", txt)        # get hit
         self.assertIn(": miss", txt)       # get miss
-        self.assertIn("exists(r0 g0) : found", txt)
-        self.assertIn("exists(r0 g_missing) : not_found", txt)
+        self.assertIn(f"exists(r0 {g0}) : found", txt)
+        self.assertIn(f"exists(r0 {missing}) : not_found", txt)
 
     def test_auto_rank_suffix_and_backup_skip(self):
         members = self._node("as")
@@ -1090,7 +1236,10 @@ class DfkvAccessLogTest(unittest.TestCase):
             st.set("f1", b"x" * 16)  # exception must propagate, not be swallowed
         self._flush()
         txt = self._read(os.path.join(self.tmp, "acc.0.log"))
-        self.assertIn("set(r0 f0, 0B) : fail none", txt)
+        self.assertIn(
+            f"set(r0 {dfkv_hicache._key_label(st._keys('f0')[0])}, 0B) : fail none",
+            txt,
+        )
         self.assertIn("FAIL RuntimeError: boom", txt)
 
 
@@ -1242,55 +1391,67 @@ class ClientStatsPollerTest(unittest.TestCase):
 
 
 class DfkvClientRegistrationTest(unittest.TestCase):
-    """SGLang HiCache client registration (parity with vLLM/LMCache, v1.15.0).
+    """SGLang HiCache ABI-v2 construction and MDS registration.
 
-    The registration call rides on the MDS-discovery path. We don't run a real
-    etcd/MDS here (deterministic, no external deps): we swap _load_lib for a fake
-    CDLL that records the C-ABI calls. The fake's dfkv_start_mds_discovery
-    returns 0 (success) so the registration call is reached; we then assert the
-    info string carries type=hicache + model/tp fields, and that the opt-out and
-    older-lib (missing symbol) paths are honored.
+    A fake CDLL decodes the versioned options passed to ``dfkv_open_v2`` so the
+    test proves discovery, registration identity, and opt-out policy are
+    configured atomically without a real cache node or MDS.
     """
     PAGE_SIZE = 64
     PAGE_BYTES = 4096
 
-    def _fake_lib(self, *, with_symbol=True, reg_rc=0):
-        """A ctypes-shaped stand-in for libdfkv.so. Records ABI calls so tests
-        can assert what the plugin invoked, without a real cache node / MDS."""
-        calls = {"discovery": [], "registration": []}
+    def _fake_lib(self):
+        """A ctypes-shaped stand-in recording decoded ABI-v2 open options."""
+        calls = {"discovery": [], "registration": [], "open": []}
 
         class _FakeLib:
-            # The plugin probes the symbol at _load_lib time (hasattr) to declare
-            # its argtypes/restype. Hide it entirely to model an older lib.
             def __init__(self):
-                if with_symbol:
-                    self.dfkv_start_client_registration = self._reg
-                self.dfkv_start_mds_discovery = self._disc
-                self.dfkv_open = self._open
-                self.dfkv_set_batch_concurrency = lambda *a, **k: 0
+                self.dfkv_open_v2 = self._open_v2
                 self.dfkv_transport_mode = lambda *a, **k: b"tcp"
                 self.dfkv_close = lambda *a, **k: None
-                self.dfkv_version = lambda *a, **k: b"1.15.1"
+                self.dfkv_version = lambda *a, **k: b"2.0.0"
 
-            def _open(self, *a, **k):
-                return ctypes.c_void_p(0xDEADBEEF)  # non-null handle
-
-            def _disc(self, h, mds, group, poll_ms):
-                calls["discovery"].append((mds.decode(), group.decode(), poll_ms))
-                return 0  # success -> registration call is reached
-
-            def _reg(self, h, mds, group, cid, info, hb_ms):
-                calls["registration"].append(
-                    (mds.decode(), group.decode(), cid.decode(),
-                     info.decode(), hb_ms))
-                return reg_rc
+            def _open_v2(self, options_ptr):
+                options = ctypes.cast(
+                    options_ptr,
+                    ctypes.POINTER(dfkv_hicache.DfkvClientOptionsV2),
+                ).contents
+                mds = (
+                    options.mds_endpoints.decode()
+                    if options.mds_endpoints
+                    else ""
+                )
+                group = (
+                    options.mds_group.decode()
+                    if options.mds_group
+                    else "default"
+                )
+                calls["open"].append(options.abi_version)
+                if mds:
+                    calls["discovery"].append(
+                        (mds, group, options.mds_poll_ms))
+                if options.flags:
+                    calls["registration"].append(
+                        (
+                            mds,
+                            group,
+                            options.client_id.decode(),
+                            (
+                                options.client_info.decode()
+                                if options.client_info
+                                else ""
+                            ),
+                            options.client_heartbeat_ms,
+                        )
+                    )
+                return ctypes.c_void_p(0xDEADBEEF)
 
         return _FakeLib(), calls
 
     def _mds_cfg(self, mds="127.0.0.1:9999", tp_rank=0, tp_size=8,
                  model="glm-5.1", extra=None):
         ec = {
-            "mds_endpoints": mds, "mds_group": "t-grp", "model_hash": 0x51,
+            "mds_endpoints": mds, "mds_group": "t-grp",
             "dtype_tag": 0x46384534, "page_size": self.PAGE_SIZE,
             "layer_num": 78, "head_num": 1, "head_dim": 576,
             "interface_v1": 1,
@@ -1357,28 +1518,6 @@ class DfkvClientRegistrationTest(unittest.TestCase):
             self._make_plugin(cfg, fake)
         self.assertEqual(len(calls["registration"]), 1)
 
-    def test_older_lib_missing_symbol_skips_silently(self):
-        # An older libdfkv.so without dfkv_start_client_registration must not
-        # crash startup (the hasattr guard drops the symbol; the call site's
-        # AttributeError branch swallows it). Discovery still succeeds.
-        os.environ.pop("DFKV_CLIENT_REGISTER", None)
-        fake, calls = self._fake_lib(with_symbol=False)
-        cfg = self._mds_cfg()
-        self._make_plugin(cfg, fake)  # must not raise
-        self.assertEqual(len(calls["discovery"]), 1)
-        self.assertEqual(calls["registration"], [])
-
-    def test_registration_failure_does_not_block_startup(self):
-        # A non-zero rc from dfkv_start_client_registration must not abort: the
-        # data path is already up via discovery, so registration is best-effort.
-        os.environ.pop("DFKV_CLIENT_REGISTER", None)
-        fake, calls = self._fake_lib(reg_rc=1)
-        cfg = self._mds_cfg()
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            self._make_plugin(cfg, fake)  # must not raise
-            self.assertTrue(any("client registration skipped" in str(x.message) for x in w))
-        self.assertEqual(len(calls["discovery"]), 1)
 
     def test_no_registration_on_static_members_path(self):
         # Static-members deployments (no mds_endpoints) never register: there's
@@ -1386,7 +1525,7 @@ class DfkvClientRegistrationTest(unittest.TestCase):
         os.environ.pop("DFKV_CLIENT_REGISTER", None)
         fake, calls = self._fake_lib()
         ec = {
-            "members": "n1=127.0.0.1:1", "model_hash": 0x51,
+            "members": "n1=127.0.0.1:1",
             "dtype_tag": 0x46384534, "page_size": self.PAGE_SIZE,
             "layer_num": 78, "head_num": 1, "head_dim": 576,
             "interface_v1": 1,
@@ -1451,22 +1590,29 @@ class PutRetryTest(unittest.TestCase):
 
         class _FakeLib:
             def __init__(self):
-                self.dfkv_open = lambda *a, **k: ctypes.c_void_p(0xBEEF)
-                self.dfkv_set_batch_concurrency = lambda *a, **k: 0
+                self.dfkv_open_v2 = (
+                    lambda *a, **k: ctypes.c_void_p(0xBEEF))
                 self.dfkv_transport_mode = lambda *a, **k: b"tcp"
                 self.dfkv_close = lambda *a, **k: None
                 self.dfkv_version = lambda *a, **k: b"1.27.0"
                 self.dfkv_batch_exist = self._exist
                 self.dfkv_batch_put = self._put
 
-            def _exist(self, h, karr, n, out):
+            def _exist(self, h, karr, klens, n, out):
                 calls["exist"] += 1
+                keys = [
+                    ctypes.string_at(karr[i], klens[i]) for i in range(n)]
+                self.assert_lengths = [len(key) for key in keys]
+                self.assert_lens = list(klens)
+                assert self.assert_lengths == self.assert_lens
                 for i in range(n):
                     out[i] = 0  # nothing in L3 yet: all keys proceed to put
                 return 0
 
-            def _put(self, h, karr, parr, sarr, n, out):
-                keys = [karr[i].decode() for i in range(n)]
+            def _put(self, h, karr, klens, parr, sarr, n, out):
+                keys = [
+                    ctypes.string_at(karr[i], klens[i]) for i in range(n)]
+                assert [len(key) for key in keys] == list(klens)
                 calls["put"].append(keys)
                 first = len(calls["put"]) == 1
                 for i, k in enumerate(keys):
@@ -1486,9 +1632,7 @@ class PutRetryTest(unittest.TestCase):
             tp_rank=0, tp_size=8, is_mla_model=True,
             is_page_first_layout=False, model_name="glm-retry",
             extra_config={
-                "members": "n0=127.0.0.1:1", "model_hash": 0x51,
-                "dtype_tag": 0x46384534, "page_size": self.PAGE_SIZE,
-                "layer_num": 78, "head_num": 1, "head_dim": 576,
+                "members": "n0=127.0.0.1:1",
                 "interface_v1": 1,
             })
         with patch.object(dfkv_hicache, "_load_lib", return_value=fake):
@@ -1512,13 +1656,14 @@ class PutRetryTest(unittest.TestCase):
         self.assertEqual(st._put_retry_recovered, 3)
 
     def test_persistent_failures_stay_false(self):
-        # MLA sub-key = "<model>/<page_hash>_k"; k0 fails on both attempts.
-        fake, calls = self._fake_lib(fail_always_keys={"glm-retry/k0_k"})
+        key = dfkv_hicache.pool_key(
+            "k0", pool="kv", tp_size=8, tp_rank=-1, component="all")
+        fake, calls = self._fake_lib(fail_always_keys={key})
         st = self._plugin(fake)
         res = self._set(st, 4)
         self.assertEqual(res, [False, True, True, True])
-        self.assertEqual(len(calls["put"]), 2)          # retry attempted once
-        self.assertEqual(calls["put"][1], ["glm-retry/k0_k"])
+        self.assertEqual(len(calls["put"]), 2)
+        self.assertEqual(calls["put"][1], [key])
         self.assertEqual(st._put_retry_recovered, 0)
 
     def test_no_retry_when_all_succeed(self):

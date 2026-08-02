@@ -86,8 +86,8 @@ bool MdsMemberPoller::PollOnce() {
   // recovery (mass lease expiry), not a genuine teardown; adopting it remaps
   // the whole cluster into a miss storm and remaps AGAIN when the members
   // re-register. Suspicious views must persist for kViewsToAccept polls.
-  // Rejecting must not advance the epoch — the eventual adoption of the same
-  // etcd revision would otherwise be suppressed by the epoch dedup below.
+  // Rejecting must not advance the placement-content epoch — eventual adoption
+  // of that same content would otherwise be suppressed by epoch dedup below.
   if (!guard_.Admit(ms.size()))
     return true;  // keep the last ring; do NOT invoke on_change
 

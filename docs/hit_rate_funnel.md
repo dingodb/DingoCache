@@ -23,7 +23,8 @@
 
 **失败模式与判读**：
 - **环写满 → 命中率断崖归零**：`dfkv_used_bytes / cap > ~0.95` 且 `dfkv_evictions_total` 与写入量同步暴涨 = 满环自噬（刚写的热页被逐出）。**修**：容量水位（`DFKV_SLAB_EVICT_HIGH_PCT`，看 `dfkv_slab_watermark_evictions_total` 是否在动）+ 别让环写满。
-- **keyspace 隔离/串味**：命中率异常低但环不满 → 查 `model_name`/`model_hash` 是否一致（dfkv key 前缀 = model_name）。
+- **identity 不一致**：环不满但命中率低 → 对齐 exact runtime model identity、`key_namespace` override 和 canonical object-key 坐标；任何 namespace/key 差异都是 cold miss。
+- **identity 相同但 layout 不同**：若命中后 shape/内容异常，同一 namespace+key 被不同 dtype/page/shape/layout 复用；这是 operator error。停止混写并发布新的 schema `key_namespace`。
 
 ---
 
@@ -62,7 +63,8 @@ exist 命中 **≠** 数据真被拉回。SGLang HiCache 的 `prefetch-policy=ti
 | 症状 | 层 | 首查指标 | 首选修法 |
 |---|---|---|---|
 | exist 命中率低、环快满 | ① | `used_bytes/cap`、`watermark_evictions` | 容量水位 + 别写满 |
-| exist 命中率低、环不满 | ① | `model_name`/`model_hash` | keyspace 对齐 |
+| exist 命中率低、环不满 | ① | effective namespace / object key | 对齐 model identity、override 与 key 坐标；差异即 cold miss |
+| exist 命中但内容/shape 异常 | ① | writer/reader raw layout | 停止混写，为新 schema 发布新 `key_namespace` |
 | exist 高但读回量小 | ② | `bytes_read`、access log | 查 prefetch timeout、确认 dedup 未误开 |
 | 热轮慢于冷轮 | ③ | 冷/热吞吐、读回 GB/s | 多节点、prefetch overlap |
 | 热轮仍大量写入 | ③ | `bytes_written` 热轮增量 | backup exist 门 |

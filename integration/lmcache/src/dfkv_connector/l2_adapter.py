@@ -30,21 +30,19 @@ Design notes:
 * **Locking is a no-op.** dfkv is a remote KV store with no L1-eviction concept,
   so lookup "locks" / unlocks are tracked only as a client-side refcount (kept for
   interface symmetry; nothing can evict a remote object out from under a loader).
-* **Isolation.** ``ObjectKey`` is serialized to a model-namespaced string
-  (``model_name@kv_rank@object_group_id@chunk_hash[@cache_salt]``); on top of that
-  the dfkv geometry header carries a stable ``model_hash`` derived from the
-  configured ``model_name`` so two deployments sharing a ring stay isolated.
+* **Isolation.** ``dfkv_open`` receives an explicit binary model namespace;
+  object keys use the same canonical pool-coordinate schema as every connector.
 """
 
 from __future__ import annotations
 
 import asyncio
 import dataclasses
-import hashlib
 import os
 import threading
 from concurrent.futures import Future as _CFuture
 from typing import TYPE_CHECKING, List, Optional
+from dfkv_common import LMCACHE_RAW_V1, canonical_namespace, pool_key
 
 from lmcache.logging import init_logger
 from lmcache.native_storage_ops import Bitmap
@@ -64,39 +62,22 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Key field separator — same convention as fs / native-connector L2 adapters.
-# ObjectKey forbids ``@`` in model_name and cache_salt, so this is unambiguous.
-_KEY_SEP = "@"
-
-_FLAG_IS_MLA = 0x1
 
 
-def _object_key_to_string(key: ObjectKey) -> str:
-    """Serialize an ObjectKey to a stable, model-namespaced dfkv key string.
-
-    Format (matches the native-connector L2 adapter so behavior is familiar)::
-
-        <model_name>@<kv_rank_hex>@<object_group_id_hex>@<chunk_hash_hex>[@<cache_salt>]
-
-    Deterministic across processes/restarts so a cache written before a restart
-    is found afterwards.
-
-    MLA 8x (historical KNOWN GAP, FIXED via opt-in): kv_rank packs
-    (world_size<<24 | global_rank<<16 | ...), so every TP worker got a distinct
-    kv_rank and MLA's replicated KV was stored 8x over. The adapter now
-    canonicalizes rank fields to 0 when ``mla_canonical_keys=true`` (see
-    DfkvL2AdapterConfig / _canonical_kv_rank), giving all ranks ONE shared key
-    with an exists-probe dedup on the store path. Canonicalization folds PP
-    stages as well (pp lives inside global_rank), so enable it only for
-    MLA + PP=1 deployments (the RemoteConnector path's precondition too).
-    """
-    base = (
-        f"{key.model_name}{_KEY_SEP}{key.kv_rank:08x}"
-        f"{_KEY_SEP}{key.object_group_id:x}{_KEY_SEP}{key.chunk_hash.hex()}"
-    )
+def _object_key_to_bytes(key: ObjectKey, replicated: bool = False) -> bytes:
+    """Encode an ObjectKey using dfkv's canonical binary pool-key schema."""
+    global_rank = (int(key.kv_rank) >> 16) & 0xFF
+    component = "all"
     if key.cache_salt:
-        return f"{base}{_KEY_SEP}{key.cache_salt}"
-    return base
+        component = f"salt-{key.cache_salt}"
+    return pool_key(
+        key.chunk_hash.hex(),
+        pool="kv",
+        tp_size=max(1, _kv_rank_world(int(key.kv_rank))),
+        tp_rank=-1 if replicated else global_rank,
+        group_id=int(key.object_group_id),
+        component=component,
+    )
 
 
 def _kv_rank_world(kv_rank: int) -> int:
@@ -116,14 +97,6 @@ def _canonical_kv_rank(kv_rank: int) -> int:
     return kv_rank & 0xFF00FF00
 
 
-def _stable_model_hash(model_name: str) -> int:
-    """Deterministic 64-bit hash of the model name (NOT Python's salted hash).
-
-    Goes into the dfkv geometry header and must be stable across process
-    restarts so a cache written before a restart is still readable.
-    """
-    digest = hashlib.blake2b((model_name or "").encode(), digest_size=8).digest()
-    return int.from_bytes(digest, "little")
 
 
 # ----------------------------------------------------------------------------
@@ -154,9 +127,11 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
       - membership (str): ``"mds"`` (default) or ``"static"``.
       - lib (str): path to ``libdfkv.so`` (else env ``DFKV_LIB`` /
         ``$DFKV_BUILD/libdfkv.so``).
-      - model_name (str): isolation namespace → stable dfkv ``model_hash``.
+      - model_name (str): model identity used to derive the binary namespace.
+      - key_namespace (str): optional cross-runtime namespace override.
       - mds_poll_ms (int): MDS ring re-discovery interval (default 3000).
-      - page_size (int): dfkv geometry page-size guard (default 0 = no guard).
+      - tenant_id (str): explicit tenant identity (default ``"default"``).
+      - model_revision (str): explicit model revision (default ``model_name``).
       - num_workers (int): client I/O parallelism (default 8).
       - max_capacity_gb (float): if > 0, enables aggregate usage reporting /
         global eviction; default 0 (dfkv manages its own capacity).
@@ -168,8 +143,10 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
         membership: str = "mds",
         lib: Optional[str] = None,
         model_name: str = "",
+        key_namespace: Optional[str] = None,
+        tenant_id: str = "default",
+        model_revision: Optional[str] = None,
         mds_poll_ms: int = 3000,
-        page_size: int = 0,
         num_workers: int = 8,
         max_capacity_gb: float = 0.0,
         mla_canonical_keys: bool = False,
@@ -178,8 +155,10 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
         self.membership = membership
         self.lib = lib
         self.model_name = model_name
+        self.key_namespace = key_namespace
+        self.tenant_id = tenant_id
+        self.model_revision = model_revision or model_name
         self.mds_poll_ms = mds_poll_ms
-        self.page_size = page_size
         self.num_workers = num_workers
         self.max_capacity_gb = max_capacity_gb
         self.mla_canonical_keys = bool(mla_canonical_keys)
@@ -201,17 +180,29 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
         model_name = d.get("model_name", "")
         if not isinstance(model_name, str):
             raise ValueError("dfkv L2 adapter: 'model_name' must be a string")
-        # model_name is the isolation namespace (derives the dfkv model_hash);
-        # refuse to start on an empty one unless the shared keyspace is opted in.
-        _tcfg.require_isolation_name(model_name, cfg=d)
+        key_namespace = d.get("key_namespace")
+        if key_namespace is not None and (
+                not isinstance(key_namespace, str) or not key_namespace):
+            raise ValueError(
+                "dfkv L2 adapter: 'key_namespace' must be a non-empty string")
+        if not model_name and key_namespace is None:
+            raise ValueError(
+                "dfkv L2 adapter: provide non-empty 'model_name' or "
+                "'key_namespace'")
+        tenant_id = d.get("tenant_id", "default")
+        if not isinstance(tenant_id, str) or not tenant_id:
+            raise ValueError(
+                "dfkv L2 adapter: 'tenant_id' must be a non-empty string")
+        model_revision = d.get("model_revision", model_name)
+        if not isinstance(model_revision, str) or (
+                not model_revision and key_namespace is None):
+            raise ValueError(
+                "dfkv L2 adapter: 'model_revision' must be a non-empty string")
 
         mds_poll_ms = d.get("mds_poll_ms", 3000)
         if not isinstance(mds_poll_ms, int) or mds_poll_ms <= 0:
             raise ValueError("dfkv L2 adapter: 'mds_poll_ms' must be a positive int")
 
-        page_size = d.get("page_size", 0)
-        if not isinstance(page_size, int) or page_size < 0:
-            raise ValueError("dfkv L2 adapter: 'page_size' must be a non-negative int")
 
         num_workers = d.get("num_workers", 8)
         if isinstance(num_workers, bool) or not isinstance(num_workers, int) \
@@ -224,29 +215,22 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
                 "dfkv L2 adapter: 'max_capacity_gb' must be a non-negative number"
             )
 
-        # MLA canonical keys: fold kv_rank rank fields -> one shared key per
-        # chunk + exists-probe dedup on the store path (fixes the MLA 8x
-        # storage/write inflation). OFF by default: wrongly enabling it under a
-        # SHARDED (non-MLA) or PP>1 model would collapse distinct content onto
-        # one key. Env DFKV_L2ADAPTER_MLA_CANONICAL_KEYS is honored when the
-        # dict key is absent. Flipping the effective value = cold cache (the
-        # key set changes).
-        mla_canonical_keys = d.get("mla_canonical_keys", None)
-        if mla_canonical_keys is None:
-            env = os.environ.get("DFKV_L2ADAPTER_MLA_CANONICAL_KEYS", "")
-            mla_canonical_keys = env.strip().lower() in ("1", "true", "yes", "on")
-        elif not isinstance(mla_canonical_keys, (bool, int)):
+        # Key geometry is explicit configuration. Environment variables must
+        # not silently split or alias the cache namespace between processes.
+        mla_canonical_keys = d.get("mla_canonical_keys", False)
+        if not isinstance(mla_canonical_keys, (bool, int)):
             raise ValueError(
                 "dfkv L2 adapter: 'mla_canonical_keys' must be a boolean"
             )
-
         return cls(
             url=url,
             membership=membership,
             lib=lib,
             model_name=model_name,
+            key_namespace=key_namespace,
+            tenant_id=tenant_id,
+            model_revision=model_revision,
             mds_poll_ms=mds_poll_ms,
-            page_size=page_size,
             num_workers=num_workers,
             max_capacity_gb=float(max_capacity_gb),
             mla_canonical_keys=bool(mla_canonical_keys),
@@ -259,9 +243,11 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
             "- url (str, required): dfkv://<endpoint>/<group>\n"
             "- membership (str): 'mds' (default) or 'static'\n"
             "- lib (str): path to libdfkv.so (else env DFKV_LIB)\n"
-            "- model_name (str): isolation namespace -> stable model_hash\n"
+            "- model_name (str): model identity for namespace derivation\n"
+            "- key_namespace (str): optional cross-runtime namespace override\n"
+            "- tenant_id (str): explicit tenant identity (default 'default')\n"
+            "- model_revision (str): explicit revision (default model_name)\n"
             "- mds_poll_ms (int): MDS rediscovery interval (default 3000)\n"
-            "- page_size (int): geometry page-size guard (default 0 = off)\n"
             "- num_workers (int): client I/O parallelism (default 8)\n"
             "- max_capacity_gb (float): >0 enables aggregate eviction "
             "(default 0 = dfkv manages capacity)\n"
@@ -329,24 +315,21 @@ class DfkvL2Adapter(L2AdapterInterface):
             if ptr and size:
                 rdma_pools = [(ptr, size)]
 
-        geometry = {
-            "model_hash": _stable_model_hash(config.model_name),
-            "page_size": int(config.page_size),
-            "dtype_tag": 0,
-            "flags": 0,
-            "tp_size": 1,
-            "tp_rank": 0,
-            "layer_num": 0,
-            "head_num": 0,
-            "head_dim": 0,
-        }
+        namespace = canonical_namespace(
+            config.model_name,
+            LMCACHE_RAW_V1,
+            config.key_namespace,
+            tenant_id=config.tenant_id,
+            model_revision=config.model_revision,
+            dtype="opaque-lmcache-l2",
+        )
 
         endpoint = parse_dfkv_url(config.url, membership=config.membership)
         self._client = DfkvNativeClient(
             raw_endpoint=endpoint.raw_endpoint,
             group=endpoint.group,
             membership=endpoint.membership,
-            geometry=geometry,
+            key_namespace=namespace,
             lib_path=config.lib,
             mds_poll_ms=config.mds_poll_ms,
             rdma_pools=rdma_pools,
@@ -355,9 +338,9 @@ class DfkvL2Adapter(L2AdapterInterface):
         )
         logger.info(
             "DfkvL2Adapter ready: endpoint=%s group=%s membership=%s "
-            "model_hash=%d rdma_pools=%d transport=%s mla_canonical_keys=%s",
+            "namespace=%s rdma_pools=%d transport=%s mla_canonical_keys=%s",
             endpoint.raw_endpoint, endpoint.group, endpoint.membership,
-            geometry["model_hash"], len(rdma_pools),
+            namespace.hex(), len(rdma_pools),
             getattr(self._client, "transport_mode", "unknown"),
             self._canonical,
         )
@@ -413,19 +396,19 @@ class DfkvL2Adapter(L2AdapterInterface):
     # Store
     # ------------------------------------------------------------------
 
-    async def _batch_set_maybe_dedup(self, key_strs, views):
+    async def _batch_set_maybe_dedup(self, binary_keys, views):
         """With canonical keys, every TP worker submits the SAME key for one
         chunk; probe existence first and transfer only the missing ones.
         Returns (ok, per_key_flags). Race note: two tasks probing miss in the
         same window both write — benign, the bytes are identical (this is a
         cache). Disabled → plain batch_set."""
         if not self._canonical:
-            return await self._client.batch_set(key_strs, views)
-        present = await self._client.batch_exists(key_strs)
+            return await self._client.batch_set(binary_keys, views)
+        present = await self._client.batch_exists(binary_keys)
         if all(present):
-            return True, [True] * len(key_strs)
+            return True, [True] * len(binary_keys)
         miss = [i for i, p in enumerate(present) if not p]
-        mkeys = [key_strs[i] for i in miss]
+        mkeys = [binary_keys[i] for i in miss]
         mviews = [views[i] for i in miss]
         ok, per = await self._client.batch_set(mkeys, mviews)
         flags = [bool(p) for p in present]
@@ -438,14 +421,16 @@ class DfkvL2Adapter(L2AdapterInterface):
     ) -> L2TaskId:
         keys = [self._canon(k) for k in keys]
         self._hint_canonical_if_mla(keys)
-        key_strs = [_object_key_to_string(k) for k in keys]
+        binary_keys = [
+            _object_key_to_bytes(k, replicated=self._canonical) for k in keys
+        ]
         views = [obj.byte_array for obj in objects]
         sizes = [obj.get_size() for obj in objects]
         with self._lock:
             task_id = self._next_task_id
             self._next_task_id += 1
         fut = asyncio.run_coroutine_threadsafe(
-            self._batch_set_maybe_dedup(key_strs, views), self._loop
+            self._batch_set_maybe_dedup(binary_keys, views), self._loop
         )
         # Hold ``objects`` alive in the closure until the store completes — the
         # memoryviews alias their buffers and the C call must finish reading.
@@ -503,12 +488,14 @@ class DfkvL2Adapter(L2AdapterInterface):
 
     def submit_lookup_and_lock_task(self, keys: List[ObjectKey]) -> L2TaskId:
         keys = [self._canon(k) for k in keys]
-        key_strs = [_object_key_to_string(k) for k in keys]
+        binary_keys = [
+            _object_key_to_bytes(k, replicated=self._canonical) for k in keys
+        ]
         with self._lock:
             task_id = self._next_task_id
             self._next_task_id += 1
         fut = asyncio.run_coroutine_threadsafe(
-            self._client.batch_exists(key_strs), self._loop
+            self._client.batch_exists(binary_keys), self._loop
         )
         fut.add_done_callback(
             lambda f: self._on_lookup_done(f, task_id, list(keys))
@@ -561,13 +548,15 @@ class DfkvL2Adapter(L2AdapterInterface):
         self, keys: List[ObjectKey], objects: List[MemoryObj]
     ) -> L2TaskId:
         keys = [self._canon(k) for k in keys]
-        key_strs = [_object_key_to_string(k) for k in keys]
+        binary_keys = [
+            _object_key_to_bytes(k, replicated=self._canonical) for k in keys
+        ]
         views = [obj.byte_array for obj in objects]
         with self._lock:
             task_id = self._next_task_id
             self._next_task_id += 1
         fut = asyncio.run_coroutine_threadsafe(
-            self._client.batch_get(key_strs, views), self._loop
+            self._client.batch_get(binary_keys, views), self._loop
         )
         # Keep ``objects`` alive until the C call finishes writing into them.
         fut.add_done_callback(
@@ -628,9 +617,11 @@ class DfkvL2Adapter(L2AdapterInterface):
                     "eviction is a no-op. Rebuild dfkv with the remove RPC."
                 )
             return
-        key_strs = [_object_key_to_string(k) for k in keys]
+        binary_keys = [
+            _object_key_to_bytes(k, replicated=self._canonical) for k in keys
+        ]
         fut = asyncio.run_coroutine_threadsafe(
-            self._client.batch_remove(key_strs), self._loop
+            self._client.batch_remove(binary_keys), self._loop
         )
         try:
             per_key = fut.result(timeout=30.0)

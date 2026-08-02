@@ -1,5 +1,5 @@
-// TDD R13 — transport factory: always returns a working transport (TCP fallback
-// when RDMA is not built / not requested / no device).
+// Transport factory: TCP is selected only when RDMA is not requested; an
+// unavailable requested RDMA transport fails closed.
 #include "transport/transport_factory.h"
 #include "cache/kv_node_server.h"
 #include "client/key_map.h"
@@ -29,7 +29,9 @@ struct EnvSave {
 };
 }  // namespace
 
-TEST(Factory, ReturnsWorkingTransportWithTcpFallback) {
+TEST(Factory, ReturnsWorkingTcpWhenRdmaNotRequested) {
+  EnvSave save_rdma("DFKV_RDMA");
+  ::unsetenv("DFKV_RDMA");
   auto dir = fs::temp_directory_path() / "dfkv_factory";
   fs::remove_all(dir); fs::create_directories(dir);
   KvNodeServer srv(dir.string(), 1ull << 30);
@@ -42,36 +44,27 @@ TEST(Factory, ReturnsWorkingTransportWithTcpFallback) {
   EXPECT_NE(reason.find("tcp"), std::string::npos) << reason;  // no DFKV_RDMA env here
 
   std::string v(128, 'f');
-  ASSERT_EQ(t->Cache(addr, ToBlockKey("k"), v.data(), v.size()), Status::kOk);
+  ASSERT_EQ(t->Cache(addr, ToBlockKey("test/model", "k"), v.data(), v.size()), Status::kOk);
   std::string out;
-  ASSERT_EQ(t->Range(addr, ToBlockKey("k"), 0, v.size(), &out), Status::kOk);
+  ASSERT_EQ(t->Range(addr, ToBlockKey("test/model", "k"), 0, v.size(), &out), Status::kOk);
   EXPECT_EQ(out, v);
   srv.Stop();
 }
 
-TEST(Factory, RequireRdmaRejectsImplicitTcpFallback) {
-  EnvSave save_require("DFKV_REQUIRE_RDMA");
-  EnvSave save_rdma("DFKV_RDMA");
-  ::setenv("DFKV_REQUIRE_RDMA", "1", 1);
-  ::unsetenv("DFKV_RDMA");
 
-  std::string reason;
-  auto t = MakeClientTransport(&reason);
-  EXPECT_EQ(t, nullptr);
-  EXPECT_NE(reason.find("rdma-required"), std::string::npos) << reason;
-}
-
-TEST(Factory, ExplicitDeviceFilterNeverFallsBackToTcp) {
-  EnvSave save_require("DFKV_REQUIRE_RDMA");
+TEST(Factory, RequestedUnavailableDeviceFailsClosed) {
   EnvSave save_rdma("DFKV_RDMA");
   EnvSave save_dev("DFKV_RDMA_DEV");
-  ::unsetenv("DFKV_REQUIRE_RDMA");
   ::setenv("DFKV_RDMA", "1", 1);
   ::setenv("DFKV_RDMA_DEV", "dfkv-no-such-rdma-device", 1);
 
   std::string reason;
   auto t = MakeClientTransport(&reason);
   EXPECT_EQ(t, nullptr);
-  EXPECT_NE(reason.find("rdma-configured-devices"), std::string::npos)
+#ifdef DFKV_WITH_RDMA
+  EXPECT_NE(reason.find("rdma-configured-devices"), std::string::npos) << reason;
+#else
+  EXPECT_NE(reason.find("rdma-requested-but-not-built"), std::string::npos)
       << reason;
+#endif
 }

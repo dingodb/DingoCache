@@ -13,6 +13,7 @@ Wire-up in LMCache config (plugin mode, recommended):
       remote_storage_plugin.dfkv.membership:  mds      # "mds" (default) | "static"
       remote_storage_plugin.dfkv.lib:         /path/to/libdfkv.so   # overrides $DFKV_LIB
       remote_storage_plugin.dfkv.mds_poll_ms: 3000
+      remote_storage_plugin.dfkv.key_namespace: shared-model-key
 
 For static membership the URL carries the member string directly, e.g.
     remote_storage_plugin.dfkv.url:        dfkv://n1=10.0.0.1:12000,n2=10.0.0.2:12000/x
@@ -59,6 +60,7 @@ class _PluginOverrides:
     target_url: str
     membership: str
     lib_path: Optional[str]
+    key_namespace: Optional[str]
     mds_poll_ms: int
 
 
@@ -96,6 +98,7 @@ class DfkvConnectorAdapter(ConnectorAdapter):
                 loop=context.loop,
                 local_cpu_backend=context.local_cpu_backend,
                 lib_path=ov.lib_path,
+                key_namespace=ov.key_namespace,
                 membership=ov.membership,
                 mds_poll_ms=ov.mds_poll_ms,
             )
@@ -107,7 +110,8 @@ class DfkvConnectorAdapter(ConnectorAdapter):
         if url.startswith(_LEGACY_URL_PREFIX):
             return _PluginOverrides(
                 target_url=url, membership=_DEFAULT_MEMBERSHIP,
-                lib_path=None, mds_poll_ms=_DEFAULT_MDS_POLL_MS,
+                lib_path=None, key_namespace=None,
+                mds_poll_ms=_DEFAULT_MDS_POLL_MS,
             )
 
         plugin_name = getattr(context, "plugin_name", None) or url[
@@ -147,6 +151,11 @@ class DfkvConnectorAdapter(ConnectorAdapter):
                 f"extra_config['{prefix}.lib']={lib_path!r} must be a "
                 "filesystem path string"
             )
+        key_namespace = extra_config.get(f"{prefix}.key_namespace")
+        if key_namespace is not None and not isinstance(key_namespace, str):
+            raise ValueError(
+                f"extra_config['{prefix}.key_namespace'] must be a string"
+            )
 
         raw_poll = extra_config.get(f"{prefix}.mds_poll_ms")
         mds_poll_ms = _DEFAULT_MDS_POLL_MS
@@ -168,5 +177,6 @@ class DfkvConnectorAdapter(ConnectorAdapter):
             target_url=target_url,
             membership=membership,
             lib_path=lib_path or None,
+            key_namespace=key_namespace or None,
             mds_poll_ms=mds_poll_ms,
         )

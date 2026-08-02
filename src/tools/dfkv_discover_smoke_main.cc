@@ -21,11 +21,9 @@
 #include <vector>
 
 #include "client/kv_client.h"
-#include "common/value_header.h"
 #include "common/version.h"
 
 using dfkv::KVClient;
-using dfkv::ValueHeader;
 
 static std::vector<std::string> SplitComma(const std::string& s) {
   std::vector<std::string> out;
@@ -66,20 +64,7 @@ int main(int argc, char** argv) {
 
   std::vector<std::string> mds_eps = SplitComma(mds_arg);
 
-  // Fixed MLA-ish header — same geometry as used in kv_client_mds_test.cc.
-  ValueHeader hdr = ValueHeader::Make(
-      0x51ULL,           // model_hash
-      64,                // page_size (tokens/page)
-      0x46384534u,       // dtype_tag
-      ValueHeader::kFlagIsMla,  // flags
-      8,                 // tp_size
-      0,                 // tp_rank
-      78,                // layer_num
-      1,                 // head_num
-      576                // head_dim
-  );
-
-  KVClient c({}, hdr);
+  KVClient c({}, "dfkv/discovery-smoke");
   c.StartMdsDiscovery(mds_eps, group, poll_ms);
 
   // --- Readiness probe: loop until a Put succeeds or timeout ---

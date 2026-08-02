@@ -104,6 +104,36 @@ std::vector<RdmaDevInfo> RdmaTopology::Discover(
   return active;
 }
 
+RailCandidates RdmaTopology::CandidatesFor(int numa_node,
+                                           bool numa_aware) const {
+  std::lock_guard<std::mutex> lock(mu_);
+  RailCandidates out;
+  out.allowed = enabled_;
+  if (!numa_aware) return out;
+  if (numa_node < 0) {
+    out.locality = RailLocality::kCallerUnknown;
+    return out;
+  }
+
+  bool found_local = false;
+  for (size_t i = 0; i < devices_.size(); ++i) {
+    if (enabled_[i] && devices_[i].numa_node == numa_node) {
+      found_local = true;
+      break;
+    }
+  }
+  if (!found_local) {
+    out.locality = RailLocality::kNoLocal;
+    return out;
+  }
+
+  out.locality = RailLocality::kLocal;
+  for (size_t i = 0; i < devices_.size(); ++i) {
+    if (devices_[i].numa_node != numa_node) out.allowed[i] = 0;
+  }
+  return out;
+}
+
 int RdmaTopology::SelectDevice(int numa_node, bool numa_aware,
                                size_t retry_count) const {
   std::lock_guard<std::mutex> lock(mu_);

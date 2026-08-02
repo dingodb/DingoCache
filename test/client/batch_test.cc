@@ -1,7 +1,6 @@
 // TDD R9 — KVClient batch APIs with concurrent fan-out across nodes.
 #include "client/kv_client.h"
 #include "cache/kv_node_server.h"
-#include "common/value_header.h"
 
 #include <gtest/gtest.h>
 
@@ -14,9 +13,7 @@ namespace fs = std::filesystem;
 using namespace dfkv;  // NOLINT
 
 namespace {
-ValueHeader Hdr() {
-  return ValueHeader::Make(0x51, 64, 0x46384534u, ValueHeader::kFlagIsMla, 8, 0, 78, 1, 576);
-}
+std::string Hdr() { return "test/model"; }
 struct Node { fs::path dir; std::unique_ptr<KvNodeServer> srv; std::string addr; };
 std::unique_ptr<Node> Start(const std::string& tag) {
   auto n = std::make_unique<Node>();

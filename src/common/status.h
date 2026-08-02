@@ -6,13 +6,21 @@
 
 namespace dfkv {
 
-enum class Status { kOk, kNotFound, kCacheFull, kIOError, kInvalid };
+enum class Status {
+  kOk,
+  kNotFound,
+  kCacheFull,
+  kQuotaExceeded,
+  kIOError,
+  kInvalid
+};
 
 inline const char* StatusName(Status s) {
   switch (s) {
     case Status::kOk: return "Ok";
     case Status::kNotFound: return "NotFound";
     case Status::kCacheFull: return "CacheFull";
+    case Status::kQuotaExceeded: return "QuotaExceeded";
     case Status::kIOError: return "IOError";
     case Status::kInvalid: return "Invalid";
   }

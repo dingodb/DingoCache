@@ -35,6 +35,13 @@ def _req_meta(req_id: str) -> "types.SimpleNamespace":
 
 @unittest.skipUnless(HAVE_VLLM, "requires vllm (dfkv_vllm.worker imports it)")
 class PreemptFenceTest(unittest.TestCase):
+    def setUp(self):
+        self._threads: list["KVCacheStoreSendingThread"] = []
+
+    def tearDown(self):
+        for thread in self._threads:
+            thread.stop(cancel_pending=True)
+
     def _mk_thread(self, coord) -> "KVCacheStoreSendingThread":
         ready = threading.Event()
         t = KVCacheStoreSendingThread(
@@ -49,6 +56,7 @@ class PreemptFenceTest(unittest.TestCase):
         )
         t.start()
         self.assertTrue(ready.wait(5))
+        self._threads.append(t)
         return t
 
     def test_wait_blocks_while_put_executes_and_returns_after(self):

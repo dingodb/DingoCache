@@ -14,6 +14,7 @@ offload staging, ReplicateConfig/preferred_segment) are dropped.
 """
 
 import dataclasses
+import hashlib
 import os
 import queue
 import socket
@@ -24,6 +25,7 @@ from collections.abc import Callable
 from typing import Any, TypeVar
 
 import torch
+from dfkv_common import VLLM_RAW_V1, canonical_namespace, sg_key
 import zmq
 
 import vllm.envs as envs
@@ -112,6 +114,34 @@ def _put_failed_indices(rcs: list[int]) -> list[int]:
 # Transfer Threads
 # ============================================================
 
+# Each direction owns one queue. ReqMeta objects retain block/hash lists and
+# CUDA-event references, so an unbounded queue can grow host memory and keep
+# scheduler-owned GPU blocks pinned indefinitely when the native client slows.
+# Reject-new is deliberately non-blocking: blocking get_finished() on queue
+# capacity would prevent vLLM from observing completions and freeing blocks.
+DEFAULT_TRANSFER_QUEUE_CAPACITY = 256
+MAX_TRANSFER_QUEUE_CAPACITY = 65536
+_TRANSFER_STOP = object()
+
+
+def _parse_transfer_queue_capacity(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("transfer_queue_capacity must be an integer")
+    if isinstance(value, int):
+        capacity = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        capacity = int(value.strip())
+    else:
+        raise ValueError("transfer_queue_capacity must be an integer")
+    if not 1 <= capacity <= MAX_TRANSFER_QUEUE_CAPACITY:
+        raise ValueError(
+            "transfer_queue_capacity must be in "
+            f"[1, {MAX_TRANSFER_QUEUE_CAPACITY}], got {capacity}"
+        )
+    return capacity
+
+
+
 
 class KVTransferThread(threading.Thread):
     """Base class for async KV cache transfer threads."""
@@ -125,8 +155,9 @@ class KVTransferThread(threading.Thread):
         ready_event: threading.Event,
         name: str,
         record_operation: Callable[..., None] | None = None,
+        queue_capacity: int = DEFAULT_TRANSFER_QUEUE_CAPACITY,
     ):
-        super().__init__(daemon=True, name=name)
+        super().__init__(daemon=False, name=name)
         self.client = client
         self.ready_event = ready_event
         self.block_size = block_size
@@ -134,13 +165,39 @@ class KVTransferThread(threading.Thread):
         self.token_databases = token_databases
         self._record_operation_cb = record_operation
         self.done_task_lock = threading.Lock()
-        self.request_queue: queue.Queue[Any] = queue.Queue()
+        self.request_queue: queue.Queue[Any] = queue.Queue(maxsize=queue_capacity)
         self.finished_requests: set[str] = set()
         self.kv_event_lock = threading.Lock()
         self.kv_events: list[BlockStored] = []
+        self._stop_lock = threading.Lock()
+        self._accepting = True
+        self._stop_enqueued = False
 
-    def add_request(self, request: ReqMeta) -> None:
-        self.request_queue.put(request)
+    def add_request(self, request: ReqMeta) -> bool:
+        """Submit without blocking; reject when closed or saturated.
+
+        Rejection is completed synchronously through ``_cancel_request`` so a
+        load becomes a recompute and a save's fence can reach zero. This keeps
+        scheduler cleanup progressing instead of pinning blocks behind a full
+        queue.
+        """
+        reason = "closed"
+        with self._stop_lock:
+            if self._accepting:
+                try:
+                    self.request_queue.put_nowait(request)
+                    return True
+                except queue.Full:
+                    reason = "saturated"
+        self._cancel_request(request)
+        logger.warning(
+            "%s rejected request %s: transfer queue %s (capacity=%d)",
+            self.name,
+            getattr(request, "req_id", "<unknown>"),
+            reason,
+            self.request_queue.maxsize,
+        )
+        return False
 
     def get_and_clear_finished_requests(self) -> set[str]:
         with self.done_task_lock:
@@ -155,18 +212,66 @@ class KVTransferThread(threading.Thread):
     def run(self):
         self.ready_event.set()
         while True:
+            request_data = self.request_queue.get()
             try:
-                request_data = self.request_queue.get()
-                if request_data is None:
-                    logger.warning("Received a None request!")
-                    self.request_queue.task_done()
-                    continue
+                if request_data is _TRANSFER_STOP:
+                    return
                 self._handle_request(request_data)
             except Exception as e:
                 logger.error("Error in %s: %s", self.name, e)
+            finally:
+                self.request_queue.task_done()
 
     def _handle_request(self, req_meta: Any):
-        pass
+        raise NotImplementedError
+
+    def _cancel_request(self, req_meta: Any) -> None:
+        """Resolve a request that will never run."""
+        req_id = getattr(req_meta, "req_id", None)
+        if req_id is not None:
+            self.set_finished_request(req_id)
+
+    def stop(self, *, cancel_pending: bool = True) -> None:
+        """Stop accepting work, then cancel or drain and join deterministically.
+
+        ``cancel_pending=True`` is the worker-shutdown policy: queued loads are
+        failed into recompute and queued saves decrement their finish fences.
+        The one active native operation is allowed to finish before the client
+        is closed. ``False`` drains all accepted work before the sentinel.
+        """
+        with self._stop_lock:
+            first_stop = not self._stop_enqueued
+            self._accepting = False
+            if first_stop:
+                self._stop_enqueued = True
+                if cancel_pending or self.ident is None:
+                    while True:
+                        try:
+                            pending = self.request_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        try:
+                            if pending is not _TRANSFER_STOP:
+                                try:
+                                    self._cancel_request(pending)
+                                except Exception:
+                                    logger.exception(
+                                        "%s failed to resolve cancelled request %s",
+                                        self.name,
+                                        getattr(pending, "req_id", "<unknown>"),
+                                    )
+                        finally:
+                            self.request_queue.task_done()
+                if self.ident is not None:
+                    self.request_queue.put(_TRANSFER_STOP)
+
+        if self.ident is None:
+            return
+        self.request_queue.join()
+        if threading.current_thread() is not self:
+            self.join()
+
+    close = stop
 
     def _record_operation(
         self,
@@ -215,6 +320,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         ready_event: threading.Event,
         enable_kv_event: bool = False,
         record_operation: Callable[..., None] | None = None,
+        queue_capacity: int = DEFAULT_TRANSFER_QUEUE_CAPACITY,
     ):
         super().__init__(
             client,
@@ -224,6 +330,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             ready_event,
             name="KVCacheStoreSendingThread",
             record_operation=record_operation,
+            queue_capacity=queue_capacity,
         )
         self.put_step = put_step
         # CLIENT_RANKS store convergence (issue #111): stripe index/step over
@@ -294,12 +401,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
             with self._active_cv:
                 self._active_req_id = None
                 self._active_cv.notify_all()
-            self.request_queue.task_done()
             return
 
-        # Decrement the in-flight counter and signal task_done() in `finally`
-        # so the scheduler can release the GPU blocks it pinned for this
-        # request (via `delay_free_blocks`) even when the store path raises.
+        # Decrement the in-flight counter in ``finally`` (the base run loop
+        # always signals ``task_done``) so the scheduler can release the GPU
+        # blocks it pinned for this request even when the store path raises.
         try:
             if token_len == 0:
                 return
@@ -309,7 +415,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             store_masks = self.coord.store_mask(token_len)
             starts: list[int] = []
             ends: list[int] = []
-            keys: list[str] = []
+            keys: list[bytes] = []
             block_hashes: list[BlockHash] = []
             group_indices: list[int] = []
             for g_idx, db in enumerate(self.token_databases):
@@ -321,7 +427,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         continue
                     starts.append(start)
                     ends.append(end)
-                    keys.append(key.to_string())
+                    keys.append(key.to_bytes())
                     block_hashes.append(BlockHash(bytes.fromhex(key.chunk_hash)))
                     group_indices.append(g_idx)
 
@@ -342,13 +448,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if not keys:
                 return
 
-            # Check which blocks already exist (dedup). Blocks are stored under
-            # scatter-gather keys "<key>@sg{n}" (see _group_segments_sg), so we
-            # must probe the first SG group as the block-present proxy -- the
-            # SAME proxy the lookup path uses (find_longest_cache_hit). Probing
-            # the bare "<key>" never matches a stored "<key>@sg0", so without the
-            # suffix this dedup is a silent no-op: every block gets re-PUT on
-            # every request, even when identical KV is already cached.
+            # Stored values use explicit scatter-group coordinates (see
+            # _group_segments_sg), so probe group 0 as the block-present proxy.
+            # Lookup uses the same proxy. Probing the bare pool key would miss
+            # every stored group and defeat deduplication.
             save_exists_start = time.perf_counter()
             try:
                 exists_states = self.client.batch_exist(
@@ -425,11 +528,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if current_event is not None:
                 current_event.synchronize()
 
-            # dfkv: coalesce each chunk's per-layer segments (addrs[i]/sizes[i])
-            # into ONE dfkv key via scatter-gather (<=29 segs/key on max_sge=30),
-            # suffixed "@sg{n}" -- one RDMA multi-SGE op + one server blob per key
-            # instead of one tiny key per segment. This cuts the key count ~20x
-            # (25392 -> ~1242) so the load is bandwidth-bound, not per-key-bound.
+            # Coalesce each chunk's per-layer segments into one raw dfkv value
+            # per explicit scatter group. This cuts the key count ~20x
+            # (25392 -> ~1242), making loads bandwidth-bound rather than
+            # per-key-bound.
             sg_keys, sg_ptrs, sg_sizes, _ = _group_segments_sg(
                 keys, addrs, sizes, _sg_segs_of(self.client)
             )
@@ -463,7 +565,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         len(sg_keys),
                         failed_codes,
                         batch_bytes,
-                        sg_keys[0] if sg_keys else "N/A",
+                        _key_label(sg_keys[0]) if sg_keys else "N/A",
                     )
             except Exception as e:
                 self._record_operation(
@@ -474,7 +576,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     status="error",
                     num_failed_keys=len(sg_keys),
                 )
-                logger.error("Failed to put keys %s, error: %s", sg_keys[:3], e)
+                logger.error(
+                    "Failed to put keys %s, error: %s",
+                    [_key_label(key) for key in sg_keys[:3]],
+                    e,
+                )
 
             if self.enable_kv_event and stored_events:
                 self.update_kv_event(stored_events)
@@ -483,7 +589,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 self._active_req_id = None
                 self._active_cv.notify_all()
             self.dec_stored_request(req_id)
-            self.request_queue.task_done()
+
+    def _cancel_request(self, req_meta: Any) -> None:
+        # Keep a zero-valued entry so _get_and_clear_finished_sending can
+        # acknowledge a finished request whose save was rejected/cancelled.
+        self.dec_stored_request(req_meta.req_id)
 
 
 class KVCacheStoreRecvingThread(KVTransferThread):
@@ -499,6 +609,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         ready_event: threading.Event,
         record_operation: Callable[..., None] | None = None,
         client_provider: Callable[[], Any] | None = None,
+        queue_capacity: int = DEFAULT_TRANSFER_QUEUE_CAPACITY,
     ):
         super().__init__(
             client,
@@ -508,6 +619,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             ready_event,
             name="KVCacheStoreRecvingThread",
             record_operation=record_operation,
+            queue_capacity=queue_capacity,
         )
         # Elided ranks start with client=None; a real load arriving there calls
         # this back into the worker to lazily un-elide (create + register the
@@ -544,7 +656,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
 
             addr_list: list[list[int]] = []
             size_list: list[list[int]] = []
-            key_list: list[str] = []
+            key_list: list[bytes] = []
             block_id_list: list[int] = []
             for g_idx, db in enumerate(self.token_databases):
                 mask = load_mask_per_group[g_idx]
@@ -557,7 +669,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     addr, size, block_id = db.prepare_value(
                         start, end, req_meta.block_ids[g_idx]
                     )
-                    key_list.append(key.to_string())
+                    key_list.append(key.to_bytes())
                     addr_list.append(addr)
                     size_list.append(size)
                     block_id_list.append(block_id)
@@ -609,7 +721,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 for i, (hit, got_len) in enumerate(zip(hits, lens, strict=True)):
                     if hit != 1 or got_len < sg_totals[i]:
                         failed_block_ids.append(block_id_list_c[sg_owner[i]])
-                        failed_detail.append((sg_keys[i], hit))
+                        failed_detail.append((_key_label(sg_keys[i]), hit))
                 self._record_operation(
                     "load_get",
                     load_get_start,
@@ -645,7 +757,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 )
                 logger.warning(
                     "Failed to get dfkv batch %s, error: %s",
-                    sg_keys[:3],
+                    [_key_label(key) for key in sg_keys[:3]],
                     e,
                 )
 
@@ -661,14 +773,28 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 pass
         finally:
             self.set_finished_request(req_id)
-            self.request_queue.task_done()
+
+    def _cancel_request(self, req_meta: Any) -> None:
+        # A queued/rejected load must finish as a visible recompute, never leave
+        # the request stuck in WAITING_FOR_REMOTE_KVS.
+        try:
+            self._add_load_error_block_ids(
+                [block_id for ids in req_meta.block_ids for block_id in ids]
+            )
+        except Exception:
+            logger.exception(
+                "%s could not enumerate cancelled load blocks for request %s",
+                self.name,
+                getattr(req_meta, "req_id", "<unknown>"),
+            )
+        finally:
+            self.set_finished_request(req_meta.req_id)
 
 
-# dfkv: max payload segments gathered into one scatter-gather key. The HCA
-# Historical/default SG width: ConnectX-era max_sge=30, SGE[0] is the
-# request/value header, leaving 29 for payload. The LIVE width comes from
-# dfkv_max_sg_segs (negotiated per HCA); this constant is the fallback and the
-# compatibility anchor for key naming (see _sg_group_key).
+# Maximum raw-payload segments gathered into one scatter-group object.
+# The ConnectX-era default is max_sge=30 minus one request-prefix SGE. The
+# negotiated value comes from ``dfkv_max_sg_segs``; the fallback is encoded in
+# the binary SG object-key coordinate (see ``_sg_group_key``).
 SG_MAX_SEGS = 29
 
 
@@ -686,31 +812,26 @@ def _sg_segs_of(client: Any) -> int:
         client._sg_segs_cache = v
     return v
 
-
-# SG group key name. The grouping WIDTH is part of a key's identity: the same
-# "@sg1" under different widths would carry different segment spans, and a
-# variable-size GET whose total cap happens to fit would scatter the WRONG
-# bytes without any error. Non-default widths therefore get their own key
-# namespace ("@sgw{W}.{n}"); the default width keeps the historical "@sg{n}"
-# so existing cached data stays reachable across this upgrade.
-def _sg_group_key(key: str, grp: int, max_segs: int) -> str:
-    if max_segs == SG_MAX_SEGS:
-        return f"{key}@sg{grp}"
-    return f"{key}@sgw{max_segs}.{grp}"
+def _key_label(key: bytes) -> str:
+    """Return a deterministic JSON/text-safe representation of a binary key."""
+    return f"len={len(key)} sha256={hashlib.sha256(key).hexdigest()[:16]}"
 
 
-# dfkv scatter-gather grouping: coalesce each chunk's per-layer segments
-# (addrs[i]/sizes[i]) into "<key>@sg{n}" groups of <= max_segs segments. Each
-# group is ONE dfkv key carrying all its segments via a single RDMA multi-SGE op
-# (one @sg key per chunk). owner[i] maps each @sg key back to
-# its originating chunk index for per-block load-error attribution.
+# Scatter geometry is always explicit in the physical key.
+def _sg_group_key(key: bytes, grp: int, max_segs: int) -> bytes:
+    return sg_key(key, max_segs, grp)
+
+
+# Coalesce each chunk's per-layer segments into explicit scatter-group keys.
+# Each group is one raw dfkv value written through one RDMA multi-SGE operation.
+# owner[i] maps each physical key back to its source chunk for error attribution.
 def _group_segments_sg(
-    keys: list[str],
+    keys: list[bytes],
     addrs: list[list[int]],
     sizes: list[list[int]],
     max_segs: int = SG_MAX_SEGS,
-) -> tuple[list[str], list[list[int]], list[list[int]], list[int]]:
-    sg_keys: list[str] = []
+) -> tuple[list[bytes], list[list[int]], list[list[int]], list[int]]:
+    sg_keys: list[bytes] = []
     sg_ptrs: list[list[int]] = []
     sg_sizes: list[list[int]] = []
     sg_owner: list[int] = []
@@ -742,6 +863,7 @@ class DfkvStoreWorker:
         parallel_config = vllm_config.parallel_config
 
         self.dp_rank = get_dp_engine_index(parallel_config)
+        self.dp_size = parallel_config.data_parallel_size
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.pp_size = parallel_config.pipeline_parallel_size
@@ -753,13 +875,26 @@ class DfkvStoreWorker:
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
 
         assert vllm_config.kv_transfer_config is not None
+        extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self.transfer_queue_capacity = _parse_transfer_queue_capacity(
+            extra.get(
+                "transfer_queue_capacity",
+                DEFAULT_TRANSFER_QUEUE_CAPACITY,
+            )
+        )
+        logger.info(
+            "dfkv transfer queues: capacity=%d per direction, "
+            "overload=reject-new, shutdown=cancel-pending",
+            self.transfer_queue_capacity,
+        )
+        self._close_lock = threading.Lock()
+        self._closed = False
+        self._close_done = threading.Event()
         # Store keys embed block_hashes: refuse to start with process-local
         # hashing (silent 0% cross-instance/cross-restart hit rate otherwise).
         ensure_deterministic_block_hashing(vllm_config.cache_config)
         self.kv_role = vllm_config.kv_transfer_config.kv_role
-        self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
-            "load_async", True
-        )
+        self.load_async = extra.get("load_async", True)
         if not self.load_async:
             # Fail at construction with an actionable message: the synchronous
             # load mode was never implemented, and the old hot-path assert in
@@ -802,8 +937,8 @@ class DfkvStoreWorker:
         # each rank's own unique shard, so cross-instance (PD) consumers miss
         # most of the KV (observed ~7% hit at TP8/DCP8, i.e. ~1/8). Shrink the
         # stride by dcp_size so every rank stores its full shard. head_or_tp_rank
-        # is left unchanged: @dcp{r} already separates the shards, and both P and
-        # D derive it identically, so the keyspace stays consistent.
+        # is left unchanged: the `dcp=S:R` coordinate already separates shards,
+        # and both P and D derive it identically.
         if self.dcp_size > 1 and self.put_step > 1:
             self.put_step = max(1, self.put_step // self.dcp_size)
 
@@ -831,18 +966,20 @@ class DfkvStoreWorker:
 
         self.metadata = KeyMetadata(
             model_name=model_config.model.rstrip("/").split("/")[-1],
-            tp_rank=self.head_or_tp_rank,
+            dp_size=self.dp_size,
+            dp_rank=-1,
+            tp_size=self.tp_size,
+            tp_rank=-1 if replicated else self.head_or_tp_rank,
+            pcp_size=self.pcp_size,
             pcp_rank=self.pcp_rank,
+            dcp_size=self.dcp_size,
             dcp_rank=self.dcp_rank,
+            pp_size=self.pp_size,
             pp_rank=self.pp_rank,
         )
 
-        # dfkv: replace the MooncakeDistributedStore setup (MooncakeStoreConfig
-        # .load_from_env, rdma_utils RNIC selection, store.setup(), ReplicateConfig,
-        # preferred_segment, enable_offload mode warnings) with the dfkv device
-        # client. dfkv selects its own RNIC via the DFKV_RDMA_DEV env and is
-        # configured entirely through kv_connector_extra_config.
-        extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+        # dfkv uses a native device client and selects its own RNIC through
+        # DFKV_RDMA_DEV; all connector settings come from extra_config.
         # Membership: prefer MDS discovery (production) when mds_endpoints is set;
         # else fall back to a static members list. The client requires one of them.
         mds_endpoints = extra.get("mds_endpoints", "")
@@ -863,15 +1000,56 @@ class DfkvStoreWorker:
                 f"role={self.kv_role},tp_size={self.tp_size},"
                 f"tp_rank={self.tp_rank},ver={_tcfg.dist_version('dfkv-vllm')}"
             )
-        # Refuse to start on a missing/invalid isolation identity or with no ring
-        # to connect to. mh=0 is the shared legacy keyspace with NO geometry
-        # guard beyond the byte-length check (two models with the same
-        # model_name but a different dtype/page layout can cross-read each
-        # other's blocks), so it now requires an explicit opt-in
-        # (allow_shared_keyspace=1) rather than being the silent default.
+        # The automatic binary namespace captures model revision, runtime
+        # layout contract, cache dtype/block geometry and topology. Pool/rank
+        # scope remains in each object key. key_namespace is an explicit
+        # byte-compatibility override across runtimes.
         _tcfg.require_ring_endpoint(extra.get("members", ""), mds_endpoints)
-        model_hash = _tcfg.require_model_hash(extra)
-        # Phase 9: same-host rendezvous ON BY DEFAULT for exactly the topology
+        model_identity = str(model_config.model)
+        if not extra.get("key_namespace"):
+            _tcfg.require_isolation_name(
+                model_identity, field="model_name")
+        _hf_config = getattr(model_config, "hf_config", None)
+        _model_revision = (
+            extra.get("model_revision")
+            or getattr(model_config, "revision", None)
+            or getattr(_hf_config, "_commit_hash", None)
+            or model_identity
+        )
+        _cache_dtype = str(
+            getattr(self.cache_config, "cache_dtype", "unknown"))
+        _group_layout = "|".join(
+            f"{idx}:{type(group.kv_cache_spec).__name__}:"
+            f"{int(getattr(group.kv_cache_spec, 'block_size', 0))}:"
+            f"{','.join(sorted(group.layer_names))}"
+            for idx, group in enumerate(kv_cache_config.kv_cache_groups)
+        )
+        key_namespace = canonical_namespace(
+            model_identity,
+            VLLM_RAW_V1,
+            extra.get("key_namespace"),
+            tenant_id=str(extra.get("tenant_id", "default")),
+            model_revision=str(_model_revision),
+            dtype=_cache_dtype,
+            block_tokens=max(1, self.block_size),
+            layer_count=max(1, self.num_layers),
+            tp_size=self.tp_size,
+            dp_size=self.dp_size,
+            pp_size=self.pp_size,
+            layout_fields={
+                "cache_dtype": _cache_dtype,
+                "model_dtype": str(getattr(model_config, "dtype", "unknown")),
+                "block_size": self.block_size,
+                "hash_block_size": self.hash_block_size,
+                "num_layers": self.num_layers,
+                "num_kv_heads": self.num_kv_head,
+                "use_mla": self.use_mla,
+                "pcp_size": self.pcp_size,
+                "dcp_size": self.dcp_size,
+                "group_layout": _group_layout,
+            },
+        )
+        # Same-host rendezvous defaults on only for replicated MLA topology:
         # it exists for — MLA with REPLICATED KV across tp ranks (dcp/pcp
         # shard the KV, so their per-rank keys never rendezvous). The vLLM SG
         # data path is GPUDirect, so both flavors are defaulted: the CUDA-IPC
@@ -894,9 +1072,9 @@ class DfkvStoreWorker:
             mds_endpoints=mds_endpoints,
             mds_group=mds_group,
             mds_poll_ms=int(extra.get("mds_poll_ms", 3000)),
-            model_hash=model_hash,
+            key_namespace=key_namespace,
             lib_path=extra.get("lib"),
-            batch_concurrency=int(extra.get("batch_concurrency", 0)),  # 0 = lib default (>=1.20 auto)
+            batch_concurrency=int(extra.get("batch_concurrency", 0)),
             client_register=client_register,
             client_id=client_id,
             client_info=client_info,
@@ -1003,13 +1181,20 @@ class DfkvStoreWorker:
         ]
 
     def register_cross_layers_kv_caches(self, kv_cache: torch.Tensor) -> None:
-        """Register a cross-layers KV cache tensor.
-
-        Wraps the unified tensor in a single-entry dict so that the
-        existing stride-based logic in register_kv_caches() produces
-        the correct single-segment result (block_len = page_size * num_layers).
-        """
-        self.register_kv_caches({"__cross_layer__": kv_cache})
+        """Register a unified cross-layer tensor against its real cache group."""
+        assert len(self._kv_cache_groups) == 1, (
+            "Cross-layer KV cache is supported only for a single cache group"
+        )
+        layer_name = next(
+            (name for name in self._kv_cache_groups[0].layer_names if name),
+            None,
+        )
+        if layer_name is None:
+            raise RuntimeError(
+                "Cannot register cross-layer KV cache: cache group 0 has no "
+                "real layer names"
+            )
+        self.register_kv_caches({layer_name: kv_cache})
 
     def _ensure_client_for_load(self) -> Any:
         """Lazily un-elide: create the dfkv client on an elided producer rank
@@ -1018,11 +1203,15 @@ class DfkvStoreWorker:
         the common P-instance case while never trading a whole-span recompute
         for them. Thread-safe; returns None (load misses, vLLM recomputes) if
         creation fails or the rank was never elided-with-kwargs."""
+        if getattr(self, "_closed", False):
+            return None
         if self.client is not None:
             return self.client
         if self._lazy_client_kwargs is None:
             return None
         with self._lazy_client_lock:
+            if getattr(self, "_closed", False):
+                return None
             if self.client is None:
                 try:
                     client = DfkvDeviceClient(**self._lazy_client_kwargs)
@@ -1043,6 +1232,8 @@ class DfkvStoreWorker:
         kv_caches: dict[str, torch.Tensor | list[torch.Tensor]],
     ) -> None:
         """Register KV cache tensors and start transfer threads."""
+        if getattr(self, "_closed", False):
+            raise RuntimeError("dfkv worker is closed")
         if not kv_caches:
             logger.warning("No KV caches to offload.")
             return
@@ -1175,6 +1366,9 @@ class DfkvStoreWorker:
                 ready_event_sending,
                 self.enable_kv_events,
                 record_operation=self._record_kv_connector_operation,
+                queue_capacity=getattr(
+                    self, "transfer_queue_capacity", DEFAULT_TRANSFER_QUEUE_CAPACITY
+                ),
             )
             if self.client_ranks < self.tp_size:
                 # Converged mode: re-stripe stores over the participant set.
@@ -1194,6 +1388,9 @@ class DfkvStoreWorker:
             ready_event_recving,
             record_operation=self._record_kv_connector_operation,
             client_provider=self._ensure_client_for_load,
+            queue_capacity=getattr(
+                self, "transfer_queue_capacity", DEFAULT_TRANSFER_QUEUE_CAPACITY
+            ),
         )
         self.kv_recv_thread.start()
         ready_event_recving.wait()
@@ -1378,7 +1575,7 @@ class DfkvStoreWorker:
 
         # Build per-(group, hash) candidate keys expanded across TP/PP.
         # candidate_meta[i] is the (group_id, hash_bytes) for candidate_keys[i].
-        candidate_keys: list[str] = []
+        candidate_keys: list[bytes] = []
         candidate_meta: list[tuple[int, bytes]] = []
         tp_count = min(self.tp_size, self.num_kv_head)
         # dfkv: gate candidates by store_mask -- the SAME per-(group,chunk) set
@@ -1407,12 +1604,10 @@ class DfkvStoreWorker:
                 for tp in range(tp_count):
                     for pp in range(self.pp_size):
                         md = dataclasses.replace(db.metadata, tp_rank=tp, pp_rank=pp)
-                        # dfkv: keys are stored per scatter-gather group
-                        # ("<key>@sg{n}"); probe the first group as the
-                        # block-present proxy so the lookup agrees with the
-                        # SAVE/LOAD on-wire key.
+                        # Probe scatter group 0 so lookup agrees with the exact
+                        # SAVE/LOAD object key.
                         candidate_keys.append(
-                            _sg_group_key(PoolKey(md, h.hex()).to_string(), 0,
+                            _sg_group_key(PoolKey(md, h.hex()).to_bytes(), 0,
                                           _sg_segs_of(self.client))
                         )
                         candidate_meta.append((g_idx, bytes(h)))
@@ -1461,6 +1656,77 @@ class DfkvStoreWorker:
             return self.kv_send_thread.get_kv_events()
         return []
 
+    def close(self) -> None:
+        """Cancel queued transfers, join workers, and close native state once.
+
+        Shutdown is fail-closed for new submissions. Queued loads are reported
+        as load errors/completed so vLLM recomputes them; queued saves decrement
+        their per-request counters so delayed block frees cannot remain pinned.
+        An operation already inside the native client is allowed to finish
+        before the client handle is closed.
+        """
+        with self._close_lock:
+            close_done = getattr(self, "_close_done", None)
+            if close_done is None:
+                close_done = self._close_done = threading.Event()
+            if self._closed:
+                wait_for_close = True
+            else:
+                self._closed = True
+                wait_for_close = False
+        if wait_for_close:
+            close_done.wait()
+            return
+
+        errors: list[Exception] = []
+        try:
+            recv_thread = self.kv_recv_thread
+            if recv_thread is not None:
+                try:
+                    recv_thread.stop(cancel_pending=True)
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    self.kv_recv_thread = None
+
+            send_thread = self.kv_send_thread
+            if send_thread is not None:
+                try:
+                    send_thread.stop(cancel_pending=True)
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    self.kv_send_thread = None
+
+            lookup_server = self.lookup_server
+            if lookup_server is not None:
+                try:
+                    lookup_server.close()
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    self.lookup_server = None
+
+            # Serialize against lazy un-elision. Clear the reference before
+            # close so repeated cleanup or DfkvDeviceClient.__del__ cannot
+            # close the native handle twice.
+            with self._lazy_client_lock:
+                self._lazy_client_kwargs = None
+                client = self.client
+                self.client = None
+            if client is not None:
+                try:
+                    client.close()
+                except Exception as e:
+                    errors.append(e)
+        finally:
+            close_done.set()
+
+        if errors:
+            raise RuntimeError(
+                f"dfkv worker shutdown had {len(errors)} cleanup error(s)"
+            ) from errors[0]
+
 
 # ============================================================
 # Lookup Key Server
@@ -1493,13 +1759,23 @@ class LookupKeyServer:
             zmq.REP,  # type: ignore[attr-defined]
             bind=True,
         )
+        self.socket.setsockopt(zmq.RCVTIMEO, 100)  # type: ignore[attr-defined]
+        self._close_lock = threading.Lock()
+        self._closed = False
 
         self.store_worker = store_worker
         self.running = True
 
         def process_request():
             while self.running:
-                all_frames = self.socket.recv_multipart(copy=False)
+                try:
+                    all_frames = self.socket.recv_multipart(copy=False)
+                except zmq.Again:  # type: ignore[attr-defined]
+                    continue
+                except zmq.ZMQError:  # type: ignore[attr-defined]
+                    if not self.running:
+                        return
+                    raise
                 msg_type = bytes(all_frames[0])
 
                 if msg_type == LOOKUP_MSG:
@@ -1512,8 +1788,7 @@ class LookupKeyServer:
 
                 elif msg_type == RESET_MSG:
                     # dfkv: DfkvDeviceClient exposes no remove_all / global wipe
-                    # primitive (the dfkv cache is keyed by model_hash + key
-                    # namespace; entries expire by the server's own policy). We
+                    # primitive. Entries expire by the server's own policy. We
                     # still drain in-flight puts to honor the ordering contract,
                     # then NACK so callers know the hard reset was not applied.
                     try:
@@ -1538,7 +1813,14 @@ class LookupKeyServer:
         self.thread.start()
 
     def close(self):
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self.running = False
+        self.thread.join()
         self.socket.close(linger=0)
+        self.ctx.term()
         if os.path.exists(self._ipc_path):
             os.unlink(self._ipc_path)
 
@@ -1559,6 +1841,8 @@ class LookupKeyClient:
     def __init__(self, vllm_config: VllmConfig):
         self.encoder = MsgpackEncoder()
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
+        self._close_lock = threading.Lock()
+        self._closed = False
         socket_path = get_zmq_rpc_path_lookup(vllm_config)
         self.socket = make_zmq_socket(
             self.ctx,
@@ -1593,7 +1877,12 @@ class LookupKeyClient:
         return bytes(resp) == RESP_OK
 
     def close(self):
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
         self.socket.close(linger=0)
+        self.ctx.term()
 
 
 def get_zmq_rpc_path_lookup(vllm_config: VllmConfig) -> str:

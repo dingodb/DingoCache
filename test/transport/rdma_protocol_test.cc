@@ -20,9 +20,29 @@ TEST(RdmaProtocol, SlotGeometryKeepsPayloadAligned) {
   const size_t slot = V2SlotSize(4u << 20);
   ASSERT_NE(slot, 0u);
   EXPECT_EQ(slot % kV2DataOffset, 0u);
-  EXPECT_GE(slot - kV2DataOffset, (4u << 20) + ValueHeader::kSize);
+  EXPECT_GE(slot - kV2DataOffset, 4u << 20);
   EXPECT_EQ(kV2PutPrefixOffset + kReqPrefix, kV2DataOffset);
   EXPECT_EQ(kV2MaxGetTargets, 29u);
+}
+
+TEST(RdmaProtocol, MembersControlResponseHasExactBoundedCapacity) {
+  EXPECT_EQ(kV2ControlResponseMax, 32u << 10);
+  EXPECT_EQ(kV2ControlCap, kRespPrefix + (32u << 10));
+
+  char response[kRespPrefix];
+  Status status = Status::kInvalid;
+  uint64_t data_len = 0;
+  EncodeRespVersion(response, kNativeProtoRdmaV2, Status::kOk,
+                    kV2ControlResponseMax);
+  EXPECT_TRUE(DecodeRespVersion(response, kNativeProtoRdmaV2, &status,
+                                &data_len, kV2ControlResponseMax));
+  EXPECT_EQ(status, Status::kOk);
+  EXPECT_EQ(data_len, kV2ControlResponseMax);
+
+  EncodeRespVersion(response, kNativeProtoRdmaV2, Status::kOk,
+                    kV2ControlResponseMax + 1);
+  EXPECT_FALSE(DecodeRespVersion(response, kNativeProtoRdmaV2, &status,
+                                 &data_len, kV2ControlResponseMax));
 }
 
 TEST(RdmaProtocol, PutCompletionMustCoverExactFrame) {

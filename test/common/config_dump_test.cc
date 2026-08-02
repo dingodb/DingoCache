@@ -58,14 +58,14 @@ TEST_F(ConfigDumpTest, EnvU64StrBool) {
 }
 
 TEST_F(ConfigDumpTest, EmitShowsRecordsWithSourceAndFoldsEnvScan) {
-  cd::Record("model_hash", "81", cd::Source::kFlag);
+  cd::Record("key_namespace", "test/model", cd::Source::kFlag);
   ::setenv("DFKV_TEST_SCAN", "scanned", 1);  // not recorded -> scan folds it in
   testing::internal::CaptureStderr();
   cd::Emit("client");
   const std::string out = testing::internal::GetCapturedStderr();
   EXPECT_NE(out.find("effective config (client)"), std::string::npos);
-  EXPECT_NE(out.find("model_hash"), std::string::npos);
-  EXPECT_NE(out.find("81  (flag)"), std::string::npos);
+  EXPECT_NE(out.find("key_namespace"), std::string::npos);
+  EXPECT_NE(out.find("test/model  (flag)"), std::string::npos);
   EXPECT_NE(out.find("DFKV_TEST_SCAN"), std::string::npos);
   EXPECT_NE(out.find("scanned  (env)"), std::string::npos);
 }
@@ -77,8 +77,10 @@ TEST_F(ConfigDumpTest, ExplicitRecordWinsOverEnvScan) {
   testing::internal::CaptureStderr();
   cd::Emit("server");
   const std::string out = testing::internal::GetCapturedStderr();
-  EXPECT_NE(out.find("DFKV_TEST_SCAN = 4"), std::string::npos);
-  EXPECT_EQ(out.find("DFKV_TEST_SCAN = 16"), std::string::npos);
+  EXPECT_NE(out.find("DFKV_TEST_SCAN"), std::string::npos);
+  // Alignment width depends on any ambient DFKV_* variables on the host.
+  EXPECT_NE(out.find(" = 4  (env)"), std::string::npos);
+  EXPECT_EQ(out.find(" = 16  (env)"), std::string::npos);
 }
 
 TEST_F(ConfigDumpTest, EmitClearsRegistry) {

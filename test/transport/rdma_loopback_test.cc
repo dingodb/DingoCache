@@ -9,10 +9,9 @@
 #include "client/key_map.h"
 #include "cache/kv_node_server.h"
 #include "cache/rdma_server.h"
-#include "compat/sgengine_rdma_frontend.h"
 #include "transport/rdma_transport.h"
+#include "transport/rdma_protocol.h"
 #include "transport/rdma_verbs.h"
-#include "common/value_header.h"
 
 #include <gtest/gtest.h>
 #include <sys/mman.h>  // shm_unlink (node-dedup test)
@@ -22,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -36,10 +36,7 @@ namespace {
 // (RDMA pins registered memory); the test values are a few KB.
 constexpr size_t kMaxMsg = 256 * 1024;
 
-ValueHeader SelfHdr() {
-  return ValueHeader::Make(0x51ULL, 64, 0x46384534u, ValueHeader::kFlagIsMla,
-                           8, 0, 78, 1, 576);
-}
+std::string SelfHdr() { return "test/model"; }
 void ConfigureTestRecvSegment() {
   // Keep Soft-RoCE CI below modest RLIMIT_MEMLOCK. Production defaults to
   // 2 GiB, but these fixtures use 256-KiB blocks and need only a small segment.
@@ -62,20 +59,23 @@ struct RdmaNode {
     srv = std::make_unique<KvNodeServer>(dir.string(), 1ull << 30);
     EXPECT_EQ(srv->Start(0), Status::kOk);  // TCP listener owns the cache group
     rsrv = std::make_unique<RdmaServer>(
-        [this](uint8_t op, uint64_t id, uint32_t idx, uint32_t ks, uint64_t off,
-               uint64_t len, const char* pl, uint64_t pll, std::string* out) {
-          return srv->ProcessRequest(op, id, idx, ks, off, len, pl, pll, out);
+        [this](uint8_t op, const BlockKey& key, uint64_t off, uint64_t len,
+               const char* pl, uint64_t pll, std::string* out,
+               size_t* value_len) {
+          return srv->ProcessRequestForKey(
+              op, key, off, len, pl, pll, out, value_len);
         },
         max_msg);
     rsrv->set_range_handler(
-        [this](uint64_t id, uint32_t idx, uint32_t ks, uint64_t off, uint64_t len,
-               char* io_buf, size_t cap, const char** out_data, size_t* out_len) {
-          return srv->RangeDirect(id, idx, ks, off, len, io_buf, cap, out_data, out_len);
+        [this](const BlockKey& key, uint64_t off, uint64_t len,
+               char* io_buf, size_t cap, const char** out_data,
+               size_t* out_len, size_t* value_len) {
+          return srv->RangeDirectForKey(
+              key, off, len, io_buf, cap, out_data, out_len, value_len);
         });
     rsrv->set_cache_direct_handler(
-        [this](uint64_t id, uint32_t idx, uint32_t ks, char* data, size_t len,
-               size_t cap) {
-          return srv->CacheDirect(id, idx, ks, data, len, cap);
+        [this](const BlockKey& key, char* data, size_t len, size_t cap) {
+          return srv->CacheDirectForKey(key, data, len, cap);
         });
     EXPECT_EQ(rsrv->Start(0), Status::kOk);
     addr = "127.0.0.1:" + std::to_string(rsrv->port());
@@ -99,47 +99,123 @@ long CounterVal(const std::string& text, const std::string& name) {
   try { return std::stol(text.substr(sp + 1)); } catch (...) { return -1; }
 }
 
+struct FakePoolRail {
+  size_t declared = 0;
+  size_t staged = 0;
+  bool reject_stage = false;
+  size_t commits = 0;
+  size_t rollbacks = 0;
+
+  bool Stage(size_t requested) {
+    if (reject_stage) return false;
+    staged = requested;
+    return true;
+  }
+  void Commit() {
+    declared = staged;
+    ++commits;
+  }
+  void Rollback() {
+    staged = declared;
+    ++rollbacks;
+  }
+  bool Covers(size_t offset, size_t length) const {
+    return offset <= declared && length <= declared - offset;
+  }
+};
+
 }  // namespace
 
-TEST(RdmaLoopback, SgEngineV1PortIsolatedFromNativeKeyDomain) {
-  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
-  ::setenv("DFKV_RDMA_RECV_SEGMENT_SIZE", "8388608", 1);
-  RdmaNode node("sgengine-domain");
-  compat::SgEngineRdmaFrontend legacy(*node.srv, kMaxMsg);
-  ASSERT_EQ(legacy.Start(0), Status::kOk);
-  const std::string legacy_address =
-      "127.0.0.1:" + std::to_string(legacy.port());
-
-  // Force the old SGEngine protocol: no DCP2 probe or one-sided payload path.
-  ::setenv("DFKV_RDMA_PROTOCOL", "1", 1);
-  auto transport = std::make_unique<RdmaTransport>(kMaxMsg);
-  ::unsetenv("DFKV_RDMA_PROTOCOL");
-
-  const BlockKey wire_key{73, 4, 4096};
-  const std::string native_value = "native-rdma";
-  const std::string legacy_value = "legacy-rdma";
-  ASSERT_EQ(transport->Cache(node.addr, wire_key, native_value.data(),
-                             native_value.size()),
-            Status::kOk);
-  ASSERT_EQ(transport->Cache(legacy_address, wire_key, legacy_value.data(),
-                             legacy_value.size()),
-            Status::kOk);
-
-  std::string out;
-  ASSERT_EQ(transport->Range(node.addr, wire_key, 0, native_value.size(), &out),
-            Status::kOk);
-  EXPECT_EQ(out, native_value);
-  ASSERT_EQ(transport->Range(legacy_address, wire_key, 0,
-                             legacy_value.size(), &out),
-            Status::kOk);
-  EXPECT_EQ(out, legacy_value);
-
-  std::string members;
-  EXPECT_EQ(transport->Members(legacy_address, &members), Status::kInvalid);
-  EXPECT_EQ(legacy.RejectedOps(), 1u);
-  transport.reset();
-  legacy.Stop();
+TEST(RdmaSafety, CompletionDeadlineUsesOneAbsoluteBudget) {
+  using Clock = CompletionDeadline::Clock;
+  const auto start = Clock::time_point(std::chrono::milliseconds(100));
+  CompletionDeadline deadline(50, start);
+  EXPECT_EQ(deadline.RemainingAt(start), 50);
+  EXPECT_EQ(deadline.RemainingAt(start + std::chrono::milliseconds(30)), 20);
+  // A partial completion at +30 ms does not create a fresh 50-ms wait.
+  EXPECT_EQ(deadline.RemainingAt(start + std::chrono::milliseconds(49)), 1);
+  EXPECT_EQ(deadline.RemainingAt(start + std::chrono::milliseconds(50)), 0);
+  CompletionDeadline infinite(-1, start);
+  EXPECT_EQ(infinite.RemainingAt(start + std::chrono::hours(24)), -1);
 }
+
+TEST(RdmaSafety, PartialMultiRailPoolGrowthRollsBackBeforePublication) {
+  std::vector<FakePoolRail> rails(3, FakePoolRail{64, 64});
+  rails[1].reject_stage = true;
+  size_t published_bytes = 64;
+  const bool registered = rdma::RunPoolMrTransaction(
+      rails.size(),
+      [&](size_t rail) { return rails[rail].Stage(128); },
+      [&](size_t rail) { rails[rail].Commit(); },
+      [&](size_t rail) { rails[rail].Rollback(); });
+  if (registered) published_bytes = 128;
+
+  EXPECT_FALSE(registered);
+  EXPECT_EQ(published_bytes, 64u);
+  for (const auto& rail : rails) {
+    EXPECT_EQ(rail.declared, 64u);
+    EXPECT_EQ(rail.staged, 64u);
+    EXPECT_EQ(rail.commits, 0u);
+  }
+  EXPECT_EQ(rails[0].rollbacks, 1u);
+  EXPECT_EQ(rails[1].rollbacks, 0u);
+  EXPECT_EQ(rails[2].rollbacks, 0u);
+}
+
+TEST(RdmaSafety, SuccessfulMultiRailPoolGrowthKeepsOldRangeUsable) {
+  std::vector<FakePoolRail> rails(3, FakePoolRail{64, 64});
+  size_t published_bytes = 64;
+  const bool registered = rdma::RunPoolMrTransaction(
+      rails.size(),
+      [&](size_t rail) { return rails[rail].Stage(128); },
+      [&](size_t rail) { rails[rail].Commit(); },
+      [&](size_t rail) { rails[rail].Rollback(); });
+  if (registered) published_bytes = 128;
+
+  ASSERT_TRUE(registered);
+  EXPECT_EQ(published_bytes, 128u);
+  for (const auto& rail : rails) {
+    EXPECT_EQ(rail.declared, 128u);
+    EXPECT_EQ(rail.commits, 1u);
+    EXPECT_EQ(rail.rollbacks, 0u);
+    EXPECT_TRUE(rail.Covers(8, 16));
+    EXPECT_TRUE(rail.Covers(96, 16));
+  }
+}
+
+TEST(RdmaSafety, OverridesRejectMalformedVectorsBeforeAcquiringQp) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaTransport transport(kMaxMsg);
+  const std::vector<BlockKey> keys = {{1, 2}, {3, 4}};
+  std::vector<uint64_t> value_lengths;
+  const auto mismatched =
+      transport.RangeInto("unused", keys, {{nullptr, 0}}, &value_lengths);
+  ASSERT_EQ(mismatched.size(), keys.size());
+  EXPECT_EQ(mismatched[0], Status::kInvalid);
+  EXPECT_EQ(mismatched[1], Status::kInvalid);
+
+  const auto null_write = transport.CacheMany(
+      "unused", {CacheItem{keys[0], nullptr, 1}});
+  ASSERT_EQ(null_write.size(), 1u);
+  EXPECT_EQ(null_write[0], Status::kInvalid);
+
+  const void* nonnull = reinterpret_cast<const void*>(uintptr_t{1});
+  CacheSrcMulti overflow{
+      keys[0],
+      {{nonnull, std::numeric_limits<size_t>::max()}, {nonnull, 1}}};
+  const auto overflow_status =
+      transport.CacheFromMulti("unused", {overflow});
+  ASSERT_EQ(overflow_status.size(), 1u);
+  EXPECT_EQ(overflow_status[0], Status::kInvalid);
+
+  EXPECT_EQ(transport.ExistMany("unused", keys, nullptr),
+            std::vector<Status>(keys.size(), Status::kInvalid));
+  EXPECT_EQ(transport.Members("unused", nullptr), Status::kInvalid);
+  EXPECT_EQ(CounterVal(transport.MetricsText(),
+                       "dfkv_rdma_client_conns_opened_total"), 0);
+}
+
+
 
 // Direct transport ExistMany: windowed batch existence probe on one connection.
 // Must be correct across multiple send windows (N > depth) with mixed hit/miss.
@@ -154,14 +230,12 @@ TEST(RdmaLoopback, ExistManyWindowedMixedHitMiss) {
     std::string v = "v" + std::to_string(i);
     ASSERT_TRUE(c.Put("p" + std::to_string(i), v.data(), v.size())) << i;
   }
-  // Interleave present (even) and absent (odd) keys. The probes must carry the
-  // same model_hash the KVClient salted the identity with on Put (SelfHdr());
-  // a bare ToBlockKey probes the mh=0 keyspace and misses everything.
-  const uint64_t mh = SelfHdr().model_hash;
+  // Interleave present (even) and absent (odd) keys using the exact namespace
+  // the KVClient used for the writes.
   std::vector<BlockKey> keys;
   for (int i = 0; i < N; ++i) {
-    keys.push_back(ToBlockKey("p" + std::to_string(i), mh));      // present
-    keys.push_back(ToBlockKey("absent" + std::to_string(i), mh)); // miss
+    keys.push_back(ToBlockKey(SelfHdr(), "p" + std::to_string(i)));
+    keys.push_back(ToBlockKey(SelfHdr(), "absent" + std::to_string(i)));
   }
   std::vector<char> exists;
   auto sts = rt.ExistMany(node.addr, keys, &exists);
@@ -239,7 +313,8 @@ TEST(RdmaLoopback, BatchPutOversizedFailsOnlyOffender) {
 // server — server-side completions stay ~flat while the data stays correct.
 TEST(RdmaLoopback, NodeDedupCollapsesSameHostGets) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
-  const std::string nm = NodeDedup::EnvSegmentName(SelfHdr().model_hash);
+  const std::string nm = NodeDedup::EnvSegmentName(
+      ToBlockKey(SelfHdr(), "").digest_hi);
   ::shm_unlink(nm.c_str());
   ::setenv("DFKV_CLIENT_NODE_DEDUP", "1", 1);
   {
@@ -309,7 +384,7 @@ TEST(RdmaLoopback, MetricsCountersTrackOps) {
   KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
 
   std::vector<char> pool(64 * 1024);
-  c.RegisterMemory(pool.data(), pool.size());
+  ASSERT_TRUE(c.RegisterMemory(pool.data(), pool.size()));
   std::string v(2048, 'z');
   ASSERT_TRUE(c.Put("m1", v.data(), v.size()));
   std::string out(v.size(), '\0');
@@ -329,89 +404,57 @@ TEST(RdmaLoopback, MetricsCountersTrackOps) {
   EXPECT_NE(cli_text.find("dfkv_rdma_client_conns_opened_total"), std::string::npos) << cli_text;
   EXPECT_NE(cli_text.find("dfkv_rdma_client_rail_conns_total{dev="), std::string::npos) << cli_text;
   EXPECT_NE(cli_text.find("dfkv_rdma_client_mr_regions 1"), std::string::npos) << cli_text;
-  EXPECT_GE(CounterVal(cli_text, "dfkv_rdma_client_v2_conns_opened_total"), 1);
   EXPECT_GE(CounterVal(cli_text, "dfkv_rdma_client_v2_put_writes_total"), 1);
   EXPECT_GE(CounterVal(cli_text, "dfkv_rdma_client_v2_get_writes_total"), 1);
+  EXPECT_GE(CounterVal(cli_text,
+                       "dfkv_rdma_client_pool_mr_registrations_total"), 1);
+  EXPECT_GE(CounterVal(cli_text, "dfkv_rdma_client_max_block_seen_bytes"),
+            2048);
+  EXPECT_EQ(CounterVal(cli_text,
+                       "dfkv_rdma_client_transient_user_mr_active"), 0);
+  EXPECT_GE(CounterVal(cli_text, "dfkv_rdma_client_v2_probe_attempts_total"),
+            1);
+  EXPECT_GE(CounterVal(cli_text,
+                       "dfkv_rdma_client_completion_timeouts_total"), 0);
 
   // and the client snapshot folds transport metrics in after the health metrics
   std::string snap = c.MetricsSnapshot();
   EXPECT_NE(snap.find("dfkv_client_ops_served_total"), std::string::npos) << snap;
   EXPECT_NE(snap.find("dfkv_rdma_client_conns_opened_total"), std::string::npos) << snap;
 }
-TEST(RdmaLoopback, AutoFallsBackWhenServerForcesV1) {
-  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
-  ::setenv("DFKV_RDMA_SERVER_PROTOCOL", "1", 1);
-  RdmaNode node("v1-fallback");
-  ::unsetenv("DFKV_RDMA_SERVER_PROTOCOL");
 
-  RdmaTransport transport(kMaxMsg);
-  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
-  std::string value(4096, 'f');
-  ASSERT_TRUE(client.Put("fallback", value.data(), value.size()));
-  std::string output(value.size(), '\0');
-  ASSERT_TRUE(client.Get("fallback", output.data(), output.size()));
-  EXPECT_EQ(output, value);
-
-  EXPECT_GE(node.rsrv->V1Conns(), 1u);
-  EXPECT_EQ(node.rsrv->V2Conns(), 0u);
-  EXPECT_GE(CounterVal(transport.MetricsText(),
-                       "dfkv_rdma_client_v1_conns_opened_total"),
-            1);
-}
-
-TEST(RdmaLoopback, AutoFallbackPreservesLegacyUndeclaredFrame) {
-  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
-  // Before v2, an unset block declaration produced a plain legacy frame. The
-  // fallback must not invent the client's larger max as DCP1: an older server
-  // with a smaller --max-msg would reject it even when the real value fits.
-  ::unsetenv("DFKV_RDMA_MAX_BLOCK_BYTES");
-  ::setenv("DFKV_RDMA_SERVER_PROTOCOL", "1", 1);
-  constexpr size_t kSmallerOldServerCap = 64 * 1024;
-  RdmaNode node("v1-undeclared-fallback", kSmallerOldServerCap);
-  ::unsetenv("DFKV_RDMA_SERVER_PROTOCOL");
-
-  RdmaTransport transport(kMaxMsg);
-  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
-  std::string value(4096, 'u');
-  ASSERT_TRUE(client.Put("undeclared-fallback", value.data(), value.size()));
-  std::string output(value.size(), '\0');
-  ASSERT_TRUE(
-      client.Get("undeclared-fallback", output.data(), output.size()));
-  EXPECT_EQ(output, value);
-  EXPECT_GE(node.rsrv->V1Conns(), 1u);
-  EXPECT_EQ(node.rsrv->V2Conns(), 0u);
-}
-
-TEST(RdmaLoopback, LargeMembersReplyUsesDedicatedV1ControlLane) {
+TEST(RdmaLoopback, MembersReplyHonorsExactBoundAndRejectsOversize) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   RdmaNode node("large-members");
-  const std::string members(32u << 10, 'm');
-  node.srv->set_members(members);
+  const std::string boundary(rdma::kV2ControlResponseMax, 'm');
+  node.srv->set_members(boundary);
 
   RdmaTransport transport(kMaxMsg);
   std::string output;
   ASSERT_EQ(transport.Members(node.addr, &output), Status::kOk);
-  EXPECT_EQ(output, members);
-  EXPECT_GE(node.rsrv->V1Conns(), 1u);
-  EXPECT_EQ(node.rsrv->V2Conns(), 0u);
+  EXPECT_EQ(output, boundary);
+  EXPECT_GE(node.rsrv->V2Conns(), 1u);
+
+  node.srv->set_members(
+      std::string(rdma::kV2ControlResponseMax + 1, 'x'));
+  output = "must be cleared";
+  EXPECT_EQ(transport.Members(node.addr, &output), Status::kIOError);
+  EXPECT_TRUE(output.empty());
+
+  node.srv->set_members(boundary);
+  ASSERT_EQ(transport.Members(node.addr, &output), Status::kOk);
+  EXPECT_EQ(output, boundary);
 }
 
-TEST(RdmaLoopback, AutoFallsBackWhenSharedSegmentHasNoLease) {
+TEST(RdmaLoopback, StartupFailsWhenV2ReceiveSegmentIsUnavailable) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   ::setenv("DFKV_RDMA_RECV_SEGMENT_SIZE", "4096", 1);
-  RdmaNode node("segment-fallback");
+  RdmaServer server(
+      [](uint8_t, const BlockKey&, uint64_t, uint64_t, const char*, uint64_t,
+         std::string*, size_t*) { return Status::kInvalid; },
+      kMaxMsg);
+  EXPECT_EQ(server.Start(0), Status::kIOError);
   ::unsetenv("DFKV_RDMA_RECV_SEGMENT_SIZE");
-
-  RdmaTransport transport(kMaxMsg);
-  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
-  std::string value(4096, 's');
-  ASSERT_TRUE(client.Put("segment-fallback", value.data(), value.size()));
-  std::string output(value.size(), '\0');
-  ASSERT_TRUE(
-      client.Get("segment-fallback", output.data(), output.size()));
-  EXPECT_EQ(output, value);
-  EXPECT_GE(node.rsrv->V1Conns(), 1u);
-  EXPECT_EQ(node.rsrv->V2Conns(), 0u);
 }
 
 
@@ -419,16 +462,14 @@ TEST(RdmaLoopback, V2CacheAcceptsReadOnlySourceMemory) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   RdmaNode node("readonly-v2");
   RdmaTransport transport(kMaxMsg);
-  const BlockKey key = ToBlockKey("readonly-v2", SelfHdr().model_hash);
+  const BlockKey key = ToBlockKey(SelfHdr(), "readonly-v2");
   constexpr size_t kPayload = 512;
-  const size_t stored_len = ValueHeader::kSize + kPayload;
+  const size_t stored_len = kPayload;
   void* mapping =
       ::mmap(nullptr, 4096, PROT_READ | PROT_WRITE,
              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   ASSERT_NE(mapping, MAP_FAILED);
-  const ValueHeader header = SelfHdr();
-  std::memcpy(mapping, &header, ValueHeader::kSize);
-  std::memset(static_cast<char*>(mapping) + ValueHeader::kSize, 'r', kPayload);
+  std::memset(mapping, 'r', kPayload);
   ASSERT_EQ(::mprotect(mapping, 4096, PROT_READ), 0);
 
   ASSERT_EQ(transport.Cache(node.addr, key, mapping, stored_len), Status::kOk);
@@ -444,11 +485,9 @@ TEST(RdmaLoopback, DirectSingleCacheRangeUsesV2Writes) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   RdmaNode node("direct-v2");
   RdmaTransport transport(kMaxMsg);
-  const BlockKey key = ToBlockKey("direct-v2", SelfHdr().model_hash);
-  std::string stored(ValueHeader::kSize + 4096, '\0');
-  const ValueHeader header = SelfHdr();
-  std::memcpy(stored.data(), &header, ValueHeader::kSize);
-  for (size_t i = ValueHeader::kSize; i < stored.size(); ++i)
+  const BlockKey key = ToBlockKey(SelfHdr(), "direct-v2");
+  std::string stored(4096, '\0');
+  for (size_t i = 0; i < stored.size(); ++i)
     stored[i] = static_cast<char>((i * 29 + 3) & 0xff);
 
   ASSERT_EQ(transport.Cache(node.addr, key, stored.data(), stored.size()),
@@ -545,25 +584,20 @@ TEST(RdmaLoopback, ManyEndpointsShareDeviceContext) {
   ASSERT_TRUE(again.Open(nullptr, 64 * 1024, 1));
 }
 
-// The user-MR LRU cap must be >= pipeline depth, else a single windowed batch
-// (which registers up to `depth` distinct out-of-pool buffers before posting
-// their WRs) could evict an MR still referenced by an in-flight WR.
-TEST(RdmaLoopback, UserMrCapTracksDepth) {
+
+TEST(RdmaLoopback, RegisterMemoryRejectsInvalidRange) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
-  rdma::RcEndpoint shallow;
-  ASSERT_TRUE(shallow.Open(nullptr, 16 * 1024, 1));
-  EXPECT_GE(shallow.user_mr_cap(), 64u);            // floor
-  EXPECT_GE(shallow.user_mr_cap(), shallow.depth());
-  rdma::RcEndpoint deep;
-  // v2 reserves up to max_sge+1 SQ WRs per request. Keep this above the
-  // historical 64-MR floor without asking the NIC for a pathological QP.
-  constexpr size_t kDeepDepth = 65;
-  ASSERT_TRUE(deep.Open(nullptr, 16 * 1024, kDeepDepth));
-  // The SG multi paths register up to max_sge-1 out-of-pool segments per slot
-  // and post only after the whole window is registered: the cap must cover
-  // depth * max_sge or a same-window LRU eviction hands a freed MR to a WR.
-  EXPECT_GE(deep.user_mr_cap(), kDeepDepth * deep.max_sge())
-      << "cap below depth*max_sge -> in-window MR eviction risk on SG batches";
+  RdmaTransport rt(kMaxMsg);
+  char byte = 0;
+  EXPECT_FALSE(rt.RegisterMemory(nullptr, 1));
+  EXPECT_FALSE(rt.RegisterMemory(&byte, 0));
+  const std::string metrics = rt.MetricsText();
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_mr_regions"), 0);
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_mr_registered_bytes"), 0);
+  EXPECT_EQ(CounterVal(
+                metrics,
+                "dfkv_rdma_client_mr_registration_rejections_total"),
+            2);
 }
 
 // Client-side anchor: RegisterMemory must register the pool MRs at
@@ -575,9 +609,107 @@ TEST(RdmaLoopback, RegisterMemoryAnchorsPoolMrBeforeFirstConn) {
   const uint64_t before = rdma::RcEndpoint::PoolMrRegistrations();
   RdmaTransport rt(kMaxMsg);
   std::vector<char> pool(256 * 1024);
-  rt.RegisterMemory(pool.data(), pool.size());
+  ASSERT_TRUE(rt.RegisterMemory(pool.data(), 64 * 1024));
   EXPECT_GT(rdma::RcEndpoint::PoolMrRegistrations(), before)
       << "pool MR not registered at declaration time (anchor missing)";
+  std::string metrics = rt.MetricsText();
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_mr_regions"), 1);
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_mr_registered_bytes"),
+            64 * 1024);
+
+  ASSERT_TRUE(rt.RegisterMemory(pool.data(), pool.size()));
+  metrics = rt.MetricsText();
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_mr_regions"), 1);
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_mr_registered_bytes"),
+            static_cast<long>(pool.size()));
+  EXPECT_EQ(CounterVal(
+                metrics,
+                "dfkv_rdma_client_mr_registration_rejections_total"),
+            0);
+
+  const uintptr_t base = reinterpret_cast<uintptr_t>(pool.data());
+  const size_t wrapping_size =
+      std::numeric_limits<uintptr_t>::max() - base + 1;
+  EXPECT_FALSE(rt.RegisterMemory(pool.data(), wrapping_size));
+  metrics = rt.MetricsText();
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_mr_regions"), 1);
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_mr_registered_bytes"),
+            static_cast<long>(pool.size()));
+  EXPECT_EQ(CounterVal(
+                metrics,
+                "dfkv_rdma_client_mr_registration_rejections_total"),
+            1);
+}
+
+TEST(RdmaLoopback, SameBasePoolRegistrationGrowthIsEffective) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  rdma::RcEndpoint endpoint;
+  rdma::RcEndpoint old_generation_user;
+  ASSERT_TRUE(endpoint.Open(nullptr, 64 * 1024, 1));
+  ASSERT_TRUE(old_generation_user.Open(nullptr, 64 * 1024, 1));
+  std::vector<char> region(256 * 1024);
+  ASSERT_TRUE(endpoint.AddPoolMr(region.data(), 64 * 1024, true));
+  ASSERT_TRUE(
+      old_generation_user.AddPoolMr(region.data(), 64 * 1024, true));
+  ibv_mr* initial = endpoint.RegisterUser(region.data() + 4096, 4096);
+  ASSERT_NE(initial, nullptr);
+  EXPECT_EQ(old_generation_user.RegisterUser(region.data() + 4096, 4096),
+            initial);
+  const uint64_t registrations = rdma::RcEndpoint::PoolMrRegistrations();
+  const uint64_t active =
+      rdma::RcEndpoint::PoolMrActiveRegistrations();
+
+  ASSERT_TRUE(endpoint.AddPoolMr(region.data(), region.size(), true));
+  EXPECT_EQ(rdma::RcEndpoint::PoolMrRegistrations(), registrations + 1);
+  EXPECT_EQ(rdma::RcEndpoint::PoolMrActiveRegistrations(), active + 1)
+      << "the old generation stays leased by its current endpoint";
+  ibv_mr* grown =
+      endpoint.RegisterUser(region.data() + 128 * 1024, 4096);
+  ASSERT_NE(grown, nullptr);
+  EXPECT_NE(grown, initial);
+  EXPECT_EQ(endpoint.RegisterUser(region.data() + 4096, 4096), grown)
+      << "the grown endpoint resolves the old prefix through the new MR";
+  EXPECT_EQ(old_generation_user.RegisterUser(region.data() + 4096, 4096),
+            initial)
+      << "an endpoint using the previous generation keeps its old range valid";
+  EXPECT_EQ(old_generation_user.RegisterUser(
+                region.data() + 128 * 1024, 4096),
+            nullptr);
+
+  ASSERT_TRUE(old_generation_user.AddPoolMr(
+      region.data(), region.size(), true));
+  EXPECT_EQ(rdma::RcEndpoint::PoolMrActiveRegistrations(), active)
+      << "the superseded generation retires after its final endpoint advances";
+  EXPECT_EQ(old_generation_user.RegisterUser(region.data() + 4096, 4096),
+            grown);
+}
+
+TEST(RdmaLoopback, UnregisteredBuffersLeaveNoLiveMrAfterReturn) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaNode node("transient-lifetime");
+  RdmaTransport transport(kMaxMsg);
+  const BlockKey key = ToBlockKey(SelfHdr(), "transient-lifetime");
+  const uint64_t baseline = rdma::RcEndpoint::TransientUserMrActive();
+
+  {
+    std::vector<char> source(4096, 't');
+    const auto statuses = transport.CacheFrom(
+        node.addr, {CacheSrc{key, source.data(), source.size()}});
+    ASSERT_EQ(statuses.size(), 1u);
+    ASSERT_EQ(statuses[0], Status::kOk);
+    EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), baseline);
+  }  // source may be freed immediately: no cached MR may reference it.
+
+  {
+    std::vector<char> destination(4096);
+    std::vector<uint64_t> value_lengths;
+    const auto statuses = transport.RangeInto(
+        node.addr, {key},
+        {RangeDst{destination.data(), destination.size()}}, &value_lengths);
+    ASSERT_EQ(statuses.size(), 1u);
+    ASSERT_EQ(statuses[0], Status::kOk);
+    EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), baseline);
+  }  // destination may be freed immediately after return as well.
 }
 
 TEST(RdmaLoopback, PoolMrSharedAcrossBuffers) {
@@ -591,9 +723,8 @@ TEST(RdmaLoopback, PoolMrSharedAcrossBuffers) {
   ASSERT_NE(a, nullptr);
   EXPECT_EQ(a, b);  // both inside the pool -> one shared MR, no per-op registration
   std::vector<char> outside(4096);
-  ibv_mr* c = ep.RegisterUser(outside.data(), outside.size());
-  ASSERT_NE(c, nullptr);
-  EXPECT_NE(c, a);  // outside the pool -> ad-hoc registration
+  EXPECT_EQ(ep.RegisterUser(outside.data(), outside.size()), nullptr)
+      << "out-of-pool stable lookup must fail closed, never cache caller memory";
 }
 
 TEST(RdmaLoopback, PoolMrAccessUpgradeWinsRangeLookup) {
@@ -650,14 +781,13 @@ TEST(RdmaLoopback, PoolMrRegisteredOncePerDeviceNotPerConnection) {
 }
 
 // End-to-end: register the host pool once, then Put from / Get into sub-buffers
-// of it. All transfers hit the pool MR (no per-op registration) and round-trip.
 TEST(RdmaLoopback, RegisterMemoryRoundtrip) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   RdmaNode node("rmr");
   RdmaTransport rt(kMaxMsg);
   KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
   std::vector<char> pool(128 * 1024);
-  c.RegisterMemory(pool.data(), pool.size());  // one region covers every page below
+  ASSERT_TRUE(c.RegisterMemory(pool.data(), pool.size()));
 
   const size_t sz = 4096;
   for (int i = 0; i < 8; ++i) {
@@ -708,7 +838,7 @@ TEST(RdmaLoopback, ScatterGatherRoundtripOverRdma) {
   RdmaNode node("sg");
   RdmaTransport rt(kMaxMsg);
   KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
-  ASSERT_TRUE(rt.pipelined());  // RDMA path, not the TCP fallback
+  ASSERT_TRUE(rt.pipelined());  // RDMA path, not native TCP
 
   auto make_chunks = [](const std::string& tag, const std::vector<size_t>& sizes) {
     std::vector<std::string> v(sizes.size());
@@ -802,14 +932,10 @@ TEST(RdmaLoopback, ScatterGatherRoundtripOverRdma) {
 // CacheFromMulti/RangeIntoMulti, NOT poison its node batch. Previously the up-front
 // validation std::fill'd every result kInvalid and returned; now the offender is
 // skipped in the window and its siblings on the same node proceed normally.
-// Regression (phase-4 C5): one deep window of SG items where EVERY segment is
-// a distinct unregistered buffer. The ad-hoc MR cache was capped at
-// max(64, depth); the SG multi paths register the whole window's segments
-// (up to depth * (max_sge-1) MRs) BEFORE posting any WR, so slot 3+'s
-// registrations LRU-evicted (ibv_dereg_mr) MRs earlier slots still held in
-// mrs_per — posted WRs then carried freed lkeys (use-after-dereg; on the RECV
-// side a completion scattering into freed memory). With the cap raised to
-// depth * max_sge the whole window stays registered and the batch is correct.
+// Regression: one deep window of SG items where every segment is a distinct
+// unregistered buffer. All MRs must remain live until the whole posted window
+// completes, then be released before the public call returns. This exercises
+// depth * (max_sge-1) simultaneous transient registrations across PUT and GET.
 TEST(RdmaLoopback, SgDeepWindowManyUnregisteredSegmentsSafe) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   ::setenv("DFKV_RDMA_DEPTH", "4", 1);
@@ -817,6 +943,8 @@ TEST(RdmaLoopback, SgDeepWindowManyUnregisteredSegmentsSafe) {
   RdmaTransport rt(kMaxMsg);
   KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
   ASSERT_TRUE(rt.pipelined());
+  const uint64_t transient_baseline =
+      rdma::RcEndpoint::TransientUserMrActive();
 
   constexpr int kItems = 8;   // > depth: also crosses windows
   constexpr int kSegs = 29;   // max payload SGEs per slot
@@ -837,6 +965,7 @@ TEST(RdmaLoopback, SgDeepWindowManyUnregisteredSegmentsSafe) {
   auto pr = c.BatchPutSg(puts);
   ASSERT_EQ(pr.size(), puts.size());
   for (int it = 0; it < kItems; ++it) EXPECT_TRUE(pr[it]) << "put item " << it;
+  EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), transient_baseline);
 
   std::vector<std::vector<std::string>> dst(kItems);
   std::vector<KvGetItemSg> gets;
@@ -856,6 +985,7 @@ TEST(RdmaLoopback, SgDeepWindowManyUnregisteredSegmentsSafe) {
     for (int sg = 0; sg < kSegs; ++sg)
       EXPECT_EQ(dst[it][sg], src[it][sg]) << "item " << it << " seg " << sg;
   }
+  EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), transient_baseline);
   ::unsetenv("DFKV_RDMA_DEPTH");
 }
 
@@ -1025,13 +1155,11 @@ TEST(RdmaLoopback, BatchRetriesAfterServerReclaim) {
   // probe must detect that on the first window and re-dial a fresh conn, returning
   // CORRECT results — not kIOError for the whole batch. Direct transport call so no
   // KVClient-level health retry can mask a transport that failed to recover.
-  // Probe with the Put-side model_hash: KVClient salts the block identity with
-  // SelfHdr().model_hash, so a bare ToBlockKey would probe the wrong keyspace.
-  const uint64_t mh = SelfHdr().model_hash;
+  // Probe with the same canonical namespace/object identity as the warm writes.
   std::vector<BlockKey> keys;
   for (int i = 0; i < N; ++i) {
-    keys.push_back(ToBlockKey("b" + std::to_string(i), mh));     // present (warm)
-    keys.push_back(ToBlockKey("nope" + std::to_string(i), mh));  // absent
+    keys.push_back(ToBlockKey(SelfHdr(), "b" + std::to_string(i)));
+    keys.push_back(ToBlockKey(SelfHdr(), "nope" + std::to_string(i)));
   }
   std::vector<char> exists;
   auto sts = rt.ExistMany(node.addr, keys, &exists);
@@ -1065,42 +1193,29 @@ struct RdmaUringNode {
     srv = std::make_unique<KvNodeServer>(dir.string(), 1ull << 30);
     EXPECT_EQ(srv->Start(0), Status::kOk);
     rsrv = std::make_unique<RdmaServer>(
-        [this](uint8_t op, uint64_t id, uint32_t idx, uint32_t ks, uint64_t off,
-               uint64_t len, const char* pl, uint64_t pll, std::string* out) {
-          return srv->ProcessRequest(op, id, idx, ks, off, len, pl, pll, out);
+        [this](uint8_t op, const BlockKey& key, uint64_t off, uint64_t len,
+               const char* pl, uint64_t pll, std::string* out,
+               size_t* value_len) {
+          return srv->ProcessRequestForKey(
+              op, key, off, len, pl, pll, out, value_len);
         },
         max_msg);
     rsrv->set_range_handler(  // sync fallback (used when uring path is off)
-        [this](uint64_t id, uint32_t idx, uint32_t ks, uint64_t off, uint64_t len,
-               char* io_buf, size_t cap, const char** out_data, size_t* out_len) {
-          return srv->RangeDirect(id, idx, ks, off, len, io_buf, cap, out_data, out_len);
+        [this](const BlockKey& key, uint64_t off, uint64_t len,
+               char* io_buf, size_t cap, const char** out_data,
+               size_t* out_len, size_t* value_len) {
+          return srv->RangeDirectForKey(
+              key, off, len, io_buf, cap, out_data, out_len, value_len);
         });
     rsrv->set_cache_direct_handler(
-        [this](uint64_t id, uint32_t idx, uint32_t ks, char* data, size_t len,
-               size_t cap) {
-          return srv->CacheDirect(id, idx, ks, data, len, cap);
+        [this](const BlockKey& key, char* data, size_t len, size_t cap) {
+          return srv->CacheDirectForKey(key, data, len, cap);
         });
-    rsrv->set_range_prep_handler(
-        [this](uint64_t id, uint32_t idx, uint32_t ks, uint64_t off, uint64_t len,
-               size_t cap, RdmaServer::RangePrepResult* o) {
-          KVStore::RangePrep p;
-          Status st = srv->RangeDirectPrep(id, idx, ks, off, len, cap, &p, &o->flight);
-          if (st == Status::kOk) {
-            o->fd = p.fd; o->aligned_off = p.aligned_off; o->aligned_len = p.aligned_len;
-            o->head = p.head; o->payload_len = p.payload_len;
-            o->release_token = p.token;
-          }
-          return st;
+    rsrv->set_prepare_read_handler(
+        [this](const BlockKey& key, uint64_t off, uint64_t len,
+               char* staging, size_t cap) {
+          return srv->PrepareReadForKey(key, off, len, staging, cap);
         });
-    rsrv->set_range_complete_handler(
-        [this](bool ok, size_t bytes, double elapsed_sec, uint64_t flight,
-               const char* data) {
-          srv->RangeDirectComplete(ok, bytes, elapsed_sec, flight, data);
-        });
-    rsrv->set_range_release_handler(
-        [this](uint64_t tok) { srv->RangePrepRelease(tok); });
-    rsrv->set_range_flight_abort_handler(
-        [this](uint64_t f) { srv->RangeFlightAbort(f); });
     EXPECT_EQ(rsrv->Start(0), Status::kOk);
     addr = "127.0.0.1:" + std::to_string(rsrv->port());
   }
@@ -1248,29 +1363,33 @@ struct RamRdmaNode {
     srv = std::make_unique<KvNodeServer>(dir.string(), 1ull << 30);
     EXPECT_EQ(srv->Start(0), Status::kOk);
     rsrv = std::make_unique<RdmaServer>(
-        [this](uint8_t op, uint64_t id, uint32_t idx, uint32_t ks, uint64_t off,
-               uint64_t len, const char* pl, uint64_t pll, std::string* out) {
-          return srv->ProcessRequest(op, id, idx, ks, off, len, pl, pll, out);
+        [this](uint8_t op, const BlockKey& key, uint64_t off, uint64_t len,
+               const char* pl, uint64_t pll, std::string* out,
+               size_t* value_len) {
+          return srv->ProcessRequestForKey(
+              op, key, off, len, pl, pll, out, value_len);
         },
         max_msg);
     rsrv->set_range_handler(
-        [this](uint64_t id, uint32_t idx, uint32_t ks, uint64_t off, uint64_t len,
-               char* io_buf, size_t cap, const char** out_data, size_t* out_len) {
-          return srv->RangeDirect(id, idx, ks, off, len, io_buf, cap, out_data, out_len);
+        [this](const BlockKey& key, uint64_t off, uint64_t len,
+               char* io_buf, size_t cap, const char** out_data,
+               size_t* out_len, size_t* value_len) {
+          return srv->RangeDirectForKey(
+              key, off, len, io_buf, cap, out_data, out_len, value_len);
         });
     rsrv->set_cache_direct_handler(
-        [this](uint64_t id, uint32_t idx, uint32_t ks, char* data, size_t len,
-               size_t cap) { return srv->CacheDirect(id, idx, ks, data, len, cap); });
-    // The B5-3 wiring (mirrors dfkv_server_main): register the arena as a pool MR
-    // and set the zero-copy serve hooks.
+        [this](const BlockKey& key, char* data, size_t len, size_t cap) {
+          return srv->CacheDirectForKey(key, data, len, cap);
+        });
+    rsrv->set_prepare_read_handler(
+        [this](const BlockKey& key, uint64_t off, uint64_t len,
+               char* staging, size_t cap) {
+          return srv->PrepareReadForKey(key, off, len, staging, cap);
+        });
+    // The RAM arena is a registered source pool; per-send pin ownership lives
+    // inside PreparedRead.
     if (srv->ram_enabled()) {
       rsrv->RegisterMemory(srv->ram_arena(), srv->ram_arena_bytes());
-      rsrv->set_ram_range_handler(
-          [this](uint64_t id, uint32_t idx, uint32_t ks, uint64_t off, uint64_t len,
-                 const char** p, size_t* l, uint64_t* tok) {
-            return srv->RamRangePrep(id, idx, ks, off, len, p, l, tok);
-          });
-      rsrv->set_ram_release_handler([this](uint64_t tok) { srv->RamRelease(tok); });
     }
     EXPECT_EQ(rsrv->Start(0), Status::kOk);
     addr = "127.0.0.1:" + std::to_string(rsrv->port());
@@ -1350,7 +1469,7 @@ TEST(RdmaLoopback, DefaultDeclarationKeepsGlobalCap) {
   RdmaNode node("nocaps");
   RdmaTransport rt(kMaxMsg);
   KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
-  std::string v(kMaxMsg - ValueHeader::kSize, 'c');  // near the global cap
+  std::string v(kMaxMsg - 1, 'c');  // near the global raw-value cap
   ASSERT_TRUE(c.Put("full-size", v.data(), v.size()));
   std::string got(v.size(), '\0');
   ASSERT_TRUE(c.Get("full-size", got.data(), got.size()));

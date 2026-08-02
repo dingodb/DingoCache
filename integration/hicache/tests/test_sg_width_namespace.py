@@ -1,13 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for SG-width key namespacing in the HiCache backend.
-
-Regression: `_flatten_device` used to always emit "@sg{n}" regardless of the
-negotiated SG width. Two instances on one ring that negotiate DIFFERENT
-widths (e.g. mixed HCA fleet) would read each other's chunk keys and
-silently reassemble the wrong bytes — same key string, different layer
-spans, no error signal. Non-default widths now use "@sgw{W}.{n}"; the
-historical default (29) keeps "@sg{n}" so existing cached pages stay
-reachable. Mirrors the vLLM connector's `_sg_group_key` policy.
+The SG width is part of the canonical v2 key. Two instances on one ring that
+negotiate different widths (for example, on a mixed-HCA fleet) must never read
+each other's chunks and silently reassemble the wrong bytes.
 
 These tests run WITHOUT SGLang/torch: a minimal shim module is installed so
 the plugin's import surface is satisfied, and DfkvHiCache is exercised via
@@ -22,6 +17,7 @@ or standalone:
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import os
 import sys
 import types
@@ -126,6 +122,11 @@ def _mk_instance(width: int, mla: bool = True):
     inst.tp_size = 8
     inst.enable_pp = False
     inst.pp_rank = 0
+    inst.pp_size = 1
+    inst.pcp_size = 1
+    inst.pcp_rank = 0
+    inst.dcp_size = 1
+    inst.dcp_rank = 0
     inst.mem_pool_device = object()  # non-None → device (L2-bypass) mode
     inst._metrics = _FakeMetrics()
     inst._alog_tag = "test"
@@ -139,25 +140,52 @@ def _mk_instance(width: int, mla: bool = True):
 
 
 class TestSgGroupKey(unittest.TestCase):
-    def test_default_width_keeps_legacy_suffix(self):
+    def test_default_width_is_explicit(self):
         inst = _mk_instance(29)
-        self.assertEqual(inst._sg_group_key("K", 0), "K@sg0")
-        self.assertEqual(inst._sg_group_key("K", 2), "K@sg2")
+        self.assertEqual(
+            inst._sg_group_key(b"K\x00\xff", 0),
+            H.sg_key(b"K\x00\xff", 29, 0))
+        self.assertEqual(
+            inst._sg_group_key(b"K\x00\xff", 2),
+            H.sg_key(b"K\x00\xff", 29, 2))
 
     def test_nondefault_width_gets_own_namespace(self):
         inst = _mk_instance(4)
-        self.assertEqual(inst._sg_group_key("K", 0), "K@sgw4.0")
+        self.assertEqual(
+            inst._sg_group_key(b"K", 0), H.sg_key(b"K", 4, 0))
         inst63 = _mk_instance(63)
-        self.assertEqual(inst63._sg_group_key("K", 1), "K@sgw63.1")
+        self.assertEqual(
+            inst63._sg_group_key(b"K", 1), H.sg_key(b"K", 63, 1))
 
-    def test_width_detect_failure_falls_back_to_legacy_namespace(self):
+    def test_width_detect_failure_uses_explicit_default_width(self):
         class _DeadLib:
             def dfkv_max_sg_segs(self, _h):
                 raise RuntimeError("old lib")
 
         inst = _mk_instance(29)
         inst._lib = _DeadLib()
-        self.assertEqual(inst._sg_group_key("K", 0), "K@sg0")
+        self.assertEqual(
+            inst._sg_group_key(b"K", 0), H.sg_key(b"K", 29, 0))
+
+    def test_binary_key_log_label_is_digest_only(self):
+        label = H._key_label(b"\xff\x00raw-secret")
+        self.assertRegex(label, r"^len=12 sha256=[0-9a-f]{16}$")
+        self.assertNotIn("raw-secret", label)
+
+    def test_register_memory_checks_and_surfaces_native_failure(self):
+        seen = []
+
+        class FakeLib:
+            def dfkv_register_memory(self, _h, base, size):
+                seen.append((base.value, size.value))
+                return -1
+
+        inst = _mk_instance(29)
+        inst._lib = FakeLib()
+        with self.assertLogs(H._log.name, level="WARNING") as logs:
+            self.assertFalse(inst.register_memory(0x1000, 4096))
+        self.assertEqual(seen, [(0x1000, 4096)])
+        self.assertIn("rc=-1", logs.output[0])
 
 
 class TestFlattenDeviceKeyNames(unittest.TestCase):
@@ -169,27 +197,29 @@ class TestFlattenDeviceKeyNames(unittest.TestCase):
         sizes = [512] * nlayers
         return ptrs, sizes
 
-    def test_legacy_namespace_when_default_width(self):
+    def test_default_width_uses_canonical_v2_key(self):
         inst = _mk_instance(29)
         nl = 13
         ptrs, sizes = self._seglists(nl)
-        stride, sks, sp, ss = inst._flatten_device(["hash0"], [ptrs], [sizes])
-        self.assertEqual(sks, ["GLM-TEST/hash0_k@sg0"])
+        stride, sks, sp, ss = inst._flatten_device(
+            [b"hash\x00\xff"], [ptrs], [sizes])
+        base = H.pool_key(
+            b"hash\x00\xff", tp_size=8, tp_rank=-1, component="all")
+        self.assertEqual(sks, [H.sg_key(base, 29, 0)])
         self.assertEqual(stride, 1)
-        self.assertEqual(len(sp[0]), nl)  # single chunk holds all layers
+        self.assertEqual(len(sp[0]), nl)
 
     def test_namespaced_chunking_when_narrow(self):
         inst = _mk_instance(4)
         nl = 13
         ptrs, sizes = self._seglists(nl)
-        stride, sks, sp, ss = inst._flatten_device(["hash0"], [ptrs], [sizes])
+        stride, sks, sp, ss = inst._flatten_device(
+            ["hash0"], [ptrs], [sizes])
+        base = H.pool_key(
+            "hash0", tp_size=8, tp_rank=-1, component="all")
         self.assertEqual(
-            sks,
-            ["GLM-TEST/hash0_k@sgw4.0", "GLM-TEST/hash0_k@sgw4.1",
-             "GLM-TEST/hash0_k@sgw4.2", "GLM-TEST/hash0_k@sgw4.3"],
-        )
+            sks, [H.sg_key(base, 4, group) for group in range(4)])
         self.assertEqual(stride, 4)
-        # chunk segment slicing must follow the same width
         self.assertEqual([len(p) for p in sp], [4, 4, 4, 1])
         self.assertEqual(sp[0], ptrs[0:4])
         self.assertEqual(sp[3], ptrs[12:13])
@@ -197,16 +227,65 @@ class TestFlattenDeviceKeyNames(unittest.TestCase):
     def test_mha_pp_composition(self):
         inst = _mk_instance(4, mla=False)
         inst.enable_pp = True
+        inst.pp_size = 2
         inst.pp_rank = 1
-        nl = 3
-        ptrs, sizes = self._seglists(nl)
+        ptrs, sizes = self._seglists(3)
         stride, sks, sp, ss = inst._flatten_device(
             ["hash0"], [ptrs, ptrs], [sizes, sizes])
-        self.assertEqual(
-            sks,
-            ["GLM-TEST/hash0_8_3_pp1_k@sgw4.0", "GLM-TEST/hash0_8_3_pp1_v@sgw4.0"],
-        )
-        self.assertEqual(stride, 2)  # sub=2 objects, one chunk each
+        expected = [
+            H.sg_key(
+                H.pool_key(
+                    "hash0", tp_size=8, tp_rank=3,
+                    pp_size=2, pp_rank=1, component=component),
+                4, 0,
+            )
+            for component in ("k", "v")
+        ]
+        self.assertEqual(sks, expected)
+        self.assertEqual(stride, 2)
+
+class TestSgBinaryAbi(unittest.TestCase):
+    def test_sg_calls_keep_each_pointer_aligned_with_exact_length(self):
+        key = H.sg_key(
+            H.pool_key(b"hash\x00\xff", component=b"all\x00\xfe"), 4, 0)
+        seen = []
+
+        def assert_key(key_ptrs, key_lens):
+            self.assertEqual(list(key_lens), [len(key)])
+            self.assertEqual(
+                ctypes.string_at(key_ptrs[0], key_lens[0]), key)
+
+        class FakeLib:
+            def dfkv_batch_put_sg(
+                self, _h, key_ptrs, key_lens, ptrs, sizes,
+                num_segs, n, out,
+            ):
+                self_test.assertEqual(n, 1)
+                assert_key(key_ptrs, key_lens)
+                self_test.assertIs(out._type_, ctypes.c_int)
+                out[0] = 1
+                seen.append("put")
+                return 0
+
+            def dfkv_batch_get_auto_sg(
+                self, _h, key_ptrs, key_lens, ptrs, caps,
+                num_segs, n, out_hit, out_len,
+            ):
+                self_test.assertEqual(n, 1)
+                assert_key(key_ptrs, key_lens)
+                self_test.assertIs(out_hit._type_, ctypes.c_int)
+                out_hit[0], out_len[0] = 1, 8
+                seen.append("get")
+                return 0
+
+        self_test = self
+        inst = _mk_instance(4)
+        inst._lib = FakeLib()
+        self.assertEqual(inst._batch_put_sg(
+            [key], [[0x1000]], [[8]]), [True])
+        self.assertEqual(inst._batch_get_sg(
+            [key], [[0x2000]], [[8]]), ([1], [8]))
+        self.assertEqual(seen, ["put", "get"])
 
 
 class TestCrossWidthIsolation(unittest.TestCase):
@@ -215,7 +294,7 @@ class TestCrossWidthIsolation(unittest.TestCase):
 
     @staticmethod
     def _ring_from(inst, hash_name: str, nlayers: int, width: int):
-        """Simulate a "ring": the set of key strings `inst` would have written."""
+        """Simulate a ring containing the exact key bytes `inst` would write."""
         ptrs = [1000 * (i + 1) for i in range(nlayers)]
         sizes = [512] * nlayers
         _, sks, _, _ = inst._flatten_device([hash_name], [ptrs], [sizes])
@@ -237,33 +316,34 @@ class TestCrossWidthIsolation(unittest.TestCase):
     def test_cross_width_is_a_miss_not_a_corrupt_read(self):
         writer29 = _mk_instance(29)
         ring = self._ring_from(writer29, "hashX", 13, 29)
-
         reader4 = _mk_instance(4)
-        reader4._ring = ring  # sole key universe contains only @sg{n} keys
-
+        reader4._ring = ring
         sks, hits = self._probe(reader4, ["hashX"])
-        # the reader probes its own namespace (@sgw4.0) → nothing matches
-        self.assertEqual(sks, ["GLM-TEST/hashX_k@sgw4.0"])
+        base = H.pool_key(
+            "hashX", tp_size=8, tp_rank=-1, component="all")
+        self.assertEqual(sks, [H.sg_key(base, 4, 0)])
         self.assertEqual(hits, 0)
 
     def test_same_width_hits(self):
         writer = _mk_instance(4)
         ring = self._ring_from(writer, "hashX", 13, 4)
-
         reader = _mk_instance(4)
         reader._ring = ring
         sks, hits = self._probe(reader, ["hashX"])
-        self.assertEqual(sks, ["GLM-TEST/hashX_k@sgw4.0"])
+        base = H.pool_key(
+            "hashX", tp_size=8, tp_rank=-1, component="all")
+        self.assertEqual(sks, [H.sg_key(base, 4, 0)])
         self.assertEqual(hits, 1)
 
-    def test_default_width_still_finds_legacy_cached_pages(self):
+    def test_same_default_width_hits(self):
         writer = _mk_instance(29)
         ring = self._ring_from(writer, "hashX", 13, 29)
-
         reader = _mk_instance(29)
         reader._ring = ring
         sks, hits = self._probe(reader, ["hashX"])
-        self.assertEqual(sks, ["GLM-TEST/hashX_k@sg0"])
+        base = H.pool_key(
+            "hashX", tp_size=8, tp_rank=-1, component="all")
+        self.assertEqual(sks, [H.sg_key(base, 29, 0)])
         self.assertEqual(hits, 1)
 
 

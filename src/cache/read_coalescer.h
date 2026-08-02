@@ -12,12 +12,10 @@
  *    arrival ("leader") does the disk read into a shared scratch buffer, every
  *    overlapping arrival ("follower") blocks until it completes and memcpy()s
  *    from the scratch.
- *  - Asynchronous (the io_uring serve path, the production default since
- *    v1.27.0): TryRegisterAsync() at prep time creates the flight WITHOUT
- *    performing the read; the serve loop does the read out-of-band and calls
- *    CompleteAsync() with the payload, which hands it to any waiters. A
- *    duplicate GET's prep declines (token 0 / InFlight), falls back to the
- *    sync path, and joins the flight through Read() like any follower.
+ *  - Asynchronous (the io_uring serve path): TryRegisterAsync() creates the
+ *    flight during preparation. Its token is hidden inside the move-only
+ *    PreparedRead owner, whose Commit/destructor-abort calls CompleteAsync().
+ *    A duplicate prep declines and joins through synchronous Read().
  *
  * A follower waits at most WaitMs() (DFKV_READ_COALESCE_TIMEOUT_MS, default
  * 500 ms) and falls back to its OWN disk read on timeout or on a failed/
@@ -65,12 +63,12 @@ class ReadCoalescer {
   struct Key {
     uint64_t digest_hi;
     uint64_t digest_lo;
-    uint32_t domain;
+    uint64_t tenant_hash;
     uint64_t offset;
     uint64_t length;
     bool operator==(const Key& other) const {
       return digest_hi == other.digest_hi && digest_lo == other.digest_lo &&
-             domain == other.domain && offset == other.offset &&
+             tenant_hash == other.tenant_hash && offset == other.offset &&
              length == other.length;
     }
   };
@@ -81,7 +79,7 @@ class ReadCoalescer {
         hash ^= value + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
       };
       combine(std::hash<uint64_t>()(key.digest_lo));
-      combine(std::hash<uint32_t>()(key.domain));
+      combine(std::hash<uint64_t>()(key.tenant_hash));
       combine(std::hash<uint64_t>()(key.offset));
       combine(std::hash<uint64_t>()(key.length));
       return hash;
@@ -91,8 +89,7 @@ class ReadCoalescer {
   // True if an identical read is currently in flight (used by the async-prep
   // path as a cheap early decline, before the index lookup + fd open).
   bool InFlight(const BlockKey& bk, uint64_t offset, uint64_t length) {
-    Key k{bk.digest_hi, bk.digest_lo, static_cast<uint32_t>(bk.domain),
-          offset, length};
+    Key k{bk.digest_hi, bk.digest_lo, bk.tenant_hash, offset, length};
     std::lock_guard<std::mutex> lk(mu_);
     return map_.find(k) != map_.end();
   }
@@ -102,19 +99,19 @@ class ReadCoalescer {
   // flight — the caller then declines the async prep and joins via Read().
   // `whole_value` records whether this read covers the entire stored value
   // (offset 0, full length): only such reads are eligible for RAM promotion.
-  uint64_t TryRegisterAsync(const BlockKey& bk, uint64_t offset, uint64_t length,
-                            bool whole_value) {
-    Key k{bk.digest_hi, bk.digest_lo, static_cast<uint32_t>(bk.domain),
-          offset, length};
+  uint64_t TryRegisterAsync(const BlockKey& bk, uint64_t offset,
+                            uint64_t length, bool whole_value,
+                            size_t value_len = 0) {
+    Key k{bk.digest_hi, bk.digest_lo, bk.tenant_hash, offset, length};
     std::lock_guard<std::mutex> lk(mu_);
     if (map_.find(k) != map_.end()) return 0;
     auto f = std::make_shared<Flight>();
     f->key = k;
     f->whole = whole_value;
     f->leader_tid = std::this_thread::get_id();
-    // Recurrence window (v2): a convoy whose ranks drift past the in-flight
-    // window never produces a waiter, so v1's fan-in gate missed it entirely.
-    // A completed no-waiter whole read leaves a key FINGERPRINT (not payload —
+    f->value_len = value_len;
+    // A convoy whose ranks drift past the in-flight window never produces a
+    // waiter. A completed no-waiter whole read leaves a key fingerprint.
     // that is what keeps the window seconds-cheap) for RecurMs(); finding it
     // here means this same range is being read AGAIN within the window, which
     // is promotion evidence just as strong as an overlap.
@@ -192,8 +189,8 @@ class ReadCoalescer {
     f->cv.notify_all();
     leaders_.fetch_add(1, std::memory_order_relaxed);
     if (key)
-      *key = BlockKey{f->key.digest_hi, f->key.digest_lo,
-                      static_cast<KeyDomain>(f->key.domain)};
+      *key =
+          BlockKey{f->key.digest_hi, f->key.digest_lo, f->key.tenant_hash};
     if (whole) *whole = f->whole;
     if (recurrent) *recurrent = f->recurrent;
     return waiters;
@@ -206,16 +203,16 @@ class ReadCoalescer {
     bool had_waiters = false;
   };
 
-  // Execute `fill(buf, cap, out_len)` exactly once per concurrent set of
-  // identical (key, offset, length) readers; copy the result into every
-  // caller's dst. A follower that times out, joins its own thread's pending
-  // flight, or sees a failed/aborted flight runs its own fill instead.
+  using FillWithMetadata =
+      std::function<Status(char*, size_t, size_t*, size_t*)>;
+
+  // Execute `fill(buf, cap, out_len, value_len)` exactly once per concurrent
+  // set of identical readers. The stored length travels with the same storage
+  // snapshot as the bytes; followers never perform a racy second lookup.
   Status Read(const BlockKey& bk, uint64_t offset, uint64_t length, char* dst,
-              size_t dst_cap, size_t* out_len,
-              const std::function<Status(char*, size_t, size_t*)>& fill,
-              Outcome* oc = nullptr) {
-    Key k{bk.digest_hi, bk.digest_lo, static_cast<uint32_t>(bk.domain),
-          offset, length};
+              size_t dst_cap, size_t* out_len, size_t* out_value_len,
+              const FillWithMetadata& fill, Outcome* oc = nullptr) {
+    Key k{bk.digest_hi, bk.digest_lo, bk.tenant_hash, offset, length};
     std::shared_ptr<Flight> f;
     bool leader = false;
     {
@@ -235,8 +232,10 @@ class ReadCoalescer {
       // Aligned scratch: the fill may be an O_DIRECT read straight into it.
       f->data = AlignedAlloc(dst_cap);
       size_t n = 0;
-      Status st = f->data ? fill(f->data.get(), dst_cap, &n)
-                          : fill(dst, dst_cap, &n);  // alloc failed: no sharing
+      size_t value_len = 0;
+      Status st =
+          f->data ? fill(f->data.get(), dst_cap, &n, &value_len)
+                  : fill(dst, dst_cap, &n, &value_len);
       {
         std::lock_guard<std::mutex> lk(mu_);
         auto it = map_.find(k);
@@ -246,6 +245,7 @@ class ReadCoalescer {
         std::lock_guard<std::mutex> fl(f->m);
         f->st = st;
         f->len = n;
+        f->value_len = value_len;
         f->done = true;
       }
       f->cv.notify_all();
@@ -258,16 +258,17 @@ class ReadCoalescer {
         std::memcpy(dst, f->data.get(), n < dst_cap ? n : dst_cap);
         if (out_len) *out_len = n < dst_cap ? n : dst_cap;
       } else if (st == Status::kOk && out_len && !f->data) {
-        // fill wrote dst directly; *out_len was set by fill via &n above.
+        // fill wrote dst directly; `n` is its returned byte count.
         *out_len = n;
       }
+      if (st == Status::kOk && out_value_len) *out_value_len = value_len;
       return st;
     }
     // A pipelined duplicate on the flight's own serve thread: the leader's read
     // has not been submitted yet (async prep registers before the uring batch
     // runs), so waiting here would deadlock. Read it ourselves.
     if (f->leader_tid == std::this_thread::get_id())
-      return fill(dst, dst_cap, out_len);
+      return fill(dst, dst_cap, out_len, out_value_len);
     // Follower: wait (bounded) for the leader, then copy from the shared
     // buffer; on timeout / failure / abort, fall back to our own read.
     f->waiters.fetch_add(1, std::memory_order_acq_rel);
@@ -277,16 +278,19 @@ class ReadCoalescer {
                           [&] { return f->done; })) {
         timeouts_.fetch_add(1, std::memory_order_relaxed);
         fl.unlock();
-        return fill(dst, dst_cap, out_len);
+        return fill(dst, dst_cap, out_len, out_value_len);
       }
     }
-    if (f->st != Status::kOk || !f->data) return fill(dst, dst_cap, out_len);
+    if (f->st != Status::kOk || !f->data)
+      return fill(dst, dst_cap, out_len, out_value_len);
     const size_t c = f->len < dst_cap ? f->len : dst_cap;
     if (c) std::memcpy(dst, f->data.get(), c);
     if (out_len) *out_len = c;
+    if (out_value_len) *out_value_len = f->value_len;
     coalesced_.fetch_add(1, std::memory_order_relaxed);
     return Status::kOk;
   }
+
 
   size_t leaders() const { return leaders_.load(std::memory_order_relaxed); }
   size_t coalesced() const { return coalesced_.load(std::memory_order_relaxed); }
@@ -300,6 +304,7 @@ class ReadCoalescer {
     bool done = false;
     Status st = Status::kInvalid;
     size_t len = 0;
+    size_t value_len = 0;
     std::shared_ptr<char> data;  // 4096-aligned scratch (leader's read target)
     Key key{};
     bool whole = false;
@@ -336,7 +341,7 @@ class ReadCoalescer {
   // convoy (worst-case drift; production ranks are layer-locked) spreads a
   // page's reads over <=~500 ms, so 1s covers it with margin, and the window
   // holds fingerprints (64 B), not payloads, so seconds-scale is nearly free.
-  // DFKV_READ_COALESCE_RECUR_MS overrides; 0 disables (v1 overlap-only gate).
+  // DFKV_READ_COALESCE_RECUR_MS overrides; 0 disables recurrence tracking.
   static int RecurMs() {
     static const int ms = [] {
       int out = 1000;

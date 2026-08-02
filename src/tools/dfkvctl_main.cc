@@ -9,8 +9,7 @@
  *     The MDS now hands back each node's TCP stat port (MemberInfo.tcp_port), so stat --all
  *     reaches nodes automatically even in RDMA deploys. --stat-port <p> stays as a manual
  *     override (e.g. for older servers that predate tcp_port registration).
- * Geometry flags (must match the writer for get to hit): --model_hash --page_size
- *   --dtype_tag --layer_num --head_num --head_dim --mla 0|1 --tp_size --tp_rank */
+ * Native data commands require --namespace <model/raw-layout schema identity>. */
 #include <cstdlib>
 #include <cstdint>
 #include <cstdio>
@@ -24,7 +23,6 @@
 #include "common/membership.h"
 #include "utils/prom_parse.h"
 #include "transport/tcp_transport.h"
-#include "common/value_header.h"
 #include "common/version.h"
 #include "utils/wire_limits.h"
 
@@ -320,8 +318,7 @@ static std::vector<std::pair<std::string, std::string>> ParseMembers(const std::
 int main(int argc, char** argv) {
   if (WantsVersion(argc, argv)) { std::printf("dfkvctl %s\n", Version()); return 0; }
   std::string members;
-  uint64_t model_hash = 0x51;
-  uint32_t page = 64, dtype = 0x46384534u, layer = 78, head = 1, hd = 576, tps = 8, tpr = 0, mla = 1;
+  std::string key_namespace;
   std::string mds, group = "default";
   bool all = false;
   uint32_t stat_port = 0;  // override; 0 = use MDS-provided tcp_port, else the member's port
@@ -330,25 +327,16 @@ int main(int argc, char** argv) {
     std::string a = argv[i];
     // strtoull/strtoul (not stoull/stoul): the std:: variants THROW on a
     // non-numeric arg, terminating the tool; strto* return 0 instead.
-    auto nv = [&](uint64_t* d) { if (i + 1 < argc) *d = std::strtoull(argv[++i], nullptr, 0); };
     auto nv32 = [&](uint32_t* d) { if (i + 1 < argc) *d = (uint32_t)std::strtoul(argv[++i], nullptr, 0); };
     if (a == "--members" && i + 1 < argc) members = argv[++i];
     else if (a == "--mds" && i + 1 < argc) mds = argv[++i];
     else if (a == "--group" && i + 1 < argc) group = argv[++i];
     else if (a == "--all") all = true;
     else if (a == "--stat-port") nv32(&stat_port);
-    else if (a == "--model_hash") nv(&model_hash);
-    else if (a == "--page_size") nv32(&page);
-    else if (a == "--dtype_tag") nv32(&dtype);
-    else if (a == "--layer_num") nv32(&layer);
-    else if (a == "--head_num") nv32(&head);
-    else if (a == "--head_dim") nv32(&hd);
-    else if (a == "--tp_size") nv32(&tps);
-    else if (a == "--tp_rank") nv32(&tpr);
-    else if (a == "--mla") nv32(&mla);
+    else if (a == "--namespace" && i + 1 < argc) key_namespace = argv[++i];
     else pos.push_back(a);
   }
-  if (pos.empty()) { std::fprintf(stderr, "usage: dfkvctl [--members ...] put|get|exist|stat|stats|ring ...\n"); return 2; }
+  if (pos.empty()) { std::fprintf(stderr, "usage: dfkvctl [--members ...] [--namespace ...] put|get|exist|stat|stats|ring ...\n"); return 2; }
   const std::string& cmd = pos[0];
 
   if (cmd == "ring") return CmdRing(mds, group);
@@ -369,11 +357,8 @@ int main(int argc, char** argv) {
 
   auto mem = ParseMembers(members);
   if (mem.empty()) { std::fprintf(stderr, "need --members name=ip:port,...\n"); return 2; }
-  ValueHeader hdr = ValueHeader::Make(model_hash, page, dtype,
-                                      mla ? ValueHeader::kFlagIsMla : 0,
-                                      (uint16_t)tps, (uint16_t)tpr, (uint16_t)layer,
-                                      (uint16_t)head, (uint16_t)hd);
-  KVClient c(mem, hdr);
+  if (key_namespace.empty()) { std::fprintf(stderr, "need --namespace model/raw-layout-schema\n"); return 2; }
+  KVClient c(mem, key_namespace);
 
   if (cmd == "put" && pos.size() >= 3) {
     bool ok = c.Put(pos[1], pos[2].data(), pos[2].size());

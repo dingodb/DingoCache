@@ -5,7 +5,6 @@
 // rdma_loopback_test.
 #include "client/kv_client.h"
 #include "transport/transport.h"
-#include "common/value_header.h"
 #include "client/key_map.h"
 
 #include <gtest/gtest.h>
@@ -17,12 +16,6 @@
 using namespace dfkv;  // NOLINT
 
 namespace {
-ValueHeader Hdr(uint64_t payload_len) {
-  ValueHeader h = ValueHeader::Make(0x51ULL, 64, 0x46384534u, ValueHeader::kFlagIsMla,
-                                    8, 0, 78, 1, 576);
-  h.payload_len = payload_len;
-  return h;
-}
 
 // Pipelined transport that serves stored blobs only through RangeInto and counts
 // each entry point, so a test can prove GetAuto never falls back to Range here.
@@ -34,11 +27,18 @@ struct FakePipelinedTransport : Transport {
   bool pipelined() const override { return true; }
 
   Status Range(const std::string&, const BlockKey&, uint64_t, uint64_t,
-               std::string*) override {
-    ++range_calls;  // must stay 0 on the pipelined GetAuto path
+               std::string*, uint64_t*) override {
+    ++range_calls;
     return Status::kIOError;
   }
   Status Cache(const std::string&, const BlockKey&, const void*, size_t) override {
+    return Status::kOk;
+  }
+  Status Lookup(const std::string&, const BlockKey& key,
+                uint64_t* value_len) override {
+    auto it = blobs.find(key.Filename());
+    if (it == blobs.end()) return Status::kNotFound;
+    *value_len = it->second.size();
     return Status::kOk;
   }
   Status Exist(const std::string&, const BlockKey&, bool* e) override {
@@ -48,23 +48,19 @@ struct FakePipelinedTransport : Transport {
   std::vector<Status> RangeInto(const std::string& node,
                                 const std::vector<BlockKey>& keys,
                                 const std::vector<RangeDst>& dsts,
-                                size_t header_size,
-                                std::vector<std::string>* hdrs) override {
+                                std::vector<uint64_t>* value_lens) override {
     ++rangeinto_calls;
-    hdrs->assign(keys.size(), std::string());
+    value_lens->assign(keys.size(), 0);
     std::vector<Status> r(keys.size(), Status::kNotFound);
     for (size_t i = 0; i < keys.size(); ++i) {
       if (node == dead) { r[i] = Status::kIOError; continue; }
       auto it = blobs.find(keys[i].Filename());
-      if (it == blobs.end()) { r[i] = Status::kNotFound; continue; }
+      if (it == blobs.end()) continue;
       const std::string& payload = it->second;
-      // Header carries the TRUE stored length; payload scatters up to dsts[i].n.
-      ValueHeader h = Hdr(payload.size());
-      std::string hb(header_size, '\0');
-      h.Serialize(&hb[0]);
-      (*hdrs)[i] = hb;
-      size_t n = std::min(payload.size(), dsts[i].n);
-      if (n && dsts[i].payload) std::memcpy(dsts[i].payload, payload.data(), n);
+      (*value_lens)[i] = payload.size();
+      const size_t n = std::min(payload.size(), dsts[i].n);
+      if (n && dsts[i].payload)
+        std::memcpy(dsts[i].payload, payload.data(), n);
       r[i] = Status::kOk;
     }
     return r;
@@ -72,10 +68,7 @@ struct FakePipelinedTransport : Transport {
 };
 
 KVClient MakeClient(FakePipelinedTransport* t) {
-  return KVClient({{"n", "10.0.0.1:1"}},
-                  ValueHeader::Make(0x51ULL, 64, 0x46384534u, ValueHeader::kFlagIsMla,
-                                    8, 0, 78, 1, 576),
-                  t);
+  return KVClient({{"n", "10.0.0.1:1"}}, "test/model", t);
 }
 }  // namespace
 
@@ -83,7 +76,7 @@ TEST(GetAutoPipelined, VoidBufferUsesRangeIntoNotRange) {
   FakePipelinedTransport t;
   KVClient c = MakeClient(&t);
   std::string v(1234, 'p');
-  t.blobs[ToBlockKey("kv", 0x51ULL).Filename()] = v;
+  t.blobs[ToBlockKey("test/model", "kv").Filename()] = v;
 
   std::vector<char> buf(4096);
   size_t got = 0;
@@ -98,7 +91,7 @@ TEST(GetAutoPipelined, StringOverloadTrimsToTrueLength) {
   FakePipelinedTransport t;
   KVClient c = MakeClient(&t);
   std::string v(777, 'q');
-  t.blobs[ToBlockKey("ks", 0x51ULL).Filename()] = v;
+  t.blobs[ToBlockKey("test/model", "ks").Filename()] = v;
 
   std::string out;
   ASSERT_TRUE(c.GetAuto("ks", &out, 8192));
@@ -115,7 +108,7 @@ TEST(GetAutoPipelined, ValueLargerThanEightMiBIsServed) {
   KVClient c = MakeClient(&t);
   const size_t big = (10u << 20);  // 10 MiB > 8 MiB control_cap
   std::string v(big, 'B');
-  t.blobs[ToBlockKey("kbig", 0x51ULL).Filename()] = v;
+  t.blobs[ToBlockKey("test/model", "kbig").Filename()] = v;
 
   std::string out;
   ASSERT_TRUE(c.GetAuto("kbig", &out, 16u << 20));
@@ -128,7 +121,8 @@ TEST(GetAutoPipelined, ValueLargerThanEightMiBIsServed) {
 TEST(GetAutoPipelined, CapSmallerThanPayloadIsMiss) {
   FakePipelinedTransport t;
   KVClient c = MakeClient(&t);
-  t.blobs[ToBlockKey("kbig2", 0x51ULL).Filename()] = std::string(5000, 'z');
+  t.blobs[ToBlockKey("test/model", "kbig2").Filename()] =
+      std::string(5000, 'z');
 
   std::vector<char> buf(1024);
   size_t got = 0;

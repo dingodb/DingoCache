@@ -2,7 +2,6 @@
 #include "cache/kv_node_server.h"
 #include "mds/mds_server.h"
 #include "mds/mds_registrar.h"
-#include "common/value_header.h"
 #include "transport/wire.h"
 #include "utils/net_util.h"
 #include <gtest/gtest.h>
@@ -18,10 +17,7 @@ using namespace dfkv;  // NOLINT
 
 namespace {
 const char* EtcdEp() { return std::getenv("DFKV_TEST_ETCD"); }
-ValueHeader SelfHdr() {
-  return ValueHeader::Make(0x51ULL, 64, 0x46384534u, ValueHeader::kFlagIsMla,
-                           8, 0, 78, 1, 576);
-}
+std::string SelfHdr() { return "test/model"; }
 }  // namespace
 
 TEST(KvClientMds, DiscoversNodesAndRoundTrips) {

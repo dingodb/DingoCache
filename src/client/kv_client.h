@@ -1,12 +1,7 @@
 /* KVClient — the standalone DingoFS KV cache client used by the SGLang HiCache
- * plugin. Routes keys via consistent hash, wraps values with a ValueHeader
- * (model/page/dtype/layer geometry), and speaks to cache nodes via a Transport.
- *  - Put  -> SyncCache (durable-visible write, header-wrapped)
- *  - Get  -> Range + header geometry verify (mismatch => miss)
- *  - Exist-> local existence check on the owning node
- * NOTE: the header carries geometry, not a payload checksum (CRC was dropped in
- * v3). A geometry mismatch is caught, but silent payload bit-rot on the wire/disk
- * is not detected here — we rely on the underlying transport/filesystem. */
+ * plugin. Routes canonical SHA-256 identities through consistent hashing and
+ * stores caller values as opaque raw bytes. Model metadata belongs in the key;
+ * values carry no dfkv-owned envelope. */
 #ifndef DFKV_KV_CLIENT_H_
 #define DFKV_KV_CLIENT_H_
 
@@ -16,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -31,7 +27,6 @@
 #include "client/peer_health.h"
 #include "client/peer_latency.h"
 #include "transport/transport.h"
-#include "common/value_header.h"
 
 namespace dfkv {
 
@@ -66,23 +61,22 @@ struct KvGetItemSg {
 
 class KVClient {
  public:
-  // members: (node_name, "ip:port"). self_hdr: this engine's geometry identity.
-  // transport defaults to TcpTransport (owned) when nullptr.
+  // key_namespace is binary model/raw-layout identity. Canonical pool and
+  // per-object coordinates live in `key`; both byte strings are length-framed
+  // before hashing. Transport defaults when nullptr.
   KVClient(std::vector<std::pair<std::string, std::string>> members,
-           ValueHeader self_hdr, Transport* transport = nullptr);
+           std::string key_namespace, Transport* transport = nullptr,
+           std::optional<size_t> batch_concurrency_override = std::nullopt);
   ~KVClient();
 
   bool Put(const std::string& key, const void* value, size_t n);
   bool Get(const std::string& key, void* out, size_t n);  // true = hit (exact n)
-  // Variable-size get: learns payload length from the stored header. For CLI/
-  // tooling where the caller doesn't know the page size up front.
-  bool GetAuto(const std::string& key, std::string* out, size_t max_bytes = (64u << 20));
-  // Variable-size get into a caller buffer of capacity `cap`. On hit, writes the
-  // stored payload (whatever length it was Put with) and reports its true length
-  // via *out_len; returns false (miss) on geometry mismatch, route/health failure,
-  // or if the stored payload would not fit in `cap`. Unlike Get(), it does NOT
-  // require the caller to know the exact stored size — the LMCache connector uses
-  // it to read back variable-size (unfull) chunks.
+  // Variable-size get. The authoritative full stored size comes from the
+  // response prefix, separately from returned range bytes.
+  bool GetAuto(const std::string& key, std::string* out,
+               size_t max_bytes = (64u << 20));
+  // Variable-size get into a caller buffer. Returns false when the stored value
+  // does not fit; on success *out_len is the full stored size.
   bool GetAuto(const std::string& key, void* out, size_t cap, size_t* out_len);
   bool Exist(const std::string& key);
   // Drop a key from its owning node. true iff the node confirmed the op (the
@@ -107,14 +101,14 @@ class KVClient {
 
   // Scatter-gather batch put: each key gathers its N source segments into one
   // stored blob (sum of sizes). Mirrors BatchPut (consistent-hash routing per key,
-  // group by node, zero-copy multi-SGE gather on RDMA). Per-item result. A key
-  // with more segments than the RDMA transport can carry in one work request
-  // (max_sge-1) is reported as failed (false) rather than corrupted.
+  // group by node, zero-copy multi-SGE gather where supported). Per-item result.
+  // A key exceeding the active transport's runtime segment limit, or whose byte
+  // sum overflows size_t, is reported failed rather than routed.
   std::vector<bool> BatchPutSg(const std::vector<KvPutItemSg>& items);
   // Scatter-gather variable-size batch get: each key's stored blob is scattered
-  // across its N destination segments in order (the segment sizes define the
-  // split). Mirrors BatchGetAuto: accepts any stored size <= sum(caps); out_lens
-  // (if non-null) receives the true stored payload length per key (0 on miss).
+  // across its N destination segments in order. Mirrors BatchGetAuto: accepts a
+  // stored size <= the checked sum(caps); overflow or a runtime segment-limit
+  // violation is a miss. out_lens receives the true length (0 on miss).
   std::vector<bool> BatchGetAutoSg(const std::vector<KvGetItemSg>& items,
                                    std::vector<size_t>* out_lens);
 
@@ -128,15 +122,17 @@ class KVClient {
     batch_concurrency_.store(n, std::memory_order_relaxed);
   }
 
-  // Register a large caller memory region (e.g. the whole SGLang host KV pool) for
-  // zero-copy transfer, so Put/Get never do a per-op RDMA MR registration — every
-  // buffer inside the region resolves to the pre-registered pool MR. No-op on TCP.
-  // Call once at startup (after the pool is allocated) before traffic.
-  void RegisterMemory(void* base, size_t size) { t_->RegisterMemory(base, size); }
+  // Register a large caller memory region (e.g. the whole SGLang host KV pool)
+  // for zero-copy transfer, so Put/Get resolve every covered buffer to the
+  // pre-registered pool MR. Returns false when RDMA cannot register the full
+  // range; copying transports such as TCP return true without work.
+  bool RegisterMemory(void* base, size_t size) {
+    return t_->RegisterMemory(base, size);
+  }
 
-  // Max payload segments per scatter-gather key on the LIVE transport (RDMA:
-  // negotiated max_sge - 1; TCP: 29). Connectors size their SG chunking from
-  // this (via dfkv_max_sg_segs) instead of hard-coding the ConnectX-era 29.
+  // Runtime payload-segment limit reported by the active transport. Connectors
+  // query this through dfkv_max_sg_segs and must not assume a fixed HCA or
+  // transport capability.
   size_t MaxSgPayloadSegs() const { return t_->MaxSgPayloadSegs(); }
 
   // Hot-swap the cluster membership (rebuilds the consistent-hash ring).
@@ -169,8 +165,8 @@ class KVClient {
   bool RefreshMembers(const std::string& seed_addr);
 
   // Client-side Prometheus metrics text (ops served, IO errors, peer health
-  // transitions, per-peer errors, per-peer latency) plus transport-level
-  // counters (RDMA per-rail connections, MR regions). Surfaced via the C ABI.
+  // transitions, per-peer errors, per-peer latency) plus transport-level pool,
+  // RDMA rail, and memory-registration counters. Surfaced via the C ABI.
   std::string MetricsSnapshot() const;
   const std::string& TransportMode() const { return transport_reason_; }
 
@@ -190,29 +186,37 @@ class KVClient {
   // (added/removed node ids) vs the previously-adopted view. Shared by both
   // SetMembers overloads so static and MDS-discovery paths log identically.
   void AdoptRing(ConHash ring, std::map<std::string, std::string> addr);
-  // The plain (no-dedup) batch bodies; the public methods wrap them with the
-  // same-host rendezvous when DFKV_CLIENT_NODE_DEDUP=1 (see node_dedup.h).
+  // Scalar transport bodies. Public scalar methods add exactly one metric;
+  // TCP batch fan-out calls these bodies so it cannot double-count each key.
+  bool PutDirect(const std::string& key, const void* value, size_t n);
+  bool GetDirect(const std::string& key, void* out, size_t n);
+  bool GetAutoDirect(const std::string& key, std::string* out,
+                     size_t max_bytes);
+  bool GetAutoDirect(const std::string& key, void* out, size_t cap,
+                     size_t* out_len);
+  bool ExistDirect(const std::string& key, Status* status);
+  bool RemoveDirect(const std::string& key);
+  void InvalidateRendezvous(const BlockKey& key);
+
+  // Plain batch bodies; public methods own the one metric record across direct
+  // and rendezvous paths.
   std::vector<bool> BatchGetDirect(const std::vector<KvGetItem>& items);
   std::vector<bool> BatchGetAutoDirect(const std::vector<KvGetItem>& items,
                                        std::vector<size_t>* out_lens);
   std::vector<bool> BatchGetAutoSgDirect(const std::vector<KvGetItemSg>& items,
                                          std::vector<size_t>* out_lens);
-  std::vector<bool> BatchExistDirect(const std::vector<std::string>& keys);
-  // Lazily opens the GPU rendezvous on the first SG batch carrying a device
-  // destination; the hint pointer selects the primary context to bind when
-  // the calling (transfer) thread has none. nullptr = feature off. Init is
-  // once-only; metrics readers use gpu_dedup_raw_.
+  std::vector<bool> BatchExistDirect(const std::vector<std::string>& keys,
+                                     std::vector<Status>* statuses);
   GpuNodeDedup* GpuDedup(const void* device_dst_hint);
-  // Record a batch op (hits = count of true flags) into op_stats_ and return the
-  // per-item result vector. Called at each batch method's return point.
   std::vector<bool> RecordBatch(OpMetrics::Op op,
                                 std::chrono::steady_clock::time_point t0,
-                                const std::vector<char>& flags, uint64_t bytes);
+                                std::vector<bool> flags, uint64_t bytes);
 
   mutable std::mutex ring_mu_;  // guards ring_ + addr_
   ConHash ring_;
   std::map<std::string, std::string> addr_;  // name -> ip:port
-  ValueHeader self_hdr_;
+  std::string key_namespace_;
+  uint64_t namespace_hash_ = 0;
   std::unique_ptr<Transport> owned_;
   Transport* t_;
   std::string transport_reason_ = "unknown";
@@ -232,7 +236,8 @@ class KVClient {
   std::atomic<GpuNodeDedup*> gpu_dedup_raw_{nullptr};
   std::unique_ptr<MdsRegistrar> client_registrar_;  // consumer identity lease (best-effort)
   PeerHealth health_;
-  OpMetrics op_stats_;  // per-op (put/get/exist) counters + latency, snapshot'd
+  OpMetrics op_stats_;  // every public put/get/exist/remove call, exactly once
+  int get_miss_retries_ = 1;
 
   // Active per-peer latency prober (off the datapath; own thread).
   PeerLatency peer_lat_;

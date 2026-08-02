@@ -35,21 +35,25 @@ BlockKey K(uint64_t id) { return BlockKey{id, 0}; }
 TEST(ReadCoalescer, AsyncFlightHandsPayloadToFollower) {
   ReadCoalescer c;
   const std::string v = "payload-bytes";
-  uint64_t t = c.TryRegisterAsync(K(1), 0, v.size(), /*whole_value=*/true);
+  uint64_t t = c.TryRegisterAsync(K(1), 0, v.size(),
+                                  /*whole_value=*/true, /*value_len=*/97);
   ASSERT_NE(t, 0u);
   ASSERT_TRUE(c.InFlight(K(1), 0, v.size()));
 
   std::atomic<int> own_reads{0};
   std::string got(v.size(), '\0');
   size_t got_len = 0;
+  size_t got_value_len = 0;
   std::thread follower([&] {
-    Status st = c.Read(K(1), 0, v.size(), &got[0], got.size(), &got_len,
-                       [&](char* buf, size_t, size_t* n) {
-                         own_reads.fetch_add(1);
-                         std::memcpy(buf, v.data(), v.size());
-                         *n = v.size();
-                         return Status::kOk;
-                       });
+    Status st = c.Read(
+        K(1), 0, v.size(), &got[0], got.size(), &got_len, &got_value_len,
+        [&](char* buf, size_t, size_t* n, size_t* value_len) {
+          own_reads.fetch_add(1);
+          std::memcpy(buf, v.data(), v.size());
+          *n = v.size();
+          *value_len = 1;
+          return Status::kOk;
+        });
     EXPECT_EQ(st, Status::kOk);
   });
   // Give the follower time to join the flight, then complete it.
@@ -61,6 +65,7 @@ TEST(ReadCoalescer, AsyncFlightHandsPayloadToFollower) {
   EXPECT_EQ(own_reads.load(), 0);  // served from the flight, no duplicate read
   EXPECT_EQ(got, v);
   EXPECT_EQ(got_len, v.size());
+  EXPECT_EQ(got_value_len, 97u);
   EXPECT_EQ(key.digest_hi, 1u);
   EXPECT_TRUE(whole);
   EXPECT_EQ(c.coalesced(), 1u);
@@ -92,8 +97,8 @@ TEST(ReadCoalescer, AbortedFlightFollowerFallsBackToOwnRead) {
   char buf[4];
   size_t n = 0;
   std::thread follower([&] {
-    Status st = c.Read(K(4), 0, 4, buf, sizeof(buf), &n,
-                       [&](char* b, size_t, size_t* on) {
+    Status st = c.Read(K(4), 0, 4, buf, sizeof(buf), &n, nullptr,
+                       [&](char* b, size_t, size_t* on, size_t*) {
                          own_reads.fetch_add(1);
                          std::memcpy(b, "sane", 4);
                          *on = 4;
@@ -118,8 +123,8 @@ TEST(ReadCoalescer, WaiterTimeoutFallsBackToOwnRead) {
   char buf[4];
   size_t n = 0;
   std::thread follower([&] {
-    Status st = c.Read(K(5), 0, 4, buf, sizeof(buf), &n,
-                       [&](char* b, size_t, size_t* on) {
+    Status st = c.Read(K(5), 0, 4, buf, sizeof(buf), &n, nullptr,
+                       [&](char* b, size_t, size_t* on, size_t*) {
                          own_reads.fetch_add(1);
                          std::memcpy(b, "wake", 4);
                          *on = 4;
@@ -143,8 +148,8 @@ TEST(ReadCoalescer, SameThreadDuplicateReadsItselfImmediately) {
   char buf[4];
   size_t n = 0;
   const auto t0 = std::chrono::steady_clock::now();
-  Status st = c.Read(K(6), 0, 4, buf, sizeof(buf), &n,
-                     [&](char* b, size_t, size_t* on) {
+  Status st = c.Read(K(6), 0, 4, buf, sizeof(buf), &n, nullptr,
+                     [&](char* b, size_t, size_t* on, size_t*) {
                        std::memcpy(b, "self", 4);
                        *on = 4;
                        return Status::kOk;
@@ -166,8 +171,8 @@ TEST(ReadCoalescer, SyncLeaderReportsFanIn) {
   std::string lbuf(v.size(), '\0');
   size_t ln = 0;
   std::thread leader([&] {
-    c.Read(K(7), 0, v.size(), &lbuf[0], lbuf.size(), &ln,
-           [&](char* b, size_t, size_t* on) {
+    c.Read(K(7), 0, v.size(), &lbuf[0], lbuf.size(), &ln, nullptr,
+           [&](char* b, size_t, size_t* on, size_t*) {
              leader_entered.store(true);
              std::this_thread::sleep_for(100ms);  // hold the flight open
              fills.fetch_add(1);
@@ -180,8 +185,8 @@ TEST(ReadCoalescer, SyncLeaderReportsFanIn) {
   while (!leader_entered.load()) std::this_thread::sleep_for(1ms);
   std::string fbuf(v.size(), '\0');
   size_t fn = 0;
-  Status st = c.Read(K(7), 0, v.size(), &fbuf[0], fbuf.size(), &fn,
-                     [&](char* b, size_t, size_t* on) {
+  Status st = c.Read(K(7), 0, v.size(), &fbuf[0], fbuf.size(), &fn, nullptr,
+                     [&](char* b, size_t, size_t* on, size_t*) {
                        fills.fetch_add(1);
                        std::memcpy(b, v.data(), v.size());
                        *on = v.size();

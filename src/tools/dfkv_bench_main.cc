@@ -17,29 +17,31 @@
  * unique key ("dfkv-bench-<i>") so the write-once cache never collides. Reports
  * aggregate GB/s and per-call p50/p99/max latency for the PUT and GET phases.
  *
- * --key-seed S pins the key namespace to S instead of the default pid, so the
+ * --key-seed S pins the object-key set to S instead of the default pid, so
  * phases can run in DIFFERENT processes or on DIFFERENT nodes: `--op put
  * --key-seed x` on node A, then `--op get --key-seed x` (same --size/--count)
- * on node B measures the cross-node read path (the PD "prefill writes, decode
- * reads" shape). With an explicit seed, re-running PUT with the same seed+size
- * hits the write-once dedup and measures nothing -- pick a fresh seed per
- * experiment (the pid default exists precisely to make reruns collision-free). */
+ * on node B measures the cross-node read path. With an explicit seed,
+ * re-running PUT with the same seed+size hits write-once dedup and measures
+ * nothing; pick a fresh seed per experiment.
+ * The pid default keeps ordinary reruns collision-free. */
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
 #include "client/kv_client.h"
 #include "transport/transport_factory.h"
-#include "common/value_header.h"
 #include "common/version.h"
 
 using namespace dfkv;  // NOLINT
@@ -73,6 +75,22 @@ static std::vector<std::string> SplitComma(const std::string& s) {
     i = c + 1;
   }
   return out;
+}
+
+static bool ParseSize(const char* text, size_t* value) {
+  if (text == nullptr || *text == '\0') return false;
+  const char* end = text + std::strlen(text);
+  auto parsed = std::from_chars(text, end, *value);
+  return parsed.ec == std::errc{} && parsed.ptr == end;
+}
+
+static void PrintUsage(FILE* stream) {
+  std::fprintf(
+      stream,
+      "usage: dfkv_bench (--members name=ip:port,... | --mds ip:port,... [--group g])\n"
+      "                  [--size BYTES] [--count N] [--threads T] [--batch B]\n"
+      "                  [--bc N] [--op put|get|both] [--key-seed S]\n"
+      "                  [--ready-timeout SECS]\n");
 }
 
 static double Pct(std::vector<double>& v, double p) {
@@ -115,24 +133,64 @@ static void Report(const char* phase, size_t count, size_t size, size_t threads,
 }
 
 int main(int argc, char** argv) {
-  if (dfkv::WantsVersion(argc, argv)) { std::printf("dfkv_bench %s\n", dfkv::Version()); return 0; }
+  if (argc == 2 && dfkv::WantsVersion(argc, argv)) {
+    std::printf("dfkv_bench %s\n", dfkv::Version());
+    return 0;
+  }
+  if (argc == 2 && dfkv::WantsHelp(argc, argv)) {
+    PrintUsage(stdout);
+    return 0;
+  }
   std::string members, mds, group = "default", op = "both", key_seed;
   size_t size = 2752512, count = 2000, threads = 8, batch = 1, bc = 0;
   size_t ready_timeout_s = 30, mds_poll_ms = 1000;
-  for (int i = 1; i + 1 < argc; i += 2) {
-    if (!std::strcmp(argv[i], "--members")) members = argv[i + 1];
-    else if (!std::strcmp(argv[i], "--mds")) mds = argv[i + 1];       // MDS discovery endpoints
-    else if (!std::strcmp(argv[i], "--group")) group = argv[i + 1];   // MDS ring group
-    else if (!std::strcmp(argv[i], "--ready-timeout")) ready_timeout_s = std::stoull(argv[i + 1]);
-    else if (!std::strcmp(argv[i], "--size")) size = std::stoull(argv[i + 1]);
-    else if (!std::strcmp(argv[i], "--count")) count = std::stoull(argv[i + 1]);
-    else if (!std::strcmp(argv[i], "--threads")) threads = std::stoull(argv[i + 1]);
-    else if (!std::strcmp(argv[i], "--batch")) batch = std::stoull(argv[i + 1]);
-    else if (!std::strcmp(argv[i], "--bc")) bc = std::stoull(argv[i + 1]);  // KVClient internal batch_concurrency
-    else if (!std::strcmp(argv[i], "--op")) op = argv[i + 1];
-    else if (!std::strcmp(argv[i], "--key-seed")) key_seed = argv[i + 1];
+  for (int i = 1; i < argc; i += 2) {
+    const char* flag = argv[i];
+    const bool known =
+        !std::strcmp(flag, "--members") || !std::strcmp(flag, "--mds") ||
+        !std::strcmp(flag, "--group") || !std::strcmp(flag, "--ready-timeout") ||
+        !std::strcmp(flag, "--size") || !std::strcmp(flag, "--count") ||
+        !std::strcmp(flag, "--threads") || !std::strcmp(flag, "--batch") ||
+        !std::strcmp(flag, "--bc") || !std::strcmp(flag, "--op") ||
+        !std::strcmp(flag, "--key-seed");
+    if (!known) {
+      std::fprintf(stderr, "unknown argument: %s\n", flag);
+      PrintUsage(stderr);
+      return 2;
+    }
+    if (i + 1 >= argc) {
+      std::fprintf(stderr, "missing value for %s\n", flag);
+      PrintUsage(stderr);
+      return 2;
+    }
+    const char* value = argv[i + 1];
+    if (!std::strcmp(flag, "--members")) members = value;
+    else if (!std::strcmp(flag, "--mds")) mds = value;
+    else if (!std::strcmp(flag, "--group")) group = value;
+    else if (!std::strcmp(flag, "--op")) op = value;
+    else if (!std::strcmp(flag, "--key-seed")) key_seed = value;
+    else {
+      size_t* target = nullptr;
+      if (!std::strcmp(flag, "--ready-timeout")) target = &ready_timeout_s;
+      else if (!std::strcmp(flag, "--size")) target = &size;
+      else if (!std::strcmp(flag, "--count")) target = &count;
+      else if (!std::strcmp(flag, "--threads")) target = &threads;
+      else if (!std::strcmp(flag, "--batch")) target = &batch;
+      else if (!std::strcmp(flag, "--bc")) target = &bc;
+      if (!ParseSize(value, target)) {
+        std::fprintf(stderr, "invalid numeric value for %s: %s\n", flag, value);
+        return 2;
+      }
+    }
   }
-  if (batch < 1) batch = 1;
+  if (op != "put" && op != "get" && op != "both") {
+    std::fprintf(stderr, "invalid --op: %s (expected put, get, or both)\n", op.c_str());
+    return 2;
+  }
+  if (size == 0 || count == 0 || threads == 0 || batch == 0) {
+    std::fprintf(stderr, "--size, --count, --threads, and --batch must be greater than zero\n");
+    return 2;
+  }
   // Ring membership: exactly one of a static --members list or --mds discovery.
   auto mem = ParseMembers(members);
   if (mem.empty() == mds.empty()) {
@@ -150,10 +208,7 @@ int main(int argc, char** argv) {
     std::printf("dfkv_bench transport=%s mds=%s group=%s\n",
                 reason.c_str(), mds.c_str(), group.c_str());
 
-  // GLM-5.1 / MLA geometry (matches dfkv_smoke / dfkvctl defaults)
-  ValueHeader hdr = ValueHeader::Make(0x51, 64, 0x46384534u, ValueHeader::kFlagIsMla,
-                                      8, 0, 78, 1, 576);
-  KVClient c(mem, hdr);   // empty members when discovering via MDS
+  KVClient c(mem, "dfkv/bench");  // empty members when discovering via MDS
   if (!mds.empty()) {
     // Populate the ring from MDS, then wait until it's usable (a warmup Put
     // succeeds) so the measured phases don't race discovery. Mirrors
@@ -181,35 +236,41 @@ int main(int argc, char** argv) {
 
   std::string val(size, '\0');
   for (size_t i = 0; i < size; ++i) val[i] = static_cast<char>(i & 0xFF);
-  // Unique key namespace per run (pid + size): dfkv is write-once (idempotent
-  // Cache), so a fixed key set would make reruns at a different --size skip the
-  // PUT (measuring nothing) and miss the GET (stored size != requested size) =>
-  // false fails. pid+size guarantees fresh keys each invocation. --key-seed
-  // replaces the pid so a GET in another process/node can find a prior PUT's
-  // keys (cross-node read benchmarks); the caller owns collision avoidance.
+  // Unique object-key set per run (pid + size): dfkv is write-once
+  // (idempotent Cache), so a fixed key set would make reruns at a different
+  // --size skip PUT and then miss GET on stored-length mismatch. pid+size
+  // guarantees fresh keys. --key-seed replaces pid so another process/node can
+  // find a prior PUT; the caller owns collision avoidance.
   const std::string run_id =
       "dfkv-bench-" +
       (key_seed.empty() ? std::to_string(static_cast<long>(getpid())) : key_seed) +
       "-" + std::to_string(size) + "-";
   auto key = [&run_id](size_t i) { return run_id + std::to_string(i); };
-  const size_t units = (count + batch - 1) / batch;
+  const size_t units = count / batch + (count % batch != 0);
 
   std::vector<double> lat;
   std::atomic<size_t> fails{0};
+  size_t total_fails = 0;
 
   if (op == "put" || op == "both") {
-    fails = 0;
+    fails.store(0);
     double s = RunPhase(units, threads, [&](size_t u) {
       size_t base = u * batch, w = std::min(batch, count - base);
       std::vector<KvPutItem> items(w);
       for (size_t j = 0; j < w; ++j) items[j] = {key(base + j), val.data(), val.size()};
       auto oks = c.BatchPut(items);
-      size_t f = 0; for (bool ok : oks) if (!ok) ++f; return f;
+      size_t succeeded = 0;
+      for (size_t j = 0; j < std::min(w, oks.size()); ++j) {
+        if (oks[j]) ++succeeded;
+      }
+      return w - succeeded;
     }, &lat, &fails);
-    Report("PUT", count, size, threads, batch, s, lat, fails.load());
+    const size_t phase_fails = fails.load();
+    Report("PUT", count, size, threads, batch, s, lat, phase_fails);
+    total_fails += phase_fails;
   }
   if (op == "get" || op == "both") {
-    fails = 0;
+    fails.store(0);
     // One contiguous, page-aligned destination arena for ALL threads, declared
     // once via RegisterMemory: every dst then resolves to the pre-registered
     // pool MR (the production connectors' registered-host-pool shape). The old
@@ -221,7 +282,10 @@ int main(int argc, char** argv) {
     // allocation fails.
     const size_t stride = (size + 4095) & ~size_t{4095};
     char* arena = static_cast<char*>(std::aligned_alloc(4096, threads * batch * stride));
-    if (arena) c.RegisterMemory(arena, threads * batch * stride);
+    if (arena && !c.RegisterMemory(arena, threads * batch * stride)) {
+      std::free(arena);
+      arena = nullptr;
+    }
     std::atomic<size_t> arena_slot{0};
     double s = RunPhase(units, threads, [&](size_t u) {
       size_t base = u * batch, w = std::min(batch, count - base);
@@ -250,10 +314,16 @@ int main(int argc, char** argv) {
           std::fprintf(stderr, "STALL %.3f dur=%.1fms u=%zu\n",
                        std::chrono::duration<double>(st1.time_since_epoch()).count(), ms, u);
       }
-      size_t f = 0; for (bool h : hits) if (!h) ++f; return f;
+      size_t succeeded = 0;
+      for (size_t j = 0; j < std::min(w, hits.size()); ++j) {
+        if (hits[j]) ++succeeded;
+      }
+      return w - succeeded;
     }, &lat, &fails);
-    Report("GET", count, size, threads, batch, s, lat, fails.load());
+    const size_t phase_fails = fails.load();
+    Report("GET", count, size, threads, batch, s, lat, phase_fails);
+    total_fails += phase_fails;
     std::free(arena);
   }
-  return 0;
+  return total_fails == 0 ? 0 : 1;
 }

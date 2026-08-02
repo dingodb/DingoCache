@@ -1,22 +1,14 @@
 """Device-pointer dfkv client for the vLLM connector.
 
-Every buffer here is a raw integer pointer -- a slice of the GPU paged KV cache
-that was pre-registered via :meth:`register_memory`. This differs from the
-LMCache integration's ``native_client`` (which operates on host ``memoryview``s):
-the vLLM connector hands GPU device pointers, so we call the C ABI with
-``c_void_p(int)`` directly.
-
-Validated facts (hd04 H100 + IB, nvidia-peermem loaded):
-  * ``register_memory`` accepts a CUDA device pointer -> GPUDirect MR.
-  * GPU buffers MUST go through the batch path (``batch_get``); the single
-    ``dfkv_get_auto`` computes a CRC over the destination on the CPU and
-    segfaults on device memory.
-  * The member address MUST point at the server's RDMA bootstrap port
-    (``--rdma-port``), not the main ``--port``, when ``DFKV_RDMA=1``.
+Every value buffer is a raw integer GPU pointer pre-registered through
+``register_memory``. The native ABI stores opaque bytes and returns authoritative
+stored lengths separately; it never dereferences device memory on the CPU.
 """
 import ctypes
 import os
+import threading
 from typing import Optional, Sequence
+from dfkv_common import make_client_options_v2, make_key_array
 
 from ._cabi import load_lib, native_version
 from .client_stats import ClientStatsPoller, read_snapshot
@@ -28,15 +20,9 @@ from ._telemetry import metrics as _push_metrics
 from ._telemetry import tracing as _push_tracing
 
 c_void_p = ctypes.c_void_p
-c_char_p = ctypes.c_char_p
 c_uint64 = ctypes.c_uint64
-c_uint32 = ctypes.c_uint32
 c_int = ctypes.c_int
 
-# dfkv geometry guard fields (src/common/value_header.h). Default 0 = no geometry guard;
-# isolation is by model_hash + key namespace. A KV pool sharing one model_hash
-# must share kv-cache-dtype / page-size / layout (see dfkv sharing-safety notes).
-_GEOMETRY_ZEROS = (0,) * 8
 
 
 def _env_rank() -> int:
@@ -58,10 +44,9 @@ class DfkvDeviceClient:
     def __init__(
         self,
         members: str = "",
-        model_hash: int = 0,
+        key_namespace: bytes = b"",
         lib_path: Optional[str] = None,
-        batch_concurrency: int = 0,  # 0 = library default (>=1.20 auto-scales)
-        geometry: Sequence[int] = _GEOMETRY_ZEROS,
+        batch_concurrency: int = 0,
         mds_endpoints: str = "",
         mds_group: str = "default",
         mds_poll_ms: int = 3000,
@@ -70,56 +55,58 @@ class DfkvDeviceClient:
         client_info: str = "",
         client_heartbeat_ms: int = 10000,
     ):
-        if len(geometry) != 8:
-            raise ValueError("geometry must have exactly 8 fields")
+        if not key_namespace:
+            raise ValueError("DfkvDeviceClient requires a non-empty key namespace")
         if not members and not mds_endpoints:
             raise ValueError(
                 "DfkvDeviceClient needs 'mds_endpoints' (MDS discovery) or "
                 "'members' (static list)"
             )
+        self._close_lock = threading.Lock()
         self._lib = load_lib(lib_path)
-        # MDS path opens with an empty/seed member list and lets discovery build
-        # the ring; the static path opens directly with the given members.
-        self._h = self._lib.dfkv_open(
-            members.encode(),
-            c_uint64(model_hash & 0xFFFFFFFFFFFFFFFF),
-            *(c_uint32(int(g) & 0xFFFFFFFF) for g in geometry),
+        # ABI v2 constructs one fully configured handle: static membership or
+        # MDS discovery, batch fan-out, and optional client registration become
+        # visible together instead of mutating a partially initialized client.
+        self._key_namespace = bytes(key_namespace)
+        options = make_client_options_v2(
+            self._key_namespace,
+            members=members,
+            batch_concurrency=batch_concurrency,
+            mds_endpoints=mds_endpoints,
+            mds_group=mds_group,
+            mds_poll_ms=mds_poll_ms,
+            register_client=bool(
+                client_register and client_id and mds_endpoints),
+            client_id=client_id,
+            client_info=client_info,
+            client_heartbeat_ms=client_heartbeat_ms,
         )
+        self._h = self._lib.dfkv_open_v2(ctypes.byref(options))
         if not self._h:
             raise RuntimeError(
-                f"dfkv_open failed (members={members!r}, mds={mds_endpoints!r})"
+                "dfkv_open_v2 failed "
+                f"(members={members!r}, mds={mds_endpoints!r})"
             )
-        if batch_concurrency > 0:
-            self._lib.dfkv_set_batch_concurrency(self._h, c_uint64(batch_concurrency))
-        if mds_endpoints:
-            rc = self._lib.dfkv_start_mds_discovery(
-                self._h, mds_endpoints.encode(), mds_group.encode(), int(mds_poll_ms)
+        try:
+            mode = self._lib.dfkv_transport_mode(self._h)
+        except Exception as exc:
+            rejected_handle = self._h
+            self._h = None
+            self._lib.dfkv_close(rejected_handle)
+            raise RuntimeError(
+                "DfkvDeviceClient requires GPUDirect RDMA transport, but "
+                "dfkv_transport_mode failed; set DFKV_RDMA=1 and configure "
+                "a usable RDMA device"
+            ) from exc
+        if mode != b"rdma":
+            rejected_handle = self._h
+            self._h = None
+            self._lib.dfkv_close(rejected_handle)
+            raise RuntimeError(
+                "DfkvDeviceClient requires GPUDirect RDMA transport "
+                f"(dfkv_transport_mode returned {mode!r}); "
+                "set DFKV_RDMA=1 and configure a usable RDMA device"
             )
-            if rc != 0:
-                raise RuntimeError(
-                    f"dfkv_start_mds_discovery failed (rc={rc}, "
-                    f"mds={mds_endpoints!r}, group={mds_group!r})"
-                )
-            # Register this connector as a cache consumer so `dfkvctl clients` can
-            # answer "who is using dfkv". Best-effort: a missing symbol (older
-            # libdfkv.so) or a registration failure is logged, never fatal — the
-            # data path is already up via discovery above. Default on; opt out with
-            # client_register=False / DFKV_CLIENT_REGISTER=0.
-            if client_register and client_id:
-                try:
-                    rc = self._lib.dfkv_start_client_registration(
-                        self._h, mds_endpoints.encode(), mds_group.encode(),
-                        client_id.encode(),
-                        (client_info or "").encode(), int(client_heartbeat_ms))
-                    if rc != 0:
-                        raise RuntimeError(f"rc={rc}")
-                except AttributeError:
-                    pass  # older libdfkv.so without the symbol — skip silently
-                except Exception as e:  # noqa: BLE001 — never block startup
-                    import warnings
-                    warnings.warn(
-                        f"dfkv client registration skipped (mds={mds_endpoints!r}): {e}",
-                        stacklevel=2)
         # Unified fleet metrics pushed over OTLP to the central Collector (off by
         # default; zero cost when DFKV_METRICS_ENABLED is unset). Env-driven so it
         # needs no connector plumbing: set DFKV_METRICS_ENABLED + OTEL_*. Report
@@ -161,10 +148,10 @@ class DfkvDeviceClient:
         return self._lib.dfkv_transport_mode(self._h).decode()
 
     def max_sg_segs(self) -> int:
-        """Max payload segments one scatter-gather key may carry on the live
-        transport (RDMA: negotiated max_sge - 1; TCP: 29). Raises
-        AttributeError on an older libdfkv without the export — callers fall
-        back to the historical 29 (see worker._sg_segs_of)."""
+        """Return the negotiated RDMA payload-SGE width for one key.
+
+        Older native libraries may lack this export; the caller retains its
+        historical width fallback for key-geometry stability."""
         return int(self._lib.dfkv_max_sg_segs(self._h))
 
     def register_memory(self, base: int, size: int) -> None:
@@ -178,7 +165,7 @@ class DfkvDeviceClient:
                 )
 
     def batch_put(
-        self, keys: Sequence[str], ptrs: Sequence[int], sizes: Sequence[int]
+        self, keys: Sequence[bytes], ptrs: Sequence[int], sizes: Sequence[int]
     ) -> list:
         """Store ``keys[i]`` from buffer ``ptrs[i]`` (device or host) of
         ``sizes[i]`` bytes. Returns per-key status (``0`` = ok, ``1`` = failed).
@@ -195,11 +182,12 @@ class DfkvDeviceClient:
                 _nb = sum(sizes)
                 _m.bytes = _nb
                 _sp.bytes = _nb
-            karr = (c_char_p * n)(*[k.encode() for k in keys])
+            karr, klens, key_owners = make_key_array(keys)
             parr = (c_void_p * n)(*[c_void_p(p) for p in ptrs])
             sarr = (c_uint64 * n)(*sizes)
             out = (c_int * n)()
-            rc = self._lib.dfkv_batch_put(self._h, karr, parr, sarr, n, out)
+            rc = self._lib.dfkv_batch_put(
+                self._h, karr, klens, parr, sarr, n, out)
             if rc != 0:
                 raise RuntimeError(f"dfkv_batch_put rc={rc}")
             res = [0 if ok == 1 else 1 for ok in out]
@@ -207,10 +195,11 @@ class DfkvDeviceClient:
             r.result = f"ok={ok_n}/{n}"
             if _sp:
                 _sp.hits = ok_n
+            del key_owners
             return res
 
     def batch_get(
-        self, keys: Sequence[str], ptrs: Sequence[int], caps: Sequence[int]
+        self, keys: Sequence[bytes], ptrs: Sequence[int], caps: Sequence[int]
     ):
         """Load ``keys[i]`` into buffer ``ptrs[i]`` (device or host, capacity
         ``caps[i]``). Returns ``(hits, lengths)``: ``hits[i]`` is 1 on hit, 0 on
@@ -219,13 +208,13 @@ class DfkvDeviceClient:
         with _push_metrics.op("get", num_keys=n) as _m, \
                 _push_tracing.span("batch_get", n) as _sp, \
                 access_log("batch_get_auto", lambda: f"{n} keys") as r:
-            karr = (c_char_p * n)(*[k.encode() for k in keys])
+            karr, klens, key_owners = make_key_array(keys)
             parr = (c_void_p * n)(*[c_void_p(p) for p in ptrs])
             carr = (c_uint64 * n)(*caps)
             out_hit = (c_int * n)()
             out_len = (c_uint64 * n)()
             rc = self._lib.dfkv_batch_get_auto(
-                self._h, karr, parr, carr, n, out_hit, out_len
+                self._h, karr, klens, parr, carr, n, out_hit, out_len
             )
             if rc != 0:
                 raise RuntimeError(f"dfkv_batch_get_auto rc={rc}")
@@ -236,11 +225,12 @@ class DfkvDeviceClient:
             if _sp:
                 _sp.hits = nhit; _sp.bytes = nbytes
             r.result = f"hits={nhit}/{n}, {nbytes} bytes"
+            del key_owners
             return hits, lens
 
     def batch_put_sg(
         self,
-        keys: Sequence[str],
+        keys: Sequence[bytes],
         seg_ptrs: Sequence[Sequence[int]],
         seg_sizes: Sequence[Sequence[int]],
     ) -> list:
@@ -260,7 +250,7 @@ class DfkvDeviceClient:
                 _nb = sum(sum(s) for s in seg_sizes)
                 _m.bytes = _nb
                 _sp.bytes = _nb
-            karr = (c_char_p * n)(*[k.encode() for k in keys])
+            karr, klens, key_owners = make_key_array(keys)
             # Keep the per-key inner arrays alive for the duration of the call.
             inner_p = [(c_void_p * len(p))(*[c_void_p(x) for x in p]) for p in seg_ptrs]
             inner_s = [(c_uint64 * len(s))(*s) for s in seg_sizes]
@@ -272,7 +262,8 @@ class DfkvDeviceClient:
             )
             narr = (c_int * n)(*[len(p) for p in seg_ptrs])
             out = (c_int * n)()
-            rc = self._lib.dfkv_batch_put_sg(self._h, karr, parr, sarr, narr, n, out)
+            rc = self._lib.dfkv_batch_put_sg(
+                self._h, karr, klens, parr, sarr, narr, n, out)
             if rc != 0:
                 raise RuntimeError(f"dfkv_batch_put_sg rc={rc}")
             res = [0 if ok == 1 else 1 for ok in out]
@@ -280,11 +271,12 @@ class DfkvDeviceClient:
             r.result = f"ok={ok_n}/{n}"
             if _sp:
                 _sp.hits = ok_n
+            del key_owners
             return res
 
     def batch_get_auto_sg(
         self,
-        keys: Sequence[str],
+        keys: Sequence[bytes],
         seg_ptrs: Sequence[Sequence[int]],
         seg_caps: Sequence[Sequence[int]],
     ):
@@ -296,7 +288,7 @@ class DfkvDeviceClient:
         with _push_metrics.op("get", num_keys=n) as _m, \
                 _push_tracing.span("batch_get_auto_sg", n) as _sp, \
                 access_log("batch_get_auto_sg", lambda: f"{n} keys") as r:
-            karr = (c_char_p * n)(*[k.encode() for k in keys])
+            karr, klens, key_owners = make_key_array(keys)
             inner_p = [(c_void_p * len(p))(*[c_void_p(x) for x in p]) for p in seg_ptrs]
             inner_c = [(c_uint64 * len(c))(*c) for c in seg_caps]
             parr = (ctypes.POINTER(c_void_p) * n)(
@@ -309,7 +301,7 @@ class DfkvDeviceClient:
             out_hit = (c_int * n)()
             out_len = (c_uint64 * n)()
             rc = self._lib.dfkv_batch_get_auto_sg(
-                self._h, karr, parr, carr, narr, n, out_hit, out_len
+                self._h, karr, klens, parr, carr, narr, n, out_hit, out_len
             )
             if rc != 0:
                 raise RuntimeError(f"dfkv_batch_get_auto_sg rc={rc}")
@@ -320,17 +312,19 @@ class DfkvDeviceClient:
             if _sp:
                 _sp.hits = nhit; _sp.bytes = nbytes
             r.result = f"hits={nhit}/{n}, {nbytes} bytes"
+            del key_owners
             return hits, lens
 
-    def batch_exist(self, keys: Sequence[str]) -> list:
+    def batch_exist(self, keys: Sequence[bytes]) -> list:
         """Return ``[1|0]`` per key (1 = present in the cache)."""
         n = len(keys)
         with _push_metrics.op("exist", num_keys=n), \
                 _push_tracing.span("batch_exist", n) as _sp, \
                 access_log("batch_exist", lambda: f"{n} keys") as r:
-            karr = (c_char_p * n)(*[k.encode() for k in keys])
+            karr, klens, key_owners = make_key_array(keys)
             out = (c_int * n)()
-            rc = self._lib.dfkv_batch_exist(self._h, karr, n, out)
+            rc = self._lib.dfkv_batch_exist(
+                self._h, karr, klens, n, out)
             if rc != 0:
                 raise RuntimeError(f"dfkv_batch_exist rc={rc}")
             res = list(out)
@@ -338,6 +332,7 @@ class DfkvDeviceClient:
             r.result = f"present={present}/{n}"
             if _sp:
                 _sp.hits = present
+            del key_owners
             return res
 
     def close(self) -> None:
@@ -351,10 +346,12 @@ class DfkvDeviceClient:
             _hot_config.stop()
         except Exception:
             pass
-        if getattr(self, "_h", None):
+        with self._close_lock:
+            handle = getattr(self, "_h", None)
+            self._h = None
+        if handle:
             with access_log("close", lambda: ""):
-                self._lib.dfkv_close(self._h)
-                self._h = None
+                self._lib.dfkv_close(handle)
 
     def __del__(self):
         try:

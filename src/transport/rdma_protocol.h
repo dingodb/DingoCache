@@ -8,17 +8,20 @@
 #include <limits>
 #include <string>
 
-#include "common/value_header.h"
 #include "transport/dev_frame.h"
 #include "transport/wire.h"
 #include "utils/net_util.h"
 
 namespace dfkv::rdma {
 
-// v2 endpoints keep only small two-sided control buffers. Large PUT payloads
-// land at the aligned data area of a shared server receive segment; GET payloads
-// are RDMA-WRITEd into client-owned memory.
-constexpr size_t kV2ControlCap = 4096;
+// v2 endpoints keep bounded two-sided request/response buffers. Large PUT
+// payloads land at the aligned data area of a shared server receive segment;
+// GET payloads are RDMA-WRITEd into client-owned memory. Members is the only
+// variable-size two-sided datapath response and has an explicit 32-KiB contract.
+// The prefix is included in the registered control-buffer capacity so the exact
+// boundary is representable without truncation or a connection abort.
+constexpr size_t kV2ControlResponseMax = 32u << 10;
+constexpr size_t kV2ControlCap = kRespPrefix + kV2ControlResponseMax;
 constexpr size_t kV2DataOffset = 4096;
 constexpr size_t kV2PutPrefixOffset = kV2DataOffset - kReqPrefix;
 // Fleet-wide protocol bound. A GET target is one server RDMA WRITE WR, not one
@@ -59,13 +62,11 @@ inline size_t AlignUp(size_t value, size_t alignment) {
 }
 
 inline size_t V2SlotSize(uint64_t max_block_bytes) {
-  if (max_block_bytes == 0 ||
-      max_block_bytes > std::numeric_limits<size_t>::max() -
-                            kV2DataOffset - ValueHeader::kSize) {
+  if (max_block_bytes >
+      std::numeric_limits<size_t>::max() - kV2DataOffset) {
     return 0;
   }
-  return AlignUp(kV2DataOffset + ValueHeader::kSize +
-                     static_cast<size_t>(max_block_bytes),
+  return AlignUp(kV2DataOffset + static_cast<size_t>(max_block_bytes),
                  kV2DataOffset);
 }
 
