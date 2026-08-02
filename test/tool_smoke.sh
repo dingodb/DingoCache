@@ -12,8 +12,9 @@ done
 echo "version smoke OK"
 
 D=$(mktemp -d)
+mkdir "$D/cache"
 : > "$D/srv.out"   # pre-create so the awk below can't fail on a missing file under `set -e`
-"$BUILD/dfkv_server" --dir "$D" --port 0 --cap 1073741824 >>"$D/srv.out" 2>&1 &
+"$BUILD/dfkv_server" --dir "$D/cache" --port 0 --cap 1073741824 >>"$D/srv.out" 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null; rm -rf "$D"' EXIT
 P=""

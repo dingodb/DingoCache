@@ -326,6 +326,32 @@ TEST_F(KVStoreTest, RebuildIndexReclaimsOrphanTmpAndKeepsPublishedBlocks) {
   (void)before;
 }
 
+TEST_F(KVStoreTest, ForeignLayoutFailsClosed) {
+  std::ofstream(dir_ / "slab_meta", std::ios::binary) << "foreign";
+  KVStore store(Opts());
+  EXPECT_FALSE(store.Healthy());
+  EXPECT_NE(store.StartupError().find("different store layout"),
+            std::string::npos);
+  std::string value(16, 'x');
+  EXPECT_EQ(store.Cache(BlockKey{1, 0, 1}, value.data(), value.size()),
+            Status::kIOError);
+  EXPECT_FALSE(store.IsCached(BlockKey{1, 0, 1}));
+}
+
+TEST_F(KVStoreTest, InvalidDirectoryAndCapacityFailClosed) {
+  auto zero = Opts();
+  zero.capacity_bytes = 0;
+  KVStore zero_capacity(zero);
+  EXPECT_FALSE(zero_capacity.Healthy());
+  EXPECT_FALSE(zero_capacity.StartupError().empty());
+
+  fs::remove_all(dir_);
+  std::ofstream(dir_, std::ios::binary) << "not-a-directory";
+  KVStore regular_file(Opts());
+  EXPECT_FALSE(regular_file.Healthy());
+  EXPECT_FALSE(regular_file.StartupError().empty());
+}
+
 TEST_F(KVStoreTest, EnospcTriggersForceEvictAndRetrySucceeds) {
   // Fill the store with several evictable blocks, then inject a single ENOSPC
   // on the next write. The store must force-evict and retry, landing the block.

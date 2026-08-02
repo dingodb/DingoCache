@@ -13,6 +13,8 @@
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
+#include <limits>
+#include <sys/stat.h>
 #include <vector>
 
 #include "utils/net_util.h"
@@ -27,6 +29,9 @@ namespace {
 constexpr uint32_t kRecMagic = 0x424C5453u;   // "SLTB"
 constexpr uint32_t kMetaMagic = 0x424C534Du;  // "SLBM"
 constexpr uint32_t kFormatVersion = 1;
+constexpr uint32_t kStateMagic = 0x53424C53u;  // "SLBS"
+constexpr uint32_t kStateClean = 1;
+constexpr uint32_t kStateDirty = 2;
 
 // Small CRC32 (IEEE, reflected) over a byte range; enough to catch a torn record.
 uint32_t Crc32(const uint8_t* p, size_t n) {
@@ -72,14 +77,10 @@ thread_local io_uring* tls_uring_w = nullptr;
 }  // namespace
 
 DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
-  if (opt_.extent_bytes == 0) opt_.extent_bytes = (1ull << 30);
-  if (opt_.slot_granularity == 0) opt_.slot_granularity = (1ull << 20);
-  if (opt_.capacity_bytes < opt_.extent_bytes) opt_.capacity_bytes = opt_.extent_bytes;
-  num_extents_ = static_cast<uint32_t>(opt_.capacity_bytes / opt_.extent_bytes);
-  if (num_extents_ == 0) num_extents_ = 1;
-  max_slots_per_extent_ =
-      static_cast<uint32_t>(opt_.extent_bytes / opt_.slot_granularity);
-  if (max_slots_per_extent_ == 0) max_slots_per_extent_ = 1;
+  if (!ValidateOptions()) {
+    if (ok) *ok = false;
+    return;
+  }
 
   SlabAllocator::Options ao;
   ao.extent_bytes = opt_.extent_bytes;
@@ -97,10 +98,20 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   ao.on_extent_bind = [this](uint32_t e) {
     const std::vector<char> zeros(
         static_cast<size_t>(max_slots_per_extent_) * kRecBytes, 0);
-    if (PwriteAll(table_fd_, zeros.data(), zeros.size(), TableOffset(e, 0))) {
-      ::fdatasync(table_fd_);
-      bind_wipes_.fetch_add(1, std::memory_order_relaxed);
-    }
+    if (!PwriteAll(table_fd_, zeros.data(), zeros.size(), TableOffset(e, 0)))
+      return FailMetadata();
+    if (::fdatasync(table_fd_) != 0) return FailMetadata();
+    bind_wipes_.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  };
+  ao.on_slot_evict = [this](const SlabAllocator::SlotRef& ref) {
+    const uint8_t zero[kRecBytes] = {0};
+    if (!PwriteAll(table_fd_, zero, sizeof(zero),
+                   TableOffset(ref.extent, ref.slot)))
+      return FailMetadata();
+    record_writes_.fetch_add(1, std::memory_order_relaxed);
+    eviction_record_clears_.fetch_add(1, std::memory_order_relaxed);
+    return true;
   };
   alloc_ = std::make_unique<SlabAllocator>(ao);
 
@@ -122,8 +133,10 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   evict_low_bytes_ = opt_.capacity_bytes / 100 * low_pct;
 
   ok_ = OpenOrInit();
-  if (ok_) Rebuild();
-  if (ok_ && opt_.table_sync_ms > 0) {
+  if (ok_ && unclean_start_) ok_ = ResetUncleanEpoch();
+  if (ok_) ok_ = Rebuild();
+  if (ok_) ok_ = MarkDirtyEpoch();
+  if (Healthy() && opt_.table_sync_ms > 0) {
     sync_thread_ = std::thread([this] {
       NameThisThread("slab-sync");
       std::unique_lock<std::mutex> lk(sync_mu_);
@@ -132,12 +145,11 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
                           [this] { return sync_stop_; });
         if (sync_stop_) return;
         const uint64_t seen = record_writes_.load(std::memory_order_relaxed);
-        if (seen == synced_marker_) continue;  // no new records: skip the syscall
+        if (seen == synced_marker_) continue;
         lk.unlock();
-        ::fdatasync(table_fd_);
+        const bool synced = SyncTable(seen);
         lk.lock();
-        synced_marker_ = seen;
-        table_syncs_.fetch_add(1, std::memory_order_relaxed);
+        if (!synced) return;
       }
     });
   }
@@ -151,7 +163,7 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
                                 uring_write_enabled_ ? "on" : "off");
   }
 #endif
-  if (ok_ && opt_.reclaim_interval_ms > 0) {
+  if (Healthy() && opt_.reclaim_interval_ms > 0) {
     reclaim_thread_ = std::thread([this] {
       NameThisThread("slab-reclaim");
       std::unique_lock<std::mutex> lk(reclaim_mu_);
@@ -165,159 +177,374 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
       }
     });
   }
-  if (ok) *ok = ok_;
+  if (ok) *ok = Healthy();
 }
 
 DiskSlabStore::~DiskSlabStore() {
   if (reclaim_thread_.joinable()) {
-    { std::lock_guard<std::mutex> lk(reclaim_mu_); reclaim_stop_ = true; }
+    {
+      std::lock_guard<std::mutex> lk(reclaim_mu_);
+      reclaim_stop_ = true;
+    }
     reclaim_cv_.notify_all();
     reclaim_thread_.join();
   }
   if (sync_thread_.joinable()) {
-    { std::lock_guard<std::mutex> lk(sync_mu_); sync_stop_ = true; }
+    {
+      std::lock_guard<std::mutex> lk(sync_mu_);
+      sync_stop_ = true;
+    }
     sync_cv_.notify_all();
     sync_thread_.join();
   }
-  for (int fd : extent_fds_) if (fd >= 0) ::close(fd);
-  for (int fd : extent_dio_fds_) if (fd >= 0) ::close(fd);
+  bool clean = Healthy();
+  if (clean) clean = SyncPayloads();
+  if (clean)
+    clean = SyncTable(record_writes_.load(std::memory_order_relaxed));
+  if (clean) MarkCleanEpoch();
+  for (int fd : extent_fds_)
+    if (fd >= 0) ::close(fd);
+  for (int fd : extent_dio_fds_)
+    if (fd >= 0) ::close(fd);
   if (table_fd_ >= 0) ::close(table_fd_);
+  if (state_fd_ >= 0) ::close(state_fd_);
+}
+
+bool DiskSlabStore::SetStartupError(std::string error) {
+  if (startup_error_.empty()) startup_error_ = std::move(error);
+  return false;
+}
+
+bool DiskSlabStore::ValidateOptions() {
+  if (opt_.dir.empty()) return SetStartupError("cache directory is empty");
+  if (opt_.capacity_bytes == 0)
+    return SetStartupError("capacity_bytes must be non-zero");
+  if (opt_.extent_bytes == 0 ||
+      opt_.extent_bytes > std::numeric_limits<uint32_t>::max())
+    return SetStartupError("extent_bytes must fit uint32 and be non-zero");
+  if (opt_.slot_granularity < 4096 ||
+      opt_.slot_granularity > std::numeric_limits<uint32_t>::max() ||
+      (opt_.slot_granularity % 4096) != 0)
+    return SetStartupError(
+        "slot_granularity must be a non-zero 4 KiB multiple fitting uint32");
+  if ((opt_.extent_bytes % opt_.slot_granularity) != 0)
+    return SetStartupError(
+        "extent_bytes must be divisible by slot_granularity");
+  if (opt_.capacity_bytes < opt_.extent_bytes ||
+      (opt_.capacity_bytes % opt_.extent_bytes) != 0)
+    return SetStartupError(
+        "capacity_bytes must be an exact positive multiple of extent_bytes");
+
+  const uint64_t extents = opt_.capacity_bytes / opt_.extent_bytes;
+  const uint64_t slots = opt_.extent_bytes / opt_.slot_granularity;
+  if (extents > std::numeric_limits<uint32_t>::max() || slots == 0 ||
+      slots > std::numeric_limits<uint32_t>::max())
+    return SetStartupError("slab geometry exceeds uint32 limits");
+  if (extents > static_cast<uint64_t>(
+                    std::numeric_limits<off_t>::max()) /
+                    slots / kRecBytes)
+    return SetStartupError("slots.tbl geometry exceeds off_t");
+
+  num_extents_ = static_cast<uint32_t>(extents);
+  max_slots_per_extent_ = static_cast<uint32_t>(slots);
+  return true;
 }
 
 bool DiskSlabStore::OpenOrInit() {
   std::error_code ec;
-  fs::create_directories(opt_.dir, ec);
-  fs::create_directories(fs::path(opt_.dir) / "extents", ec);
-  const std::string meta_path = (fs::path(opt_.dir) / "slab_meta").string();
+  const fs::path root(opt_.dir);
+  const fs::path extents_dir = root / "extents";
+  fs::create_directories(root, ec);
+  if (ec || !fs::is_directory(root, ec))
+    return SetStartupError("cannot create or access cache directory");
 
-  // Meta = magic, version, extent_bytes, slot_granularity, num_extents. A magic
-  // mismatch = corruption (refuse); a config mismatch = re-init fresh (the old
-  // layout can't be reused). Cache semantics make a fresh start safe.
-  uint8_t meta[64];
-  bool fresh = true;
-  int mfd = ::open(meta_path.c_str(), O_RDONLY);
-  if (mfd >= 0) {
-    if (PreadAll(mfd, meta, sizeof(meta), 0) && net::GetU32(reinterpret_cast<char*>(meta)) == kMetaMagic) {
-      const uint32_t ver = net::GetU32(reinterpret_cast<char*>(meta) + 4);
-      const uint64_t eb = net::GetU64(reinterpret_cast<char*>(meta) + 8);
-      const uint64_t sg = net::GetU64(reinterpret_cast<char*>(meta) + 16);
-      const uint32_t ne = net::GetU32(reinterpret_cast<char*>(meta) + 24);
-      fresh = !(ver == kFormatVersion && eb == opt_.extent_bytes &&
-                sg == opt_.slot_granularity && ne == num_extents_);
-    }
-    ::close(mfd);
-  }
-
-  const std::string tbl_path = (fs::path(opt_.dir) / "slots.tbl").string();
+  const std::string meta_path = (root / "slab_meta").string();
+  const std::string tbl_path = (root / "slots.tbl").string();
   const uint64_t tbl_bytes =
       static_cast<uint64_t>(num_extents_) * max_slots_per_extent_ * kRecBytes;
+  uint8_t meta[64] = {0};
+  bool fresh = false;
+
+  int mfd = ::open(meta_path.c_str(), O_RDONLY);
+  if (mfd >= 0) {
+    struct stat st {};
+    const bool read_ok =
+        ::fstat(mfd, &st) == 0 && st.st_size == static_cast<off_t>(sizeof(meta)) &&
+        PreadAll(mfd, meta, sizeof(meta), 0);
+    ::close(mfd);
+    if (!read_ok)
+      return SetStartupError("slab_meta is truncated or unreadable");
+    if (net::GetU32(reinterpret_cast<char*>(meta)) != kMetaMagic)
+      return SetStartupError("slab_meta magic mismatch");
+    const uint32_t ver = net::GetU32(reinterpret_cast<char*>(meta) + 4);
+    const uint64_t eb = net::GetU64(reinterpret_cast<char*>(meta) + 8);
+    const uint64_t sg = net::GetU64(reinterpret_cast<char*>(meta) + 16);
+    const uint32_t ne = net::GetU32(reinterpret_cast<char*>(meta) + 24);
+    if (ver != kFormatVersion || eb != opt_.extent_bytes ||
+        sg != opt_.slot_granularity || ne != num_extents_)
+      return SetStartupError(
+          "existing slab layout differs from requested geometry");
+    ec.clear();
+    if (!fs::is_directory(extents_dir, ec) || ec)
+      return SetStartupError("extents directory is missing or unreadable");
+  } else {
+    if (errno != ENOENT)
+      return SetStartupError("cannot open slab_meta");
+    fresh = true;
+    ec.clear();
+    fs::directory_iterator root_it(root, ec);
+    if (ec) return SetStartupError("cannot inspect cache directory");
+    if (root_it != fs::directory_iterator())
+      return SetStartupError(
+          "cache directory contains a different or incomplete store layout");
+    fs::create_directories(extents_dir, ec);
+    if (ec || !fs::is_directory(extents_dir, ec))
+      return SetStartupError("cannot create extents directory");
+  }
 
   if (fresh) {
-    // (Re)write meta, zero the table, and (re)create extent files at full size.
-    std::memset(meta, 0, sizeof(meta));
     net::PutU32(reinterpret_cast<char*>(meta), kMetaMagic);
     net::PutU32(reinterpret_cast<char*>(meta) + 4, kFormatVersion);
     net::PutU64(reinterpret_cast<char*>(meta) + 8, opt_.extent_bytes);
     net::PutU64(reinterpret_cast<char*>(meta) + 16, opt_.slot_granularity);
     net::PutU32(reinterpret_cast<char*>(meta) + 24, num_extents_);
-    int wfd = ::open(meta_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (wfd < 0 || !PwriteAll(wfd, meta, sizeof(meta), 0)) { if (wfd >= 0) ::close(wfd); return false; }
+    int wfd =
+        ::open(meta_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (wfd < 0) return SetStartupError("cannot create slab_meta");
+    const bool meta_ok = PwriteAll(wfd, meta, sizeof(meta), 0) &&
+                         ::fdatasync(wfd) == 0;
     ::close(wfd);
-    // Truncate the table to size (sparse zeros == all-free records).
-    int tfd = ::open(tbl_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
-    if (tfd < 0 || ::ftruncate(tfd, static_cast<off_t>(tbl_bytes)) != 0) {
-      if (tfd >= 0) ::close(tfd);
-      return false;
-    }
-    table_fd_ = tfd;
+    if (!meta_ok) return SetStartupError("cannot persist slab_meta");
+
+    table_fd_ =
+        ::open(tbl_path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);
+    if (table_fd_ < 0 ||
+        ::ftruncate(table_fd_, static_cast<off_t>(tbl_bytes)) != 0 ||
+        ::fdatasync(table_fd_) != 0)
+      return SetStartupError("cannot create or size slots.tbl");
   } else {
-    int tfd = ::open(tbl_path.c_str(), O_RDWR);
-    if (tfd < 0) return false;
-    // Ensure full size (idempotent); a table we cannot size is a broken store,
-    // same as the create path above.
-    if (::ftruncate(tfd, static_cast<off_t>(tbl_bytes)) != 0) {
-      ::close(tfd);
-      return false;
-    }
-    table_fd_ = tfd;
+    table_fd_ = ::open(tbl_path.c_str(), O_RDWR);
+    if (table_fd_ < 0) return SetStartupError("cannot open slots.tbl");
+    struct stat st {};
+    if (::fstat(table_fd_, &st) != 0 ||
+        st.st_size != static_cast<off_t>(tbl_bytes))
+      return SetStartupError("slots.tbl size differs from slab geometry");
   }
 
-  // Open (create + size) every extent file, keep the fd resident.
   extent_fds_.assign(num_extents_, -1);
   if (opt_.direct_writes) extent_dio_fds_.assign(num_extents_, -1);
   for (uint32_t e = 0; e < num_extents_; ++e) {
     char name[32];
     std::snprintf(name, sizeof(name), "E%05u", e);
-    const std::string ep = (fs::path(opt_.dir) / "extents" / name).string();
-    int fd = ::open(ep.c_str(), O_RDWR | O_CREAT, 0644);
-    if (fd < 0) return false;
-    off_t sz = ::lseek(fd, 0, SEEK_END);
-    if (sz < static_cast<off_t>(opt_.extent_bytes) &&
-        ::ftruncate(fd, static_cast<off_t>(opt_.extent_bytes)) != 0) {
-      ::close(fd);
-      return false;
+    const std::string ep = (extents_dir / name).string();
+    const int flags = O_RDWR | (fresh ? (O_CREAT | O_EXCL) : 0);
+    int fd = ::open(ep.c_str(), flags, 0644);
+    if (fd < 0) return SetStartupError("cannot open extent " + ep);
+    struct stat st {};
+    bool sized = ::fstat(fd, &st) == 0;
+    if (fresh) {
+      sized = sized &&
+              ::ftruncate(fd, static_cast<off_t>(opt_.extent_bytes)) == 0;
+    } else {
+      sized = sized &&
+              st.st_size == static_cast<off_t>(opt_.extent_bytes);
     }
-    // Materialize the extent (idempotent): DIO OVERWRITES of allocated/unwritten
-    // ranges parallelize on XFS; allocating writes into ftruncate holes would
-    // serialize on the exclusive iolock (measured 4.2 vs 2.0 GB/s at 8 writers).
+    if (!sized) {
+      ::close(fd);
+      return SetStartupError("extent size differs from slab geometry: " + ep);
+    }
     if (opt_.direct_writes && !extent_dio_fds_.empty() &&
         ::fallocate(fd, 0, 0, static_cast<off_t>(opt_.extent_bytes)) != 0 &&
         errno != EOPNOTSUPP && errno != ENOSYS && errno != EINVAL) {
       ::close(fd);
-      return false;
+      return SetStartupError("cannot materialize extent " + ep);
     }
     extent_fds_[e] = fd;
     if (opt_.direct_writes && !extent_dio_fds_.empty()) {
-      // O_RDWR: the twin serves DIO writes AND the aligned RangeDirect/prep
-      // reads. A filesystem that rejects O_DIRECT (tmpfs) demotes the whole
-      // store to buffered -- resolved truth via DirectWritesActive().
       int dfd = ::open(ep.c_str(), O_RDWR | O_DIRECT);
       if (dfd < 0) {
-        for (int d : extent_dio_fds_) if (d >= 0) ::close(d);
+        for (int direct_fd : extent_dio_fds_)
+          if (direct_fd >= 0) ::close(direct_fd);
         extent_dio_fds_.clear();
       } else {
         extent_dio_fds_[e] = dfd;
       }
     }
   }
+  return OpenEpochState(fresh);
+}
+
+bool DiskSlabStore::WriteEpochState(uint32_t state, uint64_t epoch) {
+  if (state_fd_ < 0) return false;
+  uint8_t record[64] = {0};
+  net::PutU32(reinterpret_cast<char*>(record), kStateMagic);
+  net::PutU32(reinterpret_cast<char*>(record) + 4, kFormatVersion);
+  net::PutU64(reinterpret_cast<char*>(record) + 8, epoch);
+  net::PutU32(reinterpret_cast<char*>(record) + 16, state);
+  net::PutU32(reinterpret_cast<char*>(record) + 60, Crc32(record, 60));
+  return PwriteAll(state_fd_, record, sizeof(record), 0) &&
+         ::fdatasync(state_fd_) == 0;
+}
+
+bool DiskSlabStore::OpenEpochState(bool fresh) {
+  const std::string path = (fs::path(opt_.dir) / "slab_state").string();
+  if (fresh) {
+    state_fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);
+    if (state_fd_ < 0 || !WriteEpochState(kStateClean, 0))
+      return SetStartupError("cannot create clean slab_state");
+    run_epoch_ = 0;
+    return true;
+  }
+
+  state_fd_ = ::open(path.c_str(), O_RDWR);
+  if (state_fd_ < 0 && errno == ENOENT) {
+    // Safe migration from the pre-epoch format: assume the prior process died
+    // uncleanly, persist that fact first, then cold-reset slots.tbl.
+    state_fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);
+    run_epoch_ = 1;
+    unclean_start_ = true;
+    if (state_fd_ < 0 || !WriteEpochState(kStateDirty, run_epoch_))
+      return SetStartupError("cannot create migration slab_state");
+    return true;
+  }
+  if (state_fd_ < 0) return SetStartupError("cannot open slab_state");
+
+  struct stat st {};
+  uint8_t record[64] = {0};
+  if (::fstat(state_fd_, &st) != 0 ||
+      st.st_size != static_cast<off_t>(sizeof(record)) ||
+      !PreadAll(state_fd_, record, sizeof(record), 0))
+    return SetStartupError("slab_state is truncated or unreadable");
+  if (net::GetU32(reinterpret_cast<char*>(record)) != kStateMagic ||
+      net::GetU32(reinterpret_cast<char*>(record) + 4) != kFormatVersion ||
+      net::GetU32(reinterpret_cast<char*>(record) + 60) != Crc32(record, 60))
+    return SetStartupError("slab_state checksum or format mismatch");
+  const uint32_t state =
+      net::GetU32(reinterpret_cast<char*>(record) + 16);
+  if (state != kStateClean && state != kStateDirty)
+    return SetStartupError("slab_state contains an invalid epoch state");
+  run_epoch_ = net::GetU64(reinterpret_cast<char*>(record) + 8);
+  unclean_start_ = state == kStateDirty;
   return true;
 }
 
-void DiskSlabStore::Rebuild() {
-  // Scan slots.tbl; each CRC-valid, state==1 record reinstalls its key into the
-  // allocator (Restore) at its recorded slot. A torn/free record is skipped.
+bool DiskSlabStore::ResetUncleanEpoch() {
+  const uint64_t bytes =
+      static_cast<uint64_t>(num_extents_) * max_slots_per_extent_ * kRecBytes;
+  const size_t chunk_bytes =
+      static_cast<size_t>(std::min<uint64_t>(bytes, 1ull << 20));
+  const std::vector<char> zeros(chunk_bytes, 0);
+  for (uint64_t offset = 0; offset < bytes; offset += chunk_bytes) {
+    const size_t n =
+        static_cast<size_t>(std::min<uint64_t>(chunk_bytes, bytes - offset));
+    if (!PwriteAll(table_fd_, zeros.data(), n, offset)) {
+      FailMetadata();
+      return SetStartupError("cannot reset slots.tbl after unclean shutdown");
+    }
+  }
+  if (::fdatasync(table_fd_) != 0) {
+    FailMetadata();
+    return SetStartupError("cannot persist unclean slots.tbl reset");
+  }
+  unclean_resets_.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+bool DiskSlabStore::MarkDirtyEpoch() {
+  if (run_epoch_ == std::numeric_limits<uint64_t>::max())
+    return SetStartupError("slab_state epoch exhausted");
+  ++run_epoch_;
+  if (WriteEpochState(kStateDirty, run_epoch_)) return true;
+  FailMetadata();
+  return SetStartupError("cannot persist dirty slab_state");
+}
+
+bool DiskSlabStore::MarkCleanEpoch() {
+  if (WriteEpochState(kStateClean, run_epoch_)) return true;
+  return FailMetadata();
+}
+
+bool DiskSlabStore::SyncPayloads() {
+  for (int fd : extent_fds_) {
+    if (fd >= 0 && ::fdatasync(fd) != 0) return FailMetadata();
+  }
+  return true;
+}
+
+bool DiskSlabStore::Rebuild() {
   uint8_t rec[kRecBytes];
+  bool repaired = false;
   for (uint32_t e = 0; e < num_extents_; ++e) {
     for (uint32_t s = 0; s < max_slots_per_extent_; ++s) {
-      if (!PreadAll(table_fd_, rec, kRecBytes, TableOffset(e, s))) return;
-      if (net::GetU32(reinterpret_cast<char*>(rec)) != kRecMagic) continue;
+      if (!PreadAll(table_fd_, rec, kRecBytes, TableOffset(e, s))) {
+        FailMetadata();
+        return SetStartupError("cannot read slots.tbl during rebuild");
+      }
+      const uint32_t magic =
+          net::GetU32(reinterpret_cast<char*>(rec));
+      if (magic != kRecMagic) {
+        if (magic != 0) ++rebuild_corrupt_records_;
+        continue;
+      }
       const uint32_t crc = net::GetU32(reinterpret_cast<char*>(rec) + 4);
-      if (Crc32(rec + 8, kRecBytes - 8) != crc) continue;  // torn
-      if (rec[8] != 1) continue;                            // not valid
-      const uint32_t slot_size = net::GetU32(reinterpret_cast<char*>(rec) + 12);
+      if (Crc32(rec + 8, kRecBytes - 8) != crc) {
+        ++rebuild_corrupt_records_;
+        continue;
+      }
+      if (rec[8] != 1) continue;
+      const uint32_t slot_size =
+          net::GetU32(reinterpret_cast<char*>(rec) + 12);
       BlockKey key;
       key.id = net::GetU64(reinterpret_cast<char*>(rec) + 16);
       key.index = net::GetU32(reinterpret_cast<char*>(rec) + 24);
       key.size = net::GetU32(reinterpret_cast<char*>(rec) + 28);
-      const uint32_t payload_len = net::GetU32(reinterpret_cast<char*>(rec) + 32);
+      const uint32_t payload_len =
+          net::GetU32(reinterpret_cast<char*>(rec) + 32);
+      const bool geometry_ok =
+          slot_size >= opt_.slot_granularity &&
+          (slot_size % opt_.slot_granularity) == 0 &&
+          slot_size <= opt_.extent_bytes && payload_len <= slot_size &&
+          s < opt_.extent_bytes / slot_size;
       const std::string fn = key.Filename();
-      if (alloc_->Restore(fn, slot_size, e, s)) {
-        payload_len_[fn] = payload_len;
+      if (geometry_ok && alloc_->Restore(fn, slot_size, e, s)) {
+        CommitPayloadLocked(fn, payload_len);
         ++table_rebuilt_;
-      } else {
-        // Rejected record (duplicate slot, class mismatch on the extent, out of
-        // range): physically clear it so pre-fix mixed-class leftovers can't
-        // win the first-record race on a LATER rebuild and resurrect an old key
-        // over another class's bytes.
-        uint8_t zero[kRecBytes] = {0};
-        PwriteAll(table_fd_, zero, kRecBytes, TableOffset(e, s));
+        continue;
       }
+      ++rebuild_rejected_records_;
+      uint8_t zero[kRecBytes] = {0};
+      if (!PwriteAll(table_fd_, zero, kRecBytes, TableOffset(e, s))) {
+        FailMetadata();
+        return SetStartupError("cannot clear rejected slots.tbl record");
+      }
+      repaired = true;
     }
   }
+  if (repaired && ::fdatasync(table_fd_) != 0) {
+    FailMetadata();
+    return SetStartupError("cannot persist slots.tbl rebuild repairs");
+  }
+  return true;
 }
 
-bool DiskSlabStore::WriteRecord(const SlabAllocator::SlotRef& r, const BlockKey& key,
-                                uint32_t payload_len, bool valid) {
+bool DiskSlabStore::FailMetadata() {
+  metadata_io_errors_.fetch_add(1, std::memory_order_relaxed);
+  metadata_failed_.store(true, std::memory_order_release);
+  return false;
+}
+
+bool DiskSlabStore::SyncTable(uint64_t seen) {
+  if (!Healthy()) return false;
+  if (::fdatasync(table_fd_) != 0) return FailMetadata();
+  synced_marker_ = seen;
+  table_syncs_.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+bool DiskSlabStore::WriteRecord(const SlabAllocator::SlotRef& r,
+                                const BlockKey& key, uint32_t payload_len,
+                                bool valid) {
+  if (!Healthy()) return false;
   uint8_t rec[kRecBytes];
   std::memset(rec, 0, sizeof(rec));
   net::PutU32(reinterpret_cast<char*>(rec), kRecMagic);
@@ -329,9 +556,10 @@ bool DiskSlabStore::WriteRecord(const SlabAllocator::SlotRef& r, const BlockKey&
   net::PutU32(reinterpret_cast<char*>(rec) + 32, payload_len);
   const uint32_t crc = Crc32(rec + 8, kRecBytes - 8);
   net::PutU32(reinterpret_cast<char*>(rec) + 4, crc);
-  const bool ok = PwriteAll(table_fd_, rec, kRecBytes, TableOffset(r.extent, r.slot));
-  if (ok) record_writes_.fetch_add(1, std::memory_order_relaxed);
-  return ok;
+  if (!PwriteAll(table_fd_, rec, kRecBytes, TableOffset(r.extent, r.slot)))
+    return FailMetadata();
+  record_writes_.fetch_add(1, std::memory_order_relaxed);
+  return true;
 }
 
 bool DiskSlabStore::WritePayload(const SlabAllocator::SlotRef& r, const void* data,
@@ -349,6 +577,27 @@ bool DiskSlabStore::WritePayloadDirect(const SlabAllocator::SlotRef& r, char* da
   return PwriteAll(extent_dio_fds_[r.extent], data, alen, r.offset);
 }
 
+void DiskSlabStore::CommitPayloadLocked(const std::string& key,
+                                        uint32_t payload_len) {
+  auto [it, inserted] = payload_len_.try_emplace(key, payload_len);
+  if (inserted) {
+    committed_payload_bytes_ += payload_len;
+    return;
+  }
+  committed_payload_bytes_ -= it->second;
+  it->second = payload_len;
+  committed_payload_bytes_ += payload_len;
+}
+
+uint32_t DiskSlabStore::ErasePayloadLocked(const std::string& key) {
+  const auto it = payload_len_.find(key);
+  if (it == payload_len_.end()) return 0;
+  const uint32_t payload_len = it->second;
+  committed_payload_bytes_ -= payload_len;
+  payload_len_.erase(it);
+  return payload_len;
+}
+
 // mu_ guards only the in-memory maps; the MB-scale payload I/O runs OUTSIDE it
 // (same discipline as KVStore::Cache and RamTier::Put), so concurrent ops to one
 // disk overlap in the kernel instead of serializing behind the store lock. The
@@ -359,27 +608,23 @@ bool DiskSlabStore::WritePayloadDirect(const SlabAllocator::SlotRef& r, char* da
 template <typename WriteFn>
 Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
                                 const WriteFn& write_payload) {
-  if (!ok_) return Status::kIOError;
+  if (!Healthy()) return Status::kIOError;
   const std::string fn = key.Filename();
   SlabAllocator::SlotRef ref;
   {
     std::lock_guard<std::mutex> lk(mu_);
+    if (!Healthy()) return Status::kIOError;
     // Idempotent: committed, or mid-write by another thread (which will commit).
     if (alloc_->Contains(fn)) return Status::kOk;
     std::vector<std::string> evicted;
     if (!alloc_->Put(fn, len, &ref, &evicted)) return Status::kIOError;  // too big / all pinned
     alloc_->Pin(fn);  // write-pin for the unlocked I/O below
     inflight_[fn]++;  // guards the slot against a concurrent Remove (see ReleaseInflightLocked)
-    // Drop evicted keys from the runtime payload map. Their table records are left
-    // as-is: a slot's record always reflects its LAST occupant, so this Put's
-    // WriteRecord overwrites the reused slot's record, and any other evicted slot
-    // that isn't reused before a crash simply "resurrects" its (still-valid,
-    // content-addressed) key on restart -- correct cache data, never corruption
-    // (design's resurrectable-remove semantics).
-    for (const auto& ev : evicted) {
-      auto pit = payload_len_.find(ev);
-      if (pit != payload_len_.end()) { evicted_bytes_ += pit->second; payload_len_.erase(pit); }
-    }
+    // The allocator has already invalidated every evicted slot record through
+    // on_slot_evict (or wiped the whole extent before a rebind). Remove the
+    // corresponding runtime commit metadata in the same store critical section.
+    for (const auto& ev : evicted)
+      evicted_bytes_ += ErasePayloadLocked(ev);
   }
 
   const bool io_ok = write_payload(ref) &&
@@ -390,13 +635,13 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
   // holder of an uncommitted key): ReleaseInflightLocked executes it, so the key
   // must not be committed afterwards.
   const bool removed_while_writing = deferred_remove_.count(fn) > 0;
-  ReleaseInflightLocked(key, fn);
-  if (!io_ok) {
+  const bool release_ok = ReleaseInflightLocked(key, fn);
+  if (!io_ok || !release_ok) {
     if (!removed_while_writing) alloc_->Remove(fn);  // roll back the reservation
     return Status::kIOError;
   }
   if (removed_while_writing) return Status::kOk;  // acked put, then removed: a miss later is correct
-  payload_len_[fn] = static_cast<uint32_t>(len);
+  CommitPayloadLocked(fn, static_cast<uint32_t>(len));
   return Status::kOk;
 }
 
@@ -437,7 +682,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
     const std::vector<CacheBatchItem>& items) {
   const size_t N = items.size();
   std::vector<Status> out(N, Status::kIOError);
-  if (!ok_ || N == 0) return out;  // already N x kIOError / empty
+  if (!Healthy() || N == 0) return out;
   struct Slot { std::string fn; SlabAllocator::SlotRef ref; bool active = false; bool io_ok = false; bool direct = false; };
   std::vector<Slot> st(N);
   // -- L1: allocate under one lock --
@@ -452,10 +697,8 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
       if (!alloc_->Put(st[i].fn, it.len, &st[i].ref, &evicted)) { out[i] = Status::kIOError; continue; }
       alloc_->Pin(st[i].fn);
       inflight_[st[i].fn]++;
-      for (const auto& ev : evicted) {
-        auto pit = payload_len_.find(ev);
-        if (pit != payload_len_.end()) { evicted_bytes_ += pit->second; payload_len_.erase(pit); }
-      }
+      for (const auto& ev : evicted)
+        evicted_bytes_ += ErasePayloadLocked(ev);
       st[i].active = true;
       // Same eligibility test as CacheDirect: aligned buffer + padded cap.
       const size_t alen = (it.len + 4095) & ~static_cast<size_t>(4095);
@@ -580,13 +823,16 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
     for (size_t i = 0; i < N; ++i) {
       if (!st[i].active) continue;
       const bool removed = deferred_remove_.count(st[i].fn) > 0;
-      ReleaseInflightLocked(items[i].key, st[i].fn);
-      if (!st[i].io_ok) {
+      const bool release_ok =
+          ReleaseInflightLocked(items[i].key, st[i].fn);
+      if (!st[i].io_ok || !release_ok || !Healthy()) {
         if (!removed) alloc_->Remove(st[i].fn);
         out[i] = Status::kIOError;
         continue;
       }
-      if (!removed) payload_len_[st[i].fn] = static_cast<uint32_t>(items[i].len);
+      if (!removed)
+        CommitPayloadLocked(st[i].fn,
+                            static_cast<uint32_t>(items[i].len));
       out[i] = Status::kOk;
     }
   }
@@ -599,12 +845,13 @@ Status DiskSlabStore::RangeDirect(const BlockKey& key, uint64_t offset,
   // Direct mode + aligned io_buf (the RDMA path's contract): O_DIRECT read of
   // the slot-absolute aligned window, payload pointer trimmed by head -- the
   // GET path stays page-cache-free. Anything else: buffered RangeInto.
-  if (!extent_dio_fds_.empty() && ok_ &&
+  if (!extent_dio_fds_.empty() && Healthy() &&
       (reinterpret_cast<uintptr_t>(io_buf) & 4095) == 0) {
     const std::string fn = key.Filename();
     SlabAllocator::SlotRef ref;
     uint32_t plen = 0;
-    if (!AcquireForRead(fn, &ref, &plen)) return Status::kNotFound;
+    if (!AcquireForRead(fn, &ref, &plen))
+      return Healthy() ? Status::kNotFound : Status::kIOError;
     Status st = Status::kOk;
     size_t got = 0, head = 0;
     if (offset < plen) {
@@ -631,14 +878,14 @@ Status DiskSlabStore::RangeDirect(const BlockKey& key, uint64_t offset,
     }
     {
       std::lock_guard<std::mutex> lk(mu_);
-      ReleaseInflightLocked(key, fn);
+      if (!ReleaseInflightLocked(key, fn)) st = Status::kIOError;
     }
     if (st != Status::kOk) return st;
     if (out_data) *out_data = io_buf + head;
     if (out_len) *out_len = got;
     return Status::kOk;
   }
-  if (!extent_dio_fds_.empty() && ok_)
+  if (!extent_dio_fds_.empty() && Healthy())
     dio_read_fallbacks_.fetch_add(1, std::memory_order_relaxed);  // unaligned io_buf
   size_t got = 0;
   Status st = RangeInto(key, offset, length, io_buf, io_cap, &got);
@@ -650,15 +897,15 @@ Status DiskSlabStore::RangeDirectPrep(const BlockKey& key, uint64_t offset,
                                       uint64_t length, size_t io_cap,
                                       RangePrep* out) {
   if (out) *out = RangePrep{};
-  if (!ok_) return Status::kIOError;
+  if (!Healthy()) return Status::kIOError;
   const std::string fn = key.Filename();
   SlabAllocator::SlotRef ref;
   uint32_t plen = 0;
-  if (!AcquireForRead(fn, &ref, &plen)) return Status::kNotFound;
-  auto bail = [&](Status s) {  // release the read-acquire on every non-prep exit
+  if (!AcquireForRead(fn, &ref, &plen))
+    return Healthy() ? Status::kNotFound : Status::kIOError;
+  auto bail = [&](Status status) {
     std::lock_guard<std::mutex> lk(mu_);
-    ReleaseInflightLocked(key, fn);
-    return s;
+    return ReleaseInflightLocked(key, fn) ? status : Status::kIOError;
   };
   out->value_len = plen;
   if (offset >= plen) { out->payload_len = 0; return bail(Status::kOk); }  // zero-len hit, fd=-1
@@ -701,10 +948,11 @@ void DiskSlabStore::RangeRelease(uint64_t token) {
 
 // Reads take the lock only to resolve the slot + commit length and acquire the
 // key (pin + inflight count), then pread OUTSIDE the lock. The pin keeps the
-// slot away from eviction; the inflight count defers a concurrent Remove, whose
-// allocator-level free would hand the slot's bytes to a new writer mid-read.
+// slot away from eviction or explicit-remove reuse; the inflight count orders a
+// concurrent Remove's durable invalidation before the slot becomes reusable.
 bool DiskSlabStore::AcquireForRead(const std::string& fn, SlabAllocator::SlotRef* ref,
                                    uint32_t* plen) {
+  if (!Healthy()) return false;
   std::lock_guard<std::mutex> lk(mu_);
   auto it = payload_len_.find(fn);
   if (it == payload_len_.end()) return false;  // in-flight write / removed: no commit
@@ -714,29 +962,34 @@ bool DiskSlabStore::AcquireForRead(const std::string& fn, SlabAllocator::SlotRef
   return true;
 }
 
-void DiskSlabStore::ReleaseInflightLocked(const BlockKey& key, const std::string& fn) {
+bool DiskSlabStore::ReleaseInflightLocked(const BlockKey& key,
+                                          const std::string& fn) {
   alloc_->Unpin(fn);
   auto it = inflight_.find(fn);
-  if (it == inflight_.end()) return;  // defensive: unbalanced release
-  if (--it->second > 0) return;
+  if (it == inflight_.end()) return true;
+  if (--it->second > 0) return true;
   inflight_.erase(it);
-  if (!deferred_remove_.erase(fn)) return;
-  // Last holder gone: perform the Remove that arrived mid-flight.
+  if (!deferred_remove_.erase(fn)) return true;
   SlabAllocator::SlotRef ref;
   if (alloc_->Get(fn, &ref)) {
-    WriteRecord(ref, key, 0, /*valid=*/false);
+    if (!WriteRecord(ref, key, 0, /*valid=*/false)) {
+      ErasePayloadLocked(fn);
+      return false;
+    }
     alloc_->Remove(fn);
   }
-  payload_len_.erase(fn);
+  ErasePayloadLocked(fn);
+  return true;
 }
 
 Status DiskSlabStore::Range(const BlockKey& key, uint64_t offset, uint64_t length,
                             std::string* out) {
-  if (!ok_) return Status::kIOError;
+  if (!Healthy()) return Status::kIOError;
   const std::string fn = key.Filename();
   SlabAllocator::SlotRef ref;
   uint32_t plen = 0;
-  if (!AcquireForRead(fn, &ref, &plen)) return Status::kNotFound;
+  if (!AcquireForRead(fn, &ref, &plen))
+    return Healthy() ? Status::kNotFound : Status::kIOError;
   Status st = Status::kOk;
   if (offset >= plen) {
     out->clear();
@@ -749,17 +1002,18 @@ Status DiskSlabStore::Range(const BlockKey& key, uint64_t offset, uint64_t lengt
       st = Status::kIOError;
   }
   std::lock_guard<std::mutex> lk(mu_);
-  ReleaseInflightLocked(key, fn);
+  if (!ReleaseInflightLocked(key, fn)) st = Status::kIOError;
   return st;
 }
 
 Status DiskSlabStore::RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,
                                 char* dst, size_t dst_cap, size_t* out_len) {
-  if (!ok_) return Status::kIOError;
+  if (!Healthy()) return Status::kIOError;
   const std::string fn = key.Filename();
   SlabAllocator::SlotRef ref;
   uint32_t plen = 0;
-  if (!AcquireForRead(fn, &ref, &plen)) return Status::kNotFound;
+  if (!AcquireForRead(fn, &ref, &plen))
+    return Healthy() ? Status::kNotFound : Status::kIOError;
   Status st = Status::kOk;
   size_t got = 0;
   if (offset < plen) {
@@ -771,14 +1025,14 @@ Status DiskSlabStore::RangeInto(const BlockKey& key, uint64_t offset, uint64_t l
   }
   {
     std::lock_guard<std::mutex> lk(mu_);
-    ReleaseInflightLocked(key, fn);
+    if (!ReleaseInflightLocked(key, fn)) st = Status::kIOError;
   }
   if (st == Status::kOk && out_len) *out_len = got;
   return st;
 }
 
 bool DiskSlabStore::IsCached(const BlockKey& key) const {
-  if (!ok_) return false;
+  if (!Healthy()) return false;
   std::lock_guard<std::mutex> lk(mu_);
   // Commit-gated (matches what a Range would hit): an in-flight write or a
   // deferred-removed key reads as absent.
@@ -786,31 +1040,38 @@ bool DiskSlabStore::IsCached(const BlockKey& key) const {
 }
 
 Status DiskSlabStore::Remove(const BlockKey& key) {
-  if (!ok_) return Status::kIOError;
+  if (!Healthy()) return Status::kIOError;
   const std::string fn = key.Filename();
   std::lock_guard<std::mutex> lk(mu_);
   SlabAllocator::SlotRef ref;
   if (!alloc_->Get(fn, &ref)) return Status::kNotFound;
   if (inflight_.count(fn)) {
-    // An unlocked pread/pwrite holds this slot. Freeing it now would let the
-    // allocator hand its bytes to a new writer mid-I/O (allocator Remove frees
-    // even a pinned slot); defer the free to the last releaser. Readers gate
-    // off immediately via the payload_len_ erase.
+    // An unlocked pread/pwrite holds this slot. Defer durable invalidation and
+    // physical removal to the last releaser; readers gate off immediately via
+    // the payload_len_ erase. SlabAllocator's own deferred-remove state remains
+    // a final defense for callers that miss this higher-level ordering.
     deferred_remove_.insert(fn);
     ++deferred_remove_total_;
-    payload_len_.erase(fn);
+    ErasePayloadLocked(fn);
     return Status::kOk;
   }
-  WriteRecord(ref, key, 0, /*valid=*/false);  // free the durable record first
+  if (!WriteRecord(ref, key, 0, /*valid=*/false))
+    return Status::kIOError;
   alloc_->Remove(fn);
-  payload_len_.erase(fn);
+  ErasePayloadLocked(fn);
   return Status::kOk;
 }
 
-size_t DiskSlabStore::Count() const { return alloc_->Count(); }
-uint64_t DiskSlabStore::UsedBytes() const { return alloc_->UsedBytes(); }
-uint64_t DiskSlabStore::Capacity() const { return alloc_->Capacity(); }
-uint64_t DiskSlabStore::Evictions() const { return alloc_->Evictions(); }
+size_t DiskSlabStore::Count() const { return alloc_ ? alloc_->Count() : 0; }
+uint64_t DiskSlabStore::UsedBytes() const {
+  return alloc_ ? alloc_->UsedBytes() : 0;
+}
+uint64_t DiskSlabStore::Capacity() const {
+  return alloc_ ? alloc_->Capacity() : 0;
+}
+uint64_t DiskSlabStore::Evictions() const {
+  return alloc_ ? alloc_->Evictions() : 0;
+}
 uint64_t DiskSlabStore::EvictedBytes() const {
   std::lock_guard<std::mutex> lk(mu_);
   return evicted_bytes_;
@@ -830,19 +1091,22 @@ uint64_t DiskSlabStore::EvictedBytes() const {
 // RECLAIM: then top free slots up to the demand-driven watermark (~2 intervals
 // of the insert rate, capped at 1/4 of bound capacity) in bounded batches per
 // lock hold, so Put never waits behind an inline CLOCK sweep.
-void DiskSlabStore::ReclaimTick() {
-  // Proactive watermark eviction FIRST: keep global headroom so the
-  // demand-driven grow/reclaim below never runs against a full ring.
+void DiskSlabStore::ReclaimTick(
+    const std::function<void()>& after_watermark_evict) {
+  if (!Healthy()) return;
+  // Watermark eviction is a composite mutation: allocator occupancy and the
+  // payload-length commit map must change under the same store lock. Otherwise
+  // a concurrent rewrite can commit a reused key between those two mutations,
+  // only for this pass to erase the new commit state.
   if (evict_high_bytes_ != 0 && alloc_->UsedBytes() > evict_high_bytes_) {
-    std::vector<std::string> evicted;
-    // Bounded per tick (kGrowExtentsPerTick) so the store lock isn't held long;
-    // the 50 ms cadence drains a sustained overflow over a few ticks.
-    alloc_->EvictColdToTarget(evict_low_bytes_, kGrowExtentsPerTick, &evicted);
-    if (!evicted.empty()) {
-      std::lock_guard<std::mutex> lk(mu_);
-      for (const auto& ev : evicted) {
-        auto pit = payload_len_.find(ev);
-        if (pit != payload_len_.end()) { evicted_bytes_ += pit->second; payload_len_.erase(pit); }
+    std::lock_guard<std::mutex> lk(mu_);
+    if (alloc_->UsedBytes() > evict_high_bytes_) {
+      std::vector<std::string> evicted;
+      alloc_->EvictColdToTarget(evict_low_bytes_, /*max_extents=*/64,
+                               &evicted);
+      if (!evicted.empty()) {
+        if (after_watermark_evict) after_watermark_evict();
+        for (const auto& fn : evicted) ErasePayloadLocked(fn);
       }
     }
   }
@@ -882,13 +1146,8 @@ void DiskSlabStore::ReclaimTick() {
         {
           std::lock_guard<std::mutex> lk(mu_);
           ok = alloc_->StealFrom(donor, i, &evicted);
-          for (const auto& ev : evicted) {
-            auto pit = payload_len_.find(ev);
-            if (pit != payload_len_.end()) {
-              evicted_bytes_ += pit->second;
-              payload_len_.erase(pit);
-            }
-          }
+          for (const auto& ev : evicted)
+            evicted_bytes_ += ErasePayloadLocked(ev);
         }
         if (!ok) { extents[donor] = 0; continue; }  // donor all pinned: try next
         extents[donor]--;
@@ -909,13 +1168,8 @@ void DiskSlabStore::ReclaimTick() {
       {
         std::lock_guard<std::mutex> lk(mu_);
         got = alloc_->ReclaimClass(i, target, batch, &evicted);
-        for (const auto& ev : evicted) {
-          auto pit = payload_len_.find(ev);
-          if (pit != payload_len_.end()) {
-            evicted_bytes_ += pit->second;
-            payload_len_.erase(pit);
-          }
-        }
+        for (const auto& ev : evicted)
+          evicted_bytes_ += ErasePayloadLocked(ev);
       }
       if (got > 0) reclaimed_.fetch_add(got, std::memory_order_relaxed);
       budget -= std::min(budget, got);
@@ -929,22 +1183,48 @@ void DiskSlabStore::ReclaimTick() {
 
 DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   Stats st;
-  st.dio_write_fallbacks = dio_write_fallbacks_.load(std::memory_order_relaxed);
-  st.dio_read_fallbacks = dio_read_fallbacks_.load(std::memory_order_relaxed);
+  st.dio_write_fallbacks =
+      dio_write_fallbacks_.load(std::memory_order_relaxed);
+  st.dio_read_fallbacks =
+      dio_read_fallbacks_.load(std::memory_order_relaxed);
   st.table_syncs = table_syncs_.load(std::memory_order_relaxed);
   st.bind_wipes = bind_wipes_.load(std::memory_order_relaxed);
-  st.steals = alloc_->Steals();
-  st.cold_steals = alloc_->ColdSteals();
-  st.watermark_evictions = alloc_->WatermarkEvictions();
-  st.extent_returns = alloc_->ExtentReturns();
+  st.metadata_io_errors =
+      metadata_io_errors_.load(std::memory_order_relaxed);
+  st.unclean_resets = unclean_resets_.load(std::memory_order_relaxed);
+  st.eviction_record_clears =
+      eviction_record_clears_.load(std::memory_order_relaxed);
+  st.record_writes = record_writes_.load(std::memory_order_relaxed);
+  st.table_rebuilt = table_rebuilt_;
+  st.rebuild_corrupt_records = rebuild_corrupt_records_;
+  st.rebuild_rejected_records = rebuild_rejected_records_;
+  st.capacity_bytes =
+      static_cast<uint64_t>(opt_.extent_bytes) * num_extents_;
+  st.failed = !Healthy();
+  st.failed_disks = st.failed ? 1 : 0;
+  if (alloc_) {
+    st.steals = alloc_->Steals();
+    st.cold_steals = alloc_->ColdSteals();
+    st.watermark_evictions = alloc_->WatermarkEvictions();
+    st.extent_returns = alloc_->ExtentReturns();
+    st.allocated_bytes = alloc_->UsedBytes();
+    st.allocator_objects = alloc_->Count();
+    const auto classes = alloc_->Classes();
+    st.class_count = classes.size();
+    for (const auto& cls : classes) st.bound_extents += cls.extents;
+    st.pool_extents = alloc_->PoolExtents();
+  }
   std::lock_guard<std::mutex> lk(mu_);
+  st.payload_bytes = committed_payload_bytes_;
+  st.committed_objects = payload_len_.size();
   st.deferred_removes = deferred_remove_total_;
   st.inflight = inflight_.size();
   st.prep_holds = prep_holds_.size();
   st.reclaimed_slots = reclaimed_.load(std::memory_order_relaxed);
   st.rebalanced_extents = rebalanced_.load(std::memory_order_relaxed);
   st.batched_writes = batched_writes_.load(std::memory_order_relaxed);
-  st.uring_write_batches = uring_write_batches_.load(std::memory_order_relaxed);
+  st.uring_write_batches =
+      uring_write_batches_.load(std::memory_order_relaxed);
   return st;
 }
 

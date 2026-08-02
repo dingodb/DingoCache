@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 #include <unistd.h>
 
@@ -18,6 +19,29 @@ namespace fs = std::filesystem;
 using namespace dfkv;  // NOLINT
 
 namespace {
+class ScopedEnv {
+ public:
+  ScopedEnv(const char* name, const char* value) : name_(name) {
+    const char* old = ::getenv(name);
+    if (old != nullptr) {
+      had_old_ = true;
+      old_ = old;
+    }
+    ::setenv(name, value, 1);
+  }
+  ~ScopedEnv() {
+    if (had_old_)
+      ::setenv(name_.c_str(), old_.c_str(), 1);
+    else
+      ::unsetenv(name_.c_str());
+  }
+
+ private:
+  std::string name_;
+  std::string old_;
+  bool had_old_ = false;
+};
+
 std::unique_ptr<KvNodeServer> Start(fs::path dir, std::string* addr) {
   fs::remove_all(dir); fs::create_directories(dir);
   auto s = std::make_unique<KvNodeServer>(dir.string(), 1ull << 30);
@@ -53,6 +77,49 @@ TEST(Metrics, CountersTrackOps) {
   EXPECT_NE(text.find("dfkv_cache_put_total 2"), std::string::npos) << text;
   EXPECT_NE(text.find("dfkv_objects 2"), std::string::npos) << text;
   s->Stop();
+}
+
+TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
+  ScopedEnv engine("DFKV_STORE_ENGINE", "slab");
+  ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "4096");
+  ScopedEnv reclaim("DFKV_SLAB_RECLAIM_MS", "0");
+  std::string addr;
+  auto dir = fs::temp_directory_path() / "dfkv_metrics_slab";
+  auto s = Start(dir, &addr);
+  TcpTransport t;
+  std::string value(3000, 's');
+  ASSERT_EQ(t.Cache(addr, ToBlockKey("slab-key"), value.data(), value.size()),
+            Status::kOk);
+
+  const std::string text = s->MetricsText();
+  EXPECT_NE(text.find("dfkv_slab_capacity_bytes 1073741824"),
+            std::string::npos)
+      << text;
+  EXPECT_NE(text.find("dfkv_slab_allocated_bytes 4096"),
+            std::string::npos)
+      << text;
+  EXPECT_NE(text.find("dfkv_slab_payload_bytes 3000"), std::string::npos)
+      << text;
+  EXPECT_NE(text.find("dfkv_slab_internal_fragmentation_bytes 1096"),
+            std::string::npos)
+      << text;
+  EXPECT_NE(text.find("dfkv_slab_allocator_objects 1"), std::string::npos)
+      << text;
+  EXPECT_NE(text.find("dfkv_slab_committed_objects 1"), std::string::npos)
+      << text;
+  EXPECT_NE(text.find("dfkv_slab_record_writes_total 1"), std::string::npos)
+      << text;
+  EXPECT_NE(text.find("dfkv_slab_bound_extents 1"), std::string::npos)
+      << text;
+  EXPECT_NE(text.find("dfkv_slab_pool_extents 0"), std::string::npos)
+      << text;
+  EXPECT_NE(text.find("dfkv_slab_failed_disks 0"), std::string::npos)
+      << text;
+  EXPECT_NE(text.find("dfkv_slab_healthy 1"), std::string::npos) << text;
+  s->Stop();
+  s.reset();
+  fs::remove_all(dir);
 }
 
 TEST(Metrics, PrometheusFormatAndIdentity) {

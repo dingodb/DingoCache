@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "common/config_dump.h"
+#include "utils/log.h"
 #include "utils/net_util.h"
 #include "utils/thread_name.h"
 #include "utils/wire_limits.h"
@@ -26,12 +27,21 @@ inline double NowSec() {
 }
 }  // namespace
 
-KvNodeServer::KvNodeServer(const std::string& cache_dir, uint64_t capacity_bytes)
-    : group_(DiskCacheGroup::Options{{cache_dir}, capacity_bytes}) { InitRamTier(); InitAdmission(); }
+KvNodeServer::KvNodeServer(const std::string& cache_dir,
+                           uint64_t capacity_bytes)
+    : group_(DiskCacheGroup::Options{{cache_dir}, capacity_bytes}) {
+  if (!group_.Healthy()) return;
+  InitRamTier();
+  InitAdmission();
+}
 
 KvNodeServer::KvNodeServer(const std::vector<std::string>& cache_dirs,
                            uint64_t capacity_bytes)
-    : group_(DiskCacheGroup::Options{cache_dirs, capacity_bytes}) { InitRamTier(); InitAdmission(); }
+    : group_(DiskCacheGroup::Options{cache_dirs, capacity_bytes}) {
+  if (!group_.Healthy()) return;
+  InitRamTier();
+  InitAdmission();
+}
 
 KvNodeServer::~KvNodeServer() {
   // Order matters: Stop() first joins the accept + handler threads so no request
@@ -110,6 +120,10 @@ void KvNodeServer::InitRamTier() {
 }
 
 Status KvNodeServer::Start(int port) {
+  if (!group_.Healthy()) {
+    DFKV_LOG_ERROR("refusing startup: " + group_.StartupError());
+    return Status::kIOError;
+  }
   listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
   if (listen_fd_ < 0) return Status::kIOError;
   int one = 1;
@@ -313,6 +327,56 @@ std::string KvNodeServer::MetricsText() const {
            "io_uring one-submit rounds on the batched write path", ss.uring_write_batches);
     metric("dfkv_slab_rebalanced_total", "counter",
            "Extents moved from cold classes to hot ones by the reclaimer", ss.rebalanced_extents);
+    metric("dfkv_slab_bind_wipes_total", "counter",
+           "Extent slot-grid wipes completed before publishing a new class",
+           ss.bind_wipes);
+    metric("dfkv_slab_metadata_io_errors_total", "counter",
+           "Failed slots.tbl or epoch-state durability operations",
+           ss.metadata_io_errors);
+    metric("dfkv_slab_unclean_resets_total", "counter",
+           "Dirty prior epochs discarded during cold recovery",
+           ss.unclean_resets);
+    metric("dfkv_slab_eviction_record_clears_total", "counter",
+           "Slot records durably cleared before allocator reuse",
+           ss.eviction_record_clears);
+    metric("dfkv_slab_record_writes_total", "counter",
+           "Committed slots.tbl record writes", ss.record_writes);
+    metric("dfkv_slab_table_rebuilt_objects", "gauge",
+           "Committed objects restored from slots.tbl at startup",
+           ss.table_rebuilt);
+    metric("dfkv_slab_rebuild_corrupt_records_total", "counter",
+           "Non-empty malformed or checksum-invalid startup records",
+           ss.rebuild_corrupt_records);
+    metric("dfkv_slab_rebuild_rejected_records_total", "counter",
+           "Valid records rejected and cleared for unsafe geometry or conflict",
+           ss.rebuild_rejected_records);
+    metric("dfkv_slab_capacity_bytes", "gauge",
+           "Configured physical slab payload capacity", ss.capacity_bytes);
+    metric("dfkv_slab_allocated_bytes", "gauge",
+           "Slot bytes occupied by allocator residents", ss.allocated_bytes);
+    metric("dfkv_slab_payload_bytes", "gauge",
+           "Logical committed payload bytes", ss.payload_bytes);
+    metric("dfkv_slab_internal_fragmentation_bytes", "gauge",
+           "Allocated slot bytes not carrying logical payload",
+           ss.allocated_bytes >= ss.payload_bytes
+               ? ss.allocated_bytes - ss.payload_bytes
+               : 0);
+    metric("dfkv_slab_allocator_objects", "gauge",
+           "Allocator residents including uncommitted writes",
+           ss.allocator_objects);
+    metric("dfkv_slab_committed_objects", "gauge",
+           "Reader-visible committed slab objects", ss.committed_objects);
+    metric("dfkv_slab_classes", "gauge", "Active slab size classes",
+           ss.class_count);
+    metric("dfkv_slab_bound_extents", "gauge",
+           "Extents assigned to active slab classes", ss.bound_extents);
+    metric("dfkv_slab_pool_extents", "gauge",
+           "Unbound extents available to new classes", ss.pool_extents);
+    metric("dfkv_slab_failed_disks", "gauge",
+           "Slab disks in fail-closed state", ss.failed_disks);
+    metric("dfkv_slab_healthy", "gauge",
+           "Whether all configured slab disks are healthy",
+           ss.failed ? 0 : 1);
   }
   if (put_busy_limit_ > 0)
     metric("dfkv_put_busy_total", "counter",

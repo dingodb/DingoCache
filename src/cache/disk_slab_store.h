@@ -18,6 +18,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -33,7 +34,10 @@
 
 namespace dfkv {
 
+class DiskSlabStoreTestPeer;
+
 class DiskSlabStore : public StoreEngine {
+
  public:
   struct Options {
     std::string dir;
@@ -70,21 +74,38 @@ class DiskSlabStore : public StoreEngine {
 
   // One store's runtime counters (see KvNodeServer's dfkv_slab_* metrics).
   struct Stats {
-    uint64_t dio_write_fallbacks = 0;  // direct mode: writes that fell back buffered
-    uint64_t dio_read_fallbacks = 0;   // direct mode: aligned reads that fell back
-    uint64_t table_syncs = 0;          // fdatasync cycles actually performed
-    uint64_t bind_wipes = 0;           // extent table regions wiped on (re)bind
-    uint64_t steals = 0;               // allocator cross-class extent steals
-    uint64_t cold_steals = 0;          // steals of globally-cold donor extents (phase 9)
-    uint64_t watermark_evictions = 0;  // proactive watermark extent evictions (phase 10)
-    uint64_t extent_returns = 0;       // fully-free extents returned to the pool
-    uint64_t deferred_removes = 0;     // Removes deferred behind in-flight I/O
-    uint64_t inflight = 0;             // keys with an unlocked read/write in flight
-    uint64_t prep_holds = 0;           // outstanding async-prep slot holds
-    uint64_t reclaimed_slots = 0;      // slots freed by the background reclaimer
-    uint64_t rebalanced_extents = 0;   // extents moved hot<-cold by the reclaimer
-    uint64_t batched_writes = 0;       // payload writes that rode a batch submit
-    uint64_t uring_write_batches = 0;  // io_uring one-submit rounds (0 = loop path)
+    uint64_t dio_write_fallbacks = 0;
+    uint64_t dio_read_fallbacks = 0;
+    uint64_t table_syncs = 0;
+    uint64_t bind_wipes = 0;
+    uint64_t steals = 0;
+    uint64_t cold_steals = 0;
+    uint64_t watermark_evictions = 0;
+    uint64_t extent_returns = 0;
+    uint64_t deferred_removes = 0;
+    uint64_t inflight = 0;
+    uint64_t prep_holds = 0;
+    uint64_t reclaimed_slots = 0;
+    uint64_t rebalanced_extents = 0;
+    uint64_t batched_writes = 0;
+    uint64_t uring_write_batches = 0;
+    uint64_t metadata_io_errors = 0;
+    uint64_t unclean_resets = 0;
+    uint64_t eviction_record_clears = 0;
+    uint64_t record_writes = 0;
+    uint64_t table_rebuilt = 0;
+    uint64_t rebuild_corrupt_records = 0;
+    uint64_t rebuild_rejected_records = 0;
+    uint64_t capacity_bytes = 0;
+    uint64_t allocated_bytes = 0;
+    uint64_t payload_bytes = 0;
+    uint64_t allocator_objects = 0;
+    uint64_t committed_objects = 0;
+    uint64_t class_count = 0;
+    uint64_t bound_extents = 0;
+    uint64_t pool_extents = 0;
+    uint64_t failed_disks = 0;
+    bool failed = false;
   };
 
   // Opens (or creates) the store under Options::dir, pre-allocating extents and
@@ -132,19 +153,36 @@ class DiskSlabStore : public StoreEngine {
   // Resolved I/O mode: direct_writes requested AND the filesystem took O_DIRECT.
   bool DirectWritesActive() const { return !extent_dio_fds_.empty(); }
   Stats GetStats() const;
+  bool Healthy() const override {
+    return ok_ && !metadata_failed_.load(std::memory_order_acquire);
+  }
+  const std::string& StartupError() const override { return startup_error_; }
 
  private:
+  friend class DiskSlabStoreTestPeer;
   static constexpr size_t kRecBytes = 64;
 
-  bool OpenOrInit();                 // create/verify meta, extents, table
-  void Rebuild();                    // scan slots.tbl -> allocator + payload map
+  bool ValidateOptions();
+  bool SetStartupError(std::string error);
+  bool OpenOrInit();
+  bool Rebuild();
+  bool OpenEpochState(bool fresh);
+  bool ResetUncleanEpoch();
+  bool WriteEpochState(uint32_t state, uint64_t epoch);
+  bool MarkDirtyEpoch();
+  bool MarkCleanEpoch();
+  bool SyncPayloads();
   bool WriteRecord(const SlabAllocator::SlotRef& r, const BlockKey& key,
                    uint32_t payload_len, bool valid);
+  bool SyncTable(uint64_t seen);
+  bool FailMetadata();
   bool WritePayload(const SlabAllocator::SlotRef& r, const void* data, size_t len);
   // O_DIRECT payload write from the caller's ALIGNED buffer (CacheDirect path):
   // zeroes the padding bytes in place (cap allows) and pwrites the 4 KiB-rounded
   // length via the extent's DIO fd. Caller pre-checked alignment/cap fit.
   bool WritePayloadDirect(const SlabAllocator::SlotRef& r, char* data, size_t len);
+  void CommitPayloadLocked(const std::string& key, uint32_t payload_len);
+  uint32_t ErasePayloadLocked(const std::string& key);
   // Shared allocate/pin -> unlocked payload write -> commit skeleton for
   // Cache/CacheDirect; `write_payload` does just the payload I/O for the slot.
   template <typename WriteFn>
@@ -153,13 +191,12 @@ class DiskSlabStore : public StoreEngine {
   // read (pin + inflight count, under mu_). False = miss (absent, or a write
   // still in flight). Balanced by a Release{...}Locked call.
   bool AcquireForRead(const std::string& fn, SlabAllocator::SlotRef* ref, uint32_t* plen);
-  // Drop one in-flight hold on fn (unpin + count). The LAST releaser executes a
-  // Remove that arrived while the key was in flight (deferred_remove_): freeing
-  // the slot mid-I/O would let the allocator hand its bytes to a new writer while
-  // our unlocked pread/pwrite still touches them (SlabAllocator::Remove frees a
-  // slot immediately even when pinned -- pins only block EVICTION).
+  // Drop one in-flight hold on fn (unpin + count). The LAST releaser performs
+  // the durable invalidation for a Remove that arrived while I/O was active.
+  // SlabAllocator itself also defers pinned removal, but this caller-level state
+  // is still required to order the slots.tbl record before physical reuse.
   // Call with mu_ held.
-  void ReleaseInflightLocked(const BlockKey& key, const std::string& fn);
+  bool ReleaseInflightLocked(const BlockKey& key, const std::string& fn);
   uint64_t TableOffset(uint32_t extent, uint32_t slot) const {
     return static_cast<uint64_t>(extent) * max_slots_per_extent_ * kRecBytes +
            static_cast<uint64_t>(slot) * kRecBytes;
@@ -172,6 +209,9 @@ class DiskSlabStore : public StoreEngine {
   std::vector<int> extent_fds_;      // resident, one per extent (buffered)
   std::vector<int> extent_dio_fds_;  // O_DIRECT twins (only when direct_writes)
   int table_fd_ = -1;                // slots.tbl
+  int state_fd_ = -1;                // slab_state clean/dirty epoch marker
+  uint64_t run_epoch_ = 0;
+  bool unclean_start_ = false;
   // Outstanding async-prep holds: token -> the key to release (see RangeRelease).
   struct PrepHold { BlockKey key; std::string fn; };
   std::unordered_map<uint64_t, PrepHold> prep_holds_;
@@ -188,7 +228,10 @@ class DiskSlabStore : public StoreEngine {
   // unlocked window, inflight_/deferred_remove_ protect it from Remove;
   // payload_len_ install after the write is the reader-visible commit).
   mutable std::mutex mu_;
+  uint64_t committed_payload_bytes_ = 0;  // under mu_
   bool ok_ = false;
+  std::atomic<bool> metadata_failed_{false};
+  std::string startup_error_;
   uint64_t table_rebuilt_ = 0;
   uint64_t evicted_bytes_ = 0;
   uint64_t deferred_remove_total_ = 0;  // under mu_
@@ -196,7 +239,12 @@ class DiskSlabStore : public StoreEngine {
   std::atomic<uint64_t> dio_read_fallbacks_{0};
   std::atomic<uint64_t> table_syncs_{0};
   std::atomic<uint64_t> bind_wipes_{0};
+  std::atomic<uint64_t> metadata_io_errors_{0};
+  std::atomic<uint64_t> unclean_resets_{0};
+  std::atomic<uint64_t> eviction_record_clears_{0};
   // slots.tbl sync thread (see Options::table_sync_ms): fdatasync only when
+  uint64_t rebuild_corrupt_records_ = 0;
+  uint64_t rebuild_rejected_records_ = 0;
   // records were written since the last cycle.
   std::atomic<uint64_t> record_writes_{0};
   uint64_t synced_marker_ = 0;  // sync-thread-local snapshot of record_writes_
@@ -207,7 +255,8 @@ class DiskSlabStore : public StoreEngine {
   // Background free-slot reclaimer (see Options::reclaim_interval_ms): runs
   // ReclaimTick every interval, evicting ahead of demand in bounded batches
   // and rebalancing extents from cold classes to hot ones on a full store.
-  void ReclaimTick();
+  void ReclaimTick(
+      const std::function<void()>& after_watermark_evict = {});
   // Rebalance rate cap: extents moved per tick per hot class. Each move evicts
   // a donor extent's residents + wipes its table region under the lock, so it
   // is deliberately slow-drip (converges in seconds at the 50 ms tick).
