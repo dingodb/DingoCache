@@ -37,8 +37,6 @@ Design notes:
 from __future__ import annotations
 
 import asyncio
-import dataclasses
-import os
 import threading
 from concurrent.futures import Future as _CFuture
 from typing import TYPE_CHECKING, List, Optional
@@ -68,8 +66,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-
-def _object_key_to_bytes(key: ObjectKey, replicated: bool = False) -> bytes:
+def _object_key_to_bytes(key: ObjectKey) -> bytes:
     """Encode an ObjectKey using dfkv's canonical binary pool-key schema."""
     global_rank = (int(key.kv_rank) >> 16) & 0xFF
     component = "all"
@@ -79,7 +76,7 @@ def _object_key_to_bytes(key: ObjectKey, replicated: bool = False) -> bytes:
         key.chunk_hash.hex(),
         pool="kv",
         tp_size=max(1, _kv_rank_world(int(key.kv_rank))),
-        tp_rank=-1 if replicated else global_rank,
+        tp_rank=global_rank,
         group_id=int(key.object_group_id),
         component=component,
     )
@@ -88,20 +85,6 @@ def _object_key_to_bytes(key: ObjectKey, replicated: bool = False) -> bytes:
 def _kv_rank_world(kv_rank: int) -> int:
     """world_size component of an ObjectKey kv_rank (upstream packs 4x8bit)."""
     return (kv_rank >> 24) & 0xFF
-
-
-def _canonical_kv_rank(kv_rank: int) -> int:
-    """Fold the rank fields (global_rank<<16 | local_rank) of a kv_rank to zero
-    while keeping the topology dims (world_size<<24 | local_world_size<<8).
-
-    Replicated (MLA) KV is byte-identical across TP ranks, so all ranks share
-    one canonical key; different TP shapes must still NOT collide, hence the
-    topology dims stay. PP stages hold different content — canonicalization is
-    only safe for PP=1 (config gate mla_canonical_keys documents that).
-    """
-    return kv_rank & 0xFF00FF00
-
-
 
 
 # ----------------------------------------------------------------------------
@@ -152,7 +135,6 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
         mds_poll_ms: int = 3000,
         num_workers: int = 8,
         max_capacity_gb: float = 0.0,
-        mla_canonical_keys: bool = False,
     ) -> None:
         self.url = url
         self.membership = membership
@@ -163,7 +145,6 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
         self.mds_poll_ms = mds_poll_ms
         self.num_workers = num_workers
         self.max_capacity_gb = max_capacity_gb
-        self.mla_canonical_keys = bool(mla_canonical_keys)
 
     @classmethod
     def from_dict(cls, d: dict) -> "DfkvL2AdapterConfig":
@@ -181,25 +162,27 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
 
         model_name = d.get("model_name", "")
         if not isinstance(model_name, str) or not model_name:
-            raise ValueError(
-                "dfkv L2 adapter: 'model_name' must be a non-empty string")
+            raise ValueError("dfkv L2 adapter: 'model_name' must be a non-empty string")
         reject_namespace_override(d)
         tenant_id = d.get("tenant_id", "default")
         if not isinstance(tenant_id, str) or not tenant_id:
-            raise ValueError(
-                "dfkv L2 adapter: 'tenant_id' must be a non-empty string")
+            raise ValueError("dfkv L2 adapter: 'tenant_id' must be a non-empty string")
         model_revision = d.get("model_revision", model_name)
         if not isinstance(model_revision, str) or not model_revision:
             raise ValueError(
-                "dfkv L2 adapter: 'model_revision' must be a non-empty string")
+                "dfkv L2 adapter: 'model_revision' must be a non-empty string"
+            )
 
         mds_poll_ms = d.get("mds_poll_ms", 3000)
         if not isinstance(mds_poll_ms, int) or mds_poll_ms <= 0:
             raise ValueError("dfkv L2 adapter: 'mds_poll_ms' must be a positive int")
 
         num_workers = d.get("num_workers", 8)
-        if isinstance(num_workers, bool) or not isinstance(num_workers, int) \
-                or num_workers <= 0:
+        if (
+            isinstance(num_workers, bool)
+            or not isinstance(num_workers, int)
+            or num_workers <= 0
+        ):
             raise ValueError("dfkv L2 adapter: 'num_workers' must be a positive int")
 
         max_capacity_gb = d.get("max_capacity_gb", 0.0)
@@ -208,12 +191,12 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
                 "dfkv L2 adapter: 'max_capacity_gb' must be a non-negative number"
             )
 
-        # Key geometry is explicit configuration. Environment variables must
-        # not silently split or alias the cache namespace between processes.
-        mla_canonical_keys = d.get("mla_canonical_keys", False)
-        if not isinstance(mla_canonical_keys, (bool, int)):
+        # Reject the retired rank-folding knob instead of ignoring it.
+        if "mla_canonical_keys" in d:
             raise ValueError(
-                "dfkv L2 adapter: 'mla_canonical_keys' must be a boolean"
+                "dfkv L2 adapter: 'mla_canonical_keys' is unsupported because "
+                "the MP-server API does not expose enough model/PP metadata to "
+                "prove that rank folding is byte-compatible"
             )
         return cls(
             url=url,
@@ -225,7 +208,6 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
             mds_poll_ms=mds_poll_ms,
             num_workers=num_workers,
             max_capacity_gb=float(max_capacity_gb),
-            mla_canonical_keys=bool(mla_canonical_keys),
         )
 
     @classmethod
@@ -241,10 +223,7 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
             "- mds_poll_ms (int): MDS rediscovery interval (default 3000)\n"
             "- num_workers (int): client I/O parallelism (default 8)\n"
             "- max_capacity_gb (float): >0 enables aggregate eviction "
-            "(default 0 = dfkv manages capacity)\n"
-            "- mla_canonical_keys (bool): MLA-only opt-in — fold kv_rank rank "
-            "fields so replicated KV shares one key + exists-dedup stores "
-            "(fixed 8x inflation; MLA+PP=1 only; flipping = cold cache)"
+            "(default 0 = dfkv manages capacity)"
         )
 
 
@@ -266,13 +245,9 @@ class DfkvL2Adapter(L2AdapterInterface):
         super().__init__(max_capacity_bytes=int(config.max_capacity_gb * (1024**3)))
         self._config = config
 
-        # MLA canonical keys (opt-in): fold kv_rank rank fields so replicated
-        # MLA KV shares ONE key per chunk, and dedup stores with an exists
-        # probe (the store path otherwise transfers the same bytes world_size
-        # times). Enabling under a non-MLA / PP>1 model would collapse
-        # distinct content — the config flag documents the precondition.
-        self._canonical = bool(config.mla_canonical_keys)
-        self._warned_mla_hint = False
+        # Preserve LMCache's world-size/global-rank identity. The MP-server
+        # adapter receives only ObjectKey and an L1 buffer descriptor, not
+        # model/PP metadata; folding rank bits could alias distinct payloads.
 
         # 3 distinct event notifiers (the contract requires distinct fds).
         self._store_efd = create_event_notifier()
@@ -328,46 +303,14 @@ class DfkvL2Adapter(L2AdapterInterface):
         )
         logger.info(
             "DfkvL2Adapter ready: endpoint=%s group=%s membership=%s "
-            "namespace=%s rdma_pools=%d transport=%s mla_canonical_keys=%s",
-            endpoint.raw_endpoint, endpoint.group, endpoint.membership,
-            namespace.hex(), len(rdma_pools),
+            "namespace=%s rdma_pools=%d transport=%s",
+            endpoint.raw_endpoint,
+            endpoint.group,
+            endpoint.membership,
+            namespace.hex(),
+            len(rdma_pools),
             getattr(self._client, "transport_mode", "unknown"),
-            self._canonical,
         )
-
-    # ------------------------------------------------------------------
-    # Key canonicalization (MLA opt-in)
-    # ------------------------------------------------------------------
-
-    def _canon(self, key: ObjectKey) -> ObjectKey:
-        """Fold rank fields of kv_rank when canonical keys are enabled.
-
-        A world_size of 1 (or a mis-unpacked kv_rank) passes through unchanged.
-        ObjectKey is a frozen dataclass — dataclasses.replace keeps every other
-        field (chunk_hash / object_group_id / cache_salt)."""
-        if not self._canonical or _kv_rank_world(key.kv_rank) <= 1:
-            return key
-        return dataclasses.replace(
-            key, kv_rank=_canonical_kv_rank(key.kv_rank)
-        )
-
-    def _hint_canonical_if_mla(self, keys: List[ObjectKey]) -> None:
-        """One-time operational hint when the keyspace looks replicated-MLA
-        (world_size>1) but canonicalization is off — the old MLA-8x mode."""
-        if self._canonical or self._warned_mla_hint:
-            return
-        for k in keys:
-            if _kv_rank_world(k.kv_rank) > 1:
-                self._warned_mla_hint = True
-                logger.warning(
-                    "dfkv L2 adapter: kv_rank world_size=%d with "
-                    "mla_canonical_keys=false — if this model replicates KV "
-                    "across TP ranks (MLA), enabling mla_canonical_keys "
-                    "removes the %dx storage/write inflation (flipping = cold "
-                    "cache). Safe to ignore for sharded (non-MLA) models.",
-                    _kv_rank_world(k.kv_rank), _kv_rank_world(k.kv_rank),
-                )
-                return
 
     # ------------------------------------------------------------------
     # Event Fd Interface
@@ -386,41 +329,17 @@ class DfkvL2Adapter(L2AdapterInterface):
     # Store
     # ------------------------------------------------------------------
 
-    async def _batch_set_maybe_dedup(self, binary_keys, views):
-        """With canonical keys, every TP worker submits the SAME key for one
-        chunk; probe existence first and transfer only the missing ones.
-        Returns (ok, per_key_flags). Race note: two tasks probing miss in the
-        same window both write — benign, the bytes are identical (this is a
-        cache). Disabled → plain batch_set."""
-        if not self._canonical:
-            return await self._client.batch_set(binary_keys, views)
-        present = await self._client.batch_exists(binary_keys)
-        if all(present):
-            return True, [True] * len(binary_keys)
-        miss = [i for i, p in enumerate(present) if not p]
-        mkeys = [binary_keys[i] for i in miss]
-        mviews = [views[i] for i in miss]
-        ok, per = await self._client.batch_set(mkeys, mviews)
-        flags = [bool(p) for p in present]
-        for idx, f in zip(miss, per):
-            flags[idx] = bool(f)
-        return ok, flags
-
     def submit_store_task(
         self, keys: List[ObjectKey], objects: List[MemoryObj]
     ) -> L2TaskId:
-        keys = [self._canon(k) for k in keys]
-        self._hint_canonical_if_mla(keys)
-        binary_keys = [
-            _object_key_to_bytes(k, replicated=self._canonical) for k in keys
-        ]
+        binary_keys = [_object_key_to_bytes(k) for k in keys]
         views = [obj.byte_array for obj in objects]
         sizes = [obj.get_size() for obj in objects]
         with self._lock:
             task_id = self._next_task_id
             self._next_task_id += 1
         fut = asyncio.run_coroutine_threadsafe(
-            self._batch_set_maybe_dedup(binary_keys, views), self._loop
+            self._client.batch_set(binary_keys, views), self._loop
         )
         # Hold ``objects`` alive in the closure until the store completes — the
         # memoryviews alias their buffers and the C call must finish reading.
@@ -477,19 +396,14 @@ class DfkvL2Adapter(L2AdapterInterface):
     # ------------------------------------------------------------------
 
     def submit_lookup_and_lock_task(self, keys: List[ObjectKey]) -> L2TaskId:
-        keys = [self._canon(k) for k in keys]
-        binary_keys = [
-            _object_key_to_bytes(k, replicated=self._canonical) for k in keys
-        ]
+        binary_keys = [_object_key_to_bytes(k) for k in keys]
         with self._lock:
             task_id = self._next_task_id
             self._next_task_id += 1
         fut = asyncio.run_coroutine_threadsafe(
             self._client.batch_exists(binary_keys), self._loop
         )
-        fut.add_done_callback(
-            lambda f: self._on_lookup_done(f, task_id, list(keys))
-        )
+        fut.add_done_callback(lambda f: self._on_lookup_done(f, task_id, list(keys)))
         return task_id
 
     def _on_lookup_done(
@@ -507,7 +421,9 @@ class DfkvL2Adapter(L2AdapterInterface):
                 for i, found in enumerate(per_key):
                     if found:
                         bitmap.set(i)
-                        self._locked_keys[keys[i]] = self._locked_keys.get(keys[i], 0) + 1
+                        self._locked_keys[keys[i]] = (
+                            self._locked_keys.get(keys[i], 0) + 1
+                        )
             self._completed_lookups[task_id] = bitmap
         self._lookup_efd.notify()
 
@@ -518,8 +434,6 @@ class DfkvL2Adapter(L2AdapterInterface):
     def submit_unlock(self, keys: List[ObjectKey]) -> None:
         # dfkv objects are remote and never evicted out from under a loader, so
         # this is purely client-side refcount bookkeeping (kept for symmetry).
-        # Canonicalize so the refcount collapses onto the shared key too.
-        keys = [self._canon(k) for k in keys]
         with self._lock:
             for key in keys:
                 c = self._locked_keys.get(key)
@@ -537,10 +451,7 @@ class DfkvL2Adapter(L2AdapterInterface):
     def submit_load_task(
         self, keys: List[ObjectKey], objects: List[MemoryObj]
     ) -> L2TaskId:
-        keys = [self._canon(k) for k in keys]
-        binary_keys = [
-            _object_key_to_bytes(k, replicated=self._canonical) for k in keys
-        ]
+        binary_keys = [_object_key_to_bytes(k) for k in keys]
         views = [obj.byte_array for obj in objects]
         with self._lock:
             task_id = self._next_task_id
@@ -589,8 +500,6 @@ class DfkvL2Adapter(L2AdapterInterface):
     # ------------------------------------------------------------------
 
     def delete(self, keys: List[ObjectKey]) -> None:
-        # Canonicalize so eviction removes the shared key, not one rank's ghost.
-        keys = [self._canon(k) for k in keys]
         """Drop keys from dfkv (L2 eviction). Synchronous per the L2 controller
         contract; fires ``_notify_keys_deleted`` so the eviction policy's byte
         accounting stays in sync. No-op (with a one-time warning) if the loaded
@@ -607,9 +516,7 @@ class DfkvL2Adapter(L2AdapterInterface):
                     "eviction is a no-op. Rebuild dfkv with the remove RPC."
                 )
             return
-        binary_keys = [
-            _object_key_to_bytes(k, replicated=self._canonical) for k in keys
-        ]
+        binary_keys = [_object_key_to_bytes(k) for k in keys]
         fut = asyncio.run_coroutine_threadsafe(
             self._client.batch_remove(binary_keys), self._loop
         )

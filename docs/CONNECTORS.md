@@ -770,13 +770,10 @@ vllm serve <model> --tensor-parallel-size 8 --no-enable-prefix-caching \
 
 `adapter_params` 键：`url`（必填，语法同 in-process）、`membership`（`mds` 默认
 或 `static`）、`lib`（否则 `DFKV_LIB`）、必填 `model_name`（MP-server 不会从
-runtime metadata 自动提供）、可选 `key_namespace`（显式 schema override）、
-`mds_poll_ms`（3000）、`num_workers`（8）、`max_capacity_gb`（0 = 容量交给
-dfkv 自管；>0 开 LMCache 聚合 L2 淘汰，见 §4.6.6）、`mla_canonical_keys`
-（bool 默认关，MLA 专用 opt-in：折叠 kv_rank 坐标，使复制态 KV 共享一个
-canonical key 并在写前 exists 去重；仅 MLA+PP=1。分片或 PP 模型打开会把
-不同内容压成同一 identity；切换此项会 cold miss。也可设
-`DFKV_L2ADAPTER_MLA_CANONICAL_KEYS=1`）。
+runtime metadata 自动提供）、`mds_poll_ms`（3000）、`num_workers`（8）、
+`max_capacity_gb`（0 = 容量交给 dfkv 自管；>0 开 LMCache 聚合 L2 淘汰，见
+§4.6.6）。MP-server API 不提供足以证明 byte-identical MLA replica 的 model/PP
+元数据，因此对象 key 始终保留 `world_size/global_rank` identity，并拒绝手工折叠开关。
 server 的 pinned L1 arena 在 LMCache 传入 `l1_memory_desc` 时自动注册 RDMA 零拷贝。
 
 实现要点：dfkv 无原生 eventfd，`DfkvL2Adapter` 用**后台 asyncio loop + 三个
@@ -805,7 +802,7 @@ connector 移植自 dingofs 项目的 LMCache connector，与 HiCache 插件走�
 
 - LMCache 把每个 prompt 切成 `chunk_size` token 的 **chunk**，对每个 chunk 做内容哈希得
   `CacheEngineKey`，再调 `RemoteConnector` 的 get/put/exists。
-- `DfkvConnector` 把 `CacheEngineKey` 序列化成 dfkv key 字符串，把 chunk 字节
+- `DfkvConnector` 把 `CacheEngineKey` 序列化成 binary object key，把 chunk 字节
   （`MemoryObj.byte_array`，LMCache 固定 host arena 的切片）经 `DfkvNativeClient`
   零拷贝交给 dfkv。
 - dfkv `KVClient` 按 key 一致性哈希路由到 cache node，走 RDMA（或 TCP）读写。
@@ -855,7 +852,7 @@ integration/lmcache/
     ├── remote_connector.py   # DfkvConnector(RemoteConnector)
     ├── native_client.py      # DfkvNativeClient：ctypes + ThreadPoolExecutor
     ├── l2_adapter.py         # DfkvL2Adapter：MP-server L2 路径（asyncio + eventfd 桥）
-    ├── key_mapper.py         # CacheEngineKey -> dfkv key 字符串（完整 hash、明文 ws/wid）
+    ├── key_mapper.py         # CacheEngineKey -> binary object key（完整 hash/ws/wid）
     ├── access_log.py         # 逐操作访问日志（默认关，DFKV_ACCESS_LOG_*）
     └── exists_cache.py       # ExistsLRU：「刚 put 又问存在」的远程往返短路
 ```
@@ -888,13 +885,18 @@ in-process connector 从 LMCache runtime metadata 取精确 `model_name`；MP-se
 路径要求 `adapter_params.model_name`。namespace 始终绑定该 identity 与
 `lmcache/raw-v1`，不接受 operator alias。
 
+in-process `RemoteConnector` 原样保留 LMCache runtime `CacheEngineKey` 的
+`world_size/worker_id`。replicated MLA 识别、rank 归一化和 single-writer 选择均由
+LMCache `RemoteBackend` 负责；dfkv 不再二次折叠或条纹分工，避免 PP/sharded 内容别名，
+也避免 LMCache 已选单 writer 后 connector 再丢弃部分 chunk。
+
 LMCache 的 `CacheEngineKey` / `ObjectKey` 统一编码为 §1.4 的
-self-delimiting binary pool key。完整 hash、world size/rank、cache group 和
-salt/component 都是 identity；字段按长度分帧，因此 NUL、分隔符与非 UTF-8
-字节不会截断或别名。`mla_canonical_keys` 会把确认复制的 rank 坐标改为
-`-1`，因此切换该选项是 cold miss。dtype、chunk size、shape 或序列化顺序
-若在同一 model identity 下变化，必须发布新的 schema `key_namespace`；dfkv
-raw value 没有 geometry guard。
+self-delimiting binary pool key。完整 hash、框架给出的 world size/rank、cache group
+和 salt/component 都是 identity；字段按长度分帧，因此 NUL、分隔符与非 UTF-8
+字节不会截断或别名。MP-server 路径始终保留 `world_size/global_rank` identity；
+在上游 API 能表达可验证的 replicated/sharded 布局之前，不折叠 rank。
+dtype、chunk size、shape 或序列化顺序若在同一 model identity 下变化，必须 bump
+source-controlled `lmcache/raw-v1` layout ID；dfkv raw value 没有 geometry guard。
 
 成员发现：URL `dfkv://<endpoint>/<group>` 由 `membership` 决定解释——
 **mds（默认）**把 endpoint/group 写入 v2 options，由 constructor 启动后台

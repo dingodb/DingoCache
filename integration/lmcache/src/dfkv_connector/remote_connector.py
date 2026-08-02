@@ -33,7 +33,6 @@ from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 
-from ._telemetry import config as _tcfg
 from .access_log import access_log
 from .config import parse_dfkv_url
 from .exists_cache import ExistsLRU
@@ -43,7 +42,6 @@ from .native_client import DfkvNativeClient
 logger = init_logger(__name__)
 
 
-
 def _fmt_bytes(n: int) -> str:
     if n < 1024:
         return f"{n}B"
@@ -51,10 +49,9 @@ def _fmt_bytes(n: int) -> str:
         return f"{n / 1024:.2f}KiB"
     return f"{n / 1024 / 1024:.2f}MiB"
 
+
 def _key_label(key: bytes) -> str:
     return f"len={len(key)} sha256={hashlib.sha256(key).hexdigest()[:16]}"
-
-
 
 
 class DfkvConnector(RemoteConnector):
@@ -75,7 +72,6 @@ class DfkvConnector(RemoteConnector):
         lib_path: Optional[str] = None,
         membership: str = "mds",
         mds_poll_ms: int = 3000,
-        mla_canonical_keys: Optional[bool] = None,
     ) -> None:
         with access_log("__init__", lambda: f"url={url}") as r:
             super().__init__(local_cpu_backend.config, local_cpu_backend.metadata)
@@ -91,55 +87,29 @@ class DfkvConnector(RemoteConnector):
 
             rdma_pools = self._collect_rdma_pools(local_cpu_backend)
             _md = local_cpu_backend.metadata
-            self._use_mla = bool(getattr(_md, "use_mla", False))
-            self._world_size = max(
-                1, int(getattr(_md, "world_size", 1)))
-            self._worker_id = int(getattr(_md, "worker_id", 0))
+            use_mla = bool(getattr(_md, "use_mla", False))
+            world_size = max(1, int(getattr(_md, "world_size", 1)))
+            worker_id = int(getattr(_md, "worker_id", 0))
             model_identity = str(getattr(_md, "model_name", ""))
-            _dtype_identity = ",".join(
-                str(dtype) for dtype in self.meta_dtypes)
-            _shape_identity = "|".join(
-                str(tuple(shape)) for shape in self.meta_shapes)
+            _dtype_identity = ",".join(str(dtype) for dtype in self.meta_dtypes)
+            _shape_identity = "|".join(str(tuple(shape)) for shape in self.meta_shapes)
             namespace = canonical_namespace(
                 model_identity,
                 LMCACHE_RAW_V1,
                 tenant_id=str(getattr(_md, "tenant_id", "default")),
-                model_revision=str(
-                    getattr(_md, "model_revision", model_identity)),
+                model_revision=str(getattr(_md, "model_revision", model_identity)),
                 dtype=_dtype_identity or "unknown",
-                block_tokens=max(
-                    1, int(getattr(_md, "chunk_size", 1))),
+                block_tokens=max(1, int(getattr(_md, "chunk_size", 1))),
                 layer_count=max(1, len(self.meta_shapes)),
-                tp_size=self._world_size,
+                tp_size=world_size,
                 layout_fields={
                     "meta_shapes": _shape_identity,
                     "meta_dtypes": _dtype_identity,
                     "meta_format": str(self.meta_fmt),
-                    "full_chunk_size_bytes": int(
-                        self.full_chunk_size_bytes),
-                    "use_mla": self._use_mla,
+                    "full_chunk_size_bytes": int(self.full_chunk_size_bytes),
+                    "use_mla": use_mla,
                 },
             )
-
-            # Phase 9: canonical (rank-agnostic) keys for MLA. LMCache embeds
-            # worker_id in every key although MLA KV is replicated across TP
-            # ranks — 8x storage/writes/reads at TP8, and the same-host
-            # rendezvous can never match (different keys). With canonical keys
-            # all ranks share one keyspace; writes are striped to a single
-            # deterministic owner per chunk (see _stripe_owner). The decision
-            # comes from runtime metadata or this explicit constructor option;
-            # environment variables may not alter cache identity/key geometry.
-            auto_canonical = self._use_mla and self._world_size > 1
-            self._canonical_keys = (
-                auto_canonical
-                if mla_canonical_keys is None
-                else auto_canonical and bool(mla_canonical_keys)
-            )
-            if self._canonical_keys:
-                logger.info(
-                    "dfkv canonical MLA keys enabled (world=%d): shared "
-                    "keyspace + single-writer striping",
-                    self._world_size)
 
             self._local_cpu_backend = local_cpu_backend
             self._exists_lru = ExistsLRU(capacity=exists_cache_capacity)
@@ -148,8 +118,8 @@ class DfkvConnector(RemoteConnector):
                 group=endpoint.group,
                 membership=endpoint.membership,
                 key_namespace=namespace,
-                tp_size=self._world_size,
-                tp_rank=self._worker_id,
+                tp_size=world_size,
+                tp_rank=worker_id,
                 lib_path=lib_path,
                 mds_poll_ms=mds_poll_ms,
                 rdma_pools=rdma_pools,
@@ -162,25 +132,30 @@ class DfkvConnector(RemoteConnector):
                 "DfkvConnector ready: membership=%s endpoint=%s group=%s "
                 "full_chunk=%d (%.2f MiB) namespace=%s rdma_pools=%d (%.1f MiB) "
                 "batch_max_keys=%d get_parallelism=%d assume_exists=%s transport=%s",
-                endpoint.membership, endpoint.raw_endpoint, endpoint.group,
+                endpoint.membership,
+                endpoint.raw_endpoint,
+                endpoint.group,
                 self.full_chunk_size_bytes,
                 self.full_chunk_size_bytes / (1024 * 1024),
-                namespace.hex(), len(rdma_pools), total_pool_mib,
-                self._batch_max_keys, self._get_parallelism, self._assume_exists,
+                namespace.hex(),
+                len(rdma_pools),
+                total_pool_mib,
+                self._batch_max_keys,
+                self._get_parallelism,
+                self._assume_exists,
                 getattr(self._client, "transport_mode", "unknown"),
             )
             r.result = f"endpoint={endpoint.raw_endpoint} group={endpoint.group}"
 
     def _key(self, key: CacheEngineKey) -> bytes:
-        return cache_engine_key_to_dfkv_key(key, self._canonical_keys)
+        """Encode the rank identity supplied by LMCache without rewriting it.
 
-    def _stripe_owner(self, key: CacheEngineKey) -> bool:
-        """With canonical keys every rank would redundantly PUT the same key;
-        exactly one deterministic owner writes each chunk instead (identical
-        bytes on every rank — MLA — so any single writer is correct)."""
-        if not self._canonical_keys:
-            return True
-        return (key.chunk_hash % self._world_size) == self._worker_id
+        LMCache owns replicated-layout detection and writer selection. The
+        connector must preserve that decision: inferring rank equivalence here
+        can alias pipeline stages or discard writes when LMCache already chose
+        a single writer.
+        """
+        return cache_engine_key_to_dfkv_key(key)
 
     @staticmethod
     def _collect_rdma_pools(local_cpu_backend: Any) -> List[Tuple[int, int]]:
@@ -234,7 +209,9 @@ class DfkvConnector(RemoteConnector):
         except Exception as e:
             logger.warning(
                 "discarding hit with invalid length %d (full=%d): %s",
-                nbytes, self.full_chunk_size_bytes, e,
+                nbytes,
+                self.full_chunk_size_bytes,
+                e,
             )
             return None
 
@@ -265,7 +242,8 @@ class DfkvConnector(RemoteConnector):
                 found = self._client.exists_sync(key_bytes)
             except Exception as e:
                 logger.warning(
-                    "exists_sync failed for %s: %s", _key_label(key_bytes), e)
+                    "exists_sync failed for %s: %s", _key_label(key_bytes), e
+                )
                 r.result = f"error: {e}"
                 return False
             r.result = "found" if found else "not_found"
@@ -302,16 +280,18 @@ class DfkvConnector(RemoteConnector):
                 chunk = remaining[start:end]
                 per_key = await self._client.batch_exists(chunk)
                 if not per_key:
-                    r.result = (f"prefix={i + start} (lru={i}, "
-                                f"remote={start} +0 no resp)")
+                    r.result = (
+                        f"prefix={i + start} (lru={i}, remote={start} +0 no resp)"
+                    )
                     return i + start
                 hit_keys: List[bytes] = []
                 for j, found in enumerate(per_key):
                     if not found:
                         if hit_keys:
                             self._exists_lru.add_many(hit_keys)
-                        r.result = (f"prefix={i + start + j} "
-                                    f"(lru={i}, remote={start + j})")
+                        r.result = (
+                            f"prefix={i + start + j} (lru={i}, remote={start + j})"
+                        )
                         return i + start + j
                     hit_keys.append(chunk[j])
                 if hit_keys:
@@ -364,12 +344,6 @@ class DfkvConnector(RemoteConnector):
             "put",
             lambda: f"{_key_label(key_bytes)}, {_fmt_bytes(size)}",
         ) as r:
-            if not self._stripe_owner(key):
-                # canonical keys: the owning rank writes this chunk; treating
-                # it as stored here prevents this rank from ever re-putting.
-                self._exists_lru.add(key_bytes)
-                r.result = "striped_skip"
-                return
             ok, _ = await self._client.batch_set([key_bytes], [memory_obj.byte_array])
             if ok:
                 self._exists_lru.add(key_bytes)
@@ -397,21 +371,6 @@ class DfkvConnector(RemoteConnector):
             if len(keys) != len(memory_objs):
                 r.result = "FAIL length_mismatch"
                 raise ValueError("keys and memory_objs length mismatch")
-            if self._canonical_keys:
-                # single-writer striping: this rank only writes the chunks it
-                # owns; the rest are (being) written by their owners and are
-                # remembered as stored so this rank never re-puts them.
-                owned = [i for i, k in enumerate(keys) if self._stripe_owner(k)]
-                skipped = [self._key(keys[i]) for i in range(n)
-                           if i not in set(owned)]
-                if skipped:
-                    self._exists_lru.add_many(skipped)
-                if not owned:
-                    r.result = f"striped_skip {n} keys"
-                    return
-                keys = [keys[i] for i in owned]
-                memory_objs = [memory_objs[i] for i in owned]
-                n = len(keys)
             binary_keys = [self._key(k) for k in keys]
             views = [obj.byte_array for obj in memory_objs]
             ok_all = True
@@ -433,9 +392,11 @@ class DfkvConnector(RemoteConnector):
                     ok_all = False
             if stored_keys:
                 self._exists_lru.add_many(stored_keys)
-            r.result = (f"ok chunks={chunks}" if ok_all
-                        else f"partial_fail stored={len(stored_keys)}/{n} "
-                             f"chunks={chunks}")
+            r.result = (
+                f"ok chunks={chunks}"
+                if ok_all
+                else f"partial_fail stored={len(stored_keys)}/{n} chunks={chunks}"
+            )
 
     def support_batched_get(self) -> bool:
         return True
@@ -527,8 +488,7 @@ class DfkvConnector(RemoteConnector):
 
     def reshape_partial_chunk(self, memory_obj, bytes_read):
         full = self.full_chunk_size_bytes
-        with access_log("reshape_partial_chunk",
-                        lambda: f"{bytes_read}/{full} bytes"):
+        with access_log("reshape_partial_chunk", lambda: f"{bytes_read}/{full} bytes"):
             return super().reshape_partial_chunk(memory_obj, bytes_read)
 
     # ------------------------------------------------------------------
@@ -544,8 +504,9 @@ class DfkvConnector(RemoteConnector):
         keys: List[CacheEngineKey],
     ) -> List[MemoryObj]:
         n = len(keys)
-        with access_log("batched_get_non_blocking",
-                        lambda: f"{n} keys lookup_id={lookup_id}") as r:
+        with access_log(
+            "batched_get_non_blocking", lambda: f"{n} keys lookup_id={lookup_id}"
+        ) as r:
             if not keys:
                 r.result = "empty"
                 return []
@@ -555,7 +516,7 @@ class DfkvConnector(RemoteConnector):
             ranges = list(self._batch_slices(n))
             chunks = len(ranges)
             for group_start in range(0, len(ranges), self._get_parallelism):
-                group = ranges[group_start:group_start + self._get_parallelism]
+                group = ranges[group_start : group_start + self._get_parallelism]
                 group_objs: List[List[MemoryObj]] = []
                 group_views: List[List[memoryview]] = []
                 for start, end in group:
@@ -568,8 +529,9 @@ class DfkvConnector(RemoteConnector):
                                     o.ref_count_down()
                             for o in objs:
                                 o.ref_count_down()
-                            r.result = (f"alloc_failed prefix={len(out)}/{n} "
-                                        f"chunks={chunks}")
+                            r.result = (
+                                f"alloc_failed prefix={len(out)}/{n} chunks={chunks}"
+                            )
                             return out
                         objs.append(obj)
                     group_objs.append(objs)
@@ -594,9 +556,11 @@ class DfkvConnector(RemoteConnector):
                 ):
                     per_key_list = list(per_key or [])
                     local_prefix = 0
-                    while (local_prefix < len(objs) and
-                           local_prefix < len(per_key_list) and
-                           per_key_list[local_prefix]):
+                    while (
+                        local_prefix < len(objs)
+                        and local_prefix < len(per_key_list)
+                        and per_key_list[local_prefix]
+                    ):
                         reshaped = self._reshape_hit(
                             objs[local_prefix], lengths[local_prefix]
                         )
@@ -607,14 +571,14 @@ class DfkvConnector(RemoteConnector):
 
                     if local_prefix:
                         self._exists_lru.add_many(
-                            binary_keys[start:start + local_prefix]
+                            binary_keys[start : start + local_prefix]
                         )
                         out.extend(objs[:local_prefix])
 
                     if local_prefix < len(objs):
                         for obj in objs[local_prefix:]:
                             obj.ref_count_down()
-                        for later_objs in group_objs[idx + 1:]:
+                        for later_objs in group_objs[idx + 1 :]:
                             for obj in later_objs:
                                 obj.ref_count_down()
                         r.result = f"prefix={len(out)}/{n} chunks={chunks}"
@@ -635,7 +599,8 @@ class DfkvConnector(RemoteConnector):
                 ok = self._client.remove_sync(key_bytes)
             except Exception as e:
                 logger.warning(
-                    "remove_sync failed for %s: %s", _key_label(key_bytes), e)
+                    "remove_sync failed for %s: %s", _key_label(key_bytes), e
+                )
                 r.result = f"error: {e}"
                 return False
             if ok:
@@ -674,7 +639,7 @@ class DfkvConnector(RemoteConnector):
         ranges = list(self._batch_slices(len(binary_keys)))
         out = []
         for group_start in range(0, len(ranges), self._get_parallelism):
-            group = ranges[group_start:group_start + self._get_parallelism]
+            group = ranges[group_start : group_start + self._get_parallelism]
             results = await asyncio.gather(
                 *(
                     self._client.batch_get(binary_keys[start:end], views[start:end])

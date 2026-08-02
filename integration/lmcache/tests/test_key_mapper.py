@@ -50,12 +50,14 @@ def _base_key(model="glm-5.1", world_size=8, worker_id=0, chunk_hash=0xABCDEF):
     )
 
 
-def _layer_key(model="glm-5.1", world_size=8, worker_id=0, chunk_hash=0xABCDEF,
-               layer_id=0):
+def _layer_key(
+    model="glm-5.1", world_size=8, worker_id=0, chunk_hash=0xABCDEF, layer_id=0
+):
     """A LayerCacheEngineKey stand-in (has layer_id)."""
     k = _base_key(model, world_size, worker_id, chunk_hash)
     k.layer_id = layer_id
     return k
+
 
 def _decode_key(key: bytes):
     assert key.startswith(b"DFKVPOOL\x02")
@@ -65,7 +67,7 @@ def _decode_key(key: bytes):
         nonlocal offset
         size = struct.unpack_from("<I", key, offset)[0]
         offset += 4
-        value = key[offset:offset + size]
+        value = key[offset : offset + size]
         offset += size
         return value
 
@@ -81,24 +83,23 @@ def _decode_key(key: bytes):
 
 
 def test_base_key_canonical_golden_format():
-    key = cache_engine_key_to_dfkv_key(
-        _base_key(worker_id=2, chunk_hash=0x1234))
+    key = cache_engine_key_to_dfkv_key(_base_key(worker_id=2, chunk_hash=0x1234))
     assert _decode_key(key) == (
-        b"kv", b"1234",
+        b"kv",
+        b"1234",
         (1, -1, 8, 2, 1, 0, 1, 0, 1, 0),
-        0, b"all",
+        0,
+        b"all",
     )
 
 
 def test_base_key_full_hash_preserved():
-    key = cache_engine_key_to_dfkv_key(
-        _base_key(chunk_hash=0xDEADBEEFCAFE))
+    key = cache_engine_key_to_dfkv_key(_base_key(chunk_hash=0xDEADBEEFCAFE))
     assert _decode_key(key)[1] == b"deadbeefcafe"
 
 
 def test_layer_key_has_explicit_component():
-    key = cache_engine_key_to_dfkv_key(
-        _layer_key(chunk_hash=0x99, layer_id=7))
+    key = cache_engine_key_to_dfkv_key(_layer_key(chunk_hash=0x99, layer_id=7))
     assert _decode_key(key)[4] == b"layer7"
 
 
@@ -112,7 +113,8 @@ def test_layer_keys_same_chunk_different_layers_distinct():
     assert len(set(binary_keys)) == 8
     for layer, key in enumerate(keys):
         assert _decode_key(cache_engine_key_to_dfkv_key(key))[4] == (
-            f"layer{layer}".encode())
+            f"layer{layer}".encode()
+        )
 
 
 def test_base_and_layer_zero_distinct():
@@ -133,31 +135,24 @@ def test_layer_id_zero_is_encoded():
     assert _decode_key(key)[4] == b"layer0"
 
 
-
-def test_canonical_worker_uses_replicated_rank():
-    key = cache_engine_key_to_dfkv_key(
-        _base_key(worker_id=5, chunk_hash=0xABC),
-        canonicalize_worker=True)
-    assert _decode_key(key)[2][3] == -1
-
-
-def test_sharded_default_keeps_worker_rank():
-    key = cache_engine_key_to_dfkv_key(
-        _base_key(worker_id=5, chunk_hash=0xABC))
+def test_worker_rank_is_preserved():
+    key = cache_engine_key_to_dfkv_key(_base_key(worker_id=5, chunk_hash=0xABC))
     assert _decode_key(key)[2][3] == 5
 
 
-def test_canonical_all_ranks_converge():
-    rendered = {cache_engine_key_to_dfkv_key(_base_key(worker_id=w, chunk_hash=0xDEAD), canonicalize_worker=True)
-        for w in range(8)}
-    assert len(rendered) == 1
+def test_distinct_worker_ranks_stay_distinct():
+    rendered = {
+        cache_engine_key_to_dfkv_key(_base_key(worker_id=worker, chunk_hash=0xDEAD))
+        for worker in range(8)
+    }
+    assert len(rendered) == 8
 
 
-def test_canonical_layerwise_keeps_layer_id():
+def test_layerwise_key_preserves_worker_rank():
     key = cache_engine_key_to_dfkv_key(
-        _layer_key(worker_id=3, chunk_hash=0x1, layer_id=7),
-        canonicalize_worker=True)
-    assert _decode_key(key)[2][3] == -1
+        _layer_key(worker_id=3, chunk_hash=0x1, layer_id=7)
+    )
+    assert _decode_key(key)[2][3] == 3
     assert _decode_key(key)[4] == b"layer7"
 
 
@@ -171,6 +166,7 @@ def _run_all():
         except Exception as e:
             failed += 1
             import traceback
+
             print(f"FAIL {fn.__name__}: {e}")
             traceback.print_exc()
     print(f"\n{len(fns) - failed}/{len(fns)} passed")
@@ -179,4 +175,3 @@ def _run_all():
 
 if __name__ == "__main__":
     sys.exit(1 if _run_all() else 0)
-

@@ -88,14 +88,11 @@ vllm serve <model> --tensor-parallel-size 8 --no-enable-prefix-caching \
 
 `adapter_params` keys: `url` (required, same grammar as in-process),
 `membership` (`mds`|`static`), `lib` (else `DFKV_LIB`), required `model_name`
-(MP-server does not supply runtime model metadata), optional `key_namespace`
-(explicit schema override), `mds_poll_ms` (3000), `num_workers` (8),
-`max_capacity_gb` (0 = dfkv manages capacity; >0 enables aggregate L2
-eviction), and `mla_canonical_keys` (bool, default false). The latter is an
-MLA+PP=1-only opt-in: it marks replicated kv_rank coordinates as shared and
-deduplicates stores with an exists probe. Enabling it for sharded/PP KV aliases
-different content; changing it later produces a cold cache. The equivalent env
-is `DFKV_L2ADAPTER_MLA_CANONICAL_KEYS=1`.
+(MP-server does not supply runtime model metadata), `mds_poll_ms` (3000),
+`num_workers` (8), and `max_capacity_gb` (0 = dfkv manages capacity; >0 enables
+aggregate L2 eviction). The MP-server API does not expose enough model/PP
+metadata to prove byte-identical MLA replication, so object keys always retain
+the `world_size/global_rank` identity and the adapter rejects manual folding.
 The server's pinned L1 arena is auto-registered for RDMA zero-copy when LMCache
 passes an `l1_memory_desc`. Only `dfkv_register_memory` return code `0` counts
 as registered; any native MR rejection fails startup instead of silently using
@@ -107,6 +104,12 @@ store → restart (L1 wiped) → reload from dfkv with prefill skipped.
 The in-process path gets the exact `model_name` from LMCache runtime metadata;
 the MP-server path gets it from `adapter_params`. The binary namespace always
 binds that identity to the source-controlled `lmcache/raw-v1` layout ID.
+
+The in-process `RemoteConnector` preserves the `world_size` and `worker_id`
+chosen by LMCache. Replicated-MLA normalization and single-writer selection
+belong to LMCache's `RemoteBackend`; dfkv applies no second folding or striping
+policy. The MP-server path likewise fails closed by retaining rank identity
+because its L2 API does not expose equivalent model/PP semantics.
 
 Object keys use the shared self-delimiting binary form: `DFKVPOOL\x02`,
 uint32-LE length-framed pool/hash, fixed uint32-size/int32-rank pairs for
