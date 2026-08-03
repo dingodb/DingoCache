@@ -14,6 +14,8 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -44,6 +46,42 @@ inline bool ReadAll(int fd, void* buf, size_t n) {
     if (r < 0) {
       if (errno == EINTR) continue;
       return false;
+    }
+    off += static_cast<size_t>(r);
+  }
+  return true;
+}
+
+// ReadAll with an ABSOLUTE deadline for the whole read. SO_RCVTIMEO alone is a
+// per-SYSCALL budget: a slow-dribble peer (one byte just under each interval)
+// would otherwise never time out. Here the per-syscall budget is recomputed
+// before EVERY recv as min(base_timeout, deadline - now), so the read must
+// complete before `deadline` (monotonic clock) no matter how the bytes arrive.
+// Same return contract as ReadAll (false on close, error, or timeout/expiry).
+// `base_timeout` of {0,0} means "no per-syscall cap, deadline only".
+inline bool ReadAllWithin(int fd, void* buf, size_t n, timeval base_timeout,
+                          std::chrono::steady_clock::time_point deadline) {
+  char* p = static_cast<char*>(buf);
+  size_t off = 0;
+  while (off < n) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) return false;  // budget already spent => close
+    const int64_t remain_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(deadline - now)
+            .count();
+    const int64_t base_us =
+        static_cast<int64_t>(base_timeout.tv_sec) * 1000000 +
+        base_timeout.tv_usec;
+    int64_t budget_us = remain_us;
+    if (base_us > 0 && base_us < budget_us) budget_us = base_us;
+    timeval tv{budget_us / 1000000, budget_us % 1000000};
+    if (tv.tv_sec == 0 && tv.tv_usec == 0) tv.tv_usec = 1;  // {0,0} = wait forever
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ssize_t r = ::recv(fd, p + off, n - off, 0);
+    if (r == 0) return false;  // peer closed
+    if (r < 0) {
+      if (errno == EINTR) continue;  // budget recomputed next iteration
+      return false;  // includes EAGAIN/EWOULDBLOCK from SO_RCVTIMEO expiry
     }
     off += static_cast<size_t>(r);
   }

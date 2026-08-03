@@ -75,6 +75,7 @@ class KvNodeServer {
   }
   size_t TcpMaxConnections() const { return tcp_max_connections_; }
   int TcpIoTimeoutSeconds() const { return tcp_io_timeout_seconds_; }
+  uint64_t TcpFirstReqMs() const { return tcp_first_req_ms_; }
 
   // metrics (relaxed atomics)
   size_t m_cache_put() const { return cache_put_.load(std::memory_order_relaxed); }
@@ -143,7 +144,9 @@ class KvNodeServer {
                             Status result, size_t bytes_read,
                             double elapsed_sec, const char* data) noexcept;
   void AcceptLoop();
-  void Handle(int fd);
+  // accepted_at stamps the accept() return so the first complete request frame
+  // is due within DFKV_TCP_FIRST_REQ_MS of ACCEPT, not of handler scheduling.
+  void Handle(int fd, std::chrono::steady_clock::time_point accepted_at);
   void InitRamTier();     // construct ram_ if DFKV_RAM_TIER is enabled (env)
   void InitAdmission();   // read DFKV_PUT_INFLIGHT_LIMIT (0 = gate off)
   void ReapDoneLocked();  // join+erase finished handler threads; conn_mu_ held
@@ -170,8 +173,13 @@ class KvNodeServer {
   static constexpr size_t kHardTcpMaxConnections = 4096;
   static constexpr int kDefaultTcpIoTimeoutSeconds = 60;
   static constexpr int kHardTcpIoTimeoutSeconds = 3600;
+  // Absolute deadline for the FIRST complete request frame after accept
+  // (SO_RCVTIMEO alone is per-syscall, so a drip feeder never timed out).
+  static constexpr uint64_t kDefaultTcpFirstReqMs = 30000;
+  static constexpr uint64_t kHardTcpFirstReqMs = 3600000;
   size_t tcp_max_connections_ = kDefaultTcpMaxConnections;
   int tcp_io_timeout_seconds_ = kDefaultTcpIoTimeoutSeconds;
+  uint64_t tcp_first_req_ms_ = kDefaultTcpFirstReqMs;  // 0 = deadline disabled
   std::atomic<size_t> tcp_rejected_connections_{0};
   Sampler lat_sampler_{64};        // 1-in-64 latency sampling (near-zero hot-path cost)
   LatencyHist get_lat_, put_lat_;  // server-side op latency (sampled)
