@@ -35,6 +35,11 @@ n1               10.0.0.1:28001             1      100   33.3%  ver=2.0,engine=s
 n2               10.0.0.2:28001             2      200   66.7%  ver=2.0,engine=slab,disks=3,cap=9,ram=0,rdma=on
 """
 
+RING_OLD = """group=glm members=1 ring_points=300
+ID               ADDR                   WEIGHT   VNODES   SHARE  INFO
+n1               10.0.0.1:28001             1      300  100.0%  ver=2.0,engine=slab,disks=3,cap=9,ram=0,rdma=on
+"""
+
 CLIENTS = """group=glm clients=2 (only upgraded clients register)
 ID                           TYPE       MODEL                    ROLE           TP       INFO
 host-a_1                     vllm       model-a                  producer       8        type=vllm,model=model-a
@@ -176,6 +181,80 @@ class ReplacementWorkflowTest(unittest.TestCase):
         workflow.rollback(RuntimeError("cutover failed"))
         self.assertEqual(workflow.actions, [("old", "start")])
         self.assertEqual(workflow.required, [{"n1"}])
+
+    def test_start_timeout_marks_started_new_and_rollback_stops_replacement(self) -> None:
+        class Fixture(Replacer):
+            def __init__(self, args):
+                super().__init__(args)
+                self.actions = []
+
+            def ring(self):
+                return parse_ring(RING_OLD)
+
+            def clients(self):
+                return {"client-1"}
+
+            def remote(self, host, action):
+                self.actions.append((host, action))
+                if (host, action) == ("new", "start"):
+                    raise subprocess.TimeoutExpired(["ssh", "new"], 1.0)
+
+        workflow = Fixture(self.args(dry_run=False))
+        with self.assertRaises(subprocess.TimeoutExpired):
+            workflow.run()
+        # The local SSH timeout must not hide a remotely running replacement.
+        self.assertTrue(workflow.started_new)
+        self.assertFalse(workflow.old_stopped)
+        workflow.rollback(RuntimeError("start ssh timed out"))
+        self.assertEqual(workflow.actions, [("new", "start"), ("new", "stop")])
+        events = workflow.events
+        self.assertTrue(any(event["phase"] == "rollback" for event in events))
+        self.assertFalse(any("safe abort" in str(event["message"]) for event in events))
+
+    def test_successful_cutover_keeps_started_new_without_rollback(self) -> None:
+        class Fixture(Replacer):
+            def __init__(self, args):
+                super().__init__(args)
+                self.actions = []
+
+            def ring(self):
+                return parse_ring(RING_OLD)
+
+            def clients(self):
+                return {"client-1"}
+
+            def remote(self, host, action):
+                self.actions.append((host, action))
+
+            def wait_stable_ring(self, required, forbidden):
+                return parse_ring(RING)
+
+            def wait_for(self, description, predicate):
+                return True
+
+        workflow = Fixture(self.args(dry_run=False))
+        workflow.run()
+        self.assertEqual(workflow.actions, [("new", "start"), ("old", "stop")])
+        self.assertTrue(workflow.started_new)
+        self.assertTrue(workflow.old_stopped)
+        phases = [event["phase"] for event in workflow.events]
+        self.assertNotIn("rollback", phases)
+        self.assertNotIn("abort", phases)
+
+    def test_rollback_fails_loudly_when_replacement_stop_fails(self) -> None:
+        class Fixture(Replacer):
+            def remote(self, host, action):
+                raise subprocess.TimeoutExpired(["ssh", host], 1.0)
+
+        workflow = Fixture(self.args(dry_run=False))
+        workflow.started_new = True
+        with self.assertRaises(WorkflowError) as raised:
+            workflow.rollback(RuntimeError("start ssh timed out"))
+        message = str(raised.exception)
+        self.assertIn("CRITICAL", message)
+        self.assertIn("still be registered in the ring", message)
+        self.assertIn("stop dfkv on new manually", message)
+        self.assertFalse(any("safe abort" in str(event["message"]) for event in workflow.events))
 
     def test_wait_for_retries_command_timeouts_until_predicate_succeeds(self) -> None:
         transient = subprocess.TimeoutExpired(["dfkvctl", "ring"], 1.0)
