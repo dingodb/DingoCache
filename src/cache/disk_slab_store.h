@@ -246,6 +246,10 @@ class DiskSlabStore : public StoreEngine {
   // whose Remove arrived during that window (executed by the last releaser).
   std::unordered_map<std::string, uint32_t> inflight_;
   std::unordered_set<std::string> deferred_remove_;
+  // Signaled by the last in-flight releaser right after it executes a deferred
+  // Remove (mu_ held): a re-PUT of that key waits out the window (bounded)
+  // thereon instead of failing hard against the still-resident slot.
+  std::condition_variable remove_cv_;
   // A reserved-but-uncommitted key has exactly one leader. Scalar and batch
   // duplicates join this flight and observe its real commit result.
   std::unordered_map<std::string, std::shared_ptr<PutFlight>> put_flights_;
@@ -268,6 +272,12 @@ class DiskSlabStore : public StoreEngine {
   std::atomic<uint64_t> metadata_io_errors_{0};
   std::function<bool()> payload_write_hook_for_test_;
   std::function<bool()> record_write_hook_for_test_;
+  // Test-only seam (never set in production; same discipline as the hooks
+  // above): when set, replaces EVERY CQE reap of the batched io_uring write
+  // path -- the blocking wait AND the post-failure non-blocking drain -- so
+  // tests can inject a hard reap failure. The void* signature keeps liburing
+  // types out of the header (build-flag-independent class layout).
+  std::function<int(void* ring, void* cqe)> uring_reap_hook_for_test_;
   std::atomic<uint64_t> unclean_resets_{0};
   std::atomic<uint64_t> eviction_record_clears_{0};
   // slots.tbl sync thread (see Options::table_sync_ms): fdatasync only when
