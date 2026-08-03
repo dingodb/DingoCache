@@ -19,10 +19,10 @@
 - `dfkv_exist_hit_total` / `dfkv_exist_miss_total` → 命中率 = hit / (hit + miss)
 - `dfkv_cache_hit_total`（按 key 的读命中）、`dfkv_objects`、`dfkv_used_bytes`
 
-**健康态**：稳态热工作集下应 ≈ 100%（实测清环 99.8%）。
+**健康态**：稳态热工作集下应 ≈ 100%（实测清环 99.8%）。环级真值看 [METRICS.md](METRICS.md) §3.2 的 `dfkv_mds_group_*` 系列（每环容量/水位/`hits_sum`/`misses_sum`，来自 MDS 聚合心跳，比逐节点 scrape 更快定位整环塌陷）。
 
 **失败模式与判读**：
-- **环写满 → 命中率断崖归零**：`dfkv_used_bytes / cap > ~0.95` 且 `dfkv_evictions_total` 与写入量同步暴涨 = 满环自噬（刚写的热页被逐出）。**修**：容量水位（`DFKV_SLAB_EVICT_HIGH_PCT`，看 `dfkv_slab_watermark_evictions_total` 是否在动）+ 别让环写满。
+- **环写满 → 命中率断崖归零**：`dfkv_used_bytes / cap > ~0.95` 且 `dfkv_evictions_total` 与写入量同步暴涨 = 满环自噬（刚写的热页被逐出）。**修**：容量水位（`DFKV_SLAB_EVICT_HIGH_PCT` 默认 92 / `DFKV_SLAB_EVICT_LOW_PCT` 默认 88，看 `dfkv_slab_watermark_evictions_total` 是否在动）+ 别让环写满。
 - **identity 不一致**：环不满但命中率低 → 对齐 exact runtime model identity 和 canonical object-key 坐标；任何 namespace/key 差异都是 cold miss。
 - **identity 相同但 layout 不同**：若命中后 shape/内容异常，同一 namespace+key 被不同 dtype/page/shape/layout 复用；这是 type-safety violation。停止混写，bump source-controlled raw-layout ID，并同时发布所有 writer/reader。
 
@@ -35,7 +35,7 @@ exist 命中 **≠** 数据真被拉回。SGLang HiCache 的 `prefetch-policy=ti
 **指标**：
 - 客户端 access log（`access_log=1`）：`batch_get_auto_sg(N keys) hits=N/N`、`batch_exists prefix=X/N`
 - 服务端读回量：`dfkv_bytes_read_total` 增量 vs 工作集应拉回的字节。远小于应拉回量 = 大量预取被 timeout 砍掉。
-- 客户端会合（**本期新增遥测**）：`dfkv_connector_dedup_hits_total` / `_fetches_total` / `_wait_hits_total` / `_wait_timeouts_total`（GPU 目标另有 `dfkv_connector_gpu_dedup_*`）。
+- 客户端会合：`dfkv_connector_dedup_hits_total` / `_fetches_total` / `_wait_hits_total` / `_wait_timeouts_total`（GPU 目标另有 `dfkv_connector_gpu_dedup_*`）。这组 de-dup 指标**只经 OTLP push** 上报（见 [METRICS.md](METRICS.md) §3.4），SGLang 本地 `/metrics` **不镜像**；C 客户端快照里的原始名是 `dfkv_client_dedup_*`（push 时改名为 `dfkv_connector_dedup_*`）。
 
 **判读**：
 - 会合（node-dedup）**默认关**（R2 A/B 实测 2026-07-17：推理批形状下会合协调开销反噬——dedup-on 热轮 TTFT +19-36% 恶化、批 p99 22s；dedup-off 直连 8× 读放大反而 TTFT −43%、吞吐 +50-71%）。仅多节点环 fabric 带宽吃紧时显式开 `DFKV_CLIENT_NODE_DEDUP=1`，且必须实测热轮为正收益。开了之后才看 `dedup_hits/wait_hits/fetches` 三兄弟。

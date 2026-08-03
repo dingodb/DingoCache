@@ -57,7 +57,10 @@ weighted consistent-hash ring whenever its epoch advances. Two-layer offline
 detection: **layer-2** — etcd lease expiry → MDS view changes → client epoch →
 ring rebuild (authoritative removal, ≤ 30 s); **layer-1** — `PeerHealth` fast
 avoidance short-circuits transport failures to misses during a cooldown. There
-is no post-open membership mutation API in v2.
+is no post-open membership mutation API in v2. For rings still running v1.x
+nodes/clients, `DFKV_MDS_ACCEPT_LEGACY=1` enables a dual-protocol shim on the
+MDS control plane (ring-level isolation still applies) — see
+`docs/DEPLOY.md` §2b.
 
 **Client registration** (who is using dfkv): cache *consumers* (inference
 connector instances — vLLM / LMCache / SGLang HiCache) register themselves with
@@ -178,6 +181,12 @@ docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire p
   Collector → Grafana — opt-in via `DFKV_METRICS_ENABLED=1`, **zero-dependency stdlib
   exporter by default**; see [deploy/observability/CONNECTOR-USAGE.md](deploy/observability/CONNECTOR-USAGE.md)
   and [docs/METRICS.md](docs/METRICS.md) §3.4.
+  Health endpoints differ by daemon: `dfkv_server /readyz` means startup
+  finished + first MDS registration done + current store/RAM health OK
+  (`src/cache/dfkv_server_main.cc:389`); `dfkv_mds /healthz` is pure process
+  liveness (it no longer probes etcd, avoiding CrashLoop storms), while
+  `dfkv_mds /readyz` runs a TTL-debounced etcd probe
+  (`DFKV_MDS_PROBE_CACHE_MS`, default 2500 ms).
 - **Dynamic membership**: the immutable `dfkv_client_options_v2` descriptor
   selects MDS discovery at construction; the client polls MDS and atomically
   rebuilds its weighted Ketama ring on etcd-epoch changes. No mutable
@@ -191,7 +200,8 @@ docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire p
   with no device override each host chooses its first `ACTIVE` local HCA and
   sends an empty device selector to its peer. An explicit comma whitelist opts
   into multi-rail round-robin and therefore must name the intended fabric on
-  both hosts. QPs bootstrap over a tiny TCP channel, so the data fabric needs no
+  both hosts. Device names are limited to 18 bytes in the wire dev frame —
+  longer names fail fast instead of silently truncating (7837f0b). QPs bootstrap over a tiny TCP channel, so the data fabric needs no
   IP. A v2 capability probe is mandatory; protocol, QP, receive-segment, or
   registration mismatch rejects the connection. Unset `DFKV_RDMA` selects TCP;
   once RDMA is requested it never switches transports.
@@ -207,11 +217,14 @@ docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire p
   (`batch_concurrency`) and **fewer/larger keys**. See `docs/datapath-perf-notes.md`.
 - **NUMA-aware rail selection** (`DFKV_RDMA_NUMA=1`): with an explicit
   multi-rail whitelist, prefers an `ACTIVE` rail local to the calling thread,
-  then round-robins the listed healthy rails. Server threads follow their QP's
+  then round-robins the listed healthy rails; when every NUMA-local rail is
+  inadmissible, it degrades to the full enabled rail set instead of refusing
+  traffic (5ef39f1). Server threads follow their QP's
   rail NUMA node; the single shared receive segment is registered on each
   selected rail but is not separately NUMA-allocated per rail. Off by default;
   vendor-neutral (sysfs + `sched_getcpu`, no libnuma/CUDA).
-- **HiCache v2** (PoolTransfer) for multi-pool models (Mamba/SWA/DeepSeek-V4).
+- **SGLang HiCache pool-aware v2 interface** (`batch_set_v2`/`batch_get_v2` +
+  PoolTransfer) for multi-pool models (Mamba/SWA/DeepSeek-V4).
 - **Packaging**: CPack (deb/rpm/tgz) + Dockerfile; **graceful shutdown**; leveled logging.
 
 ## Recommended tuning (v2.0)
@@ -228,9 +241,11 @@ fabric selection and capacity explicit.
 |---|---|---|
 | `--rdma-dev` | leave unset for one local HCA; list the fabric explicitly for multi-rail | Unset selects the first `ACTIVE` local HCA (peer names may differ). A comma list opts into multi-rail, anchors only listed active devices, and requires compatible names/fabric on both hosts; inactive entries are rejected. |
 | `DFKV_DISK_HASH_WEIGHT` | `10` | Flattens the intra-server disk ring share from ±20 % to ±3 % so the hottest disk stops gating the whole node (+5–6 % cold read, ~2× lower p99). **Re-routes existing keys** (cache miss + refill) — flip together with a restart/upgrade window. |
-| `--rdma-depth` | `4` (keep) | Deeper is not itself a throughput knob. It consumes more slots from the fixed shared receive segment. |
+| `--rdma-depth` | `4` | Set explicitly; the server defaults to 1 and the handshake takes min(client/server). Deeper is not itself a throughput knob. It consumes more slots from the fixed shared receive segment. |
 | `--ram-tier` / `--ram-tier-bytes` / `--ram-tier-shards` | on / sized to the node / `16` for ≥100 GiB arenas | Large arenas contend on the shard locks under mixed load (+40 % mixed R/W at 16 shards on a 128 GiB arena); small (≤16 GiB) arenas are fine at the default 8. |
 | `--store-engine` | `slab` | Index rebuilds on restart; removes file-per-block hazards. |
+| `DFKV_TCP_FIRST_REQ_MS` / `DFKV_MDS_FIRST_REQ_MS` / `DFKV_METRICS_FIRST_REQ_MS` | `30000` (default) / `0` = off | First-request deadline per listener: a connection that sends nothing before the deadline is dropped, capping idle pre-auth connections. |
+| `DFKV_METRICS_MAX_CONNS` | `64` (default) | Connection cap on the metrics listener; protects the exporter from connection floods. |
 
 **Production client** (inference connectors, one process per TP rank):
 
@@ -248,7 +263,7 @@ repeat reads of promoted pages hit zero disk**):
 
 | Knob | Recommended | Why |
 |---|---|---|
-| `DFKV_READ_COALESCE` | `1` | Master switch. Concurrent identical GETs share one disk read (sync + io_uring paths), and a whole-value read with convoy evidence is promoted into the RAM arena as a born-durable resident (zero flush cost, evictable at once). Unset = exact pre-1.35 data path. |
+| `DFKV_READ_COALESCE` | `1` | Master switch. Concurrent identical GETs share one disk read (sync + io_uring paths), and a whole-value read with convoy evidence is promoted into the RAM arena as a born-durable resident (zero flush cost, evictable at once). Unset = coalescing/promotion off, restoring the original single-read path. |
 | `DFKV_READ_COALESCE_RECUR_MS` | `1000` (default) | Recurrence window: a lone whole read leaves a 64-byte key fingerprint; an identical read inside the window promotes on completion even when rank drift missed the in-flight overlap. Fingerprints, not payloads — widening it costs ~nothing (64 Ki-entry bound). `0` restores the overlap-only gate. |
 | `DFKV_READ_COALESCE_TIMEOUT_MS` | `500` (default) | Follower wait bound; a waiter whose leader connection dies falls back to its own read instead of hanging. |
 
@@ -258,10 +273,6 @@ Watch `dfkv_read_coalesce_{leaders,coalesced,recur,timeouts}_total` and
 promotion; coalescing alone works without it. Note for env-file deployments:
 the file is *sourced*, so new knobs must be explicitly **exported** by the
 start script or a systemd drop-in to reach the server process.
-
-Order matters when rolling this out: upgrade **servers to v1.34+ first**, then
-widen clients to multi-rail — pre-1.34 servers have no anchor on non-default
-rails and will exhibit the idle re-registration storm described above.
 
 **Benchmark reproduction** (`dfkv_bench`): `DFKV_RDMA=1` (explicit, or it
 silently measures TCP), 8-rail `DFKV_RDMA_DEV`, `DFKV_RDMA_DEPTH=4`,
@@ -273,7 +284,7 @@ then exits `1` if any PUT/GET failed, `2` for invalid CLI usage, and `0` only
 when every requested operation succeeded.
 
 ## Status
-TDD; **264 C++ ctest entries (default) / 288 (RDMA+io_uring) + Python plugin &
-connector tests green**, 0 warnings, **ThreadSanitizer-clean**.
+TDD; **570 C++ ctest entries (default) / 632 (RDMA+io_uring) + Python plugin &
+connector tests green**, **ThreadSanitizer-clean (C++ core)**.
 CI: gcc/clang build+test, TSan, RDMA datapath (Soft-RoCE loopback), RDMA compile-check, static-artifact build. License: Apache-2.0.
 Architecture & design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Rollout: `docs/DEPLOY.md`.

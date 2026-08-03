@@ -1,6 +1,27 @@
 # dfkv RDMA datapath — perf notes & investigated-but-deferred items
 
-## Current datapath (as of 187d241)
+## Current one-sided RDMA v2 payload plane
+
+RDMA v2 uses small two-sided SEND/RECV messages only for requests, descriptors,
+and status:
+
+- PUT uses client `RDMA_WRITE_WITH_IMM` into a lease from the server's registered
+  process-wide receive segment.
+- GET sends the client `{addr,rkey,len}` targets, then the server uses
+  `RDMA_WRITE` to place the value directly into the registered HiCache buffers.
+- Cold values still require a request because their source is NVMe rather than a
+  remotely addressable persistent MR; the server stages the disk read before its
+  one-sided WRITE.
+
+The retired two-sided payload protocol is not a fallback. Capability, QP,
+receive-segment, or registration mismatch rejects the RDMA connection.
+
+The negotiated pipeline depth contract is `qd = min(client depth, server depth)`
+(`DFKV_RDMA_DEPTH` on the client is an upper bound). The server's resolved
+runtime value can be audited live through the `qd=` column of `dfkvctl ring`
+INFO — check it before reasoning about pipelining behavior.
+
+## Retired two-sided plane (187d241, superseded by v2)
 
 - RC **two-sided SEND/RECV**, two-end **zero-copy** (server reads disk straight into
   the registered send buffer; client SEND/RECV scatters straight into the caller's
@@ -65,22 +86,30 @@ Empirical (8x400G IB testbed, 3-node, 1 MiB PUT, single writer thread, batch 64)
   node: the SSD's read latency varies several-fold with other tenants' I/O, which can
   masquerade as a depth effect — interleave depth values within one run to cancel it.
 
-## Current one-sided RDMA v2 payload plane
+The depth-flat and multi-connection results above were collected before the
+one-sided cutover. Under the v2 shared-segment PUT the server no longer receives
+the payload inline in its serve loop (it lands directly in the leased slot via
+`WRITE_WITH_IMM`), and the slab store commits through the async/io_uring write
+path — the mechanism premise behind those numbers has changed. They remain
+useful topology guidance, but absolute throughput and latency claims for
+current v2 require a new hardware run.
 
-RDMA v2 uses small two-sided SEND/RECV messages only for requests, descriptors,
-and status:
+## v2 datapath performance: TBD
 
-- PUT uses client `RDMA_WRITE_WITH_IMM` into a lease from the server's registered
-  process-wide receive segment.
-- GET sends the client `{addr,rkey,len}` targets, then the server uses
-  `RDMA_WRITE` to place the value directly into the registered HiCache buffers.
-- Cold values still require a request because their source is NVMe rather than a
-  remotely addressable persistent MR; the server stages the disk read before its
-  one-sided WRITE.
+No post-cutover hardware run exists yet. The items a v2 perf chapter must
+measure before any absolute claims are made:
 
-The retired two-sided payload protocol is not a fallback. Capability, QP,
-receive-segment, or registration mismatch rejects the RDMA connection.
-
-The depth-flat and multi-connection results above were collected before this
-one-sided cutover. They remain useful topology guidance, but absolute throughput
-and latency claims for current v2 require a new hardware run.
+- **PUT slot-to-durable latency**: client `WRITE_WITH_IMM` slot submission →
+  server commit acknowledgment, at 1 MiB and page-scale payloads, across
+  negotiated `qd` values.
+- **Server `RDMA_WRITE` GET**: warm (RAM-tier) and cold (NVMe → stage → WRITE)
+  paths, single connection vs `batch_concurrency` fan-out; compare against the
+  retired two-sided numbers above.
+- **Commit granularity**: per-slot store batches vs depth on the slab
+  io_uring write path (`dfkv_slab_uring_write_batches_total`).
+- **Depth curve under v2**: re-prove or refute depth-flatness on the one-sided
+  plane (`qd = min(client, server)`; audit the runtime value via `dfkvctl ring`
+  INFO `qd=`).
+- **Shared receive-segment capacity effects**: `DFKV_RDMA_RECV_SEGMENT_SIZE`
+  sizing vs concurrent connection count (`qd`×slot-size lease per connection);
+  exhaustion behavior and its impact on admitted concurrency.

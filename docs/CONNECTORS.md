@@ -31,11 +31,10 @@
 **原生身份/裸值切换是 clean break。** 新 client、server 与 connector 应一起
 升级并接受一次冷缓存；不会读取旧 key，也不会双写旧身份或旧 value 格式。
 
-**版本兼容（v1.34 / v1.35）**：同样零客户端改动，但对接方应知道两件事——
-① **v1.34 服务端多轨 anchor**（`--rdma-dev` 逗号列表）：客户端按 §1.2 配轨亲和后才吃满
-8 轨；推广顺序是**先升服务端**再放开客户端多轨（pre-1.34 服务端对非默认轨无 anchor，
-空闲回收后下一波请求付串行重注册风暴）。
-② **v1.35 读侧 convoy 合并 + RAM 晋升**（服务端 opt-in `DFKV_READ_COALESCE=1`，见根
+**同版本同时具备的服务端能力**（零客户端改动，对接方了解即可）——
+① **服务端多轨 anchor**（`--rdma-dev` 逗号列表）：客户端按 §1.2 配轨亲和后即可吃满
+8 轨；客户端与服务端应同版本整体升级。
+② **读侧 convoy 合并 + RAM 晋升**（服务端 opt-in `DFKV_READ_COALESCE=1`，见根
 README "Recommended tuning"）：TP-N 各 rank 独立进程重复读同页时，服务端把 N 次盘读
 合并/晋升——客户端观察到的效果是**同页重复冷读与重放显著变快**（xb01 实测每重复页盘读
 8→~2.4 次、晋升页复读零盘），无任何客户端配置或行为变化。
@@ -57,7 +56,7 @@ TCP 仍使用当前 versioned native wire。
 | env | 默认 | 说明 |
 |-----|------|------|
 | `DFKV_LIB`（或 `DFKV_BUILD`） | — | `libdfkv.so` 绝对路径（`DFKV_BUILD` 指目录，取 `$DFKV_BUILD/libdfkv.so`）。连接器 config 里的 lib 键优先于 env：HiCache=`lib_path`、vLLM=`lib`、LMCache=`remote_storage_plugin.dfkv.lib` / L2 `lib`。 |
-| `DFKV_MEMBERS` | — | **遗留静态**成员表 `name=ip:port,...`，单节点/简单部署用。生产优先 MDS 发现。 |
+| ~~`DFKV_MEMBERS`~~ | — | 仅测试脚本读取（如 `test/python/rdma_e2e_validate.py`），连接器不读；连接器静态成员走各自 config 的 `members` 键，生产优先 MDS 发现。 |
 
 **MDS 动态发现（生产推荐）**走连接器 config 而非 env：`mds_endpoints=ip:port,...` +
 `mds_group=<group>`（须与 `dfkv_server --group` 一致）。客户端后台轮询 MDS
@@ -72,7 +71,7 @@ cooldown 快速转为 miss。
 
 **客户端注册**（"谁在用 dfkv"）：三条路径在 MDS 发现成功后，自动把本连接器作为消费方
 注册到 `/dfkv/v1/groups/<g>/clients/<id>`（与节点成员表隔离，不入放置环）。死掉的连接器
-key 在 TTL（30s）内自动过期，无显式反注册、无脏 key。v1.15.0 起三条路径（SGLang HiCache /
+key 在 TTL（30s）内自动过期，无显式反注册、无脏 key。三条路径（SGLang HiCache /
 vLLM / LMCache）行为一致，默认开，env `DFKV_CLIENT_REGISTER=0` 或连接器 config
 `client_register=0` 关闭。SGLang HiCache 的注册信息串为 `type=hicache,model=<m>,tp_size=..,
 tp_rank=..,ver=<lib>`（无 `role`——HiCache 是前缀 L3 缓存，无生产/消费角色之分）。观察：
@@ -84,7 +83,7 @@ tp_rank=..,ver=<lib>`（无 `role`——HiCache 是前缀 L3 缓存，无生产/
 | env | 默认 | 推荐 | 说明 |
 |-----|------|------|------|
 | `DFKV_RDMA` | 一般路径未设 = TCP；**vLLM 直连无默认，必须 `1`** | 按连接器选择 | `1` 显式选择 native-verbs RDMA v2；请求 RDMA 后设备或协议不可用会失败，不会自动选择 TCP。`DfkvStoreConnector` 只接收 GPU 设备指针，构造时会关闭并拒绝任何非 RDMA handle。 |
-| `DFKV_RDMA_DEV` | 首个 `ACTIVE` 本地 HCA | 留空让两端各自选本地首口；多轨才显式写同 fabric 白名单 | 留空时 bootstrap 不发送设备名，client/server 可使用不同本地命名。逗号列表显式开启多轨，新连接在健康轨间轮转；显式设备名会发给 peer，故两端必须存在同名且互通的 fabric。 |
+| `DFKV_RDMA_DEV` | 首个 `ACTIVE` 本地 HCA | 留空让两端各自选本地首口；多轨才显式写同 fabric 白名单 | 留空时 bootstrap 不发送设备名，client/server 可使用不同本地命名。逗号列表显式开启多轨，新连接在健康轨间轮转；显式设备名会发给 peer，故两端必须存在同名且互通的 fabric。设备名上限 **18 字节**（v2 bootstrap dev frame 限制），超长即 fail-fast 拒绝启动/建连，不会静默截断（见 `src/transport/dev_frame.h`）。 |
 | `DFKV_RDMA_DEPTH` | `1` | 两侧可不同，按容量选 | 握手协商 `min(client,server)` 作为安全窗口。每连接注册 `2 × depth × (18 B + 32 KiB)` 的有界 SEND/RECV control buffer，并从共享 receive segment 租 `depth` 个 slot。 |
 | `DFKV_RDMA_MAX_BLOCK_BYTES` | 64 MiB 安全上限 | 按连接器块几何精确设置 | DCP2 声明本连接最大 PUT/GET block，决定共享 segment 的 slot 大小；超声明请求在客户端失败且不上 wire。声明越准，同一 segment 可容纳的 live/pooled v2 连接越多。 |
 | `DFKV_RDMA_RECV_SEGMENT_SIZE` | 2 GiB | 按下文 live/pooled 连接公式设置 | server 启动时申请，并在每个选中 rail 的共享 PD 上注册；失败会拒绝启动，segment 无可用 lease 时拒绝新连接。 |
@@ -145,23 +144,23 @@ capability；HCA `max_sge` 低于 dfkv 上限时会缩小宽度，高于上限�
 
 **换模型的 tuning 步骤**：
 1. 按上表算出理论值（两条路径都算，取大者——同一集群可能两种都跑）
-2. 起一轮真实负载，读服务端/客户端日志里的 `rdma: max block observed <N>B` 高水位（v1.40+）
+2. 起一轮真实负载，读服务端/客户端日志里的 `rdma: max block observed <N>B` 高水位
 3. 取实测值的 2~4 倍设定，注意**必须同时覆盖原版 L2 路径的整页对象**
 4. 复核服务端日志 `rdma conn: protocol=v2 declared=… control=… shared-slot=… qd=…` 确认生效
 
 🔴 **设小后上层仍只看到 miss——这是最危险的部分。** 超声明的块被判 `kInvalid`，
 而 `kInvalid` 被客户端健康计数刻意忽略，上层 `hits[i] != 1` 与“这页压根没缓存”
-无法区分：不崩、不熔断。v1.40+ 会打 `rdma: block …B exceeds the declared bound
+无法区分：不崩、不熔断。因此会打 `rdma: block …B exceeds the declared bound
 …B` 告警（首次 + 每 1024 次），所以必须纳入日志告警。
 典型踩法：照 L2-bypass 实测的 1.02 MiB 调到 2 MiB，切回原版 L2 后
 2.74 MiB 的整页对象全部静默失效。
 
-> **服务端侧上限 `--max-msg`（v1.40+）**：默认 64 MiB，即"客户端不声明时给多少"。
+> **服务端侧上限 `--max-msg`**：默认 64 MiB，即"客户端不声明时给多少"。
 > 它同时是本服务端接受的**上限**：客户端声明**高于**它会被**明确拒绝连接**并打日志，
 > 而不是悄悄按小的开——后者会让客户端按自己声明的大小发包、打爆对端 recv buffer（RNR/QP 断）。
 > 大集群建议显式设定，否则服务端的内存预算完全由客户端决定，而客户端常由别的团队部署、版本不一。
 
-> ⚠️ 旧 `rail_affinity`（extra_config）**已废弃为 no-op**（v1.2.0）：它按 `tp_rank`
+> ⚠️ 旧 `rail_affinity`（extra_config）**已废弃为 no-op**：它按 `tp_rank`
 > 收窄选轨，但 DP-attention 下每 rank `tp_rank=0`→塌缩单轨。配了只打 stderr 告警。
 > 用 `rdma_numa` / `DFKV_RDMA_NUMA` 替代。
 
@@ -174,7 +173,10 @@ capability；HCA `max_sge` 低于 dfkv 上限时会缩小宽度，高于上限�
 
 两种 prefix 都携带 64-bit tenant hash + 128-bit object digest。旧 epoch 直接
 拒绝而不解码；client/server 必须按 [DEPLOY.md](DEPLOY.md) §4e 的隔离 ring
-方式切换，不能依赖 rolling 混跑兼容。
+方式切换，不能依赖 rolling 混跑兼容。唯一例外是 MDS 控制面：
+`DFKV_MDS_ACCEPT_LEGACY=1` 可让 v2 MDS 以旧 epoch 帧服务 v1.x 节点/客户端的
+注册与心跳（按 epoch 判别，status 按 v1 枚举顺序回声），**数据面仍严格拒绝**——
+v1/v2 须分属不同 group，见 [DEPLOY.md](DEPLOY.md) §2b。
 
 ### 1.4 原生 namespace、对象 key 与 raw value
 
@@ -185,7 +187,10 @@ client registration identity. Unknown flags/version/short structs fail closed.
 There are no post-open membership mutators, operator namespace aliases, or
 geometry parameters. The namespace binds the exact runtime model identity and
 connector raw-layout ID (`sglang-hicache/raw-v1`, `vllm/raw-v1`,
-`lmcache/raw-v1`).
+`lmcache/raw-v1`). 可调字段只有 `tenant_id`（默认 `default`）与
+`model_revision`（默认取 model identity），走各连接器的 extra_config/config 键
+（§2.2 / §3.4 / §4.5）——多租户隔离或模型版本滚动时显式分开
+namespace；operator namespace alias 一律被拒绝（fail-closed）。
 
 所有 connector 的对象 key 都是 self-delimiting binary bytes，编码顺序为：
 
@@ -234,13 +239,15 @@ page/chunk size、shape、层顺序或内存布局是**operator error**，不会
 | `DFKV_CONNECTOR_BATCH_MAX_KEYS` | 连接器各异（LMCache 512） | 单次 native 批量最大 key 数 |
 | `DFKV_CONNECTOR_GET_PARALLELISM` | 连接器各异（LMCache 1） | 并发 batched-get 组数（=线程池 worker 数），提高可降 TTFT |
 | `DFKV_CONNECTOR_ASSUME_EXISTS` | `0` | 跳过 load 前的 Exist 探测（省一次探测、换可能 miss；调试用） |
-| `DFKV_TP_RANK` | — | tensor-parallel rank（MLA 场景仅 rank 0 写） |
+| `DFKV_TP_RANK` | — | 仅 vLLM connector：用作 `connector_id` 遥测 label 的 rank 后缀；写复制/缓存身份由 canonical key 决定，不受它影响 |
+| `DFKV_CLIENT_NODE_DEDUP` | `0` | 客户端侧节点内 rendezvous 去重：同一引擎进程内**并发去同一目标节点的相同 batch 操作合并领头**，免重复 wire 往返。replicated-MLA 场景（vLLM / HiCache）自动置 `1`，显式 `0` 可关 |
+| `DFKV_CLIENT_NODE_DEDUP_GPU` | `0` | 上一条的 GPU（device-pointer）路径开关；vLLM replicated-MLA 在 host dedup 开启且未显式设置时自动 `1` |
 | `DFKV_READ_SHARD_KEYS` | `16` | 每读分片的目标 key 数：把单节点的一组批量 GET 切成多分片并发（少节点环/大 batch 集中单节点时突破 ~166 MB/s/conn 的单连接串行 drain 天花板；宽环上无感） |
 | `DFKV_READ_MAX_CONNS` | `8` | 单节点读分片的并发连接上限（与上一条配对；`1` = 关闭分片） |
 | `DFKV_FANOUT_THREADS` | `32` | 客户端批量操作 fan-out 线程池上限（clamp [1,1024]）；高并发引擎（callers × node-groups ≫ 32）不调会退化 caller-serial，per-call 延迟从 max(group) 变 sum(group) |
 
 以上三条为 **native C 客户端**（`libdfkv.so`）knob，对 HiCache / LMCache / vLLM
-三条接入路径同等生效；生产漂移排查时先看启动 config dump（v1.37+ 全 knob 带来源打印）。
+三条接入路径同等生效；生产漂移排查时先看启动 config dump（全 knob 带来源打印）。
 
 ### 1.6 可观测性（opt-in，全部不占数据路径）
 
@@ -268,8 +275,10 @@ page/chunk size、shape、层顺序或内存布局是**operator error**，不会
 | `DFKV_RAM_TIER` / `DFKV_RAM_TIER_BYTES` | **server** | 写穿 RAM 热层 |
 | `DFKV_SERVER_URING` | **server** | io_uring 异步 GET serve 路径 |
 | `DFKV_SLAB_WRITE` | **server** | slab I/O 模式（默认 direct；`buffered` 为退出开关） |
-| `DFKV_READ_COALESCE` / `_RECUR_MS` / `_TIMEOUT_MS` | **server** | v1.35 读侧 convoy 合并 + RAM 晋升（见根 README "Recommended tuning"） |
+| `DFKV_READ_COALESCE` / `_RECUR_MS` / `_TIMEOUT_MS` | **server** | 读侧 convoy 合并 + RAM 晋升（见根 README "Recommended tuning"） |
 | `DFKV_TENANT_QUOTAS_FILE` / `DFKV_TENANT_DEFAULT_QUOTA_BYTES` | **server** | immutable per-node tenant capacity admission；客户端不要设置 |
+| `DFKV_TCP_FIRST_REQ_MS` / `DFKV_MDS_FIRST_REQ_MS` / `DFKV_METRICS_FIRST_REQ_MS` | **server / mds** | 各 listener 首请求 deadline（默认 30000ms，`0`=关）：deadline 内不发首个请求的连接被踢，防空连接堆积 |
+| `DFKV_METRICS_MAX_CONNS` / `DFKV_MDS_MAX_CONNS` | **mds / metrics** | listener 并发连接上限（metrics 64、MDS 4096），防连接洪泛 |
 
 显式配置的混合车队（部分节点 slab、部分诊断节点 file；部分带 RAM 层）对所有客户端**完全等价**。不配置 flag/env 的节点一律选择 slab；slab 配置无效时拒绝启动，不会自行加入为 file 节点。
 
@@ -339,6 +348,12 @@ sglang serve ... \
 `pcp_size`/`pcp_rank`、`dcp_size`/`dcp_rank`、`layer_num`（仅 L2-bypass 的 SG
 分组控制，不进 namespace/value）、`lib_path`、`batch_concurrency`、
 `rdma_depth`/`require_rdma`/`rdma_numa`、
+canonical namespace 的可配键 `tenant_id`（默认 `default`）、`model_revision`
+（默认取 model identity），以及 identity/layout 字段
+`page_size`（默认 64）/`kv_cache_dtype`/`dtype_tag`/`head_num`/`head_dim`/
+`dp_size`——这些都进 canonical namespace，改动即换 namespace（表现为一次冷缓存）；
+`node_dedup`（对应 env `DFKV_CLIENT_NODE_DEDUP`，见 §1.5）、
+`backup_exist_gate`（save 前的 exist 探测门）、
 `client_stats_poll_s`（10s，`0`=关）、
 访问日志/telemetry 键（`access_log`、`access_log_path`、`metrics`、`tracing`、
 `otlp_endpoint`、`trace_slow_request_ms`、`trace_sample_percent` 等，env 同义项见
@@ -348,6 +363,34 @@ sglang serve ... \
 `pcp_size`/`dcp_size` 默认 `1`，此时对应 rank 固定为 `0`。任一 size
 大于 `1` 时必须显式提供 `0 <= rank < size`；size/rank 不是整数、越界或缺失
 都会在打开 dfkv client 前拒绝启动。PCP/DCP 是物理分片坐标，同一 page hash
+
+#### 多模型/多租户配置（对应 §5 四维度）
+
+分组按最关心配置写：
+
+| 维度 | 配置位点 | 示例 |
+|---|---|---|
+| ① Group | `mds_group` extra_config | `"mds_group":"glm-prod"` |
+| ③ tenant_id | `tenant_id` extra_config | `"tenant_id":"prod-chat"` |
+| ④ model_name | SGLang `--served-model-name`（或 `--model-path` 解析而来） | `--served-model-name glm-5.2` |
+| ④ model_revision | `model_revision` extra_config（默认 = model_name） | `"model_revision":"nvfp4-2026-08"` |
+
+生产双业务线共环配置示例（同模型一权、两 tenant）：
+
+```bash
+sglang serve /models/glm-5.2-nvfp4 --served-model-name glm-5.2 \
+  ... \
+  --hicache-storage-backend-extra-config '{
+    "backend_name":"dfkv","module_path":"dfkv_hicache","class_name":"DfkvHiCache",
+    "interface_v1":1,
+    "mds_endpoints":"10.201.3.10:28150,10.201.3.11:28150",
+    "mds_group":"glm-prod",
+    "tenant_id":"prod-chat",
+    "model_revision":"nvfp4-2026-08"}'
+```
+
+布局参数变化（dtype/量化/层数/TP）**必须 bump `model_revision`**，
+同 model_name+ 默认 revision = 自动隐含同 layout，可能命中 byte-incompatible bytes。
 在不同 rank 上生成不同 canonical object bytes，不能依赖默认 rank。
 
 ### 2.3 HiCache 关键 flag
@@ -365,9 +408,13 @@ sglang serve ... \
 
 - **`interface_v1:1` 必填**，插件 `__init__` 强校验：缺失即 `raise ValueError` 启动失败。
   原因——对 `dynamic` 后端，SGLang 仅在 `interface_v1` 为真时才走零拷贝
-  `batch_set_v1/get_v1`；否则退回 generic `set/get`，而 dfkv 的 generic
-  `get/batch_get` 是未实现的桩 → **写成功、L3 读静默失败**（线上踩过：
-  launch 脚本漏配，14GB 写入但 prefetch 全 miss）。`interface_v1:1` 下 GET
+  `batch_set_v1/get_v1`；否则退回 generic `set/get`。dfkv 的 generic 路径
+  已实现，但相比 `interface_v1` 多一次 host 中间拷贝；且 MLA 模型下 generic
+  路径每个 rank 都会重复写同一页（无 `backup_skip` 单写者判定）。强制
+  `interface_v1` 是为了**拒绝静默降级**——早期版本 generic 还是未实现的桩
+  （线上踩过：launch 脚本漏配，14GB 写入但 prefetch 全 miss）；如今虽已
+  实现，漏配仍会静默带来多一次拷贝与 MLA 重复写，插件仍 fail fast。
+  `interface_v1:1` 下 GET
   payload 经 RDMA 直落 HiCache 宿主页（client 零拷贝）；server O_DIRECT /
   io_uring 直读入注册 buffer，RDMA v2 以 one-sided WRITE 直落 client 目标
   MR，无 payload memcpy。
@@ -410,7 +457,7 @@ sglang serve ... \
   约 +6%，失败自动回同步并有指标。
 - **`DFKV_RDMA_DEPTH` — 两侧无需强制相等。** 握手取最小值，按共享 segment
   容量和连接 fan-out 分别配置即可。
-- **HiCache 命中/吞吐/延迟与 client 注册指标**已在 v1.5.2+ 内，无需额外动作。
+- **HiCache 命中/吞吐/延迟与 client 注册指标**已内置，无需额外动作。
 
 ---
 
@@ -466,11 +513,11 @@ L2-bypass 不需要独立 server 协议，但两项决定 v2 容量：
 nerdctl logs <容器> 2>&1 | grep -c 'L2-bypass ENABLED'
 # 2. 声明真的到了服务端（这行只在客户端真声明时出现）
 journalctl -u dfkv-server | grep 'rdma conn: protocol=v2 declared=.*shared-slot='
-# 3. 块大小与余量（v1.40+）
+# 3. 块大小与余量
 nerdctl logs <容器> 2>&1 | grep 'max block observed'
 nerdctl logs <容器> 2>&1 | grep -c 'exceeds the declared bound'   # 必须为 0
-# 4. 握手耗时（服务端 v1.40+ 诊断构建）
-journalctl -u dfkv-server | grep BOOT-SLOW
+# 4. 协商后的深度窗口（服务端 rdma 协商日志，qd= 为握手取 min(client,server) 的真值）
+journalctl -u dfkv-server | grep 'rdma conn: protocol=v2 declared=' | grep -o 'qd=[0-9]*'
 ```
 
 ## 3. vLLM 直连 — DfkvStoreConnector
@@ -594,13 +641,50 @@ namespace/key 不一致是预期 cold miss。**空环 / MDS 不可达**可直接
 | `transfer_queue_capacity` | `256` | 保持默认，按压测调 | 每个 worker、每个方向的排队上限（`1..65536`）。满队列时非阻塞拒绝新任务：save 立即释放 finish/free fence，load 标记失败并重算；非法值启动即失败。 |
 | `enable_cross_layers_blocks` | `False` | 默认 False | 仅当引擎分页布局层内交错时开 |
 | `lookup_rpc_port` | ipc 自动 | 一般不设 | rank0 前缀查询 RPC，仅 socket 名冲突时设 |
+| `client_register` | `1`（MDS 发现时） | 默认即可 | MDS 客户端注册开关（`0` 关；env `DFKV_CLIENT_REGISTER=0` 等价，见 §1.1） |
+| `tenant_id` | `default` | 多租户时显式设 | canonical namespace 的 tenant 字段（§1.4） |
+| `model_revision` | model identity | 模型版本滚动时显式设 | canonical namespace 的模型版本字段（§1.4）；改动即换 namespace（冷缓存） |
+
+DCP（decode context parallel）宽度/Rank **不是**本表键：连接器从 vLLM 运行时取
+（`get_dcp_group().world_size`），与 `tp_rank=-1`（replicated-MLA 存储坐标）一起进入
+canonical key metadata（§1.4），勿在 extra_config 手工设定。
 
 连接器实现 vLLM `shutdown()` 生命周期钩子：先停止接单并取消排队任务，再等待当前
 native 操作完成、join 收发线程，最后仅关闭一次 native client。因而正常退出不依赖
 daemon 线程或进程终止；过载和退出期间都不会静默留下永久占用的 KV block。
 
+**MLA / SG 坐标语义（v2.0.0 修正点）**：
+- **replicated-MLA**（MLA + TP>1 + DCP≤1）：每次 SAVE 都挂在单一 canonical
+  存储坐标 `tp_rank=-1`；lookup dedup 探测也按 `tp_rank=-1` 原样探测。
+  早期版本按 `tp_rank=0..tp_count-1` 展开探测，永远对不上 `-1` 坐标，
+  replicated-MLA 外部 L3 命中恒为 0——升级到 v2.0.0 连接器前勿在 MLA 生产
+  上预期外部命中。
+- **多 kv_cache_group / SG 分组**：dedup/lookup 探测 chunk 的**全部**显式
+  scatter group（不只是 group 0）；任一组缺失（partial write 或被淘汰）即判
+  未缓存并整 chunk 重写，避免半存 chunk 当命中。
+- **partial save 清理**：PUT 部分失败时，连接器 best-effort `batch_remove`
+  清掉失败 chunk 的各兄弟 group key（`_remove_partial_sg_groups`，不抛、
+  无 remove RPC 时直接跳过），防止半存 chunk 占环容量直到 eviction。
+
 ### 3.5 按场景的推荐配置
 
+- **多模型 / 多租户（生产）**：四维度必须按 §5 显式在 `kv_connector_extra_config` 里设定；
+  **布局参数变化必 bump `model_revision`**。
+  ```json
+  {
+    "kv_connector":"DfkvStoreConnector",
+    "kv_role":"kv_both",
+    "kv_connector_extra_config":{
+      "mds_endpoints":"10.201.3.10:28150,10.201.3.11:28150",
+      "mds_group":"glm-prod",
+      "tenant_id":"prod-chat",
+      "model_revision":"nvfp4-2026-08"
+    }
+  }
+  ```
+  位点映射：`mds_group`（① 环）、`tenant_id`（③）、`model_revision`（④）。
+  `model_name`（④）由 **vLLM 启动 `--model`/`--served-model-name`** 提供，不是 extra_config
+  键；引擎/布局身份全量进 canonical namespace（§1.4）。
 - **单实例 / 单 DP**：`--prefix-caching-hash-algo sha256` + `DFKV_RDMA=1` +
   `batch_concurrency=8` 默认，depth 保持 1。
 - **多 DP / 多实例共享池**：所有实例使用 `--prefix-caching-hash-algo sha256`，
@@ -681,13 +765,38 @@ extra_config:
 生产多 fabric 节点必须用 `DFKV_RDMA_DEV` 过滤出与 cache server 同 fabric
 的本机设备（同型号节点可逗号列全轨，见 §1.2）。
 
-**生产推荐 MDS 动态发现**（节点增减自动生效）：`membership` 改 `mds`，URL endpoint 改成
-dfkv_mds 层 `ip:port` 列表，组名走 URL 末尾 `/<group>`：
+**🔴 生产多模型 / 多租户隔离（in-process 隔离能力的天花板）**
+
+in-process connector 的 canonical namespace（`remote_connector.py:93-117`）字段中
+`model_name` 来自 LMCache upstream `KVCacheMetadata`（必有）；`tenant_id`/`model_revision`
+经 `getattr(metadata, "tenant_id", "default")` 读取——**上游 KunCacheMetadata 不含这两个
+字段**，因此 in-process **`tenant_id` / `model_revision` 全部固定为 `"default"`，无法配置**。
+**layout 参数变化不能用 revision 隔离**。
+
+因此 LMCache in-process **只暴露一个隔离维度**：
+
+| 维度 | 配置位点 | 示例 |
+|---|---|---|
+| ① Group（ring） | **`lmcache.yaml` 的 `url`**（`dfkv://<mds列表>/<group>`）| `dfkv://10.201.3.10:28150/glm-prod-chat` |
+| ③ tenant | ❌ 不可配 | — |
+| ④ revision | ❌ 不可配 | — |
+
+**生产两套模型/两业务线和配置变化的 tenant 隔离 → 用 MP-server L2 adapter（§4.5）**
+（全部字段可设）；in-process 场景要用，只能按业务线分 **group**（同 ring 硬件共
+享但 namespace=业务隔离）：
 
 ```yaml
-  remote_storage_plugin.dfkv.membership: mds
-  remote_storage_plugin.dfkv.url:        dfkv://192.168.0.8:28150,192.168.0.9:28150,192.168.0.10:28150/glm
+# 业务 chat
+remote_storage_plugin.dfkv.url: dfkv://10.201.3.10:28150,10.201.3.11:28150/glm-chat
+
+# 业务 coder (同模型、同布局时)
+remote_storage_plugin.dfkv.url: dfkv://10.201.3.10:28150,10.201.3.11:28150/glm-coder
 ```
+
+🔴 **同 group 同 model_name 参数变化（dtype/量化/层宽度任一变）不允许同 key 复用，
+必须分新的 `<新名>` group tag**（如 `glm` → `glm-nvfp4-m2`）——因为
+in-process 没有 revision 字段可以在编码路径起隔离效应。换一种理解：
+**in-process 的 group tag 包揽 tenant+revision 应该充填的 namespace 角色**。
 
 ### 4.3 启动 vLLM（in-process 路径）
 
@@ -768,11 +877,70 @@ vllm serve <model> --tensor-parallel-size 8 --no-enable-prefix-caching \
     "kv_connector_extra_config":{"lmcache.mp.port":6555}}'
 ```
 
-`adapter_params` 键：`url`（必填，语法同 in-process）、`membership`（`mds` 默认
-或 `static`）、`lib`（否则 `DFKV_LIB`）、必填 `model_name`（MP-server 不会从
-runtime metadata 自动提供）、`mds_poll_ms`（3000）、`num_workers`（8）、
-`max_capacity_gb`（0 = 容量交给 dfkv 自管；>0 开 LMCache 聚合 L2 淘汰，见
-§4.6.6）。MP-server API 不提供足以证明 byte-identical MLA replica 的 model/PP
+`adapter_params` 完整字段（全部可选除非标注必填，经 `from_dict` 校验
+`l2_adapter.py:150-165`）：
+
+| 字段 | 必填 | 默认 | 说明 |
+|---|---|---|---|
+| `url` | ✅ | — | `dfkv://<endpoint>/<group>`。`membership="mds"`（默认）时 `<endpoint>` 是**逗号分隔的 MDS ip:port 列表**（多副本自动 failover/round-robin），`group` 是 client 可见的 ring 名。例：`"dfkv://10.201.3.10:28150,10.201.3.11:28150/glm"`。`membership="static"` 时 `<endpoint>` 是字面 member 字符串（如 `"smoke0064=192.168.5.1:28301"`），`group` 同义 |
+| `membership` | — | `"mds"` | `"mds"`（生产推荐，动态发现 server）或 `"static"`（简单/测试场景） |
+| `lib` | — | `DFKV_LIB` env / 系统路径 | `libdfkv.so` 路径（必须 v2 SOVERSION，无 v1.x 兼容） |
+| `model_name` | ✅ | — | **MP-server 不会从 runtime metadata 自动提供**，须显式写（见下方「多模型隔离」约束），影响 canonical namespace |
+| `tenant_id` | — | `"default"` | tenant 配额/billing 身份（`docs/ARCHITECTURE.md` §8），同模型多业务共用环时可显式区分（§5 key 隔离 §①） |
+| `model_revision` | — | 同 `model_name` | 模型 revision/版本标签——同 model_name 但权重/布局变化时**必须区分**（§5 key 隔离 §②） |
+| `mds_poll_ms` | — | `3000` | 客户端 MDS 环重新发现间隔（毫秒） |
+| `num_workers` | — | `8` | 客户端 I/O 并发度 |
+| `max_capacity_gb` | — | `0` | > 0 时启用 LMCache 聚合 L2 切割（见 §4.6.6）；0 = 容量交给 dfkv 自管 |
+
+**MDS 列表的填写规则**：全部可用 MDS 副本的 `ip:port` 以逗号拼接，无空格。
+client 启动时挨个尝试，失败自动下位。若以后只改了一处且其他已死/未在，
+该副本依旧可用（membership 由 lease 管投入，不由列表管断路）。
+示例（生产 3 副本 MDS 署）：
+
+```json
+"adapter_params":{
+  "url":"dfkv://10.201.3.10:28150,10.201.3.11:28150,10.201.3.12:28150/glm",
+  "membership":"mds",
+  "lib":"/dfkv/lib/libdfkv.so",
+  "model_name":"glm-5.2",
+  "model_revision":"2026-08-04-nvfp4-m2",
+  "tenant_id":"prod-chat",
+  "num_workers":16}
+```
+
+#### 多模型/多租户配置（对应 §5 四维度）
+
+| 维度 | 配置位点 | 示例 |
+|---|---|---|
+| ① Group | `url` 末尾 `/<group>` | `dfkv://10.201.3.10:28150/glm-prod-chat` |
+| ③ tenant_id | `adapter_params.tenant_id` | `"tenant_id":"prod-chat"` |
+| ④ model_name | `adapter_params.model_name`（**必填**） | `"model_name":"glm-5.2"` |
+| ④ model_revision | `adapter_params.model_revision` | `"model_revision":"nvfp4-2026-08"` |
+
+完整生产示例（同模型同参数量化，两业务线分 group + 分 tenant）：
+
+```json
+// chat
+{
+  "adapter_params":{
+    "url":"dfkv://10.201.3.10:28150,10.201.3.11:28150/glm-chat",
+    "model_name":"glm-5.2",
+    "model_revision":"nvfp4-2026-08",
+    "tenant_id":"prod-chat"}
+}
+// coder
+{
+  "adapter_params":{
+    "url":"dfkv://10.201.3.10:28150,10.201.3.11:28150/glm-coder",
+    "model_name":"glm-5.2",
+    "model_revision":"nvfp4-2026-08",
+    "tenant_id":"prod-coder"}
+}
+```
+
+**vs in-process**：只有 MP-server L2 adapter 能配置 tenant_id/model_revision；
+in-process 上游 metadata 无这两项（见 §4.3 🔴）。对生产参与 tenant 配额或
+参数变化隔离场景的**唯一选项是本 adapter**。MP-server API 不提供足以证明 byte-identical MLA replica 的 model/PP
 元数据，因此对象 key 始终保留 `world_size/global_rank` identity，并拒绝手工折叠开关。
 server 的 pinned L1 arena 在 LMCache 传入 `l1_memory_desc` 时自动注册 RDMA 零拷贝。
 
@@ -825,7 +993,9 @@ connector 移植自 dingofs 项目的 LMCache connector，与 HiCache 插件走�
 buffer）；dfkv 无此限制，直接存 LMCache 的 `full_chunk_size_bytes`（可几十 MiB）。
 dfkv value 是 raw payload；权威存储长度保存在 store metadata 中并独立于 payload
 返回。LMCache 的末个 chunk 可能不满，若用满块大小调用 fixed-size GET，会因
-stored length 不等而 miss。变长 get 解决这个问题：
+stored length 不等而 miss。变长 get 解决这个问题（另注：GET 目标 buffer
+不可写/非连续时 native 层 fail-loud 抛错，向上冒泡为该 chunk miss，而非假命中，
+见 **②** 的 pointers 一条）：
 - C++：`KVClient::GetAuto(key, out, cap, *out_len)` /
   `BatchGetAuto(items, *out_lens)`；只要实际长度 `<= cap` 就返回 raw bytes 与长度。
 - C ABI：`dfkv_get_auto` / `dfkv_batch_get_auto`。
@@ -835,7 +1005,7 @@ stored length 不等而 miss。变长 get 解决这个问题：
 
 **② pybind11 → ctypes。** dingofs 用 pybind11 原生模块（eventfd 完成队列）；dfkv 直接
 ctypes 调 `libdfkv.so`（与 HiCache 插件一致）。C ABI 同步且内部线程安全：`dfkv_batch_*`
-阻塞、内部线程池跨 owning node 并行 fan-out；成员 ring 有互斥锁，**一个 `dfkv_open`
+阻塞、内部线程池跨 owning node 并行 fan-out；成员 ring 有互斥锁，**一个 `dfkv_open_v2`
 handle 可多线程共享**。`ctypes.CDLL` 调用期间释放 GIL，把阻塞调用派发到
 `ThreadPoolExecutor` 即得真并发——无需原生 demux 线程或跨线程 Future 桥接。
 
@@ -869,8 +1039,11 @@ integration/lmcache/
 3. 专用 `ThreadPoolExecutor(max_workers=get_parallelism)`，`loop.run_in_executor` 派发
    阻塞 ctypes 调用。`close()` 先停止接收新任务并等待已提交调用结束，再
    `dfkv_close`，避免 native handle 与在飞调用竞态。
-4. 零拷贝指针：`(c_char*nbytes).from_buffer(mv)` 直接别名可写连续 buffer；只读 buffer
-   退回 `from_buffer_copy`。keepalive 对象保活到 C 调用返回。
+4. 零拷贝指针：`(c_char*nbytes).from_buffer(mv)` 直接别名可写连续 buffer。PUT 对
+   只读 buffer 退回 `from_buffer_copy` staging（数据先拷入 staging，再发 native）；
+   **GET 不作 staging**——目标 buffer 不可写或非 C 连续时，在**所有 native 调用之前**
+   `raise ValueError`（fail-loud，连接器上层把它当 miss 处理），绝不返回指向
+   staging 副本的假命中。keepalive 对象保活到 C 调用返回。
 5. 返回结构：`batch_set→(ok, per_key)`；`batch_get→(ok, per_key, lengths)`；
    `batch_exists→per_key`。
 
@@ -927,9 +1100,12 @@ refresh 前 ring 可能为空，早期操作安全 miss（LMCache 重算）。
 - **L2 adapter**：`integration/lmcache/tests/test_l2_adapter.py`（单测，fake client）、
   `test_l2_adapter_integration.py`（真环集成）。
 
-### 4.7 实测结果（参考）
+### 4.7 实测结果（历史实测，参考）
 
-环境：a100（vLLM 0.21 + LMCache 0.4.5）；dfkv = 2 节点 static 成员（TCP 18800 / RDMA
+> ⚠️ 下表是 **vLLM 0.21 + LMCache 0.4.5** 旧栈上的历史实测（相对收益方向仍
+> 可参考），v2.0.0 原生身份/传输栈下的绝对值需以新实测与新部署为准。
+
+环境：a100（vLLM 0.21 + LMCache 0.4.5，历史实测）；dfkv = 2 节点 static 成员（TCP 18800 / RDMA
 18801）；DeepSeek-R1-Distill-Qwen-32B（TP=1）；`chunk_size=16`（每 chunk ≈4 MiB）；
 bench random 16000-in / 100-out，20 prompts，并发 10，同 `--seed`。冷遍写入约 **81 GB**。
 
@@ -956,7 +1132,7 @@ prompt ≈4 GB KV」的 TTFT）：
 
 ### 4.8 已知问题 / 排查
 
-- **vLLM 在请求被中止时崩溃**：LMCache 0.4.5 + vLLM 0.21 在 `FINISHED_ABORTED` 时
+- **vLLM 在请求被中止时崩溃**（历史实测栈 LMCache 0.4.5 + vLLM 0.21 观察）：在该旧栈上 `FINISHED_ABORTED` 时
   scheduler 进程 `vllm_v1_adapter.request_finished` 会 `assert self.lmcache_engine is not
   None` 崩溃。**与 dfkv 无关**（任何 remote backend 都触发），正常完成请求不走该路径；上游已知。
 - **启动日志没有 `DfkvConnector ready`**：查 `lmcache.yaml` 的 `module_path/class_name/url`，
@@ -990,6 +1166,99 @@ parallel coordinates、component 或 scatter width 的任何差异。
 payload bytes 完全兼容。
 
 共池铁律：**control plane 可共享；identity 不同是冷缓存；identity 相同必须 byte-compatible。**
+
+### 5.1 多模型/多租户生产隔离四维度
+
+生产环境跑多套模型或同模型多业务时，按四个维度组合隔离（独立起效，全组合生效）。
+**建议全部四列都设**，否则撞上跨写/错读开头后很难查。
+
+#### ① Group（环归属）
+
+同一个 etcd 里多个 group = 各自的 membership/ring。**不同业务线分 group**
+（`mds_group`；in-process LMCache 的 `url` 尾段；MP-server 的 `url` 尾段）。
+server 只入一个 group（flag），client 只看到本组 server，无跨组走 wire 的场景。
+特殊场景（如 K3 KV pool 供同一模型多个 DP rank 共享）则有意共用同 group。
+
+#### ② canonical namespace（模型身份 + 布局）
+
+每条 connector 启动时浇出一个 sources-controlled namespace descriptor：
+`model_identity` + `model_revision` + `tenant_id` + `dtype` + `block_tokens` +
+`num_layers` + `tp/dp/pp_size` + `group_layout`。这些都进 BlockKey 的 SHA-256，任一不同
+均冷 miss。**同名模型但参数/布局不同（dtype、量化、TP 组布局、header/cache dtype）必须
+靠显式 `model_revision` 或 `tenant_id` 隔离**，否则高概率复用到不可解释的
+bytes（见下）。
+
+#### ③ tenant_id（配额与计费）
+
+`tenant_id` 进 BlockKey（64-bit tenant hash）**且**进配额 admission（default+strict hash
+表，`dfkv_tenant_quota.py` 管理）。生产多模型共环时，为每个业务线分配一个
+tenant_id（如 `prod-chat`、`prod-coder`、`dev-ab`），可以同时拿到
+*该业务的 usage 配额*与*身份隔离*。tenant_id 只影响 identity/quota，**不构成 ACL**——
+任何能到达端口的 client 都可以自报 tenant_hash（`docs/ARCHITECTURE.md` §8）。
+
+#### ④ model_name / model_revision（显式模型版本标签）
+
+- `model_name`：精确模型 identity（如 `glm-5.2`、`deepseek-v2-lite`）。MP-server/
+  in-process LMCache 必填（不自动从 runtime metadata 提供）。
+- `model_revision`：同 `model_name` 但权重、量化、并发点切边时间不同（如
+  `2026-08-04-nvfp4-m2`、`fp8-ep16-团子`）时的**必修标签**。默认值 = `model_name`；
+  不同时**必须显式设置**，否则同 model_name 不同布局会命中成 byte-incompatible 冷数据。
+
+### 5.2 三套生产配置实例
+
+**A. 同模型不同业务线（同 group + 不同 tenant）**
+
+```jsonc
+// 业务 chat: url="dfkv://mds.../glm", tenant_id="prod-chat",
+//                model_name="glm-5.2", model_revision="nvfp4-2026-08"
+// 业务 coder: url="dfkv://mds.../glm", tenant_id="prod-coder",
+//                 model_name="glm-5.2", model_revision="nvfp4-2026-08"
+```
+**效果**：同一 ring；quota 独立；key identity 互不可见（tenant hash 不同）。
+生产建议：为每个 tenant_id 在 `dfkv_tenant_quota.py` 预置配额。
+
+**B. 同模型不同参数量化（同 group + 不同 model_revision）**
+
+```jsonc
+// v1: model_name="deepseek-v4-flash", model_revision="fp8-ep8-0731"
+// v2: model_name="deepseek-v4-flash", model_revision="nvfp4-0731"
+```
+**效果**：同 ring；identity 互 miss；不会被拉错 layout。布局切换（如 FP8
+屁股换 NVFP4）必须 bump model_revision，不允许沿用默认。
+
+**C. 业务线与模型交叉（多 group + 多 tenant）**
+
+```jsonc
+// chat:  mds_group=glm-chat,  tenant_id=prod-chat,   model_name="glm-5.2"
+// coder: mds_group=glm-coder, tenant_id=prod-coder,  model_name="glm-5.2"
+// k3:    mds_group=gcp-chat,  tenant_id=kimi-k3,     model_name="kimi-k3"
+```
+**效果**：三 ring；各 server 只入自身 group；互不可见（group 本身就是权限边）。
+注意 server 只入一个 group——多业务线要么加节点独属 group，要么共用 group 靠 A/B 两
+种组合区分。
+
+### 5.3 排障看 namespace 的第一眼
+
+冷缓存/miss 但 server 写入看起来正常的首要排查对象就是 namespace：
+
+1. **init 行**（access log，见 access_log.md §1）：核对 `init(r0 <model> ...) : ok <membership>` 里的 model 与 endpoint 是否对得上该实例应入的 group/预期 revision。
+2. **client INFO**（`dfkvctl clients --group <g>`）：现册 client 自报的 model_hash（tenant hash 的入口）与 target model_name/model_revision 是否匹配。
+3. **命中率的 identity 欺诈**（hit_rate_funnel.md §①）：model_identity/pcp/dcp/
+  group_layout 任一与预期不同但在同一 MDS group，可用 `dfkv_mds_group_version_skew`
+  指标看环内 client 是否跑错版本。
+
+### 5.4 🔴 对生产环境的硬性警告
+
+1. **布局变化必须 bump 显式 revision**：dtype、量化、层数、TP/PCP/DCP/PP 维度任一
+变化都改变 layout。`model_revision`（connector 级）或 connector 内部
+source-controlled layout ID 必须同步更新；dfkv 本身不保存 header。
+2. **v2 与 v1.x 不能混 wire**：v2 client/server 只收 epoch 6/7 frame，v1.40 前的
+frame 会被 fast-reject（`wire.h:92-108`）。混合代际升级走 MDS 双协议
+（DFKV_MDS_ACCEPT_LEGACY）的受控迁移，不允许双写数据面。
+3. **operator 自定义 namespace 别名被拒**（03d7035）：v2.0.0 起 connector 只接受
+source-controlled layout ID，不允许 runtime 传入部署标签当 payload schema。
+4. **🔴 跨实例 L3 复用必须全实例 `PYTHONHASHSEED=0`**：vLLM block hash 跨进程
+确定性靠固定种子；不设时跨实例命中率呈静默 0（与 replicated-MLA 修复前同签名）。
 
 ---
 
