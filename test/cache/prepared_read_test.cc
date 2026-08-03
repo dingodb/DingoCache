@@ -156,3 +156,44 @@ TEST(PreparedRead, FallbackAbortAndDestructorReleaseFlight) {
 }
 
 }  // namespace
+TEST(PreparedRead, CoalescedRangeDirectHeadShiftByteExact) {
+  ::setenv("DFKV_READ_COALESCE", "1", 1);
+  ::unsetenv("DFKV_RAM_TIER");
+  const fs::path dir =
+      fs::temp_directory_path() / "dfkv_coalesce_direct_head";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  {
+  KvNodeServer server(dir.string(), 1ull << 30);
+  ASSERT_TRUE(server.Healthy());
+  if (server.write_mode() != "direct")
+    GTEST_SKIP() << "fs rejected O_DIRECT (tmpfs): no head-shifted read";
+
+  std::string value(16384, '\0');
+  for (size_t i = 0; i < value.size(); ++i)
+    value[i] = static_cast<char>('a' + (i % 26));
+  ASSERT_EQ(Put(&server, Key(8), value), Status::kOk);
+
+  AlignedBuffer io(1 << 20);
+  for (const uint64_t offset : {13ull, 4093ull}) {
+    const uint64_t length = 5000;
+    const char* data = nullptr;
+    size_t len = 0;
+    size_t value_len = 0;
+    ASSERT_EQ(server.RangeDirectForKey(Key(8), offset, length, io.data(),
+                                       io.size(), &data, &len, &value_len),
+              Status::kOk);
+    EXPECT_EQ(data, io.data());  // payload compacted back to the buffer base
+    EXPECT_EQ(len, static_cast<size_t>(length));
+    EXPECT_EQ(value_len, value.size());
+    EXPECT_EQ(std::memcmp(data, value.data() + offset,
+                          static_cast<size_t>(length)),
+              0);
+  }
+
+  }
+  fs::remove_all(dir);
+  ::unsetenv("DFKV_READ_COALESCE");
+}
+
+}  // namespace

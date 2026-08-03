@@ -916,8 +916,12 @@ Status KvNodeServer::RangeDirectForKey(
           const char* p = nullptr;
           Status s = group_.RangeDirect(key, offset, length, buf, cap, &p, n,
                                         stored_len);
+          // A DIO superset read returns p = buf + head with head in (0, 4095]:
+          // src points INSIDE dst, so this in-place compaction overlaps
+          // (forward) and must be a memmove -- memcpy on an overlap is UB and
+          // can hand shifted bytes to the leader AND every follower.
           if (s == Status::kOk && p && p != buf && *n > 0)
-            std::memcpy(buf, p, *n < cap ? *n : cap);
+            std::memmove(buf, p, *n < cap ? *n : cap);
           return s;
         });
     if (st == Status::kOk && out_data) *out_data = io_buf;
