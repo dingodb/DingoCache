@@ -150,6 +150,45 @@ TEST(KvNodeServerListener, NormalPooledTcpRemainsFunctionalAtLimit) {
   server->Stop();
 }
 
+// A kRange whose declared range length exceeds the payload ceiling can never
+// name a real value: the TCP frontend drops the connection at the same gate
+// as an oversized payload (the RDMA frontend already rejects this shape at
+// its decode/serve gates). Well-formed frames on the same server are
+// unaffected. Regression guard for the hostile-length coalesced-read finding.
+TEST(KvNodeServerListener, RangeLengthBeyondPayloadBoundDropsConnection) {
+  ScopedEnv engine("DFKV_STORE_ENGINE", "file");
+  auto server = StartServer("range_len");
+  server->set_max_request_payload(4096);
+
+  {
+    const int fd = Dial(*server);
+    ASSERT_GE(fd, 0);
+    char pre[kReqPrefix];
+    EncodeReq(pre, WireOp::kRange, BlockKey{1, 2, 3}, 0, 8192, 0);
+    ASSERT_TRUE(net::WriteAll(fd, pre, sizeof(pre)));
+    char rp[kRespPrefix];
+    EXPECT_FALSE(net::ReadAll(fd, rp, sizeof(rp)));
+    ::close(fd);
+  }
+  {
+    const int fd = Dial(*server);
+    ASSERT_GE(fd, 0);
+    const std::string value = "ok";
+    char pre[kReqPrefix];
+    EncodeReq(pre, WireOp::kCache, BlockKey{1, 2, 3}, 0, 0, value.size());
+    ASSERT_TRUE(net::WriteAll(fd, pre, sizeof(pre)));
+    ASSERT_TRUE(net::WriteAll(fd, value.data(), value.size()));
+    char rp[kRespPrefix];
+    ASSERT_TRUE(net::ReadAll(fd, rp, sizeof(rp)));
+    Status st = Status::kIOError;
+    uint64_t data_len = 0;
+    ASSERT_TRUE(DecodeResp(rp, &st, &data_len));
+    EXPECT_EQ(st, Status::kOk);
+    ::close(fd);
+  }
+  server->Stop();
+}
+
 TEST(KvNodeServerListener, ConfigIsHardBoundedAndExported) {
   ScopedEnv engine("DFKV_STORE_ENGINE", "file");
   ScopedEnv max_connections("DFKV_TCP_MAX_CONNS", "999999");

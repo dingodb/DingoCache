@@ -693,25 +693,48 @@ Status KvNodeServer::ProcessRequestForKey(
         if (coalesce_enabled_ && length > 0) {
           // TCP convoy collapse: leader reads via group_.Range into a scratch
           // string sized by the store; followers copy the shared bytes.
-          const size_t cap = length;
-          out_data->resize(cap);
-          size_t n = 0;
-          st = read_coalescer_.Read(
-              key, offset, length,
-              out_data->empty() ? nullptr : &(*out_data)[0], cap, &n,
-              out_value_len,
-              [&](char* buf, size_t bcap, size_t* on, size_t* value_len) {
-                std::string tmp;
-                Status s =
-                    group_.Range(key, offset, length, &tmp, value_len);
-                if (s == Status::kOk) {
-                  size_t m = tmp.size() < bcap ? tmp.size() : bcap;
-                  std::memcpy(buf, tmp.data(), m);
-                  *on = m;
-                }
-                return s;
-              });
-          out_data->resize(st == Status::kOk ? n : 0);
+          //
+          // The client-declared length is UNTRUSTED: sizing the scratch
+          // straight from it lets one forged kRange frame drive an unbounded
+          // allocation (length_error/bad_alloc -> std::terminate, or OOM).
+          // Look up the authoritative stored length first -- an unknown key
+          // must fail here exactly like the plain path, before ANY sized
+          // allocation happens.
+          ValueMetadata metadata;
+          st = LookupForKey(key, &metadata);
+          if (st == Status::kOk) {
+            const uint64_t max_payload = max_request_payload_
+                                             ? max_request_payload_
+                                             : wire_limits::MaxRequestPayload();
+            const uint64_t avail = offset < metadata.value_len
+                                       ? metadata.value_len - offset
+                                       : 0;
+            // cap is an ALLOCATION bound only: the fill still issues
+            // group_.Range with the original (offset, length), so store-side
+            // Range semantics (offset >= value_len, data clamped to the
+            // remainder) are unchanged; a concurrent same-key rewrite stays
+            // the store-level race it already was.
+            const size_t cap =
+                static_cast<size_t>(std::min({length, avail, max_payload}));
+            out_data->resize(cap);
+            size_t n = 0;
+            st = read_coalescer_.Read(
+                key, offset, length,
+                out_data->empty() ? nullptr : &(*out_data)[0], cap, &n,
+                out_value_len,
+                [&](char* buf, size_t bcap, size_t* on, size_t* value_len) {
+                  std::string tmp;
+                  Status s =
+                      group_.Range(key, offset, length, &tmp, value_len);
+                  if (s == Status::kOk) {
+                    size_t m = tmp.size() < bcap ? tmp.size() : bcap;
+                    std::memcpy(buf, tmp.data(), m);
+                    *on = m;
+                  }
+                  return s;
+                });
+            out_data->resize(st == Status::kOk ? n : 0);
+          }
         } else {
           st = group_.Range(key, offset, length, out_data, out_value_len);
         }
@@ -1061,6 +1084,14 @@ void KvNodeServer::Handle(int fd) {
     if (!net::ReadAll(fd, prefix, kReqPrefix)) return;  // peer closed / error
     ReqFields rq;
     if (!DecodeReq(prefix, &rq, max_payload)) return;  // bad version / oversize => drop
+    // Same-source bound for a kRange's declared range length: a value can
+    // never exceed max_payload, so a longer range is always garbage or a
+    // hostile pre-allocation attempt. The RDMA frontend rejects this shape at
+    // its own decode/serve gates (rdma_server.cc); the TCP frontend drops the
+    // connection here so no request handler ever sees it.
+    if (rq.op == static_cast<uint8_t>(WireOp::kRange) &&
+        rq.length > max_payload)
+      return;
     std::vector<char> payload(rq.payload_len);
     if (rq.payload_len && !net::ReadAll(fd, payload.data(), rq.payload_len)) return;
 
