@@ -454,30 +454,47 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 return
 
             # Stored values use explicit scatter-group coordinates (see
-            # _group_segments_sg), so probe group 0 as the block-present proxy.
-            # Lookup uses the same proxy. Probing the bare pool key would miss
-            # every stored group and defeat deduplication.
+            # _group_segments_sg). A chunk is "stored" only when EVERY group
+            # of it is present: group 0 alone is a partial write (a sibling
+            # group failed or was evicted) whose load would fail wholesale,
+            # so it must be rewritten, not skipped in place. Lookup probes
+            # the same full set so both paths agree on "present". Probing
+            # the bare pool key would miss every stored group and defeat
+            # deduplication.
+            max_sg_segs = _sg_segs_of(self.client)
+            probe_keys: list[bytes] = []
+            probe_owner: list[int] = []
+            for i, (k, s, e) in enumerate(zip(keys, starts, ends, strict=True)):
+                for grp in range(
+                    _num_sg_groups(
+                        self.token_databases[group_indices[i]], e - s, max_sg_segs
+                    )
+                ):
+                    probe_keys.append(_sg_group_key(k, grp, max_sg_segs))
+                    probe_owner.append(i)
             save_exists_start = time.perf_counter()
             try:
-                exists_states = self.client.batch_exist(
-                    [_sg_group_key(k, 0, _sg_segs_of(self.client)) for k in keys]
-                )
+                exists_states = self.client.batch_exist(probe_keys)
             except Exception:
                 self._record_operation(
                     "save_exists",
                     save_exists_start,
-                    len(keys),
+                    len(probe_keys),
                     status="error",
-                    num_failed_keys=len(keys),
+                    num_failed_keys=len(probe_keys),
                 )
                 raise
             self._record_operation(
                 "save_exists",
                 save_exists_start,
-                len(keys),
+                len(probe_keys),
             )
+            chunk_missing = [False] * len(keys)
+            for owner, exists in zip(probe_owner, exists_states, strict=True):
+                if exists != 1:
+                    chunk_missing[owner] = True
             missing_indices = [
-                i for i, exists in enumerate(exists_states) if exists != 1
+                i for i, missing in enumerate(chunk_missing) if missing
             ]
 
             if not missing_indices:
@@ -537,7 +554,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             # per explicit scatter group. This cuts the key count ~20x
             # (25392 -> ~1242), making loads bandwidth-bound rather than
             # per-key-bound.
-            sg_keys, sg_ptrs, sg_sizes, _ = _group_segments_sg(
+            sg_keys, sg_ptrs, sg_sizes, sg_owner = _group_segments_sg(
                 keys, addrs, sizes, _sg_segs_of(self.client)
             )
             batch_bytes = sum(sum(s) for s in sg_sizes)
@@ -572,6 +589,45 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         batch_bytes,
                         _key_label(sg_keys[0]) if sg_keys else "N/A",
                     )
+                    # Scrub every sibling group key of each failed chunk so no
+                    # half-stored chunk (group 0 in, siblings out) burns ring
+                    # capacity until eviction; the dedup probe above already
+                    # refuses to call such a chunk stored. Best-effort: never
+                    # raises, skipped entirely without a remove RPC.
+                    rm_start = time.perf_counter()
+                    rm_supported, rm_attempted, rm_confirmed = (
+                        _remove_partial_sg_groups(
+                            self.client, sg_keys, sg_owner, failed
+                        )
+                    )
+                    if rm_attempted:
+                        self._record_operation(
+                            "save_remove_partial",
+                            rm_start,
+                            rm_attempted,
+                            status="ok" if rm_confirmed == rm_attempted
+                            else "partial_failure",
+                            num_failed_keys=rm_attempted - rm_confirmed,
+                        )
+                        logger.debug(
+                            "dfkv save partial-group cleanup: removed %d/%d "
+                            "sibling keys of %d failed chunk(s)",
+                            rm_confirmed,
+                            rm_attempted,
+                            len({sg_owner[i] for i in failed}),
+                        )
+                    elif not rm_supported:
+                        self._record_operation(
+                            "save_remove_partial",
+                            rm_start,
+                            0,
+                            status="unsupported",
+                        )
+                        logger.debug(
+                            "dfkv client has no remove RPC; %d failed chunk(s) "
+                            "keep partial-group residue until eviction",
+                            len({sg_owner[i] for i in failed}),
+                        )
             except Exception as e:
                 self._record_operation(
                     "save_put",
@@ -849,6 +905,62 @@ def _group_segments_sg(
             sg_owner.append(key_idx)
             grp += 1
     return sg_keys, sg_ptrs, sg_sizes, sg_owner
+
+
+# How many explicit scatter-group values _group_segments_sg emits for one
+# chunk. Probing only group 0 would treat a partially-written chunk (group 0
+# present, a sibling group lost to a failed put or eviction) as stored, so
+# dedup/lookup must enumerate this exact set to agree with SAVE/LOAD on what
+# "present" means. Layout selection mirrors data.py prepare_value: the exact
+# per-run seg layout when installed, else the legacy flat base/len tables
+# (one segment per layer per block). An unknown layout (unit-test doubles)
+# degrades to a single group -- the pre-fix probe geometry.
+def _num_sg_groups(db: Any, token_span: int, max_segs: int) -> int:
+    layout = getattr(db, "_seg_layout", None)
+    if layout is not None:
+        segs_per_block = len(layout)
+    else:
+        segs_per_block = max(
+            len(getattr(db, "kv_caches_base_addr", None) or ()),
+            len(getattr(db, "block_len", None) or ()),
+        )
+    num_segments = segs_per_block * (token_span // db.block_size)
+    return max(1, (num_segments + max_segs - 1) // max_segs)
+
+
+# Best-effort remove of every group key of each failed chunk after a partial
+# batch_put_sg: a chunk whose group 0 landed while a sibling failed is
+# half-stored -- probing alone now refuses to call it present, but the
+# orphan still burns ring capacity until eviction. Removing the whole chunk
+# makes the next save a clean full rewrite. Returns (supported, attempted,
+# confirmed); never raises and never blocks the save path. Clients without a
+# remove RPC (older libdfkv) report supported=False and are skipped.
+def _remove_partial_sg_groups(
+    client: Any,
+    sg_keys: list[bytes],
+    sg_owner: list[int],
+    failed: list[int],
+) -> tuple[bool, int, int]:
+    if not failed:
+        return False, 0, 0
+    remove = getattr(client, "batch_remove", None)
+    if remove is None:
+        return False, 0, 0
+    try:
+        supports = getattr(client, "supports_remove", None)
+        if callable(supports) and not supports():
+            return False, 0, 0
+    except Exception:
+        return False, 0, 0
+    bad_chunks = {sg_owner[i] for i in failed}
+    siblings = [k for j, k in enumerate(sg_keys) if sg_owner[j] in bad_chunks]
+    if not siblings:
+        return False, 0, 0
+    try:
+        per_key = remove(siblings)
+    except Exception:
+        return True, len(siblings), 0
+    return True, len(siblings), sum(1 for ok in per_key if ok)
 
 
 # ============================================================
@@ -1579,6 +1691,9 @@ class DfkvStoreWorker:
         # candidate_meta[i] is the (group_id, hash_bytes) for candidate_keys[i].
         candidate_keys: list[bytes] = []
         candidate_meta: list[tuple[int, bytes]] = []
+        # Per-(group_id, hash) hit count required to call the chunk present:
+        # TP*PP rank replicas x the chunk's number of scatter groups.
+        expected_per_chunk: dict[tuple[int, bytes], int] = {}
         tp_count = min(self.tp_size, self.num_kv_head)
         # dfkv: gate candidates by store_mask -- the SAME per-(group,chunk) set
         # the SAVE path stores (worker.py save gate) and the LOAD path reads
@@ -1591,6 +1706,8 @@ class DfkvStoreWorker:
             token_len // self.coord.lcm_block_size * self.coord.lcm_block_size
         )
         store_masks = self.coord.store_mask(aligned_token_len)
+        # SG width is fixed per client/transport; resolve once (cached).
+        max_sg_segs = _sg_segs_of(self.client)
         for g_idx, db in enumerate(self.token_dbs):
             spec_block_size = db.block_size
             mask = store_masks[g_idx]
@@ -1605,23 +1722,30 @@ class DfkvStoreWorker:
             tp_candidates = (
                 [db.metadata.tp_rank] if db.metadata.tp_rank < 0 else range(tp_count)
             )
-            expected_per_key = max(1, len(list(tp_candidates)) * self.pp_size)
+            rank_probes = max(1, len(list(tp_candidates)) * self.pp_size)
             for chunk_id, h in enumerate(group_hashes):
                 start_idx = chunk_id * spec_block_size
                 if start_idx >= token_len:
                     break
                 if chunk_id >= len(mask) or not mask[chunk_id]:
                     continue
+                # Probe EVERY explicit scatter group of the chunk, not just
+                # group 0: a partial write (group 0 present, a sibling group
+                # missing) must count as uncached -- the save dedup gate
+                # rewrites it and the load path needs every group to succeed.
+                n_groups = _num_sg_groups(
+                    db, min(spec_block_size, token_len - start_idx), max_sg_segs
+                )
+                expected_per_chunk[(g_idx, bytes(h))] = rank_probes * n_groups
                 for tp in tp_candidates:
                     for pp in range(self.pp_size):
                         md = dataclasses.replace(db.metadata, tp_rank=tp, pp_rank=pp)
-                        # Probe scatter group 0 so lookup agrees with the exact
-                        # SAVE/LOAD object key.
-                        candidate_keys.append(
-                            _sg_group_key(PoolKey(md, h.hex()).to_bytes(), 0,
-                                          _sg_segs_of(self.client))
-                        )
-                        candidate_meta.append((g_idx, bytes(h)))
+                        base_key = PoolKey(md, h.hex()).to_bytes()
+                        for grp in range(n_groups):
+                            candidate_keys.append(
+                                _sg_group_key(base_key, grp, max_sg_segs)
+                            )
+                            candidate_meta.append((g_idx, bytes(h)))
 
         if not candidate_keys:
             return 0
@@ -1645,12 +1769,15 @@ class DfkvStoreWorker:
             logger.error("Remote connection failed in lookup: %s", e)
             return 0
 
-        # A (group, hash) is "present" only when every TP*PP rank has it.
+        # A (group, hash) is "present" only when every TP*PP rank has every
+        # scatter group of it.
         present_count: dict[tuple[int, bytes], int] = {}
         for gh, exists in zip(candidate_meta, res, strict=True):
             if exists == 1:
                 present_count[gh] = present_count.get(gh, 0) + 1
-        exists_set = {gh for gh, c in present_count.items() if c >= expected_per_key}
+        exists_set = {
+            gh for gh, c in present_count.items() if c >= expected_per_chunk[gh]
+        }
 
         _masks, hit_length = self.coord.find_longest_cache_hit(
             block_hashes, token_len, ExternalCachedBlockPool(exists_set)

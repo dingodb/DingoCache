@@ -335,6 +335,38 @@ class DfkvDeviceClient:
             del key_owners
             return res
 
+    def supports_remove(self) -> bool:
+        """True iff the loaded libdfkv.so exposes the remove RPC (additive)."""
+        return hasattr(self._lib, "dfkv_batch_remove")
+
+    def batch_remove(self, keys: Sequence[bytes]) -> list:
+        """Drop ``keys`` from the ring. Returns ``[1|0]`` per key: 1 iff the
+        owning node confirmed the op (removed or already absent). Used for
+        best-effort cleanup of partially-stored scatter groups. Raises if the
+        lib has no remove RPC."""
+        n = len(keys)
+        if not self.supports_remove():
+            raise RuntimeError(
+                "libdfkv.so has no dfkv_batch_remove (rebuild dfkv with the "
+                "remove RPC to enable partial-SG cleanup)"
+            )
+        with _push_metrics.op("remove", num_keys=n), \
+                _push_tracing.span("batch_remove", n) as _sp, \
+                access_log("batch_remove", lambda: f"{n} keys") as r:
+            karr, klens, key_owners = make_key_array(keys)
+            out = (c_int * n)()
+            rc = self._lib.dfkv_batch_remove(
+                self._h, karr, klens, n, out)
+            if rc != 0:
+                raise RuntimeError(f"dfkv_batch_remove rc={rc}")
+            res = list(out)
+            ok = res.count(1)
+            r.result = f"ok={ok}/{n}"
+            if _sp:
+                _sp.hits = ok
+            del key_owners
+            return res
+
     def close(self) -> None:
         try:
             if getattr(self, "_stats_poller", None):
