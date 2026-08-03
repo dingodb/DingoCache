@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import struct
+import subprocess
 import sys
 import unittest
 from tempfile import TemporaryDirectory
@@ -17,7 +18,7 @@ sys.path.insert(0, str(DEPLOY))
 
 from dfkv_load_regression import bench_once, histogram_delta, histogram_quantile, percentile  # noqa: E402
 from dfkv_membership_audit import decode_registration, info_fields, range_end  # noqa: E402
-from dfkv_node_replace import Replacer  # noqa: E402
+from dfkv_node_replace import Replacer, WorkflowError  # noqa: E402
 from dfkv_tenant_quota import load_quotas, main as quota_main  # noqa: E402
 from dfkv_ops_common import (  # noqa: E402
     members_epoch,
@@ -175,6 +176,33 @@ class ReplacementWorkflowTest(unittest.TestCase):
         workflow.rollback(RuntimeError("cutover failed"))
         self.assertEqual(workflow.actions, [("old", "start")])
         self.assertEqual(workflow.required, [{"n1"}])
+
+    def test_wait_for_retries_command_timeouts_until_predicate_succeeds(self) -> None:
+        transient = subprocess.TimeoutExpired(["dfkvctl", "ring"], 1.0)
+        with patch("dfkv_node_replace.run_command", side_effect=[transient, transient, RING]) as command:
+            workflow = Replacer(self.args())
+            view = workflow.wait_for("replacement ring", workflow.ring)
+        self.assertEqual([member.node_id for member in view.members], ["n1", "n2"])
+        self.assertEqual(command.call_count, 3)
+
+    def test_wait_for_deadline_still_fails_under_persistent_timeouts(self) -> None:
+        args = self.args()
+        args.timeout = 0.05
+        transient = subprocess.TimeoutExpired(["dfkvctl", "ring"], 1.0)
+        with patch("dfkv_node_replace.run_command", side_effect=transient) as command:
+            workflow = Replacer(args)
+            with self.assertRaises(WorkflowError) as raised:
+                workflow.wait_for("replacement ring", workflow.ring)
+        self.assertIn("timed out", str(raised.exception))
+        self.assertGreaterEqual(command.call_count, 2)
+
+    def test_wait_for_retries_os_errors_as_transient(self) -> None:
+        reset = OSError(104, "connection reset by peer")
+        with patch("dfkv_node_replace.run_command", side_effect=[reset, reset, RING]) as command:
+            workflow = Replacer(self.args())
+            view = workflow.wait_for("replacement ring", workflow.ring)
+        self.assertEqual([member.node_id for member in view.members], ["n1", "n2"])
+        self.assertEqual(command.call_count, 3)
 
 
 class MembershipDecodeTest(unittest.TestCase):
