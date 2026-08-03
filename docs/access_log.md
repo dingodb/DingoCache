@@ -12,7 +12,7 @@
 实测样例（一个 TP rank 的文件，含 `init` 与各数据面接口）：
 
 ```
-2026-06-15 20:16:16.727 init(r0 glm-5.1 tp=0/8 mla=1) : ok static <0.000461>
+2026-06-15 20:16:16.727 init(r0 glm-5.2 tp=0/8 pcp=0/1 dcp=0/1 mla=1) : ok mds-discovery transport=rdma <0.000461>
 2026-06-15 20:16:16.734 batch_set_v1(r0 3 keys) : ok 3/3 <0.005716>
 2026-06-15 20:16:16.734 batch_get_v1(r0 3 keys) : hits=3/3 <0.000392>
 2026-06-15 20:16:16.734 batch_exists(r0 3 keys) : prefix=2/3 <0.000110>
@@ -24,6 +24,11 @@
 ```
 
 每行 `<参数>` 都以 `r{tp_rank}` 开头，合并多 rank 文件查看时也能区分来源。
+
+> v2.0.0 起 operator 通过配置自定义 namespace 别名会被**拒绝（fail-closed）**——缓存身份只能由
+> connector 源码里的 canonical namespace 携带。排查命中率第一眼就看 `init` 行：
+> 它打印了 canonical identity 的坐标（`tp=… pcp=… dcp=… mla=…`）与发现/传输方式
+> （`ok static` / `ok mds-discovery transport=…`），写读两侧任何一处不一致都是 cold miss。
 
 ## 配置项
 
@@ -144,11 +149,19 @@ rm -f /etc/dfkv/hot.json
 
 | op | 触发时机 | `<结果>` 取值 |
 |---|---|---|
-| `init` | 插件构造（打开连接 + MDS 发现） | `ok static` / `ok mds-discovery` |
+| `init` | 插件构造（打开连接 + MDS 发现） | `ok static` / `ok mds-discovery`，后接 ` transport=tcp\|rdma` |
+| `register_mem_pool_host` | host KV 池 RDMA 注册 | `registered N region(s)` / `no backing buffer found` / `skip (<异常类型>)` |
+| `register_mem_host_pool_v2` | 多池 host pool（v2 接口） | 同 `register_mem_pool_host`；探测失败会 `raise` |
+| `pool_components` | 多池 layout 探测（随 `register_mem_host_pool_v2`） | `components=(…) replicated=<bool> (ok)` |
+| `register_mem_pool_device` / `register_mem_pool_device_sidecar` / `register_mem_pool_device_draft` / `register_mem_pool_device_draft_sidecar` | GPU 池 / DSA sidecar / draft / draft-indexer 池注册（bypass 下失败即拒启动） | `registered N device region(s)`（sidecar/draft 相应加修饰词）/ `no … device buffer registered`；失败 `failed (<异常类型>)` 并 `raise` |
 | `batch_set_v1` | 零拷贝写（生产热路径） | `ok H/N`；MLA 非 0 号 rank 为 `backup_skip` |
 | `batch_get_v1` | 零拷贝读（生产热路径） | `hits=H/N` |
+| `batch_set_v1_device` | device-directed 零拷贝写（GPUDirect，同语义、同结果格式） | `ok H/N (device-direct)`；MLA 非 0 号 rank 为 `backup_skip` |
+| `batch_get_v1_device` | device-directed 零拷贝读 | `hits=H/N (device-direct)`；截断读追加 ` short_read=S` |
+| `batch_set_v1_device_draft` / `batch_get_v1_device_draft` | DSA draft 池 device-directed 读写（同语义零拷贝） | `ok H/N (draft device-direct)` / `hits=H/N (draft device-direct)`；带 indexer sidecar 时追加 ` +indexer H/N`；复制 draft 的非 0 号 rank 写为 `backup_skip` |
 | `batch_exists` | 前缀命中探测 | `prefix=N/total` |
-| `batch_set_v2` / `batch_get_v2` | 多池（Mamba/SWA/DeepSeek-V4） | 逐池 `kv ok=3/3, extra ok=3/3` |
+| `batch_set_v2` / `batch_get_v2` | 多池（Mamba/SWA/DeepSeek-V4） | 逐池 `kv ok=3/3, extra ok=3/3`；put 重试恢复时追加 ` retry_ok=N` |
+| `batch_set_v2_device` / `batch_get_v2_device` | 多池 device-directed（DSA L2-bypass：anchor kv 池 + sidecar 均走 GPU 直达） | `kv N/n (device-direct); <pool> ok=…`；put 重试恢复时追加 ` retry_ok=N` |
 | `batch_exists_v2` | 多池前缀探测 | `kv=K/total <pool>=…` |
 | `set` / `get` | generic 单页读写 | `ok`/`fail`/`fail none`；`hit`/`miss`，参数带字节数 |
 | `batch_set` / `batch_get` | generic 批量（循环 set/get） | `ok H/N` / `hits=H/N` |
@@ -156,6 +169,7 @@ rm -f /etc/dfkv/hot.json
 
 > 异常会被记成 `... : FAIL <异常类型>: <信息>` 并**照常向上抛出**（不吞异常）。
 > `init` 里若 `dfkv_open` / 发现启动失败即属此类。最早的 `interface_v1` 必填校验在日志配置之前就 `raise`，不记录。
+> `retry_ok=N`（put 重试恢复计数，见 `dfkv_hicache.py` `_put_retry_recovered`）对 `batch_set_v1` / `batch_set_v1_device` / `batch_set_v2` / `batch_set_v2_device` 一律追加在结果尾部。
 
 ## 性能
 

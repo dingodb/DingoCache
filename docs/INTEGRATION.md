@@ -1,16 +1,20 @@
 # Optional: fuse dfkv semantics into production dingo-cache (brpc + MDS)
 
-> **Status — read first.** The primary, supported way to run dfkv is the
-> **standalone repo** with its own daemon + native-verbs RDMA transport
-> (`dfkv_server`, see `docs/DEPLOY.md`). It is feature-complete and validated on
-> 400G. The standalone path now includes its **own lightweight MDS** (`dfkv_mds` +
-> etcd) for dynamic membership and service discovery — it does **not** require or
-> touch the production dingo-cache MDS. This document is an **optional,
-> aspirational** guide for an alternative path: re-implementing the same
+> **Status — archived design note (pre-v2), read first.** The primary, supported
+> way to run dfkv is the **standalone repo** with its own daemon + native-verbs
+> RDMA transport (`dfkv_server`, see `docs/DEPLOY.md`). The standalone path
+> includes its **own lightweight MDS** (`dfkv_mds` + etcd) for dynamic membership
+> and service discovery — it does **not** require or touch the production
+> dingo-cache MDS. This document is an **optional, aspirational** guide for an
+> alternative path that was never productized: re-implementing the same
 > Cache/Range/Exist semantics *inside* the production `dingo-cache` (brpc + MDS +
 > DiskCache) so HiCache could talk to the existing cache fleet over brpc instead
-> of dfkv_server. It is **not required** for deployment and parts may be stale —
-> re-confirm line refs on the build tag. Most users want `DEPLOY.md`, not this.
+> of dfkv_server. It was last reconciled against the **pre-v2 codebase** (the
+> v1.x/two-sided-transport era) and does **not** describe the current v2
+> one-sided datapath, `dfkv_open_v2` constructor, or canonical identity codec —
+> re-confirm every line ref and mechanism claim on the current build tag before
+> acting on it. It is **not required** for deployment. Most users want
+> `DEPLOY.md`, not this.
 
 To wire the semantics into the full dingofs build, apply the following.
 **Compile in the full toolchain (gcc-13 / cmake-3.30 / dingo-eureka).**

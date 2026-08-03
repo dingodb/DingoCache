@@ -184,9 +184,15 @@ Production discovery uses MDS.
   `DFKV_RDMA_BATCH_OP_TIMEOUT_MS` applies to every multi-item method, including
   Cache/Range/Exist batches, zero-copy variants, and both SG variants; unset
   follows `DFKV_RDMA_OP_TIMEOUT_MS`.
-- With an empty device selector each side chooses its own first ACTIVE local HCA,
-  so host-local names may differ. An explicit comma list is a cross-host
-  whitelist and therefore requires the same names/fabric on both peers.
+- With an empty device selector each side chooses its own first ACTIVE local
+  HCA, so host-local names may differ. An explicit comma list is a cross-host
+  whitelist and therefore requires the same names/fabric on both peers. A
+  device name is announced inside the fixed 32-byte v2 bootstrap frame
+  alongside the NUL terminator and the `"DCP2"`/`max_block_bytes`/protocol
+  capability trailer, so names longer than 18 bytes (32 − 1 − 4 − 8 − 1, see
+  `src/transport/dev_frame.h`) are rejected fail-fast at client whitelist and
+  server anchor validation time rather than silently losing the trailer;
+  the fix is a shorter udev/bond alias, not a longer name.
 - Rail health is host-local evidence only. Local device open, verbs/QP
   transition, post, or CQ failures increment the selected rail's failure streak
   and may quarantine that rail. TCP bootstrap, unreachable/incompatible peer,
@@ -196,7 +202,9 @@ Production discovery uses MDS.
   If any enabled configured rail has matching discovery metadata, only that
   stable-index subset competes for credits. Unknown caller topology or no local
   rail falls back to all enabled rails; an explicit device whitelist remains the
-  authoritative candidate set.
+  authoritative candidate set. When every NUMA-local rail is inadmissible
+  (quarantined or credit-bound), admission retries once across every enabled
+  rail — locality is a preference, never an availability gate.
 
 `dfkv_rdma_v2_ready`, receive-segment total/free bytes, registered-rail count,
 opened connections, v2 PUT/GET WRITE counters, client rail-vs-endpoint failure
@@ -295,7 +303,7 @@ quota admission immediately.
 
 ---
 
-## 6. RAM hot tier (P3, opt-in)
+## 6. RAM hot tier (opt-in)
 
 A COLD dfkv load is disk-bound (~480 MB/s O_DIRECT) and dominates PD-decode TTFT.
 The RAM tier fronts the disk with a pre-registered RAM arena so a PD-warm GET is
@@ -373,6 +381,9 @@ data plane or the connection fails.
 | RDMA transport | build `-DDFKV_WITH_RDMA=ON`, `DFKV_RDMA=1` | TCP | active-HCA discovery; `DFKV_RDMA_DEV` is an optional whitelist |
 | RDMA v2 | `DFKV_RDMA=1` | TCP when RDMA was not requested | bounded 32,786-byte control buffers (32-KiB Members data) + mandatory shared registered receive segment |
 | io_uring async GET | build `-DDFKV_WITH_URING`; `DFKV_SERVER_URING=0` disables | on when built, unavailable otherwise | RDMA v2 disk-read path |
+| first-request absolute deadline | `DFKV_TCP_FIRST_REQ_MS` / `DFKV_MDS_FIRST_REQ_MS` / `DFKV_METRICS_FIRST_REQ_MS` | 30000 ms; `0` = off | anchored at accept: the first complete frame/request line is due within this window, so a drip feeder cannot pin a handler thread; `dfkv_server` also publishes its resolved value as the `dfkv_tcp_first_req_ms` gauge |
+| MDS legacy control-plane shim | `DFKV_MDS_ACCEPT_LEGACY=1` | off (strict epoch gate) | widens the MDS control-plane version gate by exactly one epoch so v1.x peers are served with legacy 42/10-byte framing during a mixed-generation migration; data-plane listeners stay strictly epoch 6/7; drop the env once `dfkv_mds_legacy_frames_total` drains to zero |
+| MDS /readyz etcd probe debounce | `DFKV_MDS_PROBE_CACHE_MS` | 2500 ms (clamp 600000; `0` = per-request probe) | TTL-debounced etcd reachability probe so kubelet scrape cadence cannot amplify into etcd read load during an incident |
 
 ---
 

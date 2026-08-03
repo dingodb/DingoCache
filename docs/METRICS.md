@@ -17,10 +17,25 @@
 还要求本地 startup 完成以及（配置 MDS 时）首次注册成功。首次注册 latch 后，
 瞬时 heartbeat 丢失不会清 readiness；用下述 heartbeat 指标单独告警。未配置
 MDS 的 node 仅等待本地 startup 和动态 storage health。
-`dfkv_mds` 的语义不同：`/healthz` 和 `/readyz` 都现场 probe etcd。运行期依赖
-丢失时两者从 200 变 503，scheduler 必须用 `/readyz` 摘流；etcd 恢复后同一
-MDS 进程自动回到 200。
+`dfkv_mds` 的语义不同：`/healthz` 是纯进程 liveness，**不 probe etcd**——
+否则一次秒级 etcd 抖动会让 kubelet 同时重启全部 MDS 副本，CrashLoop 比抖动
+更久并引发 lease 集体过期。`/readyz` 保留 etcd 依赖检查，但经 TTL-debounced
+probe（`DFKV_MDS_PROBE_CACHE_MS`，默认 2500 ms 内复用上次结果，0=恢复逐请求
+现场 probe）：not-ready 副本每 TTL 最多重探一次，kubelet 抓取节奏不会放大成
+etcd 读负载。运行期依赖丢失时 `/readyz` 从 200 变 503，scheduler 必须用它
+摘流；etcd 恢复后同一 MDS 进程自动回到 200。
 
+监听加固 knobs（均 env，resolved 后进 config dump；两进程的 metrics HTTP 还
+支持 `--metrics-bind <addr>` 绑定监听地址，缺省 0.0.0.0）：
+
+| knob | 默认 | 作用 |
+|---|---|---|
+| `DFKV_METRICS_FIRST_REQ_MS` | 30000（0=关，硬上限 3600000） | metrics HTTP 首行请求 absolute deadline（accept 起算），防 drip/silent 连接占 handler |
+| `DFKV_METRICS_MAX_CONNS` | 64（硬上限 4096） | metrics HTTP 并发连接上限，超限直接关闭 |
+| `DFKV_MDS_FIRST_REQ_MS` | 30000（0=关，硬上限 3600000） | `dfkv_mds` 控制面首帧 absolute deadline |
+| `DFKV_MDS_MAX_CONNS` | 4096 | `dfkv_mds` 并发连接上限 |
+| `DFKV_MDS_PROBE_CACHE_MS` | 2500（0=逐请求现场 probe，钳制上限 600000） | `dfkv_mds` `/readyz` etcd probe TTL 去抖 |
+| `DFKV_TCP_FIRST_REQ_MS` | 30000（0=关，硬上限 3600000） | `dfkv_server` 数据面首帧 absolute deadline；resolved 值见 `dfkv_tcp_first_req_ms` |
 
 ```bash
 dfkv_server --dir /mnt/d1,/mnt/d2 --port 12000 --rdma-port 12001 \
@@ -32,7 +47,9 @@ curl -s 127.0.0.1:9100/metrics
 ## 2. 集群 / 环视图（CLI）
 
 > **v1.8.0 起**：`dfkvctl ring` 多一列 `INFO` = 各节点在注册/心跳时自报的
-> `ver=…,engine=…,disks=…,cap=…,ram=…,rdma=…`（运行时真相，非 flag 意图）。
+> `ver=…,engine=…,wr=…,disks=…,cap=…,ram=…,rdma=…,qd=…`（运行时 resolved
+> 真相，非 flag 意图；`wr=` 是 slab 的 direct/buffered resolved 写模式，`qd=`
+> 是 server 端协商后的 pipeline depth）。
 > 全环版本/引擎审计一条命令完成（抓"静默跳升级/引擎不一致"）。`-` = 节点还是
 > 旧版未上报（本身就是版本信号）。信息不参与环 epoch（变更不会触发客户端重建环）。
 > 生效条件：server 与 MDS 都 ≥ v1.8.0（老 MDS 会丢弃该扩展字段）。
@@ -46,17 +63,22 @@ dfkvctl stat <ip:port>                        # 单节点原始 /metrics 文本�
 ## 3. 指标清单
 
 ### 3.1 cache 节点（`dfkv_server` /metrics）
+> 下表只收录告警/排障相关序列，不是全量清单；容量级与诊断序列（per-class
+> slab gauge、rebuild 细节等）以线上 `/metrics` 实际输出为准。
+
 | 指标 | 类型 | 含义 |
 |---|---|---|
-| `dfkv_build_info{version,transport,engine,write_mode}` | gauge | 版本 + 构建传输（rdma/tcp）+ resolved 存储引擎；slab 的 `write_mode` 为 `direct`/`buffered`，显式 file 为 `n/a`；恒为 1 |
+| `dfkv_build_info{version,transport,engine,write_mode[,node,group]}` | gauge | 版本 + 构建传输（rdma/tcp）+ resolved 存储引擎；slab 的 `write_mode` 为 `direct`/`buffered`，显式 file 为 `n/a`；设置 `--id`/`--group` 时追加 `node`/`group` label；恒为 1 |
 | `dfkv_uptime_seconds` | gauge | 启动至今秒数 |
 | `dfkv_storage_healthy` | gauge | 当前 disk group 与显式请求 RAM tier 的 terminal health；0 时 `/healthz`、`/readyz` 均为 503 |
 | `dfkv_cache_put_total` / `cache_hit_total` / `cache_miss_total` | counter | PUT / GET 命中 / GET 未命中 |
 | `dfkv_exist_hit_total` / `exist_miss_total` | counter | Exist 命中 / 未命中 |
+| `dfkv_remove_ok_total` / `remove_miss_total` | counter | Remove 删掉了块 / 目标本就不存在（partial save 清理等路径的诊断分型） |
 | `dfkv_bytes_written_total` / `bytes_read_total` | counter | 读写字节 |
 | `dfkv_accepts_total` | counter | 累计 TCP accept |
 | `dfkv_open_connections` | gauge | 当前打开连接数 |
 | `dfkv_tcp_max_connections` / `dfkv_tcp_io_timeout_seconds` | gauge | cache TCP handler 硬准入上限 / socket I/O 超时的 resolved 配置 |
+| `dfkv_tcp_first_req_ms` | gauge | 首帧 absolute deadline 的 resolved 配置（`DFKV_TCP_FIRST_REQ_MS`，默认 30000，0=关；防 drip 连接占 handler 槽位） |
 | `dfkv_tcp_rejected_connections_total` | counter | 达 handler 上限后拒绝的新 TCP 连接；增长表示 silent/flood 或连接池规模超过预算 |
 | `dfkv_mds_registration_latched{group,node}` | gauge | server 首次 MDS 注册是否完成；成功后保持 1 |
 | `dfkv_mds_first_registration_timeout_ms{group,node}` | gauge | 首次注册 deadline 的 resolved 值；cache daemon 默认 60000，合法配置范围 1000–600000 |
@@ -110,12 +132,16 @@ RDMA 构建额外（折叠进同一 /metrics）：
 | `dfkv_read_coalesce_recur_total` | counter | 命中复现指纹（tombstone）的读——漂移超窗后的晋升证据（v2 驻留窗 `DFKV_READ_COALESCE_RECUR_MS`,默认 1000ms） |
 | `dfkv_read_coalesce_timeouts_total` | counter | follower 等待超时回退自读的次数（`DFKV_READ_COALESCE_TIMEOUT_MS`,默认 500ms;**健康态应恒 0**,持续非零 = leader 连接异常死亡或盘读时延超阈） |
 
-slab 引擎内部（**仅 `--store-engine slab` 时输出**；file 引擎无此系列）：
+slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际引擎判定，不设 flag/env 的默认也命中；file 引擎无此系列）：
 | 指标 | 类型 | 含义 |
 |------|------|------|
 | `dfkv_slab_dio_write_fallback_total` / `dfkv_slab_dio_read_fallback_total` | counter | direct 模式下回退 buffered 的写/读——**非零升高 = page cache 悄悄回来了**（对齐条件被破坏），direct 部署重点盯 |
 | `dfkv_slab_table_sync_total` | counter | slots.tbl fdatasync 周期数（`DFKV_SLAB_TABLE_SYNC_MS`，默认 100ms；限定崩溃复活毒化窗口） |
 | `dfkv_slab_extent_steals_total` / `dfkv_slab_extent_returns_total` | counter | 跨 class extent 抢占（伴随驱逐，容量失衡信号）/ 全空 extent 主动回池（无损再平衡） |
+| `dfkv_slab_cold_steals_total` | counter | 命中"全局最冷 extent"护栏的跨 class 抢占（donor 全部内容都冷于 `DFKV_SLAB_COLD_STEAL_WINDOW` 窗口才走此路，满环自噬护栏；0=窗口关闭） |
+| `dfkv_slab_watermark_evictions_total` | counter | 水位线主动驱逐（`DFKV_SLAB_EVICT_HIGH_PCT`/`_LOW_PCT`，默认 92/88）——赶在 demand 前腾 headroom，满环自噬的第一道防线 |
+| `dfkv_slab_table_rebuilt_objects` / `dfkv_slab_rebuild_scanned_bytes` / `rebuild_scan_chunks` / `rebuild_sparse_ranges` / `rebuild_mmap_scans` | gauge | 上次启动冷升从 slots.tbl 恢复的对象数 / 扫描字节 / chunk / sparse range / mmap 的表数（冷升目录规模诊断） |
+| `dfkv_slab_rebuild_corrupt_records_total` / `rebuild_rejected_records_total` / `rebuild_sequential_fallbacks_total` | counter | 启动 rebuild 丢弃的损坏记录 / 因几何不安全被清除的合法记录 / sparse seek 退化为顺序扫描的次数（任一非零都值得看日志） |
 | `dfkv_slab_deferred_removes_total` | counter | 被在飞 I/O 延迟执行的 Remove |
 | `dfkv_slab_inflight_keys` / `dfkv_slab_prep_holds` | gauge | 锁外 I/O 在飞 key 数 / 未释放的异步 prep 持有数（持续增长 = 泄漏） |
 | `dfkv_slab_reclaimed_total` | counter | 后台回收线程预驱逐的 slot 数（`DFKV_SLAB_RECLAIM_MS`，默认 50ms）——持续为 0 且 PUT 延迟高 = 回收被关或池未满，先查 `--slab-reclaim-ms` |
@@ -138,12 +164,17 @@ RAM 热层（**仅 `DFKV_RAM_TIER=1` 时输出**；关时无此系列，向后�
 | `dfkv_ram_reclaimed_total` | counter | 其中由后台回收线程预驱逐的数量（`DFKV_RAM_RECLAIM_MS`，默认 10ms；flush 积压 >4096 时自动歇拍，此计数暂停属预期） |
 | `dfkv_ram_rebalanced_total` | counter | RAM 层类再平衡搬动的 extent 数（增长阶段不受 flush 积压歇拍影响——从冷 donor 搬 durable extent 恰是 flush-gated 时唯一能扩收速的动作） |
 | `dfkv_ram_objects` / `dfkv_ram_flush_backlog` | gauge | 当前 RAM 常驻块 / 待 flush（未 DURABLE）队列深度 |
+| `dfkv_ram_budget_bytes` / `dfkv_ram_arena_bytes` / `dfkv_ram_large_budget_bytes` | gauge | RAM 层总预算（arena+dedicated）/ arena 固定预留 / 总预算内大对象 dedicated 预留 |
+| `dfkv_ram_used_bytes` / `dfkv_ram_large_used_bytes` | gauge | 已用（常驻 slot + dedicated 分配）/ 其中 dedicated 大对象已用——与上组预算行做水位比 |
 
 > 关键运维信号：COLD `load_get_avg_ms` 骤降 + `dfkv_ram_hit_total` 上升 = RAM 热层生效；`dfkv_ram_put_bypass_total` 或 `dfkv_ram_flush_backlog` 持续升高 = flush 落盘带宽不足，需扩 flush 或降 PUT 速率（见 [docs/ARCHITECTURE.md](ARCHITECTURE.md) §6 背压）。
 
 ### 3.2 MDS（`dfkv_mds` /metrics）
-`dfkv_mds` 自身的 scheduler readiness 不是启动 latch：每次 `/readyz` 请求均
-执行 etcd reachability probe，因此支持 200 → 503 → 200 原地恢复。
+`dfkv_mds` 自身的 scheduler readiness 不是启动 latch：`/readyz` 经
+TTL-debounced etcd probe 判定（`DFKV_MDS_PROBE_CACHE_MS`，默认 2500 ms 内复用
+上次结果，0=逐请求现场 probe），probe 频率由 TTL 去抖决定而非 kubelet 抓取
+节奏；`/healthz` 不探 etcd，恒反映进程存活。因此支持 200 → 503 → 200 原地
+恢复。
 
 
 每环汇总（**v1.10.0 起**；scrape 时 MDS 现场 range 一次 etcd，数值来自各节点心跳携带的 STA1 统计，新鲜度≈心跳周期 10s。全部为 **gauge 语义**——节点重启会使 `_sum` 回落，速率分析请用节点级 counter）：
@@ -246,8 +277,15 @@ C 客户端快照还含传输级指标（RDMA 构建）：
 | `dfkv_connector_info` / `_info_ratio` | gauge | — | 实例信息 / 命中比 |
 | `dfkv_client_peer_latency_avg_seconds` / `_max_seconds` | gauge | `peer` | **逐 dfkv server 节点延迟**（诊断慢节点/慢路径，如跨机房） |
 | `dfkv_client_peer_latency_seconds_count` / `_sum` | counter | `peer` | 逐 peer 延迟采样数 / 总和 |
+| `dfkv_connector_dedup_hits_total` / `fetches_total` / `wait_hits_total` / `wait_timeouts_total` | counter | — | 同主机 rendezvous dedup（命中率漏斗顶部：TP 复制读被合并到 1× 还是按 rank 扇出；timeouts 应趋零） |
+| `dfkv_connector_gpu_dedup_hits_total` / `fetches_total` / `wait_hits_total` / `wait_timeouts_total` | counter | — | 同上 CUDA IPC flavor（GPU destination 走 GPUDirect 时） |
 
 > 逐 peer 延迟由 C++ 客户端主动探测（`DFKV_PROBE_INTERVAL_MS`）：SGLang HiCache 开 metrics 即自动开；vLLM/LMCache 需手动 `export DFKV_PROBE_INTERVAL_MS=5000`。
+
+> dedup 族的 C 快照原始名是 `dfkv_client_dedup_*` / `dfkv_client_gpu_dedup_*`
+> （无 label），OTLP 导出时改写为 `dfkv_connector_` 前缀并按本连接器身份上报。
+> 该族**只经 opt-in OTLP push 输出**：SGLang 插件本地 `/metrics`（§3.3）不镜像，
+> 本地排查只能直接读 C 快照（或在连接器日志/OTLP 管道里看）。
 
 ### 3.5 vLLM 连接器客户端健康（`dfkv-vllm` /metrics，经 prometheus_client，pull）
 §3.4 是 OTLP **push**（opt-in）；此外 vLLM 连接器后台轮询线程读同一 C 客户端快照（`DFKV_CLIENT_STATS_POLL_S`，默认 15s，0=关），把**环/MDS 健康**镜像为带 `{tp_rank}` 的 Gauge，直接落在 vLLM 自带 `/metrics` 上（**无需开 telemetry**）。这样"空环（写无处可去、ok=0）/ MDS 不可达"在 scrape 上可见，而非只在客户端日志里——正是一次生产事故（静默空环）的教训。
