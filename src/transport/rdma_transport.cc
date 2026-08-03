@@ -14,6 +14,7 @@
 #include "utils/net_util.h"     // Dial / WriteAll / ReadAll / Put*/Get*
 #include "utils/numa_util.h"
 #include "transport/rdma_topology.h"
+#include "transport/rail_classify.h"
 #include "transport/rail_select.h"
 #include "transport/rdma_verbs.h"   // RcEndpoint, QpInfo
 #include "transport/rdma_protocol.h"
@@ -91,14 +92,31 @@ std::string JoinDevices(const std::vector<std::string>& devices) {
   return out;
 }
 
+// Local post/CQ/verbs API failures happen below the work-completion layer, so
+// no real WC status exists for them. The reap helpers report such failures as
+// this local-fault bucket so every datapath teardown can funnel through
+// rdma::ClassifyCompletion and attribute them kRailFailure.
+constexpr ibv_wc_status kLocalFaultWcStatus = IBV_WC_GENERAL_ERR;
+
 // Reap one signaled request completion and one status RECV per posted request.
 // Every poll consumes the same absolute deadline; a partial CQ drain cannot
 // restart the timeout budget. slot_count may exceed posted when invalid items
 // were skipped inside a mixed window.
+// On failure the evidence out-params describe what killed the window:
+// worst_status is the first non-SUCCESS reaped status (IBV_WC_SUCCESS when no
+// error WC was observed — deadline expiry or a bogus wr_id), and
+// had_completions whether ANY completion events arrived. Classify them with
+// rdma::ClassifyCompletion before Destroying the connection: a reaped
+// remote-side status or a silent deadline is peer evidence, never rail
+// evidence. A WaitComp CQ/verbs API failure surfaces as kLocalFaultWcStatus.
 bool ReapPosted(rdma::RcEndpoint& ep, size_t posted, size_t slot_count,
                 std::vector<uint32_t>* rbytes, int timeout_ms,
-                bool* timed_out = nullptr) {
+                bool* timed_out = nullptr,
+                ibv_wc_status* worst_status = nullptr,
+                bool* had_completions = nullptr) {
   if (timed_out) *timed_out = false;
+  if (worst_status) *worst_status = IBV_WC_SUCCESS;
+  if (had_completions) *had_completions = false;
   rbytes->assign(slot_count, 0);
   if (posted == 0) return true;
   std::vector<ibv_wc> wcs(2 * posted);
@@ -114,10 +132,19 @@ bool ReapPosted(rdma::RcEndpoint& ep, size_t posted, size_t slot_count,
                                 remaining_ms);
     if (got <= 0) {
       if (got == 0 && timed_out) *timed_out = true;
+      if (got < 0 && worst_status) {
+        // CQ notification/polling itself failed: local rail evidence (the
+        // client never Wake()s a live endpoint; Wake is server shutdown only).
+        *worst_status = kLocalFaultWcStatus;
+      }
       return false;
     }
+    if (had_completions) *had_completions = true;
     for (int i = 0; i < got; ++i) {
-      if (wcs[i].status != IBV_WC_SUCCESS) return false;
+      if (wcs[i].status != IBV_WC_SUCCESS) {
+        if (worst_status) *worst_status = wcs[i].status;
+        return false;
+      }
       if (wcs[i].opcode == IBV_WC_RECV) {
         const size_t slot = static_cast<size_t>(wcs[i].wr_id);
         if (slot >= slot_count) return false;
@@ -131,17 +158,30 @@ bool ReapPosted(rdma::RcEndpoint& ep, size_t posted, size_t slot_count,
 
 bool ReapWindow(rdma::RcEndpoint& ep, size_t width,
                 std::vector<uint32_t>* rbytes, int timeout_ms,
-                bool* timed_out = nullptr) {
-  return ReapPosted(ep, width, width, rbytes, timeout_ms, timed_out);
+                bool* timed_out = nullptr,
+                ibv_wc_status* worst_status = nullptr,
+                bool* had_completions = nullptr) {
+  return ReapPosted(ep, width, width, rbytes, timeout_ms, timed_out,
+                    worst_status, had_completions);
 }
 
 // Post ordinary SEND requests with one status RECV per slot.
 bool RunWindow(rdma::RcEndpoint& ep, const std::vector<size_t>& slen,
                std::vector<uint32_t>* rbytes, int timeout_ms,
-               bool* timed_out = nullptr) {
-  for (size_t j = 0; j < slen.size(); ++j)
-    if (!ep.PostRecv(j) || !ep.PostSend(j, slen[j])) return false;
-  return ReapWindow(ep, slen.size(), rbytes, timeout_ms, timed_out);
+               bool* timed_out = nullptr,
+               ibv_wc_status* worst_status = nullptr,
+               bool* had_completions = nullptr) {
+  for (size_t j = 0; j < slen.size(); ++j) {
+    if (!ep.PostRecv(j) || !ep.PostSend(j, slen[j])) {
+      // A post failure is local verbs evidence: no WC exists to reap, so
+      // report the local-fault bucket for uniform classification.
+      if (worst_status) *worst_status = kLocalFaultWcStatus;
+      if (had_completions) *had_completions = false;
+      return false;
+    }
+  }
+  return ReapWindow(ep, slen.size(), rbytes, timeout_ms, timed_out,
+                    worst_status, had_completions);
 }
 }  // namespace
 
@@ -418,7 +458,7 @@ RdmaTransport::Conn* RdmaTransport::Acquire(
     ::close(fd);
     DFKV_LOG_WARN("rdma: device " + dev +
                   " Open failed; rail failure policy will quarantine it");
-    Destroy(conn);
+    Destroy(conn, rdma::RailCompletion::kRailFailure);
     return nullptr;
   }
 
@@ -886,8 +926,17 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
 
     std::vector<uint32_t> reply_bytes;
     bool timed_out = false;
-    if (ok)
-      ok = ReapWindow(ep, 1, &reply_bytes, op_timeout_ms_, &timed_out);
+    // Post/encode failures above carry no WC evidence and stay a local rail
+    // failure; a failed reap window is classified from its own evidence so a
+    // dead peer cannot poison a healthy local rail.
+    rdma::RailCompletion completion = rdma::RailCompletion::kRailFailure;
+    if (ok) {
+      ibv_wc_status wc_status = IBV_WC_SUCCESS;
+      bool had_wcs = false;
+      ok = ReapWindow(ep, 1, &reply_bytes, op_timeout_ms_, &timed_out,
+                      &wc_status, &had_wcs);
+      if (!ok) completion = rdma::ClassifyCompletion(wc_status, had_wcs);
+    }
     if (timed_out)
       completion_timeouts_.fetch_add(1, std::memory_order_relaxed);
     const uint32_t recv_bytes =
@@ -898,7 +947,7 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
     }
 
     if (!ok) {
-      Destroy(conn);
+      Destroy(conn, completion);
       if (!from_pool) return Status::kIOError;
       continue;
     }
@@ -1017,7 +1066,10 @@ std::vector<Status> RdmaTransport::CacheMany(
     const size_t window = std::min(
         ep.window(), static_cast<size_t>(conn->lease.credits));
     bool conn_ok = true;
-    bool endpoint_failure = false;
+    // Failure attribution for Destroy: post/encode/register failures keep the
+    // local-rail default; a failed reap window is classified from its WC
+    // evidence; wire decode failures blame the peer.
+    rdma::RailCompletion completion = rdma::RailCompletion::kRailFailure;
     for (size_t base = 0; base < count && conn_ok; base += window) {
       const size_t width = std::min(window, count - base);
       std::vector<ibv_mr*> payload_mrs(width, nullptr);
@@ -1055,10 +1107,13 @@ std::vector<Status> RdmaTransport::CacheMany(
       }
       std::vector<uint32_t> reply_bytes;
       bool timed_out = false;
+      ibv_wc_status wc_status = IBV_WC_SUCCESS;
+      bool had_wcs = false;
       if (conn_ok &&
           !ReapPosted(ep, posted, width, &reply_bytes, BatchTimeout(),
-                      &timed_out)) {
+                      &timed_out, &wc_status, &had_wcs)) {
         conn_ok = false;
+        completion = rdma::ClassifyCompletion(wc_status, had_wcs);
       }
       if (timed_out)
         completion_timeouts_.fetch_add(1, std::memory_order_relaxed);
@@ -1072,7 +1127,7 @@ std::vector<Status> RdmaTransport::CacheMany(
         if (reply_bytes[slot] < kRespPrefix ||
             !conn->Decode(ep.rbuf(slot), &status, &data_len, 0)) {
           conn_ok = false;
-          endpoint_failure = true;
+          completion = rdma::RailCompletion::kEndpointFailure;
           break;
         }
         result[item_index] = status;
@@ -1082,8 +1137,7 @@ std::vector<Status> RdmaTransport::CacheMany(
       Release(node, Lane::kData, conn);
       return result;
     }
-    Destroy(conn, endpoint_failure ? rdma::RailCompletion::kEndpointFailure
-                                   : rdma::RailCompletion::kRailFailure);
+    Destroy(conn, completion);
     if (from_pool) continue;
     return result;
   }
@@ -1134,7 +1188,10 @@ std::vector<Status> RdmaTransport::RangeMany(
     const size_t window = std::min(
         ep.window(), static_cast<size_t>(conn->lease.credits));
     bool conn_ok = true;
-    bool endpoint_failure = false;
+    // Failure attribution for Destroy: post/encode/register failures keep the
+    // local-rail default; a failed reap window is classified from its WC
+    // evidence; wire decode failures blame the peer.
+    rdma::RailCompletion completion = rdma::RailCompletion::kRailFailure;
     for (size_t base = 0; base < count && conn_ok; base += window) {
       const size_t width = std::min(window, count - base);
       std::vector<ibv_mr*> output_mrs(width, nullptr);
@@ -1164,9 +1221,13 @@ std::vector<Status> RdmaTransport::RangeMany(
       }
       std::vector<uint32_t> reply_bytes;
       bool timed_out = false;
+      ibv_wc_status wc_status = IBV_WC_SUCCESS;
+      bool had_wcs = false;
       if (conn_ok &&
-          !ReapWindow(ep, width, &reply_bytes, BatchTimeout(), &timed_out)) {
+          !ReapWindow(ep, width, &reply_bytes, BatchTimeout(), &timed_out,
+                      &wc_status, &had_wcs)) {
         conn_ok = false;
+        completion = rdma::ClassifyCompletion(wc_status, had_wcs);
       }
       if (timed_out)
         completion_timeouts_.fetch_add(1, std::memory_order_relaxed);
@@ -1175,7 +1236,7 @@ std::vector<Status> RdmaTransport::RangeMany(
       for (size_t slot = 0; slot < width; ++slot) {
         if (reply_bytes[slot] < kRespPrefix) {
           conn_ok = false;
-          endpoint_failure = true;
+          completion = rdma::RailCompletion::kEndpointFailure;
           break;
         }
         Status status;
@@ -1184,7 +1245,7 @@ std::vector<Status> RdmaTransport::RangeMany(
         if (!conn->Decode(ep.rbuf(slot), &status, &data_len, length,
                           &value_len)) {
           conn_ok = false;
-          endpoint_failure = true;
+          completion = rdma::RailCompletion::kEndpointFailure;
           break;
         }
         result[base + slot] = status;
@@ -1196,7 +1257,7 @@ std::vector<Status> RdmaTransport::RangeMany(
           output.resize(static_cast<size_t>(data_len));
         } else {
           conn_ok = false;
-          endpoint_failure = true;
+          completion = rdma::RailCompletion::kEndpointFailure;
           break;
         }
       }
@@ -1205,8 +1266,7 @@ std::vector<Status> RdmaTransport::RangeMany(
       Release(node, Lane::kData, conn);
       return result;
     }
-    Destroy(conn, endpoint_failure ? rdma::RailCompletion::kEndpointFailure
-                                   : rdma::RailCompletion::kRailFailure);
+    Destroy(conn, completion);
     if (from_pool) continue;
     return result;
   }
@@ -1235,7 +1295,10 @@ std::vector<Status> RdmaTransport::ExistMany(
     const size_t window = std::min(
         ep.window(), static_cast<size_t>(conn->lease.credits));
     bool conn_ok = true;
-    bool endpoint_failure = false;
+    // Failure attribution for Destroy: post/encode/register failures keep the
+    // local-rail default; a failed reap window is classified from its WC
+    // evidence; wire decode failures blame the peer.
+    rdma::RailCompletion completion = rdma::RailCompletion::kRailFailure;
     for (size_t base = 0; base < count && conn_ok; base += window) {
       const size_t width = std::min(window, count - base);
       std::vector<size_t> send_lengths(width);
@@ -1246,8 +1309,11 @@ std::vector<Status> RdmaTransport::ExistMany(
       }
       std::vector<uint32_t> reply_bytes;
       bool timed_out = false;
+      ibv_wc_status wc_status = IBV_WC_SUCCESS;
+      bool had_wcs = false;
       if (!RunWindow(ep, send_lengths, &reply_bytes, BatchTimeout(),
-                     &timed_out)) {
+                     &timed_out, &wc_status, &had_wcs)) {
+        completion = rdma::ClassifyCompletion(wc_status, had_wcs);
         if (timed_out)
           completion_timeouts_.fetch_add(1, std::memory_order_relaxed);
         conn_ok = false;
@@ -1259,7 +1325,7 @@ std::vector<Status> RdmaTransport::ExistMany(
         if (reply_bytes[slot] < kRespPrefix ||
             !conn->Decode(ep.rbuf(slot), &status, &data_len, 0)) {
           conn_ok = false;
-          endpoint_failure = true;
+          completion = rdma::RailCompletion::kEndpointFailure;
           break;
         }
         result[base + slot] = status;
@@ -1270,8 +1336,7 @@ std::vector<Status> RdmaTransport::ExistMany(
       Release(node, Lane::kControl, conn);
       return result;
     }
-    Destroy(conn, endpoint_failure ? rdma::RailCompletion::kEndpointFailure
-                                   : rdma::RailCompletion::kRailFailure);
+    Destroy(conn, completion);
     if (from_pool) continue;
     return result;
   }
@@ -1316,7 +1381,10 @@ std::vector<Status> RdmaTransport::RangeInto(
     const size_t window = std::min(
         ep.window(), static_cast<size_t>(conn->lease.credits));
     bool conn_ok = true;
-    bool endpoint_failure = false;
+    // Failure attribution for Destroy: post/encode/register failures keep the
+    // local-rail default; a failed reap window is classified from its WC
+    // evidence; wire decode failures blame the peer.
+    rdma::RailCompletion completion = rdma::RailCompletion::kRailFailure;
     for (size_t base = 0; base < count && conn_ok; base += window) {
       const size_t width = std::min(window, count - base);
       std::vector<ibv_mr*> output_mrs(width, nullptr);
@@ -1352,10 +1420,13 @@ std::vector<Status> RdmaTransport::RangeInto(
       }
       std::vector<uint32_t> reply_bytes;
       bool timed_out = false;
+      ibv_wc_status wc_status = IBV_WC_SUCCESS;
+      bool had_wcs = false;
       if (conn_ok &&
           !ReapPosted(ep, posted, width, &reply_bytes, BatchTimeout(),
-                      &timed_out)) {
+                      &timed_out, &wc_status, &had_wcs)) {
         conn_ok = false;
+        completion = rdma::ClassifyCompletion(wc_status, had_wcs);
       }
       if (timed_out)
         completion_timeouts_.fetch_add(1, std::memory_order_relaxed);
@@ -1371,7 +1442,7 @@ std::vector<Status> RdmaTransport::RangeInto(
             !conn->Decode(ep.rbuf(slot), &status, &data_len,
                           destinations[item_index].n, &value_len)) {
           conn_ok = false;
-          endpoint_failure = true;
+          completion = rdma::RailCompletion::kEndpointFailure;
           break;
         }
         result[item_index] = status;
@@ -1382,8 +1453,7 @@ std::vector<Status> RdmaTransport::RangeInto(
       Release(node, Lane::kData, conn);
       return result;
     }
-    Destroy(conn, endpoint_failure ? rdma::RailCompletion::kEndpointFailure
-                                   : rdma::RailCompletion::kRailFailure);
+    Destroy(conn, completion);
     if (from_pool) continue;
     return result;
   }
@@ -1447,7 +1517,10 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
     const size_t window = std::min(
         ep.window(), static_cast<size_t>(conn->lease.credits));
     bool conn_ok = true;
-    bool endpoint_failure = false;
+    // Failure attribution for Destroy: post/encode/register failures keep the
+    // local-rail default; a failed reap window is classified from its WC
+    // evidence; wire decode failures blame the peer.
+    rdma::RailCompletion completion = rdma::RailCompletion::kRailFailure;
     for (size_t base = 0; base < count && conn_ok; base += window) {
       const size_t width = std::min(window, count - base);
       std::vector<std::vector<ibv_mr*>> mrs(width);
@@ -1489,10 +1562,13 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
       }
       std::vector<uint32_t> reply_bytes;
       bool timed_out = false;
+      ibv_wc_status wc_status = IBV_WC_SUCCESS;
+      bool had_wcs = false;
       if (conn_ok &&
           !ReapPosted(ep, posted, width, &reply_bytes, BatchTimeout(),
-                      &timed_out)) {
+                      &timed_out, &wc_status, &had_wcs)) {
         conn_ok = false;
+        completion = rdma::ClassifyCompletion(wc_status, had_wcs);
       }
       if (timed_out)
         completion_timeouts_.fetch_add(1, std::memory_order_relaxed);
@@ -1507,7 +1583,7 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
         if (reply_bytes[slot] < kRespPrefix ||
             !conn->Decode(ep.rbuf(slot), &status, &data_len, 0)) {
           conn_ok = false;
-          endpoint_failure = true;
+          completion = rdma::RailCompletion::kEndpointFailure;
           break;
         }
         result[item_index] = status;
@@ -1517,8 +1593,7 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
       Release(node, Lane::kData, conn);
       return result;
     }
-    Destroy(conn, endpoint_failure ? rdma::RailCompletion::kEndpointFailure
-                                   : rdma::RailCompletion::kRailFailure);
+    Destroy(conn, completion);
     if (from_pool) continue;
     return result;
   }
@@ -1613,7 +1688,10 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
     const size_t window = std::min(
         ep.window(), static_cast<size_t>(conn->lease.credits));
     bool conn_ok = true;
-    bool endpoint_failure = false;
+    // Failure attribution for Destroy: post/encode/register failures keep the
+    // local-rail default; a failed reap window is classified from its WC
+    // evidence; wire decode failures blame the peer.
+    rdma::RailCompletion completion = rdma::RailCompletion::kRailFailure;
     for (size_t base = 0; base < count && conn_ok; base += window) {
       const size_t width = std::min(window, count - base);
       std::vector<std::vector<ibv_mr*>> mrs(width);
@@ -1653,10 +1731,13 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
       }
       std::vector<uint32_t> reply_bytes;
       bool timed_out = false;
+      ibv_wc_status wc_status = IBV_WC_SUCCESS;
+      bool had_wcs = false;
       if (conn_ok &&
           !ReapPosted(ep, posted, width, &reply_bytes, BatchTimeout(),
-                      &timed_out)) {
+                      &timed_out, &wc_status, &had_wcs)) {
         conn_ok = false;
+        completion = rdma::ClassifyCompletion(wc_status, had_wcs);
       }
       if (timed_out)
         completion_timeouts_.fetch_add(1, std::memory_order_relaxed);
@@ -1674,7 +1755,7 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
                           capacities[item_index], &value_len) ||
             value_len > std::numeric_limits<size_t>::max()) {
           conn_ok = false;
-          endpoint_failure = true;
+          completion = rdma::RailCompletion::kEndpointFailure;
           break;
         }
         result[item_index] = status;
@@ -1687,8 +1768,7 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
       Release(node, Lane::kData, conn);
       return result;
     }
-    Destroy(conn, endpoint_failure ? rdma::RailCompletion::kEndpointFailure
-                                   : rdma::RailCompletion::kRailFailure);
+    Destroy(conn, completion);
     if (from_pool) continue;
     return result;
   }
