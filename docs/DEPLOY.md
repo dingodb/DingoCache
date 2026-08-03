@@ -110,6 +110,14 @@ journalctl -u dfkv_mds -n 5 --no-pager   # 应见 "dfkv_mds listening on 9400, e
 > 立即返回 503，使 scheduler 摘除该 MDS；etcd 恢复后同一进程自动回到 200。
 > `dfkv_mds` 不因运行期 etcd 短暂故障退出。
 
+> **混合代际滚动（v1.x ↔ v2）**：`DFKV_MDS_ACCEPT_LEGACY=1` 把 MDS 控制面版本闸
+> 按已知 epoch 放宽一档——v1.x 节点/客户端以旧 42/10 字节帧直接被服务（操作码、
+> MemberInfo 载荷、etcd schema、租约语义跨代一致，status 字节按 v1 枚举顺序回声）。
+> 默认关闭 = 历史严格行为（旧 epoch 帧立即拒连）。这**只打通 MDS 控制面**：数据面
+> 仍严格 epoch 6/7，v1/v2 节点与客户端必须各属一个 group（环级隔离），客户端版本
+> 跟随自己的环。迁移期配好后用 `dfkv_mds_legacy_frames_total` 观察旧流量，归零后
+> 撤掉该 env 恢复严格模式。
+
 
 ## 3. 每节点：systemd unit
 如启用示例 quota 文件，先创建（已存在时绝不覆盖）：

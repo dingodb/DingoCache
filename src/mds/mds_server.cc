@@ -16,6 +16,7 @@
 #include "utils/thread_name.h"
 #include "utils/wire_limits.h"
 #include "transport/wire.h"
+#include "transport/wire_legacy.h"
 
 namespace dfkv {
 
@@ -429,12 +430,33 @@ std::string MdsServer::GroupMetricsText() {
 
 void MdsServer::Handle(int fd) {
   while (running_) {
+    // Control-plane epoch discrimination for mixed-generation rollouts. The
+    // leading byte is the deterministic discriminator: native v2 peers write
+    // a 50-byte prefix, legacy v1.x peers a 42-byte one. Unknown epochs still
+    // fail closed — the deliberate fast-reject version gate is widened by one
+    // known epoch (via DFKV_MDS_ACCEPT_LEGACY), not removed. Data-plane
+    // listeners stay strictly epoch-6/7; this shim exists only in the MDS.
     char prefix[kReqPrefix];
-    if (!net::ReadAll(fd, prefix, kReqPrefix)) return;
+    if (!net::ReadAll(fd, prefix, 1)) return;
+    const uint8_t epoch = static_cast<uint8_t>(prefix[0]);
+    bool legacy = false;
     ReqFields rq;
     // MDS frames carry a group name + one MemberInfo (<1 KiB); cap the
     // declared length so a forged prefix can't trigger a giant allocation.
-    if (!DecodeReq(prefix, &rq, wire_limits::kMdsMaxReqPayload)) return;
+    if (epoch == kNativeProtoTcp) {
+      if (!net::ReadAll(fd, prefix + 1, kReqPrefix - 1) ||
+          !DecodeReq(prefix, &rq, wire_limits::kMdsMaxReqPayload)) {
+        return;
+      }
+    } else {
+      if (!accept_legacy_ || epoch != kNativeProtoLegacyTcp) return;
+      if (!net::ReadAll(fd, prefix + 1, kLegacyReqPrefix - 1) ||
+          !DecodeLegacyReq(prefix, &rq, wire_limits::kMdsMaxReqPayload)) {
+        return;
+      }
+      legacy = true;
+      metrics_.legacy_frames.fetch_add(1, std::memory_order_relaxed);
+    }
     std::vector<char> payload(rq.payload_len);
     if (rq.payload_len && !net::ReadAll(fd, payload.data(), rq.payload_len)) return;
 
@@ -473,8 +495,16 @@ void MdsServer::Handle(int fd) {
     }
 
     char rp[kRespPrefix];
-    EncodeResp(rp, st, data.size());
-    if (!net::WriteAll(fd, rp, kRespPrefix)) return;
+    size_t rp_len = kRespPrefix;
+    if (legacy) {
+      // v1.x peers expect a 10-byte prefix and the v1 status byte order
+      // (kIOError=3); the response data itself is generation-neutral.
+      EncodeLegacyResp(rp, st, data.size());
+      rp_len = kLegacyRespPrefix;
+    } else {
+      EncodeResp(rp, st, data.size());
+    }
+    if (!net::WriteAll(fd, rp, rp_len)) return;
     if (!data.empty() && !net::WriteAll(fd, data.data(), data.size())) return;
   }
 }

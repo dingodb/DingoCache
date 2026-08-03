@@ -172,6 +172,7 @@ RAM 热层（**仅 `DFKV_RAM_TIER=1` 时输出**；关时无此系列，向后�
 | `dfkv_mds_members` | gauge | 上次 List 返回的成员数 |
 | `dfkv_mds_local_member_leases` / `dfkv_mds_local_client_leases` | gauge | 本 MDS 进程当前缓存的 member/client lease shortcut 数；只是 etcd 权威状态的有界优化 |
 | `dfkv_mds_local_member_leases_pruned_total` / `dfkv_mds_local_client_leases_pruned_total` | counter | 因多个 TTL 未在本 MDS 使用而丢弃的本地 shortcut；churn 下增长正常，下次心跳会 fresh grant+Put |
+| `dfkv_mds_legacy_frames_total` | counter | 以 v1.x 旧控制面帧（42/10 字节帧）服务的请求数；仅在 `DFKV_MDS_ACCEPT_LEGACY=1` 的混合代际迁移期出现，**归零后应撤掉该 env** |
 
 ### 3.3 客户端（SGLang 插件 /metrics，经 prometheus_client）
 插件后台轮询线程读 C 客户端快照（`client_stats_poll_s`，默认 10s，0=关）并镜像为带 `{tp_rank}` 的 Counter：

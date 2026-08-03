@@ -30,6 +30,11 @@ struct MdsMetrics {
   std::atomic<uint64_t> local_client_leases{0};
   std::atomic<uint64_t> local_member_leases_pruned{0};
   std::atomic<uint64_t> local_client_leases_pruned{0};
+  // Mixed-generation rollout visibility: control frames accepted in the
+  // legacy v1.x control-plane encoding (wire_legacy.h). Operators watch this
+  // drain to zero as the last v1 ring retires, then drop
+  // DFKV_MDS_ACCEPT_LEGACY.
+  std::atomic<uint64_t> legacy_frames{0};
 
   std::string Render() const {
     std::string s;
@@ -60,6 +65,7 @@ struct MdsMetrics {
     m("dfkv_mds_local_client_leases", "gauge", "Client lease shortcuts currently cached in this MDS process", ld(local_client_leases));
     m("dfkv_mds_local_member_leases_pruned_total", "counter", "Idle member lease shortcuts discarded locally", ld(local_member_leases_pruned));
     m("dfkv_mds_local_client_leases_pruned_total", "counter", "Idle client lease shortcuts discarded locally", ld(local_client_leases_pruned));
+    m("dfkv_mds_legacy_frames_total", "counter", "Control frames served in the legacy v1.x control-plane encoding", ld(legacy_frames));
     return s;
   }
 };
