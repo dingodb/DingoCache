@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "common/config_dump.h"
+#include "utils/log.h"
 #include "utils/net_util.h"
 #include "utils/thread_name.h"
 #include "utils/wire_limits.h"
@@ -106,10 +107,32 @@ void KvNodeServer::InitRamTier() {
     for (size_t i = 0; i < sts.size(); ++i) ok[i] = (sts[i] == Status::kOk);
     return ok;
   });
-  if (tier->ok()) ram_ = std::move(tier);  // arena alloc failed => stay disk-only
+  if (tier->ok()) {
+    ram_ = std::move(tier);
+  } else {
+    // An explicitly requested tier that cannot allocate its arena is a startup
+    // failure, not a silent downgrade: the operator sized clients and eviction
+    // around it, and the old disk-only fallback produced nodes whose RAM stats
+    // read as "empty" with no log line explaining why.
+    ram_required_failed_ = true;
+    DFKV_LOG_ERROR("requested RAM tier initialization failed (arena alloc of " +
+                   std::to_string(o.bytes) + " bytes); refusing disk-only startup");
+  }
+}
+
+bool KvNodeServer::Healthy() const {
+  return group_.FailedDirs().empty() && !ram_required_failed_;
 }
 
 Status KvNodeServer::Start(int port) {
+  if (!Healthy()) {
+    for (const auto& d : group_.FailedDirs())
+      DFKV_LOG_ERROR("local storage initialization failed: " + d);
+    DFKV_LOG_ERROR("refusing startup: local storage or RAM tier initialization "
+                   "failed (a node serving in this state would stay in the MDS "
+                   "ring and fail every op routed to it)");
+    return Status::kIOError;
+  }
   listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
   if (listen_fd_ < 0) return Status::kIOError;
   int one = 1;

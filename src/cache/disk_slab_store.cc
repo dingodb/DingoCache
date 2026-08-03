@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <vector>
 
+#include "utils/log.h"
 #include "utils/net_util.h"
 #include "utils/thread_name.h"  // PutU32/PutU64/GetU32/GetU64 (host-endian codec)
 
@@ -122,6 +123,11 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   evict_low_bytes_ = opt_.capacity_bytes / 100 * low_pct;
 
   ok_ = OpenOrInit();
+  if (!ok_)
+    DFKV_LOG_ERROR("slab store init failed for dir " + opt_.dir +
+                   " (errno " + std::to_string(errno) + ": " +
+                   std::strerror(errno) + "); every op on this disk would " +
+                   "return IOError");
   if (ok_) Rebuild();
   if (ok_ && opt_.table_sync_ms > 0) {
     sync_thread_ = std::thread([this] {

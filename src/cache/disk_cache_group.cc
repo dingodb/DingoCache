@@ -79,7 +79,9 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
       if (slab_gran) so.slot_granularity = slab_gran;
       so.table_sync_ms = sync_ms;
       so.reclaim_interval_ms = reclaim_ms;
-      auto slab = std::make_unique<DiskSlabStore>(so);
+      bool store_ok = false;
+      auto slab = std::make_unique<DiskSlabStore>(so, &store_ok);
+      if (!store_ok) failed_dirs_.push_back(dir);
       slabs_.push_back(slab.get());
       // Resolved truth (an fs that rejects O_DIRECT demotes to buffered).
       write_mode_ = slab->DirectWritesActive() ? "direct" : "buffered";

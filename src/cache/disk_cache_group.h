@@ -74,6 +74,11 @@ class DiskCacheGroup {
   const std::string& DiskPath(size_t i) const { return disks_[i]->Dir(); }
   uint64_t DiskUsedBytes(size_t i) const { return disks_[i]->UsedBytes(); }
   size_t DiskObjects(size_t i) const { return disks_[i]->Count(); }
+  // Dirs whose store failed to initialize (slab engine). A failed store still
+  // routes -- every op on it returns kIOError forever -- so startup must be
+  // refused while any entry is present (operator fixes the mount or removes
+  // the dir from --dir).
+  const std::vector<std::string>& FailedDirs() const { return failed_dirs_; }
 
  private:
   static constexpr uint64_t kTokenMask = (1ull << 56) - 1;  // engine token bits
@@ -83,6 +88,7 @@ class DiskCacheGroup {
   std::string engine_;      // resolved backend name (see EngineName)
   std::string write_mode_;  // resolved slab I/O mode (see WriteMode)
   std::vector<std::unique_ptr<StoreEngine>> disks_;
+  std::vector<std::string> failed_dirs_;     // dirs whose store init failed (see FailedDirs)
   std::vector<const DiskSlabStore*> slabs_;  // typed view of disks_ (slab engine only)
   std::unordered_map<std::string, StoreEngine*> by_id_;  // disk id -> store
   ConHash ring_;

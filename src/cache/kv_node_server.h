@@ -32,6 +32,12 @@ class KvNodeServer {
   ~KvNodeServer();
 
   Status Start(int port);  // port 0 => ephemeral; query with port()
+  // False when any --dir slab store failed to initialize or a requested RAM
+  // tier could not allocate its arena. Start() refuses (fail-closed): a node
+  // that served in that state would stay registered with the MDS, keep its
+  // ring shares, and fail every op routed to it -- a zombie member the MDS
+  // lease can never detect.
+  bool Healthy() const;
   void Stop();
   // Cluster member list this node advertises for discovery (kMembers wire op):
   // "name=ip:port,name=ip:port,...". Clients query any node to learn the cluster.
@@ -153,6 +159,7 @@ class KvNodeServer {
   void InitRamTier();     // construct ram_ if DFKV_RAM_TIER is enabled (env)
   void InitAdmission();   // read DFKV_PUT_INFLIGHT_LIMIT (0 = gate off)
   void ReapDoneLocked();  // join+erase finished handler threads; conn_mu_ held
+  bool ram_required_failed_ = false;  // DFKV_RAM_TIER requested but arena alloc failed
   std::atomic<size_t> cache_put_{0}, cache_hit_{0}, cache_miss_{0};
   std::atomic<size_t> exist_hit_{0}, exist_miss_{0};
   std::atomic<size_t> remove_ok_{0}, remove_miss_{0};
