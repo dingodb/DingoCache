@@ -4,8 +4,10 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -155,7 +157,73 @@ TEST(PreparedRead, FallbackAbortAndDestructorReleaseFlight) {
   ::unsetenv("DFKV_READ_COALESCE_TIMEOUT_MS");
 }
 
-}  // namespace
+// Regression (PR237 review #2): a coalesced TCP kRange must size its scratch
+// from the REAL stored length, never from the client-declared range length --
+// a forged multi-exabyte length used to resize the reply string before any
+// storage lookup (one frame -> length_error/bad_alloc -> std::terminate, or
+// OOM). Unknown keys must miss BEFORE any sized allocation, like the plain
+// path. These asserts die on the unfixed code at the first hostile call.
+TEST(PreparedRead, CoalescedRangeClampsHostileLength) {
+  ::setenv("DFKV_READ_COALESCE", "1", 1);
+  ::unsetenv("DFKV_RAM_TIER");
+  const fs::path dir =
+      fs::temp_directory_path() / "dfkv_coalesce_range_clamp";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  {
+  KvNodeServer server(dir.string(), 1ull << 30);
+  ASSERT_TRUE(server.Healthy());
+
+  std::string value(10000, '\0');
+  for (size_t i = 0; i < value.size(); ++i)
+    value[i] = static_cast<char>('a' + (i % 26));
+  ASSERT_EQ(Put(&server, Key(7), value), Status::kOk);
+
+  const uint64_t kHostile = std::numeric_limits<uint64_t>::max();
+  auto range = [&](const BlockKey& key, uint64_t offset, uint64_t length,
+                   std::string* out, size_t* value_len) {
+    out->clear();
+    return server.ProcessRequestForKey(
+        static_cast<uint8_t>(WireOp::kRange), key, offset, length, nullptr, 0,
+        out, value_len);
+  };
+
+  std::string out;
+  size_t value_len = 0;
+  // Whole value under a hostile length: served, clamped to the remainder.
+  EXPECT_EQ(range(Key(7), 0, kHostile, &out, &value_len), Status::kOk);
+  EXPECT_EQ(out, value);
+  EXPECT_EQ(value_len, value.size());
+  // Length beyond the remainder clamps to [offset, value_len).
+  EXPECT_EQ(range(Key(7), 4000, kHostile, &out, &value_len), Status::kOk);
+  EXPECT_EQ(out, value.substr(4000));
+  EXPECT_EQ(value_len, value.size());
+  // Store Range semantics survive: past-the-end offset is kInvalid, an
+  // exact-end offset is an empty success with the authoritative length.
+  EXPECT_EQ(range(Key(7), value.size() + 1, 16, &out, &value_len),
+            Status::kInvalid);
+  EXPECT_EQ(range(Key(7), value.size(), 16, &out, &value_len), Status::kOk);
+  EXPECT_TRUE(out.empty());
+  EXPECT_EQ(value_len, value.size());
+  // The reported attack: an UNKNOWN key with a hostile length misses before
+  // any sized allocation, exactly like the non-coalesced path.
+  EXPECT_EQ(range(Key(404), 0, kHostile, &out, &value_len),
+            Status::kNotFound);
+  EXPECT_TRUE(out.empty());
+
+  }
+  fs::remove_all(dir);
+  ::unsetenv("DFKV_READ_COALESCE");
+}
+
+// Regression (PR237 review #3): the coalesced RangeDirect fill compacts the
+// DIO superset in place (dst = shared scratch base, src = scratch + head with
+// head in (0, 4095]) -- that forward overlap requires memmove; memcpy on it
+// is UB and can hand shifted bytes to the leader and every follower. Assert
+// byte-exact payload for non-4K-aligned offsets (sanitizer builds flag the
+// overlap outright). Skips where the filesystem demotes the slab store to
+// buffered I/O (tmpfs): there RangeDirect hands back io_buf itself and no
+// head-shifted copy exists.
 TEST(PreparedRead, CoalescedRangeDirectHeadShiftByteExact) {
   ::setenv("DFKV_READ_COALESCE", "1", 1);
   ::unsetenv("DFKV_RAM_TIER");
