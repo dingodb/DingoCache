@@ -16,10 +16,16 @@
 namespace dfkv {
 
 namespace {
-// Mass-shrink suspicion threshold, percent of the adopted baseline that must
-// disappear IN ONE POLL to trigger hysteresis. 50 clears any realistic
-// same-poll failure burst (a 64-node ring trips only below 32 survivors) while
-// catching the etcd NOSPACE / lease-mass-expiry signature. 0 disables.
+// Suspicion threshold, percent of the guard's trusted REFERENCE (not the last
+// adopted hop) a view must deviate by — shrink or growth — to trigger
+// hysteresis. Anchoring on a reference frozen while under suspicion is what
+// stops diffuse mass expiry (heartbeat phases spread over polls) from
+// ratcheting the ring down hop by hop, and the symmetric growth arm stops a
+// re-registration ramp from rebuilding the ring once per epoch. 50 clears
+// any realistic same-poll failure burst (a 64-node ring trips only below 32
+// survivors or above 96 members) while catching the etcd NOSPACE /
+// lease-mass-expiry signature and its recovery mirror. 0 disables both
+// deviation arms; the empty arm always stays on.
 int ShrinkGuardPct() {
   // NOTE: this is a CLIENT-side MDS-discovery knob, read when the poller is
   // built during StartMdsDiscovery — after the client's startup config dump has
@@ -81,11 +87,13 @@ bool MdsMemberPoller::PollOnce() {
   uint64_t epoch = 0;
   if (!Query(&ms, &epoch)) return false;  // failed RPC never clears the ring
 
-  // Adoption guard (MemberViewGuard): a *successful* response that is empty OR
-  // sheds most of the adopted baseline at once is almost always etcd-outage
-  // recovery (mass lease expiry), not a genuine teardown; adopting it remaps
-  // the whole cluster into a miss storm and remaps AGAIN when the members
-  // re-register. Suspicious views must persist for kViewsToAccept polls.
+  // Adoption guard (MemberViewGuard): a *successful* response that is empty
+  // OR deviates from the trusted reference past the suspicion bar is almost
+  // always etcd-outage recovery (mass lease expiry / staggered
+  // re-registration), not a genuine membership swing; adopting it remaps the
+  // whole cluster into a miss storm and remaps AGAIN when the members
+  // stabilize. Suspicious views must reappear as the SAME value for
+  // kViewsToAccept polls.
   // Rejecting must not advance the placement-content epoch — eventual adoption
   // of that same content would otherwise be suppressed by epoch dedup below.
   if (!guard_.Admit(ms.size()))
