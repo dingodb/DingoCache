@@ -9,6 +9,10 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 
+#ifdef DFKV_WITH_URING
+#include <liburing.h>
+#endif
+
 #include <cerrno>
 #include <atomic>
 #include <chrono>
@@ -68,6 +72,12 @@ class DiskSlabStoreTestPeer {
   static void SetRecordWriteHook(DiskSlabStore* store,
                                  std::function<bool()> hook) {
     store->record_write_hook_for_test_ = std::move(hook);
+  }
+  // Production never sets this; when set it replaces every CQE reap of the
+  // batched io_uring write path (blocking wait AND post-failure drain).
+  static void SetUringReapHook(DiskSlabStore* store,
+                               std::function<int(void*, void*)> hook) {
+    store->uring_reap_hook_for_test_ = std::move(hook);
   }
   static void BreakStateFd(DiskSlabStore* store) {
     if (store->state_fd_ >= 0) ::close(store->state_fd_);
@@ -846,6 +856,94 @@ TEST_F(DiskSlabTest, ReadLeaseMovesAndReleasesOnDestructionAndError) {
   EXPECT_EQ(s.Count(), 0u);
 }
 
+// Deferred-remove re-PUT (#17): Remove(K) while a read lease pins the slot
+// defers the physical remove -- commit state is erased, but the allocator
+// slot stays resident. A re-PUT arriving in that window used to hard-fail
+// kIOError against the still-resident slot; it must instead wait (bounded)
+// for the in-flight holder to release and then land normally.
+TEST_F(DiskSlabTest, ReputDuringDeferredRemoveWaitsOutWindowThenLands) {
+  auto opts = Opts(1 << 20, 1 << 20, 4096);
+  opts.table_sync_ms = 0;
+  opts.reclaim_interval_ms = 0;
+  bool ok = false;
+  DiskSlabStore s(opts, &ok);
+  ASSERT_TRUE(ok);
+  std::string v1(4096, 'a');
+  ASSERT_EQ(s.Cache(K(60), v1.data(), v1.size()), Status::kOk);
+  dfkv::ReadLease lease;
+  ASSERT_EQ(s.RangeDirectPrep(K(60), 0, 0, 1 << 20, &lease), Status::kOk);
+  ASSERT_GE(lease.fd(), 0);
+  ASSERT_EQ(s.Remove(K(60)), Status::kOk);
+  EXPECT_FALSE(s.IsCached(K(60)));  // commit state erased immediately
+  EXPECT_EQ(s.Count(), 1u);         // slot still pinned: the window
+
+  std::string v2(4096, 'b');
+  Status reput = Status::kInvalid;
+  std::atomic<bool> reput_done{false};
+  std::thread t([&] {
+    reput = s.Cache(K(60), v2.data(), v2.size());
+    reput_done.store(true, std::memory_order_release);
+  });
+  // The window closes only when the lease below is destroyed, so the re-PUT
+  // cannot complete yet; the old hard-fail path would already be done.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_FALSE(reput_done.load(std::memory_order_acquire))
+      << "re-PUT in the window must wait for the pin, not fail at once";
+  { dfkv::ReadLease drop(std::move(lease)); }  // destruction releases the pin
+  t.join();
+  EXPECT_EQ(reput, Status::kOk);
+  std::string out;
+  ASSERT_EQ(s.Range(K(60), 0, 0, &out), Status::kOk);
+  EXPECT_EQ(out, v2) << "readers must observe the re-PUT bytes, not stale ones";
+  EXPECT_EQ(s.Count(), 1u);
+
+  // Guard rails: outside the window nothing changed -- remove-then-re-PUT was
+  // already fine, and a committed key still wins keep-first.
+  ASSERT_EQ(s.Remove(K(60)), Status::kOk);  // no pin now: immediate remove
+  EXPECT_EQ(s.Count(), 0u);
+  std::string v3(4096, 'c');
+  EXPECT_EQ(s.Cache(K(60), v3.data(), v3.size()), Status::kOk);
+  std::string v4(4096, 'd');
+  EXPECT_EQ(s.Cache(K(60), v4.data(), v4.size()), Status::kOk);
+  ASSERT_EQ(s.Range(K(60), 0, 0, &out), Status::kOk);
+  EXPECT_EQ(out, v3) << "a duplicate PUT must not overwrite committed bytes";
+}
+
+// Same window through the batched PUT path: CacheDirectBatch items must wait
+// out a deferred remove exactly like the scalar Cache path.
+TEST_F(DiskSlabTest, BatchReputDuringDeferredRemoveWaitsOutWindowThenLands) {
+  auto opts = Opts(1 << 20, 1 << 20, 4096);
+  opts.table_sync_ms = 0;
+  opts.reclaim_interval_ms = 0;
+  bool ok = false;
+  DiskSlabStore s(opts, &ok);
+  ASSERT_TRUE(ok);
+  std::string v1(4096, 'a');
+  ASSERT_EQ(s.Cache(K(61), v1.data(), v1.size()), Status::kOk);
+  dfkv::ReadLease lease;
+  ASSERT_EQ(s.RangeDirectPrep(K(61), 0, 0, 1 << 20, &lease), Status::kOk);
+  ASSERT_GE(lease.fd(), 0);
+  ASSERT_EQ(s.Remove(K(61)), Status::kOk);
+  EXPECT_EQ(s.Count(), 1u);
+
+  std::string v2(4096, 'e');
+  std::vector<Status> sts;
+  std::atomic<bool> done{false};
+  std::thread t([&] {
+    sts = s.CacheDirectBatch({{K(61), v2.data(), v2.size(), v2.size()}});
+    done.store(true, std::memory_order_release);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_FALSE(done.load(std::memory_order_acquire));
+  { dfkv::ReadLease drop(std::move(lease)); }
+  t.join();
+  ASSERT_EQ(sts.size(), 1u);
+  EXPECT_EQ(sts[0], Status::kOk);
+  std::string out;
+  ASSERT_EQ(s.Range(K(61), 0, 0, &out), Status::kOk);
+  EXPECT_EQ(out, v2);
+}
+
 // Direct-mode RangeDirect: O_DIRECT aligned-window read with head trim -- the
 // returned pointer must land exactly on the requested offset's bytes, including
 // a non-4KiB-aligned client offset (head != 0).
@@ -1375,6 +1473,128 @@ TEST_F(DiskSlabTest, UringBatchCountsOnlyConfirmedWrites) {
     ASSERT_EQ(s.Range(K(700 + i), 0, kLen, &out), Status::kOk) << i;
     EXPECT_EQ(out, std::string(kLen, static_cast<char>('A' + i))) << i;
   }
+  for (auto* b : bufs) free(b);
+}
+
+// Reap-failure drain (#16): a hard io_uring_wait_cqe failure used to retire
+// the ring while the kernel's accepted writes were still un-reaped -- and
+// io_uring_queue_exit does NOT cancel in-flight requests, so a zombie write
+// could land after the flush rolled the failed items' slots back and handed
+// them to other keys. The failed batch must best-effort drain every accepted
+// CQE BEFORE the ring is retired: then no zombie remains, the store must NOT
+// fail closed, every item lands via the sequential rewrite, and the next
+// batch re-inits the ring and fast-paths again.
+TEST_F(DiskSlabTest, UringReapFailureDrainsBeforeReset) {
+  auto opts = Opts(1 << 20, 1 << 20, 4096);
+  opts.direct_writes = true;
+  bool ok = false;
+  DiskSlabStore s(opts, &ok);
+  ASSERT_TRUE(ok);
+  if (!s.DirectWritesActive()) GTEST_SKIP() << "fs rejected O_DIRECT (tmpfs)";
+  // The first reap (the blocking wait) hard-fails; every reap afterwards is
+  // the drain's non-blocking peek, behaving exactly like the real one.
+  std::atomic<int> reap_calls{0};
+  dfkv::DiskSlabStoreTestPeer::SetUringReapHook(
+      &s, [&reap_calls](void* r, void* c) -> int {
+        if (reap_calls.fetch_add(1) == 0) return -EIO;
+        return io_uring_peek_cqe(static_cast<io_uring*>(r),
+                                 static_cast<io_uring_cqe**>(c));
+      });
+  constexpr uint64_t N = 4;
+  constexpr size_t kLen = 4096;
+  std::vector<void*> bufs(N);
+  std::vector<DiskSlabStore::CacheBatchItem> items;
+  for (uint64_t i = 0; i < N; ++i) {
+    ASSERT_EQ(posix_memalign(&bufs[i], 4096, kLen), 0);
+    std::memset(bufs[i], static_cast<int>('A' + i), kLen);
+    items.push_back({K(800 + i), static_cast<char*>(bufs[i]), kLen, kLen});
+  }
+  auto sts = s.CacheDirectBatch(items);
+  if (reap_calls.load() == 0) {
+    for (auto* b : bufs) free(b);
+    GTEST_SKIP() << "uring path not taken (env-disabled or init fallback)";
+  }
+  for (auto st : sts) ASSERT_EQ(st, Status::kOk);
+  // The failed wait left N accepted writes outstanding; the drain must have
+  // reaped them (the real peek may also poll on -EAGAIN before completions).
+  EXPECT_GE(reap_calls.load(), 1 + static_cast<int>(N))
+      << "drain must reap what the failed wait left outstanding";
+  EXPECT_TRUE(s.Healthy()) << "a successful drain is not a fail-closed event";
+  EXPECT_EQ(s.GetStats().metadata_io_errors, 0u);
+  {  // nothing was CQE-confirmed, so the failed batch tallies nothing uring
+    const auto stats = s.GetStats();
+    EXPECT_EQ(stats.uring_write_batches, 0u);
+    EXPECT_EQ(stats.batched_writes, 0u);
+  }
+  // The sequential rewrite must be what readers observe (dangling-buffer and
+  // torn-payload semantics would show up here or in the next store's data).
+  for (uint64_t i = 0; i < N; ++i) {
+    std::string out;
+    ASSERT_EQ(s.Range(K(800 + i), 0, kLen, &out), Status::kOk) << i;
+    EXPECT_EQ(out, std::string(kLen, static_cast<char>('A' + i))) << i;
+  }
+
+  // The retired ring re-inits on the next batch and fast-paths again.
+  dfkv::DiskSlabStoreTestPeer::SetUringReapHook(&s, nullptr);
+  std::vector<DiskSlabStore::CacheBatchItem> items2;
+  for (uint64_t i = 0; i < N; ++i) {
+    std::memset(bufs[i], static_cast<int>('a' + i), kLen);
+    items2.push_back({K(900 + i), static_cast<char*>(bufs[i]), kLen, kLen});
+  }
+  sts = s.CacheDirectBatch(items2);
+  for (auto st : sts) ASSERT_EQ(st, Status::kOk);
+  {
+    const auto stats = s.GetStats();
+    EXPECT_EQ(stats.uring_write_batches, 1u) << "ring re-init did not happen";
+    EXPECT_EQ(stats.batched_writes, N);
+  }
+  for (uint64_t i = 0; i < N; ++i) {
+    std::string out;
+    ASSERT_EQ(s.Range(K(900 + i), 0, kLen, &out), Status::kOk) << i;
+    EXPECT_EQ(out, std::string(kLen, static_cast<char>('a' + i))) << i;
+    // And the first batch's bytes are untouched by anything that followed.
+    ASSERT_EQ(s.Range(K(800 + i), 0, kLen, &out), Status::kOk) << i;
+    EXPECT_EQ(out, std::string(kLen, static_cast<char>('A' + i))) << i;
+  }
+  for (auto* b : bufs) free(b);
+}
+
+// Dropped-CQE fail-closed (#16): if the kernel cannot return the accepted
+// completions at all, a zombie write may still land after the slot rollback,
+// so the drain coming up short must fail the store closed rather than risk
+// serving bytes a late landing overwrote.
+TEST_F(DiskSlabTest, UringReapDrainMissFailsStoreClosed) {
+  auto opts = Opts(1 << 20, 1 << 20, 4096);
+  opts.direct_writes = true;
+  bool ok = false;
+  DiskSlabStore s(opts, &ok);
+  ASSERT_TRUE(ok);
+  if (!s.DirectWritesActive()) GTEST_SKIP() << "fs rejected O_DIRECT (tmpfs)";
+  std::atomic<int> reap_calls{0};
+  dfkv::DiskSlabStoreTestPeer::SetUringReapHook(
+      &s, [&reap_calls](void*, void*) -> int {
+        reap_calls.fetch_add(1);
+        return -EIO;  // blocking wait AND drain peeks all fail
+      });
+  constexpr uint64_t N = 4;
+  constexpr size_t kLen = 4096;
+  std::vector<void*> bufs(N);
+  std::vector<DiskSlabStore::CacheBatchItem> items;
+  for (uint64_t i = 0; i < N; ++i) {
+    ASSERT_EQ(posix_memalign(&bufs[i], 4096, kLen), 0);
+    std::memset(bufs[i], static_cast<int>('C' + i), kLen);
+    items.push_back({K(810 + i), static_cast<char*>(bufs[i]), kLen, kLen});
+  }
+  auto sts = s.CacheDirectBatch(items);
+  if (reap_calls.load() == 0) {
+    for (auto* b : bufs) free(b);
+    GTEST_SKIP() << "uring path not taken (env-disabled or init fallback)";
+  }
+  for (auto st : sts) EXPECT_EQ(st, Status::kIOError);
+  EXPECT_FALSE(s.Healthy());
+  EXPECT_GE(s.GetStats().metadata_io_errors, 1u);
+  EXPECT_EQ(s.Count(), 0u) << "failed items must roll their slots back";
+  for (uint64_t i = 0; i < N; ++i) EXPECT_FALSE(s.IsCached(K(810 + i)));
   for (auto* b : bufs) free(b);
 }
 #endif  // DFKV_WITH_URING

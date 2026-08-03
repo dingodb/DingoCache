@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -34,6 +35,13 @@ constexpr uint32_t kFormatVersion = 3;
 constexpr uint32_t kStateMagic = 0x53424C53u;  // "SLBS"
 constexpr uint32_t kStateClean = 1;
 constexpr uint32_t kStateDirty = 2;
+
+// Bound on a re-PUT waiting out a deferred-remove window. The window lasts
+// one in-flight read/write of the slot -- I/O time, even for MiB-scale direct
+// reads -- so this is generous; but a request-serving thread must never park
+// behind a stuck holder, so on expiry the PUT falls back to the pre-wait
+// behavior (kIOError) instead of blocking forever.
+constexpr auto kDeferredRemoveWaitMax = std::chrono::seconds(5);
 
 // Small CRC32 (IEEE, reflected) over a byte range; enough to catch a torn record.
 uint32_t Crc32(const uint8_t* p, size_t n) {
@@ -84,6 +92,40 @@ struct ThreadUring {
   io_uring* ring = nullptr;
 };
 thread_local ThreadUring tls_uring_w;
+
+// Best-effort drain of `outstanding` batch writes the kernel has already
+// accepted, after a reap hard failure and BEFORE the ring is retired:
+// io_uring_queue_exit does NOT cancel in-flight requests (the contract
+// UringReader's Drain documents), so an undrained zombie write keeps
+// referencing its caller buffer (RAM arena slot / client recv segment) and
+// can land AFTER the flush returned -- by then the failed item's slot may be
+// rolled back and reused by a DIFFERENT key (slot payloads carry no CRC;
+// write order is the only correctness argument). Each completion is reaped
+// with the NON-BLOCKING peek and immediately seen; results are discarded --
+// every item of the failed batch is rewritten by the sequential path anyway.
+// The test hook, when installed, replaces the peek so a dropped-CQE kernel
+// can be simulated. Bounded to ~1 s of 1 ms polls (in-flight NVMe writes
+// complete in I/O time; beyond that the kernel has lost the CQEs and grinding
+// longer only parks the flush worker). Returns false with CQEs still missing:
+// the caller must then fail closed, because a zombie write may still land.
+bool DrainBatchWrites(io_uring* ring, size_t outstanding,
+                      const std::function<int(void*, void*)>& hook) {
+  int polls = 0;
+  while (outstanding > 0 && polls < 1000) {
+    io_uring_cqe* cqe = nullptr;
+    const int prc =
+        hook ? hook(ring, &cqe) : io_uring_peek_cqe(ring, &cqe);
+    if (prc == 0 && cqe != nullptr) {
+      io_uring_cqe_seen(ring, cqe);
+      --outstanding;
+      continue;
+    }
+    if (prc != -EAGAIN && prc != -EINTR) break;  // ring itself is dead: stop
+    ++polls;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return outstanding == 0;
+}
 #endif
 }  // namespace
 
@@ -850,13 +892,30 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
   std::shared_ptr<PutFlight> flight;
   bool leader = false;
   {
-    std::lock_guard<std::mutex> lk(mu_);
-    if (!Healthy()) return Status::kIOError;
-    if (payload_len_.count(fn) != 0) return Status::kOk;
-    auto existing = put_flights_.find(fn);
-    if (existing != put_flights_.end()) {
-      flight = existing->second;
-    } else {
+    std::unique_lock<std::mutex> lk(mu_);
+    for (;;) {
+      if (!Healthy()) return Status::kIOError;
+      if (payload_len_.count(fn) != 0) return Status::kOk;  // keep-first
+      auto existing = put_flights_.find(fn);
+      if (existing != put_flights_.end()) {
+        flight = existing->second;  // follower of the in-flight PUT
+        break;
+      }
+      if (deferred_remove_.count(fn) != 0) {
+        // Deferred-remove window, NOT a duplicate write: a Remove already
+        // erased this key's commit state, but an in-flight read/write still
+        // pins its slot, so the allocator would still report Contains(key)
+        // and the leader path below would hard-fail. Wait (bounded -- a
+        // serving thread must never park behind a stuck holder) for the last
+        // releaser to perform the real Remove, which it signals on
+        // remove_cv_, then re-judge from scratch. A genuine duplicate (no
+        // deferred remove in play) keeps the existing semantics below.
+        if (remove_cv_.wait_for(lk, kDeferredRemoveWaitMax, [&] {
+              return deferred_remove_.count(fn) == 0 || !Healthy();
+            }))
+          continue;  // window closed: the slot is gone; fresh judgment
+        return Status::kIOError;  // pin outlived the bound: fail as before
+      }
       flight = std::make_shared<PutFlight>();
       put_flights_.emplace(fn, flight);
       leader = true;
@@ -870,6 +929,7 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
       inflight_[fn]++;
       for (const BlockKey& ev : evicted)
         evicted_bytes_ += ErasePayloadLocked(ev.Filename());
+      break;
     }
   }
   if (!leader) return WaitPut(flight);
@@ -948,7 +1008,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
   std::vector<Slot> st(N);
   // -- L1: allocate leaders and attach followers under one lock --
   {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::unique_lock<std::mutex> lk(mu_);
     for (size_t i = 0; i < N; ++i) {
       const auto& it = items[i];
       if (it.len == 0 || it.data == nullptr) {
@@ -956,34 +1016,55 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
         continue;
       }
       st[i].fn = it.key.Filename();
-      if (payload_len_.count(st[i].fn) != 0) {
-        out[i] = Status::kOk;
-        continue;
+      // Per-item judgment, re-run (once per closed window) when the item sat
+      // out a deferred-remove window.
+      for (;;) {
+        if (!Healthy()) {
+          out[i] = Status::kIOError;
+          break;
+        }
+        if (payload_len_.count(st[i].fn) != 0) {
+          out[i] = Status::kOk;
+          break;
+        }
+        auto existing = put_flights_.find(st[i].fn);
+        if (existing != put_flights_.end()) {
+          st[i].flight = existing->second;  // follower: wait after leader L2
+          break;
+        }
+        if (deferred_remove_.count(st[i].fn) != 0) {
+          // Same deferred-remove window as CacheImpl: the Remove already raced
+          // (commit state erased, slot still pinned by in-flight I/O), so this
+          // re-PUT must wait the window out -- bounded, see remove_cv_ --
+          // instead of hard-failing on the allocator's still-resident slot.
+          if (remove_cv_.wait_for(lk, kDeferredRemoveWaitMax, [&] {
+                return deferred_remove_.count(st[i].fn) == 0 || !Healthy();
+              }))
+            continue;  // window closed: re-judge this item from scratch
+          out[i] = Status::kIOError;  // pin outlived the bound: fail as before
+          break;
+        }
+        st[i].flight = std::make_shared<PutFlight>();
+        put_flights_.emplace(st[i].fn, st[i].flight);
+        std::vector<BlockKey> evicted;
+        if (alloc_->Contains(it.key) ||
+            !alloc_->Put(it.key, it.len, &st[i].ref, &evicted)) {
+          put_flights_.erase(st[i].fn);
+          CompletePut(st[i].flight, Status::kIOError);
+          break;
+        }
+        alloc_->Pin(it.key);
+        inflight_[st[i].fn]++;
+        for (const BlockKey& ev : evicted)
+          evicted_bytes_ += ErasePayloadLocked(ev.Filename());
+        st[i].active = true;
+        // Same alignment and padded-capacity eligibility as CacheDirect.
+        const size_t alen = (it.len + 4095) & ~static_cast<size_t>(4095);
+        st[i].direct = !extent_dio_fds_.empty() && it.len != 0 &&
+                       (reinterpret_cast<uintptr_t>(it.data) & 4095) == 0 &&
+                       alen <= it.cap && alen <= st[i].ref.slot_size;
+        break;
       }
-      auto existing = put_flights_.find(st[i].fn);
-      if (existing != put_flights_.end()) {
-        st[i].flight = existing->second;  // follower: wait after leader L2
-        continue;
-      }
-      st[i].flight = std::make_shared<PutFlight>();
-      put_flights_.emplace(st[i].fn, st[i].flight);
-      std::vector<BlockKey> evicted;
-      if (alloc_->Contains(it.key) ||
-          !alloc_->Put(it.key, it.len, &st[i].ref, &evicted)) {
-        put_flights_.erase(st[i].fn);
-        CompletePut(st[i].flight, Status::kIOError);
-        continue;
-      }
-      alloc_->Pin(it.key);
-      inflight_[st[i].fn]++;
-      for (const BlockKey& ev : evicted)
-        evicted_bytes_ += ErasePayloadLocked(ev.Filename());
-      st[i].active = true;
-      // Use the same alignment and padded-capacity eligibility as CacheDirect.
-      const size_t alen = (it.len + 4095) & ~static_cast<size_t>(4095);
-      st[i].direct = !extent_dio_fds_.empty() && it.len != 0 &&
-                     (reinterpret_cast<uintptr_t>(it.data) & 4095) == 0 &&
-                     alen <= it.cap && alen <= st[i].ref.slot_size;
     }
   }
   // -- IO: payloads (uring one-submit when possible), then records --
@@ -1039,7 +1120,10 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
         bool reap_ok = true;
         while (done < expect) {
           io_uring_cqe* cqe = nullptr;
-          const int wrc = io_uring_wait_cqe(ring, &cqe);
+          const int wrc =
+              uring_reap_hook_for_test_
+                  ? uring_reap_hook_for_test_(ring, &cqe)
+                  : io_uring_wait_cqe(ring, &cqe);
           if (wrc == -EINTR) continue;         // signal: just retry the wait
           if (wrc != 0) { reap_ok = false; break; }
           // Bounds-check the completion's index BEFORE touching items[i]: a
@@ -1054,12 +1138,27 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
           io_uring_cqe_seen(ring, cqe);
           ++done;
         }
-        if (!reap_ok || expect != submitted) {
-          // Unreaped CQEs or unsubmitted SQEs remain: retire the ring so they
-          // die with it; this thread's next batch re-inits a fresh one. The
-          // affected items keep io_ok=false and are rewritten by the
-          // sequential path below (their slots are exclusively owned by this
-          // flush, so the rewrite is idempotent).
+        if (!reap_ok) {
+          // Reap HARD FAILURE: `expect - done` writes the kernel already
+          // accepted are still un-reaped and reference this batch's caller
+          // buffers (see DrainBatchWrites for the zombie-write model). Drain
+          // them first; only retire the ring afterwards. If the drain comes
+          // up short the kernel has dropped CQEs -- a zombie write may still
+          // be in flight against a slot this flush is about to roll back and
+          // hand to another key -- so fail closed rather than risk serving
+          // bytes a late landing wrote over a committed payload.
+          if (!DrainBatchWrites(ring, expect - done,
+                                uring_reap_hook_for_test_))
+            FailMetadata();
+          tls_uring_w.Reset();
+        } else if (expect != submitted) {
+          // Short submit is the SAFE half: `expect` counts exactly the SQEs
+          // the kernel consumed, so the unsubmitted tail never owned a write
+          // -- no in-flight request references this batch's buffers and
+          // retiring the ring just drops the dormant SQEs (this thread's next
+          // batch re-inits a fresh one). The affected items keep io_ok=false
+          // and are rewritten by the sequential path below (their slots are
+          // exclusively owned by this flush, so the rewrite is idempotent).
           tls_uring_w.Reset();
         }
         did_uring = true;
@@ -1278,16 +1377,20 @@ bool DiskSlabStore::ReleaseInflightLocked(const BlockKey& key,
   if (--it->second > 0) return true;
   inflight_.erase(it);
   if (!deferred_remove_.erase(fn)) return true;
+  // The deferred Remove executes NOW (record invalidation, then physical
+  // removal). Wake any re-PUT waiting out the window on BOTH exits so it
+  // re-judges promptly instead of burning its full wait bound.
   SlabAllocator::SlotRef ref;
+  bool release_ok = true;
   if (alloc_->Get(key, &ref)) {
-    if (!WriteRecord(ref, key, 0, /*valid=*/false)) {
-      ErasePayloadLocked(fn);
-      return false;
-    }
-    alloc_->Remove(key);
+    if (!WriteRecord(ref, key, 0, /*valid=*/false))
+      release_ok = false;
+    else
+      alloc_->Remove(key);
   }
   ErasePayloadLocked(fn);
-  return true;
+  remove_cv_.notify_all();
+  return release_ok;
 }
 
 Status DiskSlabStore::Range(const BlockKey& key, uint64_t offset,
