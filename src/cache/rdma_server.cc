@@ -87,6 +87,18 @@ RdmaServer::RdmaServer(Handler handler, size_t max_msg,
 RdmaServer::~RdmaServer() { Stop(); }
 
 Status RdmaServer::Start(int port) {
+  // An explicitly configured anchor whose name overruns the v2 bootstrap
+  // frame stays fully usable here — this server only EVER parses peer frames
+  // and default-anchor (empty-name) clients fall back to it — but it can
+  // never be selected BY NAME: an announceable client name must fit the frame
+  // (client-side startup rejects longer ones). Name it at startup with the
+  // real limit instead of leaving ops to decode per-connection rejections.
+  for (const auto& device : anchor_devs_) {
+    if (!device.empty() && !rdma::DeviceNameFitsFrame(device)) {
+      DFKV_LOG_WARN(rdma::OversizedDeviceNameError(device) +
+                    "; serving anyway, reachable as the default anchor only");
+    }
+  }
   listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
   if (listen_fd_ < 0) return Status::kIOError;
   int one = 1;
