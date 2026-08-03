@@ -114,4 +114,39 @@ TEST(RdmaTopology, NoLocalRailFallsBackToAllEnabledRails) {
   EXPECT_EQ(candidates.allowed, (std::vector<uint8_t>{1, 1}));
 }
 
+TEST(RdmaTopology, LocalMaskCarriesAllEnabledRailsAsFallback) {
+  RdmaTopology topology({Device("ib0", true, 0), Device("ib1", true, 0),
+                         Device("ib2", true, 1)});
+
+  const auto candidates = topology.CandidatesFor(0, true);
+
+  EXPECT_EQ(candidates.locality, RailLocality::kLocal);
+  EXPECT_EQ(candidates.allowed, (std::vector<uint8_t>{1, 1, 0}));
+  // The backstop spans every enabled rail, NUMA locality aside.
+  EXPECT_EQ(candidates.fallback, (std::vector<uint8_t>{1, 1, 1}));
+}
+
+TEST(RdmaTopology, FallbackMaskStillExcludesRuntimeDisabledRails) {
+  RdmaTopology topology({Device("ib0", true, 0), Device("ib1", true, 1)});
+  topology.DisableDevice("ib1");
+
+  const auto candidates = topology.CandidatesFor(0, true);
+
+  EXPECT_EQ(candidates.locality, RailLocality::kLocal);
+  EXPECT_EQ(candidates.allowed, (std::vector<uint8_t>{1, 0}));
+  EXPECT_EQ(candidates.fallback, (std::vector<uint8_t>{1, 0}));
+}
+
+TEST(RdmaTopology, FallbackMaskIsEmptyWithoutLocalPreference) {
+  RdmaTopology topology({Device("ib0", true, 0), Device("ib1", true, 1)});
+
+  const auto disabled = topology.CandidatesFor(0, false);
+  EXPECT_EQ(disabled.locality, RailLocality::kDisabled);
+  EXPECT_TRUE(disabled.fallback.empty());
+
+  const auto unknown = topology.CandidatesFor(-1, true);
+  EXPECT_EQ(unknown.locality, RailLocality::kCallerUnknown);
+  EXPECT_TRUE(unknown.fallback.empty());
+}
+
 }  // namespace

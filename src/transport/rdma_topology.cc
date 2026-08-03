@@ -128,6 +128,7 @@ RailCandidates RdmaTopology::CandidatesFor(int numa_node,
   }
 
   out.locality = RailLocality::kLocal;
+  out.fallback = enabled_;
   for (size_t i = 0; i < devices_.size(); ++i) {
     if (devices_[i].numa_node != numa_node) out.allowed[i] = 0;
   }

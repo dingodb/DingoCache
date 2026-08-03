@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+using dfkv::rdma::AcquireWithFallback;
 using dfkv::rdma::PickRail;
 using dfkv::rdma::RailCompletion;
 using dfkv::rdma::RailPolicy;
@@ -177,6 +178,76 @@ TEST(RailPolicy, LocalMaskDoesNotEscapeWhenLocalCreditsAreBusy) {
   EXPECT_EQ(next->rail, 0u);
 }
 
+TEST(RailPolicy, FallbackMaskServesWhenLocalRailsAreQuarantined) {
+  RailPolicy policy(4, RailPolicyConfig{2, 1, 60'000'000, 1, 100});
+  const std::vector<uint8_t> local{1, 1, 0, 0};
+  const std::vector<uint8_t> all{1, 1, 1, 1};
+  // AcquireWithFallback reads the real clock (like RailPolicy::Acquire), so
+  // the quarantine below is pinned to NowMicros instead of a virtual time.
+  const uint64_t now = RailPolicy::NowMicros();
+  const auto first = policy.TryAcquire(1, now, local);
+  ASSERT_TRUE(first);
+  ASSERT_EQ(first->rail, 0u);
+  policy.Complete(*first, 10, RailCompletion::kRailFailure, now);
+  const auto second = policy.TryAcquire(1, now + 1, local);
+  ASSERT_TRUE(second);
+  ASSERT_EQ(second->rail, 1u);
+  policy.Complete(*second, 10, RailCompletion::kRailFailure, now + 1);
+
+  // Both local rails quarantined for ~60s: local-only admission fails, and
+  // without a fallback mask the helper cannot serve either.
+  EXPECT_FALSE(policy.TryAcquire(1, now + 2, local));
+  EXPECT_FALSE(AcquireWithFallback(policy, 1, 0, local, {}));
+
+  // The backstop mask degrades to the healthy remote rails, granting exactly
+  // one lease.
+  const auto lease = AcquireWithFallback(policy, 1, 0, local, all);
+  ASSERT_TRUE(lease);
+  EXPECT_EQ(lease->rail, 2u);
+  const auto stats = policy.Snapshot(now + 3);
+  EXPECT_EQ(stats[0].inflight, 0u);
+  EXPECT_EQ(stats[1].inflight, 0u);
+  EXPECT_EQ(stats[2].inflight, 1u);
+  EXPECT_EQ(stats[3].inflight, 0u);
+  policy.Complete(*lease, 25, RailCompletion::kSuccess, now + 4);
+}
+
+TEST(RailPolicy, FallbackMaskServesWhenLocalCreditsAreExhausted) {
+  RailPolicy policy(2, RailPolicyConfig{1, 3, 1000, 1, 100});
+  const std::vector<uint8_t> local{1, 0};
+  const std::vector<uint8_t> all{1, 1};
+  const auto held = AcquireWithFallback(policy, 1, 0, local, all);
+  ASSERT_TRUE(held);
+  EXPECT_EQ(held->rail, 0u);
+  EXPECT_EQ(policy.Snapshot(1)[1].inflight, 0u);
+
+  // Local credit-bound: the backstop overflows to the idle remote rail.
+  const auto overflow = AcquireWithFallback(policy, 1, 0, local, all);
+  ASSERT_TRUE(overflow);
+  EXPECT_EQ(overflow->rail, 1u);
+
+  // Nothing admissible anywhere: a non-blocking attempt still fails, and each
+  // rail granted exactly one credit.
+  EXPECT_FALSE(AcquireWithFallback(policy, 1, 0, local, all));
+  const auto stats = policy.Snapshot(2);
+  EXPECT_EQ(stats[0].inflight, 1u);
+  EXPECT_EQ(stats[1].inflight, 1u);
+  policy.Complete(*held, 20, RailCompletion::kSuccess, 3);
+  policy.Complete(*overflow, 20, RailCompletion::kSuccess, 4);
+}
+
+TEST(RailPolicy, FallbackKeepsLocalityWhenLocalRailCanServe) {
+  RailPolicy policy(2, RailPolicyConfig{1, 3, 1000, 1, 100});
+  const std::vector<uint8_t> local{1, 0};
+  const std::vector<uint8_t> all{1, 1};
+
+  const auto lease = AcquireWithFallback(policy, 1, 0, local, all);
+  ASSERT_TRUE(lease);
+  EXPECT_EQ(lease->rail, 0u);
+  EXPECT_EQ(policy.Snapshot(1)[1].inflight, 0u);
+  policy.Complete(*lease, 20, RailCompletion::kSuccess, 2);
+}
+
 TEST(RailPolicy, EndpointFailuresReturnCreditsWithoutPenalizingRail) {
   RailPolicy policy(2, RailPolicyConfig{1, 1, 1000, 1, 100});
   const std::vector<uint8_t> first_rail{1, 0};
@@ -225,6 +296,45 @@ TEST(RailPolicy, EndpointFailureDoesNotConsumeRecoveryProbe) {
   EXPECT_EQ(stats[failed_rail->rail].recoveries, 1u);
   EXPECT_EQ(stats[failed_rail->rail].quarantined_until_us, 0u);
   EXPECT_FALSE(stats[failed_rail->rail].quarantined);
+}
+
+TEST(RailPolicy, RecoveryProbeMarksOnlyTheGrantedRail) {
+  RailPolicy policy(2, RailPolicyConfig{2, 1, 1000, 1, 100});
+  const auto first = policy.TryAcquire(1, 10);
+  ASSERT_TRUE(first);
+  ASSERT_EQ(first->rail, 0u);
+  policy.Complete(*first, 10, RailCompletion::kRailFailure, 20);
+  const auto second = policy.TryAcquire(1, 21);
+  ASSERT_TRUE(second);
+  ASSERT_EQ(second->rail, 1u);
+  policy.Complete(*second, 10, RailCompletion::kRailFailure, 30);
+
+  // Both cooldowns (until 1020/1030) have elapsed: a single admission marks
+  // only the rail it actually grants, never the candidate it outscored.
+  const auto probe = policy.TryAcquire(1, 2000);
+  ASSERT_TRUE(probe);
+  EXPECT_EQ(probe->rail, 0u);
+  auto stats = policy.Snapshot(2001);
+  EXPECT_TRUE(stats[0].recovery_probe);
+  EXPECT_FALSE(stats[1].recovery_probe);
+
+  policy.Complete(*probe, 25, RailCompletion::kSuccess, 2010);
+  stats = policy.Snapshot(2011);
+  EXPECT_EQ(stats[0].recoveries, 1u);
+  EXPECT_FALSE(stats[0].recovery_probe);
+
+  // The losing rail's quarantine marker survives unscathed, so the next
+  // admission discovers it as a genuine fresh probe.
+  const auto next = policy.TryAcquire(1, 2012);
+  ASSERT_TRUE(next);
+  EXPECT_EQ(next->rail, 1u);
+  stats = policy.Snapshot(2013);
+  EXPECT_TRUE(stats[1].recovery_probe);
+  policy.Complete(*next, 25, RailCompletion::kSuccess, 2020);
+  stats = policy.Snapshot(2021);
+  EXPECT_EQ(stats[1].recoveries, 1u);
+  EXPECT_FALSE(stats[1].recovery_probe);
+  EXPECT_FALSE(stats[1].quarantined);
 }
 
 #ifdef DFKV_WITH_RDMA
