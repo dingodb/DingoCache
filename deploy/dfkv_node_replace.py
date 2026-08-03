@@ -124,7 +124,26 @@ class Replacer:
 
     def rollback(self, reason: BaseException) -> None:
         if not self.old_stopped:
-            self.record("abort", f"old node was never stopped; safe abort: {reason}")
+            if not self.started_new:
+                self.record("abort", f"old node was never stopped; safe abort: {reason}")
+                return
+            # The replacement may be running and registered in the ring even
+            # when its start command timed out locally; silently aborting
+            # would leave an unplanned member. Stop it best-effort, mirroring
+            # the old-node restart below.
+            self.record(
+                "rollback",
+                f"failure after replacement start; stopping {self.args.new_id} on {self.args.new_host}: {reason}",
+            )
+            try:
+                self.remote(self.args.new_host, "stop")
+                self.record("rollback", "replacement stopped; ring back to old-only membership")
+            except BaseException as rollback_error:
+                raise WorkflowError(
+                    f"replacement failed ({reason}); CRITICAL stopping the just-started replacement also failed "
+                    f"({rollback_error}); replacement may still be registered in the ring; "
+                    f"stop {self.args.service} on {self.args.new_host} manually"
+                ) from rollback_error
             return
         self.record("rollback", f"failure after old-node stop; restarting {self.args.old_id}: {reason}")
         try:
@@ -166,8 +185,11 @@ class Replacer:
 
         if not new_present:
             self.record("join", f"starting replacement {self.args.new_id} on {self.args.new_host}")
-            self.remote(self.args.new_host, "start")
+            # Mark replacement-started before SSH: a remote systemctl may
+            # succeed even when the local SSH command times out or is
+            # interrupted, mirroring the old-node stop marking below.
             self.started_new = True
+            self.remote(self.args.new_host, "start")
             if self.args.dry_run:
                 self.record("dry-run", f"would wait up to {self.args.timeout}s for replacement membership/readiness")
                 self.record("dry-run", f"would stop {self.args.old_id}, observe lease expiry, and verify clients")
