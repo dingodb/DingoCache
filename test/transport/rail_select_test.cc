@@ -1,4 +1,9 @@
 #include "transport/rail_select.h"
+// ClassifyCompletion is verbs-dependent (ibv_wc_status): only RDMA builds
+// compile its coverage below; elsewhere those tests are compiled away.
+#ifdef DFKV_WITH_RDMA
+#include "transport/rail_classify.h"
+#endif
 
 #include <gtest/gtest.h>
 
@@ -221,3 +226,111 @@ TEST(RailPolicy, EndpointFailureDoesNotConsumeRecoveryProbe) {
   EXPECT_EQ(stats[failed_rail->rail].quarantined_until_us, 0u);
   EXPECT_FALSE(stats[failed_rail->rail].quarantined);
 }
+
+#ifdef DFKV_WITH_RDMA
+using dfkv::rdma::ClassifyCompletion;
+
+TEST(ClassifyCompletion, RemoteEvidenceNeverBlamesTheRail) {
+  const ibv_wc_status remote[] = {
+      IBV_WC_REM_ACCESS_ERR,   IBV_WC_REM_OP_ERR,
+      IBV_WC_REM_INV_REQ_ERR,  IBV_WC_REM_ABORT_ERR,
+      IBV_WC_RETRY_EXC_ERR,    IBV_WC_RNR_RETRY_EXC_ERR,
+      IBV_WC_RESP_TIMEOUT_ERR, IBV_WC_WR_FLUSH_ERR,
+  };
+  for (ibv_wc_status status : remote) {
+    for (bool had : {false, true}) {
+      EXPECT_EQ(ClassifyCompletion(status, had),
+                RailCompletion::kEndpointFailure)
+          << "wc status " << status;
+    }
+  }
+}
+
+TEST(ClassifyCompletion, LocalEvidenceBlamesTheRail) {
+  const ibv_wc_status local[] = {
+      IBV_WC_LOC_LEN_ERR,    IBV_WC_LOC_QP_OP_ERR,
+      IBV_WC_LOC_EEC_OP_ERR, IBV_WC_LOC_PROT_ERR,
+      IBV_WC_LOC_ACCESS_ERR, IBV_WC_LOC_RDD_VIOL_ERR,
+      IBV_WC_FATAL_ERR,      IBV_WC_GENERAL_ERR,
+  };
+  for (ibv_wc_status status : local) {
+    for (bool had : {false, true}) {
+      EXPECT_EQ(ClassifyCompletion(status, had), RailCompletion::kRailFailure)
+          << "wc status " << status;
+    }
+  }
+}
+
+TEST(ClassifyCompletion, DeadlineExpiryIsPeerSilence) {
+  // Zero completions: the peer went silent and the NIC surfaced no local
+  // error evidence.
+  EXPECT_EQ(ClassifyCompletion(IBV_WC_SUCCESS, /*had_completions=*/false),
+            RailCompletion::kEndpointFailure);
+  // Partial progress then stall: completions prove the rail was healthy when
+  // last observed, so the same verdict holds.
+  EXPECT_EQ(ClassifyCompletion(IBV_WC_SUCCESS, /*had_completions=*/true),
+            RailCompletion::kEndpointFailure);
+}
+
+TEST(ClassifyCompletion, UnknownStatusSparesTheRail) {
+  // Unlisted/ambiguous evidence must never quarantine a healthy HCA.
+  const ibv_wc_status unknown[] = {
+      IBV_WC_MW_BIND_ERR, IBV_WC_BAD_RESP_ERR, IBV_WC_REM_INV_RD_REQ_ERR,
+      IBV_WC_INV_EECN_ERR, static_cast<ibv_wc_status>(0x7f),
+  };
+  for (ibv_wc_status status : unknown) {
+    for (bool had : {false, true}) {
+      EXPECT_EQ(ClassifyCompletion(status, had),
+                RailCompletion::kEndpointFailure)
+          << "wc status " << status;
+    }
+  }
+}
+
+TEST(ClassifyCompletion, DeadPeerWindowLeavesRailHealthy) {
+  // End to end through the policy: dead-peer evidence (retry-chain exhaustion
+  // or a silent deadline) repeated past the error threshold must not
+  // quarantine the local rail.
+  RailPolicy policy(1, RailPolicyConfig{1, 3, 1000, 1, 100});
+  for (uint64_t now = 10; now < 15; ++now) {
+    const auto lease = policy.TryAcquire(1, now);
+    ASSERT_TRUE(lease);
+    policy.Complete(*lease, 20,
+                    ClassifyCompletion(IBV_WC_RETRY_EXC_ERR,
+                                       /*had_completions=*/true),
+                    now + 1);
+  }
+  const auto silent_lease = policy.TryAcquire(1, 20);
+  ASSERT_TRUE(silent_lease);
+  policy.Complete(*silent_lease, 20,
+                  ClassifyCompletion(IBV_WC_SUCCESS,
+                                     /*had_completions=*/false),
+                  21);
+  const auto stats = policy.Snapshot(22);
+  EXPECT_EQ(stats[0].endpoint_errors, 6u);
+  EXPECT_EQ(stats[0].errors, 0u);
+  EXPECT_EQ(stats[0].consecutive_errors, 0u);
+  EXPECT_EQ(stats[0].quarantines, 0u);
+  EXPECT_TRUE(policy.TryAcquire(1, 23));
+}
+
+TEST(ClassifyCompletion, LocalFaultWindowFeedsQuarantine) {
+  // Local evidence (the local-fault bucket also used for post/CQ API
+  // failures) still counts toward quarantine.
+  RailPolicy policy(1, RailPolicyConfig{1, 3, 1000, 1, 100});
+  for (uint64_t now = 10; now < 13; ++now) {
+    const auto lease = policy.TryAcquire(1, now);
+    ASSERT_TRUE(lease);
+    policy.Complete(*lease, 20,
+                    ClassifyCompletion(IBV_WC_GENERAL_ERR,
+                                       /*had_completions=*/true),
+                    now + 1);
+  }
+  const auto stats = policy.Snapshot(14);
+  EXPECT_EQ(stats[0].errors, 3u);
+  EXPECT_EQ(stats[0].consecutive_errors, 3u);
+  EXPECT_EQ(stats[0].quarantines, 1u);
+  EXPECT_TRUE(stats[0].quarantined);
+  EXPECT_FALSE(policy.TryAcquire(1, 15));
+}
+#endif  // DFKV_WITH_RDMA
