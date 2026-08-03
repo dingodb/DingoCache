@@ -383,6 +383,9 @@ RdmaTransport::Conn* RdmaTransport::Acquire(
   // the caller's local NUMA rails when that topology exists, then choose least
   // normalized inflight with latency/error penalties and stable device index as
   // the final tie-break. Unknown/no-local topology falls back to all rails.
+  // When every NUMA-local rail is inadmissible (quarantined or credit-bound),
+  // admission retries once across every enabled rail — locality is a
+  // preference, never an availability gate.
   const int caller_node = numa_aware_ ? numa::CurrentNode() : -1;
   const auto candidates =
       topology_->CandidatesFor(caller_node, numa_aware_);
@@ -391,8 +394,10 @@ RdmaTransport::Conn* RdmaTransport::Acquire(
   } else if (candidates.locality == rdma::RailLocality::kNoLocal) {
     numa_no_local_fallbacks_.fetch_add(1, std::memory_order_relaxed);
   }
-  auto lease = rail_policy_->Acquire(requested, rail_backpressure_us_,
-                                     candidates.allowed);
+  auto lease = rdma::AcquireWithFallback(*rail_policy_, requested,
+                                         rail_backpressure_us_,
+                                         candidates.allowed,
+                                         candidates.fallback);
   if (!lease) return nullptr;
 
   const size_t ridx = lease->rail;

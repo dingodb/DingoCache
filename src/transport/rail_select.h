@@ -225,11 +225,13 @@ class RailPolicy {
       State& rail = rails_[i];
       if (!Allowed(i, allowed)) continue;
       if (rail.quarantined_until_us > now_us) continue;
-      if (rail.quarantined_until_us != 0 && !rail.recovery_probe) {
-        // Cooldown elapsed. Permit exactly one probe until it completes.
-        rail.recovery_probe = true;
-      }
-      if (rail.recovery_probe && rail.inflight != 0) continue;
+      // Cooldown elapsed: this rail may serve as the single recovery probe.
+      // The recovery_probe flag is set only when the lease is actually granted
+      // to this rail below, never during the scan — a candidate that loses the
+      // score comparison must not keep a phantom "probe in flight" state that
+      // only a nonexistent completion could clear.
+      const bool probe = rail.recovery_probe || rail.quarantined_until_us != 0;
+      if (probe && rail.inflight != 0) continue;
       if (requested > rail.credits - rail.inflight) {
         ++rail.credits_exhausted;
         continue;
@@ -240,16 +242,20 @@ class RailPolicy {
           occupancy + rail.latency_ewma_us * config_.latency_weight +
           static_cast<uint64_t>(rail.consecutive_errors) *
               config_.error_penalty_us;
-      if ((rail.recovery_probe && !selected_recovery) ||
-          (rail.recovery_probe == selected_recovery &&
-           score < selected_score)) {
+      if ((probe && !selected_recovery) ||
+          (probe == selected_recovery && score < selected_score)) {
         selected = i;
         selected_score = score;
-        selected_recovery = rail.recovery_probe;
+        selected_recovery = probe;
       }
     }
     if (selected == rails_.size()) return std::nullopt;
     State& rail = rails_[selected];
+    if (!rail.recovery_probe && rail.quarantined_until_us != 0) {
+      // Granting the single post-cooldown admission on this rail: mark the
+      // probe in flight. Complete clears the flag exactly once.
+      rail.recovery_probe = true;
+    }
     rail.inflight += requested;
     ++rail.selections;
     return RailLease{selected, requested};
@@ -260,6 +266,25 @@ class RailPolicy {
   std::condition_variable cv_;
   std::vector<State> rails_;
 };
+
+// Bounded admission that prefers one candidate mask and degrades to a
+// fallback mask when no preferred rail can serve immediately — every
+// preferred rail quarantined or credit-bound — while fallback rails still
+// can. Locality stays strictly preferred whenever it is admissible; the
+// fallback is only a backstop. At most one lease is ever granted per call;
+// when neither mask can serve right away, the caller waits on the preferred
+// rails exactly as RailPolicy::Acquire with `preferred` alone would.
+inline std::optional<RailLease> AcquireWithFallback(
+    RailPolicy& policy, uint32_t requested, uint64_t timeout_us,
+    const std::vector<uint8_t>& preferred,
+    const std::vector<uint8_t>& fallback) {
+  const uint64_t now = RailPolicy::NowMicros();
+  if (auto lease = policy.TryAcquire(requested, now, preferred)) return lease;
+  if (!fallback.empty()) {
+    if (auto lease = policy.TryAcquire(requested, now, fallback)) return lease;
+  }
+  return policy.Acquire(requested, timeout_us, preferred);
+}
 
 }  // namespace rdma
 }  // namespace dfkv

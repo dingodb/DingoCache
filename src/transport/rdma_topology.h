@@ -36,6 +36,12 @@ struct RailCandidates {
   // Stable device-index mask. A non-empty mask prevents the admission policy's
   // empty-mask "all rails" convention from reviving a disabled topology rail.
   std::vector<uint8_t> allowed;
+  // Degraded backstop mask, populated only when locality == kLocal: every
+  // currently enabled rail, locality aside. Callers retry admission against it
+  // once when no allowed (NUMA-local) rail can serve, so locality prefers but
+  // never prevents progress. Empty for every other locality, where allowed
+  // already spans all enabled rails.
+  std::vector<uint8_t> fallback;
   RailLocality locality = RailLocality::kDisabled;
 };
 
@@ -64,8 +70,10 @@ class RdmaTopology {
 
   // Build the production admission mask from discovered device NUMA metadata.
   // With NUMA disabled every enabled rail is allowed. With it enabled, local
-  // rails are exclusive when known; unknown caller/no-local topology falls back
-  // to every enabled rail so locality can never prevent progress.
+  // rails are exclusive when known and `fallback` carries every enabled rail
+  // as the backstop for when no local rail is admissible (quarantined or
+  // credit-bound); unknown caller/no-local topology falls back to every
+  // enabled rail in `allowed` itself. Locality can never prevent progress.
   RailCandidates CandidatesFor(int numa_node, bool numa_aware) const;
 
   // Exclude a rail after a runtime local-device failure. Existing connections
