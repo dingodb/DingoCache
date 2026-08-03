@@ -7,6 +7,7 @@ import argparse
 import json
 import re
 import shlex
+import subprocess
 import sys
 import time
 from dataclasses import asdict
@@ -83,7 +84,9 @@ class Replacer:
                 if value:
                     return value
                 last_error = "condition was false"
-            except (RuntimeError, ValueError) as error:
+            # Command timeouts and transient SSH/OS failures retry like any
+            # other pollable error; the deadline above still bounds total wait.
+            except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
                 last_error = str(error)
             time.sleep(self.args.poll_interval)
         raise WorkflowError(f"timeout after {self.args.timeout}s waiting for {description}: {last_error}")
