@@ -9,6 +9,9 @@
 #define DFKV_METRICS_HTTP_H_
 
 #include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -49,11 +52,35 @@ class MetricsHttpServer {
   // now that finished connections are joined as new ones arrive — Prometheus
   // scrapes are Connection: close, so without reaping this grew per scrape.
   size_t live_conn_count();
+  // Live connections admitted (not yet closed). Test/diagnostic; the accept
+  // loop gates on this so DFKV_METRICS_MAX_CONNS is an exact bound.
+  size_t ActiveConnections() const {
+    return active_connections_.load(std::memory_order_relaxed);
+  }
+  // Accepted connections closed instantly because the server was at
+  // DFKV_METRICS_MAX_CONNS (oneshot port: no queue for a handler thread).
+  size_t DroppedConnections() const {
+    return dropped_connections_.load(std::memory_order_relaxed);
+  }
 
  private:
   void AcceptLoop();
-  void Handle(int fd);
+  // accepted_at stamps the accept() return so the first complete request line
+  // is due within DFKV_METRICS_FIRST_REQ_MS of ACCEPT, not of scheduling.
+  void Handle(int fd, std::chrono::steady_clock::time_point accepted_at);
   void ReapDoneLocked();  // join+erase finished handler threads; conn_mu_ held
+
+  // Absolute deadline for the first complete request line after accept — a
+  // drip feeder otherwise never hit the per-syscall SO_RCVTIMEO (0 = off).
+  static constexpr uint64_t kDefaultFirstReqMs = 30000;
+  static constexpr uint64_t kHardFirstReqMs = 3600000;
+  // Connection cap for this oneshot/low-frequency port (none existed before).
+  static constexpr size_t kDefaultMaxConns = 64;
+  static constexpr size_t kHardMaxConns = 4096;
+  uint64_t first_req_ms_ = kDefaultFirstReqMs;
+  size_t max_conns_ = kDefaultMaxConns;
+  std::atomic<size_t> active_connections_{0};
+  std::atomic<size_t> dropped_connections_{0};
 
   // A live connection: its handler thread + a flag the thread sets last, so
   // AcceptLoop can join it without blocking. shared_ptr because conns_ may

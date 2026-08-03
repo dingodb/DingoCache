@@ -5,16 +5,62 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <cstdlib>
 #include <string>
 
+#include "common/config_dump.h"
+#include "utils/log.h"
 #include "utils/net_util.h"
 #include "utils/thread_name.h"
 
 namespace dfkv {
 
+namespace {
+// Bounded uint64 env knob: empty => fallback; non-numeric or 0 (unless the
+// knob documents 0 as "off") => warn + fallback; above hard_max => warn +
+// clamp. Same parse policy as the cache TCP listener knobs (kv_node_server.cc).
+uint64_t BoundedEnv(const char* name, uint64_t fallback, uint64_t hard_max,
+                    bool allow_zero) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || *value == '\0') return fallback;
+  if (*value < '0' || *value > '9') {
+    DFKV_LOG_WARN(std::string("invalid ") + name + "='" + value + "'; using " +
+                  std::to_string(fallback));
+    return fallback;
+  }
+  errno = 0;
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(value, &end, 10);
+  if (errno != 0 || end == value || *end != '\0' ||
+      (parsed == 0 && !allow_zero)) {
+    DFKV_LOG_WARN(std::string("invalid ") + name + "='" + value + "'; using " +
+                  std::to_string(fallback));
+    return fallback;
+  }
+  if (parsed > hard_max) {
+    DFKV_LOG_WARN(std::string(name) + " clamped to hard maximum " +
+                  std::to_string(hard_max));
+    return hard_max;
+  }
+  return parsed;
+}
+}  // namespace
+
 MetricsHttpServer::~MetricsHttpServer() { Stop(); }
 
 Status MetricsHttpServer::Start(int port, const std::string& bind_addr) {
+  // Connection-lifecycle knobs are resolved at Start so a test/operator can
+  // still adjust them per process boot (they are not hot-reloaded).
+  first_req_ms_ = BoundedEnv("DFKV_METRICS_FIRST_REQ_MS", kDefaultFirstReqMs,
+                             kHardFirstReqMs, /*allow_zero=*/true);
+  max_conns_ = static_cast<size_t>(BoundedEnv(
+      "DFKV_METRICS_MAX_CONNS", kDefaultMaxConns, kHardMaxConns,
+      /*allow_zero=*/false));
+  config_dump::RecordResolved("DFKV_METRICS_FIRST_REQ_MS",
+                              std::to_string(first_req_ms_));
+  config_dump::RecordResolved("DFKV_METRICS_MAX_CONNS",
+                              std::to_string(max_conns_));
   listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
   if (listen_fd_ < 0) return Status::kIOError;
   int one = 1;
@@ -77,6 +123,8 @@ void MetricsHttpServer::AcceptLoop() {
   while (running_) {
     int fd = ::accept(listen_fd_, nullptr, nullptr);
     if (fd < 0) { if (!running_) break; continue; }
+    // First-request deadline anchors at ACCEPT time (DFKV_METRICS_FIRST_REQ_MS).
+    const auto accepted_at = std::chrono::steady_clock::now();
     // A scrape is one short request/response; a silent peer must not pin the
     // handler thread (Handle's recv loop otherwise blocks indefinitely).
     timeval tv{10, 0};
@@ -85,11 +133,23 @@ void MetricsHttpServer::AcceptLoop() {
     std::lock_guard<std::mutex> lk(conn_mu_);
     if (!running_) { ::close(fd); break; }
     ReapDoneLocked();  // join finished scrape handlers (Connection: close => one per scrape)
+    if (active_connections_.load(std::memory_order_relaxed) >= max_conns_) {
+      // Oneshot, low-frequency port: past DFKV_METRICS_MAX_CONNS the accept is
+      // closed IMMEDIATELY instead of occupying a handler thread forever.
+      dropped_connections_.fetch_add(1, std::memory_order_relaxed);
+      ::close(fd);
+      continue;
+    }
+    // +1 exactly once here (under conn_mu_, so the cap check above is exact);
+    // the handler thread's -1 below pairs it on every exit path (clean EOF,
+    // recv error, deadline expiry, shutdown) with no double-count.
+    active_connections_.fetch_add(1, std::memory_order_relaxed);
     conn_fds_.insert(fd);
     auto done = std::make_shared<std::atomic<bool>>(false);
-    conns_.push_back({std::thread([this, fd, done] {
+    conns_.push_back({std::thread([this, fd, done, accepted_at] {
                         NameThisThread("met-conn");
-                        Handle(fd);
+                        Handle(fd, accepted_at);
+                        active_connections_.fetch_sub(1, std::memory_order_relaxed);
                         { std::lock_guard<std::mutex> lk(conn_mu_); conn_fds_.erase(fd); }
                         ::close(fd);
                         done->store(true, std::memory_order_release);  // last act
@@ -108,15 +168,28 @@ std::string Resp(const char* status_line, const char* ctype, const std::string& 
 }
 }  // namespace
 
-void MetricsHttpServer::Handle(int fd) {
+void MetricsHttpServer::Handle(
+    int fd, std::chrono::steady_clock::time_point accepted_at) {
   // Read just the request line (up to CRLF). Headers/body are ignored — we only
   // need method + path. Bound the read so a silent peer can't pin the thread.
+  // The request line also has an ABSOLUTE deadline (DFKV_METRICS_FIRST_REQ_MS,
+  // anchored at accept): SO_RCVTIMEO alone is per-syscall, so a drip feeder
+  // (1 byte < 10s apart) would otherwise pin a handler thread. Before every
+  // recv the per-syscall budget is recomputed as min(10s, deadline remaining);
+  // a spent budget closes the connection. 0 disables (legacy behavior).
+  const bool deadline_on = first_req_ms_ > 0;
+  const auto deadline =
+      accepted_at + std::chrono::milliseconds(first_req_ms_);
+  const timeval base_tv{10, 0};
   std::string line;
   char c;
   size_t guard = 0;
   while (guard++ < 8192) {
-    ssize_t r = ::recv(fd, &c, 1, 0);
-    if (r <= 0) return;  // peer closed / error
+    if (deadline_on) {
+      if (!net::ReadAllWithin(fd, &c, 1, base_tv, deadline)) return;
+    } else {
+      if (::recv(fd, &c, 1, 0) <= 0) return;  // peer closed / error
+    }
     if (c == '\n') break;
     if (c != '\r') line.push_back(c);
   }

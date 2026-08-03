@@ -99,11 +99,17 @@ int main(int argc, char** argv) {
   std::unique_ptr<dfkv::MetricsHttpServer> mhttp;
   if (metrics_port >= 0) {
     mhttp = std::make_unique<dfkv::MetricsHttpServer>([&srv] { return srv.MetricsText(); });
-    // Both liveness dependency reporting and scheduler readiness are live etcd
-    // probes. A running MDS cannot serve membership correctly without etcd, so
-    // it must be removed from routing during an outage and recover in place.
-    mhttp->set_health_check([&srv] { return srv.ProbeEtcd(); });
-    mhttp->set_ready_check([&srv] { return srv.ProbeEtcd(); });
+    // Liveness and readiness are deliberately DIFFERENT predicates:
+    // - /healthz is left unset (always 200): it reflects only this process
+    //   being alive. A live etcd probe here turns any second-long etcd blip
+    //   into kubelet restarting ALL MDS replicas at once — a CrashLoop that
+    //   outlasts the blip and further buries etcd under re-registrations.
+    // - /readyz keeps the etcd dependency check (a running MDS cannot serve
+    //   membership without etcd and must be pulled from routing), but through
+    //   a TTL-debounced probe (DFKV_MDS_PROBE_CACHE_MS, default 2500 ms) so
+    //   the kubelet scrape cadence can't amplify into etcd read load during
+    //   an ongoing incident; a not-ready replica re-probes at most once per TTL.
+    mhttp->set_ready_check([&srv] { return srv.ProbeEtcdCached(); });
     if (mhttp->Start(metrics_port, metrics_bind) == dfkv::Status::kOk)
       std::printf("dfkv_mds /metrics on port %d\n", mhttp->port());
     std::fflush(stdout);

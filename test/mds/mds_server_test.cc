@@ -5,28 +5,37 @@
 #include "utils/net_util.h"
 #include <gtest/gtest.h>
 #include <unistd.h>
+#include <atomic>
+#include <cerrno>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <vector>
 using namespace dfkv;  // NOLINT
 
 namespace {
 const char* EtcdEp() { return std::getenv("DFKV_TEST_ETCD"); }
 
-bool DoReq(int port, WireOp op, const std::string& payload, Status* st, std::string* data) {
-  int fd = net::Dial("127.0.0.1:" + std::to_string(port), 2000, 2000);
-  if (fd < 0) return false;
+bool DoReqOnFd(int fd, WireOp op, const std::string& payload, Status* st, std::string* data) {
   char pre[kReqPrefix];
   EncodeReq(pre, op, BlockKey{}, 0, 0, payload.size());
   if (!net::WriteAll(fd, pre, kReqPrefix) ||
-      (!payload.empty() && !net::WriteAll(fd, payload.data(), payload.size()))) { ::close(fd); return false; }
+      (!payload.empty() && !net::WriteAll(fd, payload.data(), payload.size()))) return false;
   char rp[kRespPrefix];
-  if (!net::ReadAll(fd, rp, kRespPrefix)) { ::close(fd); return false; }
+  if (!net::ReadAll(fd, rp, kRespPrefix)) return false;
   Status s; uint64_t dlen = 0;
-  if (!DecodeResp(rp, &s, &dlen)) { ::close(fd); return false; }
+  if (!DecodeResp(rp, &s, &dlen)) return false;
   data->resize(dlen);
-  if (dlen && !net::ReadAll(fd, &(*data)[0], dlen)) { ::close(fd); return false; }
-  *st = s; ::close(fd); return true;
+  if (dlen && !net::ReadAll(fd, &(*data)[0], dlen)) return false;
+  *st = s; return true;
+}
+
+bool DoReq(int port, WireOp op, const std::string& payload, Status* st, std::string* data) {
+  int fd = net::Dial("127.0.0.1:" + std::to_string(port), 2000, 2000);
+  if (fd < 0) return false;
+  const bool ok = DoReqOnFd(fd, op, payload, st, data);
+  ::close(fd);
+  return ok;
 }
 }  // namespace
 
@@ -431,4 +440,219 @@ TEST(LocalLeaseMap, RecentUseSurvivesWhileStaleEntryIsForgotten) {
   EXPECT_EQ(leases.Size(), 1u);
   EXPECT_FALSE(leases.LookupAndTouch("cold", 122000, &lease_id));
   EXPECT_TRUE(leases.LookupAndTouch("hot", 122000, &lease_id));
+}
+
+// ---- EtcdProbeCache (TTL-debounced, single-flight probe behind /readyz) -----
+// No etcd needed: clock and prober are injected. These pin the debounce
+// contract: replay within the TTL (failures included), refetch after expiry,
+// concurrent callers collapse onto one probe, and ttl 0 = live probing (the
+// pre-knob behavior).
+
+TEST(EtcdProbeCache, ReplaysResultWithinTtlWithoutReprobing) {
+  uint64_t now_ms = 1000;
+  int probes = 0;
+  EtcdProbeCache c(2000, [&] { return now_ms; },
+                   [&] { ++probes; return true; });
+  EXPECT_TRUE(c.Get());
+  EXPECT_EQ(probes, 1);
+  now_ms += 1999;  // still inside the TTL
+  EXPECT_TRUE(c.Get());
+  EXPECT_EQ(probes, 1) << "fresh result must be replayed, not re-probed";
+}
+
+TEST(EtcdProbeCache, ExpiryTriggersNewProbe) {
+  uint64_t now_ms = 1000;
+  int probes = 0;
+  bool result = true;
+  EtcdProbeCache c(2000, [&] { return now_ms; },
+                   [&] { ++probes; return result; });
+  EXPECT_TRUE(c.Get());
+  EXPECT_EQ(probes, 1);
+  now_ms += 2000;  // the TTL boundary itself counts as expired
+  result = false;
+  EXPECT_FALSE(c.Get());
+  EXPECT_EQ(probes, 2) << "expired result must be re-probed";
+}
+
+TEST(EtcdProbeCache, FailureIsCachedForTheTtlToo) {
+  // The point of the debounce: during an etcd outage the probe rate is bounded
+  // by the TTL — a failure must be replayed, not retried on every probe hit.
+  uint64_t now_ms = 1000;
+  int probes = 0;
+  bool result = false;
+  EtcdProbeCache c(2000, [&] { return now_ms; },
+                   [&] { ++probes; return result; });
+  EXPECT_FALSE(c.Get());
+  EXPECT_EQ(probes, 1);
+  result = true;   // etcd recovers inside the TTL
+  now_ms += 1000;
+  EXPECT_FALSE(c.Get()) << "cached failure must be replayed within the TTL";
+  EXPECT_EQ(probes, 1);
+  now_ms += 1000;  // TTL expires -> recovery becomes visible
+  EXPECT_TRUE(c.Get());
+  EXPECT_EQ(probes, 2);
+}
+
+TEST(EtcdProbeCache, ZeroTtlDisablesCaching) {
+  uint64_t now_ms = 0;
+  int probes = 0;
+  EtcdProbeCache c(0, [&] { return now_ms; },
+                   [&] { ++probes; return true; });
+  EXPECT_TRUE(c.Get());
+  EXPECT_TRUE(c.Get());
+  EXPECT_EQ(probes, 2) << "ttl 0 must probe live on every call (old behavior)";
+}
+
+TEST(EtcdProbeCache, ConcurrentCallersCollapseOntoSingleFlight) {
+  uint64_t now_ms = 1000;
+  std::atomic<int> probes{0};
+  std::atomic<bool> entered{false};
+  std::atomic<bool> release{false};
+  EtcdProbeCache c(2000, [&] { return now_ms; }, [&] {
+    ++probes;
+    entered.store(true);
+    while (!release.load()) usleep(1000);  // hold the flight open
+    return true;
+  });
+  std::atomic<int> answered_true{0};
+  std::vector<std::thread> threads;
+  for (int i = 0; i < 4; ++i)
+    threads.emplace_back([&] { if (c.Get()) ++answered_true; });
+  for (int i = 0; i < 200 && !entered.load(); ++i) usleep(1000);
+  usleep(20 * 1000);  // give the other callers time to block on the flight
+  release.store(true);
+  for (auto& t : threads) t.join();
+  EXPECT_EQ(answered_true.load(), 4);
+  EXPECT_EQ(probes.load(), 1) << "concurrent probes must single-flight";
+}
+
+// Cached-probe wiring: the cache stores answers, it never invents health —
+// a dead endpoint must read false through ProbeEtcdCached as well.
+TEST(MdsServer, ProbeEtcdCachedReflectsReachability) {
+  ::setenv("DFKV_MDS_PROBE_CACHE_MS", "60000", 1);
+  { MdsServer dead("127.0.0.1:9", /*timeout_ms=*/300);
+    EXPECT_FALSE(dead.ProbeEtcdCached());
+    EXPECT_FALSE(dead.ProbeEtcdCached()); }
+  ::unsetenv("DFKV_MDS_PROBE_CACHE_MS");
+
+  const char* ep = EtcdEp();
+  if (!ep) GTEST_SKIP() << "set DFKV_TEST_ETCD for the reachable case";
+  MdsServer live(ep);
+  EXPECT_TRUE(live.ProbeEtcdCached());
+}
+
+// ---- First-frame absolute deadline (DFKV_MDS_FIRST_REQ_MS) ------------------
+// The base SO_RCVTIMEO is a PER-SYSCALL budget: a peer dribbling one byte per
+// sub-timeout interval never trips it and pins a handler thread forever. The
+// deadline stamps each conn at accept and requires the first COMPLETE frame
+// within the budget. No etcd needed (dead-endpoint MDS, local sockets only).
+
+namespace {
+// The server never sends data on these conns, so a readable fd means FIN:
+// recv==0 confirms it (server closed). false = still open or timeout.
+bool ServerClosed(int fd, int wait_ms) {
+  pollfd pfd{fd, POLLIN, 0};
+  if (::poll(&pfd, 1, wait_ms) <= 0) return false;
+  char tmp[16];
+  const ssize_t r = ::recv(fd, tmp, sizeof(tmp), MSG_DONTWAIT);
+  return r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK);
+}
+}  // namespace
+
+TEST(MdsServer, SlowDribbleFirstFrameDiesAtAbsoluteDeadline) {
+  ::setenv("DFKV_MDS_FIRST_REQ_MS", "300", 1);
+  ::setenv("DFKV_MDS_IO_TIMEOUT_S", "30", 1);  // per-syscall budget >> deadline
+  MdsServer srv("127.0.0.1:1");  // etcd never contacted: no frame completes
+  ASSERT_EQ(srv.Start(0), Status::kOk);
+  int fd = net::Dial("127.0.0.1:" + std::to_string(srv.port()), 2000, 2000);
+  ASSERT_GE(fd, 0);
+  // Lead with the v2 epoch discriminator so the server passes the epoch gate
+  // and settles into the framed prefix read; then dribble one byte every
+  // 100 ms. A per-syscall 30 s timeout would never fire, so closure within
+  // ~2 s can only come from the absolute first-frame deadline.
+  bool closed = false;
+  int sent = 0;
+  {
+    const char epoch = static_cast<char>(kNativeProtoTcp);
+    ASSERT_EQ(::send(fd, &epoch, 1, MSG_NOSIGNAL), 1);
+  }
+  for (; sent < 20 && !closed; ++sent) {
+    usleep(100 * 1000);
+    const char b = 1;
+    if (::send(fd, &b, 1, MSG_NOSIGNAL) <= 0 || ServerClosed(fd, 50))
+      closed = true;
+  }
+  EXPECT_TRUE(closed) << "slow-dribble conn must be killed by the deadline";
+  EXPECT_LT(sent, 20) << "closed well before the per-syscall timeout";
+  for (int i = 0; i < 100 && srv.live_conn_count() > 0; ++i) usleep(20 * 1000);
+  EXPECT_EQ(srv.live_conn_count(), 0u) << "dead conn's handler must be reaped";
+  ::close(fd);
+  srv.Stop();
+  ::unsetenv("DFKV_MDS_FIRST_REQ_MS");
+  ::unsetenv("DFKV_MDS_IO_TIMEOUT_S");
+}
+
+TEST(MdsServer, FirstFrameDeadlineEndsAfterFirstCompleteFrame) {
+  // The deadline governs ONLY the gap accept -> first complete frame. A conn
+  // that spoke within the deadline must live past accept+deadline, with the
+  // steady-state per-syscall timeout (here 30 s) as the only remaining bound.
+  ::setenv("DFKV_MDS_FIRST_REQ_MS", "800", 1);
+  ::setenv("DFKV_MDS_IO_TIMEOUT_S", "30", 1);
+  MdsServer srv("127.0.0.1:1");  // dead etcd: requests answer kIOError but the
+                                 // conn itself stays usable
+  ASSERT_EQ(srv.Start(0), Status::kOk);
+  int fd = net::Dial("127.0.0.1:" + std::to_string(srv.port()), 3000, 3000);
+  ASSERT_GE(fd, 0);
+  Status st = Status::kInvalid;
+  std::string data;
+  MemberInfo m{"n1", "10.1.1.1", 28000, 1};
+  // Frame #1 lands well inside the 800 ms deadline.
+  ASSERT_TRUE(DoReqOnFd(fd, WireOp::kRegister, EncodeMemberReq("dl-grp", m),
+                        &st, &data));
+  EXPECT_EQ(st, Status::kIOError) << "dead etcd -> kIOError, but conn answered";
+  usleep(1000 * 1000);  // now past the ORIGINAL accept deadline
+  // Frame #2 must still be served: the deadline must not outlive frame #1
+  // (this is the normal-traffic regression guard for the new read path).
+  ASSERT_TRUE(DoReqOnFd(fd, WireOp::kHeartbeat, EncodeMemberReq("dl-grp", m),
+                        &st, &data))
+      << "first-frame deadline must not kill a conn that already spoke";
+  EXPECT_EQ(st, Status::kIOError);
+  ::close(fd);
+  srv.Stop();
+  ::unsetenv("DFKV_MDS_FIRST_REQ_MS");
+  ::unsetenv("DFKV_MDS_IO_TIMEOUT_S");
+}
+
+TEST(MdsServer, ZeroFirstReqMsKeepsOldDribbleBehavior) {
+  // Knob explicitly OFF: no absolute deadline — a dribble at sub-timeout
+  // cadence outlives the (here much shorter) per-syscall I/O timeout because
+  // every recv returns in time. Pins the 0 = disabled compatibility mode.
+  ::setenv("DFKV_MDS_FIRST_REQ_MS", "0", 1);
+  ::setenv("DFKV_MDS_IO_TIMEOUT_S", "1", 1);
+  MdsServer srv("127.0.0.1:1");
+  ASSERT_EQ(srv.Start(0), Status::kOk);
+  int fd = net::Dial("127.0.0.1:" + std::to_string(srv.port()), 2000, 2000);
+  ASSERT_GE(fd, 0);
+  // Lead with the v2 epoch discriminator so the server passes the epoch gate
+  // and waits on the rest of the prefix; the dribble below then exercises
+  // pure per-syscall cadence (no absolute deadline) exactly as pre-shim.
+  bool died = false;
+  {
+    const char epoch = static_cast<char>(kNativeProtoTcp);
+    ASSERT_EQ(::send(fd, &epoch, 1, MSG_NOSIGNAL), 1);
+  }
+  for (int i = 0; i < 5 && !died; ++i) {
+    usleep(300 * 1000);  // 300 ms cadence < 1 s per-syscall timeout
+    const char b = 1;
+    if (::send(fd, &b, 1, MSG_NOSIGNAL) <= 0 || ServerClosed(fd, 50)) {
+      died = true;
+    }
+  }
+  // Dribble span 1.5 s > 1 s per-syscall budget: only per-syscall semantics
+  // were in play, so the conn must have survived all of it.
+  EXPECT_FALSE(died) << "knob=0: dribble at sub-timeout cadence must survive";
+  ::close(fd);
+  srv.Stop();
+  ::unsetenv("DFKV_MDS_FIRST_REQ_MS");
+  ::unsetenv("DFKV_MDS_IO_TIMEOUT_S");
 }

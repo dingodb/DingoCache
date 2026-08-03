@@ -3,14 +3,57 @@
 
 #include <gtest/gtest.h>
 
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <functional>
 #include <string>
+#include <thread>
 
 #include "utils/net_util.h"
 
 using namespace dfkv;  // NOLINT
 
 namespace {
+class ScopedEnv {
+ public:
+  ScopedEnv(const char* name, const char* value) : name_(name) {
+    if (const char* old = std::getenv(name)) {
+      had_old_ = true;
+      old_ = old;
+    }
+    ::setenv(name, value, 1);
+  }
+  ~ScopedEnv() {
+    if (had_old_)
+      ::setenv(name_.c_str(), old_.c_str(), 1);
+    else
+      ::unsetenv(name_.c_str());
+  }
+
+ private:
+  std::string name_;
+  std::string old_;
+  bool had_old_ = false;
+};
+
+bool WaitFor(const std::function<bool()>& predicate, int timeout_ms) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(timeout_ms);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (predicate()) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return predicate();
+}
+
+int Dial(int port) {
+  return net::Dial("127.0.0.1:" + std::to_string(port), 1000, 2000);
+}
+
 // Minimal HTTP/1.0 client: send one request, read the whole response (server
 // closes the connection after the body, so recv to EOF).
 std::string HttpGet(int port, const std::string& path) {
@@ -145,6 +188,113 @@ TEST(MetricsHttp, ReadyCheckRecoversAcrossLiveDependencyLoss) {
   EXPECT_NE(dflt.find("200"), std::string::npos) << dflt;
   plain.Stop();
   srv.Stop();
+}
+
+// DFKV_METRICS_MAX_CONNS bounds the oneshot port: excess accepts are closed
+// IMMEDIATELY (no handler thread), the drop is counted, and the capped
+// connections — plus later scrapes after they drain — keep working.
+TEST(MetricsHttp, MaxConnsClosesExcessAcceptsImmediately) {
+  ScopedEnv max_conns("DFKV_METRICS_MAX_CONNS", "2");
+  MetricsHttpServer srv([] { return std::string("dfkv_x 1\n"); });
+  ASSERT_EQ(srv.Start(0), Status::kOk);
+  const int port = srv.port();
+
+  const int c1 = Dial(port);
+  const int c2 = Dial(port);
+  ASSERT_GE(c1, 0);
+  ASSERT_GE(c2, 0);
+  ASSERT_TRUE(WaitFor([&] { return srv.ActiveConnections() == 2; }, 2000));
+
+  const int c3 = Dial(port);
+  ASSERT_GE(c3, 0);
+  ASSERT_TRUE(WaitFor([&] { return srv.DroppedConnections() == 1; }, 2000));
+  EXPECT_EQ(srv.ActiveConnections(), 2u);
+  // The dropped peer sees an instant EOF — the accept was closed, not queued.
+  char byte = 0;
+  EXPECT_LE(::recv(c3, &byte, 1, 0), 0);
+  ::close(c3);
+
+  // The two admitted connections still serve normally (request completes well
+  // inside the default first-request deadline).
+  const std::string req = "GET /healthz HTTP/1.0\r\n\r\n";
+  ASSERT_TRUE(net::WriteAll(c1, req.data(), req.size()));
+  char buf[128];
+  ssize_t r = ::recv(c1, buf, sizeof(buf), 0);
+  ASSERT_GT(r, 0);
+  EXPECT_NE(std::string(buf, static_cast<size_t>(r)).find("200"),
+            std::string::npos);
+  ::close(c1);
+  ::close(c2);
+  // After the surge drains to zero, a fresh scrape is admitted again.
+  ASSERT_TRUE(WaitFor([&] { return srv.ActiveConnections() == 0; }, 2000));
+  EXPECT_NE(HttpGet(port, "/metrics").find("dfkv_x 1"), std::string::npos);
+  srv.Stop();
+}
+
+// SO_RCVTIMEO is a per-SYSCALL budget: a drip feeder sending one byte per
+// (timeout - epsilon) never timed out and pinned a handler thread forever.
+// DFKV_METRICS_FIRST_REQ_MS gives the request line an absolute deadline
+// anchored at accept, so the drip connection is closed while the 10s
+// per-syscall base alone would never have fired (drip interval < 10s).
+TEST(MetricsHttp, SlowDripRequestLineIsClosedByAbsoluteDeadline) {
+  ScopedEnv first_req("DFKV_METRICS_FIRST_REQ_MS", "300");
+  MetricsHttpServer srv([] { return std::string("dfkv_x 1\n"); });
+  ASSERT_EQ(srv.Start(0), Status::kOk);
+
+  const int fd = Dial(srv.port());
+  ASSERT_GE(fd, 0);
+  ASSERT_TRUE(WaitFor([&] { return srv.ActiveConnections() == 1; }, 2000));
+  // Drip a partial request line one byte at a time below the 10s base.
+  const char* drip = "GE";
+  ::send(fd, drip, 1, MSG_NOSIGNAL);
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  ::send(fd, drip + 1, 1, MSG_NOSIGNAL);
+  EXPECT_TRUE(WaitFor([&] { return srv.ActiveConnections() == 0; }, 3000))
+      << "drip connection outlived its first-request deadline";
+  EXPECT_EQ(srv.DroppedConnections(), 0u);  // timeout close is NOT a cap drop
+  ::close(fd);
+  // Normal scrapes are unaffected on the same server.
+  EXPECT_NE(HttpGet(srv.port(), "/metrics").find("dfkv_x 1"),
+            std::string::npos);
+  srv.Stop();
+}
+
+// The active-connection count is +1 at admit and −1 exactly once on EVERY
+// exit path — normal EOF after a scrape, abrupt close mid-request, deadline
+// expiry, and Stop() interrupting an idle handler. No leak, no double-dec.
+TEST(MetricsHttp, ConnCountBalancesAcrossEveryClosePath) {
+  ScopedEnv first_req("DFKV_METRICS_FIRST_REQ_MS", "300");
+  ScopedEnv max_conns("DFKV_METRICS_MAX_CONNS", "8");
+  MetricsHttpServer srv([] { return std::string("dfkv_x 1\n"); });
+  ASSERT_EQ(srv.Start(0), Status::kOk);
+  const int port = srv.port();
+
+  // path 1: clean one-shot scrape, closed by the server after the response.
+  EXPECT_NE(HttpGet(port, "/metrics").find("dfkv_x 1"), std::string::npos);
+  // path 2: peer connects then vanishes WITHOUT a request (handler's first
+  // recv sees EOF).
+  const int gone = Dial(port);
+  ASSERT_GE(gone, 0);
+  ::close(gone);
+  // path 3: drip feeder closed by the absolute deadline (server-side close,
+  // NOT a client close — the count must still unwind to zero).
+  const int drip = Dial(port);
+  ASSERT_GE(drip, 0);
+  ::send(drip, "G", 1, MSG_NOSIGNAL);
+  ASSERT_TRUE(WaitFor([&] { return srv.ActiveConnections() == 1; }, 3000))
+      << "expected only the drip conn to remain; got "
+      << srv.ActiveConnections();
+  ASSERT_TRUE(WaitFor([&] { return srv.ActiveConnections() == 0; }, 3000))
+      << "deadline close leaked the connection count";
+  ::close(drip);
+
+  // path 4: Stop() interrupts an idle pre-request handler mid-recv.
+  const int idle = Dial(port);
+  ASSERT_GE(idle, 0);
+  ASSERT_TRUE(WaitFor([&] { return srv.ActiveConnections() == 1; }, 2000));
+  srv.Stop();
+  EXPECT_EQ(srv.ActiveConnections(), 0u);
+  ::close(idle);
 }
 
 TEST(MetricsHttp, StorageHealthDynamicallyRemovesReadiness) {

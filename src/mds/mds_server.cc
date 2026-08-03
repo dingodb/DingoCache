@@ -1,6 +1,8 @@
 #include "common/config_dump.h"
 #include "mds/mds_server.h"
 
+#include <algorithm>
+#include <cerrno>
 #include <cstdlib>
 #include <chrono>
 #include <map>
@@ -77,6 +79,44 @@ size_t LocalLeaseMap::Size() const {
   std::lock_guard<std::mutex> lk(mu_);
   return entries_.size();
 }
+
+bool EtcdProbeCache::Get() {
+  if (ttl_ms_ == 0) return prober_();  // caching off: live probe, old behavior
+  std::unique_lock<std::mutex> lk(mu_);
+  const uint64_t now = clock_();
+  if (have_value_ && now >= fetched_at_ms_ && now - fetched_at_ms_ < ttl_ms_)
+    return value_;  // fresh: replay the last result (failures included)
+  if (refreshing_) {
+    // Single-flight: wait for the in-flight probe instead of stacking a
+    // concurrent etcd read; the result it caches is fresh by construction.
+    cv_.wait(lk, [this] { return !refreshing_; });
+    return value_;
+  }
+  refreshing_ = true;
+  lk.unlock();
+  const bool v = prober_();  // the one real probe for this TTL window
+  lk.lock();
+  value_ = v;
+  have_value_ = true;
+  fetched_at_ms_ = clock_();
+  refreshing_ = false;
+  cv_.notify_all();
+  return value_;
+}
+
+MdsServer::MdsServer(const std::string& etcd_addr, int etcd_timeout_ms)
+    : http_(etcd_addr, etcd_timeout_ms),
+      etcd_(&http_),
+      accept_legacy_(config_dump::EnvBool("DFKV_MDS_ACCEPT_LEGACY", false)),
+      // DFKV_MDS_PROBE_CACHE_MS: /readyz probe debounce, default 2500 ms,
+      // 0 disables caching (ProbeEtcdCached then behaves like ProbeEtcd).
+      // Clamped at 10 min: a negative env value wraps strtoull into ~2^64 and
+      // would pin /readyz on its first result for the process lifetime.
+      probe_cache_(std::min<uint64_t>(
+                       config_dump::EnvU64("DFKV_MDS_PROBE_CACHE_MS", 2500),
+                       600000),
+                   SteadyNowMs,
+                   [this] { return ProbeEtcd(); }) {}
 
 MdsServer::~MdsServer() { Stop(); }
 
@@ -163,10 +203,28 @@ void MdsServer::AcceptLoop() {
     const long m = std::atol(v);
     if (m > 0) max_conns = static_cast<size_t>(m);
   }
+  // First-frame ABSOLUTE deadline (DFKV_MDS_FIRST_REQ_MS, default 30000,
+  // 0=disabled): the per-syscall SO_RCVTIMEO above only bounds ONE recv, so a
+  // peer dribbling one byte per sub-timeout interval would pin a handler
+  // thread forever. With the knob on, the first COMPLETE frame must arrive
+  // within this budget counted from accept(); steady-state traffic is
+  // untouched (plain per-syscall timeout, same as before).
+  long first_req_ms = 30000;
+  if (const char* v = std::getenv("DFKV_MDS_FIRST_REQ_MS")) {
+    errno = 0;
+    char* end = nullptr;
+    const long t = std::strtol(v, &end, 10);
+    // Strict full-string parse: garbage or a negative value falls back to the
+    // default (it must never silently DISABLE the safeguard); an explicit 0
+    // disables it. Hard-clamped at 1 h so the accept+ms deadline can't wrap.
+    if (errno == 0 && end != v && *end == '\0' && t >= 0)
+      first_req_ms = t > 3600000 ? 3600000 : t;
+  }
   // Recorded from the accept thread's prologue (runs at Start, before main
   // reaches Emit after its network etcd probe) so the dump shows these defaults.
   config_dump::RecordResolved("DFKV_MDS_IO_TIMEOUT_S", std::to_string(tmo_s));
   config_dump::RecordResolved("DFKV_MDS_MAX_CONNS", std::to_string(max_conns));
+  config_dump::RecordResolved("DFKV_MDS_FIRST_REQ_MS", std::to_string(first_req_ms));
   while (running_) {
     int fd = ::accept(listen_fd_, nullptr, nullptr);
     if (fd < 0) { if (!running_) break; continue; }
@@ -180,10 +238,17 @@ void MdsServer::AcceptLoop() {
     ReapDoneLocked();  // join handlers that finished since the last accept
     if (conns_.size() >= max_conns) { ::close(fd); continue; }
     conn_fds_.push_back(fd);
+    // The deadline is stamped at ACCEPT time (before the handler thread even
+    // starts), so a thread-start delay can never extend it.
+    const auto first_req_deadline =
+        first_req_ms > 0
+            ? std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(first_req_ms)
+            : std::chrono::steady_clock::time_point::max();
     auto done = std::make_shared<std::atomic<bool>>(false);
-    conns_.push_back({std::thread([this, fd, done] {
+    conns_.push_back({std::thread([this, fd, done, tmo_s, first_req_deadline] {
                         NameThisThread("mds-conn");
-                        Handle(fd);
+                        Handle(fd, tmo_s, first_req_deadline);
                         {
                           std::lock_guard<std::mutex> lk(conn_mu_);
                           for (auto it = conn_fds_.begin(); it != conn_fds_.end(); ++it)
@@ -428,7 +493,15 @@ std::string MdsServer::GroupMetricsText() {
   return s;
 }
 
-void MdsServer::Handle(int fd) {
+void MdsServer::Handle(int fd, long io_timeout_s,
+                       std::chrono::steady_clock::time_point first_frame_deadline) {
+  const timeval base_rcvtmo{io_timeout_s, 0};
+  // While armed, both reads of the FIRST frame (prefix + payload) run through
+  // net::ReadAllWithin, which re-arms SO_RCVTIMEO to min(base, remaining)
+  // before every recv — so the deadline is absolute and a byte-at-a-time
+  // dribble dies on it instead of surviving under a fresh per-syscall budget.
+  bool arm_deadline =
+      first_frame_deadline != std::chrono::steady_clock::time_point::max();
   while (running_) {
     // Control-plane epoch discrimination for mixed-generation rollouts. The
     // leading byte is the deterministic discriminator: native v2 peers write
@@ -437,20 +510,38 @@ void MdsServer::Handle(int fd) {
     // known epoch (via DFKV_MDS_ACCEPT_LEGACY), not removed. Data-plane
     // listeners stay strictly epoch-6/7; this shim exists only in the MDS.
     char prefix[kReqPrefix];
-    if (!net::ReadAll(fd, prefix, 1)) return;
+    // Epoch discriminator: read the leading byte first (v2 = 50-byte prefix,
+    // legacy = 42-byte one). While armed it runs under the same absolute
+    // first-frame deadline as every other read of the first frame.
+    const bool got_discriminator =
+        arm_deadline
+            ? net::ReadAllWithin(fd, prefix, 1, base_rcvtmo,
+                                 first_frame_deadline)
+            : net::ReadAll(fd, prefix, 1);
+    if (!got_discriminator) return;
     const uint8_t epoch = static_cast<uint8_t>(prefix[0]);
     bool legacy = false;
     ReqFields rq;
     // MDS frames carry a group name + one MemberInfo (<1 KiB); cap the
     // declared length so a forged prefix can't trigger a giant allocation.
     if (epoch == kNativeProtoTcp) {
-      if (!net::ReadAll(fd, prefix + 1, kReqPrefix - 1) ||
+      const bool got_prefix =
+          arm_deadline
+              ? net::ReadAllWithin(fd, prefix + 1, kReqPrefix - 1, base_rcvtmo,
+                                   first_frame_deadline)
+              : net::ReadAll(fd, prefix + 1, kReqPrefix - 1);
+      if (!got_prefix ||
           !DecodeReq(prefix, &rq, wire_limits::kMdsMaxReqPayload)) {
         return;
       }
     } else {
       if (!accept_legacy_ || epoch != kNativeProtoLegacyTcp) return;
-      if (!net::ReadAll(fd, prefix + 1, kLegacyReqPrefix - 1) ||
+      const bool got_prefix =
+          arm_deadline
+              ? net::ReadAllWithin(fd, prefix + 1, kLegacyReqPrefix - 1,
+                                   base_rcvtmo, first_frame_deadline)
+              : net::ReadAll(fd, prefix + 1, kLegacyReqPrefix - 1);
+      if (!got_prefix ||
           !DecodeLegacyReq(prefix, &rq, wire_limits::kMdsMaxReqPayload)) {
         return;
       }
@@ -458,7 +549,22 @@ void MdsServer::Handle(int fd) {
       metrics_.legacy_frames.fetch_add(1, std::memory_order_relaxed);
     }
     std::vector<char> payload(rq.payload_len);
-    if (rq.payload_len && !net::ReadAll(fd, payload.data(), rq.payload_len)) return;
+    if (rq.payload_len) {
+      const bool got_payload =
+          arm_deadline
+              ? net::ReadAllWithin(fd, payload.data(), rq.payload_len,
+                                   base_rcvtmo, first_frame_deadline)
+              : net::ReadAll(fd, payload.data(), rq.payload_len);
+      if (!got_payload) return;
+    }
+    if (arm_deadline) {
+      // First complete frame received: end the deadline regime. ReadAllWithin
+      // shrank SO_RCVTIMEO toward the deadline, so restore the base per-syscall
+      // budget for all steady-state reads.
+      arm_deadline = false;
+      ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &base_rcvtmo,
+                   sizeof(base_rcvtmo));
+    }
 
     std::string data;
     Status st = Status::kInvalid;
