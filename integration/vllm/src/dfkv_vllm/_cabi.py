@@ -92,6 +92,17 @@ def load_lib(lib_path: Optional[str] = None) -> ctypes.CDLL:
     ]
 
 
+    # Remove support remains capability-detected for deployments that omit the
+    # optional eviction RPC; partial-SG cleanup degrades to a no-op then.
+    if hasattr(lib, "dfkv_remove"):
+        lib.dfkv_remove.restype = c_int
+        lib.dfkv_remove.argtypes = [c_void_p, c_void_p, c_uint64]
+    if hasattr(lib, "dfkv_batch_remove"):
+        lib.dfkv_batch_remove.restype = c_int
+        lib.dfkv_batch_remove.argtypes = [
+            c_void_p, POINTER(c_void_p), POINTER(c_uint64),
+            c_int, POINTER(c_int)]
+
     lib.dfkv_transport_mode.restype = c_char_p
     lib.dfkv_transport_mode.argtypes = [c_void_p]
 
