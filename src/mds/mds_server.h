@@ -14,6 +14,7 @@
 #include "mds/etcd_client.h"
 #include "utils/http_client.h"
 #include "common/status.h"
+#include "common/config_dump.h"
 #include "mds/mds_metrics.h"
 #include "common/membership.h"
 
@@ -53,8 +54,13 @@ class LocalLeaseMap {
 // the MDS keeps no durable state. Liveness = the lease (TTL kTtlSeconds).
 class MdsServer {
  public:
+  // DFKV_MDS_ACCEPT_LEGACY (default off) widens the control-plane version
+  // gate by exactly one epoch: v1.x peers are served with the legacy
+  // 42/10-byte framing via wire_legacy.h. Off = historic strict behavior.
   explicit MdsServer(const std::string& etcd_addr, int etcd_timeout_ms = 2000)
-      : http_(etcd_addr, etcd_timeout_ms), etcd_(&http_) {}
+      : http_(etcd_addr, etcd_timeout_ms),
+        etcd_(&http_),
+        accept_legacy_(config_dump::EnvBool("DFKV_MDS_ACCEPT_LEGACY", false)) {}
   ~MdsServer();
 
   Status Start(int port);
@@ -106,6 +112,9 @@ class MdsServer {
 
   TcpHttpTransport http_;
   EtcdClient etcd_;
+  // Resolved once at ctor; widens Handle()'s control-plane version gate by
+  // the single legacy epoch (v1.x peers, wire_legacy.h framing).
+  const bool accept_legacy_;
   std::atomic<bool> running_{false};
   int listen_fd_ = -1;
   int port_ = 0;
