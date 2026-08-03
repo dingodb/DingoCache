@@ -501,13 +501,19 @@ RamTier::Admission RamTier::Admit(
   char* dst = large ? dedicated.get() : arena_ + offset;
   if (len != 0) std::memcpy(dst, data, len);
 
+  // The canceled check, the writing-set erase and the index install must be
+  // ONE s.mu section: Remove() sets canceled while holding s.mu, so reading
+  // the flag anywhere else lets the cancel land between the read and the
+  // install and resurrects an explicitly Removed key. Nested lock order here
+  // is s.mu -> completion->mu, matching Remove() and every CompletePut call
+  // site under s.mu -- no path ever takes s.mu while holding completion->mu.
   bool canceled = false;
   {
-    std::lock_guard<std::mutex> lk(completion->mu);
-    canceled = completion->canceled;
-  }
-  {
     std::lock_guard<std::mutex> lk(s.mu);
+    {
+      std::lock_guard<std::mutex> state_lk(completion->mu);
+      canceled = completion->canceled;
+    }
     s.writing.erase(fn);
     if (!canceled) {
       Entry e;
@@ -626,20 +632,41 @@ bool RamTier::PutDurable(const BlockKey& key, const void* data, size_t len) {
   char* dst = large ? dedicated.get() : arena_ + offset;
   if (len != 0) std::memcpy(dst, data, len);
 
+  // Same cancel/install atomicity as Admit(): a Remove() that flagged the
+  // shared completion while the copy ran must suppress the install -- before
+  // this the promotion installed unconditionally and revived a Removed key.
+  bool canceled = false;
   {
     std::lock_guard<std::mutex> lk(s.mu);
-    Entry e;
-    e.key = key;
-    e.offset = offset;
-    e.len = len;
-    e.cap = cap;
-    e.large = std::move(dedicated);
-    e.durable = true;
-    e.completion = completion;
-    CompletePut(completion, true);
-    s.index.emplace(fn, std::move(e));
+    {
+      std::lock_guard<std::mutex> state_lk(completion->mu);
+      canceled = completion->canceled;
+    }
     s.writing.erase(fn);
-    if (!large) s.alloc->Unpin(key);
+    if (!canceled) {
+      Entry e;
+      e.key = key;
+      e.offset = offset;
+      e.len = len;
+      e.cap = cap;
+      e.large = std::move(dedicated);
+      e.durable = true;
+      e.completion = completion;
+      CompletePut(completion, true);
+      s.index.emplace(fn, std::move(e));
+      if (!large) s.alloc->Unpin(key);
+    } else if (!large) {
+      s.alloc->Unpin(key);   // release the copy-window pin
+      s.alloc->Remove(key);  // free the slot
+    }
+  }
+  if (canceled) {
+    if (large)
+      ReleaseLargeBudget(cap);
+    else
+      ReleaseBudget(cap);
+    CompletePut(completion, false);  // release Remove's WaitPut
+    return false;
   }
   promotes_.fetch_add(1, std::memory_order_relaxed);
   return true;
@@ -762,11 +789,32 @@ bool RamTier::Remove(const BlockKey& key) {
   }
   if (completion) (void)WaitPut(completion);
   {
+    // Fallback tombstone: no install path may outlive Remove(). If the key
+    // nevertheless sits in the index untombstoned, mark it now (purging its
+    // queued flush, mirroring phase one) and run the normal drop path, so
+    // Remove never returns while the key is still visible.
     std::lock_guard<std::mutex> lk(s.mu);
     auto it = s.index.find(fn);
-    if (it != s.index.end() && it->second.remove_pending &&
-        !it->second.flushing && it->second.send_pins == 0)
-      DropLocked(s, fn);
+    if (it != s.index.end()) {
+      Entry& e = it->second;
+      if (!e.remove_pending) {
+        e.remove_pending = true;
+        for (auto q = s.flushq.begin(); q != s.flushq.end();) {
+          if (q->fn == fn)
+            q = s.flushq.erase(q);
+          else
+            ++q;
+        }
+        if (!e.flushing) {
+          if (e.flush_pin) {
+            if (e.in_arena()) s.alloc->Unpin(e.key);
+            e.flush_pin = false;
+          }
+          if (!e.durable) CompletePut(e.completion, false);
+        }
+      }
+      if (!e.flushing && e.send_pins == 0) DropLocked(s, fn);
+    }
   }
   return had;
 }

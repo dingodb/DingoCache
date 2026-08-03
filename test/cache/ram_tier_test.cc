@@ -331,6 +331,106 @@ TEST(RamTier, RemoveHidesActiveFlushAndDefersPinnedRelease) {
   EXPECT_EQ(rt.Count(), 0u);
 }
 
+// Regression: Remove() racing an in-flight PUT must not resurrect the key.
+// Admit used to read completion->canceled in one critical section and erase
+// writing + install the index entry in another; a Remove landing in between
+// flagged the canceled bit too late, the entry was installed untombstoned,
+// and the key kept answering GETs after Remove returned true (the disk copy
+// is deleted by the caller on remove, so the tier served a deleted value).
+// Here a pack of hammer threads keeps the single shard mutex saturated so
+// the writer blocks between that read and the install, opening the race
+// window; rounds where Remove observed the key must all end with the key
+// invisible.
+TEST(RamTier, RemoveRacingInFlightPutNeverResurrects) {
+  ::setenv("DFKV_RAM_TIER_EXTENT_BYTES", "1048576", 1);
+  ::setenv("DFKV_RAM_TIER_SHARDS", "1", 1);
+  FlushSink sink;  // gate open: installs flush (and complete) promptly
+  RamTier rt(Opts(64ull << 20), sink.fn());
+  ASSERT_TRUE(rt.ok());
+  const std::string v(1ull << 20, 'v');  // in-arena (== one extent), slow copy
+
+  std::atomic<bool> stop_hammer{false};
+  std::vector<std::thread> hammers;
+  for (int i = 0; i < 8; ++i) {
+    hammers.emplace_back([&, i] {
+      // Never admitted; pure lock pressure on the single shard mutex so the
+      // writer's read->install transition contends with Remove's phase one.
+      while (!stop_hammer.load(std::memory_order_relaxed))
+        (void)rt.Contains(K(0xFFF00000u + i));
+    });
+  }
+
+  int observed = 0;       // rounds where Remove found the key tracked
+  int resurrections = 0;  // observed rounds where the key survived Remove
+  for (uint64_t r = 0; r < 600; ++r) {
+    std::atomic<bool> started{false};
+    std::thread writer([&] {
+      started.store(true, std::memory_order_release);
+      rt.Put(K(r), v.data(), v.size());
+    });
+    while (!started.load(std::memory_order_acquire))
+      std::this_thread::yield();
+    // Sweep across the writer's copy window (~100+ us for 1 MiB under
+    // contention) so many rounds land mid-flight.
+    std::this_thread::sleep_for(std::chrono::microseconds(10 + (r % 28) * 5));
+    const bool removed = rt.Remove(K(r));
+    writer.join();
+    if (removed) {
+      ++observed;
+      if (rt.Contains(K(r))) ++resurrections;
+      RamTier::Hit h;
+      if (rt.GetPrep(K(r), 0, 0, &h)) ++resurrections;
+    }
+    rt.Remove(K(r));  // cleanup: writer may have missed the race window
+  }
+  stop_hammer.store(true, std::memory_order_relaxed);
+  for (auto& t : hammers) t.join();
+
+  EXPECT_GE(observed, 3);  // prove the race regime was actually entered
+  EXPECT_EQ(resurrections, 0);
+}
+
+// Regression: same cancel/install race through PutDurable (read-promotion),
+// which installed the entry without ever consulting completion->canceled. The
+// promotion's setup window spans a large posix_memalign + memcpy, so a Remove
+// started inside it deterministically flags the shared completion; before the
+// fix the entry was still installed (and completed) untombstoned.
+TEST(RamTier, RemoveRacingInFlightPutDurableNeverResurrects) {
+  ::setenv("DFKV_RAM_TIER_EXTENT_BYTES", "1048576", 1);
+  ::setenv("DFKV_RAM_TIER_SHARDS", "1", 1);
+  FlushSink sink;  // unused: promoted entries are born durable, never flushed
+  RamTier::Options o = Opts(96ull << 20);
+  o.large_reserve_bytes = 48ull << 20;  // fit the 8 MiB dedicated values
+  RamTier rt(o, sink.fn());
+  ASSERT_TRUE(rt.ok());
+  const std::string v(8ull << 20, 'p');  // dedicated: ms-wide install window
+
+  int observed = 0;
+  int resurrections = 0;
+  for (uint64_t r = 0; r < 40; ++r) {
+    std::atomic<bool> started{false};
+    std::thread writer([&] {
+      started.store(true, std::memory_order_release);
+      rt.PutDurable(K(r), v.data(), v.size());
+    });
+    while (!started.load(std::memory_order_acquire))
+      std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::microseconds(100 + (r % 9) * 100));
+    const bool removed = rt.Remove(K(r));
+    writer.join();
+    if (removed) {
+      ++observed;
+      if (rt.Contains(K(r))) ++resurrections;
+      RamTier::Hit h;
+      if (rt.GetPrep(K(r), 0, 0, &h)) ++resurrections;
+    }
+    rt.Remove(K(r));  // cleanup
+  }
+
+  EXPECT_GE(observed, 3);  // prove the race regime was actually entered
+  EXPECT_EQ(resurrections, 0);
+}
+
 TEST(RamTier, LargeValueReadRangeFlushAndRemoveIsByteExact) {
   ::setenv("DFKV_RAM_TIER_EXTENT_BYTES", "1048576", 1);
   std::mutex m;
