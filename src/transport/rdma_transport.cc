@@ -235,6 +235,19 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
     if (configured) list = configured;
   }
   const auto filter = ParseDeviceList(list);
+  // A configured rail name is announced to the peer inside the fixed-size v2
+  // bootstrap frame (EncodeDevFrame at Acquire). One that does not fit would
+  // silently lose the "DCP2" capability trailer: capability probes (short
+  // probe name) keep succeeding while every real connection is rejected as
+  // "missing v2 negotiation". Fail here, at startup, with the actual cause
+  // and limit. Auto-discovery needs no check: it announces an empty name.
+  for (const auto& device : filter) {
+    if (!rdma::DeviceNameFitsFrame(device)) {
+      const std::string error = rdma::OversizedDeviceNameError(device);
+      DFKV_LOG_ERROR(error);
+      throw std::runtime_error(error);
+    }
+  }
   auto_device_ = filter.empty();
   auto discovered = rdma::RdmaTopology::Discover(filter);
   if (discovered.empty()) {
