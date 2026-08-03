@@ -121,17 +121,44 @@ def _native_version(lib: ctypes.CDLL) -> str:
 
 
 def _mv_ptr(mv: memoryview) -> Tuple[int, Any]:
-    """Return ``(address, keepalive)`` for a memoryview buffer.
+    """Return ``(address, keepalive)`` for a PUT source buffer.
 
     Zero-copy for a writable, C-contiguous buffer (the common case — every
     MemoryObj byte_array is a slice of LMCache's pinned arena). A read-only
     buffer can't be aliased by ctypes, so we copy into a ctypes array (rare;
     correctness over zero-copy). The keepalive must outlive the C call.
+
+    Source buffers only: the copy fallback is safe here because the copy
+    *carries* the bytes towards dfkv. GET destinations must go through
+    :func:`_mv_dst_ptr` instead, where the same fallback would silently
+    drop the fetched payload.
     """
     try:
         arr = (ctypes.c_char * mv.nbytes).from_buffer(mv)
     except (TypeError, ValueError):
         arr = (ctypes.c_char * mv.nbytes).from_buffer_copy(mv)
+    return ctypes.addressof(arr), arr
+
+
+def _mv_dst_ptr(mv: memoryview) -> Tuple[int, Any]:
+    """Return ``(address, keepalive)`` for a GET destination buffer.
+
+    No copy fallback here, by design: the native call writes the fetched
+    bytes into the buffer we hand over, so a ``from_buffer_copy`` staging
+    array would leave the payload in a discarded temporary while
+    ``out_hit`` still reports a hit — the caller would then return stale
+    arena bytes as a hit. Destinations must be writable, C-contiguous
+    buffers (LMCache arena slices always are); anything else fails loudly
+    so the caller treats the op as a miss rather than a hit.
+    """
+    try:
+        arr = (ctypes.c_char * mv.nbytes).from_buffer(mv)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "dfkv GET destination must be a writable, C-contiguous buffer "
+            f"(readonly={mv.readonly}, c_contiguous={mv.c_contiguous}, "
+            f"nbytes={mv.nbytes})"
+        ) from exc
     return ctypes.addressof(arr), arr
 
 
@@ -290,7 +317,9 @@ class DfkvNativeClient:
         ptrs: List[int] = []
         keepalive: List[Any] = []
         for mv in bufs:
-            p, ka = _mv_ptr(mv)
+            # Destination buffers: never the copy fallback of _mv_ptr —
+            # fetched bytes must land in the caller's own buffer.
+            p, ka = _mv_dst_ptr(mv)
             ptrs.append(p)
             keepalive.append(ka)
         parr = (c_void_p * n)(*[c_void_p(p) for p in ptrs])

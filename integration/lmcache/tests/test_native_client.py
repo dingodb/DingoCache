@@ -189,3 +189,73 @@ def test_register_memory_surfaces_native_mr_failure():
         assert "dfkv_register_memory(base=0x1000, size=4096) rc=-1" == str(exc)
     else:
         raise AssertionError("MR registration failure was not surfaced")
+
+
+def test_batch_get_rejects_readonly_destination_before_native_call():
+    keys = [b"k"]
+    called = []
+
+    class FakeLib:
+        def dfkv_batch_get_auto(self, *args):
+            called.append(args)
+            return 0
+
+    client = object.__new__(DfkvNativeClient)
+    client._lib = FakeLib()
+    client._h = 0xBEEF
+    try:
+        client._batch_get_blocking(keys, [memoryview(b"abc")])
+    except ValueError as exc:
+        assert "writable, C-contiguous" in str(exc)
+    else:
+        raise AssertionError("read-only GET destination was not rejected")
+    # Fail before the native call: a hit can never be manufactured for a
+    # destination the payload cannot land in.
+    assert called == []
+
+
+def test_batch_get_rejects_strided_destination_before_native_call():
+    keys = [b"k"]
+    called = []
+
+    class FakeLib:
+        def dfkv_batch_get_auto(self, *args):
+            called.append(args)
+            return 0
+
+    client = object.__new__(DfkvNativeClient)
+    client._lib = FakeLib()
+    client._h = 0xBEEF
+    # Writable but not C-contiguous: the old copy fallback would alias it
+    # into a discarded temporary and still report out_hit=1.
+    strided = memoryview(bytearray(8))[::2]
+    assert not strided.c_contiguous and not strided.readonly
+    try:
+        client._batch_get_blocking(keys, [strided])
+    except ValueError as exc:
+        assert "writable, C-contiguous" in str(exc)
+    else:
+        raise AssertionError("strided GET destination was not rejected")
+    assert called == []
+
+
+def test_batch_set_still_ships_readonly_source_via_copy_fallback():
+    keys = [b"k"]
+    payload = b"ab\x00c"
+
+    class FakeLib:
+        def dfkv_batch_put(
+            self, _h, key_ptrs, key_lens, ptrs, sizes, n, out,
+        ):
+            assert n == 1
+            assert ctypes.string_at(key_ptrs[0], key_lens[0]) == keys[0]
+            # The copy fallback must carry the source bytes to dfkv.
+            assert ctypes.string_at(ptrs[0], sizes[0]) == payload
+            out[0] = 1
+            return 0
+
+    client = object.__new__(DfkvNativeClient)
+    client._lib = FakeLib()
+    client._h = 0xBEEF
+    assert client._batch_set_blocking(keys, [memoryview(payload)]) == (
+        True, [True])
