@@ -84,7 +84,9 @@ def _make_store(geometry: str, hashes: list[BlockHash]) -> set[bytes]:
     return store
 
 
-def _lookup_hit_tokens(store: set[bytes], hashes: list[BlockHash]) -> int:
+def _lookup_hit_tokens(
+    store: set[bytes], hashes: list[BlockHash], md: KeyMetadata | None = None
+) -> int:
     class _FakeClient:
         _sg_segs_cache = SG_MAX_SEGS
 
@@ -106,7 +108,10 @@ def _lookup_hit_tokens(store: set[bytes], hashes: list[BlockHash]) -> int:
     )
     self_ = SimpleNamespace(
         coord=coord,
-        token_dbs=[SimpleNamespace(metadata=_md(0), block_size=BLOCK)],
+        token_dbs=[
+            SimpleNamespace(metadata=md if md is not None else _md(0),
+                            block_size=BLOCK)
+        ],
         client=_FakeClient(store),
         tp_size=8,
         num_kv_head=1,
@@ -140,4 +145,51 @@ def test_pre_70_geometry_lookup_collapses():
     hit = _lookup_hit_tokens(store, hashes)
     assert 0 < hit < NCHUNK * BLOCK // 2, (
         f"documented-negative geometry should truncate badly, got {hit}"
+    )
+
+
+# Replicated MLA (plain-TP MLA -- put_step==tp_size, no DCP/PCP, e.g.
+# GLM-5.2 TP16 / V4-Flash TP8): the SAVE/dedup/LOAD paths encode the single
+# canonical tp_rank=-1 (worker.py metadata init), NOT a per-TP coordinate.
+# The pre-fix lookup probed tp_rank=0 unconditionally
+# (tp_count = min(tp_size, num_kv_head) = 1), so external L3 hit detection
+# was constantly 0 for exactly this topology.
+_MLA_METADATA = {**_METADATA, "dcp_size": 1, "tp_rank": -1}
+
+
+def _mla_md() -> KeyMetadata:
+    return KeyMetadata(**{**_MLA_METADATA, "dcp_rank": 0})
+
+
+def _legacy_tp0_md() -> KeyMetadata:
+    # The coordinate the pre-fix lookup probed for ANY metadata: tp_rank=0.
+    return KeyMetadata(**{**_METADATA, "dcp_size": 1, "dcp_rank": 0})
+
+
+def test_replicated_mla_lookup_full_prefix():
+    """Every chunk stored under the canonical tp_rank=-1 (group 0): lookup
+    with replicated-MLA metadata must probe that same coordinate and report
+    the complete prefix, i.e. plain-TP MLA has full external L3 coverage."""
+    hashes = _hashes()
+    md = _mla_md()
+    store = {_onewire_key(md, h) for h in hashes}
+    assert len(store) == NCHUNK
+    hit = _lookup_hit_tokens(store, hashes, md=md)
+    assert hit == NCHUNK * BLOCK, (
+        f"replicated-MLA lookup must hit the tp_rank=-1 store, "
+        f"got {hit}/{NCHUNK * BLOCK}"
+    )
+
+
+def test_replicated_mla_lookup_misses_legacy_tp0_coordinate():
+    """Negative control: keys under the OLD probe coordinate (tp_rank=0)
+    must NOT match a replicated-MLA lookup -- nothing in this geometry ever
+    saves there. Locks the regression: probing coordinates the SAVE side
+    never writes."""
+    hashes = _hashes()
+    store = {_onewire_key(_legacy_tp0_md(), h) for h in hashes}
+    assert len(store) == NCHUNK
+    hit = _lookup_hit_tokens(store, hashes, md=_mla_md())
+    assert hit == 0, (
+        f"lookup must not probe the legacy tp_rank=0 coordinate, got {hit}"
     )

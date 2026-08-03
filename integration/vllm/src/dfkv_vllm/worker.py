@@ -1597,13 +1597,22 @@ class DfkvStoreWorker:
             group_hashes = self.coord.block_hashes_for_spec(
                 block_hashes, self._kv_cache_groups[g_idx].kv_cache_spec
             )
+            # Replicated MLA stores every SAVE under the single canonical
+            # tp_rank=-1 coordinate (see metadata init): expanding to
+            # tp_rank=0..tp_count-1 would never match it. Probe the stored
+            # coordinate as-is when negative; else expand across the per-TP
+            # head coordinates used by GQA/DCP saves.
+            tp_candidates = (
+                [db.metadata.tp_rank] if db.metadata.tp_rank < 0 else range(tp_count)
+            )
+            expected_per_key = max(1, len(list(tp_candidates)) * self.pp_size)
             for chunk_id, h in enumerate(group_hashes):
                 start_idx = chunk_id * spec_block_size
                 if start_idx >= token_len:
                     break
                 if chunk_id >= len(mask) or not mask[chunk_id]:
                     continue
-                for tp in range(tp_count):
+                for tp in tp_candidates:
                     for pp in range(self.pp_size):
                         md = dataclasses.replace(db.metadata, tp_rank=tp, pp_rank=pp)
                         # Probe scatter group 0 so lookup agrees with the exact
@@ -1637,7 +1646,6 @@ class DfkvStoreWorker:
             return 0
 
         # A (group, hash) is "present" only when every TP*PP rank has it.
-        expected_per_key = max(1, tp_count * self.pp_size)
         present_count: dict[tuple[int, bytes], int] = {}
         for gh, exists in zip(candidate_meta, res, strict=True):
             if exists == 1:
