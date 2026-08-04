@@ -190,7 +190,7 @@ Environment=DFKV_TENANT_DEFAULT_QUOTA_BYTES=0
 # 此生产示例故意不设置 --store-engine/DFKV_STORE_ENGINE：resolved 默认即 slab。
 ExecStart=/usr/local/bin/dfkv_server \
   --dir /mnt/disk1/dfkv,/mnt/disk2/dfkv,/mnt/disk3/dfkv \
-  --port 28000 --rdma-port 28001 --max-msg 67108864 \
+  --port 28000 --rdma-port 28001 \
   --rdma-dev ib7s400p0,ib7s400p1,ib7s400p2,ib7s400p3,ib7s400p4,ib7s400p5,ib7s400p6,ib7s400p7 \
   --rdma-depth 4 --rdma-numa 1 \
   --ram-tier on --ram-tier-bytes 1099511627776 --ram-tier-shards 16 \
@@ -227,11 +227,12 @@ LimitMEMLOCK=infinity        # RDMA 需要锁页内存
 WantedBy=multi-user.target
 ```
 
-> **`--max-msg` 必须与 client 默认 `DFKV_RDMA_MAX_BLOCK_BYTES`（64 MiB = 67108864）匹配或更大**：
-> server `--max-msg` 是 RDMA receive-segment 单 slot 上限；client 在 DCP2 协商时声明自己的
+> **`--max-msg` 默认 64 MiB（`64ull << 20`），与 client 默认 `DFKV_RDMA_MAX_BLOCK_BYTES` 一致，
+> 无需显式设置。** 它是 RDMA receive-segment 单 slot 上限；client 在 DCP2 协商时声明自己的
 > `DFKV_RDMA_MAX_BLOCK_BYTES`（默认 64 MiB）。若 server `--max-msg` < client 声明值，server
 > 拒绝连接（日志 `client declared max block ... above this server's cap ...`），所有 PUT 失败
-> 但 exist 不受影响（不走 max_block 协商）。**生产 systemd unit 必须 `--max-msg 67108864`**。
+> 但 exist 不受影响（不走 max_block 协商）。**不要降低 `--max-msg` 除非同时降低所有 client 的
+> `DFKV_RDMA_MAX_BLOCK_BYTES`。**
 >
 > Completion timeout：`DFKV_RDMA_OP_TIMEOUT_MS`（默认 5000）约束单操作；
 > `DFKV_RDMA_BATCH_OP_TIMEOUT_MS`（unset/0 = 跟随前者）覆盖 **所有** multi-item
@@ -639,8 +640,7 @@ Rollback trigger and procedure:
 3. 冒烟（任一能访问内网的机器）：
    ```bash
    dfkv_smoke --members n57=192.168.1.57:28000 --size 2752512                          # TCP
-   DFKV_RDMA=1 DFKV_RDMA_MAX_BLOCK_BYTES=67108864 \
-     DFKV_RDMA_DEV=ib7s400p0 dfkv_smoke --members n57=192.168.1.57:28001 --size 2752512
+   DFKV_RDMA=1 DFKV_RDMA_DEV=ib7s400p0 dfkv_smoke --members n57=192.168.1.57:28001 --size 2752512
    ```
 4. 端到端零拷贝校验（插件 → libdfkv → RDMA → server，验证 payload 直落缓冲）：
    ```bash
