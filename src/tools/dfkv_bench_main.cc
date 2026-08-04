@@ -227,6 +227,21 @@ int main(int argc, char** argv) {
                    ready_timeout_s, mds.c_str(), group.c_str());
       return 2;
     }
+    // Settle: the single warmup key only reaches ONE ring member, leaving the
+    // other nodes' RDMA connections cold. The measured phase's first batch to
+    // those nodes fails on connection setup (observed as ~N/total fails where
+    // N = unprobed node count on a freshly-restarted ring). Issue probe keys
+    // with distinct hashes to cover every ring member, retrying individually
+    // until each succeeds — a batched settle still fails on cold connections;
+    // individual Puts block until the per-node QP is established.
+    constexpr size_t kSettleKeys = 32;  // covers rings up to ~32 nodes
+    for (size_t i = 0; i < kSettleKeys; ++i) {
+      std::string sk = "dfkv_bench/settle_" + std::to_string(i);
+      for (int attempt = 0; attempt < 20; ++attempt) {
+        if (c.Put(sk, probe.data(), probe.size())) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+    }
   }
   // External --threads already provide concurrency; with multi-node members the
   // client's per-call internal RunParallel(batch_concurrency) would nest under
