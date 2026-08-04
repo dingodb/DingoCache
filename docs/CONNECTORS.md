@@ -429,6 +429,13 @@ sglang serve /models/glm-5.2-nvfp4 --served-model-name glm-5.2 \
   bump source-controlled raw-layout ID，再同时发布所有 writer/reader，并接受一次
   冷缓存。namespace/key 不一致只会 cold miss；相同 namespace+key 下布局不一致
   是 type-safety violation。
+- **block hash 是 SGLang C++ native SHA256，无需 `PYTHONHASHSEED`。** SGLang
+  `radix_cache.hash_page()` → `get_native_hash()` → `hash_binding.cpp` 的 C++
+  SHA256 实现，`page_hash` 传入 dfkv 时已是确定性 hex string，不经过 Python
+  `hash()`。跨进程/跨实例 block hash 天然一致，`PYTHONHASHSEED=0` 无需设置（设了
+  无害但不参与身份契约）。这与 vLLM 连接器（§3.1）的硬门禁不同——HiCache 没有
+  `builtin` 选项，SGLang 的 page hash 始终是 SHA256。v1 时代部分部署沿用的
+  `PYTHONHASHSEED=0` 是 vLLM `builtin` 算法的历史遗留，HiCache 路径从未需要。
 - **客户端指标（pull）**：插件自动在 SGLang 自带 `/metrics` 上暴露
   `dfkv_client_*{tp_rank}`（set/get 量、命中、IO 错误、peer 熔断切换、延迟直方图）。
   后台轮询线程读 C 客户端快照，间隔 extra_config `client_stats_poll_s`（默认 10s，
