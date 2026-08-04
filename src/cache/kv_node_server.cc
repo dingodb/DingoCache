@@ -883,28 +883,20 @@ Status KvNodeServer::CacheDirectForKey(const BlockKey& key, char* data,
   }
   bool samp = lat_sampler_.ShouldSample();
   double t0 = samp ? NowSec() : 0.0;
-  // RAM admission is not success: wait for the leader's disk commit. Only
-  // kCacheFull means genuine arena backpressure and may take the direct disk
-  // fallback; an admitted failure and every duplicate return the shared result.
+  // PUT write-around: write directly to disk, skip the synchronous 1 MiB
+  // arena memcpy. The arena is filled lazily by read-promotion on GET miss
+  // (RangeDirectForKey), so hot keys still get zero-copy RDMA GET from the
+  // arena without paying a per-PUT copy on the write path. The old path
+  // (ram_->PutCommitted) copied every PUT into the arena and flushed
+  // asynchronously — the 1 MiB memcpy was 44% of serve-thread CPU and
+  // capped single-node PUT at 3.4 GB/s vs 4.4 GB/s direct-disk.
   Status st = Status::kCacheFull;
-  bool needs_disk = true;
-  if (ram_ && group_.TenantQuotaBytes(key.tenant_hash) == 0) {
-    st = ram_->PutCommitted(key, data, len);
-    needs_disk = st == Status::kCacheFull;
-    if (st == Status::kOk) {
-      cache_put_.fetch_add(1, std::memory_order_relaxed);
-      bytes_written_.fetch_add(len, std::memory_order_relaxed);
-    } else if (!needs_disk && st == Status::kIOError) {
-      put_io_err_.fetch_add(1, std::memory_order_relaxed);
-    }
-  }
-  if (needs_disk && put_busy_limit_ > 0 &&
+  const bool quota_ok = !ram_ || group_.TenantQuotaBytes(key.tenant_hash) == 0;
+  if (quota_ok && put_busy_limit_ > 0 &&
       disk_put_inflight_.load(std::memory_order_relaxed) >= put_busy_limit_) {
     st = Status::kCacheFull;
     put_busy_.fetch_add(1, std::memory_order_relaxed);
-    needs_disk = false;
-  }
-  if (needs_disk) {
+  } else if (quota_ok) {
     disk_put_inflight_.fetch_add(1, std::memory_order_relaxed);
     st = group_.CacheDirect(key, data, len, cap);
     disk_put_inflight_.fetch_sub(1, std::memory_order_relaxed);
@@ -970,6 +962,13 @@ Status KvNodeServer::RangeDirectForKey(
   if (st == Status::kOk) {
     cache_hit_.fetch_add(1, std::memory_order_relaxed);
     bytes_read_.fetch_add(*out_len, std::memory_order_relaxed);
+    // Read promotion: install the just-read value into the RAM arena so
+    // subsequent GETs hit the zero-copy RDMA path. Best-effort (a full arena
+    // silently skips); the data is already durable on disk so this costs zero
+    // flush bandwidth.  With the PUT write-around change above, this is the
+    // ONLY way the arena gets populated.
+    if (ram_ && *out_data && *out_len > 0)
+      ram_->PutDurable(key, *out_data, *out_len);
   } else if (st == Status::kNotFound) {
     cache_miss_.fetch_add(1, std::memory_order_relaxed);
   } else if (st == Status::kIOError) {
@@ -978,8 +977,6 @@ Status KvNodeServer::RangeDirectForKey(
   if (samp) get_lat_.Observe(NowSec() - t0);
   return st;
 }
-
-
 PreparedRead KvNodeServer::PrepareReadForKey(
     const BlockKey& key, uint64_t offset, uint64_t length, char* staging,
     size_t staging_cap) {
@@ -1065,8 +1062,7 @@ void KvNodeServer::FinishDiskRead(
     const bool had_waiters = server->read_coalescer_.CompleteAsync(
         flight, ok ? Status::kOk : Status::kIOError, data, bytes_read, &key,
         &whole, &recurrent);
-    if (ok && (had_waiters || recurrent) && whole && server->ram_ && data &&
-        bytes_read) {
+    if (ok && whole && server->ram_ && data && bytes_read) {
       server->ram_->PutDurable(key, data, bytes_read);
     }
   }
