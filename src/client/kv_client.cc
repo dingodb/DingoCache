@@ -231,6 +231,8 @@ void KVClient::AdoptRing(ConHash ring, std::map<std::string, std::string> addr) 
     DFKV_LOG_WARN("ring: adopted EMPTY membership (0 nodes) — puts/gets route to nowhere (ok=0)");
   else if (delta.empty())
     DFKV_LOG_INFO("ring: " + std::to_string(count) + " member(s) (unchanged)");
+  else
+    DFKV_LOG_INFO("ring: " + std::to_string(count) + " member(s) " + delta);
   if (count > 0) ring_cv_.notify_all();
 }
 
