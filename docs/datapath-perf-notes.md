@@ -69,12 +69,12 @@ Empirical (8x400G IB testbed, 3-node, 1 MiB PUT, single writer thread, batch 64)
   as an opt-in knob (`rdma_depth` extra_config / `DFKV_RDMA_DEPTH`) — it can help on
   a network-latency-bound link — but on a disk-bound path it is flat.
 - **Multi-connection fan-out is the real write lever**: splitting a batch across N
-  connections hits N parallel server serve threads. `batch_concurrency` **defaults
-  to 8** in the client, so the SGLang plugin's single-writer (MLA rank0) path
-  **already parallelizes writes 8-way** with no extra config. It saturates at ~8 on
-  this hardware, so there is no large untapped win here; the write ceiling is the
-  single-rank r0 path + server serial-per-connection writes, already mitigated by
-  the 8-way fan-out.
+  connections hits N parallel server serve threads. `batch_concurrency` auto mode
+  (the default, `0`) now floors at `min(max(groups, 8), 32)` — single-node rings
+  (groups=1) get 8-way parallelism automatically, while multi-node rings (groups
+  ≥ 8) keep their existing one-worker-per-group scaling. It saturates at ~8 on
+  this hardware; the write ceiling is the single-rank r0 path + server
+  serial-per-connection writes, mitigated by the fan-out.
 
 - **GET is depth-flat too** (2026-06-20, `dfkv_bench --threads 1 --bc 1 --size 512KiB
   --count 2000`, single RC connection, io_uring server on a local SSD, 3 interleaved
