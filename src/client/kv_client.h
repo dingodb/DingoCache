@@ -30,13 +30,20 @@
 
 namespace dfkv {
 
-// Batch fan-out worker sizing: explicit bc wins; 0 = one worker per node group
-// capped at 32 (a fixed small default serializes a wide ring's groups into
-// waves, multiplying the batch tail for single-threaded callers).
+// When batch_concurrency is unset (0 = auto), use at least 8 workers so a
+// single-node ring (groups=1) still gets 8-way parallel batch_put_sg /
+// batch_get_auto_sg. Multi-node rings (groups >= 8) are unaffected: they
+// already get one worker per group. The floor of 8 matches the typical
+// RDMA connection pool size (DFKV_TCP_POOL_MAX_CONNS), so the extra
+// workers do not exceed the pooled connection count.
 inline size_t AutoBatchWorkers(size_t bc, size_t groups) {
   constexpr size_t kMaxAutoBatchWorkers = 32;
+  constexpr size_t kMinAutoBatchWorkers = 8;
   if (bc) return bc;
-  return std::min(std::max<size_t>(groups, 1), kMaxAutoBatchWorkers);
+  // auto: one worker per group, but at least 8 (for single-node rings),
+  // capped at 32. Multi-node rings (groups >= 8) are unaffected.
+  return std::min(std::max<size_t>(groups, kMinAutoBatchWorkers),
+                  kMaxAutoBatchWorkers);
 }
 
 struct KvPutItem { std::string key; const void* value; size_t n; };
