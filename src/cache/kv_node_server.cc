@@ -1059,7 +1059,7 @@ void KvNodeServer::FinishDiskRead(
     BlockKey key;
     bool whole = false;
     bool recurrent = false;
-    const bool had_waiters = server->read_coalescer_.CompleteAsync(
+    (void)server->read_coalescer_.CompleteAsync(
         flight, ok ? Status::kOk : Status::kIOError, data, bytes_read, &key,
         &whole, &recurrent);
     if (ok && whole && server->ram_ && data && bytes_read) {
