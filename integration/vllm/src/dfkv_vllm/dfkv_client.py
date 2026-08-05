@@ -46,7 +46,7 @@ class DfkvDeviceClient:
         members: str = "",
         key_namespace: bytes = b"",
         lib_path: Optional[str] = None,
-        batch_concurrency: int = 8,
+        batch_concurrency: int = 0,
         mds_endpoints: str = "",
         mds_group: str = "default",
         mds_poll_ms: int = 3000,
