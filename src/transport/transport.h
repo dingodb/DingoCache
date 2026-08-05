@@ -280,6 +280,7 @@ class Transport {
       std::vector<size_t>* out_lens) {
     const size_t n = keys.size();
     if (out_lens) out_lens->assign(n, 0);
+    if (n == 0) return {};
     if (dsts.size() != n) return InvalidStatuses(n);
     std::vector<Status> result(n, Status::kInvalid);
     std::vector<std::vector<char>> scratch(n);
