@@ -231,8 +231,7 @@ void KVClient::AdoptRing(ConHash ring, std::map<std::string, std::string> addr) 
     DFKV_LOG_WARN("ring: adopted EMPTY membership (0 nodes) — puts/gets route to nowhere (ok=0)");
   else if (delta.empty())
     DFKV_LOG_INFO("ring: " + std::to_string(count) + " member(s) (unchanged)");
-  else
-    DFKV_LOG_INFO("ring: " + std::to_string(count) + " member(s) " + delta);
+  if (count > 0) ring_cv_.notify_all();
 }
 
 void KVClient::SetMembers(std::vector<std::pair<std::string, std::string>> members) {
@@ -264,6 +263,14 @@ void KVClient::StartMdsDiscovery(std::vector<std::string> mds_eps,
       std::move(mds_eps), group,
       [this](const std::vector<MemberInfo>& ms) { SetMembers(ms); }, poll_ms);
   poller_->Start();
+}
+
+bool KVClient::WaitForRing(int timeout_ms) {
+  std::unique_lock<std::mutex> lk(ring_mu_);
+  if (!addr_.empty()) return true;
+  ring_cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms),
+                    [this] { return !addr_.empty(); });
+  return !addr_.empty();
 }
 
 void KVClient::StopMdsDiscovery() {
