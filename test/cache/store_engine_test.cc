@@ -110,8 +110,9 @@ void ExpectSharedRangeContract(const std::string& backend,
         << " length=" << example.length;
     if (answer.status == Status::kOk) {
       EXPECT_EQ(answer.bytes.size(), std::strlen(example.bytes)) << backend;
-      if (answer.exact_bytes)
+      if (answer.exact_bytes) {
         EXPECT_EQ(answer.bytes, example.bytes) << backend;
+      }
       EXPECT_EQ(answer.value_len, 10u) << backend;
     }
   }
