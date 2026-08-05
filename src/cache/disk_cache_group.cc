@@ -32,8 +32,7 @@ bool ParseUnsigned(const char* text, uint64_t max, uint64_t* out) {
 bool ResolveDiskHashWeight(int* out) {
   const char* text = std::getenv("DFKV_DISK_HASH_WEIGHT");
   if (text == nullptr) {
-    *out = 1;
-    return true;
+    *out = 10;
   }
   uint64_t value = 0;
   if (!ParseUnsigned(text, 64, &value) || value == 0) return false;
