@@ -241,7 +241,7 @@ fabric selection and capacity explicit.
 |---|---|---|
 | `--rdma-dev` | leave unset for one local HCA; list the fabric explicitly for multi-rail | Unset selects the first `ACTIVE` local HCA (peer names may differ). A comma list opts into multi-rail, anchors only listed active devices, and requires compatible names/fabric on both hosts; inactive entries are rejected. |
 | `DFKV_DISK_HASH_WEIGHT` | `10` | Flattens the intra-server disk ring share from ±20 % to ±3 % so the hottest disk stops gating the whole node (+5–6 % cold read, ~2× lower p99). **Re-routes existing keys** (cache miss + refill) — flip together with a restart/upgrade window. |
-| `--rdma-depth` | `4` | Set explicitly; the server defaults to 1 and the handshake takes min(client/server). Deeper is not itself a throughput knob. It consumes more slots from the fixed shared receive segment. |
+| `--rdma-depth` | `1` | The server defaults to 1 and the handshake takes min(client/server). Depth is **not** a throughput knob (measured flat on PUT and GET across depth 1/2/4/8/16 on 8×B200 loopback); it only hides network latency. Raising it inflates per-connection receive-segment lease (depth × slot_size), which can exhaust the shared segment under high connection counts — depth=8 × 64 MiB slot = 512 MiB/conn, a 16 GiB segment holds only ~31 connections. Keep 1 unless the link is latency-bound and the segment has headroom. |
 | `--ram-tier` / `--ram-tier-bytes` / `--ram-tier-shards` | on / sized to the node / `16` for ≥100 GiB arenas | Large arenas contend on the shard locks under mixed load (+40 % mixed R/W at 16 shards on a 128 GiB arena); small (≤16 GiB) arenas are fine at the default 8. |
 | `--store-engine` | `slab` | Index rebuilds on restart; removes file-per-block hazards. |
 | `DFKV_TCP_FIRST_REQ_MS` / `DFKV_MDS_FIRST_REQ_MS` / `DFKV_METRICS_FIRST_REQ_MS` | `30000` (default) / `0` = off | First-request deadline per listener: a connection that sends nothing before the deadline is dropped, capping idle pre-auth connections. |
@@ -252,7 +252,7 @@ fabric selection and capacity explicit.
 | Knob | Recommended | Why |
 |---|---|---|
 | `DFKV_RDMA_DEV` | best: **rail affinity per rank** — inject the matching local/server HCA name per process; simpler on symmetric hosts: the full comma list + `DFKV_RDMA_NUMA=1` | Explicit values are sent to the peer, so verify those names exist on both hosts/containers. Leave unset to let each host select its own first ACTIVE HCA when names differ. |
-| `DFKV_RDMA_DEPTH` | `4` | Pairs with the server's posted depth (window = min of both, negotiated). |
+| `DFKV_RDMA_DEPTH` | `1` | Pairs with the server's posted depth (window = min of both, negotiated). Default 1; raising it inflates receive-segment lease and can exhaust the shared segment without improving throughput. |
 | `DFKV_FANOUT_THREADS` | unset (default 32) | Only wide single-process clients (benchmarks, many concurrent Batch* callers) need more. |
 
 **Read-side convoy collapse (v2.0, opt-in)** — for MLA + TP-N inference
@@ -275,7 +275,7 @@ the file is *sourced*, so new knobs must be explicitly **exported** by the
 start script or a systemd drop-in to reach the server process.
 
 **Benchmark reproduction** (`dfkv_bench`): `DFKV_RDMA=1` (explicit, or it
-silently measures TCP), 8-rail `DFKV_RDMA_DEV`, `DFKV_RDMA_DEPTH=4`,
+silently measures TCP), 8-rail `DFKV_RDMA_DEV`, `DFKV_RDMA_DEPTH=1`,
 `DFKV_FANOUT_THREADS=256`; cold-read sweet spot `--threads 16 --batch 8
 --size 4194304` per client node. Keep `--count` ≤ the seed's written key count,
 and let the drives settle ~10 min after bulk writes before cold-read A/Bs (FTL

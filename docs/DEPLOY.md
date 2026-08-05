@@ -144,7 +144,7 @@ test -e /etc/dfkv/tenant-quotas ||
 > | 项 | xb01 生产 (v1.37/1.40) | 本示例 (v2.0.0) | 变动 |
 > |---|---|---|---|
 > | `--rdma-dev` | 8 轨全列 | 8 轨全列 | 一致 |
-> | RDMA depth | `DFKV_RDMA_DEPTH=32` | `DFKV_RDMA_DEPTH=4` | depth-flat；超过共享 segment 槽位会被吃（segment 2 GiB / 4 MiB ≈ 127 个 data QP），不宜再叠高 |
+> | RDMA depth | `DFKV_RDMA_DEPTH=32` | `DFKV_RDMA_DEPTH=1` | depth-flat（实测 depth 1/2/4/8/16 对 PUT/GET 吞吐无差异）；depth>1 膨胀每连接 segment lease（depth×slot），高并发时易耗尽共享 segment |
 > | RDMA_NUMA | `1` | 保留 `DFKV_RDMA_NUMA=1` | 一致 |
 > | RAM tier | on + 1TiB | on + 1TiB（`--ram-tier-bytes 1099511627776`） | 一致 |
 > | SERVER_URING | 开，depth=32 | 默认关，经 drop-in 打开（须编 `-DDFKV_WITH_URING`） | v2 保留 |
@@ -162,10 +162,10 @@ After=network-online.target dfkv-mds.service
 Wants=network-online.target
 [Service]
 Type=simple
-# v2 shared segment 示例：RDMA depth=4 上限 4 MiB、segment=2 GiB
-# （对应 ~127 data QP；client 侧也对应 dfkv_rdma_depth=4/segment-size 同口径，CONNECTORS §1.2.1
-#  的公式按 peak live + pooled QP 复算）。
-Environment=DFKV_RDMA_DEPTH=4
+# v2 shared segment 示例：RDMA depth=1（默认，slot=64MiB@max-msg 64MiB）、segment=2 GiB
+# （depth=1 时 ~31 data QP；depth>1 膨胀 lease，高并发易耗尽，CONNECTORS §1.2.1
+# 的公式按 peak live + pooled QP 复算）。
+Environment=DFKV_RDMA_DEPTH=1
 Environment=DFKV_RDMA_RECV_SEGMENT_SIZE=2147483648
 # 8×400G 轨全轨白名单 + NUMA：B200 生产 host 一台带 8 个 HCA 轨；
 # server 两端白名单到**同名互通**一组轨；client 的 `DFKV_RDMA_NUMA=1` 后每 rank 优先本 NUMA 轨，
@@ -192,7 +192,7 @@ ExecStart=/usr/local/bin/dfkv_server \
   --dir /mnt/disk1/dfkv,/mnt/disk2/dfkv,/mnt/disk3/dfkv \
   --port 28000 --rdma-port 28001 \
   --rdma-dev ib7s400p0,ib7s400p1,ib7s400p2,ib7s400p3,ib7s400p4,ib7s400p5,ib7s400p6,ib7s400p7 \
-  --rdma-depth 4 --rdma-numa 1 \
+  --rdma-depth 1 --rdma-numa 1 \
   --ram-tier on --ram-tier-bytes 1099511627776 --ram-tier-shards 16 \
   --cap 6597069766656 --mds 10.0.0.1:9400,10.0.0.2:9400 \
   --metrics-port 28010 --group default --id n57 \
@@ -307,8 +307,8 @@ journalctl -u dfkv -n 10 --no-pager
 >
 > **v2 segment 预算**：`slot=align4K(4096 + max_raw_payload)`；
 > `segment >= Σ(live + client-pool-idle data/control QP × depth × slot)`。lease
-> 保留到 QP 销毁或 idle reclaim，不能只数在飞请求。4 MiB/depth=4/2 GiB
-> 约容纳 127 条 data QP（未扣 control lease）。上线先看
+> 保留到 QP 销毁或 idle reclaim，不能只数在飞请求。64 MiB/depth=1/2 GiB
+> 约容纳 31 条 data QP（未扣 control lease）；depth=4 时约 7 条，depth=8 时约 3 条。上线先看
 > `dfkv_rdma_recv_segment_free_bytes`、`dfkv_rdma_v2_ready` 和
 > `dfkv_rdma_v2_conns_opened_total`；free 接近 0 会使新连接被拒绝。
 
@@ -661,7 +661,7 @@ trial 汇总 median/p95/p99；延迟从 workload 前后的 server
 并在隔离压测窗口执行，避免其它流量混入 histogram delta。
 
 ```bash
-DFKV_RDMA=1 DFKV_RDMA_DEV=ib7s400p0 DFKV_RDMA_DEPTH=4 \
+DFKV_RDMA=1 DFKV_RDMA_DEV=ib7s400p0 DFKV_RDMA_DEPTH=1 \
 deploy/dfkv_load_regression.py \
   --baseline-mds 10.0.1.1:9400 --baseline-group glm \
   --baseline-metrics 10.0.1.11:28010,10.0.1.12:28010 \
