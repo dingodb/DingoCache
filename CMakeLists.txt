@@ -18,7 +18,7 @@ endif()
 add_compile_options(-Wall -Wextra)
 
 option(DFKV_BUILD_TESTS "Build dfkv tests" ON)
-option(DFKV_STATIC_LIBSTDCXX "Statically link libstdc++/libgcc for portable artifacts" OFF)
+option(DFKV_STATIC_LIBSTDCXX "Statically link libstdc++/libgcc for portable artifacts" ON)
 option(DFKV_WITH_RDMA "Build the RDMA transport (needs libibverbs)" OFF)
 # Additive, env-gated io_uring async-GET disk-read path in the RDMA server. When
 # ON, links liburing and compiles the DFKV_WITH_URING code; the path is still
