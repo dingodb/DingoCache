@@ -1188,7 +1188,7 @@ class DfkvStoreWorker:
             mds_poll_ms=int(extra.get("mds_poll_ms", 3000)),
             key_namespace=key_namespace,
             lib_path=extra.get("lib"),
-            batch_concurrency=int(extra.get("batch_concurrency", 8)),
+            batch_concurrency=int(extra.get("batch_concurrency", 0)),
             client_register=client_register,
             client_id=client_id,
             client_info=client_info,

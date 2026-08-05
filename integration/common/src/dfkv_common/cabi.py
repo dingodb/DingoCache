@@ -62,7 +62,7 @@ def make_client_options_v2(
     key_namespace: bytes,
     *,
     members: str = "",
-    batch_concurrency: int = 8,
+    batch_concurrency: int = 0,
     mds_endpoints: str = "",
     mds_group: str = "default",
     mds_poll_ms: int = 3000,
