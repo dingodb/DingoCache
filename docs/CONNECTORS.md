@@ -115,9 +115,9 @@ B_required >= N_data × depth × S_data + N_control × depth × S_control
 
 `N_data` / `N_control` 是该 server 上所有 rank、进程的**峰值 live + client
 pool 中空闲连接**；lease 一直保留到 QP 被销毁或 `DFKV_RDMA_IDLE_MS` 回收，
-线程峰值留下的 pooled QP 也要计入。4 MiB 声明、depth=4 时
-`S_data=4,198,400 B`，2 GiB segment 最多约 127 条 data QP（未扣 control
-lease）；depth=8 时约 63 条。上线同时观察
+线程峰值留下的 pooled QP 也要计入。64 MiB 声明、depth=1 时
+`S_data=67,112,960 B`，2 GiB segment 最多约 31 条 data QP（未扣 control
+lease）；depth=4 时约 7 条，depth=8 时约 3 条。上线同时观察
 `dfkv_rdma_recv_segment_free_bytes` 与 `dfkv_rdma_v2_ready`；free 接近 0
 即扩容或缩小声明/depth/pool，避免新连接被拒绝。
 
