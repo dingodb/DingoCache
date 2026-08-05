@@ -150,6 +150,12 @@ class KVClient {
   // the ring on each epoch change. Replaces static membership.
   void StartMdsDiscovery(std::vector<std::string> mds_eps, const std::string& group,
                          int poll_ms = 3000);
+  // Block until MDS discovery populates a non-empty ring, or timeout. Returns
+ // true if the ring is non-empty when the call returns. Use after
+ // StartMdsDiscovery to avoid silent PUT/GET failures during the async
+ // discovery race at startup (ring empty → Route() returns "" → all ops
+ // silently fail). Env DFKV_OPEN_RING_WAIT_MS overrides the timeout (default 30s).
+  bool WaitForRing(int timeout_ms = 30000);
   void StopMdsDiscovery();
   // Register THIS client (a cache consumer / inference instance) with the MDS so
   // `dfkvctl clients` can surface "who is using dfkv". `self` carries identity
@@ -221,6 +227,7 @@ class KVClient {
   mutable std::mutex ring_mu_;  // guards ring_ + addr_
   ConHash ring_;
   std::map<std::string, std::string> addr_;  // name -> ip:port
+  std::condition_variable ring_cv_;  // notified when AdoptRing sets a non-empty ring
   std::string key_namespace_;
   uint64_t namespace_hash_ = 0;
   std::unique_ptr<Transport> owned_;

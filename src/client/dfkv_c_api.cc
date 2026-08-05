@@ -1,6 +1,6 @@
 #include "client/dfkv_c_api.h"
 
-#include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <string>
@@ -154,6 +154,22 @@ dfkv_client_t dfkv_open_v2(const dfkv_client_options_v2* options) {
       client->StartMdsDiscovery(
           endpoints, group,
           options->mds_poll_ms > 0 ? options->mds_poll_ms : 3000);
+      // Synchronously wait for a non-empty ring before returning. Without this,
+      // async MDS discovery races the first PUT/GET: if the ring is still empty
+      // (first poll not yet complete), every op silently fails (Route() returns ""
+      // → ok=0). The write is lost and never retried — L3 cache appears dead.
+      // Env DFKV_OPEN_RING_WAIT_MS overrides the timeout (default 30s, 0=skip).
+      uint64_t ring_wait_ms = 30000;
+      if (const char* e = std::getenv("DFKV_OPEN_RING_WAIT_MS")) {
+        char* end = nullptr;
+        const unsigned long long v = std::strtoull(e, &end, 10);
+        if (end != e) ring_wait_ms = static_cast<uint64_t>(v);
+      }
+      if (ring_wait_ms > 0 && !client->WaitForRing(static_cast<int>(ring_wait_ms))) {
+        DFKV_LOG_WARN("dfkv_open_v2: ring still empty after "
+                      + std::to_string(ring_wait_ms)
+                      + "ms; ops will silently fail until MDS populates the ring");
+      }
       if (register_with_mds) {
         dfkv::MemberInfo self{options->client_id, "0.0.0.0", 0, 0};
         self.info = options->client_info ? std::string(options->client_info)
