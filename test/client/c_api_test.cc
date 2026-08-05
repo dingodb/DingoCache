@@ -378,8 +378,11 @@ TEST(CApiStats, SnapshotSizingAndContent) {
   dfkv_close(c);
 }
 
-TEST(AutoBatchWorkers, ExplicitWinsAutoScalesCapped) {
-  EXPECT_EQ(dfkv::AutoBatchWorkers(8, 47), 8u);
-  EXPECT_EQ(dfkv::AutoBatchWorkers(0, 47), 32u);
-  EXPECT_EQ(dfkv::AutoBatchWorkers(0, 0), 1u);
+TEST(AutoBatchWorkers, ExplicitWinsAutoScalesFlooredCapped) {
+  EXPECT_EQ(dfkv::AutoBatchWorkers(8, 47), 8u);   // explicit wins
+  EXPECT_EQ(dfkv::AutoBatchWorkers(0, 47), 32u);  // auto capped at 32
+  EXPECT_EQ(dfkv::AutoBatchWorkers(0, 1), 8u);    // auto floored at 8 (single node)
+  EXPECT_EQ(dfkv::AutoBatchWorkers(0, 7), 8u);    // auto floored at 8 (7-node ring)
+  EXPECT_EQ(dfkv::AutoBatchWorkers(0, 22), 22u);  // auto keeps groups (22-node ring)
+  EXPECT_EQ(dfkv::AutoBatchWorkers(0, 0), 8u);    // auto floor at 8 (no groups)
 }

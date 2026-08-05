@@ -74,7 +74,7 @@ LMCache connector access logs, so one setting covers every integration. Format:
 |---|---|---|
 | `members` | (required) | dfkv member string. **The port MUST be the server's `--rdma-port`** (the RDMA bootstrap listener), not the main `--port`, when RDMA is enabled. |
 | `lib` | env `DFKV_LIB` / `$DFKV_BUILD/libdfkv.so` | path to `libdfkv.so`. |
-| `batch_concurrency` | `8` | client fan-out across nodes for batch ops; the real throughput lever (depth is flat). Raise toward the cluster's node count for wider pools. |
+| `batch_concurrency` | `0`=auto | client fan-out for batch ops; the real throughput lever (depth is flat). Auto = `min(max(nodes, 8), 32)`: 8-way parallel on single-node, one-per-node on multi-node. Set >0 to pin a fixed value. |
 | `load_async` | `True` | async KV load: the scheduler returns `WAITING_FOR_REMOTE_KVS` and the load runs off the critical path. Keep `True`. |
 | `transfer_queue_capacity` | `256` | Maximum queued requests **per direction and worker** (`1..65536`). Submission is non-blocking: a full queue rejects new saves as completed (releasing finish/free fences) and rejects new loads as load errors (forcing recompute), so overload cannot grow memory or pin blocks indefinitely. Invalid or out-of-range values abort connector construction. |
 | `enable_cross_layers_blocks` | `False` | opt-in for engines whose paged layout interleaves layers within a block. Leave `False` unless you know the layout needs it. |

@@ -123,11 +123,10 @@ class KVClient {
                                    std::vector<size_t>* out_lens);
 
   // Batch fan-out worker count. 0 (the default) = auto: one worker per node
-  // group, capped at kMaxAutoBatchWorkers -- with the old fixed default of 8, a
-  // 64-key batch over a 47..61-node ring ran its groups in 6-8 serial WAVES,
-  // multiplying the batch tail by the wave count for single-threaded callers
-  // (the production connector shape). Explicit n keeps the old fixed behavior
-  // (dfkv_bench passes --bc 1 so its external threads stay the only load).
+  // group, floored at kMinAutoBatchWorkers (8) so single-node rings get
+  // 8-way parallelism, capped at kMaxAutoBatchWorkers (32). Explicit n
+  // keeps the old fixed behavior (dfkv_bench passes --bc 1 so its external
+  // threads stay the only load).
   void set_batch_concurrency(size_t n) {
     batch_concurrency_.store(n, std::memory_order_relaxed);
   }
