@@ -455,7 +455,7 @@ class DfkvHiCache(HiCacheStorage):
             options = make_client_options_v2(
                 self._key_namespace,
                 members=members,
-                batch_concurrency=int(cfg.get("batch_concurrency", 0)),
+                batch_concurrency=int(cfg.get("batch_concurrency", 8)),
                 mds_endpoints=mds,
                 mds_group=group,
                 mds_poll_ms=poll_ms,
