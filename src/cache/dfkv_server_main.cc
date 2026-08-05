@@ -73,6 +73,9 @@ int main(int argc, char** argv) {
       "  --slab-table-sync-ms <n>  slab table sync cadence ms (env DFKV_SLAB_TABLE_SYNC_MS)\n"
       "  --slab-reclaim-ms <n>  slab background free-slot reclaimer cadence ms, 0 = off (env DFKV_SLAB_RECLAIM_MS)\n"
       "  --ram-reclaim-ms <n>   RAM tier background reclaimer cadence ms, 0 = off (env DFKV_RAM_RECLAIM_MS)\n"
+      "  --rdma-recv-segment-size <n>  RDMA v2 shared receive segment bytes (default 2 GiB; env DFKV_RDMA_RECV_SEGMENT_SIZE)\n"
+      "  --disk-hash-weight <n>  per-disk vnode multiplier (default 10; env DFKV_DISK_HASH_WEIGHT)\n"
+      "  --read-coalesce <0|1>  read-side convoy merge + RAM promotion (default off; env DFKV_READ_COALESCE)\n"
       "  --log <level>        log level: INFO|DEBUG|WARN|ERROR (env DFKV_LOG)\n"
       "  --version, -V        print version and exit\n"
       "  --help, -h           print this help and exit\n"
@@ -95,7 +98,8 @@ int main(int argc, char** argv) {
                    "--server-uring-depth", "--ram-flush-threads",
                    "--ram-tier-numa", "--ram-tier-shards", "--slab-table-sync-ms",
                    "--slab-reclaim-ms", "--ram-reclaim-ms", "--log",
-                   "--mds-registration-timeout-ms", "--max-msg"});
+                   "--mds-registration-timeout-ms", "--max-msg",
+                   "--rdma-recv-segment-size", "--disk-hash-weight", "--read-coalesce"});
   std::string dir = args.Get("--dir", "/tmp/dfkv_node");
   std::string rdma_dev = args.Get("--rdma-dev", "");
   std::string mds = args.Get("--mds", "");
@@ -177,6 +181,18 @@ int main(int argc, char** argv) {
   std::string ram_tier_shards = args.Get("--ram-tier-shards", "");
   if (!ram_tier_shards.empty())
     ::setenv("DFKV_RAM_TIER_SHARDS", ram_tier_shards.c_str(), 1);
+  // RDMA v2 receive segment size (shared receive buffer pool; default 2 GiB).
+  std::string recv_seg = args.Get("--rdma-recv-segment-size", "");
+  if (!recv_seg.empty())
+    ::setenv("DFKV_RDMA_RECV_SEGMENT_SIZE", recv_seg.c_str(), 1);
+  // Disk hash weight — per-disk vnode multiplier (default 10; was 1).
+  std::string disk_hash_weight = args.Get("--disk-hash-weight", "");
+  if (!disk_hash_weight.empty())
+    ::setenv("DFKV_DISK_HASH_WEIGHT", disk_hash_weight.c_str(), 1);
+  // Read coalesce — convoy merge + RAM promotion (opt-in; default off).
+  std::string read_coalesce = args.Get("--read-coalesce", "");
+  if (!read_coalesce.empty())
+    ::setenv("DFKV_READ_COALESCE", read_coalesce.c_str(), 1);
   // Slab table sync cadence (ms).
   std::string slab_table_sync_ms = args.Get("--slab-table-sync-ms", "");
   if (!slab_table_sync_ms.empty())
