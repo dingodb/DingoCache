@@ -959,6 +959,18 @@ int RcEndpoint::WaitComp(ibv_wc* out, int max, int timeout_ms) {
     }
     return got;
   };
+  if (busy_poll_) {
+    using Clock = std::chrono::steady_clock;
+    auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms < 0 ? 0 : timeout_ms);
+    for (;;) {
+      int got = ibv_poll_cq(cq_, max, out);
+      if (got != 0) return observe(got);
+      pollfd pfd = {wake_rfd_, POLLIN, 0};
+      if (::poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) return -1;
+      if (timeout_ms == 0) return observe(0);
+      if (timeout_ms > 0 && Clock::now() >= deadline) return observe(0);
+    }
+  }
   for (;;) {
     int got = ibv_poll_cq(cq_, max, out);
     if (got != 0) return observe(got);

@@ -44,6 +44,9 @@ class RdmaServer {
   // containing exactly the raw stored value bytes.
   using CacheDirectHandler = std::function<Status(
       const BlockKey& key, char* data, size_t len, size_t cap)>;
+  // Batched direct PUT: multiple keys in one call for io_uring flush.
+  using CacheDirectBatchHandler = std::function<std::vector<Status>(
+      const std::vector<StoreEngine::CacheBatchItem>& items)>;
 
   // One read-preparation entry point for disk, coalescer, and RAM sources. The
   // returned move-only transaction is the sole cleanup authority across
@@ -59,6 +62,9 @@ class RdmaServer {
   void set_range_handler(RangeHandler h) { range_handler_ = std::move(h); }
   void set_cache_direct_handler(CacheDirectHandler h) {
     cache_direct_handler_ = std::move(h);
+  }
+  void set_cache_direct_batch_handler(CacheDirectBatchHandler h) {
+    cache_direct_batch_handler_ = std::move(h);
   }
   void set_prepare_read_handler(PrepareReadHandler h) {
     prepare_read_handler_ = std::move(h);
@@ -126,6 +132,7 @@ class RdmaServer {
   Handler handler_;
   RangeHandler range_handler_;
   CacheDirectHandler cache_direct_handler_;
+  CacheDirectBatchHandler cache_direct_batch_handler_;
   PrepareReadHandler prepare_read_handler_;
   std::vector<std::pair<void*, size_t>> user_regions_;  // RAM arena pool MRs (RegisterMemory)
   size_t max_msg_;

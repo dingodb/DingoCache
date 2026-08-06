@@ -1,3 +1,4 @@
+#include "cache/store_engine.h"
 /* KvNodeServer — a cache-node daemon for the harness: wraps a DiskCacheGroup
  * (one or more NVMe SSDs) and serves Cache/Range/Exist over the TCP wire
  * protocol. The real cache node is dingo-cache (brpc + DiskCache); this proves
@@ -113,6 +114,8 @@ class KvNodeServer {
   // value bytes. Writes without a payload-sized CPU copy.
   Status CacheDirectForKey(const BlockKey& key, char* data, size_t len,
                            size_t cap);
+  std::vector<Status> CacheDirectBatchForKeys(
+      const std::vector<StoreEngine::CacheBatchItem>& items);
 
   // RDMA direct GET: read an O_DIRECT-aligned superset into `io_buf`; *out_data
   // points inside that same buffer at the exact requested range so the RDMA layer

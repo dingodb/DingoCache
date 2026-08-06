@@ -875,6 +875,11 @@ Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
 }
 
 
+std::vector<Status> KvNodeServer::CacheDirectBatchForKeys(
+    const std::vector<StoreEngine::CacheBatchItem>& items) {
+  return group_.CacheDirectBatch(items);
+}
+
 Status KvNodeServer::CacheDirectForKey(const BlockKey& key, char* data,
                                        size_t len, size_t cap) {
   if (len == 0 || data == nullptr) {

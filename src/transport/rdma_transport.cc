@@ -479,6 +479,7 @@ RdmaTransport::Conn* RdmaTransport::Acquire(
     Destroy(conn, rdma::RailCompletion::kRailFailure);
     return nullptr;
   }
+  { const char* bp = std::getenv("DFKV_RDMA_BUSY_POLL"); if (bp && *bp && *bp != '0') conn->ep.set_busy_poll(true); }
 
   const uint64_t conn_declared =
       lane == Lane::kControl
