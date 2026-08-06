@@ -142,7 +142,7 @@ bool ReapPosted(rdma::RcEndpoint& ep, size_t posted, size_t slot_count,
     if (had_completions) *had_completions = true;
     for (int i = 0; i < got; ++i) {
       if (wcs[i].status != IBV_WC_SUCCESS) {
-        if (worst_status) *worst_status = wcs[i].status;
+        DFKV_LOG_INFO("rdma: WC fail status=" + std::to_string(wcs[i].status) + " opcode=" + std::to_string(wcs[i].opcode) + " wr_id=" + std::to_string(wcs[i].wr_id));
         return false;
       }
       if (wcs[i].opcode == IBV_WC_RECV) {
@@ -907,13 +907,10 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
         return Status::kIOError;
       }
       conn->Encode(ep.sbuf(0), op, key, offset, length, payload_len);
-      ok = ep.PostWriteScatter(
+      ok = ep.PostRecv(0) &&
+           ep.PostWriteImmScatter(
                0, kReqPrefix, payload, static_cast<size_t>(payload_len),
-               payload_mr, conn->put_addr(0), conn->recv_segment.rkey);
-      if (ok) {
-        std::memcpy(ep.nbuf(0), ep.sbuf(0), kReqPrefix);
-        ok = ep.PostRecv(0) && ep.PostSendNotify(0, kReqPrefix);
-      }
+               payload_mr, conn->put_addr(0), conn->recv_segment.rkey, 0);
       if (ok)
         v2_put_writes_.fetch_add(1, std::memory_order_relaxed);
     } else if (op == WireOp::kRange) {
@@ -1117,15 +1114,11 @@ std::vector<Status> RdmaTransport::CacheMany(
         }
         conn->Encode(ep.sbuf(slot), WireOp::kCache, item.key, 0, 0,
                      item.len);
-        if (!ep.PostWriteScatter(
+        if (!ep.PostRecv(slot) ||
+            !ep.PostWriteImmScatter(
                 slot, kReqPrefix, item.data, item.len, mr,
-                conn->put_addr(slot), conn->recv_segment.rkey) ||
-            !ep.PostRecv(slot)) {
-          conn_ok = false;
-          break;
-        }
-        std::memcpy(ep.nbuf(slot), ep.sbuf(slot), kReqPrefix);
-        if (!ep.PostSendNotify(slot, kReqPrefix)) {
+                conn->put_addr(slot), conn->recv_segment.rkey,
+                static_cast<uint32_t>(slot))) {
           conn_ok = false;
           break;
         }
@@ -1153,6 +1146,10 @@ std::vector<Status> RdmaTransport::CacheMany(
         uint64_t data_len = 0;
         if (reply_bytes[slot] < kRespPrefix ||
             !conn->Decode(ep.rbuf(slot), &status, &data_len, 0)) {
+          if (reply_bytes[slot] < kRespPrefix)
+            DFKV_LOG_INFO("rdma: slot " + std::to_string(slot) + " reply_bytes=" + std::to_string(reply_bytes[slot]) + " < kRespPrefix=" + std::to_string(kRespPrefix));
+          else
+            DFKV_LOG_INFO("rdma: slot " + std::to_string(slot) + " Decode failed, reply_bytes=" + std::to_string(reply_bytes[slot]) + " status=" + std::to_string(static_cast<int>(status)));
           conn_ok = false;
           completion = rdma::RailCompletion::kEndpointFailure;
           break;
