@@ -907,12 +907,10 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
         return Status::kIOError;
       }
       conn->Encode(ep.sbuf(0), op, key, offset, length, payload_len);
-      std::memcpy(ep.nbuf(0), ep.sbuf(0), kReqPrefix);
-      ok = ep.PostWriteScatter(
+      ok = ep.PostRecv(0) &&
+           ep.PostWriteImmScatter(
                0, kReqPrefix, payload, static_cast<size_t>(payload_len),
-               payload_mr, conn->put_addr(0), conn->recv_segment.rkey);
-      if (ok)
-        ok = ep.PostRecv(0) && ep.PostSendNotify(0, kReqPrefix);
+               payload_mr, conn->put_addr(0), conn->recv_segment.rkey, 0);
       if (ok)
         v2_put_writes_.fetch_add(1, std::memory_order_relaxed);
     } else if (op == WireOp::kRange) {

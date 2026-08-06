@@ -209,7 +209,6 @@ class RdmaTransport : public Transport {
   std::atomic<uint64_t> numa_caller_unknown_fallbacks_{0};
   std::atomic<uint64_t> numa_no_local_fallbacks_{0};
   // #1: async CQ reaper for high-concurrency batch operations
-  bool reaper_enabled_ = false;
 };
 
 }  // namespace dfkv
