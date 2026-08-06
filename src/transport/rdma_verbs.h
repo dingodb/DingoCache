@@ -25,6 +25,8 @@
 
 #include "transport/dev_frame.h"
 #include <utility>
+#include <atomic>
+#include <thread>
 #include <vector>
 
 namespace dfkv {
@@ -266,6 +268,11 @@ class RcEndpoint {
   void set_busy_poll(bool v) { busy_poll_ = v; }
   void set_num_qp(size_t n) { num_qp_ = n > 0 ? n : 1; }
   size_t num_qp() const { return num_qp_; }
+  // #1: Start a background CQ reaper that polls ibv_poll_cq in a tight
+  // loop and fills per-slot atomic flags. Eliminates CQ channel
+  // syscall and CQ contention at high thread counts.
+  void StartReaper(std::vector<std::atomic<uint32_t>*>* slots);
+  void StopReaper();
 
  private:
   void Close();
@@ -283,6 +290,11 @@ class RcEndpoint {
   unsigned cq_armed_unacked_ = 0;
   bool busy_poll_ = false;
   size_t num_qp_ = 1;
+  // #1: async CQ reaper support. Per-slot atomic completion flags
+  // filled by a background reaper thread, checked by ReapPosted.
+  std::vector<std::atomic<uint32_t>*> reap_slots_;
+  std::atomic<bool> reap_stop_{false};
+  std::thread* reap_thread_ = nullptr;
 
   size_t cap_ = 0, depth_ = 0, dbuf_cap_ = 0;
   uint16_t remote_depth_ = 0;  // Set from the required v2 QP advertisement.

@@ -15,6 +15,7 @@
 #include <mutex>
 #include <random>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 
@@ -337,7 +338,7 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
   // of either HCA's max_sge because every WRITE itself has one SGE.
   static_assert(kV2MaxGetTargets == kMaxSge - 1);
   const size_t wr_per_slot =
-      v2_responder ? (kV2MaxGetTargets + 1) : 1;
+      v2_responder ? (kV2MaxGetTargets + 1) : 2;
   if (depth_ > (std::numeric_limits<uint32_t>::max() - 1) / wr_per_slot) {
     DFKV_LOG_ERROR("rdma: requested send queue depth overflows uint32");
     Close();
@@ -1001,6 +1002,40 @@ int RcEndpoint::WaitComp(ibv_wc* out, int max, int timeout_ms) {
 
 void RcEndpoint::Wake() {
   if (wake_wfd_ >= 0) { char b = 1; ssize_t n = ::write(wake_wfd_, &b, 1); (void)n; }
+}
+
+
+void RcEndpoint::StartReaper(std::vector<std::atomic<uint32_t>*>* slots) {
+  reap_slots_ = *slots;
+  reap_stop_.store(false, std::memory_order_relaxed);
+  reap_thread_ = new std::thread([this] {
+    std::vector<ibv_wc> wcs(64);
+    while (!reap_stop_.load(std::memory_order_relaxed)) {
+      int got = ibv_poll_cq(cq_, static_cast<int>(wcs.size()), wcs.data());
+      if (got > 0) {
+        for (int i = 0; i < got; ++i) {
+          size_t slot = static_cast<size_t>(wcs[i].wr_id);
+          if (slot < reap_slots_.size() && reap_slots_[slot]) {
+            // Store byte_len for RECV, mark done for SEND
+            uint32_t val = (wcs[i].opcode == IBV_WC_RECV) ? wcs[i].byte_len : 0xFFFFFFFF;
+            reap_slots_[slot]->store(val, std::memory_order_release);
+          }
+        }
+      } else if (got == 0) {
+        // No completion: brief yield to avoid 100% CPU
+        std::this_thread::yield();
+      }
+    }
+  });
+}
+
+void RcEndpoint::StopReaper() {
+  if (!reap_thread_) return;
+  reap_stop_.store(true, std::memory_order_relaxed);
+  reap_thread_->join();
+  delete reap_thread_;
+  reap_thread_ = nullptr;
+  reap_slots_.clear();
 }
 
 }  // namespace rdma

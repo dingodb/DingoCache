@@ -142,7 +142,7 @@ bool ReapPosted(rdma::RcEndpoint& ep, size_t posted, size_t slot_count,
     if (had_completions) *had_completions = true;
     for (int i = 0; i < got; ++i) {
       if (wcs[i].status != IBV_WC_SUCCESS) {
-        DFKV_LOG_INFO("rdma: WC fail status=" + std::to_string(wcs[i].status) + " opcode=" + std::to_string(wcs[i].opcode) + " wr_id=" + std::to_string(wcs[i].wr_id));
+        if (worst_status) *worst_status = wcs[i].status;
         return false;
       }
       if (wcs[i].opcode == IBV_WC_RECV) {
@@ -1146,10 +1146,6 @@ std::vector<Status> RdmaTransport::CacheMany(
         uint64_t data_len = 0;
         if (reply_bytes[slot] < kRespPrefix ||
             !conn->Decode(ep.rbuf(slot), &status, &data_len, 0)) {
-          if (reply_bytes[slot] < kRespPrefix)
-            DFKV_LOG_INFO("rdma: slot " + std::to_string(slot) + " reply_bytes=" + std::to_string(reply_bytes[slot]) + " < kRespPrefix=" + std::to_string(kRespPrefix));
-          else
-            DFKV_LOG_INFO("rdma: slot " + std::to_string(slot) + " Decode failed, reply_bytes=" + std::to_string(reply_bytes[slot]) + " status=" + std::to_string(static_cast<int>(status)));
           conn_ok = false;
           completion = rdma::RailCompletion::kEndpointFailure;
           break;
