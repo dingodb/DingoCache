@@ -366,11 +366,6 @@ int main(int argc, char** argv) {
           return srv.RangeDirectForKey(key, off, len, io_buf, cap, out_data,
                                        out_len, value_len);
         });
-    rsrv->set_cache_direct_batch_handler(
-      [&srv](const std::vector<dfkv::StoreEngine::CacheBatchItem>& items)
-          -> std::vector<dfkv::Status> {
-        return srv.CacheDirectBatchForKeys(items);
-      });
   rsrv->set_cache_direct_handler(  // server-side direct PUT: RDMA dbuf -> O_DIRECT write
         [&srv](const dfkv::BlockKey& key, char* data, size_t len, size_t cap) {
           return srv.CacheDirectForKey(key, data, len, cap);
