@@ -906,10 +906,13 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
         return Status::kIOError;
       }
       conn->Encode(ep.sbuf(0), op, key, offset, length, payload_len);
-      ok = ep.PostRecv(0) &&
-           ep.PostWriteImmScatter(
+      ok = ep.PostWriteScatter(
                0, kReqPrefix, payload, static_cast<size_t>(payload_len),
-               payload_mr, conn->put_addr(0), conn->recv_segment.rkey, 0);
+               payload_mr, conn->put_addr(0), conn->recv_segment.rkey);
+      if (ok) {
+        std::memcpy(ep.nbuf(0), ep.sbuf(0), kReqPrefix);
+        ok = ep.PostRecv(0) && ep.PostSendNotify(0, kReqPrefix);
+      }
       if (ok)
         v2_put_writes_.fetch_add(1, std::memory_order_relaxed);
     } else if (op == WireOp::kRange) {
@@ -1113,10 +1116,15 @@ std::vector<Status> RdmaTransport::CacheMany(
         }
         conn->Encode(ep.sbuf(slot), WireOp::kCache, item.key, 0, 0,
                      item.len);
-        if (!ep.PostWriteImmScatter(
+        if (!ep.PostWriteScatter(
                 slot, kReqPrefix, item.data, item.len, mr,
-                conn->put_addr(slot), conn->recv_segment.rkey,
-                static_cast<uint32_t>(slot))) {
+                conn->put_addr(slot), conn->recv_segment.rkey) ||
+            !ep.PostRecv(slot)) {
+          conn_ok = false;
+          break;
+        }
+        std::memcpy(ep.nbuf(slot), ep.sbuf(slot), kReqPrefix);
+        if (!ep.PostSendNotify(slot, kReqPrefix)) {
           conn_ok = false;
           break;
         }

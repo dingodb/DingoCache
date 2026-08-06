@@ -127,6 +127,7 @@ class RcEndpoint {
   int numa_node() const { return numa_node_; }  // device's NUMA node, or -1
   char* sbuf(size_t slot) { return sbuf_[slot]; }
   char* rbuf(size_t slot) { return rbuf_[slot]; }
+  char* nbuf(size_t slot) { return nbuf_[slot]; }
   char* dbuf(size_t slot) { return dbuf_.empty() ? nullptr : dbuf_[slot]; }
   size_t dbuf_cap() const { return dbuf_cap_; }
   ibv_mr* dmr(size_t slot) { return dmr_.empty() ? nullptr : dmr_[slot]; }
@@ -239,6 +240,14 @@ class RcEndpoint {
       const std::vector<std::pair<const void*, uint32_t>>& segs,
       const std::vector<ibv_mr*>& mrs, uint64_t remote_addr,
       uint32_t remote_rkey, uint32_t immediate);
+  // Unsignaled scatter WRITE (no IMM): header from sbuf_[slot], payload from
+  // caller. A following signaled PostSendNotify fences the source buffer.
+  bool PostWriteScatter(
+      size_t slot, size_t header_len, const void* payload,
+      size_t payload_len, ibv_mr* payload_mr, uint64_t remote_addr,
+      uint32_t remote_rkey);
+  // Signaled SEND from nbuf_[slot] (notification buffer).
+  bool PostSendNotify(size_t slot, size_t len);
 
   // QP scatter-gather capability negotiated in Open() = min(kMaxSge, device cap).
   // The SG datapath caps raw-payload segments at max_sge()-1 (SGE0 is the wire prefix).
@@ -275,6 +284,8 @@ class RcEndpoint {
   size_t max_sge_ = 2;  // QP max_send_sge/max_recv_sge = min(kMaxSge, device cap)
   std::vector<char*> sbuf_, rbuf_, dbuf_;
   std::vector<ibv_mr*> smr_, rmr_, dmr_;
+  std::vector<char*> nbuf_;
+  std::vector<ibv_mr*> nmr_;
   // Big pre-registered caller regions (the host KV pool). Each cache entry owns
   // one shared-registry reference. Successful growth replaces the idle
   // endpoint's older same-base generation; endpoints with an in-flight user
