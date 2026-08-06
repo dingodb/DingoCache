@@ -263,6 +263,9 @@ class RcEndpoint {
   // Unblock a thread sitting in WaitComp (so the server can join its Serve
   // threads at shutdown). Thread-safe vs the waiter.
   void Wake();
+  void set_busy_poll(bool v) { busy_poll_ = v; }
+  void set_num_qp(size_t n) { num_qp_ = n > 0 ? n : 1; }
+  size_t num_qp() const { return num_qp_; }
 
  private:
   void Close();
@@ -278,6 +281,8 @@ class RcEndpoint {
   int wake_rfd_ = -1, wake_wfd_ = -1;  // self-pipe to interrupt WaitComp on stop
   ibv_mtu mtu_ = IBV_MTU_4096;
   unsigned cq_armed_unacked_ = 0;
+  bool busy_poll_ = false;
+  size_t num_qp_ = 1;
 
   size_t cap_ = 0, depth_ = 0, dbuf_cap_ = 0;
   uint16_t remote_depth_ = 0;  // Set from the required v2 QP advertisement.
