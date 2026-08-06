@@ -273,10 +273,8 @@ void RcEndpoint::Close() {
   // only after the last endpoint that can still return it has gone idle/closed.
   for (const auto& pool : pool_mr_) SharedReleasePoolMr(ctx_, pool.mr);
   pool_mr_.clear();
-  smr_.clear(); rmr_.clear(); dmr_.clear(); nmr_.clear(); nbuf_.clear();
+  smr_.clear(); rmr_.clear(); dmr_.clear();
   for (auto* b : sbuf_) delete[] b;
-  for (auto* m : nmr_) if (m) ibv_dereg_mr(m);
-  for (auto* b : nbuf_) delete[] b;
   for (auto* b : rbuf_) delete[] b;
   for (auto* b : dbuf_) std::free(b);
   sbuf_.clear(); rbuf_.clear(); dbuf_.clear();
@@ -414,7 +412,6 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
   // sizes (>=128 KiB) new[] is mmap-backed = page-aligned, which mbind needs.
   numa_node_ = numa::DeviceNode(dev_name);
   sbuf_.resize(depth_, nullptr); rbuf_.resize(depth_, nullptr);
-  nbuf_.resize(depth_, nullptr); nmr_.resize(depth_, nullptr);
   smr_.resize(depth_, nullptr); rmr_.resize(depth_, nullptr);
   if (direct_io_buffers) {
     const size_t dio_cap = direct_io_cap ? direct_io_cap : cap_;
@@ -439,9 +436,6 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
     }
   }
   for (size_t i = 0; i < depth_; ++i) {
-    nbuf_[i] = new char[64];
-    nmr_[i] = ibv_reg_mr(pd_, nbuf_[i], 64, IBV_ACCESS_LOCAL_WRITE);
-    if (!nmr_[i]) { Close(); return false; }
   }
 
   // local addressing info
@@ -897,21 +891,6 @@ bool RcEndpoint::PostWriteScatter(
   return ibv_post_send(qp_, &wr, &bad) == 0;
 }
 
-bool RcEndpoint::PostSendNotify(size_t slot, size_t len) {
-  if (slot >= depth_ || len > 64 || !nbuf_[slot] || !nmr_[slot]) return false;
-  ibv_sge sge{};
-  sge.addr = reinterpret_cast<uintptr_t>(nbuf_[slot]);
-  sge.length = static_cast<uint32_t>(len);
-  sge.lkey = nmr_[slot]->lkey;
-  ibv_send_wr wr{}, *bad = nullptr;
-  wr.wr_id = slot;
-  wr.sg_list = &sge;
-  wr.num_sge = 1;
-  wr.opcode = IBV_WR_SEND;
-  wr.send_flags = IBV_SEND_SIGNALED;
-  return ibv_post_send(qp_, &wr, &bad) == 0;
-}
-
 bool RcEndpoint::PostWriteImmScatterMulti(
     size_t slot, size_t header_len,
     const std::vector<std::pair<const void*, uint32_t>>& segs,
@@ -1004,39 +983,6 @@ void RcEndpoint::Wake() {
   if (wake_wfd_ >= 0) { char b = 1; ssize_t n = ::write(wake_wfd_, &b, 1); (void)n; }
 }
 
-
-void RcEndpoint::StartReaper(std::vector<std::atomic<uint32_t>*>* slots) {
-  reap_slots_ = *slots;
-  reap_stop_.store(false, std::memory_order_relaxed);
-  reap_thread_ = new std::thread([this] {
-    std::vector<ibv_wc> wcs(64);
-    while (!reap_stop_.load(std::memory_order_relaxed)) {
-      int got = ibv_poll_cq(cq_, static_cast<int>(wcs.size()), wcs.data());
-      if (got > 0) {
-        for (int i = 0; i < got; ++i) {
-          size_t slot = static_cast<size_t>(wcs[i].wr_id);
-          if (slot < reap_slots_.size() && reap_slots_[slot]) {
-            // Store byte_len for RECV, mark done for SEND
-            uint32_t val = (wcs[i].opcode == IBV_WC_RECV) ? wcs[i].byte_len : 0xFFFFFFFF;
-            reap_slots_[slot]->store(val, std::memory_order_release);
-          }
-        }
-      } else if (got == 0) {
-        // No completion: brief yield to avoid 100% CPU
-        std::this_thread::yield();
-      }
-    }
-  });
-}
-
-void RcEndpoint::StopReaper() {
-  if (!reap_thread_) return;
-  reap_stop_.store(true, std::memory_order_relaxed);
-  reap_thread_->join();
-  delete reap_thread_;
-  reap_thread_ = nullptr;
-  reap_slots_.clear();
-}
 
 }  // namespace rdma
 }  // namespace dfkv
