@@ -132,9 +132,15 @@ void KvNodeServer::InitRamTier() {
   // asynchronously; writearound writes directly to disk and fills the arena via
   // GET read-promotion. Any value other than "writearound" keeps write-back.
   const char* wm = std::getenv("DFKV_RAM_WRITE_MODE");
-  ram_write_back_ = !(wm && std::string(wm) == "writearound");
-  config_dump::RecordResolved("DFKV_RAM_WRITE_MODE",
-                              ram_write_back_ ? "writeback" : "writearound");
+  std::string mode = wm ? std::string(wm) : "";
+  if (mode != "writeback" && mode != "writearound") {
+    if (!mode.empty())
+      DFKV_LOG_WARN("DFKV_RAM_WRITE_MODE='" + mode +
+                    "' not recognized; using writeback");
+    mode = "writeback";
+  }
+  ram_write_back_ = mode == "writeback";
+  config_dump::RecordResolved("DFKV_RAM_WRITE_MODE", mode);
   // Flush workers default to 4x the disk count (cap 16). One sync DIO stream
   // per worker leaves NVMe queues nearly idle for small objects; measured on a
   // 3-disk node (64 KiB saturated writes): 3 workers 6.8k ops/s -> 16 workers
