@@ -151,6 +151,9 @@ class KvNodeServer {
   // is due within DFKV_TCP_FIRST_REQ_MS of ACCEPT, not of handler scheduling.
   void Handle(int fd, std::chrono::steady_clock::time_point accepted_at);
   void InitRamTier();     // construct ram_ if DFKV_RAM_TIER is enabled (env)
+  // RAM tier write policy: write-back (PUT lands in arena, async flush) or
+  // write-around (PUT direct to disk, arena filled by GET read-promotion).
+  void set_ram_write_back(bool wb) { ram_write_back_ = wb; }
   void InitAdmission();   // read DFKV_PUT_INFLIGHT_LIMIT (0 = gate off)
   void ReapDoneLocked();  // join+erase finished handler threads; conn_mu_ held
   void InitTcpListenerConfig();
@@ -169,6 +172,7 @@ class KvNodeServer {
   // PUT admission gate (I6): reject with kCacheFull once this many disk writes
   // are in flight (0 = unlimited/off). See --put-inflight-limit.
   size_t put_busy_limit_ = 0;
+  bool ram_write_back_ = true;  // default write-back; DFKV_RAM_WRITE_MODE=writearound switches
   std::atomic<size_t> disk_put_inflight_{0};
   std::atomic<size_t> put_busy_{0};
   std::atomic<size_t> open_connections_{0};

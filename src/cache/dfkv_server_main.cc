@@ -91,7 +91,7 @@ int main(int argc, char** argv) {
                    "--mds", "--group",
                    "--id", "--advertise", "--weight",
                    "--metrics-port", "--metrics-bind", "--store-engine",
-                   "--slab-write", "--ram-tier", "--ram-tier-bytes",
+                   "--slab-write", "--ram-tier", "--ram-tier-bytes", "--ram-write-mode",
                    "--slab-granularity", "--put-inflight-limit",
                    "--tcp-max-conns", "--tcp-io-timeout-s",
                    "--rdma-depth", "--rdma-numa", "--rdma-idle-ms",
@@ -129,6 +129,12 @@ int main(int argc, char** argv) {
   std::string ram_tier_bytes = args.Get("--ram-tier-bytes", "");
   if (!ram_tier_bytes.empty())
     ::setenv("DFKV_RAM_TIER_BYTES", ram_tier_bytes.c_str(), 1);
+  // RAM write policy: writeback (default) absorbs PUT bursts in the arena and
+  // serves zero-copy GET; writearound writes straight to disk and fills the
+  // arena via GET read-promotion.
+  std::string ram_write_mode = args.Get("--ram-write-mode", "");
+  if (!ram_write_mode.empty())
+    ::setenv("DFKV_RAM_WRITE_MODE", ram_write_mode.c_str(), 1);
   // Slot quantum is persistent geometry. An existing store with a different
   // value is rejected fail-closed; operators must explicitly use an empty dir.
   std::string slab_gran = args.Get("--slab-granularity", "");
