@@ -154,6 +154,7 @@ class RdmaServer {
   // admission an explicit bounded resource instead of multiplying max payload
   // buffers by every connection.
   rdma::RecvSegment recv_segment_;
+  std::atomic<uint64_t> segment_evictions_{0};
   size_t recv_segment_bytes_ = 0;
   size_t recv_segment_registered_rails_ = 0;
   // One anchor per explicitly resolved ACTIVE rail holds a lifetime shared

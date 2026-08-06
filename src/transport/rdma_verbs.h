@@ -127,6 +127,10 @@ class RcEndpoint {
   }
   size_t cap() const { return cap_; }
   int numa_node() const { return numa_node_; }  // device's NUMA node, or -1
+  // Last completion timestamp (steady-clock us), updated by the owner Serve
+  // loop whenever WaitComp yields completions. Lets the server evict the
+  // stalest idle connection when the shared receive segment is exhausted.
+  std::atomic<uint64_t> last_active_us_{0};
   char* sbuf(size_t slot) { return sbuf_[slot]; }
   char* rbuf(size_t slot) { return rbuf_[slot]; }
   char* dbuf(size_t slot) { return dbuf_.empty() ? nullptr : dbuf_[slot]; }

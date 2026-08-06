@@ -42,6 +42,10 @@ using wire_limits::ResolveMaxPayload;
 // Monotonic seconds for the async-read submit->complete latency stamp. Read
 // twice per deferred GET (prep + completion), both off the SSD-bound path, so
 // the vDSO clock read is amortized away.
+inline uint64_t SteadyUs() {
+  return static_cast<uint64_t>(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+}
 inline double NowSteadySec() {
   return std::chrono::duration<double>(
              std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -425,13 +429,46 @@ void RdmaServer::Serve(int boot_fd) {
   rdma::RecvSegment::Lease recv_lease =
       recv_segment_.Allocate(K * slot_size, rdma::kV2DataOffset);
   if (!recv_lease) {
-    DFKV_LOG_ERROR(
-        "rdma v2: shared receive segment exhausted; refusing connection "
-        "(need=" +
-        std::to_string(K * slot_size) +
-        " free=" + std::to_string(recv_segment_.free_bytes()) + ")");
-    ::close(boot_fd);
-    return;
+    // Segment exhausted: evict the stalest idle connection(s) to make room
+    // before refusing. Client pooled connections re-dial via the stale-retry
+    // path, so evicting only connections idle longer than kEvictIdleMinUs
+    // (no completions for 2 s -> no in-flight request) is safe.
+    const uint64_t now = SteadyUs();
+    constexpr uint64_t kEvictIdleMinUs = 2000000;
+    for (int round = 0; round < 32 && !recv_lease; ++round) {
+      rdma::RcEndpoint* victim = nullptr;
+      uint64_t victim_active = std::numeric_limits<uint64_t>::max();
+      {
+        std::lock_guard<std::mutex> lk(conn_mu_);
+        for (rdma::RcEndpoint* ep : live_eps_) {
+          const uint64_t a =
+              ep->last_active_us_.load(std::memory_order_relaxed);
+          if (a <= now && now - a >= kEvictIdleMinUs && a < victim_active) {
+            victim = ep;
+            victim_active = a;
+          }
+        }
+      }
+      if (!victim) break;  // every connection is recently active; refuse
+      victim->Wake();  // Serve exits; the Lease destructor returns its range
+      segment_evictions_.fetch_add(1, std::memory_order_relaxed);
+      // Poll for the freed range (bounded). The victim's Serve thread tears
+      // down its endpoint and releases the lease asynchronously.
+      for (int i = 0; i < 100 && !recv_lease; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        recv_lease =
+            recv_segment_.Allocate(K * slot_size, rdma::kV2DataOffset);
+      }
+    }
+    if (!recv_lease) {
+      DFKV_LOG_ERROR(
+          "rdma v2: shared receive segment exhausted; refusing connection "
+          "(need=" +
+          std::to_string(K * slot_size) +
+          " free=" + std::to_string(recv_segment_.free_bytes()) + ")");
+      ::close(boot_fd);
+      return;
+    }
   }
 
   rdma::RcEndpoint ep;
@@ -506,6 +543,7 @@ void RdmaServer::Serve(int boot_fd) {
     if (!running_) return;
     live_eps_.insert(&ep);
   }
+  ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
 
   // Send-slot free list (a reply uses one send slot until its SEND completes).
   std::vector<size_t> free_send;
@@ -865,6 +903,8 @@ void RdmaServer::Serve(int boot_fd) {
 
       while (running_ && !fail) {
         int g = ep.WaitComp(wcs.data(), static_cast<int>(K), idle_ms);
+        if (g > 0)
+          ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
         if (g == 0) { idle_reclaims_.fetch_add(1, std::memory_order_relaxed); break; }
         if (g < 0) break;  // error / Stop()'s Wake()
         descs.clear();
@@ -1110,6 +1150,8 @@ sync_serve_loop:;
 
   while (running_ && !fail) {
     int g = ep.WaitComp(wcs.data(), static_cast<int>(K), idle_ms);
+    if (g > 0)
+      ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
     if (g == 0) { idle_reclaims_.fetch_add(1, std::memory_order_relaxed); break; }  // idle -> reclaim
     if (g < 0) break;  // error / Stop()'s Wake()
     for (int w = 0; w < g && !fail; ++w) {
@@ -1184,6 +1226,9 @@ std::string RdmaServer::MetricsText() const {
   m(s, "dfkv_rdma_v2_ready", "gauge",
     "Whether RDMA v2 has a registered shared receive segment",
     recv_segment_registered_rails_ > 0 ? 1 : 0);
+  m(s, "dfkv_rdma_segment_evictions_total", "counter",
+     "Connections evicted to free shared receive segment space",
+     segment_evictions_.load(std::memory_order_relaxed));
   m(s, "dfkv_rdma_idle_reclaims_total", "counter", "RDMA connections reclaimed on idle timeout",
     IdleReclaims());
   m(s, "dfkv_uring_reads_total", "counter",
