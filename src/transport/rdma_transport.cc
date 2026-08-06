@@ -1110,13 +1110,9 @@ std::vector<Status> RdmaTransport::CacheMany(
                                        /*remote_write=*/false)
                 : nullptr;
         payload_mrs[slot] = mr;
-        if ((item.len != 0 && !mr) || !ep.PostRecv(slot)) {
-          conn_ok = false;
-          break;
-        }
         conn->Encode(ep.sbuf(slot), WireOp::kCache, item.key, 0, 0,
                      item.len);
-        if (!ep.PostRecv(slot) ||
+        if ((item.len != 0 && !mr) || !ep.PostRecv(slot) ||
             !ep.PostWriteImmScatter(
                 slot, kReqPrefix, item.data, item.len, mr,
                 conn->put_addr(slot), conn->recv_segment.rkey,
