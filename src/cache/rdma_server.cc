@@ -745,11 +745,9 @@ void RdmaServer::Serve(int boot_fd) {
         std::memcpy(cache_data, request.contiguous_payload,
                     static_cast<size_t>(fields.payload_len));
       }
-      const Status status = cache_direct_batch_handler_
-          ? cache_direct_batch_handler_({{{key, cache_data, static_cast<size_t>(fields.payload_len), direct_buffer_cap}}})[0]
-          : cache_direct_handler_(
-              key, cache_data, static_cast<size_t>(fields.payload_len),
-              direct_buffer_cap);
+      const Status status = cache_direct_handler_(
+          key, cache_data, static_cast<size_t>(fields.payload_len),
+          direct_buffer_cap);
       encode_status(status, 0);
       reply->first_len = response_prefix;
       return true;
