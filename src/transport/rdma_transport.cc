@@ -1116,15 +1116,11 @@ std::vector<Status> RdmaTransport::CacheMany(
         }
         conn->Encode(ep.sbuf(slot), WireOp::kCache, item.key, 0, 0,
                      item.len);
-        std::memcpy(ep.nbuf(slot), ep.sbuf(slot), kReqPrefix);
-        if (!ep.PostWriteScatter(
+        if (!ep.PostRecv(slot) ||
+            !ep.PostWriteImmScatter(
                 slot, kReqPrefix, item.data, item.len, mr,
-                conn->put_addr(slot), conn->recv_segment.rkey) ||
-            !ep.PostRecv(slot)) {
-          conn_ok = false;
-          break;
-        }
-        if (!ep.PostSendNotify(slot, kReqPrefix)) {
+                conn->put_addr(slot), conn->recv_segment.rkey,
+                static_cast<uint32_t>(slot))) {
           conn_ok = false;
           break;
         }
