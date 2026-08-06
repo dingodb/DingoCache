@@ -577,6 +577,28 @@ void RdmaServer::Serve(int boot_fd) {
       }
       return request->get.targets.size() <= rdma::kV2MaxGetTargets;
     }
+    // Unilateral PUT path: the notification is a 50B request prefix sent via
+    // SEND. The offset field carries the data_slot index where [header|payload]
+    // was written via plain RDMA WRITE to the shared receive segment.
+    if (request->fields.op == static_cast<uint8_t>(WireOp::kCache)) {
+      if (completion.byte_len < kReqPrefix) return false;
+      const size_t data_slot = static_cast<size_t>(request->fields.offset);
+      if (data_slot >= K) return false;
+      const char* data_frame = recv_lease.data() + data_slot * slot_size +
+                               rdma::kV2PutPrefixOffset;
+      if (!DecodeReqVersion(
+              data_frame, kNativeProtoRdmaV2, &request->fields,
+              static_cast<uint64_t>(logical_data_cap)) ||
+          request->fields.op != static_cast<uint8_t>(WireOp::kCache) ||
+          request->fields.payload_len > static_cast<uint64_t>(logical_data_cap)) {
+        return false;
+      }
+      request->data_slot = data_slot;
+      request->contiguous_payload = data_frame + kReqPrefix;
+      v2_put_writes_.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+    // Other control ops (Exist/Remove/Members/Lookup) with inline payload
     if (completion.byte_len <
         kReqPrefix + request->fields.payload_len) {
       return false;

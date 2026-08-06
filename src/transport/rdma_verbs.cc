@@ -272,8 +272,10 @@ void RcEndpoint::Close() {
   // only after the last endpoint that can still return it has gone idle/closed.
   for (const auto& pool : pool_mr_) SharedReleasePoolMr(ctx_, pool.mr);
   pool_mr_.clear();
-  smr_.clear(); rmr_.clear(); dmr_.clear();
+  smr_.clear(); rmr_.clear(); dmr_.clear(); nmr_.clear(); nbuf_.clear();
   for (auto* b : sbuf_) delete[] b;
+  for (auto* m : nmr_) if (m) ibv_dereg_mr(m);
+  for (auto* b : nbuf_) delete[] b;
   for (auto* b : rbuf_) delete[] b;
   for (auto* b : dbuf_) std::free(b);
   sbuf_.clear(); rbuf_.clear(); dbuf_.clear();
@@ -335,7 +337,7 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
   // of either HCA's max_sge because every WRITE itself has one SGE.
   static_assert(kV2MaxGetTargets == kMaxSge - 1);
   const size_t wr_per_slot =
-      v2_responder ? kV2MaxGetTargets + 1 : 1;
+      v2_responder ? (kV2MaxGetTargets + 1) : 2;
   if (depth_ > (std::numeric_limits<uint32_t>::max() - 1) / wr_per_slot) {
     DFKV_LOG_ERROR("rdma: requested send queue depth overflows uint32");
     Close();
@@ -411,6 +413,7 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
   // sizes (>=128 KiB) new[] is mmap-backed = page-aligned, which mbind needs.
   numa_node_ = numa::DeviceNode(dev_name);
   sbuf_.resize(depth_, nullptr); rbuf_.resize(depth_, nullptr);
+  nbuf_.resize(depth_, nullptr); nmr_.resize(depth_, nullptr);
   smr_.resize(depth_, nullptr); rmr_.resize(depth_, nullptr);
   if (direct_io_buffers) {
     const size_t dio_cap = direct_io_cap ? direct_io_cap : cap_;
@@ -433,6 +436,11 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
       dmr_[i] = ibv_reg_mr(pd_, dbuf_[i], dbuf_cap_, IBV_ACCESS_LOCAL_WRITE);
       if (!dmr_[i]) { Close(); return false; }
     }
+  }
+  for (size_t i = 0; i < depth_; ++i) {
+    nbuf_[i] = new char[64];
+    nmr_[i] = ibv_reg_mr(pd_, nbuf_[i], 64, IBV_ACCESS_LOCAL_WRITE);
+    if (!nmr_[i]) { Close(); return false; }
   }
 
   // local addressing info
@@ -857,6 +865,49 @@ bool RcEndpoint::PostWriteImmScatter(
   wr.imm_data = htonl(immediate);
   wr.wr.rdma.remote_addr = remote_addr;
   wr.wr.rdma.rkey = remote_rkey;
+  return ibv_post_send(qp_, &wr, &bad) == 0;
+}
+
+bool RcEndpoint::PostWriteScatter(
+    size_t slot, size_t header_len, const void* payload, size_t payload_len,
+    ibv_mr* payload_mr, uint64_t remote_addr, uint32_t remote_rkey) {
+  if (slot >= depth_ || header_len > cap_ ||
+      header_len > std::numeric_limits<uint32_t>::max() ||
+      payload_len > std::numeric_limits<uint32_t>::max() ||
+      (payload_len != 0 && (!payload || !payload_mr)) ||
+      remote_addr == 0 || remote_rkey == 0) {
+    return false;
+  }
+  ibv_sge sge[2]{};
+  sge[0].addr = reinterpret_cast<uintptr_t>(sbuf_[slot]);
+  sge[0].length = static_cast<uint32_t>(header_len);
+  sge[0].lkey = smr_[slot]->lkey;
+  sge[1].addr = reinterpret_cast<uintptr_t>(payload);
+  sge[1].length = static_cast<uint32_t>(payload_len);
+  sge[1].lkey = payload_len ? payload_mr->lkey : 0;
+  ibv_send_wr wr{}, *bad = nullptr;
+  wr.wr_id = slot;
+  wr.sg_list = sge;
+  wr.num_sge = payload_len ? 2 : 1;
+  wr.opcode = IBV_WR_RDMA_WRITE;
+  wr.send_flags = 0;
+  wr.wr.rdma.remote_addr = remote_addr;
+  wr.wr.rdma.rkey = remote_rkey;
+  return ibv_post_send(qp_, &wr, &bad) == 0;
+}
+
+bool RcEndpoint::PostSendNotify(size_t slot, size_t len) {
+  if (slot >= depth_ || len > 64 || !nbuf_[slot] || !nmr_[slot]) return false;
+  ibv_sge sge{};
+  sge.addr = reinterpret_cast<uintptr_t>(nbuf_[slot]);
+  sge.length = static_cast<uint32_t>(len);
+  sge.lkey = nmr_[slot]->lkey;
+  ibv_send_wr wr{}, *bad = nullptr;
+  wr.wr_id = slot;
+  wr.sg_list = &sge;
+  wr.num_sge = 1;
+  wr.opcode = IBV_WR_SEND;
+  wr.send_flags = IBV_SEND_SIGNALED;
   return ibv_post_send(qp_, &wr, &bad) == 0;
 }
 
