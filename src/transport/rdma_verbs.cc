@@ -337,7 +337,7 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
   // of either HCA's max_sge because every WRITE itself has one SGE.
   static_assert(kV2MaxGetTargets == kMaxSge - 1);
   const size_t wr_per_slot =
-      v2_responder ? (kV2MaxGetTargets + 1) : 2;
+      v2_responder ? (kV2MaxGetTargets + 1) : 1;
   if (depth_ > (std::numeric_limits<uint32_t>::max() - 1) / wr_per_slot) {
     DFKV_LOG_ERROR("rdma: requested send queue depth overflows uint32");
     Close();
