@@ -43,8 +43,11 @@ using wire_limits::ResolveMaxPayload;
 // twice per deferred GET (prep + completion), both off the SSD-bound path, so
 // the vDSO clock read is amortized away.
 inline uint64_t SteadyUs() {
+  // steady_clock::count() is nanoseconds on Linux; cast to real microseconds.
   return static_cast<uint64_t>(
-      std::chrono::steady_clock::now().time_since_epoch().count());
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
 }
 inline double NowSteadySec() {
   return std::chrono::duration<double>(
@@ -435,7 +438,9 @@ void RdmaServer::Serve(int boot_fd) {
     // (no completions for 2 s -> no in-flight request) is safe.
     const uint64_t now = SteadyUs();
     constexpr uint64_t kEvictIdleMinUs = 2000000;
+    const uint64_t evict_started = SteadyUs();
     for (int round = 0; round < 32 && !recv_lease; ++round) {
+      if (SteadyUs() - evict_started > 5000000) break;  // bound: <= 5 s total
       rdma::RcEndpoint* victim = nullptr;
       uint64_t victim_active = std::numeric_limits<uint64_t>::max();
       {
@@ -443,12 +448,15 @@ void RdmaServer::Serve(int boot_fd) {
         for (rdma::RcEndpoint* ep : live_eps_) {
           const uint64_t a =
               ep->last_active_us_.load(std::memory_order_relaxed);
-          if (a <= now && now - a >= kEvictIdleMinUs && a < victim_active) {
+          // a == 0: endpoint inserted but Serve has not stamped it yet.
+          if (a != 0 && a <= now && now - a >= kEvictIdleMinUs &&
+              a < victim_active) {
             victim = ep;
             victim_active = a;
           }
         }
-      }
+        if (victim) live_eps_.erase(victim);  // claim it: no other evictor
+      }                                        // can Wake a freed stack endpoint
       if (!victim) break;  // every connection is recently active; refuse
       victim->Wake();  // Serve exits; the Lease destructor returns its range
       segment_evictions_.fetch_add(1, std::memory_order_relaxed);
