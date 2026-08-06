@@ -128,6 +128,13 @@ void KvNodeServer::InitRamTier() {
     unsigned long long n = std::strtoull(b, nullptr, 10);
     if (n > 0) o.bytes = n;
   }
+  // RAM write policy: writeback (default) admits PUT into the arena and flushes
+  // asynchronously; writearound writes directly to disk and fills the arena via
+  // GET read-promotion. Any value other than "writearound" keeps write-back.
+  const char* wm = std::getenv("DFKV_RAM_WRITE_MODE");
+  ram_write_back_ = !(wm && std::string(wm) == "writearound");
+  config_dump::RecordResolved("DFKV_RAM_WRITE_MODE",
+                              ram_write_back_ ? "writeback" : "writearound");
   // Flush workers default to 4x the disk count (cap 16). One sync DIO stream
   // per worker leaves NVMe queues nearly idle for small objects; measured on a
   // 3-disk node (64 KiB saturated writes): 3 workers 6.8k ops/s -> 16 workers
@@ -897,11 +904,27 @@ Status KvNodeServer::CacheDirectForKey(const BlockKey& key, char* data,
   // capped single-node PUT at 3.4 GB/s vs 4.4 GB/s direct-disk.
   Status st = Status::kCacheFull;
   const bool quota_ok = !ram_ || group_.TenantQuotaBytes(key.tenant_hash) == 0;
-  if (quota_ok && put_busy_limit_ > 0 &&
+  bool needs_disk = true;
+  // Write-back: admit to the RAM arena first; the arena absorbs PUT bursts
+  // and serves zero-copy GET until the async flusher drains to disk. Only
+  // genuine arena backpressure (kCacheFull) falls through to direct disk
+  // write. Write-around (DFKV_RAM_WRITE_MODE=writearound) writes straight to
+  // disk and fills the arena lazily via GET read-promotion instead.
+  if (ram_write_back_ && ram_ && quota_ok) {
+    st = ram_->PutCommitted(key, data, len);
+    needs_disk = st == Status::kCacheFull;
+    if (st == Status::kOk) {
+      cache_put_.fetch_add(1, std::memory_order_relaxed);
+      bytes_written_.fetch_add(len, std::memory_order_relaxed);
+    } else if (!needs_disk && st == Status::kIOError) {
+      put_io_err_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  if (needs_disk && quota_ok && put_busy_limit_ > 0 &&
       disk_put_inflight_.load(std::memory_order_relaxed) >= put_busy_limit_) {
     st = Status::kCacheFull;
     put_busy_.fetch_add(1, std::memory_order_relaxed);
-  } else if (quota_ok) {
+  } else if (needs_disk && quota_ok) {
     disk_put_inflight_.fetch_add(1, std::memory_order_relaxed);
     st = group_.CacheDirect(key, data, len, cap);
     disk_put_inflight_.fetch_sub(1, std::memory_order_relaxed);
