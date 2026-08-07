@@ -2110,7 +2110,7 @@ class DfkvStoreWorker:
                 ExternalCachedBlockPool(exists_set),
             )
             hit_length = min(complete_prefix_tokens, semantic_hit_length)
-        logger.debug(
+        logger.warning(
             "dfkv lookup: token_len=%d candidates=%d complete_chunks=%d/%d "
             "-> hit_length=%d",
             token_len,
