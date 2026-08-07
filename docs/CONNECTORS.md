@@ -84,9 +84,9 @@ tp_rank=..,ver=<lib>`（无 `role`——HiCache 是前缀 L3 缓存，无生产/
 |-----|------|------|------|
 | `DFKV_RDMA` | 一般路径未设 = TCP；**vLLM 直连无默认，必须 `1`** | 按连接器选择 | `1` 显式选择 native-verbs RDMA v2；请求 RDMA 后设备或协议不可用会失败，不会自动选择 TCP。`DfkvStoreConnector` 只接收 GPU 设备指针，构造时会关闭并拒绝任何非 RDMA handle。 |
 | `DFKV_RDMA_DEV` | 首个 `ACTIVE` 本地 HCA | 留空让两端各自选本地首口；多轨才显式写同 fabric 白名单 | 留空时 bootstrap 不发送设备名，client/server 可使用不同本地命名。逗号列表显式开启多轨，新连接在健康轨间轮转；显式设备名会发给 peer，故两端必须存在同名且互通的 fabric。设备名上限 **18 字节**（v2 bootstrap dev frame 限制），超长即 fail-fast 拒绝启动/建连，不会静默截断（见 `src/transport/dev_frame.h`）。 |
-| `DFKV_RDMA_DEPTH` | `1` | 两侧可不同，按容量选 | 握手协商 `min(client,server)` 作为安全窗口。每连接注册 `2 × depth × (18 B + 32 KiB)` 的有界 SEND/RECV control buffer，并从共享 receive segment 租 `depth` 个 slot。 |
-| `DFKV_RDMA_MAX_BLOCK_BYTES` | 64 MiB 安全上限 | 按连接器块几何精确设置 | DCP2 声明本连接最大 PUT/GET block，决定共享 segment 的 slot 大小；超声明请求在客户端失败且不上 wire。声明越准，同一 segment 可容纳的 live/pooled v2 连接越多。 |
-| `DFKV_RDMA_RECV_SEGMENT_SIZE` | 2 GiB | 按下文 live/pooled 连接公式设置 | server 启动时申请，并在每个选中 rail 的共享 PD 上注册；失败会拒绝启动，segment 无可用 lease 时拒绝新连接。 |
+| `DFKV_RDMA_DEPTH` | `4` | 两侧可不同，按容量选 | 握手协商 `min(client,server)` 作为安全窗口。每连接注册 `2 × depth × (18 B + 32 KiB)` 的有界 SEND/RECV control buffer，并从共享 receive segment 租 `depth` 个 slot。 |
+| `DFKV_RDMA_MAX_BLOCK_BYTES` | 4 MiB 安全上限 | 按连接器块几何精确设置 | DCP2 声明本连接最大 PUT/GET block，决定共享 segment 的 slot 大小；超声明请求在客户端失败且不上 wire。声明越准，同一 segment 可容纳的 live/pooled v2 连接越多。 |
+| `DFKV_RDMA_RECV_SEGMENT_SIZE` | 16 GiB | 按下文 live/pooled 连接公式设置 | server 启动时申请，并在每个选中 rail 的共享 PD 上注册；失败会拒绝启动，segment 无可用 lease 时拒绝新连接。 |
 | `DFKV_RDMA_NUMA` | `0` | 显式多轨的大机可设 `1` | 建连时按调用线程 NUMA 选本地 rail（无本地 rail→轮转白名单），server serve 线程跟随 QP rail。单块共享 receive segment 不做 per-rail NUMA 分配；仅保证选轨/线程亲和。 |
 | `DFKV_RDMA_MAX_PAYLOAD_BYTES` | 64 MiB（67108864） | — | 客户端单 value payload 上限（不得超过 server 侧同名上限） |
 
@@ -115,9 +115,9 @@ B_required >= N_data × depth × S_data + N_control × depth × S_control
 
 `N_data` / `N_control` 是该 server 上所有 rank、进程的**峰值 live + client
 pool 中空闲连接**；lease 一直保留到 QP 被销毁或 `DFKV_RDMA_IDLE_MS` 回收，
-线程峰值留下的 pooled QP 也要计入。64 MiB 声明、depth=1 时
-`S_data=67,112,960 B`，2 GiB segment 最多约 31 条 data QP（未扣 control
-lease）；depth=4 时约 7 条，depth=8 时约 3 条。上线同时观察
+线程峰值留下的 pooled QP 也要计入。4 MiB 声明、depth=4 时
+`S_data=4,198,400 B`，16 GiB segment 最多约 1024 条 data QP（未扣 control
+lease）；depth=1 时约 4092 条，depth=8 时约 511 条。上线同时观察
 `dfkv_rdma_recv_segment_free_bytes` 与 `dfkv_rdma_v2_ready`；free 接近 0
 即扩容或缩小声明/depth/pool，避免新连接被拒绝。
 
@@ -155,7 +155,7 @@ capability；HCA `max_sge` 低于 dfkv 上限时会缩小宽度，高于上限�
 典型踩法：照 L2-bypass 实测的 1.02 MiB 调到 2 MiB，切回原版 L2 后
 2.74 MiB 的整页对象全部静默失效。
 
-> **服务端侧上限 `--max-msg`**：默认 64 MiB，即"客户端不声明时给多少"。
+> **服务端侧上限 `--max-msg`**：默认 32 MiB，即"客户端不声明时给多少"。
 > 它同时是本服务端接受的**上限**：客户端声明**高于**它会被**明确拒绝连接**并打日志，
 > 而不是悄悄按小的开——后者会让客户端按自己声明的大小发包、打爆对端 recv buffer（RNR/QP 断）。
 > 大集群建议显式设定，否则服务端的内存预算完全由客户端决定，而客户端常由别的团队部署、版本不一。
@@ -625,7 +625,7 @@ namespace/key 不一致是预期 cold miss。**空环 / MDS 不可达**可直接
 | env | 默认 | 推荐 | 说明 |
 |---|---|---|---|
 | `DFKV_RDMA` / `DFKV_RDMA_DEV` | **无；`DFKV_RDMA=1` 必填** | `1` / 全轨列表 | vLLM 设备指针连接器仅支持 GPUDirect RDMA；unset/TCP 在构造期关闭并拒绝，无 fallback。见 §1.2 |
-| `DFKV_RDMA_DEPTH` | `1` | 保持 1 | depth-flat（§1.2） |
+| `DFKV_RDMA_DEPTH` | `4` | 保持 4 | depth-flat（§1.2） |
 | `DFKV_RDMA_NUMA` | `0` | 多 NUMA 大机 `1` | §1.2 |
 | `DFKV_LIB` / `DFKV_BUILD` | — | so 路径 | 被 extra_config `lib` 覆盖 |
 | `DFKV_ACCESS_LOG_*` | 关 | 排查时开 | §1.6；vLLM 侧记 `batch_get_auto_sg`/`batch_put_sg`/`batch_exist`/`register_memory` |
@@ -693,7 +693,7 @@ daemon 线程或进程终止；过载和退出期间都不会静默留下永久�
   `model_name`（④）由 **vLLM 启动 `--model`/`--served-model-name`** 提供，不是 extra_config
   键；引擎/布局身份全量进 canonical namespace（§1.4）。
 - **单实例 / 单 DP**：`--prefix-caching-hash-algo sha256` + `DFKV_RDMA=1` +
-  `batch_concurrency=8` 默认，depth 保持 1。
+  `batch_concurrency=8` 默认，depth 默认 4。
 - **多 DP / 多实例共享池**：所有实例使用 `--prefix-caching-hash-algo sha256`，
   并保持 effective namespace、canonical key 坐标和 raw payload layout 一致（§5）。
 - **大集群 / 宽池**：`batch_concurrency` 提到接近 dfkv 节点数，让一批 KV 在更多节点并行。
@@ -708,7 +708,7 @@ daemon 线程或进程终止；过载和退出期间都不会静默留下永久�
   SWA-index kernel）；暖后 12k 上下文 WARM≈2s < COLD 2.7s。在意首 token 延迟就在启动后
   给每个 rank 打一个合成命中预热。
 - **SG 合并**：每 chunk 一个 key（而非每层段一个），25392→1242 key（~20×），减少 per-key 磁盘读。
-- **depth 平**：裸 GET 单连接 depth 1 = depth 32 ≈ 1.24 GB/s，完全一样。
+- **depth 平**：裸 GET 单连接 depth 1 = depth 32 ≈ 1.24 GB/s，完全一样（默认已改为 4）。
 - **传输层**：裸 GET 8 连接 5.2 GB/s、16 连接 6.2 GB/s（详见 [datapath-perf-notes.md](datapath-perf-notes.md)）。
 
 ### 3.7 已知问题 / 排查

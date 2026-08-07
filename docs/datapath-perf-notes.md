@@ -66,7 +66,7 @@ Empirical (8x400G IB testbed, 3-node, 1 MiB PUT, single writer thread, batch 64)
 - **Depth pipelining does NOT raise PUT.** The server's per-connection serve loop
   processes requests serially (each does the O_DIRECT disk write inline), so a
   client that pipelines `depth` PUTs just queues them at the server. Depth is kept
-  as an opt-in knob (`rdma_depth` extra_config / `DFKV_RDMA_DEPTH`) — it can help on
+  as a knob defaulting to 4 (`rdma_depth` extra_config / `DFKV_RDMA_DEPTH`) — it can help on
   a network-latency-bound link — but on a disk-bound path it is flat.
 - **Multi-connection fan-out is the real write lever**: splitting a batch across N
   connections hits N parallel server serve threads. `batch_concurrency` auto mode
