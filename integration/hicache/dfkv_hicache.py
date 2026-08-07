@@ -1265,6 +1265,21 @@ class DfkvHiCache(HiCacheStorage):
                 if _sp:
                     _sp.attrs = {"dfkv.anchor_noop": True}
                 return [True] * n
+            # Device-direct PUT writes SG-chunked keys via _flatten_device
+            # (_sg_group_key), but this host-buffer GET path uses flat keys
+            # via _flatten/_keys. The key namespaces differ, so a host GET
+            # would miss every page that device-direct PUT wrote. Return
+            # all-present so the prefetch controller counts the anchor prefix
+            # complete and the hybrid controller loads real KV via the v2
+            # side-pool path (batch_get_v2). Without this, the prefetch
+            # reports "failed to retrieve page" for every hot-round page and
+            # falls back to cold compute, making hot throughput worse than
+            # cold (observed -29.8% on GLM-5.2-NVFP4 B200 single-node).
+            if getattr(self, "mem_pool_device", None) is not None:
+                r.result = "device_direct_anchor"
+                if _sp:
+                    _sp.attrs = {"dfkv.device_direct_anchor": True}
+                return [True] * n
             ptrs, sizes = meta
             sub, sks, sp, ss = self._flatten(keys, ptrs, sizes)
             karr, klens, parr, sarr, out, key_owners = _arrays(sks, sp, ss)
