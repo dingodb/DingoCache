@@ -1968,7 +1968,7 @@ class DfkvStoreWorker:
     def lookup(self, token_len: int, block_hashes: list[BlockHash]) -> int:
         """Check how many prefix tokens exist in the store.
 
-        Checks across all TP ranks and PP ranks.
+        Checks across all TP ranks at this worker's own PP rank.
         """
         if not block_hashes or token_len <= 0:
             return 0
@@ -2010,7 +2010,7 @@ class DfkvStoreWorker:
             tp_candidates = (
                 [db.metadata.tp_rank] if db.metadata.tp_rank < 0 else range(tp_count)
             )
-            rank_probes = max(1, len(tp_candidates) * self.pp_size)
+            rank_probes = max(1, len(tp_candidates))
             processed_chunks = 0
             for chunk_id, h in enumerate(group_hashes):
                 start_idx = chunk_id * spec_block_size
@@ -2024,10 +2024,13 @@ class DfkvStoreWorker:
                 expected_per_object[object_meta] = rank_probes
                 required_objects_per_chunk[logical_chunk_idx] += 1
                 for tp in tp_candidates:
-                    for pp in range(self.pp_size):
-                        md = dataclasses.replace(db.metadata, tp_rank=tp, pp_rank=pp)
-                        candidate_keys.append(PoolKey(md, h.hex()).to_bytes())
-                        candidate_meta.append(object_meta)
+                    # Keep this worker's own pp_rank (db.metadata.pp_rank): PP
+                    # partitions layers, so each (group, chunk) lives under a
+                    # single stage's pp_rank, matching the SAVE/LOAD keys. Probing
+                    # every pp_rank matched nothing and forced present=0 on PP>1.
+                    md = dataclasses.replace(db.metadata, tp_rank=tp)
+                    candidate_keys.append(PoolKey(md, h.hex()).to_bytes())
+                    candidate_meta.append(object_meta)
             # A truncated hash vector is malformed metadata. Mark only its
             # ungenerated required suffix chunks incomplete; the normal path
             # has no second full mask scan.
