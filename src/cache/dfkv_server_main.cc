@@ -57,12 +57,12 @@ int main(int argc, char** argv) {
       "  --store-engine <e>   storage backend: slab | file (default slab)\n"
       "  --slab-write <m>     slab I/O mode: direct | buffered (default direct)\n"
       "  --ram-tier <on|off>  RAM hot tier: write-through arena + RDMA zero-copy GET (default off)\n"
-      "  --ram-tier-bytes <n> RAM arena size in bytes (default 4 GiB; pinned once registered)\n"
+      "  --ram-tier-bytes <n> RAM arena size in bytes (default 16 GiB; pinned once registered)\n"
       "  --slab-granularity <n>  slab slot quantum bytes (default 1 MiB; existing mismatched geometry fails startup)\n"
       "  --put-inflight-limit <n>  cap concurrent disk PUTs; excess fast-fail kCacheFull (0 = off)\n"
       "  --tcp-max-conns <n> cap cache TCP handlers (default 512, hard max 4096)\n"
       "  --tcp-io-timeout-s <n>  per-socket TCP read/write timeout seconds (default 60, hard max 3600)\n"
-      "  --rdma-depth <n>     RDMA write pipeline depth (must be <= client's; env DFKV_RDMA_DEPTH)\n"
+      "  --rdma-depth <n>     RDMA write pipeline depth (default 4; must be >= client's; env DFKV_RDMA_DEPTH)\n"
       "  --rdma-numa <0|1>    NUMA-local rail selection per connection (env DFKV_RDMA_NUMA)\n"
       "  --rdma-idle-ms <n>   idle connection reaper interval ms (env DFKV_RDMA_IDLE_MS)\n"
       "  --rdma-op-timeout-ms <n>  per-op RDMA timeout ms (env DFKV_RDMA_OP_TIMEOUT_MS)\n"
@@ -74,7 +74,7 @@ int main(int argc, char** argv) {
       "  --slab-table-sync-ms <n>  slab table sync cadence ms (env DFKV_SLAB_TABLE_SYNC_MS)\n"
       "  --slab-reclaim-ms <n>  slab background free-slot reclaimer cadence ms, 0 = off (env DFKV_SLAB_RECLAIM_MS)\n"
       "  --ram-reclaim-ms <n>   RAM tier background reclaimer cadence ms, 0 = off (env DFKV_RAM_RECLAIM_MS)\n"
-      "  --rdma-recv-segment-size <n>  RDMA v2 shared receive segment bytes (default 2 GiB; env DFKV_RDMA_RECV_SEGMENT_SIZE)\n"
+      "  --rdma-recv-segment-size <n>  RDMA v2 shared receive segment bytes (default 16 GiB; env DFKV_RDMA_RECV_SEGMENT_SIZE)\n"
       "  --disk-hash-weight <n>  per-disk vnode multiplier (default 10; env DFKV_DISK_HASH_WEIGHT)\n"
       "  --read-coalesce <0|1>  read-side convoy merge + RAM promotion (default off; env DFKV_READ_COALESCE)\n"
       "  --log <level>        log level: INFO|DEBUG|WARN|ERROR (env DFKV_LOG)\n"
@@ -354,7 +354,7 @@ int main(int argc, char** argv) {
 #ifdef DFKV_WITH_RDMA
   // --max-msg is the hard payload ceiling. RDMA v2 leases slots from one
   // process-wide receive segment sized by DFKV_RDMA_RECV_SEGMENT_SIZE.
-  const unsigned long long max_msg = args.GetU64("--max-msg", 64ull << 20);
+  const unsigned long long max_msg = args.GetU64("--max-msg", 32ull << 20);
   std::unique_ptr<dfkv::RdmaServer> rsrv;
   if (rdma_port >= 0) {
     rsrv = std::make_unique<dfkv::RdmaServer>(

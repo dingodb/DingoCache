@@ -87,7 +87,7 @@ class RdmaTransport : public Transport {
 
   bool pipelined() const override { return true; }
   size_t MaxSgPayloadSegs() const override { return sg_payload_segs_; }
-  // Pipelined: up to `depth_` requests in flight on a single connection.
+  // Pipelined: up to `depth_` requests in flight on a single connection (default 4; env DFKV_RDMA_DEPTH).
   std::vector<Status> CacheMany(const std::string& node,
                                 const std::vector<CacheItem>& items) override;
   std::vector<Status> CacheFrom(const std::string& node,
@@ -152,6 +152,7 @@ class RdmaTransport : public Transport {
   // queue_depth * aligned_slot_size from one fixed pinned segment. Inflating
   // this value reduces connection capacity; understating it deterministically
   // rejects larger operations. It must therefore be exact and nonzero.
+  // Default 4 MiB (env DFKV_RDMA_MAX_BLOCK_BYTES); capped by max_payload_.
   uint64_t declared_ = 0;
   size_t OpBound() const {  // per-op payload bound honoring the declaration
     return declared_ ? static_cast<size_t>(declared_) : max_payload_;
