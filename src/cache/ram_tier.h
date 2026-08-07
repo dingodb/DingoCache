@@ -66,7 +66,7 @@ class KvNodeServer;
 class RamTier {
  public:
   struct Options {
-    uint64_t bytes = (4ull << 30);       // total RAM-tier byte budget
+    uint64_t bytes = (16ull << 30);       // total RAM-tier byte budget
     // Bytes reserved outside the registered fixed-slot arena for dedicated
     // oversized values. UINT64_MAX selects two allocator extents (or zero when
     // the default extent spans the whole budget); 0 disables dedicated

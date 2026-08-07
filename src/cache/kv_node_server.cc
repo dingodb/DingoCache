@@ -117,7 +117,7 @@ void KvNodeServer::InitAdmission() {
 
 void KvNodeServer::InitRamTier() {
   // Off by default. DFKV_RAM_TIER in {1,on,true,yes} enables the RAM hot tier;
-  // DFKV_RAM_TIER_BYTES sizes the pre-registered arena (default 4 GiB).
+  // DFKV_RAM_TIER_BYTES sizes the pre-registered arena (default 16 GiB).
   const char* e = std::getenv("DFKV_RAM_TIER");
   const std::string v = (e && *e) ? std::string(e) : "";
   const bool enabled = (v == "1" || v == "on" || v == "true" || v == "yes");

@@ -104,10 +104,10 @@ class RdmaServer {
   uint64_t V2GetWrites() const {
     return v2_get_writes_.load(std::memory_order_relaxed);
   }
-  // The server-side pipeline depth (env DFKV_RDMA_DEPTH, default 1) -- surfaced
+  // The server-side pipeline depth (env DFKV_RDMA_DEPTH, default 4) -- surfaced
   // in ring INFO because the CLIENT's depth must not exceed it: excess in-flight
   // requests hit receiver-not-ready retries and degrade SILENTLY (measured 3-4x
-  // on pipelined GETs), they don't fail.
+  // on pipelined GETs) and cause PUT batch failures during burst writes.
   size_t PipelineDepth() const;
   std::string MetricsText() const;  // Prometheus text (dfkv_rdma_*)
   // Whether the io_uring async-GET serve path should be used for new conns.

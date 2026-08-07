@@ -226,9 +226,9 @@ bool RdmaTransport::Available() {
 RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
     : max_payload_(ResolveMaxPayload(max_msg)),
       declared_(std::min<uint64_t>(
-          EnvBytes("DFKV_RDMA_MAX_BLOCK_BYTES", ResolveMaxPayload(max_msg)),
+          EnvBytes("DFKV_RDMA_MAX_BLOCK_BYTES", 4ull << 20),
           ResolveMaxPayload(max_msg))),
-      depth_(1) {
+      depth_(4) {
   std::string list = dev_name;
   if (list.empty()) {
     const char* configured = std::getenv("DFKV_RDMA_DEV");
@@ -270,7 +270,7 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
       msge = std::min(msge, rdma::QueryMaxSge(d.empty() ? nullptr : d.c_str()));
     sg_payload_segs_ = msge - 1;  // SGE0 carries the wire request prefix
   }
-  const char* d = std::getenv("DFKV_RDMA_DEPTH");  // pipeline depth (must be <= server's)
+  const char* d = std::getenv("DFKV_RDMA_DEPTH");  // pipeline depth (default 4; must be <= server's)
   if (d && *d) { long v = std::strtol(d, nullptr, 10); if (v >= 1 && v <= 256) depth_ = (size_t)v; }
   config_dump::RecordResolved("DFKV_RDMA_DEV", JoinDevices(devs_));
   config_dump::RecordResolved("DFKV_RDMA_DEPTH", std::to_string(depth_));
