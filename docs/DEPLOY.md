@@ -144,7 +144,7 @@ test -e /etc/dfkv/tenant-quotas ||
 > | 项 | xb01 生产 (v1.37/1.40) | 本示例 (v2.0.0) | 变动 |
 > |---|---|---|---|
 > | `--rdma-dev` | 8 轨全列 | 8 轨全列 | 一致 |
-> | RDMA depth | `DFKV_RDMA_DEPTH=32` | `DFKV_RDMA_DEPTH=1` | depth-flat（实测 depth 1/2/4/8/16 对 PUT/GET 吞吐无差异）；depth>1 膨胀每连接 segment lease（depth×slot），高并发时易耗尽共享 segment |
+> | RDMA depth | `DFKV_RDMA_DEPTH=32` | `DFKV_RDMA_DEPTH=4` | 新默认 4 对齐 client/server——depth=1 会 clamp 批处理窗口，pipeline GET 退化 3-4×、突发 PUT 批失败致 L3 prefetch miss（热轮吞吐 -29.8%，depth=4 后仅 -2.9%）；depth>1 膨胀每连接 segment lease（depth×slot），过大在高并发时易耗尽共享 segment |
 > | RDMA_NUMA | `1` | 保留 `DFKV_RDMA_NUMA=1` | 一致 |
 > | RAM tier | on + 1TiB | on + 1TiB（`--ram-tier-bytes 1099511627776`） | 一致 |
 > | SERVER_URING | 开，depth=32 | 默认关，经 drop-in 打开（须编 `-DDFKV_WITH_URING`） | v2 保留 |
@@ -162,11 +162,11 @@ After=network-online.target dfkv-mds.service
 Wants=network-online.target
 [Service]
 Type=simple
-# v2 shared segment 示例：RDMA depth=1（默认，slot=64MiB@max-msg 64MiB）、segment=2 GiB
-# （depth=1 时 ~31 data QP；depth>1 膨胀 lease，高并发易耗尽，CONNECTORS §1.2.1
+# v2 shared segment 示例：RDMA depth=4（默认，slot=4MiB=min(client MAX_BLOCK_BYTES 4MiB, server --max-msg 32MiB)）、segment=16 GiB
+# （depth=4 时 ~1024 data QP；depth>1 膨胀 lease，高并发易耗尽，CONNECTORS §1.2.1
 # 的公式按 peak live + pooled QP 复算）。
-Environment=DFKV_RDMA_DEPTH=1
-Environment=DFKV_RDMA_RECV_SEGMENT_SIZE=2147483648
+Environment=DFKV_RDMA_DEPTH=4
+Environment=DFKV_RDMA_RECV_SEGMENT_SIZE=17179869184
 # 8×400G 轨全轨白名单 + NUMA：B200 生产 host 一台带 8 个 HCA 轨；
 # server 两端白名单到**同名互通**一组轨；client 的 `DFKV_RDMA_NUMA=1` 后每 rank 优先本 NUMA 轨，
 # 本地轨全不可准入时降级重试全部 enabled rail（rail_select.h/rdma_transport.cc:399-413）。
@@ -192,7 +192,7 @@ ExecStart=/usr/local/bin/dfkv_server \
   --dir /mnt/disk1/dfkv,/mnt/disk2/dfkv,/mnt/disk3/dfkv \
   --port 28000 --rdma-port 28001 \
   --rdma-dev ib7s400p0,ib7s400p1,ib7s400p2,ib7s400p3,ib7s400p4,ib7s400p5,ib7s400p6,ib7s400p7 \
-  --rdma-depth 1 --rdma-numa 1 \
+  --rdma-depth 4 --rdma-numa 1 \
   --ram-tier on --ram-tier-bytes 1099511627776 --ram-tier-shards 16 \
   --cap 6597069766656 --mds 10.0.0.1:9400,10.0.0.2:9400 \
   --metrics-port 28010 --group default --id n57 \
@@ -227,9 +227,10 @@ LimitMEMLOCK=infinity        # RDMA 需要锁页内存
 WantedBy=multi-user.target
 ```
 
-> **`--max-msg` 默认 64 MiB（`64ull << 20`），与 client 默认 `DFKV_RDMA_MAX_BLOCK_BYTES` 一致，
-> 无需显式设置。** 它是 RDMA receive-segment 单 slot 上限；client 在 DCP2 协商时声明自己的
-> `DFKV_RDMA_MAX_BLOCK_BYTES`（默认 64 MiB）。若 server `--max-msg` < client 声明值，server
+> **`--max-msg` 默认 32 MiB（`32ull << 20`），是 client 声明值上限；client 默认
+> `DFKV_RDMA_MAX_BLOCK_BYTES` 为 4 MiB，实际 slot 取 `min(client 声明, server --max-msg)`，默认无需显式设置。**
+> 它是 RDMA receive-segment 单 slot 上限；client 在 DCP2 协商时声明自己的
+> `DFKV_RDMA_MAX_BLOCK_BYTES`（默认 4 MiB）。若 server `--max-msg` < client 声明值，server
 > 拒绝连接（日志 `client declared max block ... above this server's cap ...`），所有 PUT 失败
 > 但 exist 不受影响（不走 max_block 协商）。**不要降低 `--max-msg` 除非同时降低所有 client 的
 > `DFKV_RDMA_MAX_BLOCK_BYTES`。**
@@ -307,8 +308,8 @@ journalctl -u dfkv -n 10 --no-pager
 >
 > **v2 segment 预算**：`slot=align4K(4096 + max_raw_payload)`；
 > `segment >= Σ(live + client-pool-idle data/control QP × depth × slot)`。lease
-> 保留到 QP 销毁或 idle reclaim，不能只数在飞请求。64 MiB/depth=1/2 GiB
-> 约容纳 31 条 data QP（未扣 control lease）；depth=4 时约 7 条，depth=8 时约 3 条。上线先看
+> 保留到 QP 销毁或 idle reclaim，不能只数在飞请求。4 MiB/depth=4/16 GiB
+> 约容纳 1024 条 data QP（未扣 control lease）；depth=8 时约 512 条，depth=16 时约 256 条。上线先看
 > `dfkv_rdma_recv_segment_free_bytes`、`dfkv_rdma_v2_ready` 和
 > `dfkv_rdma_v2_conns_opened_total`；free 接近 0 会使新连接被拒绝。
 
@@ -382,14 +383,14 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `--store-engine` / `DFKV_STORE_ENGINE` | `slab` | `slab` 为默认；`file` 为显式诊断 fallback |
 | `--slab-write` / `DFKV_SLAB_WRITE` | `direct` | slab 数据面 O_DIRECT / buffered；文件系统不支持 DIO 时整店回退 buffered 并以 `wr=` 上报 |
 | `--ram-tier` / `DFKV_RAM_TIER` | `off` | RAM 热层（写穿+RDMA zero-copy GET） |
-| `--ram-tier-bytes` / `DFKV_RAM_TIER_BYTES` | `4 GiB` | arena 预算（pin 一次即注册） |
+| `--ram-tier-bytes` / `DFKV_RAM_TIER_BYTES` | `16 GiB` | arena 预算（pin 一次即注册） |
 | `--ram-tier-numa` / `DFKV_RAM_TIER_NUMA` | `interleave` | NUMA 策略：`interleave`/`off`（不接 node id） |
 | `--ram-tier-shards` / `DFKV_RAM_TIER_SHARDS` | `8`, 硬上限 64 | arena 锁分片数（大 arena ≥100 GiB 建议 16） |
 | `--slab-granularity` / `DFKV_SLAB_GRANULARITY` | `1 MiB` | slab slot 量子；现有目录 geometry 不符启动拒绝 |
 | `--put-inflight-limit` / `DFKV_PUT_INFLIGHT_LIMIT` | `0`=关 | 并发盘写上限，超出返回 kCacheFull 快速拒绝 |
 | `--tcp-max-conns` / `DFKV_TCP_MAX_CONNS` | `512`, 硬上限 4096 | cache TCP handler 上限；超限 accept 恒拒 |
 | `--tcp-io-timeout-s` / `DFKV_TCP_IO_TIMEOUT_S` | `60`, 硬上限 3600 | per-syscall RCVTIMEO（秒） |
-| `--rdma-depth` / `DFKV_RDMA_DEPTH` | `1` | server 提交 QP post 深度；与 client 协商取 `min` |
+| `--rdma-depth` / `DFKV_RDMA_DEPTH` | `4` | server 提交 QP post 深度；与 client 协商取 `min` |
 | `--rdma-numa` / `DFKV_RDMA_NUMA` | `0` | NUMA-aware rail choice（off/1） |
 | `--rdma-idle-ms` / `DFKV_RDMA_IDLE_MS` | — | idle connection reaper tick |
 | `--rdma-op-timeout-ms` / `DFKV_RDMA_OP_TIMEOUT_MS` | `5000` | per-op RDMA deadline |
@@ -400,7 +401,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `--slab-reclaim-ms` / `DFKV_SLAB_RECLAIM_MS` | `50 ms`, `0`=关 | slab 后台回收 tick |
 | `--ram-reclaim-ms` / `DFKV_RAM_RECLAIM_MS` | `10 ms`, `0`=关 | RAM tier 后台回收 tick |
 | `--log` / `DFKV_LOG` | `INFO` | INFO/DEBUG/WARN/ERROR |
-| `--max-msg`（或 `DFKV_RDMA_MAX_PAYLOAD_BYTES`） | `64 MiB` | 单笔 payload 硬上限（RDMA 与 TCP 数据路径同受此限） |
+| `--max-msg`（或 `DFKV_RDMA_MAX_PAYLOAD_BYTES`） | `32 MiB` | 单笔 payload 硬上限（RDMA 与 TCP 数据路径同受此限） |
 | `--version, -V` / `--help` | — | 打印版本/帮助并退出 |
 
 #### b. RDMA 传输面（均在 dfkv_server 进程读取）
@@ -661,7 +662,7 @@ trial 汇总 median/p95/p99；延迟从 workload 前后的 server
 并在隔离压测窗口执行，避免其它流量混入 histogram delta。
 
 ```bash
-DFKV_RDMA=1 DFKV_RDMA_DEV=ib7s400p0 DFKV_RDMA_DEPTH=1 \
+DFKV_RDMA=1 DFKV_RDMA_DEV=ib7s400p0 DFKV_RDMA_DEPTH=4 \
 deploy/dfkv_load_regression.py \
   --baseline-mds 10.0.1.1:9400 --baseline-group glm \
   --baseline-metrics 10.0.1.11:28010,10.0.1.12:28010 \
