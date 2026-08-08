@@ -9,6 +9,7 @@ Run: python3 -m unittest test_determinism_guard  (from this directory)
 
 import importlib.util
 import pathlib
+from unittest import mock
 import types
 import unittest
 
@@ -31,29 +32,38 @@ def _cfg(algo):
 class DeterminismGuardTest(unittest.TestCase):
 
     def test_builtin_raises(self):
-        with self.assertRaisesRegex(RuntimeError, "sha256"):
-            ensure_deterministic_block_hashing(_cfg("builtin"))
+        with mock.patch.dict("os.environ", {"PYTHONHASHSEED": "0"}):
+            with self.assertRaisesRegex(RuntimeError, "sha256"):
+                ensure_deterministic_block_hashing(_cfg("builtin"))
 
     def test_builtin_rejects_pinned_python_seed(self):
-        with self.assertRaisesRegex(RuntimeError, "PYTHONHASHSEED"):
-            ensure_deterministic_block_hashing(_cfg("builtin"))
+        with mock.patch.dict("os.environ", {"PYTHONHASHSEED": "0"}):
+            with self.assertRaisesRegex(RuntimeError, "sha256"):
+                ensure_deterministic_block_hashing(_cfg("builtin"))
 
-    def test_sha256_family_passes(self):
-        ensure_deterministic_block_hashing(_cfg("sha256"))
-        ensure_deterministic_block_hashing(_cfg("sha256_cbor_64bit"))
+    def test_sha256_family_requires_pinned_python_seed(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "PYTHONHASHSEED"):
+                ensure_deterministic_block_hashing(_cfg("sha256"))
+
+    def test_sha256_family_passes_with_pinned_seed(self):
+        with mock.patch.dict("os.environ", {"PYTHONHASHSEED": "0"}):
+            ensure_deterministic_block_hashing(_cfg("sha256"))
+            ensure_deterministic_block_hashing(_cfg("sha256_cbor_64bit"))
 
     def test_enum_like_algo_value_passes(self):
         # vLLM may hand an enum whose str() embeds the name.
-
         class Algo:
             def __str__(self):
                 return "HashAlgo.SHA256"
 
-        ensure_deterministic_block_hashing(_cfg(Algo()))
+        with mock.patch.dict("os.environ", {"PYTHONHASHSEED": "0"}):
+            ensure_deterministic_block_hashing(_cfg(Algo()))
 
     def test_missing_attr_defaults_to_builtin(self):
-        with self.assertRaises(RuntimeError):
-            ensure_deterministic_block_hashing(types.SimpleNamespace())
+        with mock.patch.dict("os.environ", {"PYTHONHASHSEED": "0"}):
+            with self.assertRaises(RuntimeError):
+                ensure_deterministic_block_hashing(types.SimpleNamespace())
 
 
 if __name__ == "__main__":
