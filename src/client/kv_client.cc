@@ -476,7 +476,9 @@ bool KVClient::PutDirect(const std::string& key, const void* value, size_t n) {
   }
   if (st == Status::kOk || st == Status::kNotFound)
     health_.MarkGood(node, NowMs());
-  return st == Status::kOk;
+  const bool ok = st == Status::kOk;
+  if (ok) InvalidateRendezvous(bk);
+  return ok;
 }
 
 bool KVClient::Get(const std::string& key, void* out, size_t n) {
@@ -672,7 +674,10 @@ std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
       srcs.push_back(CacheSrc{ToBlockKey(key_namespace_, items[k].key),
                               items[k].value, items[k].n});
     std::vector<Status> sts = t_->CacheFrom(node, srcs);
-    for (size_t m = 0; m < idx.size(); ++m) ok[idx[m]] = (sts[m] == Status::kOk) ? 1 : 0;
+    for (size_t m = 0; m < idx.size(); ++m) {
+      ok[idx[m]] = (sts[m] == Status::kOk) ? 1 : 0;
+      if (ok[idx[m]]) InvalidateRendezvous(srcs[m].key);
+    }
     bool resp = false, ioerr = false;
     // kInvalid (oversize/per-item guard) is neither: it must not clear the
     // peer cooldown (resp) nor trip MarkBad (ioerr).
@@ -1186,7 +1191,10 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
       srcs.push_back(std::move(s));
     }
     std::vector<Status> sts = t_->CacheFromMulti(node, srcs);
-    for (size_t m = 0; m < idx.size(); ++m) ok[idx[m]] = (sts[m] == Status::kOk) ? 1 : 0;
+    for (size_t m = 0; m < idx.size(); ++m) {
+      ok[idx[m]] = (sts[m] == Status::kOk) ? 1 : 0;
+      if (ok[idx[m]]) InvalidateRendezvous(srcs[m].key);
+    }
     bool resp = false, ioerr = false;
     // kInvalid (oversize/per-item guard) is neither: it must not clear the
     // peer cooldown (resp) nor trip MarkBad (ioerr).

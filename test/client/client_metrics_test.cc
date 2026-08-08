@@ -228,6 +228,36 @@ TEST(ClientOpMetrics, RendezvousHitsAreCountedAndRemoveCannotServeStale) {
   EXPECT_EQ(Metric(snapshot, "dfkv_client_op_hits_total", "get"), 2u);
 }
 
+TEST(ClientDedup, SuccessfulPutsInvalidateCachedAbsence) {
+  const std::string key_namespace = "metrics/put-invalidates-absence";
+  DedupEnv env(key_namespace);
+  MetricsTransport transport;
+  transport.pipeline = true;
+  KVClient client({{"n", "test:1"}}, key_namespace, &transport);
+  const std::string value = "payload";
+
+  EXPECT_EQ(client.BatchExist({"scalar"}), std::vector<bool>({false}));
+  EXPECT_TRUE(client.Put("scalar", value.data(), value.size()));
+  EXPECT_EQ(client.BatchExist({"scalar"}), std::vector<bool>({true}));
+
+  EXPECT_EQ(client.BatchExist({"batch"}), std::vector<bool>({false}));
+  std::vector<KvPutItem> batch{
+      {"batch", value.data(), value.size()},
+  };
+  EXPECT_EQ(client.BatchPut(batch), std::vector<bool>({true}));
+  EXPECT_EQ(client.BatchExist({"batch"}), std::vector<bool>({true}));
+
+  EXPECT_EQ(client.BatchExist({"sg"}), std::vector<bool>({false}));
+  std::vector<KvPutItemSg> sg{
+      {"sg", {value.data()}, {value.size()}},
+  };
+  EXPECT_EQ(client.BatchPutSg(sg), std::vector<bool>({true}));
+  EXPECT_EQ(client.BatchExist({"sg"}), std::vector<bool>({true}));
+
+  EXPECT_EQ(transport.exist_calls, 6u)
+      << "each successful PUT must invalidate the cached absent verdict";
+}
+
 TEST(ClientDedup, TransientExistFailureIsNotPublishedAsAbsence) {
   const std::string key_namespace = "metrics/exist-transient";
   DedupEnv env(key_namespace);

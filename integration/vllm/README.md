@@ -42,15 +42,18 @@ TCP or host-bounce fallback for this connector.
 
 Read by `libdfkv.so` (the C client) and the connector, so set them in **every**
 vLLM engine process — each DP rank is its own process.
-The connector requires vLLM's content-defined block hashing:
-`--prefix-caching-hash-algo sha256`. Startup fails before traffic when the
-process-local `builtin` algorithm is selected; `PYTHONHASHSEED` is not accepted
-as a cross-fleet identity contract.
+The connector requires vLLM's content-defined block hashing and a stable root:
+set `--prefix-caching-hash-algo sha256` and the same fixed
+`PYTHONHASHSEED` in every engine process. Current vLLM releases initialize the
+first block's parent hash from `os.urandom()` when the seed is unset, which
+makes every restart miss all previously stored keys. Startup fails before
+traffic if either requirement is missing.
 
 
 | env | default | meaning |
 |---|---|---|
 | `DFKV_RDMA` | **required: `1`** | Selects the required GPUDirect RDMA transport. Unset/TCP is rejected during connector construction; there is no TCP fallback. |
+| `PYTHONHASHSEED` | **required: fixed value** | Stabilizes vLLM's root block hash across processes and restarts. Use the same value (for example `0`) on every producer and consumer sharing a store. |
 | `DFKV_RDMA_DEV` | — | RDMA rail by name (`ib7s400p0`; comma-list = multi-rail). Required when `DFKV_RDMA=1`. |
 | `DFKV_RDMA_DEPTH` | `1` | Requests in flight per connection. A latency hider, **not** a throughput knob (GET/PUT are depth-flat — the per-connection serve loop is in-order). Leave at default. |
 | `DFKV_RDMA_NUMA` | `0` | `1` pins buffers/threads to the rail's NUMA node and picks a NUMA-local rail per connection. Optional. |
@@ -115,9 +118,11 @@ payload layouts.
 
 - **member port = rdma-port.** Pointing at the main `--port` makes every RDMA
   `put` fail (`rc=-1`); RDMA QP bootstrap listens on `--rdma-port`.
-- **Use `--prefix-caching-hash-algo sha256` on every engine.** The connector
-  rejects process-local `builtin` hashes before traffic; `PYTHONHASHSEED` is not
-  accepted as a fleet identity contract.
+- **Use `--prefix-caching-hash-algo sha256` and a fixed `PYTHONHASHSEED` on
+  every engine.** Without the seed, current vLLM releases derive the first
+  block's parent hash from `os.urandom()`, so every restart silently turns all
+  previously stored entries into cold misses. The connector rejects both
+  unsafe configurations before traffic.
 - **Identity mismatches are cold misses.** If a read hits but the decoded
   shape/content is wrong, stop mixed writers: the same namespace+key has been
   reused for incompatible raw layouts. Bump the source-controlled layout ID.
