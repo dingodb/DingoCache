@@ -315,11 +315,9 @@ class DingoFSHiCacheTest(unittest.TestCase):
             ),
         )
 
-    def test_rdma_depth_extra_config_sets_env(self):
-        # extra_config rdma_depth must propagate to DFKV_RDMA_DEPTH so the C client
-        # builds its transport with write pipelining (#1). Set before dfkv_open.
+    def test_rdma_depth_is_preserved_for_connection_fanout(self):
         members, _, _ = self._node("rdepth")
-        os.environ.pop("DFKV_RDMA_DEPTH", None)
+        os.environ["DFKV_RDMA_DEPTH"] = "4"
         try:
             cfg = self._cfg(members)
             cfg.extra_config["rdma_depth"] = 8
@@ -328,13 +326,17 @@ class DingoFSHiCacheTest(unittest.TestCase):
         finally:
             os.environ.pop("DFKV_RDMA_DEPTH", None)
 
-    def _rail_for(self, members, rails_csv, tp_rank, tp_size):
+    def _rail_for(self, members, rails_csv, rank, size):
         saved = os.environ.get("DFKV_RDMA_DEV")
         os.environ["DFKV_RDMA_DEV"] = rails_csv
         os.environ.pop("DFKV_RDMA_NUMA", None)
         try:
-            cfg = self._cfg(members, tp_rank=tp_rank, tp_size=tp_size)
-            cfg.extra_config["rail_affinity"] = True
+            cfg = self._cfg(members, tp_rank=0, tp_size=1)
+            cfg.extra_config.update({
+                "rail_affinity": True,
+                "pcp_rank": rank,
+                "pcp_size": size,
+            })
             dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
             return os.environ.get("DFKV_RDMA_DEV"), os.environ.get("DFKV_RDMA_NUMA")
         finally:
@@ -344,23 +346,19 @@ class DingoFSHiCacheTest(unittest.TestCase):
             else:
                 os.environ["DFKV_RDMA_DEV"] = saved
 
-    def test_rail_affinity_deprecated_is_noop_8rails(self):
-        # rail_affinity is DEPRECATED: it must NOT narrow DFKV_RDMA_DEV anymore.
-        # The full multi-rail list is preserved (the C++ client now selects a
-        # NUMA-local rail per connection). It also no longer forces DFKV_RDMA_NUMA.
+    def test_rail_affinity_uses_physical_attention_rank(self):
         members, _, _ = self._node("rail8")
-        rails = "ib7s400p0,ib7s400p1,ib7s400p2,ib7s400p3,ib7s400p4,ib7s400p5,ib7s400p6,ib7s400p7"
-        dev, numa = self._rail_for(members, rails, tp_rank=3, tp_size=8)
-        self.assertEqual(dev, rails)   # unchanged: no per-rank narrowing
-        self.assertIsNone(numa)        # rail_affinity no longer sets DFKV_RDMA_NUMA
+        rails = "ib0,ib1,ib2,ib3,ib4,ib5,ib6,ib7"
+        dev, numa = self._rail_for(members, rails, rank=3, size=8)
+        self.assertEqual(dev, "ib3")
+        self.assertEqual(numa, "0")
 
-    def test_rail_affinity_deprecated_is_noop_2rails(self):
-        # Regardless of tp_rank, the full rail list survives (no DP-attention collapse).
+    def test_rail_affinity_wraps_over_available_rails(self):
         members, _, _ = self._node("rail2")
         rails = "ibA,ibB"
-        self.assertEqual(self._rail_for(members, rails, tp_rank=2, tp_size=8)[0], rails)
-        self.assertEqual(self._rail_for(members, rails, tp_rank=5, tp_size=8)[0], rails)
-        self.assertEqual(self._rail_for(members, rails, tp_rank=7, tp_size=8)[0], rails)
+        self.assertEqual(self._rail_for(members, rails, rank=2, size=8)[0], "ibA")
+        self.assertEqual(self._rail_for(members, rails, rank=5, size=8)[0], "ibB")
+        self.assertEqual(self._rail_for(members, rails, rank=7, size=8)[0], "ibB")
 
     def test_rdma_numa_extra_config_sets_env(self):
         # The new rdma_numa knob opts into client-side NUMA-aware rail selection

@@ -336,29 +336,31 @@ class DfkvHiCache(HiCacheStorage):
             mds = cfg.get("mds_endpoints", "")
             members = cfg.get("members", "")
             _tcfg.require_ring_endpoint(members, mds)
-            # RDMA write pipelining: depth>1 keeps multiple PUTs in flight on one
-            # connection, hiding per-op latency (single-rank MLA writes are
-            # latency-bound). The C client reads DFKV_RDMA_DEPTH when it builds the
-            # transport inside dfkv_open below, so set it from extra_config first.
-            # NOTE: the dfkv_server must set the SAME (or larger) DFKV_RDMA_DEPTH in
-            # its own env -- client depth must be <= server depth.
-            if cfg.get("rdma_depth"):
-                os.environ["DFKV_RDMA_DEPTH"] = str(int(cfg["rdma_depth"]))
+            # Multi-SGE device writes use a dedicated connection lane in the
+            # native transport, so each QP still has one in-flight CUDA range.
+            # Depth fans a batch across independent QPs and is required to keep
+            # the SSD/RDMA pipeline full.
+            requested_depth = int(
+                cfg.get("rdma_depth", os.environ.get("DFKV_RDMA_DEPTH", "1")))
+            os.environ["DFKV_RDMA_DEPTH"] = str(max(1, requested_depth))
             if _truthy(cfg.get("require_rdma")):
                 if not _truthy(os.environ.get("DFKV_RDMA")):
                     os.environ["DFKV_RDMA"] = "1"
-            # rail_affinity (per-tp_rank narrowing) is DEPRECATED and now a no-op:
-            # it keyed off tp_rank, which is always 0 under DP-attention (every rank
-            # is its own attention TP group of size 1), so it collapsed all ranks to
-            # one rail. NUMA-aware rail selection now lives in the C++ client: keep
-            # the full multi-rail DFKV_RDMA_DEV and set DFKV_RDMA_NUMA=1, and the
-            # client picks a NUMA-local rail per connection (works for TP and DP).
-            if cfg.get("rail_affinity"):
-                import sys as _sys
-                print("[dfkv] WARNING: 'rail_affinity' is deprecated and ignored; "
-                      "set DFKV_RDMA_NUMA=1 + multi-rail DFKV_RDMA_DEV for NUMA-aware "
-                      "rail selection in the client.", file=_sys.stderr, flush=True)
-            if cfg.get("rdma_numa"):
+            # Optional one-rank/one-rail affinity keeps a large CUDA pool from
+            # being registered against every HCA PD. Use the physical attention
+            # rank, not tp_rank (tp_rank is always zero under DP-attention).
+            # Eight 128-GiB pools × eight rails exhausted mlx5 registration on
+            # B200; one rail per PCP rank registered cleanly and still aggregates
+            # all rails across the eight workers.
+            if _truthy(cfg.get("rail_affinity")):
+                rails = [x.strip() for x in
+                         os.environ.get("DFKV_RDMA_DEV", "").split(",")
+                         if x.strip()]
+                if len(rails) > 1:
+                    rank = self.pcp_rank if self.pcp_size > 1 else self.tp_rank
+                    os.environ["DFKV_RDMA_DEV"] = rails[rank % len(rails)]
+                    os.environ["DFKV_RDMA_NUMA"] = "0"
+            elif cfg.get("rdma_numa"):
                 os.environ.setdefault("DFKV_RDMA_NUMA", "1")
             # Same-host GET rendezvous (phase 5): dedups TP-replicated L3 loads
             # across the rank processes of one node (HiCache destinations are

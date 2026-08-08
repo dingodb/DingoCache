@@ -116,9 +116,10 @@ class RdmaTransport : public Transport {
 
  private:
   struct Conn;
-  // force_new skips the idle pool after a stale connection. lane separates
-  // payload traffic from key-sized control traffic.
-  enum class Lane { kData, kControl };
+  // force_new skips the idle pool after a stale connection. Lanes separate
+  // payload, device-direct SG, and key-sized control traffic. SG uses a
+  // depth-one QP because overlapping multi-SGE CUDA writes fail on mlx5.
+  enum class Lane { kData, kSgData, kControl };
   Conn* Acquire(const std::string& node, Lane lane, bool* from_pool,
                 bool force_new = false, size_t requested_credits = 1);
   void Release(const std::string& node, Lane lane, Conn* c);
@@ -132,6 +133,7 @@ class RdmaTransport : public Transport {
   bool ProbeV2(const std::string& node) const;
   std::mutex mu_;
   std::unordered_map<std::string, std::vector<Conn*>> pool_;
+  std::unordered_map<std::string, std::vector<Conn*>> sg_pool_;
   // Separate idle-connection pool for control-lane ops
   // (Exist/Remove/Members). Responses stay bounded, including the explicit
   // 32-KiB Members capacity, and never share a QP with payload transfers.

@@ -350,6 +350,8 @@ RdmaTransport::~RdmaTransport() {
   std::lock_guard<std::mutex> lk(mu_);
   for (auto& [node, cs] : pool_)
     for (Conn* c : cs) Destroy(c);
+  for (auto& [node, cs] : sg_pool_)
+    for (Conn* c : cs) Destroy(c);
   for (auto& [node, cs] : control_pool_)
     for (Conn* c : cs) Destroy(c);
 }
@@ -427,7 +429,9 @@ RdmaTransport::Conn* RdmaTransport::Acquire(
     std::lock_guard<std::mutex> lk(mu_);
     pools = pools_;
     if (!force_new) {
-      auto& idle = lane == Lane::kData ? pool_ : control_pool_;
+      auto& idle = lane == Lane::kData
+                       ? pool_
+                       : (lane == Lane::kSgData ? sg_pool_ : control_pool_);
       auto it = idle.find(node);
       if (it != idle.end()) {
         auto& candidates = it->second;
@@ -472,7 +476,8 @@ RdmaTransport::Conn* RdmaTransport::Acquire(
   conn->lease = *lease;
   conn->lease_started_us = lease_started;
   conn->credit_held = true;
-  if (!conn->ep.Open(dev.c_str(), rdma::kV2ControlCap, depth_)) {
+  const size_t conn_depth = lane == Lane::kSgData ? 1 : depth_;
+  if (!conn->ep.Open(dev.c_str(), rdma::kV2ControlCap, conn_depth)) {
     ::close(fd);
     DFKV_LOG_WARN("rdma: device " + dev +
                   " Open failed; rail failure policy will quarantine it");
@@ -490,7 +495,7 @@ RdmaTransport::Conn* RdmaTransport::Acquire(
                        devbuf, rdma::kDevProtoV2);
   char mine[rdma::kQpInfoBytes], peer[rdma::kQpInfoBytes];
   rdma::QpInfo my = conn->ep.Local();
-  my.depth = static_cast<uint16_t>(std::min<size_t>(depth_, 256));
+  my.depth = static_cast<uint16_t>(std::min<size_t>(conn_depth, 256));
   my.protocol_version = rdma::kDevProtoV2;
   rdma::SerializeQpInfo(my, mine);
   if (!net::WriteAll(fd, devbuf, rdma::kDevNameBytes) ||
@@ -847,7 +852,9 @@ void RdmaTransport::Release(const std::string& node, Lane lane, Conn* c) {
   bool reusable = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
-    auto& idle = lane == Lane::kData ? pool_ : control_pool_;
+    auto& idle = lane == Lane::kData
+                     ? pool_
+                     : (lane == Lane::kSgData ? sg_pool_ : control_pool_);
     auto& v = idle[node];
     // A connection that was active during successful growth still owns the old
     // generation. Refresh it only after its WRs complete, before it becomes
@@ -1526,8 +1533,13 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
     for (size_t i = 0; i < count; ++i)
       if (bad[i]) result[i] = Status::kInvalid;
     bool from_pool = false;
-    Conn* conn = Acquire(node, Lane::kData, &from_pool, attempt > 0,
-                         std::min(valid_count, depth_));
+    // Multi-SGE GPU writes are fanned out across independent connections by
+    // KVClient. Keep each connection at one in-flight item: the B200 mlx5
+    // device-direct path reports protection/error WCs when one QP overlaps
+    // writes from distinct registered CUDA ranges. That reduced a 3,937-page
+    // backup to 34 successful writes at depth 4; depth 1 completed all pages.
+    // RDMA depth is not a throughput lever for this path.
+    Conn* conn = Acquire(node, Lane::kSgData, &from_pool, attempt > 0, 1);
     if (!conn) return result;
     rdma::RcEndpoint& ep = conn->ep;
     const size_t window = std::min(
