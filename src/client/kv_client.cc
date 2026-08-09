@@ -1410,51 +1410,72 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
 
   // Group by (node, total_cap): a group shares the Range length (= sum of caps)
   // so the existing RangeInto windowing/pipelining applies unchanged.
-  std::map<std::pair<std::string, size_t>, std::vector<size_t>> by;
-  for (size_t i = 0; i < N; ++i) {
-    if (over[i]) continue;
-    std::string node = Route(items[i].key);
-    if (node.empty()) continue;
-    by[{node, total_caps[i]}].push_back(i);
+  auto run_pass = [&](const std::vector<size_t>& todo) {
+    std::map<std::pair<std::string, size_t>, std::vector<size_t>> by;
+    for (size_t i : todo) {
+      if (over[i]) continue;
+      std::string node = Route(items[i].key);
+      if (node.empty()) continue;
+      by[{node, total_caps[i]}].push_back(i);
+    }
+    std::vector<std::pair<std::pair<std::string, size_t>,
+                          std::vector<size_t>>>
+        groups = ShardReadGroups(
+            std::vector<std::pair<std::pair<std::string, size_t>,
+                                  std::vector<size_t>>>(by.begin(), by.end()));
+    RunParallel(groups.size(), BatchWorkers(groups.size()), [&](size_t g) {
+      const std::string& node = groups[g].first.first;
+      uint64_t now = NowMs();
+      if (!health_.Healthy(node, now)) return;
+      const std::vector<size_t>& idx = groups[g].second;
+      std::vector<BlockKey> keys;
+      std::vector<RangeDstMulti> dsts;
+      keys.reserve(idx.size());
+      dsts.reserve(idx.size());
+      for (size_t k : idx) {
+        keys.push_back(ToBlockKey(key_namespace_, items[k].key));
+        RangeDstMulti d;
+        d.payloads.reserve(items[k].dsts.size());
+        for (size_t j = 0; j < items[k].dsts.size(); ++j)
+          d.payloads.emplace_back(items[k].dsts[j], items[k].caps[j]);
+        dsts.push_back(std::move(d));
+      }
+      std::vector<size_t> value_lens;
+      std::vector<Status> sts =
+          t_->RangeIntoMulti(node, keys, dsts, &value_lens);
+      bool resp = false, ioerr = false;
+      // kInvalid (oversize/per-item guard) is neither: it must not clear the
+      // peer cooldown (resp) nor trip MarkBad (ioerr).
+      for (Status s : sts) {
+        if (s == Status::kIOError) ioerr = true;
+        else if (s == Status::kOk || s == Status::kNotFound) resp = true;
+      }
+      if (resp) health_.MarkGood(node, NowMs());
+      else if (ioerr) health_.MarkBad(node, NowMs());
+      for (size_t m = 0; m < idx.size(); ++m) {
+        size_t cap = groups[g].first.second;
+        if (sts[m] != Status::kOk || m >= value_lens.size() ||
+            value_lens[m] > cap)
+          continue;
+        lens[idx[m]] = static_cast<size_t>(value_lens[m]);
+        hit[idx[m]] = 1;
+      }
+    });
+  };
+  std::vector<size_t> all(N);
+  for (size_t i = 0; i < N; ++i) all[i] = i;
+  run_pass(all);
+  // Match scalar BatchGet's bounded transient-miss recovery. Under concurrent
+  // RAM flush/reclaim or connection turnover a small subset can return absent
+  // for one pass even though the server serves it immediately on retry. Retry
+  // only a minority; a genuinely cold SG batch must remain a single probe.
+  for (int r = 0; r < get_miss_retries_; ++r) {
+    std::vector<size_t> missed;
+    for (size_t i = 0; i < N; ++i)
+      if (!over[i] && !hit[i]) missed.push_back(i);
+    if (missed.empty() || missed.size() > N / 2) break;
+    run_pass(missed);
   }
-  std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>> groups = ShardReadGroups(std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>>(by.begin(), by.end()));
-  RunParallel(groups.size(), BatchWorkers(groups.size()), [&](size_t g) {
-    const std::string& node = groups[g].first.first;
-    uint64_t now = NowMs();
-    if (!health_.Healthy(node, now)) return;
-    const std::vector<size_t>& idx = groups[g].second;
-    std::vector<BlockKey> keys;
-    std::vector<RangeDstMulti> dsts;
-    keys.reserve(idx.size());
-    dsts.reserve(idx.size());
-    for (size_t k : idx) {
-      keys.push_back(ToBlockKey(key_namespace_, items[k].key));
-      RangeDstMulti d;
-      d.payloads.reserve(items[k].dsts.size());
-      for (size_t j = 0; j < items[k].dsts.size(); ++j)
-        d.payloads.emplace_back(items[k].dsts[j], items[k].caps[j]);
-      dsts.push_back(std::move(d));
-    }
-    std::vector<size_t> value_lens;
-    std::vector<Status> sts =
-        t_->RangeIntoMulti(node, keys, dsts, &value_lens);
-    bool resp = false, ioerr = false;
-    // kInvalid (oversize/per-item guard) is neither: it must not clear the
-    // peer cooldown (resp) nor trip MarkBad (ioerr).
-    for (Status s : sts) {
-      if (s == Status::kIOError) ioerr = true;
-      else if (s == Status::kOk || s == Status::kNotFound) resp = true;
-    }
-    if (resp) health_.MarkGood(node, NowMs()); else if (ioerr) health_.MarkBad(node, NowMs());
-    for (size_t m = 0; m < idx.size(); ++m) {
-      size_t cap = groups[g].first.second;
-      if (sts[m] != Status::kOk || m >= value_lens.size() ||
-          value_lens[m] > cap)
-        continue;
-      lens[idx[m]] = static_cast<size_t>(value_lens[m]);
-      hit[idx[m]] = 1;
-    }
-  });
   if (out_lens) *out_lens = std::move(lens);
   return std::vector<bool>(hit.begin(), hit.end());
 }
