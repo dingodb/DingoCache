@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
 
 #include <string>
 #include <chrono>
@@ -26,6 +27,8 @@ class MetricsTransport final : public Transport {
   std::vector<Status> exist_script;
   size_t exist_calls = 0;
   size_t range_calls = 0;
+  size_t range_multi_calls = 0;
+  size_t range_multi_misses = 0;
 
   Status Cache(const std::string&, const BlockKey& key, const void* data,
                size_t len) override {
@@ -73,6 +76,21 @@ class MetricsTransport final : public Transport {
     return Status::kOk;
   }
   bool pipelined() const override { return pipeline; }
+  std::vector<Status> RangeIntoMulti(
+      const std::string& node, const std::vector<BlockKey>& keys,
+      const std::vector<RangeDstMulti>& dsts,
+      std::vector<size_t>* out_lens) override {
+    ++range_multi_calls;
+    std::vector<Status> result =
+        Transport::RangeIntoMulti(node, keys, dsts, out_lens);
+    for (size_t i = 0; i < result.size() && range_multi_misses > 0; ++i) {
+      if (result[i] != Status::kOk) continue;
+      result[i] = Status::kNotFound;
+      if (out_lens && i < out_lens->size()) (*out_lens)[i] = 0;
+      --range_multi_misses;
+    }
+    return result;
+  }
 };
 
 uint64_t Metric(const std::string& snapshot, const std::string& family,
@@ -308,4 +326,32 @@ TEST(ClientRetries, InvalidOrOutOfRangeValueUsesBoundedDefault) {
     EXPECT_EQ(client.BatchGet(gets), std::vector<bool>({true, false}));
     EXPECT_EQ(transport.range_calls, 3u) << invalid;
   }
+}
+
+TEST(ClientRetries, SgGetRetriesTransientMinorityMisses) {
+  MetricsTransport transport;
+  transport.pipeline = true;
+  const std::string key_namespace = "retry/sg";
+  KVClient client({{"n", "test:1"}}, key_namespace, &transport);
+  const std::string value = "abcdef";
+  ASSERT_TRUE(client.Put("retry", value.data(), value.size()));
+  ASSERT_TRUE(client.Put("stable", value.data(), value.size()));
+  transport.range_multi_misses = 1;
+  std::array<char, 3> retry_first{}, retry_second{};
+  std::array<char, 3> stable_first{}, stable_second{};
+  KvGetItemSg retry{"retry",
+                    {retry_first.data(), retry_second.data()},
+                    {retry_first.size(), retry_second.size()}};
+  KvGetItemSg stable{"stable",
+                     {stable_first.data(), stable_second.data()},
+                     {stable_first.size(), stable_second.size()}};
+  std::vector<size_t> lengths;
+  EXPECT_EQ(client.BatchGetAutoSg({retry, stable}, &lengths),
+            std::vector<bool>({true, true}));
+  EXPECT_EQ(lengths,
+            std::vector<size_t>({value.size(), value.size()}));
+  EXPECT_EQ(std::string(retry_first.data(), retry_first.size()) +
+                std::string(retry_second.data(), retry_second.size()),
+            value);
+  EXPECT_EQ(transport.range_multi_calls, 2u);
 }
