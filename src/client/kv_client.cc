@@ -989,21 +989,29 @@ std::vector<bool> KVClient::BatchExist(const std::vector<std::string>& keys) {
   std::vector<std::string> fetch_keys;
   std::vector<size_t> fetch_map, wait_list;
   std::vector<uint64_t> tokens(N, 0);
+  std::vector<char> roles(N, 0), values(N, 0);
   fetch_keys.reserve(N);
-  for (size_t i = 0; i < N; ++i) {
+  // Shared-memory rendezvous probes are independent per key. Long-context
+  // scheduler lookups contain thousands of keys; serial ClaimExist calls can
+  // cost more than the sharded RDMA ExistMany itself.
+  RunParallel(N, BatchWorkers(N), [&](size_t i) {
     bks[i] = ToBlockKey(key_namespace_, keys[i]);
-    bool val = false;
-    switch (dedup_->ClaimExist(bks[i], &val, &tokens[i])) {
-      case NodeDedup::Role::kHit:
-        res[i] = val;
-        break;
-      case NodeDedup::Role::kFetch:
-        fetch_map.push_back(i);
-        fetch_keys.push_back(keys[i]);
-        break;
-      case NodeDedup::Role::kWait:
-        wait_list.push_back(i);
-        break;
+    bool value = false;
+    const NodeDedup::Role role =
+        dedup_->ClaimExist(bks[i], &value, &tokens[i]);
+    roles[i] = role == NodeDedup::Role::kHit
+                   ? 1
+                   : (role == NodeDedup::Role::kFetch ? 2 : 3);
+    values[i] = value ? 1 : 0;
+  });
+  for (size_t i = 0; i < N; ++i) {
+    if (roles[i] == 1) {
+      res[i] = values[i] != 0;
+    } else if (roles[i] == 2) {
+      fetch_map.push_back(i);
+      fetch_keys.push_back(keys[i]);
+    } else {
+      wait_list.push_back(i);
     }
   }
   if (!fetch_keys.empty()) {
@@ -1048,16 +1056,19 @@ std::vector<bool> KVClient::BatchExistDirect(
     if (statuses) *statuses = std::move(raw);
     return std::vector<bool>(e.begin(), e.end());
   }
-  // RDMA: group by node so each node's keys pipeline kExist on a single pooled
-  // connection (one Acquire/node) instead of one round trip — and one connection
-  // bootstrap under contention — per key. Nodes still fan out in parallel.
+  // RDMA: shard each node's keys across pooled connections. ExistMany is
+  // served key-by-key on one QP; a single-node ring would otherwise serialize
+  // thousands of scheduler probes before any KV load can start. Keep original
+  // indices in every shard so result ordering is unchanged.
   std::map<std::string, std::vector<size_t>> by_node;
   for (size_t i = 0; i < N; ++i) {
     std::string node = Route(keys[i]);
     if (node.empty()) continue;
     by_node[node].push_back(i);
   }
-  std::vector<std::pair<std::string, std::vector<size_t>>> groups(by_node.begin(), by_node.end());
+  std::vector<std::pair<std::string, std::vector<size_t>>> groups =
+      ShardReadGroups(std::vector<std::pair<std::string, std::vector<size_t>>>(
+          by_node.begin(), by_node.end()));
   RunParallel(groups.size(), BatchWorkers(groups.size()), [&](size_t g) {
     const std::string& node = groups[g].first;
     uint64_t now = NowMs();
