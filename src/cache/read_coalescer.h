@@ -4,9 +4,7 @@
  * (same BlockKey, same range) within the same prefetch window; client-side
  * NodeDedup is per-process so eight copies of every read reach the node and,
  * because the disk path is O_DIRECT with no read cache, hit the NVMe eight
- * times (measured 1:1 disk:wire on replay workloads, E11B 2026-07-20). The
- * write path already absorbs this convoy via the RAM write-through arena; this
- * class is the read-side counterpart, and it registers BOTH read paths:
+ * times. This class collapses the read-side convoy and registers BOTH paths:
  *
  *  - Synchronous (TCP kRange, RangeInto, sync RangeDirect): Read() — the first
  *    arrival ("leader") does the disk read into a shared scratch buffer, every
@@ -15,7 +13,8 @@
  *  - Asynchronous (the io_uring serve path): TryRegisterAsync() creates the
  *    flight during preparation. Its token is hidden inside the move-only
  *    PreparedRead owner, whose Commit/destructor-abort calls CompleteAsync().
- *    A duplicate prep declines and joins through synchronous Read().
+ *    A duplicate prep waits for completion, then serves the published RAM slot
+ *    directly instead of copying the leader payload into connection staging.
  *
  * A follower waits at most WaitMs() (DFKV_READ_COALESCE_TIMEOUT_MS, default
  * 500 ms) and falls back to its OWN disk read on timeout or on a failed/
@@ -94,14 +93,22 @@ class ReadCoalescer {
     return map_.find(k) != map_.end();
   }
 
+  enum class PublishedWait {
+    kNotEligible,  // no matching direct-to-RAM flight; use normal join logic
+    kReady,        // leader completed successfully; re-check the RAM tier
+    kFallback,     // timeout/failure/self-recursion; issue an independent read
+  };
+
   // Register a flight for a read the CALLER will perform out-of-band (io_uring).
   // Returns a non-zero completion token, or 0 if an identical read is already in
   // flight — the caller then declines the async prep and joins via Read().
-  // `whole_value` records whether this read covers the entire stored value
-  // (offset 0, full length): only such reads are eligible for RAM promotion.
+  // `whole_value` records whether this read covers the entire stored value.
+  // `publishes_to_ram` is an immutable promise: successful completion publishes
+  // the bytes before waking no-copy followers.
   uint64_t TryRegisterAsync(const BlockKey& bk, uint64_t offset,
                             uint64_t length, bool whole_value,
-                            size_t value_len = 0) {
+                            size_t value_len = 0,
+                            bool publishes_to_ram = false) {
     Key k{bk.digest_hi, bk.digest_lo, bk.tenant_hash, offset, length};
     std::lock_guard<std::mutex> lk(mu_);
     if (map_.find(k) != map_.end()) return 0;
@@ -110,12 +117,13 @@ class ReadCoalescer {
     f->whole = whole_value;
     f->leader_tid = std::this_thread::get_id();
     f->value_len = value_len;
-    // A convoy whose ranks drift past the in-flight window never produces a
-    // waiter. A completed no-waiter whole read leaves a key fingerprint.
-    // that is what keeps the window seconds-cheap) for RecurMs(); finding it
-    // here means this same range is being read AGAIN within the window, which
-    // is promotion evidence just as strong as an overlap.
-    if (whole_value) {
+    f->publishes_to_ram = publishes_to_ram;
+    // A staged convoy whose ranks drift past the in-flight window never
+    // produces a waiter. A completed no-waiter whole read leaves a key
+    // fingerprint (not a payload; that is what keeps the window seconds-cheap)
+    // for RecurMs(). Direct-to-RAM flights are already resident on completion,
+    // so they neither consume nor create recurrence fingerprints.
+    if (whole_value && !publishes_to_ram) {
       auto it = recents_.find(k);
       if (it != recents_.end()) {
         if (std::chrono::steady_clock::now() <= it->second) {
@@ -131,16 +139,17 @@ class ReadCoalescer {
     return t;
   }
 
-  // Complete (or abort) an async flight. On st==kOk with data, any waiters are
-  // handed a copy of the payload; on any other status (or abort: data==nullptr)
-  // waiters fall back to their own disk reads. Returns true if at least one
-  // waiter had joined — the fan-in evidence the caller's RAM-promotion
-  // admission gate keys on — and fills *key / *whole from registration.
-  // A successful whole-value completion with NO waiter leaves a recurrence
-  // tombstone (key fingerprint, not payload) for RecurMs(): a second identical
-  // read inside that window is recurrence evidence, so ITS completion promotes
-  // even without an in-flight overlap (the drift-tolerant half of the gate;
-  // see TryRegisterAsync). Idempotent per token; unknown tokens return false.
+  // Complete (or abort) an async flight. On st==kOk with data, copy-based
+  // waiters are handed a copy of the payload; direct-publication waiters use
+  // the RAM slot committed before this call. On any other status (or abort:
+  // data==nullptr), waiters fall back to their own disk reads. Returns true if
+  // at least one waiter had joined and fills *key / *whole from registration.
+  // A successful staged whole-value completion with NO waiter leaves a
+  // recurrence tombstone (key fingerprint, not payload) for RecurMs(): a
+  // second identical read inside that window is recurrence evidence, so ITS
+  // completion promotes even without an in-flight overlap. Direct-publication
+  // completions skip the tombstone because the RAM resident is the recurrence
+  // mechanism.
   bool CompleteAsync(uint64_t token, Status st, const char* data, size_t len,
                      BlockKey* key = nullptr, bool* whole = nullptr,
                      bool* recurrent = nullptr) {
@@ -155,12 +164,10 @@ class ReadCoalescer {
       auto mit = map_.find(f->key);
       if (mit != map_.end() && mit->second == f) map_.erase(mit);
       waiters = f->waiters.load(std::memory_order_acquire) > 0;
-      // Lay the recurrence tombstone for a successful lone whole read: no
-      // waiter (nothing promoted this page) and not itself a recurrence hit
-      // (its completion promotes, RAM covers later arrivals). Fingerprints
-      // only — bounded by kRecurCap with amortized FIFO expiry.
-      if (RecurMs() > 0 && st == Status::kOk && f->whole && !waiters &&
-          !f->recurrent) {
+      // Lay the recurrence tombstone for a successful staged lone whole read:
+      // direct-to-RAM flights are already resident and do not need one.
+      if (RecurMs() > 0 && st == Status::kOk && f->whole &&
+          !f->publishes_to_ram && !waiters && !f->recurrent) {
         const auto dl = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(RecurMs());
         recents_[f->key] = dl;
@@ -176,7 +183,8 @@ class ReadCoalescer {
         }
       }
     }
-    if (waiters && st == Status::kOk && data && len) {
+    if (f->copy_waiters.load(std::memory_order_acquire) > 0 &&
+        st == Status::kOk && data && len) {
       f->data = AlignedAlloc(len);
       if (f->data) std::memcpy(f->data.get(), data, len);
     }
@@ -194,6 +202,38 @@ class ReadCoalescer {
     if (whole) *whole = f->whole;
     if (recurrent) *recurrent = f->recurrent;
     return waiters;
+  }
+
+  // Join only a flight whose leader has already committed to reading into a
+  // durable RAM reservation. kNotEligible preserves the ordinary synchronous
+  // copy-follower path. kFallback tells the caller not to wait a second time:
+  // issue an independent disk read after timeout, failure, or self-recursion.
+  PublishedWait WaitForPublished(const BlockKey& bk, uint64_t offset,
+                                 uint64_t length) {
+    Key k{bk.digest_hi, bk.digest_lo, bk.tenant_hash, offset, length};
+    std::shared_ptr<Flight> f;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      auto it = map_.find(k);
+      if (it == map_.end() || !it->second->publishes_to_ram)
+        return PublishedWait::kNotEligible;
+      if (it->second->leader_tid == std::this_thread::get_id())
+        return PublishedWait::kFallback;
+      f = it->second;
+      f->waiters.fetch_add(1, std::memory_order_acq_rel);
+    }
+    std::unique_lock<std::mutex> fl(f->m);
+    if (!f->cv.wait_for(fl, std::chrono::milliseconds(WaitMs()),
+                        [&] { return f->done; })) {
+      timeouts_.fetch_add(1, std::memory_order_relaxed);
+      return PublishedWait::kFallback;
+    }
+    return f->st == Status::kOk ? PublishedWait::kReady
+                                : PublishedWait::kFallback;
+  }
+
+  void RecordCoalesced() {
+    coalesced_.fetch_add(1, std::memory_order_relaxed);
   }
 
   // Leader/follower outcome of a Read() call, for the caller's promotion gate
@@ -272,6 +312,7 @@ class ReadCoalescer {
     // Follower: wait (bounded) for the leader, then copy from the shared
     // buffer; on timeout / failure / abort, fall back to our own read.
     f->waiters.fetch_add(1, std::memory_order_acq_rel);
+    f->copy_waiters.fetch_add(1, std::memory_order_acq_rel);
     {
       std::unique_lock<std::mutex> fl(f->m);
       if (!f->cv.wait_for(fl, std::chrono::milliseconds(WaitMs()),
@@ -309,8 +350,10 @@ class ReadCoalescer {
     Key key{};
     bool whole = false;
     bool recurrent = false;  // registered while a recurrence tombstone was live
+    bool publishes_to_ram = false;
     std::thread::id leader_tid;
     std::atomic<int> waiters{0};
+    std::atomic<int> copy_waiters{0};
   };
 
   static std::shared_ptr<char> AlignedAlloc(size_t n) {

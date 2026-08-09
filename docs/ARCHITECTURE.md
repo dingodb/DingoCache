@@ -29,10 +29,10 @@ env/config reference see [CONNECTORS.md](CONNECTORS.md).
    ┌──────────────────────┐        ┌──────────────────────────────────────┐
    │ dfkv_mds (+ etcd)    │        │  dfkv_server (cache node)             │
    │ membership directory │        │  ┌────────────────────────────────┐  │
-   └──────────────────────┘        │  │ RamTier (opt) — write-through   │  │
-                                    │  │  RAM arena, RDMA zero-copy GET  │  │
+   └──────────────────────┘        │  │ RamTier (opt) — registered RAM  │  │
+                                    │  │ promotion + zero-copy RDMA GET  │  │
                                     │  └───────────────┬────────────────┘  │
-                                    │      miss ▼      │ async flush        │
+                                    │      miss ▼      │ flush (write-back) │
                                     │  ┌──────────────────────────────────┐│
                                     │  │ DiskCacheGroup — Ketama over N    ││
                                     │  │  disks, each a StoreEngine:       ││
@@ -310,22 +310,26 @@ The RAM tier fronts the disk with a pre-registered RAM arena so a PD-warm GET is
 served straight from RAM over RDMA — no open, no pread, no disk. Enabled with
 `DFKV_RAM_TIER=1` (`DFKV_RAM_TIER_BYTES` sizes the arena; default off).
 
-**Write-through with durable acknowledgement**: admission copies the value into
-a RAM slot and makes it visible to concurrent reads, then enqueues its disk
-flush. The server PUT waits for that flush result before returning `kOk`.
-Overlapping same-key callers share the leader's exact success/failure.
+**PUT policy with durable acknowledgement**: `writeback` (default) admits into
+a visible RAM slot and enqueues a disk flush; `writearound` writes straight to
+disk and populates RAM on a later whole-value GET. In either mode the server
+does not return PUT `kOk` before disk durability. Overlapping same-key
+write-back callers share the leader's exact success/failure.
 
 **State machine = allocator pin refcount.** The slot lifecycle maps directly onto
 the allocator's pin count — this is why the allocator was built media-agnostic:
 
 | state | pin holders | evictable? |
 |-------|-------------|------------|
+| RESERVED (cold-read I/O) | reservation pin | no |
 | RAM_ONLY (flush pending) | flush-pin | no |
 | in-flight (RDMA transfer reading arena) | transfer-pin | no |
 | DURABLE & idle | none (refcount 0) | **yes** |
 
-- **flush-pin** — taken on admission, released when the flush reaches disk or is
-  canceled.
+- **reservation pin** — hides a cold-read slot until disk completion commits it
+  as durable; on success the same pin becomes the first transfer-pin.
+- **flush-pin** — taken on write-back admission, released when the flush reaches
+  disk or is canceled.
 - **transfer-pin** — taken on `GetPrep`, released only after the completion that
   fences the payload transfer (`IBV_WC_SEND`). REMOVE hides the entry
   immediately but defers physical reuse until this final pin releases.
@@ -337,6 +341,18 @@ then sends the small status response. Its signaled SEND completion fences the
 preceding WRITEs and releases the transfer-pin. Connection teardown releases
 any outstanding pins, so a dead QP cannot leak an allocator pin. With RAM tier
 off none of this path is wired.
+
+**Direct cold-read promotion**: on a whole-value io_uring miss, the server
+reserves the final arena slot before submitting disk I/O. O_DIRECT reads into
+that registered slot, completion publishes it as born-durable, and the same pin
+holds it through the first RDMA SEND. The request therefore performs no
+staging-to-arena `memcpy` and no promotion flush. An identical in-flight
+follower waits only for publication, takes its own transfer-pin, and sends from
+the same slot instead of copying the leader payload into connection staging.
+Partial reads, values larger than an arena extent, allocation pressure,
+timeouts, failures, and same-thread pipelined duplicates retain the bounded
+independent/staging fallback. Identity-checked slot handles and serialized key
+lifecycles prevent a stale reservation or SEND from pinning a replacement slot.
 
 Values no larger than one RAM extent live inside that registered arena and keep
 the zero-copy path. Larger accepted values use a dedicated aligned allocation
@@ -350,12 +366,14 @@ two extents. `DFKV_RAM_TIER_LARGE_RESERVE_BYTES=0` gives all bytes to the arena;
 set an explicit reserve when values larger than an extent are expected.
 
 **Backpressure, durability, and removal**: if the arena fills with
-non-evictable slots, admission declines and the caller takes one synchronous
-disk path. A queued REMOVE cancels the queue item; an active flush is fenced and
-then compensated on disk, so no later worker can resurrect the key. Exhausting
-flush retries is terminal RAM/store health and removes readiness. Only a
-DURABLE slot may be capacity-evicted. Requested arena allocation or an
-unsupported NUMA mode rejects startup instead of silently running disk-only.
+non-evictable slots, PUT admission declines and the caller takes one synchronous
+disk path; a cold GET declines its direct reservation and retains the bounded
+staging path. A queued REMOVE cancels the queue item; an active flush or hidden
+cold-read reservation is fenced before slot reuse, so no later completion can
+resurrect the key. Exhausting flush retries is terminal RAM/store health and
+removes readiness. Only a DURABLE idle slot may be capacity-evicted. Requested
+arena allocation or an unsupported NUMA mode rejects startup instead of
+silently running disk-only.
 
 Observability: `dfkv_ram_hit/miss/put/put_bypass/flushed/flush_dropped/
 evictions_total`, `dfkv_ram_healthy`, actual `dfkv_ram_flush_threads`,
@@ -373,11 +391,13 @@ data plane or the connection fails.
 | Feature | Enable with | Default | Notes |
 |---------|-------------|---------|-------|
 | disk storage engine | `--store-engine=slab|file` / `DFKV_STORE_ENGINE` | `slab` (all server/store construction paths) | option > env > default; v3 slab needs a clean cache directory; invalid capacity, format, or geometry fails closed without a file fallback |
-| RAM hot tier | `DFKV_RAM_TIER=1` (+ `DFKV_RAM_TIER_BYTES`) | off | durable-acknowledged write-through + RDMA zero-copy GET; requested allocation failure rejects startup |
+| RAM hot tier | `DFKV_RAM_TIER=1` (+ `DFKV_RAM_TIER_BYTES`) | off | durable-acknowledged write-back/write-around + direct cold-read promotion + RDMA zero-copy GET; requested allocation failure rejects startup |
+| RAM PUT policy | `--ram-write-mode=writeback|writearound` / `DFKV_RAM_WRITE_MODE` | `writeback` | write-back absorbs PUT bursts; write-around avoids the PUT arena copy and relies on direct GET promotion |
 | RAM NUMA policy | `--ram-tier-numa=interleave|off` / `DFKV_RAM_TIER_NUMA` | `interleave` | numeric node IDs are not accepted |
 | RAM flush workers | `--ram-flush-threads` / `DFKV_RAM_FLUSH_THREADS` | 4× disk count, cap 16 | actual count is at least shard count and is reported after adjustment |
 | RAM dedicated-value reserve | `DFKV_RAM_TIER_LARGE_RESERVE_BYTES` | two extents | partitions the hard total budget; `0` disables oversized residency |
 | RAM tier lock shards | `--ram-tier-shards` / `DFKV_RAM_TIER_SHARDS` | 8 | 1-64; auto-halved while a shard would hold <32 extents |
+| read convoy/direct promotion | `DFKV_READ_COALESCE=1` | off | collapses identical reads; with RAM + io_uring, whole-value disk misses read directly into a hidden registered arena reservation |
 | RDMA transport | build `-DDFKV_WITH_RDMA=ON`, `DFKV_RDMA=1` | TCP | active-HCA discovery; `DFKV_RDMA_DEV` is an optional whitelist |
 | RDMA v2 | `DFKV_RDMA=1` | TCP when RDMA was not requested | bounded 32,786-byte control buffers (32-KiB Members data) + mandatory shared registered receive segment |
 | io_uring async GET | build `-DDFKV_WITH_URING`; `DFKV_SERVER_URING=0` disables | on when built, unavailable otherwise | RDMA v2 disk-read path |

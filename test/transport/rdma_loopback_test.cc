@@ -247,10 +247,10 @@ TEST(RdmaLoopback, ExistManyWindowedMixedHitMiss) {
   }
 }
 
-// Client BatchExist over RDMA must pipeline on the per-node pooled connection
-// instead of fanning out one round trip per key. Guards the perf fix: after a
-// warm-up that pools a connection, a large BatchExist opens no new connections.
-TEST(RdmaLoopback, BatchExistReusesPooledConn) {
+// Client BatchExist over RDMA may expand one node's pool for parallel probe
+// shards, but repeated calls must reuse that bounded pool instead of opening a
+// fresh connection per key.
+TEST(RdmaLoopback, BatchExistReusesExpandedPool) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   RdmaNode node("bex");
   RdmaTransport rt(kMaxMsg);
@@ -267,20 +267,29 @@ TEST(RdmaLoopback, BatchExistReusesPooledConn) {
     probe.push_back("e" + std::to_string(i) + "_x"); // absent
   }
 
-  // Warm the pool so exactly one connection is parked for the node.
+  // Warm one connection, then let the first large batch expand the bounded
+  // per-node pool according to the host's available fan-out.
   EXPECT_TRUE(c.Exist("e0"));
-  long before = CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
+  const long before =
+      CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
   ASSERT_GE(before, 1);
 
   auto er = c.BatchExist(probe);
   ASSERT_EQ(er.size(), probe.size());
   for (size_t i = 0; i < probe.size(); ++i)
     EXPECT_EQ((bool)er[i], (i % 2 == 0)) << probe[i];
+  const long expanded =
+      CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
+  EXPECT_LE(expanded - before, 15);  // default max 16, one already warm
 
-  long after = CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
-  EXPECT_LE(after - before, 1)
-      << "BatchExist opened " << (after - before)
-      << " new conns; pipelined path should reuse the pooled connection";
+  auto again = c.BatchExist(probe);
+  ASSERT_EQ(again.size(), probe.size());
+  for (size_t i = 0; i < probe.size(); ++i)
+    EXPECT_EQ((bool)again[i], (i % 2 == 0)) << probe[i];
+  const long reused =
+      CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
+  EXPECT_EQ(reused, expanded)
+      << "repeated BatchExist did not reuse its expanded connection pool";
 }
 
 // Non-SG batch PUT: one oversized item must fail ONLY itself, not poison the
@@ -1352,8 +1361,13 @@ struct RamRdmaNode {
   std::unique_ptr<RdmaServer> rsrv;
   std::string addr;
 
-  explicit RamRdmaNode(const std::string& tag, size_t max_msg = kMaxMsg) {
+  explicit RamRdmaNode(const std::string& tag, size_t max_msg = kMaxMsg,
+                       bool writearound = false) {
     ConfigureTestRecvSegment();
+    if (writearound)
+      ::setenv("DFKV_RAM_WRITE_MODE", "writearound", 1);
+    else
+      ::unsetenv("DFKV_RAM_WRITE_MODE");
     ::setenv("DFKV_RAM_TIER", "1", 1);
     ::setenv("DFKV_RAM_TIER_BYTES", "8388608", 1);  // 8 MiB arena
     dir = fs::temp_directory_path() / ("dfkv_ramrdma_" + tag);
@@ -1399,6 +1413,7 @@ struct RamRdmaNode {
     srv.reset();
     ::unsetenv("DFKV_RAM_TIER");
     ::unsetenv("DFKV_RAM_TIER_BYTES");
+    ::unsetenv("DFKV_RAM_WRITE_MODE");
     fs::remove_all(dir);
   }
 };
@@ -1433,6 +1448,45 @@ TEST(RdmaLoopback, RamTierZeroCopyServe) {
   std::string out2(vals[0].size(), '\0');
   ASSERT_TRUE(c.Get("z0", &out2[0], out2.size()));
   EXPECT_EQ(out2, vals[0]);
+}
+
+TEST(RdmaLoopback, ColdGetPromotesDirectlyIntoRegisteredRamArena) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device (load rdma_rxe for Soft-RoCE)";
+  ::setenv("DFKV_READ_COALESCE", "1", 1);
+  ::setenv("DFKV_SERVER_URING", "1", 1);
+  {
+    RamRdmaNode node("cold-direct-promotion", kMaxMsg,
+                     /*writearound=*/true);
+    ASSERT_TRUE(node.srv->ram_enabled());
+    RdmaTransport rt(kMaxMsg);
+    KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+
+    std::string value(256 * 1024, '\0');
+    for (size_t i = 0; i < value.size(); ++i)
+      value[i] = static_cast<char>('a' + (i % 19));
+    ASSERT_TRUE(c.Put("cold-direct", value.data(), value.size()));
+    EXPECT_EQ(CounterVal(node.srv->MetricsText(), "dfkv_ram_objects"), 0);
+
+    std::string first(value.size(), '\0');
+    ASSERT_TRUE(c.Get("cold-direct", first.data(), first.size()));
+    EXPECT_EQ(first, value);
+    const std::string after_cold = node.srv->MetricsText();
+    EXPECT_EQ(CounterVal(after_cold, "dfkv_ram_promoted_total"), 1);
+    EXPECT_EQ(CounterVal(after_cold, "dfkv_ram_objects"), 1);
+#ifdef DFKV_WITH_URING
+    EXPECT_GT(node.rsrv->UringReads(), 0u);
+#endif
+
+    const long hits_before =
+        CounterVal(after_cold, "dfkv_ram_hit_total");
+    std::string warm(value.size(), '\0');
+    ASSERT_TRUE(c.Get("cold-direct", warm.data(), warm.size()));
+    EXPECT_EQ(warm, value);
+    EXPECT_GT(CounterVal(node.srv->MetricsText(), "dfkv_ram_hit_total"),
+              hits_before);
+  }
+  ::unsetenv("DFKV_READ_COALESCE");
+  ::unsetenv("DFKV_SERVER_URING");
 }
 
 // DCP2 declared caps: a client that tightens its max block size gets smaller

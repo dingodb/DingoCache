@@ -324,7 +324,7 @@ std::string KvNodeServer::MetricsText() const {
          "Coalesce waiters that timed out and fell back to their own read",
          read_coalescer_.timeouts());
   metric("dfkv_read_coalesce_recur_total", "counter",
-         "Reads that hit a recurrence tombstone (drift-window promotion evidence)",
+         "Staged reads that hit a recurrence tombstone (drift diagnostic)",
          read_coalescer_.recur_hits());
   metric("dfkv_accepts_total", "counter", "TCP connections accepted", AcceptCount());
   metric("dfkv_evictions_total", "counter", "Objects evicted (capacity pressure)",
@@ -1020,28 +1020,53 @@ PreparedRead KvNodeServer::PrepareReadForKey(
   // keep their send pin until SEND completion; dedicated allocations copy into
   // the registered staging buffer but retain the pin until the same terminal
   // action, so every exit follows one ownership protocol.
-  if (ram_) {
+  auto prepare_ram_hit = [&]() -> PreparedRead {
+    if (!ram_) return PreparedRead::Result(Status::kInvalid);
     RamTier::Hit hit;
-    if (ram_->GetPrep(key, offset, length, &hit)) {
-      const uint64_t token = hit.TransferToken();
-      PreparedRead read = PreparedRead::Ready(
-          hit.in_arena ? hit.ptr : staging, hit.len, hit.value_len,
-          hit.in_arena, staging, staging_cap, this, token, &FinishRamRead);
-      if (hit.len > staging_cap || (hit.len != 0 && hit.ptr == nullptr)) {
-        read.Abort();
-        return PreparedRead::Result(Status::kInvalid);
+    if (!ram_->GetPrep(key, offset, length, &hit))
+      return PreparedRead::Result(Status::kInvalid);
+    const uint64_t token = hit.TransferToken();
+    PreparedRead read = PreparedRead::Ready(
+        hit.in_arena ? hit.ptr : staging, hit.len, hit.value_len,
+        hit.in_arena, staging, staging_cap, this, token, &FinishRamRead);
+    if (hit.len > staging_cap || (hit.len != 0 && hit.ptr == nullptr)) {
+      read.Abort();
+      return PreparedRead::Result(Status::kInvalid);
+    }
+    if (!hit.in_arena && hit.len != 0)
+      std::memcpy(staging, hit.ptr, hit.len);
+    cache_hit_.fetch_add(1, std::memory_order_relaxed);
+    bytes_read_.fetch_add(hit.len, std::memory_order_relaxed);
+    return read;
+  };
+
+  PreparedRead resident = prepare_ram_hit();
+  if (resident.status() == Status::kOk) return resident;
+
+  // A direct-to-RAM leader publishes before waking its no-copy followers.
+  // A successful follower acquires its own send pin; timeout, failure, or a
+  // same-thread duplicate must issue an independent read instead of waiting a
+  // second time in the synchronous coalescer fallback.
+  bool force_independent_read = false;
+  if (ram_ && coalesce_enabled_) {
+    const ReadCoalescer::PublishedWait waited =
+        read_coalescer_.WaitForPublished(key, offset, length);
+    if (waited != ReadCoalescer::PublishedWait::kNotEligible) {
+      if (waited == ReadCoalescer::PublishedWait::kReady) {
+        resident = prepare_ram_hit();
+        if (resident.status() == Status::kOk) {
+          read_coalescer_.RecordCoalesced();
+          return resident;
+        }
       }
-      if (!hit.in_arena && hit.len != 0)
-        std::memcpy(staging, hit.ptr, hit.len);
-      cache_hit_.fetch_add(1, std::memory_order_relaxed);
-      bytes_read_.fetch_add(hit.len, std::memory_order_relaxed);
-      return read;
+      force_independent_read = true;
     }
   }
 
-  // An existing identical flight must be joined by the synchronous coalescer
-  // path; declining here avoids opening a descriptor that would be discarded.
-  if (coalesce_enabled_ && read_coalescer_.InFlight(key, offset, length))
+  // A normal async leader is joined by the synchronous copy-follower path.
+  // Direct-flight timeout/failure/self-recursion bypasses that second wait.
+  if (!force_independent_read && coalesce_enabled_ &&
+      read_coalescer_.InFlight(key, offset, length))
     return PreparedRead::Result(Status::kInvalid);
 
   ReadLease lease;
@@ -1054,19 +1079,49 @@ PreparedRead KvNodeServer::PrepareReadForKey(
   }
   if (st != Status::kOk) return PreparedRead::Result(st);
 
+  const bool whole = offset == 0 && lease.value_len != 0 &&
+                     lease.payload_len == lease.value_len;
+
+  // Reserve before publishing the async flight: followers may skip their
+  // payload copy only when the flight is born with an immutable promise that
+  // successful completion will publish a durable RAM entry before wakeup.
+  RamTier::DurableReservation reservation;
+  bool direct_reservation = false;
+  if (ram_ && whole && lease.head == 0 &&
+      ram_->ReserveDurable(key, lease.value_len, &reservation)) {
+    direct_reservation = lease.aligned_len <= reservation.capacity();
+    if (!direct_reservation)
+      reservation = RamTier::DurableReservation{};
+  }
+
   uint64_t flight = 0;
-  if (coalesce_enabled_ && lease.fd() >= 0 && lease.payload_len != 0 &&
-      lease.aligned_len <= staging_cap &&
+  if (!force_independent_read && coalesce_enabled_ && lease.fd() >= 0 &&
+      lease.payload_len != 0 && lease.aligned_len <= staging_cap &&
       lease.aligned_len <= std::numeric_limits<unsigned>::max()) {
-    const bool whole = offset == 0 && lease.value_len != 0 &&
-                       lease.payload_len == lease.value_len;
     flight = read_coalescer_.TryRegisterAsync(
-        key, offset, length, whole, lease.value_len);
+        key, offset, length, whole, lease.value_len, direct_reservation);
     if (flight == 0) {
-      // The lease remains local and releases its descriptor/pin on return.
+      // The lease and any hidden reservation release on return.
       return PreparedRead::Result(Status::kInvalid);
     }
   }
+
+  // Whole-value misses can read O_DIRECT straight into their final registered
+  // RAM slot. The reservation stays hidden and pinned across disk IO and RDMA
+  // SEND; completion publishes the durable entry, then SEND completion drops
+  // the final pin. Partial, oversized, and arena-pressure reads retain staging.
+  if (direct_reservation) {
+    auto promoted = std::make_shared<PromotedRead>();
+    promoted->server = this;
+    promoted->reservation = std::move(reservation);
+    char* destination = promoted->reservation.data();
+    const size_t destination_cap = promoted->reservation.capacity();
+    return PreparedRead::Storage(
+        std::move(lease), destination, destination_cap, promoted.get(),
+        flight, &FinishPromotedDiskRead,
+        /*source_registered=*/true, staging, staging_cap, promoted);
+  }
+
   return PreparedRead::Storage(std::move(lease), staging, staging_cap, this,
                                flight, &FinishDiskRead);
 }
@@ -1099,6 +1154,37 @@ void KvNodeServer::FinishDiskRead(
     if (ok && whole && server->ram_ && data && bytes_read) {
       server->ram_->PutDurable(key, data, bytes_read);
     }
+  }
+  if (server->lat_sampler_.ShouldSample())
+    server->get_lat_.Observe(elapsed_sec);
+}
+
+void KvNodeServer::FinishPromotedDiskRead(
+    void* owner, uint64_t flight, bool committed, Status result,
+    size_t bytes_read, double elapsed_sec, const char* data) noexcept {
+  PromotedRead* promoted = static_cast<PromotedRead*>(owner);
+  KvNodeServer* server = promoted == nullptr ? nullptr : promoted->server;
+  if (server == nullptr) return;
+  if (!committed) {
+    if (flight)
+      server->read_coalescer_.CompleteAsync(flight, Status::kIOError, nullptr,
+                                            0);
+    return;
+  }
+
+  const bool ok = result == Status::kOk;
+  if (ok) {
+    // Commit keeps the reservation's allocator pin as a send pin. The
+    // PreparedRead post-read hold releases it only after SEND completion.
+    (void)promoted->reservation.Commit();
+    server->cache_hit_.fetch_add(1, std::memory_order_relaxed);
+    server->bytes_read_.fetch_add(bytes_read, std::memory_order_relaxed);
+  } else {
+    server->get_io_err_.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (flight) {
+    (void)server->read_coalescer_.CompleteAsync(
+        flight, ok ? Status::kOk : Status::kIOError, data, bytes_read);
   }
   if (server->lat_sampler_.ShouldSample())
     server->get_lat_.Observe(elapsed_sec);

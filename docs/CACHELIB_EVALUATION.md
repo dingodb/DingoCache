@@ -38,7 +38,7 @@ The dfkv side was evaluated from these current source contracts:
   direct I/O, async read preparation, commit ordering, rebuild, and the
   clean/dirty run epoch.
 - `src/cache/ram_tier.{h,cc}`: one bounded aligned arena, durable-acknowledged
-  write-through, flush and transfer pins, and the arena MR hand-off.
+  write-back/direct read-promotion, lifecycle pins, and the arena MR hand-off.
 - `src/cache/disk_cache_group.{h,cc}`: per-disk routing and exact per-node tenant
   quota admission/accounting.
 - `src/cache/rdma_server.{h,cc}` and `src/transport/rdma_recv_segment.*`:
@@ -130,9 +130,9 @@ The published HybridCache object lifecycle is the blocking mismatch:
 2. it spills to NVM when evicted from DRAM;
 3. an NVM hit is promoted back into DRAM before application access.
 
-That is not dfkv's optional RAM write-through tier over an authoritative disk
+That is not dfkv's optional registered RAM tier over an authoritative disk
 cache. A normal CacheLib insert can succeed while the object is only in DRAM,
-whereas dfkv does not return PUT `kOk` until the disk flush result is known.
+whereas dfkv does not return PUT `kOk` until the disk result is known.
 Likewise, the documented HybridCache read API returns a ready/not-ready handle
 to a DRAM item; it does not implement `RangeDirectPrep` over a resident extent
 into dfkv's caller-provided registered I/O buffer. Partial range reads, exact

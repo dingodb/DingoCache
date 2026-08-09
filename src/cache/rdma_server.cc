@@ -715,20 +715,30 @@ void RdmaServer::Serve(int boot_fd) {
                 ::pread(prepared.fd(), prepared.staging(),
                         prepared.aligned_len(),
                         static_cast<off_t>(prepared.aligned_off()));
-            const bool ok =
+            bool ok =
                 got >= 0 &&
                 static_cast<size_t>(got) >=
                     prepared.head() + prepared.payload_len();
-            const char* data = prepared.data();
             const size_t payload_len = prepared.payload_len();
             const size_t value_len = prepared.value_len();
+            ibv_mr* source_mr = direct_mr(request.data_slot);
+            bool source_uses_slot = true;
+            if (ok && prepared.source_registered() && payload_len != 0) {
+              source_mr = ep.RegisterUser(
+                  const_cast<char*>(prepared.data()), payload_len);
+              if (!source_mr && prepared.Stage())
+                source_mr = direct_mr(request.data_slot);
+              if (!source_mr) ok = false;
+              source_uses_slot = !prepared.source_registered();
+            }
+            const char* data = prepared.data();
             prepared.Commit(ok ? Status::kOk : Status::kIOError,
                             ok ? payload_len : 0,
                             NowSteadySec() - submit_sec);
             return data_reply(ok ? Status::kOk : Status::kIOError,
                               ok ? data : nullptr, payload_len, value_len,
-                              direct_mr(request.data_slot),
-                              /*source_uses_slot=*/true, PreparedRead{});
+                              source_mr, source_uses_slot,
+                              std::move(prepared));
           }
           const size_t payload_len = prepared.payload_len();
           ibv_mr* source_mr = direct_mr(request.data_slot);
@@ -1097,11 +1107,22 @@ void RdmaServer::Serve(int boot_fd) {
                  static_cast<size_t>(got) >=
                      qd.read.head() + qd.read.payload_len();
           }
-          // Terminal completion runs before the reply send so coalesced waiters
-          // and RAM promotion can copy from the still-owned staging bytes.
-          const char* out_data = qd.read.data();
+          // Resolve the send source while the read owner is still active:
+          // direct-to-arena reads use the registered RAM MR, with a staging
+          // copy only if that MR cannot be resolved on this connection.
           const size_t payload_len = qd.read.payload_len();
           const size_t value_len = qd.read.value_len();
+          ibv_mr* source_mr = direct_mr(qd.data_slot);
+          bool source_uses_slot = true;
+          if (ok && qd.read.source_registered() && payload_len != 0) {
+            source_mr = ep.RegisterUser(
+                const_cast<char*>(qd.read.data()), payload_len);
+            if (!source_mr && qd.read.Stage())
+              source_mr = direct_mr(qd.data_slot);
+            if (!source_mr) ok = false;
+            source_uses_slot = !qd.read.source_registered();
+          }
+          const char* out_data = qd.read.data();
           qd.read.Commit(ok ? Status::kOk : Status::kIOError,
                          ok ? payload_len : 0,
                          NowSteadySec() - qd.submit_sec);
@@ -1132,11 +1153,17 @@ void RdmaServer::Serve(int boot_fd) {
             reply.remote_write = true;
             reply.payload = out_data;
             reply.payload_len = payload_len;
-            reply.payload_mr = direct_mr(qd.data_slot);
+            reply.payload_mr = source_mr;
             reply.targets = qd.get.targets;
-            reply.defer_recv_rearm = true;
+            reply.defer_recv_rearm = source_uses_slot;
             reply.recv_slot = qd.recv_slot;
-            rearm_on_send[qd.send_slot] = qd.recv_slot;
+            if (source_uses_slot) {
+              rearm_on_send[qd.send_slot] = qd.recv_slot;
+            } else if (!post_request_recv(qd.recv_slot)) {
+              fail = true;
+              break;
+            }
+            complete_on_send[qd.send_slot] = std::move(qd.read);
           } else if (!post_request_recv(qd.recv_slot)) {
             fail = true;
             break;

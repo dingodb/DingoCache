@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <condition_variable>
 #include <mutex>
 #include <set>
@@ -82,6 +83,34 @@ TEST(RamTier, ReadAfterWriteBeforeFlush) {
   EXPECT_EQ(rt.Hits(), 1u);
   h = RamTier::Hit{};
   sink.open();
+}
+
+TEST(RamTier, TenantIdentityIsPartOfResidentKey) {
+  FlushSink sink;
+  RamTier rt(Opts(64 * 4096), sink.fn());
+  const BlockKey first{7, 11, 101};
+  const BlockKey second{7, 11, 202};
+  const std::string first_value = "tenant-a";
+  const std::string second_value = "tenant-b";
+
+  ASSERT_TRUE(
+      rt.PutDurable(first, first_value.data(), first_value.size()));
+  ASSERT_TRUE(
+      rt.PutDurable(second, second_value.data(), second_value.size()));
+
+  RamTier::Hit hit;
+  ASSERT_TRUE(rt.GetPrep(first, 0, 0, &hit));
+  EXPECT_EQ(std::string(hit.ptr, hit.len), first_value);
+  hit = RamTier::Hit{};
+  ASSERT_TRUE(rt.GetPrep(second, 0, 0, &hit));
+  EXPECT_EQ(std::string(hit.ptr, hit.len), second_value);
+  hit = RamTier::Hit{};
+
+  EXPECT_TRUE(rt.Remove(first));
+  EXPECT_FALSE(rt.Contains(first));
+  EXPECT_TRUE(rt.Contains(second));
+  ASSERT_TRUE(rt.GetPrep(second, 0, 0, &hit));
+  EXPECT_EQ(std::string(hit.ptr, hit.len), second_value);
 }
 
 TEST(RamTier, FlushMakesDurable) {
@@ -187,6 +216,25 @@ TEST(RamTier, SendPinBlocksEvictionUntilRelease) {
   EXPECT_FALSE(rt.Contains(K(11)));
   EXPECT_GE(rt.Evictions(), 1u);
   h = RamTier::Hit{};
+}
+
+TEST(RamTier, SendPinTokenSurvivesResidentIndexRehash) {
+  FlushSink sink;
+  RamTier rt(Opts(32ull << 20), sink.fn());
+  const std::string value(4096, 'r');
+  const BlockKey pinned = K(1'000'000);
+  ASSERT_TRUE(rt.PutDurable(pinned, value.data(), value.size()));
+
+  RamTier::Hit hit;
+  ASSERT_TRUE(rt.GetPrep(pinned, 0, value.size(), &hit));
+  ASSERT_EQ(std::string(hit.ptr, hit.len), value);
+  for (uint64_t id = 1; id <= 4096; ++id)
+    ASSERT_TRUE(rt.PutDurable(K(id), value.data(), value.size()));
+
+  EXPECT_TRUE(rt.Contains(pinned));
+  hit = RamTier::Hit{};
+  EXPECT_TRUE(rt.Remove(pinned));
+  EXPECT_FALSE(rt.Contains(pinned));
 }
 
 TEST(RamTier, BackpressureBypassWhenFlushStalls) {
@@ -799,6 +847,60 @@ TEST(RamTier, PutDurableNoFlushIOAndImmediatelyEvictable) {
   // No flush-pin held: Remove (which declines on any pin) succeeds at once.
   EXPECT_TRUE(rt.Remove(K(90)));
   EXPECT_FALSE(rt.Contains(K(90)));
+}
+
+TEST(RamTier, DirectDurableReservationPublishesAndPinsUntilRelease) {
+  FlushSink sink;
+  sink.close();
+  RamTier rt(Opts(64 * 4096), sink.fn());
+  ASSERT_TRUE(rt.ok());
+  const std::string value(8192, 'r');
+
+  RamTier::DurableReservation reservation;
+  ASSERT_TRUE(rt.ReserveDurable(K(190), value.size(), &reservation));
+  ASSERT_TRUE(reservation);
+  ASSERT_GE(reservation.capacity(), value.size());
+  EXPECT_FALSE(rt.Contains(K(190)));  // hidden while storage fills the slot
+  EXPECT_EQ(rt.UsedBytes(), reservation.capacity());
+  std::memcpy(reservation.data(), value.data(), value.size());
+
+  ASSERT_TRUE(reservation.Commit());
+  EXPECT_TRUE(rt.Contains(K(190)));
+  EXPECT_EQ(rt.Promoted(), 1u);
+  EXPECT_EQ(rt.FlushBacklog(), 0u);
+  {
+    std::lock_guard<std::mutex> lk(sink.m);
+    EXPECT_EQ(sink.calls, 0);  // already durable: no write-back
+  }
+
+  RamTier::Hit hit;
+  ASSERT_TRUE(rt.GetPrep(K(190), 0, value.size(), &hit));
+  EXPECT_EQ(std::string(hit.ptr, hit.len), value);
+  hit = RamTier::Hit{};
+
+  // Commit retains the reservation pin for an in-flight RDMA send. Remove
+  // hides the key immediately, but physical capacity is released only when
+  // the send owner drops the reservation.
+  EXPECT_TRUE(rt.Remove(K(190)));
+  EXPECT_FALSE(rt.Contains(K(190)));
+  EXPECT_NE(rt.UsedBytes(), 0u);
+  reservation = RamTier::DurableReservation{};
+  EXPECT_EQ(rt.UsedBytes(), 0u);
+}
+
+TEST(RamTier, AbandonedDirectDurableReservationReleasesHiddenSlot) {
+  FlushSink sink;
+  RamTier rt(Opts(64 * 4096), sink.fn());
+  ASSERT_TRUE(rt.ok());
+  {
+    RamTier::DurableReservation reservation;
+    ASSERT_TRUE(rt.ReserveDurable(K(191), 4096, &reservation));
+    std::memset(reservation.data(), 'x', 4096);
+    EXPECT_FALSE(rt.Contains(K(191)));
+    EXPECT_NE(rt.UsedBytes(), 0u);
+  }
+  EXPECT_FALSE(rt.Contains(K(191)));
+  EXPECT_EQ(rt.UsedBytes(), 0u);
 }
 
 TEST(RamTier, PutDurableDedupsAgainstResident) {
