@@ -567,8 +567,11 @@ python -m pip install integration/common integration/vllm
 **`mds_endpoints` 或 `members` 二选一**，设了 `mds_endpoints` 即优先走 MDS。
 
 ```bash
+PYTHONHASHSEED=0 \
 DFKV_RDMA=1 \
 DFKV_RDMA_DEV=ib7s400p0,ib7s400p1,ib7s400p2,ib7s400p3,ib7s400p4,ib7s400p5,ib7s400p6,ib7s400p7 \
+DFKV_RDMA_DEPTH=1 \
+DFKV_RDMA_NUMA=1 \
 DFKV_LIB=/opt/dfkv/libdfkv.so \
 vllm serve <model> \
   --tensor-parallel-size 2 --data-parallel-size 4 \
@@ -598,10 +601,54 @@ extra-config 键。namespace 始终绑定该 model identity 与 `vllm/raw-v1`；
 > ⚠️ **`members` 端口必须是 server 的 `--rdma-port`（RDMA QP bootstrap 监听口），
 > 不是主 `--port`。** 指错则每个 RDMA `put` 失败 `rc=-1`。
 
-> **必须使用 `--prefix-caching-hash-algo sha256`。** dfkv native 层会对完整
-> namespace/object key 再做 SHA-256，但无法修复上游已经写进 object key 的进程本地
-> Python hash。连接器在 scheduler/worker 启动时同时硬门禁：`builtin` 即拒绝，
-> `PYTHONHASHSEED` 即使固定也不能替代内容定义的身份契约。
+> **必须同时使用 `--prefix-caching-hash-algo sha256` 和固定
+> `PYTHONHASHSEED`。** 当前 vLLM 即使选择 SHA-256，未设置 seed 时仍以
+> `os.urandom()` 初始化首块 parent hash，导致引擎每次重启后所有旧 key 静默
+> cold miss。连接器对两项均有启动硬门禁。共享同一 store 的所有 producer 和
+> consumer 必须使用同一个固定值，推荐 `PYTHONHASHSEED=0`。
+
+### 3.1.1 正式 server / launcher 必须固化的参数
+
+不要只在交互 shell 临时 `export`。这些参数必须写入实际创建 vLLM engine
+进程的 systemd unit、Kubernetes Pod spec 或容器 launcher；仅更新 env 文件但
+没有 `export`/`EnvironmentFile=` 不生效。
+
+| 层级 | 必须固化 | 原因 |
+|---|---|---|
+| engine 参数 | `--prefix-caching-hash-algo sha256` | object key 必须是内容定义 hash；`builtin` 被连接器拒绝 |
+| engine 环境 | `PYTHONHASHSEED=0`（所有共享实例同值） | 稳定首块 parent hash；缺失会在每次进程重启后全量 cold miss |
+| engine 环境 | `DFKV_RDMA=1`、`DFKV_RDMA_DEV=<本机 ACTIVE HCA 列表>` | 强制 GPUDirect RDMA；网卡名必须按节点实际拓扑配置 |
+| engine 环境 | `DFKV_RDMA_DEPTH=1` | device-direct SG 每条 QP 仅允许一个在途 CUDA range；吞吐靠连接 fanout，不靠同 QP depth |
+| engine 环境 | `DFKV_RDMA_NUMA=1` | 每条连接选择 NUMA-local rail 和内存，避免跨 socket 路径 |
+| 容器资源 | Docker/nerdctl `--ulimit memlock=-1:-1`；Kubernetes `ulimits` 等价配置；systemd `LimitMEMLOCK=infinity` | 允许完整 GPU/host pool 注册 MR；8 MiB 默认值会触发 `ibv_reg_mr` 失败和临时注册退化 |
+| 宿主机 | `nvidia-peermem` 已加载 | GPUDirect MR 注册前提 |
+
+nerdctl/Docker 参考（参数必须出现在**创建容器**时，容器启动后再执行
+`ulimit` 无效）：
+
+```bash
+nerdctl run --ulimit memlock=-1:-1 \
+  -e PYTHONHASHSEED=0 \
+  -e DFKV_RDMA=1 \
+  -e DFKV_RDMA_DEV=ib7s400p0,ib7s400p1 \
+  -e DFKV_RDMA_DEPTH=1 \
+  -e DFKV_RDMA_NUMA=1 \
+  ... <image> \
+  vllm serve <model> --prefix-caching-hash-algo sha256 ...
+```
+
+启动后验收：
+
+```bash
+grep 'Max locked memory' /proc/<engine-pid>/limits   # unlimited
+tr '\0' '\n' </proc/<engine-pid>/environ |
+  grep -E '^(PYTHONHASHSEED|DFKV_RDMA|DFKV_RDMA_DEV|DFKV_RDMA_DEPTH|DFKV_RDMA_NUMA)='
+lsmod | grep nvidia_peermem
+```
+
+功能验收不能只测同进程第二次请求：必须写入长 prompt，**重启整个 engine
+进程**后重复相同 prompt，确认 key 存在、cached tokens 接近完整 prompt，
+且 `dfkv_rdma_completion_errors_total` 无增量。
 
 ### 3.2 验证
 
@@ -611,9 +658,9 @@ extra-config 键。namespace 始终绑定该 model identity 与 `vllm/raw-v1`；
    **输出与 cold 逐字一致**。
 3. server 侧 `dfkvctl stat --all` 或 `/metrics` 看 get 命中、写入量。
 
-不命中排查顺序：确认启动参数为 `--prefix-caching-hash-algo sha256` → MDS 可达
-（或静态 `members` 端口是否 rdma-port）→ effective namespace 与 canonical
-object-key 坐标是否一致（§1.4/§5）。
+不命中排查顺序：确认 `--prefix-caching-hash-algo sha256` 与
+`PYTHONHASHSEED` 同时存在且所有实例同值 → MDS 可达（或静态 `members`
+端口是否 rdma-port）→ effective namespace 与 canonical object-key 坐标是否一致。
 namespace/key 不一致是预期 cold miss。**空环 / MDS 不可达**可直接在 vLLM
 `/metrics` 上看：`vllm:dfkv_client_ring_members==0`（写无处可去）或
 `vllm:dfkv_client_mds_reachable==0`（[METRICS.md](METRICS.md) §3.5）。
@@ -692,10 +739,12 @@ daemon 线程或进程终止；过载和退出期间都不会静默留下永久�
   位点映射：`mds_group`（① 环）、`tenant_id`（③）、`model_revision`（④）。
   `model_name`（④）由 **vLLM 启动 `--model`/`--served-model-name`** 提供，不是 extra_config
   键；引擎/布局身份全量进 canonical namespace（§1.4）。
-- **单实例 / 单 DP**：`--prefix-caching-hash-algo sha256` + `DFKV_RDMA=1` +
-  `batch_concurrency=8` 默认，depth 默认 4。
-- **多 DP / 多实例共享池**：所有实例使用 `--prefix-caching-hash-algo sha256`，
-  并保持 effective namespace、canonical key 坐标和 raw payload layout 一致（§5）。
+- **单实例 / 单 DP**：`--prefix-caching-hash-algo sha256` +
+  `PYTHONHASHSEED=0` + `DFKV_RDMA=1`；`batch_concurrency=8` 默认，
+  `DFKV_RDMA_DEPTH=1`。
+- **多 DP / 多实例共享池**：所有实例使用
+  `--prefix-caching-hash-algo sha256` 和相同固定 `PYTHONHASHSEED`，并保持
+  effective namespace、canonical key 坐标和 raw payload layout 一致（§5）。
 - **大集群 / 宽池**：`batch_concurrency` 提到接近 dfkv 节点数，让一批 KV 在更多节点并行。
 - **长上下文（50k+）**：load 带宽随上下文线性增长，单盘会成瓶颈；靠**分布式存储环**
   （多 server、多盘）摊带宽，而非调 depth。首请求 JIT 见 §3.6。
@@ -715,7 +764,7 @@ daemon 线程或进程终止；过载和退出期间都不会静默留下永久�
 
 | 现象 | 原因 / 解 |
 |---|---|
-| 写成功但**读永不命中** | 未使用 `--prefix-caching-hash-algo sha256`（当前连接器会启动失败）；或 effective namespace / canonical object key 不一致（后两者表现为 cold miss） |
+| 写成功但**读永不命中** | 未同时设置 `--prefix-caching-hash-algo sha256` 与固定 `PYTHONHASHSEED`（当前连接器会启动失败）；或所有实例 seed 不同；或 effective namespace / canonical object key 不一致 |
 | 命中后输出/shape 错误 | 同一 namespace+key 被不同 dtype/page/shape/layout 复用；这是 type-safety violation。停写，bump source-controlled raw-layout ID 并同时发布所有 writer/reader |
 | 每个 RDMA `put` 失败 `rc=-1` | `members` 指了 `--port` 而非 `--rdma-port` |
 | `ibv_reg_mr` 失败 / 无 GPUDirect | GPU 节点没加载 `nvidia-peermem` |
