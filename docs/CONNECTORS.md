@@ -466,6 +466,28 @@ sglang serve /models/glm-5.2-nvfp4 --served-model-name glm-5.2 \
   容量和连接 fan-out 分别配置即可。
 - **HiCache 命中/吞吐/延迟与 client 注册指标**已内置，无需额外动作。
 
+#### 0064 B200 + GLM-5.2-NVFP4 实测（2026-08-09）
+
+95,000-token 请求，8 个 attention-CP rank、8 条物理 rail、完整 L3 命中：
+
+- API 返回 `cached_tokens=94,976`，server 读取 42.40 GB，RDMA completion
+  error 增量为 0。
+- 插件自身指标每 rank：主 KV 4.267 GB / 0.13–0.18 s，side pool
+  0.978 GB / 0.034–0.041 s。dfkv 数据路径已低于 0.22 s/rank；API 端到端
+  波动主要来自 SGLang 的恢复 prefill、rank barrier/JIT，而不是存储拉取。
+- `DFKV_READ_MAX_CONNS=16` 在 8 rank 单机上形成最多 128 条并发 data QP，
+  端到端反而从 3.61 s 退化到 44.94 s；保持默认 8。吞吐靠 rank-to-rail
+  隔离和默认 8-way fanout，不能无限加连接。
+- 不要为 attention-CP rank 打开 native
+  `DFKV_CLIENT_NODE_DEDUP_GPU`：各 rank 的 page hash 可以相同，但目标 KV
+  payload 是 rank-local shard。实测打开后仅恢复 32,768/94,976 tokens，
+  请求退化至 61–87 s。SGLang 并发请求去重只使用
+  `SGLANG_HICACHE_L2_BYPASS_DEDUP` 的框架级语义。
+
+该配置下继续增加 client/server fanout 没有存储侧收益；优化重点应转向
+SGLang engine 的恢复 prefill 和跨 rank 同步。
+
+
 ---
 
 ### 2.7 L2-bypass（L1↔L3 device 直连，绕过 host 池）
@@ -759,6 +781,18 @@ daemon 线程或进程终止；过载和退出期间都不会静默留下永久�
 - **SG 合并**：每 chunk 一个 key（而非每层段一个），25392→1242 key（~20×），减少 per-key 磁盘读。
 - **depth 平**：裸 GET 单连接 depth 1 = depth 32 ≈ 1.24 GB/s，完全一样（默认已改为 4）。
 - **传输层**：裸 GET 8 连接 5.2 GB/s、16 连接 6.2 GB/s（详见 [datapath-perf-notes.md](datapath-perf-notes.md)）。
+
+0064 B200 + GLM-5.2-NVFP4（94,000-token，2026-08-09）补充：
+
+- 固定 `PYTHONHASHSEED=0` 后跨 engine 重启 5,872/5,872 对象命中；
+  未设置时相同 prompt 重启后 5,748 个候选全部 cold miss。
+- warm：每 rank 4.48 GB 用时 1.11–1.18 s，8-rank 有效载荷约
+  30.3 GB/s，API 2.72 s。
+- server 重启后的 cold disk：每 rank 1.64–1.75 s，双 NVMe 峰值
+  2.11 + 2.18 GB/s，API 2.82 s，completion error 增量为 0。
+- PR #280 将 5,872-key scheduler `batch_exist` 从 246 ms 降到 71 ms：
+  RDMA `ExistMany` 复用 GET fanout 分片，并并行 shared-memory rendezvous
+  probe。完整 warm API 为 2.02 s；剩余主耗时在 GPU load/engine barrier。
 
 ### 3.7 已知问题 / 排查
 
