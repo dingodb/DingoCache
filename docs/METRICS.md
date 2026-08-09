@@ -126,11 +126,11 @@ RDMA 构建额外（折叠进同一 /metrics）：
 > 随负载增长，`v2_ready=1` 且 `recv_segment_free_bytes` 有容量余量。启动失败
 > 或连接拒绝时检查 segment 容量、每轨注册日志和两端协议版本。
 
-读侧 convoy 合并（v1.35+，`DFKV_READ_COALESCE=1` 时才有增量；恒零 = 开关没生效）：
-| `dfkv_read_coalesce_leaders_total` | counter | 经 coalescer 登记并执行的读（同步 leader + uring flight 完成各计一次;>0 = 合并路径确实在环内） |
-| `dfkv_read_coalesced_total` | counter | 从在途同键读直接取到数据的 follower 数（窗口内合并吸收量） |
-| `dfkv_read_coalesce_recur_total` | counter | 命中复现指纹（tombstone）的读——漂移超窗后的晋升证据（v2 驻留窗 `DFKV_READ_COALESCE_RECUR_MS`,默认 1000ms） |
-| `dfkv_read_coalesce_timeouts_total` | counter | follower 等待超时回退自读的次数（`DFKV_READ_COALESCE_TIMEOUT_MS`,默认 500ms;**健康态应恒 0**,持续非零 = leader 连接异常死亡或盘读时延超阈） |
+读侧 convoy 合并与直读晋升（`DFKV_READ_COALESCE=1` 时才有增量；恒零 = 开关没生效）：
+| `dfkv_read_coalesce_leaders_total` | counter | 经 coalescer 登记并完成的读（同步 leader + io_uring flight 各计一次；>0 = 合并路径确实在环内） |
+| `dfkv_read_coalesced_total` | counter | 被在途同键读吸收的 follower 数；直读晋升 follower 等发布后从 RAM 获取独立 send pin，不复制 leader payload |
+| `dfkv_read_coalesce_recur_total` | counter | staged fallback flight 命中复现指纹的诊断计数（`DFKV_READ_COALESCE_RECUR_MS`，默认 1000ms）；direct-to-RAM flight 不创建指纹 |
+| `dfkv_read_coalesce_timeouts_total` | counter | follower 等待超时回退自读的次数（`DFKV_READ_COALESCE_TIMEOUT_MS`，默认 500ms；**健康态应恒 0**，持续非零 = leader 连接异常死亡或盘读时延超阈） |
 
 slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际引擎判定，不设 flag/env 的默认也命中；file 引擎无此系列）：
 | 指标 | 类型 | 含义 |
@@ -156,7 +156,7 @@ RAM 热层（**仅 `DFKV_RAM_TIER=1` 时输出**；关时无此系列，向后�
 | `dfkv_ram_hit_total` / `dfkv_ram_miss_total` | counter | GET 命中 RAM / 未命中落盘（命中率 = hit/(hit+miss)） |
 | `dfkv_ram_put_total` | counter | 写直通进 RAM 的 PUT 数 |
 | `dfkv_ram_put_bypass_total` | counter | **背压**：arena 满（flush 落后）→ PUT 旁路直写盘，非零即 flush 跟不上 |
-| `dfkv_ram_promoted_total` | counter | 读晋升（v1.35+,需 `DFKV_READ_COALESCE=1`）：带 convoy 证据（扇入或复现指纹）的整值冷读以 born-durable 身份直入 arena——不进 flushq、零刷盘成本、随时可逐;健康态应跟随 `dfkv_read_coalesce_recur_total` |
+| `dfkv_ram_promoted_total` | counter | 整值冷读晋升：优先让 O_DIRECT 直接读入隐藏 arena reservation，成功后以 born-durable 身份发布；staged fallback 则读后复制晋升。不进 flushq、零重复刷盘、随时可驱逐；健康冷→热运行中首次读增长，随后应转为 `dfkv_ram_hit_total` 增长且磁盘字节不再增加 |
 | `dfkv_ram_flushed_total` / `dfkv_ram_flush_dropped_total` | counter | RAM slot 落盘转 DURABLE / flush 多次失败后丢弃 |
 | `dfkv_ram_healthy` | gauge | RAM flusher 未发生 terminal failure 时为 1；0 会动态摘除 readiness |
 | `dfkv_ram_flush_threads` | gauge | shard 最小值调整后的实际 flusher 数（不是原始请求值） |

@@ -1,11 +1,11 @@
-/* RamTier — a write-through RAM hot tier that fronts the disk cache.
+/* RamTier — a registered RAM hot tier that fronts the disk cache.
  *
  * Motivation (P3): a COLD dfkv load is disk-bound (~480 MB/s O_DIRECT), which
  * dominates PD decode TTFT. For PD-warm GETs, serving the KV straight from a
  * pre-registered RAM arena over RDMA -- no open, no pread, no disk -- removes
- * that bottleneck. PUT is write-through: the value is copied into a RAM slot and
- * made visible synchronously (read-after-write), then flushed to disk in the
- * background for durability and capacity overflow.
+ * that bottleneck. In server write-back mode, PUT becomes synchronously visible
+ * in a RAM slot and flushes to disk before acknowledgement. A whole-value cold
+ * GET can instead read directly into a hidden slot and publish it born-durable.
  *
  * Ordinary values use SlabAllocator's dense fixed-slot arena. Values larger
  * than one allocator extent use a dedicated aligned allocation instead: they
@@ -13,8 +13,9 @@
  * transport because they are outside the arena MR.
  *
  * Both storage kinds follow the same lifecycle:
- *   - flush-pin: taken on Put, released when the async flush reaches disk.
- *   - send-pin: taken on GetPrep, released on send completion.
+ *   - reservation-pin: protects an unpublished cold-read destination.
+ *   - flush-pin: protects a write-back value until disk commit.
+ *   - send-pin: protects a visible value through transport completion.
  *   durable && no send in flight  <=>  evictable.
  * Arena pins are maintained by SlabAllocator; dedicated entries maintain the
  * equivalent counters directly.
@@ -49,7 +50,6 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <string>
 #include <thread>
 #include <utility>
 #include <unordered_map>
@@ -127,6 +127,31 @@ class RamTier {
     uint64_t token_ = 0;
   };
 
+  // Move-only arena reservation for a value already durable on disk. The
+  // storage read may target data() directly, eliminating PutDurable's
+  // payload-sized promotion memcpy. Until Commit(), the key stays hidden and
+  // the slot stays pinned; destruction aborts and releases the reservation.
+  class DurableReservation {
+   public:
+    DurableReservation() noexcept;
+    ~DurableReservation();
+    DurableReservation(const DurableReservation&) = delete;
+    DurableReservation& operator=(const DurableReservation&) = delete;
+    DurableReservation(DurableReservation&& other) noexcept;
+    DurableReservation& operator=(DurableReservation&& other) noexcept;
+
+    explicit operator bool() const noexcept { return state_ != nullptr; }
+    char* data() const noexcept;
+    size_t capacity() const noexcept;
+    bool Commit() noexcept;
+
+   private:
+    friend class RamTier;
+    struct State;
+    void Reset() noexcept;
+    std::unique_ptr<State> state_;
+  };
+
   RamTier(Options opt, FlushFn flush);
   ~RamTier();                // stops the flushers, joins
 
@@ -155,6 +180,12 @@ class RamTier {
   // declines (false) and the promotion is silently skipped; promoted slots can
   // never crowd out the write path's flush resources.
   bool PutDurable(const BlockKey& key, const void* data, size_t len);
+
+  // Reserve a registered-arena slot before an O_DIRECT read, so the read can
+  // populate the durable RAM entry in place. Oversized values live outside the
+  // registered arena and intentionally decline this zero-copy path.
+  bool ReserveDurable(const BlockKey& key, size_t len,
+                      DurableReservation* out);
 
   // On hit, pins the resident allocation and returns one move-only owner.
   // Miss leaves `out` empty.
@@ -209,6 +240,7 @@ class RamTier {
     uint64_t offset = 0;   // global arena offset; ignored for dedicated values
     uint64_t len = 0;      // exact payload length
     uint64_t cap = 0;      // charged/aligned allocation size
+    SlabAllocator::SlotHandle slot_handle;
     AlignedBuffer large;   // non-null iff this entry is outside the arena
     std::shared_ptr<PutCompletion> completion;
     uint32_t send_pins = 0;
@@ -219,11 +251,22 @@ class RamTier {
     bool in_arena() const { return !large; }
     char* data(char* arena) const { return large ? large.get() : arena + offset; }
   };
-  struct QItem { std::string fn; BlockKey key; uint32_t tries = 0; };
-  struct PinRef {
-    std::string fn;
-    BlockKey key;
+  struct KeyHash {
+    size_t operator()(const BlockKey& key) const noexcept {
+      auto mix = [](uint64_t value) {
+        value ^= value >> 30;
+        value *= 0xbf58476d1ce4e5b9ULL;
+        value ^= value >> 27;
+        value *= 0x94d049bb133111ebULL;
+        return value ^ (value >> 31);
+      };
+      uint64_t hash = mix(key.digest_hi + 0x9e3779b97f4a7c15ULL);
+      hash ^= mix(key.digest_lo + 0x3c6ef372fe94f82aULL);
+      hash ^= mix(key.tenant_hash + 0xdaa66d2c7ddef743ULL);
+      return static_cast<size_t>(mix(hash));
+    }
   };
+  struct QItem { BlockKey key; uint32_t tries = 0; };
 
   // One independent slice of the tier. All state a key's lifecycle touches
   // (allocator, index, writing set, send-pins, flush queue) lives here, under
@@ -232,10 +275,8 @@ class RamTier {
     uint64_t base_off = 0;
     std::unique_ptr<SlabAllocator> alloc;
     mutable std::mutex mu;
-    std::unordered_map<std::string, Entry> index;
-    std::unordered_map<std::string, std::shared_ptr<PutCompletion>> writing;
-    std::unordered_map<uint64_t, PinRef> pinned;
-    uint64_t next_token = 1;
+    std::unordered_map<BlockKey, Entry, KeyHash> index;
+    std::unordered_map<BlockKey, std::shared_ptr<PutCompletion>, KeyHash> writing;
     std::deque<QItem> flushq;
     std::condition_variable cv;
     bool stop = false;
@@ -255,13 +296,15 @@ class RamTier {
   static void CompletePut(const std::shared_ptr<PutCompletion>& completion,
                           bool success);
   static Status WaitPut(const std::shared_ptr<PutCompletion>& completion);
+  bool CommitReservation(DurableReservation* reservation) noexcept;
+  void AbortReservation(DurableReservation* reservation) noexcept;
   void ReclaimLargeFor(uint64_t bytes);
 
-  Shard& ShardFor(const std::string& fn) {
-    return *shards_[std::hash<std::string>{}(fn) % shards_.size()];
+  Shard& ShardFor(const BlockKey& key) {
+    return *shards_[KeyHash{}(key) % shards_.size()];
   }
-  const Shard& ShardFor(const std::string& fn) const {
-    return *shards_[std::hash<std::string>{}(fn) % shards_.size()];
+  const Shard& ShardFor(const BlockKey& key) const {
+    return *shards_[KeyHash{}(key) % shards_.size()];
   }
 
   void FlushLoop(Shard& s);
@@ -269,19 +312,16 @@ class RamTier {
   // the two store-lock hops + reach a useful uring submit width, small enough
   // that a batch's slots stay flush-pinned only briefly.
   static constexpr size_t kFlushBatchMax = 16;
-  // Send-pin tokens encode their shard in the low bits so RAII release can route
-  // without a global map. 6 bits = up to 64 shards (raised from 4/16 in phase
-  // 10: a clean GET scaling sweep peaked at 8 threads with the default 8 shards
-  // then DEGRADED — the per-shard lock is the >8-connection concurrency ceiling
-  // for both read and write. Raising the cap lets read/write-heavy multi-client
-  // deployments set DFKV_RAM_TIER_SHARDS past 16; the default stays 8).
-  static constexpr int kTokenShardBits = 6;
-  static constexpr size_t kMaxShards = 1u << kTokenShardBits;
+  // The entry itself is the send-pin release token. unordered_map keeps node
+  // addresses stable across rehash, and every removal path defers erasure while
+  // send_pins is nonzero, so completion can release without a second token map
+  // insertion, allocation, lookup, and index lookup.
+  static constexpr size_t kMaxShards = 64;
   void ReclaimTick(Shard& s, size_t shard_idx);
   // Rebalance rate cap: extents moved per tick per hot class (32 MiB default
   // extents; converges in well under a second at the 10 ms tick).
   static constexpr size_t kGrowExtentsPerTick = 8;
-  void DropLocked(Shard& s, const std::string& fn);  // s.mu held
+  void DropLocked(Shard& s, const BlockKey& key);  // s.mu held
 
   Options opt_;
   FlushFn flush_;

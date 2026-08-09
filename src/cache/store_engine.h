@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstring>
 #include <cstdint>
+#include <memory>
 #include <utility>
 #include <unistd.h>
 #include <string>
@@ -135,15 +136,17 @@ class PreparedRead {
   bool source_registered() const noexcept { return source_registered_; }
   // Copy a registered source into the owned destination staging when the
   // connection cannot resolve its pool MR. The transaction and its pin remain
-  // intact; only the send source changes.
   bool Stage() noexcept {
-    if (!active_ || !source_registered_ || staging_ == nullptr ||
-        payload_len_ > staging_cap_ ||
+    char* target = fallback_ != nullptr ? fallback_ : staging_;
+    const size_t target_cap =
+        fallback_ != nullptr ? fallback_cap_ : staging_cap_;
+    if (!active_ || !source_registered_ || target == nullptr ||
+        payload_len_ > target_cap ||
         (payload_len_ != 0 && data_ == nullptr)) {
       return false;
     }
-    if (payload_len_ != 0) std::memcpy(staging_, data_, payload_len_);
-    data_ = staging_;
+    if (payload_len_ != 0) std::memcpy(target, data_, payload_len_);
+    data_ = target;
     source_registered_ = false;
     return true;
   }
@@ -151,7 +154,12 @@ class PreparedRead {
   // Commit a completed storage read or a completed RAM-backed send. `bytes_read`
   // is the exact payload byte count exposed to completion accounting.
   bool Commit(Status result, size_t bytes_read, double elapsed_sec) noexcept {
-    if (!active_) return false;
+    if (!active_) {
+      // A storage read may retain a post-read source pin until the subsequent
+      // SEND completion. Its second terminal call releases that pin.
+      post_read_hold_.reset();
+      return false;
+    }
     active_ = false;
     FinishFn finish = std::exchange(finish_, nullptr);
     void* owner = std::exchange(owner_, nullptr);
@@ -167,7 +175,10 @@ class PreparedRead {
   // Abort preparation/queueing/send teardown. The destructor calls this when a
   // caller leaves any path without choosing a terminal action.
   bool Abort() noexcept {
-    if (!active_) return false;
+    if (!active_) {
+      post_read_hold_.reset();
+      return false;
+    }
     active_ = false;
     FinishFn finish = std::exchange(finish_, nullptr);
     void* owner = std::exchange(owner_, nullptr);
@@ -176,6 +187,7 @@ class PreparedRead {
       finish(owner, token, false, Status::kIOError, 0, 0.0, nullptr);
     }
     lease_ = ReadLease{};
+    post_read_hold_.reset();
     return true;
   }
 
@@ -190,12 +202,15 @@ class PreparedRead {
     read.status_ = status;
     return read;
   }
-  static PreparedRead Storage(ReadLease lease, char* staging,
-                              size_t staging_cap, void* owner, uint64_t token,
-                              FinishFn finish) noexcept {
+  static PreparedRead Storage(
+      ReadLease lease, char* staging, size_t staging_cap, void* owner,
+      uint64_t token, FinishFn finish, bool source_registered = false,
+      char* fallback = nullptr, size_t fallback_cap = 0,
+      std::shared_ptr<void> post_read_hold = {}) noexcept {
     PreparedRead read;
     read.status_ = Status::kOk;
     read.needs_io_ = lease.aligned_len != 0;
+    read.source_registered_ = source_registered;
     read.aligned_off_ = lease.aligned_off;
     read.aligned_len_ = lease.aligned_len;
     read.head_ = lease.head;
@@ -203,12 +218,15 @@ class PreparedRead {
     read.value_len_ = lease.value_len;
     read.staging_ = staging;
     read.staging_cap_ = staging_cap;
+    read.fallback_ = fallback;
+    read.fallback_cap_ = fallback_cap;
     read.data_ = staging == nullptr ? nullptr : staging + lease.head;
     read.owner_ = owner;
     read.token_ = token;
     read.finish_ = finish;
     read.active_ = true;
     read.lease_ = std::move(lease);
+    read.post_read_hold_ = std::move(post_read_hold);
     return read;
   }
   static PreparedRead Ready(const char* data, size_t payload_len,
@@ -243,9 +261,12 @@ class PreparedRead {
     staging_cap_ = other.staging_cap_;
     data_ = other.data_;
     owner_ = std::exchange(other.owner_, nullptr);
+    fallback_ = other.fallback_;
+    fallback_cap_ = other.fallback_cap_;
     token_ = std::exchange(other.token_, 0);
     finish_ = std::exchange(other.finish_, nullptr);
     lease_ = std::move(other.lease_);
+    post_read_hold_ = std::move(other.post_read_hold_);
   }
 
   Status status_ = Status::kInvalid;
@@ -259,11 +280,14 @@ class PreparedRead {
   size_t value_len_ = 0;
   char* staging_ = nullptr;
   size_t staging_cap_ = 0;
+  char* fallback_ = nullptr;
+  size_t fallback_cap_ = 0;
   const char* data_ = nullptr;
   void* owner_ = nullptr;
   uint64_t token_ = 0;
   FinishFn finish_ = nullptr;
   ReadLease lease_;
+  std::shared_ptr<void> post_read_hold_;
 };
 struct ValueMetadata {
   uint64_t value_len = 0;

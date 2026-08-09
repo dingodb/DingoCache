@@ -98,8 +98,8 @@ class KvNodeServer {
                               std::string* out_data,
                               size_t* value_len = nullptr);
   // Payload-free lookup used by protocol response framing and connector
-  // descriptor validation. RAM is authoritative while a write-through value
-  // is visible but not yet committed to disk.
+  // descriptor validation. RAM is authoritative while a write-back value is
+  // visible but not yet committed to disk.
   Status LookupForKey(const BlockKey& key, ValueMetadata* out) const;
 
 
@@ -143,6 +143,13 @@ class KvNodeServer {
   static void FinishDiskRead(void* owner, uint64_t flight, bool committed,
                              Status result, size_t bytes_read,
                              double elapsed_sec, const char* data) noexcept;
+  struct PromotedRead {
+    KvNodeServer* server = nullptr;
+    RamTier::DurableReservation reservation;
+  };
+  static void FinishPromotedDiskRead(
+      void* owner, uint64_t flight, bool committed, Status result,
+      size_t bytes_read, double elapsed_sec, const char* data) noexcept;
   static void FinishRamRead(void* owner, uint64_t token, bool committed,
                             Status result, size_t bytes_read,
                             double elapsed_sec, const char* data) noexcept;
@@ -206,9 +213,9 @@ class KvNodeServer {
   DiskCacheGroup group_;
   // Optional RAM hot tier (P3). Declared AFTER group_ so it is destroyed FIRST:
   // ~RamTier stops+joins the flusher, whose callback calls group_.Cache, before
-  // group_ is torn down. nullptr unless DFKV_RAM_TIER is enabled. Write-through:
-  // PUT lands in RAM (sync-visible) + async-flushes to group_; GET checks RAM
-  // first (served from the arena) then falls back to group_.
+  // group_ is torn down. nullptr unless DFKV_RAM_TIER is enabled. In write-back
+  // mode, PUT lands in RAM (sync-visible) and flushes to group_; write-around
+  // populates RAM through born-durable GET promotion. GET checks RAM first.
   std::unique_ptr<RamTier> ram_;
   bool ram_required_failed_ = false;
   int listen_fd_ = -1;

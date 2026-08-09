@@ -26,9 +26,9 @@ three engines through thin adapters over one portable core:
   `--store-engine` option nor `DFKV_STORE_ENGINE`, every server/store path
   selects the restart-safe slab backend. `file` remains an explicit
   diagnostic/rollback choice; invalid slab capacity/geometry refuses startup
-  rather than falling back. An optional write-through **RAM hot tier**
-  (`DFKV_RAM_TIER=1`) serves registered-memory hits without disk I/O — see
-  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+  rather than falling back. An optional registered **RAM hot tier**
+  (`DFKV_RAM_TIER=1`) provides direct cold-read promotion and disk-free
+  zero-copy warm GETs — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **`dfkv_mds`** — stateless Membership Directory Service daemon. Flags:
   `--listen <port>` and `--etcd <host:port>` (default `127.0.0.1:2379`). The only
   etcd client in the system; holds each node's etcd lease on its behalf. Deploy as
@@ -154,11 +154,13 @@ docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire p
   keep failures fail-closed. `--store-engine=file` is an explicit diagnostic
   fallback, not a silent recovery path or the production default.
 - **RAM hot tier** (`DFKV_RAM_TIER=1`, off by default): a pre-registered arena
-  fronting the disk — PUT is **write-through** (synchronously visible, async-flushed
-  to disk) and a warm GET is served **straight from the arena over RDMA** (zero-copy
-  scatter-send from the arena MR, no open/pread/disk), removing the disk-bound COLD
-  load bottleneck. Send-in-flight slot pinning + flush backpressure keep it correct;
-  `dfkv_ram_*` metrics expose hit-rate + backpressure. See
+  fronting the disk — PUT can be write-back or write-around, a cold whole-value
+  GET is read directly from NVMe into its final arena slot, and a warm GET is
+  served **straight from that slot over RDMA**. The read-promotion path removes
+  both the staging-buffer copy and the duplicate follower payload copy. Send
+  pins, identity-checked slot handles, and flush backpressure prevent slot reuse
+  while disk or network I/O is in flight; `dfkv_ram_*` metrics expose hit rate,
+  promotion, and backpressure. See
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §5–6.
 - **128-bit native block identity**: SHA-256 of length-framed canonical
   namespace + object-key bytes, truncated to 128 bits for wire/storage identity.
@@ -255,24 +257,26 @@ fabric selection and capacity explicit.
 | `DFKV_RDMA_DEPTH` | `1` | Pairs with the server's posted depth (window = min of both, negotiated). Default 1; raising it inflates receive-segment lease and can exhaust the shared segment without improving throughput. |
 | `DFKV_FANOUT_THREADS` | unset (default 32) | Only wide single-process clients (benchmarks, many concurrent Batch* callers) need more. |
 
-**Read-side convoy collapse (v2.0, opt-in)** — for MLA + TP-N inference
-rings, where every rank is a separate process fetching the SAME page and the
-NVMe otherwise eats N identical reads per page (measured 1:1 disk:wire on a
-TP8 replay; with the knobs below: **~2.4 device reads per duplicated page,
-repeat reads of promoted pages hit zero disk**):
+**Read-side convoy collapse and direct promotion (opt-in)** — for MLA + TP-N
+inference rings, where every rank is a separate process fetching the SAME page
+and NVMe would otherwise execute N identical reads per page. With both knobs
+enabled, the io_uring leader reserves the final registered arena slot before
+submitting the read; followers wait for publication and then RDMA-send from the
+same resident slot. Repeated reads hit zero disk.
 
 | Knob | Recommended | Why |
 |---|---|---|
-| `DFKV_READ_COALESCE` | `1` | Master switch. Concurrent identical GETs share one disk read (sync + io_uring paths), and a whole-value read with convoy evidence is promoted into the RAM arena as a born-durable resident (zero flush cost, evictable at once). Unset = coalescing/promotion off, restoring the original single-read path. |
-| `DFKV_READ_COALESCE_RECUR_MS` | `1000` (default) | Recurrence window: a lone whole read leaves a 64-byte key fingerprint; an identical read inside the window promotes on completion even when rank drift missed the in-flight overlap. Fingerprints, not payloads — widening it costs ~nothing (64 Ki-entry bound). `0` restores the overlap-only gate. |
+| `DFKV_READ_COALESCE` | `1` | Master switch. Concurrent identical GETs share one disk read. A whole-value io_uring miss that fits the arena reads NVMe directly into a hidden RAM reservation and publishes it born-durable before waking followers: no staging copy, no extra flush, and no follower payload copy. Partial, oversized, or capacity-constrained requests retain the bounded staging fallback. Unset restores independent disk reads. |
+| `DFKV_READ_COALESCE_RECUR_MS` | `1000` (default) | Diagnostic recurrence window for staged fallback flights: a lone whole read leaves a bounded key fingerprint and an identical read inside the window increments `recur`. Direct-to-RAM flights create no fingerprint because the resident itself covers the recurrence. `0` disables this diagnostic. |
 | `DFKV_READ_COALESCE_TIMEOUT_MS` | `500` (default) | Follower wait bound; a waiter whose leader connection dies falls back to its own read instead of hanging. |
 
-Watch `dfkv_read_coalesce_{leaders,coalesced,recur,timeouts}_total` and
-`dfkv_ram_promoted_total`; `timeouts` staying at 0 and `promoted` tracking
-`recur` are the healthy signature. Requires the RAM tier (`--ram-tier`) for
-promotion; coalescing alone works without it. Note for env-file deployments:
-the file is *sourced*, so new knobs must be explicitly **exported** by the
-start script or a systemd drop-in to reach the server process.
+Watch `dfkv_read_coalesce_{leaders,coalesced,timeouts}_total` and
+`dfkv_ram_promoted_total`; healthy cold-to-warm runs have `timeouts=0`,
+`promoted` rising on first whole-value reads, then `dfkv_ram_hit_total` rising
+without disk bytes. Direct promotion requires the RAM tier (`--ram-tier`);
+coalescing alone works without it. Note for env-file deployments: the file is
+*sourced*, so new knobs must be explicitly **exported** by the start script or
+a systemd drop-in to reach the server process.
 
 **Benchmark reproduction** (`dfkv_bench`): `DFKV_RDMA=1` (explicit, or it
 silently measures TCP), 8-rail `DFKV_RDMA_DEV`, `DFKV_RDMA_DEPTH=1`,

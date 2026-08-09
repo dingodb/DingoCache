@@ -204,6 +204,30 @@ TEST(SlabAllocator, PinBlocksEviction) {
   EXPECT_TRUE(a.Put(Key("nope"), 4096, &r, &ev));
 }
 
+TEST(SlabAllocator, SlotHandlePinsOnlyItsLiveKey) {
+  SlabAllocator a(Opts(2 * 4096, 1));
+  std::vector<BlockKey> evicted;
+  SlotRef ref;
+  SlabAllocator::SlotHandle first_handle;
+  const BlockKey first = Key("first");
+  const BlockKey second = Key("second");
+
+  ASSERT_TRUE(a.Put(first, 4096, &ref, &evicted, &first_handle));
+  ASSERT_TRUE(first_handle.valid());
+  EXPECT_FALSE(a.Pin(second, first_handle));
+  ASSERT_TRUE(a.Pin(first, first_handle));
+  EXPECT_EQ(a.Remove(first), SlabAllocator::RemoveResult::kDeferred);
+  EXPECT_FALSE(a.Pin(first, first_handle));
+  ASSERT_TRUE(a.Unpin(first, first_handle));
+  EXPECT_FALSE(a.Contains(first));
+
+  SlabAllocator::SlotHandle second_handle;
+  ASSERT_TRUE(a.Put(second, 4096, &ref, &evicted, &second_handle));
+  EXPECT_FALSE(a.Pin(first, first_handle));
+  ASSERT_TRUE(a.Pin(second, second_handle));
+  EXPECT_TRUE(a.Unpin(second, second_handle));
+}
+
 TEST(SlabAllocator, CrossClassStealWhenPoolEmpty) {
   // 2 extents. Fill both with class-A (4096) keys. Then a class-B (8192) key
   // with the pool empty must STEAL a fully-unpinned A extent and rebind it.

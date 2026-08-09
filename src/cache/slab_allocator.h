@@ -43,6 +43,14 @@ class SlabAllocator {
     bool valid() const { return slot_size != 0; }
   };
 
+  // Stable only while the corresponding key remains resident. Callers that
+  // already serialize the key lifecycle can use this handle to pin without a
+  // second hash-table probe.
+  struct SlotHandle {
+    uint32_t index = UINT32_MAX;
+    bool valid() const { return index != UINT32_MAX; }
+  };
+
   enum class RemoveResult { kRemoved, kDeferred, kNotFound };
 
   struct Options {
@@ -65,7 +73,7 @@ class SlabAllocator {
   explicit SlabAllocator(Options opt);
 
   bool Put(const BlockKey& key, size_t len, SlotRef* out,
-           std::vector<BlockKey>* evicted);
+           std::vector<BlockKey>* evicted, SlotHandle* out_handle = nullptr);
   bool Get(const BlockKey& key, SlotRef* out);
   bool GetAndPin(const BlockKey& key, SlotRef* out);
   bool Contains(const BlockKey& key) const;
@@ -86,6 +94,8 @@ class SlabAllocator {
   RemoveResult Remove(const BlockKey& key);
   bool Pin(const BlockKey& key);
   bool Unpin(const BlockKey& key);
+  bool Pin(const BlockKey& key, SlotHandle handle);
+  bool Unpin(const BlockKey& key, SlotHandle handle);
 
   struct ClassStat {
     uint32_t slot_size = 0;

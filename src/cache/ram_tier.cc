@@ -22,6 +22,52 @@ bool AlignCapacity(size_t len, uint64_t align, uint64_t* out) {
 }
 }  // namespace
 
+struct RamTier::DurableReservation::State {
+  RamTier* owner = nullptr;
+  size_t shard_index = 0;
+  BlockKey key;
+  size_t len = 0;
+  uint64_t offset = 0;
+  uint64_t cap = 0;
+  SlabAllocator::SlotHandle slot_handle;
+  std::shared_ptr<PutCompletion> completion;
+  bool finished = false;
+  bool installed = false;
+};
+RamTier::DurableReservation::DurableReservation() noexcept = default;
+
+
+RamTier::DurableReservation::~DurableReservation() { Reset(); }
+
+RamTier::DurableReservation::DurableReservation(
+    DurableReservation&& other) noexcept
+    : state_(std::move(other.state_)) {}
+
+RamTier::DurableReservation& RamTier::DurableReservation::operator=(
+    DurableReservation&& other) noexcept {
+  if (this != &other) {
+    Reset();
+    state_ = std::move(other.state_);
+  }
+  return *this;
+}
+
+char* RamTier::DurableReservation::data() const noexcept {
+  return state_ ? state_->owner->arena_ + state_->offset : nullptr;
+}
+
+size_t RamTier::DurableReservation::capacity() const noexcept {
+  return state_ ? static_cast<size_t>(state_->cap) : 0;
+}
+
+bool RamTier::DurableReservation::Commit() noexcept {
+  return state_ && state_->owner->CommitReservation(this);
+}
+
+void RamTier::DurableReservation::Reset() noexcept {
+  if (state_) state_->owner->AbortReservation(this);
+}
+
 
 RamTier::RamTier(Options opt, FlushFn flush)
     : opt_(opt), flush_(std::move(flush)) {
@@ -352,7 +398,7 @@ void RamTier::ReleaseLargeBudget(uint64_t bytes) {
 void RamTier::EraseEvictedLocked(
     Shard& s, const std::vector<BlockKey>& keys) {
   for (const BlockKey& key : keys) {
-    auto it = s.index.find(key.Filename());
+    auto it = s.index.find(key);
     if (it == s.index.end()) continue;
     ReleaseBudget(it->second.cap);
     s.index.erase(it);
@@ -416,12 +462,11 @@ RamTier::Admission RamTier::Admit(
     return Admission::kBypass;
   }
 
-  const std::string fn = key.Filename();
-  Shard& s = ShardFor(fn);
+  Shard& s = ShardFor(key);
   auto completion = std::make_shared<PutCompletion>();
   {
     std::lock_guard<std::mutex> lk(s.mu);
-    auto existing = s.index.find(fn);
+    auto existing = s.index.find(key);
     if (existing != s.index.end()) {
       if (existing->second.remove_pending) {
         put_bypass_.fetch_add(1, std::memory_order_relaxed);
@@ -434,12 +479,12 @@ RamTier::Admission RamTier::Admit(
       if (out_completion) *out_completion = existing->second.completion;
       return Admission::kDuplicate;
     }
-    auto writing = s.writing.find(fn);
+    auto writing = s.writing.find(key);
     if (writing != s.writing.end()) {
       if (out_completion) *out_completion = writing->second;
       return Admission::kDuplicate;
     }
-    s.writing.emplace(fn, completion);
+    s.writing.emplace(key, completion);
   }
   if (out_completion) *out_completion = completion;
 
@@ -447,6 +492,7 @@ RamTier::Admission RamTier::Admit(
   uint64_t offset = 0;
   uint64_t cap = requested_cap;
   AlignedBuffer dedicated;
+  SlabAllocator::SlotHandle slot_handle;
   bool admitted = false;
 
   if (large) {
@@ -471,13 +517,13 @@ RamTier::Admission RamTier::Admit(
         std::lock_guard<std::mutex> lk(s.mu);
         SlabAllocator::SlotRef ref;
         std::vector<BlockKey> evicted;
-        if (!s.alloc->Put(key, len, &ref, &evicted)) break;
+        if (!s.alloc->Put(key, len, &ref, &evicted, &slot_handle)) break;
         EraseEvictedLocked(s, evicted);
         cap = ref.slot_size;
         if (!TryReserve(cap)) {
           s.alloc->Remove(key);
         } else {
-          s.alloc->Pin(key);  // flush-pin
+          s.alloc->Pin(key, slot_handle);  // flush-pin
           offset = s.base_off + ref.extent * extent_bytes_ + ref.offset;
           admitted = true;
         }
@@ -489,7 +535,7 @@ RamTier::Admission RamTier::Admit(
   if (!admitted) {
     {
       std::lock_guard<std::mutex> lk(s.mu);
-      auto writing = s.writing.find(fn);
+      auto writing = s.writing.find(key);
       if (writing != s.writing.end() && writing->second == completion)
         s.writing.erase(writing);
     }
@@ -514,21 +560,22 @@ RamTier::Admission RamTier::Admit(
       std::lock_guard<std::mutex> state_lk(completion->mu);
       canceled = completion->canceled;
     }
-    s.writing.erase(fn);
+    s.writing.erase(key);
     if (!canceled) {
       Entry e;
       e.key = key;
       e.offset = offset;
       e.len = len;
       e.cap = cap;
+      e.slot_handle = slot_handle;
       e.large = std::move(dedicated);
       e.completion = completion;
       e.durable = false;
       e.flush_pin = true;
-      s.index.emplace(fn, std::move(e));
-      s.flushq.push_back(QItem{fn, key, 0});
+      s.index.emplace(key, std::move(e));
+      s.flushq.push_back(QItem{key, 0});
     } else if (!large) {
-      s.alloc->Unpin(key);
+      s.alloc->Unpin(key, slot_handle);
       s.alloc->Remove(key);
     }
   }
@@ -559,6 +606,147 @@ Status RamTier::PutCommitted(const BlockKey& key, const void* data, size_t len) 
   return WaitPut(completion);
 }
 
+bool RamTier::ReserveDurable(const BlockKey& key, size_t len,
+                             DurableReservation* out) {
+  if (out == nullptr) return false;
+  out->Reset();
+  if (!arena_ || len == 0 || static_cast<uint64_t>(len) > extent_bytes_)
+    return false;
+
+  uint64_t requested_cap = 0;
+  if (!AlignCapacity(len, opt_.slot_granularity, &requested_cap) ||
+      requested_cap > opt_.bytes)
+    return false;
+
+  const size_t shard_index = KeyHash{}(key) % shards_.size();
+  Shard& s = *shards_[shard_index];
+  auto completion = std::make_shared<PutCompletion>();
+  uint64_t offset = 0;
+  uint64_t cap = requested_cap;
+  SlabAllocator::SlotHandle slot_handle;
+  bool admitted = false;
+
+  for (int attempt = 0; attempt < 2 && !admitted; ++attempt) {
+    {
+      std::lock_guard<std::mutex> lk(s.mu);
+      auto existing = s.index.find(key);
+      if (existing != s.index.end() || s.writing.count(key)) return false;
+      SlabAllocator::SlotRef ref;
+      std::vector<BlockKey> evicted;
+      if (!s.alloc->Put(key, len, &ref, &evicted, &slot_handle)) break;
+      EraseEvictedLocked(s, evicted);
+      cap = ref.slot_size;
+      if (!TryReserve(cap)) {
+        s.alloc->Remove(key);
+      } else {
+        s.alloc->Pin(key, slot_handle);
+        s.writing.emplace(key, completion);
+        offset = s.base_off + ref.extent * extent_bytes_ + ref.offset;
+        admitted = true;
+      }
+    }
+    if (!admitted) ReclaimLargeFor(cap);
+  }
+  if (!admitted) return false;
+
+  auto state = std::make_unique<DurableReservation::State>();
+  state->owner = this;
+  state->shard_index = shard_index;
+  state->key = key;
+  state->len = len;
+  state->offset = offset;
+  state->cap = cap;
+  state->slot_handle = slot_handle;
+  state->completion = std::move(completion);
+  out->state_ = std::move(state);
+  return true;
+}
+
+bool RamTier::CommitReservation(
+    DurableReservation* reservation) noexcept {
+  if (reservation == nullptr || !reservation->state_ ||
+      reservation->state_->finished)
+    return false;
+  DurableReservation::State& state = *reservation->state_;
+  Shard& s = *shards_[state.shard_index];
+  bool canceled = false;
+  {
+    std::lock_guard<std::mutex> lk(s.mu);
+    {
+      std::lock_guard<std::mutex> state_lk(state.completion->mu);
+      canceled = state.completion->canceled;
+    }
+    auto writing = s.writing.find(state.key);
+    if (writing != s.writing.end() &&
+        writing->second == state.completion)
+      s.writing.erase(writing);
+    if (!canceled) {
+      Entry entry;
+      entry.key = state.key;
+      entry.offset = state.offset;
+      entry.len = state.len;
+      entry.cap = state.cap;
+      entry.slot_handle = state.slot_handle;
+      entry.durable = true;
+      entry.send_pins = 1;
+      entry.completion = state.completion;
+      CompletePut(state.completion, true);
+      s.index.emplace(state.key, std::move(entry));
+      state.installed = true;
+    } else {
+      // Remove() canceled the promotion while storage was filling the slot.
+      // Keep the physical slot pinned for the in-flight reply, but hide it and
+      // let the reservation destructor release the deferred allocation.
+      s.alloc->Remove(state.key);
+      CompletePut(state.completion, false);
+    }
+    state.finished = true;
+  }
+  if (!canceled) promotes_.fetch_add(1, std::memory_order_relaxed);
+  return !canceled;
+}
+
+void RamTier::AbortReservation(
+    DurableReservation* reservation) noexcept {
+  if (reservation == nullptr || !reservation->state_) return;
+  std::unique_ptr<DurableReservation::State> state =
+      std::move(reservation->state_);
+  Shard& s = *shards_[state->shard_index];
+  if (state->finished) {
+    bool release_budget = !state->installed;
+    {
+      std::lock_guard<std::mutex> lk(s.mu);
+      if (state->installed) {
+        auto it = s.index.find(state->key);
+        if (it != s.index.end() && it->second.send_pins != 0) {
+          Entry& entry = it->second;
+          --entry.send_pins;
+          s.alloc->Unpin(entry.key, entry.slot_handle);
+          if (entry.remove_pending && entry.send_pins == 0 &&
+              !entry.flushing)
+            DropLocked(s, state->key);
+        }
+      } else {
+        s.alloc->Unpin(state->key, state->slot_handle);
+      }
+    }
+    if (release_budget) ReleaseBudget(state->cap);
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(s.mu);
+    auto writing = s.writing.find(state->key);
+    if (writing != s.writing.end() &&
+        writing->second == state->completion)
+      s.writing.erase(writing);
+    s.alloc->Unpin(state->key, state->slot_handle);
+    s.alloc->Remove(state->key);
+  }
+  ReleaseBudget(state->cap);
+  CompletePut(state->completion, false);
+}
+
 bool RamTier::PutDurable(const BlockKey& key, const void* data, size_t len) {
   if (!arena_ || len == 0 || data == nullptr) return false;
   uint64_t requested_cap = 0;
@@ -566,28 +754,28 @@ bool RamTier::PutDurable(const BlockKey& key, const void* data, size_t len) {
       requested_cap > opt_.bytes)
     return false;
 
-  const std::string fn = key.Filename();
-  Shard& s = ShardFor(fn);
+  Shard& s = ShardFor(key);
   const bool large = static_cast<uint64_t>(len) > extent_bytes_;
   uint64_t offset = 0;
   uint64_t cap = requested_cap;
   AlignedBuffer dedicated;
+  SlabAllocator::SlotHandle slot_handle;
   auto completion = std::make_shared<PutCompletion>();
 
   if (large) {
     {
       std::lock_guard<std::mutex> lk(s.mu);
-      auto existing = s.index.find(fn);
+      auto existing = s.index.find(key);
       if (existing != s.index.end())
         return !existing->second.remove_pending;
-      if (s.writing.count(fn)) return false;
-      s.writing.emplace(fn, completion);
+      if (s.writing.count(key)) return false;
+      s.writing.emplace(key, completion);
     }
     if (!TryReserveLarge(cap)) {
       ReclaimLargeFor(cap);
       if (!TryReserveLarge(cap)) {
         std::lock_guard<std::mutex> lk(s.mu);
-        s.writing.erase(fn);
+        s.writing.erase(key);
         CompletePut(completion, false);
         return false;
       }
@@ -596,7 +784,7 @@ bool RamTier::PutDurable(const BlockKey& key, const void* data, size_t len) {
     if (posix_memalign(&p, 4096, cap) != 0 || p == nullptr) {
       ReleaseLargeBudget(cap);
       std::lock_guard<std::mutex> lk(s.mu);
-      s.writing.erase(fn);
+      s.writing.erase(key);
       CompletePut(completion, false);
       return false;
     }
@@ -606,20 +794,20 @@ bool RamTier::PutDurable(const BlockKey& key, const void* data, size_t len) {
     for (int attempt = 0; attempt < 2 && !admitted; ++attempt) {
       {
         std::lock_guard<std::mutex> lk(s.mu);
-        auto existing = s.index.find(fn);
+        auto existing = s.index.find(key);
         if (existing != s.index.end())
           return !existing->second.remove_pending;
-        if (s.writing.count(fn)) return false;
+        if (s.writing.count(key)) return false;
         SlabAllocator::SlotRef ref;
         std::vector<BlockKey> evicted;
-        if (!s.alloc->Put(key, len, &ref, &evicted)) break;
+        if (!s.alloc->Put(key, len, &ref, &evicted, &slot_handle)) break;
         EraseEvictedLocked(s, evicted);
         cap = ref.slot_size;
         if (!TryReserve(cap)) {
           s.alloc->Remove(key);
         } else {
-          s.alloc->Pin(key);  // protects the copy window
-          s.writing.emplace(fn, completion);
+          s.alloc->Pin(key, slot_handle);  // protects the copy window
+          s.writing.emplace(key, completion);
           offset = s.base_off + ref.extent * extent_bytes_ + ref.offset;
           admitted = true;
         }
@@ -642,21 +830,22 @@ bool RamTier::PutDurable(const BlockKey& key, const void* data, size_t len) {
       std::lock_guard<std::mutex> state_lk(completion->mu);
       canceled = completion->canceled;
     }
-    s.writing.erase(fn);
+    s.writing.erase(key);
     if (!canceled) {
       Entry e;
       e.key = key;
       e.offset = offset;
       e.len = len;
       e.cap = cap;
+      e.slot_handle = slot_handle;
       e.large = std::move(dedicated);
       e.durable = true;
       e.completion = completion;
       CompletePut(completion, true);
-      s.index.emplace(fn, std::move(e));
-      if (!large) s.alloc->Unpin(key);
+      s.index.emplace(key, std::move(e));
+      if (!large) s.alloc->Unpin(key, slot_handle);
     } else if (!large) {
-      s.alloc->Unpin(key);   // release the copy-window pin
+      s.alloc->Unpin(key, slot_handle);  // release the copy-window pin
       s.alloc->Remove(key);  // free the slot
     }
   }
@@ -676,11 +865,10 @@ bool RamTier::GetPrep(const BlockKey& key, uint64_t offset, uint64_t length,
                       Hit* out) {
   if (out != nullptr) *out = Hit{};
   if (shards_.empty()) return false;
-  const std::string fn = key.Filename();
-  const size_t sidx = std::hash<std::string>{}(fn) % shards_.size();
+  const size_t sidx = KeyHash{}(key) % shards_.size();
   Shard& s = *shards_[sidx];
   std::lock_guard<std::mutex> lk(s.mu);
-  auto it = s.index.find(fn);
+  auto it = s.index.find(key);
   if (it == s.index.end() || it->second.remove_pending) {
     misses_.fetch_add(1, std::memory_order_relaxed);
     return false;
@@ -692,7 +880,7 @@ bool RamTier::GetPrep(const BlockKey& key, uint64_t offset, uint64_t length,
   const uint64_t n = std::min(length == 0 ? avail : length, avail);
   if (out) {
     if (e.in_arena()) {
-      if (!s.alloc->Pin(key)) return false;
+      if (!s.alloc->Pin(key, e.slot_handle)) return false;
     }
     ++e.send_pins;
     out->ptr = e.data(arena_) + start;
@@ -703,47 +891,40 @@ bool RamTier::GetPrep(const BlockKey& key, uint64_t offset, uint64_t length,
                   ? arena_mr_.load(std::memory_order_acquire)
                   : nullptr;
     out->owner_ = this;
-    out->token_ = (s.next_token++ << kTokenShardBits) | sidx;
-    s.pinned[out->token_] = PinRef{fn, key};
+    out->token_ =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&e));
   }
   hits_.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 
 void RamTier::ReleaseToken(uint64_t token) {
-  if (shards_.empty()) return;
-  Shard& s = *shards_[(token & (kMaxShards - 1)) % shards_.size()];
+  if (shards_.empty() || token == 0) return;
+  Entry* entry =
+      reinterpret_cast<Entry*>(static_cast<uintptr_t>(token));
+  Shard& s = ShardFor(entry->key);
   std::lock_guard<std::mutex> lk(s.mu);
-  auto pin = s.pinned.find(token);
-  if (pin == s.pinned.end()) return;
-  const PinRef held = pin->second;
-  s.pinned.erase(pin);
-  auto entry = s.index.find(held.fn);
-  if (entry == s.index.end()) {
-    s.alloc->Unpin(held.key);  // defensive: balance the arena send pin
-    return;
+  if (entry->send_pins == 0) return;
+  --entry->send_pins;
+  if (entry->in_arena()) s.alloc->Unpin(entry->key, entry->slot_handle);
+  if (entry->remove_pending && entry->send_pins == 0 && !entry->flushing) {
+    const BlockKey key = entry->key;
+    DropLocked(s, key);
   }
-  Entry& e = entry->second;
-  if (e.send_pins > 0) --e.send_pins;
-  if (e.in_arena()) s.alloc->Unpin(e.key);
-  if (e.remove_pending && e.send_pins == 0 && !e.flushing)
-    DropLocked(s, held.fn);
 }
 
 bool RamTier::Contains(const BlockKey& key) const {
   if (shards_.empty()) return false;
-  const std::string fn = key.Filename();
-  const Shard& s = ShardFor(fn);
+  const Shard& s = ShardFor(key);
   std::lock_guard<std::mutex> lk(s.mu);
-  auto it = s.index.find(fn);
+  auto it = s.index.find(key);
   return it != s.index.end() && !it->second.remove_pending;
 }
 bool RamTier::Lookup(const BlockKey& key, size_t* value_len) const {
   if (shards_.empty() || value_len == nullptr) return false;
-  const std::string fn = key.Filename();
-  const Shard& s = ShardFor(fn);
+  const Shard& s = ShardFor(key);
   std::lock_guard<std::mutex> lk(s.mu);
-  auto it = s.index.find(fn);
+  auto it = s.index.find(key);
   if (it == s.index.end() || it->second.remove_pending) return false;
   *value_len = static_cast<size_t>(it->second.len);
   return true;
@@ -752,38 +933,37 @@ bool RamTier::Lookup(const BlockKey& key, size_t* value_len) const {
 
 bool RamTier::Remove(const BlockKey& key) {
   if (shards_.empty()) return false;
-  const std::string fn = key.Filename();
-  Shard& s = ShardFor(fn);
+  Shard& s = ShardFor(key);
   std::shared_ptr<PutCompletion> completion;
   bool had = false;
   {
     std::lock_guard<std::mutex> lk(s.mu);
-    auto writing = s.writing.find(fn);
+    auto writing = s.writing.find(key);
     if (writing != s.writing.end()) {
       completion = writing->second;
       had = true;
       std::lock_guard<std::mutex> state_lk(completion->mu);
       completion->canceled = true;
     } else {
-      auto it = s.index.find(fn);
+      auto it = s.index.find(key);
       if (it == s.index.end() || it->second.remove_pending) return false;
       had = true;
       Entry& e = it->second;
       e.remove_pending = true;  // visibility fence precedes every wait
       completion = e.completion;
       for (auto q = s.flushq.begin(); q != s.flushq.end();) {
-        if (q->fn == fn)
+        if (q->key == key)
           q = s.flushq.erase(q);
         else
           ++q;
       }
       if (!e.flushing) {
         if (e.flush_pin) {
-          if (e.in_arena()) s.alloc->Unpin(e.key);
+          if (e.in_arena()) s.alloc->Unpin(e.key, e.slot_handle);
           e.flush_pin = false;
         }
         if (!e.durable) CompletePut(completion, false);
-        if (e.send_pins == 0) DropLocked(s, fn);
+        if (e.send_pins == 0) DropLocked(s, key);
       }
     }
   }
@@ -794,33 +974,33 @@ bool RamTier::Remove(const BlockKey& key) {
     // queued flush, mirroring phase one) and run the normal drop path, so
     // Remove never returns while the key is still visible.
     std::lock_guard<std::mutex> lk(s.mu);
-    auto it = s.index.find(fn);
+    auto it = s.index.find(key);
     if (it != s.index.end()) {
       Entry& e = it->second;
       if (!e.remove_pending) {
         e.remove_pending = true;
         for (auto q = s.flushq.begin(); q != s.flushq.end();) {
-          if (q->fn == fn)
+          if (q->key == key)
             q = s.flushq.erase(q);
           else
             ++q;
         }
         if (!e.flushing) {
           if (e.flush_pin) {
-            if (e.in_arena()) s.alloc->Unpin(e.key);
+            if (e.in_arena()) s.alloc->Unpin(e.key, e.slot_handle);
             e.flush_pin = false;
           }
           if (!e.durable) CompletePut(e.completion, false);
         }
       }
-      if (!e.flushing && e.send_pins == 0) DropLocked(s, fn);
+      if (!e.flushing && e.send_pins == 0) DropLocked(s, key);
     }
   }
   return had;
 }
 
-void RamTier::DropLocked(Shard& s, const std::string& fn) {
-  auto it = s.index.find(fn);
+void RamTier::DropLocked(Shard& s, const BlockKey& key) {
+  auto it = s.index.find(key);
   if (it == s.index.end()) return;
   Entry& e = it->second;
   if (e.send_pins != 0 || e.flushing) {
@@ -859,7 +1039,7 @@ void RamTier::FlushLoop(Shard& s) {
     {
       std::lock_guard<std::mutex> lk(s.mu);
       for (size_t i = 0; i < B; ++i) {
-        auto it = s.index.find(batch[i].fn);
+        auto it = s.index.find(batch[i].key);
         if (it == s.index.end() || it->second.durable ||
             it->second.remove_pending)
           continue;
@@ -894,22 +1074,24 @@ void RamTier::FlushLoop(Shard& s) {
       std::lock_guard<std::mutex> lk(s.mu);
       for (size_t i = 0; i < B; ++i) {
         if (!live[i]) continue;
-        auto it = s.index.find(batch[i].fn);
+        auto it = s.index.find(batch[i].key);
         if (it == s.index.end()) continue;  // defensive
         Entry& entry = it->second;
         entry.flushing = false;
         if (entry.remove_pending) {
           if (entry.flush_pin) {
-            if (entry.in_arena()) s.alloc->Unpin(batch[i].key);
+            if (entry.in_arena())
+              s.alloc->Unpin(entry.key, entry.slot_handle);
             entry.flush_pin = false;
           }
           CompletePut(entry.completion, false);
-          if (entry.send_pins == 0) DropLocked(s, batch[i].fn);
+          if (entry.send_pins == 0) DropLocked(s, batch[i].key);
         } else if (ok[i]) {
           entry.durable = true;
           if (entry.flush_pin) {
             if (entry.in_arena())
-              s.alloc->Unpin(batch[i].key);  // release the flush-pin
+              s.alloc->Unpin(entry.key,
+                             entry.slot_handle);  // release the flush-pin
             entry.flush_pin = false;
           }
           CompletePut(entry.completion, true);
@@ -919,11 +1101,12 @@ void RamTier::FlushLoop(Shard& s) {
           s.cv.notify_one();
         } else {
           if (entry.flush_pin) {
-            if (entry.in_arena()) s.alloc->Unpin(batch[i].key);
+            if (entry.in_arena())
+              s.alloc->Unpin(entry.key, entry.slot_handle);
             entry.flush_pin = false;
           }
           CompletePut(entry.completion, false);
-          DropLocked(s, batch[i].fn);
+          DropLocked(s, batch[i].key);
           healthy_.store(false, std::memory_order_release);
           flush_dropped_.fetch_add(1, std::memory_order_relaxed);
         }

@@ -3,6 +3,8 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -262,6 +264,82 @@ TEST(PreparedRead, CoalescedRangeDirectHeadShiftByteExact) {
   }
   fs::remove_all(dir);
   ::unsetenv("DFKV_READ_COALESCE");
+}
+
+TEST(PreparedRead, WholeDiskMissReadsDirectlyIntoDurableRamSlot) {
+  ::setenv("DFKV_READ_COALESCE", "1", 1);
+  ::setenv("DFKV_RAM_TIER", "1", 1);
+  ::setenv("DFKV_RAM_TIER_BYTES", "16777216", 1);
+  ::setenv("DFKV_RAM_TIER_EXTENT_BYTES", "1048576", 1);
+  ::setenv("DFKV_RAM_WRITE_MODE", "writearound", 1);
+  const fs::path dir =
+      fs::temp_directory_path() / "dfkv_prepared_read_direct_promotion";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  {
+    KvNodeServer server(dir.string(), 1ull << 30);
+    ASSERT_TRUE(server.Healthy());
+    ASSERT_TRUE(server.ram_enabled());
+
+    std::string value(8192, '\0');
+    for (size_t i = 0; i < value.size(); ++i)
+      value[i] = static_cast<char>('a' + (i % 23));
+    AlignedBuffer seed(value.size());
+    std::memcpy(seed.data(), value.data(), value.size());
+    ASSERT_EQ(server.CacheDirectForKey(
+                  Key(92), seed.data(), value.size(), seed.size()),
+              Status::kOk);
+    AlignedBuffer staging(1 << 20);
+
+    PreparedRead read =
+        server.PrepareReadForKey(Key(92), 0, value.size(), staging.data(),
+                                 staging.size());
+    ASSERT_EQ(read.status(), Status::kOk);
+    ASSERT_TRUE(read.needs_io());
+    EXPECT_TRUE(read.source_registered());
+    EXPECT_NE(read.staging(), staging.data());
+    AlignedBuffer follower_staging(1 << 20);
+    PreparedRead follower;
+    std::atomic<bool> follower_entered{false};
+    std::thread follower_thread([&] {
+      follower_entered.store(true, std::memory_order_release);
+      follower = server.PrepareReadForKey(
+          Key(92), 0, value.size(), follower_staging.data(),
+          follower_staging.size());
+    });
+    while (!follower_entered.load(std::memory_order_acquire))
+      std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const ssize_t got = ::pread(read.fd(), read.staging(), read.aligned_len(),
+                                static_cast<off_t>(read.aligned_off()));
+    const bool io_ok =
+        got >= 0 &&
+        static_cast<size_t>(got) >= read.head() + read.payload_len();
+    EXPECT_TRUE(read.Commit(io_ok ? Status::kOk : Status::kIOError,
+                            io_ok ? read.payload_len() : 0, 0.001));
+    follower_thread.join();
+    ASSERT_TRUE(io_ok);
+    EXPECT_EQ(std::memcmp(read.data(), value.data(), value.size()), 0);
+    // The concurrent duplicate waited for disk completion, then acquired the
+    // published arena entry directly: no follower payload copy or second IO.
+    ASSERT_EQ(follower.status(), Status::kOk);
+    EXPECT_FALSE(follower.needs_io());
+    EXPECT_TRUE(follower.source_registered());
+    EXPECT_NE(follower.data(), follower_staging.data());
+    EXPECT_EQ(std::memcmp(follower.data(), value.data(), value.size()), 0);
+
+    // A second terminal call models SEND completion and releases the retained
+    // post-read source pin; the follower releases its independent RAM pin.
+    EXPECT_FALSE(read.Commit(Status::kOk, read.payload_len(), 0.0));
+    EXPECT_TRUE(
+        follower.Commit(Status::kOk, follower.payload_len(), 0.0));
+  }
+  fs::remove_all(dir);
+  ::unsetenv("DFKV_READ_COALESCE");
+  ::unsetenv("DFKV_RAM_TIER");
+  ::unsetenv("DFKV_RAM_TIER_BYTES");
+  ::unsetenv("DFKV_RAM_TIER_EXTENT_BYTES");
+  ::unsetenv("DFKV_RAM_WRITE_MODE");
 }
 
 }  // namespace

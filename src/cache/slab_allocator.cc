@@ -662,14 +662,17 @@ bool SlabAllocator::StealFrom(size_t donor_cls, size_t target_cls,
 }
 
 bool SlabAllocator::Put(const BlockKey& key, size_t len, SlotRef* out,
-                        std::vector<BlockKey>* evicted) {
+                        std::vector<BlockKey>* evicted,
+                        SlotHandle* out_handle) {
   std::lock_guard<std::mutex> lock(mu_);
+  if (out_handle) *out_handle = SlotHandle{};
   ++activity_seq_;
   if (uint32_t* existing = index_.Find(key)) {
     SlotMeta& meta = slots_[*existing];
     if (meta.remove_pending) return false;
     meta.referenced = true;
     if (out) *out = meta.ref;
+    if (out_handle) out_handle->index = *existing;
     return true;
   }
   if (len == 0 || len > opt_.extent_bytes || len > UINT32_MAX) return false;
@@ -733,6 +736,7 @@ bool SlabAllocator::Put(const BlockKey& key, size_t len, SlotRef* out,
   extent.youngest_seq = std::max(extent.youngest_seq, meta.put_seq);
   used_bytes_ += meta.ref.slot_size;
   if (out) *out = meta.ref;
+  if (out_handle) out_handle->index = meta_index;
   return true;
 }
 
@@ -801,6 +805,29 @@ bool SlabAllocator::Unpin(const BlockKey& key) {
   if (meta.refs == 0) {
     if (extents_[meta.ref.extent].pinned > 0) --extents_[meta.ref.extent].pinned;
     if (meta.remove_pending) FreeSlotLocked(index);
+  }
+  return true;
+}
+
+bool SlabAllocator::Pin(const BlockKey& key, SlotHandle handle) {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (!handle.valid() || handle.index >= slots_.size()) return false;
+  SlotMeta& meta = slots_[handle.index];
+  if (!meta.live || !(meta.key == key) || meta.remove_pending) return false;
+  if (meta.refs == 0) ++extents_[meta.ref.extent].pinned;
+  ++meta.refs;
+  return true;
+}
+
+bool SlabAllocator::Unpin(const BlockKey& key, SlotHandle handle) {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (!handle.valid() || handle.index >= slots_.size()) return false;
+  SlotMeta& meta = slots_[handle.index];
+  if (!meta.live || !(meta.key == key) || meta.refs == 0) return false;
+  --meta.refs;
+  if (meta.refs == 0) {
+    if (extents_[meta.ref.extent].pinned > 0) --extents_[meta.ref.extent].pinned;
+    if (meta.remove_pending) FreeSlotLocked(handle.index);
   }
   return true;
 }

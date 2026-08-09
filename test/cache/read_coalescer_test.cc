@@ -201,6 +201,67 @@ TEST(ReadCoalescer, SyncLeaderReportsFanIn) {
   EXPECT_TRUE(oc.had_waiters);
 }
 
+TEST(ReadCoalescer, AsyncFollowerWaitsWithoutPayloadCopy) {
+  ReadCoalescer c;
+  const std::string value(8192, 'z');
+  const uint64_t token = c.TryRegisterAsync(
+      K(8), 0, value.size(), /*whole_value=*/true, value.size(),
+      /*publishes_to_ram=*/true);
+  ASSERT_NE(token, 0u);
+
+  std::atomic<bool> entered{false};
+  ReadCoalescer::PublishedWait waited =
+      ReadCoalescer::PublishedWait::kNotEligible;
+  std::thread follower([&] {
+    entered.store(true, std::memory_order_release);
+    waited = c.WaitForPublished(K(8), 0, value.size());
+  });
+  while (!entered.load(std::memory_order_acquire))
+    std::this_thread::sleep_for(1ms);
+  std::this_thread::sleep_for(20ms);
+
+  // No payload is supplied: a direct follower needs only the completion fence,
+  // then obtains bytes through the separately published RAM reservation.
+  EXPECT_TRUE(c.CompleteAsync(
+      token, Status::kOk, nullptr, value.size()));
+  follower.join();
+  EXPECT_EQ(waited, ReadCoalescer::PublishedWait::kReady);
+  EXPECT_EQ(c.coalesced(), 0u);
+  c.RecordCoalesced();
+  EXPECT_EQ(c.coalesced(), 1u);
+}
+
+TEST(ReadCoalescer, NoCopyWaitRequiresDirectRamPublication) {
+  ReadCoalescer c;
+  const std::string value(4096, 's');
+  const uint64_t token = c.TryRegisterAsync(
+      K(9), 0, value.size(), /*whole_value=*/true, value.size(),
+      /*publishes_to_ram=*/false);
+  ASSERT_NE(token, 0u);
+  EXPECT_EQ(c.WaitForPublished(K(9), 0, value.size()),
+            ReadCoalescer::PublishedWait::kNotEligible);
+  EXPECT_TRUE(c.InFlight(K(9), 0, value.size()));
+  EXPECT_FALSE(c.CompleteAsync(token, Status::kOk, value.data(), value.size()));
+}
+
+TEST(ReadCoalescer, DirectPublicationSkipsRecurrenceTombstone) {
+  ReadCoalescer c;
+  const uint64_t direct = c.TryRegisterAsync(
+      K(10), 0, 4096, /*whole_value=*/true, 4096,
+      /*publishes_to_ram=*/true);
+  ASSERT_NE(direct, 0u);
+  EXPECT_FALSE(c.CompleteAsync(direct, Status::kOk, nullptr, 4096));
+
+  bool recurrent = true;
+  const uint64_t staged =
+      c.TryRegisterAsync(K(10), 0, 4096, /*whole_value=*/true);
+  ASSERT_NE(staged, 0u);
+  c.CompleteAsync(
+      staged, Status::kOk, nullptr, 4096, nullptr, nullptr, &recurrent);
+  EXPECT_FALSE(recurrent);
+  EXPECT_EQ(c.recur_hits(), 0u);
+}
+
 }  // namespace
 
 // v2 recurrence window: a lone whole-value read leaves a key fingerprint; a
