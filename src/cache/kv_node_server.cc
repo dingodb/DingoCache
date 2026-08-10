@@ -155,6 +155,16 @@ void KvNodeServer::InitRamTier() {
   // Background free-slot reclaimer cadence (ms; 0 disables). Default 10.
   if (const char* r = std::getenv("DFKV_RAM_RECLAIM_MS"))
     o.reclaim_interval_ms = static_cast<uint32_t>(std::strtoul(r, nullptr, 10));
+  const char* ack = std::getenv("DFKV_PUT_ACK_MODE");
+  ram_ack_enabled_ = ack != nullptr && std::string(ack) == "ram";
+  if (const char* p = std::getenv("DFKV_RAM_ACK_HIGH_WATERMARK_PCT")) {
+    const unsigned long n = std::strtoul(p, nullptr, 10);
+    if (n <= 100) o.ack_high_watermark_pct = static_cast<uint32_t>(n);
+  }
+  config_dump::RecordResolved("DFKV_PUT_ACK_MODE",
+                              ram_ack_enabled_ ? "ram" : "disk");
+  config_dump::RecordResolved("DFKV_RAM_ACK_HIGH_WATERMARK_PCT",
+                              std::to_string(o.ack_high_watermark_pct));
   config_dump::RecordResolved("DFKV_RAM_TIER_BYTES", std::to_string(o.bytes));
   config_dump::RecordResolved("DFKV_RAM_RECLAIM_MS", std::to_string(o.reclaim_interval_ms));
   // Flusher persists a RAM slot to the disk group. CacheDirect (not Cache): the
@@ -571,6 +581,22 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_ram_rebalanced_total", "counter", "RAM extents moved from cold classes to hot ones by the reclaimer", ram_->Rebalanced());
     metric("dfkv_ram_objects", "gauge", "Blocks currently resident in the RAM hot tier", ram_->Count());
     metric("dfkv_ram_flush_backlog", "gauge", "RAM slots queued or flushing (not yet durable)", ram_->FlushBacklog());
+    metric("dfkv_ram_dirty_objects", "gauge",
+           "RAM-resident objects not yet durable on disk", ram_->DirtyObjects());
+    metric("dfkv_ram_dirty_bytes", "gauge",
+           "Allocated bytes not yet durable on disk", ram_->DirtyBytes());
+    metric("dfkv_ram_oldest_dirty_age_seconds", "gauge",
+           "Age in seconds of the oldest non-durable RAM object",
+           ram_->OldestDirtyAgeSeconds());
+    metric("dfkv_ram_ack_total", "counter",
+           "PUTs acknowledged from flush-pinned RAM before disk commit",
+           ram_->RamAcks());
+    metric("dfkv_ram_ack_backpressure_total", "counter",
+           "RAM-ACK PUTs forced to wait for disk at the dirty watermark",
+           ram_->AckBackpressure());
+    metric("dfkv_ram_post_ack_flush_failures_total", "counter",
+           "Acknowledged RAM PUTs whose background disk flush later failed",
+           ram_->PostAckFlushFailures());
     metric("dfkv_ram_budget_bytes", "gauge",
            "Hard total RAM-tier budget across arena and dedicated values",
            ram_->budget_bytes());
@@ -677,13 +703,14 @@ Status KvNodeServer::ProcessRequestForKey(
       }
       bool samp = lat_sampler_.ShouldSample();
       double t0 = samp ? NowSec() : 0.0;
-      // A server PUT cannot acknowledge an arena admission: it waits for the
-      // actual disk commit. Only genuine RAM capacity backpressure falls through
-      // to a separate synchronous disk write; an in-flight duplicate shares its
-      // leader's final result.
+      // RAM-ACK mode publishes a flush-pinned copy and returns immediately;
+      // its dirty-byte watermark switches individual requests back to waiting
+      // for disk. Admission failure falls through to the normal disk path.
       bool needs_disk = true;
       if (ram_ && group_.TenantQuotaBytes(key.tenant_hash) == 0) {
-        st = ram_->PutCommitted(key, payload, payload_len);
+        st = ram_ack_enabled_
+                 ? ram_->PutWriteBack(key, payload, payload_len)
+                 : ram_->PutCommitted(key, payload, payload_len);
         needs_disk = st == Status::kCacheFull;
         if (st == Status::kOk) {
           cache_put_.fetch_add(1, std::memory_order_relaxed);
@@ -928,13 +955,12 @@ Status KvNodeServer::CacheDirectForKey(const BlockKey& key, char* data,
   Status st = Status::kCacheFull;
   const bool quota_ok = !ram_ || group_.TenantQuotaBytes(key.tenant_hash) == 0;
   bool needs_disk = true;
-  // Write-back: admit to the RAM arena first; the arena absorbs PUT bursts
-  // and serves zero-copy GET until the async flusher drains to disk. Only
-  // genuine arena backpressure (kCacheFull) falls through to direct disk
-  // write. Write-around (DFKV_RAM_WRITE_MODE=writearound) writes straight to
-  // disk and fills the arena lazily via GET read-promotion instead.
+  // Write-back admits to the RAM arena first. RAM-ACK returns after the
+  // flush-pinned value is visible; disk-ACK waits for the same flush result.
+  // Genuine arena backpressure falls through to direct disk write.
   if (ram_write_back_ && ram_ && quota_ok) {
-    st = ram_->PutCommitted(key, data, len);
+    st = ram_ack_enabled_ ? ram_->PutWriteBack(key, data, len)
+                          : ram_->PutCommitted(key, data, len);
     needs_disk = st == Status::kCacheFull;
     if (st == Status::kOk) {
       cache_put_.fetch_add(1, std::memory_order_relaxed);

@@ -224,6 +224,7 @@ class KvNodeServer {
   // mode, PUT lands in RAM (sync-visible) and flushes to group_; write-around
   // populates RAM through born-durable GET promotion. GET checks RAM first.
   std::unique_ptr<RamTier> ram_;
+  bool ram_ack_enabled_ = false;
   bool ram_required_failed_ = false;
   int listen_fd_ = -1;
   int port_ = 0;

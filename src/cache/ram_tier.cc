@@ -451,7 +451,7 @@ Status RamTier::WaitPut(
 }
 
 RamTier::Admission RamTier::Admit(
-    const BlockKey& key, const void* data, size_t len,
+    const BlockKey& key, const void* data, size_t len, bool client_ack,
     std::shared_ptr<PutCompletion>* out_completion) {
   if (out_completion) out_completion->reset();
   if (!arena_ || len == 0 || data == nullptr) return Admission::kBypass;
@@ -572,8 +572,12 @@ RamTier::Admission RamTier::Admit(
       e.completion = completion;
       e.durable = false;
       e.flush_pin = true;
+      e.client_acked = client_ack;
+      e.dirty_since = std::chrono::steady_clock::now();
       s.index.emplace(key, std::move(e));
       s.flushq.push_back(QItem{key, 0});
+      dirty_bytes_.fetch_add(cap, std::memory_order_relaxed);
+      dirty_objects_.fetch_add(1, std::memory_order_relaxed);
     } else if (!large) {
       s.alloc->Unpin(key, slot_handle);
       s.alloc->Remove(key);
@@ -595,13 +599,12 @@ RamTier::Admission RamTier::Admit(
 
 bool RamTier::Put(const BlockKey& key, const void* data, size_t len) {
   std::shared_ptr<PutCompletion> completion;
-  return Admit(key, data, len, &completion) != Admission::kBypass;
+  return Admit(key, data, len, false, &completion) != Admission::kBypass;
 }
 
 Status RamTier::PutCommitted(const BlockKey& key, const void* data, size_t len) {
-  if (len == 0 || data == nullptr) return Status::kInvalid;
   std::shared_ptr<PutCompletion> completion;
-  const Admission admission = Admit(key, data, len, &completion);
+  const Admission admission = Admit(key, data, len, false, &completion);
   if (admission == Admission::kBypass) return Status::kCacheFull;
   return WaitPut(completion);
 }
@@ -745,6 +748,23 @@ void RamTier::AbortReservation(
   }
   ReleaseBudget(state->cap);
   CompletePut(state->completion, false);
+}
+
+Status RamTier::PutWriteBack(const BlockKey& key, const void* data, size_t len) {
+  const uint64_t high =
+      opt_.bytes * std::min<uint32_t>(opt_.ack_high_watermark_pct, 100) / 100;
+  const bool synchronous =
+      high == 0 || dirty_bytes_.load(std::memory_order_relaxed) >= high;
+  std::shared_ptr<PutCompletion> completion;
+  const Admission admission =
+      Admit(key, data, len, !synchronous, &completion);
+  if (admission == Admission::kBypass) return Status::kCacheFull;
+  if (synchronous) {
+    ack_backpressure_.fetch_add(1, std::memory_order_relaxed);
+    return WaitPut(completion);
+  }
+  ram_acks_.fetch_add(1, std::memory_order_relaxed);
+  return Status::kOk;
 }
 
 bool RamTier::PutDurable(const BlockKey& key, const void* data, size_t len) {
@@ -1009,6 +1029,10 @@ void RamTier::DropLocked(Shard& s, const BlockKey& key) {
   }
   const uint64_t cap = e.cap;
   const bool large = !e.in_arena();
+  if (!e.durable) {
+    dirty_bytes_.fetch_sub(cap, std::memory_order_relaxed);
+    dirty_objects_.fetch_sub(1, std::memory_order_relaxed);
+  }
   if (!large) s.alloc->Remove(e.key);
   s.index.erase(it);
   if (large)
@@ -1089,6 +1113,8 @@ void RamTier::FlushLoop(Shard& s) {
           if (entry.send_pins == 0) DropLocked(s, batch[i].key);
         } else if (ok[i]) {
           entry.durable = true;
+          dirty_bytes_.fetch_sub(entry.cap, std::memory_order_relaxed);
+          dirty_objects_.fetch_sub(1, std::memory_order_relaxed);
           if (entry.flush_pin) {
             if (entry.in_arena())
               s.alloc->Unpin(entry.key,
@@ -1107,6 +1133,8 @@ void RamTier::FlushLoop(Shard& s) {
             entry.flush_pin = false;
           }
           CompletePut(entry.completion, false);
+          if (entry.client_acked)
+            post_ack_flush_failures_.fetch_add(1, std::memory_order_relaxed);
           DropLocked(s, batch[i].key);
           healthy_.store(false, std::memory_order_release);
           flush_dropped_.fetch_add(1, std::memory_order_relaxed);
@@ -1144,6 +1172,21 @@ size_t RamTier::FlushBacklog() const {
     n += sh->flushq.size() + sh->flush_inflight;
   }
   return n;
+}
+
+uint64_t RamTier::OldestDirtyAgeSeconds() const {
+  const auto now = std::chrono::steady_clock::now();
+  std::chrono::steady_clock::duration oldest{};
+  for (const auto& sh : shards_) {
+    std::lock_guard<std::mutex> lk(sh->mu);
+    for (const auto& [_, entry] : sh->index) {
+      if (!entry.durable && !entry.remove_pending) {
+        oldest = std::max(oldest, now - entry.dirty_since);
+      }
+    }
+  }
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(oldest).count());
 }
 
 }  // namespace dfkv

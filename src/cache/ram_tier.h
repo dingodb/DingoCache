@@ -42,6 +42,7 @@
 #ifndef DFKV_RAM_TIER_H_
 #define DFKV_RAM_TIER_H_
 #include <cstdlib>
+#include <chrono>
 
 #include <atomic>
 #include <condition_variable>
@@ -85,6 +86,9 @@ class RamTier {
     // without it a full arena runs the CLOCK eviction sweep inline under the
     // shard lock on every admission.
     uint32_t reclaim_interval_ms = 10;
+    // Dirty-byte watermark for RAM-ACK mode. Once reached, new PUTs wait for
+    // their flush result instead of acknowledging asynchronously.
+    uint32_t ack_high_watermark_pct = 80;
   };
 
   // Persists a resident value to disk. `data` is 4 KiB aligned and `cap` is
@@ -167,10 +171,15 @@ class RamTier {
   // capacity backpressure.
   bool Put(const BlockKey& key, const void* data, size_t len);
 
-  // Server PUT contract: wait for the admitted key's actual flush result.
+  // Disk-ACK contract: wait for the admitted key's actual flush result.
   // kCacheFull is the only disk-fallback result; kIOError means an admitted
   // leader exhausted its flush retries (duplicates observe the same result).
   Status PutCommitted(const BlockKey& key, const void* data, size_t len);
+
+  // Cache RAM-ACK contract: acknowledge after the payload is copied into a
+  // visible, flush-pinned RAM entry. At the dirty-byte high watermark this
+  // request waits for disk commit, bounding acknowledged volatile data.
+  Status PutWriteBack(const BlockKey& key, const void* data, size_t len);
 
   // Read-promotion entry: install a value that is ALREADY durable on disk
   // (a coalesced cold read with fan-in evidence). Same allocation/index logic
@@ -222,6 +231,22 @@ class RamTier {
   uint64_t UsedBytes() const;   // arena slot + dedicated allocation bytes
   size_t Count() const;
   size_t FlushBacklog() const;  // queued or flushing, not-yet-durable items
+  uint64_t DirtyBytes() const {
+    return dirty_bytes_.load(std::memory_order_relaxed);
+  }
+  uint64_t DirtyObjects() const {
+    return dirty_objects_.load(std::memory_order_relaxed);
+  }
+  uint64_t OldestDirtyAgeSeconds() const;
+  uint64_t RamAcks() const {
+    return ram_acks_.load(std::memory_order_relaxed);
+  }
+  uint64_t AckBackpressure() const {
+    return ack_backpressure_.load(std::memory_order_relaxed);
+  }
+  uint64_t PostAckFlushFailures() const {
+    return post_ack_flush_failures_.load(std::memory_order_relaxed);
+  }
 
  private:
   struct FreeAligned {
@@ -247,6 +272,8 @@ class RamTier {
     bool durable = false;
     bool flushing = false;
     bool flush_pin = false;
+    bool client_acked = false;
+    std::chrono::steady_clock::time_point dirty_since;
     bool remove_pending = false;  // hidden immediately; physical free after pins
     bool in_arena() const { return !large; }
     char* data(char* arena) const { return large ? large.get() : arena + offset; }
@@ -293,6 +320,7 @@ class RamTier {
   void EraseEvictedLocked(Shard& s, const std::vector<BlockKey>& keys);
   enum class Admission { kAccepted, kDuplicate, kBypass };
   Admission Admit(const BlockKey& key, const void* data, size_t len,
+                  bool client_ack,
                   std::shared_ptr<PutCompletion>* completion);
   static void CompletePut(const std::shared_ptr<PutCompletion>& completion,
                           bool success);
@@ -348,6 +376,9 @@ class RamTier {
   std::atomic<uint64_t> large_evictions_{0};
   std::atomic<uint64_t> hits_{0}, misses_{0}, puts_{0}, put_bypass_{0}, promotes_{0};
   std::atomic<uint64_t> flushed_{0}, flush_dropped_{0}, reclaimed_{0}, rebalanced_{0};
+  std::atomic<uint64_t> dirty_bytes_{0}, dirty_objects_{0};
+  std::atomic<uint64_t> ram_acks_{0}, ack_backpressure_{0};
+  std::atomic<uint64_t> post_ack_flush_failures_{0};
 };
 
 inline RamTier::Hit::~Hit() { Reset(); }
