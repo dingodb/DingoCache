@@ -227,6 +227,11 @@ class ObservabilityContractTest(unittest.TestCase):
         compose = (ROOT / "deploy" / "observability" / "docker-compose.yml").read_text()
         self.assertIn("/etc/prometheus/alerts.yml", prometheus)
         self.assertIn("./alerts.yml:/etc/prometheus/alerts.yml:ro", compose)
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        self.assertIn(
+            '-v "$PWD/deploy/observability:/etc/prometheus:ro"', ci
+        )
+        self.assertIn("check config /etc/prometheus/prometheus.yml", ci)
 
 
     def test_deployment_defaults_are_fail_closed_and_immutable(self):
