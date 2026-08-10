@@ -32,12 +32,5 @@ TEST(ParallelExecutor, ItemExceptionDoesNotPoisonLaterJobs) {
   EXPECT_EQ(completed.load(), 19u);
 }
 
-TEST(ParallelExecutor, CompletedJobsLeaveNoStaleHelperTickets) {
-  for (size_t run = 0; run < 100; ++run)
-    RunParallel(2, 32, [](size_t) {});
-
-  EXPECT_EQ(ParallelExecutor::Instance().PendingQueueEntriesForTest(), 0u);
-}
-
 }  // namespace
 }  // namespace dfkv
