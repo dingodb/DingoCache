@@ -46,6 +46,8 @@ class ReleaseVersionContractTest(unittest.TestCase):
         self.assertIn("docker build --target runtime", workflow)
         self.assertIn("docker image save", workflow)
         self.assertIn("ctest --test-dir build-release --output-on-failure", workflow)
+        self.assertIn('git merge-base --is-ancestor "$GITHUB_SHA" origin/main', workflow)
+        self.assertIn("--exclude-regex '^RdmaLoopback\\.'", workflow)
         self.assertIn("promtool", workflow)
         self.assertIn("--no-deps --target wheel-check release/*.whl", workflow)
         self.assertIn("dfkv_connector/_telemetry/metrics_push.py", workflow)

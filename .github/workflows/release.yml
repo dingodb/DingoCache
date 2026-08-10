@@ -32,6 +32,10 @@ jobs:
           tag=${GITHUB_REF_NAME}
           test "$tag" = "v$version"
           python3 -m unittest discover -s test/python -p test_release_contract.py
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            echo "::error::release tag commit is not reachable from origin/main"
+            exit 1
+          }
 
       - name: Install build dependencies
         run: |
@@ -55,8 +59,13 @@ jobs:
             -DDFKV_STATIC_LIBSTDCXX=ON
           cmake --build build-release -j2
 
+      # The generic release runner has no HCA. Hardware-only loopback tests are
+      # covered by CI's dedicated RDMA compile + probe-gated Soft-RoCE jobs and
+      # by release qualification on real RDMA hardware.
       - name: Run release tests
-        run: ctest --test-dir build-release --output-on-failure -j2
+        run: |
+          ctest --test-dir build-release --output-on-failure -j2 \
+            --exclude-regex '^RdmaLoopback\.'
 
       - name: Validate observability configuration
         env:

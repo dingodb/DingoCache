@@ -26,7 +26,7 @@ dfkv 把**控制面**与**数据面**解耦：
 
 ## 1. 构建可移植 release 产物（同架构构建机一次）
 
-> v2.11.0 的 canonical Linux 交付是一个自包含 tarball，含 versioned
+> v2.11.1 的 canonical Linux 交付是一个自包含 tarball，含 versioned
 > `libdfkv.so`/SONAME symlink、全部 CLI/daemon、Python shim、connector 源码、
 > deploy 工具和文档。不要从 build tree 手工挑文件。
 
@@ -56,7 +56,7 @@ ldd build/libdfkv.so | grep ibverbs
 ## 2. 每节点：分发 + 缓存目录
 
 ```bash
-version=2.11.0
+version=2.11.1
 tar xzf "dfkv-${version}-linux-x86_64.tar.gz"
 root="$PWD/dfkv-${version}-linux-x86_64"
 install -m755 "$root/bin/dfkv_server" /usr/local/bin/dfkv_server
