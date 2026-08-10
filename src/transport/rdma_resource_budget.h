@@ -19,6 +19,14 @@ struct ResourceRequest {
 class ResourceBudget {
  public:
   explicit ResourceBudget(ResourceRequest limit) : limit_(limit) {}
+  bool TryAcquire(const ResourceRequest& request) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!FitsLimit(request) || !FitsAvailable(request)) return false;
+    Add(&used_, request);
+    ++waiters_served_;
+    return true;
+  }
+
 
   bool Acquire(const ResourceRequest& request,
                std::chrono::milliseconds timeout) {

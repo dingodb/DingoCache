@@ -129,6 +129,7 @@ class RdmaTransport : public Transport {
   void Destroy(Conn* c,
                rdma::RailCompletion completion =
                    rdma::RailCompletion::kRailFailure);
+  bool EvictOneIdle();
   // Keep every idle QP alive while its client process is healthy. This lets a
   // short server-side idle reaper reclaim dead clients without forcing the
   // first cache read after an idle gap to discover and rebuild stale QPs.
@@ -226,6 +227,9 @@ class RdmaTransport : public Transport {
   std::atomic<uint64_t> keepalive_successes_{0};
   std::atomic<uint64_t> keepalive_failures_{0};
   std::unique_ptr<std::atomic<uint64_t>[]> rail_conns_;  // sized to devs_.size()
+  std::atomic<uint64_t> endpoint_cache_hits_{0};
+  std::atomic<uint64_t> endpoint_cache_misses_{0};
+  std::atomic<uint64_t> endpoint_cache_evictions_{0};
   // Fixed-cardinality locality fallback reasons: caller NUMA unknown / no
   // enabled local rail. Endpoint failures are bounded per configured rail in
   // RailPolicy::Snapshot rather than labeled by arbitrary node addresses.

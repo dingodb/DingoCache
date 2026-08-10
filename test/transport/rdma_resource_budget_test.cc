@@ -47,6 +47,18 @@ TEST(RdmaResourceBudget, TimeoutDoesNotOversubscribe) {
   EXPECT_EQ(budget.timeouts(), 1u);
   budget.Release(request);
 }
+TEST(RdmaResourceBudget, TryAcquireNeverWaitsOrCountsTimeout) {
+  ResourceBudget budget({1, 1, 1, 1});
+  const ResourceRequest request{1, 1, 1, 1};
+  ASSERT_TRUE(budget.TryAcquire(request));
+  EXPECT_FALSE(budget.TryAcquire(request));
+  EXPECT_EQ(budget.timeouts(), 0u);
+  EXPECT_EQ(budget.used().endpoints, 1u);
+  budget.Release(request);
+  EXPECT_TRUE(budget.TryAcquire(request));
+  budget.Release(request);
+}
+
 
 }  // namespace
 }  // namespace dfkv::rdma
