@@ -818,6 +818,44 @@ TEST(RdmaLoopback, RegisterMemoryRoundtrip) {
   }
 }
 
+// A live client must not inherit the server's short dead-client reap interval
+// as a first-read reconnect penalty. Idle QPs receive lightweight membership
+// probes; a dead process sends none and remains reclaimable by the server.
+TEST(RdmaLoopback, KeepalivePreservesIdleDataConnection) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ::setenv("DFKV_RDMA_IDLE_MS", "150", 1);
+  ::setenv("DFKV_RDMA_KEEPALIVE_MS", "30", 1);
+  {
+    RdmaNode node("keepalive");
+    RdmaTransport rt(kMaxMsg);
+    KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+    std::string value(4096, 'k');
+    std::string out(value.size(), '\0');
+    EXPECT_TRUE(c.Put("alive", value.data(), value.size()));
+    EXPECT_TRUE(c.Get("alive", out.data(), out.size()));
+    EXPECT_EQ(out, value);
+
+    const long stale_before = CounterVal(
+        rt.MetricsText(), "dfkv_rdma_client_stale_pool_retries_total");
+    std::this_thread::sleep_for(std::chrono::milliseconds(450));
+    out.assign(value.size(), '\0');
+    EXPECT_TRUE(c.Get("alive", out.data(), out.size()));
+    EXPECT_EQ(out, value);
+    const std::string metrics = rt.MetricsText();
+    EXPECT_GT(CounterVal(
+                  metrics, "dfkv_rdma_client_keepalive_successes_total"),
+              0);
+    EXPECT_EQ(CounterVal(
+                  metrics, "dfkv_rdma_client_stale_pool_retries_total"),
+              stale_before);
+    EXPECT_EQ(CounterVal(
+                  metrics, "dfkv_rdma_client_keepalive_failures_total"),
+              0);
+  }
+  ::unsetenv("DFKV_RDMA_KEEPALIVE_MS");
+  ::unsetenv("DFKV_RDMA_IDLE_MS");
+}
+
 // A zero-length item in a mixed RDMA batch fails independently; the valid
 // neighbor still completes and no empty object reaches the server.
 TEST(RdmaLoopback, BatchPutRejectsEmptyValue) {

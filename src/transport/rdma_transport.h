@@ -11,10 +11,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <memory>
 #include <limits>
 #include <mutex>
+#include <thread>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -126,6 +128,11 @@ class RdmaTransport : public Transport {
   void Destroy(Conn* c,
                rdma::RailCompletion completion =
                    rdma::RailCompletion::kRailFailure);
+  // Keep every idle QP alive while its client process is healthy. This lets a
+  // short server-side idle reaper reclaim dead clients without forcing the
+  // first cache read after an idle gap to discover and rebuild stale QPs.
+  void KeepaliveLoop();
+  bool KeepaliveConn(Conn* c);
   Status RoundTrip(const std::string& node, WireOp op, const BlockKey& key,
                    uint64_t offset, uint64_t length, const void* payload,
                    uint64_t payload_len, std::string* out,
@@ -187,6 +194,13 @@ class RdmaTransport : public Transport {
     return batch_op_timeout_ms_ > 0 ? batch_op_timeout_ms_ : op_timeout_ms_;
   }
   size_t pool_max_ = 256;             // idle conns kept per node (DFKV_RDMA_POOL_MAX)
+  // Opt-in because the interval must be shorter than the server's
+  // DFKV_RDMA_IDLE_MS. Zero disables keepalives.
+  int keepalive_ms_ = 0;              // DFKV_RDMA_KEEPALIVE_MS
+  std::atomic<bool> keepalive_stop_{false};
+  std::condition_variable keepalive_cv_;
+  std::mutex keepalive_mu_;
+  std::thread keepalive_thread_;
   std::unique_ptr<rdma::RdmaTopology> topology_;
   std::vector<std::string> devs_;  // stable discovered ACTIVE rail order
   bool auto_device_ = true;
@@ -205,6 +219,9 @@ class RdmaTransport : public Transport {
   mutable std::atomic<uint64_t> v2_probe_failures_{0};
   std::atomic<uint64_t> stale_pool_retries_{0};
   std::atomic<uint64_t> completion_timeouts_{0};
+  std::atomic<uint64_t> keepalive_attempts_{0};
+  std::atomic<uint64_t> keepalive_successes_{0};
+  std::atomic<uint64_t> keepalive_failures_{0};
   std::unique_ptr<std::atomic<uint64_t>[]> rail_conns_;  // sized to devs_.size()
   // Fixed-cardinality locality fallback reasons: caller NUMA unknown / no
   // enabled local rail. Endpoint failures are bounded per configured rail in

@@ -337,16 +337,37 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
                               std::to_string(op_timeout_ms_));
   config_dump::RecordResolved("DFKV_RDMA_BATCH_OP_TIMEOUT_MS",
                               std::to_string(batch_op_timeout_ms_));
+  // Idle keepalives are opt-in: operators set an interval shorter than the
+  // server's DFKV_RDMA_IDLE_MS. They preserve live pooled QPs while still
+  // allowing the server reaper to reclaim clients whose process has exited.
+  if (const char* value = std::getenv("DFKV_RDMA_KEEPALIVE_MS");
+      value && *value) {
+    errno = 0;
+    char* end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (errno == 0 && end != value && *end == '\0' && parsed > 0) {
+      keepalive_ms_ = static_cast<int>(
+          std::min<long>(parsed, std::numeric_limits<int>::max()));
+    }
+  }
+  config_dump::RecordResolved("DFKV_RDMA_KEEPALIVE_MS",
+                              std::to_string(keepalive_ms_));
   // Idle-connection pool cap. The pool naturally bounds at peak concurrency
   // (each thread holds <=1 conn); this only guards against a thread-count spike
   // leaving many idle conns. Must be >= peak concurrency or releases churn
   // (destroy+recreate every op), which fails the bootstrap under load. Default
   // 256 covers typical fan-out; raise via DFKV_RDMA_POOL_MAX for more threads.
   pool_max_ = static_cast<size_t>(EnvInt("DFKV_RDMA_POOL_MAX", 256));
-  rail_conns_ = std::make_unique<std::atomic<uint64_t>[]>(devs_.size());  // 0-initialized
+  rail_conns_ = std::make_unique<std::atomic<uint64_t>[]>(devs_.size());
+  if (keepalive_ms_ > 0)
+    keepalive_thread_ = std::thread(&RdmaTransport::KeepaliveLoop, this);
 }
 
 RdmaTransport::~RdmaTransport() {
+  keepalive_stop_.store(true, std::memory_order_relaxed);
+  keepalive_cv_.notify_all();
+  if (keepalive_thread_.joinable()) keepalive_thread_.join();
+
   std::lock_guard<std::mutex> lk(mu_);
   for (auto& [node, cs] : pool_)
     for (Conn* c : cs) Destroy(c);
@@ -354,6 +375,77 @@ RdmaTransport::~RdmaTransport() {
     for (Conn* c : cs) Destroy(c);
   for (auto& [node, cs] : control_pool_)
     for (Conn* c : cs) Destroy(c);
+}
+
+bool RdmaTransport::KeepaliveConn(Conn* conn) {
+  if (!conn) return false;
+  keepalive_attempts_.fetch_add(1, std::memory_order_relaxed);
+  rdma::RcEndpoint& ep = conn->ep;
+  conn->Encode(ep.sbuf(0), WireOp::kMembers, BlockKey{}, 0, 0, 0);
+  if (!ep.PostRecv(0) || !ep.PostSend(0, kReqPrefix)) {
+    keepalive_failures_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  std::vector<uint32_t> reply_bytes;
+  bool timed_out = false;
+  ibv_wc_status wc_status = IBV_WC_SUCCESS;
+  bool had_wcs = false;
+  const int timeout_ms =
+      op_timeout_ms_ < 0 ? 100 : std::min(op_timeout_ms_, 100);
+  if (!ReapWindow(ep, 1, &reply_bytes, timeout_ms, &timed_out, &wc_status,
+                  &had_wcs) ||
+      reply_bytes.empty() || reply_bytes[0] < kRespPrefix) {
+    keepalive_failures_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  Status status = Status::kIOError;
+  uint64_t data_len = 0;
+  if (!conn->Decode(ep.rbuf(0), &status, &data_len,
+                    rdma::kV2ControlResponseMax) ||
+      status != Status::kOk ||
+      data_len > reply_bytes[0] - kRespPrefix) {
+    keepalive_failures_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  keepalive_successes_.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+void RdmaTransport::KeepaliveLoop() {
+  struct IdleConn {
+    std::string node;
+    Lane lane;
+    Conn* conn;
+  };
+  std::unique_lock<std::mutex> wait_lock(keepalive_mu_);
+  while (!keepalive_cv_.wait_for(
+      wait_lock, std::chrono::milliseconds(keepalive_ms_),
+      [&] { return keepalive_stop_.load(std::memory_order_relaxed); })) {
+    wait_lock.unlock();
+    std::vector<IdleConn> idle;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      const auto collect = [&](auto& pools, Lane lane) {
+        for (auto& [node, connections] : pools) {
+          for (Conn* conn : connections)
+            idle.push_back(IdleConn{node, lane, conn});
+          connections.clear();
+        }
+      };
+      collect(pool_, Lane::kData);
+      collect(sg_pool_, Lane::kSgData);
+      collect(control_pool_, Lane::kControl);
+    }
+    for (const auto& entry : idle) {
+      if (keepalive_stop_.load(std::memory_order_relaxed) ||
+          !KeepaliveConn(entry.conn)) {
+        Destroy(entry.conn, rdma::RailCompletion::kEndpointFailure);
+      } else {
+        Release(entry.node, entry.lane, entry.conn);
+      }
+    }
+    wait_lock.lock();
+  }
 }
 
 void RdmaTransport::Destroy(Conn* c, rdma::RailCompletion completion) {
@@ -838,6 +930,21 @@ std::string RdmaTransport::MetricsText() const {
   s += "# TYPE dfkv_rdma_client_completion_timeouts_total counter\n";
   s += "dfkv_rdma_client_completion_timeouts_total " +
        std::to_string(completion_timeouts_.load(std::memory_order_relaxed)) +
+       "\n";
+  s += "# HELP dfkv_rdma_client_keepalive_attempts_total Idle pooled QP keepalive probes attempted\n";
+  s += "# TYPE dfkv_rdma_client_keepalive_attempts_total counter\n";
+  s += "dfkv_rdma_client_keepalive_attempts_total " +
+       std::to_string(keepalive_attempts_.load(std::memory_order_relaxed)) +
+       "\n";
+  s += "# HELP dfkv_rdma_client_keepalive_successes_total Idle pooled QP keepalive probes completed\n";
+  s += "# TYPE dfkv_rdma_client_keepalive_successes_total counter\n";
+  s += "dfkv_rdma_client_keepalive_successes_total " +
+       std::to_string(keepalive_successes_.load(std::memory_order_relaxed)) +
+       "\n";
+  s += "# HELP dfkv_rdma_client_keepalive_failures_total Idle pooled QP keepalive probes that retired a connection\n";
+  s += "# TYPE dfkv_rdma_client_keepalive_failures_total counter\n";
+  s += "dfkv_rdma_client_keepalive_failures_total " +
+       std::to_string(keepalive_failures_.load(std::memory_order_relaxed)) +
        "\n";
   return s;
 }
