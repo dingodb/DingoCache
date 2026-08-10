@@ -242,6 +242,18 @@ class ObservabilityContractTest(unittest.TestCase):
         self.assertEqual(compose.count("@sha256:"), 4)
         self.assertIn("${DFKV_GRAFANA_ADMIN_PASSWORD:?", compose)
         self.assertNotIn("DFKV_GRAFANA_ADMIN_PASSWORD:-admin", compose)
+        self.assertEqual(compose.count("no-new-privileges:true"), 4)
+        self.assertEqual(compose.count("cap_drop: [ALL]"), 4)
+        self.assertIn("GF_PLUGINS_PREINSTALL_DISABLED=true", compose)
+        self.assertIn("GF_ANALYTICS_REPORTING_ENABLED=false", compose)
+        self.assertIn("GF_NEWS_NEWS_FEED_ENABLED=false", compose)
+        collector = (
+            ROOT / "deploy" / "observability" / "otel-collector-config.yaml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("otlp_grpc/tempo", collector)
+        self.assertNotIn("otlp/tempo", collector)
+        self.assertIn("readers:", collector)
+        self.assertIn("port: 8888", collector)
         self.assertIn("DFKV_BASE_IMAGE=", dockerfile)
         self.assertIn("@sha256:", dockerfile)
 
