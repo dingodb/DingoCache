@@ -194,9 +194,9 @@ class RdmaTransport : public Transport {
     return batch_op_timeout_ms_ > 0 ? batch_op_timeout_ms_ : op_timeout_ms_;
   }
   size_t pool_max_ = 256;             // idle conns kept per node (DFKV_RDMA_POOL_MAX)
-  // Opt-in because the interval must be shorter than the server's
-  // DFKV_RDMA_IDLE_MS. Zero disables keepalives.
-  int keepalive_ms_ = 0;              // DFKV_RDMA_KEEPALIVE_MS
+  // Enabled by default below the recommended 30 s server reaper interval.
+  // Set DFKV_RDMA_KEEPALIVE_MS=0 to disable.
+  int keepalive_ms_ = 15000;
   std::atomic<bool> keepalive_stop_{false};
   std::condition_variable keepalive_cv_;
   std::mutex keepalive_mu_;

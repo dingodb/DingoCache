@@ -465,12 +465,11 @@ sglang serve /models/glm-5.2-nvfp4 --served-model-name glm-5.2 \
 - **`DFKV_RDMA_DEPTH` — 两侧无需强制相等。** 握手取最小值，按共享 segment
   容量和连接 fan-out 分别配置即可。
 - **HiCache 命中/吞吐/延迟与 client 注册指标**已内置，无需额外动作。
-- **短 server reaper 必须配 client keepalive。** server 使用
-  `DFKV_RDMA_IDLE_MS=30000` 回收已退出 Pod 的 receive-segment lease 时，live
-  connector 应设置 `DFKV_RDMA_KEEPALIVE_MS=10000`。后台线程只探测 idle pool
-  中的 QP；进程退出后探测自然停止，server 仍可在 30 秒后回收。keepalive
-  interval 必须严格小于 server idle interval；默认 `0`（关闭），因此使用
-  server 默认 10 分钟 reaper 的通用部署无需额外 QP 流量。
+- **client keepalive 默认开启。** `DFKV_RDMA_KEEPALIVE_MS` 默认 `15000`，每
+  15 秒探测 idle pool 中的 QP，低于频繁重建场景推荐的 server
+  `DFKV_RDMA_IDLE_MS=30000`。进程退出后探测自然停止，server 仍可在 30 秒后
+  回收 receive-segment lease。keepalive interval 必须严格小于 server idle
+  interval；不需要保活时显式设置 `DFKV_RDMA_KEEPALIVE_MS=0`。
 
 #### 0064 B200 + GLM-5.2-NVFP4 实测（2026-08-09）
 
