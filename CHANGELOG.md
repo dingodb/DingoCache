@@ -1,5 +1,18 @@
 # Changelog
 
+## v2.11.1 — 2026-08-10
+
+### Release
+
+- Corrected the tag workflow to keep the generic no-HCA release runner from
+  executing hardware-only `RdmaLoopback.*` tests. RDMA remains gated by the
+  dedicated compile and probe-gated Soft-RoCE CI jobs and by qualification on
+  real RDMA hardware.
+- Require every release tag commit to be reachable from `origin/main`.
+- The immutable `v2.11.0` tag published no release assets because its generic
+  runner attempted those hardware-only tests; v2.11.1 supersedes that failed
+  publication attempt without data-path behavior changes.
+
 ## v2.11.0 — 2026-08-09
 
 ### Observability
