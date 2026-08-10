@@ -85,6 +85,23 @@ TEST(RamTier, ReadAfterWriteBeforeFlush) {
   sink.open();
 }
 
+TEST(RamTier, ShutdownDrainTimeoutAndAckDurabilityLatencyAreObservable) {
+  FlushSink sink;
+  sink.close();
+  RamTier rt(Opts(64 * 4096), sink.fn());
+  const std::string value(4096, 'd');
+  ASSERT_EQ(rt.PutWriteBack(K(2), value.data(), value.size()), Status::kOk);
+
+  EXPECT_FALSE(rt.WaitForDrain(10ms));
+  EXPECT_EQ(rt.ShutdownDrainTimeouts(), 1u);
+  sink.open();
+  ASSERT_TRUE(rt.WaitForDrain(2s));
+  EXPECT_EQ(rt.DirtyObjects(), 0u);
+  EXPECT_NE(rt.AckToDurableLatencyMetrics("").find(
+                "dfkv_ram_ack_to_durable_latency_seconds_count 1"),
+            std::string::npos);
+}
+
 TEST(RamTier, TenantIdentityIsPartOfResidentKey) {
   FlushSink sink;
   RamTier rt(Opts(64 * 4096), sink.fn());

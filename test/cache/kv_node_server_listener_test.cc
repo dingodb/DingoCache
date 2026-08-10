@@ -79,6 +79,12 @@ TEST(KvNodeServerConfig, WriteBackDefaultsToRamAckAndDiskCanOverride) {
     ScopedEnv ack_mode("DFKV_PUT_ACK_MODE", "");
     auto server = StartServer("ram_ack_default");
     EXPECT_TRUE(server->ram_ack_enabled());
+    const std::string metrics = server->MetricsText();
+    EXPECT_NE(metrics.find("dfkv_ram_ack_to_durable_latency_seconds_bucket"),
+              std::string::npos);
+    EXPECT_NE(metrics.find("dfkv_ram_flush_disk_batches_total"),
+              std::string::npos);
+    EXPECT_NE(metrics.find("disk_index=\"0\""), std::string::npos);
     server->Stop();
   }
   {

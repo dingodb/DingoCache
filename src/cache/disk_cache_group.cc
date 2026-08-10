@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <chrono>
 #include <charconv>
 #include <cstring>
 #include <fstream>
@@ -415,7 +416,8 @@ Status DiskCacheGroup::RangeDirectPrep(const BlockKey& key, uint64_t offset,
 }
 
 std::vector<Status> DiskCacheGroup::CacheDirectBatch(
-    const std::vector<StoreEngine::CacheBatchItem>& items) {
+    const std::vector<StoreEngine::CacheBatchItem>& items,
+    const DirectBatchObserver& observe) {
   std::vector<Status> out(items.size(), Status::kInvalid);
   if (items.empty()) return out;
 
@@ -493,8 +495,11 @@ std::vector<Status> DiskCacheGroup::CacheDirectBatch(
   }
 
   auto run_disk = [&](size_t disk) noexcept {
+    const auto started = std::chrono::steady_clock::now();
+    const auto& indexes = groups[disk];
+    uint64_t bytes = 0;
+    for (size_t index : indexes) bytes += items[index].len;
     try {
-      const auto& indexes = groups[disk];
       std::vector<StoreEngine::CacheBatchItem> sub;
       sub.reserve(indexes.size());
       for (size_t index : indexes) sub.push_back(items[index]);
@@ -504,6 +509,15 @@ std::vector<Status> DiskCacheGroup::CacheDirectBatch(
       for (size_t i = 0; i < count; ++i) out[indexes[i]] = statuses[i];
     } catch (...) {
       // Per-item defaults remain kIOError; other disks still complete.
+    }
+    if (observe) {
+      size_t failures = 0;
+      for (size_t index : indexes)
+        if (out[index] != Status::kOk) ++failures;
+      observe(disk, indexes.size(), bytes, failures,
+              std::chrono::duration<double>(
+                  std::chrono::steady_clock::now() - started)
+                  .count());
     }
   };
   if (participating.empty()) return out;

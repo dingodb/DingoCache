@@ -47,7 +47,13 @@ class DiskCacheGroup {
   Status Cache(const BlockKey& key, const void* data, size_t len);
   Status CacheDirect(const BlockKey& key, char* data, size_t len, size_t cap);
   // Batched CacheDirect: split by disk route, one engine batch per disk.
-  std::vector<Status> CacheDirectBatch(const std::vector<StoreEngine::CacheBatchItem>& items);
+  // `observe` runs once per participating disk after its engine call.
+  using DirectBatchObserver = std::function<void(
+      size_t disk, size_t objects, uint64_t bytes, size_t failures,
+      double elapsed_seconds)>;
+  std::vector<Status> CacheDirectBatch(
+      const std::vector<StoreEngine::CacheBatchItem>& items,
+      const DirectBatchObserver& observe = {});
   Status Range(const BlockKey& key, uint64_t offset, uint64_t length,
                std::string* out, size_t* value_len = nullptr);
   Status RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,
