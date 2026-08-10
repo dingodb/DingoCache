@@ -253,7 +253,7 @@ WantedBy=multi-user.target
 > **存储/加速开关（见 [ARCHITECTURE.md](ARCHITECTURE.md) §5–7）。解析顺序为 flag > 环境变量 > `slab`；运行时真值经 `dfkvctl ring` INFO 列（`engine=`/`wr=`/`ram=`）和 `dfkv_build_info{engine,write_mode}` 审计。**
 > - `--store-engine slab|file`：不设置 flag/env 时所有 store/server 路径默认 `slab`。slab = extent 池 + sparse `slots.tbl` + dirty/clean epoch。**早期格式→v3 tenant-scoped slab 必须使用空缓存目录**；容量、格式或几何不符会拒绝启动而不会改写原数据，也绝不会静默改用 file。`file` 的 48 字符 tenant+object 文件名同样不读取旧 cache，仅作显式诊断/回滚。
 > - `--slab-write direct|buffered`（默认 `direct`）：slab 数据面使用 O_DIRECT；文件系统不支持时整店回退 bounded buffered，以 `wr=` 上报真值。
-> - `--ram-tier on`（默认关）：arena 内对象走 RDMA 零拷贝；配合 `--ram-write-mode writeback|writearound`（默认 `writeback`）选择 PUT 先入 RAM 再落盘，或 PUT 直写盘、后续整值 GET 直接从 NVMe 读入最终 arena slot。两种模式都等真实落盘结果后才返回 PUT `kOk`。超 extent 大对象走同预算的 dedicated allocation + bounded copy。`--ram-tier-bytes <bytes>` 定总预算；显式请求 RAM 时 allocation 或不支持的 NUMA mode 会拒绝启动，不能静默退成 disk-only。
+> - `--ram-tier on`（默认关）：arena 内对象走 RDMA 零拷贝；配合 `--ram-write-mode writeback|writearound`（默认 `writeback`）选择 PUT 先入 RAM 再落盘，或 PUT 直写盘、后续整值 GET 直接从 NVMe 读入最终 arena slot。`writeback` 默认在数据进入可读且 flush-pinned 的 RAM slot 后返回 PUT `kOk`；dirty bytes 达 `DFKV_RAM_ACK_HIGH_WATERMARK_PCT`（默认 80）后，新请求改为等待落盘。需要严格 durable ACK 时显式设置 `DFKV_PUT_ACK_MODE=disk`。`writearound` 仍以磁盘结果返回。超 extent 大对象走同预算的 dedicated allocation + bounded copy。`--ram-tier-bytes <bytes>` 定总预算；显式请求 RAM 时 allocation 或不支持的 NUMA mode 会拒绝启动，不能静默退成 disk-only。
 > - `--ram-tier-numa interleave|off`（默认 `interleave`）：这是当前完整 mode 集；不接受数字 node ID。arena 预触并绑策略，须核 `MemoryMax`。
 > - `--ram-flush-threads <n>` / `DFKV_RAM_FLUSH_THREADS`：请求值会提高到至少 shard 数；实际值由 `dfkv_ram_flush_threads` 报告（默认请求=4×盘数，上限 16）。
 > - 微调项（env only）：`DFKV_SLAB_TABLE_SYNC_MS` 控制 table sync 节奏（默认 100 ms，0=关；dirty epoch 重启仍无条件冷重置）。

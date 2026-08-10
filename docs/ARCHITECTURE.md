@@ -310,11 +310,14 @@ The RAM tier fronts the disk with a pre-registered RAM arena so a PD-warm GET is
 served straight from RAM over RDMA — no open, no pread, no disk. Enabled with
 `DFKV_RAM_TIER=1` (`DFKV_RAM_TIER_BYTES` sizes the arena; default off).
 
-**PUT policy with durable acknowledgement**: `writeback` (default) admits into
-a visible RAM slot and enqueues a disk flush; `writearound` writes straight to
-disk and populates RAM on a later whole-value GET. In either mode the server
-does not return PUT `kOk` before disk durability. Overlapping same-key
-write-back callers share the leader's exact success/failure.
+**PUT policy and acknowledgement**: `writeback` (default) admits into a visible,
+flush-pinned RAM slot and, by default, returns `kOk` before the asynchronous disk
+flush completes. At the dirty-byte high watermark (80% by default), new PUTs
+wait for disk so acknowledged volatile data stays bounded. Set
+`DFKV_PUT_ACK_MODE=disk` for durable acknowledgement. `writearound` writes
+straight to disk and populates RAM on a later whole-value GET, so its result
+always reflects the disk write. Overlapping same-key write-back callers share
+the leader's resident value and flush result when waiting is required.
 
 **State machine = allocator pin refcount.** The slot lifecycle maps directly onto
 the allocator's pin count — this is why the allocator was built media-agnostic:
@@ -391,8 +394,9 @@ data plane or the connection fails.
 | Feature | Enable with | Default | Notes |
 |---------|-------------|---------|-------|
 | disk storage engine | `--store-engine=slab|file` / `DFKV_STORE_ENGINE` | `slab` (all server/store construction paths) | option > env > default; v3 slab needs a clean cache directory; invalid capacity, format, or geometry fails closed without a file fallback |
-| RAM hot tier | `DFKV_RAM_TIER=1` (+ `DFKV_RAM_TIER_BYTES`) | off | durable-acknowledged write-back/write-around + direct cold-read promotion + RDMA zero-copy GET; requested allocation failure rejects startup |
+| RAM hot tier | `DFKV_RAM_TIER=1` (+ `DFKV_RAM_TIER_BYTES`) | off | write-back/write-around + direct cold-read promotion + RDMA zero-copy GET; requested allocation failure rejects startup |
 | RAM PUT policy | `--ram-write-mode=writeback|writearound` / `DFKV_RAM_WRITE_MODE` | `writeback` | write-back absorbs PUT bursts; write-around avoids the PUT arena copy and relies on direct GET promotion |
+| RAM PUT acknowledgement | `DFKV_PUT_ACK_MODE=ram|disk` | `ram` for write-back; disk otherwise | RAM-ACK returns after visible flush-pinned admission; `disk` explicitly restores durable ACK; dirty watermark forces bounded synchronous waiting |
 | RAM NUMA policy | `--ram-tier-numa=interleave|off` / `DFKV_RAM_TIER_NUMA` | `interleave` | numeric node IDs are not accepted |
 | RAM flush workers | `--ram-flush-threads` / `DFKV_RAM_FLUSH_THREADS` | 4× disk count, cap 16 | actual count is at least shard count and is reported after adjustment |
 | RAM dedicated-value reserve | `DFKV_RAM_TIER_LARGE_RESERVE_BYTES` | two extents | partitions the hard total budget; `0` disables oversized residency |

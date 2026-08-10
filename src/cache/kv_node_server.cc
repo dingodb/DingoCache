@@ -155,8 +155,17 @@ void KvNodeServer::InitRamTier() {
   // Background free-slot reclaimer cadence (ms; 0 disables). Default 10.
   if (const char* r = std::getenv("DFKV_RAM_RECLAIM_MS"))
     o.reclaim_interval_ms = static_cast<uint32_t>(std::strtoul(r, nullptr, 10));
-  const char* ack = std::getenv("DFKV_PUT_ACK_MODE");
-  ram_ack_enabled_ = ack != nullptr && std::string(ack) == "ram";
+  const char* ack_env = std::getenv("DFKV_PUT_ACK_MODE");
+  const std::string ack = ack_env ? std::string(ack_env) : "";
+  if (ack.empty()) {
+    ram_ack_enabled_ = ram_write_back_;
+  } else if (ack == "ram" || ack == "disk") {
+    ram_ack_enabled_ = ack == "ram";
+  } else {
+    DFKV_LOG_WARN("DFKV_PUT_ACK_MODE='" + ack +
+                  "' not recognized; using RAM-ACK for writeback");
+    ram_ack_enabled_ = ram_write_back_;
+  }
   if (const char* p = std::getenv("DFKV_RAM_ACK_HIGH_WATERMARK_PCT")) {
     const unsigned long n = std::strtoul(p, nullptr, 10);
     if (n <= 100) o.ack_high_watermark_pct = static_cast<uint32_t>(n);
