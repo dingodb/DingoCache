@@ -351,12 +351,14 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   }
   config_dump::RecordResolved("DFKV_RDMA_KEEPALIVE_MS",
                               std::to_string(keepalive_ms_));
-  // Idle-connection pool cap. The pool naturally bounds at peak concurrency
-  // (each thread holds <=1 conn); this only guards against a thread-count spike
-  // leaving many idle conns. Must be >= peak concurrency or releases churn
-  // (destroy+recreate every op), which fails the bootstrap under load. Default
-  // 256 covers typical fan-out; raise via DFKV_RDMA_POOL_MAX for more threads.
-  pool_max_ = static_cast<size_t>(EnvInt("DFKV_RDMA_POOL_MAX", 256));
+  // Idle-connection pool cap per node and lane. The pool naturally bounds at
+  // peak concurrency; this guards against a transient thread spike retaining
+  // enough QPs to consume the server's shared receive segment. Sixteen covers
+  // the measured 0064 SGLang C32 fan-out with 2x per-lane headroom; raise it
+  // only for a workload that proves repeated connection churn.
+  pool_max_ = static_cast<size_t>(EnvInt("DFKV_RDMA_POOL_MAX", 16));
+  config_dump::RecordResolved("DFKV_RDMA_POOL_MAX",
+                              std::to_string(pool_max_));
   rail_conns_ = std::make_unique<std::atomic<uint64_t>[]>(devs_.size());
   if (keepalive_ms_ > 0)
     keepalive_thread_ = std::thread(&RdmaTransport::KeepaliveLoop, this);

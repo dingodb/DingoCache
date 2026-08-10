@@ -282,6 +282,7 @@ fabric selection and capacity explicit.
 | `DFKV_RDMA_DEV` | leave unset for one local HCA; use the same fabric whitelist on both hosts for multi-rail | Unset lets each endpoint select its own first `ACTIVE` local HCA, so local names may differ. A comma list explicitly enables multi-rail and is sent to the peer; every listed name must exist and be on the intended interoperable fabric at both ends. |
 | `DFKV_RDMA_DEPTH` | `4` (default) | Keep client/server defaults aligned for connector batch correctness. Throughput scaling comes from multiple pooled connections, not raising one QP's depth; lowering depth reduces receive-segment consumption only after validating the real engine workload. |
 | `DFKV_RDMA_KEEPALIVE_MS` | `15000` (default); `0` = off | Sends lightweight membership probes over every idle pooled QP. Live clients keep their QPs and avoid first-GET reconnect tails; exited clients send no probes and remain reclaimable. Keep the interval strictly below the server reap interval. |
+| `DFKV_RDMA_POOL_MAX` | `16` (default) | Maximum idle QPs retained per server and per lane, across all rails. It is not a process-wide connection cap. Raise only when connection-open metrics grow on repeated steady-state rounds; each retained QP leases `depth × align4K(4096 + declared_max_block)` from the server receive segment. |
 | `DFKV_FANOUT_THREADS` | unset (default 32) | Only wide single-process clients (benchmarks, many concurrent Batch* callers) need more. |
 
 **Read-side convoy collapse and direct promotion (opt-in)** — for MLA + TP-N

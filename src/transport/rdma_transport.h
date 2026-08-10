@@ -193,7 +193,7 @@ class RdmaTransport : public Transport {
   int BatchTimeout() const {
     return batch_op_timeout_ms_ > 0 ? batch_op_timeout_ms_ : op_timeout_ms_;
   }
-  size_t pool_max_ = 256;             // idle conns kept per node (DFKV_RDMA_POOL_MAX)
+  size_t pool_max_ = 16;              // idle conns kept per node/lane
   // Enabled by default below the recommended 30 s server reaper interval.
   // Set DFKV_RDMA_KEEPALIVE_MS=0 to disable.
   int keepalive_ms_ = 15000;

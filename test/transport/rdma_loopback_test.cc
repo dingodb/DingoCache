@@ -268,8 +268,8 @@ TEST(RdmaLoopback, BatchExistReusesExpandedPool) {
     probe.push_back("e" + std::to_string(i) + "_x"); // absent
   }
 
-  // Warm one connection, then let the first large batch expand the bounded
-  // per-node pool according to the host's available fan-out.
+  // Warm one connection, then let two large batches settle the bounded
+  // per-node pool. Thread scheduling need not expose peak fan-out in one call.
   EXPECT_TRUE(c.Exist("e0"));
   const long before =
       CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
@@ -287,10 +287,18 @@ TEST(RdmaLoopback, BatchExistReusesExpandedPool) {
   ASSERT_EQ(again.size(), probe.size());
   for (size_t i = 0; i < probe.size(); ++i)
     EXPECT_EQ((bool)again[i], (i % 2 == 0)) << probe[i];
+  const long settled =
+      CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
+  EXPECT_LE(settled - before, 15);  // default pool cap 16, one already warm
+
+  auto steady = c.BatchExist(probe);
+  ASSERT_EQ(steady.size(), probe.size());
+  for (size_t i = 0; i < probe.size(); ++i)
+    EXPECT_EQ((bool)steady[i], (i % 2 == 0)) << probe[i];
   const long reused =
       CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
-  EXPECT_EQ(reused, expanded)
-      << "repeated BatchExist did not reuse its expanded connection pool";
+  EXPECT_EQ(reused, settled)
+      << "settled BatchExist did not reuse its bounded connection pool";
 }
 
 // Non-SG batch PUT: one oversized item must fail ONLY itself, not poison the
@@ -819,9 +827,10 @@ TEST(RdmaLoopback, RegisterMemoryRoundtrip) {
   }
 }
 
-TEST(RdmaLoopback, KeepaliveDefaultsToFifteenSecondsAndZeroDisables) {
+TEST(RdmaLoopback, ConnectionPoolAndKeepaliveDefaultsResolveAndDisable) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   ::unsetenv("DFKV_RDMA_KEEPALIVE_MS");
+  ::unsetenv("DFKV_RDMA_POOL_MAX");
   config_dump::ResetForTest();
   testing::internal::CaptureStderr();
   { RdmaTransport rt(kMaxMsg); }
@@ -829,8 +838,14 @@ TEST(RdmaLoopback, KeepaliveDefaultsToFifteenSecondsAndZeroDisables) {
   std::string output = testing::internal::GetCapturedStderr();
   EXPECT_NE(output.find("DFKV_RDMA_KEEPALIVE_MS"), std::string::npos);
   EXPECT_NE(output.find(" = 15000  (default)"), std::string::npos);
+  const size_t pool_name = output.find("DFKV_RDMA_POOL_MAX");
+  ASSERT_NE(pool_name, std::string::npos);
+  const std::string pool_line =
+      output.substr(pool_name, output.find('\n', pool_name) - pool_name);
+  EXPECT_NE(pool_line.find(" = 16  (default)"), std::string::npos);
 
   ::setenv("DFKV_RDMA_KEEPALIVE_MS", "0", 1);
+  ::setenv("DFKV_RDMA_POOL_MAX", "2", 1);
   config_dump::ResetForTest();
   testing::internal::CaptureStderr();
   { RdmaTransport rt(kMaxMsg); }
@@ -838,7 +853,14 @@ TEST(RdmaLoopback, KeepaliveDefaultsToFifteenSecondsAndZeroDisables) {
   output = testing::internal::GetCapturedStderr();
   EXPECT_NE(output.find("DFKV_RDMA_KEEPALIVE_MS"), std::string::npos);
   EXPECT_NE(output.find(" = 0  (env)"), std::string::npos);
+  const size_t pool_override_name = output.find("DFKV_RDMA_POOL_MAX");
+  ASSERT_NE(pool_override_name, std::string::npos);
+  const std::string pool_override_line =
+      output.substr(pool_override_name,
+                    output.find('\n', pool_override_name) - pool_override_name);
+  EXPECT_NE(pool_override_line.find(" = 2  (env)"), std::string::npos);
   ::unsetenv("DFKV_RDMA_KEEPALIVE_MS");
+  ::unsetenv("DFKV_RDMA_POOL_MAX");
 }
 
 // A live client must not inherit the server's short dead-client reap interval

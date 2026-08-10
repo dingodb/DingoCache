@@ -420,7 +420,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `DFKV_RDMA_CONNECT_MS` | — | IB QP 建连超时 |
 | `DFKV_RDMA_IO_MS` | — | 控制面帧读写超时 |
 | `DFKV_RDMA_BATCH_OP_TIMEOUT_MS` | 0=跟随 RDMA_OP | multi-item Cache/Range/Exist、SG 窗口总期限 |
-| `DFKV_RDMA_POOL_MAX` | — | client 侧 per-endpoint 连接池上限 |
+| `DFKV_RDMA_POOL_MAX` | `16` | client 侧每 server、每 lane、跨所有 rail 的 idle QP 保留上限，不是进程总连接上限；只在稳定负载仍反复建连时上调 |
 | `DFKV_RDMA_RAIL_CREDITS` | 默认 `64`, 硬上限 4096 | client 每 rail QP 信用数（inflight 上限），>server depth 会回退 |
 | `DFKV_RDMA_RAIL_BACKPRESSURE_MS` | `10` | Acquire 失败重试 backoff |
 | `DFKV_RDMA_RAIL_COOLDOWN_MS` | `5000` | rail quarantine 冷却期；期间只允许 1 个 recovery probe |
