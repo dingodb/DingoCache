@@ -66,6 +66,17 @@ class ParallelExecutor {
     job->done_cv.wait(lock, [&] {
       return job->done.load(std::memory_order_acquire) == job->count;
     });
+
+    // The caller can finish a small job before every helper ticket has been
+    // consumed. Leaving those no-op tickets in the global FIFO makes later
+    // batches wait behind O(callers * concurrency) stale entries. Remove only
+    // this completed job's residual tickets; workers that already claimed one
+    // observe next == count and return immediately.
+    {
+      std::lock_guard<std::mutex> queue_lock(mu_);
+      queue_.erase(std::remove(queue_.begin(), queue_.end(), job),
+                   queue_.end());
+    }
   }
 
   static size_t MaxThreads() {
@@ -83,6 +94,11 @@ class ParallelExecutor {
       return result;
     }();
     return value;
+  }
+
+  size_t PendingQueueEntriesForTest() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return queue_.size();
   }
 
  private:
