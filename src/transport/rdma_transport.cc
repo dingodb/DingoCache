@@ -1618,7 +1618,7 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
       }
     }
     if (conn_ok) {
-      Release(node, Lane::kData, conn);
+      Release(node, Lane::kSgData, conn);
       return result;
     }
     Destroy(conn, completion);
@@ -1709,8 +1709,10 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
       if (bad[i]) result[i] = Status::kInvalid;
     if (out_lengths) out_lengths->assign(count, 0);
     bool from_pool = false;
-    Conn* conn = Acquire(node, Lane::kData, &from_pool, attempt > 0,
-                         std::min(valid_count, depth_));
+    // GPU multi-SGE reads need the same dedicated depth-one QP lane as writes:
+    // sharing kData reintroduces overlapping CUDA-range WRs and lets SG traffic
+    // consume the ordinary batch window.
+    Conn* conn = Acquire(node, Lane::kSgData, &from_pool, attempt > 0, 1);
     if (!conn) return result;
     rdma::RcEndpoint& ep = conn->ep;
     const size_t window = std::min(
@@ -1793,7 +1795,7 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
       }
     }
     if (conn_ok) {
-      Release(node, Lane::kData, conn);
+      Release(node, Lane::kSgData, conn);
       return result;
     }
     Destroy(conn, completion);
