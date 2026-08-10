@@ -9,6 +9,7 @@
 #include "client/key_map.h"
 #include "cache/kv_node_server.h"
 #include "cache/rdma_server.h"
+#include "common/config_dump.h"
 #include "transport/rdma_transport.h"
 #include "transport/rdma_protocol.h"
 #include "transport/rdma_verbs.h"
@@ -816,6 +817,28 @@ TEST(RdmaLoopback, RegisterMemoryRoundtrip) {
     ASSERT_TRUE(c.Get(key, dst, sz)) << i;
     EXPECT_EQ(0, std::memcmp(src, dst, sz)) << i;
   }
+}
+
+TEST(RdmaLoopback, KeepaliveDefaultsToFifteenSecondsAndZeroDisables) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ::unsetenv("DFKV_RDMA_KEEPALIVE_MS");
+  config_dump::ResetForTest();
+  testing::internal::CaptureStderr();
+  { RdmaTransport rt(kMaxMsg); }
+  config_dump::Emit("keepalive-default-test");
+  std::string output = testing::internal::GetCapturedStderr();
+  EXPECT_NE(output.find("DFKV_RDMA_KEEPALIVE_MS"), std::string::npos);
+  EXPECT_NE(output.find(" = 15000  (default)"), std::string::npos);
+
+  ::setenv("DFKV_RDMA_KEEPALIVE_MS", "0", 1);
+  config_dump::ResetForTest();
+  testing::internal::CaptureStderr();
+  { RdmaTransport rt(kMaxMsg); }
+  config_dump::Emit("keepalive-disabled-test");
+  output = testing::internal::GetCapturedStderr();
+  EXPECT_NE(output.find("DFKV_RDMA_KEEPALIVE_MS"), std::string::npos);
+  EXPECT_NE(output.find(" = 0  (env)"), std::string::npos);
+  ::unsetenv("DFKV_RDMA_KEEPALIVE_MS");
 }
 
 // A live client must not inherit the server's short dead-client reap interval

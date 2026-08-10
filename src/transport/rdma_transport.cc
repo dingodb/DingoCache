@@ -337,15 +337,14 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
                               std::to_string(op_timeout_ms_));
   config_dump::RecordResolved("DFKV_RDMA_BATCH_OP_TIMEOUT_MS",
                               std::to_string(batch_op_timeout_ms_));
-  // Idle keepalives are opt-in: operators set an interval shorter than the
-  // server's DFKV_RDMA_IDLE_MS. They preserve live pooled QPs while still
-  // allowing the server reaper to reclaim clients whose process has exited.
+  // Keep live pooled QPs warm by default. The 15 s interval is below the
+  // recommended 30 s server dead-client reaper; set 0 explicitly to disable.
   if (const char* value = std::getenv("DFKV_RDMA_KEEPALIVE_MS");
       value && *value) {
     errno = 0;
     char* end = nullptr;
     const long parsed = std::strtol(value, &end, 10);
-    if (errno == 0 && end != value && *end == '\0' && parsed > 0) {
+    if (errno == 0 && end != value && *end == '\0' && parsed >= 0) {
       keepalive_ms_ = static_cast<int>(
           std::min<long>(parsed, std::numeric_limits<int>::max()));
     }
