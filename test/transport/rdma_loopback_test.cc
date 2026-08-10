@@ -845,10 +845,11 @@ TEST(RdmaLoopback, BatchPutRejectsEmptyValue) {
 // blob via a multi-SGE SEND; BatchGetAutoSg scatters the stored blob across N
 // caller buffers via a multi-SGE RECV. Exercises the real PostSendScatterMulti /
 // PostRecvScatterMulti datapath (not the concat fallback). Covers N=1, N=2,
-// N=29 (max_sge-1), variable sizes, the >29 guard, and N > depth windowing.
+// N=29 (max_sge-1), variable sizes, the >29 guard, and depth-one windowing.
 TEST(RdmaLoopback, ScatterGatherRoundtripOverRdma) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
-  // depth>1 so the SG path also crosses send windows (N > depth).
+  // The configured ordinary-data depth stays >1; the dedicated SG lane must
+  // nevertheless use depth-one windows.
   ::setenv("DFKV_RDMA_DEPTH", "4", 1);
   RdmaNode node("sg");
   RdmaTransport rt(kMaxMsg);
@@ -903,11 +904,10 @@ TEST(RdmaLoopback, ScatterGatherRoundtripOverRdma) {
     EXPECT_FALSE(c.BatchGetAutoSg({get}, &lens)[0]);
   }
 
-  // Multi-key fan-out exceeding the send window depth (4). Pin concurrency to 1:
-  // the Soft-RoCE (rdma_rxe) loopback used in CI races when many distinct QPs run
-  // in parallel (the SAME flakiness affects the contiguous BatchGetAuto path on
-  // rxe — it is an emulation artifact, not an SG defect). This still exercises the
-  // real multi-SGE verbs datapath across many keys and multiple send windows.
+  // Multi-key fan-out crosses the SG lane's depth-one send window. Pin client
+  // concurrency to 1: Soft-RoCE (rdma_rxe) loopback races when many distinct
+  // QPs run in parallel (the same flakiness affects contiguous BatchGetAuto).
+  // This still exercises the real multi-SGE verbs datapath across many keys.
   {
     c.set_batch_concurrency(1);
     const int N = 24;
@@ -939,6 +939,61 @@ TEST(RdmaLoopback, ScatterGatherRoundtripOverRdma) {
       for (size_t j = 0; j < srcs[i].size(); ++j) EXPECT_EQ(dsts[i][j], srcs[i][j]) << i << " " << j;
     }
   }
+  ::unsetenv("DFKV_RDMA_DEPTH");
+}
+
+TEST(RdmaLoopback, ScatterGatherGetUsesDedicatedPool) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ::setenv("DFKV_RDMA_DEPTH", "4", 1);
+  RdmaNode node("sggetlane");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+
+  std::string value = "scatter-get-payload";
+  ASSERT_TRUE(c.Put("sg_get_seed", value.data(), value.size()));
+  const long data_opened =
+      CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
+  ASSERT_EQ(data_opened, 1);
+
+  std::string first(7, '\0');
+  std::string second(value.size() - first.size(), '\0');
+  KvGetItemSg get{"sg_get_seed", {first.data(), second.data()},
+                  {first.size(), second.size()}};
+  std::vector<size_t> lengths;
+  ASSERT_TRUE(c.BatchGetAutoSg({get}, &lengths)[0]);
+  ASSERT_EQ(lengths[0], value.size());
+  EXPECT_EQ(first + second, value);
+  EXPECT_EQ(CounterVal(rt.MetricsText(),
+                       "dfkv_rdma_client_conns_opened_total"),
+            data_opened + 1)
+      << "SG GET reused the ordinary data pool instead of opening its lane";
+
+  ::unsetenv("DFKV_RDMA_DEPTH");
+}
+
+TEST(RdmaLoopback, ScatterGatherPutReturnsToDedicatedPool) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ::setenv("DFKV_RDMA_DEPTH", "4", 1);
+  RdmaNode node("sgputlane");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+
+  std::string first = "scatter-";
+  std::string second = "put-payload";
+  KvPutItemSg put{"sg_put_seed", {first.data(), second.data()},
+                  {first.size(), second.size()}};
+  ASSERT_TRUE(c.BatchPutSg({put})[0]);
+  const long sg_opened =
+      CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
+  ASSERT_EQ(sg_opened, 1);
+
+  std::string ordinary = "ordinary-data";
+  ASSERT_TRUE(c.Put("ordinary_after_sg", ordinary.data(), ordinary.size()));
+  EXPECT_EQ(CounterVal(rt.MetricsText(),
+                       "dfkv_rdma_client_conns_opened_total"),
+            sg_opened + 1)
+      << "SG PUT returned its depth-one connection to the ordinary data pool";
+
   ::unsetenv("DFKV_RDMA_DEPTH");
 }
 
