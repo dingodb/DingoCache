@@ -63,6 +63,15 @@ class ReleaseVersionContractTest(unittest.TestCase):
             for ref in refs:
                 self.assertRegex(ref, r"^[0-9a-f]{40}$", (name, ref))
 
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        portable = ci.split("  portable-static-build:", 1)[1].split(
+            "\n  python-wheels:", 1
+        )[0]
+        self.assertNotIn("actions/setup-python", portable)
+        self.assertIn("python3 python3-pip", portable)
+
         release = (ROOT / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8"
         )
