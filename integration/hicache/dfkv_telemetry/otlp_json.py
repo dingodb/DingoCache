@@ -29,6 +29,7 @@ import socket
 import threading
 import time
 import urllib.request
+import warnings
 
 
 def _attr(key, value):
@@ -44,14 +45,15 @@ def _attr(key, value):
 
 
 def metrics_url(endpoint):
-    """Resolve OTEL_EXPORTER_OTLP_ENDPOINT to the metrics path. A base endpoint
-    gets ``/v1/metrics`` appended; a full ``.../v1/metrics`` is used verbatim."""
+    """Resolve a generic or signal-specific OTLP endpoint to ``/v1/metrics``."""
     ep = (endpoint or "http://localhost:4318").strip()
     if "://" not in ep:
         ep = "http://" + ep
     ep = ep.rstrip("/")
     if ep.endswith("/v1/metrics"):
         return ep
+    if ep.endswith("/v1/traces"):
+        return ep[:-len("/v1/traces")] + "/v1/metrics"
     return ep + "/v1/metrics"
 
 
@@ -74,6 +76,13 @@ def build_payload(rec, snap, start_ns, now_ns):
         _attr("dfkv.pid", os.getpid()),
         _attr("dfkv.tp_rank", int(rec.tp_rank)),
     ]
+    for key, value in (
+            ("dfkv.model", getattr(rec, "model", "")),
+            ("dfkv.deployment", getattr(rec, "deployment", "")),
+            ("dfkv.cache_role", getattr(rec, "cache_role", "")),
+            ("dfkv.team", getattr(rec, "team", ""))):
+        if value:
+            res_attrs.append(_attr(key, value))
     if getattr(rec, "version", ""):
         res_attrs.append(_attr("dfkv.version", rec.version))
     if getattr(rec, "native_version", ""):
@@ -121,8 +130,9 @@ def build_payload(rec, snap, start_ns, now_ns):
                         "histogram": {"aggregationTemporality": 2, "dataPoints": hist_dps}})
 
     # --- gauges: per-op max, info heartbeat, per-peer latency ---
-    max_dps = [{"attributes": [_attr("op", op)], "timeUnixNano": t, "asDouble": v}
-               for op, v in snap["dur_max"].items() if v]
+    max_dps = [{"attributes": [_attr("op", op)], "timeUnixNano": t,
+                "asDouble": value}
+               for op, value in snap["dur_max"].items() if value]
     if max_dps:
         metrics.append({"name": "dfkv_connector_op_max_seconds",
                         "gauge": {"dataPoints": max_dps}})
@@ -132,14 +142,25 @@ def build_payload(rec, snap, start_ns, now_ns):
 
     peer = snap["peer"]
     if peer:
-        metrics.append({"name": "dfkv_client_peer_latency_avg_seconds",
-                        "gauge": {"dataPoints": [
-                            {"attributes": [_attr("peer", p)], "timeUnixNano": t, "asDouble": avg}
-                            for p, (avg, _mx) in peer.items()]}})
-        metrics.append({"name": "dfkv_client_peer_latency_max_seconds",
-                        "gauge": {"dataPoints": [
-                            {"attributes": [_attr("peer", p)], "timeUnixNano": t, "asDouble": mx}
-                            for p, (_avg, mx) in peer.items()]}})
+        for name, field in (
+                ("dfkv_client_peer_latency_avg_seconds", "avg"),
+                ("dfkv_client_peer_latency_max_seconds", "max")):
+            metrics.append({"name": name, "gauge": {"dataPoints": [
+                {"attributes": [_attr("peer", peer_name)],
+                 "timeUnixNano": t, "asDouble": values[field]}
+                for peer_name, values in peer.items()]}})
+        for name, field in (
+                ("dfkv_client_peer_latency_seconds_sum", "sum"),
+                ("dfkv_client_peer_latency_seconds_count", "count")):
+            metrics.append({"name": name,
+                            "sum": {"aggregationTemporality": 2,
+                                    "isMonotonic": True,
+                                    "dataPoints": [
+                                        {"attributes": [_attr("peer", peer_name)],
+                                         "startTimeUnixNano": st,
+                                         "timeUnixNano": t,
+                                         "asDouble": values[field]}
+                                        for peer_name, values in peer.items()]}})
 
     # --- per-op metrics forwarded from the C++ KVClient snapshot (dfkv_client_op_*),
     #     re-emitted with this connector's identity. One name set across all
@@ -152,23 +173,24 @@ def build_payload(rec, snap, start_ns, now_ns):
                            ("hits", "dfkv_connector_op_hits_total"),
                            ("bytes", "dfkv_connector_op_bytes_total")):
             dps = [{"attributes": [_attr("op", op)], "startTimeUnixNano": st,
-                    "timeUnixNano": t, "asInt": str(int(d.get(fld, 0)))}
-                   for op, d in cops.items() if d.get(fld)]
+                    "timeUnixNano": t,
+                    "asDouble": float(values[fld])}
+                   for op, values in cops.items() if fld in values]
             if dps:
                 metrics.append({"name": mname,
                                 "sum": {"aggregationTemporality": 2,
                                         "isMonotonic": True, "dataPoints": dps}})
         max_dps = [{"attributes": [_attr("op", op)], "timeUnixNano": t,
-                    "asDouble": float(d.get("max", 0.0))}
-                   for op, d in cops.items() if d.get("max")]
+                    "asDouble": float(values["max"])}
+                   for op, values in cops.items() if "max" in values]
         if max_dps:
-            metrics.append({"name": "dfkv_connector_op_max_seconds",
+            metrics.append({"name": "dfkv_connector_op_lifetime_max_seconds",
                             "gauge": {"dataPoints": max_dps}})
         hist_dps = []
         for op, d in cops.items():
             cnt = d.get("lat_count")
             buckets = d.get("buckets")
-            if not cnt or not buckets:
+            if cnt is None or buckets is None:
                 continue
             # Prometheus cumulative (le) buckets -> OTLP explicitBounds + per-bucket
             # counts. The +Inf bucket = count - last cumulative.
@@ -204,6 +226,61 @@ def build_payload(rec, snap, start_ns, now_ns):
                                                 "timeUnixNano": t,
                                                 "asInt": str(int(val))}]}})
 
+    # --- bounded native client health/transport/MR metrics. Group labeled
+    # samples into one OTLP metric family and preserve counter vs gauge type.
+    native = {}
+    for sample in snap.get("client_status") or []:
+        native.setdefault(
+            (sample["name"], sample["kind"]), []).append(sample)
+    for (name, kind), samples in sorted(native.items()):
+        points = []
+        for sample in samples:
+            point = {
+                "attributes": [
+                    _attr(key, value)
+                    for key, value in sorted(sample["labels"].items())
+                ],
+                "timeUnixNano": t,
+            }
+            if kind == "counter":
+                point["startTimeUnixNano"] = st
+                point["asInt"] = str(int(sample["value"]))
+            else:
+                point["asDouble"] = float(sample["value"])
+            points.append(point)
+        if kind == "counter":
+            metrics.append({
+                "name": name,
+                "sum": {
+                    "aggregationTemporality": 2,
+                    "isMonotonic": True,
+                    "dataPoints": points,
+                },
+            })
+        else:
+            metrics.append({"name": name, "gauge": {"dataPoints": points}})
+
+    poll = snap.get("client_poll") or {}
+    if poll.get("observed"):
+        for name, field in (
+                ("dfkv_connector_client_stats_poll_success", "success"),
+                ("dfkv_connector_client_stats_last_success_unixtime",
+                 "last_success_unixtime")):
+            metrics.append({"name": name, "gauge": {"dataPoints": [{
+                "timeUnixNano": t, "asDouble": float(poll[field])}]}})
+        metrics.append({
+            "name": "dfkv_connector_client_stats_poll_errors_total",
+            "sum": {
+                "aggregationTemporality": 2,
+                "isMonotonic": True,
+                "dataPoints": [{
+                    "startTimeUnixNano": st,
+                    "timeUnixNano": t,
+                    "asInt": str(int(poll["errors"])),
+                }],
+            },
+        })
+
     return {"resourceMetrics": [{
         "resource": {"attributes": res_attrs},
         "scopeMetrics": [{"scope": {"name": "dfkv.connector"}, "metrics": metrics}],
@@ -224,6 +301,8 @@ class StdlibExporter:
         self._thread = None
         # An opener with an empty ProxyHandler ignores HTTP(S)_PROXY for this POST.
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        self._failed = False
+        self._push_lock = threading.Lock()
 
     def build(self, now_ns=None):
         now_ns = now_ns or time.time_ns()
@@ -231,22 +310,47 @@ class StdlibExporter:
         return build_payload(self._rec, snap, self._start_ns, now_ns)
 
     def push_once(self):
-        body = json.dumps(self.build()).encode("utf-8")
-        req = urllib.request.Request(self._url, data=body,
-                                     headers={"Content-Type": "application/json"})
-        resp = self._opener.open(req, timeout=5)
+        # Serialize the periodic and shutdown flushes. The snapshot's window max
+        # is committed only after delivery; cumulative counters remain absolute.
+        with self._push_lock:
+            snap = self._rec.export_snapshot()
+            try:
+                payload = build_payload(
+                    self._rec, snap, self._start_ns, time.time_ns())
+                body = json.dumps(payload).encode("utf-8")
+                req = urllib.request.Request(
+                    self._url, data=body,
+                    headers={"Content-Type": "application/json"})
+                resp = self._opener.open(req, timeout=5)
+                try:
+                    resp.read()
+                    return resp.status
+                finally:
+                    resp.close()
+            except Exception:
+                self._rec.restore_maxima(snap)
+                raise
+    def _push_guarded(self):
         try:
-            resp.read()
-            return resp.status
-        finally:
-            resp.close()
+            self.push_once()
+        except Exception as exc:
+            if not self._failed:
+                warnings.warn(
+                    "dfkv OTLP metrics export failed for {}: {}; "
+                    "will retry in the background".format(self._url, exc),
+                    RuntimeWarning, stacklevel=2)
+            self._failed = True
+            return False
+        if self._failed:
+            warnings.warn(
+                "dfkv OTLP metrics export recovered for {}".format(self._url),
+                RuntimeWarning, stacklevel=2)
+        self._failed = False
+        return True
 
     def _loop(self):
         while not self._stop.wait(self._interval):
-            try:
-                self.push_once()
-            except Exception:
-                pass  # transient collector hiccup must not kill the thread
+            self._push_guarded()
 
     def start(self):
         if self._interval <= 0:
@@ -255,8 +359,12 @@ class StdlibExporter:
                                         daemon=True)
         self._thread.start()
 
-    def stop(self):
+    def stop(self, flush=True):
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=2)
+            # urllib's request timeout is 5s. Wait past it so the final flush
+            # cannot race an in-flight periodic flush over a drained max window.
+            self._thread.join(timeout=6)
             self._thread = None
+        if flush:
+            self._push_guarded()

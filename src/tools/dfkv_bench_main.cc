@@ -43,6 +43,7 @@
 #include "client/kv_client.h"
 #include "transport/transport_factory.h"
 #include "common/version.h"
+#include "utils/prom_parse.h"
 
 using namespace dfkv;  // NOLINT
 using Clock = std::chrono::steady_clock;
@@ -124,12 +125,84 @@ static double RunPhase(size_t units, size_t threads,
 }
 
 static void Report(const char* phase, size_t count, size_t size, size_t threads,
-                   size_t batch, double secs, std::vector<double>& lat, size_t fails) {
-  double total_gb = double(count) * double(size) / 1e9;
-  std::printf("%-5s n=%zu size=%zu threads=%zu batch=%zu | %.3fs  %.2f GB/s  %.0f ops/s  "
-              "call-lat ms p50=%.3f p99=%.3f max=%.3f  fails=%zu\n",
-              phase, count, size, threads, batch, secs, total_gb / secs,
-              secs > 0 ? count / secs : 0, Pct(lat, 0.50), Pct(lat, 0.99), Pct(lat, 1.0), fails);
+                   size_t batch, double secs, std::vector<double>& lat,
+                   size_t fails) {
+  const size_t succeeded = fails <= count ? count - fails : 0;
+  const double good_gb = double(succeeded) * double(size) / 1e9;
+  std::printf("%-5s n=%zu size=%zu threads=%zu batch=%zu | %.3fs  "
+              "goodput %.2f GB/s  %.0f ok-ops/s  "
+              "call-lat ms p50=%.3f p99=%.3f max=%.3f  ok=%zu fails=%zu\n",
+              phase, count, size, threads, batch, secs,
+              secs > 0 ? good_gb / secs : 0,
+              secs > 0 ? succeeded / secs : 0, Pct(lat, 0.50),
+              Pct(lat, 0.99), Pct(lat, 1.0), succeeded, fails);
+}
+
+static uint64_t CounterDelta(const std::string& before,
+                             const std::string& after,
+                             const char* name) {
+  const uint64_t a = PromMetricSum(before, name);
+  const uint64_t b = PromMetricSum(after, name);
+  return b >= a ? b - a : b;
+}
+
+static void ReportDiagnostics(const char* phase, const std::string& before,
+                              const std::string& after) {
+  uint64_t ring = 0;
+  const bool client_metrics_available =
+      PromMetricValue(after, "dfkv_client_ring_members", &ring);
+  uint64_t mds_reachable = 0;
+  const bool mds_available =
+      PromMetricValue(after, "dfkv_client_mds_reachable", &mds_reachable);
+  uint64_t declared_max_block = 0;
+  const bool rdma_available = PromMetricValue(
+      after, "dfkv_rdma_client_declared_max_block_bytes",
+      &declared_max_block);
+  std::printf(
+      "DIAG phase=%s client_metrics_available=%d ring=%llu "
+      "mds_available=%d mds_reachable=%llu mds_unreachable_polls=%llu "
+      "rdma_available=%d io_errors=%llu unhealthy_skips=%llu "
+      "peer_bad=%llu endpoint_errors=%llu rail_errors=%llu cq_errors=%llu "
+      "completion_timeouts=%llu stale_retries=%llu mr_rejections=%llu "
+      "mr_failures=%llu adhoc_mr=%llu mr_registered_bytes=%llu "
+      "oversize_rejects=%llu max_block_seen_bytes=%llu "
+      "declared_max_block_bytes=%llu\n",
+      phase, client_metrics_available ? 1 : 0,
+      (unsigned long long)ring, mds_available ? 1 : 0,
+      (unsigned long long)mds_reachable,
+      (unsigned long long)CounterDelta(
+          before, after, "dfkv_client_mds_unreachable_polls_total"),
+      rdma_available ? 1 : 0,
+      (unsigned long long)CounterDelta(
+          before, after, "dfkv_client_io_errors_total"),
+      (unsigned long long)CounterDelta(
+          before, after, "dfkv_client_unhealthy_skips_total"),
+      (unsigned long long)CounterDelta(
+          before, after, "dfkv_client_peer_marked_bad_total"),
+      (unsigned long long)CounterDelta(
+          before, after, "dfkv_rdma_client_endpoint_errors_total"),
+      (unsigned long long)CounterDelta(
+          before, after, "dfkv_rdma_client_rail_errors_total"),
+      (unsigned long long)CounterDelta(
+          before, after, "dfkv_rdma_cq_errors_total"),
+      (unsigned long long)CounterDelta(
+          before, after, "dfkv_rdma_client_completion_timeouts_total"),
+      (unsigned long long)CounterDelta(
+          before, after, "dfkv_rdma_client_stale_pool_retries_total"),
+      (unsigned long long)CounterDelta(
+          before, after, "dfkv_rdma_client_mr_registration_rejections_total"),
+      (unsigned long long)CounterDelta(
+          before, after,
+          "dfkv_rdma_client_pool_mr_registration_failures_total"),
+      (unsigned long long)CounterDelta(
+          before, after, "dfkv_rdma_client_adhoc_user_mr_total"),
+      (unsigned long long)PromMetricValue(
+          after, "dfkv_rdma_client_mr_registered_bytes"),
+      (unsigned long long)CounterDelta(
+          before, after, "dfkv_rdma_client_oversize_rejects_total"),
+      (unsigned long long)PromMetricValue(
+          after, "dfkv_rdma_client_max_block_seen_bytes"),
+      (unsigned long long)declared_max_block);
 }
 
 int main(int argc, char** argv) {
@@ -225,6 +298,7 @@ int main(int argc, char** argv) {
       std::fprintf(stderr,
                    "dfkv_bench: ring not ready after %zus (mds=%s group=%s)\n",
                    ready_timeout_s, mds.c_str(), group.c_str());
+      ReportDiagnostics("READY", "", c.MetricsSnapshot());
       return 2;
     }
     // Settle: the single warmup key only reaches ONE ring member, leaving the
@@ -235,12 +309,26 @@ int main(int argc, char** argv) {
     // until each succeeds — a batched settle still fails on cold connections;
     // individual Puts block until the per-node QP is established.
     constexpr size_t kSettleKeys = 32;  // covers rings up to ~32 nodes
+    size_t settle_failures = 0;
     for (size_t i = 0; i < kSettleKeys; ++i) {
       std::string sk = "dfkv_bench/settle_" + std::to_string(i);
+      bool settled = false;
       for (int attempt = 0; attempt < 20; ++attempt) {
-        if (c.Put(sk, probe.data(), probe.size())) break;
+        if (c.Put(sk, probe.data(), probe.size())) {
+          settled = true;
+          break;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
       }
+      if (!settled) ++settle_failures;
+    }
+    if (settle_failures != 0) {
+      std::fprintf(stderr,
+                   "dfkv_bench: %zu/%zu connection-settle keys failed; "
+                   "refusing a misleading measured phase\n",
+                   settle_failures, kSettleKeys);
+      ReportDiagnostics("SETTLE", "", c.MetricsSnapshot());
+      return 2;
     }
   }
   // External --threads already provide concurrency; with multi-node members the
@@ -269,6 +357,7 @@ int main(int argc, char** argv) {
 
   if (op == "put" || op == "both") {
     fails.store(0);
+    const std::string diag_before = c.MetricsSnapshot();
     double s = RunPhase(units, threads, [&](size_t u) {
       size_t base = u * batch, w = std::min(batch, count - base);
       std::vector<KvPutItem> items(w);
@@ -282,38 +371,57 @@ int main(int argc, char** argv) {
     }, &lat, &fails);
     const size_t phase_fails = fails.load();
     Report("PUT", count, size, threads, batch, s, lat, phase_fails);
+    ReportDiagnostics("PUT", diag_before, c.MetricsSnapshot());
     total_fails += phase_fails;
   }
   if (op == "get" || op == "both") {
     fails.store(0);
+    const std::string diag_before = c.MetricsSnapshot();
     // One contiguous, page-aligned destination arena for ALL threads, declared
-    // once via RegisterMemory: every dst then resolves to the pre-registered
-    // pool MR (the production connectors' registered-host-pool shape). The old
-    // per-thread std::string buffers exceeded the per-connection user-MR cache
-    // (threads*batch addrs vs cap ~64) once calls rotate over pooled
-    // connections, so under load nearly every GET paid an ad-hoc 4MiB
-    // ibv_reg_mr+dereg (gup pins + mmap_lock) — measured as second-scale call
-    // tails that capped throughput. Falls back to the old buffers if the
-    // allocation fails.
-    const size_t stride = (size + 4095) & ~size_t{4095};
-    char* arena = static_cast<char*>(std::aligned_alloc(4096, threads * batch * stride));
-    if (arena && !c.RegisterMemory(arena, threads * batch * stride)) {
-      std::free(arena);
-      arena = nullptr;
+    // once via RegisterMemory. A missing/failed arena invalidates an RDMA
+    // throughput result, so fail closed instead of silently timing ad-hoc MRs.
+    const size_t active_workers = std::min(threads, units);
+    const size_t worker_slots = std::min(batch, count);
+    if (size > std::numeric_limits<size_t>::max() - 4095 ||
+        worker_slots > std::numeric_limits<size_t>::max() / active_workers) {
+      std::fprintf(stderr, "dfkv_bench: GET arena size overflow\n");
+      return 2;
     }
+    const size_t stride = (size + 4095) & ~size_t{4095};
+    const size_t slots = active_workers * worker_slots;
+    if (stride > std::numeric_limits<size_t>::max() / slots) {
+      std::fprintf(stderr, "dfkv_bench: GET arena size overflow\n");
+      return 2;
+    }
+    const size_t arena_bytes = slots * stride;
+    char* arena =
+        static_cast<char*>(std::aligned_alloc(4096, arena_bytes));
+    if (!arena) {
+      std::fprintf(stderr,
+                   "dfkv_bench: GET registered arena allocation failed "
+                   "(bytes=%zu)\n", arena_bytes);
+      ReportDiagnostics("GET_SETUP", diag_before, c.MetricsSnapshot());
+      return 2;
+    }
+    if (!c.RegisterMemory(arena, arena_bytes)) {
+      std::fprintf(stderr,
+                   "dfkv_bench: GET arena registration failed (bytes=%zu); "
+                   "refusing an ad-hoc-MR fallback\n", arena_bytes);
+      std::free(arena);
+      ReportDiagnostics("GET_SETUP", diag_before, c.MetricsSnapshot());
+      return 2;
+    }
+    std::printf("GET_SETUP registered_arena_bytes=%zu slots=%zu stride=%zu\n",
+                arena_bytes, slots, stride);
     std::atomic<size_t> arena_slot{0};
     double s = RunPhase(units, threads, [&](size_t u) {
       size_t base = u * batch, w = std::min(batch, count - base);
       thread_local char* mybuf = nullptr;
-      thread_local std::vector<std::string> outs;
-      if (arena) {
-        if (!mybuf) mybuf = arena + arena_slot.fetch_add(1) * batch * stride;
-      } else if (outs.size() < batch) {
-        outs.resize(batch); for (auto& o : outs) o.resize(size);
-      }
+      if (!mybuf)
+        mybuf = arena + arena_slot.fetch_add(1) * worker_slots * stride;
       std::vector<KvGetItem> items(w);
       for (size_t j = 0; j < w; ++j)
-        items[j] = {key(base + j), arena ? mybuf + j * stride : &outs[j][0], size};
+        items[j] = {key(base + j), mybuf + j * stride, size};
       // DFKV_BENCH_STALL_MS: log wall-clock timestamps of slow calls to stderr
       // so stalls can be time-correlated across processes/nodes (diagnostics).
       static const long stall_ms = [] {
@@ -337,6 +445,7 @@ int main(int argc, char** argv) {
     }, &lat, &fails);
     const size_t phase_fails = fails.load();
     Report("GET", count, size, threads, batch, s, lat, phase_fails);
+    ReportDiagnostics("GET", diag_before, c.MetricsSnapshot());
     total_fails += phase_fails;
     std::free(arena);
   }

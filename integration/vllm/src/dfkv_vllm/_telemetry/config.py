@@ -23,9 +23,16 @@ ENV_TRACING_ENABLED = "DFKV_TRACING_ENABLED"
 # --- OTLP push target (standard OTel env, shared with the C++ side) ---------
 ENV_OTLP_ENDPOINT = "OTEL_EXPORTER_OTLP_ENDPOINT"
 ENV_OTLP_PROTOCOL = "OTEL_EXPORTER_OTLP_PROTOCOL"  # grpc | http/protobuf
+# Traces use the stdlib OTLP/HTTP exporter even when metrics opt into the SDK
+# gRPC exporter. Set this when the generic endpoint/protocol is gRPC.
+ENV_TRACE_OTLP_ENDPOINT = "DFKV_TRACE_OTLP_ENDPOINT"
 
 # --- dfkv-namespaced knobs --------------------------------------------------
 ENV_CONNECTOR_ID = "DFKV_CONNECTOR_ID"
+ENV_MODEL = "DFKV_MODEL"
+ENV_DEPLOYMENT = "DFKV_DEPLOYMENT"
+ENV_CACHE_ROLE = "DFKV_CACHE_ROLE"
+ENV_TEAM = "DFKV_TEAM"
 ENV_EXPORT_INTERVAL_MS = "DFKV_METRICS_EXPORT_INTERVAL_MS"   # OTLP push cadence (default 10000)
 # Which exporter pushes the metrics: "stdlib" (default; pure-stdlib OTLP/HTTP-JSON,
 # zero third-party deps) or "otel" (the OpenTelemetry SDK, if installed).

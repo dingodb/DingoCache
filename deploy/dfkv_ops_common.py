@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import struct
 import subprocess
 import tempfile
@@ -56,9 +57,17 @@ _RING_HEADER = re.compile(r"^group=(\S+) members=(\d+) ring_points=(\d+)$")
 _CLIENT_HEADER = re.compile(r"^group=(\S+) clients=(\d+)")
 _BENCH_LINE = re.compile(
     r"^(PUT|GET)\s+n=(\d+)\s+size=(\d+)\s+threads=(\d+)\s+batch=(\d+)\s+\|\s+"
-    r"([0-9.]+)s\s+([0-9.]+) GB/s\s+([0-9.]+) ops/s\s+"
-    r"call-lat ms p50=([0-9.]+) p99=([0-9.]+) max=([0-9.]+)\s+fails=(\d+)$"
+    r"([0-9.]+)s\s+goodput\s+([0-9.]+) GB/s\s+([0-9.]+) ok-ops/s\s+"
+    r"call-lat ms p50=([0-9.]+) p99=([0-9.]+) max=([0-9.]+)\s+"
+    r"ok=(\d+) fails=(\d+)$"
 )
+_LEGACY_BENCH_LINE = re.compile(
+    r"^(PUT|GET)\s+n=(\d+)\s+size=(\d+)\s+threads=(\d+)\s+batch=(\d+)\s+\|\s+"
+    r"([0-9.]+)s\s+([0-9.]+) GB/s\s+([0-9.]+) ops/s\s+"
+    r"call-lat ms p50=([0-9.]+) p99=([0-9.]+) max=([0-9.]+)\s+"
+    r"(?:ok=(\d+)\s+)?fails=(\d+)$"
+)
+_BENCH_DIAG = re.compile(r"^DIAG phase=(READY|SETTLE|GET_SETUP|PUT|GET)\s+(.+)$")
 
 
 def run_command(argv: Sequence[str], timeout: float, *, env: dict[str, str] | None = None) -> str:
@@ -147,11 +156,19 @@ def parse_bench(text: str) -> dict[str, dict[str, float | int]]:
     phases: dict[str, dict[str, float | int]] = {}
     for raw in text.splitlines():
         match = _BENCH_LINE.match(raw.strip())
+        legacy = False
+        if not match:
+            match = _LEGACY_BENCH_LINE.match(raw.strip())
+            legacy = match is not None
         if not match:
             continue
         phase = match.group(1).lower()
+        if phase in phases:
+            raise ValueError(f"dfkv_bench emitted duplicate {phase.upper()} result")
+        count = int(match.group(2))
+        fails = int(match.group(13))
         phases[phase] = {
-            "count": int(match.group(2)),
+            "count": count,
             "size_bytes": int(match.group(3)),
             "threads": int(match.group(4)),
             "batch": int(match.group(5)),
@@ -161,10 +178,46 @@ def parse_bench(text: str) -> dict[str, dict[str, float | int]]:
             "bench_p50_ms": float(match.group(9)),
             "bench_p99_ms": float(match.group(10)),
             "bench_max_ms": float(match.group(11)),
-            "fails": int(match.group(12)),
+            "successful_operations": (
+                count - fails if match.group(12) is None else int(match.group(12))
+            ),
+            "fails": fails,
         }
     if set(phases) != {"put", "get"}:
         raise ValueError("dfkv_bench must emit exactly one PUT and one GET result (use --op both)")
+    return phases
+
+
+def parse_bench_diagnostics(
+    text: str, *, required: bool = True
+) -> dict[str, dict[str, int]]:
+    phases: dict[str, dict[str, int]] = {}
+    for raw in text.splitlines():
+        match = _BENCH_DIAG.match(raw.strip())
+        if not match:
+            continue
+        values: dict[str, int] = {}
+        for token in match.group(2).split():
+            key, separator, value = token.partition("=")
+            if not separator:
+                raise ValueError(f"invalid dfkv_bench diagnostic token: {token!r}")
+            try:
+                values[key] = int(value)
+            except ValueError as error:
+                raise ValueError(
+                    f"invalid dfkv_bench diagnostic value: {token!r}"
+                ) from error
+        phases[match.group(1).lower()] = values
+    if not phases:
+        if not required:
+            return {}
+        raise ValueError(
+            "dfkv_bench must emit one DIAG line for each PUT and GET phase"
+        )
+    if required and not {"put", "get"}.issubset(phases):
+        raise ValueError(
+            "dfkv_bench must emit one DIAG line for each PUT and GET phase"
+        )
     return phases
 
 
@@ -191,12 +244,27 @@ def members_epoch(members: Iterable[RingMember]) -> int:
     return value
 
 
-def atomic_write(path: str, content: str) -> None:
+def atomic_write(path: str, content: str | bytes, *, mode: int = 0o644) -> None:
+    """Atomically replace content, preserving existing mode/owner when present."""
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=str(destination.parent))
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        existing = destination.stat()
+    except FileNotFoundError:
+        existing = None
+    target_mode = (
+        stat.S_IMODE(existing.st_mode) if existing is not None else mode)
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{destination.name}.", dir=str(destination.parent))
+    try:
+        if isinstance(content, bytes):
+            stream = os.fdopen(fd, "wb")
+        else:
+            stream = os.fdopen(fd, "w", encoding="utf-8")
+        with stream:
+            os.fchmod(stream.fileno(), target_mode)
+            if existing is not None:
+                os.fchown(stream.fileno(), existing.st_uid, existing.st_gid)
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
@@ -207,3 +275,14 @@ def atomic_write(path: str, content: str) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def atomic_write_with_checksum(path: str, content: str) -> None:
+    """Write an artifact and a standard SHA-256 sidecar."""
+    atomic_write(path, content)
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    destination = Path(path)
+    atomic_write(
+        str(destination) + ".sha256",
+        f"{digest}  {destination.name}\n",
+    )

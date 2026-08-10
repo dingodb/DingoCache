@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools==82.0.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "dfkv-common"
-version = "2.0.0"
+version = "2.11.0"
 description = "Canonical namespace and pool-key schema shared by dfkv connectors"
 requires-python = ">=3.9"
 

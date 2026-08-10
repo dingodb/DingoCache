@@ -419,16 +419,35 @@ int main(int argc, char** argv) {
       std::make_shared<std::atomic<bool>>(mds.empty());
   auto registrar_metrics =
       std::make_shared<std::atomic<dfkv::MdsRegistrar*>>(nullptr);
-  if (metrics_port >= 0) {
-    mhttp = std::make_unique<dfkv::MetricsHttpServer>([&] {
-      std::string s = srv.MetricsText();
+  srv.set_metrics_extension([&] {
+    std::string s;
 #ifdef DFKV_WITH_RDMA
-      if (rsrv) s += rsrv->MetricsText();
+    if (rsrv) s += rsrv->MetricsText();
 #endif
-      if (auto* r = registrar_metrics->load(std::memory_order_acquire))
-        s += r->MetricsText();
-      return s;
-    });
+    if (auto* r = registrar_metrics->load(std::memory_order_acquire))
+      s += r->MetricsText();
+    auto gauge = [&s](const char* name, const char* help, bool value) {
+      s += "# HELP "; s += name; s += " "; s += help; s += "\n";
+      s += "# TYPE "; s += name; s += " gauge\n";
+      s += name; s += value ? " 1\n" : " 0\n";
+    };
+    const bool startup = ready_flag->load(std::memory_order_acquire);
+    const bool registered = mds_ready->load(std::memory_order_acquire);
+    const bool healthy = srv.Healthy();
+    gauge("dfkv_server_startup_complete",
+          "Whether every local startup stage completed", startup);
+    gauge("dfkv_server_mds_registration_ready",
+          "Whether the initial MDS registration gate is satisfied", registered);
+    gauge("dfkv_server_healthy",
+          "Whether local storage and required RAM tiers are healthy", healthy);
+    gauge("dfkv_server_ready",
+          "Whether startup, MDS registration, and local health are ready",
+          startup && registered && healthy);
+    return s;
+  });
+  if (metrics_port >= 0) {
+    mhttp = std::make_unique<dfkv::MetricsHttpServer>(
+        [&srv] { return srv.FullMetricsText(); });
     mhttp->set_health_check([&srv] { return srv.Healthy(); });
     mhttp->set_ready_check([ready_flag, mds_ready, &srv] {
       return ready_flag->load(std::memory_order_acquire) &&

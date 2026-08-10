@@ -12,22 +12,37 @@ dfkv_server / dfkv_mds  <--Prometheus pull (/metrics)-------------/        ^
   many and dynamically scheduled, so pull-discovery is impractical).
 - **dfkv C++ daemons are PULLED**: Prometheus scrapes `dfkv_server`/`dfkv_mds`
   `/metrics` directly (few, long-lived). Start them with `--metrics-port`.
-- The Collector re-exposes the pushed metrics at `:8889` for Prometheus and
-  forwards traces (later milestones) to Tempo.
+- The Collector re-exposes pushed metrics at `:8889` for Prometheus and forwards
+  connector traces to Tempo.
 
 ## Bring it up
 
+The compose file pins Collector `0.158.0`, Prometheus `3.13.2`, Tempo `3.0.2`,
+and Grafana `13.1.3`. Mainland-China hosts default to
+`docker.m.daocloud.io`; set `DFKV_IMAGE_REGISTRY` to the approved private
+registry when required. All published ports bind to loopback.
+
 ```bash
+export DFKV_GRAFANA_ADMIN_PASSWORD='replace-me'
 docker compose -f deploy/observability/docker-compose.yml up -d
+curl -fsS http://127.0.0.1:13133/
 ```
+
+Prometheus, Tempo, and Grafana data persist in named Docker volumes.
 
 | Service | URL | Notes |
 |---|---|---|
-| Grafana | http://localhost:3000 | anon admin; dashboards **"Connector"** (connector fleet) + **"Cluster"** (cache nodes + MDS) auto-provisioned |
-| Prometheus | http://localhost:9090 | |
-| Collector OTLP | grpc `localhost:4317`, http `localhost:4318` | connectors push here |
-| Collector scrape | http://localhost:8889/metrics | what Prometheus reads |
-| Tempo | http://localhost:3200 | traces (later milestones) |
+| Grafana | http://127.0.0.1:3000 | admin / configured password; anonymous access disabled; **Connector** and **Cluster** dashboards auto-provisioned |
+| Prometheus | http://127.0.0.1:9090 | alert rules loaded from `alerts.yml` |
+| Collector OTLP | HTTP `127.0.0.1:4318` (default stdlib); gRPC `127.0.0.1:4317` (explicit SDK exporter) | connectors push here |
+| Collector health/scrape | http://127.0.0.1:13133 / http://127.0.0.1:8889/metrics | liveness / pushed metrics |
+| Tempo | http://127.0.0.1:3200 | traces |
+
+If a default host port is occupied, set the corresponding compose variable:
+`DFKV_GRAFANA_PORT`, `DFKV_PROMETHEUS_PORT`, `DFKV_TEMPO_PORT`,
+`DFKV_OTLP_HTTP_PORT`, `DFKV_OTLP_GRPC_PORT`,
+`DFKV_COLLECTOR_HEALTH_PORT`, or `DFKV_COLLECTOR_PROM_PORT`. These change only
+the loopback host port; container-to-container addresses remain unchanged.
 
 ## Point a connector at it
 
@@ -35,13 +50,14 @@ Telemetry is **off by default** (zero cost). Turn it on per connector process:
 
 ```bash
 export DFKV_METRICS_ENABLED=1
-export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317      # gRPC; use :4318 for http
-# optional: a stable, human-readable id (else auto = host:pid:tp_rank)
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318      # default stdlib OTLP/HTTP JSON
+# optional: a stable, human-readable id (else auto = host_pid_tp_rank)
 export DFKV_CONNECTOR_ID=myhost-rank0
 # optional: active per-cache-node latency probe (every 5s) so idle nodes still
 # show avg/max latency. Off unless set. (The SGLang plugin auto-enables it.)
 export DFKV_PROBE_INTERVAL_MS=5000
-# install the optional OTel deps once: pip install 'dfkv-vllm[otel]'  (or dfkv-connector[otel])
+# No package is required for the default exporter. For the SDK exporter only:
+# pip install 'dfkv-vllm[otel]' && export DFKV_METRICS_EXPORTER=otel
 ```
 
 Then run vLLM / LMCache / SGLang as usual. Metrics appear in Grafana within ~15s.
@@ -54,20 +70,36 @@ equivalent `extra_config` keys, precedence **extra_config > env > default**).
 | Env var | extra_config key | Default | Effect |
 |---|---|---|---|
 | `DFKV_METRICS_ENABLED` | `metrics` | `0` (off) | master switch for push metrics |
-| `DFKV_TELEMETRY_ENABLED` | `telemetry` | `0` | umbrella switch (metrics + future traces) |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `otlp_endpoint` | SDK default | Collector endpoint (grpc `:4317` / http `:4318`) |
-| `OTEL_EXPORTER_OTLP_PROTOCOL` | `otlp_protocol` | `grpc` | `grpc` or `http/protobuf` |
-| `DFKV_CONNECTOR_ID` | `connector_id` | `<host>:<pid>:<tp_rank>` | stable instance id label |
+| `DFKV_TELEMETRY_ENABLED` | `telemetry` | `0` | umbrella switch (metrics + traces); explicit per-signal switch wins |
+| `DFKV_METRICS_EXPORTER` | `metrics_exporter` | `stdlib` | `stdlib` = built-in OTLP/HTTP JSON; `otel` = optional OpenTelemetry SDK |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `otlp_endpoint` | stdlib: `http://localhost:4318`; otel: SDK default | HTTP `:4318` for stdlib; gRPC `:4317` only with an SDK gRPC exporter |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `otlp_protocol` | stdlib: fixed HTTP/JSON; otel: SDK default | only interpreted by the SDK exporter |
+| `DFKV_CONNECTOR_ID` | `connector_id` | `<host>_<pid>_<tp_rank>` | stable instance id label; `[A-Za-z0-9._-]` |
 | `DFKV_METRICS_EXPORT_INTERVAL_MS` | `metrics_export_interval_ms` | `10000` | OTLP push cadence (min 1000) |
 | `DFKV_PROBE_INTERVAL_MS` | `probe_interval_ms` | `0` off (`5000` when metrics on) | C++ active per-peer latency probe |
 | `DFKV_PEER_LATENCY_POLL_S` | `peer_latency_poll_s` | `10` | snapshot→push cadence for per-peer latency |
 
 **Cost model.** When metrics are **off**: the connector op path evaluates no
 metric args (a falsy no-op guard), the C++ datapath is byte-for-byte unchanged,
-and the OTel SDK is never imported — effectively zero. When **on**: each op does
-an in-memory aggregate update (no I/O); a background thread pushes the aggregated
-state over OTLP every `DFKV_METRICS_EXPORT_INTERVAL_MS` (time-triggered, not
-size-triggered — metrics are aggregates, not an event buffer).
+and the OTel SDK is never imported. When **on**: each op updates bounded
+in-memory aggregates; a sleeping background poller snapshots the native C client
+outside the request path, and a second thread pushes aggregates over OTLP every
+`DFKV_METRICS_EXPORT_INTERVAL_MS`. Export failures emit one warning, retain
+bounded trace data for retry, and emit a recovery warning; no request is blocked.
+
+## Health and alert rules
+
+Prometheus loads `alerts.yml` from this directory. It evaluates server readiness/
+storage health, MDS scrape and etcd readiness, version skew, missing heartbeat
+stats, RDMA completion/receive-segment failures, connector poll staleness, empty
+rings, MDS reachability, transport backoff, and rendezvous timeouts.
+
+Rules are visible under Prometheus **Alerts** and as the `ALERTS` series. This
+local stack intentionally does not embed an Alertmanager destination; production
+deployments must route Prometheus alerts to their existing Alertmanager/on-call
+system. `promtool check config` validates both `prometheus.yml` and `alerts.yml`
+in CI.
+
 
 ## Dashboards
 
@@ -76,39 +108,46 @@ Two dashboards split by audience: **connector / business-traffic view** vs
 
 ### 1. "Connector" (connector fleet — pushed via OTLP)
 
-1. **Connector instances / by type / inventory table** — how many connectors,
-   which type (hicache/lmcache/vllm), by `connector_id`. The inventory table also
-   shows each instance's `dfkv_version` (connector pkg) and `dfkv_native_version`
-   (libdfkv.so), so a half-finished rolling upgrade / version skew is visible.
-2. **PUT/GET req-rate, keys/s, bytes/s** — volume per op.
-3. **Op latency avg / p99 / max** — per op.
-4. **Ops by status + success rate** — success vs failure and the ratio.
-5. **Per-cache-node latency** (avg / max per node) — from the client's active
-   per-peer probe (`DFKV_PROBE_INTERVAL_MS`); visible even when idle.
+- Fleet inventory and request volume by connector type/id and package/native
+  version.
+- Request/key/byte rates; average, p99, and max latency; success/failure ratio.
+- Per-cache-node active-probe latency.
+- Native ring/MDS health, transport-pool connections/backoff, peer
+  quarantine/recovery, same-host CPU/GPU rendezvous funnels, and client
+  operation/I/O errors.
+- RDMA rail connection/completion/error rates, CQ/MR state, completion
+  timeouts, pipeline depth, and NUMA fallback reasons.
 
-Use the **Connector type** / **Connector id** template variables at the top to
-drill into one type or one instance.
+Use the **Connector type** / **Connector id** variables to drill into one type
+or process. `dfkv_connector_client_stats_poll_success` and
+`dfkv_connector_client_stats_last_success_unixtime` distinguish a healthy zero
+from a stale last-good native snapshot.
 
 ### 2. "Cluster" (cache nodes + MDS — scraped via pull)
 
-Fed by the `dfkv_server` / `dfkv_mds` Prometheus scrape jobs (start the daemons
-with `--metrics-port`). Three sections:
+Fed by the `dfkv_server` / `dfkv_mds` Prometheus scrape jobs (start daemons with
+`--metrics-port`):
 
-- **Cache nodes** — hit ratio, cache/exist ops/s, op latency avg/p99 by op,
-  read/write throughput, evictions, errors by op/status, capacity (used + per
-  disk), connections, and a node inventory table (version / uptime).
-- **RDMA** — active connections, completions/s & errors/s, idle reclaims/s.
-- **MDS** — members, register/keepalive/list ops/s, etcd lease grants & errors,
-  and a replica inventory table (version per instance).
+- **Cache nodes** — composite readiness, startup completion, local storage/RAM
+  health, MDS registration/heartbeat health, hit ratio, request latency and
+  throughput, capacity/objects/evictions, open/rejected connections, and node
+  version/uptime inventory.
+- **Disk/RAM/slab** — physical/logical slab occupancy, per-class reserved vs
+  used capacity, reclaim progress, watermarks, failed disks, io_uring batches
+  and fallback/errors, RAM admission/promotion/flush backlog.
+- **RDMA** — active connections, completions and errors per rail, receive
+  segment registered/free bytes and evictions, one-sided PUT/GET payload rates,
+  and io_uring read/fallback counters.
+- **MDS** — scrape/etcd readiness, member/client counts, capacity and hit/miss
+  aggregates per group, registration/list/keepalive and etcd latency/error
+  rates, heartbeat completeness, version skew, and replica inventory.
 
-Use the **Cache node** template variable to filter by `instance`.
+Use the **Cache node** variable to filter by `instance`.
 
-> Note: the C++ client-side health counters (`dfkv_client_io_errors_total`,
-> `unhealthy_skips`, `peer_marked_bad/recovered`, `peer_errors`) are **not** on
-> this central Prometheus — they are mirrored only onto SGLang's own `/metrics`
-> via `dfkv_metrics.py` (needs `prometheus_client` + multiproc mode). Only
-> `dfkv_client_peer_latency_*` reaches the center (pushed via OTLP), and it lives
-> on the connector dashboard. Wiring those counters to OTLP push is future work.
+The connector snapshot poller mirrors the bounded native C-client allowlist to
+central OTLP, so client I/O, peer, MDS, RDMA, transport-pool, and rendezvous
+families are available on the Connector dashboard for vLLM, LMCache, and
+SGLang. SGLang also keeps its process-local Prometheus mirror.
 
 ## Metric reference (what the connectors emit)
 
@@ -120,6 +159,12 @@ Use the **Cache node** template variable to filter by `instance`.
 | `dfkv_connector_bytes_total` | counter | `op` |
 | `dfkv_connector_op_seconds` | histogram | `op` |
 | `dfkv_connector_op_max_seconds` | gauge | `op` |
+| `dfkv_connector_client_stats_poll_success` | gauge | connector identity |
+| `dfkv_connector_client_stats_last_success_unixtime` | gauge | connector identity |
+| `dfkv_connector_{ring,mds,rdma,transport_pool,dedup,gpu_dedup,...}` | counter/gauge | native labels such as `peer`, `dev`, `reason` |
+
+The complete authoritative family list and producer ownership are in
+[`docs/METRICS.md`](../../docs/METRICS.md) §3.4.
 
 Identity rides on OTLP **resource attributes**; the Collector's
 `resource_to_telemetry_conversion` turns them into the `dfkv_connector_*` labels
@@ -127,7 +172,7 @@ above (with `.`→`_`). Metric-name suffixing is disabled so names are verbatim.
 
 ## Trace backend: Tempo vs Jaeger
 
-Tempo is used for first-class Grafana trace↔metrics↔logs correlation. To use a
-standalone Jaeger UI instead, swap the `tempo` service for
-`jaegertracing/all-in-one` (`COLLECTOR_OTLP_ENABLED=true`, ports 16686/4317) and
-point the Collector's `otlp/tempo` exporter at it.
+Tempo provides Grafana trace search and connector request attributes. To use a
+standalone Jaeger UI instead, point the Collector's `otlp/tempo` exporter at a
+compatible Jaeger OTLP endpoint. On mainland-China hosts, mirror and pin the
+Jaeger image in the approved registry rather than pulling Docker Hub directly.

@@ -37,9 +37,12 @@ class ConnectorAccessLogHotTest(unittest.TestCase):
         return alog, hot
 
     def _run_for(self, connector):
-        for k in list(os.environ):
-            if k.startswith("DFKV_"):
-                del os.environ[k]
+        saved_env = {
+            key: value for key, value in os.environ.items()
+            if key.startswith("DFKV_")
+        }
+        self.addCleanup(self._restore_dfkv_env, saved_env)
+        self._restore_dfkv_env({})
         alog, hot = self._mods(connector)
         tmp = tempfile.mkdtemp(prefix=f"dfkv_{connector}_")
         logpath = os.path.join(tmp, "acc.log")
@@ -107,6 +110,13 @@ class ConnectorAccessLogHotTest(unittest.TestCase):
         self.assertTrue(alog.is_enabled(), f"{connector}: watcher file-driven enable")
         self.assertTrue(watcher.is_alive())
         hot.stop()
+
+    @staticmethod
+    def _restore_dfkv_env(saved):
+        for key in list(os.environ):
+            if key.startswith("DFKV_"):
+                del os.environ[key]
+        os.environ.update(saved)
 
     def test_vllm(self):
         self._run_for("vllm")

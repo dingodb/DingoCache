@@ -126,6 +126,22 @@ TEST(RamTier, FlushMakesDurable) {
   EXPECT_EQ(rt.FlushBacklog(), 0u);
 }
 
+TEST(RamTier, FlushBacklogIncludesDequeuedInflightItem) {
+  FlushSink sink;
+  sink.close();
+  RamTier rt(Opts(64 * 4096), sink.fn());
+  std::string v(1000, 'q');
+  ASSERT_TRUE(rt.Put(K(3), v.data(), v.size()));
+  ASSERT_TRUE(WaitFor([&] {
+    std::lock_guard<std::mutex> lk(sink.m);
+    return sink.calls == 1;
+  }));
+  EXPECT_EQ(rt.FlushBacklog(), 1u);
+  sink.open();
+  ASSERT_TRUE(WaitFor([&] { return rt.Flushed() == 1u; }));
+  EXPECT_EQ(rt.FlushBacklog(), 0u);
+}
+
 // Regression (hd04 prod, 2026-07): the RAM tier bound its whole arena to ONE
 // SlabAllocator extent, so it could hold only a single size class at a time. A
 // real KV working set has assorted value sizes (partial blocks, variable-length

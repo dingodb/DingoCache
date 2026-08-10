@@ -1,8 +1,12 @@
 # dfkv 可观测性（Metrics / 集群视图）
 
-> v1.4.0 起。所有指标均为**新增**、对数据面零性能影响（热路径仅 relaxed 原子；延迟为 1/64 采样；HTTP 在独立端口/线程）。默认不开端口 → 行为与旧版一致。
+> 本页是 **v2.11.0** 的稳定指标契约；表内列出本版本全部公开 metric family，
+> 并标明按构建、引擎或开关才出现的条件族。旧版本可能缺少后续增加的指标，
+> 不得把“序列不存在”直接解释为 0。`/metrics` 生成仍在独立端口/线程，
+> 热路径计数为 relaxed 原子、延迟按 1/64 采样；不开端口时不启动 HTTP。
 
-> **分布式追踪（traces）** 是另一条独立的连接器侧能力（按慢请求 / 采样 / 失败上报 span，经 OTLP `/v1/traces`），见 [tracing.md](tracing.md)。本文只覆盖 metrics。
+> **分布式追踪（traces）** 是独立的连接器侧能力（OTLP `/v1/traces`），
+> 见 [tracing.md](tracing.md)。本文只覆盖 metrics。
 
 ## 1. 抓取端点
 
@@ -63,18 +67,19 @@ dfkvctl stat <ip:port>                        # 单节点原始 /metrics 文本�
 ## 3. 指标清单
 
 ### 3.1 cache 节点（`dfkv_server` /metrics）
-> 下表只收录告警/排障相关序列，不是全量清单；容量级与诊断序列（per-class
-> slab gauge、rebuild 细节等）以线上 `/metrics` 实际输出为准。
+下表及其条件子表构成 v2.11.0 的完整公开 family 清单。带 `{disk}`、`{dev}`、
+`{tenant_hash}`、`{slot_size}` 的序列，其 label 值来自启动时有界集合，不能由请求输入扩张。
 
 | 指标 | 类型 | 含义 |
 |---|---|---|
 | `dfkv_build_info{version,transport,engine,write_mode[,node,group]}` | gauge | 版本 + 构建传输（rdma/tcp）+ resolved 存储引擎；slab 的 `write_mode` 为 `direct`/`buffered`，显式 file 为 `n/a`；设置 `--id`/`--group` 时追加 `node`/`group` label；恒为 1 |
 | `dfkv_uptime_seconds` | gauge | 启动至今秒数 |
 | `dfkv_storage_healthy` | gauge | 当前 disk group 与显式请求 RAM tier 的 terminal health；0 时 `/healthz`、`/readyz` 均为 503 |
-| `dfkv_cache_put_total` / `cache_hit_total` / `cache_miss_total` | counter | PUT / GET 命中 / GET 未命中 |
-| `dfkv_exist_hit_total` / `exist_miss_total` | counter | Exist 命中 / 未命中 |
-| `dfkv_remove_ok_total` / `remove_miss_total` | counter | Remove 删掉了块 / 目标本就不存在（partial save 清理等路径的诊断分型） |
-| `dfkv_bytes_written_total` / `bytes_read_total` | counter | 读写字节 |
+| `dfkv_server_startup_complete` / `dfkv_server_mds_registration_ready` / `dfkv_server_healthy` / `dfkv_server_ready` | gauge | startup、本次首次 MDS 注册门、本地动态 health、三者合取；`dfkvctl stat --all` 用这组稳定 gauge 判定节点健康 |
+| `dfkv_cache_put_total` / `dfkv_cache_hit_total` / `dfkv_cache_miss_total` | counter | PUT / GET 命中 / GET 未命中 |
+| `dfkv_exist_hit_total` / `dfkv_exist_miss_total` | counter | Exist 命中 / 未命中 |
+| `dfkv_remove_ok_total` / `dfkv_remove_miss_total` | counter | Remove 删掉了块 / 目标本就不存在（partial save 清理等路径的诊断分型） |
+| `dfkv_bytes_written_total` / `dfkv_bytes_read_total` | counter | 读写字节 |
 | `dfkv_accepts_total` | counter | 累计 TCP accept |
 | `dfkv_open_connections` | gauge | 当前打开连接数 |
 | `dfkv_tcp_max_connections` / `dfkv_tcp_io_timeout_seconds` | gauge | cache TCP handler 硬准入上限 / socket I/O 超时的 resolved 配置 |
@@ -86,16 +91,16 @@ dfkvctl stat <ip:port>                        # 单节点原始 /metrics 文本�
 | `dfkv_mds_heartbeat_healthy{group,node}` | gauge | 首次注册后最近一次 heartbeat 是否成功 |
 | `dfkv_mds_heartbeat_failures_consecutive{group,node}` / `dfkv_mds_heartbeat_failures_total{group,node}` | gauge / counter | 连续 / 累计 heartbeat 失败 |
 | `dfkv_mds_last_success_age_seconds{group,node}` | gauge | 最近成功注册或 heartbeat 的年龄 |
-| `dfkv_evictions_total` / `evicted_bytes_total` | counter | 淘汰对象数 / 字节 |
+| `dfkv_evictions_total` / `dfkv_evicted_bytes_total` | counter | 淘汰对象数 / 字节 |
 | `dfkv_errors_total{op,status}` | counter | 失败 op（put/get io、invalid） |
-| `dfkv_objects` / `used_bytes` / `disks` | gauge | 对象数 / 占用 / 盘数 |
+| `dfkv_objects` / `dfkv_used_bytes` / `dfkv_disks` | gauge | 对象数 / 占用 / 盘数 |
 | `dfkv_disk_used_bytes{disk}` / `dfkv_disk_objects{disk}` | gauge | 每盘占用 / 对象 |
 | `dfkv_tenant_default_quota_bytes` | gauge | 本节点未显式列出 tenant 的 quota；0=无限 |
 | `dfkv_tenant_quota_rejections_total` | counter | 本节点所有 tenant 的 `kQuotaExceeded` item 总数 |
 | `dfkv_tenant_quota_limit_bytes{tenant_hash}` | gauge | 配置文件中该 16 位小写 hex tenant hash 的 per-node limit；0=无限 |
 | `dfkv_tenant_used_bytes{tenant_hash}` | gauge | 该显式配置 tenant 在本节点的 committed payload bytes |
 | `dfkv_tenant_quota_rejections_by_hash_total{tenant_hash}` | counter | 该显式配置 tenant 在本节点的 quota rejection |
-| `dfkv_op_latency_seconds{op}` | histogram | **1/64 采样**的 **get / put / exist** 服务端延迟（50µs–100ms 桶）。`op="exist"` 是 exist handler 体延迟（Contains + IsCached 的锁），L3 预取停滞时先查它的尾——慢 exist 卡住预取决策；serve-loop 排队（大 GET 挡在同连接的 exist 前）是另一回事，靠客户端 control-lane QP 隔离规避 |
+| `dfkv_op_latency_seconds{op}` | histogram | **1/64 采样**的 **get / put / exist** 服务端延迟（50µs–60s 桶，另有 `+Inf`）。`op="exist"` 是 exist handler 体延迟（Contains + IsCached 的锁），L3 预取停滞时先查它的尾；serve-loop 排队（大 GET 挡在同连接的 exist 前）是另一回事，靠客户端 control-lane QP 隔离规避 |
 
 Tenant 标签**只**来自启动时有界配置文件中的 16-hex hash；默认 quota 命中的
 未列 tenant 不生成动态 label。容量余量为
@@ -112,18 +117,23 @@ Tenant 标签**只**来自启动时有界配置文件中的 16-hex hash；默认
 触发时同步看 `dfkv_open_connections / dfkv_tcp_max_connections`。
 
 RDMA 构建额外（折叠进同一 /metrics）：
-| `dfkv_rdma_completions_total` / `completion_errors_total` | counter | RDMA 请求完成 / 错误完成 |
+| `dfkv_rdma_completions_total` / `dfkv_rdma_completion_errors_total` | counter | RDMA 请求完成 / 错误完成 |
 | `dfkv_rdma_active_conns` | gauge | 当前服务中的 RDMA 连接 |
 | `dfkv_rdma_v2_conns_opened_total` | counter | server 累计打开的 v2 连接 |
-| `dfkv_rdma_v2_put_writes_total` / `v2_get_writes_total` | counter | server 实际收到的 `WRITE_WITH_IMM` PUT / 实际发出的 RDMA WRITE GET payload |
+| `dfkv_rdma_v2_put_writes_total` / `dfkv_rdma_v2_get_writes_total` | counter | server 实际收到的 `WRITE_WITH_IMM` PUT / 实际发出的 RDMA WRITE GET payload |
 | `dfkv_rdma_recv_segment_bytes` / `dfkv_rdma_recv_segment_free_bytes` | gauge | process-wide receive segment 总字节 / 当前未租 lease 字节；free 接近 0 时新连接会被拒绝 |
 | `dfkv_rdma_recv_segment_registered_rails` | gauge | 成功把共享 segment 注册到共享 PD 的 rail 数；应等于选中 rail 数 |
 | `dfkv_rdma_v2_ready` | gauge | 至少一个 rail 完成共享 segment 注册；进程就绪后应为 1 |
 | `dfkv_uring_reads_total` / `dfkv_uring_init_fallbacks_total` | counter | io_uring 路径真实提交的读数（**>0 = 路径确实激活**，外部可证）/ 想用 uring 但 ring 初始化失败静默回退同步的连接数（>0 = 配了没生效，查内核/权限） |
 | `dfkv_rdma_idle_reclaims_total` | counter | 空闲超时回收的连接数 |
+| `dfkv_rdma_segment_evictions_total` | counter | receive segment 空间不足时主动淘汰连接的次数；增长说明 segment/连接预算不足 |
+| `dfkv_rdma_rail_active_conns{dev}` | gauge | 每个本地 HCA 上当前连接数 |
+| `dfkv_rdma_rail_completions_total{dev}` / `dfkv_rdma_rail_completion_errors_total{dev}` | counter | 每 rail 请求完成 / 错误完成 |
+| `dfkv_rdma_rail_put_writes_total{dev}` / `dfkv_rdma_rail_put_bytes_total{dev}` | counter | 每 rail 收到的 PUT one-sided writes / payload bytes |
+| `dfkv_rdma_rail_get_writes_total{dev}` / `dfkv_rdma_rail_get_bytes_total{dev}` | counter | 每 rail 发出的 GET one-sided writes / payload bytes |
 
 > **v2 上线判据**：client/server 两侧连接总数增长，PUT/GET write counter
-> 随负载增长，`v2_ready=1` 且 `recv_segment_free_bytes` 有容量余量。启动失败
+> 随负载增长，`dfkv_rdma_v2_ready=1` 且 `dfkv_rdma_recv_segment_free_bytes` 有容量余量。启动失败
 > 或连接拒绝时检查 segment 容量、每轨注册日志和两端协议版本。
 
 读侧 convoy 合并与直读晋升（`DFKV_READ_COALESCE=1` 时才有增量；恒零 = 开关没生效）：
@@ -140,12 +150,23 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_extent_steals_total` / `dfkv_slab_extent_returns_total` | counter | 跨 class extent 抢占（伴随驱逐，容量失衡信号）/ 全空 extent 主动回池（无损再平衡） |
 | `dfkv_slab_cold_steals_total` | counter | 命中"全局最冷 extent"护栏的跨 class 抢占（donor 全部内容都冷于 `DFKV_SLAB_COLD_STEAL_WINDOW` 窗口才走此路，满环自噬护栏；0=窗口关闭） |
 | `dfkv_slab_watermark_evictions_total` | counter | 水位线主动驱逐（`DFKV_SLAB_EVICT_HIGH_PCT`/`_LOW_PCT`，默认 92/88）——赶在 demand 前腾 headroom，满环自噬的第一道防线 |
-| `dfkv_slab_table_rebuilt_objects` / `dfkv_slab_rebuild_scanned_bytes` / `rebuild_scan_chunks` / `rebuild_sparse_ranges` / `rebuild_mmap_scans` | gauge | 上次启动冷升从 slots.tbl 恢复的对象数 / 扫描字节 / chunk / sparse range / mmap 的表数（冷升目录规模诊断） |
-| `dfkv_slab_rebuild_corrupt_records_total` / `rebuild_rejected_records_total` / `rebuild_sequential_fallbacks_total` | counter | 启动 rebuild 丢弃的损坏记录 / 因几何不安全被清除的合法记录 / sparse seek 退化为顺序扫描的次数（任一非零都值得看日志） |
+| `dfkv_slab_table_rebuilt_objects` / `dfkv_slab_rebuild_scanned_bytes` / `dfkv_slab_rebuild_scan_chunks` / `dfkv_slab_rebuild_sparse_ranges` / `dfkv_slab_rebuild_mmap_scans` | gauge | 上次启动冷升从 slots.tbl 恢复的对象数 / 扫描字节 / chunk / sparse range / mmap 的表数（冷升目录规模诊断） |
+| `dfkv_slab_rebuild_corrupt_records_total` / `dfkv_slab_rebuild_rejected_records_total` / `dfkv_slab_rebuild_sequential_fallbacks_total` | counter | 启动 rebuild 丢弃的损坏记录 / 因几何不安全被清除的合法记录 / sparse seek 退化为顺序扫描的次数（任一非零都值得看日志） |
 | `dfkv_slab_deferred_removes_total` | counter | 被在飞 I/O 延迟执行的 Remove |
 | `dfkv_slab_inflight_keys` / `dfkv_slab_prep_holds` | gauge | 锁外 I/O 在飞 key 数 / 未释放的异步 prep 持有数（持续增长 = 泄漏） |
 | `dfkv_slab_reclaimed_total` | counter | 后台回收线程预驱逐的 slot 数（`DFKV_SLAB_RECLAIM_MS`，默认 50ms）——持续为 0 且 PUT 延迟高 = 回收被关或池未满，先查 `--slab-reclaim-ms` |
 | `dfkv_slab_rebalanced_total` | counter | 回收线程从冷 class 搬给热 class 的 extent 数（类再平衡）——换模型/尺寸迁移期应看到增长，稳态应静止 |
+| `dfkv_slab_batched_writes_total` / `dfkv_slab_uring_write_batches_total` | counter | 进入 batched store visit 的 payload 写数 / io_uring 单次 submit 轮数 |
+| `dfkv_slab_bind_wipes_total` | counter | extent 绑定新 class 前完成的旧 slot-grid 清理 |
+| `dfkv_slab_metadata_io_errors_total` / `dfkv_slab_unclean_resets_total` | counter | slots.tbl/epoch 持久化失败 / 冷升时丢弃 dirty epoch |
+| `dfkv_slab_eviction_record_clears_total` / `dfkv_slab_record_writes_total` | counter | allocator 复用前持久清除记录 / 已提交 slots.tbl record 写数 |
+| `dfkv_slab_capacity_bytes` / `dfkv_slab_allocated_bytes` / `dfkv_slab_payload_bytes` / `dfkv_slab_internal_fragmentation_bytes` | gauge | 物理 payload 容量 / 已占 slot / 逻辑 payload / 内部碎片 |
+| `dfkv_slab_allocator_objects` / `dfkv_slab_committed_objects` | gauge | allocator resident（含未提交写）/ reader-visible 已提交对象 |
+| `dfkv_slab_classes` / `dfkv_slab_bound_extents` / `dfkv_slab_pool_extents` | gauge | live class 数 / 已绑定 extent / 未绑定共享池 extent |
+| `dfkv_slab_class_extents{slot_size}` / `dfkv_slab_class_resident_objects{slot_size}` / `dfkv_slab_class_free_slots{slot_size}` | gauge | 每个 live size class 的 extent、resident、可立即分配 slot |
+| `dfkv_slab_class_allocated_bytes{slot_size}` / `dfkv_slab_class_useful_bytes{slot_size}` / `dfkv_slab_class_fragmentation_bytes{slot_size}` | gauge | 每 class 的占用、有效 payload、内部碎片 |
+| `dfkv_slab_class_read_heat{slot_size}` / `dfkv_slab_class_put_total{slot_size}` | gauge / counter | 每 class 的衰减读热度 / 累计 PUT |
+| `dfkv_slab_failed_disks` / `dfkv_slab_healthy` | gauge | fail-closed disk 数 / 全部 slab disk 是否健康 |
 
 PUT 准入门（**仅 `--put-inflight-limit > 0` 时输出**）：
 | `dfkv_put_busy_total` | counter | 被准入门以 kCacheFull 快速拒绝的 PUT（受控 miss，替代深队列尾延迟） |
@@ -163,7 +184,7 @@ RAM 热层（**仅 `DFKV_RAM_TIER=1` 时输出**；关时无此系列，向后�
 | `dfkv_ram_evictions_total` | counter | RAM slot 容量压力淘汰数（含内联与后台回收两路） |
 | `dfkv_ram_reclaimed_total` | counter | 其中由后台回收线程预驱逐的数量（`DFKV_RAM_RECLAIM_MS`，默认 10ms；flush 积压 >4096 时自动歇拍，此计数暂停属预期） |
 | `dfkv_ram_rebalanced_total` | counter | RAM 层类再平衡搬动的 extent 数（增长阶段不受 flush 积压歇拍影响——从冷 donor 搬 durable extent 恰是 flush-gated 时唯一能扩收速的动作） |
-| `dfkv_ram_objects` / `dfkv_ram_flush_backlog` | gauge | 当前 RAM 常驻块 / 待 flush（未 DURABLE）队列深度 |
+| `dfkv_ram_objects` / `dfkv_ram_flush_backlog` | gauge | 当前 RAM 常驻块 / 待 flush（含已出队、正在 flush，均尚未 DURABLE）的块数 |
 | `dfkv_ram_budget_bytes` / `dfkv_ram_arena_bytes` / `dfkv_ram_large_budget_bytes` | gauge | RAM 层总预算（arena+dedicated）/ arena 固定预留 / 总预算内大对象 dedicated 预留 |
 | `dfkv_ram_used_bytes` / `dfkv_ram_large_used_bytes` | gauge | 已用（常驻 slot + dedicated 分配）/ 其中 dedicated 大对象已用——与上组预算行做水位比 |
 
@@ -181,38 +202,53 @@ TTL-debounced etcd probe 判定（`DFKV_MDS_PROBE_CACHE_MS`，默认 2500 ms 内
 | 指标 | 含义 |
 |------|------|
 | `dfkv_mds_group_nodes{group}` | 该环成员数（带标签版；旧无标签 `dfkv_mds_members` 保留不动） |
-| `dfkv_mds_group_capacity_bytes` / `_used_bytes{group}` | 环总容量 / **环水位**（direct 模式下 df 已失真，此为唯一真值） |
+| `dfkv_mds_group_capacity_bytes{group}` / `dfkv_mds_group_used_bytes{group}` | 环总容量 / **环水位**（direct 模式下 df 已失真，此为唯一真值） |
 | `dfkv_mds_group_objects{group}` | 环内常驻块数 |
-| `dfkv_mds_group_hits_sum` / `_misses_sum{group}` | 环级命中率 = hits/(hits+misses) |
-| `dfkv_mds_group_evictions_sum` / `_puts_sum{group}` | 容量压力 / 写入量 |
+| `dfkv_mds_group_hits_sum{group}` / `dfkv_mds_group_misses_sum{group}` | 环级命中率 = hits/(hits+misses) |
+| `dfkv_mds_group_evictions_sum{group}` / `dfkv_mds_group_puts_sum{group}` | 容量压力 / 写入量 |
 | `dfkv_mds_group_put_busy_sum{group}` | 准入门拒绝总数（过载信号） |
 | `dfkv_mds_group_dio_fallbacks_sum{group}` | direct 模式 buffered 回退总数（**>0 = page cache 悄悄回来了**，舰队级告警位） |
-| `dfkv_mds_group_ram_used_bytes` / `_ram_hits_sum{group}` | RAM 热层水位 / 命中 |
+| `dfkv_mds_group_ram_used_bytes{group}` / `dfkv_mds_group_ram_hits_sum{group}` | RAM 热层水位 / 命中 |
 | `dfkv_mds_group_stats_missing{group}` | 无 STA1 上报的成员数（滚动升级进度/掉队检测） |
 | `dfkv_mds_group_version_skew{group}` | 去重版本数，**>1 = 版本漂移** |
+| `dfkv_mds_group_clients{group}` | 当前注册的 inference connector/consumer 实例数；client lease 到期后自动下降 |
 
 对应 CLI：`dfkvctl stats --mds <eps> --group <g>`（每节点表格+汇总行，数据一跳来自 MDS 不触节点）/ `--all`（kListGroups 枚举全部环）。深钻仍用 `dfkvctl stat --all`（逐节点全量 /metrics）。
 
 原有计数：
 | 指标 | 类型 | 含义 |
 |---|---|---|
-| `dfkv_mds_register_requests_total` / `keepalives_total` | counter | 注册 / 心跳 |
+| `dfkv_mds_ready` | gauge | TTL-debounced etcd probe；与 `/readyz` 使用同一 cache，1=可服务 membership |
+| `dfkv_build_info{version,role="mds"}` | gauge | MDS 二进制版本；恒为 1 |
+| `dfkv_mds_register_requests_total` / `dfkv_mds_keepalives_total` | counter | 注册 / 心跳 |
 | `dfkv_mds_list_requests_total` | counter | ListMembers 次数 |
 | `dfkv_mds_lease_grants_total` | counter | etcd lease 授予 |
 | `dfkv_mds_etcd_errors_total` | counter | etcd I/O 失败 |
 | `dfkv_mds_members` | gauge | 上次 List 返回的成员数 |
+| `dfkv_mds_client_register_requests_total` / `dfkv_mds_client_keepalives_total` / `dfkv_mds_client_list_requests_total` | counter | consumer 注册 / 心跳 / ListClients |
+| `dfkv_mds_clients` | gauge | 上次 ListClients 返回的 consumer 数 |
+| `dfkv_mds_etcd_requests_total{op}` / `dfkv_mds_etcd_request_errors_total{op}` | counter | etcd HTTP 请求 / 传输或 HTTP status 失败，`op=lease_grant|lease_keepalive|put|range|metrics_range`；`metrics_range` 是每次 MDS scrape 同时用于 readiness 与 group 聚合的唯一 range，和业务控制面流量分开计数 |
+| `dfkv_mds_etcd_request_duration_seconds{op}` | histogram | 同五类 etcd HTTP 请求延迟（50µs–60s + `+Inf`）；用于区分本地控制面排队、常规 etcd 慢响应和 scrape 自身的聚合 range |
 | `dfkv_mds_local_member_leases` / `dfkv_mds_local_client_leases` | gauge | 本 MDS 进程当前缓存的 member/client lease shortcut 数；只是 etcd 权威状态的有界优化 |
 | `dfkv_mds_local_member_leases_pruned_total` / `dfkv_mds_local_client_leases_pruned_total` | counter | 因多个 TTL 未在本 MDS 使用而丢弃的本地 shortcut；churn 下增长正常，下次心跳会 fresh grant+Put |
 | `dfkv_mds_legacy_frames_total` | counter | 以 v1.x 旧控制面帧（42/10 字节帧）服务的请求数；仅在 `DFKV_MDS_ACCEPT_LEGACY=1` 的混合代际迁移期出现，**归零后应撤掉该 env** |
 
-### 3.3 客户端（SGLang 插件 /metrics，经 prometheus_client）
-插件后台轮询线程读 C 客户端快照（`client_stats_poll_s`，默认 10s，0=关）并镜像为带 `{tp_rank}` 的 Counter：
-| 指标 | 含义 |
-|---|---|
-| `dfkv_client_ops_served_total` | 收到响应的 op 数 |
-| `dfkv_client_io_errors_total` | 客户端观察到的传输失败 |
-| `dfkv_client_unhealthy_skips_total` | 因 peer 熔断短路的 op |
-| `dfkv_client_peer_marked_bad_total` / `peer_recovered_total` | peer 熔断 / 恢复切换 |
+### 3.3 客户端（SGLang 插件 `/metrics` 与原生 C 快照）
+SGLang 后台线程每 `client_stats_poll_s`（默认 10s，0=关）读取一次 C 客户端快照，
+把下列有界 family 镜像到插件 `/metrics` 并追加 `{tp_rank}`；request path 不做
+Prometheus 调用。vLLM 使用同一 allowlist，区别只是在 family 前加 `vllm:`，见 §3.5。
+
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `dfkv_client_stats_snapshot_success` / `dfkv_client_stats_snapshot_timestamp_seconds` / `dfkv_client_stats_snapshot_errors_total` | gauge / gauge / counter | 最新 poll 是否成功 / 最后成功 Unix 时间 / 失败累计；失败时保留 last-good 数据并显式置 success=0 |
+| `dfkv_client_transport_info{transport}` | gauge | live transport identity（`rdma`/`tcp`），恒为 1 |
+| `dfkv_client_ops_served_total` / `dfkv_client_io_errors_total` / `dfkv_client_health_checks_total` | counter | 收到响应 / 传输失败 / endpoint health check |
+| `dfkv_client_unhealthy_skips_total` / `dfkv_client_busy_suppressed_total` | counter | peer 熔断短路 / busy 后主动抑制请求 |
+| `dfkv_client_peer_marked_bad_total` / `dfkv_client_peer_recovered_total` | counter | peer 熔断 / 恢复切换 |
+| `dfkv_client_peer_errors_total{peer}` | counter | 逐 endpoint 错误；peer 集合在原生层硬限 4096 |
+| `dfkv_client_ring_members` / `dfkv_client_mds_reachable` / `dfkv_client_mds_unreachable_polls_total` | gauge / gauge / counter | 当前环节点数 / 最近发现轮询是否可达 MDS / 不可达轮询累计 |
+| `dfkv_client_dedup_hits_total` / `dfkv_client_dedup_fetches_total` / `dfkv_client_dedup_wait_hits_total` / `dfkv_client_dedup_wait_timeouts_total` | counter | host rendezvous 命中、真实 fetch、等待后命中、等待超时 |
+| `dfkv_client_gpu_dedup_hits_total` / `dfkv_client_gpu_dedup_fetches_total` / `dfkv_client_gpu_dedup_wait_hits_total` / `dfkv_client_gpu_dedup_wait_timeouts_total` | counter | 同上 CUDA IPC rendezvous |
 
 原生 `KVClient` 的收敛操作指标（`op="put|get|exist|remove"`）：
 
@@ -222,15 +258,22 @@ TTL-debounced etcd probe 判定（`DFKV_MDS_PROBE_CACHE_MS`，默认 2500 ms 内
 | `dfkv_client_op_keys_total{op}` | 调用提交的 key 数；TCP fan-out、RDMA pipeline、重试和 rendezvous 不重复计数 |
 | `dfkv_client_op_hits_total{op}` | put/remove 确认成功数、get 命中数、exist 存在数；shm/CUDA rendezvous 命中也计入 |
 | `dfkv_client_op_bytes_total{op}` | 成功移动的 payload 字节 |
-| `dfkv_client_op_latency_seconds{op}` / `op_max_seconds{op}` | 完整公开调用延迟，包含 rendezvous 等待和有界重试 |
+| `dfkv_client_op_latency_seconds{op}`（C 快照 histogram）/ `dfkv_client_op_max_seconds{op}`（镜像 gauge） | 完整公开调用延迟（含 rendezvous 等待和有界重试）/ lifetime max；prometheus_client 不重复注册外部累计 histogram，插件另用下述 per-batch histogram |
 
 路由为空、peer cooldown、I/O 失败等早退仍计入 request/key（hit 为 0）。
 因此这些指标可直接校验请求守恒，不应与 transport 请求数或 dedup fetch 数相等。
 
-插件直接暴露（per-batch）：
-| `dfkv_client_set_calls/pages/ok_pages/bytes_total{tp_rank}` | set 量 |
-| `dfkv_client_get_calls/pages/hit_pages/bytes_total{tp_rank}` | get 量 |
-| `dfkv_client_set_seconds{tp_rank}` / `get_seconds{tp_rank}` | batch 调用耗时直方图 |
+插件直接暴露的调用层 family（全部带 `{tp_rank}`）：
+
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `dfkv_client_set_calls_total` / `dfkv_client_set_pages_total` / `dfkv_client_set_ok_pages_total` / `dfkv_client_set_bytes_total` | counter | v1 set 调用、提交页、成功页、字节 |
+| `dfkv_client_get_calls_total` / `dfkv_client_get_pages_total` / `dfkv_client_get_hit_pages_total` / `dfkv_client_get_bytes_total` | counter | v1 get 调用、请求页、命中页、字节 |
+| `dfkv_client_set_seconds` / `dfkv_client_get_seconds` | histogram | v1 batch set/get 延迟 |
+| `dfkv_client_set_v2_calls_total` / `dfkv_client_set_v2_pages_total` / `dfkv_client_set_v2_ok_pages_total` / `dfkv_client_set_v2_bytes_total` | counter | side-pool v2 set 调用、提交页、成功页、字节 |
+| `dfkv_client_get_v2_calls_total` / `dfkv_client_get_v2_pages_total` / `dfkv_client_get_v2_hit_pages_total` / `dfkv_client_get_v2_bytes_total` | counter | side-pool v2 get 调用、请求页、命中页、字节 |
+| `dfkv_client_set_v2_seconds` / `dfkv_client_get_v2_seconds` | histogram | v2 batch set/get I/O 延迟 |
+| `dfkv_client_exist_v2_calls_total` / `dfkv_client_exist_v2_probe_pages_total` / `dfkv_client_exist_v2_hit_pages_total` | counter | v2 prefix probe 调用、候选页、可用 hit-prefix 页 |
 
 C 客户端快照还含传输级指标（RDMA 构建）：
 
@@ -238,65 +281,110 @@ C 客户端快照还含传输级指标（RDMA 构建）：
 |---|---|---|
 | `dfkv_rdma_client_conns_opened_total` | counter | 累计打开的 RDMA client QP |
 | `dfkv_rdma_client_v2_put_writes_total` / `dfkv_rdma_client_v2_get_writes_total` | counter | 实际发出的 v2 one-sided PUT / GET |
-| `dfkv_rdma_client_mr_regions` / `mr_registered_bytes` | gauge | 所有 active rail 已成功 anchor 后才发布的 host pool MR 区域数 / 声明字节数；任一 rail 失败时两者保持上次成功值 |
+| `dfkv_rdma_client_mr_regions` / `dfkv_rdma_client_mr_registered_bytes` | gauge | 所有 active rail 已成功 anchor 后才发布的 host pool MR 区域数 / 声明字节数；任一 rail 失败时两者保持上次成功值 |
 | `dfkv_rdma_client_mr_registration_rejections_total` | counter | 非法 range、rail anchor 或 `ibv_reg_mr` 失败而未发布（已回滚）的声明次数 |
-| `dfkv_rdma_client_adhoc_user_mr_total` / `transient_user_mr_active` | counter / gauge | pool 外实际注册累计 / 当前仍存活的一次性 MR；公开调用返回后 active 必须回到调用前基线 |
-| `dfkv_rdma_client_pool_mr_registrations_total` / `pool_mr_registration_failures_total` | counter | shared-PD 上真实 `ibv_reg_mr` 次数 / 单 rail 显式 pool 注册失败；包含最终回滚的尝试 |
+| `dfkv_rdma_client_adhoc_user_mr_total` / `dfkv_rdma_client_transient_user_mr_active` | counter / gauge | pool 外实际注册累计 / 当前仍存活的一次性 MR；公开调用返回后 active 必须回到调用前基线 |
+| `dfkv_rdma_client_pool_mr_registrations_total` / `dfkv_rdma_client_pool_mr_registration_failures_total` | counter | shared-PD 上真实 `ibv_reg_mr` 次数 / 单 rail 显式 pool 注册失败；包含最终回滚的尝试 |
 | `dfkv_rdma_client_pool_mr_active_registrations` | gauge | 进程内仍有 endpoint 引用的 shared-PD MR generations；扩容成功后 anchor/空闲 endpoint 立即释放旧代，在飞旧 endpoint 到下次 acquire/close 才释放，确保旧 range 不中断 |
-| `dfkv_rdma_client_max_block_seen_bytes` / `declared_max_block_bytes` | gauge | 实际请求高水位 / DCP2 声明上限 |
+| `dfkv_rdma_client_max_block_seen_bytes` / `dfkv_rdma_client_declared_max_block_bytes` | gauge | 实际请求高水位 / DCP2 声明上限 |
 | `dfkv_rdma_client_oversize_rejects_total` | counter | 分配、注册或发帖前因超过声明上限而拒绝的操作 |
-| `dfkv_rdma_client_v2_probe_attempts_total` / `v2_probe_failures_total` | counter | 必选 v2 bootstrap probe 尝试 / 失败 |
+| `dfkv_rdma_client_v2_probe_attempts_total` / `dfkv_rdma_client_v2_probe_failures_total` | counter | 必选 v2 bootstrap probe 尝试 / 失败 |
 | `dfkv_rdma_client_stale_pool_retries_total` | counter | pooled QP 失败后改用 fresh connection 的重试 |
 | `dfkv_rdma_client_completion_timeouts_total` | counter | 消耗完一次绝对 completion-window deadline 的窗口；部分完成不重置预算 |
-| `dfkv_rdma_client_rail_conns_total{dev}` / `rail_selections_total{dev}` | counter | 每 rail 新连接 / 准入分布 |
-| `dfkv_rdma_client_rail_inflight{dev}` / `rail_credits_available{dev}` | gauge | 当前已租 / 可用 request credits |
+| `dfkv_rdma_client_rail_conns_total{dev}` / `dfkv_rdma_client_rail_selections_total{dev}` | counter | 每 rail 新连接 / 准入分布 |
+| `dfkv_rdma_client_rail_inflight{dev}` / `dfkv_rdma_client_rail_credits_available{dev}` | gauge | 当前已租 / 可用 request credits |
 | `dfkv_rdma_client_rail_credits_exhausted_total{dev}` | counter | 因 local candidate credit 不足跳过次数 |
-| `dfkv_rdma_client_rail_errors_total{dev}` / `rail_consecutive_errors{dev}` | counter / gauge | **仅本地** verbs/device/post/CQ 失败累计 / 当前连续值 |
+| `dfkv_rdma_client_rail_errors_total{dev}` / `dfkv_rdma_client_rail_consecutive_errors{dev}` | counter / gauge | **仅本地** verbs/device/post/CQ 失败累计 / 当前连续值 |
 | `dfkv_rdma_client_endpoint_errors_total{dev}` | counter | peer bootstrap/不可达/协议 frame 失败；credit 已归还，**不惩罚 rail** |
-| `dfkv_rdma_client_rail_quarantines_total{dev}` / `rail_quarantined{dev}` / `rail_recovery_probe{dev}` / `rail_recoveries_total{dev}` | counter / gauge / gauge / counter | rail 隔离切换 / 隔离状态（直到真实成功）/ 单个在飞 recovery probe / 成功恢复 |
+| `dfkv_rdma_client_rail_quarantines_total{dev}` / `dfkv_rdma_client_rail_quarantined{dev}` / `dfkv_rdma_client_rail_recovery_probe{dev}` / `dfkv_rdma_client_rail_recoveries_total{dev}` | counter / gauge / gauge / counter | rail 隔离切换 / 隔离状态（直到真实成功）/ 单个在飞 recovery probe / 成功恢复 |
 | `dfkv_rdma_client_numa_fallbacks_total{reason="caller_unknown\|no_local_rail"}` | counter | `DFKV_RDMA_NUMA=1` 无法建立 local mask 而回退全部 enabled rails |
+| `dfkv_rdma_cq_completions_total` / `dfkv_rdma_cq_errors_total` | counter | client CQ 完成 / 错误完成 |
+| `dfkv_rdma_client_pipeline_depth` | gauge | 握手解析后的有效 pipeline depth |
+
+TCP 构建或 TCP fallback 的 C 快照 family（同样由插件镜像）：
+
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `dfkv_transport_pool_connections` / `dfkv_transport_pool_inflight` | gauge | 当前 pooled 连接 / 在飞 acquire |
+| `dfkv_transport_pool_selections_total` | counter | routed endpoint 的 pooled connection 选择数 |
+| `dfkv_transport_pool_retirements_total{reason}` | counter | 连接退休数；`reason=idle|error` |
+| `dfkv_transport_pool_backoff_endpoints` | gauge | 当前阻止连接增长的 endpoint 数 |
+| `dfkv_transport_pool_backoff_events_total` / `dfkv_transport_pool_backoff_suppressed_total` | counter | 进入 backoff / backoff 中被 fast-fail 的 acquire |
 
 所有 `{dev}` 序列数固定为进程启动时发现的 rail 数，NUMA `reason` 只有上述两个
 枚举；不会按任意 endpoint 扩张。endpoint cooldown/恢复由上表
-`dfkv_client_peer_marked_bad_total` / `peer_recovered_total` 汇总，逐 peer error
+`dfkv_client_peer_marked_bad_total` / `dfkv_client_peer_recovered_total` 汇总，逐 peer error
 序列在 `PeerHealth` 内硬限 4096 条。因此 rail 故障、endpoint 故障和两种 quarantine
 可以分别告警，单个坏 node 不再表现为共享 HCA 故障。
 
 ### 3.4 连接器车队指标（三连接器 OTLP **push**，opt-in）
-§3.3 是 SGLang 插件本地 `/metrics`（**pull**）。此外三个连接器（vLLM `dfkv-vllm` / LMCache `dfkv-connector` / SGLang HiCache `dfkv_hicache.py`）可把聚合后的运行指标经 **OTLP 主动推送**到中心 Collector→Prometheus→Grafana，用于"车队级"按实例/类型观测。
-- **opt-in**：`DFKV_METRICS_ENABLED=1` + `OTEL_EXPORTER_OTLP_ENDPOINT`；关时零开销。默认导出器 `DFKV_METRICS_EXPORTER=stdlib`（纯标准库，**零第三方依赖**），可选 `otel`（OpenTelemetry SDK）。完整配置与各引擎接法见 [`../deploy/observability/CONNECTOR-USAGE.md`](../deploy/observability/CONNECTOR-USAGE.md)。
-- **公共标签**：`connector_type`（`hicache`/`lmcache`/`vllm`）、`connector_id`（实例标识）、`version`（连接器包版本，滚动升级可见）。
+§3.3 是进程本地 Prometheus **pull**。vLLM、LMCache、SGLang HiCache 还可把
+同一份聚合状态经 OTLP push 到中心 Collector，用一个 dashboard 按实例、引擎、
+模型、部署、版本和节点过滤。
+
+- 开关：`DFKV_METRICS_ENABLED=1`；关闭时 recorder 是冻结 no-op singleton，
+  不 import OTel，不启动线程。
+- 默认 `DFKV_METRICS_EXPORTER=stdlib` 使用纯标准库 **OTLP/HTTP JSON**，
+  endpoint 必须是 HTTP receiver（通常 `http://collector:4318`）；自动补
+  `/v1/metrics`。把标准 gRPC 端口 `4317` 交给 stdlib exporter 会启动告警，
+  Collector 也会因协议不匹配拒绝请求。
+- 显式 `DFKV_METRICS_EXPORTER=otel` 才使用 OpenTelemetry SDK，可按 SDK 配置
+  gRPC `4317` 或 HTTP `4318`。详细接法见
+  [`../deploy/observability/CONNECTOR-USAGE.md`](../deploy/observability/CONNECTOR-USAGE.md)。
+- OTLP resource attribute 是 `dfkv.connector_type`、`dfkv.connector_id`、
+  `dfkv.host`、`dfkv.pid`、`dfkv.tp_rank`，以及有值时的 `dfkv.version`、
+  `dfkv.native_version`、`dfkv.model`、`dfkv.deployment`、
+  `dfkv.cache_role`、`dfkv.team`。示例 Collector 开启
+  `resource_to_telemetry_conversion` 后，Prometheus label 对应为
+  `dfkv_connector_type`、`dfkv_connector_id` 等。
+- 同进程多个 connector 共享 recorder/tracer 并按实例引用计数；最后一个 close
+  停止 native poller 后同步 final export。失败的窗口最大值和 native counter
+  delta 保留到下一次成功推送，不会因 snapshot/reset 顺序丢失。
 
 | 指标 | 类型 | 标签 | 含义 |
 |---|---|---|---|
-| `dfkv_connector_ops_total` | counter | `op` | 各 op 次数（→ 命中率） |
-| `dfkv_connector_keys_total` | counter | `op` | 各 op 涉及的 key 数 |
-| `dfkv_connector_bytes_total` | counter | `op` | 各 op 字节量（→ 吞吐） |
-| `dfkv_connector_op_seconds` | histogram | `op` | 各 op 延迟分布 |
-| `dfkv_connector_op_max_seconds` | gauge | `op` | 各 op 周期内峰值延迟 |
-| `dfkv_connector_info` / `_info_ratio` | gauge | — | 实例信息 / 命中比 |
-| `dfkv_client_peer_latency_avg_seconds` / `_max_seconds` | gauge | `peer` | **逐 dfkv server 节点延迟**（诊断慢节点/慢路径，如跨机房） |
-| `dfkv_client_peer_latency_seconds_count` / `_sum` | counter | `peer` | 逐 peer 延迟采样数 / 总和 |
-| `dfkv_connector_dedup_hits_total` / `fetches_total` / `wait_hits_total` / `wait_timeouts_total` | counter | — | 同主机 rendezvous dedup（命中率漏斗顶部：TP 复制读被合并到 1× 还是按 rank 扇出；timeouts 应趋零） |
-| `dfkv_connector_gpu_dedup_hits_total` / `fetches_total` / `wait_hits_total` / `wait_timeouts_total` | counter | — | 同上 CUDA IPC flavor（GPU destination 走 GPUDirect 时） |
+| `dfkv_connector_ops_total` / `dfkv_connector_keys_total` / `dfkv_connector_bytes_total` | counter | `op` | Python connector 完成的调用、key、payload bytes |
+| `dfkv_connector_op_seconds` | histogram | `op` | connector 调用延迟 |
+| `dfkv_connector_op_max_seconds` | gauge | `op` | 上一导出窗口观察到的最大 connector 调用延迟 |
+| `dfkv_connector_info` | gauge | — | connector 活跃心跳，值为 1；身份在 resource labels |
+| `dfkv_connector_client_stats_poll_success` / `dfkv_connector_client_stats_poll_errors_total` / `dfkv_connector_client_stats_last_success_unixtime` | gauge / counter / gauge | — | 最新原生快照 poll 是否成功 / 失败累计 / 最后成功时间；失败保留 last-good |
+| `dfkv_connector_op_requests_total` / `dfkv_connector_op_keys_total` / `dfkv_connector_op_hits_total` / `dfkv_connector_op_bytes_total` | counter | `op` | C++ KVClient 收敛 chokepoint 的公开调用计数 |
+| `dfkv_connector_op_latency_seconds` / `dfkv_connector_op_lifetime_max_seconds` | histogram / gauge | `op` | C++ 完整调用延迟 / lifetime max |
+| `dfkv_client_peer_latency_avg_seconds` / `dfkv_client_peer_latency_max_seconds` | gauge | `peer` | 当前 poll 窗口平均值 / lifetime max |
+| `dfkv_client_peer_latency_seconds_count` / `dfkv_client_peer_latency_seconds_sum` | counter | `peer` | C++ 累计 peer probe 样本数 / 时长 |
+| `dfkv_connector_dedup_hits_total` / `dfkv_connector_dedup_fetches_total` / `dfkv_connector_dedup_wait_hits_total` / `dfkv_connector_dedup_wait_timeouts_total` | counter | — | host rendezvous dedup 漏斗 |
+| `dfkv_connector_gpu_dedup_hits_total` / `dfkv_connector_gpu_dedup_fetches_total` / `dfkv_connector_gpu_dedup_wait_hits_total` / `dfkv_connector_gpu_dedup_wait_timeouts_total` | counter | — | CUDA IPC rendezvous 漏斗 |
 
-> 逐 peer 延迟由 C++ 客户端主动探测（`DFKV_PROBE_INTERVAL_MS`）：SGLang HiCache 开 metrics 即自动开；vLLM/LMCache 需手动 `export DFKV_PROBE_INTERVAL_MS=5000`。
+其余原生状态/传输 family 由 §3.3 的 allowlist **一一**导出，名称映射是公开契约：
 
-> dedup 族的 C 快照原始名是 `dfkv_client_dedup_*` / `dfkv_client_gpu_dedup_*`
-> （无 label），OTLP 导出时改写为 `dfkv_connector_` 前缀并按本连接器身份上报。
-> 该族**只经 opt-in OTLP push 输出**：SGLang 插件本地 `/metrics`（§3.3）不镜像，
-> 本地排查只能直接读 C 快照（或在连接器日志/OTLP 管道里看）。
+| C 快照前缀 | OTLP/Prometheus 前缀 | 范围 |
+|---|---|---|
+| `dfkv_client_` | `dfkv_connector_` | health、ring、MDS；不含由上表单独转换的 op/dedup/peer |
+| `dfkv_rdma_client_` | `dfkv_connector_rdma_` | QP、MR、rail、NUMA、timeout、pipeline |
+| `dfkv_rdma_cq_` | `dfkv_connector_rdma_cq_` | CQ completion/error |
+| `dfkv_transport_pool_` | `dfkv_connector_transport_pool_` | TCP pool、retirement、backoff |
 
-### 3.5 vLLM 连接器客户端健康（`dfkv-vllm` /metrics，经 prometheus_client，pull）
-§3.4 是 OTLP **push**（opt-in）；此外 vLLM 连接器后台轮询线程读同一 C 客户端快照（`DFKV_CLIENT_STATS_POLL_S`，默认 15s，0=关），把**环/MDS 健康**镜像为带 `{tp_rank}` 的 Gauge，直接落在 vLLM 自带 `/metrics` 上（**无需开 telemetry**）。这样"空环（写无处可去、ok=0）/ MDS 不可达"在 scrape 上可见，而非只在客户端日志里——正是一次生产事故（静默空环）的教训。
-| 指标 | 类型 | 标签 | 含义 |
-|---|---|---|---|
-| `vllm:dfkv_client_ring_members` | gauge | `tp_rank` | 客户端看到的环成员数（`0` = 空环） |
-| `vllm:dfkv_client_mds_reachable` | gauge | `tp_rank` | 上次发现轮询 MDS 是否可达（`1`/`0`） |
-| `vllm:dfkv_client_mds_unreachable_polls_total` | gauge | `tp_rank` | 无法连上 MDS 的发现轮询次数（镜像 C 端计数器） |
-| `vllm:dfkv_client_transport_info` | gauge | `tp_rank`,`transport` | 恒为 `1`，`transport` 标 live 传输（`rdma`/`tcp`） |
+例如 §3.3 的 `dfkv_rdma_client_completion_timeouts_total` 对应
+`dfkv_connector_rdma_completion_timeouts_total`。逐 endpoint
+`dfkv_client_peer_errors_total{peer}` 不进入 OTLP：动态 peer 集合虽在 C++ 内有
+4096 上限，仍不适合作为全车队中心序列；中心诊断使用固定 rail family 和聚合
+peer health counter。
 
-> 源快照名（C 端无 `vllm:` 前缀）为 `dfkv_client_ring_members` / `dfkv_client_mds_reachable` / `dfkv_client_mds_unreachable_polls_total`（PR#207），与 SGLang HiCache §3.3 同源；vLLM 侧加 `vllm:` 前缀入连接器命名空间。
+逐 peer 延迟由 C++ 主动探测（`DFKV_PROBE_INTERVAL_MS`）：SGLang HiCache 开
+metrics 时自动启用；vLLM/LMCache 需显式配置非零 interval。
+
+### 3.5 vLLM 本地客户端指标（`dfkv-vllm` `/metrics`，pull）
+vLLM 的 `DFKV_CLIENT_STATS_POLL_S`（默认 15s，0=关）镜像 §3.3 中**全部**
+allow-listed counter/gauge，而不是只镜像 ring/MDS。名称固定为
+`vllm:<C快照原名>`，并追加 `{tp_rank}` 与源 family 的 `{op|peer|dev|reason|transport}`。
+例如：
+
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `vllm:dfkv_client_ring_members` / `vllm:dfkv_client_mds_reachable` | gauge | 空环 / MDS 可达性 |
+| `vllm:dfkv_rdma_client_rail_errors_total{tp_rank,dev}` | counter | 每 rank、每 rail 本地错误 |
+| `vllm:dfkv_transport_pool_connections{tp_rank}` | gauge | TCP pool 当前连接 |
+| `vllm:dfkv_client_stats_snapshot_success` / `vllm:dfkv_client_stats_snapshot_timestamp_seconds` / `vllm:dfkv_client_stats_snapshot_errors_total` | gauge / gauge / counter | poll last-good 健康；无需开启 OTLP telemetry |
 
 ### 3.6 成员一致性巡检 textfile 指标
 

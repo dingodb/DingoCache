@@ -397,9 +397,14 @@ Status MdsServer::ListGroups(std::string* out) {
   return Status::kOk;
 }
 
-std::string MdsServer::GroupMetricsText() {
-  auto r = etcd_.RangePrefix("/dfkv/v1/groups/");
-  if (!r) { metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed); return ""; }
+std::string MdsServer::GroupMetricsText(bool* etcd_reachable) {
+  if (etcd_reachable) *etcd_reachable = false;
+  auto r = etcd_.RangePrefixForMetrics("/dfkv/v1/groups/");
+  if (!r) {
+    metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed);
+    return "";
+  }
+  if (etcd_reachable) *etcd_reachable = true;
   struct Agg {
     uint64_t nodes = 0, missing = 0, clients = 0;
     MemberStats sum;

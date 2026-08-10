@@ -1,57 +1,80 @@
-# dfkv local observability stack — bring up with:
-#   docker compose -f deploy/observability/docker-compose.yml up -d
-# Then point connectors at the Collector (push) and open Grafana:
-#   DFKV_METRICS_ENABLED=1 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 <run a connector>
-#   http://localhost:3000  (admin/admin) -> "dfkv — cluster overview"
-#
-# Split: connectors PUSH OTLP to the Collector; the Collector re-exposes metrics
-# for Prometheus and forwards traces to Tempo. Prometheus also PULLS the dfkv C++
-# server/mds /metrics directly (host.docker.internal:28010 / :9410).
+# dfkv single-host observability stack. Images are pinned and default to the
+# DaoCloud mirror for mainland-China hosts. Every default is digest-pinned.
+# A private mirror may replace only the registry prefix while retaining the
+# reviewed content digests:
+#   DFKV_IMAGE_REGISTRY=registry.example.com docker compose \
+#     -f deploy/observability/docker-compose.yml up -d
+# Host ports default to the service ports below; override the DFKV_*_PORT
+# variables when a workstation already uses one. Then point host connectors at
+# the selected OTLP HTTP port and open the selected Grafana port
+# (admin / the required DFKV_GRAFANA_ADMIN_PASSWORD).
+# Every host port is loopback-only; use an authenticated reverse proxy for
+# remote access. Connectors PUSH OTLP; daemons expose Prometheus pull endpoints.
 services:
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:latest
+    # opentelemetry-collector-contrib 0.158.0
+    image: ${DFKV_IMAGE_REGISTRY:-docker.m.daocloud.io}/otel/opentelemetry-collector-contrib@sha256:c5918f78992ee73b0d6f0e599423ac5ec52dd5d9726733114d6eca53d5a32ed5
     command: ["--config=/etc/otelcol/config.yaml"]
     volumes:
       - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
     ports:
-      - "4317:4317"   # OTLP gRPC (connectors push here)
-      - "4318:4318"   # OTLP HTTP
-      - "8889:8889"   # Prometheus scrape of pushed metrics
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - "127.0.0.1:${DFKV_OTLP_GRPC_PORT:-4317}:4317"
+      - "127.0.0.1:${DFKV_OTLP_HTTP_PORT:-4318}:4318"
+      - "127.0.0.1:${DFKV_COLLECTOR_HEALTH_PORT:-13133}:13133"
+      - "127.0.0.1:${DFKV_COLLECTOR_PROM_PORT:-8889}:8889"
+    depends_on:
+      - tempo
+    restart: unless-stopped
 
   prometheus:
-    image: prom/prometheus:latest
+    # Prometheus 3.13.2
+    image: ${DFKV_IMAGE_REGISTRY:-docker.m.daocloud.io}/prom/prometheus@sha256:508729e0e2d18e11fd742a5a5ca70e557b940a93948c3c95fd0123a6fd538b69
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--enable-feature=exemplar-storage"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
     ports:
-      - "9090:9090"
+      - "127.0.0.1:${DFKV_PROMETHEUS_PORT:-9090}:9090"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    restart: unless-stopped
 
   tempo:
-    image: grafana/tempo:latest
+    # Tempo 3.0.2
+    image: ${DFKV_IMAGE_REGISTRY:-docker.m.daocloud.io}/grafana/tempo@sha256:cda87c212d8c584dc0b89e337e7ed648a5100feb657e5d528480ee4fa03dbbe3
     command: ["-config.file=/etc/tempo/tempo.yaml"]
     volumes:
       - ./tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
     ports:
-      - "3200:3200"
+      - "127.0.0.1:${DFKV_TEMPO_PORT:-3200}:3200"
+    restart: unless-stopped
 
   grafana:
-    image: grafana/grafana:latest
+    # Grafana 13.1.3
+    image: ${DFKV_IMAGE_REGISTRY:-docker.m.daocloud.io}/grafana/grafana@sha256:ab5cb380e3ff3172d6c8bd2e7cfd31cce977d2881b260e1f5bc089bf0b759b43
     environment:
       - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_AUTH_ANONYMOUS_ENABLED=true
-      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - "GF_SECURITY_ADMIN_PASSWORD=${DFKV_GRAFANA_ADMIN_PASSWORD:?set a non-default Grafana admin password}"
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=false
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
     ports:
-      - "3000:3000"
+      - "127.0.0.1:${DFKV_GRAFANA_PORT:-3000}:3000"
     depends_on:
       - prometheus
       - tempo
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  prometheus-data:
+  tempo-data:
+  grafana-data:

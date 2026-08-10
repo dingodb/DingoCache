@@ -1,0 +1,214 @@
+groups:
+  - name: dfkv-daemons
+    rules:
+      - alert: DfkvServerNotReady
+        expr: (up{job="dfkv_server"} == 0) or (dfkv_server_ready == 0) or (absent(up{job="dfkv_server"}) == 1)
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "dfkv server is not ready"
+          description: "{{ $labels.instance }} has failed startup, MDS registration, or local-health readiness."
+      - alert: DfkvServerUnhealthy
+        expr: dfkv_server_healthy == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "dfkv server local storage is unhealthy"
+          description: "{{ $labels.instance }} reports terminal disk or required RAM-tier failure."
+      - alert: DfkvMdsUnavailable
+        expr: (up{job="dfkv_mds"} == 0) or (dfkv_mds_ready == 0) or (absent(up{job="dfkv_mds"}) == 1)
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "dfkv MDS is unavailable or not ready"
+          description: "{{ $labels.instance }} is not scrapeable or cannot reach etcd."
+      - alert: DfkvMdsEtcdErrors
+        expr: increase(dfkv_mds_etcd_request_errors_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "dfkv MDS cannot complete etcd requests"
+          description: "{{ $labels.instance }} has etcd transport/status errors for operation {{ $labels.op }}."
+      - alert: DfkvGroupVersionSkew
+        expr: max by (group) (dfkv_mds_group_version_skew) > 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "dfkv group contains multiple server versions"
+          description: "Group {{ $labels.group }} reports {{ $value }} distinct versions."
+      - alert: DfkvGroupStatsMissing
+        expr: max by (group) (dfkv_mds_group_stats_missing) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "dfkv group has members without heartbeat statistics"
+          description: "Group {{ $labels.group }} has {{ $value }} member(s) missing STA1 statistics."
+      - alert: DfkvRdmaCompletionErrors
+        expr: increase(dfkv_rdma_completion_errors_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "dfkv server RDMA completion errors"
+          description: "{{ $labels.instance }} has failing RDMA completions."
+      - alert: DfkvRdmaReceiveSegmentLow
+        expr: dfkv_rdma_recv_segment_bytes > 0 and (dfkv_rdma_recv_segment_free_bytes / dfkv_rdma_recv_segment_bytes) < 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "dfkv RDMA receive segment has less than 10% free"
+          description: "{{ $labels.instance }} may reject new data QPs."
+      - alert: DfkvServerMdsHeartbeatDegraded
+        expr: dfkv_mds_heartbeat_healthy == 0 or dfkv_mds_last_success_age_seconds > 30
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "dfkv server MDS heartbeat is degraded"
+          description: "{{ $labels.instance }} cannot renew its MDS membership lease."
+      - alert: DfkvTcpConnectionsRejected
+        expr: increase(dfkv_tcp_rejected_connections_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "dfkv server rejected TCP connections"
+          description: "{{ $labels.instance }} reached its handler admission limit."
+      - alert: DfkvSlabDirectIoFallback
+        expr: increase(dfkv_slab_dio_write_fallback_total[5m]) > 0 or increase(dfkv_slab_dio_read_fallback_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "dfkv slab direct I/O fell back to buffered I/O"
+          description: "{{ $labels.instance }} is no longer using the configured direct path for every request."
+      - alert: DfkvRamFlushBacklog
+        expr: dfkv_ram_flush_backlog > 4096
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "dfkv RAM-tier flush backlog is high"
+          description: "{{ $labels.instance }} has more than 4096 non-durable RAM entries queued."
+      - alert: DfkvReadCoalesceTimeouts
+        expr: increase(dfkv_read_coalesce_timeouts_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "dfkv read-coalescing followers timed out"
+          description: "{{ $labels.instance }} fell back to duplicate disk reads after leader timeout."
+      - alert: DfkvUringInitializationFallback
+        expr: increase(dfkv_uring_init_fallbacks_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "dfkv io_uring initialization fell back"
+          description: "{{ $labels.instance }} requested io_uring but is serving synchronous reads."
+
+  - name: dfkv-connectors
+    rules:
+      - alert: DfkvConnectorTelemetryAbsent
+        expr: absent(dfkv_connector_info) == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "no dfkv connector telemetry is reaching Prometheus"
+          description: "No connector_info series exists; verify OTLP export and Collector ingestion."
+      - alert: DfkvConnectorSnapshotPollFailed
+        expr: dfkv_connector_client_stats_poll_success == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "dfkv connector native metric polling is failing"
+          description: "Connector {{ $labels.dfkv_connector_id }} is exporting stale last-good native metrics."
+      - alert: DfkvConnectorSnapshotStale
+        expr: time() - dfkv_connector_client_stats_last_success_unixtime > 60
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "dfkv connector native metric snapshot is stale"
+          description: "Connector {{ $labels.dfkv_connector_id }} has no successful native snapshot for over 60 seconds."
+      - alert: DfkvConnectorEmptyRing
+        expr: dfkv_connector_ring_members == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "dfkv connector has an empty placement ring"
+          description: "Connector {{ $labels.dfkv_connector_id }} routes data operations nowhere."
+      - alert: DfkvConnectorMdsUnreachable
+        expr: dfkv_connector_mds_reachable == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "dfkv connector cannot reach MDS"
+          description: "Connector {{ $labels.dfkv_connector_id }} cannot refresh membership."
+      - alert: DfkvConnectorTransportBackoff
+        expr: increase(dfkv_connector_transport_pool_backoff_events_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "dfkv TCP connector pool is backing off endpoints"
+          description: "Connector {{ $labels.dfkv_connector_id }} is suppressing connection growth after failures."
+      - alert: DfkvConnectorDedupTimeouts
+        expr: increase(dfkv_connector_dedup_wait_timeouts_total[5m]) > 0 or increase(dfkv_connector_gpu_dedup_wait_timeouts_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "dfkv same-host dedup rendezvous timed out"
+          description: "Connector {{ $labels.dfkv_connector_id }} is falling back to duplicated fetches."
+      - alert: DfkvConnectorNativeIoErrors
+        expr: increase(dfkv_connector_io_errors_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "dfkv connector native I/O errors"
+          description: "Connector {{ $labels.dfkv_connector_id }} is failing cache operations."
+      - alert: DfkvConnectorRdmaFailures
+        expr: increase(dfkv_connector_rdma_completion_timeouts_total[5m]) > 0 or increase(dfkv_connector_rdma_cq_errors_total[5m]) > 0 or increase(dfkv_connector_rdma_rail_errors_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "dfkv connector RDMA transport failures"
+          description: "Connector {{ $labels.dfkv_connector_id }} has timeout, CQ, or rail errors."
+      - alert: DfkvConnectorMrFailures
+        expr: increase(dfkv_connector_rdma_mr_registration_rejections_total[5m]) > 0 or increase(dfkv_connector_rdma_pool_mr_registration_failures_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "dfkv connector memory registration failed"
+          description: "Connector {{ $labels.dfkv_connector_id }} cannot retain the configured zero-copy MR path."
+      - alert: DfkvConnectorRailQuarantined
+        expr: dfkv_connector_rdma_rail_quarantined > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "dfkv connector RDMA rail is quarantined"
+          description: "Connector {{ $labels.dfkv_connector_id }} quarantined device {{ $labels.dev }}."
+      - alert: DfkvConnectorNumaFallback
+        expr: increase(dfkv_connector_rdma_numa_fallbacks_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "dfkv connector lost NUMA-local rail placement"
+          description: "Connector {{ $labels.dfkv_connector_id }} fell back for reason {{ $labels.reason }}."

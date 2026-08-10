@@ -7,6 +7,9 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -22,7 +25,9 @@ jobs:
     env:
       CXX: ${{ matrix.compiler }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - name: Install build & test deps
         run: |
@@ -40,7 +45,7 @@ jobs:
             cmake ninja-build g++ clang python3 python3-numpy git ca-certificates
 
       - name: Cache FetchContent (googletest)
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: build/_deps
           # Scope the key to the repository: build/_deps holds googletest-subbuild,
@@ -61,11 +66,67 @@ jobs:
       - name: Test (C++ gtests + Python plugin)
         run: ctest --test-dir build --output-on-failure -j
 
+  container-deployment-smoke:
+    name: runtime container deployment smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Validate deployment and alert configuration
+        env:
+          DFKV_GRAFANA_ADMIN_PASSWORD: ci-validation-only
+        run: |
+          docker compose -f deploy/observability/docker-compose.yml config -q
+          docker run --rm \
+            -v "$PWD/deploy/observability:/etc/dfkv-observability:ro" \
+            --entrypoint promtool \
+            docker.m.daocloud.io/prom/prometheus@sha256:508729e0e2d18e11fd742a5a5ca70e557b940a93948c3c95fd0123a6fd538b69 \
+            check config /etc/dfkv-observability/prometheus.yml
+          docker run --rm \
+            -v "$PWD/deploy/observability:/etc/dfkv-observability:ro" \
+            docker.m.daocloud.io/otel/opentelemetry-collector-contrib@sha256:c5918f78992ee73b0d6f0e599423ac5ec52dd5d9726733114d6eca53d5a32ed5 \
+            validate --config=/etc/dfkv-observability/otel-collector-config.yaml
+          docker run --rm \
+            -v "$PWD/deploy/observability:/etc/dfkv-observability:ro" \
+            --entrypoint /tempo \
+            docker.m.daocloud.io/grafana/tempo@sha256:cda87c212d8c584dc0b89e337e7ed648a5100feb657e5d528480ee4fa03dbbe3 \
+            -config.file=/etc/dfkv-observability/tempo.yaml -config.verify=true
+      - name: Build the shipped runtime image
+        run: docker build --target runtime -t dfkv-runtime-smoke .
+      - name: Launch and exercise the deployed data path
+        run: |
+          set -eu
+          id=$(docker run -d --entrypoint dfkv_server dfkv-runtime-smoke \
+            --dir /tmp/dfkv-data --port 12000 --cap 67108864 \
+            --store-engine file)
+          trap 'docker logs "$id"; docker rm -f "$id" >/dev/null' EXIT
+          ready=0
+          for _ in $(seq 1 100); do
+            if docker exec "$id" dfkvctl stat 127.0.0.1:12000 \
+                 | grep -q 'dfkv_server_ready 1'; then
+              ready=1
+              break
+            fi
+            sleep 0.1
+          done
+          test "$ready" = 1
+          docker exec "$id" dfkv_smoke \
+            --members n=127.0.0.1:12000 --size 4096
+          docker exec "$id" dfkvctl \
+            --members n=127.0.0.1:12000 --namespace ci/container \
+            put deployment-smoke payload
+          test "$(docker exec "$id" dfkvctl \
+            --members n=127.0.0.1:12000 --namespace ci/container \
+            get deployment-smoke)" = payload
+
   thread-sanitizer:
     name: ThreadSanitizer (race detection)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - name: Install deps
         run: |
           # Drop preinstalled third-party apt sources (google-chrome, microsoft):
@@ -93,7 +154,9 @@ jobs:
     name: RDMA build (compile-check)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - name: Install deps incl. RDMA dev
         run: |
           # Drop preinstalled third-party apt sources (google-chrome, microsoft):
@@ -120,7 +183,9 @@ jobs:
     name: RDMA datapath (Soft-RoCE loopback + TSan)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - name: Install deps incl. RDMA dev + tools
         run: |
           # Drop preinstalled third-party apt sources (google-chrome, microsoft):
@@ -187,7 +252,7 @@ jobs:
     # the runner's ubuntu-latest (glibc 2.39) bakes in GLIBC_2.3x symbols that
     # FAIL on older deploy nodes. RDMA-enabled + static libstdc++/libgcc;
     # libibverbs stays dynamic (it dlopen()s provider drivers at runtime).
-    container: ubuntu:22.04
+    container: m.daocloud.io/docker.io/library/ubuntu@sha256:3b06811b2afd352be909dd088a004166d665dc76d38b13eada33522a9d915c6f # 22.04
     steps:
       # Bare container: install the toolchain (incl. git, for checkout) first.
       - name: Install build deps
@@ -195,16 +260,24 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             cmake ninja-build g++ binutils git ca-certificates libibverbs-dev \
-            liburing-dev xz-utils tar
-      - uses: actions/checkout@v6
+            liburing-dev python3 python3-pip python3-numpy xz-utils tar
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
       - name: Build portable RDMA artifacts (static libstdc++, no tests)
         run: |
           cmake -S . -B build-static -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DDFKV_BUILD_TESTS=OFF -DDFKV_WITH_RDMA=ON -DDFKV_WITH_URING=ON \
             -DDFKV_STATIC_LIBSTDCXX=ON
           cmake --build build-static -j
-          strip build-static/dfkv_server build-static/dfkv_mds build-static/dfkv_bench \
-                build-static/dfkv_smoke build-static/dfkvctl build-static/libdfkv.so || true
+          strip build-static/dfkv_server build-static/dfkv_mds \
+                build-static/dfkv_bench build-static/dfkv_smoke \
+                build-static/dfkvctl build-static/dfkv_discover_smoke \
+                build-static/dfkv_gpu_dedup_repro \
+                build-static/libdfkv.so || true
       - name: Verify portability (glibc floor + RDMA linked + static libstdc++)
         run: |
           echo "== glibc floor (must be <= 2.35) =="
@@ -217,82 +290,96 @@ jobs:
           if objdump -T build-static/dfkv_server build-static/libdfkv.so \
                | grep -qoE 'GLIBC_2\.(3[6-9]|[4-9][0-9])'; then
             echo 'ERROR: glibc floor exceeds 2.35'; exit 1; fi
-      - name: Package portable tarball
+      - name: Install, package, and verify exact release payload
         run: |
+          set -eu
           V=$(cat VERSION)
           PKG="dfkv-${V}-linux-x86_64"
-          mkdir -p "$PKG/bin" "$PKG/lib" "$PKG/python"
-          cp build-static/dfkv_server build-static/dfkv_mds build-static/dfkv_bench \
-             build-static/dfkv_smoke build-static/dfkvctl "$PKG/bin/"
-          cp build-static/libdfkv.so "$PKG/lib/"
-          # SGLang HiCache 插件（仓库源在 integration/hicache/；产物内保持 python/ 布局不变，
-          # 线上部署脚本引用的是 tarball 内的 python/dfkv_hicache.py 路径）。
-          # 顶层 *.py 全量拷贝：手写清单在 v1.31.0 漏掉了新增的 dfkv_hot_config.py，
-          # 导致 dfkv_hicache import 即挂；glob 让清单不再需要人工维护。
-          cp integration/hicache/*.py "$PKG/python/"
-          # 共享遥测包：dfkv_hicache.py 顶部 `from dfkv_telemetry import ...`，
-          # 不一起打包则 SGLang 插件加载即 ImportError。
-          cp -r integration/hicache/dfkv_telemetry "$PKG/python/"
-          # Standalone HiCache deployment adds only python/ to PYTHONPATH, so its
-          # shared identity dependency must live beside the plugin as well.
-          cp -r integration/common/src/dfkv_common "$PKG/python/"
-          # 共享 identity/C ABI 包 + vLLM / LMCache 连接器（源码 Python 包，随 release
-          # 一起发；三个 sibling root 可从解压后的 tarball 直接 pip install）。
-          mkdir -p "$PKG/integration"
-          cp -r integration/common integration/vllm integration/lmcache "$PKG/integration/"
-          find "$PKG/python" "$PKG/integration" -type d \( -name '__pycache__' -o -name '*.egg-info' -o -name '.pytest_cache' \) -prune -exec rm -rf {} + 2>/dev/null || true
-          cp README.md VERSION LICENSE "$PKG/"
-          # Python 包闭包也必须纯 shell 验证：portable 构建容器刻意不安装 python3，
-          # 更不能用临时 wheel 掩盖 tarball 内缺少 sibling source root 的问题。
-          for spec in \
-            "common:dfkv-common:dfkv_common" \
-            "vllm:dfkv-vllm:dfkv_vllm" \
-            "lmcache:dfkv-connector:dfkv_connector"; do
-            package=${spec%%:*}
-            rest=${spec#*:}
-            distribution=${rest%%:*}
-            module=${rest##*:}
-            root="$PKG/integration/$package"
-            if [ ! -f "$root/pyproject.toml" ] || [ ! -d "$root/src/$module" ]; then
-              echo "ERROR: packaged integration/$package is not an installable source root"
-              exit 1
-            fi
-            if ! grep -Eq "^[[:space:]]*name[[:space:]]*=[[:space:]]*\"$distribution\"[[:space:]]*$" \
-                 "$root/pyproject.toml"; then
-              echo "ERROR: packaged integration/$package has wrong project name (expected $distribution)"
-              exit 1
-            fi
+
+          # Exercise the supported system-prefix manifest independently.
+          cmake --install build-static --prefix "$PWD/install-check/$PKG"
+
+          # The canonical packager flattens share/dfkv into a self-contained
+          # portable repository layout while preserving bin/lib/include.
+          mkdir -p release unpack
+          deploy/package_release.sh build-static release
+          tar xzf "release/${PKG}.tar.gz" -C unpack
+          ! tar -tzf "release/${PKG}.tar.gz" | grep -E '(__pycache__|\.py[co]$)'
+          ROOT="$PWD/unpack/$PKG"
+
+          for binary in dfkv_server dfkv_mds dfkv_bench dfkv_smoke dfkvctl \
+                        dfkv_discover_smoke dfkv_gpu_dedup_repro; do
+            test -x "$ROOT/bin/$binary"
+            "$ROOT/bin/$binary" --version
           done
-          common_version=$(sed -nE \
-            's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"([^"]+)"[[:space:]]*$/\1/p' \
-            "$PKG/integration/common/pyproject.toml")
-          if [ -z "$common_version" ]; then
-            echo "ERROR: packaged integration/common has no project version"
-            exit 1
-          fi
-          for package in vllm lmcache; do
-            if ! grep -Fq "\"dfkv-common==$common_version\"" \
-                 "$PKG/integration/$package/pyproject.toml"; then
-              echo "ERROR: packaged integration/$package does not pin local dfkv-common==$common_version"
-              exit 1
-            fi
-          done
-          echo "package source-root closure check OK (common=$common_version, vllm, lmcache)"
-          # 打包自检：静态解析 python/ 内所有本地 dfkv_* import，缺一个文件就 fail。
-          # （sglang 不在 runner 里装不了，真 import 跑不了；容器也没有 python3——
-          #   用纯 shell 做依赖闭包检查，正是这道门能拦住 v1.31.0 漏 dfkv_hot_config.py 这类事故。）
-          mods=$(grep -rhoE '^[[:space:]]*(import|from)[[:space:]]+dfkv_[A-Za-z0-9_]+' \
-                   --include='*.py' "$PKG/python/" | awk '{print $2}' | sort -u)
-          for m in $mods; do
-            if [ ! -e "$PKG/python/$m.py" ] && [ ! -d "$PKG/python/$m" ]; then
-              echo "ERROR: packaged python/ missing local import: $m"; exit 1
-            fi
-          done
-          echo "package import-closure check OK ($(echo "$mods" | tr '\n' ' '))"
-          tar czf "${PKG}.tar.gz" "$PKG"
-          sha256sum "${PKG}.tar.gz"
+          test -f "$ROOT/lib/libdfkv.so"
+          test -L "$ROOT/lib/libdfkv.so"
+          test -L "$ROOT/lib/libdfkv.so.${V%%.*}"
+          test "$(readlink "$ROOT/lib/libdfkv.so")" = "libdfkv.so.${V%%.*}"
+          test "$(readlink "$ROOT/lib/libdfkv.so.${V%%.*}")" = "libdfkv.so.$V"
+          test -f "$ROOT/python/dfkv_hicache.py"
+          test -f "$ROOT/python/dfkv_common/client_metrics.py"
+          test -f "$ROOT/python/dfkv_telemetry/metrics_push.py"
+          test -f "$ROOT/deploy/dfkv_load_regression.py"
+          test -f "$ROOT/deploy/dfkv_membership_audit.py"
+          test -f "$ROOT/deploy/observability/docker-compose.yml"
+          test -f "$ROOT/deploy/observability/alerts.yml"
+          test -f "$ROOT/docs/METRICS.md"
+          test -f "$ROOT/src/cache/dfkv_server_main.cc"
+          test -f "$ROOT/integration/common/pyproject.toml"
+          test -f "$ROOT/test/python/test_dfkv_operational_tools.py"
+          test -f "$ROOT/Makefile"
+          test -f "$ROOT/Dockerfile"
+          test -f "$ROOT/.dockerignore"
+          test -f "$ROOT/.github/workflows/ci.yml"
+          test -f "$ROOT/.github/workflows/release.yml"
+
+          PYTHONPYCACHEPREFIX="$PWD/pycache" python3 -m compileall -q \
+            "$ROOT/python" "$ROOT/deploy" "$ROOT/integration"
+          PYTHONPYCACHEPREFIX="$PWD/pycache" PYTHONPATH="$ROOT/python:$ROOT/test/python" python3 - <<'PY'
+          import dfkv_common
+          import dfkv_hicache
+          import dfkv_hot_config
+          import dfkv_metrics
+          import dfkv_telemetry
+          PY
+
+          cp "release/${PKG}.tar.gz" .
+          sha256sum "${PKG}.tar.gz" | tee "${PKG}.tar.gz.sha256"
+      - name: Build connector wheels and verify release versions
+        run: |
+          set -eu
+          V=$(cat VERSION)
+          mkdir -p wheels
+          python -m pip wheel --no-deps --wheel-dir wheels integration/common
+          python -m pip wheel --no-deps --wheel-dir wheels integration/lmcache
+          python -m pip wheel --no-deps --wheel-dir wheels integration/vllm
+          test -f "wheels/dfkv_common-${V}-py3-none-any.whl"
+          test -f "wheels/dfkv_connector-${V}-py3-none-any.whl"
+          test -f "wheels/dfkv_vllm-${V}-py3-none-any.whl"
+          rm -rf wheel-check
+          python -m pip install --no-deps --target wheel-check wheels/*.whl
+          PYTHONPATH=wheel-check python - <<'PY'
+          from importlib import metadata
+          expected = {
+              "dfkv-common": "dfkv_common/client_metrics.py",
+              "dfkv-connector": "dfkv_connector/_telemetry/metrics_push.py",
+              "dfkv-vllm": "dfkv_vllm/_telemetry/metrics_push.py",
+          }
+          version = open("VERSION", encoding="utf-8").read().strip()
+          for distribution, required_file in expected.items():
+              assert metadata.version(distribution) == version
+              packaged = {str(path) for path in metadata.files(distribution) or ()}
+              assert required_file in packaged, (distribution, required_file)
+          import dfkv_common
+          import dfkv_vllm
+          import dfkv_vllm._telemetry.metrics_push
+          PY
       - name: Upload artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: dfkv-linux-x86_64
-          path: dfkv-*-linux-x86_64.tar.gz
+          path: |
+            dfkv-*-linux-x86_64.tar.gz
+            dfkv-*-linux-x86_64.tar.gz.sha256
+            wheels/*.whl

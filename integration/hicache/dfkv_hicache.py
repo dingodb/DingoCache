@@ -33,6 +33,7 @@ from dfkv_common import (
     pool_key,
     sg_key,
 )
+from dfkv_common.client_metrics import read_native_snapshot
 
 from dfkv_access_log import (access_log, configure as _configure_access_log,
                             apply_hot as _access_log_apply_hot,
@@ -207,13 +208,8 @@ def _native_version(lib) -> str:
 
 
 def _read_snapshot(lib, h) -> str:
-    """Read the C client's Prometheus metrics snapshot (size query, then fetch)."""
-    need = int(lib.dfkv_stats_snapshot(h, None, 0))
-    if need <= 0:
-        return ""
-    buf = ctypes.create_string_buffer(need + 1)
-    lib.dfkv_stats_snapshot(h, buf, need + 1)
-    return buf.value.decode("utf-8", "replace")
+    """Read one complete native client metrics snapshot."""
+    return read_native_snapshot(lib, h)
 
 
 # One-byte marker for the logical-anchor "kv" pool of V4/DSA models. Native
@@ -309,15 +305,27 @@ class DfkvHiCache(HiCacheStorage):
         # Unified fleet metrics pushed over OTLP to the central Collector (off by
         # default; zero cost when DFKV_METRICS_ENABLED is unset). Powers the
         # cross-connector global dashboard (per connector_id / type).
-        _push_metrics.configure(cfg, connector_type=_tcfg.TYPE_HICACHE,
-                                tp_rank=self.tp_rank, model=self.model,
-                                version=native_ver, native_version=native_ver)
-        # Connector-side request tracing (off by default; zero cost when off).
-        # Emits a span per op for slow / sampled / failed requests over OTLP
-        # /v1/traces — same identity + endpoint as the fleet metrics above.
-        _tracing.configure(cfg, connector_type=_tcfg.TYPE_HICACHE,
-                           tp_rank=self.tp_rank, model=self.model,
-                           version=native_ver, native_version=native_ver)
+        metrics_acquired = tracing_acquired = False
+        try:
+            # configure() acquires before validating identity, so mark each
+            # acquisition first and roll it back even when configuration raises.
+            metrics_acquired = True
+            _push_metrics.configure(
+                cfg, connector_type=_tcfg.TYPE_HICACHE,
+                tp_rank=self.tp_rank, model=self.model,
+                version=native_ver, native_version=native_ver)
+            tracing_acquired = True
+            _tracing.configure(
+                cfg, connector_type=_tcfg.TYPE_HICACHE,
+                tp_rank=self.tp_rank, model=self.model,
+                version=native_ver, native_version=native_ver)
+        except Exception:
+            if tracing_acquired:
+                _tracing.release()
+            if metrics_acquired:
+                _push_metrics.release()
+            raise
+        self._telemetry_acquired = True
         # When metrics are on, enable the C client's active per-peer latency probe
         # (read at dfkv_open below) so every cache node shows avg/max latency even
         # when idle. extra_config 'probe_interval_ms' overrides; 0 disables.
@@ -540,6 +548,13 @@ class DfkvHiCache(HiCacheStorage):
             if getattr(self, "_h", None):
                 self._lib.dfkv_close(self._h)
                 self._h = None
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_telemetry_acquired", False):
+                self._telemetry_acquired = False
+                _push_metrics.release()
+                _tracing.release()
         except Exception:
             pass
 

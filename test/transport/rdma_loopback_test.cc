@@ -407,6 +407,13 @@ TEST(RdmaLoopback, MetricsCountersTrackOps) {
   EXPECT_GE(CounterVal(srv_text, "dfkv_rdma_v2_put_writes_total"), 1);
   EXPECT_GE(CounterVal(srv_text, "dfkv_rdma_v2_get_writes_total"), 1);
   EXPECT_GT(CounterVal(srv_text, "dfkv_rdma_recv_segment_bytes"), 0);
+  EXPECT_NE(srv_text.find("dfkv_rdma_rail_active_conns{dev=\""),
+            std::string::npos) << srv_text;
+  EXPECT_GE(CounterVal(srv_text, "dfkv_rdma_rail_completions_total"), 2);
+  EXPECT_GE(CounterVal(srv_text, "dfkv_rdma_rail_put_writes_total"), 1);
+  EXPECT_GE(CounterVal(srv_text, "dfkv_rdma_rail_put_bytes_total"), 2048);
+  EXPECT_GE(CounterVal(srv_text, "dfkv_rdma_rail_get_writes_total"), 1);
+  EXPECT_GE(CounterVal(srv_text, "dfkv_rdma_rail_get_bytes_total"), 2048);
 
   // client transport: a connection was opened and the MR region declared
   std::string cli_text = rt.MetricsText();

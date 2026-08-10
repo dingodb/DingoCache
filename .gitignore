@@ -10,8 +10,12 @@ compile_commands.json
 
 # Python build artifacts
 *.egg-info/
-integration/lmcache/build/
-integration/lmcache/dist/
+integration/*/build/
+integration/*/dist/
 .cache/
 .analysis/
 
+
+
+# Local release assembly output
+/release-*/

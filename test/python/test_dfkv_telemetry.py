@@ -167,6 +167,17 @@ class EnabledInProcessTest(TelemetryTestBase):
         self.assertTrue(metrics.is_enabled())
 
 
+    def test_lifecycle_reference_count_allows_reconfigure(self):
+        self._enable()
+        metrics.configure({}, connector_type=config.TYPE_VLLM)
+        self.assertEqual(metrics._users, 2)
+        metrics.release()
+        self.assertTrue(metrics.is_enabled())
+        metrics.release()
+        self.assertEqual(metrics._users, 0)
+        self.assertFalse(metrics.is_enabled())
+
+
 class LiteralZeroOffTest(TelemetryTestBase):
     """When off, `if _m:` must be falsy so the connector never evaluates the
     (potentially O(batch)) metric args — literal zero overhead."""
@@ -230,9 +241,9 @@ class PeerLatencyTest(TelemetryTestBase):
         rec = metrics._recorder
         poller = PeerLatencyPoller(lambda: _SAMPLE_SNAPSHOT, rec, interval_s=0)
         res = poller.poll_once()
-        self.assertAlmostEqual(res["10.0.0.1:9000"][0], 0.001)   # avg 0.003/3
-        self.assertAlmostEqual(res["10.0.0.1:9000"][1], 0.0015)  # max
-        self.assertAlmostEqual(res["10.0.0.2:9000"][0], 0.005)   # avg 0.01/2
+        self.assertAlmostEqual(res["10.0.0.1:9000"]["avg"], 0.001)
+        self.assertAlmostEqual(res["10.0.0.1:9000"]["max"], 0.0015)
+        self.assertAlmostEqual(res["10.0.0.2:9000"]["avg"], 0.005)
         # recorder state is updated (observable gauges read it)
         self.assertIn("10.0.0.1:9000", rec.peer_latency_snapshot())
 
@@ -251,8 +262,25 @@ class PeerLatencyTest(TelemetryTestBase):
         poller = PeerLatencyPoller(lambda: next(texts), metrics._recorder, interval_s=0)
         poller.poll_once()                       # baseline
         res = poller.poll_once()                 # delta: (0.005-0.002)/(3-2) = 0.003
-        self.assertAlmostEqual(res["p"][0], 0.003)
-        self.assertAlmostEqual(res["p"][1], 0.003)  # lifetime max
+        self.assertAlmostEqual(res["p"]["avg"], 0.003)
+        self.assertAlmostEqual(res["p"]["max"], 0.003)  # lifetime max
+
+    def test_poll_failure_preserves_data_and_marks_snapshot_stale(self):
+        from dfkv_telemetry.metrics_push import PeerLatencyPoller
+        os.environ[config.ENV_METRICS_ENABLED] = "1"
+        metrics.configure({}, connector_type=config.TYPE_VLLM)
+        rec = metrics._recorder
+        poller = PeerLatencyPoller(lambda: _SAMPLE_SNAPSHOT, rec, interval_s=0)
+        poller.poll_once()
+        before = rec.peer_latency_snapshot()
+        poller._get_text = lambda: ""
+        with self.assertRaisesRegex(ValueError, "empty or invalid"):
+            poller.poll_once()
+        self.assertEqual(rec.peer_latency_snapshot(), before)
+        health = rec.client_poll_snapshot()
+        self.assertEqual(health["success"], 0.0)
+        self.assertEqual(health["errors"], 1)
+        self.assertGreater(health["last_success_unixtime"], 0.0)
 
 
 class StdlibExporterTest(TelemetryTestBase):
@@ -268,6 +296,12 @@ class StdlibExporterTest(TelemetryTestBase):
         self.assertTrue(metrics.is_enabled())
         self.assertIsNotNone(rec._stdlib)   # stdlib pusher started
         self.assertIsNone(rec._otel)        # OTel SDK not used
+
+    def test_stdlib_warns_on_standard_grpc_port(self):
+        os.environ[config.ENV_METRICS_ENABLED] = "1"
+        os.environ[config.ENV_OTLP_ENDPOINT] = "http://collector:4317"
+        with self.assertWarnsRegex(RuntimeWarning, "OTLP/HTTP JSON"):
+            metrics.configure({}, connector_type=config.TYPE_HICACHE, tp_rank=2)
 
     def test_build_payload_structure_and_values(self):
         rec = self._enabled()
@@ -310,6 +344,56 @@ class StdlibExporterTest(TelemetryTestBase):
         self.assertEqual(metrics_url("http://h:4318/v1/metrics"), "http://h:4318/v1/metrics")
         self.assertEqual(metrics_url("http://h:4318/v1/metrics/"), "http://h:4318/v1/metrics")
         self.assertEqual(metrics_url(""), "http://localhost:4318/v1/metrics")
+        self.assertEqual(
+            metrics_url("http://h:4318/v1/traces"),
+            "http://h:4318/v1/metrics")
+
+
+    def test_background_push_warns_once_and_reports_recovery(self):
+        import warnings
+        from dfkv_telemetry.otlp_json import StdlibExporter
+
+        exp = StdlibExporter(self._enabled(), "http://127.0.0.1:1", interval_s=0)
+
+        def fail():
+            raise OSError("collector down")
+
+        exp.push_once = fail
+        with self.assertWarnsRegex(RuntimeWarning, "metrics export failed"):
+            self.assertFalse(exp._push_guarded())
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.assertFalse(exp._push_guarded())
+        self.assertEqual(caught, [])
+        exp.push_once = lambda: 200
+        with self.assertWarnsRegex(RuntimeWarning, "export recovered"):
+            self.assertTrue(exp._push_guarded())
+
+    def test_stop_performs_one_final_push(self):
+        from dfkv_telemetry.otlp_json import StdlibExporter
+        exp = StdlibExporter(
+            self._enabled(), "http://127.0.0.1:1", interval_s=0)
+        calls = []
+        exp._push_guarded = lambda: calls.append("push") or True
+        exp.stop()
+        self.assertEqual(calls, ["push"])
+
+    def test_failed_push_restores_window_maximum(self):
+        from dfkv_telemetry.otlp_json import StdlibExporter
+        rec = self._enabled()
+        with metrics.op("get", num_keys=1, num_bytes=1):
+            pass
+        exp = StdlibExporter(rec, "http://127.0.0.1:1", interval_s=0)
+
+        class Down:
+            def open(self, *_args, **_kwargs):
+                raise OSError("collector down")
+
+        exp._opener = Down()
+        with self.assertRaisesRegex(OSError, "collector down"):
+            exp.push_once()
+        self.assertGreater(rec.export_snapshot()["dur_max"]["get"], 0.0)
+
 
     def test_push_once_to_local_http_server(self):
         import http.server
@@ -398,6 +482,31 @@ class OtelPushTest(TelemetryTestBase):
         except RuntimeError:
             pass
 
+        native = (
+            'dfkv_client_op_requests_total{op="get"} 8\n'
+            'dfkv_client_op_keys_total{op="get"} 64\n'
+            'dfkv_client_op_max_seconds{op="get"} 0.02\n'
+            'dfkv_client_op_latency_seconds_bucket{le="0.1",op="get"} 8\n'
+            'dfkv_client_op_latency_seconds_sum{op="get"} 0.08\n'
+            'dfkv_client_op_latency_seconds_count{op="get"} 8\n'
+            'dfkv_client_dedup_hits_total 7\n'
+            'dfkv_client_ring_members 1\n'
+            'dfkv_transport_pool_connections 4\n'
+        )
+        rec = metrics._recorder
+        rec.update_client_ops(metrics.parse_client_ops(native))
+        rec.update_client_dedup(metrics.parse_client_dedup(native))
+        rec.update_client_status(metrics.parse_client_status(native))
+        rec.update_peer_latency({
+            "node:28101": {
+                "avg": 0.001,
+                "max": 0.002,
+                "sum": 0.008,
+                "count": 8,
+            },
+        })
+        rec.record_client_poll(True)
+
         found, res = self._collect(reader)
         # identity rides on resource attributes (-> Prometheus labels via the
         # Collector's resource_to_telemetry_conversion).
@@ -419,6 +528,21 @@ class OtelPushTest(TelemetryTestBase):
         self.assertIn("dfkv_connector_op_seconds", found)
         self.assertIn("dfkv_connector_op_max_seconds", found)
         self.assertTrue(any(v == 1 for _, v in found["dfkv_connector_info"]))
+        for name in (
+                "dfkv_connector_op_requests_total",
+                "dfkv_connector_op_latency_seconds_bucket",
+                "dfkv_connector_op_latency_seconds_sum",
+                "dfkv_connector_op_latency_seconds_count",
+                "dfkv_connector_op_lifetime_max_seconds",
+                "dfkv_connector_dedup_hits_total",
+                "dfkv_connector_ring_members",
+                "dfkv_connector_transport_pool_connections",
+                "dfkv_client_peer_latency_seconds_sum",
+                "dfkv_client_peer_latency_seconds_count",
+                "dfkv_connector_client_stats_poll_success",
+                "dfkv_connector_client_stats_last_success_unixtime",
+                "dfkv_connector_client_stats_poll_errors_total"):
+            self.assertIn(name, found)
         metrics.shutdown()
 
 
@@ -493,10 +617,20 @@ class ClientOpForwardTest(TelemetryTestBase):
         payload = otlp_json.build_payload(rec, rec.export_snapshot(), 1, 2)
         ms = {m["name"]: m for m in
               payload["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]}
-        for n in ("dfkv_connector_op_requests_total", "dfkv_connector_op_keys_total",
-                  "dfkv_connector_op_hits_total", "dfkv_connector_op_bytes_total",
-                  "dfkv_connector_op_max_seconds", "dfkv_connector_op_latency_seconds"):
-            self.assertIn(n, ms)
+        for name in (
+                "dfkv_connector_op_requests_total",
+                "dfkv_connector_op_keys_total",
+                "dfkv_connector_op_hits_total",
+                "dfkv_connector_op_bytes_total",
+                "dfkv_connector_op_lifetime_max_seconds",
+                "dfkv_connector_op_latency_seconds"):
+            self.assertIn(name, ms)
+        metric_names = [
+            metric["name"]
+            for metric in
+            payload["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+        ]
+        self.assertEqual(len(metric_names), len(set(metric_names)))
         attrs = {a["key"] for a in
                  payload["resourceMetrics"][0]["resource"]["attributes"]}
         self.assertIn("dfkv.connector_type", attrs)
@@ -506,6 +640,90 @@ class ClientOpForwardTest(TelemetryTestBase):
                  if dp["attributes"][0]["value"]["stringValue"] == "exist"][0]
         self.assertEqual(ehist["count"], "5")
         self.assertEqual(ehist["bucketCounts"][-1], "1")  # +Inf bucket = the 48s op
+        metrics.shutdown()
+
+
+class NativeSnapshotDeltaTest(unittest.TestCase):
+    def test_uncommitted_counter_delta_is_replayed(self):
+        from dfkv_common.client_metrics import SnapshotDelta
+        delta = SnapshotDelta()
+        text = "dfkv_client_io_errors_total 5\n"
+        first = delta.prepare(text)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0].value, 5.0)
+        replay = delta.prepare(text)
+        self.assertEqual(replay[0].value, 5.0)
+        delta.commit(replay[0])
+        self.assertEqual(delta.prepare(text), [])
+
+
+class ClientStatusForwardTest(TelemetryTestBase):
+    SNAP = (
+        'dfkv_client_transport_info{transport="rdma"} 1\n'
+        'dfkv_client_ring_members 0\n'
+        'dfkv_client_mds_reachable 0\n'
+        'dfkv_client_io_errors_total 2\n'
+        'dfkv_client_peer_errors_total{peer="unbounded"} 9\n'
+        'dfkv_rdma_client_rail_errors_total{dev="ib0"} 3\n'
+        'dfkv_rdma_client_rail_errors_total{dev="ib1"} 0\n'
+        'dfkv_rdma_client_mr_registered_bytes 134217728\n'
+        'dfkv_rdma_cq_completions_total 11\n'
+        'dfkv_transport_pool_connections 8\n'
+        'dfkv_transport_pool_retirements_total{reason="idle"} 2\n'
+        'dfkv_client_op_requests_total{op="get"} 8\n'
+        'dfkv_client_dedup_hits_total 4\n'
+        'unknown_metric 99\n'
+    )
+
+    def test_parse_is_bounded_and_excludes_dedicated_families(self):
+        samples = metrics.parse_client_status(self.SNAP)
+        by_name = {sample["name"] for sample in samples}
+        self.assertIn("dfkv_connector_ring_members", by_name)
+        self.assertIn("dfkv_connector_mds_reachable", by_name)
+        self.assertIn("dfkv_connector_rdma_rail_errors_total", by_name)
+        self.assertIn("dfkv_connector_rdma_mr_registered_bytes", by_name)
+        self.assertIn("dfkv_connector_rdma_cq_completions_total", by_name)
+        self.assertIn("dfkv_connector_transport_pool_connections", by_name)
+        self.assertIn("dfkv_connector_transport_pool_retirements_total", by_name)
+        self.assertNotIn("dfkv_connector_peer_errors_total", by_name)
+        self.assertNotIn("dfkv_connector_op_requests_total", by_name)
+        self.assertNotIn("dfkv_connector_dedup_hits_total", by_name)
+
+    def test_status_counters_and_zero_gauges_forward_to_otlp(self):
+        from dfkv_telemetry import otlp_json
+        os.environ[config.ENV_METRICS_ENABLED] = "1"
+        metrics.configure({}, connector_type=config.TYPE_LMCACHE, tp_rank=3)
+        rec = metrics._recorder
+        poller = metrics.PeerLatencyPoller(
+            lambda: self.SNAP, rec, interval_s=0)
+        poller.poll_once()
+        payload = otlp_json.build_payload(rec, rec.export_snapshot(), 1, 2)
+        families = {
+            metric["name"]: metric
+            for metric in payload["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+        }
+        ring = families["dfkv_connector_ring_members"]
+        self.assertEqual(ring["gauge"]["dataPoints"][0]["asDouble"], 0.0)
+        io_errors = families["dfkv_connector_io_errors_total"]
+        self.assertEqual(io_errors["sum"]["dataPoints"][0]["asInt"], "2")
+        rails = families["dfkv_connector_rdma_rail_errors_total"]["sum"]["dataPoints"]
+        self.assertEqual(len(rails), 2)
+        values = {
+            point["attributes"][0]["value"]["stringValue"]: point["asInt"]
+            for point in rails
+        }
+        self.assertEqual(values, {"ib0": "3", "ib1": "0"})
+        pool = families["dfkv_connector_transport_pool_connections"]
+        self.assertEqual(pool["gauge"]["dataPoints"][0]["asDouble"], 8.0)
+        self.assertEqual(
+            families["dfkv_connector_client_stats_poll_success"]
+            ["gauge"]["dataPoints"][0]["asDouble"], 1.0)
+        self.assertIn(
+            "dfkv_connector_client_stats_last_success_unixtime", families)
+        poll_errors = families[
+            "dfkv_connector_client_stats_poll_errors_total"]
+        self.assertEqual(
+            poll_errors["sum"]["dataPoints"][0]["asInt"], "0")
         metrics.shutdown()
 
 
@@ -725,6 +943,42 @@ class OtlpTracesTest(unittest.TestCase):
                                              interval_s=0)
         self.assertIsNone(exp.flush())
 
+    def test_stop_performs_final_trace_flush(self):
+        from dfkv_telemetry import otlp_traces
+        exp = otlp_traces.StdlibSpanExporter(
+            _FakeIdentity(), "http://127.0.0.1:1",
+            interval_s=0)
+        calls = []
+        exp._flush_guarded = lambda: calls.append("flush") or True
+        exp.stop()
+        self.assertEqual(calls, ["flush"])
+
+
+    def test_failed_flush_retains_spans_and_warns_once(self):
+        import warnings
+        from dfkv_telemetry import otlp_traces
+
+        exp = otlp_traces.StdlibSpanExporter(
+            _FakeIdentity(), "http://127.0.0.1:1", interval_s=0)
+        class Down:
+            def open(self, *_args, **_kwargs):
+                raise OSError("collector down")
+
+        exp._opener = Down()
+        exp.enqueue({"traceId": "a" * 32, "spanId": "b" * 16,
+                     "name": "get", "startTimeUnixNano": "1",
+                     "endTimeUnixNano": "2", "kind": 3, "attributes": []})
+        with self.assertWarnsRegex(RuntimeWarning, "trace export failed"):
+            self.assertFalse(exp._flush_guarded())
+        self.assertEqual(exp.buffered(), 1)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.assertFalse(exp._flush_guarded())
+        self.assertEqual(caught, [])
+        exp.flush = lambda: 200
+        with self.assertWarnsRegex(RuntimeWarning, "export recovered"):
+            self.assertTrue(exp._flush_guarded())
+
     def test_flush_to_local_http_server(self):
         import http.server
         import json as _json
@@ -753,6 +1007,9 @@ class OtlpTracesTest(unittest.TestCase):
         exp.enqueue(otlp_traces.make_span("get", "a" * 32, "b" * 16, 1, 2,
                                           {"op": "get"}))
         status = exp.flush()
+        self.assertEqual(
+            otlp_traces.traces_url("http://h:4318/v1/metrics"),
+            "http://h:4318/v1/traces")
         srv.server_close()
         self.assertEqual(status, 200)
         self.assertEqual(captured["ctype"], "application/json")

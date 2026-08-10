@@ -348,9 +348,12 @@ void KVClient::ProbeLoop() {
 
 std::string KVClient::MetricsSnapshot() const {
   std::string s;
+  const std::string transport =
+      transport_reason_.rfind("rdma", 0) == 0 ? "rdma" :
+      transport_reason_.rfind("tcp", 0) == 0 ? "tcp" : transport_reason_;
   s += "# HELP dfkv_client_transport_info Client transport selected by dfkv_open_v2\n";
   s += "# TYPE dfkv_client_transport_info gauge\n";
-  s += "dfkv_client_transport_info{transport=\"" + transport_reason_ + "\"} 1\n";
+  s += "dfkv_client_transport_info{transport=\"" + transport + "\"} 1\n";
   s += health_.Render();
   s += peer_lat_.Render();
   s += op_stats_.Render();

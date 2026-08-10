@@ -1,6 +1,7 @@
 # dfkv — distributed KV cache for LLM inference (SGLang · LMCache · vLLM)
 
-[![CI](https://github.com/dingodb/dfkv/actions/workflows/ci.yml/badge.svg)](https://github.com/dingodb/dfkv/actions/workflows/ci.yml)
+[![CI](https://github.com/dingodb/DingoCache/actions/workflows/ci.yml/badge.svg)](https://github.com/dingodb/DingoCache/actions/workflows/ci.yml)
+[![Release](https://github.com/dingodb/DingoCache/actions/workflows/release.yml/badge.svg)](https://github.com/dingodb/DingoCache/releases)
 
 A small, **self-contained** distributed key-value cache that pools GPU-node NVMe
 SSDs into a shared, large-capacity KV pool for LLM inference (e.g. GLM-5.1 / MLA,
@@ -82,6 +83,30 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure   # C++ gtests + the Python plugin test
 ```
 Artifacts: `build/dfkv_server`, `build/dfkv_mds`, `build/libdfkv.so`.
+## Download a release
+
+Tagged releases are published at
+[github.com/dingodb/DingoCache/releases](https://github.com/dingodb/DingoCache/releases).
+Each release contains:
+
+- `dfkv-<version>-linux-x86_64.tar.gz`: RDMA + io_uring binaries, `libdfkv.so`,
+  headers, deployment/observability configs, connector sources, tests and docs;
+- `dfkv_common`, `dfkv_connector` (LMCache), and `dfkv_vllm` pure-Python wheels;
+- `SHA256SUMS` covering every downloadable payload.
+
+```bash
+sha256sum -c SHA256SUMS
+tar xzf dfkv-<version>-linux-x86_64.tar.gz
+sudo cp -a dfkv-<version>-linux-x86_64/bin/. /usr/local/bin/
+sudo cp -a dfkv-<version>-linux-x86_64/lib/. /usr/local/lib/
+```
+
+The tag, root `VERSION`, C++ `--version`, and all three wheel versions are one
+CI-enforced contract. The release workflow uses a read-only build job and a
+separate publish-only job, reruns the full test suite, validates the
+Prometheus/Grafana deployment, builds from a digest-pinned Ubuntu 22.04 base
+(glibc 2.35), checksums the payloads, then publishes the GitHub Release once.
+
 
 ## Run a cluster
 ```bash
@@ -229,7 +254,7 @@ docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire p
   PoolTransfer) for multi-pool models (Mamba/SWA/DeepSeek-V4).
 - **Packaging**: CPack (deb/rpm/tgz) + Dockerfile; **graceful shutdown**; leveled logging.
 
-## Recommended tuning (v2.0)
+## Recommended tuning (v2.11)
 
 Validated on a 5-node ring (8×B200 hosts, 6× Gen4 NVMe + 8×400G IB per node,
 128 GiB RAM arena): cold read 97 → **156 GB/s**, hot read 48 → **97 GB/s**
@@ -243,7 +268,7 @@ fabric selection and capacity explicit.
 |---|---|---|
 | `--rdma-dev` | leave unset for one local HCA; list the fabric explicitly for multi-rail | Unset selects the first `ACTIVE` local HCA (peer names may differ). A comma list opts into multi-rail, anchors only listed active devices, and requires compatible names/fabric on both hosts; inactive entries are rejected. |
 | `DFKV_DISK_HASH_WEIGHT` | `10` | Flattens the intra-server disk ring share from ±20 % to ±3 % so the hottest disk stops gating the whole node (+5–6 % cold read, ~2× lower p99). **Re-routes existing keys** (cache miss + refill) — flip together with a restart/upgrade window. |
-| `--rdma-depth` | `1` | The server defaults to 1 and the handshake takes min(client/server). Depth is **not** a throughput knob (measured flat on PUT and GET across depth 1/2/4/8/16 on 8×B200 loopback); it only hides network latency. Raising it inflates per-connection receive-segment lease (depth × slot_size), which can exhaust the shared segment under high connection counts — depth=8 × 64 MiB slot = 512 MiB/conn, a 16 GiB segment holds only ~31 connections. Keep 1 unless the link is latency-bound and the segment has headroom. |
+| `--rdma-depth` | `4` (default) | Handshake window is `min(client, server)`. Single-connection PUT/GET bandwidth is depth-flat once connected, but production connector batches require both sides to expose the same bounded window; a 1-vs-4 mismatch caused burst PUT failures and a 29.8% hot-round regression on GLM-5.2. Depth 4 with the default 4 MiB declaration leases about 16 MiB per data QP, so a 16 GiB receive segment admits about 1024 QPs. Increase only for a measured latency-bound path and budget `depth × slot_size` per pooled QP. |
 | `--ram-tier` / `--ram-tier-bytes` / `--ram-tier-shards` | on / sized to the node / `16` for ≥100 GiB arenas | Large arenas contend on the shard locks under mixed load (+40 % mixed R/W at 16 shards on a 128 GiB arena); small (≤16 GiB) arenas are fine at the default 8. |
 | `--store-engine` | `slab` | Index rebuilds on restart; removes file-per-block hazards. |
 | `DFKV_TCP_FIRST_REQ_MS` / `DFKV_MDS_FIRST_REQ_MS` / `DFKV_METRICS_FIRST_REQ_MS` | `30000` (default) / `0` = off | First-request deadline per listener: a connection that sends nothing before the deadline is dropped, capping idle pre-auth connections. |
@@ -253,8 +278,8 @@ fabric selection and capacity explicit.
 
 | Knob | Recommended | Why |
 |---|---|---|
-| `DFKV_RDMA_DEV` | best: **rail affinity per rank** — inject the matching local/server HCA name per process; simpler on symmetric hosts: the full comma list + `DFKV_RDMA_NUMA=1` | Explicit values are sent to the peer, so verify those names exist on both hosts/containers. Leave unset to let each host select its own first ACTIVE HCA when names differ. |
-| `DFKV_RDMA_DEPTH` | `1` | Pairs with the server's posted depth (window = min of both, negotiated). Default 1; raising it inflates receive-segment lease and can exhaust the shared segment without improving throughput. |
+| `DFKV_RDMA_DEV` | leave unset for one local HCA; use the same fabric whitelist on both hosts for multi-rail | Unset lets each endpoint select its own first `ACTIVE` local HCA, so local names may differ. A comma list explicitly enables multi-rail and is sent to the peer; every listed name must exist and be on the intended interoperable fabric at both ends. |
+| `DFKV_RDMA_DEPTH` | `4` (default) | Keep client/server defaults aligned for connector batch correctness. Throughput scaling comes from multiple pooled connections, not raising one QP's depth; lowering depth reduces receive-segment consumption only after validating the real engine workload. |
 | `DFKV_FANOUT_THREADS` | unset (default 32) | Only wide single-process clients (benchmarks, many concurrent Batch* callers) need more. |
 
 **Read-side convoy collapse and direct promotion (opt-in)** — for MLA + TP-N
@@ -278,17 +303,22 @@ coalescing alone works without it. Note for env-file deployments: the file is
 *sourced*, so new knobs must be explicitly **exported** by the start script or
 a systemd drop-in to reach the server process.
 
-**Benchmark reproduction** (`dfkv_bench`): `DFKV_RDMA=1` (explicit, or it
-silently measures TCP), 8-rail `DFKV_RDMA_DEV`, `DFKV_RDMA_DEPTH=1`,
-`DFKV_FANOUT_THREADS=256`; cold-read sweet spot `--threads 16 --batch 8
---size 4194304` per client node. Keep `--count` ≤ the seed's written key count,
-and let the drives settle ~10 min after bulk writes before cold-read A/Bs (FTL
-GC depresses cold reads ~25 %). The command prints every requested phase report,
-then exits `1` if any PUT/GET failed, `2` for invalid CLI usage, and `0` only
-when every requested operation succeeded.
+**Benchmark reproduction** (`dfkv_bench`): set `DFKV_RDMA=1` explicitly (otherwise
+the client measures TCP), select the intended 8-rail `DFKV_RDMA_DEV`, keep
+`DFKV_RDMA_DEPTH=4`, and use `DFKV_FANOUT_THREADS=256`. The 0064 cold-read
+sweet spot was `--threads 16 --batch 8 --bc 1 --size 4194304` per client node.
+`--bc 1` prevents nested client fan-out under the external benchmark threads.
+Keep `--count` no larger than the seeded key count and let the drives settle
+after bulk writes before cold-read A/Bs. GET allocates and registers one bounded,
+page-aligned arena up front; registration failure aborts instead of silently
+benchmarking ad-hoc MRs. `DIAG` lines report ring/MDS/RDMA availability,
+transport errors, MR coverage, oversize rejects, and completion timeouts.
+The command exits `1` if any requested operation failed, `2` for setup/CLI
+failure, and `0` only when every requested operation succeeded.
 
 ## Status
-TDD; **570 C++ ctest entries (default) / 632 (RDMA+io_uring) + Python plugin &
-connector tests green**, **ThreadSanitizer-clean (C++ core)**.
-CI: gcc/clang build+test, TSan, RDMA datapath (Soft-RoCE loopback), RDMA compile-check, static-artifact build. License: Apache-2.0.
+CI gates GCC/Clang builds, C++ and Python contract tests, ThreadSanitizer,
+Soft-RoCE RDMA datapath tests when the runner supports RXE, the shipped runtime
+container, observability configuration, portable glibc-2.35 artifacts, wheel
+contents, version alignment, and release-package smoke imports.
 Architecture & design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Rollout: `docs/DEPLOY.md`.

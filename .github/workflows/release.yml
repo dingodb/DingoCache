@@ -1,0 +1,200 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-test-package:
+    name: test and package
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify tag and source versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(tr -d '[:space:]' < VERSION)
+          tag=${GITHUB_REF_NAME}
+          test "$tag" = "v$version"
+          python3 -m unittest discover -s test/python -p test_release_contract.py
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+            /etc/apt/sources.list.d/microsoft-prod.list \
+            /etc/apt/sources.list.d/azure-cli.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ binutils git ca-certificates \
+            libibverbs-dev liburing-dev python3-numpy python3-pip
+
+      - name: Configure and build release binaries
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDFKV_BUILD_TESTS=ON \
+            -DDFKV_WITH_RDMA=ON \
+            -DDFKV_WITH_URING=ON \
+            -DDFKV_STATIC_LIBSTDCXX=ON
+          cmake --build build-release -j2
+
+      - name: Run release tests
+        run: ctest --test-dir build-release --output-on-failure -j2
+
+      - name: Validate observability configuration
+        env:
+          DFKV_GRAFANA_ADMIN_PASSWORD: ci-validation-only
+        run: |
+          set -euo pipefail
+          docker compose -f deploy/observability/docker-compose.yml config -q
+          docker run --rm \
+            -v "$PWD/deploy/observability:/etc/prometheus:ro" \
+            --entrypoint promtool \
+            docker.m.daocloud.io/prom/prometheus@sha256:508729e0e2d18e11fd742a5a5ca70e557b940a93948c3c95fd0123a6fd538b69 \
+            check config /etc/prometheus/prometheus.yml
+          docker run --rm \
+            -v "$PWD/deploy/observability:/etc/dfkv-observability:ro" \
+            docker.m.daocloud.io/otel/opentelemetry-collector-contrib@sha256:c5918f78992ee73b0d6f0e599423ac5ec52dd5d9726733114d6eca53d5a32ed5 \
+            validate --config=/etc/dfkv-observability/otel-collector-config.yaml
+          docker run --rm \
+            -v "$PWD/deploy/observability:/etc/dfkv-observability:ro" \
+            --entrypoint /tempo \
+            docker.m.daocloud.io/grafana/tempo@sha256:cda87c212d8c584dc0b89e337e7ed648a5100feb657e5d528480ee4fa03dbbe3 \
+            -config.file=/etc/dfkv-observability/tempo.yaml -config.verify=true
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Install wheel builder
+        run: python -m pip install build==1.5.0
+
+      - name: Build release payloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(tr -d '[:space:]' < VERSION)
+          pkg="dfkv-${version}-linux-x86_64"
+          rm -rf release
+          deploy/package_release.sh build-release release
+          python -m pip wheel --no-deps --wheel-dir release integration/common
+          python -m pip wheel --no-deps --wheel-dir release integration/lmcache
+          python -m pip wheel --no-deps --wheel-dir release integration/vllm
+          test "$(find release -maxdepth 1 -name '*.whl' -type f | wc -l)" -eq 3
+          rm -rf wheel-check
+          python -m pip install --no-deps --target wheel-check release/*.whl
+          mkdir -p release-unpack
+          tar xzf "release/$pkg.tar.gz" -C release-unpack
+          root="$PWD/release-unpack/$pkg"
+          test -L "$root/lib/libdfkv.so"
+          test -L "$root/lib/libdfkv.so.${version%%.*}"
+          test "$(readlink "$root/lib/libdfkv.so")" = \
+            "libdfkv.so.${version%%.*}"
+          test "$(readlink "$root/lib/libdfkv.so.${version%%.*}")" = \
+            "libdfkv.so.$version"
+          test -f "$root/Makefile"
+          test -f "$root/Dockerfile"
+          test -f "$root/.dockerignore"
+          test -f "$root/.github/workflows/ci.yml"
+          test -f "$root/.github/workflows/release.yml"
+          PYTHONPYCACHEPREFIX="$PWD/release-pycache" \
+            PYTHONPATH="$root/python:$root/test/python:$root/integration/vllm/src" \
+            python - <<'PY'
+          import dfkv_common
+          import dfkv_hicache
+          import dfkv_telemetry
+          import dfkv_vllm
+          PY
+          PYTHONPATH=wheel-check python - <<'PY'
+          from importlib import metadata
+          expected = {
+              "dfkv-common": "dfkv_common/client_metrics.py",
+              "dfkv-connector": "dfkv_connector/_telemetry/metrics_push.py",
+              "dfkv-vllm": "dfkv_vllm/_telemetry/metrics_push.py",
+          }
+          version = open("VERSION", encoding="utf-8").read().strip()
+          for distribution, required_file in expected.items():
+              assert metadata.version(distribution) == version
+              packaged = {str(path) for path in metadata.files(distribution) or ()}
+              assert required_file in packaged, (distribution, required_file)
+          import dfkv_common
+          import dfkv_vllm
+          import dfkv_vllm._telemetry.metrics_push
+          PY
+          docker build --target runtime -t "dfkv:$version" .
+          test "$(docker run --rm --entrypoint dfkv_server "dfkv:$version" --version)" = \
+            "dfkv_server $version"
+          docker image save -o "release/dfkv-${version}-runtime-image.tar" \
+            "dfkv:$version"
+          gzip -9 "release/dfkv-${version}-runtime-image.tar"
+          ! tar -tzf "release/$pkg.tar.gz" | grep -E '(__pycache__|\.py[co]$)'
+          (cd release && sha256sum *.tar.gz *.whl > SHA256SUMS)
+
+      - name: Stage immutable release payload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: dfkv-release-${{ github.ref_name }}
+          path: release/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    name: publish immutable release
+    needs: build-test-package
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified payload
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: dfkv-release-${{ github.ref_name }}
+          path: release
+
+      - name: Publish GitHub release once
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag=${GITHUB_REF_NAME}
+          (cd release && sha256sum -c SHA256SUMS)
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            is_draft=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+              --json isDraft --jq .isDraft)
+            if [[ "$is_draft" != "true" ]]; then
+              echo "release $tag is already published; refusing to replace immutable assets" >&2
+              exit 1
+            fi
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+              --draft --verify-tag --title "dfkv $tag" --generate-notes
+          fi
+          gh release upload "$tag" release/* --repo "$GITHUB_REPOSITORY" --clobber
+          expected=$(find release -maxdepth 1 -type f -printf '%f\n' | sort)
+          actual=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' | sort)
+          if [[ "$actual" != "$expected" ]]; then
+            printf 'release asset mismatch\nexpected:\n%s\nactual:\n%s\n' \
+              "$expected" "$actual" >&2
+            exit 1
+          fi
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false

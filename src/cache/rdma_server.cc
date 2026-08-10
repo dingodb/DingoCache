@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "utils/log.h"          // DFKV_LOG_WARN (uring init fallback)
+#include "utils/prom_escape.h"
 #include "utils/net_util.h"     // ReadAll / WriteAll / Get*/Put*
 #include "utils/thread_name.h"
 #include "utils/numa_util.h"    // pin serve thread to the device's NUMA node
@@ -206,6 +207,10 @@ Status RdmaServer::Start(int port) {
     listen_fd_ = -1;
     return Status::kIOError;
   }
+  rail_stats_.clear();
+  rail_stats_.reserve(anchor_devs_.size());
+  for (size_t i = 0; i < anchor_devs_.size(); ++i)
+    rail_stats_.push_back(std::make_unique<RailStats>());
   if (anchor_devs_.size() > 1)
     DFKV_LOG_INFO("rdma multi-rail anchors: " +
                   std::to_string(anchors_.size()) + "/" +
@@ -402,13 +407,17 @@ void RdmaServer::Serve(int boot_fd) {
                        std::min<size_t>(declared, max_msg_));
   devbuf[rdma::kDevNameBytes - 1] = '\0';
   std::string dev = devbuf[0] ? std::string(devbuf) : dev_name_;
-  if (std::find(anchor_devs_.begin(), anchor_devs_.end(), dev) ==
-      anchor_devs_.end()) {
+  const auto rail_it =
+      std::find(anchor_devs_.begin(), anchor_devs_.end(), dev);
+  if (rail_it == anchor_devs_.end()) {
     DFKV_LOG_ERROR("rdma: client requested device outside the ACTIVE filter: " +
                    dev);
     ::close(boot_fd);
     return;
   }
+  const size_t rail_index =
+      static_cast<size_t>(std::distance(anchor_devs_.begin(), rail_it));
+  RailStats& rail_stats = *rail_stats_[rail_index];
 
   // The client sends QpInfo first. Read and validate its mandatory v2 depth
   // before allocating per-connection control slots or leasing shared receive
@@ -609,6 +618,9 @@ void RdmaServer::Serve(int boot_fd) {
       request->data_slot = data_slot;
       request->contiguous_payload = frame + kReqPrefix;
       v2_put_writes_.fetch_add(1, std::memory_order_relaxed);
+      rail_stats.put_writes.fetch_add(1, std::memory_order_relaxed);
+      rail_stats.put_bytes.fetch_add(request->fields.payload_len,
+                                     std::memory_order_relaxed);
       return true;
     }
 
@@ -841,6 +853,9 @@ void RdmaServer::Serve(int boot_fd) {
     }
     if (written != reply.payload_len) return false;
     v2_get_writes_.fetch_add(1, std::memory_order_relaxed);
+    rail_stats.get_writes.fetch_add(1, std::memory_order_relaxed);
+    rail_stats.get_bytes.fetch_add(reply.payload_len,
+                                   std::memory_order_relaxed);
     return ep.PostSend(send_slot, reply.first_len);
   };
 
@@ -866,6 +881,7 @@ void RdmaServer::Serve(int boot_fd) {
   bool fail = false;
   const int idle_ms = ServerIdleMs();
   active_conns_.fetch_add(1, std::memory_order_relaxed);
+  rail_stats.active_conns.fetch_add(1, std::memory_order_relaxed);
 
 #ifdef DFKV_WITH_URING
   // -------------------------------------------------------------------------
@@ -934,6 +950,8 @@ void RdmaServer::Serve(int boot_fd) {
           const ibv_wc& wc = wcs[w];
           if (wc.status != IBV_WC_SUCCESS) {
             completion_errors_.fetch_add(1, std::memory_order_relaxed);
+            rail_stats.completion_errors.fetch_add(1,
+                                                   std::memory_order_relaxed);
             fail = true; break;
           }
           if (wc.opcode == IBV_WC_SEND) {
@@ -949,6 +967,7 @@ void RdmaServer::Serve(int boot_fd) {
           Request request;
           if (!decode_request(wc, &request)) { fail = true; break; }
           completions_.fetch_add(1, std::memory_order_relaxed);
+          rail_stats.completions.fetch_add(1, std::memory_order_relaxed);
           const size_t r = request.recv_slot;
           const ReqFields& rq = request.fields;
           if (free_send.empty()) { fail = true; break; }
@@ -1179,6 +1198,7 @@ void RdmaServer::Serve(int boot_fd) {
       // Commit. Prepared SEND owners in complete_on_send do the same on
       // connection teardown.
     }
+    rail_stats.active_conns.fetch_sub(1, std::memory_order_relaxed);
     active_conns_.fetch_sub(1, std::memory_order_relaxed);
     { std::lock_guard<std::mutex> lk(conn_mu_); live_eps_.erase(&ep); }
     return;
@@ -1196,6 +1216,8 @@ sync_serve_loop:;
       const ibv_wc& wc = wcs[w];
       if (wc.status != IBV_WC_SUCCESS) {
         completion_errors_.fetch_add(1, std::memory_order_relaxed);
+        rail_stats.completion_errors.fetch_add(1,
+                                               std::memory_order_relaxed);
         fail = true; break;
       }
       if (wc.opcode == IBV_WC_SEND) {
@@ -1211,6 +1233,7 @@ sync_serve_loop:;
       Request request;
       if (!decode_request(wc, &request)) { fail = true; break; }
       completions_.fetch_add(1, std::memory_order_relaxed);
+      rail_stats.completions.fetch_add(1, std::memory_order_relaxed);
       const size_t r = request.recv_slot;
       if (free_send.empty()) { fail = true; break; }
       size_t s = free_send.back(); free_send.pop_back();
@@ -1228,6 +1251,7 @@ sync_serve_loop:;
     }
   }
   // Any prepared sends without completions destructor-abort below.
+  rail_stats.active_conns.fetch_sub(1, std::memory_order_relaxed);
   active_conns_.fetch_sub(1, std::memory_order_relaxed);
   { std::lock_guard<std::mutex> lk(conn_mu_); live_eps_.erase(&ep); }
   // ep dtor tears down the QP; the peer observes the drop as an error completion.
@@ -1275,6 +1299,52 @@ std::string RdmaServer::MetricsText() const {
   m(s, "dfkv_uring_init_fallbacks_total", "counter",
     "Connections that wanted io_uring but fell back to the sync path (ring init failed)",
     UringInitFallbacks());
+  auto rail_metric = [&](const char* name, const char* type, const char* help,
+                         const auto& value) {
+    s += "# HELP "; s += name; s += " "; s += help; s += "\n";
+    s += "# TYPE "; s += name; s += " "; s += type; s += "\n";
+    for (size_t i = 0; i < rail_stats_.size(); ++i) {
+      s += name;
+      s += "{dev=\"" + PromLabelEscape(anchor_devs_[i]) + "\"} ";
+      s += std::to_string(value(*rail_stats_[i]));
+      s += "\n";
+    }
+  };
+  rail_metric("dfkv_rdma_rail_active_conns", "gauge",
+              "RDMA connections currently serving on each local device",
+              [](const RailStats& r) {
+                return r.active_conns.load(std::memory_order_relaxed);
+              });
+  rail_metric("dfkv_rdma_rail_completions_total", "counter",
+              "RDMA request completions served on each local device",
+              [](const RailStats& r) {
+                return r.completions.load(std::memory_order_relaxed);
+              });
+  rail_metric("dfkv_rdma_rail_completion_errors_total", "counter",
+              "RDMA error completions on each local device",
+              [](const RailStats& r) {
+                return r.completion_errors.load(std::memory_order_relaxed);
+              });
+  rail_metric("dfkv_rdma_rail_put_writes_total", "counter",
+              "PUT requests received by RDMA WRITE_WITH_IMM on each local device",
+              [](const RailStats& r) {
+                return r.put_writes.load(std::memory_order_relaxed);
+              });
+  rail_metric("dfkv_rdma_rail_put_bytes_total", "counter",
+              "PUT payload bytes received on each local device",
+              [](const RailStats& r) {
+                return r.put_bytes.load(std::memory_order_relaxed);
+              });
+  rail_metric("dfkv_rdma_rail_get_writes_total", "counter",
+              "GET payloads sent by RDMA WRITE on each local device",
+              [](const RailStats& r) {
+                return r.get_writes.load(std::memory_order_relaxed);
+              });
+  rail_metric("dfkv_rdma_rail_get_bytes_total", "counter",
+              "GET payload bytes sent on each local device",
+              [](const RailStats& r) {
+                return r.get_bytes.load(std::memory_order_relaxed);
+              });
   return s;
 }
 

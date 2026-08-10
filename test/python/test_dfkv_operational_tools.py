@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
+import os
 import struct
 import subprocess
 import sys
@@ -21,8 +23,11 @@ from dfkv_membership_audit import decode_registration, info_fields, range_end  #
 from dfkv_node_replace import Replacer, WorkflowError  # noqa: E402
 from dfkv_tenant_quota import load_quotas, main as quota_main  # noqa: E402
 from dfkv_ops_common import (  # noqa: E402
+    atomic_write,
+    atomic_write_with_checksum,
     members_epoch,
     parse_bench,
+    parse_bench_diagnostics,
     parse_clients,
     parse_ring,
     parse_stat_reachability,
@@ -53,9 +58,21 @@ TOTAL used=1.0MB objects=10 hits=9 misses=1 hit%=90.0 bytes_w=1 bytes_r=1
 """
 
 BENCH = """dfkv_bench transport=tcp members=2
-PUT   n=8000 size=4096 threads=8 batch=4 | 1.000s  0.03 GB/s  8000 ops/s  call-lat ms p50=0.100 p99=0.900 max=1.100  fails=0
-GET   n=8000 size=4096 threads=8 batch=4 | 0.500s  0.07 GB/s  16000 ops/s  call-lat ms p50=0.050 p99=0.400 max=0.800  fails=2
+PUT   n=8000 size=4096 threads=8 batch=4 | 1.000s  goodput 0.03 GB/s  8000 ok-ops/s  call-lat ms p50=0.100 p99=0.900 max=1.100  ok=8000 fails=0
+DIAG phase=PUT ring=2 io_errors=0 unhealthy_skips=0 peer_bad=0 endpoint_errors=0 rail_errors=0 cq_errors=0 completion_timeouts=0 stale_retries=0 mr_rejections=0 mr_failures=0 adhoc_mr=0 mr_registered_bytes=134217728
+GET   n=8000 size=4096 threads=8 batch=4 | 0.500s  goodput 0.07 GB/s  15996 ok-ops/s  call-lat ms p50=0.050 p99=0.400 max=0.800  ok=7998 fails=2
+DIAG phase=GET ring=2 io_errors=2 unhealthy_skips=0 peer_bad=1 endpoint_errors=1 rail_errors=0 cq_errors=0 completion_timeouts=0 stale_retries=1 mr_rejections=0 mr_failures=0 adhoc_mr=0 mr_registered_bytes=134217728
 """
+LEGACY_BENCH = """dfkv_bench transport=tcp members=2
+PUT   n=8000 size=4096 threads=8 batch=4 | 1.000s 0.03 GB/s 8000 ops/s call-lat ms p50=0.100 p99=0.900 max=1.100 ok=8000 fails=0
+GET   n=8000 size=4096 threads=8 batch=4 | 0.500s 0.07 GB/s 15996 ops/s call-lat ms p50=0.050 p99=0.400 max=0.800 ok=7998 fails=2
+"""
+
+EMPTY_RING = """group=glm members=0 ring_points=0
+ID               ADDR                   WEIGHT   VNODES   SHARE  INFO
+"""
+
+
 
 
 class CommonParserTest(unittest.TestCase):
@@ -67,13 +84,33 @@ class CommonParserTest(unittest.TestCase):
         self.assertNotEqual(view.epoch, 0)
         self.assertEqual(parse_clients(CLIENTS), ("glm", ("host-a_1", "host-b_1")))
         self.assertEqual(parse_stat_reachability(STATS), {"n1": True, "n2": False})
+        empty = parse_ring(EMPTY_RING)
+        self.assertEqual(empty.group, "glm")
+        self.assertEqual(empty.members, ())
+
 
     def test_bench_parser_rejects_partial_output(self) -> None:
         parsed = parse_bench(BENCH)
         self.assertEqual(parsed["put"]["throughput_gbps"], 0.03)
         self.assertEqual(parsed["get"]["fails"], 2)
+        self.assertEqual(parsed["get"]["successful_operations"], 7998)
         with self.assertRaises(ValueError):
             parse_bench(BENCH.split("GET", 1)[0])
+        diagnostics = parse_bench_diagnostics(BENCH)
+        self.assertEqual(diagnostics["get"]["io_errors"], 2)
+        self.assertEqual(diagnostics["get"]["mr_registered_bytes"], 134217728)
+        with self.assertRaises(ValueError):
+            parse_bench_diagnostics(BENCH.split("GET", 1)[0])
+        self.assertEqual(
+            parse_bench_diagnostics(BENCH.replace(
+                BENCH.splitlines()[2] + "\n", "").replace(
+                BENCH.splitlines()[4] + "\n", ""), required=False),
+            {},
+        )
+        legacy = parse_bench(LEGACY_BENCH)
+        self.assertEqual(legacy["put"]["throughput_gbps"], 0.03)
+        self.assertEqual(legacy["get"]["successful_operations"], 7998)
+
 
 
 class TenantQuotaToolTest(unittest.TestCase):
@@ -122,6 +159,20 @@ class TenantQuotaToolTest(unittest.TestCase):
                 2,
             )
             self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+    def test_atomic_rewrite_preserves_mode_and_owner(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            path.write_text("old", encoding="utf-8")
+            path.chmod(0o640)
+            before = path.stat()
+            atomic_write(path, b"new")
+            after = path.stat()
+            self.assertEqual(after.st_mode & 0o777, 0o640)
+            self.assertEqual((after.st_uid, after.st_gid),
+                             (before.st_uid, before.st_gid))
+            self.assertEqual(path.read_bytes(), b"new")
+
 
 class ReplacementWorkflowTest(unittest.TestCase):
     @staticmethod
@@ -284,6 +335,23 @@ class ReplacementWorkflowTest(unittest.TestCase):
         self.assertEqual(command.call_count, 3)
 
 
+class AtomicArtifactTest(unittest.TestCase):
+    def test_atomic_write_mode_and_sha256_sidecar(self) -> None:
+        with TemporaryDirectory() as temp:
+            output = Path(temp) / "audit.json"
+            atomic_write(str(output), "first\n")
+            self.assertEqual(output.stat().st_mode & 0o777, 0o644)
+            os.chmod(output, 0o640)
+            content = '{"healthy":true}\n'
+            atomic_write_with_checksum(str(output), content)
+            self.assertEqual(output.stat().st_mode & 0o777, 0o640)
+            expected = hashlib.sha256(content.encode()).hexdigest()
+            self.assertEqual(
+                Path(str(output) + ".sha256").read_text(),
+                f"{expected}  audit.json\n",
+            )
+
+
 class MembershipDecodeTest(unittest.TestCase):
     @staticmethod
     def registration() -> bytes:
@@ -350,6 +418,38 @@ class LoadRegressionMathTest(unittest.TestCase):
                     args, "baseline", 8000, "warmup",
                     allow_operation_failures=False,
                 )
+
+    def test_bench_retries_legacy_binary_without_ready_timeout(self) -> None:
+        args = SimpleNamespace(
+            baseline_bench=None, dfkv_bench="dfkv_bench",
+            baseline_members="n=127.0.0.1:1", baseline_mds=None,
+            baseline_group="default", size=4096, threads=8, batch=4, bc=1,
+            ready_timeout=30.0, run_timeout=60.0,
+        )
+        unsupported = Mock(
+            returncode=2,
+            stdout="",
+            stderr="usage: dfkv_bench\nunknown option --ready-timeout",
+        )
+        legacy_output = "\n".join(
+            line for line in BENCH.splitlines()
+            if not line.startswith("DIAG ")
+        ) + "\n"
+        completed = Mock(returncode=0, stdout=legacy_output, stderr="")
+        with patch(
+                "dfkv_load_regression.subprocess.run",
+                side_effect=[unsupported, completed]) as run:
+            phases = bench_once(
+                args, "baseline", 8000, "seed",
+                allow_operation_failures=True,
+            )
+        self.assertEqual(run.call_count, 2)
+        self.assertNotIn("--ready-timeout", run.call_args.args[0])
+        self.assertFalse(
+            phases["get"]["compatibility"]["ready_timeout_supported"])
+        self.assertNotIn("diagnostics", phases["get"])
+        self.assertFalse(
+            phases["get"]["compatibility"]["diagnostics_available"])
 
 
 if __name__ == "__main__":

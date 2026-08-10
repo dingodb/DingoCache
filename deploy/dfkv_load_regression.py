@@ -16,7 +16,11 @@ import urllib.error
 import urllib.request
 import uuid
 
-from dfkv_ops_common import atomic_write, parse_bench
+from dfkv_ops_common import (
+    atomic_write_with_checksum,
+    parse_bench,
+    parse_bench_diagnostics,
+)
 
 
 _METRIC = re.compile(r'^dfkv_op_latency_seconds_bucket\{([^}]*)\}\s+([0-9.eE+-]+)$')
@@ -149,10 +153,43 @@ def bench_once(
         env=os.environ.copy(),
         check=False,
     )
+    legacy_ready_timeout = False
+    option_error = (completed.stderr + "\n" + completed.stdout).lower()
+    if (completed.returncode == 2
+            and "--ready-timeout" in option_error
+            and ("unknown" in option_error or "unrecognized" in option_error
+                 or "usage:" in option_error)):
+        option_index = command.index("--ready-timeout")
+        del command[option_index:option_index + 2]
+        completed = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=args.run_timeout,
+            env=os.environ.copy(),
+            check=False,
+        )
+        legacy_ready_timeout = True
+    diagnostics = parse_bench_diagnostics(completed.stdout, required=False)
     if completed.returncode not in (0, 1):
         detail = completed.stderr.strip() or completed.stdout.strip() or "no diagnostic"
+        if diagnostics:
+            detail += "; diagnostics=" + json.dumps(
+                diagnostics, sort_keys=True, separators=(",", ":"))
         raise RuntimeError(f"dfkv_bench exited {completed.returncode}: {detail}")
     phases = parse_bench(completed.stdout)
+    for phase, values in phases.items():
+        values["diagnostics_available"] = phase in diagnostics
+        if phase in diagnostics:
+            values["diagnostics"] = diagnostics[phase]
+    if legacy_ready_timeout:
+        for phase in phases.values():
+            phase["compatibility"] = {
+                "ready_timeout_supported": False,
+                "diagnostics_available": bool(phase["diagnostics_available"]),
+                "readiness": "legacy dfkv_bench behavior",
+            }
     failed = sum(int(phase["fails"]) for phase in phases.values())
     # Current dfkv_bench exits 1 when any data op fails. Preserve those complete
     # results for the measured error-rate gate; rc=1 without reported failures
@@ -165,12 +202,16 @@ def bench_once(
 
 
 def run_target(args: argparse.Namespace, name: str, nonce: str) -> dict[str, object]:
+    metrics_endpoint = getattr(args, f"{name}_metrics")
+    # Fail before mutating the target workload when server-side histogram
+    # evidence is unreachable or incomplete.
+    scrape_histograms(metrics_endpoint, args.metrics_timeout)
     for run in range(args.warmup_runs):
         bench_once(
-            args, name, args.warmup_count, f"loadreg-{nonce}-{name}-warmup-{run}",
+            args, name, args.warmup_count,
+            f"loadreg-{nonce}-{name}-warmup-{run}",
             allow_operation_failures=False,
         )
-    metrics_endpoint = getattr(args, f"{name}_metrics")
     before = scrape_histograms(metrics_endpoint, args.metrics_timeout)
     trials: list[dict[str, object]] = []
     for run in range(args.runs):
@@ -348,7 +389,8 @@ def main(argv: list[str] | None = None) -> int:
         regressions = compare(args, artifact["baseline"], artifact["candidate"])  # type: ignore[arg-type]
         artifact["regressions"] = regressions
         artifact["status"] = "regression" if regressions else "pass"
-        atomic_write(args.output, json.dumps(artifact, indent=2, sort_keys=True) + "\n")
+        atomic_write_with_checksum(
+            args.output, json.dumps(artifact, indent=2, sort_keys=True) + "\n")
         if regressions:
             print(f"REGRESSION: {len(regressions)} threshold violation(s); artifact={args.output}", file=sys.stderr)
             return 3
@@ -357,7 +399,8 @@ def main(argv: list[str] | None = None) -> int:
     except BaseException as error:
         artifact["status"] = "error"
         artifact["error"] = str(error)
-        atomic_write(args.output, json.dumps(artifact, indent=2, sort_keys=True) + "\n")
+        atomic_write_with_checksum(
+            args.output, json.dumps(artifact, indent=2, sort_keys=True) + "\n")
         print(f"ERROR: load regression run failed: {error}; artifact={args.output}", file=sys.stderr)
         return 1
 

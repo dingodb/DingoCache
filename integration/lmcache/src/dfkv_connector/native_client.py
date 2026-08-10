@@ -30,6 +30,7 @@ from dfkv_common import (
     make_key_array,
     make_key_buffer,
 )
+from dfkv_common.client_metrics import read_native_snapshot
 
 from . import access_log as _alog
 from .access_log import access_log
@@ -106,6 +107,8 @@ def load_lib(path: Optional[str] = None) -> ctypes.CDLL:
     lib.dfkv_transport_mode.argtypes = [c_void_p]
     lib.dfkv_version.restype = c_char_p
     lib.dfkv_version.argtypes = []
+    lib.dfkv_stats_snapshot.restype = c_uint64
+    lib.dfkv_stats_snapshot.argtypes = [c_void_p, c_char_p, c_uint64]
     lib.dfkv_close.restype = None
     lib.dfkv_close.argtypes = [c_void_p]
     return lib
@@ -186,6 +189,7 @@ class DfkvNativeClient:
         rdma_pools: Optional[Sequence[Tuple[int, int]]] = None,
         loop=None,
         get_parallelism: int = 1,
+        model: str = "",
     ) -> None:
         import asyncio
 
@@ -198,6 +202,7 @@ class DfkvNativeClient:
             self._lib = load_lib(lib_path)
             self._loop = loop or asyncio.get_running_loop()
             self._closed = False
+            self._telemetry_acquired = False
             if not key_namespace:
                 raise ValueError(
                     "DfkvNativeClient requires a non-empty key namespace")
@@ -257,16 +262,41 @@ class DfkvNativeClient:
             # when DFKV_METRICS_ENABLED is unset). LMCache had no dfkv metrics
             # before — this gives it parity with the SGLang/vLLM connectors. Report
             # the connector package + libdfkv.so versions for fleet skew tracking.
-            _push_metrics.configure(
-                {}, connector_type=_tcfg.TYPE_LMCACHE, tp_rank=int(tp_rank),
-                version=_tcfg.dist_version("dfkv-connector"),
-                native_version=_native_version(self._lib))
-            # Connector-side request tracing (off by default; zero cost when off).
-            # Spans for slow / sampled / failed ops pushed over OTLP /v1/traces.
-            _push_tracing.configure(
-                {}, connector_type=_tcfg.TYPE_LMCACHE, tp_rank=int(tp_rank),
-                version=_tcfg.dist_version("dfkv-connector"),
-                native_version=_native_version(self._lib))
+            metrics_acquired = tracing_acquired = False
+            try:
+                metrics_acquired = True
+                _push_metrics.configure(
+                    {}, connector_type=_tcfg.TYPE_LMCACHE,
+                    tp_rank=int(tp_rank), model=model,
+                    version=_tcfg.dist_version("dfkv-connector"),
+                    native_version=_native_version(self._lib))
+                self._peer_lat_poller = None
+                try:
+                    peer_poll_s = float(_tcfg.resolve(
+                        {}, "peer_latency_poll_s",
+                        _tcfg.ENV_PEER_POLL_S, 10.0))
+                except (TypeError, ValueError):
+                    peer_poll_s = 10.0
+                self._peer_lat_poller = (
+                    _push_metrics.start_peer_latency_poller(
+                        self.stats_snapshot, peer_poll_s))
+                # Connector-side request tracing (off by default; zero cost
+                # when off). Spans for slow / sampled / failed ops are pushed
+                # over OTLP /v1/traces.
+                tracing_acquired = True
+                _push_tracing.configure(
+                    {}, connector_type=_tcfg.TYPE_LMCACHE,
+                    tp_rank=int(tp_rank), model=model,
+                    version=_tcfg.dist_version("dfkv-connector"),
+                    native_version=_native_version(self._lib))
+            except Exception:
+                # Constructor failure after dfkv_open_v2 must release both the
+                # telemetry acquisitions and the native/executor resources.
+                self._telemetry_acquired = (
+                    metrics_acquired or tracing_acquired)
+                self.close()
+                raise
+            self._telemetry_acquired = True
             # Access log: parse the launch baseline (env-driven), then let a
             # control file toggle it at runtime without restarting LMCache
             # (opt-in via DFKV_HOT_CONFIG). docs/access_log.md -> 运行时热开关.
@@ -274,6 +304,13 @@ class DfkvNativeClient:
             _hot_config.register("access_log", _alog.apply_hot)
             _hot_config.start({}, tp_rank=int(tp_rank))
             r.result = f"ok regs={regs} transport={self.transport_mode}"
+
+    def stats_snapshot(self) -> str:
+        """Read one complete native client metrics snapshot."""
+        handle = self._h
+        if not handle:
+            return ""
+        return read_native_snapshot(self._lib, handle)
 
     def _register_memory(self, base: int, size: int) -> None:
         """Register one MR or fail startup rather than claiming zero-copy."""
@@ -481,6 +518,12 @@ class DfkvNativeClient:
             _hot_config.stop()
         except Exception:  # pragma: no cover
             pass
+        try:
+            if getattr(self, "_peer_lat_poller", None):
+                self._peer_lat_poller.stop()
+                self._peer_lat_poller = None
+        except Exception:  # pragma: no cover
+            pass
         with access_log("native.close", lambda: ""):
             self._closed = True
             try:
@@ -493,3 +536,7 @@ class DfkvNativeClient:
                     self._h = None
             except Exception as exc:  # pragma: no cover
                 logger.warning("dfkv_close failed: %s", exc)
+        if self._telemetry_acquired:
+            self._telemetry_acquired = False
+            _push_metrics.release()
+            _push_tracing.release()

@@ -100,19 +100,23 @@ class MdsServer {
   Status Start(int port);
   void Stop();
   int port() const { return port_; }
-  // Static counters + per-group ring aggregates. The aggregate half does ONE
-  // etcd prefix range over /dfkv/v1/groups/ at scrape time (MDS stays
-  // stateless; ~30s Prometheus cadence makes this negligible), decodes each
-  // member's STA1 stats and sums them per group -- ring capacity / usage /
-  // hit-rate / alarm counters become one MDS scrape instead of a fleet sweep.
+  // Static counters + per-group ring aggregates. One etcd prefix range over
+  // /dfkv/v1/groups/ both proves readiness and supplies every group aggregate;
+  // a scrape never performs a second sequential health range.
   std::string MetricsText() {
     metrics_.local_member_leases.store(leases_.Size(),
-                                        std::memory_order_relaxed);
+                                       std::memory_order_relaxed);
     metrics_.local_client_leases.store(client_leases_.Size(),
-                                        std::memory_order_relaxed);
-    return metrics_.Render() + GroupMetricsText();
+                                       std::memory_order_relaxed);
+    bool ready = false;
+    const std::string group_metrics = GroupMetricsText(&ready);
+    std::string out = metrics_.Render() + etcd_.MetricsText() + group_metrics;
+    out += "# HELP dfkv_mds_ready Whether the MDS can currently reach etcd\n";
+    out += "# TYPE dfkv_mds_ready gauge\n";
+    out += std::string("dfkv_mds_ready ") + (ready ? "1\n" : "0\n");
+    return out;
   }
-  std::string GroupMetricsText();
+  std::string GroupMetricsText(bool* etcd_reachable = nullptr);
   // kListGroups backend: distinct group names under /dfkv/v1/groups/ (newline-
   // joined). Feeds `dfkvctl stats --all`.
   Status ListGroups(std::string* out);

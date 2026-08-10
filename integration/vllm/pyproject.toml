@@ -1,21 +1,21 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools==82.0.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "dfkv-vllm"
-version = "2.0.0"
+version = "2.11.0"
 description = "Direct vLLM KVConnectorBase_V1 connector for dfkv (GPUDirect RDMA, no LMCache)"
 requires-python = ">=3.12"
 # vllm + torch are provided by the runtime image; not pinned here. The connector
 # itself is pure Python (ctypes over libdfkv.so), so there is no native build.
-dependencies = ["dfkv-common==2.0.0"]
+dependencies = ["dfkv-common==2.11.0"]
 
 # Telemetry is opt-in: the OTel SDK is only needed when DFKV_METRICS_ENABLED /
 # DFKV_TRACE_ENABLED is set. Without this extra the connector stays dependency-
 # free and the telemetry layer is a zero-cost no-op.
 [project.optional-dependencies]
-otel = ["opentelemetry-sdk", "opentelemetry-exporter-otlp"]
+otel = ["opentelemetry-sdk==1.41.1", "opentelemetry-exporter-otlp==1.41.1"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -80,6 +80,40 @@ TEST(EtcdClient, Non200OrTransportFailureReturnsNullopt) {
   EXPECT_FALSE(c.LeaseGrant(30).has_value());
 }
 
+TEST(EtcdClient, MetricsCoverEveryOperationAndErrors) {
+  FakeHttp h;
+  h.canned = {
+      {200, R"({"ID":"1","TTL":"30"})"},
+      {200, R"({"result":{"TTL":"30"}})"},
+      {200, "{}"},
+      {503, "unavailable"},
+      {200, R"({"header":{"revision":"4"}})"},
+  };
+  EtcdClient c(&h);
+  EXPECT_TRUE(c.LeaseGrant(30).has_value());
+  EXPECT_TRUE(c.LeaseKeepAlive(1));
+  EXPECT_TRUE(c.Put("/k", "v", 1));
+  EXPECT_FALSE(c.RangePrefix("/").has_value());
+  EXPECT_TRUE(c.RangePrefixForMetrics("/dfkv/v1/groups/").has_value());
+  const std::string text = c.MetricsText();
+  EXPECT_NE(text.find("dfkv_mds_etcd_requests_total{op=\"lease_grant\"} 1"),
+            std::string::npos) << text;
+  EXPECT_NE(text.find("dfkv_mds_etcd_requests_total{op=\"lease_keepalive\"} 1"),
+            std::string::npos) << text;
+  EXPECT_NE(text.find("dfkv_mds_etcd_requests_total{op=\"put\"} 1"),
+            std::string::npos) << text;
+  EXPECT_NE(text.find("dfkv_mds_etcd_requests_total{op=\"range\"} 1"),
+            std::string::npos) << text;
+  EXPECT_NE(text.find("dfkv_mds_etcd_request_errors_total{op=\"range\"} 1"),
+            std::string::npos) << text;
+  EXPECT_NE(text.find(
+                "dfkv_mds_etcd_request_duration_seconds_count{op=\"range\"} 1"),
+            std::string::npos) << text;
+  EXPECT_NE(text.find(
+                "dfkv_mds_etcd_requests_total{op=\"metrics_range\"} 1"),
+            std::string::npos) << text;
+}
+
 TEST(EtcdClient, PrefixRangeEndAll0xFFScansToEnd) {
   // All-0xFF prefix => range_end must be "\0" (scan to keyspace end), NOT empty
   // (empty range_end == single-key get in etcd).

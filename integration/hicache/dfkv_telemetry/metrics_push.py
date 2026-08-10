@@ -40,14 +40,18 @@ Metric model (op is an attribute, so put/get share one set of names):
 
 from __future__ import annotations
 
+import atexit
 import os
 import socket
 import sys
 import threading
 import time
+import warnings
+from urllib.parse import urlsplit
 from typing import Any, Optional
 
 from . import config
+from dfkv_common.client_metrics import CLIENT_METRIC_SPECS, parse_snapshot
 
 # Latency histogram bucket boundaries (seconds); same family the SGLang plugin
 # uses in dfkv_metrics so dashboards line up.
@@ -55,6 +59,40 @@ _HIST_BUCKETS = (0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025,
                  0.05, 0.1, 0.25, 0.5, 1.0)
 
 _OPS = ("put", "get", "exist")
+
+_CLIENT_STATUS_EXACT_EXCLUDES = {"dfkv_client_peer_errors_total"}
+_CLIENT_STATUS_PREFIX_EXCLUDES = (
+    "dfkv_client_op_",
+    "dfkv_client_dedup_",
+    "dfkv_client_gpu_dedup_",
+    "dfkv_client_peer_latency_",
+)
+
+
+def _is_client_status_metric(name: str) -> bool:
+    return (
+        name not in _CLIENT_STATUS_EXACT_EXCLUDES
+        and not name.startswith(_CLIENT_STATUS_PREFIX_EXCLUDES)
+    )
+
+
+def _client_status_export_name(name: str) -> str:
+    if name.startswith("dfkv_rdma_client_"):
+        return "dfkv_connector_rdma_" + name[len("dfkv_rdma_client_"):]
+    if name.startswith("dfkv_rdma_cq_"):
+        return "dfkv_connector_rdma_cq_" + name[len("dfkv_rdma_cq_"):]
+    if name.startswith("dfkv_transport_pool_"):
+        return "dfkv_connector_transport_pool_" + name[len("dfkv_transport_pool_"):]
+    if name.startswith("dfkv_client_"):
+        return "dfkv_connector_" + name[len("dfkv_client_"):]
+    return name
+
+
+_CLIENT_STATUS_SPECS = {
+    _client_status_export_name(name): spec
+    for name, spec in CLIENT_METRIC_SPECS.items()
+    if _is_client_status_metric(name)
+}
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +139,15 @@ class _NoopRecorder:
     def update_client_dedup(self, dedup):
         pass
 
+    def update_client_status(self, samples):
+        pass
+    def record_client_poll(self, success):
+        pass
+
+    def client_poll_snapshot(self):
+        return {}
+
+
     def peer_latency_snapshot(self):
         return {}
 
@@ -110,7 +157,7 @@ class _NoopRecorder:
     def snapshot(self):
         return {}
 
-    def shutdown(self):
+    def shutdown(self, flush=True):
         pass
 
 
@@ -155,13 +202,17 @@ class _Recorder:
     enabled = True
 
     def __init__(self, connector_type: str, connector_id: str, tp_rank: int,
-                 model: str, endpoint: str, interval_ms: int, protocol: str = "",
+                 model: str, deployment: str, cache_role: str, team: str,
+                 endpoint: str, interval_ms: int, protocol: str = "",
                  readers=None, version: str = "", native_version: str = "",
                  exporter: str = "stdlib"):
         self.connector_type = connector_type
         self.connector_id = connector_id
         self.tp_rank = int(tp_rank)
         self.model = model
+        self.deployment = deployment
+        self.cache_role = cache_role
+        self.team = team
         # version: the connector package version (pip dist, e.g. dfkv-vllm).
         # native_version: the linked libdfkv.so version (C dfkv_version()).
         # Both ride on the resource so the dashboard can spot version skew.
@@ -179,8 +230,8 @@ class _Recorder:
         # histogram (-> p99 in Grafana). One cheap branchy increment per op.
         self._nb = len(_HIST_BUCKETS)
         self._dur_buckets = {o: [0] * (self._nb + 1) for o in _OPS}
-        # Per-cache-node latency (peer -> (avg_seconds, max_seconds)), fed by a
-        # PeerLatencyPoller reading the C client's snapshot.
+        # Per-cache-node latency (peer -> {avg,max,sum,count}), fed by the same
+        # native snapshot poller as the C-client operation/status families.
         self._peer = {}
         # Per-op (put/get/exist) metrics, sourced from the C KVClient snapshot
         # (dfkv_client_op_*) by the same poller. The C++ client is the convergent
@@ -190,22 +241,47 @@ class _Recorder:
         # lat_count, buckets:[(le_str, cum_count)]}}.
         self._client_ops = {}
         self._client_dedup = {}
+        # Bounded health/transport/MR samples from the native snapshot. Operation,
+        # dedup and peer-latency families are forwarded by their dedicated paths.
+        self._client_status = []
+        # Poll health is explicit so a stale last-good snapshot cannot masquerade
+        # as a healthy daemon. Absent until the first polling attempt.
+        self._client_poll = {
+            "observed": False,
+            "success": 0.0,
+            "errors": 0,
+            "last_success_unixtime": 0.0,
+        }
         self._otel = None
         self._provider = None
         self._stdlib = None
-        # Default exporter = the pure-stdlib OTLP/HTTP-JSON pusher (zero third-party
-        # deps, nothing to pip-install in the container, no dependency shadowing).
-        # `readers` (test seam) or exporter="otel" selects the OpenTelemetry SDK;
-        # if the SDK is requested but absent, fall back to the stdlib pusher.
+        # Default exporter = the pure-stdlib OTLP/HTTP-JSON pusher (zero third-
+        # party deps). ``readers`` (test seam) or exporter="otel" selects the
+        # OpenTelemetry SDK. A requested gRPC SDK exporter never falls back to
+        # HTTP on the same port when the SDK is unavailable.
         if readers is not None or str(exporter).lower() == config.EXPORTER_OTEL:
             self._setup_otel(endpoint, interval_ms, protocol, readers)
-            if self._otel is None and readers is None:
+            proto = _resolved_protocol(endpoint, protocol)
+            if self._otel is None and readers is None and "grpc" not in proto:
                 self._setup_stdlib(endpoint, interval_ms)
         else:
             self._setup_stdlib(endpoint, interval_ms)
 
     def _setup_stdlib(self, endpoint: str, interval_ms: int) -> None:
         from . import otlp_json
+        url = otlp_json.metrics_url(endpoint)
+        try:
+            port = urlsplit(url).port
+        except ValueError:
+            port = None
+        if port == 4317:
+            warnings.warn(
+                "DFKV_METRICS_EXPORTER=stdlib sends OTLP/HTTP JSON; "
+                "Collector port 4317 is normally gRPC. Use the HTTP receiver "
+                "port 4318 or select DFKV_METRICS_EXPORTER=otel with grpc.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
         self._stdlib = otlp_json.StdlibExporter(
             self, endpoint, max(1000, int(interval_ms)) / 1000.0)
         self._stdlib.start()
@@ -231,6 +307,13 @@ class _Recorder:
                 "dfkv.pid": os.getpid(),
                 "dfkv.tp_rank": self.tp_rank,
             }
+            for key, value in (
+                    ("dfkv.model", self.model),
+                    ("dfkv.deployment", self.deployment),
+                    ("dfkv.cache_role", self.cache_role),
+                    ("dfkv.team", self.team)):
+                if value:
+                    res_attrs[key] = value
             # Version labels (omitted when unknown so we never emit empty labels):
             # dfkv_version = connector package, dfkv_native_version = libdfkv.so.
             if self.version:
@@ -239,14 +322,20 @@ class _Recorder:
                 res_attrs["dfkv.native_version"] = self.native_version
             res = Resource.create(res_attrs)
             if readers is None:
-                proto = (protocol or "grpc").lower()
+                proto = _resolved_protocol(endpoint, protocol)
                 if "http" in proto:
                     from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
                         OTLPMetricExporter)
+                    from .otlp_json import metrics_url
+                    sdk_endpoint = metrics_url(endpoint) if endpoint else ""
                 else:
                     from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import (
                         OTLPMetricExporter)
-                exporter = OTLPMetricExporter(endpoint=endpoint) if endpoint else OTLPMetricExporter()
+                    sdk_endpoint = endpoint
+                exporter = (
+                    OTLPMetricExporter(endpoint=sdk_endpoint)
+                    if sdk_endpoint else OTLPMetricExporter()
+                )
                 readers = [PeriodicExportingMetricReader(
                     exporter, export_interval_millis=max(1000, int(interval_ms)))]
             view = View(instrument_name="dfkv_connector_op_seconds",
@@ -322,10 +411,10 @@ class _Recorder:
             return v
 
     def update_peer_latency(self, peer_stats: dict) -> None:
-        """peer_stats: {peer: (avg_seconds, max_seconds)} from the snapshot poller."""
+        """peer_stats: {peer: {avg,max,sum,count}} from the snapshot poller."""
         with self._lock:
-            self._peer = dict(peer_stats)
-
+            self._peer = {peer: dict(values)
+                          for peer, values in peer_stats.items()}
     def update_client_ops(self, client_ops: dict) -> None:
         """Absolute per-op metrics parsed from the C KVClient snapshot
         (dfkv_client_op_*). Forwarded as-is (cumulative) by the OTLP exporter."""
@@ -337,9 +426,42 @@ class _Recorder:
         with self._lock:
             self._client_dedup = dict(dedup)
 
+    def update_client_status(self, samples: list) -> None:
+        with self._lock:
+            self._client_status = list(samples)
+    def record_client_poll(self, success: bool) -> None:
+        with self._lock:
+            self._client_poll["observed"] = True
+            self._client_poll["success"] = 1.0 if success else 0.0
+            if success:
+                self._client_poll["last_success_unixtime"] = time.time()
+            else:
+                self._client_poll["errors"] += 1
+
+    def client_poll_snapshot(self) -> dict:
+        with self._lock:
+            return dict(self._client_poll)
+
+    def client_ops_snapshot(self) -> dict:
+        with self._lock:
+            return {op: dict(values)
+                    for op, values in self._client_ops.items()}
+
+    def client_dedup_snapshot(self) -> dict:
+        with self._lock:
+            return dict(self._client_dedup)
+
+
+    def client_status_snapshot(self, name: str = "") -> list:
+        with self._lock:
+            samples = [dict(sample) for sample in self._client_status]
+        return [sample for sample in samples
+                if not name or sample["name"] == name]
+
     def peer_latency_snapshot(self) -> dict:
         with self._lock:
-            return dict(self._peer)
+            return {peer: dict(values)
+                    for peer, values in self._peer.items()}
 
     def export_snapshot(self) -> dict:
         """Consistent aggregate snapshot for the stdlib OTLP/JSON exporter. Reads-
@@ -354,13 +476,24 @@ class _Recorder:
                 "dur_buckets": {o: list(b) for o, b in self._dur_buckets.items()},
                 "dur_max": dict(self._dur_max),
                 "bounds": list(_HIST_BUCKETS),
-                "peer": dict(self._peer),
+                "peer": {peer: dict(values)
+                         for peer, values in self._peer.items()},
                 "client_ops": {o: dict(d) for o, d in self._client_ops.items()},
                 "client_dedup": dict(self._client_dedup),
+                "client_status": [dict(sample)
+                                  for sample in self._client_status],
+                "client_poll": dict(self._client_poll),
             }
             for o in list(self._dur_max):
                 self._dur_max[o] = 0.0  # read-and-reset
         return snap
+    def restore_maxima(self, snapshot: dict) -> None:
+        """Merge a failed export window back without clobbering newer maxima."""
+        with self._lock:
+            for op_name, value in snapshot.get("dur_max", {}).items():
+                self._ensure_op(op_name)
+                self._dur_max[op_name] = max(
+                    self._dur_max.get(op_name, 0.0), float(value))
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -373,13 +506,16 @@ class _Recorder:
                 "dur_sum": dict(self._dur_sum),
                 "dur_cnt": dict(self._dur_cnt),
                 "dur_max": dict(self._dur_max),
+                "client_status": [dict(sample)
+                                  for sample in self._client_status],
+                "client_poll": dict(self._client_poll),
             }
         return snap
 
-    def shutdown(self) -> None:
+    def shutdown(self, flush=True) -> None:
         if self._stdlib is not None:
             try:
-                self._stdlib.stop()
+                self._stdlib.stop(flush=flush)
             except Exception:
                 pass
             self._stdlib = None
@@ -392,8 +528,7 @@ class _Recorder:
 
 
 class _OtelInstruments:
-    """Holds the OTel instruments and mirrors a recorded op onto them. Only
-    constructed when the OTel SDK imported successfully."""
+    """Mirror every connector-owned metric family through the OTel SDK."""
 
     def __init__(self, meter, rec: "_Recorder"):
         self._rec = rec
@@ -412,17 +547,69 @@ class _OtelInstruments:
         meter.create_observable_gauge(
             "dfkv_connector_op_max_seconds", callbacks=[self._observe_max],
             unit="s", description="max op duration since last export, by op")
+
+        for name, field, unit in (
+                ("dfkv_connector_op_requests_total", "requests", "1"),
+                ("dfkv_connector_op_keys_total", "keys", "1"),
+                ("dfkv_connector_op_hits_total", "hits", "1"),
+                ("dfkv_connector_op_bytes_total", "bytes", "By"),
+                ("dfkv_connector_op_latency_seconds_sum", "lat_sum", "s"),
+                ("dfkv_connector_op_latency_seconds_count", "lat_count", "1")):
+            meter.create_observable_counter(
+                name, callbacks=[self._client_op_callback(field)], unit=unit,
+                description="Native dfkv operation metric, connector-scoped")
+        meter.create_observable_counter(
+            "dfkv_connector_op_latency_seconds_bucket",
+            callbacks=[self._observe_client_op_buckets], unit="1",
+            description="Cumulative native operation latency bucket")
         meter.create_observable_gauge(
-            "dfkv_client_peer_latency_avg_seconds", callbacks=[self._observe_peer_avg],
-            unit="s", description="avg latency to each cache node, by peer")
-        meter.create_observable_gauge(
-            "dfkv_client_peer_latency_max_seconds", callbacks=[self._observe_peer_max],
-            unit="s", description="max latency to each cache node, by peer")
-        # unit="" (not "1"): a unit of "1" makes the OTel->Prometheus convention
-        # rename the gauge to dfkv_connector_info_ratio. Empty unit keeps the name.
+            "dfkv_connector_op_lifetime_max_seconds",
+            callbacks=[self._client_op_callback("max")], unit="s",
+            description="Lifetime native operation max")
+
+        for name, field, kind in (
+                ("dfkv_client_peer_latency_avg_seconds", "avg", "gauge"),
+                ("dfkv_client_peer_latency_max_seconds", "max", "gauge"),
+                ("dfkv_client_peer_latency_seconds_sum", "sum", "counter"),
+                ("dfkv_client_peer_latency_seconds_count", "count", "counter")):
+            factory = (meter.create_observable_counter
+                       if kind == "counter"
+                       else meter.create_observable_gauge)
+            factory(name, callbacks=[self._peer_callback(field)], unit="s"
+                    if field != "count" else "1",
+                    description="Native dfkv peer latency, by peer")
+
+        for source in _DEDUP_COUNTERS:
+            name = _client_status_export_name(source)
+            meter.create_observable_counter(
+                name, callbacks=[self._dedup_callback(source)], unit="1",
+                description="Native same-host rendezvous counter")
+
+        # unit="" (not "1"): an OTel unit of "1" may be translated to a
+        # Prometheus "_ratio" suffix. Empty unit preserves this identity metric.
         meter.create_observable_gauge(
             "dfkv_connector_info", callbacks=[self._observe_info], unit="",
             description="connector liveness/identity heartbeat (=1)")
+
+        for name, spec in _CLIENT_STATUS_SPECS.items():
+            factory = (meter.create_observable_counter
+                       if spec.kind == "counter"
+                       else meter.create_observable_gauge)
+            factory(name, callbacks=[self._status_callback(name)], unit="",
+                    description="Native dfkv client metric, connector-scoped")
+
+        meter.create_observable_gauge(
+            "dfkv_connector_client_stats_poll_success",
+            callbacks=[self._poll_callback("success")], unit="",
+            description="Whether the latest native snapshot poll succeeded")
+        meter.create_observable_gauge(
+            "dfkv_connector_client_stats_last_success_unixtime",
+            callbacks=[self._poll_callback("last_success_unixtime")], unit="s",
+            description="Unix time of the latest successful native snapshot poll")
+        meter.create_observable_counter(
+            "dfkv_connector_client_stats_poll_errors_total",
+            callbacks=[self._poll_callback("errors")], unit="1",
+            description="Failed native snapshot polls")
 
     def record(self, op_name, keys, nbytes, seconds, status):
         attrs = {"op": op_name}
@@ -435,22 +622,59 @@ class _OtelInstruments:
 
     def _observe_max(self, options):
         from opentelemetry.metrics import Observation
-        return [Observation(self._rec.take_max(o), {"op": o})
-                for o in self._rec.op_names()]
+        return [Observation(self._rec.take_max(op), {"op": op})
+                for op in self._rec.op_names()]
 
-    def _observe_peer_avg(self, options):
-        from opentelemetry.metrics import Observation
-        return [Observation(avg, {"peer": p})
-                for p, (avg, _mx) in self._rec.peer_latency_snapshot().items()]
+    def _client_op_callback(self, field):
+        def observe(options):
+            from opentelemetry.metrics import Observation
+            return [Observation(values[field], {"op": op})
+                    for op, values in self._rec.client_ops_snapshot().items()
+                    if field in values]
+        return observe
 
-    def _observe_peer_max(self, options):
+    def _observe_client_op_buckets(self, options):
         from opentelemetry.metrics import Observation
-        return [Observation(mx, {"peer": p})
-                for p, (_avg, mx) in self._rec.peer_latency_snapshot().items()]
+        return [
+            Observation(value, {"op": op, "le": le})
+            for op, values in self._rec.client_ops_snapshot().items()
+            for le, value in values.get("buckets", [])
+        ]
+
+    def _peer_callback(self, field):
+        def observe(options):
+            from opentelemetry.metrics import Observation
+            return [Observation(values[field], {"peer": peer})
+                    for peer, values in self._rec.peer_latency_snapshot().items()
+                    if field in values]
+        return observe
+
+    def _dedup_callback(self, source):
+        def observe(options):
+            from opentelemetry.metrics import Observation
+            values = self._rec.client_dedup_snapshot()
+            return ([Observation(values[source])]
+                    if source in values else [])
+        return observe
 
     def _observe_info(self, options):
         from opentelemetry.metrics import Observation
         return [Observation(1)]
+
+    def _status_callback(self, name):
+        def observe(options):
+            from opentelemetry.metrics import Observation
+            return [Observation(sample["value"], sample["labels"])
+                    for sample in self._rec.client_status_snapshot(name)]
+        return observe
+
+    def _poll_callback(self, field):
+        def observe(options):
+            from opentelemetry.metrics import Observation
+            values = self._rec.client_poll_snapshot()
+            return ([Observation(values[field])]
+                    if values.get("observed") else [])
+        return observe
 
 
 def _hostname() -> str:
@@ -458,6 +682,20 @@ def _hostname() -> str:
         return socket.gethostname()
     except Exception:
         return "unknown"
+def _resolved_protocol(endpoint: str, protocol: str) -> str:
+    if protocol:
+        return protocol.lower()
+    try:
+        candidate = endpoint if "://" in endpoint else "http://" + endpoint
+        parsed = urlsplit(candidate)
+        if parsed.port == 4318 or parsed.path.endswith((
+                "/v1/metrics", "/v1/traces")):
+            return "http/protobuf"
+    except ValueError:
+        pass
+    return "grpc"
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -466,22 +704,25 @@ def _hostname() -> str:
 
 _recorder = _NoopRecorder()  # type: ignore[assignment]
 _configured = False
+_users = 0
+_atexit_registered = False
 _cfg_lock = threading.Lock()
 
 
 def configure(cfg: Optional[dict] = None, connector_type: str = "",
               tp_rank: int = 0, model: str = "", version: str = "",
-              native_version: str = "", _readers=None) -> None:
-    """Initialize the push-metrics recorder (idempotent; first call wins).
+              native_version: str = "", deployment: str = "",
+              cache_role: str = "", team: str = "", _readers=None) -> None:
+    """Acquire the process-global push recorder; the first caller sets identity.
 
-    Call once from each connector's ``__init__``. When metrics are disabled this
-    leaves a frozen no-op recorder in place (zero cost). ``version`` (the
-    connector package version) and ``native_version`` (the linked libdfkv.so,
-    from the C ``dfkv_version()``) become the ``dfkv_version`` /
-    ``dfkv_native_version`` labels. ``_readers`` is a test-only seam to inject
-    metric readers in place of the OTLP exporter."""
-    global _recorder, _configured
+    Every connector construction acquires one lifecycle reference, including
+    when telemetry is disabled. ``release`` drops it; the last release performs
+    the final export and allows a later connector in the same process to
+    reconfigure cleanly.
+    """
+    global _recorder, _configured, _users, _atexit_registered
     with _cfg_lock:
+        _users += 1
         if _configured:
             return
         _configured = True
@@ -490,20 +731,42 @@ def configure(cfg: Optional[dict] = None, connector_type: str = "",
             _recorder = _NoopRecorder()
             return
         connector_id = config.resolve_connector_id(cfg, tp_rank)
-        endpoint = str(config.resolve(cfg, "otlp_endpoint", config.ENV_OTLP_ENDPOINT, "")).strip()
-        protocol = str(config.resolve(cfg, "otlp_protocol", config.ENV_OTLP_PROTOCOL, "")).strip()
+        endpoint = str(config.resolve(
+            cfg, "otlp_endpoint", config.ENV_OTLP_ENDPOINT, "")).strip()
+        protocol = str(config.resolve(
+            cfg, "otlp_protocol", config.ENV_OTLP_PROTOCOL, "")).strip()
+        model = str(model or config.resolve(
+            cfg, "model", config.ENV_MODEL, "")).strip()
+        deployment = str(deployment or config.resolve(
+            cfg, "deployment", config.ENV_DEPLOYMENT, "")).strip()
+        cache_role = str(cache_role or config.resolve(
+            cfg, "cache_role", config.ENV_CACHE_ROLE, "")).strip()
+        team = str(team or config.resolve(
+            cfg, "team", config.ENV_TEAM, "")).strip()
         try:
             interval_ms = int(config.resolve(
-                cfg, "metrics_export_interval_ms", config.ENV_EXPORT_INTERVAL_MS, 10000))
+                cfg, "metrics_export_interval_ms",
+                config.ENV_EXPORT_INTERVAL_MS, 10000))
         except (TypeError, ValueError):
             interval_ms = 10000
         exporter = str(config.resolve(
             cfg, "metrics_exporter", config.ENV_METRICS_EXPORTER,
             config.EXPORTER_STDLIB)).lower()
-        _recorder = _Recorder(connector_type, connector_id, tp_rank, model,
-                              endpoint, interval_ms, protocol, readers=_readers,
-                              version=version, native_version=native_version,
-                              exporter=exporter)
+        try:
+            _recorder = _Recorder(
+                connector_type, connector_id, tp_rank, model, deployment,
+                cache_role, team, endpoint, interval_ms, protocol,
+                readers=_readers, version=version,
+                native_version=native_version, exporter=exporter)
+        except Exception as exc:
+            warnings.warn(
+                "dfkv metrics initialization failed; connector will continue "
+                "without telemetry: {}".format(exc),
+                RuntimeWarning, stacklevel=2)
+            _recorder = _NoopRecorder()
+        if not _atexit_registered:
+            atexit.register(shutdown)
+            _atexit_registered = True
 
 
 def op(op_name: str, num_keys: int = 0, num_bytes: int = 0):
@@ -659,11 +922,35 @@ def parse_client_dedup(text: str) -> dict:
     return out
 
 
+def parse_client_status(text: str) -> list:
+    """Bounded native ring/MDS/peer/RDMA/MR samples for connector OTLP.
+
+    The shared parser rejects unknown metrics, labels, non-finite values, and
+    negatives. Dedicated op/dedup/latency forwarders remain the single source
+    for those families, avoiding duplicate OTLP metric names.
+    """
+    out = []
+    for sample in parse_snapshot(text or ""):
+        if not _is_client_status_metric(sample.name):
+            continue
+        spec = CLIENT_METRIC_SPECS[sample.name]
+        out.append({
+            "name": _client_status_export_name(sample.name),
+            "kind": sample.kind,
+            "labels": dict(zip(spec.labels, sample.labels)),
+            "value": sample.value,
+        })
+    return out
+
+
 class PeerLatencyPoller:
-    """Sleeping daemon thread: polls the C client's metrics snapshot, computes a
-    windowed avg (delta-sum / delta-count) + lifetime max per peer, AND forwards
-    the per-op metrics (dfkv_client_op_*) so all connectors report their full
-    request mix from the one C++ chokepoint. Off the request hot path."""
+    """Poll one complete C snapshot off-path and forward bounded metrics.
+
+    Per-peer averages are windowed; peer sum/count, operations, dedup, and
+    ring/MDS/transport/RDMA/MR samples retain native cumulative/gauge semantics.
+    Poll failures preserve the last good samples and update explicit health
+    series so stale data cannot look current.
+    """
 
     def __init__(self, get_text, recorder, interval_s=10.0):
         self._get_text = get_text
@@ -674,24 +961,47 @@ class PeerLatencyPoller:
         self._thread = None
 
     def poll_once(self):
-        text = self._get_text() or ""
-        # Forward the per-op metrics (computed once in C++) over OTLP, with this
-        # connector's identity. Absolute/cumulative — no windowing needed.
-        self._rec.update_client_ops(parse_client_ops(text))
-        self._rec.update_client_dedup(parse_client_dedup(text))
-        stats = parse_peer_latency(text)
-        result = {}
-        for peer, d in stats.items():
-            s = d.get("sum", 0.0)
-            c = d.get("count", 0.0)
-            mx = d.get("max", 0.0)
-            ls, lc = self._last.get(peer, (0.0, 0.0))
-            ds, dc = s - ls, c - lc
-            avg = (ds / dc) if dc > 0 else (s / c if c > 0 else 0.0)
-            self._last[peer] = (s, c)
-            result[peer] = (avg, mx)
-        self._rec.update_peer_latency(result)
-        return result
+        try:
+            text = self._get_text() or ""
+            client_ops = parse_client_ops(text)
+            dedup = parse_client_dedup(text)
+            status = parse_client_status(text)
+            stats = parse_peer_latency(text)
+            if not (client_ops or dedup or status or stats):
+                raise ValueError("native client metrics snapshot was empty or invalid")
+
+            result = {}
+            for peer, values in stats.items():
+                total = values.get("sum", 0.0)
+                count = values.get("count", 0.0)
+                maximum = values.get("max", 0.0)
+                last_total, last_count = self._last.get(peer, (0.0, 0.0))
+                delta_total = total - last_total
+                delta_count = count - last_count
+                average = (delta_total / delta_count
+                           if delta_count > 0
+                           else total / count if count > 0 else 0.0)
+                result[peer] = {
+                    "avg": average,
+                    "max": maximum,
+                    "sum": total,
+                    "count": count,
+                }
+
+            # Publish only after every parser and derived calculation succeeds.
+            self._rec.update_client_ops(client_ops)
+            self._rec.update_client_dedup(dedup)
+            self._rec.update_client_status(status)
+            self._rec.update_peer_latency(result)
+            self._last = {
+                peer: (values.get("sum", 0.0), values.get("count", 0.0))
+                for peer, values in stats.items()
+            }
+            self._rec.record_client_poll(True)
+            return result
+        except Exception:
+            self._rec.record_client_poll(False)
+            raise
 
     def _loop(self):
         while not self._stop.wait(self._interval):
@@ -741,24 +1051,49 @@ def snapshot() -> dict:
     return _recorder.snapshot()
 
 
-def shutdown() -> None:
-    global _peer_poller
-    if _peer_poller is not None:
-        _peer_poller.stop()
+def _stop_state(recorder, poller, *, flush=True) -> None:
+    if poller is not None:
+        poller.stop()
+    recorder.shutdown(flush=flush)
+
+def release() -> None:
+    """Release one connector's telemetry lifecycle reference."""
+    global _recorder, _configured, _users, _peer_poller
+    with _cfg_lock:
+        if _users <= 0:
+            return
+        _users -= 1
+        if _users:
+            return
+        recorder, poller = _recorder, _peer_poller
+        _recorder = _NoopRecorder()
         _peer_poller = None
-    _recorder.shutdown()
+        _configured = False
+    _stop_state(recorder, poller)
+
+
+def shutdown() -> None:
+    """Force process-wide shutdown (the atexit path)."""
+    global _recorder, _configured, _users, _peer_poller
+    with _cfg_lock:
+        recorder, poller = _recorder, _peer_poller
+        _recorder = _NoopRecorder()
+        _peer_poller = None
+        _configured = False
+        _users = 0
+    _stop_state(recorder, poller)
 
 
 def _reset_for_test() -> None:
-    """Test seam: drop config + recorder so a test can reconfigure from env."""
-    global _recorder, _configured, _peer_poller
+    """Test seam: reset without a network final-export side effect."""
+    global _recorder, _configured, _users, _peer_poller
     with _cfg_lock:
-        if _peer_poller is not None:
-            _peer_poller.stop()
-            _peer_poller = None
-        try:
-            _recorder.shutdown()
-        except Exception:
-            pass
+        recorder, poller = _recorder, _peer_poller
         _recorder = _NoopRecorder()
+        _peer_poller = None
         _configured = False
+        _users = 0
+    try:
+        _stop_state(recorder, poller, flush=False)
+    except Exception:
+        pass

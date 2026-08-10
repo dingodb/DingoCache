@@ -24,19 +24,21 @@ dfkv 把**控制面**与**数据面**解耦：
 
 ---
 
-## 1. 构建可移植产物（同架构构建机一次）
+## 1. 构建可移植 release 产物（同架构构建机一次）
 
-> **产物清单**（含 MDS 新增二进制）：`build/dfkv_server`、`build/dfkv_mds`、
-> `build/libdfkv.so`、`build/dfkv_smoke`、`build/dfkvctl`、`build/dfkv_bench`。
+> v2.11.0 的 canonical Linux 交付是一个自包含 tarball，含 versioned
+> `libdfkv.so`/SONAME symlink、全部 CLI/daemon、Python shim、connector 源码、
+> deploy 工具和文档。不要从 build tree 手工挑文件。
 
 ```bash
-git clone git@github.com:ketor/dfkv.git && cd dfkv
+git clone https://github.com/dingodb/DingoCache.git && cd DingoCache
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-      -DDFKV_WITH_RDMA=ON -DDFKV_STATIC_LIBSTDCXX=ON      # RDMA + 跨发行版可移植
+      -DDFKV_WITH_RDMA=ON -DDFKV_WITH_URING=ON \
+      -DDFKV_STATIC_LIBSTDCXX=ON
 cmake --build build -j
-# 产物：build/dfkv_server  build/dfkv_mds  build/libdfkv.so
-#        build/dfkv_smoke  build/dfkvctl  build/dfkv_bench
-ldd build/dfkv_server | grep ibverbs                      # 确认链接了 RDMA 库
+deploy/package_release.sh build release
+tar tzf "release/dfkv-$(cat VERSION)-linux-x86_64.tar.gz"
+ldd build/libdfkv.so | grep ibverbs
 ```
 依赖：`libibverbs-dev`（构建期）+ 运行节点装 `rdma-core`。无 RDMA 也可去掉 `-DDFKV_WITH_RDMA` 构建纯 TCP 版。
 > QP 信息走 TCP bootstrap 交换（非 librdmacm），所以只依赖 libibverbs，不需要 librdmacm。
@@ -45,21 +47,27 @@ ldd build/dfkv_server | grep ibverbs                      # 确认链接了 RDMA
 > [CACHELIB_EVALUATION.md](CACHELIB_EVALUATION.md)。
 
 
-> ⚠️ **glibc 下限 = 构建机的 glibc**。在新发行版（如 Ubuntu 24.04 / glibc 2.39）上构建的二进制，拿到老节点（glibc 2.35）会 `version GLIBC_2.3x not found` 起不来。
-> **要部署到 glibc 2.35 的节点（如目标 GPU 节点），就在 glibc ≤ 2.35 的环境构建**（Ubuntu 22.04 / RHEL9）。仓库根的 `Dockerfile` 已固定 `ubuntu:22.04` + RDMA + 静态 libstdc++，**一次构建、glibc≥2.35 处处可跑**：
-> ```bash
-> docker build -t dfkv-build --target build . && id=$(docker create dfkv-build) && docker cp $id:/out ./dist && docker rm $id   # dist/bin/* dist/lib/libdfkv.so
-> ```
-> `DFKV_STATIC_LIBSTDCXX` 把 libstdc++/libgcc 静态进产物（这些不是 glibc）；libibverbs 无法静态（运行时 dlopen 驱动），运行节点仍需装 rdma-core。
+> ⚠️ **glibc 下限 = 构建机的 glibc**。在 Ubuntu 24.04 / glibc 2.39
+> 直接构建的二进制不能部署到 glibc 2.35。CI 的 portable job 和仓库根
+> `Dockerfile` 都固定 Ubuntu 22.04 + RDMA + 静态 libstdc++，并构建同一
+> canonical tarball。`DFKV_STATIC_LIBSTDCXX` 只静态链接 libstdc++/libgcc；
+> libibverbs 仍动态加载 provider，运行节点必须安装 rdma-core。
 
 ## 2. 每节点：分发 + 缓存目录
 
 ```bash
-install -m755 build/dfkv_server /usr/local/bin/dfkv_server
-install -m755 build/libdfkv.so  /usr/local/lib/ && ldconfig
-mkdir -p /mnt/disk1/dfkv /mnt/disk2/dfkv /mnt/disk3/dfkv   # 与现网 dingo-cache 子目录错开
+version=2.11.0
+tar xzf "dfkv-${version}-linux-x86_64.tar.gz"
+root="$PWD/dfkv-${version}-linux-x86_64"
+install -m755 "$root/bin/dfkv_server" /usr/local/bin/dfkv_server
+cp -a "$root"/lib/libdfkv.so* /usr/local/lib/
+ldconfig
+mkdir -p /mnt/disk1/dfkv /mnt/disk2/dfkv /mnt/disk3/dfkv
 ```
-容量隔离：`--cap`（总量，按盘均分）自带 LRU 自限；设保守值，确认 `现网用量 + dfkv cap + 预留 < 物理总量`。
+`cp -a` 必须保留 `libdfkv.so -> libdfkv.so.<major> -> libdfkv.so.<version>`
+两级 symlink；只拷贝一个被解引用的文件会破坏 ELF SONAME 查找。
+容量隔离：`--cap`（总量，按盘均分）自带 LRU 自限；设保守值，确认
+`现网用量 + dfkv cap + 预留 < 物理总量`。
 
 ## 2b. MDS 层：etcd + dfkv_mds
 
@@ -481,12 +489,11 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `DFKV_READ_COALESCE` | `0` | TCP 端读 convoy 合并主开关（见 README Recommended tuning 表） |
 | `DFKV_READ_COALESCE_RECUR_MS` | `1000` | 复制重现窗口（copy fingerprint 64 字节） |
 | `DFKV_READ_COALESCE_TIMEOUT_MS` | `500` | follower 等待 leader 上限 |
-| `DFKV_READ_MAX_CONNS` | — | 服务端为单 key convoy read 准备的承接连接数 |
-| `DFKV_READ_SHARD_KEYS` | — | convoy convoy 锁分片数 |
+| `DFKV_READ_MAX_CONNS` | `8` | client 每节点并行 read-shard 连接上限；server 不读取 |
+| `DFKV_READ_SHARD_KEYS` | `16` | client 每个 read shard 的目标 key 数；server 不读取 |
 | `DFKV_MDS_IO_TIMEOUT_S` | `60` | MDS 控制面帧读写超时（MDS 进程该） |
 | `DFKV_MDS_ETCD_PROBE_MS` | `30000` | MDS 与 etcd 存活探测窗（MDS 进程该） |
 | `DFKV_TENANT_QUOTAS_COUNT` | — | tenant 配额文件预期条数（容量校验） |
-| `DFKV_BENCH_STALL_MS` | — | dfkv_bench 的连续性门槛（仅 bench 读） |
 
 #### 未收录的常见误配 → 详见 CONNECTORS.md §1.7
 
@@ -653,6 +660,10 @@ Rollback trigger and procedure:
 6. 在**一个受控 SGLang 副本**上切 `dynamic` 后端，发共享长前缀请求看命中上涨，确认后推广。
 
 ### 5b. 候选版本负载回归门
+`DFKV_BENCH_STALL_MS=<毫秒>` 只由 `dfkv_bench` 读取；超过阈值的 GET batch
+会带 wall-clock 时间戳写 stderr，便于和 server/NVMe/IB 指标对齐。它不是
+`dfkv_server` 环境变量。
+
 
 `deploy/dfkv_load_regression.py` 对 baseline/candidate 使用完全相同的 size/count/
 threads/batch/transport 环境，先 warmup，再各跑多轮 `dfkv_bench --op both`。吞吐对

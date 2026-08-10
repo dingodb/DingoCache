@@ -82,6 +82,50 @@ def test_constructs_fully_configured_v2_client(monkeypatch):
     assert captured["close_calls"] == 1
 
 
+def test_telemetry_setup_failure_releases_handle_and_lifecycle(monkeypatch):
+    calls = []
+
+    class FakeLib:
+        def dfkv_open_v2(self, _ptr):
+            return 0xCAFE
+
+        def dfkv_transport_mode(self, _handle):
+            return b"rdma"
+
+        def dfkv_version(self):
+            return b"2.0.0"
+
+        def dfkv_close(self, handle):
+            calls.append(("close", handle))
+
+    def fail_metrics(*_args, **_kwargs):
+        calls.append(("metrics-configure",))
+        raise ValueError("bad telemetry identity")
+
+    monkeypatch.setattr(client_module, "load_lib", lambda _path: FakeLib())
+    monkeypatch.setattr(client_module._push_metrics, "configure", fail_metrics)
+    monkeypatch.setattr(
+        client_module._push_metrics, "release",
+        lambda: calls.append(("metrics-release",)))
+    monkeypatch.setattr(
+        client_module._push_tracing, "release",
+        lambda: calls.append(("tracing-release",)))
+    monkeypatch.setattr(client_module._hot_config, "stop", lambda: None)
+
+    with pytest.raises(ValueError, match="bad telemetry identity"):
+        DfkvDeviceClient(
+            members="n1=127.0.0.1:28001",
+            key_namespace=b"dfkv/model/v1/telemetry-failure",
+        )
+
+    assert calls == [
+        ("metrics-configure",),
+        ("close", 0xCAFE),
+        ("metrics-release",),
+        ("tracing-release",),
+    ]
+
+
 def test_rejects_and_closes_tcp_handle_before_connector_startup(monkeypatch):
     calls = []
 

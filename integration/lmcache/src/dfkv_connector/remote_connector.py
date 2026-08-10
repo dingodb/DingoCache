@@ -120,6 +120,7 @@ class DfkvConnector(RemoteConnector):
                 key_namespace=namespace,
                 tp_size=world_size,
                 tp_rank=worker_id,
+                model=model_identity,
                 lib_path=lib_path,
                 mds_poll_ms=mds_poll_ms,
                 rdma_pools=rdma_pools,

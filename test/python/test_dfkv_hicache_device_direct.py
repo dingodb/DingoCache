@@ -462,8 +462,11 @@ class TestDeviceDirectEndToEnd(unittest.TestCase):
             p.terminate()
             try:
                 p.wait(timeout=5)
-            except Exception:
+            except subprocess.TimeoutExpired:
                 p.kill()
+                p.wait(timeout=5)
+            if p.stdout is not None:
+                p.stdout.close()
         for d in cls.dirs:
             shutil.rmtree(d, ignore_errors=True)
 

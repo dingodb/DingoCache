@@ -36,6 +36,8 @@ import os
 import random
 import threading
 import time
+import warnings
+from urllib.parse import urlsplit
 from typing import Any, Optional
 
 from . import config, otlp_traces
@@ -151,13 +153,17 @@ class _Tracer:
     enabled = True
 
     def __init__(self, connector_type: str, connector_id: str, tp_rank: int,
-                 model: str, endpoint: str, slow_ms: float, sample_percent: float,
+                 model: str, deployment: str, cache_role: str, team: str,
+                 endpoint: str, slow_ms: float, sample_percent: float,
                  interval_ms: int, max_spans: int, version: str = "",
                  native_version: str = "", exporter=None):
         self.connector_type = connector_type
         self.connector_id = connector_id
         self.tp_rank = int(tp_rank)
         self.model = model
+        self.deployment = deployment
+        self.cache_role = cache_role
+        self.team = team
         self.pid = os.getpid()
         self.version = version or ""
         self.native_version = native_version or ""
@@ -221,20 +227,29 @@ class _Tracer:
 
 _tracer = _NoopTracer()  # type: ignore[assignment]
 _configured = False
+_users = 0
+_atexit_registered = False
 _cfg_lock = threading.Lock()
+
+
+def _grpc_target(endpoint: str, protocol: str) -> bool:
+    if "grpc" in (protocol or "").lower():
+        return True
+    try:
+        candidate = endpoint if "://" in endpoint else "http://" + endpoint
+        return urlsplit(candidate).port == 4317
+    except ValueError:
+        return False
 
 
 def configure(cfg: Optional[dict] = None, connector_type: str = "",
               tp_rank: int = 0, model: str = "", version: str = "",
-              native_version: str = "", _exporter=None) -> None:
-    """Initialize the tracer (idempotent; first call wins).
-
-    Call once from each connector's ``__init__`` (next to ``metrics.configure``).
-    When tracing is disabled this leaves a frozen no-op tracer in place (zero cost).
-    ``_exporter`` is a test-only seam to inject a span sink in place of the OTLP
-    pusher."""
-    global _tracer, _configured
+              native_version: str = "", deployment: str = "",
+              cache_role: str = "", team: str = "", _exporter=None) -> None:
+    """Acquire the process-global tracer; first caller sets its identity."""
+    global _tracer, _configured, _users, _atexit_registered
     with _cfg_lock:
+        _users += 1
         if _configured:
             return
         _configured = True
@@ -243,21 +258,61 @@ def configure(cfg: Optional[dict] = None, connector_type: str = "",
             _tracer = _NoopTracer()
             return
         connector_id = config.resolve_connector_id(cfg, tp_rank)
-        endpoint = str(config.resolve(
+        generic_endpoint = str(config.resolve(
             cfg, "otlp_endpoint", config.ENV_OTLP_ENDPOINT, "")).strip()
+        endpoint = str(config.resolve(
+            cfg, "trace_otlp_endpoint", config.ENV_TRACE_OTLP_ENDPOINT,
+            "")).strip()
+        protocol = str(config.resolve(
+            cfg, "otlp_protocol", config.ENV_OTLP_PROTOCOL, "")).strip()
+        if not endpoint:
+            endpoint = generic_endpoint
+        if _exporter is None and _grpc_target(endpoint, protocol):
+            warnings.warn(
+                "dfkv trace exporter requires OTLP/HTTP; the selected trace "
+                "endpoint/protocol is gRPC. Set DFKV_TRACE_OTLP_ENDPOINT to "
+                "the Collector HTTP receiver (normally :4318).",
+                RuntimeWarning, stacklevel=2)
+            _tracer = _NoopTracer()
+            if not _atexit_registered:
+                atexit.register(shutdown)
+                _atexit_registered = True
+            return
+        model = str(model or config.resolve(
+            cfg, "model", config.ENV_MODEL, "")).strip()
+        deployment = str(deployment or config.resolve(
+            cfg, "deployment", config.ENV_DEPLOYMENT, "")).strip()
+        cache_role = str(cache_role or config.resolve(
+            cfg, "cache_role", config.ENV_CACHE_ROLE, "")).strip()
+        team = str(team or config.resolve(
+            cfg, "team", config.ENV_TEAM, "")).strip()
         slow_ms = _to_float(config.resolve(
-            cfg, "trace_slow_request_ms", config.ENV_TRACE_SLOW_REQUEST_MS, 1000), 1000.0)
+            cfg, "trace_slow_request_ms",
+            config.ENV_TRACE_SLOW_REQUEST_MS, 1000), 1000.0)
         sample_percent = _to_float(config.resolve(
-            cfg, "trace_sample_percent", config.ENV_TRACE_SAMPLE_PERCENT, 0), 0.0)
+            cfg, "trace_sample_percent",
+            config.ENV_TRACE_SAMPLE_PERCENT, 0), 0.0)
         interval_ms = _to_int(config.resolve(
-            cfg, "trace_export_interval_ms", config.ENV_TRACE_EXPORT_INTERVAL_MS, 5000), 5000)
+            cfg, "trace_export_interval_ms",
+            config.ENV_TRACE_EXPORT_INTERVAL_MS, 5000), 5000)
         max_spans = _to_int(config.resolve(
-            cfg, "trace_max_buffered_spans", config.ENV_TRACE_MAX_BUFFERED_SPANS, 2048), 2048)
-        _tracer = _Tracer(connector_type, connector_id, tp_rank, model, endpoint,
-                          slow_ms, sample_percent, interval_ms, max_spans,
-                          version=version, native_version=native_version,
-                          exporter=_exporter)
-        atexit.register(shutdown)
+            cfg, "trace_max_buffered_spans",
+            config.ENV_TRACE_MAX_BUFFERED_SPANS, 2048), 2048)
+        try:
+            _tracer = _Tracer(
+                connector_type, connector_id, tp_rank, model, deployment,
+                cache_role, team, endpoint, slow_ms, sample_percent,
+                interval_ms, max_spans, version=version,
+                native_version=native_version, exporter=_exporter)
+        except Exception as exc:
+            warnings.warn(
+                "dfkv tracing initialization failed; connector will continue "
+                "without tracing: {}".format(exc),
+                RuntimeWarning, stacklevel=2)
+            _tracer = _NoopTracer()
+        if not _atexit_registered:
+            atexit.register(shutdown)
+            _atexit_registered = True
 
 
 def span(op_name: str, num_keys: int = 0):
@@ -269,17 +324,35 @@ def is_enabled() -> bool:
     return _tracer.enabled
 
 
+def release() -> None:
+    """Release one connector's tracing lifecycle reference."""
+    global _tracer, _configured, _users
+    with _cfg_lock:
+        if _users <= 0:
+            return
+        _users -= 1
+        if _users:
+            return
+        tracer = _tracer
+        _tracer = _NoopTracer()
+        _configured = False
+    tracer.shutdown()
+
+
 def shutdown() -> None:
-    _tracer.shutdown()
+    """Force process-wide shutdown (the atexit path)."""
+    global _tracer, _configured, _users
+    with _cfg_lock:
+        tracer = _tracer
+        _tracer = _NoopTracer()
+        _configured = False
+        _users = 0
+    tracer.shutdown()
 
 
 def _reset_for_test() -> None:
     """Test seam: drop config + tracer so a test can reconfigure from env."""
-    global _tracer, _configured
-    with _cfg_lock:
-        try:
-            _tracer.shutdown()
-        except Exception:
-            pass
-        _tracer = _NoopTracer()
-        _configured = False
+    try:
+        shutdown()
+    except Exception:
+        pass
