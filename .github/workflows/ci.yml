@@ -79,10 +79,10 @@ jobs:
         run: |
           docker compose -f deploy/observability/docker-compose.yml config -q
           docker run --rm \
-            -v "$PWD/deploy/observability:/etc/dfkv-observability:ro" \
+            -v "$PWD/deploy/observability:/etc/prometheus:ro" \
             --entrypoint promtool \
             docker.m.daocloud.io/prom/prometheus@sha256:508729e0e2d18e11fd742a5a5ca70e557b940a93948c3c95fd0123a6fd538b69 \
-            check config /etc/dfkv-observability/prometheus.yml
+            check config /etc/prometheus/prometheus.yml
           docker run --rm \
             -v "$PWD/deploy/observability:/etc/dfkv-observability:ro" \
             docker.m.daocloud.io/otel/opentelemetry-collector-contrib@sha256:c5918f78992ee73b0d6f0e599423ac5ec52dd5d9726733114d6eca53d5a32ed5 \
