@@ -283,7 +283,8 @@ fabric selection and capacity explicit.
 | `DFKV_RDMA_DEPTH` | `4` (default) | Keep client/server defaults aligned for connector batch correctness. Throughput scaling comes from multiple pooled connections, not raising one QP's depth; lowering depth reduces receive-segment consumption only after validating the real engine workload. |
 | `DFKV_RDMA_KEEPALIVE_MS` | `15000` (default); `0` = off | Sends lightweight membership probes over every idle pooled QP. Live clients keep their QPs and avoid first-GET reconnect tails; exited clients send no probes and remain reclaimable. Keep the interval strictly below the server reap interval. |
 | `DFKV_RDMA_POOL_MAX` | `16` (default) | Maximum idle QPs retained per server and per lane, across all rails. It is not a process-wide connection cap. Raise only when connection-open metrics grow on repeated steady-state rounds; each retained QP leases `depth × align4K(4096 + declared_max_block)` from the server receive segment. |
-| `DFKV_FANOUT_THREADS` | unset (default 32) | Only wide single-process clients (benchmarks, many concurrent Batch* callers) need more. |
+| `DFKV_FANOUT_THREADS` | unset (default 32) | Bounds TCP batch, RDMA write, and compatibility helpers; RDMA reads use the separate bounded scheduler below. |
+| `DFKV_RDMA_READ_WORKERS` | `7` (default) | Process-wide hard cap for active RDMA GET/GET-Auto/SG-GET/Exist shards across every client handle. Concurrent batches advance round-robin. Seven workers replace the legacy executor's seven helpers per rank without adding a thread; unlike the legacy caller-participates path, active read QPs cannot grow with concurrent callers. Raise only when an A/B proves seven active depth-four QPs cannot saturate the target fabric. |
 
 **Read-side convoy collapse and direct promotion (opt-in)** — for MLA + TP-N
 inference rings, where every rank is a separate process fetching the SAME page

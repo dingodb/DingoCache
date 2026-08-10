@@ -478,8 +478,9 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | env | 默认 | 说明 |
 |---|---|---|
 | `DFKV_LOG` | `INFO` | log level |
-| `DFKV_FANOUT_THREADS` | `32` | client 批量 fan-out 线程数（**worker 侧 dfkv client**；大广播/高并发时增） |
-| `DFKV_BATCH_CONCURRENCY` | `0`=auto（auto: `min(max(nodes, 8), 32)`） | batch 分段并发度（**worker 侧**）。auto 模式：每节点 1 个 worker，但**下限 8**（单节点环也获得 8 路并行），上限 32。显式设 >0 则固定值。**单节点环必开 auto 或 ≥8**（否则串行，PUT/GET 仅 0.9 GB/s vs 45 GB/s RDMA 带宽） |
+| `DFKV_FANOUT_THREADS` | `32` | TCP batch、RDMA write 和兼容路径共用的 process-wide helper 上限；RDMA read 不再使用该线程池 |
+| `DFKV_RDMA_READ_WORKERS` | `7` | process-wide RDMA GET/GET-Auto/SG-GET/Exist shard worker 硬上限；替换旧 executor 每 rank 的 7 个 helper，不增加线程。caller 不参与执行，因此并发 batch 不能继续推高活跃 read QP；batch 间按 shard round-robin |
+| `DFKV_BATCH_CONCURRENCY` | `0`=auto（auto: `min(max(nodes, 8), 32)`） | TCP/write/兼容路径的 batch 分段并发度。RDMA read 的实际 process-wide 并发由 `DFKV_RDMA_READ_WORKERS` 限制 |
 | `DFKV_GET_MISS_RETRIES` | `1` | client GET miss 后发重试次数 |
 | `DFKV_PROBE_INTERVAL_MS` | `0`=关 | client 对 server 的主动健康 probe 间隔 |
 | `DFKV_PEER_COOLDOWN_MS` | `2000` | PeerHealth endpoint 快速回避窗口 |
