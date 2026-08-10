@@ -68,10 +68,13 @@ class ClientMetricsTest(unittest.TestCase):
         self.assertEqual(
             delta.totals(), {"dfkv_client_io_errors_total": 2.0})
 
-    def test_parser_accepts_bounded_tcp_pool_metrics(self):
+    def test_parser_accepts_bounded_transport_metrics(self):
         samples = parse_snapshot(
             'dfkv_transport_pool_retirements_total{reason="idle"} 4\n'
             'dfkv_transport_pool_connections 3\n'
+            'dfkv_rdma_client_keepalive_attempts_total 9\n'
+            'dfkv_rdma_client_keepalive_successes_total 8\n'
+            'dfkv_rdma_client_keepalive_failures_total 1\n'
         )
         self.assertEqual(
             [(sample.name, sample.labels, sample.value)
@@ -79,6 +82,9 @@ class ClientMetricsTest(unittest.TestCase):
             [
                 ("dfkv_transport_pool_retirements_total", ("idle",), 4.0),
                 ("dfkv_transport_pool_connections", (), 3.0),
+                ("dfkv_rdma_client_keepalive_attempts_total", (), 9.0),
+                ("dfkv_rdma_client_keepalive_successes_total", (), 8.0),
+                ("dfkv_rdma_client_keepalive_failures_total", (), 1.0),
             ],
         )
 
