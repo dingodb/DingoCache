@@ -68,6 +68,40 @@ int Dial(const KvNodeServer& server) {
 }
 }  // namespace
 
+TEST(KvNodeServerConfig, WriteBackDefaultsToRamAckAndDiskCanOverride) {
+  ScopedEnv engine("DFKV_STORE_ENGINE", "file");
+  ScopedEnv ram_tier("DFKV_RAM_TIER", "1");
+  ScopedEnv ram_bytes("DFKV_RAM_TIER_BYTES", "1048576");
+  ScopedEnv extent_bytes("DFKV_RAM_TIER_EXTENT_BYTES", "1048576");
+  ScopedEnv write_mode("DFKV_RAM_WRITE_MODE", "writeback");
+
+  {
+    ScopedEnv ack_mode("DFKV_PUT_ACK_MODE", "");
+    auto server = StartServer("ram_ack_default");
+    EXPECT_TRUE(server->ram_ack_enabled());
+    server->Stop();
+  }
+  {
+    ScopedEnv ack_mode("DFKV_PUT_ACK_MODE", "disk");
+    auto server = StartServer("disk_ack_override");
+    EXPECT_FALSE(server->ram_ack_enabled());
+    server->Stop();
+  }
+}
+
+TEST(KvNodeServerConfig, WriteAroundDoesNotDefaultToRamAck) {
+  ScopedEnv engine("DFKV_STORE_ENGINE", "file");
+  ScopedEnv ram_tier("DFKV_RAM_TIER", "1");
+  ScopedEnv ram_bytes("DFKV_RAM_TIER_BYTES", "1048576");
+  ScopedEnv extent_bytes("DFKV_RAM_TIER_EXTENT_BYTES", "1048576");
+  ScopedEnv write_mode("DFKV_RAM_WRITE_MODE", "writearound");
+  ScopedEnv ack_mode("DFKV_PUT_ACK_MODE", "");
+
+  auto server = StartServer("writearound_ack_default");
+  EXPECT_FALSE(server->ram_ack_enabled());
+  server->Stop();
+}
+
 TEST(KvNodeServerListener, SaturationRejectsBeyondHandlerLimit) {
   ScopedEnv engine("DFKV_STORE_ENGINE", "file");
   ScopedEnv max_connections("DFKV_TCP_MAX_CONNS", "2");
