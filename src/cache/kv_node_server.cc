@@ -181,6 +181,9 @@ void KvNodeServer::InitRamTier() {
   // via O_DIRECT -- a buffered flush would route the RAM tier's entire write
   // volume back through the page cache, defeating the tier's purpose of keeping
   // memory use bounded and explicit on GPU nodes.
+  ram_flush_disks_.reserve(group_.DiskCount());
+  for (size_t i = 0; i < group_.DiskCount(); ++i)
+    ram_flush_disks_.push_back(std::make_unique<RamFlushDiskMetrics>());
   auto tier = std::make_unique<RamTier>(
       o, [this](const BlockKey& k, char* d, size_t l, size_t cap) {
         return group_.CacheDirect(k, d, l, cap) == Status::kOk;
@@ -192,7 +195,17 @@ void KvNodeServer::InitRamTier() {
     b.reserve(items.size());
     for (const auto& it : items)
       b.push_back(StoreEngine::CacheBatchItem{it.key, it.data, it.len, it.cap});
-    std::vector<Status> sts = group_.CacheDirectBatch(b);
+    std::vector<Status> sts = group_.CacheDirectBatch(
+        b, [this](size_t disk, size_t objects, uint64_t bytes,
+                  size_t failures, double seconds) {
+          if (disk >= ram_flush_disks_.size()) return;
+          auto& m = *ram_flush_disks_[disk];
+          m.batches.fetch_add(1, std::memory_order_relaxed);
+          m.objects.fetch_add(objects, std::memory_order_relaxed);
+          m.bytes.fetch_add(bytes, std::memory_order_relaxed);
+          m.failures.fetch_add(failures, std::memory_order_relaxed);
+          m.latency.Observe(seconds);
+        });
     std::vector<bool> ok(items.size(), false);
     for (size_t i = 0; i < sts.size(); ++i) ok[i] = (sts[i] == Status::kOk);
     return ok;
@@ -255,6 +268,22 @@ void KvNodeServer::Stop() {
   }
   for (int fd : fds) ::shutdown(fd, SHUT_RDWR);
   for (auto& c : conns) if (c.th.joinable()) c.th.join();
+  if (ram_) {
+    uint64_t timeout_seconds = 30;
+    if (const char* value =
+            std::getenv("DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S")) {
+      const unsigned long parsed = std::strtoul(value, nullptr, 10);
+      if (parsed <= 3600) timeout_seconds = parsed;
+    }
+    const bool drained = ram_->WaitForDrain(
+        std::chrono::seconds(timeout_seconds));
+    if (!drained) {
+      DFKV_LOG_WARN("RAM shutdown drain timed out after " +
+                    std::to_string(timeout_seconds) + "s with " +
+                    std::to_string(ram_->DirtyObjects()) +
+                    " dirty objects; destructor will continue safe draining");
+    }
+  }
 }
 
 void KvNodeServer::ReapDoneLocked() {
@@ -606,6 +635,7 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_ram_post_ack_flush_failures_total", "counter",
            "Acknowledged RAM PUTs whose background disk flush later failed",
            ram_->PostAckFlushFailures());
+    s += ram_->AckToDurableLatencyMetrics(idlabels);
     metric("dfkv_ram_budget_bytes", "gauge",
            "Hard total RAM-tier budget across arena and dedicated values",
            ram_->budget_bytes());
@@ -627,6 +657,37 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_ram_flush_threads", "gauge",
            "Actual RAM flusher count after the per-shard minimum adjustment",
            ram_->flusher_count());
+    metric("dfkv_ram_shutdown_drain_timeouts_total", "counter",
+           "Graceful shutdown drain attempts that exceeded their timeout",
+           ram_->ShutdownDrainTimeouts());
+    s += "# HELP dfkv_ram_flush_disk_batches_total RAM flush batches completed by disk\n";
+    s += "# TYPE dfkv_ram_flush_disk_batches_total counter\n";
+    s += "# HELP dfkv_ram_flush_disk_objects_total RAM flush objects submitted by disk\n";
+    s += "# TYPE dfkv_ram_flush_disk_objects_total counter\n";
+    s += "# HELP dfkv_ram_flush_disk_bytes_total RAM flush payload bytes submitted by disk\n";
+    s += "# TYPE dfkv_ram_flush_disk_bytes_total counter\n";
+    s += "# HELP dfkv_ram_flush_disk_failures_total RAM flush objects failed by disk\n";
+    s += "# TYPE dfkv_ram_flush_disk_failures_total counter\n";
+    s += "# HELP dfkv_ram_flush_disk_latency_seconds RAM flush engine batch latency seconds\n";
+    s += "# TYPE dfkv_ram_flush_disk_latency_seconds histogram\n";
+    for (size_t i = 0; i < ram_flush_disks_.size(); ++i) {
+      const auto& m = *ram_flush_disks_[i];
+      const std::string disk_labels =
+          "disk=\"" + PromLabelEscape(group_.DiskPath(i)) + "\",disk_index=\"" +
+          std::to_string(i) + "\"" +
+          (idlabels.empty() ? "" : "," + idlabels);
+      const std::string disk_braces = "{" + disk_labels + "}";
+      s += "dfkv_ram_flush_disk_batches_total" + disk_braces + " " +
+           std::to_string(m.batches.load(std::memory_order_relaxed)) + "\n";
+      s += "dfkv_ram_flush_disk_objects_total" + disk_braces + " " +
+           std::to_string(m.objects.load(std::memory_order_relaxed)) + "\n";
+      s += "dfkv_ram_flush_disk_bytes_total" + disk_braces + " " +
+           std::to_string(m.bytes.load(std::memory_order_relaxed)) + "\n";
+      s += "dfkv_ram_flush_disk_failures_total" + disk_braces + " " +
+           std::to_string(m.failures.load(std::memory_order_relaxed)) + "\n";
+      s += m.latency.RenderBody("dfkv_ram_flush_disk_latency_seconds",
+                                disk_labels);
+    }
   }
   return s;
 }

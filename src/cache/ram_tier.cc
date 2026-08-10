@@ -264,6 +264,18 @@ RamTier::~RamTier() {
   if (arena_) std::free(arena_);
 }
 
+bool RamTier::WaitForDrain(std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (DirtyObjects() != 0) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      shutdown_drain_timeouts_.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return true;
+}
+
 // One reclaimer pass over one shard (mirror of DiskSlabStore::ReclaimTick,
 // arena flavor): for every class with new inserts since the last pass, top its
 // free slots up to a demand-driven watermark, in small batches per lock hold.
@@ -1113,6 +1125,13 @@ void RamTier::FlushLoop(Shard& s) {
           if (entry.send_pins == 0) DropLocked(s, batch[i].key);
         } else if (ok[i]) {
           entry.durable = true;
+          if (entry.client_acked) {
+            const double seconds =
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - entry.dirty_since)
+                    .count();
+            ack_to_durable_latency_.Observe(seconds);
+          }
           dirty_bytes_.fetch_sub(entry.cap, std::memory_order_relaxed);
           dirty_objects_.fetch_sub(1, std::memory_order_relaxed);
           if (entry.flush_pin) {

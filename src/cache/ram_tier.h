@@ -60,6 +60,7 @@
 #include "cache/slab_allocator.h"
 #include "common/kv_types.h"
 #include "common/status.h"
+#include "utils/latency_hist.h"
 
 namespace dfkv {
 class KvNodeServer;
@@ -247,6 +248,14 @@ class RamTier {
   uint64_t PostAckFlushFailures() const {
     return post_ack_flush_failures_.load(std::memory_order_relaxed);
   }
+  std::string AckToDurableLatencyMetrics(const std::string& labels) const {
+    return ack_to_durable_latency_.Render(
+        "dfkv_ram_ack_to_durable_latency_seconds", labels);
+  }
+  bool WaitForDrain(std::chrono::milliseconds timeout);
+  uint64_t ShutdownDrainTimeouts() const {
+    return shutdown_drain_timeouts_.load(std::memory_order_relaxed);
+  }
 
  private:
   struct FreeAligned {
@@ -379,6 +388,8 @@ class RamTier {
   std::atomic<uint64_t> dirty_bytes_{0}, dirty_objects_{0};
   std::atomic<uint64_t> ram_acks_{0}, ack_backpressure_{0};
   std::atomic<uint64_t> post_ack_flush_failures_{0};
+  std::atomic<uint64_t> shutdown_drain_timeouts_{0};
+  LatencyHist ack_to_durable_latency_;
 };
 
 inline RamTier::Hit::~Hit() { Reset(); }

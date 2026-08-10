@@ -217,6 +217,14 @@ class KvNodeServer {
   std::chrono::steady_clock::time_point start_time_ = std::chrono::steady_clock::now();
   mutable std::mutex metrics_extension_mu_;
   std::function<std::string()> metrics_extension_;
+  struct RamFlushDiskMetrics {
+    std::atomic<uint64_t> batches{0};
+    std::atomic<uint64_t> objects{0};
+    std::atomic<uint64_t> bytes{0};
+    std::atomic<uint64_t> failures{0};
+    LatencyHist latency;
+  };
+  std::vector<std::unique_ptr<RamFlushDiskMetrics>> ram_flush_disks_;
 
   DiskCacheGroup group_;
   // Optional RAM hot tier (P3). Declared AFTER group_ so it is destroyed FIRST:
