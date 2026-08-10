@@ -24,6 +24,7 @@
 
 #include "transport/transport.h"
 #include "transport/rail_select.h"
+#include "transport/rdma_resource_budget.h"
 
 namespace dfkv {
 namespace rdma {
@@ -201,6 +202,8 @@ class RdmaTransport : public Transport {
   std::condition_variable keepalive_cv_;
   std::mutex keepalive_mu_;
   std::thread keepalive_thread_;
+  std::shared_ptr<rdma::ResourceBudget> resource_budget_;
+  int resource_acquire_ms_ = 10000;
   std::unique_ptr<rdma::RdmaTopology> topology_;
   std::vector<std::string> devs_;  // stable discovered ACTIVE rail order
   bool auto_device_ = true;

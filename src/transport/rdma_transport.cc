@@ -52,6 +52,17 @@ size_t EnvBytes(const char* name, size_t dflt) {
   if (x > kMaxSge) x = kMaxSge;
   return static_cast<size_t>(x);
 }
+uint64_t EnvU64(const char* name, uint64_t dflt) {
+  const char* value = std::getenv(name);
+  if (!value || !*value) return dflt;
+  errno = 0;
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(value, &end, 10);
+  return errno == 0 && end != value && *end == '\0' && parsed > 0
+             ? static_cast<uint64_t>(parsed)
+             : dflt;
+}
+
 
 size_t ResolveMaxPayload(size_t configured) {
   size_t n = configured ? configured : (64u << 20);
@@ -183,6 +194,12 @@ bool RunWindow(rdma::RcEndpoint& ep, const std::vector<size_t>& slen,
   return ReapWindow(ep, slen.size(), rbytes, timeout_ms, timed_out,
                     worst_status, had_completions);
 }
+std::shared_ptr<rdma::ResourceBudget> ProcessResourceBudget(
+    const rdma::ResourceRequest& limit) {
+  static auto budget = std::make_shared<rdma::ResourceBudget>(limit);
+  return budget;
+}
+
 }  // namespace
 
 struct RdmaTransport::Conn {
@@ -192,6 +209,8 @@ struct RdmaTransport::Conn {
   rdma::RailLease lease;
   uint64_t lease_started_us = 0;
   bool credit_held = false;
+  rdma::ResourceRequest budget_request;
+  bool budget_held = false;
 
   void Encode(char* out, WireOp op, const BlockKey& key, uint64_t offset,
               uint64_t length, uint64_t payload_len) const {
@@ -275,6 +294,40 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   config_dump::RecordResolved("DFKV_RDMA_DEV", JoinDevices(devs_));
   config_dump::RecordResolved("DFKV_RDMA_DEPTH", std::to_string(depth_));
   config_dump::RecordResolved("DFKV_RDMA_NUMA", numa_aware_ ? "1" : "0");
+  const size_t endpoint_limit = static_cast<size_t>(
+      EnvBoundedInt("DFKV_RDMA_ENDPOINT_CACHE_MAX", 256, 65536));
+  const size_t qp_limit = static_cast<size_t>(
+      EnvBoundedInt("DFKV_RDMA_QP_BUDGET",
+                    static_cast<int>(endpoint_limit), 65536));
+  const size_t wr_limit = static_cast<size_t>(EnvU64(
+      "DFKV_RDMA_WR_BUDGET",
+      static_cast<uint64_t>(endpoint_limit) * depth_));
+  const uint64_t slot_bytes =
+      static_cast<uint64_t>(rdma::V2SlotSize(static_cast<size_t>(declared_)));
+  const uint64_t default_registered_budget =
+      slot_bytes != 0 &&
+              endpoint_limit <=
+                  std::numeric_limits<uint64_t>::max() / slot_bytes / depth_
+          ? slot_bytes * depth_ * endpoint_limit
+          : std::numeric_limits<uint64_t>::max();
+  const uint64_t registered_limit = EnvU64(
+      "DFKV_RDMA_REGISTERED_BYTES_BUDGET", default_registered_budget);
+  resource_acquire_ms_ =
+      EnvBoundedInt("DFKV_RDMA_RESOURCE_ACQUIRE_MS", 10000, 600000);
+  resource_budget_ = ProcessResourceBudget(
+      {endpoint_limit, qp_limit, wr_limit, registered_limit});
+  const rdma::ResourceRequest effective_budget = resource_budget_->limit();
+  config_dump::RecordResolved("DFKV_RDMA_ENDPOINT_CACHE_MAX",
+                              std::to_string(effective_budget.endpoints));
+  config_dump::RecordResolved("DFKV_RDMA_QP_BUDGET",
+                              std::to_string(effective_budget.qps));
+  config_dump::RecordResolved("DFKV_RDMA_WR_BUDGET",
+                              std::to_string(effective_budget.wr_slots));
+  config_dump::RecordResolved(
+      "DFKV_RDMA_REGISTERED_BYTES_BUDGET",
+      std::to_string(effective_budget.registered_bytes));
+  config_dump::RecordResolved("DFKV_RDMA_RESOURCE_ACQUIRE_MS",
+                              std::to_string(resource_acquire_ms_));
   rdma::RailPolicyConfig rail_config;
   rail_config.credits_per_rail = static_cast<uint32_t>(
       EnvBoundedInt("DFKV_RDMA_RAIL_CREDITS", 64, 4096));
@@ -457,7 +510,10 @@ void RdmaTransport::Destroy(Conn* c, rdma::RailCompletion completion) {
                            now);
     c->credit_held = false;
   }
-  delete c;  // RcEndpoint dtor tears down QP/MRs.
+  const bool release_budget = c->budget_held;
+  const rdma::ResourceRequest budget_request = c->budget_request;
+  delete c;  // RcEndpoint dtor tears down QP/MRs before budget is returned.
+  if (release_budget) resource_budget_->Release(budget_request);
 }
 
 bool RdmaTransport::ProbeV2(const std::string& node) const {
@@ -550,18 +606,37 @@ RdmaTransport::Conn* RdmaTransport::Acquire(
     *from_pool = true;
     return pooled;
   }
+  const size_t conn_depth = lane == Lane::kSgData ? 1 : depth_;
+  const uint64_t conn_declared =
+      lane == Lane::kControl
+          ? static_cast<uint64_t>(rdma::kV2ControlCap)
+          : declared_;
+  const uint64_t conn_slot_bytes =
+      static_cast<uint64_t>(rdma::V2SlotSize(
+          static_cast<size_t>(std::max<uint64_t>(
+              conn_declared, rdma::kV2DataOffset))));
+  const rdma::ResourceRequest budget_request{
+      1, 1, conn_depth, conn_slot_bytes * conn_depth};
+  if (!resource_budget_->Acquire(
+          budget_request, std::chrono::milliseconds(resource_acquire_ms_))) {
+    fail_endpoint_lease();
+    return nullptr;
+  }
+
 
   const std::string& dev = devs_[ridx];
   if (!ProbeV2(node)) {
     DFKV_LOG_ERROR("rdma: peer " + node +
                    " does not support the required v2 protocol");
     fail_endpoint_lease();
+    resource_budget_->Release(budget_request);
     return nullptr;
   }
 
   int fd = net::Dial(node, connect_ms_, io_ms_);
   if (fd < 0) {
     fail_endpoint_lease();
+    resource_budget_->Release(budget_request);
     return nullptr;
   }
   auto* conn = new Conn();
@@ -569,7 +644,8 @@ RdmaTransport::Conn* RdmaTransport::Acquire(
   conn->lease = *lease;
   conn->lease_started_us = lease_started;
   conn->credit_held = true;
-  const size_t conn_depth = lane == Lane::kSgData ? 1 : depth_;
+  conn->budget_request = budget_request;
+  conn->budget_held = true;
   if (!conn->ep.Open(dev.c_str(), rdma::kV2ControlCap, conn_depth)) {
     ::close(fd);
     DFKV_LOG_WARN("rdma: device " + dev +
@@ -579,10 +655,6 @@ RdmaTransport::Conn* RdmaTransport::Acquire(
   }
   { const char* bp = std::getenv("DFKV_RDMA_BUSY_POLL"); if (bp && *bp && *bp != '0') conn->ep.set_busy_poll(true); }
 
-  const uint64_t conn_declared =
-      lane == Lane::kControl
-          ? static_cast<uint64_t>(rdma::kV2ControlCap)
-          : declared_;
   char devbuf[rdma::kDevNameBytes];
   rdma::EncodeDevFrame(auto_device_ ? std::string() : dev, conn_declared,
                        devbuf, rdma::kDevProtoV2);
@@ -769,6 +841,33 @@ std::string RdmaTransport::MetricsText() const {
   s += "# TYPE dfkv_rdma_client_conns_opened_total counter\n";
   s += "dfkv_rdma_client_conns_opened_total " +
        std::to_string(conns_opened_.load(std::memory_order_relaxed)) + "\n";
+  const rdma::ResourceRequest resource_used = resource_budget_->used();
+  const rdma::ResourceRequest resource_limit = resource_budget_->limit();
+  const auto resource_gauge = [&](const char* name, const char* help,
+                                  uint64_t used, uint64_t limit) {
+    s += "# HELP " + std::string(name) + " " + help + "\n";
+    s += "# TYPE " + std::string(name) + " gauge\n";
+    s += std::string(name) + "{kind=\"used\"} " + std::to_string(used) + "\n";
+    s += std::string(name) + "{kind=\"limit\"} " + std::to_string(limit) +
+         "\n";
+  };
+  resource_gauge("dfkv_rdma_client_endpoint_budget",
+                 "Process-wide RDMA endpoint budget", resource_used.endpoints,
+                 resource_limit.endpoints);
+  resource_gauge("dfkv_rdma_client_qp_budget",
+                 "Process-wide RDMA QP budget", resource_used.qps,
+                 resource_limit.qps);
+  resource_gauge("dfkv_rdma_client_wr_slot_budget",
+                 "Process-wide RDMA work-request slot budget",
+                 resource_used.wr_slots, resource_limit.wr_slots);
+  resource_gauge("dfkv_rdma_client_registered_slot_bytes_budget",
+                 "Process-wide remote receive-slot byte budget",
+                 resource_used.registered_bytes,
+                 resource_limit.registered_bytes);
+  s += "# HELP dfkv_rdma_client_resource_budget_timeouts_total Connection admissions rejected after bounded resource wait\n";
+  s += "# TYPE dfkv_rdma_client_resource_budget_timeouts_total counter\n";
+  s += "dfkv_rdma_client_resource_budget_timeouts_total " +
+       std::to_string(resource_budget_->timeouts()) + "\n";
   s += "# HELP dfkv_rdma_client_v2_put_writes_total PUT requests sent with RDMA WRITE_WITH_IMM\n";
   s += "# TYPE dfkv_rdma_client_v2_put_writes_total counter\n";
   s += "dfkv_rdma_client_v2_put_writes_total " +
