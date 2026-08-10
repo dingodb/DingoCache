@@ -18,6 +18,7 @@
 
 #include "client/group_shard.h"
 #include "client/key_map.h"
+#include "client/read_scheduler.h"
 #include "utils/log.h"
 #include "utils/thread_name.h"
 #include "utils/parallel_for.h"
@@ -404,6 +405,8 @@ std::string KVClient::MetricsSnapshot() const {
     s += "# TYPE dfkv_client_mds_reachable gauge\n";
     s += "dfkv_client_mds_reachable " + std::string(poller_->reachable() ? "1" : "0") + "\n";
   }
+  if (t_ && t_->pipelined())
+    s += ReadScheduler::Instance().MetricsText();
   if (t_) s += t_->MetricsText();
   return s;
 }
@@ -784,7 +787,7 @@ std::vector<bool> KVClient::BatchGetDirect(const std::vector<KvGetItem>& items) 
       by[{node, items[i].n}].push_back(i);
     }
     std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>> groups = ShardReadGroups(std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>>(by.begin(), by.end()));
-    RunParallel(groups.size(), BatchWorkers(groups.size()), [&](size_t g) {
+    RunReadScheduled(groups.size(), [&](size_t g) {
       const std::string& node = groups[g].first.first;
       uint64_t now = NowMs();
       if (!health_.Healthy(node, now)) return;
@@ -941,7 +944,7 @@ std::vector<bool> KVClient::BatchGetAutoDirect(const std::vector<KvGetItem>& ite
     by[{node, items[i].n}].push_back(i);
   }
   std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>> groups = ShardReadGroups(std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>>(by.begin(), by.end()));
-  RunParallel(groups.size(), BatchWorkers(groups.size()), [&](size_t g) {
+  RunReadScheduled(groups.size(), [&](size_t g) {
     const std::string& node = groups[g].first.first;
     uint64_t now = NowMs();
     if (!health_.Healthy(node, now)) return;
@@ -1072,7 +1075,7 @@ std::vector<bool> KVClient::BatchExistDirect(
   std::vector<std::pair<std::string, std::vector<size_t>>> groups =
       ShardReadGroups(std::vector<std::pair<std::string, std::vector<size_t>>>(
           by_node.begin(), by_node.end()));
-  RunParallel(groups.size(), BatchWorkers(groups.size()), [&](size_t g) {
+  RunReadScheduled(groups.size(), [&](size_t g) {
     const std::string& node = groups[g].first;
     uint64_t now = NowMs();
     if (!health_.Healthy(node, now)) return;
@@ -1426,7 +1429,7 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
         groups = ShardReadGroups(
             std::vector<std::pair<std::pair<std::string, size_t>,
                                   std::vector<size_t>>>(by.begin(), by.end()));
-    RunParallel(groups.size(), BatchWorkers(groups.size()), [&](size_t g) {
+    RunReadScheduled(groups.size(), [&](size_t g) {
       const std::string& node = groups[g].first.first;
       uint64_t now = NowMs();
       if (!health_.Healthy(node, now)) return;
