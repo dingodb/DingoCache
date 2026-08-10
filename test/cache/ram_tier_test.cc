@@ -113,6 +113,68 @@ TEST(RamTier, TenantIdentityIsPartOfResidentKey) {
   EXPECT_EQ(std::string(hit.ptr, hit.len), second_value);
 }
 
+TEST(RamTier, WriteBackAcknowledgesVisiblePinnedRamBeforeFlush) {
+  FlushSink sink;
+  sink.close();
+  RamTier rt(Opts(64 * 4096), sink.fn());
+  const std::string value(4096, 'w');
+
+  EXPECT_EQ(rt.PutWriteBack(K(101), value.data(), value.size()), Status::kOk);
+  EXPECT_EQ(rt.RamAcks(), 1u);
+  EXPECT_EQ(rt.DirtyObjects(), 1u);
+  EXPECT_EQ(rt.DirtyBytes(), 4096u);
+  RamTier::Hit hit;
+  ASSERT_TRUE(rt.GetPrep(K(101), 0, 0, &hit));
+  EXPECT_EQ(std::string(hit.ptr, hit.len), value);
+  hit = RamTier::Hit{};
+
+  sink.open();
+  ASSERT_TRUE(WaitFor([&] { return rt.Flushed() == 1u; }));
+  EXPECT_EQ(rt.DirtyObjects(), 0u);
+  EXPECT_EQ(rt.DirtyBytes(), 0u);
+}
+
+TEST(RamTier, WriteBackWatermarkWaitsForDiskCommit) {
+  FlushSink sink;
+  sink.close();
+  RamTier::Options options = Opts(2 * 4096, 4096);
+  options.ack_high_watermark_pct = 50;
+  RamTier rt(options, sink.fn());
+  const std::string value(4096, 'b');
+
+  ASSERT_EQ(rt.PutWriteBack(K(102), value.data(), value.size()), Status::kOk);
+  std::atomic<bool> completed{false};
+  Status result = Status::kInvalid;
+  std::thread put([&] {
+    result = rt.PutWriteBack(K(103), value.data(), value.size());
+    completed.store(true, std::memory_order_release);
+  });
+  std::this_thread::sleep_for(10ms);
+  EXPECT_FALSE(completed.load(std::memory_order_acquire));
+  EXPECT_EQ(rt.AckBackpressure(), 1u);
+
+  sink.open();
+  put.join();
+  EXPECT_EQ(result, Status::kOk);
+  EXPECT_TRUE(WaitFor([&] { return rt.DirtyObjects() == 0u; }));
+}
+
+TEST(RamTier, WriteBackFlushFailureIsPostAckAndUnhealthy) {
+  FlushSink sink;
+  sink.fail = true;
+  RamTier::Options options = Opts(8 * 4096);
+  options.flush_retries = 1;
+  RamTier rt(options, sink.fn());
+  const std::string value(500, 'f');
+
+  EXPECT_EQ(rt.PutWriteBack(K(104), value.data(), value.size()), Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return rt.FlushDropped() == 1u; }));
+  EXPECT_EQ(rt.PostAckFlushFailures(), 1u);
+  EXPECT_EQ(rt.DirtyObjects(), 0u);
+  EXPECT_FALSE(rt.healthy());
+  EXPECT_FALSE(rt.Contains(K(104)));
+}
+
 TEST(RamTier, FlushMakesDurable) {
   FlushSink sink;
   RamTier rt(Opts(64 * 4096), sink.fn());
