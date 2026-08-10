@@ -211,6 +211,7 @@ struct RdmaTransport::Conn {
   bool credit_held = false;
   rdma::ResourceRequest budget_request;
   bool budget_held = false;
+  bool visited = true;  // guarded by RdmaTransport::mu_ while idle
 
   void Encode(char* out, WireOp op, const BlockKey& key, uint64_t offset,
               uint64_t length, uint64_t payload_len) const {
@@ -516,6 +517,35 @@ void RdmaTransport::Destroy(Conn* c, rdma::RailCompletion completion) {
   if (release_budget) resource_budget_->Release(budget_request);
 }
 
+bool RdmaTransport::EvictOneIdle() {
+  Conn* victim = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto scan = [&](auto& pools) {
+      for (auto& [node, connections] : pools) {
+        (void)node;
+        for (auto it = connections.begin(); it != connections.end(); ++it) {
+          if ((*it)->visited) {
+            (*it)->visited = false;
+            continue;
+          }
+          victim = *it;
+          connections.erase(it);
+          return true;
+        }
+      }
+      return false;
+    };
+    for (int pass = 0; pass < 2 && victim == nullptr; ++pass) {
+      if (scan(pool_) || scan(sg_pool_) || scan(control_pool_)) break;
+    }
+  }
+  if (!victim) return false;
+  Destroy(victim);
+  endpoint_cache_evictions_.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
 bool RdmaTransport::ProbeV2(const std::string& node) const {
   v2_probe_attempts_.fetch_add(1, std::memory_order_relaxed);
   int fd = net::Dial(node, connect_ms_, io_ms_);
@@ -599,6 +629,8 @@ RdmaTransport::Conn* RdmaTransport::Acquire(
     pooled->lease = *lease;
     pooled->lease_started_us = lease_started;
     pooled->credit_held = true;
+    pooled->visited = true;
+    endpoint_cache_hits_.fetch_add(1, std::memory_order_relaxed);
     if (!pooled->ep.EnsurePoolMrs(pools, true)) {
       Destroy(pooled, rdma::RailCompletion::kRailFailure);
       return nullptr;
@@ -606,6 +638,7 @@ RdmaTransport::Conn* RdmaTransport::Acquire(
     *from_pool = true;
     return pooled;
   }
+  endpoint_cache_misses_.fetch_add(1, std::memory_order_relaxed);
   const size_t conn_depth = lane == Lane::kSgData ? 1 : depth_;
   const uint64_t conn_declared =
       lane == Lane::kControl
@@ -617,8 +650,13 @@ RdmaTransport::Conn* RdmaTransport::Acquire(
               conn_declared, rdma::kV2DataOffset))));
   const rdma::ResourceRequest budget_request{
       1, 1, conn_depth, conn_slot_bytes * conn_depth};
-  if (!resource_budget_->Acquire(
-          budget_request, std::chrono::milliseconds(resource_acquire_ms_))) {
+  bool budget_acquired = resource_budget_->TryAcquire(budget_request);
+  if (!budget_acquired && EvictOneIdle())
+    budget_acquired = resource_budget_->TryAcquire(budget_request);
+  if (!budget_acquired)
+    budget_acquired = resource_budget_->Acquire(
+        budget_request, std::chrono::milliseconds(resource_acquire_ms_));
+  if (!budget_acquired) {
     fail_endpoint_lease();
     return nullptr;
   }
@@ -868,6 +906,22 @@ std::string RdmaTransport::MetricsText() const {
   s += "# TYPE dfkv_rdma_client_resource_budget_timeouts_total counter\n";
   s += "dfkv_rdma_client_resource_budget_timeouts_total " +
        std::to_string(resource_budget_->timeouts()) + "\n";
+  s += "# HELP dfkv_rdma_endpoint_cache_hits_total Idle endpoint cache hits\n";
+  s += "# TYPE dfkv_rdma_endpoint_cache_hits_total counter\n";
+  s += "dfkv_rdma_endpoint_cache_hits_total " +
+       std::to_string(endpoint_cache_hits_.load(std::memory_order_relaxed)) +
+       "\n";
+  s += "# HELP dfkv_rdma_endpoint_cache_misses_total Endpoint acquisitions requiring a new QP\n";
+  s += "# TYPE dfkv_rdma_endpoint_cache_misses_total counter\n";
+  s += "dfkv_rdma_endpoint_cache_misses_total " +
+       std::to_string(endpoint_cache_misses_.load(std::memory_order_relaxed)) +
+       "\n";
+  s += "# HELP dfkv_rdma_endpoint_cache_evictions_total Idle endpoints evicted under process-wide resource pressure\n";
+  s += "# TYPE dfkv_rdma_endpoint_cache_evictions_total counter\n";
+  s += "dfkv_rdma_endpoint_cache_evictions_total " +
+       std::to_string(
+           endpoint_cache_evictions_.load(std::memory_order_relaxed)) +
+       "\n";
   s += "# HELP dfkv_rdma_client_v2_put_writes_total PUT requests sent with RDMA WRITE_WITH_IMM\n";
   s += "# TYPE dfkv_rdma_client_v2_put_writes_total counter\n";
   s += "dfkv_rdma_client_v2_put_writes_total " +
