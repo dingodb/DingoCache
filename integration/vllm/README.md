@@ -54,8 +54,8 @@ traffic if either requirement is missing.
 |---|---|---|
 | `DFKV_RDMA` | **required: `1`** | Selects the required GPUDirect RDMA transport. Unset/TCP is rejected during connector construction; there is no TCP fallback. |
 | `PYTHONHASHSEED` | **required: fixed value** | Stabilizes vLLM's root block hash across processes and restarts. Use the same value (for example `0`) on every producer and consumer sharing a store. |
-| `DFKV_RDMA_DEV` | — | RDMA rail by name (`ib7s400p0`; comma-list = multi-rail). Required when `DFKV_RDMA=1`. |
-| `DFKV_RDMA_DEPTH` | `1` | Requests in flight per connection. A latency hider, **not** a throughput knob (GET/PUT are depth-flat — the per-connection serve loop is in-order). Leave at default. |
+| `DFKV_RDMA_DEV` | first local `ACTIVE` HCA | Optional device/fabric selector. Leave unset for one local rail even when `DFKV_RDMA=1`; use a comma-list only to opt into multi-rail, and verify the same listed names/fabric at both endpoints. |
+| `DFKV_RDMA_DEPTH` | `4` | Negotiated request window (`min(client, server)`). Keep the defaults aligned for production connector batches. Per-connection bandwidth is depth-flat after connection setup; scale read throughput with sharded pooled connections, not by increasing depth. |
 | `DFKV_RDMA_NUMA` | `0` | `1` pins buffers/threads to the rail's NUMA node and picks a NUMA-local rail per connection. Optional. |
 | `DFKV_READ_SHARD_KEYS` | `16` | Target keys per read shard: splits one node's batched GET into parallel shards. The real read-throughput lever on few-node rings / large batches landing on one node (single connection drains ~166 MB/s serially); no-op on wide rings. |
 | `DFKV_READ_MAX_CONNS` | `8` | Per-node cap on concurrent read-shard connections (pairs with the above; `1` disables sharding). |

@@ -54,6 +54,8 @@ class DfkvDeviceClient:
         client_id: str = "",
         client_info: str = "",
         client_heartbeat_ms: int = 10000,
+        model: str = "",
+        cache_role: str = "",
     ):
         if not key_namespace:
             raise ValueError("DfkvDeviceClient requires a non-empty key namespace")
@@ -63,6 +65,7 @@ class DfkvDeviceClient:
                 "'members' (static list)"
             )
         self._close_lock = threading.Lock()
+        self._telemetry_acquired = False
         self._lib = load_lib(lib_path)
         # ABI v2 constructs one fully configured handle: static membership or
         # MDS discovery, batch fan-out, and optional client registration become
@@ -112,26 +115,37 @@ class DfkvDeviceClient:
         # needs no connector plumbing: set DFKV_METRICS_ENABLED + OTEL_*. Report
         # both the connector package version and the linked libdfkv.so version so
         # the dashboard can spot version skew across the fleet.
-        _push_metrics.configure(
-            {}, connector_type=_tcfg.TYPE_VLLM, tp_rank=_env_rank(),
-            version=_tcfg.dist_version("dfkv-vllm"),
-            native_version=native_version(self._lib))
-        # Connector-side request tracing (off by default; zero cost when off).
-        # Spans for slow / sampled / failed ops pushed over OTLP /v1/traces.
-        _push_tracing.configure(
-            {}, connector_type=_tcfg.TYPE_VLLM, tp_rank=_env_rank(),
-            version=_tcfg.dist_version("dfkv-vllm"),
-            native_version=native_version(self._lib))
+        metrics_acquired = tracing_acquired = False
+        try:
+            metrics_acquired = True
+            _push_metrics.configure(
+                {}, connector_type=_tcfg.TYPE_VLLM, tp_rank=_env_rank(),
+                model=model, cache_role=cache_role,
+                version=_tcfg.dist_version("dfkv-vllm"),
+                native_version=native_version(self._lib))
+            # Spans for slow / sampled / failed ops pushed over OTLP /v1/traces.
+            tracing_acquired = True
+            _push_tracing.configure(
+                {}, connector_type=_tcfg.TYPE_VLLM, tp_rank=_env_rank(),
+                model=model, cache_role=cache_role,
+                version=_tcfg.dist_version("dfkv-vllm"),
+                native_version=native_version(self._lib))
+        except Exception:
+            # close() is safe on this partially constructed object and releases
+            # both lifecycle references plus the already-open native handle.
+            self._telemetry_acquired = metrics_acquired or tracing_acquired
+            self.close()
+            raise
+        self._telemetry_acquired = True
         # Access log: parse the launch baseline (env-driven), then let a control
         # file toggle it at runtime without restarting vLLM (opt-in via
         # DFKV_HOT_CONFIG). See docs/access_log.md -> 运行时热开关.
         _alog.configure({}, tp_rank=_env_rank())
         _hot_config.register("access_log", _alog.apply_hot)
         _hot_config.start({}, tp_rank=_env_rank())
-        # Surface the C client's ring/MDS health on Prometheus so an empty ring
-        # (writes routed nowhere) or an unreachable MDS is visible on the scrape,
-        # not just in the client log. Sleeping daemon thread off the request path;
-        # DFKV_CLIENT_STATS_POLL_S=0 disables. Mirrors the HiCache stats poller.
+        # Mirror native operation, peer-health, MDS, RDMA rail, MR, and timeout
+        # state onto Prometheus. The sleeping poller stays off the request path;
+        # DFKV_CLIENT_STATS_POLL_S=0 disables it.
         self._stats_poller = None
         try:
             poll_s = float(os.environ.get("DFKV_CLIENT_STATS_POLL_S", 15))
@@ -140,8 +154,16 @@ class DfkvDeviceClient:
         if poll_s > 0:
             self._stats_poller = ClientStatsPoller(
                 lambda: read_snapshot(self._lib, self._h), _env_rank(),
-                transport=self.transport_mode, interval_s=poll_s)
+                interval_s=poll_s)
             self._stats_poller.start()
+        self._peer_lat_poller = None
+        try:
+            peer_poll_s = float(_tcfg.resolve(
+                {}, "peer_latency_poll_s", _tcfg.ENV_PEER_POLL_S, 10.0))
+        except (TypeError, ValueError):
+            peer_poll_s = 10.0
+        self._peer_lat_poller = _push_metrics.start_peer_latency_poller(
+            lambda: read_snapshot(self._lib, self._h), peer_poll_s)
 
     @property
     def transport_mode(self) -> str:
@@ -369,6 +391,12 @@ class DfkvDeviceClient:
 
     def close(self) -> None:
         try:
+            if getattr(self, "_peer_lat_poller", None):
+                self._peer_lat_poller.stop()
+                self._peer_lat_poller = None
+        except Exception:
+            pass
+        try:
             if getattr(self, "_stats_poller", None):
                 self._stats_poller.stop()
                 self._stats_poller = None
@@ -381,9 +409,15 @@ class DfkvDeviceClient:
         with self._close_lock:
             handle = getattr(self, "_h", None)
             self._h = None
+            telemetry_acquired = getattr(
+                self, "_telemetry_acquired", False)
+            self._telemetry_acquired = False
         if handle:
             with access_log("close", lambda: ""):
                 self._lib.dfkv_close(handle)
+        if telemetry_acquired:
+            _push_metrics.release()
+            _push_tracing.release()
 
     def __del__(self):
         try:

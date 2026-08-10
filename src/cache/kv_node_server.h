@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -86,7 +87,11 @@ class KvNodeServer {
   size_t m_exist_miss() const { return exist_miss_.load(std::memory_order_relaxed); }
   size_t m_remove_ok() const { return remove_ok_.load(std::memory_order_relaxed); }
   size_t m_remove_miss() const { return remove_miss_.load(std::memory_order_relaxed); }
-  std::string MetricsText() const;  // Prometheus text format
+  std::string MetricsText() const;  // cache-node metrics only
+  // Add transport/registrar/readiness metrics to both HTTP /metrics and the
+  // kStats wire response used by dfkvctl. Assignment and scrape are thread-safe.
+  void set_metrics_extension(std::function<std::string()> render);
+  std::string FullMetricsText() const;
 
   // Transport-agnostic request processing (shared by the TCP handler and, when
   // built with DFKV_WITH_RDMA, the RDMA handler). Returns status and raw bytes;
@@ -209,6 +214,8 @@ class KvNodeServer {
   uint64_t max_request_payload_ = 0;  // 0 = resolve default lazily (see .cc)
   std::string node_id_, node_group_;       // identity for Prometheus labels (optional)
   std::chrono::steady_clock::time_point start_time_ = std::chrono::steady_clock::now();
+  mutable std::mutex metrics_extension_mu_;
+  std::function<std::string()> metrics_extension_;
 
   DiskCacheGroup group_;
   // Optional RAM hot tier (P3). Declared AFTER group_ so it is destroyed FIRST:

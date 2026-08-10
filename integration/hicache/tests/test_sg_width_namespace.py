@@ -27,6 +27,8 @@ import unittest
 # dfkv_access_log / dfkv_hot_config / dfkv_metrics / dfkv_telemetry live in
 # integration/hicache/).
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(
+    0, os.path.join(os.path.dirname(__file__), "..", "..", "common", "src"))
 
 
 # ---------------------------------------------------------------------------

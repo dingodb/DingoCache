@@ -38,6 +38,9 @@ exist_v2_hit_pages_total / exist_v2_probe_pages_total.
   dfkv_client_exist_v2_hit_pages_total    usable hit-prefix pages (kv_hit_pages)
 """
 import threading
+import time
+
+from dfkv_common.client_metrics import CLIENT_METRIC_SPECS, SnapshotDelta
 
 try:
     from prometheus_client import (Counter as _PromCounter, Gauge as _PromGauge,
@@ -165,125 +168,119 @@ class Metrics:
             return snap
 
 
-# --- client-side snapshot mirroring (from the C client via dfkv_stats_snapshot) ---
+# --- native client snapshot mirroring (dfkv_stats_snapshot) -----------------
 #
-# The C++ KVClient accumulates client-observed counters (ops served, IO errors,
-# peer-health transitions) that the Python layer can't see. A sleeping daemon
-# thread polls the snapshot text and mirrors the aggregate counters onto
-# Prometheus Counters by delta, so they aggregate across the per-TP-rank
-# processes in SGLang's multiprocess metrics mode. Off the request hot path.
+# The C++ client owns the authoritative operation, peer-health, RDMA rail, MR,
+# timeout, and MDS counters. A sleeping daemon polls that snapshot and mirrors
+# the bounded families into SGLang's Prometheus multiprocess registry. No
+# snapshot or Prometheus work runs on the cache request path.
 
-# Counters mirrored by positive delta (monotonic across polls).
-_CLIENT_COUNTER_NAMES = [
-    "dfkv_client_ops_served_total",
-    "dfkv_client_io_errors_total",
-    "dfkv_client_unhealthy_skips_total",
-    "dfkv_client_peer_marked_bad_total",
-    "dfkv_client_peer_recovered_total",
-    "dfkv_client_mds_unreachable_polls_total",
-]
-# Gauges mirrored by set() to the current value each poll: ring size and MDS
-# reachability, so a bad/unreachable mds_endpoint is visible on the SCRAPE
-# (ring_members==0 / mds_reachable==0), not just in the client log.
-_CLIENT_GAUGE_NAMES = [
-    "dfkv_client_ring_members",
-    "dfkv_client_mds_reachable",
-]
-# The union the snapshot parser captures (per-peer labeled series stay excluded).
-_CLIENT_NAMES = _CLIENT_COUNTER_NAMES + _CLIENT_GAUGE_NAMES
-
-_CLIENT_PROM = {}
-_CLIENT_GAUGE_PROM = {}
-if _HAVE_PROM:
-    for _n in _CLIENT_COUNTER_NAMES:
-        try:
-            _CLIENT_PROM[_n] = _PromCounter(_n, _n, ["tp_rank"])
-        except Exception:
-            _CLIENT_PROM = {}
-            break
-    for _n in _CLIENT_GAUGE_NAMES:
-        try:
-            # multiprocess_mode is consulted only under PROMETHEUS_MULTIPROC_DIR;
-            # 'liveall' keeps each live rank's current value (tp_rank labels them).
-            _CLIENT_GAUGE_PROM[_n] = _PromGauge(_n, _n, ["tp_rank"],
-                                                multiprocess_mode="liveall")
-        except Exception:
-            _CLIENT_GAUGE_PROM = {}
-            break
+_NATIVE_PROM = {}
+_NATIVE_POLL_PROM = {}
+_HAVE_NATIVE_PROM = _HAVE_PROM
+if _HAVE_NATIVE_PROM:
+    try:
+        for _source, _spec in CLIENT_METRIC_SPECS.items():
+            _labels = ["tp_rank", *_spec.labels]
+            if _spec.kind == "counter":
+                _NATIVE_PROM[_source] = _PromCounter(
+                    _source, _spec.description, _labels)
+            else:
+                _NATIVE_PROM[_source] = _PromGauge(
+                    _source, _spec.description, _labels,
+                    multiprocess_mode="liveall")
+        _NATIVE_POLL_PROM["success"] = _PromGauge(
+            "dfkv_client_stats_snapshot_success",
+            "1 when the latest native client metrics snapshot poll succeeded",
+            ["tp_rank"], multiprocess_mode="liveall")
+        _NATIVE_POLL_PROM["timestamp"] = _PromGauge(
+            "dfkv_client_stats_snapshot_timestamp_seconds",
+            "Unix timestamp of the latest successful native client metrics snapshot",
+            ["tp_rank"], multiprocess_mode="liveall")
+        _NATIVE_POLL_PROM["errors"] = _PromCounter(
+            "dfkv_client_stats_snapshot_errors_total",
+            "Native client metrics snapshot poll failures", ["tp_rank"])
+    except Exception:
+        _HAVE_NATIVE_PROM = False
+        _NATIVE_PROM = {}
+        _NATIVE_POLL_PROM = {}
 
 
 class ClientStatsPoller:
-    """Polls a Prometheus-text snapshot provider and mirrors the aggregate client
-    counters onto Prometheus Counters by delta. One sleeping daemon thread."""
+    """Mirror every allow-listed native client metric off the request path."""
 
     def __init__(self, get_text, tp_rank, interval_s=10.0):
         self._get_text = get_text
         self._rank = str(int(tp_rank))
         self._interval = float(interval_s)
-        self._last = {n: 0 for n in _CLIENT_COUNTER_NAMES}
-        self._totals = {n: 0 for n in _CLIENT_COUNTER_NAMES}  # in-process mirror (tests/debug)
-        self._gauges = {n: 0 for n in _CLIENT_GAUGE_NAMES}    # last-seen gauge values
+        self._mirror = SnapshotDelta()
+        self._health = {
+            "success": 0,
+            "timestamp_seconds": 0.0,
+            "errors_total": 0,
+        }
         self._stop = threading.Event()
         self._thread = None
 
-    @staticmethod
-    def _parse(text):
-        out = {}
-        for line in text.splitlines():
-            if not line or line[0] == "#":
-                continue
-            sp = line.rfind(" ")
-            if sp <= 0:
-                continue
-            name = line[:sp]
-            brace = name.find("{")
-            if brace != -1:
-                name = name[:brace]
-            if name in _CLIENT_NAMES:
-                try:
-                    out[name] = out.get(name, 0) + int(line[sp + 1:])
-                except ValueError:
-                    pass
-        return out
+    def _record_failure(self):
+        self._health["success"] = 0
+        self._health["errors_total"] += 1
+        if _HAVE_NATIVE_PROM:
+            _NATIVE_POLL_PROM["success"].labels(self._rank).set(0)
+            _NATIVE_POLL_PROM["errors"].labels(self._rank).inc()
 
     def poll_once(self):
-        vals = self._parse(self._get_text() or "")
-        for n in _CLIENT_COUNTER_NAMES:  # counters: mirror by positive delta
-            v = vals.get(n, 0)
-            d = v - self._last[n]
-            if d > 0:
-                self._last[n] = v
-                self._totals[n] += d
-                if _HAVE_PROM and n in _CLIENT_PROM:
-                    _CLIENT_PROM[n].labels(self._rank).inc(d)
-        for n in _CLIENT_GAUGE_NAMES:  # gauges: mirror the current value each poll
-            v = vals.get(n, 0)
-            self._gauges[n] = v
-            if _HAVE_PROM and n in _CLIENT_GAUGE_PROM:
-                _CLIENT_GAUGE_PROM[n].labels(self._rank).set(v)
+        try:
+            text = self._get_text() or ""
+            if not text:
+                raise RuntimeError("empty dfkv client metrics snapshot")
+            updates = self._mirror.prepare(text)
+            if not updates:
+                raise RuntimeError("no recognized dfkv client metrics")
+            for update in updates:
+                if _HAVE_NATIVE_PROM:
+                    metric = _NATIVE_PROM[update.name].labels(
+                        self._rank, *update.labels)
+                    if update.kind == "counter":
+                        metric.inc(update.value)
+                    else:
+                        metric.set(update.value)
+                self._mirror.commit(update)
+            now = time.time()
+            self._health["success"] = 1
+            self._health["timestamp_seconds"] = now
+            if _HAVE_NATIVE_PROM:
+                _NATIVE_POLL_PROM["success"].labels(self._rank).set(1)
+                _NATIVE_POLL_PROM["timestamp"].labels(self._rank).set(now)
+        except Exception:
+            self._record_failure()
+            raise
 
     def totals(self):
-        return dict(self._totals)
+        return self._mirror.totals()
 
     def gauges(self):
-        return dict(self._gauges)
+        return self._mirror.gauges()
+
+    def health(self):
+        return dict(self._health)
 
     def _loop(self):
         while not self._stop.wait(self._interval):
             try:
                 self.poll_once()
             except Exception:
-                pass  # never let a transient snapshot error kill the thread
+                pass  # failure is exported; never kill the poll thread
 
     def start(self):
         if self._interval <= 0:
-            return  # disabled
+            return
         try:
-            self.poll_once()  # immediate first read
+            self.poll_once()
         except Exception:
             pass
-        self._thread = threading.Thread(target=self._loop, name="dfkv-client-stats",
-                                        daemon=True)
+        self._thread = threading.Thread(target=self._loop,
+                                        name="dfkv-client-stats", daemon=True)
         self._thread.start()
 
     def stop(self):

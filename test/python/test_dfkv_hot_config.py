@@ -34,9 +34,8 @@ def _reset():
     with hot._lock:
         hot._appliers.clear()
         hot._watcher = None
-    for k in list(os.environ):
-        if k.startswith("DFKV_"):
-            del os.environ[k]
+    os.environ.pop("DFKV_HOT_CONFIG", None)
+    os.environ.pop("DFKV_HOT_CONFIG_POLL_S", None)
 
 
 class AccessLogHotToggleTest(unittest.TestCase):

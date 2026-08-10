@@ -14,10 +14,15 @@ namespace dfkv {
 
 class LatencyHist {
  public:
-  // Cumulative bucket upper bounds in SECONDS (50us .. 100ms). +Inf is implicit.
-  static constexpr int kNB = 11;
-  static constexpr double kBounds[kNB] = {50e-6, 100e-6, 250e-6, 500e-6, 1e-3,
-                                          2.5e-3, 5e-3, 10e-3, 25e-3, 50e-3, 100e-3};
+  // Cumulative bucket upper bounds in SECONDS (50us .. 60s). Fast data-plane
+  // observations still return at the first matching bucket; the long tail keeps
+  // control-plane and transport timeouts quantile-observable instead of folding
+  // every 5-60s failure into +Inf.
+  static constexpr int kNB = 19;
+  static constexpr double kBounds[kNB] = {
+      50e-6, 100e-6, 250e-6, 500e-6, 1e-3, 2.5e-3, 5e-3, 10e-3,
+      25e-3, 50e-3, 100e-3, 250e-3, 500e-3, 1.0, 2.5, 5.0,
+      10.0, 30.0, 60.0};
 
   void Observe(double seconds) {
     if (seconds < 0) seconds = 0;

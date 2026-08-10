@@ -3,7 +3,7 @@
  *   dfkvctl --members "n=ip:port,..." get   <key>
  *   dfkvctl --members "n=ip:port,..." exist <key>
  *   dfkvctl stat <node-ip:port>           # fetch a node's Prometheus metrics
- *   dfkvctl ring --mds <ep,...> --group <g>          # show the cluster ring + vnode share
+ *   dfkvctl ring --mds <ep,...> --group <g> [--allow-empty]  # show the cluster ring + vnode share
  *   dfkvctl clients --mds <ep,...> --group <g>        # list cache consumers (inference instances)
  *   dfkvctl stat --all --mds <ep,...> --group <g> [--stat-port <p>]  # per-node metrics + aggregate
  *     The MDS now hands back each node's TCP stat port (MemberInfo.tcp_port), so stat --all
@@ -161,6 +161,11 @@ static int CmdStats(const std::string& mds, const std::string& group) {
   if (mds.empty()) { std::fprintf(stderr, "stats needs --mds ip:port[,...]\n"); return 2; }
   std::vector<MemberInfo> ms;
   if (!QueryMembers(mds, group, &ms)) { std::fprintf(stderr, "stats: MDS query failed\n"); return 1; }
+  if (ms.empty()) {
+    std::fprintf(stderr, "stats: group=%s has an empty placement ring\n",
+                 group.c_str());
+    return 1;
+  }
   std::printf("group=%s members=%zu (stats as of each node's last heartbeat)\n", group.c_str(), ms.size());
   std::printf("%-16s %6s %14s %5s %8s %6s %7s %6s %7s %8s %7s\n",
               "ID", "WEIGHT", "USED/CAP", "UTIL", "OBJ", "HIT%", "EVIC", "BUSY", "DIO-FB", "RAM-USED", "UPTIME");
@@ -194,15 +199,19 @@ static int CmdStats(const std::string& mds, const std::string& group) {
   // Surface registered consumers on the same line so `dfkvctl stats` answers
   // "and who is using this ring" without a second command.
   std::vector<MemberInfo> cs;
-  size_t nclients = QueryClients(mds, group, &cs) ? cs.size() : 0;
-  std::printf("-- group=%s: %zu nodes  %s/%s (%.0f%%)  hit %.1f%%  evic %llu  busy %llu  dio-fb %llu  ram %s  stats-missing %llu  clients %zu\n",
+  const bool clients_ok = QueryClients(mds, group, &cs);
+  const std::string clients =
+      clients_ok ? std::to_string(cs.size()) : std::string("unavailable");
+  std::printf("-- group=%s: %zu nodes  %s/%s (%.0f%%)  hit %.1f%%  evic %llu  busy %llu  dio-fb %llu  ram %s  stats-missing %llu  clients %s\n",
               group.c_str(), ms.size(), HumanBytes(sum.used_bytes).c_str(), HumanBytes(sum.capacity_bytes).c_str(),
               sum.capacity_bytes ? 100.0 * (double)sum.used_bytes / (double)sum.capacity_bytes : 0.0,
               lk ? 100.0 * (double)sum.hits_total / (double)lk : 0.0,
               (unsigned long long)sum.evictions_total, (unsigned long long)sum.put_busy_total,
               (unsigned long long)sum.dio_write_fallbacks, HumanBytes(sum.ram_used_bytes).c_str(),
-              (unsigned long long)missing, nclients);
-  return 0;
+              (unsigned long long)missing, clients.c_str());
+  if (!clients_ok)
+    std::fprintf(stderr, "stats: client inventory query failed\n");
+  return clients_ok ? 0 : 1;
 }
 
 static int CmdStatsAllGroups(const std::string& mds) {
@@ -217,10 +226,22 @@ static int CmdStatsAllGroups(const std::string& mds) {
   return rc;
 }
 
-static int CmdRing(const std::string& mds, const std::string& group) {
+static int CmdRing(const std::string& mds, const std::string& group,
+                   bool allow_empty) {
   if (mds.empty()) { std::fprintf(stderr, "ring needs --mds ip:port[,...]\n"); return 2; }
   std::vector<MemberInfo> ms;
   if (!QueryMembers(mds, group, &ms)) { std::fprintf(stderr, "ring: MDS query failed\n"); return 1; }
+  if (ms.empty()) {
+    std::printf("group=%s members=0 ring_points=0\n", group.c_str());
+    std::printf("%-16s %-22s %6s %8s %7s  %s\n",
+                "ID", "ADDR", "WEIGHT", "VNODES", "SHARE", "INFO");
+    if (!allow_empty) {
+      std::fprintf(stderr, "ring: group=%s has no registered cache nodes\n",
+                   group.c_str());
+      return 1;
+    }
+    return 0;
+  }
   ConHash ring;
   for (const auto& m : ms) ring.AddNode(m.id, m.weight);
   ring.Build();
@@ -267,37 +288,100 @@ static int CmdStatAll(const std::string& mds, const std::string& group,
   if (mds.empty()) { std::fprintf(stderr, "stat --all needs --mds ip:port[,...]\n"); return 2; }
   std::vector<MemberInfo> ms;
   if (!QueryMembers(mds, group, &ms)) { std::fprintf(stderr, "stat --all: MDS query failed\n"); return 1; }
+  if (ms.empty()) {
+    std::fprintf(stderr, "stat --all: group=%s has an empty placement ring\n",
+                 group.c_str());
+    return 1;
+  }
   TcpTransport t; t.set_timeouts(2000, 3000);
   uint64_t T_used = 0, T_obj = 0, T_hit = 0, T_miss = 0, T_w = 0, T_r = 0;
-  std::printf("%-14s %-20s %10s %9s %9s %9s %6s\n",
-              "ID", "ADDR", "USED_MB", "OBJECTS", "HITS", "MISSES", "HIT%");
+  uint64_t unreachable = 0, unhealthy = 0, unknown = 0;
+  std::printf("%-14s %-20s %-10s %6s %6s %5s %5s %7s %10s %9s %9s %9s %6s\n",
+              "ID", "ADDR", "VERSION", "READY", "HEALTH", "MDS", "RDMA",
+              "RD-ERR", "USED_MB", "OBJECTS", "HITS", "MISSES", "HIT%");
   for (const auto& m : ms) {
     // Port to reach kStats on: an explicit --stat-port wins; else the server-registered
     // TCP wire/stat port from the MDS (m.tcp_port); else fall back to the member's data
-    // port (the rdma-port in an RDMA deploy, where it would print (unreachable)).
+    // port (the rdma-port in an RDMA deploy, where it prints unreachable).
     uint32_t sp = stat_port ? stat_port : (m.tcp_port ? m.tcp_port : m.port);
+    const std::string version = InfoField(m.info, "ver");
     std::string addr = m.ip + ":" + std::to_string(sp), text;
     if (t.Stats(addr, &text) != Status::kOk) {
-      std::printf("%-14s %-20s   (unreachable)\n", m.id.c_str(), addr.c_str());
+      std::printf("%-14s %-20s %-10s   (unreachable)\n", m.id.c_str(),
+                  addr.c_str(), version.empty() ? "-" : version.c_str());
+      ++unreachable;
       continue;
     }
+    uint64_t ready = 0, health = 0, mds_health = 0, rdma_ready = 0;
+    const bool has_ready = PromMetricValue(text, "dfkv_server_ready", &ready);
+    const bool has_health =
+        PromMetricValue(text, "dfkv_server_healthy", &health);
+    const bool has_mds =
+        PromMetricValue(text, "dfkv_mds_heartbeat_healthy", &mds_health);
+    const bool has_rdma =
+        PromMetricValue(text, "dfkv_rdma_v2_ready", &rdma_ready);
+    auto state = [](bool present, uint64_t value) {
+      return present ? (value ? "yes" : "NO") : "-";
+    };
+    const bool bad = (has_ready && !ready) || (has_health && !health) ||
+                     (has_mds && !mds_health) || (has_rdma && !rdma_ready);
+    if (bad) ++unhealthy;
+    if (!has_ready || !has_health) ++unknown;
     uint64_t used = PromMetricValue(text, "dfkv_used_bytes");
     uint64_t obj = PromMetricValue(text, "dfkv_objects");
     uint64_t hit = PromMetricValue(text, "dfkv_cache_hit_total");
     uint64_t miss = PromMetricValue(text, "dfkv_cache_miss_total");
     uint64_t w = PromMetricValue(text, "dfkv_bytes_written_total");
     uint64_t r = PromMetricValue(text, "dfkv_bytes_read_total");
-    double hr = (hit + miss) ? 100.0 * static_cast<double>(hit) / static_cast<double>(hit + miss) : 0.0;
-    std::printf("%-14s %-20s %10.1f %9llu %9llu %9llu %5.1f%%\n", m.id.c_str(), addr.c_str(),
-                used / 1048576.0, (unsigned long long)obj, (unsigned long long)hit,
+    uint64_t rdma_errors =
+        PromMetricValue(text, "dfkv_rdma_completion_errors_total");
+    double hr = (hit + miss) ? 100.0 * static_cast<double>(hit) /
+                                  static_cast<double>(hit + miss)
+                             : 0.0;
+    std::printf("%-14s %-20s %-10s %6s %6s %5s %5s %7llu %10.1f %9llu %9llu %9llu %5.1f%%\n",
+                m.id.c_str(), addr.c_str(),
+                version.empty() ? "-" : version.c_str(),
+                state(has_ready, ready), state(has_health, health),
+                state(has_mds, mds_health), state(has_rdma, rdma_ready),
+                (unsigned long long)rdma_errors, used / 1048576.0,
+                (unsigned long long)obj, (unsigned long long)hit,
                 (unsigned long long)miss, hr);
     T_used += used; T_obj += obj; T_hit += hit; T_miss += miss; T_w += w; T_r += r;
   }
-  double thr = (T_hit + T_miss) ? 100.0 * static_cast<double>(T_hit) / static_cast<double>(T_hit + T_miss) : 0.0;
-  std::printf("TOTAL used=%.1fMB objects=%llu hits=%llu misses=%llu hit%%=%.1f bytes_w=%llu bytes_r=%llu\n",
-              T_used / 1048576.0, (unsigned long long)T_obj, (unsigned long long)T_hit,
-              (unsigned long long)T_miss, thr, (unsigned long long)T_w, (unsigned long long)T_r);
-  return 0;
+  double thr = (T_hit + T_miss) ? 100.0 * static_cast<double>(T_hit) /
+                                      static_cast<double>(T_hit + T_miss)
+                                : 0.0;
+  std::printf("TOTAL used=%.1fMB objects=%llu hits=%llu misses=%llu hit%%=%.1f bytes_w=%llu bytes_r=%llu unreachable=%llu unhealthy=%llu health-unknown=%llu\n",
+              T_used / 1048576.0, (unsigned long long)T_obj,
+              (unsigned long long)T_hit, (unsigned long long)T_miss, thr,
+              (unsigned long long)T_w, (unsigned long long)T_r,
+              (unsigned long long)unreachable, (unsigned long long)unhealthy,
+              (unsigned long long)unknown);
+  return (unreachable == 0 && unhealthy == 0 && unknown == 0) ? 0 : 1;
+}
+
+static int CmdStatAllGroups(const std::string& mds, uint32_t stat_port) {
+  if (mds.empty()) {
+    std::fprintf(stderr, "stat --all needs --mds ip:port[,...]\n");
+    return 2;
+  }
+  std::vector<std::string> groups;
+  if (!QueryGroups(mds, &groups)) {
+    std::fprintf(stderr,
+                 "stat --all: group inventory query failed (MDS < 1.10?)\n");
+    return 1;
+  }
+  if (groups.empty()) {
+    std::printf("no groups registered\n");
+    return 0;
+  }
+  int rc = 0;
+  for (size_t i = 0; i < groups.size(); ++i) {
+    if (i) std::printf("\n");
+    std::printf("== group=%s ==\n", groups[i].c_str());
+    rc |= CmdStatAll(mds, groups[i], stat_port);
+  }
+  return rc;
 }
 
 static std::vector<std::pair<std::string, std::string>> ParseMembers(const std::string& s) {
@@ -315,12 +399,49 @@ static std::vector<std::pair<std::string, std::string>> ParseMembers(const std::
   return out;
 }
 
+static void PrintClientDiagnostics(const char* op, const KVClient& client,
+                                   bool always) {
+  const std::string text = client.MetricsSnapshot();
+  const uint64_t ring = PromMetricValue(text, "dfkv_client_ring_members");
+  const uint64_t io = PromMetricValue(text, "dfkv_client_io_errors_total");
+  const uint64_t skipped =
+      PromMetricValue(text, "dfkv_client_unhealthy_skips_total");
+  const uint64_t endpoint =
+      PromMetricSum(text, "dfkv_rdma_client_endpoint_errors_total");
+  const uint64_t rail =
+      PromMetricSum(text, "dfkv_rdma_client_rail_errors_total");
+  const uint64_t timeouts =
+      PromMetricValue(text, "dfkv_rdma_client_completion_timeouts_total");
+  const uint64_t oversize =
+      PromMetricValue(text, "dfkv_rdma_client_oversize_rejects_total");
+  const uint64_t seen =
+      PromMetricValue(text, "dfkv_rdma_client_max_block_seen_bytes");
+  const uint64_t declared =
+      PromMetricValue(text, "dfkv_rdma_client_declared_max_block_bytes");
+  if (!always && ring != 0 && io == 0 && skipped == 0 && endpoint == 0 &&
+      rail == 0 && timeouts == 0 && oversize == 0)
+    return;  // a normal logical miss/absence
+  std::fprintf(
+      stderr,
+      "dfkvctl %s diagnostics: ring=%llu io_errors=%llu unhealthy_skips=%llu "
+      "endpoint_errors=%llu rail_errors=%llu completion_timeouts=%llu "
+      "oversize_rejects=%llu max_block_seen_bytes=%llu "
+      "declared_max_block_bytes=%llu\n",
+      op, (unsigned long long)ring, (unsigned long long)io,
+      (unsigned long long)skipped, (unsigned long long)endpoint,
+      (unsigned long long)rail, (unsigned long long)timeouts,
+      (unsigned long long)oversize, (unsigned long long)seen,
+      (unsigned long long)declared);
+}
+
 int main(int argc, char** argv) {
   if (WantsVersion(argc, argv)) { std::printf("dfkvctl %s\n", Version()); return 0; }
   std::string members;
   std::string key_namespace;
   std::string mds, group = "default";
   bool all = false;
+  bool allow_empty = false;
+  bool group_explicit = false;
   uint32_t stat_port = 0;  // override; 0 = use MDS-provided tcp_port, else the member's port
   std::vector<std::string> pos;
   for (int i = 1; i < argc; ++i) {
@@ -330,8 +451,12 @@ int main(int argc, char** argv) {
     auto nv32 = [&](uint32_t* d) { if (i + 1 < argc) *d = (uint32_t)std::strtoul(argv[++i], nullptr, 0); };
     if (a == "--members" && i + 1 < argc) members = argv[++i];
     else if (a == "--mds" && i + 1 < argc) mds = argv[++i];
-    else if (a == "--group" && i + 1 < argc) group = argv[++i];
+    else if (a == "--group" && i + 1 < argc) {
+      group = argv[++i];
+      group_explicit = true;
+    }
     else if (a == "--all") all = true;
+    else if (a == "--allow-empty") allow_empty = true;
     else if (a == "--stat-port") nv32(&stat_port);
     else if (a == "--namespace" && i + 1 < argc) key_namespace = argv[++i];
     else pos.push_back(a);
@@ -339,7 +464,7 @@ int main(int argc, char** argv) {
   if (pos.empty()) { std::fprintf(stderr, "usage: dfkvctl [--members ...] [--namespace ...] put|get|exist|stat|stats|ring ...\n"); return 2; }
   const std::string& cmd = pos[0];
 
-  if (cmd == "ring") return CmdRing(mds, group);
+  if (cmd == "ring") return CmdRing(mds, group, allow_empty);
   if (cmd == "clients") return CmdClients(mds, group);
 
   if (cmd == "stats") {
@@ -347,7 +472,9 @@ int main(int argc, char** argv) {
     return CmdStats(mds, group);
   }
   if (cmd == "stat") {
-    if (all) return CmdStatAll(mds, group, stat_port);
+    if (all)
+      return group_explicit ? CmdStatAll(mds, group, stat_port)
+                            : CmdStatAllGroups(mds, stat_port);
     if (pos.size() < 2) { std::fprintf(stderr, "stat <node-ip:port>  |  stat --all --mds ... [--stat-port <p>]\n"); return 2; }
     TcpTransport t; std::string text;
     if (t.Stats(pos[1], &text) != Status::kOk) { std::fprintf(stderr, "stat failed\n"); return 1; }
@@ -362,15 +489,22 @@ int main(int argc, char** argv) {
 
   if (cmd == "put" && pos.size() >= 3) {
     bool ok = c.Put(pos[1], pos[2].data(), pos[2].size());
+    if (!ok) PrintClientDiagnostics("put", c, true);
     std::printf("%s\n", ok ? "OK" : "FAIL"); return ok ? 0 : 1;
   }
   if (cmd == "get" && pos.size() >= 2) {
     std::string out;
-    if (!c.GetAuto(pos[1], &out)) { std::printf("(miss)\n"); return 1; }
+    if (!c.GetAuto(pos[1], &out)) {
+      PrintClientDiagnostics("get", c, false);
+      std::printf("(miss)\n");
+      return 1;
+    }
     std::fwrite(out.data(), 1, out.size(), stdout); std::printf("\n"); return 0;
   }
   if (cmd == "exist" && pos.size() >= 2) {
-    bool e = c.Exist(pos[1]); std::printf("%s\n", e ? "true" : "false"); return e ? 0 : 1;
+    bool e = c.Exist(pos[1]);
+    if (!e) PrintClientDiagnostics("exist", c, false);
+    std::printf("%s\n", e ? "true" : "false"); return e ? 0 : 1;
   }
   std::fprintf(stderr, "unknown/!args: %s\n", cmd.c_str());
   return 2;

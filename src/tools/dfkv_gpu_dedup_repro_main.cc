@@ -20,6 +20,8 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <cerrno>
+#include <csignal>
 
 #include <chrono>
 #include <cstdio>
@@ -30,6 +32,7 @@
 #include <vector>
 
 #include "client/cuda_ipc.h"
+#include "common/version.h"
 #include "client/kv_client.h"
 
 using namespace dfkv;
@@ -44,6 +47,7 @@ struct Args {
   std::string key_namespace = "dfkv/gpu-dedup-repro";
   int rank = -1;  // >=0: child mode
   std::string barrier;
+  int timeout_seconds = 300;
 };
 
 std::string KeyName(size_t i) { return "gpudedup-repro-" + std::to_string(i); }
@@ -84,19 +88,35 @@ int Child(const Args& a) {
     items[i].caps = {a.size};
   }
 
-  // Barrier: every rank touches the file, then waits for `ranks` lines.
+  // Barrier: every rank touches the file, then waits boundedly for all peers.
   {
     FILE* f = std::fopen(a.barrier.c_str(), "a");
+    if (!f) {
+      std::fprintf(stderr, "rank %d: cannot open barrier for append\n", a.rank);
+      return 4;
+    }
     std::fprintf(f, "%d\n", a.rank);
     std::fclose(f);
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(a.timeout_seconds);
     for (;;) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
       FILE* r = std::fopen(a.barrier.c_str(), "r");
+      if (!r) {
+        std::fprintf(stderr, "rank %d: cannot open barrier for read\n", a.rank);
+        return 4;
+      }
       int lines = 0, ch;
       while ((ch = std::fgetc(r)) != EOF)
         if (ch == '\n') ++lines;
       std::fclose(r);
       if (lines >= a.ranks) break;
+      if (std::chrono::steady_clock::now() >= deadline) {
+        std::fprintf(stderr,
+                     "rank %d: barrier timed out after %d seconds (%d/%d ready)\n",
+                     a.rank, a.timeout_seconds, lines, a.ranks);
+        return 4;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
   }
 
@@ -130,6 +150,10 @@ int Child(const Args& a) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (WantsVersion(argc, argv)) {
+    std::printf("dfkv_gpu_dedup_repro %s\n", Version());
+    return 0;
+  }
   Args a;
   std::vector<char*> rest;
   for (int i = 1; i < argc; ++i) {
@@ -142,10 +166,17 @@ int main(int argc, char** argv) {
     else if (s == "--namespace") a.key_namespace = next();
     else if (s == "--rank") a.rank = std::stoi(next());
     else if (s == "--barrier") a.barrier = next();
+    else if (s == "--timeout") a.timeout_seconds = std::stoi(next());
   }
   if (a.members.empty()) {
-    std::fprintf(stderr, "usage: %s --members node=ip:port [--keys N] [--size B] [--ranks R]\n",
+    std::fprintf(stderr,
+                 "usage: %s --members node=ip:port [--keys N] [--size B] "
+                 "[--ranks R] [--timeout SECONDS]\n",
                  argv[0]);
+    return 1;
+  }
+  if (a.ranks <= 0 || a.timeout_seconds <= 0) {
+    std::fprintf(stderr, "--ranks and --timeout must be positive\n");
     return 1;
   }
   if (a.rank >= 0) return Child(a);
@@ -175,8 +206,13 @@ int main(int argc, char** argv) {
 
   char bar[] = "/tmp/gpudedup-repro-XXXXXX";
   int bfd = ::mkstemp(bar);
-  if (bfd >= 0) ::close(bfd);
+  if (bfd < 0) {
+    std::perror("mkstemp");
+    return 4;
+  }
+  ::close(bfd);
   std::vector<pid_t> kids;
+  int rc = 0;
   for (int r = 0; r < a.ranks; ++r) {
     pid_t pid = ::fork();
     if (pid == 0) {
@@ -186,16 +222,53 @@ int main(int argc, char** argv) {
               "--ranks", std::to_string(a.ranks).c_str(),
               "--namespace", a.key_namespace.c_str(),
               "--rank", std::to_string(r).c_str(),
-              "--barrier", bar, static_cast<char*>(nullptr));
+              "--barrier", bar,
+              "--timeout", std::to_string(a.timeout_seconds).c_str(),
+              static_cast<char*>(nullptr));
       _exit(97);
+    }
+    if (pid < 0) {
+      std::perror("fork");
+      rc = 4;
+      break;
     }
     kids.push_back(pid);
   }
-  int rc = 0;
-  for (pid_t p : kids) {
-    int st = 0;
-    ::waitpid(p, &st, 0);
-    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) rc = 4;
+
+  std::vector<bool> reaped(kids.size(), false);
+  size_t remaining = kids.size();
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(a.timeout_seconds);
+  while (remaining && std::chrono::steady_clock::now() < deadline) {
+    for (size_t i = 0; i < kids.size(); ++i) {
+      if (reaped[i]) continue;
+      int status = 0;
+      const pid_t result = ::waitpid(kids[i], &status, WNOHANG);
+      if (result == kids[i] || (result < 0 && errno != EINTR)) {
+        reaped[i] = true;
+        --remaining;
+        if (result < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+          rc = 4;
+      }
+    }
+    if (remaining)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  if (remaining) {
+    std::fprintf(stderr,
+                 "master: %zu rank(s) timed out after %d seconds; terminating\n",
+                 remaining, a.timeout_seconds);
+    rc = 4;
+    for (size_t i = 0; i < kids.size(); ++i)
+      if (!reaped[i]) ::kill(kids[i], SIGTERM);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    for (size_t i = 0; i < kids.size(); ++i) {
+      if (reaped[i]) continue;
+      int status = 0;
+      if (::waitpid(kids[i], &status, WNOHANG) == 0)
+        ::kill(kids[i], SIGKILL);
+      ::waitpid(kids[i], &status, 0);
+    }
   }
   ::unlink(bar);
   std::printf("master: %s\n", rc == 0 ? "ALL RANKS OK" : "FAILURES");

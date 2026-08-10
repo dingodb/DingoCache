@@ -1,7 +1,10 @@
-# OpenTelemetry Collector — receives OTLP from the dfkv connectors (metrics now,
-# traces later) and fans out: metrics -> a Prometheus scrape endpoint (:8889),
-# traces -> Tempo. The dfkv C++ server/mds are scraped directly by Prometheus
-# (pull); only the many/dynamic connectors push here.
+# OpenTelemetry Collector receives connector metrics and traces over OTLP.
+# Metrics become a Prometheus scrape endpoint; traces flow to Tempo. The small,
+# long-lived C++ server/MDS fleet remains direct Prometheus pull.
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
 receivers:
   otlp:
     protocols:
@@ -32,10 +35,9 @@ exporters:
     endpoint: tempo:4317
     tls:
       insecure: true
-  debug:
-    verbosity: basic
 
 service:
+  extensions: [health_check]
   telemetry:
     metrics:
       level: basic
@@ -43,8 +45,8 @@ service:
     metrics:
       receivers: [otlp]
       processors: [memory_limiter, batch]
-      exporters: [prometheus, debug]
+      exporters: [prometheus]
     traces:
       receivers: [otlp]
       processors: [memory_limiter, batch]
-      exporters: [otlp/tempo, debug]
+      exporters: [otlp/tempo]

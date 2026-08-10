@@ -258,6 +258,7 @@ TEST(MdsServer, StatsFlowThroughEtcdAndAggregateInMetrics) {
             std::string::npos);
   EXPECT_NE(mt.find("dfkv_mds_group_stats_missing{group=\"" + group + "\"} 0"),
             std::string::npos);
+  EXPECT_NE(mt.find("dfkv_mds_ready 1"), std::string::npos) << mt;
 
   // kListGroups enumerates it.
   ASSERT_TRUE(DoReq(port, WireOp::kListGroups, "", &st, &data));

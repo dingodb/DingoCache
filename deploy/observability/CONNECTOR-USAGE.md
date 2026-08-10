@@ -36,12 +36,14 @@ dfkv_server / dfkv_mds  <--Prometheus pull (/metrics)---------/        ^
 
 - **本地起一套**(自测用):
   ```bash
+  export DFKV_GRAFANA_ADMIN_PASSWORD='replace-me'
   docker compose -f deploy/observability/docker-compose.yml up -d
   # podman 无 compose 插件时,容器已存在可直接:
   # docker start otel-collector prometheus grafana tempo
   ```
-  Collector 端点:gRPC `localhost:4317` / HTTP `localhost:4318`,Grafana `localhost:3300`。
-- **指向中心化 Collector**:把下面的 `OTEL_EXPORTER_OTLP_ENDPOINT` 换成中心地址即可。
+  默认 stdlib exporter 用 HTTP `localhost:4318`；`localhost:4317` 只给显式
+  OTel SDK gRPC exporter。Grafana 为 `localhost:3000`。
+- **指向中心化 Collector**：把下面的 `OTEL_EXPORTER_OTLP_ENDPOINT` 换成中心 HTTP receiver 地址即可。
 
 ### 1.2 依赖(默认零依赖,不用装任何东西)
 telemetry 是 opt-in,且**默认用纯 stdlib 的 OTLP/HTTP-JSON 推送器**(`DFKV_METRICS_EXPORTER=stdlib`,默认)——
@@ -63,19 +65,25 @@ pip install opentelemetry-sdk opentelemetry-exporter-otlp
 | 环境变量 | extra_config 键 | 默认 | 作用 |
 |---|---|---|---|
 | `DFKV_METRICS_ENABLED` | `metrics` | `0`(关) | 推送指标总开关 |
-| `DFKV_TELEMETRY_ENABLED` | `telemetry` | `0` | 大开关(指标 + 以后的 trace),开它等于也开 metrics |
+| `DFKV_TELEMETRY_ENABLED` | `telemetry` | `0` | 大开关（metrics + traces）；各自显式开关优先 |
 | `DFKV_METRICS_EXPORTER` | `metrics_exporter` | `stdlib` | 导出器:`stdlib`(纯标准库 OTLP/HTTP-JSON,**零依赖,默认**) 或 `otel`(用 OpenTelemetry SDK,需装 `[otel]`) |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `otlp_endpoint` | SDK 默认 | Collector 地址(gRPC `:4317` / HTTP `:4318`) |
-| `OTEL_EXPORTER_OTLP_PROTOCOL` | `otlp_protocol` | `grpc` | `grpc` 或 `http/protobuf` |
-| `DFKV_CONNECTOR_ID` | `connector_id` | `<host>:<pid>:<tp_rank>` | 实例标识(给个稳定可读的名字更好认) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `otlp_endpoint` | stdlib: `http://localhost:4318`；otel: SDK 默认 | Collector endpoint；默认 stdlib 只发 OTLP/HTTP JSON（通常 `:4318`），显式 SDK exporter 才可按 SDK 配置 gRPC `:4317` |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `otlp_protocol` | stdlib: 固定 HTTP/JSON；otel: SDK 默认 | 只对 `DFKV_METRICS_EXPORTER=otel` 生效；stdlib 不读取它 |
+| `DFKV_CONNECTOR_ID` | `connector_id` | `<host>_<pid>_<tp_rank>` | 实例标识（建议给稳定可读值；字符限 `[A-Za-z0-9._-]`） |
+| `DFKV_MODEL` | `model` | runtime model / empty | Fallback model label when the connector does not pass authoritative runtime identity |
+| `DFKV_DEPLOYMENT` | `deployment` | empty | Stable deployment/serving-pool label |
+| `DFKV_CACHE_ROLE` | `cache_role` | runtime role / empty | `kv_producer` / `kv_consumer` / `kv_both` or the deployment's equivalent |
+| `DFKV_TEAM` | `team` | empty | Owning team label |
 | `DFKV_METRICS_EXPORT_INTERVAL_MS` | `metrics_export_interval_ms` | `10000` | OTLP 推送间隔(最小 1000) |
 | `DFKV_PROBE_INTERVAL_MS` | `probe_interval_ms` | 关(开 metrics 时 `5000`) | C++ 主动逐 peer 延迟探测,空闲节点也出延迟 |
 | `DFKV_PEER_LATENCY_POLL_S` | `peer_latency_poll_s` | `10` | 逐 peer 延迟 snapshot→push 间隔 |
 
-> **成本模型**:metrics 关时 —— 连接器 op 路径不求值任何指标参数(falsy 短路),
-> C++ 数据面字节不变,OTel SDK 根本不 import,约等于零。metrics 开时 —— 每个 op
-> 做一次内存里的聚合更新(无 I/O),后台线程按 `DFKV_METRICS_EXPORT_INTERVAL_MS`
-> 周期推送聚合状态(时间触发,不是按量触发)。
+> **成本与生命周期**：metrics 关时，连接器 op 路径不求值任何指标参数
+>（falsy 短路），不 import OTel、不启动线程。打开后，每个 op 只更新内存聚合，
+> 后台按 `DFKV_METRICS_EXPORT_INTERVAL_MS` 推送。多个同进程 connector 对共享
+> recorder 做引用计数；最后一个 close 会停止 poller、串行执行一次 final push，
+> 再释放 exporter。周期 push 失败不会丢掉窗口最大值或 native counter delta，
+> 下一次成功会重放。
 
 ---
 
@@ -102,7 +110,7 @@ source-controlled `vllm/raw-v1` namespace.
 
 ```bash
 export DFKV_METRICS_ENABLED=1
-export OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector>:4317
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector>:4318
 export DFKV_CONNECTOR_ID=prefill-rank0          # 可选,建议给
 # 然后照常 vllm serve ...
 ```
@@ -132,7 +140,7 @@ extra_config:
 
 ```bash
 export DFKV_METRICS_ENABLED=1
-export OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector>:4317
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector>:4318
 export DFKV_CONNECTOR_ID=lmcache-node1          # 可选
 ```
 
@@ -169,7 +177,7 @@ HiCache 连接器把 `extra_config` 传进了 telemetry(`configure(cfg)`),所以
   "interface_v1": 1,
   "mds_endpoints": "mds1:6700,mds2:6700",
   "metrics": 1,                              // ← 打开上报
-  "otlp_endpoint": "http://<collector>:4317",
+  "otlp_endpoint": "http://<collector>:4318",
   "connector_id": "sglang-tp0",              // 可选
   "probe_interval_ms": 5000                  // 可选,见下
 }
@@ -178,7 +186,7 @@ HiCache 连接器把 `extra_config` 传进了 telemetry(`configure(cfg)`),所以
 **写法 B:用环境变量**(和 vLLM/LMCache 一样,extra_config 没写时生效)
 ```bash
 export DFKV_METRICS_ENABLED=1
-export OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector>:4317
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector>:4318
 ```
 
 ### 4.3 SGLang 特有:自动开逐 peer 延迟探测
@@ -224,6 +232,6 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector>:4317
 
 | 我在用 | 最小开启(默认 stdlib,零依赖) |
 |---|---|
-| vLLM | `export DFKV_METRICS_ENABLED=1 OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector>:4317`（想用 SDK 才 `pip install 'dfkv-vllm[otel]'`） |
+| vLLM | `export DFKV_METRICS_ENABLED=1 OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector>:4318`（想用 SDK 才 `pip install 'dfkv-vllm[otel]'`） |
 | LMCache | 同上两个 env（想用 SDK 才 `pip install 'dfkv-connector[otel]'`） |
-| SGLang HiCache | extra_config 加 `"metrics":1,"otlp_endpoint":"http://<collector>:4317"`（想用 SDK 才 `pip install opentelemetry-sdk opentelemetry-exporter-otlp`） |
+| SGLang HiCache | extra_config 加 `"metrics":1,"otlp_endpoint":"http://<collector>:4318"`（想用 SDK 才 `pip install opentelemetry-sdk opentelemetry-exporter-otlp`） |

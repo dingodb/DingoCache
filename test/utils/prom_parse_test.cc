@@ -19,6 +19,19 @@ TEST(PromParse, BareAndLabeledAndMissing) {
   EXPECT_EQ(PromMetricValue(text, "dfkv_missing_metric"), 0u);
 }
 
+TEST(PromParse, DistinguishesMissingFromZeroAndSumsLabels) {
+  std::string text =
+      "dfkv_server_ready 0\n"
+      "dfkv_rdma_client_rail_errors_total{dev=\"ib0\"} 2\n"
+      "dfkv_rdma_client_rail_errors_total{dev=\"ib1\"} 3\n"
+      "dfkv_rdma_client_rail_errors_total_extra{dev=\"ib2\"} 99\n";
+  uint64_t value = 7;
+  EXPECT_TRUE(PromMetricValue(text, "dfkv_server_ready", &value));
+  EXPECT_EQ(value, 0u);
+  EXPECT_FALSE(PromMetricValue(text, "dfkv_missing", &value));
+  EXPECT_EQ(PromMetricSum(text, "dfkv_rdma_client_rail_errors_total"), 5u);
+}
+
 TEST(PromParse, DoesNotMatchPrefixOrHelpLine) {
   std::string text =
       "# HELP dfkv_cache_hit_total help\n"

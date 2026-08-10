@@ -5,7 +5,8 @@ BUILD="${1:?build dir}"
 
 # --version: each binary prints its name + a version string and exits 0 (must NOT
 # fall through to running the daemon).
-for b in dfkv_server dfkv_mds dfkvctl dfkv_bench dfkv_smoke; do
+for b in dfkv_server dfkv_mds dfkvctl dfkv_bench dfkv_smoke \
+         dfkv_discover_smoke dfkv_gpu_dedup_repro; do
   out=$("$BUILD/$b" --version)
   echo "$out" | grep -qE "^$b [0-9]+\.[0-9]+" || { echo "$b --version bad: '$out'"; exit 1; }
 done
@@ -138,6 +139,18 @@ echo "$out" | grep -qE '^GET[[:space:]].*fails=0$' || {
   echo "dfkv_bench successful GET report missing: '$out'"
   exit 1
 }
+echo "$out" | grep -qE '^GET_SETUP registered_arena_bytes=[1-9][0-9]* ' || {
+  echo "dfkv_bench registered GET arena report missing: '$out'"
+  exit 1
+}
+echo "$out" | grep -qE '^GET[[:space:]].*goodput [0-9.]+ GB/s.*ok=4 fails=0$' || {
+  echo "dfkv_bench fail-adjusted goodput report missing: '$out'"
+  exit 1
+}
+echo "$out" | grep -qE '^DIAG phase=GET .*ring=1 .*io_errors=0 .*completion_timeouts=0 ' || {
+  echo "dfkv_bench GET diagnostics missing: '$out'"
+  exit 1
+}
 
 rc=0
 out=$("$BUILD/dfkv_bench" --members "n=127.0.0.1:$P" --size 4096 --count 2 \
@@ -148,6 +161,22 @@ echo "$out" | grep -qE '^GET[[:space:]].*fails=2$' || {
   exit 1
 }
 echo "dfkv_bench parser/exit smoke OK"
+
+# One-shot CLI failures must include native ring/transport diagnostics rather
+# than only printing FAIL. Port 1 is intentionally unreachable.
+rc=0
+"$BUILD/dfkvctl" --members "n=127.0.0.1:1" --namespace "dfkv/smoke" \
+  put unavailable value >"$D/ctl-fail.out" 2>"$D/ctl-fail.err" || rc=$?
+[ "$rc" = 1 ] || {
+  echo "dfkvctl failed PUT: expected exit 1, got $rc"
+  exit 1
+}
+grep -qE 'dfkvctl put diagnostics: ring=1 io_errors=[1-9][0-9]*' \
+  "$D/ctl-fail.err" || {
+  echo "dfkvctl failed PUT diagnostics missing"
+  cat "$D/ctl-fail.err"
+  exit 1
+}
 
 # MDS must fail loud (exit 1) when etcd is unreachable, within the probe window,
 # instead of running "healthy" while every registration silently fails.

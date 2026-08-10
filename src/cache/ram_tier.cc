@@ -1029,6 +1029,7 @@ void RamTier::FlushLoop(Shard& s) {
         batch.push_back(std::move(s.flushq.front()));
         s.flushq.pop_front();
       }
+      s.flush_inflight += batch.size();
     }
 
     // Snapshot the slots (guaranteed present: queued items are flush-pinned,
@@ -1111,6 +1112,7 @@ void RamTier::FlushLoop(Shard& s) {
           flush_dropped_.fetch_add(1, std::memory_order_relaxed);
         }
       }
+      s.flush_inflight -= B;
     }
   }
 }
@@ -1139,7 +1141,7 @@ size_t RamTier::FlushBacklog() const {
   size_t n = 0;
   for (const auto& sh : shards_) {
     std::lock_guard<std::mutex> lk(sh->mu);
-    n += sh->flushq.size();
+    n += sh->flushq.size() + sh->flush_inflight;
   }
   return n;
 }

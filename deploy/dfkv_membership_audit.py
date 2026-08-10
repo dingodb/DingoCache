@@ -14,7 +14,14 @@ import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
 
-from dfkv_ops_common import RingMember, RingView, atomic_write, parse_ring, run_command
+from dfkv_ops_common import (
+    RingMember,
+    RingView,
+    atomic_write,
+    atomic_write_with_checksum,
+    parse_ring,
+    run_command,
+)
 
 
 @dataclass(frozen=True)
@@ -154,10 +161,13 @@ def audit(args: argparse.Namespace) -> tuple[dict[str, object], int]:
     views: dict[str, RingView] = {}
     for endpoint in [item for item in args.mds.split(",") if item]:
         try:
-            output = run_command(
-                [args.dfkvctl, "ring", "--mds", endpoint, "--group", args.group],
-                args.timeout,
-            )
+            command = [
+                args.dfkvctl, "ring", "--mds", endpoint,
+                "--group", args.group,
+            ]
+            if args.allow_empty:
+                command.append("--allow-empty")
+            output = run_command(command, args.timeout)
             views[endpoint] = parse_ring(output)
         except (RuntimeError, ValueError) as error:
             issues.append({"severity": "critical", "code": "mds_unreachable", "endpoint": endpoint, "message": str(error)})
@@ -187,15 +197,6 @@ def audit(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                         "code": "mds_split_brain",
                         "endpoint": endpoint,
                         "message": "MDS endpoint returned a different placement view/ring epoch",
-                    }
-                )
-            if view.fingerprint() != canonical.fingerprint():
-                issues.append(
-                    {
-                        "severity": "warning",
-                        "code": "mds_self_report_drift",
-                        "endpoint": endpoint,
-                        "message": "MDS placement agrees but node self-report/vnode metadata differs",
                     }
                 )
 
@@ -239,11 +240,12 @@ def audit(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                     }
                 )
 
+    has_critical = any(issue["severity"] == "critical" for issue in issues)
     report: dict[str, object] = {
         "schema_version": 1,
         "generated_at": int(time.time()),
         "group": args.group,
-        "healthy": not issues,
+        "healthy": not has_critical,
         "ring_epoch": canonical.epoch if canonical else None,
         "etcd_header_revision": etcd_revision,
         "mds_views": {
@@ -268,7 +270,7 @@ def audit(args: argparse.Namespace) -> tuple[dict[str, object], int]:
         ],
         "issues": issues,
     }
-    return report, 0 if not issues else 2
+    return report, 2 if has_critical else 0
 
 
 def prometheus(report: dict[str, object]) -> str:
@@ -347,7 +349,7 @@ def main(argv: list[str] | None = None) -> int:
         report, status = audit(args)
         content = json.dumps(report, indent=2, sort_keys=True) + "\n"
         if args.output:
-            atomic_write(args.output, content)
+            atomic_write_with_checksum(args.output, content)
         else:
             sys.stdout.write(content)
         if args.prom_output:

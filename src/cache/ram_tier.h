@@ -221,7 +221,7 @@ class RamTier {
   uint64_t Evictions() const;
   uint64_t UsedBytes() const;   // arena slot + dedicated allocation bytes
   size_t Count() const;
-  size_t FlushBacklog() const;  // queued, not-yet-durable items
+  size_t FlushBacklog() const;  // queued or flushing, not-yet-durable items
 
  private:
   struct FreeAligned {
@@ -278,6 +278,7 @@ class RamTier {
     std::unordered_map<BlockKey, Entry, KeyHash> index;
     std::unordered_map<BlockKey, std::shared_ptr<PutCompletion>, KeyHash> writing;
     std::deque<QItem> flushq;
+    size_t flush_inflight = 0;
     std::condition_variable cv;
     bool stop = false;
     std::vector<uint64_t> reclaim_last_puts;  // reclaim-thread-local snapshot

@@ -109,7 +109,8 @@ add_executable(dfkv_gpu_dedup_repro ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/dfkv_g
 target_link_libraries(dfkv_gpu_dedup_repro PRIVATE dfkv_core)
 
 include(GNUInstallDirs)
-install(TARGETS dfkv dfkv_server dfkv_mds dfkv_smoke dfkvctl dfkv_bench dfkv_discover_smoke dfkv_core
+install(TARGETS dfkv dfkv_server dfkv_mds dfkv_smoke dfkvctl dfkv_bench
+        dfkv_discover_smoke dfkv_gpu_dedup_repro dfkv_core
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
@@ -124,20 +125,38 @@ install(FILES
 # Canonical binary namespace/client ABI package shared by every connector.
 install(DIRECTORY integration/common/src/dfkv_common
   DESTINATION ${CMAKE_INSTALL_DATADIR}/dfkv/python
-  FILES_MATCHING PATTERN "*.py")
+  FILES_MATCHING PATTERN "*.py" PATTERN "__pycache__" EXCLUDE)
 # Shared telemetry package (push metrics and tracing).
 install(DIRECTORY integration/hicache/dfkv_telemetry
   DESTINATION ${CMAKE_INSTALL_DATADIR}/dfkv/python
-  FILES_MATCHING PATTERN "*.py")
+  FILES_MATCHING PATTERN "*.py" PATTERN "__pycache__" EXCLUDE)
+# Ship the supported operational scripts, deployment templates, connector
+# sources, documentation, and referenced C++/test sources in one inspectable
+# repository layout. Relative links under docs/ therefore remain valid offline.
+install(DIRECTORY src docs deploy integration test .github
+  DESTINATION ${CMAKE_INSTALL_DATADIR}/dfkv
+  USE_SOURCE_PERMISSIONS
+  PATTERN "__pycache__" EXCLUDE
+  PATTERN ".pytest_cache" EXCLUDE
+  PATTERN ".mypy_cache" EXCLUDE
+  PATTERN "*.egg-info" EXCLUDE
+  PATTERN "build" EXCLUDE
+  PATTERN "dist" EXCLUDE
+  PATTERN "*.pyc" EXCLUDE)
+install(FILES CMakeLists.txt Makefile Dockerfile .dockerignore
+              README.md CHANGELOG.md VERSION LICENSE
+  DESTINATION ${CMAKE_INSTALL_DATADIR}/dfkv)
 
 # --- tests ---
 if(DFKV_BUILD_TESTS)
   enable_testing()
   include(FetchContent)
   FetchContent_Declare(googletest
-    GIT_REPOSITORY https://github.com/google/googletest.git
-    GIT_TAG release-1.12.1)
+    URL https://github.com/google/googletest/releases/download/v1.17.0/googletest-1.17.0.tar.gz
+    URL_HASH SHA256=65fab701d9829d38cb77c14acdc431d2108bfdbf8979e40eb8ae567edf10b27c
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
   set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+  set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(googletest)
   include(GoogleTest)
 
@@ -194,11 +213,27 @@ if(DFKV_BUILD_TESTS)
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
     set_tests_properties(python_plugin PROPERTIES
       ENVIRONMENT "DFKV_BUILD=${CMAKE_BINARY_DIR};DFKV_LIB=${CMAKE_BINARY_DIR}/libdfkv.so;DFKV_STORE_ENGINE=file;DFKV_SLAB_WRITE=buffered;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
+    add_test(NAME python_client_metrics
+      COMMAND ${PYTHON3} -m unittest discover
+              -s ${CMAKE_CURRENT_SOURCE_DIR}/integration/common/tests
+              -p test_client_metrics.py)
+    set_tests_properties(python_client_metrics PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
     # Shared telemetry layer: pure-python, no build/lib needed (OTel-push test
     # self-skips when the SDK is absent). Includes the vendored-copy drift guard.
     add_test(NAME python_telemetry
       COMMAND ${PYTHON3} -m unittest test_dfkv_telemetry test_telemetry_vendor_sync
+              test_observability_contract test_release_contract
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
+    set_tests_properties(python_telemetry PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
+    add_test(NAME python_operational_tools
+      COMMAND ${PYTHON3} -m unittest test_dfkv_operational_tools
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
+    add_test(NAME dfkvctl_all_groups
+      COMMAND ${PYTHON3}
+              ${CMAKE_CURRENT_SOURCE_DIR}/test/python/test_dfkvctl_all_groups.py
+              ${CMAKE_BINARY_DIR})
   endif()
 
   # CLI tools integration smoke (dfkv_server + dfkv_smoke + dfkvctl)

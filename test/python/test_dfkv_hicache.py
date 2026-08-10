@@ -230,8 +230,11 @@ class DingoFSHiCacheTest(unittest.TestCase):
             p.terminate()
             try:
                 p.wait(timeout=5)
-            except Exception:
+            except subprocess.TimeoutExpired:
                 p.kill()
+                p.wait(timeout=5)
+            if p.stdout is not None:
+                p.stdout.close()
         for d in cls.dirs:
             shutil.rmtree(d, ignore_errors=True)
 
@@ -1052,8 +1055,11 @@ class DfkvAccessLogTest(unittest.TestCase):
             p.terminate()
             try:
                 p.wait(timeout=5)
-            except Exception:
+            except subprocess.TimeoutExpired:
                 p.kill()
+                p.wait(timeout=5)
+            if p.stdout is not None:
+                p.stdout.close()
         for d in cls.dirs:
             shutil.rmtree(d, ignore_errors=True)
 
@@ -1325,15 +1331,16 @@ class ClientStatsPollerTest(unittest.TestCase):
 
         return ClientStatsPoller(get_text, tp_rank=0, interval_s=0.01)
 
-    def test_parse_handles_bare_and_labeled(self):
-        from dfkv_metrics import ClientStatsPoller
+    def test_shared_parser_handles_bare_and_labeled_metrics(self):
+        from dfkv_common.client_metrics import parse_snapshot
         text = ("# TYPE dfkv_client_ops_served_total counter\n"
                 "dfkv_client_ops_served_total 7\n"
                 "dfkv_client_peer_errors_total{peer=\"1.2.3.4:1\"} 3\n")
-        vals = ClientStatsPoller._parse(text)
-        self.assertEqual(vals.get("dfkv_client_ops_served_total"), 7)
-        # per-peer series is not in the mirrored aggregate set
-        self.assertNotIn("dfkv_client_peer_errors_total", vals)
+        samples = {sample.name: sample for sample in parse_snapshot(text)}
+        self.assertEqual(samples["dfkv_client_ops_served_total"].value, 7)
+        self.assertEqual(samples["dfkv_client_peer_errors_total"].value, 3)
+        self.assertEqual(samples["dfkv_client_peer_errors_total"].labels,
+                         ("1.2.3.4:1",))
 
     def test_poll_once_accumulates_deltas(self):
         p = self._poller([

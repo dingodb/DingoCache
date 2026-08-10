@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
+requires = ["setuptools==82.0.1", "wheel==0.47.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "dfkv-connector"
-version = "2.0.0"
+version = "2.11.0"
 description = "LMCache RemoteConnector for the dfkv KV cache (ctypes over libdfkv.so)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -14,7 +14,7 @@ authors = [{ name = "Wine93", email = "wine93.info@gmail.com" }]
 # runtime by path (DFKV_LIB / remote_storage_plugin.dfkv.lib). No bundled .so,
 # no CPython extension, so the wheel is platform-independent.
 dependencies = [
-  "dfkv-common==2.0.0",
+  "dfkv-common==2.11.0",
   "lmcache",
   "torch",
 ]
@@ -22,7 +22,7 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest", "pytest-asyncio"]
 # Opt-in telemetry (OTLP push); zero-cost no-op when unset / not installed.
-otel = ["opentelemetry-sdk", "opentelemetry-exporter-otlp"]
+otel = ["opentelemetry-sdk==1.41.1", "opentelemetry-exporter-otlp==1.41.1"]
 
 [tool.setuptools]
 package-dir = { "" = "src" }

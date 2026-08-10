@@ -570,7 +570,7 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_ram_reclaimed_total", "counter", "RAM slots freed ahead of demand by the background reclaimer", ram_->Reclaimed());
     metric("dfkv_ram_rebalanced_total", "counter", "RAM extents moved from cold classes to hot ones by the reclaimer", ram_->Rebalanced());
     metric("dfkv_ram_objects", "gauge", "Blocks currently resident in the RAM hot tier", ram_->Count());
-    metric("dfkv_ram_flush_backlog", "gauge", "RAM slots queued for flush (not yet durable)", ram_->FlushBacklog());
+    metric("dfkv_ram_flush_backlog", "gauge", "RAM slots queued or flushing (not yet durable)", ram_->FlushBacklog());
     metric("dfkv_ram_budget_bytes", "gauge",
            "Hard total RAM-tier budget across arena and dedicated values",
            ram_->budget_bytes());
@@ -594,6 +594,23 @@ std::string KvNodeServer::MetricsText() const {
            ram_->flusher_count());
   }
   return s;
+}
+
+void KvNodeServer::set_metrics_extension(
+    std::function<std::string()> render) {
+  std::lock_guard<std::mutex> lk(metrics_extension_mu_);
+  metrics_extension_ = std::move(render);
+}
+
+std::string KvNodeServer::FullMetricsText() const {
+  std::function<std::string()> render;
+  {
+    std::lock_guard<std::mutex> lk(metrics_extension_mu_);
+    render = metrics_extension_;
+  }
+  std::string text = MetricsText();
+  if (render) text += render();
+  return text;
 }
 
 void KvNodeServer::AcceptLoop() {
@@ -822,7 +839,7 @@ Status KvNodeServer::ProcessRequestForKey(
       break;
     }
     case WireOp::kStats:
-      *out_data = MetricsText();
+      *out_data = FullMetricsText();
       st = Status::kOk;
       break;
     case WireOp::kMembers:

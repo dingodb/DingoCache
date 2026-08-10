@@ -10,7 +10,8 @@
 # glibc; static-linking them removes a separate runtime dep). libibverbs CANNOT
 # be static (it dlopen()s provider drivers at runtime), so the run node still
 # needs rdma-core / libibverbs installed.
-ARG DFKV_BASE_IMAGE=m.daocloud.io/docker.io/library/ubuntu:22.04
+# ubuntu:22.04, pinned so a release tag always rebuilds from identical bytes.
+ARG DFKV_BASE_IMAGE=m.daocloud.io/docker.io/library/ubuntu@sha256:3b06811b2afd352be909dd088a004166d665dc76d38b13eada33522a9d915c6f
 FROM ${DFKV_BASE_IMAGE} AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake ninja-build g++ git ca-certificates libibverbs-dev liburing-dev && \

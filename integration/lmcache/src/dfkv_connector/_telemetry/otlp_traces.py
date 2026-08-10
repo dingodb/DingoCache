@@ -25,6 +25,7 @@ import collections
 import json
 import threading
 import urllib.request
+import warnings
 
 # Reuse the metrics exporter's attribute encoder + hostname helper so the two
 # OTLP/HTTP-JSON paths can't drift in how they encode values / resolve the host.
@@ -32,15 +33,15 @@ from .otlp_json import _attr, _host
 
 
 def traces_url(endpoint):
-    """Resolve OTEL_EXPORTER_OTLP_ENDPOINT to the traces path. A base endpoint
-    gets ``/v1/traces`` appended; a full ``.../v1/traces`` is used verbatim.
-    Mirrors ``otlp_json.metrics_url``."""
+    """Resolve a generic or signal-specific OTLP endpoint to ``/v1/traces``."""
     ep = (endpoint or "http://localhost:4318").strip()
     if "://" not in ep:
         ep = "http://" + ep
     ep = ep.rstrip("/")
     if ep.endswith("/v1/traces"):
         return ep
+    if ep.endswith("/v1/metrics"):
+        return ep[:-len("/v1/metrics")] + "/v1/traces"
     return ep + "/v1/traces"
 
 
@@ -86,6 +87,13 @@ def _resource_attrs(identity):
         _attr("dfkv.pid", identity.pid),
         _attr("dfkv.tp_rank", int(identity.tp_rank)),
     ]
+    for key, value in (
+            ("dfkv.model", getattr(identity, "model", "")),
+            ("dfkv.deployment", getattr(identity, "deployment", "")),
+            ("dfkv.cache_role", getattr(identity, "cache_role", "")),
+            ("dfkv.team", getattr(identity, "team", ""))):
+        if value:
+            attrs.append(_attr(key, value))
     if getattr(identity, "version", ""):
         attrs.append(_attr("dfkv.version", identity.version))
     if getattr(identity, "native_version", ""):
@@ -123,6 +131,8 @@ class StdlibSpanExporter:
         self._thread = None
         # An opener with an empty ProxyHandler ignores HTTP(S)_PROXY for this POST.
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        self._failed = False
+        self._flush_lock = threading.Lock()
 
     def enqueue(self, span):
         """Append a finished span. Drops (and counts) the oldest if the buffer is
@@ -147,29 +157,59 @@ class StdlibSpanExporter:
             spans = list(self._buf)
             self._buf.clear()
             return spans
+    def _restore_after_failure(self, spans):
+        with self._lock:
+            combined = spans + list(self._buf)
+            overflow = max(0, len(combined) - self._max)
+            if overflow:
+                self._dropped += overflow
+                combined = combined[overflow:]
+            self._buf = collections.deque(combined, maxlen=self._max)
+
 
     def flush(self):
-        """Drain the buffer and POST one batch. Returns the HTTP status, or None
-        if there was nothing to send."""
-        spans = self._drain()
-        if not spans:
-            return None
-        body = json.dumps(build_payload(self._identity, spans)).encode("utf-8")
-        req = urllib.request.Request(self._url, data=body,
-                                     headers={"Content-Type": "application/json"})
-        resp = self._opener.open(req, timeout=5)
+        """Drain and POST one batch, restoring it on any delivery-path failure."""
+        with self._flush_lock:
+            spans = self._drain()
+            if not spans:
+                return None
+            try:
+                body = json.dumps(
+                    build_payload(self._identity, spans)).encode("utf-8")
+                req = urllib.request.Request(
+                    self._url, data=body,
+                    headers={"Content-Type": "application/json"})
+                resp = self._opener.open(req, timeout=5)
+                try:
+                    resp.read()
+                    return resp.status
+                finally:
+                    resp.close()
+            except Exception:
+                self._restore_after_failure(spans)
+                raise
+
+    def _flush_guarded(self):
         try:
-            resp.read()
-            return resp.status
-        finally:
-            resp.close()
+            status = self.flush()
+        except Exception as exc:
+            if not self._failed:
+                warnings.warn(
+                    "dfkv OTLP trace export failed for {}: {}; buffered spans "
+                    "were retained and will be retried".format(self._url, exc),
+                    RuntimeWarning, stacklevel=2)
+            self._failed = True
+            return False
+        if status is not None and self._failed:
+            warnings.warn(
+                "dfkv OTLP trace export recovered for {}".format(self._url),
+                RuntimeWarning, stacklevel=2)
+            self._failed = False
+        return True
 
     def _loop(self):
         while not self._stop.wait(self._interval):
-            try:
-                self.flush()
-            except Exception:
-                pass  # a transient collector hiccup must not kill the thread
+            self._flush_guarded()
 
     def start(self):
         if self._interval <= 0:
@@ -181,9 +221,8 @@ class StdlibSpanExporter:
     def stop(self):
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=2)
+            # urllib's request timeout is 5s; do not race a final flush against
+            # a periodic request that already drained the shared buffer.
+            self._thread.join(timeout=6)
             self._thread = None
-        try:
-            self.flush()  # final best-effort flush of whatever is still buffered
-        except Exception:
-            pass
+        self._flush_guarded()

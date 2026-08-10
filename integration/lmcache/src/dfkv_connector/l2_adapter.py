@@ -297,6 +297,7 @@ class DfkvL2Adapter(L2AdapterInterface):
             key_namespace=namespace,
             lib_path=config.lib,
             mds_poll_ms=config.mds_poll_ms,
+            model=config.model_name,
             rdma_pools=rdma_pools,
             loop=self._loop,
             get_parallelism=config.num_workers,

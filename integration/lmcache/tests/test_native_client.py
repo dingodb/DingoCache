@@ -90,6 +90,57 @@ def test_mds_discovery_and_registration_are_atomic_open_options(monkeypatch):
     assert captured["heartbeat"] == 10000
     assert captured["closed"]
 
+def test_telemetry_setup_failure_closes_native_client(monkeypatch):
+    calls = []
+
+    class FakeLib:
+        def dfkv_open_v2(self, _ptr):
+            return 0xCAFE
+
+        def dfkv_transport_mode(self, _handle):
+            return b"rdma"
+
+        def dfkv_version(self):
+            return b"2.0.0"
+
+        def dfkv_close(self, handle):
+            calls.append(("close", handle))
+
+    def fail_metrics(*_args, **_kwargs):
+        calls.append(("metrics-configure",))
+        raise ValueError("bad telemetry identity")
+
+    monkeypatch.setattr(client_module, "load_lib", lambda _path: FakeLib())
+    monkeypatch.setattr(client_module._push_metrics, "configure", fail_metrics)
+    monkeypatch.setattr(
+        client_module._push_metrics, "release",
+        lambda: calls.append(("metrics-release",)))
+    monkeypatch.setattr(
+        client_module._push_tracing, "release",
+        lambda: calls.append(("tracing-release",)))
+    monkeypatch.setattr(client_module._hot_config, "stop", lambda: None)
+
+    async def construct():
+        try:
+            DfkvNativeClient(
+                raw_endpoint="n1=127.0.0.1:28001",
+                membership="static",
+                key_namespace=b"lmcache\x00telemetry-failure",
+            )
+        except ValueError as exc:
+            assert "bad telemetry identity" in str(exc)
+        else:
+            raise AssertionError("constructor unexpectedly succeeded")
+
+    asyncio.run(construct())
+    assert calls == [
+        ("metrics-configure",),
+        ("close", 0xCAFE),
+        ("metrics-release",),
+        ("tracing-release",),
+    ]
+
+
 def test_binary_keys_and_lengths_reach_every_native_operation():
     keys = [b"a\x00\xff", b"a"]
     seen = []

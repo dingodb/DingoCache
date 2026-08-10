@@ -1,0 +1,14 @@
+.git
+build
+build-*
+release
+release-*
+dist
+wheels
+integration/*/build
+integration/*/dist
+integration/*/*.egg-info
+integration/*/src/*.egg-info
+**/__pycache__
+**/.pytest_cache
+**/*.pyc

@@ -41,14 +41,19 @@ inline bool Base64Decode(const std::string& in, std::string* out) {
     return -1;
   };
   out->clear();
-  int buf = 0, bits = 0;
+  uint32_t buf = 0;
+  unsigned bits = 0;
   for (char c : in) {
     if (c == '=' || c == '\n' || c == '\r') continue;
     int v = val(c);
     if (v < 0) return false;
-    buf = (buf << 6) | v;
+    buf = (buf << 6) | static_cast<uint32_t>(v);
     bits += 6;
-    if (bits >= 8) { bits -= 8; out->push_back(char((buf >> bits) & 0xFF)); }
+    if (bits >= 8) {
+      bits -= 8;
+      out->push_back(char((buf >> bits) & 0xFF));
+      buf &= bits == 0 ? 0u : (uint32_t{1} << bits) - 1;
+    }
   }
   return true;
 }

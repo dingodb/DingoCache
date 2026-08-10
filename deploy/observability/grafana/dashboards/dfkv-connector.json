@@ -6,7 +6,7 @@
     "telemetry"
   ],
   "schemaVersion": 39,
-  "version": 3,
+  "version": 4,
   "refresh": "10s",
   "time": {
     "from": "now-30m",
@@ -57,6 +57,94 @@
         },
         "refresh": 2,
         "sort": 1
+      },
+      {
+        "type": "query",
+        "name": "model",
+        "label": "Model",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "qryType": 1,
+          "query": "label_values(dfkv_connector_info{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}, dfkv_model)",
+          "refId": "A"
+        },
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "refresh": 2,
+        "sort": 1
+      },
+      {
+        "type": "query",
+        "name": "deployment",
+        "label": "Deployment",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "qryType": 1,
+          "query": "label_values(dfkv_connector_info{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}, dfkv_deployment)",
+          "refId": "A"
+        },
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "refresh": 2,
+        "sort": 1
+      },
+      {
+        "type": "query",
+        "name": "cache_role",
+        "label": "Cache role",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "qryType": 1,
+          "query": "label_values(dfkv_connector_info{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}, dfkv_cache_role)",
+          "refId": "A"
+        },
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "refresh": 2,
+        "sort": 1
+      },
+      {
+        "type": "query",
+        "name": "team",
+        "label": "Team",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "qryType": 1,
+          "query": "label_values(dfkv_connector_info{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}, dfkv_team)",
+          "refId": "A"
+        },
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "refresh": 2,
+        "sort": 1
       }
     ]
   },
@@ -95,7 +183,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "count(group by (dfkv_connector_id) (dfkv_connector_info{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}))"
+          "expr": "count(group by (dfkv_connector_id) (dfkv_connector_info{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}))"
         }
       ]
     },
@@ -133,7 +221,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "(sum(rate(dfkv_connector_op_requests_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval]))) or (sum(rate(dfkv_connector_ops_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])))"
+          "expr": "(sum(rate(dfkv_connector_op_requests_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))) or (sum(rate(dfkv_connector_ops_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval])))"
         }
       ]
     },
@@ -171,7 +259,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "(sum(rate(dfkv_connector_op_keys_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval]))) or (sum(rate(dfkv_connector_keys_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])))"
+          "expr": "(sum(rate(dfkv_connector_op_keys_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))) or (sum(rate(dfkv_connector_keys_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval])))"
         }
       ]
     },
@@ -209,7 +297,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "(sum(rate(dfkv_connector_op_bytes_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval]))) or (sum(rate(dfkv_connector_bytes_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])))"
+          "expr": "(sum(rate(dfkv_connector_op_bytes_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))) or (sum(rate(dfkv_connector_bytes_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval])))"
         }
       ]
     },
@@ -250,7 +338,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "count by (dfkv_connector_type) (dfkv_connector_info{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"})",
+          "expr": "count by (dfkv_connector_type) (dfkv_connector_info{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"})",
           "legendFormat": "{{dfkv_connector_type}}"
         }
       ]
@@ -292,7 +380,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "count by (dfkv_native_version) (dfkv_connector_info{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"})",
+          "expr": "count by (dfkv_native_version) (dfkv_connector_info{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"})",
           "legendFormat": "{{dfkv_native_version}}"
         }
       ]
@@ -300,7 +388,7 @@
     {
       "id": 7,
       "type": "row",
-      "title": "By operation (put / get / exist \u2014 C++ chokepoint; old put/get shown until the connector rollout)",
+      "title": "By operation (put / get / exist — C++ chokepoint; old put/get shown until the connector rollout)",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -354,7 +442,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "(sum by (op) (rate(dfkv_connector_op_requests_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval]))) or (sum by (op) (rate(dfkv_connector_ops_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])))",
+          "expr": "(sum by (op) (rate(dfkv_connector_op_requests_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))) or (sum by (op) (rate(dfkv_connector_ops_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval])))",
           "legendFormat": "{{op}}"
         }
       ]
@@ -403,7 +491,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "(sum by (op) (rate(dfkv_connector_op_keys_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval]))) or (sum by (op) (rate(dfkv_connector_keys_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])))",
+          "expr": "(sum by (op) (rate(dfkv_connector_op_keys_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))) or (sum by (op) (rate(dfkv_connector_keys_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval])))",
           "legendFormat": "{{op}}"
         }
       ]
@@ -452,7 +540,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "(sum by (op) (rate(dfkv_connector_op_bytes_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval]))) or (sum by (op) (rate(dfkv_connector_bytes_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])))",
+          "expr": "(sum by (op) (rate(dfkv_connector_op_bytes_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))) or (sum by (op) (rate(dfkv_connector_bytes_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval])))",
           "legendFormat": "{{op}}"
         }
       ]
@@ -460,7 +548,7 @@
     {
       "id": 11,
       "type": "timeseries",
-      "title": "Success ratio by op (put=write-ok, get=hit, exist=present) \u2014 needs rollout",
+      "title": "Success ratio by op (put=write-ok, get=hit, exist=present) — needs rollout",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -501,7 +589,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (op)(rate(dfkv_connector_op_hits_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])) / clamp_min(sum by (op)(rate(dfkv_connector_op_keys_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])),1)",
+          "expr": "sum by (op)(rate(dfkv_connector_op_hits_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval])) / clamp_min(sum by (op)(rate(dfkv_connector_op_keys_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval])),1)",
           "legendFormat": "{{op}}"
         }
       ]
@@ -509,7 +597,7 @@
     {
       "id": 12,
       "type": "timeseries",
-      "title": "Failed / missed keys/s by op (put = 'Write page' failures) \u2014 needs rollout",
+      "title": "Failed / missed keys/s by op (put = 'Write page' failures) — needs rollout",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -550,7 +638,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (op)(rate(dfkv_connector_op_keys_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval]) - rate(dfkv_connector_op_hits_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval]))",
+          "expr": "sum by (op)(rate(dfkv_connector_op_keys_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]) - rate(dfkv_connector_op_hits_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
           "legendFormat": "{{op}}"
         }
       ],
@@ -600,7 +688,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "(sum by (op)(rate(dfkv_connector_op_latency_seconds_sum{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])) / clamp_min(sum by (op)(rate(dfkv_connector_op_latency_seconds_count{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])),1)) or (sum by (op)(rate(dfkv_connector_op_seconds_sum{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])) / clamp_min(sum by (op)(rate(dfkv_connector_op_seconds_count{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])),1))",
+          "expr": "(sum by (op)(rate(dfkv_connector_op_latency_seconds_sum{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval])) / clamp_min(sum by (op)(rate(dfkv_connector_op_latency_seconds_count{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval])),1)) or (sum by (op)(rate(dfkv_connector_op_seconds_sum{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval])) / clamp_min(sum by (op)(rate(dfkv_connector_op_seconds_count{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval])),1))",
           "legendFormat": "{{op}}"
         }
       ]
@@ -649,7 +737,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "(histogram_quantile(0.99, sum by (op,le)(rate(dfkv_connector_op_latency_seconds_bucket{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])))) or (histogram_quantile(0.99, sum by (op,le)(rate(dfkv_connector_op_seconds_bucket{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval]))))",
+          "expr": "(histogram_quantile(0.99, sum by (op,le)(rate(dfkv_connector_op_latency_seconds_bucket{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval])))) or (histogram_quantile(0.99, sum by (op,le)(rate(dfkv_connector_op_seconds_bucket{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))))",
           "legendFormat": "{{op}}"
         }
       ],
@@ -699,7 +787,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "max by (op)(dfkv_connector_op_max_seconds{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"})",
+          "expr": "max by (op)(dfkv_connector_op_max_seconds{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"})",
           "legendFormat": "{{op}}"
         }
       ],
@@ -762,7 +850,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "avg by (peer)(dfkv_client_peer_latency_avg_seconds{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"})",
+          "expr": "avg by (peer)(dfkv_client_peer_latency_avg_seconds{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"})",
           "legendFormat": "avg {{peer}}"
         },
         {
@@ -771,8 +859,1020 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "max by (peer)(dfkv_client_peer_latency_max_seconds{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"})",
+          "expr": "max by (peer)(dfkv_client_peer_latency_max_seconds{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"})",
           "legendFormat": "max {{peer}}"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "row",
+      "title": "Health, routing, dedup and transport",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 41
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 19,
+      "type": "stat",
+      "title": "Native pollers failing",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 42
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.5
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "noValue": "No data"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "count(dfkv_connector_client_stats_poll_success{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"} == 0) or vector(0)"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "stat",
+      "title": "Connectors with empty ring",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 42
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.5
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "noValue": "No data"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "count(dfkv_connector_ring_members{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"} == 0) or vector(0)"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "type": "stat",
+      "title": "Connectors with MDS unreachable",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 42
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.5
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "noValue": "No data"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "count(dfkv_connector_mds_reachable{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"} == 0) or vector(0)"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "stat",
+      "title": "Oldest native snapshot",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 42
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 60
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "noValue": "No data"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(time() - dfkv_connector_client_stats_last_success_unixtime{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"})"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Same-host dedup funnel /s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 46
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_dedup_fetches_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "host fetch"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_dedup_hits_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "host immediate hit"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_dedup_wait_hits_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "host wait hit"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_dedup_wait_timeouts_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "host timeout"
+        },
+        {
+          "refId": "E",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_gpu_dedup_fetches_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "GPU fetch"
+        },
+        {
+          "refId": "F",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_gpu_dedup_hits_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "GPU immediate hit"
+        },
+        {
+          "refId": "G",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_gpu_dedup_wait_hits_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "GPU wait hit"
+        },
+        {
+          "refId": "H",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_gpu_dedup_wait_timeouts_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "GPU timeout"
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Transport failures /s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 46
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_rdma_completion_timeouts_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "RDMA completion timeout"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_rdma_cq_errors_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "RDMA CQ error"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_rdma_rail_errors_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "RDMA rail error"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_transport_pool_backoff_events_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "TCP pool backoff"
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "type": "row",
+      "title": "Native transport, RDMA, memory registration, and recovery",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 53
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Transport pool state",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 54
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(dfkv_connector_transport_pool_connections{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"})",
+          "legendFormat": "connections"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(dfkv_connector_transport_pool_inflight{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"})",
+          "legendFormat": "inflight"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(dfkv_connector_transport_pool_backoff_endpoints{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"})",
+          "legendFormat": "backoff endpoints"
+        }
+      ]
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "RDMA rail state by device",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 54
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (dev)(dfkv_connector_rdma_rail_inflight{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"})",
+          "legendFormat": "{{dev}} inflight"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (dev)(dfkv_connector_rdma_rail_credits_available{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"})",
+          "legendFormat": "{{dev}} credits"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (dev)(dfkv_connector_rdma_rail_consecutive_errors{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"})",
+          "legendFormat": "{{dev}} consecutive errors"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (dev)(dfkv_connector_rdma_rail_quarantined{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"})",
+          "legendFormat": "{{dev}} quarantined"
+        }
+      ]
+    },
+    {
+      "id": 28,
+      "type": "timeseries",
+      "title": "Peer and rail quarantine / recovery events",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 61
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_peer_marked_bad_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "peer marked bad/s"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_peer_recovered_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "peer recovered/s"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_rdma_rail_quarantines_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "rail quarantined/s"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_rdma_rail_recoveries_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "rail recovered/s"
+        }
+      ]
+    },
+    {
+      "id": 29,
+      "type": "timeseries",
+      "title": "Native I/O and routing failures",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 61
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_io_errors_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "I/O errors/s"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_unhealthy_skips_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "unhealthy skips/s"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_peer_errors_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "peer errors/s"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_rdma_endpoint_errors_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "endpoint errors/s"
+        },
+        {
+          "refId": "E",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_busy_suppressed_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "busy suppressed/s"
+        },
+        {
+          "refId": "F",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_mds_unreachable_polls_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "MDS unreachable polls/s"
+        }
+      ]
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "RDMA memory footprint and block bounds",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 68
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(dfkv_connector_rdma_mr_registered_bytes{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"})",
+          "legendFormat": "registered bytes"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(dfkv_connector_rdma_max_block_seen_bytes{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"})",
+          "legendFormat": "max block seen"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(dfkv_connector_rdma_declared_max_block_bytes{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"})",
+          "legendFormat": "declared max block"
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "MR / NUMA fallback events",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 68
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_rdma_mr_registration_rejections_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "MR rejected/s"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_rdma_pool_mr_registration_failures_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "pool MR failed/s"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_rdma_adhoc_user_mr_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "ad-hoc MR/s"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(dfkv_connector_rdma_oversize_rejects_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "oversize rejected/s"
+        },
+        {
+          "refId": "E",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (reason)(rate(dfkv_connector_rdma_numa_fallbacks_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "{{reason}} NUMA fallback/s"
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Pipeline and MR concurrency",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 68
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(dfkv_connector_rdma_pipeline_depth{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"})",
+          "legendFormat": "pipeline depth"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(dfkv_connector_rdma_pool_mr_active_registrations{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"})",
+          "legendFormat": "pool MR active"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(dfkv_connector_rdma_transient_user_mr_active{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"})",
+          "legendFormat": "transient MR active"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(dfkv_connector_rdma_mr_regions{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"})",
+          "legendFormat": "MR regions"
         }
       ]
     }

@@ -129,6 +129,18 @@ class RdmaServer {
     std::shared_ptr<std::atomic<bool>> done;
   };
 
+  // Per-device counters make a partial rail failure or affinity imbalance
+  // visible without polling host counters. The rail set is fixed by Start().
+  struct RailStats {
+    std::atomic<uint64_t> active_conns{0};
+    std::atomic<uint64_t> completions{0};
+    std::atomic<uint64_t> completion_errors{0};
+    std::atomic<uint64_t> put_writes{0};
+    std::atomic<uint64_t> put_bytes{0};
+    std::atomic<uint64_t> get_writes{0};
+    std::atomic<uint64_t> get_bytes{0};
+  };
+
   Handler handler_;
   RangeHandler range_handler_;
   CacheDirectHandler cache_direct_handler_;
@@ -163,6 +175,7 @@ class RdmaServer {
   // anchored: HCA names are host-local configuration, never peer identities.
   std::vector<std::unique_ptr<rdma::RcEndpoint>> anchors_;
   std::vector<std::string> anchor_devs_;  // configured filter, then active rails
+  std::vector<std::unique_ptr<RailStats>> rail_stats_;  // indexed with anchor_devs_
   std::atomic<uint64_t> uring_reads_{0}, uring_init_fallbacks_{0};
   std::atomic<uint64_t> v2_conns_{0}, v2_put_writes_{0}, v2_get_writes_{0};
   std::atomic<uint64_t> completions_{0}, completion_errors_{0}, active_conns_{0},

@@ -293,6 +293,28 @@ TEST(Metrics, RemoteStatsOp) {
   s->Stop();
 }
 
+TEST(Metrics, RemoteStatsIncludesRuntimeExtension) {
+  std::string addr;
+  auto dir = fs::temp_directory_path() / "dfkv_metrics_extension";
+  auto s = Start(dir, &addr);
+  s->set_metrics_extension([] {
+    return std::string(
+        "# TYPE dfkv_server_ready gauge\n"
+        "dfkv_server_ready 1\n"
+        "# TYPE dfkv_rdma_v2_ready gauge\n"
+        "dfkv_rdma_v2_ready 1\n");
+  });
+  EXPECT_EQ(s->MetricsText().find("dfkv_server_ready"), std::string::npos);
+  EXPECT_NE(s->FullMetricsText().find("dfkv_server_ready 1"),
+            std::string::npos);
+  TcpTransport t;
+  std::string text;
+  ASSERT_EQ(t.Stats(addr, &text), Status::kOk);
+  EXPECT_NE(text.find("dfkv_server_ready 1"), std::string::npos) << text;
+  EXPECT_NE(text.find("dfkv_rdma_v2_ready 1"), std::string::npos) << text;
+  s->Stop();
+}
+
 // exist latency histogram: the exist handler body is sampled into a distinct
 // op="exist" series (separate from get/put). Its tail is the first signal to
 // check when L3 prefetch stalls — before this it was invisible in metrics and
