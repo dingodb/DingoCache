@@ -465,6 +465,12 @@ sglang serve /models/glm-5.2-nvfp4 --served-model-name glm-5.2 \
 - **`DFKV_RDMA_DEPTH` — 两侧无需强制相等。** 握手取最小值，按共享 segment
   容量和连接 fan-out 分别配置即可。
 - **HiCache 命中/吞吐/延迟与 client 注册指标**已内置，无需额外动作。
+- **短 server reaper 必须配 client keepalive。** server 使用
+  `DFKV_RDMA_IDLE_MS=30000` 回收已退出 Pod 的 receive-segment lease 时，live
+  connector 应设置 `DFKV_RDMA_KEEPALIVE_MS=10000`。后台线程只探测 idle pool
+  中的 QP；进程退出后探测自然停止，server 仍可在 30 秒后回收。keepalive
+  interval 必须严格小于 server idle interval；默认 `0`（关闭），因此使用
+  server 默认 10 分钟 reaper 的通用部署无需额外 QP 流量。
 
 #### 0064 B200 + GLM-5.2-NVFP4 实测（2026-08-09）
 
@@ -483,6 +489,21 @@ sglang serve /models/glm-5.2-nvfp4 --served-model-name glm-5.2 \
   payload 是 rank-local shard。实测打开后仅恢复 32,768/94,976 tokens，
   请求退化至 61–87 s。SGLang 并发请求去重只使用
   `SGLANG_HICACHE_L2_BYPASS_DEDUP` 的框架级语义。
+
+#### 0064 标准 L2 idle-tail 修复（2026-08-10）
+
+server `DFKV_RDMA_IDLE_MS=30000`、client 未开 keepalive 时，45 秒空闲后的
+4×100K-token L3 GET 每 rank 产生 12–17 次
+`dfkv_rdma_client_stale_pool_retries_total`，单次 `batch_get` 最慢
+3.779 s，TTFT 均值 18.313 s、吞吐 20,989 tok/s；completion timeout 与 rail
+error 均为 0，排除了 SSD/IB 带宽不足。
+
+client 设置 `DFKV_RDMA_KEEPALIVE_MS=10000` 后，同样 45 秒空闲窗口内 keepalive
+保住所有 live QP；随后 GET 的 stale retry/new connection 增量均为 0，
+`batch_get` 最慢 78.992 ms、TTFT 均值 4.595 s、吞吐 65,008 tok/s。对应
+Prometheus 指标为 `dfkv_rdma_client_keepalive_{attempts,successes,failures}_total`
+（connector pull 端附加 `tp_rank`，OTLP 中映射为
+`dfkv_connector_rdma_keepalive_*_total`）。
 
 该配置下继续增加 client/server fanout 没有存储侧收益；优化重点应转向
 SGLang engine 的恢复 prefill 和跨 rank 同步。
