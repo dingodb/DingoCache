@@ -480,6 +480,11 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `DFKV_LOG` | `INFO` | log level |
 | `DFKV_FANOUT_THREADS` | `32` | TCP batch、RDMA write 和兼容路径共用的 process-wide helper 上限；RDMA read 不再使用该线程池 |
 | `DFKV_RDMA_READ_WORKERS` | `7` | process-wide RDMA GET/GET-Auto/SG-GET/Exist shard worker 硬上限；替换旧 executor 每 rank 的 7 个 helper，不增加线程。caller 不参与执行，因此并发 batch 不能继续推高活跃 read QP；batch 间按 shard round-robin |
+| `DFKV_RDMA_ENDPOINT_CACHE_MAX` | `256` | 所有 client handle 共享的 live RDMA endpoint 硬上限；只有 QP/MR 真正销毁后才归还额度 |
+| `DFKV_RDMA_QP_BUDGET` | endpoint 上限 | process-wide QP 预算；当前一个 endpoint 对应一个 QP |
+| `DFKV_RDMA_WR_BUDGET` | endpoint 上限 × depth | process-wide negotiated WR slot 预算；SG lane 每 endpoint 只占 1 |
+| `DFKV_RDMA_REGISTERED_BYTES_BUDGET` | endpoint 上限 × depth × receive slot | live endpoint 对端 receive-segment lease 字节预算 |
+| `DFKV_RDMA_RESOURCE_ACQUIRE_MS` | `10000` | 建立新 QP 前等待全部资源额度的上限；超时明确失败，不超发 |
 | `DFKV_BATCH_CONCURRENCY` | `0`=auto（auto: `min(max(nodes, 8), 32)`） | TCP/write/兼容路径的 batch 分段并发度。RDMA read 的实际 process-wide 并发由 `DFKV_RDMA_READ_WORKERS` 限制 |
 | `DFKV_GET_MISS_RETRIES` | `1` | client GET miss 后发重试次数 |
 | `DFKV_PROBE_INTERVAL_MS` | `0`=关 | client 对 server 的主动健康 probe 间隔 |
