@@ -196,6 +196,18 @@ class FakeLogicalAnchorPool:
         return None
 
 
+class FakeTupleNoneAnchorPool:
+    """SGLang v0.5.17+ DeepSeekV4PagedHostPool contract: the logical anchor
+    declares "no host layout" as a tuple containing None instead of None
+    itself. Semantics are identical to FakeLogicalAnchorPool."""
+
+    def __init__(self, page_size=64):
+        self.page_size = page_size
+
+    def get_page_buffer_meta(self, host_indices):
+        return (None, None)
+
+
 def _spawn_node(tag):
     d = tempfile.mkdtemp(prefix=f"dfkv_py_{tag}_")
     p = subprocess.Popen(
@@ -869,6 +881,61 @@ class DingoFSHiCacheTest(unittest.TestCase):
         # anchor load is a no-op but reports all pages complete
         self.assertEqual(st.batch_get_v1(keys, hi), [True, True, True])
         self.assertTrue(st._anchor_noop_warned)
+
+    def test_v1_logical_anchor_tuple_none_contract(self):
+        # SGLang v0.5.17+ (DeepSeekV4PagedHostPool) declares the logical anchor
+        # as a tuple containing None instead of None itself. Same marker
+        # semantics as the None contract; must not crash or hard-miss.
+        members, _, ndir = self._node("anchor17")
+        st = self._plugin(self._cfg(members, model="glm-5.2"),
+                          FakeTupleNoneAnchorPool(self.PAGE_SIZE))
+        keys = ["t0", "t1"]
+        hi = list(range(2 * self.PAGE_SIZE))
+        self.assertEqual(st.batch_set_v1(keys, hi), [True, True])
+        self.assertEqual(_count_objects(ndir), 2)
+        self.assertEqual(st.batch_exists(keys), 2)
+        self.assertEqual(st.batch_get_v1(keys, hi), [True, True])
+        self.assertTrue(st._anchor_noop_warned)
+
+    def test_register_v2_logical_anchor_marker_only_no_raise(self):
+        # The v0.5.17 DSV4 hybrid stack registers the logical "kv" pool through
+        # register_mem_host_pool_v2 at attach time. Both no-layout wire forms
+        # must register marker-only instead of raising (was: RuntimeError
+        # "pool component probe returned no layout" crashing the scheduler).
+        from sglang.srt.mem_cache.hicache_storage import PoolTransfer
+        members, _, ndir = self._node("regv2anchor")
+        cfg = self._cfg(members, model="glm-5.2")
+        st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+        st.register_mem_host_pool_v2(FakeLogicalAnchorPool(self.PAGE_SIZE), "kv")
+        self.assertTrue(st._pool_logical["kv"])
+        st.register_mem_host_pool_v2(
+            FakeTupleNoneAnchorPool(self.PAGE_SIZE), "kv")
+        self.assertTrue(st._pool_logical["kv"])
+        # v2 writes on the logical pool land one-byte markers that gate the
+        # prefix; v2 reads no-op complete so side pools still get loaded.
+        keys = ["r0", "r1", "r2"]
+        hi = list(range(3 * self.PAGE_SIZE))
+        res = st.batch_set_v2(
+            [PoolTransfer(name="kv", host_indices=hi, keys=keys)])
+        self.assertEqual(res["kv"], [True, True, True])
+        self.assertEqual(_count_objects(ndir), 3)
+        self.assertEqual(st.batch_exists(keys), 3)
+        res = st.batch_get_v2(
+            [PoolTransfer(name="kv", host_indices=hi, keys=keys)])
+        self.assertEqual(res["kv"], [True, True, True])
+
+    def test_register_v2_physical_pool_clears_logical_flag(self):
+        # Re-registering the same name with a real layout must drop the
+        # marker-only state so the physical path takes over.
+        members, _, _ = self._node("regv2flip")
+        cfg = self._cfg(members, model="glm-5.2")
+        st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+        st.register_mem_host_pool_v2(
+            FakeTupleNoneAnchorPool(self.PAGE_SIZE), "side")
+        self.assertTrue(st._pool_logical["side"])
+        st.register_mem_host_pool_v2(
+            FakeMlaPool(2, self.PAGE_BYTES, self.PAGE_SIZE), "side")
+        self.assertNotIn("side", st._pool_logical)
 
     def test_v2_exists_with_logical_anchor_full_and_shrunk(self):
         # End-to-end multi-pool existence for a logical-anchor (DSA) model: the
