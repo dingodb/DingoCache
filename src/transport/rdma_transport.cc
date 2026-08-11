@@ -18,6 +18,7 @@
 #include "transport/rail_select.h"
 #include "transport/rdma_verbs.h"   // RcEndpoint, QpInfo
 #include "transport/rdma_protocol.h"
+#include "transport/rdma_operation.h"
 
 namespace dfkv {
 
@@ -1649,6 +1650,9 @@ std::vector<Status> RdmaTransport::RangeInto(
     }
   }
   if (valid_count == 0) return result;
+  rdma::OperationContext operation;
+  if (!operation.Submit() || !operation.ClaimPoller()) return result;
+  bool final_timeout = false;
 
   for (int attempt = 0; attempt < 2; ++attempt) {
     if (attempt != 0)
@@ -1660,7 +1664,10 @@ std::vector<Status> RdmaTransport::RangeInto(
     bool from_pool = false;
     Conn* conn = Acquire(node, Lane::kData, &from_pool, attempt > 0,
                          std::min(valid_count, depth_));
-    if (!conn) return result;
+    if (!conn) {
+      operation.Complete(false);
+      return result;
+    }
     rdma::RcEndpoint& ep = conn->ep;
     const size_t window = std::min(
         ep.window(), static_cast<size_t>(conn->lease.credits));
@@ -1714,6 +1721,7 @@ std::vector<Status> RdmaTransport::RangeInto(
       }
       if (timed_out)
         completion_timeouts_.fetch_add(1, std::memory_order_relaxed);
+      final_timeout = timed_out;
       if (!conn_ok) break;
       for (ibv_mr* mr : output_mrs) ep.ReleaseTransient(mr);
       for (size_t slot = 0; slot < width; ++slot) {
@@ -1735,12 +1743,17 @@ std::vector<Status> RdmaTransport::RangeInto(
     }
     if (conn_ok) {
       Release(node, Lane::kData, conn);
+      operation.Complete(true);
       return result;
     }
     Destroy(conn, completion);
     if (from_pool) continue;
+    if (final_timeout) operation.RequestCancel();
+    operation.Complete(false);
     return result;
   }
+  if (final_timeout) operation.RequestCancel();
+  operation.Complete(false);
   return result;
 }
 
