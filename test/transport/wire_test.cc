@@ -1,6 +1,7 @@
 // Wire-framing encode/decode: round-trips plus the negative paths a hostile or
 // version-skewed peer can take (bad version byte, oversized declared length).
 #include "transport/wire.h"
+#include "transport/rdma_protocol.h"
 
 #include <cstring>
 
@@ -26,7 +27,9 @@ TEST(Wire, ReqRoundTrip) {
 
 TEST(Wire, TenantScopedEpochAndPrefixAreExact) {
   EXPECT_EQ(kNativeProtoTcp, 6);
-  EXPECT_EQ(kNativeProtoRdmaV2, 7);
+  EXPECT_EQ(kNativeProtoRdmaV2, 8);
+  EXPECT_EQ(kRdmaGetWindowMagic, 0x3357474du);  // "MGW3" little-endian
+  EXPECT_EQ(rdma::kV2ProbeMagic, 0x33564644u);  // "DFV3" little-endian
   EXPECT_EQ(kReqPrefix, 50u);
 }
 
@@ -154,6 +157,34 @@ TEST(Wire, V2GetScatterRoundTrip) {
   EXPECT_EQ(get.targets[0].addr, targets[0].addr);
   EXPECT_EQ(get.targets[1].rkey, targets[1].rkey);
   EXPECT_EQ(get.Capacity(), 4096u);
+}
+
+TEST(Wire, V2MultiWindowGetCarriesStableOperationIdentity) {
+  char buf[256] = {};
+  const BlockKey key{1, 2, 3};
+  const std::vector<RdmaWriteTarget> targets{
+      {0x1000, 7, 8}, {0x2000, 9, 8}};
+  size_t encoded = 0;
+  ASSERT_TRUE(EncodeRdmaGetReqWindow(
+      buf, sizeof(buf), key, 0, 64, targets,
+      /*operation_id=*/3, /*window_index=*/1, /*window_count=*/4,
+      /*logical_offset=*/16, /*total_capacity=*/64, &encoded));
+  EXPECT_EQ(net::GetU32(buf + kReqPrefix + 4), 0x3357474du);
+  EXPECT_EQ(net::GetU32(buf + kReqPrefix + 8), 3u);
+
+  ReqFields req{};
+  RdmaGetFields get;
+  ASSERT_TRUE(DecodeRdmaGetReq(buf, encoded, &req, &get));
+  EXPECT_EQ(req.Key(), key);
+  EXPECT_EQ(get.operation_id, 3u);
+  EXPECT_EQ(get.window_index, 1u);
+  EXPECT_EQ(get.window_count, 4u);
+  EXPECT_EQ(get.logical_offset, 16u);
+  EXPECT_EQ(get.total_capacity, 64u);
+  EXPECT_EQ(get.Capacity(), 16u);
+
+  net::PutU32(buf + kReqPrefix + 4, 0x3257474du);  // old "MGW2"
+  EXPECT_FALSE(DecodeRdmaGetReq(buf, encoded, &req, &get));
 }
 
 TEST(Wire, V2GetRejectsShortCapacityAndMalformedTarget) {

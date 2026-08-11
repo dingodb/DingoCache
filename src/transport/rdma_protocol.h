@@ -37,7 +37,7 @@ constexpr size_t kV2MaxGetTargets = 29;
 constexpr uint64_t kV2MultiWrPutMagic = 0x325257495455504dull;  // "MPUTIWR2"
 
 constexpr const char* kV2ProbeDevice = "__dfkv_v2__";
-constexpr uint32_t kV2ProbeMagic = 0x32564644u;  // ASCII "DFV2" (LE)
+constexpr uint32_t kV2ProbeMagic = 0x33564644u;  // ASCII "DFV3" (LE)
 constexpr size_t kV2ProbeReplyBytes = 8;
 
 inline bool IsV2Probe(const char frame[kDevNameBytes]) {
@@ -58,6 +58,13 @@ inline bool ParseV2ProbeReply(const char in[kV2ProbeReplyBytes]) {
   std::memcpy(&magic, in, sizeof(magic));
   return magic == kV2ProbeMagic &&
          static_cast<uint8_t>(in[4]) == kDevProtoV2;
+}
+
+// Multi-window GET IDs name one of the negotiated per-connection logical
+// request slots. Keeping the namespace bounded by queue depth both caps server
+// state and makes duplicate ownership explicit.
+inline bool V2GetOperationIdValid(uint32_t operation_id, size_t depth) {
+  return depth != 0 && operation_id < depth;
 }
 
 inline size_t AlignUp(size_t value, size_t alignment) {

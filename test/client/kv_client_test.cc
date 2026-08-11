@@ -196,49 +196,74 @@ TEST_F(KVClientTest, ScatterGatherMultiWindowSemanticsMatchTcp) {
   nodes_.push_back(StartNode("sg_multiwr_tcp"));
   KVClient c({{"a", nodes_[0]->addr}}, SelfHdr());
 
-  constexpr size_t kSegments = 67;  // more than two 29-SGE WR windows
-  std::vector<std::string> src(kSegments);
-  std::vector<const void*> ptrs;
-  std::vector<size_t> sizes;
-  std::string expected;
-  for (size_t i = 0; i < kSegments; ++i) {
-    const size_t len = (i == 3 || i == 31) ? 0 : 5 + i % 17;
-    src[i].resize(len);
-    for (size_t j = 0; j < len; ++j)
-      src[i][j] = static_cast<char>((i * 37 + j * 11) & 0xff);
-    ptrs.push_back(src[i].data());
-    sizes.push_back(len);
-    expected.append(static_cast<const char*>(ptrs[i]), sizes[i]);
+  constexpr size_t kItems = 2;
+  constexpr size_t kSegments = 97;  // at least four 29-SGE RDMA windows
+  std::vector<std::vector<std::string>> src(
+      kItems, std::vector<std::string>(kSegments));
+  std::vector<std::vector<const void*>> ptrs(kItems);
+  std::vector<std::vector<size_t>> sizes(kItems);
+  std::vector<std::string> expected(kItems);
+  std::vector<KvPutItemSg> puts;
+  for (size_t item = 0; item < kItems; ++item) {
+    for (size_t segment = 0; segment < kSegments; ++segment) {
+      const size_t len =
+          (segment == 3 + item || segment == 31 + item) ? 0
+                                                        : 5 + segment % 17;
+      src[item][segment].resize(len);
+      for (size_t byte = 0; byte < len; ++byte) {
+        src[item][segment][byte] = static_cast<char>(
+            (item * 149 + segment * 37 + byte * 11) & 0xff);
+      }
+      ptrs[item].push_back(src[item][segment].data());
+      sizes[item].push_back(len);
+      expected[item].append(src[item][segment]);
+    }
+    puts.push_back({"tcp_multiwr_" + std::to_string(item), ptrs[item],
+                    sizes[item]});
   }
 
-  const auto put = c.BatchPutSg({{"tcp_multiwr", ptrs, sizes}});
-  ASSERT_EQ(put.size(), 1u);
-  ASSERT_TRUE(put[0]);
-  EXPECT_EQ(nodes_[0]->srv->Count(), 1u);
+  const auto put = c.BatchPutSg(puts);
+  ASSERT_EQ(put.size(), kItems);
+  for (size_t item = 0; item < kItems; ++item) ASSERT_TRUE(put[item]);
+  EXPECT_EQ(nodes_[0]->srv->Count(), kItems);
 
-  std::vector<std::string> dst(kSegments);
-  std::vector<void*> dptrs;
-  for (size_t i = 0; i < kSegments; ++i) {
-    dst[i].assign(sizes[i], '\0');
-    dptrs.push_back(dst[i].data());
+  std::vector<std::vector<std::string>> dst(
+      kItems, std::vector<std::string>(kSegments));
+  std::vector<KvGetItemSg> gets;
+  for (size_t item = 0; item < kItems; ++item) {
+    std::vector<void*> dptrs;
+    for (size_t segment = 0; segment < kSegments; ++segment) {
+      dst[item][segment].assign(sizes[item][segment], '\0');
+      dptrs.push_back(dst[item][segment].data());
+    }
+    gets.push_back({"tcp_multiwr_" + std::to_string(item), dptrs,
+                    sizes[item]});
   }
+
   std::vector<size_t> lens;
-  const auto get = c.BatchGetAutoSg(
-      {{"tcp_multiwr", dptrs, sizes}}, &lens);
-  ASSERT_EQ(get.size(), 1u);
-  ASSERT_TRUE(get[0]);
-  ASSERT_EQ(lens.size(), 1u);
-  EXPECT_EQ(lens[0], expected.size());
-  std::string scattered;
-  for (size_t i = 0; i < dst.size(); ++i) {
-    EXPECT_EQ(dst[i], src[i]) << "segment " << i;
-    scattered += dst[i];
+  const auto get = c.BatchGetAutoSg(gets, &lens);
+  ASSERT_EQ(get.size(), kItems);
+  ASSERT_EQ(lens.size(), kItems);
+  for (size_t item = 0; item < kItems; ++item) {
+    ASSERT_TRUE(get[item]) << "item " << item;
+    EXPECT_EQ(lens[item], expected[item].size()) << "item " << item;
+    std::string scattered;
+    for (size_t segment = 0; segment < kSegments; ++segment) {
+      EXPECT_EQ(dst[item][segment], src[item][segment])
+          << "item " << item << " segment " << segment;
+      scattered += dst[item][segment];
+    }
+    EXPECT_EQ(scattered, expected[item]) << "item " << item;
+    EXPECT_NE(scattered, expected[1 - item])
+        << "distinct logical GETs contaminated each other";
   }
-  EXPECT_EQ(scattered, expected);
 
-  std::string ordinary(expected.size(), '\0');
-  ASSERT_TRUE(c.Get("tcp_multiwr", ordinary.data(), ordinary.size()));
-  EXPECT_EQ(ordinary, expected);
+  for (size_t item = 0; item < kItems; ++item) {
+    std::string ordinary(expected[item].size(), '\0');
+    ASSERT_TRUE(c.Get("tcp_multiwr_" + std::to_string(item), ordinary.data(),
+                      ordinary.size()));
+    EXPECT_EQ(ordinary, expected[item]);
+  }
 }
 
 TEST_F(KVClientTest, TwoNodeConsistentHashCrossNodeRead) {

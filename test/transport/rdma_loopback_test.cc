@@ -44,7 +44,10 @@ class ScopedEnv {
       had_old_ = true;
       old_ = old;
     }
-    ::setenv(name, value, 1);
+    if (value)
+      ::setenv(name, value, 1);
+    else
+      ::unsetenv(name);
   }
   ~ScopedEnv() {
     if (had_old_)
@@ -1530,6 +1533,177 @@ struct RdmaUringNode {
     fs::remove_all(dir);
   }
 };
+
+TEST(RdmaLoopback, MultiWindowGetDepthFourKeepsLogicalOperationsIsolated) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
+  ScopedEnv recv_segment("DFKV_RDMA_RECV_SEGMENT_SIZE", "33554432");
+  ScopedEnv idle_reclaim("DFKV_RDMA_IDLE_MS", "200");
+  ScopedEnv sync_prepared_reads("DFKV_SERVER_URING", "0");
+  // The malformed-window injection is local to the deliberate fault below.
+  // Force it off even when the test process inherited the variable, then
+  // restore the inherited value when the test exits.
+  ScopedEnv bad_get_op_id_disabled(
+      "DFKV_RDMA_TEST_BAD_GET_OP_ID_WINDOW", nullptr);
+  RdmaUringNode node("getopid");
+  ASSERT_EQ(node.rsrv->PipelineDepth(), 4u);
+
+  const uint64_t transient_baseline =
+      rdma::RcEndpoint::TransientUserMrActive();
+  const uint64_t active_baseline = node.rsrv->ActiveConns();
+  const auto wait_for_active_at_most = [&node](uint64_t limit) {
+    for (int i = 0; i < 1000 && node.rsrv->ActiveConns() > limit; ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    return node.rsrv->ActiveConns();
+  };
+
+  {
+    RdmaTransport rt(kMaxMsg);
+    KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+    c.set_batch_concurrency(1);  // one QP; concurrency is the negotiated depth
+    ASSERT_EQ(
+        CounterVal(rt.MetricsText(), "dfkv_rdma_client_pipeline_depth"), 4);
+
+    const size_t targets_per_window = rt.MaxSgPayloadSegs();
+    ASSERT_GE(targets_per_window, 2u);
+    const size_t segment_count = targets_per_window * 3 + 5;
+    std::vector<size_t> sizes(segment_count);
+    for (size_t segment = 0; segment < segment_count; ++segment)
+      sizes[segment] = 73 + segment % 29;
+
+    constexpr size_t kItems = 2;
+    std::vector<std::string> values(kItems);
+    for (size_t item = 0; item < kItems; ++item) {
+      for (size_t segment = 0; segment < segment_count; ++segment) {
+        for (size_t byte = 0; byte < sizes[segment]; ++byte) {
+          values[item].push_back(static_cast<char>(
+              (item * 151 + segment * 41 + byte * 17) & 0xff));
+        }
+      }
+      ASSERT_TRUE(c.Put("getopid_" + std::to_string(item),
+                        values[item].data(), values[item].size()));
+    }
+    ASSERT_NE(values[0], values[1]);
+
+    std::vector<std::vector<std::string>> dst(
+        kItems, std::vector<std::string>(segment_count));
+    std::vector<KvGetItemSg> gets;
+    for (size_t item = 0; item < kItems; ++item) {
+      std::vector<void*> ptrs;
+      for (size_t segment = 0; segment < segment_count; ++segment) {
+        dst[item][segment].assign(sizes[segment], '\0');
+        ptrs.push_back(dst[item][segment].data());
+      }
+      gets.push_back(
+          {"getopid_" + std::to_string(item), ptrs, sizes});
+    }
+
+    const long slot_changes_before = CounterVal(
+        node.rsrv->MetricsText(),
+        "dfkv_rdma_v2_get_continuation_slot_changes_total");
+    std::vector<size_t> lengths;
+    const auto got = c.BatchGetAutoSg(gets, &lengths);
+    ASSERT_EQ(got.size(), kItems);
+    ASSERT_EQ(lengths.size(), kItems);
+    for (size_t item = 0; item < kItems; ++item) {
+      ASSERT_TRUE(got[item]) << "logical GET " << item;
+      EXPECT_EQ(lengths[item], values[item].size());
+      std::string flattened;
+      for (size_t segment = 0; segment < segment_count; ++segment)
+        flattened += dst[item][segment];
+      EXPECT_EQ(flattened, values[item]) << "logical GET " << item;
+      EXPECT_NE(flattened, values[1 - item])
+          << "continuation state crossed logical GET identities";
+    }
+    const long slot_changes_after = CounterVal(
+        node.rsrv->MetricsText(),
+        "dfkv_rdma_v2_get_continuation_slot_changes_total");
+    ASSERT_GE(slot_changes_before, 0);
+    EXPECT_GE(slot_changes_after - slot_changes_before, 2)
+        << "test did not move continuations across receive WQE slots";
+    EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), transient_baseline);
+
+    // Corrupt the stable identity on window two. The server must reject the
+    // continuation, destroy that operation's PreparedRead/state, and never
+    // issue writes for any later window. The transport retires the failed QP.
+    std::vector<std::string> poisoned_dst(
+        segment_count, std::string());
+    std::vector<void*> poisoned_ptrs;
+    for (size_t segment = 0; segment < segment_count; ++segment) {
+      poisoned_dst[segment].assign(sizes[segment], '\x5a');
+      poisoned_ptrs.push_back(poisoned_dst[segment].data());
+    }
+    const uint64_t active_before_fault = node.rsrv->ActiveConns();
+    const uint64_t opened_before_fault = node.rsrv->V2Conns();
+    std::vector<bool> failed;
+    std::vector<size_t> failed_lengths;
+    {
+      ScopedEnv bad_id("DFKV_RDMA_TEST_BAD_GET_OP_ID_WINDOW", "2");
+      failed = c.BatchGetAutoSg(
+          {{"getopid_0", poisoned_ptrs, sizes}}, &failed_lengths);
+    }
+    ASSERT_EQ(failed.size(), 1u);
+    EXPECT_FALSE(failed[0]);
+    ASSERT_EQ(failed_lengths.size(), 1u);
+    EXPECT_EQ(failed_lengths[0], 0u);
+    size_t first_window_offset = 0;
+    for (size_t segment = 0; segment < targets_per_window; ++segment) {
+      EXPECT_EQ(poisoned_dst[segment],
+                values[0].substr(first_window_offset, sizes[segment]))
+          << "fault injection ran before the first window, segment " << segment;
+      first_window_offset += sizes[segment];
+    }
+    for (size_t segment = targets_per_window;
+         segment < segment_count; ++segment) {
+      EXPECT_EQ(poisoned_dst[segment],
+                std::string(sizes[segment], '\x5a'))
+          << "server mutated a destination after rejecting bad op id, segment "
+          << segment;
+    }
+
+    const uint64_t opened_delta =
+        node.rsrv->V2Conns() - opened_before_fault;
+    ASSERT_GT(opened_delta, 0u);
+    ASSERT_GT(active_before_fault, active_baseline);
+    const uint64_t cleanup_limit = active_before_fault - 1;
+    EXPECT_LE(wait_for_active_at_most(cleanup_limit), cleanup_limit)
+        << "malformed continuation connection did not retire";
+    EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), transient_baseline);
+    ASSERT_EQ(std::getenv("DFKV_RDMA_TEST_BAD_GET_OP_ID_WINDOW"), nullptr);
+
+    // A fresh logical ID on the same key must not inherit rejected sequence
+    // state or a stale PreparedRead owner.
+    std::vector<std::string> recovered_dst(
+        segment_count, std::string());
+    std::vector<void*> recovered_ptrs;
+    for (size_t segment = 0; segment < segment_count; ++segment) {
+      recovered_dst[segment].assign(sizes[segment], '\0');
+      recovered_ptrs.push_back(recovered_dst[segment].data());
+    }
+    std::vector<size_t> recovered_lengths;
+    // A transport error marks the node unhealthy in the public KVClient API.
+    // Use fresh client health state while retaining the same transport/pool:
+    // recovery therefore tests QP retirement/redial rather than an intentional
+    // client cooldown, and still catches a poisoned pooled endpoint.
+    KVClient recovery_client({{"n", node.addr}}, SelfHdr(), &rt);
+    recovery_client.set_batch_concurrency(1);
+    const auto recovered = recovery_client.BatchGetAutoSg(
+        {{"getopid_0", recovered_ptrs, sizes}}, &recovered_lengths);
+    ASSERT_EQ(recovered.size(), 1u);
+    ASSERT_TRUE(recovered[0]);
+    ASSERT_EQ(recovered_lengths.size(), 1u);
+    EXPECT_EQ(recovered_lengths[0], values[0].size());
+    std::string recovered_value;
+    for (const auto& segment : recovered_dst) recovered_value += segment;
+    EXPECT_EQ(recovered_value, values[0]);
+    EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), transient_baseline);
+  }
+
+  EXPECT_LE(wait_for_active_at_most(active_baseline), active_baseline);
+  EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), transient_baseline);
+  node.rsrv->Stop();
+  EXPECT_EQ(node.rsrv->ActiveConns(), 0u);
+}
 
 // Correctness proof for the io_uring async-GET path: many concurrent GETs over a
 // SINGLE pooled connection, with the depth high enough that several requests are
