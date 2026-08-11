@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -56,6 +57,16 @@ class CApiTransport final : public dfkv::Transport {
     Throw();
     return 29;
   }
+  std::vector<dfkv::Status> RangeIntoMulti(
+      const std::string&, const std::vector<dfkv::BlockKey>& keys,
+      const std::vector<dfkv::RangeDstMulti>&,
+      std::vector<size_t>* out_lens) override {
+    range_into_multi_called.store(true, std::memory_order_relaxed);
+    Throw();
+    if (out_lens) out_lens->assign(keys.size(), 0);
+    return std::vector<dfkv::Status>(keys.size(), dfkv::Status::kNotFound);
+  }
+  std::atomic<bool> range_into_multi_called{false};
   std::string MetricsText() const override {
     Throw();
     return {};
@@ -294,7 +305,7 @@ TEST(CApiRegistration, PropagatesNativeRegistrationFailure) {
   dfkv_close(c);
 }
 
-TEST(CApiNoThrow, EveryOperationFamilyTranslatesInjectedExceptions) {
+TEST(CApiNoThrow, EveryOperationFamilyContainsInjectedExceptions) {
   CApiTransport transport;
   dfkv_client_t c = Injected(&transport);
   transport.throwing = true;
@@ -350,11 +361,16 @@ TEST(CApiNoThrow, EveryOperationFamilyTranslatesInjectedExceptions) {
   void** sg_dsts[] = {sg_dst};
   out[0] = 9;
   lengths[0] = 9;
+  // SG reads run on the bounded read scheduler. It contains transport
+  // exceptions as per-item misses before control returns to the C ABI, whereas
+  // SG writes execute this single-item fake inline and reach the ABI guard.
   EXPECT_EQ(dfkv_batch_get_auto_sg(c, keys, key_lens, sg_dsts,
                                    sg_sizes_array, counts, 1, out, lengths),
-            -1);
+            0);
   EXPECT_EQ(out[0], 0);
   EXPECT_EQ(lengths[0], 0u);
+  EXPECT_TRUE(
+      transport.range_into_multi_called.load(std::memory_order_relaxed));
 
   char stats[16] = {'X'};
   EXPECT_EQ(dfkv_stats_snapshot(c, stats, sizeof(stats)), 0u);

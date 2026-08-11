@@ -1,9 +1,8 @@
 // Scatter-gather (multi-buffer-per-key) round-trip tests for the additive
 // dfkv_batch_put_sg / dfkv_batch_get_auto_sg path. One dfkv key gathers N
 // non-contiguous source buffers on put and scatters into N destination buffers
-// on get. Exercises N=1, N=2, N=29, the >29 guard, and a multi-key/multi-node
-// fan-out. Runs over the loopback TCP transport (default-fallback SG path), which
-// is what the build env provides when RDMA is unavailable.
+// on get. Exercises small widths, variable segment sizes, logical widths larger
+// than one transport window, and multi-key/multi-node fan-out over loopback TCP.
 #include "client/kv_client.h"
 #include "cache/kv_node_server.h"
 
@@ -92,7 +91,7 @@ TEST(Sg, RoundTripN2) {
 TEST(Sg, RoundTripN29) {
   auto a = Start("n29");
   KVClient c({{"a", a->addr}}, Hdr());
-  RoundTrip(c, "k_n29", 29, 128);  // max allowed (max_sge-1)
+  RoundTrip(c, "k_n29", 29, 128);
   a->srv->Stop();
 }
 
@@ -118,29 +117,45 @@ TEST(Sg, RoundTripVariableSizes) {
   a->srv->Stop();
 }
 
-// >29 buffers must be reported failed (put) and a miss (get), not corrupt.
-TEST(Sg, OverLimitGuard) {
-  auto a = Start("over");
+// Logical SG width is not capped by one transport window. Use enough uniquely
+// sized and populated segments to cross two boundaries, so both PUT gathering
+// and GET scattering must preserve every byte in order across multiple windows.
+TEST(Sg, UnlimitedLogicalWidthRoundTripsByteExact) {
+  auto a = Start("unlimited_width");
   KVClient c({{"a", a->addr}}, Hdr());
-  const size_t kBad = 30;  // 30 > max_sge-1 (=29)
-  std::vector<size_t> sizes(kBad, 16);
-  auto src = MakeChunks("over", sizes);
-  std::vector<const void*> ptrs;
-  for (auto& s : src) ptrs.push_back(s.data());
-  KvPutItemSg put{"k_over", ptrs, sizes};
-  auto pr = c.BatchPutSg({put});
-  ASSERT_EQ(pr.size(), 1u);
-  EXPECT_FALSE(pr[0]) << "30-segment put must be rejected by the guard";
+  const size_t window_segs = c.MaxSgPayloadSegs();
+  ASSERT_GT(window_segs, 0u);
+  const size_t nsegs = window_segs * 2 + 3;
 
-  // The key was never written, so a get is a miss too (and a 30-dst get is also
-  // guarded out independently).
-  std::vector<std::string> dst(kBad);
+  std::vector<size_t> sizes;
+  sizes.reserve(nsegs);
+  for (size_t i = 0; i < nsegs; ++i) sizes.push_back(1 + (i * 17) % 97);
+  auto src = MakeChunks("unlimited_width", sizes);
+  std::vector<const void*> ptrs;
+  ptrs.reserve(nsegs);
+  for (auto& segment : src) ptrs.push_back(segment.data());
+
+  const auto put = c.BatchPutSg({{"k_unlimited_width", ptrs, sizes}});
+  ASSERT_EQ(put.size(), 1u);
+  ASSERT_TRUE(put[0]);
+
+  std::vector<std::string> dst(nsegs);
   std::vector<void*> dptrs;
-  for (size_t i = 0; i < kBad; ++i) { dst[i].assign(16, '\0'); dptrs.push_back(&dst[i][0]); }
-  KvGetItemSg get{"k_over", dptrs, sizes};
-  std::vector<size_t> lens;
-  auto gr = c.BatchGetAutoSg({get}, &lens);
-  EXPECT_FALSE(gr[0]) << "30-segment get must be rejected by the guard";
+  dptrs.reserve(nsegs);
+  for (size_t i = 0; i < nsegs; ++i) {
+    dst[i].assign(sizes[i], '\0');
+    dptrs.push_back(dst[i].data());
+  }
+  std::vector<size_t> lengths;
+  const auto get = c.BatchGetAutoSg(
+      {{"k_unlimited_width", dptrs, sizes}}, &lengths);
+  ASSERT_EQ(get.size(), 1u);
+  ASSERT_EQ(lengths.size(), 1u);
+  ASSERT_TRUE(get[0]);
+  EXPECT_EQ(lengths[0],
+            std::accumulate(sizes.begin(), sizes.end(), size_t{0}));
+  for (size_t i = 0; i < nsegs; ++i)
+    EXPECT_EQ(dst[i], src[i]) << "segment " << i;
   a->srv->Stop();
 }
 
