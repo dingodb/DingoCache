@@ -77,6 +77,18 @@ bool AbortMultiWrWindow(size_t one_based_window, size_t window_count) {
          parsed == one_based_window;
 }
 
+bool CorruptGetOperationId(size_t one_based_window, size_t window_count) {
+  if (window_count <= 1) return false;
+  const char* value =
+      std::getenv("DFKV_RDMA_TEST_BAD_GET_OP_ID_WINDOW");
+  if (!value || !*value) return false;
+  errno = 0;
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(value, &end, 10);
+  return errno == 0 && end != value && *end == '\0' &&
+         parsed == one_based_window;
+}
+
 size_t ResolveMaxPayload(size_t configured) {
   size_t n = configured ? configured : (64u << 20);
   n = EnvBytes("DFKV_RDMA_MAX_PAYLOAD_BYTES", n);
@@ -658,7 +670,7 @@ RdmaTransport::Conn* RdmaTransport::Acquire(
     return pooled;
   }
   endpoint_cache_misses_.fetch_add(1, std::memory_order_relaxed);
-  const size_t conn_depth = lane == Lane::kSgData ? 1 : depth_;
+  const size_t conn_depth = depth_;
   const uint64_t conn_declared =
       lane == Lane::kControl
           ? static_cast<uint64_t>(rdma::kV2ControlCap)
@@ -2040,123 +2052,212 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
       }
     }
     bool from_pool = false;
-    Conn* conn = Acquire(node, Lane::kSgData, &from_pool, attempt > 0, 1);
+    Conn* conn = Acquire(
+        node, Lane::kSgData, &from_pool, attempt > 0,
+        std::min<size_t>(valid_count, depth_));
     if (!conn) return result;
     rdma::RcEndpoint& ep = conn->ep;
     const size_t target_limit =
         std::max<size_t>(1, std::min(ep.max_sge() - 1,
                                     rdma::kV2MaxGetTargets));
-    bool conn_ok = true;
+    const size_t operation_limit = ep.window();
+    bool conn_ok = operation_limit != 0;
     rdma::RailCompletion completion = rdma::RailCompletion::kRailFailure;
 
-    for (size_t item_index = 0; item_index < count && conn_ok; ++item_index) {
-      if (bad[item_index] || completed[item_index]) continue;
-      const RangeDstMulti& destination = destinations[item_index];
-      size_t nonempty = 0;
-      for (const auto& payload : destination.payloads)
-        if (payload.second != 0) ++nonempty;
-      const size_t window_count =
-          nonempty == 0 ? 1 : 1 + (nonempty - 1) / target_limit;
-      if (window_count > std::numeric_limits<uint32_t>::max()) {
-        result[item_index] = Status::kInvalid;
-        completed[item_index] = 1;
+    struct GetProgress {
+      size_t item = 0;
+      size_t segment_index = 0;
+      size_t logical_offset = 0;
+      size_t window_index = 0;
+      size_t window_count = 0;
+      uint32_t operation_id = 0;
+      uint64_t response_data_len = 0;
+      uint64_t response_value_len = 0;
+      bool finished = false;
+    };
+
+    size_t next_item = 0;
+    while (conn_ok) {
+      std::vector<GetProgress> active;
+      active.reserve(operation_limit);
+      while (next_item < count && active.size() < operation_limit) {
+        const size_t item = next_item++;
+        if (bad[item] || completed[item]) continue;
+        size_t nonempty = 0;
+        for (const auto& payload : destinations[item].payloads)
+          if (payload.second != 0) ++nonempty;
+        const size_t window_count =
+            nonempty == 0 ? 1 : 1 + (nonempty - 1) / target_limit;
+        if (window_count > std::numeric_limits<uint32_t>::max()) {
+          result[item] = Status::kInvalid;
+          completed[item] = 1;
+          continue;
+        }
+        GetProgress progress;
+        progress.item = item;
+        progress.window_count = window_count;
+        progress.operation_id = static_cast<uint32_t>(active.size());
+        active.push_back(progress);
+      }
+      if (active.empty()) {
+        if (next_item >= count) break;
         continue;
       }
 
-      size_t segment_index = 0;
-      size_t logical_offset = 0;
-      uint64_t value_len = 0;
-      uint64_t response_data_len = 0;
-      uint64_t response_value_len = 0;
-      for (size_t window_index = 0;
-           window_index < window_count && conn_ok; ++window_index) {
-        std::vector<RdmaWriteTarget> targets;
-        std::vector<ibv_mr*> mrs;
-        targets.reserve(target_limit);
-        mrs.reserve(target_limit);
-        size_t window_capacity = 0;
-        while (segment_index < destination.payloads.size() &&
-               targets.size() < target_limit) {
-          const auto& payload = destination.payloads[segment_index++];
-          if (payload.second == 0) continue;
-          ibv_mr* mr =
-              ep.RegisterTransient(payload.first, payload.second);
-          if (!mr) {
-            conn_ok = false;
+      size_t remaining = active.size();
+      while (conn_ok && remaining != 0) {
+        std::vector<size_t> frame_lengths;
+        std::vector<size_t> round_progress;
+        std::vector<size_t> round_capacity;
+        std::vector<std::vector<ibv_mr*>> round_mrs;
+        frame_lengths.reserve(remaining);
+        round_progress.reserve(remaining);
+        round_capacity.reserve(remaining);
+        round_mrs.reserve(remaining);
+
+        for (size_t progress_index = 0;
+             progress_index < active.size() && conn_ok; ++progress_index) {
+          GetProgress& progress = active[progress_index];
+          if (progress.finished) continue;
+          const RangeDstMulti& destination =
+              destinations[progress.item];
+          std::vector<RdmaWriteTarget> targets;
+          std::vector<ibv_mr*> mrs;
+          targets.reserve(target_limit);
+          mrs.reserve(target_limit);
+          size_t window_capacity = 0;
+          while (progress.segment_index < destination.payloads.size() &&
+                 targets.size() < target_limit) {
+            const auto& payload =
+                destination.payloads[progress.segment_index++];
+            if (payload.second == 0) continue;
+            ibv_mr* mr =
+                ep.RegisterTransient(payload.first, payload.second);
+            if (!mr) {
+              conn_ok = false;
+              break;
+            }
+            targets.push_back(
+                {reinterpret_cast<uint64_t>(payload.first), mr->rkey,
+                 static_cast<uint32_t>(payload.second)});
+            mrs.push_back(mr);
+            window_capacity += payload.second;
+          }
+          if (!conn_ok) {
+            for (ibv_mr* mr : mrs) ep.ReleaseTransient(mr);
             break;
           }
-          targets.push_back(
-              {reinterpret_cast<uint64_t>(payload.first), mr->rkey,
-               static_cast<uint32_t>(payload.second)});
-          mrs.push_back(mr);
-          window_capacity += payload.second;
+          if (AbortMultiWrWindow(progress.window_index + 1,
+                                 progress.window_count)) {
+            for (ibv_mr* mr : mrs) ep.ReleaseTransient(mr);
+            conn_ok = false;
+            completion = rdma::RailCompletion::kEndpointFailure;
+            break;
+          }
+          uint32_t operation_id = progress.operation_id;
+          if (CorruptGetOperationId(progress.window_index + 1,
+                                    progress.window_count)) {
+            operation_id =
+                operation_limit > 1
+                    ? static_cast<uint32_t>(
+                          (static_cast<size_t>(operation_id) + 1) %
+                          operation_limit)
+                    : 1;
+          }
+          const size_t slot = frame_lengths.size();
+          size_t frame_len = 0;
+          if (!EncodeRdmaGetReqWindow(
+                  ep.sbuf(slot), ep.cap(), keys[progress.item], 0,
+                  capacities[progress.item], targets, operation_id,
+                  static_cast<uint32_t>(progress.window_index),
+                  static_cast<uint32_t>(progress.window_count),
+                  progress.logical_offset, capacities[progress.item],
+                  &frame_len)) {
+            for (ibv_mr* mr : mrs) ep.ReleaseTransient(mr);
+            conn_ok = false;
+            completion = rdma::RailCompletion::kEndpointFailure;
+            break;
+          }
+          frame_lengths.push_back(frame_len);
+          round_progress.push_back(progress_index);
+          round_capacity.push_back(window_capacity);
+          round_mrs.push_back(std::move(mrs));
         }
-        if (!conn_ok) break;
-        if (AbortMultiWrWindow(window_index + 1, window_count)) {
-          conn_ok = false;
+        if (!conn_ok) {
+          for (auto& mrs : round_mrs)
+            for (ibv_mr* mr : mrs) ep.ReleaseTransient(mr);
           break;
         }
-        size_t frame_len = 0;
-        if (!EncodeRdmaGetReqWindow(
-                ep.sbuf(0), ep.cap(), keys[item_index], 0,
-                capacities[item_index], targets,
-                static_cast<uint32_t>(window_index),
-                static_cast<uint32_t>(window_count), logical_offset,
-                capacities[item_index], &frame_len) ||
-            !ep.PostRecv(0) || !ep.PostSend(0, frame_len)) {
-          conn_ok = false;
-          break;
-        }
-        v2_get_writes_.fetch_add(1, std::memory_order_relaxed);
+
         std::vector<uint32_t> reply_bytes;
         bool timed_out = false;
         ibv_wc_status wc_status = IBV_WC_SUCCESS;
         bool had_wcs = false;
-        if (!ReapPosted(ep, 1, 1, &reply_bytes, BatchTimeout(), &timed_out,
-                        &wc_status, &had_wcs)) {
+        if (!RunWindow(ep, frame_lengths, &reply_bytes, BatchTimeout(),
+                       &timed_out, &wc_status, &had_wcs)) {
           conn_ok = false;
           completion = rdma::ClassifyCompletion(wc_status, had_wcs);
         }
         if (timed_out)
           completion_timeouts_.fetch_add(1, std::memory_order_relaxed);
         if (!conn_ok) break;
-        for (ibv_mr* mr : mrs) ep.ReleaseTransient(mr);
-        Status status;
-        uint64_t data_len = 0;
-        if (reply_bytes[0] < kRespPrefix ||
-            !conn->Decode(ep.rbuf(0), &status, &data_len,
-                          capacities[item_index], &value_len) ||
-            value_len > std::numeric_limits<size_t>::max() ||
-            value_len > capacities[item_index] ||
-            (status == Status::kOk && data_len != value_len) ||
-            (window_index != 0 &&
-             (status != Status::kOk ||
-              data_len != response_data_len ||
-              value_len != response_value_len))) {
-          conn_ok = false;
-          completion = rdma::RailCompletion::kEndpointFailure;
-          break;
+        for (auto& mrs : round_mrs)
+          for (ibv_mr* mr : mrs) ep.ReleaseTransient(mr);
+        v2_get_writes_.fetch_add(frame_lengths.size(),
+                                 std::memory_order_relaxed);
+
+        for (size_t slot = 0;
+             slot < round_progress.size() && conn_ok; ++slot) {
+          GetProgress& progress = active[round_progress[slot]];
+          Status status;
+          uint64_t data_len = 0;
+          uint64_t value_len = 0;
+          if (reply_bytes[slot] < kRespPrefix ||
+              !conn->Decode(ep.rbuf(slot), &status, &data_len,
+                            capacities[progress.item], &value_len) ||
+              value_len > std::numeric_limits<size_t>::max() ||
+              value_len > capacities[progress.item] ||
+              (status == Status::kOk && data_len != value_len) ||
+              (progress.window_index != 0 &&
+               (status != Status::kOk ||
+                data_len != progress.response_data_len ||
+                value_len != progress.response_value_len))) {
+            conn_ok = false;
+            completion = rdma::RailCompletion::kEndpointFailure;
+            break;
+          }
+          if (progress.window_index == 0) {
+            progress.response_data_len = data_len;
+            progress.response_value_len = value_len;
+          }
+          result[progress.item] = status;
+          if (status != Status::kOk) {
+            progress.finished = true;
+            completed[progress.item] = 1;
+            --remaining;
+            continue;
+          }
+          progress.logical_offset += round_capacity[slot];
+          ++progress.window_index;
+          if (progress.window_index == progress.window_count) {
+            if (progress.logical_offset != capacities[progress.item]) {
+              conn_ok = false;
+              completion = rdma::RailCompletion::kEndpointFailure;
+              break;
+            }
+            progress.finished = true;
+            completed[progress.item] = 1;
+            if (out_lengths) {
+              (*out_lengths)[progress.item] =
+                  static_cast<size_t>(progress.response_value_len);
+            }
+            --remaining;
+          }
         }
-        if (window_index == 0) {
-          response_data_len = data_len;
-          response_value_len = value_len;
-        }
-        result[item_index] = status;
-        if (status != Status::kOk) break;
-        logical_offset += window_capacity;
       }
-      if (conn_ok && result[item_index] == Status::kOk) {
-        if (logical_offset != capacities[item_index]) {
-          conn_ok = false;
-          completion = rdma::RailCompletion::kEndpointFailure;
-          break;
-        }
-        if (out_lengths)
-          (*out_lengths)[item_index] =
-              static_cast<size_t>(response_value_len);
-      }
-      if (conn_ok) completed[item_index] = 1;
+      if (next_item >= count && conn_ok) break;
     }
+
     if (conn_ok) {
       Release(node, Lane::kSgData, conn);
       return result;

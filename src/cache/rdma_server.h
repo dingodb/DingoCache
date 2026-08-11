@@ -105,6 +105,9 @@ class RdmaServer {
   uint64_t V2GetWrites() const {
     return v2_get_writes_.load(std::memory_order_relaxed);
   }
+  uint64_t V2GetContinuationSlotChanges() const {
+    return v2_get_continuation_slot_changes_.load(std::memory_order_relaxed);
+  }
   // The server-side pipeline depth (env DFKV_RDMA_DEPTH, default 4) -- surfaced
   // in ring INFO because the CLIENT's depth must not exceed it: excess in-flight
   // requests hit receiver-not-ready retries and degrade SILENTLY (measured 3-4x
@@ -179,6 +182,7 @@ class RdmaServer {
   std::vector<std::unique_ptr<RailStats>> rail_stats_;  // indexed with anchor_devs_
   std::atomic<uint64_t> uring_reads_{0}, uring_init_fallbacks_{0};
   std::atomic<uint64_t> v2_conns_{0}, v2_put_writes_{0}, v2_get_writes_{0};
+  std::atomic<uint64_t> v2_get_continuation_slot_changes_{0};
   std::atomic<uint64_t> completions_{0}, completion_errors_{0}, active_conns_{0},
       idle_reclaims_{0};
 };

@@ -120,8 +120,8 @@ class RdmaTransport : public Transport {
  private:
   struct Conn;
   // force_new skips the idle pool after a stale connection. Lanes separate
-  // payload, device-direct SG, and key-sized control traffic. SG uses a
-  // depth-one QP because overlapping multi-SGE CUDA writes fail on mlx5.
+  // payload, device-direct SG, and key-sized control traffic; each lane keeps
+  // the negotiated depth while owning an independent endpoint pool.
   enum class Lane { kData, kSgData, kControl };
   Conn* Acquire(const std::string& node, Lane lane, bool* from_pool,
                 bool force_new = false, size_t requested_credits = 1);
