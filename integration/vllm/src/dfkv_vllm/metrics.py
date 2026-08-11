@@ -41,6 +41,14 @@ DFKV_OBSERVATION_NAMES = frozenset(
         "geometry_preparation",
     }
 )
+
+DFKV_POOL_SAMPLE_NAMES = frozenset(
+    {
+        "receive_queue_depth",
+        "receive_active_workers",
+    }
+)
+_POOL_SAMPLES_KEY = "_pool_samples"
 _OBSERVATIONS_KEY = "_observations"
 
 
@@ -99,6 +107,18 @@ class DfkvStoreConnectorStats(KVConnectorStats):
                     ]
                     if durations:
                         _reduce_durations(reduced, observation, durations)
+                continue
+            if operation == _POOL_SAMPLES_KEY:
+                for sample_name in sorted(DFKV_POOL_SAMPLE_NAMES):
+                    values = [
+                        float(record["value"])
+                        for record in records
+                        if record["name"] == sample_name
+                    ]
+                    if values:
+                        reduced[f"{sample_name}_count"] = len(values)
+                        reduced[f"{sample_name}_avg"] = round(fmean(values), 3)
+                        reduced[f"{sample_name}_max"] = max(values)
                 continue
             if not records:
                 continue
@@ -160,6 +180,16 @@ class DfkvStoreConnectorStats(KVConnectorStats):
             }
         )
 
+    def record_pool_sample(self, name: str, value: int) -> None:
+        if name not in DFKV_POOL_SAMPLE_NAMES:
+            raise ValueError(f"Unknown Dfkv connector pool sample: {name!r}")
+        self.data.setdefault(_POOL_SAMPLES_KEY, []).append(
+            {
+                "name": name,
+                "value": value,
+            }
+        )
+
 
 class DfkvStorePromMetrics(KVConnectorPromMetrics):
     """Prometheus metrics for Dfkv store communication."""
@@ -175,6 +205,7 @@ class DfkvStorePromMetrics(KVConnectorPromMetrics):
         metric_labelnames = labelnames + ["operation", "status"]
         self._metric_cache: dict[tuple[int, str, str], dict[str, PromMetric]] = {}
         self._observation_cache: dict[tuple[int, str], PromMetric] = {}
+        self._pool_sample_cache: dict[tuple[int, str], PromMetric] = {}
 
         self._histogram_operation_time = self._histogram_cls(
             name="vllm:dfkv_store_operation_time_seconds",
@@ -255,6 +286,21 @@ class DfkvStorePromMetrics(KVConnectorPromMetrics):
             )
             for name, metric_name in observation_metric_names.items()
         }
+        pool_sample_metric_names = {
+            "receive_queue_depth": "vllm:dfkv_receive_queue_depth",
+            "receive_active_workers": "vllm:dfkv_receive_active_workers",
+        }
+        self._histogram_pool_samples = {
+            name: self._histogram_cls(
+                name=metric_name,
+                documentation=f"Histogram of Dfkv {name.replace('_', ' ')}.",
+                buckets=list(range(0, 33))
+                if name == "receive_active_workers"
+                else [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
+                labelnames=labelnames,
+            )
+            for name, metric_name in pool_sample_metric_names.items()
+        }
 
     def _get_metrics(
         self,
@@ -291,6 +337,16 @@ class DfkvStorePromMetrics(KVConnectorPromMetrics):
             ].labels(*self.per_engine_labelvalues[engine_idx])
         return self._observation_cache[cache_key]
 
+    def _get_pool_sample_metric(self, engine_idx: int, name: str) -> PromMetric:
+        if name not in DFKV_POOL_SAMPLE_NAMES:
+            raise ValueError(f"Unknown Dfkv connector pool sample: {name!r}")
+        cache_key = (engine_idx, name)
+        if cache_key not in self._pool_sample_cache:
+            self._pool_sample_cache[cache_key] = self._histogram_pool_samples[
+                name
+            ].labels(*self.per_engine_labelvalues[engine_idx])
+        return self._pool_sample_cache[cache_key]
+
     def observe(self, transfer_stats_data: dict[str, Any] | None, engine_idx: int = 0):
         if not transfer_stats_data:
             return
@@ -300,8 +356,14 @@ class DfkvStorePromMetrics(KVConnectorPromMetrics):
             self._get_observation_metric(engine_idx, name).observe(
                 float(record["duration_seconds"])
             )
+        for record in transfer_stats_data.get(_POOL_SAMPLES_KEY, ()):
+            assert isinstance(record, dict)
+            name = str(record["name"])
+            self._get_pool_sample_metric(engine_idx, name).observe(
+                float(record["value"])
+            )
         for operation, records in transfer_stats_data.items():
-            if operation == _OBSERVATIONS_KEY:
+            if operation in {_OBSERVATIONS_KEY, _POOL_SAMPLES_KEY}:
                 continue
             assert isinstance(records, list)
             for record in records:

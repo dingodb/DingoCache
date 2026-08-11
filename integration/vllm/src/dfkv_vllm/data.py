@@ -7,7 +7,7 @@
 
 import hashlib
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, MutableSequence, Sequence
 from dfkv_common import pool_key
 from dataclasses import dataclass
 from itertools import product
@@ -96,6 +96,34 @@ def split_block_contiguous_runs(
             )
         previous_end = offset + size
     return block_stride, runs
+
+@dataclass(frozen=True, slots=True)
+class SgLayoutGeometry:
+    """Immutable pointer-arithmetic plan for one registered KV-cache group."""
+
+    segment_bases: tuple[int, ...]
+    block_strides: tuple[int, ...]
+    segment_sizes: tuple[int, ...]
+    segment_capacities: tuple[int, ...]
+    segments_per_block: int
+    logical_bytes_per_block: int
+
+    @classmethod
+    def from_layout(
+        cls, layout: Sequence[tuple[int, int, int]]
+    ) -> "SgLayoutGeometry":
+        bases = tuple(entry[0] for entry in layout)
+        strides = tuple(entry[1] for entry in layout)
+        sizes = tuple(entry[2] for entry in layout)
+        return cls(
+            segment_bases=bases,
+            block_strides=strides,
+            segment_sizes=sizes,
+            segment_capacities=sizes,
+            segments_per_block=len(layout),
+            logical_bytes_per_block=sum(sizes),
+        )
+
 
 
 
@@ -186,15 +214,20 @@ class ChunkedTokenDatabase:
         # strided layer. prepare_value emits them in canonical layer/run/block
         # order and always addresses the real physical block IDs.
         self._seg_layout: list[tuple[int, int, int]] | None = None
+        self._geometry: SgLayoutGeometry | None = None
 
     def _make_key_by_hash(self, chunk_hash: str | bytes) -> PoolKey:
         return PoolKey(self.metadata, chunk_hash)
 
     def set_kv_caches_base_addr(self, kv_caches_base_addr: list[int]):
-        self.kv_caches_base_addr = kv_caches_base_addr
+        self.kv_caches_base_addr = list(kv_caches_base_addr)
+        if self._seg_layout is None:
+            self._geometry = None
 
     def set_block_len(self, block_len: list[int]):
-        self.block_len = block_len
+        self.block_len = list(block_len)
+        if self._seg_layout is None:
+            self._geometry = None
 
     def set_seg_layout(self, seg_layout: list[tuple[int, int, int]]):
         """Install exact per-run ``(base, block_stride, block_content)``."""
@@ -205,11 +238,30 @@ class ChunkedTokenDatabase:
                     f"stride={stride} content={content}"
                 )
         self._seg_layout = list(seg_layout)
+        self._geometry = SgLayoutGeometry.from_layout(self._seg_layout)
 
-    def prepare_value(
-        self, start: int, end: int, block_ids: list[int]
-    ) -> tuple[list[int], list[int], int]:
-        """Return one logical chunk's complete, canonically ordered SG vector."""
+    @property
+    def geometry(self) -> SgLayoutGeometry:
+        """Return the immutable geometry shared by every request for this layout."""
+        geometry = self._geometry
+        if geometry is not None:
+            return geometry
+        if len(self.kv_caches_base_addr) != len(self.block_len):
+            raise ValueError("legacy KV base and block-length tables differ")
+        layout = tuple(
+            (base, length, length)
+            for base, length in zip(
+                self.kv_caches_base_addr, self.block_len, strict=True
+            )
+        )
+        geometry = SgLayoutGeometry.from_layout(layout)
+        self._geometry = geometry
+        return geometry
+
+    def descriptor_shape(
+        self, start: int, end: int, block_ids: Sequence[int]
+    ) -> tuple[int, int, int]:
+        """Return ``(segment_count, logical_bytes, first_block_id)``."""
         if (
             start < 0
             or end <= start
@@ -220,35 +272,63 @@ class ChunkedTokenDatabase:
                 f"token range [{start}, {end}) must align to "
                 f"block_size={self.block_size}"
             )
-
         start_block = start // self.block_size
         nblocks = (end - start) // self.block_size
-        chunk_block_ids = block_ids[start_block:start_block + nblocks]
-        if len(chunk_block_ids) != nblocks:
+        available = max(0, min(nblocks, len(block_ids) - start_block))
+        if available != nblocks:
             raise ValueError(
-                f"block table has {len(chunk_block_ids)} ids for "
+                f"block table has {available} ids for "
                 f"{nblocks} requested blocks at index {start_block}"
             )
+        geometry = self.geometry
+        return (
+            geometry.segments_per_block * nblocks,
+            geometry.logical_bytes_per_block * nblocks,
+            int(block_ids[start_block]),
+        )
 
-        if self._seg_layout is None:
-            if len(self.kv_caches_base_addr) != len(self.block_len):
-                raise ValueError("legacy KV base and block-length tables differ")
-            layout = [
-                (base, length, length)
-                for base, length in zip(
-                    self.kv_caches_base_addr, self.block_len, strict=True
-                )
-            ]
-        else:
-            layout = self._seg_layout
+    def fill_descriptors(
+        self,
+        start: int,
+        end: int,
+        block_ids: Sequence[int],
+        pointers: MutableSequence[int],
+        sizes: MutableSequence[int],
+        offset: int = 0,
+    ) -> int:
+        """Fill flat descriptor arrays and return the first unused index."""
+        segment_count, _, _ = self.descriptor_shape(start, end, block_ids)
+        if offset < 0 or len(pointers) - offset < segment_count:
+            raise ValueError("pointer descriptor array is too small")
+        if len(sizes) - offset < segment_count:
+            raise ValueError("size descriptor array is too small")
+        geometry = self.geometry
+        start_block = start // self.block_size
+        end_block = end // self.block_size
+        cursor = offset
+        for base, stride, content in zip(
+            geometry.segment_bases,
+            geometry.block_strides,
+            geometry.segment_sizes,
+            strict=True,
+        ):
+            for block_index in range(start_block, end_block):
+                pointers[cursor] = base + int(block_ids[block_index]) * stride
+                sizes[cursor] = content
+                cursor += 1
+        return cursor
 
-        addr_list: list[int] = []
-        size_list: list[int] = []
-        for base, stride, content in layout:
-            for block_id in chunk_block_ids:
-                addr_list.append(base + block_id * stride)
-                size_list.append(content)
-        return addr_list, size_list, chunk_block_ids[0]
+    def prepare_value(
+        self, start: int, end: int, block_ids: list[int]
+    ) -> tuple[list[int], list[int], int]:
+        """Return one logical chunk's complete, canonically ordered SG vector."""
+        segment_count, _, first_block_id = self.descriptor_shape(
+            start, end, block_ids
+        )
+        addr_list = [0] * segment_count
+        size_list = [0] * segment_count
+        self.fill_descriptors(start, end, block_ids, addr_list, size_list)
+        return addr_list, size_list, first_block_id
 
     def process_tokens(
         self,

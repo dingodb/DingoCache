@@ -23,6 +23,170 @@ c_void_p = ctypes.c_void_p
 c_uint64 = ctypes.c_uint64
 c_int = ctypes.c_int
 
+class _FlatSgVectorView(Sequence[int]):
+    """Read-only view of one key's slice in a flat ctypes descriptor array."""
+
+    __slots__ = ("_values", "_start", "_length")
+
+    def __init__(self, values: ctypes.Array, start: int, length: int):
+        self._values = values
+        self._start = start
+        self._length = length
+
+    def __len__(self) -> int:
+        return self._length
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            start, stop, step = index.indices(self._length)
+            return [
+                0 if self._values[self._start + i] is None
+                else int(self._values[self._start + i])
+                for i in range(start, stop, step)
+            ]
+        if index < 0:
+            index += self._length
+        if index < 0 or index >= self._length:
+            raise IndexError(index)
+        value = self._values[self._start + index]
+        return 0 if value is None else int(value)
+
+
+class _FlatSgVectors(Sequence[Sequence[int]]):
+    """Public-API-compatible nested view backed by one flat allocation."""
+
+    __slots__ = ("_batch", "_kind")
+
+    def __init__(self, batch: "SgDescriptorBatch", kind: str):
+        self._batch = batch
+        self._kind = kind
+
+    def __len__(self) -> int:
+        return len(self._batch.counts)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self))
+            return [self[i] for i in range(start, stop, step)]
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        values = (
+            self._batch._pointers
+            if self._kind == "pointers"
+            else self._batch._sizes
+        )
+        return _FlatSgVectorView(
+            values, self._batch.offsets[index], self._batch.counts[index]
+        )
+
+
+class SgDescriptorBatch:
+    """Request-owned, flat ctypes SG descriptors for one native batch call."""
+
+    __slots__ = (
+        "counts",
+        "offsets",
+        "logical_lengths",
+        "num_segments",
+        "total_bytes",
+        "_pointers",
+        "_sizes",
+        "_pointer_vectors",
+        "_size_vectors",
+        "_count_array",
+        "ptrs",
+        "sizes",
+        "caps",
+    )
+
+    def __init__(
+        self,
+        counts: Sequence[int],
+        logical_lengths: Sequence[int],
+    ):
+        if len(counts) != len(logical_lengths):
+            raise ValueError("descriptor counts and logical lengths differ")
+        if any(count <= 0 for count in counts):
+            raise ValueError("every SG key must have at least one descriptor")
+        self.counts = tuple(int(count) for count in counts)
+        self.logical_lengths = tuple(int(length) for length in logical_lengths)
+        offsets: list[int] = []
+        cursor = 0
+        for count in self.counts:
+            offsets.append(cursor)
+            cursor += count
+        self.offsets = tuple(offsets)
+        self.num_segments = cursor
+        self.total_bytes = sum(self.logical_lengths)
+        self._pointers = (c_void_p * self.num_segments)()
+        self._sizes = (c_uint64 * self.num_segments)()
+        nkeys = len(self.counts)
+        self._pointer_vectors = (ctypes.POINTER(c_void_p) * nkeys)()
+        self._size_vectors = (ctypes.POINTER(c_uint64) * nkeys)()
+        for i, offset in enumerate(self.offsets):
+            self._pointer_vectors[i] = ctypes.cast(
+                ctypes.byref(
+                    self._pointers, offset * ctypes.sizeof(c_void_p)
+                ),
+                ctypes.POINTER(c_void_p),
+            )
+            self._size_vectors[i] = ctypes.cast(
+                ctypes.byref(
+                    self._sizes, offset * ctypes.sizeof(c_uint64)
+                ),
+                ctypes.POINTER(c_uint64),
+            )
+        self._count_array = (c_int * nkeys)(*self.counts)
+        self.ptrs = _FlatSgVectors(self, "pointers")
+        self.sizes = _FlatSgVectors(self, "sizes")
+        self.caps = self.sizes
+
+    @classmethod
+    def from_chunks(cls, chunks: Sequence[tuple[object, int, int, Sequence[int]]]):
+        """Build one flat batch from ``(database, start, end, block_ids)``."""
+        shapes = [
+            db.descriptor_shape(start, end, block_ids)  # type: ignore[attr-defined]
+            for db, start, end, block_ids in chunks
+        ]
+        batch = cls(
+            [shape[0] for shape in shapes],
+            [shape[1] for shape in shapes],
+        )
+        cursor = 0
+        for db, start, end, block_ids in chunks:
+            cursor = db.fill_descriptors(  # type: ignore[attr-defined]
+                start,
+                end,
+                block_ids,
+                batch._pointers,
+                batch._sizes,
+                cursor,
+            )
+        if cursor != batch.num_segments:
+            raise RuntimeError(
+                f"descriptor fill mismatch: expected={batch.num_segments} "
+                f"actual={cursor}"
+            )
+        return batch
+
+
+def _prebuilt_sg_batch(
+    seg_ptrs: Sequence[Sequence[int]],
+    seg_lengths: Sequence[Sequence[int]],
+) -> SgDescriptorBatch | None:
+    if not isinstance(seg_ptrs, _FlatSgVectors):
+        return None
+    if not isinstance(seg_lengths, _FlatSgVectors):
+        return None
+    if seg_ptrs._kind != "pointers" or seg_lengths._kind != "sizes":
+        return None
+    if seg_ptrs._batch is not seg_lengths._batch:
+        return None
+    return seg_ptrs._batch
+
+
 
 
 def _env_rank() -> int:
@@ -51,6 +215,13 @@ def _validate_sg_vectors(
             f"keys={len(keys)} ptr_vectors={len(seg_ptrs)} "
             f"length_vectors={len(seg_lengths)}"
         )
+    prebuilt = _prebuilt_sg_batch(seg_ptrs, seg_lengths)
+    if prebuilt is not None:
+        if len(prebuilt.counts) != len(keys):
+            raise ValueError(
+                f"{operation} prebuilt descriptor count differs from keys"
+            )
+        return
     for i, (ptrs, lengths) in enumerate(
         zip(seg_ptrs, seg_lengths, strict=True)
     ):
@@ -288,8 +459,13 @@ class DfkvDeviceClient:
         reports one status per key (``0`` = ok, ``1`` = failed)."""
         _validate_sg_vectors(keys, seg_ptrs, seg_sizes, "batch_put_sg")
         n = len(keys)
-        num_segments = sum(len(p) for p in seg_ptrs)
-        num_bytes = sum(sum(s) for s in seg_sizes)
+        prebuilt = _prebuilt_sg_batch(seg_ptrs, seg_sizes)
+        if prebuilt is None:
+            num_segments = sum(len(p) for p in seg_ptrs)
+            num_bytes = sum(sum(s) for s in seg_sizes)
+        else:
+            num_segments = prebuilt.num_segments
+            num_bytes = prebuilt.total_bytes
         with _push_metrics.op("put", num_keys=n) as _m, \
                 _push_tracing.span("batch_put_sg", n) as _sp, \
                 access_log(
@@ -302,16 +478,30 @@ class DfkvDeviceClient:
                 _sp.bytes = num_bytes
                 _sp.attrs = {"dfkv.sg_segments": num_segments}
             karr, klens, key_owners = make_key_array(keys)
-            # Keep the per-key inner arrays alive for the duration of the call.
-            inner_p = [(c_void_p * len(p))(*[c_void_p(x) for x in p]) for p in seg_ptrs]
-            inner_s = [(c_uint64 * len(s))(*s) for s in seg_sizes]
-            parr = (ctypes.POINTER(c_void_p) * n)(
-                *[ctypes.cast(a, ctypes.POINTER(c_void_p)) for a in inner_p]
-            )
-            sarr = (ctypes.POINTER(c_uint64) * n)(
-                *[ctypes.cast(a, ctypes.POINTER(c_uint64)) for a in inner_s]
-            )
-            narr = (c_int * n)(*[len(p) for p in seg_ptrs])
+            if prebuilt is None:
+                # Legacy callers keep their existing nested-Sequence API.
+                inner_p = [
+                    (c_void_p * len(p))(*[c_void_p(x) for x in p])
+                    for p in seg_ptrs
+                ]
+                inner_s = [(c_uint64 * len(s))(*s) for s in seg_sizes]
+                parr = (ctypes.POINTER(c_void_p) * n)(
+                    *[
+                        ctypes.cast(a, ctypes.POINTER(c_void_p))
+                        for a in inner_p
+                    ]
+                )
+                sarr = (ctypes.POINTER(c_uint64) * n)(
+                    *[
+                        ctypes.cast(a, ctypes.POINTER(c_uint64))
+                        for a in inner_s
+                    ]
+                )
+                narr = (c_int * n)(*[len(p) for p in seg_ptrs])
+            else:
+                parr = prebuilt._pointer_vectors
+                sarr = prebuilt._size_vectors
+                narr = prebuilt._count_array
             out = (c_int * n)()
             rc = self._lib.dfkv_batch_put_sg(
                 self._h, karr, klens, parr, sarr, narr, n, out)
@@ -338,7 +528,12 @@ class DfkvDeviceClient:
         ``(hits, lengths)`` result."""
         _validate_sg_vectors(keys, seg_ptrs, seg_caps, "batch_get_auto_sg")
         n = len(keys)
-        num_segments = sum(len(p) for p in seg_ptrs)
+        prebuilt = _prebuilt_sg_batch(seg_ptrs, seg_caps)
+        num_segments = (
+            prebuilt.num_segments
+            if prebuilt is not None
+            else sum(len(p) for p in seg_ptrs)
+        )
         with _push_metrics.op("get", num_keys=n) as _m, \
                 _push_tracing.span("batch_get_auto_sg", n) as _sp, \
                 access_log(
@@ -348,15 +543,29 @@ class DfkvDeviceClient:
             if _sp:
                 _sp.attrs = {"dfkv.sg_segments": num_segments}
             karr, klens, key_owners = make_key_array(keys)
-            inner_p = [(c_void_p * len(p))(*[c_void_p(x) for x in p]) for p in seg_ptrs]
-            inner_c = [(c_uint64 * len(c))(*c) for c in seg_caps]
-            parr = (ctypes.POINTER(c_void_p) * n)(
-                *[ctypes.cast(a, ctypes.POINTER(c_void_p)) for a in inner_p]
-            )
-            carr = (ctypes.POINTER(c_uint64) * n)(
-                *[ctypes.cast(a, ctypes.POINTER(c_uint64)) for a in inner_c]
-            )
-            narr = (c_int * n)(*[len(p) for p in seg_ptrs])
+            if prebuilt is None:
+                inner_p = [
+                    (c_void_p * len(p))(*[c_void_p(x) for x in p])
+                    for p in seg_ptrs
+                ]
+                inner_c = [(c_uint64 * len(c))(*c) for c in seg_caps]
+                parr = (ctypes.POINTER(c_void_p) * n)(
+                    *[
+                        ctypes.cast(a, ctypes.POINTER(c_void_p))
+                        for a in inner_p
+                    ]
+                )
+                carr = (ctypes.POINTER(c_uint64) * n)(
+                    *[
+                        ctypes.cast(a, ctypes.POINTER(c_uint64))
+                        for a in inner_c
+                    ]
+                )
+                narr = (c_int * n)(*[len(p) for p in seg_ptrs])
+            else:
+                parr = prebuilt._pointer_vectors
+                carr = prebuilt._size_vectors
+                narr = prebuilt._count_array
             out_hit = (c_int * n)()
             out_len = (c_uint64 * n)()
             rc = self._lib.dfkv_batch_get_auto_sg(

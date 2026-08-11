@@ -12,6 +12,7 @@ enabling prefix caching via hash-based deduplication.
 """
 
 from collections.abc import Iterable
+import threading
 from typing import Any
 
 import torch
@@ -145,6 +146,8 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self._kv_cache_config = kv_cache_config
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self._kv_cache_events: DfkvStoreKVEvents | None = None
+        self._shutdown_lock = threading.Lock()
+        self._shutdown = False
 
         self.connector_scheduler: DfkvStoreScheduler | None = None
         self.connector_worker: DfkvStoreWorker | None = None
@@ -245,14 +248,21 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
     # ============================================================
     # Worker-side methods
     # ============================================================
+    def _reject_after_shutdown(self) -> None:
+        with self._shutdown_lock:
+            if self._shutdown:
+                raise RuntimeError("dfkv connector is shut down")
+
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        self._reject_after_shutdown()
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
 
     def register_cross_layers_kv_cache(
         self, kv_cache: torch.Tensor, attn_backend: type
     ):
+        self._reject_after_shutdown()
         assert self.connector_worker is not None
         assert (
             self._kv_cache_config is not None
@@ -261,6 +271,7 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self.connector_worker.register_cross_layers_kv_caches(kv_cache)
 
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
+        self._reject_after_shutdown()
         # Loads are issued in get_finished() for compute overlap; this hook
         # only runs the preemption fence, which must happen BEFORE this step's
         # forward pass can overwrite a preempted request's freed (and possibly
@@ -291,6 +302,7 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
+        self._reject_after_shutdown()
         assert self.connector_worker is not None
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, DfkvStoreConnectorMetadata)
@@ -318,11 +330,28 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
         return self.connector_worker.get_kv_connector_stats()
 
     def shutdown(self) -> None:
-        """vLLM lifecycle hook: release connector resources deterministically."""
-        if self.connector_worker is not None:
-            self.connector_worker.close()
-        if self.connector_scheduler is not None:
-            self.connector_scheduler.close()
+        """Join connector workers and release native state exactly once."""
+        errors: list[Exception] = []
+        with self._shutdown_lock:
+            if self._shutdown:
+                return
+            try:
+                if self.connector_worker is not None:
+                    try:
+                        self.connector_worker.close()
+                    except Exception as error:
+                        errors.append(error)
+                if self.connector_scheduler is not None:
+                    try:
+                        self.connector_scheduler.close()
+                    except Exception as error:
+                        errors.append(error)
+            finally:
+                self._shutdown = True
+        if errors:
+            raise RuntimeError(
+                f"dfkv connector shutdown had {len(errors)} cleanup error(s)"
+            ) from errors[0]
 
     @classmethod
     def build_kv_connector_stats(
