@@ -60,9 +60,11 @@ class DfkvStoreScheduler:
         # hashing (silent 0% cross-instance/cross-restart hit rate otherwise).
         ensure_deterministic_block_hashing(vllm_config.cache_config)
         self.kv_role = vllm_config.kv_transfer_config.kv_role
-        self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
-            "load_async", True
+        extra_config = (
+            vllm_config.kv_transfer_config.kv_connector_extra_config
         )
+        self.load_async = extra_config.get("load_async", True)
+        self.lookup_async = extra_config.get("lookup_async", False)
         self.client = LookupKeyClient(vllm_config)
         self._closed = False
 
@@ -82,21 +84,31 @@ class DfkvStoreScheduler:
         self,
         request: Request,
         num_computed_tokens: int,
-    ) -> tuple[int, bool]:
-        """Check for external KV cache hit."""
+    ) -> tuple[int | None, bool]:
+        """Check for an external KV cache hit.
+
+        Returns ``(None, False)`` while an asynchronous lookup is pending so
+        vLLM retries the request on a later scheduler step.
+        """
         # Look up against the full prefill range, not just the prompt.
         token_len = request.num_tokens // self._block_size * self._block_size
         if token_len < self._block_size:
             return 0, False
 
         _lk0 = time.perf_counter()
-        num_external_hit_tokens = self.client.lookup(token_len, request.block_hashes)
+        num_external_hit_tokens = self.client.lookup(
+            request.request_id,
+            token_len,
+            request.block_hashes,
+            non_block=self.lookup_async,
+        )
+        if num_external_hit_tokens is None:
+            return None, False
         logger.debug(
             "dfkv matched: req=%s tokens=%d computed=%d lookup_ms=%.1f hit_tokens=%d",
             request.request_id, request.num_tokens, num_computed_tokens,
             (time.perf_counter() - _lk0) * 1000.0, num_external_hit_tokens,
         )
-
         if num_external_hit_tokens == request.num_tokens:
             # Leave a sub-block tail uncomputed for sampling, on a block
             # boundary so the recv-side load mask covers every yielded chunk.
@@ -171,6 +183,7 @@ class DfkvStoreScheduler:
         force_skip_save = self.kv_role == "kv_consumer"
 
         for finished_req_id in scheduler_output.finished_req_ids:
+            self.client.discard(finished_req_id)
             self.load_specs.pop(finished_req_id, None)
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
@@ -180,6 +193,7 @@ class DfkvStoreScheduler:
         preempted_ids = scheduler_output.preempted_req_ids or set()
         self._preempted_req_ids.update(preempted_ids)
         for req_id in preempted_ids:
+            self.client.discard(req_id)
             self.load_specs.pop(req_id, None)
             if request_tracker := self._request_trackers.get(req_id):
                 request_tracker.reset()
@@ -360,6 +374,7 @@ class DfkvStoreScheduler:
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         """Determine whether to delay freeing blocks for async save."""
+        self.client.discard(request.request_id)
         if self.kv_role == "kv_consumer":
             return False, None
         tracker = self._request_trackers.get(request.request_id)

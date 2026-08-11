@@ -22,6 +22,7 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, TypeVar
 
 import torch
@@ -50,7 +51,6 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_kv_cache_block_sizes,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
-from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 # dfkv: get_dp_engine_index replaces mooncake_utils.get_mooncake_dp_engine_index;
 # dfkv handles its own RDMA bootstrap so the transfer-engine helpers are dropped.
@@ -76,9 +76,12 @@ from .metrics import DfkvStoreConnectorStats
 from ._telemetry import config as _tcfg  # connector identity + client_register switch
 from .protocol import (
     LOOKUP_MSG,
+    LOOKUP_RESPONSE_BYTES,
     RESET_MSG,
     RESP_ERR,
     RESP_OK,
+    _decode_lookup_request,
+    _encode_lookup_request,
 )
 
 logger = init_logger(__name__)
@@ -160,6 +163,7 @@ class KVTransferThread(threading.Thread):
         ready_event: threading.Event,
         name: str,
         record_operation: Callable[..., None] | None = None,
+        record_observation: Callable[[str, float], None] | None = None,
         queue_capacity: int = DEFAULT_TRANSFER_QUEUE_CAPACITY,
     ):
         super().__init__(daemon=False, name=name)
@@ -169,6 +173,7 @@ class KVTransferThread(threading.Thread):
         self.tp_rank = tp_rank
         self.token_databases = token_databases
         self._record_operation_cb = record_operation
+        self._record_observation_cb = record_observation
         self.done_task_lock = threading.Lock()
         self.request_queue: queue.Queue[Any] = queue.Queue(maxsize=queue_capacity)
         self.finished_requests: set[str] = set()
@@ -284,6 +289,7 @@ class KVTransferThread(threading.Thread):
         start_time: float,
         num_keys: int,
         *,
+        num_logical_keys: int | None = None,
         num_bytes: int = 0,
         status: str = "ok",
         num_failed_keys: int = 0,
@@ -294,10 +300,15 @@ class KVTransferThread(threading.Thread):
             operation=operation,
             duration_seconds=time.perf_counter() - start_time,
             num_keys=num_keys,
+            num_logical_keys=num_logical_keys,
             num_bytes=num_bytes,
             status=status,
             num_failed_keys=num_failed_keys,
         )
+
+    def _record_observation(self, name: str, start_time: float) -> None:
+        if self._record_observation_cb is not None:
+            self._record_observation_cb(name, time.perf_counter() - start_time)
 
     def update_kv_event(self, events: list[BlockStored]):
         with self.kv_event_lock:
@@ -480,6 +491,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     "save_exists",
                     save_exists_start,
                     len(probe_keys),
+                    num_logical_keys=len(keys),
                     status="error",
                     num_failed_keys=len(probe_keys),
                 )
@@ -488,6 +500,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 "save_exists",
                 save_exists_start,
                 len(probe_keys),
+                num_logical_keys=len(keys),
             )
             chunk_missing = [False] * len(keys)
             for owner, exists in zip(probe_owner, exists_states, strict=True):
@@ -566,6 +579,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     "save_put",
                     put_start,
                     len(sg_keys),
+                    num_logical_keys=len(keys),
                     num_bytes=batch_bytes,
                     status="partial_failure" if failed else "ok",
                     num_failed_keys=len(failed),
@@ -605,6 +619,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                             "save_remove_partial",
                             rm_start,
                             rm_attempted,
+                            num_logical_keys=len({sg_owner[i] for i in failed}),
                             status="ok" if rm_confirmed == rm_attempted
                             else "partial_failure",
                             num_failed_keys=rm_attempted - rm_confirmed,
@@ -633,6 +648,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     "save_put",
                     put_start,
                     len(sg_keys),
+                    num_logical_keys=len(keys),
                     num_bytes=batch_bytes,
                     status="error",
                     num_failed_keys=len(sg_keys),
@@ -669,6 +685,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         tp_rank: int,
         ready_event: threading.Event,
         record_operation: Callable[..., None] | None = None,
+        record_observation: Callable[[str, float], None] | None = None,
         client_provider: Callable[[], Any] | None = None,
         queue_capacity: int = DEFAULT_TRANSFER_QUEUE_CAPACITY,
     ):
@@ -680,16 +697,21 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             ready_event,
             name="KVCacheStoreRecvingThread",
             record_operation=record_operation,
+            record_observation=record_observation,
             queue_capacity=queue_capacity,
         )
         # Elided ranks start with client=None; a real load arriving there calls
         # this back into the worker to lazily un-elide (create + register the
         # client) instead of failing the span into a recompute.
         self.client_provider = client_provider
-        # _invalid_block_ids can be access by both the Worker and RecvingThread
+        # _invalid_block_ids can be accessed by both the Worker and RecvingThread.
         self._invalid_block_ids_lock = threading.Lock()
         self._invalid_block_ids: set[int] = set()
         self.coord = coord
+
+    def add_request(self, request: ReqMeta) -> bool:
+        request._dfkv_receive_enqueued_at = time.perf_counter()  # type: ignore[attr-defined]
+        return super().add_request(request)
 
     def _add_load_error_block_ids(self, block_ids: list[int]) -> None:
         with self._invalid_block_ids_lock:
@@ -703,6 +725,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
 
     def _handle_request(self, req_meta: ReqMeta):
         req_id = req_meta.req_id
+        enqueued_at = getattr(req_meta, "_dfkv_receive_enqueued_at", None)
+        if enqueued_at is not None:
+            self._record_observation("receive_queue_wait", enqueued_at)
+        geometry_start = time.perf_counter()
         try:
             token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
             mask_num = (
@@ -739,6 +765,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             # the request now, else `tp_rank % 0` below would raise and the req would
             # never be reported done, hanging vLLM's WAITING_FOR_REMOTE_KVS wait.
             if not key_list:
+                self._record_observation("geometry_preparation", geometry_start)
                 return
 
             # Rotate aligned lists by tp_rank for load balancing.
@@ -763,6 +790,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             sg_keys, sg_ptrs, sg_caps, sg_owner = _group_segments_sg(
                 key_list_c, addr_list_c, size_list_c, _sg_segs_of(client)
             )
+            self._record_observation("geometry_preparation", geometry_start)
             sg_totals = [sum(c) for c in sg_caps]
             batch_bytes = sum(sg_totals)
 
@@ -787,6 +815,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     "load_get",
                     load_get_start,
                     len(sg_keys),
+                    num_logical_keys=len(key_list_c),
                     num_bytes=batch_bytes,
                     status="partial_failure" if failed_block_ids else "ok",
                     num_failed_keys=len(failed_block_ids),
@@ -812,6 +841,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     "load_get",
                     load_get_start,
                     len(sg_keys),
+                    num_logical_keys=len(key_list_c),
                     num_bytes=batch_bytes,
                     status="error",
                     num_failed_keys=len(sg_keys),
@@ -1503,6 +1533,7 @@ class DfkvStoreWorker:
             self.tp_rank,
             ready_event_recving,
             record_operation=self._record_kv_connector_operation,
+            record_observation=self._record_kv_connector_observation,
             client_provider=self._ensure_client_for_load,
             queue_capacity=getattr(
                 self, "transfer_queue_capacity", DEFAULT_TRANSFER_QUEUE_CAPACITY
@@ -1629,6 +1660,7 @@ class DfkvStoreWorker:
         duration_seconds: float,
         num_keys: int,
         *,
+        num_logical_keys: int | None = None,
         num_bytes: int = 0,
         status: str = "ok",
         num_failed_keys: int = 0,
@@ -1638,10 +1670,19 @@ class DfkvStoreWorker:
                 operation=operation,
                 duration_seconds=duration_seconds,
                 num_keys=num_keys,
+                num_logical_keys=num_logical_keys,
                 num_bytes=num_bytes,
                 status=status,
                 num_failed_keys=num_failed_keys,
             )
+
+    def _record_kv_connector_observation(
+        self,
+        name: str,
+        duration_seconds: float,
+    ) -> None:
+        with self._kv_connector_stats_lock:
+            self.kv_connector_stats.record_observation(name, duration_seconds)
 
     def get_kv_connector_stats(self) -> DfkvStoreConnectorStats | None:
         with self._kv_connector_stats_lock:
@@ -1759,12 +1800,14 @@ class DfkvStoreWorker:
                 "lookup_exists",
                 time.perf_counter() - lookup_start,
                 len(candidate_keys),
+                num_logical_keys=len(expected_per_chunk),
             )
         except Exception as e:
             self._record_kv_connector_operation(
                 "lookup_exists",
                 time.perf_counter() - lookup_start,
                 len(candidate_keys),
+                num_logical_keys=len(expected_per_chunk),
                 status="error",
                 num_failed_keys=len(candidate_keys),
             )
@@ -1886,7 +1929,6 @@ class LookupKeyServer:
         store_worker: DfkvStoreWorker,
         vllm_config: VllmConfig,
     ):
-        self.decoder = MsgpackDecoder()
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
         socket_path = get_zmq_rpc_path_lookup(vllm_config)
         self._ipc_path = socket_path.removeprefix("ipc://")
@@ -1915,17 +1957,47 @@ class LookupKeyServer:
                     if not self.running:
                         return
                     raise
-                msg_type = bytes(all_frames[0])
 
+                if not all_frames:
+                    logger.warning("LookupKeyServer received an empty request")
+                    self.socket.send(RESP_ERR)
+                    continue
+
+                msg_type = bytes(all_frames[0])
                 if msg_type == LOOKUP_MSG:
-                    token_len = int.from_bytes(all_frames[1], byteorder="big")
-                    hash_frames = all_frames[2:]
-                    hashes_str = self.decoder.decode(hash_frames)
-                    block_hashes = [BlockHash(bytes.fromhex(s)) for s in hashes_str]
-                    result = self.store_worker.lookup(token_len, block_hashes)
-                    self.socket.send(result.to_bytes(4, "big"))
+                    # A malformed request is an external-cache miss, never a
+                    # reason to terminate the rank-0 admin server.
+                    lookup_ipc_start = time.perf_counter()
+                    try:
+                        token_len, hash_bytes = _decode_lookup_request(
+                            [frame.buffer for frame in all_frames]
+                        )
+                        block_hashes = [BlockHash(value) for value in hash_bytes]
+                        result = self.store_worker.lookup(token_len, block_hashes)
+                        if not 0 <= result < 1 << (8 * LOOKUP_RESPONSE_BYTES):
+                            raise ValueError(
+                                f"lookup result is outside uint32: {result}"
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "LookupKeyServer rejected lookup request: %s", e
+                        )
+                        result = 0
+                    self.socket.send(
+                        result.to_bytes(LOOKUP_RESPONSE_BYTES, byteorder="big")
+                    )
+                    self.store_worker._record_kv_connector_observation(
+                        "lookup_ipc", time.perf_counter() - lookup_ipc_start
+                    )
 
                 elif msg_type == RESET_MSG:
+                    if len(all_frames) != 1:
+                        logger.warning(
+                            "LookupKeyServer rejected reset with %d frames",
+                            len(all_frames),
+                        )
+                        self.socket.send(RESP_ERR)
+                        continue
                     # dfkv: DfkvDeviceClient exposes no remove_all / global wipe
                     # primitive. Entries expire by the server's own policy. We
                     # still drain in-flight puts to honor the ordering contract,
@@ -1972,13 +2044,11 @@ class LookupKeyServer:
 class LookupKeyClient:
     """ZMQ client for the LookupKey admin channel.
 
-    Routes both prefix-cache lookups and admin commands (currently:
-    ``reset``) to ``LookupKeyServer`` on worker rank 0. The first frame
-    of every request is a named tag from ``protocol.py``.
+    The single-worker executor is also the sole owner of socket I/O. Async
+    scheduler calls retain one future per request and poll it on later steps.
     """
 
     def __init__(self, vllm_config: VllmConfig):
-        self.encoder = MsgpackEncoder()
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
         self._close_lock = threading.Lock()
         self._closed = False
@@ -1989,37 +2059,86 @@ class LookupKeyClient:
             zmq.REQ,  # type: ignore[attr-defined]
             bind=False,
         )
+        self.executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="DfkvLookupClient",
+        )
+        self.futures: dict[str, Future[int]] = {}
 
-    def lookup(self, token_len: int, block_hashes: list[BlockHash]) -> int:
-        hash_strs = [h.hex() for h in block_hashes]
-        hash_frames = self.encoder.encode(hash_strs)
-        token_len_bytes = token_len.to_bytes(4, byteorder="big")
-        all_frames = [LOOKUP_MSG, token_len_bytes] + list(hash_frames)
+    def _lookup(self, token_len: int, block_hashes: list[BlockHash]) -> int:
+        all_frames = _encode_lookup_request(token_len, block_hashes)
         self.socket.send_multipart(all_frames, copy=False)
         resp = self.socket.recv()
-        result = int.from_bytes(resp, "big")
-        return result
+        if len(resp) != LOOKUP_RESPONSE_BYTES:
+            raise ValueError(
+                f"lookup response has {len(resp)} bytes, "
+                f"expected {LOOKUP_RESPONSE_BYTES}"
+            )
+        return int.from_bytes(resp, byteorder="big")
 
-    def reset(self) -> bool:
-        """Trigger a global store wipe on worker rank 0.
+    def lookup(
+        self,
+        req_id: str,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        non_block: bool = False,
+    ) -> int | None:
+        """Return a hit count, or ``None`` while a non-blocking lookup runs."""
+        with self._close_lock:
+            if self._closed:
+                return 0
+            future = self.futures.get(req_id)
+            if future is None:
+                future = self.executor.submit(
+                    self._lookup,
+                    token_len,
+                    list(block_hashes),
+                )
+                self.futures[req_id] = future
 
-        Ordering assumption: caller MUST ensure no in-flight Dfkv
-        lookups or transfers when invoking reset. In RL workflows this
-        holds naturally at the step boundary after weight updates and
-        rollout drain. Returns True on ACK, False on NACK.
+        if non_block and not future.done():
+            return None
+        try:
+            return future.result()
+        except Exception as e:
+            logger.error("Dfkv lookup failed for %s: %s", req_id, e)
+            return 0
+        finally:
+            with self._close_lock:
+                if self.futures.get(req_id) is future:
+                    self.futures.pop(req_id)
 
-        dfkv: dfkv has no remove_all primitive, so the worker drains the
-        send queue and NACKs; this returns False.
-        """
+    def discard(self, req_id: str) -> None:
+        """Drop any cached or queued lookup for an aborted request."""
+        with self._close_lock:
+            future = self.futures.pop(req_id, None)
+        if future is not None:
+            future.cancel()
+
+    def _reset(self) -> bool:
+        """Send the reset admin request from the socket-owner thread."""
         self.socket.send(RESET_MSG)
         resp = self.socket.recv()
         return bytes(resp) == RESP_OK
+
+    def reset(self) -> bool:
+        """Trigger the worker's best-effort global store reset."""
+        with self._close_lock:
+            if self._closed:
+                return False
+            future = self.executor.submit(self._reset)
+        return future.result()
 
     def close(self):
         with self._close_lock:
             if self._closed:
                 return
             self._closed = True
+            futures = tuple(self.futures.values())
+            self.futures.clear()
+        for future in futures:
+            future.cancel()
+        self.executor.shutdown(wait=True, cancel_futures=True)
         self.socket.close(linger=0)
         self.ctx.term()
 
