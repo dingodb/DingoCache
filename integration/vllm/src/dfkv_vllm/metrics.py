@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Per-operation telemetry for DfkvStoreConnector.
+"""Fixed-cardinality telemetry for DfkvStoreConnector.
 
-Records one row per Dfkv RPC (``save_exists``, ``save_put``, ``load_get``,
-``lookup_exists``) with duration, key/byte counts, status, and failed-key
-count. Exposed to the logger via ``KVConnectorLogging`` and to Prometheus
-via ``DfkvStorePromMetrics``.
+RPC records retain physical key, logical chunk, byte, status, and wall-time
+totals. Queue, geometry, and lookup IPC phases use a validated observation set
+with dedicated Prometheus histograms, so request- or key-derived labels can
+never create unbounded series.
 """
 
 from dataclasses import dataclass
@@ -20,6 +20,29 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     PromMetricT,
 )
 
+DFKV_OPERATION_NAMES = frozenset(
+    {
+        "save_exists",
+        "save_put",
+        "save_remove_partial",
+        "load_get",
+        "lookup_exists",
+    }
+)
+DFKV_OPERATION_STATUSES = frozenset(
+    {"ok", "error", "partial_failure", "unsupported"}
+)
+
+DFKV_OBSERVATION_NAMES = frozenset(
+    {
+        "lookup_ipc",
+        "lookup_queue_wait",
+        "receive_queue_wait",
+        "geometry_preparation",
+    }
+)
+_OBSERVATIONS_KEY = "_observations"
+
 
 def _nearest_rank_percentile(values: list[float], percentile: float) -> float:
     if not values:
@@ -29,6 +52,18 @@ def _nearest_rank_percentile(values: list[float], percentile: float) -> float:
         0, min(len(sorted_values) - 1, int(percentile * len(sorted_values) - 1e-12))
     )
     return sorted_values[rank]
+
+
+def _reduce_durations(
+    reduced: dict[str, int | float],
+    name: str,
+    durations: list[float],
+) -> None:
+    reduced[f"{name}_count"] = len(durations)
+    reduced[f"{name}_avg_ms"] = round(fmean(durations) * 1e3, 3)
+    reduced[f"{name}_p90_ms"] = round(
+        _nearest_rank_percentile(durations, 0.9) * 1e3, 3
+    )
 
 
 @dataclass
@@ -55,16 +90,26 @@ class DfkvStoreConnectorStats(KVConnectorStats):
     def reduce(self) -> dict[str, int | float]:
         reduced: dict[str, int | float] = {}
         for operation, records in sorted(self.data.items()):
+            if operation == _OBSERVATIONS_KEY:
+                for observation in sorted(DFKV_OBSERVATION_NAMES):
+                    durations = [
+                        float(record["duration_seconds"])
+                        for record in records
+                        if record["name"] == observation
+                    ]
+                    if durations:
+                        _reduce_durations(reduced, observation, durations)
+                continue
             if not records:
                 continue
             durations = [float(record["duration_seconds"]) for record in records]
-            reduced[f"{operation}_count"] = len(records)
-            reduced[f"{operation}_avg_ms"] = round(fmean(durations) * 1e3, 3)
-            reduced[f"{operation}_p90_ms"] = round(
-                _nearest_rank_percentile(durations, 0.9) * 1e3, 3
-            )
+            _reduce_durations(reduced, operation, durations)
             reduced[f"{operation}_total_keys"] = sum(
                 int(record["num_keys"]) for record in records
+            )
+            reduced[f"{operation}_total_logical_keys"] = sum(
+                int(record.get("num_logical_keys", record["num_keys"]))
+                for record in records
             )
             reduced[f"{operation}_total_bytes"] = sum(
                 int(record["num_bytes"]) for record in records
@@ -83,17 +128,35 @@ class DfkvStoreConnectorStats(KVConnectorStats):
         duration_seconds: float,
         num_keys: int,
         *,
+        num_logical_keys: int | None = None,
         num_bytes: int = 0,
         status: str = "ok",
         num_failed_keys: int = 0,
     ) -> None:
+        if operation not in DFKV_OPERATION_NAMES:
+            raise ValueError(f"Unknown Dfkv connector operation: {operation!r}")
+        if status not in DFKV_OPERATION_STATUSES:
+            raise ValueError(f"Unknown Dfkv connector status: {status!r}")
+        if num_logical_keys is None:
+            num_logical_keys = num_keys
         self.data.setdefault(operation, []).append(
             {
                 "duration_seconds": duration_seconds,
                 "num_keys": num_keys,
+                "num_logical_keys": num_logical_keys,
                 "num_bytes": num_bytes,
                 "status": status,
                 "num_failed_keys": num_failed_keys,
+            }
+        )
+
+    def record_observation(self, name: str, duration_seconds: float) -> None:
+        if name not in DFKV_OBSERVATION_NAMES:
+            raise ValueError(f"Unknown Dfkv connector observation: {name!r}")
+        self.data.setdefault(_OBSERVATIONS_KEY, []).append(
+            {
+                "name": name,
+                "duration_seconds": duration_seconds,
             }
         )
 
@@ -111,6 +174,7 @@ class DfkvStorePromMetrics(KVConnectorPromMetrics):
         super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
         metric_labelnames = labelnames + ["operation", "status"]
         self._metric_cache: dict[tuple[int, str, str], dict[str, PromMetric]] = {}
+        self._observation_cache: dict[tuple[int, str], PromMetric] = {}
 
         self._histogram_operation_time = self._histogram_cls(
             name="vllm:dfkv_store_operation_time_seconds",
@@ -144,6 +208,11 @@ class DfkvStorePromMetrics(KVConnectorPromMetrics):
             documentation="Number of Dfkv store keys touched by operations.",
             labelnames=metric_labelnames,
         )
+        self._counter_operation_logical_keys = self._counter_cls(
+            name="vllm:dfkv_store_operation_logical_keys_total",
+            documentation="Number of logical Dfkv chunks touched by operations.",
+            labelnames=metric_labelnames,
+        )
         self._counter_operation_bytes = self._counter_cls(
             name="vllm:dfkv_store_operation_bytes_total",
             documentation="Number of bytes transferred by Dfkv store operations.",
@@ -154,6 +223,38 @@ class DfkvStorePromMetrics(KVConnectorPromMetrics):
             documentation="Number of Dfkv store keys that failed in operations.",
             labelnames=metric_labelnames,
         )
+        observation_metric_names = {
+            "lookup_ipc": "vllm:dfkv_lookup_ipc_time_seconds",
+            "lookup_queue_wait": "vllm:dfkv_lookup_queue_wait_time_seconds",
+            "receive_queue_wait": "vllm:dfkv_receive_queue_wait_time_seconds",
+            "geometry_preparation": (
+                "vllm:dfkv_geometry_preparation_time_seconds"
+            ),
+        }
+        self._histogram_observations = {
+            name: self._histogram_cls(
+                name=metric_name,
+                documentation=f"Histogram of Dfkv {name.replace('_', ' ')} time.",
+                buckets=[
+                    1e-6,
+                    5e-6,
+                    1e-5,
+                    5e-5,
+                    1e-4,
+                    5e-4,
+                    1e-3,
+                    5e-3,
+                    1e-2,
+                    5e-2,
+                    1e-1,
+                    5e-1,
+                    1.0,
+                    5.0,
+                ],
+                labelnames=labelnames,
+            )
+            for name, metric_name in observation_metric_names.items()
+        }
 
     def _get_metrics(
         self,
@@ -161,6 +262,10 @@ class DfkvStorePromMetrics(KVConnectorPromMetrics):
         operation: str,
         status: str,
     ) -> dict[str, PromMetric]:
+        if operation not in DFKV_OPERATION_NAMES:
+            raise ValueError(f"Unknown Dfkv connector operation: {operation!r}")
+        if status not in DFKV_OPERATION_STATUSES:
+            raise ValueError(f"Unknown Dfkv connector status: {status!r}")
         cache_key = (engine_idx, operation, status)
         if cache_key not in self._metric_cache:
             label_values = self.per_engine_labelvalues[engine_idx] + [operation, status]
@@ -168,15 +273,36 @@ class DfkvStorePromMetrics(KVConnectorPromMetrics):
                 "time": self._histogram_operation_time.labels(*label_values),
                 "calls": self._counter_operation_calls.labels(*label_values),
                 "keys": self._counter_operation_keys.labels(*label_values),
+                "logical_keys": self._counter_operation_logical_keys.labels(
+                    *label_values
+                ),
                 "bytes": self._counter_operation_bytes.labels(*label_values),
                 "failed_keys": self._counter_failed_keys.labels(*label_values),
             }
         return self._metric_cache[cache_key]
 
+    def _get_observation_metric(self, engine_idx: int, name: str) -> PromMetric:
+        if name not in DFKV_OBSERVATION_NAMES:
+            raise ValueError(f"Unknown Dfkv connector observation: {name!r}")
+        cache_key = (engine_idx, name)
+        if cache_key not in self._observation_cache:
+            self._observation_cache[cache_key] = self._histogram_observations[
+                name
+            ].labels(*self.per_engine_labelvalues[engine_idx])
+        return self._observation_cache[cache_key]
+
     def observe(self, transfer_stats_data: dict[str, Any] | None, engine_idx: int = 0):
         if not transfer_stats_data:
             return
+        for record in transfer_stats_data.get(_OBSERVATIONS_KEY, ()):
+            assert isinstance(record, dict)
+            name = str(record["name"])
+            self._get_observation_metric(engine_idx, name).observe(
+                float(record["duration_seconds"])
+            )
         for operation, records in transfer_stats_data.items():
+            if operation == _OBSERVATIONS_KEY:
+                continue
             assert isinstance(records, list)
             for record in records:
                 assert isinstance(record, dict)
@@ -185,5 +311,8 @@ class DfkvStorePromMetrics(KVConnectorPromMetrics):
                 metrics["time"].observe(float(record["duration_seconds"]))
                 metrics["calls"].inc()
                 metrics["keys"].inc(int(record["num_keys"]))
+                metrics["logical_keys"].inc(
+                    int(record.get("num_logical_keys", record["num_keys"]))
+                )
                 metrics["bytes"].inc(int(record["num_bytes"]))
                 metrics["failed_keys"].inc(int(record["num_failed_keys"]))
