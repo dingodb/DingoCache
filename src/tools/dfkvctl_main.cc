@@ -92,6 +92,51 @@ static bool QueryClients(const std::string& mds, const std::string& group,
   return got;
 }
 
+static bool QueryTopology(const std::string& mds, const std::string& group,
+                          std::vector<MemberInfo>* out) {
+  for (const auto& ep : SplitCsv(mds)) {
+    int fd = net::Dial(ep, 2000, 2000);
+    if (fd < 0) continue;
+    char pre[kReqPrefix];
+    EncodeReq(pre, WireOp::kListTopology, BlockKey{}, 0, 0, group.size());
+    bool ok = net::WriteAll(fd, pre, kReqPrefix) &&
+              (group.empty() ||
+               net::WriteAll(fd, group.data(), group.size()));
+    std::string data;
+    if (ok) {
+      char rp[kRespPrefix];
+      Status st = Status::kInvalid;
+      uint64_t dlen = 0;
+      ok = net::ReadAll(fd, rp, kRespPrefix) &&
+           DecodeResp(rp, &st, &dlen, wire_limits::kMdsMaxRespData) &&
+           st == Status::kOk;
+      if (ok) {
+        data.resize(dlen);
+        ok = dlen == 0 || net::ReadAll(fd, &data[0], dlen);
+      }
+    }
+    ::close(fd);
+    uint64_t epoch = 0;
+    if (ok && DecodeMembers(data.data(), data.size(), out, &epoch)) return true;
+  }
+  // Pre-health MDS versions do not recognize kListTopology.
+  return QueryMembers(mds, group, out);
+}
+
+static std::string IbHealthSummary(const MemberInfo& member) {
+  if (!member.has_health) return "unknown";
+  std::string out;
+  for (const auto& device : member.health.ib_devices) {
+    if (!out.empty()) out += ",";
+    out += device.name + ":";
+    out += device.query_ok
+               ? std::string(IbPortStateName(device.port_state)) + "/" +
+                     IbPhysStateName(device.phys_state)
+               : "QUERY_FAILED";
+  }
+  return out.empty() ? "none" : out;
+}
+
 // Extract the value of `key=` from a "k=v,k=v" info string, or "" if absent.
 static std::string InfoField(const std::string& info, const std::string& key) {
   std::string tok = key + "=";
@@ -230,7 +275,7 @@ static int CmdRing(const std::string& mds, const std::string& group,
                    bool allow_empty) {
   if (mds.empty()) { std::fprintf(stderr, "ring needs --mds ip:port[,...]\n"); return 2; }
   std::vector<MemberInfo> ms;
-  if (!QueryMembers(mds, group, &ms)) { std::fprintf(stderr, "ring: MDS query failed\n"); return 1; }
+  if (!QueryTopology(mds, group, &ms)) { std::fprintf(stderr, "ring: MDS query failed\n"); return 1; }
   if (ms.empty()) {
     std::printf("group=%s members=0 ring_points=0\n", group.c_str());
     std::printf("%-16s %-22s %6s %8s %7s  %s\n",
@@ -243,20 +288,37 @@ static int CmdRing(const std::string& mds, const std::string& group,
     return 0;
   }
   ConHash ring;
-  for (const auto& m : ms) ring.AddNode(m.id, m.weight);
+  size_t eligible = 0;
+  for (const auto& m : ms) {
+    if (!m.RingEligible()) continue;
+    ring.AddNode(m.id, m.weight);
+    ++eligible;
+  }
   ring.Build();
   auto pc = ring.NodePointCounts();
   size_t total = ring.RingSize();
-  std::printf("group=%s members=%zu ring_points=%zu\n", group.c_str(), ms.size(), total);
-  std::printf("%-16s %-22s %6s %8s %7s  %s\n", "ID", "ADDR", "WEIGHT", "VNODES", "SHARE", "INFO");
+  std::printf("group=%s members=%zu eligible=%zu ring_points=%zu\n",
+              group.c_str(), ms.size(), eligible, total);
+  std::printf("%-16s %-22s %-9s %6s %8s %7s %-30s %s\n",
+              "ID", "ADDR", "STATUS", "WEIGHT", "VNODES", "SHARE",
+              "IB-HEALTH", "INFO");
   for (const auto& m : ms) {
     std::string addr = m.ip + ":" + std::to_string(m.port);
     size_t v = pc.count(m.id) ? pc[m.id] : 0;
     double share = total ? 100.0 * static_cast<double>(v) / static_cast<double>(total) : 0.0;
     // INFO = the node's self-description from register/heartbeat (version, engine,
     // cap, ...). "-" = node predates info reporting (itself a version signal).
-    std::printf("%-16s %-22s %6u %8zu %6.1f%%  %s\n", m.id.c_str(), addr.c_str(), m.weight,
-                v, share, m.info.empty() ? "-" : m.info.c_str());
+    std::printf("%-16s %-22s %-9s %6u %8zu %6.1f%% %-30s %s\n",
+                m.id.c_str(), addr.c_str(),
+                m.RingEligible() ? "ACTIVE" : "DEGRADED", m.weight, v, share,
+                IbHealthSummary(m).c_str(),
+                m.info.empty() ? "-" : m.info.c_str());
+  }
+  if (eligible == 0 && !allow_empty) {
+    std::fprintf(stderr,
+                 "ring: group=%s has no health-eligible cache nodes\n",
+                 group.c_str());
+    return 1;
   }
   return 0;
 }
@@ -461,10 +523,11 @@ int main(int argc, char** argv) {
     else if (a == "--namespace" && i + 1 < argc) key_namespace = argv[++i];
     else pos.push_back(a);
   }
-  if (pos.empty()) { std::fprintf(stderr, "usage: dfkvctl [--members ...] [--namespace ...] put|get|exist|stat|stats|ring ...\n"); return 2; }
+  if (pos.empty()) { std::fprintf(stderr, "usage: dfkvctl [--members ...] [--namespace ...] put|get|exist|stat|stats|ring|topology ...\n"); return 2; }
   const std::string& cmd = pos[0];
 
-  if (cmd == "ring") return CmdRing(mds, group, allow_empty);
+  if (cmd == "ring" || cmd == "topology")
+    return CmdRing(mds, group, allow_empty);
   if (cmd == "clients") return CmdClients(mds, group);
 
   if (cmd == "stats") {

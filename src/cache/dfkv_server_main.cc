@@ -25,6 +25,7 @@
 #ifdef DFKV_WITH_RDMA
 #include "cache/store_engine.h"
 #include "cache/rdma_server.h"
+#include "transport/rdma_health.h"
 #endif
 
 using dfkv::KvNodeServer;
@@ -357,6 +358,7 @@ int main(int argc, char** argv) {
   // process-wide receive segment sized by DFKV_RDMA_RECV_SEGMENT_SIZE.
   const unsigned long long max_msg = args.GetU64("--max-msg", 32ull << 20);
   std::unique_ptr<dfkv::RdmaServer> rsrv;
+  std::unique_ptr<dfkv::rdma::RdmaHealthMonitor> rdma_health;
   if (rdma_port >= 0) {
     rsrv = std::make_unique<dfkv::RdmaServer>(
         [&srv](uint8_t op, const dfkv::BlockKey& key, uint64_t off,
@@ -404,6 +406,32 @@ int main(int argc, char** argv) {
     // config dump (they are otherwise read lazily on the serve path, after Emit).
     (void)rsrv->PipelineDepth();
     (void)rsrv->UseUringPath();
+    const std::vector<std::string> health_devices = rsrv->DeviceNames();
+    const char* override_env = std::getenv("DFKV_RDMA_HEALTH_FILE");
+    const std::string health_file = override_env ? override_env : "";
+    uint32_t recovery_samples = 3;
+    if (const char* value = std::getenv("DFKV_RDMA_HEALTH_RECOVERY_SAMPLES")) {
+      char* end = nullptr;
+      const unsigned long parsed = std::strtoul(value, &end, 10);
+      if (end != value && *end == '\0' && parsed > 0 && parsed <= 100)
+        recovery_samples = static_cast<uint32_t>(parsed);
+    }
+    rdma_health = std::make_unique<dfkv::rdma::RdmaHealthMonitor>(
+        [health_devices, health_file] {
+          return dfkv::rdma::ProbeIbDeviceHealth(health_devices, health_file);
+        },
+        recovery_samples);
+    const auto initial_health = rdma_health->Sample();
+    DFKV_LOG_INFO("rdma-health: monitoring " +
+                  std::to_string(initial_health.ib_devices.size()) +
+                  " device(s), ring_eligible=" +
+                  (initial_health.ring_eligible ? "true" : "false"));
+    dfkv::config_dump::RecordResolved(
+        "DFKV_RDMA_HEALTH_RECOVERY_SAMPLES",
+        std::to_string(recovery_samples));
+    dfkv::config_dump::RecordResolved(
+        "DFKV_RDMA_HEALTH_FILE",
+        health_file.empty() ? "(sysfs)" : health_file);
   }
 
 #endif
@@ -423,6 +451,7 @@ int main(int argc, char** argv) {
     std::string s;
 #ifdef DFKV_WITH_RDMA
     if (rsrv) s += rsrv->MetricsText();
+    if (rdma_health) s += rdma_health->MetricsText();
 #endif
     if (auto* r = registrar_metrics->load(std::memory_order_acquire))
       s += r->MetricsText();
@@ -527,6 +556,12 @@ int main(int argc, char** argv) {
       st.ram_hits_total = srv.RamHits();
       return st;
     });
+#ifdef DFKV_WITH_RDMA
+    if (rdma_health) {
+      registrar->set_health_provider(
+          [&rdma_health] { return rdma_health->Sample(); });
+    }
+#endif
     registrar->set_registered_callback([mds_ready, group, node_id] {
       mds_ready->store(true, std::memory_order_release);
       DFKV_LOG_INFO("dfkv_server registered with MDS group=" + group +

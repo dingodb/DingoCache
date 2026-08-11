@@ -657,3 +657,56 @@ TEST(MdsServer, ZeroFirstReqMsKeepsOldDribbleBehavior) {
   ::unsetenv("DFKV_MDS_FIRST_REQ_MS");
   ::unsetenv("DFKV_MDS_IO_TIMEOUT_S");
 }
+
+TEST(MdsServer, DegradedMemberIsExcludedFromRingButVisibleInTopology) {
+  const char* ep = EtcdEp();
+  if (!ep) GTEST_SKIP() << "set DFKV_TEST_ETCD=host:port";
+  MdsServer mds(ep);
+  ASSERT_EQ(mds.Start(0), Status::kOk);
+  const std::string group =
+      "itest-health-" + std::to_string(mds.port());
+  MemberInfo active{"active", "10.1.1.1", 28000, 1};
+  active.has_health = true;
+  active.health.ib_devices = {{"ib0", 4, 5, true}};
+  MemberInfo degraded{"degraded", "10.1.1.2", 28000, 1};
+  degraded.has_health = true;
+  degraded.health.ring_eligible = false;
+  degraded.health.ib_devices = {{"ib1", 2, 2, true}};
+  Status st;
+  std::string data;
+  ASSERT_TRUE(DoReq(mds.port(), WireOp::kRegister,
+                    EncodeMemberReq(group, active), &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  ASSERT_TRUE(DoReq(mds.port(), WireOp::kRegister,
+                    EncodeMemberReq(group, degraded), &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+
+  std::vector<MemberInfo> members;
+  uint64_t epoch = 0;
+  ASSERT_TRUE(DoReq(mds.port(), WireOp::kListMembers, group, &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  ASSERT_TRUE(DecodeMembers(data.data(), data.size(), &members, &epoch));
+  ASSERT_EQ(members.size(), 1u);
+  EXPECT_EQ(members[0].id, "active");
+
+  ASSERT_TRUE(DoReq(mds.port(), WireOp::kListTopology, group, &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  ASSERT_TRUE(DecodeMembers(data.data(), data.size(), &members, &epoch));
+  ASSERT_EQ(members.size(), 2u);
+  EXPECT_TRUE(members[0].has_health);
+  bool saw_degraded = false;
+  for (const auto& member : members)
+    if (member.id == "degraded") saw_degraded = !member.RingEligible();
+  EXPECT_TRUE(saw_degraded);
+  bool etcd_reachable = false;
+  const std::string metrics = mds.GroupMetricsText(&etcd_reachable);
+  EXPECT_TRUE(etcd_reachable);
+  EXPECT_NE(metrics.find(
+                "dfkv_mds_group_ring_eligible_nodes{group=\"" + group +
+                "\"} 1"),
+            std::string::npos);
+  EXPECT_NE(metrics.find(
+                "dfkv_mds_group_degraded_nodes{group=\"" + group + "\"} 1"),
+            std::string::npos);
+  mds.Stop();
+}

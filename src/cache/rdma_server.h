@@ -79,6 +79,7 @@ class RdmaServer {
   Status Start(int port);  // TCP bootstrap port
   void Stop();
   int port() const { return port_; }
+  const std::vector<std::string>& DeviceNames() const { return anchor_devs_; }
 
   // Observability (used by tests): number of Serve threads not yet reaped.
   // Bounded under churn now that finished connections are joined as new ones

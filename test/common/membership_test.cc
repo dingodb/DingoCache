@@ -237,3 +237,47 @@ TEST(Membership, StatsExcludedFromEpochAndEquality) {
   EXPECT_EQ(MembersEpoch({a}), MembersEpoch({b}))
       << "stats churn must never rebuild client rings";
 }
+
+TEST(Membership, HealthRoundTripAndPlacementEpoch) {
+  MemberInfo active{"n1", "10.0.0.1", 28001, 1};
+  active.has_health = true;
+  active.health.ring_eligible = true;
+  active.health.ib_devices = {
+      {"ib0", 4, 5, true}, {"ib1", 4, 5, true}};
+  MemberInfo degraded{"n2", "10.0.0.2", 28001, 1};
+  degraded.has_health = true;
+  degraded.health.ring_eligible = false;
+  degraded.health.ib_devices = {{"ib2", 2, 2, true}};
+
+  std::vector<MemberInfo> out;
+  uint64_t epoch = 0;
+  const std::string encoded = EncodeMembers({active, degraded}, 7);
+  ASSERT_TRUE(DecodeMembers(encoded.data(), encoded.size(), &out, &epoch));
+  ASSERT_EQ(out.size(), 2u);
+  EXPECT_TRUE(out[0].RingEligible());
+  EXPECT_EQ(out[0].health.ib_devices[0].name, "ib0");
+  EXPECT_TRUE(out[0].health.ib_devices[0].healthy());
+  EXPECT_FALSE(out[1].RingEligible());
+  EXPECT_EQ(IbPortStateName(out[1].health.ib_devices[0].port_state), "INIT");
+  EXPECT_EQ(IbPhysStateName(out[1].health.ib_devices[0].phys_state),
+            "POLLING");
+
+  MemberInfo changed = active;
+  changed.health.ib_devices[0].port_state = 3;
+  EXPECT_EQ(MembersEpoch({active}), MembersEpoch({changed}))
+      << "raw telemetry changes must not rebuild the ring";
+  changed.health.ring_eligible = false;
+  EXPECT_NE(MembersEpoch({active}), MembersEpoch({changed}))
+      << "eligibility changes must rebuild the ring";
+}
+
+TEST(Membership, MissingHealthExtensionDefaultsEligible) {
+  MemberInfo legacy{"legacy", "10.0.0.1", 28001, 1};
+  const std::string encoded = EncodeMembers({legacy}, 1);
+  std::vector<MemberInfo> out;
+  uint64_t epoch = 0;
+  ASSERT_TRUE(DecodeMembers(encoded.data(), encoded.size(), &out, &epoch));
+  ASSERT_EQ(out.size(), 1u);
+  EXPECT_FALSE(out[0].has_health);
+  EXPECT_TRUE(out[0].RingEligible());
+}

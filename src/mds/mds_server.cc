@@ -328,7 +328,8 @@ Status MdsServer::UpsertLeased(const std::string& key, const MemberInfo& m,
   return Status::kOk;
 }
 
-Status MdsServer::ListMembers(const std::string& group, std::string* out) {
+Status MdsServer::ListMembers(const std::string& group, std::string* out,
+                              bool include_degraded) {
   metrics_.list_requests.fetch_add(1, std::memory_order_relaxed);
   // A malformed group would build a RangePrefix straddling other groups'
   // subtrees; reject it the same way Upsert does.
@@ -340,7 +341,9 @@ Status MdsServer::ListMembers(const std::string& group, std::string* out) {
   for (const auto& kv : r->kvs) {
     std::vector<MemberInfo> one;
     uint64_t e = 0;
-    if (DecodeMembers(kv.second.data(), kv.second.size(), &one, &e) && one.size() == 1)
+    if (DecodeMembers(kv.second.data(), kv.second.size(), &one, &e) &&
+        one.size() == 1 &&
+        (include_degraded || one[0].RingEligible()))
       members.push_back(one[0]);
   }
   // Epoch = content hash of the member set, NOT etcd's global revision: the
@@ -406,7 +409,7 @@ std::string MdsServer::GroupMetricsText(bool* etcd_reachable) {
   }
   if (etcd_reachable) *etcd_reachable = true;
   struct Agg {
-    uint64_t nodes = 0, missing = 0, clients = 0;
+    uint64_t nodes = 0, degraded = 0, missing = 0, clients = 0;
     MemberStats sum;
     std::map<std::string, int> vers;  // version skew, from info "ver="
   };
@@ -426,9 +429,11 @@ std::string MdsServer::GroupMetricsText(bool* etcd_reachable) {
     if (kind == "clients") { a.clients++; continue; }
     std::vector<MemberInfo> one;
     uint64_t e = 0;
-    if (!DecodeMembers(kv.second.data(), kv.second.size(), &one, &e) || one.size() != 1)
+    if (!DecodeMembers(kv.second.data(), kv.second.size(), &one, &e) ||
+        one.size() != 1)
       continue;
     const MemberInfo& m = one[0];
+    if (!m.RingEligible()) a.degraded++;
     a.nodes++;
     // version skew from the static info string ("ver=X,...") -- the one place
     // we parse info at the MDS; everything numeric rides binary STA1.
@@ -461,6 +466,14 @@ std::string MdsServer::GroupMetricsText(bool* etcd_reachable) {
     s += name; s += "{group=\""; s += g; s += "\"} "; s += std::to_string(v); s += "\n";
   };
   // All ring aggregates are GAUGES (a node restart resets its counters, so the
+  emit("dfkv_mds_group_ring_eligible_nodes",
+       "Members currently eligible for placement");
+  for (auto& [g, a] : groups)
+    line("dfkv_mds_group_ring_eligible_nodes", g, a.nodes - a.degraded);
+  emit("dfkv_mds_group_degraded_nodes",
+       "Registered members excluded from placement by health");
+  for (auto& [g, a] : groups)
+    line("dfkv_mds_group_degraded_nodes", g, a.degraded);
   // per-group sum can go down; rate analysis belongs on the node-level series).
   emit("dfkv_mds_group_nodes", "Registered members per group");
   for (auto& [g, a] : groups) line("dfkv_mds_group_nodes", g, a.nodes);
@@ -595,9 +608,10 @@ void MdsServer::Handle(int fd, long io_timeout_s,
       MemberInfo m;
       if (DecodeMemberReq(payload.data(), rq.payload_len, &group, &m))
         st = UpsertClient(group, m);
-    } else if (op == WireOp::kListMembers) {
+    } else if (op == WireOp::kListMembers ||
+               op == WireOp::kListTopology) {
       std::string group(payload.data(), rq.payload_len);
-      st = ListMembers(group, &data);
+      st = ListMembers(group, &data, op == WireOp::kListTopology);
     } else if (op == WireOp::kListClients) {
       std::string group(payload.data(), rq.payload_len);
       st = ListClients(group, &data);

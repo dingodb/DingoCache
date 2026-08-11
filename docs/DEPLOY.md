@@ -499,6 +499,8 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `DFKV_READ_SHARD_KEYS` | `16` | client 每个 read shard 的目标 key 数；server 不读取 |
 | `DFKV_MDS_IO_TIMEOUT_S` | `60` | MDS 控制面帧读写超时（MDS 进程该） |
 | `DFKV_MDS_ETCD_PROBE_MS` | `30000` | MDS 与 etcd 存活探测窗（MDS 进程该） |
+| `DFKV_RDMA_HEALTH_RECOVERY_SAMPLES` | `3` | server 在每次 MDS 心跳前检查全部 resolved RDMA rail；任一 rail 查询失败或非 ACTIVE/LinkUp 立即退 placement ring，连续该次数健康后恢复入环 |
+| `DFKV_RDMA_HEALTH_FILE` | 未设置（生产必须未设置） | 仅用于受控故障注入；每行 `device port_state phys_state`，缺失已配置设备按查询失败处理。生产从 sysfs 读取 |
 | `DFKV_TENANT_QUOTAS_COUNT` | — | tenant 配额文件预期条数（容量校验） |
 
 #### 未收录的常见误配 → 详见 CONNECTORS.md §1.7

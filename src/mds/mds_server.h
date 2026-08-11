@@ -140,7 +140,8 @@ class MdsServer {
               std::chrono::steady_clock::time_point first_frame_deadline);
   void ReapDoneLocked();  // join+erase finished handler threads; conn_mu_ held
   Status Upsert(const std::string& group, const MemberInfo& m);
-  Status ListMembers(const std::string& group, std::string* out);
+  Status ListMembers(const std::string& group, std::string* out,
+                     bool include_degraded = false);
   // Client (consumer) registration — same lease/keepalive contract as Upsert/
   // ListMembers but under a disjoint etcd prefix (/clients/<id> vs /members/<id>)
   // so consumers never enter the placement ring. A consumer carries no data-path
