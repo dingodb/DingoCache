@@ -28,8 +28,19 @@ import urllib.request
 from typing import Any
 
 
-CORPUS_FORMAT_VERSION = 1
+CORPUS_FORMAT_VERSION = 2
 GENERATOR_VERSION = "dfkv-vllm-long-prefix-v1"
+DEPLOYMENT_IDENTITY_FIELDS = (
+    "model",
+    "model_revision",
+    "vllm_version",
+    "vllm_commit",
+    "dfkv_version",
+    "dfkv_build_commit",
+    "connector_layout",
+    "connector_version",
+    "deployment_manifest_hash",
+)
 WORDS = (
     "amber", "aperture", "archive", "balance", "beacon", "binary", "canvas",
     "cascade", "circuit", "context", "delta", "deterministic", "engine",
@@ -213,6 +224,58 @@ def prefix_for_token_target(
     )
 
 
+def deployment_identity(args: argparse.Namespace) -> dict[str, str | None]:
+    """Return the fixed-schema, operator-supplied deployment identity."""
+    return {
+        "model": args.model,
+        "model_revision": args.model_revision,
+        "vllm_version": args.vllm_version,
+        "vllm_commit": args.vllm_commit,
+        "dfkv_version": args.dfkv_version,
+        "dfkv_build_commit": args.dfkv_build_commit,
+        "connector_layout": args.connector_layout,
+        "connector_version": args.connector_version,
+        "deployment_manifest_hash": args.deployment_manifest_hash,
+    }
+
+
+def corpus_compatibility_identity(
+    identity: dict[str, str | None],
+) -> dict[str, str | None]:
+    """Identity fields that affect the corpus model/tokenizer contract."""
+    return {
+        "model": identity["model"],
+        "model_revision": identity["model_revision"],
+    }
+
+
+def require_summary_identity(
+    path: str | None, expected: dict[str, str | None]
+) -> str | None:
+    if path is None:
+        return None
+    with open(path, "rb") as source:
+        raw = source.read()
+    summary = json.loads(raw)
+    if not isinstance(summary, dict):
+        raise ValueError("identity reference summary must be a JSON object")
+    actual = summary.get("deployment_identity")
+    if not isinstance(actual, dict):
+        raise ValueError("identity reference summary is missing deployment_identity")
+    if tuple(sorted(actual)) != tuple(sorted(DEPLOYMENT_IDENTITY_FIELDS)):
+        raise ValueError("identity reference summary has an invalid deployment_identity schema")
+    mismatches = [
+        field for field in DEPLOYMENT_IDENTITY_FIELDS
+        if actual.get(field) != expected[field]
+    ]
+    if mismatches:
+        raise ValueError(
+            "deployment identity does not match reference summary fields: "
+            + ", ".join(mismatches)
+        )
+    return sha256_bytes(raw)
+
+
 def expected_corpus_config(args: argparse.Namespace) -> dict[str, Any]:
     target_mode = "tokens" if args.prefix_tokens is not None else "characters"
     target_value = args.prefix_tokens if args.prefix_tokens is not None else args.prefix_chars
@@ -226,11 +289,25 @@ def expected_corpus_config(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def validate_corpus(corpus: dict[str, Any], expected: dict[str, Any]) -> None:
+def validate_corpus(
+    corpus: dict[str, Any],
+    expected: dict[str, Any],
+    current_identity: dict[str, str | None],
+) -> None:
     if corpus.get("format_version") != CORPUS_FORMAT_VERSION:
         raise ValueError("unsupported corpus format_version")
     if corpus.get("config") != expected:
         raise ValueError("saved corpus config does not match this command")
+    saved_identity = corpus.get("deployment_identity")
+    if not isinstance(saved_identity, dict):
+        raise ValueError("saved corpus is missing deployment_identity")
+    if tuple(sorted(saved_identity)) != tuple(sorted(DEPLOYMENT_IDENTITY_FIELDS)):
+        raise ValueError("saved corpus has an invalid deployment_identity schema")
+    compatibility = corpus.get("compatibility_identity")
+    if compatibility != corpus_compatibility_identity(saved_identity):
+        raise ValueError("saved corpus has inconsistent compatibility identity")
+    if compatibility != corpus_compatibility_identity(current_identity):
+        raise ValueError("saved corpus model identity does not match this command")
     prefix = corpus.get("prefix")
     suffixes = corpus.get("suffixes")
     if not isinstance(prefix, str) or not isinstance(suffixes, list):
@@ -244,14 +321,18 @@ def validate_corpus(corpus: dict[str, Any], expected: dict[str, Any]) -> None:
 
 def load_or_create_corpus(args: argparse.Namespace) -> tuple[dict[str, Any], str, bool]:
     expected = expected_corpus_config(args)
-    config_id = sha256_bytes(canonical_json(expected))[:16]
+    identity = deployment_identity(args)
+    config_id = sha256_bytes(canonical_json({
+        "config": expected,
+        "compatibility_identity": corpus_compatibility_identity(identity),
+    }))[:16]
     path = args.corpus_file or os.path.join(args.output_dir, f"corpus-{config_id}.json")
     if os.path.exists(path):
         with open(path, "rb") as source:
             corpus = json.load(source)
         if not isinstance(corpus, dict):
             raise ValueError("saved corpus must be a JSON object")
-        validate_corpus(corpus, expected)
+        validate_corpus(corpus, expected, identity)
         return corpus, os.path.abspath(path), False
 
     if args.corpus_file:
@@ -274,6 +355,8 @@ def load_or_create_corpus(args: argparse.Namespace) -> tuple[dict[str, Any], str
     corpus = {
         "format_version": CORPUS_FORMAT_VERSION,
         "config": expected,
+        "deployment_identity": identity,
+        "compatibility_identity": corpus_compatibility_identity(identity),
         "prefix": prefix,
         "suffixes": suffixes,
         "prefix_characters": len(prefix),
@@ -292,7 +375,12 @@ def snapshot_metrics(
     for index, (kind, endpoint) in enumerate(endpoints):
         started = utc_now()
         url = metrics_url(endpoint)
-        record: dict[str, Any] = {"kind": kind, "url": url, "phase": phase, "timestamp": started}
+        record: dict[str, Any] = {
+            "kind": kind,
+            "endpoint_sha256": sha256_bytes(endpoint.encode("utf-8")),
+            "phase": phase,
+            "timestamp": started,
+        }
         try:
             request = urllib.request.Request(url, headers={"Accept": "text/plain"}, method="GET")
             with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -306,10 +394,10 @@ def snapshot_metrics(
                 "http_status": status,
                 "bytes": len(body),
                 "sha256": sha256_bytes(body),
-                "path": os.path.abspath(path),
+                "artifact": filename,
             })
         except (OSError, urllib.error.URLError, ValueError) as error:
-            record.update({"success": False, "error": f"{type(error).__name__}: {error}"})
+            record.update({"success": False, "error_type": type(error).__name__})
         snapshots.append(record)
     return snapshots
 
@@ -372,7 +460,7 @@ def stream_request(
                 if not isinstance(event, dict):
                     continue
                 if "error" in event:
-                    raise RuntimeError(f"stream error: {event['error']}")
+                    raise RuntimeError("stream reported an error")
                 usage = event.get("usage")
                 if isinstance(usage, dict) and isinstance(usage.get("completion_tokens"), int):
                     usage_completion_tokens = usage["completion_tokens"]
@@ -400,11 +488,11 @@ def stream_request(
                         completion_characters += len(piece)
                         output_chunks += 1
     except urllib.error.HTTPError as error:
-        detail = error.read(4096).decode("utf-8", errors="replace")
-        error_text = f"HTTPError: HTTP {error.code}: {detail}"
+        error.read(4096)
+        error_text = f"HTTPError: HTTP {error.code}"
         http_status = error.code
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, RuntimeError) as error:
-        error_text = f"{type(error).__name__}: {error}"
+        error_text = type(error).__name__
     finally:
         ended_ns = time.perf_counter_ns()
         ended_at = utc_now()
@@ -465,6 +553,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--endpoint", required=True, help="vLLM base URL or /v1/chat/completions URL")
     parser.add_argument("--model", required=True)
+    identity = parser.add_argument_group("deployment identity")
+    identity.add_argument("--model-revision", help="exact model revision or artifact digest")
+    identity.add_argument("--vllm-version", help="exact deployed vLLM version")
+    identity.add_argument("--vllm-commit", help="exact deployed vLLM source commit")
+    identity.add_argument("--dfkv-version", help="exact deployed dfkv version")
+    identity.add_argument("--dfkv-build-commit", help="exact deployed libdfkv build commit")
+    identity.add_argument("--connector-layout", help="exact connector storage layout identity")
+    identity.add_argument("--connector-version", help="exact deployed connector package version")
+    identity.add_argument(
+        "--deployment-manifest-hash",
+        help="exact digest of the immutable deployment manifest",
+    )
+    identity.add_argument(
+        "--require-identity-summary",
+        metavar="FILE",
+        help="fail before requests unless FILE has the same deployment identity",
+    )
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--prefix-tokens", type=int, help="exact prefix token target via vLLM tokenize APIs")
     target.add_argument("--prefix-chars", type=int, help="exact prefix character target")
@@ -479,7 +584,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
         "--corpus-file",
-        help="reuse an existing saved corpus; its seed, model, size, and request count must match",
+        help="reuse a saved corpus; generation config and model identity must match",
     )
     parser.add_argument(
         "--vllm-metrics-endpoint", action="append", default=[],
@@ -504,8 +609,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    invocation = list(sys.argv if argv is None else [sys.argv[0], *argv])
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    current_identity = deployment_identity(args)
+    identity_reference_sha256 = require_summary_identity(
+        args.require_identity_summary, current_identity
+    )
     os.makedirs(args.output_dir, exist_ok=True)
 
     corpus, corpus_path, corpus_created = load_or_create_corpus(args)
@@ -552,8 +660,7 @@ def main(argv: list[str] | None = None) -> int:
         source_counts[source] = source_counts.get(source, 0) + 1
 
     config = {
-        "endpoint": args.endpoint,
-        "completion_url": completion_url(args.endpoint),
+        "endpoint_sha256": sha256_bytes(args.endpoint.encode("utf-8")),
         "model": args.model,
         "prefix_tokens": args.prefix_tokens,
         "prefix_chars": args.prefix_chars,
@@ -562,29 +669,34 @@ def main(argv: list[str] | None = None) -> int:
         "max_tokens": args.max_tokens,
         "seed": args.seed,
         "round_name": args.round_name,
-        "output_dir": os.path.abspath(args.output_dir),
-        "corpus_file": corpus_path,
-        "vllm_metrics_endpoints": list(args.vllm_metrics_endpoint),
-        "dfkv_metrics_endpoints": list(args.dfkv_metrics_endpoint),
+        "corpus_file": os.path.basename(corpus_path),
+        "vllm_metrics_endpoint_count": len(args.vllm_metrics_endpoint),
+        "dfkv_metrics_endpoint_count": len(args.dfkv_metrics_endpoint),
         "timeout": args.timeout,
     }
     summary = {
-        "format_version": 1,
-        "invocation": invocation,
+        "format_version": 2,
+        "deployment_identity": current_identity,
+        "identity_requirement": {
+            "enforced": identity_reference_sha256 is not None,
+            "reference_summary_sha256": identity_reference_sha256,
+        },
         "config": config,
         "timestamps": {"started_at": started_at, "ended_at": ended_at},
         "duration_seconds": (run_ended_ns - run_started_ns) / 1e9,
         "cache_policy": "round name is a label; benchmark never resets external or local cache",
         "corpus": {
-            "path": corpus_path,
+            "artifact": os.path.basename(corpus_path),
             "created_by_this_run": corpus_created,
             "sha256": corpus["corpus_sha256"],
             "prefix_sha256": corpus["prefix_sha256"],
             "prefix_characters": corpus["prefix_characters"],
             "prefix_tokens": corpus["prefix_tokens"],
+            "deployment_identity": corpus["deployment_identity"],
+            "compatibility_identity": corpus["compatibility_identity"],
         },
         "requests": {
-            "raw_jsonl": raw_path,
+            "raw_jsonl_artifact": os.path.basename(raw_path),
             "total": len(rows),
             "successful": len(successful),
             "failed": len(rows) - len(successful),

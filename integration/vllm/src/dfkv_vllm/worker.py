@@ -431,8 +431,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         executing cannot be cancelled -- it holds an RDMA read against the
         request's GPU blocks -- so the preemption path must wait it out
         before those blocks can be handed to another request. Returns False
-        on timeout (put ops are client-side bounded, so this only happens if
-        the store path is badly wedged).
+        when the diagnostic interval expires; callers that protect GPU block
+        ownership must keep waiting until this returns True.
         """
         with self._active_cv:
             return self._active_cv.wait_for(
@@ -1734,19 +1734,22 @@ class DfkvStoreWorker:
                 wait=True,
                 fail_closed=False,
             )
-        if self.kv_send_thread is None:
+        send_thread = self.kv_send_thread
+        if send_thread is None:
             return
         # Drop queued entries first (the dequeue gate re-checks per entry),
-        # then join whichever entry is already executing.
+        # then join whichever entry is already executing. The timeout is only
+        # a diagnostic interval: returning from this hook while native PUT can
+        # still read the blocks would let the scheduler reuse them.
         for req_id in metadata.preempted_req_ids:
-            self.kv_send_thread.delete_finished_stored_request(req_id)
+            send_thread.delete_finished_stored_request(req_id)
         for req_id in metadata.preempted_req_ids:
             wait_start = time.perf_counter()
-            if not self.kv_send_thread.wait_for_inflight_put(req_id):
+            while not send_thread.wait_for_inflight_put(req_id):
                 logger.error(
-                    "preemption fence timed out waiting for in-flight save "
-                    "of request %s (%.1fs); its old GPU blocks may be read "
-                    "while reused -- possible poisoned store keys",
+                    "preemption fence still waiting for in-flight save "
+                    "of request %s after %.1fs; GPU block reuse remains fenced "
+                    "until the native save exits",
                     req_id,
                     time.perf_counter() - wait_start,
                 )
