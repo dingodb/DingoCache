@@ -19,6 +19,7 @@
 #include "transport/rdma_verbs.h"   // RcEndpoint, QpInfo
 #include "transport/rdma_protocol.h"
 #include "transport/rdma_operation.h"
+#include "transport/rdma_connection_lifecycle.h"
 
 namespace dfkv {
 
@@ -214,6 +215,7 @@ struct RdmaTransport::Conn {
   bool budget_held = false;
   bool visited = true;  // guarded by RdmaTransport::mu_ while idle
 
+  rdma::ConnectionLifecycle lifecycle;
   void Encode(char* out, WireOp op, const BlockKey& key, uint64_t offset,
               uint64_t length, uint64_t payload_len) const {
     EncodeReqVersion(out, kNativeProtoRdmaV2, op, key, offset, length,
@@ -483,8 +485,10 @@ void RdmaTransport::KeepaliveLoop() {
       std::lock_guard<std::mutex> lock(mu_);
       const auto collect = [&](auto& pools, Lane lane) {
         for (auto& [node, connections] : pools) {
-          for (Conn* conn : connections)
-            idle.push_back(IdleConn{node, lane, conn});
+          for (Conn* conn : connections) {
+            if (conn->lifecycle.Activate())
+              idle.push_back(IdleConn{node, lane, conn});
+          }
           connections.clear();
         }
       };
@@ -506,6 +510,7 @@ void RdmaTransport::KeepaliveLoop() {
 
 void RdmaTransport::Destroy(Conn* c, rdma::RailCompletion completion) {
   if (!c) return;
+  c->lifecycle.BeginDrain();
   if (c->credit_held) {
     const uint64_t now = rdma::RailPolicy::NowMicros();
     rail_policy_->Complete(c->lease, now - c->lease_started_us, completion,
@@ -530,6 +535,7 @@ bool RdmaTransport::EvictOneIdle() {
             (*it)->visited = false;
             continue;
           }
+          if (!(*it)->lifecycle.RequestRetire()) continue;
           victim = *it;
           connections.erase(it);
           return true;
@@ -616,8 +622,8 @@ RdmaTransport::Conn* RdmaTransport::Acquire(
       if (it != idle.end()) {
         auto& candidates = it->second;
         for (size_t i = candidates.size(); i > 0; --i) {
-          if (candidates[i - 1]->rail_index == ridx) {
-            pooled = candidates[i - 1];
+          if (candidates[i - 1]->rail_index == ridx &&
+              candidates[i - 1]->lifecycle.Activate()) {
             candidates.erase(candidates.begin() +
                              static_cast<std::ptrdiff_t>(i - 1));
             break;
@@ -1122,7 +1128,8 @@ void RdmaTransport::Release(const std::string& node, Lane lane, Conn* c) {
     // generation. Refresh it only after its WRs complete, before it becomes
     // idle; this is the endpoint lease that makes old-generation retirement
     // safe without interrupting the operation that used it.
-    if (v.size() < pool_max_ && c->ep.EnsurePoolMrs(pools_, true)) {
+    if (v.size() < pool_max_ && c->ep.EnsurePoolMrs(pools_, true) &&
+        c->lifecycle.MakeIdle()) {
       v.push_back(c);
       reusable = true;
     }
