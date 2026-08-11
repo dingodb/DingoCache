@@ -573,6 +573,158 @@ class LogicalChunkTransferTest(unittest.TestCase):
         self.assertEqual(put_sizes, [sizes])
         self.assertEqual(client.remove_calls, [])
 
+    def test_put_timeout_stays_fenced_until_exception_and_close_complete(
+        self,
+    ) -> None:
+        metadata = self._metadata()
+        logical_key = PoolKey(metadata, self._hash("blocked-save").hex())
+        native_started = threading.Event()
+        native_release = threading.Event()
+
+        class _Database:
+            block_size = 64
+            _seg_layout = [(0, 1, 1)]
+
+            @staticmethod
+            def process_tokens(*_args):
+                return [(0, 64, logical_key)]
+
+            @staticmethod
+            def descriptor_shape(_start, _end, block_ids):
+                return 1, 64, block_ids[0]
+
+            @staticmethod
+            def fill_descriptors(
+                _start, _end, block_ids, pointers, sizes, offset=0
+            ):
+                pointers[offset] = 0x10000 + block_ids[0] * 0x100
+                sizes[offset] = 64
+                return offset + 1
+
+        client_closed = threading.Event()
+        class _Client:
+            @staticmethod
+            def batch_exist(keys):
+                return [0] * len(keys)
+
+            @staticmethod
+            def batch_put_sg(_keys, _ptrs, _sizes):
+                native_started.set()
+                if not native_release.wait(timeout=2):
+                    raise AssertionError("native PUT release was not signalled")
+                raise RuntimeError("controlled native PUT failure")
+
+            @staticmethod
+            def close():
+                client_closed.set()
+
+        client = _Client()
+        sender = KVCacheStoreSendingThread(
+            client,
+            SimpleNamespace(
+                lcm_block_size=64,
+                store_mask=lambda _token_len: [[True]],
+            ),
+            [_Database()],
+            block_size=64,
+            tp_rank=0,
+            put_step=1,
+            kv_role="kv_both",
+            ready_event=threading.Event(),
+        )
+        request = ReqMeta(
+            req_id="blocked-save",
+            token_len_chunk=64,
+            block_ids=([7],),
+            block_hashes=[self._hash("blocked-save")],
+        )
+        sender.add_stored_request(request.req_id)
+        sender.start()
+        self.assertTrue(sender.ready_event.wait(timeout=1))
+        self.assertTrue(sender.add_request(request))
+        self.assertTrue(native_started.wait(timeout=1))
+
+        diagnostic_expired = threading.Event()
+        wait_outcomes: list[bool] = []
+        original_wait = sender.wait_for_inflight_put
+
+        def short_diagnostic_wait(req_id: str) -> bool:
+            result = original_wait(req_id, timeout_s=0.01)
+            wait_outcomes.append(result)
+            if not result:
+                diagnostic_expired.set()
+            return result
+
+        sender.wait_for_inflight_put = short_diagnostic_wait
+        worker = DfkvStoreWorker.__new__(DfkvStoreWorker)
+        worker.kv_recv_thread = None
+        worker.kv_send_thread = sender
+        worker.lookup_server = None
+        worker._close_lock = threading.Lock()
+        worker._closed = False
+        worker._close_done = threading.Event()
+        worker._lazy_client_lock = threading.Lock()
+        worker._lazy_client_kwargs = None
+        worker.client = client
+        preemption_returned = threading.Event()
+        preemption_errors: list[BaseException] = []
+
+        def preempt() -> None:
+            try:
+                worker.start_load_kv(
+                    SimpleNamespace(preempted_req_ids={request.req_id})
+                )
+            except BaseException as exc:
+                preemption_errors.append(exc)
+            finally:
+                preemption_returned.set()
+
+        close_entered = threading.Event()
+        close_returned = threading.Event()
+        close_errors: list[BaseException] = []
+
+        def close() -> None:
+            close_entered.set()
+            try:
+                worker.close()
+            except BaseException as exc:
+                close_errors.append(exc)
+            finally:
+                close_returned.set()
+
+        preemption_thread = threading.Thread(target=preempt)
+        close_thread = threading.Thread(target=close)
+        preemption_thread.start()
+        try:
+            self.assertTrue(diagnostic_expired.wait(timeout=1))
+            self.assertFalse(preemption_returned.is_set())
+
+            close_thread.start()
+            self.assertTrue(close_entered.wait(timeout=1))
+            self.assertFalse(close_returned.is_set())
+
+            native_release.set()
+            self.assertTrue(preemption_returned.wait(timeout=1))
+            self.assertTrue(close_returned.wait(timeout=1))
+            preemption_thread.join(timeout=1)
+            close_thread.join(timeout=1)
+
+            self.assertEqual(preemption_errors, [])
+            self.assertEqual(close_errors, [])
+            self.assertGreaterEqual(wait_outcomes.count(False), 1)
+            self.assertEqual(wait_outcomes.count(True), 1)
+            self.assertIsNone(sender._active_req_id)
+            self.assertFalse(sender.is_alive())
+            self.assertTrue(client_closed.is_set())
+            self.assertIsNone(worker.kv_send_thread)
+            self.assertIsNone(worker.client)
+        finally:
+            native_release.set()
+            preemption_thread.join(timeout=1)
+            if close_thread.ident is not None:
+                close_thread.join(timeout=1)
+            sender.stop(cancel_pending=True)
+
     def test_partial_chunk_load_preserves_descriptor_order(self) -> None:
         metadata = self._metadata()
         hashes = [self._hash("load-hit"), self._hash("load-miss")]

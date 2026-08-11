@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from importlib.util import find_spec
 import sys
+import threading
 import unittest
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -70,6 +71,22 @@ def _install_vllm_stubs() -> None:
     class BlockHash(bytes):
         pass
 
+    class KVConnectorBase_V1:
+        pass
+
+    class SupportsHMA:
+        pass
+
+    class KVConnectorRole:
+        SCHEDULER = "scheduler"
+        WORKER = "worker"
+
+    class KVConnectorKVEvents:
+        pass
+
+    class KVEventAggregator:
+        pass
+
     @dataclass
     class KVCacheBlock:
         block_id: int
@@ -106,13 +123,22 @@ def _install_vllm_stubs() -> None:
         get_tensor_model_parallel_rank=lambda: 0,
         get_tensor_model_parallel_world_size=lambda: 1,
     )
-    stub("vllm.distributed.kv_events", BlockStored=BlockStored)
+    stub(
+        "vllm.distributed.kv_events",
+        BlockStored=BlockStored,
+        KVCacheEvent=Placeholder,
+        KVConnectorKVEvents=KVConnectorKVEvents,
+        KVEventAggregator=KVEventAggregator,
+    )
     stub("vllm.distributed.kv_transfer")
     stub("vllm.distributed.kv_transfer.kv_connector")
     stub("vllm.distributed.kv_transfer.kv_connector.v1")
     stub(
         "vllm.distributed.kv_transfer.kv_connector.v1.base",
+        KVConnectorBase_V1=KVConnectorBase_V1,
         KVConnectorMetadata=Placeholder,
+        KVConnectorRole=KVConnectorRole,
+        SupportsHMA=SupportsHMA,
     )
     stub(
         "vllm.distributed.kv_transfer.kv_connector.v1.metrics",
@@ -122,6 +148,7 @@ def _install_vllm_stubs() -> None:
         PromMetricT=PromMetric,
     )
     stub("vllm.logger", init_logger=logging.getLogger)
+    stub("vllm.forward_context", ForwardContext=Placeholder)
     stub("vllm.utils")
     stub(
         "vllm.utils.math_utils",
@@ -135,6 +162,11 @@ def _install_vllm_stubs() -> None:
         make_zmq_socket=lambda *_args, **_kwargs: None,
     )
     stub("vllm.v1")
+    stub("vllm.v1.attention")
+    stub(
+        "vllm.v1.attention.backend",
+        AttentionMetadata=Placeholder,
+    )
     stub("vllm.v1.core")
     stub("vllm.v1.core.block_pool", BlockPool=Placeholder)
     stub("vllm.v1.core.kv_cache_manager", KVCacheBlocks=Placeholder)
@@ -165,6 +197,7 @@ def _install_vllm_stubs() -> None:
         KVCacheSpec=Placeholder,
         UniformTypeKVCacheSpecs=Placeholder,
     )
+    stub("vllm.v1.outputs", KVConnectorOutput=Placeholder)
     stub(
         "vllm.v1.kv_cache_spec_registry",
         KVCacheSpecRegistry=KVCacheSpecRegistry,
@@ -180,7 +213,9 @@ sys.path.insert(0, str(ROOT / "integration" / "common" / "src"))
 sys.path.insert(0, str(ROOT / "integration" / "vllm" / "src"))
 
 from dfkv_common import VLLM_RAW_V1, pool_key  # noqa: E402
+from dfkv_vllm.connector import DfkvStoreConnector  # noqa: E402
 from dfkv_vllm.data import (  # noqa: E402
+    DfkvStoreConnectorMetadata,
     KeyMetadata,
     PoolKey,
 )
@@ -316,6 +351,145 @@ class SchedulerLookupTest(unittest.TestCase):
 
         self.assertEqual(scheduler.get_num_new_matched_tokens(request, 0), (0, False))
         self.assertEqual(client.calls[0][2], ())
+
+
+class _BlockingConnectorBackend:
+    def __init__(self) -> None:
+        self.call_entered = threading.Barrier(2)
+        self.call_release = threading.Barrier(2)
+        self.close_calls = 0
+
+    def _block_call(self) -> None:
+        self.call_entered.wait(timeout=5)
+        self.call_release.wait(timeout=5)
+
+    def get_finished(self, finished_req_ids, metadata):
+        self._block_call()
+        return set(finished_req_ids), set(metadata.unfinished_request_ids)
+
+    def request_finished(self, request, block_ids):
+        self._block_call()
+        return True, {"request_id": request.request_id, "block_ids": block_ids}
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class ConnectorShutdownGateTest(unittest.TestCase):
+    @staticmethod
+    def _connector(
+        *,
+        worker: _BlockingConnectorBackend | None = None,
+        scheduler: _BlockingConnectorBackend | None = None,
+    ) -> DfkvStoreConnector:
+        connector = DfkvStoreConnector.__new__(DfkvStoreConnector)
+        connector._shutdown_condition = threading.Condition()
+        connector._inflight_calls = 0
+        connector._shutdown = False
+        connector._shutdown_complete = False
+        connector.connector_worker = worker
+        connector.connector_scheduler = scheduler
+        return connector
+
+    def _assert_shutdown_waits_for_call(
+        self,
+        connector: DfkvStoreConnector,
+        backend: _BlockingConnectorBackend,
+        call,
+        rejected_call,
+    ):
+        call_results = []
+        thread_errors = []
+
+        def run_call() -> None:
+            try:
+                call_results.append(call())
+            except BaseException as error:
+                thread_errors.append(error)
+
+        def run_shutdown() -> None:
+            try:
+                connector.shutdown()
+            except BaseException as error:
+                thread_errors.append(error)
+
+        call_thread = threading.Thread(target=run_call)
+        call_thread.start()
+        backend.call_entered.wait(timeout=5)
+
+        shutdown_thread = threading.Thread(target=run_shutdown)
+        shutdown_thread.start()
+        with connector._shutdown_condition:
+            self.assertTrue(
+                connector._shutdown_condition.wait_for(
+                    lambda: connector._shutdown, timeout=5
+                )
+            )
+
+        self.assertTrue(shutdown_thread.is_alive())
+        self.assertEqual(backend.close_calls, 0)
+        with self.assertRaisesRegex(RuntimeError, "connector is shut down"):
+            rejected_call()
+
+        backend.call_release.wait(timeout=5)
+        call_thread.join(timeout=5)
+        shutdown_thread.join(timeout=5)
+        self.assertFalse(call_thread.is_alive())
+        self.assertFalse(shutdown_thread.is_alive())
+        self.assertEqual(thread_errors, [])
+        self.assertEqual(backend.close_calls, 1)
+
+        connector.shutdown()
+        self.assertEqual(backend.close_calls, 1)
+        with self.assertRaisesRegex(RuntimeError, "connector is shut down"):
+            rejected_call()
+        return call_results
+
+    def test_get_finished_admitted_before_shutdown_completes_before_close(
+        self,
+    ) -> None:
+        backend = _BlockingConnectorBackend()
+        connector = self._connector(worker=backend)
+        metadata = DfkvStoreConnectorMetadata({"unfinished"}, set())
+        connector._get_connector_metadata = lambda: metadata
+
+        results = self._assert_shutdown_waits_for_call(
+            connector,
+            backend,
+            lambda: connector.get_finished({"finished"}),
+            lambda: connector.get_finished({"too-late"}),
+        )
+
+        self.assertEqual(results, [({"finished"}, {"unfinished"})])
+
+    def test_request_lifecycle_calls_admitted_before_shutdown_finish_first(
+        self,
+    ) -> None:
+        request = SimpleNamespace(request_id="request")
+        calls = (
+            (
+                lambda connector: connector.request_finished(request, [1, 2]),
+                (True, {"request_id": "request", "block_ids": ([1, 2],)}),
+            ),
+            (
+                lambda connector: connector.request_finished_all_groups(
+                    request, ([1], [2])
+                ),
+                (True, {"request_id": "request", "block_ids": ([1], [2])}),
+            ),
+        )
+
+        for call, expected in calls:
+            with self.subTest(expected=expected):
+                backend = _BlockingConnectorBackend()
+                connector = self._connector(scheduler=backend)
+                results = self._assert_shutdown_waits_for_call(
+                    connector,
+                    backend,
+                    lambda: call(connector),
+                    lambda: call(connector),
+                )
+                self.assertEqual(results, [expected])
 
 
 class LogicalChunkNamespaceTest(unittest.TestCase):

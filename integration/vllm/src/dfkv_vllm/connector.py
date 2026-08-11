@@ -146,8 +146,10 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self._kv_cache_config = kv_cache_config
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self._kv_cache_events: DfkvStoreKVEvents | None = None
-        self._shutdown_lock = threading.Lock()
+        self._shutdown_condition = threading.Condition()
+        self._inflight_calls = 0
         self._shutdown = False
+        self._shutdown_complete = False
 
         self.connector_scheduler: DfkvStoreScheduler | None = None
         self.connector_worker: DfkvStoreWorker | None = None
@@ -168,10 +170,14 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
         request: Request,
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
-        assert self.connector_scheduler is not None
-        return self.connector_scheduler.get_num_new_matched_tokens(
-            request, num_computed_tokens
-        )
+        self._begin_call()
+        try:
+            assert self.connector_scheduler is not None
+            return self.connector_scheduler.get_num_new_matched_tokens(
+                request, num_computed_tokens
+            )
+        finally:
+            self._finish_call()
 
     def update_state_after_alloc(
         self,
@@ -179,32 +185,49 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
         blocks: KVCacheBlocks,
         num_external_tokens: int,
     ):
-        assert self.connector_scheduler is not None
-        return self.connector_scheduler.update_state_after_alloc(
-            request, blocks, num_external_tokens
-        )
+        self._begin_call()
+        try:
+            assert self.connector_scheduler is not None
+            return self.connector_scheduler.update_state_after_alloc(
+                request, blocks, num_external_tokens
+            )
+        finally:
+            self._finish_call()
 
     def build_connector_meta(
         self,
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
-        assert self.connector_scheduler is not None
-        return self.connector_scheduler.build_connector_meta(scheduler_output)
+        self._begin_call()
+        try:
+            assert self.connector_scheduler is not None
+            return self.connector_scheduler.build_connector_meta(scheduler_output)
+        finally:
+            self._finish_call()
 
     def request_finished(
         self,
         request: Request,
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
-        return self.request_finished_all_groups(request, (block_ids,))
+        self._begin_call()
+        try:
+            assert self.connector_scheduler is not None
+            return self.connector_scheduler.request_finished(request, (block_ids,))
+        finally:
+            self._finish_call()
 
     def request_finished_all_groups(
         self,
         request: Request,
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
-        assert self.connector_scheduler is not None
-        return self.connector_scheduler.request_finished(request, block_ids)
+        self._begin_call()
+        try:
+            assert self.connector_scheduler is not None
+            return self.connector_scheduler.request_finished(request, block_ids)
+        finally:
+            self._finish_call()
 
     def reset_cache(self) -> bool | None:
         """Reset the external Dfkv store on prefix-cache reset.
@@ -215,13 +238,17 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
 
         Returns True on ack, False on failure, None for the worker role.
         """
-        if self.role == KVConnectorRole.SCHEDULER:
-            assert self.connector_scheduler is not None
-            # Clear local references to keys we're about to wipe.
-            self.connector_scheduler.load_specs.clear()
-            self._kv_cache_events = None
-            return self.connector_scheduler.reset_store()
-        return None
+        self._begin_call()
+        try:
+            if self.role == KVConnectorRole.SCHEDULER:
+                assert self.connector_scheduler is not None
+                # Clear local references to keys we're about to wipe.
+                self.connector_scheduler.load_specs.clear()
+                self._kv_cache_events = None
+                return self.connector_scheduler.reset_store()
+            return None
+        finally:
+            self._finish_call()
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         kv_cache_events = connector_output.kv_cache_events
@@ -248,42 +275,62 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
     # ============================================================
     # Worker-side methods
     # ============================================================
-    def _reject_after_shutdown(self) -> None:
-        with self._shutdown_lock:
+    def _begin_call(self) -> None:
+        """Admit one API call while connector state is fully available."""
+        with self._shutdown_condition:
             if self._shutdown:
                 raise RuntimeError("dfkv connector is shut down")
+            self._inflight_calls += 1
 
+    def _finish_call(self) -> None:
+        with self._shutdown_condition:
+            self._inflight_calls -= 1
+            if self._inflight_calls == 0:
+                self._shutdown_condition.notify_all()
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
-        self._reject_after_shutdown()
-        assert self.connector_worker is not None
-        self.connector_worker.register_kv_caches(kv_caches)
+        self._begin_call()
+        try:
+            assert self.connector_worker is not None
+            self.connector_worker.register_kv_caches(kv_caches)
+        finally:
+            self._finish_call()
 
     def register_cross_layers_kv_cache(
         self, kv_cache: torch.Tensor, attn_backend: type
     ):
-        self._reject_after_shutdown()
-        assert self.connector_worker is not None
-        assert (
-            self._kv_cache_config is not None
-            and len(self._kv_cache_config.kv_cache_groups) == 1
-        ), "Cross-layer KV cache does not supported with hybrid models"
-        self.connector_worker.register_cross_layers_kv_caches(kv_cache)
+        self._begin_call()
+        try:
+            assert self.connector_worker is not None
+            assert (
+                self._kv_cache_config is not None
+                and len(self._kv_cache_config.kv_cache_groups) == 1
+            ), "Cross-layer KV cache does not supported with hybrid models"
+            self.connector_worker.register_cross_layers_kv_caches(kv_cache)
+        finally:
+            self._finish_call()
 
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
-        self._reject_after_shutdown()
-        # Loads are issued in get_finished() for compute overlap; this hook
-        # only runs the preemption fence, which must happen BEFORE this step's
-        # forward pass can overwrite a preempted request's freed (and possibly
-        # re-allocated) blocks while an in-flight save still reads them.
-        assert self.connector_worker is not None
-        metadata = self._get_connector_metadata()
-        assert isinstance(metadata, DfkvStoreConnectorMetadata)
-        self.connector_worker.start_load_kv(metadata)
+        self._begin_call()
+        try:
+            # Loads are issued in get_finished() for compute overlap; this hook
+            # only runs the preemption fence, which must happen BEFORE this step's
+            # forward pass can overwrite a preempted request's freed (and possibly
+            # re-allocated) blocks while an in-flight save still reads them.
+            assert self.connector_worker is not None
+            metadata = self._get_connector_metadata()
+            assert isinstance(metadata, DfkvStoreConnectorMetadata)
+            self.connector_worker.start_load_kv(metadata)
+        finally:
+            self._finish_call()
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        # No layerwise support - no-op
-        return
+        self._begin_call()
+        try:
+            # No layerwise support - no-op
+            return
+        finally:
+            self._finish_call()
 
     def save_kv_layer(
         self,
@@ -292,62 +339,95 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
         attn_metadata: AttentionMetadata,
         **kwargs: Any,
     ) -> None:
-        # No layerwise support - no-op
-        return
+        self._begin_call()
+        try:
+            # No layerwise support - no-op
+            return
+        finally:
+            self._finish_call()
 
     def wait_for_save(self):
-        # No-op: stores are issued in get_finished() for compute overlap.
-        pass
+        self._begin_call()
+        try:
+            # No-op: stores are issued in get_finished() for compute overlap.
+            return
+        finally:
+            self._finish_call()
 
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
-        self._reject_after_shutdown()
-        assert self.connector_worker is not None
-        metadata = self._get_connector_metadata()
-        assert isinstance(metadata, DfkvStoreConnectorMetadata)
-        return self.connector_worker.get_finished(finished_req_ids, metadata)
+        self._begin_call()
+        try:
+            assert self.connector_worker is not None
+            metadata = self._get_connector_metadata()
+            assert isinstance(metadata, DfkvStoreConnectorMetadata)
+            return self.connector_worker.get_finished(finished_req_ids, metadata)
+        finally:
+            self._finish_call()
 
     def get_block_ids_with_load_errors(self) -> set[int]:
-        assert self.connector_worker is not None
-        return self.connector_worker.get_block_ids_with_load_errors()
+        self._begin_call()
+        try:
+            assert self.connector_worker is not None
+            return self.connector_worker.get_block_ids_with_load_errors()
+        finally:
+            self._finish_call()
 
     def get_kv_connector_kv_cache_events(
         self,
     ) -> DfkvStoreKVEvents | None:
-        assert self.connector_worker is not None
-        events = self.connector_worker.get_kv_events()
-        if not events:
-            return None
+        self._begin_call()
+        try:
+            assert self.connector_worker is not None
+            events = self.connector_worker.get_kv_events()
+            if not events:
+                return None
 
-        kv_events = DfkvStoreKVEvents(num_workers=1)
-        kv_events.add_events(events)
-        return kv_events
+            kv_events = DfkvStoreKVEvents(num_workers=1)
+            kv_events.add_events(events)
+            return kv_events
+        finally:
+            self._finish_call()
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
-        if self.connector_worker is None:
-            return None
-        return self.connector_worker.get_kv_connector_stats()
+        self._begin_call()
+        try:
+            if self.connector_worker is None:
+                return None
+            return self.connector_worker.get_kv_connector_stats()
+        finally:
+            self._finish_call()
 
     def shutdown(self) -> None:
-        """Join connector workers and release native state exactly once."""
-        errors: list[Exception] = []
-        with self._shutdown_lock:
+        """Drain admitted API calls, then release connector state exactly once."""
+        with self._shutdown_condition:
             if self._shutdown:
+                while not self._shutdown_complete:
+                    self._shutdown_condition.wait()
                 return
-            try:
-                if self.connector_worker is not None:
-                    try:
-                        self.connector_worker.close()
-                    except Exception as error:
-                        errors.append(error)
-                if self.connector_scheduler is not None:
-                    try:
-                        self.connector_scheduler.close()
-                    except Exception as error:
-                        errors.append(error)
-            finally:
-                self._shutdown = True
+            self._shutdown = True
+            self._shutdown_condition.notify_all()
+            while self._inflight_calls:
+                self._shutdown_condition.wait()
+
+        errors: list[Exception] = []
+        try:
+            if self.connector_worker is not None:
+                try:
+                    self.connector_worker.close()
+                except Exception as error:
+                    errors.append(error)
+            if self.connector_scheduler is not None:
+                try:
+                    self.connector_scheduler.close()
+                except Exception as error:
+                    errors.append(error)
+        finally:
+            with self._shutdown_condition:
+                self._shutdown_complete = True
+                self._shutdown_condition.notify_all()
+
         if errors:
             raise RuntimeError(
                 f"dfkv connector shutdown had {len(errors)} cleanup error(s)"

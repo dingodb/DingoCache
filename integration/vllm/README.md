@@ -80,17 +80,68 @@ LMCache connector access logs, so one setting covers every integration. Format:
 | `lib` | env `DFKV_LIB` / `$DFKV_BUILD/libdfkv.so` | path to `libdfkv.so`. |
 | `batch_concurrency` | `0`=auto | client fan-out for batch ops; the real throughput lever (depth is flat). Auto = `min(max(nodes, 8), 32)`: 8-way parallel on single-node, one-per-node on multi-node. Set >0 to pin a fixed value. |
 | `load_async` | `True` | async KV load: the scheduler returns `WAITING_FOR_REMOTE_KVS` and the load runs off the critical path. Keep `True`. |
-| `transfer_queue_capacity` | `256` | Maximum queued requests **per direction and worker** (`1..65536`). Submission is non-blocking: a full queue rejects new saves as completed (releasing finish/free fences) and rejects new loads as load errors (forcing recompute), so overload cannot grow memory or pin blocks indefinitely. Invalid or out-of-range values abort connector construction. |
+| `transfer_queue_capacity` | `256` | Maximum queued requests in each direction (`1..65536`). All receive workers consume one shared receive queue of this capacity; capacity is not multiplied by `recv_workers`. Submission is non-blocking: a full queue rejects new saves as completed (releasing finish/free fences) and rejects new loads as load errors (forcing recompute), so overload cannot grow memory or pin blocks indefinitely. Invalid or out-of-range values abort connector construction. |
+| `recv_workers` | `1` | Receive/load worker count (`1..32`). Workers consume the shared bounded receive queue and may execute independent native GETs concurrently. Invalid, boolean, or out-of-range values abort connector construction. |
 | `enable_cross_layers_blocks` | `False` | opt-in for engines whose paged layout interleaves layers within a block. Leave `False` unless you know the layout needs it. |
 | `lookup_rpc_port` | (ipc auto) | port for the rank-0 scheduler-side prefix-lookup RPC; set only if the default IPC socket name collides. |
 
 Transfer threads are shut down through vLLM's connector `shutdown()` lifecycle
 hook. Shutdown stops admission, cancels queued transfers with the same visible
-save/load outcomes described above, waits for the one active native operation,
-joins both threads, and closes the native dfkv client exactly once. Accepted
-work can also be drained explicitly by the thread-level `stop(cancel_pending=False)`
-path; normal framework teardown uses cancellation to avoid extending engine
-shutdown behind an accumulated queue.
+save/load outcomes described above, waits for active native operations, joins
+the send thread and every receive worker, and closes native dfkv clients exactly
+once. Accepted work can also be drained explicitly by the thread-level
+`stop(cancel_pending=False)` path; normal framework teardown uses cancellation
+to avoid extending engine shutdown behind an accumulated queue.
+
+Start with `recv_workers=1`. Increase it only in controlled, byte-identical hot
+rounds when `vllm:dfkv_receive_queue_wait_time_seconds` and
+`vllm:dfkv_receive_queue_depth` show sustained receive-side queuing while native
+GET latency and the dfkv service still have headroom. Confirm actual parallelism
+with `vllm:dfkv_receive_active_workers`; all three are Prometheus histograms
+(with the standard `_bucket`, `_sum`, and `_count` series). Compare TTFT,
+queue-wait quantiles, active-worker samples, dfkv GET latency, and failed/recompute
+counts at each setting rather than assuming more workers are faster. Startup
+must contain the evidence line
+`dfkv transfer queues: capacity=<N> per direction, recv_workers=<N>, overload=reject-new, shutdown=cancel-pending`;
+capture it together with the before/after Prometheus snapshots.
+
+## Reproducible external-cache benchmark
+
+`test/python/vllm_external_cache_benchmark.py` never resets caches, deploys
+software, or runs local/remote version-discovery commands. Supply immutable
+deployment identity explicitly:
+
+| CLI option | summary/corpus key | default |
+|---|---|---|
+| `--vllm-version` | `vllm_version` | `null` |
+| `--vllm-commit` | `vllm_commit` | `null` |
+| `--dfkv-version` | `dfkv_version` | `null` |
+| `--dfkv-build-commit` | `dfkv_build_commit` | `null` |
+| `--connector-layout` | `connector_layout` | `null` |
+| `--connector-version` | `connector_version` | `null` |
+| `--model-revision` | `model_revision` | `null` |
+| `--deployment-manifest-hash` | `deployment_manifest_hash` | `null` |
+
+Values are stored verbatim in the fixed-schema `deployment_identity` object;
+the required `--model` is stored as its `model` member. Provide an immutable
+manifest digest, not a manifest path or manifest contents. Do not put
+credentials, URLs, or host paths in identity values. Summary files store
+endpoint hashes and artifact basenames rather than endpoint credentials or host
+paths.
+
+For a populate/restart/hot measurement, generate the corpus once, preserve the
+external cache, restart only the intended vLLM deployment, then reuse the corpus
+with `--corpus-file`. Keep model, model revision, prefix target, request count,
+seed, concurrency, and generation settings fixed. The corpus checksum proves
+byte-identical prompts; corpus reuse rejects a different model or model
+revision. Pass the populate summary as
+`--require-identity-summary FILE` when the compared rounds must use exactly the
+same model, vLLM, dfkv, connector, layout, and deployment-manifest identity.
+This check runs before metrics collection or inference requests, and the new
+summary records the reference summary's SHA-256. Capture vLLM and dfkv
+Prometheus endpoints with the respective repeatable
+`--vllm-metrics-endpoint` and `--dfkv-metrics-endpoint` options so every round
+contains before/after metric evidence.
 
 ## Identity and raw-value contract
 
