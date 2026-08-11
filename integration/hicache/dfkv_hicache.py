@@ -219,6 +219,22 @@ _MARKER_BUF = ctypes.create_string_buffer(1)
 _MARKER_PTR = ctypes.addressof(_MARKER_BUF)
 
 
+def _meta_has_no_layout(meta) -> bool:
+    """True when get_page_buffer_meta() explicitly declares "no physical layout".
+
+    Two wire forms exist for the logical-anchor pool of V4/DSA models:
+    - None                       (LogicalHostPool, SGLang <= v0.5.13)
+    - a 2-tuple containing None  (DeepSeekV4PagedHostPool, SGLang v0.5.17+)
+    Both mean "this pool holds no host buffer"; the real KV rides side pools.
+    Malformed shapes (wrong arity, empty/mismatched components) are NOT
+    treated as logical — they stay hard errors in the callers.
+    """
+    if meta is None:
+        return True
+    return (isinstance(meta, (tuple, list)) and len(meta) == 2
+            and (meta[0] is None or meta[1] is None))
+
+
 def _is_device_transfer(tr) -> bool:
     """A sidecar PoolTransfer is DEVICE-direct (task 4) when it carries device slot
     indices and NO host indices — the indexer RDMAs from/into its GPU buffer. A host
@@ -657,8 +673,27 @@ class DfkvHiCache(HiCacheStorage):
             except ImportError:
                 indices = list(range(page_size))
             meta = host_pool.get_page_buffer_meta(indices)
-            if (not isinstance(meta, (tuple, list)) or len(meta) != 2
-                    or meta[0] is None or meta[1] is None):
+            if _meta_has_no_layout(meta):
+                # The DSV4/DSA hybrid stack (SGLang v0.5.17+) registers the
+                # *logical anchor* "kv" pool through this v2 entry too. It holds
+                # no host buffer, so there is no layout to discover and nothing
+                # to physically register — but raising here crashes HiCache
+                # setup for the whole scheduler. Record it marker-only: v2
+                # writes ride the one-byte anchor markers, reads no-op (real
+                # data lives in the side pools). Malformed layouts (wrong
+                # arity, empty/mismatched components) still fail below.
+                if not hasattr(self, "_pool_logical"):
+                    self._pool_logical = {}
+                self._pool_logical[name] = True
+                self._pool_component_names[name] = ("all",)
+                self._pool_replicated[name] = True
+                self.registered_pools[name] = host_pool
+                self._note_logical_anchor_once()
+                with access_log("pool_components",
+                                lambda: f"{self._alog_tag} {name}") as result:
+                    result.result = "logical anchor (no host layout); marker-only"
+                return
+            if not isinstance(meta, (tuple, list)) or len(meta) != 2:
                 raise RuntimeError("pool component probe returned no layout")
             ptrs, sizes = meta
             count = len(ptrs)
@@ -691,12 +726,14 @@ class DfkvHiCache(HiCacheStorage):
             self.registered_pools.pop(name, None)
             self._pool_component_names.pop(name, None)
             self._pool_replicated.pop(name, None)
+            getattr(self, "_pool_logical", {}).pop(name, None)
             raise RuntimeError(
                 f"cannot discover physical layout for pool {name!r}") from exc
 
         self._pool_component_names[name] = tuple(names)
         self._pool_replicated[name] = replicated
         self.registered_pools[name] = host_pool
+        getattr(self, "_pool_logical", {}).pop(name, None)
         with access_log("pool_components",
                         lambda: f"{self._alog_tag} {name}") as result:
             result.result = (
@@ -1001,7 +1038,7 @@ class DfkvHiCache(HiCacheStorage):
                     _sp.attrs = {"dfkv.backup_skip": True}
                 return [True] * n
             meta = self.mem_pool_host.get_page_buffer_meta(host_indices)
-            if meta is None:
+            if _meta_has_no_layout(meta):
                 # Primary "kv" pool is a *logical anchor* holding no KV buffer
                 # (V4/DSA-compressed models, e.g. GLM-5.2: SGLang registers a
                 # LogicalHostPool whose get_page_buffer_meta() returns None). The
@@ -1267,7 +1304,7 @@ class DfkvHiCache(HiCacheStorage):
         with _tracing.span("batch_get_v1", n) as _sp, \
                 access_log("batch_get_v1", lambda: f"{self._alog_tag} {n} keys") as r:
             meta = self.mem_pool_host.get_page_buffer_meta(host_indices)
-            if meta is None:
+            if _meta_has_no_layout(meta):
                 # Logical anchor pool, no buffer to scatter into (V4/DSA models,
                 # e.g. GLM-5.2). The "kv" prefix was already confirmed present by
                 # batch_exists_v2 (via the one-byte markers written on backup);
@@ -1439,7 +1476,31 @@ class DfkvHiCache(HiCacheStorage):
                 results[name] = [True] * len(keys)
                 continue
             pool = self.registered_pools[name]
-            ptrs, sizes = pool.get_page_buffer_meta(tr.host_indices)
+            logical = getattr(self, "_pool_logical", {}).get(name, False)
+            if not logical:
+                meta = pool.get_page_buffer_meta(tr.host_indices)
+                if _meta_has_no_layout(meta):
+                    # Late no-layout declaration: the pool registered with a
+                    # physical-looking probe but now reports "no host buffer".
+                    # Same contract as registration time — flip to marker-only.
+                    if not hasattr(self, "_pool_logical"):
+                        self._pool_logical = {}
+                    self._pool_logical[name] = logical = True
+                    self._note_logical_anchor_once()
+            if logical:
+                if not putting:
+                    # A logical anchor holds no data to load; report complete so
+                    # the hybrid controller proceeds to the real side pools.
+                    results[name] = [True] * len(keys)
+                    continue
+                sub = self._pool_sub(name)
+                start = len(sks)
+                for k in keys:
+                    for sk in self._pool_keys(name, k):
+                        sks.append(sk); sp.append(_MARKER_PTR); ss.append(1)
+                segments.append((name, len(keys), sub, start, len(sks)))
+                continue
+            ptrs, sizes = meta
             sub = self._pool_sub(name)
             start = len(sks)
             for i, k in enumerate(keys):
