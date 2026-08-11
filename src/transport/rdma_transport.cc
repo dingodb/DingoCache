@@ -624,6 +624,7 @@ RdmaTransport::Conn* RdmaTransport::Acquire(
         for (size_t i = candidates.size(); i > 0; --i) {
           if (candidates[i - 1]->rail_index == ridx &&
               candidates[i - 1]->lifecycle.Activate()) {
+            pooled = candidates[i - 1];
             candidates.erase(candidates.begin() +
                              static_cast<std::ptrdiff_t>(i - 1));
             break;
