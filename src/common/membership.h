@@ -34,6 +34,46 @@ struct MemberStats {
 };
 constexpr uint32_t kMemberStatsFields = 12;  // == u64 count above, wire order
 
+struct IbDeviceHealth {
+  std::string name;
+  uint8_t port_state = 0;
+  uint8_t phys_state = 0;
+  bool query_ok = false;
+
+  bool healthy() const {
+    return query_ok && port_state == 4 && phys_state == 5;
+  }
+};
+
+struct MemberHealth {
+  bool ring_eligible = true;
+  std::vector<IbDeviceHealth> ib_devices;
+};
+
+inline const char* IbPortStateName(uint8_t state) {
+  switch (state) {
+    case 1: return "DOWN";
+    case 2: return "INIT";
+    case 3: return "ARMED";
+    case 4: return "ACTIVE";
+    case 5: return "ACTIVE_DEFER";
+    default: return "UNKNOWN";
+  }
+}
+
+inline const char* IbPhysStateName(uint8_t state) {
+  switch (state) {
+    case 1: return "SLEEP";
+    case 2: return "POLLING";
+    case 3: return "DISABLED";
+    case 4: return "TRAINING";
+    case 5: return "LINK_UP";
+    case 6: return "ERROR_RECOVERY";
+    case 7: return "PHY_TEST";
+    default: return "UNKNOWN";
+  }
+}
+
 struct MemberInfo {
   std::string id;
   std::string ip;
@@ -52,13 +92,19 @@ struct MemberInfo {
   // (-Wmissing-field-initializers skips NSDMI'd members).
   MemberStats stats{};
   bool has_stats = false;
+  MemberHealth health{};
+  bool has_health = false;
   // tcp_port and info ride OPTIONAL trailing extensions in Encode/DecodeMembers, so peers
   // that don't send them still interoperate. Both are intentionally EXCLUDED from
   // operator== and MembersEpoch: they are orthogonal metadata (not part of ring
   // placement), and their consumers (dfkvctl) re-fetch every run, so a change need not
   // trigger a client ring rebuild.
+  bool RingEligible() const {
+    return !has_health || health.ring_eligible;
+  }
   bool operator==(const MemberInfo& o) const {
-    return id == o.id && ip == o.ip && port == o.port && weight == o.weight;
+    return id == o.id && ip == o.ip && port == o.port && weight == o.weight &&
+           RingEligible() == o.RingEligible();
   }
 };
 
@@ -85,6 +131,7 @@ inline bool IsValidGroupOrId(const std::string& s) {
 constexpr uint32_t kMemberExtTcpPort = 0x54435031u;  // "TCP1": one tcp_port u32 per member
 constexpr uint32_t kMemberExtInfo = 0x4E464F31u;     // "NFO1": one length-prefixed info string per member
 constexpr uint32_t kMemberExtStats = 0x31415453u;    // "STA1": nfields u8 then per member { has u8 [nfields x u64] }
+constexpr uint32_t kMemberExtHealth = 0x31544C48u;   // "HLT1": eligibility + per-device IB health
 
 // Wire format for a membership view. Register payload = 1 member; ListMembers
 // response = N members + the epoch (etcd revision) clients compare to skip
@@ -136,6 +183,25 @@ inline std::string EncodeMembers(const std::vector<MemberInfo>& ms,
     for (uint32_t k = 0; k < kMemberStatsFields; ++k) {
       net::PutU64(u64buf, f[k]);
       out.append(u64buf, 8);
+    }
+  }
+  if (std::any_of(ms.begin(), ms.end(),
+                  [](const MemberInfo& m) { return m.has_health; })) {
+    net::PutU32(num, kMemberExtHealth); out.append(num, 4);
+    for (const auto& m : ms) {
+      out.push_back(m.has_health ? 1 : 0);
+      if (!m.has_health) continue;
+      out.push_back(m.health.ring_eligible ? 1 : 0);
+      net::PutU32(num, static_cast<uint32_t>(m.health.ib_devices.size()));
+      out.append(num, 4);
+      for (const auto& d : m.health.ib_devices) {
+        net::PutU32(num, static_cast<uint32_t>(d.name.size()));
+        out.append(num, 4);
+        out += d.name;
+        out.push_back(static_cast<char>(d.port_state));
+        out.push_back(static_cast<char>(d.phys_state));
+        out.push_back(d.query_ok ? 1 : 0);
+      }
     }
   }
   return out;
@@ -206,6 +272,41 @@ inline bool DecodeMembers(const char* p, size_t n,
         (*out)[i].has_stats = true;
       }
       if (!ok) break;
+    } else if (tag == kMemberExtHealth) {
+      off += 4;
+      bool ok = true;
+      for (uint32_t i = 0; i < count; ++i) {
+        if (off + 1 > n) { ok = false; break; }
+        const bool has = p[off++] != 0;
+        if (!has) continue;
+        if (off + 5 > n) { ok = false; break; }
+        MemberHealth health;
+        health.ring_eligible = p[off++] != 0;
+        const uint32_t devices = net::GetU32(p + off);
+        off += 4;
+        if (devices > 64) { ok = false; break; }
+        health.ib_devices.reserve(devices);
+        for (uint32_t j = 0; j < devices; ++j) {
+          if (off + 4 > n) { ok = false; break; }
+          const uint32_t name_len = net::GetU32(p + off);
+          off += 4;
+          if (name_len > 128 || off + name_len + 3 > n) {
+            ok = false;
+            break;
+          }
+          IbDeviceHealth device;
+          device.name.assign(p + off, name_len);
+          off += name_len;
+          device.port_state = static_cast<uint8_t>(p[off++]);
+          device.phys_state = static_cast<uint8_t>(p[off++]);
+          device.query_ok = p[off++] != 0;
+          health.ib_devices.push_back(std::move(device));
+        }
+        if (!ok) break;
+        (*out)[i].health = std::move(health);
+        (*out)[i].has_health = true;
+      }
+      if (!ok) break;
     } else {
       break;  // unknown/future tag: ignore the rest (forward compatible)
     }
@@ -235,6 +336,8 @@ inline uint64_t MembersEpoch(std::vector<MemberInfo> ms) {
     mix(&ipn, 4); mix(m.ip.data(), m.ip.size());
     mix(&m.port, sizeof(m.port));
     mix(&m.weight, sizeof(m.weight));
+    const bool eligible = m.RingEligible();
+    mix(&eligible, sizeof(eligible));
   }
   return h;
 }

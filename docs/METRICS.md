@@ -76,6 +76,8 @@ dfkvctl stat <ip:port>                        # 单节点原始 /metrics 文本�
 | `dfkv_uptime_seconds` | gauge | 启动至今秒数 |
 | `dfkv_storage_healthy` | gauge | 当前 disk group 与显式请求 RAM tier 的 terminal health；0 时 `/healthz`、`/readyz` 均为 503 |
 | `dfkv_server_startup_complete` / `dfkv_server_mds_registration_ready` / `dfkv_server_healthy` / `dfkv_server_ready` | gauge | startup、本次首次 MDS 注册门、本地动态 health、三者合取；`dfkvctl stat --all` 用这组稳定 gauge 判定节点健康 |
+| `dfkv_server_ring_eligible` | gauge | 全部 configured IB rail 当前是否允许节点进入 placement ring；故障时为 0，但 server 进程和 `/healthz` 保持在线 |
+| `dfkv_server_ib_device_healthy{device}` | gauge | 各 resolved RDMA 设备 port 1 是否同时为 ACTIVE 与 LinkUp；设备 label 来自启动时固定集合 |
 | `dfkv_cache_put_total` / `dfkv_cache_hit_total` / `dfkv_cache_miss_total` | counter | PUT / GET 命中 / GET 未命中 |
 | `dfkv_exist_hit_total` / `dfkv_exist_miss_total` | counter | Exist 命中 / 未命中 |
 | `dfkv_remove_ok_total` / `dfkv_remove_miss_total` | counter | Remove 删掉了块 / 目标本就不存在（partial save 清理等路径的诊断分型） |
@@ -202,6 +204,7 @@ TTL-debounced etcd probe 判定（`DFKV_MDS_PROBE_CACHE_MS`，默认 2500 ms 内
 | 指标 | 含义 |
 |------|------|
 | `dfkv_mds_group_nodes{group}` | 该环成员数（带标签版；旧无标签 `dfkv_mds_members` 保留不动） |
+| `dfkv_mds_group_ring_eligible_nodes{group}` / `dfkv_mds_group_degraded_nodes{group}` | 当前可参与 placement 的节点数 / 因 IB health 被排除但 lease 仍在线的节点数 |
 | `dfkv_mds_group_capacity_bytes{group}` / `dfkv_mds_group_used_bytes{group}` | 环总容量 / **环水位**（direct 模式下 df 已失真，此为唯一真值） |
 | `dfkv_mds_group_objects{group}` | 环内常驻块数 |
 | `dfkv_mds_group_hits_sum{group}` / `dfkv_mds_group_misses_sum{group}` | 环级命中率 = hits/(hits+misses) |
@@ -213,7 +216,7 @@ TTL-debounced etcd probe 判定（`DFKV_MDS_PROBE_CACHE_MS`，默认 2500 ms 内
 | `dfkv_mds_group_version_skew{group}` | 去重版本数，**>1 = 版本漂移** |
 | `dfkv_mds_group_clients{group}` | 当前注册的 inference connector/consumer 实例数；client lease 到期后自动下降 |
 
-对应 CLI：`dfkvctl stats --mds <eps> --group <g>`（每节点表格+汇总行，数据一跳来自 MDS 不触节点）/ `--all`（kListGroups 枚举全部环）。深钻仍用 `dfkvctl stat --all`（逐节点全量 /metrics）。
+对应 CLI：`dfkvctl topology --mds <eps> --group <g>` 展示全部在线节点、逐设备 IB 状态及 ACTIVE/DEGRADED ring 状态；`dfkvctl stats --mds <eps> --group <g>` 只统计 health-eligible placement view（每节点表格+汇总行，数据一跳来自 MDS 不触节点）/ `--all`（kListGroups 枚举全部环）。深钻仍用 `dfkvctl stat --all`（逐节点全量 /metrics）。
 
 原有计数：
 | 指标 | 类型 | 含义 |

@@ -29,7 +29,8 @@ enum class WireOp : uint8_t {
   // (group + MemberInfo) and lease semantics; only the etcd key prefix differs
   // (/clients/<id> vs /members/<id>), so clients never pollute the placement ring.
   kClientRegister = 11, kClientHeartbeat = 12, kListClients = 13,
-  kLookup = 14  // payload-free stored-value metadata lookup
+  kLookup = 14,  // payload-free stored-value metadata lookup
+  kListTopology = 15  // MDS: all members, including health-degraded nodes
 };
 
 constexpr uint8_t kNativeProtoTcp = 6;

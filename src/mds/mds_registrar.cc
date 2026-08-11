@@ -68,6 +68,10 @@ bool MdsRegistrar::SendOnce(uint8_t op, int io_timeout_ms,
     self_.stats = stats_fn_();
     self_.has_stats = true;
   }
+  if (health_fn_) {
+    self_.health = health_fn_();
+    self_.has_health = true;
+  }
   std::string payload = EncodeMemberReq(group_, self_);
   char pre[kReqPrefix];
   EncodeReq(pre, static_cast<WireOp>(op), BlockKey{}, 0, 0, payload.size());
