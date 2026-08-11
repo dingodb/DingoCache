@@ -20,8 +20,9 @@ import queue
 import socket
 import threading
 import time
+import zlib
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, TypeVar
 
@@ -70,7 +71,7 @@ from .data import (
     key_diagnostic_label,
     split_block_contiguous_runs,
 )
-from .dfkv_client import DfkvDeviceClient
+from .dfkv_client import DfkvDeviceClient, SgDescriptorBatch
 from .dfkv_utils import get_dp_engine_index
 from .metrics import DfkvStoreConnectorStats
 from ._telemetry import config as _tcfg  # connector identity + client_register switch
@@ -91,6 +92,20 @@ _T = TypeVar("_T")
 
 def _rotate_list(values: list[_T], offset: int) -> list[_T]:
     return values[offset:] + values[:offset]
+
+def _batch_rotation_offset(
+    req_id: str,
+    block_hashes: list[BlockHash],
+    tp_rank: int,
+    batch_size: int,
+) -> int:
+    """Choose a stable, rank-staggered first object for one request batch."""
+    if batch_size <= 1:
+        return 0
+    seed = zlib.crc32(req_id.encode("utf-8"))
+    if block_hashes:
+        seed = zlib.crc32(bytes(block_hashes[0]), seed)
+    return (seed + tp_rank) % batch_size
 
 
 # dfkv: Removed Mooncake-store-only helpers:
@@ -123,6 +138,8 @@ def _put_failed_indices(rcs: list[int]) -> list[int]:
 # capacity would prevent vLLM from observing completions and freeing blocks.
 DEFAULT_TRANSFER_QUEUE_CAPACITY = 256
 MAX_TRANSFER_QUEUE_CAPACITY = 65536
+DEFAULT_RECV_WORKERS = 1
+MAX_RECV_WORKERS = 32
 _TRANSFER_STOP = object()
 
 
@@ -142,6 +159,31 @@ def _parse_transfer_queue_capacity(value: Any) -> int:
         )
     return capacity
 
+def _parse_recv_workers(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("recv_workers must be an integer")
+    if isinstance(value, int):
+        workers = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        workers = int(value.strip())
+    else:
+        raise ValueError("recv_workers must be an integer")
+    if not 1 <= workers <= MAX_RECV_WORKERS:
+        raise ValueError(
+            f"recv_workers must be in [1, {MAX_RECV_WORKERS}], got {workers}"
+        )
+    return workers
+
+
+@dataclasses.dataclass
+class _ReceiveRequestState:
+    request: ReqMeta | None
+    block_ids: tuple[int, ...]
+    phase: str = "queued"
+    cancel_requested: bool = False
+    fail_closed_on_cancel: bool = False
+    completion: threading.Event = dataclasses.field(default_factory=threading.Event)
+
 
 
 
@@ -159,6 +201,7 @@ class KVTransferThread(threading.Thread):
         record_operation: Callable[..., None] | None = None,
         record_observation: Callable[[str, float], None] | None = None,
         queue_capacity: int = DEFAULT_TRANSFER_QUEUE_CAPACITY,
+        record_pool_sample: Callable[[str, int], None] | None = None,
     ):
         super().__init__(daemon=False, name=name)
         self.client = client
@@ -168,6 +211,7 @@ class KVTransferThread(threading.Thread):
         self.token_databases = token_databases
         self._record_operation_cb = record_operation
         self._record_observation_cb = record_observation
+        self._record_pool_sample_cb = record_pool_sample
         self.done_task_lock = threading.Lock()
         self.request_queue: queue.Queue[Any] = queue.Queue(maxsize=queue_capacity)
         self.finished_requests: set[str] = set()
@@ -303,6 +347,10 @@ class KVTransferThread(threading.Thread):
     def _record_observation(self, name: str, start_time: float) -> None:
         if self._record_observation_cb is not None:
             self._record_observation_cb(name, time.perf_counter() - start_time)
+
+    def _record_pool_sample(self, name: str, value: int) -> None:
+        if self._record_pool_sample_cb is not None:
+            self._record_pool_sample_cb(name, value)
 
     def update_kv_event(self, events: list[BlockStored]):
         with self.kv_event_lock:
@@ -505,8 +553,18 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 req_id,
             )
 
-            addrs: list[list[int]] = []
-            sizes: list[list[int]] = []
+            descriptor_chunks = [
+                (
+                    self.token_databases[g_idx],
+                    start,
+                    end,
+                    block_ids_per_group[g_idx],
+                )
+                for start, end, g_idx in zip(
+                    starts, ends, group_indices, strict=True
+                )
+            ]
+            descriptor_batch = SgDescriptorBatch.from_chunks(descriptor_chunks)
             stored_events: list[BlockStored] = []
             # parent_block_hash chains live within a group, not across.
             prev_key_per_group: dict[int, Any] = {}
@@ -516,9 +574,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 zip(starts, ends, group_indices, strict=True)
             ):
                 db = self.token_databases[g_idx]
-                addr, size, _ = db.prepare_value(s, e, block_ids_per_group[g_idx])
-                addrs.append(addr)
-                sizes.append(size)
 
                 if self.enable_kv_event:
                     token_ids = (
@@ -545,12 +600,14 @@ class KVCacheStoreSendingThread(KVTransferThread):
             # One key and one complete segment vector represent each logical
             # chunk. libdfkv splits vectors wider than the negotiated HCA SGE
             # limit into ordered WR windows under one object completion.
-            batch_bytes = sum(sum(s) for s in sizes)
-            num_segments = sum(len(s) for s in sizes)
+            batch_bytes = descriptor_batch.total_bytes
+            num_segments = descriptor_batch.num_segments
             put_start = time.perf_counter()
             successful_events: list[BlockStored] = []
             try:
-                res = self.client.batch_put_sg(keys, addrs, sizes)
+                res = self.client.batch_put_sg(
+                    keys, descriptor_batch.ptrs, descriptor_batch.sizes
+                )
                 if len(res) != len(keys):
                     raise RuntimeError(
                         "batch_put_sg returned incomplete per-key results: "
@@ -624,7 +681,14 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
 
 class KVCacheStoreRecvingThread(KVTransferThread):
-    """Background thread for loading KV cache blocks from the store."""
+    """Bounded worker pool for loading KV cache blocks from the store.
+
+    The object remains a ``Thread`` for connector/API compatibility; that
+    thread is worker zero and ``recv_workers - 1`` bounded peer threads share
+    its request queue.  A request has one queue entry and one lifecycle state.
+    The state retains its GPU block fence until that request alone completes or
+    is cancelled, independent of other requests' completion order.
+    """
 
     def __init__(
         self,
@@ -638,6 +702,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         record_observation: Callable[[str, float], None] | None = None,
         client_provider: Callable[[], Any] | None = None,
         queue_capacity: int = DEFAULT_TRANSFER_QUEUE_CAPACITY,
+        recv_workers: int = DEFAULT_RECV_WORKERS,
+        record_pool_sample: Callable[[str, int], None] | None = None,
     ):
         super().__init__(
             client,
@@ -648,20 +714,263 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             name="KVCacheStoreRecvingThread",
             record_operation=record_operation,
             record_observation=record_observation,
+            record_pool_sample=record_pool_sample,
             queue_capacity=queue_capacity,
         )
-        # Elided ranks start with client=None; a real load arriving there calls
-        # this back into the worker to lazily un-elide (create + register the
-        # client) instead of failing the span into a recompute.
+        self.recv_workers = _parse_recv_workers(recv_workers)
         self.client_provider = client_provider
-        # _invalid_block_ids can be accessed by both the Worker and RecvingThread.
         self._invalid_block_ids_lock = threading.Lock()
         self._invalid_block_ids: set[int] = set()
         self.coord = coord
+        self._request_states_lock = threading.Lock()
+        self._request_states: dict[str, _ReceiveRequestState] = {}
+        self._active_workers = 0
+        self._pool_stop_lock = threading.Lock()
+        self._pool_stop_started = False
+        self._pool_stop_done = threading.Event()
+        self._peer_threads = [
+            threading.Thread(
+                target=self._run_receive_worker,
+                daemon=False,
+                name=f"KVCacheStoreRecvingThread-{worker_idx}",
+            )
+            for worker_idx in range(1, self.recv_workers)
+        ]
+
+    @property
+    def worker_threads(self) -> tuple[threading.Thread, ...]:
+        return (self, *self._peer_threads)
+
+    def start(self) -> None:
+        with self._pool_stop_lock:
+            if self._pool_stop_started:
+                raise RuntimeError("receive pool is closed")
+            super().start()
+            for worker in self._peer_threads:
+                worker.start()
+
+    def run(self) -> None:
+        self.ready_event.set()
+        self._run_receive_worker()
 
     def add_request(self, request: ReqMeta) -> bool:
         request._dfkv_receive_enqueued_at = time.perf_counter()  # type: ignore[attr-defined]
-        return super().add_request(request)
+        block_ids = tuple(
+            block_id for group_ids in request.block_ids for block_id in group_ids
+        )
+        reason = "closed"
+        with self._stop_lock:
+            if self._accepting:
+                with self._request_states_lock:
+                    if request.req_id in self._request_states:
+                        logger.warning(
+                            "%s ignored duplicate request %s",
+                            self.name,
+                            request.req_id,
+                        )
+                        return False
+                    state = _ReceiveRequestState(request=request, block_ids=block_ids)
+                    self._request_states[request.req_id] = state
+                    try:
+                        self.request_queue.put_nowait(request)
+                    except queue.Full:
+                        reason = "saturated"
+                        self._terminalize_locked(state, failed=True)
+                    else:
+                        self._record_pool_sample(
+                            "receive_queue_depth", self.request_queue.qsize()
+                        )
+                        return True
+            else:
+                state = _ReceiveRequestState(request=request, block_ids=block_ids)
+                with self._request_states_lock:
+                    existing = self._request_states.get(request.req_id)
+                    if existing is not None:
+                        return False
+                    self._request_states[request.req_id] = state
+                    self._terminalize_locked(state, failed=True)
+                    self._request_states.pop(request.req_id, None)
+        logger.warning(
+            "%s rejected request %s: transfer queue %s (capacity=%d)",
+            self.name,
+            request.req_id,
+            reason,
+            self.request_queue.maxsize,
+        )
+        return False
+
+    def get_and_clear_finished_requests(self) -> set[str]:
+        with self._request_states_lock:
+            with self.done_task_lock:
+                finished = self.finished_requests.copy()
+                self.finished_requests.clear()
+            for req_id in finished:
+                state = self._request_states.get(req_id)
+                if state is not None and state.phase == "terminal":
+                    self._request_states.pop(req_id, None)
+        return finished
+
+    def cancel_requests(
+        self,
+        req_ids: set[str] | list[str] | tuple[str, ...],
+        *,
+        wait: bool = True,
+        fail_closed: bool = True,
+    ) -> None:
+        """Cancel loads and fence active native calls through completion."""
+        wait_events: list[threading.Event] = []
+        with self._request_states_lock:
+            for req_id in req_ids:
+                state = self._request_states.get(req_id)
+                if state is None or state.phase == "terminal":
+                    continue
+                if state.phase == "queued":
+                    self._terminalize_locked(state, failed=fail_closed)
+                else:
+                    state.cancel_requested = True
+                    state.fail_closed_on_cancel = (
+                        state.fail_closed_on_cancel or fail_closed
+                    )
+                    wait_events.append(state.completion)
+        if wait:
+            for completion in wait_events:
+                completion.wait()
+
+    def _terminalize_locked(
+        self,
+        state: _ReceiveRequestState,
+        *,
+        failed: bool,
+    ) -> bool:
+        if state.phase == "terminal":
+            return False
+        req = state.request
+        req_id = req.req_id if req is not None else None
+        state.phase = "terminal"
+        state.request = None
+        if failed and state.block_ids:
+            with self._invalid_block_ids_lock:
+                self._invalid_block_ids.update(state.block_ids)
+        state.block_ids = ()
+        if req_id is not None:
+            with self.done_task_lock:
+                self.finished_requests.add(req_id)
+        state.completion.set()
+        return True
+
+    def _run_receive_worker(self) -> None:
+        while True:
+            request = self.request_queue.get()
+            try:
+                self._record_pool_sample(
+                    "receive_queue_depth", self.request_queue.qsize()
+                )
+                if request is _TRANSFER_STOP:
+                    return
+                with self._request_states_lock:
+                    state = self._request_states.get(request.req_id)
+                    if (
+                        state is None
+                        or state.phase != "queued"
+                        or state.request is not request
+                    ):
+                        continue
+                    state.phase = "active"
+                    self._active_workers += 1
+                    self._record_pool_sample(
+                        "receive_active_workers", self._active_workers
+                    )
+                failed = False
+                try:
+                    self._handle_request(request)
+                except Exception:
+                    failed = True
+                    logger.exception(
+                        "Error in %s for request %s", self.name, request.req_id
+                    )
+                finally:
+                    with self._request_states_lock:
+                        state = self._request_states.get(request.req_id)
+                        if state is not None and state.phase == "active":
+                            self._active_workers -= 1
+                            failed = (
+                                failed
+                                or (
+                                    state.cancel_requested
+                                    and state.fail_closed_on_cancel
+                                )
+                            )
+                            self._terminalize_locked(state, failed=failed)
+                            self._record_pool_sample(
+                                "receive_active_workers", self._active_workers
+                            )
+            finally:
+                self.request_queue.task_done()
+
+    def stop(self, *, cancel_pending: bool = True) -> None:
+        with self._pool_stop_lock:
+            first_stop = not self._pool_stop_started
+            if first_stop:
+                self._pool_stop_started = True
+        if not first_stop:
+            self._pool_stop_done.wait()
+            return
+
+        try:
+            with self._stop_lock:
+                self._accepting = False
+            if cancel_pending:
+                while True:
+                    try:
+                        pending = self.request_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    try:
+                        if pending is not _TRANSFER_STOP:
+                            self.cancel_requests(
+                                (pending.req_id,),
+                                wait=False,
+                                fail_closed=False,
+                            )
+                    finally:
+                        self.request_queue.task_done()
+                with self._request_states_lock:
+                    for state in self._request_states.values():
+                        if state.phase == "active":
+                            state.cancel_requested = True
+            if self.ident is None:
+                while True:
+                    try:
+                        self.request_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    else:
+                        self.request_queue.task_done()
+                with self._request_states_lock:
+                    for state in self._request_states.values():
+                        if state.phase != "terminal":
+                            self._terminalize_locked(state, failed=False)
+                    self._request_states.clear()
+                self._record_pool_sample("receive_queue_depth", 0)
+                self._record_pool_sample("receive_active_workers", 0)
+                return
+            for _ in self.worker_threads:
+                self.request_queue.put(_TRANSFER_STOP)
+            self.request_queue.join()
+            for worker in self.worker_threads:
+                if threading.current_thread() is not worker:
+                    worker.join()
+            with self._request_states_lock:
+                if any(state.phase != "terminal" for state in self._request_states.values()):
+                    raise RuntimeError("receive pool stopped with non-terminal requests")
+                self._request_states.clear()
+            self._record_pool_sample("receive_queue_depth", 0)
+            self._record_pool_sample("receive_active_workers", 0)
+        finally:
+            self._pool_stop_done.set()
+
+    close = stop
+
 
     def _add_load_error_block_ids(self, block_ids: list[int]) -> None:
         with self._invalid_block_ids_lock:
@@ -691,8 +1000,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             # locally (e.g. SWA pre-window) even if the producer stored them.
             load_mask_per_group = self.coord.load_mask(req_meta.block_hashes, token_len)
 
-            addr_list: list[list[int]] = []
-            size_list: list[list[int]] = []
+            descriptor_chunks: list[
+                tuple[object, int, int, Sequence[int]]
+            ] = []
             key_list: list[bytes] = []
             block_id_list: list[int] = []
             for g_idx, db in enumerate(self.token_databases):
@@ -703,27 +1013,33 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     chunk_idx = start // db.block_size
                     if chunk_idx >= len(mask) or not mask[chunk_idx]:
                         continue
-                    addr, size, block_id = db.prepare_value(
-                        start, end, req_meta.block_ids[g_idx]
+                    block_id = int(
+                        req_meta.block_ids[g_idx][start // db.block_size]
                     )
                     key_list.append(key.to_bytes())
-                    addr_list.append(addr)
-                    size_list.append(size)
+                    descriptor_chunks.append(
+                        (db, start, end, req_meta.block_ids[g_idx])
+                    )
                     block_id_list.append(block_id)
 
-            # Nothing to load (e.g. every chunk masked out for this group) -> finish
-            # the request now, else `tp_rank % 0` below would raise and the req would
-            # never be reported done, hanging vLLM's WAITING_FOR_REMOTE_KVS wait.
+            # An empty descriptor batch finishes immediately; in particular,
+            # avoid taking a modulo by zero while choosing the first object.
             if not key_list:
                 self._record_observation("geometry_preparation", geometry_start)
                 return
 
-            # Rotate aligned lists by tp_rank for load balancing.
-            rotation = self.tp_rank % len(key_list)
+            # Rotate submission order only. The request and its first chunk
+            # choose a stable base shard, while adjacent TP ranks start at
+            # adjacent objects instead of repeating one fixed burst pattern.
+            # All aligned metadata follows the same permutation, so keys,
+            # object-internal segment order, and failure attribution are intact.
+            rotation = _batch_rotation_offset(
+                req_id, req_meta.block_hashes, self.tp_rank, len(key_list)
+            )
             rotated_keys = _rotate_list(key_list, rotation)
-            rotated_addrs = _rotate_list(addr_list, rotation)
-            rotated_sizes = _rotate_list(size_list, rotation)
+            rotated_chunks = _rotate_list(descriptor_chunks, rotation)
             rotated_block_ids = _rotate_list(block_id_list, rotation)
+            descriptor_batch = SgDescriptorBatch.from_chunks(rotated_chunks)
 
             # dfkv: one logical chunk is one batch key with its complete
             # destination segment vector. libdfkv performs any HCA-width
@@ -734,9 +1050,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 if client is not None:
                     self.client = client
             self._record_observation("geometry_preparation", geometry_start)
-            chunk_totals = [sum(chunk_sizes) for chunk_sizes in rotated_sizes]
-            batch_bytes = sum(chunk_totals)
-            num_segments = sum(len(chunk_sizes) for chunk_sizes in rotated_sizes)
+            chunk_totals = descriptor_batch.logical_lengths
+            batch_bytes = descriptor_batch.total_bytes
+            num_segments = descriptor_batch.num_segments
 
             load_get_start = time.perf_counter()
             try:
@@ -748,7 +1064,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     hits, lens = [False] * len(rotated_keys), [0] * len(rotated_keys)
                 else:
                     hits, lens = client.batch_get_auto_sg(
-                        rotated_keys, rotated_addrs, rotated_sizes
+                        rotated_keys,
+                        descriptor_batch.ptrs,
+                        descriptor_batch.caps,
                     )
                 if len(hits) != len(rotated_keys) or len(lens) != len(rotated_keys):
                     raise RuntimeError(
@@ -830,24 +1148,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 )
             except Exception:
                 pass
-        finally:
-            self.set_finished_request(req_id)
-
     def _cancel_request(self, req_meta: Any) -> None:
-        # A queued/rejected load must finish as a visible recompute, never leave
-        # the request stuck in WAITING_FOR_REMOTE_KVS.
-        try:
-            self._add_load_error_block_ids(
-                [block_id for ids in req_meta.block_ids for block_id in ids]
-            )
-        except Exception:
-            logger.exception(
-                "%s could not enumerate cancelled load blocks for request %s",
-                self.name,
-                getattr(req_meta, "req_id", "<unknown>"),
-            )
-        finally:
-            self.set_finished_request(req_meta.req_id)
+        self.cancel_requests(
+            (req_meta.req_id,), wait=False, fail_closed=True
+        )
 
 
 
@@ -888,10 +1192,14 @@ class DfkvStoreWorker:
                 DEFAULT_TRANSFER_QUEUE_CAPACITY,
             )
         )
+        self.recv_workers = _parse_recv_workers(
+            extra.get("recv_workers", DEFAULT_RECV_WORKERS)
+        )
         logger.info(
-            "dfkv transfer queues: capacity=%d per direction, "
+            "dfkv transfer queues: capacity=%d per direction, recv_workers=%d, "
             "overload=reject-new, shutdown=cancel-pending",
             self.transfer_queue_capacity,
+            self.recv_workers,
         )
         self._close_lock = threading.Lock()
         self._closed = False
@@ -1401,6 +1709,8 @@ class DfkvStoreWorker:
             queue_capacity=getattr(
                 self, "transfer_queue_capacity", DEFAULT_TRANSFER_QUEUE_CAPACITY
             ),
+            recv_workers=getattr(self, "recv_workers", DEFAULT_RECV_WORKERS),
+            record_pool_sample=self._record_kv_connector_pool_sample,
         )
         self.kv_recv_thread.start()
         ready_event_recving.wait()
@@ -1409,24 +1719,22 @@ class DfkvStoreWorker:
         self,
         metadata: DfkvStoreConnectorMetadata,
     ):
-        """Pre-forward hook: fence preempted requests' in-flight saves.
+        """Fence every preempted request's active GPU transfer.
 
-        Loads/stores are issued in get_finished() for overlap; the ONLY work
-        here is the preemption fence, and it must be here. The scheduler
-        frees a preempted request's GPU blocks with no connector hook
-        (request_finished()'s delay-free covers only the normal finish path)
-        and can hand them to another request scheduled in this very step.
-        This hook runs before this step's forward pass writes into those
-        blocks, so it is the last point where the race can still be closed:
-        drop the queued-not-started saves, then wait out the one save the
-        send thread may currently be executing (an uncancellable RDMA read
-        of the request's old blocks). Without the fence that read races the
-        new request's prefill writes and stores mixed bytes under a
-        content-addressed key -- and the save path's exists-dedup then
-        prevents the correct bytes from ever replacing them (persistent
-        cache poison, spread across instances by PD reuse).
+        A queued receive is cancelled without a native call.  An active receive
+        cannot be interrupted safely, so this waits for only that request's
+        GPUDirect write before its blocks may be reused.  The send-side fence
+        likewise waits for its request's active RDMA read.
         """
-        if self.kv_send_thread is None or not metadata.preempted_req_ids:
+        if not metadata.preempted_req_ids:
+            return
+        if self.kv_recv_thread is not None:
+            self.kv_recv_thread.cancel_requests(
+                metadata.preempted_req_ids,
+                wait=True,
+                fail_closed=False,
+            )
+        if self.kv_send_thread is None:
             return
         # Drop queued entries first (the dequeue gate re-checks per entry),
         # then join whichever entry is already executing.
@@ -1461,6 +1769,14 @@ class DfkvStoreWorker:
         compute is launched on the compute stream) for better
         compute-I/O overlap.
         """
+        # Aborted/finished requests may have an outstanding remote load.  Their
+        # blocks cannot be freed until that request's own GPUDirect write exits.
+        if finished_req_ids and self.kv_recv_thread is not None:
+            self.kv_recv_thread.cancel_requests(
+                finished_req_ids,
+                wait=True,
+                fail_closed=False,
+            )
         # Issue async loads
         for request in meta.requests:
             load_spec = request.load_spec
@@ -1547,6 +1863,14 @@ class DfkvStoreWorker:
         with self._kv_connector_stats_lock:
             self.kv_connector_stats.record_observation(name, duration_seconds)
 
+    def _record_kv_connector_pool_sample(
+        self,
+        name: str,
+        value: int,
+    ) -> None:
+        with self._kv_connector_stats_lock:
+            self.kv_connector_stats.record_pool_sample(name, value)
+
     def get_kv_connector_stats(self) -> DfkvStoreConnectorStats | None:
         with self._kv_connector_stats_lock:
             if self.kv_connector_stats.is_empty():
@@ -1593,11 +1917,12 @@ class DfkvStoreWorker:
         if not block_hashes or token_len <= 0:
             return 0
 
-        # Build one physical object candidate per logical (group, hash, TP, PP)
-        # coordinate. candidate_meta maps each object back to the logical chunk.
+        # Build every physical object required by each logical LCM chunk.
+        # Object metadata retains the logical chunk index so repeated hashes
+        # cannot collapse accounting across distinct prefix positions.
         candidate_keys: list[bytes] = []
-        candidate_meta: list[tuple[int, bytes]] = []
-        expected_per_chunk: dict[tuple[int, bytes], int] = {}
+        candidate_meta: list[tuple[int, int, int, bytes]] = []
+        expected_per_object: dict[tuple[int, int, int, bytes], int] = {}
         tp_count = min(self.tp_size, self.num_kv_head)
         # dfkv: gate candidates by store_mask -- the SAME per-(group,chunk) set
         # the SAVE path stores (worker.py save gate) and the LOAD path reads
@@ -1610,6 +1935,11 @@ class DfkvStoreWorker:
             token_len // self.coord.lcm_block_size * self.coord.lcm_block_size
         )
         store_masks = self.coord.store_mask(aligned_token_len)
+        if aligned_token_len == 0:
+            return 0
+        num_prefix_chunks = aligned_token_len // self.coord.lcm_block_size
+        required_objects_per_chunk = [0] * num_prefix_chunks
+        missing_required_per_chunk = [False] * num_prefix_chunks
         for g_idx, db in enumerate(self.token_dbs):
             spec_block_size = db.block_size
             mask = store_masks[g_idx]
@@ -1625,18 +1955,35 @@ class DfkvStoreWorker:
                 [db.metadata.tp_rank] if db.metadata.tp_rank < 0 else range(tp_count)
             )
             rank_probes = max(1, len(tp_candidates) * self.pp_size)
+            processed_chunks = 0
             for chunk_id, h in enumerate(group_hashes):
                 start_idx = chunk_id * spec_block_size
-                if start_idx >= token_len:
+                if start_idx >= aligned_token_len:
                     break
+                processed_chunks = chunk_id + 1
                 if chunk_id >= len(mask) or not mask[chunk_id]:
                     continue
-                expected_per_chunk[(g_idx, bytes(h))] = rank_probes
+                logical_chunk_idx = start_idx // self.coord.lcm_block_size
+                object_meta = (logical_chunk_idx, g_idx, chunk_id, bytes(h))
+                expected_per_object[object_meta] = rank_probes
+                required_objects_per_chunk[logical_chunk_idx] += 1
                 for tp in tp_candidates:
                     for pp in range(self.pp_size):
                         md = dataclasses.replace(db.metadata, tp_rank=tp, pp_rank=pp)
                         candidate_keys.append(PoolKey(md, h.hex()).to_bytes())
-                        candidate_meta.append((g_idx, bytes(h)))
+                        candidate_meta.append(object_meta)
+            # A truncated hash vector is malformed metadata. Mark only its
+            # ungenerated required suffix chunks incomplete; the normal path
+            # has no second full mask scan.
+            for chunk_id in range(
+                processed_chunks,
+                min(len(mask), aligned_token_len // spec_block_size),
+            ):
+                if mask[chunk_id]:
+                    logical_chunk_idx = (
+                        chunk_id * spec_block_size // self.coord.lcm_block_size
+                    )
+                    missing_required_per_chunk[logical_chunk_idx] = True
 
         if not candidate_keys:
             return 0
@@ -1644,41 +1991,77 @@ class DfkvStoreWorker:
         lookup_start = time.perf_counter()
         try:
             res = self.client.batch_exist(candidate_keys)
-            self._record_kv_connector_operation(
-                "lookup_exists",
-                time.perf_counter() - lookup_start,
-                len(candidate_keys),
-                num_logical_keys=len(expected_per_chunk),
-            )
+            if len(res) != len(candidate_keys):
+                raise RuntimeError(
+                    "batch_exist returned incomplete per-key results: "
+                    f"keys={len(candidate_keys)} statuses={len(res)}"
+                )
         except Exception as e:
             self._record_kv_connector_operation(
                 "lookup_exists",
                 time.perf_counter() - lookup_start,
                 len(candidate_keys),
-                num_logical_keys=len(expected_per_chunk),
+                num_logical_keys=len(expected_per_object),
                 status="error",
                 num_failed_keys=len(candidate_keys),
             )
             logger.error("Remote connection failed in lookup: %s", e)
             return 0
 
-        # A (group, hash) is present only when every required TP*PP object
-        # exists. A partial request therefore fails closed at the first missing
-        # chunk without any sibling-key interpretation.
-        present_count: dict[tuple[int, bytes], int] = {}
-        for gh, exists in zip(candidate_meta, res, strict=True):
-            if exists == 1:
-                present_count[gh] = present_count.get(gh, 0) + 1
-        exists_set = {
-            gh for gh, c in present_count.items() if c >= expected_per_chunk[gh]
-        }
-
-        _masks, hit_length = self.coord.find_longest_cache_hit(
-            block_hashes, token_len, ExternalCachedBlockPool(exists_set)
+        self._record_kv_connector_operation(
+            "lookup_exists",
+            time.perf_counter() - lookup_start,
+            len(candidate_keys),
+            num_logical_keys=len(expected_per_object),
         )
+
+        # A semantic object exists only if every TP*PP coordinate exists. A
+        # logical LCM chunk is complete only if all of its semantic objects do.
+        # Scan logical chunks in order and cap the semantic coordinator at the
+        # first incomplete one, so an isolated later hit can never be loaded.
+        present_per_object: dict[tuple[int, int, int, bytes], int] = {}
+        for object_meta, exists in zip(candidate_meta, res, strict=True):
+            if exists == 1:
+                present_per_object[object_meta] = (
+                    present_per_object.get(object_meta, 0) + 1
+                )
+
+        complete_chunks = [
+            required > 0 and not missing_required_per_chunk[idx]
+            for idx, required in enumerate(required_objects_per_chunk)
+        ]
+        exists_set: set[tuple[int, bytes]] = set()
+        for object_meta, expected in expected_per_object.items():
+            logical_chunk_idx, g_idx, _chunk_id, chunk_hash = object_meta
+            if present_per_object.get(object_meta, 0) != expected:
+                complete_chunks[logical_chunk_idx] = False
+            else:
+                exists_set.add((g_idx, chunk_hash))
+
+        prefix_chunks = 0
+        for chunk_idx, complete in enumerate(complete_chunks):
+            if required_objects_per_chunk[chunk_idx] == 0 or not complete:
+                break
+            prefix_chunks += 1
+        complete_prefix_tokens = prefix_chunks * self.coord.lcm_block_size
+
+        if complete_prefix_tokens == 0:
+            hit_length = 0
+        else:
+            _masks, semantic_hit_length = self.coord.find_longest_cache_hit(
+                block_hashes,
+                complete_prefix_tokens,
+                ExternalCachedBlockPool(exists_set),
+            )
+            hit_length = min(complete_prefix_tokens, semantic_hit_length)
         logger.debug(
-            "dfkv lookup: token_len=%d candidates=%d present=%d -> hit_length=%d",
-            token_len, len(candidate_keys), len(exists_set), hit_length,
+            "dfkv lookup: token_len=%d candidates=%d complete_chunks=%d/%d "
+            "-> hit_length=%d",
+            token_len,
+            len(candidate_keys),
+            prefix_chunks,
+            num_prefix_chunks,
+            hit_length,
         )
         return hit_length
 

@@ -185,6 +185,7 @@ sys.path.insert(0, str(ROOT / "integration" / "vllm" / "src"))
 from vllm.v1.core.kv_cache_utils import BlockHash  # noqa: E402
 
 from dfkv_vllm.data import (  # noqa: E402
+    ChunkedTokenDatabase,
     KeyMetadata,
     LoadSpec,
     PoolKey,
@@ -493,6 +494,19 @@ class LogicalChunkTransferTest(unittest.TestCase):
             def process_tokens(self, *_args):
                 return [(0, 64, logical_key)]
 
+            def descriptor_shape(self, _start, _end, block_ids):
+                return len(addresses), sum(sizes), block_ids[0]
+
+            def fill_descriptors(
+                self, _start, _end, _block_ids, pointers, out_sizes, offset=0
+            ):
+                for index, (address, size) in enumerate(
+                    zip(addresses, sizes, strict=True), start=offset
+                ):
+                    pointers[index] = address
+                    out_sizes[index] = size
+                return offset + len(addresses)
+
             def prepare_value(self, *_args):
                 return list(addresses), list(sizes), 7
 
@@ -579,6 +593,26 @@ class LogicalChunkTransferTest(unittest.TestCase):
             def process_tokens(self, *_args):
                 return [(0, 64, keys[0]), (64, 128, keys[1])]
 
+            def descriptor_shape(self, start, _end, block_ids):
+                index = start // 64
+                return (
+                    len(addresses[index]),
+                    sum(sizes[index]),
+                    block_ids[index],
+                )
+
+            def fill_descriptors(
+                self, start, _end, _block_ids, pointers, out_sizes, offset=0
+            ):
+                index = start // 64
+                for cursor, (address, size) in enumerate(
+                    zip(addresses[index], sizes[index], strict=True),
+                    start=offset,
+                ):
+                    pointers[cursor] = address
+                    out_sizes[cursor] = size
+                return offset + len(addresses[index])
+
             def prepare_value(self, start, *_args):
                 index = start // 64
                 return list(addresses[index]), list(sizes[index]), (7, 9)[index]
@@ -586,18 +620,26 @@ class LogicalChunkTransferTest(unittest.TestCase):
         class _Client:
             def __init__(self) -> None:
                 self.get_call = None
-                self.result = ([1, 0], [sum(sizes[0]), 0])
+                self.truncate = False
 
             def max_sg_segs(self) -> int:
                 return 29
 
             def batch_get_auto_sg(self, get_keys, ptrs, caps):
+                key_order = list(get_keys)
                 self.get_call = (
-                    list(get_keys),
+                    key_order,
                     [list(value) for value in ptrs],
                     [list(value) for value in caps],
                 )
-                return self.result
+                hits = [int(key == keys[0].to_bytes()) for key in key_order]
+                lengths = [
+                    sum(sizes[0]) if key == keys[0].to_bytes() else 0
+                    for key in key_order
+                ]
+                if self.truncate:
+                    return hits[:1], lengths[:1]
+                return hits, lengths
 
         client = _Client()
         coord = SimpleNamespace(
@@ -625,9 +667,19 @@ class LogicalChunkTransferTest(unittest.TestCase):
         )
         receiver._handle_request(request)
 
+        get_keys, get_addrs, get_sizes = client.get_call
+        observed = {
+            key: (chunk_addrs, chunk_sizes)
+            for key, chunk_addrs, chunk_sizes in zip(
+                get_keys, get_addrs, get_sizes, strict=True
+            )
+        }
         self.assertEqual(
-            client.get_call,
-            ([key.to_bytes() for key in keys], addresses, sizes),
+            observed,
+            {
+                keys[0].to_bytes(): (addresses[0], sizes[0]),
+                keys[1].to_bytes(): (addresses[1], sizes[1]),
+            },
         )
         load_errors = receiver.get_and_clear_block_ids_with_load_errors()
         self.assertNotIn(7, load_errors)
@@ -637,11 +689,895 @@ class LogicalChunkTransferTest(unittest.TestCase):
         # A truncated native result must be rejected before per-key indexing.
         # Fail the whole batch closed rather than silently treating the omitted
         # logical chunk as a hit.
-        client.result = ([1], [sum(sizes[0])])
+        client.truncate = True
         receiver._handle_request(request)
         self.assertEqual(
             receiver.get_and_clear_block_ids_with_load_errors(), {7, 9}
         )
+
+
+class GeometryReuseTest(unittest.TestCase):
+    @staticmethod
+    def _metadata() -> KeyMetadata:
+        return KeyMetadata(
+            model_name="geometry",
+            dp_size=1,
+            dp_rank=-1,
+            tp_size=1,
+            tp_rank=-1,
+            pcp_size=1,
+            pcp_rank=0,
+            dcp_size=1,
+            dcp_rank=0,
+            pp_size=1,
+            pp_rank=0,
+        )
+
+    def test_cached_layout_uses_current_arbitrary_ids_and_returns_owned_arrays(
+        self,
+    ) -> None:
+        database = ChunkedTokenDatabase(self._metadata(), block_size=64)
+        database.set_seg_layout(
+            [
+                (0x1000, 0x80, 0x60),
+                (0x8000, 0x100, 0xC0),
+            ]
+        )
+        geometry = database.geometry
+        with self.assertRaises(AttributeError):
+            geometry.segment_bases = ()  # type: ignore[misc]
+
+        first_ids = [17, 2, 999]
+        first_addrs, first_sizes, first_block_id = database.prepare_value(
+            0, 192, first_ids
+        )
+        expected_first_addrs = [
+            0x1000 + block_id * 0x80 for block_id in first_ids
+        ] + [
+            0x8000 + block_id * 0x100 for block_id in first_ids
+        ]
+        self.assertEqual(list(first_addrs), expected_first_addrs)
+        self.assertEqual(list(first_sizes), [0x60] * 3 + [0xC0] * 3)
+        self.assertEqual(first_block_id, 17)
+
+        first_snapshot = (list(first_addrs), list(first_sizes))
+        second_addrs, second_sizes, second_block_id = database.prepare_value(
+            0, 192, [4, 81, 6]
+        )
+        self.assertEqual(second_block_id, 4)
+        self.assertEqual(
+            list(second_addrs),
+            [
+                0x1000 + 4 * 0x80,
+                0x1000 + 81 * 0x80,
+                0x1000 + 6 * 0x80,
+                0x8000 + 4 * 0x100,
+                0x8000 + 81 * 0x100,
+                0x8000 + 6 * 0x100,
+            ],
+        )
+        self.assertEqual(list(second_sizes), [0x60] * 3 + [0xC0] * 3)
+        self.assertIsNot(first_addrs, second_addrs)
+        self.assertIsNot(first_sizes, second_sizes)
+        self.assertEqual((list(first_addrs), list(first_sizes)), first_snapshot)
+        self.assertIs(database.geometry, geometry)
+
+    def test_sequential_requests_do_not_share_mutable_native_vectors(self) -> None:
+        database = ChunkedTokenDatabase(self._metadata(), block_size=64)
+        database.set_seg_layout([(0x5000, 0x200, 0x180)])
+
+        class _Client:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def batch_get_auto_sg(self, keys, pointers, capacities):
+                self.calls.append((keys, pointers, capacities))
+                return [1], [0x180]
+
+        client = _Client()
+        receiver = KVCacheStoreRecvingThread(
+            client,
+            SimpleNamespace(load_mask=lambda _hashes, _token_len: [[True]]),
+            [database],
+            block_size=64,
+            tp_rank=0,
+            ready_event=threading.Event(),
+        )
+
+        def request(request_id: str, block_id: int) -> ReqMeta:
+            block_hash = BlockHash(hashlib.sha256(request_id.encode()).digest())
+            return ReqMeta(
+                req_id=request_id,
+                token_len_chunk=64,
+                block_ids=([block_id],),
+                block_hashes=[block_hash],
+                load_spec=LoadSpec(
+                    vllm_cached_tokens=0,
+                    kvpool_cached_tokens=64,
+                    can_load=True,
+                    token_len=64,
+                ),
+            )
+
+        receiver._handle_request(request("first", 37))
+        first_pointers = client.calls[0][1]
+        first_capacities = client.calls[0][2]
+        first_snapshot = (
+            [list(chunk) for chunk in first_pointers],
+            [list(chunk) for chunk in first_capacities],
+        )
+        receiver._handle_request(request("second", 901))
+
+        self.assertIsNot(first_pointers, client.calls[1][1])
+        self.assertIsNot(first_capacities, client.calls[1][2])
+        self.assertEqual(
+            (
+                [list(chunk) for chunk in first_pointers],
+                [list(chunk) for chunk in first_capacities],
+            ),
+            first_snapshot,
+        )
+        self.assertEqual(first_snapshot, ([[0x5000 + 37 * 0x200]], [[0x180]]))
+        self.assertEqual(
+            [list(chunk) for chunk in client.calls[1][1]],
+            [[0x5000 + 901 * 0x200]],
+        )
+
+
+class ReceiveRotationTest(unittest.TestCase):
+    @staticmethod
+    def _hash(seed: str) -> BlockHash:
+        return BlockHash(hashlib.sha256(seed.encode()).digest())
+
+    @staticmethod
+    def _metadata() -> KeyMetadata:
+        return KeyMetadata(
+            model_name="rotation",
+            dp_size=1,
+            dp_rank=-1,
+            tp_size=8,
+            tp_rank=-1,
+            pcp_size=1,
+            pcp_rank=0,
+            dcp_size=1,
+            dcp_rank=0,
+            pp_size=1,
+            pp_rank=0,
+        )
+
+    def _exercise(
+        self, req_id: str, tp_rank: int
+    ) -> tuple[list[bytes], set[int]]:
+        hashes = [self._hash(f"chunk-{index}") for index in range(4)]
+        keys = [PoolKey(self._metadata(), value.hex()).to_bytes() for value in hashes]
+        block_ids = [101, 7, 4095, 23]
+        expected_by_key = {
+            key: (0x2000 + block_id * 0x100, 64, block_id)
+            for key, block_id in zip(keys, block_ids, strict=True)
+        }
+
+        class _Database:
+            block_size = 64
+            _seg_layout = [(0x2000, 0x100, 64)]
+
+            def process_tokens(self, *_args):
+                return [
+                    (index * 64, (index + 1) * 64, PoolKey(
+                        ReceiveRotationTest._metadata(), hashes[index].hex()
+                    ))
+                    for index in range(4)
+                ]
+
+            def descriptor_shape(self, start, _end, current_block_ids):
+                index = start // 64
+                return 1, 64, current_block_ids[index]
+
+            def fill_descriptors(
+                self, start, _end, current_block_ids, pointers, sizes, offset=0
+            ):
+                index = start // 64
+                pointers[offset] = 0x2000 + current_block_ids[index] * 0x100
+                sizes[offset] = 64
+                return offset + 1
+
+            def prepare_value(self, start, _end, current_block_ids):
+                index = start // 64
+                block_id = current_block_ids[index]
+                return [0x2000 + block_id * 0x100], [64], block_id
+
+        class _Client:
+            def __init__(self) -> None:
+                self.orders: list[list[bytes]] = []
+
+            def batch_get_auto_sg(self, get_keys, ptrs, caps):
+                key_order = list(get_keys)
+                self.orders.append(key_order)
+                hits: list[int] = []
+                lengths: list[int] = []
+                for key, addresses, sizes in zip(
+                    key_order, ptrs, caps, strict=True
+                ):
+                    expected_addr, expected_size, expected_block_id = expected_by_key[key]
+                    if list(addresses) != [expected_addr]:
+                        raise AssertionError(
+                            f"key {key!r} used stale block {expected_block_id}"
+                        )
+                    if list(sizes) != [expected_size]:
+                        raise AssertionError(f"key {key!r} used wrong geometry")
+                    hit = key != keys[2]
+                    hits.append(int(hit))
+                    lengths.append(expected_size if hit else 0)
+                return hits, lengths
+
+        client = _Client()
+        receiver = KVCacheStoreRecvingThread(
+            client,
+            SimpleNamespace(load_mask=lambda _hashes, _token_len: [[True] * 4]),
+            [_Database()],
+            block_size=64,
+            tp_rank=tp_rank,
+            ready_event=threading.Event(),
+        )
+        request = ReqMeta(
+            req_id=req_id,
+            token_len_chunk=256,
+            block_ids=(block_ids,),
+            block_hashes=hashes,
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                kvpool_cached_tokens=256,
+                can_load=True,
+                token_len=256,
+            ),
+        )
+        receiver._handle_request(request)
+        return client.orders[0], receiver.get_and_clear_block_ids_with_load_errors()
+
+    def test_request_seed_rotates_initial_chunk_stably_without_reordering_results(
+        self,
+    ) -> None:
+        canonical = [
+            PoolKey(self._metadata(), self._hash(f"chunk-{index}").hex()).to_bytes()
+            for index in range(4)
+        ]
+        orders: list[list[bytes]] = []
+        for index in range(12):
+            order, failed_blocks = self._exercise(f"request-{index}", tp_rank=0)
+            orders.append(order)
+            self.assertEqual(failed_blocks, {4095})
+            doubled = canonical + canonical
+            start = doubled.index(order[0])
+            self.assertEqual(order, doubled[start:start + len(canonical)])
+
+        self.assertGreater(
+            len({tuple(order) for order in orders}),
+            1,
+            "request identity must spread the first logical chunk at fixed TP rank",
+        )
+        repeated, failed_blocks = self._exercise("request-3", tp_rank=0)
+        self.assertEqual(repeated, orders[3])
+        self.assertEqual(failed_blocks, {4095})
+
+    def test_tp_ranks_rotate_only_the_native_issue_order(self) -> None:
+        orders = []
+        for tp_rank in range(4):
+            order, failed_blocks = self._exercise("same-request", tp_rank)
+            orders.append(tuple(order))
+            self.assertEqual(failed_blocks, {4095})
+        self.assertEqual(len(set(orders)), 4)
+
+
+class LongestCompletePrefixLookupTest(unittest.TestCase):
+    @staticmethod
+    def _hash(seed: str) -> BlockHash:
+        return BlockHash(hashlib.sha256(seed.encode()).digest())
+
+    @staticmethod
+    def _metadata(group_id: int) -> KeyMetadata:
+        return KeyMetadata(
+            model_name="lookup-prefix",
+            dp_size=1,
+            dp_rank=-1,
+            tp_size=1,
+            tp_rank=-1,
+            pcp_size=1,
+            pcp_rank=0,
+            dcp_size=1,
+            dcp_rank=0,
+            pp_size=1,
+            pp_rank=0,
+            group_id=group_id,
+        )
+
+    def _worker(self, response, *, repeated_hashes: bool = False):
+        if repeated_hashes:
+            wide_hashes = [self._hash("wide-repeat")] * 3
+            fine_hashes = [self._hash("fine-repeat")] * 6
+        else:
+            wide_hashes = [self._hash(f"wide-{index}") for index in range(3)]
+            fine_hashes = [self._hash(f"fine-{index}") for index in range(6)]
+        wide_spec, fine_spec = object(), object()
+
+        class _Coordinator:
+            lcm_block_size = 128
+
+            @staticmethod
+            def store_mask(_token_len):
+                return [[True] * 3, [True] * 6]
+
+            @staticmethod
+            def block_hashes_for_spec(_block_hashes, spec):
+                return wide_hashes if spec is wide_spec else fine_hashes
+
+            @staticmethod
+            def find_longest_cache_hit(_block_hashes, _token_len, pool):
+                hit = 0
+                for chunk in range(3):
+                    required = (
+                        (0, wide_hashes[chunk]),
+                        (1, fine_hashes[chunk * 2]),
+                        (1, fine_hashes[chunk * 2 + 1]),
+                    )
+                    if not all(
+                        pool.get_cached_block(block_hash, [group_id])
+                        for group_id, block_hash in required
+                    ):
+                        break
+                    hit += 128
+                return [[], []], hit
+
+        class _Client:
+            def __init__(self):
+                self.calls: list[list[bytes]] = []
+
+            def batch_exist(self, keys):
+                self.calls.append(list(keys))
+                if isinstance(response, Exception):
+                    raise response
+                return response
+
+        client = _Client()
+        worker = DfkvStoreWorker.__new__(DfkvStoreWorker)
+        worker.client = client
+        worker.coord = _Coordinator()
+        worker.token_dbs = [
+            SimpleNamespace(block_size=128, metadata=self._metadata(0)),
+            SimpleNamespace(block_size=64, metadata=self._metadata(1)),
+        ]
+        worker._kv_cache_groups = [
+            SimpleNamespace(kv_cache_spec=wide_spec),
+            SimpleNamespace(kv_cache_spec=fine_spec),
+        ]
+        worker.tp_size = 1
+        worker.num_kv_head = 1
+        worker.pp_size = 1
+        worker._record_kv_connector_operation = lambda *_args, **_kwargs: None
+        return worker, client
+
+    def test_stops_at_first_incomplete_cross_group_chunk_and_ignores_later_hits(
+        self,
+    ) -> None:
+        # Candidate order is three wide-group chunks followed by six fine-group
+        # subchunks. Logical chunk 1 is incomplete only in the fine group;
+        # logical chunk 2 is an isolated later hit and must not be loaded.
+        worker, client = self._worker(
+            [1, 1, 1, 1, 1, 1, 0, 1, 1]
+        )
+        block_hashes = [self._hash(f"scheduler-{index}") for index in range(6)]
+        self.assertEqual(worker.lookup(384, block_hashes), 128)
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(len(client.calls[0]), 9)
+
+        first_missing_worker, _ = self._worker(
+            [1, 1, 1, 1, 0, 1, 1, 1, 1]
+        )
+        self.assertEqual(first_missing_worker.lookup(384, block_hashes), 0)
+
+    def test_repeated_equal_hashes_do_not_mask_an_incomplete_occurrence(self) -> None:
+        worker, _client = self._worker(
+            # Fine-group occurrence 0 is absent; identical hashes in later
+            # chunks are present and must not inflate this occurrence's count.
+            [1, 1, 1, 0, 1, 1, 1, 1, 1],
+            repeated_hashes=True,
+        )
+        block_hashes = [self._hash("scheduler-repeat")] * 6
+        self.assertEqual(worker.lookup(384, block_hashes), 0)
+
+    def test_malformed_exist_result_lengths_fail_closed(self) -> None:
+        block_hashes = [self._hash(f"scheduler-{index}") for index in range(6)]
+        for malformed in (
+            [1] * 8,
+            [1] * 10,
+            None,
+        ):
+            with self.subTest(result=malformed):
+                worker, _client = self._worker(malformed)
+                self.assertEqual(worker.lookup(384, block_hashes), 0)
+
+
+class _BlockingReceiveClient:
+    def __init__(self, request_keys: dict[bytes, str]) -> None:
+        self.request_keys = request_keys
+        self.started = {
+            request_id: threading.Event() for request_id in request_keys.values()
+        }
+        self.release = {
+            request_id: threading.Event() for request_id in request_keys.values()
+        }
+        self.returned = {
+            request_id: threading.Event() for request_id in request_keys.values()
+        }
+        self.raise_for: set[str] = set()
+        self._lock = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+
+    def batch_get_auto_sg(self, keys, addresses, sizes):
+        self.assert_one_aligned_object(keys, addresses, sizes)
+        request_id = self.request_keys[bytes(keys[0])]
+        with self._lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        self.started[request_id].set()
+        try:
+            if request_id in self.raise_for:
+                raise RuntimeError(f"injected receive failure for {request_id}")
+            if not self.release[request_id].wait(timeout=5):
+                raise TimeoutError(f"test did not release {request_id}")
+            return [1], [64]
+        finally:
+            with self._lock:
+                self.active -= 1
+            self.returned[request_id].set()
+
+    @staticmethod
+    def assert_one_aligned_object(keys, addresses, sizes) -> None:
+        if len(keys) != 1 or len(addresses) != 1 or len(sizes) != 1:
+            raise AssertionError("expected one logical object")
+        if len(addresses[0]) != 1 or list(sizes[0]) != [64]:
+            raise AssertionError("key/descriptor geometry was not aligned")
+
+
+class ReceiveConcurrencyTest(unittest.TestCase):
+    @staticmethod
+    def _metadata() -> KeyMetadata:
+        return KeyMetadata(
+            model_name="receive-concurrency",
+            dp_size=1,
+            dp_rank=-1,
+            tp_size=1,
+            tp_rank=-1,
+            pcp_size=1,
+            pcp_rank=0,
+            dcp_size=1,
+            dcp_rank=0,
+            pp_size=1,
+            pp_rank=0,
+        )
+
+    @staticmethod
+    def _hash(request_id: str) -> BlockHash:
+        return BlockHash(hashlib.sha256(request_id.encode()).digest())
+
+    def test_recv_worker_configuration_is_positive_and_bounded(self) -> None:
+        common = (
+            object(),
+            SimpleNamespace(),
+            [],
+            64,
+            0,
+            threading.Event(),
+        )
+        for invalid in (0, 33, True, "four"):
+            with self.subTest(value=invalid):
+                with self.assertRaises(ValueError):
+                    KVCacheStoreRecvingThread(
+                        *common, recv_workers=invalid  # type: ignore[arg-type]
+                    )
+
+        receiver = KVCacheStoreRecvingThread(
+            *common, recv_workers="4"  # type: ignore[arg-type]
+        )
+        self.assertEqual(receiver.recv_workers, 4)
+        self.assertEqual(len(receiver.worker_threads), 4)
+        receiver.stop()
+
+    def _requests(self, request_ids: tuple[str, ...]) -> tuple[
+        dict[str, ReqMeta], dict[bytes, str]
+    ]:
+        requests: dict[str, ReqMeta] = {}
+        request_keys: dict[bytes, str] = {}
+        metadata = self._metadata()
+        for index, request_id in enumerate(request_ids):
+            block_hash = self._hash(request_id)
+            request_keys[PoolKey(metadata, block_hash.hex()).to_bytes()] = request_id
+            requests[request_id] = ReqMeta(
+                req_id=request_id,
+                token_len_chunk=64,
+                block_ids=([1000 + index * 17],),
+                block_hashes=[block_hash],
+                load_spec=LoadSpec(
+                    vllm_cached_tokens=0,
+                    kvpool_cached_tokens=64,
+                    can_load=True,
+                    token_len=64,
+                ),
+            )
+        return requests, request_keys
+
+    def _receiver(
+        self,
+        request_ids: tuple[str, ...],
+        *,
+        recv_workers: int = 1,
+        queue_capacity: int = 8,
+    ) -> tuple[
+        KVCacheStoreRecvingThread,
+        _BlockingReceiveClient,
+        dict[str, ReqMeta],
+        dict[str, threading.Event],
+        dict[str, int],
+        list[str],
+    ]:
+        requests, request_keys = self._requests(request_ids)
+        metadata = self._metadata()
+
+        class _Database:
+            block_size = 64
+            _seg_layout = [(0x10000, 0x100, 64)]
+
+            @staticmethod
+            def process_tokens(_token_len, block_hashes, _mask_num):
+                return [(0, 64, PoolKey(metadata, block_hashes[0].hex()))]
+
+            @staticmethod
+            def descriptor_shape(_start, _end, block_ids):
+                return 1, 64, block_ids[0]
+
+            @staticmethod
+            def fill_descriptors(
+                _start, _end, block_ids, pointers, sizes, offset=0
+            ):
+                pointers[offset] = 0x10000 + block_ids[0] * 0x100
+                sizes[offset] = 64
+                return offset + 1
+
+            @staticmethod
+            def prepare_value(_start, _end, block_ids):
+                return [0x10000 + block_ids[0] * 0x100], [64], block_ids[0]
+
+        client = _BlockingReceiveClient(request_keys)
+        receiver = KVCacheStoreRecvingThread(
+            client,
+            SimpleNamespace(load_mask=lambda _hashes, _token_len: [[True]]),
+            [_Database()],
+            block_size=64,
+            tp_rank=0,
+            ready_event=threading.Event(),
+            queue_capacity=queue_capacity,
+            recv_workers=recv_workers,
+        )
+        done_events = {
+            request_id: threading.Event() for request_id in request_ids
+        }
+        transition_counts = {request_id: 0 for request_id in request_ids}
+        transition_order: list[str] = []
+        transition_lock = threading.Lock()
+        terminalize = receiver._terminalize_locked
+
+        def record_terminal(state, *, failed):
+            request = state.request
+            request_id = request.req_id if request is not None else None
+            transitioned = terminalize(state, failed=failed)
+            if transitioned and request_id is not None:
+                with transition_lock:
+                    transition_counts[request_id] += 1
+                    transition_order.append(request_id)
+                    done_events[request_id].set()
+            return transitioned
+
+        receiver._terminalize_locked = record_terminal
+        receiver.start()
+        self.assertTrue(receiver.ready_event.wait(timeout=1))
+        return (
+            receiver,
+            client,
+            requests,
+            done_events,
+            transition_counts,
+            transition_order,
+        )
+
+    @staticmethod
+    def _wait(event: threading.Event, label: str) -> None:
+        if not event.wait(timeout=2):
+            raise AssertionError(f"timed out waiting for {label}")
+
+    def test_recv_workers_overlap_complete_out_of_order_and_bound_active_calls(
+        self,
+    ) -> None:
+        request_ids = ("slow", "fast", "queued", "rejected")
+        (
+            receiver,
+            client,
+            requests,
+            done,
+            counts,
+            order,
+        ) = self._receiver(request_ids, recv_workers=2, queue_capacity=1)
+        try:
+            self.assertTrue(receiver.add_request(requests["slow"]))
+            self._wait(client.started["slow"], "slow native GET")
+            self.assertTrue(receiver.add_request(requests["fast"]))
+            self._wait(client.started["fast"], "fast native GET")
+
+            self.assertTrue(receiver.add_request(requests["queued"]))
+            self.assertFalse(receiver.add_request(requests["rejected"]))
+            self._wait(done["rejected"], "saturated request terminalization")
+            self.assertFalse(client.started["queued"].is_set())
+            self.assertLessEqual(client.max_active, 2)
+
+            client.release["fast"].set()
+            self._wait(done["fast"], "fast completion")
+            self._wait(client.started["queued"], "queued request start")
+            self.assertFalse(done["slow"].is_set())
+            client.release["queued"].set()
+            self._wait(done["queued"], "queued completion")
+            client.release["slow"].set()
+            self._wait(done["slow"], "slow completion")
+
+            self.assertLess(order.index("fast"), order.index("slow"))
+            self.assertEqual(counts, {request_id: 1 for request_id in request_ids})
+            self.assertEqual(
+                receiver.get_and_clear_block_ids_with_load_errors(),
+                {requests["rejected"].block_ids[0][0]},
+            )
+            self.assertEqual(
+                receiver.get_and_clear_finished_requests(), set(request_ids)
+            )
+            self.assertEqual(receiver.get_and_clear_finished_requests(), set())
+        finally:
+            for event in client.release.values():
+                event.set()
+            receiver.stop(cancel_pending=True)
+
+    def test_default_single_worker_preserves_compatibility_without_overlap(
+        self,
+    ) -> None:
+        receiver, client, requests, done, counts, _order = self._receiver(
+            ("first", "second")
+        )
+        try:
+            self.assertTrue(receiver.add_request(requests["first"]))
+            self._wait(client.started["first"], "first native GET")
+            self.assertTrue(receiver.add_request(requests["second"]))
+            self.assertFalse(client.started["second"].is_set())
+            self.assertEqual(client.max_active, 1)
+
+            client.release["first"].set()
+            self._wait(done["first"], "first completion")
+            self._wait(client.started["second"], "second native GET")
+            client.release["second"].set()
+            self._wait(done["second"], "second completion")
+            self.assertEqual(counts, {"first": 1, "second": 1})
+            self.assertEqual(client.max_active, 1)
+        finally:
+            for event in client.release.values():
+                event.set()
+            receiver.stop(cancel_pending=True)
+
+    def test_cancel_active_and_queued_requests_fences_each_block_once(self) -> None:
+        receiver, client, requests, done, counts, _order = self._receiver(
+            ("active", "queued"), recv_workers=1
+        )
+        try:
+            self.assertTrue(receiver.add_request(requests["active"]))
+            self._wait(client.started["active"], "active native GET")
+            self.assertTrue(receiver.add_request(requests["queued"]))
+
+            receiver.cancel_requests({"active", "queued"}, wait=False)
+            self._wait(done["queued"], "queued cancellation")
+            self.assertFalse(done["active"].is_set())
+            self.assertFalse(client.started["queued"].is_set())
+
+            client.release["active"].set()
+            self._wait(done["active"], "active cancellation fence")
+            self.assertEqual(counts, {"active": 1, "queued": 1})
+            self.assertEqual(
+                receiver.get_and_clear_block_ids_with_load_errors(),
+                {
+                    requests["active"].block_ids[0][0],
+                    requests["queued"].block_ids[0][0],
+                },
+            )
+            receiver.cancel_requests({"active", "queued"}, wait=True)
+            self.assertEqual(counts, {"active": 1, "queued": 1})
+        finally:
+            for event in client.release.values():
+                event.set()
+            receiver.stop(cancel_pending=True)
+
+    def test_preemption_hook_waits_for_only_its_inflight_receive(self) -> None:
+        receiver, client, requests, done, counts, _order = self._receiver(
+            ("preempted",), recv_workers=1
+        )
+        self.assertTrue(receiver.add_request(requests["preempted"]))
+        self._wait(client.started["preempted"], "preempted native GET")
+
+        cancel_entered = threading.Event()
+        original_cancel = receiver.cancel_requests
+
+        def observed_cancel(req_ids, *, wait=True, **kwargs):
+            cancel_entered.set()
+            return original_cancel(req_ids, wait=wait, **kwargs)
+
+        receiver.cancel_requests = observed_cancel
+        send_thread = SimpleNamespace(
+            delete_finished_stored_request=lambda _req_id: None,
+            wait_for_inflight_put=lambda _req_id: True,
+        )
+        worker = DfkvStoreWorker.__new__(DfkvStoreWorker)
+        worker.kv_send_thread = send_thread
+        worker.kv_recv_thread = receiver
+        returned = threading.Event()
+
+        def preempt() -> None:
+            worker.start_load_kv(SimpleNamespace(preempted_req_ids={"preempted"}))
+            returned.set()
+
+        thread = threading.Thread(target=preempt)
+        thread.start()
+        try:
+            self._wait(cancel_entered, "receive preemption hook")
+            self.assertFalse(returned.is_set())
+            self.assertFalse(done["preempted"].is_set())
+            client.release["preempted"].set()
+            self._wait(returned, "preemption fence return")
+            thread.join(timeout=1)
+            self._wait(done["preempted"], "preempted terminalization")
+            self.assertEqual(counts["preempted"], 1)
+            self.assertEqual(
+                receiver.get_and_clear_block_ids_with_load_errors(), set()
+            )
+        finally:
+            client.release["preempted"].set()
+            thread.join(timeout=1)
+            receiver.stop(cancel_pending=True)
+
+    def test_finished_abort_waits_for_inflight_receive_before_acknowledging(
+        self,
+    ) -> None:
+        receiver, client, requests, done, counts, _order = self._receiver(
+            ("aborted",), recv_workers=1
+        )
+        self.assertTrue(receiver.add_request(requests["aborted"]))
+        self._wait(client.started["aborted"], "aborted native GET")
+
+        cancel_entered = threading.Event()
+        original_cancel = receiver.cancel_requests
+
+        def observed_cancel(req_ids, *, wait=True, **kwargs):
+            cancel_entered.set()
+            return original_cancel(req_ids, wait=wait, **kwargs)
+
+        receiver.cancel_requests = observed_cancel
+        worker = DfkvStoreWorker.__new__(DfkvStoreWorker)
+        worker.kv_recv_thread = receiver
+        worker.kv_send_thread = None
+        worker.kv_role = "kv_consumer"
+        worker.load_async = True
+        worker.tp_rank = 0
+        returned = threading.Event()
+        result: list[tuple[set[str], set[str]]] = []
+
+        def finish_abort() -> None:
+            result.append(
+                worker.get_finished(
+                    {"aborted"},
+                    SimpleNamespace(requests=[], preempted_req_ids=set()),
+                )
+            )
+            returned.set()
+
+        thread = threading.Thread(target=finish_abort)
+        thread.start()
+        try:
+            self._wait(cancel_entered, "finished-request receive cancellation")
+            self.assertFalse(returned.is_set())
+            self.assertFalse(done["aborted"].is_set())
+            client.release["aborted"].set()
+            self._wait(returned, "finished-request receive fence")
+            thread.join(timeout=1)
+            self.assertEqual(result, [(set(), {"aborted"})])
+            self.assertEqual(counts["aborted"], 1)
+            self.assertEqual(
+                receiver.get_and_clear_block_ids_with_load_errors(), set()
+            )
+        finally:
+            client.release["aborted"].set()
+            thread.join(timeout=1)
+            receiver.stop(cancel_pending=True)
+
+    def test_stop_drains_when_requested_and_native_exception_is_fail_closed(
+        self,
+    ) -> None:
+        receiver, client, requests, done, counts, order = self._receiver(
+            ("failing", "drained"), recv_workers=1
+        )
+        thread: threading.Thread | None = None
+        try:
+            client.raise_for.add("failing")
+            self.assertTrue(receiver.add_request(requests["failing"]))
+            self._wait(done["failing"], "exception terminalization")
+            self.assertTrue(receiver.add_request(requests["drained"]))
+            self._wait(client.started["drained"], "drained native GET")
+
+            stopped = threading.Event()
+
+            def drain() -> None:
+                receiver.stop(cancel_pending=False)
+                stopped.set()
+
+            thread = threading.Thread(target=drain)
+            thread.start()
+            self.assertFalse(stopped.is_set())
+            client.release["drained"].set()
+            self._wait(stopped, "draining stop")
+            thread.join(timeout=1)
+            self._wait(done["drained"], "drained request completion")
+
+            self.assertEqual(counts, {"failing": 1, "drained": 1})
+            self.assertEqual(order, ["failing", "drained"])
+            self.assertEqual(
+                receiver.get_and_clear_block_ids_with_load_errors(),
+                {requests["failing"].block_ids[0][0]},
+            )
+        finally:
+            for event in client.release.values():
+                event.set()
+            if thread is not None:
+                thread.join(timeout=1)
+            receiver.stop(cancel_pending=True)
+
+    def test_close_cancels_queued_and_fences_active_before_returning(self) -> None:
+        receiver, client, requests, done, counts, _order = self._receiver(
+            ("active", "queued", "after-close"), recv_workers=1
+        )
+        thread: threading.Thread | None = None
+        try:
+            self.assertTrue(receiver.add_request(requests["active"]))
+            self._wait(client.started["active"], "active native GET")
+            self.assertTrue(receiver.add_request(requests["queued"]))
+            stopped = threading.Event()
+
+            def close() -> None:
+                receiver.close(cancel_pending=True)
+                stopped.set()
+
+            thread = threading.Thread(target=close)
+            thread.start()
+            self._wait(done["queued"], "queued close cancellation")
+            self.assertFalse(stopped.is_set())
+            self.assertFalse(done["active"].is_set())
+            client.release["active"].set()
+            self._wait(stopped, "close after active fence")
+            thread.join(timeout=1)
+            self._wait(done["active"], "active close cancellation")
+
+            self.assertFalse(receiver.add_request(requests["after-close"]))
+            self._wait(done["after-close"], "post-close rejection")
+            self.assertEqual(
+                counts, {"active": 1, "queued": 1, "after-close": 1}
+            )
+            self.assertEqual(
+                receiver.get_and_clear_block_ids_with_load_errors(),
+                {requests["after-close"].block_ids[0][0]},
+            )
+        finally:
+            client.release["active"].set()
+            if thread is not None:
+                thread.join(timeout=1)
+            receiver.stop(cancel_pending=True)
 
 
 class LookupAccountingTest(unittest.TestCase):
