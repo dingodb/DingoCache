@@ -1342,6 +1342,108 @@ class ClientStatsPollerTest(unittest.TestCase):
         self.assertEqual(samples["dfkv_client_peer_errors_total"].labels,
                          ("1.2.3.4:1",))
 
+    def test_shared_parser_keeps_scheduler_and_resource_budget_metrics(self):
+        from dfkv_common.client_metrics import parse_snapshot
+        text = (
+            "dfkv_read_scheduler_pending_batches 2\n"
+            "dfkv_read_scheduler_pending_shards 11\n"
+            "dfkv_read_scheduler_active_shards 7\n"
+            "dfkv_read_scheduler_queue_delay_us_total 1234\n"
+            "dfkv_read_scheduler_fairness_yields_total 9\n"
+            'dfkv_rdma_client_endpoint_budget{kind="used"} 16\n'
+            'dfkv_rdma_client_endpoint_budget{kind="limit"} 256\n'
+            'dfkv_rdma_client_qp_budget{kind="used"} 32\n'
+            'dfkv_rdma_client_wr_slot_budget{kind="limit"} 8192\n'
+            'dfkv_rdma_client_registered_slot_bytes_budget{kind="used"} 4096\n'
+            "dfkv_rdma_client_resource_budget_timeouts_total 3\n"
+            "dfkv_rdma_endpoint_cache_hits_total 20\n"
+            "dfkv_rdma_endpoint_cache_misses_total 4\n"
+            "dfkv_rdma_endpoint_cache_evictions_total 1\n"
+            "dfkv_unknown_future_metric 99\n"
+        )
+        samples = {
+            (sample.name, sample.labels): sample
+            for sample in parse_snapshot(text)
+        }
+        self.assertEqual(
+            samples[("dfkv_read_scheduler_pending_shards", ())].kind,
+            "gauge",
+        )
+        self.assertEqual(
+            samples[("dfkv_read_scheduler_queue_delay_us_total", ())].kind,
+            "counter",
+        )
+        self.assertEqual(
+            samples[
+                ("dfkv_rdma_client_endpoint_budget", ("used",))
+            ].value,
+            16,
+        )
+        self.assertEqual(
+            samples[
+                ("dfkv_rdma_client_endpoint_budget", ("limit",))
+            ].value,
+            256,
+        )
+        self.assertEqual(
+            samples[
+                ("dfkv_rdma_client_resource_budget_timeouts_total", ())
+            ].value,
+            3,
+        )
+        self.assertEqual(
+            samples[("dfkv_rdma_endpoint_cache_evictions_total", ())].value,
+            1,
+        )
+        self.assertNotIn(
+            ("dfkv_unknown_future_metric", ()),
+            samples,
+        )
+
+    def test_poll_once_mirrors_scheduler_and_resource_budget_metrics(self):
+        p = self._poller([
+            (
+                "dfkv_read_scheduler_pending_shards 11\n"
+                "dfkv_read_scheduler_active_shards 7\n"
+                "dfkv_read_scheduler_queue_delay_us_total 1200\n"
+                'dfkv_rdma_client_qp_budget{kind="used"} 32\n'
+                'dfkv_rdma_client_qp_budget{kind="limit"} 256\n'
+                "dfkv_rdma_client_resource_budget_timeouts_total 2\n"
+            ),
+            (
+                "dfkv_read_scheduler_pending_shards 3\n"
+                "dfkv_read_scheduler_active_shards 1\n"
+                "dfkv_read_scheduler_queue_delay_us_total 1500\n"
+                'dfkv_rdma_client_qp_budget{kind="used"} 16\n'
+                'dfkv_rdma_client_qp_budget{kind="limit"} 256\n'
+                "dfkv_rdma_client_resource_budget_timeouts_total 3\n"
+            ),
+        ])
+        p.poll_once()
+        p.poll_once()
+        self.assertEqual(
+            p.gauges()["dfkv_read_scheduler_pending_shards"],
+            3,
+        )
+        self.assertEqual(
+            p.gauges()['dfkv_rdma_client_qp_budget{kind="used"}'],
+            16,
+        )
+        self.assertEqual(
+            p.gauges()['dfkv_rdma_client_qp_budget{kind="limit"}'],
+            256,
+        )
+        self.assertEqual(
+            p.totals()["dfkv_read_scheduler_queue_delay_us_total"],
+            1500,
+        )
+        self.assertEqual(
+            p.totals()[
+                "dfkv_rdma_client_resource_budget_timeouts_total"
+            ],
+            3,
+        )
+
     def test_poll_once_accumulates_deltas(self):
         p = self._poller([
             "dfkv_client_ops_served_total 5\ndfkv_client_io_errors_total 1\n",

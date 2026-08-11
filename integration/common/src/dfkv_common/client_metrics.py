@@ -90,6 +90,12 @@ _COUNTERS: dict[str, tuple[str, ...]] = {
     "dfkv_transport_pool_retirements_total": ("reason",),
     "dfkv_transport_pool_backoff_events_total": (),
     "dfkv_transport_pool_backoff_suppressed_total": (),
+    "dfkv_read_scheduler_queue_delay_us_total": (),
+    "dfkv_read_scheduler_fairness_yields_total": (),
+    "dfkv_rdma_client_resource_budget_timeouts_total": (),
+    "dfkv_rdma_endpoint_cache_hits_total": (),
+    "dfkv_rdma_endpoint_cache_misses_total": (),
+    "dfkv_rdma_endpoint_cache_evictions_total": (),
 }
 
 _GAUGES: dict[str, tuple[str, ...]] = {
@@ -114,6 +120,13 @@ _GAUGES: dict[str, tuple[str, ...]] = {
     "dfkv_transport_pool_connections": (),
     "dfkv_transport_pool_inflight": (),
     "dfkv_transport_pool_backoff_endpoints": (),
+    "dfkv_read_scheduler_pending_batches": (),
+    "dfkv_read_scheduler_pending_shards": (),
+    "dfkv_read_scheduler_active_shards": (),
+    "dfkv_rdma_client_endpoint_budget": ("kind",),
+    "dfkv_rdma_client_qp_budget": ("kind",),
+    "dfkv_rdma_client_wr_slot_budget": ("kind",),
+    "dfkv_rdma_client_registered_slot_bytes_budget": ("kind",),
 }
 
 CLIENT_METRIC_SPECS: dict[str, MetricSpec] = {
