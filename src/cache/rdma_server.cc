@@ -577,6 +577,31 @@ void RdmaServer::Serve(int boot_fd) {
   const size_t direct_buffer_cap = slot_size - rdma::kV2DataOffset;
   const size_t logical_data_cap = conn_max;
 
+  struct MultiPutState {
+    bool active = false;
+    BlockKey key;
+    uint64_t total_len = 0;
+    uint64_t received = 0;
+    uint32_t next_window = 0;
+    uint32_t window_count = 0;
+  };
+  struct MultiGetState {
+    bool active = false;
+    BlockKey key;
+    uint64_t total_capacity = 0;
+    uint64_t next_offset = 0;
+    uint64_t payload_len = 0;
+    uint64_t value_len = 0;
+    uint32_t next_window = 0;
+    uint32_t window_count = 0;
+    const char* payload = nullptr;
+    ibv_mr* payload_mr = nullptr;
+    bool source_uses_slot = false;
+    PreparedRead completion;
+  };
+  std::vector<MultiPutState> multi_put(K);
+  std::vector<MultiGetState> multi_get(K);
+
   struct Request {
     ReqFields fields{};
     uint32_t recv_bytes = 0;
@@ -584,6 +609,8 @@ void RdmaServer::Serve(int boot_fd) {
     size_t data_slot = 0;  // shared receive-segment slot
     const char* contiguous_payload = nullptr;
     RdmaGetFields get;
+    bool multi_put_window = false;
+    bool multi_put_final = false;
   };
 
   auto decode_request = [&](const ibv_wc& completion,
@@ -603,23 +630,75 @@ void RdmaServer::Serve(int boot_fd) {
     request->recv_bytes = completion.byte_len;
     if (write_imm_recv) {
       const size_t data_slot = static_cast<size_t>(ntohl(completion.imm_data));
-      if (data_slot >= K || completion.byte_len < kReqPrefix) return false;
+      if (data_slot >= K || multi_get[data_slot].active) return false;
       const char* frame = recv_lease.data() + data_slot * slot_size +
                           rdma::kV2PutPrefixOffset;
-      if (!DecodeReqVersion(
-              frame, kNativeProtoRdmaV2, &request->fields,
-              static_cast<uint64_t>(logical_data_cap)) ||
-          request->fields.op != static_cast<uint8_t>(WireOp::kCache) ||
-          !rdma::V2PutCompletionIsValid(
-              write_imm_recv, has_immediate, completion.byte_len,
-              request->fields.payload_len, logical_data_cap, slot_size)) {
-        return false;
+      MultiPutState& state = multi_put[data_slot];
+      uint64_t window_bytes = completion.byte_len;
+      if (state.active) {
+        if (completion.byte_len == 0 || state.next_window >= state.window_count ||
+            window_bytes > state.total_len - state.received) {
+          return false;
+        }
+        request->fields.op = static_cast<uint8_t>(WireOp::kCache);
+        request->fields.tenant_hash = state.key.tenant_hash;
+        request->fields.digest_hi = state.key.digest_hi;
+        request->fields.digest_lo = state.key.digest_lo;
+        request->fields.offset = rdma::kV2MultiWrPutMagic;
+        request->fields.length = state.window_count;
+        request->fields.payload_len = state.total_len;
+        state.received += window_bytes;
+        ++state.next_window;
+        request->multi_put_window = true;
+        request->multi_put_final =
+            state.next_window == state.window_count;
+        if (request->multi_put_final !=
+            (state.received == state.total_len)) {
+          return false;
+        }
+        if (request->multi_put_final) state = MultiPutState{};
+      } else {
+        if (completion.byte_len < kReqPrefix ||
+            !DecodeReqVersion(
+                frame, kNativeProtoRdmaV2, &request->fields,
+                static_cast<uint64_t>(logical_data_cap)) ||
+            request->fields.op != static_cast<uint8_t>(WireOp::kCache)) {
+          return false;
+        }
+        if (request->fields.offset == rdma::kV2MultiWrPutMagic) {
+          if (request->fields.length <= 1 ||
+              request->fields.length >
+                  std::numeric_limits<uint32_t>::max() ||
+              request->fields.payload_len == 0) {
+            return false;
+          }
+          window_bytes -= kReqPrefix;
+          if (window_bytes == 0 ||
+              window_bytes >= request->fields.payload_len) {
+            return false;
+          }
+          state.active = true;
+          state.key = request->fields.Key();
+          state.total_len = request->fields.payload_len;
+          state.received = window_bytes;
+          state.next_window = 1;
+          state.window_count =
+              static_cast<uint32_t>(request->fields.length);
+          request->multi_put_window = true;
+        } else if (!rdma::V2PutCompletionIsValid(
+                       write_imm_recv, has_immediate,
+                       completion.byte_len, request->fields.payload_len,
+                       logical_data_cap, slot_size)) {
+          return false;
+        } else {
+          window_bytes = request->fields.payload_len;
+        }
       }
       request->data_slot = data_slot;
       request->contiguous_payload = frame + kReqPrefix;
       v2_put_writes_.fetch_add(1, std::memory_order_relaxed);
       rail_stats.put_writes.fetch_add(1, std::memory_order_relaxed);
-      rail_stats.put_bytes.fetch_add(request->fields.payload_len,
+      rail_stats.put_bytes.fetch_add(window_bytes,
                                      std::memory_order_relaxed);
       return true;
     }
@@ -636,9 +715,16 @@ void RdmaServer::Serve(int boot_fd) {
                             static_cast<uint64_t>(conn_max))) {
         return false;
       }
+      if (multi_put[recv_slot].active ||
+          (request->get.window_index == 0 && multi_get[recv_slot].active)) {
+        return false;
+      }
       return request->get.targets.size() <= rdma::kV2MaxGetTargets;
     }
 
+
+    if (multi_put[recv_slot].active || multi_get[recv_slot].active)
+      return false;
 
     // Other control ops (Exist/Remove/Members/Lookup) with inline payload
     if (completion.byte_len <
@@ -677,6 +763,49 @@ void RdmaServer::Serve(int boot_fd) {
       reply->first_len = response_prefix;
       return true;
     };
+    if (fields.op == static_cast<uint8_t>(WireOp::kRange) &&
+        request.get.window_index != 0) {
+      MultiGetState& state = multi_get[request.data_slot];
+      uint64_t window_capacity = 0;
+      if (!request.get.Capacity(&window_capacity) || !state.active ||
+          multi_put[request.data_slot].active || !(state.key == key) ||
+          request.get.window_count != state.window_count ||
+          request.get.window_index != state.next_window ||
+          request.get.total_capacity != state.total_capacity ||
+          request.get.logical_offset != state.next_offset ||
+          window_capacity == 0 ||
+          window_capacity > state.total_capacity - state.next_offset ||
+          ((state.next_window + 1 == state.window_count) !=
+           (window_capacity == state.total_capacity - state.next_offset))) {
+        state = MultiGetState{};
+        return false;
+      }
+      encode_status(Status::kOk, state.payload_len, state.value_len);
+      reply->first_len = response_prefix;
+      const uint64_t remaining =
+          state.payload_len > state.next_offset
+              ? state.payload_len - state.next_offset
+              : 0;
+      const size_t bytes = static_cast<size_t>(
+          std::min<uint64_t>(remaining, window_capacity));
+      reply->defer_recv_rearm = state.source_uses_slot;
+      reply->recv_slot = request.recv_slot;
+      if (bytes != 0) {
+        reply->remote_write = true;
+        reply->payload = state.payload + state.next_offset;
+        reply->payload_len = bytes;
+        reply->payload_mr = state.payload_mr;
+        reply->targets = request.get.targets;
+      }
+      state.next_offset += window_capacity;
+      ++state.next_window;
+      if (state.next_window == state.window_count) {
+        reply->completion = std::move(state.completion);
+        state = MultiGetState{};
+      }
+      return true;
+    }
+
     auto data_reply = [&](Status status, const char* data, size_t data_len,
                           size_t value_len, ibv_mr* data_mr,
                           bool source_uses_slot,
@@ -687,24 +816,63 @@ void RdmaServer::Serve(int boot_fd) {
         reply->first_len = response_prefix;
         return true;
       }
-      if (successful_len > request.get.Capacity() ||
-          (successful_len != 0 && !data)) {
+      if (successful_len > request.get.total_capacity ||
+          value_len > request.get.total_capacity ||
+          (request.get.window_count > 1 && successful_len != value_len) ||
+          (successful_len != 0 && (!data || !data_mr))) {
         return invalid_reply();
       }
       encode_status(Status::kOk, successful_len, value_len);
       reply->first_len = response_prefix;
-      if (successful_len != 0) {
-        if (!data_mr) return false;
+      if (request.get.window_count == 1) {
+        if (successful_len != 0) {
+          reply->remote_write = true;
+          reply->defer_recv_rearm = source_uses_slot;
+          reply->recv_slot = request.recv_slot;
+          reply->payload = data;
+          reply->payload_len = successful_len;
+          reply->payload_mr = data_mr;
+          reply->targets = request.get.targets;
+          reply->completion = std::move(completion);
+        } else {
+          completion.Commit(Status::kOk, 0, 0.0);
+        }
+        return true;
+      }
+
+      MultiGetState& state = multi_get[request.data_slot];
+      uint64_t window_capacity = 0;
+      if (request.get.window_index != 0 ||
+          request.get.logical_offset != 0 || state.active ||
+          multi_put[request.data_slot].active ||
+          !request.get.Capacity(&window_capacity) ||
+          window_capacity == 0 ||
+          window_capacity >= request.get.total_capacity) {
+        return invalid_reply();
+      }
+      state.active = true;
+      state.key = key;
+      state.total_capacity = request.get.total_capacity;
+      state.next_offset = window_capacity;
+      state.payload_len = successful_len;
+      state.value_len = value_len;
+      state.next_window = 1;
+      state.window_count = request.get.window_count;
+      state.payload = data;
+      state.payload_mr = data_mr;
+      state.source_uses_slot = source_uses_slot;
+      state.completion = std::move(completion);
+      reply->defer_recv_rearm = source_uses_slot;
+      reply->recv_slot = request.recv_slot;
+      const size_t bytes =
+          std::min<size_t>(successful_len,
+                           static_cast<size_t>(window_capacity));
+      if (bytes != 0) {
         reply->remote_write = true;
-        reply->defer_recv_rearm = source_uses_slot;
-        reply->recv_slot = request.recv_slot;
         reply->payload = data;
-        reply->payload_len = successful_len;
+        reply->payload_len = bytes;
         reply->payload_mr = data_mr;
         reply->targets = request.get.targets;
-        reply->completion = std::move(completion);
-      } else {
-        completion.Commit(Status::kOk, 0, 0.0);
       }
       return true;
     };
@@ -782,6 +950,13 @@ void RdmaServer::Serve(int boot_fd) {
       return data_reply(status, output, output_len, value_len,
                         direct_mr(request.data_slot),
                         /*source_uses_slot=*/true, PreparedRead{});
+    }
+
+    if (fields.op == static_cast<uint8_t>(WireOp::kCache) &&
+        request.multi_put_window && !request.multi_put_final) {
+      encode_status(Status::kOk, 0);
+      reply->first_len = response_prefix;
+      return true;
     }
 
     if (fields.op == static_cast<uint8_t>(WireOp::kCache) &&
@@ -985,6 +1160,7 @@ void RdmaServer::Serve(int boot_fd) {
           bool deferred = false;
           bool handled = false;
           if (rq.op == static_cast<uint8_t>(WireOp::kRange) &&
+              request.get.window_count == 1 &&
               direct_buffer(request.data_slot) &&
               direct_mr(request.data_slot) &&
               rq.length <= static_cast<uint64_t>(conn_max)) {
@@ -1011,7 +1187,8 @@ void RdmaServer::Serve(int boot_fd) {
                        !prepared.needs_io()) {
               char* sb = ep.sbuf(qd.send_slot);
               const size_t payload_len = prepared.payload_len();
-              if (payload_len > qd.get.Capacity() ||
+              if (payload_len > qd.get.total_capacity ||
+                  prepared.value_len() > qd.get.total_capacity ||
                   (payload_len != 0 && prepared.data() == nullptr)) {
                 EncodeRespVersion(sb, wire_epoch, Status::kInvalid, 0);
                 qd.reply.first_len = response_prefix;
@@ -1155,7 +1332,8 @@ void RdmaServer::Serve(int boot_fd) {
             }
             continue;
           }
-          if (payload_len > qd.get.Capacity()) {
+          if (payload_len > qd.get.total_capacity ||
+              value_len > qd.get.total_capacity) {
             EncodeRespVersion(sb, wire_epoch, Status::kInvalid, 0);
             if (!post_request_recv(qd.recv_slot) ||
                 !ep.PostSend(qd.send_slot, response_prefix)) {

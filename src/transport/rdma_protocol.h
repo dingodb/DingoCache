@@ -29,6 +29,13 @@ constexpr size_t kV2PutPrefixOffset = kV2DataOffset - kReqPrefix;
 // Keep it equal to the public SG layout's maximum payload width.
 constexpr size_t kV2MaxGetTargets = 29;
 
+// A kCache request with offset=kV2MultiWrPutMagic and length>1 starts an
+// ordered multi-WR PUT. payload_len remains the logical object size; each
+// WRITE_WITH_IMM completion contributes one bounded payload window. The server
+// publishes the object only after exactly `length` windows and payload_len
+// bytes have arrived.
+constexpr uint64_t kV2MultiWrPutMagic = 0x325257495455504dull;  // "MPUTIWR2"
+
 constexpr const char* kV2ProbeDevice = "__dfkv_v2__";
 constexpr uint32_t kV2ProbeMagic = 0x32564644u;  // ASCII "DFV2" (LE)
 constexpr size_t kV2ProbeReplyBytes = 8;
@@ -133,7 +140,9 @@ inline bool DecodeRecvSegmentInfo(const char in[kRecvSegmentInfoBytes],
   info->slot_size = net::GetU64(in + 16);
   return info->rkey != 0 && info->base_addr != 0 &&
          info->slot_size >= kV2DataOffset &&
-         info->slot_size % kV2DataOffset == 0;
+         info->slot_size % kV2DataOffset == 0 &&
+         info->base_addr <=
+             std::numeric_limits<uint64_t>::max() - (info->slot_size - 1);
 }
 
 }  // namespace dfkv::rdma

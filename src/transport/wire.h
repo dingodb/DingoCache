@@ -146,9 +146,10 @@ inline bool DecodeResp(const char* p, Status* st, uint64_t* data_len,
                            value_len);
 }
 
-// RDMA v2 GET carries one or more client destinations after the request prefix.
-// The server returns metadata in the response prefix and RDMA-WRITEs raw value
-// bytes into these regions in order.
+// RDMA v2 GET carries one bounded window of client destinations after the
+// request prefix. window_index/window_count bind multiple ordered requests to
+// one logical lookup; logical_offset selects the slice of the already-read
+// value written by this window.
 struct RdmaWriteTarget {
   uint64_t addr = 0;
   uint32_t rkey = 0;
@@ -157,6 +158,10 @@ struct RdmaWriteTarget {
 
 struct RdmaGetFields {
   std::vector<RdmaWriteTarget> targets;
+  uint32_t window_index = 0;
+  uint32_t window_count = 1;
+  uint64_t logical_offset = 0;
+  uint64_t total_capacity = 0;
 
   bool Capacity(uint64_t* capacity) const {
     if (capacity == nullptr) return false;
@@ -176,8 +181,9 @@ struct RdmaGetFields {
   }
 };
 
-constexpr size_t kRdmaGetFixed = 4;   // target_count(4)
-constexpr size_t kRdmaGetTarget = 16; // addr(8), rkey(4), length(4)
+constexpr uint32_t kRdmaGetWindowMagic = 0x3257474du;  // "MGW2" (LE)
+constexpr size_t kRdmaGetFixed = 32;
+constexpr size_t kRdmaGetTarget = 16;  // addr(8), rkey(4), length(4)
 
 inline size_t RdmaGetFrameSize(size_t target_count) {
   if (target_count >
@@ -188,28 +194,42 @@ inline size_t RdmaGetFrameSize(size_t target_count) {
   return kReqPrefix + kRdmaGetFixed + target_count * kRdmaGetTarget;
 }
 
-inline bool EncodeRdmaGetReq(char* p, size_t cap, const BlockKey& key,
-                             uint64_t offset, uint64_t length,
-                             const std::vector<RdmaWriteTarget>& targets,
-                             size_t* encoded_len) {
+inline bool EncodeRdmaGetReqWindow(
+    char* p, size_t cap, const BlockKey& key, uint64_t offset,
+    uint64_t length, const std::vector<RdmaWriteTarget>& targets,
+    uint32_t window_index, uint32_t window_count, uint64_t logical_offset,
+    uint64_t total_capacity, size_t* encoded_len) {
   const size_t frame_len = RdmaGetFrameSize(targets.size());
   if (p == nullptr || encoded_len == nullptr || frame_len == 0 ||
       frame_len > cap ||
-      targets.size() > std::numeric_limits<uint32_t>::max()) {
+      targets.size() > std::numeric_limits<uint32_t>::max() ||
+      window_count == 0 || window_index >= window_count ||
+      logical_offset > total_capacity || length > total_capacity) {
     return false;
   }
-  uint64_t capacity = 0;
+  uint64_t window_capacity = 0;
   for (const auto& target : targets) {
-    if ((target.length != 0 && (target.addr == 0 || target.rkey == 0)) ||
-        target.length > std::numeric_limits<uint64_t>::max() - capacity) {
+    if ((target.length != 0 &&
+         (target.addr == 0 || target.rkey == 0 ||
+          target.addr >
+              std::numeric_limits<uint64_t>::max() -
+                  (static_cast<uint64_t>(target.length) - 1))) ||
+        target.length >
+            std::numeric_limits<uint64_t>::max() - window_capacity) {
       return false;
     }
-    capacity += target.length;
+    window_capacity += target.length;
   }
-  if (capacity < length) return false;
+  if (window_capacity > total_capacity - logical_offset) return false;
+  if (window_count > 1 && window_capacity == 0) return false;
   EncodeReqVersion(p, kNativeProtoRdmaV2, WireOp::kRange, key, offset, length,
                    0);
   net::PutU32(p + kReqPrefix, static_cast<uint32_t>(targets.size()));
+  net::PutU32(p + kReqPrefix + 4, kRdmaGetWindowMagic);
+  net::PutU32(p + kReqPrefix + 8, window_index);
+  net::PutU32(p + kReqPrefix + 12, window_count);
+  net::PutU64(p + kReqPrefix + 16, logical_offset);
+  net::PutU64(p + kReqPrefix + 24, total_capacity);
   char* out = p + kReqPrefix + kRdmaGetFixed;
   for (const auto& target : targets) {
     net::PutU64(out, target.addr);
@@ -221,39 +241,71 @@ inline bool EncodeRdmaGetReq(char* p, size_t cap, const BlockKey& key,
   return true;
 }
 
+inline bool EncodeRdmaGetReq(char* p, size_t cap, const BlockKey& key,
+                             uint64_t offset, uint64_t length,
+                             const std::vector<RdmaWriteTarget>& targets,
+                             size_t* encoded_len) {
+  uint64_t capacity = 0;
+  for (const auto& target : targets) {
+    if (target.length > std::numeric_limits<uint64_t>::max() - capacity)
+      return false;
+    capacity += target.length;
+  }
+  return EncodeRdmaGetReqWindow(p, cap, key, offset, length, targets, 0, 1, 0,
+                                capacity, encoded_len);
+}
+
 inline bool DecodeRdmaGetReq(const char* p, size_t frame_len, ReqFields* req,
                              RdmaGetFields* get,
                              uint64_t max_payload = kMaxFrameLen) {
   if (frame_len < kReqPrefix + kRdmaGetFixed ||
       !DecodeReqVersion(p, kNativeProtoRdmaV2, req, max_payload) ||
       req->op != static_cast<uint8_t>(WireOp::kRange) ||
-      req->payload_len != 0) {
+      req->payload_len != 0 ||
+      net::GetU32(p + kReqPrefix + 4) != kRdmaGetWindowMagic) {
     return false;
   }
   const uint32_t count = net::GetU32(p + kReqPrefix);
   const size_t expected = RdmaGetFrameSize(count);
   if (expected == 0 || expected != frame_len) return false;
+  get->window_index = net::GetU32(p + kReqPrefix + 8);
+  get->window_count = net::GetU32(p + kReqPrefix + 12);
+  get->logical_offset = net::GetU64(p + kReqPrefix + 16);
+  get->total_capacity = net::GetU64(p + kReqPrefix + 24);
+  if (get->window_count == 0 ||
+      get->window_index >= get->window_count ||
+      get->logical_offset > get->total_capacity ||
+      get->total_capacity > max_payload ||
+      req->length > get->total_capacity ||
+      req->offset > std::numeric_limits<uint64_t>::max() - req->length) {
+    return false;
+  }
   get->targets.clear();
   get->targets.reserve(count);
   const char* in = p + kReqPrefix + kRdmaGetFixed;
-  uint64_t capacity = 0;
+  uint64_t window_capacity = 0;
   for (uint32_t i = 0; i < count; ++i) {
     RdmaWriteTarget target;
     target.addr = net::GetU64(in);
     target.rkey = net::GetU32(in + 8);
     target.length = net::GetU32(in + 12);
-    if (target.length != 0 && (target.addr == 0 || target.rkey == 0)) {
+    if (target.length != 0 &&
+        (target.addr == 0 || target.rkey == 0 ||
+         target.addr >
+             std::numeric_limits<uint64_t>::max() -
+                 (static_cast<uint64_t>(target.length) - 1))) {
       return false;
     }
-    if (capacity > std::numeric_limits<uint64_t>::max() - target.length) {
+    if (target.length >
+        std::numeric_limits<uint64_t>::max() - window_capacity) {
       return false;
     }
-    capacity += target.length;
+    window_capacity += target.length;
     get->targets.push_back(target);
     in += kRdmaGetTarget;
   }
-  if (capacity < req->length) return false;
-  return true;
+  return (get->window_count == 1 || window_capacity != 0) &&
+         window_capacity <= get->total_capacity - get->logical_offset;
 }
 
 }  // namespace dfkv

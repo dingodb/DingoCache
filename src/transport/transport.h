@@ -314,14 +314,17 @@ class Transport {
          valid_i < indices.size() && valid_i < valid_result.size(); ++valid_i) {
       const size_t i = indices[valid_i];
       result[i] = valid_result[valid_i];
-      if (result[i] != Status::kOk || valid_i >= stored.size()) continue;
-      if (stored[valid_i] > std::numeric_limits<size_t>::max()) {
+      if (result[i] != Status::kOk) continue;
+      if (valid_i >= stored.size()) {
         result[i] = Status::kInvalid;
         continue;
       }
-      size_t remaining =
-          std::min<size_t>(static_cast<size_t>(stored[valid_i]),
-                           scratch[i].size());
+      if (stored[valid_i] > std::numeric_limits<size_t>::max() ||
+          static_cast<size_t>(stored[valid_i]) > scratch[i].size()) {
+        result[i] = Status::kInvalid;
+        continue;
+      }
+      size_t remaining = static_cast<size_t>(stored[valid_i]);
       size_t off = 0;
       for (const auto& p : dsts[i].payloads) {
         const size_t copy = std::min(p.second, remaining);

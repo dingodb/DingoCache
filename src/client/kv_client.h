@@ -54,7 +54,7 @@ struct KvGetItem { std::string key; void* out; size_t n; };
 // is the in-order concatenation of the segments; segment boundaries are purely
 // client-side (the server stores one opaque blob). ptrs.size() == sizes.size();
 // dsts.size() == caps.size(). Used by the additive C ABI dfkv_batch_put_sg /
-// dfkv_batch_get_auto_sg to coalesce many tiny KV chunks into one key/RDMA op.
+// dfkv_batch_get_auto_sg; N may exceed one transport WR's SGE width.
 struct KvPutItemSg {
   std::string key;
   std::vector<const void*> ptrs;
@@ -109,16 +109,15 @@ class KVClient {
   std::vector<bool> BatchRemove(const std::vector<std::string>& keys);
 
   // Scatter-gather batch put: each key gathers its N source segments into one
-  // stored blob (sum of sizes). Mirrors BatchPut (consistent-hash routing per key,
-  // group by node, zero-copy multi-SGE gather where supported). Per-item result.
-  // A key exceeding the active transport's runtime segment limit, whose total
-  // value size is zero, or whose byte sum overflows size_t is reported failed
-  // rather than routed.
+  // stored blob (sum of sizes). Mirrors BatchPut (consistent-hash routing per
+  // key, group by node, zero-copy bounded multi-WR gather where required).
+  // Descriptor count is arbitrary; zero total size or a byte-sum overflow fails
+  // the item before routing.
   std::vector<bool> BatchPutSg(const std::vector<KvPutItemSg>& items);
   // Scatter-gather variable-size batch get: each key's stored blob is scattered
-  // across its N destination segments in order. Mirrors BatchGetAuto: accepts a
-  // stored size <= the checked sum(caps); overflow or a runtime segment-limit
-  // violation is a miss. out_lens receives the true length (0 on miss).
+  // across its N destination segments in order. Mirrors BatchGetAuto and accepts
+  // a stored size <= the checked sum(caps). Descriptor count is arbitrary;
+  // overflow is a miss. out_lens receives the true length (0 on miss).
   std::vector<bool> BatchGetAutoSg(const std::vector<KvGetItemSg>& items,
                                    std::vector<size_t>* out_lens);
 
@@ -139,9 +138,8 @@ class KVClient {
     return t_->RegisterMemory(base, size);
   }
 
-  // Runtime payload-segment limit reported by the active transport. Connectors
-  // query this through dfkv_max_sg_segs and must not assume a fixed HCA or
-  // transport capability.
+  // Runtime payload-segment width of one transport window. Logical SG calls may
+  // exceed it: the transport splits them into one ordered operation internally.
   size_t MaxSgPayloadSegs() const { return t_->MaxSgPayloadSegs(); }
 
   // Hot-swap the cluster membership (rebuilds the consistent-hash ring).

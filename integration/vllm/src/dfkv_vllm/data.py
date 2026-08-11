@@ -5,6 +5,8 @@
 # (vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/).
 """Data classes for DfkvStoreConnector."""
 
+import hashlib
+
 from collections.abc import Iterable, Sequence
 from dfkv_common import pool_key
 from dataclasses import dataclass
@@ -23,6 +25,20 @@ from vllm.v1.core.kv_cache_utils import (
 )
 
 logger = init_logger(__name__)
+
+# Source-controlled object-layout discriminator. It is framed into every pool
+# key and also binds the native namespace, so sg-v1 and multiwr-v2 objects can
+# never collide or be read through a compatibility fallback.
+VLLM_MULTIWR_V2 = b"vllm-multiwr-v2"
+
+def key_diagnostic_label(key: bytes) -> str:
+    """Return the standard non-reversible diagnostic label for a store key."""
+    try:
+        return f"len={len(key)} sha256={hashlib.sha256(key).hexdigest()[:16]}"
+    except Exception:
+        # Diagnostics must never turn a successfully transferred key into an
+        # application-visible failure.
+        return "<key unavailable>"
 
 
 def split_block_contiguous_runs(
@@ -142,7 +158,7 @@ class PoolKey:
             pp_size=self.key_metadata.pp_size,
             pp_rank=self.key_metadata.pp_rank,
             group_id=self.key_metadata.group_id,
-            component="all",
+            component=VLLM_MULTIWR_V2.decode("ascii"),
         )
 
 
@@ -193,7 +209,7 @@ class ChunkedTokenDatabase:
     def prepare_value(
         self, start: int, end: int, block_ids: list[int]
     ) -> tuple[list[int], list[int], int]:
-        """Compute memory addresses and sizes for an aligned token range."""
+        """Return one logical chunk's complete, canonically ordered SG vector."""
         if (
             start < 0
             or end <= start

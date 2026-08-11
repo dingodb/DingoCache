@@ -179,6 +179,11 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "integration" / "common" / "src"))
 sys.path.insert(0, str(ROOT / "integration" / "vllm" / "src"))
 
+from dfkv_common import VLLM_RAW_V1, pool_key  # noqa: E402
+from dfkv_vllm.data import (  # noqa: E402
+    KeyMetadata,
+    PoolKey,
+)
 from dfkv_vllm.metrics import (  # noqa: E402
     DfkvStoreConnectorStats,
     DfkvStorePromMetrics,
@@ -311,6 +316,59 @@ class SchedulerLookupTest(unittest.TestCase):
 
         self.assertEqual(scheduler.get_num_new_matched_tokens(request, 0), (0, False))
         self.assertEqual(client.calls[0][2], ())
+
+
+class LogicalChunkNamespaceTest(unittest.TestCase):
+    def test_multiwr_v2_component_isolated_from_legacy_layouts(self) -> None:
+        metadata = KeyMetadata(
+            model_name="model",
+            dp_size=2,
+            dp_rank=1,
+            tp_size=4,
+            tp_rank=3,
+            pcp_size=1,
+            pcp_rank=0,
+            dcp_size=1,
+            dcp_rank=0,
+            pp_size=2,
+            pp_rank=1,
+            group_id=5,
+        )
+        chunk_hash = bytes(range(32))
+        generated = PoolKey(metadata, chunk_hash).to_bytes()
+        coordinates = dict(
+            pool="kv",
+            dp_size=2,
+            dp_rank=1,
+            tp_size=4,
+            tp_rank=3,
+            pcp_size=1,
+            pcp_rank=0,
+            dcp_size=1,
+            dcp_rank=0,
+            pp_size=2,
+            pp_rank=1,
+            group_id=5,
+        )
+        expected_v2 = pool_key(
+            chunk_hash,
+            component="vllm-multiwr-v2",
+            **coordinates,
+        )
+        legacy_raw = pool_key(
+            chunk_hash,
+            component=VLLM_RAW_V1,
+            **coordinates,
+        )
+        legacy_sg = pool_key(
+            chunk_hash,
+            component="sg-v1",
+            **coordinates,
+        )
+
+        self.assertEqual(generated, expected_v2)
+        self.assertNotEqual(generated, legacy_raw)
+        self.assertNotEqual(generated, legacy_sg)
 
 
 class _PromMetric:
