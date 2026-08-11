@@ -14,7 +14,7 @@ offload staging, ReplicateConfig/preferred_segment) are dropped.
 """
 
 import dataclasses
-import hashlib
+import logging
 import os
 import queue
 import socket
@@ -27,10 +27,8 @@ from typing import Any, TypeVar
 
 import torch
 from dfkv_common import (
-    VLLM_RAW_V1,
     canonical_namespace,
     reject_namespace_override,
-    sg_key,
 )
 import zmq
 
@@ -63,11 +61,13 @@ from .coordinator import (
     DfkvStoreCoordinator,
 )
 from .data import (
+    VLLM_MULTIWR_V2,
     ChunkedTokenDatabase,
     DfkvStoreConnectorMetadata,
     KeyMetadata,
     PoolKey,
     ReqMeta,
+    key_diagnostic_label,
     split_block_contiguous_runs,
 )
 from .dfkv_client import DfkvDeviceClient
@@ -93,10 +93,6 @@ def _rotate_list(values: list[_T], offset: int) -> list[_T]:
     return values[offset:] + values[:offset]
 
 
-def _sum_batch_bytes(sizes: list[list[int]]) -> int:
-    return sum(sum(size) for size in sizes)
-
-
 # dfkv: Removed Mooncake-store-only helpers:
 #   * disk-offload staging budget math (_align_up,
 #     _estimate_disk_offload_staging_bytes, _get_usable_disk_offload_buffer
@@ -110,10 +106,8 @@ def _sum_batch_bytes(sizes: list[list[int]]) -> int:
 #     _HANDLE pressure code -- dfkv is configured via kv_connector_extra_config
 #     and has no embedded/standalone-store topology or offload pressure signal.
 
-
-# dfkv: batch_put returns a per-key rc (0 == ok, non-zero == failure); a GET
-# returns (hits, lens) with hit in {0, 1}. These helpers normalize the two
-# dfkv return shapes into the (failed-index list) shape the threads expect.
+# dfkv: batch_put returns a per-key rc (0 == ok, non-zero == failure).
+# Normalize that result into the failed-index list the send thread expects.
 def _put_failed_indices(rcs: list[int]) -> list[int]:
     return [i for i, rc in enumerate(rcs) if rc != 0]
 
@@ -464,50 +458,35 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if not keys:
                 return
 
-            # Stored values use explicit scatter-group coordinates (see
-            # _group_segments_sg). A chunk is "stored" only when EVERY group
-            # of it is present: group 0 alone is a partial write (a sibling
-            # group failed or was evicted) whose load would fail wholesale,
-            # so it must be rewritten, not skipped in place. Lookup probes
-            # the same full set so both paths agree on "present". Probing
-            # the bare pool key would miss every stored group and defeat
-            # deduplication.
-            max_sg_segs = _sg_segs_of(self.client)
-            probe_keys: list[bytes] = []
-            probe_owner: list[int] = []
-            for i, (k, s, e) in enumerate(zip(keys, starts, ends, strict=True)):
-                for grp in range(
-                    _num_sg_groups(
-                        self.token_databases[group_indices[i]], e - s, max_sg_segs
-                    )
-                ):
-                    probe_keys.append(_sg_group_key(k, grp, max_sg_segs))
-                    probe_owner.append(i)
+            # A multiwr-v2 chunk is exactly one dfkv object. The native client
+            # owns any HCA-width windowing, so dedup probes the logical keys
+            # directly and a missing object is rewritten as a whole.
             save_exists_start = time.perf_counter()
             try:
-                exists_states = self.client.batch_exist(probe_keys)
+                exists_states = self.client.batch_exist(keys)
+                if len(exists_states) != len(keys):
+                    raise RuntimeError(
+                        "batch_exist returned incomplete per-key results: "
+                        f"keys={len(keys)} statuses={len(exists_states)}"
+                    )
             except Exception:
                 self._record_operation(
                     "save_exists",
                     save_exists_start,
-                    len(probe_keys),
+                    len(keys),
                     num_logical_keys=len(keys),
                     status="error",
-                    num_failed_keys=len(probe_keys),
+                    num_failed_keys=len(keys),
                 )
                 raise
             self._record_operation(
                 "save_exists",
                 save_exists_start,
-                len(probe_keys),
+                len(keys),
                 num_logical_keys=len(keys),
             )
-            chunk_missing = [False] * len(keys)
-            for owner, exists in zip(probe_owner, exists_states, strict=True):
-                if exists != 1:
-                    chunk_missing[owner] = True
             missing_indices = [
-                i for i, missing in enumerate(chunk_missing) if missing
+                i for i, exists in enumerate(exists_states) if exists != 1
             ]
 
             if not missing_indices:
@@ -563,104 +542,75 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if current_event is not None:
                 current_event.synchronize()
 
-            # Coalesce each chunk's per-layer segments into one raw dfkv value
-            # per explicit scatter group. This cuts the key count ~20x
-            # (25392 -> ~1242), making loads bandwidth-bound rather than
-            # per-key-bound.
-            sg_keys, sg_ptrs, sg_sizes, sg_owner = _group_segments_sg(
-                keys, addrs, sizes, _sg_segs_of(self.client)
-            )
-            batch_bytes = sum(sum(s) for s in sg_sizes)
+            # One key and one complete segment vector represent each logical
+            # chunk. libdfkv splits vectors wider than the negotiated HCA SGE
+            # limit into ordered WR windows under one object completion.
+            batch_bytes = sum(sum(s) for s in sizes)
+            num_segments = sum(len(s) for s in sizes)
             put_start = time.perf_counter()
+            successful_events: list[BlockStored] = []
             try:
-                res = self.client.batch_put_sg(sg_keys, sg_ptrs, sg_sizes)
+                res = self.client.batch_put_sg(keys, addrs, sizes)
+                if len(res) != len(keys):
+                    raise RuntimeError(
+                        "batch_put_sg returned incomplete per-key results: "
+                        f"keys={len(keys)} statuses={len(res)}"
+                    )
                 failed = _put_failed_indices(res)
+                if stored_events:
+                    successful_events = [
+                        event
+                        for event, rc in zip(stored_events, res, strict=True)
+                        if rc == 0
+                    ]
                 self._record_operation(
                     "save_put",
                     put_start,
-                    len(sg_keys),
+                    len(keys),
                     num_logical_keys=len(keys),
                     num_bytes=batch_bytes,
                     status="partial_failure" if failed else "ok",
                     num_failed_keys=len(failed),
                 )
                 logger.debug(
-                    "dfkv save_put: keys=%d bytes=%d ms=%.1f failed=%d",
-                    len(sg_keys), batch_bytes,
+                    "dfkv save_put: keys=%d segments=%d bytes=%d ms=%.1f "
+                    "failed=%d",
+                    len(keys), num_segments, batch_bytes,
                     (time.perf_counter() - put_start) * 1000.0, len(failed),
                 )
-                if failed:
+                if failed and logger.isEnabledFor(logging.WARNING):
                     failed_codes = set(res[i] for i in failed)
-                    # dfkv: write failure is non-fatal -- count + drop this
-                    # request's save; dfkv's peer-health marks the bad peer and
-                    # short-circuits. Never block inference.
+                    # A native multi-WR failure fails the object atomically.
+                    # Dropping this save is non-fatal to inference; no sibling
+                    # physical keys exist to probe or scrub.
                     logger.warning(
                         "batch_put_sg failed: %d/%d keys failed "
                         "(codes=%s, batch_bytes=%d), first_key=%s",
                         len(failed),
-                        len(sg_keys),
+                        len(keys),
                         failed_codes,
                         batch_bytes,
-                        _key_label(sg_keys[0]) if sg_keys else "N/A",
+                        key_diagnostic_label(keys[0]) if keys else "N/A",
                     )
-                    # Scrub every sibling group key of each failed chunk so no
-                    # half-stored chunk (group 0 in, siblings out) burns ring
-                    # capacity until eviction; the dedup probe above already
-                    # refuses to call such a chunk stored. Best-effort: never
-                    # raises, skipped entirely without a remove RPC.
-                    rm_start = time.perf_counter()
-                    rm_supported, rm_attempted, rm_confirmed = (
-                        _remove_partial_sg_groups(
-                            self.client, sg_keys, sg_owner, failed
-                        )
-                    )
-                    if rm_attempted:
-                        self._record_operation(
-                            "save_remove_partial",
-                            rm_start,
-                            rm_attempted,
-                            num_logical_keys=len({sg_owner[i] for i in failed}),
-                            status="ok" if rm_confirmed == rm_attempted
-                            else "partial_failure",
-                            num_failed_keys=rm_attempted - rm_confirmed,
-                        )
-                        logger.debug(
-                            "dfkv save partial-group cleanup: removed %d/%d "
-                            "sibling keys of %d failed chunk(s)",
-                            rm_confirmed,
-                            rm_attempted,
-                            len({sg_owner[i] for i in failed}),
-                        )
-                    elif not rm_supported:
-                        self._record_operation(
-                            "save_remove_partial",
-                            rm_start,
-                            0,
-                            status="unsupported",
-                        )
-                        logger.debug(
-                            "dfkv client has no remove RPC; %d failed chunk(s) "
-                            "keep partial-group residue until eviction",
-                            len({sg_owner[i] for i in failed}),
-                        )
             except Exception as e:
                 self._record_operation(
                     "save_put",
                     put_start,
-                    len(sg_keys),
+                    len(keys),
                     num_logical_keys=len(keys),
                     num_bytes=batch_bytes,
                     status="error",
-                    num_failed_keys=len(sg_keys),
+                    num_failed_keys=len(keys),
                 )
-                logger.error(
-                    "Failed to put keys %s, error: %s",
-                    [_key_label(key) for key in sg_keys[:3]],
-                    e,
-                )
+                if logger.isEnabledFor(logging.ERROR):
+                    logger.error(
+                        "Failed to put keys %s, error: %s",
+                        [key_diagnostic_label(key) for key in keys[:3]],
+                        e,
+                    )
 
-            if self.enable_kv_event and stored_events:
-                self.update_kv_event(stored_events)
+            if self.enable_kv_event and successful_events:
+                self.update_kv_event(successful_events)
         finally:
             with self._active_cv:
                 self._active_req_id = None
@@ -770,87 +720,105 @@ class KVCacheStoreRecvingThread(KVTransferThread):
 
             # Rotate aligned lists by tp_rank for load balancing.
             rotation = self.tp_rank % len(key_list)
-            key_list_c = _rotate_list(key_list, rotation)
-            addr_list_c = _rotate_list(addr_list, rotation)
-            size_list_c = _rotate_list(size_list, rotation)
-            block_id_list_c = _rotate_list(block_id_list, rotation)
+            rotated_keys = _rotate_list(key_list, rotation)
+            rotated_addrs = _rotate_list(addr_list, rotation)
+            rotated_sizes = _rotate_list(size_list, rotation)
+            rotated_block_ids = _rotate_list(block_id_list, rotation)
 
-            # dfkv: A GET is one batch -- dfkv has no owner-side DirectIO staging
-            # budget, so the Mooncake disk-offload sub-batch split is dropped.
-            # Flatten per-key scatter-gather to one (ptr, cap) per dfkv key, then
-            # map each flattened result back to its originating block id for error
-            # reporting (see _group_segments_sg / seg_owner).
-            # Resolve the client BEFORE grouping: the SG width (and with it the
-            # on-wire key names) comes from the live transport.
+            # dfkv: one logical chunk is one batch key with its complete
+            # destination segment vector. libdfkv performs any HCA-width
+            # multi-WR windowing without changing object identity.
             client = self.client
             if client is None and self.client_provider is not None:
                 client = self.client_provider()  # lazy un-elide
                 if client is not None:
                     self.client = client
-            sg_keys, sg_ptrs, sg_caps, sg_owner = _group_segments_sg(
-                key_list_c, addr_list_c, size_list_c, _sg_segs_of(client)
-            )
             self._record_observation("geometry_preparation", geometry_start)
-            sg_totals = [sum(c) for c in sg_caps]
-            batch_bytes = sum(sg_totals)
+            chunk_totals = [sum(chunk_sizes) for chunk_sizes in rotated_sizes]
+            batch_bytes = sum(chunk_totals)
+            num_segments = sum(len(chunk_sizes) for chunk_sizes in rotated_sizes)
 
             load_get_start = time.perf_counter()
             try:
-                # dfkv: one scatter-gather GET per coalesced key -> (hits, lens). The
-                # server returns one blob; the RDMA recv SGE list scatters it back
-                # into this chunk's per-layer segments. hit == 1 + len == sum(caps)
-                # means the chunk loaded; a miss or short read marks the originating
-                # block as a load error so vLLM recomputes that span (never fatal).
+                # The native logical operation publishes a hit only after every
+                # ordered WR window completes. Require the exact stored length;
+                # misses and either short or oversized objects fail the chunk
+                # closed and force vLLM to recompute it.
                 if client is None:  # no client (un-elide failed): miss -> recompute
-                    hits, lens = [False] * len(sg_keys), [0] * len(sg_keys)
+                    hits, lens = [False] * len(rotated_keys), [0] * len(rotated_keys)
                 else:
-                    hits, lens = client.batch_get_auto_sg(sg_keys, sg_ptrs, sg_caps)
-                failed_block_ids: list[int] = []
-                failed_detail: list[tuple[str, int]] = []
-                for i, (hit, got_len) in enumerate(zip(hits, lens, strict=True)):
-                    if hit != 1 or got_len < sg_totals[i]:
-                        failed_block_ids.append(block_id_list_c[sg_owner[i]])
-                        failed_detail.append((_key_label(sg_keys[i]), hit))
-                self._record_operation(
-                    "load_get",
-                    load_get_start,
-                    len(sg_keys),
-                    num_logical_keys=len(key_list_c),
-                    num_bytes=batch_bytes,
-                    status="partial_failure" if failed_block_ids else "ok",
-                    num_failed_keys=len(failed_block_ids),
-                )
-                logger.debug(
-                    "dfkv load_get: req=%s keys=%d bytes=%d ms=%.1f failed=%d",
-                    req_id, len(sg_keys), batch_bytes,
-                    (time.perf_counter() - load_get_start) * 1000.0,
-                    len(failed_block_ids),
-                )
-                if failed_block_ids:
-                    self._add_load_error_block_ids(failed_block_ids)
-                    logger.warning(
-                        "Failed to get %d dfkv keys from batch "
-                        "(batch_keys=%d, first_failures=%s)",
-                        len(failed_block_ids),
-                        len(sg_keys),
-                        failed_detail[:3],
+                    hits, lens = client.batch_get_auto_sg(
+                        rotated_keys, rotated_addrs, rotated_sizes
+                    )
+                if len(hits) != len(rotated_keys) or len(lens) != len(rotated_keys):
+                    raise RuntimeError(
+                        "batch_get_auto_sg returned incomplete per-key results: "
+                        f"keys={len(rotated_keys)} hits={len(hits)} lens={len(lens)}"
                     )
             except Exception as e:
-                self._add_load_error_block_ids(block_id_list_c)
+                self._add_load_error_block_ids(rotated_block_ids)
                 self._record_operation(
                     "load_get",
                     load_get_start,
-                    len(sg_keys),
-                    num_logical_keys=len(key_list_c),
+                    len(rotated_keys),
+                    num_logical_keys=len(rotated_keys),
                     num_bytes=batch_bytes,
                     status="error",
-                    num_failed_keys=len(sg_keys),
+                    num_failed_keys=len(rotated_keys),
                 )
-                logger.warning(
-                    "Failed to get dfkv batch %s, error: %s",
-                    [_key_label(key) for key in sg_keys[:3]],
-                    e,
-                )
+                if logger.isEnabledFor(logging.WARNING):
+                    logger.warning(
+                        "Failed to get dfkv batch %s, error: %s",
+                        [
+                            key_diagnostic_label(key)
+                            for key in rotated_keys[:3]
+                        ],
+                        e,
+                    )
+                return
+
+            failed_indices = [
+                i
+                for i, (hit, got_len) in enumerate(zip(hits, lens, strict=True))
+                if hit != 1 or got_len != chunk_totals[i]
+            ]
+            failed_block_ids = [rotated_block_ids[i] for i in failed_indices]
+            self._record_operation(
+                "load_get",
+                load_get_start,
+                len(rotated_keys),
+                num_logical_keys=len(rotated_keys),
+                num_bytes=batch_bytes,
+                status="partial_failure" if failed_block_ids else "ok",
+                num_failed_keys=len(failed_block_ids),
+            )
+            logger.debug(
+                "dfkv load_get: req=%s keys=%d segments=%d bytes=%d "
+                "ms=%.1f failed=%d",
+                req_id, len(rotated_keys), num_segments, batch_bytes,
+                (time.perf_counter() - load_get_start) * 1000.0,
+                len(failed_block_ids),
+            )
+            if failed_block_ids:
+                self._add_load_error_block_ids(failed_block_ids)
+                if logger.isEnabledFor(logging.WARNING):
+                    failed_detail = [
+                        (
+                            key_diagnostic_label(rotated_keys[i]),
+                            hits[i],
+                            lens[i],
+                            chunk_totals[i],
+                        )
+                        for i in failed_indices[:3]
+                    ]
+                    logger.warning(
+                        "Failed to get %d dfkv keys from batch "
+                        "(batch_keys=%d, first_failures="
+                        "[(key, hit, got, expected)]=%s)",
+                        len(failed_block_ids),
+                        len(rotated_keys),
+                        failed_detail,
+                    )
 
         except Exception as e:
             # Any unexpected failure in the load path -> recompute this
@@ -882,115 +850,6 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             self.set_finished_request(req_meta.req_id)
 
 
-# Maximum raw-payload segments gathered into one scatter-group object.
-# The ConnectX-era default is max_sge=30 minus one request-prefix SGE. The
-# negotiated value comes from ``dfkv_max_sg_segs``; the fallback is encoded in
-# the binary SG object-key coordinate (see ``_sg_group_key``).
-SG_MAX_SEGS = 29
-
-
-# Live SG width of a client's transport, cached on the client object (device
-# caps don't change under a running process). None / old libs => the default.
-def _sg_segs_of(client: Any) -> int:
-    if client is None:
-        return SG_MAX_SEGS
-    v = getattr(client, "_sg_segs_cache", None)
-    if v is None:
-        try:
-            v = int(client.max_sg_segs()) or SG_MAX_SEGS
-        except Exception:  # older libdfkv without dfkv_max_sg_segs
-            v = SG_MAX_SEGS
-        client._sg_segs_cache = v
-    return v
-
-def _key_label(key: bytes) -> str:
-    """Return a deterministic JSON/text-safe representation of a binary key."""
-    return f"len={len(key)} sha256={hashlib.sha256(key).hexdigest()[:16]}"
-
-
-# Scatter geometry is always explicit in the physical key.
-def _sg_group_key(key: bytes, grp: int, max_segs: int) -> bytes:
-    return sg_key(key, max_segs, grp)
-
-
-# Coalesce each chunk's per-layer segments into explicit scatter-group keys.
-# Each group is one raw dfkv value written through one RDMA multi-SGE operation.
-# owner[i] maps each physical key back to its source chunk for error attribution.
-def _group_segments_sg(
-    keys: list[bytes],
-    addrs: list[list[int]],
-    sizes: list[list[int]],
-    max_segs: int = SG_MAX_SEGS,
-) -> tuple[list[bytes], list[list[int]], list[list[int]], list[int]]:
-    sg_keys: list[bytes] = []
-    sg_ptrs: list[list[int]] = []
-    sg_sizes: list[list[int]] = []
-    sg_owner: list[int] = []
-    for key_idx, (key, addr, size) in enumerate(zip(keys, addrs, sizes, strict=True)):
-        grp = 0
-        for off in range(0, len(addr), max_segs):
-            sg_keys.append(_sg_group_key(key, grp, max_segs))
-            sg_ptrs.append(list(addr[off:off + max_segs]))
-            sg_sizes.append(list(size[off:off + max_segs]))
-            sg_owner.append(key_idx)
-            grp += 1
-    return sg_keys, sg_ptrs, sg_sizes, sg_owner
-
-
-# How many explicit scatter-group values _group_segments_sg emits for one
-# chunk. Probing only group 0 would treat a partially-written chunk (group 0
-# present, a sibling group lost to a failed put or eviction) as stored, so
-# dedup/lookup must enumerate this exact set to agree with SAVE/LOAD on what
-# "present" means. Layout selection mirrors data.py prepare_value: the exact
-# per-run seg layout when installed, else the legacy flat base/len tables
-# (one segment per layer per block). An unknown layout (unit-test doubles)
-# degrades to a single group -- the pre-fix probe geometry.
-def _num_sg_groups(db: Any, token_span: int, max_segs: int) -> int:
-    layout = getattr(db, "_seg_layout", None)
-    if layout is not None:
-        segs_per_block = len(layout)
-    else:
-        segs_per_block = max(
-            len(getattr(db, "kv_caches_base_addr", None) or ()),
-            len(getattr(db, "block_len", None) or ()),
-        )
-    num_segments = segs_per_block * (token_span // db.block_size)
-    return max(1, (num_segments + max_segs - 1) // max_segs)
-
-
-# Best-effort remove of every group key of each failed chunk after a partial
-# batch_put_sg: a chunk whose group 0 landed while a sibling failed is
-# half-stored -- probing alone now refuses to call it present, but the
-# orphan still burns ring capacity until eviction. Removing the whole chunk
-# makes the next save a clean full rewrite. Returns (supported, attempted,
-# confirmed); never raises and never blocks the save path. Clients without a
-# remove RPC (older libdfkv) report supported=False and are skipped.
-def _remove_partial_sg_groups(
-    client: Any,
-    sg_keys: list[bytes],
-    sg_owner: list[int],
-    failed: list[int],
-) -> tuple[bool, int, int]:
-    if not failed:
-        return False, 0, 0
-    remove = getattr(client, "batch_remove", None)
-    if remove is None:
-        return False, 0, 0
-    try:
-        supports = getattr(client, "supports_remove", None)
-        if callable(supports) and not supports():
-            return False, 0, 0
-    except Exception:
-        return False, 0, 0
-    bad_chunks = {sg_owner[i] for i in failed}
-    siblings = [k for j, k in enumerate(sg_keys) if sg_owner[j] in bad_chunks]
-    if not siblings:
-        return False, 0, 0
-    try:
-        per_key = remove(siblings)
-    except Exception:
-        return True, len(siblings), 0
-    return True, len(siblings), sum(1 for ok in per_key if ok)
 
 
 # ============================================================
@@ -1171,7 +1030,7 @@ class DfkvStoreWorker:
         )
         key_namespace = canonical_namespace(
             model_identity,
-            VLLM_RAW_V1,
+            VLLM_MULTIWR_V2.decode("ascii"),
             tenant_id=str(extra.get("tenant_id", "default")),
             model_revision=str(_model_revision),
             dtype=_cache_dtype,
@@ -1181,6 +1040,7 @@ class DfkvStoreWorker:
             dp_size=self.dp_size,
             pp_size=self.pp_size,
             layout_fields={
+                "storage_layout": VLLM_MULTIWR_V2.decode("ascii"),
                 "cache_dtype": _cache_dtype,
                 "model_dtype": str(getattr(model_config, "dtype", "unknown")),
                 "block_size": self.block_size,
@@ -1427,8 +1287,11 @@ class DfkvStoreWorker:
             [] for _ in self.token_dbs
         ]
 
-        for layer_name, value in kv_caches.items():
-            cache = _repr_tensor(value)
+        # Dict insertion order is not a storage-layout contract. Canonicalize by
+        # semantic layer name so independently constructed producer/consumer
+        # mappings gather and scatter the same ordered byte stream.
+        for layer_name in sorted(kv_caches):
+            cache = _repr_tensor(kv_caches[layer_name])
             cache_storage = cache.untyped_storage()
             base_addr = cache_storage.data_ptr()
             region_len = cache_storage.nbytes()
@@ -1730,12 +1593,10 @@ class DfkvStoreWorker:
         if not block_hashes or token_len <= 0:
             return 0
 
-        # Build per-(group, hash) candidate keys expanded across TP/PP.
-        # candidate_meta[i] is the (group_id, hash_bytes) for candidate_keys[i].
+        # Build one physical object candidate per logical (group, hash, TP, PP)
+        # coordinate. candidate_meta maps each object back to the logical chunk.
         candidate_keys: list[bytes] = []
         candidate_meta: list[tuple[int, bytes]] = []
-        # Per-(group_id, hash) hit count required to call the chunk present:
-        # TP*PP rank replicas x the chunk's number of scatter groups.
         expected_per_chunk: dict[tuple[int, bytes], int] = {}
         tp_count = min(self.tp_size, self.num_kv_head)
         # dfkv: gate candidates by store_mask -- the SAME per-(group,chunk) set
@@ -1749,8 +1610,6 @@ class DfkvStoreWorker:
             token_len // self.coord.lcm_block_size * self.coord.lcm_block_size
         )
         store_masks = self.coord.store_mask(aligned_token_len)
-        # SG width is fixed per client/transport; resolve once (cached).
-        max_sg_segs = _sg_segs_of(self.client)
         for g_idx, db in enumerate(self.token_dbs):
             spec_block_size = db.block_size
             mask = store_masks[g_idx]
@@ -1765,30 +1624,19 @@ class DfkvStoreWorker:
             tp_candidates = (
                 [db.metadata.tp_rank] if db.metadata.tp_rank < 0 else range(tp_count)
             )
-            rank_probes = max(1, len(list(tp_candidates)) * self.pp_size)
+            rank_probes = max(1, len(tp_candidates) * self.pp_size)
             for chunk_id, h in enumerate(group_hashes):
                 start_idx = chunk_id * spec_block_size
                 if start_idx >= token_len:
                     break
                 if chunk_id >= len(mask) or not mask[chunk_id]:
                     continue
-                # Probe EVERY explicit scatter group of the chunk, not just
-                # group 0: a partial write (group 0 present, a sibling group
-                # missing) must count as uncached -- the save dedup gate
-                # rewrites it and the load path needs every group to succeed.
-                n_groups = _num_sg_groups(
-                    db, min(spec_block_size, token_len - start_idx), max_sg_segs
-                )
-                expected_per_chunk[(g_idx, bytes(h))] = rank_probes * n_groups
+                expected_per_chunk[(g_idx, bytes(h))] = rank_probes
                 for tp in tp_candidates:
                     for pp in range(self.pp_size):
                         md = dataclasses.replace(db.metadata, tp_rank=tp, pp_rank=pp)
-                        base_key = PoolKey(md, h.hex()).to_bytes()
-                        for grp in range(n_groups):
-                            candidate_keys.append(
-                                _sg_group_key(base_key, grp, max_sg_segs)
-                            )
-                            candidate_meta.append((g_idx, bytes(h)))
+                        candidate_keys.append(PoolKey(md, h.hex()).to_bytes())
+                        candidate_meta.append((g_idx, bytes(h)))
 
         if not candidate_keys:
             return 0
@@ -1814,8 +1662,9 @@ class DfkvStoreWorker:
             logger.error("Remote connection failed in lookup: %s", e)
             return 0
 
-        # A (group, hash) is "present" only when every TP*PP rank has every
-        # scatter group of it.
+        # A (group, hash) is present only when every required TP*PP object
+        # exists. A partial request therefore fails closed at the first missing
+        # chunk without any sibling-key interpretation.
         present_count: dict[tuple[int, bytes], int] = {}
         for gh, exists in zip(candidate_meta, res, strict=True):
             if exists == 1:

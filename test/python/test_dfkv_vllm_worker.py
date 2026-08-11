@@ -9,7 +9,7 @@ import queue
 import sys
 import threading
 import unittest
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
@@ -184,10 +184,17 @@ sys.path.insert(0, str(ROOT / "integration" / "vllm" / "src"))
 
 from vllm.v1.core.kv_cache_utils import BlockHash  # noqa: E402
 
-from dfkv_vllm.data import KeyMetadata  # noqa: E402
+from dfkv_vllm.data import (  # noqa: E402
+    KeyMetadata,
+    LoadSpec,
+    PoolKey,
+    ReqMeta,
+)
 from dfkv_vllm.protocol import LOOKUP_MSG  # noqa: E402
 from dfkv_vllm.worker import (  # noqa: E402
     DfkvStoreWorker,
+    KVCacheStoreRecvingThread,
+    KVCacheStoreSendingThread,
     LookupKeyClient,
     LookupKeyServer,
 )
@@ -451,12 +458,198 @@ class LookupFutureTest(unittest.TestCase):
 
 
 
+class LogicalChunkTransferTest(unittest.TestCase):
+    @staticmethod
+    def _metadata() -> KeyMetadata:
+        return KeyMetadata(
+            model_name="model",
+            dp_size=1,
+            dp_rank=-1,
+            tp_size=1,
+            tp_rank=-1,
+            pcp_size=1,
+            pcp_rank=0,
+            dcp_size=1,
+            dcp_rank=0,
+            pp_size=1,
+            pp_rank=0,
+            group_id=0,
+        )
+
+    @staticmethod
+    def _hash(seed: str) -> BlockHash:
+        return BlockHash(hashlib.sha256(seed.encode()).digest())
+
+    def test_save_uses_one_key_and_preserves_more_than_29_descriptors(self) -> None:
+        metadata = self._metadata()
+        logical_key = PoolKey(metadata, self._hash("save").hex())
+        addresses = [0x1000 + i * 0x100 for i in range(35)]
+        sizes = [i + 1 for i in range(35)]
+
+        class _Database:
+            block_size = 64
+            _seg_layout = [(0, 1, 1)] * len(addresses)
+
+            def process_tokens(self, *_args):
+                return [(0, 64, logical_key)]
+
+            def prepare_value(self, *_args):
+                return list(addresses), list(sizes), 7
+
+        class _Client:
+            def __init__(self) -> None:
+                self.exist_calls: list[list[bytes]] = []
+                self.put_calls: list[
+                    tuple[list[bytes], list[list[int]], list[list[int]]]
+                ] = []
+                self.remove_calls: list[list[bytes]] = []
+
+            def max_sg_segs(self) -> int:
+                return 29
+
+            def batch_exist(self, keys):
+                self.exist_calls.append(list(keys))
+                return [0] * len(keys)
+
+            def batch_put_sg(self, keys, ptrs, seg_sizes):
+                self.put_calls.append(
+                    (list(keys), [list(v) for v in ptrs],
+                     [list(v) for v in seg_sizes])
+                )
+                return [0] * len(keys)
+
+            def supports_remove(self) -> bool:
+                return True
+
+            def batch_remove(self, keys):
+                self.remove_calls.append(list(keys))
+                return [0] * len(keys)
+
+        client = _Client()
+        coord = SimpleNamespace(
+            lcm_block_size=64,
+            store_mask=lambda _token_len: [[True]],
+        )
+        sender = KVCacheStoreSendingThread(
+            client,
+            coord,
+            [_Database()],
+            block_size=64,
+            tp_rank=0,
+            put_step=1,
+            kv_role="kv_both",
+            ready_event=threading.Event(),
+        )
+        sender.add_stored_request("save")
+        sender._handle_request(
+            ReqMeta(
+                req_id="save",
+                token_len_chunk=64,
+                block_ids=([7],),
+                block_hashes=[self._hash("save")],
+            )
+        )
+
+        expected_key = logical_key.to_bytes()
+        self.assertEqual(client.exist_calls, [[expected_key]])
+        self.assertEqual(len(client.put_calls), 1)
+        put_keys, put_ptrs, put_sizes = client.put_calls[0]
+        self.assertEqual(put_keys, [expected_key])
+        self.assertEqual(put_ptrs, [addresses])
+        self.assertEqual(put_sizes, [sizes])
+        self.assertEqual(client.remove_calls, [])
+
+    def test_partial_chunk_load_preserves_descriptor_order(self) -> None:
+        metadata = self._metadata()
+        hashes = [self._hash("load-hit"), self._hash("load-miss")]
+        keys = [PoolKey(metadata, value.hex()) for value in hashes]
+        addresses = [
+            [0x2000 + i * 0x80 for i in range(35)],
+            [0x8000 + i * 0x40 for i in range(33)],
+        ]
+        sizes = [
+            [2 + i for i in range(35)],
+            [7 + (i % 5) for i in range(33)],
+        ]
+
+        class _Database:
+            block_size = 64
+            _seg_layout = [(0, 1, 1)] * 35
+
+            def process_tokens(self, *_args):
+                return [(0, 64, keys[0]), (64, 128, keys[1])]
+
+            def prepare_value(self, start, *_args):
+                index = start // 64
+                return list(addresses[index]), list(sizes[index]), (7, 9)[index]
+
+        class _Client:
+            def __init__(self) -> None:
+                self.get_call = None
+                self.result = ([1, 0], [sum(sizes[0]), 0])
+
+            def max_sg_segs(self) -> int:
+                return 29
+
+            def batch_get_auto_sg(self, get_keys, ptrs, caps):
+                self.get_call = (
+                    list(get_keys),
+                    [list(value) for value in ptrs],
+                    [list(value) for value in caps],
+                )
+                return self.result
+
+        client = _Client()
+        coord = SimpleNamespace(
+            load_mask=lambda _hashes, _token_len: [[True, True]],
+        )
+        receiver = KVCacheStoreRecvingThread(
+            client,
+            coord,
+            [_Database()],
+            block_size=64,
+            tp_rank=0,
+            ready_event=threading.Event(),
+        )
+        request = ReqMeta(
+            req_id="load",
+            token_len_chunk=128,
+            block_ids=([7, 9],),
+            block_hashes=hashes,
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                kvpool_cached_tokens=128,
+                can_load=True,
+                token_len=128,
+            ),
+        )
+        receiver._handle_request(request)
+
+        self.assertEqual(
+            client.get_call,
+            ([key.to_bytes() for key in keys], addresses, sizes),
+        )
+        load_errors = receiver.get_and_clear_block_ids_with_load_errors()
+        self.assertNotIn(7, load_errors)
+        self.assertIn(9, load_errors)
+        self.assertEqual(load_errors, {9})
+
+        # A truncated native result must be rejected before per-key indexing.
+        # Fail the whole batch closed rather than silently treating the omitted
+        # logical chunk as a hit.
+        client.result = ([1], [sum(sizes[0])])
+        receiver._handle_request(request)
+        self.assertEqual(
+            receiver.get_and_clear_block_ids_with_load_errors(), {7, 9}
+        )
+
+
 class LookupAccountingTest(unittest.TestCase):
     @staticmethod
     def _hash(seed: str) -> BlockHash:
         return BlockHash(hashlib.sha256(seed.encode()).digest())
 
-    def test_lookup_records_physical_and_logical_key_counts(self) -> None:
+    def test_lookup_probes_one_v2_key_per_rank_and_keeps_partial_prefix(self) -> None:
         hashes = [self._hash("one"), self._hash("two")]
         metadata = KeyMetadata(
             model_name="model",
@@ -481,19 +674,31 @@ class LookupAccountingTest(unittest.TestCase):
 
             def batch_exist(self, keys):
                 self.keys = list(keys)
-                return [1] * len(keys)
+                # Every rank replica of chunk 0 is present. Chunk 1 is only
+                # partially replicated and therefore cannot extend the prefix.
+                return [1, 1, 1, 1, 1, 1, 1, 0]
 
         client = _Client()
         records: list[dict[str, object]] = []
-        db = SimpleNamespace(block_size=64, metadata=metadata, _seg_layout=[1, 2, 3])
+        db = SimpleNamespace(
+            block_size=64,
+            metadata=metadata,
+            _seg_layout=[1, 2, 3],
+        )
+
+        def _find_longest(values, _token_len, pool):
+            hit = 0
+            for value in values:
+                if pool.get_cached_block(value, [0]) is None:
+                    break
+                hit += 64
+            return None, hit
+
         coord = SimpleNamespace(
             lcm_block_size=64,
             store_mask=lambda _token_len: [[True, True]],
             block_hashes_for_spec=lambda values, _spec: values,
-            find_longest_cache_hit=lambda _hashes, token_len, _pool: (
-                None,
-                token_len,
-            ),
+            find_longest_cache_hit=_find_longest,
         )
         worker = SimpleNamespace(
             coord=coord,
@@ -504,15 +709,30 @@ class LookupAccountingTest(unittest.TestCase):
             pp_size=2,
             _kv_cache_groups=[SimpleNamespace(kv_cache_spec=object())],
             _record_kv_connector_operation=lambda operation, duration, num_keys, **kwargs: records.append(
-                {"operation": operation, "duration": duration, "num_keys": num_keys, **kwargs}
+                {
+                    "operation": operation,
+                    "duration": duration,
+                    "num_keys": num_keys,
+                    **kwargs,
+                }
             ),
         )
 
-        self.assertEqual(DfkvStoreWorker.lookup(worker, 128, hashes), 128)
-        self.assertEqual(len(client.keys), 16)
+        self.assertEqual(DfkvStoreWorker.lookup(worker, 128, hashes), 64)
+        expected_keys = [
+            PoolKey(
+                replace(metadata, tp_rank=tp, pp_rank=pp),
+                value.hex(),
+            ).to_bytes()
+            for value in hashes
+            for tp in range(2)
+            for pp in range(2)
+        ]
+        self.assertEqual(client.keys, expected_keys)
+        self.assertEqual(len(set(client.keys)), 8)
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["operation"], "lookup_exists")
-        self.assertEqual(records[0]["num_keys"], 16)
+        self.assertEqual(records[0]["num_keys"], 8)
         self.assertEqual(records[0]["num_logical_keys"], 2)
 
 

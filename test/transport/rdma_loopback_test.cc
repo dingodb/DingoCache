@@ -37,6 +37,31 @@ namespace {
 // (RDMA pins registered memory); the test values are a few KB.
 constexpr size_t kMaxMsg = 256 * 1024;
 
+class ScopedEnv {
+ public:
+  ScopedEnv(const char* name, const char* value) : name_(name) {
+    if (const char* old = std::getenv(name)) {
+      had_old_ = true;
+      old_ = old;
+    }
+    ::setenv(name, value, 1);
+  }
+  ~ScopedEnv() {
+    if (had_old_)
+      ::setenv(name_.c_str(), old_.c_str(), 1);
+    else
+      ::unsetenv(name_.c_str());
+  }
+
+  ScopedEnv(const ScopedEnv&) = delete;
+  ScopedEnv& operator=(const ScopedEnv&) = delete;
+
+ private:
+  std::string name_;
+  std::string old_;
+  bool had_old_ = false;
+};
+
 std::string SelfHdr() { return "test/model"; }
 void ConfigureTestRecvSegment() {
   // Keep Soft-RoCE CI below modest RLIMIT_MEMLOCK. Production defaults to
@@ -924,16 +949,14 @@ TEST(RdmaLoopback, BatchPutRejectsEmptyValue) {
   EXPECT_EQ(out, nonempty);
 }
 
-// Scatter-gather over RDMA: BatchPutSg gathers N caller buffers into one stored
-// blob via a multi-SGE SEND; BatchGetAutoSg scatters the stored blob across N
-// caller buffers via a multi-SGE RECV. Exercises the real PostSendScatterMulti /
-// PostRecvScatterMulti datapath (not the concat fallback). Covers N=1, N=2,
-// N=29 (max_sge-1), variable sizes, the >29 guard, and depth-one windowing.
+// Scatter-gather over RDMA: one logical object may span any number of caller
+// descriptors. The transport windows that descriptor stream to the negotiated
+// HCA SGE limit without changing object identity or byte order.
 TEST(RdmaLoopback, ScatterGatherRoundtripOverRdma) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   // The configured ordinary-data depth stays >1; the dedicated SG lane must
   // nevertheless use depth-one windows.
-  ::setenv("DFKV_RDMA_DEPTH", "4", 1);
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
   RdmaNode node("sg");
   RdmaTransport rt(kMaxMsg);
   KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
@@ -953,38 +976,70 @@ TEST(RdmaLoopback, ScatterGatherRoundtripOverRdma) {
     std::vector<const void*> ptrs;
     for (auto& s : src) ptrs.push_back(s.data());
     KvPutItemSg put{key, ptrs, sizes};
-    auto pr = c.BatchPutSg({put});
+    const auto pr = c.BatchPutSg({put});
+    ASSERT_EQ(pr.size(), 1u);
     ASSERT_TRUE(pr[0]) << "put " << key;
     std::vector<std::string> dst(sizes.size());
     std::vector<void*> dptrs;
-    for (size_t i = 0; i < sizes.size(); ++i) { dst[i].assign(sizes[i], '\0'); dptrs.push_back(&dst[i][0]); }
+    for (size_t i = 0; i < sizes.size(); ++i) {
+      dst[i].assign(sizes[i], '\0');
+      dptrs.push_back(dst[i].data());
+    }
     KvGetItemSg get{key, dptrs, sizes};
     std::vector<size_t> lens;
-    auto gr = c.BatchGetAutoSg({get}, &lens);
+    const auto gr = c.BatchGetAutoSg({get}, &lens);
+    ASSERT_EQ(gr.size(), 1u);
     ASSERT_TRUE(gr[0]) << "get " << key;
     size_t total = 0; for (size_t s : sizes) total += s;
     EXPECT_EQ(lens[0], total);
     for (size_t i = 0; i < sizes.size(); ++i) EXPECT_EQ(dst[i], src[i]) << key << " seg " << i;
   };
 
+  const size_t max_sg = rt.MaxSgPayloadSegs();
+  ASSERT_GE(max_sg, 2u);
   roundtrip("sg_n1", std::vector<size_t>(1, 4096));
   roundtrip("sg_n2", std::vector<size_t>(2, 2048));
-  roundtrip("sg_n29", std::vector<size_t>(29, 256));         // max payload SGEs
-  roundtrip("sg_var", {1, 7, 64, 333, 4096, 11});            // variable per-seg sizes
+  roundtrip("sg_exact_max", std::vector<size_t>(max_sg, 256));
+  roundtrip("sg_max_plus_one", std::vector<size_t>(max_sg + 1, 193));
+  roundtrip("sg_multi_window", std::vector<size_t>(max_sg * 3 + 5, 71));
+  roundtrip("sg_var", {1, 7, 64, 333, 4096, 11});
+  roundtrip("sg_zero_descriptors", {17, 0, 31, 0, 9});
 
-  // >29 segments: rejected by the guard (put fails, get is a miss) — no corruption.
+  // Insufficient aggregate capacity is rejected before any destination byte is
+  // touched, even when both the value and destination cross WR boundaries.
   {
-    std::vector<size_t> sizes(30, 16);
-    auto src = make_chunks("sg_over", sizes);
-    std::vector<const void*> ptrs; for (auto& s : src) ptrs.push_back(s.data());
-    KvPutItemSg put{"sg_over", ptrs, sizes};
-    EXPECT_FALSE(c.BatchPutSg({put})[0]);
-    std::vector<std::string> dst(30);
+    std::vector<size_t> sizes(max_sg + 3, 32);
+    auto src = make_chunks("sg_small_cap", sizes);
+    std::vector<const void*> ptrs;
+    for (auto& s : src) ptrs.push_back(s.data());
+    const auto put = c.BatchPutSg({{"sg_small_cap", ptrs, sizes}});
+    ASSERT_EQ(put.size(), 1u);
+    ASSERT_TRUE(put[0]);
+
+    std::vector<size_t> caps = sizes;
+    ASSERT_FALSE(caps.empty());
+    --caps.back();
+    std::vector<std::string> dst(caps.size());
     std::vector<void*> dptrs;
-    for (int i = 0; i < 30; ++i) { dst[i].assign(16, '\0'); dptrs.push_back(&dst[i][0]); }
-    KvGetItemSg get{"sg_over", dptrs, sizes};
+    for (size_t i = 0; i < caps.size(); ++i) {
+      dst[i].assign(caps[i], '\x5a');
+      dptrs.push_back(dst[i].data());
+    }
     std::vector<size_t> lens;
-    EXPECT_FALSE(c.BatchGetAutoSg({get}, &lens)[0]);
+    const auto get = c.BatchGetAutoSg(
+        {{"sg_small_cap", dptrs, caps}}, &lens);
+    ASSERT_EQ(get.size(), 1u);
+    EXPECT_FALSE(get[0]);
+    ASSERT_EQ(lens.size(), 1u);
+    EXPECT_EQ(lens[0], 0u);
+    for (const auto& segment : dst)
+      EXPECT_EQ(segment, std::string(segment.size(), '\x5a'));
+
+    std::string contiguous;
+    for (const auto& segment : src) contiguous += segment;
+    std::string out(contiguous.size(), '\0');
+    ASSERT_TRUE(c.Get("sg_small_cap", out.data(), out.size()));
+    EXPECT_EQ(out, contiguous);
   }
 
   // Multi-key fan-out crosses the SG lane's depth-one send window. Pin client
@@ -1003,6 +1058,7 @@ TEST(RdmaLoopback, ScatterGatherRoundtripOverRdma) {
       puts[i] = {"sgm" + std::to_string(i), ptrs, sizes};
     }
     auto pr = c.BatchPutSg(puts);
+    ASSERT_EQ(pr.size(), static_cast<size_t>(N));
     for (int i = 0; i < N; ++i) ASSERT_TRUE(pr[i]) << i;
     std::vector<std::vector<std::string>> dsts(N);
     std::vector<KvGetItemSg> gets(N);
@@ -1017,12 +1073,108 @@ TEST(RdmaLoopback, ScatterGatherRoundtripOverRdma) {
     }
     std::vector<size_t> lens;
     auto gr = c.BatchGetAutoSg(gets, &lens);
+    ASSERT_EQ(gr.size(), static_cast<size_t>(N));
+    ASSERT_EQ(lens.size(), static_cast<size_t>(N));
     for (int i = 0; i < N; ++i) {
       ASSERT_TRUE(gr[i]) << i;
-      for (size_t j = 0; j < srcs[i].size(); ++j) EXPECT_EQ(dsts[i][j], srcs[i][j]) << i << " " << j;
+      size_t expected_len = 0;
+      for (size_t j = 0; j < srcs[i].size(); ++j) {
+        expected_len += srcs[i][j].size();
+        EXPECT_EQ(dsts[i][j], srcs[i][j]) << i << " " << j;
+      }
+      EXPECT_EQ(lens[i], expected_len) << i;
     }
   }
-  ::unsetenv("DFKV_RDMA_DEPTH");
+}
+
+TEST(RdmaLoopback, MultiWrLaterWindowFailureIsAtomicAndReclaimsState) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv idle_reclaim("DFKV_RDMA_IDLE_MS", "2000");
+  RdmaNode node("sgabort");
+  const uint64_t transient_baseline =
+      rdma::RcEndpoint::TransientUserMrActive();
+  const uint64_t active_baseline = node.rsrv->ActiveConns();
+  const auto wait_for_active_at_most = [&node](uint64_t limit) {
+    for (int i = 0; i < 2000 && node.rsrv->ActiveConns() > limit; ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    return node.rsrv->ActiveConns();
+  };
+
+  std::vector<std::string> src;
+  std::vector<const void*> ptrs;
+  std::vector<size_t> sizes;
+  {
+    RdmaTransport rt(kMaxMsg);
+    const size_t max_sg = rt.MaxSgPayloadSegs();
+    ASSERT_GE(max_sg, 2u);
+    src.resize(max_sg + 7);
+    for (size_t i = 0; i < src.size(); ++i) {
+      src[i].assign(97 + i % 11, static_cast<char>('a' + i % 26));
+      ptrs.push_back(src[i].data());
+      sizes.push_back(src[i].size());
+    }
+    KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+    const uint64_t active_before_fault = node.rsrv->ActiveConns();
+    const uint64_t opened_before_fault = node.rsrv->V2Conns();
+    std::vector<bool> failed;
+    {
+      ScopedEnv abort_window("DFKV_RDMA_TEST_ABORT_MULTIWR_WINDOW", "2");
+      failed = c.BatchPutSg(
+          {{"sg_later_window_abort", ptrs, sizes}});
+    }
+    ASSERT_EQ(failed.size(), 1u);
+    EXPECT_FALSE(failed[0]);
+    const uint64_t opened_delta =
+        node.rsrv->V2Conns() - opened_before_fault;
+    ASSERT_GT(opened_delta, 0u);
+    // ActiveConns is a server-side gauge: destroying an RC peer may leave its
+    // silent server half alive until the idle reaper runs.  Allow every healthy
+    // connection opened by the operation, but require the faulted QP itself to
+    // disappear.  One leaked QP therefore exceeds this bound by exactly one.
+    const uint64_t max_active_after_fault =
+        active_before_fault + opened_delta - 1;
+    EXPECT_LE(wait_for_active_at_most(max_active_after_fault),
+              max_active_after_fault);
+    EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), transient_baseline);
+  }
+
+  EXPECT_LE(wait_for_active_at_most(active_baseline), active_baseline);
+  EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), transient_baseline);
+
+  EXPECT_EQ(node.srv->Count(), 0u);
+  // A failed logical PUT never commits a readable prefix. Once fault injection
+  // is removed, the same object succeeds and round-trips on a fresh connection.
+  {
+    RdmaTransport rt(kMaxMsg);
+    KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+    EXPECT_FALSE(c.Exist("sg_later_window_abort"));
+    const auto put = c.BatchPutSg(
+        {{"sg_later_window_abort", ptrs, sizes}});
+    ASSERT_EQ(put.size(), 1u);
+    ASSERT_TRUE(put[0]);
+    std::vector<std::string> dst(src.size());
+    std::vector<void*> dptrs;
+    for (size_t i = 0; i < src.size(); ++i) {
+      dst[i].assign(src[i].size(), '\0');
+      dptrs.push_back(dst[i].data());
+    }
+    std::vector<size_t> lens;
+    const auto get = c.BatchGetAutoSg(
+        {{"sg_later_window_abort", dptrs, sizes}}, &lens);
+    ASSERT_EQ(get.size(), 1u);
+    ASSERT_TRUE(get[0]);
+    ASSERT_EQ(lens.size(), 1u);
+    size_t expected_len = 0;
+    for (size_t i = 0; i < src.size(); ++i) {
+      expected_len += src[i].size();
+      EXPECT_EQ(dst[i], src[i]) << i;
+    }
+    EXPECT_EQ(lens[0], expected_len);
+  }
+  EXPECT_LE(wait_for_active_at_most(active_baseline), active_baseline);
+  EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), transient_baseline);
+  node.rsrv->Stop();
+  EXPECT_EQ(node.rsrv->ActiveConns(), 0u);
 }
 
 TEST(RdmaLoopback, ScatterGatherGetUsesDedicatedPool) {

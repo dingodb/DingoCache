@@ -48,8 +48,8 @@ def load_lib(lib_path: Optional[str] = None) -> ctypes.CDLL:
     lib.dfkv_register_memory.restype = c_int
     lib.dfkv_register_memory.argtypes = [c_void_p, c_void_p, c_uint64]
 
-    # Live SG width (negotiated max_sge - 1). Older libs lack the symbol;
-    # callers must tolerate AttributeError and fall back to 29.
+    # Informational live width of one negotiated WR window (max_sge - 1).
+    # Logical SG calls accept wider vectors; libdfkv performs the windowing.
     try:
         lib.dfkv_max_sg_segs.restype = c_uint32
         lib.dfkv_max_sg_segs.argtypes = [c_void_p]
@@ -75,9 +75,10 @@ def load_lib(lib_path: Optional[str] = None) -> ctypes.CDLL:
         c_int, POINTER(c_int)]
 
     # Scatter-gather: one key gathers num_bufs[i] non-contiguous source buffers
-    # (ptrs[i][..], sizes[i][..]) on put / scatters into num_dsts[i] dst buffers
-    # (dsts[i][..], caps[i][..]) on get. Coalesces a chunk's per-layer segments
-    # into ONE key + one RDMA multi-SGE op (<=29 segs/key on max_sge=30 HCAs).
+    # (ptrs[i][..], sizes[i][..]) on put / scatters into num_dsts[i] destination
+    # buffers (dsts[i][..], caps[i][..]) on get. A logical object may have an
+    # arbitrary-width ordered descriptor vector; libdfkv posts bounded WR windows
+    # internally without splitting the object key or completion.
     lib.dfkv_batch_put_sg.restype = c_int
     lib.dfkv_batch_put_sg.argtypes = [
         c_void_p, POINTER(c_void_p), POINTER(c_uint64),
@@ -90,18 +91,6 @@ def load_lib(lib_path: Optional[str] = None) -> ctypes.CDLL:
         POINTER(POINTER(c_void_p)), POINTER(POINTER(c_uint64)),
         POINTER(c_int), c_int, POINTER(c_int), POINTER(c_uint64),
     ]
-
-
-    # Remove support remains capability-detected for deployments that omit the
-    # optional eviction RPC; partial-SG cleanup degrades to a no-op then.
-    if hasattr(lib, "dfkv_remove"):
-        lib.dfkv_remove.restype = c_int
-        lib.dfkv_remove.argtypes = [c_void_p, c_void_p, c_uint64]
-    if hasattr(lib, "dfkv_batch_remove"):
-        lib.dfkv_batch_remove.restype = c_int
-        lib.dfkv_batch_remove.argtypes = [
-            c_void_p, POINTER(c_void_p), POINTER(c_uint64),
-            c_int, POINTER(c_int)]
 
     lib.dfkv_transport_mode.restype = c_char_p
     lib.dfkv_transport_mode.argtypes = [c_void_p]

@@ -192,6 +192,55 @@ TEST_F(KVClientTest, RawPayloadCorruptionIsReturned) {
   EXPECT_EQ(out[100], '!');                           // the corrupted byte is returned
 }
 
+TEST_F(KVClientTest, ScatterGatherMultiWindowSemanticsMatchTcp) {
+  nodes_.push_back(StartNode("sg_multiwr_tcp"));
+  KVClient c({{"a", nodes_[0]->addr}}, SelfHdr());
+
+  constexpr size_t kSegments = 67;  // more than two 29-SGE WR windows
+  std::vector<std::string> src(kSegments);
+  std::vector<const void*> ptrs;
+  std::vector<size_t> sizes;
+  std::string expected;
+  for (size_t i = 0; i < kSegments; ++i) {
+    const size_t len = (i == 3 || i == 31) ? 0 : 5 + i % 17;
+    src[i].resize(len);
+    for (size_t j = 0; j < len; ++j)
+      src[i][j] = static_cast<char>((i * 37 + j * 11) & 0xff);
+    ptrs.push_back(src[i].data());
+    sizes.push_back(len);
+    expected.append(static_cast<const char*>(ptrs[i]), sizes[i]);
+  }
+
+  const auto put = c.BatchPutSg({{"tcp_multiwr", ptrs, sizes}});
+  ASSERT_EQ(put.size(), 1u);
+  ASSERT_TRUE(put[0]);
+  EXPECT_EQ(nodes_[0]->srv->Count(), 1u);
+
+  std::vector<std::string> dst(kSegments);
+  std::vector<void*> dptrs;
+  for (size_t i = 0; i < kSegments; ++i) {
+    dst[i].assign(sizes[i], '\0');
+    dptrs.push_back(dst[i].data());
+  }
+  std::vector<size_t> lens;
+  const auto get = c.BatchGetAutoSg(
+      {{"tcp_multiwr", dptrs, sizes}}, &lens);
+  ASSERT_EQ(get.size(), 1u);
+  ASSERT_TRUE(get[0]);
+  ASSERT_EQ(lens.size(), 1u);
+  EXPECT_EQ(lens[0], expected.size());
+  std::string scattered;
+  for (size_t i = 0; i < dst.size(); ++i) {
+    EXPECT_EQ(dst[i], src[i]) << "segment " << i;
+    scattered += dst[i];
+  }
+  EXPECT_EQ(scattered, expected);
+
+  std::string ordinary(expected.size(), '\0');
+  ASSERT_TRUE(c.Get("tcp_multiwr", ordinary.data(), ordinary.size()));
+  EXPECT_EQ(ordinary, expected);
+}
+
 TEST_F(KVClientTest, TwoNodeConsistentHashCrossNodeRead) {
   nodes_.push_back(StartNode("n1"));
   nodes_.push_back(StartNode("n2"));

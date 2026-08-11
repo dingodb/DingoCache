@@ -49,11 +49,9 @@ std::string MembershipDelta(const std::map<std::string, std::string>& old_m,
   return s;
 }
 
-// Max payload segments per scatter-gather key: the guards below use the active
-// transport's runtime capability, and the connector reads that same value
-// through dfkv_max_sg_segs. A key exceeding the reported limit, or whose
-// aggregate byte count cannot be represented by size_t, fails independently
-// before routing; valid siblings in the same batch still run.
+// Aggregate SG byte counts are checked once before routing. Descriptor count is
+// intentionally unbounded at this layer: RDMA windows it to the negotiated HCA
+// width, while framed transports preserve their existing logical SG fallback.
 
 bool CheckedSizeSum(const std::vector<size_t>& values, size_t* total) {
   size_t sum = 0;
@@ -1170,7 +1168,6 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
     }
     if (items[i].key.empty() ||
         items[i].ptrs.size() != items[i].sizes.size() ||
-        items[i].ptrs.size() > t_->MaxSgPayloadSegs() ||
         !CheckedSizeSum(items[i].sizes, &total_bytes[i]) ||
         total_bytes[i] == 0 || invalid_buffer)
       over[i] = 1;
@@ -1288,7 +1285,6 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
     // rendezvous entirely — an unclaimed fetch has no publish obligation.
     const bool eligible = !items[i].key.empty() && !items[i].dsts.empty() &&
                           items[i].dsts.size() == items[i].caps.size() &&
-                          items[i].dsts.size() <= t_->MaxSgPayloadSegs() &&
                           totals_valid[i] && cu->IsDevicePtr(items[i].dsts[0]);
     if (!eligible) {
       fetch_map.push_back(i);
@@ -1402,14 +1398,13 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
   std::vector<char> hit(N, 0);
   std::vector<size_t> lens(N, 0);  // distinct indices => thread-safe writes
 
-  // Guard (same as put): an item exceeding the active transport's runtime
-  // destination-segment capability is reported a miss up front.
+  // Validate shape and aggregate capacity; the transport windows arbitrary
+  // descriptor counts internally.
   std::vector<char> over(N, 0);
   std::vector<size_t> total_caps(N, 0);
   for (size_t i = 0; i < N; ++i) {
     if (items[i].key.empty() ||  // null/empty key: skip (no wasted GET issued)
         items[i].dsts.size() != items[i].caps.size() ||
-        items[i].dsts.size() > t_->MaxSgPayloadSegs() ||
         !CheckedSizeSum(items[i].caps, &total_caps[i]))
       over[i] = 1;
   }

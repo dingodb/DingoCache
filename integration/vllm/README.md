@@ -12,9 +12,10 @@ registered once via `dfkv_register_memory` (an `ibv_reg_mr` that, under
 nvidia-peermem, yields a GPUDirect MR). Only return code `0` is accepted;
 registration failure aborts startup rather than issuing I/O with an unregistered
 pointer. Transfers then run directly between RDMA and GPU memory with no host
-bounce. Per-chunk layer segments are coalesced into one dfkv
-key via the **scatter-gather** batch API (one multi-SGE RDMA per chunk instead of
-one per layer-segment), cutting key/disk-read count ~20x.
+bounce. Each logical chunk is one dfkv object whose complete ordered GPU
+segment vector is passed to the **scatter-gather** batch API. When the vector
+exceeds one HCA WR's SGE limit, libdfkv posts ordered bounded WR windows under
+that single object operation; it does not split the chunk into physical keys.
 
 > **Full deployment walkthrough + recommended settings: [`docs/CONNECTORS.md`](../../docs/CONNECTORS.md) §3.**
 > This README is the quick reference.
@@ -69,7 +70,7 @@ traffic if either requirement is missing.
 The access log shares the same env vars and line format as the dfkv HiCache /
 LMCache connector access logs, so one setting covers every integration. Format:
 `<op>(<args>) : <result> <duration_s>`, e.g.
-`batch_get_auto_sg(20 keys) : hits=20/20, 1310720 bytes <0.007234>`.
+`batch_get_auto_sg(20 keys, 1240 segments) : hits=20/20, 1310720 bytes <0.007234>`.
 
 ## `kv_connector_extra_config` keys
 
@@ -94,22 +95,33 @@ shutdown behind an accumulated queue.
 ## Identity and raw-value contract
 
 `model_name` is the exact vLLM `model_config.model`, not an extra-config key.
-The binary namespace always binds it to the source-controlled `vllm/raw-v1`
-layout ID; operator-supplied aliases are rejected.
+The binary namespace and every object key bind it to the source-controlled
+`vllm-multiwr-v2` storage-layout ID; operator-supplied aliases are rejected.
 
 Object keys are self-delimiting binary bytes: `DFKVPOOL\x02`, uint32-LE
 length-framed pool and full page hash, fixed `(uint32 size, int32 rank)` pairs
-for DP/TP/PCP/DCP/PP, uint32 group, and a length-framed component. Scatter
-groups append `DFKVSG\x02` plus uint32-LE width/group. Fields may contain NUL,
-delimiters, or non-UTF-8 bytes. Every native operation receives a pointer plus
-its exact uint64 length (parallel pointer/length arrays for batch and SG);
-no C-string, decode/re-encode, delimiter, Python-hash, or legacy ABI path exists.
-The namespace remains separate binary identity. dfkv stores only the raw GPU
-bytes and returns their length separately; it has no geometry/dtype envelope.
+for DP/TP/PCP/DCP/PP, uint32 KV-cache group, and the length-framed
+`vllm-multiwr-v2` component. There is exactly one key per logical chunk,
+independent of its GPU segment count or the negotiated HCA `max_sge`. Every
+native operation receives a pointer plus its exact uint64 length (parallel
+pointer/length arrays for batch and SG); no C-string, decode/re-encode,
+delimiter, Python-hash, or legacy ABI path exists. The KV-cache group field is
+the semantic vLLM hybrid `group_id`, never a WR-window or sibling index. dfkv
+stores only the raw GPU segments in canonical layer-name/run/physical-block
+order and returns their total length separately; it has no geometry/dtype
+envelope. A read is accepted only when the object hits and its returned length
+exactly equals the complete destination-vector capacity; otherwise that logical
+chunk is failed closed and recomputed.
+
+`multiwr-v2` is a clean cutover from the former `sg-v1` physical-key layout.
+Old objects are cold misses by namespace/key identity: readers do not probe,
+assemble, or clean up v1 scatter-group siblings. Roll producers and consumers
+together; expect a cold external cache after rollout. Do not mix connector
+versions in one deployment.
 
 Different namespace/key bytes are a cold miss. The same namespace+key with a
 different dtype, page/block size, shape, layer order, or KV memory layout is a
-type-safety violation, not a guarded miss. Such changes require a
+type-safety violation, not a guarded miss. Such changes require another
 source-controlled layout-ID bump and coordinated writer/reader deployment.
 Cross-runtime sharing requires both identical object keys and byte-compatible
 payload layouts.

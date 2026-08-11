@@ -66,6 +66,17 @@ uint64_t EnvU64(const char* name, uint64_t dflt) {
 }
 
 
+bool AbortMultiWrWindow(size_t one_based_window, size_t window_count) {
+  if (window_count <= 1) return false;
+  const char* value = std::getenv("DFKV_RDMA_TEST_ABORT_MULTIWR_WINDOW");
+  if (!value || !*value) return false;
+  errno = 0;
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(value, &end, 10);
+  return errno == 0 && end != value && *end == '\0' &&
+         parsed == one_based_window;
+}
+
 size_t ResolveMaxPayload(size_t configured) {
   size_t n = configured ? configured : (64u << 20);
   n = EnvBytes("DFKV_RDMA_MAX_PAYLOAD_BYTES", n);
@@ -1782,10 +1793,11 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
   std::vector<Status> result(count, Status::kIOError);
   if (count == 0) return result;
   std::vector<char> bad(count, 0);
+  std::vector<char> completed(count, 0);
   std::vector<size_t> totals(count, 0);
   size_t valid_count = 0;
   for (size_t i = 0; i < count; ++i) {
-    bool invalid = sources[i].payloads.size() > sg_payload_segs_;
+    bool invalid = false;
     size_t total = 0;
     for (const auto& payload : sources[i].payloads) {
       size_t next = 0;
@@ -1811,99 +1823,132 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
   for (int attempt = 0; attempt < 2; ++attempt) {
     if (attempt != 0)
       stale_pool_retries_.fetch_add(1, std::memory_order_relaxed);
-    std::fill(result.begin(), result.end(), Status::kIOError);
-    for (size_t i = 0; i < count; ++i)
-      if (bad[i]) result[i] = Status::kInvalid;
+    for (size_t i = 0; i < count; ++i) {
+      if (bad[i]) {
+        result[i] = Status::kInvalid;
+      } else if (!completed[i]) {
+        result[i] = Status::kIOError;
+      }
+    }
     bool from_pool = false;
-    // Multi-SGE GPU writes are fanned out across independent connections by
-    // KVClient. Keep each connection at one in-flight item: the B200 mlx5
-    // device-direct path reports protection/error WCs when one QP overlaps
-    // writes from distinct registered CUDA ranges. That reduced a 3,937-page
-    // backup to 34 successful writes at depth 4; depth 1 completed all pages.
-    // RDMA depth is not a throughput lever for this path.
     Conn* conn = Acquire(node, Lane::kSgData, &from_pool, attempt > 0, 1);
     if (!conn) return result;
     rdma::RcEndpoint& ep = conn->ep;
-    const size_t window = std::min(
-        ep.window(), static_cast<size_t>(conn->lease.credits));
+    const size_t seg_limit = std::max<size_t>(1, ep.max_sge() - 1);
     bool conn_ok = true;
-    // Failure attribution for Destroy: post/encode/register failures keep the
-    // local-rail default; a failed reap window is classified from its WC
-    // evidence; wire decode failures blame the peer.
     rdma::RailCompletion completion = rdma::RailCompletion::kRailFailure;
-    for (size_t base = 0; base < count && conn_ok; base += window) {
-      const size_t width = std::min(window, count - base);
-      std::vector<std::vector<ibv_mr*>> mrs(width);
-      size_t posted = 0;
-      for (size_t slot = 0; slot < width; ++slot) {
-        const size_t item_index = base + slot;
-        if (bad[item_index]) continue;
-        const CacheSrcMulti& source = sources[item_index];
-        mrs[slot].assign(source.payloads.size(), nullptr);
-        for (size_t seg = 0; seg < source.payloads.size(); ++seg) {
-          if (source.payloads[seg].second == 0) continue;
-          mrs[slot][seg] = ep.RegisterTransient(
-              const_cast<void*>(source.payloads[seg].first),
-              source.payloads[seg].second, /*remote_write=*/false);
-          if (!mrs[slot][seg]) {
+    const size_t remote_capacity = conn->data_capacity();
+
+    for (size_t item_index = 0; item_index < count && conn_ok; ++item_index) {
+      if (bad[item_index] || completed[item_index]) continue;
+      if (totals[item_index] > remote_capacity) {
+        result[item_index] = Status::kInvalid;
+        completed[item_index] = 1;
+        continue;
+      }
+      const CacheSrcMulti& source = sources[item_index];
+      size_t nonempty = 0;
+      for (const auto& payload : source.payloads)
+        if (payload.second != 0) ++nonempty;
+      const size_t window_count = 1 + (nonempty - 1) / seg_limit;
+      if (window_count > std::numeric_limits<uint32_t>::max()) {
+        result[item_index] = Status::kInvalid;
+        completed[item_index] = 1;
+        continue;
+      }
+
+      conn->Encode(ep.sbuf(0), WireOp::kCache, source.key,
+                   window_count > 1 ? rdma::kV2MultiWrPutMagic : 0,
+                   window_count > 1 ? window_count : 0,
+                   totals[item_index]);
+      size_t segment_index = 0;
+      size_t logical_offset = 0;
+      for (size_t window_index = 0;
+           window_index < window_count && conn_ok; ++window_index) {
+        std::vector<std::pair<const void*, uint32_t>> segments;
+        std::vector<ibv_mr*> mrs;
+        segments.reserve(seg_limit);
+        mrs.reserve(seg_limit);
+        size_t window_bytes = 0;
+        while (segment_index < source.payloads.size() &&
+               segments.size() < seg_limit) {
+          const auto& payload = source.payloads[segment_index++];
+          if (payload.second == 0) continue;
+          ibv_mr* mr = ep.RegisterTransient(
+              const_cast<void*>(payload.first), payload.second,
+              /*remote_write=*/false);
+          if (!mr) {
             conn_ok = false;
             break;
           }
-        }
-        if (!conn_ok) break;
-        std::vector<std::pair<const void*, uint32_t>> segments;
-        segments.reserve(source.payloads.size());
-        for (const auto& payload : source.payloads) {
           segments.emplace_back(payload.first,
                                 static_cast<uint32_t>(payload.second));
+          mrs.push_back(mr);
+          window_bytes += payload.second;
         }
-        conn->Encode(ep.sbuf(slot), WireOp::kCache, source.key, 0, 0,
-                     totals[item_index]);
-        if (!ep.PostRecv(slot) ||
-            !ep.PostWriteImmScatterMulti(
-                slot, kReqPrefix, segments, mrs[slot],
-                conn->put_addr(slot), conn->recv_segment.rkey,
-                static_cast<uint32_t>(slot))) {
+        if (!conn_ok) break;
+        if (AbortMultiWrWindow(window_index + 1, window_count)) {
           conn_ok = false;
           break;
         }
-        ++posted;
+        const size_t header_len = window_index == 0 ? kReqPrefix : 0;
+        const uint64_t remote_addr =
+            conn->put_addr(0) +
+            (window_index == 0 ? 0 : kReqPrefix + logical_offset);
+        if (!ep.PostRecv(0) ||
+            !ep.PostWriteImmScatterMulti(
+                0, header_len, segments, mrs, remote_addr,
+                conn->recv_segment.rkey, 0)) {
+          conn_ok = false;
+          break;
+        }
         v2_put_writes_.fetch_add(1, std::memory_order_relaxed);
-      }
-      std::vector<uint32_t> reply_bytes;
-      bool timed_out = false;
-      ibv_wc_status wc_status = IBV_WC_SUCCESS;
-      bool had_wcs = false;
-      if (conn_ok &&
-          !ReapPosted(ep, posted, width, &reply_bytes, BatchTimeout(),
-                      &timed_out, &wc_status, &had_wcs)) {
-        conn_ok = false;
-        completion = rdma::ClassifyCompletion(wc_status, had_wcs);
-      }
-      if (timed_out)
-        completion_timeouts_.fetch_add(1, std::memory_order_relaxed);
-      if (!conn_ok) break;
-      for (auto& slot_mrs : mrs)
-        for (ibv_mr* mr : slot_mrs) ep.ReleaseTransient(mr);
-      for (size_t slot = 0; slot < width; ++slot) {
-        const size_t item_index = base + slot;
-        if (bad[item_index]) continue;
+        std::vector<uint32_t> reply_bytes;
+        bool timed_out = false;
+        ibv_wc_status wc_status = IBV_WC_SUCCESS;
+        bool had_wcs = false;
+        if (!ReapPosted(ep, 1, 1, &reply_bytes, BatchTimeout(), &timed_out,
+                        &wc_status, &had_wcs)) {
+          conn_ok = false;
+          completion = rdma::ClassifyCompletion(wc_status, had_wcs);
+        }
+        if (timed_out)
+          completion_timeouts_.fetch_add(1, std::memory_order_relaxed);
+        if (!conn_ok) break;
+        for (ibv_mr* mr : mrs) ep.ReleaseTransient(mr);
         Status status;
         uint64_t data_len = 0;
-        if (reply_bytes[slot] < kRespPrefix ||
-            !conn->Decode(ep.rbuf(slot), &status, &data_len, 0)) {
+        if (reply_bytes[0] < kRespPrefix ||
+            !conn->Decode(ep.rbuf(0), &status, &data_len, 0)) {
           conn_ok = false;
           completion = rdma::RailCompletion::kEndpointFailure;
           break;
         }
         result[item_index] = status;
+        if (status != Status::kOk) {
+          if (window_index + 1 != window_count) {
+            conn_ok = false;
+            completion = rdma::RailCompletion::kEndpointFailure;
+          }
+          break;
+        }
+        logical_offset += window_bytes;
       }
+      if (conn_ok && result[item_index] == Status::kOk &&
+          logical_offset != totals[item_index]) {
+        conn_ok = false;
+        completion = rdma::RailCompletion::kEndpointFailure;
+      }
+      if (conn_ok) completed[item_index] = 1;
     }
     if (conn_ok) {
       Release(node, Lane::kSgData, conn);
       return result;
     }
     Destroy(conn, completion);
+    for (size_t i = 0; i < count; ++i) {
+      if (!bad[i] && !completed[i]) result[i] = Status::kIOError;
+    }
     if (from_pool) continue;
     return result;
   }
@@ -1956,11 +2001,11 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
   std::vector<Status> result(count, Status::kIOError);
   if (count == 0) return result;
   std::vector<char> bad(count, 0);
+  std::vector<char> completed(count, 0);
   std::vector<size_t> capacities(count, 0);
   size_t valid_count = 0;
   for (size_t i = 0; i < count; ++i) {
-    bool invalid =
-        destinations[i].payloads.size() > rdma::kV2MaxGetTargets;
+    bool invalid = false;
     size_t capacity = 0;
     for (const auto& destination : destinations[i].payloads) {
       size_t next = 0;
@@ -1986,101 +2031,143 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
   for (int attempt = 0; attempt < 2; ++attempt) {
     if (attempt != 0)
       stale_pool_retries_.fetch_add(1, std::memory_order_relaxed);
-    std::fill(result.begin(), result.end(), Status::kIOError);
-    for (size_t i = 0; i < count; ++i)
-      if (bad[i]) result[i] = Status::kInvalid;
-    if (out_lengths) out_lengths->assign(count, 0);
+    for (size_t i = 0; i < count; ++i) {
+      if (bad[i]) {
+        result[i] = Status::kInvalid;
+      } else if (!completed[i]) {
+        result[i] = Status::kIOError;
+        if (out_lengths) (*out_lengths)[i] = 0;
+      }
+    }
     bool from_pool = false;
-    // GPU multi-SGE reads need the same dedicated depth-one QP lane as writes:
-    // sharing kData reintroduces overlapping CUDA-range WRs and lets SG traffic
-    // consume the ordinary batch window.
     Conn* conn = Acquire(node, Lane::kSgData, &from_pool, attempt > 0, 1);
     if (!conn) return result;
     rdma::RcEndpoint& ep = conn->ep;
-    const size_t window = std::min(
-        ep.window(), static_cast<size_t>(conn->lease.credits));
+    const size_t target_limit =
+        std::max<size_t>(1, std::min(ep.max_sge() - 1,
+                                    rdma::kV2MaxGetTargets));
     bool conn_ok = true;
-    // Failure attribution for Destroy: post/encode/register failures keep the
-    // local-rail default; a failed reap window is classified from its WC
-    // evidence; wire decode failures blame the peer.
     rdma::RailCompletion completion = rdma::RailCompletion::kRailFailure;
-    for (size_t base = 0; base < count && conn_ok; base += window) {
-      const size_t width = std::min(window, count - base);
-      std::vector<std::vector<ibv_mr*>> mrs(width);
-      size_t posted = 0;
-      for (size_t slot = 0; slot < width; ++slot) {
-        const size_t item_index = base + slot;
-        if (bad[item_index]) continue;
-        const RangeDstMulti& destination = destinations[item_index];
-        mrs[slot].assign(destination.payloads.size(), nullptr);
+
+    for (size_t item_index = 0; item_index < count && conn_ok; ++item_index) {
+      if (bad[item_index] || completed[item_index]) continue;
+      const RangeDstMulti& destination = destinations[item_index];
+      size_t nonempty = 0;
+      for (const auto& payload : destination.payloads)
+        if (payload.second != 0) ++nonempty;
+      const size_t window_count =
+          nonempty == 0 ? 1 : 1 + (nonempty - 1) / target_limit;
+      if (window_count > std::numeric_limits<uint32_t>::max()) {
+        result[item_index] = Status::kInvalid;
+        completed[item_index] = 1;
+        continue;
+      }
+
+      size_t segment_index = 0;
+      size_t logical_offset = 0;
+      uint64_t value_len = 0;
+      uint64_t response_data_len = 0;
+      uint64_t response_value_len = 0;
+      for (size_t window_index = 0;
+           window_index < window_count && conn_ok; ++window_index) {
         std::vector<RdmaWriteTarget> targets;
-        targets.reserve(destination.payloads.size());
-        for (size_t seg = 0; seg < destination.payloads.size(); ++seg) {
-          const auto& payload = destination.payloads[seg];
+        std::vector<ibv_mr*> mrs;
+        targets.reserve(target_limit);
+        mrs.reserve(target_limit);
+        size_t window_capacity = 0;
+        while (segment_index < destination.payloads.size() &&
+               targets.size() < target_limit) {
+          const auto& payload = destination.payloads[segment_index++];
           if (payload.second == 0) continue;
-          mrs[slot][seg] =
+          ibv_mr* mr =
               ep.RegisterTransient(payload.first, payload.second);
-          if (!mrs[slot][seg]) {
+          if (!mr) {
             conn_ok = false;
             break;
           }
           targets.push_back(
-              {reinterpret_cast<uint64_t>(payload.first),
-               mrs[slot][seg]->rkey,
+              {reinterpret_cast<uint64_t>(payload.first), mr->rkey,
                static_cast<uint32_t>(payload.second)});
+          mrs.push_back(mr);
+          window_capacity += payload.second;
         }
         if (!conn_ok) break;
-        size_t frame_len = 0;
-        if (!EncodeRdmaGetReq(ep.sbuf(slot), ep.cap(), keys[item_index],
-                              0, capacities[item_index], targets,
-                              &frame_len) ||
-            !ep.PostRecv(slot) || !ep.PostSend(slot, frame_len)) {
+        if (AbortMultiWrWindow(window_index + 1, window_count)) {
           conn_ok = false;
           break;
         }
-        ++posted;
+        size_t frame_len = 0;
+        if (!EncodeRdmaGetReqWindow(
+                ep.sbuf(0), ep.cap(), keys[item_index], 0,
+                capacities[item_index], targets,
+                static_cast<uint32_t>(window_index),
+                static_cast<uint32_t>(window_count), logical_offset,
+                capacities[item_index], &frame_len) ||
+            !ep.PostRecv(0) || !ep.PostSend(0, frame_len)) {
+          conn_ok = false;
+          break;
+        }
         v2_get_writes_.fetch_add(1, std::memory_order_relaxed);
-      }
-      std::vector<uint32_t> reply_bytes;
-      bool timed_out = false;
-      ibv_wc_status wc_status = IBV_WC_SUCCESS;
-      bool had_wcs = false;
-      if (conn_ok &&
-          !ReapPosted(ep, posted, width, &reply_bytes, BatchTimeout(),
-                      &timed_out, &wc_status, &had_wcs)) {
-        conn_ok = false;
-        completion = rdma::ClassifyCompletion(wc_status, had_wcs);
-      }
-      if (timed_out)
-        completion_timeouts_.fetch_add(1, std::memory_order_relaxed);
-      if (!conn_ok) break;
-      for (auto& slot_mrs : mrs)
-        for (ibv_mr* mr : slot_mrs) ep.ReleaseTransient(mr);
-      for (size_t slot = 0; slot < width; ++slot) {
-        const size_t item_index = base + slot;
-        if (bad[item_index]) continue;
+        std::vector<uint32_t> reply_bytes;
+        bool timed_out = false;
+        ibv_wc_status wc_status = IBV_WC_SUCCESS;
+        bool had_wcs = false;
+        if (!ReapPosted(ep, 1, 1, &reply_bytes, BatchTimeout(), &timed_out,
+                        &wc_status, &had_wcs)) {
+          conn_ok = false;
+          completion = rdma::ClassifyCompletion(wc_status, had_wcs);
+        }
+        if (timed_out)
+          completion_timeouts_.fetch_add(1, std::memory_order_relaxed);
+        if (!conn_ok) break;
+        for (ibv_mr* mr : mrs) ep.ReleaseTransient(mr);
         Status status;
         uint64_t data_len = 0;
-        uint64_t value_len = 0;
-        if (reply_bytes[slot] < kRespPrefix ||
-            !conn->Decode(ep.rbuf(slot), &status, &data_len,
+        if (reply_bytes[0] < kRespPrefix ||
+            !conn->Decode(ep.rbuf(0), &status, &data_len,
                           capacities[item_index], &value_len) ||
-            value_len > std::numeric_limits<size_t>::max()) {
+            value_len > std::numeric_limits<size_t>::max() ||
+            value_len > capacities[item_index] ||
+            (status == Status::kOk && data_len != value_len) ||
+            (window_index != 0 &&
+             (status != Status::kOk ||
+              data_len != response_data_len ||
+              value_len != response_value_len))) {
           conn_ok = false;
           completion = rdma::RailCompletion::kEndpointFailure;
           break;
         }
-        result[item_index] = status;
-        if (status == Status::kOk && out_lengths) {
-          (*out_lengths)[item_index] = static_cast<size_t>(value_len);
+        if (window_index == 0) {
+          response_data_len = data_len;
+          response_value_len = value_len;
         }
+        result[item_index] = status;
+        if (status != Status::kOk) break;
+        logical_offset += window_capacity;
       }
+      if (conn_ok && result[item_index] == Status::kOk) {
+        if (logical_offset != capacities[item_index]) {
+          conn_ok = false;
+          completion = rdma::RailCompletion::kEndpointFailure;
+          break;
+        }
+        if (out_lengths)
+          (*out_lengths)[item_index] =
+              static_cast<size_t>(response_value_len);
+      }
+      if (conn_ok) completed[item_index] = 1;
     }
     if (conn_ok) {
       Release(node, Lane::kSgData, conn);
       return result;
     }
     Destroy(conn, completion);
+    for (size_t i = 0; i < count; ++i) {
+      if (!bad[i] && !completed[i]) {
+        result[i] = Status::kIOError;
+        if (out_lengths) (*out_lengths)[i] = 0;
+      }
+    }
     if (from_pool) continue;
     return result;
   }

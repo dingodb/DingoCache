@@ -38,6 +38,31 @@ def _env_rank() -> int:
     return 0
 
 
+def _validate_sg_vectors(
+    keys: Sequence[bytes],
+    seg_ptrs: Sequence[Sequence[int]],
+    seg_lengths: Sequence[Sequence[int]],
+    operation: str,
+) -> None:
+    """Reject malformed parallel SG vectors before entering the native ABI."""
+    if len(seg_ptrs) != len(keys) or len(seg_lengths) != len(keys):
+        raise ValueError(
+            f"{operation} requires one descriptor vector per key: "
+            f"keys={len(keys)} ptr_vectors={len(seg_ptrs)} "
+            f"length_vectors={len(seg_lengths)}"
+        )
+    for i, (ptrs, lengths) in enumerate(
+        zip(seg_ptrs, seg_lengths, strict=True)
+    ):
+        if not ptrs:
+            raise ValueError(f"{operation} key {i} has no descriptors")
+        if len(ptrs) != len(lengths):
+            raise ValueError(
+                f"{operation} key {i} descriptor arrays differ: "
+                f"ptrs={len(ptrs)} lengths={len(lengths)}"
+            )
+
+
 class DfkvDeviceClient:
     """Thin device-pointer wrapper over libdfkv.so for the vLLM connector."""
 
@@ -170,10 +195,10 @@ class DfkvDeviceClient:
         return self._lib.dfkv_transport_mode(self._h).decode()
 
     def max_sg_segs(self) -> int:
-        """Return the negotiated RDMA payload-SGE width for one key.
+        """Return the negotiated payload-SGE width of one native WR window.
 
-        Older native libraries may lack this export; the caller retains its
-        historical width fallback for key-geometry stability."""
+        Logical SG object operations may contain more segments; libdfkv splits
+        them into ordered windows of at most this width."""
         return int(self._lib.dfkv_max_sg_segs(self._h))
 
     def register_memory(self, base: int, size: int) -> None:
@@ -256,22 +281,26 @@ class DfkvDeviceClient:
         seg_ptrs: Sequence[Sequence[int]],
         seg_sizes: Sequence[Sequence[int]],
     ) -> list:
-        """Scatter-gather put: ``keys[i]`` stores the in-order concatenation of
-        the buffers ``seg_ptrs[i][..]`` (device pointers) of ``seg_sizes[i][..]``
-        bytes, as ONE dfkv key + one RDMA multi-SGE op. Each key takes <=29 segs
-        (max_sge-1); the C ABI reports a >29 key failed. Returns per-key status
-        (``0`` = ok, ``1`` = failed), same "0=ok" normalization as ``batch_put``."""
+        """Store each key as the in-order concatenation of its GPU segments.
+
+        Segment vectors may exceed one HCA WR's negotiated SGE limit: libdfkv
+        executes ordered bounded WR windows as one logical object operation and
+        reports one status per key (``0`` = ok, ``1`` = failed)."""
+        _validate_sg_vectors(keys, seg_ptrs, seg_sizes, "batch_put_sg")
         n = len(keys)
+        num_segments = sum(len(p) for p in seg_ptrs)
+        num_bytes = sum(sum(s) for s in seg_sizes)
         with _push_metrics.op("put", num_keys=n) as _m, \
                 _push_tracing.span("batch_put_sg", n) as _sp, \
                 access_log(
                     "batch_put_sg",
-                    lambda: f"{n} keys, {sum(sum(s) for s in seg_sizes)} bytes",
+                    lambda: f"{n} keys, {num_segments} segments, {num_bytes} bytes",
                 ) as r:
-            if _m or _sp:
-                _nb = sum(sum(s) for s in seg_sizes)
-                _m.bytes = _nb
-                _sp.bytes = _nb
+            if _m:
+                _m.bytes = num_bytes
+            if _sp:
+                _sp.bytes = num_bytes
+                _sp.attrs = {"dfkv.sg_segments": num_segments}
             karr, klens, key_owners = make_key_array(keys)
             # Keep the per-key inner arrays alive for the duration of the call.
             inner_p = [(c_void_p * len(p))(*[c_void_p(x) for x in p]) for p in seg_ptrs]
@@ -302,14 +331,22 @@ class DfkvDeviceClient:
         seg_ptrs: Sequence[Sequence[int]],
         seg_caps: Sequence[Sequence[int]],
     ):
-        """Scatter-gather get: ``keys[i]``'s stored blob is scattered in order
-        across destination buffers ``seg_ptrs[i][..]`` of capacity
-        ``seg_caps[i][..]`` (the segment sizes define the split). Returns
-        ``(hits, lengths)`` where ``lengths[i]`` is the total stored bytes."""
+        """Scatter each stored object in order across its destination segments.
+
+        Segment vectors may exceed one HCA WR's negotiated SGE limit; libdfkv
+        completes all bounded WR windows before returning the per-object
+        ``(hits, lengths)`` result."""
+        _validate_sg_vectors(keys, seg_ptrs, seg_caps, "batch_get_auto_sg")
         n = len(keys)
+        num_segments = sum(len(p) for p in seg_ptrs)
         with _push_metrics.op("get", num_keys=n) as _m, \
                 _push_tracing.span("batch_get_auto_sg", n) as _sp, \
-                access_log("batch_get_auto_sg", lambda: f"{n} keys") as r:
+                access_log(
+                    "batch_get_auto_sg",
+                    lambda: f"{n} keys, {num_segments} segments",
+                ) as r:
+            if _sp:
+                _sp.attrs = {"dfkv.sg_segments": num_segments}
             karr, klens, key_owners = make_key_array(keys)
             inner_p = [(c_void_p * len(p))(*[c_void_p(x) for x in p]) for p in seg_ptrs]
             inner_c = [(c_uint64 * len(c))(*c) for c in seg_caps]
@@ -357,37 +394,6 @@ class DfkvDeviceClient:
             del key_owners
             return res
 
-    def supports_remove(self) -> bool:
-        """True iff the loaded libdfkv.so exposes the remove RPC (additive)."""
-        return hasattr(self._lib, "dfkv_batch_remove")
-
-    def batch_remove(self, keys: Sequence[bytes]) -> list:
-        """Drop ``keys`` from the ring. Returns ``[1|0]`` per key: 1 iff the
-        owning node confirmed the op (removed or already absent). Used for
-        best-effort cleanup of partially-stored scatter groups. Raises if the
-        lib has no remove RPC."""
-        n = len(keys)
-        if not self.supports_remove():
-            raise RuntimeError(
-                "libdfkv.so has no dfkv_batch_remove (rebuild dfkv with the "
-                "remove RPC to enable partial-SG cleanup)"
-            )
-        with _push_metrics.op("remove", num_keys=n), \
-                _push_tracing.span("batch_remove", n) as _sp, \
-                access_log("batch_remove", lambda: f"{n} keys") as r:
-            karr, klens, key_owners = make_key_array(keys)
-            out = (c_int * n)()
-            rc = self._lib.dfkv_batch_remove(
-                self._h, karr, klens, n, out)
-            if rc != 0:
-                raise RuntimeError(f"dfkv_batch_remove rc={rc}")
-            res = list(out)
-            ok = res.count(1)
-            r.result = f"ok={ok}/{n}"
-            if _sp:
-                _sp.hits = ok
-            del key_owners
-            return res
 
     def close(self) -> None:
         try:

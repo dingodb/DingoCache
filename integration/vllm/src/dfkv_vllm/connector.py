@@ -43,7 +43,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
-from .data import DfkvStoreConnectorMetadata
+from .data import DfkvStoreConnectorMetadata, VLLM_MULTIWR_V2
 from .metrics import DfkvStoreConnectorStats, DfkvStorePromMetrics
 from .scheduler import DfkvStoreScheduler
 from .worker import DfkvStoreWorker
@@ -86,6 +86,9 @@ class DfkvStoreKVEvents(KVConnectorKVEvents):
 
 class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
     """KV connector using DfkvDistributedStore as shared KV pool."""
+
+    # Wire/storage schema, intentionally not operator-configurable.
+    storage_layout_id = VLLM_MULTIWR_V2
 
     @property
     def prefer_cross_layer_blocks(self) -> bool:
