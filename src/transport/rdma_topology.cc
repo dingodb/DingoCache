@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <memory>
 #include <utility>
 
 #include "utils/log.h"
@@ -38,70 +39,155 @@ std::vector<RdmaDevInfo> RdmaTopology::FilterActive(
   return out;
 }
 
-std::vector<RdmaDevInfo> RdmaTopology::Discover(
-    const std::vector<std::string>& filter) {
-  int count = 0;
-  ibv_device** list = ibv_get_device_list(&count);
-  if (!list || count == 0) {
-    if (list) ibv_free_device_list(list);
-    DFKV_LOG_WARN("rdma: no verbs devices found");
-    return {};
+RdmaDiscoveryResult RdmaTopology::ResolveDiscovery(
+    const std::vector<RdmaDiscoveryProbe>& probes,
+    const std::vector<std::string>& filter, RdmaDiscoveryPolicy policy) {
+  RdmaDiscoveryResult result;
+  if (policy == RdmaDiscoveryPolicy::kActiveOnly) {
+    std::vector<RdmaDevInfo> candidates;
+    candidates.reserve(probes.size());
+    for (const auto& probe : probes) {
+      if (probe.status == RdmaDiscoveryStatus::kOk ||
+          probe.status == RdmaDiscoveryStatus::kGidQueryFailed) {
+        candidates.push_back(probe.device);
+      }
+    }
+    result.devices = FilterActive(candidates, filter);
+    return result;
   }
 
-  std::vector<RdmaDevInfo> candidates;
-  candidates.reserve(static_cast<size_t>(count));
+  const auto fail = [&](RdmaDiscoveryStatus status,
+                        const std::string& device) {
+    result.observed_devices = std::move(result.devices);
+    result.devices.clear();
+    result.status = status;
+    result.failed_device = device;
+  };
+  if (filter.empty()) {
+    result.devices.reserve(probes.size());
+    for (const auto& probe : probes) {
+      if (probe.status != RdmaDiscoveryStatus::kOk) {
+        fail(probe.status, probe.device.name);
+        return result;
+      }
+      const bool duplicate = std::any_of(
+          result.devices.begin(), result.devices.end(),
+          [&](const RdmaDevInfo& selected) {
+            return selected.name == probe.device.name;
+          });
+      if (!duplicate) result.devices.push_back(probe.device);
+    }
+    return result;
+  }
+
+  result.devices.reserve(filter.size());
+  for (const auto& requested : filter) {
+    const bool duplicate = std::any_of(
+        result.devices.begin(), result.devices.end(),
+        [&](const RdmaDevInfo& selected) {
+          return selected.name == requested;
+        });
+    if (duplicate) continue;
+
+    const auto probe = std::find_if(
+        probes.begin(), probes.end(), [&](const RdmaDiscoveryProbe& candidate) {
+          return candidate.device.name == requested;
+        });
+    if (probe == probes.end()) {
+      fail(RdmaDiscoveryStatus::kConfiguredDeviceMissing, requested);
+      return result;
+    }
+    if (probe->status != RdmaDiscoveryStatus::kOk) {
+      fail(probe->status, requested);
+      return result;
+    }
+    result.devices.push_back(probe->device);
+  }
+  return result;
+}
+
+std::vector<RdmaDevInfo> RdmaTopology::Discover(
+    const std::vector<std::string>& filter) {
+  return Discover(filter, RdmaDiscoveryPolicy::kActiveOnly).devices;
+}
+
+RdmaDiscoveryResult RdmaTopology::Discover(
+    const std::vector<std::string>& filter, RdmaDiscoveryPolicy policy) {
+  int count = 0;
+  ibv_device** list = ibv_get_device_list(&count);
+  if (!list) {
+    DFKV_LOG_WARN("rdma: ibv_get_device_list failed");
+    RdmaDiscoveryResult result;
+    result.status = RdmaDiscoveryStatus::kDeviceListFailed;
+    return result;
+  }
+  if (count == 0) DFKV_LOG_WARN("rdma: no verbs devices found");
+
+  std::vector<RdmaDiscoveryProbe> probes;
+  probes.reserve(static_cast<size_t>(count));
   for (int i = 0; i < count; ++i) {
     const char* raw_name = ibv_get_device_name(list[i]);
     if (!raw_name) continue;
     const std::string name(raw_name);
     if (!Contains(filter, name)) continue;
 
-    ibv_context* context = ibv_open_device(list[i]);
+    RdmaDiscoveryProbe probe;
+    probe.device.name = name;
+    std::unique_ptr<ibv_context, decltype(&ibv_close_device)> context(
+        ibv_open_device(list[i]), &ibv_close_device);
     if (!context) {
       DFKV_LOG_WARN("rdma: skipping device " + name +
                     ": ibv_open_device failed");
+      probe.status = RdmaDiscoveryStatus::kDeviceOpenFailed;
+      probes.push_back(std::move(probe));
       continue;
     }
 
     ibv_port_attr port{};
-    if (ibv_query_port(context, 1, &port) != 0) {
+    if (ibv_query_port(context.get(), 1, &port) != 0) {
       DFKV_LOG_WARN("rdma: skipping device " + name +
                     ": ibv_query_port(1) failed");
-      ibv_close_device(context);
+      probe.status = RdmaDiscoveryStatus::kPortQueryFailed;
+      probes.push_back(std::move(probe));
       continue;
     }
 
-    RdmaDevInfo info;
-    info.name = name;
-    info.numa_node = numa::DeviceNode(name.c_str());
-    info.lid = port.lid;
-    info.active = port.state == IBV_PORT_ACTIVE;
-    union ibv_gid gid{};
-    if (ibv_query_gid(context, 1, 0, &gid) == 0)
-      std::memcpy(info.gid.data(), gid.raw, info.gid.size());
-    ibv_close_device(context);
+    probe.device.numa_node = numa::DeviceNode(name.c_str());
+    probe.device.lid = port.lid;
+    probe.device.active = port.state == IBV_PORT_ACTIVE;
+    union ibv_gid gid {};
+    if (ibv_query_gid(context.get(), 1, 0, &gid) != 0) {
+      DFKV_LOG_WARN("rdma: device " + name +
+                    ": ibv_query_gid(1, 0) failed");
+      probe.status = RdmaDiscoveryStatus::kGidQueryFailed;
+    } else {
+      std::memcpy(probe.device.gid.data(), gid.raw, probe.device.gid.size());
+    }
 
-    if (!info.active) {
-      DFKV_LOG_WARN("rdma: skipping device " + name + ": port 1 state=" +
+    if (!probe.device.active) {
+      DFKV_LOG_WARN("rdma: device " + name + ": port 1 state=" +
                     std::to_string(static_cast<int>(port.state)) +
                     " (ACTIVE=" +
                     std::to_string(static_cast<int>(IBV_PORT_ACTIVE)) + ")");
     }
-    candidates.push_back(std::move(info));
+    probes.push_back(std::move(probe));
   }
   ibv_free_device_list(list);
 
-  std::vector<RdmaDevInfo> active = FilterActive(candidates, filter);
-  for (const auto& requested : filter) {
-    const bool found = std::any_of(
-        active.begin(), active.end(), [&](const RdmaDevInfo& device) {
-          return device.name == requested;
-        });
-    if (!found)
-      DFKV_LOG_WARN("rdma: configured device " + requested +
-                    " is absent or not ACTIVE");
+  auto result = ResolveDiscovery(probes, filter, policy);
+  if (policy == RdmaDiscoveryPolicy::kActiveOnly) {
+    for (const auto& requested : filter) {
+      const bool found = std::any_of(
+          result.devices.begin(), result.devices.end(),
+          [&](const RdmaDevInfo& device) {
+            return device.name == requested;
+          });
+      if (!found)
+        DFKV_LOG_WARN("rdma: configured device " + requested +
+                      " is absent or not ACTIVE");
+    }
   }
-  return active;
+  return result;
 }
 
 RailCandidates RdmaTopology::CandidatesFor(int numa_node,

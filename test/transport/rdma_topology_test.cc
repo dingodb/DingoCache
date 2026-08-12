@@ -2,14 +2,18 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <string>
 #include <vector>
 
 namespace {
 
-using dfkv::rdma::RdmaDevInfo;
-using dfkv::rdma::RdmaTopology;
 using dfkv::rdma::RailLocality;
+using dfkv::rdma::RdmaDevInfo;
+using dfkv::rdma::RdmaDiscoveryPolicy;
+using dfkv::rdma::RdmaDiscoveryProbe;
+using dfkv::rdma::RdmaDiscoveryStatus;
+using dfkv::rdma::RdmaTopology;
 
 RdmaDevInfo Device(std::string name, bool active, int numa_node = -1) {
   RdmaDevInfo info;
@@ -17,6 +21,15 @@ RdmaDevInfo Device(std::string name, bool active, int numa_node = -1) {
   info.active = active;
   info.numa_node = numa_node;
   return info;
+}
+
+RdmaDiscoveryProbe Probe(
+    std::string name, bool active,
+    RdmaDiscoveryStatus status = RdmaDiscoveryStatus::kOk) {
+  RdmaDiscoveryProbe probe;
+  probe.device = Device(std::move(name), active);
+  probe.status = status;
+  return probe;
 }
 
 TEST(RdmaTopology, DiscoveryDropsDownPortsWithoutAFilter) {
@@ -59,6 +72,124 @@ TEST(RdmaTopology, DuplicateCandidatesRemainOneRail) {
 
   ASSERT_EQ(selected.size(), 1u);
   EXPECT_EQ(selected[0].name, "ib7s400p0");
+}
+
+TEST(RdmaTopology, TypedActiveOnlyResolutionFiltersInactiveAndFailedProbes) {
+  const std::vector<RdmaDiscoveryProbe> probes{
+      Probe("ib0", false), Probe("ib1", true),
+      Probe("ib2", false, RdmaDiscoveryStatus::kDeviceOpenFailed),
+      Probe("ib3", true)};
+
+  const auto result = RdmaTopology::ResolveDiscovery(
+      probes, {}, RdmaDiscoveryPolicy::kActiveOnly);
+
+  ASSERT_TRUE(result.ok());
+  ASSERT_EQ(result.devices.size(), 2u);
+  EXPECT_EQ(result.devices[0].name, "ib1");
+  EXPECT_EQ(result.devices[1].name, "ib3");
+}
+
+TEST(RdmaTopology, ActiveOnlyPreservesLegacyGidQueryFailureBehavior) {
+  const std::vector<RdmaDiscoveryProbe> probes{
+      Probe("ib0", true, RdmaDiscoveryStatus::kGidQueryFailed),
+      Probe("ib1", true)};
+
+  const auto result = RdmaTopology::ResolveDiscovery(
+      probes, {}, RdmaDiscoveryPolicy::kActiveOnly);
+
+  ASSERT_TRUE(result.ok());
+  ASSERT_EQ(result.devices.size(), 2u);
+  EXPECT_EQ(result.devices[0].name, "ib0");
+  EXPECT_EQ(result.devices[0].gid, (std::array<uint8_t, 16>{}));
+  EXPECT_EQ(result.devices[1].name, "ib1");
+}
+
+TEST(RdmaTopology, AllowInactiveRetainsStateInConfiguredOrder) {
+  const std::vector<RdmaDiscoveryProbe> probes{
+      Probe("ib0", true), Probe("ib1", false), Probe("ib2", true)};
+  const std::vector<std::string> configured{"ib2", "ib1", "ib0"};
+
+  const auto result = RdmaTopology::ResolveDiscovery(
+      probes, configured, RdmaDiscoveryPolicy::kAllowInactive);
+
+  ASSERT_TRUE(result.ok());
+  ASSERT_EQ(result.devices.size(), 3u);
+  EXPECT_EQ(result.devices[0].name, "ib2");
+  EXPECT_TRUE(result.devices[0].active);
+  EXPECT_EQ(result.devices[1].name, "ib1");
+  EXPECT_FALSE(result.devices[1].active);
+  EXPECT_EQ(result.devices[2].name, "ib0");
+  EXPECT_TRUE(result.devices[2].active);
+}
+
+TEST(RdmaTopology, AllowInactiveUsesFirstConfiguredOccurrence) {
+  const std::vector<RdmaDiscoveryProbe> probes{
+      Probe("ib0", true), Probe("ib1", false)};
+  const std::vector<std::string> configured{"ib1", "ib0", "ib1", "ib0"};
+
+  const auto result = RdmaTopology::ResolveDiscovery(
+      probes, configured, RdmaDiscoveryPolicy::kAllowInactive);
+
+  ASSERT_TRUE(result.ok());
+  ASSERT_EQ(result.devices.size(), 2u);
+  EXPECT_EQ(result.devices[0].name, "ib1");
+  EXPECT_EQ(result.devices[1].name, "ib0");
+}
+
+TEST(RdmaTopology, AllowInactiveFailsClosedForMissingConfiguredDevice) {
+  const std::vector<RdmaDiscoveryProbe> probes{Probe("ib0", true)};
+
+  const auto result = RdmaTopology::ResolveDiscovery(
+      probes, {"ib0", "ib-missing"}, RdmaDiscoveryPolicy::kAllowInactive);
+
+  EXPECT_FALSE(result.ok());
+  EXPECT_EQ(result.status, RdmaDiscoveryStatus::kConfiguredDeviceMissing);
+  EXPECT_EQ(result.failed_device, "ib-missing");
+  EXPECT_TRUE(result.devices.empty());
+}
+
+TEST(RdmaTopology, AllowInactiveFailsClosedForDeviceOpenFailure) {
+  const std::vector<RdmaDiscoveryProbe> probes{
+      Probe("ib0", true),
+      Probe("ib1", false, RdmaDiscoveryStatus::kDeviceOpenFailed)};
+
+  const auto result = RdmaTopology::ResolveDiscovery(
+      probes, {"ib0", "ib1"}, RdmaDiscoveryPolicy::kAllowInactive);
+
+  EXPECT_FALSE(result.ok());
+  EXPECT_EQ(result.status, RdmaDiscoveryStatus::kDeviceOpenFailed);
+  EXPECT_EQ(result.failed_device, "ib1");
+  EXPECT_TRUE(result.devices.empty());
+}
+
+TEST(RdmaTopology, AllowInactiveFailsClosedForPortQueryFailure) {
+  const std::vector<RdmaDiscoveryProbe> probes{
+      Probe("ib0", false, RdmaDiscoveryStatus::kPortQueryFailed),
+      Probe("ib1", true)};
+
+  const auto result = RdmaTopology::ResolveDiscovery(
+      probes, {"ib0", "ib1"}, RdmaDiscoveryPolicy::kAllowInactive);
+
+  EXPECT_FALSE(result.ok());
+  EXPECT_EQ(result.status, RdmaDiscoveryStatus::kPortQueryFailed);
+  EXPECT_EQ(result.failed_device, "ib0");
+  EXPECT_TRUE(result.devices.empty());
+}
+
+TEST(RdmaTopology, AllowInactiveFailsClosedForGidQueryFailure) {
+  const std::vector<RdmaDiscoveryProbe> probes{
+      Probe("ib0", true),
+      Probe("ib1", true, RdmaDiscoveryStatus::kGidQueryFailed)};
+
+  const auto result = RdmaTopology::ResolveDiscovery(
+      probes, {"ib0", "ib1"}, RdmaDiscoveryPolicy::kAllowInactive);
+
+  EXPECT_FALSE(result.ok());
+  EXPECT_EQ(result.status, RdmaDiscoveryStatus::kGidQueryFailed);
+  EXPECT_EQ(result.failed_device, "ib1");
+  EXPECT_TRUE(result.devices.empty());
+  ASSERT_EQ(result.observed_devices.size(), 1u);
+  EXPECT_EQ(result.observed_devices[0].name, "ib0");
 }
 
 TEST(RdmaTopology, SelectsLocalRailsRoundRobin) {

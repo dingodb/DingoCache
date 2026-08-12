@@ -56,19 +56,41 @@ are the liveness signal. Native clients use the single immutable
 `mds_endpoints` + `mds_group`. MDS mode polls the directory and rebuilds the
 weighted consistent-hash ring whenever its epoch advances. Two-layer offline
 detection: **layer-2** — etcd lease expiry → MDS view changes → client epoch →
-ring rebuild (authoritative removal, ≤ 30 s); **layer-1** — `PeerHealth` fast
-avoidance short-circuits transport failures to misses during a cooldown. There
-is no post-open membership mutation API in v2. For rings still running v1.x
+ring rebuild (authoritative removal after the 30 s lease TTL plus etcd, MDS RPC,
+and client-polling delay; this is not a 30 s upper bound); **layer-1** —
+`PeerHealth` fast avoidance short-circuits transport failures to misses during
+a cooldown. There is no post-open membership mutation API in v2. For rings still running v1.x
 nodes/clients, `DFKV_MDS_ACCEPT_LEGACY=1` enables a dual-protocol shim on the
 MDS control plane (ring-level isolation still applies) — see
 `docs/DEPLOY.md` §2b.
+
+**RDMA server rail admission** is deliberately asymmetric. With no device
+list, automatic discovery remains `ACTIVE`-only. An explicit
+`dfkv_server --rdma-dev` list instead defines a fixed topology in configured
+first-occurrence order: a present but `DOWN` rail is still opened, initialized
+(anchor plus every required MR), and monitored. A missing/unopenable device,
+port- or GID-query failure, or any anchor/MR initialization failure aborts startup.
+The daemon may start with an initialized `DOWN` rail, but the whole node stays
+out of the placement ring until **every initialized/resolved rail**, including
+the auto-discovered rail when no list is configured, is `ACTIVE`/`LinkUp` for
+the recovery sample streak. The default is three successful sampling
+opportunities. At the nominal 10 s registrar cadence this usually takes about
+20–30 s depending on phase, plus registrar connection/RPC delays, and can take
+longer while MDS is unreachable; it is not a wall-clock upper bound. The node
+then rejoins without a restart. This fail-closed policy trades the node's entire
+cache capacity while any one resolved rail is unhealthy for immutable,
+index-aligned multi-rail topology. Startup
+cardinalities and current health are described in
+[`docs/DEPLOY.md`](docs/DEPLOY.md) and
+[`docs/METRICS.md`](docs/METRICS.md).
 
 **Client registration** (who is using dfkv): cache *consumers* (inference
 connector instances — vLLM / LMCache / SGLang HiCache) register themselves with
 the MDS under a disjoint etcd prefix (`/dfkv/v1/groups/<g>/clients/<id>`) so
 they never enter the placement ring. The same lease/heartbeat contract as nodes
-applies — a dead connector's key expires out of etcd within the TTL, no explicit
-deregister, no stale keys. Connectors set
+applies — a dead connector's key expires after the lease TTL plus etcd
+processing delay, not within a strict TTL upper bound; no explicit deregister
+or permanent stale key is required. Connectors set
 `DFKV_CLIENT_OPT_REGISTER_WITH_MDS`, `client_id`, `client_info`, and heartbeat
 fields in `dfkv_client_options_v2` when MDS discovery is used (opt out with
 `DFKV_CLIENT_REGISTER=0`).
@@ -201,8 +223,12 @@ docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire p
 - **Observability** ([docs/METRICS.md](docs/METRICS.md)): opt-in embedded Prometheus
   `/metrics` on `dfkv_server` and `dfkv_mds` (`--metrics-port`); sampled op-latency
   histogram, eviction/error/per-disk/RDMA counters server-side; client-side counters
-  (peer health, IO errors) via `dfkv_stats_snapshot` + a plugin poller. **Opt-in and
-  off the datapath** — no `--metrics-port` ⇒ no listener, behavior unchanged.
+  (peer health, IO errors) via `dfkv_stats_snapshot` + a plugin poller. The
+  `dfkv_server_ring_eligible` and `dfkv_server_ib_device_healthy` families are
+  emitted only by an RDMA-enabled binary that is running an RDMA listener.
+  Their absence from a TCP-only binary or an RDMA build without a listener is
+  expected and must not be coerced to zero by dashboards or alerts. **Opt-in and
+  off the datapath** — no `--metrics-port` ⇒ no metrics listener, behavior unchanged.
   The three connectors (vLLM / LMCache / SGLang HiCache) can also **push** fleet
   metrics (ops/keys/bytes, op latency, per-peer latency) over OTLP to a central
   Collector → Grafana — opt-in via `DFKV_METRICS_ENABLED=1`, **zero-dependency stdlib
@@ -266,12 +292,12 @@ fabric selection and capacity explicit.
 
 | Knob | Recommended | Why |
 |---|---|---|
-| `--rdma-dev` | leave unset for one local HCA; list the fabric explicitly for multi-rail | Unset selects the first `ACTIVE` local HCA (peer names may differ). A comma list opts into multi-rail, anchors only listed active devices, and requires compatible names/fabric on both hosts; inactive entries are rejected. |
+| `--rdma-dev` | leave unset for one local HCA; list the fabric explicitly for multi-rail | Unset resolves and initializes the first `ACTIVE` local HCA (peer names may differ). An explicit comma list defines a fixed topology in first-occurrence order: every listed device must be present/openable with complete provider metadata, including a successful GID query, and complete anchor/MR initialization; a present `DOWN` entry remains initialized and monitored rather than being rejected. Both hosts still require compatible names/fabric. |
 | `DFKV_DISK_HASH_WEIGHT` | `10` | Flattens the intra-server disk ring share from ±20 % to ±3 % so the hottest disk stops gating the whole node (+5–6 % cold read, ~2× lower p99). **Re-routes existing keys** (cache miss + refill) — flip together with a restart/upgrade window. |
 | `--rdma-depth` | `4` (default) | Handshake window is `min(client, server)`. Single-connection PUT/GET bandwidth is depth-flat once connected, but production connector batches require both sides to expose the same bounded window; a 1-vs-4 mismatch caused burst PUT failures and a 29.8% hot-round regression on GLM-5.2. Depth 4 with the default 4 MiB declaration leases about 16 MiB per data QP, so a 16 GiB receive segment admits about 1024 QPs. Increase only for a measured latency-bound path and budget `depth × slot_size` per pooled QP. |
 | `DFKV_RDMA_IDLE_MS` | `30000` for frequently replaced clients; otherwise default `600000` | Server dead-client reaper. A short interval bounds leaked receive-segment leases, but live clients must set `DFKV_RDMA_KEEPALIVE_MS` below this value or their next GET pays stale-QP recovery. |
-| `DFKV_RDMA_HEALTH_RECOVERY_SAMPLES` | `3` | Server samples every configured IB rail before each MDS heartbeat. Any query failure or non-ACTIVE/LinkUp rail removes the node from placement immediately; this many consecutive healthy samples re-admit it. |
-| `DFKV_RDMA_HEALTH_FILE` | unset | Diagnostic-only health input (`device port_state phys_state`, one per configured rail) for controlled fault injection. Production MUST leave this unset so health comes from sysfs. |
+| `DFKV_RDMA_HEALTH_RECOVERY_SAMPLES` | `3` | With an RDMA listener, the server gates placement on every initialized/resolved IB rail, including the auto-discovered rail. Any query failure or non-ACTIVE/LinkUp rail removes the node immediately; three successful sampling opportunities re-admit it. At the nominal 10 s registrar cadence this is usually about 20–30 s depending on phase, plus registrar connection/RPC delays, and can be longer while MDS is unreachable; it is not an upper bound. |
+| `DFKV_RDMA_HEALTH_FILE` | unset | Diagnostic-only health input (`device port_state phys_state`, one per initialized/resolved rail, including an auto-discovered rail) for controlled fault injection. Production MUST leave this unset so health comes from sysfs. |
 | `--ram-tier` / `--ram-tier-bytes` / `--ram-tier-shards` | on / sized to the node / `16` for ≥100 GiB arenas | Large arenas contend on the shard locks under mixed load (+40 % mixed R/W at 16 shards on a 128 GiB arena); small (≤16 GiB) arenas are fine at the default 8. |
 | `--store-engine` | `slab` | Index rebuilds on restart; removes file-per-block hazards. |
 | `DFKV_TCP_FIRST_REQ_MS` / `DFKV_MDS_FIRST_REQ_MS` / `DFKV_METRICS_FIRST_REQ_MS` | `30000` (default) / `0` = off | First-request deadline per listener: a connection that sends nothing before the deadline is dropped, capping idle pre-auth connections. |
