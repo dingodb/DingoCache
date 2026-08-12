@@ -17,8 +17,8 @@ dfkv 把**控制面**与**数据面**解耦：
 
 - **控制面 = TCP + 两边 SEND/RECV**：bootstrap TCP 只交换设备/QP/receive-segment 描述；RDMA QP 的 request descriptor 有界，response buffer 显式预留 `18-byte prefix + 32 KiB`，使 32-KiB `Members` 在 control lane 完整返回；更大响应直接失败、不截断。
 - **payload = one-sided RDMA**：v2 PUT 用 `RDMA_WRITE_WITH_IMM` 直落 server 共享 receive-segment slot，GET 由 server `RDMA_WRITE` 到 client 提交的 `{addr,rkey,len}`。数据 fabric 无需 IP。
-- **设备发现**：留空时两端各选本地首个 port 1 `ACTIVE` HCA；显式逗号白名单才开启多轨轮转，多 fabric 节点须过滤到两端同名且互通的 fabric。
-- **失败策略**：未设 `DFKV_RDMA` 时选择 TCP；一旦选择 RDMA，client/server 必须完成 v2 协商和共享 segment 注册，失败即拒绝启动或连接。
+- **设备发现**：留空时自动发现策略保持 `ACTIVE`-only（两端各选本地首个 port 1 `ACTIVE` HCA）；显式逗号白名单定义固定 topology，按配置首次出现顺序去重，且 server 会接纳**存在但启动时 DOWN** 的设备完成 anchor/MR 初始化并持续监控。多 fabric 节点仍须过滤到两端同名且互通的 fabric。
+- **失败策略**：未设 `DFKV_RDMA` 时选择 TCP；一旦选择 RDMA，显式设备缺失、open/port/GID query 失败，或任一 configured rail 的 anchor、共享 receive-segment MR、RAM/user MR 初始化失败，均拒绝启动而不缩小 topology。present DOWN 本身不拒绝启动，但整个节点保持 ring-ineligible，直至全部 initialized/resolved rail（包括未配置列表时自动发现的 rail）通过恢复采样门；无需重启。
 
 发现：默认走 **MDS 动态发现**（etcd + dfkv_mds，见 §2b）；静态成员表仍作为遗留/单节点备用路径（见 §4-legacy）。无副本（一致性哈希单属主，节点挂 = 该分片 miss → 重算）。
 
@@ -175,10 +175,13 @@ Type=simple
 # 的公式按 peak live + pooled QP 复算）。
 Environment=DFKV_RDMA_DEPTH=4
 Environment=DFKV_RDMA_RECV_SEGMENT_SIZE=17179869184
-# 8×400G 轨全轨白名单 + NUMA：B200 生产 host 一台带 8 个 HCA 轨；
-# server 两端白名单到**同名互通**一组轨；client 的 `DFKV_RDMA_NUMA=1` 后每 rank 优先本 NUMA 轨，
-# 本地轨全不可准入时降级重试全部 enabled rail（rail_select.h/rdma_transport.cc:399-413）。
-# --rdma-dev 直传 RDMA server，胜过同名 env；client 侧 `DFKV_RDMA_DEV` 另行注入（CONNECTORS §1.2）。
+# 8×400G 轨全轨白名单 + NUMA：B200 生产 host 一台带 8 个 HCA 轨。
+# 显式白名单是固定 topology：保留首次出现顺序；present DOWN rail 仍必须完成
+# anchor/共享 segment/所有配置 MR 初始化，随后由 health monitor 等待 LinkUp。
+# server/client 两端白名单到**同名互通**一组轨；client 的 `DFKV_RDMA_NUMA=1`
+# 后每 rank 优先本 NUMA 轨，本地轨全不可准入时降级重试全部 enabled rail
+# （rail_select.h/rdma_transport.cc）。`--rdma-dev` 直传 RDMA server，胜过同名
+# env；client 侧 `DFKV_RDMA_DEV` 另行注入（CONNECTORS §1.2）。
 Environment=DFKV_RDMA_NUMA=1
 # v2.0.0 监听器加固（PR#240）：首帧 30s absolute deadline 断 slow-dribble,
 # metrics 端口连接数上限 64（防连接占用打满）,
@@ -278,7 +281,7 @@ WantedBy=multi-user.target
 ```bash
 systemctl daemon-reload && systemctl enable --now dfkv
 journalctl -u dfkv -n 10 --no-pager
-# 应见 "PORT 28000" + "RDMA listening (TCP bootstrap) on port 28001, dev=ib7s400p0"
+# 应见 "PORT 28000" + "rdma topology startup: configured=8 initialized=8 ACTIVE=<n> inactive=<names|(none)>"
 #      + "dfkv_server MDS registration loop started group=default id=n57 advertise=192.168.1.57:28001"
 # 首次成功后另见 "dfkv_server registered with MDS group=default id=n57"
 ```
@@ -290,21 +293,45 @@ journalctl -u dfkv -n 10 --no-pager
 > startup 和首次 MDS 注册完成。首次成功后 readiness latch 不因瞬时 heartbeat
 > 失败清零，已注册节点继续运行并在 MDS 恢复后续租；必须同时监控
 > [METRICS.md](METRICS.md) 的 registrar heartbeat 指标。
+> RDMA startup 日志
+> `rdma topology startup: configured=N initialized=N ACTIVE=M inactive=...`
+> 分别给出 `configured`（显式列表按首次出现去重；自动发现时为 0）、
+> `initialized`（自动发现或显式配置后 resolved、且 anchor 和启动所需 MR 全部
+> 完成的 rail）及启动瞬间 verbs port `IBV_PORT_ACTIVE` rail 数。显式部署必须
+> 看到 `configured == initialized`；`ACTIVE` 可以较小，此时启动成功但
+> `dfkv_server_ring_eligible=0`。运行期 rail 总数/顺序 immutable，健康门覆盖
+> **全部 initialized/resolved rail**，包括 auto 模式选出的 rail；当前
+> ACTIVE+LinkUp 健康数应从 `sum(dfkv_server_ib_device_healthy)` 读取，不能把
+> 启动 `ACTIVE` 快照当成当前状态。这两个 `dfkv_server_*` IB health family
+> 仅在 RDMA-enabled binary 实际启动 RDMA listener 时输出；TCP-only binary
+> 或未启动 RDMA listener 的进程缺少它们是预期行为，告警不得把缺失补成 0。
 > server 的 bootstrap 监听 `0.0.0.0`，靠防火墙限制在内网。优雅关闭已修（`systemctl stop` 约 1s 退出）。
-> **多轨与 NUMA**：server 启动时 anchor 白名单内全部 active rail；client 以
-> `DFKV_RDMA_RAIL_CREDITS` 的 per-rail credit、归一化 inflight、延迟和本地
-> rail 错误分数选轨（分数相同时按发现顺序稳定选择）。留空时两端各选本地首个
-> ACTIVE HCA，适合 local device 名不同的单 fabric 主机；显式
-> `--rdma-dev` / `DFKV_RDMA_DEV` 是权威白名单并把具体设备选择发给 peer，故
-> 生产多 fabric 主机必须在两端过滤到**同名且互通**的一组设备。设备名上限
-> 18 字节（v2 dev frame 中 name + capability trailer 共 32 字节），超长的
-> 白名单/anchor 设备名在启动时 fail-fast 拒绝，不会截断后误配。
-> `DFKV_RDMA_NUMA=1` 在每次 Acquire 读取 caller NUMA；白名单内存在 local
-> rail 时严格优先 local mask。caller NUMA 未知或没有 local rail 时回退全部
-> 白名单；全部 local rail 都不可准入（被隔离或 credit 耗尽）时也会降级为
-> 全 enabled rail 重试一次——local 是严格偏好而不是可用性闸门，不阻止
-> progress。receive segment 仍是单块 process-wide 分配，不是
-> per-NUMA/per-rail 分片。
+> **多轨与 NUMA**：两端自动发现留空时仍只选首个 ACTIVE HCA。server 的显式
+> `--rdma-dev` 是固定 anchor 白名单：按首次出现顺序去重并固定索引；client 的
+> `DFKV_RDMA_DEV` 是独立的数据面选择，仍须指向当前可用且与 server 同名互通的
+> rail。server 对每个 provider metadata 完整（包括 GID query 成功）的 configured
+> rail 建立 anchor、共享 receive-segment MR 及所有已配置 MR，**不会因为启动时
+> DOWN 就删轨或重排**。任一 rail missing/open/port/GID query/anchor/MR 失败都
+> fail-fast，不以子集启动。设备名在 peer
+> 显式选轨 frame 中上限 18 字节；超长 server anchor 只能作为 default anchor
+> 访问，生产两端显式白名单不得使用。生产多 fabric 主机仍须在两端过滤到
+> **同名且互通**设备。client 以 `DFKV_RDMA_RAIL_CREDITS` 的 per-rail credit、
+> 归一化 inflight、延迟和本地 rail 错误分数选轨（分数相同时按固定发现顺序
+> 选择）。`DFKV_RDMA_NUMA=1` 在每次 Acquire 读取 caller NUMA；白名单内存在
+> local rail 时严格优先 local mask。caller NUMA 未知或没有 local rail 时回退
+> 全部白名单；全部 local rail 都不可准入（被隔离或 credit 耗尽）时也会降级为
+> 全 enabled rail 重试一次——local 是严格偏好而不是可用性闸门。receive
+> segment 仍是单块 process-wide 分配，不是 per-NUMA/per-rail 分片。
+>
+> **boot-degraded 与容量取舍**：present DOWN rail 完成初始化后留在固定
+> topology 和 metrics label 集合中；任一 initialized/resolved rail（包括 auto
+> 模式选出的 rail）当前不是 ACTIVE/LinkUp，节点就以 `DEGRADED` 注册并整体退出
+> placement ring。其余健康 rail 不承接该节点的部分流量，因此代价是临时损失
+> 该节点**全部** cache capacity/vnode share，而不是只损失一条 rail 的带宽。
+> 恢复门默认要求三个连续成功的本地健康采样机会。按 registrar 名义 10 s 节拍，
+> LinkUp 后通常约 20–30 s（取决于采样相位）完成三次，但还要叠加 registrar
+> 建连/RPC 及 MDS 对外可见延迟；MDS 不可达时采样/发布可更久，因此这不是
+> wall-clock 上界。门满足后同一进程自动 rejoin，**LinkUp 后无需 restart**。
 >
 > **失败域隔离**：TCP bootstrap、peer 不可达、epoch/QP frame/receive-segment
 > 不兼容属于 endpoint 失败：立即归还 rail credit，由 client `PeerHealth` 对该
@@ -379,7 +406,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `--cap <bytes>` | —（必填） | 节点总容量（LRU 超限触发自裁） |
 | `--port <p>` | 0(临时） | TCP bootstrap+数据端口；0=随机 |
 | `--rdma-port <p>` | —（RDMA build 必填） | RDMA bootstrap 端口（含 RDMA 时开启） |
-| `--rdma-dev` | first ACTIVE 本地 | RDMA 白名单（逗号）；与 `DFKV_RDMA_DEV` 不同：这是 server 的 anchor |
+| `--rdma-dev` | first ACTIVE 本地 | server RDMA 白名单（逗号）；留空保持 ACTIVE-only 自动发现。显式列表按首次出现去重，present DOWN 也须初始化并监控；missing/open/query/任一 anchor 或 MR 失败则拒绝启动 |
 | `--mds <ip:port,...>` | —（生产必须） | 注册进的 MDS 列表；配后须配 `--group/--id/--advertise` |
 | `--group` | `"default"` | ring 名 |
 | `--id <id>` | 主机名 | server 节点 id（与 `--advertise` 联动） |
@@ -499,8 +526,8 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `DFKV_READ_SHARD_KEYS` | `16` | client 每个 read shard 的目标 key 数；server 不读取 |
 | `DFKV_MDS_IO_TIMEOUT_S` | `60` | MDS 控制面帧读写超时（MDS 进程该） |
 | `DFKV_MDS_ETCD_PROBE_MS` | `30000` | MDS 与 etcd 存活探测窗（MDS 进程该） |
-| `DFKV_RDMA_HEALTH_RECOVERY_SAMPLES` | `3` | server 在每次 MDS 心跳前检查全部 resolved RDMA rail；任一 rail 查询失败或非 ACTIVE/LinkUp 立即退 placement ring，连续该次数健康后恢复入环 |
-| `DFKV_RDMA_HEALTH_FILE` | 未设置（生产必须未设置） | 仅用于受控故障注入；每行 `device port_state phys_state`，缺失已配置设备按查询失败处理。生产从 sysfs 读取 |
+| `DFKV_RDMA_HEALTH_RECOVERY_SAMPLES` | `3` | 仅有 RDMA listener 时生效。健康门检查固定的全部 initialized/resolved rail（包括 auto-discovered rail）；任一 query 失败或非 ACTIVE/LinkUp 立即退整节点。恢复要求连续三个成功采样机会，不是固定时长：启动先采样一次，后续在 registrar 建连后、每次 MDS 注册/心跳 RPC 发送前采样。heartbeat 名义间隔 10 s，通常约 20–30 s（取决于相位），另加建连/RPC/发布延迟；MDS 不可达时可能更久，无 wall-clock 上界 |
+| `DFKV_RDMA_HEALTH_FILE` | 未设置（生产必须未设置） | 仅用于受控故障注入；每行 `device port_state phys_state`，缺失任一 initialized/resolved 设备（包括 auto-discovered rail）按 query 失败处理。生产从 sysfs 读取 |
 | `DFKV_TENANT_QUOTAS_COUNT` | — | tenant 配额文件预期条数（容量校验） |
 
 #### 未收录的常见误配 → 详见 CONNECTORS.md §1.7
@@ -651,21 +678,43 @@ Rollback trigger and procedure:
 
 ## 5. 上线顺序 + 冒烟（无需 GPU）
 
-1. （MDS 路径）起 etcd，再起所有 `dfkv_mds` 副本（§2b），确认日志 "listening"。
-2. 所有节点起 `dfkv_server`（§3），确认 PORT + "registered with MDS" 日志。
-3. 冒烟（任一能访问内网的机器）：
+1. 对最终显式 rail 列表做**只读、无状态变更**的 clean preflight；设备必须存在且
+   verbs open/query 成功，`DOWN`/`LinkDown` 只记录、不在这里删出配置或强制拉链：
+   ```bash
+   set -eu
+   for dev in ib7s400p0 ib7s400p1 ib7s400p2 ib7s400p3 \
+              ib7s400p4 ib7s400p5 ib7s400p6 ib7s400p7; do
+     test -r "/sys/class/infiniband/$dev/ports/1/state" &&
+       test -r "/sys/class/infiniband/$dev/ports/1/phys_state" || exit 1
+     ibv_devinfo -d "$dev" >/dev/null
+     printf '%s state=%s phys_state=%s\n' "$dev" \
+       "$(cat "/sys/class/infiniband/$dev/ports/1/state")" \
+       "$(cat "/sys/class/infiniband/$dev/ports/1/phys_state")"
+   done
+   ```
+   此检查不能代替真实 anchor/MR 初始化；确认 unit 有 `LimitMEMLOCK=infinity`
+   后由 `dfkv_server` 启动结果作为最终门。不得为了“先起进程”临时缩短
+   `--rdma-dev`，否则固定 topology/容量语义已改变。
+2. （MDS 路径）起 etcd，再起所有 `dfkv_mds` 副本（§2b），确认日志 "listening"。
+3. 所有节点起 `dfkv_server`（§3）。启动日志
+   `rdma topology startup: configured=N initialized=N ACTIVE=M inactive=...`
+   必须显示显式部署 `configured == initialized`；允许 `ACTIVE < configured`，
+   但此时 `dfkv_server_ring_eligible=0`，节点是已初始化、可监控但不承载
+   placement 的 `DEGRADED` 成员。missing/open/port/GID query 或任一 anchor/MR
+   失败必须使服务启动失败。
+4. 冒烟（任一能访问内网的机器；只对 ring-eligible 节点执行）：
    ```bash
    dfkv_smoke --members n57=192.168.1.57:28000 --size 2752512                          # TCP
    DFKV_RDMA=1 DFKV_RDMA_DEV=ib7s400p0 dfkv_smoke --members n57=192.168.1.57:28001 --size 2752512
    ```
-4. 端到端零拷贝校验（插件 → libdfkv → RDMA → server，验证 payload 直落缓冲）：
+5. 端到端零拷贝校验（插件 → libdfkv → RDMA → server，验证 payload 直落缓冲）：
    ```bash
    DFKV_RDMA=1 DFKV_RDMA_DEV=ib7s400p0 DFKV_MEMBERS='n=192.168.1.57:28001' \
      python3 test/python/rdma_e2e_validate.py    # 期望 RESULT: ZERO-COPY RDMA E2E OK
    # 随后在 server /metrics 确认 v2_ready=1、v2_conns_opened_total 增长且 free_bytes 有余量
    ```
-5. 压测（可选）：`DFKV_RDMA=1 DFKV_RDMA_DEV=ib7s400p0 dfkv_bench --members ... --size 2752512 --count 8000 --threads 64`。
-6. 在**一个受控 SGLang 副本**上切 `dynamic` 后端，发共享长前缀请求看命中上涨，确认后推广。
+6. 压测（可选）：`DFKV_RDMA=1 DFKV_RDMA_DEV=ib7s400p0 dfkv_bench --members ... --size 2752512 --count 8000 --threads 64`。
+7. 在**一个受控 SGLang 副本**上切 `dynamic` 后端，发共享长前缀请求看命中上涨，确认后推广。
 
 ### 5b. 候选版本负载回归门
 `DFKV_BENCH_STALL_MS=<毫秒>` 只由 `dfkv_bench` 读取；超过阈值的 GET batch

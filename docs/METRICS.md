@@ -21,6 +21,13 @@
 还要求本地 startup 完成以及（配置 MDS 时）首次注册成功。首次注册 latch 后，
 瞬时 heartbeat 丢失不会清 readiness；用下述 heartbeat 指标单独告警。未配置
 MDS 的 node 仅等待本地 startup 和动态 storage health。
+IB ring eligibility is intentionally independent of these HTTP checks. Only an
+RDMA-enabled binary with an active RDMA listener constructs the health monitor
+and emits `dfkv_server_ring_eligible` /
+`dfkv_server_ib_device_healthy`; their absence from a TCP-only binary or an
+RDMA build without a listener is expected. When present, an initialized server
+with a `DOWN` rail can keep `/healthz` and `/readyz` at 200 while
+`dfkv_server_ring_eligible=0` excludes the whole node from placement.
 `dfkv_mds` 的语义不同：`/healthz` 是纯进程 liveness，**不 probe etcd**——
 否则一次秒级 etcd 抖动会让 kubelet 同时重启全部 MDS 副本，CrashLoop 比抖动
 更久并引发 lease 集体过期。`/readyz` 保留 etcd 依赖检查，但经 TTL-debounced
@@ -76,8 +83,6 @@ dfkvctl stat <ip:port>                        # 单节点原始 /metrics 文本�
 | `dfkv_uptime_seconds` | gauge | 启动至今秒数 |
 | `dfkv_storage_healthy` | gauge | 当前 disk group 与显式请求 RAM tier 的 terminal health；0 时 `/healthz`、`/readyz` 均为 503 |
 | `dfkv_server_startup_complete` / `dfkv_server_mds_registration_ready` / `dfkv_server_healthy` / `dfkv_server_ready` | gauge | startup、本次首次 MDS 注册门、本地动态 health、三者合取；`dfkvctl stat --all` 用这组稳定 gauge 判定节点健康 |
-| `dfkv_server_ring_eligible` | gauge | 全部 configured IB rail 当前是否允许节点进入 placement ring；故障时为 0，但 server 进程和 `/healthz` 保持在线 |
-| `dfkv_server_ib_device_healthy{device}` | gauge | 各 resolved RDMA 设备 port 1 是否同时为 ACTIVE 与 LinkUp；设备 label 来自启动时固定集合 |
 | `dfkv_cache_put_total` / `dfkv_cache_hit_total` / `dfkv_cache_miss_total` | counter | PUT / GET 命中 / GET 未命中 |
 | `dfkv_exist_hit_total` / `dfkv_exist_miss_total` | counter | Exist 命中 / 未命中 |
 | `dfkv_remove_ok_total` / `dfkv_remove_miss_total` | counter | Remove 删掉了块 / 目标本就不存在（partial save 清理等路径的诊断分型） |
@@ -118,14 +123,52 @@ Tenant 标签**只**来自启动时有界配置文件中的 16-hex hash；默认
 此时 cache `/readyz` 保持 200，恢复后续租。`rate(dfkv_tcp_rejected_connections_total[5m]) > 0`
 触发时同步看 `dfkv_open_connections / dfkv_tcp_max_connections`。
 
-RDMA 构建额外（折叠进同一 /metrics）：
+IB rail 告警必须按**节点**聚合：
+`min by (instance) (dfkv_server_ib_device_healthy) == 0` 或
+`dfkv_server_ring_eligible == 0` 表示该节点的**全部** cache capacity 已从
+placement ring 移除，不能把其余健康 rail 当成部分容量仍可路由。这两个查询在
+TCP-only server 或未启动 RDMA listener 的 RDMA build 上不会返回序列，这是预期
+行为；不得用 `or vector(0)` 等方式把缺失补成 unhealthy。若要告警“应有但缺失”，
+必须用明确标识 RDMA-listener 部署的 scrape inventory，例如：
+```promql
+(up{job="dfkv-server-rdma"} == 1)
+  unless on(job, instance) dfkv_server_ring_eligible{job="dfkv-server-rdma"}
+```
+不能对混合 TCP/RDMA job 全局使用 `absent()`。
+
+默认 `DFKV_RDMA_HEALTH_RECOVERY_SAMPLES=3`。健康门覆盖全部
+initialized/resolved rail，包括未配置设备列表时 auto-discovered 的 rail；任一
+query 失败或 non-ACTIVE/LinkUp 样本立即清零 streak 并退环。恢复要求三个连续
+成功的本地健康采样机会，而不是固定时长。启动时先采样一次，后续在 registrar
+成功建立连接后、每次注册/心跳 RPC 发送前采样（heartbeat 名义间隔 10 s），MDS
+只在 RPC 成功后看到新状态。因此 LinkUp 后通常约 20–30 s（取决于采样相位）
+完成三个样本，还要叠加 registrar 建连/RPC 与发布延迟；MDS 不可达时可能更久。
+这不是 wall-clock 上界。**无需重启**；重启反而丢弃已初始化 topology 并重新
+承担全部 anchor/MR 启动成本。
+
+四种 rail 口径不能混用：
+
+| 口径 | 权威来源 | 解释 |
+|---|---|---|
+| configured | startup log `configured=N` | 显式列表按首次出现去重后的意图；auto 模式为 0 |
+| initialized/resolved | startup log `initialized=N`；成功启动后 `dfkv_rdma_recv_segment_registered_rails` | 自动发现或显式配置后已完成 anchor、共享 segment 和全部启动 MR 的固定 topology；auto 模式包含选出的 rail |
+| startup-ACTIVE | startup log `ACTIVE=N` / `inactive=...` | 仅启动瞬间的 verbs port-state 快照，不会随恢复改写 |
+| current healthy | `sum by (instance) (dfkv_server_ib_device_healthy)`；最终门为 `dfkv_server_ring_eligible` | 固定 initialized/resolved 集合中当前 ACTIVE+LinkUp 数；仅 RDMA listener 存在时输出 |
+
+仅在 **RDMA-enabled binary 实际启动 RDMA listener** 时额外输出（折叠进同一
+`/metrics`）；TCP-only binary 或未启动 RDMA listener 时下列 family 不存在：
+
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `dfkv_server_ring_eligible` | gauge | **当前**全部 initialized/resolved IB rail（包括 auto-discovered rail）是否满足恢复门；任一设备 query 失败或不是 ACTIVE/LinkUp 时为 0，整个节点（不是单 rail 容量）退出 placement ring，但进程、`/healthz`、`/readyz` 保持在线 |
+| `dfkv_server_ib_device_healthy{device}` | gauge | 各 initialized/resolved RDMA 设备 port 1 的**当前**状态是否同时为 ACTIVE 与 LinkUp；`device` 集合与顺序在启动后固定，包含 auto-discovered rail，也包含显式配置的启动时 DOWN rail |
 | `dfkv_rdma_completions_total` / `dfkv_rdma_completion_errors_total` | counter | RDMA 请求完成 / 错误完成 |
 | `dfkv_rdma_active_conns` | gauge | 当前服务中的 RDMA 连接 |
 | `dfkv_rdma_v2_conns_opened_total` | counter | server 累计打开的 v2 连接 |
 | `dfkv_rdma_v2_put_writes_total` / `dfkv_rdma_v2_get_writes_total` | counter | server 实际收到的 `WRITE_WITH_IMM` PUT / 实际发出的 RDMA WRITE GET payload |
 | `dfkv_rdma_recv_segment_bytes` / `dfkv_rdma_recv_segment_free_bytes` | gauge | process-wide receive segment 总字节 / 当前未租 lease 字节；free 接近 0 时新连接会被拒绝 |
-| `dfkv_rdma_recv_segment_registered_rails` | gauge | 成功把共享 segment 注册到共享 PD 的 rail 数；应等于选中 rail 数 |
-| `dfkv_rdma_v2_ready` | gauge | 至少一个 rail 完成共享 segment 注册；进程就绪后应为 1 |
+| `dfkv_rdma_recv_segment_registered_rails` | gauge | 成功把共享 segment 注册到共享 PD 的 initialized rail 数；显式 topology 启动成功后必须等于 configured rail 数，包括启动时 DOWN 的 rail |
+| `dfkv_rdma_v2_ready` | gauge | shared receive segment 是否已建立；启动成功后应为 1，不能替代逐 rail 注册数和健康检查 |
 | `dfkv_uring_reads_total` / `dfkv_uring_init_fallbacks_total` | counter | io_uring 路径真实提交的读数（**>0 = 路径确实激活**，外部可证）/ 想用 uring 但 ring 初始化失败静默回退同步的连接数（>0 = 配了没生效，查内核/权限） |
 | `dfkv_rdma_idle_reclaims_total` | counter | 空闲超时回收的连接数 |
 | `dfkv_rdma_segment_evictions_total` | counter | receive segment 空间不足时主动淘汰连接的次数；增长说明 segment/连接预算不足 |
@@ -134,9 +177,20 @@ RDMA 构建额外（折叠进同一 /metrics）：
 | `dfkv_rdma_rail_put_writes_total{dev}` / `dfkv_rdma_rail_put_bytes_total{dev}` | counter | 每 rail 收到的 PUT one-sided writes / payload bytes |
 | `dfkv_rdma_rail_get_writes_total{dev}` / `dfkv_rdma_rail_get_bytes_total{dev}` | counter | 每 rail 发出的 GET one-sided writes / payload bytes |
 
-> **v2 上线判据**：client/server 两侧连接总数增长，PUT/GET write counter
-> 随负载增长，`dfkv_rdma_v2_ready=1` 且 `dfkv_rdma_recv_segment_free_bytes` 有容量余量。启动失败
-> 或连接拒绝时检查 segment 容量、每轨注册日志和两端协议版本。
+> **v2 上线判据**：启动日志
+> `rdma topology startup: configured=N initialized=N ACTIVE=M inactive=...`
+> 精确区分显式 configured、自动发现或显式配置后完成 anchor/MR 的
+> initialized/resolved，以及启动瞬间 verbs port `IBV_PORT_ACTIVE` 快照；
+> 自动发现的 `configured=0` 但 initialized 集合包含选出的 rail，显式 topology
+> 则必须
+> `configured == initialized == dfkv_rdma_recv_segment_registered_rails`，而
+> `ACTIVE` 可以更小。RDMA listener 运行期用固定 initialized/resolved 集合
+> `dfkv_server_ib_device_healthy{device}` 统计 current ACTIVE+LinkUp healthy，
+> 并以 `dfkv_server_ring_eligible` 判断整节点是否可放置。随后确认
+> client/server 两侧连接总数增长、PUT/GET write counter 随负载增长、
+> `dfkv_rdma_v2_ready=1` 且 `dfkv_rdma_recv_segment_free_bytes` 有容量余量。
+> 启动失败或连接拒绝时检查缺失/open/port/GID query 错误、每轨
+> anchor/MR/segment 注册日志、segment 容量和两端协议版本。
 
 读侧 convoy 合并与直读晋升（`DFKV_READ_COALESCE=1` 时才有增量；恒零 = 开关没生效）：
 | `dfkv_read_coalesce_leaders_total` | counter | 经 coalescer 登记并完成的读（同步 leader + io_uring flight 各计一次；>0 = 合并路径确实在环内） |

@@ -1,9 +1,8 @@
 /* RDMA device discovery and runtime rail selection.
  *
- * Device names supplied through DFKV_RDMA_DEV are a whitelist, never a bypass
- * around link-state checks. Only port-1 devices in IBV_PORT_ACTIVE state are
- * returned, so an unconfigured client automatically uses every healthy rail
- * and an explicit list safely degrades when one member is down. */
+ * Automatic discovery returns only port-1 devices in IBV_PORT_ACTIVE state.
+ * Explicitly configured topologies may opt into retaining inactive ports so
+ * their stable rail indexes survive a boot-time hardware degradation. */
 #ifndef DFKV_RDMA_TOPOLOGY_H_
 #define DFKV_RDMA_TOPOLOGY_H_
 
@@ -23,6 +22,43 @@ struct RdmaDevInfo {
   uint16_t lid = 0;
   std::array<uint8_t, 16> gid{};
   bool active = false;
+};
+
+enum class RdmaDiscoveryPolicy : uint8_t {
+  kActiveOnly,
+  kAllowInactive,
+};
+
+enum class RdmaDiscoveryStatus : uint8_t {
+  kOk,
+  kDeviceListFailed,
+  kConfiguredDeviceMissing,
+  kDeviceOpenFailed,
+  kPortQueryFailed,
+  kGidQueryFailed,
+};
+
+// A non-kOk result is fail-closed: devices is empty and failed_device names
+// the configured rail when the failure is device-specific.
+struct RdmaDiscoveryResult {
+  std::vector<RdmaDevInfo> devices;
+  RdmaDiscoveryStatus status = RdmaDiscoveryStatus::kOk;
+  std::string failed_device;
+
+  // Provider-complete rails observed before an explicit discovery failure.
+  // Unlike devices, this evidence is preserved for truthful diagnostics when
+  // fail-closed resolution rejects the topology.
+  std::vector<RdmaDevInfo> observed_devices;
+
+  bool ok() const { return status == RdmaDiscoveryStatus::kOk; }
+};
+
+// One deterministic device-enumeration outcome. Failed probes carry only the
+// device name, except kGidQueryFailed retains metadata for legacy ACTIVE-only
+// resolution; successful probes carry the complete RdmaDevInfo.
+struct RdmaDiscoveryProbe {
+  RdmaDevInfo device;
+  RdmaDiscoveryStatus status = RdmaDiscoveryStatus::kOk;
 };
 
 enum class RailLocality : uint8_t {
@@ -49,13 +85,23 @@ class RdmaTopology {
  public:
   explicit RdmaTopology(std::vector<RdmaDevInfo> devices);
 
-  // Enumerate port 1 on every verbs device, apply the optional name whitelist,
-  // and return only ports whose state is IBV_PORT_ACTIVE.
+  // Default discovery remains ACTIVE-only.
   static std::vector<RdmaDevInfo> Discover(
       const std::vector<std::string>& filter = {});
 
-  // Pure filtering seam shared by Discover and the hardware-free unit tests.
-  // Preserves enumeration order and removes duplicate names.
+  // Typed discovery for explicit topology construction. kAllowInactive
+  // preserves configured first-occurrence order and fails closed unless every
+  // configured device has complete provider metadata, including a queried GID.
+  static RdmaDiscoveryResult Discover(
+      const std::vector<std::string>& filter, RdmaDiscoveryPolicy policy);
+
+  // Pure resolution seam used by Discover and hardware-free unit tests.
+  static RdmaDiscoveryResult ResolveDiscovery(
+      const std::vector<RdmaDiscoveryProbe>& probes,
+      const std::vector<std::string>& filter, RdmaDiscoveryPolicy policy);
+
+  // Pure ACTIVE-only filtering seam. Preserves enumeration order and removes
+  // duplicate names.
   static std::vector<RdmaDevInfo> FilterActive(
       const std::vector<RdmaDevInfo>& candidates,
       const std::vector<std::string>& filter = {});

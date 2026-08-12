@@ -1,10 +1,10 @@
 /* RDMA cache-node listener — native v2 libibverbs RC. Bounded 32,786-byte
  * per-QP control buffers share a process-wide registered payload segment.
  * Peers that cannot negotiate v2 are rejected.
- * The listener is a TCP socket used only for capability/QP bootstrap. Startup
- * discovers ACTIVE HCAs (or applies the configured whitelist), anchors their
- * shared PD/MRs, and each accepted connection opens an RC QP on its requested
- * rail. shutdown(listen_fd) keeps Stop() interruptible. */
+ * The TCP listener only bootstraps QPs. Startup discovers the first ACTIVE HCA
+ * automatically, or resolves every explicitly configured HCA into a fixed
+ * topology (including initially inactive ports), then anchors shared PD/MRs.
+ * shutdown(listen_fd) keeps Stop() interruptible. */
 #ifndef DFKV_RDMA_SERVER_H_
 #define DFKV_RDMA_SERVER_H_
 
@@ -25,8 +25,10 @@
 #include "common/status.h"
 #include "transport/rdma_recv_segment.h"
 #include "transport/rdma_verbs.h"  // rdma::RcEndpoint
+#include "transport/rdma_topology.h"
 
 namespace dfkv {
+class RdmaServerTestPeer;
 
 class RdmaServer {
  public:
@@ -79,6 +81,8 @@ class RdmaServer {
   Status Start(int port);  // TCP bootstrap port
   void Stop();
   int port() const { return port_; }
+  // Explicit-mode failures retain the complete requested order; diagnostic
+  // probe evidence never replaces this with a partially discovered topology.
   const std::vector<std::string>& DeviceNames() const { return anchor_devs_; }
 
   // Observability (used by tests): number of Serve threads not yet reaped.
@@ -173,13 +177,24 @@ class RdmaServer {
   std::atomic<uint64_t> segment_evictions_{0};
   size_t recv_segment_bytes_ = 0;
   size_t recv_segment_registered_rails_ = 0;
-  // One anchor per explicitly resolved ACTIVE rail holds a lifetime shared
-  // device reference and registers the receive segment and caller pools on
-  // that rail's PD. With no filter, only the first ACTIVE local rail is
-  // anchored: HCA names are host-local configuration, never peer identities.
+  // One anchor per resolved rail holds a lifetime shared device reference and
+  // registers the receive segment and caller pools on that rail's PD. Auto
+  // mode anchors only the first ACTIVE local rail. An explicit list is fixed
+  // at startup and may include inactive ports so they can recover in place.
   std::vector<std::unique_ptr<rdma::RcEndpoint>> anchors_;
-  std::vector<std::string> anchor_devs_;  // configured filter, then active rails
+  std::vector<std::string> anchor_devs_;  // fixed resolved rail names
   std::vector<std::unique_ptr<RailStats>> rail_stats_;  // indexed with anchor_devs_
+  // Narrow hardware-free startup seams, private and reachable only through the
+  // test peer. Production always calls verbs discovery and materializes real
+  // anchors.
+  std::function<rdma::RdmaDiscoveryResult(
+      const std::vector<std::string>&, rdma::RdmaDiscoveryPolicy)>
+      discover_for_test_;
+  std::function<std::unique_ptr<rdma::RcEndpoint>(
+      const std::string&, const std::vector<std::pair<void*, size_t>>&,
+      void*, size_t)>
+      initialize_anchor_for_test_;
+  friend class RdmaServerTestPeer;
   std::atomic<uint64_t> uring_reads_{0}, uring_init_fallbacks_{0};
   std::atomic<uint64_t> v2_conns_{0}, v2_put_writes_{0}, v2_get_writes_{0};
   std::atomic<uint64_t> v2_get_continuation_slot_changes_{0};

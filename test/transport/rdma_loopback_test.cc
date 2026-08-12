@@ -31,6 +31,34 @@
 namespace fs = std::filesystem;
 using namespace dfkv;  // NOLINT
 
+namespace dfkv {
+class RdmaServerTestPeer {
+ public:
+  using DiscoverFn = std::function<rdma::RdmaDiscoveryResult(
+      const std::vector<std::string>&, rdma::RdmaDiscoveryPolicy)>;
+  using InitializeAnchorFn = std::function<std::unique_ptr<rdma::RcEndpoint>(
+      const std::string&, const std::vector<std::pair<void*, size_t>>&,
+      void*, size_t)>;
+
+  static void SetDiscovery(RdmaServer* server, DiscoverFn discover) {
+    server->discover_for_test_ = std::move(discover);
+  }
+  static void SetInitializeAnchor(RdmaServer* server,
+                                  InitializeAnchorFn initialize) {
+    server->initialize_anchor_for_test_ = std::move(initialize);
+  }
+  static size_t AnchorCount(const RdmaServer& server) {
+    return server.anchors_.size();
+  }
+  static size_t RailStatsCount(const RdmaServer& server) {
+    return server.rail_stats_.size();
+  }
+  static size_t RegisteredRailCount(const RdmaServer& server) {
+    return server.recv_segment_registered_rails_;
+  }
+};
+}  // namespace dfkv
+
 namespace {
 
 // Small per-buffer cap so the test stays well under a modest RLIMIT_MEMLOCK
@@ -154,6 +182,182 @@ struct FakePoolRail {
 };
 
 }  // namespace
+
+TEST(RdmaServerStartup, AutoModeKeepsFirstActiveDeviceSemantics) {
+  ScopedEnv configured_device("DFKV_RDMA_DEV", nullptr);
+  ScopedEnv recv_segment("DFKV_RDMA_RECV_SEGMENT_SIZE", "1048576");
+  RdmaServer server(
+      [](uint8_t, const BlockKey&, uint64_t, uint64_t, const char*, uint64_t,
+         std::string*, size_t*) { return Status::kInvalid; },
+      kMaxMsg);
+  RdmaServerTestPeer::SetDiscovery(
+      &server,
+      [](const std::vector<std::string>& requested,
+         rdma::RdmaDiscoveryPolicy policy) {
+        EXPECT_TRUE(requested.empty());
+        EXPECT_EQ(policy, rdma::RdmaDiscoveryPolicy::kActiveOnly);
+        rdma::RdmaDevInfo first;
+        first.name = "mlx5_first";
+        first.active = true;
+        rdma::RdmaDevInfo second;
+        second.name = "mlx5_second";
+        second.active = true;
+        rdma::RdmaDiscoveryResult result;
+        result.devices = {first, second};
+        return result;
+      });
+  std::vector<std::string> initialized;
+  RdmaServerTestPeer::SetInitializeAnchor(
+      &server,
+      [&initialized](
+          const std::string& device,
+          const std::vector<std::pair<void*, size_t>>&, void*, size_t) {
+        initialized.push_back(device);
+        return std::make_unique<rdma::RcEndpoint>();
+      });
+
+  ASSERT_EQ(server.Start(0), Status::kOk);
+  EXPECT_EQ(server.DeviceNames(),
+            (std::vector<std::string>{"mlx5_first"}));
+  EXPECT_EQ(initialized, server.DeviceNames());
+  EXPECT_EQ(RdmaServerTestPeer::AnchorCount(server), 1u);
+  EXPECT_EQ(RdmaServerTestPeer::RailStatsCount(server), 1u);
+  EXPECT_EQ(RdmaServerTestPeer::RegisteredRailCount(server), 1u);
+  server.Stop();
+}
+
+TEST(RdmaServerStartup, ExplicitInactiveRailRemainsInFixedTopology) {
+  ScopedEnv recv_segment("DFKV_RDMA_RECV_SEGMENT_SIZE", "1048576");
+  RdmaServer server(
+      [](uint8_t, const BlockKey&, uint64_t, uint64_t, const char*, uint64_t,
+         std::string*, size_t*) { return Status::kInvalid; },
+      kMaxMsg, "mlx5_active,mlx5_down,mlx5_active");
+  RdmaServerTestPeer::SetDiscovery(
+      &server,
+      [](const std::vector<std::string>& requested,
+         rdma::RdmaDiscoveryPolicy policy) {
+        EXPECT_EQ(requested,
+                  (std::vector<std::string>{"mlx5_active", "mlx5_down"}));
+        EXPECT_EQ(policy, rdma::RdmaDiscoveryPolicy::kAllowInactive);
+        rdma::RdmaDevInfo active;
+        active.name = "mlx5_active";
+        active.active = true;
+        rdma::RdmaDevInfo inactive;
+        inactive.name = "mlx5_down";
+        inactive.active = false;
+        rdma::RdmaDiscoveryResult result;
+        result.devices = {active, inactive};
+        return result;
+      });
+  std::vector<std::string> initialized;
+  RdmaServerTestPeer::SetInitializeAnchor(
+      &server,
+      [&initialized](
+          const std::string& device,
+          const std::vector<std::pair<void*, size_t>>&, void*, size_t) {
+        initialized.push_back(device);
+        return std::make_unique<rdma::RcEndpoint>();
+      });
+
+  ASSERT_EQ(server.Start(0), Status::kOk);
+  EXPECT_EQ(server.DeviceNames(),
+            (std::vector<std::string>{"mlx5_active", "mlx5_down"}));
+  EXPECT_EQ(initialized, server.DeviceNames());
+  EXPECT_EQ(RdmaServerTestPeer::AnchorCount(server), 2u);
+  EXPECT_EQ(RdmaServerTestPeer::RailStatsCount(server), 2u);
+  EXPECT_EQ(RdmaServerTestPeer::RegisteredRailCount(server), 2u);
+  server.Stop();
+}
+
+TEST(RdmaServerStartup, PartialAnchorMaterializationFailsAtomically) {
+  ScopedEnv recv_segment("DFKV_RDMA_RECV_SEGMENT_SIZE", "1048576");
+  RdmaServer server(
+      [](uint8_t, const BlockKey&, uint64_t, uint64_t, const char*, uint64_t,
+         std::string*, size_t*) { return Status::kInvalid; },
+      kMaxMsg, "mlx5_0,mlx5_1");
+  RdmaServerTestPeer::SetDiscovery(
+      &server,
+      [](const std::vector<std::string>&,
+         rdma::RdmaDiscoveryPolicy policy) {
+        EXPECT_EQ(policy, rdma::RdmaDiscoveryPolicy::kAllowInactive);
+        rdma::RdmaDevInfo first;
+        first.name = "mlx5_0";
+        first.active = true;
+        rdma::RdmaDevInfo second;
+        second.name = "mlx5_1";
+        second.active = false;
+        rdma::RdmaDiscoveryResult result;
+        result.devices = {first, second};
+        return result;
+      });
+  size_t attempts = 0;
+  RdmaServerTestPeer::SetInitializeAnchor(
+      &server,
+      [&attempts](
+          const std::string&, const std::vector<std::pair<void*, size_t>>&,
+          void*, size_t) -> std::unique_ptr<rdma::RcEndpoint> {
+        if (++attempts == 2) return nullptr;
+        return std::make_unique<rdma::RcEndpoint>();
+      });
+
+  EXPECT_EQ(server.Start(0), Status::kIOError);
+  EXPECT_EQ(attempts, 2u);
+  EXPECT_EQ(server.DeviceNames(),
+            (std::vector<std::string>{"mlx5_0", "mlx5_1"}));
+  EXPECT_EQ(RdmaServerTestPeer::AnchorCount(server), 0u);
+  EXPECT_EQ(RdmaServerTestPeer::RailStatsCount(server), 0u);
+  EXPECT_EQ(RdmaServerTestPeer::RegisteredRailCount(server), 0u);
+}
+
+TEST(RdmaServerStartup, ExplicitResolutionFailureNeverShrinksTopology) {
+  RdmaServer server(
+      [](uint8_t, const BlockKey&, uint64_t, uint64_t, const char*, uint64_t,
+         std::string*, size_t*) { return Status::kInvalid; },
+      kMaxMsg, "mlx5_present,mlx5_missing");
+  RdmaServerTestPeer::SetDiscovery(
+      &server,
+      [](const std::vector<std::string>& requested,
+         rdma::RdmaDiscoveryPolicy policy) {
+        EXPECT_EQ(requested,
+                  (std::vector<std::string>{"mlx5_present", "mlx5_missing"}));
+        EXPECT_EQ(policy, rdma::RdmaDiscoveryPolicy::kAllowInactive);
+        rdma::RdmaDiscoveryResult result;
+        result.status =
+            rdma::RdmaDiscoveryStatus::kConfiguredDeviceMissing;
+        result.failed_device = "mlx5_missing";
+        rdma::RdmaDevInfo observed;
+        observed.name = "mlx5_present";
+        observed.active = true;
+        result.observed_devices = {observed};
+        return result;
+      });
+  size_t anchor_attempts = 0;
+  RdmaServerTestPeer::SetInitializeAnchor(
+      &server,
+      [&anchor_attempts](
+          const std::string&, const std::vector<std::pair<void*, size_t>>&,
+          void*, size_t) -> std::unique_ptr<rdma::RcEndpoint> {
+        ++anchor_attempts;
+        return std::make_unique<rdma::RcEndpoint>();
+      });
+
+  testing::internal::CaptureStderr();
+  EXPECT_EQ(server.Start(0), Status::kIOError);
+  const std::string logs = testing::internal::GetCapturedStderr();
+  EXPECT_NE(logs.find("configured=2 initialized=0 probed=1 "
+                      "observed_ACTIVE=1 observed_inactive=(none) "
+                      "unresolved=mlx5_missing"),
+            std::string::npos)
+      << logs;
+  EXPECT_EQ(logs.find(" ACTIVE=0 inactive=(none)"), std::string::npos)
+      << logs;
+  EXPECT_EQ(anchor_attempts, 0u);
+  EXPECT_EQ(server.DeviceNames(),
+            (std::vector<std::string>{"mlx5_present", "mlx5_missing"}));
+  EXPECT_EQ(RdmaServerTestPeer::AnchorCount(server), 0u);
+  EXPECT_EQ(RdmaServerTestPeer::RailStatsCount(server), 0u);
+  EXPECT_EQ(RdmaServerTestPeer::RegisteredRailCount(server), 0u);
+}
 
 TEST(RdmaSafety, CompletionDeadlineUsesOneAbsoluteBudget) {
   using Clock = CompletionDeadline::Clock;

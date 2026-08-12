@@ -65,6 +65,54 @@ size_t RecvSegmentBytes() {
                               std::to_string(bytes));
   return bytes;
 }
+
+const char* DiscoveryStatusName(rdma::RdmaDiscoveryStatus status) {
+  switch (status) {
+    case rdma::RdmaDiscoveryStatus::kOk:
+      return "ok";
+    case rdma::RdmaDiscoveryStatus::kDeviceListFailed:
+      return "device-list-failed";
+    case rdma::RdmaDiscoveryStatus::kConfiguredDeviceMissing:
+      return "configured-device-missing";
+    case rdma::RdmaDiscoveryStatus::kDeviceOpenFailed:
+      return "device-open-failed";
+    case rdma::RdmaDiscoveryStatus::kPortQueryFailed:
+      return "port-query-failed";
+    case rdma::RdmaDiscoveryStatus::kGidQueryFailed:
+      return "gid-query-failed";
+  }
+  return "unknown";
+}
+
+void LogTopologySummary(size_t configured, size_t initialized,
+                        const std::vector<rdma::RdmaDevInfo>& devices,
+                        bool discovery_complete = true,
+                        const std::string& unresolved = {}) {
+  size_t active = 0;
+  std::string inactive;
+  for (const auto& device : devices) {
+    if (device.active) {
+      ++active;
+      continue;
+    }
+    if (!inactive.empty()) inactive += ",";
+    inactive += device.name;
+  }
+  std::string summary =
+      "rdma topology startup: configured=" + std::to_string(configured) +
+      " initialized=" + std::to_string(initialized);
+  if (discovery_complete) {
+    summary += " ACTIVE=" + std::to_string(active) +
+               " inactive=" + (inactive.empty() ? "(none)" : inactive);
+  } else {
+    summary += " probed=" + std::to_string(devices.size()) +
+               " observed_ACTIVE=" + std::to_string(active) +
+               " observed_inactive=" +
+               (inactive.empty() ? "(none)" : inactive);
+  }
+  if (!unresolved.empty()) summary += " unresolved=" + unresolved;
+  DFKV_LOG_INFO(summary);
+}
 }  // namespace
 
 RdmaServer::RdmaServer(Handler handler, size_t max_msg,
@@ -85,7 +133,10 @@ RdmaServer::RdmaServer(Handler handler, size_t max_msg,
     size_t c = dev_name_.find(',', i);
     if (c == std::string::npos) c = dev_name_.size();
     std::string d = dev_name_.substr(i, c - i);
-    if (!d.empty()) anchor_devs_.push_back(d);
+    if (!d.empty() &&
+        std::find(anchor_devs_.begin(), anchor_devs_.end(), d) ==
+            anchor_devs_.end())
+      anchor_devs_.push_back(d);
     i = c + 1;
   }
   if (anchor_devs_.empty()) anchor_devs_.push_back("");
@@ -124,37 +175,73 @@ Status RdmaServer::Start(int port) {
   socklen_t sl = sizeof(sa);
   ::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&sa), &sl);
   port_ = ntohs(sa.sin_port);
-  // Resolve an explicit comma list as an ACTIVE-device whitelist. With no
-  // override, preserve host-local device semantics by selecting only the first
-  // ACTIVE HCA; multi-rail is opt-in because names need not match on peers.
+  // Automatic discovery remains ACTIVE-only and selects the first verbs HCA.
+  // Explicit configuration is different: every named HCA must resolve, but an
+  // initially inactive port remains a fixed rail so runtime health can recover
+  // it without changing topology indices.
   std::vector<std::string> requested_devices;
-  for (const auto& device : anchor_devs_) {
-    if (!device.empty()) requested_devices.push_back(device);
-  }
-  auto active_devices = rdma::RdmaTopology::Discover(requested_devices);
-  if (auto_device_ && active_devices.size() > 1) active_devices.resize(1);
-  if (active_devices.empty()) {
+  if (!auto_device_) requested_devices = anchor_devs_;
+  const rdma::RdmaDiscoveryPolicy discovery_policy =
+      auto_device_ ? rdma::RdmaDiscoveryPolicy::kActiveOnly
+                   : rdma::RdmaDiscoveryPolicy::kAllowInactive;
+  rdma::RdmaDiscoveryResult discovery =
+      discover_for_test_
+          ? discover_for_test_(requested_devices, discovery_policy)
+          : rdma::RdmaTopology::Discover(requested_devices, discovery_policy);
+  if (!discovery.ok()) {
+    LogTopologySummary(requested_devices.size(), 0,
+                       discovery.observed_devices, false,
+                       discovery.failed_device);
     DFKV_LOG_ERROR(
-        requested_devices.empty()
-            ? "rdma: no ACTIVE device found"
-            : "rdma: none of the configured devices is ACTIVE");
+        "rdma: device discovery failed: status=" +
+        std::string(DiscoveryStatusName(discovery.status)) +
+        (discovery.failed_device.empty()
+             ? std::string()
+             : " device=" + discovery.failed_device));
     ::close(listen_fd_);
     listen_fd_ = -1;
     return Status::kIOError;
   }
-  anchor_devs_.clear();
+  if (auto_device_ && discovery.devices.size() > 1)
+    discovery.devices.resize(1);
+  if (discovery.devices.empty()) {
+    LogTopologySummary(requested_devices.size(), 0, discovery.devices);
+    DFKV_LOG_ERROR("rdma: no ACTIVE device found");
+    ::close(listen_fd_);
+    listen_fd_ = -1;
+    return Status::kIOError;
+  }
+  if (!auto_device_) {
+    bool exact = discovery.devices.size() == requested_devices.size();
+    for (size_t i = 0; exact && i < requested_devices.size(); ++i)
+      exact = discovery.devices[i].name == requested_devices[i];
+    if (!exact) {
+      LogTopologySummary(requested_devices.size(), 0, discovery.devices);
+      DFKV_LOG_ERROR(
+          "rdma: explicit discovery returned a partial or reordered topology");
+      ::close(listen_fd_);
+      listen_fd_ = -1;
+      return Status::kIOError;
+    }
+  }
+
+  std::vector<std::string> resolved_device_names;
+  resolved_device_names.reserve(discovery.devices.size());
   std::string resolved_devices;
-  for (const auto& device : active_devices) {
-    anchor_devs_.push_back(device.name);
+  for (const auto& device : discovery.devices) {
+    resolved_device_names.push_back(device.name);
     if (!resolved_devices.empty()) resolved_devices += ",";
     resolved_devices += device.name;
   }
+  anchor_devs_ = std::move(resolved_device_names);
   dev_name_ = anchor_devs_.front();
   config_dump::RecordResolved("DFKV_RDMA_DEV", resolved_devices);
+
   // Allocate the mandatory process-wide receive segment before opening anchors.
   recv_segment_bytes_ = RecvSegmentBytes();
   const size_t min_slot_bytes = rdma::V2SlotSize(max_msg_);
   if (!rdma::V2RecvSegmentFitsOneSlot(recv_segment_bytes_, max_msg_)) {
+    LogTopologySummary(requested_devices.size(), 0, discovery.devices);
     DFKV_LOG_ERROR(
         "rdma: configured v2 receive segment (" +
         std::to_string(recv_segment_bytes_) +
@@ -168,6 +255,7 @@ Status RdmaServer::Start(int port) {
     return Status::kIOError;
   }
   if (!recv_segment_.Init(recv_segment_bytes_, rdma::kV2DataOffset)) {
+    LogTopologySummary(requested_devices.size(), 0, discovery.devices);
     DFKV_LOG_ERROR("rdma: unable to allocate required v2 receive segment (" +
                    std::to_string(recv_segment_bytes_) + " bytes)");
     recv_segment_bytes_ = 0;
@@ -175,42 +263,53 @@ Status RdmaServer::Start(int port) {
     listen_fd_ = -1;
     return Status::kIOError;
   }
-  recv_segment_registered_rails_ = 0;
-  for (const auto& d : anchor_devs_) {
-    auto anchor = std::make_unique<rdma::RcEndpoint>();
-    if (!anchor->Open(d.empty() ? nullptr : d.c_str(),
-                      rdma::kV2ControlCap, 1)) {
-      DFKV_LOG_ERROR("rdma: failed to open required v2 device " +
-                     (d.empty() ? std::string("(auto)") : d));
-      continue;
+
+  std::vector<std::unique_ptr<rdma::RcEndpoint>> initialized_anchors;
+  initialized_anchors.reserve(anchor_devs_.size());
+  for (const auto& device : anchor_devs_) {
+    std::unique_ptr<rdma::RcEndpoint> anchor;
+    if (initialize_anchor_for_test_) {
+      anchor = initialize_anchor_for_test_(
+          device, user_regions_, recv_segment_.data(), recv_segment_.size());
+    } else {
+      anchor = std::make_unique<rdma::RcEndpoint>();
+      if (!anchor->Open(device.c_str(), rdma::kV2ControlCap, 1)) {
+        DFKV_LOG_ERROR("rdma: failed to open required v2 device " + device);
+        anchor.reset();
+      } else if (!anchor->EnsurePoolMrs(user_regions_)) {
+        DFKV_LOG_ERROR("rdma: failed to register explicit user region on " +
+                       device);
+        anchor.reset();
+      } else if (!anchor->RegisterRemoteRegion(recv_segment_.data(),
+                                               recv_segment_.size())) {
+        DFKV_LOG_ERROR(
+            "rdma: failed to register required v2 receive segment on " +
+            device);
+        anchor.reset();
+      }
     }
-    if (!anchor->EnsurePoolMrs(user_regions_)) {
-      DFKV_LOG_ERROR("rdma: failed to register explicit user region on " +
-                     (d.empty() ? std::string("(auto)") : d));
-      continue;
+    if (!anchor) {
+      LogTopologySummary(requested_devices.size(),
+                         initialized_anchors.size(), discovery.devices);
+      DFKV_LOG_ERROR(
+          "rdma: every resolved rail must initialize; startup aborted");
+      recv_segment_registered_rails_ = 0;
+      ::close(listen_fd_);
+      listen_fd_ = -1;
+      return Status::kIOError;
     }
-    if (!anchor->RegisterRemoteRegion(recv_segment_.data(),
-                                      recv_segment_.size())) {
-      DFKV_LOG_ERROR("rdma: failed to register required v2 receive segment on " +
-                     (d.empty() ? std::string("(auto)") : d));
-      continue;
-    }
-    ++recv_segment_registered_rails_;
-    anchors_.push_back(std::move(anchor));
+    initialized_anchors.push_back(std::move(anchor));
   }
-  if (anchors_.size() != anchor_devs_.size() ||
-      recv_segment_registered_rails_ != anchor_devs_.size()) {
-    DFKV_LOG_ERROR(
-        "rdma: v2 receive segment was not established on every selected rail");
-    anchors_.clear();
-    ::close(listen_fd_);
-    listen_fd_ = -1;
-    return Status::kIOError;
-  }
-  rail_stats_.clear();
-  rail_stats_.reserve(anchor_devs_.size());
+
+  std::vector<std::unique_ptr<RailStats>> initialized_stats;
+  initialized_stats.reserve(anchor_devs_.size());
   for (size_t i = 0; i < anchor_devs_.size(); ++i)
-    rail_stats_.push_back(std::make_unique<RailStats>());
+    initialized_stats.push_back(std::make_unique<RailStats>());
+  anchors_ = std::move(initialized_anchors);
+  rail_stats_ = std::move(initialized_stats);
+  recv_segment_registered_rails_ = anchors_.size();
+  LogTopologySummary(requested_devices.size(), anchors_.size(),
+                     discovery.devices);
   if (anchor_devs_.size() > 1)
     DFKV_LOG_INFO("rdma multi-rail anchors: " +
                   std::to_string(anchors_.size()) + "/" +
@@ -410,7 +509,7 @@ void RdmaServer::Serve(int boot_fd) {
   const auto rail_it =
       std::find(anchor_devs_.begin(), anchor_devs_.end(), dev);
   if (rail_it == anchor_devs_.end()) {
-    DFKV_LOG_ERROR("rdma: client requested device outside the ACTIVE filter: " +
+    DFKV_LOG_ERROR("rdma: client requested device outside the fixed topology: " +
                    dev);
     ::close(boot_fd);
     return;
