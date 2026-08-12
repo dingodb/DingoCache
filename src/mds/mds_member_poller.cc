@@ -40,11 +40,22 @@ int ShrinkGuardPct() {
 }
 }  // namespace
 
-MdsMemberPoller::MdsMemberPoller(std::vector<std::string> mds_eps, std::string group,
-                                 OnChange cb, int poll_ms, int io_timeout_ms)
+MdsMemberPoller::MdsMemberPoller(std::vector<std::string> mds_eps,
+                                 std::string group, OnChange cb, int poll_ms,
+                                 int io_timeout_ms)
     : eps_(std::move(mds_eps)),
       group_(std::move(group)),
       cb_(std::move(cb)),
+      poll_ms_(poll_ms),
+      io_ms_(io_timeout_ms),
+      guard_(kViewsToAccept, ShrinkGuardPct()) {}
+
+MdsMemberPoller::MdsMemberPoller(std::vector<std::string> mds_eps,
+                                 std::string group, OnTopologyChange cb,
+                                 int poll_ms, int io_timeout_ms)
+    : eps_(std::move(mds_eps)),
+      group_(std::move(group)),
+      topology_cb_(std::move(cb)),
       poll_ms_(poll_ms),
       io_ms_(io_timeout_ms),
       guard_(kViewsToAccept, ShrinkGuardPct()) {}
@@ -58,53 +69,107 @@ uint64_t MdsMemberPoller::NowMs() const {
 }
 
 bool MdsMemberPoller::Query(std::vector<MemberInfo>* out, uint64_t* epoch) {
-  uint64_t now = NowMs();
-  std::string ep = eps_.Pick(now);
+  const uint64_t now = NowMs();
+  const std::string ep = eps_.Pick(now);
   if (ep.empty()) return false;
-  int fd = net::Dial(ep, io_ms_, io_ms_);
-  if (fd < 0) { eps_.MarkFailed(ep, now); return false; }
-  char pre[kReqPrefix];
-  EncodeReq(pre, WireOp::kListMembers, BlockKey{}, 0, 0, group_.size());
-  bool ok = net::WriteAll(fd, pre, kReqPrefix) &&
-            (group_.empty() || net::WriteAll(fd, group_.data(), group_.size()));
+
+  auto request = [&](WireOp op, Status* status, std::string* data) {
+    const int fd = net::Dial(ep, io_ms_, io_ms_);
+    if (fd < 0) return false;
+
+    char pre[kReqPrefix];
+    EncodeReq(pre, op, BlockKey{}, 0, 0, group_.size());
+    bool ok =
+        net::WriteAll(fd, pre, kReqPrefix) &&
+        (group_.empty() ||
+         net::WriteAll(fd, group_.data(), group_.size()));
+    uint64_t data_len = 0;
+    if (ok) {
+      char response[kRespPrefix];
+      ok = net::ReadAll(fd, response, kRespPrefix) &&
+           DecodeResp(response, status, &data_len,
+                      wire_limits::kMdsMaxRespData);
+    }
+    if (ok && *status == Status::kOk) {
+      data->resize(data_len);
+      ok = data_len == 0 || net::ReadAll(fd, &(*data)[0], data_len);
+    }
+    ::close(fd);
+    return ok;
+  };
+
+  Status status = Status::kInvalid;
   std::string data;
-  if (ok) {
-    char rp[kRespPrefix];
-    Status st = Status::kInvalid;
-    uint64_t dlen = 0;
-    ok = net::ReadAll(fd, rp, kRespPrefix) && DecodeResp(rp, &st, &dlen, wire_limits::kMdsMaxRespData) &&
-         st == Status::kOk;
-    if (ok) { data.resize(dlen); ok = (dlen == 0) || net::ReadAll(fd, &data[0], dlen); }
+  bool legacy_members = false;
+  bool ok = request(WireOp::kListTopology, &status, &data);
+  if (ok && status == Status::kInvalid) {
+    // kListTopology was appended after the legacy placement RPC. An old MDS
+    // reports an unknown operation as kInvalid; retry that same selected
+    // endpoint with kListMembers. No transport/framing failure reaches this
+    // branch, so an unhealthy modern endpoint still participates in failover.
+    data.clear();
+    ok = request(WireOp::kListMembers, &status, &data);
+    legacy_members = ok && status == Status::kOk;
   }
-  ::close(fd);
-  if (!ok) { eps_.MarkFailed(ep, now); return false; }
+  if (!ok || status != Status::kOk ||
+      !DecodeMembers(data.data(), data.size(), out, epoch)) {
+    eps_.MarkFailed(ep, now);
+    return false;
+  }
+  if (legacy_members) {
+    // ListMembers is a placement view and may omit degraded peers, so it can
+    // never prove complete rail topology even if a transitional MDS happens to
+    // append HLT1. Preserve legacy placement while making explicit-tier
+    // transports fail closed. Its wire epoch belongs to the placement view;
+    // publish the canonical topology generation expected by modern consumers.
+    for (auto& member : *out) {
+      member.health = MemberHealth{};
+      member.has_health = false;
+    }
+    *epoch = MembersTopologyEpoch(*out);
+  }
   eps_.MarkOk(ep);
-  return DecodeMembers(data.data(), data.size(), out, epoch);
+  return true;
 }
 
 bool MdsMemberPoller::PollOnce() {
-  std::vector<MemberInfo> ms;
-  uint64_t epoch = 0;
-  if (!Query(&ms, &epoch)) return false;  // failed RPC never clears the ring
+  std::vector<MemberInfo> topology;
+  uint64_t topology_epoch = 0;
+  if (!Query(&topology, &topology_epoch))
+    return false;  // failed RPC never clears the ring
 
-  // Adoption guard (MemberViewGuard): a *successful* response that is empty
-  // OR deviates from the trusted reference past the suspicion bar is almost
-  // always etcd-outage recovery (mass lease expiry / staggered
-  // re-registration), not a genuine membership swing; adopting it remaps the
-  // whole cluster into a miss storm and remaps AGAIN when the members
-  // stabilize. Suspicious views must reappear as the SAME value for
-  // kViewsToAccept polls.
-  // Rejecting must not advance the placement-content epoch — eventual adoption
-  // of that same content would otherwise be suppressed by epoch dedup below.
-  if (!guard_.Admit(ms.size()))
-    return true;  // keep the last ring; do NOT invoke on_change
-
-  if (!have_epoch_ || epoch != last_epoch_) {
-    last_epoch_ = epoch;
-    have_epoch_ = true;
-    if (!ms.empty()) ever_adopted_ = true;
-    cb_(ms);
+  std::vector<MemberInfo> placement;
+  placement.reserve(topology.size());
+  for (const auto& member : topology) {
+    if (member.RingEligible()) placement.push_back(member);
   }
+  const uint64_t placement_epoch = MembersEpoch(placement);
+
+  // The placement guard still judges the eligible view, exactly as it did when
+  // kListMembers filtered degraded members on the server. A rejected placement
+  // never advances its epoch, so a persistent view can be adopted later.
+  // Topology generations are independent: HLT1 changes must reach the modern
+  // callback immediately even while the corresponding placement is held.
+  const bool placement_admitted = guard_.Admit(placement.size());
+  const bool topology_changed =
+      !have_topology_epoch_ || topology_epoch != last_topology_epoch_;
+  if (topology_changed) {
+    last_topology_epoch_ = topology_epoch;
+    have_topology_epoch_ = true;
+  }
+
+  bool placement_changed = false;
+  if (placement_admitted &&
+      (!have_placement_epoch_ || placement_epoch != last_placement_epoch_)) {
+    last_placement_epoch_ = placement_epoch;
+    have_placement_epoch_ = true;
+    placement_changed = true;
+    if (!placement.empty()) ever_adopted_ = true;
+  }
+
+  if (topology_cb_ && (topology_changed || placement_changed))
+    topology_cb_(topology, topology_epoch, placement_admitted);
+  if (cb_ && placement_changed) cb_(placement);
   return true;
 }
 
@@ -119,7 +184,7 @@ void MdsMemberPoller::ReportHealth(bool query_ok) {
     }
     return;
   }
-  // Query failed: no MDS endpoint answered ListMembers (unreachable or RPC
+  // Query failed: no MDS endpoint answered ListTopology (unreachable or RPC
   // error). The ring is intentionally NOT cleared, but if it was never
   // populated the client routes every op to an empty ring and silently returns
   // ok=0 — the exact trap where a mistyped mds_endpoint looks like a write/data

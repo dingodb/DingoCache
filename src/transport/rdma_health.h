@@ -20,6 +20,9 @@ class RdmaHealthMonitor {
   using ProbeFn = std::function<std::vector<IbDeviceHealth>()>;
 
   explicit RdmaHealthMonitor(ProbeFn probe, uint32_t recovery_samples = 3);
+  // Runtime placement needs at least one healthy initialized rail. Loss of the
+  // final rail is immediate; recovery from zero requires recovery_samples
+  // consecutive samples with at least one healthy rail.
 
   MemberHealth Sample();
   MemberHealth Last() const;
@@ -30,7 +33,7 @@ class RdmaHealthMonitor {
   uint32_t recovery_samples_;
   mutable std::mutex mu_;
   MemberHealth last_;
-  uint32_t healthy_streak_ = 0;
+  uint32_t active_streak_ = 0;
   bool sampled_ = false;
 };
 

@@ -17,8 +17,8 @@ dfkv 把**控制面**与**数据面**解耦：
 
 - **控制面 = TCP + 两边 SEND/RECV**：bootstrap TCP 只交换设备/QP/receive-segment 描述；RDMA QP 的 request descriptor 有界，response buffer 显式预留 `18-byte prefix + 32 KiB`，使 32-KiB `Members` 在 control lane 完整返回；更大响应直接失败、不截断。
 - **payload = one-sided RDMA**：v2 PUT 用 `RDMA_WRITE_WITH_IMM` 直落 server 共享 receive-segment slot，GET 由 server `RDMA_WRITE` 到 client 提交的 `{addr,rkey,len}`。数据 fabric 无需 IP。
-- **设备发现**：留空时自动发现策略保持 `ACTIVE`-only（两端各选本地首个 port 1 `ACTIVE` HCA）；显式逗号白名单定义固定 topology，按配置首次出现顺序去重，且 server 会接纳**存在但启动时 DOWN** 的设备完成 anchor/MR 初始化并持续监控。多 fabric 节点仍须过滤到两端同名且互通的 fabric。
-- **失败策略**：未设 `DFKV_RDMA` 时选择 TCP；一旦选择 RDMA，显式设备缺失、open/port/GID query 失败，或任一 configured rail 的 anchor、共享 receive-segment MR、RAM/user MR 初始化失败，均拒绝启动而不缩小 topology。present DOWN 本身不拒绝启动，但整个节点保持 ring-ineligible，直至全部 initialized/resolved rail（包括未配置列表时自动发现的 rail）通过恢复采样门；无需重启。
+- **设备发现与拓扑**：留空时自动发现保持 `ACTIVE`-only（两端各选本地首个 port 1 `ACTIVE` HCA）；显式逗号白名单定义固定 topology，按首次出现顺序去重，server 会接纳**存在但启动时 DOWN** 的设备完成 anchor/MR 初始化并持续监控。运行期至少一条 initialized rail 健康即可承载 placement；最后一条健康 rail 丢失立即退环，0→非 0 恢复仍通过连续采样门。
+- **失败策略**：未设 `DFKV_RDMA` 时选择 TCP；一旦选择 RDMA，显式设备缺失、open/port/GID query 失败，或任一 configured rail 的 anchor、共享 receive-segment MR、RAM/user MR 初始化失败，均拒绝启动而不缩小 topology。client 配置 `DFKV_RDMA_RAIL_TIERS` 后还要求 MDS 返回完整 HLT1 peer topology；缺失/不完整或无兼容健康轨以 client-local `kNoCompatibleRail` fail closed，不切 TCP、不惩罚 peer。
 
 发现：默认走 **MDS 动态发现**（etcd + dfkv_mds，见 §2b）；静态成员表仍作为遗留/单节点备用路径（见 §4-legacy）。无副本（一致性哈希单属主，节点挂 = 该分片 miss → 重算）。
 
@@ -178,10 +178,10 @@ Environment=DFKV_RDMA_RECV_SEGMENT_SIZE=17179869184
 # 8×400G 轨全轨白名单 + NUMA：B200 生产 host 一台带 8 个 HCA 轨。
 # 显式白名单是固定 topology：保留首次出现顺序；present DOWN rail 仍必须完成
 # anchor/共享 segment/所有配置 MR 初始化，随后由 health monitor 等待 LinkUp。
-# server/client 两端白名单到**同名互通**一组轨；client 的 `DFKV_RDMA_NUMA=1`
-# 后每 rank 优先本 NUMA 轨，本地轨全不可准入时降级重试全部 enabled rail
-# （rail_select.h/rdma_transport.cc）。`--rdma-dev` 直传 RDMA server，胜过同名
-# env；client 侧 `DFKV_RDMA_DEV` 另行注入（CONNECTORS §1.2）。
+# client 侧另行注入本机 `DFKV_RDMA_DEV`；GPU/CPU host 可有不同列表。
+# 若设置 `DFKV_RDMA_RAIL_TIERS`，名称须来自该 local list，peer HLT1 用同名健康
+# 交集决定最高可用 tier。NUMA/credits/latency 只在 tier 内选择，拥塞不降 tier。
+# `--rdma-dev` 只配置 server，胜过同名 env（CONNECTORS §1.2）。
 Environment=DFKV_RDMA_NUMA=1
 # v2.0.0 监听器加固（PR#240）：首帧 30s absolute deadline 断 slow-dribble,
 # metrics 端口连接数上限 64（防连接占用打满）,
@@ -295,74 +295,74 @@ journalctl -u dfkv -n 10 --no-pager
 > [METRICS.md](METRICS.md) 的 registrar heartbeat 指标。
 > RDMA startup 日志
 > `rdma topology startup: configured=N initialized=N ACTIVE=M inactive=...`
-> 分别给出 `configured`（显式列表按首次出现去重；自动发现时为 0）、
-> `initialized`（自动发现或显式配置后 resolved、且 anchor 和启动所需 MR 全部
-> 完成的 rail）及启动瞬间 verbs port `IBV_PORT_ACTIVE` rail 数。显式部署必须
-> 看到 `configured == initialized`；`ACTIVE` 可以较小，此时启动成功但
-> `dfkv_server_ring_eligible=0`。运行期 rail 总数/顺序 immutable，健康门覆盖
-> **全部 initialized/resolved rail**，包括 auto 模式选出的 rail；当前
-> ACTIVE+LinkUp 健康数应从 `sum(dfkv_server_ib_device_healthy)` 读取，不能把
-> 启动 `ACTIVE` 快照当成当前状态。这两个 `dfkv_server_*` IB health family
-> 仅在 RDMA-enabled binary 实际启动 RDMA listener 时输出；TCP-only binary
-> 或未启动 RDMA listener 的进程缺少它们是预期行为，告警不得把缺失补成 0。
-> server 的 bootstrap 监听 `0.0.0.0`，靠防火墙限制在内网。优雅关闭已修（`systemctl stop` 约 1s 退出）。
-> **多轨与 NUMA**：两端自动发现留空时仍只选首个 ACTIVE HCA。server 的显式
-> `--rdma-dev` 是固定 anchor 白名单：按首次出现顺序去重并固定索引；client 的
-> `DFKV_RDMA_DEV` 是独立的数据面选择，仍须指向当前可用且与 server 同名互通的
-> rail。server 对每个 provider metadata 完整（包括 GID query 成功）的 configured
-> rail 建立 anchor、共享 receive-segment MR 及所有已配置 MR，**不会因为启动时
-> DOWN 就删轨或重排**。任一 rail missing/open/port/GID query/anchor/MR 失败都
-> fail-fast，不以子集启动。设备名在 peer
-> 显式选轨 frame 中上限 18 字节；超长 server anchor 只能作为 default anchor
-> 访问，生产两端显式白名单不得使用。生产多 fabric 主机仍须在两端过滤到
-> **同名且互通**设备。client 以 `DFKV_RDMA_RAIL_CREDITS` 的 per-rail credit、
-> 归一化 inflight、延迟和本地 rail 错误分数选轨（分数相同时按固定发现顺序
-> 选择）。`DFKV_RDMA_NUMA=1` 在每次 Acquire 读取 caller NUMA；白名单内存在
-> local rail 时严格优先 local mask。caller NUMA 未知或没有 local rail 时回退
-> 全部白名单；全部 local rail 都不可准入（被隔离或 credit 耗尽）时也会降级为
-> 全 enabled rail 重试一次——local 是严格偏好而不是可用性闸门。receive
-> segment 仍是单块 process-wide 分配，不是 per-NUMA/per-rail 分片。
+> 分别给出显式 configured、完成 anchor/启动 MR 的固定 initialized 集合、以及
+> 启动瞬间 ACTIVE 快照。显式部署必须 `configured == initialized`；missing/open/
+> port/GID/anchor/MR 任一失败仍拒绝启动。运行期不可用 rail 不会被删除或重排。
+> 当前总数和健康数看 `dfkv_server_rdma_rails_configured`、
+> `dfkv_rdma_rails_initialized`、`dfkv_server_rdma_rails_active` 和
+> `dfkv_server_ib_device_healthy{device}`，不能把启动 `ACTIVE` 当现状。这些
+> family 仅在 RDMA listener 存在时输出；TCP-only 进程缺失是预期行为。
 >
-> **boot-degraded 与容量取舍**：present DOWN rail 完成初始化后留在固定
-> topology 和 metrics label 集合中；任一 initialized/resolved rail（包括 auto
-> 模式选出的 rail）当前不是 ACTIVE/LinkUp，节点就以 `DEGRADED` 注册并整体退出
-> placement ring。其余健康 rail 不承接该节点的部分流量，因此代价是临时损失
-> 该节点**全部** cache capacity/vnode share，而不是只损失一条 rail 的带宽。
-> 恢复门默认要求三个连续成功的本地健康采样机会。按 registrar 名义 10 s 节拍，
-> LinkUp 后通常约 20–30 s（取决于采样相位）完成三次，但还要叠加 registrar
-> 建连/RPC 及 MDS 对外可见延迟；MDS 不可达时采样/发布可更久，因此这不是
-> wall-clock 上界。门满足后同一进程自动 rejoin，**LinkUp 后无需 restart**。
+> **partial health**：至少一条 initialized rail 健康即允许 placement。9→8 等
+> 部分掉轨保持 ring eligible，并报告 `PARTIAL`；最后一条健康轨丢失时立即
+> `DEGRADED`/退环。0→1 恢复保持
+> `DFKV_RDMA_HEALTH_RECOVERY_SAMPLES`（默认 3）连续成功采样门，通过后以
+> `PARTIAL` 或 `ACTIVE` 原进程回环，无需重启。该门只防恢复抖动，不延迟从非零
+> 到零的摘除。
 >
-> **client-local 失败域与有界重放**：本地 device open、QP transition、
-> MR register/refresh、post/CQ verbs API 失败，以及被分类为 local 的 WC
-> （`LOC_*`、`FATAL`、`GENERAL`）才是 `kRailFailure`。TCP bootstrap、peer
-> 不可达、probe/协商/protocol/receive-segment/decode 失败，remote/retry/RNR/
-> response-timeout/flush WC，以及没有 local-error WC 的 completion deadline
-> 是 endpoint 失败；resource/rail-credit admission、cancel 和 invalid input
-> 也不是 rail 健康证据。后两类不会增加 rail consecutive errors 或错误恢复
-> rail，endpoint 失败仍由 `PeerHealth` 处理。
+> **peer-aware tiers**：server `--rdma-dev` 和 client `DFKV_RDMA_DEV` 都固定
+> 本机设备索引。client 的 `DFKV_RDMA_RAIL_TIERS` 用 `a|b;c` 表示优先级：
+> `|` 是同 tier，`;` 从 Tier 0 向低优先级分隔；空 tier/name、重复 rail 或任何
+> 不在 `DFKV_RDMA_DEV` 的名称都使 client 初始化失败。未配置 tiers 时全部 local
+> devices 是一个 homogeneous tier。MDS `kListTopology` 返回 Members 基础记录的
+> 地址/placement binding，并复用 `HLT1` 扩展承载 eligibility 与
+> `{device,port_state,phys_state,query_ok}`；不另建 rail 协议。client 选择稳定的
+> `local enabled ∩ peer healthy ∩ highest available tier`。NUMA、credits、
+> latency、quarantine/cooldown 只在该 tier 内排序/等待；**健康 Tier-0 credit
+> 紧张必须等待，拥塞绝不溢出 Tier 1**。只有 peer health 使高 tier 完全不可用，
+> 才会使用下一 tier。
 >
-> 首次 `kRailFailure` 后，client 必须先 retire endpoint，并同步完成 QP/CQ/MR
-> teardown，才会建立 fresh endpoint 做**至多一次**重试；物理尝试总数固定为
-> 2，不可配置。第二次选择从 NUMA preferred 和 fallback 两个集合同时排除故障
-> rail，只要 topology 中存在另一条 enabled rail 就必须换轨；不能因为另一轨
-> credit 耗尽、正在 quarantine 或 cooldown 就回到原轨。单轨部署没有另一条
-> topology-enabled rail 时可做一次 fresh 同轨重试，但绝不复用故障 QP，也不
-> 绕过 quarantine/cooldown/backpressure。
+> GPU/CPU 异构示例（名称仅为示例，生产须用两端实际同 fabric 名）：
+> ```bash
+> # GPU host: two preferred rails plus one lower-bandwidth fallback
+> export DFKV_RDMA_DEV=mlx5_0,mlx5_1,mlx5_2
+> export DFKV_RDMA_RAIL_TIERS='mlx5_0|mlx5_1;mlx5_2'
 >
-> 该重试会从头重放现有整个 logical PUT/GET/batch/SG operation，语义仍是
-> **at-least-once**：若 PUT 已在远端 commit 而本地 completion 丢失，同一覆盖
-> 写可能执行两次，不提供 exactly-once 或 concurrent-writer isolation。它与
-> pooled stale-QP 的既有 fresh-endpoint retry 分开计数。实现完全在 client，
-> 与 server 的 `DFKV_RDMA_HEALTH_FILE`、`dfkv_server_ring_eligible` 整节点
-> 退环/恢复机制无关；**不修改 RDMA wire protocol 或 server 行为**，因此升级
-> client 与仍支持同一 RDMA v2 protocol 的混合版本 server 兼容。
+> # CPU host: one preferred rail plus the shared fallback
+> export DFKV_RDMA_DEV=mlx5_0,mlx5_2
+> export DFKV_RDMA_RAIL_TIERS='mlx5_0;mlx5_2'
+> ```
+> GPU↔GPU 可在 `mlx5_0|mlx5_1` 内选择；GPU↔CPU 的最高共同健康 tier 是
+> `mlx5_0`，仅它健康性消失后才考虑 `mlx5_2`。设备名不匹配不是“异构映射”，
+> 而是无交集。
 >
-> **client-local quarantine 恢复**：默认连续 3 次 `kRailFailure` 后隔离该
-> rail 5000 ms。cooldown 前不准入；到期仅一个真实 operation 获得 recovery
-> probe，其他 caller 继续跳过。probe success 清除 consecutive errors/
-> quarantine 并记录 recovery；probe local failure 重启完整 cooldown；probe
-> endpoint failure 只释放 probe ownership，既不证明恢复也不增加 local fault。
+> **HLT1 / mixed version**：`MembersTopologyEpoch` 以稳定 member-id/device-name
+> 顺序 canonicalize 地址/placement binding、eligibility 和每轨 health 字段；
+> client 用 placement epoch 独立去重 Ketama ring，同时始终把新的 topology
+> generation 送给 transport。旧 MDS 不识别 `kListTopology`：modern poll 会失败并
+> 保留 last-good ring，不会静默降回 `kListMembers`；因此 rollout 先升级 MDS。
+> 当前 MDS 中的旧 member 没有 HLT1，topology 标记 incomplete。未配置 tiers 的
+> homogeneous client 可继续服务这类 member；配置 tiers 时返回
+> `Status::kNoCompatibleRail`。静态 member 列表也没有 HLT1，不能与 configured
+> tiers 搭配。旧 client 对新 MDS 仍可使用既有 placement API，但没有 peer-aware
+> tier 能力。
+>
+> **generation fence 与错误语义**：每个 logical operation 在开始时捕获一个
+> peer generation，两次物理尝试都使用它。Conn 记录 peer generation；旧代 pool
+> entry 不再复用/回池，只由既有 single-owner lifecycle teardown，防止 topology
+> 变化后跨代 QP 复活。`kNoCompatibleRail` 是 client-local、从不编码上 wire，
+> 不计 served response、IO error 或 peer cooldown。
+>
+> 物理尝试总数仍固定至多 2。已完成的 GET/batch/SG item/window 保留 byte-exact
+> 结果，第二次只提交未完成工作。PUT 只有在确认 request 尚未 post 时才可换轨；
+> post 后 failure 的远端 commit 状态不明确，必须原样失败，**不得跨轨 replay**。
+> 这不扩大 pooled stale-QP 的既有 fresh retry，也不承诺 exactly-once 或
+> concurrent-writer isolation。
+>
+> client-local rail quarantine 仍由本地 Open/QP/MR/post/CQ 和 local WC 证据
+> 驱动；peer/bootstrap/protocol、remote/RNR/timeout、admission、
+> `kNoCompatibleRail` 均不增加 local rail error。cooldown 到期仍只准入一个真实
+> recovery probe。
 >
 > **v2 segment 预算**：`slot=align4K(4096 + max_raw_payload)`；
 > `segment >= Σ(live + client-pool-idle data/control QP × depth × slot)`。lease
@@ -472,10 +472,11 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `DFKV_RDMA_BATCH_OP_TIMEOUT_MS` | 0=跟随 RDMA_OP | client：multi-item Cache/Range/Exist、SG 窗口总期限 |
 | `DFKV_RDMA_POOL_MAX` | `16` | client：每 server、每 lane、跨所有 rail 的 idle QP 保留上限，不是进程总连接上限；只在稳定负载仍反复建连时上调 |
 | `DFKV_RDMA_RAIL_CREDITS` | 默认 `64`, 硬上限 4096 | client：每 rail QP 信用数（inflight 上限），>server depth 会回退 |
+| `DFKV_RDMA_RAIL_TIERS` | unset = `DFKV_RDMA_DEV` 全部同一 homogeneous tier | client：`a|b;c`；所有名必须在 `DFKV_RDMA_DEV`。从最高非空 `local enabled ∩ peer healthy` tier 选轨；configured tiers 遇 absent/incomplete HLT1 或空交集返回 `kNoCompatibleRail` |
 | `DFKV_RDMA_RAIL_BACKPRESSURE_MS` | `10` | client：Acquire 失败重试 backoff |
 | `DFKV_RDMA_RAIL_COOLDOWN_MS` | `5000` | client-local rail quarantine 冷却期；冷却期间不准入，期满仅允许 1 个真实 operation 作为 recovery probe |
 | `DFKV_RDMA_RAIL_ERROR_THRESHOLD` | `3` | client：连续 `kRailFailure` 达到该值才 quarantine；peer/endpoint、admission、timeout（无 local-error WC）、cancel 和 invalid input 不计入 |
-| client-local rail attempts | 固定 `2`（不可配置） | client：初次尝试加至多一次 fresh retry；存在另一条 topology-enabled rail 时必须换轨，单轨才可 fresh 同轨且不得绕过 quarantine |
+| client-local rail attempts | 固定 `2`（不可配置） | GET/batch/SG 第二次只重试未完成 item/window；PUT 仅在确认 request 未 post 时可换轨，post 后 ambiguous failure 不 replay |
 | `DFKV_RDMA_RAIL_LATENCY_WEIGHT` | — | client：rail selection 的延迟 EWMA 权重 |
 | `DFKV_RDMA_RAIL_ERROR_PENALTY_US` | — | client：rail selection 的错误分数惩罚微秒 |
 | `DFKV_RDMA_IDLE_MS` | — | server：idle QP 重回收周期 |
@@ -550,8 +551,8 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `DFKV_READ_SHARD_KEYS` | `16` | client 每个 read shard 的目标 key 数；server 不读取 |
 | `DFKV_MDS_IO_TIMEOUT_S` | `60` | MDS 控制面帧读写超时（MDS 进程该） |
 | `DFKV_MDS_ETCD_PROBE_MS` | `30000` | MDS 与 etcd 存活探测窗（MDS 进程该） |
-| `DFKV_RDMA_HEALTH_RECOVERY_SAMPLES` | `3` | 仅有 RDMA listener 时生效。健康门检查固定的全部 initialized/resolved rail（包括 auto-discovered rail）；任一 query 失败或非 ACTIVE/LinkUp 立即退整节点。恢复要求连续三个成功采样机会，不是固定时长：启动先采样一次，后续在 registrar 建连后、每次 MDS 注册/心跳 RPC 发送前采样。heartbeat 名义间隔 10 s，通常约 20–30 s（取决于相位），另加建连/RPC/发布延迟；MDS 不可达时可能更久，无 wall-clock 上界 |
-| `DFKV_RDMA_HEALTH_FILE` | 未设置（生产必须未设置） | 仅用于受控故障注入；每行 `device port_state phys_state`，缺失任一 initialized/resolved 设备（包括 auto-discovered rail）按 query 失败处理。生产从 sysfs 读取 |
+| `DFKV_RDMA_HEALTH_RECOVERY_SAMPLES` | `3` | 仅 RDMA listener 生效。任一 initialized rail 健康即可 placement；部分掉轨保持 `PARTIAL`。最后一条健康 rail 丢失立即 `DEGRADED`；0→非 0 恢复要求连续成功样本，通过后 `PARTIAL`/`ACTIVE` 回环 |
+| `DFKV_RDMA_HEALTH_FILE` | 未设置（生产必须未设置） | 仅受控故障注入；逐 initialized device 提供 `device port_state phys_state`，生产从 sysfs 读取 |
 | `DFKV_TENANT_QUOTAS_COUNT` | — | tenant 配额文件预期条数（容量校验） |
 
 #### 未收录的常见误配 → 详见 CONNECTORS.md §1.7
@@ -566,11 +567,13 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 ### 4a. MDS 动态发现（推荐）
 
 节点通过 `--mds` + `--group` + `--id` + `--advertise` 向 MDS 自注册。客户端在
-调用 `dfkv_open_v2` 前，把 endpoints、group、poll interval 和可选客户端注册身份
-一次性写入 `dfkv_client_options_v2`；构造成功后自动轮询 MDS。epoch
-（placement 内容 hash）变化时自动重建加权 Ketama 环。增减节点只需启停
-`dfkv_server`，无需修改已运行客户端的配置。
-
+`dfkv_open_v2` 构造时一次性提供 endpoints/group/poll interval。现代客户端请求
+`kListTopology`：placement 仍用原成员字段和 `MembersEpoch` 独立去重；已有
+`HLT1` 扩展承载 eligibility 与逐设备健康，`MembersTopologyEpoch` 变化时即使
+Ketama placement 不变也调用 transport 的 peer-topology 更新。当前 MDS 中的旧
+member 因缺少 HLT1 而产生 incomplete topology：未配置 tiers 时 homogeneous
+兼容，配置 `DFKV_RDMA_RAIL_TIERS` 时 fail closed。旧 MDS 不支持
+`kListTopology`，modern poll 失败并保留 last-good ring；rollout 必须 MDS-first。
 两层离线检测：
 - **层 2（权威）**：etcd lease 到期（TTL 30s）→ 下次 MDS poll（默认 3s）→
   placement-content epoch 推进 → 环重建。小幅缩容通常约 TTL+一次 poll；

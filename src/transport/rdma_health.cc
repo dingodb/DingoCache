@@ -72,19 +72,20 @@ RdmaHealthMonitor::RdmaHealthMonitor(ProbeFn probe,
       recovery_samples_(std::max<uint32_t>(1, recovery_samples)) {}
 
 MemberHealth RdmaHealthMonitor::Sample() {
-  std::vector<IbDeviceHealth> devices = probe_ ? probe_() : std::vector<IbDeviceHealth>{};
-  const bool all_healthy = !devices.empty() &&
-      std::all_of(devices.begin(), devices.end(),
+  std::vector<IbDeviceHealth> devices =
+      probe_ ? probe_() : std::vector<IbDeviceHealth>{};
+  const bool any_healthy =
+      std::any_of(devices.begin(), devices.end(),
                   [](const IbDeviceHealth& d) { return d.healthy(); });
   std::lock_guard<std::mutex> lock(mu_);
   const bool was_eligible = last_.ring_eligible;
-  if (!all_healthy) {
-    healthy_streak_ = 0;
+  if (!any_healthy) {
+    active_streak_ = 0;
     last_.ring_eligible = false;
   } else if (!sampled_ || last_.ring_eligible) {
-    healthy_streak_ = recovery_samples_;
+    active_streak_ = recovery_samples_;
     last_.ring_eligible = true;
-  } else if (++healthy_streak_ >= recovery_samples_) {
+  } else if (++active_streak_ >= recovery_samples_) {
     last_.ring_eligible = true;
   }
   last_.ib_devices = std::move(devices);
@@ -104,11 +105,22 @@ MemberHealth RdmaHealthMonitor::Last() const {
 
 std::string RdmaHealthMonitor::MetricsText() const {
   const MemberHealth health = Last();
+  const size_t active = static_cast<size_t>(std::count_if(
+      health.ib_devices.begin(), health.ib_devices.end(),
+      [](const IbDeviceHealth& device) { return device.healthy(); }));
   std::string out =
       "# HELP dfkv_server_ring_eligible Whether IB health permits placement ring membership\n"
       "# TYPE dfkv_server_ring_eligible gauge\n"
       "dfkv_server_ring_eligible " +
       std::string(health.ring_eligible ? "1\n" : "0\n") +
+      "# HELP dfkv_server_rdma_rails_configured RDMA rails in the server's fixed configured topology\n"
+      "# TYPE dfkv_server_rdma_rails_configured gauge\n"
+      "dfkv_server_rdma_rails_configured " +
+      std::to_string(health.ib_devices.size()) + "\n"
+      "# HELP dfkv_server_rdma_rails_active Configured RDMA rails currently healthy\n"
+      "# TYPE dfkv_server_rdma_rails_active gauge\n"
+      "dfkv_server_rdma_rails_active " +
+      std::to_string(active) + "\n"
       "# HELP dfkv_server_ib_device_healthy Whether an IB device port is ACTIVE and LinkUp\n"
       "# TYPE dfkv_server_ib_device_healthy gauge\n";
   for (const auto& device : health.ib_devices) {

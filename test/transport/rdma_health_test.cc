@@ -16,7 +16,7 @@ IbDeviceHealth Device(const char* name, uint8_t port, uint8_t phys,
 
 }  // namespace
 
-TEST(RdmaHealth, AnyUnhealthyDeviceRemovesNodeImmediately) {
+TEST(RdmaHealth, AnyHealthyDeviceKeepsNodeEligible) {
   std::deque<std::vector<IbDeviceHealth>> samples{
       {Device("ib0", 4, 5), Device("ib1", 4, 5)},
       {Device("ib0", 4, 5), Device("ib1", 2, 2)}};
@@ -26,10 +26,29 @@ TEST(RdmaHealth, AnyUnhealthyDeviceRemovesNodeImmediately) {
     return sample;
   });
   EXPECT_TRUE(monitor.Sample().ring_eligible);
-  const MemberHealth degraded = monitor.Sample();
-  EXPECT_FALSE(degraded.ring_eligible);
-  ASSERT_EQ(degraded.ib_devices.size(), 2u);
-  EXPECT_FALSE(degraded.ib_devices[1].healthy());
+  const MemberHealth partially_degraded = monitor.Sample();
+  EXPECT_TRUE(partially_degraded.ring_eligible);
+  ASSERT_EQ(partially_degraded.ib_devices.size(), 2u);
+  EXPECT_TRUE(partially_degraded.ib_devices[0].healthy());
+  EXPECT_FALSE(partially_degraded.ib_devices[1].healthy());
+  const std::string metrics = monitor.MetricsText();
+  EXPECT_NE(metrics.find("dfkv_server_rdma_rails_configured 2"),
+            std::string::npos);
+  EXPECT_NE(metrics.find("dfkv_server_rdma_rails_active 1"),
+            std::string::npos);
+}
+
+TEST(RdmaHealth, ZeroActiveDevicesRemovesNodeImmediately) {
+  std::deque<std::vector<IbDeviceHealth>> samples{
+      {Device("ib0", 4, 5), Device("ib1", 2, 2)},
+      {Device("ib0", 1, 2), Device("ib1", 2, 2)}};
+  rdma::RdmaHealthMonitor monitor([&] {
+    auto sample = samples.front();
+    samples.pop_front();
+    return sample;
+  });
+  EXPECT_TRUE(monitor.Sample().ring_eligible);
+  EXPECT_FALSE(monitor.Sample().ring_eligible);
 }
 
 TEST(RdmaHealth, RecoveryRequiresConsecutiveHealthySamples) {
@@ -45,6 +64,21 @@ TEST(RdmaHealth, RecoveryRequiresConsecutiveHealthySamples) {
   EXPECT_FALSE(monitor.Sample().ring_eligible);
   EXPECT_FALSE(monitor.Sample().ring_eligible);
   EXPECT_FALSE(monitor.Sample().ring_eligible);
+  EXPECT_FALSE(monitor.Sample().ring_eligible);
+  EXPECT_FALSE(monitor.Sample().ring_eligible);
+  EXPECT_TRUE(monitor.Sample().ring_eligible);
+}
+
+TEST(RdmaHealth, SingleRailUsesTheSameRemovalAndRecoveryLifecycle) {
+  std::deque<std::vector<IbDeviceHealth>> samples{
+      {Device("ib0", 4, 5)}, {Device("ib0", 1, 2)},
+      {Device("ib0", 4, 5)}, {Device("ib0", 4, 5)}};
+  rdma::RdmaHealthMonitor monitor([&] {
+    auto sample = samples.front();
+    samples.pop_front();
+    return sample;
+  }, 2);
+  EXPECT_TRUE(monitor.Sample().ring_eligible);
   EXPECT_FALSE(monitor.Sample().ring_eligible);
   EXPECT_FALSE(monitor.Sample().ring_eligible);
   EXPECT_TRUE(monitor.Sample().ring_eligible);

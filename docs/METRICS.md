@@ -21,13 +21,12 @@
 还要求本地 startup 完成以及（配置 MDS 时）首次注册成功。首次注册 latch 后，
 瞬时 heartbeat 丢失不会清 readiness；用下述 heartbeat 指标单独告警。未配置
 MDS 的 node 仅等待本地 startup 和动态 storage health。
-IB ring eligibility is intentionally independent of these HTTP checks. Only an
-RDMA-enabled binary with an active RDMA listener constructs the health monitor
-and emits `dfkv_server_ring_eligible` /
-`dfkv_server_ib_device_healthy`; their absence from a TCP-only binary or an
-RDMA build without a listener is expected. When present, an initialized server
-with a `DOWN` rail can keep `/healthz` and `/readyz` at 200 while
-`dfkv_server_ring_eligible=0` excludes the whole node from placement.
+IB placement eligibility is independent of these HTTP checks. Only an
+RDMA-enabled binary with an active listener emits the server rail families.
+At least one healthy initialized rail keeps the node eligible: a partial loss
+reports fewer active rails but `/healthz`, `/readyz`, and placement remain
+online. Losing the final healthy rail makes `dfkv_server_ring_eligible=0`
+immediately; 0→nonzero recovery waits the configured sample streak.
 `dfkv_mds` 的语义不同：`/healthz` 是纯进程 liveness，**不 probe etcd**——
 否则一次秒级 etcd 抖动会让 kubelet 同时重启全部 MDS 副本，CrashLoop 比抖动
 更久并引发 lease 集体过期。`/readyz` 保留 etcd 依赖检查，但经 TTL-debounced
@@ -123,45 +122,38 @@ Tenant 标签**只**来自启动时有界配置文件中的 16-hex hash；默认
 此时 cache `/readyz` 保持 200，恢复后续租。`rate(dfkv_tcp_rejected_connections_total[5m]) > 0`
 触发时同步看 `dfkv_open_connections / dfkv_tcp_max_connections`。
 
-IB rail 告警必须按**节点**聚合：
-`min by (instance) (dfkv_server_ib_device_healthy) == 0` 或
-`dfkv_server_ring_eligible == 0` 表示该节点的**全部** cache capacity 已从
-placement ring 移除，不能把其余健康 rail 当成部分容量仍可路由。这两个查询在
-TCP-only server 或未启动 RDMA listener 的 RDMA build 上不会返回序列，这是预期
-行为；不得用 `or vector(0)` 等方式把缺失补成 unhealthy。若要告警“应有但缺失”，
-必须用明确标识 RDMA-listener 部署的 scrape inventory，例如：
-```promql
-(up{job="dfkv-server-rdma"} == 1)
-  unless on(job, instance) dfkv_server_ring_eligible{job="dfkv-server-rdma"}
-```
-不能对混合 TCP/RDMA job 全局使用 `absent()`。
+IB rail 告警先看 active cardinality，再看 eligibility：
+`dfkv_server_rdma_rails_active < dfkv_rdma_rails_initialized` 表示 `PARTIAL`
+带宽；只要 active ≥1，节点仍在 placement。`dfkv_server_ring_eligible == 0`
+表示最后健康 rail 已丢失、该节点全部 cache capacity 已摘除。逐轨定位用
+`dfkv_server_ib_device_healthy{device}`。这些查询在 TCP-only server 或未启动
+RDMA listener 的 RDMA build 上不会返回序列，这是预期行为；不得用
+`or vector(0)` 把缺失补成 unhealthy。告警“应有但缺失”必须关联明确的
+RDMA-listener scrape inventory。
 
-默认 `DFKV_RDMA_HEALTH_RECOVERY_SAMPLES=3`。健康门覆盖全部
-initialized/resolved rail，包括未配置设备列表时 auto-discovered 的 rail；任一
-query 失败或 non-ACTIVE/LinkUp 样本立即清零 streak 并退环。恢复要求三个连续
-成功的本地健康采样机会，而不是固定时长。启动时先采样一次，后续在 registrar
-成功建立连接后、每次注册/心跳 RPC 发送前采样（heartbeat 名义间隔 10 s），MDS
-只在 RPC 成功后看到新状态。因此 LinkUp 后通常约 20–30 s（取决于采样相位）
-完成三个样本，还要叠加 registrar 建连/RPC 与发布延迟；MDS 不可达时可能更久。
-这不是 wall-clock 上界。**无需重启**；重启反而丢弃已初始化 topology 并重新
-承担全部 anchor/MR 启动成本。
+默认 `DFKV_RDMA_HEALTH_RECOVERY_SAMPLES=3`。从非零健康轨降到零立即清 eligibility；
+从零恢复到非零才要求连续成功的本地健康采样机会。通过后，全部轨健康为
+`ACTIVE`，部分健康为 `PARTIAL`。heartbeat 名义间隔 10 s 时三次机会通常约
+20–30 s（取决于相位），还要叠加 registrar/MDS 发布延迟；这不是上界，也无需
+重启。部分掉轨 9→8 不走该恢复门，因为节点从未失去最后健康轨。
 
 四种 rail 口径不能混用：
 
 | 口径 | 权威来源 | 解释 |
 |---|---|---|
-| configured | startup log `configured=N` | 显式列表按首次出现去重后的意图；auto 模式为 0 |
-| initialized/resolved | startup log `initialized=N`；成功启动后 `dfkv_rdma_recv_segment_registered_rails` | 自动发现或显式配置后已完成 anchor、共享 segment 和全部启动 MR 的固定 topology；auto 模式包含选出的 rail |
-| startup-ACTIVE | startup log `ACTIVE=N` / `inactive=...` | 仅启动瞬间的 verbs port-state 快照，不会随恢复改写 |
-| current healthy | `sum by (instance) (dfkv_server_ib_device_healthy)`；最终门为 `dfkv_server_ring_eligible` | 固定 initialized/resolved 集合中当前 ACTIVE+LinkUp 数；仅 RDMA listener 存在时输出 |
+| configured input / monitored topology | startup log `configured=N`; `dfkv_server_rdma_rails_configured` | log 值是显式列表去重数（auto 为 0）；gauge 是 health monitor 的固定 resolved rail 数（auto 含选出的 rail） |
+| initialized/resolved | startup log `initialized=N`; `dfkv_rdma_rails_initialized`; `dfkv_rdma_recv_segment_registered_rails` | 完成 anchor、共享 segment 和全部启动 MR 的固定 topology，auto 含选出的 rail |
+| startup-ACTIVE | startup log `ACTIVE=N` / `inactive=...` | 仅启动瞬间快照 |
+| current healthy | `dfkv_server_rdma_rails_active`; `sum(dfkv_server_ib_device_healthy)` | 当前 ACTIVE+LinkUp 数；至少 1 即可 placement |
 
 仅在 **RDMA-enabled binary 实际启动 RDMA listener** 时额外输出（折叠进同一
 `/metrics`）；TCP-only binary 或未启动 RDMA listener 时下列 family 不存在：
 
 | 指标 | 类型 | 含义 |
 |---|---|---|
-| `dfkv_server_ring_eligible` | gauge | **当前**全部 initialized/resolved IB rail（包括 auto-discovered rail）是否满足恢复门；任一设备 query 失败或不是 ACTIVE/LinkUp 时为 0，整个节点（不是单 rail 容量）退出 placement ring，但进程、`/healthz`、`/readyz` 保持在线 |
-| `dfkv_server_ib_device_healthy{device}` | gauge | 各 initialized/resolved RDMA 设备 port 1 的**当前**状态是否同时为 ACTIVE 与 LinkUp；`device` 集合与顺序在启动后固定，包含 auto-discovered rail，也包含显式配置的启动时 DOWN rail |
+| `dfkv_server_ring_eligible` | gauge | 当前是否有至少一条通过门控的 initialized healthy rail；最后一条丢失立即为 0，0→非 0 需 recovery streak |
+| `dfkv_server_rdma_rails_configured` / `dfkv_rdma_rails_initialized` / `dfkv_server_rdma_rails_active` | gauge | health monitor 固定 resolved 数 / 成功 anchor 初始化数 / 当前健康数；auto 模式均包含选出的 rail，无 `device` label |
+| `dfkv_server_ib_device_healthy{device}` | gauge | 每个固定 initialized device 当前是否 `query_ok && ACTIVE && LinkUp`；部分为 0 不再等价于整节点退环 |
 | `dfkv_rdma_completions_total` / `dfkv_rdma_completion_errors_total` | counter | RDMA 请求完成 / 错误完成 |
 | `dfkv_rdma_active_conns` | gauge | 当前服务中的 RDMA 连接 |
 | `dfkv_rdma_v2_conns_opened_total` | counter | server 累计打开的 v2 连接 |
@@ -177,20 +169,14 @@ query 失败或 non-ACTIVE/LinkUp 样本立即清零 streak 并退环。恢复�
 | `dfkv_rdma_rail_put_writes_total{dev}` / `dfkv_rdma_rail_put_bytes_total{dev}` | counter | 每 rail 收到的 PUT one-sided writes / payload bytes |
 | `dfkv_rdma_rail_get_writes_total{dev}` / `dfkv_rdma_rail_get_bytes_total{dev}` | counter | 每 rail 发出的 GET one-sided writes / payload bytes |
 
-> **v2 上线判据**：启动日志
-> `rdma topology startup: configured=N initialized=N ACTIVE=M inactive=...`
-> 精确区分显式 configured、自动发现或显式配置后完成 anchor/MR 的
-> initialized/resolved，以及启动瞬间 verbs port `IBV_PORT_ACTIVE` 快照；
-> 自动发现的 `configured=0` 但 initialized 集合包含选出的 rail，显式 topology
-> 则必须
-> `configured == initialized == dfkv_rdma_recv_segment_registered_rails`，而
-> `ACTIVE` 可以更小。RDMA listener 运行期用固定 initialized/resolved 集合
-> `dfkv_server_ib_device_healthy{device}` 统计 current ACTIVE+LinkUp healthy，
-> 并以 `dfkv_server_ring_eligible` 判断整节点是否可放置。随后确认
-> client/server 两侧连接总数增长、PUT/GET write counter 随负载增长、
-> `dfkv_rdma_v2_ready=1` 且 `dfkv_rdma_recv_segment_free_bytes` 有容量余量。
-> 启动失败或连接拒绝时检查缺失/open/port/GID query 错误、每轨
-> anchor/MR/segment 注册日志、segment 容量和两端协议版本。
+> **v2 上线判据**：显式 topology 必须
+> `configured == initialized == dfkv_rdma_recv_segment_registered_rails`。
+> 启动 `ACTIVE` 只是快照；运行期以
+> `dfkv_server_rdma_rails_active` 和逐设备 healthy 为准。active≥1 时
+> `dfkv_server_ring_eligible=1`；`active < initialized` 是 `PARTIAL`，不是整节点
+> 故障。active=0 必须立即退环，恢复到非零在 sample streak 后重新 eligible。
+> 随后确认 client/server QP 与 PUT/GET write counter 增长、
+> `dfkv_rdma_v2_ready=1` 且 receive-segment free bytes 有余量。
 
 读侧 convoy 合并与直读晋升（`DFKV_READ_COALESCE=1` 时才有增量；恒零 = 开关没生效）：
 | `dfkv_read_coalesce_leaders_total` | counter | 经 coalescer 登记并完成的读（同步 leader + io_uring flight 各计一次；>0 = 合并路径确实在环内） |
@@ -270,7 +256,7 @@ TTL-debounced etcd probe 判定（`DFKV_MDS_PROBE_CACHE_MS`，默认 2500 ms 内
 | `dfkv_mds_group_version_skew{group}` | 去重版本数，**>1 = 版本漂移** |
 | `dfkv_mds_group_clients{group}` | 当前注册的 inference connector/consumer 实例数；client lease 到期后自动下降 |
 
-对应 CLI：`dfkvctl topology --mds <eps> --group <g>` 展示全部在线节点、逐设备 IB 状态及 ACTIVE/DEGRADED ring 状态；`dfkvctl stats --mds <eps> --group <g>` 只统计 health-eligible placement view（每节点表格+汇总行，数据一跳来自 MDS 不触节点）/ `--all`（kListGroups 枚举全部环）。深钻仍用 `dfkvctl stat --all`（逐节点全量 /metrics）。
+对应 CLI：`dfkvctl topology --mds <eps> --group <g>` 通过 `kListTopology` 展示全部在线节点和 HLT1 逐设备健康。HLT1 是 Members 的已有可选扩展（placement eligibility + repeated device name/port_state/phys_state/query_ok），不是独立 rail protocol。`MembersTopologyEpoch` 对 member id/device name 稳定排序并包含地址/placement binding 与全部 health 字段；因此 rail health 变化不必重建 Ketama 环，仍会更新 transport。`dfkvctl stats` 只聚合 eligible placement；`PARTIAL` 节点仍在其中，只有零 active 的 `DEGRADED` 节点进入 degraded 计数。
 
 原有计数：
 | 指标 | 类型 | 含义 |
@@ -347,14 +333,17 @@ C 客户端快照还含传输级指标（RDMA 构建）：
 | `dfkv_rdma_client_oversize_rejects_total` | counter | 分配、注册或发帖前因超过声明上限而拒绝的操作 |
 | `dfkv_rdma_client_v2_probe_attempts_total` / `dfkv_rdma_client_v2_probe_failures_total` | counter | 必选 v2 bootstrap probe 尝试 / 失败 |
 | `dfkv_rdma_client_stale_pool_retries_total` | counter | pooled QP 失败后改用 fresh connection 的重试 |
-| `dfkv_rdma_client_cross_rail_retries_total` | counter | 无 label 的 process counter；client-local `kRailFailure` 后启动的 logical-operation replay；一次调用最多加 1，不按 batch window 计数。存在另一条 topology-enabled rail 时 retry 必须换轨 |
-| `dfkv_rdma_client_cross_rail_retry_successes_total` | counter | 无 label 的 process counter；上述 retry 最终成功的 logical operation 数 |
-| `dfkv_rdma_client_cross_rail_retry_exhausted_total` | counter | 无 label 的 process counter；已启动上述 retry、但第二次物理尝试仍失败的 logical operation 数 |
+| `dfkv_rdma_client_cross_rail_retries_total` | counter | 无 label；client-local `kRailFailure` 后真正启动的 cross-rail logical retry。GET 可重试未完成 work；PUT 只有 request 未 post 才计入 |
+| `dfkv_rdma_client_cross_rail_retry_successes_total` | counter | 无 label；上述 retry 最终成功的 logical operation 数 |
+| `dfkv_rdma_client_cross_rail_retry_exhausted_total` | counter | 无 label；上述 retry 的第二次物理尝试仍失败 |
 | `dfkv_rdma_client_completion_timeouts_total` | counter | 消耗完一次绝对 completion-window deadline 的窗口；部分完成不重置预算 |
 | `dfkv_rdma_client_resource_budget_raises_total` | counter | 预算自适应放大次数（随 ring 采纳，只增不减；任一预算 env 显式设置时恒为 0） |
 | `dfkv_rdma_client_admission_failures_total` | counter | 本进程预算饥饿导致的操作失败（返回 kResourceExhausted，对端从未被拨号、不进冷却）；应恒为 0，>0 说明预算仍小于扇出需求 |
 | `dfkv_rdma_client_depth_refunds_total` | counter | 服务端 clamp depth 后按协商值退还 WR/注册字节预算的连接数（首连按上限探测，后续按学习值建连） |
 | `dfkv_rdma_client_topology_nodes` | gauge | 最近一次喂给预算自适应的 ring 规模（0=从未提示或自适应关闭） |
+| `dfkv_rdma_client_peer_topology_updates_total` | counter | 无 label；接纳的新 peer immutable topology generation 数；同 generation 重复通知不增加 |
+| `dfkv_rdma_client_no_compatible_rail_total` | counter | 无 label；configured tiers 因 absent/incomplete peer topology 或最高可用交集为空而返回 `kNoCompatibleRail` 的次数；不计 peer health failure |
+| `dfkv_rdma_client_stale_generation_reaps_total` | counter | 无 label；因 Conn 的 peer generation 落后而拒绝 take/repool/keepalive、并经 single-owner lifecycle 回收的 endpoint 数 |
 | `dfkv_rdma_client_keepalive_attempts_total` / `dfkv_rdma_client_keepalive_successes_total` / `dfkv_rdma_client_keepalive_failures_total` | counter | idle pooled QP 的保活尝试 / 成功 / 失败并退役连接；仅 `DFKV_RDMA_KEEPALIVE_MS>0` 时增长 |
 | `dfkv_rdma_client_rail_conns_total{dev}` / `dfkv_rdma_client_rail_selections_total{dev}` | counter | 每 rail 新连接 / 准入分布 |
 | `dfkv_rdma_client_rail_inflight{dev}` / `dfkv_rdma_client_rail_credits_available{dev}` | gauge | 当前已租 / 可用 request credits |
@@ -376,40 +365,37 @@ TCP 构建或 TCP fallback 的 C 快照 family（同样由插件镜像）：
 | `dfkv_transport_pool_backoff_endpoints` | gauge | 当前阻止连接增长的 endpoint 数 |
 | `dfkv_transport_pool_backoff_events_total` / `dfkv_transport_pool_backoff_suppressed_total` | counter | 进入 backoff / backoff 中被 fast-fail 的 acquire |
 
-RDMA client transport family 只在 RDMA build/runtime 使用相应传输并由 client
-stats snapshot/connector poller 导出时可见；TCP-only 进程缺失这些 family 是预期
-行为，不能补 0 解释为 rail 故障。所有 `{dev}` 序列数固定为进程启动时发现的 rail
-数，NUMA `reason` 只有上述两个枚举，不会按任意 endpoint 扩张。endpoint
-cooldown/恢复由上表 `dfkv_client_peer_marked_bad_total` /
-`dfkv_client_peer_recovered_total` 汇总，逐 peer error 序列在 `PeerHealth` 内硬限
-4096 条。因此 rail 故障、endpoint 故障和两种 quarantine 可以分别告警，单个坏
-node 不再表现为共享 HCA 故障。
+RDMA client transport family 只在 RDMA runtime 使用相应传输并由 client snapshot/
+connector poller 导出时可见；TCP-only 进程缺失是预期行为。所有新 peer-topology
+family 均是无 label process counter，避免 peer 地址造成无界时序；`{dev}` 仍只
+来自进程启动时的固定 local rail 集合。`kNoCompatibleRail` 是本地兼容性结果，
+不增加 `dfkv_client_ops_served_total`、`dfkv_client_io_errors_total`、
+`dfkv_client_peer_marked_bad_total` 或 cooldown。endpoint 和 local-rail health
+仍按各自既有 family 分开告警。
 
 **retry 语义与告警**：
 
-- 三个 `cross_rail` counter 只统计 `kRailFailure` 后的 replay；pooled endpoint
-  staleness 仍只计 `dfkv_rdma_client_stale_pool_retries_total`，peer/endpoint、
-  admission、cancel、invalid input 不计。每个公开调用物理尝试最多 2 次；第二次
-  使用 fresh endpoint，且在任何另一条 enabled local rail 存在时必须换轨。单轨
-  topology 才允许 fresh 同轨 retry，且不得绕过 quarantine/cooldown。
-- retry 前同步 retire 故障 endpoint 并 teardown QP/CQ/MR，然后从 item 0 重放
-  整个 logical PUT/GET/batch/SG operation。语义为 at-least-once；remote PUT
-  commit 后 completion 丢失时可能覆盖写两次，不保证 exactly-once。公开
-  `dfkv_client_op_{requests,keys}_total` 不随物理尝试翻倍，hit/bytes 只按最终
-  logical result 计，latency 包含两次尝试。
-- `rate(dfkv_rdma_client_cross_rail_retry_exhausted_total[5m]) > 0` 任何增长都
-  需要处置；它表示一次换轨（或单轨 fresh）机会仍未恢复 logical operation。
-  任一 `dfkv_rdma_client_rail_quarantined{dev} == 1` 持续超过两个默认 cooldown
-  （10 s；若修改 `DFKV_RDMA_RAIL_COOLDOWN_MS` 则使用其两倍）也应告警。
-- workload drain 后 `dfkv_rdma_client_rail_inflight{dev} != 0`，或
-  `dfkv_rdma_client_transient_user_mr_active` 未回到 drain 前基线，按资源泄漏
-  告警。`dfkv_rdma_client_rail_recovery_probe{dev}` 应在 probe 完成后归零。
+- `cross_rail` counter 只统计 client-local `kRailFailure` 后真正启动的跨轨 retry；
+  pooled endpoint staleness仍由 `stale_pool_retries_total` 单独计数。每个 logical
+  operation 捕获一个 peer generation，物理尝试最多 2 次。
+- GET/batch/SG 保留已完成 item/window 的 byte-exact staged 结果，fresh 第二次只
+  提交未完成集合。PUT 仅在明确 request 尚未 post 时允许换轨；post 后 completion
+  不明的 PUT 不 cross-rail replay，避免扩大 ambiguous write 语义。
+- Conn 绑定 peer generation；pool 中旧代 endpoint 永不复用或回池，并通过既有
+  single-owner lifecycle 销毁。topology update 不在别的线程直接双重 teardown。
+- `Status::kNoCompatibleRail` 是 client-local（不上 wire）、peer-health neutral：
+  不增加 served、IO error、marked-bad 或 cooldown。configured tiers 遇 absent/
+  incomplete HLT1 或空健康交集时返回它；未配置 tiers 的 legacy homogeneous 模式
+  不需要完整 peer topology。
+- `rate(dfkv_rdma_client_cross_rail_retry_exhausted_total[5m]) > 0` 或持续
+  `rail_quarantined{dev} == 1` 需要处置。workload drain 后 inflight 或 transient
+  MR 不归零按资源泄漏告警。
 
-这是 **client-only** rail recovery，与 server 的
-`dfkv_server_ib_device_healthy` / `dfkv_server_ring_eligible` 整节点 placement
-健康门完全分离；`DFKV_RDMA_HEALTH_FILE` 只影响 server health monitor。该能力
-不改变 RDMA wire protocol 或 server 行为，升级 client 与仍支持同一 RDMA v2
-protocol 的混合版本 server 兼容。
+该能力不新增 rail wire protocol：MDS 复用 Members HLT1，transport 数据面仍是
+RDMA v2。新 client + 当前 MDS + legacy member 在未配置 tiers 时保持
+homogeneous 兼容；configured tiers 对该 member fail closed。legacy MDS 不识别
+`kListTopology`，modern poll 失败并保留 last-good ring，rollout 必须 MDS-first，
+不能把这类 poll failure 解释为 homogeneous fallback。
 
 ### 3.4 连接器车队指标（三连接器 OTLP **push**，opt-in）
 §3.3 是进程本地 Prometheus **pull**。vLLM、LMCache、SGLang HiCache 还可把

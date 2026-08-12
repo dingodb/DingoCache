@@ -341,6 +341,69 @@ inline uint64_t MembersEpoch(std::vector<MemberInfo> ms) {
   }
   return h;
 }
+// Canonical generation for the complete peer topology carried by HLT1. Unlike
+// MembersEpoch, this intentionally changes for rail-health-only updates so
+// transports can retire connections selected from an obsolete peer view
+// without rebuilding the placement ring. Member and device ordering from etcd
+// and sysfs is not stable, so both are sorted before hashing. The placement
+// fields bind a topology generation to the exact transport address/ring view it
+// describes; has_health distinguishes a legacy/incomplete report from a
+// complete report containing zero rails.
+inline uint64_t MembersTopologyEpoch(std::vector<MemberInfo> ms) {
+  std::sort(ms.begin(), ms.end(), [](const MemberInfo& a, const MemberInfo& b) {
+    if (a.id != b.id) return a.id < b.id;
+    if (a.ip != b.ip) return a.ip < b.ip;
+    if (a.port != b.port) return a.port < b.port;
+    return a.weight < b.weight;
+  });
+  uint64_t h = 1469598103934665603ull;
+  auto mix = [&h](const void* p, size_t n) {
+    const unsigned char* b = static_cast<const unsigned char*>(p);
+    for (size_t i = 0; i < n; ++i) {
+      h ^= b[i];
+      h *= 1099511628211ull;
+    }
+  };
+  auto mix_string = [&mix](const std::string& s) {
+    const uint32_t n = static_cast<uint32_t>(s.size());
+    mix(&n, sizeof(n));
+    mix(s.data(), s.size());
+  };
+  const uint32_t member_count = static_cast<uint32_t>(ms.size());
+  mix(&member_count, sizeof(member_count));
+  for (auto& m : ms) {
+    mix_string(m.id);
+    mix_string(m.ip);
+    mix(&m.port, sizeof(m.port));
+    mix(&m.weight, sizeof(m.weight));
+    const uint8_t eligible = m.RingEligible() ? 1 : 0;
+    const uint8_t has_health = m.has_health ? 1 : 0;
+    mix(&eligible, sizeof(eligible));
+    mix(&has_health, sizeof(has_health));
+    if (!m.has_health) continue;
+
+    std::sort(m.health.ib_devices.begin(), m.health.ib_devices.end(),
+              [](const IbDeviceHealth& a, const IbDeviceHealth& b) {
+                if (a.name != b.name) return a.name < b.name;
+                if (a.port_state != b.port_state)
+                  return a.port_state < b.port_state;
+                if (a.phys_state != b.phys_state)
+                  return a.phys_state < b.phys_state;
+                return a.query_ok < b.query_ok;
+              });
+    const uint32_t rail_count =
+        static_cast<uint32_t>(m.health.ib_devices.size());
+    mix(&rail_count, sizeof(rail_count));
+    for (const auto& d : m.health.ib_devices) {
+      mix_string(d.name);
+      mix(&d.port_state, sizeof(d.port_state));
+      mix(&d.phys_state, sizeof(d.phys_state));
+      const uint8_t query_ok = d.query_ok ? 1 : 0;
+      mix(&query_ok, sizeof(query_ok));
+    }
+  }
+  return h;
+}
 
 }  // namespace dfkv
 

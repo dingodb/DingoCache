@@ -250,6 +250,48 @@ void KVClient::AdoptRing(ConHash ring, std::map<std::string, std::string> addr) 
   if (count > 0) ring_cv_.notify_all();
 }
 
+void KVClient::PublishPeerTopologies(
+    const std::vector<MemberInfo>& topology, uint64_t generation) {
+  std::set<std::string> current;
+  for (const auto& member : topology)
+    current.insert(member.ip + ":" + std::to_string(member.port));
+
+  std::set<std::string> omitted;
+  {
+    std::lock_guard<std::mutex> lock(ring_mu_);
+    omitted = published_peer_addrs_;
+    for (const auto& [name, address] : addr_) {
+      (void)name;
+      omitted.insert(address);
+    }
+    for (const auto& address : current) omitted.erase(address);
+    published_peer_addrs_ = current;
+  }
+
+  for (const auto& member : topology) {
+    PeerTopology peer;
+    peer.peer_addr = member.ip + ":" + std::to_string(member.port);
+    peer.generation = generation;
+    peer.complete = member.has_health;
+    peer.rails.reserve(member.health.ib_devices.size());
+    for (const auto& device : member.health.ib_devices)
+      peer.rails.push_back(PeerRailTopology{device.name, device.healthy()});
+    std::sort(peer.rails.begin(), peer.rails.end(),
+              [](const PeerRailTopology& a, const PeerRailTopology& b) {
+                return a.name < b.name;
+              });
+    t_->OnPeerTopology(peer);
+  }
+
+  for (const auto& address : omitted) {
+    PeerTopology peer;
+    peer.peer_addr = address;
+    peer.generation = generation;
+    peer.complete = false;
+    t_->OnPeerTopology(peer);
+  }
+}
+
 void KVClient::SetMembers(std::vector<std::pair<std::string, std::string>> members) {
   ConHash ring;
   std::map<std::string, std::string> addr;
@@ -265,6 +307,7 @@ void KVClient::SetMembers(const std::vector<MemberInfo>& members) {
   ConHash ring;
   std::map<std::string, std::string> addr;
   for (const auto& m : members) {
+    if (!m.RingEligible()) continue;
     ring.AddNode(m.id, m.weight < 1 ? 1 : static_cast<int>(m.weight));
     addr[m.id] = m.ip + ":" + std::to_string(m.port);
   }
@@ -275,9 +318,36 @@ void KVClient::SetMembers(const std::vector<MemberInfo>& members) {
 void KVClient::StartMdsDiscovery(std::vector<std::string> mds_eps,
                                  const std::string& group, int poll_ms) {
   StopMdsDiscovery();
+  struct PlacementEpochState {
+    bool have_epoch = false;
+    uint64_t epoch = 0;
+  };
+  auto placement_state = std::make_shared<PlacementEpochState>();
   poller_ = std::make_unique<MdsMemberPoller>(
       std::move(mds_eps), group,
-      [this](const std::vector<MemberInfo>& ms) { SetMembers(ms); }, poll_ms);
+      [this, placement_state](const std::vector<MemberInfo>& topology,
+                              uint64_t topology_epoch,
+                              bool placement_admitted) {
+        // Topology is a replace-all stream independent of placement. Degraded
+        // members remain here even though SetMembers excludes them. Omitted
+        // peers still held by a guard-rejected ring are explicitly invalidated.
+        PublishPeerTopologies(topology, topology_epoch);
+
+        if (!placement_admitted) return;
+        std::vector<MemberInfo> placement;
+        placement.reserve(topology.size());
+        for (const auto& member : topology) {
+          if (member.RingEligible()) placement.push_back(member);
+        }
+        const uint64_t placement_epoch = MembersEpoch(placement);
+        if (placement_state->have_epoch &&
+            placement_state->epoch == placement_epoch)
+          return;
+        placement_state->epoch = placement_epoch;
+        placement_state->have_epoch = true;
+        SetMembers(placement);
+      },
+      poll_ms);
   poller_->Start();
 }
 
@@ -349,10 +419,11 @@ void KVClient::ProbeLoop() {
       // A non-IO reply also means the peer is reachable: clear its data-path
       // cooldown here (off the data path) so recovery never depends on a data
       // request re-dialing a peer that is still inside its backed-off cooldown.
-      // kResourceExhausted never dialed the peer at all: its wall time is a
-      // local budget wait (up to RESOURCE_ACQUIRE_MS) that would poison the
-      // latency EWMA, and it proves nothing about peer reachability.
-      if (st != Status::kIOError && st != Status::kResourceExhausted) {
+      // kResourceExhausted and kNoCompatibleRail never dialed the peer at all:
+      // their wall time is local resource/topology selection and would poison
+      // the latency EWMA; neither proves anything about peer reachability.
+      if (st != Status::kIOError && st != Status::kResourceExhausted &&
+          st != Status::kNoCompatibleRail) {
         peer_lat_.Observe(a, sec);
         health_.MarkProbeAlive(a);
       }

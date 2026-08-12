@@ -20,7 +20,11 @@ enum class Status {
   // Peer health must treat it as neither a served response nor a peer IO
   // failure: cooling down a peer for a local admission stall poisons every
   // key routed to it (see .issue/0812-004).
-  kResourceExhausted
+  kResourceExhausted,
+  // Client-local only and peer-health-neutral. The selected peer topology has
+  // no healthy device-name intersection with this client's configured rails.
+  // This is decided before taking credits, process budget, or dialing a peer.
+  kNoCompatibleRail
 };
 
 inline const char* StatusName(Status s) {
@@ -32,6 +36,7 @@ inline const char* StatusName(Status s) {
     case Status::kIOError: return "IOError";
     case Status::kInvalid: return "Invalid";
     case Status::kResourceExhausted: return "ResourceExhausted";
+    case Status::kNoCompatibleRail: return "NoCompatibleRail";
   }
   return "?";
 }

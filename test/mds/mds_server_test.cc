@@ -37,6 +37,13 @@ bool DoReq(int port, WireOp op, const std::string& payload, Status* st, std::str
   ::close(fd);
   return ok;
 }
+
+const MemberInfo* FindMember(const std::vector<MemberInfo>& members,
+                             const std::string& id) {
+  for (const auto& member : members)
+    if (member.id == id) return &member;
+  return nullptr;
+}
 }  // namespace
 
 TEST(MdsServer, RegisterThenListRoundTripsThroughEtcd) {
@@ -658,46 +665,125 @@ TEST(MdsServer, ZeroFirstReqMsKeepsOldDribbleBehavior) {
   ::unsetenv("DFKV_MDS_IO_TIMEOUT_S");
 }
 
-TEST(MdsServer, DegradedMemberIsExcludedFromRingButVisibleInTopology) {
+TEST(MdsServer, PlacementAndTopologyTrackRailHealthIndependently) {
   const char* ep = EtcdEp();
   if (!ep) GTEST_SKIP() << "set DFKV_TEST_ETCD=host:port";
   MdsServer mds(ep);
   ASSERT_EQ(mds.Start(0), Status::kOk);
   const std::string group =
       "itest-health-" + std::to_string(mds.port());
-  MemberInfo active{"active", "10.1.1.1", 28000, 1};
-  active.has_health = true;
-  active.health.ib_devices = {{"ib0", 4, 5, true}};
-  MemberInfo degraded{"degraded", "10.1.1.2", 28000, 1};
-  degraded.has_health = true;
-  degraded.health.ring_eligible = false;
-  degraded.health.ib_devices = {{"ib1", 2, 2, true}};
+
+  // Keep a legacy member beside the HLT1 member. The optional per-member
+  // extension must remain decodable in a mixed-version view.
+  MemberInfo legacy{"legacy", "10.1.1.1", 28000, 1};
+  MemberInfo peer{"peer", "10.1.1.2", 28000, 1};
+  peer.has_health = true;
+  peer.health.ring_eligible = true;
+  peer.health.ib_devices = {
+      {"ib0", 4, 5, true}, {"ib1", 4, 5, true}};
   Status st;
   std::string data;
   ASSERT_TRUE(DoReq(mds.port(), WireOp::kRegister,
-                    EncodeMemberReq(group, active), &st, &data));
+                    EncodeMemberReq(group, legacy), &st, &data));
   ASSERT_EQ(st, Status::kOk);
   ASSERT_TRUE(DoReq(mds.port(), WireOp::kRegister,
-                    EncodeMemberReq(group, degraded), &st, &data));
+                    EncodeMemberReq(group, peer), &st, &data));
   ASSERT_EQ(st, Status::kOk);
 
   std::vector<MemberInfo> members;
-  uint64_t epoch = 0;
+  uint64_t placement_epoch = 0;
   ASSERT_TRUE(DoReq(mds.port(), WireOp::kListMembers, group, &st, &data));
   ASSERT_EQ(st, Status::kOk);
-  ASSERT_TRUE(DecodeMembers(data.data(), data.size(), &members, &epoch));
+  ASSERT_TRUE(
+      DecodeMembers(data.data(), data.size(), &members, &placement_epoch));
+  ASSERT_EQ(members.size(), 2u);
+
+  uint64_t topology_epoch = 0;
+  ASSERT_TRUE(DoReq(mds.port(), WireOp::kListTopology, group, &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  ASSERT_TRUE(
+      DecodeMembers(data.data(), data.size(), &members, &topology_epoch));
+  ASSERT_EQ(members.size(), 2u);
+  const MemberInfo* visible_peer = FindMember(members, "peer");
+  ASSERT_NE(visible_peer, nullptr);
+  ASSERT_TRUE(visible_peer->has_health);
+  ASSERT_EQ(visible_peer->health.ib_devices.size(), 2u);
+  EXPECT_EQ(visible_peer->health.ib_devices[0].name, "ib0");
+  EXPECT_TRUE(visible_peer->health.ib_devices[0].healthy());
+  EXPECT_EQ(visible_peer->health.ib_devices[1].name, "ib1");
+  EXPECT_TRUE(visible_peer->health.ib_devices[1].healthy());
+  const MemberInfo* visible_legacy = FindMember(members, "legacy");
+  ASSERT_NE(visible_legacy, nullptr);
+  EXPECT_FALSE(visible_legacy->has_health);
+
+  // Canonical topology generations are independent of the member's HLT1 rail
+  // serialization order.
+  const uint64_t initial_topology_epoch = topology_epoch;
+  peer.health.ib_devices = {
+      {"ib1", 4, 5, true}, {"ib0", 4, 5, true}};
+  ASSERT_TRUE(DoReq(mds.port(), WireOp::kHeartbeat,
+                    EncodeMemberReq(group, peer), &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  ASSERT_TRUE(DoReq(mds.port(), WireOp::kListTopology, group, &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  ASSERT_TRUE(
+      DecodeMembers(data.data(), data.size(), &members, &topology_epoch));
+  EXPECT_EQ(topology_epoch, initial_topology_epoch);
+
+  // One failed rail is a topology-only change: the peer remains in placement,
+  // the placement epoch stays stable, and the canonical topology epoch moves.
+  const uint64_t initial_placement_epoch = placement_epoch;
+  peer.health.ib_devices = {
+      {"ib0", 4, 5, true}, {"ib1", 2, 2, true}};
+  ASSERT_TRUE(DoReq(mds.port(), WireOp::kHeartbeat,
+                    EncodeMemberReq(group, peer), &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  ASSERT_TRUE(DoReq(mds.port(), WireOp::kListMembers, group, &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  ASSERT_TRUE(
+      DecodeMembers(data.data(), data.size(), &members, &placement_epoch));
+  ASSERT_EQ(members.size(), 2u);
+  EXPECT_EQ(placement_epoch, initial_placement_epoch);
+  ASSERT_TRUE(DoReq(mds.port(), WireOp::kListTopology, group, &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  ASSERT_TRUE(
+      DecodeMembers(data.data(), data.size(), &members, &topology_epoch));
+  EXPECT_NE(topology_epoch, initial_topology_epoch);
+  visible_peer = FindMember(members, "peer");
+  ASSERT_NE(visible_peer, nullptr);
+  ASSERT_EQ(visible_peer->health.ib_devices.size(), 2u);
+  EXPECT_TRUE(visible_peer->health.ib_devices[0].healthy());
+  EXPECT_FALSE(visible_peer->health.ib_devices[1].healthy());
+
+  // Losing the last active rail removes the peer from placement immediately,
+  // while kListTopology continues to expose its full degraded HLT1 state.
+  const uint64_t partial_topology_epoch = topology_epoch;
+  peer.health.ring_eligible = false;
+  peer.health.ib_devices[0] = {"ib0", 1, 2, true};
+  ASSERT_TRUE(DoReq(mds.port(), WireOp::kHeartbeat,
+                    EncodeMemberReq(group, peer), &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  ASSERT_TRUE(DoReq(mds.port(), WireOp::kListMembers, group, &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  ASSERT_TRUE(
+      DecodeMembers(data.data(), data.size(), &members, &placement_epoch));
   ASSERT_EQ(members.size(), 1u);
-  EXPECT_EQ(members[0].id, "active");
+  EXPECT_EQ(members[0].id, "legacy");
+  EXPECT_NE(placement_epoch, initial_placement_epoch);
 
   ASSERT_TRUE(DoReq(mds.port(), WireOp::kListTopology, group, &st, &data));
   ASSERT_EQ(st, Status::kOk);
-  ASSERT_TRUE(DecodeMembers(data.data(), data.size(), &members, &epoch));
+  ASSERT_TRUE(
+      DecodeMembers(data.data(), data.size(), &members, &topology_epoch));
+  EXPECT_NE(topology_epoch, partial_topology_epoch);
   ASSERT_EQ(members.size(), 2u);
-  EXPECT_TRUE(members[0].has_health);
-  bool saw_degraded = false;
-  for (const auto& member : members)
-    if (member.id == "degraded") saw_degraded = !member.RingEligible();
-  EXPECT_TRUE(saw_degraded);
+  visible_peer = FindMember(members, "peer");
+  ASSERT_NE(visible_peer, nullptr);
+  EXPECT_FALSE(visible_peer->RingEligible());
+  ASSERT_EQ(visible_peer->health.ib_devices.size(), 2u);
+  EXPECT_FALSE(visible_peer->health.ib_devices[0].healthy());
+  EXPECT_FALSE(visible_peer->health.ib_devices[1].healthy());
+
   bool etcd_reachable = false;
   const std::string metrics = mds.GroupMetricsText(&etcd_reachable);
   EXPECT_TRUE(etcd_reachable);

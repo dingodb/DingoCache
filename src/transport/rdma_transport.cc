@@ -140,19 +140,20 @@ std::vector<std::string> ParseDeviceList(const std::string& list) {
   return devices;
 }
 
-std::string JoinDevices(const std::vector<std::string>& devices) {
+std::string JoinDevices(const std::vector<std::string>& devices,
+                        const char* separator = ",") {
   std::string out;
   for (const auto& device : devices) {
-    if (!out.empty()) out += ",";
+    if (!out.empty()) out += separator;
     out += device;
   }
   return out;
 }
 
-// Test-only deterministic completion faults for replay-safe read operations.
+// Test-only deterministic completion faults for data operations.
 // The env value is a comma-separated list of
 // "<logical-call>:<attempt>:<completion-window>" specs, all one-based.
-// Eligible logical read calls are numbered only while the env is set. Each
+// Eligible logical calls are numbered only while the env is set. Each
 // operation owns its injection state and passes it explicitly to data-path
 // reaps, so pooled connection maintenance cannot consume a target window.
 // A matching successfully reaped window is surfaced once as
@@ -325,13 +326,12 @@ std::shared_ptr<rdma::ResourceBudget> ProcessResourceBudget(
   return budget;
 }
 
-// Admission (budget) starvation never dialed the peer, so it must not be
-// reported as the peer's kIOError: PeerHealth would cool the node down and
-// blanket-fail every key routed to it (the 0812-004 amplification). Flip only
-// the slots still carrying the kIOError default; kInvalid verdicts stand.
-void MarkAdmissionFailure(std::vector<Status>* result) {
+// Client-local failures that occur before dialing the peer must remain neutral
+// to PeerHealth. Flip only slots still carrying the kIOError default;
+// deterministic kInvalid verdicts stand.
+void MarkClientLocalFailure(std::vector<Status>* result, Status status) {
   for (auto& s : *result)
-    if (s == Status::kIOError) s = Status::kResourceExhausted;
+    if (s == Status::kIOError) s = status;
 }
 
 }  // namespace
@@ -340,6 +340,7 @@ struct RdmaTransport::Conn {
   rdma::RcEndpoint ep;
   rdma::RecvSegmentInfo recv_segment;
   size_t rail_index = 0;
+  uint64_t peer_generation = 0;
   rdma::RailLease lease;
   uint64_t lease_started_us = 0;
   bool credit_held = false;
@@ -413,6 +414,25 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   if (auto_device_ && discovered.size() > 1) discovered.resize(1);
   devs_.reserve(discovered.size());
   for (const auto& device : discovered) devs_.push_back(device.name);
+  const char* tiers_env = std::getenv("DFKV_RDMA_RAIL_TIERS");
+  const std::string tiers_spec = tiers_env ? tiers_env : "";
+  peer_topology_required_ = !tiers_spec.empty();
+  if (peer_topology_required_ && filter.empty()) {
+    const std::string error =
+        "DFKV_RDMA_RAIL_TIERS requires an explicit DFKV_RDMA_DEV list";
+    DFKV_LOG_ERROR(error);
+    throw std::runtime_error(error);
+  }
+  std::string tiers_error;
+  if (!rdma::ParseRailTiers(tiers_spec, devs_, &rail_tiers_, &tiers_error)) {
+    DFKV_LOG_ERROR(tiers_error);
+    throw std::runtime_error(tiers_error);
+  }
+  peer_topologies_ = std::make_unique<rdma::PeerTopologyStore>(
+      devs_, rail_tiers_, peer_topology_required_);
+  config_dump::RecordResolved(
+      "DFKV_RDMA_RAIL_TIERS",
+      peer_topology_required_ ? tiers_spec : JoinDevices(devs_, "|"));
   topology_ =
       std::make_unique<rdma::RdmaTopology>(std::move(discovered));
   numa_aware_ = numa::Enabled();
@@ -648,8 +668,12 @@ void RdmaTransport::KeepaliveLoop() {
       collect(control_pool_, Lane::kControl);
     }
     for (const auto& entry : idle) {
-      if (keepalive_stop_.load(std::memory_order_relaxed) ||
-          !KeepaliveConn(entry.conn)) {
+      if (!peer_topologies_->IsCurrent(entry.node,
+                                       entry.conn->peer_generation)) {
+        stale_generation_reaps_.fetch_add(1, std::memory_order_relaxed);
+        Destroy(entry.conn, rdma::RailCompletion::kAdmission);
+      } else if (keepalive_stop_.load(std::memory_order_relaxed) ||
+                 !KeepaliveConn(entry.conn)) {
         Destroy(entry.conn, rdma::RailCompletion::kEndpointFailure);
       } else {
         Release(entry.node, entry.lane, entry.conn);
@@ -737,6 +761,40 @@ void RdmaTransport::OnTopologyHint(size_t nodes) {
   }
 }
 
+void RdmaTransport::OnPeerTopology(const PeerTopology& topology) {
+  std::vector<Conn*> stale;
+  {
+    // Publish and detach under the same pool lock. Acquire's generation check
+    // uses this lock too, so no idle endpoint can cross the update linearization
+    // point and become active with the retired generation.
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!peer_topologies_->Update(topology)) return;
+    const auto reap = [&](auto& pools) {
+      const auto found = pools.find(topology.peer_addr);
+      if (found == pools.end()) return;
+      auto& connections = found->second;
+      for (auto it = connections.begin(); it != connections.end();) {
+        Conn* conn = *it;
+        if (conn->peer_generation == topology.generation ||
+            !conn->lifecycle.RequestRetire()) {
+          ++it;
+          continue;
+        }
+        stale.push_back(conn);
+        it = connections.erase(it);
+      }
+      if (connections.empty()) pools.erase(found);
+    };
+    reap(pool_);
+    reap(sg_pool_);
+    reap(control_pool_);
+  }
+  peer_topology_updates_.fetch_add(1, std::memory_order_relaxed);
+  for (Conn* conn : stale)
+    Destroy(conn, rdma::RailCompletion::kAdmission);
+  stale_generation_reaps_.fetch_add(stale.size(), std::memory_order_relaxed);
+}
+
 uint16_t RdmaTransport::LearnedDepth(const std::string& node, Lane lane) {
   const uint16_t full = static_cast<uint16_t>(std::min<size_t>(depth_, 256));
   std::lock_guard<std::mutex> lk(depth_mu_);
@@ -778,13 +836,21 @@ bool RdmaTransport::ProbeV2(const std::string& node) const {
 
 RdmaTransport::AcquireResult RdmaTransport::Acquire(
     const std::string& node, Lane lane, const AcquireOptions& options) {
+  AcquireResult result;
+  const auto peer_snapshot =
+      options.peer ? options.peer : peer_topologies_->Snapshot(node);
+  if (!peer_snapshot || !rdma::HasRail(peer_snapshot->peer_healthy)) {
+    no_compatible_rail_.fetch_add(1, std::memory_order_relaxed);
+    result.failure = AcquireFailure::kNoCompatibleRail;
+    result.status = Status::kNoCompatibleRail;
+    return result;
+  }
   const uint32_t requested = static_cast<uint32_t>(
       std::min<size_t>(options.requested_credits,
                        std::numeric_limits<uint32_t>::max()));
-  // Selection is global across configured rails: first constrain candidates to
-  // the caller's local NUMA rails when that topology exists, then choose least
-  // normalized inflight with latency/error penalties. The operation-local
-  // exclusion applies to both the preferred and fallback topology masks.
+  // NUMA preference, credits, latency, and quarantine are applied only inside
+  // the highest tier in the captured peer generation that still intersects
+  // the runtime-enabled local topology.
   const int caller_node = numa_aware_ ? numa::CurrentNode() : -1;
   const auto candidates =
       topology_->CandidatesFor(caller_node, numa_aware_);
@@ -793,12 +859,25 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   } else if (candidates.locality == rdma::RailLocality::kNoLocal) {
     numa_no_local_fallbacks_.fetch_add(1, std::memory_order_relaxed);
   }
-  auto lease = rdma::AcquireWithFallback(
-      *rail_policy_, requested, rail_backpressure_us_, candidates.allowed,
-      candidates.fallback, options.excluded);
-  if (!lease) return {};
-
-  AcquireResult result;
+  const auto local_enabled =
+      rdma::UnionRailMasks(candidates.allowed, candidates.fallback);
+  const auto highest_tier = rdma::HighestCompatibleTier(
+      rail_tiers_,
+      rdma::IntersectRailMasks(peer_snapshot->peer_healthy, local_enabled));
+  if (!rdma::HasRail(highest_tier)) {
+    no_compatible_rail_.fetch_add(1, std::memory_order_relaxed);
+    result.failure = AcquireFailure::kNoCompatibleRail;
+    result.status = Status::kNoCompatibleRail;
+    return result;
+  }
+  auto lease = rdma::AcquireHighestTier(
+      *rail_policy_, requested, rail_backpressure_us_, highest_tier,
+      candidates.allowed, candidates.fallback, options.excluded);
+  if (!lease) {
+    result.failure = AcquireFailure::kAdmission;
+    result.status = Status::kResourceExhausted;
+    return result;
+  }
   result.attempted_rail = lease->rail;
   const size_t ridx = lease->rail;
   const uint64_t lease_started = rdma::RailPolicy::NowMicros();
@@ -809,10 +888,13 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
       };
 
   std::vector<std::pair<void*, size_t>> pools;
+  std::vector<Conn*> stale;
   Conn* pooled = nullptr;
   {
     std::lock_guard<std::mutex> lk(mu_);
     pools = pools_;
+    const uint64_t current_generation =
+        peer_topologies_->Snapshot(node)->generation;
     if (!options.force_new) {
       auto& idle = lane == Lane::kData
                        ? pool_
@@ -821,9 +903,19 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
       if (it != idle.end()) {
         auto& pool_candidates = it->second;
         for (size_t i = pool_candidates.size(); i > 0; --i) {
-          if (pool_candidates[i - 1]->rail_index == ridx &&
-              pool_candidates[i - 1]->lifecycle.Activate()) {
-            pooled = pool_candidates[i - 1];
+          Conn* candidate = pool_candidates[i - 1];
+          if (candidate->peer_generation != current_generation) {
+            if (candidate->lifecycle.RequestRetire()) {
+              stale.push_back(candidate);
+              pool_candidates.erase(pool_candidates.begin() +
+                                    static_cast<std::ptrdiff_t>(i - 1));
+            }
+            continue;
+          }
+          if (candidate->peer_generation == peer_snapshot->generation &&
+              candidate->rail_index == ridx &&
+              candidate->lifecycle.Activate()) {
+            pooled = candidate;
             pool_candidates.erase(
                 pool_candidates.begin() + static_cast<std::ptrdiff_t>(i - 1));
             break;
@@ -832,6 +924,9 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
       }
     }
   }
+  for (Conn* conn : stale)
+    Destroy(conn, rdma::RailCompletion::kAdmission);
+  stale_generation_reaps_.fetch_add(stale.size(), std::memory_order_relaxed);
   if (pooled) {
     pooled->lease = *lease;
     pooled->lease_started_us = lease_started;
@@ -891,6 +986,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     }
     complete_unowned_lease(rdma::RailCompletion::kAdmission);
     result.failure = AcquireFailure::kAdmission;
+    result.status = Status::kResourceExhausted;
     return result;
   }
 
@@ -913,6 +1009,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   }
   auto* conn = new Conn();
   conn->rail_index = ridx;
+  conn->peer_generation = peer_snapshot->generation;
   conn->lease = *lease;
   conn->lease_started_us = lease_started;
   conn->credit_held = true;
@@ -934,20 +1031,20 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   char devbuf[rdma::kDevNameBytes];
   rdma::EncodeDevFrame(auto_device_ ? std::string() : dev, conn_declared,
                        devbuf, rdma::kDevProtoV2);
-  char mine[rdma::kQpInfoBytes], peer[rdma::kQpInfoBytes];
+  char mine[rdma::kQpInfoBytes], remote_qp_bytes[rdma::kQpInfoBytes];
   rdma::QpInfo my = conn->ep.Local();
   my.depth = static_cast<uint16_t>(std::min<size_t>(conn_depth, 256));
   my.protocol_version = rdma::kDevProtoV2;
   rdma::SerializeQpInfo(my, mine);
   if (!net::WriteAll(fd, devbuf, rdma::kDevNameBytes) ||
       !net::WriteAll(fd, mine, rdma::kQpInfoBytes) ||
-      !net::ReadAll(fd, peer, rdma::kQpInfoBytes)) {
+      !net::ReadAll(fd, remote_qp_bytes, rdma::kQpInfoBytes)) {
     ::close(fd);
     Destroy(conn, rdma::RailCompletion::kEndpointFailure);
     result.failure = AcquireFailure::kEndpoint;
     return result;
   }
-  const rdma::QpInfo remote = rdma::ParseQpInfo(peer);
+  const rdma::QpInfo remote = rdma::ParseQpInfo(remote_qp_bytes);
   if (remote.protocol_version != rdma::kDevProtoV2 || remote.depth == 0) {
     DFKV_LOG_ERROR("rdma: peer " + node +
                    " returned an invalid v2 QP negotiation");
@@ -1025,8 +1122,12 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
 
 bool RdmaTransport::PrepareRetry(
     int attempt, bool from_pool, std::optional<size_t> attempted_rail,
-    AcquireFailure failure, RailMask* excluded, bool* cross_rail_retry) {
-  if (attempt != 0) return false;
+    AcquireFailure failure, ReplaySafety replay_safety, bool request_posted,
+    const std::shared_ptr<const rdma::PeerRailSnapshot>& peer,
+    RailMask* excluded, bool* cross_rail_retry) {
+  if (attempt != 0 || failure == AcquireFailure::kNoCompatibleRail ||
+      (replay_safety == ReplaySafety::kUnsafeAfterPost && request_posted))
+    return false;
   if (failure == AcquireFailure::kLocalRail && attempted_rail &&
       *attempted_rail < devs_.size()) {
     excluded->assign(devs_.size(), 0);
@@ -1034,14 +1135,21 @@ bool RdmaTransport::PrepareRetry(
     const int caller_node = numa_aware_ ? numa::CurrentNode() : -1;
     const auto candidates =
         topology_->CandidatesFor(caller_node, numa_aware_);
-    if (rdma::HasUnexcludedRail(candidates.allowed, candidates.fallback,
-                                *excluded)) {
+    const auto local_enabled =
+        rdma::UnionRailMasks(candidates.allowed, candidates.fallback);
+    const auto highest_tier = rdma::HighestCompatibleTier(
+        rail_tiers_,
+        rdma::IntersectRailMasks(peer->peer_healthy, local_enabled));
+    const auto preferred =
+        rdma::IntersectRailMasks(highest_tier, candidates.allowed);
+    const auto fallback =
+        rdma::IntersectRailMasks(highest_tier, candidates.fallback);
+    if (rdma::HasUnexcludedRail(preferred, fallback, *excluded)) {
       cross_rail_retries_.fetch_add(1, std::memory_order_relaxed);
       *cross_rail_retry = true;
     } else {
-      // A one-enabled-rail topology may make one fresh same-rail attempt, but
-      // ordinary admission still enforces quarantine, cooldown, and credits.
-      // It is not a cross-rail retry, so leave its accounting flag clear.
+      // A one-compatible-rail topology may make one fresh same-rail attempt,
+      // while ordinary admission still enforces quarantine and credits.
       excluded->assign(devs_.size(), 0);
     }
     return true;
@@ -1425,6 +1533,21 @@ std::string RdmaTransport::MetricsText() const {
   s += "dfkv_rdma_client_keepalive_failures_total " +
        std::to_string(keepalive_failures_.load(std::memory_order_relaxed)) +
        "\n";
+  s += "# HELP dfkv_rdma_client_peer_topology_updates_total Published peer topology generations\n";
+  s += "# TYPE dfkv_rdma_client_peer_topology_updates_total counter\n";
+  s += "dfkv_rdma_client_peer_topology_updates_total " +
+       std::to_string(
+           peer_topology_updates_.load(std::memory_order_relaxed)) + "\n";
+  s += "# HELP dfkv_rdma_client_no_compatible_rail_total Operations rejected before admission because no peer-compatible rail exists\n";
+  s += "# TYPE dfkv_rdma_client_no_compatible_rail_total counter\n";
+  s += "dfkv_rdma_client_no_compatible_rail_total " +
+       std::to_string(no_compatible_rail_.load(std::memory_order_relaxed)) +
+       "\n";
+  s += "# HELP dfkv_rdma_client_stale_generation_reaps_total Connections retired instead of reuse after a peer topology generation change\n";
+  s += "# TYPE dfkv_rdma_client_stale_generation_reaps_total counter\n";
+  s += "dfkv_rdma_client_stale_generation_reaps_total " +
+       std::to_string(
+           stale_generation_reaps_.load(std::memory_order_relaxed)) + "\n";
   return s;
 }
 
@@ -1449,17 +1572,24 @@ void RdmaTransport::Release(const std::string& node, Lane lane, Conn* c) {
   }
 
   bool reusable = false;
+  bool generation_current = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
-    auto& idle = lane == Lane::kData
-                     ? pool_
-                     : (lane == Lane::kSgData ? sg_pool_ : control_pool_);
-    auto& v = idle[node];
-    if (v.size() < pool_max_ && c->lifecycle.MakeIdle()) {
-      v.push_back(c);
-      reusable = true;
+    generation_current =
+        peer_topologies_->IsCurrent(node, c->peer_generation);
+    if (generation_current) {
+      auto& idle = lane == Lane::kData
+                       ? pool_
+                       : (lane == Lane::kSgData ? sg_pool_ : control_pool_);
+      auto& v = idle[node];
+      if (v.size() < pool_max_ && c->lifecycle.MakeIdle()) {
+        v.push_back(c);
+        reusable = true;
+      }
     }
   }
+  if (!reusable && !generation_current)
+    stale_generation_reaps_.fetch_add(1, std::memory_order_relaxed);
   if (!reusable) Destroy(c);
 }
 
@@ -1481,11 +1611,17 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
   const Lane lane =
       op == WireOp::kCache || op == WireOp::kRange ? Lane::kData
                                                    : Lane::kControl;
-  const bool replay_safe = op != WireOp::kCache && op != WireOp::kRemove;
+  const bool local_rail_replay_safe =
+      op != WireOp::kCache && op != WireOp::kRemove;
+  const ReplaySafety replay_safety =
+      op == WireOp::kCache ? ReplaySafety::kUnsafeAfterPost
+                           : ReplaySafety::kReplaySafe;
+  const auto peer = peer_topologies_->Snapshot(node);
   RailMask excluded(devs_.size(), 0);
   bool cross_rail_retry = false;
   CompletionFaultOperation completion_fault(
-      &test_completion_fault_calls_, op == WireOp::kRange);
+      &test_completion_fault_calls_,
+      op == WireOp::kCache || op == WireOp::kRange);
   for (int attempt = 0; attempt < 2; ++attempt) {
     completion_fault.BeginAttempt(attempt);
     std::string attempt_out;
@@ -1493,26 +1629,26 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
     AcquireOptions options;
     options.force_new = attempt != 0;
     options.excluded = excluded;
+    options.peer = peer;
     AcquireResult acquired = Acquire(node, lane, options);
     if (!acquired.conn) {
       if (PrepareRetry(attempt, acquired.from_pool, acquired.attempted_rail,
-                       acquired.failure, &excluded, &cross_rail_retry)) {
+                       acquired.failure, replay_safety, false, peer, &excluded,
+                       &cross_rail_retry)) {
         continue;
       }
       if (cross_rail_retry)
         cross_rail_retry_exhausted_.fetch_add(1,
                                               std::memory_order_relaxed);
-      return acquired.failure == AcquireFailure::kAdmission
-                 ? Status::kResourceExhausted
-                 : Status::kIOError;
+      return acquired.status;
     }
     Conn* conn = acquired.conn;
     if (InjectLocalRailFailure(attempt)) {
       const size_t failed_rail = conn->rail_index;
       Destroy(conn, rdma::RailCompletion::kRailFailure);
       if (PrepareRetry(attempt, acquired.from_pool, failed_rail,
-                       AcquireFailure::kLocalRail, &excluded,
-                       &cross_rail_retry))
+                       AcquireFailure::kLocalRail, replay_safety, false, peer,
+                       &excluded, &cross_rail_retry))
         continue;
       if (cross_rail_retry)
         cross_rail_retry_exhausted_.fetch_add(1,
@@ -1644,11 +1780,12 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
     Destroy(conn, completion);
     const AcquireFailure failure =
         completion == rdma::RailCompletion::kRailFailure &&
-                (replay_safe || !request_posted)
+                (local_rail_replay_safe || !request_posted)
             ? AcquireFailure::kLocalRail
             : AcquireFailure::kEndpoint;
     if (PrepareRetry(attempt, acquired.from_pool, failed_rail, failure,
-                     &excluded, &cross_rail_retry)) {
+                     replay_safety, request_posted, peer, &excluded,
+                     &cross_rail_retry)) {
       continue;
     }
     if (cross_rail_retry)
@@ -1721,9 +1858,12 @@ std::vector<Status> RdmaTransport::CacheMany(
   }
   if (valid_count == 0) return result;
 
+  const auto peer = peer_topologies_->Snapshot(node);
   RailMask excluded(devs_.size(), 0);
   bool cross_rail_retry = false;
+  CompletionFaultOperation completion_fault(&test_completion_fault_calls_);
   for (int attempt = 0; attempt < 2; ++attempt) {
+    completion_fault.BeginAttempt(attempt);
     std::fill(result.begin(), result.end(), Status::kIOError);
     for (size_t i = 0; i < count; ++i)
       if (bad[i]) result[i] = Status::kInvalid;
@@ -1731,16 +1871,19 @@ std::vector<Status> RdmaTransport::CacheMany(
     options.force_new = attempt != 0;
     options.requested_credits = std::min(valid_count, depth_);
     options.excluded = excluded;
+    options.peer = peer;
     AcquireResult acquired = Acquire(node, Lane::kData, options);
     if (!acquired.conn) {
       if (PrepareRetry(attempt, acquired.from_pool, acquired.attempted_rail,
-                       acquired.failure, &excluded, &cross_rail_retry))
+                       acquired.failure, ReplaySafety::kUnsafeAfterPost, false,
+                       peer, &excluded, &cross_rail_retry))
         continue;
       if (cross_rail_retry)
         cross_rail_retry_exhausted_.fetch_add(1,
                                               std::memory_order_relaxed);
-      if (acquired.failure == AcquireFailure::kAdmission)
-        MarkAdmissionFailure(&result);
+      if (acquired.failure == AcquireFailure::kAdmission ||
+          acquired.failure == AcquireFailure::kNoCompatibleRail)
+        MarkClientLocalFailure(&result, acquired.status);
       return result;
     }
     Conn* conn = acquired.conn;
@@ -1792,7 +1935,7 @@ std::vector<Status> RdmaTransport::CacheMany(
       bool had_wcs = false;
       if (conn_ok &&
           !ReapPosted(ep, posted, width, &reply_bytes, BatchTimeout(),
-                      &timed_out, &wc_status, &had_wcs)) {
+                      &timed_out, &wc_status, &had_wcs, &completion_fault)) {
         conn_ok = false;
         completion = rdma::ClassifyCompletion(wc_status, had_wcs);
       }
@@ -1828,6 +1971,7 @@ std::vector<Status> RdmaTransport::CacheMany(
             ? AcquireFailure::kLocalRail
             : AcquireFailure::kEndpoint;
     if (PrepareRetry(attempt, acquired.from_pool, failed_rail, failure,
+                     ReplaySafety::kUnsafeAfterPost, request_posted, peer,
                      &excluded, &cross_rail_retry))
       continue;
     if (cross_rail_retry)
@@ -1864,6 +2008,7 @@ std::vector<Status> RdmaTransport::RangeMany(
     return InvalidStatuses(count);
   }
 
+  const auto peer = peer_topologies_->Snapshot(node);
   RailMask excluded(devs_.size(), 0);
   bool cross_rail_retry = false;
   CompletionFaultOperation completion_fault(&test_completion_fault_calls_);
@@ -1876,16 +2021,19 @@ std::vector<Status> RdmaTransport::RangeMany(
     options.force_new = attempt != 0;
     options.requested_credits = std::min(count, depth_);
     options.excluded = excluded;
+    options.peer = peer;
     AcquireResult acquired = Acquire(node, Lane::kData, options);
     if (!acquired.conn) {
       if (PrepareRetry(attempt, acquired.from_pool, acquired.attempted_rail,
-                       acquired.failure, &excluded, &cross_rail_retry))
+                       acquired.failure, ReplaySafety::kReplaySafe, false,
+                       peer, &excluded, &cross_rail_retry))
         continue;
       if (cross_rail_retry)
         cross_rail_retry_exhausted_.fetch_add(1,
                                               std::memory_order_relaxed);
-      if (acquired.failure == AcquireFailure::kAdmission)
-        MarkAdmissionFailure(&result);
+      if (acquired.failure == AcquireFailure::kAdmission ||
+          acquired.failure == AcquireFailure::kNoCompatibleRail)
+        MarkClientLocalFailure(&result, acquired.status);
       return result;
     }
     Conn* conn = acquired.conn;
@@ -1983,7 +2131,8 @@ std::vector<Status> RdmaTransport::RangeMany(
             ? AcquireFailure::kLocalRail
             : AcquireFailure::kEndpoint;
     if (PrepareRetry(attempt, acquired.from_pool, failed_rail, failure,
-                     &excluded, &cross_rail_retry))
+                     ReplaySafety::kReplaySafe, false, peer, &excluded,
+                     &cross_rail_retry))
       continue;
     if (cross_rail_retry)
       cross_rail_retry_exhausted_.fetch_add(1, std::memory_order_relaxed);
@@ -2003,6 +2152,7 @@ std::vector<Status> RdmaTransport::ExistMany(
   std::vector<Status> result(count, Status::kIOError);
   if (count == 0) return result;
 
+  const auto peer = peer_topologies_->Snapshot(node);
   RailMask excluded(devs_.size(), 0);
   bool cross_rail_retry = false;
   for (int attempt = 0; attempt < 2; ++attempt) {
@@ -2012,16 +2162,19 @@ std::vector<Status> RdmaTransport::ExistMany(
     options.force_new = attempt != 0;
     options.requested_credits = std::min(count, depth_);
     options.excluded = excluded;
+    options.peer = peer;
     AcquireResult acquired = Acquire(node, Lane::kControl, options);
     if (!acquired.conn) {
       if (PrepareRetry(attempt, acquired.from_pool, acquired.attempted_rail,
-                       acquired.failure, &excluded, &cross_rail_retry))
+                       acquired.failure, ReplaySafety::kReplaySafe, false,
+                       peer, &excluded, &cross_rail_retry))
         continue;
       if (cross_rail_retry)
         cross_rail_retry_exhausted_.fetch_add(1,
                                               std::memory_order_relaxed);
-      if (acquired.failure == AcquireFailure::kAdmission)
-        MarkAdmissionFailure(&result);
+      if (acquired.failure == AcquireFailure::kAdmission ||
+          acquired.failure == AcquireFailure::kNoCompatibleRail)
+        MarkClientLocalFailure(&result, acquired.status);
       return result;
     }
     Conn* conn = acquired.conn;
@@ -2080,7 +2233,8 @@ std::vector<Status> RdmaTransport::ExistMany(
             ? AcquireFailure::kLocalRail
             : AcquireFailure::kEndpoint;
     if (PrepareRetry(attempt, acquired.from_pool, failed_rail, failure,
-                     &excluded, &cross_rail_retry))
+                     ReplaySafety::kReplaySafe, false, peer, &excluded,
+                     &cross_rail_retry))
       continue;
     if (cross_rail_retry)
       cross_rail_retry_exhausted_.fetch_add(1, std::memory_order_relaxed);
@@ -2124,6 +2278,7 @@ std::vector<Status> RdmaTransport::RangeInto(
   rdma::OperationContext operation;
   if (!operation.Submit() || !operation.ClaimPoller()) return result;
   bool final_timeout = false;
+  const auto peer = peer_topologies_->Snapshot(node);
   RailMask excluded(devs_.size(), 0);
   bool cross_rail_retry = false;
   CompletionFaultOperation completion_fault(&test_completion_fault_calls_);
@@ -2146,16 +2301,19 @@ std::vector<Status> RdmaTransport::RangeInto(
     options.force_new = attempt != 0;
     options.requested_credits = std::min(valid_count, depth_);
     options.excluded = excluded;
+    options.peer = peer;
     AcquireResult acquired = Acquire(node, Lane::kData, options);
     if (!acquired.conn) {
       if (PrepareRetry(attempt, acquired.from_pool, acquired.attempted_rail,
-                       acquired.failure, &excluded, &cross_rail_retry))
+                       acquired.failure, ReplaySafety::kReplaySafe, false,
+                       peer, &excluded, &cross_rail_retry))
         continue;
       if (cross_rail_retry)
         cross_rail_retry_exhausted_.fetch_add(1,
                                               std::memory_order_relaxed);
-      if (acquired.failure == AcquireFailure::kAdmission)
-        MarkAdmissionFailure(&result);
+      if (acquired.failure == AcquireFailure::kAdmission ||
+          acquired.failure == AcquireFailure::kNoCompatibleRail)
+        MarkClientLocalFailure(&result, acquired.status);
       operation.Complete(false);
       return result;
     }
@@ -2257,7 +2415,8 @@ std::vector<Status> RdmaTransport::RangeInto(
             ? AcquireFailure::kLocalRail
             : AcquireFailure::kEndpoint;
     if (PrepareRetry(attempt, acquired.from_pool, failed_rail, failure,
-                     &excluded, &cross_rail_retry))
+                     ReplaySafety::kReplaySafe, false, peer, &excluded,
+                     &cross_rail_retry))
       continue;
     if (cross_rail_retry)
       cross_rail_retry_exhausted_.fetch_add(1, std::memory_order_relaxed);
@@ -2316,26 +2475,31 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
   }
   if (valid_count == 0) return result;
 
+  const auto peer = peer_topologies_->Snapshot(node);
   RailMask excluded(devs_.size(), 0);
   bool cross_rail_retry = false;
+  CompletionFaultOperation completion_fault(&test_completion_fault_calls_);
   for (int attempt = 0; attempt < 2; ++attempt) {
-    // Completed items and their terminal statuses survive a fresh-rail
-    // attempt. Any incomplete item restarts below with new connection-local
-    // progress and transient registrations.
+    // A fresh attempt is possible only before any request is posted;
+    // validation results survive while connection-local progress restarts.
+    completion_fault.BeginAttempt(attempt);
     AcquireOptions options;
     options.force_new = attempt != 0;
     options.requested_credits = 1;
     options.excluded = excluded;
+    options.peer = peer;
     AcquireResult acquired = Acquire(node, Lane::kSgData, options);
     if (!acquired.conn) {
       if (PrepareRetry(attempt, acquired.from_pool, acquired.attempted_rail,
-                       acquired.failure, &excluded, &cross_rail_retry))
+                       acquired.failure, ReplaySafety::kUnsafeAfterPost, false,
+                       peer, &excluded, &cross_rail_retry))
         continue;
       if (cross_rail_retry)
         cross_rail_retry_exhausted_.fetch_add(1,
                                               std::memory_order_relaxed);
-      if (acquired.failure == AcquireFailure::kAdmission)
-        MarkAdmissionFailure(&result);
+      if (acquired.failure == AcquireFailure::kAdmission ||
+          acquired.failure == AcquireFailure::kNoCompatibleRail)
+        MarkClientLocalFailure(&result, acquired.status);
       return result;
     }
     Conn* conn = acquired.conn;
@@ -2416,7 +2580,7 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
         ibv_wc_status wc_status = IBV_WC_SUCCESS;
         bool had_wcs = false;
         if (!ReapPosted(ep, 1, 1, &reply_bytes, BatchTimeout(), &timed_out,
-                        &wc_status, &had_wcs)) {
+                        &wc_status, &had_wcs, &completion_fault)) {
           conn_ok = false;
           completion = rdma::ClassifyCompletion(wc_status, had_wcs);
         }
@@ -2466,6 +2630,7 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
             ? AcquireFailure::kLocalRail
             : AcquireFailure::kEndpoint;
     if (PrepareRetry(attempt, acquired.from_pool, failed_rail, failure,
+                     ReplaySafety::kUnsafeAfterPost, request_posted, peer,
                      &excluded, &cross_rail_retry))
       continue;
     if (cross_rail_retry)
@@ -2570,6 +2735,7 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
   if (!operation.Submit() || !operation.ClaimPoller()) return result;
   bool final_timeout = false;
 
+  const auto peer = peer_topologies_->Snapshot(node);
   RailMask excluded(devs_.size(), 0);
   bool cross_rail_retry = false;
   CompletionFaultOperation completion_fault(&test_completion_fault_calls_);
@@ -2590,16 +2756,19 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
     options.force_new = attempt != 0;
     options.requested_credits = std::min<size_t>(remaining_count, depth_);
     options.excluded = excluded;
+    options.peer = peer;
     AcquireResult acquired = Acquire(node, Lane::kSgData, options);
     if (!acquired.conn) {
       if (PrepareRetry(attempt, acquired.from_pool, acquired.attempted_rail,
-                       acquired.failure, &excluded, &cross_rail_retry))
+                       acquired.failure, ReplaySafety::kReplaySafe, false,
+                       peer, &excluded, &cross_rail_retry))
         continue;
       if (cross_rail_retry)
         cross_rail_retry_exhausted_.fetch_add(1,
                                               std::memory_order_relaxed);
-      if (acquired.failure == AcquireFailure::kAdmission)
-        MarkAdmissionFailure(&result);
+      if (acquired.failure == AcquireFailure::kAdmission ||
+          acquired.failure == AcquireFailure::kNoCompatibleRail)
+        MarkClientLocalFailure(&result, acquired.status);
       operation.Complete(false);
       return result;
     }
@@ -2843,7 +3012,8 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
             ? AcquireFailure::kLocalRail
             : AcquireFailure::kEndpoint;
     if (PrepareRetry(attempt, acquired.from_pool, failed_rail, failure,
-                     &excluded, &cross_rail_retry))
+                     ReplaySafety::kReplaySafe, false, peer, &excluded,
+                     &cross_rail_retry))
       continue;
     if (cross_rail_retry)
       cross_rail_retry_exhausted_.fetch_add(1, std::memory_order_relaxed);
