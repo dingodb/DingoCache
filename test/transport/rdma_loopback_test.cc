@@ -11,6 +11,8 @@
 #include "cache/rdma_server.h"
 #include "common/config_dump.h"
 #include "transport/rdma_transport.h"
+#include "transport/rail_select.h"
+#include "transport/rdma_topology.h"
 #include "transport/rdma_protocol.h"
 #include "transport/rdma_verbs.h"
 
@@ -19,11 +21,17 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <condition_variable>
+#include <algorithm>
+#include <cctype>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -107,6 +115,9 @@ struct RdmaNode {
   std::unique_ptr<KvNodeServer> srv;
   std::unique_ptr<RdmaServer> rsrv;
   std::string addr;  // bootstrap "ip:port" for the client member list
+  mutable std::mutex observation_mu;
+  std::map<std::string, size_t> cache_direct_calls;
+  std::map<std::string, size_t> range_direct_calls;
 
   explicit RdmaNode(const std::string& tag, size_t max_msg = kMaxMsg) {
     ConfigureTestRecvSegment();
@@ -127,11 +138,19 @@ struct RdmaNode {
         [this](const BlockKey& key, uint64_t off, uint64_t len,
                char* io_buf, size_t cap, const char** out_data,
                size_t* out_len, size_t* value_len) {
+          {
+            std::lock_guard<std::mutex> lock(observation_mu);
+            ++range_direct_calls[key.Filename()];
+          }
           return srv->RangeDirectForKey(
               key, off, len, io_buf, cap, out_data, out_len, value_len);
         });
     rsrv->set_cache_direct_handler(
         [this](const BlockKey& key, char* data, size_t len, size_t cap) {
+          {
+            std::lock_guard<std::mutex> lock(observation_mu);
+            ++cache_direct_calls[key.Filename()];
+          }
           return srv->CacheDirectForKey(key, data, len, cap);
         });
     EXPECT_EQ(rsrv->Start(0), Status::kOk);
@@ -141,6 +160,16 @@ struct RdmaNode {
     if (rsrv) rsrv->Stop();
     if (srv) srv->Stop();
     fs::remove_all(dir);
+  }
+  size_t CacheDirectCalls(const BlockKey& key) const {
+    std::lock_guard<std::mutex> lock(observation_mu);
+    const auto found = cache_direct_calls.find(key.Filename());
+    return found == cache_direct_calls.end() ? 0 : found->second;
+  }
+  size_t RangeDirectCalls(const BlockKey& key) const {
+    std::lock_guard<std::mutex> lock(observation_mu);
+    const auto found = range_direct_calls.find(key.Filename());
+    return found == range_direct_calls.end() ? 0 : found->second;
   }
 };
 
@@ -154,6 +183,95 @@ long CounterVal(const std::string& text, const std::string& name) {
   auto sp = text.find(' ', p);
   if (sp == std::string::npos) return -1;
   try { return std::stol(text.substr(sp + 1)); } catch (...) { return -1; }
+}
+long DeviceCounterVal(const std::string& text, const std::string& name,
+                      const std::string& device) {
+  const std::string prefix = name + "{dev=\"" + device + "\"} ";
+  const auto pos = text.find(prefix);
+  if (pos == std::string::npos) return -1;
+  try {
+    return std::stol(text.substr(pos + prefix.size()));
+  } catch (...) {
+    return -1;
+  }
+}
+// Rail-policy configuration is process-global. Keep every two-HCA test on one
+// suite-safe value: 32 concurrent callers may each reserve the depth-four
+// maximum, even if locality initially selects the same rail for all of them.
+constexpr char kRealHcaRailCredits[] = "128";
+
+std::vector<std::string> ConfiguredTwoTestRails() {
+  const char* configured = std::getenv("DFKV_RDMA_DEV");
+  if (!configured || !*configured) return {};
+  std::vector<std::string> rails;
+  std::string value(configured);
+  for (size_t start = 0; start <= value.size();) {
+    const size_t comma = value.find(',', start);
+    const size_t end = comma == std::string::npos ? value.size() : comma;
+    std::string rail = value.substr(start, end - start);
+    rail.erase(std::remove_if(rail.begin(), rail.end(),
+                              [](unsigned char c) { return std::isspace(c); }),
+               rail.end());
+    if (!rail.empty()) rails.push_back(std::move(rail));
+    if (comma == std::string::npos) break;
+    start = comma + 1;
+  }
+  return rails.size() == 2 ? rails : std::vector<std::string>{};
+}
+bool HaveConfiguredActiveRails(const std::vector<std::string>& rails) {
+  if (rails.size() != 2 || rails[0] == rails[1]) return false;
+  const auto discovered = rdma::RdmaTopology::Discover(
+      rails, rdma::RdmaDiscoveryPolicy::kActiveOnly);
+  return discovered.status == rdma::RdmaDiscoveryStatus::kOk &&
+         discovered.devices.size() == rails.size();
+}
+
+void ExpectReleasedRailResources(const std::string& before,
+                                 const std::string& after,
+                                 const std::vector<std::string>& rails) {
+  for (const auto& rail : rails) {
+    EXPECT_EQ(DeviceCounterVal(after, "dfkv_rdma_client_rail_inflight", rail),
+              0)
+        << rail;
+    EXPECT_EQ(
+        DeviceCounterVal(after, "dfkv_rdma_client_rail_credits_available",
+                         rail),
+        DeviceCounterVal(before, "dfkv_rdma_client_rail_credits_available",
+                         rail))
+        << rail;
+  }
+  EXPECT_EQ(CounterVal(after, "dfkv_rdma_client_transient_user_mr_active"),
+            CounterVal(before,
+                       "dfkv_rdma_client_transient_user_mr_active"));
+}
+void ExpectTwoDistinctRailAttempts(
+    const std::string& before, const std::string& after,
+    const std::vector<std::string>& rails, long expected_local_failures) {
+  ASSERT_EQ(rails.size(), 2u);
+  long selections = 0;
+  long errors = 0;
+  long endpoint_errors = 0;
+  for (const auto& rail : rails) {
+    const long selected =
+        DeviceCounterVal(after, "dfkv_rdma_client_rail_selections_total",
+                         rail) -
+        DeviceCounterVal(before, "dfkv_rdma_client_rail_selections_total",
+                         rail);
+    EXPECT_EQ(selected, 1) << rail;
+    selections += selected;
+    errors += DeviceCounterVal(after, "dfkv_rdma_client_rail_errors_total",
+                               rail) -
+              DeviceCounterVal(before, "dfkv_rdma_client_rail_errors_total",
+                               rail);
+    endpoint_errors +=
+        DeviceCounterVal(after, "dfkv_rdma_client_endpoint_errors_total",
+                         rail) -
+        DeviceCounterVal(before, "dfkv_rdma_client_endpoint_errors_total",
+                         rail);
+  }
+  EXPECT_EQ(selections, 2);
+  EXPECT_EQ(errors, expected_local_failures);
+  EXPECT_EQ(endpoint_errors, 0);
 }
 
 struct FakePoolRail {
@@ -357,6 +475,194 @@ TEST(RdmaServerStartup, ExplicitResolutionFailureNeverShrinksTopology) {
   EXPECT_EQ(RdmaServerTestPeer::AnchorCount(server), 0u);
   EXPECT_EQ(RdmaServerTestPeer::RailStatsCount(server), 0u);
   EXPECT_EQ(RdmaServerTestPeer::RegisteredRailCount(server), 0u);
+}
+
+TEST(RdmaSafety, LocalRailFailureQuarantinesButPeerFailureDoesNot) {
+  rdma::RailPolicyConfig config;
+  config.credits_per_rail = 2;
+  config.error_threshold = 1;
+  config.quarantine_us = 1000;
+  config.latency_weight = 1;
+  config.error_penalty_us = 100;
+  rdma::RailPolicy policy(2, config);
+
+  auto local = policy.TryAcquire(2, 100);
+  ASSERT_TRUE(local);
+  ASSERT_EQ(local->rail, 0u);
+  policy.Complete(*local, 10, rdma::RailCompletion::kRailFailure, 200);
+  auto stats = policy.Snapshot(200);
+  ASSERT_EQ(stats.size(), 2u);
+  EXPECT_EQ(stats[0].errors, 1u);
+  EXPECT_EQ(stats[0].endpoint_errors, 0u);
+  EXPECT_EQ(stats[0].consecutive_errors, 1u);
+  EXPECT_EQ(stats[0].quarantines, 1u);
+  EXPECT_TRUE(stats[0].quarantined);
+  EXPECT_EQ(stats[0].inflight, 0u);
+  EXPECT_EQ(stats[0].credits, 2u);
+
+  auto endpoint = policy.TryAcquire(2, 200);
+  ASSERT_TRUE(endpoint);
+  ASSERT_EQ(endpoint->rail, 1u);
+  policy.Complete(*endpoint, 10, rdma::RailCompletion::kEndpointFailure, 210);
+  stats = policy.Snapshot(210);
+  EXPECT_EQ(stats[1].errors, 0u);
+  EXPECT_EQ(stats[1].endpoint_errors, 1u);
+  EXPECT_EQ(stats[1].consecutive_errors, 0u);
+  EXPECT_EQ(stats[1].quarantines, 0u);
+  EXPECT_FALSE(stats[1].quarantined);
+  EXPECT_EQ(stats[1].inflight, 0u);
+  EXPECT_EQ(stats[1].credits, 2u);
+}
+
+TEST(RdmaSafety, OperationExclusionAppliesToPreferredAndFallbackRails) {
+  rdma::RailPolicy policy(
+      3, rdma::RailPolicyConfig{/*credits_per_rail=*/2,
+                                /*error_threshold=*/3,
+                                /*quarantine_us=*/1000,
+                                /*latency_weight=*/1,
+                                /*error_penalty_us=*/100});
+  const std::vector<uint8_t> preferred{1, 1, 0};
+  const std::vector<uint8_t> fallback{0, 0, 1};
+
+  auto preferred_retry = rdma::AcquireWithFallback(
+      policy, 1, 0, preferred, fallback, /*excluded=*/{1, 0, 0});
+  ASSERT_TRUE(preferred_retry);
+  EXPECT_EQ(preferred_retry->rail, 1u);
+  policy.Complete(*preferred_retry, 1, rdma::RailCompletion::kSuccess, 100);
+
+  auto fallback_retry = rdma::AcquireWithFallback(
+      policy, 1, 0, preferred, fallback, /*excluded=*/{1, 1, 0});
+  ASSERT_TRUE(fallback_retry);
+  EXPECT_EQ(fallback_retry->rail, 2u);
+  policy.Complete(*fallback_retry, 1, rdma::RailCompletion::kSuccess, 101);
+
+  EXPECT_TRUE(rdma::HasUnexcludedRail(preferred, fallback, {1, 1, 0}));
+  EXPECT_FALSE(rdma::HasUnexcludedRail({1}, {}, {1}));
+  EXPECT_FALSE(
+      rdma::AcquireWithFallback(policy, 1, 0, {1, 0, 0}, {}, {1, 0, 0}))
+      << "admission must not silently bypass an operation-local exclusion";
+}
+TEST(RdmaSafety, QuarantinedRailAllowsOneProbeAndRecoversOnlyOnSuccess) {
+
+  rdma::RailPolicyConfig config;
+  config.credits_per_rail = 64;
+  config.error_threshold = 1;
+  config.quarantine_us = 1000;
+  config.latency_weight = 1;
+  config.error_penalty_us = 100;
+  rdma::RailPolicy policy(2, config);
+
+  auto failed = policy.TryAcquire(1, 100);
+  ASSERT_TRUE(failed);
+  ASSERT_EQ(failed->rail, 0u);
+  policy.Complete(*failed, 10, rdma::RailCompletion::kRailFailure, 200);
+  auto before_cooldown = policy.TryAcquire(1, 1199);
+  ASSERT_TRUE(before_cooldown);
+  EXPECT_EQ(before_cooldown->rail, 1u);
+  policy.Complete(*before_cooldown, 10, rdma::RailCompletion::kSuccess, 1199);
+
+  constexpr size_t kCallers = 32;
+  std::mutex gate_mu;
+  std::condition_variable ready_cv;
+  std::condition_variable start_cv;
+  std::condition_variable completed_cv;
+  size_t ready = 0;
+  size_t completed = 0;
+  bool start = false;
+  std::vector<std::optional<rdma::RailLease>> leases(kCallers);
+  std::vector<std::thread> callers;
+  callers.reserve(kCallers);
+  for (size_t i = 0; i < kCallers; ++i) {
+    callers.emplace_back([&, i] {
+      std::unique_lock<std::mutex> lock(gate_mu);
+      ++ready;
+      ready_cv.notify_one();
+      start_cv.wait(lock, [&] { return start; });
+      lock.unlock();
+      leases[i] = policy.TryAcquire(1, 1200);
+      lock.lock();
+      ++completed;
+      completed_cv.notify_one();
+    });
+  }
+  bool all_ready = false;
+  {
+    std::unique_lock<std::mutex> lock(gate_mu);
+    all_ready = ready_cv.wait_for(lock, std::chrono::seconds(2),
+                                  [&] { return ready == kCallers; });
+    start = true;
+  }
+  start_cv.notify_all();
+  EXPECT_TRUE(all_ready) << "callers did not reach the start barrier";
+  {
+    std::unique_lock<std::mutex> lock(gate_mu);
+    EXPECT_TRUE(completed_cv.wait_for(lock, std::chrono::seconds(2),
+                                      [&] { return completed == kCallers; }))
+        << "rail-policy callers deadlocked";
+  }
+  for (auto& caller : callers) caller.join();
+
+  size_t probe_index = kCallers;
+  size_t rail0_leases = 0;
+  for (size_t i = 0; i < leases.size(); ++i) {
+    ASSERT_TRUE(leases[i]) << i;
+    if (leases[i]->rail == 0) {
+      ++rail0_leases;
+      probe_index = i;
+    } else {
+      EXPECT_EQ(leases[i]->rail, 1u);
+    }
+  }
+  ASSERT_EQ(rail0_leases, 1u);
+  auto stats = policy.Snapshot(1200);
+  EXPECT_TRUE(stats[0].quarantined);
+  EXPECT_TRUE(stats[0].recovery_probe);
+  EXPECT_EQ(stats[0].recoveries, 0u);
+
+  for (size_t i = 0; i < leases.size(); ++i) {
+    if (i == probe_index) continue;
+    policy.Complete(*leases[i], 10, rdma::RailCompletion::kSuccess, 1201);
+  }
+  policy.Complete(*leases[probe_index], 10,
+                  rdma::RailCompletion::kEndpointFailure, 1201);
+  stats = policy.Snapshot(1201);
+  EXPECT_TRUE(stats[0].quarantined);
+  EXPECT_FALSE(stats[0].recovery_probe);
+  EXPECT_EQ(stats[0].recoveries, 0u);
+  EXPECT_EQ(stats[0].endpoint_errors, 1u);
+
+  auto failed_probe = policy.TryAcquire(1, 1202);
+  ASSERT_TRUE(failed_probe);
+  ASSERT_EQ(failed_probe->rail, 0u);
+  policy.Complete(*failed_probe, 10, rdma::RailCompletion::kRailFailure, 1202);
+  stats = policy.Snapshot(1202);
+  EXPECT_EQ(stats[0].quarantines, 2u);
+  EXPECT_TRUE(stats[0].quarantined);
+  EXPECT_FALSE(stats[0].recovery_probe);
+
+  auto other_success = policy.TryAcquire(1, 2201);
+  ASSERT_TRUE(other_success);
+  ASSERT_EQ(other_success->rail, 1u);
+  policy.Complete(*other_success, 10, rdma::RailCompletion::kSuccess, 2201);
+  stats = policy.Snapshot(2201);
+  EXPECT_EQ(stats[0].recoveries, 0u)
+      << "success on another rail must not recover the quarantined rail";
+
+  auto successful_probe = policy.TryAcquire(1, 2202);
+  ASSERT_TRUE(successful_probe);
+  ASSERT_EQ(successful_probe->rail, 0u);
+  policy.Complete(*successful_probe, 10, rdma::RailCompletion::kSuccess, 2203);
+  stats = policy.Snapshot(2203);
+  EXPECT_EQ(stats[0].recoveries, 1u);
+  EXPECT_EQ(stats[0].consecutive_errors, 0u);
+  EXPECT_FALSE(stats[0].quarantined);
+  EXPECT_FALSE(stats[0].recovery_probe);
+
+  auto admitted_after_recovery = policy.TryAcquire(1, 2204);
+  ASSERT_TRUE(admitted_after_recovery);
+  EXPECT_EQ(admitted_after_recovery->rail, 0u);
+  policy.Complete(*admitted_after_recovery, 10,
+                  rdma::RailCompletion::kSuccess, 2205);
 }
 
 TEST(RdmaSafety, CompletionDeadlineUsesOneAbsoluteBudget) {
@@ -2202,4 +2508,509 @@ TEST(RdmaLoopback, DefaultDeclarationKeepsGlobalCap) {
   std::string got(v.size(), '\0');
   ASSERT_TRUE(c.Get("full-size", got.data(), got.size()));
   EXPECT_EQ(got, v);
+}
+
+TEST(RdmaLoopback, ClientLocalRailFailureRetriesFreshPutAndGet) {
+  if (!HaveRdma())
+    GTEST_SKIP() << "no RDMA device (load two rdma_rxe devices for this test)";
+  const auto rails = ConfiguredTwoTestRails();
+  if (!HaveConfiguredActiveRails(rails))
+    GTEST_SKIP() << "set DFKV_RDMA_DEV to exactly two ACTIVE test devices";
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
+  ScopedEnv credits("DFKV_RDMA_RAIL_CREDITS", kRealHcaRailCredits);
+  ScopedEnv threshold("DFKV_RDMA_RAIL_ERROR_THRESHOLD", "100");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv local_failure_fault(
+      "DFKV_RDMA_TEST_LOCAL_RAIL_FAILURE_ATTEMPTS", nullptr);
+  RdmaNode node("cross-rail-scalar");
+  RdmaTransport transport(kMaxMsg, rails[0] + "," + rails[1]);
+  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+  const std::string value(64 * 1024, 'p');
+
+  std::string before = transport.MetricsText();
+  const long stale_before =
+      CounterVal(before, "dfkv_rdma_client_stale_pool_retries_total");
+  {
+    ScopedEnv fault("DFKV_RDMA_TEST_LOCAL_RAIL_FAILURE_ATTEMPTS", "1");
+    ASSERT_TRUE(client.Put("fresh-put", value.data(), value.size()));
+  }
+  std::string after = transport.MetricsText();
+  ExpectTwoDistinctRailAttempts(before, after, rails, 1);
+  ExpectReleasedRailResources(before, after, rails);
+  EXPECT_EQ(
+      CounterVal(after, "dfkv_rdma_endpoint_cache_hits_total") -
+          CounterVal(before, "dfkv_rdma_endpoint_cache_hits_total"),
+      0)
+      << "the first local failure must be exercised on a fresh endpoint";
+  EXPECT_EQ(
+      CounterVal(after, "dfkv_rdma_endpoint_cache_misses_total") -
+          CounterVal(before, "dfkv_rdma_endpoint_cache_misses_total"),
+      2);
+  EXPECT_EQ(
+      CounterVal(after, "dfkv_rdma_client_cross_rail_retries_total") -
+          CounterVal(before, "dfkv_rdma_client_cross_rail_retries_total"),
+      1);
+  EXPECT_EQ(
+      CounterVal(after,
+                 "dfkv_rdma_client_cross_rail_retry_successes_total") -
+          CounterVal(before,
+                     "dfkv_rdma_client_cross_rail_retry_successes_total"),
+      1);
+  EXPECT_EQ(
+      CounterVal(after,
+                 "dfkv_rdma_client_cross_rail_retry_exhausted_total") -
+          CounterVal(before,
+                     "dfkv_rdma_client_cross_rail_retry_exhausted_total"),
+      0);
+  EXPECT_EQ(CounterVal(after,
+                       "dfkv_rdma_client_stale_pool_retries_total"),
+            stale_before);
+
+  // Attempt 2 of the PUT left a healthy idle QP on its rail. Admission chooses
+  // a rail from current NUMA locality and health before consulting that rail's
+  // pool, so the GET may start either pooled or fresh. Its injected local
+  // failure must still retire that endpoint and retry on the other local rail.
+  before = after;
+  const long get_stale_before =
+      CounterVal(before, "dfkv_rdma_client_stale_pool_retries_total");
+  std::string output(value.size(), '\0');
+  {
+    ScopedEnv fault("DFKV_RDMA_TEST_COMPLETION_FAULT", "1:1:1");
+    ASSERT_TRUE(client.Get("fresh-put", output.data(), output.size()));
+  }
+  EXPECT_EQ(output, value);
+  after = transport.MetricsText();
+  ExpectTwoDistinctRailAttempts(before, after, rails, 1);
+  ExpectReleasedRailResources(before, after, rails);
+  const long get_endpoint_misses =
+      CounterVal(after, "dfkv_rdma_endpoint_cache_misses_total") -
+      CounterVal(before, "dfkv_rdma_endpoint_cache_misses_total");
+  EXPECT_GE(get_endpoint_misses, 1);
+  EXPECT_LE(get_endpoint_misses, 2)
+      << "two rail attempts may require at most one fresh endpoint per rail";
+  EXPECT_EQ(
+      CounterVal(after, "dfkv_rdma_client_cross_rail_retries_total") -
+          CounterVal(before, "dfkv_rdma_client_cross_rail_retries_total"),
+      1);
+  EXPECT_EQ(
+      CounterVal(after,
+                 "dfkv_rdma_client_cross_rail_retry_successes_total") -
+          CounterVal(before,
+                     "dfkv_rdma_client_cross_rail_retry_successes_total"),
+      1);
+  EXPECT_EQ(CounterVal(after,
+                       "dfkv_rdma_client_stale_pool_retries_total"),
+            get_stale_before)
+      << "a local-rail failure is not a stale-endpoint retry";
+}
+
+TEST(RdmaLoopback, SingleEnabledRailFallbackIsNotCrossRailRetry) {
+  if (!HaveRdma())
+    GTEST_SKIP() << "no RDMA device (load two rdma_rxe devices for this test)";
+  const auto rails = ConfiguredTwoTestRails();
+  if (!HaveConfiguredActiveRails(rails))
+    GTEST_SKIP() << "set DFKV_RDMA_DEV to exactly two ACTIVE test devices";
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
+  ScopedEnv credits("DFKV_RDMA_RAIL_CREDITS", kRealHcaRailCredits);
+  ScopedEnv threshold("DFKV_RDMA_RAIL_ERROR_THRESHOLD", "100");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv local_failure_fault(
+      "DFKV_RDMA_TEST_LOCAL_RAIL_FAILURE_ATTEMPTS", nullptr);
+  RdmaNode node("same-rail-fallback");
+  RdmaTransport transport(kMaxMsg, rails[0]);
+  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+  const std::string value(64 * 1024, 's');
+
+  const std::string before = transport.MetricsText();
+  {
+    ScopedEnv fault("DFKV_RDMA_TEST_LOCAL_RAIL_FAILURE_ATTEMPTS", "1");
+    ASSERT_TRUE(client.Put("same-rail", value.data(), value.size()));
+  }
+  const std::string after = transport.MetricsText();
+  EXPECT_EQ(
+      DeviceCounterVal(after, "dfkv_rdma_client_rail_selections_total",
+                       rails[0]) -
+          DeviceCounterVal(before,
+                           "dfkv_rdma_client_rail_selections_total",
+                           rails[0]),
+      2);
+  EXPECT_EQ(DeviceCounterVal(after, "dfkv_rdma_client_rail_errors_total",
+                             rails[0]) -
+                DeviceCounterVal(before,
+                                 "dfkv_rdma_client_rail_errors_total",
+                                 rails[0]),
+            1);
+  EXPECT_EQ(
+      CounterVal(after, "dfkv_rdma_client_cross_rail_retries_total") -
+          CounterVal(before, "dfkv_rdma_client_cross_rail_retries_total"),
+      0);
+  EXPECT_EQ(
+      CounterVal(after,
+                 "dfkv_rdma_client_cross_rail_retry_successes_total") -
+          CounterVal(before,
+                     "dfkv_rdma_client_cross_rail_retry_successes_total"),
+      0);
+  EXPECT_EQ(
+      CounterVal(after,
+                 "dfkv_rdma_client_cross_rail_retry_exhausted_total") -
+          CounterVal(before,
+                     "dfkv_rdma_client_cross_rail_retry_exhausted_total"),
+      0);
+  ExpectReleasedRailResources(before, after, {rails[0]});
+}
+
+TEST(RdmaLoopback,
+     ClientCompletionFailurePreservesCompletedMultiWindowSgItems) {
+  if (!HaveRdma())
+    GTEST_SKIP() << "no RDMA device (load two rdma_rxe devices for this test)";
+  const auto rails = ConfiguredTwoTestRails();
+  if (!HaveConfiguredActiveRails(rails))
+    GTEST_SKIP() << "set DFKV_RDMA_DEV to exactly two ACTIVE test devices";
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
+  ScopedEnv credits("DFKV_RDMA_RAIL_CREDITS", kRealHcaRailCredits);
+  ScopedEnv threshold("DFKV_RDMA_RAIL_ERROR_THRESHOLD", "100");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv local_failure_fault(
+      "DFKV_RDMA_TEST_LOCAL_RAIL_FAILURE_ATTEMPTS", nullptr);
+  // PUT uses the pre-post local-failure seam, so its retry may safely replay
+  // every item. GET advances both items in rounds: item 0 completes in round 2
+  // and completion window 3 faults only the still-incomplete item.
+  RdmaNode node("cross-rail-sg");
+  RdmaTransport transport(kMaxMsg, rails[0] + "," + rails[1]);
+  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+
+  constexpr size_t kItems = 2;
+  constexpr size_t kSegmentBytes = 31;
+  const size_t max_sg = transport.MaxSgPayloadSegs();
+  ASSERT_GE(max_sg, 2u);
+  std::vector<std::vector<std::string>> segments(kItems);
+  segments[0].resize(max_sg + 1);
+  segments[1].resize(3 * max_sg + 1);
+  std::vector<std::string> expected(kItems);
+  std::vector<KvPutItemSg> puts;
+  puts.reserve(kItems);
+  std::vector<BlockKey> block_keys;
+  block_keys.reserve(kItems);
+  for (size_t i = 0; i < kItems; ++i) {
+    std::vector<const void*> pointers;
+    std::vector<size_t> sizes;
+    for (size_t segment = 0; segment < segments[i].size(); ++segment) {
+      // BatchGetAutoSg groups by total capacity. Make both totals equal so the
+      // two- and four-window items share one RangeIntoMulti logical call;
+      // segment count, rather than byte count, still determines the windows.
+      const size_t segment_bytes =
+          i == 0 && segment == 0
+              ? (2 * max_sg + 1) * kSegmentBytes
+              : kSegmentBytes;
+      segments[i][segment] =
+          std::string(segment_bytes,
+                      static_cast<char>('A' + i * 13 + segment % 13));
+      expected[i] += segments[i][segment];
+      pointers.push_back(segments[i][segment].data());
+      sizes.push_back(segments[i][segment].size());
+    }
+    const std::string key = "sg-" + std::to_string(i);
+    puts.push_back({key, std::move(pointers), std::move(sizes)});
+    block_keys.push_back(ToBlockKey(SelfHdr(), key));
+  }
+
+  std::string before = transport.MetricsText();
+  {
+    ScopedEnv fault("DFKV_RDMA_TEST_LOCAL_RAIL_FAILURE_ATTEMPTS", "1");
+    EXPECT_EQ(client.BatchPutSg(puts), std::vector<bool>(kItems, true));
+  }
+  std::string after = transport.MetricsText();
+  ExpectTwoDistinctRailAttempts(before, after, rails, 1);
+  ExpectReleasedRailResources(before, after, rails);
+  EXPECT_EQ(node.CacheDirectCalls(block_keys[0]), 1u)
+      << "pre-post failure must not duplicate the first PUT item";
+  EXPECT_EQ(node.CacheDirectCalls(block_keys[1]), 1u)
+      << "pre-post failure must not duplicate the second PUT item";
+
+  std::vector<std::vector<std::string>> output(kItems);
+  std::vector<KvGetItemSg> gets;
+  gets.reserve(kItems);
+  std::vector<size_t> expected_lengths;
+  expected_lengths.reserve(kItems);
+  for (size_t i = 0; i < kItems; ++i) {
+    std::vector<void*> pointers;
+    std::vector<size_t> capacities;
+    size_t total = 0;
+    output[i].resize(segments[i].size());
+    for (size_t segment = 0; segment < segments[i].size(); ++segment) {
+      output[i][segment].assign(segments[i][segment].size(), '\0');
+      pointers.push_back(output[i][segment].data());
+      capacities.push_back(output[i][segment].size());
+      total += output[i][segment].size();
+    }
+    gets.push_back(
+        {puts[i].key, std::move(pointers), std::move(capacities)});
+    expected_lengths.push_back(total);
+  }
+  ASSERT_EQ(expected_lengths[0], expected_lengths[1])
+      << "SG retry items must remain in one transport group";
+
+  before = after;
+  std::vector<size_t> lengths;
+  {
+    ScopedEnv fault("DFKV_RDMA_TEST_COMPLETION_FAULT", "1:1:3");
+    EXPECT_EQ(client.BatchGetAutoSg(gets, &lengths),
+              std::vector<bool>(kItems, true));
+  }
+  EXPECT_EQ(lengths, expected_lengths);
+  after = transport.MetricsText();
+  ExpectTwoDistinctRailAttempts(before, after, rails, 1);
+  ExpectReleasedRailResources(before, after, rails);
+  EXPECT_EQ(node.RangeDirectCalls(block_keys[0]), 1u)
+      << "the completed GET item must not restart on the fresh rail";
+  EXPECT_EQ(node.RangeDirectCalls(block_keys[1]), 2u)
+      << "only the incomplete GET item must restart from window zero";
+  for (size_t i = 0; i < kItems; ++i) {
+    std::string actual;
+    for (const auto& segment : output[i]) actual += segment;
+    EXPECT_EQ(actual, expected[i]) << i;
+  }
+  EXPECT_EQ(CounterVal(after, "dfkv_rdma_client_cross_rail_retries_total"),
+            2);
+  EXPECT_EQ(
+      CounterVal(after,
+                 "dfkv_rdma_client_cross_rail_retry_successes_total"),
+      2);
+  EXPECT_EQ(
+      CounterVal(after,
+                 "dfkv_rdma_client_cross_rail_retry_exhausted_total"),
+      0);
+  EXPECT_EQ(CounterVal(after,
+                       "dfkv_rdma_client_stale_pool_retries_total"),
+            0);
+}
+
+TEST(RdmaLoopback, ConcurrentOperationsRemainIsolatedAcrossLocalRailRetry) {
+  if (!HaveRdma())
+    GTEST_SKIP() << "no RDMA device (load two rdma_rxe devices for this test)";
+  const auto rails = ConfiguredTwoTestRails();
+  if (!HaveConfiguredActiveRails(rails))
+    GTEST_SKIP() << "set DFKV_RDMA_DEV to exactly two ACTIVE test devices";
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
+  ScopedEnv credits("DFKV_RDMA_RAIL_CREDITS", kRealHcaRailCredits);
+  ScopedEnv threshold("DFKV_RDMA_RAIL_ERROR_THRESHOLD", "100");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv local_failure_fault(
+      "DFKV_RDMA_TEST_LOCAL_RAIL_FAILURE_ATTEMPTS", nullptr);
+  ScopedEnv ambient_completion_fault("DFKV_RDMA_TEST_COMPLETION_FAULT",
+                                     nullptr);
+  RdmaNode node("cross-rail-concurrent");
+  RdmaTransport transport(kMaxMsg, rails[0] + "," + rails[1]);
+  KVClient client({{"n", node.addr}}, "test/cross-rail-concurrent",
+                  &transport);
+
+  constexpr size_t kCallers = 32;
+  constexpr auto kConcurrencyDeadline = std::chrono::seconds(30);
+  constexpr size_t kValueBytes = 64 * 1024;
+  std::vector<std::string> values(kCallers);
+  for (size_t i = 0; i < kCallers; ++i) {
+    values[i].resize(kValueBytes);
+    for (size_t byte = 0; byte < kValueBytes; ++byte)
+      values[i][byte] =
+          static_cast<char>((i * 31 + byte * 17) & 0xff);
+  }
+  std::vector<std::string> outputs(
+      kCallers, std::string(kValueBytes, '\0'));
+  for (size_t i = 0; i < kCallers; ++i) {
+    ASSERT_TRUE(client.Put("concurrent-" + std::to_string(i),
+                           values[i].data(), values[i].size()))
+        << i;
+  }
+  std::vector<char> get_ok(kCallers, 0);
+  std::mutex gate_mu;
+  std::condition_variable ready_cv;
+  std::condition_variable start_cv;
+  std::condition_variable completed_cv;
+  size_t ready = 0;
+  size_t completed = 0;
+  bool start = false;
+  const auto deadline =
+      std::chrono::steady_clock::now() + kConcurrencyDeadline;
+  std::vector<std::thread> callers;
+  callers.reserve(kCallers);
+  const std::string before = transport.MetricsText();
+  {
+    ScopedEnv fault("DFKV_RDMA_TEST_COMPLETION_FAULT", "1:1:1");
+    for (size_t i = 0; i < kCallers; ++i) {
+      callers.emplace_back([&, i] {
+        std::unique_lock<std::mutex> lock(gate_mu);
+        ++ready;
+        ready_cv.notify_one();
+        if (!start_cv.wait_until(lock, deadline, [&] { return start; })) {
+          ++completed;
+          completed_cv.notify_one();
+          return;
+        }
+        lock.unlock();
+        get_ok[i] =
+            client.Get("concurrent-" + std::to_string(i), outputs[i].data(),
+                       outputs[i].size())
+                ? 1
+                : 0;
+        lock.lock();
+        ++completed;
+        completed_cv.notify_one();
+      });
+    }
+    bool all_ready = false;
+    {
+      std::unique_lock<std::mutex> lock(gate_mu);
+      all_ready =
+          ready_cv.wait_until(lock, deadline, [&] { return ready == kCallers; });
+      start = true;
+    }
+    start_cv.notify_all();
+    EXPECT_TRUE(all_ready) << "callers did not reach the start barrier";
+    {
+      std::unique_lock<std::mutex> lock(gate_mu);
+      EXPECT_TRUE(completed_cv.wait_until(
+          lock, deadline, [&] { return completed == kCallers; }))
+          << "concurrent RDMA calls deadlocked";
+    }
+    for (auto& caller : callers) caller.join();
+  }
+  EXPECT_EQ(get_ok, std::vector<char>(kCallers, 1));
+
+  const std::string after = transport.MetricsText();
+  long selection_delta = 0;
+  long error_delta = 0;
+  for (const auto& rail : rails) {
+    selection_delta +=
+        DeviceCounterVal(after, "dfkv_rdma_client_rail_selections_total",
+                         rail) -
+        DeviceCounterVal(before, "dfkv_rdma_client_rail_selections_total",
+                         rail);
+    error_delta +=
+        DeviceCounterVal(after, "dfkv_rdma_client_rail_errors_total", rail) -
+        DeviceCounterVal(before, "dfkv_rdma_client_rail_errors_total", rail);
+  }
+  EXPECT_EQ(selection_delta, static_cast<long>(kCallers + 1))
+      << "exactly one logical call must have two rail attempts";
+  EXPECT_EQ(error_delta, 1);
+  EXPECT_EQ(
+      CounterVal(after, "dfkv_rdma_client_cross_rail_retries_total") -
+          CounterVal(before, "dfkv_rdma_client_cross_rail_retries_total"),
+      1);
+  EXPECT_EQ(
+      CounterVal(after,
+                 "dfkv_rdma_client_cross_rail_retry_successes_total") -
+          CounterVal(before,
+                     "dfkv_rdma_client_cross_rail_retry_successes_total"),
+      1);
+  EXPECT_EQ(
+      CounterVal(after,
+                 "dfkv_rdma_client_cross_rail_retry_exhausted_total") -
+          CounterVal(before,
+                     "dfkv_rdma_client_cross_rail_retry_exhausted_total"),
+      0);
+  ExpectReleasedRailResources(before, after, rails);
+
+  for (size_t i = 0; i < kCallers; ++i)
+    EXPECT_EQ(outputs[i], values[i]) << i;
+  ExpectReleasedRailResources(after, transport.MetricsText(), rails);
+}
+
+TEST(RdmaLoopback, AllLocalRailsFailOnceAndReclaimOperationResources) {
+  if (!HaveRdma())
+    GTEST_SKIP() << "no RDMA device (load two rdma_rxe devices for this test)";
+  const auto rails = ConfiguredTwoTestRails();
+  if (!HaveConfiguredActiveRails(rails))
+    GTEST_SKIP() << "set DFKV_RDMA_DEV to exactly two ACTIVE test devices";
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
+  ScopedEnv credits("DFKV_RDMA_RAIL_CREDITS", kRealHcaRailCredits);
+  ScopedEnv threshold("DFKV_RDMA_RAIL_ERROR_THRESHOLD", "100");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv local_failure_fault(
+      "DFKV_RDMA_TEST_LOCAL_RAIL_FAILURE_ATTEMPTS", nullptr);
+  ScopedEnv ambient_completion_fault("DFKV_RDMA_TEST_COMPLETION_FAULT",
+                                     nullptr);
+  RdmaNode node("cross-rail-exhausted");
+  RdmaTransport transport(kMaxMsg, rails[0] + "," + rails[1]);
+  const std::string key_namespace = "test/cross-rail-exhausted";
+  KVClient client({{"n", node.addr}}, key_namespace, &transport);
+  const std::string value(64 * 1024, 'x');
+
+  std::string before = transport.MetricsText();
+  {
+    ScopedEnv fault("DFKV_RDMA_TEST_LOCAL_RAIL_FAILURE_ATTEMPTS", "1,2");
+    EXPECT_FALSE(client.Put("failed-put", value.data(), value.size()));
+  }
+  std::string after = transport.MetricsText();
+  ExpectTwoDistinctRailAttempts(before, after, rails, 2);
+  ExpectReleasedRailResources(before, after, rails);
+  EXPECT_EQ(
+      CounterVal(after, "dfkv_rdma_client_cross_rail_retries_total") -
+          CounterVal(before, "dfkv_rdma_client_cross_rail_retries_total"),
+      1);
+  EXPECT_EQ(
+      CounterVal(after,
+                 "dfkv_rdma_client_cross_rail_retry_successes_total") -
+          CounterVal(before,
+                     "dfkv_rdma_client_cross_rail_retry_successes_total"),
+      0);
+  EXPECT_EQ(
+      CounterVal(after,
+                 "dfkv_rdma_client_cross_rail_retry_exhausted_total") -
+          CounterVal(before,
+                     "dfkv_rdma_client_cross_rail_retry_exhausted_total"),
+      1);
+  std::vector<char> exists;
+  // Both PUT failures are injected before posting, so retry exhaustion cannot
+  // leave an ambiguous server-side commit.
+  EXPECT_EQ(transport.ExistMany(
+                node.addr, {ToBlockKey(key_namespace, "failed-put")}, &exists),
+            std::vector<Status>({Status::kNotFound}));
+  EXPECT_EQ(exists, std::vector<char>({0}));
+
+  // Seed a readable value with both fault seams disabled, then fail both local
+  // attempts of a fresh public GET. Neither failed attempt may mutate its
+  // caller destination.
+  KVClient writer({{"n", node.addr}}, key_namespace, &transport);
+  ASSERT_TRUE(writer.Put("failed-get", value.data(), value.size()));
+  KVClient reader({{"n", node.addr}}, key_namespace, &transport);
+  std::string output(value.size(), static_cast<char>(0x5a));
+  before = transport.MetricsText();
+  {
+    ScopedEnv fault("DFKV_RDMA_TEST_COMPLETION_FAULT",
+                    "1:1:1,1:2:1");
+    EXPECT_FALSE(reader.Get("failed-get", output.data(), output.size()));
+  }
+  after = transport.MetricsText();
+  ExpectTwoDistinctRailAttempts(before, after, rails, 2);
+  ExpectReleasedRailResources(before, after, rails);
+  EXPECT_EQ(output,
+            std::string(value.size(), static_cast<char>(0x5a)));
+  EXPECT_EQ(
+      CounterVal(after, "dfkv_rdma_client_cross_rail_retries_total") -
+          CounterVal(before, "dfkv_rdma_client_cross_rail_retries_total"),
+      1);
+  EXPECT_EQ(
+      CounterVal(after,
+                 "dfkv_rdma_client_cross_rail_retry_successes_total") -
+          CounterVal(before,
+                     "dfkv_rdma_client_cross_rail_retry_successes_total"),
+      0);
+  EXPECT_EQ(
+      CounterVal(after,
+                 "dfkv_rdma_client_cross_rail_retry_exhausted_total") -
+          CounterVal(before,
+                     "dfkv_rdma_client_cross_rail_retry_exhausted_total"),
+      1);
+  EXPECT_EQ(CounterVal(after,
+                       "dfkv_rdma_client_stale_pool_retries_total"),
+            CounterVal(before,
+                       "dfkv_rdma_client_stale_pool_retries_total"));
+
+  // Drive another synchronous control completion before checking the sentinel
+  // again; failed QP teardown must fence every old DMA before retry/return.
+  EXPECT_EQ(transport.ExistMany(
+                node.addr, {ToBlockKey(key_namespace, "failed-get")}, &exists),
+            std::vector<Status>({Status::kOk}));
+  EXPECT_EQ(output,
+            std::string(value.size(), static_cast<char>(0x5a)));
 }

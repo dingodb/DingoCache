@@ -6,6 +6,9 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <array>
+#include <cstdint>
+#include <cstring>
+#include <initializer_list>
 
 #include <string>
 #include <chrono>
@@ -21,21 +24,44 @@ using namespace dfkv;  // NOLINT
 namespace {
 class MetricsTransport final : public Transport {
  public:
+  enum class AttemptResult : uint8_t { kSuccess, kRailFailure };
+  struct ScriptedAttempt {
+    size_t rail;
+    AttemptResult result;
+    std::chrono::milliseconds delay{0};
+    size_t completed_items_before_failure = 0;
+  };
+
   bool pipeline = false;
-  std::mutex mu;
+  mutable std::mutex mu;
   std::map<std::string, std::string> values;
   std::vector<Status> exist_script;
+  std::vector<ScriptedAttempt> attempt_script;
+  std::vector<ScriptedAttempt> attempts;
+  std::vector<size_t> replay_item_counts;
   size_t exist_calls = 0;
   size_t range_calls = 0;
   size_t range_multi_calls = 0;
   size_t range_multi_misses = 0;
+  uint64_t cross_rail_retries = 0;
+  uint64_t cross_rail_retry_successes = 0;
+  uint64_t cross_rail_retry_exhausted = 0;
+
+  void Script(std::initializer_list<ScriptedAttempt> script) {
+    std::lock_guard<std::mutex> lock(mu);
+    attempt_script.assign(script);
+    attempts.clear();
+    replay_item_counts.clear();
+  }
 
   Status Cache(const std::string&, const BlockKey& key, const void* data,
                size_t len) override {
     std::lock_guard<std::mutex> lock(mu);
-    values[key.Filename()] =
-        std::string(static_cast<const char*>(data), len);
-    return Status::kOk;
+    const bool ok = RunAttemptsLocked(1, [&] {
+      values[key.Filename()] =
+          std::string(static_cast<const char*>(data), len);
+    });
+    return ok ? Status::kOk : Status::kIOError;
   }
   Status Range(const std::string&, const BlockKey& key, uint64_t offset,
                uint64_t length, std::string* out,
@@ -44,11 +70,13 @@ class MetricsTransport final : public Transport {
     ++range_calls;
     auto found = values.find(key.Filename());
     if (found == values.end()) return Status::kNotFound;
-    if (value_len) *value_len = found->second.size();
-    const size_t begin =
-        std::min<size_t>(static_cast<size_t>(offset), found->second.size());
-    *out = found->second.substr(begin, static_cast<size_t>(length));
-    return Status::kOk;
+    const bool ok = RunAttemptsLocked(1, [&] {
+      if (value_len) *value_len = found->second.size();
+      const size_t begin =
+          std::min<size_t>(static_cast<size_t>(offset), found->second.size());
+      *out = found->second.substr(begin, static_cast<size_t>(length));
+    });
+    return ok ? Status::kOk : Status::kIOError;
   }
   Status Lookup(const std::string&, const BlockKey& key,
                 uint64_t* value_len) override {
@@ -76,20 +104,145 @@ class MetricsTransport final : public Transport {
     return Status::kOk;
   }
   bool pipelined() const override { return pipeline; }
+
+  std::vector<Status> CacheFrom(
+      const std::string&, const std::vector<CacheSrc>& srcs) override {
+    std::lock_guard<std::mutex> lock(mu);
+    const bool ok = RunAttemptsLocked(srcs.size(), [&] {
+      for (const auto& src : srcs) {
+        values[src.key.Filename()] =
+            std::string(static_cast<const char*>(src.payload),
+                        src.payload_len);
+      }
+    });
+    return std::vector<Status>(
+        srcs.size(), ok ? Status::kOk : Status::kIOError);
+  }
+
+  std::vector<Status> RangeInto(
+      const std::string&, const std::vector<BlockKey>& keys,
+      const std::vector<RangeDst>& dsts,
+      std::vector<uint64_t>* value_lens) override {
+    std::lock_guard<std::mutex> lock(mu);
+    range_calls += keys.size();
+    if (value_lens) value_lens->assign(keys.size(), 0);
+    if (dsts.size() != keys.size()) return InvalidStatuses(keys.size());
+    std::vector<Status> result(keys.size(), Status::kNotFound);
+    const bool ok = RunAttemptsLocked(keys.size(), [&] {
+      for (size_t i = 0; i < keys.size(); ++i) {
+        auto found = values.find(keys[i].Filename());
+        if (found == values.end()) continue;
+        const size_t copied = std::min(dsts[i].n, found->second.size());
+        if (copied) std::memcpy(dsts[i].payload, found->second.data(), copied);
+        if (value_lens) (*value_lens)[i] = found->second.size();
+        result[i] = Status::kOk;
+      }
+    });
+    if (!ok) result.assign(keys.size(), Status::kIOError);
+    return result;
+  }
+
+  std::vector<Status> CacheFromMulti(
+      const std::string&, const std::vector<CacheSrcMulti>& srcs) override {
+    std::lock_guard<std::mutex> lock(mu);
+    const bool ok = RunAttemptsLocked(srcs.size(), [&] {
+      for (const auto& src : srcs) {
+        std::string value;
+        for (const auto& segment : src.payloads)
+          value.append(static_cast<const char*>(segment.first),
+                       segment.second);
+        values[src.key.Filename()] = std::move(value);
+      }
+    });
+    return std::vector<Status>(
+        srcs.size(), ok ? Status::kOk : Status::kIOError);
+  }
+
   std::vector<Status> RangeIntoMulti(
-      const std::string& node, const std::vector<BlockKey>& keys,
+      const std::string&, const std::vector<BlockKey>& keys,
       const std::vector<RangeDstMulti>& dsts,
       std::vector<size_t>* out_lens) override {
+    std::lock_guard<std::mutex> lock(mu);
     ++range_multi_calls;
-    std::vector<Status> result =
-        Transport::RangeIntoMulti(node, keys, dsts, out_lens);
-    for (size_t i = 0; i < result.size() && range_multi_misses > 0; ++i) {
-      if (result[i] != Status::kOk) continue;
-      result[i] = Status::kNotFound;
-      if (out_lens && i < out_lens->size()) (*out_lens)[i] = 0;
-      --range_multi_misses;
+    if (out_lens) out_lens->assign(keys.size(), 0);
+    if (dsts.size() != keys.size()) return InvalidStatuses(keys.size());
+    std::vector<Status> result(keys.size(), Status::kNotFound);
+    const bool ok = RunAttemptsLocked(keys.size(), [&] {
+      for (size_t i = 0; i < keys.size(); ++i) {
+        auto found = values.find(keys[i].Filename());
+        if (found == values.end()) continue;
+        size_t offset = 0;
+        for (const auto& segment : dsts[i].payloads) {
+          const size_t copy =
+              std::min(segment.second, found->second.size() - offset);
+          if (copy)
+            std::memcpy(segment.first, found->second.data() + offset, copy);
+          offset += copy;
+          if (offset == found->second.size()) break;
+        }
+        if (out_lens) (*out_lens)[i] = found->second.size();
+        result[i] = Status::kOk;
+      }
+    });
+    if (!ok) {
+      result.assign(keys.size(), Status::kIOError);
+    } else {
+      for (size_t i = 0; i < result.size() && range_multi_misses > 0; ++i) {
+        if (result[i] != Status::kOk) continue;
+        result[i] = Status::kNotFound;
+        if (out_lens) (*out_lens)[i] = 0;
+        --range_multi_misses;
+      }
     }
     return result;
+  }
+
+  std::string MetricsText() const override {
+    std::lock_guard<std::mutex> lock(mu);
+    return
+        "# TYPE dfkv_rdma_client_cross_rail_retries_total counter\n"
+        "dfkv_rdma_client_cross_rail_retries_total " +
+        std::to_string(cross_rail_retries) +
+        "\n# TYPE dfkv_rdma_client_cross_rail_retry_successes_total counter\n"
+        "dfkv_rdma_client_cross_rail_retry_successes_total " +
+        std::to_string(cross_rail_retry_successes) +
+        "\n# TYPE dfkv_rdma_client_cross_rail_retry_exhausted_total counter\n"
+        "dfkv_rdma_client_cross_rail_retry_exhausted_total " +
+        std::to_string(cross_rail_retry_exhausted) + "\n";
+  }
+
+ private:
+  template <typename Success>
+  bool RunAttemptsLocked(size_t item_count, Success&& success) {
+    const std::vector<ScriptedAttempt> script =
+        attempt_script.empty()
+            ? std::vector<ScriptedAttempt>{{0, AttemptResult::kSuccess}}
+            : attempt_script;
+    size_t remaining_items = item_count;
+    bool cross_rail_retry = false;
+    for (size_t i = 0; i < script.size() && i < 2; ++i) {
+      if (script[i].delay.count() != 0)
+        std::this_thread::sleep_for(script[i].delay);
+      attempts.push_back(script[i]);
+      replay_item_counts.push_back(remaining_items);
+      if (script[i].result == AttemptResult::kSuccess) {
+        success();
+        if (cross_rail_retry) ++cross_rail_retry_successes;
+        return true;
+      }
+      remaining_items -=
+          std::min(remaining_items,
+                   script[i].completed_items_before_failure);
+      if (i == 0 && script.size() > 1) {
+        cross_rail_retry = script[1].rail != script[0].rail;
+        if (cross_rail_retry) ++cross_rail_retries;
+        continue;
+      }
+      if (cross_rail_retry) ++cross_rail_retry_exhausted;
+      return false;
+    }
+    if (cross_rail_retry) ++cross_rail_retry_exhausted;
+    return false;
   }
 };
 
@@ -101,6 +254,29 @@ uint64_t Metric(const std::string& snapshot, const std::string& family,
   EXPECT_NE(start, std::string::npos) << snapshot;
   if (start == std::string::npos) return 0;
   return std::stoull(snapshot.substr(start + prefix.size()));
+}
+uint64_t TransportCounter(const std::string& snapshot,
+                          const std::string& family) {
+  const std::string prefix = family + " ";
+  size_t start = snapshot.find(prefix);
+  while (start != std::string::npos &&
+         start != 0 && snapshot[start - 1] != '\n') {
+    start = snapshot.find(prefix, start + 1);
+  }
+  EXPECT_NE(start, std::string::npos) << snapshot;
+  if (start == std::string::npos) return 0;
+  EXPECT_EQ(snapshot.find(family + "{"), std::string::npos)
+      << family << " must remain an unlabeled process counter";
+  return std::stoull(snapshot.substr(start + prefix.size()));
+}
+double MetricDouble(const std::string& snapshot, const std::string& family,
+                    const std::string& op) {
+  const std::string prefix =
+      family + "{op=\"" + op + "\"} ";
+  const size_t start = snapshot.find(prefix);
+  EXPECT_NE(start, std::string::npos) << snapshot;
+  if (start == std::string::npos) return 0;
+  return std::stod(snapshot.substr(start + prefix.size()));
 }
 
 struct DedupEnv {
@@ -221,6 +397,239 @@ TEST(ClientOpMetrics, TcpAndPipelinedBatchesCountCallsNotFanoutKeys) {
     }
   }
 }
+TEST(ClientOpMetrics, CrossRailRetryCountsOneScalarPublicCall) {
+  using Result = MetricsTransport::AttemptResult;
+  MetricsTransport transport;
+  transport.pipeline = true;
+  KVClient client({{"n", "test:1"}}, "metrics/cross-rail-scalar",
+                  &transport);
+  const std::string value = "rail-retry-payload";
+  const auto failed_attempt_delay = std::chrono::milliseconds(35);
+  const auto successful_attempt_delay = std::chrono::milliseconds(5);
+
+  transport.Script(
+      {{0, Result::kRailFailure, failed_attempt_delay},
+       {1, Result::kSuccess, successful_attempt_delay}});
+  ASSERT_TRUE(client.Put("key", value.data(), value.size()));
+  ASSERT_EQ(transport.attempts.size(), 2u);
+  EXPECT_EQ(transport.attempts[0].rail, 0u);
+  EXPECT_EQ(transport.attempts[1].rail, 1u);
+  EXPECT_EQ(transport.replay_item_counts, (std::vector<size_t>{1, 1}));
+
+  transport.Script(
+      {{0, Result::kRailFailure, failed_attempt_delay},
+       {1, Result::kSuccess, successful_attempt_delay}});
+  std::string output(value.size(), '\0');
+  ASSERT_TRUE(client.Get("key", output.data(), output.size()));
+  EXPECT_EQ(output, value);
+  ASSERT_EQ(transport.attempts.size(), 2u);
+  EXPECT_EQ(transport.attempts[0].rail, 0u);
+  EXPECT_EQ(transport.attempts[1].rail, 1u);
+  EXPECT_EQ(transport.replay_item_counts, (std::vector<size_t>{1, 1}));
+
+  const std::string snapshot = client.MetricsSnapshot();
+  for (const char* op : {"put", "get"}) {
+    EXPECT_EQ(Metric(snapshot, "dfkv_client_op_requests_total", op), 1u);
+    EXPECT_EQ(Metric(snapshot, "dfkv_client_op_keys_total", op), 1u);
+    EXPECT_EQ(Metric(snapshot, "dfkv_client_op_hits_total", op), 1u);
+    EXPECT_EQ(Metric(snapshot, "dfkv_client_op_bytes_total", op),
+              value.size());
+    EXPECT_EQ(Metric(snapshot, "dfkv_client_op_latency_seconds_count", op),
+              1u);
+    EXPECT_GE(MetricDouble(
+                  snapshot, "dfkv_client_op_latency_seconds_sum", op),
+              std::chrono::duration<double>(failed_attempt_delay +
+                                            successful_attempt_delay)
+                      .count() *
+                  0.9)
+        << "one public latency sample must enclose both transport attempts";
+    EXPECT_LT(MetricDouble(
+                  snapshot, "dfkv_client_op_latency_seconds_sum", op),
+              2.0)
+        << "scripted retry latency unexpectedly exceeded the deadlock guard";
+  }
+  EXPECT_EQ(TransportCounter(
+                snapshot, "dfkv_rdma_client_cross_rail_retries_total"),
+            2u);
+  EXPECT_EQ(TransportCounter(
+                snapshot,
+                "dfkv_rdma_client_cross_rail_retry_successes_total"),
+            2u);
+  EXPECT_EQ(TransportCounter(
+                snapshot,
+                "dfkv_rdma_client_cross_rail_retry_exhausted_total"),
+            0u);
+}
+
+TEST(ClientOpMetrics, SameRailFallbackDoesNotCountAsCrossRailRetry) {
+  using Result = MetricsTransport::AttemptResult;
+  MetricsTransport transport;
+  transport.pipeline = true;
+  KVClient client({{"n", "test:1"}}, "metrics/same-rail-fallback",
+                  &transport);
+  const std::string value = "same-rail-payload";
+
+  transport.Script(
+      {{0, Result::kRailFailure}, {0, Result::kSuccess}});
+  ASSERT_TRUE(client.Put("key", value.data(), value.size()));
+  ASSERT_EQ(transport.attempts.size(), 2u);
+  EXPECT_EQ(transport.attempts[0].rail, 0u);
+  EXPECT_EQ(transport.attempts[1].rail, 0u);
+
+  const std::string snapshot = client.MetricsSnapshot();
+  EXPECT_EQ(TransportCounter(
+                snapshot, "dfkv_rdma_client_cross_rail_retries_total"),
+            0u);
+  EXPECT_EQ(TransportCounter(
+                snapshot,
+                "dfkv_rdma_client_cross_rail_retry_successes_total"),
+            0u);
+  EXPECT_EQ(TransportCounter(
+                snapshot,
+                "dfkv_rdma_client_cross_rail_retry_exhausted_total"),
+            0u);
+}
+
+TEST(ClientOpMetrics, CrossRailRetryPreservesCompletedMultiWindowSgItems) {
+  using Result = MetricsTransport::AttemptResult;
+  constexpr size_t kItems = 9;  // 2 * depth(4) + 1
+  constexpr size_t kSegmentBytes = 4;
+  constexpr size_t kCompletedBeforeFailure = 4;
+  MetricsTransport transport;
+  transport.pipeline = true;
+  KVClient client({{"n", "test:1"}}, "metrics/cross-rail-sg", &transport);
+
+  std::vector<std::array<std::string, 3>> segments(kItems);
+  std::vector<std::string> expected(kItems);
+  std::vector<KvPutItemSg> puts;
+  puts.reserve(kItems);
+  for (size_t i = 0; i < kItems; ++i) {
+    for (size_t segment = 0; segment < 3; ++segment) {
+      segments[i][segment] =
+          std::string(kSegmentBytes,
+                      static_cast<char>('A' + i * 3 + segment));
+      expected[i] += segments[i][segment];
+    }
+    puts.push_back(
+        {"key-" + std::to_string(i),
+         {segments[i][0].data(), segments[i][1].data(),
+          segments[i][2].data()},
+         {kSegmentBytes, kSegmentBytes, kSegmentBytes}});
+  }
+
+  transport.Script(
+      {{0, Result::kRailFailure, {}, kCompletedBeforeFailure},
+       {1, Result::kSuccess}});
+  EXPECT_EQ(client.BatchPutSg(puts), std::vector<bool>(kItems, true));
+  EXPECT_EQ(transport.replay_item_counts,
+            (std::vector<size_t>{kItems,
+                                 kItems - kCompletedBeforeFailure}));
+
+  std::vector<std::array<std::array<char, kSegmentBytes>, 3>> output(kItems);
+  std::vector<KvGetItemSg> gets;
+  gets.reserve(kItems);
+  for (size_t i = 0; i < kItems; ++i) {
+    gets.push_back(
+        {puts[i].key,
+         {output[i][0].data(), output[i][1].data(), output[i][2].data()},
+         {kSegmentBytes, kSegmentBytes, kSegmentBytes}});
+  }
+  transport.Script(
+      {{0, Result::kRailFailure, {}, kCompletedBeforeFailure},
+       {1, Result::kSuccess}});
+  std::vector<size_t> lengths;
+  EXPECT_EQ(client.BatchGetAutoSg(gets, &lengths),
+            std::vector<bool>(kItems, true));
+  EXPECT_EQ(lengths, std::vector<size_t>(kItems, 3 * kSegmentBytes));
+  EXPECT_EQ(transport.replay_item_counts,
+            (std::vector<size_t>{kItems,
+                                 kItems - kCompletedBeforeFailure}));
+  for (size_t i = 0; i < kItems; ++i) {
+    std::string actual;
+    for (const auto& segment : output[i])
+      actual.append(segment.data(), segment.size());
+    EXPECT_EQ(actual, expected[i]) << i;
+  }
+
+  const std::string snapshot = client.MetricsSnapshot();
+  for (const char* op : {"put", "get"}) {
+    EXPECT_EQ(Metric(snapshot, "dfkv_client_op_requests_total", op), 1u);
+    EXPECT_EQ(Metric(snapshot, "dfkv_client_op_keys_total", op), kItems);
+    EXPECT_EQ(Metric(snapshot, "dfkv_client_op_hits_total", op), kItems);
+    EXPECT_EQ(Metric(snapshot, "dfkv_client_op_bytes_total", op),
+              kItems * 3 * kSegmentBytes);
+    EXPECT_EQ(Metric(snapshot, "dfkv_client_op_latency_seconds_count", op),
+              1u);
+  }
+  EXPECT_EQ(TransportCounter(
+                snapshot, "dfkv_rdma_client_cross_rail_retries_total"),
+            2u);
+  EXPECT_EQ(TransportCounter(
+                snapshot,
+                "dfkv_rdma_client_cross_rail_retry_successes_total"),
+            2u);
+  EXPECT_EQ(TransportCounter(
+                snapshot,
+                "dfkv_rdma_client_cross_rail_retry_exhausted_total"),
+            0u);
+}
+
+TEST(ClientOpMetrics, ExhaustedCrossRailRetryCountsOneFailure) {
+  using Result = MetricsTransport::AttemptResult;
+  constexpr size_t kItems = 9;
+  constexpr size_t kSegmentBytes = 4;
+  MetricsTransport transport;
+  transport.pipeline = true;
+  KVClient client({{"n", "test:1"}}, "metrics/cross-rail-exhausted",
+                  &transport);
+
+  std::vector<std::array<std::array<char, kSegmentBytes>, 3>> output(kItems);
+  for (auto& item : output)
+    for (auto& segment : item) segment.fill(static_cast<char>(0x5a));
+  std::vector<KvGetItemSg> gets;
+  gets.reserve(kItems);
+  for (size_t i = 0; i < kItems; ++i) {
+    gets.push_back(
+        {"key-" + std::to_string(i),
+         {output[i][0].data(), output[i][1].data(), output[i][2].data()},
+         {kSegmentBytes, kSegmentBytes, kSegmentBytes}});
+  }
+
+  transport.Script(
+      {{0, Result::kRailFailure}, {1, Result::kRailFailure}});
+  std::vector<size_t> lengths;
+  EXPECT_EQ(client.BatchGetAutoSg(gets, &lengths),
+            std::vector<bool>(kItems, false));
+  EXPECT_EQ(lengths, std::vector<size_t>(kItems, 0));
+  ASSERT_EQ(transport.attempts.size(), 2u);
+  EXPECT_EQ(transport.attempts[0].rail, 0u);
+  EXPECT_EQ(transport.attempts[1].rail, 1u);
+  EXPECT_EQ(transport.replay_item_counts,
+            (std::vector<size_t>{kItems, kItems}));
+  for (const auto& item : output)
+    for (const auto& segment : item)
+      for (char byte : segment) EXPECT_EQ(byte, static_cast<char>(0x5a));
+
+  const std::string snapshot = client.MetricsSnapshot();
+  EXPECT_EQ(Metric(snapshot, "dfkv_client_op_requests_total", "get"), 1u);
+  EXPECT_EQ(Metric(snapshot, "dfkv_client_op_keys_total", "get"), kItems);
+  EXPECT_EQ(Metric(snapshot, "dfkv_client_op_hits_total", "get"), 0u);
+  EXPECT_EQ(Metric(snapshot, "dfkv_client_op_bytes_total", "get"), 0u);
+  EXPECT_EQ(Metric(snapshot, "dfkv_client_op_latency_seconds_count", "get"),
+            1u);
+  EXPECT_EQ(TransportCounter(
+                snapshot, "dfkv_rdma_client_cross_rail_retries_total"),
+            1u);
+  EXPECT_EQ(TransportCounter(
+                snapshot,
+                "dfkv_rdma_client_cross_rail_retry_successes_total"),
+            0u);
+  EXPECT_EQ(TransportCounter(
+                snapshot,
+                "dfkv_rdma_client_cross_rail_retry_exhausted_total"),
+            1u);
+}
+
 
 TEST(ClientOpMetrics, RendezvousHitsAreCountedAndRemoveCannotServeStale) {
   const std::string key_namespace = "metrics/dedup";

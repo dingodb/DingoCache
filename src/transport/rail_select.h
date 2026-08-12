@@ -46,6 +46,9 @@ struct RailLease {
 
 enum class RailCompletion : uint8_t {
   kSuccess,
+  // Admission/resource control failure after a lease was selected. Return
+  // credits without changing either local-rail or endpoint health.
+  kAdmission,
   // The remote node/bootstrap/protocol failed. Return admission credits without
   // changing this host's HCA health or satisfying a pending recovery probe.
   kEndpointFailure,
@@ -83,31 +86,38 @@ class RailPolicy {
     for (auto& rail : rails_) rail.credits = config_.credits_per_rail;
   }
 
-  // Empty allowed means every rail. requested is clamped to the per-rail
-  // credit limit; callers must clamp their actual posting window to lease.credits.
+  // Empty allowed means every rail. A non-empty excluded mask removes matching
+  // rails after a failure in the current logical operation. requested is
+  // clamped to the per-rail credit limit; callers must clamp their actual
+  // posting window to lease.credits.
   std::optional<RailLease> TryAcquire(
       uint32_t requested, uint64_t now_us,
-      const std::vector<uint8_t>& allowed = {}) {
+      const std::vector<uint8_t>& allowed = {},
+      const std::vector<uint8_t>& excluded = {}) {
     std::lock_guard<std::mutex> lock(mu_);
-    return TryAcquireLocked(requested, now_us, allowed);
+    return TryAcquireLocked(requested, now_us, allowed, excluded);
   }
 
   // Bounded backpressure: wait for a completion or cooldown expiry, but never
   // beyond timeout_us. A zero timeout is a single non-blocking attempt.
   std::optional<RailLease> Acquire(
       uint32_t requested, uint64_t timeout_us,
-      const std::vector<uint8_t>& allowed = {}) {
+      const std::vector<uint8_t>& allowed = {},
+      const std::vector<uint8_t>& excluded = {}) {
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::microseconds(timeout_us);
     std::unique_lock<std::mutex> lock(mu_);
     for (;;) {
       const uint64_t now_us = NowMicros();
-      if (auto lease = TryAcquireLocked(requested, now_us, allowed))
+      if (auto lease =
+              TryAcquireLocked(requested, now_us, allowed, excluded))
         return lease;
       if (timeout_us == 0 || std::chrono::steady_clock::now() >= deadline)
         return std::nullopt;
       auto wake = deadline;
-      for (const auto& rail : rails_) {
+      for (size_t i = 0; i < rails_.size(); ++i) {
+        const auto& rail = rails_[i];
+        if (!Allowed(i, allowed) || Excluded(i, excluded)) continue;
         if (rail.quarantined_until_us > now_us) {
           const auto cooldown =
               std::chrono::steady_clock::now() +
@@ -140,6 +150,11 @@ class RailPolicy {
         ++rail.recoveries;
         rail.quarantined_until_us = 0;
       }
+      rail.recovery_probe = false;
+    } else if (completion == RailCompletion::kAdmission) {
+      // Admission failure is not endpoint evidence. If this lease was the
+      // single recovery probe, leave the expired quarantine marker intact and
+      // allow a later admission to perform the real probe.
       rail.recovery_probe = false;
     } else if (completion == RailCompletion::kEndpointFailure) {
       ++rail.endpoint_errors;
@@ -212,9 +227,14 @@ class RailPolicy {
            (rail < allowed.size() && allowed[rail] != 0);
   }
 
+  bool Excluded(size_t rail, const std::vector<uint8_t>& excluded) const {
+    return rail < excluded.size() && excluded[rail] != 0;
+  }
+
   std::optional<RailLease> TryAcquireLocked(
       uint32_t requested, uint64_t now_us,
-      const std::vector<uint8_t>& allowed) {
+      const std::vector<uint8_t>& allowed,
+      const std::vector<uint8_t>& excluded) {
     bool selected_recovery = false;
     if (rails_.empty()) return std::nullopt;
     requested =
@@ -223,7 +243,7 @@ class RailPolicy {
     uint64_t selected_score = std::numeric_limits<uint64_t>::max();
     for (size_t i = 0; i < rails_.size(); ++i) {
       State& rail = rails_[i];
-      if (!Allowed(i, allowed)) continue;
+      if (!Allowed(i, allowed) || Excluded(i, excluded)) continue;
       if (rail.quarantined_until_us > now_us) continue;
       // Cooldown elapsed: this rail may serve as the single recovery probe.
       // The recovery_probe flag is set only when the lease is actually granted
@@ -267,23 +287,45 @@ class RailPolicy {
   std::vector<State> rails_;
 };
 
-// Bounded admission that prefers one candidate mask and degrades to a
-// fallback mask when no preferred rail can serve immediately — every
-// preferred rail quarantined or credit-bound — while fallback rails still
-// can. Locality stays strictly preferred whenever it is admissible; the
-// fallback is only a backstop. At most one lease is ever granted per call;
-// when neither mask can serve right away, the caller waits on the preferred
-// rails exactly as RailPolicy::Acquire with `preferred` alone would.
+// True when the preferred/fallback topology masks contain an enabled rail that
+// is not excluded by the current logical operation. This intentionally ignores
+// credits, quarantine, cooldown, and current health.
+inline bool HasUnexcludedRail(const std::vector<uint8_t>& preferred,
+                              const std::vector<uint8_t>& fallback,
+                              const std::vector<uint8_t>& excluded) {
+  const size_t rails =
+      std::max({preferred.size(), fallback.size(), excluded.size()});
+  for (size_t i = 0; i < rails; ++i) {
+    const bool enabled =
+        (i < preferred.size() && preferred[i] != 0) ||
+        (i < fallback.size() && fallback[i] != 0);
+    if (enabled && !(i < excluded.size() && excluded[i] != 0)) return true;
+  }
+  return false;
+}
+
+// Bounded admission that prefers one candidate mask and degrades to a fallback
+// mask when no preferred rail can serve immediately. Exclusion is applied to
+// both masks. When every preferred topology rail is excluded, bounded waiting
+// moves to the fallback mask instead of waiting on an impossible candidate set.
 inline std::optional<RailLease> AcquireWithFallback(
     RailPolicy& policy, uint32_t requested, uint64_t timeout_us,
     const std::vector<uint8_t>& preferred,
-    const std::vector<uint8_t>& fallback) {
+    const std::vector<uint8_t>& fallback,
+    const std::vector<uint8_t>& excluded = {}) {
   const uint64_t now = RailPolicy::NowMicros();
-  if (auto lease = policy.TryAcquire(requested, now, preferred)) return lease;
+  if (auto lease = policy.TryAcquire(requested, now, preferred, excluded))
+    return lease;
   if (!fallback.empty()) {
-    if (auto lease = policy.TryAcquire(requested, now, fallback)) return lease;
+    if (auto lease = policy.TryAcquire(requested, now, fallback, excluded))
+      return lease;
   }
-  return policy.Acquire(requested, timeout_us, preferred);
+  const bool preferred_available =
+      HasUnexcludedRail(preferred, {}, excluded);
+  return policy.Acquire(requested, timeout_us,
+                        preferred_available || fallback.empty() ? preferred
+                                                               : fallback,
+                        excluded);
 }
 
 }  // namespace rdma

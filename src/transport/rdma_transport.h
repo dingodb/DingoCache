@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <limits>
 #include <mutex>
 #include <thread>
@@ -119,16 +120,41 @@ class RdmaTransport : public Transport {
 
  private:
   struct Conn;
-  // force_new skips the idle pool after a stale connection. Lanes separate
-  // payload, device-direct SG, and key-sized control traffic; each lane keeps
-  // the negotiated depth while owning an independent endpoint pool.
+  using RailMask = std::vector<uint8_t>;
+  enum class AcquireFailure : uint8_t {
+    kNone,
+    kAdmission,
+    kLocalRail,
+    kEndpoint,
+  };
+  struct AcquireOptions {
+    bool force_new = false;
+    size_t requested_credits = 1;
+    RailMask excluded;
+  };
+  struct AcquireResult {
+    Conn* conn = nullptr;
+    bool from_pool = false;
+    std::optional<size_t> attempted_rail;
+    AcquireFailure failure = AcquireFailure::kAdmission;
+  };
+  // Lanes separate payload, device-direct SG, and key-sized control traffic;
+  // each lane keeps the negotiated depth while owning an independent endpoint
+  // pool. Acquisition performs exactly one rail admission and one endpoint
+  // lookup/construction; the logical operation owns all retry decisions.
   enum class Lane { kData, kSgData, kControl };
-  Conn* Acquire(const std::string& node, Lane lane, bool* from_pool,
-                bool force_new = false, size_t requested_credits = 1);
+  AcquireResult Acquire(const std::string& node, Lane lane,
+                        const AcquireOptions& options);
+  // Schedules at most one fresh retry. cross_rail_retry is set only while the
+  // failed rail stays excluded and another topology-enabled rail exists.
+  bool PrepareRetry(int attempt, bool from_pool,
+                    std::optional<size_t> attempted_rail,
+                    AcquireFailure failure, RailMask* excluded,
+                    bool* cross_rail_retry);
   void Release(const std::string& node, Lane lane, Conn* c);
   void Destroy(Conn* c,
                rdma::RailCompletion completion =
-                   rdma::RailCompletion::kRailFailure);
+                   rdma::RailCompletion::kAdmission);
   bool EvictOneIdle();
   // Keep every idle QP alive while its client process is healthy. This lets a
   // short server-side idle reaper reclaim dead clients without forcing the
@@ -222,6 +248,12 @@ class RdmaTransport : public Transport {
   mutable std::atomic<uint64_t> v2_probe_attempts_{0};
   mutable std::atomic<uint64_t> v2_probe_failures_{0};
   std::atomic<uint64_t> stale_pool_retries_{0};
+  std::atomic<uint64_t> cross_rail_retries_{0};
+  std::atomic<uint64_t> cross_rail_retry_successes_{0};
+  std::atomic<uint64_t> cross_rail_retry_exhausted_{0};
+  // Deterministic test-only completion-fault targeting. Inert unless
+  // DFKV_RDMA_TEST_COMPLETION_FAULT is set.
+  std::atomic<uint64_t> test_completion_fault_calls_{0};
   std::atomic<uint64_t> completion_timeouts_{0};
   std::atomic<uint64_t> keepalive_attempts_{0};
   std::atomic<uint64_t> keepalive_successes_{0};
