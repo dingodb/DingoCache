@@ -223,11 +223,17 @@ docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire p
 - **Observability** ([docs/METRICS.md](docs/METRICS.md)): opt-in embedded Prometheus
   `/metrics` on `dfkv_server` and `dfkv_mds` (`--metrics-port`); sampled op-latency
   histogram, eviction/error/per-disk/RDMA counters server-side; client-side counters
-  (peer health, IO errors) via `dfkv_stats_snapshot` + a plugin poller. The
-  `dfkv_server_ring_eligible` and `dfkv_server_ib_device_healthy` families are
-  emitted only by an RDMA-enabled binary that is running an RDMA listener.
-  Their absence from a TCP-only binary or an RDMA build without a listener is
-  expected and must not be coerced to zero by dashboards or alerts. **Opt-in and
+  (peer health, IO errors, per-rail quarantine/recovery,
+  `dfkv_rdma_client_cross_rail_retries_total`,
+  `dfkv_rdma_client_cross_rail_retry_successes_total`, and
+  `dfkv_rdma_client_cross_rail_retry_exhausted_total`) via
+  `dfkv_stats_snapshot` + a plugin poller. Client RDMA families exist only
+  when the RDMA transport is in use and that snapshot is exported; absence from
+  a TCP-only process is expected. Server `dfkv_server_ring_eligible` and
+  `dfkv_server_ib_device_healthy` families are emitted only by an RDMA-enabled
+  binary running an RDMA listener. Their absence from a TCP-only binary or an
+  RDMA build without a listener must not be coerced to zero by dashboards or
+  alerts. **Opt-in and
   off the datapath** — no `--metrics-port` ⇒ no metrics listener, behavior unchanged.
   The three connectors (vLLM / LMCache / SGLang HiCache) can also **push** fleet
   metrics (ops/keys/bytes, op latency, per-peer latency) over OTLP to a central
@@ -276,6 +282,25 @@ docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire p
   rail NUMA node; the single shared receive segment is registered on each
   selected rail but is not separately NUMA-allocated per rail. Off by default;
   vendor-neutral (sysfs + `sched_getcpu`, no libnuma/CUDA).
+- **Client-local rail recovery**: local device/verbs evidence (`Open`, local QP
+  transition, MR registration/refresh, post/CQ API failure, or a locally
+  classified WC) is `kRailFailure`; peer/bootstrap/protocol failure, remote/RNR/
+  retry/flush WC, silent completion timeout, resource admission, cancellation,
+  and invalid input are not. A first-attempt `kRailFailure` retires the failed
+  endpoint and synchronously tears down its QP/MRs before one fresh retry. The
+  retry excludes that rail from both NUMA-preferred and fallback selection, so
+  it uses a distinct topology-enabled local rail whenever one exists. There are
+  at most two physical attempts. A one-rail topology may instead make the one
+  fresh retry on that same rail, but it never reuses the failed QP or bypasses
+  quarantine, cooldown, credits, or the single recovery-probe gate.
+- **Bounded at-least-once replay**: a rail retry replays the existing whole
+  logical PUT/GET/batch/SG operation after teardown; it does not promise
+  exactly-once PUT execution when a remote commit preceded a lost completion.
+  This is client-only recovery and is separate from server node/ring health
+  (`DFKV_RDMA_HEALTH_FILE` and `dfkv_server_ring_eligible`). It changes neither
+  the RDMA wire protocol nor server behavior, so upgraded clients remain
+  compatible with mixed-version servers that already speak the same RDMA v2
+  protocol.
 - **SGLang HiCache pool-aware v2 interface** (`batch_set_v2`/`batch_get_v2` +
   PoolTransfer) for multi-pool models (Mamba/SWA/DeepSeek-V4).
 - **Packaging**: CPack (deb/rpm/tgz) + Dockerfile; **graceful shutdown**; leveled logging.
@@ -309,6 +334,9 @@ fabric selection and capacity explicit.
 |---|---|---|
 | `DFKV_RDMA_DEV` | leave unset for one local HCA; use the same fabric whitelist on both hosts for multi-rail | Unset lets each endpoint select its own first `ACTIVE` local HCA, so local names may differ. A comma list explicitly enables multi-rail and is sent to the peer; every listed name must exist and be on the intended interoperable fabric at both ends. |
 | `DFKV_RDMA_DEPTH` | `4` (default) | Keep client/server defaults aligned for connector batch correctness. Throughput scaling comes from multiple pooled connections, not raising one QP's depth; lowering depth reduces receive-segment consumption only after validating the real engine workload. |
+| `DFKV_RDMA_RAIL_ERROR_THRESHOLD` | `3` (default) | Consecutive client-local rail failures required to quarantine that rail; endpoint/peer failures do not contribute. |
+| `DFKV_RDMA_RAIL_COOLDOWN_MS` | `5000` (default) | Quarantine duration. No admission occurs during cooldown; afterward exactly one real operation is admitted as the recovery probe. Probe success clears the rail state, local failure starts another cooldown, and endpoint failure proves neither recovery nor a new local fault. |
+| local-rail attempts | fixed at `2` (not configurable) | One initial attempt plus at most one fresh retry after `kRailFailure`; a distinct enabled local rail is mandatory when present. A one-rail topology may retry fresh on the same rail without bypassing quarantine. |
 | `DFKV_RDMA_KEEPALIVE_MS` | `15000` (default); `0` = off | Sends lightweight membership probes over every idle pooled QP. Live clients keep their QPs and avoid first-GET reconnect tails; exited clients send no probes and remain reclaimable. Keep the interval strictly below the server reap interval. |
 | `DFKV_RDMA_POOL_MAX` | `16` (default) | Maximum idle QPs retained per server and per lane, across all rails. It is not a process-wide connection cap. Raise only when connection-open metrics grow on repeated steady-state rounds; each retained QP leases `depth × align4K(4096 + declared_max_block)` from the server receive segment. |
 | `DFKV_RDMA_ENDPOINT_CACHE_MAX` | `256` (default, process-wide) | Hard cap on live client RDMA endpoints across all `RdmaTransport` instances. Under pressure, the requesting transport applies a SIEVE second-chance scan to its idle data/SG/control endpoints, destroys one cold QP, then retries admission. A hot cache hit sets only one visited bit; no LRU mutation occurs on the datapath. |

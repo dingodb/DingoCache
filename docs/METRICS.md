@@ -347,14 +347,17 @@ C 客户端快照还含传输级指标（RDMA 构建）：
 | `dfkv_rdma_client_oversize_rejects_total` | counter | 分配、注册或发帖前因超过声明上限而拒绝的操作 |
 | `dfkv_rdma_client_v2_probe_attempts_total` / `dfkv_rdma_client_v2_probe_failures_total` | counter | 必选 v2 bootstrap probe 尝试 / 失败 |
 | `dfkv_rdma_client_stale_pool_retries_total` | counter | pooled QP 失败后改用 fresh connection 的重试 |
+| `dfkv_rdma_client_cross_rail_retries_total` | counter | 无 label 的 process counter；client-local `kRailFailure` 后启动的 logical-operation replay；一次调用最多加 1，不按 batch window 计数。存在另一条 topology-enabled rail 时 retry 必须换轨 |
+| `dfkv_rdma_client_cross_rail_retry_successes_total` | counter | 无 label 的 process counter；上述 retry 最终成功的 logical operation 数 |
+| `dfkv_rdma_client_cross_rail_retry_exhausted_total` | counter | 无 label 的 process counter；已启动上述 retry、但第二次物理尝试仍失败的 logical operation 数 |
 | `dfkv_rdma_client_completion_timeouts_total` | counter | 消耗完一次绝对 completion-window deadline 的窗口；部分完成不重置预算 |
 | `dfkv_rdma_client_keepalive_attempts_total` / `dfkv_rdma_client_keepalive_successes_total` / `dfkv_rdma_client_keepalive_failures_total` | counter | idle pooled QP 的保活尝试 / 成功 / 失败并退役连接；仅 `DFKV_RDMA_KEEPALIVE_MS>0` 时增长 |
 | `dfkv_rdma_client_rail_conns_total{dev}` / `dfkv_rdma_client_rail_selections_total{dev}` | counter | 每 rail 新连接 / 准入分布 |
 | `dfkv_rdma_client_rail_inflight{dev}` / `dfkv_rdma_client_rail_credits_available{dev}` | gauge | 当前已租 / 可用 request credits |
 | `dfkv_rdma_client_rail_credits_exhausted_total{dev}` | counter | 因 local candidate credit 不足跳过次数 |
-| `dfkv_rdma_client_rail_errors_total{dev}` / `dfkv_rdma_client_rail_consecutive_errors{dev}` | counter / gauge | **仅本地** verbs/device/post/CQ 失败累计 / 当前连续值 |
-| `dfkv_rdma_client_endpoint_errors_total{dev}` | counter | peer bootstrap/不可达/协议 frame 失败；credit 已归还，**不惩罚 rail** |
-| `dfkv_rdma_client_rail_quarantines_total{dev}` / `dfkv_rdma_client_rail_quarantined{dev}` / `dfkv_rdma_client_rail_recovery_probe{dev}` / `dfkv_rdma_client_rail_recoveries_total{dev}` | counter / gauge / gauge / counter | rail 隔离切换 / 隔离状态（直到真实成功）/ 单个在飞 recovery probe / 成功恢复 |
+| `dfkv_rdma_client_rail_errors_total{dev}` / `dfkv_rdma_client_rail_consecutive_errors{dev}` | counter / gauge | **仅本地** device open、QP transition、MR register/refresh、post/CQ verbs API 失败和 local WC 累计 / 当前连续值 |
+| `dfkv_rdma_client_endpoint_errors_total{dev}` | counter | peer bootstrap/不可达/probe/protocol/receive-segment/decode、remote/RNR/retry/timeout/flush WC；credit 已归还，**不惩罚或恢复 rail**。没有 local-error WC 的 completion deadline 也属 endpoint，不触发 cross-rail retry |
+| `dfkv_rdma_client_rail_quarantines_total{dev}` / `dfkv_rdma_client_rail_quarantined{dev}` / `dfkv_rdma_client_rail_recovery_probe{dev}` / `dfkv_rdma_client_rail_recoveries_total{dev}` | counter / gauge / gauge / counter | 连续 3 次 client-local failure 后隔离（默认 cooldown 5000 ms）/ 隔离状态 / cooldown 到期后唯一真实 probe / probe 成功恢复；probe local failure 重启 cooldown，endpoint failure 只释放 probe ownership |
 | `dfkv_rdma_client_numa_fallbacks_total{reason="caller_unknown\|no_local_rail"}` | counter | `DFKV_RDMA_NUMA=1` 无法建立 local mask 而回退全部 enabled rails |
 | `dfkv_rdma_cq_completions_total` / `dfkv_rdma_cq_errors_total` | counter | client CQ 完成 / 错误完成 |
 | `dfkv_rdma_client_pipeline_depth` | gauge | 握手解析后的有效 pipeline depth |
@@ -369,11 +372,40 @@ TCP 构建或 TCP fallback 的 C 快照 family（同样由插件镜像）：
 | `dfkv_transport_pool_backoff_endpoints` | gauge | 当前阻止连接增长的 endpoint 数 |
 | `dfkv_transport_pool_backoff_events_total` / `dfkv_transport_pool_backoff_suppressed_total` | counter | 进入 backoff / backoff 中被 fast-fail 的 acquire |
 
-所有 `{dev}` 序列数固定为进程启动时发现的 rail 数，NUMA `reason` 只有上述两个
-枚举；不会按任意 endpoint 扩张。endpoint cooldown/恢复由上表
-`dfkv_client_peer_marked_bad_total` / `dfkv_client_peer_recovered_total` 汇总，逐 peer error
-序列在 `PeerHealth` 内硬限 4096 条。因此 rail 故障、endpoint 故障和两种 quarantine
-可以分别告警，单个坏 node 不再表现为共享 HCA 故障。
+RDMA client transport family 只在 RDMA build/runtime 使用相应传输并由 client
+stats snapshot/connector poller 导出时可见；TCP-only 进程缺失这些 family 是预期
+行为，不能补 0 解释为 rail 故障。所有 `{dev}` 序列数固定为进程启动时发现的 rail
+数，NUMA `reason` 只有上述两个枚举，不会按任意 endpoint 扩张。endpoint
+cooldown/恢复由上表 `dfkv_client_peer_marked_bad_total` /
+`dfkv_client_peer_recovered_total` 汇总，逐 peer error 序列在 `PeerHealth` 内硬限
+4096 条。因此 rail 故障、endpoint 故障和两种 quarantine 可以分别告警，单个坏
+node 不再表现为共享 HCA 故障。
+
+**retry 语义与告警**：
+
+- 三个 `cross_rail` counter 只统计 `kRailFailure` 后的 replay；pooled endpoint
+  staleness 仍只计 `dfkv_rdma_client_stale_pool_retries_total`，peer/endpoint、
+  admission、cancel、invalid input 不计。每个公开调用物理尝试最多 2 次；第二次
+  使用 fresh endpoint，且在任何另一条 enabled local rail 存在时必须换轨。单轨
+  topology 才允许 fresh 同轨 retry，且不得绕过 quarantine/cooldown。
+- retry 前同步 retire 故障 endpoint 并 teardown QP/CQ/MR，然后从 item 0 重放
+  整个 logical PUT/GET/batch/SG operation。语义为 at-least-once；remote PUT
+  commit 后 completion 丢失时可能覆盖写两次，不保证 exactly-once。公开
+  `dfkv_client_op_{requests,keys}_total` 不随物理尝试翻倍，hit/bytes 只按最终
+  logical result 计，latency 包含两次尝试。
+- `rate(dfkv_rdma_client_cross_rail_retry_exhausted_total[5m]) > 0` 任何增长都
+  需要处置；它表示一次换轨（或单轨 fresh）机会仍未恢复 logical operation。
+  任一 `dfkv_rdma_client_rail_quarantined{dev} == 1` 持续超过两个默认 cooldown
+  （10 s；若修改 `DFKV_RDMA_RAIL_COOLDOWN_MS` 则使用其两倍）也应告警。
+- workload drain 后 `dfkv_rdma_client_rail_inflight{dev} != 0`，或
+  `dfkv_rdma_client_transient_user_mr_active` 未回到 drain 前基线，按资源泄漏
+  告警。`dfkv_rdma_client_rail_recovery_probe{dev}` 应在 probe 完成后归零。
+
+这是 **client-only** rail recovery，与 server 的
+`dfkv_server_ib_device_healthy` / `dfkv_server_ring_eligible` 整节点 placement
+健康门完全分离；`DFKV_RDMA_HEALTH_FILE` 只影响 server health monitor。该能力
+不改变 RDMA wire protocol 或 server 行为，升级 client 与仍支持同一 RDMA v2
+protocol 的混合版本 server 兼容。
 
 ### 3.4 连接器车队指标（三连接器 OTLP **push**，opt-in）
 §3.3 是进程本地 Prometheus **pull**。vLLM、LMCache、SGLang HiCache 还可把

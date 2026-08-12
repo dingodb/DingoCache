@@ -333,13 +333,36 @@ journalctl -u dfkv -n 10 --no-pager
 > 建连/RPC 及 MDS 对外可见延迟；MDS 不可达时采样/发布可更久，因此这不是
 > wall-clock 上界。门满足后同一进程自动 rejoin，**LinkUp 后无需 restart**。
 >
-> **失败域隔离**：TCP bootstrap、peer 不可达、epoch/QP frame/receive-segment
-> 不兼容属于 endpoint 失败：立即归还 rail credit，由 client `PeerHealth` 对该
-> node 做 bounded cooldown，不增加共享 HCA 的 consecutive failure，也不会让
-> node A 隔离 node B 的健康 rail。只有本地 device open、verbs/QP transition、
-> post 或 CQ 失败才按 `DFKV_RDMA_RAIL_ERROR_THRESHOLD` 隔离 rail
-> `DFKV_RDMA_RAIL_COOLDOWN_MS`；cooldown 到期仍以单 probe 成功恢复，endpoint
-> 失败既不误恢复也不重新惩罚 rail。
+> **client-local 失败域与有界重放**：本地 device open、QP transition、
+> MR register/refresh、post/CQ verbs API 失败，以及被分类为 local 的 WC
+> （`LOC_*`、`FATAL`、`GENERAL`）才是 `kRailFailure`。TCP bootstrap、peer
+> 不可达、probe/协商/protocol/receive-segment/decode 失败，remote/retry/RNR/
+> response-timeout/flush WC，以及没有 local-error WC 的 completion deadline
+> 是 endpoint 失败；resource/rail-credit admission、cancel 和 invalid input
+> 也不是 rail 健康证据。后两类不会增加 rail consecutive errors 或错误恢复
+> rail，endpoint 失败仍由 `PeerHealth` 处理。
+>
+> 首次 `kRailFailure` 后，client 必须先 retire endpoint，并同步完成 QP/CQ/MR
+> teardown，才会建立 fresh endpoint 做**至多一次**重试；物理尝试总数固定为
+> 2，不可配置。第二次选择从 NUMA preferred 和 fallback 两个集合同时排除故障
+> rail，只要 topology 中存在另一条 enabled rail 就必须换轨；不能因为另一轨
+> credit 耗尽、正在 quarantine 或 cooldown 就回到原轨。单轨部署没有另一条
+> topology-enabled rail 时可做一次 fresh 同轨重试，但绝不复用故障 QP，也不
+> 绕过 quarantine/cooldown/backpressure。
+>
+> 该重试会从头重放现有整个 logical PUT/GET/batch/SG operation，语义仍是
+> **at-least-once**：若 PUT 已在远端 commit 而本地 completion 丢失，同一覆盖
+> 写可能执行两次，不提供 exactly-once 或 concurrent-writer isolation。它与
+> pooled stale-QP 的既有 fresh-endpoint retry 分开计数。实现完全在 client，
+> 与 server 的 `DFKV_RDMA_HEALTH_FILE`、`dfkv_server_ring_eligible` 整节点
+> 退环/恢复机制无关；**不修改 RDMA wire protocol 或 server 行为**，因此升级
+> client 与仍支持同一 RDMA v2 protocol 的混合版本 server 兼容。
+>
+> **client-local quarantine 恢复**：默认连续 3 次 `kRailFailure` 后隔离该
+> rail 5000 ms。cooldown 前不准入；到期仅一个真实 operation 获得 recovery
+> probe，其他 caller 继续跳过。probe success 清除 consecutive errors/
+> quarantine 并记录 recovery；probe local failure 重启完整 cooldown；probe
+> endpoint failure 只释放 probe ownership，既不证明恢复也不增加 local fault。
 >
 > **v2 segment 预算**：`slot=align4K(4096 + max_raw_payload)`；
 > `segment >= Σ(live + client-pool-idle data/control QP × depth × slot)`。lease
@@ -439,22 +462,23 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `--max-msg`（或 `DFKV_RDMA_MAX_PAYLOAD_BYTES`） | `32 MiB` | 单笔 payload 硬上限（RDMA 与 TCP 数据路径同受此限） |
 | `--version, -V` / `--help` | — | 打印版本/帮助并退出 |
 
-#### b. RDMA 传输面（均在 dfkv_server 进程读取）
+#### b. RDMA 传输面（server/client 读取方见各项说明）
 
 | env | 默认 | 说明 |
 |---|---|---|
-| `DFKV_RDMA_RECV_SEGMENT_SIZE` | 动态 | v2 共享 receive segment 总大小；`slot=align4K(4096+max_raw_payload)`，容量按 expected live QP×depth×slot 预算 |
-| `DFKV_RDMA_CONNECT_MS` | — | IB QP 建连超时 |
-| `DFKV_RDMA_IO_MS` | — | 控制面帧读写超时 |
-| `DFKV_RDMA_BATCH_OP_TIMEOUT_MS` | 0=跟随 RDMA_OP | multi-item Cache/Range/Exist、SG 窗口总期限 |
-| `DFKV_RDMA_POOL_MAX` | `16` | client 侧每 server、每 lane、跨所有 rail 的 idle QP 保留上限，不是进程总连接上限；只在稳定负载仍反复建连时上调 |
-| `DFKV_RDMA_RAIL_CREDITS` | 默认 `64`, 硬上限 4096 | client 每 rail QP 信用数（inflight 上限），>server depth 会回退 |
-| `DFKV_RDMA_RAIL_BACKPRESSURE_MS` | `10` | Acquire 失败重试 backoff |
-| `DFKV_RDMA_RAIL_COOLDOWN_MS` | `5000` | rail quarantine 冷却期；期间只允许 1 个 recovery probe |
-| `DFKV_RDMA_RAIL_ERROR_THRESHOLD` | `3` | 连锁本地 verbs/CQ/post 错误才 quarantine rail |
-| `DFKV_RDMA_RAIL_LATENCY_WEIGHT` | — | rail selection 的延迟 EWMA 权重 |
-| `DFKV_RDMA_RAIL_ERROR_PENALTY_US` | — | rail selection 的错误分数惩罚微秒 |
-| `DFKV_RDMA_IDLE_MS` | — | idle QP 重回收周期 |
+| `DFKV_RDMA_RECV_SEGMENT_SIZE` | 动态 | server：v2 共享 receive segment 总大小；`slot=align4K(4096+max_raw_payload)`，容量按 expected live QP×depth×slot 预算 |
+| `DFKV_RDMA_CONNECT_MS` | — | client：IB QP 建连超时 |
+| `DFKV_RDMA_IO_MS` | — | client：控制面帧读写超时 |
+| `DFKV_RDMA_BATCH_OP_TIMEOUT_MS` | 0=跟随 RDMA_OP | client：multi-item Cache/Range/Exist、SG 窗口总期限 |
+| `DFKV_RDMA_POOL_MAX` | `16` | client：每 server、每 lane、跨所有 rail 的 idle QP 保留上限，不是进程总连接上限；只在稳定负载仍反复建连时上调 |
+| `DFKV_RDMA_RAIL_CREDITS` | 默认 `64`, 硬上限 4096 | client：每 rail QP 信用数（inflight 上限），>server depth 会回退 |
+| `DFKV_RDMA_RAIL_BACKPRESSURE_MS` | `10` | client：Acquire 失败重试 backoff |
+| `DFKV_RDMA_RAIL_COOLDOWN_MS` | `5000` | client-local rail quarantine 冷却期；冷却期间不准入，期满仅允许 1 个真实 operation 作为 recovery probe |
+| `DFKV_RDMA_RAIL_ERROR_THRESHOLD` | `3` | client：连续 `kRailFailure` 达到该值才 quarantine；peer/endpoint、admission、timeout（无 local-error WC）、cancel 和 invalid input 不计入 |
+| client-local rail attempts | 固定 `2`（不可配置） | client：初次尝试加至多一次 fresh retry；存在另一条 topology-enabled rail 时必须换轨，单轨才可 fresh 同轨且不得绕过 quarantine |
+| `DFKV_RDMA_RAIL_LATENCY_WEIGHT` | — | client：rail selection 的延迟 EWMA 权重 |
+| `DFKV_RDMA_RAIL_ERROR_PENALTY_US` | — | client：rail selection 的错误分数惩罚微秒 |
+| `DFKV_RDMA_IDLE_MS` | — | server：idle QP 重回收周期 |
 
 #### c. TCP 连接池（client 读，但 server 运维也受影响）
 
