@@ -41,6 +41,7 @@ inline void Emit(Level lvl, const char* tag, const std::string& msg) {
 
 }  // namespace logging
 
+#define DFKV_LOG_DEBUG(msg) ::dfkv::logging::Emit(::dfkv::logging::kDebug, "DEBUG", (msg))
 #define DFKV_LOG_INFO(msg) ::dfkv::logging::Emit(::dfkv::logging::kInfo, "INFO", (msg))
 #define DFKV_LOG_WARN(msg) ::dfkv::logging::Emit(::dfkv::logging::kWarn, "WARN", (msg))
 #define DFKV_LOG_ERROR(msg) ::dfkv::logging::Emit(::dfkv::logging::kError, "ERROR", (msg))

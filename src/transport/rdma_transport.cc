@@ -1254,7 +1254,9 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   conn->ep.set_remote_depth(remote.depth);
   NoteNegotiatedDepth(node, lane, remote.depth);
   if (remote.depth < conn_depth) {
-    DFKV_LOG_INFO("rdma: server depth " + std::to_string(remote.depth) +
+    // SG lane advertises depth 1 by design -> fires on every SG connection;
+    // demote to debug to keep default INFO logs clean (DFKV_LOG=debug to see).
+    DFKV_LOG_DEBUG("rdma: server depth " + std::to_string(remote.depth) +
                   " < client depth " + std::to_string(conn_depth) +
                   ": batching window clamped to " +
                   std::to_string(remote.depth) +
