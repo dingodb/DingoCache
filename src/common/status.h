@@ -12,7 +12,15 @@ enum class Status {
   kCacheFull,
   kQuotaExceeded,
   kIOError,
-  kInvalid
+  kInvalid,
+  // Client-local only, NEVER encoded on the wire: the response decoder
+  // (wire.h DecodeRespVersion) pins kInvalid as the highest legal wire byte.
+  // kResourceExhausted means THIS process ran out of transport budget
+  // (endpoints/QPs/WRs/registered bytes) before the peer was ever dialed.
+  // Peer health must treat it as neither a served response nor a peer IO
+  // failure: cooling down a peer for a local admission stall poisons every
+  // key routed to it (see .issue/0812-004).
+  kResourceExhausted
 };
 
 inline const char* StatusName(Status s) {
@@ -23,6 +31,7 @@ inline const char* StatusName(Status s) {
     case Status::kQuotaExceeded: return "QuotaExceeded";
     case Status::kIOError: return "IOError";
     case Status::kInvalid: return "Invalid";
+    case Status::kResourceExhausted: return "ResourceExhausted";
   }
   return "?";
 }

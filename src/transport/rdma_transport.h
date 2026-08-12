@@ -89,6 +89,14 @@ class RdmaTransport : public Transport {
   bool RegisterMemory(void* base, size_t size) override;
   std::string MetricsText() const override;  // dfkv_rdma_client_* (conns, per-rail)
 
+  // Adaptive resource budget: connection demand is nodes x (2 data lanes x
+  // rails + control), so the process budget must follow the adopted ring, not
+  // a constant. Raises (never shrinks) every derived budget dimension when
+  // the ring outgrows the current limit. Disabled when the operator pinned
+  // any budget env explicitly (DFKV_RDMA_ENDPOINT_CACHE_MAX / QP_BUDGET /
+  // WR_BUDGET / REGISTERED_BYTES_BUDGET): explicit config is a contract.
+  void OnTopologyHint(size_t nodes) override;
+
   bool pipelined() const override { return true; }
   size_t MaxSgPayloadSegs() const override { return sg_payload_segs_; }
   // Pipelined: up to `depth_` requests in flight on a single connection (default 4; env DFKV_RDMA_DEPTH).
@@ -231,6 +239,30 @@ class RdmaTransport : public Transport {
   std::thread keepalive_thread_;
   std::shared_ptr<rdma::ResourceBudget> resource_budget_;
   int resource_acquire_ms_ = 10000;
+  // Autoscale state: enabled unless any budget env was pinned explicitly.
+  // topology_nodes_ dedups repeated hints so steady-state adoptions are free.
+  bool budget_autoscale_enabled_ = true;
+  std::atomic<size_t> topology_nodes_{0};
+  // Learned per-node negotiated queue depth. The server clamps depth by its
+  // receive-segment policy (large data slots often clamp to 1); the client
+  // only discovers this after Open() already sized QP/WR/slot resources at
+  // depth_. First contact pays full depth_; every later connection to that
+  // node opens and budgets at the learned value, so churned reconnects stop
+  // reserving depth_ x slot bytes they can never use. Data and SG lanes share
+  // slot geometry (declared_); control negotiates its own. Values only learn
+  // downward within a process lifetime — a server that raises its depth is
+  // picked up by new client processes, not running ones (documented).
+  std::mutex depth_mu_;
+  std::unordered_map<std::string, uint16_t> learned_data_depth_;
+  std::unordered_map<std::string, uint16_t> learned_control_depth_;
+  uint16_t LearnedDepth(const std::string& node, Lane lane);
+  void NoteNegotiatedDepth(const std::string& node, Lane lane,
+                           uint16_t remote_depth);
+  // Admission (budget) starvation observability: ops that failed because THIS
+  // process ran out of transport budget. Logged with a coarse throttle.
+  std::atomic<uint64_t> admission_failures_{0};
+  // Connections whose clamped negotiation refunded WR/registered budget.
+  std::atomic<uint64_t> depth_refunds_{0};
   std::unique_ptr<rdma::RdmaTopology> topology_;
   std::vector<std::string> devs_;  // stable discovered ACTIVE rail order
   bool auto_device_ = true;

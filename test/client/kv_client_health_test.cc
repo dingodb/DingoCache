@@ -64,3 +64,37 @@ TEST(KvClientHealth, DeadPeerShortCircuitsPut) {
   std::lock_guard<std::mutex> lk(t.mu);
   EXPECT_EQ(t.cache_calls["10.0.0.9:2"], 1);
 }
+
+namespace {
+// Local budget starvation: the peer was never dialed, so unlike kIOError it
+// must not engage the cooldown (0812-004: cooling an innocent peer blanket-
+// fails every key routed to it and collapses cache hit rates).
+struct StarvedTransport : CountingTransport {
+  Status Range(const std::string& node, const BlockKey&, uint64_t, uint64_t,
+               std::string*, uint64_t*) override {
+    { std::lock_guard<std::mutex> lk(mu); range_calls[node]++; }
+    return Status::kResourceExhausted;
+  }
+  Status Cache(const std::string& node, const BlockKey&, const void*,
+               size_t) override {
+    { std::lock_guard<std::mutex> lk(mu); cache_calls[node]++; }
+    return Status::kResourceExhausted;
+  }
+};
+}  // namespace
+
+TEST(KvClientHealth, ResourceExhaustedDoesNotCoolThePeer) {
+  StarvedTransport t;
+  KVClient c({{"n", "10.0.0.9:3"}}, Hdr(), &t);
+  char out[64] = {0};
+  std::string v(64, 'x');
+  // Every op fails honestly, but the peer stays healthy: each retry reaches
+  // the transport instead of being short-circuited by a cooldown.
+  EXPECT_FALSE(c.Get("k1", out, 64));
+  EXPECT_FALSE(c.Get("k2", out, 64));
+  EXPECT_FALSE(c.Put("k1", v.data(), v.size()));
+  EXPECT_FALSE(c.Put("k2", v.data(), v.size()));
+  std::lock_guard<std::mutex> lk(t.mu);
+  EXPECT_EQ(t.range_calls["10.0.0.9:3"], 2);
+  EXPECT_EQ(t.cache_calls["10.0.0.9:3"], 2);
+}
