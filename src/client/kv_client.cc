@@ -166,6 +166,17 @@ KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
     t_ = owned_.get();
     DFKV_LOG_INFO("dfkv client transport=" + transport_reason_);
   }
+  // Static member lists adopt their ring above, before t_ exists, and never
+  // pass through the MDS poller again — replay the scale hint once so the
+  // transport budget is sized for them too.
+  {
+    size_t adopted = 0;
+    {
+      std::lock_guard<std::mutex> lk(ring_mu_);
+      adopted = addr_.size();
+    }
+    if (adopted > 0) t_->OnTopologyHint(adopted);
+  }
   // Same-host GET rendezvous. The namespace digest prevents independent
   // model/raw-layout domains from sharing process-local entries.
   dedup_ = NodeDedup::FromEnv(namespace_hash_);
@@ -232,6 +243,10 @@ void KVClient::AdoptRing(ConHash ring, std::map<std::string, std::string> addr) 
     DFKV_LOG_INFO("ring: " + std::to_string(count) + " member(s) (unchanged)");
   else
     DFKV_LOG_INFO("ring: " + std::to_string(count) + " member(s) " + delta);
+  // Budget demand follows the ring (nodes x rails), so every adoption feeds
+  // the transport's scale hint. t_ is null for the constructor's initial
+  // SetMembers — the ctor replays the hint once the transport exists.
+  if (count > 0 && t_ != nullptr) t_->OnTopologyHint(count);
   if (count > 0) ring_cv_.notify_all();
 }
 
@@ -334,7 +349,10 @@ void KVClient::ProbeLoop() {
       // A non-IO reply also means the peer is reachable: clear its data-path
       // cooldown here (off the data path) so recovery never depends on a data
       // request re-dialing a peer that is still inside its backed-off cooldown.
-      if (st != Status::kIOError) {
+      // kResourceExhausted never dialed the peer at all: its wall time is a
+      // local budget wait (up to RESOURCE_ACQUIRE_MS) that would poison the
+      // latency EWMA, and it proves nothing about peer reachability.
+      if (st != Status::kIOError && st != Status::kResourceExhausted) {
         peer_lat_.Observe(a, sec);
         health_.MarkProbeAlive(a);
       }

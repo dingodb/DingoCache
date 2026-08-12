@@ -89,3 +89,51 @@ TEST(DynamicMembers, SetMembersLogsAddRemoveDelta) {
   log = testing::internal::GetCapturedStderr();
   EXPECT_NE(log.find("EMPTY membership"), std::string::npos) << log;
 }
+
+// Ring adoptions must feed the transport's topology hint: connection budgets
+// scale with nodes x rails, so a growing ring has to reach OnTopologyHint
+// both at construction (static member lists never re-adopt) and on every
+// later SetMembers (0812-004: a fixed budget starved a 55-node ring).
+namespace {
+struct HintRecordingTransport : dfkv::Transport {
+  std::vector<size_t> hints;
+  void OnTopologyHint(size_t nodes) override { hints.push_back(nodes); }
+  Status Cache(const std::string&, const dfkv::BlockKey&, const void*,
+               size_t) override {
+    return Status::kOk;
+  }
+  Status Range(const std::string&, const dfkv::BlockKey&, uint64_t, uint64_t,
+               std::string*, uint64_t*) override {
+    return Status::kNotFound;
+  }
+  Status Lookup(const std::string&, const dfkv::BlockKey&,
+                uint64_t* value_len) override {
+    if (value_len) *value_len = 0;
+    return Status::kNotFound;
+  }
+  Status Exist(const std::string&, const dfkv::BlockKey&,
+               bool* exist) override {
+    if (exist) *exist = false;
+    return Status::kOk;
+  }
+};
+}  // namespace
+
+TEST(DynamicMembers, AdoptionsFeedTransportTopologyHint) {
+  using P = std::vector<std::pair<std::string, std::string>>;
+  HintRecordingTransport t;
+  KVClient c(P{{"n1", "127.0.0.1:1"}, {"n2", "127.0.0.1:2"}}, Hdr(), &t);
+  // The constructor replays the initial adoption once the transport exists.
+  ASSERT_EQ(t.hints.size(), 1u);
+  EXPECT_EQ(t.hints[0], 2u);
+
+  c.SetMembers(P{{"n1", "127.0.0.1:1"},
+                 {"n2", "127.0.0.1:2"},
+                 {"n3", "127.0.0.1:3"}});
+  ASSERT_EQ(t.hints.size(), 2u);
+  EXPECT_EQ(t.hints[1], 3u);
+
+  // An empty adoption routes nowhere and must not hint a zero-sized ring.
+  c.SetMembers(P{});
+  EXPECT_EQ(t.hints.size(), 2u);
+}

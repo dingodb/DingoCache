@@ -235,7 +235,9 @@ class KVClient {
   std::string key_namespace_;
   uint64_t namespace_hash_ = 0;
   std::unique_ptr<Transport> owned_;
-  Transport* t_;
+  // Null until the constructor selects a transport; AdoptRing runs earlier
+  // (initial SetMembers) and must observe null, not garbage.
+  Transport* t_ = nullptr;
   std::string transport_reason_ = "unknown";
   // Atomic: configurable via the C ABI; reads on the batch path are relaxed.
   std::atomic<size_t> batch_concurrency_{0};  // 0 = auto (see set_batch_concurrency)

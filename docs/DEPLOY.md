@@ -531,7 +531,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `DFKV_LOG` | `INFO` | log level |
 | `DFKV_FANOUT_THREADS` | `32` | TCP batch、RDMA write 和兼容路径共用的 process-wide helper 上限；RDMA read 不再使用该线程池 |
 | `DFKV_RDMA_READ_WORKERS` | `7` | process-wide RDMA GET/GET-Auto/SG-GET/Exist shard worker 硬上限；替换旧 executor 每 rank 的 7 个 helper，不增加线程。caller 不参与执行，因此并发 batch 不能继续推高活跃 read QP；batch 间按 shard round-robin |
-| `DFKV_RDMA_ENDPOINT_CACHE_MAX` | `256` | 所有 client handle 共享的 live RDMA endpoint 硬上限；只有 QP/MR 真正销毁后才归还额度 |
+| `DFKV_RDMA_ENDPOINT_CACHE_MAX` | 自适应（下限 `256`） | 所有 client handle 共享的 live RDMA endpoint 硬上限；只有 QP/MR 真正销毁后才归还额度。不设置时随 ring 自动放大：`节点数 x (2 x 轨数 + 1) x 1.25`，成员采纳时只增不减；显式设置任一预算 env 即固定全部预算并关闭自适应。预算饥饿返回 kResourceExhausted（不再把无辜节点打入冷却，见 .issue/0812-004） |
 | `DFKV_RDMA_QP_BUDGET` | endpoint 上限 | process-wide QP 预算；当前一个 endpoint 对应一个 QP |
 | `DFKV_RDMA_WR_BUDGET` | endpoint 上限 × depth | process-wide negotiated WR slot 预算；SG lane 每 endpoint 只占 1 |
 | `DFKV_RDMA_REGISTERED_BYTES_BUDGET` | endpoint 上限 × depth × receive slot | live endpoint 对端 receive-segment lease 字节预算 |

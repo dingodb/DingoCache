@@ -79,6 +79,9 @@ inline uint8_t LegacyStatusByte(Status st) {
     case Status::kQuotaExceeded: return 3;  // v2-only; folds into legacy kIOError
     case Status::kIOError: return 3;
     case Status::kInvalid: return 4;
+    // Client-local admission starvation; unreachable on any server encode
+    // path, folded like kIOError for switch exhaustiveness.
+    case Status::kResourceExhausted: return 3;
   }
   return 4;
 }

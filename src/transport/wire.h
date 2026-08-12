@@ -130,6 +130,9 @@ inline bool DecodeRespVersion(const char* p, uint8_t expected_version,
                               uint64_t* value_len = nullptr) {
   if (static_cast<uint8_t>(p[0]) != expected_version) return false;
   const uint8_t raw_status = static_cast<uint8_t>(p[1]);
+  // kInvalid stays the highest legal WIRE status: values above it (e.g.
+  // kResourceExhausted) are client-local admission outcomes that no peer may
+  // ever encode; keep rejecting them here.
   if (raw_status > static_cast<uint8_t>(Status::kInvalid)) return false;
   const uint64_t decoded_data_len = net::GetU64(p + 2);
   if (decoded_data_len > max_data) return false;

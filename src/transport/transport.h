@@ -127,6 +127,14 @@ class Transport {
     return true;
   }
 
+  // Ring-scale hint from the client's adopted MDS membership. Connection-
+  // oriented transports size process-wide resource budgets from it (demand
+  // grows with nodes x rails, not with any constant), so a fixed default can
+  // never starve a large ring into admission timeouts (.issue/0812-004).
+  // Called on every membership adoption; implementations must tolerate
+  // repeated and concurrent calls. Default: stateless transports ignore it.
+  virtual void OnTopologyHint(size_t nodes) { (void)nodes; }
+
   // True if CacheMany/RangeMany pipeline requests on one connection (RDMA). When
   // false (TCP), the client parallelizes batches across items with its own
   // threads instead, since the per-node loop here would be sequential.

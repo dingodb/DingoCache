@@ -325,6 +325,15 @@ std::shared_ptr<rdma::ResourceBudget> ProcessResourceBudget(
   return budget;
 }
 
+// Admission (budget) starvation never dialed the peer, so it must not be
+// reported as the peer's kIOError: PeerHealth would cool the node down and
+// blanket-fail every key routed to it (the 0812-004 amplification). Flip only
+// the slots still carrying the kIOError default; kInvalid verdicts stand.
+void MarkAdmissionFailure(std::vector<Status>* result) {
+  for (auto& s : *result)
+    if (s == Status::kIOError) s = Status::kResourceExhausted;
+}
+
 }  // namespace
 
 struct RdmaTransport::Conn {
@@ -443,6 +452,16 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
       EnvBoundedInt("DFKV_RDMA_RESOURCE_ACQUIRE_MS", 10000, 600000);
   resource_budget_ = ProcessResourceBudget(
       {endpoint_limit, qp_limit, wr_limit, registered_limit});
+  // Any explicitly pinned budget dimension turns the whole autoscale off:
+  // partial-manual sizing recreated exactly the "QP raised but WR/registered
+  // still starve" trap of 0812-002 §6.1, so explicit config wins wholesale.
+  budget_autoscale_enabled_ =
+      !std::getenv("DFKV_RDMA_ENDPOINT_CACHE_MAX") &&
+      !std::getenv("DFKV_RDMA_QP_BUDGET") &&
+      !std::getenv("DFKV_RDMA_WR_BUDGET") &&
+      !std::getenv("DFKV_RDMA_REGISTERED_BYTES_BUDGET");
+  config_dump::RecordResolved("budget_autoscale",
+                              budget_autoscale_enabled_ ? "on" : "off (explicit budget env)");
   const rdma::ResourceRequest effective_budget = resource_budget_->limit();
   config_dump::RecordResolved("DFKV_RDMA_ENDPOINT_CACHE_MAX",
                               std::to_string(effective_budget.endpoints));
@@ -690,6 +709,53 @@ bool RdmaTransport::EvictOneIdle() {
   return true;
 }
 
+void RdmaTransport::OnTopologyHint(size_t nodes) {
+  if (!budget_autoscale_enabled_ || nodes == 0) return;
+  // Same-size adoptions are the steady state (MDS re-polls); dedup them so
+  // the hint costs one relaxed load. Shrinking rings keep the high-water
+  // budget: limits are ceilings, an oversized ceiling costs nothing.
+  size_t previous = topology_nodes_.load(std::memory_order_relaxed);
+  while (nodes > previous) {
+    if (!topology_nodes_.compare_exchange_weak(previous, nodes,
+                                               std::memory_order_relaxed))
+      continue;
+    const uint64_t slot_bytes = static_cast<uint64_t>(
+        rdma::V2SlotSize(static_cast<size_t>(declared_)));
+    const rdma::ResourceRequest target = rdma::AdaptiveBudgetTarget(
+        nodes, devs_.size(), depth_, slot_bytes, /*floor_endpoints=*/256);
+    if (resource_budget_->RaiseLimit(target)) {
+      const rdma::ResourceRequest limit = resource_budget_->limit();
+      DFKV_LOG_INFO(
+          "rdma: resource budget autoscaled for ring=" +
+          std::to_string(nodes) + " rails=" + std::to_string(devs_.size()) +
+          ": endpoints=" + std::to_string(limit.endpoints) +
+          " qps=" + std::to_string(limit.qps) +
+          " wr=" + std::to_string(limit.wr_slots) +
+          " registered_bytes=" + std::to_string(limit.registered_bytes));
+    }
+    return;
+  }
+}
+
+uint16_t RdmaTransport::LearnedDepth(const std::string& node, Lane lane) {
+  const uint16_t full = static_cast<uint16_t>(std::min<size_t>(depth_, 256));
+  std::lock_guard<std::mutex> lk(depth_mu_);
+  const auto& map =
+      lane == Lane::kControl ? learned_control_depth_ : learned_data_depth_;
+  const auto it = map.find(node);
+  return it == map.end() ? full : std::min(full, it->second);
+}
+
+void RdmaTransport::NoteNegotiatedDepth(const std::string& node, Lane lane,
+                                        uint16_t remote_depth) {
+  if (remote_depth == 0) return;
+  std::lock_guard<std::mutex> lk(depth_mu_);
+  auto& map =
+      lane == Lane::kControl ? learned_control_depth_ : learned_data_depth_;
+  const auto it = map.find(node);
+  if (it == map.end() || remote_depth < it->second) map[node] = remote_depth;
+}
+
 bool RdmaTransport::ProbeV2(const std::string& node) const {
   v2_probe_attempts_.fetch_add(1, std::memory_order_relaxed);
   int fd = net::Dial(node, connect_ms_, io_ms_);
@@ -784,7 +850,10 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   }
 
   endpoint_cache_misses_.fetch_add(1, std::memory_order_relaxed);
-  const size_t conn_depth = depth_;
+  // Open, announce, and budget at the depth this node actually granted last
+  // time: churned reconnects stop reserving WR/slot capacity the server's
+  // clamp will never let them use (first contact still probes at depth_).
+  const size_t conn_depth = LearnedDepth(node, lane);
   const uint64_t conn_declared =
       lane == Lane::kControl
           ? static_cast<uint64_t>(rdma::kV2ControlCap)
@@ -801,6 +870,25 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     budget_acquired = resource_budget_->Acquire(
         budget_request, std::chrono::milliseconds(resource_acquire_ms_));
   if (!budget_acquired) {
+    // Budget starvation is a LOCAL condition: the peer was never dialed. The
+    // silent variant of this path cost days of diagnosis (0812-002/004), so
+    // say what starved and how big the pool is, throttled to one line per 64
+    // occurrences (bursts arrive at batch rate).
+    const uint64_t seen =
+        admission_failures_.fetch_add(1, std::memory_order_relaxed);
+    if ((seen & 63u) == 0) {
+      const rdma::ResourceRequest used = resource_budget_->used();
+      const rdma::ResourceRequest limit = resource_budget_->limit();
+      DFKV_LOG_WARN(
+          "rdma: transport budget exhausted acquiring an endpoint for " +
+          node + " after " + std::to_string(resource_acquire_ms_) +
+          "ms (endpoints " + std::to_string(used.endpoints) + "/" +
+          std::to_string(limit.endpoints) + ", wr " +
+          std::to_string(used.wr_slots) + "/" +
+          std::to_string(limit.wr_slots) +
+          "); op fails kResourceExhausted, peer is NOT cooled down; raise "
+          "DFKV_RDMA_ENDPOINT_CACHE_MAX or let ring autoscale size it");
+    }
     complete_unowned_lease(rdma::RailCompletion::kAdmission);
     result.failure = AcquireFailure::kAdmission;
     return result;
@@ -877,11 +965,27 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     return result;
   }
   conn->ep.set_remote_depth(remote.depth);
-  if (remote.depth < depth_)
+  NoteNegotiatedDepth(node, lane, remote.depth);
+  if (remote.depth < conn_depth) {
     DFKV_LOG_INFO("rdma: server depth " + std::to_string(remote.depth) +
-                  " < client depth " + std::to_string(depth_) +
+                  " < client depth " + std::to_string(conn_depth) +
                   ": batching window clamped to " +
-                  std::to_string(remote.depth));
+                  std::to_string(remote.depth) +
+                  " (later connections open at the learned depth)");
+    // Refund the budget the clamp made unusable. The server leases its recv
+    // segment at the NEGOTIATED depth, so WR/registered accounting above the
+    // clamp models capacity that exists nowhere. Shrink the connection's own
+    // record first, then release the surplus: every later failure path
+    // releases via Destroy(conn->budget_request), and this order keeps
+    // acquired == refund + destroy-release exact (Subtract is unchecked).
+    const size_t surplus = conn_depth - remote.depth;
+    conn->budget_request = rdma::ResourceRequest{
+        1, 1, static_cast<size_t>(remote.depth),
+        conn_slot_bytes * remote.depth};
+    resource_budget_->Release(
+        rdma::ResourceRequest{0, 0, surplus, conn_slot_bytes * surplus});
+    depth_refunds_.fetch_add(1, std::memory_order_relaxed);
+  }
 
   char ready = 0;
   char encoded[rdma::kRecvSegmentInfoBytes];
@@ -1093,6 +1197,23 @@ std::string RdmaTransport::MetricsText() const {
   s += "# TYPE dfkv_rdma_client_resource_budget_timeouts_total counter\n";
   s += "dfkv_rdma_client_resource_budget_timeouts_total " +
        std::to_string(resource_budget_->timeouts()) + "\n";
+  s += "# HELP dfkv_rdma_client_resource_budget_raises_total Autoscale limit raises applied to the process budget\n";
+  s += "# TYPE dfkv_rdma_client_resource_budget_raises_total counter\n";
+  s += "dfkv_rdma_client_resource_budget_raises_total " +
+       std::to_string(resource_budget_->raises()) + "\n";
+  s += "# HELP dfkv_rdma_client_admission_failures_total Operations failed kResourceExhausted by local budget starvation (peer never dialed)\n";
+  s += "# TYPE dfkv_rdma_client_admission_failures_total counter\n";
+  s += "dfkv_rdma_client_admission_failures_total " +
+       std::to_string(admission_failures_.load(std::memory_order_relaxed)) +
+       "\n";
+  s += "# HELP dfkv_rdma_client_depth_refunds_total Connections whose clamped depth negotiation refunded WR/registered budget\n";
+  s += "# TYPE dfkv_rdma_client_depth_refunds_total counter\n";
+  s += "dfkv_rdma_client_depth_refunds_total " +
+       std::to_string(depth_refunds_.load(std::memory_order_relaxed)) + "\n";
+  s += "# HELP dfkv_rdma_client_topology_nodes Ring size last hinted to the transport budget autoscaler (0=never hinted or autoscale off)\n";
+  s += "# TYPE dfkv_rdma_client_topology_nodes gauge\n";
+  s += "dfkv_rdma_client_topology_nodes " +
+       std::to_string(topology_nodes_.load(std::memory_order_relaxed)) + "\n";
   s += "# HELP dfkv_rdma_endpoint_cache_hits_total Idle endpoint cache hits\n";
   s += "# TYPE dfkv_rdma_endpoint_cache_hits_total counter\n";
   s += "dfkv_rdma_endpoint_cache_hits_total " +
@@ -1216,7 +1337,7 @@ std::string RdmaTransport::MetricsText() const {
        std::to_string(rdma::RcEndpoint::CqErrors()) + "\n";
   // Effective per-connection posting depth. Aggregate concurrency is bounded
   // independently by the per-rail credit policy above.
-  s += "# HELP dfkv_rdma_client_pipeline_depth Effective RDMA pipeline depth (env DFKV_RDMA_DEPTH)\n";
+  s += "# HELP dfkv_rdma_client_pipeline_depth Configured RDMA pipeline depth ceiling (env DFKV_RDMA_DEPTH); per-node connections may open at a lower learned negotiated depth\n";
   s += "# TYPE dfkv_rdma_client_pipeline_depth gauge\n";
   s += "dfkv_rdma_client_pipeline_depth " + std::to_string(depth_) + "\n";
   s += "# HELP dfkv_rdma_client_adhoc_user_mr_total One-shot user MRs registered outside explicit pool regions\n";
@@ -1381,7 +1502,9 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
       if (cross_rail_retry)
         cross_rail_retry_exhausted_.fetch_add(1,
                                               std::memory_order_relaxed);
-      return Status::kIOError;
+      return acquired.failure == AcquireFailure::kAdmission
+                 ? Status::kResourceExhausted
+                 : Status::kIOError;
     }
     Conn* conn = acquired.conn;
     if (InjectLocalRailFailure(attempt)) {
@@ -1616,6 +1739,8 @@ std::vector<Status> RdmaTransport::CacheMany(
       if (cross_rail_retry)
         cross_rail_retry_exhausted_.fetch_add(1,
                                               std::memory_order_relaxed);
+      if (acquired.failure == AcquireFailure::kAdmission)
+        MarkAdmissionFailure(&result);
       return result;
     }
     Conn* conn = acquired.conn;
@@ -1759,6 +1884,8 @@ std::vector<Status> RdmaTransport::RangeMany(
       if (cross_rail_retry)
         cross_rail_retry_exhausted_.fetch_add(1,
                                               std::memory_order_relaxed);
+      if (acquired.failure == AcquireFailure::kAdmission)
+        MarkAdmissionFailure(&result);
       return result;
     }
     Conn* conn = acquired.conn;
@@ -1893,6 +2020,8 @@ std::vector<Status> RdmaTransport::ExistMany(
       if (cross_rail_retry)
         cross_rail_retry_exhausted_.fetch_add(1,
                                               std::memory_order_relaxed);
+      if (acquired.failure == AcquireFailure::kAdmission)
+        MarkAdmissionFailure(&result);
       return result;
     }
     Conn* conn = acquired.conn;
@@ -2025,6 +2154,8 @@ std::vector<Status> RdmaTransport::RangeInto(
       if (cross_rail_retry)
         cross_rail_retry_exhausted_.fetch_add(1,
                                               std::memory_order_relaxed);
+      if (acquired.failure == AcquireFailure::kAdmission)
+        MarkAdmissionFailure(&result);
       operation.Complete(false);
       return result;
     }
@@ -2203,6 +2334,8 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
       if (cross_rail_retry)
         cross_rail_retry_exhausted_.fetch_add(1,
                                               std::memory_order_relaxed);
+      if (acquired.failure == AcquireFailure::kAdmission)
+        MarkAdmissionFailure(&result);
       return result;
     }
     Conn* conn = acquired.conn;
@@ -2465,6 +2598,8 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
       if (cross_rail_retry)
         cross_rail_retry_exhausted_.fetch_add(1,
                                               std::memory_order_relaxed);
+      if (acquired.failure == AcquireFailure::kAdmission)
+        MarkAdmissionFailure(&result);
       operation.Complete(false);
       return result;
     }
