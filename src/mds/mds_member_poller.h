@@ -19,9 +19,10 @@ namespace dfkv {
 // are taken against a trusted REFERENCE size, not the last adopted hop: the
 // reference only follows a view size that has repeated views_to_accept_
 // consecutive polls (or a persisted suspicious view, below), never a one-off
-// hop. Three suspicious cases share one hysteresis: a successful ListMembers
-// that is (a) empty, or (b) a shrink dropping more than shrink_pct% of the
-// reference, or (c) growth ballooning past +shrink_pct% of it. (a)/(b) are
+// hop. Three suspicious cases share one hysteresis: a successful topology's
+// eligible view that is (a) empty, or (b) a shrink dropping more than
+// shrink_pct% of the reference, or (c) growth ballooning past
+// +shrink_pct% of it. (a)/(b) are
 // almost always etcd-outage recovery (mass lease expiry, e.g. NOSPACE)
 // rather than a genuine teardown, and (c) is that same outage unwinding as
 // members re-register on their own schedule. Suspicious views must reappear
@@ -129,14 +130,23 @@ class MemberViewGuard {
   uint64_t rejected_growth_ = 0;
 };
 
-// Client-side discovery: periodically polls the MDS for a group's member view
-// and invokes on_change(members) whenever its placement-content epoch changes.
+// Client-side discovery: periodically polls the MDS for a group's complete
+// topology. The legacy callback remains placement-only. The modern callback
+// receives every topology generation plus whether the placement guard admits
+// the corresponding eligible-member view; its consumer can forward topology
+// immediately while independently deduplicating ring adoption.
 // Endpoint selection + failover via MdsEndpoints. One background thread.
 class MdsMemberPoller {
  public:
   using OnChange = std::function<void(const std::vector<MemberInfo>&)>;
-  MdsMemberPoller(std::vector<std::string> mds_eps, std::string group, OnChange cb,
-                  int poll_ms = 3000, int io_timeout_ms = 2000);
+  using OnTopologyChange =
+      std::function<void(const std::vector<MemberInfo>&, uint64_t, bool)>;
+  MdsMemberPoller(std::vector<std::string> mds_eps, std::string group,
+                  OnChange cb, int poll_ms = 3000,
+                  int io_timeout_ms = 2000);
+  MdsMemberPoller(std::vector<std::string> mds_eps, std::string group,
+                  OnTopologyChange cb, int poll_ms = 3000,
+                  int io_timeout_ms = 2000);
   ~MdsMemberPoller();
 
   void Start();
@@ -167,10 +177,13 @@ class MdsMemberPoller {
   MdsEndpoints eps_;
   std::string group_;
   OnChange cb_;
+  OnTopologyChange topology_cb_;
   int poll_ms_;
   int io_ms_;
-  uint64_t last_epoch_ = 0;
-  bool have_epoch_ = false;
+  uint64_t last_topology_epoch_ = 0;
+  uint64_t last_placement_epoch_ = 0;
+  bool have_topology_epoch_ = false;
+  bool have_placement_epoch_ = false;
   // MDS reachability diagnostics (ReportHealth). Without these a bad mds
   // endpoint fails 100% silently — the exact trap where "ok=0" writes look like
   // a data/write bug instead of "the ring was never populated".

@@ -10,7 +10,12 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <memory>
 #include <vector>
+#include <string>
+#include <unordered_map>
+
+#include "transport/transport.h"
 
 namespace dfkv {
 namespace rdma {
@@ -30,6 +35,185 @@ inline size_t PickRail(const std::vector<int>& dev_node, int caller_node,
   if (local.empty()) return rr_tick % n;        // no NUMA-local rail -> all
   return local[rr_tick % local.size()];
 }
+
+// Parse DFKV_RDMA_RAIL_TIERS. A missing value synthesizes one homogeneous tier
+// containing every configured local device. An explicit value is a strict
+// semicolon-separated tier list whose alternatives use '|': "a|b;c". Empty
+// names/tiers, duplicates, and names outside DFKV_RDMA_DEV are rejected.
+inline bool ParseRailTiers(const std::string& spec,
+                           const std::vector<std::string>& local_devices,
+                           std::vector<std::vector<uint8_t>>* tiers,
+                           std::string* error) {
+  if (!tiers) return false;
+  tiers->clear();
+  if (error) error->clear();
+  if (spec.empty()) {
+    tiers->push_back(std::vector<uint8_t>(local_devices.size(), 1));
+    return true;
+  }
+  std::vector<uint8_t> seen(local_devices.size(), 0);
+  size_t tier_begin = 0;
+  while (tier_begin <= spec.size()) {
+    const size_t tier_end = spec.find(';', tier_begin);
+    const size_t end =
+        tier_end == std::string::npos ? spec.size() : tier_end;
+    if (end == tier_begin) {
+      if (error) *error = "DFKV_RDMA_RAIL_TIERS contains an empty tier";
+      tiers->clear();
+      return false;
+    }
+    std::vector<uint8_t> mask(local_devices.size(), 0);
+    size_t name_begin = tier_begin;
+    while (name_begin <= end) {
+      const size_t separator = spec.find('|', name_begin);
+      const size_t name_end =
+          separator == std::string::npos || separator > end ? end : separator;
+      if (name_end == name_begin) {
+        if (error) *error = "DFKV_RDMA_RAIL_TIERS contains an empty rail name";
+        tiers->clear();
+        return false;
+      }
+      const std::string name = spec.substr(name_begin, name_end - name_begin);
+      const auto found =
+          std::find(local_devices.begin(), local_devices.end(), name);
+      if (found == local_devices.end()) {
+        if (error)
+          *error = "DFKV_RDMA_RAIL_TIERS rail '" + name +
+                   "' is not present in DFKV_RDMA_DEV";
+        tiers->clear();
+        return false;
+      }
+      const size_t index =
+          static_cast<size_t>(std::distance(local_devices.begin(), found));
+      if (seen[index]) {
+        if (error)
+          *error = "DFKV_RDMA_RAIL_TIERS repeats rail '" + name + "'";
+        tiers->clear();
+        return false;
+      }
+      seen[index] = 1;
+      mask[index] = 1;
+      if (name_end == end) break;
+      name_begin = name_end + 1;
+    }
+    tiers->push_back(std::move(mask));
+    if (tier_end == std::string::npos) break;
+    tier_begin = tier_end + 1;
+  }
+  return true;
+}
+
+// Return the first (highest-priority) tier with at least one peer-healthy local
+// rail. The returned mask contains only that tier's intersection, preventing
+// credits, latency, NUMA, or quarantine from spilling into a lower tier.
+inline std::vector<uint8_t> HighestCompatibleTier(
+    const std::vector<std::vector<uint8_t>>& tiers,
+    const std::vector<uint8_t>& peer_healthy) {
+  for (const auto& tier : tiers) {
+    std::vector<uint8_t> compatible(
+        std::max(tier.size(), peer_healthy.size()), 0);
+    bool any = false;
+    for (size_t i = 0; i < compatible.size(); ++i) {
+      compatible[i] =
+          i < tier.size() && tier[i] != 0 && i < peer_healthy.size() &&
+          peer_healthy[i] != 0;
+      any = any || compatible[i] != 0;
+    }
+    if (any) return compatible;
+  }
+  return {};
+}
+
+struct PeerRailSnapshot {
+  uint64_t generation = 0;
+  bool complete = false;
+  // Peer health by stable local device index. `compatible` is the highest tier
+  // for an all-enabled local topology; transports recompute from peer_healthy
+  // when runtime local eligibility removes rails.
+  std::vector<uint8_t> peer_healthy;
+  std::vector<uint8_t> compatible;
+};
+
+// Thread-safe immutable snapshot publication keyed by peer address. Explicit
+// heterogeneous tiers fail closed until a complete HLT1 topology arrives.
+// Without explicit tiers, absent/incomplete topology preserves the legacy
+// homogeneous all-local behavior.
+class PeerTopologyStore {
+ public:
+  PeerTopologyStore(std::vector<std::string> local_devices,
+                    std::vector<std::vector<uint8_t>> tiers,
+                    bool require_complete)
+      : local_devices_(std::move(local_devices)),
+        tiers_(std::move(tiers)),
+        require_complete_(require_complete) {
+    auto fallback = std::make_shared<PeerRailSnapshot>();
+    fallback->complete = !require_complete_;
+    if (!require_complete_) {
+      fallback->peer_healthy.assign(local_devices_.size(), 1);
+      fallback->compatible.assign(local_devices_.size(), 1);
+    }
+    fallback_ = std::move(fallback);
+  }
+
+  bool Update(const PeerTopology& topology) {
+    if (topology.peer_addr.empty()) return false;
+    auto next = std::make_shared<PeerRailSnapshot>();
+    next->generation = topology.generation;
+    next->complete = topology.complete;
+    if (topology.complete) {
+      std::vector<uint8_t> healthy(local_devices_.size(), 0);
+      for (const auto& rail : topology.rails) {
+        if (!rail.healthy) continue;
+        const auto found =
+            std::find(local_devices_.begin(), local_devices_.end(), rail.name);
+        if (found != local_devices_.end()) {
+          healthy[static_cast<size_t>(
+              std::distance(local_devices_.begin(), found))] = 1;
+        }
+      }
+      next->peer_healthy = healthy;
+      next->compatible = HighestCompatibleTier(tiers_, healthy);
+    } else if (!require_complete_) {
+      next->peer_healthy.assign(local_devices_.size(), 1);
+      next->compatible.assign(local_devices_.size(), 1);
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto found = snapshots_.find(topology.peer_addr);
+    // generation is a canonical FNV topology token, not a numeric sequence.
+    // MdsMemberPoller publishes callbacks in order; compare equality only to
+    // deduplicate the same immutable snapshot. Ordering it with < or > would
+    // reject arbitrary valid topology changes.
+    if (found != snapshots_.end() &&
+        topology.generation == found->second->generation)
+      return false;
+    snapshots_[topology.peer_addr] = std::move(next);
+    return true;
+  }
+
+  std::shared_ptr<const PeerRailSnapshot> Snapshot(
+      const std::string& peer_addr) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto found = snapshots_.find(peer_addr);
+    return found == snapshots_.end() ? fallback_ : found->second;
+  }
+
+  bool IsCurrent(const std::string& peer_addr, uint64_t generation) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto found = snapshots_.find(peer_addr);
+    return (found == snapshots_.end() ? fallback_->generation
+                                      : found->second->generation) ==
+           generation;
+  }
+
+ private:
+  std::vector<std::string> local_devices_;
+  std::vector<std::vector<uint8_t>> tiers_;
+  bool require_complete_;
+  std::shared_ptr<const PeerRailSnapshot> fallback_;
+  mutable std::mutex mu_;
+  std::unordered_map<std::string,
+                     std::shared_ptr<const PeerRailSnapshot>> snapshots_;
+};
 
 struct RailPolicyConfig {
   uint32_t credits_per_rail = 64;
@@ -302,6 +486,60 @@ inline bool HasUnexcludedRail(const std::vector<uint8_t>& preferred,
     if (enabled && !(i < excluded.size() && excluded[i] != 0)) return true;
   }
   return false;
+}
+
+inline std::vector<uint8_t> IntersectRailMasks(
+    const std::vector<uint8_t>& left, const std::vector<uint8_t>& right) {
+  std::vector<uint8_t> out(std::max(left.size(), right.size()), 0);
+  for (size_t i = 0; i < out.size(); ++i)
+    out[i] = i < left.size() && left[i] != 0 && i < right.size() &&
+             right[i] != 0;
+  return out;
+}
+
+
+inline std::vector<uint8_t> UnionRailMasks(
+    const std::vector<uint8_t>& left, const std::vector<uint8_t>& right) {
+  std::vector<uint8_t> out(std::max(left.size(), right.size()), 0);
+  for (size_t i = 0; i < out.size(); ++i)
+    out[i] = (i < left.size() && left[i] != 0) ||
+             (i < right.size() && right[i] != 0);
+  return out;
+}
+inline bool HasRail(const std::vector<uint8_t>& mask) {
+  return std::any_of(mask.begin(), mask.end(),
+                     [](uint8_t enabled) { return enabled != 0; });
+}
+
+// Apply locality only within an already selected highest compatible tier.
+// Credit pressure waits on that tier; `fallback` is a NUMA fallback mask, never
+// a lower heterogeneous tier.
+inline std::optional<RailLease> AcquireHighestTier(
+    RailPolicy& policy, uint32_t requested, uint64_t timeout_us,
+    const std::vector<uint8_t>& highest_tier,
+    const std::vector<uint8_t>& preferred,
+    const std::vector<uint8_t>& fallback,
+    const std::vector<uint8_t>& excluded = {}) {
+  std::vector<uint8_t> local = IntersectRailMasks(highest_tier, preferred);
+  std::vector<uint8_t> nonlocal =
+      IntersectRailMasks(highest_tier, fallback);
+  if (!HasRail(local)) {
+    local = std::move(nonlocal);
+    nonlocal.clear();
+  }
+  if (!HasRail(local)) return std::nullopt;
+  const uint64_t now = RailPolicy::NowMicros();
+  if (auto lease = policy.TryAcquire(requested, now, local, excluded))
+    return lease;
+  if (HasRail(nonlocal)) {
+    if (auto lease = policy.TryAcquire(requested, now, nonlocal, excluded))
+      return lease;
+  }
+  const bool local_available = HasUnexcludedRail(local, {}, excluded);
+  return policy.Acquire(requested, timeout_us,
+                        local_available || !HasRail(nonlocal) ? local
+                                                             : nonlocal,
+                        excluded);
 }
 
 // Bounded admission that prefers one candidate mask and degrades to a fallback

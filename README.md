@@ -49,39 +49,38 @@ TCP/RDMA → `dfkv_server` → optional RAM hot tier → DiskCacheGroup over N N
 Distributed = client-side consistent hashing; no replication (regenerable KV →
 node loss = miss → recompute). Full architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-**Membership** is managed by the MDS tier (`dfkv_mds` + etcd). Nodes register
-with the MDS on startup and send periodic heartbeats; etcd leases (TTL 30 s)
-are the liveness signal. Native clients use the single immutable
-`dfkv_client_options_v2` constructor: set either static `members` or
-`mds_endpoints` + `mds_group`. MDS mode polls the directory and rebuilds the
-weighted consistent-hash ring whenever its epoch advances. Two-layer offline
-detection: **layer-2** — etcd lease expiry → MDS view changes → client epoch →
-ring rebuild (authoritative removal after the 30 s lease TTL plus etcd, MDS RPC,
-and client-polling delay; this is not a 30 s upper bound); **layer-1** —
-`PeerHealth` fast avoidance short-circuits transport failures to misses during
-a cooldown. There is no post-open membership mutation API in v2. For rings still running v1.x
+**Membership and peer topology** are managed by the MDS tier (`dfkv_mds` +
+etcd). Nodes register and heartbeat; etcd leases (TTL 30 s) are the liveness
+signal. Native clients use the immutable `dfkv_client_options_v2` constructor:
+set either static `members` or `mds_endpoints` + `mds_group`. Modern discovery
+uses `kListTopology`. Its existing optional `HLT1` membership extension carries
+each member's placement eligibility plus repeated
+`{device name, port_state, phys_state, query_ok}` rail health; no second rail
+protocol is used. Clients independently deduplicate placement changes with
+`MembersEpoch` and peer-topology changes with `MembersTopologyEpoch`. The latter
+is canonical over stable member-id/device-name order and includes the member's
+address/placement binding, eligibility, and all rail health fields, so a rail
+transition is forwarded to the transport even when the Ketama ring is
+unchanged. Two-layer offline detection remains: etcd lease expiry updates the
+placement view, while `PeerHealth` quickly avoids endpoint IO failures. There
+is no post-open membership mutation API in v2. For rings still running v1.x
 nodes/clients, `DFKV_MDS_ACCEPT_LEGACY=1` enables a dual-protocol shim on the
-MDS control plane (ring-level isolation still applies) — see
-`docs/DEPLOY.md` §2b.
+MDS control plane (ring-level isolation still applies) — see `docs/DEPLOY.md`
+§2b.
 
-**RDMA server rail admission** is deliberately asymmetric. With no device
-list, automatic discovery remains `ACTIVE`-only. An explicit
-`dfkv_server --rdma-dev` list instead defines a fixed topology in configured
-first-occurrence order: a present but `DOWN` rail is still opened, initialized
-(anchor plus every required MR), and monitored. A missing/unopenable device,
-port- or GID-query failure, or any anchor/MR initialization failure aborts startup.
-The daemon may start with an initialized `DOWN` rail, but the whole node stays
-out of the placement ring until **every initialized/resolved rail**, including
-the auto-discovered rail when no list is configured, is `ACTIVE`/`LinkUp` for
-the recovery sample streak. The default is three successful sampling
-opportunities. At the nominal 10 s registrar cadence this usually takes about
-20–30 s depending on phase, plus registrar connection/RPC delays, and can take
-longer while MDS is unreachable; it is not a wall-clock upper bound. The node
-then rejoins without a restart. This fail-closed policy trades the node's entire
-cache capacity while any one resolved rail is unhealthy for immutable,
-index-aligned multi-rail topology. Startup
-cardinalities and current health are described in
-[`docs/DEPLOY.md`](docs/DEPLOY.md) and
+**RDMA server rail admission** separates immutable startup resources from
+runtime eligibility. With no device list, discovery remains `ACTIVE`-only. An
+explicit `dfkv_server --rdma-dev` list defines fixed first-occurrence order: a
+present `DOWN` rail is still opened, initialized (anchor plus every required
+MR), and monitored. Missing/unopenable devices, port/GID-query failure, or any
+anchor/MR initialization failure abort startup; startup never shrinks the
+configured topology. After initialization, the node is placement-eligible when
+**at least one** initialized rail is healthy. Losing one of several rails is
+`PARTIAL` and keeps serving; losing the final healthy rail makes the node
+`DEGRADED` immediately. Recovery from zero to nonzero healthy rails retains the
+`DFKV_RDMA_HEALTH_RECOVERY_SAMPLES` gate (default 3), then rejoins without a
+restart as `PARTIAL` or `ACTIVE`. Startup cardinalities, current health, and
+bounded metrics are described in [`docs/DEPLOY.md`](docs/DEPLOY.md) and
 [`docs/METRICS.md`](docs/METRICS.md).
 
 **Client registration** (who is using dfkv): cache *consumers* (inference
@@ -220,21 +219,18 @@ docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire p
 - **Connection pooling + keep-alive** (TCP_NODELAY): ~250× lower latency vs dial-per-call.
 - **Batch APIs** with concurrent fan-out across nodes and local NVMe disks.
 - **Connect/IO timeouts + stale-connection retry**: a hung node fails fast, never hangs.
-- **Observability** ([docs/METRICS.md](docs/METRICS.md)): opt-in embedded Prometheus
-  `/metrics` on `dfkv_server` and `dfkv_mds` (`--metrics-port`); sampled op-latency
-  histogram, eviction/error/per-disk/RDMA counters server-side; client-side counters
-  (peer health, IO errors, per-rail quarantine/recovery,
-  `dfkv_rdma_client_cross_rail_retries_total`,
-  `dfkv_rdma_client_cross_rail_retry_successes_total`, and
-  `dfkv_rdma_client_cross_rail_retry_exhausted_total`) via
-  `dfkv_stats_snapshot` + a plugin poller. Client RDMA families exist only
-  when the RDMA transport is in use and that snapshot is exported; absence from
-  a TCP-only process is expected. Server `dfkv_server_ring_eligible` and
-  `dfkv_server_ib_device_healthy` families are emitted only by an RDMA-enabled
-  binary running an RDMA listener. Their absence from a TCP-only binary or an
-  RDMA build without a listener must not be coerced to zero by dashboards or
-  alerts. **Opt-in and
-  off the datapath** — no `--metrics-port` ⇒ no metrics listener, behavior unchanged.
+- **Observability** ([docs/METRICS.md](docs/METRICS.md)): opt-in embedded
+  Prometheus endpoints plus client snapshots. New unlabeled client process
+  counters are `dfkv_rdma_client_peer_topology_updates_total`,
+  `dfkv_rdma_client_no_compatible_rail_total`, and
+  `dfkv_rdma_client_stale_generation_reaps_total`; bounded retry counters remain
+  `dfkv_rdma_client_cross_rail_{retries,retry_successes,retry_exhausted}_total`.
+  Server partial health is exposed by `dfkv_server_rdma_rails_configured`,
+  `dfkv_rdma_rails_initialized`, `dfkv_server_rdma_rails_active`,
+  `dfkv_server_ib_device_healthy{device}`, and
+  `dfkv_server_ring_eligible`. RDMA families exist only when the corresponding
+  RDMA listener/transport is active; TCP-only absence is not zero and must not
+  be coerced to unhealthy. No metrics port means no HTTP listener.
   The three connectors (vLLM / LMCache / SGLang HiCache) can also **push** fleet
   metrics (ops/keys/bytes, op latency, per-peer latency) over OTLP to a central
   Collector → Grafana — opt-in via `DFKV_METRICS_ENABLED=1`, **zero-dependency stdlib
@@ -255,15 +251,19 @@ docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire p
   share + each node's **self-reported version/config** — engine, capacity, RAM tier,
   RDMA dev — carried on register/heartbeat, so fleet-wide version/config audit is one
   command, no per-node ssh) and `dfkvctl stat --all` (per-node metrics + aggregate) via MDS.
-- **RDMA transport v2** (gated `-DDFKV_WITH_RDMA=ON`, native libibverbs RC):
-  with no device override each host chooses its first `ACTIVE` local HCA and
-  sends an empty device selector to its peer. An explicit comma whitelist opts
-  into multi-rail round-robin and therefore must name the intended fabric on
-  both hosts. Device names are limited to 18 bytes in the wire dev frame —
-  longer names fail fast instead of silently truncating (7837f0b). QPs bootstrap over a tiny TCP channel, so the data fabric needs no
-  IP. A v2 capability probe is mandatory; protocol, QP, receive-segment, or
-  registration mismatch rejects the connection. Unset `DFKV_RDMA` selects TCP;
-  once RDMA is requested it never switches transports.
+- **Peer-aware heterogeneous RDMA rails** (gated `-DDFKV_WITH_RDMA=ON`,
+  native libibverbs RC): with no device override each host chooses its first
+  `ACTIVE` local HCA. `DFKV_RDMA_DEV` fixes stable local device indices.
+  `DFKV_RDMA_RAIL_TIERS` optionally groups that list as priority tiers using
+  `a|b;c` syntax (leftmost Tier 0, `|` peers within a tier, `;` separates
+  tiers); every name must exist in `DFKV_RDMA_DEV`. When absent, all configured
+  devices form one homogeneous tier. For each endpoint, selection intersects
+  local enabled rails with the peer's HLT1 healthy rails and uses only the
+  highest nonempty tier. A configured-tier client fails closed with
+  `Status::kNoCompatibleRail` when peer topology is missing/incomplete or the
+  intersection is empty. QPs bootstrap over TCP, so the data fabric needs no
+  IP. A v2 capability probe is mandatory; once RDMA is requested it never
+  switches transports.
 - **One-sided zero-copy data plane**: control descriptors/status use small 4-KiB
   SEND/RECV buffers. PUT payloads RDMA-WRITE into leases from one process-wide,
   pre-registered receive segment; GET payloads RDMA-WRITE directly into the
@@ -274,33 +274,33 @@ docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire p
   depth-flat (the per-connection serve loop is in-order; benchmarked GET ~1.24 GB/s at
   depth 1 == 32). The throughput levers are **multi-connection fan-out**
   (`batch_concurrency`) and **fewer/larger keys**. See `docs/datapath-perf-notes.md`.
-- **NUMA-aware rail selection** (`DFKV_RDMA_NUMA=1`): with an explicit
-  multi-rail whitelist, prefers an `ACTIVE` rail local to the calling thread,
-  then round-robins the listed healthy rails; when every NUMA-local rail is
-  inadmissible, it degrades to the full enabled rail set instead of refusing
-  traffic (5ef39f1). Server threads follow their QP's
-  rail NUMA node; the single shared receive segment is registered on each
-  selected rail but is not separately NUMA-allocated per rail. Off by default;
-  vendor-neutral (sysfs + `sched_getcpu`, no libnuma/CUDA).
-- **Client-local rail recovery**: local device/verbs evidence (`Open`, local QP
-  transition, MR registration/refresh, post/CQ API failure, or a locally
-  classified WC) is `kRailFailure`; peer/bootstrap/protocol failure, remote/RNR/
-  retry/flush WC, silent completion timeout, resource admission, cancellation,
-  and invalid input are not. A first-attempt `kRailFailure` retires the failed
-  endpoint and synchronously tears down its QP/MRs before one fresh retry. The
-  retry excludes that rail from both NUMA-preferred and fallback selection, so
-  it uses a distinct topology-enabled local rail whenever one exists. There are
-  at most two physical attempts. A one-rail topology may instead make the one
-  fresh retry on that same rail, but it never reuses the failed QP or bypasses
-  quarantine, cooldown, credits, or the single recovery-probe gate.
-- **Bounded at-least-once replay**: a rail retry replays the existing whole
-  logical PUT/GET/batch/SG operation after teardown; it does not promise
-  exactly-once PUT execution when a remote commit preceded a lost completion.
-  This is client-only recovery and is separate from server node/ring health
-  (`DFKV_RDMA_HEALTH_FILE` and `dfkv_server_ring_eligible`). It changes neither
-  the RDMA wire protocol nor server behavior, so upgraded clients remain
-  compatible with mixed-version servers that already speak the same RDMA v2
-  protocol.
+- **Tier-bounded NUMA and congestion selection** (`DFKV_RDMA_NUMA=1`):
+  NUMA locality, per-rail credits, latency, quarantine, and recovery select only
+  inside the highest compatible tier. A healthy Tier-0 rail with exhausted
+  credits waits under the existing bounded backpressure contract; congestion
+  never overflows traffic into Tier 1. Lower tiers are considered only when the
+  peer-health intersection makes every higher tier unavailable. Server threads
+  follow their QP rail NUMA node; the shared receive segment is registered on
+  each selected rail but is not separately NUMA-allocated per rail.
+- **Generation-fenced endpoint recovery**: each public operation captures one
+  peer-topology generation for both of its possible physical attempts.
+  Connections record that generation. A stale-generation pool entry is never
+  reused or returned to a pool; it is retired through the existing single-owner
+  teardown lifecycle. A first-attempt client-local `kRailFailure` retires its
+  endpoint before at most one fresh retry, excluding the failed rail when
+  another compatible rail is available. The operation never widens beyond two
+  physical attempts.
+- **Replay contract**: replay-safe GET/batch/SG paths retain byte-exact completed
+  items/windows and retry only unfinished work. A PUT may cross rails only when
+  failure is known to precede request submission. Once a PUT may have been
+  submitted, its outcome is ambiguous and it is returned without cross-rail
+  replay; dfkv does not promise exactly-once execution or broaden the existing
+  ambiguous-write policy. `kNoCompatibleRail` is client-local and peer-health
+  neutral: it neither cools the peer nor counts as a served peer response.
+  A current MDS can expose a legacy member's absent HLT1; configured tiers then
+  fail closed, while no-tier clients retain homogeneous behavior. A legacy MDS
+  does not understand `kListTopology`: modern polls fail and preserve the
+  last-good ring, so rollout is MDS-first rather than silent fallback.
 - **SGLang HiCache pool-aware v2 interface** (`batch_set_v2`/`batch_get_v2` +
   PoolTransfer) for multi-pool models (Mamba/SWA/DeepSeek-V4).
 - **Packaging**: CPack (deb/rpm/tgz) + Dockerfile; **graceful shutdown**; leveled logging.
@@ -321,7 +321,7 @@ fabric selection and capacity explicit.
 | `DFKV_DISK_HASH_WEIGHT` | `10` | Flattens the intra-server disk ring share from ±20 % to ±3 % so the hottest disk stops gating the whole node (+5–6 % cold read, ~2× lower p99). **Re-routes existing keys** (cache miss + refill) — flip together with a restart/upgrade window. |
 | `--rdma-depth` | `4` (default) | Handshake window is `min(client, server)`. Single-connection PUT/GET bandwidth is depth-flat once connected, but production connector batches require both sides to expose the same bounded window; a 1-vs-4 mismatch caused burst PUT failures and a 29.8% hot-round regression on GLM-5.2. Depth 4 with the default 4 MiB declaration leases about 16 MiB per data QP, so a 16 GiB receive segment admits about 1024 QPs. Increase only for a measured latency-bound path and budget `depth × slot_size` per pooled QP. |
 | `DFKV_RDMA_IDLE_MS` | `30000` for frequently replaced clients; otherwise default `600000` | Server dead-client reaper. A short interval bounds leaked receive-segment leases, but live clients must set `DFKV_RDMA_KEEPALIVE_MS` below this value or their next GET pays stale-QP recovery. |
-| `DFKV_RDMA_HEALTH_RECOVERY_SAMPLES` | `3` | With an RDMA listener, the server gates placement on every initialized/resolved IB rail, including the auto-discovered rail. Any query failure or non-ACTIVE/LinkUp rail removes the node immediately; three successful sampling opportunities re-admit it. At the nominal 10 s registrar cadence this is usually about 20–30 s depending on phase, plus registrar connection/RPC delays, and can be longer while MDS is unreachable; it is not an upper bound. |
+| `DFKV_RDMA_HEALTH_RECOVERY_SAMPLES` | `3` | Any healthy initialized rail keeps placement eligible; a partial loss stays online. Loss of the final healthy rail removes the node immediately. Only recovery from zero to nonzero waits the consecutive sample gate, then rejoins as `PARTIAL` or `ACTIVE`. |
 | `DFKV_RDMA_HEALTH_FILE` | unset | Diagnostic-only health input (`device port_state phys_state`, one per initialized/resolved rail, including an auto-discovered rail) for controlled fault injection. Production MUST leave this unset so health comes from sysfs. |
 | `--ram-tier` / `--ram-tier-bytes` / `--ram-tier-shards` | on / sized to the node / `16` for ≥100 GiB arenas | Large arenas contend on the shard locks under mixed load (+40 % mixed R/W at 16 shards on a 128 GiB arena); small (≤16 GiB) arenas are fine at the default 8. |
 | `--store-engine` | `slab` | Index rebuilds on restart; removes file-per-block hazards. |
@@ -332,11 +332,12 @@ fabric selection and capacity explicit.
 
 | Knob | Recommended | Why |
 |---|---|---|
-| `DFKV_RDMA_DEV` | leave unset for one local HCA; use the same fabric whitelist on both hosts for multi-rail | Unset lets each endpoint select its own first `ACTIVE` local HCA, so local names may differ. A comma list explicitly enables multi-rail and is sent to the peer; every listed name must exist and be on the intended interoperable fabric at both ends. |
+| `DFKV_RDMA_DEV` | leave unset for one local HCA; set each host's actual stable local whitelist for multi-rail | The local list may differ in cardinality on GPU and CPU hosts. Peer-aware selection uses exact shared names from HLT1; configured tiers require an explicit list. |
+| `DFKV_RDMA_RAIL_TIERS` | unset for homogeneous hosts; e.g. `mlx5_0|mlx5_1;mlx5_2` for heterogeneous hosts | Every name must be present in `DFKV_RDMA_DEV`; leftmost is highest priority. GPU and CPU hosts may expose different subsets, but interoperating rail names must describe the same fabric. The client uses the highest tier in `local enabled ∩ peer healthy`; missing/incomplete peer HLT1 fails closed only when tiers are configured. Credits, NUMA, latency, and quarantine never cause tier overflow. |
 | `DFKV_RDMA_DEPTH` | `4` (default) | Keep client/server defaults aligned for connector batch correctness. Throughput scaling comes from multiple pooled connections, not raising one QP's depth; lowering depth reduces receive-segment consumption only after validating the real engine workload. |
 | `DFKV_RDMA_RAIL_ERROR_THRESHOLD` | `3` (default) | Consecutive client-local rail failures required to quarantine that rail; endpoint/peer failures do not contribute. |
 | `DFKV_RDMA_RAIL_COOLDOWN_MS` | `5000` (default) | Quarantine duration. No admission occurs during cooldown; afterward exactly one real operation is admitted as the recovery probe. Probe success clears the rail state, local failure starts another cooldown, and endpoint failure proves neither recovery nor a new local fault. |
-| local-rail attempts | fixed at `2` (not configurable) | One initial attempt plus at most one fresh retry after `kRailFailure`; a distinct enabled local rail is mandatory when present. A one-rail topology may retry fresh on the same rail without bypassing quarantine. |
+| local-rail attempts | fixed at `2` (not configurable) | One initial attempt plus at most one fresh retry. GET retries only unfinished work. PUT crosses rails only before request post; ambiguous post-submit failure is returned without replay. Both attempts retain one captured peer generation. |
 | `DFKV_RDMA_KEEPALIVE_MS` | `15000` (default); `0` = off | Sends lightweight membership probes over every idle pooled QP. Live clients keep their QPs and avoid first-GET reconnect tails; exited clients send no probes and remain reclaimable. Keep the interval strictly below the server reap interval. |
 | `DFKV_RDMA_POOL_MAX` | `16` (default) | Maximum idle QPs retained per server and per lane, across all rails. It is not a process-wide connection cap. Raise only when connection-open metrics grow on repeated steady-state rounds; each retained QP leases `depth × align4K(4096 + declared_max_block)` from the server receive segment. |
 | `DFKV_RDMA_ENDPOINT_CACHE_MAX` | autoscaled (floor `256`, process-wide) | Hard cap on live client RDMA endpoints across all `RdmaTransport` instances. Unset, the cap follows the adopted ring: `nodes x (2 x rails + 1) x 1.25`, raised (never shrunk) on every membership adoption, so large rings cannot starve admission into 10 s `kResourceExhausted` timeouts. Setting this env (or any budget env) pins the whole budget and disables autoscaling. Under pressure, the requesting transport applies a SIEVE second-chance scan to its idle data/SG/control endpoints, destroys one cold QP, then retries admission. A hot cache hit sets only one visited bit; no LRU mutation occurs on the datapath. |

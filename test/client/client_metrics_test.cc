@@ -17,6 +17,7 @@
 #include <mutex>
 #include <sys/mman.h>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 using namespace dfkv;  // NOLINT
@@ -24,7 +25,11 @@ using namespace dfkv;  // NOLINT
 namespace {
 class MetricsTransport final : public Transport {
  public:
-  enum class AttemptResult : uint8_t { kSuccess, kRailFailure };
+  enum class AttemptResult : uint8_t {
+    kSuccess,
+    kRailFailure,
+    kAmbiguousPostSubmitFailure,
+  };
   struct ScriptedAttempt {
     size_t rail;
     AttemptResult result;
@@ -39,6 +44,9 @@ class MetricsTransport final : public Transport {
   std::vector<ScriptedAttempt> attempt_script;
   std::vector<ScriptedAttempt> attempts;
   std::vector<size_t> replay_item_counts;
+  std::vector<std::vector<size_t>> attempt_item_indices;
+  std::vector<size_t> range_multi_item_calls;
+  size_t remote_put_commits = 0;
   size_t exist_calls = 0;
   size_t range_calls = 0;
   size_t range_multi_calls = 0;
@@ -52,12 +60,15 @@ class MetricsTransport final : public Transport {
     attempt_script.assign(script);
     attempts.clear();
     replay_item_counts.clear();
+    attempt_item_indices.clear();
+    range_multi_item_calls.clear();
   }
 
   Status Cache(const std::string&, const BlockKey& key, const void* data,
                size_t len) override {
     std::lock_guard<std::mutex> lock(mu);
     const bool ok = RunAttemptsLocked(1, [&] {
+      ++remote_put_commits;
       values[key.Filename()] =
           std::string(static_cast<const char*>(data), len);
     });
@@ -109,6 +120,7 @@ class MetricsTransport final : public Transport {
       const std::string&, const std::vector<CacheSrc>& srcs) override {
     std::lock_guard<std::mutex> lock(mu);
     const bool ok = RunAttemptsLocked(srcs.size(), [&] {
+      remote_put_commits += srcs.size();
       for (const auto& src : srcs) {
         values[src.key.Filename()] =
             std::string(static_cast<const char*>(src.payload),
@@ -146,6 +158,7 @@ class MetricsTransport final : public Transport {
       const std::string&, const std::vector<CacheSrcMulti>& srcs) override {
     std::lock_guard<std::mutex> lock(mu);
     const bool ok = RunAttemptsLocked(srcs.size(), [&] {
+      remote_put_commits += srcs.size();
       for (const auto& src : srcs) {
         std::string value;
         for (const auto& segment : src.payloads)
@@ -167,8 +180,11 @@ class MetricsTransport final : public Transport {
     if (out_lens) out_lens->assign(keys.size(), 0);
     if (dsts.size() != keys.size()) return InvalidStatuses(keys.size());
     std::vector<Status> result(keys.size(), Status::kNotFound);
-    const bool ok = RunAttemptsLocked(keys.size(), [&] {
-      for (size_t i = 0; i < keys.size(); ++i) {
+    range_multi_item_calls.assign(keys.size(), 0);
+    const bool ok = RunAttemptsLocked(
+        keys.size(), [&](size_t begin, size_t end) {
+      for (size_t i = begin; i < end; ++i) {
+        ++range_multi_item_calls[i];
         auto found = values.find(keys[i].Filename());
         if (found == values.end()) continue;
         size_t offset = 0;
@@ -218,21 +234,44 @@ class MetricsTransport final : public Transport {
         attempt_script.empty()
             ? std::vector<ScriptedAttempt>{{0, AttemptResult::kSuccess}}
             : attempt_script;
-    size_t remaining_items = item_count;
+    size_t completed_items = 0;
     bool cross_rail_retry = false;
     for (size_t i = 0; i < script.size() && i < 2; ++i) {
       if (script[i].delay.count() != 0)
         std::this_thread::sleep_for(script[i].delay);
       attempts.push_back(script[i]);
-      replay_item_counts.push_back(remaining_items);
+      replay_item_counts.push_back(item_count - completed_items);
+      std::vector<size_t> attempted_items;
+      attempted_items.reserve(item_count - completed_items);
+      for (size_t item = completed_items; item < item_count; ++item)
+        attempted_items.push_back(item);
+      attempt_item_indices.push_back(std::move(attempted_items));
       if (script[i].result == AttemptResult::kSuccess) {
-        success();
+        if constexpr (std::is_invocable_v<Success, size_t, size_t>)
+          success(completed_items, item_count);
+        else
+          success();
         if (cross_rail_retry) ++cross_rail_retry_successes;
         return true;
       }
-      remaining_items -=
-          std::min(remaining_items,
+      if (script[i].result == AttemptResult::kAmbiguousPostSubmitFailure) {
+        // The peer may already have committed this PUT. The production
+        // contract returns the ambiguous failure without replaying it on a
+        // different rail.
+        if constexpr (std::is_invocable_v<Success, size_t, size_t>)
+          success(completed_items, item_count);
+        else
+          success();
+        return false;
+      }
+      const size_t newly_completed =
+          std::min(item_count - completed_items,
                    script[i].completed_items_before_failure);
+      if constexpr (std::is_invocable_v<Success, size_t, size_t>) {
+        if (newly_completed != 0)
+          success(completed_items, completed_items + newly_completed);
+      }
+      completed_items += newly_completed;
       if (i == 0 && script.size() > 1) {
         cross_rail_retry = script[1].rail != script[0].rail;
         if (cross_rail_retry) ++cross_rail_retries;
@@ -490,7 +529,124 @@ TEST(ClientOpMetrics, SameRailFallbackDoesNotCountAsCrossRailRetry) {
             0u);
 }
 
-TEST(ClientOpMetrics, CrossRailRetryPreservesCompletedMultiWindowSgItems) {
+TEST(ClientOpMetrics, AmbiguousPostSubmitPutIsNotCrossRailReplayed) {
+  using Result = MetricsTransport::AttemptResult;
+  MetricsTransport transport;
+  transport.pipeline = true;
+  KVClient client({{"n", "test:1"}}, "metrics/ambiguous-put", &transport);
+  const std::string value("committed\0payload", 17);
+
+  transport.Script(
+      {{0, Result::kAmbiguousPostSubmitFailure},
+       {1, Result::kSuccess}});
+  EXPECT_FALSE(client.Put("key", value.data(), value.size()));
+  ASSERT_EQ(transport.attempts.size(), 1u);
+  EXPECT_EQ(transport.attempts[0].rail, 0u);
+  EXPECT_EQ(transport.remote_put_commits, 1u)
+      << "the ambiguous first attempt may already have committed exactly once";
+
+  const std::string snapshot = client.MetricsSnapshot();
+  EXPECT_EQ(Metric(snapshot, "dfkv_client_op_requests_total", "put"), 1u);
+  EXPECT_EQ(Metric(snapshot, "dfkv_client_op_hits_total", "put"), 0u);
+  EXPECT_EQ(Metric(snapshot, "dfkv_client_op_bytes_total", "put"), 0u);
+  EXPECT_EQ(TransportCounter(
+                snapshot, "dfkv_rdma_client_cross_rail_retries_total"),
+            0u);
+  EXPECT_EQ(TransportCounter(
+                snapshot,
+                "dfkv_rdma_client_cross_rail_retry_successes_total"),
+            0u);
+  EXPECT_EQ(TransportCounter(
+                snapshot,
+                "dfkv_rdma_client_cross_rail_retry_exhausted_total"),
+            0u);
+}
+
+TEST(ClientOpMetrics, AmbiguousPostSubmitPipelinedBatchPutIsNotReplayed) {
+  using Result = MetricsTransport::AttemptResult;
+  MetricsTransport transport;
+  transport.pipeline = true;
+  KVClient client({{"n", "test:1"}}, "metrics/ambiguous-batch-put",
+                  &transport);
+  const std::vector<std::string> values{
+      std::string("first\0value", 11),
+      std::string("second\0value", 12),
+      std::string("third\0value", 11),
+  };
+  std::vector<KvPutItem> puts;
+  for (size_t i = 0; i < values.size(); ++i) {
+    puts.push_back({"key-" + std::to_string(i), values[i].data(),
+                    values[i].size()});
+  }
+
+  transport.Script(
+      {{0, Result::kAmbiguousPostSubmitFailure},
+       {1, Result::kSuccess}});
+  EXPECT_EQ(client.BatchPut(puts), std::vector<bool>(puts.size(), false));
+  ASSERT_EQ(transport.attempts.size(), 1u);
+  EXPECT_EQ(transport.attempts[0].rail, 0u);
+  EXPECT_EQ(transport.replay_item_counts,
+            std::vector<size_t>({puts.size()}));
+  EXPECT_EQ(transport.remote_put_commits, puts.size());
+  for (size_t i = 0; i < puts.size(); ++i) {
+    EXPECT_EQ(transport.values[ToBlockKey(
+                                   "metrics/ambiguous-batch-put", puts[i].key)
+                                   .Filename()],
+              values[i]);
+  }
+
+  const std::string snapshot = client.MetricsSnapshot();
+  EXPECT_EQ(Metric(snapshot, "dfkv_client_op_requests_total", "put"), 1u);
+  EXPECT_EQ(Metric(snapshot, "dfkv_client_op_keys_total", "put"),
+            puts.size());
+  EXPECT_EQ(Metric(snapshot, "dfkv_client_op_hits_total", "put"), 0u);
+  EXPECT_EQ(Metric(snapshot, "dfkv_client_op_bytes_total", "put"), 0u);
+  EXPECT_EQ(TransportCounter(
+                snapshot, "dfkv_rdma_client_cross_rail_retries_total"),
+            0u);
+}
+
+TEST(ClientOpMetrics, AmbiguousPostSubmitSgBatchPutIsNotReplayed) {
+  using Result = MetricsTransport::AttemptResult;
+  MetricsTransport transport;
+  transport.pipeline = true;
+  KVClient client({{"n", "test:1"}}, "metrics/ambiguous-sg-put",
+                  &transport);
+  const std::array<std::string, 3> segments{
+      std::string("first\0", 6),
+      std::string("second\0", 7),
+      std::string("third\0", 6),
+  };
+  std::vector<KvPutItemSg> puts{
+      {"sg-key",
+       {segments[0].data(), segments[1].data(), segments[2].data()},
+       {segments[0].size(), segments[1].size(), segments[2].size()}},
+  };
+
+  transport.Script(
+      {{0, Result::kAmbiguousPostSubmitFailure},
+       {1, Result::kSuccess}});
+  EXPECT_EQ(client.BatchPutSg(puts), std::vector<bool>({false}));
+  ASSERT_EQ(transport.attempts.size(), 1u);
+  EXPECT_EQ(transport.attempts[0].rail, 0u);
+  EXPECT_EQ(transport.replay_item_counts, std::vector<size_t>({1}));
+  EXPECT_EQ(transport.remote_put_commits, 1u);
+  EXPECT_EQ(transport.values[ToBlockKey("metrics/ambiguous-sg-put", "sg-key")
+                                 .Filename()],
+            segments[0] + segments[1] + segments[2]);
+
+  const std::string snapshot = client.MetricsSnapshot();
+  EXPECT_EQ(Metric(snapshot, "dfkv_client_op_requests_total", "put"), 1u);
+  EXPECT_EQ(Metric(snapshot, "dfkv_client_op_keys_total", "put"), 1u);
+  EXPECT_EQ(Metric(snapshot, "dfkv_client_op_hits_total", "put"), 0u);
+  EXPECT_EQ(Metric(snapshot, "dfkv_client_op_bytes_total", "put"), 0u);
+  EXPECT_EQ(TransportCounter(
+                snapshot, "dfkv_rdma_client_cross_rail_retries_total"),
+            0u);
+}
+
+TEST(ClientOpMetrics,
+     ByteExactGetUsesAtMostTwoAttemptsAndDoesNotReplayCompletedItems) {
   using Result = MetricsTransport::AttemptResult;
   constexpr size_t kItems = 9;  // 2 * depth(4) + 1
   constexpr size_t kSegmentBytes = 4;
@@ -505,9 +661,11 @@ TEST(ClientOpMetrics, CrossRailRetryPreservesCompletedMultiWindowSgItems) {
   puts.reserve(kItems);
   for (size_t i = 0; i < kItems; ++i) {
     for (size_t segment = 0; segment < 3; ++segment) {
-      segments[i][segment] =
-          std::string(kSegmentBytes,
-                      static_cast<char>('A' + i * 3 + segment));
+      segments[i][segment].resize(kSegmentBytes);
+      for (size_t byte = 0; byte < kSegmentBytes; ++byte) {
+        segments[i][segment][byte] = static_cast<char>(
+            (i * 37 + segment * 11 + byte * 53) & 0xff);
+      }
       expected[i] += segments[i][segment];
     }
     puts.push_back(
@@ -517,13 +675,10 @@ TEST(ClientOpMetrics, CrossRailRetryPreservesCompletedMultiWindowSgItems) {
          {kSegmentBytes, kSegmentBytes, kSegmentBytes}});
   }
 
-  transport.Script(
-      {{0, Result::kRailFailure, {}, kCompletedBeforeFailure},
-       {1, Result::kSuccess}});
+  transport.Script({{0, Result::kSuccess}});
   EXPECT_EQ(client.BatchPutSg(puts), std::vector<bool>(kItems, true));
-  EXPECT_EQ(transport.replay_item_counts,
-            (std::vector<size_t>{kItems,
-                                 kItems - kCompletedBeforeFailure}));
+  EXPECT_EQ(transport.replay_item_counts, (std::vector<size_t>{kItems}));
+  ASSERT_EQ(transport.attempts.size(), 1u);
 
   std::vector<std::array<std::array<char, kSegmentBytes>, 3>> output(kItems);
   std::vector<KvGetItemSg> gets;
@@ -544,6 +699,16 @@ TEST(ClientOpMetrics, CrossRailRetryPreservesCompletedMultiWindowSgItems) {
   EXPECT_EQ(transport.replay_item_counts,
             (std::vector<size_t>{kItems,
                                  kItems - kCompletedBeforeFailure}));
+  ASSERT_EQ(transport.attempts.size(), 2u);
+  ASSERT_EQ(transport.attempt_item_indices.size(), 2u);
+  EXPECT_EQ(transport.attempt_item_indices[0],
+            (std::vector<size_t>{0, 1, 2, 3, 4, 5, 6, 7, 8}));
+  EXPECT_EQ(transport.attempt_item_indices[1],
+            (std::vector<size_t>{4, 5, 6, 7, 8}))
+      << "items completed by attempt one must never be replayed";
+  EXPECT_EQ(transport.range_multi_item_calls,
+            std::vector<size_t>(kItems, 1u))
+      << "every byte-exact item must be fetched exactly once across attempts";
   for (size_t i = 0; i < kItems; ++i) {
     std::string actual;
     for (const auto& segment : output[i])
@@ -563,11 +728,11 @@ TEST(ClientOpMetrics, CrossRailRetryPreservesCompletedMultiWindowSgItems) {
   }
   EXPECT_EQ(TransportCounter(
                 snapshot, "dfkv_rdma_client_cross_rail_retries_total"),
-            2u);
+            1u);
   EXPECT_EQ(TransportCounter(
                 snapshot,
                 "dfkv_rdma_client_cross_rail_retry_successes_total"),
-            2u);
+            1u);
   EXPECT_EQ(TransportCounter(
                 snapshot,
                 "dfkv_rdma_client_cross_rail_retry_exhausted_total"),
@@ -596,7 +761,9 @@ TEST(ClientOpMetrics, ExhaustedCrossRailRetryCountsOneFailure) {
   }
 
   transport.Script(
-      {{0, Result::kRailFailure}, {1, Result::kRailFailure}});
+      {{0, Result::kRailFailure},
+       {1, Result::kRailFailure},
+       {2, Result::kSuccess}});
   std::vector<size_t> lengths;
   EXPECT_EQ(client.BatchGetAutoSg(gets, &lengths),
             std::vector<bool>(kItems, false));

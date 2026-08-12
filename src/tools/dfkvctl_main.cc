@@ -136,6 +136,15 @@ static std::string IbHealthSummary(const MemberInfo& member) {
   }
   return out.empty() ? "none" : out;
 }
+static const char* MemberStatus(const MemberInfo& member) {
+  if (!member.RingEligible()) return "DEGRADED";
+  if (!member.has_health) return "ACTIVE";
+  size_t active = 0;
+  for (const auto& device : member.health.ib_devices)
+    if (device.healthy()) ++active;
+  if (active == 0) return "DEGRADED";
+  return active == member.health.ib_devices.size() ? "ACTIVE" : "PARTIAL";
+}
 
 // Extract the value of `key=` from a "k=v,k=v" info string, or "" if absent.
 static std::string InfoField(const std::string& info, const std::string& key) {
@@ -310,7 +319,7 @@ static int CmdRing(const std::string& mds, const std::string& group,
     // cap, ...). "-" = node predates info reporting (itself a version signal).
     std::printf("%-16s %-22s %-9s %6u %8zu %6.1f%% %-30s %s\n",
                 m.id.c_str(), addr.c_str(),
-                m.RingEligible() ? "ACTIVE" : "DEGRADED", m.weight, v, share,
+                MemberStatus(m), m.weight, v, share,
                 IbHealthSummary(m).c_str(),
                 m.info.empty() ? "-" : m.info.c_str());
   }

@@ -346,12 +346,16 @@ Status MdsServer::ListMembers(const std::string& group, std::string* out,
         (include_degraded || one[0].RingEligible()))
       members.push_back(one[0]);
   }
-  // Epoch = content hash of the member set, NOT etcd's global revision: the
-  // revision bumps on every cluster write (including unrelated groups), which
-  // would make clients rebuild their ring needlessly. The hash changes iff THIS
-  // group's membership content changes.
+  // Placement and topology have separate canonical generations. The legacy
+  // kListMembers view is filtered to eligible members and keeps its placement
+  // epoch. kListTopology includes degraded members and uses the HLT1-sensitive
+  // generation, so rail-only changes reach modern clients without inventing a
+  // second wire extension.
   metrics_.members_last_list.store(members.size(), std::memory_order_relaxed);
-  *out = EncodeMembers(members, MembersEpoch(members));
+  const uint64_t epoch = include_degraded
+                             ? MembersTopologyEpoch(members)
+                             : MembersEpoch(members);
+  *out = EncodeMembers(members, epoch);
   return Status::kOk;
 }
 

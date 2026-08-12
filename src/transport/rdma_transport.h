@@ -96,6 +96,7 @@ class RdmaTransport : public Transport {
   // any budget env explicitly (DFKV_RDMA_ENDPOINT_CACHE_MAX / QP_BUDGET /
   // WR_BUDGET / REGISTERED_BYTES_BUDGET): explicit config is a contract.
   void OnTopologyHint(size_t nodes) override;
+  void OnPeerTopology(const PeerTopology& topology) override;
 
   bool pipelined() const override { return true; }
   size_t MaxSgPayloadSegs() const override { return sg_payload_segs_; }
@@ -131,20 +132,27 @@ class RdmaTransport : public Transport {
   using RailMask = std::vector<uint8_t>;
   enum class AcquireFailure : uint8_t {
     kNone,
+    kNoCompatibleRail,
     kAdmission,
     kLocalRail,
     kEndpoint,
+  };
+  enum class ReplaySafety : uint8_t {
+    kReplaySafe,
+    kUnsafeAfterPost,
   };
   struct AcquireOptions {
     bool force_new = false;
     size_t requested_credits = 1;
     RailMask excluded;
+    std::shared_ptr<const rdma::PeerRailSnapshot> peer;
   };
   struct AcquireResult {
     Conn* conn = nullptr;
     bool from_pool = false;
     std::optional<size_t> attempted_rail;
     AcquireFailure failure = AcquireFailure::kAdmission;
+    Status status = Status::kIOError;
   };
   // Lanes separate payload, device-direct SG, and key-sized control traffic;
   // each lane keeps the negotiated depth while owning an independent endpoint
@@ -153,12 +161,15 @@ class RdmaTransport : public Transport {
   enum class Lane { kData, kSgData, kControl };
   AcquireResult Acquire(const std::string& node, Lane lane,
                         const AcquireOptions& options);
-  // Schedules at most one fresh retry. cross_rail_retry is set only while the
-  // failed rail stays excluded and another topology-enabled rail exists.
-  bool PrepareRetry(int attempt, bool from_pool,
-                    std::optional<size_t> attempted_rail,
-                    AcquireFailure failure, RailMask* excluded,
-                    bool* cross_rail_retry);
+  // Schedules at most one fresh retry. Operations that may commit remotely
+  // are retryable only until their first request is posted. cross_rail_retry
+  // is set only while the failed rail stays excluded and another
+  // topology-enabled rail exists.
+  bool PrepareRetry(
+      int attempt, bool from_pool, std::optional<size_t> attempted_rail,
+      AcquireFailure failure, ReplaySafety replay_safety, bool request_posted,
+      const std::shared_ptr<const rdma::PeerRailSnapshot>& peer,
+      RailMask* excluded, bool* cross_rail_retry);
   void Release(const std::string& node, Lane lane, Conn* c);
   void Destroy(Conn* c,
                rdma::RailCompletion completion =
@@ -265,6 +276,9 @@ class RdmaTransport : public Transport {
   std::atomic<uint64_t> depth_refunds_{0};
   std::unique_ptr<rdma::RdmaTopology> topology_;
   std::vector<std::string> devs_;  // stable discovered ACTIVE rail order
+  std::vector<std::vector<uint8_t>> rail_tiers_;
+  bool peer_topology_required_ = false;
+  std::unique_ptr<rdma::PeerTopologyStore> peer_topologies_;
   bool auto_device_ = true;
   bool numa_aware_ = false;
   // Global least-inflight rail admission with per-rail credits, failure
@@ -283,6 +297,9 @@ class RdmaTransport : public Transport {
   std::atomic<uint64_t> cross_rail_retries_{0};
   std::atomic<uint64_t> cross_rail_retry_successes_{0};
   std::atomic<uint64_t> cross_rail_retry_exhausted_{0};
+  std::atomic<uint64_t> peer_topology_updates_{0};
+  std::atomic<uint64_t> no_compatible_rail_{0};
+  std::atomic<uint64_t> stale_generation_reaps_{0};
   // Deterministic test-only completion-fault targeting. Inert unless
   // DFKV_RDMA_TEST_COMPLETION_FAULT is set.
   std::atomic<uint64_t> test_completion_fault_calls_{0};

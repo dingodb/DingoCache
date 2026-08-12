@@ -71,6 +71,23 @@ struct EndpointPoolOptions {
   uint64_t acquire_timeout_ms = 10000;
 };
 
+// One peer rail advertised by the membership topology. Device names are the
+// shared placement binding between hosts; health is the peer's runtime view.
+struct PeerRailTopology {
+  std::string name;
+  bool healthy = false;
+};
+
+// Complete peer-specific topology update. generation is the canonical
+// membership topology epoch, not a transport-local counter. Transports must
+// treat snapshots as immutable so one logical operation cannot mix epochs.
+struct PeerTopology {
+  std::string peer_addr;
+  uint64_t generation = 0;
+  bool complete = false;
+  std::vector<PeerRailTopology> rails;
+};
+
 
 class Transport {
  public:
@@ -134,6 +151,13 @@ class Transport {
   // Called on every membership adoption; implementations must tolerate
   // repeated and concurrent calls. Default: stateless transports ignore it.
   virtual void OnTopologyHint(size_t nodes) { (void)nodes; }
+
+  // Peer-aware rail topology is independent of the scalar ring-size budget
+  // hint. Stateful transports publish an immutable per-address snapshot;
+  // transports without heterogeneous path selection ignore it.
+  virtual void OnPeerTopology(const PeerTopology& topology) {
+    (void)topology;
+  }
 
   // True if CacheMany/RangeMany pipeline requests on one connection (RDMA). When
   // false (TCP), the client parallelizes batches across items with its own

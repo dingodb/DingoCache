@@ -1627,6 +1627,9 @@ std::string RdmaServer::MetricsText() const {
     CompletionErrors());
   m(s, "dfkv_rdma_active_conns", "gauge",
     "RDMA connections currently serving", ActiveConns());
+  m(s, "dfkv_rdma_rails_initialized", "gauge",
+    "RDMA rails with successfully initialized server anchors",
+    InitializedRailCount());
   m(s, "dfkv_rdma_v2_conns_opened_total", "counter",
     "RDMA v2 connections opened", V2Conns());
   m(s, "dfkv_rdma_v2_put_writes_total", "counter",

@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -199,6 +200,11 @@ class KVClient {
   // (added/removed node ids) vs the previously-adopted view. Shared by both
   // SetMembers overloads so static and MDS-discovery paths log identically.
   void AdoptRing(ConHash ring, std::map<std::string, std::string> addr);
+  // Publish one replace-all topology response. Peers omitted by the response
+  // receive incomplete snapshots at its generation while they are still held
+  // by the ring, so a guard-rejected placement shrink cannot retain stale rails.
+  void PublishPeerTopologies(const std::vector<MemberInfo>& topology,
+                             uint64_t generation);
   // Scalar transport bodies. Public scalar methods add exactly one metric;
   // TCP batch fan-out calls these bodies so it cannot double-count each key.
   bool PutDirect(const std::string& key, const void* value, size_t n);
@@ -231,6 +237,9 @@ class KVClient {
   mutable std::mutex ring_mu_;  // guards ring_ + addr_
   ConHash ring_;
   std::map<std::string, std::string> addr_;  // name -> ip:port
+  // Addresses in the preceding replace-all topology response. Together with
+  // addr_, this finds omitted published or still-ring-held peers.
+  std::set<std::string> published_peer_addrs_;
   std::condition_variable ring_cv_;  // notified when AdoptRing sets a non-empty ring
   std::string key_namespace_;
   uint64_t namespace_hash_ = 0;

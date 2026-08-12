@@ -84,6 +84,11 @@ class RdmaServer {
   // Explicit-mode failures retain the complete requested order; diagnostic
   // probe evidence never replaces this with a partially discovered topology.
   const std::vector<std::string>& DeviceNames() const { return anchor_devs_; }
+  // Fixed topology and successfully materialized anchors. Explicit startup is
+  // fail-closed, so a running server has one initialized anchor per configured
+  // rail; keeping both counts exposes startup/lifecycle truth independently.
+  size_t ConfiguredRailCount() const { return anchor_devs_.size(); }
+  size_t InitializedRailCount() const { return anchors_.size(); }
 
   // Observability (used by tests): number of Serve threads not yet reaped.
   // Bounded under churn now that finished connections are joined as new ones

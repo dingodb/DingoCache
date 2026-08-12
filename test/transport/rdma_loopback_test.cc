@@ -20,6 +20,7 @@
 #include <sys/mman.h>  // shm_unlink (node-dedup test)
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <algorithm>
@@ -542,6 +543,287 @@ TEST(RdmaSafety, OperationExclusionAppliesToPreferredAndFallbackRails) {
       rdma::AcquireWithFallback(policy, 1, 0, {1, 0, 0}, {}, {1, 0, 0}))
       << "admission must not silently bypass an operation-local exclusion";
 }
+
+TEST(RdmaPeerRails, NineRailGpuPeerUsesOnlyPrimaryTier) {
+  const std::vector<std::string> devices{
+      "gpu0", "gpu1", "gpu2", "gpu3", "gpu4",
+      "gpu5", "gpu6", "gpu7", "cpu0"};
+  std::vector<std::vector<uint8_t>> tiers;
+  std::string error;
+  ASSERT_TRUE(rdma::ParseRailTiers(
+      "gpu0|gpu1|gpu2|gpu3|gpu4|gpu5|gpu6|gpu7;cpu0", devices,
+      &tiers, &error))
+      << error;
+  ASSERT_EQ(tiers.size(), 2u);
+  EXPECT_EQ(tiers[0],
+            (std::vector<uint8_t>{1, 1, 1, 1, 1, 1, 1, 1, 0}));
+  EXPECT_EQ(tiers[1],
+            (std::vector<uint8_t>{0, 0, 0, 0, 0, 0, 0, 0, 1}));
+
+  rdma::PeerTopologyStore store(devices, tiers, /*require_complete=*/true);
+  PeerTopology topology{
+      "gpu-peer", 41, true,
+      {{"gpu0", true}, {"gpu1", true}, {"gpu2", true},
+       {"gpu3", true}, {"gpu4", true}, {"gpu5", true},
+       {"gpu6", true}, {"gpu7", true}, {"cpu0", true}}};
+  ASSERT_TRUE(store.Update(topology));
+  const auto snapshot = store.Snapshot("gpu-peer");
+  ASSERT_TRUE(snapshot->complete);
+  EXPECT_EQ(snapshot->generation, 41u);
+  EXPECT_EQ(snapshot->compatible,
+            (std::vector<uint8_t>{1, 1, 1, 1, 1, 1, 1, 1, 0}));
+
+  rdma::RailPolicy policy(9);
+  auto lease = rdma::AcquireHighestTier(
+      policy, 1, 0, snapshot->compatible, snapshot->compatible, {});
+  ASSERT_TRUE(lease);
+  EXPECT_LT(lease->rail, 8u);
+  policy.Complete(*lease, 1, rdma::RailCompletion::kSuccess, 101);
+  EXPECT_EQ(policy.Snapshot(101)[8].selections, 0u);
+}
+
+TEST(RdmaPeerRails, CpuPeerUsesItsFirstSharedRailWithoutRejection) {
+  const std::vector<std::string> devices{
+      "gpu0", "gpu1", "gpu2", "gpu3", "gpu4",
+      "gpu5", "gpu6", "gpu7", "cpu0"};
+  std::vector<std::vector<uint8_t>> tiers;
+  ASSERT_TRUE(rdma::ParseRailTiers(
+      "gpu0|gpu1|gpu2|gpu3|gpu4|gpu5|gpu6|gpu7;cpu0", devices,
+      &tiers, nullptr));
+  rdma::PeerTopologyStore store(devices, tiers, /*require_complete=*/true);
+  ASSERT_TRUE(store.Update(
+      PeerTopology{"cpu-peer", 7, true, {{"cpu0", true}}}));
+  const auto snapshot = store.Snapshot("cpu-peer");
+  ASSERT_EQ(snapshot->compatible,
+            (std::vector<uint8_t>{0, 0, 0, 0, 0, 0, 0, 0, 1}));
+
+  rdma::RailPolicy policy(9);
+  auto lease = rdma::AcquireHighestTier(
+      policy, 1, 0, snapshot->compatible,
+      /*preferred=*/{1, 0, 0, 0, 0, 0, 0, 0, 0},
+      /*fallback=*/{1, 1, 1, 1, 1, 1, 1, 1, 1});
+  ASSERT_TRUE(lease);
+  EXPECT_EQ(lease->rail, 8u);
+  policy.Complete(*lease, 1, rdma::RailCompletion::kSuccess, 101);
+  const auto stats = policy.Snapshot(101);
+  EXPECT_EQ(stats[8].selections, 1u);
+  EXPECT_EQ(stats[8].errors, 0u);
+  EXPECT_EQ(stats[8].endpoint_errors, 0u);
+}
+
+TEST(RdmaPeerRails, PrimaryFailureUses200GFallbackAndRecoveryIsStable) {
+  const std::vector<std::string> devices{"gpu400_0", "gpu400_1", "ib200"};
+  std::vector<std::vector<uint8_t>> tiers;
+  ASSERT_TRUE(rdma::ParseRailTiers("gpu400_0|gpu400_1;ib200", devices, &tiers,
+                                   nullptr));
+  rdma::PeerTopologyStore store(devices, tiers, /*require_complete=*/true);
+
+  ASSERT_TRUE(store.Update(PeerTopology{
+      "peer", 10, true,
+      {{"ib200", true}, {"gpu400_1", true}, {"gpu400_0", false}}}));
+  const auto partial = store.Snapshot("peer");
+  EXPECT_EQ(partial->compatible, (std::vector<uint8_t>{0, 1, 0}));
+
+  ASSERT_TRUE(store.Update(PeerTopology{
+      "peer", 11, true,
+      {{"gpu400_0", false}, {"gpu400_1", false}, {"ib200", true}}}));
+  const auto fallback = store.Snapshot("peer");
+  EXPECT_EQ(fallback->compatible, (std::vector<uint8_t>{0, 0, 1}));
+  EXPECT_EQ(partial->compatible, (std::vector<uint8_t>{0, 1, 0}))
+      << "published snapshots must remain immutable";
+
+  ASSERT_TRUE(store.Update(PeerTopology{
+      "peer", 12, true,
+      {{"gpu400_0", true}, {"gpu400_1", false}, {"ib200", true}}}));
+  const auto recovered = store.Snapshot("peer");
+  EXPECT_EQ(recovered->compatible, (std::vector<uint8_t>{1, 0, 0}));
+  EXPECT_FALSE(store.Update(PeerTopology{
+      "peer", 12, true,
+      {{"gpu400_0", false}, {"gpu400_1", false}, {"ib200", true}}}))
+      << "duplicate generations must not perturb stable recovery";
+  EXPECT_EQ(store.Snapshot("peer")->compatible,
+            (std::vector<uint8_t>{1, 0, 0}));
+}
+
+TEST(RdmaPeerRails, NoIntersectionIsPeerNeutralAndLocallyObservable) {
+  const std::vector<std::string> devices{"gpu0", "cpu0"};
+  std::vector<std::vector<uint8_t>> tiers;
+  ASSERT_TRUE(
+      rdma::ParseRailTiers("gpu0;cpu0", devices, &tiers, nullptr));
+  rdma::PeerTopologyStore store(devices, tiers, /*require_complete=*/true);
+  ASSERT_TRUE(store.Update(
+      PeerTopology{"peer", 3, true, {{"remote-only", true}}}));
+  EXPECT_TRUE(store.Snapshot("peer")->compatible.empty());
+  EXPECT_STREQ(StatusName(Status::kNoCompatibleRail), "NoCompatibleRail");
+
+  rdma::RailPolicy policy(2, rdma::RailPolicyConfig{
+                                 /*credits_per_rail=*/1,
+                                 /*error_threshold=*/1,
+                                 /*quarantine_us=*/1000,
+                                 /*latency_weight=*/1,
+                                 /*error_penalty_us=*/100});
+  const auto stats = policy.Snapshot(100);
+  ASSERT_EQ(stats.size(), 2u);
+  for (const auto& rail : stats) {
+    EXPECT_EQ(rail.selections, 0u);
+    EXPECT_EQ(rail.errors, 0u);
+    EXPECT_EQ(rail.endpoint_errors, 0u);
+    EXPECT_EQ(rail.quarantines, 0u);
+    EXPECT_FALSE(rail.quarantined);
+  }
+}
+
+TEST(RdmaPeerRails, OperationGenerationFencesOlderSnapshots) {
+  const std::vector<std::string> devices{"gpu0", "cpu0"};
+  std::vector<std::vector<uint8_t>> tiers;
+  ASSERT_TRUE(
+      rdma::ParseRailTiers("gpu0;cpu0", devices, &tiers, nullptr));
+  rdma::PeerTopologyStore store(devices, tiers, /*require_complete=*/true);
+  ASSERT_TRUE(store.Update(
+      PeerTopology{"peer", 100, true, {{"gpu0", true}}}));
+  const auto operation = store.Snapshot("peer");
+  ASSERT_EQ(operation->generation, 100u);
+
+  ASSERT_TRUE(store.Update(
+      PeerTopology{"peer", 101, true, {{"cpu0", true}}}));
+  EXPECT_FALSE(store.IsCurrent("peer", operation->generation));
+  EXPECT_EQ(operation->generation, 100u);
+  EXPECT_EQ(operation->compatible, (std::vector<uint8_t>{1, 0}));
+  const auto current = store.Snapshot("peer");
+  EXPECT_EQ(current->generation, 101u);
+  EXPECT_EQ(current->compatible, (std::vector<uint8_t>{0, 1}));
+}
+
+TEST(RdmaPeerRails, PrimaryCreditPressureNeverOverflowsToLowerTier) {
+  const std::vector<std::vector<uint8_t>> tiers{{1, 0}, {0, 1}};
+  const auto compatible =
+      rdma::HighestCompatibleTier(tiers, /*peer_healthy=*/{1, 1});
+  ASSERT_EQ(compatible, (std::vector<uint8_t>{1, 0}));
+  rdma::RailPolicy policy(
+      2, rdma::RailPolicyConfig{/*credits_per_rail=*/1,
+                                /*error_threshold=*/3,
+                                /*quarantine_us=*/1000,
+                                /*latency_weight=*/1,
+                                /*error_penalty_us=*/100});
+
+  auto primary = rdma::AcquireHighestTier(
+      policy, 1, 0, compatible, /*preferred=*/{1, 0},
+      /*fallback=*/{0, 1});
+  ASSERT_TRUE(primary);
+  ASSERT_EQ(primary->rail, 0u);
+  EXPECT_FALSE(rdma::AcquireHighestTier(
+      policy, 1, 0, compatible, /*preferred=*/{1, 0},
+      /*fallback=*/{0, 1}))
+      << "healthy Tier-0 pressure must wait or time out, never use Tier-1";
+  const auto pressured = policy.Snapshot(101);
+  EXPECT_GT(pressured[0].credits_exhausted, 0u);
+  EXPECT_EQ(pressured[1].selections, 0u);
+  policy.Complete(*primary, 1, rdma::RailCompletion::kSuccess, 102);
+}
+
+TEST(RdmaPeerRails, MixedVersionPolicyFailsClosedOnlyForExplicitTiers) {
+  const std::vector<std::string> devices{"gpu0", "cpu0"};
+  std::vector<std::vector<uint8_t>> explicit_tiers;
+  ASSERT_TRUE(rdma::ParseRailTiers("gpu0;cpu0", devices, &explicit_tiers,
+                                   nullptr));
+  rdma::PeerTopologyStore strict_store(
+      devices, explicit_tiers, /*require_complete=*/true);
+  EXPECT_FALSE(strict_store.Snapshot("legacy-peer")->complete);
+  EXPECT_TRUE(strict_store.Snapshot("legacy-peer")->compatible.empty());
+  ASSERT_TRUE(strict_store.Update(
+      PeerTopology{"legacy-peer", 1, false, {}}));
+  EXPECT_TRUE(strict_store.Snapshot("legacy-peer")->compatible.empty());
+
+  std::vector<std::vector<uint8_t>> homogeneous;
+  ASSERT_TRUE(rdma::ParseRailTiers("", devices, &homogeneous, nullptr));
+  rdma::PeerTopologyStore legacy_store(
+      devices, homogeneous, /*require_complete=*/false);
+  EXPECT_TRUE(legacy_store.Snapshot("legacy-peer")->complete);
+  EXPECT_EQ(legacy_store.Snapshot("legacy-peer")->compatible,
+            (std::vector<uint8_t>{1, 1}));
+  ASSERT_TRUE(legacy_store.Update(
+      PeerTopology{"legacy-peer", 1, false, {}}));
+  EXPECT_EQ(legacy_store.Snapshot("legacy-peer")->compatible,
+            (std::vector<uint8_t>{1, 1}));
+
+  std::string error;
+  EXPECT_FALSE(rdma::ParseRailTiers("gpu0;missing", devices, &homogeneous,
+                                    &error));
+  EXPECT_FALSE(error.empty());
+}
+
+TEST(RdmaPeerRails, ConcurrentPublicationAcquisitionAndSnapshotTeardown) {
+  const std::vector<std::string> devices{"gpu0", "gpu1", "cpu0"};
+  std::vector<std::vector<uint8_t>> tiers;
+  ASSERT_TRUE(rdma::ParseRailTiers("gpu0|gpu1;cpu0", devices, &tiers,
+                                   nullptr));
+  auto store = std::make_unique<rdma::PeerTopologyStore>(
+      devices, tiers, /*require_complete=*/true);
+  ASSERT_TRUE(store->Update(PeerTopology{
+      "peer", 2, true,
+      {{"gpu0", true}, {"gpu1", false}, {"cpu0", true}}}));
+  rdma::RailPolicy policy(3);
+
+  std::atomic<bool> start{false};
+  std::atomic<uint64_t> violations{0};
+  std::vector<std::thread> threads;
+  for (uint64_t writer = 0; writer < 2; ++writer) {
+    threads.emplace_back([&, writer] {
+      while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+      for (uint64_t i = 0; i < 1000; ++i) {
+        const uint64_t generation = 10 + writer * 1000 + i;
+        const bool even = generation % 2 == 0;
+        store->Update(PeerTopology{
+            "peer", generation, true,
+            {{"gpu0", even}, {"gpu1", !even}, {"cpu0", true}}});
+      }
+    });
+  }
+  for (size_t reader = 0; reader < 4; ++reader) {
+    threads.emplace_back([&] {
+      while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+      for (size_t i = 0; i < 2000; ++i) {
+        const auto snapshot = store->Snapshot("peer");
+        const bool even = snapshot->generation % 2 == 0;
+        const std::vector<uint8_t> expected =
+            even ? std::vector<uint8_t>{1, 0, 0}
+                 : std::vector<uint8_t>{0, 1, 0};
+        auto lease =
+            policy.TryAcquire(1, snapshot->generation, snapshot->compatible);
+        if (!snapshot->complete || snapshot->compatible != expected || !lease ||
+            lease->rail >= snapshot->compatible.size() ||
+            snapshot->compatible[lease->rail] == 0) {
+          violations.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (lease) {
+          policy.Complete(*lease, 1, rdma::RailCompletion::kSuccess,
+                          snapshot->generation);
+        }
+      }
+    });
+  }
+  start.store(true, std::memory_order_release);
+  for (auto& thread : threads) thread.join();
+  EXPECT_EQ(violations.load(std::memory_order_relaxed), 0u);
+  for (const auto& rail : policy.Snapshot(3000))
+    EXPECT_EQ(rail.inflight, 0u);
+
+  const auto retained = store->Snapshot("peer");
+  std::atomic<bool> inspect{false};
+  std::thread reader([retained, &inspect, &violations] {
+    while (!inspect.load(std::memory_order_acquire))
+      std::this_thread::yield();
+    for (size_t i = 0; i < 10000; ++i) {
+      if (!retained->complete || retained->compatible.empty())
+        violations.fetch_add(1, std::memory_order_relaxed);
+    }
+  });
+  inspect.store(true, std::memory_order_release);
+  store.reset();
+  reader.join();
+  EXPECT_EQ(violations.load(std::memory_order_relaxed), 0u);
+}
+
 TEST(RdmaSafety, QuarantinedRailAllowsOneProbeAndRecoversOnlyOnSuccess) {
 
   rdma::RailPolicyConfig config;
@@ -2508,6 +2790,158 @@ TEST(RdmaLoopback, DefaultDeclarationKeepsGlobalCap) {
   std::string got(v.size(), '\0');
   ASSERT_TRUE(c.Get("full-size", got.data(), got.size()));
   EXPECT_EQ(got, v);
+}
+
+TEST(RdmaLoopback,
+     PooledPostSubmitFailureDoesNotReplayPutAndGetRemainsReplaySafe) {
+  ScopedEnv configured_device("DFKV_RDMA_DEV", nullptr);
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv ambient_completion_fault("DFKV_RDMA_TEST_COMPLETION_FAULT",
+                                     nullptr);
+  ScopedEnv ambient_local_failure(
+      "DFKV_RDMA_TEST_LOCAL_RAIL_FAILURE_ATTEMPTS", nullptr);
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaNode node("pooled-post-submit");
+  const std::string value("pooled\0put-value", 16);
+
+  const auto expect_single_pooled_put_attempt =
+      [](const std::string& before, const std::string& after,
+         long expected_posts) {
+        EXPECT_EQ(CounterVal(after, "dfkv_rdma_endpoint_cache_hits_total") -
+                      CounterVal(before,
+                                 "dfkv_rdma_endpoint_cache_hits_total"),
+                  1);
+        EXPECT_EQ(CounterVal(after, "dfkv_rdma_endpoint_cache_misses_total") -
+                      CounterVal(before,
+                                 "dfkv_rdma_endpoint_cache_misses_total"),
+                  0);
+        EXPECT_EQ(
+            CounterVal(after, "dfkv_rdma_client_v2_put_writes_total") -
+                CounterVal(before, "dfkv_rdma_client_v2_put_writes_total"),
+            expected_posts);
+        EXPECT_EQ(
+            CounterVal(after,
+                       "dfkv_rdma_client_stale_pool_retries_total") -
+                CounterVal(before,
+                           "dfkv_rdma_client_stale_pool_retries_total"),
+            0);
+        EXPECT_EQ(
+            CounterVal(after,
+                       "dfkv_rdma_client_cross_rail_retries_total") -
+                CounterVal(before,
+                           "dfkv_rdma_client_cross_rail_retries_total"),
+            0);
+      };
+
+  {
+    RdmaTransport transport(kMaxMsg);
+    const BlockKey warm_key =
+        ToBlockKey(SelfHdr(), "pooled-scalar-warm");
+    const BlockKey failed_key =
+        ToBlockKey(SelfHdr(), "pooled-scalar-failed");
+    ASSERT_EQ(transport.Cache(node.addr, warm_key, value.data(), value.size()),
+              Status::kOk);
+    const std::string before = transport.MetricsText();
+    {
+      ScopedEnv fault("DFKV_RDMA_TEST_COMPLETION_FAULT", "1:1:1");
+      EXPECT_EQ(
+          transport.Cache(node.addr, failed_key, value.data(), value.size()),
+          Status::kIOError);
+    }
+    const std::string after = transport.MetricsText();
+    expect_single_pooled_put_attempt(before, after, 1);
+    EXPECT_EQ(node.CacheDirectCalls(failed_key), 1u);
+  }
+
+  {
+    RdmaTransport transport(kMaxMsg);
+    const BlockKey warm_key =
+        ToBlockKey(SelfHdr(), "pooled-batch-warm");
+    const std::vector<BlockKey> failed_keys{
+        ToBlockKey(SelfHdr(), "pooled-batch-failed-0"),
+        ToBlockKey(SelfHdr(), "pooled-batch-failed-1"),
+    };
+    ASSERT_EQ(transport.CacheFrom(
+                  node.addr, {{warm_key, value.data(), value.size()}}),
+              std::vector<Status>({Status::kOk}));
+    const std::vector<CacheSrc> sources{
+        {failed_keys[0], value.data(), value.size()},
+        {failed_keys[1], value.data(), value.size()},
+    };
+    const std::string before = transport.MetricsText();
+    {
+      ScopedEnv fault("DFKV_RDMA_TEST_COMPLETION_FAULT", "1:1:1");
+      EXPECT_EQ(transport.CacheFrom(node.addr, sources),
+                std::vector<Status>(sources.size(), Status::kIOError));
+    }
+    const std::string after = transport.MetricsText();
+    expect_single_pooled_put_attempt(before, after, sources.size());
+    for (const BlockKey& key : failed_keys) {
+      EXPECT_EQ(node.CacheDirectCalls(key), 1u);
+    }
+  }
+
+  {
+    RdmaTransport transport(kMaxMsg);
+    const BlockKey warm_key =
+        ToBlockKey(SelfHdr(), "pooled-sg-warm");
+    const BlockKey failed_key =
+        ToBlockKey(SelfHdr(), "pooled-sg-failed");
+    const std::array<std::string, 2> segments{
+        std::string("first\0segment", 13),
+        std::string("second\0segment", 14),
+    };
+    CacheSrcMulti warm;
+    warm.key = warm_key;
+    warm.payloads = {{value.data(), value.size()}};
+    ASSERT_EQ(transport.CacheFromMulti(node.addr, {warm}),
+              std::vector<Status>({Status::kOk}));
+    CacheSrcMulti source;
+    source.key = failed_key;
+    source.payloads = {
+        {segments[0].data(), segments[0].size()},
+        {segments[1].data(), segments[1].size()},
+    };
+    const std::string before = transport.MetricsText();
+    {
+      ScopedEnv fault("DFKV_RDMA_TEST_COMPLETION_FAULT", "1:1:1");
+      EXPECT_EQ(transport.CacheFromMulti(node.addr, {source}),
+                std::vector<Status>({Status::kIOError}));
+    }
+    const std::string after = transport.MetricsText();
+    expect_single_pooled_put_attempt(before, after, 1);
+    EXPECT_EQ(node.CacheDirectCalls(failed_key), 1u);
+  }
+
+  {
+    RdmaTransport transport(kMaxMsg);
+    const BlockKey key = ToBlockKey(SelfHdr(), "pooled-get-retry");
+    ASSERT_EQ(transport.Cache(node.addr, key, value.data(), value.size()),
+              Status::kOk);
+    const std::string before = transport.MetricsText();
+    std::string output;
+    {
+      ScopedEnv fault("DFKV_RDMA_TEST_COMPLETION_FAULT", "1:1:1");
+      EXPECT_EQ(transport.Range(node.addr, key, 0, value.size(), &output,
+                                nullptr),
+                Status::kOk);
+    }
+    EXPECT_EQ(output, value);
+    const std::string after = transport.MetricsText();
+    EXPECT_EQ(CounterVal(after, "dfkv_rdma_endpoint_cache_hits_total") -
+                  CounterVal(before, "dfkv_rdma_endpoint_cache_hits_total"),
+              1);
+    EXPECT_EQ(CounterVal(after, "dfkv_rdma_endpoint_cache_misses_total") -
+                  CounterVal(before,
+                             "dfkv_rdma_endpoint_cache_misses_total"),
+              1);
+    EXPECT_EQ(
+        CounterVal(after, "dfkv_rdma_client_v2_get_writes_total") -
+            CounterVal(before, "dfkv_rdma_client_v2_get_writes_total"),
+        2);
+    EXPECT_EQ(node.RangeDirectCalls(key), 2u);
+  }
 }
 
 TEST(RdmaLoopback, ClientLocalRailFailureRetriesFreshPutAndGet) {
