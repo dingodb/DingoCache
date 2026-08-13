@@ -550,7 +550,8 @@ class LogicalChunkTransferTest(unittest.TestCase):
             [_Database()],
             block_size=64,
             tp_rank=0,
-            put_step=1,
+            stripe_idx=0,
+            stripe_step=1,
             kv_role="kv_both",
             ready_event=threading.Event(),
         )
@@ -628,7 +629,8 @@ class LogicalChunkTransferTest(unittest.TestCase):
             [_Database()],
             block_size=64,
             tp_rank=0,
-            put_step=1,
+            stripe_idx=0,
+            stripe_step=1,
             kv_role="kv_both",
             ready_event=threading.Event(),
         )

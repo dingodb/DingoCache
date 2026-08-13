@@ -50,7 +50,8 @@ class PreemptFenceTest(unittest.TestCase):
             token_databases=[],
             block_size=16,
             tp_rank=0,
-            put_step=1,
+            stripe_idx=0,
+            stripe_step=1,
             kv_role="kv_producer",
             ready_event=ready,
         )
