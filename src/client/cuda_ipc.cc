@@ -4,9 +4,11 @@
 #include <dlfcn.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <new>
+#include <string>
 #include <vector>
 
 #include "utils/log.h"
@@ -48,6 +50,16 @@ size_t HostPageSize() {
   return page_size;
 }
 
+void NotePublisherDriverFailure(const std::string& detail) {
+  static std::atomic<uint64_t> failures{0};
+  const uint64_t count =
+      failures.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (count == 1 || (count & 0x3ffu) == 0) {
+    DFKV_LOG_WARN("cuda destination publication driver failure: " + detail +
+                  " failures=" + std::to_string(count));
+  }
+}
+
 bool RegisterHostRange(const CudaLib* cuda, PublisherCudaState* state,
                        const void* source, size_t size) {
   const size_t page_size = HostPageSize();
@@ -86,15 +98,19 @@ bool RegisterHostRange(const CudaLib* cuda, PublisherCudaState* state,
 
     const uintptr_t hole_end = next_registered;
     state->registered.push_back({cursor, hole_end});
-    if (cuda->HostRegister(reinterpret_cast<void*>(cursor), hole_end - cursor,
-                           0) != kCudaSuccess) {
+    const CUresult result = cuda->HostRegister(
+        reinterpret_cast<void*>(cursor), hole_end - cursor, 0);
+    if (result != kCudaSuccess) {
       state->registered.pop_back();
+      NotePublisherDriverFailure("cuMemHostRegister result=" +
+                                 std::to_string(result));
       return false;
     }
     cursor = hole_end;
   }
   return true;
 }
+
 }  // namespace
 
 bool CudaLib::Resolve() {
@@ -322,10 +338,14 @@ bool DestinationPublisher::Copy(
 
   bool copy_ok = RegisterHostRange(cuda, state, source, size);
   if (copy_ok) {
-    copy_ok =
+    const CUresult result =
         cuda->MemcpyAsync(reinterpret_cast<CUdeviceptr>(destination),
                           reinterpret_cast<CUdeviceptr>(source), size,
-                          state->stream) == kCudaSuccess;
+                          state->stream);
+    copy_ok = result == kCudaSuccess;
+    if (!copy_ok)
+      NotePublisherDriverFailure("cuMemcpyAsync result=" +
+                                 std::to_string(result));
   }
 
   // A publisher never lends its destination context to its caller, not even
@@ -359,14 +379,26 @@ bool DestinationPublisher::Finish() {
 
   // Even after an enqueue/setup failure, synchronization must precede every
   // unregister because earlier copies can still reference operation staging.
-  if (cuda->StreamSynchronize(state->stream) != kCudaSuccess) failed_ = true;
+  // This synchronization result is the publication barrier: cleanup below
+  // cannot undo successfully synchronized destination bytes.
+  const CUresult sync_result = cuda->StreamSynchronize(state->stream);
+  if (sync_result != kCudaSuccess) {
+    failed_ = true;
+    NotePublisherDriverFailure("cuStreamSynchronize result=" +
+                               std::to_string(sync_result));
+  }
   for (auto it = state->registered.rbegin();
        it != state->registered.rend(); ++it) {
-    if (cuda->HostUnregister(reinterpret_cast<void*>(it->begin)) !=
-        kCudaSuccess)
-      failed_ = true;
+    const CUresult result =
+        cuda->HostUnregister(reinterpret_cast<void*>(it->begin));
+    if (result != kCudaSuccess)
+      NotePublisherDriverFailure("post-sync cuMemHostUnregister result=" +
+                                 std::to_string(result));
   }
-  if (cuda->StreamDestroy(state->stream) != kCudaSuccess) failed_ = true;
+  const CUresult destroy_result = cuda->StreamDestroy(state->stream);
+  if (destroy_result != kCudaSuccess)
+    NotePublisherDriverFailure("post-sync cuStreamDestroy result=" +
+                               std::to_string(destroy_result));
 
   if (state->has_pending_restore) {
     if (!cuda->SetCurrentCtx(state->pending_restore)) failed_ = true;
@@ -375,7 +407,9 @@ bool DestinationPublisher::Finish() {
   }
   if (state->retained_device >= 0 &&
       !cuda->ReleasePrimaryCtx(state->retained_device))
-    failed_ = true;
+    NotePublisherDriverFailure(
+        "post-sync cuDevicePrimaryCtxRelease device=" +
+        std::to_string(state->retained_device));
 
   delete state;
   stream_ = nullptr;
