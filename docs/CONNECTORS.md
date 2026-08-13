@@ -19,7 +19,7 @@
 | 源码 | `integration/hicache/dfkv_hicache.py` | `integration/vllm/`（包 `dfkv_vllm`） | `integration/lmcache/`（包 `dfkv_connector`） |
 | 接口 | `HiCacheStorage`（`batch_set_v1/get_v1`…） | connector API（scheduler + worker 两侧） | `RemoteConnector`（get/put/batched_\*）/ `DfkvL2Adapter` |
 | key 方案 | 页 hash + pool/component/并行坐标 | chunk hash + pool/component/并行坐标，可追加 binary SG 坐标 | chunk hash + pool/component/并行坐标 |
-| 零拷贝 | 两端零拷贝（GET 直落 HiCache 宿主页，**host-host**） | **GPUDirect RDMA**（KV 直读写 GPU 显存，无 host bounce） | host-host 零拷贝（LMCache pinned arena 一次注册 MR） |
+| 零拷贝 | 两端零拷贝（GET 直落 HiCache 宿主页，**host-host**） | PUT 为 **GPUDirect RDMA**；GET 经临时 pinned host retry staging，最终成功后同步发布到 GPU | host-host 零拷贝（LMCache pinned arena 一次注册 MR） |
 | 块大小 | 固定页（page_size token） | 变长 chunk（SG 多层段合并为一 key） | **任意**（含变长不满末块，走 `GetAuto`） |
 | 典型场景 | SGLang PD 生产（GLM-5.1/5.2 MLA） | vLLM 生产直连（DeepSeek-V4-Flash 多池已验证） | vLLM+LMCache 栈；MP-server 路径给多 KV-group 模型 |
 
@@ -571,21 +571,28 @@ journalctl -u dfkv-server | grep 'rdma conn: protocol=v2 declared=' | grep -o 'q
 
 ## 3. vLLM 直连 — DfkvStoreConnector
 
-`DfkvStoreConnector` 是 vLLM `KVConnectorBase_V1` 直连连接器：把 KV cache 经
-**GPUDirect RDMA** 直接读写到 dfkv 集群，**绕开 LMCache**，占据与
-`MooncakeStoreConnector` 相同的 `--kv-transfer-config` 槽位。生产者和消费者读写同一
-共享池，实现跨请求、跨实例、跨重启的前缀复用。
+`DfkvStoreConnector` 是 vLLM `KVConnectorBase_V1` 直连连接器：把 KV cache 接入
+dfkv 集群，**绕开 LMCache**，占据与 `MooncakeStoreConnector` 相同的
+`--kv-transfer-config` 槽位。生产者和消费者读写同一共享池，实现跨请求、跨实例、
+跨重启的前缀复用。
 
-连接器纯 Python（ctypes over `libdfkv.so`），直接对 **GPU 设备指针**做 RDMA：分页 KV cache
+连接器纯 Python（ctypes over `libdfkv.so`），接收 **GPU 设备指针**。分页 KV cache
 经 `dfkv_register_memory` 一次注册（nvidia-peermem 下 `ibv_reg_mr` 产出 GPUDirect MR），
 只有返回 `0` 才继续；注册失败会抛出启动错误，不会带着未注册指针进入流量。
+PUT 保持从 GPU MR 发起的 GPUDirect RDMA。v2.19 的 GET 则由 native range API
+显式标记 CUDA destination：RDMA 先写入该次操作拥有的 pinned host staging，只有
+最终健康 rail attempt 成功后才用 pinned async H2D copy 发布到 GPU，并同步 CUDA
+stream 后返回成功。失败 attempt 不会提前发布；连续 range、mixed host/CUDA SG 和
+rail retry 使用同一 fence。
+
 每 chunk 的多层段经 **scatter-gather 批量 API** 合并成一个 dfkv key
-（一次多-SGE RDMA / chunk，而非每层段一次），key/磁盘读数 ~20×↓。
+（一次多-SGE 操作 / chunk，而非每层段一次），key/磁盘读数 ~20×↓。
 
 `DfkvStoreConnector` **只支持 RDMA**：每个 vLLM engine 进程都必须设置
 `DFKV_RDMA=1`。`dfkv_open_v2` 后连接器会在启动 poller、热配置和任何流量前
 校验 native handle 报告的 transport；非 `rdma` handle 会立即关闭并报错。
-GPU 设备指针路径没有 TCP 或 host-bounce fallback。
+GPU PUT 没有 TCP fallback；CUDA GET 的 host staging 是 RDMA retry/publication
+机制，不是 TCP fallback。
 
 ### 3.0 角色与前置条件
 
@@ -659,10 +666,10 @@ extra-config 键。namespace 始终绑定该 model identity 与 `vllm/raw-v1`；
 |---|---|---|
 | engine 参数 | `--prefix-caching-hash-algo sha256` | object key 必须是内容定义 hash；`builtin` 被连接器拒绝 |
 | engine 环境 | `PYTHONHASHSEED=0`（所有共享实例同值） | 稳定首块 parent hash；缺失会在每次进程重启后全量 cold miss |
-| engine 环境 | `DFKV_RDMA=1`、`DFKV_RDMA_DEV=<本机 ACTIVE HCA 列表>` | 强制 GPUDirect RDMA；网卡名必须按节点实际拓扑配置 |
-| engine 环境 | `DFKV_RDMA_DEPTH=1` | device-direct SG 每条 QP 仅允许一个在途 CUDA range；吞吐靠连接 fanout，不靠同 QP depth |
+| engine 环境 | `DFKV_RDMA=1`、`DFKV_RDMA_DEV=<本机 ACTIVE HCA 列表>` | 强制 RDMA；PUT 使用 GPUDirect，GET 使用 host retry staging；网卡名必须按节点实际拓扑配置 |
+| engine 环境 | `DFKV_RDMA_DEPTH=1` | 每条 QP 限制一个在途 range；吞吐靠连接 fanout，不靠同 QP depth |
 | engine 环境 | `DFKV_RDMA_NUMA=1` | 每条连接选择 NUMA-local rail 和内存，避免跨 socket 路径 |
-| 容器资源 | Docker/nerdctl `--ulimit memlock=-1:-1`；Kubernetes `ulimits` 等价配置；systemd `LimitMEMLOCK=infinity` | 允许完整 GPU/host pool 注册 MR；8 MiB 默认值会触发 `ibv_reg_mr` 失败和临时注册退化 |
+| 容器资源 | Docker/nerdctl `--ulimit memlock=-1:-1`；Kubernetes `ulimits` 等价配置；systemd `LimitMEMLOCK=infinity` | 允许 GPU MR 及 CUDA GET 临时 pinned host staging；按并发 GET payload 验证 pinned-memory 与 memlock 容量，8 MiB 默认值可能触发 `ibv_reg_mr` 失败或临时注册退化 |
 | 宿主机 | `nvidia-peermem` 已加载 | GPUDirect MR 注册前提 |
 
 nerdctl/Docker 参考（参数必须出现在**创建容器**时，容器启动后再执行
@@ -713,7 +720,7 @@ namespace/key 不一致是预期 cold miss。**空环 / MDS 不可达**可直接
 
 | env | 默认 | 推荐 | 说明 |
 |---|---|---|---|
-| `DFKV_RDMA` / `DFKV_RDMA_DEV` | **无；`DFKV_RDMA=1` 必填** | `1` / 全轨列表 | vLLM 设备指针连接器仅支持 GPUDirect RDMA；unset/TCP 在构造期关闭并拒绝，无 fallback。见 §1.2 |
+| `DFKV_RDMA` / `DFKV_RDMA_DEV` | **无；`DFKV_RDMA=1` 必填** | `1` / 全轨列表 | vLLM GPU 指针连接器仅支持 RDMA；PUT 为 GPUDirect，GET 为 pinned host retry staging + 同步 H2D publication；unset/TCP 在构造期关闭并拒绝，无 fallback。见 §1.2 |
 | `DFKV_RDMA_DEPTH` | `4` | 保持 4 | depth-flat（§1.2） |
 | `DFKV_RDMA_NUMA` | `0` | 多 NUMA 大机 `1` | §1.2 |
 | `DFKV_LIB` / `DFKV_BUILD` | — | so 路径 | 被 extra_config `lib` 覆盖 |
@@ -814,6 +821,11 @@ daemon 线程或进程终止；过载和退出期间都不会静默留下永久�
   RDMA `ExistMany` 复用 GET fanout 分片，并并行 shared-memory rendezvous
   probe。完整 warm API 为 2.02 s；剩余主耗时在 GPU load/engine barrier。
 
+
+v2.19 CUDA GET 的正确性 fence 增加了每次操作的临时 pinned host staging、H2D copy、
+CUDA stream 同步及相关分配/注册成本；其内存峰值随并发 GET payload 增长。这是安全
+direct-GPU retry fencing 落地前的已知性能取舍，不应按旧版 direct-GPU GET 数据外推。
+
 ### 3.7 已知问题 / 排查
 
 | 现象 | 原因 / 解 |
@@ -822,6 +834,7 @@ daemon 线程或进程终止；过载和退出期间都不会静默留下永久�
 | 命中后输出/shape 错误 | 同一 namespace+key 被不同 dtype/page/shape/layout 复用；这是 type-safety violation。停写，bump source-controlled raw-layout ID 并同时发布所有 writer/reader |
 | 每个 RDMA `put` 失败 `rc=-1` | `members` 指了 `--port` 而非 `--rdma-port` |
 | `ibv_reg_mr` 失败 / 无 GPUDirect | GPU 节点没加载 `nvidia-peermem` |
+| CUDA GET pinned allocation / MR 注册失败或吞吐下降 | v2.19 GET 需要按并发 payload 分配临时 pinned host staging，并执行 H2D copy + stream 同步；检查容器/systemd memlock 与宿主机 pinned-memory 容量，压测实际并发和块大小 |
 | 首 token 偶发慢 ~2s | 每 DP rank 一次性 Triton JIT（非 bug）；预热可消 |
 | 异构 HCA 的 SG 宽度不同 | binary SG 坐标把宽度纳入 key；不同宽度互相 cold miss。要共享就统一有效宽度 |
 
