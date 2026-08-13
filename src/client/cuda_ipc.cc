@@ -374,9 +374,17 @@ bool PublishThroughBounce(const CudaLib* cuda, PublisherCudaState* state,
         reinterpret_cast<CUdeviceptr>(destination) + copied,
         reinterpret_cast<CUdeviceptr>(lease.data), chunk, state->stream);
     if (copy_result != kCudaSuccess) {
-      pool.Release(lease.index, true);
+      // A failed enqueue does not prove that the driver rejected the transfer
+      // before taking ownership of the pinned source. Fence the stream before
+      // making the lease reusable; if the fence itself fails, keep the backing
+      // permanently quarantined because DMA completion is unknowable.
+      const CUresult recovery_sync_result =
+          cuda->StreamSynchronize(state->stream);
+      pool.Release(lease.index, recovery_sync_result == kCudaSuccess);
       NotePublisherDriverFailure(
           "cuMemcpyAsync result=" + std::to_string(copy_result) +
+          " recovery_sync_result=" +
+          std::to_string(recovery_sync_result) +
           " copy=" + std::to_string(state->copy_count) +
           " chunk=" + std::to_string(chunk_index) +
           " bytes=" + std::to_string(chunk));
