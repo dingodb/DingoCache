@@ -450,6 +450,104 @@ const CudaLib* ActiveCudaForTest() {
   return cuda;
 }
 
+using MemcpyAsyncFn =
+    CUresult (*)(CUdeviceptr, CUdeviceptr, size_t, CUstream);
+using StreamSynchronizeFn = CUresult (*)(CUstream);
+
+MemcpyAsyncFn cuda_memcpy_async_real = nullptr;
+StreamSynchronizeFn cuda_stream_synchronize_real = nullptr;
+std::atomic<bool> fail_next_cuda_memcpy_async{false};
+std::atomic<bool> fail_next_cuda_stream_synchronize{false};
+std::atomic<uint64_t> injected_cuda_memcpy_async_calls{0};
+std::atomic<uint64_t> injected_cuda_stream_synchronize_calls{0};
+std::atomic<CUdeviceptr> last_cuda_memcpy_async_source{0};
+
+CUresult InjectCudaMemcpyAsync(CUdeviceptr destination, CUdeviceptr source,
+                               size_t size, CUstream stream) {
+  last_cuda_memcpy_async_source.store(source, std::memory_order_relaxed);
+  injected_cuda_memcpy_async_calls.fetch_add(1, std::memory_order_relaxed);
+  if (fail_next_cuda_memcpy_async.exchange(false,
+                                           std::memory_order_relaxed)) {
+    return 999;
+  }
+  return cuda_memcpy_async_real(destination, source, size, stream);
+}
+
+CUresult InjectCudaStreamSynchronize(CUstream stream) {
+  injected_cuda_stream_synchronize_calls.fetch_add(
+      1, std::memory_order_relaxed);
+  if (fail_next_cuda_stream_synchronize.exchange(
+          false, std::memory_order_relaxed)) {
+    return 999;
+  }
+  return cuda_stream_synchronize_real(stream);
+}
+
+class ScopedCudaAsyncFault {
+ public:
+  explicit ScopedCudaAsyncFault(const CudaLib* cuda)
+      : cuda_(const_cast<CudaLib*>(cuda)),
+        memcpy_async_(cuda_->MemcpyAsync),
+        stream_synchronize_(cuda_->StreamSynchronize) {
+    cuda_memcpy_async_real = memcpy_async_;
+    cuda_stream_synchronize_real = stream_synchronize_;
+    fail_next_cuda_memcpy_async.store(false, std::memory_order_relaxed);
+    fail_next_cuda_stream_synchronize.store(false,
+                                            std::memory_order_relaxed);
+    injected_cuda_memcpy_async_calls.store(0, std::memory_order_relaxed);
+    injected_cuda_stream_synchronize_calls.store(0,
+                                                  std::memory_order_relaxed);
+    last_cuda_memcpy_async_source.store(0, std::memory_order_relaxed);
+    cuda_->MemcpyAsync = InjectCudaMemcpyAsync;
+    cuda_->StreamSynchronize = InjectCudaStreamSynchronize;
+  }
+
+  ~ScopedCudaAsyncFault() {
+    cuda_->MemcpyAsync = memcpy_async_;
+    cuda_->StreamSynchronize = stream_synchronize_;
+    fail_next_cuda_memcpy_async.store(false, std::memory_order_relaxed);
+    fail_next_cuda_stream_synchronize.store(false,
+                                            std::memory_order_relaxed);
+    cuda_memcpy_async_real = nullptr;
+    cuda_stream_synchronize_real = nullptr;
+  }
+
+  void FailNextEnqueueAndSynchronize() {
+    fail_next_cuda_memcpy_async.store(true, std::memory_order_relaxed);
+    fail_next_cuda_stream_synchronize.store(true,
+                                            std::memory_order_relaxed);
+  }
+
+  uint64_t memcpy_async_calls() const {
+    return injected_cuda_memcpy_async_calls.load(std::memory_order_relaxed);
+  }
+
+  uint64_t stream_synchronize_calls() const {
+    return injected_cuda_stream_synchronize_calls.load(
+        std::memory_order_relaxed);
+  }
+
+  CUdeviceptr last_source() const {
+    return last_cuda_memcpy_async_source.load(std::memory_order_relaxed);
+  }
+
+ private:
+  CudaLib* cuda_;
+  MemcpyAsyncFn memcpy_async_;
+  StreamSynchronizeFn stream_synchronize_;
+};
+
+class ScopedCudaContextRestore {
+ public:
+  ScopedCudaContextRestore(const CudaLib* cuda, CUcontext context)
+      : cuda_(cuda), context_(context) {}
+  ~ScopedCudaContextRestore() { cuda_->SetCurrentCtx(context_); }
+
+ private:
+  const CudaLib* cuda_;
+  CUcontext context_;
+};
+
 }  // namespace
 
 TEST(RdmaServerStartup, AutoModeKeepsFirstActiveDeviceSemantics) {
@@ -2941,6 +3039,78 @@ TEST(RdmaLoopback, DefaultDeclarationKeepsGlobalCap) {
   std::string got(v.size(), '\0');
   ASSERT_TRUE(c.Get("full-size", got.data(), got.size()));
   EXPECT_EQ(got, v);
+}
+
+TEST(RdmaLoopback,
+     PinnedBouncePoolQuarantinesSlotAfterEnqueueAndRecoverySyncErrors) {
+  const CudaLib* cuda = ActiveCudaForTest();
+  if (!cuda) GTEST_SKIP() << "no usable CUDA device";
+
+  // Leave healthy capacity after the deliberately poisoned lease so the test
+  // can prove both quarantine and forward progress in the process-wide pool.
+  ScopedEnv pool_bytes("DFKV_CUDA_PINNED_POOL_BYTES", "3145728");
+  ScopedEnv slot_bytes("DFKV_CUDA_PINNED_SLOT_BYTES", "1048576");
+  const PinnedBouncePoolStats before = GetPinnedBouncePoolStatsForTest();
+  ASSERT_GT(before.slot_bytes, 0u);
+
+  const std::string value = CudaTestBytes(257, 0x42);
+  CudaGuardedBuffer failed_destination(cuda, value.size());
+  CudaGuardedBuffer healthy_destination(cuda, value.size());
+  ASSERT_TRUE(failed_destination.Allocate());
+  ASSERT_TRUE(healthy_destination.Allocate());
+
+  CUcontext destination_context = nullptr;
+  ASSERT_TRUE(cuda->GetCurrentCtx(&destination_context));
+  ASSERT_NE(destination_context, nullptr);
+  ScopedCudaContextRestore restore_context(cuda, destination_context);
+  ASSERT_TRUE(cuda->SetCurrentCtx(nullptr));
+  CUcontext caller_context = destination_context;
+  ASSERT_TRUE(cuda->GetCurrentCtx(&caller_context));
+  ASSERT_EQ(caller_context, nullptr);
+
+  ScopedCudaAsyncFault fault(cuda);
+  DestinationPublisher failed_publisher;
+  fault.FailNextEnqueueAndSynchronize();
+  EXPECT_FALSE(failed_publisher.Copy(failed_destination.payload(), value.data(),
+                                     value.size(),
+                                     DestinationMemoryKind::kDevice));
+  const CUdeviceptr quarantined_source = fault.last_source();
+  ASSERT_NE(quarantined_source, 0u);
+  EXPECT_EQ(fault.memcpy_async_calls(), 1u);
+  EXPECT_EQ(fault.stream_synchronize_calls(), 1u)
+      << "an enqueue error must fence the stream before releasing the lease";
+
+  CUcontext context_after_failure = nullptr;
+  ASSERT_TRUE(cuda->GetCurrentCtx(&context_after_failure));
+  EXPECT_EQ(context_after_failure, caller_context);
+  EXPECT_EQ(GetPinnedBouncePoolStatsForTest().active_leases, 0u);
+
+  EXPECT_FALSE(failed_publisher.Finish());
+  const uint64_t calls_after_finish = fault.stream_synchronize_calls();
+  EXPECT_FALSE(failed_publisher.Finish());
+  EXPECT_EQ(fault.stream_synchronize_calls(), calls_after_finish)
+      << "Finish must not repeat teardown or lease handling";
+  EXPECT_EQ(GetPinnedBouncePoolStatsForTest().active_leases, 0u);
+
+  DestinationPublisher healthy_publisher;
+  ASSERT_TRUE(healthy_publisher.Copy(healthy_destination.payload(), value.data(),
+                                     value.size(),
+                                     DestinationMemoryKind::kDevice));
+  const CUdeviceptr healthy_source = fault.last_source();
+  EXPECT_NE(healthy_source, quarantined_source)
+      << "the failed recovery fence must permanently quarantine its slot";
+  ASSERT_TRUE(healthy_publisher.Finish());
+  EXPECT_EQ(GetPinnedBouncePoolStatsForTest().active_leases, 0u);
+  CUcontext context_after_finish = destination_context;
+  ASSERT_TRUE(cuda->GetCurrentCtx(&context_after_finish));
+  EXPECT_EQ(context_after_finish, caller_context);
+
+  ASSERT_TRUE(cuda->SetCurrentCtx(destination_context));
+
+  std::string actual;
+  ASSERT_TRUE(healthy_destination.ReadPayload(&actual));
+  EXPECT_EQ(actual, value);
+  EXPECT_TRUE(healthy_destination.GuardsIntact());
 }
 
 TEST(RdmaLoopback,
