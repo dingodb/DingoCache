@@ -32,11 +32,22 @@ inline std::vector<Status> InvalidStatuses(size_t count) {
 }
 
 
+enum class DestinationMemoryKind : uint8_t {
+  kHost,
+  kDevice,
+};
+
+// One read target. The memory kind is explicit because a CUDA device virtual
+// address must never be passed to a CPU memcpy. Host is the compatibility
+// default for existing transports and string-backed callers.
+struct RangeDst {
+  void* payload;
+  size_t n;
+  DestinationMemoryKind memory_kind = DestinationMemoryKind::kHost;
+};
+
 // One write in a batch (data must outlive the CacheMany call).
 struct CacheItem { BlockKey key; const void* data; size_t len; };
-// One zero-copy read target: up to `n` bytes are written into `payload`.
-// The authoritative stored length is returned separately by the read call.
-struct RangeDst { void* payload; size_t n; };
 // One zero-copy write source. The raw value is gathered directly from payload.
 // The buffer must outlive CacheFrom and remain unmodified until it returns.
 struct CacheSrc {
@@ -51,11 +62,44 @@ struct CacheSrcMulti {
   BlockKey key;
   std::vector<std::pair<const void*, size_t>> payloads;
 };
+struct RangeDstSegment {
+  RangeDstSegment(
+      void* payload_in, size_t size_in,
+      DestinationMemoryKind memory_kind_in = DestinationMemoryKind::kHost)
+      : first(payload_in), second(size_in), memory_kind(memory_kind_in) {}
+
+  void* first;
+  size_t second;
+  DestinationMemoryKind memory_kind;
+};
 // Scatter-gather read target: the stored payload (one concatenated blob) is
 // scattered across N caller buffers in order, each receiving its own size worth
-// of bytes (RDMA multi-SGE RECV). The destination capacity = sum of segment sizes.
+// of bytes. The destination capacity is the sum of segment sizes.
 struct RangeDstMulti {
-  std::vector<std::pair<void*, size_t>> payloads;  // (ptr, size) in order
+  std::vector<RangeDstSegment> payloads;
+};
+
+// Publishes operation-owned host staging into caller destinations. Host copies
+// are direct and do not touch CUDA. The first device copy lazily binds its
+// destination primary context and creates one nonblocking stream; Finish waits
+// once for every enqueued device copy before destroying that stream.
+class DestinationPublisher {
+ public:
+  DestinationPublisher() = default;
+  ~DestinationPublisher();
+  DestinationPublisher(const DestinationPublisher&) = delete;
+  DestinationPublisher& operator=(const DestinationPublisher&) = delete;
+
+  bool Copy(void* destination, const void* source, size_t size,
+            DestinationMemoryKind memory_kind);
+  bool Finish();
+
+ private:
+  const void* cuda_ = nullptr;
+  void* stream_ = nullptr;
+  int device_ = -1;
+  bool failed_ = false;
+  bool finished_ = false;
 };
 // Common per-endpoint connection-pool policy. A transport may ignore it when
 // its connection lifecycle is protocol-defined, but pooled transports use the
@@ -237,9 +281,9 @@ class Transport {
     return r;
   }
 
-  // Zero-copy read: up to dsts[i].n raw stored bytes land directly in
-  // dsts[i].payload. value_lens[i] is the authoritative full stored size.
-  // Default: Range + copy; RDMA overrides with direct writes.
+  // Read into caller-provided host or CUDA destinations. value_lens[i] is the
+  // authoritative full stored size. The default uses Range plus final
+  // publication; RDMA overrides while retaining the same publication contract.
   virtual std::vector<Status> RangeInto(
       const std::string& node, const std::vector<BlockKey>& keys,
       const std::vector<RangeDst>& dsts,
@@ -247,16 +291,47 @@ class Transport {
     if (value_lens) value_lens->assign(keys.size(), 0);
     if (dsts.size() != keys.size()) return InvalidStatuses(keys.size());
     std::vector<Status> r(keys.size(), Status::kInvalid);
+    const bool has_device =
+        std::any_of(dsts.begin(), dsts.end(), [](const RangeDst& dst) {
+          return dst.memory_kind == DestinationMemoryKind::kDevice;
+        });
+    if (!has_device) {
+      for (size_t i = 0; i < keys.size(); ++i) {
+        if (!ValidBuffer(dsts[i].payload, dsts[i].n)) continue;
+        std::string raw;
+        uint64_t stored = 0;
+        Status st = Range(node, keys[i], 0, dsts[i].n, &raw, &stored);
+        r[i] = st;
+        if (value_lens) (*value_lens)[i] = stored;
+        if (st != Status::kOk) continue;
+        const size_t n = std::min(raw.size(), dsts[i].n);
+        if (n) std::memcpy(dsts[i].payload, raw.data(), n);
+      }
+      return r;
+    }
+
+    // Device copies are asynchronous until the one Finish below, so every
+    // Range result must remain alive for the entire publication.
+    std::vector<std::string> raw_values(keys.size());
+    DestinationPublisher publisher;
     for (size_t i = 0; i < keys.size(); ++i) {
       if (!ValidBuffer(dsts[i].payload, dsts[i].n)) continue;
-      std::string raw;
       uint64_t stored = 0;
-      Status st = Range(node, keys[i], 0, dsts[i].n, &raw, &stored);
+      Status st =
+          Range(node, keys[i], 0, dsts[i].n, &raw_values[i], &stored);
       r[i] = st;
       if (value_lens) (*value_lens)[i] = stored;
       if (st != Status::kOk) continue;
-      size_t n = std::min(raw.size(), dsts[i].n);
-      if (n) std::memcpy(dsts[i].payload, raw.data(), n);
+      const size_t n = std::min(raw_values[i].size(), dsts[i].n);
+      if (n && !publisher.Copy(dsts[i].payload, raw_values[i].data(), n,
+                               dsts[i].memory_kind))
+        r[i] = Status::kIOError;
+    }
+    if (!publisher.Finish()) {
+      for (size_t i = 0; i < dsts.size(); ++i)
+        if (r[i] == Status::kOk &&
+            dsts[i].memory_kind == DestinationMemoryKind::kDevice)
+          r[i] = Status::kIOError;
     }
     return r;
   }
@@ -314,11 +389,11 @@ class Transport {
   }
 
   // Scatter-gather read: raw stored bytes are split across each key's caller
-  // buffers in order. The default implementation reads once into a contiguous
-  // scratch value and split-copies it, so every transport is correct without
-  // scatter support. RDMA overrides this with a multi-SGE receive directly into
-  // registered destinations. out_lens[i] is the authoritative stored length
-  // (zero on miss), independent of destination capacity.
+  // buffers in order. The default reads once into contiguous operation-owned
+  // scratch and publishes each segment. RDMA uses registered operation-owned
+  // staging so retries and failed completions can never mutate caller memory.
+  // out_lens[i] is the authoritative stored length (zero on miss), independent
+  // of destination capacity.
   virtual std::vector<Status> RangeIntoMulti(
       const std::string& node, const std::vector<BlockKey>& keys,
       const std::vector<RangeDstMulti>& dsts,
@@ -355,6 +430,7 @@ class Transport {
     }
     std::vector<uint64_t> stored;
     const auto valid_result = RangeInto(node, valid_keys, flat, &stored);
+    DestinationPublisher publisher;
     for (size_t valid_i = 0;
          valid_i < indices.size() && valid_i < valid_result.size(); ++valid_i) {
       const size_t i = indices[valid_i];
@@ -369,15 +445,30 @@ class Transport {
         result[i] = Status::kInvalid;
         continue;
       }
+      if (out_lens)
+        (*out_lens)[i] = static_cast<size_t>(stored[valid_i]);
       size_t remaining = static_cast<size_t>(stored[valid_i]);
       size_t off = 0;
       for (const auto& p : dsts[i].payloads) {
         const size_t copy = std::min(p.second, remaining);
-        if (copy) std::memcpy(p.first, scratch[i].data() + off, copy);
+        if (copy &&
+            !publisher.Copy(p.first, scratch[i].data() + off, copy,
+                            p.memory_kind))
+          result[i] = Status::kIOError;
         off += copy;
         remaining -= copy;
       }
-      if (out_lens) (*out_lens)[i] = static_cast<size_t>(stored[valid_i]);
+    }
+    if (!publisher.Finish()) {
+      for (size_t i : indices) {
+        const bool has_device = std::any_of(
+            dsts[i].payloads.begin(), dsts[i].payloads.end(),
+            [](const RangeDstSegment& segment) {
+              return segment.memory_kind == DestinationMemoryKind::kDevice;
+            });
+        if (has_device && result[i] == Status::kOk)
+          result[i] = Status::kIOError;
+      }
     }
     return result;
   }

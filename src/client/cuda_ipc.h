@@ -1,12 +1,12 @@
-/* CudaLib — dlopen'd CUDA *driver* API surface for the GPU rendezvous path.
+/* CudaLib — dlopen'd CUDA driver API for GPU rendezvous and final device
+ * destination publication.
  *
- * libdfkv.so must not link CUDA: SGLang hosts and CPU-only tools load the
- * same library. Everything here resolves from libcuda.so.1 at first use; if
- * the driver (or any required symbol) is absent, Get() returns nullptr and
- * callers run without GPU dedup — the same "nothing here is load-bearing"
- * rule as NodeDedup. The declarations below intentionally mirror cuda.h so
- * no CUDA toolkit is needed at build time; they are ABI, not API (the driver
- * exports them with C linkage and fixed layouts).
+ * libdfkv.so must not link CUDA: SGLang hosts and CPU-only tools load the same
+ * library. Everything here resolves from libcuda.so.1 at first use. Optional
+ * GPU dedup disables itself when unavailable; an explicitly classified device
+ * publication instead returns failure and never reports unpublished bytes.
+ * The declarations intentionally mirror cuda.h so no CUDA toolkit is needed at
+ * build time; they are ABI, not API (driver exports use fixed C layouts).
  */
 #ifndef DFKV_CUDA_IPC_H_
 #define DFKV_CUDA_IPC_H_
@@ -41,14 +41,17 @@ class CudaLib {
   bool IsDevicePtr(const void* p) const;
   // Device ordinal owning device pointer p; -1 on failure.
   int DeviceOf(const void* p) const;
-  // True iff the calling thread has a current CUDA context. Framework compute
-  // threads always do; the connectors' pure-Python transfer threads (ctypes ->
-  // C ABI, never touched CUDA) do NOT — those must BindPrimaryCtx first.
+  // Current-context access used by scoped publication. GetCurrentCtx succeeds
+  // with a null context when the calling thread has no current CUDA context.
+  bool GetCurrentCtx(CUcontext* context) const;
+  bool SetCurrentCtx(CUcontext context) const;
+  // Retain/release are deliberately separate so every scoped retain can be
+  // paired on partial setup failure as well as normal teardown.
+  bool RetainPrimaryCtx(int dev, CUcontext* context) const;
+  bool ReleasePrimaryCtx(int dev) const;
+  // Legacy helper for GPU-dedup callers whose context is process-lived.
   bool HasCurrentCtx() const;
   int CurrentDevice() const;  // -1 without a context
-  // Make device dev's PRIMARY context current on the calling thread (retains
-  // it once per process — the framework already holds it; this only bumps a
-  // refcount, it never creates a fresh context behind the framework's back).
   bool BindPrimaryCtx(int dev) const;
 
   CUresult (*MemAlloc)(CUdeviceptr*, size_t) = nullptr;
@@ -64,6 +67,8 @@ class CudaLib {
   CUresult (*StreamCreate)(CUstream*, unsigned) = nullptr;
   CUresult (*StreamSynchronize)(CUstream) = nullptr;
   CUresult (*StreamDestroy)(CUstream) = nullptr;
+  CUresult (*HostRegister)(void*, size_t, unsigned) = nullptr;
+  CUresult (*HostUnregister)(void*) = nullptr;
   CUresult (*IpcGetMemHandle)(CUipcMemHandle*, CUdeviceptr) = nullptr;
   CUresult (*IpcOpenMemHandle)(CUdeviceptr*, CUipcMemHandle, unsigned) = nullptr;
   CUresult (*IpcCloseMemHandle)(CUdeviceptr) = nullptr;
@@ -76,6 +81,7 @@ class CudaLib {
   CUresult (*ctx_set_current_)(CUcontext) = nullptr;
   CUresult (*ctx_get_device_)(int*) = nullptr;
   CUresult (*primary_ctx_retain_)(CUcontext*, int) = nullptr;
+  CUresult (*primary_ctx_release_)(int) = nullptr;
   CUresult (*pointer_get_attribute_)(void*, int, CUdeviceptr) = nullptr;
 };
 

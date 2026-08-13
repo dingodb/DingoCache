@@ -2629,11 +2629,21 @@ std::vector<Status> RdmaTransport::RangeInto(
       }
     }
     if (conn_ok) {
+      DestinationPublisher publisher;
       for (size_t i = 0; i < count; ++i) {
-        if (result[i] == Status::kOk && attempt_data_lens[i] != 0) {
-          std::memcpy(destinations[i].payload, attempt_outputs[i].data(),
-                      static_cast<size_t>(attempt_data_lens[i]));
-        }
+        if (result[i] == Status::kOk && attempt_data_lens[i] != 0 &&
+            !publisher.Copy(destinations[i].payload,
+                            attempt_outputs[i].data(),
+                            static_cast<size_t>(attempt_data_lens[i]),
+                            destinations[i].memory_kind))
+          result[i] = Status::kIOError;
+      }
+      if (!publisher.Finish()) {
+        for (size_t i = 0; i < count; ++i)
+          if (result[i] == Status::kOk &&
+              destinations[i].memory_kind ==
+                  DestinationMemoryKind::kDevice)
+            result[i] = Status::kIOError;
       }
       if (value_lens) *value_lens = std::move(attempt_value_lens);
       Release(node, Lane::kData, conn);
@@ -3216,6 +3226,7 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
     }
 
     if (conn_ok) {
+      DestinationPublisher publisher;
       for (size_t i = 0; i < count; ++i) {
         if (result[i] != Status::kOk) continue;
         size_t copied = 0;
@@ -3223,10 +3234,26 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
           const size_t remaining = staged_out_lengths[i] - copied;
           const size_t n = std::min(payload.second, remaining);
           if (n != 0) {
-            std::memcpy(payload.first, staged_outputs[i].data() + copied, n);
+            if (!publisher.Copy(payload.first,
+                                staged_outputs[i].data() + copied, n,
+                                payload.memory_kind))
+              result[i] = Status::kIOError;
             copied += n;
           }
           if (copied == staged_out_lengths[i]) break;
+        }
+      }
+      if (!publisher.Finish()) {
+        for (size_t i = 0; i < count; ++i) {
+          const bool has_device = std::any_of(
+              destinations[i].payloads.begin(),
+              destinations[i].payloads.end(),
+              [](const RangeDstSegment& segment) {
+                return segment.memory_kind ==
+                       DestinationMemoryKind::kDevice;
+              });
+          if (has_device && result[i] == Status::kOk)
+            result[i] = Status::kIOError;
         }
       }
       if (out_lengths) *out_lengths = staged_out_lengths;
