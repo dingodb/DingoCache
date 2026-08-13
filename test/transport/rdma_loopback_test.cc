@@ -2534,6 +2534,10 @@ struct RdmaUringNode {
   std::unique_ptr<KvNodeServer> srv;
   std::unique_ptr<RdmaServer> rsrv;
   std::string addr;
+  mutable std::mutex observation_mu;
+  std::map<std::string, size_t> prepare_calls;
+  std::map<std::string, size_t> range_calls;
+
 
   explicit RdmaUringNode(const std::string& tag, size_t max_msg = kMaxMsg) {
     dir = fs::temp_directory_path() / ("dfkv_uring_" + tag);
@@ -2553,6 +2557,10 @@ struct RdmaUringNode {
         [this](const BlockKey& key, uint64_t off, uint64_t len,
                char* io_buf, size_t cap, const char** out_data,
                size_t* out_len, size_t* value_len) {
+          {
+            std::lock_guard<std::mutex> lock(observation_mu);
+            ++range_calls[key.Filename()];
+          }
           return srv->RangeDirectForKey(
               key, off, len, io_buf, cap, out_data, out_len, value_len);
         });
@@ -2563,6 +2571,10 @@ struct RdmaUringNode {
     rsrv->set_prepare_read_handler(
         [this](const BlockKey& key, uint64_t off, uint64_t len,
                char* staging, size_t cap) {
+          {
+            std::lock_guard<std::mutex> lock(observation_mu);
+            ++prepare_calls[key.Filename()];
+          }
           return srv->PrepareReadForKey(key, off, len, staging, cap);
         });
     EXPECT_EQ(rsrv->Start(0), Status::kOk);
@@ -2573,7 +2585,59 @@ struct RdmaUringNode {
     if (srv) srv->Stop();
     fs::remove_all(dir);
   }
+  size_t PrepareCalls(const std::string& logical_key) const {
+    std::lock_guard<std::mutex> lock(observation_mu);
+    const auto found =
+        prepare_calls.find(ToBlockKey(SelfHdr(), logical_key).Filename());
+    return found == prepare_calls.end() ? 0 : found->second;
+  }
+  size_t RangeCalls(const std::string& logical_key) const {
+    std::lock_guard<std::mutex> lock(observation_mu);
+    const auto found =
+        range_calls.find(ToBlockKey(SelfHdr(), logical_key).Filename());
+    return found == range_calls.end() ? 0 : found->second;
+  }
 };
+
+struct MultiWindowGet {
+  explicit MultiWindowGet(size_t targets_per_window, size_t window_count,
+                          size_t seed)
+      : sizes(targets_per_window * (window_count - 1) + 1),
+        destinations(sizes.size()),
+        pointers(sizes.size()) {
+    for (size_t i = 0; i < sizes.size(); ++i) {
+      sizes[i] = 113 + ((seed + i * 17) % 89);
+      destinations[i].assign(sizes[i], '\0');
+      pointers[i] = destinations[i].data();
+    }
+  }
+
+  size_t capacity() const {
+    size_t total = 0;
+    for (size_t size : sizes) total += size;
+    return total;
+  }
+  size_t window_count(size_t targets_per_window) const {
+    return 1 + (sizes.size() - 1) / targets_per_window;
+  }
+  std::string Flatten() const {
+    std::string out;
+    out.reserve(capacity());
+    for (const auto& destination : destinations) out += destination;
+    return out;
+  }
+
+  std::vector<size_t> sizes;
+  std::vector<std::string> destinations;
+  std::vector<void*> pointers;
+};
+
+std::string PatternValue(size_t size, size_t seed) {
+  std::string value(size, '\0');
+  for (size_t i = 0; i < size; ++i)
+    value[i] = static_cast<char>((seed * 131 + i * 29 + i / 97) & 0xff);
+  return value;
+}
 
 TEST(RdmaLoopback, MultiWindowGetDepthFourKeepsLogicalOperationsIsolated) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
@@ -2746,6 +2810,241 @@ TEST(RdmaLoopback, MultiWindowGetDepthFourKeepsLogicalOperationsIsolated) {
   EXPECT_EQ(node.rsrv->ActiveConns(), 0u);
 }
 
+// Multi-window io_uring contract: one prepared disk read backs every ordered
+// continuation, and its source ownership survives through the final SEND.
+TEST(RdmaLoopback, UringMultiWindowGetSubmitsOnceAndRetainsSource) {
+#ifndef DFKV_WITH_URING
+  GTEST_SKIP() << "test requires a DFKV_WITH_URING build";
+#else
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "1");
+  ScopedEnv uring_depth("DFKV_SERVER_URING_DEPTH", "8");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
+  ScopedEnv recv_segment("DFKV_RDMA_RECV_SEGMENT_SIZE", "33554432");
+  ScopedEnv abort_window("DFKV_RDMA_TEST_ABORT_MULTIWR_WINDOW", nullptr);
+  ScopedEnv bad_operation("DFKV_RDMA_TEST_BAD_GET_OP_ID_WINDOW", nullptr);
+
+  RdmaUringNode node("multi-window-submit-once", 64 * 1024);
+  RdmaTransport transport(64 * 1024);
+  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+  client.set_batch_concurrency(1);
+  const size_t targets_per_window = transport.MaxSgPayloadSegs();
+  ASSERT_GE(targets_per_window, 2u);
+
+  MultiWindowGet first(targets_per_window, 4, 7);
+  ASSERT_EQ(first.window_count(targets_per_window), 4u);
+  const std::string first_value = PatternValue(first.capacity(), 11);
+  ASSERT_TRUE(
+      client.Put("uring_multi_first", first_value.data(), first_value.size()));
+  if (node.rsrv->UringInitFallbacks() != 0)
+    GTEST_SKIP() << "io_uring unavailable";
+
+  const uint64_t reads_before = node.rsrv->UringReads();
+  const uint64_t writes_before = node.rsrv->V2GetWrites();
+  std::vector<size_t> lengths;
+  const auto result = client.BatchGetAutoSg(
+      {{"uring_multi_first", first.pointers, first.sizes}}, &lengths);
+  ASSERT_EQ(result.size(), 1u);
+  ASSERT_TRUE(result[0]);
+  ASSERT_EQ(lengths.size(), 1u);
+  EXPECT_EQ(lengths[0], first_value.size());
+  EXPECT_EQ(first.Flatten(), first_value);
+  EXPECT_EQ(node.PrepareCalls("uring_multi_first"), 1u)
+      << "continuation windows must reuse the first prepared read";
+  EXPECT_EQ(node.RangeCalls("uring_multi_first"), 0u)
+      << "an eligible multi-window read must not fall back to blocking Range";
+  EXPECT_EQ(node.rsrv->UringReads() - reads_before, 1u)
+      << "one logical object must submit exactly one disk read";
+  EXPECT_EQ(node.rsrv->V2GetWrites() - writes_before, 4u)
+      << "each non-empty logical window must issue one RDMA WRITE";
+
+  // A second logical GET on the same QP can reuse every receive/source slot only
+  // after the first operation's final signaled SEND has retired its owner.
+  MultiWindowGet repeated(targets_per_window, 4, 7);
+  const uint64_t repeat_reads_before = node.rsrv->UringReads();
+  std::vector<size_t> repeated_lengths;
+  const auto repeated_result = client.BatchGetAutoSg(
+      {{"uring_multi_first", repeated.pointers, repeated.sizes}},
+      &repeated_lengths);
+  ASSERT_EQ(repeated_result.size(), 1u);
+  ASSERT_TRUE(repeated_result[0]);
+  ASSERT_EQ(repeated_lengths.size(), 1u);
+  EXPECT_EQ(repeated_lengths[0], first_value.size());
+  EXPECT_EQ(repeated.Flatten(), first_value);
+  EXPECT_EQ(node.PrepareCalls("uring_multi_first"), 2u);
+  EXPECT_EQ(node.RangeCalls("uring_multi_first"), 0u);
+  EXPECT_EQ(node.rsrv->UringReads() - repeat_reads_before, 1u);
+
+  // Two different operation IDs post their first windows before waiting for a
+  // reply. Both must be prepared/submitted independently; their continuations
+  // then consume the matching retained source in request order.
+  MultiWindowGet left(targets_per_window, 3, 19);
+  MultiWindowGet right(targets_per_window, 3, 43);
+  const std::string left_value = PatternValue(left.capacity(), 23);
+  const std::string right_value = PatternValue(right.capacity(), 47);
+  ASSERT_NE(left_value, right_value);
+  ASSERT_TRUE(client.Put("uring_multi_left", left_value.data(),
+                         left_value.size()));
+  ASSERT_TRUE(client.Put("uring_multi_right", right_value.data(),
+                         right_value.size()));
+  const uint64_t pair_reads_before = node.rsrv->UringReads();
+  const uint64_t pair_writes_before = node.rsrv->V2GetWrites();
+  std::vector<size_t> pair_lengths;
+  const auto pair_result = client.BatchGetAutoSg(
+      {{"uring_multi_left", left.pointers, left.sizes},
+       {"uring_multi_right", right.pointers, right.sizes}},
+      &pair_lengths);
+  ASSERT_EQ(pair_result.size(), 2u);
+  EXPECT_TRUE(pair_result[0]);
+  EXPECT_TRUE(pair_result[1]);
+  ASSERT_EQ(pair_lengths.size(), 2u);
+  EXPECT_EQ(pair_lengths[0], left_value.size());
+  EXPECT_EQ(pair_lengths[1], right_value.size());
+  EXPECT_EQ(left.Flatten(), left_value);
+  EXPECT_EQ(right.Flatten(), right_value);
+  EXPECT_NE(left.Flatten(), right_value)
+      << "ordered replies crossed independent operation IDs";
+  EXPECT_EQ(node.PrepareCalls("uring_multi_left"), 1u);
+  EXPECT_EQ(node.PrepareCalls("uring_multi_right"), 1u);
+  EXPECT_EQ(node.RangeCalls("uring_multi_left"), 0u);
+  EXPECT_EQ(node.RangeCalls("uring_multi_right"), 0u);
+  EXPECT_EQ(node.rsrv->UringReads() - pair_reads_before, 2u);
+  EXPECT_EQ(node.rsrv->V2GetWrites() - pair_writes_before, 6u);
+#endif
+}
+
+TEST(RdmaLoopback, UringMultiWindowDisconnectReleasesPreparedRead) {
+#ifndef DFKV_WITH_URING
+  GTEST_SKIP() << "test requires a DFKV_WITH_URING build";
+#else
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "1");
+  ScopedEnv uring_depth("DFKV_SERVER_URING_DEPTH", "8");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
+  ScopedEnv recv_segment("DFKV_RDMA_RECV_SEGMENT_SIZE", "33554432");
+  ScopedEnv abort_window_disabled(
+      "DFKV_RDMA_TEST_ABORT_MULTIWR_WINDOW", nullptr);
+  ScopedEnv bad_operation_disabled(
+      "DFKV_RDMA_TEST_BAD_GET_OP_ID_WINDOW", nullptr);
+
+  RdmaUringNode node("multi-window-disconnect", 64 * 1024);
+  RdmaTransport seed_transport(64 * 1024);
+  KVClient seed_client({{"n", node.addr}}, SelfHdr(), &seed_transport);
+  seed_client.set_batch_concurrency(1);
+  const size_t targets_per_window = seed_transport.MaxSgPayloadSegs();
+  ASSERT_GE(targets_per_window, 2u);
+  MultiWindowGet shape(targets_per_window, 4, 61);
+  ASSERT_EQ(shape.window_count(targets_per_window), 4u);
+  const std::string value = PatternValue(shape.capacity(), 67);
+  ASSERT_TRUE(
+      seed_client.Put("uring_multi_abort", value.data(), value.size()));
+  if (node.rsrv->UringInitFallbacks() != 0)
+    GTEST_SKIP() << "io_uring unavailable";
+
+  // Corrupt windows 2, 3, and 4 respectively. The server disconnects after the
+  // async first-window submission, an intermediate continuation, and the final
+  // continuation request. Every exit must retire the same retained owner once.
+  for (size_t corrupt_at : {2u, 3u, 4u}) {
+    MultiWindowGet aborted(targets_per_window, 4, 61);
+    for (auto& destination : aborted.destinations)
+      destination.assign(destination.size(), '\x5a');
+    for (size_t i = 0; i < aborted.pointers.size(); ++i)
+      aborted.pointers[i] = aborted.destinations[i].data();
+
+    const size_t prepares_before = node.PrepareCalls("uring_multi_abort");
+    const uint64_t reads_before = node.rsrv->UringReads();
+    std::vector<size_t> aborted_lengths;
+    std::vector<bool> aborted_result;
+    {
+      const std::string window = std::to_string(corrupt_at);
+      ScopedEnv bad_operation("DFKV_RDMA_TEST_BAD_GET_OP_ID_WINDOW",
+                              window.c_str());
+      RdmaTransport failed_transport(64 * 1024);
+      KVClient failed_client({{"n", node.addr}}, SelfHdr(), &failed_transport);
+      failed_client.set_batch_concurrency(1);
+      aborted_result = failed_client.BatchGetAutoSg(
+          {{"uring_multi_abort", aborted.pointers, aborted.sizes}},
+          &aborted_lengths);
+    }
+    ASSERT_EQ(aborted_result.size(), 1u);
+    EXPECT_FALSE(aborted_result[0]) << "corrupt window " << corrupt_at;
+    ASSERT_EQ(aborted_lengths.size(), 1u);
+    EXPECT_EQ(aborted_lengths[0], 0u);
+    EXPECT_EQ(node.rsrv->UringReads() - reads_before, 1u)
+        << "corrupt window " << corrupt_at
+        << " reread or failed to submit the first window";
+    EXPECT_EQ(node.PrepareCalls("uring_multi_abort") - prepares_before, 1u)
+        << "continuations must not prepare after window " << corrupt_at;
+    // RangeIntoMulti publishes operation-owned staging only after the logical
+    // item completes. A disconnect must therefore expose no torn prefix even
+    // though the server has already issued writes for earlier windows.
+    for (size_t segment = 0; segment < aborted.sizes.size(); ++segment) {
+      EXPECT_EQ(aborted.destinations[segment],
+                std::string(aborted.sizes[segment], '\x5a'))
+          << "corrupt window " << corrupt_at << ", segment " << segment;
+    }
+    // Destruction of the failed connection must abort its retained owner and
+    // free the source slot exactly once: a fresh operation on the same key must
+    // neither join a stale coalescer flight nor inherit continuation state.
+    MultiWindowGet recovered(targets_per_window, 4, 61);
+    RdmaTransport recovery_transport(64 * 1024);
+    KVClient recovery_client(
+        {{"n", node.addr}}, SelfHdr(), &recovery_transport);
+    recovery_client.set_batch_concurrency(1);
+    std::vector<size_t> recovered_lengths;
+    const auto recovered_result = recovery_client.BatchGetAutoSg(
+        {{"uring_multi_abort", recovered.pointers, recovered.sizes}},
+        &recovered_lengths);
+    ASSERT_EQ(recovered_result.size(), 1u);
+    ASSERT_TRUE(recovered_result[0]) << "recovery after window " << corrupt_at;
+    ASSERT_EQ(recovered_lengths.size(), 1u);
+    EXPECT_EQ(recovered_lengths[0], value.size());
+    EXPECT_EQ(recovered.Flatten(), value);
+    EXPECT_EQ(node.PrepareCalls("uring_multi_abort") - prepares_before, 2u)
+        << "the failed owner leaked into the recovery operation";
+  }
+#endif
+}
+
+TEST(RdmaLoopback, PreparedReadSyncAndSingleWindowPathsStayUnchanged) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "0");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
+  ScopedEnv recv_segment("DFKV_RDMA_RECV_SEGMENT_SIZE", "33554432");
+  RdmaUringNode node("prepared-sync-unchanged", 64 * 1024);
+  RdmaTransport transport(64 * 1024);
+  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+  client.set_batch_concurrency(1);
+
+  const std::string single_value = PatternValue(8193, 71);
+  ASSERT_TRUE(client.Put("prepared_single", single_value.data(),
+                         single_value.size()));
+  std::string single_out(single_value.size(), '\0');
+  ASSERT_TRUE(client.Get("prepared_single", single_out.data(),
+                         single_out.size()));
+  EXPECT_EQ(single_out, single_value);
+  EXPECT_EQ(node.PrepareCalls("prepared_single"), 1u);
+  EXPECT_EQ(node.RangeCalls("prepared_single"), 0u);
+  EXPECT_EQ(node.rsrv->UringReads(), 0u);
+
+  const size_t targets_per_window = transport.MaxSgPayloadSegs();
+  MultiWindowGet multi(targets_per_window, 3, 73);
+  const std::string multi_value = PatternValue(multi.capacity(), 79);
+  ASSERT_TRUE(
+      client.Put("prepared_multi", multi_value.data(), multi_value.size()));
+  std::vector<size_t> lengths;
+  const auto result = client.BatchGetAutoSg(
+      {{"prepared_multi", multi.pointers, multi.sizes}}, &lengths);
+  ASSERT_EQ(result.size(), 1u);
+  ASSERT_TRUE(result[0]);
+  ASSERT_EQ(lengths.size(), 1u);
+  EXPECT_EQ(lengths[0], multi_value.size());
+  EXPECT_EQ(multi.Flatten(), multi_value);
+  EXPECT_EQ(node.PrepareCalls("prepared_multi"), 1u);
+  EXPECT_EQ(node.RangeCalls("prepared_multi"), 0u);
+  EXPECT_EQ(node.rsrv->UringReads(), 0u);
+}
+
 // Correctness proof for the io_uring async-GET path: many concurrent GETs over a
 // SINGLE pooled connection, with the depth high enough that several requests are
 // in flight per WaitComp batch (so the server submits a multi-read io_uring batch
@@ -2872,6 +3171,12 @@ struct RamRdmaNode {
   std::unique_ptr<KvNodeServer> srv;
   std::unique_ptr<RdmaServer> rsrv;
   std::string addr;
+  std::mutex flight_mu;
+  std::condition_variable flight_cv;
+  std::string barrier_key;
+  bool leader_prepared = false;
+  bool follower_entered = false;
+
 
   explicit RamRdmaNode(const std::string& tag, size_t max_msg = kMaxMsg,
                        bool writearound = false) {
@@ -2899,6 +3204,14 @@ struct RamRdmaNode {
         [this](const BlockKey& key, uint64_t off, uint64_t len,
                char* io_buf, size_t cap, const char** out_data,
                size_t* out_len, size_t* value_len) {
+          {
+            std::lock_guard<std::mutex> lock(flight_mu);
+            if (!barrier_key.empty() && key.Filename() == barrier_key &&
+                leader_prepared) {
+              follower_entered = true;
+              flight_cv.notify_all();
+            }
+          }
           return srv->RangeDirectForKey(
               key, off, len, io_buf, cap, out_data, out_len, value_len);
         });
@@ -2909,7 +3222,20 @@ struct RamRdmaNode {
     rsrv->set_prepare_read_handler(
         [this](const BlockKey& key, uint64_t off, uint64_t len,
                char* staging, size_t cap) {
-          return srv->PrepareReadForKey(key, off, len, staging, cap);
+          PreparedRead prepared =
+              srv->PrepareReadForKey(key, off, len, staging, cap);
+          if (prepared.status() == Status::kOk && prepared.needs_io()) {
+            std::unique_lock<std::mutex> lock(flight_mu);
+            if (!barrier_key.empty() && key.Filename() == barrier_key &&
+                !leader_prepared) {
+              leader_prepared = true;
+              flight_cv.notify_all();
+              (void)flight_cv.wait_for(
+                  lock, std::chrono::seconds(2),
+                  [this] { return follower_entered; });
+            }
+          }
+          return prepared;
         });
     // The RAM arena is a registered source pool; per-send pin ownership lives
     // inside PreparedRead.
@@ -2927,6 +3253,17 @@ struct RamRdmaNode {
     ::unsetenv("DFKV_RAM_TIER_BYTES");
     ::unsetenv("DFKV_RAM_WRITE_MODE");
     fs::remove_all(dir);
+  }
+  void BarrierFirstPreparedRead(const std::string& logical_key) {
+    std::lock_guard<std::mutex> lock(flight_mu);
+    barrier_key = ToBlockKey(SelfHdr(), logical_key).Filename();
+    leader_prepared = false;
+    follower_entered = false;
+  }
+  bool WaitForPreparedLeader() {
+    std::unique_lock<std::mutex> lock(flight_mu);
+    return flight_cv.wait_for(lock, std::chrono::seconds(2),
+                              [this] { return leader_prepared; });
   }
 };
 }  // namespace
@@ -2999,6 +3336,100 @@ TEST(RdmaLoopback, ColdGetPromotesDirectlyIntoRegisteredRamArena) {
   }
   ::unsetenv("DFKV_READ_COALESCE");
   ::unsetenv("DFKV_SERVER_URING");
+}
+
+TEST(RdmaLoopback, UringMultiWindowCoalescedFollowerPromotesToRam) {
+#ifndef DFKV_WITH_URING
+  GTEST_SKIP() << "test requires a DFKV_WITH_URING build";
+#else
+  if (!HaveRdma())
+    GTEST_SKIP() << "no RDMA device (load rdma_rxe for Soft-RoCE)";
+  ScopedEnv coalesce("DFKV_READ_COALESCE", "1");
+  ScopedEnv coalesce_timeout("DFKV_READ_COALESCE_TIMEOUT_MS", "1000");
+  ScopedEnv uring("DFKV_SERVER_URING", "1");
+  ScopedEnv uring_depth("DFKV_SERVER_URING_DEPTH", "8");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
+  ScopedEnv recv_segment("DFKV_RDMA_RECV_SEGMENT_SIZE", "33554432");
+
+  RamRdmaNode node("multi-window-coalesced-promotion", 64 * 1024,
+                   /*writearound=*/true);
+  ASSERT_TRUE(node.srv->ram_enabled());
+  RdmaTransport seed_transport(64 * 1024);
+  KVClient seed_client({{"n", node.addr}}, SelfHdr(), &seed_transport);
+  seed_client.set_batch_concurrency(1);
+  const size_t targets_per_window = seed_transport.MaxSgPayloadSegs();
+  MultiWindowGet shape(targets_per_window, 3, 83);
+  ASSERT_EQ(shape.window_count(targets_per_window), 3u);
+  const std::string value = PatternValue(shape.capacity(), 89);
+  ASSERT_TRUE(
+      seed_client.Put("coalesced_multi", value.data(), value.size()));
+  ASSERT_EQ(CounterVal(node.srv->MetricsText(), "dfkv_ram_objects"), 0);
+  if (node.rsrv->UringInitFallbacks() != 0)
+    GTEST_SKIP() << "io_uring unavailable";
+
+  node.BarrierFirstPreparedRead("coalesced_multi");
+  MultiWindowGet leader(targets_per_window, 3, 83);
+  MultiWindowGet follower(targets_per_window, 3, 83);
+  bool leader_ok = false;
+  bool follower_ok = false;
+  size_t leader_len = 0;
+  size_t follower_len = 0;
+  const uint64_t reads_before = node.rsrv->UringReads();
+
+  std::thread leader_thread([&] {
+    RdmaTransport transport(64 * 1024);
+    KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+    client.set_batch_concurrency(1);
+    std::vector<size_t> lengths;
+    const auto result = client.BatchGetAutoSg(
+        {{"coalesced_multi", leader.pointers, leader.sizes}}, &lengths);
+    leader_ok = result.size() == 1 && result[0];
+    if (lengths.size() == 1) leader_len = lengths[0];
+  });
+  EXPECT_TRUE(node.WaitForPreparedLeader())
+      << "leader did not register its async coalescer flight";
+  std::thread follower_thread([&] {
+    RdmaTransport transport(64 * 1024);
+    KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+    client.set_batch_concurrency(1);
+    std::vector<size_t> lengths;
+    const auto result = client.BatchGetAutoSg(
+        {{"coalesced_multi", follower.pointers, follower.sizes}}, &lengths);
+    follower_ok = result.size() == 1 && result[0];
+    if (lengths.size() == 1) follower_len = lengths[0];
+  });
+  leader_thread.join();
+  follower_thread.join();
+
+  ASSERT_TRUE(leader_ok);
+  ASSERT_TRUE(follower_ok);
+  EXPECT_EQ(leader_len, value.size());
+  EXPECT_EQ(follower_len, value.size());
+  EXPECT_EQ(leader.Flatten(), value);
+  EXPECT_EQ(follower.Flatten(), value);
+  EXPECT_EQ(node.rsrv->UringReads() - reads_before, 1u)
+      << "the follower must consume the leader's published read";
+  const std::string after_cold = node.srv->MetricsText();
+  EXPECT_EQ(CounterVal(after_cold, "dfkv_read_coalesce_leaders_total"), 1);
+  EXPECT_EQ(CounterVal(after_cold, "dfkv_read_coalesced_total"), 1);
+  EXPECT_EQ(CounterVal(after_cold, "dfkv_ram_promoted_total"), 1);
+  EXPECT_EQ(CounterVal(after_cold, "dfkv_ram_objects"), 1);
+
+  // The promoted resident remains a multi-window source, but no longer needs a
+  // disk descriptor. Its send pin still spans all continuations until final SEND.
+  MultiWindowGet warm(targets_per_window, 3, 83);
+  const uint64_t warm_reads_before = node.rsrv->UringReads();
+  std::vector<size_t> warm_lengths;
+  const auto warm_result = seed_client.BatchGetAutoSg(
+      {{"coalesced_multi", warm.pointers, warm.sizes}}, &warm_lengths);
+  ASSERT_EQ(warm_result.size(), 1u);
+  ASSERT_TRUE(warm_result[0]);
+  ASSERT_EQ(warm_lengths.size(), 1u);
+  EXPECT_EQ(warm_lengths[0], value.size());
+  EXPECT_EQ(warm.Flatten(), value);
+  EXPECT_EQ(node.rsrv->UringReads(), warm_reads_before);
+  EXPECT_GT(CounterVal(node.srv->MetricsText(), "dfkv_ram_hit_total"), 0);
+#endif
 }
 
 // DCP2 declared caps: a client that tightens its max block size gets smaller
