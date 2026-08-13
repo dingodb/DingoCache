@@ -107,6 +107,69 @@ def _batch_rotation_offset(
         seed = zlib.crc32(bytes(block_hashes[0]), seed)
     return (seed + tp_rank) % batch_size
 
+@dataclasses.dataclass(frozen=True)
+class _KeyStripeIdentity:
+    """The stored key coordinate and replica stripe owned by one worker."""
+
+    tp_rank: int
+    dcp_rank: int
+    stripe_idx: int
+    stripe_step: int
+
+
+def _key_stripe_identity(
+    *,
+    tp_rank: int,
+    tp_size: int,
+    pcp_rank: int,
+    pcp_size: int,
+    dcp_rank: int,
+    dcp_size: int,
+    num_kv_heads: int,
+    use_mla: bool,
+) -> _KeyStripeIdentity:
+    """Map a vLLM TP/PCP/DCP rank to its key namespace and store stripe.
+
+    vLLM forms DCP groups after transposing the ``PCP x TP`` rank grid, so
+    DCP rank is ``(tp_rank * pcp_size + pcp_rank) % dcp_size``.  Workers with
+    the same TP-head, PCP, and DCP key coordinate are payload replicas.  They
+    split that namespace's chunks by their position in that actual replica
+    set; raw TP parity is not a replica identity when DCP is enabled.
+    """
+    replica_step = tp_size // num_kv_heads if num_kv_heads < tp_size else 1
+    key_tp_rank = tp_rank // replica_step if replica_step > 1 else tp_rank
+    expected_dcp_rank = (tp_rank * pcp_size + pcp_rank) % dcp_size
+    if dcp_rank != expected_dcp_rank:
+        raise RuntimeError(
+            "vLLM DCP rank does not match the PCP x TP group layout: "
+            f"tp={tp_rank}/{tp_size} pcp={pcp_rank}/{pcp_size} "
+            f"dcp={dcp_rank}/{dcp_size} expected_dcp_rank={expected_dcp_rank}"
+        )
+
+    replica_ranks = [
+        candidate
+        for candidate in range(tp_size)
+        if (
+            (
+                candidate // replica_step
+                if replica_step > 1
+                else candidate
+            )
+            == key_tp_rank
+            and (candidate * pcp_size + pcp_rank) % dcp_size == dcp_rank
+        )
+    ]
+    stripe_idx = replica_ranks.index(tp_rank)
+    metadata_tp_rank = (
+        -1 if use_mla and pcp_size == 1 and dcp_size == 1 else key_tp_rank
+    )
+    return _KeyStripeIdentity(
+        tp_rank=metadata_tp_rank,
+        dcp_rank=dcp_rank,
+        stripe_idx=stripe_idx,
+        stripe_step=len(replica_ranks),
+    )
+
 
 # dfkv: Removed Mooncake-store-only helpers:
 #   * disk-offload staging budget math (_align_up,
@@ -373,7 +436,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         token_databases: list[ChunkedTokenDatabase],
         block_size: int,
         tp_rank: int,
-        put_step: int,
+        stripe_idx: int,
+        stripe_step: int,
         kv_role: str,
         ready_event: threading.Event,
         enable_kv_event: bool = False,
@@ -390,13 +454,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
             record_operation=record_operation,
             queue_capacity=queue_capacity,
         )
-        self.put_step = put_step
-        # CLIENT_RANKS store convergence (issue #111): stripe index/step over
-        # the participating ranks. stripe_idx None = this rank stores nothing
-        # (a converged peer stores on its behalf; KV is TP-replicated).
-        # Defaults reproduce the legacy tp_rank % put_step striping exactly.
-        self.stripe_idx: int | None = tp_rank % put_step
-        self.stripe_step: int = put_step
+        # Workers sharing one key coordinate split its chunks without
+        # replicated writes. CLIENT_RANKS convergence may later set
+        # stripe_idx=None for a non-participant.
+        self.stripe_idx: int | None = stripe_idx
+        self.stripe_step = stripe_step
         self.coord = coord
         self.kv_role = kv_role
         self.stored_requests: defaultdict[str, int] = defaultdict(int)
@@ -489,14 +551,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     block_hashes.append(BlockHash(bytes.fromhex(key.chunk_hash)))
                     group_indices.append(g_idx)
 
-            # Apply store striding: legacy = tp_rank % put_step over put_step;
-            # under CLIENT_RANKS convergence = index over the participant set,
-            # and non-participants select nothing (empty slice keeps the
-            # request lifecycle -- bookkeeping/finish -- identical).
+            # Split chunks across the workers that share this exact key
+            # coordinate. A converged CLIENT_RANKS non-participant selects
+            # nothing while preserving request bookkeeping and completion.
             if self.stripe_idx is None:
                 sl = slice(0, 0)
             else:
-                sl = slice(self.stripe_idx % self.stripe_step, None, self.stripe_step)
+                sl = slice(self.stripe_idx, None, self.stripe_step)
             starts = starts[sl]
             ends = ends[sl]
             keys = keys[sl]
@@ -1236,35 +1297,26 @@ class DfkvStoreWorker:
         else:
             self.num_kv_head = model_config.get_total_num_kv_heads()
 
-        if self.num_kv_head < self.tp_size:
-            self.put_step = self.tp_size // self.num_kv_head
-            self.head_or_tp_rank = self.tp_rank // self.put_step
-        else:
-            self.head_or_tp_rank = self.tp_rank
-            self.put_step = 1
-
-        # DCP shards the (otherwise TP-replicated) MLA KV across dcp ranks, so
-        # each rank holds a UNIQUE shard (separated by the @dcp{r} key field),
-        # not a replica. put_step is a dedup stride that assumes replication:
-        # only 1/put_step of the identical-across-TP keys are stored. Under DCP
-        # that assumption is wrong -- the stride would drop ~(1 - 1/put_step) of
-        # each rank's own unique shard, so cross-instance (PD) consumers miss
-        # most of the KV (observed ~7% hit at TP8/DCP8, i.e. ~1/8). Shrink the
-        # stride by dcp_size so every rank stores its full shard. head_or_tp_rank
-        # is left unchanged: the `dcp=S:R` coordinate already separates shards,
-        # and both P and D derive it identically.
-        if self.dcp_size > 1 and self.put_step > 1:
-            self.put_step = max(1, self.put_step // self.dcp_size)
+        key_stripe = _key_stripe_identity(
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            pcp_rank=self.pcp_rank,
+            pcp_size=self.pcp_size,
+            dcp_rank=self.dcp_rank,
+            dcp_size=self.dcp_size,
+            num_kv_heads=self.num_kv_head,
+            use_mla=self.use_mla,
+        )
+        self.head_or_tp_rank = key_stripe.tp_rank
+        self.dcp_rank = key_stripe.dcp_rank
+        self.stripe_idx = key_stripe.stripe_idx
+        self.stripe_step = key_stripe.stripe_step
 
         # CLIENT_RANKS (issue #111): converge store-side dfkv clients onto a
-        # subset of ranks when the KV object is TP-replicated. Layout-clamped,
-        # never rejects (one fleet-wide env template must be safe everywhere).
-        replicated = (
-            self.use_mla
-            and self.put_step == self.tp_size
-            and self.dcp_size <= 1
-            and getattr(self, "pcp_size", 1) <= 1
-        )
+        # subset of ranks when the KV object is fully TP-replicated.
+        # Layout-clamped, never rejects (one fleet-wide env template must be
+        # safe everywhere).
+        replicated = self.head_or_tp_rank < 0
         requested = os.environ.get(CLIENT_RANKS_ENV)
         self.client_ranks, cr_reason = resolve_client_ranks(
             requested, self.tp_size, replicated
@@ -1283,7 +1335,7 @@ class DfkvStoreWorker:
             dp_size=self.dp_size,
             dp_rank=-1,
             tp_size=self.tp_size,
-            tp_rank=-1 if replicated else self.head_or_tp_rank,
+            tp_rank=self.head_or_tp_rank,
             pcp_size=self.pcp_size,
             pcp_rank=self.pcp_rank,
             dcp_size=self.dcp_size,
@@ -1678,7 +1730,8 @@ class DfkvStoreWorker:
                 self.token_dbs,
                 self.block_size,
                 self.tp_rank,
-                self.put_step,
+                self.stripe_idx,
+                self.stripe_step,
                 self.kv_role,
                 ready_event_sending,
                 self.enable_kv_events,
