@@ -66,6 +66,81 @@ class RdmaServerTestPeer {
     return server.recv_segment_registered_rails_;
   }
 };
+
+class RdmaTransportTestPeer {
+ public:
+  struct SeededFailure {
+    uint64_t now_us = 0;
+    RemoteRailCompletion completion;
+  };
+
+  struct RetryDecision {
+    bool retry = false;
+    bool cross_rail = false;
+    std::vector<uint8_t> excluded;
+  };
+
+  static std::optional<SeededFailure> CoolRemoteRail(
+      RdmaTransport* transport, const std::string& peer_id, size_t rail) {
+    const uint64_t now = rdma::RailPolicy::NowMicros();
+    auto lease = transport->remote_rail_health_->TryAcquire(peer_id, rail, now);
+    if (!lease) return std::nullopt;
+    return SeededFailure{
+        now,
+        transport->remote_rail_health_->Complete(
+            peer_id, rail, lease->generation,
+            RemoteRailOutcome::kEndpointFailure, now)};
+  }
+
+  static std::vector<uint8_t> RemoteAllowed(
+      const RdmaTransport& transport, const std::string& peer_id,
+      const std::vector<uint8_t>& candidates, uint64_t now_us) {
+    return transport.remote_rail_health_->AllowedMask(peer_id, candidates,
+                                                      now_us);
+  }
+
+  static size_t DataPoolSize(RdmaTransport* transport,
+                             const std::string& node) {
+    std::lock_guard<std::mutex> lock(transport->mu_);
+    const auto found = transport->pool_.find(node);
+    return found == transport->pool_.end() ? 0 : found->second.size();
+  }
+
+  static uint64_t PeerPublication(const RdmaTransport& transport,
+                                  const std::string& node) {
+    return transport.peer_topologies_->Snapshot(node)->publication;
+  }
+
+  static RdmaTransport::Conn* AcquireData(RdmaTransport* transport,
+                                          const std::string& node) {
+    RdmaTransport::AcquireOptions options;
+    return transport->Acquire(node, RdmaTransport::Lane::kData, options).conn;
+  }
+
+  static void ReleaseData(RdmaTransport* transport, const std::string& node,
+                          RdmaTransport::Conn* conn) {
+    transport->Release(node, RdmaTransport::Lane::kData, conn);
+  }
+
+  static RetryDecision PrepareEndpointRetry(
+      RdmaTransport* transport, bool from_pool, bool replay_safe,
+      bool request_posted, size_t attempted_rail) {
+    auto peer = std::make_shared<rdma::PeerRailSnapshot>();
+    peer->complete = true;
+    peer->peer_healthy.assign(transport->devs_.size(), 1);
+    peer->compatible.assign(transport->devs_.size(), 1);
+    RdmaTransport::RailMask excluded(transport->devs_.size(), 0);
+    bool cross_rail = false;
+    const bool retry = transport->PrepareRetry(
+        /*attempt=*/0, from_pool, attempted_rail,
+        RdmaTransport::AcquireFailure::kEndpoint,
+        replay_safe ? RdmaTransport::ReplaySafety::kReplaySafe
+                    : RdmaTransport::ReplaySafety::kUnsafeAfterPost,
+        request_posted, peer, &excluded, &cross_rail);
+    return RetryDecision{retry, cross_rail, std::move(excluded)};
+  }
+};
+
 }  // namespace dfkv
 
 namespace {
@@ -673,7 +748,7 @@ TEST(RdmaPeerRails, NoIntersectionIsPeerNeutralAndLocallyObservable) {
   }
 }
 
-TEST(RdmaPeerRails, OperationGenerationFencesOlderSnapshots) {
+TEST(RdmaPeerRails, OperationPublicationFencesOlderSnapshots) {
   const std::vector<std::string> devices{"gpu0", "cpu0"};
   std::vector<std::vector<uint8_t>> tiers;
   ASSERT_TRUE(
@@ -683,10 +758,11 @@ TEST(RdmaPeerRails, OperationGenerationFencesOlderSnapshots) {
       PeerTopology{"peer", 100, true, {{"gpu0", true}}}));
   const auto operation = store.Snapshot("peer");
   ASSERT_EQ(operation->generation, 100u);
+  ASSERT_TRUE(store.IsCurrent("peer", operation->publication));
 
   ASSERT_TRUE(store.Update(
       PeerTopology{"peer", 101, true, {{"cpu0", true}}}));
-  EXPECT_FALSE(store.IsCurrent("peer", operation->generation));
+  EXPECT_FALSE(store.IsCurrent("peer", operation->publication));
   EXPECT_EQ(operation->generation, 100u);
   EXPECT_EQ(operation->compatible, (std::vector<uint8_t>{1, 0}));
   const auto current = store.Snapshot("peer");
@@ -3447,4 +3523,593 @@ TEST(RdmaLoopback, AllLocalRailsFailOnceAndReclaimOperationResources) {
             std::vector<Status>({Status::kOk}));
   EXPECT_EQ(output,
             std::string(value.size(), static_cast<char>(0x5a)));
+}
+
+TEST(RdmaLoopback,
+     EndpointCompletionCoolsOnlyFailedPeerRailAndPublicGetReplays) {
+  if (!HaveRdma())
+    GTEST_SKIP() << "no RDMA device (load two rdma_rxe devices for this test)";
+  const auto rails = ConfiguredTwoTestRails();
+  if (!HaveConfiguredActiveRails(rails))
+    GTEST_SKIP() << "set DFKV_RDMA_DEV to exactly two ACTIVE test devices";
+  ScopedEnv cooldown("DFKV_RDMA_REMOTE_RAIL_COOLDOWN_MS", "30000");
+  ScopedEnv max_cooldown("DFKV_RDMA_REMOTE_RAIL_MAX_COOLDOWN_MS", "30000");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv credits("DFKV_RDMA_RAIL_CREDITS", kRealHcaRailCredits);
+  ScopedEnv ambient_local_completion_fault(
+      "DFKV_RDMA_TEST_COMPLETION_FAULT", nullptr);
+  ScopedEnv ambient_endpoint_completion_fault(
+      "DFKV_RDMA_TEST_ENDPOINT_COMPLETION_FAULT", nullptr);
+
+  RdmaNode failed_peer("remote-completion-failed-peer");
+  RdmaNode independent_peer("remote-completion-independent-peer");
+  const BlockKey failed_peer_key =
+      ToBlockKey(SelfHdr(), "remote-completion-failed-peer");
+  const BlockKey independent_peer_key =
+      ToBlockKey(SelfHdr(), "remote-completion-independent-peer");
+  const std::string failed_peer_value(64 * 1024, 'f');
+  const std::string independent_peer_value(4096, 'i');
+  {
+    // Seed server state through public operations on a separate transport so
+    // the transport under test begins with deterministic rail-zero admission.
+    RdmaTransport writer(kMaxMsg, rails[0]);
+    ASSERT_EQ(writer.Cache(failed_peer.addr, failed_peer_key,
+                           failed_peer_value.data(), failed_peer_value.size()),
+              Status::kOk);
+    ASSERT_EQ(writer.Cache(independent_peer.addr, independent_peer_key,
+                           independent_peer_value.data(),
+                           independent_peer_value.size()),
+              Status::kOk);
+  }
+
+  RdmaTransport transport(kMaxMsg, rails[0] + "," + rails[1]);
+  PeerTopology failed_topology;
+  failed_topology.peer_addr = failed_peer.addr;
+  failed_topology.peer_id = "remote-completion-failed-peer-id";
+  failed_topology.generation = 1;
+  failed_topology.complete = true;
+  for (const auto& rail : rails)
+    failed_topology.rails.push_back(PeerRailTopology{rail, true});
+  transport.OnPeerTopology(failed_topology);
+
+  PeerTopology independent_topology;
+  independent_topology.peer_addr = independent_peer.addr;
+  independent_topology.peer_id = "remote-completion-independent-peer-id";
+  independent_topology.generation = 1;
+  independent_topology.complete = true;
+  independent_topology.rails.push_back(PeerRailTopology{rails[0], true});
+  independent_topology.rails.push_back(PeerRailTopology{rails[1], false});
+  transport.OnPeerTopology(independent_topology);
+  KVClient failed_client({{"n", failed_peer.addr}}, SelfHdr(), &transport);
+  KVClient independent_client({{"n", independent_peer.addr}}, SelfHdr(),
+                              &transport);
+
+  const std::string before_fault = transport.MetricsText();
+  std::string output(failed_peer_value.size(), '\0');
+  {
+    ScopedEnv fault("DFKV_RDMA_TEST_ENDPOINT_COMPLETION_FAULT", "1:1:1");
+    ASSERT_TRUE(failed_client.Get("remote-completion-failed-peer",
+                                  output.data(), output.size()));
+  }
+  EXPECT_EQ(output, failed_peer_value);
+  const std::string after_fault = transport.MetricsText();
+
+  EXPECT_EQ(CounterVal(after_fault,
+                       "dfkv_rdma_client_remote_rail_failures_total") -
+                CounterVal(before_fault,
+                           "dfkv_rdma_client_remote_rail_failures_total"),
+            1)
+      << "the failed production lease must complete exactly once";
+  EXPECT_EQ(CounterVal(after_fault,
+                       "dfkv_rdma_client_remote_rail_cooldowns_total") -
+                CounterVal(before_fault,
+                           "dfkv_rdma_client_remote_rail_cooldowns_total"),
+            1)
+      << "one endpoint failure must cause one cooldown transition";
+  EXPECT_EQ(
+      CounterVal(after_fault,
+                 "dfkv_rdma_client_remote_rail_admissions_denied_total"),
+      CounterVal(before_fault,
+                 "dfkv_rdma_client_remote_rail_admissions_denied_total"))
+      << "the injected completion is endpoint evidence, not admission failure";
+  EXPECT_EQ(
+      DeviceCounterVal(
+          after_fault,
+          "dfkv_rdma_client_remote_rail_failures_by_rail_total", rails[0]) -
+          DeviceCounterVal(
+              before_fault,
+              "dfkv_rdma_client_remote_rail_failures_by_rail_total", rails[0]),
+      1);
+  EXPECT_EQ(
+      DeviceCounterVal(
+          after_fault,
+          "dfkv_rdma_client_remote_rail_cooldowns_by_rail_total", rails[0]) -
+          DeviceCounterVal(
+              before_fault,
+              "dfkv_rdma_client_remote_rail_cooldowns_by_rail_total", rails[0]),
+      1);
+  EXPECT_EQ(
+      DeviceCounterVal(
+          after_fault,
+          "dfkv_rdma_client_remote_rail_failures_by_rail_total", rails[1]),
+      DeviceCounterVal(
+          before_fault,
+          "dfkv_rdma_client_remote_rail_failures_by_rail_total", rails[1]));
+  EXPECT_EQ(
+      DeviceCounterVal(
+          after_fault,
+          "dfkv_rdma_client_remote_rail_cooldowns_by_rail_total", rails[1]),
+      DeviceCounterVal(
+          before_fault,
+          "dfkv_rdma_client_remote_rail_cooldowns_by_rail_total", rails[1]));
+  EXPECT_EQ(
+      DeviceCounterVal(after_fault, "dfkv_rdma_client_rail_errors_total",
+                       rails[0]),
+      DeviceCounterVal(before_fault, "dfkv_rdma_client_rail_errors_total",
+                       rails[0]))
+      << "endpoint evidence must not blame the local rail";
+  EXPECT_EQ(
+      DeviceCounterVal(after_fault, "dfkv_rdma_client_endpoint_errors_total",
+                       rails[0]) -
+          DeviceCounterVal(before_fault,
+                           "dfkv_rdma_client_endpoint_errors_total", rails[0]),
+      1);
+  for (const auto& rail : rails) {
+    EXPECT_EQ(
+        DeviceCounterVal(after_fault,
+                         "dfkv_rdma_client_rail_selections_total", rail) -
+            DeviceCounterVal(before_fault,
+                             "dfkv_rdma_client_rail_selections_total", rail),
+        1)
+        << rail << ": GET must fail once then replay on its sibling rail";
+  }
+  EXPECT_EQ(
+      CounterVal(after_fault, "dfkv_rdma_client_cross_rail_retries_total") -
+          CounterVal(before_fault,
+                     "dfkv_rdma_client_cross_rail_retries_total"),
+      1);
+  EXPECT_EQ(
+      CounterVal(
+          after_fault,
+          "dfkv_rdma_client_cross_rail_retry_successes_total") -
+          CounterVal(
+              before_fault,
+              "dfkv_rdma_client_cross_rail_retry_successes_total"),
+      1);
+
+  const std::string before_same_peer = after_fault;
+  EXPECT_TRUE(failed_client.Exist("remote-completion-failed-peer"));
+  const std::string after_same_peer = transport.MetricsText();
+  EXPECT_EQ(
+      DeviceCounterVal(after_same_peer,
+                       "dfkv_rdma_client_rail_selections_total", rails[0]),
+      DeviceCounterVal(before_same_peer,
+                       "dfkv_rdma_client_rail_selections_total", rails[0]))
+      << "the next public operation must avoid the cooled peer/rail pair";
+  EXPECT_EQ(
+      DeviceCounterVal(after_same_peer,
+                       "dfkv_rdma_client_rail_selections_total", rails[1]) -
+          DeviceCounterVal(before_same_peer,
+                           "dfkv_rdma_client_rail_selections_total", rails[1]),
+      1)
+      << "the sibling rail remains eligible for the failed peer";
+
+  const std::string before_independent_peer = after_same_peer;
+  EXPECT_TRUE(
+      independent_client.Exist("remote-completion-independent-peer"));
+  const std::string after_independent_peer = transport.MetricsText();
+  EXPECT_EQ(
+      DeviceCounterVal(after_independent_peer,
+                       "dfkv_rdma_client_rail_selections_total", rails[0]) -
+          DeviceCounterVal(before_independent_peer,
+                           "dfkv_rdma_client_rail_selections_total", rails[0]),
+      1)
+      << "remote cooldown is scoped by peer and must not disable this local "
+         "rail for another peer";
+  EXPECT_EQ(
+      DeviceCounterVal(after_independent_peer,
+                       "dfkv_rdma_client_rail_errors_total", rails[0]),
+      DeviceCounterVal(before_fault, "dfkv_rdma_client_rail_errors_total",
+                       rails[0]));
+  EXPECT_EQ(CounterVal(after_independent_peer,
+                       "dfkv_rdma_client_remote_rail_failures_total") -
+                CounterVal(before_fault,
+                           "dfkv_rdma_client_remote_rail_failures_total"),
+            1)
+      << "later successful public operations must not double-complete failure";
+  EXPECT_EQ(CounterVal(after_independent_peer,
+                       "dfkv_rdma_client_remote_rail_cooldowns_total") -
+                CounterVal(before_fault,
+                           "dfkv_rdma_client_remote_rail_cooldowns_total"),
+            1);
+}
+
+TEST(RdmaLoopback,
+     PostSubmitPutFailureCoolsActualRemoteRailWithoutReplay) {
+  if (!HaveRdma())
+    GTEST_SKIP() << "no RDMA device (load two rdma_rxe devices for this test)";
+  const auto rails = ConfiguredTwoTestRails();
+  if (!HaveConfiguredActiveRails(rails))
+    GTEST_SKIP() << "set DFKV_RDMA_DEV to exactly two ACTIVE test devices";
+  ScopedEnv cooldown("DFKV_RDMA_REMOTE_RAIL_COOLDOWN_MS", "30000");
+  ScopedEnv max_cooldown("DFKV_RDMA_REMOTE_RAIL_MAX_COOLDOWN_MS", "30000");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv credits("DFKV_RDMA_RAIL_CREDITS", kRealHcaRailCredits);
+  ScopedEnv ambient_local_completion_fault(
+      "DFKV_RDMA_TEST_COMPLETION_FAULT", nullptr);
+  ScopedEnv ambient_endpoint_completion_fault(
+      "DFKV_RDMA_TEST_ENDPOINT_COMPLETION_FAULT", nullptr);
+  ScopedEnv ambient_local_failure(
+      "DFKV_RDMA_TEST_LOCAL_RAIL_FAILURE_ATTEMPTS", nullptr);
+
+  RdmaNode node("remote-post-submit-put");
+  RdmaTransport transport(kMaxMsg, rails[0] + "," + rails[1]);
+  PeerTopology topology;
+  topology.peer_addr = node.addr;
+  topology.peer_id = "remote-post-submit-put-peer";
+  topology.generation = 1;
+  topology.complete = true;
+  for (const auto& rail : rails)
+    topology.rails.push_back(PeerRailTopology{rail, true});
+  transport.OnPeerTopology(topology);
+
+  const std::string key_namespace = "test/remote-post-submit-put";
+  KVClient client({{"n", node.addr}}, key_namespace, &transport);
+  const std::string value(64 * 1024, 'f');
+  const BlockKey failed_key =
+      ToBlockKey(key_namespace, "completion-failed-put");
+  const std::string before_fault = transport.MetricsText();
+  {
+    ScopedEnv fault("DFKV_RDMA_TEST_ENDPOINT_COMPLETION_FAULT", "1:1:1");
+    EXPECT_FALSE(
+        client.Put("completion-failed-put", value.data(), value.size()));
+  }
+  const std::string after_fault = transport.MetricsText();
+
+  EXPECT_EQ(CounterVal(after_fault, "dfkv_rdma_client_v2_put_writes_total") -
+                CounterVal(before_fault,
+                           "dfkv_rdma_client_v2_put_writes_total"),
+            1)
+      << "an unsafe PUT must not be posted again after ambiguous completion";
+  EXPECT_EQ(node.CacheDirectCalls(failed_key), 1u)
+      << "the server must observe exactly the single posted PUT";
+  EXPECT_EQ(
+      CounterVal(after_fault, "dfkv_rdma_client_cross_rail_retries_total") -
+          CounterVal(before_fault,
+                     "dfkv_rdma_client_cross_rail_retries_total"),
+      0)
+      << "post-submit PUT failure is not replay-safe";
+
+  size_t failed_rail = rails.size();
+  long failed_selections = 0;
+  for (size_t rail = 0; rail < rails.size(); ++rail) {
+    const long selected =
+        DeviceCounterVal(after_fault,
+                         "dfkv_rdma_client_rail_selections_total",
+                         rails[rail]) -
+        DeviceCounterVal(before_fault,
+                         "dfkv_rdma_client_rail_selections_total",
+                         rails[rail]);
+    EXPECT_TRUE(selected == 0 || selected == 1) << rails[rail];
+    if (selected == 1) failed_rail = rail;
+    failed_selections += selected;
+  }
+  ASSERT_EQ(failed_selections, 1);
+  ASSERT_LT(failed_rail, rails.size());
+  const size_t sibling_rail = 1 - failed_rail;
+  EXPECT_EQ(
+      DeviceCounterVal(
+          after_fault,
+          "dfkv_rdma_client_remote_rail_failures_by_rail_total",
+          rails[failed_rail]) -
+          DeviceCounterVal(
+              before_fault,
+              "dfkv_rdma_client_remote_rail_failures_by_rail_total",
+              rails[failed_rail]),
+      1);
+  EXPECT_EQ(
+      DeviceCounterVal(
+          after_fault,
+          "dfkv_rdma_client_remote_rail_cooldowns_by_rail_total",
+          rails[failed_rail]) -
+          DeviceCounterVal(
+              before_fault,
+              "dfkv_rdma_client_remote_rail_cooldowns_by_rail_total",
+              rails[failed_rail]),
+      1)
+      << "the endpoint completion must cool the rail that owned its lease";
+  EXPECT_EQ(
+      DeviceCounterVal(
+          after_fault,
+          "dfkv_rdma_client_remote_rail_cooldowns_by_rail_total",
+          rails[sibling_rail]) -
+          DeviceCounterVal(
+              before_fault,
+              "dfkv_rdma_client_remote_rail_cooldowns_by_rail_total",
+              rails[sibling_rail]),
+      0);
+
+  KVClient future_client({{"n", node.addr}}, key_namespace, &transport);
+  const BlockKey future_key = ToBlockKey(key_namespace, "future-put");
+  ASSERT_TRUE(future_client.Put("future-put", value.data(), value.size()));
+  const std::string after_future = transport.MetricsText();
+  EXPECT_EQ(
+      DeviceCounterVal(after_future,
+                       "dfkv_rdma_client_rail_selections_total",
+                       rails[failed_rail]) -
+          DeviceCounterVal(after_fault,
+                           "dfkv_rdma_client_rail_selections_total",
+                           rails[failed_rail]),
+      0)
+      << "future admission must bypass the cooled endpoint rail";
+  EXPECT_EQ(
+      DeviceCounterVal(after_future,
+                       "dfkv_rdma_client_rail_selections_total",
+                       rails[sibling_rail]) -
+          DeviceCounterVal(after_fault,
+                           "dfkv_rdma_client_rail_selections_total",
+                           rails[sibling_rail]),
+      1);
+  EXPECT_EQ(
+      CounterVal(after_future, "dfkv_rdma_client_v2_put_writes_total") -
+          CounterVal(after_fault, "dfkv_rdma_client_v2_put_writes_total"),
+      1);
+  EXPECT_EQ(node.CacheDirectCalls(future_key), 1u);
+}
+
+TEST(RdmaLoopback, RemoteCooldownBypassesIdlePoolAndUsesSiblingRail) {
+  if (!HaveRdma())
+    GTEST_SKIP() << "no RDMA device (load two rdma_rxe devices for this test)";
+  const auto rails = ConfiguredTwoTestRails();
+  if (!HaveConfiguredActiveRails(rails))
+    GTEST_SKIP() << "set DFKV_RDMA_DEV to exactly two ACTIVE test devices";
+  ScopedEnv cooldown("DFKV_RDMA_REMOTE_RAIL_COOLDOWN_MS", "30000");
+  ScopedEnv max_cooldown("DFKV_RDMA_REMOTE_RAIL_MAX_COOLDOWN_MS", "30000");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv credits("DFKV_RDMA_RAIL_CREDITS", kRealHcaRailCredits);
+
+  RdmaNode node("remote-idle-bypass");
+  RdmaTransport transport(kMaxMsg, rails[0] + "," + rails[1]);
+  PeerTopology topology;
+  topology.peer_addr = node.addr;
+  topology.peer_id = "remote-idle-bypass-peer";
+  topology.generation = 1;
+  topology.complete = true;
+  for (const auto& rail : rails)
+    topology.rails.push_back(PeerRailTopology{rail, true});
+  transport.OnPeerTopology(topology);
+
+  const BlockKey key = ToBlockKey(SelfHdr(), "remote-idle-bypass");
+  const std::string value(64 * 1024, 'r');
+  ASSERT_EQ(transport.Cache(node.addr, key, value.data(), value.size()),
+            Status::kOk);
+  ASSERT_EQ(RdmaTransportTestPeer::DataPoolSize(&transport, node.addr), 1u);
+  const std::string warm = transport.MetricsText();
+  ASSERT_EQ(
+      DeviceCounterVal(warm, "dfkv_rdma_client_rail_selections_total",
+                       rails[0]),
+      1)
+      << "the deterministic first admission must warm local rail zero";
+
+  const auto seeded = RdmaTransportTestPeer::CoolRemoteRail(
+      &transport, topology.peer_id, 0);
+  ASSERT_TRUE(seeded);
+  ASSERT_EQ(seeded->completion.transition, RemoteRailTransition::kCooled);
+  EXPECT_EQ(RdmaTransportTestPeer::RemoteAllowed(
+                transport, topology.peer_id, {1, 1}, seeded->now_us),
+            (std::vector<uint8_t>{0, 1}));
+
+  const std::string before = transport.MetricsText();
+  std::string output;
+  ASSERT_EQ(transport.Range(node.addr, key, 0, value.size(), &output, nullptr),
+            Status::kOk);
+  EXPECT_EQ(output, value);
+  const std::string after = transport.MetricsText();
+  EXPECT_EQ(
+      DeviceCounterVal(after, "dfkv_rdma_client_rail_selections_total",
+                       rails[0]) -
+          DeviceCounterVal(before, "dfkv_rdma_client_rail_selections_total",
+                           rails[0]),
+      0)
+      << "the idle QP on the cooled peer/rail must not bypass admission";
+  EXPECT_EQ(
+      DeviceCounterVal(after, "dfkv_rdma_client_rail_selections_total",
+                       rails[1]) -
+          DeviceCounterVal(before, "dfkv_rdma_client_rail_selections_total",
+                           rails[1]),
+      1);
+  EXPECT_EQ(CounterVal(after, "dfkv_rdma_endpoint_cache_hits_total") -
+                CounterVal(before, "dfkv_rdma_endpoint_cache_hits_total"),
+            0);
+  EXPECT_EQ(CounterVal(after, "dfkv_rdma_endpoint_cache_misses_total") -
+                CounterVal(before, "dfkv_rdma_endpoint_cache_misses_total"),
+            1);
+  EXPECT_EQ(RdmaTransportTestPeer::DataPoolSize(&transport, node.addr), 2u)
+      << "the cooled idle QP remains present only to prove it was bypassed";
+}
+
+TEST(RdmaLoopback, SoleRemoteCooledRailReturnsExplicitFailure) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv cooldown("DFKV_RDMA_REMOTE_RAIL_COOLDOWN_MS", "30000");
+  ScopedEnv max_cooldown("DFKV_RDMA_REMOTE_RAIL_MAX_COOLDOWN_MS", "30000");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+
+  const auto discovered = rdma::RdmaTopology::Discover(
+      {}, rdma::RdmaDiscoveryPolicy::kActiveOnly);
+  if (discovered.status != rdma::RdmaDiscoveryStatus::kOk ||
+      discovered.devices.empty())
+    GTEST_SKIP() << "no ACTIVE RDMA device";
+  const std::string rail = discovered.devices.front().name;
+  RdmaNode node("remote-sole-cooled");
+  RdmaTransport transport(kMaxMsg, rail);
+  PeerTopology topology;
+  topology.peer_addr = node.addr;
+  topology.peer_id = "remote-sole-cooled-peer";
+  topology.generation = 1;
+  topology.complete = true;
+  topology.rails.push_back(PeerRailTopology{rail, true});
+  transport.OnPeerTopology(topology);
+
+  const BlockKey key = ToBlockKey(SelfHdr(), "remote-sole-cooled");
+  const std::string value(4096, 'c');
+  ASSERT_EQ(transport.Cache(node.addr, key, value.data(), value.size()),
+            Status::kOk);
+  ASSERT_EQ(RdmaTransportTestPeer::DataPoolSize(&transport, node.addr), 1u);
+  const auto seeded = RdmaTransportTestPeer::CoolRemoteRail(
+      &transport, topology.peer_id, 0);
+  ASSERT_TRUE(seeded);
+  ASSERT_EQ(seeded->completion.transition, RemoteRailTransition::kCooled);
+
+  const std::string before = transport.MetricsText();
+  std::string output;
+  EXPECT_EQ(transport.Range(node.addr, key, 0, value.size(), &output, nullptr),
+            Status::kNoCompatibleRail);
+  const std::string after = transport.MetricsText();
+  EXPECT_TRUE(output.empty());
+  EXPECT_EQ(CounterVal(after, "dfkv_rdma_client_no_compatible_rail_total") -
+                CounterVal(before,
+                           "dfkv_rdma_client_no_compatible_rail_total"),
+            1);
+  EXPECT_EQ(CounterVal(after, "dfkv_rdma_endpoint_cache_hits_total"),
+            CounterVal(before, "dfkv_rdma_endpoint_cache_hits_total"));
+  EXPECT_EQ(CounterVal(after, "dfkv_rdma_endpoint_cache_misses_total"),
+            CounterVal(before, "dfkv_rdma_endpoint_cache_misses_total"));
+  EXPECT_EQ(RdmaTransportTestPeer::DataPoolSize(&transport, node.addr), 1u);
+}
+
+TEST(RdmaLoopback, StableIdentityTopologyFlapRetainsRemoteCooldown) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv cooldown("DFKV_RDMA_REMOTE_RAIL_COOLDOWN_MS", "30000");
+  ScopedEnv max_cooldown("DFKV_RDMA_REMOTE_RAIL_MAX_COOLDOWN_MS", "30000");
+  const auto discovered = rdma::RdmaTopology::Discover(
+      {}, rdma::RdmaDiscoveryPolicy::kActiveOnly);
+  if (discovered.status != rdma::RdmaDiscoveryStatus::kOk ||
+      discovered.devices.empty())
+    GTEST_SKIP() << "no ACTIVE RDMA device";
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  const std::string rail = discovered.devices.front().name;
+  RdmaTransport transport(kMaxMsg, rail);
+  PeerTopology topology;
+  topology.peer_addr = "unused-peer-address";
+  topology.peer_id = "stable-flapping-peer";
+  topology.generation = 100;
+  topology.complete = true;
+  topology.rails.push_back(PeerRailTopology{rail, true});
+  transport.OnPeerTopology(topology);
+  const uint64_t first_publication =
+      RdmaTransportTestPeer::PeerPublication(transport, topology.peer_addr);
+
+  const auto seeded = RdmaTransportTestPeer::CoolRemoteRail(
+      &transport, topology.peer_id, 0);
+  ASSERT_TRUE(seeded);
+  topology.generation = 7;
+  topology.rails[0].healthy = false;
+  transport.OnPeerTopology(topology);
+  topology.generation = 999;
+  topology.rails[0].healthy = true;
+  transport.OnPeerTopology(topology);
+  EXPECT_GT(
+      RdmaTransportTestPeer::PeerPublication(transport, topology.peer_addr),
+      first_publication)
+      << "health-only snapshots may republish without resetting rail health";
+  EXPECT_EQ(RdmaTransportTestPeer::RemoteAllowed(
+                transport, topology.peer_id, {1}, seeded->now_us),
+            (std::vector<uint8_t>{0}))
+      << "health-only topology generations must not reset stable identity";
+}
+
+
+TEST(RdmaLoopback,
+     LateReleaseCannotRepoolAcrossRemoveAndIdenticalReadd) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  const auto discovered = rdma::RdmaTopology::Discover(
+      {}, rdma::RdmaDiscoveryPolicy::kActiveOnly);
+  if (discovered.status != rdma::RdmaDiscoveryStatus::kOk ||
+      discovered.devices.empty())
+    GTEST_SKIP() << "no ACTIVE RDMA device";
+
+  const std::string rail = discovered.devices.front().name;
+  RdmaNode node("peer-reincarnation");
+  RdmaTransport transport(kMaxMsg, rail);
+  PeerTopology topology;
+  topology.peer_addr = node.addr;
+  topology.peer_id = "reincarnated-peer";
+  topology.generation = 55;
+  topology.complete = true;
+  topology.rails.push_back(PeerRailTopology{rail, true});
+  transport.OnPeerTopology(topology);
+  const uint64_t first_publication =
+      RdmaTransportTestPeer::PeerPublication(transport, node.addr);
+
+  auto* old_active =
+      RdmaTransportTestPeer::AcquireData(&transport, node.addr);
+  ASSERT_NE(old_active, nullptr);
+  ASSERT_EQ(RdmaTransportTestPeer::DataPoolSize(&transport, node.addr), 0u);
+
+  topology.present = false;
+  transport.OnPeerTopology(topology);
+  topology.present = true;
+  transport.OnPeerTopology(topology);
+  EXPECT_GT(RdmaTransportTestPeer::PeerPublication(transport, node.addr),
+            first_publication);
+
+  const std::string before_release = transport.MetricsText();
+  RdmaTransportTestPeer::ReleaseData(&transport, node.addr, old_active);
+  const std::string after_release = transport.MetricsText();
+  EXPECT_EQ(RdmaTransportTestPeer::DataPoolSize(&transport, node.addr), 0u);
+  EXPECT_EQ(
+      CounterVal(after_release,
+                 "dfkv_rdma_client_stale_generation_reaps_total") -
+          CounterVal(before_release,
+                     "dfkv_rdma_client_stale_generation_reaps_total"),
+      1);
+
+  const std::string before_reacquire = transport.MetricsText();
+  auto* current =
+      RdmaTransportTestPeer::AcquireData(&transport, node.addr);
+  ASSERT_NE(current, nullptr);
+  const std::string after_reacquire = transport.MetricsText();
+  EXPECT_EQ(CounterVal(after_reacquire,
+                       "dfkv_rdma_endpoint_cache_hits_total"),
+            CounterVal(before_reacquire,
+                       "dfkv_rdma_endpoint_cache_hits_total"));
+  EXPECT_EQ(CounterVal(after_reacquire,
+                       "dfkv_rdma_endpoint_cache_misses_total") -
+                CounterVal(before_reacquire,
+                           "dfkv_rdma_endpoint_cache_misses_total"),
+            1);
+  RdmaTransportTestPeer::ReleaseData(&transport, node.addr, current);
+  EXPECT_EQ(RdmaTransportTestPeer::DataPoolSize(&transport, node.addr), 1u);
+}
+
+TEST(RdmaLoopback,
+     ReplaySafeEndpointRetryExcludesRailButPostedPutNeverReplays) {
+  if (!HaveRdma())
+    GTEST_SKIP() << "no RDMA device (load two rdma_rxe devices for this test)";
+  const auto rails = ConfiguredTwoTestRails();
+  if (!HaveConfiguredActiveRails(rails))
+    GTEST_SKIP() << "set DFKV_RDMA_DEV to exactly two ACTIVE test devices";
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  RdmaTransport transport(kMaxMsg, rails[0] + "," + rails[1]);
+
+  const auto replay_safe = RdmaTransportTestPeer::PrepareEndpointRetry(
+      &transport, /*from_pool=*/false, /*replay_safe=*/true,
+      /*request_posted=*/true, /*attempted_rail=*/0);
+  EXPECT_TRUE(replay_safe.retry);
+  EXPECT_TRUE(replay_safe.cross_rail);
+  EXPECT_EQ(replay_safe.excluded, (std::vector<uint8_t>{1, 0}))
+      << "a fresh replay-safe retry must not revisit the failed endpoint rail";
+
+  const auto posted_put = RdmaTransportTestPeer::PrepareEndpointRetry(
+      &transport, /*from_pool=*/true, /*replay_safe=*/false,
+      /*request_posted=*/true, /*attempted_rail=*/0);
+  EXPECT_FALSE(posted_put.retry);
+  EXPECT_FALSE(posted_put.cross_rail);
+  EXPECT_EQ(posted_put.excluded, (std::vector<uint8_t>{0, 0}));
 }

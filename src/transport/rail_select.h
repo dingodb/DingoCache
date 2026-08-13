@@ -125,7 +125,13 @@ inline std::vector<uint8_t> HighestCompatibleTier(
 }
 
 struct PeerRailSnapshot {
+  // Stable MDS identity. Address remains the lookup/routing key, but identity
+  // survives health-only generations and address changes.
+  std::string peer_id;
   uint64_t generation = 0;
+  // Transport-local publication/incarnation token. Unlike generation, this
+  // orders accepted store publications and changes across remove/re-add.
+  uint64_t publication = 0;
   bool complete = false;
   // Peer health by stable local device index. `compatible` is the highest tier
   // for an all-enabled local topology; transports recompute from peer_healthy
@@ -134,10 +140,10 @@ struct PeerRailSnapshot {
   std::vector<uint8_t> compatible;
 };
 
-// Thread-safe immutable snapshot publication keyed by peer address. Explicit
-// heterogeneous tiers fail closed until a complete HLT1 topology arrives.
-// Without explicit tiers, absent/incomplete topology preserves the legacy
-// homogeneous all-local behavior.
+// Thread-safe immutable snapshot publication keyed by peer address and carrying
+// the stable MDS identity. Explicit heterogeneous tiers fail closed until a
+// complete HLT1 topology arrives. Without explicit tiers, absent/incomplete
+// topology preserves the legacy homogeneous all-local behavior.
 class PeerTopologyStore {
  public:
   PeerTopologyStore(std::vector<std::string> local_devices,
@@ -157,7 +163,17 @@ class PeerTopologyStore {
 
   bool Update(const PeerTopology& topology) {
     if (topology.peer_addr.empty()) return false;
+    if (!topology.present) {
+      std::lock_guard<std::mutex> lock(mu_);
+      const auto found = snapshots_.find(topology.peer_addr);
+      if (found == snapshots_.end()) return true;
+      if (found->second->peer_id != topology.peer_id) return false;
+      snapshots_.erase(found);
+      return true;
+    }
+
     auto next = std::make_shared<PeerRailSnapshot>();
+    next->peer_id = topology.peer_id;
     next->generation = topology.generation;
     next->complete = topology.complete;
     if (topology.complete) {
@@ -177,15 +193,31 @@ class PeerTopologyStore {
       next->peer_healthy.assign(local_devices_.size(), 1);
       next->compatible.assign(local_devices_.size(), 1);
     }
+
     std::lock_guard<std::mutex> lock(mu_);
     const auto found = snapshots_.find(topology.peer_addr);
     // generation is a canonical FNV topology token, not a numeric sequence.
     // MdsMemberPoller publishes callbacks in order; compare equality only to
-    // deduplicate the same immutable snapshot. Ordering it with < or > would
-    // reject arbitrary valid topology changes.
+    // deduplicate the same immutable identity snapshot. Ordering it with < or >
+    // would reject arbitrary valid topology changes.
     if (found != snapshots_.end() &&
-        topology.generation == found->second->generation)
+        topology.generation == found->second->generation &&
+        topology.peer_id == found->second->peer_id)
       return false;
+    next->publication = ++last_publication_;
+
+    // An address may change while the MDS identity remains stable. Retire only
+    // the superseded address entry; immutable snapshots already captured by an
+    // in-flight operation remain valid.
+    if (!topology.peer_id.empty()) {
+      for (auto it = snapshots_.begin(); it != snapshots_.end();) {
+        if (it->first != topology.peer_addr &&
+            it->second->peer_id == topology.peer_id)
+          it = snapshots_.erase(it);
+        else
+          ++it;
+      }
+    }
     snapshots_[topology.peer_addr] = std::move(next);
     return true;
   }
@@ -197,12 +229,22 @@ class PeerTopologyStore {
     return found == snapshots_.end() ? fallback_ : found->second;
   }
 
-  bool IsCurrent(const std::string& peer_addr, uint64_t generation) const {
+  bool IsCurrent(const std::string& peer_addr, uint64_t publication) const {
     std::lock_guard<std::mutex> lock(mu_);
     const auto found = snapshots_.find(peer_addr);
-    return (found == snapshots_.end() ? fallback_->generation
-                                      : found->second->generation) ==
-           generation;
+    return (found == snapshots_.end() ? fallback_->publication
+                                      : found->second->publication) ==
+           publication;
+  }
+
+  bool IsCurrent(const std::string& peer_addr, const std::string& peer_id,
+                 uint64_t publication) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto found = snapshots_.find(peer_addr);
+    const auto& snapshot =
+        found == snapshots_.end() ? fallback_ : found->second;
+    return snapshot->peer_id == peer_id &&
+           snapshot->publication == publication;
   }
 
  private:
@@ -210,6 +252,7 @@ class PeerTopologyStore {
   std::vector<std::vector<uint8_t>> tiers_;
   bool require_complete_;
   std::shared_ptr<const PeerRailSnapshot> fallback_;
+  uint64_t last_publication_ = 0;
   mutable std::mutex mu_;
   std::unordered_map<std::string,
                      std::shared_ptr<const PeerRailSnapshot>> snapshots_;

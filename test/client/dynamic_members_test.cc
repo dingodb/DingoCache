@@ -289,10 +289,22 @@ struct HintRecordingTransport : dfkv::Transport {
     peer_topologies.push_back(topology);
     cv.notify_all();
   }
+  void OnPeerIdentities(
+      const std::vector<std::string>& live_peer_ids) override {
+    std::lock_guard<std::mutex> lock(mu);
+    peer_identity_sets.push_back(live_peer_ids);
+    cv.notify_all();
+  }
   bool WaitForPeerTopologies(size_t count) {
     std::unique_lock<std::mutex> lock(mu);
     return cv.wait_for(lock, std::chrono::seconds(5), [&] {
       return peer_topologies.size() >= count;
+    });
+  }
+  bool WaitForPeerIdentitySets(size_t count) {
+    std::unique_lock<std::mutex> lock(mu);
+    return cv.wait_for(lock, std::chrono::seconds(5), [&] {
+      return peer_identity_sets.size() >= count;
     });
   }
   bool WaitForHints(size_t count) {
@@ -308,6 +320,10 @@ struct HintRecordingTransport : dfkv::Transport {
     std::lock_guard<std::mutex> lock(mu);
     return peer_topologies;
   }
+  std::vector<std::vector<std::string>> PeerIdentitySets() const {
+    std::lock_guard<std::mutex> lock(mu);
+    return peer_identity_sets;
+  }
   std::vector<std::string> CachePeers() const {
     std::lock_guard<std::mutex> lock(mu);
     return cache_peers;
@@ -320,6 +336,7 @@ struct HintRecordingTransport : dfkv::Transport {
   std::condition_variable cv;
   std::vector<size_t> hints;
   std::vector<PeerTopology> peer_topologies;
+  std::vector<std::vector<std::string>> peer_identity_sets;
   std::vector<std::string> cache_peers;
   rdma::PeerTopologyStore topology_store{{"ib0"}, {{0}}, true};
   Status Cache(const std::string& peer, const dfkv::BlockKey&, const void*,
@@ -391,10 +408,14 @@ TEST(DynamicMembers, LegacyMdsFallbackAdoptsIncompleteTopology) {
   const std::vector<PeerTopology> topologies = transport.PeerTopologies();
   ASSERT_EQ(topologies.size(), 1u);
   EXPECT_EQ(topologies[0].peer_addr, "127.0.0.1:28101");
+  EXPECT_EQ(topologies[0].peer_id, "legacy-n1");
+  EXPECT_TRUE(topologies[0].present);
   EXPECT_EQ(topologies[0].generation,
             MembersTopologyEpoch(std::vector<MemberInfo>{peer}));
   EXPECT_FALSE(topologies[0].complete);
   EXPECT_TRUE(topologies[0].rails.empty());
+  EXPECT_EQ(transport.PeerIdentitySets(),
+            (std::vector<std::vector<std::string>>{{"legacy-n1"}}));
 }
 
 TEST(DynamicMembers, TransportFailureDoesNotTriggerLegacyFallback) {
@@ -430,6 +451,8 @@ TEST(DynamicMembers, RailHealthChangePropagatesWithoutPlacementChurn) {
   const std::vector<PeerTopology> initial = transport.PeerTopologies();
   ASSERT_EQ(initial.size(), 1u);
   EXPECT_EQ(initial[0].peer_addr, "127.0.0.1:28001");
+  EXPECT_EQ(initial[0].peer_id, "n1");
+  EXPECT_TRUE(initial[0].present);
   EXPECT_TRUE(initial[0].complete);
   EXPECT_EQ(initial[0].generation,
             MembersTopologyEpoch(std::vector<MemberInfo>{peer}));
@@ -449,12 +472,17 @@ TEST(DynamicMembers, RailHealthChangePropagatesWithoutPlacementChurn) {
   const std::vector<PeerTopology> changed = transport.PeerTopologies();
   ASSERT_EQ(changed.size(), 2u);
   EXPECT_EQ(changed[1].peer_addr, initial[0].peer_addr);
+  EXPECT_EQ(changed[1].peer_id, initial[0].peer_id);
+  EXPECT_TRUE(changed[1].present);
   EXPECT_NE(changed[1].generation, initial[0].generation);
   EXPECT_EQ(changed[1].generation,
             MembersTopologyEpoch(std::vector<MemberInfo>{peer}));
   ASSERT_EQ(changed[1].rails.size(), 2u);
   EXPECT_TRUE(changed[1].rails[0].healthy);
   EXPECT_FALSE(changed[1].rails[1].healthy);
+  ASSERT_TRUE(transport.WaitForPeerIdentitySets(2));
+  EXPECT_EQ(transport.PeerIdentitySets(),
+            (std::vector<std::vector<std::string>>{{"n1"}, {"n1"}}));
 
   // Placement was adopted once. The partial rail transition was independently
   // forwarded to the transport without another ring adoption/scale hint.
@@ -463,6 +491,95 @@ TEST(DynamicMembers, RailHealthChangePropagatesWithoutPlacementChurn) {
   EXPECT_EQ(hints[0], 1u);
   EXPECT_TRUE(client.WaitForRing(0));
   EXPECT_TRUE(mds.only_topology_requests());
+}
+
+TEST(DynamicMembers, StableIdentityTracksAddressReplacementAndRemoval) {
+  using P = std::vector<std::pair<std::string, std::string>>;
+  MemberInfo peer{"stable-n1", "127.0.0.1", 28301, 1};
+  peer.has_health = true;
+  peer.health.ring_eligible = true;
+  peer.health.ib_devices = {{"ib0", 4, 5, true}};
+  ScriptedTopologyMds mds({peer});
+  HintRecordingTransport transport;
+  KVClient client(P{}, Hdr(), &transport);
+  // A long interval prevents the guarded empty placement from reaching its
+  // persistence threshold before the first authoritative removal is asserted.
+  client.StartMdsDiscovery({mds.endpoint()}, "identity-test", 1000);
+
+  ASSERT_TRUE(transport.WaitForPeerTopologies(1));
+  ASSERT_TRUE(transport.WaitForPeerIdentitySets(1));
+  const uint64_t initial_generation =
+      MembersTopologyEpoch(std::vector<MemberInfo>{peer});
+  const auto initial_snapshot =
+      transport.PeerSnapshot("127.0.0.1:28301");
+  ASSERT_EQ(initial_snapshot->peer_id, "stable-n1");
+  ASSERT_EQ(initial_snapshot->generation, initial_generation);
+
+  // A routing address change explicitly retires the old address, then
+  // publishes the same stable identity at its new address.
+  peer.port = 28302;
+  mds.SetMembers({peer});
+  ASSERT_TRUE(transport.WaitForPeerTopologies(3));
+  ASSERT_TRUE(transport.WaitForPeerIdentitySets(2));
+  const uint64_t address_generation =
+      MembersTopologyEpoch(std::vector<MemberInfo>{peer});
+  const auto address_snapshot =
+      transport.PeerSnapshot("127.0.0.1:28302");
+  ASSERT_EQ(address_snapshot->peer_id, "stable-n1");
+  ASSERT_EQ(address_snapshot->generation, address_generation);
+  EXPECT_EQ(initial_snapshot->peer_id, "stable-n1");
+  EXPECT_EQ(initial_snapshot->generation, initial_generation);
+
+  // Reusing an address for a different MDS id is an identity replacement, not
+  // an address-derived alias of the old peer.
+  peer.id = "replacement-n2";
+  mds.SetMembers({peer});
+  ASSERT_TRUE(transport.WaitForPeerTopologies(5));
+  ASSERT_TRUE(transport.WaitForPeerIdentitySets(3));
+  const uint64_t replacement_generation =
+      MembersTopologyEpoch(std::vector<MemberInfo>{peer});
+  const auto replacement_snapshot =
+      transport.PeerSnapshot("127.0.0.1:28302");
+  ASSERT_EQ(replacement_snapshot->peer_id, "replacement-n2");
+  ASSERT_EQ(replacement_snapshot->generation, replacement_generation);
+  EXPECT_EQ(address_snapshot->peer_id, "stable-n1");
+  EXPECT_EQ(address_snapshot->generation, address_generation);
+
+  // The replace-all empty view removes the final identity even though the
+  // placement guard may deliberately retain its route.
+  mds.SetMembers({});
+  ASSERT_TRUE(transport.WaitForPeerTopologies(6));
+  ASSERT_TRUE(transport.WaitForPeerIdentitySets(4));
+  client.StopMdsDiscovery();
+
+  const auto updates = transport.PeerTopologies();
+  ASSERT_EQ(updates.size(), 6u);
+  EXPECT_EQ(updates[0].peer_id, "stable-n1");
+  EXPECT_EQ(updates[0].peer_addr, "127.0.0.1:28301");
+  EXPECT_TRUE(updates[0].present);
+  EXPECT_EQ(updates[1].peer_id, "stable-n1");
+  EXPECT_EQ(updates[1].peer_addr, "127.0.0.1:28301");
+  EXPECT_EQ(updates[1].generation, address_generation);
+  EXPECT_FALSE(updates[1].present);
+  EXPECT_EQ(updates[2].peer_id, "stable-n1");
+  EXPECT_EQ(updates[2].peer_addr, "127.0.0.1:28302");
+  EXPECT_TRUE(updates[2].present);
+  EXPECT_EQ(updates[3].peer_id, "stable-n1");
+  EXPECT_EQ(updates[3].peer_addr, "127.0.0.1:28302");
+  EXPECT_EQ(updates[3].generation, replacement_generation);
+  EXPECT_FALSE(updates[3].present);
+  EXPECT_EQ(updates[4].peer_id, "replacement-n2");
+  EXPECT_EQ(updates[4].peer_addr, "127.0.0.1:28302");
+  EXPECT_TRUE(updates[4].present);
+  EXPECT_EQ(updates[5].peer_id, "replacement-n2");
+  EXPECT_EQ(updates[5].peer_addr, "127.0.0.1:28302");
+  EXPECT_EQ(updates[5].generation,
+            MembersTopologyEpoch(std::vector<MemberInfo>{}));
+  EXPECT_FALSE(updates[5].present);
+  EXPECT_EQ(transport.PeerIdentitySets(),
+            (std::vector<std::vector<std::string>>{
+                {"stable-n1"}, {"stable-n1"}, {"replacement-n2"}, {}}));
+  EXPECT_TRUE(transport.PeerSnapshot("127.0.0.1:28302")->peer_id.empty());
 }
 
 TEST(DynamicMembers, GuardRejectedShrinkInvalidatesOmittedRoutablePeers) {
@@ -499,29 +616,34 @@ TEST(DynamicMembers, GuardRejectedShrinkInvalidatesOmittedRoutablePeers) {
   ASSERT_NE(shrink_generation, initial_generation);
   const std::vector<PeerTopology> updates = transport.PeerTopologies();
   ASSERT_EQ(updates.size(), 6u);
-  EXPECT_EQ(updates[3].peer_addr, "127.0.0.1:28201");
-  EXPECT_EQ(updates[3].generation, shrink_generation);
-  EXPECT_TRUE(updates[3].complete);
-  for (size_t i = 4; i < 6; ++i) {
+  for (size_t i = 3; i < 5; ++i) {
     EXPECT_EQ(updates[i].generation, shrink_generation);
+    EXPECT_FALSE(updates[i].present);
     EXPECT_FALSE(updates[i].complete);
     EXPECT_TRUE(updates[i].rails.empty());
   }
-  EXPECT_NE(updates[4].peer_addr, updates[5].peer_addr);
-  EXPECT_TRUE((updates[4].peer_addr == "127.0.0.1:28202" ||
-               updates[4].peer_addr == "127.0.0.1:28203"));
-  EXPECT_TRUE((updates[5].peer_addr == "127.0.0.1:28202" ||
-               updates[5].peer_addr == "127.0.0.1:28203"));
+  EXPECT_NE(updates[3].peer_id, updates[4].peer_id);
+  EXPECT_TRUE((updates[3].peer_id == "n1" || updates[3].peer_id == "n2"));
+  EXPECT_TRUE((updates[4].peer_id == "n1" || updates[4].peer_id == "n2"));
+  EXPECT_EQ(updates[5].peer_id, "n0");
+  EXPECT_EQ(updates[5].peer_addr, "127.0.0.1:28201");
+  EXPECT_EQ(updates[5].generation, shrink_generation);
+  EXPECT_TRUE(updates[5].present);
+  EXPECT_TRUE(updates[5].complete);
+  ASSERT_TRUE(transport.WaitForPeerIdentitySets(2));
+  EXPECT_EQ(transport.PeerIdentitySets(),
+            (std::vector<std::vector<std::string>>{
+                {"n0", "n1", "n2"}, {"n0"}}));
 
-  // No second placement hint: the guard retained all three routes. The
-  // replace-all invalidations have already made explicitly configured tiers
-  // fail closed for the omitted peers.
+  // No second placement hint: the guard retained all three routes. Explicit
+  // identity retirements remove their address snapshots, so the strict store's
+  // fallback keeps the omitted routes fail-closed without retaining state.
   const auto omitted_two = transport.PeerSnapshot("127.0.0.1:28202");
   const auto omitted_three = transport.PeerSnapshot("127.0.0.1:28203");
-  EXPECT_EQ(omitted_two->generation, shrink_generation);
+  EXPECT_TRUE(omitted_two->peer_id.empty());
   EXPECT_FALSE(omitted_two->complete);
   EXPECT_TRUE(omitted_two->compatible.empty());
-  EXPECT_EQ(omitted_three->generation, shrink_generation);
+  EXPECT_TRUE(omitted_three->peer_id.empty());
   EXPECT_FALSE(omitted_three->complete);
   EXPECT_TRUE(omitted_three->compatible.empty());
   ASSERT_EQ(transport.Hints(), std::vector<size_t>({3u}));

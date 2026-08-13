@@ -151,14 +151,15 @@ std::string JoinDevices(const std::vector<std::string>& devices,
 }
 
 // Test-only deterministic completion faults for data operations.
-// The env value is a comma-separated list of
+// DFKV_RDMA_TEST_COMPLETION_FAULT injects local IBV_WC_GENERAL_ERR evidence;
+// DFKV_RDMA_TEST_ENDPOINT_COMPLETION_FAULT injects remote
+// IBV_WC_REM_ACCESS_ERR evidence. Their value is a comma-separated list of
 // "<logical-call>:<attempt>:<completion-window>" specs, all one-based.
-// Eligible logical calls are numbered only while the env is set. Each
-// operation owns its injection state and passes it explicitly to data-path
-// reaps, so pooled connection maintenance cannot consume a target window.
-// A matching successfully reaped window is surfaced once as
-// IBV_WC_GENERAL_ERR through
-// the production ReapPosted/ClassifyCompletion path.
+// Eligible logical calls are numbered only while one of the env vars is set.
+// Each operation owns its injection state and passes it explicitly to
+// data-path reaps, so pooled connection maintenance cannot consume a target
+// window. A matching successfully reaped window is surfaced once through the
+// production ReapPosted/ClassifyCompletion path.
 struct CompletionFaultTarget {
   uint64_t call = 0;
   uint64_t attempt = 0;
@@ -170,7 +171,13 @@ class CompletionFaultOperation {
   explicit CompletionFaultOperation(std::atomic<uint64_t>* calls,
                                     bool enabled = true) {
     if (!enabled) return;
-    const char* cursor = std::getenv("DFKV_RDMA_TEST_COMPLETION_FAULT");
+    const char* cursor =
+        std::getenv("DFKV_RDMA_TEST_ENDPOINT_COMPLETION_FAULT");
+    if (cursor && *cursor) {
+      status_ = IBV_WC_REM_ACCESS_ERR;
+    } else {
+      cursor = std::getenv("DFKV_RDMA_TEST_COMPLETION_FAULT");
+    }
     if (!cursor || !*cursor) return;
     std::vector<CompletionFaultTarget> parsed;
     for (;;) {
@@ -214,10 +221,12 @@ class CompletionFaultOperation {
     }
     return false;
   }
+  ibv_wc_status status() const { return status_; }
 
  private:
   std::vector<CompletionFaultTarget> targets_;
   uint64_t attempt_ = 0;
+  ibv_wc_status status_ = IBV_WC_GENERAL_ERR;
   uint64_t window_ = 0;
 };
 
@@ -284,7 +293,7 @@ bool ReapPosted(rdma::RcEndpoint& ep, size_t posted, size_t slot_count,
     }
   }
   if (completion_fault && completion_fault->InjectAfterCompletedWindow()) {
-    if (worst_status) *worst_status = IBV_WC_GENERAL_ERR;
+    if (worst_status) *worst_status = completion_fault->status();
     if (had_completions) *had_completions = true;
     return false;
   }
@@ -340,7 +349,11 @@ struct RdmaTransport::Conn {
   rdma::RcEndpoint ep;
   rdma::RecvSegmentInfo recv_segment;
   size_t rail_index = 0;
-  uint64_t peer_generation = 0;
+  uint64_t peer_publication = 0;
+  std::string peer_id;
+  uint64_t remote_lease_generation = 0;
+  bool remote_lease_held = false;
+  bool remote_recovery_probe = false;
   rdma::RailLease lease;
   uint64_t lease_started_us = 0;
   bool credit_held = false;
@@ -430,6 +443,19 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   }
   peer_topologies_ = std::make_unique<rdma::PeerTopologyStore>(
       devs_, rail_tiers_, peer_topology_required_);
+  const int remote_base_cooldown_ms = EnvBoundedInt(
+      "DFKV_RDMA_REMOTE_RAIL_COOLDOWN_MS", 2000, 30000);
+  const int remote_max_cooldown_ms = std::max(
+      remote_base_cooldown_ms,
+      EnvBoundedInt("DFKV_RDMA_REMOTE_RAIL_MAX_COOLDOWN_MS", 30000, 30000));
+  remote_rail_health_ = std::make_unique<RemoteRailHealth>(
+      RemoteRailHealthConfig{
+          static_cast<uint64_t>(remote_base_cooldown_ms) * 1000,
+          static_cast<uint64_t>(remote_max_cooldown_ms) * 1000});
+  config_dump::RecordResolved("DFKV_RDMA_REMOTE_RAIL_COOLDOWN_MS",
+                              std::to_string(remote_base_cooldown_ms));
+  config_dump::RecordResolved("DFKV_RDMA_REMOTE_RAIL_MAX_COOLDOWN_MS",
+                              std::to_string(remote_max_cooldown_ms));
   config_dump::RecordResolved(
       "DFKV_RDMA_RAIL_TIERS",
       peer_topology_required_ ? tiers_spec : JoinDevices(devs_, "|"));
@@ -606,12 +632,15 @@ RdmaTransport::~RdmaTransport() {
   for (Conn* conn : idle) Destroy(conn);
 }
 
-bool RdmaTransport::KeepaliveConn(Conn* conn) {
-  if (!conn) return false;
+bool RdmaTransport::KeepaliveConn(Conn* conn,
+                                  rdma::RailCompletion* failure) {
+  if (!conn || !failure) return false;
+  *failure = rdma::RailCompletion::kAdmission;
   keepalive_attempts_.fetch_add(1, std::memory_order_relaxed);
   rdma::RcEndpoint& ep = conn->ep;
   conn->Encode(ep.sbuf(0), WireOp::kMembers, BlockKey{}, 0, 0, 0);
   if (!ep.PostRecv(0) || !ep.PostSend(0, kReqPrefix)) {
+    *failure = rdma::RailCompletion::kRailFailure;
     keepalive_failures_.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
@@ -622,8 +651,13 @@ bool RdmaTransport::KeepaliveConn(Conn* conn) {
   const int timeout_ms =
       op_timeout_ms_ < 0 ? 100 : std::min(op_timeout_ms_, 100);
   if (!ReapWindow(ep, 1, &reply_bytes, timeout_ms, &timed_out, &wc_status,
-                  &had_wcs) ||
-      reply_bytes.empty() || reply_bytes[0] < kRespPrefix) {
+                  &had_wcs)) {
+    *failure = rdma::ClassifyCompletion(wc_status, had_wcs);
+    keepalive_failures_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  if (reply_bytes.empty() || reply_bytes[0] < kRespPrefix) {
+    *failure = rdma::RailCompletion::kEndpointFailure;
     keepalive_failures_.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
@@ -631,8 +665,12 @@ bool RdmaTransport::KeepaliveConn(Conn* conn) {
   uint64_t data_len = 0;
   if (!conn->Decode(ep.rbuf(0), &status, &data_len,
                     rdma::kV2ControlResponseMax) ||
-      status != Status::kOk ||
       data_len > reply_bytes[0] - kRespPrefix) {
+    *failure = rdma::RailCompletion::kEndpointFailure;
+    keepalive_failures_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  if (status != Status::kOk) {
     keepalive_failures_.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
@@ -668,29 +706,117 @@ void RdmaTransport::KeepaliveLoop() {
       collect(control_pool_, Lane::kControl);
     }
     for (const auto& entry : idle) {
-      if (!peer_topologies_->IsCurrent(entry.node,
-                                       entry.conn->peer_generation)) {
-        stale_generation_reaps_.fetch_add(1, std::memory_order_relaxed);
+      if (!peer_topologies_->IsCurrent(entry.node, entry.conn->peer_id,
+                                       entry.conn->peer_publication)) {
+        stale_publication_reaps_.fetch_add(1, std::memory_order_relaxed);
         Destroy(entry.conn, rdma::RailCompletion::kAdmission);
-      } else if (keepalive_stop_.load(std::memory_order_relaxed) ||
-                 !KeepaliveConn(entry.conn)) {
-        Destroy(entry.conn, rdma::RailCompletion::kEndpointFailure);
-      } else {
-        Release(entry.node, entry.lane, entry.conn);
+        continue;
       }
+      if (keepalive_stop_.load(std::memory_order_relaxed)) {
+        Destroy(entry.conn, rdma::RailCompletion::kAdmission);
+        continue;
+      }
+      if (!entry.conn->peer_id.empty()) {
+        const auto remote = remote_rail_health_->TryAcquire(
+            entry.conn->peer_id, entry.conn->rail_index,
+            rdma::RailPolicy::NowMicros());
+        if (!remote) {
+          Destroy(entry.conn, rdma::RailCompletion::kAdmission);
+          continue;
+        }
+        entry.conn->remote_lease_generation = remote->generation;
+        entry.conn->remote_lease_held = true;
+        entry.conn->remote_recovery_probe = remote->recovery_probe;
+      }
+      rdma::RailCompletion failure = rdma::RailCompletion::kAdmission;
+      if (!KeepaliveConn(entry.conn, &failure))
+        Destroy(entry.conn, failure);
+      else
+        Release(entry.node, entry.lane, entry.conn);
     }
     wait_lock.lock();
   }
 }
 
+void RdmaTransport::RetireIdlePeerRail(const std::string& peer_id,
+                                       size_t local_rail) {
+  if (peer_id.empty()) return;
+  std::vector<Conn*> retired;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto reap = [&](auto& pools) {
+      for (auto map_it = pools.begin(); map_it != pools.end();) {
+        auto& connections = map_it->second;
+        for (auto it = connections.begin(); it != connections.end();) {
+          Conn* conn = *it;
+          if (conn->peer_id != peer_id || conn->rail_index != local_rail ||
+              !conn->lifecycle.RequestRetire()) {
+            ++it;
+            continue;
+          }
+          retired.push_back(conn);
+          it = connections.erase(it);
+        }
+        if (connections.empty())
+          map_it = pools.erase(map_it);
+        else
+          ++map_it;
+      }
+    };
+    reap(pool_);
+    reap(sg_pool_);
+    reap(control_pool_);
+  }
+  for (Conn* conn : retired)
+    Destroy(conn, rdma::RailCompletion::kAdmission);
+}
+
+void RdmaTransport::CompleteRemote(const std::string& peer_id,
+                                   size_t local_rail, uint64_t generation,
+                                   RemoteRailOutcome outcome) {
+  if (peer_id.empty() || generation == 0) return;
+  const uint64_t now = rdma::RailPolicy::NowMicros();
+  const RemoteRailCompletion completion = remote_rail_health_->Complete(
+      peer_id, local_rail, generation, outcome, now);
+  const std::string dev =
+      local_rail < devs_.size() && !devs_[local_rail].empty()
+          ? devs_[local_rail]
+          : "default";
+  if (completion.transition == RemoteRailTransition::kCooled) {
+    DFKV_LOG_WARN(
+        "rdma: remote endpoint rail cooled peer_id=" + peer_id +
+        " dev=" + dev + " cooldown_ms=" +
+        std::to_string(completion.cooldown_until_us > now
+                           ? (completion.cooldown_until_us - now) / 1000
+                           : 0));
+    RetireIdlePeerRail(peer_id, local_rail);
+  } else if (completion.transition == RemoteRailTransition::kRecovered) {
+    DFKV_LOG_INFO("rdma: remote endpoint rail recovered peer_id=" + peer_id +
+                  " dev=" + dev);
+  }
+}
+
+void RdmaTransport::CompleteRemoteLease(Conn* c,
+                                        RemoteRailOutcome outcome) {
+  if (!c || !c->remote_lease_held) return;
+  c->remote_lease_held = false;
+  CompleteRemote(c->peer_id, c->rail_index, c->remote_lease_generation,
+                 outcome);
+}
+
 void RdmaTransport::Destroy(Conn* c, rdma::RailCompletion completion) {
   if (!c) return;
+
   c->lifecycle.BeginDrain();
   const bool credit_held = c->credit_held;
   const rdma::RailLease lease = c->lease;
   const uint64_t lease_started_us = c->lease_started_us;
   const bool release_budget = c->budget_held;
   const rdma::ResourceRequest budget_request = c->budget_request;
+  CompleteRemoteLease(
+      c, completion == rdma::RailCompletion::kEndpointFailure
+             ? RemoteRailOutcome::kEndpointFailure
+             : RemoteRailOutcome::kAbandon);
 
   // The endpoint owns the QP, CQs, and all transient/pool MRs. Destroy it
   // synchronously before returning either rail credits or process resources,
@@ -764,19 +890,23 @@ void RdmaTransport::OnTopologyHint(size_t nodes) {
 void RdmaTransport::OnPeerTopology(const PeerTopology& topology) {
   std::vector<Conn*> stale;
   {
-    // Publish and detach under the same pool lock. Acquire's generation check
-    // uses this lock too, so no idle endpoint can cross the update linearization
-    // point and become active with the retired generation.
+    // Publish and detach under the same pool lock. Acquire's publication check
+    // uses this lock too, so no idle endpoint can cross the update
+    // linearization point and become active with the retired incarnation.
     std::lock_guard<std::mutex> lock(mu_);
     if (!peer_topologies_->Update(topology)) return;
+    const auto current_snapshot =
+        peer_topologies_->Snapshot(topology.peer_addr);
     const auto reap = [&](auto& pools) {
       const auto found = pools.find(topology.peer_addr);
       if (found == pools.end()) return;
       auto& connections = found->second;
       for (auto it = connections.begin(); it != connections.end();) {
         Conn* conn = *it;
-        if (conn->peer_generation == topology.generation ||
-            !conn->lifecycle.RequestRetire()) {
+        const bool current =
+            topology.present && conn->peer_id == current_snapshot->peer_id &&
+            conn->peer_publication == current_snapshot->publication;
+        if (current || !conn->lifecycle.RequestRetire()) {
           ++it;
           continue;
         }
@@ -792,7 +922,12 @@ void RdmaTransport::OnPeerTopology(const PeerTopology& topology) {
   peer_topology_updates_.fetch_add(1, std::memory_order_relaxed);
   for (Conn* conn : stale)
     Destroy(conn, rdma::RailCompletion::kAdmission);
-  stale_generation_reaps_.fetch_add(stale.size(), std::memory_order_relaxed);
+  stale_publication_reaps_.fetch_add(stale.size(), std::memory_order_relaxed);
+}
+
+void RdmaTransport::OnPeerIdentities(
+    const std::vector<std::string>& live_peer_ids) {
+  remote_rail_health_->Reconcile(live_peer_ids);
 }
 
 uint16_t RdmaTransport::LearnedDepth(const std::string& node, Lane lane) {
@@ -848,9 +983,9 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   const uint32_t requested = static_cast<uint32_t>(
       std::min<size_t>(options.requested_credits,
                        std::numeric_limits<uint32_t>::max()));
-  // NUMA preference, credits, latency, and quarantine are applied only inside
-  // the highest tier in the captured peer generation that still intersects
-  // the runtime-enabled local topology.
+  // NUMA preference, credits, latency, and local quarantine are applied only
+  // inside the highest tier in the captured immutable peer snapshot that
+  // intersects runtime-enabled local topology and remote endpoint health.
   const int caller_node = numa_aware_ ? numa::CurrentNode() : -1;
   const auto candidates =
       topology_->CandidatesFor(caller_node, numa_aware_);
@@ -861,28 +996,61 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   }
   const auto local_enabled =
       rdma::UnionRailMasks(candidates.allowed, candidates.fallback);
-  const auto highest_tier = rdma::HighestCompatibleTier(
-      rail_tiers_,
-      rdma::IntersectRailMasks(peer_snapshot->peer_healthy, local_enabled));
-  if (!rdma::HasRail(highest_tier)) {
+  const auto topology_compatible =
+      rdma::IntersectRailMasks(peer_snapshot->peer_healthy, local_enabled);
+  RailMask admission_excluded = options.excluded;
+  admission_excluded.resize(devs_.size(), 0);
+  std::optional<rdma::RailLease> lease;
+  std::optional<RemoteRailLease> remote_lease;
+  uint64_t lease_started = 0;
+  size_t ridx = 0;
+  for (size_t selection_attempt = 0; selection_attempt < devs_.size();
+       ++selection_attempt) {
+    const uint64_t now = rdma::RailPolicy::NowMicros();
+    const auto remote_compatible =
+        peer_snapshot->peer_id.empty()
+            ? topology_compatible
+            : remote_rail_health_->AllowedMask(
+                  peer_snapshot->peer_id, topology_compatible, now);
+    const auto highest_tier =
+        rdma::HighestCompatibleTier(rail_tiers_, remote_compatible);
+    if (!rdma::HasRail(highest_tier)) break;
+    lease = rdma::AcquireHighestTier(
+        *rail_policy_, requested, rail_backpressure_us_, highest_tier,
+        candidates.allowed, candidates.fallback, admission_excluded);
+    if (!lease) {
+      result.failure = AcquireFailure::kAdmission;
+      result.status = Status::kResourceExhausted;
+      return result;
+    }
+    ridx = lease->rail;
+    result.attempted_rail = ridx;
+    lease_started = rdma::RailPolicy::NowMicros();
+    if (peer_snapshot->peer_id.empty()) break;
+    remote_lease = remote_rail_health_->TryAcquire(
+        peer_snapshot->peer_id, ridx, lease_started);
+    if (remote_lease) break;
+    const uint64_t denied_at = rdma::RailPolicy::NowMicros();
+    rail_policy_->Complete(*lease, denied_at - lease_started,
+                           rdma::RailCompletion::kAdmission, denied_at);
+    admission_excluded[ridx] = 1;
+    lease.reset();
+  }
+  if (!lease) {
     no_compatible_rail_.fetch_add(1, std::memory_order_relaxed);
     result.failure = AcquireFailure::kNoCompatibleRail;
     result.status = Status::kNoCompatibleRail;
     return result;
   }
-  auto lease = rdma::AcquireHighestTier(
-      *rail_policy_, requested, rail_backpressure_us_, highest_tier,
-      candidates.allowed, candidates.fallback, options.excluded);
-  if (!lease) {
-    result.failure = AcquireFailure::kAdmission;
-    result.status = Status::kResourceExhausted;
-    return result;
-  }
-  result.attempted_rail = lease->rail;
-  const size_t ridx = lease->rail;
-  const uint64_t lease_started = rdma::RailPolicy::NowMicros();
   const auto complete_unowned_lease =
       [&](rdma::RailCompletion completion) {
+        if (remote_lease) {
+          CompleteRemote(
+              peer_snapshot->peer_id, ridx, remote_lease->generation,
+              completion == rdma::RailCompletion::kEndpointFailure
+                  ? RemoteRailOutcome::kEndpointFailure
+                  : RemoteRailOutcome::kAbandon);
+        }
         const uint64_t now = rdma::RailPolicy::NowMicros();
         rail_policy_->Complete(*lease, now - lease_started, completion, now);
       };
@@ -890,12 +1058,15 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   std::vector<std::pair<void*, size_t>> pools;
   std::vector<Conn*> stale;
   Conn* pooled = nullptr;
+  bool snapshot_current = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
     pools = pools_;
-    const uint64_t current_generation =
-        peer_topologies_->Snapshot(node)->generation;
-    if (!options.force_new) {
+    const auto current_peer = peer_topologies_->Snapshot(node);
+    snapshot_current =
+        current_peer && current_peer->peer_id == peer_snapshot->peer_id &&
+        current_peer->publication == peer_snapshot->publication;
+    if (snapshot_current && !options.force_new) {
       auto& idle = lane == Lane::kData
                        ? pool_
                        : (lane == Lane::kSgData ? sg_pool_ : control_pool_);
@@ -904,7 +1075,9 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
         auto& pool_candidates = it->second;
         for (size_t i = pool_candidates.size(); i > 0; --i) {
           Conn* candidate = pool_candidates[i - 1];
-          if (candidate->peer_generation != current_generation) {
+          if (!current_peer ||
+              candidate->peer_id != current_peer->peer_id ||
+              candidate->peer_publication != current_peer->publication) {
             if (candidate->lifecycle.RequestRetire()) {
               stale.push_back(candidate);
               pool_candidates.erase(pool_candidates.begin() +
@@ -912,7 +1085,8 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
             }
             continue;
           }
-          if (candidate->peer_generation == peer_snapshot->generation &&
+          if (candidate->peer_id == peer_snapshot->peer_id &&
+              candidate->peer_publication == peer_snapshot->publication &&
               candidate->rail_index == ridx &&
               candidate->lifecycle.Activate()) {
             pooled = candidate;
@@ -926,12 +1100,22 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   }
   for (Conn* conn : stale)
     Destroy(conn, rdma::RailCompletion::kAdmission);
-  stale_generation_reaps_.fetch_add(stale.size(), std::memory_order_relaxed);
+  stale_publication_reaps_.fetch_add(stale.size(), std::memory_order_relaxed);
+  if (!snapshot_current) {
+    complete_unowned_lease(rdma::RailCompletion::kAdmission);
+    result.failure = AcquireFailure::kAdmission;
+    return result;
+  }
   if (pooled) {
     pooled->lease = *lease;
     pooled->lease_started_us = lease_started;
     pooled->credit_held = true;
     pooled->visited = true;
+    pooled->remote_lease_generation =
+        remote_lease ? remote_lease->generation : 0;
+    pooled->remote_lease_held = remote_lease.has_value();
+    pooled->remote_recovery_probe =
+        remote_lease && remote_lease->recovery_probe;
     result.from_pool = true;
     if (!pooled->ep.EnsurePoolMrs(pools, true)) {
       Destroy(pooled, rdma::RailCompletion::kRailFailure);
@@ -1009,7 +1193,13 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   }
   auto* conn = new Conn();
   conn->rail_index = ridx;
-  conn->peer_generation = peer_snapshot->generation;
+  conn->peer_publication = peer_snapshot->publication;
+  conn->peer_id = peer_snapshot->peer_id;
+  conn->remote_lease_generation =
+      remote_lease ? remote_lease->generation : 0;
+  conn->remote_lease_held = remote_lease.has_value();
+  conn->remote_recovery_probe =
+      remote_lease && remote_lease->recovery_probe;
   conn->lease = *lease;
   conn->lease_started_us = lease_started;
   conn->credit_held = true;
@@ -1113,6 +1303,18 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     result.failure = AcquireFailure::kLocalRail;
     return result;
   }
+  bool publication_current = false;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    publication_current = peer_topologies_->IsCurrent(
+        node, conn->peer_id, conn->peer_publication);
+  }
+  if (!publication_current) {
+    stale_publication_reaps_.fetch_add(1, std::memory_order_relaxed);
+    Destroy(conn, rdma::RailCompletion::kAdmission);
+    result.failure = AcquireFailure::kAdmission;
+    return result;
+  }
   conns_opened_.fetch_add(1, std::memory_order_relaxed);
   rail_conns_[ridx].fetch_add(1, std::memory_order_relaxed);
   result.conn = conn;
@@ -1137,9 +1339,14 @@ bool RdmaTransport::PrepareRetry(
         topology_->CandidatesFor(caller_node, numa_aware_);
     const auto local_enabled =
         rdma::UnionRailMasks(candidates.allowed, candidates.fallback);
-    const auto highest_tier = rdma::HighestCompatibleTier(
-        rail_tiers_,
-        rdma::IntersectRailMasks(peer->peer_healthy, local_enabled));
+    auto compatible =
+        rdma::IntersectRailMasks(peer->peer_healthy, local_enabled);
+    if (!peer->peer_id.empty()) {
+      compatible = remote_rail_health_->AllowedMask(
+          peer->peer_id, compatible, rdma::RailPolicy::NowMicros());
+    }
+    const auto highest_tier =
+        rdma::HighestCompatibleTier(rail_tiers_, compatible);
     const auto preferred =
         rdma::IntersectRailMasks(highest_tier, candidates.allowed);
     const auto fallback =
@@ -1154,8 +1361,33 @@ bool RdmaTransport::PrepareRetry(
     }
     return true;
   }
-  if (failure == AcquireFailure::kEndpoint && from_pool) {
-    stale_pool_retries_.fetch_add(1, std::memory_order_relaxed);
+  if (failure == AcquireFailure::kEndpoint && attempted_rail &&
+      *attempted_rail < devs_.size()) {
+    excluded->assign(devs_.size(), 0);
+    (*excluded)[*attempted_rail] = 1;
+    const int caller_node = numa_aware_ ? numa::CurrentNode() : -1;
+    const auto candidates =
+        topology_->CandidatesFor(caller_node, numa_aware_);
+    const auto local_enabled =
+        rdma::UnionRailMasks(candidates.allowed, candidates.fallback);
+    auto compatible =
+        rdma::IntersectRailMasks(peer->peer_healthy, local_enabled);
+    if (!peer->peer_id.empty()) {
+      compatible = remote_rail_health_->AllowedMask(
+          peer->peer_id, compatible, rdma::RailPolicy::NowMicros());
+    }
+    const auto highest_tier =
+        rdma::HighestCompatibleTier(rail_tiers_, compatible);
+    const auto preferred =
+        rdma::IntersectRailMasks(highest_tier, candidates.allowed);
+    const auto fallback =
+        rdma::IntersectRailMasks(highest_tier, candidates.fallback);
+    if (!rdma::HasUnexcludedRail(preferred, fallback, *excluded))
+      return false;
+    if (from_pool)
+      stale_pool_retries_.fetch_add(1, std::memory_order_relaxed);
+    cross_rail_retries_.fetch_add(1, std::memory_order_relaxed);
+    *cross_rail_retry = true;
     return true;
   }
   return false;
@@ -1496,7 +1728,7 @@ std::string RdmaTransport::MetricsText() const {
   s += "dfkv_rdma_client_stale_pool_retries_total " +
        std::to_string(stale_pool_retries_.load(std::memory_order_relaxed)) +
        "\n";
-  s += "# HELP dfkv_rdma_client_cross_rail_retries_total Logical operations retried with the failed client-local RDMA rail excluded and another topology-enabled rail available\n";
+  s += "# HELP dfkv_rdma_client_cross_rail_retries_total Logical operations retried with the failed local or remote endpoint rail excluded and another compatible healthy rail available\n";
   s += "# TYPE dfkv_rdma_client_cross_rail_retries_total counter\n";
   s += "dfkv_rdma_client_cross_rail_retries_total " +
        std::to_string(cross_rail_retries_.load(std::memory_order_relaxed)) +
@@ -1533,7 +1765,7 @@ std::string RdmaTransport::MetricsText() const {
   s += "dfkv_rdma_client_keepalive_failures_total " +
        std::to_string(keepalive_failures_.load(std::memory_order_relaxed)) +
        "\n";
-  s += "# HELP dfkv_rdma_client_peer_topology_updates_total Published peer topology generations\n";
+  s += "# HELP dfkv_rdma_client_peer_topology_updates_total Published peer topology snapshots\n";
   s += "# TYPE dfkv_rdma_client_peer_topology_updates_total counter\n";
   s += "dfkv_rdma_client_peer_topology_updates_total " +
        std::to_string(
@@ -1543,15 +1775,18 @@ std::string RdmaTransport::MetricsText() const {
   s += "dfkv_rdma_client_no_compatible_rail_total " +
        std::to_string(no_compatible_rail_.load(std::memory_order_relaxed)) +
        "\n";
-  s += "# HELP dfkv_rdma_client_stale_generation_reaps_total Connections retired instead of reuse after a peer topology generation change\n";
+  s += "# HELP dfkv_rdma_client_stale_generation_reaps_total Connections retired instead of reuse after a peer publication/incarnation change\n";
   s += "# TYPE dfkv_rdma_client_stale_generation_reaps_total counter\n";
   s += "dfkv_rdma_client_stale_generation_reaps_total " +
        std::to_string(
-           stale_generation_reaps_.load(std::memory_order_relaxed)) + "\n";
+           stale_publication_reaps_.load(std::memory_order_relaxed)) + "\n";
+  s += remote_rail_health_->MetricsText(devs_);
   return s;
 }
 
-void RdmaTransport::Release(const std::string& node, Lane lane, Conn* c) {
+void RdmaTransport::Release(const std::string& node, Lane lane, Conn* c,
+                            RemoteRailOutcome remote_outcome) {
+  CompleteRemoteLease(c, remote_outcome);
   bool refresh_ok = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
@@ -1572,12 +1807,12 @@ void RdmaTransport::Release(const std::string& node, Lane lane, Conn* c) {
   }
 
   bool reusable = false;
-  bool generation_current = false;
+  bool publication_current = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
-    generation_current =
-        peer_topologies_->IsCurrent(node, c->peer_generation);
-    if (generation_current) {
+    publication_current = peer_topologies_->IsCurrent(
+        node, c->peer_id, c->peer_publication);
+    if (publication_current) {
       auto& idle = lane == Lane::kData
                        ? pool_
                        : (lane == Lane::kSgData ? sg_pool_ : control_pool_);
@@ -1588,8 +1823,8 @@ void RdmaTransport::Release(const std::string& node, Lane lane, Conn* c) {
       }
     }
   }
-  if (!reusable && !generation_current)
-    stale_generation_reaps_.fetch_add(1, std::memory_order_relaxed);
+  if (!reusable && !publication_current)
+    stale_publication_reaps_.fetch_add(1, std::memory_order_relaxed);
   if (!reusable) Destroy(c);
 }
 
@@ -1663,7 +1898,7 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
     bool request_posted = false;
     if (op == WireOp::kCache) {
       if (payload_len > conn->data_capacity()) {
-        Release(node, lane, conn);
+        Release(node, lane, conn, RemoteRailOutcome::kAbandon);
         return Status::kInvalid;
       }
       ibv_mr* payload_mr =
@@ -1685,7 +1920,7 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
     } else if (op == WireOp::kRange) {
       if (!out || length > conn->data_capacity() ||
           length > std::numeric_limits<uint32_t>::max()) {
-        Release(node, lane, conn);
+        Release(node, lane, conn, RemoteRailOutcome::kAbandon);
         return Status::kInvalid;
       }
       attempt_out.resize(static_cast<size_t>(length));
