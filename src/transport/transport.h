@@ -86,6 +86,11 @@ struct PeerTopology {
   uint64_t generation = 0;
   bool complete = false;
   std::vector<PeerRailTopology> rails;
+  // Stable MDS identity is distinct from the routable address. `present=false`
+  // retires this exact identity/address binding without affecting a replacement
+  // peer that has already claimed the address.
+  std::string peer_id;
+  bool present = true;
 };
 
 
@@ -157,6 +162,14 @@ class Transport {
   // transports without heterogeneous path selection ignore it.
   virtual void OnPeerTopology(const PeerTopology& topology) {
     (void)topology;
+  }
+
+  // Full stable-identity membership after one topology adoption. Stateful
+  // transports use this authoritative set to discard health for departed
+  // identities; address callbacks alone cannot distinguish address reuse.
+  virtual void OnPeerIdentities(
+      const std::vector<std::string>& live_peer_ids) {
+    (void)live_peer_ids;
   }
 
   // True if CacheMany/RangeMany pipeline requests on one connection (RDMA). When

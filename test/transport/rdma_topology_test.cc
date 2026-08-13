@@ -1,4 +1,5 @@
 #include "transport/rdma_topology.h"
+#include "transport/rail_select.h"
 
 #include <gtest/gtest.h>
 
@@ -14,6 +15,7 @@ using dfkv::rdma::RdmaDiscoveryPolicy;
 using dfkv::rdma::RdmaDiscoveryProbe;
 using dfkv::rdma::RdmaDiscoveryStatus;
 using dfkv::rdma::RdmaTopology;
+using dfkv::rdma::PeerTopologyStore;
 
 RdmaDevInfo Device(std::string name, bool active, int numa_node = -1) {
   RdmaDevInfo info;
@@ -278,6 +280,79 @@ TEST(RdmaTopology, FallbackMaskIsEmptyWithoutLocalPreference) {
   const auto unknown = topology.CandidatesFor(-1, true);
   EXPECT_EQ(unknown.locality, RailLocality::kCallerUnknown);
   EXPECT_TRUE(unknown.fallback.empty());
+}
+
+
+TEST(RdmaTopology, StableIdentityMovesAddressAndGuardsRetirement) {
+  PeerTopologyStore store({"ib0"}, {{1}}, /*require_complete=*/true);
+  dfkv::PeerTopology first;
+  first.peer_addr = "10.0.0.1:1000";
+  first.peer_id = "stable-peer";
+  first.generation = 11;
+  first.complete = true;
+  first.rails.push_back(dfkv::PeerRailTopology{"ib0", true});
+  ASSERT_TRUE(store.Update(first));
+  auto snapshot = store.Snapshot(first.peer_addr);
+  EXPECT_EQ(snapshot->peer_id, first.peer_id);
+  EXPECT_EQ(snapshot->generation, 11u);
+  EXPECT_EQ(snapshot->compatible, (std::vector<uint8_t>{1}));
+
+  dfkv::PeerTopology moved = first;
+  moved.peer_addr = "10.0.0.2:2000";
+  moved.generation = 3;
+  ASSERT_TRUE(store.Update(moved));
+  snapshot = store.Snapshot(moved.peer_addr);
+  EXPECT_EQ(snapshot->peer_id, first.peer_id);
+  EXPECT_EQ(snapshot->generation, 3u);
+  EXPECT_EQ(snapshot->compatible, (std::vector<uint8_t>{1}));
+  EXPECT_FALSE(store.Snapshot(first.peer_addr)->complete)
+      << "the superseded address must not retain a second live binding";
+
+  dfkv::PeerTopology stale_removal = moved;
+  stale_removal.present = false;
+  stale_removal.peer_id = "replaced-peer";
+  EXPECT_FALSE(store.Update(stale_removal));
+  EXPECT_EQ(store.Snapshot(moved.peer_addr)->peer_id, "stable-peer")
+      << "late retirement for another identity must not remove the replacement";
+
+  stale_removal.peer_id = "stable-peer";
+  EXPECT_TRUE(store.Update(stale_removal));
+  EXPECT_FALSE(store.Snapshot(moved.peer_addr)->complete);
+}
+
+TEST(RdmaTopology,
+     RemoveAndIdenticalReaddPublishesANewTransportIncarnation) {
+  PeerTopologyStore store({"ib0"}, {{1}}, /*require_complete=*/true);
+  dfkv::PeerTopology topology;
+  topology.peer_addr = "10.0.0.1:1000";
+  topology.peer_id = "stable-peer";
+  topology.generation = 77;
+  topology.complete = true;
+  topology.rails.push_back(dfkv::PeerRailTopology{"ib0", true});
+
+  ASSERT_TRUE(store.Update(topology));
+  const auto first = store.Snapshot(topology.peer_addr);
+  ASSERT_EQ(first->generation, 77u);
+  ASSERT_NE(first->publication, 0u);
+  EXPECT_TRUE(store.IsCurrent(topology.peer_addr, topology.peer_id,
+                              first->publication));
+  EXPECT_FALSE(store.Update(topology))
+      << "the opaque content generation remains equality-only";
+
+  topology.present = false;
+  ASSERT_TRUE(store.Update(topology));
+  EXPECT_FALSE(store.IsCurrent(topology.peer_addr, topology.peer_id,
+                               first->publication));
+
+  topology.present = true;
+  ASSERT_TRUE(store.Update(topology));
+  const auto reincarnated = store.Snapshot(topology.peer_addr);
+  EXPECT_EQ(reincarnated->generation, first->generation);
+  EXPECT_GT(reincarnated->publication, first->publication);
+  EXPECT_FALSE(store.IsCurrent(topology.peer_addr, topology.peer_id,
+                               first->publication));
+  EXPECT_TRUE(store.IsCurrent(topology.peer_addr, topology.peer_id,
+                              reincarnated->publication));
 }
 
 }  // namespace

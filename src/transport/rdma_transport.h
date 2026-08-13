@@ -26,6 +26,7 @@
 #include "transport/transport.h"
 #include "transport/rail_select.h"
 #include "transport/rdma_resource_budget.h"
+#include "transport/remote_rail_health.h"
 
 namespace dfkv {
 namespace rdma {
@@ -97,6 +98,8 @@ class RdmaTransport : public Transport {
   // WR_BUDGET / REGISTERED_BYTES_BUDGET): explicit config is a contract.
   void OnTopologyHint(size_t nodes) override;
   void OnPeerTopology(const PeerTopology& topology) override;
+  void OnPeerIdentities(
+      const std::vector<std::string>& live_peer_ids) override;
 
   bool pipelined() const override { return true; }
   size_t MaxSgPayloadSegs() const override { return sg_payload_segs_; }
@@ -128,6 +131,7 @@ class RdmaTransport : public Transport {
       std::vector<size_t>* out_lens) override;
 
  private:
+  friend class RdmaTransportTestPeer;
   struct Conn;
   using RailMask = std::vector<uint8_t>;
   enum class AcquireFailure : uint8_t {
@@ -163,23 +167,29 @@ class RdmaTransport : public Transport {
                         const AcquireOptions& options);
   // Schedules at most one fresh retry. Operations that may commit remotely
   // are retryable only until their first request is posted. cross_rail_retry
-  // is set only while the failed rail stays excluded and another
-  // topology-enabled rail exists.
+  // is set only while the failed rail stays excluded and another currently
+  // topology-compatible, local-eligible, remotely healthy rail exists.
   bool PrepareRetry(
       int attempt, bool from_pool, std::optional<size_t> attempted_rail,
       AcquireFailure failure, ReplaySafety replay_safety, bool request_posted,
       const std::shared_ptr<const rdma::PeerRailSnapshot>& peer,
       RailMask* excluded, bool* cross_rail_retry);
-  void Release(const std::string& node, Lane lane, Conn* c);
+  void Release(const std::string& node, Lane lane, Conn* c,
+               RemoteRailOutcome remote_outcome =
+                   RemoteRailOutcome::kSuccess);
   void Destroy(Conn* c,
                rdma::RailCompletion completion =
                    rdma::RailCompletion::kAdmission);
+  void CompleteRemote(const std::string& peer_id, size_t local_rail,
+                      uint64_t generation, RemoteRailOutcome outcome);
+  void RetireIdlePeerRail(const std::string& peer_id, size_t local_rail);
+  void CompleteRemoteLease(Conn* c, RemoteRailOutcome outcome);
   bool EvictOneIdle();
   // Keep every idle QP alive while its client process is healthy. This lets a
   // short server-side idle reaper reclaim dead clients without forcing the
   // first cache read after an idle gap to discover and rebuild stale QPs.
   void KeepaliveLoop();
-  bool KeepaliveConn(Conn* c);
+  bool KeepaliveConn(Conn* c, rdma::RailCompletion* failure);
   Status RoundTrip(const std::string& node, WireOp op, const BlockKey& key,
                    uint64_t offset, uint64_t length, const void* payload,
                    uint64_t payload_len, std::string* out,
@@ -279,6 +289,7 @@ class RdmaTransport : public Transport {
   std::vector<std::vector<uint8_t>> rail_tiers_;
   bool peer_topology_required_ = false;
   std::unique_ptr<rdma::PeerTopologyStore> peer_topologies_;
+  std::unique_ptr<RemoteRailHealth> remote_rail_health_;
   bool auto_device_ = true;
   bool numa_aware_ = false;
   // Global least-inflight rail admission with per-rail credits, failure
@@ -299,7 +310,7 @@ class RdmaTransport : public Transport {
   std::atomic<uint64_t> cross_rail_retry_exhausted_{0};
   std::atomic<uint64_t> peer_topology_updates_{0};
   std::atomic<uint64_t> no_compatible_rail_{0};
-  std::atomic<uint64_t> stale_generation_reaps_{0};
+  std::atomic<uint64_t> stale_publication_reaps_{0};
   // Deterministic test-only completion-fault targeting. Inert unless
   // DFKV_RDMA_TEST_COMPLETION_FAULT is set.
   std::atomic<uint64_t> test_completion_fault_calls_{0};

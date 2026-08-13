@@ -200,9 +200,11 @@ class KVClient {
   // (added/removed node ids) vs the previously-adopted view. Shared by both
   // SetMembers overloads so static and MDS-discovery paths log identically.
   void AdoptRing(ConHash ring, std::map<std::string, std::string> addr);
-  // Publish one replace-all topology response. Peers omitted by the response
-  // receive incomplete snapshots at its generation while they are still held
-  // by the ring, so a guard-rejected placement shrink cannot retain stale rails.
+  // Publish one replace-all topology response. Stable MDS ids are retained
+  // separately from routing addresses; superseded addresses are explicitly
+  // retired, and the complete live-id set is reconciled after publication.
+  // Peers omitted while still held by a guard-rejected ring are retired from
+  // topology state, so strict selection falls back closed without stale rails.
   void PublishPeerTopologies(const std::vector<MemberInfo>& topology,
                              uint64_t generation);
   // Scalar transport bodies. Public scalar methods add exactly one metric;
@@ -237,9 +239,10 @@ class KVClient {
   mutable std::mutex ring_mu_;  // guards ring_ + addr_
   ConHash ring_;
   std::map<std::string, std::string> addr_;  // name -> ip:port
-  // Addresses in the preceding replace-all topology response. Together with
-  // addr_, this finds omitted published or still-ring-held peers.
-  std::set<std::string> published_peer_addrs_;
+  // Stable identity -> routing address from the preceding replace-all topology
+  // response. Together with addr_, this finds removed identities and old
+  // addresses still held by a guard-rejected ring.
+  std::map<std::string, std::string> published_peers_;
   std::condition_variable ring_cv_;  // notified when AdoptRing sets a non-empty ring
   std::string key_namespace_;
   uint64_t namespace_hash_ = 0;

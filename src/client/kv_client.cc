@@ -252,20 +252,30 @@ void KVClient::AdoptRing(ConHash ring, std::map<std::string, std::string> addr) 
 
 void KVClient::PublishPeerTopologies(
     const std::vector<MemberInfo>& topology, uint64_t generation) {
-  std::set<std::string> current;
+  std::map<std::string, std::string> current;
   for (const auto& member : topology)
-    current.insert(member.ip + ":" + std::to_string(member.port));
+    current[member.id] = member.ip + ":" + std::to_string(member.port);
 
-  std::set<std::string> omitted;
+  std::set<std::pair<std::string, std::string>> retired;
   {
     std::lock_guard<std::mutex> lock(ring_mu_);
-    omitted = published_peer_addrs_;
-    for (const auto& [name, address] : addr_) {
-      (void)name;
-      omitted.insert(address);
-    }
-    for (const auto& address : current) omitted.erase(address);
-    published_peer_addrs_ = current;
+    for (const auto& peer : published_peers_) retired.insert(peer);
+    for (const auto& peer : addr_) retired.insert(peer);
+    for (const auto& peer : current) retired.erase(peer);
+    published_peers_ = current;
+  }
+
+  // Retire old address/identity bindings before publishing replacements. In
+  // particular, replacing an id at the same address must not let the old
+  // retirement tear down the newly-published binding.
+  for (const auto& [peer_id, address] : retired) {
+    PeerTopology peer;
+    peer.peer_addr = address;
+    peer.generation = generation;
+    peer.complete = false;
+    peer.peer_id = peer_id;
+    peer.present = false;
+    t_->OnPeerTopology(peer);
   }
 
   for (const auto& member : topology) {
@@ -280,16 +290,18 @@ void KVClient::PublishPeerTopologies(
               [](const PeerRailTopology& a, const PeerRailTopology& b) {
                 return a.name < b.name;
               });
+    peer.peer_id = member.id;
+    peer.present = true;
     t_->OnPeerTopology(peer);
   }
 
-  for (const auto& address : omitted) {
-    PeerTopology peer;
-    peer.peer_addr = address;
-    peer.generation = generation;
-    peer.complete = false;
-    t_->OnPeerTopology(peer);
+  std::vector<std::string> live_peer_ids;
+  live_peer_ids.reserve(current.size());
+  for (const auto& [peer_id, address] : current) {
+    (void)address;
+    live_peer_ids.push_back(peer_id);
   }
+  t_->OnPeerIdentities(live_peer_ids);
 }
 
 void KVClient::SetMembers(std::vector<std::pair<std::string, std::string>> members) {
