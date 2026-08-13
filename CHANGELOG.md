@@ -1,5 +1,27 @@
 # Changelog
 
+## v2.19.0 — 2026-08-13
+
+### CUDA GET correctness
+
+- Fixed a `RangeInto`/`RangeIntoMulti` failure in which the host publication
+  path could call `memcpy` with a CUDA device destination and terminate the
+  process with `SIGSEGV`.
+- Added an explicit destination kind to range reads. CUDA GETs now receive RDMA
+  data into operation-owned pinned host staging and publish it with asynchronous
+  host-to-device copies only after the final healthy rail attempt succeeds.
+  Completion remains synchronous: the call returns success only after the CUDA
+  stream has completed publication.
+- Applied the same publication and retry fence to contiguous ranges, mixed
+  host/CUDA scatter-gather ranges, and rail retry, so a failed attempt cannot
+  publish partial CUDA data before a later attempt succeeds.
+- PUT and memory-registration behavior are unchanged and remain GPUDirect.
+  CUDA GET adds temporary pinned host memory, a host-to-device copy, stream
+  synchronization, and associated allocation/registration overhead. This is a
+  known performance tradeoff pending safe direct-GPU retry fencing; deployments
+  should validate pinned-memory and memlock capacity for their concurrent GET
+  payload.
+
 ## v2.11.1 — 2026-08-10
 
 ### Release
