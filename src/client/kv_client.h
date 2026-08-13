@@ -8,11 +8,13 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -135,9 +137,7 @@ class KVClient {
   // for zero-copy transfer, so Put/Get resolve every covered buffer to the
   // pre-registered pool MR. Returns false when RDMA cannot register the full
   // range; copying transports such as TCP return true without work.
-  bool RegisterMemory(void* base, size_t size) {
-    return t_->RegisterMemory(base, size);
-  }
+  bool RegisterMemory(void* base, size_t size);
 
   // Runtime payload-segment width of one transport window. Logical SG calls may
   // exceed it: the transport splits them into one ordered operation internally.
@@ -218,6 +218,8 @@ class KVClient {
   bool ExistDirect(const std::string& key, Status* status);
   bool RemoveDirect(const std::string& key);
   void InvalidateRendezvous(const BlockKey& key);
+  DestinationMemoryKind ClassifyDestination(const void* destination,
+                                             size_t size) const;
 
   // Plain batch bodies; public methods own the one metric record across direct
   // and rendezvous paths.
@@ -236,6 +238,16 @@ class KVClient {
                                 std::chrono::steady_clock::time_point t0,
                                 std::vector<bool> flags, uint64_t bytes);
 
+  struct RegisteredMemoryRange {
+    uintptr_t base;
+    uintptr_t end;  // exclusive
+    DestinationMemoryKind kind;
+  };
+  // RegisterMemory is rare; GET classification takes only this shared lock and
+  // scans the small declaration list without allocating. Newer overlapping
+  // declarations win, matching a successful same-base growth deterministically.
+  mutable std::shared_mutex registered_memory_mu_;
+  std::vector<RegisteredMemoryRange> registered_memory_;
   mutable std::mutex ring_mu_;  // guards ring_ + addr_
   ConHash ring_;
   std::map<std::string, std::string> addr_;  // name -> ip:port
