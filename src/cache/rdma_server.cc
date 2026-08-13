@@ -590,6 +590,55 @@ void RdmaServer::Serve(int boot_fd) {
     }
   }
 
+  // These operation owners deliberately precede the endpoint. On teardown the
+  // endpoint (and therefore its QP) is destroyed first, before any prepared
+  // source pin, coalescer flight, or shared receive-slot lease is released.
+  struct MultiPutState {
+    bool active = false;
+    BlockKey key;
+    uint64_t total_len = 0;
+    uint64_t received = 0;
+    uint32_t next_window = 0;
+    uint32_t window_count = 0;
+  };
+  struct MultiGetState {
+    bool active = false;
+    BlockKey key;
+    uint64_t total_capacity = 0;
+    uint64_t next_offset = 0;
+    uint64_t payload_len = 0;
+    uint64_t value_len = 0;
+    uint32_t next_window = 0;
+    uint32_t window_count = 0;
+    size_t source_slot = 0;
+    size_t last_recv_slot = 0;
+    const char* payload = nullptr;
+    ibv_mr* payload_mr = nullptr;
+    bool source_uses_slot = false;
+    double completion_elapsed_sec = 0.0;
+    PreparedRead completion;
+  };
+  struct PendingCompletion {
+    PreparedRead read;
+    Status status = Status::kOk;
+    size_t bytes = 0;
+    double elapsed_sec = 0.0;
+  };
+  std::vector<MultiPutState> multi_put(K);
+  std::vector<MultiGetState> multi_get(K);
+  std::vector<int32_t> multi_get_source_owner(K, -1);
+  std::vector<PendingCompletion> complete_on_send(K);
+  auto clear_multi_get = [&](size_t operation_id) {
+    MultiGetState& state = multi_get[operation_id];
+    if (state.active && state.source_uses_slot &&
+        state.source_slot < multi_get_source_owner.size() &&
+        multi_get_source_owner[state.source_slot] ==
+            static_cast<int32_t>(operation_id)) {
+      multi_get_source_owner[state.source_slot] = -1;
+    }
+    state = MultiGetState{};
+  };
+
   rdma::RcEndpoint ep;
   constexpr size_t conn_control = rdma::kV2ControlCap;
   if (!ep.Open(dev.empty() ? nullptr : dev.c_str(), conn_control, K,
@@ -676,43 +725,6 @@ void RdmaServer::Serve(int boot_fd) {
   const size_t direct_buffer_cap = slot_size - rdma::kV2DataOffset;
   const size_t logical_data_cap = conn_max;
 
-  struct MultiPutState {
-    bool active = false;
-    BlockKey key;
-    uint64_t total_len = 0;
-    uint64_t received = 0;
-    uint32_t next_window = 0;
-    uint32_t window_count = 0;
-  };
-  struct MultiGetState {
-    bool active = false;
-    BlockKey key;
-    uint64_t total_capacity = 0;
-    uint64_t next_offset = 0;
-    uint64_t payload_len = 0;
-    uint64_t value_len = 0;
-    uint32_t next_window = 0;
-    uint32_t window_count = 0;
-    size_t source_slot = 0;
-    size_t last_recv_slot = 0;
-    const char* payload = nullptr;
-    ibv_mr* payload_mr = nullptr;
-    bool source_uses_slot = false;
-    PreparedRead completion;
-  };
-  std::vector<MultiPutState> multi_put(K);
-  std::vector<MultiGetState> multi_get(K);
-  std::vector<int32_t> multi_get_source_owner(K, -1);
-  auto clear_multi_get = [&](size_t operation_id) {
-    MultiGetState& state = multi_get[operation_id];
-    if (state.active && state.source_uses_slot &&
-        state.source_slot < multi_get_source_owner.size() &&
-        multi_get_source_owner[state.source_slot] ==
-            static_cast<int32_t>(operation_id)) {
-      multi_get_source_owner[state.source_slot] = -1;
-    }
-    state = MultiGetState{};
-  };
 
   struct Request {
     ReqFields fields{};
@@ -863,6 +875,100 @@ void RdmaServer::Serve(int boot_fd) {
     ibv_mr* payload_mr = nullptr;
     std::vector<RdmaWriteTarget> targets;
     PreparedRead completion;
+    double completion_elapsed_sec = 0.0;
+  };
+
+  auto build_data_reply =
+      [&](size_t send_slot, const Request& request, Status status,
+          const char* data, size_t data_len, size_t value_len, ibv_mr* data_mr,
+          bool source_uses_slot, PreparedRead completion,
+          double completion_elapsed_sec, Reply* reply) -> bool {
+    auto encode_status = [&](Status response_status, uint64_t response_len,
+                             uint64_t response_value_len = 0) {
+      EncodeRespVersion(ep.sbuf(send_slot), wire_epoch, response_status,
+                        response_len, response_value_len);
+    };
+    auto invalid_reply = [&] {
+      encode_status(Status::kInvalid, 0);
+      reply->first_len = response_prefix;
+      return true;
+    };
+    const size_t successful_len = status == Status::kOk ? data_len : 0;
+    if (status != Status::kOk) {
+      encode_status(status, 0);
+      reply->first_len = response_prefix;
+      return true;
+    }
+    if (successful_len > request.get.total_capacity ||
+        value_len > request.get.total_capacity ||
+        (request.get.window_count > 1 && successful_len != value_len) ||
+        (successful_len != 0 && (!data || !data_mr))) {
+      return invalid_reply();
+    }
+    encode_status(Status::kOk, successful_len, value_len);
+    reply->first_len = response_prefix;
+    if (request.get.window_count == 1) {
+      if (successful_len != 0) {
+        reply->remote_write = true;
+        reply->defer_recv_rearm = source_uses_slot;
+        reply->recv_slot = request.recv_slot;
+        reply->payload = data;
+        reply->payload_len = successful_len;
+        reply->payload_mr = data_mr;
+        reply->targets = request.get.targets;
+        reply->completion = std::move(completion);
+        reply->completion_elapsed_sec = completion_elapsed_sec;
+      } else {
+        completion.Commit(Status::kOk, 0, completion_elapsed_sec);
+      }
+      return true;
+    }
+
+    const size_t operation_id = request.get.operation_id;
+    MultiGetState& state = multi_get[operation_id];
+    uint64_t window_capacity = 0;
+    if (request.get.window_index != 0 ||
+        request.get.logical_offset != 0 || state.active ||
+        multi_put[request.data_slot].active ||
+        multi_get_source_owner[request.data_slot] >= 0 ||
+        !request.get.Capacity(&window_capacity) ||
+        window_capacity == 0 ||
+        window_capacity >= request.get.total_capacity) {
+      return invalid_reply();
+    }
+    state.active = true;
+    state.key = request.fields.Key();
+    state.total_capacity = request.get.total_capacity;
+    state.next_offset = window_capacity;
+    state.payload_len = successful_len;
+    state.last_recv_slot = request.recv_slot;
+    state.value_len = value_len;
+    state.next_window = 1;
+    state.window_count = request.get.window_count;
+    state.source_slot = request.data_slot;
+    state.payload = data;
+    state.payload_mr = data_mr;
+    state.source_uses_slot = source_uses_slot;
+    state.completion_elapsed_sec = completion_elapsed_sec;
+    state.completion = std::move(completion);
+    if (source_uses_slot) {
+      multi_get_source_owner[request.data_slot] =
+          static_cast<int32_t>(operation_id);
+      // Repost this WQE only after the first write finishes, but keep the
+      // source owner until the logical GET's final SEND completion.
+      reply->defer_recv_rearm = true;
+    }
+    reply->recv_slot = request.recv_slot;
+    const size_t bytes =
+        std::min<size_t>(successful_len, static_cast<size_t>(window_capacity));
+    if (bytes != 0) {
+      reply->remote_write = true;
+      reply->payload = data;
+      reply->payload_len = bytes;
+      reply->payload_mr = data_mr;
+      reply->targets = request.get.targets;
+    }
+    return true;
   };
 
 
@@ -922,6 +1028,7 @@ void RdmaServer::Serve(int boot_fd) {
       ++state.next_window;
       if (state.next_window == state.window_count) {
         reply->completion = std::move(state.completion);
+        reply->completion_elapsed_sec = state.completion_elapsed_sec;
         reply->release_source_on_send = state.source_uses_slot;
         reply->source_recv_slot = state.source_slot;
         if (state.source_uses_slot &&
@@ -937,86 +1044,6 @@ void RdmaServer::Serve(int boot_fd) {
       return true;
     }
 
-    auto data_reply = [&](Status status, const char* data, size_t data_len,
-                          size_t value_len, ibv_mr* data_mr,
-                          bool source_uses_slot,
-                          PreparedRead completion) -> bool {
-      const size_t successful_len = status == Status::kOk ? data_len : 0;
-      if (status != Status::kOk) {
-        encode_status(status, 0);
-        reply->first_len = response_prefix;
-        return true;
-      }
-      if (successful_len > request.get.total_capacity ||
-          value_len > request.get.total_capacity ||
-          (request.get.window_count > 1 && successful_len != value_len) ||
-          (successful_len != 0 && (!data || !data_mr))) {
-        return invalid_reply();
-      }
-      encode_status(Status::kOk, successful_len, value_len);
-      reply->first_len = response_prefix;
-      if (request.get.window_count == 1) {
-        if (successful_len != 0) {
-          reply->remote_write = true;
-          reply->defer_recv_rearm = source_uses_slot;
-          reply->recv_slot = request.recv_slot;
-          reply->payload = data;
-          reply->payload_len = successful_len;
-          reply->payload_mr = data_mr;
-          reply->targets = request.get.targets;
-          reply->completion = std::move(completion);
-        } else {
-          completion.Commit(Status::kOk, 0, 0.0);
-        }
-        return true;
-      }
-
-      const size_t operation_id = request.get.operation_id;
-      MultiGetState& state = multi_get[operation_id];
-      uint64_t window_capacity = 0;
-      if (request.get.window_index != 0 ||
-          request.get.logical_offset != 0 || state.active ||
-          multi_put[request.data_slot].active ||
-          multi_get_source_owner[request.data_slot] >= 0 ||
-          !request.get.Capacity(&window_capacity) ||
-          window_capacity == 0 ||
-          window_capacity >= request.get.total_capacity) {
-        return invalid_reply();
-      }
-      state.active = true;
-      state.key = key;
-      state.total_capacity = request.get.total_capacity;
-      state.next_offset = window_capacity;
-      state.payload_len = successful_len;
-      state.last_recv_slot = request.recv_slot;
-      state.value_len = value_len;
-      state.next_window = 1;
-      state.window_count = request.get.window_count;
-      state.source_slot = request.data_slot;
-      state.payload = data;
-      state.payload_mr = data_mr;
-      state.source_uses_slot = source_uses_slot;
-      state.completion = std::move(completion);
-      if (source_uses_slot) {
-        multi_get_source_owner[request.data_slot] =
-            static_cast<int32_t>(operation_id);
-        // Repost this WQE only after the first write finishes, but keep the
-        // source owner until the logical GET's final SEND completion.
-        reply->defer_recv_rearm = true;
-      }
-      reply->recv_slot = request.recv_slot;
-      const size_t bytes =
-          std::min<size_t>(successful_len,
-                           static_cast<size_t>(window_capacity));
-      if (bytes != 0) {
-        reply->remote_write = true;
-        reply->payload = data;
-        reply->payload_len = bytes;
-        reply->payload_mr = data_mr;
-        reply->targets = request.get.targets;
-      }
-      return true;
-    };
 
     if (fields.op == static_cast<uint8_t>(WireOp::kRange) &&
         range_handler_) {
@@ -1053,13 +1080,19 @@ void RdmaServer::Serve(int boot_fd) {
               source_uses_slot = !prepared.source_registered();
             }
             const char* data = prepared.data();
-            prepared.Commit(ok ? Status::kOk : Status::kIOError,
-                            ok ? payload_len : 0,
-                            NowSteadySec() - submit_sec);
-            return data_reply(ok ? Status::kOk : Status::kIOError,
-                              ok ? data : nullptr, payload_len, value_len,
-                              source_mr, source_uses_slot,
-                              std::move(prepared));
+            const double elapsed_sec = NowSteadySec() - submit_sec;
+            // A successful multi-window read remains one live transaction
+            // through every continuation and the final signaled SEND. Errors
+            // and the established single-window path complete immediately.
+            if (!ok || request.get.window_count == 1) {
+              prepared.Commit(ok ? Status::kOk : Status::kIOError,
+                              ok ? payload_len : 0, elapsed_sec);
+            }
+            return build_data_reply(
+                send_slot, request,
+                ok ? Status::kOk : Status::kIOError,
+                ok ? data : nullptr, payload_len, value_len, source_mr,
+                source_uses_slot, std::move(prepared), elapsed_sec, reply);
           }
           const size_t payload_len = prepared.payload_len();
           ibv_mr* source_mr = direct_mr(request.data_slot);
@@ -1070,15 +1103,17 @@ void RdmaServer::Serve(int boot_fd) {
               source_mr = direct_mr(request.data_slot);
           }
           const char* data = prepared.data();
-          return data_reply(Status::kOk, data, payload_len,
-                            prepared.value_len(), source_mr,
-                            /*source_uses_slot=*/
-                            !prepared.source_registered(),
-                            std::move(prepared));
+          return build_data_reply(
+              send_slot, request, Status::kOk, data, payload_len,
+              prepared.value_len(), source_mr,
+              /*source_uses_slot=*/!prepared.source_registered(),
+              std::move(prepared), /*completion_elapsed_sec=*/0.0, reply);
         }
         if (prepared.status() != Status::kInvalid) {
-          return data_reply(prepared.status(), nullptr, 0, 0, nullptr,
-                            /*source_uses_slot=*/false, PreparedRead{});
+          return build_data_reply(
+              send_slot, request, prepared.status(), nullptr, 0, 0, nullptr,
+              /*source_uses_slot=*/false, PreparedRead{},
+              /*completion_elapsed_sec=*/0.0, reply);
         }
       }
 
@@ -1088,9 +1123,11 @@ void RdmaServer::Serve(int boot_fd) {
       const Status status = range_handler_(
           key, fields.offset, fields.length, direct_buffer(request.data_slot),
           direct_buffer_cap, &output, &output_len, &value_len);
-      return data_reply(status, output, output_len, value_len,
-                        direct_mr(request.data_slot),
-                        /*source_uses_slot=*/true, PreparedRead{});
+      return build_data_reply(
+          send_slot, request, status, output, output_len, value_len,
+          direct_mr(request.data_slot),
+          /*source_uses_slot=*/true, PreparedRead{},
+          /*completion_elapsed_sec=*/0.0, reply);
     }
 
     if (fields.op == static_cast<uint8_t>(WireOp::kCache) &&
@@ -1136,10 +1173,11 @@ void RdmaServer::Serve(int boot_fd) {
       if (!data.empty())
         std::memcpy(direct_buffer(request.data_slot), data.data(),
                     data.size());
-      return data_reply(status, direct_buffer(request.data_slot), data.size(),
-                        value_len,
-                        direct_mr(request.data_slot),
-                        /*source_uses_slot=*/true, PreparedRead{});
+      return build_data_reply(
+          send_slot, request, status, direct_buffer(request.data_slot),
+          data.size(), value_len, direct_mr(request.data_slot),
+          /*source_uses_slot=*/true, PreparedRead{},
+          /*completion_elapsed_sec=*/0.0, reply);
     }
     if (ep.cap() < response_prefix ||
         data.size() > ep.cap() - response_prefix ||
@@ -1189,14 +1227,15 @@ void RdmaServer::Serve(int boot_fd) {
   auto rearm_request_recv = [&](size_t slot) {
     return post_request_recv(slot);
   };
-  // A prepared RAM read remains pinned in its move-only transaction until the
-  // signaled SEND completion. Uncompleted slots destructor-abort on teardown.
-  std::vector<PreparedRead> complete_on_send(K);
+  // Prepared reads remain in their move-only transaction until the signaled
+  // SEND completion. A completion can be the first and only terminal call for
+  // a multi-window disk read, so resetting the slot after Commit also releases
+  // any post-read source hold at that exact fence.
   auto complete_send = [&](size_t sid) {
-    if (sid < complete_on_send.size()) {
-      PreparedRead& read = complete_on_send[sid];
-      read.Commit(Status::kOk, read.payload_len(), 0.0);
-    }
+    if (sid >= complete_on_send.size()) return;
+    PendingCompletion& pending = complete_on_send[sid];
+    pending.read.Commit(pending.status, pending.bytes, pending.elapsed_sec);
+    pending = PendingCompletion{};
   };
   bool fail = false;
   const int idle_ms = ServerIdleMs();
@@ -1247,7 +1286,7 @@ void RdmaServer::Serve(int boot_fd) {
         size_t send_slot = 0;
         size_t recv_slot = 0;
         size_t data_slot = 0;
-        RdmaGetFields get;       // v2 response header/remote destinations
+        Request request;          // exact first-window protocol/state input
         int read_idx = -1;       // >=0: index into descs (async read)
         PreparedRead read;
         double submit_sec = 0.0;
@@ -1276,6 +1315,9 @@ void RdmaServer::Serve(int boot_fd) {
           }
           if (wc.opcode == IBV_WC_SEND) {
             size_t sid = static_cast<size_t>(wc.wr_id);
+            // Finish any deferred read while its source slot is still owned and
+            // before reposting a receive that could overwrite completion data.
+            complete_send(sid);
             if (sid < release_source_on_send.size() &&
                 release_source_on_send[sid] != kNoSlot) {
               multi_get_source_owner[release_source_on_send[sid]] = -1;
@@ -1288,7 +1330,6 @@ void RdmaServer::Serve(int boot_fd) {
               }
               rearm_on_send[sid] = kNoSlot;
             }
-            complete_send(sid);
             free_send.push_back(sid);
             continue;
           }
@@ -1305,7 +1346,6 @@ void RdmaServer::Serve(int boot_fd) {
           qd.send_slot = s;
           qd.recv_slot = r;
           qd.data_slot = request.data_slot;
-          qd.get = request.get;
 
           // Defer a prepared storage read to the io_uring batch. RAM hits are
           // already ready and retain their transaction in the queued reply
@@ -1313,7 +1353,7 @@ void RdmaServer::Serve(int boot_fd) {
           bool deferred = false;
           bool handled = false;
           if (rq.op == static_cast<uint8_t>(WireOp::kRange) &&
-              request.get.window_count == 1 &&
+              request.get.window_index == 0 &&
               direct_buffer(request.data_slot) &&
               direct_mr(request.data_slot) &&
               rq.length <= static_cast<uint64_t>(conn_max)) {
@@ -1333,53 +1373,40 @@ void RdmaServer::Serve(int boot_fd) {
               qd.read_idx = static_cast<int>(descs.size());
               descs.push_back(d);
               qd.read = std::move(prepared);
+              qd.request = std::move(request);
               qd.submit_sec = NowSteadySec();
               deferred = true;
               handled = true;
             } else if (prepared.status() == Status::kOk &&
                        !prepared.needs_io()) {
-              char* sb = ep.sbuf(qd.send_slot);
               const size_t payload_len = prepared.payload_len();
-              if (payload_len > qd.get.total_capacity ||
-                  prepared.value_len() > qd.get.total_capacity ||
-                  (payload_len != 0 && prepared.data() == nullptr)) {
-                EncodeRespVersion(sb, wire_epoch, Status::kInvalid, 0);
-                qd.reply.first_len = response_prefix;
-              } else {
-                EncodeRespVersion(sb, wire_epoch, Status::kOk, payload_len,
-                                  prepared.value_len());
-                qd.reply.first_len = response_prefix;
-                if (payload_len != 0) {
-                  ibv_mr* source_mr = direct_mr(request.data_slot);
-                  if (prepared.source_registered()) {
-                    source_mr = ep.RegisterUser(
-                        const_cast<char*>(prepared.data()), payload_len);
-                    if (!source_mr && prepared.Stage())
-                      source_mr = direct_mr(request.data_slot);
-                  }
-                  if (!source_mr) {
-                    fail = true;
-                    break;
-                  }
-                  qd.reply.remote_write = true;
-                  qd.reply.defer_recv_rearm =
-                      !prepared.source_registered();
-                  qd.reply.recv_slot = request.recv_slot;
-                  qd.reply.payload = prepared.data();
-                  qd.reply.payload_len = payload_len;
-                  qd.reply.payload_mr = source_mr;
-                  qd.reply.targets = qd.get.targets;
-                  qd.reply.completion = std::move(prepared);
-                } else {
-                  prepared.Commit(Status::kOk, 0, 0.0);
-                }
+              ibv_mr* source_mr = direct_mr(request.data_slot);
+              if (prepared.source_registered() && payload_len != 0) {
+                source_mr = ep.RegisterUser(
+                    const_cast<char*>(prepared.data()), payload_len);
+                if (!source_mr && prepared.Stage())
+                  source_mr = direct_mr(request.data_slot);
+              }
+              if (!source_mr ||
+                  !build_data_reply(
+                      qd.send_slot, request, Status::kOk, prepared.data(),
+                      payload_len, prepared.value_len(), source_mr,
+                      /*source_uses_slot=*/!prepared.source_registered(),
+                      std::move(prepared), /*completion_elapsed_sec=*/0.0,
+                      &qd.reply)) {
+                fail = true;
+                break;
               }
               handled = true;
             } else if (prepared.status() != Status::kOk &&
                        prepared.status() != Status::kInvalid) {
-              EncodeRespVersion(ep.sbuf(qd.send_slot), wire_epoch,
-                                prepared.status(), 0);
-              qd.reply.first_len = response_prefix;
+              if (!build_data_reply(
+                      qd.send_slot, request, prepared.status(), nullptr, 0, 0,
+                      nullptr, /*source_uses_slot=*/false, PreparedRead{},
+                      /*completion_elapsed_sec=*/0.0, &qd.reply)) {
+                fail = true;
+                break;
+              }
               handled = true;
             }
           }
@@ -1426,107 +1453,78 @@ void RdmaServer::Serve(int boot_fd) {
         // so an async reply never trails a later request's reply).
         for (size_t i = 0; i < queue.size() && !fail; ++i) {
           Queued& qd = queue[i];
-          if (qd.read_idx < 0) {
-            // Sync-built reply: rearm recv (or defer to SEND), then SEND in order.
-            Reply& reply = qd.reply;
-            if (reply.defer_recv_rearm) {
-              rearm_on_send[qd.send_slot] = reply.recv_slot;
-            } else if (!rearm_request_recv(qd.recv_slot)) {
+          if (qd.read_idx >= 0) {
+            // Deferred async read: validate its CQE (or the drained sync
+            // fallback) and feed the exact same first-window state builder used
+            // by the sync path. Continuations never enter this branch.
+            UringReader::ReadDesc& d = descs[qd.read_idx];
+            bool ok;
+            if (batch_ok) {
+              const long res = d.result;
+              ok = res >= 0 &&
+                   static_cast<size_t>(res) >=
+                       qd.read.head() + qd.read.payload_len();
+            } else {
+              const ssize_t got = ::pread(
+                  qd.read.fd(), d.buf, d.len, static_cast<off_t>(d.off));
+              ok = got >= 0 &&
+                   static_cast<size_t>(got) >=
+                       qd.read.head() + qd.read.payload_len();
+            }
+
+            const size_t payload_len = qd.read.payload_len();
+            const size_t value_len = qd.read.value_len();
+            ibv_mr* source_mr = direct_mr(qd.data_slot);
+            bool source_uses_slot = true;
+            if (ok && qd.read.source_registered() && payload_len != 0) {
+              source_mr = ep.RegisterUser(
+                  const_cast<char*>(qd.read.data()), payload_len);
+              if (!source_mr && qd.read.Stage())
+                source_mr = direct_mr(qd.data_slot);
+              if (!source_mr) ok = false;
+              source_uses_slot = !qd.read.source_registered();
+            }
+            const char* out_data = qd.read.data();
+            const double elapsed_sec = NowSteadySec() - qd.submit_sec;
+            // Preserve established single-window completion timing. A
+            // successful multi-window transaction instead remains active in
+            // MultiGetState until the final status SEND completion.
+            if (!ok || qd.request.get.window_count == 1) {
+              qd.read.Commit(ok ? Status::kOk : Status::kIOError,
+                             ok ? payload_len : 0, elapsed_sec);
+            }
+            if (!build_data_reply(
+                    qd.send_slot, qd.request,
+                    ok ? Status::kOk : Status::kIOError,
+                    ok ? out_data : nullptr, payload_len, value_len, source_mr,
+                    source_uses_slot, std::move(qd.read), elapsed_sec,
+                    &qd.reply)) {
               fail = true;
               break;
             }
-            if (reply.release_source_on_send) {
-              if (release_source_on_send[qd.send_slot] != kNoSlot) {
-                fail = true;
-                break;
-              }
-              release_source_on_send[qd.send_slot] =
-                  reply.source_recv_slot;
-            }
-            complete_on_send[qd.send_slot] = std::move(reply.completion);
-            if (!post_reply(qd.send_slot, reply)) {
-              fail = true;
-              break;
-            }
-            continue;
           }
-          // Deferred async read: validate result (or sync fallback), then SEND.
-          UringReader::ReadDesc& d = descs[qd.read_idx];
-          bool ok;
-          if (batch_ok) {
-            long res = d.result;
-            ok = res >= 0 &&
-                 static_cast<size_t>(res) >=
-                     qd.read.head() + qd.read.payload_len();
-          } else {
-            ssize_t got =
-                ::pread(qd.read.fd(), d.buf, d.len, static_cast<off_t>(d.off));
-            ok = got >= 0 &&
-                 static_cast<size_t>(got) >=
-                     qd.read.head() + qd.read.payload_len();
-          }
-          // Resolve the send source while the read owner is still active:
-          // direct-to-arena reads use the registered RAM MR, with a staging
-          // copy only if that MR cannot be resolved on this connection.
-          const size_t payload_len = qd.read.payload_len();
-          const size_t value_len = qd.read.value_len();
-          ibv_mr* source_mr = direct_mr(qd.data_slot);
-          bool source_uses_slot = true;
-          if (ok && qd.read.source_registered() && payload_len != 0) {
-            source_mr = ep.RegisterUser(
-                const_cast<char*>(qd.read.data()), payload_len);
-            if (!source_mr && qd.read.Stage())
-              source_mr = direct_mr(qd.data_slot);
-            if (!source_mr) ok = false;
-            source_uses_slot = !qd.read.source_registered();
-          }
-          const char* out_data = qd.read.data();
-          qd.read.Commit(ok ? Status::kOk : Status::kIOError,
-                         ok ? payload_len : 0,
-                         NowSteadySec() - qd.submit_sec);
-          char* sb = ep.sbuf(qd.send_slot);
-          if (!ok) {
-            EncodeRespVersion(sb, wire_epoch, Status::kIOError, 0);
-            if (!post_request_recv(qd.recv_slot) ||
-                !ep.PostSend(qd.send_slot, response_prefix)) {
-              fail = true;
-              break;
-            }
-            continue;
-          }
-          if (payload_len > qd.get.total_capacity ||
-              value_len > qd.get.total_capacity) {
-            EncodeRespVersion(sb, wire_epoch, Status::kInvalid, 0);
-            if (!post_request_recv(qd.recv_slot) ||
-                !ep.PostSend(qd.send_slot, response_prefix)) {
-              fail = true;
-              break;
-            }
-            continue;
-          }
-          EncodeRespVersion(sb, wire_epoch, Status::kOk, payload_len,
-                            value_len);
-          Reply reply;
-          reply.first_len = response_prefix;
-          if (payload_len != 0) {
-            reply.remote_write = true;
-            reply.payload = out_data;
-            reply.payload_len = payload_len;
-            reply.payload_mr = source_mr;
-            reply.targets = qd.get.targets;
-            reply.defer_recv_rearm = source_uses_slot;
-            reply.recv_slot = qd.recv_slot;
-            if (source_uses_slot) {
-              rearm_on_send[qd.send_slot] = qd.recv_slot;
-            } else if (!post_request_recv(qd.recv_slot)) {
-              fail = true;
-              break;
-            }
-            complete_on_send[qd.send_slot] = std::move(qd.read);
-          } else if (!post_request_recv(qd.recv_slot)) {
+
+          // Every reply, whether built synchronously or completed by the ring,
+          // is emitted from this single ordered queue.
+          Reply& reply = qd.reply;
+          if (reply.defer_recv_rearm) {
+            rearm_on_send[qd.send_slot] = reply.recv_slot;
+          } else if (!rearm_request_recv(qd.recv_slot)) {
             fail = true;
             break;
           }
+          if (reply.release_source_on_send) {
+            if (release_source_on_send[qd.send_slot] != kNoSlot) {
+              fail = true;
+              break;
+            }
+            release_source_on_send[qd.send_slot] =
+                reply.source_recv_slot;
+          }
+          PendingCompletion& pending = complete_on_send[qd.send_slot];
+          pending.read = std::move(reply.completion);
+          pending.bytes = pending.read.payload_len();
+          pending.elapsed_sec = reply.completion_elapsed_sec;
           if (!post_reply(qd.send_slot, reply)) {
             fail = true;
             break;
@@ -1562,6 +1560,9 @@ sync_serve_loop:;
       }
       if (wc.opcode == IBV_WC_SEND) {
         size_t sid = static_cast<size_t>(wc.wr_id);
+        // Finish any deferred read while its source slot is still owned and
+        // before reposting a receive that could overwrite completion data.
+        complete_send(sid);
         if (sid < release_source_on_send.size() &&
             release_source_on_send[sid] != kNoSlot) {
           multi_get_source_owner[release_source_on_send[sid]] = -1;
@@ -1574,7 +1575,6 @@ sync_serve_loop:;
           }
           rearm_on_send[sid] = kNoSlot;
         }
-        complete_send(sid);
         free_send.push_back(sid);
         continue;
       }
@@ -1601,7 +1601,10 @@ sync_serve_loop:;
         }
         release_source_on_send[s] = reply.source_recv_slot;
       }
-      complete_on_send[s] = std::move(reply.completion);
+      PendingCompletion& pending = complete_on_send[s];
+      pending.read = std::move(reply.completion);
+      pending.bytes = pending.read.payload_len();
+      pending.elapsed_sec = reply.completion_elapsed_sec;
       bool sent = post_reply(s, reply);
       if (!sent) { fail = true; break; }
     }
