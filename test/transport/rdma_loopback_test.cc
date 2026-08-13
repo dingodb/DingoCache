@@ -3223,6 +3223,17 @@ struct RamRdmaNode {
     rsrv->set_prepare_read_handler(
         [this](const BlockKey& key, uint64_t off, uint64_t len,
                char* staging, size_t cap) {
+          // An async follower blocks inside PrepareReadForKey while waiting for
+          // the leader's published RAM reservation. Signal at handler entry,
+          // before that wait, so the held leader can submit and publish.
+          {
+            std::lock_guard<std::mutex> lock(flight_mu);
+            if (!barrier_key.empty() && key.Filename() == barrier_key &&
+                leader_prepared && !follower_entered) {
+              follower_entered = true;
+              flight_cv.notify_all();
+            }
+          }
           PreparedRead prepared =
               srv->PrepareReadForKey(key, off, len, staging, cap);
           if (prepared.status() == Status::kOk && prepared.needs_io()) {
