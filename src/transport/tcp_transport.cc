@@ -357,6 +357,12 @@ std::vector<Status> TcpTransport::RangeInto(
   if (keys.size() != dsts.size())
     return std::vector<Status>(keys.size(), Status::kInvalid);
   if (value_lens) value_lens->assign(keys.size(), 0);
+  const bool has_device =
+      std::any_of(dsts.begin(), dsts.end(), [](const RangeDst& dst) {
+        return dst.memory_kind == DestinationMemoryKind::kDevice;
+      });
+  if (has_device)
+    return Transport::RangeInto(node, keys, dsts, value_lens);
   std::vector<Status> statuses;
   statuses.reserve(keys.size());
   for (size_t i = 0; i < keys.size(); ++i) {

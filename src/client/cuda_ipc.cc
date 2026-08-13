@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <new>
 #include <string>
 #include <vector>
@@ -34,6 +35,24 @@ struct RegisteredHostRange {
   uintptr_t end;
 };
 
+struct ProcessHostRegistration {
+  uintptr_t begin;
+  uintptr_t end;
+  size_t references;
+};
+
+struct HostRegistrationRegistry {
+  std::mutex mutex;
+  std::vector<ProcessHostRegistration> ranges;
+};
+
+HostRegistrationRegistry& ProcessHostRegistry() {
+  // Publishers can be destroyed during process teardown. Keep the registry
+  // alive until process exit rather than depending on static destruction order.
+  static HostRegistrationRegistry* registry = new HostRegistrationRegistry();
+  return *registry;
+}
+
 struct PublisherCudaState {
   CUstream stream = nullptr;
   CUcontext context = nullptr;
@@ -41,7 +60,7 @@ struct PublisherCudaState {
   size_t copy_count = 0;
   CUcontext pending_restore = nullptr;
   bool has_pending_restore = false;
-  std::vector<RegisteredHostRange> registered;
+  std::vector<RegisteredHostRange> leases;
 };
 
 void NotePublisherDriverFailure(const std::string& detail);
@@ -54,7 +73,7 @@ bool EnqueueRegisteredCopy(const CudaLib* cuda, PublisherCudaState* state,
   while (copied < size) {
     const uintptr_t cursor = source_begin + copied;
     const RegisteredHostRange* containing = nullptr;
-    for (const auto& range : state->registered) {
+    for (const auto& range : state->leases) {
       if (range.begin <= cursor && cursor < range.end) {
         containing = &range;
         break;
@@ -103,8 +122,46 @@ void NotePublisherDriverFailure(const std::string& detail) {
   }
 }
 
-bool RegisterHostRange(const CudaLib* cuda, PublisherCudaState* state,
-                       const void* source, size_t size) {
+bool ReleaseHostRangesLocked(
+    const CudaLib* cuda, HostRegistrationRegistry* registry,
+    const std::vector<RegisteredHostRange>& leases, const char* failure_prefix) {
+  bool released = true;
+  for (auto lease = leases.rbegin(); lease != leases.rend(); ++lease) {
+    auto registration = std::find_if(
+        registry->ranges.begin(), registry->ranges.end(),
+        [&](const ProcessHostRegistration& range) {
+          return range.begin == lease->begin && range.end == lease->end;
+        });
+    if (registration == registry->ranges.end() ||
+        registration->references == 0) {
+      NotePublisherDriverFailure(
+          "host registration reference bookkeeping underflow");
+      released = false;
+      continue;
+    }
+
+    --registration->references;
+    if (registration->references != 0) continue;
+
+    const CUresult result =
+        cuda->HostUnregister(reinterpret_cast<void*>(registration->begin));
+    if (result == kCudaSuccess) {
+      registry->ranges.erase(registration);
+    } else {
+      // Keep a zero-reference entry so a driver failure never leaves an
+      // untracked physical pin. A later acquisition can reuse it and its final
+      // release will retry the unregister.
+      NotePublisherDriverFailure(std::string(failure_prefix) +
+                                 " cuMemHostUnregister result=" +
+                                 std::to_string(result));
+      released = false;
+    }
+  }
+  return released;
+}
+
+bool AcquireHostRange(const CudaLib* cuda, PublisherCudaState* state,
+                      const void* source, size_t size) {
   const size_t page_size = HostPageSize();
   const uintptr_t address = reinterpret_cast<uintptr_t>(source);
   if (!source || page_size == 0 ||
@@ -121,38 +178,78 @@ bool RegisterHostRange(const CudaLib* cuda, PublisherCudaState* state,
     end += padding;
   }
 
-  // Register only holes in the page-aligned union. Batched scatter publication
-  // commonly presents adjacent slices of one vector; registering each slice
-  // independently would overlap the same host pages and fail. Copy enqueues
-  // are split at these registration boundaries: CUDA rejects one memcpy
-  // spanning two otherwise adjacent registered allocations.
+  HostRegistrationRegistry& registry = ProcessHostRegistry();
+  std::lock_guard<std::mutex> lock(registry.mutex);
+
+  // Build a complete acquisition plan before changing either the global
+  // reference counts or this publisher's leases. The registry is sorted and
+  // non-overlapping; existing physical registrations are acquired whole, while
+  // uncovered holes become distinct CUDA registrations.
+  std::vector<RegisteredHostRange> plan;
+  plan.reserve(registry.ranges.size() + 1);
+  size_t holes = 0;
   uintptr_t cursor = begin;
-  while (cursor < end) {
-    uintptr_t covered_until = cursor;
-    uintptr_t next_registered = end;
-    for (const auto& range : state->registered) {
-      if (range.begin <= cursor && range.end > covered_until)
-        covered_until = range.end;
-      else if (range.begin > cursor && range.begin < next_registered)
-        next_registered = range.begin;
+  for (const auto& range : registry.ranges) {
+    if (range.end <= cursor) continue;
+    if (range.begin >= end) break;
+    if (cursor < range.begin) {
+      plan.push_back({cursor, std::min(end, range.begin)});
+      ++holes;
+      cursor = std::min(end, range.begin);
     }
-    if (covered_until > cursor) {
-      cursor = covered_until;
+    if (cursor >= end) break;
+    if (range.end > cursor) {
+      plan.push_back({range.begin, range.end});
+      cursor = range.end;
+    }
+  }
+  if (cursor < end) {
+    plan.push_back({cursor, end});
+    ++holes;
+  }
+
+  // Reserve before the first CUDA call so bookkeeping allocation cannot fail
+  // after a physical registration has succeeded.
+  registry.ranges.reserve(registry.ranges.size() + holes);
+  state->leases.reserve(state->leases.size() + plan.size());
+
+  std::vector<RegisteredHostRange> acquired;
+  acquired.reserve(plan.size());
+  for (const auto& piece : plan) {
+    auto registration = std::find_if(
+        registry.ranges.begin(), registry.ranges.end(),
+        [&](const ProcessHostRegistration& range) {
+          return range.begin == piece.begin && range.end == piece.end;
+        });
+    if (registration != registry.ranges.end()) {
+      ++registration->references;
+      acquired.push_back(piece);
       continue;
     }
 
-    const uintptr_t hole_end = next_registered;
-    state->registered.push_back({cursor, hole_end});
     const CUresult result = cuda->HostRegister(
-        reinterpret_cast<void*>(cursor), hole_end - cursor, 0);
+        reinterpret_cast<void*>(piece.begin), piece.end - piece.begin,
+        kCuMemHostRegisterPortable);
     if (result != kCudaSuccess) {
-      state->registered.pop_back();
       NotePublisherDriverFailure("cuMemHostRegister result=" +
                                  std::to_string(result));
+      ReleaseHostRangesLocked(cuda, &registry, acquired,
+                              "acquisition rollback");
       return false;
     }
-    cursor = hole_end;
+
+    const auto insertion = std::lower_bound(
+        registry.ranges.begin(), registry.ranges.end(), piece.begin,
+        [](const ProcessHostRegistration& range, uintptr_t range_begin) {
+          return range.begin < range_begin;
+        });
+    registry.ranges.insert(
+        insertion, {piece.begin, piece.end, /*references=*/1});
+    acquired.push_back(piece);
   }
+
+  state->leases.insert(state->leases.end(), acquired.begin(),
+                       acquired.end());
   return true;
 }
 
@@ -381,7 +478,7 @@ bool DestinationPublisher::Copy(
     return false;
   }
 
-  bool copy_ok = RegisterHostRange(cuda, state, source, size);
+  bool copy_ok = AcquireHostRange(cuda, state, source, size);
   if (copy_ok) {
     ++state->copy_count;
     copy_ok =
@@ -427,13 +524,10 @@ bool DestinationPublisher::Finish() {
     NotePublisherDriverFailure("cuStreamSynchronize result=" +
                                std::to_string(sync_result));
   }
-  for (auto it = state->registered.rbegin();
-       it != state->registered.rend(); ++it) {
-    const CUresult result =
-        cuda->HostUnregister(reinterpret_cast<void*>(it->begin));
-    if (result != kCudaSuccess)
-      NotePublisherDriverFailure("post-sync cuMemHostUnregister result=" +
-                                 std::to_string(result));
+  {
+    HostRegistrationRegistry& registry = ProcessHostRegistry();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    ReleaseHostRangesLocked(cuda, &registry, state->leases, "post-sync");
   }
   const CUresult destroy_result = cuda->StreamDestroy(state->stream);
   if (destroy_result != kCudaSuccess)
