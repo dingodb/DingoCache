@@ -3176,6 +3176,7 @@ struct RamRdmaNode {
   std::string barrier_key;
   bool leader_prepared = false;
   bool follower_entered = false;
+  bool follower_wait_timed_out = false;
 
 
   explicit RamRdmaNode(const std::string& tag, size_t max_msg = kMaxMsg,
@@ -3230,9 +3231,11 @@ struct RamRdmaNode {
                 !leader_prepared) {
               leader_prepared = true;
               flight_cv.notify_all();
-              (void)flight_cv.wait_for(
-                  lock, std::chrono::seconds(2),
-                  [this] { return follower_entered; });
+              if (!flight_cv.wait_for(
+                      lock, std::chrono::seconds(30),
+                      [this] { return follower_entered; })) {
+                follower_wait_timed_out = true;
+              }
             }
           }
           return prepared;
@@ -3259,11 +3262,16 @@ struct RamRdmaNode {
     barrier_key = ToBlockKey(SelfHdr(), logical_key).Filename();
     leader_prepared = false;
     follower_entered = false;
+    follower_wait_timed_out = false;
   }
   bool WaitForPreparedLeader() {
     std::unique_lock<std::mutex> lock(flight_mu);
-    return flight_cv.wait_for(lock, std::chrono::seconds(2),
+    return flight_cv.wait_for(lock, std::chrono::seconds(30),
                               [this] { return leader_prepared; });
+  }
+  bool FollowerWaitTimedOut() {
+    std::lock_guard<std::mutex> lock(flight_mu);
+    return follower_wait_timed_out;
   }
 };
 }  // namespace
@@ -3367,21 +3375,40 @@ TEST(RdmaLoopback, UringMultiWindowCoalescedFollowerPromotesToRam) {
   if (node.rsrv->UringInitFallbacks() != 0)
     GTEST_SKIP() << "io_uring unavailable";
 
-  node.BarrierFirstPreparedRead("coalesced_multi");
   MultiWindowGet leader(targets_per_window, 3, 83);
   MultiWindowGet follower(targets_per_window, 3, 83);
   bool leader_ok = false;
   bool follower_ok = false;
   size_t leader_len = 0;
   size_t follower_len = 0;
+  // Establish both SG-data QPs before holding the leader in preparation. Real
+  // HCAs may spend seconds registering a fresh connection's memory; making that
+  // setup part of the convoy race turned the old two-second barrier into a
+  // scheduler/hardware-speed test. Missing-key probes warm the exact transport
+  // lane without reading or promoting the value under test.
+  RdmaTransport leader_transport(64 * 1024);
+  KVClient leader_client({{"n", node.addr}}, SelfHdr(), &leader_transport);
+  leader_client.set_batch_concurrency(1);
+  RdmaTransport follower_transport(64 * 1024);
+  KVClient follower_client({{"n", node.addr}}, SelfHdr(), &follower_transport);
+  follower_client.set_batch_concurrency(1);
+  auto warm_sg_connection = [&](KVClient* client, size_t seed) {
+    MultiWindowGet probe(targets_per_window, 1, seed);
+    std::vector<size_t> lengths;
+    const auto result = client->BatchGetAutoSg(
+        {{"coalesced_multi_missing", probe.pointers, probe.sizes}}, &lengths);
+    return result.size() == 1 && !result[0] && lengths.size() == 1 &&
+           lengths[0] == 0;
+  };
+  ASSERT_TRUE(warm_sg_connection(&leader_client, 91));
+  ASSERT_TRUE(warm_sg_connection(&follower_client, 97));
+  node.BarrierFirstPreparedRead("coalesced_multi");
+
   const uint64_t reads_before = node.rsrv->UringReads();
 
   std::thread leader_thread([&] {
-    RdmaTransport transport(64 * 1024);
-    KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
-    client.set_batch_concurrency(1);
     std::vector<size_t> lengths;
-    const auto result = client.BatchGetAutoSg(
+    const auto result = leader_client.BatchGetAutoSg(
         {{"coalesced_multi", leader.pointers, leader.sizes}}, &lengths);
     leader_ok = result.size() == 1 && result[0];
     if (lengths.size() == 1) leader_len = lengths[0];
@@ -3389,11 +3416,8 @@ TEST(RdmaLoopback, UringMultiWindowCoalescedFollowerPromotesToRam) {
   EXPECT_TRUE(node.WaitForPreparedLeader())
       << "leader did not register its async coalescer flight";
   std::thread follower_thread([&] {
-    RdmaTransport transport(64 * 1024);
-    KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
-    client.set_batch_concurrency(1);
     std::vector<size_t> lengths;
-    const auto result = client.BatchGetAutoSg(
+    const auto result = follower_client.BatchGetAutoSg(
         {{"coalesced_multi", follower.pointers, follower.sizes}}, &lengths);
     follower_ok = result.size() == 1 && result[0];
     if (lengths.size() == 1) follower_len = lengths[0];
@@ -3401,6 +3425,8 @@ TEST(RdmaLoopback, UringMultiWindowCoalescedFollowerPromotesToRam) {
   leader_thread.join();
   follower_thread.join();
 
+  EXPECT_FALSE(node.FollowerWaitTimedOut())
+      << "pre-warmed follower never entered the retained leader flight";
   ASSERT_TRUE(leader_ok);
   ASSERT_TRUE(follower_ok);
   EXPECT_EQ(leader_len, value.size());
