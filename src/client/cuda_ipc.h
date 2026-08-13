@@ -30,6 +30,7 @@ constexpr int kCuPointerAttributeMemoryType = 2;    // CU_POINTER_ATTRIBUTE_MEMO
 constexpr int kCuPointerAttributeDeviceOrdinal = 9; // CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL
 constexpr unsigned kCuMemoryTypeDevice = 2;         // CU_MEMORYTYPE_DEVICE
 constexpr unsigned kCuStreamNonBlocking = 1;        // CU_STREAM_NON_BLOCKING
+constexpr unsigned kCuMemHostRegisterPortable = 0x1;  // CU_MEMHOSTREGISTER_PORTABLE
 
 class CudaLib {
  public:

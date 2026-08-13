@@ -105,6 +105,56 @@ TEST(ConnectionPool, CorrectnessAcrossManyKeys) {
   n->srv->Stop();
 }
 
+TEST(ConnectionPool, DeviceDestinationsUseStagedPublication) {
+  auto n = Start("device_destination");
+  TcpTransport t;
+  const BlockKey key = ToBlockKey("test/model", "device_destination");
+  const std::string value = "abcdefgh";
+  ASSERT_EQ(t.Cache(n->addr, key, value.data(), value.size()), Status::kOk);
+  const uint64_t accepts = n->srv->AcceptCount();
+
+  std::string device_destination(value.size(), '!');
+  std::vector<uint64_t> value_lengths;
+  const auto device_status = t.RangeInto(
+      n->addr, {key},
+      {RangeDst{device_destination.data(), device_destination.size(),
+                DestinationMemoryKind::kDevice}},
+      &value_lengths);
+  ASSERT_EQ(device_status.size(), 1u);
+  EXPECT_EQ(device_status[0], Status::kIOError);
+  ASSERT_EQ(value_lengths.size(), 1u);
+  EXPECT_EQ(value_lengths[0], value.size());
+  EXPECT_EQ(device_destination, std::string(value.size(), '!'));
+
+  std::string host_segment(3, '!');
+  std::string device_segment(value.size() - host_segment.size(), '!');
+  const RangeDstMulti mixed_destination{{
+      RangeDstSegment{host_segment.data(), host_segment.size()},
+      RangeDstSegment{device_segment.data(), device_segment.size(),
+                      DestinationMemoryKind::kDevice},
+  }};
+  std::vector<size_t> out_lengths;
+  const auto mixed_status =
+      t.RangeIntoMulti(n->addr, {key}, {mixed_destination}, &out_lengths);
+  ASSERT_EQ(mixed_status.size(), 1u);
+  EXPECT_EQ(mixed_status[0], Status::kIOError);
+  ASSERT_EQ(out_lengths.size(), 1u);
+  EXPECT_EQ(out_lengths[0], value.size());
+  EXPECT_EQ(host_segment, value.substr(0, host_segment.size()));
+  EXPECT_EQ(device_segment, std::string(device_segment.size(), '!'));
+
+  std::string host_destination(value.size(), '!');
+  const auto host_status = t.RangeInto(
+      n->addr, {key},
+      {RangeDst{host_destination.data(), host_destination.size()}},
+      &value_lengths);
+  ASSERT_EQ(host_status.size(), 1u);
+  EXPECT_EQ(host_status[0], Status::kOk);
+  EXPECT_EQ(host_destination, value);
+  EXPECT_EQ(n->srv->AcceptCount(), accepts);
+  n->srv->Stop();
+}
+
 TEST(ConnectionPool, SurvivesStalePooledConnection) {
   // Put via transport, restart the server (old pooled fd is now stale), then a
   // new request must transparently reconnect (retry once) — not hard-fail.
