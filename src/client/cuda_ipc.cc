@@ -4,6 +4,7 @@
 #include <dlfcn.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <limits>
@@ -37,10 +38,52 @@ struct PublisherCudaState {
   CUstream stream = nullptr;
   CUcontext context = nullptr;
   int retained_device = -1;
+  size_t copy_count = 0;
   CUcontext pending_restore = nullptr;
   bool has_pending_restore = false;
   std::vector<RegisteredHostRange> registered;
 };
+
+void NotePublisherDriverFailure(const std::string& detail);
+
+bool EnqueueRegisteredCopy(const CudaLib* cuda, PublisherCudaState* state,
+                           void* destination, const void* source, size_t size) {
+  const uintptr_t source_begin = reinterpret_cast<uintptr_t>(source);
+  size_t copied = 0;
+  size_t chunk_index = 0;
+  while (copied < size) {
+    const uintptr_t cursor = source_begin + copied;
+    const RegisteredHostRange* containing = nullptr;
+    for (const auto& range : state->registered) {
+      if (range.begin <= cursor && cursor < range.end) {
+        containing = &range;
+        break;
+      }
+    }
+    if (!containing) {
+      NotePublisherDriverFailure(
+          "host registration bookkeeping left source uncovered");
+      return false;
+    }
+    const size_t chunk =
+        std::min(size - copied,
+                 static_cast<size_t>(containing->end - cursor));
+    const CUresult result = cuda->MemcpyAsync(
+        reinterpret_cast<CUdeviceptr>(destination) + copied,
+        reinterpret_cast<CUdeviceptr>(source) + copied, chunk, state->stream);
+    if (result != kCudaSuccess) {
+      NotePublisherDriverFailure(
+          "cuMemcpyAsync result=" + std::to_string(result) +
+          " copy=" + std::to_string(state->copy_count) +
+          " chunk=" + std::to_string(chunk_index) +
+          " bytes=" + std::to_string(chunk));
+      return false;
+    }
+    copied += chunk;
+    ++chunk_index;
+  }
+  return true;
+}
 
 size_t HostPageSize() {
   static const size_t page_size = [] {
@@ -80,7 +123,9 @@ bool RegisterHostRange(const CudaLib* cuda, PublisherCudaState* state,
 
   // Register only holes in the page-aligned union. Batched scatter publication
   // commonly presents adjacent slices of one vector; registering each slice
-  // independently would overlap the same host pages and fail.
+  // independently would overlap the same host pages and fail. Copy enqueues
+  // are split at these registration boundaries: CUDA rejects one memcpy
+  // spanning two otherwise adjacent registered allocations.
   uintptr_t cursor = begin;
   while (cursor < end) {
     uintptr_t covered_until = cursor;
@@ -338,14 +383,9 @@ bool DestinationPublisher::Copy(
 
   bool copy_ok = RegisterHostRange(cuda, state, source, size);
   if (copy_ok) {
-    const CUresult result =
-        cuda->MemcpyAsync(reinterpret_cast<CUdeviceptr>(destination),
-                          reinterpret_cast<CUdeviceptr>(source), size,
-                          state->stream);
-    copy_ok = result == kCudaSuccess;
-    if (!copy_ok)
-      NotePublisherDriverFailure("cuMemcpyAsync result=" +
-                                 std::to_string(result));
+    ++state->copy_count;
+    copy_ok =
+        EnqueueRegisteredCopy(cuda, state, destination, source, size);
   }
 
   // A publisher never lends its destination context to its caller, not even
