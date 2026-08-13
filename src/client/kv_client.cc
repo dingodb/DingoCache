@@ -67,12 +67,6 @@ bool CheckedSizeSum(const std::vector<size_t>& values, size_t* total) {
   return true;
 }
 
-DestinationMemoryKind ClassifyDestination(const void* destination) {
-  const CudaLib* cuda = CudaLib::Get();
-  return cuda && cuda->IsDevicePtr(destination)
-             ? DestinationMemoryKind::kDevice
-             : DestinationMemoryKind::kHost;
-}
 
 void AddMetricBytes(size_t value, uint64_t* total) {
   if constexpr (sizeof(size_t) > sizeof(uint64_t)) {
@@ -229,6 +223,66 @@ KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
     cd::Record("transport", transport_reason_, cd::Source::kArg);
     cd::Emit("client");
   });
+}
+
+bool KVClient::RegisterMemory(void* base, size_t size) {
+  const uintptr_t address = reinterpret_cast<uintptr_t>(base);
+  if (!base || size == 0 ||
+      size > std::numeric_limits<uintptr_t>::max() - address) {
+    return false;
+  }
+
+  // Serialize declarations with classification reads so a GET concurrent with
+  // a successful registration cannot slip through the publication gap and
+  // initialize/query CUDA on its registered host destination.
+  std::unique_lock<std::shared_mutex> lock(registered_memory_mu_);
+  const CudaLib* cuda = CudaLib::Get();
+  const DestinationMemoryKind kind =
+      cuda && cuda->IsDevicePtr(base) ? DestinationMemoryKind::kDevice
+                                      : DestinationMemoryKind::kHost;
+  if (!t_->RegisterMemory(base, size)) return false;
+
+  const uintptr_t end = address + size;
+  for (auto it = registered_memory_.begin();
+       it != registered_memory_.end(); ++it) {
+    if (it->base != address) continue;
+    // Same-base declarations are one transport pool. A smaller redeclaration
+    // does not shrink it; growth replaces the older entry and becomes newest.
+    RegisteredMemoryRange updated{
+        address, std::max(it->end, end), kind};
+    registered_memory_.erase(it);
+    registered_memory_.push_back(updated);
+    return true;
+  }
+  registered_memory_.push_back({address, end, kind});
+  return true;
+}
+
+DestinationMemoryKind KVClient::ClassifyDestination(
+    const void* destination, size_t size) const {
+  if (!destination || size == 0) return DestinationMemoryKind::kHost;
+  const uintptr_t address = reinterpret_cast<uintptr_t>(destination);
+  const bool valid =
+      size <= std::numeric_limits<uintptr_t>::max() - address;
+  if (valid) {
+    std::shared_lock<std::shared_mutex> lock(registered_memory_mu_);
+    // Reverse declaration order gives overlaps an explicit latest-wins rule.
+    // Subtraction-based containment cannot wrap at the end of address space.
+    for (auto it = registered_memory_.rbegin();
+         it != registered_memory_.rend(); ++it) {
+      if (address >= it->base && address < it->end &&
+          size <= it->end - address) {
+        return it->kind;
+      }
+    }
+  }
+
+  // No lifetime is known for an unregistered pointer, so caching a host answer
+  // could misclassify a later CUDA allocation that reuses the same VA.
+  const CudaLib* cuda = CudaLib::Get();
+  return cuda && cuda->IsDevicePtr(destination)
+             ? DestinationMemoryKind::kDevice
+             : DestinationMemoryKind::kHost;
 }
 
 void KVClient::AdoptRing(ConHash ring, std::map<std::string, std::string> addr) {
@@ -610,7 +664,7 @@ bool KVClient::GetDirect(const std::string& key, void* out, size_t n) {
   uint64_t value_len = 0;
   std::vector<BlockKey> keys{bk};
   std::vector<RangeDst> dsts{
-      RangeDst{n ? out : nullptr, n, ClassifyDestination(out)}};
+      RangeDst{n ? out : nullptr, n, ClassifyDestination(out, n)}};
   std::vector<uint64_t> value_lens;
   const Status st = t_->RangeInto(node, keys, dsts, &value_lens)[0];
   if (!value_lens.empty()) value_len = value_lens[0];
@@ -686,7 +740,7 @@ bool KVClient::GetAutoDirect(const std::string& key, void* out, size_t cap,
   uint64_t value_len = 0;
   std::vector<BlockKey> keys{bk};
   std::vector<RangeDst> dsts{
-      RangeDst{cap ? out : nullptr, cap, ClassifyDestination(out)}};
+      RangeDst{cap ? out : nullptr, cap, ClassifyDestination(out, cap)}};
   std::vector<uint64_t> value_lens;
   const Status st = t_->RangeInto(node, keys, dsts, &value_lens)[0];
   if (!value_lens.empty()) value_len = value_lens[0];
@@ -827,12 +881,12 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
   std::vector<size_t> fetch_map, wait_list;
   std::vector<uint64_t> tokens(N, 0);
   fetch_items.reserve(N);
-  // Host rendezvous can't serve device destinations (memcpy to a device VA);
-  // route those straight to the fetch list unclaimed instead of crashing when
-  // the env switch is set in a GPUDirect process. cu is null on CPU-only hosts.
-  const CudaLib* cu = CudaLib::Get();
+  // Host rendezvous cannot serve device destinations (memcpy to a device VA);
+  // registered pools use the declaration cache, while unregistered pointers
+  // take the conservative CUDA probe.
   for (size_t i = 0; i < N; ++i) {
-    if (cu && cu->IsDevicePtr(items[i].out)) {
+    if (ClassifyDestination(items[i].out, items[i].n) ==
+        DestinationMemoryKind::kDevice) {
       fetch_map.push_back(i);
       fetch_items.push_back(items[i]);
       // token remains zero: this direct fetch has no publish obligation.
@@ -909,7 +963,7 @@ std::vector<bool> KVClient::BatchGetDirect(const std::vector<KvGetItem>& items) 
       for (size_t k : idx) {
         keys.push_back(ToBlockKey(key_namespace_, items[k].key));
         dsts.push_back(RangeDst{items[k].out, n,
-                                ClassifyDestination(items[k].out)});
+                                ClassifyDestination(items[k].out, n)});
       }
       // The transport stages retry-owned bytes, then publishes them into each
       // host or CUDA destination before returning the authoritative size.
@@ -969,9 +1023,9 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
   std::vector<size_t> fetch_map, wait_list;
   std::vector<uint64_t> tokens(N, 0);
   fetch_items.reserve(N);
-  const CudaLib* cu = CudaLib::Get();  // device destinations bypass (see BatchGet)
   for (size_t i = 0; i < N; ++i) {
-    if (cu && cu->IsDevicePtr(items[i].out)) {
+    if (ClassifyDestination(items[i].out, items[i].n) ==
+        DestinationMemoryKind::kDevice) {
       fetch_map.push_back(i);
       fetch_items.push_back(items[i]);
       // Unclaimed device fetch: token remains zero.
@@ -1067,7 +1121,7 @@ std::vector<bool> KVClient::BatchGetAutoDirect(const std::vector<KvGetItem>& ite
     for (size_t k : idx) {
       keys.push_back(ToBlockKey(key_namespace_, items[k].key));
       dsts.push_back(RangeDst{items[k].out, cap,
-                              ClassifyDestination(items[k].out)});
+                              ClassifyDestination(items[k].out, cap)});
     }
     std::vector<uint64_t> value_lens;
     std::vector<Status> sts = t_->RangeInto(node, keys, dsts, &value_lens);
@@ -1352,18 +1406,19 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
   // Init the GPU rendezvous only once an all-device SG destination shows up:
   // its first pointer selects the primary context for the arena. Mixed and
   // host-only SG items use the ordinary transport publication path.
-  const CudaLib* cu = CudaLib::Get();
   std::vector<char> all_device(items.size(), 0);
   const void* hint = nullptr;
-  if (cu) {
-    for (size_t i = 0; i < items.size(); ++i) {
-      bool all = !items[i].dsts.empty();
-      for (const void* destination : items[i].dsts) {
-        if (!cu->IsDevicePtr(destination)) all = false;
+  for (size_t i = 0; i < items.size(); ++i) {
+    bool all = !items[i].dsts.empty() &&
+               items[i].dsts.size() == items[i].caps.size();
+    for (size_t j = 0; all && j < items[i].dsts.size(); ++j) {
+      if (ClassifyDestination(items[i].dsts[j], items[i].caps[j]) !=
+          DestinationMemoryKind::kDevice) {
+        all = false;
       }
-      all_device[i] = all ? 1 : 0;
-      if (all && !hint) hint = items[i].dsts[0];
     }
+    all_device[i] = all ? 1 : 0;
+    if (all && !hint) hint = items[i].dsts[0];
   }
   GpuNodeDedup* gd = hint ? GpuDedup(hint) : nullptr;
   if (!gd || items.empty()) {
@@ -1557,7 +1612,7 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
         for (size_t j = 0; j < items[k].dsts.size(); ++j)
           d.payloads.emplace_back(
               items[k].dsts[j], items[k].caps[j],
-              ClassifyDestination(items[k].dsts[j]));
+              ClassifyDestination(items[k].dsts[j], items[k].caps[j]));
         dsts.push_back(std::move(d));
       }
       std::vector<size_t> value_lens;

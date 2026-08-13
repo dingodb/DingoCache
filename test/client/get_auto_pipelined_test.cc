@@ -8,6 +8,7 @@
 #include "client/key_map.h"
 
 #include <gtest/gtest.h>
+#include <limits>
 #include <cstring>
 #include <map>
 #include <string>
@@ -23,6 +24,14 @@ struct FakePipelinedTransport : Transport {
   std::map<std::string, std::string> blobs;  // key.Filename() -> payload
   std::string dead;
   int range_calls = 0, rangeinto_calls = 0;
+  std::vector<DestinationMemoryKind> last_range_kinds;
+  std::vector<std::vector<DestinationMemoryKind>> last_multi_kinds;
+  int register_calls = 0;
+
+  bool RegisterMemory(void*, size_t) override {
+    ++register_calls;
+    return true;
+  }
 
   bool pipelined() const override { return true; }
 
@@ -50,6 +59,10 @@ struct FakePipelinedTransport : Transport {
                                 const std::vector<RangeDst>& dsts,
                                 std::vector<uint64_t>* value_lens) override {
     ++rangeinto_calls;
+    last_range_kinds.clear();
+    last_range_kinds.reserve(dsts.size());
+    for (const auto& dst : dsts)
+      last_range_kinds.push_back(dst.memory_kind);
     value_lens->assign(keys.size(), 0);
     std::vector<Status> r(keys.size(), Status::kNotFound);
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -64,6 +77,38 @@ struct FakePipelinedTransport : Transport {
       r[i] = Status::kOk;
     }
     return r;
+  }
+
+  std::vector<Status> RangeIntoMulti(
+      const std::string&, const std::vector<BlockKey>& keys,
+      const std::vector<RangeDstMulti>& dsts,
+      std::vector<size_t>* value_lens) override {
+    value_lens->assign(keys.size(), 0);
+    last_multi_kinds.clear();
+    last_multi_kinds.reserve(dsts.size());
+    std::vector<Status> result(keys.size(), Status::kNotFound);
+    for (size_t i = 0; i < keys.size(); ++i) {
+      std::vector<DestinationMemoryKind> kinds;
+      kinds.reserve(dsts[i].payloads.size());
+      for (const auto& segment : dsts[i].payloads)
+        kinds.push_back(segment.memory_kind);
+      last_multi_kinds.push_back(std::move(kinds));
+
+      auto it = blobs.find(keys[i].Filename());
+      if (it == blobs.end()) continue;
+      (*value_lens)[i] = it->second.size();
+      size_t offset = 0;
+      for (const auto& segment : dsts[i].payloads) {
+        const size_t copy =
+            std::min(segment.second, it->second.size() - offset);
+        if (copy)
+          std::memcpy(segment.first, it->second.data() + offset, copy);
+        offset += copy;
+        if (offset == it->second.size()) break;
+      }
+      result[i] = Status::kOk;
+    }
+    return result;
   }
 };
 
@@ -140,4 +185,45 @@ TEST(GetAutoPipelined, MissReturnsFalse) {
   EXPECT_FALSE(c.GetAuto("absent", buf.data(), buf.size(), &got));
   std::string s;
   EXPECT_FALSE(c.GetAuto("absent", &s, 64));
+}
+
+TEST(GetAutoPipelined, RegisteredHostSubrangesClassifyWithoutCudaOnGet) {
+  FakePipelinedTransport t;
+  KVClient c = MakeClient(&t);
+  std::vector<char> pool(4096, '\0');
+  ASSERT_TRUE(c.RegisterMemory(pool.data(), 1024));
+  ASSERT_TRUE(c.RegisterMemory(pool.data(), pool.size()));
+  ASSERT_EQ(t.register_calls, 2);
+
+  ASSERT_TRUE(c.RegisterMemory(pool.data() + 512, 1024));
+  ASSERT_EQ(t.register_calls, 3);
+  const uintptr_t address = reinterpret_cast<uintptr_t>(pool.data());
+  const size_t wrapping_size =
+      std::numeric_limits<uintptr_t>::max() - address + 1;
+  EXPECT_FALSE(c.RegisterMemory(pool.data(), wrapping_size));
+  EXPECT_EQ(t.register_calls, 3);
+  const std::string scalar_value(127, 's');
+  t.blobs[ToBlockKey("test/model", "registered-scalar").Filename()] =
+      scalar_value;
+  size_t got = 0;
+  char* const scalar_destination = pool.data() + 777;
+  ASSERT_TRUE(c.GetAuto("registered-scalar", scalar_destination,
+                        scalar_value.size(), &got));
+  EXPECT_EQ(got, scalar_value.size());
+  ASSERT_EQ(t.last_range_kinds.size(), 1);
+  EXPECT_EQ(t.last_range_kinds[0], DestinationMemoryKind::kHost);
+
+  const std::string sg_value = "registered-host-scatter-gather";
+  t.blobs[ToBlockKey("test/model", "registered-sg").Filename()] = sg_value;
+  KvGetItemSg item;
+  item.key = "registered-sg";
+  item.dsts = {pool.data() + 31, pool.data() + 503, pool.data() + 2049};
+  item.caps = {5, 9, sg_value.size() - 14};
+  std::vector<size_t> lengths;
+  ASSERT_EQ(c.BatchGetAutoSg({item}, &lengths), std::vector<bool>({true}));
+  ASSERT_EQ(lengths, std::vector<size_t>({sg_value.size()}));
+  ASSERT_EQ(t.last_multi_kinds.size(), 1);
+  EXPECT_EQ(t.last_multi_kinds[0],
+            std::vector<DestinationMemoryKind>(
+                3, DestinationMemoryKind::kHost));
 }
