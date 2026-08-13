@@ -7,6 +7,7 @@
 #include "transport/transport.h"
 #include "client/key_map.h"
 
+#include <algorithm>
 #include <gtest/gtest.h>
 #include <limits>
 #include <cstring>
@@ -226,4 +227,63 @@ TEST(GetAutoPipelined, RegisteredHostSubrangesClassifyWithoutCudaOnGet) {
   EXPECT_EQ(t.last_multi_kinds[0],
             std::vector<DestinationMemoryKind>(
                 3, DestinationMemoryKind::kHost));
+}
+
+TEST(GetAutoPipelined,
+     DefaultMultiPublicationUsesScratchAcrossOddSgBoundariesAndFailure) {
+  FakePipelinedTransport t;
+  const BlockKey key = ToBlockKey("test/model", "default-sg");
+  std::string expected(16391, '\0');
+  for (size_t i = 0; i < expected.size(); ++i)
+    expected[i] = static_cast<char>((29u * i + 0x63u) & 0xffu);
+  t.blobs[key.Filename()] = expected;
+
+  constexpr size_t kGuard = 19;
+  constexpr char kSentinel = static_cast<char>(0xd3);
+  const std::vector<size_t> segment_sizes{4093, 4109,
+                                          expected.size() - 8202};
+  std::vector<std::string> allocations;
+  RangeDstMulti destination;
+  allocations.reserve(segment_sizes.size());
+  for (size_t size : segment_sizes) {
+    allocations.emplace_back(size + 2 * kGuard, kSentinel);
+    destination.payloads.emplace_back(
+        allocations.back().data() + kGuard, size,
+        DestinationMemoryKind::kHost);
+  }
+
+  std::vector<size_t> lengths;
+  const auto statuses = t.Transport::RangeIntoMulti(
+      "10.0.0.1:1", {key}, {destination}, &lengths);
+  EXPECT_EQ(statuses, std::vector<Status>({Status::kOk}));
+  EXPECT_EQ(lengths, std::vector<size_t>({expected.size()}));
+  size_t offset = 0;
+  for (size_t i = 0; i < segment_sizes.size(); ++i) {
+    EXPECT_EQ(allocations[i].substr(0, kGuard),
+              std::string(kGuard, kSentinel))
+        << "leading guard " << i;
+    EXPECT_EQ(allocations[i].substr(kGuard, segment_sizes[i]),
+              expected.substr(offset, segment_sizes[i]))
+        << "payload " << i;
+    EXPECT_EQ(allocations[i].substr(kGuard + segment_sizes[i]),
+              std::string(kGuard, kSentinel))
+        << "trailing guard " << i;
+    offset += segment_sizes[i];
+  }
+
+  // The base publication contract reads into operation-owned scratch first.
+  // A failed attempt therefore reports its exact status without exposing any
+  // partially received bytes to caller SG buffers.
+  for (auto& allocation : allocations)
+    std::fill(allocation.begin(), allocation.end(), kSentinel);
+  t.dead = "failed-rail";
+  lengths.clear();
+  const auto failed = t.Transport::RangeIntoMulti(
+      t.dead, {key}, {destination}, &lengths);
+  EXPECT_EQ(failed, std::vector<Status>({Status::kIOError}));
+  EXPECT_EQ(lengths, std::vector<size_t>({0}));
+  for (size_t i = 0; i < allocations.size(); ++i)
+    EXPECT_EQ(allocations[i],
+              std::string(allocations[i].size(), kSentinel))
+        << "failed destination " << i;
 }

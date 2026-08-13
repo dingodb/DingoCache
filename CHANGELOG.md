@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### CUDA GET pinned publication pool
+
+- Replaced per-operation CUDA host registration for GET publication with a
+  process-wide, bounded, reusable portable-pinned bounce pool. Slots are fixed
+  size, allocated and pinned/registered once on first use, exclusively leased,
+  and returned only after the stream-ordered host-to-device copy synchronizes.
+- Added `DFKV_CUDA_PINNED_POOL_BYTES` (default 67108864, 64 MiB; maximum
+  4 GiB) and `DFKV_CUDA_PINNED_SLOT_BYTES` (default 4194304, 4 MiB; accepted
+  range 4 KiB–64 MiB). Values are positive decimal byte counts; the budget
+  rounds down to whole slots with at least one and at most 4096 slots. Invalid
+  sizing warns and falls back to both defaults. Allocation is lazy, so
+  pinned-memory and memlock consumption grows only to the concurrent high-water
+  and remains bounded by that rounded per-process budget.
+- When every slot is leased and the budget is exhausted, CUDA GET publication
+  blocks until a slot is returned rather than allocating beyond the bound.
+  Payloads larger than one slot are published in fixed-size chunks.
+- Kept RDMA retry data in operation-owned pageable staging. Only the final
+  winning attempt is copied through the pinned pool to caller CUDA memory, so a
+  failed rail cannot partially publish into the caller buffer. Direct
+  GPUDirect GET would violate that retry fence; GPUDirect PUT remains unchanged.
+- CUDA context preservation, multi-device publication, byte-exact mixed
+  scatter-gather behavior, synchronous completion, fail-closed CUDA errors,
+  parent-process teardown, and fail-closed post-fork child behavior are
+  preserved. A slot whose stream synchronization fails is quarantined and kept
+  pinned until process exit rather than risking release while the driver may
+  still reference it. Deployments must provision `RLIMIT_MEMLOCK` for the
+  pool's lazy high-water plus other locked memory.
+
 ## v2.19.0 — 2026-08-13
 
 ### CUDA GET correctness
