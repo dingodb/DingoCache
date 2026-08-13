@@ -67,6 +67,13 @@ bool CheckedSizeSum(const std::vector<size_t>& values, size_t* total) {
   return true;
 }
 
+DestinationMemoryKind ClassifyDestination(const void* destination) {
+  const CudaLib* cuda = CudaLib::Get();
+  return cuda && cuda->IsDevicePtr(destination)
+             ? DestinationMemoryKind::kDevice
+             : DestinationMemoryKind::kHost;
+}
+
 void AddMetricBytes(size_t value, uint64_t* total) {
   if constexpr (sizeof(size_t) > sizeof(uint64_t)) {
     if (value > std::numeric_limits<uint64_t>::max()) {
@@ -602,7 +609,8 @@ bool KVClient::GetDirect(const std::string& key, void* out, size_t n) {
   const BlockKey bk = ToBlockKey(key_namespace_, key);
   uint64_t value_len = 0;
   std::vector<BlockKey> keys{bk};
-  std::vector<RangeDst> dsts{RangeDst{n ? out : nullptr, n}};
+  std::vector<RangeDst> dsts{
+      RangeDst{n ? out : nullptr, n, ClassifyDestination(out)}};
   std::vector<uint64_t> value_lens;
   const Status st = t_->RangeInto(node, keys, dsts, &value_lens)[0];
   if (!value_lens.empty()) value_len = value_lens[0];
@@ -634,8 +642,9 @@ bool KVClient::GetAutoDirect(const std::string& key, std::string* out,
   uint64_t value_len = 0;
   out->resize(max_bytes);
   std::vector<BlockKey> keys{bk};
-  std::vector<RangeDst> dsts{
-      RangeDst{max_bytes ? &(*out)[0] : nullptr, max_bytes}};
+  std::vector<RangeDst> dsts{RangeDst{
+      max_bytes ? &(*out)[0] : nullptr, max_bytes,
+      DestinationMemoryKind::kHost}};
   std::vector<uint64_t> value_lens;
   const Status st = t_->RangeInto(node, keys, dsts, &value_lens)[0];
   if (!value_lens.empty()) value_len = value_lens[0];
@@ -676,7 +685,8 @@ bool KVClient::GetAutoDirect(const std::string& key, void* out, size_t cap,
   const BlockKey bk = ToBlockKey(key_namespace_, key);
   uint64_t value_len = 0;
   std::vector<BlockKey> keys{bk};
-  std::vector<RangeDst> dsts{RangeDst{cap ? out : nullptr, cap}};
+  std::vector<RangeDst> dsts{
+      RangeDst{cap ? out : nullptr, cap, ClassifyDestination(out)}};
   std::vector<uint64_t> value_lens;
   const Status st = t_->RangeInto(node, keys, dsts, &value_lens)[0];
   if (!value_lens.empty()) value_len = value_lens[0];
@@ -898,10 +908,11 @@ std::vector<bool> KVClient::BatchGetDirect(const std::vector<KvGetItem>& items) 
       dsts.reserve(idx.size());
       for (size_t k : idx) {
         keys.push_back(ToBlockKey(key_namespace_, items[k].key));
-        dsts.push_back(RangeDst{items[k].out, n});
+        dsts.push_back(RangeDst{items[k].out, n,
+                                ClassifyDestination(items[k].out)});
       }
-      // Raw payload lands straight in items[].out; authoritative stored sizes
-      // return in the response prefix.
+      // The transport stages retry-owned bytes, then publishes them into each
+      // host or CUDA destination before returning the authoritative size.
       std::vector<uint64_t> value_lens;
       std::vector<Status> sts = t_->RangeInto(node, keys, dsts, &value_lens);
       bool resp = false, ioerr = false;
@@ -1034,8 +1045,8 @@ std::vector<bool> KVClient::BatchGetAutoDirect(const std::vector<KvGetItem>& ite
     return std::vector<bool>(hit.begin(), hit.end());
   }
   // RDMA: group by (node, cap) so each group shares the Range length, then
-  // pipeline. Same zero-copy datapath as BatchGet; the only difference is we
-  // accept any payload_len <= cap (instead of == n) and report the true length.
+  // pipeline. Same staged-publication datapath as BatchGet; the only
+  // difference is accepting payload_len <= cap and reporting the true length.
   std::map<std::pair<std::string, size_t>, std::vector<size_t>> by;
   for (size_t i = 0; i < N; ++i) {
     std::string node = Route(items[i].key);
@@ -1055,7 +1066,8 @@ std::vector<bool> KVClient::BatchGetAutoDirect(const std::vector<KvGetItem>& ite
     dsts.reserve(idx.size());
     for (size_t k : idx) {
       keys.push_back(ToBlockKey(key_namespace_, items[k].key));
-      dsts.push_back(RangeDst{items[k].out, cap});
+      dsts.push_back(RangeDst{items[k].out, cap,
+                              ClassifyDestination(items[k].out)});
     }
     std::vector<uint64_t> value_lens;
     std::vector<Status> sts = t_->RangeInto(node, keys, dsts, &value_lens);
@@ -1337,16 +1349,23 @@ GpuNodeDedup* KVClient::GpuDedup(const void* device_dst_hint) {
 std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items,
                                            std::vector<size_t>* out_lens) {
   const auto t0 = std::chrono::steady_clock::now();
-  // Init the GPU rendezvous only once a DEVICE destination shows up: its
-  // pointer picks the primary context to bind when this (transfer) thread
-  // has none, and host-only callers never pay for an arena.
-  GpuNodeDedup* gd = nullptr;
-  if (const CudaLib* cu0 = CudaLib::Get()) {
-    const void* hint = nullptr;
-    for (const auto& it : items)
-      if (!it.dsts.empty() && cu0->IsDevicePtr(it.dsts[0])) { hint = it.dsts[0]; break; }
-    if (hint) gd = GpuDedup(hint);
+  // Init the GPU rendezvous only once an all-device SG destination shows up:
+  // its first pointer selects the primary context for the arena. Mixed and
+  // host-only SG items use the ordinary transport publication path.
+  const CudaLib* cu = CudaLib::Get();
+  std::vector<char> all_device(items.size(), 0);
+  const void* hint = nullptr;
+  if (cu) {
+    for (size_t i = 0; i < items.size(); ++i) {
+      bool all = !items[i].dsts.empty();
+      for (const void* destination : items[i].dsts) {
+        if (!cu->IsDevicePtr(destination)) all = false;
+      }
+      all_device[i] = all ? 1 : 0;
+      if (all && !hint) hint = items[i].dsts[0];
+    }
   }
+  GpuNodeDedup* gd = hint ? GpuDedup(hint) : nullptr;
   if (!gd || items.empty()) {
     std::vector<size_t> lengths;
     auto result = BatchGetAutoSgDirect(items, &lengths);
@@ -1356,12 +1375,10 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
     if (out_lens) *out_lens = std::move(lengths);
     return RecordBatch(OpMetrics::kGet, t0, std::move(result), bytes);
   }
-  // Same-host rendezvous for GPU destinations (phase 2b, see node_dedup_gpu.h):
-  // the vLLM connector's SG gets land in device memory, where lockstep TP
-  // ranks re-fetch identical TP-replicated KV. Payloads rendezvous through
-  // per-process GPU staging arenas (CUDA IPC + NVLink D2D); every outcome
-  // degrades to the plain remote path.
-  const CudaLib* cu = CudaLib::Get();  // non-null: gd exists
+  // Same-host rendezvous for all-device GPU destinations (phase 2b, see
+  // node_dedup_gpu.h): the vLLM connector's SG lands in device memory, where
+  // lockstep TP ranks re-fetch identical TP-replicated KV. Mixed SG items use
+  // the ordinary staged publication path instead.
   const size_t N = items.size();
   std::vector<bool> res(N, false);
   std::vector<size_t> lens(N, 0);
@@ -1381,12 +1398,11 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
   for (size_t i = 0; i < N; ++i)
     totals_valid[i] = CheckedSizeSum(items[i].caps, &total_caps[i]) ? 1 : 0;
   for (size_t i = 0; i < N; ++i) {
-    // Eligible = well-shaped AND device-memory destination. Host-destination
-    // SG items (or malformed ones the Direct guard rejects) skip the
-    // rendezvous entirely — an unclaimed fetch has no publish obligation.
+    // Eligible = well-shaped AND entirely device memory. Mixed SG must bypass
+    // GPU rendezvous because its CUDA IPC copier cannot publish host segments.
     const bool eligible = !items[i].key.empty() && !items[i].dsts.empty() &&
                           items[i].dsts.size() == items[i].caps.size() &&
-                          totals_valid[i] && cu->IsDevicePtr(items[i].dsts[0]);
+                          totals_valid[i] && all_device[i];
     if (!eligible) {
       fetch_map.push_back(i);
       fetch_items.push_back(items[i]);
@@ -1539,7 +1555,9 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
         RangeDstMulti d;
         d.payloads.reserve(items[k].dsts.size());
         for (size_t j = 0; j < items[k].dsts.size(); ++j)
-          d.payloads.emplace_back(items[k].dsts[j], items[k].caps[j]);
+          d.payloads.emplace_back(
+              items[k].dsts[j], items[k].caps[j],
+              ClassifyDestination(items[k].dsts[j]));
         dsts.push_back(std::move(d));
       }
       std::vector<size_t> value_lens;

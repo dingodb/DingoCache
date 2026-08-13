@@ -5,6 +5,7 @@
 // no RDMA device is present. Built only when DFKV_WITH_RDMA is defined. Run under
 // ThreadSanitizer to exercise the worker-pool / QP concurrency.
 #include "client/kv_client.h"
+#include "client/cuda_ipc.h"
 #include "client/node_dedup.h"
 #include "client/key_map.h"
 #include "cache/kv_node_server.h"
@@ -374,6 +375,76 @@ struct FakePoolRail {
     return offset <= declared && length <= declared - offset;
   }
 };
+
+std::string CudaTestBytes(size_t size, uint8_t seed) {
+  std::string bytes(size, '\0');
+  for (size_t i = 0; i < size; ++i) {
+    bytes[i] = static_cast<char>(
+        (static_cast<unsigned>(seed) + 131u * i + 17u * (i >> 3)) & 0xffu);
+  }
+  return bytes;
+}
+
+// CUDA allocation with sentinels on both sides of the caller-visible range.
+// Upload/download use the dlopen'd driver surface, so this test binary needs
+// neither CUDA headers nor a link-time dependency on libcuda.
+class CudaGuardedBuffer {
+ public:
+  static constexpr size_t kGuardBytes = 37;
+  static constexpr uint8_t kGuardByte = 0xa7;
+
+  CudaGuardedBuffer(const CudaLib* cuda, size_t payload_size)
+      : cuda_(cuda), payload_size_(payload_size) {}
+  ~CudaGuardedBuffer() {
+    if (base_) cuda_->MemFree(base_);
+  }
+
+  bool Allocate() {
+    if (cuda_->MemAlloc(&base_, payload_size_ + 2 * kGuardBytes) !=
+        kCudaSuccess) {
+      base_ = 0;
+      return false;
+    }
+    const std::string initial(payload_size_ + 2 * kGuardBytes,
+                              static_cast<char>(kGuardByte));
+    return cuda_->Memcpy(base_,
+                         reinterpret_cast<CUdeviceptr>(initial.data()),
+                         initial.size()) == kCudaSuccess;
+  }
+
+  void* payload() const {
+    return reinterpret_cast<void*>(base_ + kGuardBytes);
+  }
+
+  bool ReadPayload(std::string* out) const {
+    out->assign(payload_size_, '\0');
+    return cuda_->Memcpy(reinterpret_cast<CUdeviceptr>(out->data()),
+                         base_ + kGuardBytes, payload_size_) == kCudaSuccess;
+  }
+
+  bool GuardsIntact() const {
+    std::string allocation(payload_size_ + 2 * kGuardBytes, '\0');
+    if (cuda_->Memcpy(reinterpret_cast<CUdeviceptr>(allocation.data()), base_,
+                      allocation.size()) != kCudaSuccess) {
+      return false;
+    }
+    const std::string guard(kGuardBytes, static_cast<char>(kGuardByte));
+    return allocation.compare(0, kGuardBytes, guard) == 0 &&
+           allocation.compare(kGuardBytes + payload_size_, kGuardBytes,
+                              guard) == 0;
+  }
+
+ private:
+  const CudaLib* cuda_;
+  size_t payload_size_;
+  CUdeviceptr base_ = 0;
+};
+
+const CudaLib* ActiveCudaForTest() {
+  const CudaLib* cuda = CudaLib::Get();
+  if (!cuda || !cuda->BindPrimaryCtx(0)) return nullptr;
+  return cuda;
+}
 
 }  // namespace
 
@@ -2868,6 +2939,117 @@ TEST(RdmaLoopback, DefaultDeclarationKeepsGlobalCap) {
   EXPECT_EQ(got, v);
 }
 
+TEST(RdmaLoopback, ScalarGetPublishesExactBytesToGuardedCudaDestination) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const CudaLib* cuda = ActiveCudaForTest();
+  if (!cuda) GTEST_SKIP() << "no usable CUDA device";
+  ScopedEnv host_dedup("DFKV_CLIENT_NODE_DEDUP", nullptr);
+  ScopedEnv gpu_dedup("DFKV_CLIENT_NODE_DEDUP_GPU", nullptr);
+  ScopedEnv completion_fault("DFKV_RDMA_TEST_COMPLETION_FAULT", nullptr);
+  ScopedEnv endpoint_fault("DFKV_RDMA_TEST_ENDPOINT_COMPLETION_FAULT",
+                           nullptr);
+  ScopedEnv local_failure("DFKV_RDMA_TEST_LOCAL_RAIL_FAILURE_ATTEMPTS",
+                          nullptr);
+
+  RdmaNode node("cuda-scalar-get");
+  RdmaTransport transport(kMaxMsg);
+  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+  const std::string value = CudaTestBytes(8197, 0x31);
+  ASSERT_TRUE(client.Put("cuda-scalar", value.data(), value.size()));
+
+  CudaGuardedBuffer destination(cuda, value.size());
+  ASSERT_TRUE(destination.Allocate());
+  ASSERT_TRUE(cuda->IsDevicePtr(destination.payload()));
+  ASSERT_TRUE(client.Get("cuda-scalar", destination.payload(), value.size()));
+
+  // Read back immediately after Get returns. The API contract is synchronous:
+  // its private nonblocking CUDA stream must already be synchronized here.
+  std::string actual;
+  ASSERT_TRUE(destination.ReadPayload(&actual));
+  EXPECT_EQ(actual, value);
+  EXPECT_TRUE(destination.GuardsIntact());
+}
+
+TEST(RdmaLoopback,
+     MultiSegmentGetPublishesUnequalExactBytesToGuardedCudaDestinations) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const CudaLib* cuda = ActiveCudaForTest();
+  if (!cuda) GTEST_SKIP() << "no usable CUDA device";
+  ScopedEnv host_dedup("DFKV_CLIENT_NODE_DEDUP", nullptr);
+  ScopedEnv gpu_dedup("DFKV_CLIENT_NODE_DEDUP_GPU", nullptr);
+  ScopedEnv completion_fault("DFKV_RDMA_TEST_COMPLETION_FAULT", nullptr);
+  ScopedEnv endpoint_fault("DFKV_RDMA_TEST_ENDPOINT_COMPLETION_FAULT",
+                           nullptr);
+  ScopedEnv local_failure("DFKV_RDMA_TEST_LOCAL_RAIL_FAILURE_ATTEMPTS",
+                          nullptr);
+
+  // Host first is deliberate: treating the whole SG item as host from its
+  // first segment crashes on the following CUDA pointer. The remaining three
+  // CUDA segments have unequal, odd capacities and independent guards.
+  constexpr std::array<size_t, 4> kSegmentSizes{613, 997, 2051, 4099};
+  const size_t total = kSegmentSizes[0] + kSegmentSizes[1] +
+                       kSegmentSizes[2] + kSegmentSizes[3];
+  const std::string value = CudaTestBytes(total, 0x6d);
+
+  RdmaNode node("cuda-multisegment-get");
+  RdmaTransport transport(kMaxMsg);
+  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+  ASSERT_TRUE(client.Put("cuda-multisegment", value.data(), value.size()));
+
+  const std::string host_guard(
+      CudaGuardedBuffer::kGuardBytes,
+      static_cast<char>(CudaGuardedBuffer::kGuardByte));
+  std::string host_allocation(
+      kSegmentSizes[0] + 2 * CudaGuardedBuffer::kGuardBytes,
+      static_cast<char>(CudaGuardedBuffer::kGuardByte));
+  char* const host_payload =
+      host_allocation.data() + CudaGuardedBuffer::kGuardBytes;
+
+  std::array<std::unique_ptr<CudaGuardedBuffer>, 3> device_buffers;
+  KvGetItemSg get;
+  get.key = "cuda-multisegment";
+  get.dsts.push_back(host_payload);
+  get.caps.push_back(kSegmentSizes[0]);
+  for (size_t i = 0; i < device_buffers.size(); ++i) {
+    const size_t segment = i + 1;
+    device_buffers[i] =
+        std::make_unique<CudaGuardedBuffer>(cuda, kSegmentSizes[segment]);
+    ASSERT_TRUE(device_buffers[i]->Allocate()) << "segment " << segment;
+    ASSERT_TRUE(cuda->IsDevicePtr(device_buffers[i]->payload()))
+        << "segment " << segment;
+    get.dsts.push_back(device_buffers[i]->payload());
+    get.caps.push_back(kSegmentSizes[segment]);
+  }
+
+  std::vector<size_t> lengths;
+  ASSERT_EQ(client.BatchGetAutoSg({get}, &lengths),
+            std::vector<bool>({true}));
+  ASSERT_EQ(lengths, std::vector<size_t>({value.size()}));
+
+  // Every immediate read observes API-return state. Odd, unequal boundaries
+  // expose word-sized over-copy, and host-first ordering proves memory kind is
+  // classified per segment rather than once per SG item.
+  EXPECT_EQ(std::string(host_payload, kSegmentSizes[0]),
+            value.substr(0, kSegmentSizes[0]));
+  EXPECT_EQ(host_allocation.substr(0, CudaGuardedBuffer::kGuardBytes),
+            host_guard);
+  EXPECT_EQ(host_allocation.substr(CudaGuardedBuffer::kGuardBytes +
+                                   kSegmentSizes[0]),
+            host_guard);
+  size_t offset = kSegmentSizes[0];
+  for (size_t i = 0; i < device_buffers.size(); ++i) {
+    const size_t segment = i + 1;
+    std::string actual;
+    ASSERT_TRUE(device_buffers[i]->ReadPayload(&actual))
+        << "segment " << segment;
+    EXPECT_EQ(actual, value.substr(offset, kSegmentSizes[segment]))
+        << "segment " << segment;
+    EXPECT_TRUE(device_buffers[i]->GuardsIntact())
+        << "segment " << segment;
+    offset += kSegmentSizes[segment];
+  }
+}
+
 TEST(RdmaLoopback,
      PooledPostSubmitFailureDoesNotReplayPutAndGetRemainsReplaySafe) {
   ScopedEnv configured_device("DFKV_RDMA_DEV", nullptr);
@@ -3112,6 +3294,82 @@ TEST(RdmaLoopback, ClientLocalRailFailureRetriesFreshPutAndGet) {
                        "dfkv_rdma_client_stale_pool_retries_total"),
             get_stale_before)
       << "a local-rail failure is not a stale-endpoint retry";
+}
+
+TEST(RdmaLoopback,
+     ReplaySafeTwoRailRetryPublishesExactBytesToCudaDestination) {
+  if (!HaveRdma())
+    GTEST_SKIP() << "no RDMA device (load two active devices for this test)";
+  const auto rails = ConfiguredTwoTestRails();
+  if (!HaveConfiguredActiveRails(rails))
+    GTEST_SKIP() << "set DFKV_RDMA_DEV to exactly two ACTIVE test devices";
+  const CudaLib* cuda = ActiveCudaForTest();
+  if (!cuda) GTEST_SKIP() << "no usable CUDA device";
+
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
+  ScopedEnv credits("DFKV_RDMA_RAIL_CREDITS", kRealHcaRailCredits);
+  ScopedEnv threshold("DFKV_RDMA_RAIL_ERROR_THRESHOLD", "100");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv ambient_completion_fault("DFKV_RDMA_TEST_COMPLETION_FAULT",
+                                     nullptr);
+  ScopedEnv ambient_endpoint_fault(
+      "DFKV_RDMA_TEST_ENDPOINT_COMPLETION_FAULT", nullptr);
+  ScopedEnv ambient_local_failure(
+      "DFKV_RDMA_TEST_LOCAL_RAIL_FAILURE_ATTEMPTS", nullptr);
+  ScopedEnv host_dedup("DFKV_CLIENT_NODE_DEDUP", nullptr);
+  ScopedEnv gpu_dedup("DFKV_CLIENT_NODE_DEDUP_GPU", nullptr);
+
+  RdmaNode node("cuda-cross-rail-get");
+  RdmaTransport transport(kMaxMsg, rails[0] + "," + rails[1]);
+  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+  const std::string value = CudaTestBytes(64 * 1024 + 3, 0x93);
+  ASSERT_TRUE(client.Put("cuda-cross-rail", value.data(), value.size()));
+
+  CudaGuardedBuffer destination(cuda, value.size());
+  ASSERT_TRUE(destination.Allocate());
+  ASSERT_TRUE(cuda->IsDevicePtr(destination.payload()));
+  const std::string before = transport.MetricsText();
+  const long stale_before =
+      CounterVal(before, "dfkv_rdma_client_stale_pool_retries_total");
+  {
+    ScopedEnv fault("DFKV_RDMA_TEST_COMPLETION_FAULT", "1:1:1");
+    ASSERT_TRUE(client.Get("cuda-cross-rail", destination.payload(),
+                           value.size()));
+  }
+
+  // Successful return is the publication fence: readback must need no
+  // application-side stream synchronization.
+  std::string actual;
+  ASSERT_TRUE(destination.ReadPayload(&actual));
+  EXPECT_EQ(actual, value);
+  EXPECT_TRUE(destination.GuardsIntact());
+
+  const std::string after = transport.MetricsText();
+  ExpectTwoDistinctRailAttempts(before, after, rails, 1);
+  ExpectReleasedRailResources(before, after, rails);
+  EXPECT_EQ(
+      CounterVal(after, "dfkv_rdma_client_v2_get_writes_total") -
+          CounterVal(before, "dfkv_rdma_client_v2_get_writes_total"),
+      2);
+  EXPECT_EQ(
+      CounterVal(after, "dfkv_rdma_client_cross_rail_retries_total") -
+          CounterVal(before, "dfkv_rdma_client_cross_rail_retries_total"),
+      1);
+  EXPECT_EQ(
+      CounterVal(after,
+                 "dfkv_rdma_client_cross_rail_retry_successes_total") -
+          CounterVal(before,
+                     "dfkv_rdma_client_cross_rail_retry_successes_total"),
+      1);
+  EXPECT_EQ(
+      CounterVal(after,
+                 "dfkv_rdma_client_cross_rail_retry_exhausted_total") -
+          CounterVal(before,
+                     "dfkv_rdma_client_cross_rail_retry_exhausted_total"),
+      0);
+  EXPECT_EQ(
+      CounterVal(after, "dfkv_rdma_client_stale_pool_retries_total"),
+      stale_before);
 }
 
 TEST(RdmaLoopback, SingleEnabledRailFallbackIsNotCrossRailRetry) {
