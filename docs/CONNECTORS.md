@@ -19,7 +19,7 @@
 | 源码 | `integration/hicache/dfkv_hicache.py` | `integration/vllm/`（包 `dfkv_vllm`） | `integration/lmcache/`（包 `dfkv_connector`） |
 | 接口 | `HiCacheStorage`（`batch_set_v1/get_v1`…） | connector API（scheduler + worker 两侧） | `RemoteConnector`（get/put/batched_\*）/ `DfkvL2Adapter` |
 | key 方案 | 页 hash + pool/component/并行坐标 | chunk hash + pool/component/并行坐标，可追加 binary SG 坐标 | chunk hash + pool/component/并行坐标 |
-| 零拷贝 | 两端零拷贝（GET 直落 HiCache 宿主页，**host-host**） | PUT 为 **GPUDirect RDMA**；GET 经临时 pinned host retry staging，最终成功后同步发布到 GPU | host-host 零拷贝（LMCache pinned arena 一次注册 MR） |
+| 零拷贝 | 两端零拷贝（GET 直落 HiCache 宿主页，**host-host**） | PUT 为 **GPUDirect RDMA**；GET 先落 retry-owned pageable staging，最终成功后经有界复用 pinned bounce pool 同步发布到 GPU | host-host 零拷贝（LMCache pinned arena 一次注册 MR） |
 | 块大小 | 固定页（page_size token） | 变长 chunk（SG 多层段合并为一 key） | **任意**（含变长不满末块，走 `GetAuto`） |
 | 典型场景 | SGLang PD 生产（GLM-5.1/5.2 MLA） | vLLM 生产直连（DeepSeek-V4-Flash 多池已验证） | vLLM+LMCache 栈；MP-server 路径给多 KV-group 模型 |
 
@@ -89,6 +89,8 @@ tp_rank=..,ver=<lib>`（无 `role`——HiCache 是前缀 L3 缓存，无生产/
 | `DFKV_RDMA_RECV_SEGMENT_SIZE` | 16 GiB | 按下文 live/pooled 连接公式设置 | server 启动时申请，并在每个选中 rail 的共享 PD 上注册；失败会拒绝启动，segment 无可用 lease 时拒绝新连接。 |
 | `DFKV_RDMA_NUMA` | `0` | 显式多轨的大机可设 `1` | 建连时按调用线程 NUMA 选本地 rail（无本地 rail→轮转白名单），server serve 线程跟随 QP rail。单块共享 receive segment 不做 per-rail NUMA 分配；仅保证选轨/线程亲和。 |
 | `DFKV_RDMA_MAX_PAYLOAD_BYTES` | 64 MiB（67108864） | — | 客户端单 value payload 上限（不得超过 server 侧同名上限） |
+| `DFKV_CUDA_PINNED_POOL_BYTES` | 64 MiB（67108864） | 按进程允许的 CUDA pinned host memory / memlock 设置 | vLLM CUDA GET publication 的进程级 bounce pool 预算。取正十进制字节数，最大 4 GiB；预算向下取整为完整 slot，且至少容纳一个 slot、最多 4096 个。非法或与 slot 不兼容的组合告警并回退整组默认值。slot 按需创建，因此实际 pinned high-water 不超过取整后的预算。 |
+| `DFKV_CUDA_PINNED_SLOT_BYTES` | 4 MiB（4194304） | 保持能容纳常见单块；不必按最大 payload 预分配 | 固定 publication slot 大小，取 4 KiB–64 MiB 的正十进制字节数。非法值告警并回退默认 sizing。大 payload 按 slot 大小分块发布，不要求一个 payload 对应一个 slot。 |
 
 **v2 数据面**：PUT 把 `[request prefix | raw payload]` 以
 `RDMA_WRITE_WITH_IMM` 直接写入 server 租出的 slot；GET 先用 SEND 提交
@@ -96,6 +98,27 @@ tp_rank=..,ver=<lib>`（无 `role`——HiCache 是前缀 L3 缓存，无生产/
 buffer，最后只 SEND 状态与 authoritative stored length。两向 block payload
 都不经过 control buffer。`kMembers` 在隔离的 control lane 上使用显式
 `18-byte prefix + 32-KiB data` 容量；边界值完整返回，更大响应失败而不截断。
+
+**CUDA GET publication**：RDMA 仍写入每次请求自有的 pageable retry
+staging，而不是直接写调用方 CUDA 地址。这样失败 rail 的部分写入不会污染调用方
+buffer；只有最终获胜的完整尝试才进入 publication。进程级 pool 对固定大小 slot
+进行独占租赁；无空闲 slot 且预算已用尽时调用会阻塞等待（backpressure），不会
+继续分配。每个 slot 首次按需创建时使用 portable CUDA pinned host allocation；
+若该分配路径不可用，则以对齐 host allocation 加 portable CUDA host registration
+作为回退。slot 在其生命周期内只分配并 pin/register 一次。publication 对每块先
+从 pageable staging 复制到当次 leased slot，再在保留调用线程 CUDA context 的前提下
+排入异步 H2D copy；该块 stream 同步完成后才归还 slot。大 payload 逐块重复
+lease/copy/sync/release 流程。因此 CUDA GET 仍是 staged H2D，而不是 direct
+GPUDirect GET：后者无法满足“失败重试不得改动 caller buffer”的 publication
+fence。PUT 的 GPUDirect 路径不变。
+
+容器和进程的 pinned-memory / `RLIMIT_MEMLOCK` 必须覆盖 pool **实际按需分配的
+high-water**（上限是向 slot 取整后的 pool budget），还要为进程内其他 locked
+memory 留余量。pool acquisition、pin/register、CUDA copy 或 stream sync 出错会
+令 publication fail closed；sync 失败的 slot 会被永久隔离，并保持 pinned 直到
+进程退出，避免释放 driver 仍可能引用的内存。正常 teardown 等待 active lease
+归还后释放其余 pool slot 并记录 driver 释放错误；`fork()` 后的 child 拒绝使用
+parent 继承的 CUDA pool 状态。
 
 #### 1.2.1 `DFKV_RDMA_MAX_BLOCK_BYTES` 怎么定（含 L2 / L2-bypass 两套公式）
 

@@ -30,6 +30,7 @@ constexpr int kCuPointerAttributeMemoryType = 2;    // CU_POINTER_ATTRIBUTE_MEMO
 constexpr int kCuPointerAttributeDeviceOrdinal = 9; // CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL
 constexpr unsigned kCuMemoryTypeDevice = 2;         // CU_MEMORYTYPE_DEVICE
 constexpr unsigned kCuStreamNonBlocking = 1;        // CU_STREAM_NON_BLOCKING
+constexpr unsigned kCuMemHostAllocPortable = 0x1;  // CU_MEMHOSTALLOC_PORTABLE
 constexpr unsigned kCuMemHostRegisterPortable = 0x1;  // CU_MEMHOSTREGISTER_PORTABLE
 
 class CudaLib {
@@ -55,6 +56,8 @@ class CudaLib {
   int CurrentDevice() const;  // -1 without a context
   bool BindPrimaryCtx(int dev) const;
 
+  CUresult (*MemHostAlloc)(void**, size_t, unsigned) = nullptr;
+  CUresult (*MemFreeHost)(void*) = nullptr;
   CUresult (*MemAlloc)(CUdeviceptr*, size_t) = nullptr;
   CUresult (*MemFree)(CUdeviceptr) = nullptr;
   // Unified-addressing copy: any host/device src/dst combination.
@@ -84,7 +87,23 @@ class CudaLib {
   CUresult (*primary_ctx_retain_)(CUcontext*, int) = nullptr;
   CUresult (*primary_ctx_release_)(int) = nullptr;
   CUresult (*pointer_get_attribute_)(void*, int, CUdeviceptr) = nullptr;
+  uint64_t owner_process_ = 0;
 };
+
+// Process-wide CUDA destination bounce-pool counters. They are intentionally
+// cumulative so tests and diagnostics can verify that pinning activity becomes
+// flat after lazy warm-up without exposing mutable pool internals.
+struct PinnedBouncePoolStats {
+  size_t slot_bytes = 0;
+  size_t allocated_slots = 0;
+  uint64_t allocation_calls = 0;
+  uint64_t registration_calls = 0;
+  uint64_t wait_count = 0;
+  size_t active_leases = 0;
+  size_t peak_active_leases = 0;
+};
+
+PinnedBouncePoolStats GetPinnedBouncePoolStatsForTest();
 
 }  // namespace dfkv
 

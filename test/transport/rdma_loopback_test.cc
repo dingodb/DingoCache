@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -196,6 +197,7 @@ struct RdmaNode {
   std::map<std::string, size_t> cache_direct_calls;
   std::map<std::string, size_t> range_direct_calls;
 
+  std::function<void(size_t)> before_range;
   explicit RdmaNode(const std::string& tag, size_t max_msg = kMaxMsg) {
     ConfigureTestRecvSegment();
     dir = fs::temp_directory_path() / ("dfkv_rdma_" + tag);
@@ -215,10 +217,12 @@ struct RdmaNode {
         [this](const BlockKey& key, uint64_t off, uint64_t len,
                char* io_buf, size_t cap, const char** out_data,
                size_t* out_len, size_t* value_len) {
+          size_t call = 0;
           {
             std::lock_guard<std::mutex> lock(observation_mu);
-            ++range_direct_calls[key.Filename()];
+            call = ++range_direct_calls[key.Filename()];
           }
+          if (before_range) before_range(call);
           return srv->RangeDirectForKey(
               key, off, len, io_buf, cap, out_data, out_len, value_len);
         });
@@ -2939,6 +2943,157 @@ TEST(RdmaLoopback, DefaultDeclarationKeepsGlobalCap) {
   EXPECT_EQ(got, v);
 }
 
+TEST(RdmaLoopback,
+     PinnedBouncePoolChunksAndBackpressuresConcurrentCudaPublications) {
+  const CudaLib* cuda = ActiveCudaForTest();
+  if (!cuda) GTEST_SKIP() << "no usable CUDA device";
+
+  // Keep this regression cheap when it is the first CUDA publication in the
+  // process. If another test initialized the process-wide pool first, the
+  // assertions below derive the already-fixed slot size and remain valid.
+  ScopedEnv pool_bytes("DFKV_CUDA_PINNED_POOL_BYTES", "2097152");
+  ScopedEnv slot_bytes("DFKV_CUDA_PINNED_SLOT_BYTES", "1048576");
+  const PinnedBouncePoolStats before = GetPinnedBouncePoolStatsForTest();
+  ASSERT_GT(before.slot_bytes, 0u);
+
+  constexpr size_t kWorkers = 32;
+  const size_t payload_size =
+      std::max<size_t>(3052800, before.slot_bytes + 8197);
+  auto destinations =
+      std::make_shared<std::vector<std::unique_ptr<CudaGuardedBuffer>>>();
+  destinations->reserve(kWorkers);
+  for (size_t i = 0; i < kWorkers; ++i) {
+    auto destination =
+        std::make_unique<CudaGuardedBuffer>(cuda, payload_size);
+    ASSERT_TRUE(destination->Allocate()) << "worker " << i;
+    destinations->push_back(std::move(destination));
+  }
+
+  struct WaveState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool start = false;
+    size_t ready = 0;
+    size_t done = 0;
+    std::vector<uint8_t> published;
+    std::vector<uint8_t> context_restored;
+  };
+
+  const auto run_wave = [&](uint8_t seed) {
+    auto value =
+        std::make_shared<const std::string>(CudaTestBytes(payload_size, seed));
+    auto state = std::make_shared<WaveState>();
+    state->published.assign(kWorkers, 0);
+    state->context_restored.assign(kWorkers, 0);
+    std::vector<std::thread> workers;
+    workers.reserve(kWorkers);
+    for (size_t i = 0; i < kWorkers; ++i) {
+      workers.emplace_back(
+          [cuda, destinations, state, value, pool_slot_bytes = before.slot_bytes,
+           i] {
+        CUcontext context_before = nullptr;
+        CUcontext context_after = nullptr;
+        const bool queried_before = cuda->GetCurrentCtx(&context_before);
+        {
+          std::unique_lock<std::mutex> lock(state->mutex);
+          ++state->ready;
+          state->cv.notify_all();
+          state->cv.wait(lock, [&] { return state->start; });
+        }
+
+        DestinationPublisher publisher;
+        // The first logical SG segment is itself larger than one bounce slot;
+        // the odd following boundaries catch chunk truncation and offset bugs.
+        const std::array<size_t, 3> segments{
+            pool_slot_bytes + 17,
+            2053,
+            value->size() - (pool_slot_bytes + 17 + 2053),
+        };
+        size_t offset = 0;
+        bool published = true;
+        for (size_t segment : segments) {
+          published &=
+              publisher.Copy(static_cast<char*>((*destinations)[i]->payload()) +
+                                 offset,
+                             value->data() + offset, segment,
+                             DestinationMemoryKind::kDevice);
+          offset += segment;
+        }
+        published &= publisher.Finish();
+        const bool queried_after = cuda->GetCurrentCtx(&context_after);
+
+        {
+          std::lock_guard<std::mutex> lock(state->mutex);
+          state->published[i] = published;
+          state->context_restored[i] =
+              queried_before && queried_after &&
+              context_before == context_after;
+          ++state->done;
+        }
+        state->cv.notify_all();
+      });
+    }
+
+    bool all_ready = false;
+    {
+      std::unique_lock<std::mutex> lock(state->mutex);
+      all_ready = state->cv.wait_for(
+          lock, std::chrono::seconds(10),
+          [&] { return state->ready == kWorkers; });
+      state->start = true;
+    }
+    state->cv.notify_all();
+
+    bool all_done = false;
+    {
+      std::unique_lock<std::mutex> lock(state->mutex);
+      all_done = state->cv.wait_for(
+          lock, std::chrono::seconds(30),
+          [&] { return state->done == kWorkers; });
+    }
+    for (auto& worker : workers) {
+      if (all_done)
+        worker.join();
+      else
+        worker.detach();
+    }
+
+    EXPECT_TRUE(all_ready) << "publication workers missed start deadline";
+    EXPECT_TRUE(all_done) << "bounded pool deadlocked under backpressure";
+    if (!all_ready || !all_done) return false;
+    EXPECT_EQ(state->published,
+              std::vector<uint8_t>(kWorkers, 1));
+    EXPECT_EQ(state->context_restored,
+              std::vector<uint8_t>(kWorkers, 1));
+    for (size_t i = 0; i < kWorkers; ++i) {
+      std::string actual;
+      const bool read_ok = (*destinations)[i]->ReadPayload(&actual);
+      EXPECT_TRUE(read_ok) << "worker " << i;
+      if (read_ok) EXPECT_EQ(actual, *value) << "worker " << i;
+      EXPECT_TRUE((*destinations)[i]->GuardsIntact()) << "worker " << i;
+    }
+    return true;
+  };
+
+  ASSERT_TRUE(run_wave(0x51));
+  const PinnedBouncePoolStats warm = GetPinnedBouncePoolStatsForTest();
+  EXPECT_GT(warm.allocated_slots, 0u);
+  EXPECT_LT(warm.allocated_slots, kWorkers)
+      << "the wave must exceed the bounded slot count";
+  EXPECT_EQ(warm.active_leases, 0u);
+  EXPECT_GT(warm.peak_active_leases, 0u);
+  EXPECT_GT(warm.wait_count, before.wait_count)
+      << "oversubscription must take the blocking backpressure path";
+
+  ASSERT_TRUE(run_wave(0xb7));
+  const PinnedBouncePoolStats reused = GetPinnedBouncePoolStatsForTest();
+  EXPECT_EQ(reused.active_leases, 0u);
+  EXPECT_EQ(reused.allocated_slots, warm.allocated_slots);
+  EXPECT_EQ(reused.allocation_calls, warm.allocation_calls);
+  EXPECT_EQ(reused.registration_calls, warm.registration_calls)
+      << "all CUDA pinning must be one-time slot warmup, not per publication";
+}
+
 TEST(RdmaLoopback, ScalarGetPublishesExactBytesToGuardedCudaDestination) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   const CudaLib* cuda = ActiveCudaForTest();
@@ -3321,21 +3476,84 @@ TEST(RdmaLoopback,
 
   RdmaNode node("cuda-cross-rail-get");
   RdmaTransport transport(kMaxMsg, rails[0] + "," + rails[1]);
-  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+  const BlockKey key = ToBlockKey(SelfHdr(), "cuda-cross-rail");
   const std::string value = CudaTestBytes(64 * 1024 + 3, 0x93);
-  ASSERT_TRUE(client.Put("cuda-cross-rail", value.data(), value.size()));
+  ASSERT_EQ(transport.Cache(node.addr, key, value.data(), value.size()),
+            Status::kOk);
 
   CudaGuardedBuffer destination(cuda, value.size());
   ASSERT_TRUE(destination.Allocate());
   ASSERT_TRUE(cuda->IsDevicePtr(destination.payload()));
+  CUcontext caller_context = nullptr;
+  ASSERT_TRUE(cuda->GetCurrentCtx(&caller_context));
+  ASSERT_NE(caller_context, nullptr);
+
+  std::mutex gate_mu;
+  std::condition_variable gate_cv;
+  bool winning_attempt_entered = false;
+  bool release_winner = false;
+  node.before_range = [&](size_t call) {
+    if (call != 2) return;
+    std::unique_lock<std::mutex> lock(gate_mu);
+    winning_attempt_entered = true;
+    gate_cv.notify_one();
+    gate_cv.wait(lock, [&] { return release_winner; });
+  };
+
   const std::string before = transport.MetricsText();
   const long stale_before =
       CounterVal(before, "dfkv_rdma_client_stale_pool_retries_total");
+  std::vector<Status> statuses;
+  std::vector<uint64_t> value_lens;
+  bool context_setup_ok = false;
+  bool context_query_ok = false;
+  CUcontext context_before = nullptr;
+  CUcontext context_after = nullptr;
+  ScopedEnv fault("DFKV_RDMA_TEST_COMPLETION_FAULT", "1:1:1");
+  std::thread getter([&] {
+    context_setup_ok = cuda->SetCurrentCtx(caller_context) &&
+                       cuda->GetCurrentCtx(&context_before);
+    statuses = transport.RangeInto(
+        node.addr, {key},
+        {{destination.payload(), value.size(), DestinationMemoryKind::kDevice}},
+        &value_lens);
+    context_query_ok = cuda->GetCurrentCtx(&context_after);
+  });
+
+  bool observed_winner = false;
   {
-    ScopedEnv fault("DFKV_RDMA_TEST_COMPLETION_FAULT", "1:1:1");
-    ASSERT_TRUE(client.Get("cuda-cross-rail", destination.payload(),
-                           value.size()));
+    std::unique_lock<std::mutex> lock(gate_mu);
+    observed_winner = gate_cv.wait_for(
+        lock, std::chrono::seconds(10),
+        [&] { return winning_attempt_entered; });
   }
+  if (observed_winner) {
+    // Attempt one has completed its RDMA write and been rejected, while the
+    // second rail has not written a byte. Failed-attempt staging must not leak
+    // into the caller's CUDA allocation.
+    std::string before_winner;
+    const bool read_ok = destination.ReadPayload(&before_winner);
+    EXPECT_TRUE(read_ok);
+    if (read_ok) {
+      EXPECT_EQ(before_winner,
+                std::string(value.size(),
+                            static_cast<char>(CudaGuardedBuffer::kGuardByte)));
+    }
+    EXPECT_TRUE(destination.GuardsIntact());
+  }
+  {
+    std::lock_guard<std::mutex> lock(gate_mu);
+    release_winner = true;
+  }
+  gate_cv.notify_all();
+  getter.join();
+  ASSERT_TRUE(observed_winner) << "winning rail did not enter before deadline";
+  EXPECT_TRUE(context_setup_ok);
+  EXPECT_TRUE(context_query_ok);
+  EXPECT_EQ(context_before, caller_context);
+  EXPECT_EQ(context_after, caller_context);
+  EXPECT_EQ(statuses, std::vector<Status>({Status::kOk}));
+  EXPECT_EQ(value_lens, std::vector<uint64_t>({value.size()}));
 
   // Successful return is the publication fence: readback must need no
   // application-side stream synchronization.
@@ -3343,7 +3561,6 @@ TEST(RdmaLoopback,
   ASSERT_TRUE(destination.ReadPayload(&actual));
   EXPECT_EQ(actual, value);
   EXPECT_TRUE(destination.GuardsIntact());
-
   const std::string after = transport.MetricsText();
   ExpectTwoDistinctRailAttempts(before, after, rails, 1);
   ExpectReleasedRailResources(before, after, rails);
