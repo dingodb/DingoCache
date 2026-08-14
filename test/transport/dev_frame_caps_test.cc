@@ -24,6 +24,29 @@ TEST(DevFrameCaps, V2RoundTrip) {
   EXPECT_EQ(ParseDevFrameProtocol(frame), kDevProtoV2);
 }
 
+TEST(DevFrameCaps, WriterRetirementRequestDoesNotChangeBlockGeometry) {
+  constexpr uint64_t max_block = 4u << 20;
+  char frame[kDevNameBytes];
+  EncodeDevFrame("ib0", max_block | kDevFrameRequestWriterRetirement, frame);
+
+  EXPECT_EQ(ParseDevFrameCaps(frame),
+            max_block | kDevFrameRequestWriterRetirement);
+  EXPECT_EQ(ParseDevFrameMaxBlock(frame), max_block);
+  EXPECT_TRUE(DevFrameRequestsWriterRetirement(frame));
+  EXPECT_EQ(ParseDevFrameProtocol(frame), kDevProtoV2);
+
+  EncodeDevFrame("ib0", max_block, frame);
+  EXPECT_EQ(ParseDevFrameMaxBlock(frame), max_block);
+  EXPECT_FALSE(DevFrameRequestsWriterRetirement(frame));
+}
+
+TEST(DevFrameCaps, RawOpaqueControlValueKeepsBit63) {
+  constexpr uint64_t token = kDevFrameRequestWriterRetirement | 0x1234;
+  char frame[kDevNameBytes];
+  EncodeDevFrame("__control__", token, frame);
+  EXPECT_EQ(ParseDevFrameCaps(frame), token);
+}
+
 TEST(DevFrameCaps, V2RequiresDeclarationAndTailRoom) {
   char f[kDevNameBytes];
   EncodeDevFrame("ib7s400p0", 0, f, kDevProtoV2);

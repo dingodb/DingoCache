@@ -38,7 +38,7 @@ struct PernodeFallbackEnv {
     ::setenv("DFKV_ACCESS_DIR", dir.c_str(), 1);
     ::unsetenv("DFKV_CLIENT_LOG_SUFFIX");
     ::setenv("DFKV_CLIENT_PERNODE_QUEUE_CAPACITY", "8", 1);
-    ::setenv("DFKV_CLIENT_PERNODE_ROTATE_BYTES", "512", 1);
+    ::setenv("DFKV_CLIENT_PERNODE_ROTATE_BYTES", "1024", 1);
   }
   std::string GetLogPath() const {
     return dir + "/dfkv_client_get.log.p" + std::to_string(::getpid());

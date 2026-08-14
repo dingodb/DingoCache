@@ -1247,6 +1247,7 @@ struct PernodeStat {
   uint64_t fail = 0;  // issued responses other than kOk/kNotFound (PUT: non-kOk)
   uint64_t nonissued_fail = 0;
   uint64_t invalid_input = 0, no_route = 0, health_cooldown = 0;
+  uint64_t resource_exhausted = 0, no_compatible_rail = 0;
   uint32_t status_mask = 0;       // statuses returned by the transport
   uint32_t fail_status_mask = 0;  // failed statuses returned by the transport
   uint32_t nonissued_status_mask = 0;
@@ -1344,14 +1345,23 @@ enum class PernodeNonIssuedReason {
   kInvalidInput,
   kNoRoute,
   kHealthCooldown,
+  kResourceExhausted,
+  kNoCompatibleRail,
 };
 
 uint32_t PernodeNonIssuedStatusBit(PernodeNonIssuedReason reason) {
-  // Routing absence and a health gate do not produce a transport Status.
-  // Invalid input is a real client-local kInvalid outcome.
-  return reason == PernodeNonIssuedReason::kInvalidInput
-             ? PernodeStatusBit(Status::kInvalid)
-             : 0;
+  switch (reason) {
+    case PernodeNonIssuedReason::kInvalidInput:
+      return PernodeStatusBit(Status::kInvalid);
+    case PernodeNonIssuedReason::kResourceExhausted:
+      return PernodeStatusBit(Status::kResourceExhausted);
+    case PernodeNonIssuedReason::kNoCompatibleRail:
+      return PernodeStatusBit(Status::kNoCompatibleRail);
+    case PernodeNonIssuedReason::kNoRoute:
+    case PernodeNonIssuedReason::kHealthCooldown:
+      return 0;
+  }
+  return 0;
 }
 
 void RecordPernodeNonIssued(PernodeStat* stat,
@@ -1368,6 +1378,12 @@ void RecordPernodeNonIssued(PernodeStat* stat,
     case PernodeNonIssuedReason::kHealthCooldown:
       stat->health_cooldown += count;
       break;
+    case PernodeNonIssuedReason::kResourceExhausted:
+      stat->resource_exhausted += count;
+      break;
+    case PernodeNonIssuedReason::kNoCompatibleRail:
+      stat->no_compatible_rail += count;
+      break;
   }
   stat->nonissued_status_mask |= PernodeNonIssuedStatusBit(reason);
   if (stat->first_fail.empty()) stat->first_fail = PernodeKeyFp(first_key);
@@ -1378,6 +1394,8 @@ void MergePernodeNonIssued(PernodeStat* into, const PernodeStat& from) {
   into->invalid_input += from.invalid_input;
   into->no_route += from.no_route;
   into->health_cooldown += from.health_cooldown;
+  into->resource_exhausted += from.resource_exhausted;
+  into->no_compatible_rail += from.no_compatible_rail;
   into->nonissued_status_mask |= from.nonissued_status_mask;
   if (into->first_fail.empty() && !from.first_fail.empty())
     into->first_fail = from.first_fail;
@@ -1397,6 +1415,10 @@ std::string PernodeNonIssuedReasons(const PernodeStat& stat) {
   append("invalid_input", "kInvalid", stat.invalid_input);
   append("no_route", "not_issued", stat.no_route);
   append("health_cooldown", "not_issued", stat.health_cooldown);
+  append("resource_exhausted", "kResourceExhausted",
+         stat.resource_exhausted);
+  append("no_compatible_rail", "kNoCompatibleRail",
+         stat.no_compatible_rail);
   return out.empty() ? "none" : out;
 }
 
@@ -1459,6 +1481,7 @@ class PernodeSink {
   }
 
   size_t capacity() const { return capacity_; }
+  uint64_t rotate_bytes() const { return rotate_bytes_; }
   size_t high_water() const {
     std::lock_guard<std::mutex> lock(mu_);
     return high_water_;
@@ -1495,7 +1518,8 @@ class PernodeSink {
   PernodeSink()
       : capacity_(std::min<size_t>(
             EnvSize("DFKV_CLIENT_PERNODE_QUEUE_CAPACITY", 256), 65536)),
-        rotate_bytes_(EnvSize("DFKV_CLIENT_PERNODE_ROTATE_BYTES", 64u << 20)),
+        rotate_bytes_(std::max<size_t>(
+            1, EnvSize("DFKV_CLIENT_PERNODE_ROTATE_BYTES", 64u << 20))),
         worker_([this] { Run(); }) {}
 
   ~PernodeSink() {
@@ -1549,26 +1573,45 @@ class PernodeSink {
             ? std::string()
             : "pernode-sink DROPPED: dropped_batches=" +
                   std::to_string(batch.dropped_before);
-    uint64_t batch_bytes = 0;
-    if (!drop_line.empty())
-      batch_bytes += std::strlen(ts) + 1 + drop_line.size() + 1;
-    for (const std::string& line : batch.lines)
-      batch_bytes += std::strlen(ts) + 1 + line.size() + 1;
 
     FileState& state = Open(batch.fname);
-    if (state.file && state.bytes > 0 &&
-        batch_bytes > rotate_bytes_ - std::min(rotate_bytes_, state.bytes))
-      Rotate(state);
-    if (state.file) {
-      if (!drop_line.empty())
-        std::fprintf(state.file, "%s %s\n", ts, drop_line.c_str());
-      for (const std::string& line : batch.lines)
-        std::fprintf(state.file, "%s %s\n", ts, line.c_str());
-      state.bytes += batch_bytes;
-    } else {
-      if (!drop_line.empty()) DFKV_LOG_INFO(drop_line);
-      for (const std::string& line : batch.lines) DFKV_LOG_INFO(line);
-    }
+    auto write_line = [&](const std::string& line) {
+      if (!state.file) {
+        DFKV_LOG_INFO(line);
+        return;
+      }
+
+      std::string serialized =
+          std::string(ts) + " " + line + "\n";
+      if (serialized.size() > rotate_bytes_) {
+        const size_t original_bytes = serialized.size();
+        serialized = std::string(ts) +
+                     " pernode-sink OVERSIZE: original_bytes=" +
+                     std::to_string(original_bytes) + "\n";
+        if (serialized.size() > rotate_bytes_) {
+          serialized = "OVERSIZE\n";
+          if (serialized.size() > rotate_bytes_) {
+            serialized.assign(static_cast<size_t>(rotate_bytes_), '!');
+            serialized.back() = '\n';
+          }
+        }
+      }
+
+      if (state.bytes > 0 &&
+          (state.bytes >= rotate_bytes_ ||
+           serialized.size() > rotate_bytes_ - state.bytes))
+        Rotate(state);
+      if (!state.file) {
+        DFKV_LOG_INFO(line);
+        return;
+      }
+      if (!serialized.empty())
+        std::fwrite(serialized.data(), 1, serialized.size(), state.file);
+      state.bytes += serialized.size();
+    };
+
+    if (!drop_line.empty()) write_line(drop_line);
+    for (const std::string& line : batch.lines) write_line(line);
   }
 
   void Run() {
@@ -1647,8 +1690,8 @@ void PernodeWrite(const char* fname, std::vector<std::string> lines) {
 }
 
 // op: 0=get, 1=put, 2=exist. issued_keys counts transport items only.
-// Non-issued routing/health failures remain logical failures and carry their
-// reason/status separately instead of being misreported as transport attempts.
+// Client-local routing, health, resource, and topology failures remain logical
+// failures and carry their reason/status separately from transport attempts.
 void EmitPernode(int op, const char* label, const char* fname,
                  const std::map<std::string, PernodeStat>& per,
                  const std::map<std::string, std::string>& addr2name,
@@ -1712,6 +1755,10 @@ void EmitPernode(int op, const char* label, const char* fname,
       " invalid_input=" + std::to_string(nonissued.invalid_input) +
       " no_route=" + std::to_string(nonissued.no_route) +
       " health_cooldown=" + std::to_string(nonissued.health_cooldown) +
+      " resource_exhausted=" +
+      std::to_string(nonissued.resource_exhausted) +
+      " no_compatible_rail=" +
+      std::to_string(nonissued.no_compatible_rail) +
       " nonissued_reasons=" + PernodeNonIssuedReasons(nonissued);
   if (op == 0)
     total += " logical_hits=" + std::to_string(logical_hits) +
@@ -1780,6 +1827,10 @@ void EmitPernode(int op, const char* label, const char* fname,
         " invalid_input=" + std::to_string(stat.invalid_input) +
         " no_route=" + std::to_string(stat.no_route) +
         " health_cooldown=" + std::to_string(stat.health_cooldown) +
+        " resource_exhausted=" +
+        std::to_string(stat.resource_exhausted) +
+        " no_compatible_rail=" +
+        std::to_string(stat.no_compatible_rail) +
         " nonissued_reasons=" + PernodeNonIssuedReasons(stat);
     if (op == 0)
       line += " hit_issued_keys=" + std::to_string(stat.hit) +
@@ -1802,6 +1853,9 @@ void EmitPernode(int op, const char* label, const char* fname,
 namespace testing {
 void DrainPernodeSink() { PernodeSink::Instance().DrainForTest(); }
 size_t PernodeQueueCapacity() { return PernodeSink::Instance().capacity(); }
+uint64_t PernodeRotateBytes() {
+  return PernodeSink::Instance().rotate_bytes();
+}
 size_t PernodeQueueHighWater() { return PernodeSink::Instance().high_water(); }
 uint64_t PernodeQueueDropped() { return PernodeSink::Instance().dropped(); }
 uint64_t PernodeQueuePendingDropped() {
@@ -1880,12 +1934,23 @@ std::vector<bool> KVClient::BatchExistDirect(
       const uint64_t us = static_cast<uint64_t>(
           std::chrono::duration<double, std::micro>(
               std::chrono::steady_clock::now() - pn_t0).count());
-      uint64_t present = 0, failn = 0;
+      uint64_t issuedn = 0, present = 0, failn = 0;
       uint32_t status_mask = 0, fail_mask = 0;
       std::string first_fail;
       for (size_t m = 0; m < idx.size(); ++m) {
         const Status status =
             m < sts.size() ? sts[m] : Status::kInvalid;
+        if (status == Status::kResourceExhausted ||
+            status == Status::kNoCompatibleRail) {
+          RecordPernodeNonIssued(
+              &gstat[g],
+              status == Status::kResourceExhausted
+                  ? PernodeNonIssuedReason::kResourceExhausted
+                  : PernodeNonIssuedReason::kNoCompatibleRail,
+              1, keys[idx[m]]);
+          continue;
+        }
+        ++issuedn;
         status_mask |= PernodeStatusBit(status);
         if (status == Status::kOk) {
           if (m < ex.size() && ex[m]) ++present;
@@ -1896,13 +1961,14 @@ std::vector<bool> KVClient::BatchExistDirect(
             first_fail = PernodeKeyFp(keys[idx[m]]);
         }
       }
-      gstat[g].issued_keys = idx.size();
-      gstat[g].busy_us = us;
+      gstat[g].issued_keys = issuedn;
+      gstat[g].busy_us = issuedn == 0 ? 0 : us;
       gstat[g].hit = present;
       gstat[g].fail = failn;
       gstat[g].status_mask = status_mask;
       gstat[g].fail_status_mask = fail_mask;
-      gstat[g].first_fail = std::move(first_fail);
+      if (gstat[g].first_fail.empty())
+        gstat[g].first_fail = std::move(first_fail);
       gstat[g].dev = std::move(shard_dev);
     }
     bool resp = false, ioerr = false;
@@ -2099,13 +2165,24 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
       const uint64_t us = static_cast<uint64_t>(
           std::chrono::duration<double, std::micro>(
               std::chrono::steady_clock::now() - pn_t0).count());
-      uint64_t vb = 0, hits = 0, failn = 0,
+      uint64_t issuedn = 0, vb = 0, hits = 0, failn = 0,
                mn = std::numeric_limits<uint64_t>::max(), mx = 0;
       uint32_t status_mask = 0, fail_mask = 0;
       std::string first_fail;
       for (size_t m = 0; m < idx.size(); ++m) {
         const Status status =
             m < sts.size() ? sts[m] : Status::kInvalid;
+        if (status == Status::kResourceExhausted ||
+            status == Status::kNoCompatibleRail) {
+          RecordPernodeNonIssued(
+              &gstat[g],
+              status == Status::kResourceExhausted
+                  ? PernodeNonIssuedReason::kResourceExhausted
+                  : PernodeNonIssuedReason::kNoCompatibleRail,
+              1, items[idx[m]].key);
+          continue;
+        }
+        ++issuedn;
         status_mask |= PernodeStatusBit(status);
         if (status == Status::kOk) {
           ++hits;
@@ -2120,16 +2197,17 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
             first_fail = PernodeKeyFp(items[idx[m]].key);
         }
       }
-      gstat[g].issued_keys = idx.size();
+      gstat[g].issued_keys = issuedn;
       gstat[g].bytes = vb;
-      gstat[g].busy_us = us;
+      gstat[g].busy_us = issuedn == 0 ? 0 : us;
       gstat[g].min_b = mn;
       gstat[g].max_b = mx;
       gstat[g].hit = hits;
       gstat[g].fail = failn;
       gstat[g].status_mask = status_mask;
       gstat[g].fail_status_mask = fail_mask;
-      gstat[g].first_fail = std::move(first_fail);
+      if (gstat[g].first_fail.empty())
+        gstat[g].first_fail = std::move(first_fail);
       gstat[g].dev = std::move(shard_dev);
     }
     for (size_t m = 0; m < idx.size(); ++m) {
@@ -2473,7 +2551,7 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
         const uint64_t us = static_cast<uint64_t>(
             std::chrono::duration<double, std::micro>(
                 std::chrono::steady_clock::now() - pn_t0).count());
-        uint64_t vb = 0, hits = 0, failn = 0,
+        uint64_t issuedn = 0, vb = 0, hits = 0, failn = 0,
                  mn = std::numeric_limits<uint64_t>::max(), mx = 0;
         uint32_t status_mask = 0, fail_mask = 0;
         std::string first_fail;
@@ -2483,6 +2561,17 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
           if (status == Status::kOk &&
               (m >= value_lens.size() || value_lens[m] > cap))
             status = Status::kInvalid;
+          if (status == Status::kResourceExhausted ||
+              status == Status::kNoCompatibleRail) {
+            RecordPernodeNonIssued(
+                &gstat[g],
+                status == Status::kResourceExhausted
+                    ? PernodeNonIssuedReason::kResourceExhausted
+                    : PernodeNonIssuedReason::kNoCompatibleRail,
+                1, items[idx[m]].key);
+            continue;
+          }
+          ++issuedn;
           status_mask |= PernodeStatusBit(status);
           if (status == Status::kOk) {
             ++hits;
@@ -2497,16 +2586,17 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
               first_fail = PernodeKeyFp(items[idx[m]].key);
           }
         }
-        gstat[g].issued_keys = idx.size();
+        gstat[g].issued_keys = issuedn;
         gstat[g].bytes = vb;
-        gstat[g].busy_us = us;
+        gstat[g].busy_us = issuedn == 0 ? 0 : us;
         gstat[g].min_b = mn;
         gstat[g].max_b = mx;
         gstat[g].hit = hits;
         gstat[g].fail = failn;
         gstat[g].status_mask = status_mask;
         gstat[g].fail_status_mask = fail_mask;
-        gstat[g].first_fail = std::move(first_fail);
+        if (gstat[g].first_fail.empty())
+          gstat[g].first_fail = std::move(first_fail);
         gstat[g].dev = std::move(shard_dev);
       }
       bool resp = false, ioerr = false;

@@ -516,7 +516,14 @@ void RdmaServer::Serve(int boot_fd) {
       const auto found = writers_.find(token);
       if (found != writers_.end()) writer = found->second;
     }
-    if (writer) {
+    if (!writer) {
+      // Only a token registered by a capability-negotiated bootstrap may
+      // operate the retirement control plane. Never manufacture proof for an
+      // arbitrary nonzero value.
+      ::close(boot_fd);
+      return;
+    }
+    {
       std::unique_lock<std::mutex> lock(writer->mu);
       if (!writer->retired && writer->endpoint)
         writer->endpoint->CancelResponderWrites();
@@ -537,7 +544,11 @@ void RdmaServer::Serve(int boot_fd) {
     return;
   }
 
-  const uint64_t declared = rdma::ParseDevFrameCaps(devbuf);
+  // Parse capability and payload geometry from the same raw u64, but never
+  // allow the request bit to leak into max-block checks or slot arithmetic.
+  const bool writer_retirement_requested =
+      rdma::DevFrameRequestsWriterRetirement(devbuf);
+  const uint64_t declared = rdma::ParseDevFrameMaxBlock(devbuf);
   if (rdma::ParseDevFrameProtocol(devbuf) != rdma::kDevProtoV2 ||
       declared == 0) {
     DFKV_LOG_ERROR("rdma: rejecting peer without required v2 negotiation");
@@ -741,10 +752,18 @@ void RdmaServer::Serve(int boot_fd) {
     ::close(boot_fd);
     return;
   }
-  auto writer = std::make_shared<WriterState>();
-  writer->endpoint = &ep;
-  const uint64_t writer_token = RegisterWriter(writer);
+  std::shared_ptr<WriterState> writer;
+  uint64_t writer_token = 0;
+  if (writer_retirement_requested) {
+    writer = std::make_shared<WriterState>();
+    writer->endpoint = &ep;
+    writer_token = RegisterWriter(writer);
+  }
   auto retire_writer = [&] {
+    // An unnegotiated client keeps the legacy teardown path. Only a bootstrap
+    // that requested retirement owns a registered token and the explicit
+    // responder-WRITE drain/proof lifecycle.
+    if (!writer) return;
     const bool retired = ep.RetireResponderWrites();
     if (!retired)
       DFKV_LOG_ERROR("rdma: responder WRITE CQ drain failed");
@@ -753,25 +772,23 @@ void RdmaServer::Serve(int boot_fd) {
       writer->endpoint = nullptr;
       writer->retired = retired;
     }
-    if (!retired) std::abort();
     writer->retired_cv.notify_all();
-    std::lock_guard<std::mutex> lock(writer_mu_);
-    writers_.erase(writer_token);
+    {
+      std::lock_guard<std::mutex> lock(writer_mu_);
+      writers_.erase(writer_token);
+    }
+    if (!retired) std::abort();
   };
   // Receives must be posted before readiness becomes visible. Publish the
   // leased receive-segment address, rkey and slot geometry only after the QP is
   // armed, so the client cannot issue a one-sided write into an unready slot.
-  char ready = 1;
   const rdma::RecvSegmentInfo info{
       reinterpret_cast<uint64_t>(recv_lease.data()),
       recv_segment_mr->rkey, slot_size};
-  char encoded[rdma::kRecvSegmentInfoBytes];
-  char encoded_token[rdma::kV2WriterTokenBytes];
-  rdma::EncodeRecvSegmentInfo(info, encoded);
-  net::PutU64(encoded_token, writer_token);
-  const bool ok = net::WriteAll(boot_fd, &ready, 1) &&
-                  net::WriteAll(boot_fd, encoded, sizeof(encoded)) &&
-                  net::WriteAll(boot_fd, encoded_token, sizeof(encoded_token));
+  char readiness[rdma::kV2RetirementReadinessBytes];
+  const size_t readiness_bytes =
+      rdma::EncodeV2Readiness(info, writer_token, readiness);
+  const bool ok = net::WriteAll(boot_fd, readiness, readiness_bytes);
   ::close(boot_fd);
   if (!ok) {
     retire_writer();

@@ -1,6 +1,6 @@
 /* RDMA v2 bootstrap device frame.
  *
- * [name | NUL | "DCP2" u32 | max_block_bytes u64 | protocol u8]
+ * [name | NUL | "DCP2" u32 | (request bit | max_block_bytes) u64 | protocol u8]
  *
  * The declaration and protocol marker are mandatory. Header-only and
  * verbs-free so protocol rejection is unit-testable without RDMA hardware.
@@ -17,6 +17,13 @@ namespace dfkv::rdma {
 constexpr size_t kDevNameBytes = 32;
 constexpr uint32_t kDevCapsV2Magic = 0x32504344u;  // ASCII "DCP2" (LE)
 constexpr uint8_t kDevProtoV2 = 2;
+// Bit 63 of the raw declaration is a bootstrap capability request. It is not
+// part of max_block_bytes and must be removed before any geometry, capacity,
+// or limit calculation. Keeping the raw-field parser separate also preserves
+// the full 64-bit opaque value used by writer-retirement control frames.
+constexpr uint64_t kDevFrameRequestWriterRetirement = uint64_t{1} << 63;
+constexpr uint64_t kDevFrameMaxBlockMask =
+    ~kDevFrameRequestWriterRetirement;
 
 // Room a device name must leave in the fixed 32-byte frame: NUL terminator +
 // "DCP2" u32 + max_block_bytes u64 + protocol u8. A name at most this long
@@ -77,6 +84,16 @@ inline uint64_t ParseDevFrameCaps(const char in[kDevNameBytes]) {
   uint64_t value = 0;
   std::memcpy(&value, in + nul + 5, 8);
   return value;
+}
+// Parse the declared block size of a normal bootstrap frame. Callers doing
+// geometry/capacity work must use this masked view, never ParseDevFrameCaps.
+inline uint64_t ParseDevFrameMaxBlock(const char in[kDevNameBytes]) {
+  return ParseDevFrameCaps(in) & kDevFrameMaxBlockMask;
+}
+
+inline bool DevFrameRequestsWriterRetirement(
+    const char in[kDevNameBytes]) {
+  return (ParseDevFrameCaps(in) & kDevFrameRequestWriterRetirement) != 0;
 }
 
 inline uint8_t ParseDevFrameProtocol(const char in[kDevNameBytes]) {

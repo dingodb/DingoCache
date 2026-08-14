@@ -20,6 +20,7 @@
 
 #include <gtest/gtest.h>
 #include <sys/mman.h>  // shm_unlink (node-dedup test)
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -80,6 +81,9 @@ class RdmaServerTestPeer {
   static bool HasWriter(RdmaServer* server, uint64_t token) {
     std::lock_guard<std::mutex> lock(server->writer_mu_);
     return server->writers_.find(token) != server->writers_.end();
+  }
+  static void ServeBootstrap(RdmaServer* server, int fd) {
+    server->Serve(fd);
   }
 #ifdef DFKV_WITH_URING
   static void SetUringBackendFactory(
@@ -658,6 +662,45 @@ TEST(RdmaWriterToken, FreshProcessesDoNotReuseStaleTokens) {
   ASSERT_NE(new_process.token, 0u);
   EXPECT_FALSE(new_process.stale_token_found);
   EXPECT_NE(new_process.token, old_process.token);
+}
+
+TEST(RdmaBootstrapCapability, ServerAdvertisesWriterRetirementInProbe) {
+  RdmaServer server(RdmaServer::Handler{}, kMaxMsg);
+  int sockets[2];
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);
+  std::thread serving(
+      [&] { RdmaServerTestPeer::ServeBootstrap(&server, sockets[1]); });
+
+  char request[rdma::kDevNameBytes];
+  rdma::EncodeDevFrame(rdma::kV2ProbeDevice, 4u << 20, request);
+  const bool wrote = net::WriteAll(sockets[0], request, sizeof(request));
+  char reply[rdma::kV2ProbeReplyBytes];
+  const bool read = wrote && net::ReadAll(sockets[0], reply, sizeof(reply));
+
+  ::close(sockets[0]);
+  serving.join();
+  ASSERT_TRUE(read);
+  EXPECT_TRUE(rdma::V2ProbeSupportsWriterRetirement(reply));
+}
+
+TEST(RdmaBootstrapCapability, UnnegotiatedTokenGetsNoRetirementProof) {
+  RdmaServer server(RdmaServer::Handler{}, kMaxMsg);
+  int sockets[2];
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);
+  std::thread serving(
+      [&] { RdmaServerTestPeer::ServeBootstrap(&server, sockets[1]); });
+
+  char request[rdma::kDevNameBytes];
+  rdma::EncodeDevFrame(rdma::kV2RetireWriterDevice, 0x12345678, request);
+  const bool wrote = net::WriteAll(sockets[0], request, sizeof(request));
+  char proof[rdma::kV2RetireProofBytes];
+  const bool read =
+      wrote && net::ReadAll(sockets[0], proof, sizeof(proof));
+
+  ::close(sockets[0]);
+  serving.join();
+  ASSERT_TRUE(wrote);
+  EXPECT_FALSE(read);
 }
 
 TEST(RdmaServerStartup, AutoModeKeepsFirstActiveDeviceSemantics) {

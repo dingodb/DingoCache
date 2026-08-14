@@ -992,7 +992,7 @@ bool RdmaTransport::ProbeV2(const std::string& node) const {
   const bool ok =
       net::WriteAll(fd, frame, sizeof(frame)) &&
       net::ReadAll(fd, reply, sizeof(reply)) &&
-      rdma::ParseV2ProbeReply(reply);
+      rdma::V2ProbeSupportsWriterRetirement(reply);
   ::close(fd);
   if (!ok) v2_probe_failures_.fetch_add(1, std::memory_order_relaxed);
   return ok;
@@ -1205,8 +1205,9 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
 
   const std::string& dev = devs_[ridx];
   if (!ProbeV2(node)) {
-    DFKV_LOG_ERROR("rdma: peer " + node +
-                   " does not support the required v2 protocol");
+    DFKV_LOG_ERROR(
+        "rdma: peer " + node +
+        " does not advertise the required v2 writer-retirement capability");
     complete_unowned_lease(rdma::RailCompletion::kEndpointFailure);
     resource_budget_->Release(budget_request);
     result.failure = AcquireFailure::kEndpoint;
@@ -1248,8 +1249,13 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   }
 
   char devbuf[rdma::kDevNameBytes];
-  rdma::EncodeDevFrame(auto_device_ ? std::string() : dev, conn_declared,
-                       devbuf, rdma::kDevProtoV2);
+  // The probe above proves the peer understands bit 63 before a real QP is
+  // created. Echo the request on this bootstrap so a rolling-upgraded server
+  // sends the token only to a client that will consume it.
+  const uint64_t bootstrap_declared =
+      conn_declared | rdma::kDevFrameRequestWriterRetirement;
+  rdma::EncodeDevFrame(auto_device_ ? std::string() : dev,
+                       bootstrap_declared, devbuf, rdma::kDevProtoV2);
   char mine[rdma::kQpInfoBytes], remote_qp_bytes[rdma::kQpInfoBytes];
   rdma::QpInfo my = conn->ep.Local();
   my.depth = static_cast<uint16_t>(std::min<size_t>(conn_depth, 256));
@@ -1303,16 +1309,15 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     depth_refunds_.fetch_add(1, std::memory_order_relaxed);
   }
 
-  char ready = 0;
-  char encoded[rdma::kRecvSegmentInfoBytes];
-  char encoded_token[rdma::kV2WriterTokenBytes];
-  if (!net::ReadAll(fd, &ready, 1) || ready != 1 ||
-      !net::ReadAll(fd, encoded, sizeof(encoded)) ||
-      !net::ReadAll(fd, encoded_token, sizeof(encoded_token)) ||
-      !rdma::DecodeRecvSegmentInfo(encoded, &conn->recv_segment) ||
-      (conn->writer_token = net::GetU64(encoded_token)) == 0) {
-    DFKV_LOG_ERROR("rdma: peer " + node +
-                   " did not provide a valid v2 receive segment");
+  char readiness[rdma::kV2RetirementReadinessBytes];
+  if (!net::ReadAll(fd, readiness, sizeof(readiness)) ||
+      !rdma::DecodeV2Readiness(
+          readiness, sizeof(readiness),
+          /*writer_retirement_negotiated=*/true, &conn->recv_segment,
+          &conn->writer_token)) {
+    DFKV_LOG_ERROR(
+        "rdma: peer " + node +
+        " did not provide a valid retirement-capable v2 receive segment");
     ::close(fd);
     Destroy(conn, rdma::RailCompletion::kEndpointFailure);
     result.failure = AcquireFailure::kEndpoint;
@@ -2433,6 +2438,7 @@ std::vector<Status> RdmaTransport::ExistMany(
   const auto peer = peer_topologies_->Snapshot(node);
   RailMask excluded(devs_.size(), 0);
   bool cross_rail_retry = false;
+  bool out_dev_set = false;
   for (int attempt = 0; attempt < 2; ++attempt) {
     std::fill(result.begin(), result.end(), Status::kIOError);
     std::fill(exists->begin(), exists->end(), 0);
@@ -2456,7 +2462,16 @@ std::vector<Status> RdmaTransport::ExistMany(
       return result;
     }
     Conn* conn = acquired.conn;
-    if (out_dev) *out_dev = devs_[conn->rail_index];
+    if (out_dev) {
+      const std::string& attempted_dev = devs_[conn->rail_index];
+      if (!out_dev_set) {
+        *out_dev = attempted_dev;
+        out_dev_set = true;
+      } else if (*out_dev != attempted_dev) {
+        *out_dev += "->";
+        *out_dev += attempted_dev;
+      }
+    }
     rdma::RcEndpoint& ep = conn->ep;
     const size_t window = std::min(
         ep.window(), static_cast<size_t>(conn->lease.credits));
@@ -2752,6 +2767,7 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
   const auto peer = peer_topologies_->Snapshot(node);
   RailMask excluded(devs_.size(), 0);
   bool cross_rail_retry = false;
+  bool out_dev_set = false;
   CompletionFaultOperation completion_fault(&test_completion_fault_calls_);
   for (int attempt = 0; attempt < 2; ++attempt) {
     // A fresh attempt is possible only before any request is posted;
@@ -2777,7 +2793,16 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
       return result;
     }
     Conn* conn = acquired.conn;
-    if (out_dev) *out_dev = devs_[conn->rail_index];
+    if (out_dev) {
+      const std::string& attempted_dev = devs_[conn->rail_index];
+      if (!out_dev_set) {
+        *out_dev = attempted_dev;
+        out_dev_set = true;
+      } else if (*out_dev != attempted_dev) {
+        *out_dev += "->";
+        *out_dev += attempted_dev;
+      }
+    }
     rdma::RcEndpoint& ep = conn->ep;
     const size_t seg_limit = std::max<size_t>(1, ep.max_sge() - 1);
     bool conn_ok = !InjectLocalRailFailure(attempt);
@@ -3008,6 +3033,7 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
   const auto peer = peer_topologies_->Snapshot(node);
   RailMask excluded(devs_.size(), 0);
   bool cross_rail_retry = false;
+  bool out_dev_set = false;
   CompletionFaultOperation completion_fault(&test_completion_fault_calls_);
   for (int attempt = 0; attempt < 2; ++attempt) {
     completion_fault.BeginAttempt(attempt);
@@ -3044,7 +3070,16 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
       return result;
     }
     Conn* conn = acquired.conn;
-    if (out_dev) *out_dev = devs_[conn->rail_index];
+    if (out_dev) {
+      const std::string& attempted_dev = devs_[conn->rail_index];
+      if (!out_dev_set) {
+        *out_dev = attempted_dev;
+        out_dev_set = true;
+      } else if (*out_dev != attempted_dev) {
+        *out_dev += "->";
+        *out_dev += attempted_dev;
+      }
+    }
     rdma::RcEndpoint& ep = conn->ep;
     const size_t target_limit =
         std::max<size_t>(1, std::min(ep.max_sge() - 1,
