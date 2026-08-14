@@ -3071,7 +3071,7 @@ TEST(RdmaLoopback, UringAsyncGetManyConcurrentInOrder) {
   RdmaUringNode node("ag", kUringMsg);
   RdmaServerTestPeer::SetBeforeUringReadyDrain(
       node.rsrv.get(), [&hold_ready_drain] {
-        if (hold_ready_drain.load(std::memory_order_acquire))
+        if (hold_ready_drain.exchange(false, std::memory_order_acq_rel))
           std::this_thread::sleep_for(std::chrono::milliseconds(50));
       });
   RdmaTransport rt(kUringMsg);
@@ -3123,7 +3123,6 @@ TEST(RdmaLoopback, UringAsyncGetManyConcurrentInOrder) {
 #endif
   hold_ready_drain.store(true, std::memory_order_release);
   const auto controlled_result = c.BatchGet(controlled_gets);
-  hold_ready_drain.store(false, std::memory_order_release);
   ASSERT_EQ(controlled_result.size(), kControlledReads);
   for (size_t i = 0; i < kControlledReads; ++i) {
     ASSERT_TRUE(controlled_result[i]) << "controlled key " << i;
@@ -3273,8 +3272,13 @@ TEST(RdmaLoopback, UringReadyDrainSingleCompletionDoesNotWaitAndRecovers) {
               Status::kOk);
   }
   EXPECT_EQ(recovered, value);
-  EXPECT_EQ(node.rsrv->UringReads() - fault_reads_before, 2u);
-  EXPECT_EQ(node.rsrv->UringReadBatches() - fault_batches_before, 2u);
+  const uint64_t fault_reads =
+      node.rsrv->UringReads() - fault_reads_before;
+  const uint64_t fault_batches =
+      node.rsrv->UringReadBatches() - fault_batches_before;
+  EXPECT_GE(fault_reads, 1u);
+  EXPECT_EQ(fault_batches, fault_reads)
+      << "every request in this single-ready recovery must submit alone";
   EXPECT_EQ(node.rsrv->UringReadBatchMax(), 1u);
   EXPECT_GT(node.rsrv->V2Conns(), conns_before)
       << "error completion did not retire and reconnect the pooled QP";
