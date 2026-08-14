@@ -20,6 +20,9 @@
 #include <utility>
 #include <vector>
 
+#ifdef DFKV_WITH_URING
+#include "cache/uring_reader.h"
+#endif
 #include "cache/store_engine.h"
 #include "common/kv_types.h"
 #include "common/status.h"
@@ -100,9 +103,8 @@ class RdmaServer {
   uint64_t CompletionErrors() const { return completion_errors_.load(std::memory_order_relaxed); }
   uint64_t ActiveConns() const { return active_conns_.load(std::memory_order_relaxed); }
   uint64_t IdleReclaims() const { return idle_reclaims_.load(std::memory_order_relaxed); }
-  // io_uring async-GET path observability. UringReads is the total number of
-  // descriptors passed to non-empty batches; UringReadBatches counts those
-  // calls and UringReadBatchMax is their process-lifetime high-water mark.
+  // io_uring pipeline observability. A submit batch is one SQ flush group;
+  // completions count logical descriptors (short-read residuals stay one).
   // All remain zero when the path is off.
   uint64_t UringReads() const {
     return uring_reads_.load(std::memory_order_relaxed);
@@ -112,6 +114,15 @@ class RdmaServer {
   }
   uint64_t UringReadBatchMax() const {
     return uring_read_batch_max_.load(std::memory_order_relaxed);
+  }
+  uint64_t UringCompletions() const {
+    return uring_completions_.load(std::memory_order_relaxed);
+  }
+  uint64_t UringInflight() const {
+    return uring_inflight_.load(std::memory_order_relaxed);
+  }
+  uint64_t UringInflightMax() const {
+    return uring_inflight_max_.load(std::memory_order_relaxed);
   }
   uint64_t UringInitFallbacks() const {
     return uring_init_fallbacks_.load(std::memory_order_relaxed);
@@ -208,9 +219,15 @@ class RdmaServer {
       const std::string&, const std::vector<std::pair<void*, size_t>>&,
       void*, size_t)>
       initialize_anchor_for_test_;
+#ifdef DFKV_WITH_URING
+  // Externally owned backend seam for deterministic queue/completion tests.
+  // Production leaves this empty and UringReader selects liburing directly.
+  std::function<UringReader::Backend*()> uring_backend_factory_for_test_;
+#endif
   friend class RdmaServerTestPeer;
   std::atomic<uint64_t> uring_reads_{0}, uring_read_batches_{0},
-      uring_read_batch_max_{0}, uring_init_fallbacks_{0};
+      uring_read_batch_max_{0}, uring_completions_{0}, uring_inflight_{0},
+      uring_inflight_max_{0}, uring_init_fallbacks_{0};
   std::atomic<uint64_t> v2_conns_{0}, v2_put_writes_{0}, v2_get_writes_{0};
   std::atomic<uint64_t> v2_get_continuation_slot_changes_{0};
   std::atomic<uint64_t> completions_{0}, completion_errors_{0}, active_conns_{0},

@@ -29,10 +29,12 @@
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <limits>
 #include <map>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -67,6 +69,13 @@ class RdmaServerTestPeer {
   static size_t RegisteredRailCount(const RdmaServer& server) {
     return server.recv_segment_registered_rails_;
   }
+#ifdef DFKV_WITH_URING
+  static void SetUringBackendFactory(
+      RdmaServer* server,
+      std::function<UringReader::Backend*()> factory) {
+    server->uring_backend_factory_for_test_ = std::move(factory);
+  }
+#endif
 };
 
 class RdmaTransportTestPeer {
@@ -2525,8 +2534,217 @@ TEST(RdmaLoopback, BatchRetriesAfterServerReclaim) {
   ::unsetenv("DFKV_RDMA_IDLE_MS");
 }
 
+#ifdef DFKV_WITH_URING
+class ControlledRdmaUringBackend final : public UringReader::Backend {
+ public:
+  struct Request {
+    int fd = -1;
+    void* buf = nullptr;
+    unsigned len = 0;
+    uint64_t off = 0;
+    UringReader::Token token = UringReader::kInvalidToken;
+  };
+
+  int QueueInit(unsigned entries, io_uring*) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    initialized_depth_ = entries;
+    return queue_init_result;
+  }
+
+  void QueueExit(io_uring*) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    exited_ = true;
+    cv_.notify_all();
+  }
+
+  io_uring_sqe* GetSqe(io_uring*) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    sqes_.emplace_back();
+    return &sqes_.back();
+  }
+
+  void PrepRead(io_uring_sqe* sqe, int fd, void* buf, unsigned len,
+                uint64_t off) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    prepared_[sqe] =
+        Request{fd, buf, len, off, UringReader::kInvalidToken};
+  }
+
+  void SetData(io_uring_sqe* sqe, UringReader::Token token) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto found = prepared_.find(sqe);
+    if (found == prepared_.end()) {
+      bad_state_ = true;
+      return;
+    }
+    found->second.token = token;
+    dormant_.push_back(found->second);
+    prepared_.erase(found);
+  }
+
+  int Submit(io_uring*) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    ++submit_calls_;
+    int result = static_cast<int>(dormant_.size());
+    if (!submit_results_.empty()) {
+      result = submit_results_.front();
+      submit_results_.pop_front();
+    }
+    if (result > 0 && static_cast<size_t>(result) <= dormant_.size()) {
+      for (int i = 0; i < result; ++i) {
+        Request request = dormant_.front();
+        dormant_.pop_front();
+        accepted_[request.token] = request;
+        history_.push_back(request);
+      }
+      max_inflight_ = std::max(max_inflight_, accepted_.size());
+    }
+    cv_.notify_all();
+    return result;
+  }
+
+  int PeekCqe(io_uring*, io_uring_cqe** cqe) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (ready_.empty()) {
+      *cqe = nullptr;
+      return -EAGAIN;
+    }
+    *cqe = &ready_.front();
+    return 0;
+  }
+
+  int WaitCqe(io_uring*, io_uring_cqe** cqe, int timeout_ms) override {
+    std::unique_lock<std::mutex> lock(mu_);
+    const auto ready = [&] { return !ready_.empty() || exited_; };
+    if (timeout_ms < 0) {
+      cv_.wait(lock, ready);
+    } else if (!cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                             ready)) {
+      *cqe = nullptr;
+      return -ETIME;
+    }
+    if (ready_.empty()) {
+      *cqe = nullptr;
+      return -ETIME;
+    }
+    *cqe = &ready_.front();
+    return 0;
+  }
+
+  void Seen(io_uring*, io_uring_cqe* cqe) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (ready_.empty() || cqe != &ready_.front()) {
+      bad_state_ = true;
+      return;
+    }
+    ready_.pop_front();
+    ++seen_;
+    cv_.notify_all();
+  }
+
+  void SetSubmitResults(std::deque<int> results) {
+    std::lock_guard<std::mutex> lock(mu_);
+    submit_results_ = std::move(results);
+  }
+
+  bool WaitForSubmitted(size_t count, int timeout_ms = 5000) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                        [&] { return history_.size() >= count; });
+  }
+
+  bool WaitForSubmitCalls(size_t count, int timeout_ms = 5000) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                        [&] { return submit_calls_ >= count; });
+  }
+
+  bool WaitForSeen(size_t count, int timeout_ms = 5000) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                        [&] { return seen_ >= count; });
+  }
+
+  std::vector<Request> History() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return history_;
+  }
+
+  bool CompleteRead(UringReader::Token token) {
+    Request request;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      auto found = accepted_.find(token);
+      if (found == accepted_.end()) return false;
+      request = found->second;
+    }
+    const ssize_t result =
+        ::pread(request.fd, request.buf, request.len,
+                static_cast<off_t>(request.off));
+    return Complete(token, result);
+  }
+
+  bool Complete(UringReader::Token token, long result) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto found = accepted_.find(token);
+    if (found == accepted_.end()) return false;
+    accepted_.erase(found);
+    io_uring_cqe cqe{};
+    cqe.user_data = token;
+    cqe.res = static_cast<int32_t>(result);
+    ready_.push_back(cqe);
+    cv_.notify_all();
+    return true;
+  }
+
+  size_t MaxInflight() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return max_inflight_;
+  }
+
+  size_t SeenCount() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return seen_;
+  }
+
+  size_t AcceptedCount() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return accepted_.size();
+  }
+
+  bool Exited() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return exited_;
+  }
+
+  bool BadState() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return bad_state_;
+  }
+
+  int queue_init_result = 0;
+
+ private:
+  mutable std::mutex mu_;
+  std::condition_variable cv_;
+  unsigned initialized_depth_ = 0;
+  size_t submit_calls_ = 0;
+  size_t seen_ = 0;
+  size_t max_inflight_ = 0;
+  bool exited_ = false;
+  bool bad_state_ = false;
+  std::list<io_uring_sqe> sqes_;
+  std::map<io_uring_sqe*, Request> prepared_;
+  std::deque<Request> dormant_;
+  std::map<UringReader::Token, Request> accepted_;
+  std::vector<Request> history_;
+  std::list<io_uring_cqe> ready_;
+  std::deque<int> submit_results_;
+};
+#endif
+
 // A cache node that ALSO wires the async-GET prep + complete hooks, so the server
-// uses the io_uring batch-and-wait GET path when DFKV_SERVER_URING=1 (and the
+// uses the nonblocking io_uring GET pipeline when DFKV_SERVER_URING=1 (and the
 // binary was built with -DDFKV_WITH_URING). With the env off / unbuilt these
 // hooks are simply never consulted and the node behaves like a plain RdmaNode.
 struct RdmaUringNode {
@@ -2537,9 +2755,20 @@ struct RdmaUringNode {
   mutable std::mutex observation_mu;
   std::map<std::string, size_t> prepare_calls;
   std::map<std::string, size_t> range_calls;
+#ifdef DFKV_WITH_URING
+  mutable std::mutex backend_mu;
+  std::condition_variable backend_cv;
+  std::vector<std::unique_ptr<ControlledRdmaUringBackend>> backends;
+#endif
 
 
-  explicit RdmaUringNode(const std::string& tag, size_t max_msg = kMaxMsg) {
+  explicit RdmaUringNode(
+      const std::string& tag, size_t max_msg = kMaxMsg
+#ifdef DFKV_WITH_URING
+      ,
+      std::function<void(ControlledRdmaUringBackend*)> backend_configure = {}
+#endif
+      ) {
     dir = fs::temp_directory_path() / ("dfkv_uring_" + tag);
     fs::remove_all(dir);
     fs::create_directories(dir);
@@ -2577,9 +2806,40 @@ struct RdmaUringNode {
           }
           return srv->PrepareReadForKey(key, off, len, staging, cap);
         });
+#ifdef DFKV_WITH_URING
+    if (backend_configure)
+      InstallControlledBackendFactory(std::move(backend_configure));
+#endif
     EXPECT_EQ(rsrv->Start(0), Status::kOk);
     addr = "127.0.0.1:" + std::to_string(rsrv->port());
   }
+#ifdef DFKV_WITH_URING
+  void InstallControlledBackendFactory(
+      std::function<void(ControlledRdmaUringBackend*)> configure = {}) {
+    RdmaServerTestPeer::SetUringBackendFactory(
+        rsrv.get(), [this, configure = std::move(configure)] {
+          auto backend = std::make_unique<ControlledRdmaUringBackend>();
+          if (configure) configure(backend.get());
+          ControlledRdmaUringBackend* result = backend.get();
+          {
+            std::lock_guard<std::mutex> lock(backend_mu);
+            backends.push_back(std::move(backend));
+          }
+          backend_cv.notify_all();
+          return result;
+        });
+  }
+
+  ControlledRdmaUringBackend* WaitForBackend(
+      size_t index, int timeout_ms = 5000) {
+    std::unique_lock<std::mutex> lock(backend_mu);
+    if (!backend_cv.wait_for(
+            lock, std::chrono::milliseconds(timeout_ms),
+            [&] { return backends.size() > index; }))
+      return nullptr;
+    return backends[index].get();
+  }
+#endif
   ~RdmaUringNode() {
     if (rsrv) rsrv->Stop();
     if (srv) srv->Stop();
@@ -3278,6 +3538,420 @@ TEST(RdmaLoopback, UringReadyDrainSingleCompletionDoesNotWaitAndRecovers) {
 #endif
 }
 
+
+TEST(RdmaLoopback,
+     ControlledUringKeepsSixteenReadsInflightAndRepliesInWireOrder) {
+#ifndef DFKV_WITH_URING
+  GTEST_SKIP() << "test requires a DFKV_WITH_URING build";
+#else
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "1");
+  ScopedEnv uring_depth("DFKV_SERVER_URING_DEPTH", "32");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "16");
+  ScopedEnv recv_segment("DFKV_RDMA_RECV_SEGMENT_SIZE", "8388608");
+
+  constexpr size_t kMsg = 64 * 1024;
+  constexpr size_t kItems = 32;
+  RdmaUringNode node(
+      "controlled-pipeline", kMsg,
+      [](ControlledRdmaUringBackend*) {});
+  RdmaTransport transport(kMsg);
+  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+  client.set_batch_concurrency(1);
+
+  std::vector<std::string> keys(kItems), values(kItems);
+  std::vector<KvPutItem> puts(kItems);
+  for (size_t i = 0; i < kItems; ++i) {
+    keys[i] = "controlled_pipeline_" + std::to_string(i);
+    values[i] = PatternValue(4097 + (i * 977) % 8191, 200 + i);
+    puts[i] = {keys[i], values[i].data(), values[i].size()};
+  }
+  const auto put_result = client.BatchPut(puts);
+  ASSERT_EQ(put_result.size(), kItems);
+  for (size_t i = 0; i < kItems; ++i)
+    ASSERT_TRUE(put_result[i]) << "put " << i;
+
+  ControlledRdmaUringBackend* backend = node.WaitForBackend(0);
+  ASSERT_NE(backend, nullptr);
+  std::vector<std::string> outputs(kItems);
+  std::vector<KvGetItem> gets(kItems);
+  for (size_t i = 0; i < kItems; ++i) {
+    outputs[i].assign(values[i].size(), '\0');
+    gets[i] = {keys[i], outputs[i].data(), outputs[i].size()};
+  }
+  std::vector<bool> get_result;
+  std::thread get_thread([&] { get_result = client.BatchGet(gets); });
+  const auto stop_and_join = [&] {
+    std::thread stopper([&] { node.rsrv->Stop(); });
+    for (const auto& request : backend->History())
+      backend->CompleteRead(request.token);
+    stopper.join();
+    if (get_thread.joinable()) get_thread.join();
+  };
+
+  const bool first_window = backend->WaitForSubmitted(16);
+  EXPECT_TRUE(first_window)
+      << "server waited for disk before ingesting sixteen first windows";
+  if (!first_window) {
+    stop_and_join();
+    return;
+  }
+  EXPECT_GE(backend->MaxInflight(), 16u);
+  EXPECT_GE(node.rsrv->UringInflightMax(), 16u);
+  EXPECT_EQ(node.rsrv->UringCompletions(), 0u);
+
+  // Retire half the first client window. SEND completions and the newly rearmed
+  // receives must be consumed while the other eight disk reads remain pending.
+  std::vector<ControlledRdmaUringBackend::Request> history =
+      backend->History();
+  if (history.size() < 16) {
+    ADD_FAILURE() << "backend lost admitted first-window reads";
+    stop_and_join();
+    return;
+  }
+  for (size_t i = 0; i < 8; ++i) {
+    if (!backend->CompleteRead(history[i].token)) {
+      ADD_FAILURE() << "first-window token " << i << " was not retained";
+      stop_and_join();
+      return;
+    }
+  }
+  const bool mixed_progress = backend->WaitForSubmitted(24);
+  EXPECT_TRUE(mixed_progress)
+      << "pending disk reads stranded mixed SEND/RECV completions";
+  if (!mixed_progress) {
+    stop_and_join();
+    return;
+  }
+
+  // Complete requests 23..8 in reverse. The server may reap every CQE, but it
+  // must emit only the contiguous request prefix on the RC wire.
+  history = backend->History();
+  if (history.size() < 24) {
+    ADD_FAILURE() << "mixed SEND/RECV progress lost admitted reads";
+    stop_and_join();
+    return;
+  }
+  for (size_t i = 24; i-- > 8;) {
+    if (!backend->CompleteRead(history[i].token)) {
+      ADD_FAILURE() << "out-of-order token " << i << " was not retained";
+      stop_and_join();
+      return;
+    }
+  }
+  if (!backend->WaitForSubmitted(32)) {
+    ADD_FAILURE() << "final receive window was not ingested";
+    stop_and_join();
+    return;
+  }
+  history = backend->History();
+  if (history.size() != kItems) {
+    ADD_FAILURE() << "expected exactly " << kItems << " disk submissions";
+    stop_and_join();
+    return;
+  }
+  for (size_t i = kItems; i-- > 24;) {
+    if (!backend->CompleteRead(history[i].token)) {
+      ADD_FAILURE() << "final token " << i << " was not retained";
+      stop_and_join();
+      return;
+    }
+  }
+
+  get_thread.join();
+  ASSERT_EQ(get_result.size(), kItems);
+  for (size_t i = 0; i < kItems; ++i) {
+    ASSERT_TRUE(get_result[i]) << "get " << i;
+    EXPECT_EQ(outputs[i], values[i]) << "ordered reply " << i;
+  }
+  EXPECT_EQ(node.rsrv->UringReads(), kItems);
+  EXPECT_EQ(node.rsrv->UringCompletions(), kItems);
+  EXPECT_EQ(node.rsrv->UringInflight(), 0u);
+  EXPECT_GE(node.rsrv->UringInflightMax(), 16u);
+  EXPECT_FALSE(backend->BadState());
+#endif
+}
+
+
+TEST(RdmaLoopback, ControlledUringMultiWindowBytesAndSendLifetimeAreExact) {
+#ifndef DFKV_WITH_URING
+  GTEST_SKIP() << "test requires a DFKV_WITH_URING build";
+#else
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "1");
+  ScopedEnv uring_depth("DFKV_SERVER_URING_DEPTH", "16");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "16");
+  ScopedEnv recv_segment("DFKV_RDMA_RECV_SEGMENT_SIZE", "8388608");
+
+  constexpr size_t kMsg = 64 * 1024;
+  RdmaUringNode node(
+      "controlled-multi-window", kMsg,
+      [](ControlledRdmaUringBackend*) {});
+  RdmaTransport transport(kMsg);
+  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+  client.set_batch_concurrency(1);
+  const size_t targets_per_window = transport.MaxSgPayloadSegs();
+  ASSERT_GE(targets_per_window, 2u);
+  MultiWindowGet first(targets_per_window, 4, 503);
+  const std::string value = PatternValue(first.capacity(), 509);
+  ASSERT_TRUE(
+      client.Put("controlled_multi", value.data(), value.size()));
+  ControlledRdmaUringBackend* backend = node.WaitForBackend(0);
+  ASSERT_NE(backend, nullptr);
+
+  std::vector<size_t> first_lengths;
+  std::vector<bool> first_result;
+  std::thread first_thread([&] {
+    first_result = client.BatchGetAutoSg(
+        {{"controlled_multi", first.pointers, first.sizes}},
+        &first_lengths);
+  });
+  const bool first_submitted = backend->WaitForSubmitted(1);
+  EXPECT_TRUE(first_submitted);
+  auto history = backend->History();
+  if (!first_submitted || history.size() != 1 ||
+      !backend->CompleteRead(history.front().token)) {
+    ADD_FAILURE() << "controlled multi-window read was not retained";
+    std::thread stopper([&] { node.rsrv->Stop(); });
+    for (const auto& request : history) backend->CompleteRead(request.token);
+    stopper.join();
+    first_thread.join();
+    return;
+  }
+  first_thread.join();
+  ASSERT_EQ(first_result.size(), 1u);
+  ASSERT_TRUE(first_result[0]);
+  ASSERT_EQ(first_lengths.size(), 1u);
+  EXPECT_EQ(first_lengths[0], value.size());
+  EXPECT_EQ(first.Flatten(), value);
+  EXPECT_EQ(node.PrepareCalls("controlled_multi"), 1u);
+  EXPECT_EQ(node.RangeCalls("controlled_multi"), 0u);
+  EXPECT_EQ(backend->History().size(), 1u)
+      << "continuation windows must retain, not resubmit, the source";
+
+  // Immediate reuse exercises the final signaled SEND ownership fence. The
+  // first source slot/PreparedRead may be recycled only after that completion.
+  MultiWindowGet second(targets_per_window, 4, 503);
+  std::vector<size_t> second_lengths;
+  std::vector<bool> second_result;
+  std::thread second_thread([&] {
+    second_result = client.BatchGetAutoSg(
+        {{"controlled_multi", second.pointers, second.sizes}},
+        &second_lengths);
+  });
+  const bool second_submitted = backend->WaitForSubmitted(2);
+  EXPECT_TRUE(second_submitted);
+  history = backend->History();
+  if (!second_submitted || history.size() != 2 ||
+      !backend->CompleteRead(history.back().token)) {
+    ADD_FAILURE() << "source slot was not reusable after final SEND";
+    std::thread stopper([&] { node.rsrv->Stop(); });
+    for (const auto& request : history) backend->CompleteRead(request.token);
+    stopper.join();
+    second_thread.join();
+    return;
+  }
+  second_thread.join();
+  ASSERT_EQ(second_result.size(), 1u);
+  ASSERT_TRUE(second_result[0]);
+  ASSERT_EQ(second_lengths.size(), 1u);
+  EXPECT_EQ(second_lengths[0], value.size());
+  EXPECT_EQ(second.Flatten(), value);
+  EXPECT_EQ(node.PrepareCalls("controlled_multi"), 2u);
+  EXPECT_EQ(node.RangeCalls("controlled_multi"), 0u);
+  EXPECT_EQ(backend->History().size(), 2u);
+  EXPECT_FALSE(backend->BadState());
+#endif
+}
+TEST(RdmaLoopback, ControlledUringDisconnectDrainsPartialCqBeforeOwners) {
+#ifndef DFKV_WITH_URING
+  GTEST_SKIP() << "test requires a DFKV_WITH_URING build";
+#else
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "1");
+  ScopedEnv uring_depth("DFKV_SERVER_URING_DEPTH", "16");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "16");
+  ScopedEnv recv_segment("DFKV_RDMA_RECV_SEGMENT_SIZE", "8388608");
+
+  constexpr size_t kMsg = 64 * 1024;
+  constexpr size_t kItems = 16;
+  RdmaUringNode node(
+      "controlled-disconnect", kMsg,
+      [](ControlledRdmaUringBackend*) {});
+  RdmaTransport transport(kMsg);
+  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+  client.set_batch_concurrency(1);
+  std::vector<std::string> keys(kItems), values(kItems);
+  std::vector<KvPutItem> puts(kItems);
+  for (size_t i = 0; i < kItems; ++i) {
+    keys[i] = "controlled_disconnect_" + std::to_string(i);
+    values[i] = PatternValue(8192 + i, 300 + i);
+    puts[i] = {keys[i], values[i].data(), values[i].size()};
+  }
+  const auto put_result = client.BatchPut(puts);
+  ASSERT_EQ(put_result.size(), kItems);
+  for (bool ok : put_result) ASSERT_TRUE(ok);
+  ControlledRdmaUringBackend* backend = node.WaitForBackend(0);
+  ASSERT_NE(backend, nullptr);
+
+  std::vector<std::string> outputs(kItems);
+  std::vector<KvGetItem> gets(kItems);
+  for (size_t i = 0; i < kItems; ++i) {
+    outputs[i].assign(values[i].size(), '\0');
+    gets[i] = {keys[i], outputs[i].data(), outputs[i].size()};
+  }
+  std::vector<bool> get_result;
+  std::thread get_thread([&] { get_result = client.BatchGet(gets); });
+  const bool submitted = backend->WaitForSubmitted(kItems);
+  EXPECT_TRUE(submitted);
+  const auto history = backend->History();
+  if (!submitted || history.size() != kItems) {
+    ADD_FAILURE() << "disconnect fixture did not admit the full depth";
+    std::thread stopper([&] { node.rsrv->Stop(); });
+    for (const auto& request : history) backend->CompleteRead(request.token);
+    stopper.join();
+    get_thread.join();
+    return;
+  }
+
+  std::atomic<bool> stop_done{false};
+  std::thread stop_thread([&] {
+    node.rsrv->Stop();
+    stop_done.store(true, std::memory_order_release);
+  });
+  bool first_half_completed = true;
+  for (size_t i = 0; i < kItems / 2; ++i)
+    first_half_completed &=
+        backend->CompleteRead(history[i].token);
+  EXPECT_TRUE(first_half_completed);
+  const bool partial_seen = backend->WaitForSeen(kItems / 2);
+  EXPECT_TRUE(partial_seen);
+  EXPECT_FALSE(stop_done.load(std::memory_order_acquire))
+      << "disconnect released PreparedRead/staging with reads still in flight";
+  EXPECT_EQ(backend->AcceptedCount(), kItems / 2);
+
+  bool second_half_completed = true;
+  for (size_t i = kItems / 2; i < kItems; ++i)
+    second_half_completed &=
+        backend->CompleteRead(history[i].token);
+  EXPECT_TRUE(second_half_completed);
+  stop_thread.join();
+  get_thread.join();
+  EXPECT_TRUE(stop_done.load(std::memory_order_acquire));
+  EXPECT_EQ(backend->SeenCount(), kItems);
+  EXPECT_EQ(backend->AcceptedCount(), 0u);
+  EXPECT_TRUE(backend->Exited());
+  EXPECT_EQ(node.rsrv->UringInflight(), 0u);
+  EXPECT_FALSE(backend->BadState());
+#endif
+}
+
+
+TEST(RdmaLoopback, ControlledUringSubmitFailureDrainsAcceptedReadAndAborts) {
+#ifndef DFKV_WITH_URING
+  GTEST_SKIP() << "test requires a DFKV_WITH_URING build";
+#else
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "1");
+  ScopedEnv uring_depth("DFKV_SERVER_URING_DEPTH", "8");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
+  ScopedEnv recv_segment("DFKV_RDMA_RECV_SEGMENT_SIZE", "4194304");
+
+  constexpr size_t kMsg = 64 * 1024;
+  constexpr size_t kItems = 4;
+  RdmaUringNode node(
+      "controlled-partial-submit", kMsg,
+      [](ControlledRdmaUringBackend*) {});
+  RdmaTransport transport(kMsg);
+  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+  client.set_batch_concurrency(1);
+  std::vector<std::string> keys(kItems), values(kItems);
+  std::vector<KvPutItem> puts(kItems);
+  for (size_t i = 0; i < kItems; ++i) {
+    keys[i] = "controlled_partial_" + std::to_string(i);
+    values[i] = PatternValue(4096 + i, 600 + i);
+    puts[i] = {keys[i], values[i].data(), values[i].size()};
+  }
+  const auto put_result = client.BatchPut(puts);
+  ASSERT_EQ(put_result.size(), kItems);
+  for (bool ok : put_result) ASSERT_TRUE(ok);
+  ControlledRdmaUringBackend* backend = node.WaitForBackend(0);
+  ASSERT_NE(backend, nullptr);
+  // Whether ingress is grouped or arrives singly, exactly one read reaches the
+  // kernel before the scripted submit failure forces connection teardown.
+  backend->SetSubmitResults({1, -EIO});
+
+  std::vector<std::string> outputs(
+      kItems, std::string(4100, '\x5a'));
+  std::vector<KvGetItem> gets(kItems);
+  for (size_t i = 0; i < kItems; ++i)
+    gets[i] = {keys[i], outputs[i].data(), values[i].size()};
+  std::vector<bool> get_result;
+  std::thread get_thread([&] { get_result = client.BatchGet(gets); });
+  const bool admitted = backend->WaitForSubmitted(1);
+  EXPECT_TRUE(admitted);
+  const auto history = backend->History();
+  if (!admitted || history.size() != 1) {
+    ADD_FAILURE() << "backend did not expose the scripted accepted read";
+    std::thread stopper([&] { node.rsrv->Stop(); });
+    for (const auto& request : history) backend->CompleteRead(request.token);
+    stopper.join();
+    get_thread.join();
+    return;
+  }
+
+  std::thread stop_thread([&] { node.rsrv->Stop(); });
+  EXPECT_TRUE(backend->CompleteRead(history[0].token));
+  stop_thread.join();
+  get_thread.join();
+  EXPECT_EQ(backend->SeenCount(), 1u);
+  EXPECT_EQ(backend->AcceptedCount(), 0u);
+  EXPECT_TRUE(backend->Exited());
+  EXPECT_EQ(node.rsrv->UringInflight(), 0u);
+  EXPECT_LE(node.rsrv->UringReads(), 1u)
+      << "only a fully admitted first group may publish a logical read";
+  ASSERT_EQ(get_result.size(), kItems);
+  for (size_t i = 0; i < kItems; ++i) {
+    EXPECT_FALSE(get_result[i]) << i;
+    EXPECT_EQ(outputs[i], std::string(4100, '\x5a')) << i;
+    EXPECT_EQ(node.RangeCalls(keys[i]), 0u) << i;
+  }
+  EXPECT_GE(node.PrepareCalls(keys[0]), 1u);
+  EXPECT_FALSE(backend->BadState());
+#endif
+}
+TEST(RdmaLoopback, ControlledUringInitFailureUsesExactSyncFallback) {
+#ifndef DFKV_WITH_URING
+  GTEST_SKIP() << "test requires a DFKV_WITH_URING build";
+#else
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "1");
+  ScopedEnv uring_depth("DFKV_SERVER_URING_DEPTH", "32");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "16");
+  ScopedEnv recv_segment("DFKV_RDMA_RECV_SEGMENT_SIZE", "8388608");
+
+  constexpr size_t kMsg = 64 * 1024;
+  RdmaUringNode node(
+      "controlled-init-fallback", kMsg,
+      [](ControlledRdmaUringBackend* backend) {
+        backend->queue_init_result = -EPERM;
+      });
+  RdmaTransport transport(kMsg);
+  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+  client.set_batch_concurrency(1);
+  const std::string value = PatternValue(16387, 401);
+  ASSERT_TRUE(client.Put("controlled_sync", value.data(), value.size()));
+  std::string output(value.size(), '\0');
+  ASSERT_TRUE(client.Get("controlled_sync", output.data(), output.size()));
+  EXPECT_EQ(output, value);
+  ControlledRdmaUringBackend* backend = node.WaitForBackend(0);
+  ASSERT_NE(backend, nullptr);
+  EXPECT_TRUE(backend->History().empty());
+  EXPECT_EQ(node.rsrv->UringReads(), 0u);
+  EXPECT_GE(node.rsrv->UringInitFallbacks(), 1u);
+  EXPECT_EQ(node.PrepareCalls("controlled_sync"), 1u);
+#endif
+}
 // --- P3 B5-3: RAM hot-tier zero-copy RDMA serve --------------------------------
 // A cache node with the RAM tier enabled must serve a GET straight from the
 // pre-registered arena MR (scatter-send, no copy into the connection buffer, no
