@@ -390,8 +390,10 @@ class Transport {
 
   // Scatter-gather read: raw stored bytes are split across each key's caller
   // buffers in order. The default reads once into contiguous operation-owned
-  // scratch and publishes each segment. RDMA uses registered operation-owned
-  // staging so retries and failed completions can never mutate caller memory.
+  // scratch and publishes each segment. RDMA registers the caller segments and
+  // lets server DMA land in them directly (GPUDirect when they are device
+  // memory); on failure the destination contents are unspecified, and QP
+  // teardown fences in-flight DMA before any retry or return.
   // out_lens[i] is the authoritative stored length (zero on miss), independent
   // of destination capacity.
   virtual std::vector<Status> RangeIntoMulti(
