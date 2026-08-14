@@ -124,6 +124,15 @@ class RdmaServer {
   uint64_t UringInflightMax() const {
     return uring_inflight_max_.load(std::memory_order_relaxed);
   }
+  uint64_t UringSendFences() const {
+    return uring_send_fences_.load(std::memory_order_relaxed);
+  }
+  uint64_t UringRepliesPosted() const {
+    return uring_replies_posted_.load(std::memory_order_relaxed);
+  }
+  uint64_t UringSendPostErrors() const {
+    return uring_send_post_errors_.load(std::memory_order_relaxed);
+  }
   uint64_t UringInitFallbacks() const {
     return uring_init_fallbacks_.load(std::memory_order_relaxed);
   }
@@ -227,7 +236,9 @@ class RdmaServer {
   friend class RdmaServerTestPeer;
   std::atomic<uint64_t> uring_reads_{0}, uring_read_batches_{0},
       uring_read_batch_max_{0}, uring_completions_{0}, uring_inflight_{0},
-      uring_inflight_max_{0}, uring_init_fallbacks_{0};
+      uring_inflight_max_{0}, uring_replies_posted_{0},
+      uring_send_fences_{0}, uring_send_post_errors_{0},
+      uring_init_fallbacks_{0};
   std::atomic<uint64_t> v2_conns_{0}, v2_put_writes_{0}, v2_get_writes_{0};
   std::atomic<uint64_t> v2_get_continuation_slot_changes_{0};
   std::atomic<uint64_t> completions_{0}, completion_errors_{0}, active_conns_{0},
