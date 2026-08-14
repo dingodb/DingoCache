@@ -114,7 +114,8 @@ class RdmaTransport : public Transport {
       std::vector<uint64_t>* value_lens = nullptr) override;
   std::vector<Status> ExistMany(const std::string& node,
                                 const std::vector<BlockKey>& keys,
-                                std::vector<char>* exists) override;
+                                std::vector<char>* exists,
+                                std::string* out_dev = nullptr) override;
   std::vector<Status> RangeInto(
       const std::string& node, const std::vector<BlockKey>& keys,
       const std::vector<RangeDst>& dsts,
@@ -124,11 +125,12 @@ class RdmaTransport : public Transport {
   // for dfkv_batch_put_sg / dfkv_batch_get_auto_sg).
   std::vector<Status> CacheFromMulti(
       const std::string& node,
-      const std::vector<CacheSrcMulti>& srcs) override;
+      const std::vector<CacheSrcMulti>& srcs,
+      std::string* out_dev = nullptr) override;
   std::vector<Status> RangeIntoMulti(
       const std::string& node, const std::vector<BlockKey>& keys,
       const std::vector<RangeDstMulti>& dsts,
-      std::vector<size_t>* out_lens) override;
+      std::vector<size_t>* out_lens, std::string* out_dev = nullptr) override;
 
  private:
   friend class RdmaTransportTestPeer;

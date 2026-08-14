@@ -155,7 +155,8 @@ class MetricsTransport final : public Transport {
   }
 
   std::vector<Status> CacheFromMulti(
-      const std::string&, const std::vector<CacheSrcMulti>& srcs) override {
+      const std::string&, const std::vector<CacheSrcMulti>& srcs,
+      std::string* /*out_dev*/ = nullptr) override {
     std::lock_guard<std::mutex> lock(mu);
     const bool ok = RunAttemptsLocked(srcs.size(), [&] {
       remote_put_commits += srcs.size();
@@ -174,7 +175,8 @@ class MetricsTransport final : public Transport {
   std::vector<Status> RangeIntoMulti(
       const std::string&, const std::vector<BlockKey>& keys,
       const std::vector<RangeDstMulti>& dsts,
-      std::vector<size_t>* out_lens) override {
+      std::vector<size_t>* out_lens,
+      std::string* /*out_dev*/ = nullptr) override {
     std::lock_guard<std::mutex> lock(mu);
     ++range_multi_calls;
     if (out_lens) out_lens->assign(keys.size(), 0);

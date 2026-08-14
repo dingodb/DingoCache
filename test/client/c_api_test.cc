@@ -60,7 +60,8 @@ class CApiTransport final : public dfkv::Transport {
   std::vector<dfkv::Status> RangeIntoMulti(
       const std::string&, const std::vector<dfkv::BlockKey>& keys,
       const std::vector<dfkv::RangeDstMulti>&,
-      std::vector<size_t>* out_lens) override {
+      std::vector<size_t>* out_lens,
+      std::string* /*out_dev*/ = nullptr) override {
     range_into_multi_called.store(true, std::memory_order_relaxed);
     Throw();
     if (out_lens) out_lens->assign(keys.size(), 0);

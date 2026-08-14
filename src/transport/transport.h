@@ -267,7 +267,9 @@ class Transport {
   // accounting (kIOError => transport failure; anything else => node responded).
   virtual std::vector<Status> ExistMany(const std::string& node,
                                         const std::vector<BlockKey>& keys,
-                                        std::vector<char>* exists) {
+                                        std::vector<char>* exists,
+                                        std::string* out_dev = nullptr) {
+    if (out_dev) out_dev->clear();  // RDMA rail device; base/TCP has none
     if (exists == nullptr) return InvalidStatuses(keys.size());
     exists->assign(keys.size(), 0);
     std::vector<Status> r;
@@ -352,7 +354,9 @@ class Transport {
   // through CacheFrom (no payload zero-copy, but correct on any transport). The
   // RDMA transport overrides this to gather the segments via a multi-SGE SEND.
   virtual std::vector<Status> CacheFromMulti(
-      const std::string& node, const std::vector<CacheSrcMulti>& srcs) {
+      const std::string& node, const std::vector<CacheSrcMulti>& srcs,
+      std::string* out_dev = nullptr) {
+    if (out_dev) out_dev->clear();  // RDMA rail device; base/TCP has none
     std::vector<Status> result(srcs.size(), Status::kInvalid);
     std::vector<std::vector<char>> bufs(srcs.size());
     std::vector<CacheSrc> flat;
@@ -399,7 +403,8 @@ class Transport {
   virtual std::vector<Status> RangeIntoMulti(
       const std::string& node, const std::vector<BlockKey>& keys,
       const std::vector<RangeDstMulti>& dsts,
-      std::vector<size_t>* out_lens) {
+      std::vector<size_t>* out_lens, std::string* out_dev = nullptr) {
+    if (out_dev) out_dev->clear();  // RDMA rail device; base/TCP has none
     const size_t n = keys.size();
     if (out_lens) out_lens->assign(n, 0);
     if (n == 0) return {};
