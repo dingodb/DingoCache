@@ -5715,6 +5715,56 @@ TEST(RdmaLoopback, AllLocalRailsFailOnceAndReclaimOperationResources) {
             std::string(value.size(), static_cast<char>(0x5a)));
 }
 
+// The SG read path (RangeIntoMulti) shares the direct-write contract: server
+// DMA lands straight in the caller segments, so a failed GET may leave
+// partial payload behind, but QP teardown fences every in-flight write before
+// the call returns, and a later successful GET rewrites the item in full.
+TEST(RdmaLoopback, FailedSgGetLeavesCallerSegmentsStableAfterReturn) {
+  if (!HaveRdma())
+    GTEST_SKIP() << "no RDMA device (load two rdma_rxe devices for this test)";
+  const auto rails = ConfiguredTwoTestRails();
+  if (!HaveConfiguredActiveRails(rails))
+    GTEST_SKIP() << "set DFKV_RDMA_DEV to exactly two ACTIVE test devices";
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
+  ScopedEnv credits("DFKV_RDMA_RAIL_CREDITS", kRealHcaRailCredits);
+  ScopedEnv threshold("DFKV_RDMA_RAIL_ERROR_THRESHOLD", "100");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  RdmaNode node("sg-failed-get-fence");
+  RdmaTransport transport(kMaxMsg, rails[0] + "," + rails[1]);
+  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+  const std::string value(64 * 1024, 'q');
+  ASSERT_TRUE(client.Put("sg-failed-get", value.data(), value.size()));
+
+  std::string first(4096, '\x5a');
+  std::string second(value.size() - first.size(), '\x5a');
+  KvGetItemSg get{"sg-failed-get", {first.data(), second.data()},
+                  {first.size(), second.size()}};
+  std::vector<size_t> lengths;
+  {
+    ScopedEnv fault("DFKV_RDMA_TEST_COMPLETION_FAULT", "1:1:1,1:2:1");
+    EXPECT_FALSE(client.BatchGetAutoSg({get}, &lengths)[0]);
+  }
+  // Partial payload may already sit in the segments (unspecified contents on
+  // failure); what the fence guarantees is that they stop changing here.
+  const std::string first_at_return = first;
+  const std::string second_at_return = second;
+
+  // Drive another synchronous control completion; teardown must have fenced
+  // every in-flight DMA before the failed call returned.
+  std::vector<char> exists;
+  EXPECT_EQ(transport.ExistMany(
+                node.addr, {ToBlockKey(SelfHdr(), "sg-failed-get")}, &exists),
+            std::vector<Status>({Status::kOk}));
+  EXPECT_EQ(first, first_at_return);
+  EXPECT_EQ(second, second_at_return);
+
+  // A clean retry through the same destinations must rewrite the item in
+  // full: no first-attempt residue can leak through a successful GET.
+  ASSERT_TRUE(client.BatchGetAutoSg({get}, &lengths)[0]);
+  ASSERT_EQ(lengths[0], value.size());
+  EXPECT_EQ(first + second, value);
+}
+
 TEST(RdmaLoopback,
      EndpointCompletionCoolsOnlyFailedPeerRailAndPublicGetReplays) {
   if (!HaveRdma())
