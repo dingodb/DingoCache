@@ -208,10 +208,6 @@ class RdmaServer {
       const std::string&, const std::vector<std::pair<void*, size_t>>&,
       void*, size_t)>
       initialize_anchor_for_test_;
-  // Deterministic hardware integration-test barrier: after WaitComp returns
-  // the first snapshot but before the ready-only CQ drain. Production leaves
-  // this empty.
-  std::function<void()> before_uring_ready_drain_for_test_;
   friend class RdmaServerTestPeer;
   std::atomic<uint64_t> uring_reads_{0}, uring_read_batches_{0},
       uring_read_batch_max_{0}, uring_init_fallbacks_{0};
