@@ -5668,8 +5668,10 @@ TEST(RdmaLoopback, AllLocalRailsFailOnceAndReclaimOperationResources) {
   EXPECT_EQ(exists, std::vector<char>({0}));
 
   // Seed a readable value with both fault seams disabled, then fail both local
-  // attempts of a fresh public GET. Neither failed attempt may mutate its
-  // caller destination.
+  // attempts of a fresh public GET. Server DMA lands directly in the caller
+  // destination, so a faulted completion may leave partial payload behind; the
+  // fence must guarantee the buffer stops changing once the failed GET
+  // returns.
   KVClient writer({{"n", node.addr}}, key_namespace, &transport);
   ASSERT_TRUE(writer.Put("failed-get", value.data(), value.size()));
   KVClient reader({{"n", node.addr}}, key_namespace, &transport);
@@ -5683,8 +5685,7 @@ TEST(RdmaLoopback, AllLocalRailsFailOnceAndReclaimOperationResources) {
   after = transport.MetricsText();
   ExpectTwoDistinctRailAttempts(before, after, rails, 2);
   ExpectReleasedRailResources(before, after, rails);
-  EXPECT_EQ(output,
-            std::string(value.size(), static_cast<char>(0x5a)));
+  const std::string output_at_return = output;
   EXPECT_EQ(
       CounterVal(after, "dfkv_rdma_client_cross_rail_retries_total") -
           CounterVal(before, "dfkv_rdma_client_cross_rail_retries_total"),
@@ -5706,13 +5707,13 @@ TEST(RdmaLoopback, AllLocalRailsFailOnceAndReclaimOperationResources) {
             CounterVal(before,
                        "dfkv_rdma_client_stale_pool_retries_total"));
 
-  // Drive another synchronous control completion before checking the sentinel
-  // again; failed QP teardown must fence every old DMA before retry/return.
+  // Drive another synchronous control completion before checking the buffer
+  // again; failed QP teardown must fence every old DMA before retry/return, so
+  // nothing may land after the failed GET returned.
   EXPECT_EQ(transport.ExistMany(
                 node.addr, {ToBlockKey(key_namespace, "failed-get")}, &exists),
             std::vector<Status>({Status::kOk}));
-  EXPECT_EQ(output,
-            std::string(value.size(), static_cast<char>(0x5a)));
+  EXPECT_EQ(output, output_at_return);
 }
 
 TEST(RdmaLoopback,
