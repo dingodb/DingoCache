@@ -26,7 +26,8 @@ class RecordingTransport final : public Transport {
   }
   std::vector<Status> CacheFromMulti(
       const std::string& node,
-      const std::vector<CacheSrcMulti>& srcs) override {
+      const std::vector<CacheSrcMulti>& srcs,
+      std::string* /*out_dev*/ = nullptr) override {
     {
       std::lock_guard<std::mutex> lock(mu_);
       selected_nodes_.push_back(node);
