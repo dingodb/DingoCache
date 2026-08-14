@@ -256,6 +256,11 @@ class RcEndpoint {
   // The SG datapath caps raw-payload segments at max_sge()-1 (SGE0 is the wire prefix).
   size_t max_sge() const { return max_sge_; }
 
+  // One nonblocking CQ snapshot. Unlike WaitComp(..., 0), this never arms or
+  // consumes completion-channel notifications; it is safe for ready-only
+  // microbatch drains after WaitComp has delivered the first completion.
+  int PollComp(ibv_wc* out, int max);
+
   // Block until at least one completion, drain up to `max` into out[]; returns
   // the count (>0), or <0 on error / when Wake() is called. wr_id of each wc =
   // the slot. Used for single round-trips (max=1) and pipelined batches.

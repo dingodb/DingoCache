@@ -58,6 +58,10 @@ class RdmaServerTestPeer {
                                   InitializeAnchorFn initialize) {
     server->initialize_anchor_for_test_ = std::move(initialize);
   }
+  static void SetBeforeUringReadyDrain(RdmaServer* server,
+                                       std::function<void()> callback) {
+    server->before_uring_ready_drain_for_test_ = std::move(callback);
+  }
   static size_t AnchorCount(const RdmaServer& server) {
     return server.anchors_.size();
   }
@@ -3063,7 +3067,13 @@ TEST(RdmaLoopback, UringAsyncGetManyConcurrentInOrder) {
   // Small per-buffer cap so K=8 slots (rbuf+sbuf+dbuf each) stay under an 8 MiB
   // RLIMIT_MEMLOCK (CI default). Values below are <= 12 KiB, well within 64 KiB.
   constexpr size_t kUringMsg = 64 * 1024;
+  std::atomic<bool> hold_ready_drain{false};
   RdmaUringNode node("ag", kUringMsg);
+  RdmaServerTestPeer::SetBeforeUringReadyDrain(
+      node.rsrv.get(), [&hold_ready_drain] {
+        if (hold_ready_drain.load(std::memory_order_acquire))
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      });
   RdmaTransport rt(kUringMsg);
   ASSERT_TRUE(rt.pipelined());
   KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
@@ -3092,6 +3102,52 @@ TEST(RdmaLoopback, UringAsyncGetManyConcurrentInOrder) {
   }
   auto pr = c.BatchPut(puts);
   for (int i = 0; i < N; ++i) ASSERT_TRUE(pr[i]) << i;
+
+  // Make one window deterministic instead of relying on scheduler luck. The
+  // server pauses after WaitComp's first snapshot, while this one-QP BatchGet
+  // has time to post all K requests. The ready-only drain must then collect the
+  // other seven WCs without waiting and submit exactly one eight-read batch.
+  // Waiting briefly first keeps the seed PUT's SEND completions out of this
+  // controlled snapshot.
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  constexpr size_t kControlledReads = 8;
+  std::vector<std::string> controlled_outs(kControlledReads);
+  std::vector<KvGetItem> controlled_gets(kControlledReads);
+  for (size_t i = 0; i < kControlledReads; ++i) {
+    controlled_outs[i].assign(vals[i].size(), '\0');
+    controlled_gets[i] = {keys[i], controlled_outs[i].data(), vals[i].size()};
+  }
+#ifdef DFKV_WITH_URING
+  const uint64_t controlled_reads_before = node.rsrv->UringReads();
+  const uint64_t controlled_batches_before = node.rsrv->UringReadBatches();
+#endif
+  hold_ready_drain.store(true, std::memory_order_release);
+  const auto controlled_result = c.BatchGet(controlled_gets);
+  hold_ready_drain.store(false, std::memory_order_release);
+  ASSERT_EQ(controlled_result.size(), kControlledReads);
+  for (size_t i = 0; i < kControlledReads; ++i) {
+    ASSERT_TRUE(controlled_result[i]) << "controlled key " << i;
+    EXPECT_EQ(controlled_outs[i], vals[i]) << "controlled key " << i;
+  }
+#ifdef DFKV_WITH_URING
+  const char* controlled_uring = std::getenv("DFKV_SERVER_URING");
+  if ((!controlled_uring || std::strcmp(controlled_uring, "0") != 0) &&
+      node.rsrv->UringInitFallbacks() == 0) {
+    EXPECT_EQ(controlled_reads_before, 0u);
+    EXPECT_EQ(controlled_batches_before, 0u);
+    EXPECT_EQ(node.rsrv->UringReads(), kControlledReads);
+    EXPECT_EQ(node.rsrv->UringReadBatches(), 1u);
+    EXPECT_GT(node.rsrv->UringReadBatchMax(), 1u);
+    EXPECT_EQ(node.rsrv->UringReadBatchMax(), kControlledReads);
+    const std::string controlled_metrics = node.rsrv->MetricsText();
+    EXPECT_EQ(CounterVal(controlled_metrics, "dfkv_uring_batches_total"), 1);
+    EXPECT_EQ(CounterVal(controlled_metrics,
+                         "dfkv_uring_batch_reads_total"),
+              static_cast<long>(kControlledReads));
+    EXPECT_EQ(CounterVal(controlled_metrics, "dfkv_uring_batch_max"),
+              static_cast<long>(kControlledReads));
+  }
+#endif
 
   // Run several BatchGet rounds over the one pooled connection; each round fans
   // out N GETs that pipeline K-at-a-time -> the server forms multi-read batches.
@@ -3158,6 +3214,71 @@ TEST(RdmaLoopback, UringAsyncGetManyConcurrentInOrder) {
   ::unsetenv("DFKV_SERVER_URING_DEPTH");
   ::unsetenv("DFKV_RDMA_DEPTH");
   ::unsetenv("DFKV_RDMA_RECV_SEGMENT_SIZE");
+}
+
+TEST(RdmaLoopback, UringReadyDrainSingleCompletionDoesNotWaitAndRecovers) {
+#ifndef DFKV_WITH_URING
+  GTEST_SKIP() << "test requires a DFKV_WITH_URING build";
+#else
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "1");
+  ScopedEnv uring_depth("DFKV_SERVER_URING_DEPTH", "8");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "8");
+  ScopedEnv recv_segment("DFKV_RDMA_RECV_SEGMENT_SIZE", "4194304");
+  // A mistakenly blocking "drain one more" would consume this full idle wait.
+  ScopedEnv idle_reclaim("DFKV_RDMA_IDLE_MS", "2000");
+  ScopedEnv ambient_completion_fault("DFKV_RDMA_TEST_COMPLETION_FAULT",
+                                     nullptr);
+
+  constexpr size_t kUringMsg = 64 * 1024;
+  RdmaUringNode node("single-ready-drain", kUringMsg);
+  RdmaTransport transport(kUringMsg);
+  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+  client.set_batch_concurrency(1);
+  const std::string value = PatternValue(12288, 101);
+  ASSERT_TRUE(client.Put("single_ready", value.data(), value.size()));
+  if (node.rsrv->UringInitFallbacks() != 0)
+    GTEST_SKIP() << "io_uring unavailable";
+
+  // Let the seed PUT's SEND completion retire so the next CQ wake contains only
+  // this GET. Polling for another ready WC must return immediately rather than
+  // waiting for a completion that does not exist.
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  const uint64_t reads_before = node.rsrv->UringReads();
+  const uint64_t batches_before = node.rsrv->UringReadBatches();
+  std::string output(value.size(), '\0');
+  const auto started = std::chrono::steady_clock::now();
+  ASSERT_TRUE(client.Get("single_ready", output.data(), output.size()));
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  EXPECT_EQ(output, value);
+  EXPECT_LT(elapsed, std::chrono::milliseconds(1500))
+      << "ready-only drain waited for a nonexistent second completion";
+  EXPECT_EQ(node.rsrv->UringReads() - reads_before, 1u);
+  EXPECT_EQ(node.rsrv->UringReadBatches() - batches_before, 1u);
+  EXPECT_EQ(node.rsrv->UringReadBatchMax(), 1u);
+
+  // A client-side error completion retires the pooled QP after the request was
+  // posted. GET is replay-safe: it must reconnect, issue one fresh single-ready
+  // request, and still return the exact bytes. This also exercises connection
+  // teardown while the server owns completion/source-lifetime state.
+  const uint64_t fault_reads_before = node.rsrv->UringReads();
+  const uint64_t fault_batches_before = node.rsrv->UringReadBatches();
+  const uint64_t conns_before = node.rsrv->V2Conns();
+  std::string recovered;
+  {
+    ScopedEnv completion_fault("DFKV_RDMA_TEST_COMPLETION_FAULT", "1:1:1");
+    EXPECT_EQ(transport.Range(
+                  node.addr, ToBlockKey(SelfHdr(), "single_ready"), 0,
+                  value.size(), &recovered, nullptr),
+              Status::kOk);
+  }
+  EXPECT_EQ(recovered, value);
+  EXPECT_EQ(node.rsrv->UringReads() - fault_reads_before, 2u);
+  EXPECT_EQ(node.rsrv->UringReadBatches() - fault_batches_before, 2u);
+  EXPECT_EQ(node.rsrv->UringReadBatchMax(), 1u);
+  EXPECT_GT(node.rsrv->V2Conns(), conns_before)
+      << "error completion did not retire and reconnect the pooled QP";
+#endif
 }
 
 // --- P3 B5-3: RAM hot-tier zero-copy RDMA serve --------------------------------
