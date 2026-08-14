@@ -7,17 +7,56 @@
 #include "transport/transport.h"
 #include "client/key_map.h"
 
+#include <array>
+#include <cstdlib>
+#include <fstream>
 #include <algorithm>
 #include <gtest/gtest.h>
 #include <limits>
+#include <iterator>
 #include <cstring>
 #include <map>
 #include <string>
 #include <vector>
+#include <sys/stat.h>
+#include <unistd.h>
 
 using namespace dfkv;  // NOLINT
 
+namespace dfkv::testing {
+void DrainPernodeSink();
+}  // namespace dfkv::testing
+
+
 namespace {
+struct PernodeFallbackEnv {
+  std::string dir =
+      "/tmp/dfkv-pernode-get-auto-" + std::to_string(::getpid());
+  PernodeFallbackEnv() {
+    ::mkdir(dir.c_str(), 0700);
+    ::setenv("DFKV_CLIENT_PERNODE_STATS", "1", 1);
+    ::setenv("DFKV_ACCESS_DIR", dir.c_str(), 1);
+    ::unsetenv("DFKV_CLIENT_LOG_SUFFIX");
+    ::setenv("DFKV_CLIENT_PERNODE_QUEUE_CAPACITY", "8", 1);
+    ::setenv("DFKV_CLIENT_PERNODE_ROTATE_BYTES", "512", 1);
+  }
+  std::string GetLogPath() const {
+    return dir + "/dfkv_client_get.log.p" + std::to_string(::getpid());
+  }
+};
+
+PernodeFallbackEnv pernode_fallback_env;
+
+std::string ReadGetLogs() {
+  const std::string path = pernode_fallback_env.GetLogPath();
+  std::ifstream previous(path + ".1");
+  std::ifstream current(path);
+  return std::string(std::istreambuf_iterator<char>(previous),
+                     std::istreambuf_iterator<char>()) +
+         std::string(std::istreambuf_iterator<char>(current),
+                     std::istreambuf_iterator<char>());
+}
+
 
 // Pipelined transport that serves stored blobs only through RangeInto and counts
 // each entry point, so a test can prove GetAuto never falls back to Range here.
@@ -28,6 +67,7 @@ struct FakePipelinedTransport : Transport {
   std::vector<DestinationMemoryKind> last_range_kinds;
   std::vector<std::vector<DestinationMemoryKind>> last_multi_kinds;
   int register_calls = 0;
+  size_t multi_status_limit = std::numeric_limits<size_t>::max();
 
   bool RegisterMemory(void*, size_t) override {
     ++register_calls;
@@ -110,6 +150,7 @@ struct FakePipelinedTransport : Transport {
       }
       result[i] = Status::kOk;
     }
+    result.resize(std::min(result.size(), multi_status_limit));
     return result;
   }
 };
@@ -287,4 +328,43 @@ TEST(GetAutoPipelined,
     EXPECT_EQ(allocations[i],
               std::string(allocations[i].size(), kSentinel))
         << "failed destination " << i;
+}
+
+TEST(GetAutoPipelined, ShortStatusVectorIsInvalidAndUsesPidFallbackSuffix) {
+  FakePipelinedTransport transport;
+  dfkv::testing::DrainPernodeSink();
+  KVClient client = MakeClient(&transport);
+  const std::array<std::string, 3> keys{
+      "secret-get-alpha", "secret-get-beta", "secret-get-gamma"};
+  const std::string value = "abc";
+  for (const std::string& key : keys)
+    transport.blobs[ToBlockKey("test/model", key).Filename()] = value;
+  transport.multi_status_limit = 1;
+
+  std::array<std::array<char, 8>, 3> outputs{};
+  std::vector<KvGetItemSg> items;
+  for (size_t i = 0; i < keys.size(); ++i)
+    items.push_back(
+        {keys[i], {outputs[i].data()}, {outputs[i].size()}});
+  std::vector<size_t> lengths;
+  EXPECT_EQ(client.BatchGetAutoSg(items, &lengths),
+            std::vector<bool>({true, false, false}));
+  EXPECT_EQ(lengths, std::vector<size_t>({value.size(), 0, 0}));
+
+  dfkv::testing::DrainPernodeSink();
+  const std::string output = ReadGetLogs();
+  EXPECT_NE(output.find("logical_keys=3 issued_keys=3"),
+            std::string::npos)
+      << output;
+  EXPECT_NE(output.find("failed_issued_keys=2"), std::string::npos)
+      << output;
+  EXPECT_NE(output.find("statuses=kOk,kInvalid"), std::string::npos)
+      << output;
+  EXPECT_NE(output.find("first_fail=len="), std::string::npos) << output;
+  for (const std::string& key : keys)
+    EXPECT_EQ(output.find(key), std::string::npos)
+        << "raw keys must not be logged";
+  std::ifstream fallback(pernode_fallback_env.GetLogPath());
+  EXPECT_TRUE(fallback.good())
+      << "unset suffix must fall back to a process-unique PID";
 }

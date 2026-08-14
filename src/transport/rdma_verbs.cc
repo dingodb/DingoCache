@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -70,6 +71,18 @@ std::atomic<uint64_t> g_pool_mr_active{0};
 std::atomic<uint64_t> g_transient_user_mr_active{0};
 std::atomic<uint64_t> g_cq_completions{0};
 std::atomic<uint64_t> g_cq_errors{0};
+
+// The default path is one relaxed load in PostWrite. Tests can arm a bounded
+// number of responder WRITEs and hold them before ibv_post_send.
+std::atomic<size_t> g_test_block_writes{0};
+std::mutex g_test_write_mu;
+std::condition_variable g_test_write_cv;
+size_t g_test_write_entered = 0;
+size_t g_test_write_exited = 0;
+size_t g_test_write_faults_consumed = 0;
+size_t g_test_write_cancellations = 0;
+size_t g_test_write_releases = 0;
+
 
 int ObserveCqPoll(ibv_wc* out, int got) {
   if (got < 0) {
@@ -195,6 +208,61 @@ void SharedReleasePoolMr(ibv_context* ctx, ibv_mr* mr) {
   }
 }
 }  // namespace
+
+void TestBlockNextResponderWrites(size_t count) {
+  std::lock_guard<std::mutex> lock(g_test_write_mu);
+  g_test_write_entered = 0;
+  g_test_write_exited = 0;
+  g_test_write_faults_consumed = 0;
+  g_test_write_cancellations = 0;
+  g_test_write_releases = count == 0 ? count : 0;
+  g_test_block_writes.store(count, std::memory_order_release);
+}
+
+bool TestWaitForBlockedResponderWrites(size_t count, int timeout_ms) {
+  std::unique_lock<std::mutex> lock(g_test_write_mu);
+  return g_test_write_cv.wait_for(
+      lock, std::chrono::milliseconds(timeout_ms),
+      [&] { return g_test_write_entered >= count; });
+}
+
+bool TestWaitForReleasedResponderWrites(size_t count, int timeout_ms) {
+  std::unique_lock<std::mutex> lock(g_test_write_mu);
+  return g_test_write_cv.wait_for(
+      lock, std::chrono::milliseconds(timeout_ms),
+      [&] { return g_test_write_exited >= count; });
+}
+
+void TestReleaseBlockedResponderWrites() {
+  {
+    std::lock_guard<std::mutex> lock(g_test_write_mu);
+    g_test_write_releases = std::numeric_limits<size_t>::max();
+    g_test_block_writes.store(0, std::memory_order_release);
+  }
+  g_test_write_cv.notify_all();
+}
+
+void TestReleaseOneBlockedResponderWrite() {
+  {
+    std::lock_guard<std::mutex> lock(g_test_write_mu);
+    ++g_test_write_releases;
+  }
+  g_test_write_cv.notify_all();
+}
+
+bool TestWaitForResponderWriteCancellations(size_t count, int timeout_ms) {
+  std::unique_lock<std::mutex> lock(g_test_write_mu);
+  return g_test_write_cv.wait_for(
+      lock, std::chrono::milliseconds(timeout_ms),
+      [&] { return g_test_write_cancellations >= count; });
+}
+
+bool TestConsumeBlockedResponderWriteFault() {
+  std::lock_guard<std::mutex> lock(g_test_write_mu);
+  if (g_test_write_faults_consumed == g_test_write_entered) return false;
+  ++g_test_write_faults_consumed;
+  return true;
+}
 
 uint64_t RcEndpoint::AdhocUserMrTotal() {
   return g_adhoc_user_mr.load(std::memory_order_relaxed);
@@ -324,7 +392,9 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
 
   chan_ = ibv_create_comp_channel(ctx_);
   if (!chan_) { Close(); return false; }
-  int cqe = static_cast<int>(depth_ * 2 + 4);
+  const size_t cqe_per_slot =
+      v2_responder ? kV2MaxGetTargets + 2 : 2;
+  int cqe = static_cast<int>(depth_ * cqe_per_slot + 4);
   cq_ = ibv_create_cq(ctx_, cqe, nullptr, chan_, 0);
   if (!cq_) { Close(); return false; }
   if (ibv_req_notify_cq(cq_, 0) != 0) { Close(); return false; }
@@ -346,9 +416,9 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
     }
   }
 
-  // A v2 server GET may chain one unsignaled RDMA WRITE per protocol target
-  // plus one signaled status SEND. Target count is fleet-wide and independent
-  // of either HCA's max_sge because every WRITE itself has one SGE.
+  // A v2 server GET may chain one signaled RDMA WRITE per protocol target plus
+  // one signaled status SEND. Target count is fleet-wide and independent of
+  // either HCA's max_sge because every WRITE itself has one SGE.
   static_assert(kV2MaxGetTargets == kMaxSge - 1);
   const size_t wr_per_slot =
       v2_responder ? (kV2MaxGetTargets + 1) : 2;
@@ -707,6 +777,40 @@ void RcEndpoint::ReleaseTransient(ibv_mr* mr) {
   g_transient_user_mr_active.fetch_sub(1, std::memory_order_relaxed);
 }
 
+void RcEndpoint::CancelResponderWrites() {
+  if (!responder_cancelled_.exchange(true, std::memory_order_acq_rel)) {
+    std::lock_guard<std::mutex> lock(g_test_write_mu);
+    if (g_test_write_entered > g_test_write_exited)
+      ++g_test_write_cancellations;
+    g_test_write_cv.notify_all();
+  }
+  Wake();
+}
+
+bool RcEndpoint::RetireResponderWrites() {
+  CancelResponderWrites();
+  if (!qp_) return pending_responder_writes_ == 0;
+  ibv_qp_attr attr{};
+  ibv_qp_init_attr init{};
+  if (ibv_query_qp(qp_, &attr, IBV_QP_STATE, &init) != 0) return false;
+  if (attr.qp_state != IBV_QPS_ERR) {
+    attr = {};
+    attr.qp_state = IBV_QPS_ERR;
+    if (ibv_modify_qp(qp_, &attr, IBV_QP_STATE) != 0) return false;
+  }
+  std::vector<ibv_wc> wcs(std::max<size_t>(1, depth_));
+  while (pending_responder_writes_ != 0) {
+    const int got = ibv_poll_cq(cq_, static_cast<int>(wcs.size()), wcs.data());
+    if (got < 0) return false;
+    if (got == 0) {
+      std::this_thread::yield();
+      continue;
+    }
+    ObserveCompletions(wcs.data(), got);
+  }
+  return true;
+}
+
 bool RcEndpoint::PostSendScatter(size_t slot, size_t hdr_len, const void* payload,
                                  size_t payload_len, ibv_mr* payload_mr) {
   if (slot >= depth_ || hdr_len > cap_ ||
@@ -809,6 +913,30 @@ bool RcEndpoint::PostWrite(size_t slot, const void* source, size_t length,
       remote_addr == 0 || remote_rkey == 0) {
     return false;
   }
+  if (responder_cancelled_.load(std::memory_order_acquire)) return false;
+  bool test_blocked = false;
+  size_t remaining = g_test_block_writes.load(std::memory_order_acquire);
+  while (remaining != 0 &&
+         !g_test_block_writes.compare_exchange_weak(
+             remaining, remaining - 1, std::memory_order_acq_rel,
+             std::memory_order_acquire)) {
+  }
+  if (remaining != 0) {
+    test_blocked = true;
+    std::unique_lock<std::mutex> lock(g_test_write_mu);
+    const size_t ordinal = ++g_test_write_entered;
+    g_test_write_cv.notify_all();
+    g_test_write_cv.wait(
+        lock, [ordinal] { return g_test_write_releases >= ordinal; });
+  }
+  if (responder_cancelled_.load(std::memory_order_acquire)) {
+    if (test_blocked) {
+      std::lock_guard<std::mutex> lock(g_test_write_mu);
+      ++g_test_write_exited;
+      g_test_write_cv.notify_all();
+    }
+    return false;
+  }
   ibv_sge sge{};
   sge.addr = reinterpret_cast<uintptr_t>(source);
   sge.length = static_cast<uint32_t>(length);
@@ -818,10 +946,17 @@ bool RcEndpoint::PostWrite(size_t slot, const void* source, size_t length,
   wr.sg_list = &sge;
   wr.num_sge = length ? 1 : 0;
   wr.opcode = IBV_WR_RDMA_WRITE;
-  wr.send_flags = 0;
+  wr.send_flags = IBV_SEND_SIGNALED;
   wr.wr.rdma.remote_addr = remote_addr;
   wr.wr.rdma.rkey = remote_rkey;
-  return ibv_post_send(qp_, &wr, &bad) == 0;
+  const bool posted = ibv_post_send(qp_, &wr, &bad) == 0;
+  if (posted) ++pending_responder_writes_;
+  if (test_blocked) {
+    std::lock_guard<std::mutex> lock(g_test_write_mu);
+    ++g_test_write_exited;
+    g_test_write_cv.notify_all();
+  }
+  return posted;
 }
 
 bool RcEndpoint::PostWriteImm(size_t slot, size_t length,
@@ -939,8 +1074,19 @@ bool RcEndpoint::PostWriteImmScatterMulti(
   return ibv_post_send(qp_, &wr, &bad) == 0;
 }
 
+int RcEndpoint::ObserveCompletions(ibv_wc* out, int got) {
+  got = ObserveCqPoll(out, got);
+  for (int i = 0; i < got; ++i) {
+    if (out[i].opcode == IBV_WC_RDMA_WRITE &&
+        pending_responder_writes_ != 0) {
+      --pending_responder_writes_;
+    }
+  }
+  return got;
+}
+
 int RcEndpoint::PollComp(ibv_wc* out, int max) {
-  return ObserveCqPoll(out, ibv_poll_cq(cq_, max, out));
+  return ObserveCompletions(out, ibv_poll_cq(cq_, max, out));
 }
 
 int RcEndpoint::WaitComp(ibv_wc* out, int max, int timeout_ms) {
@@ -949,37 +1095,37 @@ int RcEndpoint::WaitComp(ibv_wc* out, int max, int timeout_ms) {
     auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms < 0 ? 0 : timeout_ms);
     for (;;) {
       int got = ibv_poll_cq(cq_, max, out);
-      if (got != 0) return ObserveCqPoll(out, got);
+      if (got != 0) return ObserveCompletions(out, got);
       pollfd pfd = {wake_rfd_, POLLIN, 0};
       if (::poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) return -1;
-      if (timeout_ms == 0) return ObserveCqPoll(out, 0);
+      if (timeout_ms == 0) return ObserveCompletions(out, 0);
       if (timeout_ms > 0 && Clock::now() >= deadline)
-        return ObserveCqPoll(out, 0);
+        return ObserveCompletions(out, 0);
     }
   }
   for (;;) {
     int got = ibv_poll_cq(cq_, max, out);
-    if (got != 0) return ObserveCqPoll(out, got);
+    if (got != 0) return ObserveCompletions(out, got);
     // No completion ready: arm notify, poll once more (close the race where a
     // completion arrived between the empty poll and the notify), then block on
     // the comp-channel fd OR the wake pipe (so Stop() can interrupt us).
-    if (ibv_req_notify_cq(cq_, 0) != 0) return ObserveCqPoll(out, -1);
+    if (ibv_req_notify_cq(cq_, 0) != 0) return ObserveCompletions(out, -1);
     got = ibv_poll_cq(cq_, max, out);
-    if (got != 0) return ObserveCqPoll(out, got);
+    if (got != 0) return ObserveCompletions(out, got);
     pollfd pfds[2] = {{chan_->fd, POLLIN, 0}, {wake_rfd_, POLLIN, 0}};
     int pr = ::poll(pfds, 2, timeout_ms);
     if (pr < 0) {
       if (errno == EINTR) continue;
-      return ObserveCqPoll(out, -1);
+      return ObserveCompletions(out, -1);
     }
     if (pr == 0)
-      return ObserveCqPoll(out, ibv_poll_cq(cq_, max, out));
+      return ObserveCompletions(out, ibv_poll_cq(cq_, max, out));
     if (pfds[1].revents & POLLIN) return -1;  // expected shutdown wake
     if (pfds[0].revents & POLLIN) {
       ibv_cq* ev_cq = nullptr;
       void* ev_ctx = nullptr;
       if (ibv_get_cq_event(chan_, &ev_cq, &ev_ctx) != 0)
-        return ObserveCqPoll(out, -1);
+        return ObserveCompletions(out, -1);
       ibv_ack_cq_events(ev_cq, 1);
     }
   }

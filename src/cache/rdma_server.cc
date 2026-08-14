@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -40,6 +41,29 @@ namespace {
 static_assert(wire_limits::kIoAlign == rdma::kDirectIoAlign,
               "wire_limits must mirror the RDMA direct-IO alignment");
 using wire_limits::ResolveMaxPayload;
+// Draw every token from the kernel CRNG. Unlike a userspace PRNG or counter,
+// getrandom has no inherited/reset state that can replay after fork or restart.
+uint64_t RandomNonzeroWriterToken() {
+  for (;;) {
+    uint64_t token = 0;
+    size_t filled = 0;
+    while (filled < sizeof(token)) {
+      const ssize_t n =
+          ::getrandom(reinterpret_cast<char*>(&token) + filled,
+                      sizeof(token) - filled, 0);
+      if (n > 0) {
+        filled += static_cast<size_t>(n);
+        continue;
+      }
+      if (n < 0 && errno == EINTR) continue;
+      const int error = n < 0 ? errno : 0;
+      DFKV_LOG_ERROR("rdma: secure writer-token generation failed errno=" +
+                     std::to_string(error));
+      std::abort();
+    }
+    if (token != 0) return token;
+  }
+}
 
 // Monotonic seconds for the async-read submit->complete latency stamp. Read
 // twice per deferred GET (prep + completion), both off the SSD-bound path, so
@@ -115,6 +139,15 @@ void LogTopologySummary(size_t configured, size_t initialized,
   DFKV_LOG_INFO(summary);
 }
 }  // namespace
+uint64_t RdmaServer::RegisterWriter(
+    const std::shared_ptr<WriterState>& writer) {
+  for (;;) {
+    const uint64_t token = RandomNonzeroWriterToken();
+    std::lock_guard<std::mutex> lock(writer_mu_);
+    if (writers_.emplace(token, writer).second) return token;
+  }
+}
+
 
 RdmaServer::RdmaServer(Handler handler, size_t max_msg,
                        const std::string& dev_name)
@@ -475,6 +508,26 @@ void RdmaServer::Serve(int boot_fd) {
     ::close(boot_fd);
     return;
   }
+  if (rdma::IsV2RetireWriter(devbuf)) {
+    const uint64_t token = rdma::ParseDevFrameCaps(devbuf);
+    std::shared_ptr<WriterState> writer;
+    {
+      std::lock_guard<std::mutex> lock(writer_mu_);
+      const auto found = writers_.find(token);
+      if (found != writers_.end()) writer = found->second;
+    }
+    if (writer) {
+      std::unique_lock<std::mutex> lock(writer->mu);
+      if (!writer->retired && writer->endpoint)
+        writer->endpoint->CancelResponderWrites();
+      writer->retired_cv.wait(lock, [&] { return writer->retired; });
+    }
+    char proof[rdma::kV2RetireProofBytes];
+    rdma::EncodeV2RetireProof(token, proof);
+    net::WriteAll(boot_fd, proof, sizeof(proof));
+    ::close(boot_fd);
+    return;
+  }
   // Capability probes are answered without creating a QP.
   if (rdma::IsV2Probe(devbuf)) {
     char reply[rdma::kV2ProbeReplyBytes];
@@ -688,6 +741,23 @@ void RdmaServer::Serve(int boot_fd) {
     ::close(boot_fd);
     return;
   }
+  auto writer = std::make_shared<WriterState>();
+  writer->endpoint = &ep;
+  const uint64_t writer_token = RegisterWriter(writer);
+  auto retire_writer = [&] {
+    const bool retired = ep.RetireResponderWrites();
+    if (!retired)
+      DFKV_LOG_ERROR("rdma: responder WRITE CQ drain failed");
+    {
+      std::lock_guard<std::mutex> lock(writer->mu);
+      writer->endpoint = nullptr;
+      writer->retired = retired;
+    }
+    if (!retired) std::abort();
+    writer->retired_cv.notify_all();
+    std::lock_guard<std::mutex> lock(writer_mu_);
+    writers_.erase(writer_token);
+  };
   // Receives must be posted before readiness becomes visible. Publish the
   // leased receive-segment address, rkey and slot geometry only after the QP is
   // armed, so the client cannot issue a one-sided write into an unready slot.
@@ -696,11 +766,17 @@ void RdmaServer::Serve(int boot_fd) {
       reinterpret_cast<uint64_t>(recv_lease.data()),
       recv_segment_mr->rkey, slot_size};
   char encoded[rdma::kRecvSegmentInfoBytes];
+  char encoded_token[rdma::kV2WriterTokenBytes];
   rdma::EncodeRecvSegmentInfo(info, encoded);
+  net::PutU64(encoded_token, writer_token);
   const bool ok = net::WriteAll(boot_fd, &ready, 1) &&
-                  net::WriteAll(boot_fd, encoded, sizeof(encoded));
+                  net::WriteAll(boot_fd, encoded, sizeof(encoded)) &&
+                  net::WriteAll(boot_fd, encoded_token, sizeof(encoded_token));
   ::close(boot_fd);
-  if (!ok) return;
+  if (!ok) {
+    retire_writer();
+    return;
+  }
   v2_conns_.fetch_add(1, std::memory_order_relaxed);
 
   // Register this endpoint so Stop() can Wake() us out of WaitComp and join. The
@@ -708,7 +784,10 @@ void RdmaServer::Serve(int boot_fd) {
   // Stop sees us in live_eps_ (and wakes us) or we see running_==false here.
   {
     std::lock_guard<std::mutex> lk(conn_mu_);
-    if (!running_) return;
+    if (!running_) {
+      retire_writer();
+      return;
+    }
     live_eps_.insert(&ep);
   }
   ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
@@ -1359,6 +1438,7 @@ void RdmaServer::Serve(int boot_fd) {
                                                 std::memory_order_relaxed);
         return false;
       }
+      if (wc.opcode == IBV_WC_RDMA_WRITE) return true;
       if (wc.opcode == IBV_WC_SEND) {
         const size_t sid = static_cast<size_t>(wc.wr_id);
         if (sid >= K) return false;
@@ -1652,6 +1732,7 @@ void RdmaServer::Serve(int boot_fd) {
     rail_stats.active_conns.fetch_sub(1, std::memory_order_relaxed);
     active_conns_.fetch_sub(1, std::memory_order_relaxed);
     { std::lock_guard<std::mutex> lk(conn_mu_); live_eps_.erase(&ep); }
+    retire_writer();
     return;
   }
 sync_serve_loop:;
@@ -1671,6 +1752,7 @@ sync_serve_loop:;
                                                std::memory_order_relaxed);
         fail = true; break;
       }
+      if (wc.opcode == IBV_WC_RDMA_WRITE) continue;
       if (wc.opcode == IBV_WC_SEND) {
         size_t sid = static_cast<size_t>(wc.wr_id);
         // Finish any deferred read while its source slot is still owned and
@@ -1726,8 +1808,11 @@ sync_serve_loop:;
   rail_stats.active_conns.fetch_sub(1, std::memory_order_relaxed);
   active_conns_.fetch_sub(1, std::memory_order_relaxed);
   { std::lock_guard<std::mutex> lk(conn_mu_); live_eps_.erase(&ep); }
-  // ep dtor tears down the QP; the peer observes the drop as an error completion.
+  retire_writer();
+  // Writer retirement proof, not ep destruction, fences client destinations.
+  // The endpoint destructor below only releases verbs resources.
 }
+
 
 std::string RdmaServer::MetricsText() const {
   auto m = [](std::string& s, const char* name, const char* type, const char* help,

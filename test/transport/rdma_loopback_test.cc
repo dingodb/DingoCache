@@ -16,14 +16,17 @@
 #include "transport/rdma_topology.h"
 #include "transport/rdma_protocol.h"
 #include "transport/rdma_verbs.h"
+#include "utils/net_util.h"
 
 #include <gtest/gtest.h>
 #include <sys/mman.h>  // shm_unlink (node-dedup test)
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cerrno>
 #include <algorithm>
 #include <cctype>
 #include <array>
@@ -39,6 +42,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -68,6 +72,14 @@ class RdmaServerTestPeer {
   }
   static size_t RegisteredRailCount(const RdmaServer& server) {
     return server.recv_segment_registered_rails_;
+  }
+  static uint64_t RegisterWriter(RdmaServer* server) {
+    auto writer = std::make_shared<RdmaServer::WriterState>();
+    return server->RegisterWriter(writer);
+  }
+  static bool HasWriter(RdmaServer* server, uint64_t token) {
+    std::lock_guard<std::mutex> lock(server->writer_mu_);
+    return server->writers_.find(token) != server->writers_.end();
   }
 #ifdef DFKV_WITH_URING
   static void SetUringBackendFactory(
@@ -193,6 +205,71 @@ void ConfigureTestRecvSegment() {
   // Keep Soft-RoCE CI below modest RLIMIT_MEMLOCK. Production defaults to
   // 2 GiB, but these fixtures use 256-KiB blocks and need only a small segment.
   ::setenv("DFKV_RDMA_RECV_SEGMENT_SIZE", "33554432", 0);
+}
+
+struct ChildWriterTokenResult {
+  uint64_t token = 0;
+  int status = -1;
+  bool transferred = false;
+  bool stale_token_found = false;
+};
+
+ChildWriterTokenResult WriterTokenFromFreshProcess(uint64_t stale_token = 0) {
+  int pipe_fds[2];
+  if (::pipe(pipe_fds) != 0) return {};
+  const pid_t child = ::fork();
+  if (child < 0) {
+    ::close(pipe_fds[0]);
+    ::close(pipe_fds[1]);
+    return {};
+  }
+  if (child == 0) {
+    ::close(pipe_fds[0]);
+    RdmaServer server(RdmaServer::Handler{}, kMaxMsg);
+    const uint64_t token = RdmaServerTestPeer::RegisterWriter(&server);
+    std::array<char, sizeof(token) + 1> wire{};
+    net::PutU64(wire.data(), token);
+    wire[sizeof(token)] = static_cast<char>(
+        RdmaServerTestPeer::HasWriter(&server, stale_token));
+    size_t written = 0;
+    while (written < wire.size()) {
+      const ssize_t n =
+          ::write(pipe_fds[1], wire.data() + written, wire.size() - written);
+      if (n > 0) {
+        written += static_cast<size_t>(n);
+        continue;
+      }
+      if (n < 0 && errno == EINTR) continue;
+      ::_exit(2);
+    }
+    ::_exit(0);
+  }
+
+  ::close(pipe_fds[1]);
+  ChildWriterTokenResult result;
+  std::array<char, sizeof(result.token) + 1> wire{};
+  size_t received = 0;
+  while (received < wire.size()) {
+    const ssize_t n =
+        ::read(pipe_fds[0], wire.data() + received, wire.size() - received);
+    if (n > 0) {
+      received += static_cast<size_t>(n);
+      continue;
+    }
+    if (n < 0 && errno == EINTR) continue;
+    break;
+  }
+  ::close(pipe_fds[0]);
+  pid_t waited;
+  do {
+    waited = ::waitpid(child, &result.status, 0);
+  } while (waited < 0 && errno == EINTR);
+  result.token = net::GetU64(wire.data());
+  result.stale_token_found = wire[sizeof(result.token)] != 0;
+  result.transferred =
+      received == wire.size() && waited == child &&
+      WIFEXITED(result.status) && WEXITSTATUS(result.status) == 0;
+  return result;
 }
 
 // A cache node serving RDMA: KvNodeServer owns the DiskCacheGroup; RdmaServer
@@ -558,6 +635,30 @@ class ScopedCudaContextRestore {
 };
 
 }  // namespace
+
+TEST(RdmaWriterToken, LiveWritersHaveUniqueNonzeroTokens) {
+  RdmaServer server(RdmaServer::Handler{}, kMaxMsg);
+  std::unordered_set<uint64_t> tokens;
+  constexpr size_t kWriterCount = 1024;
+  for (size_t i = 0; i < kWriterCount; ++i) {
+    const uint64_t token = RdmaServerTestPeer::RegisterWriter(&server);
+    EXPECT_NE(token, 0u);
+    EXPECT_TRUE(tokens.insert(token).second);
+  }
+}
+
+TEST(RdmaWriterToken, FreshProcessesDoNotReuseStaleTokens) {
+  const ChildWriterTokenResult old_process = WriterTokenFromFreshProcess();
+  ASSERT_TRUE(old_process.transferred) << "child status=" << old_process.status;
+  ASSERT_NE(old_process.token, 0u);
+
+  const ChildWriterTokenResult new_process =
+      WriterTokenFromFreshProcess(old_process.token);
+  ASSERT_TRUE(new_process.transferred) << "child status=" << new_process.status;
+  ASSERT_NE(new_process.token, 0u);
+  EXPECT_FALSE(new_process.stale_token_found);
+  EXPECT_NE(new_process.token, old_process.token);
+}
 
 TEST(RdmaServerStartup, AutoModeKeepsFirstActiveDeviceSemantics) {
   ScopedEnv configured_device("DFKV_RDMA_DEV", nullptr);
@@ -5243,17 +5344,13 @@ TEST(RdmaLoopback,
         [&] { return winning_attempt_entered; });
   }
   if (observed_winner) {
-    // Attempt one has completed its RDMA write and been rejected, while the
-    // second rail has not written a byte. Failed-attempt staging must not leak
-    // into the caller's CUDA allocation.
+    // Attempt one completed its direct RDMA write and DONE before the injected
+    // local completion fault. Retirement proof makes that committed payload
+    // stable while the second rail is still blocked.
     std::string before_winner;
     const bool read_ok = destination.ReadPayload(&before_winner);
     EXPECT_TRUE(read_ok);
-    if (read_ok) {
-      EXPECT_EQ(before_winner,
-                std::string(value.size(),
-                            static_cast<char>(CudaGuardedBuffer::kGuardByte)));
-    }
+    if (read_ok) EXPECT_EQ(before_winner, value);
     EXPECT_TRUE(destination.GuardsIntact());
   }
   {
@@ -5707,19 +5804,18 @@ TEST(RdmaLoopback, AllLocalRailsFailOnceAndReclaimOperationResources) {
             CounterVal(before,
                        "dfkv_rdma_client_stale_pool_retries_total"));
 
-  // Drive another synchronous control completion before checking the buffer
-  // again; failed QP teardown must fence every old DMA before retry/return, so
-  // nothing may land after the failed GET returned.
+  // Drive another synchronous control completion before checking the buffer.
+  // Responder-retirement proof must precede retry/return, so no old writer can
+  // land bytes after the failed GET returned.
   EXPECT_EQ(transport.ExistMany(
                 node.addr, {ToBlockKey(key_namespace, "failed-get")}, &exists),
             std::vector<Status>({Status::kOk}));
   EXPECT_EQ(output, output_at_return);
 }
 
-// The SG read path (RangeIntoMulti) shares the direct-write contract: server
-// DMA lands straight in the caller segments, so a failed GET may leave
-// partial payload behind, but QP teardown fences every in-flight write before
-// the call returns, and a later successful GET rewrites the item in full.
+// The SG read path shares the direct-write contract: failed attempts retire the
+// responder writer and drain its signaled WRITE CQEs before retry/return. A
+// later successful GET rewrites the item in full.
 TEST(RdmaLoopback, FailedSgGetLeavesCallerSegmentsStableAfterReturn) {
   if (!HaveRdma())
     GTEST_SKIP() << "no RDMA device (load two rdma_rxe devices for this test)";
@@ -5750,8 +5846,8 @@ TEST(RdmaLoopback, FailedSgGetLeavesCallerSegmentsStableAfterReturn) {
   const std::string first_at_return = first;
   const std::string second_at_return = second;
 
-  // Drive another synchronous control completion; teardown must have fenced
-  // every in-flight DMA before the failed call returned.
+  // Drive another synchronous control completion; retirement proof must have
+  // made every old writer terminal before the failed call returned.
   std::vector<char> exists;
   EXPECT_EQ(transport.ExistMany(
                 node.addr, {ToBlockKey(SelfHdr(), "sg-failed-get")}, &exists),
@@ -5764,6 +5860,147 @@ TEST(RdmaLoopback, FailedSgGetLeavesCallerSegmentsStableAfterReturn) {
   ASSERT_TRUE(client.BatchGetAutoSg({get}, &lengths)[0]);
   ASSERT_EQ(lengths[0], value.size());
   EXPECT_EQ(first + second, value);
+}
+
+TEST(RdmaLoopback,
+     BlockedResponderWriteRetiresBeforeHostRetryAndReclaimsMr) {
+  ScopedEnv configured_device("DFKV_RDMA_DEV", nullptr);
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+
+  RdmaNode node("writer-retire-retry");
+  RdmaTransport transport(kMaxMsg);
+  const BlockKey key = ToBlockKey(SelfHdr(), "writer-retire-retry");
+  const std::string value = PatternValue(64 * 1024 + 7, 91);
+  ASSERT_EQ(transport.Cache(node.addr, key, value.data(), value.size()),
+            Status::kOk);
+  const uint64_t mr_baseline = rdma::RcEndpoint::TransientUserMrActive();
+  std::string output(value.size(), '\x5a');
+  std::vector<Status> statuses;
+  std::vector<uint64_t> value_lens;
+  std::atomic<bool> returned{false};
+
+  rdma::TestBlockNextResponderWrites(1);
+  std::thread getter([&] {
+    statuses = transport.RangeInto(
+        node.addr, {key}, {{output.data(), output.size()}}, &value_lens);
+    returned.store(true, std::memory_order_release);
+  });
+  const bool blocked =
+      rdma::TestWaitForBlockedResponderWrites(1, 10000);
+  const bool cancelled =
+      blocked && rdma::TestWaitForResponderWriteCancellations(1, 10000);
+  EXPECT_TRUE(blocked);
+  EXPECT_TRUE(cancelled);
+  EXPECT_FALSE(returned.load(std::memory_order_acquire))
+      << "client returned before responder-retirement proof";
+  EXPECT_GT(rdma::RcEndpoint::TransientUserMrActive(), mr_baseline)
+      << "blocked direct attempt did not retain its host MR";
+  EXPECT_EQ(output, std::string(output.size(), '\x5a'))
+      << "blocked old attempt wrote before retirement";
+
+  rdma::TestReleaseOneBlockedResponderWrite();
+  const bool old_writer_exited =
+      rdma::TestWaitForReleasedResponderWrites(1, 10000);
+  if (!old_writer_exited) rdma::TestReleaseBlockedResponderWrites();
+  getter.join();
+  rdma::TestReleaseBlockedResponderWrites();
+
+  EXPECT_TRUE(old_writer_exited);
+  EXPECT_EQ(statuses, std::vector<Status>({Status::kOk}));
+  EXPECT_EQ(value_lens, std::vector<uint64_t>({value.size()}));
+  EXPECT_EQ(output, value);
+  EXPECT_EQ(node.RangeDirectCalls(key), 2u);
+  EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), mr_baseline);
+
+  const std::string at_return = output;
+  std::vector<char> exists;
+  EXPECT_EQ(transport.ExistMany(node.addr, {key}, &exists),
+            std::vector<Status>({Status::kOk}));
+  EXPECT_EQ(output, at_return)
+      << "retired first-attempt writer modified host memory after return";
+  EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), mr_baseline);
+}
+
+TEST(RdmaLoopback,
+     TwoBlockedResponderAttemptsFailSgGetBeforeReturnAndReclaimMrs) {
+  ScopedEnv configured_device("DFKV_RDMA_DEV", nullptr);
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+
+  RdmaNode node("writer-retire-terminal-sg");
+  RdmaTransport transport(kMaxMsg);
+  const BlockKey key = ToBlockKey(SelfHdr(), "writer-retire-terminal-sg");
+  const std::string value = PatternValue(96 * 1024 + 11, 37);
+  ASSERT_EQ(transport.Cache(node.addr, key, value.data(), value.size()),
+            Status::kOk);
+  const uint64_t mr_baseline = rdma::RcEndpoint::TransientUserMrActive();
+
+  std::array<std::string, 3> segments{
+      std::string(4093, '\x5a'),
+      std::string(32771, '\x5a'),
+      std::string(value.size() - 4093 - 32771, '\x5a')};
+  RangeDstMulti destination{{
+      {segments[0].data(), segments[0].size()},
+      {segments[1].data(), segments[1].size()},
+      {segments[2].data(), segments[2].size()},
+  }};
+  std::vector<Status> statuses;
+  std::vector<size_t> lengths;
+  std::atomic<bool> returned{false};
+
+  rdma::TestBlockNextResponderWrites(2);
+  std::thread getter([&] {
+    statuses =
+        transport.RangeIntoMulti(node.addr, {key}, {destination}, &lengths);
+    returned.store(true, std::memory_order_release);
+  });
+  bool fixture_ok = true;
+  for (size_t attempt = 1; attempt <= 2; ++attempt) {
+    const bool blocked =
+        rdma::TestWaitForBlockedResponderWrites(attempt, 10000);
+    const bool cancelled =
+        blocked &&
+        rdma::TestWaitForResponderWriteCancellations(attempt, 10000);
+    EXPECT_TRUE(blocked) << attempt;
+    EXPECT_TRUE(cancelled) << attempt;
+    fixture_ok = fixture_ok && blocked && cancelled;
+    EXPECT_FALSE(returned.load(std::memory_order_acquire))
+        << "attempt " << attempt << " returned before writer retirement";
+    EXPECT_GT(rdma::RcEndpoint::TransientUserMrActive(), mr_baseline)
+        << "blocked SG attempt did not retain operation MRs";
+    for (const auto& segment : segments)
+      EXPECT_EQ(segment, std::string(segment.size(), '\x5a')) << attempt;
+    rdma::TestReleaseOneBlockedResponderWrite();
+    const bool exited =
+        rdma::TestWaitForReleasedResponderWrites(attempt, 10000);
+    EXPECT_TRUE(exited) << attempt;
+    fixture_ok = fixture_ok && exited;
+    if (!fixture_ok) break;
+  }
+  if (!fixture_ok) rdma::TestReleaseBlockedResponderWrites();
+  getter.join();
+  rdma::TestReleaseBlockedResponderWrites();
+
+  EXPECT_EQ(statuses, std::vector<Status>({Status::kIOError}));
+  EXPECT_EQ(lengths, std::vector<size_t>({0}));
+  EXPECT_EQ(node.RangeDirectCalls(key), 2u);
+  EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), mr_baseline);
+  const auto at_return = segments;
+  std::vector<char> exists;
+  EXPECT_EQ(transport.ExistMany(node.addr, {key}, &exists),
+            std::vector<Status>({Status::kOk}));
+  EXPECT_EQ(segments, at_return)
+      << "retired terminal writers modified SG memory after return";
+
+  const auto recovered =
+      transport.RangeIntoMulti(node.addr, {key}, {destination}, &lengths);
+  ASSERT_EQ(recovered, std::vector<Status>({Status::kOk}));
+  ASSERT_EQ(lengths, std::vector<size_t>({value.size()}));
+  EXPECT_EQ(segments[0] + segments[1] + segments[2], value);
+  EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), mr_baseline);
 }
 
 TEST(RdmaLoopback,

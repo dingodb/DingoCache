@@ -60,6 +60,36 @@ inline bool ParseV2ProbeReply(const char in[kV2ProbeReplyBytes]) {
          static_cast<uint8_t>(in[4]) == kDevProtoV2;
 }
 
+// Failure-path writer retirement. The client reconnects with the opaque
+// per-QP writer token. The responder cancels later PostWrite calls, transitions
+// that QP to ERR, drains every signaled WRITE CQE, and only then echoes proof.
+// The proof is the protocol fence that permits retry/return with the same
+// caller/CUDA destination; QP destruction and MR teardown are not fences.
+constexpr const char* kV2RetireWriterDevice = "__dfkv_retire__";
+constexpr uint64_t kV2RetireProofMagic = 0x32524657564b4644ull;  // "DFKVWFR2"
+constexpr size_t kV2WriterTokenBytes = 8;
+constexpr size_t kV2RetireProofBytes = 16;
+
+inline bool IsV2RetireWriter(const char frame[kDevNameBytes]) {
+  size_t n = 0;
+  while (n < kDevNameBytes && frame[n] != '\0') ++n;
+  return std::string(frame, n) == kV2RetireWriterDevice &&
+         ParseDevFrameProtocol(frame) == kDevProtoV2 &&
+         ParseDevFrameCaps(frame) != 0;
+}
+
+inline void EncodeV2RetireProof(
+    uint64_t token, char out[kV2RetireProofBytes]) {
+  net::PutU64(out, kV2RetireProofMagic);
+  net::PutU64(out + 8, token);
+}
+
+inline bool ParseV2RetireProof(
+    const char in[kV2RetireProofBytes], uint64_t token) {
+  return net::GetU64(in) == kV2RetireProofMagic &&
+         net::GetU64(in + 8) == token;
+}
+
 // Multi-window GET IDs name one of the negotiated per-connection logical
 // request slots. Keeping the namespace bounded by queue depth both caps server
 // state and makes duplicate ownership explicit.

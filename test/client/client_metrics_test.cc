@@ -10,18 +10,85 @@
 #include <cstring>
 #include <initializer_list>
 
+#include <fstream>
+#include <limits>
 #include <string>
 #include <chrono>
 #include <cstdlib>
 #include <map>
 #include <mutex>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <thread>
 #include <type_traits>
 #include <vector>
+#include <iterator>
+
+
+namespace dfkv::testing {
+void DrainPernodeSink();
+size_t PernodeQueueCapacity();
+size_t PernodeQueueHighWater();
+uint64_t PernodeQueueDropped();
+uint64_t PernodeQueuePendingDropped();
+void PausePernodeSink(bool paused);
+void EnqueuePernodeForTest(const char* fname,
+                           std::vector<std::string> lines);
+std::string PernodeKeyFingerprintForTest(const std::string& key);
+}  // namespace dfkv::testing
 
 using namespace dfkv;  // NOLINT
 
+struct PernodeMetricsEnv {
+  std::string dir =
+      "/tmp/dfkv-pernode-metrics-" + std::to_string(::getpid());
+  std::string suffix =
+      "dp0_pp0_tp0_g0_p" + std::to_string(::getpid());
+
+  PernodeMetricsEnv() {
+    ::mkdir(dir.c_str(), 0700);
+    ::setenv("DFKV_CLIENT_PERNODE_STATS", "1", 1);
+    ::setenv("DFKV_ACCESS_DIR", dir.c_str(), 1);
+    ::setenv("DFKV_CLIENT_LOG_SUFFIX", suffix.c_str(), 1);
+    ::setenv("DFKV_CLIENT_PERNODE_QUEUE_CAPACITY", "4", 1);
+    ::setenv("DFKV_CLIENT_PERNODE_ROTATE_BYTES", "512", 1);
+  }
+  std::string Path(const std::string& file) const {
+    return dir + "/" + file + "." + suffix;
+  }
+};
+
+PernodeMetricsEnv pernode_env;
+
+std::string ReadText(const std::string& path) {
+  std::ifstream input(path);
+  return std::string(std::istreambuf_iterator<char>(input),
+                     std::istreambuf_iterator<char>());
+}
+
+std::string CurrentAndPrevious(const std::string& file) {
+  const std::string current = pernode_env.Path(file);
+  return ReadText(current + ".1") + ReadText(current);
+}
+
+bool HasLineWith(const std::string& text,
+                 std::initializer_list<std::string> fields) {
+  size_t begin = 0;
+  while (begin <= text.size()) {
+    const size_t end = text.find('\n', begin);
+    const std::string line =
+        text.substr(begin, end == std::string::npos ? std::string::npos
+                                                    : end - begin);
+    bool all = true;
+    for (const std::string& field : fields)
+      all = all && line.find(field) != std::string::npos;
+    if (all) return true;
+    if (end == std::string::npos) break;
+    begin = end + 1;
+  }
+  return false;
+}
 namespace {
 class MetricsTransport final : public Transport {
  public:
@@ -51,6 +118,9 @@ class MetricsTransport final : public Transport {
   size_t range_calls = 0;
   size_t range_multi_calls = 0;
   size_t range_multi_misses = 0;
+  size_t cache_status_limit = std::numeric_limits<size_t>::max();
+  size_t range_status_limit = std::numeric_limits<size_t>::max();
+  size_t exist_status_limit = std::numeric_limits<size_t>::max();
   uint64_t cross_rail_retries = 0;
   uint64_t cross_rail_retry_successes = 0;
   uint64_t cross_rail_retry_exhausted = 0;
@@ -168,8 +238,10 @@ class MetricsTransport final : public Transport {
         values[src.key.Filename()] = std::move(value);
       }
     });
-    return std::vector<Status>(
+    std::vector<Status> result(
         srcs.size(), ok ? Status::kOk : Status::kIOError);
+    result.resize(std::min(result.size(), cache_status_limit));
+    return result;
   }
 
   std::vector<Status> RangeIntoMulti(
@@ -212,6 +284,16 @@ class MetricsTransport final : public Transport {
         --range_multi_misses;
       }
     }
+    result.resize(std::min(result.size(), range_status_limit));
+    return result;
+  }
+
+  std::vector<Status> ExistMany(
+      const std::string& node, const std::vector<BlockKey>& keys,
+      std::vector<char>* exists, std::string* out_dev = nullptr) override {
+    std::vector<Status> result =
+        Transport::ExistMany(node, keys, exists, out_dev);
+    result.resize(std::min(result.size(), exist_status_limit));
     return result;
   }
 
@@ -932,4 +1014,280 @@ TEST(ClientRetries, SgGetRetriesTransientMinorityMisses) {
                 std::string(retry_second.data(), retry_second.size()),
             value);
   EXPECT_EQ(transport.range_multi_calls, 2u);
+}
+
+TEST(ClientPernodeStats, OutputsFailuresRetriesAndBoundedRotation) {
+  MetricsTransport transport;
+  dfkv::testing::DrainPernodeSink();
+  transport.pipeline = true;
+  KVClient client({{"node-a", "10.0.0.1:12000"}},
+                  "pernode/contract", &transport);
+  const std::array<std::string, 3> keys{
+      "secret-put-alpha", "secret-put-beta", "secret-put-gamma"};
+  const std::string value = "payload";
+
+  transport.cache_status_limit = 1;
+  std::vector<KvPutItemSg> puts;
+  for (const std::string& key : keys)
+    puts.push_back({key, {value.data()}, {value.size()}});
+  EXPECT_EQ(client.BatchPutSg(puts),
+            std::vector<bool>({true, false, false}));
+  dfkv::testing::DrainPernodeSink();
+  const std::string put_log =
+      CurrentAndPrevious("dfkv_client_put.log");
+  EXPECT_NE(put_log.find(
+                "logical_keys=3 issued_keys=3"),
+            std::string::npos)
+      << put_log;
+  EXPECT_NE(put_log.find("logical_success=1 logical_fail=2"),
+            std::string::npos)
+      << put_log;
+  EXPECT_NE(put_log.find("failed_issued_keys=2"), std::string::npos)
+      << put_log;
+  EXPECT_NE(put_log.find("statuses=kOk,kInvalid"), std::string::npos)
+      << put_log;
+  EXPECT_EQ(put_log.find(keys[1]), std::string::npos)
+      << "raw keys must never be logged";
+  EXPECT_NE(put_log.find("first_fail=len="), std::string::npos) << put_log;
+
+  std::array<std::array<char, 16>, 3> output{};
+  std::vector<KvGetItemSg> gets;
+  for (size_t i = 0; i < keys.size(); ++i)
+    gets.push_back({keys[i], {output[i].data()}, {output[i].size()}});
+  transport.range_status_limit = 1;
+  std::vector<size_t> lengths;
+  EXPECT_EQ(client.BatchGetAutoSg(gets, &lengths),
+            std::vector<bool>({true, false, false}));
+  dfkv::testing::DrainPernodeSink();
+  std::string get_log = CurrentAndPrevious("dfkv_client_get.log");
+  EXPECT_NE(get_log.find("logical_keys=3 issued_keys=3"),
+            std::string::npos)
+      << get_log;
+  EXPECT_NE(get_log.find("failed_issued_keys=2"), std::string::npos)
+      << get_log;
+  EXPECT_NE(get_log.find("failure_status_mask=32"), std::string::npos)
+      << get_log;
+  EXPECT_EQ(get_log.find(keys[1]), std::string::npos);
+
+  transport.range_status_limit = std::numeric_limits<size_t>::max();
+  transport.range_multi_misses = 1;
+  EXPECT_EQ(client.BatchGetAutoSg(gets, &lengths),
+            std::vector<bool>({true, true, true}));
+  dfkv::testing::DrainPernodeSink();
+  get_log = CurrentAndPrevious("dfkv_client_get.log");
+  EXPECT_NE(get_log.find(
+                "logical_keys=3 issued_keys=4"),
+            std::string::npos)
+      << get_log;
+  EXPECT_NE(get_log.find("logical_hits=3 logical_not_hit=0"),
+            std::string::npos)
+      << get_log;
+
+  transport.exist_status_limit = 1;
+  EXPECT_EQ(
+      client.BatchExist(std::vector<std::string>(keys.begin(), keys.end())),
+      std::vector<bool>({true, false, false}));
+  dfkv::testing::DrainPernodeSink();
+  const std::string exist_log =
+      CurrentAndPrevious("dfkv_client_exist.log");
+  EXPECT_NE(exist_log.find("logical_keys=3 issued_keys=3"),
+            std::string::npos)
+      << exist_log;
+  EXPECT_NE(exist_log.find("failed_issued_keys=2"), std::string::npos)
+      << exist_log;
+  EXPECT_NE(exist_log.find("failure_status_mask=32"), std::string::npos)
+      << exist_log;
+
+  EXPECT_EQ(dfkv::testing::PernodeQueueCapacity(), 4u);
+  EXPECT_GT(dfkv::testing::PernodeQueueHighWater(), 0u);
+  EXPECT_LE(dfkv::testing::PernodeQueueHighWater(),
+            dfkv::testing::PernodeQueueCapacity());
+  std::ifstream rotated(
+      pernode_env.Path("dfkv_client_get.log") + ".1");
+  EXPECT_TRUE(rotated.good()) << "fixed .1 rotation file was not created";
+}
+
+TEST(ClientPernodeStats, FingerprintsAreKeyedStableAndNeverExposeRawKeys) {
+  const std::string key = "dictionary-guessable-secret-key";
+  const std::string first =
+      dfkv::testing::PernodeKeyFingerprintForTest(key);
+  const std::string second =
+      dfkv::testing::PernodeKeyFingerprintForTest(key);
+
+  EXPECT_EQ(first, second);
+  EXPECT_NE(first.find("len=" + std::to_string(key.size())),
+            std::string::npos);
+  EXPECT_NE(first.find("hmac-sha256="), std::string::npos);
+  EXPECT_EQ(first.find("fnv"), std::string::npos);
+  EXPECT_EQ(first.find(key), std::string::npos);
+}
+
+TEST(ClientPernodeStats, RecordsEveryPretransportRoutingFailure) {
+  dfkv::testing::DrainPernodeSink();
+  MetricsTransport transport;
+  transport.pipeline = true;
+  KVClient client({}, "pernode/no-route", &transport);
+  const std::string value = "payload";
+  std::array<char, 16> output{};
+
+  const KvGetItemSg invalid_get{
+      "invalid-get-secret", {output.data()}, {}};
+  const KvGetItemSg unrouted_get{
+      "unrouted-get-secret", {output.data()}, {output.size()}};
+  std::vector<size_t> lengths;
+  EXPECT_EQ(client.BatchGetAutoSg({invalid_get, unrouted_get}, &lengths),
+            std::vector<bool>({false, false}));
+  EXPECT_EQ(client.BatchExist({"unrouted-exist-secret"}),
+            std::vector<bool>({false}));
+  const KvPutItemSg invalid_put{
+      "invalid-put-secret", {value.data()}, {}};
+  const KvPutItemSg unrouted_put{
+      "unrouted-put-secret", {value.data()}, {value.size()}};
+  EXPECT_EQ(client.BatchPutSg({invalid_put, unrouted_put}),
+            std::vector<bool>({false, false}));
+  dfkv::testing::DrainPernodeSink();
+
+  const std::string get_log =
+      CurrentAndPrevious("dfkv_client_get.log");
+  EXPECT_TRUE(HasLineWith(
+      get_log,
+      {"pernode-get TOTAL:", "logical_keys=2", "issued_keys=0",
+       "nonissued_failures=2", "invalid_input=1", "no_route=1",
+       "health_cooldown=0",
+       "nonissued_reasons=invalid_input:kInvalid=1,"
+       "no_route:not_issued=1"}))
+      << get_log;
+  EXPECT_TRUE(HasLineWith(
+      get_log,
+      {"failure_status_mask=0", "logical_failure_status_mask=32",
+       "nonissued_status_mask=32", "nonissued_statuses=kInvalid"}))
+      << get_log;
+  EXPECT_EQ(get_log.find("invalid-get-secret"), std::string::npos);
+  EXPECT_EQ(get_log.find("unrouted-get-secret"), std::string::npos);
+
+  const std::string exist_log =
+      CurrentAndPrevious("dfkv_client_exist.log");
+  EXPECT_TRUE(HasLineWith(
+      exist_log,
+      {"pernode-exist TOTAL:", "logical_keys=1", "issued_keys=0",
+       "nonissued_failures=1", "no_route=1",
+       "nonissued_reasons=no_route:not_issued=1"}))
+      << exist_log;
+  EXPECT_EQ(exist_log.find("unrouted-exist-secret"), std::string::npos);
+
+  const std::string put_log =
+      CurrentAndPrevious("dfkv_client_put.log");
+  EXPECT_TRUE(HasLineWith(
+      put_log,
+      {"pernode-put TOTAL:", "logical_keys=2", "issued_keys=0",
+       "nonissued_failures=2", "invalid_input=1", "no_route=1",
+       "preroute_fail=2"}))
+      << put_log;
+  EXPECT_EQ(put_log.find("invalid-put-secret"), std::string::npos);
+  EXPECT_EQ(put_log.find("unrouted-put-secret"), std::string::npos);
+}
+
+TEST(ClientPernodeStats, RecordsGetExistAndPutHealthCooldownSkips) {
+  dfkv::testing::DrainPernodeSink();
+  const std::string value = "payload";
+
+  MetricsTransport get_transport;
+  get_transport.pipeline = true;
+  get_transport.Script(
+      {{0, MetricsTransport::AttemptResult::kRailFailure}});
+  KVClient get_client({{"get-node", "10.0.0.1:12100"}},
+                      "pernode/get-cooldown", &get_transport);
+  std::array<char, 16> output{};
+  KvGetItemSg get{"cooling-get-secret",
+                  {output.data()}, {output.size()}};
+  std::vector<size_t> lengths;
+  EXPECT_EQ(get_client.BatchGetAutoSg({get}, &lengths),
+            std::vector<bool>({false}));
+  const size_t get_calls = get_transport.range_multi_calls;
+  EXPECT_EQ(get_client.BatchGetAutoSg({get}, &lengths),
+            std::vector<bool>({false}));
+  EXPECT_EQ(get_transport.range_multi_calls, get_calls);
+  dfkv::testing::DrainPernodeSink();
+
+  MetricsTransport exist_transport;
+  exist_transport.pipeline = true;
+  exist_transport.exist_script = {Status::kIOError};
+  KVClient exist_client({{"exist-node", "10.0.0.1:12200"}},
+                        "pernode/exist-cooldown", &exist_transport);
+  EXPECT_EQ(exist_client.BatchExist({"cooling-exist-secret"}),
+            std::vector<bool>({false}));
+  const size_t exist_calls = exist_transport.exist_calls;
+  EXPECT_EQ(exist_client.BatchExist({"cooling-exist-secret"}),
+            std::vector<bool>({false}));
+  EXPECT_EQ(exist_transport.exist_calls, exist_calls);
+  dfkv::testing::DrainPernodeSink();
+
+  MetricsTransport put_transport;
+  put_transport.pipeline = true;
+  put_transport.Script(
+      {{0, MetricsTransport::AttemptResult::kRailFailure}});
+  KVClient put_client({{"put-node", "10.0.0.1:12300"}},
+                      "pernode/put-cooldown", &put_transport);
+  KvPutItemSg put{"cooling-put-secret",
+                  {value.data()}, {value.size()}};
+  EXPECT_EQ(put_client.BatchPutSg({put}), std::vector<bool>({false}));
+  const size_t put_attempts = put_transport.attempts.size();
+  EXPECT_EQ(put_client.BatchPutSg({put}), std::vector<bool>({false}));
+  EXPECT_EQ(put_transport.attempts.size(), put_attempts);
+  dfkv::testing::DrainPernodeSink();
+
+  const std::string get_log =
+      CurrentAndPrevious("dfkv_client_get.log");
+  EXPECT_TRUE(HasLineWith(
+      get_log,
+      {"pernode-get TOTAL:", "logical_keys=1", "issued_keys=0",
+       "nonissued_failures=1", "health_cooldown=1",
+       "failure_status_mask=0", "logical_failure_status_mask=0",
+       "nonissued_reasons=health_cooldown:not_issued=1"}))
+      << get_log;
+  EXPECT_EQ(get_log.find("cooling-get-secret"), std::string::npos);
+
+  const std::string exist_log =
+      CurrentAndPrevious("dfkv_client_exist.log");
+  EXPECT_TRUE(HasLineWith(
+      exist_log,
+      {"pernode-exist TOTAL:", "logical_keys=1", "issued_keys=0",
+       "nonissued_failures=1", "health_cooldown=1",
+       "nonissued_reasons=health_cooldown:not_issued=1"}))
+      << exist_log;
+  EXPECT_EQ(exist_log.find("cooling-exist-secret"), std::string::npos);
+
+  const std::string put_log =
+      CurrentAndPrevious("dfkv_client_put.log");
+  EXPECT_TRUE(HasLineWith(
+      put_log,
+      {"pernode-put TOTAL:", "logical_keys=1", "issued_keys=0",
+       "nonissued_failures=1", "health_cooldown=1",
+       "nonissued_reasons=health_cooldown:not_issued=1"}))
+      << put_log;
+  EXPECT_EQ(put_log.find("cooling-put-secret"), std::string::npos);
+}
+
+TEST(ClientPernodeStats, QueueDropsAreReportedByNextWrittenBatch) {
+  dfkv::testing::DrainPernodeSink();
+  EXPECT_EQ(dfkv::testing::PernodeQueuePendingDropped(), 0u);
+  const size_t capacity = dfkv::testing::PernodeQueueCapacity();
+  const uint64_t dropped_before = dfkv::testing::PernodeQueueDropped();
+
+  dfkv::testing::PausePernodeSink(true);
+  for (size_t i = 0; i < capacity + 2; ++i)
+    dfkv::testing::EnqueuePernodeForTest(
+        "dfkv_client_drop_test.log",
+        {"sink-test batch=" + std::to_string(i)});
+  EXPECT_EQ(dfkv::testing::PernodeQueueDropped() - dropped_before, 2u);
+  EXPECT_EQ(dfkv::testing::PernodeQueuePendingDropped(), 2u);
+  dfkv::testing::PausePernodeSink(false);
+  dfkv::testing::DrainPernodeSink();
+
+  EXPECT_EQ(dfkv::testing::PernodeQueuePendingDropped(), 0u);
+  const std::string log =
+      CurrentAndPrevious("dfkv_client_drop_test.log");
+  EXPECT_NE(log.find("pernode-sink DROPPED: dropped_batches=2"),
+            std::string::npos)
+      << log;
 }

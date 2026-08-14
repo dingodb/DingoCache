@@ -93,6 +93,30 @@ _T = TypeVar("_T")
 def _rotate_list(values: list[_T], offset: int) -> list[_T]:
     return values[offset:] + values[:offset]
 
+def _process_log_suffix(
+    *,
+    dp_rank: int,
+    pp_rank: int,
+    tp_rank: int,
+    global_rank: int,
+    pid: int | None = None,
+    prefix: str | None = None,
+) -> str:
+    """Return a process-unique native-client log suffix.
+
+    DP/PP/TP/global coordinates make the file attributable across distributed
+    layouts. PID is the collision fence when ranks are reused by colocated
+    engines or the launcher cannot provide a globally unique rank.
+    """
+    process_id = os.getpid() if pid is None else pid
+    identity = (
+        f"dp{dp_rank}_pp{pp_rank}_tp{tp_rank}_"
+        f"g{global_rank}_p{process_id}"
+    )
+    if prefix == identity or (prefix and prefix.endswith(f"_{identity}")):
+        return prefix
+    return f"{prefix}_{identity}" if prefix else identity
+
 def _batch_rotation_offset(
     req_id: str,
     block_hashes: list[BlockHash],
@@ -1431,12 +1455,16 @@ class DfkvStoreWorker:
                     and os.environ.get("DFKV_CLIENT_NODE_DEDUP_GPU") is None):
                 os.environ["DFKV_CLIENT_NODE_DEDUP_GPU"] = "1"
 
-        # dfkv: per-rank client log suffix, mirroring the access log's
-        # ``.r{rank}`` form (access_log._build_sink), so the
-        # DFKV_CLIENT_PERNODE_STATS files of concurrent workers never share
-        # one file: dfkv_client_get.log.r3 etc. setdefault keeps an
-        # operator-provided suffix authoritative.
-        os.environ.setdefault("DFKV_CLIENT_LOG_SUFFIX", f"r{self.tp_rank}")
+        # Native per-node logs must not collide across colocated DP/PP/TP
+        # workers. Preserve an operator prefix, but always append the complete
+        # rank identity and PID collision fence instead of trusting TP alone.
+        os.environ["DFKV_CLIENT_LOG_SUFFIX"] = _process_log_suffix(
+            dp_rank=self.dp_rank,
+            pp_rank=self.pp_rank,
+            tp_rank=self.tp_rank,
+            global_rank=parallel_config.rank,
+            prefix=os.environ.get("DFKV_CLIENT_LOG_SUFFIX"),
+        )
 
         client_kwargs = dict(
             members=extra.get("members", ""),

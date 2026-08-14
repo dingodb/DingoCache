@@ -236,6 +236,27 @@ class CompletionFaultOperation {
 // rdma::ClassifyCompletion and attribute them kRailFailure.
 constexpr ibv_wc_status kLocalFaultWcStatus = IBV_WC_GENERAL_ERR;
 
+// A response DONE is the success fence: the responder posts it after signaled
+// WRITEs on the same RC QP. An ambiguous attempt must obtain server proof that
+// its writer token is retired and every WRITE CQE is terminal before the same
+// caller/CUDA destination can be retried, returned, or deregistered.
+bool RetireRemoteWriter(const std::string& node, uint64_t token,
+                        int connect_ms, int io_ms) {
+  if (token == 0) return false;
+  const int fd = net::Dial(node, connect_ms, io_ms);
+  if (fd < 0) return false;
+  char request[rdma::kDevNameBytes];
+  rdma::EncodeDevFrame(rdma::kV2RetireWriterDevice, token, request,
+                       rdma::kDevProtoV2);
+  char proof[rdma::kV2RetireProofBytes];
+  const bool retired =
+      net::WriteAll(fd, request, sizeof(request)) &&
+      net::ReadAll(fd, proof, sizeof(proof)) &&
+      rdma::ParseV2RetireProof(proof, token);
+  ::close(fd);
+  return retired;
+}
+
 // Reap one signaled request completion and one status RECV per posted request.
 // Every poll consumes the same absolute deadline; a partial CQ drain cannot
 // restart the timeout budget. slot_count may exceed posted when invalid items
@@ -262,6 +283,10 @@ bool ReapPosted(rdma::RcEndpoint& ep, size_t posted, size_t slot_count,
   int need = static_cast<int>(2 * posted);
   CompletionDeadline deadline(timeout_ms);
   while (need > 0) {
+    if (rdma::TestConsumeBlockedResponderWriteFault()) {
+      if (worst_status) *worst_status = kLocalFaultWcStatus;
+      return false;
+    }
     const int remaining_ms = deadline.Remaining();
     if (remaining_ms == 0) {
       if (timed_out) *timed_out = true;
@@ -270,6 +295,10 @@ bool ReapPosted(rdma::RcEndpoint& ep, size_t posted, size_t slot_count,
     const int got = ep.WaitComp(wcs.data(), static_cast<int>(wcs.size()),
                                 remaining_ms);
     if (got <= 0) {
+      if (rdma::TestConsumeBlockedResponderWriteFault()) {
+        if (worst_status) *worst_status = kLocalFaultWcStatus;
+        return false;
+      }
       if (got == 0 && timed_out) *timed_out = true;
       if (got < 0 && worst_status) {
         // CQ notification/polling itself failed: local rail evidence (the
@@ -348,6 +377,7 @@ void MarkClientLocalFailure(std::vector<Status>* result, Status status) {
 struct RdmaTransport::Conn {
   rdma::RcEndpoint ep;
   rdma::RecvSegmentInfo recv_segment;
+  uint64_t writer_token = 0;
   size_t rail_index = 0;
   uint64_t peer_publication = 0;
   std::string peer_id;
@@ -818,9 +848,8 @@ void RdmaTransport::Destroy(Conn* c, rdma::RailCompletion completion) {
              ? RemoteRailOutcome::kEndpointFailure
              : RemoteRailOutcome::kAbandon);
 
-  // The endpoint owns the QP, CQs, and all transient/pool MRs. Destroy it
-  // synchronously before returning either rail credits or process resources,
-  // so a retry cannot overlap stale WRs that still reference caller memory.
+  // Direct GET failure paths have already obtained responder-retirement proof.
+  // Deletion releases terminal verbs resources; it is not a DMA fence.
   delete c;
   if (credit_held) {
     const uint64_t now = rdma::RailPolicy::NowMicros();
@@ -1276,9 +1305,12 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
 
   char ready = 0;
   char encoded[rdma::kRecvSegmentInfoBytes];
+  char encoded_token[rdma::kV2WriterTokenBytes];
   if (!net::ReadAll(fd, &ready, 1) || ready != 1 ||
       !net::ReadAll(fd, encoded, sizeof(encoded)) ||
-      !rdma::DecodeRecvSegmentInfo(encoded, &conn->recv_segment)) {
+      !net::ReadAll(fd, encoded_token, sizeof(encoded_token)) ||
+      !rdma::DecodeRecvSegmentInfo(encoded, &conn->recv_segment) ||
+      (conn->writer_token = net::GetU64(encoded_token)) == 0) {
     DFKV_LOG_ERROR("rdma: peer " + node +
                    " did not provide a valid v2 receive segment");
     ::close(fd);
@@ -2012,6 +2044,12 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
     }
 
     const size_t failed_rail = conn->rail_index;
+    if (op == WireOp::kRange &&
+        !RetireRemoteWriter(node, conn->writer_token, connect_ms_, io_ms_)) {
+      DFKV_LOG_ERROR(
+          "rdma: no responder-retirement proof for failed direct GET");
+      std::abort();
+    }
     Destroy(conn, completion);
     const AcquireFailure failure =
         completion == rdma::RailCompletion::kRailFailure &&
@@ -2360,6 +2398,11 @@ std::vector<Status> RdmaTransport::RangeMany(
       return result;
     }
     const size_t failed_rail = conn->rail_index;
+    if (!RetireRemoteWriter(node, conn->writer_token, connect_ms_, io_ms_)) {
+      DFKV_LOG_ERROR(
+          "rdma: no responder-retirement proof for failed batch GET");
+      std::abort();
+    }
     Destroy(conn, completion);
     const AcquireFailure failure =
         completion == rdma::RailCompletion::kRailFailure
@@ -2560,14 +2603,14 @@ std::vector<Status> RdmaTransport::RangeInto(
       const size_t width = std::min(window, count - base);
       std::vector<ibv_mr*> output_mrs(width, nullptr);
       size_t posted = 0;
+      // Server DMA lands directly in caller/CUDA memory. DONE fences success;
+      // ambiguity retires the responder token before this memory is reused.
       for (size_t slot = 0; slot < width; ++slot) {
         const size_t item_index = base + slot;
         if (bad[item_index]) continue;
         const RangeDst& destination = destinations[item_index];
         // Server DMA lands directly in the caller buffer (GPUDirect when it is
         // device memory; a host bounce here would fault on CUDA pointers).
-        // Rail-retry fencing comes from Destroy(conn) below: tearing down the
-        // QP drops in-flight remote writes before the next attempt reposts.
         if (destination.n != 0) {
           output_mrs[slot] =
               ep.RegisterTransient(destination.payload, destination.n);
@@ -2635,6 +2678,11 @@ std::vector<Status> RdmaTransport::RangeInto(
       return result;
     }
     const size_t failed_rail = conn->rail_index;
+    if (!RetireRemoteWriter(node, conn->writer_token, connect_ms_, io_ms_)) {
+      DFKV_LOG_ERROR(
+          "rdma: no responder-retirement proof for failed direct GET");
+      std::abort();
+    }
     Destroy(conn, completion);
     const AcquireFailure failure =
         completion == rdma::RailCompletion::kRailFailure
@@ -2948,11 +2996,9 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
     if (out_lengths) out_lengths->assign(count, 0);
     return result;
   }
-  // Server DMA lands directly in the caller segments (GPUDirect when they are
-  // device memory; a host bounce here would fault on CUDA pointers).
-  // Rail-retry fencing comes from Destroy(conn): tearing down the QP drops
-  // in-flight remote writes before the next attempt reposts, and a retried
-  // item is rewritten in full from window 0.
+  // Server DMA lands directly in caller/CUDA segments. Every DONE fences its
+  // successful WRITEs. An ambiguous window retires its responder token before
+  // another rail restarts an incomplete item from window zero.
   std::vector<char> completed(count, 0);
   std::vector<size_t> out_value_lens(count, 0);
   rdma::OperationContext operation;
@@ -2994,6 +3040,7 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
           acquired.failure == AcquireFailure::kNoCompatibleRail)
         MarkClientLocalFailure(&result, acquired.status);
       operation.Complete(false);
+      if (out_lengths) *out_lengths = out_value_lens;
       return result;
     }
     Conn* conn = acquired.conn;
@@ -3213,6 +3260,11 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
       return result;
     }
     const size_t failed_rail = conn->rail_index;
+    if (!RetireRemoteWriter(node, conn->writer_token, connect_ms_, io_ms_)) {
+      DFKV_LOG_ERROR(
+          "rdma: no responder-retirement proof for failed SG GET");
+      std::abort();
+    }
     Destroy(conn, completion);
     for (size_t i = 0; i < count; ++i) {
       if (!bad[i] && !completed[i]) result[i] = Status::kIOError;
@@ -3229,12 +3281,14 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
       cross_rail_retry_exhausted_.fetch_add(1, std::memory_order_relaxed);
     if (final_timeout) operation.RequestCancel();
     operation.Complete(false);
+    if (out_lengths) *out_lengths = out_value_lens;
     return result;
   }
   if (cross_rail_retry)
     cross_rail_retry_exhausted_.fetch_add(1, std::memory_order_relaxed);
   if (final_timeout) operation.RequestCancel();
   operation.Complete(false);
+  if (out_lengths) *out_lengths = out_value_lens;
   return result;
 }
 
