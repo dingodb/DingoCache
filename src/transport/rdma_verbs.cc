@@ -71,6 +71,21 @@ std::atomic<uint64_t> g_transient_user_mr_active{0};
 std::atomic<uint64_t> g_cq_completions{0};
 std::atomic<uint64_t> g_cq_errors{0};
 
+int ObserveCqPoll(ibv_wc* out, int got) {
+  if (got < 0) {
+    g_cq_errors.fetch_add(1, std::memory_order_relaxed);
+  } else if (got > 0) {
+    g_cq_completions.fetch_add(static_cast<uint64_t>(got),
+                               std::memory_order_relaxed);
+    uint64_t failed = 0;
+    for (int i = 0; i < got; ++i)
+      if (out[i].status != IBV_WC_SUCCESS) ++failed;
+    if (failed != 0)
+      g_cq_errors.fetch_add(failed, std::memory_order_relaxed);
+  }
+  return got;
+}
+
 // Get-or-open the shared {ctx, pd} for `dev_name` (nullptr/"" = first device),
 // bumping its refcount. Returns {nullptr,nullptr} on failure (no refcount taken).
 std::pair<ibv_context*, ibv_pd*> AcquireSharedDevice(const char* dev_name) {
@@ -924,56 +939,47 @@ bool RcEndpoint::PostWriteImmScatterMulti(
   return ibv_post_send(qp_, &wr, &bad) == 0;
 }
 
+int RcEndpoint::PollComp(ibv_wc* out, int max) {
+  return ObserveCqPoll(out, ibv_poll_cq(cq_, max, out));
+}
+
 int RcEndpoint::WaitComp(ibv_wc* out, int max, int timeout_ms) {
-  const auto observe = [&](int got) {
-    if (got < 0) {
-      g_cq_errors.fetch_add(1, std::memory_order_relaxed);
-    } else if (got > 0) {
-      g_cq_completions.fetch_add(static_cast<uint64_t>(got),
-                                 std::memory_order_relaxed);
-      uint64_t failed = 0;
-      for (int i = 0; i < got; ++i)
-        if (out[i].status != IBV_WC_SUCCESS) ++failed;
-      if (failed != 0)
-        g_cq_errors.fetch_add(failed, std::memory_order_relaxed);
-    }
-    return got;
-  };
   if (busy_poll_) {
     using Clock = std::chrono::steady_clock;
     auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms < 0 ? 0 : timeout_ms);
     for (;;) {
       int got = ibv_poll_cq(cq_, max, out);
-      if (got != 0) return observe(got);
+      if (got != 0) return ObserveCqPoll(out, got);
       pollfd pfd = {wake_rfd_, POLLIN, 0};
       if (::poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) return -1;
-      if (timeout_ms == 0) return observe(0);
-      if (timeout_ms > 0 && Clock::now() >= deadline) return observe(0);
+      if (timeout_ms == 0) return ObserveCqPoll(out, 0);
+      if (timeout_ms > 0 && Clock::now() >= deadline)
+        return ObserveCqPoll(out, 0);
     }
   }
   for (;;) {
     int got = ibv_poll_cq(cq_, max, out);
-    if (got != 0) return observe(got);
+    if (got != 0) return ObserveCqPoll(out, got);
     // No completion ready: arm notify, poll once more (close the race where a
     // completion arrived between the empty poll and the notify), then block on
     // the comp-channel fd OR the wake pipe (so Stop() can interrupt us).
-    if (ibv_req_notify_cq(cq_, 0) != 0) return observe(-1);
+    if (ibv_req_notify_cq(cq_, 0) != 0) return ObserveCqPoll(out, -1);
     got = ibv_poll_cq(cq_, max, out);
-    if (got != 0) return observe(got);
+    if (got != 0) return ObserveCqPoll(out, got);
     pollfd pfds[2] = {{chan_->fd, POLLIN, 0}, {wake_rfd_, POLLIN, 0}};
     int pr = ::poll(pfds, 2, timeout_ms);
     if (pr < 0) {
       if (errno == EINTR) continue;
-      return observe(-1);
+      return ObserveCqPoll(out, -1);
     }
     if (pr == 0)
-      return observe(ibv_poll_cq(cq_, max, out));
+      return ObserveCqPoll(out, ibv_poll_cq(cq_, max, out));
     if (pfds[1].revents & POLLIN) return -1;  // expected shutdown wake
     if (pfds[0].revents & POLLIN) {
       ibv_cq* ev_cq = nullptr;
       void* ev_ctx = nullptr;
       if (ibv_get_cq_event(chan_, &ev_cq, &ev_ctx) != 0)
-        return observe(-1);
+        return ObserveCqPoll(out, -1);
       ibv_ack_cq_events(ev_cq, 1);
     }
   }

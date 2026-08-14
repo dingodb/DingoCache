@@ -100,13 +100,22 @@ class RdmaServer {
   uint64_t CompletionErrors() const { return completion_errors_.load(std::memory_order_relaxed); }
   uint64_t ActiveConns() const { return active_conns_.load(std::memory_order_relaxed); }
   uint64_t IdleReclaims() const { return idle_reclaims_.load(std::memory_order_relaxed); }
-  // io_uring async-GET path observability: reads actually submitted through a
-  // ring, and connections that WANTED the path but fell back to sync (ring init
-  // failed). Both zero when the path is off -- uring_reads_total > 0 is the
-  // external proof the env-gated path is really active (the fallback is
-  // otherwise silent by design, correctness-first).
-  uint64_t UringReads() const { return uring_reads_.load(std::memory_order_relaxed); }
-  uint64_t UringInitFallbacks() const { return uring_init_fallbacks_.load(std::memory_order_relaxed); }
+  // io_uring async-GET path observability. UringReads is the total number of
+  // descriptors passed to non-empty batches; UringReadBatches counts those
+  // calls and UringReadBatchMax is their process-lifetime high-water mark.
+  // All remain zero when the path is off.
+  uint64_t UringReads() const {
+    return uring_reads_.load(std::memory_order_relaxed);
+  }
+  uint64_t UringReadBatches() const {
+    return uring_read_batches_.load(std::memory_order_relaxed);
+  }
+  uint64_t UringReadBatchMax() const {
+    return uring_read_batch_max_.load(std::memory_order_relaxed);
+  }
+  uint64_t UringInitFallbacks() const {
+    return uring_init_fallbacks_.load(std::memory_order_relaxed);
+  }
   uint64_t V2Conns() const { return v2_conns_.load(std::memory_order_relaxed); }
   uint64_t V2PutWrites() const {
     return v2_put_writes_.load(std::memory_order_relaxed);
@@ -199,8 +208,13 @@ class RdmaServer {
       const std::string&, const std::vector<std::pair<void*, size_t>>&,
       void*, size_t)>
       initialize_anchor_for_test_;
+  // Deterministic hardware integration-test barrier: after WaitComp returns
+  // the first snapshot but before the ready-only CQ drain. Production leaves
+  // this empty.
+  std::function<void()> before_uring_ready_drain_for_test_;
   friend class RdmaServerTestPeer;
-  std::atomic<uint64_t> uring_reads_{0}, uring_init_fallbacks_{0};
+  std::atomic<uint64_t> uring_reads_{0}, uring_read_batches_{0},
+      uring_read_batch_max_{0}, uring_init_fallbacks_{0};
   std::atomic<uint64_t> v2_conns_{0}, v2_put_writes_{0}, v2_get_writes_{0};
   std::atomic<uint64_t> v2_get_continuation_slot_changes_{0};
   std::atomic<uint64_t> completions_{0}, completion_errors_{0}, active_conns_{0},

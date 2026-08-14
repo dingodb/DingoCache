@@ -1246,11 +1246,12 @@ void RdmaServer::Serve(int boot_fd) {
   // -------------------------------------------------------------------------
   // io_uring async-GET serve loop (env-gated; correctness-preserving).
   //
-  // Batch-and-wait model (Mooncake's uring_file batch_read adapted to dfkv's
-  // per-WaitComp completion batch). For each completion batch returned by
-  // WaitComp: handle SEND completions and non-kRange RECVs inline exactly as the
-  // sync loop; for kRange GETs, prep an ordered descriptor list, submit all disk
-  // reads at once, then emit v2 RDMA WRITEs in arrival order.
+  // Ready-microbatch model (Mooncake's uring_file batch_read adapted to dfkv's
+  // completion stream). WaitComp blocks only for the first completion, then a
+  // bounded ready-only CQ drain gathers the rest of the burst before any
+  // descriptors are prepared. SENDs, receives, and failed WCs remain in exact
+  // CQ order; eligible kRange GETs enter one disk batch and replies are emitted
+  // in that same order.
   // The slot backing each read stays leased until the signaled status SEND
   // completes, so neither a new PUT nor another GET can overwrite bytes still
   // being consumed by the NIC. Anything that cannot go async falls back to
@@ -1303,6 +1304,26 @@ void RdmaServer::Serve(int boot_fd) {
           ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
         if (g == 0) { idle_reclaims_.fetch_add(1, std::memory_order_relaxed); break; }
         if (g < 0) break;  // error / Stop()'s Wake()
+        if (before_uring_ready_drain_for_test_)
+          before_uring_ready_drain_for_test_();
+        // A CQ notification commonly wakes for the first WC while the rest of
+        // the client window is arriving. Snapshot those already-ready WCs now,
+        // before synchronous preparation/disk wait strands them in the CQ.
+        // PollComp is a single ibv_poll_cq: it neither blocks nor arms/consumes
+        // completion-channel notifications. K is simultaneously the negotiated
+        // receive-slot count, WC storage bound, and maximum number of first
+        // windows that can enter this batch; the ring is initialized to >= K.
+        bool drain_failed = false;
+        while (static_cast<size_t>(g) < K) {
+          const int ready = ep.PollComp(
+              wcs.data() + g, static_cast<int>(K - static_cast<size_t>(g)));
+          if (ready < 0) {
+            drain_failed = true;
+            break;
+          }
+          if (ready == 0) break;
+          g += ready;
+        }
         descs.clear();
         queue.clear();
         for (int w = 0; w < g && !fail; ++w) {
@@ -1423,13 +1444,28 @@ void RdmaServer::Serve(int boot_fd) {
           queue.push_back(std::move(qd));
         }
         if (fail) break;
+        if (drain_failed) {
+          // Preserve processing order for completions obtained before the CQ
+          // poll error, but do not submit reads or replies on a failed CQ.
+          fail = true;
+          break;
+        }
 
         // Submit + wait for ALL deferred reads in this batch (QD>1 concurrency).
         // If the batch infrastructure fails, fall back to a synchronous pread per
         // deferred request in the emit pass below (correctness-first).
         bool batch_ok = true;
         if (!descs.empty()) {
-          uring_reads_.fetch_add(descs.size(), std::memory_order_relaxed);
+          const uint64_t batch_reads = static_cast<uint64_t>(descs.size());
+          uring_reads_.fetch_add(batch_reads, std::memory_order_relaxed);
+          uring_read_batches_.fetch_add(1, std::memory_order_relaxed);
+          uint64_t previous =
+              uring_read_batch_max_.load(std::memory_order_relaxed);
+          while (batch_reads > previous &&
+                 !uring_read_batch_max_.compare_exchange_weak(
+                     previous, batch_reads, std::memory_order_relaxed,
+                     std::memory_order_relaxed)) {
+          }
           batch_ok = ring.BatchRead(descs.data(), static_cast<int>(descs.size()));
           // A failed batch may have left async reads in flight against leased
           // v2 shared-segment slots. Drain before the sync fallback
@@ -1661,6 +1697,14 @@ std::string RdmaServer::MetricsText() const {
   m(s, "dfkv_uring_reads_total", "counter",
     "GET disk reads submitted through the io_uring path (>0 = path active)",
     UringReads());
+  m(s, "dfkv_uring_batch_reads_total", "counter",
+    "GET disk-read descriptors passed to non-empty io_uring batches",
+    UringReads());
+  m(s, "dfkv_uring_batches_total", "counter",
+    "Non-empty io_uring BatchRead calls", UringReadBatches());
+  m(s, "dfkv_uring_batch_max", "gauge",
+    "Largest io_uring BatchRead descriptor count observed",
+    UringReadBatchMax());
   m(s, "dfkv_uring_init_fallbacks_total", "counter",
     "Connections that wanted io_uring but fell back to the sync path (ring init failed)",
     UringInitFallbacks());
