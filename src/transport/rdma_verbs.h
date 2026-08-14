@@ -194,7 +194,8 @@ class RcEndpoint {
   // current operation. `remote_write=true` is for receive targets; false keeps
   // const/read-only send sources valid. Registered pool MRs with sufficient
   // access are reused. The endpoint owns ad-hoc MRs until ReleaseTransient() or
-  // Close(), so a failed/timed-out QP tears down before deregistration.
+  // Close(); ambiguous direct GETs obtain responder-retirement proof before
+  // either happens.
   ibv_mr* RegisterTransient(void* addr, size_t len,
                             bool remote_write = true);
   void ReleaseTransient(ibv_mr* mr);
@@ -227,10 +228,9 @@ class RcEndpoint {
       size_t slot, const std::vector<std::pair<void*, uint32_t>>& segs,
       const std::vector<ibv_mr*>& mrs, size_t hdr_bytes);
 
-  // RDMA v2 one-sided primitives. PostWrite is intentionally UNSIGNALED: a
-  // following signaled status SEND on the same RC QP fences its source buffer
-  // lifetime and produces the sole server-side completion. WRITE_WITH_IMM is
-  // signaled because it is the client's request operation.
+  // RDMA v2 one-sided primitives. Responder PostWrite is signaled: its CQE is
+  // tracked until DONE on success or explicit writer retirement on ambiguity.
+  // WRITE_WITH_IMM is the client's signaled request operation.
   bool PostWrite(size_t slot, const void* source, size_t length,
                  ibv_mr* source_mr, uint64_t remote_addr,
                  uint32_t remote_rkey);
@@ -271,6 +271,12 @@ class RcEndpoint {
   // Unblock a thread sitting in WaitComp (so the server can join its Serve
   // threads at shutdown). Thread-safe vs the waiter.
   void Wake();
+  // Responder retirement protocol. Every PostWrite is signaled. Cancellation
+  // prevents later posts and wakes the owner; RetireResponderWrites moves the QP
+  // to ERR and consumes all tracked WRITE CQEs before the server sends proof to
+  // the client. This is the failure fence; ibv_destroy_qp is cleanup only.
+  void CancelResponderWrites();
+  bool RetireResponderWrites();
   void set_busy_poll(bool v) { busy_poll_ = v; }
   void set_num_qp(size_t n) { num_qp_ = n > 0 ? n : 1; }
   size_t num_qp() const { return num_qp_; }
@@ -279,6 +285,7 @@ class RcEndpoint {
   // syscall and CQ contention at high thread counts.
 
  private:
+  int ObserveCompletions(ibv_wc* out, int got);
   void Close();
 
   ibv_context* ctx_ = nullptr;
@@ -311,11 +318,24 @@ class RcEndpoint {
     ibv_mr* mr;
   };
   std::vector<PoolMr> pool_mr_;
-  // Operation-scoped out-of-pool MRs. These are released after completion, or
-  // after QP teardown on every failure/timeout path.
+  // Operation-scoped out-of-pool MRs. These are released after a successful
+  // DONE, or after explicit responder-retirement proof on failure.
   std::vector<ibv_mr*> transient_mr_;
   QpInfo local_;
+  std::atomic<bool> responder_cancelled_{false};
+  size_t pending_responder_writes_ = 0;  // responder owner thread only
 };
+
+// Deterministic loopback-only responder seam. It blocks the next `count`
+// PostWrite calls before ibv_post_send, allowing tests to hold real remote
+// WRITEs in flight while the client times out, fences, retries, or returns.
+void TestBlockNextResponderWrites(size_t count);
+bool TestWaitForBlockedResponderWrites(size_t count, int timeout_ms);
+bool TestWaitForReleasedResponderWrites(size_t count, int timeout_ms);
+void TestReleaseBlockedResponderWrites();
+bool TestConsumeBlockedResponderWriteFault();
+bool TestWaitForResponderWriteCancellations(size_t count, int timeout_ms);
+void TestReleaseOneBlockedResponderWrite();
 
 }  // namespace rdma
 }  // namespace dfkv

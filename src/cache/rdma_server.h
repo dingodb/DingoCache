@@ -1,21 +1,24 @@
 /* RDMA cache-node listener — native v2 libibverbs RC. Bounded 32,786-byte
  * per-QP control buffers share a process-wide registered payload segment.
  * Peers that cannot negotiate v2 are rejected.
- * The TCP listener only bootstraps QPs. Startup discovers the first ACTIVE HCA
- * automatically, or resolves every explicitly configured HCA into a fixed
- * topology (including initially inactive ports), then anchors shared PD/MRs.
+ * The TCP listener bootstraps QPs and proves failed writer generations retired.
+ * Startup discovers the first ACTIVE HCA automatically, or resolves every
+ * explicitly configured HCA into a fixed topology (including initially inactive
+ * ports), then anchors shared PD/MRs.
  * shutdown(listen_fd) keeps Stop() interruptible. */
 #ifndef DFKV_RDMA_SERVER_H_
 #define DFKV_RDMA_SERVER_H_
 
 #include <atomic>
 #include <cstddef>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -171,6 +174,16 @@ class RdmaServer {
     std::shared_ptr<std::atomic<bool>> done;
   };
 
+  struct WriterState {
+    std::mutex mu;
+    std::condition_variable retired_cv;
+    rdma::RcEndpoint* endpoint = nullptr;
+    bool retired = false;
+  };
+  // Register a writer under an OS-random, nonzero token. Candidate insertion
+  // and collision detection are atomic with respect to retire lookups.
+  uint64_t RegisterWriter(const std::shared_ptr<WriterState>& writer);
+
   // Per-device counters make a partial rail failure or affinity imbalance
   // visible without polling host counters. The rail set is fixed by Start().
   struct RailStats {
@@ -202,6 +215,8 @@ class RdmaServer {
   std::mutex conn_mu_;
   std::vector<Conn> conns_;
   std::unordered_set<rdma::RcEndpoint*> live_eps_;
+  std::mutex writer_mu_;
+  std::unordered_map<uint64_t, std::shared_ptr<WriterState>> writers_;
   // One process-wide pinned receive segment replaces per-connection payload
   // buffers. Each v2 connection leases depth * aligned_slot_size bytes, and
   // each rail's shared PD registers the segment once. This makes connection

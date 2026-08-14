@@ -1,18 +1,24 @@
 #include "client/kv_client.h"
 
 #include <unistd.h>
+#include <sys/random.h>
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <atomic>
 #include <climits>
+#include <cstdio>
+#include <ctime>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <limits>
 #include <stdexcept>
@@ -23,6 +29,7 @@
 #include "client/key_map.h"
 #include "client/read_scheduler.h"
 #include "utils/log.h"
+#include "utils/sha256.h"
 #include "utils/thread_name.h"
 #include "utils/parallel_for.h"
 #include "transport/transport_factory.h"
@@ -1221,8 +1228,8 @@ std::vector<bool> KVClient::BatchExist(const std::vector<std::string>& keys) {
 namespace {
 
 // Shared per-node (ip:port) stats for GET/PUT/EXIST. Gated by
-// DFKV_CLIENT_PERNODE_STATS=1 (off by default); emitted to
-// $DFKV_ACCESS_DIR/<file>.<suffix> (append+flush) if set, else stderr.
+// DFKV_CLIENT_PERNODE_STATS=1 (off by default). The disabled path is this one
+// cached branch; no clocks, maps, strings, or sink state are touched.
 bool PernodeOn() {
   static const bool on = [] {
     const char* e = std::getenv("DFKV_CLIENT_PERNODE_STATS");
@@ -1232,13 +1239,19 @@ bool PernodeOn() {
 }
 
 struct PernodeStat {
-  uint64_t keys = 0, bytes = 0, busy_us = 0, wall_us = 0, shards = 0;
-  uint64_t min_b = std::numeric_limits<uint64_t>::max(), max_b = 0;  // value size
-  uint64_t hit = 0;        // successes: GET retrieved / PUT written / EXIST present
-  uint64_t fail = 0;       // routed failures (status != ok among issued keys)
-  uint32_t fail_mask = 0;  // bit i set when Status value i appears among failures
-  std::string first_fail;  // fingerprint of the first failed key on this node
-  std::string dev;         // IB rail device of the slowest shard (the one setting wall_us)
+  // issued_keys counts transport items, so a retried GET is counted once per
+  // attempt. logical_keys exists only on TOTAL and always means caller inputs.
+  uint64_t issued_keys = 0, bytes = 0, busy_us = 0, wall_us = 0, shards = 0;
+  uint64_t min_b = std::numeric_limits<uint64_t>::max(), max_b = 0;
+  uint64_t hit = 0;   // GET found / PUT stored / EXIST present
+  uint64_t fail = 0;  // issued responses other than kOk/kNotFound (PUT: non-kOk)
+  uint64_t nonissued_fail = 0;
+  uint64_t invalid_input = 0, no_route = 0, health_cooldown = 0;
+  uint32_t status_mask = 0;       // statuses returned by the transport
+  uint32_t fail_status_mask = 0;  // failed statuses returned by the transport
+  uint32_t nonissued_status_mask = 0;
+  std::string first_fail;         // keyed id of first failed key
+  std::string dev;                // slowest shard's IB rail
 };
 
 const char* PernodeStatusName(Status s) {
@@ -1249,163 +1262,563 @@ const char* PernodeStatusName(Status s) {
     case Status::kQuotaExceeded: return "kQuotaExceeded";
     case Status::kIOError: return "kIOError";
     case Status::kInvalid: return "kInvalid";
+    case Status::kResourceExhausted: return "kResourceExhausted";
+    case Status::kNoCompatibleRail: return "kNoCompatibleRail";
   }
   return "kUnknown";
 }
 
-// Cheap key fingerprint (len + first bytes as hex; no hashing on the hot path).
-std::string PernodeKeyFp(const std::string& key) {
-  static const char* H = "0123456789abcdef";
-  std::string hex;
-  const size_t n = key.size() < 8 ? key.size() : 8;
-  for (size_t i = 0; i < n; ++i) {
-    const unsigned char c = static_cast<unsigned char>(key[i]);
-    hex += H[c >> 4];
-    hex += H[c & 0xf];
-  }
-  return "len=" + std::to_string(key.size()) + ":" + hex;
+uint32_t PernodeStatusBit(Status s) {
+  const int value = static_cast<int>(s);
+  return value >= 0 && value < 32 ? (1u << value) : 0;
 }
 
-std::string PernodeFmt1(uint64_t x10) {  // one decimal from an x10 integer
+std::string PernodeStatusList(uint32_t mask) {
+  std::string out;
+  for (int value = 0; value < 8; ++value) {
+    if ((mask & (1u << value)) == 0) continue;
+    if (!out.empty()) out += ",";
+    out += PernodeStatusName(static_cast<Status>(value));
+  }
+  return out.empty() ? "none" : out;
+}
+
+// Process-local HMAC-SHA256 makes repeated failures correlatable without
+// leaving a dictionary-reversible digest of the raw key in logs. If kernel
+// randomness is unavailable, omit the digest rather than weakening privacy.
+std::string PernodeKeyFp(const std::string& key) {
+  struct Key {
+    std::array<uint8_t, 32> bytes{};
+    bool ready = false;
+  };
+  static const Key process_key = [] {
+    Key result;
+    size_t offset = 0;
+    while (offset < result.bytes.size()) {
+      const ssize_t n =
+          ::getrandom(result.bytes.data() + offset,
+                      result.bytes.size() - offset, 0);
+      if (n > 0) {
+        offset += static_cast<size_t>(n);
+        continue;
+      }
+      if (n < 0 && errno == EINTR) continue;
+      return result;
+    }
+    result.ready = true;
+    return result;
+  }();
+  if (!process_key.ready)
+    return "len=" + std::to_string(key.size()) + ":digest=redacted";
+
+  std::array<uint8_t, 64> inner_pad{}, outer_pad{};
+  inner_pad.fill(0x36);
+  outer_pad.fill(0x5c);
+  for (size_t i = 0; i < process_key.bytes.size(); ++i) {
+    inner_pad[i] ^= process_key.bytes[i];
+    outer_pad[i] ^= process_key.bytes[i];
+  }
+  std::vector<uint8_t> inner(inner_pad.size() + key.size());
+  std::memcpy(inner.data(), inner_pad.data(), inner_pad.size());
+  if (!key.empty())
+    std::memcpy(inner.data() + inner_pad.size(), key.data(), key.size());
+  std::array<uint8_t, 32> inner_digest{};
+  Sha256(inner.data(), inner.size(), inner_digest.data());
+  std::array<uint8_t, 64 + 32> outer{};
+  std::memcpy(outer.data(), outer_pad.data(), outer_pad.size());
+  std::memcpy(outer.data() + outer_pad.size(), inner_digest.data(),
+              inner_digest.size());
+  std::array<uint8_t, 32> digest{};
+  Sha256(outer.data(), outer.size(), digest.data());
+
+  static const char* hex = "0123456789abcdef";
+  std::string id(32, '0');
+  for (size_t i = 0; i < 16; ++i) {
+    id[2 * i] = hex[digest[i] >> 4];
+    id[2 * i + 1] = hex[digest[i] & 0xf];
+  }
+  return "len=" + std::to_string(key.size()) + ":hmac-sha256=" + id;
+}
+
+enum class PernodeNonIssuedReason {
+  kInvalidInput,
+  kNoRoute,
+  kHealthCooldown,
+};
+
+uint32_t PernodeNonIssuedStatusBit(PernodeNonIssuedReason reason) {
+  // Routing absence and a health gate do not produce a transport Status.
+  // Invalid input is a real client-local kInvalid outcome.
+  return reason == PernodeNonIssuedReason::kInvalidInput
+             ? PernodeStatusBit(Status::kInvalid)
+             : 0;
+}
+
+void RecordPernodeNonIssued(PernodeStat* stat,
+                            PernodeNonIssuedReason reason, uint64_t count,
+                            const std::string& first_key) {
+  stat->nonissued_fail += count;
+  switch (reason) {
+    case PernodeNonIssuedReason::kInvalidInput:
+      stat->invalid_input += count;
+      break;
+    case PernodeNonIssuedReason::kNoRoute:
+      stat->no_route += count;
+      break;
+    case PernodeNonIssuedReason::kHealthCooldown:
+      stat->health_cooldown += count;
+      break;
+  }
+  stat->nonissued_status_mask |= PernodeNonIssuedStatusBit(reason);
+  if (stat->first_fail.empty()) stat->first_fail = PernodeKeyFp(first_key);
+}
+
+void MergePernodeNonIssued(PernodeStat* into, const PernodeStat& from) {
+  into->nonissued_fail += from.nonissued_fail;
+  into->invalid_input += from.invalid_input;
+  into->no_route += from.no_route;
+  into->health_cooldown += from.health_cooldown;
+  into->nonissued_status_mask |= from.nonissued_status_mask;
+  if (into->first_fail.empty() && !from.first_fail.empty())
+    into->first_fail = from.first_fail;
+}
+
+std::string PernodeNonIssuedReasons(const PernodeStat& stat) {
+  std::string out;
+  auto append = [&](const char* reason, const char* status, uint64_t count) {
+    if (count == 0) return;
+    if (!out.empty()) out += ",";
+    out += reason;
+    out += ":";
+    out += status;
+    out += "=";
+    out += std::to_string(count);
+  };
+  append("invalid_input", "kInvalid", stat.invalid_input);
+  append("no_route", "not_issued", stat.no_route);
+  append("health_cooldown", "not_issued", stat.health_cooldown);
+  return out.empty() ? "none" : out;
+}
+
+std::string PernodeFmt1(uint64_t x10) {
   return std::to_string(x10 / 10) + "." + std::to_string(x10 % 10);
 }
 
-// Per-process file suffix, mirroring the vLLM connector access log's
-// ``access.log.r{tp_rank}`` convention: the integration layer exports
-// DFKV_CLIENT_LOG_SUFFIX (e.g. "r3") for every worker it launches so each
-// rank owns its file. Without it the pid keeps concurrent local processes
-// from interleaving one shared file.
-std::string PernodeSuffix() {
+const std::string& PernodeSuffix() {
   static const std::string suffix = [] {
-    const char* e = std::getenv("DFKV_CLIENT_LOG_SUFFIX");
-    std::string s = e && *e ? e : "p" + std::to_string(::getpid());
-    for (char& c : s)
+    const char* env_suffix = std::getenv("DFKV_CLIENT_LOG_SUFFIX");
+    const std::string pid_tag = "p" + std::to_string(::getpid());
+    std::string value =
+        env_suffix && *env_suffix ? env_suffix : pid_tag;
+    for (char& c : value)
       if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_')
-        c = '_';  // a separator smuggled via the env must not escape the dir
-    return s;
+        c = '_';
+    // A launcher-supplied rank identity is attributable but not necessarily
+    // process-unique (for example TP rank repeats across DP/PP groups).
+    if (value != pid_tag &&
+        (value.size() <= pid_tag.size() ||
+         value.compare(value.size() - pid_tag.size(), pid_tag.size(),
+                       pid_tag) != 0))
+      value += "_" + pid_tag;
+    return value;
   }();
   return suffix;
 }
 
-// One FILE* per distinct file name (opened once); nullptr => stderr fallback.
-void PernodeWrite(const char* fname, const std::vector<std::string>& lines) {
-  static std::mutex mu;
-  static std::map<std::string, FILE*> sinks;
-  std::lock_guard<std::mutex> lk(mu);
-  auto it = sinks.find(fname);
-  FILE* sink;
-  if (it != sinks.end()) {
-    sink = it->second;
-  } else {
-    sink = nullptr;
-    const char* dir = std::getenv("DFKV_ACCESS_DIR");
-    if (dir && *dir) {
-      const std::string path =
-          std::string(dir) + "/" + fname + "." + PernodeSuffix();
-      sink = std::fopen(path.c_str(), "a");
-      if (!sink)
-        DFKV_LOG_WARN("pernode: cannot open " + path + "; using stderr");
-    }
-    sinks[fname] = sink;
+// File I/O is confined to this worker. Producers only move an already-formatted
+// batch into a bounded queue and notify it. Rotation keeps exactly current +
+// ".1" per operation file, so both memory and disk file count are bounded.
+class PernodeSink {
+ public:
+  static PernodeSink& Instance() {
+    static PernodeSink sink;
+    return sink;
   }
-  if (sink) {
+
+  void Enqueue(const char* fname, std::vector<std::string> lines) {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (queue_.size() >= capacity_) {
+        ++dropped_total_;
+        ++dropped_pending_;
+        return;
+      }
+      queue_.push_back({fname, std::move(lines)});
+      high_water_ = std::max(high_water_, queue_.size());
+    }
+    cv_.notify_one();
+  }
+
+  void DrainForTest() {
+    std::unique_lock<std::mutex> lock(mu_);
+    flush_requested_ = true;
+    cv_.notify_one();
+    drained_.wait(lock, [&] {
+      return queue_.empty() && !writing_ && !flush_requested_;
+    });
+  }
+
+  size_t capacity() const { return capacity_; }
+  size_t high_water() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return high_water_;
+  }
+  uint64_t dropped() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return dropped_total_;
+  }
+
+  uint64_t pending_dropped() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return dropped_pending_;
+  }
+  void PauseForTest(bool paused) {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      paused_for_test_ = paused;
+    }
+    if (!paused) cv_.notify_one();
+  }
+
+ private:
+  struct Batch {
+    std::string fname;
+    std::vector<std::string> lines;
+    uint64_t dropped_before = 0;
+  };
+  struct FileState {
+    FILE* file = nullptr;
+    std::string path;
+    uint64_t bytes = 0;
+  };
+
+  PernodeSink()
+      : capacity_(std::min<size_t>(
+            EnvSize("DFKV_CLIENT_PERNODE_QUEUE_CAPACITY", 256), 65536)),
+        rotate_bytes_(EnvSize("DFKV_CLIENT_PERNODE_ROTATE_BYTES", 64u << 20)),
+        worker_([this] { Run(); }) {}
+
+  ~PernodeSink() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      stopping_ = true;
+    }
+    cv_.notify_one();
+    worker_.join();
+  }
+
+  FileState& Open(const std::string& fname) {
+    FileState& state = files_[fname];
+    if (state.file || !state.path.empty()) return state;
+    const char* dir = std::getenv("DFKV_ACCESS_DIR");
+    if (!dir || !*dir) return state;
+    state.path = std::string(dir) + "/" + fname + "." + PernodeSuffix();
+    state.file = std::fopen(state.path.c_str(), "a");
+    if (!state.file) {
+      DFKV_LOG_WARN("pernode: cannot open " + state.path + "; using stderr");
+      return state;
+    }
+    if (std::fseek(state.file, 0, SEEK_END) == 0) {
+      const long offset = std::ftell(state.file);
+      if (offset > 0) state.bytes = static_cast<uint64_t>(offset);
+    }
+    return state;
+  }
+
+  void Rotate(FileState& state) {
+    if (state.file) std::fclose(state.file);
+    state.file = nullptr;
+    const std::string previous = state.path + ".1";
+    std::remove(previous.c_str());
+    if (std::rename(state.path.c_str(), previous.c_str()) != 0)
+      DFKV_LOG_WARN("pernode: cannot rotate " + state.path);
+    state.file = std::fopen(state.path.c_str(), "w");
+    state.bytes = 0;
+    if (!state.file)
+      DFKV_LOG_WARN("pernode: cannot reopen " + state.path + "; using stderr");
+  }
+
+  void Write(Batch batch) {
     char ts[32];
-    std::time_t tt = std::time(nullptr);
+    const std::time_t tt = std::time(nullptr);
     std::tm tm{};
     localtime_r(&tt, &tm);
     std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm);
-    for (const auto& ln : lines) std::fprintf(sink, "%s %s\n", ts, ln.c_str());
-    std::fflush(sink);
-  } else {
-    for (const auto& ln : lines) DFKV_LOG_INFO(ln);
+    const std::string drop_line =
+        batch.dropped_before == 0
+            ? std::string()
+            : "pernode-sink DROPPED: dropped_batches=" +
+                  std::to_string(batch.dropped_before);
+    uint64_t batch_bytes = 0;
+    if (!drop_line.empty())
+      batch_bytes += std::strlen(ts) + 1 + drop_line.size() + 1;
+    for (const std::string& line : batch.lines)
+      batch_bytes += std::strlen(ts) + 1 + line.size() + 1;
+
+    FileState& state = Open(batch.fname);
+    if (state.file && state.bytes > 0 &&
+        batch_bytes > rotate_bytes_ - std::min(rotate_bytes_, state.bytes))
+      Rotate(state);
+    if (state.file) {
+      if (!drop_line.empty())
+        std::fprintf(state.file, "%s %s\n", ts, drop_line.c_str());
+      for (const std::string& line : batch.lines)
+        std::fprintf(state.file, "%s %s\n", ts, line.c_str());
+      state.bytes += batch_bytes;
+    } else {
+      if (!drop_line.empty()) DFKV_LOG_INFO(drop_line);
+      for (const std::string& line : batch.lines) DFKV_LOG_INFO(line);
+    }
   }
+
+  void Run() {
+    NameThisThread("dfkv-pernode");
+    for (;;) {
+      Batch batch;
+      bool flush = false;
+      uint64_t reported_drops = 0;
+      {
+        std::unique_lock<std::mutex> lock(mu_);
+        cv_.wait(lock, [&] {
+          return stopping_ || flush_requested_ ||
+                 (!paused_for_test_ && !queue_.empty());
+        });
+        if (queue_.empty()) {
+          if (flush_requested_) {
+            flush = true;
+            writing_ = true;
+          } else if (stopping_) {
+            break;
+          } else {
+            continue;
+          }
+        } else {
+          batch = std::move(queue_.front());
+          queue_.pop_front();
+          batch.dropped_before = dropped_pending_;
+          reported_drops = batch.dropped_before;
+          writing_ = true;
+        }
+      }
+      if (flush) {
+        for (auto& entry : files_)
+          if (entry.second.file) std::fflush(entry.second.file);
+      } else {
+        Write(std::move(batch));
+      }
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!flush && reported_drops != 0)
+          dropped_pending_ -= std::min(dropped_pending_, reported_drops);
+        writing_ = false;
+        if (flush) flush_requested_ = false;
+        if (queue_.empty() && !flush_requested_) drained_.notify_all();
+      }
+    }
+    // The writer owns every FILE* through final flush/close; producer and
+    // teardown threads only signal and join, never perform sink file I/O.
+    for (auto& entry : files_) {
+      if (entry.second.file) {
+        std::fclose(entry.second.file);
+        entry.second.file = nullptr;
+      }
+    }
+  }
+
+  const size_t capacity_;
+  const uint64_t rotate_bytes_;
+  mutable std::mutex mu_;
+  std::condition_variable cv_;
+  std::condition_variable drained_;
+  std::deque<Batch> queue_;
+  std::map<std::string, FileState> files_;
+  bool writing_ = false;
+  bool stopping_ = false;
+  bool flush_requested_ = false;
+  bool paused_for_test_ = false;
+  size_t high_water_ = 0;
+  uint64_t dropped_total_ = 0;
+  uint64_t dropped_pending_ = 0;
+  std::thread worker_;
+};
+
+void PernodeWrite(const char* fname, std::vector<std::string> lines) {
+  PernodeSink::Instance().Enqueue(fname, std::move(lines));
 }
 
-// op: 0=get, 1=put, 2=exist. Sort slowest first, emit one TOTAL + per-node line.
+// op: 0=get, 1=put, 2=exist. issued_keys counts transport items only.
+// Non-issued routing/health failures remain logical failures and carry their
+// reason/status separately instead of being misreported as transport attempts.
 void EmitPernode(int op, const char* label, const char* fname,
                  const std::map<std::string, PernodeStat>& per,
                  const std::map<std::string, std::string>& addr2name,
-                 uint64_t total_wall_us, uint64_t N, uint64_t preroute_fail) {
+                 uint64_t total_wall_us, uint64_t logical_keys,
+                 uint64_t logical_hits, const PernodeStat& unrouted) {
   std::vector<const std::pair<const std::string, PernodeStat>*> rows;
   rows.reserve(per.size());
   for (const auto& it : per) rows.push_back(&it);
-  for (size_t i = 0; i + 1 < rows.size(); ++i) {  // selection sort (few nodes)
-    size_t mx = i;
-    for (size_t j = i + 1; j < rows.size(); ++j)
-      if (rows[j]->second.wall_us > rows[mx]->second.wall_us) mx = j;
-    if (mx != i) { auto* t = rows[i]; rows[i] = rows[mx]; rows[mx] = t; }
-  }
-  uint64_t tk = 0, tb = 0, th = 0, tf = 0,
-           tmin = std::numeric_limits<uint64_t>::max(), tmax = 0;
-  for (auto* r : rows) {
-    const PernodeStat& a = r->second;
-    tk += a.keys; tb += a.bytes; th += a.hit; tf += a.fail;
-    if (a.max_b > 0) {
-      if (a.min_b < tmin) tmin = a.min_b;
-      if (a.max_b > tmax) tmax = a.max_b;
+  std::sort(rows.begin(), rows.end(), [](const auto* left, const auto* right) {
+    return left->second.wall_us > right->second.wall_us;
+  });
+  uint64_t issued = 0, bytes = 0, hits = 0, failed = 0;
+  uint64_t min_b = std::numeric_limits<uint64_t>::max(), max_b = 0;
+  uint32_t issued_status_mask = 0, issued_fail_status_mask = 0;
+  PernodeStat nonissued = unrouted;
+  for (const auto* row : rows) {
+    const PernodeStat& stat = row->second;
+    issued += stat.issued_keys;
+    bytes += stat.bytes;
+    hits += stat.hit;
+    failed += stat.fail;
+    issued_status_mask |= stat.status_mask;
+    issued_fail_status_mask |= stat.fail_status_mask;
+    MergePernodeNonIssued(&nonissued, stat);
+    if (stat.max_b > 0) {
+      min_b = std::min(min_b, stat.min_b);
+      max_b = std::max(max_b, stat.max_b);
     }
   }
-  if (tmax == 0) tmin = 0;
+  if (max_b == 0) min_b = 0;
 
   std::vector<std::string> lines;
   lines.reserve(rows.size() + 1);
-  {
-    const uint64_t mbps10 =
-        total_wall_us ? (tb * 10 + total_wall_us / 2) / total_wall_us : 0;
-    const uint64_t avgv = tk ? (tb + tk / 2) / tk : 0;
-    std::string s = std::string("pernode-") + label + " TOTAL: " + label +
-                    "_ms=" + PernodeFmt1((total_wall_us + 50) / 100) +
-                    " keys=" + std::to_string(N) +
-                    " servers=" + std::to_string(rows.size()) +
-                    " bytes=" + std::to_string(tb) +
-                    " avg_bytes/key=" + std::to_string(avgv) +
-                    " min_bytes=" + std::to_string(tmin) +
-                    " max_bytes=" + std::to_string(tmax) +
-                    " MB/s=" + PernodeFmt1(mbps10);
-    if (op == 0) s += " hit=" + std::to_string(th);
-    else if (op == 2) s += " absent=" + std::to_string(tk - th);
-    else s += " fail_keys=" + std::to_string(tf + preroute_fail) +
-              " preroute_fail=" + std::to_string(preroute_fail);
-    lines.push_back(std::move(s));
+  const uint64_t mbps10 =
+      total_wall_us ? (bytes * 10 + total_wall_us / 2) / total_wall_us : 0;
+  const uint64_t avg_value = hits ? (bytes + hits / 2) / hits : 0;
+  const uint32_t logical_failure_status_mask =
+      issued_fail_status_mask | nonissued.nonissued_status_mask;
+  std::string total =
+      std::string("pernode-") + label + " TOTAL: " + label +
+      "_ms=" + PernodeFmt1((total_wall_us + 50) / 100) +
+      " logical_keys=" + std::to_string(logical_keys) +
+      " issued_keys=" + std::to_string(issued) +
+      " nonissued_failures=" + std::to_string(nonissued.nonissued_fail) +
+      " servers=" + std::to_string(rows.size()) +
+      " bytes=" + std::to_string(bytes) +
+      " avg_success_bytes=" + std::to_string(avg_value) +
+      " min_bytes=" + std::to_string(min_b) +
+      " max_bytes=" + std::to_string(max_b) +
+      " MB/s=" + PernodeFmt1(mbps10) +
+      " failed_issued_keys=" + std::to_string(failed) +
+      " status_mask=" + std::to_string(issued_status_mask) +
+      " statuses=" + PernodeStatusList(issued_status_mask) +
+      " failure_status_mask=" + std::to_string(issued_fail_status_mask) +
+      " logical_failure_status_mask=" +
+      std::to_string(logical_failure_status_mask) +
+      " nonissued_status_mask=" +
+      std::to_string(nonissued.nonissued_status_mask) +
+      " nonissued_statuses=" +
+      PernodeStatusList(nonissued.nonissued_status_mask) +
+      " invalid_input=" + std::to_string(nonissued.invalid_input) +
+      " no_route=" + std::to_string(nonissued.no_route) +
+      " health_cooldown=" + std::to_string(nonissued.health_cooldown) +
+      " nonissued_reasons=" + PernodeNonIssuedReasons(nonissued);
+  if (op == 0)
+    total += " logical_hits=" + std::to_string(logical_hits) +
+             " logical_not_hit=" +
+             std::to_string(logical_keys - logical_hits) +
+             " missed_issued_keys=" +
+             std::to_string(issued - hits - failed);
+  else if (op == 2)
+    total += " logical_present=" + std::to_string(logical_hits) +
+             " logical_not_present=" +
+             std::to_string(logical_keys - logical_hits) +
+             " absent_issued_keys=" +
+             std::to_string(issued - hits - failed);
+  else
+    total += " logical_success=" + std::to_string(logical_hits) +
+             " logical_fail=" +
+             std::to_string(logical_keys - logical_hits) +
+             " successful_issued_keys=" + std::to_string(hits) +
+             " preroute_fail=" +
+             std::to_string(nonissued.invalid_input + nonissued.no_route);
+  if (nonissued.nonissued_fail > 0)
+    total += " first_nonissued_fail=" + nonissued.first_fail;
+  lines.push_back(std::move(total));
+
+  for (const auto* row : rows) {
+    const PernodeStat& stat = row->second;
+    const uint64_t node_mbps10 =
+        stat.wall_us
+            ? (stat.bytes * 10 + stat.wall_us / 2) / stat.wall_us
+            : 0;
+    const uint64_t avg_value =
+        stat.hit ? (stat.bytes + stat.hit / 2) / stat.hit : 0;
+    const uint64_t us_per_key =
+        stat.issued_keys
+            ? (stat.busy_us + stat.issued_keys / 2) / stat.issued_keys
+            : 0;
+    const uint64_t node_min = stat.max_b ? stat.min_b : 0;
+    auto name = addr2name.find(row->first);
+    const uint32_t node_logical_failure_status_mask =
+        stat.fail_status_mask | stat.nonissued_status_mask;
+    std::string line =
+        std::string("pernode-") + label + ": node=" + row->first +
+        (name != addr2name.end() ? (" name=" + name->second) : std::string()) +
+        (stat.dev.empty() ? std::string() : (" dev=" + stat.dev)) +
+        " issued_keys=" + std::to_string(stat.issued_keys) +
+        " nonissued_failures=" + std::to_string(stat.nonissued_fail) +
+        " bytes=" + std::to_string(stat.bytes) +
+        " avg_success_bytes=" + std::to_string(avg_value) +
+        " min_bytes=" + std::to_string(node_min) +
+        " max_bytes=" + std::to_string(stat.max_b) +
+        " shards=" + std::to_string(stat.shards) +
+        " wall_us=" + std::to_string(stat.wall_us) +
+        " MB/s=" + PernodeFmt1(node_mbps10) +
+        " avg_us/issued_key=" + std::to_string(us_per_key) +
+        " failed_issued_keys=" + std::to_string(stat.fail) +
+        " status_mask=" + std::to_string(stat.status_mask) +
+        " statuses=" + PernodeStatusList(stat.status_mask) +
+        " failure_status_mask=" +
+        std::to_string(stat.fail_status_mask) +
+        " logical_failure_status_mask=" +
+        std::to_string(node_logical_failure_status_mask) +
+        " nonissued_status_mask=" +
+        std::to_string(stat.nonissued_status_mask) +
+        " nonissued_statuses=" +
+        PernodeStatusList(stat.nonissued_status_mask) +
+        " invalid_input=" + std::to_string(stat.invalid_input) +
+        " no_route=" + std::to_string(stat.no_route) +
+        " health_cooldown=" + std::to_string(stat.health_cooldown) +
+        " nonissued_reasons=" + PernodeNonIssuedReasons(stat);
+    if (op == 0)
+      line += " hit_issued_keys=" + std::to_string(stat.hit) +
+              " missed_issued_keys=" +
+              std::to_string(stat.issued_keys - stat.hit - stat.fail);
+    else if (op == 2)
+      line += " present_issued_keys=" + std::to_string(stat.hit) +
+              " absent_issued_keys=" +
+              std::to_string(stat.issued_keys - stat.hit - stat.fail);
+    else
+      line += " successful_issued_keys=" + std::to_string(stat.hit);
+    if (stat.fail > 0 || stat.nonissued_fail > 0)
+      line += " first_fail=" + stat.first_fail;
+    lines.push_back(std::move(line));
   }
-  for (auto* r : rows) {
-    const PernodeStat& a = r->second;
-    const uint64_t mbps10 =
-        a.wall_us ? (a.bytes * 10 + a.wall_us / 2) / a.wall_us : 0;
-    const uint64_t avgv = a.keys ? (a.bytes + a.keys / 2) / a.keys : 0;
-    const uint64_t us_per_key = a.keys ? (a.busy_us + a.keys / 2) / a.keys : 0;
-    const uint64_t nmin = a.max_b ? a.min_b : 0;
-    auto nit = addr2name.find(r->first);
-    std::string s = std::string("pernode-") + label + ": node=" + r->first +
-        (nit != addr2name.end() ? (" name=" + nit->second) : std::string()) +
-        (a.dev.empty() ? std::string() : (" dev=" + a.dev)) +
-        " keys=" + std::to_string(a.keys) +
-        " bytes=" + std::to_string(a.bytes) +
-        " avg_bytes/key=" + std::to_string(avgv) +
-        " min_bytes=" + std::to_string(nmin) +
-        " max_bytes=" + std::to_string(a.max_b) +
-        " shards=" + std::to_string(a.shards) +
-        " wall_us=" + std::to_string(a.wall_us) +
-        " MB/s=" + PernodeFmt1(mbps10) +
-        " avg_us/key=" + std::to_string(us_per_key);
-    if (op == 0) s += " hit=" + std::to_string(a.hit);
-    else if (op == 2) s += " absent=" + std::to_string(a.keys - a.hit);
-    if (a.fail > 0) {  // error info only when this node had failures
-      std::string codes;
-      for (int b = 0; b < 6; ++b)
-        if (a.fail_mask & (1u << b)) {
-          if (!codes.empty()) codes += ",";
-          codes += PernodeStatusName(static_cast<Status>(b));
-        }
-      s += " FAIL keys=" + std::to_string(a.fail) + " codes=" + codes +
-           " first_fail=" + a.first_fail;
-    }
-    lines.push_back(std::move(s));
-  }
-  PernodeWrite(fname, lines);
+  PernodeWrite(fname, std::move(lines));
 }
 
 }  // namespace
+namespace testing {
+void DrainPernodeSink() { PernodeSink::Instance().DrainForTest(); }
+size_t PernodeQueueCapacity() { return PernodeSink::Instance().capacity(); }
+size_t PernodeQueueHighWater() { return PernodeSink::Instance().high_water(); }
+uint64_t PernodeQueueDropped() { return PernodeSink::Instance().dropped(); }
+uint64_t PernodeQueuePendingDropped() {
+  return PernodeSink::Instance().pending_dropped();
+}
+void PausePernodeSink(bool paused) {
+  PernodeSink::Instance().PauseForTest(paused);
+}
+void EnqueuePernodeForTest(const char* fname,
+                           std::vector<std::string> lines) {
+  PernodeSink::Instance().Enqueue(fname, std::move(lines));
+}
+std::string PernodeKeyFingerprintForTest(const std::string& key) {
+  return PernodeKeyFp(key);
+}
+}  // namespace testing
+
 
 std::vector<bool> KVClient::BatchExistDirect(
     const std::vector<std::string>& keys, std::vector<Status>* statuses) {
@@ -1413,7 +1826,8 @@ std::vector<bool> KVClient::BatchExistDirect(
   std::vector<char> e(N, 0);
   std::vector<Status> raw(N, Status::kInvalid);
   const bool pernode_on = PernodeOn();
-  const auto call_t0 = std::chrono::steady_clock::now();  // whole-call wall (stats)
+  std::chrono::steady_clock::time_point call_t0;
+  if (pernode_on) call_t0 = std::chrono::steady_clock::now();
   if (!t_->pipelined()) {  // TCP: parallelize across items with our own threads
     RunParallel(N, BatchWorkers(N), [&](size_t i) {
       e[i] = ExistDirect(keys[i], &raw[i]) ? 1 : 0;
@@ -1425,10 +1839,17 @@ std::vector<bool> KVClient::BatchExistDirect(
   // served key-by-key on one QP; a single-node ring would otherwise serialize
   // thousands of scheduler probes before any KV load can start. Keep original
   // indices in every shard so result ordering is unchanged.
+  std::unique_ptr<PernodeStat> unrouted;
+  if (pernode_on) unrouted = std::make_unique<PernodeStat>();
   std::map<std::string, std::vector<size_t>> by_node;
   for (size_t i = 0; i < N; ++i) {
     std::string node = Route(keys[i]);
-    if (node.empty()) continue;
+    if (node.empty()) {
+      if (pernode_on)
+        RecordPernodeNonIssued(unrouted.get(),
+                               PernodeNonIssuedReason::kNoRoute, 1, keys[i]);
+      continue;
+    }
     by_node[node].push_back(i);
   }
   std::vector<std::pair<std::string, std::vector<size_t>>> groups =
@@ -1437,15 +1858,22 @@ std::vector<bool> KVClient::BatchExistDirect(
   std::vector<PernodeStat> gstat(pernode_on ? groups.size() : 0);
   RunReadScheduled(groups.size(), [&](size_t g) {
     const std::string& node = groups[g].first;
-    uint64_t now = NowMs();
-    if (!health_.Healthy(node, now)) return;
     const std::vector<size_t>& idx = groups[g].second;
+    uint64_t now = NowMs();
+    if (!health_.Healthy(node, now)) {
+      if (pernode_on)
+        RecordPernodeNonIssued(
+            &gstat[g], PernodeNonIssuedReason::kHealthCooldown, idx.size(),
+            keys[idx.front()]);
+      return;
+    }
     std::vector<BlockKey> bkeys;
     bkeys.reserve(idx.size());
     for (size_t k : idx) bkeys.push_back(ToBlockKey(key_namespace_, keys[k]));
     std::vector<char> ex;
     std::string shard_dev;
-    const auto pn_t0 = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point pn_t0;
+    if (pernode_on) pn_t0 = std::chrono::steady_clock::now();
     std::vector<Status> sts =
         t_->ExistMany(node, bkeys, &ex, pernode_on ? &shard_dev : nullptr);
     if (pernode_on) {
@@ -1453,53 +1881,69 @@ std::vector<bool> KVClient::BatchExistDirect(
           std::chrono::duration<double, std::micro>(
               std::chrono::steady_clock::now() - pn_t0).count());
       uint64_t present = 0, failn = 0;
-      uint32_t fmask = 0;
-      std::string ff;
+      uint32_t status_mask = 0, fail_mask = 0;
+      std::string first_fail;
       for (size_t m = 0; m < idx.size(); ++m) {
-        if (m < ex.size() && ex[m]) present++;  // hit = key exists
-        const Status st = (m < sts.size()) ? sts[m] : Status::kInvalid;
-        if (st == Status::kIOError || st == Status::kInvalid) {  // probe error
-          failn++;
-          fmask |= (1u << static_cast<int>(st));
-          if (ff.empty()) ff = PernodeKeyFp(keys[idx[m]]);
+        const Status status =
+            m < sts.size() ? sts[m] : Status::kInvalid;
+        status_mask |= PernodeStatusBit(status);
+        if (status == Status::kOk) {
+          if (m < ex.size() && ex[m]) ++present;
+        } else if (status != Status::kNotFound) {
+          ++failn;
+          fail_mask |= PernodeStatusBit(status);
+          if (first_fail.empty())
+            first_fail = PernodeKeyFp(keys[idx[m]]);
         }
       }
-      gstat[g].keys = idx.size();  // bytes/min/max stay 0 (exist has no payload)
+      gstat[g].issued_keys = idx.size();
       gstat[g].busy_us = us;
       gstat[g].hit = present;
       gstat[g].fail = failn;
-      gstat[g].fail_mask = fmask;
-      gstat[g].first_fail = ff;
+      gstat[g].status_mask = status_mask;
+      gstat[g].fail_status_mask = fail_mask;
+      gstat[g].first_fail = std::move(first_fail);
       gstat[g].dev = std::move(shard_dev);
     }
     bool resp = false, ioerr = false;
     // kInvalid (oversize/per-item guard) is neither: it must not clear the
     // peer cooldown (resp) nor trip MarkBad (ioerr).
-    for (Status s : sts) {
-      if (s == Status::kIOError) ioerr = true;
-      else if (s == Status::kOk || s == Status::kNotFound) resp = true;
+    for (Status status : sts) {
+      if (status == Status::kIOError)
+        ioerr = true;
+      else if (status == Status::kOk || status == Status::kNotFound)
+        resp = true;
     }
-    if (resp) health_.MarkGood(node, NowMs()); else if (ioerr) health_.MarkBad(node, NowMs());
+    if (resp)
+      health_.MarkGood(node, NowMs());
+    else if (ioerr)
+      health_.MarkBad(node, NowMs());
     for (size_t m = 0; m < idx.size(); ++m) {
       if (m < sts.size()) raw[idx[m]] = sts[m];
-      e[idx[m]] = (m < ex.size() && ex[m]) ? 1 : 0;
+      e[idx[m]] =
+          (m < sts.size() && sts[m] == Status::kOk &&
+           m < ex.size() && ex[m])
+              ? 1
+              : 0;
     }
   });
   if (pernode_on) {
     std::map<std::string, PernodeStat> per;
     for (size_t g = 0; g < groups.size(); ++g) {
-      if (gstat[g].keys == 0) continue;  // health-skipped or empty group
+      if (gstat[g].issued_keys == 0 && gstat[g].nonissued_fail == 0) continue;
       PernodeStat& a = per[groups[g].first];
-      a.keys += gstat[g].keys;
+      a.issued_keys += gstat[g].issued_keys;
       a.busy_us += gstat[g].busy_us;
       if (gstat[g].busy_us > a.wall_us) {
         a.wall_us = gstat[g].busy_us;
-        a.dev = gstat[g].dev;  // slowest shard's rail
+        a.dev = gstat[g].dev;
       }
-      a.shards += 1;
+      if (gstat[g].issued_keys > 0) a.shards += 1;
       a.hit += gstat[g].hit;
       a.fail += gstat[g].fail;
-      a.fail_mask |= gstat[g].fail_mask;
+      a.status_mask |= gstat[g].status_mask;
+      a.fail_status_mask |= gstat[g].fail_status_mask;
+      MergePernodeNonIssued(&a, gstat[g]);
       if (a.first_fail.empty() && !gstat[g].first_fail.empty())
         a.first_fail = gstat[g].first_fail;
     }
@@ -1511,8 +1955,10 @@ std::vector<bool> KVClient::BatchExistDirect(
     const uint64_t total_wall_us = static_cast<uint64_t>(
         std::chrono::duration<double, std::micro>(
             std::chrono::steady_clock::now() - call_t0).count());
+    uint64_t logical_present = 0;
+    for (char present : e) logical_present += present != 0;
     EmitPernode(2, "exist", "dfkv_client_exist.log", per, addr2name,
-                total_wall_us, N, 0);
+                total_wall_us, N, logical_present, *unrouted);
   }
   if (statuses) *statuses = std::move(raw);
   return std::vector<bool>(e.begin(), e.end());
@@ -1592,12 +2038,25 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
   }
 
   const bool pernode_on = PernodeOn();
-  uint64_t preroute_fail = 0;  // dropped before routing (oversize guard / no route)
+  std::unique_ptr<PernodeStat> unrouted;
+  if (pernode_on) unrouted = std::make_unique<PernodeStat>();
   std::map<std::string, std::vector<size_t>> by_node;
   for (size_t i = 0; i < N; ++i) {
-    if (over[i]) { preroute_fail++; continue; }
+    if (over[i]) {
+      if (pernode_on)
+        RecordPernodeNonIssued(
+            unrouted.get(), PernodeNonIssuedReason::kInvalidInput, 1,
+            items[i].key);
+      continue;
+    }
     std::string node = Route(items[i].key);
-    if (node.empty()) { preroute_fail++; continue; }
+    if (node.empty()) {
+      if (pernode_on)
+        RecordPernodeNonIssued(unrouted.get(),
+                               PernodeNonIssuedReason::kNoRoute, 1,
+                               items[i].key);
+      continue;
+    }
     by_node[node].push_back(i);
   }
   // Shard each per-node put group the same way the read path does (shared knobs
@@ -1612,9 +2071,15 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
   std::vector<PernodeStat> gstat(pernode_on ? groups.size() : 0);
   RunParallel(groups.size(), BatchWorkers(groups.size()), [&](size_t g) {
     const std::string& node = groups[g].first;
-    uint64_t now = NowMs();
-    if (!health_.Healthy(node, now)) return;
     const std::vector<size_t>& idx = groups[g].second;
+    uint64_t now = NowMs();
+    if (!health_.Healthy(node, now)) {
+      if (pernode_on)
+        RecordPernodeNonIssued(
+            &gstat[g], PernodeNonIssuedReason::kHealthCooldown, idx.size(),
+            items[idx.front()].key);
+      return;
+    }
     std::vector<CacheSrcMulti> srcs;
     srcs.reserve(idx.size());
     for (size_t k : idx) {
@@ -1626,7 +2091,8 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
       srcs.push_back(std::move(s));
     }
     std::string shard_dev;
-    const auto pn_t0 = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point pn_t0;
+    if (pernode_on) pn_t0 = std::chrono::steady_clock::now();
     std::vector<Status> sts =
         t_->CacheFromMulti(node, srcs, pernode_on ? &shard_dev : nullptr);
     if (pernode_on) {
@@ -1635,34 +2101,40 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
               std::chrono::steady_clock::now() - pn_t0).count());
       uint64_t vb = 0, hits = 0, failn = 0,
                mn = std::numeric_limits<uint64_t>::max(), mx = 0;
-      uint32_t fmask = 0;
-      std::string ff;
-      for (size_t m = 0; m < idx.size() && m < sts.size(); ++m) {
-        if (sts[m] == Status::kOk) {
-          hits++;
-          const uint64_t b = total_bytes[idx[m]];
-          vb += b;
-          if (b < mn) mn = b;
-          if (b > mx) mx = b;
+      uint32_t status_mask = 0, fail_mask = 0;
+      std::string first_fail;
+      for (size_t m = 0; m < idx.size(); ++m) {
+        const Status status =
+            m < sts.size() ? sts[m] : Status::kInvalid;
+        status_mask |= PernodeStatusBit(status);
+        if (status == Status::kOk) {
+          ++hits;
+          const uint64_t value_bytes = total_bytes[idx[m]];
+          vb += value_bytes;
+          mn = std::min(mn, value_bytes);
+          mx = std::max(mx, value_bytes);
         } else {
-          failn++;
-          fmask |= (1u << static_cast<int>(sts[m]));
-          if (ff.empty()) ff = PernodeKeyFp(items[idx[m]].key);
+          ++failn;
+          fail_mask |= PernodeStatusBit(status);
+          if (first_fail.empty())
+            first_fail = PernodeKeyFp(items[idx[m]].key);
         }
       }
-      gstat[g].keys = idx.size();
+      gstat[g].issued_keys = idx.size();
       gstat[g].bytes = vb;
       gstat[g].busy_us = us;
       gstat[g].min_b = mn;
       gstat[g].max_b = mx;
       gstat[g].hit = hits;
       gstat[g].fail = failn;
-      gstat[g].fail_mask = fmask;
-      gstat[g].first_fail = ff;
+      gstat[g].status_mask = status_mask;
+      gstat[g].fail_status_mask = fail_mask;
+      gstat[g].first_fail = std::move(first_fail);
       gstat[g].dev = std::move(shard_dev);
     }
     for (size_t m = 0; m < idx.size(); ++m) {
-      ok[idx[m]] = (sts[m] == Status::kOk) ? 1 : 0;
+      ok[idx[m]] =
+          (m < sts.size() && sts[m] == Status::kOk) ? 1 : 0;
       if (ok[idx[m]]) InvalidateRendezvous(srcs[m].key);
     }
     bool resp = false, ioerr = false;
@@ -1677,22 +2149,24 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
   if (pernode_on) {
     std::map<std::string, PernodeStat> per;
     for (size_t g = 0; g < groups.size(); ++g) {
-      if (gstat[g].keys == 0) continue;  // health-skipped or empty group
+      if (gstat[g].issued_keys == 0 && gstat[g].nonissued_fail == 0) continue;
       PernodeStat& a = per[groups[g].first];
-      a.keys += gstat[g].keys;
+      a.issued_keys += gstat[g].issued_keys;
       a.bytes += gstat[g].bytes;
       a.busy_us += gstat[g].busy_us;
       if (gstat[g].busy_us > a.wall_us) {
         a.wall_us = gstat[g].busy_us;
-        a.dev = gstat[g].dev;  // slowest shard's rail
+        a.dev = gstat[g].dev;
       }
-      a.shards += 1;
+      if (gstat[g].issued_keys > 0) a.shards += 1;
       a.hit += gstat[g].hit;
       a.fail += gstat[g].fail;
-      a.fail_mask |= gstat[g].fail_mask;
+      a.status_mask |= gstat[g].status_mask;
+      a.fail_status_mask |= gstat[g].fail_status_mask;
+      MergePernodeNonIssued(&a, gstat[g]);
       if (gstat[g].max_b > 0) {
-        if (gstat[g].min_b < a.min_b) a.min_b = gstat[g].min_b;
-        if (gstat[g].max_b > a.max_b) a.max_b = gstat[g].max_b;
+        a.min_b = std::min(a.min_b, gstat[g].min_b);
+        a.max_b = std::max(a.max_b, gstat[g].max_b);
       }
       if (a.first_fail.empty() && !gstat[g].first_fail.empty())
         a.first_fail = gstat[g].first_fail;
@@ -1705,8 +2179,10 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
     const uint64_t total_wall_us = static_cast<uint64_t>(
         std::chrono::duration<double, std::micro>(
             std::chrono::steady_clock::now() - t0).count());
+    uint64_t logical_success = 0;
+    for (char success : ok) logical_success += success != 0;
     EmitPernode(1, "put", "dfkv_client_put.log", per, addr2name,
-                total_wall_us, N, preroute_fail);
+                total_wall_us, N, logical_success, *unrouted);
   }
   uint64_t bytes = 0;
   for (size_t i = 0; i < N; ++i)
@@ -1900,8 +2376,14 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
   // so it approximates the node's wall time, the honest basis for MB/s (summing
   // parallel shard time would understate throughput).
   const bool pernode_on = PernodeOn();
-  std::map<std::string, PernodeStat> pernode;
-  const auto call_t0 = std::chrono::steady_clock::now();  // whole-call wall (stats)
+  std::unique_ptr<std::map<std::string, PernodeStat>> pernode;
+  std::unique_ptr<std::vector<char>> nonissued_recorded;
+  std::chrono::steady_clock::time_point call_t0;
+  if (pernode_on) {
+    pernode = std::make_unique<std::map<std::string, PernodeStat>>();
+    nonissued_recorded = std::make_unique<std::vector<char>>(N, 0);
+    call_t0 = std::chrono::steady_clock::now();
+  }
 
   // Validate shape and aggregate capacity; the transport windows arbitrary
   // descriptor counts internally.
@@ -1913,15 +2395,31 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
         !CheckedSizeSum(items[i].caps, &total_caps[i]))
       over[i] = 1;
   }
+  std::unique_ptr<PernodeStat> unrouted;
+  if (pernode_on) unrouted = std::make_unique<PernodeStat>();
 
   // Group by (node, total_cap): a group shares the Range length (= sum of caps)
   // so the existing RangeInto windowing/pipelining applies unchanged.
   auto run_pass = [&](const std::vector<size_t>& todo) {
     std::map<std::pair<std::string, size_t>, std::vector<size_t>> by;
     for (size_t i : todo) {
-      if (over[i]) continue;
+      if (over[i]) {
+        if (pernode_on)
+          RecordPernodeNonIssued(
+              unrouted.get(), PernodeNonIssuedReason::kInvalidInput, 1,
+              items[i].key);
+        continue;
+      }
       std::string node = Route(items[i].key);
-      if (node.empty()) continue;
+      if (node.empty()) {
+        if (pernode_on && !(*nonissued_recorded)[i]) {
+          RecordPernodeNonIssued(
+              unrouted.get(), PernodeNonIssuedReason::kNoRoute, 1,
+              items[i].key);
+          (*nonissued_recorded)[i] = 1;
+        }
+        continue;
+      }
       by[{node, total_caps[i]}].push_back(i);
     }
     std::vector<std::pair<std::pair<std::string, size_t>,
@@ -1932,9 +2430,25 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
     std::vector<PernodeStat> gstat(pernode_on ? groups.size() : 0);
     RunReadScheduled(groups.size(), [&](size_t g) {
       const std::string& node = groups[g].first.first;
-      uint64_t now = NowMs();
-      if (!health_.Healthy(node, now)) return;
       const std::vector<size_t>& idx = groups[g].second;
+      uint64_t now = NowMs();
+      if (!health_.Healthy(node, now)) {
+        if (pernode_on) {
+          size_t fresh = 0;
+          size_t first_fresh = 0;
+          for (size_t item_index : idx) {
+            if ((*nonissued_recorded)[item_index]) continue;
+            if (fresh == 0) first_fresh = item_index;
+            (*nonissued_recorded)[item_index] = 1;
+            ++fresh;
+          }
+          if (fresh != 0)
+            RecordPernodeNonIssued(
+                &gstat[g], PernodeNonIssuedReason::kHealthCooldown, fresh,
+                items[first_fresh].key);
+        }
+        return;
+      }
       std::vector<BlockKey> keys;
       std::vector<RangeDstMulti> dsts;
       keys.reserve(idx.size());
@@ -1951,28 +2465,48 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
       }
       std::vector<size_t> value_lens;
       std::string shard_dev;
-      const auto pn_t0 = std::chrono::steady_clock::now();
+      std::chrono::steady_clock::time_point pn_t0;
+      if (pernode_on) pn_t0 = std::chrono::steady_clock::now();
       std::vector<Status> sts = t_->RangeIntoMulti(
           node, keys, dsts, &value_lens, pernode_on ? &shard_dev : nullptr);
       if (pernode_on) {
         const uint64_t us = static_cast<uint64_t>(
             std::chrono::duration<double, std::micro>(
                 std::chrono::steady_clock::now() - pn_t0).count());
-        uint64_t vb = 0, hits = 0, mn = std::numeric_limits<uint64_t>::max(), mx = 0;
-        for (size_t v = 0; v < value_lens.size() && v < sts.size(); ++v)
-          if (sts[v] == Status::kOk) {
-            hits++;
-            const uint64_t b = value_lens[v];
-            vb += b;
-            if (b < mn) mn = b;
-            if (b > mx) mx = b;
+        uint64_t vb = 0, hits = 0, failn = 0,
+                 mn = std::numeric_limits<uint64_t>::max(), mx = 0;
+        uint32_t status_mask = 0, fail_mask = 0;
+        std::string first_fail;
+        const size_t cap = groups[g].first.second;
+        for (size_t m = 0; m < idx.size(); ++m) {
+          Status status = m < sts.size() ? sts[m] : Status::kInvalid;
+          if (status == Status::kOk &&
+              (m >= value_lens.size() || value_lens[m] > cap))
+            status = Status::kInvalid;
+          status_mask |= PernodeStatusBit(status);
+          if (status == Status::kOk) {
+            ++hits;
+            const uint64_t value_bytes = value_lens[m];
+            vb += value_bytes;
+            mn = std::min(mn, value_bytes);
+            mx = std::max(mx, value_bytes);
+          } else if (status != Status::kNotFound) {
+            ++failn;
+            fail_mask |= PernodeStatusBit(status);
+            if (first_fail.empty())
+              first_fail = PernodeKeyFp(items[idx[m]].key);
           }
-        gstat[g].keys = idx.size();
+        }
+        gstat[g].issued_keys = idx.size();
         gstat[g].bytes = vb;
         gstat[g].busy_us = us;
-        gstat[g].min_b = mn;  // UINT64_MAX if this shard had no kOk key
+        gstat[g].min_b = mn;
         gstat[g].max_b = mx;
         gstat[g].hit = hits;
+        gstat[g].fail = failn;
+        gstat[g].status_mask = status_mask;
+        gstat[g].fail_status_mask = fail_mask;
+        gstat[g].first_fail = std::move(first_fail);
         gstat[g].dev = std::move(shard_dev);
       }
       bool resp = false, ioerr = false;
@@ -1985,31 +2519,37 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
       if (resp) health_.MarkGood(node, NowMs());
       else if (ioerr) health_.MarkBad(node, NowMs());
       for (size_t m = 0; m < idx.size(); ++m) {
-        size_t cap = groups[g].first.second;
-        if (sts[m] != Status::kOk || m >= value_lens.size() ||
-            value_lens[m] > cap)
+        const size_t cap = groups[g].first.second;
+        if (m >= sts.size() || sts[m] != Status::kOk ||
+            m >= value_lens.size() || value_lens[m] > cap)
           continue;
-        lens[idx[m]] = static_cast<size_t>(value_lens[m]);
+        lens[idx[m]] = value_lens[m];
         hit[idx[m]] = 1;
       }
     });
     if (pernode_on) {
       for (size_t g = 0; g < groups.size(); ++g) {
-        if (gstat[g].keys == 0) continue;  // health-skipped or empty group
-        PernodeStat& a = pernode[groups[g].first.first];
-        a.keys += gstat[g].keys;
+        if (gstat[g].issued_keys == 0 && gstat[g].nonissued_fail == 0) continue;
+        PernodeStat& a = (*pernode)[groups[g].first.first];
+        a.issued_keys += gstat[g].issued_keys;
         a.bytes += gstat[g].bytes;
         a.busy_us += gstat[g].busy_us;
         if (gstat[g].busy_us > a.wall_us) {
           a.wall_us = gstat[g].busy_us;
-          a.dev = gstat[g].dev;  // slowest shard's rail
+          a.dev = gstat[g].dev;
         }
-        a.shards += 1;
+        if (gstat[g].issued_keys > 0) a.shards += 1;
         a.hit += gstat[g].hit;
-        if (gstat[g].max_b > 0) {  // shard had >=1 successful key
-          if (gstat[g].min_b < a.min_b) a.min_b = gstat[g].min_b;
-          if (gstat[g].max_b > a.max_b) a.max_b = gstat[g].max_b;
+        a.fail += gstat[g].fail;
+        a.status_mask |= gstat[g].status_mask;
+        a.fail_status_mask |= gstat[g].fail_status_mask;
+        MergePernodeNonIssued(&a, gstat[g]);
+        if (gstat[g].max_b > 0) {
+          a.min_b = std::min(a.min_b, gstat[g].min_b);
+          a.max_b = std::max(a.max_b, gstat[g].max_b);
         }
+        if (a.first_fail.empty() && !gstat[g].first_fail.empty())
+          a.first_fail = gstat[g].first_fail;
       }
     }
   };
@@ -2036,8 +2576,10 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
       std::lock_guard<std::mutex> lk(ring_mu_);
       for (const auto& kv : addr_) addr2name[kv.second] = kv.first;
     }
-    EmitPernode(0, "get", "dfkv_client_get.log", pernode, addr2name,
-                total_wall_us, N, 0);
+    uint64_t logical_hits = 0;
+    for (char found : hit) logical_hits += found != 0;
+    EmitPernode(0, "get", "dfkv_client_get.log", *pernode, addr2name,
+                total_wall_us, N, logical_hits, *unrouted);
   }
   if (out_lens) *out_lens = std::move(lens);
   return std::vector<bool>(hit.begin(), hit.end());
