@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <deque>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -428,12 +429,12 @@ int ServerIdleMs() {
 }
 
 #ifdef DFKV_WITH_URING
-// io_uring async-GET ring depth. Defaults to the pipeline depth K so each in-
-// flight request can have one read outstanding; can be raised independently to
-// expose more disk queue depth without growing the RDMA pipeline. Clamped to
-// [1, 256] and to >= K by the caller.
-size_t UringDepth(size_t k) {
-  size_t out = k;  // one outstanding read per in-flight request by default
+// Per-connection disk queue depth. It is independent of negotiated RDMA depth:
+// requests beyond this bound remain prepared but unsubmitted until a CQE frees
+// capacity. Sixteen is enough to expose the SSD queue on the measured hosts;
+// operators may select 32 (or another [1, 256] value) independently.
+size_t UringDepth() {
+  size_t out = 16;
   const char* e = std::getenv("DFKV_SERVER_URING_DEPTH");
   if (e && *e) {
     long v = std::strtol(e, nullptr, 10);
@@ -451,12 +452,11 @@ size_t RdmaServer::PipelineDepth() const { return ServerDepth(); }
 bool RdmaServer::UseUringPath() const {
 #ifdef DFKV_WITH_URING
   if (!prepare_read_handler_) return false;
-  // Phase 10: default ON when built with io_uring. The batch-read path submits
-  // a whole completion batch's GET disk reads at QD>1 and replies in arrival
-  // order; phase-6 measured it NEUTRAL for the many-connection case (thread/
-  // window parallelism already saturates the disk) and phase-10 measured +6%
-  // on the single/few-connection deep-pipeline read-back the L3 hot path hits.
-  // Non-negative across cases, with a sync fallback on any ring/batch failure.
+  // Default ON when built with io_uring. The split submit/reap pipeline keeps
+  // bounded disk reads outstanding while continuing to service verbs CQEs, and
+  // serializes only reply emission. Ring initialization may fall back before
+  // the first SQE; an infrastructure error after admission drops the connection
+  // after draining rather than exposing mixed async/synchronous staging bytes.
   // DFKV_SERVER_URING=0 forces the synchronous read loop.
   const char* e = std::getenv("DFKV_SERVER_URING");
   const bool out = !(e && std::strcmp(e, "0") == 0);
@@ -1244,332 +1244,390 @@ void RdmaServer::Serve(int boot_fd) {
 
 #ifdef DFKV_WITH_URING
   // -------------------------------------------------------------------------
-  // io_uring async-GET serve loop (env-gated; correctness-preserving).
-  //
-  // Ready-microbatch model (Mooncake's uring_file batch_read adapted to dfkv's
-  // completion stream). WaitComp blocks only for the first completion, then a
-  // bounded ready-only CQ drain gathers the rest of the burst before any
-  // descriptors are prepared. SENDs, receives, and failed WCs remain in exact
-  // CQ order; eligible kRange GETs enter one disk batch and replies are emitted
-  // in that same order.
-  // The slot backing each read stays leased until the signaled status SEND
-  // completes, so neither a new PUT nor another GET can overwrite bytes still
-  // being consumed by the NIC. Anything that cannot go async falls back to
-  // build_reply for that request without reordering.
+  // Nonblocking disk pipeline. RDMA receives, disk CQEs, and SEND completions
+  // are advanced independently. Replies alone are serialized by request
+  // sequence because the client correlates them by RC SEND order.
   if (UseUringPath()) {
-    const size_t uring_depth = std::max(UringDepth(K), K);
-    // Declared before the ring so destruction order is ring first, prepared
-    // reads second. An undrained kernel read therefore cannot outlive its
-    // descriptor, slab pin, coalescer flight, or destination staging ownership.
-    std::vector<PreparedRead> ring_teardown_reads;
-    ring_teardown_reads.reserve(K);
-    UringReader ring(static_cast<unsigned>(uring_depth));
+    const size_t uring_depth = UringDepth();
+    enum class DiskState : uint8_t {
+      kNone,
+      kWaiting,
+      kInflight,
+      kComplete,
+    };
+    struct Queued {
+      uint64_t sequence = 0;
+      size_t send_slot = 0;
+      size_t recv_slot = 0;
+      size_t data_slot = 0;
+      Request request;
+      DiskState disk_state = DiskState::kNone;
+      UringReader::ReadDesc desc;
+      UringReader::Token token = UringReader::kInvalidToken;
+      long read_result = 0;
+      PreparedRead read;
+      double submit_sec = 0.0;
+      bool ready = false;
+      Reply reply;
+    };
+
+    // queue owns every PreparedRead and therefore precedes ring: reverse
+    // destruction drains/exits the ring before any descriptor owner is freed.
+    std::deque<Queued> queue;
+    std::vector<UringReader::ReadDesc> submit_descs;
+    std::vector<UringReader::Token> submit_tokens;
+    std::vector<Queued*> submit_owners;
+    UringReader::Backend* uring_backend =
+        uring_backend_factory_for_test_
+            ? uring_backend_factory_for_test_()
+            : nullptr;
+    UringReader ring(static_cast<unsigned>(uring_depth), uring_backend);
     if (!ring.ok()) {
-      // Ring init failed: fall through to the sync loop below (correctness-first)
-      // -- but say so, and count it: an operator who set DFKV_SERVER_URING=1
-      // must be able to tell "active" from "silently degraded".
+      // This is the only synchronous fallback. No async SQE or payload has been
+      // exposed, so the original loop remains safe for this connection.
       uring_init_fallbacks_.fetch_add(1, std::memory_order_relaxed);
       DFKV_LOG_WARN("io_uring ring init failed (depth=" +
                     std::to_string(uring_depth) +
                     "); this connection serves on the SYNC path");
       goto sync_serve_loop;
     }
-    {
-      // One queued reply for this completion batch, kept in strict arrival order.
-      // The client correlates replies to requests purely by SEND order on the
-      // wire (RC in-order delivery; recv slot j <-> j-th reply), so EVERY reply —
-      // sync-built or read-completed — MUST be SENT in arrival order. We therefore
-      // queue all replies first, run the io_uring read batch, then emit the whole
-      // queue in order. `read_idx>=0` means this entry's payload comes from
-      // descs[read_idx] (a deferred kRange hit); otherwise it is a fully-built
-      // synchronous Reply.
-      struct Queued {
-        size_t send_slot = 0;
-        size_t recv_slot = 0;
-        size_t data_slot = 0;
-        Request request;          // exact first-window protocol/state input
-        int read_idx = -1;       // >=0: index into descs (async read)
-        PreparedRead read;
-        double submit_sec = 0.0;
-        Reply reply;         // used when read_idx < 0
-      };
-      std::vector<UringReader::ReadDesc> descs;
-      std::vector<Queued> queue;
-      descs.reserve(K);
-      queue.reserve(K);
+    submit_descs.reserve(uring_depth);
+    submit_tokens.resize(uring_depth);
+    submit_owners.reserve(uring_depth);
 
-      while (running_ && !fail) {
-        int g = ep.WaitComp(wcs.data(), static_cast<int>(K), idle_ms);
-        if (g > 0)
-          ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
-        if (g == 0) { idle_reclaims_.fetch_add(1, std::memory_order_relaxed); break; }
-        if (g < 0) break;  // error / Stop()'s Wake()
-        // A CQ notification commonly wakes for the first WC while the rest of
-        // the client window is arriving. Snapshot those already-ready WCs now,
-        // before synchronous preparation/disk wait strands them in the CQ.
-        // PollComp is a single ibv_poll_cq: it neither blocks nor arms/consumes
-        // completion-channel notifications. K is simultaneously the negotiated
-        // receive-slot count, WC storage bound, and maximum number of first
-        // windows that can enter this batch; the ring is initialized to >= K.
-        bool drain_failed = false;
-        while (static_cast<size_t>(g) < K) {
-          const int ready = ep.PollComp(
-              wcs.data() + g, static_cast<int>(K - static_cast<size_t>(g)));
-          if (ready < 0) {
-            drain_failed = true;
-            break;
-          }
-          if (ready == 0) break;
-          g += ready;
+    uint64_t next_sequence = 0;
+    uint64_t next_emit_sequence = 0;
+    uint64_t metric_inflight = 0;
+
+    auto update_inflight_max = [&](uint64_t current) {
+      uint64_t previous =
+          uring_inflight_max_.load(std::memory_order_relaxed);
+      while (current > previous &&
+             !uring_inflight_max_.compare_exchange_weak(
+                 previous, current, std::memory_order_relaxed,
+                 std::memory_order_relaxed)) {
+      }
+    };
+
+    auto finish_disk_read = [&](Queued& qd) -> bool {
+      const bool read_ok =
+          qd.read_result >= 0 &&
+          static_cast<size_t>(qd.read_result) >=
+              qd.read.head() + qd.read.payload_len();
+      const size_t payload_len = qd.read.payload_len();
+      const size_t value_len = qd.read.value_len();
+      ibv_mr* source_mr = direct_mr(qd.data_slot);
+      bool source_uses_slot = true;
+      bool ok = read_ok;
+      if (ok && qd.read.source_registered() && payload_len != 0) {
+        source_mr = ep.RegisterUser(
+            const_cast<char*>(qd.read.data()), payload_len);
+        if (!source_mr && qd.read.Stage())
+          source_mr = direct_mr(qd.data_slot);
+        if (!source_mr) ok = false;
+        source_uses_slot = !qd.read.source_registered();
+      }
+      const char* out_data = qd.read.data();
+      const double elapsed_sec = NowSteadySec() - qd.submit_sec;
+      // Multi-window completion stays live through its final continuation SEND.
+      if (!ok || qd.request.get.window_count == 1) {
+        qd.read.Commit(ok ? Status::kOk : Status::kIOError,
+                       ok ? payload_len : 0, elapsed_sec);
+      }
+      if (!build_data_reply(
+              qd.send_slot, qd.request,
+              ok ? Status::kOk : Status::kIOError,
+              ok ? out_data : nullptr, payload_len, value_len, source_mr,
+              source_uses_slot, std::move(qd.read), elapsed_sec, &qd.reply))
+        return false;
+      qd.disk_state = DiskState::kComplete;
+      qd.ready = true;
+      return true;
+    };
+
+    auto process_wc = [&](const ibv_wc& wc) -> bool {
+      if (wc.status != IBV_WC_SUCCESS) {
+        completion_errors_.fetch_add(1, std::memory_order_relaxed);
+        rail_stats.completion_errors.fetch_add(1,
+                                                std::memory_order_relaxed);
+        return false;
+      }
+      if (wc.opcode == IBV_WC_SEND) {
+        const size_t sid = static_cast<size_t>(wc.wr_id);
+        if (sid >= K) return false;
+        // Source ownership is released only at this signaled SEND fence.
+        complete_send(sid);
+        if (release_source_on_send[sid] != kNoSlot) {
+          multi_get_source_owner[release_source_on_send[sid]] = -1;
+          release_source_on_send[sid] = kNoSlot;
         }
-        descs.clear();
-        queue.clear();
-        for (int w = 0; w < g && !fail; ++w) {
-          const ibv_wc& wc = wcs[w];
-          if (wc.status != IBV_WC_SUCCESS) {
-            completion_errors_.fetch_add(1, std::memory_order_relaxed);
-            rail_stats.completion_errors.fetch_add(1,
-                                                   std::memory_order_relaxed);
-            fail = true; break;
-          }
-          if (wc.opcode == IBV_WC_SEND) {
-            size_t sid = static_cast<size_t>(wc.wr_id);
-            // Finish any deferred read while its source slot is still owned and
-            // before reposting a receive that could overwrite completion data.
-            complete_send(sid);
-            if (sid < release_source_on_send.size() &&
-                release_source_on_send[sid] != kNoSlot) {
-              multi_get_source_owner[release_source_on_send[sid]] = -1;
-              release_source_on_send[sid] = kNoSlot;
-            }
-            if (sid < rearm_on_send.size() && rearm_on_send[sid] != kNoSlot) {
-              if (!rearm_request_recv(rearm_on_send[sid])) {
-                fail = true;
-                break;
-              }
-              rearm_on_send[sid] = kNoSlot;
-            }
-            free_send.push_back(sid);
-            continue;
-          }
-          Request request;
-          if (!decode_request(wc, &request)) { fail = true; break; }
-          completions_.fetch_add(1, std::memory_order_relaxed);
-          rail_stats.completions.fetch_add(1, std::memory_order_relaxed);
-          const size_t r = request.recv_slot;
-          const ReqFields& rq = request.fields;
-          if (free_send.empty()) { fail = true; break; }
-          size_t s = free_send.back(); free_send.pop_back();
-
-          Queued qd;
-          qd.send_slot = s;
-          qd.recv_slot = r;
-          qd.data_slot = request.data_slot;
-
-          // Defer a prepared storage read to the io_uring batch. RAM hits are
-          // already ready and retain their transaction in the queued reply
-          // until SEND completion.
-          bool deferred = false;
-          bool handled = false;
-          if (rq.op == static_cast<uint8_t>(WireOp::kRange) &&
-              request.get.window_index == 0 &&
-              direct_buffer(request.data_slot) &&
-              direct_mr(request.data_slot) &&
-              rq.length <= static_cast<uint64_t>(conn_max)) {
-            PreparedRead prepared = prepare_read_handler_(
-                rq.Key(), rq.offset, rq.length,
-                direct_buffer(request.data_slot), direct_buffer_cap);
-            if (prepared.status() == Status::kOk && prepared.needs_io() &&
-                prepared.fd() >= 0 && prepared.payload_len() != 0 &&
-                prepared.aligned_len() <= direct_buffer_cap &&
-                prepared.aligned_len() <=
-                    std::numeric_limits<unsigned>::max()) {
-              UringReader::ReadDesc d;
-              d.fd = prepared.fd();
-              d.buf = prepared.staging();
-              d.len = static_cast<unsigned>(prepared.aligned_len());
-              d.off = prepared.aligned_off();
-              qd.read_idx = static_cast<int>(descs.size());
-              descs.push_back(d);
-              qd.read = std::move(prepared);
-              qd.request = std::move(request);
-              qd.submit_sec = NowSteadySec();
-              deferred = true;
-              handled = true;
-            } else if (prepared.status() == Status::kOk &&
-                       !prepared.needs_io()) {
-              const size_t payload_len = prepared.payload_len();
-              ibv_mr* source_mr = direct_mr(request.data_slot);
-              if (prepared.source_registered() && payload_len != 0) {
-                source_mr = ep.RegisterUser(
-                    const_cast<char*>(prepared.data()), payload_len);
-                if (!source_mr && prepared.Stage())
-                  source_mr = direct_mr(request.data_slot);
-              }
-              if (!source_mr ||
-                  !build_data_reply(
-                      qd.send_slot, request, Status::kOk, prepared.data(),
-                      payload_len, prepared.value_len(), source_mr,
-                      /*source_uses_slot=*/!prepared.source_registered(),
-                      std::move(prepared), /*completion_elapsed_sec=*/0.0,
-                      &qd.reply)) {
-                fail = true;
-                break;
-              }
-              handled = true;
-            } else if (prepared.status() != Status::kOk &&
-                       prepared.status() != Status::kInvalid) {
-              if (!build_data_reply(
-                      qd.send_slot, request, prepared.status(), nullptr, 0, 0,
-                      nullptr, /*source_uses_slot=*/false, PreparedRead{},
-                      /*completion_elapsed_sec=*/0.0, &qd.reply)) {
-                fail = true;
-                break;
-              }
-              handled = true;
-            }
-          }
-
-          if (!deferred && !handled) {
-            // An existing coalescer flight or unsupported shape takes the
-            // synchronous fallback, without re-running preparation.
-            if (!build_reply(s, request, &qd.reply,
-                             /*try_prepare=*/false)) {
-              fail = true;
-              break;
-            }
-          }
-          queue.push_back(std::move(qd));
+        if (rearm_on_send[sid] != kNoSlot) {
+          if (!rearm_request_recv(rearm_on_send[sid])) return false;
+          rearm_on_send[sid] = kNoSlot;
         }
-        if (fail) break;
-        if (drain_failed) {
-          // Preserve processing order for completions obtained before the CQ
-          // poll error, but do not submit reads or replies on a failed CQ.
-          fail = true;
+        free_send.push_back(sid);
+        return true;
+      }
+
+      Request request;
+      if (!decode_request(wc, &request) || free_send.empty() ||
+          next_sequence == std::numeric_limits<uint64_t>::max())
+        return false;
+      completions_.fetch_add(1, std::memory_order_relaxed);
+      rail_stats.completions.fetch_add(1, std::memory_order_relaxed);
+
+      Queued qd;
+      qd.sequence = next_sequence++;
+      qd.send_slot = free_send.back();
+      free_send.pop_back();
+      qd.recv_slot = request.recv_slot;
+      qd.data_slot = request.data_slot;
+      const ReqFields& fields = request.fields;
+
+      bool deferred = false;
+      bool handled = false;
+      if (fields.op == static_cast<uint8_t>(WireOp::kRange) &&
+          request.get.window_index == 0 &&
+          direct_buffer(request.data_slot) &&
+          direct_mr(request.data_slot) &&
+          fields.length <= static_cast<uint64_t>(conn_max)) {
+        PreparedRead prepared = prepare_read_handler_(
+            fields.Key(), fields.offset, fields.length,
+            direct_buffer(request.data_slot), direct_buffer_cap);
+        if (prepared.status() == Status::kOk && prepared.needs_io() &&
+            prepared.fd() >= 0 && prepared.payload_len() != 0 &&
+            prepared.aligned_len() <= direct_buffer_cap &&
+            prepared.aligned_len() <=
+                std::numeric_limits<unsigned>::max()) {
+          qd.desc.fd = prepared.fd();
+          qd.desc.buf = prepared.staging();
+          qd.desc.len = static_cast<unsigned>(prepared.aligned_len());
+          qd.desc.off = prepared.aligned_off();
+          qd.disk_state = DiskState::kWaiting;
+          qd.read = std::move(prepared);
+          qd.request = std::move(request);
+          qd.submit_sec = NowSteadySec();
+          deferred = true;
+          handled = true;
+        } else if (prepared.status() == Status::kOk &&
+                   !prepared.needs_io()) {
+          const size_t payload_len = prepared.payload_len();
+          ibv_mr* source_mr = direct_mr(request.data_slot);
+          if (prepared.source_registered() && payload_len != 0) {
+            source_mr = ep.RegisterUser(
+                const_cast<char*>(prepared.data()), payload_len);
+            if (!source_mr && prepared.Stage())
+              source_mr = direct_mr(request.data_slot);
+          }
+          if (!source_mr ||
+              !build_data_reply(
+                  qd.send_slot, request, Status::kOk, prepared.data(),
+                  payload_len, prepared.value_len(), source_mr,
+                  /*source_uses_slot=*/!prepared.source_registered(),
+                  std::move(prepared), /*completion_elapsed_sec=*/0.0,
+                  &qd.reply))
+            return false;
+          handled = true;
+          qd.ready = true;
+        } else if (prepared.status() != Status::kOk &&
+                   prepared.status() != Status::kInvalid) {
+          if (!build_data_reply(
+                  qd.send_slot, request, prepared.status(), nullptr, 0, 0,
+                  nullptr, /*source_uses_slot=*/false, PreparedRead{},
+                  /*completion_elapsed_sec=*/0.0, &qd.reply))
+            return false;
+          handled = true;
+          qd.ready = true;
+        }
+      }
+      if (!deferred && !handled) {
+        // Unsupported shapes and coalescer followers retain established sync
+        // semantics, but still wait behind earlier sequence numbers to send.
+        if (!build_reply(qd.send_slot, request, &qd.reply,
+                         /*try_prepare=*/false))
+          return false;
+        qd.ready = true;
+      }
+      queue.push_back(std::move(qd));
+      return true;
+    };
+
+    auto submit_waiting = [&]() -> bool {
+      const size_t count_limit = ring.capacity();
+      if (count_limit == 0) return true;
+      submit_descs.clear();
+      submit_owners.clear();
+      for (Queued& qd : queue) {
+        if (qd.disk_state != DiskState::kWaiting) continue;
+        submit_descs.push_back(qd.desc);
+        submit_owners.push_back(&qd);
+        if (submit_descs.size() == count_limit) break;
+      }
+      if (submit_descs.empty()) return true;
+      if (!ring.Submit(submit_descs.data(), submit_descs.size(),
+                       submit_tokens.data()))
+        return false;
+
+      const uint64_t count = static_cast<uint64_t>(submit_descs.size());
+      uring_reads_.fetch_add(count, std::memory_order_relaxed);
+      uring_read_batches_.fetch_add(1, std::memory_order_relaxed);
+      uint64_t previous =
+          uring_read_batch_max_.load(std::memory_order_relaxed);
+      while (count > previous &&
+             !uring_read_batch_max_.compare_exchange_weak(
+                 previous, count, std::memory_order_relaxed,
+                 std::memory_order_relaxed)) {
+      }
+      const uint64_t current =
+          uring_inflight_.fetch_add(count, std::memory_order_relaxed) + count;
+      metric_inflight += count;
+      update_inflight_max(current);
+      for (size_t i = 0; i < submit_owners.size(); ++i) {
+        submit_owners[i]->token = submit_tokens[i];
+        submit_owners[i]->disk_state = DiskState::kInflight;
+      }
+      return true;
+    };
+
+    auto reap_event = [&](UringReader::Event* event) -> int {
+      UringReader::Completion completion;
+      const int reaped = ring.Reap(event, &completion);
+      if (reaped <= 0) return reaped;
+      Queued* qd = nullptr;
+      for (Queued& candidate : queue) {
+        if (candidate.disk_state == DiskState::kInflight &&
+            candidate.token == completion.token) {
+          qd = &candidate;
           break;
         }
+      }
+      if (!qd) return -1;
+      qd->read_result = completion.result;
+      uring_completions_.fetch_add(1, std::memory_order_relaxed);
+      uring_inflight_.fetch_sub(1, std::memory_order_relaxed);
+      --metric_inflight;
+      return finish_disk_read(*qd) ? 1 : -1;
+    };
 
-        // Submit + wait for ALL deferred reads in this batch (QD>1 concurrency).
-        // If the batch infrastructure fails, fall back to a synchronous pread per
-        // deferred request in the emit pass below (correctness-first).
-        bool batch_ok = true;
-        if (!descs.empty()) {
-          const uint64_t batch_reads = static_cast<uint64_t>(descs.size());
-          uring_reads_.fetch_add(batch_reads, std::memory_order_relaxed);
-          uring_read_batches_.fetch_add(1, std::memory_order_relaxed);
-          uint64_t previous =
-              uring_read_batch_max_.load(std::memory_order_relaxed);
-          while (batch_reads > previous &&
-                 !uring_read_batch_max_.compare_exchange_weak(
-                     previous, batch_reads, std::memory_order_relaxed,
-                     std::memory_order_relaxed)) {
-          }
-          batch_ok = ring.BatchRead(descs.data(), static_cast<int>(descs.size()));
-          // A failed batch may have left async reads in flight against leased
-          // v2 shared-segment slots. Drain before the sync fallback
-          // or receive rearm can reuse those buffers.
-          // writes and put mixed-generation bytes on the wire. The native wire
-          // carries a canonical identity but intentionally has no payload CRC;
-          // RDMA ICRC covers only transport integrity.
-          // the kernel: the only safe move is to drop the connection while the
-          // endpoint (and its registered buffers) is still alive; the client
-          // re-dials. Once poisoned, later BatchRead calls return false without
-          // submitting, so the connection continues on the sync fallback.
-          if (!batch_ok && !ring.Drain()) {
-            for (auto& qd : queue)
-              ring_teardown_reads.push_back(std::move(qd.read));
-            fail = true;
-            break;
-          }
+    auto emit_ready = [&]() -> bool {
+      while (!queue.empty() && queue.front().ready) {
+        Queued& qd = queue.front();
+        if (qd.sequence != next_emit_sequence ||
+            next_emit_sequence == std::numeric_limits<uint64_t>::max())
+          return false;
+        Reply& reply = qd.reply;
+        if (reply.defer_recv_rearm) {
+          rearm_on_send[qd.send_slot] = reply.recv_slot;
+        } else if (!rearm_request_recv(qd.recv_slot)) {
+          return false;
         }
+        if (reply.release_source_on_send) {
+          if (release_source_on_send[qd.send_slot] != kNoSlot) return false;
+          release_source_on_send[qd.send_slot] = reply.source_recv_slot;
+        }
+        PendingCompletion& pending = complete_on_send[qd.send_slot];
+        pending.read = std::move(reply.completion);
+        pending.bytes = pending.read.payload_len();
+        pending.elapsed_sec = reply.completion_elapsed_sec;
+        if (!post_reply(qd.send_slot, reply)) return false;
+        ++next_emit_sequence;
+        queue.pop_front();
+      }
+      return true;
+    };
 
-        // Emit every reply in STRICT arrival order (every read is now complete,
-        // so an async reply never trails a later request's reply).
-        for (size_t i = 0; i < queue.size() && !fail; ++i) {
-          Queued& qd = queue[i];
-          if (qd.read_idx >= 0) {
-            // Deferred async read: validate its CQE (or the drained sync
-            // fallback) and feed the exact same first-window state builder used
-            // by the sync path. Continuations never enter this branch.
-            UringReader::ReadDesc& d = descs[qd.read_idx];
-            bool ok;
-            if (batch_ok) {
-              const long res = d.result;
-              ok = res >= 0 &&
-                   static_cast<size_t>(res) >=
-                       qd.read.head() + qd.read.payload_len();
-            } else {
-              const ssize_t got = ::pread(
-                  qd.read.fd(), d.buf, d.len, static_cast<off_t>(d.off));
-              ok = got >= 0 &&
-                   static_cast<size_t>(got) >=
-                       qd.read.head() + qd.read.payload_len();
-            }
+    while (running_ && !fail) {
+      bool progressed = false;
 
-            const size_t payload_len = qd.read.payload_len();
-            const size_t value_len = qd.read.value_len();
-            ibv_mr* source_mr = direct_mr(qd.data_slot);
-            bool source_uses_slot = true;
-            if (ok && qd.read.source_registered() && payload_len != 0) {
-              source_mr = ep.RegisterUser(
-                  const_cast<char*>(qd.read.data()), payload_len);
-              if (!source_mr && qd.read.Stage())
-                source_mr = direct_mr(qd.data_slot);
-              if (!source_mr) ok = false;
-              source_uses_slot = !qd.read.source_registered();
-            }
-            const char* out_data = qd.read.data();
-            const double elapsed_sec = NowSteadySec() - qd.submit_sec;
-            // Preserve established single-window completion timing. A
-            // successful multi-window transaction instead remains active in
-            // MultiGetState until the final status SEND completion.
-            if (!ok || qd.request.get.window_count == 1) {
-              qd.read.Commit(ok ? Status::kOk : Status::kIOError,
-                             ok ? payload_len : 0, elapsed_sec);
-            }
-            if (!build_data_reply(
-                    qd.send_slot, qd.request,
-                    ok ? Status::kOk : Status::kIOError,
-                    ok ? out_data : nullptr, payload_len, value_len, source_mr,
-                    source_uses_slot, std::move(qd.read), elapsed_sec,
-                    &qd.reply)) {
-              fail = true;
-              break;
-            }
-          }
-
-          // Every reply, whether built synchronously or completed by the ring,
-          // is emitted from this single ordered queue.
-          Reply& reply = qd.reply;
-          if (reply.defer_recv_rearm) {
-            rearm_on_send[qd.send_slot] = reply.recv_slot;
-          } else if (!rearm_request_recv(qd.recv_slot)) {
-            fail = true;
-            break;
-          }
-          if (reply.release_source_on_send) {
-            if (release_source_on_send[qd.send_slot] != kNoSlot) {
-              fail = true;
-              break;
-            }
-            release_source_on_send[qd.send_slot] =
-                reply.source_recv_slot;
-          }
-          PendingCompletion& pending = complete_on_send[qd.send_slot];
-          pending.read = std::move(reply.completion);
-          pending.bytes = pending.read.payload_len();
-          pending.elapsed_sec = reply.completion_elapsed_sec;
-          if (!post_reply(qd.send_slot, reply)) {
+      // Always give RDMA ingress first opportunity. This keeps first-window
+      // receives and SEND completions moving while disk reads are outstanding.
+      int g = ep.PollComp(wcs.data(), static_cast<int>(K));
+      if (g < 0) {
+        fail = true;
+        break;
+      }
+      if (g > 0) {
+        ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
+        progressed = true;
+        for (int w = 0; w < g; ++w) {
+          if (!process_wc(wcs[w])) {
             fail = true;
             break;
           }
         }
       }
+      if (fail) break;
 
-      // Queued PreparedRead destructors abort any entries that never reached
-      // Commit. Prepared SEND owners in complete_on_send do the same on
-      // connection teardown.
+      if (!submit_waiting()) {
+        fail = true;
+        break;
+      }
+
+      // Drain every ready disk CQE without blocking. Out-of-order completions
+      // only mark their own queue entry ready; emit_ready gates the prefix.
+      for (;;) {
+        UringReader::Event event;
+        const int ready = ring.Peek(&event);
+        if (ready < 0) {
+          fail = true;
+          break;
+        }
+        if (ready == 0) break;
+        progressed = true;
+        if (reap_event(&event) < 0) {
+          fail = true;
+          break;
+        }
+      }
+      if (fail || !emit_ready()) {
+        fail = true;
+        break;
+      }
+      if (progressed) continue;
+
+      if (ring.inflight() != 0) {
+        // liburing and verbs expose separate wait sources. A one-millisecond
+        // bounded ring wait avoids spinning without starving the verbs CQ or
+        // Stop()'s Wake notification.
+        UringReader::Event event;
+        const int ready = ring.Wait(&event, /*timeout_ms=*/1);
+        if (ready < 0 ||
+            (ready > 0 && reap_event(&event) < 0)) {
+          fail = true;
+          break;
+        }
+        if (ready > 0 && !emit_ready()) {
+          fail = true;
+          break;
+        }
+        continue;
+      }
+
+      // With no disk owner in the kernel, block on the ordinary verbs source
+      // and preserve the established connection-idle reclamation contract.
+      g = ep.WaitComp(wcs.data(), static_cast<int>(K), idle_ms);
+      if (g == 0) {
+        idle_reclaims_.fetch_add(1, std::memory_order_relaxed);
+        break;
+      }
+      if (g < 0) break;  // disconnect, endpoint error, or Stop()'s Wake
+      ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
+      for (int w = 0; w < g; ++w) {
+        if (!process_wc(wcs[w])) {
+          fail = true;
+          break;
+        }
+      }
     }
+
+    // No synchronous retry is allowed after successful ring initialization:
+    // an accepted SQE may have modified staging. Drain kernel ownership while
+    // queue/PreparedRead and the endpoint remain alive, then abort the queue.
+    if (ring.inflight() != 0 || ring.poisoned())
+      ring.Drain();
+    if (metric_inflight != 0)
+      uring_inflight_.fetch_sub(metric_inflight, std::memory_order_relaxed);
+
     rail_stats.active_conns.fetch_sub(1, std::memory_order_relaxed);
     active_conns_.fetch_sub(1, std::memory_order_relaxed);
     { std::lock_guard<std::mutex> lk(conn_mu_); live_eps_.erase(&ep); }
@@ -1696,13 +1754,21 @@ std::string RdmaServer::MetricsText() const {
     "GET disk reads submitted through the io_uring path (>0 = path active)",
     UringReads());
   m(s, "dfkv_uring_batch_reads_total", "counter",
-    "GET disk-read descriptors passed to non-empty io_uring batches",
+    "GET disk-read descriptors admitted to io_uring submit groups",
     UringReads());
   m(s, "dfkv_uring_batches_total", "counter",
-    "Non-empty io_uring BatchRead calls", UringReadBatches());
+    "Non-empty io_uring submit groups", UringReadBatches());
+  m(s, "dfkv_uring_submit_batches_total", "counter",
+    "Non-empty io_uring submit groups", UringReadBatches());
   m(s, "dfkv_uring_batch_max", "gauge",
-    "Largest io_uring BatchRead descriptor count observed",
-    UringReadBatchMax());
+    "Largest io_uring submit group observed", UringReadBatchMax());
+  m(s, "dfkv_uring_completions_total", "counter",
+    "Logical io_uring read descriptors completed", UringCompletions());
+  m(s, "dfkv_uring_inflight", "gauge",
+    "Logical io_uring reads currently outstanding", UringInflight());
+  m(s, "dfkv_uring_inflight_max", "gauge",
+    "Process-lifetime high-water mark of outstanding io_uring reads",
+    UringInflightMax());
   m(s, "dfkv_uring_init_fallbacks_total", "counter",
     "Connections that wanted io_uring but fell back to the sync path (ring init failed)",
     UringInitFallbacks());
