@@ -14,8 +14,53 @@ TEST(RdmaProtocol, ProbeRoundTrip) {
   char reply[kV2ProbeReplyBytes];
   EncodeV2ProbeReply(reply);
   EXPECT_TRUE(ParseV2ProbeReply(reply));
+  EXPECT_TRUE(V2ProbeSupportsWriterRetirement(reply));
+
+  // An old server's reserved bytes are zero. The base v2 reply remains valid
+  // to old clients, but a new direct-buffer client must reject it.
+  EncodeV2ProbeReply(reply, /*capabilities=*/0);
+  EXPECT_TRUE(ParseV2ProbeReply(reply));
+  EXPECT_FALSE(V2ProbeSupportsWriterRetirement(reply));
+
   reply[4] = 1;
   EXPECT_FALSE(ParseV2ProbeReply(reply));
+  EXPECT_FALSE(V2ProbeSupportsWriterRetirement(reply));
+}
+
+TEST(RdmaProtocol, LegacyAndRetirementReadinessHaveExactWireSizes) {
+  const RecvSegmentInfo expected{0x12345000, 0xAABBCCDD, 4u << 20};
+  char wire[kV2RetirementReadinessBytes];
+
+  const size_t legacy_bytes =
+      EncodeV2Readiness(expected, /*writer_token=*/0, wire);
+  EXPECT_EQ(kV2LegacyReadinessBytes, 25u);
+  EXPECT_EQ(legacy_bytes, 25u);
+  EXPECT_EQ(V2ReadinessBytes(/*writer_retirement_negotiated=*/false), 25u);
+  RecvSegmentInfo actual;
+  uint64_t token = 99;
+  EXPECT_TRUE(DecodeV2Readiness(
+      wire, legacy_bytes, /*writer_retirement_negotiated=*/false, &actual,
+      &token));
+  EXPECT_EQ(token, 0u);
+  EXPECT_EQ(actual.base_addr, expected.base_addr);
+  EXPECT_EQ(actual.rkey, expected.rkey);
+  EXPECT_EQ(actual.slot_size, expected.slot_size);
+  EXPECT_FALSE(DecodeV2Readiness(
+      wire, legacy_bytes, /*writer_retirement_negotiated=*/true, &actual,
+      &token));
+
+  constexpr uint64_t writer_token = 0x123456789ABCDEF0ull;
+  const size_t retirement_bytes =
+      EncodeV2Readiness(expected, writer_token, wire);
+  EXPECT_EQ(retirement_bytes, 33u);
+  EXPECT_EQ(V2ReadinessBytes(/*writer_retirement_negotiated=*/true), 33u);
+  EXPECT_TRUE(DecodeV2Readiness(
+      wire, retirement_bytes, /*writer_retirement_negotiated=*/true, &actual,
+      &token));
+  EXPECT_EQ(token, writer_token);
+  EXPECT_FALSE(DecodeV2Readiness(
+      wire, retirement_bytes, /*writer_retirement_negotiated=*/false, &actual,
+      &token));
 }
 
 TEST(RdmaProtocol, SlotGeometryKeepsPayloadAligned) {

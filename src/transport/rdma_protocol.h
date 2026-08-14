@@ -39,6 +39,10 @@ constexpr uint64_t kV2MultiWrPutMagic = 0x325257495455504dull;  // "MPUTIWR2"
 constexpr const char* kV2ProbeDevice = "__dfkv_v2__";
 constexpr uint32_t kV2ProbeMagic = 0x33564644u;  // ASCII "DFV3" (LE)
 constexpr size_t kV2ProbeReplyBytes = 8;
+// Probe reply byte 5 was reserved in the original 8-byte reply. Advertising
+// here is backward-compatible: old clients validate only magic/version, while
+// new clients fail before real QP bootstrap unless this bit is present.
+constexpr uint8_t kV2ProbeCapWriterRetirement = 1u << 0;
 
 inline bool IsV2Probe(const char frame[kDevNameBytes]) {
   size_t n = 0;
@@ -47,10 +51,13 @@ inline bool IsV2Probe(const char frame[kDevNameBytes]) {
          ParseDevFrameProtocol(frame) == kDevProtoV2;
 }
 
-inline void EncodeV2ProbeReply(char out[kV2ProbeReplyBytes]) {
+inline void EncodeV2ProbeReply(
+    char out[kV2ProbeReplyBytes],
+    uint8_t capabilities = kV2ProbeCapWriterRetirement) {
   std::memset(out, 0, kV2ProbeReplyBytes);
   std::memcpy(out, &kV2ProbeMagic, sizeof(kV2ProbeMagic));
   out[4] = static_cast<char>(kDevProtoV2);
+  out[5] = static_cast<char>(capabilities);
 }
 
 inline bool ParseV2ProbeReply(const char in[kV2ProbeReplyBytes]) {
@@ -58,6 +65,17 @@ inline bool ParseV2ProbeReply(const char in[kV2ProbeReplyBytes]) {
   std::memcpy(&magic, in, sizeof(magic));
   return magic == kV2ProbeMagic &&
          static_cast<uint8_t>(in[4]) == kDevProtoV2;
+}
+
+inline uint8_t ParseV2ProbeCapabilities(
+    const char in[kV2ProbeReplyBytes]) {
+  return ParseV2ProbeReply(in) ? static_cast<uint8_t>(in[5]) : 0;
+}
+
+inline bool V2ProbeSupportsWriterRetirement(
+    const char in[kV2ProbeReplyBytes]) {
+  return (ParseV2ProbeCapabilities(in) &
+          kV2ProbeCapWriterRetirement) != 0;
 }
 
 // Failure-path writer retirement. The client reconnects with the opaque
@@ -180,6 +198,44 @@ inline bool DecodeRecvSegmentInfo(const char in[kRecvSegmentInfoBytes],
          info->slot_size % kV2DataOffset == 0 &&
          info->base_addr <=
              std::numeric_limits<uint64_t>::max() - (info->slot_size - 1);
+}
+
+// The original readiness response is exactly one ready byte plus the 24-byte
+// receive-segment descriptor. A negotiated writer-retirement connection
+// appends its nonzero token; an unnegotiated client must see no extra bytes.
+constexpr size_t kV2LegacyReadinessBytes = 1 + kRecvSegmentInfoBytes;
+constexpr size_t kV2RetirementReadinessBytes =
+    kV2LegacyReadinessBytes + kV2WriterTokenBytes;
+static_assert(kV2LegacyReadinessBytes == 25);
+
+inline size_t V2ReadinessBytes(bool writer_retirement_negotiated) {
+  return writer_retirement_negotiated ? kV2RetirementReadinessBytes
+                                      : kV2LegacyReadinessBytes;
+}
+
+inline size_t EncodeV2Readiness(
+    const RecvSegmentInfo& info, uint64_t writer_token,
+    char out[kV2RetirementReadinessBytes]) {
+  std::memset(out, 0, kV2RetirementReadinessBytes);
+  out[0] = 1;
+  EncodeRecvSegmentInfo(info, out + 1);
+  if (writer_token == 0) return kV2LegacyReadinessBytes;
+  net::PutU64(out + kV2LegacyReadinessBytes, writer_token);
+  return kV2RetirementReadinessBytes;
+}
+
+inline bool DecodeV2Readiness(
+    const char* in, size_t bytes, bool writer_retirement_negotiated,
+    RecvSegmentInfo* info, uint64_t* writer_token) {
+  if (bytes != V2ReadinessBytes(writer_retirement_negotiated) || in[0] != 1 ||
+      !DecodeRecvSegmentInfo(in + 1, info)) {
+    return false;
+  }
+  *writer_token =
+      writer_retirement_negotiated
+          ? net::GetU64(in + kV2LegacyReadinessBytes)
+          : 0;
+  return !writer_retirement_negotiated || *writer_token != 0;
 }
 
 }  // namespace dfkv::rdma

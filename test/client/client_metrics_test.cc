@@ -29,6 +29,7 @@
 namespace dfkv::testing {
 void DrainPernodeSink();
 size_t PernodeQueueCapacity();
+uint64_t PernodeRotateBytes();
 size_t PernodeQueueHighWater();
 uint64_t PernodeQueueDropped();
 uint64_t PernodeQueuePendingDropped();
@@ -52,7 +53,7 @@ struct PernodeMetricsEnv {
     ::setenv("DFKV_ACCESS_DIR", dir.c_str(), 1);
     ::setenv("DFKV_CLIENT_LOG_SUFFIX", suffix.c_str(), 1);
     ::setenv("DFKV_CLIENT_PERNODE_QUEUE_CAPACITY", "4", 1);
-    ::setenv("DFKV_CLIENT_PERNODE_ROTATE_BYTES", "512", 1);
+    ::setenv("DFKV_CLIENT_PERNODE_ROTATE_BYTES", "1024", 1);
   }
   std::string Path(const std::string& file) const {
     return dir + "/" + file + "." + suffix;
@@ -108,6 +109,8 @@ class MetricsTransport final : public Transport {
   mutable std::mutex mu;
   std::map<std::string, std::string> values;
   std::vector<Status> exist_script;
+  std::vector<Status> cache_statuses;
+  std::vector<Status> range_multi_statuses;
   std::vector<ScriptedAttempt> attempt_script;
   std::vector<ScriptedAttempt> attempts;
   std::vector<size_t> replay_item_counts;
@@ -226,8 +229,15 @@ class MetricsTransport final : public Transport {
 
   std::vector<Status> CacheFromMulti(
       const std::string&, const std::vector<CacheSrcMulti>& srcs,
-      std::string* /*out_dev*/ = nullptr) override {
+      std::string* out_dev = nullptr) override {
     std::lock_guard<std::mutex> lock(mu);
+    if (!cache_statuses.empty()) {
+      std::vector<Status> result(srcs.size(), Status::kInvalid);
+      for (size_t i = 0; i < result.size(); ++i)
+        result[i] = cache_statuses[std::min(i, cache_statuses.size() - 1)];
+      return result;
+    }
+    const size_t attempt_begin = attempts.size();
     const bool ok = RunAttemptsLocked(srcs.size(), [&] {
       remote_put_commits += srcs.size();
       for (const auto& src : srcs) {
@@ -238,6 +248,7 @@ class MetricsTransport final : public Transport {
         values[src.key.Filename()] = std::move(value);
       }
     });
+    SetOutDevLocked(attempt_begin, out_dev);
     std::vector<Status> result(
         srcs.size(), ok ? Status::kOk : Status::kIOError);
     result.resize(std::min(result.size(), cache_status_limit));
@@ -248,13 +259,21 @@ class MetricsTransport final : public Transport {
       const std::string&, const std::vector<BlockKey>& keys,
       const std::vector<RangeDstMulti>& dsts,
       std::vector<size_t>* out_lens,
-      std::string* /*out_dev*/ = nullptr) override {
+      std::string* out_dev = nullptr) override {
     std::lock_guard<std::mutex> lock(mu);
     ++range_multi_calls;
     if (out_lens) out_lens->assign(keys.size(), 0);
     if (dsts.size() != keys.size()) return InvalidStatuses(keys.size());
+    if (!range_multi_statuses.empty()) {
+      std::vector<Status> scripted(keys.size(), Status::kInvalid);
+      for (size_t i = 0; i < scripted.size(); ++i)
+        scripted[i] =
+            range_multi_statuses[std::min(i, range_multi_statuses.size() - 1)];
+      return scripted;
+    }
     std::vector<Status> result(keys.size(), Status::kNotFound);
     range_multi_item_calls.assign(keys.size(), 0);
+    const size_t attempt_begin = attempts.size();
     const bool ok = RunAttemptsLocked(
         keys.size(), [&](size_t begin, size_t end) {
       for (size_t i = begin; i < end; ++i) {
@@ -274,6 +293,7 @@ class MetricsTransport final : public Transport {
         result[i] = Status::kOk;
       }
     });
+    SetOutDevLocked(attempt_begin, out_dev);
     if (!ok) {
       result.assign(keys.size(), Status::kIOError);
     } else {
@@ -312,6 +332,20 @@ class MetricsTransport final : public Transport {
   }
 
  private:
+  void SetOutDevLocked(size_t attempt_begin, std::string* out_dev) const {
+    if (!out_dev || attempt_begin >= attempts.size()) return;
+    out_dev->clear();
+    for (size_t i = attempt_begin; i < attempts.size(); ++i) {
+      const std::string dev = "ib" + std::to_string(attempts[i].rail);
+      if (out_dev->empty()) {
+        *out_dev = dev;
+      } else if (*out_dev != dev) {
+        *out_dev += "->";
+        *out_dev += dev;
+      }
+    }
+  }
+
   template <typename Success>
   bool RunAttemptsLocked(size_t item_count, Success&& success) {
     const std::vector<ScriptedAttempt> script =
@@ -1268,6 +1302,96 @@ TEST(ClientPernodeStats, RecordsGetExistAndPutHealthCooldownSkips) {
   EXPECT_EQ(put_log.find("cooling-put-secret"), std::string::npos);
 }
 
+TEST(ClientPernodeStats, ClientLocalTransportOutcomesAreNotIssued) {
+  dfkv::testing::DrainPernodeSink();
+  MetricsTransport transport;
+  transport.pipeline = true;
+  transport.cache_statuses = {
+      Status::kResourceExhausted, Status::kNoCompatibleRail};
+  transport.range_multi_statuses = {
+      Status::kResourceExhausted, Status::kNoCompatibleRail};
+  transport.exist_script = {
+      Status::kResourceExhausted, Status::kNoCompatibleRail};
+  KVClient client({{"local-node", "10.0.0.1:12400"}},
+                  "pernode/client-local", &transport);
+  const std::string value = "payload";
+  const std::array<std::string, 2> keys{"local-secret-a", "local-secret-b"};
+
+  std::vector<KvPutItemSg> puts;
+  for (const std::string& key : keys)
+    puts.push_back({key, {value.data()}, {value.size()}});
+  EXPECT_EQ(client.BatchPutSg(puts), std::vector<bool>({false, false}));
+
+  std::array<std::array<char, 16>, 2> output{};
+  std::vector<KvGetItemSg> gets;
+  for (size_t i = 0; i < keys.size(); ++i)
+    gets.push_back({keys[i], {output[i].data()}, {output[i].size()}});
+  std::vector<size_t> lengths;
+  EXPECT_EQ(client.BatchGetAutoSg(gets, &lengths),
+            std::vector<bool>({false, false}));
+  EXPECT_EQ(client.BatchExist({keys[0], keys[1]}),
+            std::vector<bool>({false, false}));
+  dfkv::testing::DrainPernodeSink();
+
+  for (const char* file : {"dfkv_client_get.log", "dfkv_client_put.log",
+                           "dfkv_client_exist.log"}) {
+    const std::string log = CurrentAndPrevious(file);
+    EXPECT_TRUE(HasLineWith(
+        log,
+        {"TOTAL:", "logical_keys=2", "issued_keys=0",
+         "failed_issued_keys=0", "status_mask=0", "failure_status_mask=0",
+         "nonissued_failures=2", "logical_failure_status_mask=192",
+         "nonissued_status_mask=192",
+         "nonissued_statuses=kResourceExhausted,kNoCompatibleRail",
+         "resource_exhausted=1", "no_compatible_rail=1",
+         "nonissued_reasons=resource_exhausted:kResourceExhausted=1,"
+         "no_compatible_rail:kNoCompatibleRail=1"}))
+        << file << "\n" << log;
+    EXPECT_EQ(log.find(keys[0]), std::string::npos) << log;
+    EXPECT_EQ(log.find(keys[1]), std::string::npos) << log;
+  }
+}
+
+TEST(ClientPernodeStats, RetryRailPathPreservesAttemptOrderAndSingleRail) {
+  dfkv::testing::DrainPernodeSink();
+  MetricsTransport transport;
+  transport.pipeline = true;
+  KVClient client({{"rail-node", "10.0.0.1:12500"}},
+                  "pernode/rail-path", &transport);
+  const std::string value = "rail-payload";
+  ASSERT_TRUE(client.Put("rail-key", value.data(), value.size()));
+
+  transport.Script({
+      {0, MetricsTransport::AttemptResult::kRailFailure},
+      {1, MetricsTransport::AttemptResult::kSuccess},
+  });
+  std::array<char, 32> output{};
+  std::vector<size_t> lengths;
+  EXPECT_EQ(client.BatchGetAutoSg(
+                {{"rail-key", {output.data()}, {output.size()}}}, &lengths),
+            std::vector<bool>({true}));
+  dfkv::testing::DrainPernodeSink();
+  std::string log = CurrentAndPrevious("dfkv_client_get.log");
+  EXPECT_TRUE(HasLineWith(
+      log, {"pernode-get:", "node=10.0.0.1:12500",
+            "dev=ib0->ib1", "issued_keys=1"}))
+      << log;
+
+  transport.Script({
+      {3, MetricsTransport::AttemptResult::kSuccess},
+  });
+  EXPECT_EQ(client.BatchGetAutoSg(
+                {{"rail-key", {output.data()}, {output.size()}}}, &lengths),
+            std::vector<bool>({true}));
+  dfkv::testing::DrainPernodeSink();
+  log = CurrentAndPrevious("dfkv_client_get.log");
+  EXPECT_TRUE(HasLineWith(
+      log, {"pernode-get:", "node=10.0.0.1:12500",
+            "dev=ib3", "issued_keys=1"}))
+      << log;
+  EXPECT_EQ(log.find("dev=ib3->"), std::string::npos) << log;
+}
+
 TEST(ClientPernodeStats, QueueDropsAreReportedByNextWrittenBatch) {
   dfkv::testing::DrainPernodeSink();
   EXPECT_EQ(dfkv::testing::PernodeQueuePendingDropped(), 0u);
@@ -1290,4 +1414,41 @@ TEST(ClientPernodeStats, QueueDropsAreReportedByNextWrittenBatch) {
   EXPECT_NE(log.find("pernode-sink DROPPED: dropped_batches=2"),
             std::string::npos)
       << log;
+}
+
+TEST(ClientPernodeStats, RotationSplitsBatchesAndBoundsOversizeLines) {
+  dfkv::testing::DrainPernodeSink();
+  const uint64_t bound = dfkv::testing::PernodeRotateBytes();
+  ASSERT_EQ(bound, 1024u);
+  const std::string file = "dfkv_client_rotation_test.log";
+  const std::string current = pernode_env.Path(file);
+  const std::string previous = current + ".1";
+  const std::string first = "rotation-first " + std::string(700, 'a');
+  const std::string oversize = "rotation-oversize " + std::string(2000, 'x');
+  const std::string last = "rotation-last " + std::string(700, 'b');
+
+  dfkv::testing::EnqueuePernodeForTest(
+      file.c_str(), {first, oversize, last});
+  dfkv::testing::DrainPernodeSink();
+
+  struct stat current_stat {};
+  struct stat previous_stat {};
+  ASSERT_EQ(::stat(current.c_str(), &current_stat), 0);
+  ASSERT_EQ(::stat(previous.c_str(), &previous_stat), 0);
+  EXPECT_LE(static_cast<uint64_t>(current_stat.st_size), bound);
+  EXPECT_LE(static_cast<uint64_t>(previous_stat.st_size), bound);
+
+  const std::string current_text = ReadText(current);
+  const std::string previous_text = ReadText(previous);
+  ASSERT_FALSE(current_text.empty());
+  ASSERT_FALSE(previous_text.empty());
+  EXPECT_EQ(current_text.back(), '\n');
+  EXPECT_EQ(previous_text.back(), '\n');
+  const std::string combined = previous_text + current_text;
+  EXPECT_NE(combined.find("rotation-first"), std::string::npos) << combined;
+  EXPECT_NE(combined.find("pernode-sink OVERSIZE: original_bytes="),
+            std::string::npos)
+      << combined;
+  EXPECT_NE(combined.find("rotation-last"), std::string::npos) << combined;
+  EXPECT_EQ(combined.find(std::string(2000, 'x')), std::string::npos);
 }
