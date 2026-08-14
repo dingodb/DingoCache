@@ -1298,6 +1298,13 @@ void RdmaServer::Serve(int boot_fd) {
     uint64_t next_sequence = 0;
     uint64_t next_emit_sequence = 0;
     uint64_t metric_inflight = 0;
+    // Never fill every logical reply slot in one posting burst. Although the
+    // QP requests worst-case WR capacity, real providers can stop accepting the
+    // final status SEND after a full window of preceding RDMA WRITEs. Leaving
+    // one reply chain of headroom also forces SEND CQ progress and receive
+    // rearming before the next client window. Depth one remains functional.
+    const size_t send_post_limit = K > 1 ? K - 1 : 1;
+    size_t posted_sends = 0;
 
     auto update_inflight_max = [&](uint64_t current) {
       uint64_t previous =
@@ -1355,6 +1362,9 @@ void RdmaServer::Serve(int boot_fd) {
       if (wc.opcode == IBV_WC_SEND) {
         const size_t sid = static_cast<size_t>(wc.wr_id);
         if (sid >= K) return false;
+        if (posted_sends == 0) return false;
+        --posted_sends;
+        uring_send_fences_.fetch_add(1, std::memory_order_relaxed);
         // Source ownership is released only at this signaled SEND fence.
         complete_send(sid);
         if (release_source_on_send[sid] != kNoSlot) {
@@ -1510,7 +1520,8 @@ void RdmaServer::Serve(int boot_fd) {
     };
 
     auto emit_ready = [&]() -> bool {
-      while (!queue.empty() && queue.front().ready) {
+      while (!queue.empty() && queue.front().ready &&
+             posted_sends < send_post_limit) {
         Queued& qd = queue.front();
         if (qd.sequence != next_emit_sequence ||
             next_emit_sequence == std::numeric_limits<uint64_t>::max())
@@ -1529,7 +1540,12 @@ void RdmaServer::Serve(int boot_fd) {
         pending.read = std::move(reply.completion);
         pending.bytes = pending.read.payload_len();
         pending.elapsed_sec = reply.completion_elapsed_sec;
-        if (!post_reply(qd.send_slot, reply)) return false;
+        if (!post_reply(qd.send_slot, reply)) {
+          uring_send_post_errors_.fetch_add(1, std::memory_order_relaxed);
+          return false;
+        }
+        uring_replies_posted_.fetch_add(1, std::memory_order_relaxed);
+        ++posted_sends;
         ++next_emit_sequence;
         queue.pop_front();
       }
@@ -1603,10 +1619,15 @@ void RdmaServer::Serve(int boot_fd) {
         continue;
       }
 
-      // With no disk owner in the kernel, block on the ordinary verbs source
-      // and preserve the established connection-idle reclamation contract.
-      g = ep.WaitComp(wcs.data(), static_cast<int>(K), idle_ms);
+      // SEND completions release PreparedRead/source ownership and rearm the
+      // receive window. Some providers can lose a completion-channel edge
+      // after our ready-only PollComp drain, so never put an outstanding SEND
+      // fence behind the multi-minute connection-idle wait. A bounded wait
+      // blocks (no spin) and its timeout path performs a final CQ poll.
+      const int verbs_wait_ms = posted_sends != 0 ? 1 : idle_ms;
+      g = ep.WaitComp(wcs.data(), static_cast<int>(K), verbs_wait_ms);
       if (g == 0) {
+        if (posted_sends != 0) continue;
         idle_reclaims_.fetch_add(1, std::memory_order_relaxed);
         break;
       }
@@ -1769,6 +1790,15 @@ std::string RdmaServer::MetricsText() const {
   m(s, "dfkv_uring_inflight_max", "gauge",
     "Process-lifetime high-water mark of outstanding io_uring reads",
     UringInflightMax());
+  m(s, "dfkv_uring_replies_posted_total", "counter",
+    "Ordered status replies successfully posted by io_uring serve loops",
+    UringRepliesPosted());
+  m(s, "dfkv_uring_send_fences_total", "counter",
+    "Signaled status SEND completions reaped by io_uring serve loops",
+    UringSendFences());
+  m(s, "dfkv_uring_send_post_errors_total", "counter",
+    "Status SEND chains rejected after an io_uring disk completion",
+    UringSendPostErrors());
   m(s, "dfkv_uring_init_fallbacks_total", "counter",
     "Connections that wanted io_uring but fell back to the sync path (ring init failed)",
     UringInitFallbacks());

@@ -2839,6 +2839,58 @@ struct RdmaUringNode {
       return nullptr;
     return backends[index].get();
   }
+
+  ControlledRdmaUringBackend* WaitForBackendWithSubmitted(
+      size_t count, int timeout_ms = 5000) const {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_ms);
+    do {
+      for (ControlledRdmaUringBackend* backend : BackendSnapshot()) {
+        if (backend->History().size() >= count) return backend;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
+    return nullptr;
+  }
+
+  std::vector<ControlledRdmaUringBackend*> BackendSnapshot() const {
+    std::lock_guard<std::mutex> lock(backend_mu);
+    std::vector<ControlledRdmaUringBackend*> snapshot;
+    snapshot.reserve(backends.size());
+    for (const auto& backend : backends) snapshot.push_back(backend.get());
+    return snapshot;
+  }
+
+  struct ControlledSubmission {
+    ControlledRdmaUringBackend* backend = nullptr;
+    ControlledRdmaUringBackend::Request request;
+  };
+
+  std::vector<ControlledSubmission> AggregateSubmissions() const {
+    std::vector<ControlledSubmission> submissions;
+    for (ControlledRdmaUringBackend* backend : BackendSnapshot()) {
+      for (const auto& request : backend->History())
+        submissions.push_back({backend, request});
+    }
+    return submissions;
+  }
+
+  bool WaitForAggregateSubmitted(size_t count, int timeout_ms = 5000) const {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_ms);
+    do {
+      if (AggregateSubmissions().size() >= count) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+  }
+
+  size_t AggregateAccepted() const {
+    size_t accepted = 0;
+    for (ControlledRdmaUringBackend* backend : BackendSnapshot())
+      accepted += backend->AcceptedCount();
+    return accepted;
+  }
 #endif
   ~RdmaUringNode() {
     if (rsrv) rsrv->Stop();
@@ -3539,8 +3591,7 @@ TEST(RdmaLoopback, UringReadyDrainSingleCompletionDoesNotWaitAndRecovers) {
 }
 
 
-TEST(RdmaLoopback,
-     ControlledUringKeepsSixteenReadsInflightAndRepliesInWireOrder) {
+TEST(RdmaLoopback, ControlledUringRangeIntoKeepsDepthFilledWithoutWaitAll) {
 #ifndef DFKV_WITH_URING
   GTEST_SKIP() << "test requires a DFKV_WITH_URING build";
 #else
@@ -3549,6 +3600,7 @@ TEST(RdmaLoopback,
   ScopedEnv uring_depth("DFKV_SERVER_URING_DEPTH", "32");
   ScopedEnv depth("DFKV_RDMA_DEPTH", "16");
   ScopedEnv recv_segment("DFKV_RDMA_RECV_SEGMENT_SIZE", "8388608");
+  ScopedEnv batch_timeout("DFKV_RDMA_BATCH_OP_TIMEOUT_MS", "15000");
 
   constexpr size_t kMsg = 64 * 1024;
   constexpr size_t kItems = 32;
@@ -3556,43 +3608,75 @@ TEST(RdmaLoopback,
       "controlled-pipeline", kMsg,
       [](ControlledRdmaUringBackend*) {});
   RdmaTransport transport(kMsg);
-  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
-  client.set_batch_concurrency(1);
 
-  std::vector<std::string> keys(kItems), values(kItems);
-  std::vector<KvPutItem> puts(kItems);
+  std::vector<BlockKey> keys(kItems);
+  std::vector<std::string> values(kItems), outputs(kItems);
+  std::vector<RangeDst> destinations(kItems);
   for (size_t i = 0; i < kItems; ++i) {
-    keys[i] = "controlled_pipeline_" + std::to_string(i);
-    values[i] = PatternValue(4097 + (i * 977) % 8191, 200 + i);
-    puts[i] = {keys[i], values[i].data(), values[i].size()};
-  }
-  const auto put_result = client.BatchPut(puts);
-  ASSERT_EQ(put_result.size(), kItems);
-  for (size_t i = 0; i < kItems; ++i)
-    ASSERT_TRUE(put_result[i]) << "put " << i;
-
-  ControlledRdmaUringBackend* backend = node.WaitForBackend(0);
-  ASSERT_NE(backend, nullptr);
-  std::vector<std::string> outputs(kItems);
-  std::vector<KvGetItem> gets(kItems);
-  for (size_t i = 0; i < kItems; ++i) {
+    keys[i] = ToBlockKey(
+        SelfHdr(), "controlled_pipeline_" + std::to_string(i));
+    values[i] = PatternValue(32 * 1024, 200 + i);
+    std::string ignored;
+    ASSERT_EQ(
+        node.srv->ProcessRequestForKey(
+            static_cast<uint8_t>(WireOp::kCache), keys[i], 0, 0,
+            values[i].data(), values[i].size(), &ignored),
+        Status::kOk)
+        << "direct seed " << i;
     outputs[i].assign(values[i].size(), '\0');
-    gets[i] = {keys[i], outputs[i].data(), outputs[i].size()};
+    destinations[i] = {outputs[i].data(), outputs[i].size()};
   }
-  std::vector<bool> get_result;
-  std::thread get_thread([&] { get_result = client.BatchGet(gets); });
+
+  const uint64_t writes_before = node.rsrv->V2GetWrites();
+  const uint64_t completion_errors_before =
+      node.rsrv->CompletionErrors();
+  const uint64_t send_fences_before = node.rsrv->UringSendFences();
+  const uint64_t send_post_errors_before =
+      node.rsrv->UringSendPostErrors();
+  const uint64_t replies_posted_before =
+      node.rsrv->UringRepliesPosted();
+  const auto pipeline_started = std::chrono::steady_clock::now();
+  std::vector<Status> statuses;
+  std::vector<uint64_t> value_lengths;
+  std::thread range_thread([&] {
+    statuses =
+        transport.RangeInto(node.addr, keys, destinations, &value_lengths);
+  });
   const auto stop_and_join = [&] {
-    std::thread stopper([&] { node.rsrv->Stop(); });
-    for (const auto& request : backend->History())
-      backend->CompleteRead(request.token);
+    std::atomic<bool> stopped{false};
+    std::thread stopper([&] {
+      node.rsrv->Stop();
+      stopped.store(true, std::memory_order_release);
+    });
+    for (int attempt = 0;
+         attempt < 1000 && !stopped.load(std::memory_order_acquire);
+         ++attempt) {
+      for (ControlledRdmaUringBackend* active : node.BackendSnapshot()) {
+        for (const auto& request : active->History())
+          active->CompleteRead(request.token);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     stopper.join();
-    if (get_thread.joinable()) get_thread.join();
+    if (range_thread.joinable()) range_thread.join();
   };
 
-  const bool first_window = backend->WaitForSubmitted(16);
-  EXPECT_TRUE(first_window)
-      << "server waited for disk before ingesting sixteen first windows";
-  if (!first_window) {
+  ControlledRdmaUringBackend* backend =
+      node.WaitForBackendWithSubmitted(16);
+  if (backend == nullptr) {
+    ADD_FAILURE() << "one RangeInto QP did not submit its first depth window";
+    stop_and_join();
+    return;
+  }
+  const auto initial_backends = node.BackendSnapshot();
+  const size_t backend_count_after_admission = initial_backends.size();
+  const uint64_t conns_after_admission = node.rsrv->V2Conns();
+  const uint64_t active_after_admission = node.rsrv->ActiveConns();
+  std::vector<ControlledRdmaUringBackend::Request> history =
+      backend->History();
+  if (history.size() != 16) {
+    ADD_FAILURE() << "first RangeInto window expected 16 reads, got "
+                  << history.size();
     stop_and_join();
     return;
   }
@@ -3600,75 +3684,106 @@ TEST(RdmaLoopback,
   EXPECT_GE(node.rsrv->UringInflightMax(), 16u);
   EXPECT_EQ(node.rsrv->UringCompletions(), 0u);
 
-  // Retire half the first client window. SEND completions and the newly rearmed
-  // receives must be consumed while the other eight disk reads remain pending.
-  std::vector<ControlledRdmaUringBackend::Request> history =
-      backend->History();
-  if (history.size() < 16) {
-    ADD_FAILURE() << "backend lost admitted first-window reads";
-    stop_and_join();
-    return;
-  }
-  for (size_t i = 0; i < 8; ++i) {
+  // Reap CQEs 15..1 while sequence zero remains outstanding. The server must
+  // consume disk CQEs immediately but emit no noncontiguous wire prefix.
+  for (size_t i = 16; i-- > 1;) {
     if (!backend->CompleteRead(history[i].token)) {
       ADD_FAILURE() << "first-window token " << i << " was not retained";
       stop_and_join();
       return;
     }
   }
-  const bool mixed_progress = backend->WaitForSubmitted(24);
-  EXPECT_TRUE(mixed_progress)
-      << "pending disk reads stranded mixed SEND/RECV completions";
-  if (!mixed_progress) {
-    stop_and_join();
-    return;
-  }
+  for (int attempt = 0;
+       attempt < 1000 && node.rsrv->UringCompletions() < 15;
+       ++attempt)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  EXPECT_EQ(node.rsrv->UringCompletions(), 15u)
+      << "ready disk CQEs were held behind a wait-all barrier";
+  EXPECT_FALSE(backend->WaitForSubmitted(17, 20))
+      << "a noncontiguous reply escaped before sequence zero";
 
-  // Complete requests 23..8 in reverse. The server may reap every CQE, but it
-  // must emit only the contiguous request prefix on the RC wire.
-  history = backend->History();
-  if (history.size() < 24) {
-    ADD_FAILURE() << "mixed SEND/RECV progress lost admitted reads";
+  if (!backend->CompleteRead(history[0].token)) {
+    ADD_FAILURE() << "sequence-zero token was not retained";
     stop_and_join();
     return;
   }
-  for (size_t i = 24; i-- > 8;) {
-    if (!backend->CompleteRead(history[i].token)) {
-      ADD_FAILURE() << "out-of-order token " << i << " was not retained";
-      stop_and_join();
-      return;
-    }
-  }
-  if (!backend->WaitForSubmitted(32)) {
-    ADD_FAILURE() << "final receive window was not ingested";
+  // A complete first prefix must reach status SEND fences before RangeInto can
+  // post its second depth window on the same QP.
+  for (int attempt = 0;
+       attempt < 500 &&
+       (node.rsrv->UringCompletions() < 16 ||
+        node.rsrv->V2GetWrites() - writes_before < 16 ||
+        node.rsrv->UringRepliesPosted() - replies_posted_before < 16 ||
+        node.rsrv->UringSendFences() - send_fences_before < 16);
+       ++attempt)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  EXPECT_EQ(node.rsrv->UringCompletions(), 16u);
+  EXPECT_EQ(node.rsrv->V2GetWrites() - writes_before, 16u);
+  EXPECT_EQ(node.rsrv->UringRepliesPosted() - replies_posted_before, 16u);
+  EXPECT_GE(node.rsrv->UringSendFences() - send_fences_before, 16u);
+  EXPECT_EQ(node.rsrv->ActiveConns(), active_after_admission);
+  EXPECT_EQ(node.rsrv->CompletionErrors(), completion_errors_before);
+  EXPECT_EQ(node.rsrv->UringSendPostErrors(), send_post_errors_before);
+
+  if (!backend->WaitForSubmitted(kItems, 2000)) {
+    ADD_FAILURE() << "same RangeInto QP did not ingest its second window";
     stop_and_join();
     return;
+  }
+  const auto backends_after_second = node.BackendSnapshot();
+  EXPECT_EQ(backends_after_second.size(), backend_count_after_admission)
+      << "controlled RangeInto retried onto a replacement QP";
+  EXPECT_EQ(node.rsrv->V2Conns(), conns_after_admission);
+  EXPECT_EQ(node.rsrv->ActiveConns(), active_after_admission);
+  for (ControlledRdmaUringBackend* initial : initial_backends) {
+    EXPECT_NE(std::find(backends_after_second.begin(),
+                        backends_after_second.end(), initial),
+              backends_after_second.end());
   }
   history = backend->History();
   if (history.size() != kItems) {
-    ADD_FAILURE() << "expected exactly " << kItems << " disk submissions";
+    ADD_FAILURE() << "expected exactly " << kItems
+                  << " same-QP disk submissions, got " << history.size();
     stop_and_join();
     return;
   }
-  for (size_t i = kItems; i-- > 24;) {
+  for (size_t i = kItems; i-- > 16;) {
     if (!backend->CompleteRead(history[i].token)) {
-      ADD_FAILURE() << "final token " << i << " was not retained";
+      ADD_FAILURE() << "second-window token " << i << " was not retained";
       stop_and_join();
       return;
     }
   }
 
-  get_thread.join();
-  ASSERT_EQ(get_result.size(), kItems);
+  range_thread.join();
+  ASSERT_EQ(statuses.size(), kItems);
+  ASSERT_EQ(value_lengths.size(), kItems);
   for (size_t i = 0; i < kItems; ++i) {
-    ASSERT_TRUE(get_result[i]) << "get " << i;
+    EXPECT_EQ(statuses[i], Status::kOk) << i;
+    EXPECT_EQ(value_lengths[i], values[i].size()) << i;
     EXPECT_EQ(outputs[i], values[i]) << "ordered reply " << i;
   }
   EXPECT_EQ(node.rsrv->UringReads(), kItems);
   EXPECT_EQ(node.rsrv->UringCompletions(), kItems);
   EXPECT_EQ(node.rsrv->UringInflight(), 0u);
   EXPECT_GE(node.rsrv->UringInflightMax(), 16u);
-  EXPECT_FALSE(backend->BadState());
+  for (int attempt = 0;
+       attempt < 500 &&
+       node.rsrv->UringSendFences() - send_fences_before < kItems;
+       ++attempt)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  EXPECT_GE(node.rsrv->UringSendFences() - send_fences_before, kItems);
+  EXPECT_EQ(node.rsrv->UringSendPostErrors(), send_post_errors_before);
+  EXPECT_EQ(node.rsrv->UringRepliesPosted() - replies_posted_before, kItems);
+  EXPECT_EQ(node.BackendSnapshot().size(), backend_count_after_admission);
+  EXPECT_EQ(node.rsrv->V2Conns(), conns_after_admission);
+  EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - pipeline_started)
+                .count(),
+            10000)
+      << "controlled pipeline exceeded its deterministic fixture budget";
+  for (ControlledRdmaUringBackend* active : node.BackendSnapshot())
+    EXPECT_FALSE(active->BadState());
 #endif
 }
 
@@ -3682,85 +3797,204 @@ TEST(RdmaLoopback, ControlledUringMultiWindowBytesAndSendLifetimeAreExact) {
   ScopedEnv uring_depth("DFKV_SERVER_URING_DEPTH", "16");
   ScopedEnv depth("DFKV_RDMA_DEPTH", "16");
   ScopedEnv recv_segment("DFKV_RDMA_RECV_SEGMENT_SIZE", "8388608");
+  ScopedEnv batch_timeout("DFKV_RDMA_BATCH_OP_TIMEOUT_MS", "15000");
 
   constexpr size_t kMsg = 64 * 1024;
+  const std::string logical_key = "controlled_multi";
+  const BlockKey key = ToBlockKey(SelfHdr(), logical_key);
   RdmaUringNode node(
       "controlled-multi-window", kMsg,
       [](ControlledRdmaUringBackend*) {});
   RdmaTransport transport(kMsg);
-  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
-  client.set_batch_concurrency(1);
   const size_t targets_per_window = transport.MaxSgPayloadSegs();
   ASSERT_GE(targets_per_window, 2u);
+  const auto align_capacity = [](MultiWindowGet* get) {
+    constexpr size_t kDiskAlignment = 4096;
+    const size_t capacity = get->capacity();
+    const size_t aligned =
+        (capacity + kDiskAlignment - 1) & ~(kDiskAlignment - 1);
+    const size_t extra = aligned - capacity;
+    get->sizes.back() += extra;
+    get->destinations.back().resize(get->sizes.back(), '\0');
+    get->pointers.back() = get->destinations.back().data();
+  };
   MultiWindowGet first(targets_per_window, 4, 503);
+  align_capacity(&first);
+  ASSERT_EQ(first.capacity() % 4096, 0u);
   const std::string value = PatternValue(first.capacity(), 509);
-  ASSERT_TRUE(
-      client.Put("controlled_multi", value.data(), value.size()));
-  ControlledRdmaUringBackend* backend = node.WaitForBackend(0);
-  ASSERT_NE(backend, nullptr);
+  std::string ignored;
+  ASSERT_EQ(
+      node.srv->ProcessRequestForKey(
+          static_cast<uint8_t>(WireOp::kCache), key, 0, 0, value.data(),
+          value.size(), &ignored),
+      Status::kOk);
+  const auto destination_for = [](MultiWindowGet& get) {
+    RangeDstMulti destination;
+    destination.payloads.reserve(get.pointers.size());
+    for (size_t i = 0; i < get.pointers.size(); ++i)
+      destination.payloads.emplace_back(get.pointers[i], get.sizes[i]);
+    return destination;
+  };
+  RangeDstMulti first_destination = destination_for(first);
+  const uint64_t writes_before = node.rsrv->V2GetWrites();
+  const uint64_t fences_before = node.rsrv->UringSendFences();
+  const uint64_t replies_before = node.rsrv->UringRepliesPosted();
+  const uint64_t completion_errors_before =
+      node.rsrv->CompletionErrors();
+  const uint64_t send_post_errors_before =
+      node.rsrv->UringSendPostErrors();
+
+  const auto stop_and_join = [&](std::thread* worker) {
+    std::atomic<bool> stopped{false};
+    std::thread stopper([&] {
+      node.rsrv->Stop();
+      stopped.store(true, std::memory_order_release);
+    });
+    for (int attempt = 0;
+         attempt < 1000 && !stopped.load(std::memory_order_acquire);
+         ++attempt) {
+      for (ControlledRdmaUringBackend* active : node.BackendSnapshot()) {
+        for (const auto& request : active->History())
+          active->CompleteRead(request.token);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    stopper.join();
+    if (worker && worker->joinable()) worker->join();
+  };
 
   std::vector<size_t> first_lengths;
-  std::vector<bool> first_result;
+  std::vector<Status> first_result;
   std::thread first_thread([&] {
-    first_result = client.BatchGetAutoSg(
-        {{"controlled_multi", first.pointers, first.sizes}},
-        &first_lengths);
+    first_result = transport.RangeIntoMulti(
+        node.addr, {key}, {first_destination}, &first_lengths);
   });
-  const bool first_submitted = backend->WaitForSubmitted(1);
-  EXPECT_TRUE(first_submitted);
+  ControlledRdmaUringBackend* backend =
+      node.WaitForBackendWithSubmitted(1);
+  if (backend == nullptr) {
+    ADD_FAILURE() << "direct multi-window read was not submitted";
+    stop_and_join(&first_thread);
+    return;
+  }
+  const auto initial_backends = node.BackendSnapshot();
+  const uint64_t conns_after_first = node.rsrv->V2Conns();
   auto history = backend->History();
-  if (!first_submitted || history.size() != 1 ||
+  if (history.size() != 1 ||
       !backend->CompleteRead(history.front().token)) {
     ADD_FAILURE() << "controlled multi-window read was not retained";
-    std::thread stopper([&] { node.rsrv->Stop(); });
-    for (const auto& request : history) backend->CompleteRead(request.token);
-    stopper.join();
-    first_thread.join();
+    stop_and_join(&first_thread);
+    return;
+  }
+  for (int attempt = 0;
+       attempt < 500 &&
+       node.rsrv->UringRepliesPosted() - replies_before < 1;
+       ++attempt)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  if (node.rsrv->UringRepliesPosted() - replies_before < 1) {
+    ADD_FAILURE()
+        << "first disk CQE produced no status SEND: writes="
+        << node.rsrv->V2GetWrites() - writes_before
+        << " replies=" << node.rsrv->UringRepliesPosted() - replies_before
+        << " fences=" << node.rsrv->UringSendFences() - fences_before
+        << " send_post_errors=" << node.rsrv->UringSendPostErrors()
+        << " completion_errors=" << node.rsrv->CompletionErrors()
+        << " active=" << node.rsrv->ActiveConns()
+        << " v2_conns=" << node.rsrv->V2Conns()
+        << " seen=" << backend->SeenCount()
+        << " accepted=" << backend->AcceptedCount()
+        << " bad_backend=" << backend->BadState();
+    stop_and_join(&first_thread);
+    return;
+  }
+  for (int attempt = 0; attempt < 2000; ++attempt) {
+    if (node.rsrv->V2GetWrites() - writes_before >= 4 ||
+        node.rsrv->CompletionErrors() != completion_errors_before ||
+        node.rsrv->ActiveConns() == 0)
+      break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  if (node.rsrv->V2GetWrites() - writes_before < 4) {
+    ADD_FAILURE()
+        << "multi-window continuation stalled after its first status: writes="
+        << node.rsrv->V2GetWrites() - writes_before
+        << " replies=" << node.rsrv->UringRepliesPosted() - replies_before
+        << " fences=" << node.rsrv->UringSendFences() - fences_before
+        << " send_post_errors=" << node.rsrv->UringSendPostErrors()
+        << " completion_errors=" << node.rsrv->CompletionErrors()
+        << " active=" << node.rsrv->ActiveConns()
+        << " v2_conns=" << node.rsrv->V2Conns()
+        << " seen=" << backend->SeenCount()
+        << " accepted=" << backend->AcceptedCount()
+        << " bad_backend=" << backend->BadState();
+    stop_and_join(&first_thread);
     return;
   }
   first_thread.join();
+  SCOPED_TRACE(
+      ::testing::Message()
+      << "first multi-window checkpoint: writes="
+      << node.rsrv->V2GetWrites() - writes_before
+      << " replies=" << node.rsrv->UringRepliesPosted() - replies_before
+      << " fences=" << node.rsrv->UringSendFences() - fences_before
+      << " send_post_errors_delta="
+      << node.rsrv->UringSendPostErrors() - send_post_errors_before
+      << " completion_errors_delta="
+      << node.rsrv->CompletionErrors() - completion_errors_before
+      << " active=" << node.rsrv->ActiveConns()
+      << " v2_conns=" << node.rsrv->V2Conns()
+      << " history=" << backend->History().size()
+      << " seen=" << backend->SeenCount()
+      << " accepted=" << backend->AcceptedCount()
+      << " max_inflight=" << backend->MaxInflight()
+      << " bad_backend=" << backend->BadState());
   ASSERT_EQ(first_result.size(), 1u);
-  ASSERT_TRUE(first_result[0]);
+  EXPECT_EQ(first_result[0], Status::kOk);
   ASSERT_EQ(first_lengths.size(), 1u);
   EXPECT_EQ(first_lengths[0], value.size());
   EXPECT_EQ(first.Flatten(), value);
-  EXPECT_EQ(node.PrepareCalls("controlled_multi"), 1u);
-  EXPECT_EQ(node.RangeCalls("controlled_multi"), 0u);
+  EXPECT_EQ(node.PrepareCalls(logical_key), 1u);
+  EXPECT_EQ(node.RangeCalls(logical_key), 0u);
   EXPECT_EQ(backend->History().size(), 1u)
       << "continuation windows must retain, not resubmit, the source";
+  EXPECT_EQ(node.rsrv->V2GetWrites() - writes_before, 4u);
+  EXPECT_EQ(node.rsrv->UringRepliesPosted() - replies_before, 4u);
 
-  // Immediate reuse exercises the final signaled SEND ownership fence. The
-  // first source slot/PreparedRead may be recycled only after that completion.
+  // Immediate same-transport reuse exercises the final signaled SEND ownership
+  // fence. The first source slot/PreparedRead may be recycled only afterward.
   MultiWindowGet second(targets_per_window, 4, 503);
+  align_capacity(&second);
+  RangeDstMulti second_destination = destination_for(second);
   std::vector<size_t> second_lengths;
-  std::vector<bool> second_result;
+  std::vector<Status> second_result;
   std::thread second_thread([&] {
-    second_result = client.BatchGetAutoSg(
-        {{"controlled_multi", second.pointers, second.sizes}},
-        &second_lengths);
+    second_result = transport.RangeIntoMulti(
+        node.addr, {key}, {second_destination}, &second_lengths);
   });
-  const bool second_submitted = backend->WaitForSubmitted(2);
-  EXPECT_TRUE(second_submitted);
+  const bool second_submitted = backend->WaitForSubmitted(2, 2000);
   history = backend->History();
   if (!second_submitted || history.size() != 2 ||
       !backend->CompleteRead(history.back().token)) {
     ADD_FAILURE() << "source slot was not reusable after final SEND";
-    std::thread stopper([&] { node.rsrv->Stop(); });
-    for (const auto& request : history) backend->CompleteRead(request.token);
-    stopper.join();
-    second_thread.join();
+    stop_and_join(&second_thread);
     return;
   }
+  EXPECT_GE(node.rsrv->UringSendFences() - fences_before, 4u)
+      << "second read reused the source before first final SEND fence";
+  EXPECT_EQ(node.BackendSnapshot().size(), initial_backends.size());
+  EXPECT_EQ(node.rsrv->V2Conns(), conns_after_first);
   second_thread.join();
   ASSERT_EQ(second_result.size(), 1u);
-  ASSERT_TRUE(second_result[0]);
+  EXPECT_EQ(second_result[0], Status::kOk);
   ASSERT_EQ(second_lengths.size(), 1u);
   EXPECT_EQ(second_lengths[0], value.size());
   EXPECT_EQ(second.Flatten(), value);
-  EXPECT_EQ(node.PrepareCalls("controlled_multi"), 2u);
-  EXPECT_EQ(node.RangeCalls("controlled_multi"), 0u);
+  EXPECT_EQ(node.PrepareCalls(logical_key), 2u);
+  EXPECT_EQ(node.RangeCalls(logical_key), 0u);
   EXPECT_EQ(backend->History().size(), 2u);
-  EXPECT_FALSE(backend->BadState());
+  EXPECT_EQ(node.rsrv->V2GetWrites() - writes_before, 8u);
+  EXPECT_EQ(node.rsrv->UringRepliesPosted() - replies_before, 8u);
+  for (ControlledRdmaUringBackend* active : node.BackendSnapshot())
+    EXPECT_FALSE(active->BadState());
 #endif
 }
 TEST(RdmaLoopback, ControlledUringDisconnectDrainsPartialCqBeforeOwners) {
@@ -3772,6 +4006,7 @@ TEST(RdmaLoopback, ControlledUringDisconnectDrainsPartialCqBeforeOwners) {
   ScopedEnv uring_depth("DFKV_SERVER_URING_DEPTH", "16");
   ScopedEnv depth("DFKV_RDMA_DEPTH", "16");
   ScopedEnv recv_segment("DFKV_RDMA_RECV_SEGMENT_SIZE", "8388608");
+  ScopedEnv batch_timeout("DFKV_RDMA_BATCH_OP_TIMEOUT_MS", "15000");
 
   constexpr size_t kMsg = 64 * 1024;
   constexpr size_t kItems = 16;
@@ -3779,38 +4014,59 @@ TEST(RdmaLoopback, ControlledUringDisconnectDrainsPartialCqBeforeOwners) {
       "controlled-disconnect", kMsg,
       [](ControlledRdmaUringBackend*) {});
   RdmaTransport transport(kMsg);
-  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
-  client.set_batch_concurrency(1);
-  std::vector<std::string> keys(kItems), values(kItems);
-  std::vector<KvPutItem> puts(kItems);
+  std::vector<BlockKey> keys(kItems);
+  std::vector<std::string> values(kItems), outputs(kItems);
+  std::vector<RangeDst> destinations(kItems);
   for (size_t i = 0; i < kItems; ++i) {
-    keys[i] = "controlled_disconnect_" + std::to_string(i);
-    values[i] = PatternValue(8192 + i, 300 + i);
-    puts[i] = {keys[i], values[i].data(), values[i].size()};
-  }
-  const auto put_result = client.BatchPut(puts);
-  ASSERT_EQ(put_result.size(), kItems);
-  for (bool ok : put_result) ASSERT_TRUE(ok);
-  ControlledRdmaUringBackend* backend = node.WaitForBackend(0);
-  ASSERT_NE(backend, nullptr);
-
-  std::vector<std::string> outputs(kItems);
-  std::vector<KvGetItem> gets(kItems);
-  for (size_t i = 0; i < kItems; ++i) {
+    keys[i] = ToBlockKey(
+        SelfHdr(), "controlled_disconnect_" + std::to_string(i));
+    values[i] = PatternValue(8192, 300 + i);
+    std::string ignored;
+    ASSERT_EQ(
+        node.srv->ProcessRequestForKey(
+            static_cast<uint8_t>(WireOp::kCache), keys[i], 0, 0,
+            values[i].data(), values[i].size(), &ignored),
+        Status::kOk);
     outputs[i].assign(values[i].size(), '\0');
-    gets[i] = {keys[i], outputs[i].data(), outputs[i].size()};
+    destinations[i] = {outputs[i].data(), outputs[i].size()};
   }
-  std::vector<bool> get_result;
-  std::thread get_thread([&] { get_result = client.BatchGet(gets); });
-  const bool submitted = backend->WaitForSubmitted(kItems);
-  EXPECT_TRUE(submitted);
-  const auto history = backend->History();
-  if (!submitted || history.size() != kItems) {
-    ADD_FAILURE() << "disconnect fixture did not admit the full depth";
-    std::thread stopper([&] { node.rsrv->Stop(); });
-    for (const auto& request : history) backend->CompleteRead(request.token);
+
+  std::vector<Status> statuses;
+  std::vector<uint64_t> value_lengths;
+  std::thread get_thread([&] {
+    statuses =
+        transport.RangeInto(node.addr, keys, destinations, &value_lengths);
+  });
+  const auto stop_and_join = [&] {
+    std::atomic<bool> stopped{false};
+    std::thread stopper([&] {
+      node.rsrv->Stop();
+      stopped.store(true, std::memory_order_release);
+    });
+    for (int attempt = 0;
+         attempt < 1000 && !stopped.load(std::memory_order_acquire);
+         ++attempt) {
+      for (ControlledRdmaUringBackend* active : node.BackendSnapshot()) {
+        for (const auto& request : active->History())
+          active->CompleteRead(request.token);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     stopper.join();
-    get_thread.join();
+    if (get_thread.joinable()) get_thread.join();
+  };
+  ControlledRdmaUringBackend* backend =
+      node.WaitForBackendWithSubmitted(kItems);
+  if (backend == nullptr) {
+    ADD_FAILURE() << "direct disconnect fixture did not admit the full depth";
+    stop_and_join();
+    return;
+  }
+  const auto history = backend->History();
+  if (history.size() != kItems) {
+    ADD_FAILURE() << "disconnect fixture admitted " << history.size()
+                  << " reads instead of exactly " << kItems;
+    stop_and_join();
     return;
   }
 
@@ -3842,7 +4098,8 @@ TEST(RdmaLoopback, ControlledUringDisconnectDrainsPartialCqBeforeOwners) {
   EXPECT_EQ(backend->AcceptedCount(), 0u);
   EXPECT_TRUE(backend->Exited());
   EXPECT_EQ(node.rsrv->UringInflight(), 0u);
-  EXPECT_FALSE(backend->BadState());
+  for (ControlledRdmaUringBackend* active : node.BackendSnapshot())
+    EXPECT_FALSE(active->BadState());
 #endif
 }
 
@@ -3856,47 +4113,74 @@ TEST(RdmaLoopback, ControlledUringSubmitFailureDrainsAcceptedReadAndAborts) {
   ScopedEnv uring_depth("DFKV_SERVER_URING_DEPTH", "8");
   ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
   ScopedEnv recv_segment("DFKV_RDMA_RECV_SEGMENT_SIZE", "4194304");
+  ScopedEnv batch_timeout("DFKV_RDMA_BATCH_OP_TIMEOUT_MS", "15000");
 
   constexpr size_t kMsg = 64 * 1024;
   constexpr size_t kItems = 4;
   RdmaUringNode node(
       "controlled-partial-submit", kMsg,
-      [](ControlledRdmaUringBackend*) {});
+      [](ControlledRdmaUringBackend* backend) {
+        backend->SetSubmitResults({1, -EIO});
+      });
   RdmaTransport transport(kMsg);
-  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
-  client.set_batch_concurrency(1);
-  std::vector<std::string> keys(kItems), values(kItems);
-  std::vector<KvPutItem> puts(kItems);
-  for (size_t i = 0; i < kItems; ++i) {
-    keys[i] = "controlled_partial_" + std::to_string(i);
-    values[i] = PatternValue(4096 + i, 600 + i);
-    puts[i] = {keys[i], values[i].data(), values[i].size()};
-  }
-  const auto put_result = client.BatchPut(puts);
-  ASSERT_EQ(put_result.size(), kItems);
-  for (bool ok : put_result) ASSERT_TRUE(ok);
-  ControlledRdmaUringBackend* backend = node.WaitForBackend(0);
-  ASSERT_NE(backend, nullptr);
-  // Whether ingress is grouped or arrives singly, exactly one read reaches the
-  // kernel before the scripted submit failure forces connection teardown.
-  backend->SetSubmitResults({1, -EIO});
-
+  std::vector<std::string> logical_keys(kItems), values(kItems);
+  std::vector<BlockKey> keys(kItems);
   std::vector<std::string> outputs(
-      kItems, std::string(4100, '\x5a'));
-  std::vector<KvGetItem> gets(kItems);
-  for (size_t i = 0; i < kItems; ++i)
-    gets[i] = {keys[i], outputs[i].data(), values[i].size()};
-  std::vector<bool> get_result;
-  std::thread get_thread([&] { get_result = client.BatchGet(gets); });
-  const bool admitted = backend->WaitForSubmitted(1);
-  EXPECT_TRUE(admitted);
-  const auto history = backend->History();
-  if (!admitted || history.size() != 1) {
-    ADD_FAILURE() << "backend did not expose the scripted accepted read";
-    std::thread stopper([&] { node.rsrv->Stop(); });
-    for (const auto& request : history) backend->CompleteRead(request.token);
+      kItems, std::string(4096, '\x5a'));
+  std::vector<RangeDst> destinations(kItems);
+  for (size_t i = 0; i < kItems; ++i) {
+    logical_keys[i] = "controlled_partial_" + std::to_string(i);
+    keys[i] = ToBlockKey(SelfHdr(), logical_keys[i]);
+    values[i] = PatternValue(4096, 600 + i);
+    std::string ignored;
+    ASSERT_EQ(
+        node.srv->ProcessRequestForKey(
+            static_cast<uint8_t>(WireOp::kCache), keys[i], 0, 0,
+            values[i].data(), values[i].size(), &ignored),
+        Status::kOk);
+    destinations[i] = {outputs[i].data(), outputs[i].size()};
+  }
+
+  std::vector<Status> statuses;
+  std::vector<uint64_t> value_lengths;
+  std::thread get_thread([&] {
+    statuses =
+        transport.RangeInto(node.addr, keys, destinations, &value_lengths);
+  });
+  const auto stop_and_join = [&] {
+    std::atomic<bool> stopped{false};
+    std::thread stopper([&] {
+      node.rsrv->Stop();
+      stopped.store(true, std::memory_order_release);
+    });
+    for (int attempt = 0;
+         attempt < 1000 && !stopped.load(std::memory_order_acquire);
+         ++attempt) {
+      for (ControlledRdmaUringBackend* active : node.BackendSnapshot()) {
+        for (const auto& request : active->History())
+          active->CompleteRead(request.token);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     stopper.join();
-    get_thread.join();
+    if (get_thread.joinable()) get_thread.join();
+  };
+  ControlledRdmaUringBackend* backend =
+      node.WaitForBackendWithSubmitted(1);
+  if (backend == nullptr) {
+    ADD_FAILURE() << "backend did not expose the scripted accepted read";
+    stop_and_join();
+    return;
+  }
+  const bool failed_after_partial_admission =
+      backend->WaitForSubmitCalls(2);
+  const auto history = backend->History();
+  if (!failed_after_partial_admission || history.size() != 1) {
+    ADD_FAILURE() << "scripted second submit failure did not follow one "
+                     "accepted read: calls="
+                  << (failed_after_partial_admission ? ">=2" : "<2")
+                  << " accepted_history=" << history.size();
+    stop_and_join();
     return;
   }
 
@@ -3910,14 +4194,15 @@ TEST(RdmaLoopback, ControlledUringSubmitFailureDrainsAcceptedReadAndAborts) {
   EXPECT_EQ(node.rsrv->UringInflight(), 0u);
   EXPECT_LE(node.rsrv->UringReads(), 1u)
       << "only a fully admitted first group may publish a logical read";
-  ASSERT_EQ(get_result.size(), kItems);
+  ASSERT_EQ(statuses.size(), kItems);
   for (size_t i = 0; i < kItems; ++i) {
-    EXPECT_FALSE(get_result[i]) << i;
-    EXPECT_EQ(outputs[i], std::string(4100, '\x5a')) << i;
-    EXPECT_EQ(node.RangeCalls(keys[i]), 0u) << i;
+    EXPECT_EQ(statuses[i], Status::kIOError) << i;
+    EXPECT_EQ(outputs[i], std::string(4096, '\x5a')) << i;
+    EXPECT_EQ(node.RangeCalls(logical_keys[i]), 0u) << i;
   }
-  EXPECT_GE(node.PrepareCalls(keys[0]), 1u);
-  EXPECT_FALSE(backend->BadState());
+  EXPECT_GE(node.PrepareCalls(logical_keys[0]), 1u);
+  for (ControlledRdmaUringBackend* active : node.BackendSnapshot())
+    EXPECT_FALSE(active->BadState());
 #endif
 }
 TEST(RdmaLoopback, ControlledUringInitFailureUsesExactSyncFallback) {
