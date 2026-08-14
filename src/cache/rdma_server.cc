@@ -1304,8 +1304,6 @@ void RdmaServer::Serve(int boot_fd) {
           ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
         if (g == 0) { idle_reclaims_.fetch_add(1, std::memory_order_relaxed); break; }
         if (g < 0) break;  // error / Stop()'s Wake()
-        if (before_uring_ready_drain_for_test_)
-          before_uring_ready_drain_for_test_();
         // A CQ notification commonly wakes for the first WC while the rest of
         // the client window is arriving. Snapshot those already-ready WCs now,
         // before synchronous preparation/disk wait strands them in the CQ.
