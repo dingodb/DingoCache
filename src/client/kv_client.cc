@@ -1426,25 +1426,21 @@ std::string PernodeFmt1(uint64_t x10) {
   return std::to_string(x10 / 10) + "." + std::to_string(x10 % 10);
 }
 
-const std::string& PernodeSuffix() {
-  static const std::string suffix = [] {
-    const char* env_suffix = std::getenv("DFKV_CLIENT_LOG_SUFFIX");
-    const std::string pid_tag = "p" + std::to_string(::getpid());
-    std::string value =
-        env_suffix && *env_suffix ? env_suffix : pid_tag;
-    for (char& c : value)
-      if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_')
-        c = '_';
-    // A launcher-supplied rank identity is attributable but not necessarily
-    // process-unique (for example TP rank repeats across DP/PP groups).
-    if (value != pid_tag &&
-        (value.size() <= pid_tag.size() ||
-         value.compare(value.size() - pid_tag.size(), pid_tag.size(),
-                       pid_tag) != 0))
-      value += "_" + pid_tag;
-    return value;
-  }();
-  return suffix;
+std::string PernodeSuffix() {
+  const char* env_suffix = std::getenv("DFKV_CLIENT_LOG_SUFFIX");
+  const std::string pid_tag = "p" + std::to_string(::getpid());
+  std::string value = env_suffix && *env_suffix ? env_suffix : pid_tag;
+  for (char& c : value)
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_')
+      c = '_';
+  // A launcher-supplied rank identity is attributable but not necessarily
+  // process-unique (for example TP rank repeats across DP/PP groups).
+  if (value != pid_tag &&
+      (value.size() <= pid_tag.size() ||
+       value.compare(value.size() - pid_tag.size(), pid_tag.size(), pid_tag) !=
+           0))
+    value += "_" + pid_tag;
+  return value;
 }
 
 // File I/O is confined to this worker. Producers only move an already-formatted
