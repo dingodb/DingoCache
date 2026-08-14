@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dfkv-connector"
-version = "2.20.1"
+version = "2.21.0"
 description = "LMCache RemoteConnector for the dfkv KV cache (ctypes over libdfkv.so)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -14,7 +14,7 @@ authors = [{ name = "Wine93", email = "wine93.info@gmail.com" }]
 # runtime by path (DFKV_LIB / remote_storage_plugin.dfkv.lib). No bundled .so,
 # no CPython extension, so the wheel is platform-independent.
 dependencies = [
-  "dfkv-common==2.20.1",
+  "dfkv-common==2.21.0",
   "lmcache",
   "torch",
 ]
