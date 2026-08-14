@@ -83,7 +83,8 @@ struct FakePipelinedTransport : Transport {
   std::vector<Status> RangeIntoMulti(
       const std::string&, const std::vector<BlockKey>& keys,
       const std::vector<RangeDstMulti>& dsts,
-      std::vector<size_t>* value_lens) override {
+      std::vector<size_t>* value_lens,
+      std::string* /*out_dev*/ = nullptr) override {
     value_lens->assign(keys.size(), 0);
     last_multi_kinds.clear();
     last_multi_kinds.reserve(dsts.size());
