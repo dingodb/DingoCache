@@ -1431,6 +1431,13 @@ class DfkvStoreWorker:
                     and os.environ.get("DFKV_CLIENT_NODE_DEDUP_GPU") is None):
                 os.environ["DFKV_CLIENT_NODE_DEDUP_GPU"] = "1"
 
+        # dfkv: per-rank client log suffix, mirroring the access log's
+        # ``.r{rank}`` form (access_log._build_sink), so the
+        # DFKV_CLIENT_PERNODE_STATS files of concurrent workers never share
+        # one file: dfkv_client_get.log.r3 etc. setdefault keeps an
+        # operator-provided suffix authoritative.
+        os.environ.setdefault("DFKV_CLIENT_LOG_SUFFIX", f"r{self.tp_rank}")
+
         client_kwargs = dict(
             members=extra.get("members", ""),
             mds_endpoints=mds_endpoints,
