@@ -231,6 +231,12 @@ class RcEndpoint {
   // RDMA v2 one-sided primitives. Responder PostWrite is signaled: its CQE is
   // tracked until DONE on success or explicit writer retirement on ambiguity.
   // WRITE_WITH_IMM is the client's signaled request operation.
+  // Initiator-side one-sided READ. `destination_mr` belongs to this endpoint's
+  // PD; the remote descriptor must remain leased until the signaled CQE is
+  // terminal.
+  bool PostRead(size_t slot, void* destination, size_t length,
+                ibv_mr* destination_mr, uint64_t remote_addr,
+                uint32_t remote_rkey);
   bool PostWrite(size_t slot, const void* source, size_t length,
                  ibv_mr* source_mr, uint64_t remote_addr,
                  uint32_t remote_rkey);
