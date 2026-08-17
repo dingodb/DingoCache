@@ -703,6 +703,13 @@ void RdmaServer::Serve(int boot_fd) {
     size_t bytes = 0;
     double elapsed_sec = 0.0;
   };
+  struct PullSlotState {
+    bool busy = false;
+    uint64_t generation = 1;
+    size_t data_len = 0;
+    size_t value_len = 0;
+  };
+  std::vector<PullSlotState> pull_slots(K);
   std::vector<MultiPutState> multi_put(K);
   std::vector<MultiGetState> multi_get(K);
   std::vector<int32_t> multi_get_source_owner(K, -1);
@@ -983,6 +990,10 @@ void RdmaServer::Serve(int boot_fd) {
       }
       return request->get.targets.size() <= rdma::kV2MaxGetTargets;
     }
+    if (request->fields.op == static_cast<uint8_t>(WireOp::kPullRange) ||
+        request->fields.op == static_cast<uint8_t>(WireOp::kPullRelease)) {
+      return completion.byte_len == kReqPrefix;
+    }
 
 
     if (multi_put[recv_slot].active) return false;
@@ -1120,6 +1131,63 @@ void RdmaServer::Serve(int boot_fd) {
       reply->first_len = response_prefix;
       return true;
     };
+    if (fields.op == static_cast<uint8_t>(WireOp::kPullRelease)) {
+      if (!pull_read_requested || fields.payload_len == 0 ||
+          fields.payload_len > K)
+        return invalid_reply();
+      const size_t slot = static_cast<size_t>(fields.payload_len - 1);
+      PullSlotState& state = pull_slots[slot];
+      if (!state.busy || state.generation != fields.length)
+        return invalid_reply();
+      state.busy = false;
+      state.data_len = 0;
+      state.value_len = 0;
+      ++state.generation;
+      if (state.generation == 0) ++state.generation;
+      encode_status(Status::kOk, 0);
+      reply->first_len = response_prefix;
+      return true;
+    }
+
+    if (fields.op == static_cast<uint8_t>(WireOp::kPullRange)) {
+      if (!pull_read_requested || !range_handler_ ||
+          fields.payload_len == 0 || fields.payload_len > K ||
+          fields.length > static_cast<uint64_t>(conn_max))
+        return invalid_reply();
+      const size_t slot = static_cast<size_t>(fields.payload_len - 1);
+      PullSlotState& state = pull_slots[slot];
+      if (state.busy) {
+        encode_status(Status::kCacheFull, 0);
+        reply->first_len = response_prefix;
+        return true;
+      }
+      char* target = pull_lease.data() + slot * slot_size;
+      const char* output = nullptr;
+      size_t output_len = 0;
+      size_t value_len = 0;
+      const Status status =
+          range_handler_(key, fields.offset, fields.length, target, slot_size,
+                         &output, &output_len, &value_len);
+      if (status != Status::kOk) {
+        encode_status(status, 0, value_len);
+        reply->first_len = response_prefix;
+        return true;
+      }
+      if (output_len > slot_size || (output_len != 0 && output == nullptr))
+        return invalid_reply();
+      if (output_len != 0 && output != target)
+        std::memcpy(target, output, output_len);
+      state.busy = true;
+      state.data_len = output_len;
+      state.value_len = value_len;
+      const rdma::PullReady ready{static_cast<uint32_t>(slot),
+                                  state.generation, output_len, value_len};
+      encode_status(Status::kOk, rdma::kPullReadyBytes, value_len);
+      rdma::EncodePullReady(ready, send_buffer + response_prefix);
+      reply->first_len = response_prefix + rdma::kPullReadyBytes;
+      return true;
+    }
+
     if (fields.op == static_cast<uint8_t>(WireOp::kRange) &&
         request.get.window_index != 0) {
       const size_t operation_id = request.get.operation_id;

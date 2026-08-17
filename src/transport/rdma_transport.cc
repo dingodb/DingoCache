@@ -2599,47 +2599,112 @@ std::vector<Status> RdmaTransport::RangeInto(
   if (value_lens) value_lens->assign(count, 0);
   if (destinations.size() != count) return InvalidStatuses(count);
   std::vector<Status> result(count, Status::kInvalid);
-  if (count == 0) return result;
+  for (size_t item = 0; item < count; ++item) {
+    const RangeDst& destination = destinations[item];
+    if (!ValidBuffer(destination.payload, destination.n) ||
+        NoteBlock(destination.n))
+      continue;
+    AcquireOptions options;
+    options.requested_credits = 1;
+    options.peer = peer_topologies_->Snapshot(node);
+    AcquireResult acquired = Acquire(node, Lane::kData, options);
+    if (!acquired.conn) {
+      result[item] = acquired.status;
+      continue;
+    }
+    Conn* conn = acquired.conn;
+    rdma::RcEndpoint& ep = conn->ep;
+    bool reusable = true;
 
-  std::vector<BlockKey> valid_keys;
-  std::vector<size_t> indices;
-  valid_keys.reserve(count);
-  indices.reserve(count);
-  size_t max_capacity = 0;
-  for (size_t i = 0; i < count; ++i) {
-    if (!ValidBuffer(destinations[i].payload, destinations[i].n)) continue;
-    valid_keys.push_back(keys[i]);
-    indices.push_back(i);
-    max_capacity = std::max(max_capacity, destinations[i].n);
-  }
-  if (valid_keys.empty()) return result;
-
-  // Responder DMA is confined to these operation-owned strings. Only a
-  // successful DONE fence reaches DestinationPublisher and caller memory.
-  std::vector<std::string> staging;
-  std::vector<uint64_t> stored;
-  const auto staged =
-      RangeMany(node, valid_keys, 0, max_capacity, &staging, &stored);
-  DestinationPublisher publisher;
-  for (size_t valid_i = 0;
-       valid_i < indices.size() && valid_i < staged.size(); ++valid_i) {
-    const size_t i = indices[valid_i];
-    result[i] = staged[valid_i];
-    if (valid_i < stored.size() && value_lens)
-      (*value_lens)[i] = stored[valid_i];
-    if (result[i] != Status::kOk || valid_i >= staging.size()) continue;
-    const size_t bytes =
-        std::min(staging[valid_i].size(), destinations[i].n);
-    if (bytes &&
-        !publisher.Copy(destinations[i].payload, staging[valid_i].data(),
-                        bytes, destinations[i].memory_kind))
-      result[i] = Status::kIOError;
-  }
-  if (!publisher.Finish()) {
-    for (size_t i : indices)
-      if (result[i] == Status::kOk &&
-          destinations[i].memory_kind == DestinationMemoryKind::kDevice)
-        result[i] = Status::kIOError;
+    conn->Encode(ep.sbuf(0), WireOp::kPullRange, keys[item], 0,
+                 destination.n, 1);
+    std::vector<uint32_t> reply_bytes;
+    bool timed_out = false;
+    ibv_wc_status wc_status = IBV_WC_SUCCESS;
+    bool had_wcs = false;
+    bool ok = ep.PostRecv(0) && ep.PostSend(0, kReqPrefix) &&
+              ReapWindow(ep, 1, &reply_bytes, BatchTimeout(), &timed_out,
+                         &wc_status, &had_wcs);
+    if (timed_out)
+      completion_timeouts_.fetch_add(1, std::memory_order_relaxed);
+    Status status = Status::kIOError;
+    uint64_t response_len = 0;
+    uint64_t stored_len = 0;
+    rdma::PullReady ready;
+    if (!ok || reply_bytes.empty() || reply_bytes[0] < kRespPrefix ||
+        !conn->Decode(ep.rbuf(0), &status, &response_len,
+                      rdma::kPullReadyBytes, &stored_len) ||
+        (status == Status::kOk &&
+         (response_len != rdma::kPullReadyBytes ||
+          reply_bytes[0] < kRespPrefix + rdma::kPullReadyBytes ||
+          !rdma::DecodePullReady(ep.rbuf(0) + kRespPrefix, &ready)))) {
+      reusable = false;
+    } else if (status != Status::kOk) {
+      result[item] = status;
+      if (value_lens) (*value_lens)[item] = stored_len;
+    } else {
+      const size_t slot_bytes =
+          conn->pull_arena.arena_bytes / conn->pull_arena.slot_count;
+      if (ready.slot_index >= conn->pull_arena.slot_count ||
+          ready.data_len > destination.n || ready.data_len > slot_bytes ||
+          ready.value_len > destination.n) {
+        reusable = false;
+      } else {
+        ibv_mr* destination_mr =
+            ready.data_len
+                ? ep.RegisterTransient(destination.payload,
+                                       static_cast<size_t>(ready.data_len))
+                : nullptr;
+        if (ready.data_len != 0 && !destination_mr) {
+          reusable = false;
+        } else {
+          const uint64_t remote_addr =
+              conn->pull_arena.base_addr +
+              static_cast<uint64_t>(ready.slot_index) * slot_bytes;
+          bool read_ok =
+              ready.data_len == 0 ||
+              ep.PostRead(0, destination.payload,
+                          static_cast<size_t>(ready.data_len), destination_mr,
+                          remote_addr, conn->pull_arena.rkey);
+          if (read_ok && ready.data_len != 0) {
+            ibv_wc completion{};
+            read_ok = ep.WaitComp(&completion, 1, BatchTimeout()) == 1 &&
+                      completion.status == IBV_WC_SUCCESS &&
+                      completion.opcode == IBV_WC_RDMA_READ;
+          }
+          if (destination_mr) ep.ReleaseTransient(destination_mr);
+          if (!read_ok) {
+            reusable = false;
+          } else {
+            conn->Encode(ep.sbuf(0), WireOp::kPullRelease, BlockKey{}, 0,
+                         ready.slot_generation,
+                         static_cast<uint64_t>(ready.slot_index) + 1);
+            reply_bytes.clear();
+            timed_out = false;
+            wc_status = IBV_WC_SUCCESS;
+            had_wcs = false;
+            Status release_status = Status::kIOError;
+            uint64_t release_len = 0;
+            ok = ep.PostRecv(0) && ep.PostSend(0, kReqPrefix) &&
+                 ReapWindow(ep, 1, &reply_bytes, BatchTimeout(), &timed_out,
+                            &wc_status, &had_wcs) &&
+                 !reply_bytes.empty() && reply_bytes[0] >= kRespPrefix &&
+                 conn->Decode(ep.rbuf(0), &release_status, &release_len, 0) &&
+                 release_status == Status::kOk;
+            if (!ok) {
+              reusable = false;
+            } else {
+              result[item] = Status::kOk;
+              if (value_lens) (*value_lens)[item] = ready.value_len;
+            }
+          }
+        }
+      }
+    }
+    if (reusable)
+      Release(node, Lane::kData, conn);
+    else
+      Destroy(conn, rdma::RailCompletion::kEndpointFailure);
   }
   return result;
 }
