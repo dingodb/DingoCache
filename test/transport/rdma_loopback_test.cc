@@ -5911,17 +5911,17 @@ TEST(RdmaLoopback,
   ScopedEnv configured_device("DFKV_RDMA_DEV", nullptr);
   ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
   ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
-  ScopedEnv completion_fault("DFKV_RDMA_TEST_COMPLETION_FAULT",
-                             "1:1:1,1:2:1");
-  ScopedEnv retirement_fault("DFKV_RDMA_TEST_RETIREMENT_PROOF_FAILURE", "1");
-  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
 
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   RdmaNode node("writer-retire-proof-missing");
   RdmaTransport transport(kMaxMsg);
   const BlockKey key = ToBlockKey(SelfHdr(), "writer-retire-proof-missing");
   const std::string value = PatternValue(64 * 1024 + 13, 57);
   ASSERT_EQ(transport.Cache(node.addr, key, value.data(), value.size()),
             Status::kOk);
+  ScopedEnv completion_fault("DFKV_RDMA_TEST_COMPLETION_FAULT",
+                             "1:1:1,1:2:1");
+  ScopedEnv retirement_fault("DFKV_RDMA_TEST_RETIREMENT_PROOF_FAILURE", "1");
 
   std::string output(value.size(), '\x5a');
   std::vector<uint64_t> value_lens;
