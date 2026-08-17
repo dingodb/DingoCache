@@ -232,6 +232,10 @@ constexpr ibv_wc_status kLocalFaultWcStatus = IBV_WC_GENERAL_ERR;
 bool RetireRemoteWriter(const std::string& node, uint64_t token,
                         int connect_ms, int io_ms) {
   if (token == 0) return false;
+  if (const char* fault =
+          std::getenv("DFKV_RDMA_TEST_RETIREMENT_PROOF_FAILURE");
+      fault && std::strcmp(fault, "1") == 0)
+    return false;
   const int fd = net::Dial(node, connect_ms, io_ms);
   if (fd < 0) return false;
   char request[rdma::kDevNameBytes];
