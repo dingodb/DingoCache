@@ -1820,6 +1820,23 @@ std::string RdmaTransport::MetricsText() const {
   s += "dfkv_rdma_client_completion_timeouts_total " +
        std::to_string(completion_timeouts_.load(std::memory_order_relaxed)) +
        "\n";
+  s += "# HELP dfkv_rdma_client_pull_prepares_total Pull-read PREPARE requests posted\n";
+  s += "# TYPE dfkv_rdma_client_pull_prepares_total counter\n";
+  s += "dfkv_rdma_client_pull_prepares_total " +
+       std::to_string(pull_prepares_.load(std::memory_order_relaxed)) + "\n";
+  s += "# HELP dfkv_rdma_client_pull_reads_total Successful initiator READ operations\n";
+  s += "# TYPE dfkv_rdma_client_pull_reads_total counter\n";
+  s += "dfkv_rdma_client_pull_reads_total " +
+       std::to_string(pull_reads_.load(std::memory_order_relaxed)) + "\n";
+  s += "# HELP dfkv_rdma_client_pull_read_bytes_total Bytes completed by initiator READ\n";
+  s += "# TYPE dfkv_rdma_client_pull_read_bytes_total counter\n";
+  s += "dfkv_rdma_client_pull_read_bytes_total " +
+       std::to_string(pull_read_bytes_.load(std::memory_order_relaxed)) +
+       "\n";
+  s += "# HELP dfkv_rdma_client_pull_failures_total Pull-read operations that destroyed their connection\n";
+  s += "# TYPE dfkv_rdma_client_pull_failures_total counter\n";
+  s += "dfkv_rdma_client_pull_failures_total " +
+       std::to_string(pull_failures_.load(std::memory_order_relaxed)) + "\n";
   s += "# HELP dfkv_rdma_client_ambiguous_get_quarantines_total Failed staged GETs retained because responder retirement proof was unavailable\n";
   s += "# TYPE dfkv_rdma_client_ambiguous_get_quarantines_total counter\n";
   s += "dfkv_rdma_client_ambiguous_get_quarantines_total " +
@@ -2628,6 +2645,7 @@ std::vector<Status> RdmaTransport::RangeInto(
     const rdma::PullPrepareControl control{
         0, conn->pending_pull_generation};
     rdma::EncodePullPrepareControl(control, ep.sbuf(0) + kReqPrefix);
+    pull_prepares_.fetch_add(1, std::memory_order_relaxed);
     std::vector<uint32_t> reply_bytes;
     bool timed_out = false;
     ibv_wc_status wc_status = IBV_WC_SUCCESS;
@@ -2692,13 +2710,19 @@ std::vector<Status> RdmaTransport::RangeInto(
           } else {
             conn->pending_pull_slot = ready.slot_index;
             conn->pending_pull_generation = ready.slot_generation;
+            pull_reads_.fetch_add(1, std::memory_order_relaxed);
+            pull_read_bytes_.fetch_add(ready.data_len,
+                                       std::memory_order_relaxed);
             result[item] = Status::kOk;
             if (value_lens) (*value_lens)[item] = ready.value_len;
           }
         }
       }
     }
-    if (!reusable) result[item] = Status::kIOError;
+    if (!reusable) {
+      result[item] = Status::kIOError;
+      pull_failures_.fetch_add(1, std::memory_order_relaxed);
+    }
     if (reusable)
       Release(node, Lane::kData, conn);
     else
@@ -3007,6 +3031,7 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
     const rdma::PullPrepareControl control{
         0, conn->pending_pull_generation};
     rdma::EncodePullPrepareControl(control, ep.sbuf(0) + kReqPrefix);
+    pull_prepares_.fetch_add(1, std::memory_order_relaxed);
     std::vector<uint32_t> reply_bytes;
     bool timed_out = false;
     ibv_wc_status wc_status = IBV_WC_SUCCESS;
@@ -3070,6 +3095,9 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
         if (reusable && copied == ready.data_len) {
           conn->pending_pull_slot = ready.slot_index;
           conn->pending_pull_generation = ready.slot_generation;
+          pull_reads_.fetch_add(1, std::memory_order_relaxed);
+          pull_read_bytes_.fetch_add(ready.data_len,
+                                     std::memory_order_relaxed);
           result[item] = Status::kOk;
           if (out_lengths)
             (*out_lengths)[item] = static_cast<size_t>(ready.value_len);
@@ -3078,7 +3106,10 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
         }
       }
     }
-    if (!reusable) result[item] = Status::kIOError;
+    if (!reusable) {
+      result[item] = Status::kIOError;
+      pull_failures_.fetch_add(1, std::memory_order_relaxed);
+    }
     if (reusable)
       Release(node, Lane::kSgData, conn);
     else
