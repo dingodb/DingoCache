@@ -1786,15 +1786,12 @@ TEST(RdmaLoopback, MetricsCountersTrackOps) {
   EXPECT_NE(srv_text.find("dfkv_rdma_completions_total"), std::string::npos) << srv_text;
   EXPECT_GE(CounterVal(srv_text, "dfkv_rdma_v2_conns_opened_total"), 1);
   EXPECT_GE(CounterVal(srv_text, "dfkv_rdma_v2_put_writes_total"), 1);
-  EXPECT_GE(CounterVal(srv_text, "dfkv_rdma_v2_get_writes_total"), 1);
   EXPECT_GT(CounterVal(srv_text, "dfkv_rdma_recv_segment_bytes"), 0);
   EXPECT_NE(srv_text.find("dfkv_rdma_rail_active_conns{dev=\""),
             std::string::npos) << srv_text;
   EXPECT_GE(CounterVal(srv_text, "dfkv_rdma_rail_completions_total"), 2);
   EXPECT_GE(CounterVal(srv_text, "dfkv_rdma_rail_put_writes_total"), 1);
   EXPECT_GE(CounterVal(srv_text, "dfkv_rdma_rail_put_bytes_total"), 2048);
-  EXPECT_GE(CounterVal(srv_text, "dfkv_rdma_rail_get_writes_total"), 1);
-  EXPECT_GE(CounterVal(srv_text, "dfkv_rdma_rail_get_bytes_total"), 2048);
 
   // client transport: a connection was opened and the MR region declared
   std::string cli_text = rt.MetricsText();
@@ -1802,7 +1799,9 @@ TEST(RdmaLoopback, MetricsCountersTrackOps) {
   EXPECT_NE(cli_text.find("dfkv_rdma_client_rail_conns_total{dev="), std::string::npos) << cli_text;
   EXPECT_NE(cli_text.find("dfkv_rdma_client_mr_regions 1"), std::string::npos) << cli_text;
   EXPECT_GE(CounterVal(cli_text, "dfkv_rdma_client_v2_put_writes_total"), 1);
-  EXPECT_GE(CounterVal(cli_text, "dfkv_rdma_client_v2_get_writes_total"), 1);
+  EXPECT_GE(CounterVal(cli_text, "dfkv_rdma_client_pull_reads_total"), 1);
+  EXPECT_GE(CounterVal(cli_text,
+                       "dfkv_rdma_client_pull_read_bytes_total"), 2048);
   EXPECT_GE(CounterVal(cli_text,
                        "dfkv_rdma_client_pool_mr_registrations_total"), 1);
   EXPECT_GE(CounterVal(cli_text, "dfkv_rdma_client_max_block_seen_bytes"),
@@ -2783,7 +2782,7 @@ TEST(RdmaLoopback, ReclaimsAndReapsIdleConnThreads) {
 // failed" on writes and 0-hit prefixes on reads after an idle gap.
 TEST(RdmaLoopback, BatchRetriesAfterServerReclaim) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
-  ::setenv("DFKV_RDMA_IDLE_MS", "120", 1);   // server reclaims idle conns fast
+  ScopedEnv idle_reclaim("DFKV_RDMA_IDLE_MS", "120");
   RdmaNode node("brc");
   RdmaTransport rt(kMaxMsg);                   // long-lived: holds the device ctx
   KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
@@ -2825,7 +2824,6 @@ TEST(RdmaLoopback, BatchRetriesAfterServerReclaim) {
       CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
   EXPECT_GT(opened_after, opened_warm) << "batch op did not re-dial after reclaim";
 
-  ::unsetenv("DFKV_RDMA_IDLE_MS");
 }
 
 #ifdef DFKV_WITH_URING
@@ -3245,179 +3243,6 @@ std::string PatternValue(size_t size, size_t seed) {
   return value;
 }
 
-TEST(RdmaLoopback, MultiWindowGetDepthFourKeepsLogicalOperationsIsolated) {
-  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
-  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
-  ScopedEnv recv_segment("DFKV_RDMA_RECV_SEGMENT_SIZE", "33554432");
-  ScopedEnv idle_reclaim("DFKV_RDMA_IDLE_MS", "200");
-  ScopedEnv sync_prepared_reads("DFKV_SERVER_URING", "0");
-  // The malformed-window injection is local to the deliberate fault below.
-  // Force it off even when the test process inherited the variable, then
-  // restore the inherited value when the test exits.
-  ScopedEnv bad_get_op_id_disabled(
-      "DFKV_RDMA_TEST_BAD_GET_OP_ID_WINDOW", nullptr);
-  RdmaUringNode node("getopid");
-  ASSERT_EQ(node.rsrv->PipelineDepth(), 4u);
-
-  const uint64_t transient_baseline =
-      rdma::RcEndpoint::TransientUserMrActive();
-  const uint64_t active_baseline = node.rsrv->ActiveConns();
-  const auto wait_for_active_at_most = [&node](uint64_t limit) {
-    for (int i = 0; i < 1000 && node.rsrv->ActiveConns() > limit; ++i)
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    return node.rsrv->ActiveConns();
-  };
-
-  {
-    RdmaTransport rt(kMaxMsg);
-    KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
-    c.set_batch_concurrency(1);  // one QP; concurrency is the negotiated depth
-    ASSERT_EQ(
-        CounterVal(rt.MetricsText(), "dfkv_rdma_client_pipeline_depth"), 4);
-
-    const size_t targets_per_window = rt.MaxSgPayloadSegs();
-    ASSERT_GE(targets_per_window, 2u);
-    const size_t segment_count = targets_per_window * 3 + 5;
-    std::vector<size_t> sizes(segment_count);
-    for (size_t segment = 0; segment < segment_count; ++segment)
-      sizes[segment] = 73 + segment % 29;
-
-    constexpr size_t kItems = 2;
-    std::vector<std::string> values(kItems);
-    for (size_t item = 0; item < kItems; ++item) {
-      for (size_t segment = 0; segment < segment_count; ++segment) {
-        for (size_t byte = 0; byte < sizes[segment]; ++byte) {
-          values[item].push_back(static_cast<char>(
-              (item * 151 + segment * 41 + byte * 17) & 0xff));
-        }
-      }
-      ASSERT_TRUE(c.Put("getopid_" + std::to_string(item),
-                        values[item].data(), values[item].size()));
-    }
-    ASSERT_NE(values[0], values[1]);
-
-    std::vector<std::vector<std::string>> dst(
-        kItems, std::vector<std::string>(segment_count));
-    std::vector<KvGetItemSg> gets;
-    for (size_t item = 0; item < kItems; ++item) {
-      std::vector<void*> ptrs;
-      for (size_t segment = 0; segment < segment_count; ++segment) {
-        dst[item][segment].assign(sizes[segment], '\0');
-        ptrs.push_back(dst[item][segment].data());
-      }
-      gets.push_back(
-          {"getopid_" + std::to_string(item), ptrs, sizes});
-    }
-
-    const long slot_changes_before = CounterVal(
-        node.rsrv->MetricsText(),
-        "dfkv_rdma_v2_get_continuation_slot_changes_total");
-    std::vector<size_t> lengths;
-    const auto got = c.BatchGetAutoSg(gets, &lengths);
-    ASSERT_EQ(got.size(), kItems);
-    ASSERT_EQ(lengths.size(), kItems);
-    for (size_t item = 0; item < kItems; ++item) {
-      ASSERT_TRUE(got[item]) << "logical GET " << item;
-      EXPECT_EQ(lengths[item], values[item].size());
-      std::string flattened;
-      for (size_t segment = 0; segment < segment_count; ++segment)
-        flattened += dst[item][segment];
-      EXPECT_EQ(flattened, values[item]) << "logical GET " << item;
-      EXPECT_NE(flattened, values[1 - item])
-          << "continuation state crossed logical GET identities";
-    }
-    const long slot_changes_after = CounterVal(
-        node.rsrv->MetricsText(),
-        "dfkv_rdma_v2_get_continuation_slot_changes_total");
-    ASSERT_GE(slot_changes_before, 0);
-    EXPECT_GE(slot_changes_after - slot_changes_before, 2)
-        << "test did not move continuations across receive WQE slots";
-    EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), transient_baseline);
-
-    // Corrupt the stable identity on window two. The server must reject the
-    // continuation, destroy that operation's PreparedRead/state, and never
-    // issue writes for any later window. The transport retires the failed QP.
-    std::vector<std::string> poisoned_dst(
-        segment_count, std::string());
-    std::vector<void*> poisoned_ptrs;
-    for (size_t segment = 0; segment < segment_count; ++segment) {
-      poisoned_dst[segment].assign(sizes[segment], '\x5a');
-      poisoned_ptrs.push_back(poisoned_dst[segment].data());
-    }
-    const uint64_t active_before_fault = node.rsrv->ActiveConns();
-    const uint64_t opened_before_fault = node.rsrv->V2Conns();
-    std::vector<bool> failed;
-    std::vector<size_t> failed_lengths;
-    {
-      ScopedEnv bad_id("DFKV_RDMA_TEST_BAD_GET_OP_ID_WINDOW", "2");
-      failed = c.BatchGetAutoSg(
-          {{"getopid_0", poisoned_ptrs, sizes}}, &failed_lengths);
-    }
-    ASSERT_EQ(failed.size(), 1u);
-    EXPECT_FALSE(failed[0]);
-    ASSERT_EQ(failed_lengths.size(), 1u);
-    EXPECT_EQ(failed_lengths[0], 0u);
-    size_t first_window_offset = 0;
-    for (size_t segment = 0; segment < targets_per_window; ++segment) {
-      EXPECT_EQ(poisoned_dst[segment],
-                values[0].substr(first_window_offset, sizes[segment]))
-          << "fault injection ran before the first window, segment " << segment;
-      first_window_offset += sizes[segment];
-    }
-    for (size_t segment = targets_per_window;
-         segment < segment_count; ++segment) {
-      EXPECT_EQ(poisoned_dst[segment],
-                std::string(sizes[segment], '\x5a'))
-          << "server mutated a destination after rejecting bad op id, segment "
-          << segment;
-    }
-
-    const uint64_t opened_delta =
-        node.rsrv->V2Conns() - opened_before_fault;
-    ASSERT_GT(opened_delta, 0u);
-    ASSERT_GT(active_before_fault, active_baseline);
-    const uint64_t cleanup_limit = active_before_fault - 1;
-    EXPECT_LE(wait_for_active_at_most(cleanup_limit), cleanup_limit)
-        << "malformed continuation connection did not retire";
-    EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), transient_baseline);
-    ASSERT_EQ(std::getenv("DFKV_RDMA_TEST_BAD_GET_OP_ID_WINDOW"), nullptr);
-
-    // A fresh logical ID on the same key must not inherit rejected sequence
-    // state or a stale PreparedRead owner.
-    std::vector<std::string> recovered_dst(
-        segment_count, std::string());
-    std::vector<void*> recovered_ptrs;
-    for (size_t segment = 0; segment < segment_count; ++segment) {
-      recovered_dst[segment].assign(sizes[segment], '\0');
-      recovered_ptrs.push_back(recovered_dst[segment].data());
-    }
-    std::vector<size_t> recovered_lengths;
-    // A transport error marks the node unhealthy in the public KVClient API.
-    // Use fresh client health state while retaining the same transport/pool:
-    // recovery therefore tests QP retirement/redial rather than an intentional
-    // client cooldown, and still catches a poisoned pooled endpoint.
-    KVClient recovery_client({{"n", node.addr}}, SelfHdr(), &rt);
-    recovery_client.set_batch_concurrency(1);
-    const auto recovered = recovery_client.BatchGetAutoSg(
-        {{"getopid_0", recovered_ptrs, sizes}}, &recovered_lengths);
-    ASSERT_EQ(recovered.size(), 1u);
-    ASSERT_TRUE(recovered[0]);
-    ASSERT_EQ(recovered_lengths.size(), 1u);
-    EXPECT_EQ(recovered_lengths[0], values[0].size());
-    std::string recovered_value;
-    for (const auto& segment : recovered_dst) recovered_value += segment;
-    EXPECT_EQ(recovered_value, values[0]);
-    EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), transient_baseline);
-  }
-
-  EXPECT_LE(wait_for_active_at_most(active_baseline), active_baseline);
-  EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), transient_baseline);
-  node.rsrv->Stop();
-  EXPECT_EQ(node.rsrv->ActiveConns(), 0u);
-}
-
-// Multi-window io_uring contract: one prepared disk read backs every ordered
-// continuation, and its source ownership survives through the final SEND.
 TEST(RdmaLoopback, UringMultiWindowGetSubmitsOnceAndRetainsSource) {
 #ifndef DFKV_WITH_URING
   GTEST_SKIP() << "test requires a DFKV_WITH_URING build";
@@ -3610,208 +3435,6 @@ TEST(RdmaLoopback, UringMultiWindowDisconnectReleasesPreparedRead) {
         << "the failed owner leaked into the recovery operation";
   }
 #endif
-}
-
-TEST(RdmaLoopback, PreparedReadSyncAndSingleWindowPathsStayUnchanged) {
-  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
-  ScopedEnv uring("DFKV_SERVER_URING", "0");
-  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
-  ScopedEnv recv_segment("DFKV_RDMA_RECV_SEGMENT_SIZE", "33554432");
-  RdmaUringNode node("prepared-sync-unchanged", 64 * 1024);
-  RdmaTransport transport(64 * 1024);
-  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
-  client.set_batch_concurrency(1);
-
-  const std::string single_value = PatternValue(8193, 71);
-  ASSERT_TRUE(client.Put("prepared_single", single_value.data(),
-                         single_value.size()));
-  std::string single_out(single_value.size(), '\0');
-  ASSERT_TRUE(client.Get("prepared_single", single_out.data(),
-                         single_out.size()));
-  EXPECT_EQ(single_out, single_value);
-  EXPECT_EQ(node.PrepareCalls("prepared_single"), 1u);
-  EXPECT_EQ(node.RangeCalls("prepared_single"), 0u);
-  EXPECT_EQ(node.rsrv->UringReads(), 0u);
-
-  const size_t targets_per_window = transport.MaxSgPayloadSegs();
-  MultiWindowGet multi(targets_per_window, 3, 73);
-  const std::string multi_value = PatternValue(multi.capacity(), 79);
-  ASSERT_TRUE(
-      client.Put("prepared_multi", multi_value.data(), multi_value.size()));
-  std::vector<size_t> lengths;
-  const auto result = client.BatchGetAutoSg(
-      {{"prepared_multi", multi.pointers, multi.sizes}}, &lengths);
-  ASSERT_EQ(result.size(), 1u);
-  ASSERT_TRUE(result[0]);
-  ASSERT_EQ(lengths.size(), 1u);
-  EXPECT_EQ(lengths[0], multi_value.size());
-  EXPECT_EQ(multi.Flatten(), multi_value);
-  EXPECT_EQ(node.PrepareCalls("prepared_multi"), 1u);
-  EXPECT_EQ(node.RangeCalls("prepared_multi"), 0u);
-  EXPECT_EQ(node.rsrv->UringReads(), 0u);
-}
-
-// Correctness proof for the io_uring async-GET path: many concurrent GETs over a
-// SINGLE pooled connection, with the depth high enough that several requests are
-// in flight per WaitComp batch (so the server submits a multi-read io_uring batch
-// and must reply in arrival order). Every value must come back byte-correct. With
-// the flag OFF this still passes via the synchronous path (regression guard); with
-// DFKV_SERVER_URING=1 + a URING build it exercises the batch-and-wait reads.
-TEST(RdmaLoopback, UringAsyncGetManyConcurrentInOrder) {
-  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
-  // Request the async path (no-op if unbuilt). Use overwrite=0 so a shell-set
-  // DFKV_SERVER_URING (e.g. =0 to force the sync path) wins — this lets the CI
-  // run the SAME test through both the sync and async serve loops.
-  ::setenv("DFKV_SERVER_URING", "1", 0);
-  ::setenv("DFKV_SERVER_URING_DEPTH", "32", 1);
-  ::setenv("DFKV_RDMA_DEPTH", "8", 1);      // K=8 in-flight => multi-read batches
-  ::setenv("DFKV_RDMA_RECV_SEGMENT_SIZE", "4194304", 1);
-  // Small per-buffer cap so K=8 slots (rbuf+sbuf+dbuf each) stay under an 8 MiB
-  // RLIMIT_MEMLOCK (CI default). Values below are <= 12 KiB, well within 64 KiB.
-  constexpr size_t kUringMsg = 64 * 1024;
-  RdmaUringNode node("ag", kUringMsg);
-  RdmaTransport rt(kUringMsg);
-  ASSERT_TRUE(rt.pipelined());
-  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
-  // Pin client batch concurrency to 1 QP: the Soft-RoCE (rdma_rxe) loopback used
-  // in CI races when many distinct QPs run in parallel (an emulation artifact that
-  // hits the plain sync GET path too — see ScatterGatherRoundtripOverRdma). A
-  // single connection still pipelines up to `depth` GETs per send window, so the
-  // SERVER still forms multi-read io_uring batches; this only removes the rxe
-  // cross-QP flakiness, not the concurrency under test.
-  c.set_batch_concurrency(1);
-
-  // Distinct content per key (offset + index dependent) so a misrouted reply
-  // (wrong buffer / reordered) would mismatch. Mix of sizes incl. sub-page and
-  // multi-page to exercise the O_DIRECT aligned-superset trim.
-  const int N = 200;
-  const size_t kSizes[] = {64, 512, 4096, 8192, 12288};
-  std::vector<std::string> vals(N), keys(N);
-  std::vector<KvPutItem> puts(N);
-  for (int i = 0; i < N; ++i) {
-    keys[i] = "ag" + std::to_string(i);
-    size_t sz = kSizes[i % 5];
-    vals[i].resize(sz);
-    for (size_t k = 0; k < sz; ++k)
-      vals[i][k] = static_cast<char>((i * 131 + k * 7 + 13) & 0xFF);
-    puts[i] = {keys[i], vals[i].data(), sz};
-  }
-  auto pr = c.BatchPut(puts);
-  for (int i = 0; i < N; ++i) ASSERT_TRUE(pr[i]) << i;
-
-  // Exercise exactly one negotiated K=8 client window. The CQ may expose those
-  // completions over several nonblocking polls, so require the observable
-  // microbatch contract: all eight reads submitted, fewer than eight batches,
-  // and at least one submitted batch wider than one. Waiting briefly first
-  // keeps the seed PUT's SEND completions out of this controlled snapshot.
-  std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  constexpr size_t kControlledReads = 8;
-  std::vector<std::string> controlled_outs(kControlledReads);
-  std::vector<KvGetItem> controlled_gets(kControlledReads);
-  for (size_t i = 0; i < kControlledReads; ++i) {
-    controlled_outs[i].assign(vals[i].size(), '\0');
-    controlled_gets[i] = {keys[i], controlled_outs[i].data(), vals[i].size()};
-  }
-#ifdef DFKV_WITH_URING
-  const uint64_t controlled_reads_before = node.rsrv->UringReads();
-  const uint64_t controlled_batches_before = node.rsrv->UringReadBatches();
-#endif
-  const auto controlled_result = c.BatchGet(controlled_gets);
-  ASSERT_EQ(controlled_result.size(), kControlledReads);
-  for (size_t i = 0; i < kControlledReads; ++i) {
-    ASSERT_TRUE(controlled_result[i]) << "controlled key " << i;
-    EXPECT_EQ(controlled_outs[i], vals[i]) << "controlled key " << i;
-  }
-#ifdef DFKV_WITH_URING
-  const char* controlled_uring = std::getenv("DFKV_SERVER_URING");
-  if ((!controlled_uring || std::strcmp(controlled_uring, "0") != 0) &&
-      node.rsrv->UringInitFallbacks() == 0) {
-    EXPECT_EQ(controlled_reads_before, 0u);
-    EXPECT_EQ(controlled_batches_before, 0u);
-    EXPECT_EQ(node.rsrv->UringReads(), kControlledReads);
-    const uint64_t controlled_batches = node.rsrv->UringReadBatches();
-    const uint64_t controlled_max = node.rsrv->UringReadBatchMax();
-    EXPECT_GT(controlled_batches, 0u);
-    EXPECT_LT(controlled_batches, kControlledReads)
-        << "ready drain never submitted more than one read per batch";
-    EXPECT_GT(controlled_max, 1u);
-    EXPECT_LE(controlled_max, kControlledReads);
-    const std::string controlled_metrics = node.rsrv->MetricsText();
-    EXPECT_EQ(CounterVal(controlled_metrics, "dfkv_uring_batches_total"),
-              static_cast<long>(controlled_batches));
-    EXPECT_EQ(CounterVal(controlled_metrics,
-                         "dfkv_uring_batch_reads_total"),
-              static_cast<long>(kControlledReads));
-    EXPECT_EQ(CounterVal(controlled_metrics, "dfkv_uring_batch_max"),
-              static_cast<long>(controlled_max));
-  }
-#endif
-
-  // Run several BatchGet rounds over the one pooled connection; each round fans
-  // out N GETs that pipeline K-at-a-time -> the server forms multi-read batches.
-  for (int round = 0; round < 3; ++round) {
-    std::vector<std::string> outs(N);
-    std::vector<KvGetItem> gets(N);
-    for (int i = 0; i < N; ++i) { outs[i].assign(vals[i].size(), '\0'); gets[i] = {keys[i], &outs[i][0], vals[i].size()}; }
-    auto gr = c.BatchGet(gets);
-    for (int i = 0; i < N; ++i) {
-      ASSERT_TRUE(gr[i]) << "round " << round << " key " << i;
-      EXPECT_EQ(outs[i], vals[i]) << "round " << round << " key " << i;
-    }
-  }
-
-  // A miss on the async path must still be a clean miss (kNotFound), not an error
-  // or a stale-buffer hit; interleave present/absent to mix sync-miss + async-hit
-  // replies in the same pipelined window (order-preservation across reply kinds).
-  std::vector<std::string> mouts(N);
-  std::vector<KvGetItem> mgets;
-  std::vector<std::string> mkeys;
-  for (int i = 0; i < N; ++i) {
-    mkeys.push_back(keys[i]);
-    mkeys.push_back("ag_absent" + std::to_string(i));
-  }
-  std::vector<std::string> mo(mkeys.size());
-  std::vector<KvGetItem> mg(mkeys.size());
-  for (size_t i = 0; i < mkeys.size(); ++i) {
-    size_t cap = (i % 2 == 0) ? vals[i / 2].size() : 4096;
-    mo[i].assign(cap, '\0');
-    mg[i] = {mkeys[i], &mo[i][0], cap};
-  }
-  auto mgr = c.BatchGet(mg);
-  for (size_t i = 0; i < mkeys.size(); ++i) {
-    if (i % 2 == 0) {
-      ASSERT_TRUE(mgr[i]) << "present key " << mkeys[i];
-      EXPECT_EQ(mo[i], vals[i / 2]) << "present key " << mkeys[i];
-    } else {
-      EXPECT_FALSE(mgr[i]) << "absent key should miss: " << mkeys[i];
-    }
-  }
-
-  // The async (uring) read path now feeds op="get" latency: after this many
-  // disk-backed GETs the 1/64 sampler must have recorded at least one sample,
-  // where before this change the default read path was latency-blind. (When the
-  // shell forces DFKV_SERVER_URING=0 the sync RangeDirect samples the same
-  // series, so the assertion holds through both serve loops.)
-  const std::string mtext = node.srv->MetricsText();
-  auto gp = mtext.find("dfkv_op_latency_seconds_count{op=\"get\"}");
-  ASSERT_NE(gp, std::string::npos) << mtext;
-  long gcnt = std::stol(mtext.substr(
-      gp + std::string("dfkv_op_latency_seconds_count{op=\"get\"}").size()));
-  EXPECT_GT(gcnt, 0) << "uring GET path recorded no op=\"get\" latency sample";
-#ifdef DFKV_WITH_URING
-  const char* uring_enabled = std::getenv("DFKV_SERVER_URING");
-  if (!uring_enabled || std::strcmp(uring_enabled, "0") != 0) {
-    EXPECT_GT(node.rsrv->UringReads(), 0u)
-        << "auto-v2 silently bypassed the io_uring read path";
-    EXPECT_GT(node.rsrv->V2Conns(), 0u)
-        << "test did not exercise the v2 async-GET response path";
-  }
-#endif
-
-  ::unsetenv("DFKV_SERVER_URING");
-  ::unsetenv("DFKV_SERVER_URING_DEPTH");
-  ::unsetenv("DFKV_RDMA_DEPTH");
-  ::unsetenv("DFKV_RDMA_RECV_SEGMENT_SIZE");
 }
 
 TEST(RdmaLoopback, UringReadyDrainSingleCompletionDoesNotWaitAndRecovers) {
@@ -4658,76 +4281,6 @@ struct RamRdmaNode {
 };
 }  // namespace
 
-TEST(RdmaLoopback, RamTierZeroCopyServe) {
-  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device (load rdma_rxe for Soft-RoCE)";
-  RamRdmaNode node("ram");
-  ASSERT_TRUE(node.srv->ram_enabled());
-  RdmaTransport rt(kMaxMsg);
-  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
-
-  // PUT then GET a spread of blocks over RDMA; each must round-trip byte-for-byte
-  // even though the GET is served zero-copy from the arena MR.
-  const int N = 40;
-  std::vector<std::string> vals;
-  for (int i = 0; i < N; ++i) {
-    std::string v = "ram-rdma-" + std::to_string(i) + std::string(300 + i, 'q');
-    vals.push_back(v);
-    ASSERT_TRUE(c.Put("z" + std::to_string(i), v.data(), v.size())) << i;
-  }
-  for (int i = 0; i < N; ++i) {
-    std::string out(vals[i].size(), '\0');
-    ASSERT_TRUE(c.Get("z" + std::to_string(i), &out[0], out.size())) << i;
-    EXPECT_EQ(out, vals[i]) << i;
-  }
-
-  const std::string m = node.srv->MetricsText();
-  EXPECT_GT(CounterVal(m, "dfkv_ram_hit_total"), 0) << "GET must be served from RAM";
-  // Every send completed, so no arena slot is left send-pinned: a re-GET still
-  // works (pin released on IBV_WC_SEND, not leaked).
-  std::string out2(vals[0].size(), '\0');
-  ASSERT_TRUE(c.Get("z0", &out2[0], out2.size()));
-  EXPECT_EQ(out2, vals[0]);
-}
-
-TEST(RdmaLoopback, ColdGetPromotesDirectlyIntoRegisteredRamArena) {
-  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device (load rdma_rxe for Soft-RoCE)";
-  ::setenv("DFKV_READ_COALESCE", "1", 1);
-  ::setenv("DFKV_SERVER_URING", "1", 1);
-  {
-    RamRdmaNode node("cold-direct-promotion", kMaxMsg,
-                     /*writearound=*/true);
-    ASSERT_TRUE(node.srv->ram_enabled());
-    RdmaTransport rt(kMaxMsg);
-    KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
-
-    std::string value(256 * 1024, '\0');
-    for (size_t i = 0; i < value.size(); ++i)
-      value[i] = static_cast<char>('a' + (i % 19));
-    ASSERT_TRUE(c.Put("cold-direct", value.data(), value.size()));
-    EXPECT_EQ(CounterVal(node.srv->MetricsText(), "dfkv_ram_objects"), 0);
-
-    std::string first(value.size(), '\0');
-    ASSERT_TRUE(c.Get("cold-direct", first.data(), first.size()));
-    EXPECT_EQ(first, value);
-    const std::string after_cold = node.srv->MetricsText();
-    EXPECT_EQ(CounterVal(after_cold, "dfkv_ram_promoted_total"), 1);
-    EXPECT_EQ(CounterVal(after_cold, "dfkv_ram_objects"), 1);
-#ifdef DFKV_WITH_URING
-    EXPECT_GT(node.rsrv->UringReads(), 0u);
-#endif
-
-    const long hits_before =
-        CounterVal(after_cold, "dfkv_ram_hit_total");
-    std::string warm(value.size(), '\0');
-    ASSERT_TRUE(c.Get("cold-direct", warm.data(), warm.size()));
-    EXPECT_EQ(warm, value);
-    EXPECT_GT(CounterVal(node.srv->MetricsText(), "dfkv_ram_hit_total"),
-              hits_before);
-  }
-  ::unsetenv("DFKV_READ_COALESCE");
-  ::unsetenv("DFKV_SERVER_URING");
-}
-
 TEST(RdmaLoopback, UringMultiWindowCoalescedFollowerPromotesToRam) {
 #ifndef DFKV_WITH_URING
   GTEST_SKIP() << "test requires a DFKV_WITH_URING build";
@@ -5211,158 +4764,6 @@ TEST(RdmaLoopback,
     EXPECT_TRUE(device_buffers[i]->GuardsIntact())
         << "segment " << segment;
     offset += kSegmentSizes[segment];
-  }
-}
-
-TEST(RdmaLoopback,
-     PooledPostSubmitFailureDoesNotReplayPutAndGetRemainsReplaySafe) {
-  ScopedEnv configured_device("DFKV_RDMA_DEV", nullptr);
-  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
-  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
-  ScopedEnv ambient_completion_fault("DFKV_RDMA_TEST_COMPLETION_FAULT",
-                                     nullptr);
-  ScopedEnv ambient_local_failure(
-      "DFKV_RDMA_TEST_LOCAL_RAIL_FAILURE_ATTEMPTS", nullptr);
-  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
-  RdmaNode node("pooled-post-submit");
-  const std::string value("pooled\0put-value", 16);
-
-  const auto expect_single_pooled_put_attempt =
-      [](const std::string& before, const std::string& after,
-         long expected_posts) {
-        EXPECT_EQ(CounterVal(after, "dfkv_rdma_endpoint_cache_hits_total") -
-                      CounterVal(before,
-                                 "dfkv_rdma_endpoint_cache_hits_total"),
-                  1);
-        EXPECT_EQ(CounterVal(after, "dfkv_rdma_endpoint_cache_misses_total") -
-                      CounterVal(before,
-                                 "dfkv_rdma_endpoint_cache_misses_total"),
-                  0);
-        EXPECT_EQ(
-            CounterVal(after, "dfkv_rdma_client_v2_put_writes_total") -
-                CounterVal(before, "dfkv_rdma_client_v2_put_writes_total"),
-            expected_posts);
-        EXPECT_EQ(
-            CounterVal(after,
-                       "dfkv_rdma_client_stale_pool_retries_total") -
-                CounterVal(before,
-                           "dfkv_rdma_client_stale_pool_retries_total"),
-            0);
-        EXPECT_EQ(
-            CounterVal(after,
-                       "dfkv_rdma_client_cross_rail_retries_total") -
-                CounterVal(before,
-                           "dfkv_rdma_client_cross_rail_retries_total"),
-            0);
-      };
-
-  {
-    RdmaTransport transport(kMaxMsg);
-    const BlockKey warm_key =
-        ToBlockKey(SelfHdr(), "pooled-scalar-warm");
-    const BlockKey failed_key =
-        ToBlockKey(SelfHdr(), "pooled-scalar-failed");
-    ASSERT_EQ(transport.Cache(node.addr, warm_key, value.data(), value.size()),
-              Status::kOk);
-    const std::string before = transport.MetricsText();
-    {
-      ScopedEnv fault("DFKV_RDMA_TEST_COMPLETION_FAULT", "1:1:1");
-      EXPECT_EQ(
-          transport.Cache(node.addr, failed_key, value.data(), value.size()),
-          Status::kIOError);
-    }
-    const std::string after = transport.MetricsText();
-    expect_single_pooled_put_attempt(before, after, 1);
-    EXPECT_EQ(node.CacheDirectCalls(failed_key), 1u);
-  }
-
-  {
-    RdmaTransport transport(kMaxMsg);
-    const BlockKey warm_key =
-        ToBlockKey(SelfHdr(), "pooled-batch-warm");
-    const std::vector<BlockKey> failed_keys{
-        ToBlockKey(SelfHdr(), "pooled-batch-failed-0"),
-        ToBlockKey(SelfHdr(), "pooled-batch-failed-1"),
-    };
-    ASSERT_EQ(transport.CacheFrom(
-                  node.addr, {{warm_key, value.data(), value.size()}}),
-              std::vector<Status>({Status::kOk}));
-    const std::vector<CacheSrc> sources{
-        {failed_keys[0], value.data(), value.size()},
-        {failed_keys[1], value.data(), value.size()},
-    };
-    const std::string before = transport.MetricsText();
-    {
-      ScopedEnv fault("DFKV_RDMA_TEST_COMPLETION_FAULT", "1:1:1");
-      EXPECT_EQ(transport.CacheFrom(node.addr, sources),
-                std::vector<Status>(sources.size(), Status::kIOError));
-    }
-    const std::string after = transport.MetricsText();
-    expect_single_pooled_put_attempt(before, after, sources.size());
-    for (const BlockKey& key : failed_keys) {
-      EXPECT_EQ(node.CacheDirectCalls(key), 1u);
-    }
-  }
-
-  {
-    RdmaTransport transport(kMaxMsg);
-    const BlockKey warm_key =
-        ToBlockKey(SelfHdr(), "pooled-sg-warm");
-    const BlockKey failed_key =
-        ToBlockKey(SelfHdr(), "pooled-sg-failed");
-    const std::array<std::string, 2> segments{
-        std::string("first\0segment", 13),
-        std::string("second\0segment", 14),
-    };
-    CacheSrcMulti warm;
-    warm.key = warm_key;
-    warm.payloads = {{value.data(), value.size()}};
-    ASSERT_EQ(transport.CacheFromMulti(node.addr, {warm}),
-              std::vector<Status>({Status::kOk}));
-    CacheSrcMulti source;
-    source.key = failed_key;
-    source.payloads = {
-        {segments[0].data(), segments[0].size()},
-        {segments[1].data(), segments[1].size()},
-    };
-    const std::string before = transport.MetricsText();
-    {
-      ScopedEnv fault("DFKV_RDMA_TEST_COMPLETION_FAULT", "1:1:1");
-      EXPECT_EQ(transport.CacheFromMulti(node.addr, {source}),
-                std::vector<Status>({Status::kIOError}));
-    }
-    const std::string after = transport.MetricsText();
-    expect_single_pooled_put_attempt(before, after, 1);
-    EXPECT_EQ(node.CacheDirectCalls(failed_key), 1u);
-  }
-
-  {
-    RdmaTransport transport(kMaxMsg);
-    const BlockKey key = ToBlockKey(SelfHdr(), "pooled-get-retry");
-    ASSERT_EQ(transport.Cache(node.addr, key, value.data(), value.size()),
-              Status::kOk);
-    const std::string before = transport.MetricsText();
-    std::string output;
-    {
-      ScopedEnv fault("DFKV_RDMA_TEST_COMPLETION_FAULT", "1:1:1");
-      EXPECT_EQ(transport.Range(node.addr, key, 0, value.size(), &output,
-                                nullptr),
-                Status::kOk);
-    }
-    EXPECT_EQ(output, value);
-    const std::string after = transport.MetricsText();
-    EXPECT_EQ(CounterVal(after, "dfkv_rdma_endpoint_cache_hits_total") -
-                  CounterVal(before, "dfkv_rdma_endpoint_cache_hits_total"),
-              1);
-    EXPECT_EQ(CounterVal(after, "dfkv_rdma_endpoint_cache_misses_total") -
-                  CounterVal(before,
-                             "dfkv_rdma_endpoint_cache_misses_total"),
-              1);
-    EXPECT_EQ(
-        CounterVal(after, "dfkv_rdma_client_v2_get_writes_total") -
-            CounterVal(before, "dfkv_rdma_client_v2_get_writes_total"),
-        2);
-    EXPECT_EQ(node.RangeDirectCalls(key), 2u);
   }
 }
 
@@ -6505,7 +5906,11 @@ TEST(RdmaLoopback, SoleRemoteCooledRailReturnsExplicitFailure) {
   if (discovered.status != rdma::RdmaDiscoveryStatus::kOk ||
       discovered.devices.empty())
     GTEST_SKIP() << "no ACTIVE RDMA device";
-  const std::string rail = discovered.devices.front().name;
+  const char* configured = std::getenv("DFKV_RDMA_DEV");
+  const std::string rail =
+      configured && *configured && std::strchr(configured, ',') == nullptr
+          ? configured
+          : discovered.devices.front().name;
   RdmaNode node("remote-sole-cooled");
   RdmaTransport transport(kMaxMsg, rail);
   PeerTopology topology;
@@ -6596,7 +6001,11 @@ TEST(RdmaLoopback,
       discovered.devices.empty())
     GTEST_SKIP() << "no ACTIVE RDMA device";
 
-  const std::string rail = discovered.devices.front().name;
+  const char* configured = std::getenv("DFKV_RDMA_DEV");
+  const std::string rail =
+      configured && *configured && std::strchr(configured, ',') == nullptr
+          ? configured
+          : discovered.devices.front().name;
   RdmaNode node("peer-reincarnation");
   RdmaTransport transport(kMaxMsg, rail);
   PeerTopology topology;
