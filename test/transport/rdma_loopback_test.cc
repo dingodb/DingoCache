@@ -1409,11 +1409,12 @@ TEST(RdmaSafety, SuccessfulMultiRailPoolGrowthKeepsOldRangeUsable) {
 TEST(RdmaReadPrimitive, HostDestinationIsByteExact) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   constexpr size_t kBytes = 1024 * 1024;
+  const char* dev = std::getenv("DFKV_RDMA_DEV");
   rdma::RcEndpoint source;
   rdma::RcEndpoint initiator;
-  ASSERT_TRUE(source.Open(nullptr, 4096, 1, 1,
+  ASSERT_TRUE(source.Open(dev, 4096, 1, 1,
                           /*direct_io_buffers=*/true, kBytes));
-  ASSERT_TRUE(initiator.Open(nullptr, 4096, 1));
+  ASSERT_TRUE(initiator.Open(dev, 4096, 1));
   const rdma::QpInfo source_info = source.Local();
   const rdma::QpInfo initiator_info = initiator.Local();
   ASSERT_TRUE(source.Connect(initiator_info));
@@ -1434,6 +1435,88 @@ TEST(RdmaReadPrimitive, HostDestinationIsByteExact) {
   EXPECT_EQ(completion.opcode, IBV_WC_RDMA_READ);
   EXPECT_EQ(std::memcmp(destination.data(), source.dbuf(0), kBytes), 0);
   initiator.ReleaseTransient(destination_mr);
+}
+
+TEST(RdmaReadPrimitive, ConcurrentOneMiBThroughput) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  constexpr size_t kBytes = 1024 * 1024;
+  constexpr size_t kThreads = 32;
+  constexpr size_t kIterations = 512;
+  const char* dev = std::getenv("DFKV_RDMA_DEV");
+  struct Pair {
+    std::unique_ptr<rdma::RcEndpoint> source;
+    std::unique_ptr<rdma::RcEndpoint> initiator;
+    std::vector<char> destination;
+    ibv_mr* destination_mr = nullptr;
+  };
+  std::vector<std::unique_ptr<Pair>> pairs;
+  pairs.reserve(kThreads);
+  for (size_t thread = 0; thread < kThreads; ++thread) {
+    auto pair = std::make_unique<Pair>();
+    pair->source = std::make_unique<rdma::RcEndpoint>();
+    pair->initiator = std::make_unique<rdma::RcEndpoint>();
+    ASSERT_TRUE(pair->source->Open(dev, 4096, 1, 1,
+                                   /*direct_io_buffers=*/true, kBytes));
+    ASSERT_TRUE(pair->initiator->Open(dev, 4096, 1));
+    const rdma::QpInfo source_info = pair->source->Local();
+    const rdma::QpInfo initiator_info = pair->initiator->Local();
+    ASSERT_TRUE(pair->source->Connect(initiator_info));
+    ASSERT_TRUE(pair->initiator->Connect(source_info));
+    std::memset(pair->source->dbuf(0), static_cast<int>(thread + 1), kBytes);
+    pair->destination.assign(kBytes, '\0');
+    pair->destination_mr = pair->initiator->RegisterTransient(
+        pair->destination.data(), pair->destination.size());
+    ASSERT_NE(pair->destination_mr, nullptr);
+    pairs.push_back(std::move(pair));
+  }
+
+  std::atomic<bool> start{false};
+  std::atomic<size_t> failures{0};
+  std::vector<std::thread> workers;
+  workers.reserve(kThreads);
+  const auto begin = std::chrono::steady_clock::now();
+  for (size_t thread = 0; thread < kThreads; ++thread) {
+    workers.emplace_back([&, thread] {
+      Pair& pair = *pairs[thread];
+      while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+      for (size_t i = 0; i < kIterations; ++i) {
+        if (!pair.initiator->PostRead(
+                0, pair.destination.data(), pair.destination.size(),
+                pair.destination_mr,
+                reinterpret_cast<uint64_t>(pair.source->dbuf(0)),
+                pair.source->dmr(0)->rkey)) {
+          failures.fetch_add(1, std::memory_order_relaxed);
+          break;
+        }
+        ibv_wc completion{};
+        if (pair.initiator->WaitComp(&completion, 1, 10000) != 1 ||
+            completion.status != IBV_WC_SUCCESS ||
+            completion.opcode != IBV_WC_RDMA_READ) {
+          failures.fetch_add(1, std::memory_order_relaxed);
+          break;
+        }
+      }
+    });
+  }
+  start.store(true, std::memory_order_release);
+  for (auto& worker : workers) worker.join();
+  const double seconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - begin)
+          .count();
+  const double gbps =
+      static_cast<double>(kThreads * kIterations * kBytes) / seconds / 1e9;
+  std::fprintf(stderr,
+               "RDMA_READ_BENCH bytes=%zu threads=%zu iterations=%zu "
+               "seconds=%.6f goodput=%.3f_GBps\n",
+               kBytes, kThreads, kIterations, seconds, gbps);
+  EXPECT_EQ(failures.load(std::memory_order_relaxed), 0u);
+  for (size_t thread = 0; thread < kThreads; ++thread) {
+    EXPECT_EQ(std::memcmp(pairs[thread]->destination.data(),
+                          pairs[thread]->source->dbuf(0), kBytes),
+              0);
+    pairs[thread]->initiator->ReleaseTransient(
+        pairs[thread]->destination_mr);
+  }
 }
 
 TEST(RdmaSafety, OverridesRejectMalformedVectorsBeforeAcquiringQp) {
