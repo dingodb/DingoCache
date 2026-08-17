@@ -736,6 +736,17 @@ ibv_mr* RcEndpoint::RegisterRemoteRegion(void* base, size_t size) {
   return nullptr;
 }
 
+ibv_mr* RcEndpoint::RegisterRemoteReadRegion(void* base, size_t size) {
+  if (!base || size == 0) return nullptr;
+  ibv_mr* mr = ibv_reg_mr(
+      pd_, base, size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ);
+  if (!mr) return nullptr;
+  transient_mr_.push_back(mr);
+  g_adhoc_user_mr.fetch_add(1, std::memory_order_relaxed);
+  g_transient_user_mr_active.fetch_add(1, std::memory_order_relaxed);
+  return mr;
+}
+
 ibv_mr* RcEndpoint::RegisterUser(void* addr, size_t len) {
   if (!addr || len == 0) return nullptr;
   const auto address = reinterpret_cast<uintptr_t>(addr);
