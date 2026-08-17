@@ -5387,13 +5387,14 @@ TEST(RdmaLoopback,
         [&] { return winning_attempt_entered; });
   }
   if (observed_winner) {
-    // Attempt one completed its direct RDMA write and DONE before the injected
-    // local completion fault. Retirement proof makes that committed payload
-    // stable while the second rail is still blocked.
+    // The winning retry has completed only into operation-owned staging.
+    // Caller memory stays untouched until RangeInto publishes after the whole
+    // logical GET is terminal.
     std::string before_winner;
     const bool read_ok = destination.ReadPayload(&before_winner);
     EXPECT_TRUE(read_ok);
-    if (read_ok) EXPECT_EQ(before_winner, value);
+    if (read_ok)
+      EXPECT_EQ(before_winner, std::string(value.size(), '\xA7'));
     EXPECT_TRUE(destination.GuardsIntact());
   }
   {
@@ -5903,6 +5904,41 @@ TEST(RdmaLoopback, FailedSgGetLeavesCallerSegmentsStableAfterReturn) {
   ASSERT_TRUE(client.BatchGetAutoSg({get}, &lengths)[0]);
   ASSERT_EQ(lengths[0], value.size());
   EXPECT_EQ(first + second, value);
+}
+
+TEST(RdmaLoopback,
+     MissingRetirementProofQuarantinesStagingAndLeavesCallerStable) {
+  ScopedEnv configured_device("DFKV_RDMA_DEV", nullptr);
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv completion_fault("DFKV_RDMA_TEST_COMPLETION_FAULT",
+                             "1:1:1,1:2:1");
+  ScopedEnv retirement_fault("DFKV_RDMA_TEST_RETIREMENT_PROOF_FAILURE", "1");
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+
+  RdmaNode node("writer-retire-proof-missing");
+  RdmaTransport transport(kMaxMsg);
+  const BlockKey key = ToBlockKey(SelfHdr(), "writer-retire-proof-missing");
+  const std::string value = PatternValue(64 * 1024 + 13, 57);
+  ASSERT_EQ(transport.Cache(node.addr, key, value.data(), value.size()),
+            Status::kOk);
+
+  std::string output(value.size(), '\x5a');
+  std::vector<uint64_t> value_lens;
+  const auto statuses = transport.RangeInto(
+      node.addr, {key}, {{output.data(), output.size()}}, &value_lens);
+
+  EXPECT_EQ(statuses, std::vector<Status>({Status::kIOError}));
+  EXPECT_EQ(output, std::string(output.size(), '\x5a'));
+  const std::string metrics = transport.MetricsText();
+  EXPECT_EQ(CounterVal(
+                metrics,
+                "dfkv_rdma_client_ambiguous_get_quarantines_total"),
+            2);
+  EXPECT_GT(CounterVal(
+                metrics,
+                "dfkv_rdma_client_ambiguous_get_quarantined_bytes"),
+            0);
 }
 
 TEST(RdmaLoopback,
