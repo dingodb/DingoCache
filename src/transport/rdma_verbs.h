@@ -330,6 +330,7 @@ class RcEndpoint {
   // Operation-scoped out-of-pool MRs. These are released after a successful
   // DONE, or after explicit responder-retirement proof on failure.
   std::vector<ibv_mr*> transient_mr_;
+  std::vector<ibv_mr*> connection_mr_;
   QpInfo local_;
   std::atomic<bool> responder_cancelled_{false};
   size_t pending_responder_writes_ = 0;  // responder owner thread only
