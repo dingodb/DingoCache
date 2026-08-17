@@ -486,7 +486,8 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
   at.qp_state = IBV_QPS_INIT;
   at.pkey_index = 0;
   at.port_num = ib_port_;
-  at.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
+  at.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                       IBV_ACCESS_REMOTE_READ;
   if (ibv_modify_qp(qp_, &at,
         IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) != 0) {
     Close(); return false;
@@ -516,7 +517,8 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
       if (posix_memalign(&p, kDirectIoAlign, dbuf_cap_) != 0) { Close(); return false; }
       dbuf_[i] = static_cast<char*>(p);
       numa::BindMemory(dbuf_[i], dbuf_cap_, numa_node_);
-      dmr_[i] = ibv_reg_mr(pd_, dbuf_[i], dbuf_cap_, IBV_ACCESS_LOCAL_WRITE);
+      dmr_[i] = ibv_reg_mr(pd_, dbuf_[i], dbuf_cap_,
+                           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ);
       if (!dmr_[i]) { Close(); return false; }
     }
   }
@@ -903,6 +905,29 @@ bool RcEndpoint::PostRecvScatterMulti(
   wr.wr_id = slot; wr.sg_list = sge.data();
   wr.num_sge = static_cast<int>(sge.size());
   return ibv_post_recv(qp_, &wr, &bad) == 0;
+}
+
+bool RcEndpoint::PostRead(size_t slot, void* destination, size_t length,
+                          ibv_mr* destination_mr, uint64_t remote_addr,
+                          uint32_t remote_rkey) {
+  if (slot >= depth_ || length > std::numeric_limits<uint32_t>::max() ||
+      (length != 0 && (!destination || !destination_mr)) ||
+      remote_addr == 0 || remote_rkey == 0) {
+    return false;
+  }
+  ibv_sge sge{};
+  sge.addr = reinterpret_cast<uintptr_t>(destination);
+  sge.length = static_cast<uint32_t>(length);
+  sge.lkey = length ? destination_mr->lkey : 0;
+  ibv_send_wr wr{}, *bad = nullptr;
+  wr.wr_id = slot;
+  wr.sg_list = &sge;
+  wr.num_sge = length ? 1 : 0;
+  wr.opcode = IBV_WR_RDMA_READ;
+  wr.send_flags = IBV_SEND_SIGNALED;
+  wr.wr.rdma.remote_addr = remote_addr;
+  wr.wr.rdma.rkey = remote_rkey;
+  return ibv_post_send(qp_, &wr, &bad) == 0;
 }
 
 bool RcEndpoint::PostWrite(size_t slot, const void* source, size_t length,
