@@ -242,6 +242,30 @@ inline bool DecodePullArenaInfo(const char in[kPullArenaInfoBytes],
          info->slot_count != 0;
 }
 
+struct PullPrepareControl {
+  uint32_t slot_index = 0;
+  uint64_t release_generation = 0;
+};
+
+constexpr uint32_t kPullPrepareMagic = 0x32525050u;  // "PPR2" (LE)
+constexpr size_t kPullPrepareBytes = 16;
+
+inline void EncodePullPrepareControl(
+    const PullPrepareControl& control, char out[kPullPrepareBytes]) {
+  std::memset(out, 0, kPullPrepareBytes);
+  net::PutU32(out, kPullPrepareMagic);
+  net::PutU32(out + 4, control.slot_index);
+  net::PutU64(out + 8, control.release_generation);
+}
+
+inline bool DecodePullPrepareControl(
+    const char in[kPullPrepareBytes], PullPrepareControl* control) {
+  if (net::GetU32(in) != kPullPrepareMagic) return false;
+  control->slot_index = net::GetU32(in + 4);
+  control->release_generation = net::GetU64(in + 8);
+  return true;
+}
+
 struct PullReady {
   uint32_t slot_index = 0;
   uint64_t slot_generation = 0;

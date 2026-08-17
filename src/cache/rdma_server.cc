@@ -990,8 +990,14 @@ void RdmaServer::Serve(int boot_fd) {
       }
       return request->get.targets.size() <= rdma::kV2MaxGetTargets;
     }
-    if (request->fields.op == static_cast<uint8_t>(WireOp::kPullRange) ||
-        request->fields.op == static_cast<uint8_t>(WireOp::kPullRelease)) {
+    if (request->fields.op == static_cast<uint8_t>(WireOp::kPullRange)) {
+      if (request->fields.payload_len != rdma::kPullPrepareBytes ||
+          completion.byte_len != kReqPrefix + rdma::kPullPrepareBytes)
+        return false;
+      request->contiguous_payload = frame + kReqPrefix;
+      return true;
+    }
+    if (request->fields.op == static_cast<uint8_t>(WireOp::kPullRelease)) {
       return completion.byte_len == kReqPrefix;
     }
 
@@ -1151,11 +1157,27 @@ void RdmaServer::Serve(int boot_fd) {
 
     if (fields.op == static_cast<uint8_t>(WireOp::kPullRange)) {
       if (!pull_read_requested || !range_handler_ ||
-          fields.payload_len == 0 || fields.payload_len > K ||
-          fields.length > static_cast<uint64_t>(conn_max))
+          fields.payload_len != rdma::kPullPrepareBytes ||
+          fields.length > static_cast<uint64_t>(conn_max) ||
+          request.contiguous_payload == nullptr)
         return invalid_reply();
-      const size_t slot = static_cast<size_t>(fields.payload_len - 1);
+      rdma::PullPrepareControl control;
+      if (!rdma::DecodePullPrepareControl(request.contiguous_payload,
+                                          &control) ||
+          control.slot_index >= K)
+        return invalid_reply();
+      const size_t slot = control.slot_index;
       PullSlotState& state = pull_slots[slot];
+      if (control.release_generation != 0) {
+        if (!state.busy ||
+            state.generation != control.release_generation)
+          return invalid_reply();
+        state.busy = false;
+        state.data_len = 0;
+        state.value_len = 0;
+        ++state.generation;
+        if (state.generation == 0) ++state.generation;
+      }
       if (state.busy) {
         encode_status(Status::kCacheFull, 0);
         reply->first_len = response_prefix;
