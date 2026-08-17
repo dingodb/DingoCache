@@ -951,6 +951,8 @@ Status KvNodeServer::ProcessRequestForKey(
     case WireOp::kClientHeartbeat:
     case WireOp::kListClients:
     case WireOp::kListTopology:
+    case WireOp::kPullRange:
+    case WireOp::kPullRelease:
       st = Status::kInvalid;  // MDS ops are not served by a cache node
       break;
     }

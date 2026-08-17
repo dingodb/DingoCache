@@ -6057,179 +6057,34 @@ TEST(RdmaLoopback, FailedSgGetLeavesCallerSegmentsStableAfterReturn) {
 }
 
 TEST(RdmaLoopback,
-     MissingRetirementProofQuarantinesStagingAndLeavesCallerStable) {
+     PullReadFailureClosesConnectionAndNextGetRecoversWithoutAbort) {
   ScopedEnv configured_device("DFKV_RDMA_DEV", nullptr);
   ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
   ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
-
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
-  RdmaNode node("writer-retire-proof-missing");
+
+  RdmaNode node("pull-read-failure");
   RdmaTransport transport(kMaxMsg);
-  const BlockKey key = ToBlockKey(SelfHdr(), "writer-retire-proof-missing");
+  const BlockKey key = ToBlockKey(SelfHdr(), "pull-read-failure");
   const std::string value = PatternValue(64 * 1024 + 13, 57);
   ASSERT_EQ(transport.Cache(node.addr, key, value.data(), value.size()),
             Status::kOk);
-  ScopedEnv completion_fault("DFKV_RDMA_TEST_COMPLETION_FAULT",
-                             "1:1:1,1:2:1");
-  ScopedEnv retirement_fault("DFKV_RDMA_TEST_RETIREMENT_PROOF_FAILURE", "1");
 
   std::string output(value.size(), '\x5a');
   std::vector<uint64_t> value_lens;
-  const auto statuses = transport.RangeInto(
-      node.addr, {key}, {{output.data(), output.size()}}, &value_lens);
-
-  EXPECT_EQ(statuses, std::vector<Status>({Status::kIOError}));
-  EXPECT_EQ(output, std::string(output.size(), '\x5a'));
-  const std::string metrics = transport.MetricsText();
-  EXPECT_EQ(CounterVal(
-                metrics,
-                "dfkv_rdma_client_ambiguous_get_quarantines_total"),
-            2);
-  EXPECT_GT(CounterVal(
-                metrics,
-                "dfkv_rdma_client_ambiguous_get_quarantined_bytes"),
-            0);
-}
-
-TEST(RdmaLoopback,
-     BlockedResponderWriteRetiresBeforeHostRetryAndReclaimsMr) {
-  ScopedEnv configured_device("DFKV_RDMA_DEV", nullptr);
-  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
-  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
-  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
-
-  RdmaNode node("writer-retire-retry");
-  RdmaTransport transport(kMaxMsg);
-  const BlockKey key = ToBlockKey(SelfHdr(), "writer-retire-retry");
-  const std::string value = PatternValue(64 * 1024 + 7, 91);
-  ASSERT_EQ(transport.Cache(node.addr, key, value.data(), value.size()),
-            Status::kOk);
-  const uint64_t mr_baseline = rdma::RcEndpoint::TransientUserMrActive();
-  std::string output(value.size(), '\x5a');
-  std::vector<Status> statuses;
-  std::vector<uint64_t> value_lens;
-  std::atomic<bool> returned{false};
-
-  rdma::TestBlockNextResponderWrites(1);
-  std::thread getter([&] {
-    statuses = transport.RangeInto(
+  {
+    ScopedEnv read_fault("DFKV_RDMA_TEST_PULL_READ_FAILURE", "1");
+    const auto statuses = transport.RangeInto(
         node.addr, {key}, {{output.data(), output.size()}}, &value_lens);
-    returned.store(true, std::memory_order_release);
-  });
-  const bool blocked =
-      rdma::TestWaitForBlockedResponderWrites(1, 10000);
-  const bool cancelled =
-      blocked && rdma::TestWaitForResponderWriteCancellations(1, 10000);
-  EXPECT_TRUE(blocked);
-  EXPECT_TRUE(cancelled);
-  EXPECT_FALSE(returned.load(std::memory_order_acquire))
-      << "client returned before responder-retirement proof";
-  EXPECT_GT(rdma::RcEndpoint::TransientUserMrActive(), mr_baseline)
-      << "blocked direct attempt did not retain its host MR";
-  EXPECT_EQ(output, std::string(output.size(), '\x5a'))
-      << "blocked old attempt wrote before retirement";
+    EXPECT_EQ(statuses, std::vector<Status>({Status::kIOError}));
+    EXPECT_EQ(output, std::string(output.size(), '\x5a'));
+  }
 
-  rdma::TestReleaseOneBlockedResponderWrite();
-  const bool old_writer_exited =
-      rdma::TestWaitForReleasedResponderWrites(1, 10000);
-  if (!old_writer_exited) rdma::TestReleaseBlockedResponderWrites();
-  getter.join();
-  rdma::TestReleaseBlockedResponderWrites();
-
-  EXPECT_TRUE(old_writer_exited);
-  EXPECT_EQ(statuses, std::vector<Status>({Status::kOk}));
+  const auto recovered = transport.RangeInto(
+      node.addr, {key}, {{output.data(), output.size()}}, &value_lens);
+  EXPECT_EQ(recovered, std::vector<Status>({Status::kOk}));
   EXPECT_EQ(value_lens, std::vector<uint64_t>({value.size()}));
   EXPECT_EQ(output, value);
-  EXPECT_EQ(node.RangeDirectCalls(key), 2u);
-  EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), mr_baseline);
-
-  const std::string at_return = output;
-  std::vector<char> exists;
-  EXPECT_EQ(transport.ExistMany(node.addr, {key}, &exists),
-            std::vector<Status>({Status::kOk}));
-  EXPECT_EQ(output, at_return)
-      << "retired first-attempt writer modified host memory after return";
-  EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), mr_baseline);
-}
-
-TEST(RdmaLoopback,
-     TwoBlockedResponderAttemptsFailSgGetBeforeReturnAndReclaimMrs) {
-  ScopedEnv configured_device("DFKV_RDMA_DEV", nullptr);
-  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
-  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
-  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
-
-  RdmaNode node("writer-retire-terminal-sg");
-  RdmaTransport transport(kMaxMsg);
-  const BlockKey key = ToBlockKey(SelfHdr(), "writer-retire-terminal-sg");
-  const std::string value = PatternValue(96 * 1024 + 11, 37);
-  ASSERT_EQ(transport.Cache(node.addr, key, value.data(), value.size()),
-            Status::kOk);
-  const uint64_t mr_baseline = rdma::RcEndpoint::TransientUserMrActive();
-
-  std::array<std::string, 3> segments{
-      std::string(4093, '\x5a'),
-      std::string(32771, '\x5a'),
-      std::string(value.size() - 4093 - 32771, '\x5a')};
-  RangeDstMulti destination{{
-      {segments[0].data(), segments[0].size()},
-      {segments[1].data(), segments[1].size()},
-      {segments[2].data(), segments[2].size()},
-  }};
-  std::vector<Status> statuses;
-  std::vector<size_t> lengths;
-  std::atomic<bool> returned{false};
-
-  rdma::TestBlockNextResponderWrites(2);
-  std::thread getter([&] {
-    statuses =
-        transport.RangeIntoMulti(node.addr, {key}, {destination}, &lengths);
-    returned.store(true, std::memory_order_release);
-  });
-  bool fixture_ok = true;
-  for (size_t attempt = 1; attempt <= 2; ++attempt) {
-    const bool blocked =
-        rdma::TestWaitForBlockedResponderWrites(attempt, 10000);
-    const bool cancelled =
-        blocked &&
-        rdma::TestWaitForResponderWriteCancellations(attempt, 10000);
-    EXPECT_TRUE(blocked) << attempt;
-    EXPECT_TRUE(cancelled) << attempt;
-    fixture_ok = fixture_ok && blocked && cancelled;
-    EXPECT_FALSE(returned.load(std::memory_order_acquire))
-        << "attempt " << attempt << " returned before writer retirement";
-    EXPECT_GT(rdma::RcEndpoint::TransientUserMrActive(), mr_baseline)
-        << "blocked SG attempt did not retain operation MRs";
-    for (const auto& segment : segments)
-      EXPECT_EQ(segment, std::string(segment.size(), '\x5a')) << attempt;
-    rdma::TestReleaseOneBlockedResponderWrite();
-    const bool exited =
-        rdma::TestWaitForReleasedResponderWrites(attempt, 10000);
-    EXPECT_TRUE(exited) << attempt;
-    fixture_ok = fixture_ok && exited;
-    if (!fixture_ok) break;
-  }
-  if (!fixture_ok) rdma::TestReleaseBlockedResponderWrites();
-  getter.join();
-  rdma::TestReleaseBlockedResponderWrites();
-
-  EXPECT_EQ(statuses, std::vector<Status>({Status::kIOError}));
-  EXPECT_EQ(lengths, std::vector<size_t>({0}));
-  EXPECT_EQ(node.RangeDirectCalls(key), 2u);
-  EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), mr_baseline);
-  const auto at_return = segments;
-  std::vector<char> exists;
-  EXPECT_EQ(transport.ExistMany(node.addr, {key}, &exists),
-            std::vector<Status>({Status::kOk}));
-  EXPECT_EQ(segments, at_return)
-      << "retired terminal writers modified SG memory after return";
-
-  const auto recovered =
-      transport.RangeIntoMulti(node.addr, {key}, {destination}, &lengths);
-  ASSERT_EQ(recovered, std::vector<Status>({Status::kOk}));
-  ASSERT_EQ(lengths, std::vector<size_t>({value.size()}));
-  EXPECT_EQ(segments[0] + segments[1] + segments[2], value);
-  EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), mr_baseline);
 }
 
 TEST(RdmaLoopback,
