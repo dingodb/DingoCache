@@ -99,6 +99,11 @@ bool InjectLocalRailFailure(int zero_based_attempt) {
   return false;
 }
 
+bool InjectPullReadFailure() {
+  const char* value = std::getenv("DFKV_RDMA_TEST_PULL_READ_FAILURE");
+  return value && std::strcmp(value, "1") == 0;
+}
+
 size_t ResolveMaxPayload(size_t configured) {
   size_t n = configured ? configured : (64u << 20);
   n = EnvBytes("DFKV_RDMA_MAX_PAYLOAD_BYTES", n);
@@ -2670,10 +2675,11 @@ std::vector<Status> RdmaTransport::RangeInto(
               conn->pull_arena.base_addr +
               static_cast<uint64_t>(ready.slot_index) * slot_bytes;
           bool read_ok =
-              ready.data_len == 0 ||
-              ep.PostRead(0, destination.payload,
-                          static_cast<size_t>(ready.data_len), destination_mr,
-                          remote_addr, conn->pull_arena.rkey);
+              !InjectPullReadFailure() &&
+              (ready.data_len == 0 ||
+               ep.PostRead(0, destination.payload,
+                           static_cast<size_t>(ready.data_len), destination_mr,
+                           remote_addr, conn->pull_arena.rkey));
           if (read_ok && ready.data_len != 0) {
             ibv_wc completion{};
             read_ok = ep.WaitComp(&completion, 1, BatchTimeout()) == 1 &&
@@ -2692,6 +2698,7 @@ std::vector<Status> RdmaTransport::RangeInto(
         }
       }
     }
+    if (!reusable) result[item] = Status::kIOError;
     if (reusable)
       Release(node, Lane::kData, conn);
     else
@@ -3044,8 +3051,9 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
           }
           ibv_mr* mr = ep.RegisterTransient(segment.first, bytes);
           bool read_ok =
-              mr && ep.PostRead(0, segment.first, bytes, mr,
-                                remote_base + copied, conn->pull_arena.rkey);
+              !InjectPullReadFailure() && mr &&
+              ep.PostRead(0, segment.first, bytes, mr,
+                          remote_base + copied, conn->pull_arena.rkey);
           if (read_ok) {
             ibv_wc completion{};
             read_ok = ep.WaitComp(&completion, 1, BatchTimeout()) == 1 &&
@@ -3070,6 +3078,7 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
         }
       }
     }
+    if (!reusable) result[item] = Status::kIOError;
     if (reusable)
       Release(node, Lane::kSgData, conn);
     else
