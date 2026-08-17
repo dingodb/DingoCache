@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dfkv-common"
-version = "2.21.0"
+version = "2.22.0"
 description = "Canonical namespace and pool-key schema shared by dfkv connectors"
 requires-python = ">=3.9"
 
