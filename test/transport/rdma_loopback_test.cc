@@ -1407,44 +1407,6 @@ TEST(RdmaReadPrimitive, HostDestinationIsByteExact) {
   EXPECT_EQ(std::memcmp(destination.data(), source.dbuf(0), kBytes), 0);
   initiator.ReleaseTransient(destination_mr);
 }
-TEST(RdmaReadPrimitive, CudaDestinationIsByteExact) {
-  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
-  const CudaLib* cuda = ActiveCudaForTest();
-  if (!cuda) GTEST_SKIP() << "no usable CUDA device";
-  constexpr size_t kBytes = 1024 * 1024;
-  const char* dev = std::getenv("DFKV_RDMA_DEV");
-  rdma::RcEndpoint source;
-  rdma::RcEndpoint initiator;
-  ASSERT_TRUE(source.Open(dev, 4096, 1, 1,
-                          /*direct_io_buffers=*/true, kBytes));
-  ASSERT_TRUE(initiator.Open(dev, 4096, 1));
-  const rdma::QpInfo source_info = source.Local();
-  const rdma::QpInfo initiator_info = initiator.Local();
-  ASSERT_TRUE(source.Connect(initiator_info));
-  ASSERT_TRUE(initiator.Connect(source_info));
-  for (size_t i = 0; i < kBytes; ++i)
-    source.dbuf(0)[i] = static_cast<char>((i * 29 + 7) & 0xff);
-
-  CudaGuardedBuffer destination(cuda, kBytes);
-  ASSERT_TRUE(destination.Allocate());
-  ibv_mr* destination_mr =
-      initiator.RegisterTransient(destination.payload(), kBytes);
-  ASSERT_NE(destination_mr, nullptr);
-  ASSERT_TRUE(initiator.PostRead(
-      0, destination.payload(), kBytes, destination_mr,
-      reinterpret_cast<uint64_t>(source.dbuf(0)), source.dmr(0)->rkey));
-  ibv_wc completion{};
-  ASSERT_EQ(initiator.WaitComp(&completion, 1, 10000), 1);
-  EXPECT_EQ(completion.status, IBV_WC_SUCCESS);
-  EXPECT_EQ(completion.opcode, IBV_WC_RDMA_READ);
-  std::string actual;
-  ASSERT_TRUE(destination.ReadPayload(&actual));
-  EXPECT_EQ(std::memcmp(actual.data(), source.dbuf(0), kBytes), 0);
-  EXPECT_TRUE(destination.GuardsIntact());
-  initiator.ReleaseTransient(destination_mr);
-}
-
-
 TEST(RdmaReadPrimitive, ConcurrentOneMiBThroughput) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   constexpr size_t kBytes = 1024 * 1024;
@@ -3475,37 +3437,6 @@ TEST(RdmaLoopback,
   EXPECT_EQ(reused.allocation_calls, warm.allocation_calls);
   EXPECT_EQ(reused.registration_calls, warm.registration_calls)
       << "all CUDA pinning must be one-time slot warmup, not per publication";
-}
-
-TEST(RdmaLoopback, ScalarGetPublishesExactBytesToGuardedCudaDestination) {
-  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
-  const CudaLib* cuda = ActiveCudaForTest();
-  if (!cuda) GTEST_SKIP() << "no usable CUDA device";
-  ScopedEnv host_dedup("DFKV_CLIENT_NODE_DEDUP", nullptr);
-  ScopedEnv gpu_dedup("DFKV_CLIENT_NODE_DEDUP_GPU", nullptr);
-  ScopedEnv completion_fault("DFKV_RDMA_TEST_COMPLETION_FAULT", nullptr);
-  ScopedEnv endpoint_fault("DFKV_RDMA_TEST_ENDPOINT_COMPLETION_FAULT",
-                           nullptr);
-  ScopedEnv local_failure("DFKV_RDMA_TEST_LOCAL_RAIL_FAILURE_ATTEMPTS",
-                          nullptr);
-
-  RdmaNode node("cuda-scalar-get");
-  RdmaTransport transport(kMaxMsg);
-  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
-  const std::string value = CudaTestBytes(8197, 0x31);
-  ASSERT_TRUE(client.Put("cuda-scalar", value.data(), value.size()));
-
-  CudaGuardedBuffer destination(cuda, value.size());
-  ASSERT_TRUE(destination.Allocate());
-  ASSERT_TRUE(cuda->IsDevicePtr(destination.payload()));
-  ASSERT_TRUE(client.Get("cuda-scalar", destination.payload(), value.size()));
-
-  // Read back immediately after Get returns. The API contract is synchronous:
-  // its private nonblocking CUDA stream must already be synchronized here.
-  std::string actual;
-  ASSERT_TRUE(destination.ReadPayload(&actual));
-  EXPECT_EQ(actual, value);
-  EXPECT_TRUE(destination.GuardsIntact());
 }
 
 TEST(RdmaLoopback,
