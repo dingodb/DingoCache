@@ -1452,8 +1452,12 @@ bool RdmaTransport::PrepareRetry(
         rdma::IntersectRailMasks(highest_tier, candidates.allowed);
     const auto fallback =
         rdma::IntersectRailMasks(highest_tier, candidates.fallback);
-    if (!rdma::HasUnexcludedRail(preferred, fallback, *excluded))
-      return false;
+    if (!rdma::HasUnexcludedRail(preferred, fallback, *excluded)) {
+      if (!from_pool) return false;
+      excluded->assign(devs_.size(), 0);
+      stale_pool_retries_.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
     if (from_pool)
       stale_pool_retries_.fetch_add(1, std::memory_order_relaxed);
     cross_rail_retries_.fetch_add(1, std::memory_order_relaxed);
@@ -1932,6 +1936,7 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
                                 uint64_t length, const void* payload,
                                 uint64_t payload_len, std::string* out,
                                 uint64_t* value_len) {
+  if (out) out->clear();
   const uint64_t value_bound = static_cast<uint64_t>(OpBound());
   if ((op == WireOp::kCache &&
        (payload_len == 0 || payload_len > value_bound ||
