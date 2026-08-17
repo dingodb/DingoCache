@@ -182,6 +182,13 @@ class RdmaTransport : public Transport {
   void Destroy(Conn* c,
                rdma::RailCompletion completion =
                    rdma::RailCompletion::kAdmission);
+  // An ambiguous responder WRITE without retirement proof must keep both the
+  // endpoint/MRs and its operation-owned destination alive. The caller-facing
+  // staged GET paths never publish these bytes, so quarantining converts the
+  // failure into a cache miss without exposing a late DMA to caller memory.
+  void QuarantineAmbiguousGet(Conn* c, void* destination_hold,
+                              size_t destination_bytes, const char* path,
+                              rdma::RailCompletion completion);
   void CompleteRemote(const std::string& peer_id, size_t local_rail,
                       uint64_t generation, RemoteRailOutcome outcome);
   void RetireIdlePeerRail(const std::string& peer_id, size_t local_rail);
@@ -317,6 +324,14 @@ class RdmaTransport : public Transport {
   // DFKV_RDMA_TEST_COMPLETION_FAULT is set.
   std::atomic<uint64_t> test_completion_fault_calls_{0};
   std::atomic<uint64_t> completion_timeouts_{0};
+  std::atomic<uint64_t> ambiguous_get_quarantines_{0};
+  std::atomic<uint64_t> ambiguous_get_quarantined_bytes_{0};
+  // Raw ownership is intentional: without retirement proof no in-process
+  // event can prove these MRs/buffers safe to destroy. The OS/HCA reclaims
+  // them atomically with process teardown.
+  std::mutex quarantine_mu_;
+  std::vector<Conn*> quarantined_get_connections_;
+  std::vector<void*> quarantined_get_destinations_;
   std::atomic<uint64_t> keepalive_attempts_{0};
   std::atomic<uint64_t> keepalive_successes_{0};
   std::atomic<uint64_t> keepalive_failures_{0};
