@@ -165,6 +165,9 @@ class RcEndpoint {
   // Register a shared server receive segment for remote PUT writes and return
   // the MR carrying both the local lkey and peer-visible rkey.
   ibv_mr* RegisterRemoteRegion(void* base, size_t size);
+  // Register an exact connection-private source arena for initiator READ.
+  // Unlike RegisterRemoteRegion this never widens to a shared segment MR.
+  ibv_mr* RegisterRemoteReadRegion(void* base, size_t size);
 
   // Cumulative one-shot user MRs registered outside explicit pool regions.
   // These are never cached; TransientUserMrActive is the lifetime invariant.

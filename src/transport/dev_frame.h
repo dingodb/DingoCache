@@ -22,8 +22,9 @@ constexpr uint8_t kDevProtoV2 = 2;
 // or limit calculation. Keeping the raw-field parser separate also preserves
 // the full 64-bit opaque value used by writer-retirement control frames.
 constexpr uint64_t kDevFrameRequestWriterRetirement = uint64_t{1} << 63;
+constexpr uint64_t kDevFrameRequestPullRead = uint64_t{1} << 62;
 constexpr uint64_t kDevFrameMaxBlockMask =
-    ~kDevFrameRequestWriterRetirement;
+    ~(kDevFrameRequestWriterRetirement | kDevFrameRequestPullRead);
 
 // Room a device name must leave in the fixed 32-byte frame: NUL terminator +
 // "DCP2" u32 + max_block_bytes u64 + protocol u8. A name at most this long
@@ -94,6 +95,10 @@ inline uint64_t ParseDevFrameMaxBlock(const char in[kDevNameBytes]) {
 inline bool DevFrameRequestsWriterRetirement(
     const char in[kDevNameBytes]) {
   return (ParseDevFrameCaps(in) & kDevFrameRequestWriterRetirement) != 0;
+}
+
+inline bool DevFrameRequestsPullRead(const char in[kDevNameBytes]) {
+  return (ParseDevFrameCaps(in) & kDevFrameRequestPullRead) != 0;
 }
 
 inline uint8_t ParseDevFrameProtocol(const char in[kDevNameBytes]) {

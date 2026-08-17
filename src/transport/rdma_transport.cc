@@ -378,6 +378,7 @@ struct RdmaTransport::Conn {
   bool remote_lease_held = false;
   bool remote_recovery_probe = false;
   rdma::RailLease lease;
+  rdma::PullArenaInfo pull_arena;
   uint64_t lease_started_us = 0;
   bool credit_held = false;
   rdma::ResourceRequest budget_request;
@@ -1016,7 +1017,8 @@ bool RdmaTransport::ProbeV2(const std::string& node) const {
   const bool ok =
       net::WriteAll(fd, frame, sizeof(frame)) &&
       net::ReadAll(fd, reply, sizeof(reply)) &&
-      rdma::V2ProbeSupportsWriterRetirement(reply);
+      rdma::V2ProbeSupportsWriterRetirement(reply) &&
+      rdma::V2ProbeSupportsPullRead(reply);
   ::close(fd);
   if (!ok) v2_probe_failures_.fetch_add(1, std::memory_order_relaxed);
   return ok;
@@ -1231,7 +1233,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   if (!ProbeV2(node)) {
     DFKV_LOG_ERROR(
         "rdma: peer " + node +
-        " does not advertise the required v2 writer-retirement capability");
+        " does not advertise required v2 writer-retirement and pull-read capabilities");
     complete_unowned_lease(rdma::RailCompletion::kEndpointFailure);
     resource_budget_->Release(budget_request);
     result.failure = AcquireFailure::kEndpoint;
@@ -1277,7 +1279,8 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   // created. Echo the request on this bootstrap so a rolling-upgraded server
   // sends the token only to a client that will consume it.
   const uint64_t bootstrap_declared =
-      conn_declared | rdma::kDevFrameRequestWriterRetirement;
+      conn_declared | rdma::kDevFrameRequestWriterRetirement |
+      rdma::kDevFrameRequestPullRead;
   rdma::EncodeDevFrame(auto_device_ ? std::string() : dev,
                        bootstrap_declared, devbuf, rdma::kDevProtoV2);
   char mine[rdma::kQpInfoBytes], remote_qp_bytes[rdma::kQpInfoBytes];
@@ -1333,15 +1336,14 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     depth_refunds_.fetch_add(1, std::memory_order_relaxed);
   }
 
-  char readiness[rdma::kV2RetirementReadinessBytes];
+  char readiness[rdma::kV2PullReadinessBytes];
   if (!net::ReadAll(fd, readiness, sizeof(readiness)) ||
-      !rdma::DecodeV2Readiness(
-          readiness, sizeof(readiness),
-          /*writer_retirement_negotiated=*/true, &conn->recv_segment,
-          &conn->writer_token)) {
+      !rdma::DecodeV2PullReadiness(
+          readiness, sizeof(readiness), &conn->recv_segment,
+          &conn->writer_token, &conn->pull_arena)) {
     DFKV_LOG_ERROR(
         "rdma: peer " + node +
-        " did not provide a valid retirement-capable v2 receive segment");
+        " did not provide valid retirement and pull-read arenas");
     ::close(fd);
     Destroy(conn, rdma::RailCompletion::kEndpointFailure);
     result.failure = AcquireFailure::kEndpoint;

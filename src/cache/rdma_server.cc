@@ -548,6 +548,7 @@ void RdmaServer::Serve(int boot_fd) {
   // allow the request bit to leak into max-block checks or slot arithmetic.
   const bool writer_retirement_requested =
       rdma::DevFrameRequestsWriterRetirement(devbuf);
+  const bool pull_read_requested = rdma::DevFrameRequestsPullRead(devbuf);
   const uint64_t declared = rdma::ParseDevFrameMaxBlock(devbuf);
   if (rdma::ParseDevFrameProtocol(devbuf) != rdma::kDevProtoV2 ||
       declared == 0) {
@@ -653,6 +654,20 @@ void RdmaServer::Serve(int boot_fd) {
       return;
     }
   }
+  rdma::RecvSegment::Lease pull_lease;
+  if (pull_read_requested) {
+    pull_lease =
+        recv_segment_.Allocate(K * slot_size, rdma::kV2DataOffset);
+    if (!pull_lease) {
+      DFKV_LOG_ERROR(
+          "rdma v2: pull-read arena unavailable; refusing negotiated "
+          "connection (need=" +
+          std::to_string(K * slot_size) +
+          " free=" + std::to_string(recv_segment_.free_bytes()) + ")");
+      ::close(boot_fd);
+      return;
+    }
+  }
 
   // These operation owners deliberately precede the endpoint. On teardown the
   // endpoint (and therefore its QP) is destroyed first, before any prepared
@@ -718,6 +733,18 @@ void RdmaServer::Serve(int boot_fd) {
                    (dev.empty() ? std::string("(auto)") : dev));
     ::close(boot_fd);
     return;
+  }
+  ibv_mr* pull_segment_mr = nullptr;
+  if (pull_read_requested) {
+    pull_segment_mr =
+        ep.RegisterRemoteReadRegion(pull_lease.data(), pull_lease.size());
+    if (!pull_segment_mr) {
+      DFKV_LOG_ERROR(
+          "rdma v2: connection-private pull-read MR unavailable on device " +
+          (dev.empty() ? std::string("(auto)") : dev));
+      ::close(boot_fd);
+      return;
+    }
   }
   DFKV_LOG_INFO("rdma conn: protocol=v2 declared=" +
                 std::to_string(declared) +
@@ -785,10 +812,21 @@ void RdmaServer::Serve(int boot_fd) {
   const rdma::RecvSegmentInfo info{
       reinterpret_cast<uint64_t>(recv_lease.data()),
       recv_segment_mr->rkey, slot_size};
-  char readiness[rdma::kV2RetirementReadinessBytes];
-  const size_t readiness_bytes =
-      rdma::EncodeV2Readiness(info, writer_token, readiness);
-  const bool ok = net::WriteAll(boot_fd, readiness, readiness_bytes);
+  char readiness[rdma::kV2PullReadinessBytes];
+  size_t readiness_bytes = 0;
+  if (pull_read_requested) {
+    const rdma::PullArenaInfo pull_info{
+        reinterpret_cast<uint64_t>(pull_lease.data()), pull_lease.size(),
+        writer_token, pull_segment_mr->rkey, static_cast<uint32_t>(K)};
+    readiness_bytes = rdma::EncodeV2PullReadiness(
+        info, writer_token, pull_info, readiness);
+  } else {
+    readiness_bytes =
+        rdma::EncodeV2Readiness(info, writer_token, readiness);
+  }
+  const bool ok =
+      readiness_bytes != 0 &&
+      net::WriteAll(boot_fd, readiness, readiness_bytes);
   ::close(boot_fd);
   if (!ok) {
     retire_writer();
