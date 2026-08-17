@@ -348,6 +348,8 @@ void RcEndpoint::Close() {
   for (auto* m : rmr_) if (m) ibv_dereg_mr(m);
   for (auto* m : dmr_) if (m) ibv_dereg_mr(m);
   for (auto* mr : transient_mr_) if (mr) ibv_dereg_mr(mr);
+  for (auto* mr : connection_mr_) if (mr) ibv_dereg_mr(mr);
+  connection_mr_.clear();
   g_transient_user_mr_active.fetch_sub(transient_mr_.size(),
                                        std::memory_order_relaxed);
   transient_mr_.clear();
@@ -741,9 +743,7 @@ ibv_mr* RcEndpoint::RegisterRemoteReadRegion(void* base, size_t size) {
   ibv_mr* mr = ibv_reg_mr(
       pd_, base, size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ);
   if (!mr) return nullptr;
-  transient_mr_.push_back(mr);
-  g_adhoc_user_mr.fetch_add(1, std::memory_order_relaxed);
-  g_transient_user_mr_active.fetch_add(1, std::memory_order_relaxed);
+  connection_mr_.push_back(mr);
   return mr;
 }
 
