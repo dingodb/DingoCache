@@ -1383,9 +1383,11 @@ TEST(RdmaReadPrimitive, HostDestinationIsByteExact) {
   const char* dev = std::getenv("DFKV_RDMA_DEV");
   rdma::RcEndpoint source;
   rdma::RcEndpoint initiator;
-  ASSERT_TRUE(source.Open(dev, 4096, 1, 1,
-                          /*direct_io_buffers=*/true, kBytes));
-  ASSERT_TRUE(initiator.Open(dev, 4096, 1));
+  if (!source.Open(dev, 4096, 1, 1,
+                   /*direct_io_buffers=*/true, kBytes))
+    GTEST_SKIP() << "no usable RDMA device";
+  if (!initiator.Open(dev, 4096, 1))
+    GTEST_SKIP() << "no usable RDMA device";
   const rdma::QpInfo source_info = source.Local();
   const rdma::QpInfo initiator_info = initiator.Local();
   ASSERT_TRUE(source.Connect(initiator_info));
@@ -1425,9 +1427,11 @@ TEST(RdmaReadPrimitive, ConcurrentOneMiBThroughput) {
     auto pair = std::make_unique<Pair>();
     pair->source = std::make_unique<rdma::RcEndpoint>();
     pair->initiator = std::make_unique<rdma::RcEndpoint>();
-    ASSERT_TRUE(pair->source->Open(dev, 4096, 1, 1,
-                                   /*direct_io_buffers=*/true, kBytes));
-    ASSERT_TRUE(pair->initiator->Open(dev, 4096, 1));
+    if (!pair->source->Open(dev, 4096, 1, 1,
+                            /*direct_io_buffers=*/true, kBytes))
+      GTEST_SKIP() << "no usable RDMA device";
+    if (!pair->initiator->Open(dev, 4096, 1))
+      GTEST_SKIP() << "no usable RDMA device";
     const rdma::QpInfo source_info = pair->source->Local();
     const rdma::QpInfo initiator_info = pair->initiator->Local();
     ASSERT_TRUE(pair->source->Connect(initiator_info));
