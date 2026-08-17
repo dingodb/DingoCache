@@ -3030,7 +3030,6 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
       if (ready.slot_index >= conn->pull_arena.slot_count ||
           ready.data_len > capacity || ready.data_len > slot_bytes ||
           ready.value_len > capacity) {
-        reusable = false;
       } else {
         const uint64_t remote_base =
             conn->pull_arena.base_addr +
@@ -3039,7 +3038,10 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
         for (const auto& segment : destinations[item].payloads) {
           const size_t bytes = std::min<size_t>(
               segment.second, static_cast<size_t>(ready.data_len) - copied);
-          if (bytes == 0) break;
+          if (bytes == 0) {
+            if (copied == ready.data_len) break;
+            continue;
+          }
           ibv_mr* mr = ep.RegisterTransient(segment.first, bytes);
           bool read_ok =
               mr && ep.PostRead(0, segment.first, bytes, mr,
