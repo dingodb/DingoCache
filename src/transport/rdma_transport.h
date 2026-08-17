@@ -324,6 +324,10 @@ class RdmaTransport : public Transport {
   // DFKV_RDMA_TEST_COMPLETION_FAULT is set.
   std::atomic<uint64_t> test_completion_fault_calls_{0};
   std::atomic<uint64_t> completion_timeouts_{0};
+  std::atomic<uint64_t> pull_prepares_{0};
+  std::atomic<uint64_t> pull_reads_{0};
+  std::atomic<uint64_t> pull_read_bytes_{0};
+  std::atomic<uint64_t> pull_failures_{0};
   std::atomic<uint64_t> ambiguous_get_quarantines_{0};
   std::atomic<uint64_t> ambiguous_get_quarantined_bytes_{0};
   // Raw ownership is intentional: without retirement proof no in-process
