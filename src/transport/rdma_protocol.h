@@ -242,6 +242,36 @@ inline bool DecodePullArenaInfo(const char in[kPullArenaInfoBytes],
          info->slot_count != 0;
 }
 
+struct PullReady {
+  uint32_t slot_index = 0;
+  uint64_t slot_generation = 0;
+  uint64_t data_len = 0;
+  uint64_t value_len = 0;
+};
+
+constexpr uint32_t kPullReadyMagic = 0x32594452u;  // "RDY2" (LE)
+constexpr size_t kPullReadyBytes = 40;
+
+inline void EncodePullReady(const PullReady& ready,
+                            char out[kPullReadyBytes]) {
+  std::memset(out, 0, kPullReadyBytes);
+  net::PutU32(out, kPullReadyMagic);
+  net::PutU32(out + 4, ready.slot_index);
+  net::PutU64(out + 8, ready.slot_generation);
+  net::PutU64(out + 16, ready.data_len);
+  net::PutU64(out + 24, ready.value_len);
+}
+
+inline bool DecodePullReady(const char in[kPullReadyBytes],
+                            PullReady* ready) {
+  if (net::GetU32(in) != kPullReadyMagic) return false;
+  ready->slot_index = net::GetU32(in + 4);
+  ready->slot_generation = net::GetU64(in + 8);
+  ready->data_len = net::GetU64(in + 16);
+  ready->value_len = net::GetU64(in + 24);
+  return ready->slot_generation != 0;
+}
+
 // The original readiness response is exactly one ready byte plus the 24-byte
 // receive-segment descriptor. A negotiated writer-retirement connection
 // appends its nonzero token; an unnegotiated client must see no extra bytes.
