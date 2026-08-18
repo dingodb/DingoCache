@@ -22,6 +22,10 @@ from .identity import (
     sg_key,
     tenant_hash,
 )
+from .rail_affinity import (
+    RailAffinitySelection,
+    apply_rank_local_rail_affinity,
+)
 
 __all__ = [
     "DFKV_CLIENT_ABI_VERSION_V2",
@@ -44,4 +48,6 @@ __all__ = [
     "pool_key",
     "sg_key",
     "tenant_hash",
+    "RailAffinitySelection",
+    "apply_rank_local_rail_affinity",
 ]

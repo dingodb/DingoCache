@@ -219,6 +219,18 @@ if(DFKV_BUILD_TESTS)
               -p test_client_metrics.py)
     set_tests_properties(python_client_metrics PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
+    add_test(NAME python_common_rail_affinity
+      COMMAND ${PYTHON3} -m unittest discover
+              -s ${CMAKE_CURRENT_SOURCE_DIR}/integration/common/tests
+              -p test_rail_affinity.py)
+    set_tests_properties(python_common_rail_affinity PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
+    add_test(NAME python_vllm_rail_affinity
+      COMMAND ${PYTHON3} -m unittest discover
+              -s ${CMAKE_CURRENT_SOURCE_DIR}/integration/vllm/tests
+              -p test_rail_affinity.py)
+    set_tests_properties(python_vllm_rail_affinity PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src:${CMAKE_CURRENT_SOURCE_DIR}/integration/vllm/src")
     # Shared telemetry layer: pure-python, no build/lib needed (OTel-push test
     # self-skips when the SDK is absent). Includes the vendored-copy drift guard.
     add_test(NAME python_telemetry

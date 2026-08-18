@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageC
 from dfkv_common import (
     DfkvClientOptionsV2,
     SGLANG_HICACHE_RAW_V1,
+    apply_rank_local_rail_affinity,
     canonical_namespace,
     reject_namespace_override,
     make_client_options_v2,
@@ -370,29 +371,14 @@ class DfkvHiCache(HiCacheStorage):
             if _truthy(cfg.get("require_rdma")):
                 if not _truthy(os.environ.get("DFKV_RDMA")):
                     os.environ["DFKV_RDMA"] = "1"
-            # Optional rank-local rail affinity bounds CUDA-pool registrations.
-            # A small explicit fallback count keeps failure recovery without
-            # returning to every-rank/every-HCA registration: with one fallback,
-            # each HCA sees two rank pools (one primary, one neighbor fallback).
-            if _truthy(cfg.get("rail_affinity")):
-                rails = [x.strip() for x in
-                         os.environ.get("DFKV_RDMA_DEV", "").split(",")
-                         if x.strip()]
-                if len(rails) > 1:
-                    rank = self.pcp_rank if self.pcp_size > 1 else self.tp_rank
-                    primary = rank % len(rails)
-                    fallback_count = max(
-                        0, min(int(cfg.get("rail_affinity_fallbacks", 1)),
-                               len(rails) - 1))
-                    selected = [
-                        rails[(primary + offset) % len(rails)]
-                        for offset in range(fallback_count + 1)
-                    ]
-                    os.environ["DFKV_RDMA_DEV"] = ",".join(selected)
-                    os.environ["DFKV_RDMA_PRIMARY_DEV"] = selected[0]
-                    os.environ["DFKV_RDMA_NUMA"] = "0"
-                    os.environ.pop("DFKV_RDMA_RAIL_TIERS", None)
-            elif cfg.get("rdma_numa"):
+            # Resolve rank-local affinity before dfkv_open_v2 so each process
+            # registers CUDA pools only on its primary and bounded fallbacks.
+            # DP-attention exposes the physical rank through PCP; plain TP
+            # uses tp_rank.
+            affinity_rank = self.pcp_rank if self.pcp_size > 1 else self.tp_rank
+            self._rail_affinity = apply_rank_local_rail_affinity(
+                cfg, affinity_rank, os.environ)
+            if not self._rail_affinity.enabled and cfg.get("rdma_numa"):
                 os.environ.setdefault("DFKV_RDMA_NUMA", "1")
             # Same-host GET rendezvous (phase 5): dedups TP-replicated L3 loads
             # across the rank processes of one node (HiCache destinations are
