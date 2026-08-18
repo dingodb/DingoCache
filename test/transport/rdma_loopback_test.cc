@@ -286,6 +286,7 @@ struct RdmaNode {
   mutable std::mutex observation_mu;
   std::map<std::string, size_t> cache_direct_calls;
   std::map<std::string, size_t> range_direct_calls;
+  std::atomic<int> handler_delay_ms{0};
 
   std::function<void(size_t)> before_range;
   explicit RdmaNode(const std::string& tag, size_t max_msg = kMaxMsg) {
@@ -299,6 +300,9 @@ struct RdmaNode {
         [this](uint8_t op, const BlockKey& key, uint64_t off, uint64_t len,
                const char* pl, uint64_t pll, std::string* out,
                size_t* value_len) {
+          const int delay = handler_delay_ms.load(std::memory_order_relaxed);
+          if (delay > 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay));
           return srv->ProcessRequestForKey(
               op, key, off, len, pl, pll, out, value_len);
         },
@@ -365,6 +369,29 @@ long DeviceCounterVal(const std::string& text, const std::string& name,
   } catch (...) {
     return -1;
   }
+}
+
+long MetricSum(const std::string& text, const std::string& prefix) {
+  long total = 0;
+  size_t begin = 0;
+  while (begin < text.size()) {
+    const size_t end = text.find('\n', begin);
+    const size_t length =
+        end == std::string::npos ? text.size() - begin : end - begin;
+    if (text.compare(begin, prefix.size(), prefix) == 0) {
+      const size_t space = text.rfind(' ', begin + length);
+      if (space != std::string::npos && space >= begin) {
+        try {
+          total += std::stol(text.substr(space + 1, begin + length - space - 1));
+        } catch (...) {
+          return -1;
+        }
+      }
+    }
+    if (end == std::string::npos) break;
+    begin = end + 1;
+  }
+  return total;
 }
 // Rail-policy configuration is process-global. Keep every two-HCA test on one
 // suite-safe value: 32 concurrent callers may each reserve the depth-four
@@ -1590,7 +1617,7 @@ TEST(RdmaLoopback, BatchExistReusesExpandedPool) {
     EXPECT_EQ((bool)er[i], (i % 2 == 0)) << probe[i];
   const long expanded =
       CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
-  EXPECT_LE(expanded - before, 15);  // default max 16, one already warm
+  EXPECT_LE(expanded - before, 7);  // default max 8, one already warm
 
   auto again = c.BatchExist(probe);
   ASSERT_EQ(again.size(), probe.size());
@@ -1598,7 +1625,7 @@ TEST(RdmaLoopback, BatchExistReusesExpandedPool) {
     EXPECT_EQ((bool)again[i], (i % 2 == 0)) << probe[i];
   const long settled =
       CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
-  EXPECT_LE(settled - before, 15);  // default pool cap 16, one already warm
+  EXPECT_LE(settled - before, 7);  // default pool cap 8, one already warm
 
   auto steady = c.BatchExist(probe);
   ASSERT_EQ(steady.size(), probe.size());
@@ -1608,6 +1635,62 @@ TEST(RdmaLoopback, BatchExistReusesExpandedPool) {
       CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
   EXPECT_EQ(reused, settled)
       << "settled BatchExist did not reuse its bounded connection pool";
+}
+
+TEST(RdmaLoopback, ConfiguredPoolMaxBoundsIdleControlConnections) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv pool_max("DFKV_RDMA_POOL_MAX", "4");
+  RdmaNode node("poolmax4");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+
+  constexpr int kWorkers = 7;
+  for (int i = 0; i < kWorkers; ++i) {
+    const std::string value = "v" + std::to_string(i);
+    ASSERT_TRUE(c.Put("pm" + std::to_string(i), value.data(), value.size()));
+  }
+  node.handler_delay_ms.store(250, std::memory_order_relaxed);
+  auto wave = [&] {
+    std::atomic<int> ready{0};
+    std::atomic<bool> start{false};
+    std::vector<char> found(kWorkers, 0);
+    std::vector<std::thread> workers;
+    for (int i = 0; i < kWorkers; ++i) {
+      workers.emplace_back([&, i] {
+        ready.fetch_add(1, std::memory_order_relaxed);
+        while (!start.load(std::memory_order_acquire))
+          std::this_thread::yield();
+        found[i] = c.Exist("pm" + std::to_string(i));
+      });
+    }
+    while (ready.load(std::memory_order_relaxed) != kWorkers)
+      std::this_thread::yield();
+    start.store(true, std::memory_order_release);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(
+        MetricSum(
+            rt.MetricsText(),
+            "dfkv_rdma_client_pool_connections{lane=\"control\",state=\"active\""),
+        kWorkers);
+    for (auto& worker : workers) worker.join();
+    for (const char present : found) EXPECT_TRUE(present);
+  };
+  wave();
+  const long opened_after_first =
+      CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
+  wave();
+  const long opened_after_second =
+      CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
+  EXPECT_GE(opened_after_second - opened_after_first, 3)
+      << "pool max four should reopen the three endpoints it cannot retain";
+
+  const std::string metrics = rt.MetricsText();
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_pool_limit"), 4);
+  EXPECT_LE(
+      MetricSum(
+          metrics,
+          "dfkv_rdma_client_pool_connections{lane=\"control\",state=\"idle\""),
+      4);
 }
 
 // Non-SG batch PUT: one oversized item must fail ONLY itself, not poison the
@@ -1724,6 +1807,16 @@ TEST(RdmaLoopback, MetricsCountersTrackOps) {
   EXPECT_GE(CounterVal(srv_text, "dfkv_rdma_v2_conns_opened_total"), 1);
   EXPECT_GE(CounterVal(srv_text, "dfkv_rdma_v2_put_writes_total"), 1);
   EXPECT_GT(CounterVal(srv_text, "dfkv_rdma_recv_segment_bytes"), 0);
+  EXPECT_GT(CounterVal(srv_text, "dfkv_rdma_recv_segment_used_bytes"), 0);
+  EXPECT_GT(CounterVal(
+                srv_text,
+                "dfkv_rdma_recv_segment_largest_free_range_bytes"),
+            0);
+  EXPECT_GE(CounterVal(srv_text, "dfkv_rdma_pull_connections"), 1);
+  EXPECT_GT(CounterVal(
+                srv_text,
+                "dfkv_rdma_connection_bytes{class=\"data\"}"),
+            0);
   EXPECT_NE(srv_text.find("dfkv_rdma_rail_active_conns{dev=\""),
             std::string::npos) << srv_text;
   EXPECT_GE(CounterVal(srv_text, "dfkv_rdma_rail_completions_total"), 2);
@@ -1741,6 +1834,13 @@ TEST(RdmaLoopback, MetricsCountersTrackOps) {
                        "dfkv_rdma_client_pull_read_bytes_total"), 2048);
   EXPECT_GE(CounterVal(cli_text,
                        "dfkv_rdma_client_pool_mr_registrations_total"), 1);
+  EXPECT_EQ(CounterVal(cli_text, "dfkv_rdma_client_pool_limit"), 8);
+  EXPECT_GE(MetricSum(
+                cli_text,
+                "dfkv_rdma_client_pool_connections{lane=\"payload\",state=\"idle\""),
+            1);
+  EXPECT_GE(MetricSum(cli_text, "dfkv_rdma_client_peer_connections{"), 1);
+
   EXPECT_GE(CounterVal(cli_text, "dfkv_rdma_client_max_block_seen_bytes"),
             2048);
   EXPECT_EQ(CounterVal(cli_text,
@@ -1754,6 +1854,39 @@ TEST(RdmaLoopback, MetricsCountersTrackOps) {
   std::string snap = c.MetricsSnapshot();
   EXPECT_NE(snap.find("dfkv_client_ops_served_total"), std::string::npos) << snap;
   EXPECT_NE(snap.find("dfkv_rdma_client_conns_opened_total"), std::string::npos) << snap;
+}
+
+TEST(RdmaLoopback, SegmentOwnershipMetricsReturnToZeroAfterClientTeardown) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv idle_reclaim("DFKV_RDMA_IDLE_MS", "200");
+  RdmaNode node("segment-metric-teardown");
+  {
+    RdmaTransport transport(kMaxMsg);
+    KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+    const std::string value(4096, 's');
+    ASSERT_TRUE(client.Put("segment-owned", value.data(), value.size()));
+    const std::string active = node.rsrv->MetricsText();
+    EXPECT_GT(CounterVal(active, "dfkv_rdma_recv_segment_used_bytes"), 0);
+    EXPECT_GT(CounterVal(active, "dfkv_rdma_pull_connections"), 0);
+    EXPECT_GT(CounterVal(
+                  active,
+                  "dfkv_rdma_connection_bytes{class=\"data\"}"),
+              0);
+  }
+  for (int i = 0; i < 1000 && node.rsrv->ActiveConns() != 0; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  ASSERT_EQ(node.rsrv->ActiveConns(), 0u);
+  const std::string released = node.rsrv->MetricsText();
+  EXPECT_EQ(CounterVal(released, "dfkv_rdma_recv_segment_used_bytes"), 0);
+  EXPECT_EQ(CounterVal(released, "dfkv_rdma_pull_connections"), 0);
+  EXPECT_EQ(CounterVal(
+                released,
+                "dfkv_rdma_connection_bytes{class=\"data\"}"),
+            0);
+  EXPECT_EQ(CounterVal(
+                released,
+                "dfkv_rdma_connection_bytes{class=\"control\"}"),
+            0);
 }
 
 TEST(RdmaLoopback, MembersReplyHonorsExactBoundAndRejectsOversize) {
@@ -2460,7 +2593,7 @@ TEST(RdmaLoopback, MultiWrLaterWindowFailureIsAtomicAndReclaimsState) {
   EXPECT_EQ(node.rsrv->ActiveConns(), 0u);
 }
 
-TEST(RdmaLoopback, ScatterGatherGetUsesDedicatedPool) {
+TEST(RdmaLoopback, ScatterGatherGetReusesUnifiedDataPool) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   ::setenv("DFKV_RDMA_DEPTH", "4", 1);
   RdmaNode node("sggetlane");
@@ -2481,15 +2614,19 @@ TEST(RdmaLoopback, ScatterGatherGetUsesDedicatedPool) {
   ASSERT_TRUE(c.BatchGetAutoSg({get}, &lengths)[0]);
   ASSERT_EQ(lengths[0], value.size());
   EXPECT_EQ(first + second, value);
-  EXPECT_EQ(CounterVal(rt.MetricsText(),
-                       "dfkv_rdma_client_conns_opened_total"),
-            data_opened + 1)
-      << "SG GET reused the ordinary data pool instead of opening its lane";
+  const std::string metrics = rt.MetricsText();
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_conns_opened_total"),
+            data_opened);
+  ASSERT_FALSE(node.rsrv->DeviceNames().empty());
+  const std::string idle_sg =
+      "dfkv_rdma_client_pool_connections{lane=\"sg\",state=\"idle\",dev=\"" +
+      node.rsrv->DeviceNames().front() + "\"}";
+  EXPECT_EQ(CounterVal(metrics, idle_sg), 1);
 
   ::unsetenv("DFKV_RDMA_DEPTH");
 }
 
-TEST(RdmaLoopback, ScatterGatherPutReturnsToDedicatedPool) {
+TEST(RdmaLoopback, ScatterGatherPutReturnsToUnifiedDataPool) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   ::setenv("DFKV_RDMA_DEPTH", "4", 1);
   RdmaNode node("sgputlane");
@@ -2509,9 +2646,11 @@ TEST(RdmaLoopback, ScatterGatherPutReturnsToDedicatedPool) {
   ASSERT_TRUE(c.Put("ordinary_after_sg", ordinary.data(), ordinary.size()));
   EXPECT_EQ(CounterVal(rt.MetricsText(),
                        "dfkv_rdma_client_conns_opened_total"),
-            sg_opened + 1)
-      << "SG PUT returned its depth-one connection to the ordinary data pool";
+            sg_opened);
 
+  std::string actual(ordinary.size(), '\0');
+  ASSERT_TRUE(c.Get("ordinary_after_sg", actual.data(), actual.size()));
+  EXPECT_EQ(actual, ordinary);
   ::unsetenv("DFKV_RDMA_DEPTH");
 }
 

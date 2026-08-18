@@ -170,11 +170,12 @@ After=network-online.target dfkv-mds.service
 Wants=network-online.target
 [Service]
 Type=simple
-# v2 shared segment 示例：RDMA depth=4（默认，slot=4MiB=min(client MAX_BLOCK_BYTES 4MiB, server --max-msg 32MiB)）、segment=16 GiB
-# （depth=4 时 ~1024 data QP；depth>1 膨胀 lease，高并发易耗尽，CONNECTORS §1.2.1
-# 的公式按 peak live + pooled QP 复算）。
+# xb01 v2 shared segment：RDMA depth=4、4 MiB block 时每条 pull data QP
+# 占 33,587,200 B（receive + source arenas）。14×TP8、每 pool=8、
+# data/control 两个 pool 含 25% churn 需要 35.4 GiB，因此配置 64 GiB；
+# 代码通用默认仍是 16 GiB。
 Environment=DFKV_RDMA_DEPTH=4
-Environment=DFKV_RDMA_RECV_SEGMENT_SIZE=17179869184
+Environment=DFKV_RDMA_RECV_SEGMENT_SIZE=68719476736
 # 8×400G 轨全轨白名单 + NUMA：B200 生产 host 一台带 8 个 HCA 轨。
 # 显式白名单是固定 topology：保留首次出现顺序；present DOWN rail 仍必须完成
 # anchor/共享 segment/所有配置 MR 初始化，随后由 health monitor 等待 LinkUp。
@@ -365,11 +366,13 @@ journalctl -u dfkv -n 10 --no-pager
 > recovery probe。
 >
 > **v2 segment 预算**：`slot=align4K(4096 + max_raw_payload)`；
-> `segment >= Σ(live + client-pool-idle data/control QP × depth × slot)`。lease
-> 保留到 QP 销毁或 idle reclaim，不能只数在飞请求。4 MiB/depth=4/16 GiB
-> 约容纳 1024 条 data QP（未扣 control lease）；depth=8 时约 512 条，depth=16 时约 256 条。上线先看
-> `dfkv_rdma_recv_segment_free_bytes`、`dfkv_rdma_v2_ready` 和
-> `dfkv_rdma_v2_conns_opened_total`；free 接近 0 会使新连接被拒绝。
+> pull-read 连接按 receive + source 两个 arena 计量：
+> `segment >= 2 × Σ((live + client-pool-idle) data/control QP × depth × slot)`。
+> lease 保留到 QP 销毁或 idle reclaim，不能只数在飞请求。4 MiB/depth=4
+> 每条 pull data QP 占 33,587,200 B；16 GiB 约容纳 511 条，64 GiB 约
+> 2046 条（未扣 control lease）。上线先看 `dfkv_rdma_recv_segment_used_bytes`、
+> `free_bytes`、`largest_free_range_bytes`、`allocation_failures_total` 和
+> `dfkv_rdma_v2_ready`；free 或最大连续 range 接近一条新 lease 时会拒绝连接。
 
 ### 3a. 每节点 tenant quota
 
@@ -466,13 +469,14 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 
 | env | 默认 | 说明 |
 |---|---|---|
-| `DFKV_RDMA_RECV_SEGMENT_SIZE` | 动态 | server：v2 共享 receive segment 总大小；`slot=align4K(4096+max_raw_payload)`，容量按 expected live QP×depth×slot 预算 |
+| `DFKV_RDMA_RECV_SEGMENT_SIZE` | `16 GiB`（xb01 `64 GiB`） | server：v2 共享 segment 总大小；pull client 每 data connection 约占 `2 × depth × align4K(4096+max_raw_payload)`，必须为基础连接和 churn 留余量 |
 | `DFKV_RDMA_CONNECT_MS` | — | client：IB QP 建连超时 |
 | `DFKV_RDMA_IO_MS` | — | client：控制面帧读写超时 |
 | `DFKV_RDMA_BATCH_OP_TIMEOUT_MS` | 0=跟随 RDMA_OP | client：multi-item Cache/Range/Exist、SG 窗口总期限 |
-| `DFKV_RDMA_POOL_MAX` | `16` | client：每 server、每 lane、跨所有 rail 的 idle QP 保留上限，不是进程总连接上限；只在稳定负载仍反复建连时上调 |
-| `DFKV_RDMA_RAIL_CREDITS` | 默认 `64`, 硬上限 4096 | client：每 rail QP 信用数（inflight 上限），>server depth 会回退 |
-| `DFKV_RDMA_RAIL_TIERS` | unset = `DFKV_RDMA_DEV` 全部同一 homogeneous tier | client：`a|b;c`；所有名必须在 `DFKV_RDMA_DEV`。从最高非空 `local enabled ∩ peer healthy` tier 选轨；configured tiers 遇 absent/incomplete HLT1 或空交集返回 `kNoCompatibleRail` |
+| `DFKV_RDMA_POOL_MAX` | `8` | client：每 server、每 pool、跨 rail 的 idle QP 上限；scalar/SG 共用 data pool，7 read workers + 1 warm spare |
+| `DFKV_RDMA_RAIL_CREDITS` | 默认 `64`, 硬上限 4096 | client：每 rail outstanding request credits |
+| `DFKV_RDMA_RAIL_TIERS` | unset = homogeneous | client：异构带宽 tier `a|b;c`，只在最高健康 tier 内选轨，不因 credit/quarantine 溢出到低 tier |
+| `DFKV_RDMA_PRIMARY_DEV` | unset | client：必须属于 `DFKV_RDMA_DEV`；所有 operation 优先该 rail，仅在不可准入/失败时使用其余 configured rail |
 | `DFKV_RDMA_RAIL_BACKPRESSURE_MS` | `10` | client：Acquire 失败重试 backoff |
 | `DFKV_RDMA_RAIL_COOLDOWN_MS` | `5000` | client-local rail quarantine 冷却期；冷却期间不准入，期满仅允许 1 个真实 operation 作为 recovery probe |
 | `DFKV_RDMA_RAIL_ERROR_THRESHOLD` | `3` | client：连续 `kRailFailure` 达到该值才 quarantine；peer/endpoint、admission、timeout（无 local-error WC）、cancel 和 invalid input 不计入 |
@@ -531,11 +535,11 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 |---|---|---|
 | `DFKV_LOG` | `INFO` | log level |
 | `DFKV_FANOUT_THREADS` | `32` | TCP batch、RDMA write 和兼容路径共用的 process-wide helper 上限；RDMA read 不再使用该线程池 |
-| `DFKV_RDMA_READ_WORKERS` | `7` | process-wide RDMA GET/GET-Auto/SG-GET/Exist shard worker 硬上限；替换旧 executor 每 rank 的 7 个 helper，不增加线程。caller 不参与执行，因此并发 batch 不能继续推高活跃 read QP；batch 间按 shard round-robin |
-| `DFKV_RDMA_ENDPOINT_CACHE_MAX` | 自适应（下限 `256`） | 所有 client handle 共享的 live RDMA endpoint 硬上限；只有 QP/MR 真正销毁后才归还额度。不设置时随 ring 自动放大：`节点数 x (2 x 轨数 + 1) x 1.25`，成员采纳时只增不减；显式设置任一预算 env 即固定全部预算并关闭自适应。预算饥饿返回 kResourceExhausted（不再把无辜节点打入冷却，见 .issue/0812-004） |
-| `DFKV_RDMA_QP_BUDGET` | endpoint 上限 | process-wide QP 预算；当前一个 endpoint 对应一个 QP |
-| `DFKV_RDMA_WR_BUDGET` | endpoint 上限 × depth | process-wide negotiated WR slot 预算；SG lane 每 endpoint 只占 1 |
-| `DFKV_RDMA_REGISTERED_BYTES_BUDGET` | endpoint 上限 × depth × receive slot | live endpoint 对端 receive-segment lease 字节预算 |
+| `DFKV_RDMA_READ_WORKERS` | `7` | process-wide RDMA GET/GET-Auto/SG-GET/Exist shard worker 硬上限；caller 不参与执行，并发 batch 不会继续推高活跃 read QP；batch 间按 shard round-robin |
+| `DFKV_RDMA_ENDPOINT_CACHE_MAX` | 自适应（下限 `256`） | 所有 client handle 共享的 live endpoint 上限；按 `节点数 × 2 pools × max(pool 上限, configured rails) × 1.25` 自动放大；显式设置任一预算 env 会固定全部预算 |
+| `DFKV_RDMA_QP_BUDGET` | endpoint 上限 | process-wide QP 预算 |
+| `DFKV_RDMA_WR_BUDGET` | endpoint 上限 × depth | process-wide negotiated WR slot 预算 |
+| `DFKV_RDMA_REGISTERED_BYTES_BUDGET` | endpoint 上限 × depth × 2 × receive slot | live endpoint 对端 receive + pull arena lease 字节预算 |
 | `DFKV_RDMA_RESOURCE_ACQUIRE_MS` | `10000` | 建立新 QP 前等待全部资源额度的上限；超时明确失败，不超发 |
 | `DFKV_BATCH_CONCURRENCY` | `0`=auto（auto: `min(max(nodes, 8), 32)`） | TCP/write/兼容路径的 batch 分段并发度。RDMA read 的实际 process-wide 并发由 `DFKV_RDMA_READ_WORKERS` 限制 |
 | `DFKV_GET_MISS_RETRIES` | `1` | client GET miss 后发重试次数 |

@@ -10,6 +10,8 @@
 namespace {
 
 using dfkv::rdma::RailLocality;
+using dfkv::rdma::PreferPrimaryRail;
+using dfkv::rdma::RailCandidates;
 using dfkv::rdma::RdmaDevInfo;
 using dfkv::rdma::RdmaDiscoveryPolicy;
 using dfkv::rdma::RdmaDiscoveryProbe;
@@ -280,6 +282,19 @@ TEST(RdmaTopology, FallbackMaskIsEmptyWithoutLocalPreference) {
   const auto unknown = topology.CandidatesFor(-1, true);
   EXPECT_EQ(unknown.locality, RailLocality::kCallerUnknown);
   EXPECT_TRUE(unknown.fallback.empty());
+}
+
+TEST(RdmaTopology, PreferredRailKeepsOnePrimaryAndBoundedFallbacks) {
+  RailCandidates candidates;
+  candidates.allowed = {1, 1, 0, 1};
+  const auto preferred = PreferPrimaryRail(candidates, 1);
+  EXPECT_EQ(preferred.allowed, (std::vector<uint8_t>{0, 1, 0, 0}));
+  EXPECT_EQ(preferred.fallback, (std::vector<uint8_t>{1, 0, 0, 1}));
+
+  const auto disabled_primary = PreferPrimaryRail(candidates, 2);
+  EXPECT_EQ(disabled_primary.allowed, (std::vector<uint8_t>{0, 0, 0, 0}));
+  EXPECT_EQ(disabled_primary.fallback,
+            (std::vector<uint8_t>{1, 1, 0, 1}));
 }
 
 

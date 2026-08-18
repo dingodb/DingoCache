@@ -226,6 +226,10 @@ class RdmaServer {
   std::atomic<uint64_t> segment_evictions_{0};
   size_t recv_segment_bytes_ = 0;
   size_t recv_segment_registered_rails_ = 0;
+  std::atomic<uint64_t> pull_connections_{0};
+  std::atomic<uint64_t> legacy_connections_{0};
+  std::atomic<uint64_t> data_connection_bytes_{0};
+  std::atomic<uint64_t> control_connection_bytes_{0};
   // One anchor per resolved rail holds a lifetime shared device reference and
   // registers the receive segment and caller pools on that rail's PD. Auto
   // mode anchors only the first ACTIVE local rail. An explicit list is fixed

@@ -1,4 +1,5 @@
 #include "transport/rdma_resource_budget.h"
+#include "transport/rdma_protocol.h"
 
 #include <atomic>
 #include <chrono>
@@ -104,28 +105,64 @@ TEST(RdmaResourceBudget, RaiseLimitAdmitsPreviouslyImpossibleRequest) {
   budget.Release({1, 1, 9, 1});
 }
 
-TEST(AdaptiveBudgetTarget, SizesFromRingAndRails) {
-  // 55 nodes x 8 rails (the 0812-004 incident shape): 2 data-family lanes per
-  // rail + control, +25% headroom => comfortably above the observed ~500
-  // endpoint demand and the manually verified 1024 fix.
+TEST(AdaptiveBudgetTarget, SizesFromRingAndRetainedPools) {
+  // Eight retained endpoints in each of the data and control pools. A 55-node
+  // ring needs 880 base endpoints and 25% teardown/churn headroom.
   const auto target = AdaptiveBudgetTarget(55, 8, 4, 4198400, 256);
-  EXPECT_EQ(target.endpoints, 55u * 17u + (55u * 17u) / 4u);  // 1168
+  EXPECT_EQ(target.endpoints, 55u * 16u + (55u * 16u) / 4u);  // 1100
   EXPECT_EQ(target.qps, target.endpoints);
   EXPECT_EQ(target.wr_slots, target.endpoints * 4u);
   EXPECT_EQ(target.registered_bytes,
-            static_cast<uint64_t>(4198400) * 4u * target.endpoints);
+            2 * static_cast<uint64_t>(4198400) * 4u * target.endpoints);
 }
 
 TEST(AdaptiveBudgetTarget, SmallRingsKeepTheFloor) {
   const auto target = AdaptiveBudgetTarget(3, 1, 4, 4198400, 256);
-  EXPECT_EQ(target.endpoints, 256u);  // 3*(2*1+1)*1.25 = 11 -> floor
+  EXPECT_EQ(target.endpoints, 256u);  // 3*(2 pools)*1.25 = 7 -> floor
   EXPECT_EQ(target.wr_slots, 256u * 4u);
+}
+
+TEST(AdaptiveBudgetTarget, SeventeenNodeDefaultPoolsExceedFloor) {
+  const auto target = AdaptiveBudgetTarget(17, 8, 4, 4198400, 256);
+  EXPECT_EQ(target.endpoints, 340u);  // 17*(2 pools)*8*1.25
+  EXPECT_EQ(target.qps, 340u);
+  EXPECT_EQ(target.wr_slots, 1360u);
+}
+
+TEST(AdaptiveBudgetTarget, UnifiedPoolFitsXb01FourteenTp8ClientsIn64GiB) {
+  constexpr uint64_t kSegment64GiB = 64ull << 30;
+  constexpr uint64_t kSegment128GiB = 128ull << 30;
+  constexpr uint64_t kServingPods = 14;
+  constexpr uint64_t kTpRanks = 8;
+  constexpr uint64_t kPoolLimit = 8;
+  constexpr size_t kDepth = 4;
+  const uint64_t data_slot = V2SlotSize(4u << 20);
+  const uint64_t control_slot = V2SlotSize(kV2ControlCap);
+  const uint64_t pull_data_connection_bytes = 2 * kDepth * data_slot;
+  const uint64_t pull_control_connection_bytes = 2 * kDepth * control_slot;
+  ASSERT_EQ(pull_data_connection_bytes, 33587200u);
+  ASSERT_EQ(pull_control_connection_bytes, 327680u);
+  EXPECT_EQ(kSegment64GiB / pull_data_connection_bytes, 2046u);
+  EXPECT_EQ(kSegment128GiB / pull_data_connection_bytes, 4092u);
+
+  const uint64_t client_ranks = kServingPods * kTpRanks;
+  const uint64_t data_connections = client_ranks * kPoolLimit;
+  const uint64_t control_connections = client_ranks * kPoolLimit;
+  const uint64_t base_bytes =
+      data_connections * pull_data_connection_bytes +
+      control_connections * pull_control_connection_bytes;
+  const uint64_t with_churn_headroom = base_bytes * 5 / 4;
+  EXPECT_EQ(data_connections, 896u);
+  EXPECT_EQ(control_connections, 896u);
+  EXPECT_EQ(base_bytes, 30387732480u);
+  EXPECT_EQ(with_churn_headroom, 37984665600u);
+  EXPECT_LT(with_churn_headroom, kSegment64GiB);
 }
 
 TEST(AdaptiveBudgetTarget, CapsAtTheEnvUpperBound) {
   const auto huge = AdaptiveBudgetTarget(100000, 8, 4, 4198400, 256);
   EXPECT_EQ(huge.endpoints, 65536u);
-  // Zero-rail and zero-depth inputs stay defined (treated as 1).
+  // Zero-pool and zero-depth inputs stay defined (treated as 1).
   const auto degenerate = AdaptiveBudgetTarget(10, 0, 0, 0, 256);
   EXPECT_EQ(degenerate.endpoints, 256u);
   EXPECT_EQ(degenerate.wr_slots, 256u);

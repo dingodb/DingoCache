@@ -341,10 +341,14 @@ class DingoFSHiCacheTest(unittest.TestCase):
         finally:
             os.environ.pop("DFKV_RDMA_DEPTH", None)
 
-    def _rail_for(self, members, rails_csv, rank, size):
-        saved = os.environ.get("DFKV_RDMA_DEV")
+    def _rail_for(self, members, rails_csv, rank, size, fallbacks=None):
+        saved_dev = os.environ.get("DFKV_RDMA_DEV")
+        saved_primary = os.environ.get("DFKV_RDMA_PRIMARY_DEV")
+        saved_tiers = os.environ.get("DFKV_RDMA_RAIL_TIERS")
         os.environ["DFKV_RDMA_DEV"] = rails_csv
         os.environ.pop("DFKV_RDMA_NUMA", None)
+        os.environ.pop("DFKV_RDMA_PRIMARY_DEV", None)
+        os.environ.pop("DFKV_RDMA_RAIL_TIERS", None)
         try:
             cfg = self._cfg(members, tp_rank=0, tp_size=1)
             cfg.extra_config.update({
@@ -352,28 +356,69 @@ class DingoFSHiCacheTest(unittest.TestCase):
                 "pcp_rank": rank,
                 "pcp_size": size,
             })
+            if fallbacks is not None:
+                cfg.extra_config["rail_affinity_fallbacks"] = fallbacks
             dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
-            return os.environ.get("DFKV_RDMA_DEV"), os.environ.get("DFKV_RDMA_NUMA")
+            return (os.environ.get("DFKV_RDMA_DEV"),
+                    os.environ.get("DFKV_RDMA_NUMA"),
+                    os.environ.get("DFKV_RDMA_PRIMARY_DEV"),
+                    os.environ.get("DFKV_RDMA_RAIL_TIERS"))
         finally:
             os.environ.pop("DFKV_RDMA_NUMA", None)
-            if saved is None:
-                os.environ.pop("DFKV_RDMA_DEV", None)
-            else:
-                os.environ["DFKV_RDMA_DEV"] = saved
+            for name, value in (
+                    ("DFKV_RDMA_DEV", saved_dev),
+                    ("DFKV_RDMA_PRIMARY_DEV", saved_primary),
+                    ("DFKV_RDMA_RAIL_TIERS", saved_tiers)):
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
     def test_rail_affinity_uses_physical_attention_rank(self):
         members, _, _ = self._node("rail8")
         rails = "ib0,ib1,ib2,ib3,ib4,ib5,ib6,ib7"
-        dev, numa = self._rail_for(members, rails, rank=3, size=8)
-        self.assertEqual(dev, "ib3")
+        dev, numa, primary, tiers = self._rail_for(
+            members, rails, rank=3, size=8)
+        self.assertEqual(dev, "ib3,ib4")
         self.assertEqual(numa, "0")
+        self.assertEqual(primary, "ib3")
+        self.assertIsNone(tiers)
 
     def test_rail_affinity_wraps_over_available_rails(self):
         members, _, _ = self._node("rail2")
         rails = "ibA,ibB"
-        self.assertEqual(self._rail_for(members, rails, rank=2, size=8)[0], "ibA")
-        self.assertEqual(self._rail_for(members, rails, rank=5, size=8)[0], "ibB")
-        self.assertEqual(self._rail_for(members, rails, rank=7, size=8)[0], "ibB")
+        self.assertEqual(
+            self._rail_for(members, rails, rank=2, size=8)[0], "ibA,ibB")
+        self.assertEqual(
+            self._rail_for(members, rails, rank=5, size=8)[0], "ibB,ibA")
+        self.assertEqual(
+            self._rail_for(members, rails, rank=7, size=8)[0], "ibB,ibA")
+
+    def test_rail_affinity_can_add_one_ordered_fallback(self):
+        members, _, _ = self._node("railfallback")
+        rails = "ib0,ib1,ib2,ib3"
+        dev, numa, primary, tiers = self._rail_for(
+            members, rails, rank=2, size=4, fallbacks=1)
+        self.assertEqual(dev, "ib2,ib3")
+        self.assertEqual(numa, "0")
+        self.assertEqual(primary, "ib2")
+        self.assertIsNone(tiers)
+
+    def test_rail_affinity_can_disable_default_fallback(self):
+        members, _, _ = self._node("railnofallback")
+        dev, _, primary, _ = self._rail_for(
+            members, "ib0,ib1,ib2,ib3", rank=2, size=4, fallbacks=0)
+        self.assertEqual(dev, "ib2")
+        self.assertEqual(primary, "ib2")
+
+    def test_rail_affinity_fallback_wraps_and_is_bounded(self):
+        members, _, _ = self._node("railfallbackwrap")
+        rails = "ib0,ib1,ib2,ib3"
+        dev, _, primary, tiers = self._rail_for(
+            members, rails, rank=3, size=4, fallbacks=99)
+        self.assertEqual(dev, "ib3,ib0,ib1,ib2")
+        self.assertEqual(primary, "ib3")
+        self.assertIsNone(tiers)
 
     def test_rdma_numa_extra_config_sets_env(self):
         # The new rdma_numa knob opts into client-side NUMA-aware rail selection

@@ -2,7 +2,9 @@
 #ifndef DFKV_TRANSPORT_RDMA_RECV_SEGMENT_H_
 #define DFKV_TRANSPORT_RDMA_RECV_SEGMENT_H_
 
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <map>
 #include <mutex>
 
@@ -45,12 +47,21 @@ class RecvSegment {
   RecvSegment& operator=(const RecvSegment&) = delete;
   ~RecvSegment();
 
+  struct Stats {
+    size_t total_bytes = 0;
+    size_t used_bytes = 0;
+    size_t free_bytes = 0;
+    size_t largest_free_range = 0;
+    uint64_t allocation_failures = 0;
+  };
+
   bool Init(size_t bytes, size_t alignment = 4096);
   Lease Allocate(size_t bytes, size_t alignment = 4096);
 
   char* data() const { return data_; }
   size_t size() const { return size_; }
   size_t free_bytes() const;
+  Stats stats() const;
 
  private:
   void Release(size_t offset, size_t bytes);
@@ -60,6 +71,7 @@ class RecvSegment {
   size_t alignment_ = 0;
   mutable std::mutex mu_;
   std::map<size_t, size_t> free_;  // offset -> length, sorted and coalesced
+  std::atomic<uint64_t> allocation_failures_{0};
 };
 
 }  // namespace dfkv::rdma

@@ -75,6 +75,11 @@ class ClientMetricsTest(unittest.TestCase):
             'dfkv_rdma_client_keepalive_attempts_total 9\n'
             'dfkv_rdma_client_keepalive_successes_total 8\n'
             'dfkv_rdma_client_keepalive_failures_total 1\n'
+            'dfkv_rdma_client_pool_connections'
+            '{lane="sg",state="idle",dev="ib7s400p0"} 6\n'
+            'dfkv_rdma_client_peer_connections'
+            '{peer="dfkv-3",dev="ib7s400p0"} 9\n'
+            'dfkv_rdma_client_pool_limit 8\n'
         )
         self.assertEqual(
             [(sample.name, sample.labels, sample.value)
@@ -85,6 +90,11 @@ class ClientMetricsTest(unittest.TestCase):
                 ("dfkv_rdma_client_keepalive_attempts_total", (), 9.0),
                 ("dfkv_rdma_client_keepalive_successes_total", (), 8.0),
                 ("dfkv_rdma_client_keepalive_failures_total", (), 1.0),
+                ("dfkv_rdma_client_pool_connections",
+                 ("sg", "idle", "ib7s400p0"), 6.0),
+                ("dfkv_rdma_client_peer_connections",
+                 ("dfkv-3", "ib7s400p0"), 9.0),
+                ("dfkv_rdma_client_pool_limit", (), 8.0),
             ],
         )
 

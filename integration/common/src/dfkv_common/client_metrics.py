@@ -127,6 +127,9 @@ _GAUGES: dict[str, tuple[str, ...]] = {
     "dfkv_rdma_client_qp_budget": ("kind",),
     "dfkv_rdma_client_wr_slot_budget": ("kind",),
     "dfkv_rdma_client_registered_slot_bytes_budget": ("kind",),
+    "dfkv_rdma_client_pool_connections": ("lane", "state", "dev"),
+    "dfkv_rdma_client_peer_connections": ("peer", "dev"),
+    "dfkv_rdma_client_pool_limit": (),
 }
 
 CLIENT_METRIC_SPECS: dict[str, MetricSpec] = {

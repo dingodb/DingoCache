@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <memory>
+#include <map>
 #include <optional>
 #include <limits>
 #include <mutex>
@@ -90,12 +91,12 @@ class RdmaTransport : public Transport {
   bool RegisterMemory(void* base, size_t size) override;
   std::string MetricsText() const override;  // dfkv_rdma_client_* (conns, per-rail)
 
-  // Adaptive resource budget: connection demand is nodes x (2 data lanes x
-  // rails + control), so the process budget must follow the adopted ring, not
-  // a constant. Raises (never shrinks) every derived budget dimension when
-  // the ring outgrows the current limit. Disabled when the operator pinned
-  // any budget env explicitly (DFKV_RDMA_ENDPOINT_CACHE_MAX / QP_BUDGET /
-  // WR_BUDGET / REGISTERED_BYTES_BUDGET): explicit config is a contract.
+  // Adaptive resource budget: connection demand is nodes x two pools x
+  // max(per-pool retention limit, configured rails), so the process budget
+  // follows the adopted ring instead of a constant.
+  // It raises (never shrinks) every derived budget dimension when the ring
+  // outgrows the current limit. Disabled when
+  // the operator pins any budget env explicitly.
   void OnTopologyHint(size_t nodes) override;
   void OnPeerTopology(const PeerTopology& topology) override;
   void OnPeerIdentities(
@@ -160,10 +161,10 @@ class RdmaTransport : public Transport {
     AcquireFailure failure = AcquireFailure::kAdmission;
     Status status = Status::kIOError;
   };
-  // Lanes separate payload, device-direct SG, and key-sized control traffic;
-  // each lane keeps the negotiated depth while owning an independent endpoint
-  // pool. Acquisition performs exactly one rail admission and one endpoint
-  // lookup/construction; the logical operation owns all retry decisions.
+  // Data operations share one endpoint pool because Acquire gives one logical
+  // operation exclusive connection ownership until Release. The enum retains
+  // scalar/SG identity for low-cardinality active/idle metrics. Control traffic
+  // keeps an independent bounded-response pool.
   enum class Lane { kData, kSgData, kControl };
   AcquireResult Acquire(const std::string& node, Lane lane,
                         const AcquireOptions& options);
@@ -182,6 +183,10 @@ class RdmaTransport : public Transport {
   void Destroy(Conn* c,
                rdma::RailCompletion completion =
                    rdma::RailCompletion::kAdmission);
+  void MarkActive(Conn* c, Lane lane);
+  void MarkInactive(Conn* c);
+  void MarkLive(Conn* c);
+  void MarkDead(Conn* c);
   // An ambiguous responder WRITE without retirement proof must keep both the
   // endpoint/MRs and its operation-owned destination alive. The caller-facing
   // staged GET paths never publish these bytes, so quarantining converts the
@@ -204,12 +209,11 @@ class RdmaTransport : public Transport {
                    uint64_t payload_len, std::string* out,
                    uint64_t* value_len = nullptr);
   bool ProbeV2(const std::string& node) const;
-  std::mutex mu_;
+  mutable std::mutex mu_;
+  // Scalar and SG operations share data endpoints. An acquired connection is
+  // never concurrently reused, while operation framing remains self-describing.
   std::unordered_map<std::string, std::vector<Conn*>> pool_;
-  std::unordered_map<std::string, std::vector<Conn*>> sg_pool_;
-  // Separate idle-connection pool for control-lane ops
-  // (Exist/Remove/Members). Responses stay bounded, including the explicit
-  // 32-KiB Members capacity, and never share a QP with payload transfers.
+  // Exist/Remove/Members remain isolated from payload transfers.
   std::unordered_map<std::string, std::vector<Conn*>> control_pool_;
   // Last successfully published caller memory declarations. RegisterMemory
   // holds mu_ through per-rail stage/commit, so Acquire can observe either the
@@ -259,7 +263,7 @@ class RdmaTransport : public Transport {
   int BatchTimeout() const {
     return batch_op_timeout_ms_ > 0 ? batch_op_timeout_ms_ : op_timeout_ms_;
   }
-  size_t pool_max_ = 16;              // idle conns kept per node/lane
+  size_t pool_max_ = 8;               // idle conns kept per peer/pool
   // Enabled by default below the recommended 30 s server reaper interval.
   // Set DFKV_RDMA_KEEPALIVE_MS=0 to disable.
   int keepalive_ms_ = 15000;
@@ -296,6 +300,7 @@ class RdmaTransport : public Transport {
   std::unique_ptr<rdma::RdmaTopology> topology_;
   std::vector<std::string> devs_;  // stable discovered ACTIVE rail order
   std::vector<std::vector<uint8_t>> rail_tiers_;
+  std::optional<size_t> preferred_rail_;
   bool peer_topology_required_ = false;
   std::unique_ptr<rdma::PeerTopologyStore> peer_topologies_;
   std::unique_ptr<RemoteRailHealth> remote_rail_health_;
@@ -339,6 +344,9 @@ class RdmaTransport : public Transport {
   std::atomic<uint64_t> keepalive_attempts_{0};
   std::atomic<uint64_t> keepalive_successes_{0};
   std::atomic<uint64_t> keepalive_failures_{0};
+  std::unique_ptr<std::atomic<uint64_t>[]> active_lane_rail_;
+  mutable std::mutex peer_connections_mu_;
+  std::map<std::pair<std::string, size_t>, uint64_t> peer_connections_;
   std::unique_ptr<std::atomic<uint64_t>[]> rail_conns_;  // sized to devs_.size()
   std::atomic<uint64_t> endpoint_cache_hits_{0};
   std::atomic<uint64_t> endpoint_cache_misses_{0};

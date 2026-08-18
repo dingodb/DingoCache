@@ -17,19 +17,22 @@ struct ResourceRequest {
   uint64_t registered_bytes = 0;
 };
 
-// Budget sized from ring topology instead of a constant. Endpoint demand is
-// nodes x (payload lane + SG lane, one endpoint per rail each) plus one
-// control endpoint per node; +25% headroom keeps eviction cheap while churned
-// teardowns still hold their budget. The other three dimensions follow the
-// same derivation the constructor defaults use (QP = endpoints, WR =
-// endpoints x depth, registered = slot x depth x endpoints). floor_endpoints
-// keeps small rings on the documented default. These are admission LIMITS,
-// not allocations: raising them consumes nothing until connections exist.
-inline ResourceRequest AdaptiveBudgetTarget(size_t nodes, size_t rails,
+// Budget sized from ring topology and each retained pool's limit instead of a
+// constant. Scalar and SG payload operations share one exclusive-ownership
+// data pool; control traffic owns a second pool. Endpoint demand is nodes x
+// both pool limits; +25% headroom covers active operations and teardown churn.
+// The other dimensions follow the constructor defaults (QP = endpoints, WR =
+// endpoints x depth, registered = receive + pull arenas = 2 x slot x depth x
+// endpoints). floor_endpoints keeps small rings on the documented default.
+// These are admission LIMITS, not allocations.
+inline ResourceRequest AdaptiveBudgetTarget(size_t nodes,
+                                            size_t endpoints_per_pool,
                                             size_t depth, uint64_t slot_bytes,
                                             size_t floor_endpoints) {
   constexpr size_t kMaxEndpoints = 65536;  // EnvBoundedInt upper bound parity
-  const size_t lanes = 2 * (rails ? rails : 1) + 1;
+  const size_t per_pool = endpoints_per_pool ? endpoints_per_pool : 1;
+  const size_t lanes =
+      per_pool > kMaxEndpoints / 2 ? kMaxEndpoints : 2 * per_pool;
   size_t endpoints = nodes > (kMaxEndpoints / lanes) ? kMaxEndpoints
                                                      : nodes * lanes;
   endpoints = endpoints > kMaxEndpoints - endpoints / 4
@@ -43,9 +46,10 @@ inline ResourceRequest AdaptiveBudgetTarget(size_t nodes, size_t rails,
   target.qps = endpoints;
   target.wr_slots = endpoints * d;
   target.registered_bytes =
-      slot_bytes != 0 && endpoints <= std::numeric_limits<uint64_t>::max() /
-                                          slot_bytes / d
-          ? slot_bytes * d * endpoints
+      slot_bytes != 0 &&
+              endpoints <= std::numeric_limits<uint64_t>::max() /
+                               slot_bytes / d / 2
+          ? 2 * slot_bytes * d * endpoints
           : std::numeric_limits<uint64_t>::max();
   return target;
 }
