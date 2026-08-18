@@ -45,6 +45,41 @@ uint64_t BoundedEnv(const char* name, uint64_t fallback, uint64_t hard_max,
   }
   return parsed;
 }
+constexpr size_t kMaxHttpRequestHeadBytes = 32 * 1024;
+
+bool ReadRequestHead(
+    int fd, bool deadline_on,
+    std::chrono::steady_clock::time_point deadline,
+    std::string* request_line) {
+  if (request_line == nullptr) return false;
+  const timeval base_timeout{10, 0};
+  std::string line;
+  bool first_line = true;
+  size_t total = 0;
+  while (total < kMaxHttpRequestHeadBytes) {
+    char c = 0;
+    const bool read =
+        deadline_on
+            ? net::ReadAllWithin(fd, &c, 1, base_timeout, deadline)
+            : ::recv(fd, &c, 1, 0) > 0;
+    if (!read) return false;
+    ++total;
+    if (c != '\n') {
+      line.push_back(c);
+      continue;
+    }
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (first_line) {
+      if (line.empty()) return false;
+      *request_line = line;
+      first_line = false;
+    } else if (line.empty()) {
+      return true;
+    }
+    line.clear();
+  }
+  return false;
+}
 }  // namespace
 
 MetricsHttpServer::~MetricsHttpServer() { Stop(); }
@@ -170,29 +205,20 @@ std::string Resp(const char* status_line, const char* ctype, const std::string& 
 
 void MetricsHttpServer::Handle(
     int fd, std::chrono::steady_clock::time_point accepted_at) {
-  // Read just the request line (up to CRLF). Headers/body are ignored — we only
-  // need method + path. Bound the read so a silent peer can't pin the thread.
-  // The request line also has an ABSOLUTE deadline (DFKV_METRICS_FIRST_REQ_MS,
-  // anchored at accept): SO_RCVTIMEO alone is per-syscall, so a drip feeder
-  // (1 byte < 10s apart) would otherwise pin a handler thread. Before every
-  // recv the per-syscall budget is recomputed as min(10s, deadline remaining);
-  // a spent budget closes the connection. 0 disables (legacy behavior).
+  // Consume the complete bounded request-head section before replying. Closing
+  // a socket with unread Prometheus headers is an abortive close on Linux: the
+  // peer sees RST and may lose the tail of a large metrics body even after
+  // WriteAll placed it in the local send buffer.
+  //
+  // The absolute deadline remains anchored at accept and now covers every
+  // header byte, not just the request line. This preserves the slow-drip guard:
+  // each recv uses min(10 s, deadline remaining), and 0 keeps the legacy
+  // no-absolute-deadline behavior.
   const bool deadline_on = first_req_ms_ > 0;
   const auto deadline =
       accepted_at + std::chrono::milliseconds(first_req_ms_);
-  const timeval base_tv{10, 0};
   std::string line;
-  char c;
-  size_t guard = 0;
-  while (guard++ < 8192) {
-    if (deadline_on) {
-      if (!net::ReadAllWithin(fd, &c, 1, base_tv, deadline)) return;
-    } else {
-      if (::recv(fd, &c, 1, 0) <= 0) return;  // peer closed / error
-    }
-    if (c == '\n') break;
-    if (c != '\r') line.push_back(c);
-  }
+  if (!ReadRequestHead(fd, deadline_on, deadline, &line)) return;
   // line == "GET /path HTTP/1.x"
   std::string path;
   {
@@ -220,7 +246,8 @@ void MetricsHttpServer::Handle(
   } else {
     out = Resp("404 Not Found", "text/plain", "not found\n");
   }
-  net::WriteAll(fd, out.data(), out.size());
+  if (!net::WriteAll(fd, out.data(), out.size())) return;
+  ::shutdown(fd, SHUT_WR);
 }
 
 }  // namespace dfkv
