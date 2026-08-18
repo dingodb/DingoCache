@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Metrics HTTP clean close
+
+- Consume the complete HTTP request-head section, bounded to 32 KiB and by the
+  existing accept-time absolute deadline, before rendering server or MDS
+  metrics. Closing no longer leaves unread Prometheus headers that force Linux
+  to send a TCP RST and truncate large remote scrapes.
+- Preserve the existing one-request connection model, connection cap,
+  slow-drip protection, health/readiness semantics, and send timeout. Successful
+  responses now finish with an explicit write-side shutdown and clean EOF.
+- Add realistic Prometheus headers, a 256 KiB byte-exact response, clean-EOF,
+  split-header, header-drip, and oversized unterminated-header regressions.
+
 ### CUDA GET pinned publication pool
 
 - Replaced per-operation CUDA host registration for GET publication with a

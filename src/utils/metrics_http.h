@@ -65,13 +65,13 @@ class MetricsHttpServer {
 
  private:
   void AcceptLoop();
-  // accepted_at stamps the accept() return so the first complete request line
-  // is due within DFKV_METRICS_FIRST_REQ_MS of ACCEPT, not of scheduling.
+  // accepted_at stamps accept() so the complete first request head is due
+  // within DFKV_METRICS_FIRST_REQ_MS of ACCEPT, not of scheduling.
   void Handle(int fd, std::chrono::steady_clock::time_point accepted_at);
   void ReapDoneLocked();  // join+erase finished handler threads; conn_mu_ held
 
-  // Absolute deadline for the first complete request line after accept — a
-  // drip feeder otherwise never hit the per-syscall SO_RCVTIMEO (0 = off).
+  // Absolute deadline for the first complete request head after accept — a
+  // drip feeder otherwise never hits the per-syscall SO_RCVTIMEO (0 = off).
   static constexpr uint64_t kDefaultFirstReqMs = 30000;
   static constexpr uint64_t kHardFirstReqMs = 3600000;
   // Connection cap for this oneshot/low-frequency port (none existed before).
