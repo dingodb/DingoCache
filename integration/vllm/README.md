@@ -29,7 +29,9 @@ that single object operation; it does not split the chunk into physical keys.
   "kv_role": "kv_both",
   "kv_connector_extra_config": {
     "members": "c1=<server-ip>:<rdma-port>",
-    "lib": "/path/to/libdfkv.so"
+    "lib": "/path/to/libdfkv.so",
+    "rail_affinity": true,
+    "rail_affinity_fallbacks": 1
   }
 }'
 ```
@@ -55,7 +57,7 @@ traffic if either requirement is missing.
 |---|---|---|
 | `DFKV_RDMA` | **required: `1`** | Selects the required GPUDirect RDMA transport. Unset/TCP is rejected during connector construction; there is no TCP fallback. |
 | `PYTHONHASHSEED` | **required: fixed value** | Stabilizes vLLM's root block hash across processes and restarts. Use the same value (for example `0`) on every producer and consumer sharing a store. |
-| `DFKV_RDMA_DEV` | first local `ACTIVE` HCA | Optional device/fabric selector. Leave unset for one local rail even when `DFKV_RDMA=1`; use a comma-list only to opt into multi-rail, and verify the same listed names/fabric at both endpoints. |
+| `DFKV_RDMA_DEV` | first local `ACTIVE` HCA | Optional ordered device/fabric list. With `rail_affinity=true`, the connector narrows this full per-host list to the worker's world-group local-rank primary plus bounded fallbacks before native open. |
 | `DFKV_RDMA_DEPTH` | `4` | Negotiated request window (`min(client, server)`). Keep the defaults aligned for production connector batches. Per-connection bandwidth is depth-flat after connection setup; scale read throughput with sharded pooled connections, not by increasing depth. |
 | `DFKV_RDMA_NUMA` | `0` | `1` pins buffers/threads to the rail's NUMA node and picks a NUMA-local rail per connection. Optional. |
 | `DFKV_READ_SHARD_KEYS` | `16` | Target keys per read shard: splits one node's batched GET into parallel shards. The real read-throughput lever on few-node rings / large batches landing on one node (single connection drains ~166 MB/s serially); no-op on wide rings. |
@@ -79,6 +81,8 @@ LMCache connector access logs, so one setting covers every integration. Format:
 | `members` | (required) | dfkv member string. **The port MUST be the server's `--rdma-port`** (the RDMA bootstrap listener), not the main `--port`, when RDMA is enabled. |
 | `lib` | env `DFKV_LIB` / `$DFKV_BUILD/libdfkv.so` | path to `libdfkv.so`. |
 | `batch_concurrency` | `0`=auto | client fan-out for batch ops; the real throughput lever (depth is flat). Auto = `min(max(nodes, 8), 32)`: 8-way parallel on single-node, one-per-node on multi-node. Set >0 to pin a fixed value. |
+| `rail_affinity` | `False` | Bind each vLLM worker process to a primary rail selected by world-group local rank; requires an ordered multi-rail `DFKV_RDMA_DEV`. |
+| `rail_affinity_fallbacks` | `1` | Number of ordered neighboring fallback rails when affinity is enabled. `0` keeps strict one-rank/one-rail; values above the available rail count are bounded. |
 | `load_async` | `True` | async KV load: the scheduler returns `WAITING_FOR_REMOTE_KVS` and the load runs off the critical path. Keep `True`. |
 | `transfer_queue_capacity` | `256` | Maximum queued requests in each direction (`1..65536`). All receive workers consume one shared receive queue of this capacity; capacity is not multiplied by `recv_workers`. Submission is non-blocking: a full queue rejects new saves as completed (releasing finish/free fences) and rejects new loads as load errors (forcing recompute), so overload cannot grow memory or pin blocks indefinitely. Invalid or out-of-range values abort connector construction. |
 | `recv_workers` | `1` | Receive/load worker count (`1..32`). Workers consume the shared bounded receive queue and may execute independent native GETs concurrently. Invalid, boolean, or out-of-range values abort connector construction. |

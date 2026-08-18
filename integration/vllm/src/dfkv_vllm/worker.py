@@ -28,6 +28,7 @@ from typing import Any, TypeVar
 
 import torch
 from dfkv_common import (
+    apply_rank_local_rail_affinity,
     canonical_namespace,
     reject_namespace_override,
 )
@@ -38,6 +39,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import (
     get_dcp_group,
     get_pcp_group,
+    get_world_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -74,6 +76,7 @@ from .data import (
 from .dfkv_client import DfkvDeviceClient, SgDescriptorBatch
 from .dfkv_utils import get_dp_engine_index
 from .metrics import DfkvStoreConnectorStats
+from .rail_affinity import physical_affinity_rank
 from ._telemetry import config as _tcfg  # connector identity + client_register switch
 from .protocol import (
     LOOKUP_MSG,
@@ -1263,14 +1266,47 @@ class DfkvStoreWorker:
         self.tp_size = get_tensor_model_parallel_world_size()
         self.pp_size = parallel_config.pipeline_parallel_size
         self.pp_rank = (parallel_config.rank // self.tp_size) % self.pp_size
+        self.local_rank = int(get_world_group().local_rank)
 
         self.pcp_size = get_pcp_group().world_size
         self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
         self.dcp_size = get_dcp_group().world_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
+        self.affinity_rank = physical_affinity_rank(
+            local_rank=self.local_rank,
+            tp_rank=self.tp_rank,
+            pcp_rank=self.pcp_rank,
+            dcp_rank=self.dcp_rank,
+            pp_rank=self.pp_rank,
+        )
 
         assert vllm_config.kv_transfer_config is not None
         extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self._rail_affinity = apply_rank_local_rail_affinity(
+            extra, self.affinity_rank, os.environ
+        )
+        if self._rail_affinity.enabled:
+            logger.info(
+                "dfkv rail affinity: status=%s physical_rank=%d "
+                "dp=%d/%d pp=%d/%d tp=%d/%d pcp=%d/%d dcp=%d/%d "
+                "available=%s selected=%s primary=%s fallbacks=%d",
+                self._rail_affinity.reason,
+                self.affinity_rank,
+                self.dp_rank,
+                self.dp_size,
+                self.pp_rank,
+                self.pp_size,
+                self.tp_rank,
+                self.tp_size,
+                self.pcp_rank,
+                self.pcp_size,
+                self.dcp_rank,
+                self.dcp_size,
+                ",".join(self._rail_affinity.available) or "<none>",
+                ",".join(self._rail_affinity.selected) or "<none>",
+                self._rail_affinity.primary or "<none>",
+                self._rail_affinity.fallback_count,
+            )
         self.transfer_queue_capacity = _parse_transfer_queue_capacity(
             extra.get(
                 "transfer_queue_capacity",

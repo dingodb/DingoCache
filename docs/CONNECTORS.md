@@ -184,11 +184,12 @@ capability；HCA `max_sge` 低于 dfkv 上限时会缩小宽度，高于上限�
 > 而不是悄悄按小的开——后者会让客户端按自己声明的大小发包、打爆对端 recv buffer（RNR/QP 断）。
 > 大集群建议显式设定，否则服务端的内存预算完全由客户端决定，而客户端常由别的团队部署、版本不一。
 
-> `rail_affinity=true` 按物理 attention rank（PCP>1 时用 `pcp_rank`，
-> 否则用 `tp_rank`）绑定一条主 rail，并默认加入相邻 1 条 fallback rail。
-> `rail_affinity_fallbacks=0` 可恢复严格 one-rank/one-rail；更大值不会超过
-> `DFKV_RDMA_DEV` 列表。connector 设置 `DFKV_RDMA_PRIMARY_DEV=<primary>`；
-> native transport 优先 primary，仅在其不可准入/失败时使用 fallback。
+> `rail_affinity=true` 在 native client 创建前把完整 `DFKV_RDMA_DEV` 收窄为
+> 一条 primary 和默认相邻 1 条 fallback。SGLang HiCache 使用其物理 attention
+> coordinate（PCP>1 时 `pcp_rank`，否则 `tp_rank`）；vLLM 使用 world-group
+> per-host `local_rank`，不把可重复的 TP/DCP/PCP/PP 存储坐标误当 HCA 序号。
+> `rail_affinity_fallbacks=0` 恢复严格 one-rank/one-rail；connector 设置
+> `DFKV_RDMA_PRIMARY_DEV=<primary>` 和 `DFKV_RDMA_NUMA=0`。
 
 ### 1.3 wire 协议版本
 
@@ -647,7 +648,7 @@ PYTHONHASHSEED=0 \
 DFKV_RDMA=1 \
 DFKV_RDMA_DEV=ib7s400p0,ib7s400p1,ib7s400p2,ib7s400p3,ib7s400p4,ib7s400p5,ib7s400p6,ib7s400p7 \
 DFKV_RDMA_DEPTH=1 \
-DFKV_RDMA_NUMA=1 \
+DFKV_RDMA_NUMA=0 \
 DFKV_LIB=/opt/dfkv/libdfkv.so \
 vllm serve <model> \
   --tensor-parallel-size 2 --data-parallel-size 4 \
@@ -659,7 +660,9 @@ vllm serve <model> \
     "kv_connector_extra_config": {
       "mds_endpoints": "192.168.0.8:28150,192.168.0.9:28150,192.168.0.10:28150",
       "mds_group": "glm",
-      "batch_concurrency": "8"
+      "batch_concurrency": "8",
+      "rail_affinity": true,
+      "rail_affinity_fallbacks": 1
     }
   }'
 ```
@@ -693,9 +696,9 @@ extra-config 键。namespace 始终绑定该 model identity 与 `vllm/raw-v1`；
 |---|---|---|
 | engine 参数 | `--prefix-caching-hash-algo sha256` | object key 必须是内容定义 hash；`builtin` 被连接器拒绝 |
 | engine 环境 | `PYTHONHASHSEED=0`（所有共享实例同值） | 稳定首块 parent hash；缺失会在每次进程重启后全量 cold miss |
-| engine 环境 | `DFKV_RDMA=1`、`DFKV_RDMA_DEV=<本机 ACTIVE HCA 列表>` | 强制 RDMA；PUT 使用 GPUDirect，GET 使用 host retry staging；网卡名必须按节点实际拓扑配置 |
+| engine 环境 | `DFKV_RDMA=1`、`DFKV_RDMA_DEV=<本机 ACTIVE HCA 有序全轨列表>` | 强制 RDMA；affinity 开启时 connector 在每个 worker 进程中按 world-group local rank 收窄为 primary + fallback |
+| connector extra-config | `rail_affinity=true`、`rail_affinity_fallbacks=1` | bounded failover；native open 前自动设置 per-process `DFKV_RDMA_PRIMARY_DEV` 和 `DFKV_RDMA_NUMA=0` |
 | engine 环境 | `DFKV_RDMA_DEPTH=1` | 每条 QP 限制一个在途 range；吞吐靠连接 fanout，不靠同 QP depth |
-| engine 环境 | `DFKV_RDMA_NUMA=1` | 每条连接选择 NUMA-local rail 和内存，避免跨 socket 路径 |
 | 容器资源 | Docker/nerdctl `--ulimit memlock=-1:-1`；Kubernetes `ulimits` 等价配置；systemd `LimitMEMLOCK=infinity` | 允许 GPU MR 及 CUDA GET 临时 pinned host staging；按并发 GET payload 验证 pinned-memory 与 memlock 容量，8 MiB 默认值可能触发 `ibv_reg_mr` 失败或临时注册退化 |
 | 宿主机 | `nvidia-peermem` 已加载 | GPUDirect MR 注册前提 |
 
@@ -708,7 +711,7 @@ nerdctl run --ulimit memlock=-1:-1 \
   -e DFKV_RDMA=1 \
   -e DFKV_RDMA_DEV=ib7s400p0,ib7s400p1 \
   -e DFKV_RDMA_DEPTH=1 \
-  -e DFKV_RDMA_NUMA=1 \
+  -e DFKV_RDMA_NUMA=0 \
   ... <image> \
   vllm serve <model> --prefix-caching-hash-algo sha256 ...
 ```
@@ -747,9 +750,9 @@ namespace/key 不一致是预期 cold miss。**空环 / MDS 不可达**可直接
 
 | env | 默认 | 推荐 | 说明 |
 |---|---|---|---|
-| `DFKV_RDMA` / `DFKV_RDMA_DEV` | **无；`DFKV_RDMA=1` 必填** | `1` / 全轨列表 | vLLM GPU 指针连接器仅支持 RDMA；PUT 为 GPUDirect，GET 为 pinned host retry staging + 同步 H2D publication；unset/TCP 在构造期关闭并拒绝，无 fallback。见 §1.2 |
-| `DFKV_RDMA_DEPTH` | `4` | 保持 4 | depth-flat（§1.2） |
-| `DFKV_RDMA_NUMA` | `0` | 多 NUMA 大机 `1` | §1.2 |
+| `DFKV_RDMA` / `DFKV_RDMA_DEV` | **无；`DFKV_RDMA=1` 必填** | `1` / 本机有序全轨列表 | vLLM GPU 指针连接器仅支持 RDMA；`rail_affinity=true` 时 connector 在每个 worker 内收窄列表 |
+| `DFKV_RDMA_DEPTH` | `4` | 保持生产已验证值 | depth-flat（§1.2） |
+| `DFKV_RDMA_NUMA` | `0` | affinity 开启时保持 `0` | connector 为严格 primary/fallback 映射显式设置 0；affinity 关闭时才按需启用 NUMA 动态选轨 |
 | `DFKV_LIB` / `DFKV_BUILD` | — | so 路径 | 被 extra_config `lib` 覆盖 |
 | `DFKV_ACCESS_LOG_*` | 关 | 排查时开 | §1.6；vLLM 侧记 `batch_get_auto_sg`/`batch_put_sg`/`batch_exist`/`register_memory` |
 | `DFKV_CLIENT_STATS_POLL_S` | `15` | 默认即可 | 后台轮询把环/MDS 健康镜像到 vLLM `/metrics`（`vllm:dfkv_client_ring_members`/`mds_reachable`/`mds_unreachable_polls_total`/`transport_info`）；`0`=关。见 [METRICS.md](METRICS.md) §3.5 |
@@ -767,6 +770,8 @@ namespace/key 不一致是预期 cold miss。**空环 / MDS 不可达**可直接
 | `members` | —（与 mds_endpoints 二选一） | `n=ip:rdma-port,...` | **端口 = server `--rdma-port`** |
 | `lib` | env 兜底 | so 绝对路径 | |
 | `batch_concurrency` | `8` | **大池可调高到 ≈ 节点数** | 跨节点 fan-out，**真正的吞吐杠杆**（depth 是平的） |
+| `rail_affinity` | `False` | 多 rank、多 rail 生产设 `true` | 按 vLLM world-group per-host `local_rank` 选择 primary；在 native client 创建前设置每进程独立 rail 环境 |
+| `rail_affinity_fallbacks` | `1` | `1` | 相邻有序 fallback 数；`0`=严格单 rail，超出可用 rail 数时自动收敛 |
 | `load_async` | `True` | 保持 True | 异步 load，走 `WAITING_FOR_REMOTE_KVS`、不占关键路径 |
 | `transfer_queue_capacity` | `256` | 保持默认，按压测调 | 每个 worker、每个方向的排队上限（`1..65536`）。满队列时非阻塞拒绝新任务：save 立即释放 finish/free fence，load 标记失败并重算；非法值启动即失败。 |
 | `enable_cross_layers_blocks` | `False` | 默认 False | 仅当引擎分页布局层内交错时开 |

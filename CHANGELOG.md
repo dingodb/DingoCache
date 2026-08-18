@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### vLLM rank-local rail affinity
+
+- Added `rail_affinity` and `rail_affinity_fallbacks` to
+  `DfkvStoreConnector`. Before opening the native client, each vLLM worker now
+  maps its world-group local rank to one primary plus a bounded ordered
+  fallback set, then sets `DFKV_RDMA_DEV`, `DFKV_RDMA_PRIMARY_DEV`, and
+  `DFKV_RDMA_NUMA=0`.
+- Moved the rail-list parsing, fallback bounds, duplicate rejection, and
+  environment update contract into `dfkv-common`; SGLang HiCache and vLLM now
+  share one implementation while retaining their framework-specific physical
+  rank resolution.
+
 ### RDMA connection capacity
 
 - Unified scalar and scatter-gather data operations on one exclusive-ownership
