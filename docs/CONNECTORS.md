@@ -84,9 +84,9 @@ tp_rank=..,ver=<lib>`（无 `role`——HiCache 是前缀 L3 缓存，无生产/
 |-----|------|------|------|
 | `DFKV_RDMA` | 一般路径未设 = TCP；**vLLM 直连无默认，必须 `1`** | 按连接器选择 | `1` 显式选择 native-verbs RDMA v2；请求 RDMA 后设备或协议不可用会失败，不会自动选择 TCP。`DfkvStoreConnector` 只接收 GPU 设备指针，构造时会关闭并拒绝任何非 RDMA handle。 |
 | `DFKV_RDMA_DEV` | 首个 `ACTIVE` 本地 HCA | 留空让两端各自选本地首口；多轨才显式写同 fabric 白名单 | 留空时 bootstrap 不发送设备名，client/server 可使用不同本地命名。逗号列表显式开启多轨，新连接在健康轨间轮转；显式设备名会发给 peer，故两端必须存在同名且互通的 fabric。设备名上限 **18 字节**（v2 bootstrap dev frame 限制），超长即 fail-fast 拒绝启动/建连，不会静默截断（见 `src/transport/dev_frame.h`）。 |
-| `DFKV_RDMA_DEPTH` | `4` | 两侧可不同，按容量选 | 握手协商 `min(client,server)` 作为安全窗口。每连接注册 `2 × depth × (18 B + 32 KiB)` 的有界 SEND/RECV control buffer，并从共享 receive segment 租 `depth` 个 slot。 |
+| `DFKV_RDMA_DEPTH` | `4` | 两侧可不同，按容量选 | 握手协商 `min(client,server)` 作为安全窗口。每连接注册 `2 × depth × (18 B + 32 KiB)` 的有界 SEND/RECV control buffer；pull-read 连接还从共享 segment 各租 `depth` 个 receive slot 和 source slot。 |
 | `DFKV_RDMA_MAX_BLOCK_BYTES` | 4 MiB 安全上限 | 按连接器块几何精确设置 | DCP2 声明本连接最大 PUT/GET block，决定共享 segment 的 slot 大小；超声明请求在客户端失败且不上 wire。声明越准，同一 segment 可容纳的 live/pooled v2 连接越多。 |
-| `DFKV_RDMA_RECV_SEGMENT_SIZE` | 16 GiB | 按下文 live/pooled 连接公式设置 | server 启动时申请，并在每个选中 rail 的共享 PD 上注册；失败会拒绝启动，segment 无可用 lease 时拒绝新连接。 |
+| `DFKV_RDMA_RECV_SEGMENT_SIZE` | 16 GiB | 按下文 live/pooled 连接公式设置；xb01 为 64 GiB | server 启动时申请，并在每个选中 rail 的共享 PD 上注册；失败会拒绝启动，segment 无可用 lease 时拒绝新连接。 |
 | `DFKV_RDMA_NUMA` | `0` | 显式多轨的大机可设 `1` | 建连时按调用线程 NUMA 选本地 rail（无本地 rail→轮转白名单），server serve 线程跟随 QP rail。单块共享 receive segment 不做 per-rail NUMA 分配；仅保证选轨/线程亲和。 |
 | `DFKV_RDMA_MAX_PAYLOAD_BYTES` | 64 MiB（67108864） | — | 客户端单 value payload 上限（不得超过 server 侧同名上限） |
 | `DFKV_CUDA_PINNED_POOL_BYTES` | 64 MiB（67108864） | 按进程允许的 CUDA pinned host memory / memlock 设置 | vLLM CUDA GET publication 的进程级 bounce pool 预算。取正十进制字节数，最大 4 GiB；预算向下取整为完整 slot，且至少容纳一个 slot、最多 4096 个。非法或与 slot 不兼容的组合告警并回退整组默认值。slot 按需创建，因此实际 pinned high-water 不超过取整后的预算。 |
@@ -123,9 +123,9 @@ parent 继承的 CUDA pool 状态。
 #### 1.2.1 `DFKV_RDMA_MAX_BLOCK_BYTES` 怎么定（含 L2 / L2-bypass 两套公式）
 
 这个值在 **v2** 决定共享 receive segment 的 slot 大小：
-`align4K(4 KiB + 声明的最大 raw payload)`。每条数据连接租 `depth` 个 slot，
-但所有连接共享一块启动期注册的 `DFKV_RDMA_RECV_SEGMENT_SIZE`，不再各自
-注册 `depth × block` 的收发 buffer，因此声明保持精确仍有价值。
+`align4K(4 KiB + 声明的最大 raw payload)`。每条 pull-read 数据连接分别租
+`depth` 个 receive slot 和 source slot；所有连接共享一块启动期注册的
+`DFKV_RDMA_RECV_SEGMENT_SIZE`，因此声明保持精确仍有价值。
 
 **共享 segment 容量必须按连接寿命算，不是按同时在飞请求算。** 数据 QP 的
 slot 为
@@ -133,14 +133,15 @@ slot 为
 ```
 S_data = align4K(4096 + DFKV_RDMA_MAX_BLOCK_BYTES)
 S_control = align4K(4096 + (18 + 32768)) = 40960
-B_required >= N_data × depth × S_data + N_control × depth × S_control
+B_required >= 2 × (N_data × depth × S_data
+                    + N_control × depth × S_control)
 ```
 
 `N_data` / `N_control` 是该 server 上所有 rank、进程的**峰值 live + client
 pool 中空闲连接**；lease 一直保留到 QP 被销毁或 `DFKV_RDMA_IDLE_MS` 回收，
-线程峰值留下的 pooled QP 也要计入。4 MiB 声明、depth=4 时
-`S_data=4,198,400 B`，16 GiB segment 最多约 1024 条 data QP（未扣 control
-lease）；depth=1 时约 4092 条，depth=8 时约 511 条。上线同时观察
+线程峰值留下的 pooled QP 也要计入。4 MiB 声明、depth=4 时每条 pull data
+QP 占 33,587,200 B；16 GiB 最多约 511 条、64 GiB 约 2046 条（均未扣
+control lease）。上线同时观察
 `dfkv_rdma_recv_segment_free_bytes` 与 `dfkv_rdma_v2_ready`；free 接近 0
 即扩容或缩小声明/depth/pool，避免新连接被拒绝。
 
@@ -183,9 +184,11 @@ capability；HCA `max_sge` 低于 dfkv 上限时会缩小宽度，高于上限�
 > 而不是悄悄按小的开——后者会让客户端按自己声明的大小发包、打爆对端 recv buffer（RNR/QP 断）。
 > 大集群建议显式设定，否则服务端的内存预算完全由客户端决定，而客户端常由别的团队部署、版本不一。
 
-> ⚠️ 旧 `rail_affinity`（extra_config）**已废弃为 no-op**：它按 `tp_rank`
-> 收窄选轨，但 DP-attention 下每 rank `tp_rank=0`→塌缩单轨。配了只打 stderr 告警。
-> 用 `rdma_numa` / `DFKV_RDMA_NUMA` 替代。
+> `rail_affinity=true` 按物理 attention rank（PCP>1 时用 `pcp_rank`，
+> 否则用 `tp_rank`）绑定一条主 rail，并默认加入相邻 1 条 fallback rail。
+> `rail_affinity_fallbacks=0` 可恢复严格 one-rank/one-rail；更大值不会超过
+> `DFKV_RDMA_DEV` 列表。connector 设置 `DFKV_RDMA_PRIMARY_DEV=<primary>`；
+> native transport 优先 primary，仅在其不可准入/失败时使用 fallback。
 
 ### 1.3 wire 协议版本
 
@@ -370,18 +373,19 @@ sglang serve ... \
 `mds_endpoints`/`mds_group`（默认 `default`）/`mds_poll_ms`（3000）或 `members`、
 `pcp_size`/`pcp_rank`、`dcp_size`/`dcp_rank`、`layer_num`（仅 L2-bypass 的 SG
 分组控制，不进 namespace/value）、`lib_path`、`batch_concurrency`、
-`rdma_depth`/`require_rdma`/`rdma_numa`、
-canonical namespace 的可配键 `tenant_id`（默认 `default`）、`model_revision`
-（默认取 model identity），以及 identity/layout 字段
-`page_size`（默认 64）/`kv_cache_dtype`/`dtype_tag`/`head_num`/`head_dim`/
-`dp_size`——这些都进 canonical namespace，改动即换 namespace（表现为一次冷缓存）；
+`rdma_depth`/`require_rdma`/`rdma_numa`、`rail_affinity`/
+`rail_affinity_fallbacks`，canonical namespace 的可配键 `tenant_id`
+（默认 `default`）、`model_revision`（默认取 model identity），以及
+identity/layout 字段 `page_size`（默认 64）/`kv_cache_dtype`/`dtype_tag`/
+`head_num`/`head_dim`/`dp_size`——这些都进 canonical namespace，改动即换
+namespace（表现为一次冷缓存）；
 `node_dedup`（对应 env `DFKV_CLIENT_NODE_DEDUP`，见 §1.5）、
 `backup_exist_gate`（save 前的 exist 探测门）、
 `client_stats_poll_s`（10s，`0`=关）、
 访问日志/telemetry 键（`access_log`、`access_log_path`、`metrics`、`tracing`、
 `otlp_endpoint`、`trace_slow_request_ms`、`trace_sample_percent` 等，env 同义项见
-§1.6）、`rail_affinity`（已废弃 no-op）。`model_name` 由 SGLang runtime 的
-`HiCacheStorageConfig` 提供，不是 extra_config 键。
+§1.6）。`model_name` 由 SGLang runtime 的 `HiCacheStorageConfig` 提供，
+不是 extra_config 键。
 
 `pcp_size`/`dcp_size` 默认 `1`，此时对应 rank 固定为 `0`。任一 size
 大于 `1` 时必须显式提供 `0 <= rank < size`；size/rank 不是整数、越界或缺失

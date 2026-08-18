@@ -14,6 +14,7 @@
 #include "utils/log.h"
 #include "utils/net_util.h"     // Dial / WriteAll / ReadAll / Put*/Get*
 #include "utils/numa_util.h"
+#include "utils/prom_escape.h"
 #include "transport/rdma_topology.h"
 #include "transport/rail_classify.h"
 #include "transport/rail_select.h"
@@ -379,6 +380,7 @@ struct RdmaTransport::Conn {
   size_t rail_index = 0;
   uint64_t peer_publication = 0;
   std::string peer_id;
+  std::string metric_peer;
   uint64_t remote_lease_generation = 0;
   bool remote_lease_held = false;
   bool remote_recovery_probe = false;
@@ -390,6 +392,9 @@ struct RdmaTransport::Conn {
   bool credit_held = false;
   rdma::ResourceRequest budget_request;
   bool budget_held = false;
+  Lane lane = Lane::kData;
+  bool active_counted = false;
+  bool live_counted = false;
   bool visited = true;  // guarded by RdmaTransport::mu_ while idle
 
   rdma::ConnectionLifecycle lifecycle;
@@ -458,6 +463,16 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   if (auto_device_ && discovered.size() > 1) discovered.resize(1);
   devs_.reserve(discovered.size());
   for (const auto& device : discovered) devs_.push_back(device.name);
+  if (const char* primary = std::getenv("DFKV_RDMA_PRIMARY_DEV");
+      primary && *primary) {
+    const auto found = std::find(devs_.begin(), devs_.end(), primary);
+    if (found == devs_.end()) {
+      throw std::runtime_error(
+          "DFKV_RDMA_PRIMARY_DEV is not present in DFKV_RDMA_DEV");
+    }
+    preferred_rail_ =
+        static_cast<size_t>(std::distance(devs_.begin(), found));
+  }
   const char* tiers_env = std::getenv("DFKV_RDMA_RAIL_TIERS");
   const std::string tiers_spec = tiers_env ? tiers_env : "";
   peer_topology_required_ = !tiers_spec.empty();
@@ -505,6 +520,9 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   const char* d = std::getenv("DFKV_RDMA_DEPTH");  // pipeline depth (default 4; must be <= server's)
   if (d && *d) { long v = std::strtol(d, nullptr, 10); if (v >= 1 && v <= 256) depth_ = (size_t)v; }
   config_dump::RecordResolved("DFKV_RDMA_DEV", JoinDevices(devs_));
+  config_dump::RecordResolved(
+      "DFKV_RDMA_PRIMARY_DEV",
+      preferred_rail_ ? devs_[*preferred_rail_] : std::string(""));
   config_dump::RecordResolved("DFKV_RDMA_DEPTH", std::to_string(depth_));
   config_dump::RecordResolved("DFKV_RDMA_NUMA", numa_aware_ ? "1" : "0");
   const size_t endpoint_limit = static_cast<size_t>(
@@ -520,8 +538,8 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   const uint64_t default_registered_budget =
       slot_bytes != 0 &&
               endpoint_limit <=
-                  std::numeric_limits<uint64_t>::max() / slot_bytes / depth_
-          ? slot_bytes * depth_ * endpoint_limit
+                  std::numeric_limits<uint64_t>::max() / slot_bytes / depth_ / 2
+          ? 2 * slot_bytes * depth_ * endpoint_limit
           : std::numeric_limits<uint64_t>::max();
   const uint64_t registered_limit = EnvU64(
       "DFKV_RDMA_REGISTERED_BYTES_BUDGET", default_registered_budget);
@@ -627,14 +645,14 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   }
   config_dump::RecordResolved("DFKV_RDMA_KEEPALIVE_MS",
                               std::to_string(keepalive_ms_));
-  // Idle-connection pool cap per node and lane. The pool naturally bounds at
-  // peak concurrency; this guards against a transient thread spike retaining
-  // enough QPs to consume the server's shared receive segment. Sixteen covers
-  // the measured 0064 SGLang C32 fan-out with 2x per-lane headroom; raise it
-  // only for a workload that proves repeated connection churn.
-  pool_max_ = static_cast<size_t>(EnvInt("DFKV_RDMA_POOL_MAX", 16));
+  // Idle endpoints retained per peer and pool. The process-wide read scheduler
+  // admits seven active shards, so eight preserves one warm spare without the
+  // former 2x retention that amplified server segment pressure.
+  pool_max_ = static_cast<size_t>(EnvInt("DFKV_RDMA_POOL_MAX", 8));
   config_dump::RecordResolved("DFKV_RDMA_POOL_MAX",
                               std::to_string(pool_max_));
+  active_lane_rail_ =
+      std::make_unique<std::atomic<uint64_t>[]>(3 * devs_.size());
   rail_conns_ = std::make_unique<std::atomic<uint64_t>[]>(devs_.size());
   if (keepalive_ms_ > 0)
     keepalive_thread_ = std::thread(&RdmaTransport::KeepaliveLoop, this);
@@ -657,7 +675,6 @@ RdmaTransport::~RdmaTransport() {
       pools.clear();
     };
     detach(pool_);
-    detach(sg_pool_);
     detach(control_pool_);
   }
   for (Conn* conn : idle) Destroy(conn);
@@ -723,18 +740,19 @@ void RdmaTransport::KeepaliveLoop() {
     std::vector<IdleConn> idle;
     {
       std::lock_guard<std::mutex> lock(mu_);
-      const auto collect = [&](auto& pools, Lane lane) {
+      const auto collect = [&](auto& pools) {
         for (auto& [node, connections] : pools) {
           for (Conn* conn : connections) {
-            if (conn->lifecycle.Activate())
-              idle.push_back(IdleConn{node, lane, conn});
+            if (conn->lifecycle.Activate()) {
+              MarkActive(conn, conn->lane);
+              idle.push_back(IdleConn{node, conn->lane, conn});
+            }
           }
           connections.clear();
         }
       };
-      collect(pool_, Lane::kData);
-      collect(sg_pool_, Lane::kSgData);
-      collect(control_pool_, Lane::kControl);
+      collect(pool_);
+      collect(control_pool_);
     }
     for (const auto& entry : idle) {
       if (!peer_topologies_->IsCurrent(entry.node, entry.conn->peer_id,
@@ -795,7 +813,6 @@ void RdmaTransport::RetireIdlePeerRail(const std::string& peer_id,
       }
     };
     reap(pool_);
-    reap(sg_pool_);
     reap(control_pool_);
   }
   for (Conn* conn : retired)
@@ -835,8 +852,44 @@ void RdmaTransport::CompleteRemoteLease(Conn* c,
                  outcome);
 }
 
+void RdmaTransport::MarkActive(Conn* c, Lane lane) {
+  if (!c || c->active_counted || c->rail_index >= devs_.size()) return;
+  c->lane = lane;
+  c->active_counted = true;
+  const size_t index =
+      static_cast<size_t>(lane) * devs_.size() + c->rail_index;
+  active_lane_rail_[index].fetch_add(1, std::memory_order_relaxed);
+}
+
+void RdmaTransport::MarkInactive(Conn* c) {
+  if (!c || !c->active_counted || c->rail_index >= devs_.size()) return;
+  c->active_counted = false;
+  const size_t index =
+      static_cast<size_t>(c->lane) * devs_.size() + c->rail_index;
+  active_lane_rail_[index].fetch_sub(1, std::memory_order_relaxed);
+}
+
+void RdmaTransport::MarkLive(Conn* c) {
+  if (!c || c->live_counted || c->rail_index >= devs_.size()) return;
+  std::lock_guard<std::mutex> lock(peer_connections_mu_);
+  ++peer_connections_[{c->metric_peer, c->rail_index}];
+  c->live_counted = true;
+}
+
+void RdmaTransport::MarkDead(Conn* c) {
+  if (!c || !c->live_counted || c->rail_index >= devs_.size()) return;
+  std::lock_guard<std::mutex> lock(peer_connections_mu_);
+  const auto key = std::make_pair(c->metric_peer, c->rail_index);
+  const auto it = peer_connections_.find(key);
+  if (it != peer_connections_.end() && --it->second == 0)
+    peer_connections_.erase(it);
+  c->live_counted = false;
+}
+
 void RdmaTransport::Destroy(Conn* c, rdma::RailCompletion completion) {
   if (!c) return;
+  MarkInactive(c);
+  MarkDead(c);
 
   c->lifecycle.BeginDrain();
   const bool credit_held = c->credit_held;
@@ -863,6 +916,7 @@ void RdmaTransport::QuarantineAmbiguousGet(
     Conn* c, void* destination_hold, size_t destination_bytes,
     const char* path, rdma::RailCompletion completion) {
   if (!c || !destination_hold) return;
+  MarkInactive(c);
   c->lifecycle.BeginDrain();
   CompleteRemoteLease(c, RemoteRailOutcome::kEndpointFailure);
   if (c->credit_held) {
@@ -911,7 +965,7 @@ bool RdmaTransport::EvictOneIdle() {
       return false;
     };
     for (int pass = 0; pass < 2 && victim == nullptr; ++pass) {
-      if (scan(pool_) || scan(sg_pool_) || scan(control_pool_)) break;
+      if (scan(pool_) || scan(control_pool_)) break;
     }
   }
   if (!victim) return false;
@@ -933,7 +987,8 @@ void RdmaTransport::OnTopologyHint(size_t nodes) {
     const uint64_t slot_bytes = static_cast<uint64_t>(
         rdma::V2SlotSize(static_cast<size_t>(declared_)));
     const rdma::ResourceRequest target = rdma::AdaptiveBudgetTarget(
-        nodes, devs_.size(), depth_, slot_bytes, /*floor_endpoints=*/256);
+        nodes, std::max(pool_max_, devs_.size()), depth_, slot_bytes,
+        /*floor_endpoints=*/256);
     if (resource_budget_->RaiseLimit(target)) {
       const rdma::ResourceRequest limit = resource_budget_->limit();
       DFKV_LOG_INFO(
@@ -977,7 +1032,6 @@ void RdmaTransport::OnPeerTopology(const PeerTopology& topology) {
       if (connections.empty()) pools.erase(found);
     };
     reap(pool_);
-    reap(sg_pool_);
     reap(control_pool_);
   }
   peer_topology_updates_.fetch_add(1, std::memory_order_relaxed);
@@ -1049,8 +1103,9 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   // inside the highest tier in the captured immutable peer snapshot that
   // intersects runtime-enabled local topology and remote endpoint health.
   const int caller_node = numa_aware_ ? numa::CurrentNode() : -1;
-  const auto candidates =
-      topology_->CandidatesFor(caller_node, numa_aware_);
+  auto candidates = topology_->CandidatesFor(caller_node, numa_aware_);
+  if (preferred_rail_)
+    candidates = rdma::PreferPrimaryRail(candidates, *preferred_rail_);
   if (candidates.locality == rdma::RailLocality::kCallerUnknown) {
     numa_caller_unknown_fallbacks_.fetch_add(1, std::memory_order_relaxed);
   } else if (candidates.locality == rdma::RailLocality::kNoLocal) {
@@ -1129,9 +1184,8 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
         current_peer && current_peer->peer_id == peer_snapshot->peer_id &&
         current_peer->publication == peer_snapshot->publication;
     if (snapshot_current && !options.force_new) {
-      auto& idle = lane == Lane::kData
-                       ? pool_
-                       : (lane == Lane::kSgData ? sg_pool_ : control_pool_);
+      auto& idle =
+          lane == Lane::kControl ? control_pool_ : pool_;
       auto it = idle.find(node);
       if (it != idle.end()) {
         auto& pool_candidates = it->second;
@@ -1151,6 +1205,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
               candidate->peer_publication == peer_snapshot->publication &&
               candidate->rail_index == ridx &&
               candidate->lifecycle.Activate()) {
+            MarkActive(candidate, lane);
             pooled = candidate;
             pool_candidates.erase(
                 pool_candidates.begin() + static_cast<std::ptrdiff_t>(i - 1));
@@ -1203,7 +1258,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
       static_cast<size_t>(
           std::max<uint64_t>(conn_declared, rdma::kV2DataOffset))));
   const rdma::ResourceRequest budget_request{
-      1, 1, conn_depth, conn_slot_bytes * conn_depth};
+      1, 1, conn_depth, 2 * conn_slot_bytes * conn_depth};
   bool budget_acquired = resource_budget_->TryAcquire(budget_request);
   if (!budget_acquired && EvictOneIdle())
     budget_acquired = resource_budget_->TryAcquire(budget_request);
@@ -1255,9 +1310,12 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     return result;
   }
   auto* conn = new Conn();
+  conn->lane = lane;
   conn->rail_index = ridx;
   conn->peer_publication = peer_snapshot->publication;
   conn->peer_id = peer_snapshot->peer_id;
+  conn->metric_peer =
+      peer_snapshot->peer_id.empty() ? node : peer_snapshot->peer_id;
   conn->remote_lease_generation =
       remote_lease ? remote_lease->generation : 0;
   conn->remote_lease_held = remote_lease.has_value();
@@ -1337,9 +1395,10 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     const size_t surplus = conn_depth - remote.depth;
     conn->budget_request = rdma::ResourceRequest{
         1, 1, static_cast<size_t>(remote.depth),
-        conn_slot_bytes * remote.depth};
+        2 * conn_slot_bytes * remote.depth};
     resource_budget_->Release(
-        rdma::ResourceRequest{0, 0, surplus, conn_slot_bytes * surplus});
+        rdma::ResourceRequest{0, 0, surplus,
+                              2 * conn_slot_bytes * surplus});
     depth_refunds_.fetch_add(1, std::memory_order_relaxed);
   }
 
@@ -1387,6 +1446,8 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   }
   conns_opened_.fetch_add(1, std::memory_order_relaxed);
   rail_conns_[ridx].fetch_add(1, std::memory_order_relaxed);
+  MarkLive(conn);
+  MarkActive(conn, lane);
   result.conn = conn;
   result.failure = AcquireFailure::kNone;
   return result;
@@ -1405,8 +1466,9 @@ bool RdmaTransport::PrepareRetry(
     excluded->assign(devs_.size(), 0);
     (*excluded)[*attempted_rail] = 1;
     const int caller_node = numa_aware_ ? numa::CurrentNode() : -1;
-    const auto candidates =
-        topology_->CandidatesFor(caller_node, numa_aware_);
+    auto candidates = topology_->CandidatesFor(caller_node, numa_aware_);
+    if (preferred_rail_)
+      candidates = rdma::PreferPrimaryRail(candidates, *preferred_rail_);
     const auto local_enabled =
         rdma::UnionRailMasks(candidates.allowed, candidates.fallback);
     auto compatible =
@@ -1436,8 +1498,9 @@ bool RdmaTransport::PrepareRetry(
     excluded->assign(devs_.size(), 0);
     (*excluded)[*attempted_rail] = 1;
     const int caller_node = numa_aware_ ? numa::CurrentNode() : -1;
-    const auto candidates =
-        topology_->CandidatesFor(caller_node, numa_aware_);
+    auto candidates = topology_->CandidatesFor(caller_node, numa_aware_);
+    if (preferred_rail_)
+      candidates = rdma::PreferPrimaryRail(candidates, *preferred_rail_);
     const auto local_enabled =
         rdma::UnionRailMasks(candidates.allowed, candidates.fallback);
     auto compatible =
@@ -1604,9 +1667,65 @@ std::string RdmaTransport::MetricsText() const {
                  "Process-wide RDMA work-request slot budget",
                  resource_used.wr_slots, resource_limit.wr_slots);
   resource_gauge("dfkv_rdma_client_registered_slot_bytes_budget",
-                 "Process-wide remote receive-slot byte budget",
+                 "Process-wide remote receive-plus-pull slot byte budget",
                  resource_used.registered_bytes,
                  resource_limit.registered_bytes);
+  std::vector<std::vector<uint64_t>> idle_by_lane_rail(
+      3, std::vector<uint64_t>(devs_.size(), 0));
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto count = [&](const auto& pools) {
+      for (const auto& [node, connections] : pools) {
+        (void)node;
+        for (const Conn* conn : connections) {
+          const size_t lane =
+              conn->lane == Lane::kData
+                  ? 0
+                  : (conn->lane == Lane::kSgData ? 1 : 2);
+          if (conn->rail_index < devs_.size())
+            ++idle_by_lane_rail[lane][conn->rail_index];
+        }
+      }
+    };
+    count(pool_);
+    count(control_pool_);
+  }
+  s += "# HELP dfkv_rdma_client_pool_connections Endpoint ownership by operation lane, state, and rail\n";
+  s += "# TYPE dfkv_rdma_client_pool_connections gauge\n";
+  constexpr const char* lane_names[] = {"payload", "sg", "control"};
+  for (size_t lane = 0; lane < idle_by_lane_rail.size(); ++lane) {
+    for (size_t rail = 0; rail < devs_.size(); ++rail) {
+      const std::string dev =
+          devs_[rail].empty() ? std::string("default") : devs_[rail];
+      const std::string labels =
+          "{lane=\"" + std::string(lane_names[lane]) + "\",state=\"";
+      s += "dfkv_rdma_client_pool_connections" + labels + "idle\",dev=\"" +
+           dev + "\"} " +
+           std::to_string(idle_by_lane_rail[lane][rail]) + "\n";
+      s += "dfkv_rdma_client_pool_connections" + labels + "active\",dev=\"" +
+           dev + "\"} " +
+           std::to_string(
+               active_lane_rail_[lane * devs_.size() + rail].load(
+                   std::memory_order_relaxed)) +
+           "\n";
+    }
+  }
+  s += "# HELP dfkv_rdma_client_peer_connections Live endpoints by peer and local rail\n";
+  s += "# TYPE dfkv_rdma_client_peer_connections gauge\n";
+  {
+    std::lock_guard<std::mutex> lock(peer_connections_mu_);
+    for (const auto& [key, count] : peer_connections_) {
+      const std::string dev =
+          devs_[key.second].empty() ? std::string("default")
+                                   : devs_[key.second];
+      s += "dfkv_rdma_client_peer_connections{peer=\"" +
+           PromLabelEscape(key.first) + "\",dev=\"" + PromLabelEscape(dev) +
+           "\"} " + std::to_string(count) + "\n";
+    }
+  }
+  s += "# HELP dfkv_rdma_client_pool_limit Idle endpoints retained per peer and pool\n";
+  s += "# TYPE dfkv_rdma_client_pool_limit gauge\n";
+  s += "dfkv_rdma_client_pool_limit " + std::to_string(pool_max_) + "\n";
   s += "# HELP dfkv_rdma_client_resource_budget_timeouts_total Connection admissions rejected after bounded resource wait\n";
   s += "# TYPE dfkv_rdma_client_resource_budget_timeouts_total counter\n";
   s += "dfkv_rdma_client_resource_budget_timeouts_total " +
@@ -1889,6 +2008,7 @@ std::string RdmaTransport::MetricsText() const {
 
 void RdmaTransport::Release(const std::string& node, Lane lane, Conn* c,
                             RemoteRailOutcome remote_outcome) {
+  MarkInactive(c);
   CompleteRemoteLease(c, remote_outcome);
   bool refresh_ok = false;
   {
@@ -1916,11 +2036,11 @@ void RdmaTransport::Release(const std::string& node, Lane lane, Conn* c,
     publication_current = peer_topologies_->IsCurrent(
         node, c->peer_id, c->peer_publication);
     if (publication_current) {
-      auto& idle = lane == Lane::kData
-                       ? pool_
-                       : (lane == Lane::kSgData ? sg_pool_ : control_pool_);
+      auto& idle =
+          lane == Lane::kControl ? control_pool_ : pool_;
       auto& v = idle[node];
       if (v.size() < pool_max_ && c->lifecycle.MakeIdle()) {
+        c->lane = lane;
         v.push_back(c);
         reusable = true;
       }

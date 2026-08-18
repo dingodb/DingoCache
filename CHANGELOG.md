@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### RDMA connection capacity
+
+- Unified scalar and scatter-gather data operations on one exclusive-ownership
+  endpoint pool. Control operations remain isolated. Ring autoscaling now sizes
+  `nodes × 2 pools × max(pool limit, rails) × 1.25`.
+- Lowered the per-peer/pool idle default from 16 to 8: seven process-wide read
+  workers plus one warm spare avoid reconnect churn, while a cap of four is
+  proven to reopen three endpoints under a seven-way concurrent wave.
+- With 4 MiB blocks and depth four, one pull data connection leases
+  33,587,200 bytes. The xb01 14×TP8, per-pool-limit-8 envelope is 896 data plus
+  896 smaller control connections per server. Including 25% churn consumes
+  37,984,665,600 bytes (35.4 GiB), so xb01's 64 GiB setting remains sufficient;
+  increasing it to 128 GiB is unnecessary.
+- On xb01-gpu-200b-0064, 64 GiB and 128 GiB segments both registered on
+  `ib7s400p6` with zero allocation failures. Readiness took 21 s and 43 s
+  respectively, so 128 GiB doubles the pinned MR and adds 22 s startup latency
+  without serving the current capacity envelope.
+- Added client idle/active pool gauges by operation lane and rail, live
+  connection gauges by peer and local rail, and the pool limit. Added server
+  receive-segment used/free/largest-range, allocation-failure, pull/legacy
+  connection, and data/control leased-byte metrics.
+- `rail_affinity=true` now assigns each rank one primary plus one ordered
+  neighboring fallback HCA by default. `rail_affinity_fallbacks=0` restores
+  strict one-rank/one-rail binding; larger values remain bounded by the
+  configured HCA list.
+
 ### Metrics HTTP clean close
 
 - Consume the complete HTTP request-head section, bounded to 32 KiB and by the

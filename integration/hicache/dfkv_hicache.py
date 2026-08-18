@@ -370,20 +370,28 @@ class DfkvHiCache(HiCacheStorage):
             if _truthy(cfg.get("require_rdma")):
                 if not _truthy(os.environ.get("DFKV_RDMA")):
                     os.environ["DFKV_RDMA"] = "1"
-            # Optional one-rank/one-rail affinity keeps a large CUDA pool from
-            # being registered against every HCA PD. Use the physical attention
-            # rank, not tp_rank (tp_rank is always zero under DP-attention).
-            # Eight 128-GiB pools × eight rails exhausted mlx5 registration on
-            # B200; one rail per PCP rank registered cleanly and still aggregates
-            # all rails across the eight workers.
+            # Optional rank-local rail affinity bounds CUDA-pool registrations.
+            # A small explicit fallback count keeps failure recovery without
+            # returning to every-rank/every-HCA registration: with one fallback,
+            # each HCA sees two rank pools (one primary, one neighbor fallback).
             if _truthy(cfg.get("rail_affinity")):
                 rails = [x.strip() for x in
                          os.environ.get("DFKV_RDMA_DEV", "").split(",")
                          if x.strip()]
                 if len(rails) > 1:
                     rank = self.pcp_rank if self.pcp_size > 1 else self.tp_rank
-                    os.environ["DFKV_RDMA_DEV"] = rails[rank % len(rails)]
+                    primary = rank % len(rails)
+                    fallback_count = max(
+                        0, min(int(cfg.get("rail_affinity_fallbacks", 1)),
+                               len(rails) - 1))
+                    selected = [
+                        rails[(primary + offset) % len(rails)]
+                        for offset in range(fallback_count + 1)
+                    ]
+                    os.environ["DFKV_RDMA_DEV"] = ",".join(selected)
+                    os.environ["DFKV_RDMA_PRIMARY_DEV"] = selected[0]
                     os.environ["DFKV_RDMA_NUMA"] = "0"
+                    os.environ.pop("DFKV_RDMA_RAIL_TIERS", None)
             elif cfg.get("rdma_numa"):
                 os.environ.setdefault("DFKV_RDMA_NUMA", "1")
             # Same-host GET rendezvous (phase 5): dedups TP-replicated L3 loads

@@ -158,12 +158,15 @@ RDMA-listener scrape inventory。
 | `dfkv_rdma_active_conns` | gauge | 当前服务中的 RDMA 连接 |
 | `dfkv_rdma_v2_conns_opened_total` | counter | server 累计打开的 v2 连接 |
 | `dfkv_rdma_v2_put_writes_total` / `dfkv_rdma_v2_get_writes_total` | counter | server 实际收到的 `WRITE_WITH_IMM` PUT / 实际发出的 RDMA WRITE GET payload |
-| `dfkv_rdma_recv_segment_bytes` / `dfkv_rdma_recv_segment_free_bytes` | gauge | process-wide receive segment 总字节 / 当前未租 lease 字节；free 接近 0 时新连接会被拒绝 |
-| `dfkv_rdma_recv_segment_registered_rails` | gauge | 成功把共享 segment 注册到共享 PD 的 initialized rail 数；显式 topology 启动成功后必须等于 configured rail 数，包括启动时 DOWN 的 rail |
-| `dfkv_rdma_v2_ready` | gauge | shared receive segment 是否已建立；启动成功后应为 1，不能替代逐 rail 注册数和健康检查 |
-| `dfkv_uring_reads_total` / `dfkv_uring_init_fallbacks_total` | counter | io_uring 路径真实提交的读数（**>0 = 路径确实激活**，外部可证）/ 想用 uring 但 ring 初始化失败静默回退同步的连接数（>0 = 配了没生效，查内核/权限） |
-| `dfkv_rdma_idle_reclaims_total` | counter | 空闲超时回收的连接数 |
-| `dfkv_rdma_segment_evictions_total` | counter | receive segment 空间不足时主动淘汰连接的次数；增长说明 segment/连接预算不足 |
+| `dfkv_rdma_recv_segment_bytes` / `used_bytes` / `free_bytes` | gauge | process-wide segment 总量、当前 lease 占用、未租字节 |
+| `dfkv_rdma_recv_segment_largest_free_range_bytes` | gauge | 最大连续 free range；明显小于 free 总量表示碎片导致大 lease 失败 |
+| `dfkv_rdma_recv_segment_allocation_failures_total` | counter | allocator 找不到满足大小/对齐的连续 range 次数（含 admission retry） |
+| `dfkv_rdma_pull_connections` / `dfkv_rdma_legacy_connections` | gauge | 当前 pull-read / legacy responder-write connection 数 |
+| `dfkv_rdma_connection_bytes{class=\"data|control\"}` | gauge | data/control connection 当前持有的 recv+pull lease 字节 |
+| `dfkv_rdma_recv_segment_registered_rails` | gauge | 成功把共享 segment 注册到 shared PD 的 rail 数 |
+| `dfkv_rdma_v2_ready` | gauge | shared receive segment 是否已建立 |
+| `dfkv_rdma_segment_evictions_total` / `dfkv_rdma_idle_reclaims_total` | counter | segment 压力淘汰 / idle timeout 回收连接 |
+| `dfkv_uring_reads_total` / `dfkv_uring_init_fallbacks_total` | counter | io_uring 路径实际读 / 初始化失败回退同步连接数 |
 | `dfkv_rdma_rail_active_conns{dev}` | gauge | 每个本地 HCA 上当前连接数 |
 | `dfkv_rdma_rail_completions_total{dev}` / `dfkv_rdma_rail_completion_errors_total{dev}` | counter | 每 rail 请求完成 / 错误完成 |
 | `dfkv_rdma_rail_put_writes_total{dev}` / `dfkv_rdma_rail_put_bytes_total{dev}` | counter | 每 rail 收到的 PUT one-sided writes / payload bytes |
@@ -337,6 +340,7 @@ C 客户端快照还含传输级指标（RDMA 构建）：
 | `dfkv_rdma_client_cross_rail_retry_successes_total` | counter | 无 label；上述 retry 最终成功的 logical operation 数 |
 | `dfkv_rdma_client_cross_rail_retry_exhausted_total` | counter | 无 label；上述 retry 的第二次物理尝试仍失败 |
 | `dfkv_rdma_client_completion_timeouts_total` | counter | 消耗完一次绝对 completion-window deadline 的窗口；部分完成不重置预算 |
+| `dfkv_rdma_client_endpoint_budget{kind}` / `qp_budget{kind}` / `wr_slot_budget{kind}` / `registered_slot_bytes_budget{kind}` | gauge | `kind=used|limit` 的进程级资源占用/上限；registered bytes 按每 endpoint 的 server receive + pull 两个 arena 计量 |
 | `dfkv_rdma_client_resource_budget_raises_total` | counter | 预算自适应放大次数（随 ring 采纳，只增不减；任一预算 env 显式设置时恒为 0） |
 | `dfkv_rdma_client_admission_failures_total` | counter | 本进程预算饥饿导致的操作失败（返回 kResourceExhausted，对端从未被拨号、不进冷却）；应恒为 0，>0 说明预算仍小于扇出需求 |
 | `dfkv_rdma_client_depth_refunds_total` | counter | 服务端 clamp depth 后按协商值退还 WR/注册字节预算的连接数（首连按上限探测，后续按学习值建连） |
@@ -354,6 +358,9 @@ C 客户端快照还含传输级指标（RDMA 构建）：
 | `dfkv_rdma_client_numa_fallbacks_total{reason="caller_unknown\|no_local_rail"}` | counter | `DFKV_RDMA_NUMA=1` 无法建立 local mask 而回退全部 enabled rails |
 | `dfkv_rdma_cq_completions_total` / `dfkv_rdma_cq_errors_total` | counter | client CQ 完成 / 错误完成 |
 | `dfkv_rdma_client_pipeline_depth` | gauge | 握手解析后的有效 pipeline depth |
+| `dfkv_rdma_client_pool_connections{lane,state=\"idle|active\",dev}` | gauge | endpoint 按最后/当前 operation lane、ownership state 和 rail 分解；active 不含已隔离连接 |
+| `dfkv_rdma_client_peer_connections{peer,dev}` | gauge | 当前 live endpoint 按 MDS stable peer identity 与本地 rail 分解；连接销毁后 series 删除，cardinality 受 endpoint budget 上限约束 |
+| `dfkv_rdma_client_pool_limit` | gauge | 每 peer/pool 的 idle retention 上限（默认 8） |
 
 TCP 构建或 TCP fallback 的 C 快照 family（同样由插件镜像）：
 

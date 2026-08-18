@@ -42,6 +42,38 @@ TEST(RecvSegment, MoveTransfersOwnershipAndExhaustionFailsCleanly) {
   EXPECT_EQ(segment.free_bytes(), 8192u);
 }
 
+TEST(RecvSegment, StatsTrackOwnershipFragmentationAndFailures) {
+  RecvSegment segment;
+  ASSERT_TRUE(segment.Init(64u << 10));
+  auto first = segment.Allocate(8192);
+  auto second = segment.Allocate(16384);
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(second);
+
+  auto stats = segment.stats();
+  EXPECT_EQ(stats.total_bytes, 64u << 10);
+  EXPECT_EQ(stats.used_bytes, 24u << 10);
+  EXPECT_EQ(stats.free_bytes, 40u << 10);
+  EXPECT_EQ(stats.largest_free_range, 40u << 10);
+  EXPECT_EQ(stats.allocation_failures, 0u);
+
+  first.Reset();
+  stats = segment.stats();
+  EXPECT_EQ(stats.used_bytes, 16u << 10);
+  EXPECT_EQ(stats.free_bytes, 48u << 10);
+  EXPECT_EQ(stats.largest_free_range, 40u << 10);
+  EXPECT_FALSE(segment.Allocate(48u << 10))
+      << "fragmented free bytes must not masquerade as one range";
+  EXPECT_EQ(segment.stats().allocation_failures, 1u);
+
+  second.Reset();
+  stats = segment.stats();
+  EXPECT_EQ(stats.used_bytes, 0u);
+  EXPECT_EQ(stats.free_bytes, 64u << 10);
+  EXPECT_EQ(stats.largest_free_range, 64u << 10);
+  EXPECT_EQ(stats.allocation_failures, 1u);
+}
+
 TEST(RecvSegment, RejectsInvalidGeometry) {
   RecvSegment segment;
   EXPECT_FALSE(segment.Init(0));

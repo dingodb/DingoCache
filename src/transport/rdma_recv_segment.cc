@@ -1,5 +1,6 @@
 #include "transport/rdma_recv_segment.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -114,14 +115,24 @@ RecvSegment::Lease RecvSegment::Allocate(size_t bytes, size_t alignment) {
     if (end < range_end) free_.emplace(end, range_end - end);
     return Lease(this, begin, bytes);
   }
+  allocation_failures_.fetch_add(1, std::memory_order_relaxed);
   return {};
 }
 
-size_t RecvSegment::free_bytes() const {
+size_t RecvSegment::free_bytes() const { return stats().free_bytes; }
+
+RecvSegment::Stats RecvSegment::stats() const {
   std::lock_guard<std::mutex> lock(mu_);
-  size_t total = 0;
-  for (const auto& range : free_) total += range.second;
-  return total;
+  Stats out;
+  out.total_bytes = size_;
+  for (const auto& range : free_) {
+    out.free_bytes += range.second;
+    out.largest_free_range = std::max(out.largest_free_range, range.second);
+  }
+  out.used_bytes = out.total_bytes - out.free_bytes;
+  out.allocation_failures =
+      allocation_failures_.load(std::memory_order_relaxed);
+  return out;
 }
 
 void RecvSegment::Release(size_t offset, size_t bytes) {

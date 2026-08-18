@@ -668,6 +668,24 @@ void RdmaServer::Serve(int boot_fd) {
       return;
     }
   }
+  const bool control_connection = conn_max <= rdma::kV2ControlCap;
+  const uint64_t connection_bytes =
+      static_cast<uint64_t>(recv_lease.size()) + pull_lease.size();
+  std::atomic<uint64_t>* const protocol_connections =
+      pull_read_requested ? &pull_connections_ : &legacy_connections_;
+  std::atomic<uint64_t>* const class_bytes =
+      control_connection ? &control_connection_bytes_ : &data_connection_bytes_;
+  protocol_connections->fetch_add(1, std::memory_order_relaxed);
+  class_bytes->fetch_add(connection_bytes, std::memory_order_relaxed);
+  struct ConnectionSegmentAccounting {
+    std::atomic<uint64_t>* connections;
+    std::atomic<uint64_t>* bytes;
+    uint64_t leased_bytes;
+    ~ConnectionSegmentAccounting() {
+      bytes->fetch_sub(leased_bytes, std::memory_order_relaxed);
+      connections->fetch_sub(1, std::memory_order_relaxed);
+    }
+  } segment_accounting{protocol_connections, class_bytes, connection_bytes};
 
   // These operation owners deliberately precede the endpoint. On teardown the
   // endpoint (and therefore its QP) is destroyed first, before any prepared
@@ -1967,10 +1985,10 @@ std::string RdmaServer::MetricsText() const {
     s += name; s += " "; s += std::to_string(v); s += "\n";
   };
   std::string s;
-  m(s, "dfkv_rdma_completions_total", "counter", "RDMA request completions served",
-    Completions());
-  m(s, "dfkv_rdma_completion_errors_total", "counter", "RDMA error completions",
-    CompletionErrors());
+  m(s, "dfkv_rdma_completions_total", "counter",
+    "RDMA request completions served", Completions());
+  m(s, "dfkv_rdma_completion_errors_total", "counter",
+    "RDMA error completions", CompletionErrors());
   m(s, "dfkv_rdma_active_conns", "gauge",
     "RDMA connections currently serving", ActiveConns());
   m(s, "dfkv_rdma_rails_initialized", "gauge",
@@ -1985,14 +2003,38 @@ std::string RdmaServer::MetricsText() const {
   m(s, "dfkv_rdma_v2_get_continuation_slot_changes_total", "counter",
     "Multi-window GET continuations received on a different WQE slot",
     V2GetContinuationSlotChanges());
+  const rdma::RecvSegment::Stats segment = recv_segment_.stats();
   m(s, "dfkv_rdma_recv_segment_bytes", "gauge",
-    "Process-wide registered receive-segment bytes", recv_segment_.size());
+    "Process-wide registered receive-segment bytes", segment.total_bytes);
+  m(s, "dfkv_rdma_recv_segment_used_bytes", "gauge",
+    "Bytes leased from the process-wide receive segment", segment.used_bytes);
   m(s, "dfkv_rdma_recv_segment_free_bytes", "gauge",
     "Unleased bytes remaining in the process-wide receive segment",
-    recv_segment_.free_bytes());
+    segment.free_bytes);
+  m(s, "dfkv_rdma_recv_segment_largest_free_range_bytes", "gauge",
+    "Largest contiguous unleased receive-segment range",
+    segment.largest_free_range);
+  m(s, "dfkv_rdma_recv_segment_allocation_failures_total", "counter",
+    "Receive-segment allocation attempts without a suitable free range",
+    segment.allocation_failures);
   m(s, "dfkv_rdma_recv_segment_registered_rails", "gauge",
     "RDMA rails with the process-wide receive segment registered",
     recv_segment_registered_rails_);
+  m(s, "dfkv_rdma_pull_connections", "gauge",
+    "Connections currently holding negotiated pull-read arenas",
+    pull_connections_.load(std::memory_order_relaxed));
+  m(s, "dfkv_rdma_legacy_connections", "gauge",
+    "Connections currently holding only legacy receive arenas",
+    legacy_connections_.load(std::memory_order_relaxed));
+  s += "# HELP dfkv_rdma_connection_bytes Receive-segment bytes leased by connection class\n";
+  s += "# TYPE dfkv_rdma_connection_bytes gauge\n";
+  s += "dfkv_rdma_connection_bytes{class=\"data\"} " +
+       std::to_string(data_connection_bytes_.load(std::memory_order_relaxed)) +
+       "\n";
+  s += "dfkv_rdma_connection_bytes{class=\"control\"} " +
+       std::to_string(
+           control_connection_bytes_.load(std::memory_order_relaxed)) +
+       "\n";
   m(s, "dfkv_rdma_v2_ready", "gauge",
     "Whether RDMA v2 has a registered shared receive segment",
     recv_segment_registered_rails_ > 0 ? 1 : 0);

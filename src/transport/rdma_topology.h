@@ -81,6 +81,27 @@ struct RailCandidates {
   RailLocality locality = RailLocality::kDisabled;
 };
 
+inline RailCandidates PreferPrimaryRail(const RailCandidates& candidates,
+                                        size_t preferred) {
+  RailCandidates out;
+  out.locality = candidates.locality;
+  const size_t width =
+      std::max(candidates.allowed.size(), candidates.fallback.size());
+  out.allowed.assign(width, 0);
+  out.fallback.assign(width, 0);
+  for (size_t rail = 0; rail < width; ++rail) {
+    const bool enabled =
+        (rail < candidates.allowed.size() && candidates.allowed[rail]) ||
+        (rail < candidates.fallback.size() && candidates.fallback[rail]);
+    if (!enabled) continue;
+    if (rail == preferred)
+      out.allowed[rail] = 1;
+    else
+      out.fallback[rail] = 1;
+  }
+  return out;
+}
+
 class RdmaTopology {
  public:
   explicit RdmaTopology(std::vector<RdmaDevInfo> devices);
