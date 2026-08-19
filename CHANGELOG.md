@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### LMCache rank-local rail affinity
+
+- Added opt-in `rail_affinity` and `rail_affinity_fallbacks` plugin settings to
+  the in-process LMCache dfkv connector. Each worker now uses LMCache's explicit
+  per-host `local_worker_id` to apply the shared primary/fallback policy before
+  opening the native client; missing or invalid local metadata fails closed.
+- Kept the MP-server L2 adapter unchanged because it owns one shared dfkv
+  client and has no single physical GPU rank at construction.
+
 ### vLLM rank-local rail affinity
 
 - Added `rail_affinity` and `rail_affinity_fallbacks` to

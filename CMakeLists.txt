@@ -225,6 +225,12 @@ if(DFKV_BUILD_TESTS)
               -p test_rail_affinity.py)
     set_tests_properties(python_common_rail_affinity PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
+    add_test(NAME python_lmcache_rail_affinity
+      COMMAND ${PYTHON3} -m unittest discover
+              -s ${CMAKE_CURRENT_SOURCE_DIR}/integration/lmcache/tests
+              -p test_rail_affinity.py)
+    set_tests_properties(python_lmcache_rail_affinity PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
     add_test(NAME python_vllm_rail_affinity
       COMMAND ${PYTHON3} -m unittest discover
               -s ${CMAKE_CURRENT_SOURCE_DIR}/integration/vllm/tests
