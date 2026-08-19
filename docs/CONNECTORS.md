@@ -917,8 +917,9 @@ extra_config:
 
 **RDMA 版**：URL 用 **RDMA 端口**（server `--rdma-port`），并给 vLLM
 进程加 `export DFKV_RDMA=1`。单 fabric 节点可直接使用自动 active-HCA 发现；
-生产多 fabric 节点必须用 `DFKV_RDMA_DEV` 过滤出与 cache server 同 fabric
-的本机设备（同型号节点可逗号列全轨，见 §1.2）。
+生产多 fabric 节点必须用 `DFKV_RDMA_DEV` 配置同一份有序全轨列表。in-process
+LMCache 可启用 `rail_affinity=true`，connector 在各 worker native open 前按
+`metadata.local_worker_id` 收窄为 primary + fallback；缺少本地 rank 元数据时启动失败。
 
 **🔴 生产多模型 / 多租户隔离（in-process 隔离能力的天花板）**
 
@@ -968,7 +969,9 @@ vllm serve <model_path> \
 
 **验证**：
 1. **连接器已加载**（vLLM 启动日志，且没回退 blackhole）：
-   `Discovered adapter: DfkvConnectorAdapter` / `DfkvConnector ready: membership=... endpoint=... rdma_pools=1 ...`
+   `Discovered adapter: DfkvConnectorAdapter` / `DfkvConnector ready: membership=... endpoint=... rdma_pools=1 ...`。
+   affinity 启用时还必须逐 worker 出现
+   `LMCache dfkv rail affinity: ... local_rank=N/... selected=... primary=...`。
 2. **缓存命中**：同一请求发两遍（或同 `--seed` 的 bench 跑两遍），第二遍
    `External prefix cache hit rate` > 0、TTFT 明显下降；也可开 `DFKV_ACCESS_LOG_ENABLED=1`
    看 `batch_set`/`batch_get` 命中。
@@ -994,6 +997,8 @@ vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
 | `membership` | 否 | **`mds`（默认）** 或 `static` |
 | `lib` | 否 | `libdfkv.so` 路径（覆盖 `DFKV_LIB`） |
 | `mds_poll_ms` | 否 | mds 模式轮询间隔，默认 3000 |
+| `rail_affinity` | 否 | 默认 `false`；仅 in-process 路径按 LMCache `local_worker_id` 选择 per-worker primary |
+| `rail_affinity_fallbacks` | 否 | 默认 `1`；相邻有序 fallback 数，`0` 为严格 one-rank/one-rail |
 
 也支持简写 URL 直连（`plugin://dfkv` 场景 URL 即成员串），此时 knob 全走默认
 （membership=mds、lib 走 env）。
@@ -1105,6 +1110,10 @@ server 的 pinned L1 arena 在 LMCache 传入 `l1_memory_desc` 时自动注册 R
 已在 GLM-5.2（vLLM 0.23.0 + LMCache 0.4.7）真机验证：store → 重启（L1 清空）→ 从 dfkv
 回载、prefill 跳过。单测 `integration/lmcache/tests/test_l2_adapter.py`（fake client）+
 集成测试 `test_l2_adapter_integration.py`（`DFKV_L2_URL`/`DFKV_L2_MEMBERSHIP` 指向真环）。
+
+MP-server L2 adapter 只有一个共享 dfkv client，构造时没有单一物理 GPU local
+rank，因此不应用 rank-local affinity；`adapter_params` 中也不接受这两个键。
+需要 per-worker/HCA 映射时使用 §4.1–4.4 的 in-process 路径。
 
 ### 4.6 设计与实现
 

@@ -13,6 +13,8 @@ Wire-up in LMCache config (plugin mode, recommended):
       remote_storage_plugin.dfkv.membership:  mds      # "mds" (default) | "static"
       remote_storage_plugin.dfkv.lib:         /path/to/libdfkv.so   # overrides $DFKV_LIB
       remote_storage_plugin.dfkv.mds_poll_ms: 3000
+      remote_storage_plugin.dfkv.rail_affinity: true
+      remote_storage_plugin.dfkv.rail_affinity_fallbacks: 1
 
 For static membership the URL carries the member string directly, e.g.
     remote_storage_plugin.dfkv.url:        dfkv://n1=10.0.0.1:12000,n2=10.0.0.2:12000/x
@@ -41,6 +43,7 @@ from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 
 from .access_log import access_log
 from .remote_connector import DfkvConnector
+from .rail_affinity import parse_plugin_rail_affinity
 
 logger = init_logger(__name__)
 
@@ -61,6 +64,8 @@ class _PluginOverrides:
     membership: str
     lib_path: Optional[str]
     mds_poll_ms: int
+    rail_affinity: bool
+    rail_affinity_fallbacks: int
 
 
 class DfkvConnectorAdapter(ConnectorAdapter):
@@ -88,9 +93,11 @@ class DfkvConnectorAdapter(ConnectorAdapter):
             ov = self._resolve_overrides(context)
             logger.info(
                 "Creating DfkvConnector: context_url=%s target_url=%s "
-                "membership=%s lib=%s mds_poll_ms=%d",
+                "membership=%s lib=%s mds_poll_ms=%d rail_affinity=%s "
+                "fallbacks=%d",
                 context.url, ov.target_url, ov.membership,
-                ov.lib_path or "-", ov.mds_poll_ms,
+                ov.lib_path or "-", ov.mds_poll_ms, ov.rail_affinity,
+                ov.rail_affinity_fallbacks,
             )
             return DfkvConnector(
                 url=ov.target_url,
@@ -99,6 +106,8 @@ class DfkvConnectorAdapter(ConnectorAdapter):
                 lib_path=ov.lib_path,
                 membership=ov.membership,
                 mds_poll_ms=ov.mds_poll_ms,
+                rail_affinity=ov.rail_affinity,
+                rail_affinity_fallbacks=ov.rail_affinity_fallbacks,
             )
 
     @staticmethod
@@ -109,6 +118,7 @@ class DfkvConnectorAdapter(ConnectorAdapter):
             return _PluginOverrides(
                 target_url=url, membership=_DEFAULT_MEMBERSHIP,
                 lib_path=None, mds_poll_ms=_DEFAULT_MDS_POLL_MS,
+                rail_affinity=False, rail_affinity_fallbacks=1,
             )
 
         plugin_name = getattr(context, "plugin_name", None) or url[
@@ -166,10 +176,13 @@ class DfkvConnectorAdapter(ConnectorAdapter):
                     f"extra_config['{prefix}.mds_poll_ms']={mds_poll_ms} must be "
                     "positive"
                 )
+        affinity = parse_plugin_rail_affinity(extra_config, prefix)
 
         return _PluginOverrides(
             target_url=target_url,
             membership=membership,
             lib_path=lib_path or None,
             mds_poll_ms=mds_poll_ms,
+            rail_affinity=affinity.enabled,
+            rail_affinity_fallbacks=affinity.fallback_count,
         )

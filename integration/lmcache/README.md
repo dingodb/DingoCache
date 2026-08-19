@@ -46,6 +46,8 @@ extra_config:
   remote_storage_plugin.dfkv.url:         dfkv://<mds_ip:port,...>/<group>
   remote_storage_plugin.dfkv.membership:  mds            # or "static"
   remote_storage_plugin.dfkv.lib:         /path/to/libdfkv.so
+  remote_storage_plugin.dfkv.rail_affinity: true
+  remote_storage_plugin.dfkv.rail_affinity_fallbacks: 1
 ```
 
 - **mds membership** (default): the URL host part is a comma-separated list of
@@ -55,6 +57,14 @@ extra_config:
 
 The library is found via (highest first) `remote_storage_plugin.dfkv.lib` →
 env `DFKV_LIB` → `$DFKV_BUILD/libdfkv.so`.
+
+For in-process LMCache, rank-local affinity is opt-in. Set the engine process
+environment to the same ordered full per-host rail list, for example
+`DFKV_RDMA_DEV=ib0,...,ib7`. Each LMCache worker reads the explicit
+`metadata.local_worker_id` before native open, narrows its process-local list to
+one primary plus the configured neighboring fallbacks, and sets
+`DFKV_RDMA_PRIMARY_DEV`. Missing or invalid local-rank metadata fails startup
+rather than falling back to the global `worker_id`.
 
 ## Configure LMCache (MP-server mode — L2 adapter)
 
@@ -140,6 +150,7 @@ payloads.
 | `DFKV_CONNECTOR_ASSUME_EXISTS` | 0 | skip remote contains checks (debug) |
 | `DFKV_ACCESS_LOG_ENABLED` | 0 | per-op access log |
 | `DFKV_ACCESS_LOG_PATH` | (stderr) | access-log file path |
+| `DFKV_RDMA_DEV` | first local ACTIVE HCA | ordered full per-host list; narrowed per worker when in-process affinity is enabled |
 
 ## Limitations
 
@@ -150,6 +161,10 @@ payloads.
   synchronous ctypes client to LMCache's eventfd model with a background asyncio
   loop (dfkv has no native eventfd, so no pybind/`NativeConnectorL2Adapter`
   path is used).
+- Rank-local rail affinity applies only to the in-process `RemoteConnector`,
+  where LMCache supplies one `local_worker_id` per engine process. The MP-server
+  L2 adapter owns one shared dfkv client and does not expose a single physical
+  GPU rank at construction, so it deliberately does not apply this policy.
 - **L2 eviction is supported** (dfkv gained a `remove` RPC): set
   `max_capacity_gb > 0` on the L2 adapter to enable LMCache's L2EvictionController,
   which calls `DfkvL2Adapter.delete()` → `dfkv_batch_remove` to drop blocks when

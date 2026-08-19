@@ -26,7 +26,11 @@ import hashlib
 import os
 from typing import Any, List, Optional, Tuple
 
-from dfkv_common import LMCACHE_RAW_V1, canonical_namespace
+from dfkv_common import (
+    LMCACHE_RAW_V1,
+    apply_rank_local_rail_affinity,
+    canonical_namespace,
+)
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_management import MemoryObj
@@ -38,6 +42,7 @@ from .config import parse_dfkv_url
 from .exists_cache import ExistsLRU
 from .key_mapper import cache_engine_key_to_dfkv_key
 from .native_client import DfkvNativeClient
+from .rail_affinity import physical_affinity_rank
 
 logger = init_logger(__name__)
 
@@ -72,6 +77,8 @@ class DfkvConnector(RemoteConnector):
         lib_path: Optional[str] = None,
         membership: str = "mds",
         mds_poll_ms: int = 3000,
+        rail_affinity: bool = False,
+        rail_affinity_fallbacks: int = 1,
     ) -> None:
         with access_log("__init__", lambda: f"url={url}") as r:
             super().__init__(local_cpu_backend.config, local_cpu_backend.metadata)
@@ -91,6 +98,31 @@ class DfkvConnector(RemoteConnector):
             world_size = max(1, int(getattr(_md, "world_size", 1)))
             worker_id = int(getattr(_md, "worker_id", 0))
             model_identity = str(getattr(_md, "model_name", ""))
+            self._rail_affinity = None
+            if rail_affinity:
+                affinity_rank = physical_affinity_rank(_md)
+                self._rail_affinity = apply_rank_local_rail_affinity(
+                    {
+                        "rail_affinity": True,
+                        "rail_affinity_fallbacks": rail_affinity_fallbacks,
+                    },
+                    affinity_rank,
+                    os.environ,
+                )
+                logger.info(
+                    "LMCache dfkv rail affinity: status=%s local_rank=%d/%d "
+                    "worker_id=%d/%d available=%s selected=%s primary=%s "
+                    "fallbacks=%d",
+                    self._rail_affinity.reason,
+                    affinity_rank,
+                    int(getattr(_md, "local_world_size")),
+                    worker_id,
+                    world_size,
+                    ",".join(self._rail_affinity.available) or "<none>",
+                    ",".join(self._rail_affinity.selected) or "<none>",
+                    self._rail_affinity.primary or "<none>",
+                    self._rail_affinity.fallback_count,
+                )
             _dtype_identity = ",".join(str(dtype) for dtype in self.meta_dtypes)
             _shape_identity = "|".join(str(tuple(shape)) for shape in self.meta_shapes)
             namespace = canonical_namespace(
