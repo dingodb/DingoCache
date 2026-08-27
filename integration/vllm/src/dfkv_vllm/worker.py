@@ -1091,6 +1091,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             self._invalid_block_ids.clear()
         return invalid_block_ids
 
+    def load_request_sync(self, request: ReqMeta) -> None:
+        """Load one request on the model thread before its forward pass."""
+        self._handle_request(request)
+
+
     def _handle_request(self, req_meta: ReqMeta):
         req_id = req_meta.req_id
         enqueued_at = getattr(req_meta, "_dfkv_receive_enqueued_at", None)
@@ -1352,14 +1357,12 @@ class DfkvStoreWorker:
         ensure_deterministic_block_hashing(vllm_config.cache_config)
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.load_async = extra.get("load_async", True)
-        if not self.load_async:
-            # Fail at construction with an actionable message: the synchronous
-            # load mode was never implemented, and the old hot-path assert in
-            # get_finished() crashed the worker mid-serving instead.
-            raise ValueError(
-                "dfkv connector: kv_connector_extra_config.load_async=false is "
-                "not supported (loads are handled by the async recv thread); "
-                "remove the key or set it to true")
+        if not isinstance(self.load_async, bool):
+            raise ValueError("dfkv connector: load_async must be a boolean")
+        logger.info(
+            "dfkv load mode: %s",
+            "async-overlap" if self.load_async else "synchronous-before-forward",
+        )
         self.cache_config = vllm_config.cache_config
         self.block_size, self.hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, vllm_config
@@ -1865,40 +1868,39 @@ class DfkvStoreWorker:
         self,
         metadata: DfkvStoreConnectorMetadata,
     ):
-        """Fence every preempted request's active GPU transfer.
-
-        A queued receive is cancelled without a native call.  An active receive
-        cannot be interrupted safely, so this waits for only that request's
-        GPUDirect write before its blocks may be reused.  The send-side fence
-        likewise waits for its request's active RDMA read.
-        """
-        if not metadata.preempted_req_ids:
-            return
-        if self.kv_recv_thread is not None:
-            self.kv_recv_thread.cancel_requests(
-                metadata.preempted_req_ids,
-                wait=True,
-                fail_closed=False,
-            )
-        send_thread = self.kv_send_thread
-        if send_thread is None:
-            return
-        # Drop queued entries first (the dequeue gate re-checks per entry),
-        # then join whichever entry is already executing. The timeout is only
-        # a diagnostic interval: returning from this hook while native PUT can
-        # still read the blocks would let the scheduler reuse them.
-        for req_id in metadata.preempted_req_ids:
-            send_thread.delete_finished_stored_request(req_id)
-        for req_id in metadata.preempted_req_ids:
-            wait_start = time.perf_counter()
-            while not send_thread.wait_for_inflight_put(req_id):
-                logger.error(
-                    "preemption fence still waiting for in-flight save "
-                    "of request %s after %.1fs; GPU block reuse remains fenced "
-                    "until the native save exits",
-                    req_id,
-                    time.perf_counter() - wait_start,
+        """Fence preemptions and perform synchronous loads before forward."""
+        if metadata.preempted_req_ids:
+            if self.kv_recv_thread is not None:
+                self.kv_recv_thread.cancel_requests(
+                    metadata.preempted_req_ids,
+                    wait=True,
+                    fail_closed=False,
                 )
+            send_thread = self.kv_send_thread
+            if send_thread is not None:
+                # Drop queued entries first, then join whichever entry is active.
+                for req_id in metadata.preempted_req_ids:
+                    send_thread.delete_finished_stored_request(req_id)
+                for req_id in metadata.preempted_req_ids:
+                    wait_start = time.perf_counter()
+                    while not send_thread.wait_for_inflight_put(req_id):
+                        logger.error(
+                            "preemption fence still waiting for in-flight save "
+                            "of request %s after %.1fs; GPU block reuse remains "
+                            "fenced until the native save exits",
+                            req_id,
+                            time.perf_counter() - wait_start,
+                        )
+
+        if self.load_async:
+            return
+        assert self.kv_recv_thread is not None
+        for request in metadata.requests:
+            load_spec = request.load_spec
+            if load_spec is None or not load_spec.can_load:
+                continue
+            load_spec.token_len = load_spec.kvpool_cached_tokens
+            self.kv_recv_thread.load_request_sync(request)
 
     def wait_for_save(
         self,
@@ -1926,16 +1928,16 @@ class DfkvStoreWorker:
                 wait=True,
                 fail_closed=False,
             )
-        # Issue async loads
-        for request in meta.requests:
-            load_spec = request.load_spec
-            if load_spec is None or not load_spec.can_load:
-                continue
-
-            load_spec.token_len = load_spec.kvpool_cached_tokens
-
-            assert self.kv_recv_thread is not None
-            self.kv_recv_thread.add_request(request)
+        # Async mode overlaps loads with unrelated model work. Synchronous mode
+        # already completed them in start_load_kv, before this forward pass.
+        if self.load_async:
+            for request in meta.requests:
+                load_spec = request.load_spec
+                if load_spec is None or not load_spec.can_load:
+                    continue
+                load_spec.token_len = load_spec.kvpool_cached_tokens
+                assert self.kv_recv_thread is not None
+                self.kv_recv_thread.add_request(request)
 
         # Issue stores with CUDA event synchronization
         if self.kv_role in ["kv_producer", "kv_both"]:

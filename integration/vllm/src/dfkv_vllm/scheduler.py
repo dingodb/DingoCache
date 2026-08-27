@@ -64,6 +64,8 @@ class DfkvStoreScheduler:
             vllm_config.kv_transfer_config.kv_connector_extra_config
         )
         self.load_async = extra_config.get("load_async", True)
+        if not isinstance(self.load_async, bool):
+            raise ValueError("dfkv connector: load_async must be a boolean")
         self.lookup_async = extra_config.get("lookup_async", False)
         self.client = LookupKeyClient(vllm_config)
         self._closed = False
