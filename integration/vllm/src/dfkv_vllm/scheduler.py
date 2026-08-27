@@ -148,9 +148,7 @@ class DfkvStoreScheduler:
         num_external_tokens: int,
     ):
         """Update state after block allocation."""
-        local_block_ids: tuple[list[int], ...] = ()
-        if num_external_tokens > 0:
-            local_block_ids = blocks.get_block_ids()
+        local_block_ids = blocks.get_block_ids()
 
         self._unfinished_requests[request.request_id] = (request, local_block_ids)
         self._unfinished_request_ids.add(request.request_id)
@@ -212,15 +210,13 @@ class DfkvStoreScheduler:
                 + scheduler_output.num_scheduled_tokens[request.req_id]
             )
             assert request.req_id in self._unfinished_requests
-            request_tuple = self._unfinished_requests.get(request.req_id)
-            request_real = request_tuple[0]  # type: ignore[index]
-
-            if isinstance(request.block_ids, tuple):
-                # Multi-group: preserve per-group structure.
-                unfolded_block_ids = tuple(b.copy() for b in request.block_ids)
-            else:
-                # Single-group legacy: list[int] -> 1-tuple.
-                unfolded_block_ids = (request.block_ids.copy(),)
+            request_real, allocated_block_ids = self._unfinished_requests[request.req_id]
+            # NewRequestData.block_ids contains only blocks allocated in this
+            # scheduler step. Keep the complete table captured after allocation
+            # so later chunks can address from sequence offset zero.
+            unfolded_block_ids = tuple(
+                group_ids.copy() for group_ids in allocated_block_ids
+            )
 
             prefill_tokens = _new_req_prefill_tokens(request)
             request_tracker = RequestTracker(
