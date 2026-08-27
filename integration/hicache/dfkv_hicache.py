@@ -96,6 +96,68 @@ def _physical_axis(cfg: dict, name: str) -> tuple[int, int]:
         raise ValueError(f"{rank_key} must be in [0, {size})")
     return size, rank
 
+def _resolve_parallel_coordinates(
+    cfg: dict,
+) -> tuple[tuple[int, int], tuple[int, int], Optional[int]]:
+    """Resolve SGLang's physical CP coordinates, with explicit overrides.
+
+    Recent SGLang releases do not copy attention-CP/DCP coordinates into the
+    dynamic HiCache backend's ``extra_config``. Discover them from the initialized
+    parallel state so sharded ranks cannot alias the default ``0/1`` keys.
+    """
+    parallel = None
+    try:
+        try:
+            from sglang.srt.runtime_context import get_parallel
+        except ImportError:
+            # Compatibility with releases that re-export runtime context through
+            # the distributed package.
+            from sglang.srt.distributed import get_parallel
+
+        parallel = get_parallel()
+    except (ImportError, AttributeError, AssertionError, RuntimeError):
+        pass
+
+    resolved = {}
+    runtime_fields = {
+        "pcp": ("attn_cp_size", "attn_cp_rank"),
+        "dcp": ("attn_dcp_size", "attn_dcp_rank"),
+    }
+    for name, (size_attr, rank_attr) in runtime_fields.items():
+        if f"{name}_size" in cfg or f"{name}_rank" in cfg:
+            resolved[name] = _physical_axis(cfg, name)
+        elif parallel is not None:
+            resolved[name] = _physical_axis(
+                {
+                    f"{name}_size": getattr(parallel, size_attr),
+                    f"{name}_rank": getattr(parallel, rank_attr),
+                },
+                name,
+            )
+        else:
+            resolved[name] = (1, 0)
+
+    attn_tp_rank = (
+        int(getattr(parallel, "attn_tp_rank"))
+        if parallel is not None and hasattr(parallel, "attn_tp_rank")
+        else None
+    )
+    return resolved["pcp"], resolved["dcp"], attn_tp_rank
+
+
+def _is_mla_replica_writer(
+    is_mla: bool,
+    tp_rank: int,
+    attn_tp_rank: Optional[int],
+    dcp_size: int,
+    dcp_rank: int,
+) -> bool:
+    """Elect one writer for each physical PCP/DCP shard."""
+    if not is_mla:
+        return True
+    rank = attn_tp_rank if attn_tp_rank is not None else tp_rank
+    return rank == (dcp_rank if dcp_size > 1 else 0)
+
 
 def resolve_node_dedup(cfg_value, env_value, is_mla: bool, tp_size: int):
     """Decide DFKV_CLIENT_NODE_DEDUP: (value_to_set | None, auto_enabled).
@@ -281,10 +343,24 @@ class DfkvHiCache(HiCacheStorage):
         self.tp_size = int(storage_config.tp_size)
         self.is_mla = bool(storage_config.is_mla_model)
         # PCP and DCP split one logical page into distinct physical shards.
-        # A guessed rank would alias those shards, so multi-rank axes require an
-        # explicit bounded coordinate before the native client is opened.
-        self.pcp_size, self.pcp_rank = _physical_axis(cfg, "pcp")
-        self.dcp_size, self.dcp_rank = _physical_axis(cfg, "dcp")
+        # SGLang does not forward those coordinates through extra_config, so use
+        # its initialized parallel state unless the operator explicitly supplied
+        # a bounded override.
+        (
+            (self.pcp_size, self.pcp_rank),
+            (self.dcp_size, self.dcp_rank),
+            attn_tp_rank,
+        ) = _resolve_parallel_coordinates(cfg)
+        # MLA is replicated only inside one effective attention-TP subgroup.
+        # DCP ranks own distinct interleaved shards, so each DCP coordinate elects
+        # its own writer; PCP ranks independently repeat the same election.
+        self._mla_replica_writer = _is_mla_replica_writer(
+            self.is_mla,
+            self.tp_rank,
+            attn_tp_rank,
+            self.dcp_size,
+            self.dcp_rank,
+        )
         self._device_direct_requested = _truthy(
             os.environ.get("SGLANG_HICACHE_L2_BYPASS"))
         self._device_registration_failed = False
@@ -1025,8 +1101,9 @@ class DfkvHiCache(HiCacheStorage):
         n = len(keys)
         with _tracing.span("batch_set_v1", n) as _sp, \
                 access_log("batch_set_v1", lambda: f"{self._alog_tag} {n} keys") as r:
-            # MLA backup_skip: latent is replicated across TP, only rank 0 writes.
-            if self.is_mla and self.tp_rank != 0:
+            # MLA latent is replicated only within one attention-TP subgroup.
+            # PCP/DCP shards elect an independent writer per physical coordinate.
+            if self.is_mla and not self._mla_replica_writer:
                 r.result = "backup_skip"
                 if _sp:
                     _sp.attrs = {"dfkv.backup_skip": True}
@@ -1190,8 +1267,9 @@ class DfkvHiCache(HiCacheStorage):
         with _tracing.span("batch_set_v1_device", n) as _sp, \
                 access_log("batch_set_v1_device",
                            lambda: f"{self._alog_tag} {n} keys") as r:
-            # MLA backup_skip: latent is replicated across TP, only rank 0 writes.
-            if self.is_mla and self.tp_rank != 0:
+            # MLA latent is replicated only within one attention-TP subgroup.
+            # PCP/DCP shards elect an independent writer per physical coordinate.
+            if self.is_mla and not self._mla_replica_writer:
                 r.result = "backup_skip"
                 if _sp:
                     _sp.attrs = {"dfkv.backup_skip": True}
@@ -1464,9 +1542,12 @@ class DfkvHiCache(HiCacheStorage):
             # Replication is inferred from the registered host layout, not a
             # model-name allowlist, and _pool_keys carries the matching
             # component/rank coordinates. Thus the write gate and collision
-            # isolation derive from the same physical contract.
-            if (putting and self.is_mla and self.tp_rank != 0
-                    and self._pool_is_replicated(name)):
+            if (
+                putting
+                and self.is_mla
+                and not self._mla_replica_writer
+                and self._pool_is_replicated(name)
+            ):
                 results[name] = [True] * len(keys)
                 continue
             pool = self.registered_pools[name]
@@ -1569,8 +1650,7 @@ class DfkvHiCache(HiCacheStorage):
         access-log wrapper, so batch_set_v2_device can reuse it for the anchor KV.
         Returns (per_page_bools, nbytes, seconds). MLA backup_skip on non-zero TP
         rank (replicated latent) short-circuits to all-True, no I/O."""
-        n = len(keys)
-        if self.is_mla and self.tp_rank != 0:
+        if self.is_mla and not self._mla_replica_writer:
             return [True] * n, 0, 0.0
         from sglang.srt.mem_cache.device_page_meta import (
             get_device_page_buffer_meta,
@@ -1684,8 +1764,7 @@ class DfkvHiCache(HiCacheStorage):
         indexer is layer-first & PAGE-indexed; get_device_sidecar_page_buffer_meta
         yields its per-layer page-row segments from the registered sidecar device
         pool. Returns (per_page_bools, nbytes, seconds)."""
-        n = len(keys)
-        if self.is_mla and self.tp_rank != 0:
+        if self.is_mla and not self._mla_replica_writer:
             return [True] * n, 0, 0.0
         from sglang.srt.mem_cache.device_page_meta import (
             get_device_sidecar_page_buffer_meta,
@@ -1754,8 +1833,7 @@ class DfkvHiCache(HiCacheStorage):
             )
             seg_ptrs, seg_sizes = get_device_page_buffer_meta(
                 self.mem_pool_device_draft, device_indices)
-            sub = len(seg_ptrs) // n if n else 1
-            if sub == 1 and self.tp_rank != 0:
+            if sub == 1 and not self._mla_replica_writer:
                 r.result = "backup_skip"
                 return [True] * n
             stride, sks, sp, ss = self._flatten_device(
@@ -1829,8 +1907,8 @@ class DfkvHiCache(HiCacheStorage):
             kv_res, kv_bytes, kv_secs = self._kv_device_set(kv_keys, kv_device_indices)
             results = {"kv": kv_res}
             # Main-KV device write reports on_set (v1-device), matching stock DSA's
-            # anchor attribution; skip the metric on the MLA rank!=0 no-op.
-            if n and not (self.is_mla and self.tp_rank != 0):
+            # anchor attribution; skip the metric on a replicated MLA follower.
+            if n and (not self.is_mla or self._mla_replica_writer):
                 self._metrics.on_set(pages=n, ok_pages=sum(kv_res),
                                      nbytes=kv_bytes, seconds=kv_secs)
             # Sidecar. Task 4: a DEVICE sidecar transfer (device_indices set,
@@ -1852,8 +1930,7 @@ class DfkvHiCache(HiCacheStorage):
                 results.update(side)
                 side_pages += sum(len(rs) for rs in side.values())
                 side_ok += sum(sum(rs) for rs in side.values())
-                side_bytes += self._v2_io_bytes; side_secs += self._v2_io_seconds
-            if side_pages and not (self.is_mla and self.tp_rank != 0):
+            if side_pages and (not self.is_mla or self._mla_replica_writer):
                 self._metrics.on_set_v2(
                     pages=side_pages, ok_pages=side_ok,
                     nbytes=side_bytes, seconds=side_secs)
