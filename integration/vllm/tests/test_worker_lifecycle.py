@@ -201,6 +201,64 @@ class WorkerCloseTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "worker is closed"):
             worker.register_kv_caches({"layer": object()})
 
+@unittest.skipUnless(HAVE_VLLM, "requires vllm (dfkv_vllm.worker imports it)")
+class SynchronousLoadTest(unittest.TestCase):
+    class FakeRecv:
+        def __init__(self):
+            self.loaded = []
+
+        def load_request_sync(self, request):
+            self.loaded.append(request.req_id)
+
+        def cancel_requests(self, *args, **kwargs):
+            raise AssertionError("no preemptions expected")
+
+    @staticmethod
+    def _request(req_id: str, can_load: bool):
+        return types.SimpleNamespace(
+            req_id=req_id,
+            load_spec=types.SimpleNamespace(
+                can_load=can_load,
+                kvpool_cached_tokens=128,
+                token_len=0,
+            ),
+        )
+
+    def test_sync_mode_loads_before_forward(self):
+        worker = DfkvStoreWorker.__new__(DfkvStoreWorker)
+        worker.load_async = False
+        worker.kv_recv_thread = self.FakeRecv()
+        worker.kv_send_thread = None
+        load = self._request("load", True)
+        skip = self._request("skip", False)
+        metadata = types.SimpleNamespace(
+            preempted_req_ids=set(),
+            requests=[load, skip],
+        )
+
+        worker.start_load_kv(metadata)
+
+        self.assertEqual(worker.kv_recv_thread.loaded, ["load"])
+        self.assertEqual(load.load_spec.token_len, 128)
+        self.assertEqual(skip.load_spec.token_len, 0)
+
+    def test_async_mode_defers_load_to_get_finished(self):
+        worker = DfkvStoreWorker.__new__(DfkvStoreWorker)
+        worker.load_async = True
+        worker.kv_recv_thread = self.FakeRecv()
+        worker.kv_send_thread = None
+        load = self._request("load", True)
+        metadata = types.SimpleNamespace(
+            preempted_req_ids=set(),
+            requests=[load],
+        )
+
+        worker.start_load_kv(metadata)
+
+        self.assertEqual(worker.kv_recv_thread.loaded, [])
+        self.assertEqual(load.load_spec.token_len, 0)
+
+
 
 if __name__ == "__main__":
     unittest.main()
