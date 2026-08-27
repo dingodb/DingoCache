@@ -59,10 +59,7 @@ from ._determinism import ensure_deterministic_block_hashing
 from .client_ranks import ENV_NAME as CLIENT_RANKS_ENV
 from .client_ranks import (ELIDE_ENV, participant, resolve_client_ranks,
                            should_create_client)
-from .coordinator import (
-    ExternalCachedBlockPool,
-    DfkvStoreCoordinator,
-)
+from .coordinator import DfkvStoreCoordinator
 from .data import (
     VLLM_MULTIWR_V2,
     ChunkedTokenDatabase,
@@ -215,6 +212,26 @@ def _key_stripe_identity(
 # Normalize that result into the failed-index list the send thread expects.
 def _put_failed_indices(rcs: list[int]) -> list[int]:
     return [i for i, rc in enumerate(rcs) if rc != 0]
+
+def _logical_block_ids(
+    mask: Sequence[bool],
+    block_ids: Sequence[int],
+) -> list[int]:
+    positions = [index for index, selected in enumerate(mask) if selected]
+    if len(block_ids) < len(positions):
+        raise ValueError(
+            f"block table has {len(block_ids)} ids for "
+            f"{len(positions)} selected state slots"
+        )
+    logical = [-1] * len(mask)
+    for position, block_id in zip(
+        positions,
+        block_ids[-len(positions) :] if positions else (),
+        strict=True,
+    ):
+        logical[position] = int(block_id)
+    return logical
+
 
 
 # ============================================================
@@ -565,8 +582,12 @@ class KVCacheStoreSendingThread(KVTransferThread):
             keys: list[bytes] = []
             block_hashes: list[BlockHash] = []
             group_indices: list[int] = []
+            logical_block_ids_per_group: list[list[int]] = []
             for g_idx, db in enumerate(self.token_databases):
                 mask = store_masks[g_idx]
+                logical_block_ids_per_group.append(
+                    _logical_block_ids(mask, block_ids_per_group[g_idx])
+                )
                 for chunk_idx, (start, end, key) in enumerate(
                     db.process_tokens(token_len, req_meta.block_hashes)
                 ):
@@ -646,7 +667,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     self.token_databases[g_idx],
                     start,
                     end,
-                    block_ids_per_group[g_idx],
+                    logical_block_ids_per_group[g_idx],
                 )
                 for start, end, g_idx in zip(
                     starts, ends, group_indices, strict=True
@@ -1095,18 +1116,19 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             block_id_list: list[int] = []
             for g_idx, db in enumerate(self.token_databases):
                 mask = load_mask_per_group[g_idx]
+                logical_block_ids = _logical_block_ids(
+                    mask, req_meta.block_ids[g_idx]
+                )
                 for start, end, key in db.process_tokens(
                     token_len, req_meta.block_hashes, mask_num
                 ):
                     chunk_idx = start // db.block_size
                     if chunk_idx >= len(mask) or not mask[chunk_idx]:
                         continue
-                    block_id = int(
-                        req_meta.block_ids[g_idx][start // db.block_size]
-                    )
+                    block_id = logical_block_ids[chunk_idx]
                     key_list.append(key.to_bytes())
                     descriptor_chunks.append(
-                        (db, start, end, req_meta.block_ids[g_idx])
+                        (db, start, end, logical_block_ids)
                     )
                     block_id_list.append(block_id)
 
@@ -2175,15 +2197,11 @@ class DfkvStoreWorker:
             prefix_chunks += 1
         complete_prefix_tokens = prefix_chunks * self.coord.lcm_block_size
 
-        if complete_prefix_tokens == 0:
-            hit_length = 0
-        else:
-            _masks, semantic_hit_length = self.coord.find_longest_cache_hit(
-                block_hashes,
-                complete_prefix_tokens,
-                ExternalCachedBlockPool(exists_set),
-            )
-            hit_length = min(complete_prefix_tokens, semantic_hit_length)
+        # candidate_keys are derived from the same manager-selected store mask
+        # used by save and load. Once every required object for the contiguous
+        # prefix exists, re-running cross-group convergence can only discard
+        # intentionally sparse stateful groups.
+        hit_length = complete_prefix_tokens
         logger.debug(
             "dfkv lookup: token_len=%d candidates=%d complete_chunks=%d/%d "
             "-> hit_length=%d",

@@ -202,32 +202,29 @@ class DfkvStoreCoordinator:
         if aligned_token_len == 0:
             return tuple([] for _ in self.kv_cache_groups)
 
-        num_chunks_per_group = [
-            aligned_token_len // g.kv_cache_spec.block_size
-            for g in self.kv_cache_groups
-        ]
-
-        # Fast path: single group or full attn groups or uniform block_sizes
-        if all(
-            isinstance(spec, FullAttentionSpec)
-            or spec.block_size == self.lcm_block_size
-            for spec, _, _ in self.attention_groups
-        ):
-            return tuple([True] * n for n in num_chunks_per_group)
-
-        n_segments = aligned_token_len // self.lcm_block_size
         dummy_hashes: list[BlockHash] = [_DUMMY_BLOCK_HASH] * (
-            self.lcm_block_size // self.hash_block_size
+            aligned_token_len // self.hash_block_size
         )
-        template_masks, _ = self.find_longest_cache_hit(
-            dummy_hashes,
-            max_length=self.lcm_block_size,
-            cached_block_pool=ExternalCachedBlockPool(),
-        )
-        return tuple(
-            list(template_masks[g]) * n_segments
-            for g in range(len(self.kv_cache_groups))
-        )
+        block_pool = ExternalCachedBlockPool(hash_block_size=self.hash_block_size)
+        masks: list[list[bool]] = [[] for _ in self.kv_cache_groups]
+        for idx, (spec, group_ids, manager_cls) in enumerate(self.attention_groups):
+            hashes = self.block_hashes_for_spec(dummy_hashes, spec)
+            hit_blocks = _unwrap_hit_blocks(
+                manager_cls.find_longest_cache_hit(
+                    block_hashes=hashes,
+                    max_length=aligned_token_len,
+                    kv_cache_group_ids=group_ids,
+                    block_pool=cast(BlockPool, block_pool),
+                    kv_cache_spec=spec,
+                    drop_eagle_block=idx in self.eagle_attn_group_indices,
+                    alignment_tokens=self.lcm_block_size,
+                )
+            )
+            for group_id, blocks in zip(group_ids, hit_blocks, strict=True):
+                masks[group_id] = [
+                    block is not block_pool.null_block for block in blocks
+                ]
+        return tuple(masks)
 
     def block_hashes_for_spec(
         self, block_hashes: list[BlockHash], spec: KVCacheSpec

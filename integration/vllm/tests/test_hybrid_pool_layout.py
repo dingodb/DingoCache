@@ -43,6 +43,17 @@ _METADATA = KeyMetadata(
 def _db() -> ChunkedTokenDatabase:
     return ChunkedTokenDatabase(_METADATA, block_size=16)
 
+def test_logical_block_ids_expand_compact_stateful_table():
+    assert worker_module._logical_block_ids([False, False, True], [7]) == [
+        -1,
+        -1,
+        7,
+    ]
+    assert worker_module._logical_block_ids([True, True], [5, 11]) == [5, 11]
+    with pytest.raises(ValueError, match="1 ids for 2 selected state slots"):
+        worker_module._logical_block_ids([True, True], [5])
+
+
 def test_pool_key_uses_cross_runtime_binary_schema():
     assert PoolKey(_METADATA, "0123abcd").to_bytes() == (
         b"DFKVPOOL\x02"
