@@ -98,6 +98,24 @@ def _stub_observability() -> None:
 
 _stub_observability()
 
+@contextlib.contextmanager
+def _parallel_runtime(**coordinates):
+    module_name = "sglang.srt.runtime_context"
+    previous = sys.modules.get(module_name)
+    module = types.ModuleType(module_name)
+    parallel = types.SimpleNamespace(**coordinates)
+    module.get_parallel = lambda: parallel
+    sys.modules[module_name] = module
+    try:
+        yield
+    finally:
+        if previous is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous
+
+
+
 
 class _FakeLib:
     """dfkv_max_sg_segs is the only handle _sg_width() needs."""
@@ -129,6 +147,7 @@ def _mk_instance(width: int, mla: bool = True):
     inst.pcp_rank = 0
     inst.dcp_size = 1
     inst.dcp_rank = 0
+    inst._mla_replica_writer = False
     inst.mem_pool_device = object()  # non-None → device (L2-bypass) mode
     inst._metrics = _FakeMetrics()
     inst._alog_tag = "test"
@@ -139,6 +158,57 @@ def _mk_instance(width: int, mla: bool = True):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+class TestParallelCoordinates(unittest.TestCase):
+    def test_discovers_sglang_pcp_dcp_coordinates(self):
+        with _parallel_runtime(
+            attn_cp_size=8,
+            attn_cp_rank=3,
+            attn_dcp_size=2,
+            attn_dcp_rank=1,
+            attn_tp_rank=0,
+        ):
+            pcp, dcp, attn_tp_rank = H._resolve_parallel_coordinates({})
+        self.assertEqual(pcp, (8, 3))
+        self.assertEqual(dcp, (2, 1))
+        self.assertEqual(attn_tp_rank, 0)
+
+    def test_explicit_coordinates_override_runtime_axes(self):
+        with _parallel_runtime(
+            attn_cp_size=8,
+            attn_cp_rank=3,
+            attn_dcp_size=2,
+            attn_dcp_rank=1,
+            attn_tp_rank=2,
+        ):
+            pcp, dcp, attn_tp_rank = H._resolve_parallel_coordinates(
+                {
+                    "pcp_size": 4,
+                    "pcp_rank": 1,
+                    "dcp_size": 1,
+                    "dcp_rank": 0,
+                }
+            )
+        self.assertEqual(pcp, (4, 1))
+        self.assertEqual(dcp, (1, 0))
+        self.assertEqual(attn_tp_rank, 2)
+
+    def test_cp_rank_changes_physical_key(self):
+        left = _mk_instance(29)
+        left.pcp_size = 8
+        left.pcp_rank = 0
+        right = _mk_instance(29)
+        right.pcp_size = 8
+        right.pcp_rank = 1
+        self.assertNotEqual(left._keys("shared-page"), right._keys("shared-page"))
+
+    def test_mla_writer_is_elected_per_physical_cp_shard(self):
+        self.assertFalse(H._is_mla_replica_writer(True, 3, None, 1, 0))
+        self.assertTrue(H._is_mla_replica_writer(True, 3, 0, 1, 0))
+        self.assertTrue(H._is_mla_replica_writer(True, 3, 3, 8, 3))
+        self.assertFalse(H._is_mla_replica_writer(True, 7, 7, 4, 3))
+        self.assertTrue(H._is_mla_replica_writer(False, 3, 2, 8, 2))
 
 
 class TestSgGroupKey(unittest.TestCase):
