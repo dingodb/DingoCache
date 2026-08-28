@@ -476,6 +476,23 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_watermark_evictions_total", "counter",
            "Proactive watermark extent evictions (headroom kept ahead of demand)",
            ss.watermark_evictions);
+    metric("dfkv_slab_watermark_extent_clears_total", "counter",
+           "Whole-extent metadata clears used by watermark eviction",
+           ss.watermark_extent_clears);
+    metric("dfkv_slab_watermark_ticks_total", "counter",
+           "Bounded watermark eviction ticks", ss.watermark_ticks);
+    metric("dfkv_slab_watermark_active", "gauge",
+           "Whether high-water eviction remains latched until low watermark",
+           ss.watermark_active);
+    metric("dfkv_slab_watermark_last_tick_us", "gauge",
+           "Duration of the latest watermark tick in microseconds",
+           ss.watermark_last_tick_us);
+    metric("dfkv_slab_watermark_max_tick_us", "gauge",
+           "Maximum watermark tick duration in microseconds",
+           ss.watermark_max_tick_us);
+    metric("dfkv_slab_watermark_max_extents_per_tick", "gauge",
+           "Configured per-disk extent eviction cap per tick",
+           ss.watermark_max_extents_per_tick);
     metric("dfkv_slab_extent_returns_total", "counter",
            "Fully-free extents returned to the shared pool", ss.extent_returns);
     metric("dfkv_slab_deferred_removes_total", "counter",

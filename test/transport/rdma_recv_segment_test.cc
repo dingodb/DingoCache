@@ -106,4 +106,46 @@ TEST(RecvSegment, SizeParserIs64BitAlignedAndNotWireCapped) {
   EXPECT_EQ(ResolveRecvSegmentBytes("8192", fallback, 3000), 0u);
 }
 
+TEST(RecvSegmentPool, GrowsLazilyWithinHardBudgetAndReusesLeases) {
+  RecvSegmentPool pool;
+  ASSERT_TRUE(pool.Init(16u << 10, 48u << 10));
+  EXPECT_EQ(pool.stats().committed_bytes, 16u << 10);
+  EXPECT_EQ(pool.stats().chunks, 1u);
+
+  auto first = pool.Allocate(12u << 10);
+  auto second = pool.Allocate(12u << 10);
+  auto third = pool.Allocate(12u << 10);
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(second);
+  ASSERT_TRUE(third);
+  EXPECT_NE(first.segment(), second.segment());
+  EXPECT_NE(second.segment(), third.segment());
+
+  auto stats = pool.stats();
+  EXPECT_EQ(stats.max_bytes, 48u << 10);
+  EXPECT_EQ(stats.committed_bytes, 48u << 10);
+  EXPECT_EQ(stats.used_bytes, 36u << 10);
+  EXPECT_EQ(stats.chunks, 3u);
+  EXPECT_EQ(stats.growths, 2u);
+  EXPECT_FALSE(pool.Allocate(12u << 10));
+  EXPECT_EQ(pool.stats().growth_failures, 1u);
+
+  RecvSegment* released_segment = second.segment();
+  second.Reset();
+  auto replacement = pool.Allocate(12u << 10);
+  ASSERT_TRUE(replacement);
+  EXPECT_EQ(replacement.segment(), released_segment);
+  EXPECT_EQ(pool.stats().growths, 2u);
+}
+
+TEST(RecvSegmentPool, RejectsInvalidOrOversizedGeometry) {
+  RecvSegmentPool pool;
+  EXPECT_FALSE(pool.Init(0, 4096));
+  EXPECT_FALSE(pool.Init(8192, 4096));
+  ASSERT_TRUE(pool.Init(8192, 16384));
+  EXPECT_EQ(pool.initial_segment()->size(), 8192u);
+  EXPECT_FALSE(pool.Allocate(20u << 10));
+  EXPECT_EQ(pool.stats().committed_bytes, 8192u);
+}
+
 }  // namespace dfkv::rdma

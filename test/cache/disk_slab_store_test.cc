@@ -1355,6 +1355,44 @@ TEST_F(DiskSlabTest, WatermarkEvictionsStayDeadAcrossCleanRestart) {
   for (uint64_t i = 0; i < 4; ++i) EXPECT_FALSE(reopened.IsCached(K(i)));
 }
 
+TEST_F(DiskSlabTest, WatermarkDrainIsLatchedAndBoundedPerTick) {
+  ::setenv("DFKV_SLAB_EVICT_HIGH_PCT", "50", 1);
+  ::setenv("DFKV_SLAB_EVICT_LOW_PCT", "25", 1);
+  ::setenv("DFKV_SLAB_EVICT_MAX_EXTENTS_PER_TICK", "1", 1);
+  auto options = Opts(8 * 4096, 4096, 4096);
+  options.reclaim_interval_ms = 0;
+  options.table_sync_ms = 0;
+  bool ok = false;
+  DiskSlabStore store(options, &ok);
+  ::unsetenv("DFKV_SLAB_EVICT_HIGH_PCT");
+  ::unsetenv("DFKV_SLAB_EVICT_LOW_PCT");
+  ::unsetenv("DFKV_SLAB_EVICT_MAX_EXTENTS_PER_TICK");
+  ASSERT_TRUE(ok);
+
+  std::string value(4000, 'w');
+  for (uint64_t i = 0; i < 8; ++i)
+    ASSERT_EQ(store.Cache(K(i), value.data(), value.size()), Status::kOk);
+
+  dfkv::DiskSlabStoreTestPeer::ReclaimNow(&store, {});
+  auto stats = store.GetStats();
+  EXPECT_EQ(store.Count(), 6u)
+      << "one bounded watermark extent plus regular free-slot reclaim";
+  EXPECT_EQ(stats.watermark_evictions, 1u);
+  EXPECT_EQ(stats.watermark_extent_clears, 1u);
+  EXPECT_EQ(stats.watermark_active, 1u);
+  EXPECT_EQ(stats.watermark_max_extents_per_tick, 1u);
+
+  for (int i = 0; i < 5; ++i)
+    dfkv::DiskSlabStoreTestPeer::ReclaimNow(&store, {});
+  stats = store.GetStats();
+  EXPECT_EQ(store.Count(), 1u);
+  EXPECT_EQ(stats.watermark_evictions, 6u);
+  EXPECT_EQ(stats.watermark_extent_clears, 6u);
+  EXPECT_EQ(stats.eviction_record_clears, 7u);
+  EXPECT_EQ(stats.watermark_ticks, 6u);
+  EXPECT_EQ(stats.watermark_active, 0u);
+}
+
 // Class rebalance regression (the "new value size retains only a sliver of its
 // writes" failure): fill the store with class A, then write a burst of class B
 // larger than B's first extent. Stock behavior self-evicts B forever (B ends

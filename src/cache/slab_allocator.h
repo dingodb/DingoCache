@@ -61,6 +61,11 @@ class SlabAllocator {
     // (slot_size - aligned_len) stays below this fraction.
     double max_waste = 0.25;
     std::function<bool(uint32_t extent)> on_extent_bind;
+    // Whole-extent eviction can clear persistent metadata in one contiguous
+    // write. When set, watermark eviction uses this instead of per-slot calls.
+    std::function<bool(uint32_t extent, uint32_t total_slots,
+                       uint32_t resident_slots)>
+        on_extent_evict;
     std::function<bool(const SlotRef&)> on_slot_evict;
   };
 

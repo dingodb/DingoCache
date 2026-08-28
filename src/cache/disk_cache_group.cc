@@ -545,6 +545,17 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.steals += st.steals;
     sum.cold_steals += st.cold_steals;
     sum.watermark_evictions += st.watermark_evictions;
+    sum.watermark_extent_clears += st.watermark_extent_clears;
+    sum.watermark_ticks += st.watermark_ticks;
+    sum.watermark_active =
+        std::max(sum.watermark_active, st.watermark_active);
+    sum.watermark_last_tick_us =
+        std::max(sum.watermark_last_tick_us, st.watermark_last_tick_us);
+    sum.watermark_max_tick_us =
+        std::max(sum.watermark_max_tick_us, st.watermark_max_tick_us);
+    sum.watermark_max_extents_per_tick =
+        std::max(sum.watermark_max_extents_per_tick,
+                 st.watermark_max_extents_per_tick);
     sum.extent_returns += st.extent_returns;
     sum.deferred_removes += st.deferred_removes;
     sum.inflight += st.inflight;

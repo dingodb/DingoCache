@@ -91,6 +91,18 @@ size_t RecvSegmentBytes() {
   return bytes;
 }
 
+size_t RecvChunkBytes(size_t max_bytes) {
+  constexpr size_t kDefault = 256ull << 20;
+  const size_t fallback = std::min(kDefault, max_bytes);
+  const size_t parsed = rdma::ResolveRecvSegmentBytes(
+      std::getenv("DFKV_RDMA_RECV_CHUNK_BYTES"), fallback,
+      rdma::kV2DataOffset);
+  const size_t bytes = parsed == 0 ? 0 : std::min(parsed, max_bytes);
+  config_dump::RecordResolved("DFKV_RDMA_RECV_CHUNK_BYTES",
+                              std::to_string(bytes));
+  return bytes;
+}
+
 const char* DiscoveryStatusName(rdma::RdmaDiscoveryStatus status) {
   switch (status) {
     case rdma::RdmaDiscoveryStatus::kOk:
@@ -271,32 +283,33 @@ Status RdmaServer::Start(int port) {
   dev_name_ = anchor_devs_.front();
   config_dump::RecordResolved("DFKV_RDMA_DEV", resolved_devices);
 
-  // Allocate the mandatory process-wide receive segment before opening anchors.
-  recv_segment_bytes_ = RecvSegmentBytes();
+  // Commit one small receive chunk at startup; additional chunks are allocated
+  // only when live connection leases need them. The legacy segment setting is
+  // now the hard process budget rather than an eager allocation size.
+  recv_segment_max_bytes_ = RecvSegmentBytes();
+  recv_segment_chunk_bytes_ = RecvChunkBytes(recv_segment_max_bytes_);
   const size_t min_slot_bytes = rdma::V2SlotSize(max_msg_);
-  if (!rdma::V2RecvSegmentFitsOneSlot(recv_segment_bytes_, max_msg_)) {
+  if (min_slot_bytes == 0 ||
+      recv_segment_max_bytes_ < 2 * min_slot_bytes ||
+      recv_segment_chunk_bytes_ == 0 ||
+      !recv_segments_.Init(recv_segment_chunk_bytes_,
+                           recv_segment_max_bytes_,
+                           rdma::kV2DataOffset)) {
     LogTopologySummary(requested_devices.size(), 0, discovery.devices);
     DFKV_LOG_ERROR(
-        "rdma: configured v2 receive segment (" +
-        std::to_string(recv_segment_bytes_) +
-        " bytes) cannot fit one complete slot (" +
-        std::to_string(min_slot_bytes) + " bytes) at server max block " +
-        std::to_string(max_msg_) +
-        " bytes; raise DFKV_RDMA_RECV_SEGMENT_SIZE or lower --max-msg");
-    recv_segment_bytes_ = 0;
+        "rdma: invalid receive-pool geometry max=" +
+        std::to_string(recv_segment_max_bytes_) +
+        " chunk=" + std::to_string(recv_segment_chunk_bytes_) +
+        " minimum-two-slot-bytes=" + std::to_string(2 * min_slot_bytes) +
+        "; raise DFKV_RDMA_RECV_SEGMENT_SIZE, adjust "
+        "DFKV_RDMA_RECV_CHUNK_BYTES, or lower --max-msg");
+    recv_segment_max_bytes_ = 0;
+    recv_segment_chunk_bytes_ = 0;
     ::close(listen_fd_);
     listen_fd_ = -1;
     return Status::kIOError;
   }
-  if (!recv_segment_.Init(recv_segment_bytes_, rdma::kV2DataOffset)) {
-    LogTopologySummary(requested_devices.size(), 0, discovery.devices);
-    DFKV_LOG_ERROR("rdma: unable to allocate required v2 receive segment (" +
-                   std::to_string(recv_segment_bytes_) + " bytes)");
-    recv_segment_bytes_ = 0;
-    ::close(listen_fd_);
-    listen_fd_ = -1;
-    return Status::kIOError;
-  }
+  rdma::RecvSegment* initial_segment = recv_segments_.initial_segment();
 
   std::vector<std::unique_ptr<rdma::RcEndpoint>> initialized_anchors;
   initialized_anchors.reserve(anchor_devs_.size());
@@ -304,7 +317,8 @@ Status RdmaServer::Start(int port) {
     std::unique_ptr<rdma::RcEndpoint> anchor;
     if (initialize_anchor_for_test_) {
       anchor = initialize_anchor_for_test_(
-          device, user_regions_, recv_segment_.data(), recv_segment_.size());
+          device, user_regions_, initial_segment->data(),
+          initial_segment->size());
     } else {
       anchor = std::make_unique<rdma::RcEndpoint>();
       if (!anchor->Open(device.c_str(), rdma::kV2ControlCap, 1)) {
@@ -314,10 +328,10 @@ Status RdmaServer::Start(int port) {
         DFKV_LOG_ERROR("rdma: failed to register explicit user region on " +
                        device);
         anchor.reset();
-      } else if (!anchor->RegisterRemoteRegion(recv_segment_.data(),
-                                               recv_segment_.size())) {
+      } else if (!anchor->RegisterRemoteRegion(initial_segment->data(),
+                                               initial_segment->size())) {
         DFKV_LOG_ERROR(
-            "rdma: failed to register required v2 receive segment on " +
+            "rdma: failed to register initial v2 receive chunk on " +
             device);
         anchor.reset();
       }
@@ -605,8 +619,8 @@ void RdmaServer::Serve(int boot_fd) {
     ::close(boot_fd);
     return;
   }
-  rdma::RecvSegment::Lease recv_lease =
-      recv_segment_.Allocate(K * slot_size, rdma::kV2DataOffset);
+  rdma::RecvSegmentPool::Lease recv_lease =
+      recv_segments_.Allocate(K * slot_size, rdma::kV2DataOffset);
   if (!recv_lease) {
     // Segment exhausted: evict the stalest idle connection(s) to make room
     // before refusing. Client pooled connections re-dial via the stale-retry
@@ -641,29 +655,33 @@ void RdmaServer::Serve(int boot_fd) {
       for (int i = 0; i < 100 && !recv_lease; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         recv_lease =
-            recv_segment_.Allocate(K * slot_size, rdma::kV2DataOffset);
+            recv_segments_.Allocate(K * slot_size, rdma::kV2DataOffset);
       }
     }
     if (!recv_lease) {
+      const auto stats = recv_segments_.stats();
       DFKV_LOG_ERROR(
-          "rdma v2: shared receive segment exhausted; refusing connection "
-          "(need=" +
+          "rdma v2: receive pool exhausted; refusing connection (need=" +
           std::to_string(K * slot_size) +
-          " free=" + std::to_string(recv_segment_.free_bytes()) + ")");
+          " free=" + std::to_string(stats.free_bytes) +
+          " committed=" + std::to_string(stats.committed_bytes) +
+          " max=" + std::to_string(stats.max_bytes) + ")");
       ::close(boot_fd);
       return;
     }
   }
-  rdma::RecvSegment::Lease pull_lease;
+  rdma::RecvSegmentPool::Lease pull_lease;
   if (pull_read_requested) {
     pull_lease =
-        recv_segment_.Allocate(K * slot_size, rdma::kV2DataOffset);
+        recv_segments_.Allocate(K * slot_size, rdma::kV2DataOffset);
     if (!pull_lease) {
+      const auto stats = recv_segments_.stats();
       DFKV_LOG_ERROR(
           "rdma v2: pull-read arena unavailable; refusing negotiated "
-          "connection (need=" +
-          std::to_string(K * slot_size) +
-          " free=" + std::to_string(recv_segment_.free_bytes()) + ")");
+          "connection (need=" + std::to_string(K * slot_size) +
+          " free=" + std::to_string(stats.free_bytes) +
+          " committed=" + std::to_string(stats.committed_bytes) +
+          " max=" + std::to_string(stats.max_bytes) + ")");
       ::close(boot_fd);
       return;
     }
@@ -751,8 +769,8 @@ void RdmaServer::Serve(int boot_fd) {
     ::close(boot_fd);
     return;
   }
-  ibv_mr* recv_segment_mr =
-      ep.RegisterRemoteRegion(recv_segment_.data(), recv_segment_.size());
+  ibv_mr* recv_segment_mr = ep.RegisterRemoteRegion(
+      recv_lease.segment()->data(), recv_lease.segment()->size());
   if (!recv_segment_mr) {
     DFKV_LOG_ERROR("rdma v2: receive-segment MR unavailable on device " +
                    (dev.empty() ? std::string("(auto)") : dev));
@@ -2003,22 +2021,30 @@ std::string RdmaServer::MetricsText() const {
   m(s, "dfkv_rdma_v2_get_continuation_slot_changes_total", "counter",
     "Multi-window GET continuations received on a different WQE slot",
     V2GetContinuationSlotChanges());
-  const rdma::RecvSegment::Stats segment = recv_segment_.stats();
+  const rdma::RecvSegmentPool::Stats segment = recv_segments_.stats();
   m(s, "dfkv_rdma_recv_segment_bytes", "gauge",
-    "Process-wide registered receive-segment bytes", segment.total_bytes);
+    "Receive-pool bytes currently committed", segment.committed_bytes);
+  m(s, "dfkv_rdma_recv_segment_max_bytes", "gauge",
+    "Hard receive-pool commit budget", segment.max_bytes);
+  m(s, "dfkv_rdma_recv_segment_chunks", "gauge",
+    "Receive-pool chunks currently committed", segment.chunks);
   m(s, "dfkv_rdma_recv_segment_used_bytes", "gauge",
-    "Bytes leased from the process-wide receive segment", segment.used_bytes);
+    "Bytes leased from committed receive chunks", segment.used_bytes);
   m(s, "dfkv_rdma_recv_segment_free_bytes", "gauge",
-    "Unleased bytes remaining in the process-wide receive segment",
-    segment.free_bytes);
+    "Unleased bytes in committed receive chunks", segment.free_bytes);
   m(s, "dfkv_rdma_recv_segment_largest_free_range_bytes", "gauge",
-    "Largest contiguous unleased receive-segment range",
+    "Largest contiguous unleased range in any receive chunk",
     segment.largest_free_range);
+  m(s, "dfkv_rdma_recv_segment_growths_total", "counter",
+    "Receive chunks committed after startup", segment.growths);
+  m(s, "dfkv_rdma_recv_segment_growth_failures_total", "counter",
+    "Receive-pool growth attempts rejected by budget or allocation",
+    segment.growth_failures);
   m(s, "dfkv_rdma_recv_segment_allocation_failures_total", "counter",
-    "Receive-segment allocation attempts without a suitable free range",
+    "Receive-pool allocations that remained unsatisfied after growth",
     segment.allocation_failures);
   m(s, "dfkv_rdma_recv_segment_registered_rails", "gauge",
-    "RDMA rails with the process-wide receive segment registered",
+    "RDMA rails with the initial receive chunk registered",
     recv_segment_registered_rails_);
   m(s, "dfkv_rdma_pull_connections", "gauge",
     "Connections currently holding negotiated pull-read arenas",

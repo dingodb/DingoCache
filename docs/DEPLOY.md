@@ -239,13 +239,10 @@ LimitMEMLOCK=infinity        # RDMA 需要锁页内存
 WantedBy=multi-user.target
 ```
 
-> **`--max-msg` 默认 32 MiB（`32ull << 20`），是 client 声明值上限；client 默认
-> `DFKV_RDMA_MAX_BLOCK_BYTES` 为 4 MiB，实际 slot 取 `min(client 声明, server --max-msg)`，默认无需显式设置。**
-> 它是 RDMA receive-segment 单 slot 上限；client 在 DCP2 协商时声明自己的
-> `DFKV_RDMA_MAX_BLOCK_BYTES`（默认 4 MiB）。若 server `--max-msg` < client 声明值，server
-> 拒绝连接（日志 `client declared max block ... above this server's cap ...`），所有 PUT 失败
-> 但 exist 不受影响（不走 max_block 协商）。**不要降低 `--max-msg` 除非同时降低所有 client 的
-> `DFKV_RDMA_MAX_BLOCK_BYTES`。**
+> **`--max-msg` 默认 32 MiB，是 server 接受的逻辑 block 上限；client
+> `DFKV_RDMA_MAX_BLOCK_BYTES` 不得超过它。** client 每次 data Acquire 按当前
+> operation 最大对象选择 power-of-two connection class；逻辑上限不再决定所有
+> QP 的物理 slot。server 小于 client 逻辑声明仍会拒绝连接，避免超限对象被误收。
 >
 > Completion timeout：`DFKV_RDMA_OP_TIMEOUT_MS`（默认 5000）约束单操作；
 > `DFKV_RDMA_BATCH_OP_TIMEOUT_MS`（unset/0 = 跟随前者）覆盖 **所有** multi-item
@@ -262,9 +259,9 @@ WantedBy=multi-user.target
 > - `--ram-flush-threads <n>` / `DFKV_RAM_FLUSH_THREADS`：请求值会提高到至少 shard 数；实际值由 `dfkv_ram_flush_threads` 报告（默认请求=4×盘数，上限 16）。
 > - 微调项（env only）：`DFKV_SLAB_TABLE_SYNC_MS` 控制 table sync 节奏（默认 100 ms，0=关；dirty epoch 重启仍无条件冷重置）。
 > - 微调项（env only）：`DFKV_SLAB_EVICT_HIGH_PCT` / `DFKV_SLAB_EVICT_LOW_PCT`
->   （默认 92 / 88，占容量百分比；high=0 关闭）：水位线主动驱逐在 demand 之前
->   保留 headroom，是满环时 cross-class extent 互抢（自噬）的第一道防线；对应
->   计数器 `dfkv_slab_watermark_evictions_total` / `dfkv_slab_cold_steals_total`。
+>   （默认 92 / 88；high=0 关）使用 persistent hysteresis：越过 high 后持续后台
+>   drain 到 low。每 tick 由 `DFKV_SLAB_EVICT_MAX_EXTENTS_PER_TICK`（默认 1）
+>   限流；整 extent 只做一次连续 slots.tbl clear，避免高水位小写风暴。
 > - `--slab-reclaim-ms <n>` / `--ram-reclaim-ms <n>`（默认 50 / 10，`0`=关）：后台预回收和类再平衡。allocator 按 useful bytes + decayed read heat 选择 donor，跳过 pinned extent；通常保留默认。
 > - `--slab-granularity <bytes>`（默认 1 MiB）：最小 slot 量子。现有 `slots.tbl` 的 format/geometry 不匹配会 fail closed；修改必须换空目录，服务不会原地冷重建或忽略旧数据。
 > - `--put-inflight-limit <n>`（默认 0=关）：并发盘写超过 n 的 PUT 以 kCacheFull 快速拒绝（客户端视为普通 put 失败、不进 cooldown）= 用受控 miss 换掉过载排队尾延迟。RDMA 与 TCP 两条数据路径同受此门约束；RAM 热层的异步 flusher 落盘**不受**此门限制（否则背压会放大为 flush 丢弃）。
@@ -365,14 +362,11 @@ journalctl -u dfkv -n 10 --no-pager
 > `kNoCompatibleRail` 均不增加 local rail error。cooldown 到期仍只准入一个真实
 > recovery probe。
 >
-> **v2 segment 预算**：`slot=align4K(4096 + max_raw_payload)`；
-> pull-read 连接按 receive + source 两个 arena 计量：
-> `segment >= 2 × Σ((live + client-pool-idle) data/control QP × depth × slot)`。
-> lease 保留到 QP 销毁或 idle reclaim，不能只数在飞请求。4 MiB/depth=4
-> 每条 pull data QP 占 33,587,200 B；16 GiB 约容纳 511 条，64 GiB 约
-> 2046 条（未扣 control lease）。上线先看 `dfkv_rdma_recv_segment_used_bytes`、
-> `free_bytes`、`largest_free_range_bytes`、`allocation_failures_total` 和
-> `dfkv_rdma_v2_ready`；free 或最大连续 range 接近一条新 lease 时会拒绝连接。
+> **v2 receive-pool 预算**：每条 data QP 按实际 connection class 计算
+> `slot=align4K(4096 + class)`，pull-read lease 为
+> `2 × depth × slot`。`DFKV_RDMA_RECV_SEGMENT_SIZE` 是 hard budget，
+> `DFKV_RDMA_RECV_CHUNK_BYTES` 是惰性提交粒度。上线看 committed/max/chunks、
+> used/free、growth/allocation failures；只有 hard budget 或注册失败才拒绝连接。
 
 ### 3a. 每节点 tenant quota
 
@@ -469,7 +463,9 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 
 | env | 默认 | 说明 |
 |---|---|---|
-| `DFKV_RDMA_RECV_SEGMENT_SIZE` | `16 GiB`（xb01 `64 GiB`） | server：v2 共享 segment 总大小；pull client 每 data connection 约占 `2 × depth × align4K(4096+max_raw_payload)`，必须为基础连接和 churn 留余量 |
+| `DFKV_RDMA_RECV_SEGMENT_SIZE` | `16 GiB` | server receive-pool hard budget；不再启动期全量分配 |
+| `DFKV_RDMA_RECV_CHUNK_BYTES` | `256 MiB` | server 启动与增量提交粒度 |
+| `DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES` | `256 KiB` | client adaptive data-QP 最小 class；实际对象向上取 power-of-two |
 | `DFKV_RDMA_CONNECT_MS` | — | client：IB QP 建连超时 |
 | `DFKV_RDMA_IO_MS` | — | client：控制面帧读写超时 |
 | `DFKV_RDMA_BATCH_OP_TIMEOUT_MS` | 0=跟随 RDMA_OP | client：multi-item Cache/Range/Exist、SG 窗口总期限 |
@@ -499,7 +495,8 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 
 | env | 默认 | 说明 |
 |---|---|---|
-| `DFKV_SLAB_EVICT_HIGH_PCT` / `DFKV_SLAB_EVICT_LOW_PCT` | `92` / `88`, high=0 关 | 水位线主动驱逐阈值；`dfkv_slab_watermark_evictions_total`/`dfkv_slab_cold_steals_total` 对应 |
+| `DFKV_SLAB_EVICT_HIGH_PCT` / `DFKV_SLAB_EVICT_LOW_PCT` | `92` / `88`, high=0 关 | high crossing latch，后台持续 drain 到 low |
+| `DFKV_SLAB_EVICT_MAX_EXTENTS_PER_TICK` | `1` | 每盘每 tick 最多整 extent 淘汰数；平滑前台尾延迟 |
 | `DFKV_SLAB_COLD_STEAL_WINDOW` | — | 小受害者选择窗口（跨 size class 强占） |
 | `DFKV_SLAB_URING_WRITE` | — | slab io_uring 异步 PUT（需要 `-DDFKV_WITH_URING`） |
 | `DFKV_SLAB_RECLAIM_MS` | `50` | 背景预回收 tick（见 §3） |

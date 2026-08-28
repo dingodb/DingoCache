@@ -151,6 +151,7 @@ class RdmaTransport : public Transport {
   struct AcquireOptions {
     bool force_new = false;
     size_t requested_credits = 1;
+    size_t required_data_bytes = 0;
     RailMask excluded;
     std::shared_ptr<const rdma::PeerRailSnapshot> peer;
   };
@@ -214,6 +215,7 @@ class RdmaTransport : public Transport {
   // never concurrently reused, while operation framing remains self-describing.
   std::unordered_map<std::string, std::vector<Conn*>> pool_;
   // Exist/Remove/Members remain isolated from payload transfers.
+  std::vector<size_t> IdleDataBounds(const std::string& node) const;
   std::unordered_map<std::string, std::vector<Conn*>> control_pool_;
   // Last successfully published caller memory declarations. RegisterMemory
   // holds mu_ through per-rail stage/commit, so Acquire can observe either the
@@ -226,24 +228,22 @@ class RdmaTransport : public Transport {
   // min over rails of (negotiated max_sge) - 1; set once in the ctor.
   size_t sg_payload_segs_ = 29;
   size_t max_payload_;
-  // Maximum block declared during mandatory v2 negotiation. It is both a
-  // protocol bound and receive-segment geometry: each data connection leases
-  // queue_depth * aligned_slot_size from one fixed pinned segment. Inflating
-  // this value reduces connection capacity; understating it deterministically
-  // rejects larger operations. It must therefore be exact and nonzero.
-  // Default 4 MiB (env DFKV_RDMA_MAX_BLOCK_BYTES); capped by max_payload_.
+  // Logical per-object safety bound. Connection receive geometry is selected
+  // independently from the current operation's actual largest object.
+  // DFKV_RDMA_MAX_BLOCK_BYTES remains the deterministic hard rejection limit.
   uint64_t declared_ = 0;
-  size_t OpBound() const {  // per-op payload bound honoring the declaration
+  // Smallest data connection declaration. Larger requests round up to the next
+  // power-of-two class, capped by declared_. Default 256 KiB.
+  size_t connection_min_block_bytes_ = 0;
+  size_t OpBound() const {
     return declared_ ? static_cast<size_t>(declared_) : max_payload_;
   }
-  // Largest block this client has actually handed to the transport. Operators
-  // use the high-water mark to choose a tight DCP2 declaration: smaller slots
-  // admit more concurrent v2 connections into the fixed shared segment, while
-  // oversize operations must remain a deterministic client-side rejection.
+  size_t ConnectionBound(size_t required) const;
+  // Largest block this client has actually handed to the transport.
   mutable std::atomic<uint64_t> max_block_seen_{0};
   mutable std::atomic<uint64_t> oversize_rejects_{0};
   // Records n as a candidate high-water mark and reports whether it exceeds the
-  // declaration. Returns true for an oversized block (caller marks it kInvalid).
+  // logical bound. Returns true for an oversized block.
   bool NoteBlock(size_t n) const;
   size_t depth_;
   int connect_ms_ = 3000;             // bootstrap TCP connect timeout (DFKV_RDMA_CONNECT_MS)

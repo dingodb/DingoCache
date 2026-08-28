@@ -161,18 +161,20 @@ Production discovery uses MDS.
 
 ### 4.1 RDMA v2 resource and failure invariants
 
-- `RdmaServer::Start` allocates one aligned `RecvSegment` per process, then
-  registers it once on every anchored rail's shared PD. Every endpoint on that
-  rail reuses the same MR; endpoint close drops only its shared-device reference.
-- DCP2 advertises the client's exact `DFKV_RDMA_MAX_BLOCK_BYTES`. The server
-  validates it against `--max-msg`, negotiates `qd=min(client depth, server depth)`,
-  and leases `qd` contiguous slots. The connection keeps that lease—including
-  while idle in the client pool—until QP teardown or idle reclaim.
-- A data slot is `align4K(4096 + declared_block)`: 4 KiB of wire-prefix space
-  plus the declared maximum raw payload, with no value-envelope allowance.
-  Segment sizing must cover every live and pooled data/control QP across all
-  client ranks/processes, not only currently in-flight operations. Exhaustion
-  rejects the connection; it is never reinterpreted as another protocol.
+- `RdmaServer::Start` commits one aligned receive chunk. Additional chunks are
+  committed on allocation misses up to `DFKV_RDMA_RECV_SEGMENT_SIZE`; only the
+  chunk leased by a connection is registered on that endpoint's rail.
+- `DFKV_RDMA_MAX_BLOCK_BYTES` is the logical object safety ceiling. Each data
+  connection advertises `next_power_of_two(max(actual operation bytes,
+  DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES))`, capped by that ceiling.
+- The server validates each connection class against `--max-msg`, negotiates
+  `qd=min(client depth, server depth)`, and leases `qd` receive plus `qd` pull
+  slots from any committed chunk. Idle reuse chooses the smallest sufficient
+  class; lease ownership lasts until QP teardown or idle reclaim.
+- A data slot is `align4K(4096 + connection_class)`. The hard receive budget
+  covers worst-case live and pooled QPs, but resident/pinned memory follows the
+  observed connection high-water in `DFKV_RDMA_RECV_CHUNK_BYTES` increments.
+  Exhausting the hard budget rejects the connection without changing protocol.
 - Client host/device pools are registered once per rail at declaration time.
   Re-declaring the same base with a larger size registers the larger extent; the
   registration call returns false/nonzero unless the full range is ready. Buffers
@@ -403,7 +405,7 @@ data plane or the connection fails.
 | RAM tier lock shards | `--ram-tier-shards` / `DFKV_RAM_TIER_SHARDS` | 8 | 1-64; auto-halved while a shard would hold <32 extents |
 | read convoy/direct promotion | `DFKV_READ_COALESCE=1` | off | collapses identical reads; with RAM + io_uring, whole-value disk misses read directly into a hidden registered arena reservation |
 | RDMA transport | build `-DDFKV_WITH_RDMA=ON`, `DFKV_RDMA=1` | TCP | active-HCA discovery; `DFKV_RDMA_DEV` is an optional whitelist |
-| RDMA v2 | `DFKV_RDMA=1` | TCP when RDMA was not requested | bounded 32,786-byte control buffers (32-KiB Members data) + mandatory shared registered receive segment |
+| RDMA v2 | `DFKV_RDMA=1` | TCP when RDMA was not requested | bounded control buffers + adaptive data-QP classes + lazily committed receive chunks |
 | io_uring async GET | build `-DDFKV_WITH_URING`; `DFKV_SERVER_URING=0` disables | on when built, unavailable otherwise | RDMA v2 disk-read path |
 | first-request absolute deadline | `DFKV_TCP_FIRST_REQ_MS` / `DFKV_MDS_FIRST_REQ_MS` / `DFKV_METRICS_FIRST_REQ_MS` | 30000 ms; `0` = off | anchored at accept: the first complete frame/request line is due within this window, so a drip feeder cannot pin a handler thread; `dfkv_server` also publishes its resolved value as the `dfkv_tcp_first_req_ms` gauge |
 | MDS legacy control-plane shim | `DFKV_MDS_ACCEPT_LEGACY=1` | off (strict epoch gate) | widens the MDS control-plane version gate by exactly one epoch so v1.x peers are served with legacy 42/10-byte framing during a mixed-generation migration; data-plane listeners stay strictly epoch 6/7; drop the env once `dfkv_mds_legacy_frames_total` drains to zero |

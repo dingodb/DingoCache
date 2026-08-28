@@ -84,10 +84,12 @@ tp_rank=..,ver=<lib>`（无 `role`——HiCache 是前缀 L3 缓存，无生产/
 |-----|------|------|------|
 | `DFKV_RDMA` | 一般路径未设 = TCP；**vLLM 直连无默认，必须 `1`** | 按连接器选择 | `1` 显式选择 native-verbs RDMA v2；请求 RDMA 后设备或协议不可用会失败，不会自动选择 TCP。`DfkvStoreConnector` 只接收 GPU 设备指针，构造时会关闭并拒绝任何非 RDMA handle。 |
 | `DFKV_RDMA_DEV` | 首个 `ACTIVE` 本地 HCA | 留空让两端各自选本地首口；多轨才显式写同 fabric 白名单 | 留空时 bootstrap 不发送设备名，client/server 可使用不同本地命名。逗号列表显式开启多轨，新连接在健康轨间轮转；显式设备名会发给 peer，故两端必须存在同名且互通的 fabric。设备名上限 **18 字节**（v2 bootstrap dev frame 限制），超长即 fail-fast 拒绝启动/建连，不会静默截断（见 `src/transport/dev_frame.h`）。 |
-| `DFKV_RDMA_DEPTH` | `4` | 两侧可不同，按容量选 | 握手协商 `min(client,server)` 作为安全窗口。每连接注册 `2 × depth × (18 B + 32 KiB)` 的有界 SEND/RECV control buffer；pull-read 连接还从共享 segment 各租 `depth` 个 receive slot 和 source slot。 |
-| `DFKV_RDMA_MAX_BLOCK_BYTES` | 4 MiB 安全上限 | 按连接器块几何精确设置 | DCP2 声明本连接最大 PUT/GET block，决定共享 segment 的 slot 大小；超声明请求在客户端失败且不上 wire。声明越准，同一 segment 可容纳的 live/pooled v2 连接越多。 |
-| `DFKV_RDMA_RECV_SEGMENT_SIZE` | 16 GiB | 按下文 live/pooled 连接公式设置；xb01 为 64 GiB | server 启动时申请，并在每个选中 rail 的共享 PD 上注册；失败会拒绝启动，segment 无可用 lease 时拒绝新连接。 |
-| `DFKV_RDMA_NUMA` | `0` | 显式多轨的大机可设 `1` | 建连时按调用线程 NUMA 选本地 rail（无本地 rail→轮转白名单），server serve 线程跟随 QP rail。单块共享 receive segment 不做 per-rail NUMA 分配；仅保证选轨/线程亲和。 |
+| `DFKV_RDMA_DEPTH` | `4` | 两侧可不同，按容量选 | 握手协商 `min(client,server)`。每条 pull data QP 租 `2 × depth × adaptive_slot`；control buffer 始终有界。 |
+| `DFKV_RDMA_MAX_BLOCK_BYTES` | 4 MiB 逻辑上限 | 覆盖最大合法对象 | 只做 deterministic oversize guard；不再让所有连接按最大值预留。 |
+| `DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES` | 256 KiB | 覆盖常见小块，保持默认起步 | 当前操作最大对象按 power-of-two 向上取 connection class；idle pool 选最小可满足 QP。 |
+| `DFKV_RDMA_RECV_SEGMENT_SIZE` | 16 GiB | 按 peak live/pooled QP 设 hard budget | server receive-pool 最大提交量；不再启动期全量申请。 |
+| `DFKV_RDMA_RECV_CHUNK_BYTES` | 256 MiB | 保持默认，除非常见 connection class 更大 | server 启动只提交一个 chunk，后续 allocation miss 按需增长，不超过 hard budget。 |
+| `DFKV_RDMA_NUMA` | `0` | 显式多轨的大机可设 `1` | 建连按调用线程 NUMA 选 rail；动态 chunk 在实际租用它的 endpoint rail 上注册。 |
 | `DFKV_RDMA_MAX_PAYLOAD_BYTES` | 64 MiB（67108864） | — | 客户端单 value payload 上限（不得超过 server 侧同名上限） |
 | `DFKV_CUDA_PINNED_POOL_BYTES` | 64 MiB（67108864） | 按进程允许的 CUDA pinned host memory / memlock 设置 | vLLM CUDA GET publication 的进程级 bounce pool 预算。取正十进制字节数，最大 4 GiB；预算向下取整为完整 slot，且至少容纳一个 slot、最多 4096 个。非法或与 slot 不兼容的组合告警并回退整组默认值。slot 按需创建，因此实际 pinned high-water 不超过取整后的预算。 |
 | `DFKV_CUDA_PINNED_SLOT_BYTES` | 4 MiB（4194304） | 保持能容纳常见单块；不必按最大 payload 预分配 | 固定 publication slot 大小，取 4 KiB–64 MiB 的正十进制字节数。非法值告警并回退默认 sizing。大 payload 按 slot 大小分块发布，不要求一个 payload 对应一个 slot。 |
@@ -120,30 +122,36 @@ memory 留余量。pool acquisition、pin/register、CUDA copy 或 stream sync �
 归还后释放其余 pool slot 并记录 driver 释放错误；`fork()` 后的 child 拒绝使用
 parent 继承的 CUDA pool 状态。
 
-#### 1.2.1 `DFKV_RDMA_MAX_BLOCK_BYTES` 怎么定（含 L2 / L2-bypass 两套公式）
+#### 1.2.1 逻辑块上限、connection class 与 receive budget
 
-这个值在 **v2** 决定共享 receive segment 的 slot 大小：
-`align4K(4 KiB + 声明的最大 raw payload)`。每条 pull-read 数据连接分别租
-`depth` 个 receive slot 和 source slot；所有连接共享一块启动期注册的
-`DFKV_RDMA_RECV_SEGMENT_SIZE`，因此声明保持精确仍有价值。
+`DFKV_RDMA_MAX_BLOCK_BYTES` 是逻辑安全上限。每次 data Acquire 取当前
+scalar/batch/SG 操作里的最大对象，计算：
 
-**共享 segment 容量必须按连接寿命算，不是按同时在飞请求算。** 数据 QP 的
-slot 为
-
-```
-S_data = align4K(4096 + DFKV_RDMA_MAX_BLOCK_BYTES)
-S_control = align4K(4096 + (18 + 32768)) = 40960
-B_required >= 2 × (N_data × depth × S_data
-                    + N_control × depth × S_control)
+```text
+connection_class =
+  min(logical_max,
+      next_power_of_two(max(actual_bytes,
+                            DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES)))
+S_data = align4K(4096 + connection_class)
+B_connection = 2 × depth × S_data
 ```
 
-`N_data` / `N_control` 是该 server 上所有 rank、进程的**峰值 live + client
-pool 中空闲连接**；lease 一直保留到 QP 被销毁或 `DFKV_RDMA_IDLE_MS` 回收，
-线程峰值留下的 pooled QP 也要计入。4 MiB 声明、depth=4 时每条 pull data
-QP 占 33,587,200 B；16 GiB 最多约 511 条、64 GiB 约 2046 条（均未扣
-control lease）。上线同时观察
-`dfkv_rdma_recv_segment_free_bytes` 与 `dfkv_rdma_v2_ready`；free 接近 0
-即扩容或缩小声明/depth/pool，避免新连接被拒绝。
+同一 peer/rail 的 idle pool 选择最小可满足 class；没有才建新 QP。pool 满时，
+较小返回连接可替换最大的 idle QP。偶发大对象因此只放大自己的连接，不放大所有
+rank/process 的常驻连接。
+
+server receive pool 以 `DFKV_RDMA_RECV_CHUNK_BYTES` 惰性提交，累计不超过
+`DFKV_RDMA_RECV_SEGMENT_SIZE`。预算仍按所有 rank/process 的 peak live +
+pooled QP 规划：
+
+```text
+B_required >= Σ B_connection(actual class)
+```
+
+上线观察 committed/max/chunks/used/free/growth failures。hard budget 耗尽才拒绝
+新连接；增大 bootstrap timeout 不会增加容量。
+
+块大小公式仍用于确定 logical max，但无需把该最大值代入每条 QP：
 
 **块大小取决于走哪条路径**——两条路径的分块规则不同：
 
@@ -568,20 +576,19 @@ device segment 分组，不写入 namespace 或 raw value。
 
 #### 冷连接池
 
-server 启动期会注册 process-wide receive segment；新 data QP 只创建小
-control buffers 并租 `depth × slot` 的 offset，不会为每连接注册
-`qd × block`。若首轮连接失败，检查 `dfkv_rdma_v2_ready`、receive segment
-free bytes、每轨注册状态和 server 协商日志；不要用增大握手超时掩盖共享
-segment 容量或注册失败。
+server 启动只注册首个 receive chunk；新 data QP 租当前 operation class 对应的
+`depth × slot`，需要时再提交 chunk。若首轮连接失败，检查
+`dfkv_rdma_recv_segment_{bytes,max_bytes,chunks,free_bytes,growth_failures_total}`
+和 `dfkv_rdma_v2_ready`；不要用增大握手超时掩盖 hard budget 或 HCA 注册失败。
 
 #### 服务端
 
-L2-bypass 不需要独立 server 协议，但两项决定 v2 容量：
+L2-bypass 不需要独立 server 协议，但三项决定 v2 容量：
 
-- `DFKV_RDMA_RECV_SEGMENT_SIZE`：按 §1.2.1 的 peak live/pooled QP 公式；
-  观察 `dfkv_rdma_recv_segment_free_bytes` 和 `dfkv_rdma_v2_ready`
-- `DFKV_RDMA_MAX_BLOCK_BYTES` + `DFKV_RDMA_DEPTH`：共同决定每 QP 的 lease；
-  声明要覆盖原版 L2 的较大整页对象，且总 lease 必须纳入共享 segment 预算。
+- `DFKV_RDMA_RECV_SEGMENT_SIZE`：receive-pool hard budget；
+- `DFKV_RDMA_RECV_CHUNK_BYTES`：启动/增量提交粒度；
+- `DFKV_RDMA_MAX_BLOCK_BYTES`、`DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES` 与
+  `DFKV_RDMA_DEPTH`：分别决定逻辑上限、最小 class 和每 QP lease。
 
 #### 验证清单
 

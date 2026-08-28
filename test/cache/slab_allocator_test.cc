@@ -320,6 +320,37 @@ TEST(SlabAllocator, EvictColdToTargetFreesGloballyColdestFirst) {
   EXPECT_TRUE(a.Contains(Key("k31"))) << "newest data must survive proactive eviction";
 }
 
+TEST(SlabAllocator, WholeExtentCallbackReplacesPerSlotMetadataClears) {
+  auto options = Opts(4 * 4096, 2);
+  uint32_t extent_calls = 0;
+  uint32_t slot_calls = 0;
+  uint32_t cleared_residents = 0;
+  options.on_extent_evict =
+      [&](uint32_t, uint32_t total_slots, uint32_t residents) {
+        ++extent_calls;
+        EXPECT_EQ(total_slots, 4u);
+        cleared_residents += residents;
+        return true;
+      };
+  options.on_slot_evict = [&](const SlotRef&) {
+    ++slot_calls;
+    return true;
+  };
+  SlabAllocator allocator(options);
+  std::vector<BlockKey> evicted;
+  SlotRef ref;
+  for (int i = 0; i < 8; ++i)
+    ASSERT_TRUE(allocator.Put(Key("k" + std::to_string(i)), 4096,
+                              &ref, &evicted));
+
+  evicted.clear();
+  EXPECT_EQ(allocator.EvictColdToTarget(0, 1, &evicted), 1u);
+  EXPECT_EQ(extent_calls, 1u);
+  EXPECT_EQ(slot_calls, 0u);
+  EXPECT_EQ(cleared_residents, 4u);
+  EXPECT_EQ(evicted.size(), 4u);
+}
+
 TEST(SlabAllocator, EvictColdToTargetRespectsPinsAndTarget) {
   SlabAllocator a(Opts(4 * 4096, 4));  // 4 extents, 16 slots
   std::vector<BlockKey> ev;
