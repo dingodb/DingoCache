@@ -750,7 +750,7 @@ namespace/key 不一致是预期 cold miss。**空环 / MDS 不可达**可直接
 
 | env | 默认 | 推荐 | 说明 |
 |---|---|---|---|
-| `DFKV_RDMA` / `DFKV_RDMA_DEV` | **无；`DFKV_RDMA=1` 必填** | `1` / 本机有序全轨列表 | vLLM GPU 指针连接器仅支持 RDMA；`rail_affinity=true` 时 connector 在每个 worker 内收窄列表 |
+| `DFKV_RDMA` / `DFKV_RDMA_DEV` | 无 | `1` / 本机有序全轨列表 | 默认 `require_rdma=true` 时必须启用可用 RDMA；显式 `require_rdma=false` 可用 TCP staging，`rail_affinity=true` 时 connector 在每个 worker 内收窄 rail 列表 |
 | `DFKV_RDMA_DEPTH` | `4` | 保持生产已验证值 | depth-flat（§1.2） |
 | `DFKV_RDMA_NUMA` | `0` | affinity 开启时保持 `0` | connector 为严格 primary/fallback 映射显式设置 0；affinity 关闭时才按需启用 NUMA 动态选轨 |
 | `DFKV_LIB` / `DFKV_BUILD` | — | so 路径 | 被 extra_config `lib` 覆盖 |
@@ -767,12 +767,13 @@ namespace/key 不一致是预期 cold miss。**空环 / MDS 不可达**可直接
 | `mds_endpoints` | — | `ip:port,...`（dfkv_mds 层） | **生产首选**；设了即走 MDS 动态发现，省略 `members` |
 | `mds_group` | `default` | 如 `glm` | MDS 成员组名，= `dfkv_server --group` |
 | `mds_poll_ms` | `3000` | 默认即可 | MDS 轮询间隔（ms） |
-| `members` | —（与 mds_endpoints 二选一） | `n=ip:rdma-port,...` | **端口 = server `--rdma-port`** |
+| `members` | —（与 mds_endpoints 二选一） | `n=ip:port,...` | `require_rdma=true` 时端口 = server `--rdma-port`；`false` 时端口 = server `--port` |
+| `require_rdma` | `True` | 生产保持 True | `False` 显式允许 TCP host staging + CUDA publication；保留正确性但失去 GPUDirect zero-copy，适合 inbound RDMA GET 不可用时降级 |
 | `lib` | env 兜底 | so 绝对路径 | |
 | `batch_concurrency` | `8` | **大池可调高到 ≈ 节点数** | 跨节点 fan-out，**真正的吞吐杠杆**（depth 是平的） |
 | `rail_affinity` | `False` | 多 rank、多 rail 生产设 `true` | 按 vLLM world-group per-host `local_rank` 选择 primary；在 native client 创建前设置每进程独立 rail 环境 |
 | `rail_affinity_fallbacks` | `1` | `1` | 相邻有序 fallback 数；`0`=严格单 rail，超出可用 rail 数时自动收敛 |
-| `load_async` | `True` | 保持 True | 异步 load，走 `WAITING_FOR_REMOTE_KVS`、不占关键路径 |
+| `load_async` | `True` | 普通 attention 保持 True；hybrid recurrent 模型设 `False` | `False` 在 forward 前同步完成 load，避免 recurrent-state compute 与远端 GPU 写重叠 |
 | `transfer_queue_capacity` | `256` | 保持默认，按压测调 | 每个 worker、每个方向的排队上限（`1..65536`）。满队列时非阻塞拒绝新任务：save 立即释放 finish/free fence，load 标记失败并重算；非法值启动即失败。 |
 | `enable_cross_layers_blocks` | `False` | 默认 False | 仅当引擎分页布局层内交错时开 |
 | `lookup_rpc_port` | ipc 自动 | 一般不设 | rank0 前缀查询 RPC，仅 socket 名冲突时设 |

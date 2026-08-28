@@ -103,7 +103,7 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
     def _validate_kv_cache_config(
         vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
     ) -> None:
-        from vllm.v1.kv_cache_interface import CrossAttentionSpec, MambaSpec
+        from vllm.v1.kv_cache_interface import CrossAttentionSpec
 
         unsupported: list[str] = []
         cache_block_size = vllm_config.cache_config.block_size
@@ -111,13 +111,6 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
             spec = g.kv_cache_spec
             if isinstance(spec, CrossAttentionSpec):
                 unsupported.append(f"group {g_idx}: CrossAttentionSpec")
-            # Enforce Mamba align mode
-            if isinstance(spec, MambaSpec) and spec.block_size != cache_block_size:
-                unsupported.append(
-                    f"group {g_idx}: MambaSpec with block_size="
-                    f"{spec.block_size} != cache_config.block_size="
-                    f"{cache_block_size} (mamba_cache_mode != 'align')"
-                )
         # NOTE: multi-group (hybrid attention, e.g. GLM-5.2 DSA = MLA + sparse
         # indexer groups) together with PCP/DCP > 1 is now supported: each group
         # is normalized to scheduler_block_size in the worker and every rank

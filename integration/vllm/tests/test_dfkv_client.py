@@ -82,6 +82,44 @@ def test_constructs_fully_configured_v2_client(monkeypatch):
     assert captured["close_calls"] == 1
 
 
+def test_explicit_tcp_staging_mode_is_allowed(monkeypatch):
+    closed = []
+
+    class FakeLib:
+        def dfkv_open_v2(self, _ptr):
+            return 0xBEEF
+
+        def dfkv_transport_mode(self, _handle):
+            return b"tcp(rdma-not-requested)"
+
+        def dfkv_version(self):
+            return b"2.0.0"
+
+        def dfkv_close(self, handle):
+            closed.append(handle)
+
+    monkeypatch.setattr(client_module, "load_lib", lambda _path: FakeLib())
+    monkeypatch.setattr(
+        client_module._push_metrics, "configure", lambda *a, **k: None)
+    monkeypatch.setattr(
+        client_module._push_tracing, "configure", lambda *a, **k: None)
+    monkeypatch.setattr(client_module._alog, "configure", lambda *a, **k: None)
+    monkeypatch.setattr(client_module._hot_config, "register", lambda *a, **k: None)
+    monkeypatch.setattr(client_module._hot_config, "start", lambda *a, **k: None)
+    monkeypatch.setattr(client_module._hot_config, "stop", lambda *a, **k: None)
+    monkeypatch.setenv("DFKV_CLIENT_STATS_POLL_S", "0")
+
+    client = DfkvDeviceClient(
+        members="n1=127.0.0.1:28000",
+        key_namespace=b"dfkv/model/v1/test/tcp-staging",
+        require_rdma=False,
+    )
+
+    assert client.transport_mode == "tcp(rdma-not-requested)"
+    client.close()
+    assert closed == [0xBEEF]
+
+
 def test_telemetry_setup_failure_releases_handle_and_lifecycle(monkeypatch):
     calls = []
 

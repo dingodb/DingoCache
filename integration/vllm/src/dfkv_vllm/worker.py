@@ -1540,6 +1540,7 @@ class DfkvStoreWorker:
             client_info=client_info,
             model=model_identity,
             cache_role=str(self.kv_role),
+            require_rdma=_tcfg.truthy(extra.get("require_rdma", True)),
         )
         # Phase 2a (issue #111): producer non-participants skip the client
         # (opt-in via DFKV_CONNECTOR_CLIENT_ELIDE=1; layout-clamped). The saved
