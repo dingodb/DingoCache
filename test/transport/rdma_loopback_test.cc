@@ -133,6 +133,16 @@ class RdmaTransportTestPeer {
     return found == transport->pool_.end() ? 0 : found->second.size();
   }
 
+  static size_t ConnectionBound(const RdmaTransport& transport,
+                                size_t required) {
+    return transport.ConnectionBound(required);
+  }
+
+  static std::vector<size_t> IdleDataBounds(
+      RdmaTransport* transport, const std::string& node) {
+    return transport->IdleDataBounds(node);
+  }
+
   static uint64_t PeerPublication(const RdmaTransport& transport,
                                   const std::string& node) {
     return transport.peer_topologies_->Snapshot(node)->publication;
@@ -206,8 +216,8 @@ class ScopedEnv {
 
 std::string SelfHdr() { return "test/model"; }
 void ConfigureTestRecvSegment() {
-  // Keep Soft-RoCE CI below modest RLIMIT_MEMLOCK. Production defaults to
-  // 2 GiB, but these fixtures use 256-KiB blocks and need only a small segment.
+  // Keep Soft-RoCE CI below modest RLIMIT_MEMLOCK. Production commits a
+  // 256-MiB initial chunk under a 16-GiB budget; fixtures need only 32 MiB.
   ::setenv("DFKV_RDMA_RECV_SEGMENT_SIZE", "33554432", 0);
 }
 
@@ -3343,6 +3353,75 @@ TEST(RdmaLoopback, DeclaredCapsRoundTripAndClientSideBound) {
   EXPECT_FALSE(c.Put("caps-over", big.data(), big.size()));
   ASSERT_TRUE(c.Get("caps-ok", got.data(), got.size())) << "conn must survive the rejected op";
   EXPECT_EQ(got, v);
+}
+
+TEST(RdmaLoopback, DataConnectionsUseActualBlockSizeClasses) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv max_block("DFKV_RDMA_MAX_BLOCK_BYTES", "262144");
+  ScopedEnv min_block("DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES", "4096");
+  RdmaNode node("adaptive-classes");
+  RdmaTransport transport(kMaxMsg);
+  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+
+  std::string small(4000, 's');
+  ASSERT_TRUE(client.Put("small", small.data(), small.size()));
+  EXPECT_EQ(RdmaTransportTestPeer::IdleDataBounds(&transport, node.addr),
+            (std::vector<size_t>{4096}));
+
+  std::string large(60 * 1024, 'l');
+  ASSERT_TRUE(client.Put("large", large.data(), large.size()));
+  EXPECT_EQ(RdmaTransportTestPeer::IdleDataBounds(&transport, node.addr),
+            (std::vector<size_t>{4096, 65536}));
+
+  std::string got(small.size(), '\0');
+  ASSERT_TRUE(client.Get("small", got.data(), got.size()));
+  EXPECT_EQ(got, small);
+  EXPECT_EQ(RdmaTransportTestPeer::IdleDataBounds(&transport, node.addr),
+            (std::vector<size_t>{4096, 65536}));
+  EXPECT_EQ(RdmaTransportTestPeer::ConnectionBound(transport, 1), 4096u);
+  EXPECT_EQ(RdmaTransportTestPeer::ConnectionBound(transport, 5000), 8192u);
+  EXPECT_EQ(RdmaTransportTestPeer::ConnectionBound(transport, 60 * 1024),
+            65536u);
+}
+
+TEST(RdmaLoopback, ServerReceivePoolCommitsChunksOnDemand) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv recv_max("DFKV_RDMA_RECV_SEGMENT_SIZE", "4194304");
+  ScopedEnv recv_chunk("DFKV_RDMA_RECV_CHUNK_BYTES", "1048576");
+  ScopedEnv max_block("DFKV_RDMA_MAX_BLOCK_BYTES", "65536");
+  ScopedEnv min_block("DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES", "4096");
+  RdmaNode node("lazy-recv-pool");
+
+  std::vector<std::unique_ptr<RdmaTransport>> transports;
+  std::vector<std::unique_ptr<KVClient>> clients;
+  std::string value(60 * 1024, 'p');
+  for (int i = 0; i < 4; ++i) {
+    auto transport = std::make_unique<RdmaTransport>(kMaxMsg);
+    auto client = std::make_unique<KVClient>(
+        std::vector<std::pair<std::string, std::string>>{
+            {"n", node.addr}},
+        SelfHdr(), transport.get());
+    ASSERT_TRUE(client->Put("pool-" + std::to_string(i),
+                            value.data(), value.size()));
+    transports.push_back(std::move(transport));
+    clients.push_back(std::move(client));
+  }
+
+  const std::string metrics = node.rsrv->MetricsText();
+  const long chunks =
+      CounterVal(metrics, "dfkv_rdma_recv_segment_chunks");
+  EXPECT_GE(chunks, 3);
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_recv_segment_max_bytes"),
+            4 * 1024 * 1024);
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_recv_segment_bytes"),
+            chunks * 1024 * 1024);
+  EXPECT_EQ(CounterVal(metrics,
+                       "dfkv_rdma_recv_segment_growths_total"),
+            chunks - 1);
+  EXPECT_EQ(CounterVal(
+                metrics,
+                "dfkv_rdma_recv_segment_growth_failures_total"),
+            0);
 }
 
 // With no explicit override, DCP2 declares the transport's safe global cap;

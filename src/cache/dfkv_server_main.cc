@@ -76,7 +76,8 @@ int main(int argc, char** argv) {
       "  --slab-table-sync-ms <n>  slab table sync cadence ms (env DFKV_SLAB_TABLE_SYNC_MS)\n"
       "  --slab-reclaim-ms <n>  slab background free-slot reclaimer cadence ms, 0 = off (env DFKV_SLAB_RECLAIM_MS)\n"
       "  --ram-reclaim-ms <n>   RAM tier background reclaimer cadence ms, 0 = off (env DFKV_RAM_RECLAIM_MS)\n"
-      "  --rdma-recv-segment-size <n>  RDMA v2 shared receive segment bytes (default 16 GiB; env DFKV_RDMA_RECV_SEGMENT_SIZE)\n"
+      "  --rdma-recv-segment-size <n>  RDMA receive-pool hard budget (default 16 GiB; env DFKV_RDMA_RECV_SEGMENT_SIZE)\n"
+      "  --rdma-recv-chunk-bytes <n>  lazy receive-pool chunk bytes (default 256 MiB; env DFKV_RDMA_RECV_CHUNK_BYTES)\n"
       "  --disk-hash-weight <n>  per-disk vnode multiplier (default 10; env DFKV_DISK_HASH_WEIGHT)\n"
       "  --read-coalesce <0|1>  read-side convoy merge + RAM promotion (default off; env DFKV_READ_COALESCE)\n"
       "  --log <level>        log level: INFO|DEBUG|WARN|ERROR (env DFKV_LOG)\n"
@@ -102,7 +103,8 @@ int main(int argc, char** argv) {
                    "--ram-tier-numa", "--ram-tier-shards", "--slab-table-sync-ms",
                    "--slab-reclaim-ms", "--ram-reclaim-ms", "--log",
                    "--mds-registration-timeout-ms", "--max-msg",
-                   "--rdma-recv-segment-size", "--disk-hash-weight", "--read-coalesce"});
+                   "--rdma-recv-segment-size", "--rdma-recv-chunk-bytes",
+                   "--disk-hash-weight", "--read-coalesce"});
   std::string dir = args.Get("--dir", "/tmp/dfkv_node");
   std::string rdma_dev = args.Get("--rdma-dev", "");
   std::string mds = args.Get("--mds", "");
@@ -190,10 +192,13 @@ int main(int argc, char** argv) {
   std::string ram_tier_shards = args.Get("--ram-tier-shards", "");
   if (!ram_tier_shards.empty())
     ::setenv("DFKV_RAM_TIER_SHARDS", ram_tier_shards.c_str(), 1);
-  // RDMA v2 receive segment size (shared receive buffer pool; default 2 GiB).
+  // RDMA v2 receive-pool budget and lazy commit chunk.
   std::string recv_seg = args.Get("--rdma-recv-segment-size", "");
   if (!recv_seg.empty())
     ::setenv("DFKV_RDMA_RECV_SEGMENT_SIZE", recv_seg.c_str(), 1);
+  std::string recv_chunk = args.Get("--rdma-recv-chunk-bytes", "");
+  if (!recv_chunk.empty())
+    ::setenv("DFKV_RDMA_RECV_CHUNK_BYTES", recv_chunk.c_str(), 1);
   // Disk hash weight — per-disk vnode multiplier (default 10; was 1).
   std::string disk_hash_weight = args.Get("--disk-hash-weight", "");
   if (!disk_hash_weight.empty())

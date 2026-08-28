@@ -158,14 +158,16 @@ RDMA-listener scrape inventory。
 | `dfkv_rdma_active_conns` | gauge | 当前服务中的 RDMA 连接 |
 | `dfkv_rdma_v2_conns_opened_total` | counter | server 累计打开的 v2 连接 |
 | `dfkv_rdma_v2_put_writes_total` / `dfkv_rdma_v2_get_writes_total` | counter | server 实际收到的 `WRITE_WITH_IMM` PUT / 实际发出的 RDMA WRITE GET payload |
-| `dfkv_rdma_recv_segment_bytes` / `used_bytes` / `free_bytes` | gauge | process-wide segment 总量、当前 lease 占用、未租字节 |
-| `dfkv_rdma_recv_segment_largest_free_range_bytes` | gauge | 最大连续 free range；明显小于 free 总量表示碎片导致大 lease 失败 |
-| `dfkv_rdma_recv_segment_allocation_failures_total` | counter | allocator 找不到满足大小/对齐的连续 range 次数（含 admission retry） |
+| `dfkv_rdma_recv_segment_bytes` / `max_bytes` / `chunks` | gauge | receive-pool 当前提交量 / hard budget / 已提交 chunk 数 |
+| `dfkv_rdma_recv_segment_used_bytes` / `free_bytes` | gauge | 已提交 chunk 中 lease 占用 / 空闲字节 |
+| `dfkv_rdma_recv_segment_largest_free_range_bytes` | gauge | 任一 chunk 最大连续 free range |
+| `dfkv_rdma_recv_segment_growths_total` / `growth_failures_total` | counter | 启动后 chunk 增长成功 / 因预算或分配失败 |
+| `dfkv_rdma_recv_segment_allocation_failures_total` | counter | grow 后仍无法满足的最终 allocation |
 | `dfkv_rdma_pull_connections` / `dfkv_rdma_legacy_connections` | gauge | 当前 pull-read / legacy responder-write connection 数 |
-| `dfkv_rdma_connection_bytes{class=\"data|control\"}` | gauge | data/control connection 当前持有的 recv+pull lease 字节 |
-| `dfkv_rdma_recv_segment_registered_rails` | gauge | 成功把共享 segment 注册到 shared PD 的 rail 数 |
-| `dfkv_rdma_v2_ready` | gauge | shared receive segment 是否已建立 |
-| `dfkv_rdma_segment_evictions_total` / `dfkv_rdma_idle_reclaims_total` | counter | segment 压力淘汰 / idle timeout 回收连接 |
+| `dfkv_rdma_connection_bytes{class=\"data|control\"}` | gauge | data/control connection 当前 lease 字节；应随 adaptive class 而非 logical max 增长 |
+| `dfkv_rdma_recv_segment_registered_rails` | gauge | 成功注册初始 receive chunk 的 rail 数；后续 chunk 按使用 rail 惰性注册 |
+| `dfkv_rdma_v2_ready` | gauge | 初始 receive chunk 与 rail anchor 是否就绪 |
+| `dfkv_rdma_segment_evictions_total` / `dfkv_rdma_idle_reclaims_total` | counter | hard budget 压力淘汰 / idle timeout 回收连接 |
 | `dfkv_uring_reads_total` / `dfkv_uring_init_fallbacks_total` | counter | io_uring 路径实际读 / 初始化失败回退同步连接数 |
 | `dfkv_rdma_rail_active_conns{dev}` | gauge | 每个本地 HCA 上当前连接数 |
 | `dfkv_rdma_rail_completions_total{dev}` / `dfkv_rdma_rail_completion_errors_total{dev}` | counter | 每 rail 请求完成 / 错误完成 |
@@ -176,10 +178,8 @@ RDMA-listener scrape inventory。
 > `configured == initialized == dfkv_rdma_recv_segment_registered_rails`。
 > 启动 `ACTIVE` 只是快照；运行期以
 > `dfkv_server_rdma_rails_active` 和逐设备 healthy 为准。active≥1 时
-> `dfkv_server_ring_eligible=1`；`active < initialized` 是 `PARTIAL`，不是整节点
-> 故障。active=0 必须立即退环，恢复到非零在 sample streak 后重新 eligible。
-> 随后确认 client/server QP 与 PUT/GET write counter 增长、
-> `dfkv_rdma_v2_ready=1` 且 receive-segment free bytes 有余量。
+> `dfkv_server_ring_eligible=1`。同时要求 `dfkv_rdma_v2_ready=1`、
+> `committed <= max`、growth/allocation failures 不增长。
 
 读侧 convoy 合并与直读晋升（`DFKV_READ_COALESCE=1` 时才有增量；恒零 = 开关没生效）：
 | `dfkv_read_coalesce_leaders_total` | counter | 经 coalescer 登记并完成的读（同步 leader + io_uring flight 各计一次；>0 = 合并路径确实在环内） |
@@ -194,7 +194,11 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_table_sync_total` | counter | slots.tbl fdatasync 周期数（`DFKV_SLAB_TABLE_SYNC_MS`，默认 100ms；限定崩溃复活毒化窗口） |
 | `dfkv_slab_extent_steals_total` / `dfkv_slab_extent_returns_total` | counter | 跨 class extent 抢占（伴随驱逐，容量失衡信号）/ 全空 extent 主动回池（无损再平衡） |
 | `dfkv_slab_cold_steals_total` | counter | 命中"全局最冷 extent"护栏的跨 class 抢占（donor 全部内容都冷于 `DFKV_SLAB_COLD_STEAL_WINDOW` 窗口才走此路，满环自噬护栏；0=窗口关闭） |
-| `dfkv_slab_watermark_evictions_total` | counter | 水位线主动驱逐（`DFKV_SLAB_EVICT_HIGH_PCT`/`_LOW_PCT`，默认 92/88）——赶在 demand 前腾 headroom，满环自噬的第一道防线 |
+| `dfkv_slab_watermark_evictions_total` | counter | high crossing 后持续到 low 的主动整 extent 驱逐数 |
+| `dfkv_slab_watermark_extent_clears_total` | counter | watermark 使用单次连续 slots.tbl clear 的 extent 数；应与 watermark eviction 同步 |
+| `dfkv_slab_watermark_ticks_total` / `dfkv_slab_watermark_active` | counter / gauge | bounded eviction tick 数 / hysteresis 是否仍在 drain |
+| `dfkv_slab_watermark_last_tick_us` / `max_tick_us` | gauge | 最近 / 进程最大 watermark 锁区间微秒数 |
+| `dfkv_slab_watermark_max_extents_per_tick` | gauge | 每盘每 tick 配置的 extent 上限 |
 | `dfkv_slab_table_rebuilt_objects` / `dfkv_slab_rebuild_scanned_bytes` / `dfkv_slab_rebuild_scan_chunks` / `dfkv_slab_rebuild_sparse_ranges` / `dfkv_slab_rebuild_mmap_scans` | gauge | 上次启动冷升从 slots.tbl 恢复的对象数 / 扫描字节 / chunk / sparse range / mmap 的表数（冷升目录规模诊断） |
 | `dfkv_slab_rebuild_corrupt_records_total` / `dfkv_slab_rebuild_rejected_records_total` / `dfkv_slab_rebuild_sequential_fallbacks_total` | counter | 启动 rebuild 丢弃的损坏记录 / 因几何不安全被清除的合法记录 / sparse seek 退化为顺序扫描的次数（任一非零都值得看日志） |
 | `dfkv_slab_deferred_removes_total` | counter | 被在飞 I/O 延迟执行的 Remove |
@@ -332,7 +336,7 @@ C 客户端快照还含传输级指标（RDMA 构建）：
 | `dfkv_rdma_client_adhoc_user_mr_total` / `dfkv_rdma_client_transient_user_mr_active` | counter / gauge | pool 外实际注册累计 / 当前仍存活的一次性 MR；公开调用返回后 active 必须回到调用前基线 |
 | `dfkv_rdma_client_pool_mr_registrations_total` / `dfkv_rdma_client_pool_mr_registration_failures_total` | counter | shared-PD 上真实 `ibv_reg_mr` 次数 / 单 rail 显式 pool 注册失败；包含最终回滚的尝试 |
 | `dfkv_rdma_client_pool_mr_active_registrations` | gauge | 进程内仍有 endpoint 引用的 shared-PD MR generations；扩容成功后 anchor/空闲 endpoint 立即释放旧代，在飞旧 endpoint 到下次 acquire/close 才释放，确保旧 range 不中断 |
-| `dfkv_rdma_client_max_block_seen_bytes` / `dfkv_rdma_client_declared_max_block_bytes` | gauge | 实际请求高水位 / DCP2 声明上限 |
+| `dfkv_rdma_client_max_block_seen_bytes` / `dfkv_rdma_client_declared_max_block_bytes` / `dfkv_rdma_client_connection_min_block_bytes` | gauge | 实际请求高水位 / 逻辑安全上限 / adaptive QP 最小 class |
 | `dfkv_rdma_client_oversize_rejects_total` | counter | 分配、注册或发帖前因超过声明上限而拒绝的操作 |
 | `dfkv_rdma_client_v2_probe_attempts_total` / `dfkv_rdma_client_v2_probe_failures_total` | counter | 必选 v2 bootstrap probe 尝试 / 失败 |
 | `dfkv_rdma_client_stale_pool_retries_total` | counter | pooled QP 失败后改用 fresh connection 的重试 |

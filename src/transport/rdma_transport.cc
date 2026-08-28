@@ -392,6 +392,7 @@ struct RdmaTransport::Conn {
   bool credit_held = false;
   rdma::ResourceRequest budget_request;
   bool budget_held = false;
+  size_t declared_bytes = 0;
   Lane lane = Lane::kData;
   bool active_counted = false;
   bool live_counted = false;
@@ -433,6 +434,9 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
       declared_(std::min<uint64_t>(
           EnvBytes("DFKV_RDMA_MAX_BLOCK_BYTES", 4ull << 20),
           ResolveMaxPayload(max_msg))),
+      connection_min_block_bytes_(std::min<size_t>(
+          EnvBytes("DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES", 256ull << 10),
+          static_cast<size_t>(declared_))),
       depth_(4) {
   std::string list = dev_name;
   if (list.empty()) {
@@ -524,6 +528,9 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
       "DFKV_RDMA_PRIMARY_DEV",
       preferred_rail_ ? devs_[*preferred_rail_] : std::string(""));
   config_dump::RecordResolved("DFKV_RDMA_DEPTH", std::to_string(depth_));
+  config_dump::RecordResolved(
+      "DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES",
+      std::to_string(connection_min_block_bytes_));
   config_dump::RecordResolved("DFKV_RDMA_NUMA", numa_aware_ ? "1" : "0");
   const size_t endpoint_limit = static_cast<size_t>(
       EnvBoundedInt("DFKV_RDMA_ENDPOINT_CACHE_MAX", 256, 65536));
@@ -1087,6 +1094,10 @@ bool RdmaTransport::ProbeV2(const std::string& node) const {
 
 RdmaTransport::AcquireResult RdmaTransport::Acquire(
     const std::string& node, Lane lane, const AcquireOptions& options) {
+  const size_t required_bound =
+      lane == Lane::kControl
+          ? static_cast<size_t>(rdma::kV2ControlCap)
+          : ConnectionBound(options.required_data_bytes);
   AcquireResult result;
   const auto peer_snapshot =
       options.peer ? options.peer : peer_topologies_->Snapshot(node);
@@ -1199,18 +1210,27 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
               pool_candidates.erase(pool_candidates.begin() +
                                     static_cast<std::ptrdiff_t>(i - 1));
             }
-            continue;
           }
+        }
+        size_t best = pool_candidates.size();
+        size_t best_bound = std::numeric_limits<size_t>::max();
+        for (size_t i = 0; i < pool_candidates.size(); ++i) {
+          Conn* candidate = pool_candidates[i];
           if (candidate->peer_id == peer_snapshot->peer_id &&
               candidate->peer_publication == peer_snapshot->publication &&
               candidate->rail_index == ridx &&
-              candidate->lifecycle.Activate()) {
-            MarkActive(candidate, lane);
-            pooled = candidate;
-            pool_candidates.erase(
-                pool_candidates.begin() + static_cast<std::ptrdiff_t>(i - 1));
-            break;
+              candidate->declared_bytes >= required_bound &&
+              candidate->declared_bytes < best_bound) {
+            best = i;
+            best_bound = candidate->declared_bytes;
           }
+        }
+        if (best < pool_candidates.size() &&
+            pool_candidates[best]->lifecycle.Activate()) {
+          pooled = pool_candidates[best];
+          MarkActive(pooled, lane);
+          pool_candidates.erase(pool_candidates.begin() +
+                                static_cast<std::ptrdiff_t>(best));
         }
       }
     }
@@ -1246,14 +1266,12 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   }
 
   endpoint_cache_misses_.fetch_add(1, std::memory_order_relaxed);
-  // Open, announce, and budget at the depth this node actually granted last
-  // time: churned reconnects stop reserving WR/slot capacity the server's
-  // clamp will never let them use (first contact still probes at depth_).
+  // Open, announce, and budget only the size class this operation needs.
   const size_t conn_depth = LearnedDepth(node, lane);
   const uint64_t conn_declared =
       lane == Lane::kControl
           ? static_cast<uint64_t>(rdma::kV2ControlCap)
-          : declared_;
+          : static_cast<uint64_t>(required_bound);
   const uint64_t conn_slot_bytes = static_cast<uint64_t>(rdma::V2SlotSize(
       static_cast<size_t>(
           std::max<uint64_t>(conn_declared, rdma::kV2DataOffset))));
@@ -1319,6 +1337,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   conn->remote_lease_generation =
       remote_lease ? remote_lease->generation : 0;
   conn->remote_lease_held = remote_lease.has_value();
+  conn->declared_bytes = static_cast<size_t>(conn_declared);
   conn->remote_recovery_probe =
       remote_lease && remote_lease->recovery_probe;
   conn->lease = *lease;
@@ -1641,6 +1660,19 @@ bool RdmaTransport::RegisterMemory(void* base, size_t size) {
   return true;
 }
 
+std::vector<size_t> RdmaTransport::IdleDataBounds(
+    const std::string& node) const {
+  std::lock_guard<std::mutex> lock(mu_);
+  std::vector<size_t> bounds;
+  const auto found = pool_.find(node);
+  if (found == pool_.end()) return bounds;
+  bounds.reserve(found->second.size());
+  for (const Conn* conn : found->second)
+    bounds.push_back(conn->declared_bytes);
+  std::sort(bounds.begin(), bounds.end());
+  return bounds;
+}
+
 std::string RdmaTransport::MetricsText() const {
   std::string s;
   s += "# HELP dfkv_rdma_client_conns_opened_total RDMA client connections opened\n";
@@ -1897,10 +1929,14 @@ std::string RdmaTransport::MetricsText() const {
   s += "# TYPE dfkv_rdma_client_max_block_seen_bytes gauge\n";
   s += "dfkv_rdma_client_max_block_seen_bytes " +
        std::to_string(max_block_seen_.load(std::memory_order_relaxed)) + "\n";
-  s += "# HELP dfkv_rdma_client_declared_max_block_bytes Negotiated maximum block declaration\n";
+  s += "# HELP dfkv_rdma_client_declared_max_block_bytes Logical RDMA block safety ceiling\n";
   s += "# TYPE dfkv_rdma_client_declared_max_block_bytes gauge\n";
   s += "dfkv_rdma_client_declared_max_block_bytes " +
        std::to_string(declared_) + "\n";
+  s += "# HELP dfkv_rdma_client_connection_min_block_bytes Smallest adaptive data-connection declaration\n";
+  s += "# TYPE dfkv_rdma_client_connection_min_block_bytes gauge\n";
+  s += "dfkv_rdma_client_connection_min_block_bytes " +
+       std::to_string(connection_min_block_bytes_) + "\n";
   s += "# HELP dfkv_rdma_client_oversize_rejects_total Operations rejected above the declared maximum block\n";
   s += "# TYPE dfkv_rdma_client_oversize_rejects_total counter\n";
   s += "dfkv_rdma_client_oversize_rejects_total " +
@@ -2031,6 +2067,7 @@ void RdmaTransport::Release(const std::string& node, Lane lane, Conn* c,
 
   bool reusable = false;
   bool publication_current = false;
+  Conn* displaced = nullptr;
   {
     std::lock_guard<std::mutex> lk(mu_);
     publication_current = peer_topologies_->IsCurrent(
@@ -2043,9 +2080,27 @@ void RdmaTransport::Release(const std::string& node, Lane lane, Conn* c,
         c->lane = lane;
         v.push_back(c);
         reusable = true;
+      } else if (lane != Lane::kControl && !v.empty()) {
+        auto largest = std::max_element(
+            v.begin(), v.end(), [](const Conn* left, const Conn* right) {
+              return left->declared_bytes < right->declared_bytes;
+            });
+        if (largest != v.end() &&
+            (*largest)->declared_bytes > c->declared_bytes &&
+            (*largest)->lifecycle.RequestRetire()) {
+          displaced = *largest;
+          if (c->lifecycle.MakeIdle()) {
+            c->lane = lane;
+            *largest = c;
+            reusable = true;
+          } else {
+            v.erase(largest);
+          }
+        }
       }
     }
   }
+  if (displaced) Destroy(displaced);
   if (!reusable && !publication_current)
     stale_publication_reaps_.fetch_add(1, std::memory_order_relaxed);
   if (!reusable) Destroy(c);
@@ -2086,6 +2141,10 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
     std::string attempt_out;
     uint64_t attempt_value_len = 0;
     AcquireOptions options;
+    options.required_data_bytes =
+        lane == Lane::kControl
+            ? 0
+            : static_cast<size_t>(std::max(payload_len, length));
     options.force_new = attempt != 0;
     options.excluded = excluded;
     options.peer = peer;
@@ -2310,6 +2369,7 @@ Status RdmaTransport::Remove(const std::string& node, const BlockKey& key) {
 std::vector<Status> RdmaTransport::CacheMany(
     const std::string& node, const std::vector<CacheItem>& items) {
   const size_t count = items.size();
+  size_t required_bytes = 0;
   std::vector<Status> result(count, Status::kIOError);
   if (count == 0) return result;
   std::vector<char> bad(count, 0);
@@ -2321,6 +2381,7 @@ std::vector<Status> RdmaTransport::CacheMany(
       bad[i] = 1;
       result[i] = Status::kInvalid;
     } else {
+      required_bytes = std::max(required_bytes, items[i].len);
       ++valid_count;
     }
   }
@@ -2336,6 +2397,7 @@ std::vector<Status> RdmaTransport::CacheMany(
     for (size_t i = 0; i < count; ++i)
       if (bad[i]) result[i] = Status::kInvalid;
     AcquireOptions options;
+    options.required_data_bytes = required_bytes;
     options.force_new = attempt != 0;
     options.requested_credits = std::min(valid_count, depth_);
     options.excluded = excluded;
@@ -2486,6 +2548,7 @@ std::vector<Status> RdmaTransport::RangeMany(
     std::vector<std::string> attempt_outputs(count);
     std::vector<uint64_t> attempt_value_lens(count, 0);
     AcquireOptions options;
+    options.required_data_bytes = static_cast<size_t>(length);
     options.force_new = attempt != 0;
     options.requested_credits = std::min(count, depth_);
     options.excluded = excluded;
@@ -2754,6 +2817,7 @@ std::vector<Status> RdmaTransport::RangeInto(
         NoteBlock(destination.n))
       continue;
     AcquireOptions options;
+    options.required_data_bytes = destination.n;
     options.requested_credits = 1;
     options.peer = peer_topologies_->Snapshot(node);
     AcquireResult acquired = Acquire(node, Lane::kData, options);
@@ -2876,6 +2940,7 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
   std::vector<char> completed(count, 0);
   std::vector<size_t> totals(count, 0);
   size_t valid_count = 0;
+  size_t required_bytes = 0;
   for (size_t i = 0; i < count; ++i) {
     bool invalid = false;
     size_t total = 0;
@@ -2895,6 +2960,7 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
       bad[i] = 1;
       result[i] = Status::kInvalid;
     } else {
+      required_bytes = std::max(required_bytes, total);
       ++valid_count;
     }
   }
@@ -2910,6 +2976,7 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
     // validation results survive while connection-local progress restarts.
     completion_fault.BeginAttempt(attempt);
     AcquireOptions options;
+    options.required_data_bytes = required_bytes;
     options.force_new = attempt != 0;
     options.requested_credits = 1;
     options.excluded = excluded;
@@ -3078,21 +3145,20 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
   return result;
 }
 
+size_t RdmaTransport::ConnectionBound(size_t required) const {
+  const size_t logical_max = OpBound();
+  size_t wanted = std::max(required, connection_min_block_bytes_);
+  if (wanted >= logical_max) return logical_max;
+  size_t size_class = 1;
+  while (size_class < wanted && size_class <= logical_max / 2)
+    size_class <<= 1;
+  return size_class < wanted ? logical_max
+                             : std::min(size_class, logical_max);
+}
+
 // Records n as a high-water candidate and reports whether it exceeds the
-// declaration. Two problems this closes, both observed on a B200 node:
-//
-//  1. The declaration determines receive-segment capacity reserved for every
-//     data connection: queue depth multiplied by the aligned slot size. An
-//     over-generous value consumes scarce pinned memory across the fleet. The
-//     average transfer size (437 KiB on the incident host) says nothing about
-//     the peak block that must fit, so the observed high-water mark is the
-//     actionable sizing signal.
-//
-//  2. An UNDER-sized declaration failed silently. Oversized blocks become
-//     kInvalid, which the client's health accounting deliberately ignores, so
-//     upstream they are indistinguishable from an ordinary cache miss: no error,
-//     no log, no counter -- just a hit rate quietly capped for large pages.
-//     Anyone tuning this down would have had no signal that they went too far.
+// logical safety declaration. Physical connection slots use ConnectionBound,
+// so a rare large object no longer inflates every data connection.
 bool RdmaTransport::NoteBlock(size_t n) const {
   uint64_t prev = max_block_seen_.load(std::memory_order_relaxed);
   while (n > prev &&
@@ -3137,6 +3203,7 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
     }
     if (!valid || NoteBlock(capacity)) continue;
     AcquireOptions options;
+    options.required_data_bytes = capacity;
     options.requested_credits = 1;
     options.peer = peer_topologies_->Snapshot(node);
     AcquireResult acquired = Acquire(node, Lane::kSgData, options);

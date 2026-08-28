@@ -157,4 +157,101 @@ void RecvSegment::Release(size_t offset, size_t bytes) {
   free_.emplace(begin, end - begin);
 }
 
+bool RecvSegmentPool::Init(size_t chunk_bytes, size_t max_bytes,
+                           size_t alignment) {
+  if (!IsPowerOfTwo(alignment) || alignment < sizeof(void*) ||
+      chunk_bytes == 0 || max_bytes == 0) {
+    return false;
+  }
+  const size_t aligned_chunk = AlignUpChecked(chunk_bytes, alignment);
+  const size_t aligned_max = AlignUpChecked(max_bytes, alignment);
+  if (aligned_chunk == std::numeric_limits<size_t>::max() ||
+      aligned_max == std::numeric_limits<size_t>::max() ||
+      aligned_chunk > aligned_max) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(mu_);
+  if (!chunks_.empty()) {
+    return chunk_bytes_ == aligned_chunk && max_bytes_ == aligned_max &&
+           alignment_ == alignment;
+  }
+  chunk_bytes_ = aligned_chunk;
+  max_bytes_ = aligned_max;
+  alignment_ = alignment;
+  auto initial = std::make_unique<RecvSegment>();
+  if (!initial->Init(chunk_bytes_, alignment_)) {
+    chunk_bytes_ = 0;
+    max_bytes_ = 0;
+    alignment_ = 0;
+    return false;
+  }
+  chunks_.push_back(std::move(initial));
+  return true;
+}
+
+std::unique_ptr<RecvSegment> RecvSegmentPool::NewChunk(
+    size_t minimum_bytes) {
+  const size_t aligned_min = AlignUpChecked(minimum_bytes, alignment_);
+  if (aligned_min == std::numeric_limits<size_t>::max()) return nullptr;
+  size_t committed = 0;
+  for (const auto& chunk : chunks_) committed += chunk->size();
+  if (committed >= max_bytes_ || aligned_min > max_bytes_ - committed)
+    return nullptr;
+  const size_t bytes =
+      std::min(std::max(chunk_bytes_, aligned_min), max_bytes_ - committed);
+  auto chunk = std::make_unique<RecvSegment>();
+  if (!chunk->Init(bytes, alignment_)) return nullptr;
+  return chunk;
+}
+
+RecvSegmentPool::Lease RecvSegmentPool::Allocate(size_t bytes,
+                                                 size_t alignment) {
+  if (bytes == 0 || !IsPowerOfTwo(alignment)) return {};
+  std::lock_guard<std::mutex> lock(mu_);
+  for (const auto& chunk : chunks_) {
+    auto lease = chunk->Allocate(bytes, alignment);
+    if (lease) return Lease(chunk.get(), std::move(lease));
+  }
+  auto chunk = NewChunk(bytes);
+  if (!chunk) {
+    allocation_failures_.fetch_add(1, std::memory_order_relaxed);
+    growth_failures_.fetch_add(1, std::memory_order_relaxed);
+    return {};
+  }
+  RecvSegment* owner = chunk.get();
+  chunks_.push_back(std::move(chunk));
+  growths_.fetch_add(1, std::memory_order_relaxed);
+  auto lease = owner->Allocate(bytes, alignment);
+  if (!lease) {
+    allocation_failures_.fetch_add(1, std::memory_order_relaxed);
+    return {};
+  }
+  return Lease(owner, std::move(lease));
+}
+
+RecvSegment* RecvSegmentPool::initial_segment() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return chunks_.empty() ? nullptr : chunks_.front().get();
+}
+
+RecvSegmentPool::Stats RecvSegmentPool::stats() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  Stats out;
+  out.max_bytes = max_bytes_;
+  out.chunks = chunks_.size();
+  for (const auto& chunk : chunks_) {
+    const RecvSegment::Stats current = chunk->stats();
+    out.committed_bytes += current.total_bytes;
+    out.used_bytes += current.used_bytes;
+    out.free_bytes += current.free_bytes;
+    out.largest_free_range =
+        std::max(out.largest_free_range, current.largest_free_range);
+  }
+  out.growths = growths_.load(std::memory_order_relaxed);
+  out.allocation_failures =
+      allocation_failures_.load(std::memory_order_relaxed);
+  out.growth_failures = growth_failures_.load(std::memory_order_relaxed);
+  return out;
+}
+
 }  // namespace dfkv::rdma

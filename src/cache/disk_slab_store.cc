@@ -157,6 +157,21 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
     bind_wipes_.fetch_add(1, std::memory_order_relaxed);
     return true;
   };
+  ao.on_extent_evict =
+      [this](uint32_t extent, uint32_t, uint32_t residents) {
+        const std::vector<char> zeros(
+            static_cast<size_t>(max_slots_per_extent_) * kRecBytes, 0);
+        if (!PwriteAll(table_fd_, zeros.data(), zeros.size(),
+                       TableOffset(extent, 0)))
+          return FailMetadata();
+        record_writes_.fetch_add(std::max<uint32_t>(residents, 1),
+                                 std::memory_order_relaxed);
+        eviction_record_clears_.fetch_add(residents,
+                                          std::memory_order_relaxed);
+        watermark_extent_clears_.fetch_add(1,
+                                           std::memory_order_relaxed);
+        return true;
+      };
   ao.on_slot_evict = [this](const SlabAllocator::SlotRef& ref) {
     const uint8_t zero[kRecBytes] = {0};
     if (!PwriteAll(table_fd_, zero, sizeof(zero),
@@ -184,6 +199,16 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   if (low_pct >= high_pct && high_pct > 0) low_pct = high_pct - 1;
   evict_high_bytes_ = high_pct ? opt_.capacity_bytes / 100 * high_pct : 0;
   evict_low_bytes_ = opt_.capacity_bytes / 100 * low_pct;
+  if (const char* value =
+          std::getenv("DFKV_SLAB_EVICT_MAX_EXTENTS_PER_TICK")) {
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (end != value && *end == '\0' && parsed > 0 && parsed <= 1024)
+      evict_max_extents_per_tick_ = static_cast<size_t>(parsed);
+  }
+  config_dump::RecordResolved(
+      "DFKV_SLAB_EVICT_MAX_EXTENTS_PER_TICK",
+      std::to_string(evict_max_extents_per_tick_));
 
   ok_ = OpenOrInit();
   if (ok_ && unclean_start_) ok_ = ResetUncleanEpoch();
@@ -1531,18 +1556,38 @@ void DiskSlabStore::ReclaimTick(
     const std::function<void()>& after_watermark_evict) {
   if (!Healthy()) return;
   // Watermark eviction is a composite mutation: allocator occupancy and the
-  // payload-length commit map must change under the same store lock. Otherwise
-  // a concurrent rewrite can commit a reused key between those two mutations,
-  // only for this pass to erase the new commit state.
-  if (evict_high_bytes_ != 0 && alloc_->UsedBytes() > evict_high_bytes_) {
-    std::lock_guard<std::mutex> lk(mu_);
-    if (alloc_->UsedBytes() > evict_high_bytes_) {
+  // payload-length commit map change under the same store lock. Crossing high
+  // latches the background drain until low is reached, but each tick removes
+  // only a small configured number of extents so GET/PUT never sits behind a
+  // multi-GiB eviction burst.
+  if (evict_high_bytes_ != 0) {
+    const uint64_t used = alloc_->UsedBytes();
+    if (used > evict_high_bytes_)
+      watermark_active_.store(true, std::memory_order_relaxed);
+    if (watermark_active_.load(std::memory_order_relaxed)) {
+      const auto started = std::chrono::steady_clock::now();
+      std::lock_guard<std::mutex> lk(mu_);
       std::vector<BlockKey> evicted;
-      alloc_->EvictColdToTarget(evict_low_bytes_, /*max_extents=*/64,
-                               &evicted);
+      alloc_->EvictColdToTarget(evict_low_bytes_,
+                               evict_max_extents_per_tick_, &evicted);
       if (!evicted.empty()) {
         if (after_watermark_evict) after_watermark_evict();
-        for (const BlockKey& key : evicted) ErasePayloadLocked(key.Filename());
+        for (const BlockKey& key : evicted)
+          ErasePayloadLocked(key.Filename());
+      }
+      if (alloc_->UsedBytes() <= evict_low_bytes_)
+        watermark_active_.store(false, std::memory_order_relaxed);
+      const uint64_t elapsed = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - started)
+              .count());
+      watermark_ticks_.fetch_add(1, std::memory_order_relaxed);
+      watermark_last_tick_us_.store(elapsed, std::memory_order_relaxed);
+      uint64_t observed =
+          watermark_max_tick_us_.load(std::memory_order_relaxed);
+      while (elapsed > observed &&
+             !watermark_max_tick_us_.compare_exchange_weak(
+                 observed, elapsed, std::memory_order_relaxed)) {
       }
     }
   }
@@ -1652,6 +1697,18 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
     st.steals = alloc_->Steals();
     st.cold_steals = alloc_->ColdSteals();
     st.watermark_evictions = alloc_->WatermarkEvictions();
+    st.watermark_extent_clears =
+        watermark_extent_clears_.load(std::memory_order_relaxed);
+    st.watermark_ticks =
+        watermark_ticks_.load(std::memory_order_relaxed);
+    st.watermark_active =
+        watermark_active_.load(std::memory_order_relaxed) ? 1 : 0;
+    st.watermark_last_tick_us =
+        watermark_last_tick_us_.load(std::memory_order_relaxed);
+    st.watermark_max_tick_us =
+        watermark_max_tick_us_.load(std::memory_order_relaxed);
+    st.watermark_max_extents_per_tick =
+        evict_max_extents_per_tick_;
     st.extent_returns = alloc_->ExtentReturns();
     st.allocated_bytes = alloc_->UsedBytes();
     st.allocator_objects = alloc_->Count();

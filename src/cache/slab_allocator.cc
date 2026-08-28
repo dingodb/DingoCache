@@ -902,10 +902,17 @@ size_t SlabAllocator::EvictColdToTarget(uint64_t target_bytes,
     }
     if (best < 0) break;
     ExtentMeta& extent = extents_[static_cast<uint32_t>(best)];
+    const bool extent_cleared =
+        opt_.on_extent_evict &&
+        opt_.on_extent_evict(static_cast<uint32_t>(best),
+                             extent.total_slots, extent.resident_count);
+    if (opt_.on_extent_evict && !extent_cleared) return freed;
     while (extent.resident_head != kNoSlot) {
       const uint32_t index = extent.resident_head;
       SlotMeta& meta = slots_[index];
-      if (opt_.on_slot_evict && !opt_.on_slot_evict(meta.ref)) return freed;
+      if (!extent_cleared && opt_.on_slot_evict &&
+          !opt_.on_slot_evict(meta.ref))
+        return freed;
       BlockKey victim = meta.key;
       FreeSlotLocked(index);
       if (evicted) evicted->push_back(std::move(victim));

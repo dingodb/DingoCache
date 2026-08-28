@@ -81,6 +81,12 @@ class DiskSlabStore : public StoreEngine {
     uint64_t steals = 0;
     uint64_t cold_steals = 0;
     uint64_t watermark_evictions = 0;
+    uint64_t watermark_extent_clears = 0;
+    uint64_t watermark_ticks = 0;
+    uint64_t watermark_active = 0;
+    uint64_t watermark_last_tick_us = 0;
+    uint64_t watermark_max_tick_us = 0;
+    uint64_t watermark_max_extents_per_tick = 0;
     uint64_t extent_returns = 0;
     uint64_t deferred_removes = 0;
     uint64_t inflight = 0;
@@ -280,6 +286,7 @@ class DiskSlabStore : public StoreEngine {
   std::function<int(void* ring, void* cqe)> uring_reap_hook_for_test_;
   std::atomic<uint64_t> unclean_resets_{0};
   std::atomic<uint64_t> eviction_record_clears_{0};
+  std::atomic<uint64_t> watermark_extent_clears_{0};
   // slots.tbl sync thread (see Options::table_sync_ms): fdatasync only when
   uint64_t rebuild_corrupt_records_ = 0;
   uint64_t rebuild_rejected_records_ = 0;
@@ -313,8 +320,13 @@ class DiskSlabStore : public StoreEngine {
   // The batched-write submission ring is thread_local (see disk_slab_store.cc):
   // one per flush worker, no shared lock across the blocking CQE wait.
   std::vector<uint64_t> reclaim_last_puts_;  // reclaim-thread-local puts snapshot
-  uint64_t evict_high_bytes_ = 0;  // used > this -> proactive cold eviction (0=off)
-  uint64_t evict_low_bytes_ = 0;   // ... down to this
+  uint64_t evict_high_bytes_ = 0;  // high crossing activates eviction
+  uint64_t evict_low_bytes_ = 0;   // active eviction drains to this target
+  size_t evict_max_extents_per_tick_ = 1;
+  std::atomic<bool> watermark_active_{false};
+  std::atomic<uint64_t> watermark_ticks_{0};
+  std::atomic<uint64_t> watermark_last_tick_us_{0};
+  std::atomic<uint64_t> watermark_max_tick_us_{0};
   std::thread reclaim_thread_;
   std::condition_variable reclaim_cv_;
   std::mutex reclaim_mu_;

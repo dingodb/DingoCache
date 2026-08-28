@@ -265,10 +265,10 @@ docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire p
   IP. A v2 capability probe is mandatory; once RDMA is requested it never
   switches transports.
 - **One-sided zero-copy data plane**: control descriptors/status use small 4-KiB
-  SEND/RECV buffers. PUT payloads RDMA-WRITE into leases from one process-wide,
-  pre-registered receive segment; GET payloads RDMA-WRITE directly into the
-  caller's registered buffer. No connection-sized block buffers or payload copy
-  are used.
+  SEND/RECV buffers. PUT payloads RDMA-WRITE into a lease from a lazily committed
+  server receive chunk; GET payloads RDMA-WRITE directly into the caller's
+  registered buffer. Data QPs negotiate a power-of-two slot class from the
+  current operation rather than reserving the logical maximum block size.
 - **Optional pipelining** (`DFKV_RDMA_DEPTH=K`): K requests in flight per connection.
   A network-latency hider, **not a throughput knob** — GET and PUT are both
   depth-flat (the per-connection serve loop is in-order; benchmarked GET ~1.24 GB/s at
@@ -280,8 +280,8 @@ docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire p
   credits waits under the existing bounded backpressure contract; congestion
   never overflows traffic into Tier 1. Lower tiers are considered only when the
   peer-health intersection makes every higher tier unavailable. Server threads
-  follow their QP rail NUMA node; the shared receive segment is registered on
-  each selected rail but is not separately NUMA-allocated per rail.
+  follow their QP rail NUMA node; receive chunks register lazily on the rail
+  that first leases them rather than pinning the full budget on every rail.
 - **Generation-fenced endpoint recovery**: each public operation captures one
   peer-topology generation for both of its possible physical attempts.
   Connections record that generation. A stale-generation pool entry is never
@@ -319,8 +319,9 @@ fabric selection and capacity explicit.
 |---|---|---|
 | `--rdma-dev` | leave unset for one local HCA; list the fabric explicitly for multi-rail | Unset resolves and initializes the first `ACTIVE` local HCA (peer names may differ). An explicit comma list defines a fixed topology in first-occurrence order: every listed device must be present/openable with complete provider metadata, including a successful GID query, and complete anchor/MR initialization; a present `DOWN` entry remains initialized and monitored rather than being rejected. Both hosts still require compatible names/fabric. |
 | `DFKV_DISK_HASH_WEIGHT` | `10` | Flattens the intra-server disk ring share from ±20 % to ±3 % so the hottest disk stops gating the whole node (+5–6 % cold read, ~2× lower p99). **Re-routes existing keys** (cache miss + refill) — flip together with a restart/upgrade window. |
-| `--rdma-depth` | `4` (default) | Handshake window is `min(client, server)`. Production connector batches require both sides to expose the same bounded window. Pull-read connections lease receive and source arenas: `2 × depth × slot_size`; with a 4 MiB declaration this is 33,587,200 bytes per data QP. |
-| `DFKV_RDMA_RECV_SEGMENT_SIZE` | `64 GiB` on xb01 (`16 GiB` code default) | The xb01 14×TP8 envelope is 896 retained data plus 896 smaller control QPs; including 25% churn requires 35.4 GiB. Keep 64 GiB; 128 GiB adds no capacity benefit for this topology. |
+| `--rdma-depth` | `4` (default) | Handshake window is `min(client, server)`. Pull-read connections lease `2 × depth × adaptive_slot_size`; a 1 MiB actual object uses about 8.4 MiB even when the logical ceiling is 64 MiB. |
+| `DFKV_RDMA_RECV_SEGMENT_SIZE` | `16 GiB` hard budget | Maximum process receive-pool commitment; it is no longer allocated eagerly. Size for worst-case live/churn connections, but startup pins only one chunk. |
+| `DFKV_RDMA_RECV_CHUNK_BYTES` | `256 MiB` | Initial and incremental receive-pool commitment. Increase only if measured connection classes are routinely larger; committed chunks never exceed the hard budget. |
 | `DFKV_RDMA_IDLE_MS` | `30000` for frequently replaced clients; otherwise default `600000` | Server dead-client reaper. A short interval bounds leaked receive-segment leases, but live clients must set `DFKV_RDMA_KEEPALIVE_MS` below this value or their next GET pays stale-QP recovery. |
 | `DFKV_RDMA_HEALTH_RECOVERY_SAMPLES` | `3` | Any healthy initialized rail keeps placement eligible; a partial loss stays online. Loss of the final healthy rail removes the node immediately. Only recovery from zero to nonzero waits the consecutive sample gate, then rejoins as `PARTIAL` or `ACTIVE`. |
 | `DFKV_RDMA_HEALTH_FILE` | unset | Diagnostic-only health input (`device port_state phys_state`, one per initialized/resolved rail, including an auto-discovered rail) for controlled fault injection. Production MUST leave this unset so health comes from sysfs. |
@@ -337,6 +338,8 @@ fabric selection and capacity explicit.
 | `DFKV_RDMA_RAIL_TIERS` | unset for homogeneous hosts; e.g. `mlx5_0|mlx5_1;mlx5_2` for heterogeneous hosts | Every name must be present in `DFKV_RDMA_DEV`; leftmost is highest priority. GPU and CPU hosts may expose different subsets, but interoperating rail names must describe the same fabric. The client uses the highest tier in `local enabled ∩ peer healthy`; missing/incomplete peer HLT1 fails closed only when tiers are configured. Credits, NUMA, latency, and quarantine never cause tier overflow. |
 | `DFKV_RDMA_PRIMARY_DEV` | unset | Optional preferred rail within `DFKV_RDMA_DEV`. Admission uses other configured rails only when the primary cannot serve. SGLang `rail_affinity=true` sets a rank-local primary plus one neighboring fallback by default; `rail_affinity_fallbacks=0` disables the fallback. |
 | `DFKV_RDMA_DEPTH` | `4` (default) | Keep client/server defaults aligned for connector batch correctness. Throughput scaling comes from multiple pooled connections, not raising one QP's depth; lowering depth reduces receive-segment consumption only after validating the real engine workload. |
+| `DFKV_RDMA_MAX_BLOCK_BYTES` | exact logical object ceiling | Deterministic oversize guard only; it no longer sizes every data QP. |
+| `DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES` | `256 KiB` | Smallest data-QP class. Each operation rounds its actual largest object to a power-of-two class; idle reuse picks the smallest sufficient QP. |
 | `DFKV_RDMA_RAIL_ERROR_THRESHOLD` | `3` (default) | Consecutive client-local rail failures required to quarantine that rail; endpoint/peer failures do not contribute. |
 | `DFKV_RDMA_RAIL_COOLDOWN_MS` | `5000` (default) | Quarantine duration. No admission occurs during cooldown; afterward exactly one real operation is admitted as the recovery probe. Probe success clears the rail state, local failure starts another cooldown, and endpoint failure proves neither recovery nor a new local fault. |
 | local-rail attempts | fixed at `2` (not configurable) | One initial attempt plus at most one fresh retry. GET retries only unfinished work. PUT crosses rails only before request post; ambiguous post-submit failure is returned without replay. Both attempts retain one captured peer generation. |
@@ -345,7 +348,7 @@ fabric selection and capacity explicit.
 | `DFKV_RDMA_ENDPOINT_CACHE_MAX` | autoscaled (floor `256`, process-wide) | Hard cap on live client RDMA endpoints. Unset, the cap follows the adopted ring: `nodes × 2 pools × max(pool limit, configured rails) × 1.25`, raised but never shrunk. Setting any budget env pins the complete budget and disables autoscaling. |
 | `DFKV_RDMA_QP_BUDGET` | endpoint cap (default) | Process-wide QP reservation limit. Keep equal to the endpoint cap while each endpoint owns one QP. |
 | `DFKV_RDMA_WR_BUDGET` | endpoint cap × `DFKV_RDMA_DEPTH` | Process-wide negotiated WR-slot reservation for unified data and control endpoints. |
-| `DFKV_RDMA_REGISTERED_BYTES_BUDGET` | endpoint cap × depth × 2 × negotiated receive-slot bytes | Bounds aggregate server receive + pull arena bytes represented by live client endpoints. |
+| `DFKV_RDMA_REGISTERED_BYTES_BUDGET` | endpoint cap × depth × 2 × logical-max slot bytes | Admission ceiling only. Actual reservation is charged from each adaptive connection class, so small QPs consume small budget. |
 | `DFKV_RDMA_RESOURCE_ACQUIRE_MS` | `10000` | Bounded wait for all endpoint/QP/WR/receive-slot credits before opening a new QP. Timeout fails the shard without oversubscribing resources. |
 | `DFKV_FANOUT_THREADS` | unset (default 32) | Bounds TCP batch, RDMA write, and compatibility helpers; RDMA reads use the separate bounded scheduler below. |
 | `DFKV_RDMA_READ_WORKERS` | `7` (default) | Process-wide hard cap for active RDMA GET/GET-Auto/SG-GET/Exist shards across every client handle. Concurrent batches advance round-robin. Seven workers replace the legacy executor's seven helpers per rank without adding a thread; unlike the legacy caller-participates path, active read QPs cannot grow with concurrent callers. Raise only when an A/B proves seven active depth-four QPs cannot saturate the target fabric. |

@@ -217,23 +217,22 @@ class RdmaServer {
   std::unordered_set<rdma::RcEndpoint*> live_eps_;
   std::mutex writer_mu_;
   std::unordered_map<uint64_t, std::shared_ptr<WriterState>> writers_;
-  // One process-wide pinned receive segment replaces per-connection payload
-  // buffers. Each v2 connection leases depth * aligned_slot_size bytes, and
-  // each rail's shared PD registers the segment once. This makes connection
-  // admission an explicit bounded resource instead of multiplying max payload
-  // buffers by every connection.
-  rdma::RecvSegment recv_segment_;
+  // Receive memory is committed in fixed-size chunks on demand. Connections
+  // lease only their negotiated slot geometry from any chunk; the old
+  // DFKV_RDMA_RECV_SEGMENT_SIZE remains the hard process budget.
+  rdma::RecvSegmentPool recv_segments_;
   std::atomic<uint64_t> segment_evictions_{0};
-  size_t recv_segment_bytes_ = 0;
+  size_t recv_segment_max_bytes_ = 0;
+  size_t recv_segment_chunk_bytes_ = 0;
   size_t recv_segment_registered_rails_ = 0;
   std::atomic<uint64_t> pull_connections_{0};
   std::atomic<uint64_t> legacy_connections_{0};
   std::atomic<uint64_t> data_connection_bytes_{0};
   std::atomic<uint64_t> control_connection_bytes_{0};
   // One anchor per resolved rail holds a lifetime shared device reference and
-  // registers the receive segment and caller pools on that rail's PD. Auto
-  // mode anchors only the first ACTIVE local rail. An explicit list is fixed
-  // at startup and may include inactive ports so they can recover in place.
+  // registers the initial receive chunk and caller pools on that rail's PD.
+  // Later chunks register lazily on the rail of the connection that leases
+  // them. Auto mode anchors only the first ACTIVE local rail.
   std::vector<std::unique_ptr<rdma::RcEndpoint>> anchors_;
   std::vector<std::string> anchor_devs_;  // fixed resolved rail names
   std::vector<std::unique_ptr<RailStats>> rail_stats_;  // indexed with anchor_devs_

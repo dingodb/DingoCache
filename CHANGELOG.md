@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Adaptive RDMA receive capacity and bounded high-water reclaim
+
+- Replaced the eagerly committed monolithic RDMA receive segment with a lazy
+  chunk pool. `DFKV_RDMA_RECV_SEGMENT_SIZE` remains the hard process budget;
+  `DFKV_RDMA_RECV_CHUNK_BYTES` (default 256 MiB) controls incremental commits.
+  Each connection publishes and registers only the chunk containing its lease.
+- Decoupled `DFKV_RDMA_MAX_BLOCK_BYTES` from physical connection geometry. It
+  remains the logical safety ceiling, while data QPs now negotiate a
+  power-of-two class sized to the current operation, with
+  `DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES` (default 256 KiB) as the floor.
+- Idle endpoint reuse selects the smallest sufficient class, and a full idle
+  pool prefers a smaller returning QP over its largest retained QP.
+- Changed watermark eviction to a persistent high/low hysteresis drain bounded
+  by `DFKV_SLAB_EVICT_MAX_EXTENTS_PER_TICK` (default one). Whole extents clear
+  `slots.tbl` in one contiguous write instead of one 64-byte pwrite per slot.
+- Added receive-pool growth/budget metrics and watermark active/tick/duration/
+  extent-clear metrics.
+- On xb01-0064, 80 live 1 MiB data QPs under a 64 MiB logical ceiling used
+  674 MiB across three lazy chunks and completed 10,000/10,000 PUTs; v2.23.3's
+  fixed geometry exhausted an 8 GiB segment at roughly 15 such QPs. Sustained
+  64 GiB high-water PUT improved from 5.39 to 6.71 GB/s, p99 from 63.8 to
+  24.1 ms, and max latency from 496.8 to 50.8 ms.
+
 ### vLLM hybrid state and explicit TCP staging
 
 - Accepted align-mode hybrid cache groups whose Mamba block size differs from
