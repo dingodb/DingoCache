@@ -142,6 +142,16 @@ class RdmaTransportTestPeer {
       RdmaTransport* transport, const std::string& node) {
     return transport->IdleDataBounds(node);
   }
+  static std::vector<size_t> IdleDataDepths(
+      RdmaTransport* transport, const std::string& node) {
+    return transport->IdleDataDepths(node);
+  }
+
+  static size_t ConnectionDepth(RdmaTransport* transport,
+                                const std::string& node, size_t requested) {
+    return transport->ConnectionDepth(node, RdmaTransport::Lane::kData,
+                                      requested);
+  }
 
   static uint64_t PeerPublication(const RdmaTransport& transport,
                                   const std::string& node) {
@@ -1823,6 +1833,10 @@ TEST(RdmaLoopback, MetricsCountersTrackOps) {
                 "dfkv_rdma_recv_segment_largest_free_range_bytes"),
             0);
   EXPECT_GE(CounterVal(srv_text, "dfkv_rdma_pull_connections"), 1);
+  EXPECT_GE(
+      CounterVal(srv_text, "dfkv_rdma_pull_memory_windows_total") +
+          CounterVal(srv_text, "dfkv_rdma_pull_mr_fallbacks_total"),
+      1);
   EXPECT_GT(CounterVal(
                 srv_text,
                 "dfkv_rdma_connection_bytes{class=\"data\"}"),
@@ -3384,12 +3398,98 @@ TEST(RdmaLoopback, DataConnectionsUseActualBlockSizeClasses) {
             65536u);
 }
 
+TEST(RdmaLoopback, DataConnectionsUseActualDepthClasses) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
+  ScopedEnv max_block("DFKV_RDMA_MAX_BLOCK_BYTES", "262144");
+  ScopedEnv min_block("DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES", "4096");
+  RdmaNode node("adaptive-depth");
+  RdmaTransport transport(kMaxMsg);
+  KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+
+  std::string scalar(4000, 's');
+  ASSERT_TRUE(client.Put("scalar", scalar.data(), scalar.size()));
+  EXPECT_EQ(RdmaTransportTestPeer::IdleDataDepths(&transport, node.addr),
+            (std::vector<size_t>{1}));
+
+  std::vector<std::string> values(4, std::string(4000, 'b'));
+  std::vector<CacheItem> items;
+  for (size_t i = 0; i < values.size(); ++i) {
+    items.push_back(CacheItem{
+        ToBlockKey(SelfHdr(), "batch-depth-" + std::to_string(i)),
+        values[i].data(), values[i].size()});
+  }
+  const auto statuses = transport.CacheMany(node.addr, items);
+  ASSERT_EQ(statuses.size(), items.size());
+  for (Status status : statuses) EXPECT_EQ(status, Status::kOk);
+  EXPECT_EQ(RdmaTransportTestPeer::IdleDataDepths(&transport, node.addr),
+            (std::vector<size_t>{1, 4}));
+
+  EXPECT_EQ(RdmaTransportTestPeer::ConnectionDepth(&transport, node.addr, 1),
+            1u);
+  EXPECT_EQ(RdmaTransportTestPeer::ConnectionDepth(&transport, node.addr, 3),
+            4u);
+  const std::string metrics = transport.MetricsText();
+  EXPECT_NE(metrics.find(
+                "dfkv_rdma_client_connection_class_opened_total"
+                "{block_bytes=\"4096\",depth=\"1\"} 1"),
+            std::string::npos);
+  EXPECT_NE(metrics.find(
+                "dfkv_rdma_client_connection_class_opened_total"
+                "{block_bytes=\"4096\",depth=\"4\"} 1"),
+            std::string::npos);
+  EXPECT_NE(metrics.find(
+                "dfkv_rdma_client_connection_class_idle"
+                "{block_bytes=\"4096\",depth=\"1\"} 1"),
+            std::string::npos);
+}
+
+TEST(RdmaLoopback, ManyAdaptiveDepthOneConnectionsStayBounded) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  int count = 32;
+  if (const char* value = std::getenv("DFKV_RDMA_TEST_CONNECTIONS"))
+    count = std::max(1, std::min(2000, std::atoi(value)));
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
+  ScopedEnv max_block("DFKV_RDMA_MAX_BLOCK_BYTES", "4096");
+  ScopedEnv min_block("DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES", "4096");
+  ScopedEnv qp_budget("DFKV_RDMA_QP_BUDGET", "4096");
+  ScopedEnv wr_budget("DFKV_RDMA_WR_BUDGET", "16384");
+  ScopedEnv registered_budget("DFKV_RDMA_REGISTERED_BYTES_BUDGET",
+                              "2147483648");
+  ScopedEnv endpoint_budget("DFKV_RDMA_ENDPOINT_CACHE_MAX", "4096");
+  ScopedEnv recv_max("DFKV_RDMA_RECV_SEGMENT_SIZE", "1073741824");
+  ScopedEnv recv_chunk("DFKV_RDMA_RECV_CHUNK_BYTES", "67108864");
+  RdmaNode node("many-adaptive-conns");
+
+  std::vector<std::unique_ptr<RdmaTransport>> transports;
+  std::vector<std::unique_ptr<KVClient>> clients;
+  transports.reserve(static_cast<size_t>(count));
+  clients.reserve(static_cast<size_t>(count));
+  std::string value(4000, 'c');
+  for (int i = 0; i < count; ++i) {
+    auto transport = std::make_unique<RdmaTransport>(kMaxMsg);
+    auto client = std::make_unique<KVClient>(
+        std::vector<std::pair<std::string, std::string>>{{"n", node.addr}},
+        SelfHdr(), transport.get());
+    ASSERT_TRUE(client->Put("conn-" + std::to_string(i), value.data(),
+                            value.size()))
+        << "connection " << i;
+    transports.push_back(std::move(transport));
+    clients.push_back(std::move(client));
+  }
+  const std::string metrics = node.rsrv->MetricsText();
+  EXPECT_GE(CounterVal(metrics, "dfkv_rdma_active_conns"), count);
+  EXPECT_LE(CounterVal(metrics,
+                       "dfkv_rdma_connection_bytes{class=\"data\"}"),
+            static_cast<long>(count) * 32 * 1024);
+}
+
 TEST(RdmaLoopback, ServerReceivePoolCommitsChunksOnDemand) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   ScopedEnv recv_max("DFKV_RDMA_RECV_SEGMENT_SIZE", "4194304");
   ScopedEnv recv_chunk("DFKV_RDMA_RECV_CHUNK_BYTES", "1048576");
-  ScopedEnv max_block("DFKV_RDMA_MAX_BLOCK_BYTES", "65536");
-  ScopedEnv min_block("DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES", "4096");
+  ScopedEnv max_block("DFKV_RDMA_MAX_BLOCK_BYTES", "262144");
+  ScopedEnv min_block("DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES", "262144");
   RdmaNode node("lazy-recv-pool");
 
   std::vector<std::unique_ptr<RdmaTransport>> transports;

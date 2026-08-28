@@ -168,6 +168,12 @@ class RcEndpoint {
   // Register an exact connection-private source arena for initiator READ.
   // Unlike RegisterRemoteRegion this never widens to a shared segment MR.
   ibv_mr* RegisterRemoteReadRegion(void* base, size_t size);
+  // Register a whole receive-pool chunk once per shared PD with REMOTE_READ.
+  // The broad MR rkey is never published; BindRemoteReadWindow narrows peer
+  // access to one connection's exact lease with a type-2 Memory Window.
+  ibv_mr* RegisterRemoteReadPool(void* base, size_t size);
+  bool BindRemoteReadWindow(ibv_mr* pool_mr, void* base, size_t size,
+                            uint32_t* rkey);
 
   // Cumulative one-shot user MRs registered outside explicit pool regions.
   // These are never cached; TransientUserMrActive is the lifetime invariant.
@@ -331,6 +337,7 @@ class RcEndpoint {
   // DONE, or after explicit responder-retirement proof on failure.
   std::vector<ibv_mr*> transient_mr_;
   std::vector<ibv_mr*> connection_mr_;
+  std::vector<ibv_mw*> connection_mw_;
   QpInfo local_;
   std::atomic<bool> responder_cancelled_{false};
   size_t pending_responder_writes_ = 0;  // responder owner thread only

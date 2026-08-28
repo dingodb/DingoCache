@@ -232,6 +232,7 @@ class DiskSlabStore : public StoreEngine {
   Options opt_;
   uint32_t num_extents_ = 0;
   uint32_t max_slots_per_extent_ = 0;
+  std::vector<char> zero_extent_records_;
   std::unique_ptr<SlabAllocator> alloc_;
   std::vector<int> extent_fds_;      // resident, one per extent (buffered)
   std::vector<int> extent_dio_fds_;  // O_DIRECT twins (only when direct_writes)

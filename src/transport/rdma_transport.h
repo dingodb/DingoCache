@@ -216,6 +216,7 @@ class RdmaTransport : public Transport {
   std::unordered_map<std::string, std::vector<Conn*>> pool_;
   // Exist/Remove/Members remain isolated from payload transfers.
   std::vector<size_t> IdleDataBounds(const std::string& node) const;
+  std::vector<size_t> IdleDataDepths(const std::string& node) const;
   std::unordered_map<std::string, std::vector<Conn*>> control_pool_;
   // Last successfully published caller memory declarations. RegisterMemory
   // holds mu_ through per-rail stage/commit, so Acquire can observe either the
@@ -239,6 +240,8 @@ class RdmaTransport : public Transport {
     return declared_ ? static_cast<size_t>(declared_) : max_payload_;
   }
   size_t ConnectionBound(size_t required) const;
+  size_t ConnectionDepth(const std::string& node, Lane lane,
+                         size_t requested_credits);
   // Largest block this client has actually handed to the transport.
   mutable std::atomic<uint64_t> max_block_seen_{0};
   mutable std::atomic<uint64_t> oversize_rejects_{0};
@@ -298,6 +301,14 @@ class RdmaTransport : public Transport {
   // Connections whose clamped negotiation refunded WR/registered budget.
   std::atomic<uint64_t> depth_refunds_{0};
   std::unique_ptr<rdma::RdmaTopology> topology_;
+  using ConnectionClass = std::pair<size_t, size_t>;  // block bytes, QP depth
+  struct ConnectionClassStats {
+    uint64_t opened = 0;
+    uint64_t active = 0;
+  };
+  void MarkClassOpened(Conn* c);
+  mutable std::mutex connection_class_mu_;
+  std::map<ConnectionClass, ConnectionClassStats> connection_class_stats_;
   std::vector<std::string> devs_;  // stable discovered ACTIVE rail order
   std::vector<std::vector<uint8_t>> rail_tiers_;
   std::optional<size_t> preferred_rail_;

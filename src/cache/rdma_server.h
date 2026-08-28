@@ -209,6 +209,9 @@ class RdmaServer {
   int port_ = 0;
   std::atomic<bool> running_{false};
   std::thread accept_thread_;
+  std::thread recv_trim_thread_;
+  std::mutex recv_trim_mu_;
+  std::condition_variable recv_trim_cv_;
   // Track per-connection Serve threads + their endpoints so Stop() can wake them
   // out of WaitComp and join them before the handler's owner is destroyed, and
   // so finished threads are reaped incrementally (see ReapDoneLocked).
@@ -224,8 +227,11 @@ class RdmaServer {
   std::atomic<uint64_t> segment_evictions_{0};
   size_t recv_segment_max_bytes_ = 0;
   size_t recv_segment_chunk_bytes_ = 0;
+  uint64_t recv_chunk_idle_ms_ = 60000;
   size_t recv_segment_registered_rails_ = 0;
   std::atomic<uint64_t> pull_connections_{0};
+  std::atomic<uint64_t> pull_memory_windows_{0};
+  std::atomic<uint64_t> pull_mr_fallbacks_{0};
   std::atomic<uint64_t> legacy_connections_{0};
   std::atomic<uint64_t> data_connection_bytes_{0};
   std::atomic<uint64_t> control_connection_bytes_{0};

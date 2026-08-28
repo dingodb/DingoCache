@@ -58,8 +58,12 @@ traffic if either requirement is missing.
 | `DFKV_RDMA` | **required: `1`** | Selects the required GPUDirect RDMA transport. Unset/TCP is rejected during connector construction; there is no TCP fallback. |
 | `PYTHONHASHSEED` | **required: fixed value** | Stabilizes vLLM's root block hash across processes and restarts. Use the same value (for example `0`) on every producer and consumer sharing a store. |
 | `DFKV_RDMA_DEV` | first local `ACTIVE` HCA | Optional ordered device/fabric list. With `rail_affinity=true`, the connector narrows this full per-host list to the worker's world-group local-rank primary plus bounded fallbacks before native open. |
-| `DFKV_RDMA_DEPTH` | `4` | Negotiated request window (`min(client, server)`). Keep the defaults aligned for production connector batches. Per-connection bandwidth is depth-flat after connection setup; scale read throughput with sharded pooled connections, not by increasing depth. |
+| `DFKV_RDMA_DEPTH` | `4` ceiling | Scalar QPs open at depth1; batches select the smallest sufficient power-of-two depth up to this ceiling and the server cap. |
 | `DFKV_RDMA_NUMA` | `0` | `1` pins buffers/threads to the rail's NUMA node and picks a NUMA-local rail per connection. Optional. |
+| `DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES` | `256 KiB` | Minimum adaptive block class; logical max remains `DFKV_RDMA_MAX_BLOCK_BYTES`. |
+| `DFKV_CONNECTOR_CLIENT_RANKS` | unset=`TP` | `auto` or `N` converges fully TP-replicated MLA stores to N evenly spread ranks. Sharded DCP/PCP layouts clamp to TP. Converged loads automatically enable native GPU same-host dedup so one rank performs each remote GET and CUDA IPC publishes to followers. |
+| `DFKV_CONNECTOR_CLIENT_ELIDE` | auto in converged mode | Producer non-participants skip eager native-client creation. Explicit `0` disables elision without disabling load convergence. |
+| `DFKV_NODE_DEDUP_GPU_ARENA_MB` | `512` | Per-rank GPU rendezvous arena used by converged loads; reduce only after the largest concurrent logical object/window fits. |
 | `DFKV_READ_SHARD_KEYS` | `16` | Target keys per read shard: splits one node's batched GET into parallel shards. The real read-throughput lever on few-node rings / large batches landing on one node (single connection drains ~166 MB/s serially); no-op on wide rings. |
 | `DFKV_READ_MAX_CONNS` | `8` | Per-node cap on concurrent read-shard connections (pairs with the above; `1` disables sharding). |
 | `DFKV_FANOUT_THREADS` | `32` | Client batch-op fan-out pool cap (clamped [1,1024]). Raise when callers × node-groups ≫ 32, or batch calls degrade to caller-serial and per-call latency grows from max(group) to sum(group). |

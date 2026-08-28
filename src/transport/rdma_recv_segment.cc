@@ -1,11 +1,14 @@
 #include "transport/rdma_recv_segment.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
 #include <utility>
+
+#include "utils/numa_util.h"
 
 namespace dfkv::rdma {
 namespace {
@@ -20,6 +23,13 @@ size_t AlignUpChecked(size_t value, size_t alignment) {
     return std::numeric_limits<size_t>::max();
   }
   return (value + alignment - 1) & ~(alignment - 1);
+}
+
+uint64_t SteadyMs() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
 }
 
 }  // namespace
@@ -76,7 +86,7 @@ void RecvSegment::Lease::Reset() {
 
 RecvSegment::~RecvSegment() { std::free(data_); }
 
-bool RecvSegment::Init(size_t bytes, size_t alignment) {
+bool RecvSegment::Init(size_t bytes, size_t alignment, int numa_node) {
   if (data_) return size_ == bytes && alignment_ == alignment;
   if (bytes == 0 || !IsPowerOfTwo(alignment) || bytes % alignment != 0 ||
       alignment < sizeof(void*)) {
@@ -85,6 +95,7 @@ bool RecvSegment::Init(size_t bytes, size_t alignment) {
   void* raw = nullptr;
   if (::posix_memalign(&raw, alignment, bytes) != 0) return false;
   data_ = static_cast<char*>(raw);
+  numa::BindMemory(raw, bytes, numa_node);
   size_ = bytes;
   alignment_ = alignment;
   free_.emplace(0, bytes);
@@ -157,6 +168,37 @@ void RecvSegment::Release(size_t offset, size_t bytes) {
   free_.emplace(begin, end - begin);
 }
 
+RecvSegmentPool::Lease::Lease(Lease&& other) noexcept
+    : pool_(other.pool_),
+      lease_(std::move(other.lease_)),
+      segment_(other.segment_) {
+  other.pool_ = nullptr;
+  other.segment_ = nullptr;
+}
+
+RecvSegmentPool::Lease& RecvSegmentPool::Lease::operator=(
+    Lease&& other) noexcept {
+  if (this == &other) return *this;
+  Reset();
+  pool_ = other.pool_;
+  lease_ = std::move(other.lease_);
+  segment_ = other.segment_;
+  other.pool_ = nullptr;
+  other.segment_ = nullptr;
+  return *this;
+}
+
+RecvSegmentPool::Lease::~Lease() { Reset(); }
+
+void RecvSegmentPool::Lease::Reset() {
+  RecvSegmentPool* pool = pool_;
+  RecvSegment* segment = segment_;
+  lease_.Reset();
+  pool_ = nullptr;
+  segment_ = nullptr;
+  if (pool && segment) pool->NoteRelease(segment);
+}
+
 bool RecvSegmentPool::Init(size_t chunk_bytes, size_t max_bytes,
                            size_t alignment) {
   if (!IsPowerOfTwo(alignment) || alignment < sizeof(void*) ||
@@ -178,8 +220,9 @@ bool RecvSegmentPool::Init(size_t chunk_bytes, size_t max_bytes,
   chunk_bytes_ = aligned_chunk;
   max_bytes_ = aligned_max;
   alignment_ = alignment;
-  auto initial = std::make_unique<RecvSegment>();
-  if (!initial->Init(chunk_bytes_, alignment_)) {
+  auto initial = std::make_unique<Chunk>();
+  initial->segment = std::make_unique<RecvSegment>();
+  if (!initial->segment->Init(chunk_bytes_, alignment_)) {
     chunk_bytes_ = 0;
     max_bytes_ = 0;
     alignment_ = 0;
@@ -189,36 +232,53 @@ bool RecvSegmentPool::Init(size_t chunk_bytes, size_t max_bytes,
   return true;
 }
 
-std::unique_ptr<RecvSegment> RecvSegmentPool::NewChunk(
-    size_t minimum_bytes) {
+std::unique_ptr<RecvSegmentPool::Chunk> RecvSegmentPool::NewChunk(
+    size_t minimum_bytes, int affinity, int numa_node) {
   const size_t aligned_min = AlignUpChecked(minimum_bytes, alignment_);
   if (aligned_min == std::numeric_limits<size_t>::max()) return nullptr;
   size_t committed = 0;
-  for (const auto& chunk : chunks_) committed += chunk->size();
+  for (const auto& chunk : chunks_) committed += chunk->segment->size();
   if (committed >= max_bytes_ || aligned_min > max_bytes_ - committed)
     return nullptr;
   const size_t bytes =
       std::min(std::max(chunk_bytes_, aligned_min), max_bytes_ - committed);
-  auto chunk = std::make_unique<RecvSegment>();
-  if (!chunk->Init(bytes, alignment_)) return nullptr;
+  auto chunk = std::make_unique<Chunk>();
+  chunk->segment = std::make_unique<RecvSegment>();
+  chunk->affinity = affinity;
+  if (!chunk->segment->Init(bytes, alignment_, numa_node)) return nullptr;
   return chunk;
 }
 
 RecvSegmentPool::Lease RecvSegmentPool::Allocate(size_t bytes,
-                                                 size_t alignment) {
+                                                 size_t alignment,
+                                                 int affinity,
+                                                 int numa_node) {
   if (bytes == 0 || !IsPowerOfTwo(alignment)) return {};
   std::lock_guard<std::mutex> lock(mu_);
-  for (const auto& chunk : chunks_) {
-    auto lease = chunk->Allocate(bytes, alignment);
-    if (lease) return Lease(chunk.get(), std::move(lease));
+  auto try_chunks = [&](int wanted_affinity) -> Lease {
+    for (const auto& chunk : chunks_) {
+      if (chunk->affinity != wanted_affinity) continue;
+      auto lease = chunk->segment->Allocate(bytes, alignment);
+      if (lease) {
+        chunk->empty_since_ms = 0;
+        return Lease(this, chunk->segment.get(), std::move(lease));
+      }
+    }
+    return {};
+  };
+  if (affinity >= 0) {
+    auto lease = try_chunks(affinity);
+    if (lease) return lease;
   }
-  auto chunk = NewChunk(bytes);
+  auto shared = try_chunks(-1);
+  if (shared) return shared;
+  auto chunk = NewChunk(bytes, affinity, numa_node);
   if (!chunk) {
     allocation_failures_.fetch_add(1, std::memory_order_relaxed);
     growth_failures_.fetch_add(1, std::memory_order_relaxed);
     return {};
   }
-  RecvSegment* owner = chunk.get();
+  RecvSegment* owner = chunk->segment.get();
   chunks_.push_back(std::move(chunk));
   growths_.fetch_add(1, std::memory_order_relaxed);
   auto lease = owner->Allocate(bytes, alignment);
@@ -226,12 +286,48 @@ RecvSegmentPool::Lease RecvSegmentPool::Allocate(size_t bytes,
     allocation_failures_.fetch_add(1, std::memory_order_relaxed);
     return {};
   }
-  return Lease(owner, std::move(lease));
+  return Lease(this, owner, std::move(lease));
+}
+
+void RecvSegmentPool::NoteRelease(RecvSegment* segment) {
+  std::lock_guard<std::mutex> lock(mu_);
+  for (const auto& chunk : chunks_) {
+    if (chunk->segment.get() != segment) continue;
+    if (chunk->segment->stats().used_bytes == 0)
+      chunk->empty_since_ms = SteadyMs();
+    return;
+  }
+}
+
+size_t RecvSegmentPool::TrimIdle(uint64_t idle_ms) {
+  if (idle_ms == 0) return 0;
+  const uint64_t now = SteadyMs();
+  size_t released = 0;
+  std::lock_guard<std::mutex> lock(mu_);
+  for (size_t i = chunks_.size(); i > 1; --i) {
+    auto& chunk = chunks_[i - 1];
+    if (chunk->segment->stats().used_bytes != 0) {
+      chunk->empty_since_ms = 0;
+      continue;
+    }
+    if (chunk->empty_since_ms == 0) {
+      chunk->empty_since_ms = now;
+      continue;
+    }
+    if (now - chunk->empty_since_ms < idle_ms) continue;
+    released += chunk->segment->size();
+    chunks_.erase(chunks_.begin() + static_cast<std::ptrdiff_t>(i - 1));
+  }
+  if (released != 0) {
+    shrinks_.fetch_add(1, std::memory_order_relaxed);
+    released_bytes_.fetch_add(released, std::memory_order_relaxed);
+  }
+  return released;
 }
 
 RecvSegment* RecvSegmentPool::initial_segment() const {
   std::lock_guard<std::mutex> lock(mu_);
-  return chunks_.empty() ? nullptr : chunks_.front().get();
+  return chunks_.empty() ? nullptr : chunks_.front()->segment.get();
 }
 
 RecvSegmentPool::Stats RecvSegmentPool::stats() const {
@@ -240,7 +336,7 @@ RecvSegmentPool::Stats RecvSegmentPool::stats() const {
   out.max_bytes = max_bytes_;
   out.chunks = chunks_.size();
   for (const auto& chunk : chunks_) {
-    const RecvSegment::Stats current = chunk->stats();
+    const RecvSegment::Stats current = chunk->segment->stats();
     out.committed_bytes += current.total_bytes;
     out.used_bytes += current.used_bytes;
     out.free_bytes += current.free_bytes;
@@ -248,6 +344,8 @@ RecvSegmentPool::Stats RecvSegmentPool::stats() const {
         std::max(out.largest_free_range, current.largest_free_range);
   }
   out.growths = growths_.load(std::memory_order_relaxed);
+  out.shrinks = shrinks_.load(std::memory_order_relaxed);
+  out.released_bytes = released_bytes_.load(std::memory_order_relaxed);
   out.allocation_failures =
       allocation_failures_.load(std::memory_order_relaxed);
   out.growth_failures = growth_failures_.load(std::memory_order_relaxed);

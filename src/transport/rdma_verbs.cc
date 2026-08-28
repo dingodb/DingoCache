@@ -344,6 +344,8 @@ RcEndpoint::~RcEndpoint() { Close(); }
 
 void RcEndpoint::Close() {
   if (qp_) { ibv_destroy_qp(qp_); qp_ = nullptr; }
+  for (auto* mw : connection_mw_) if (mw) ibv_dealloc_mw(mw);
+  connection_mw_.clear();
   for (auto* m : smr_) if (m) ibv_dereg_mr(m);
   for (auto* m : rmr_) if (m) ibv_dereg_mr(m);
   for (auto* m : dmr_) if (m) ibv_dereg_mr(m);
@@ -745,6 +747,52 @@ ibv_mr* RcEndpoint::RegisterRemoteReadRegion(void* base, size_t size) {
   if (!mr) return nullptr;
   connection_mr_.push_back(mr);
   return mr;
+}
+
+ibv_mr* RcEndpoint::RegisterRemoteReadPool(void* base, size_t size) {
+  if (!ctx_ || !pd_ || !base || size == 0) return nullptr;
+  const int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ;
+  const auto b = reinterpret_cast<uintptr_t>(base);
+  for (const auto& pool : pool_mr_) {
+    if (pool.base == b && pool.size >= size &&
+        (pool.access & access) == access)
+      return pool.mr;
+  }
+  ibv_mr* mr = SharedAddPoolMr(ctx_, pd_, base, size, access);
+  if (!mr) return nullptr;
+  pool_mr_.insert(pool_mr_.begin(), PoolMr{b, size, access, mr});
+  return mr;
+}
+
+bool RcEndpoint::BindRemoteReadWindow(ibv_mr* pool_mr, void* base,
+                                      size_t size, uint32_t* rkey) {
+  if (!qp_ || !pd_ || !pool_mr || !base || size == 0 || !rkey)
+    return false;
+  ibv_mw* mw = ibv_alloc_mw(pd_, IBV_MW_TYPE_2);
+  if (!mw) return false;
+  ibv_send_wr wr{}, *bad = nullptr;
+  wr.wr_id = std::numeric_limits<uint64_t>::max();
+  wr.opcode = IBV_WR_BIND_MW;
+  wr.send_flags = IBV_SEND_SIGNALED;
+  wr.bind_mw.mw = mw;
+  wr.bind_mw.rkey = ibv_inc_rkey(mw->rkey);
+  wr.bind_mw.bind_info.mr = pool_mr;
+  wr.bind_mw.bind_info.addr = reinterpret_cast<uintptr_t>(base);
+  wr.bind_mw.bind_info.length = size;
+  wr.bind_mw.bind_info.mw_access_flags = IBV_ACCESS_REMOTE_READ;
+  if (ibv_post_send(qp_, &wr, &bad) != 0) {
+    ibv_dealloc_mw(mw);
+    return false;
+  }
+  ibv_wc wc{};
+  const int got = WaitComp(&wc, 1, 10000);
+  if (got != 1 || wc.status != IBV_WC_SUCCESS) {
+    ibv_dealloc_mw(mw);
+    return false;
+  }
+  connection_mw_.push_back(mw);
+  *rkey = wr.bind_mw.rkey;
+  return true;
 }
 
 ibv_mr* RcEndpoint::RegisterUser(void* addr, size_t len) {
