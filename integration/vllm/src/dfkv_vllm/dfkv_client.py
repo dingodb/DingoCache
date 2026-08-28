@@ -252,6 +252,7 @@ class DfkvDeviceClient:
         client_heartbeat_ms: int = 10000,
         model: str = "",
         cache_role: str = "",
+        require_rdma: bool = True,
     ):
         if not key_namespace:
             raise ValueError("DfkvDeviceClient requires a non-empty key namespace")
@@ -297,7 +298,7 @@ class DfkvDeviceClient:
                 "dfkv_transport_mode failed; set DFKV_RDMA=1 and configure "
                 "a usable RDMA device"
             ) from exc
-        if mode != b"rdma":
+        if require_rdma and mode != b"rdma":
             rejected_handle = self._h
             self._h = None
             self._lib.dfkv_close(rejected_handle)

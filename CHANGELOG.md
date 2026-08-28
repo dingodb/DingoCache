@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### vLLM hybrid state and explicit TCP staging
+
+- Accepted align-mode hybrid cache groups whose Mamba block size differs from
+  the attention cache block size. The connector already resolves the scheduler
+  LCM and preserves each group's physical block geometry; the old equality
+  gate incorrectly rejected Qwen3.8-Flash-Next (`400` vs `4`) at startup.
+- Added opt-in `require_rdma=false` for the vLLM connector. The default remains
+  fail-closed GPUDirect RDMA; the opt-in path uses libdfkv's bounded host
+  staging plus final CUDA publication and enables a correctness-first fallback
+  when a platform's inbound GPUDirect GET path is unusable.
+
 ### LMCache rank-local rail affinity
 
 - Added opt-in `rail_affinity` and `rail_affinity_fallbacks` plugin settings to
