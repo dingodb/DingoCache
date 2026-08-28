@@ -84,11 +84,12 @@ tp_rank=..,ver=<lib>`（无 `role`——HiCache 是前缀 L3 缓存，无生产/
 |-----|------|------|------|
 | `DFKV_RDMA` | 一般路径未设 = TCP；**vLLM 直连无默认，必须 `1`** | 按连接器选择 | `1` 显式选择 native-verbs RDMA v2；请求 RDMA 后设备或协议不可用会失败，不会自动选择 TCP。`DfkvStoreConnector` 只接收 GPU 设备指针，构造时会关闭并拒绝任何非 RDMA handle。 |
 | `DFKV_RDMA_DEV` | 首个 `ACTIVE` 本地 HCA | 留空让两端各自选本地首口；多轨才显式写同 fabric 白名单 | 留空时 bootstrap 不发送设备名，client/server 可使用不同本地命名。逗号列表显式开启多轨，新连接在健康轨间轮转；显式设备名会发给 peer，故两端必须存在同名且互通的 fabric。设备名上限 **18 字节**（v2 bootstrap dev frame 限制），超长即 fail-fast 拒绝启动/建连，不会静默截断（见 `src/transport/dev_frame.h`）。 |
-| `DFKV_RDMA_DEPTH` | `4` | 两侧可不同，按容量选 | 握手协商 `min(client,server)`。每条 pull data QP 租 `2 × depth × adaptive_slot`；control buffer 始终有界。 |
+| `DFKV_RDMA_DEPTH` | `4` ceiling | 两侧保持上限一致 | scalar QP=depth1；batch按实际window选择最小power-of-two depth class，再由server cap钳制。 |
 | `DFKV_RDMA_MAX_BLOCK_BYTES` | 4 MiB 逻辑上限 | 覆盖最大合法对象 | 只做 deterministic oversize guard；不再让所有连接按最大值预留。 |
 | `DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES` | 256 KiB | 覆盖常见小块，保持默认起步 | 当前操作最大对象按 power-of-two 向上取 connection class；idle pool 选最小可满足 QP。 |
 | `DFKV_RDMA_RECV_SEGMENT_SIZE` | 16 GiB | 按 peak live/pooled QP 设 hard budget | server receive-pool 最大提交量；不再启动期全量申请。 |
 | `DFKV_RDMA_RECV_CHUNK_BYTES` | 256 MiB | 保持默认，除非常见 connection class 更大 | server 启动只提交一个 chunk，后续 allocation miss 按需增长，不超过 hard budget。 |
+| `DFKV_RDMA_RECV_CHUNK_IDLE_MS` | 60 s | 保持默认 | 空闲非初始chunk到期返还；`0`关闭。增长chunk绑定首次使用rail/NUMA。 |
 | `DFKV_RDMA_NUMA` | `0` | 显式多轨的大机可设 `1` | 建连按调用线程 NUMA 选 rail；动态 chunk 在实际租用它的 endpoint rail 上注册。 |
 | `DFKV_RDMA_MAX_PAYLOAD_BYTES` | 64 MiB（67108864） | — | 客户端单 value payload 上限（不得超过 server 侧同名上限） |
 | `DFKV_CUDA_PINNED_POOL_BYTES` | 64 MiB（67108864） | 按进程允许的 CUDA pinned host memory / memlock 设置 | vLLM CUDA GET publication 的进程级 bounce pool 预算。取正十进制字节数，最大 4 GiB；预算向下取整为完整 slot，且至少容纳一个 slot、最多 4096 个。非法或与 slot 不兼容的组合告警并回退整组默认值。slot 按需创建，因此实际 pinned high-water 不超过取整后的预算。 |
@@ -132,8 +133,10 @@ connection_class =
   min(logical_max,
       next_power_of_two(max(actual_bytes,
                             DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES)))
+depth_class = min(server_depth,
+                  next_power_of_two(max(actual_window, 1)))
 S_data = align4K(4096 + connection_class)
-B_connection = 2 × depth × S_data
+B_connection = 2 × depth_class × S_data
 ```
 
 同一 peer/rail 的 idle pool 选择最小可满足 class；没有才建新 QP。pool 满时，
@@ -586,9 +589,9 @@ server 启动只注册首个 receive chunk；新 data QP 租当前 operation cla
 L2-bypass 不需要独立 server 协议，但三项决定 v2 容量：
 
 - `DFKV_RDMA_RECV_SEGMENT_SIZE`：receive-pool hard budget；
-- `DFKV_RDMA_RECV_CHUNK_BYTES`：启动/增量提交粒度；
+- `DFKV_RDMA_RECV_CHUNK_BYTES` / `_IDLE_MS`：启动/增量提交粒度与空chunk保留期；
 - `DFKV_RDMA_MAX_BLOCK_BYTES`、`DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES` 与
-  `DFKV_RDMA_DEPTH`：分别决定逻辑上限、最小 class 和每 QP lease。
+  `DFKV_RDMA_DEPTH`：决定逻辑上限、最小block class和adaptive depth ceiling。
 
 #### 验证清单
 

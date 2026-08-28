@@ -103,6 +103,22 @@ size_t RecvChunkBytes(size_t max_bytes) {
   return bytes;
 }
 
+uint64_t RecvChunkIdleMs() {
+  constexpr uint64_t kDefault = 60000;
+  const char* value = std::getenv("DFKV_RDMA_RECV_CHUNK_IDLE_MS");
+  uint64_t out = kDefault;
+  if (value && *value) {
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (errno == 0 && end != value && *end == '\0')
+      out = std::min<uint64_t>(parsed, 86400000);
+  }
+  config_dump::RecordResolved("DFKV_RDMA_RECV_CHUNK_IDLE_MS",
+                              std::to_string(out));
+  return out;
+}
+
 const char* DiscoveryStatusName(rdma::RdmaDiscoveryStatus status) {
   switch (status) {
     case rdma::RdmaDiscoveryStatus::kOk:
@@ -288,6 +304,7 @@ Status RdmaServer::Start(int port) {
   // now the hard process budget rather than an eager allocation size.
   recv_segment_max_bytes_ = RecvSegmentBytes();
   recv_segment_chunk_bytes_ = RecvChunkBytes(recv_segment_max_bytes_);
+  recv_chunk_idle_ms_ = RecvChunkIdleMs();
   const size_t min_slot_bytes = rdma::V2SlotSize(max_msg_);
   if (min_slot_bytes == 0 ||
       recv_segment_max_bytes_ < 2 * min_slot_bytes ||
@@ -366,13 +383,30 @@ Status RdmaServer::Start(int port) {
   running_ = true;
   accept_thread_ =
       std::thread([this] { NameThisThread("rdma-accept"); AcceptLoop(); });
+  if (recv_chunk_idle_ms_ != 0) {
+    recv_trim_thread_ = std::thread([this] {
+      NameThisThread("rdma-recv-trim");
+      std::unique_lock<std::mutex> lock(recv_trim_mu_);
+      while (running_.load(std::memory_order_relaxed)) {
+        if (recv_trim_cv_.wait_for(lock, std::chrono::seconds(1), [this] {
+              return !running_.load(std::memory_order_relaxed);
+            }))
+          break;
+        lock.unlock();
+        recv_segments_.TrimIdle(recv_chunk_idle_ms_);
+        lock.lock();
+      }
+    });
+  }
   return Status::kOk;
 }
 
 void RdmaServer::Stop() {
   if (!running_.exchange(false)) return;
+  recv_trim_cv_.notify_all();
   if (listen_fd_ >= 0) ::shutdown(listen_fd_, SHUT_RDWR);  // wake accept()
   if (accept_thread_.joinable()) accept_thread_.join();
+  if (recv_trim_thread_.joinable()) recv_trim_thread_.join();
   if (listen_fd_ >= 0) { ::close(listen_fd_); listen_fd_ = -1; }
   // Wake every in-flight Serve thread out of WaitComp, then join them all so no
   // handler call can race the owner's destruction after Stop() returns.
@@ -596,6 +630,7 @@ void RdmaServer::Serve(int boot_fd) {
   const size_t rail_index =
       static_cast<size_t>(std::distance(anchor_devs_.begin(), rail_it));
   RailStats& rail_stats = *rail_stats_[rail_index];
+  const int rail_numa = anchors_[rail_index]->numa_node();
 
   // The client sends QpInfo first. Read and validate its mandatory v2 depth
   // before allocating per-connection control slots or leasing shared receive
@@ -619,8 +654,9 @@ void RdmaServer::Serve(int boot_fd) {
     ::close(boot_fd);
     return;
   }
-  rdma::RecvSegmentPool::Lease recv_lease =
-      recv_segments_.Allocate(K * slot_size, rdma::kV2DataOffset);
+  rdma::RecvSegmentPool::Lease recv_lease = recv_segments_.Allocate(
+      K * slot_size, rdma::kV2DataOffset, static_cast<int>(rail_index),
+      rail_numa);
   if (!recv_lease) {
     // Segment exhausted: evict the stalest idle connection(s) to make room
     // before refusing. Client pooled connections re-dial via the stale-retry
@@ -654,8 +690,9 @@ void RdmaServer::Serve(int boot_fd) {
       // down its endpoint and releases the lease asynchronously.
       for (int i = 0; i < 100 && !recv_lease; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        recv_lease =
-            recv_segments_.Allocate(K * slot_size, rdma::kV2DataOffset);
+        recv_lease = recv_segments_.Allocate(
+            K * slot_size, rdma::kV2DataOffset,
+            static_cast<int>(rail_index), rail_numa);
       }
     }
     if (!recv_lease) {
@@ -672,8 +709,9 @@ void RdmaServer::Serve(int boot_fd) {
   }
   rdma::RecvSegmentPool::Lease pull_lease;
   if (pull_read_requested) {
-    pull_lease =
-        recv_segments_.Allocate(K * slot_size, rdma::kV2DataOffset);
+    pull_lease = recv_segments_.Allocate(
+        K * slot_size, rdma::kV2DataOffset,
+        static_cast<int>(rail_index), rail_numa);
     if (!pull_lease) {
       const auto stats = recv_segments_.stats();
       DFKV_LOG_ERROR(
@@ -777,16 +815,24 @@ void RdmaServer::Serve(int boot_fd) {
     ::close(boot_fd);
     return;
   }
+  ibv_mr* pull_pool_mr = nullptr;
   ibv_mr* pull_segment_mr = nullptr;
+  uint32_t pull_rkey = 0;
   if (pull_read_requested) {
-    pull_segment_mr =
-        ep.RegisterRemoteReadRegion(pull_lease.data(), pull_lease.size());
-    if (!pull_segment_mr) {
-      DFKV_LOG_ERROR(
-          "rdma v2: connection-private pull-read MR unavailable on device " +
-          (dev.empty() ? std::string("(auto)") : dev));
-      ::close(boot_fd);
-      return;
+    pull_pool_mr = ep.RegisterRemoteReadPool(
+        pull_lease.segment()->data(), pull_lease.segment()->size());
+    if (!pull_pool_mr) {
+      pull_segment_mr =
+          ep.RegisterRemoteReadRegion(pull_lease.data(), pull_lease.size());
+      if (!pull_segment_mr) {
+        DFKV_LOG_ERROR(
+            "rdma v2: pull-read MR unavailable on device " +
+            (dev.empty() ? std::string("(auto)") : dev));
+        ::close(boot_fd);
+        return;
+      }
+      pull_rkey = pull_segment_mr->rkey;
+      pull_mr_fallbacks_.fetch_add(1, std::memory_order_relaxed);
     }
   }
   DFKV_LOG_INFO("rdma conn: protocol=v2 declared=" +
@@ -808,6 +854,25 @@ void RdmaServer::Serve(int boot_fd) {
       !ep.Connect(peer_info)) {
     ::close(boot_fd);
     return;
+  }
+  if (pull_read_requested && pull_pool_mr) {
+    if (ep.BindRemoteReadWindow(pull_pool_mr, pull_lease.data(),
+                                pull_lease.size(), &pull_rkey)) {
+      pull_memory_windows_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      pull_segment_mr =
+          ep.RegisterRemoteReadRegion(pull_lease.data(), pull_lease.size());
+      if (!pull_segment_mr) {
+        DFKV_LOG_ERROR(
+            "rdma v2: pull-read Memory Window bind and exact MR fallback "
+            "both failed on device " +
+            (dev.empty() ? std::string("(auto)") : dev));
+        ::close(boot_fd);
+        return;
+      }
+      pull_rkey = pull_segment_mr->rkey;
+      pull_mr_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+    }
   }
   if (!ep.EnsurePoolMrs(user_regions_)) {
     DFKV_LOG_ERROR("rdma: connection could not attach explicit user MRs");
@@ -860,9 +925,9 @@ void RdmaServer::Serve(int boot_fd) {
   if (pull_read_requested) {
     const rdma::PullArenaInfo pull_info{
         reinterpret_cast<uint64_t>(pull_lease.data()), pull_lease.size(),
-        writer_token, pull_segment_mr->rkey, static_cast<uint32_t>(K)};
-    readiness_bytes = rdma::EncodeV2PullReadiness(
-        info, writer_token, pull_info, readiness);
+        writer_token, pull_rkey, static_cast<uint32_t>(K)};
+    readiness_bytes =
+        rdma::EncodeV2PullReadiness(info, writer_token, pull_info, readiness);
   } else {
     readiness_bytes =
         rdma::EncodeV2Readiness(info, writer_token, readiness);
@@ -2037,6 +2102,15 @@ std::string RdmaServer::MetricsText() const {
     segment.largest_free_range);
   m(s, "dfkv_rdma_recv_segment_growths_total", "counter",
     "Receive chunks committed after startup", segment.growths);
+  m(s, "dfkv_rdma_recv_segment_shrinks_total", "counter",
+    "Receive-pool trim passes that released empty non-initial chunks",
+    segment.shrinks);
+  m(s, "dfkv_rdma_recv_segment_released_bytes_total", "counter",
+    "Receive-pool bytes returned after the idle hold period",
+    segment.released_bytes);
+  m(s, "dfkv_rdma_recv_segment_chunk_idle_ms", "gauge",
+    "Idle hold before an empty non-initial receive chunk is released",
+    recv_chunk_idle_ms_);
   m(s, "dfkv_rdma_recv_segment_growth_failures_total", "counter",
     "Receive-pool growth attempts rejected by budget or allocation",
     segment.growth_failures);
@@ -2049,6 +2123,12 @@ std::string RdmaServer::MetricsText() const {
   m(s, "dfkv_rdma_pull_connections", "gauge",
     "Connections currently holding negotiated pull-read arenas",
     pull_connections_.load(std::memory_order_relaxed));
+  m(s, "dfkv_rdma_pull_memory_windows_total", "counter",
+    "Pull-read connections isolated with type-2 Memory Windows",
+    pull_memory_windows_.load(std::memory_order_relaxed));
+  m(s, "dfkv_rdma_pull_mr_fallbacks_total", "counter",
+    "Pull-read connections using exact per-connection MR fallback",
+    pull_mr_fallbacks_.load(std::memory_order_relaxed));
   m(s, "dfkv_rdma_legacy_connections", "gauge",
     "Connections currently holding only legacy receive arenas",
     legacy_connections_.load(std::memory_order_relaxed));

@@ -17,10 +17,13 @@ behalf of all (SGLang HiCache has shipped the N=1 mode as backup_skip)."""
 from __future__ import annotations
 
 import logging
+from collections.abc import MutableMapping
 
 logger = logging.getLogger(__name__)
 
 ENV_NAME = "DFKV_CONNECTOR_CLIENT_RANKS"
+NODE_DEDUP_ENV = "DFKV_CLIENT_NODE_DEDUP"
+GPU_DEDUP_ENV = "DFKV_CLIENT_NODE_DEDUP_GPU"
 
 
 def resolve_client_ranks(
@@ -58,6 +61,28 @@ def participant(tp_rank: int, tp_size: int, effective: int) -> int | None:
         return None
     idx = tp_rank // spacing
     return idx if idx < effective else None
+
+def configure_load_convergence(
+    env: MutableMapping[str, str],
+    tp_size: int,
+    effective: int,
+    replicated: bool,
+) -> tuple[bool, str]:
+    """Enable the native same-host GPU rendezvous for converged replicated KV.
+
+    All TP ranks still execute vLLM's load callback, but only the native dedup
+    fetch leader opens a remote QP; followers receive the identical MLA bytes
+    through CUDA IPC. Explicit operator values win over these safe defaults.
+    """
+    if not replicated or effective >= tp_size:
+        return False, "clamped(no-load-convergence)"
+    if env.get(NODE_DEDUP_ENV, "1") != "1" or env.get(
+        GPU_DEDUP_ENV, "1"
+    ) != "1":
+        return False, "disabled(native-gpu-dedup)"
+    env.setdefault(NODE_DEDUP_ENV, "1")
+    env.setdefault(GPU_DEDUP_ENV, "1")
+    return True, f"native-gpu-dedup({effective}/{tp_size})"
 
 
 ELIDE_ENV = "DFKV_CONNECTOR_CLIENT_ELIDE"

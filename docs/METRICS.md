@@ -162,8 +162,10 @@ RDMA-listener scrape inventory。
 | `dfkv_rdma_recv_segment_used_bytes` / `free_bytes` | gauge | 已提交 chunk 中 lease 占用 / 空闲字节 |
 | `dfkv_rdma_recv_segment_largest_free_range_bytes` | gauge | 任一 chunk 最大连续 free range |
 | `dfkv_rdma_recv_segment_growths_total` / `growth_failures_total` | counter | 启动后 chunk 增长成功 / 因预算或分配失败 |
+| `dfkv_rdma_recv_segment_shrinks_total` / `released_bytes_total` / `chunk_idle_ms` | counter / gauge | 空闲缩容次数 / 已返还字节 / 非初始chunk空闲保留期 |
 | `dfkv_rdma_recv_segment_allocation_failures_total` | counter | grow 后仍无法满足的最终 allocation |
 | `dfkv_rdma_pull_connections` / `dfkv_rdma_legacy_connections` | gauge | 当前 pull-read / legacy responder-write connection 数 |
+| `dfkv_rdma_pull_memory_windows_total` / `dfkv_rdma_pull_mr_fallbacks_total` | counter | exact lease使用type-2 MW隔离 / 硬件不支持时回退per-connection MR |
 | `dfkv_rdma_connection_bytes{class=\"data|control\"}` | gauge | data/control connection 当前 lease 字节；应随 adaptive class 而非 logical max 增长 |
 | `dfkv_rdma_recv_segment_registered_rails` | gauge | 成功注册初始 receive chunk 的 rail 数；后续 chunk 按使用 rail 惰性注册 |
 | `dfkv_rdma_v2_ready` | gauge | 初始 receive chunk 与 rail anchor 是否就绪 |
@@ -337,6 +339,8 @@ C 客户端快照还含传输级指标（RDMA 构建）：
 | `dfkv_rdma_client_pool_mr_registrations_total` / `dfkv_rdma_client_pool_mr_registration_failures_total` | counter | shared-PD 上真实 `ibv_reg_mr` 次数 / 单 rail 显式 pool 注册失败；包含最终回滚的尝试 |
 | `dfkv_rdma_client_pool_mr_active_registrations` | gauge | 进程内仍有 endpoint 引用的 shared-PD MR generations；扩容成功后 anchor/空闲 endpoint 立即释放旧代，在飞旧 endpoint 到下次 acquire/close 才释放，确保旧 range 不中断 |
 | `dfkv_rdma_client_max_block_seen_bytes` / `dfkv_rdma_client_declared_max_block_bytes` / `dfkv_rdma_client_connection_min_block_bytes` | gauge | 实际请求高水位 / 逻辑安全上限 / adaptive QP 最小 class |
+| `dfkv_rdma_client_connection_class_opened_total{block_bytes,depth}` | counter | adaptive二维class累计新建data QP |
+| `dfkv_rdma_client_connection_class_active{block_bytes,depth}` / `connection_class_idle{block_bytes,depth}` | gauge | 当前执行中 / idle pool内的二维class分布；label集合受power-of-two class限制 |
 | `dfkv_rdma_client_oversize_rejects_total` | counter | 分配、注册或发帖前因超过声明上限而拒绝的操作 |
 | `dfkv_rdma_client_v2_probe_attempts_total` / `dfkv_rdma_client_v2_probe_failures_total` | counter | 必选 v2 bootstrap probe 尝试 / 失败 |
 | `dfkv_rdma_client_stale_pool_retries_total` | counter | pooled QP 失败后改用 fresh connection 的重试 |

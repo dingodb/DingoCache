@@ -14,11 +14,26 @@
   `DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES` (default 256 KiB) as the floor.
 - Idle endpoint reuse selects the smallest sufficient class, and a full idle
   pool prefers a smaller returning QP over its largest retained QP.
+- Extended adaptive geometry to QP depth: scalar operations open depth-1 QPs,
+  while batched operations select the smallest sufficient power-of-two depth.
+  Pool reuse and resource accounting now match both block and depth classes,
+  with bounded per-class opened/active/idle metrics.
+- Replaced per-connection pull-read MR registration with type-2 Memory Windows
+  over shared per-PD chunk MRs. Hardware without Memory Window support retains
+  the exact-range MR fallback and exposes which path each connection used.
+- Affinitized growth chunks to their first rail/NUMA node, and added idle
+  shrinking for empty non-initial chunks (`DFKV_RDMA_RECV_CHUNK_IDLE_MS`,
+  default 60 s). The initial shared chunk is never released.
 - Changed watermark eviction to a persistent high/low hysteresis drain bounded
   by `DFKV_SLAB_EVICT_MAX_EXTENTS_PER_TICK` (default one). Whole extents clear
   `slots.tbl` in one contiguous write instead of one 64-byte pwrite per slot.
-- Added receive-pool growth/budget metrics and watermark active/tick/duration/
-  extent-clear metrics.
+- Added receive-pool growth/shrink/budget, pull Memory Window/fallback,
+  adaptive connection-class, and watermark active/tick/duration/clear metrics.
+- Reused one preallocated zero-record buffer for extent metadata clears,
+  removing allocation and repeated zero-fill work from the watermark lock.
+- Completed vLLM replicated-MLA rank convergence: converged client-rank mode
+  automatically enables native same-host GPU rendezvous, so one rank performs
+  each remote GET and CUDA IPC publishes identical bytes to TP followers.
 - On xb01-0064, 80 live 1 MiB data QPs under a 64 MiB logical ceiling used
   674 MiB across three lazy chunks and completed 10,000/10,000 PUTs; v2.23.3's
   fixed geometry exhausted an 8 GiB segment at roughly 15 such QPs. Sustained

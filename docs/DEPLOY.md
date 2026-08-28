@@ -362,11 +362,11 @@ journalctl -u dfkv -n 10 --no-pager
 > `kNoCompatibleRail` 均不增加 local rail error。cooldown 到期仍只准入一个真实
 > recovery probe。
 >
-> **v2 receive-pool 预算**：每条 data QP 按实际 connection class 计算
-> `slot=align4K(4096 + class)`，pull-read lease 为
-> `2 × depth × slot`。`DFKV_RDMA_RECV_SEGMENT_SIZE` 是 hard budget，
-> `DFKV_RDMA_RECV_CHUNK_BYTES` 是惰性提交粒度。上线看 committed/max/chunks、
-> used/free、growth/allocation failures；只有 hard budget 或注册失败才拒绝连接。
+> **v2 receive-pool 预算**：每条data QP按实际block/depth二维class计算
+> `slot=align4K(4096 + block_class)`，pull-read lease为
+> `2 × depth_class × slot`。`DFKV_RDMA_RECV_SEGMENT_SIZE`是hard budget，
+> `_CHUNK_BYTES`是惰性提交粒度，`_CHUNK_IDLE_MS`控制空chunk返还。
+> 上线看committed/max/chunks、used/free、growth/shrink/failure和MW/fallback。
 
 ### 3a. 每节点 tenant quota
 
@@ -445,7 +445,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `--put-inflight-limit` / `DFKV_PUT_INFLIGHT_LIMIT` | `0`=关 | 并发盘写上限，超出返回 kCacheFull 快速拒绝 |
 | `--tcp-max-conns` / `DFKV_TCP_MAX_CONNS` | `512`, 硬上限 4096 | cache TCP handler 上限；超限 accept 恒拒 |
 | `--tcp-io-timeout-s` / `DFKV_TCP_IO_TIMEOUT_S` | `60`, 硬上限 3600 | per-syscall RCVTIMEO（秒） |
-| `--rdma-depth` / `DFKV_RDMA_DEPTH` | `4` | server 提交 QP post 深度；与 client 协商取 `min` |
+| `--rdma-depth` / `DFKV_RDMA_DEPTH` | `4` | server ceiling；client scalar=1，batch按实际window选择depth class后再协商取min |
 | `--rdma-numa` / `DFKV_RDMA_NUMA` | `0` | NUMA-aware rail choice（off/1） |
 | `--rdma-idle-ms` / `DFKV_RDMA_IDLE_MS` | — | idle connection reaper tick |
 | `--rdma-op-timeout-ms` / `DFKV_RDMA_OP_TIMEOUT_MS` | `5000` | per-op RDMA deadline |
@@ -465,6 +465,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 |---|---|---|
 | `DFKV_RDMA_RECV_SEGMENT_SIZE` | `16 GiB` | server receive-pool hard budget；不再启动期全量分配 |
 | `DFKV_RDMA_RECV_CHUNK_BYTES` | `256 MiB` | server 启动与增量提交粒度 |
+| `DFKV_RDMA_RECV_CHUNK_IDLE_MS` | `60000` | 空闲非初始chunk返还延迟；`0`关闭缩容 |
 | `DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES` | `256 KiB` | client adaptive data-QP 最小 class；实际对象向上取 power-of-two |
 | `DFKV_RDMA_CONNECT_MS` | — | client：IB QP 建连超时 |
 | `DFKV_RDMA_IO_MS` | — | client：控制面帧读写超时 |

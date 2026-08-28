@@ -393,6 +393,7 @@ struct RdmaTransport::Conn {
   rdma::ResourceRequest budget_request;
   bool budget_held = false;
   size_t declared_bytes = 0;
+  size_t depth = 1;
   Lane lane = Lane::kData;
   bool active_counted = false;
   bool live_counted = false;
@@ -859,6 +860,12 @@ void RdmaTransport::CompleteRemoteLease(Conn* c,
                  outcome);
 }
 
+void RdmaTransport::MarkClassOpened(Conn* c) {
+  if (!c || c->lane == Lane::kControl) return;
+  std::lock_guard<std::mutex> lock(connection_class_mu_);
+  ++connection_class_stats_[{c->declared_bytes, c->depth}].opened;
+}
+
 void RdmaTransport::MarkActive(Conn* c, Lane lane) {
   if (!c || c->active_counted || c->rail_index >= devs_.size()) return;
   c->lane = lane;
@@ -866,6 +873,10 @@ void RdmaTransport::MarkActive(Conn* c, Lane lane) {
   const size_t index =
       static_cast<size_t>(lane) * devs_.size() + c->rail_index;
   active_lane_rail_[index].fetch_add(1, std::memory_order_relaxed);
+  if (lane != Lane::kControl) {
+    std::lock_guard<std::mutex> lock(connection_class_mu_);
+    ++connection_class_stats_[{c->declared_bytes, c->depth}].active;
+  }
 }
 
 void RdmaTransport::MarkInactive(Conn* c) {
@@ -874,6 +885,12 @@ void RdmaTransport::MarkInactive(Conn* c) {
   const size_t index =
       static_cast<size_t>(c->lane) * devs_.size() + c->rail_index;
   active_lane_rail_[index].fetch_sub(1, std::memory_order_relaxed);
+  if (c->lane != Lane::kControl) {
+    std::lock_guard<std::mutex> lock(connection_class_mu_);
+    auto& active =
+        connection_class_stats_[{c->declared_bytes, c->depth}].active;
+    if (active != 0) --active;
+  }
 }
 
 void RdmaTransport::MarkLive(Conn* c) {
@@ -1182,6 +1199,8 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
         const uint64_t now = rdma::RailPolicy::NowMicros();
         rail_policy_->Complete(*lease, now - lease_started, completion, now);
       };
+  const size_t required_depth =
+      ConnectionDepth(node, lane, options.requested_credits);
 
   std::vector<std::pair<void*, size_t>> pools;
   std::vector<Conn*> stale;
@@ -1214,15 +1233,20 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
         }
         size_t best = pool_candidates.size();
         size_t best_bound = std::numeric_limits<size_t>::max();
+        size_t best_depth = std::numeric_limits<size_t>::max();
         for (size_t i = 0; i < pool_candidates.size(); ++i) {
           Conn* candidate = pool_candidates[i];
           if (candidate->peer_id == peer_snapshot->peer_id &&
               candidate->peer_publication == peer_snapshot->publication &&
               candidate->rail_index == ridx &&
               candidate->declared_bytes >= required_bound &&
-              candidate->declared_bytes < best_bound) {
+              candidate->depth >= required_depth &&
+              (candidate->declared_bytes < best_bound ||
+               (candidate->declared_bytes == best_bound &&
+                candidate->depth < best_depth))) {
             best = i;
             best_bound = candidate->declared_bytes;
+            best_depth = candidate->depth;
           }
         }
         if (best < pool_candidates.size() &&
@@ -1267,7 +1291,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
 
   endpoint_cache_misses_.fetch_add(1, std::memory_order_relaxed);
   // Open, announce, and budget only the size class this operation needs.
-  const size_t conn_depth = LearnedDepth(node, lane);
+  const size_t conn_depth = required_depth;
   const uint64_t conn_declared =
       lane == Lane::kControl
           ? static_cast<uint64_t>(rdma::kV2ControlCap)
@@ -1338,6 +1362,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
       remote_lease ? remote_lease->generation : 0;
   conn->remote_lease_held = remote_lease.has_value();
   conn->declared_bytes = static_cast<size_t>(conn_declared);
+  conn->depth = conn_depth;
   conn->remote_recovery_probe =
       remote_lease && remote_lease->recovery_probe;
   conn->lease = *lease;
@@ -1398,8 +1423,9 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     return result;
   }
   conn->ep.set_remote_depth(remote.depth);
-  NoteNegotiatedDepth(node, lane, remote.depth);
+  conn->depth = std::min<size_t>(conn_depth, remote.depth);
   if (remote.depth < conn_depth) {
+    NoteNegotiatedDepth(node, lane, remote.depth);
     DFKV_LOG_INFO("rdma: server depth " + std::to_string(remote.depth) +
                   " < client depth " + std::to_string(conn_depth) +
                   ": batching window clamped to " +
@@ -1464,6 +1490,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     return result;
   }
   conns_opened_.fetch_add(1, std::memory_order_relaxed);
+  MarkClassOpened(conn);
   rail_conns_[ridx].fetch_add(1, std::memory_order_relaxed);
   MarkLive(conn);
   MarkActive(conn, lane);
@@ -1673,12 +1700,59 @@ std::vector<size_t> RdmaTransport::IdleDataBounds(
   return bounds;
 }
 
+std::vector<size_t> RdmaTransport::IdleDataDepths(
+    const std::string& node) const {
+  std::lock_guard<std::mutex> lock(mu_);
+  std::vector<size_t> depths;
+  const auto found = pool_.find(node);
+  if (found == pool_.end()) return depths;
+  depths.reserve(found->second.size());
+  for (const Conn* conn : found->second) depths.push_back(conn->depth);
+  std::sort(depths.begin(), depths.end());
+  return depths;
+}
+
 std::string RdmaTransport::MetricsText() const {
   std::string s;
   s += "# HELP dfkv_rdma_client_conns_opened_total RDMA client connections opened\n";
   s += "# TYPE dfkv_rdma_client_conns_opened_total counter\n";
   s += "dfkv_rdma_client_conns_opened_total " +
        std::to_string(conns_opened_.load(std::memory_order_relaxed)) + "\n";
+  std::map<ConnectionClass, ConnectionClassStats> class_stats;
+  {
+    std::lock_guard<std::mutex> lock(connection_class_mu_);
+    class_stats = connection_class_stats_;
+  }
+  std::map<ConnectionClass, uint64_t> idle_classes;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    for (const auto& [node, connections] : pool_) {
+      (void)node;
+      for (const Conn* conn : connections)
+        ++idle_classes[{conn->declared_bytes, conn->depth}];
+    }
+  }
+  s += "# HELP dfkv_rdma_client_connection_class_opened_total Data QPs opened by adaptive block/depth class\n";
+  s += "# TYPE dfkv_rdma_client_connection_class_opened_total counter\n";
+  s += "# HELP dfkv_rdma_client_connection_class_active Data QPs currently executing by adaptive block/depth class\n";
+  s += "# TYPE dfkv_rdma_client_connection_class_active gauge\n";
+  for (const auto& [geometry, stats] : class_stats) {
+    const std::string labels =
+        "{block_bytes=\"" + std::to_string(geometry.first) +
+        "\",depth=\"" + std::to_string(geometry.second) + "\"} ";
+    s += "dfkv_rdma_client_connection_class_opened_total" + labels +
+         std::to_string(stats.opened) + "\n";
+    s += "dfkv_rdma_client_connection_class_active" + labels +
+         std::to_string(stats.active) + "\n";
+  }
+  s += "# HELP dfkv_rdma_client_connection_class_idle Data QPs currently idle by adaptive block/depth class\n";
+  s += "# TYPE dfkv_rdma_client_connection_class_idle gauge\n";
+  for (const auto& [geometry, idle] : idle_classes) {
+    s += "dfkv_rdma_client_connection_class_idle{block_bytes=\"" +
+         std::to_string(geometry.first) + "\",depth=\"" +
+         std::to_string(geometry.second) + "\"} " + std::to_string(idle) +
+         "\n";
+  }
   const rdma::ResourceRequest resource_used = resource_budget_->used();
   const rdma::ResourceRequest resource_limit = resource_budget_->limit();
   const auto resource_gauge = [&](const char* name, const char* help,
@@ -2083,10 +2157,12 @@ void RdmaTransport::Release(const std::string& node, Lane lane, Conn* c,
       } else if (lane != Lane::kControl && !v.empty()) {
         auto largest = std::max_element(
             v.begin(), v.end(), [](const Conn* left, const Conn* right) {
-              return left->declared_bytes < right->declared_bytes;
+              return left->budget_request.registered_bytes <
+                     right->budget_request.registered_bytes;
             });
         if (largest != v.end() &&
-            (*largest)->declared_bytes > c->declared_bytes &&
+            (*largest)->budget_request.registered_bytes >
+                c->budget_request.registered_bytes &&
             (*largest)->lifecycle.RequestRetire()) {
           displaced = *largest;
           if (c->lifecycle.MakeIdle()) {
@@ -3154,6 +3230,17 @@ size_t RdmaTransport::ConnectionBound(size_t required) const {
     size_class <<= 1;
   return size_class < wanted ? logical_max
                              : std::min(size_class, logical_max);
+}
+
+size_t RdmaTransport::ConnectionDepth(const std::string& node, Lane lane,
+                                      size_t requested_credits) {
+  const size_t learned = std::max<size_t>(1, LearnedDepth(node, lane));
+  const size_t wanted =
+      std::min(learned, std::max<size_t>(1, requested_credits));
+  size_t depth_class = 1;
+  while (depth_class < wanted && depth_class <= learned / 2)
+    depth_class <<= 1;
+  return depth_class < wanted ? learned : std::min(depth_class, learned);
 }
 
 // Records n as a high-water candidate and reports whether it exceeds the

@@ -167,14 +167,15 @@ Production discovery uses MDS.
 - `DFKV_RDMA_MAX_BLOCK_BYTES` is the logical object safety ceiling. Each data
   connection advertises `next_power_of_two(max(actual operation bytes,
   DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES))`, capped by that ceiling.
-- The server validates each connection class against `--max-msg`, negotiates
-  `qd=min(client depth, server depth)`, and leases `qd` receive plus `qd` pull
-  slots from any committed chunk. Idle reuse chooses the smallest sufficient
-  class; lease ownership lasts until QP teardown or idle reclaim.
+- The client selects a second power-of-two class from the operation's requested
+  window: scalar QPs open at depth 1, while batches reuse/open the smallest
+  sufficient depth up to the client/server ceiling.
+- The server validates the block class, negotiates the depth class, and leases
+  that many receive plus pull slots from rail-affinitized chunks. Pull arenas
+  use type-2 Memory Windows over a shared chunk MR, with exact-MR fallback.
 - A data slot is `align4K(4096 + connection_class)`. The hard receive budget
-  covers worst-case live and pooled QPs, but resident/pinned memory follows the
-  observed connection high-water in `DFKV_RDMA_RECV_CHUNK_BYTES` increments.
-  Exhausting the hard budget rejects the connection without changing protocol.
+  covers worst-case live/pooled QPs; resident memory grows by chunk and empty
+  non-initial chunks return after `DFKV_RDMA_RECV_CHUNK_IDLE_MS`.
 - Client host/device pools are registered once per rail at declaration time.
   Re-declaring the same base with a larger size registers the larger extent; the
   registration call returns false/nonzero unless the full range is ready. Buffers

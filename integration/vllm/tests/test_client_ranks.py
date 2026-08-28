@@ -3,11 +3,16 @@ converge non-replicated layouts, and participant spread must cover exactly
 the effective count."""
 
 import sys
+import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from dfkv_vllm.client_ranks import participant, resolve_client_ranks
+from dfkv_vllm.client_ranks import (
+    configure_load_convergence,
+    participant,
+    resolve_client_ranks,
+)
 
 
 def test_default_is_full_participation():
@@ -39,6 +44,24 @@ def test_participant_spread_is_even_and_exact():
     assert [participant(r, 4, 4) for r in range(4)] == [0, 1, 2, 3]
     # N=1: only rank 0.
     assert [participant(r, 4, 1) for r in range(4)] == [0, None, None, None]
+
+def test_load_convergence_enables_native_gpu_rendezvous():
+    env: dict[str, str] = {}
+    active, reason = configure_load_convergence(env, 8, 1, True)
+    assert active and "native-gpu-dedup" in reason
+    assert env["DFKV_CLIENT_NODE_DEDUP"] == "1"
+    assert env["DFKV_CLIENT_NODE_DEDUP_GPU"] == "1"
+
+
+def test_load_convergence_clamps_sharded_and_honors_explicit_disable():
+    env: dict[str, str] = {}
+    assert not configure_load_convergence(env, 8, 1, False)[0]
+    assert env == {}
+    env = {"DFKV_CLIENT_NODE_DEDUP_GPU": "0"}
+    active, reason = configure_load_convergence(env, 8, 1, True)
+    assert not active and "disabled" in reason
+    assert "DFKV_CLIENT_NODE_DEDUP" not in env
+    assert env["DFKV_CLIENT_NODE_DEDUP_GPU"] == "0"
 
 
 # ---- Phase 2a: producer-side client elision (should_create_client) ----
@@ -79,3 +102,22 @@ def test_elide_noop_without_convergence():
 def test_elide_n1_keeps_rank0_only():
     created = [should_create_client("kv_producer", r, 8, 1, True)[0] for r in range(8)]
     assert created == [True] + [False] * 7
+
+
+class ClientRanksContractTest(unittest.TestCase):
+    def test_all_client_rank_contracts(self):
+        test_default_is_full_participation()
+        test_auto_converges_only_replicated()
+        test_explicit_n_clamps_but_never_errors()
+        test_participant_spread_is_even_and_exact()
+        test_load_convergence_enables_native_gpu_rendezvous()
+        test_load_convergence_clamps_sharded_and_honors_explicit_disable()
+        test_elide_off_always_creates()
+        test_elide_only_producer_non_participants()
+        test_elide_never_touches_consumers_or_both()
+        test_elide_noop_without_convergence()
+        test_elide_n1_keeps_rank0_only()
+
+
+if __name__ == "__main__":
+    unittest.main()

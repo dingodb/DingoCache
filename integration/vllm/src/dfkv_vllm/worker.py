@@ -57,8 +57,13 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
 # dfkv handles its own RDMA bootstrap so the transfer-engine helpers are dropped.
 from ._determinism import ensure_deterministic_block_hashing
 from .client_ranks import ENV_NAME as CLIENT_RANKS_ENV
-from .client_ranks import (ELIDE_ENV, participant, resolve_client_ranks,
-                           should_create_client)
+from .client_ranks import (
+    ELIDE_ENV,
+    configure_load_convergence,
+    participant,
+    resolve_client_ranks,
+    should_create_client,
+)
 from .coordinator import DfkvStoreCoordinator
 from .data import (
     VLLM_MULTIWR_V2,
@@ -1414,6 +1419,10 @@ class DfkvStoreWorker:
             cr_reason,
             " (store convergence active)" if self.client_ranks < self.tp_size else "",
         )
+        self.load_convergence, load_reason = configure_load_convergence(
+            os.environ, self.tp_size, self.client_ranks, replicated
+        )
+        logger.info("client_ranks load convergence: %s", load_reason)
 
         self.metadata = KeyMetadata(
             model_name=model_config.model.rstrip("/").split("/")[-1],
@@ -1542,18 +1551,21 @@ class DfkvStoreWorker:
             cache_role=str(self.kv_role),
             require_rdma=_tcfg.truthy(extra.get("require_rdma", True)),
         )
-        # Phase 2a (issue #111): producer non-participants skip the client
-        # (opt-in via DFKV_CONNECTOR_CLIENT_ELIDE=1; layout-clamped). The saved
-        # kwargs let the rank UN-elide lazily if a load ever reaches it — a
-        # producer DOES load on cross-instance prefix reuse (get_finished has
-        # no role gate), and failing those loads into whole-span recomputes
-        # would cost more than the elided connections save.
+        # Converged replicated layouts enable native same-host GPU rendezvous:
+        # one TP rank performs each remote GET and CUDA IPC publishes identical
+        # MLA bytes to followers. Producer non-participants also skip eager
+        # client creation by default; an explicit CLIENT_ELIDE=0 overrides.
         self._lazy_client_kwargs: dict | None = None
         self._lazy_client_lock = threading.Lock()
         self._kv_pool_regions: list[tuple[int, int]] = []
+        elide_default = "1" if self.load_convergence else "0"
         create_client, elide_reason = should_create_client(
-            self.kv_role, self.tp_rank, self.tp_size, self.client_ranks,
-            _tcfg.truthy(os.environ.get(ELIDE_ENV, "0")))
+            self.kv_role,
+            self.tp_rank,
+            self.tp_size,
+            self.client_ranks,
+            _tcfg.truthy(os.environ.get(ELIDE_ENV, elide_default)),
+        )
         if not create_client:
             logger.info("dfkv client elided: %s", elide_reason)
             self.client = None

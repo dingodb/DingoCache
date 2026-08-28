@@ -1,6 +1,8 @@
 #include "transport/rdma_recv_segment.h"
 
+#include <chrono>
 #include <cstdint>
+#include <thread>
 #include <utility>
 
 #include <gtest/gtest.h>
@@ -146,6 +148,41 @@ TEST(RecvSegmentPool, RejectsInvalidOrOversizedGeometry) {
   EXPECT_EQ(pool.initial_segment()->size(), 8192u);
   EXPECT_FALSE(pool.Allocate(20u << 10));
   EXPECT_EQ(pool.stats().committed_bytes, 8192u);
+}
+
+TEST(RecvSegmentPool, AffinityPreventsCrossRailChunkReuse) {
+  RecvSegmentPool pool;
+  ASSERT_TRUE(pool.Init(16u << 10, 48u << 10));
+  auto initial = pool.Allocate(12u << 10, 4096, 0);
+  auto rail0 = pool.Allocate(12u << 10, 4096, 0);
+  auto rail1 = pool.Allocate(12u << 10, 4096, 1);
+  ASSERT_TRUE(initial);
+  ASSERT_TRUE(rail0);
+  ASSERT_TRUE(rail1);
+  EXPECT_NE(rail0.segment(), rail1.segment());
+
+  rail0.Reset();
+  EXPECT_FALSE(pool.Allocate(12u << 10, 4096, 1))
+      << "rail1 must not borrow an empty chunk bound to rail0";
+}
+
+TEST(RecvSegmentPool, TrimsEmptyNonInitialChunksAfterIdleHold) {
+  RecvSegmentPool pool;
+  ASSERT_TRUE(pool.Init(16u << 10, 48u << 10));
+  auto first = pool.Allocate(12u << 10);
+  auto second = pool.Allocate(12u << 10);
+  auto third = pool.Allocate(12u << 10);
+  ASSERT_EQ(pool.stats().chunks, 3u);
+  first.Reset();
+  second.Reset();
+  third.Reset();
+  std::this_thread::sleep_for(std::chrono::milliseconds(3));
+  EXPECT_EQ(pool.TrimIdle(1), 32u << 10);
+  const auto stats = pool.stats();
+  EXPECT_EQ(stats.chunks, 1u);
+  EXPECT_EQ(stats.committed_bytes, 16u << 10);
+  EXPECT_EQ(stats.shrinks, 1u);
+  EXPECT_EQ(stats.released_bytes, 32u << 10);
 }
 
 }  // namespace dfkv::rdma

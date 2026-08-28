@@ -58,7 +58,7 @@ class RecvSegment {
     uint64_t allocation_failures = 0;
   };
 
-  bool Init(size_t bytes, size_t alignment = 4096);
+  bool Init(size_t bytes, size_t alignment = 4096, int numa_node = -1);
   Lease Allocate(size_t bytes, size_t alignment = 4096);
 
   char* data() const { return data_; }
@@ -87,23 +87,23 @@ class RecvSegmentPool {
     Lease() = default;
     Lease(const Lease&) = delete;
     Lease& operator=(const Lease&) = delete;
-    Lease(Lease&&) noexcept = default;
-    Lease& operator=(Lease&&) noexcept = default;
+    Lease(Lease&& other) noexcept;
+    Lease& operator=(Lease&& other) noexcept;
+    ~Lease();
 
     explicit operator bool() const { return static_cast<bool>(lease_); }
     char* data() const { return lease_.data(); }
     size_t size() const { return lease_.size(); }
     RecvSegment* segment() const { return segment_; }
-    void Reset() {
-      lease_.Reset();
-      segment_ = nullptr;
-    }
+    void Reset();
 
    private:
     friend class RecvSegmentPool;
-    Lease(RecvSegment* segment, RecvSegment::Lease lease)
-        : lease_(std::move(lease)), segment_(segment) {}
+    Lease(RecvSegmentPool* pool, RecvSegment* segment,
+          RecvSegment::Lease lease)
+        : pool_(pool), lease_(std::move(lease)), segment_(segment) {}
 
+    RecvSegmentPool* pool_ = nullptr;
     RecvSegment::Lease lease_;
     RecvSegment* segment_ = nullptr;
   };
@@ -116,25 +116,38 @@ class RecvSegmentPool {
     size_t largest_free_range = 0;
     size_t chunks = 0;
     uint64_t growths = 0;
+    uint64_t shrinks = 0;
+    uint64_t released_bytes = 0;
     uint64_t allocation_failures = 0;
     uint64_t growth_failures = 0;
   };
 
   bool Init(size_t chunk_bytes, size_t max_bytes,
             size_t alignment = 4096);
-  Lease Allocate(size_t bytes, size_t alignment = 4096);
+  Lease Allocate(size_t bytes, size_t alignment = 4096,
+                 int affinity = -1, int numa_node = -1);
+  size_t TrimIdle(uint64_t idle_ms);
   RecvSegment* initial_segment() const;
   Stats stats() const;
 
  private:
-  std::unique_ptr<RecvSegment> NewChunk(size_t minimum_bytes);
+  struct Chunk {
+    std::unique_ptr<RecvSegment> segment;
+    int affinity = -1;
+    uint64_t empty_since_ms = 0;
+  };
+  std::unique_ptr<Chunk> NewChunk(size_t minimum_bytes, int affinity,
+                                  int numa_node);
+  void NoteRelease(RecvSegment* segment);
 
   size_t chunk_bytes_ = 0;
   size_t max_bytes_ = 0;
   size_t alignment_ = 0;
   mutable std::mutex mu_;
-  std::vector<std::unique_ptr<RecvSegment>> chunks_;
+  std::vector<std::unique_ptr<Chunk>> chunks_;
   std::atomic<uint64_t> growths_{0};
+  std::atomic<uint64_t> shrinks_{0};
+  std::atomic<uint64_t> released_bytes_{0};
   std::atomic<uint64_t> allocation_failures_{0};
   std::atomic<uint64_t> growth_failures_{0};
 };

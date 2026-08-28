@@ -134,6 +134,8 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
     if (ok) *ok = false;
     return;
   }
+  zero_extent_records_.assign(
+      static_cast<size_t>(max_slots_per_extent_) * kRecBytes, 0);
 
   SlabAllocator::Options ao;
   ao.extent_bytes = opt_.extent_bytes;
@@ -149,9 +151,8 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   // rebinds are rare (workload-mix shifts), so the ms-scale sync under the
   // allocator lock is acceptable.
   ao.on_extent_bind = [this](uint32_t e) {
-    const std::vector<char> zeros(
-        static_cast<size_t>(max_slots_per_extent_) * kRecBytes, 0);
-    if (!PwriteAll(table_fd_, zeros.data(), zeros.size(), TableOffset(e, 0)))
+    if (!PwriteAll(table_fd_, zero_extent_records_.data(),
+                   zero_extent_records_.size(), TableOffset(e, 0)))
       return FailMetadata();
     if (::fdatasync(table_fd_) != 0) return FailMetadata();
     bind_wipes_.fetch_add(1, std::memory_order_relaxed);
@@ -159,9 +160,8 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   };
   ao.on_extent_evict =
       [this](uint32_t extent, uint32_t, uint32_t residents) {
-        const std::vector<char> zeros(
-            static_cast<size_t>(max_slots_per_extent_) * kRecBytes, 0);
-        if (!PwriteAll(table_fd_, zeros.data(), zeros.size(),
+        if (!PwriteAll(table_fd_, zero_extent_records_.data(),
+                       zero_extent_records_.size(),
                        TableOffset(extent, 0)))
           return FailMetadata();
         record_writes_.fetch_add(std::max<uint32_t>(residents, 1),
