@@ -785,6 +785,9 @@ namespace/key 不一致是预期 cold miss。**空环 / MDS 不可达**可直接
 | `rail_affinity_fallbacks` | `1` | `1` | 相邻有序 fallback 数；`0`=严格单 rail，超出可用 rail 数时自动收敛 |
 | `load_async` | `True` | 普通 attention 保持 True；hybrid recurrent 模型设 `False` | `False` 在 forward 前同步完成 load，避免 recurrent-state compute 与远端 GPU 写重叠 |
 | `transfer_queue_capacity` | `256` | 保持默认，按压测调 | 每个 worker、每个方向的排队上限（`1..65536`）。满队列时非阻塞拒绝新任务：save 立即释放 finish/free fence，load 标记失败并重算；非法值启动即失败。 |
+| `recv_workers` | `1` | 从 `1` 起压测 | 共享有界 receive queue 的 GET worker 数（`1..32`）；仅在 queue wait 持续升高且后端仍有余量时增加。 |
+| `load_window_keys` | `0`（关闭） | 长上下文 replicated-MLA 按压测设置 | 单次 native GET window 的最大 key 数（`0..65536`）。窗口结果应能放入 `DFKV_NODE_DEDUP_GPU_ARENA_MB`，且在 `DFKV_NODE_DEDUP_WAIT_MS` 内完成，避免 follower rank 超时后重复读取同一批 KV。 |
+| `load_window_min_keys` | `0` | 高于常规请求 key 数 | 仅当请求 key 数达到此阈值时启用 `load_window_keys`（`0..65536`）；让短请求保持单次 GET，长上下文才窗口化。`load_window_keys=0` 时无效。 |
 | `enable_cross_layers_blocks` | `False` | 默认 False | 仅当引擎分页布局层内交错时开 |
 | `lookup_rpc_port` | ipc 自动 | 一般不设 | rank0 前缀查询 RPC，仅 socket 名冲突时设 |
 | `client_register` | `1`（MDS 发现时） | 默认即可 | MDS 客户端注册开关（`0` 关；env `DFKV_CLIENT_REGISTER=0` 等价，见 §1.1） |

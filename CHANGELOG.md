@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### vLLM long-context node-dedup load windows
+
+- Added opt-in `load_window_keys` and `load_window_min_keys` connector settings.
+  Large replicated loads can now publish bounded native GET results before the
+  same-host GPU dedup wait deadline, while short requests retain one native GET.
+- Defaults remain disabled. Values are validated at startup, preserve key/result
+  order, and retain one outer connector metric for the logical load.
+- On xb01-0064, a 1,000,000-token TP8 GLM-5.3 hot load with 128-key windows
+  reduced TTFT from 39.35 s to 22.92 s and reduced native remote fetches from
+  approximately eight copies to one, with zero dedup fallback. A 4,096-key
+  threshold kept the 65,536-token/C10 path unwindowed at 35,622 total tok/s.
+
 ### Adaptive RDMA receive capacity and bounded high-water reclaim
 
 - Replaced the eagerly committed monolithic RDMA receive segment with a lazy

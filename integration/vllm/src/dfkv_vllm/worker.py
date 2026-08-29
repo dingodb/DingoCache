@@ -252,6 +252,10 @@ DEFAULT_TRANSFER_QUEUE_CAPACITY = 256
 MAX_TRANSFER_QUEUE_CAPACITY = 65536
 DEFAULT_RECV_WORKERS = 1
 MAX_RECV_WORKERS = 32
+DEFAULT_LOAD_WINDOW_KEYS = 0
+MAX_LOAD_WINDOW_KEYS = 65536
+DEFAULT_LOAD_WINDOW_MIN_KEYS = 0
+MAX_LOAD_WINDOW_MIN_KEYS = 65536
 _TRANSFER_STOP = object()
 
 
@@ -285,6 +289,79 @@ def _parse_recv_workers(value: Any) -> int:
             f"recv_workers must be in [1, {MAX_RECV_WORKERS}], got {workers}"
         )
     return workers
+
+def _parse_load_window_keys(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("load_window_keys must be an integer")
+    if isinstance(value, int):
+        window = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        window = int(value.strip())
+    else:
+        raise ValueError("load_window_keys must be an integer")
+    if not 0 <= window <= MAX_LOAD_WINDOW_KEYS:
+        raise ValueError(
+            f"load_window_keys must be in [0, {MAX_LOAD_WINDOW_KEYS}], got {window}"
+        )
+    return window
+
+def _parse_load_window_min_keys(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("load_window_min_keys must be an integer")
+    if isinstance(value, int):
+        minimum = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        minimum = int(value.strip())
+    else:
+        raise ValueError("load_window_min_keys must be an integer")
+    if not 0 <= minimum <= MAX_LOAD_WINDOW_MIN_KEYS:
+        raise ValueError(
+            "load_window_min_keys must be in "
+            f"[0, {MAX_LOAD_WINDOW_MIN_KEYS}], got {minimum}"
+        )
+    return minimum
+
+def _load_windows(
+    length: int,
+    window_keys: int,
+    min_keys: int = 0,
+) -> tuple[tuple[int, int], ...]:
+    if length < 0:
+        raise ValueError("length must be non-negative")
+    if length == 0:
+        return ()
+    if length < min_keys or window_keys <= 0 or window_keys >= length:
+        return ((0, length),)
+    return tuple(
+        (start, min(start + window_keys, length))
+        for start in range(0, length, window_keys)
+    )
+
+def _batch_get_auto_sg_windowed(
+    client: Any,
+    keys: list[bytes],
+    seg_ptrs: list[list[int]],
+    seg_caps: list[list[int]],
+    window_keys: int,
+    min_keys: int,
+) -> tuple[list[bool], list[int]]:
+    windows = _load_windows(len(keys), window_keys, min_keys)
+    if not windows:
+        return [], []
+    if len(windows) == 1:
+        return client.batch_get_auto_sg(keys, seg_ptrs, seg_caps)
+
+    hits: list[bool] = []
+    lengths: list[int] = []
+    for start, stop in windows:
+        window_hits, window_lengths = client.batch_get_auto_sg(
+            keys[start:stop],
+            seg_ptrs[start:stop],
+            seg_caps[start:stop],
+        )
+        hits.extend(window_hits)
+        lengths.extend(window_lengths)
+    return hits, lengths
 
 
 @dataclasses.dataclass
@@ -817,6 +894,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         client_provider: Callable[[], Any] | None = None,
         queue_capacity: int = DEFAULT_TRANSFER_QUEUE_CAPACITY,
         recv_workers: int = DEFAULT_RECV_WORKERS,
+        load_window_keys: int = DEFAULT_LOAD_WINDOW_KEYS,
+        load_window_min_keys: int = DEFAULT_LOAD_WINDOW_MIN_KEYS,
         record_pool_sample: Callable[[str, int], None] | None = None,
     ):
         super().__init__(
@@ -832,6 +911,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             queue_capacity=queue_capacity,
         )
         self.recv_workers = _parse_recv_workers(recv_workers)
+        self.load_window_keys = _parse_load_window_keys(load_window_keys)
+        self.load_window_min_keys = _parse_load_window_min_keys(
+            load_window_min_keys
+        )
         self.client_provider = client_provider
         self._invalid_block_ids_lock = threading.Lock()
         self._invalid_block_ids: set[int] = set()
@@ -1161,9 +1244,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             rotated_block_ids = _rotate_list(block_id_list, rotation)
             descriptor_batch = SgDescriptorBatch.from_chunks(rotated_chunks)
 
-            # dfkv: one logical chunk is one batch key with its complete
-            # destination segment vector. libdfkv performs any HCA-width
-            # multi-WR windowing without changing object identity.
+            # One logical chunk remains one batch key with its complete
+            # destination segment vector. Optional key windows bound each
+            # native dedup publication; libdfkv still owns HCA-width multi-WR
+            # windowing within each object.
             client = self.client
             if client is None and self.client_provider is not None:
                 client = self.client_provider()  # lazy un-elide
@@ -1176,17 +1260,23 @@ class KVCacheStoreRecvingThread(KVTransferThread):
 
             load_get_start = time.perf_counter()
             try:
-                # The native logical operation publishes a hit only after every
-                # ordered WR window completes. Require the exact stored length;
-                # misses and either short or oversized objects fail the chunk
-                # closed and force vLLM to recompute it.
+                # Native node dedup publishes a fetched result only when the
+                # enclosing batch_get_auto_sg call completes. Bounded key
+                # windows let follower ranks consume large replicated loads
+                # before their wait deadline while preserving result order.
+                # Require the exact stored length; misses and either short or
+                # oversized objects fail the chunk closed and force vLLM to
+                # recompute it.
                 if client is None:  # no client (un-elide failed): miss -> recompute
                     hits, lens = [False] * len(rotated_keys), [0] * len(rotated_keys)
                 else:
-                    hits, lens = client.batch_get_auto_sg(
+                    hits, lens = _batch_get_auto_sg_windowed(
+                        client,
                         rotated_keys,
                         descriptor_batch.ptrs,
                         descriptor_batch.caps,
+                        self.load_window_keys,
+                        self.load_window_min_keys,
                     )
                 if len(hits) != len(rotated_keys) or len(lens) != len(rotated_keys):
                     raise RuntimeError(
@@ -1348,11 +1438,23 @@ class DfkvStoreWorker:
         self.recv_workers = _parse_recv_workers(
             extra.get("recv_workers", DEFAULT_RECV_WORKERS)
         )
+        self.load_window_keys = _parse_load_window_keys(
+            extra.get("load_window_keys", DEFAULT_LOAD_WINDOW_KEYS)
+        )
+        self.load_window_min_keys = _parse_load_window_min_keys(
+            extra.get(
+                "load_window_min_keys",
+                DEFAULT_LOAD_WINDOW_MIN_KEYS,
+            )
+        )
         logger.info(
             "dfkv transfer queues: capacity=%d per direction, recv_workers=%d, "
-            "overload=reject-new, shutdown=cancel-pending",
+            "load_window_keys=%d, load_window_min_keys=%d, overload=reject-new, "
+            "shutdown=cancel-pending",
             self.transfer_queue_capacity,
             self.recv_workers,
+            self.load_window_keys,
+            self.load_window_min_keys,
         )
         self._close_lock = threading.Lock()
         self._closed = False
@@ -1873,6 +1975,14 @@ class DfkvStoreWorker:
             ),
             recv_workers=getattr(self, "recv_workers", DEFAULT_RECV_WORKERS),
             record_pool_sample=self._record_kv_connector_pool_sample,
+            load_window_keys=getattr(
+                self, "load_window_keys", DEFAULT_LOAD_WINDOW_KEYS
+            ),
+            load_window_min_keys=getattr(
+                self,
+                "load_window_min_keys",
+                DEFAULT_LOAD_WINDOW_MIN_KEYS,
+            ),
         )
         self.kv_recv_thread.start()
         ready_event_recving.wait()
