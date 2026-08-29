@@ -9,6 +9,10 @@ try:
         DfkvStoreWorker,
         KVCacheStoreSendingThread,
         KVTransferThread,
+        _batch_get_auto_sg_windowed,
+        _load_windows,
+        _parse_load_window_keys,
+        _parse_load_window_min_keys,
         _parse_transfer_queue_capacity,
     )
 
@@ -155,6 +159,58 @@ class TransferQueueLifecycleTest(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     _parse_transfer_queue_capacity(value)
+
+    def test_load_window_keys_is_bounded(self):
+        self.assertEqual(_parse_load_window_keys(0), 0)
+        self.assertEqual(_parse_load_window_keys("64"), 64)
+        for value in (-1, 65537, True, 1.5, "auto"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    _parse_load_window_keys(value)
+
+    def test_load_window_min_keys_is_bounded(self):
+        self.assertEqual(_parse_load_window_min_keys(0), 0)
+        self.assertEqual(_parse_load_window_min_keys("4096"), 4096)
+        for value in (-1, 65537, True, 1.5, "auto"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    _parse_load_window_min_keys(value)
+
+    def test_load_windows_preserve_order_and_cover_exactly_once(self):
+        self.assertEqual(_load_windows(0, 64), ())
+        self.assertEqual(_load_windows(3, 0), ((0, 3),))
+        self.assertEqual(_load_windows(3, 8), ((0, 3),))
+        self.assertEqual(_load_windows(10, 4), ((0, 4), (4, 8), (8, 10)))
+        self.assertEqual(_load_windows(10, 4, 11), ((0, 10),))
+        self.assertEqual(_load_windows(10, 4, 10), ((0, 4), (4, 8), (8, 10)))
+
+    def test_windowed_get_preserves_results_and_skips_small_batches(self):
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            def batch_get_auto_sg(self, keys, ptrs, caps):
+                self.calls.append((list(keys), list(ptrs), list(caps)))
+                return [key[0] % 2 == 0 for key in keys], [cap[0] for cap in caps]
+
+        keys = [bytes([index]) for index in range(10)]
+        ptrs = [[100 + index] for index in range(10)]
+        caps = [[200 + index] for index in range(10)]
+
+        windowed = FakeClient()
+        hits, lengths = _batch_get_auto_sg_windowed(
+            windowed, keys, ptrs, caps, window_keys=4, min_keys=0
+        )
+        self.assertEqual([len(call[0]) for call in windowed.calls], [4, 4, 2])
+        self.assertEqual(hits, [index % 2 == 0 for index in range(10)])
+        self.assertEqual(lengths, [200 + index for index in range(10)])
+
+        below_threshold = FakeClient()
+        _batch_get_auto_sg_windowed(
+            below_threshold, keys, ptrs, caps, window_keys=4, min_keys=11
+        )
+        self.assertEqual(len(below_threshold.calls), 1)
+        self.assertEqual(below_threshold.calls[0], (keys, ptrs, caps))
 
 
 @unittest.skipUnless(HAVE_VLLM, "requires vllm (dfkv_vllm.worker imports it)")

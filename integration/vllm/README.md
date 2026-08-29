@@ -90,6 +90,8 @@ LMCache connector access logs, so one setting covers every integration. Format:
 | `load_async` | `True` | `True` returns `WAITING_FOR_REMOTE_KVS` and overlaps GPUDirect loads with unrelated model work. `False` performs each requested load synchronously in `start_load_kv`, before the forward pass. Use `False` for hybrid state-cache models when the engine cannot guarantee that remote writes target blocks disjoint from concurrent compute. |
 | `transfer_queue_capacity` | `256` | Maximum queued requests in each direction (`1..65536`). All receive workers consume one shared receive queue of this capacity; capacity is not multiplied by `recv_workers`. Submission is non-blocking: a full queue rejects new saves as completed (releasing finish/free fences) and rejects new loads as load errors (forcing recompute), so overload cannot grow memory or pin blocks indefinitely. Invalid or out-of-range values abort connector construction. |
 | `recv_workers` | `1` | Receive/load worker count (`1..32`). Workers consume the shared bounded receive queue and may execute independent native GETs concurrently. Invalid, boolean, or out-of-range values abort connector construction. |
+| `load_window_keys` | `0` (disabled) | Maximum keys per native GET window (`0..65536`). Use a value whose worst-case result bytes fit inside the node-dedup GPU arena. Windowing lets follower ranks consume published results before the dedup wait deadline instead of re-fetching a large replicated-MLA batch. |
+| `load_window_min_keys` | `0` | Apply `load_window_keys` only when the request contains at least this many keys (`0..65536`). Set a threshold to keep small, latency-sensitive loads as one native GET while windowing long-context loads. Has no effect when `load_window_keys=0`. |
 | `enable_cross_layers_blocks` | `False` | opt-in for engines whose paged layout interleaves layers within a block. Leave `False` unless you know the layout needs it. |
 | `lookup_rpc_port` | (ipc auto) | port for the rank-0 scheduler-side prefix-lookup RPC; set only if the default IPC socket name collides. |
 
@@ -110,8 +112,20 @@ with `vllm:dfkv_receive_active_workers`; all three are Prometheus histograms
 queue-wait quantiles, active-worker samples, dfkv GET latency, and failed/recompute
 counts at each setting rather than assuming more workers are faster. Startup
 must contain the evidence line
-`dfkv transfer queues: capacity=<N> per direction, recv_workers=<N>, overload=reject-new, shutdown=cancel-pending`;
-capture it together with the before/after Prometheus snapshots.
+`dfkv transfer queues: capacity=<N> per direction, recv_workers=<N>,
+load_window_keys=<N>, load_window_min_keys=<N>, overload=reject-new,
+shutdown=cancel-pending`; capture it together with the before/after Prometheus
+snapshots.
+
+For same-host replicated loads, a single native GET publishes deduplicated GPU
+results only after its storage fetch completes. If a large batch takes longer
+than `DFKV_NODE_DEDUP_WAIT_MS`, follower ranks time out and independently
+re-fetch it. Set `load_window_keys` so one window completes within that deadline
+and its result bytes fit `DFKV_NODE_DEDUP_GPU_ARENA_MB`. Then set
+`load_window_min_keys` above ordinary request sizes to avoid adding native-call
+overhead to short loads. Validate with `DFKV_CLIENT_NODE_DEDUP_LOG=1`: the
+windowed long-context path should report zero `fallback` and aggregate
+`fetched` counts near one logical copy, not one copy per TP rank.
 
 ## Reproducible external-cache benchmark
 
