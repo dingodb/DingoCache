@@ -127,6 +127,70 @@ overhead to short loads. Validate with `DFKV_CLIENT_NODE_DEDUP_LOG=1`: the
 windowed long-context path should report zero `fallback` and aggregate
 `fetched` counts near one logical copy, not one copy per TP rank.
 
+### Choosing load-window values
+
+Keep both settings at `0` unless same-host node-dedup logs show follower
+`fallback` or aggregate `fetched` counts approaching `TP size × logical keys`.
+Windowing adds native-call overhead and does not improve a load that already
+publishes before the follower deadline.
+
+Treat the values as **key counts, not token counts**. Derive batch key-count and
+result-byte distributions from representative `batch_get_auto_sg` access logs;
+use connector geometry or a conservative maximum for per-key sizing. Repeat
+this after changing model, KV dtype, block size, cache-group geometry, or TP/DCP
+layout.
+
+Choose `load_window_keys` with both constraints below:
+1. **Arena bound.** Choose a conservative `sizing_bytes_per_key` (p99 or the
+   geometry maximum). As an operational starting point, keep one window below
+   75% of `DFKV_NODE_DEDUP_GPU_ARENA_MB`:
+   `window_keys <= floor(0.75 × arena_bytes / sizing_bytes_per_key)`.
+2. **Deadline bound.** The p99 fetch-and-publish time of one window should be
+   comfortably below `DFKV_NODE_DEDUP_WAIT_MS` (target at most 50–70%). A
+   larger wait is not a substitute for a batch whose publication is too large.
+
+Start from the smaller bound, round down to a convenient value such as 32, 64,
+or 128, then increase one step at a time only while `fallback=0`, aggregate
+`fetched` stays near one logical copy, and TTFT improves. Smaller windows reduce
+publication latency but add calls; larger windows reduce call overhead but can
+overflow/lap the arena or cross the wait deadline.
+
+Choose `load_window_min_keys` only after separating the workload classes:
+
+- set it strictly above the p99 key count of latency-sensitive short loads;
+- keep it at or below the smallest long load that must be windowed;
+- if those ranges overlap, use separate engine pools or accept a measured
+  tradeoff rather than hiding it with an arbitrary threshold.
+
+When `load_window_keys=0`, the minimum has no effect. A batch also remains one
+native GET when it is below `load_window_min_keys` or no larger than
+`load_window_keys`; consequently, a threshold only changes behavior when it is
+larger than the window.
+
+Example from one GLM-5.3 TP8 deployment (not a portable default): the per-key
+result size used for sizing was about 3.05 MB and the dedup arena was 512 MiB.
+A 128-key window was about 391 MB, completed inside a 1,000 ms wait, and
+reduced a 15,624-key load from about eight remote copies to one.
+`load_window_min_keys=4096` kept
+approximately 1,024-key short loads on the single-GET path:
+
+```json
+{
+  "recv_workers": 2,
+  "load_window_keys": 128,
+  "load_window_min_keys": 4096,
+  "load_async": true
+}
+```
+
+Production acceptance requires two byte-identical hot tests:
+
+- **long path:** access logs show batches no larger than the window, zero
+  `fallback`, aggregate `fetched` near logical keys rather than `TP × keys`,
+  and no failed/recomputed keys;
+- **short path:** access logs show one native GET and throughput/TTFT do not
+  regress beyond the deployment's acceptance threshold.
+
 ## Reproducible external-cache benchmark
 
 `test/python/vllm_external_cache_benchmark.py` never resets caches, deploys
