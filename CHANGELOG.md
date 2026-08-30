@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### RDMA receive-pool default capacity
+
+- Raised the default `DFKV_RDMA_RECV_SEGMENT_SIZE` hard budget from 16 GiB to
+  128 GiB. The receive pool remains lazy: startup commits only the initial
+  256 MiB chunk, so the larger default expands the growth ceiling without
+  eagerly pinning or registering 128 GiB. Explicit operator overrides are
+  unchanged.
+
 ### vLLM long-context node-dedup load windows
 
 - Added opt-in `load_window_keys` and `load_window_min_keys` connector settings.

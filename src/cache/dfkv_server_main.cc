@@ -76,7 +76,7 @@ int main(int argc, char** argv) {
       "  --slab-table-sync-ms <n>  slab table sync cadence ms (env DFKV_SLAB_TABLE_SYNC_MS)\n"
       "  --slab-reclaim-ms <n>  slab background free-slot reclaimer cadence ms, 0 = off (env DFKV_SLAB_RECLAIM_MS)\n"
       "  --ram-reclaim-ms <n>   RAM tier background reclaimer cadence ms, 0 = off (env DFKV_RAM_RECLAIM_MS)\n"
-      "  --rdma-recv-segment-size <n>  RDMA receive-pool hard budget (default 16 GiB; env DFKV_RDMA_RECV_SEGMENT_SIZE)\n"
+      "  --rdma-recv-segment-size <n>  RDMA receive-pool hard budget (default 128 GiB; env DFKV_RDMA_RECV_SEGMENT_SIZE)\n"
       "  --rdma-recv-chunk-bytes <n>  lazy receive-pool chunk bytes (default 256 MiB; env DFKV_RDMA_RECV_CHUNK_BYTES)\n"
       "  --disk-hash-weight <n>  per-disk vnode multiplier (default 10; env DFKV_DISK_HASH_WEIGHT)\n"
       "  --read-coalesce <0|1>  read-side convoy merge + RAM promotion (default off; env DFKV_READ_COALESCE)\n"

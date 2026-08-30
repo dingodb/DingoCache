@@ -82,7 +82,7 @@ inline double NowSteadySec() {
 
 
 size_t RecvSegmentBytes() {
-  constexpr size_t kDefault = 16ull << 30;
+  constexpr size_t kDefault = 128ull << 30;
   const size_t bytes = rdma::ResolveRecvSegmentBytes(
       std::getenv("DFKV_RDMA_RECV_SEGMENT_SIZE"), kDefault,
       rdma::kV2DataOffset);

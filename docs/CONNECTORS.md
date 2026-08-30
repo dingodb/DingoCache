@@ -87,7 +87,7 @@ tp_rank=..,ver=<lib>`（无 `role`——HiCache 是前缀 L3 缓存，无生产/
 | `DFKV_RDMA_DEPTH` | `4` ceiling | 两侧保持上限一致 | scalar QP=depth1；batch按实际window选择最小power-of-two depth class，再由server cap钳制。 |
 | `DFKV_RDMA_MAX_BLOCK_BYTES` | 4 MiB 逻辑上限 | 覆盖最大合法对象 | 只做 deterministic oversize guard；不再让所有连接按最大值预留。 |
 | `DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES` | 256 KiB | 覆盖常见小块，保持默认起步 | 当前操作最大对象按 power-of-two 向上取 connection class；idle pool 选最小可满足 QP。 |
-| `DFKV_RDMA_RECV_SEGMENT_SIZE` | 16 GiB | 按 peak live/pooled QP 设 hard budget | server receive-pool 最大提交量；不再启动期全量申请。 |
+| `DFKV_RDMA_RECV_SEGMENT_SIZE` | 128 GiB | 按 peak live/pooled QP 设 hard budget | server receive-pool 最大提交量；不再启动期全量申请。 |
 | `DFKV_RDMA_RECV_CHUNK_BYTES` | 256 MiB | 保持默认，除非常见 connection class 更大 | server 启动只提交一个 chunk，后续 allocation miss 按需增长，不超过 hard budget。 |
 | `DFKV_RDMA_RECV_CHUNK_IDLE_MS` | 60 s | 保持默认 | 空闲非初始chunk到期返还；`0`关闭。增长chunk绑定首次使用rail/NUMA。 |
 | `DFKV_RDMA_NUMA` | `0` | 显式多轨的大机可设 `1` | 建连按调用线程 NUMA 选 rail；动态 chunk 在实际租用它的 endpoint rail 上注册。 |
