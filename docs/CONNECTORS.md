@@ -798,6 +798,60 @@ DCP（decode context parallel）宽度/Rank **不是**本表键：连接器从 v
 （`get_dcp_group().world_size`），与 `tp_rank=-1`（replicated-MLA 存储坐标）一起进入
 canonical key metadata（§1.4），勿在 extra_config 手工设定。
 
+#### 3.4.1 `load_window_keys` / `load_window_min_keys` 取值最佳实践
+
+默认保持两个参数均为`0`。只有同机node-dedup日志出现follower `fallback`，
+或各rank累计`fetched`接近`TP宽度 × 逻辑key数`时，才启用窗口。已经能在等待
+期限内完成publish的请求不会因窗口获益，反而会增加native调用开销。
+
+两个参数的单位都是**dfkv key数，不是token数**。模型、KV dtype、block size、
+cache-group geometry、TP/DCP布局任一变化后，都要从代表性
+`batch_get_auto_sg` access log和connector geometry重新取得批次key数、结果
+bytes/key及耗时分布，不能照搬其他模型的数值。
+
+`load_window_keys`同时受两个上界约束：
+
+1. **arena上界**：先选保守的`sizing_bytes_per_key`（p99或geometry最大值）。
+   作为运维起点，让单窗口不超过`DFKV_NODE_DEDUP_GPU_ARENA_MB`的75%：
+   `window_keys <= floor(0.75 × arena_bytes / sizing_bytes_per_key)`。
+2. **等待上界**：单窗口fetch+publish的p99耗时应明显低于
+   `DFKV_NODE_DEDUP_WAIT_MS`，建议控制在等待时间的50%–70%以内。
+   拉长wait不能替代缩小过大的publish批次。
+
+取两个上界中的较小值，向下取32、64、128等便于比较的档位；一次只升一档。
+只有在`fallback=0`、累计`fetched`仍接近一份逻辑key、TTFT继续改善时才保留。
+窗口过小会增加调用次数；窗口过大可能使arena被覆盖或再次越过wait deadline。
+
+`load_window_min_keys`用来隔离长短请求：
+
+- 严格高于延迟敏感短请求的p99 key数；
+- 不高于必须窗口化的最小长请求key数；
+- 两类key数范围重叠时，优先拆分engine pool；否则必须接受并量化短请求开销，
+  不要填写一个无法由分布证明的阈值。
+
+`load_window_keys=0`时minimum无效。请求key数低于minimum，或请求本身不大于
+window时，仍只执行一次native GET；因此minimum只有大于window时才改变行为。
+
+一组**仅适用于本次GLM-5.3 TP8实测、不是通用默认值**的例子：单key约3.05 MB，
+arena 512 MiB，128-key窗口约391 MB，在1,000 ms wait内完成；1M请求约15,624
+keys，remote fetch从约8份收敛到1份。`load_window_min_keys=4096`让约1,024-key
+的短请求保持单GET：
+
+```json
+{
+  "recv_workers": 2,
+  "load_window_keys": 128,
+  "load_window_min_keys": 4096,
+  "load_async": true
+}
+```
+
+生产验收必须包含同数据、fresh target的两组热轮：
+
+- **长请求**：access log每批不超过window，`fallback=0`，累计`fetched`接近
+  逻辑key数而非`TP × key数`，failed/recompute均为0；
+- **短请求**：access log仍为单次native GET，吞吐和TTFT不超过业务验收阈值。
+
 连接器实现 vLLM `shutdown()` 生命周期钩子：先停止接单并取消排队任务，再等待当前
 native 操作完成、join 收发线程，最后仅关闭一次 native client。因而正常退出不依赖
 daemon 线程或进程终止；过载和退出期间都不会静默留下永久占用的 KV block。
