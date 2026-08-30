@@ -227,7 +227,7 @@ class ScopedEnv {
 std::string SelfHdr() { return "test/model"; }
 void ConfigureTestRecvSegment() {
   // Keep Soft-RoCE CI below modest RLIMIT_MEMLOCK. Production commits a
-  // 256-MiB initial chunk under a 16-GiB budget; fixtures need only 32 MiB.
+  // 256-MiB initial chunk under a 128-GiB budget; fixtures need only 32 MiB.
   ::setenv("DFKV_RDMA_RECV_SEGMENT_SIZE", "33554432", 0);
 }
 

@@ -173,7 +173,7 @@ Type=simple
 # xb01 v2 shared segment：RDMA depth=4、4 MiB block 时每条 pull data QP
 # 占 33,587,200 B（receive + source arenas）。14×TP8、每 pool=8、
 # data/control 两个 pool 含 25% churn 需要 35.4 GiB，因此配置 64 GiB；
-# 代码通用默认仍是 16 GiB。
+# 代码通用默认是 128 GiB；这里按实测容量包络显式收紧为 64 GiB。
 Environment=DFKV_RDMA_DEPTH=4
 Environment=DFKV_RDMA_RECV_SEGMENT_SIZE=68719476736
 # 8×400G 轨全轨白名单 + NUMA：B200 生产 host 一台带 8 个 HCA 轨。
@@ -463,7 +463,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 
 | env | 默认 | 说明 |
 |---|---|---|
-| `DFKV_RDMA_RECV_SEGMENT_SIZE` | `16 GiB` | server receive-pool hard budget；不再启动期全量分配 |
+| `DFKV_RDMA_RECV_SEGMENT_SIZE` | `128 GiB` | server receive-pool hard budget；不再启动期全量分配 |
 | `DFKV_RDMA_RECV_CHUNK_BYTES` | `256 MiB` | server 启动与增量提交粒度 |
 | `DFKV_RDMA_RECV_CHUNK_IDLE_MS` | `60000` | 空闲非初始chunk返还延迟；`0`关闭缩容 |
 | `DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES` | `256 KiB` | client adaptive data-QP 最小 class；实际对象向上取 power-of-two |
