@@ -58,13 +58,13 @@ groups:
           summary: "dfkv server RDMA completion errors"
           description: "{{ $labels.instance }} has failing RDMA completions."
       - alert: DfkvRdmaReceiveSegmentLow
-        expr: dfkv_rdma_recv_segment_bytes > 0 and (dfkv_rdma_recv_segment_free_bytes / dfkv_rdma_recv_segment_bytes) < 0.1
+        expr: ((dfkv_rdma_recv_segment_max_bytes - dfkv_rdma_recv_segment_used_bytes) / dfkv_rdma_recv_segment_max_bytes) < 0.1 and dfkv_rdma_recv_segment_max_bytes > 0
         for: 2m
         labels:
           severity: warning
         annotations:
-          summary: "dfkv RDMA receive segment has less than 10% free"
-          description: "{{ $labels.instance }} may reject new data QPs."
+          summary: "dfkv RDMA receive hard budget has less than 10% free"
+          description: "{{ $labels.instance }} is close to the hard receive-pool budget and may reject new data QPs."
       - alert: DfkvServerMdsHeartbeatDegraded
         expr: dfkv_mds_heartbeat_healthy == 0 or dfkv_mds_last_success_age_seconds > 30
         for: 1m

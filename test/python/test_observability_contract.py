@@ -243,6 +243,33 @@ class ObservabilityContractTest(unittest.TestCase):
             unknown = metric_families(expression) - PUBLIC_FAMILIES
             self.assertFalse(unknown, f"alert references unknown metrics {sorted(unknown)}")
 
+    def test_receive_segment_capacity_uses_hard_budget(self):
+        alerts = ALERTS.read_text(encoding="utf-8")
+        self.assertIn(
+            "((dfkv_rdma_recv_segment_max_bytes - "
+            "dfkv_rdma_recv_segment_used_bytes) / "
+            "dfkv_rdma_recv_segment_max_bytes) < 0.1",
+            alerts,
+        )
+        self.assertNotIn(
+            "dfkv_rdma_recv_segment_free_bytes / "
+            "dfkv_rdma_recv_segment_bytes",
+            alerts,
+        )
+        dashboard = json.loads(
+            (DASHBOARDS / "dfkv-cluster.json").read_text(encoding="utf-8")
+        )
+        panel = next(panel for panel in dashboard["panels"] if panel["id"] == 23)
+        self.assertEqual(panel["title"], "Receive hard-budget free ratio")
+        self.assertIn(
+            "dfkv_rdma_recv_segment_max_bytes",
+            panel["targets"][0]["expr"],
+        )
+        self.assertIn(
+            "dfkv_rdma_recv_segment_used_bytes",
+            panel["targets"][0]["expr"],
+        )
+
     def test_prometheus_mounts_the_checked_rule_file(self):
         prometheus = (ROOT / "deploy" / "observability" / "prometheus.yml").read_text()
         compose = (ROOT / "deploy" / "observability" / "docker-compose.yml").read_text()

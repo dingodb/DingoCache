@@ -1592,7 +1592,7 @@
     {
       "id": 23,
       "type": "timeseries",
-      "title": "Receive segment free ratio",
+      "title": "Receive hard-budget free ratio",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1634,7 +1634,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "(dfkv_rdma_recv_segment_free_bytes{instance=~\"$node\"} / dfkv_rdma_recv_segment_bytes{instance=~\"$node\"})",
+          "expr": "((dfkv_rdma_recv_segment_max_bytes{instance=~\"$node\"} - dfkv_rdma_recv_segment_used_bytes{instance=~\"$node\"}) / dfkv_rdma_recv_segment_max_bytes{instance=~\"$node\"})",
           "legendFormat": "{{instance}}"
         }
       ]
