@@ -174,6 +174,16 @@ class TestParallelCoordinates(unittest.TestCase):
         self.assertEqual(dcp, (2, 1))
         self.assertEqual(attn_tp_rank, 0)
 
+    def test_legacy_sglang_without_dcp_coordinates(self):
+        with _parallel_runtime(
+            attn_cp_size=8,
+            attn_cp_rank=3,
+        ):
+            pcp, dcp, attn_tp_rank = H._resolve_parallel_coordinates({})
+        self.assertEqual(pcp, (8, 3))
+        self.assertEqual(dcp, (1, 0))
+        self.assertIsNone(attn_tp_rank)
+
     def test_explicit_coordinates_override_runtime_axes(self):
         with _parallel_runtime(
             attn_cp_size=8,

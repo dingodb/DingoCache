@@ -127,13 +127,22 @@ def _resolve_parallel_coordinates(
         if f"{name}_size" in cfg or f"{name}_rank" in cfg:
             resolved[name] = _physical_axis(cfg, name)
         elif parallel is not None:
-            resolved[name] = _physical_axis(
-                {
-                    f"{name}_size": getattr(parallel, size_attr),
-                    f"{name}_rank": getattr(parallel, rank_attr),
-                },
-                name,
-            )
+            size_value = getattr(parallel, size_attr, None)
+            rank_value = getattr(parallel, rank_attr, None)
+            if name == "dcp" and size_value is None and rank_value is None:
+                # Legacy SGLang exposes only attn_cp_*: that single axis is
+                # already represented by PCP above. It has no independent DCP
+                # shard, so duplicating attn_cp_* here would corrupt keys and
+                # replica-writer election.
+                resolved[name] = (1, 0)
+            else:
+                resolved[name] = _physical_axis(
+                    {
+                        f"{name}_size": size_value,
+                        f"{name}_rank": rank_value,
+                    },
+                    name,
+                )
         else:
             resolved[name] = (1, 0)
 
