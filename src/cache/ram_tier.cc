@@ -1146,17 +1146,21 @@ void RamTier::FlushLoop(Shard& s) {
           s.flushq.push_back(std::move(batch[i]));  // retry later
           s.cv.notify_one();
         } else {
+          const auto completion = entry.completion;
+          const bool client_acked = entry.client_acked;
           if (entry.flush_pin) {
             if (entry.in_arena())
               s.alloc->Unpin(entry.key, entry.slot_handle);
             entry.flush_pin = false;
           }
-          CompletePut(entry.completion, false);
-          if (entry.client_acked)
+          if (client_acked)
             post_ack_flush_failures_.fetch_add(1, std::memory_order_relaxed);
           DropLocked(s, batch[i].key);
           healthy_.store(false, std::memory_order_release);
           flush_dropped_.fetch_add(1, std::memory_order_relaxed);
+          // Publish every terminal side effect before waking PutCommitted()
+          // leaders and duplicate followers.
+          CompletePut(completion, false);
         }
       }
       s.flush_inflight -= B;
