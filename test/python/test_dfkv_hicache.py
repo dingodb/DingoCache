@@ -330,6 +330,38 @@ class DingoFSHiCacheTest(unittest.TestCase):
             ),
         )
 
+    def test_prefill_cp_replicated_writer_key_cross_rank_roundtrip(self):
+        members, _, _ = self._node("cpreplicated")
+        cfg0 = self._cfg(members, tp_rank=0, tp_size=8, model="glm-cp")
+        cfg7 = self._cfg(members, tp_rank=7, tp_size=8, model="glm-cp")
+        for rank, cfg in ((0, cfg0), (7, cfg7)):
+            cfg.extra_config.update({
+                "pcp_size": 8,
+                "pcp_rank": rank,
+                "prefill_cp_storage_layout": "replicated",
+            })
+        writer_pool = FakeMlaPool(1, self.PAGE_BYTES, self.PAGE_SIZE)
+        reader_pool = FakeMlaPool(1, self.PAGE_BYTES, self.PAGE_SIZE)
+        writer_pool.fill_page(0, 0xA7)
+        writer = self._plugin(cfg0, writer_pool)
+        reader = self._plugin(cfg7, reader_pool)
+        host_indices = list(range(self.PAGE_SIZE))
+        self.assertEqual(writer.batch_set_v1(["shared"], host_indices), [True])
+        self.assertEqual(reader.batch_get_v1(["shared"], host_indices), [True])
+        self.assertEqual(reader_pool.page_bytes_at(0), bytes([0xA7]) * self.PAGE_BYTES)
+        self.assertEqual(writer._keys("shared"), reader._keys("shared"))
+
+    def test_prefill_cp_layout_is_explicit_and_sharded_fails_closed(self):
+        for layout, message in ((None, "explicit"), ("sharded", "unsupported")):
+            cfg = self._cfg(
+                "n=127.0.0.1:1", tp_rank=0, tp_size=8, model="glm-cp")
+            cfg.extra_config.update({"pcp_size": 8, "pcp_rank": 0})
+            if layout is not None:
+                cfg.extra_config["prefill_cp_storage_layout"] = layout
+            with self.subTest(layout=layout):
+                with self.assertRaisesRegex(ValueError, message):
+                    dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+
     def test_rdma_depth_is_preserved_for_connection_fanout(self):
         members, _, _ = self._node("rdepth")
         os.environ["DFKV_RDMA_DEPTH"] = "4"
@@ -351,14 +383,15 @@ class DingoFSHiCacheTest(unittest.TestCase):
         os.environ.pop("DFKV_RDMA_RAIL_TIERS", None)
         try:
             cfg = self._cfg(members, tp_rank=0, tp_size=1)
-            cfg.extra_config.update({
-                "rail_affinity": True,
-                "pcp_rank": rank,
-                "pcp_size": size,
-            })
+            cfg.extra_config["rail_affinity"] = True
             if fallbacks is not None:
                 cfg.extra_config["rail_affinity_fallbacks"] = fallbacks
-            dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+            with patch.object(
+                dfkv_hicache,
+                "_resolve_local_physical_rank",
+                return_value=rank,
+            ):
+                dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
             return (os.environ.get("DFKV_RDMA_DEV"),
                     os.environ.get("DFKV_RDMA_NUMA"),
                     os.environ.get("DFKV_RDMA_PRIMARY_DEV"),
@@ -374,7 +407,7 @@ class DingoFSHiCacheTest(unittest.TestCase):
                 else:
                     os.environ[name] = value
 
-    def test_rail_affinity_uses_physical_attention_rank(self):
+    def test_rail_affinity_uses_world_group_local_rank(self):
         members, _, _ = self._node("rail8")
         rails = "ib0,ib1,ib2,ib3,ib4,ib5,ib6,ib7"
         dev, numa, primary, tiers = self._rail_for(
@@ -547,6 +580,12 @@ class DingoFSHiCacheTest(unittest.TestCase):
         self.assertEqual(m["exist_v2_probe_pages"], 3)
         self.assertEqual(m["exist_v2_hit_pages"], res.kv_hit_pages)
         self.assertEqual(m["exist_v2_hit_pages"], 3)
+        self.assertEqual(m["exist_calls"], 1)
+        self.assertEqual(m["exist_probe_pages"], 3)
+        self.assertEqual(m["exist_present_pages"], 3)
+        self.assertEqual(m["exist_contiguous_pages"], 3)
+        self.assertEqual(m["exist_result_full_hit"], 1)
+        self.assertEqual(m["exist_observations"], 1)
         # v2 latency histograms observed once per set_v2/get_v2 call
         self.assertEqual(m["set_v2_observations"], 1)
         self.assertEqual(m["get_v2_observations"], 1)
@@ -639,6 +678,11 @@ class DingoFSHiCacheTest(unittest.TestCase):
         st.pcp_rank = kw.get("pcp_rank", 0)
         st.dcp_size = kw.get("dcp_size", 1)
         st.dcp_rank = kw.get("dcp_rank", 0)
+        st.prefill_cp_storage_layout = kw.get(
+            "prefill_cp_storage_layout", None)
+        st._storage_pcp_rank = (
+            0 if st.prefill_cp_storage_layout == "replicated"
+            else st.pcp_rank)
         st._pool_component_names = {"extra": ("all",)}
         st._pool_replicated = {"extra": True}
         return st
@@ -663,6 +707,25 @@ class DingoFSHiCacheTest(unittest.TestCase):
                 dfkv_hicache.pool_key(
                     "abc", pool="kv", tp_size=8, tp_rank=2, component="v"),
             ],
+        )
+
+    def test_replicated_prefill_cp_uses_writer_key(self):
+        rank0 = self._keyonly(
+            pcp_size=8,
+            pcp_rank=0,
+            prefill_cp_storage_layout="replicated",
+        )
+        rank7 = self._keyonly(
+            pcp_size=8,
+            pcp_rank=7,
+            prefill_cp_storage_layout="replicated",
+        )
+        self.assertEqual(rank0._keys("same-page"), rank7._keys("same-page"))
+        self.assertEqual(
+            rank7._keys("same-page"),
+            [dfkv_hicache.pool_key(
+                "same-page", pool="kv", tp_size=8, tp_rank=-1,
+                pcp_size=8, pcp_rank=0, component="all")],
         )
 
     def test_keys_separate_pcp_and_dcp_physical_ranks(self):
@@ -1243,7 +1306,8 @@ class DfkvAccessLogTest(unittest.TestCase):
         self._flush()
         txt = self._read(os.path.join(self.tmp, "acc.0.log"))
         self.assertIn(
-            "init(r0 glm-5.1 tp=0/8 pcp=0/1 dcp=0/1 mla=1) : ok static", txt
+            "init(r0 glm-5.1 tp=0/8 pcp=0/1 storage_pcp=0/1 "
+            "dcp=0/1 physical_rank=- mla=1) : ok static", txt
         )
         self.assertIn("batch_set_v1(r0 2 keys) : ok 2/2", txt)
         self.assertIn("batch_get_v1(r0 2 keys) : hits=2/2", txt)

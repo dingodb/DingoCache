@@ -662,6 +662,14 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   active_lane_rail_ =
       std::make_unique<std::atomic<uint64_t>[]>(3 * devs_.size());
   rail_conns_ = std::make_unique<std::atomic<uint64_t>[]>(devs_.size());
+  rail_put_ops_ =
+      std::make_unique<std::atomic<uint64_t>[]>(devs_.size());
+  rail_put_bytes_ =
+      std::make_unique<std::atomic<uint64_t>[]>(devs_.size());
+  rail_get_ops_ =
+      std::make_unique<std::atomic<uint64_t>[]>(devs_.size());
+  rail_get_bytes_ =
+      std::make_unique<std::atomic<uint64_t>[]>(devs_.size());
   if (keepalive_ms_ > 0)
     keepalive_thread_ = std::thread(&RdmaTransport::KeepaliveLoop, this);
 }
@@ -858,6 +866,15 @@ void RdmaTransport::CompleteRemoteLease(Conn* c,
   c->remote_lease_held = false;
   CompleteRemote(c->peer_id, c->rail_index, c->remote_lease_generation,
                  outcome);
+}
+
+void RdmaTransport::RecordRailTransfer(Conn* c, bool put,
+                                       uint64_t operations, uint64_t bytes) {
+  if (!c || c->rail_index >= devs_.size() || operations == 0) return;
+  auto& op_counters = put ? rail_put_ops_ : rail_get_ops_;
+  auto& byte_counters = put ? rail_put_bytes_ : rail_get_bytes_;
+  op_counters[c->rail_index].fetch_add(operations, std::memory_order_relaxed);
+  byte_counters[c->rail_index].fetch_add(bytes, std::memory_order_relaxed);
 }
 
 void RdmaTransport::MarkClassOpened(Conn* c) {
@@ -1895,10 +1912,27 @@ std::string RdmaTransport::MetricsText() const {
        "\n";
   s += "# HELP dfkv_rdma_client_rail_conns_total Connections opened per rail (device)\n";
   s += "# TYPE dfkv_rdma_client_rail_conns_total counter\n";
+  s += "# HELP dfkv_rdma_client_rail_put_ops_total Successful logical PUT objects per local RDMA rail\n";
+  s += "# TYPE dfkv_rdma_client_rail_put_ops_total counter\n";
+  s += "# HELP dfkv_rdma_client_rail_put_bytes_total Successful logical PUT payload bytes per local RDMA rail\n";
+  s += "# TYPE dfkv_rdma_client_rail_put_bytes_total counter\n";
+  s += "# HELP dfkv_rdma_client_rail_get_ops_total Successful logical GET objects per local RDMA rail\n";
+  s += "# TYPE dfkv_rdma_client_rail_get_ops_total counter\n";
+  s += "# HELP dfkv_rdma_client_rail_get_bytes_total Successful logical GET payload bytes per local RDMA rail\n";
+  s += "# TYPE dfkv_rdma_client_rail_get_bytes_total counter\n";
   for (size_t i = 0; i < devs_.size(); ++i) {
     const std::string& d = devs_[i].empty() ? std::string("default") : devs_[i];
     s += "dfkv_rdma_client_rail_conns_total{dev=\"" + d + "\"} " +
          std::to_string(rail_conns_[i].load(std::memory_order_relaxed)) + "\n";
+    const std::string labels = "{dev=\"" + d + "\"} ";
+    s += "dfkv_rdma_client_rail_put_ops_total" + labels +
+         std::to_string(rail_put_ops_[i].load(std::memory_order_relaxed)) + "\n";
+    s += "dfkv_rdma_client_rail_put_bytes_total" + labels +
+         std::to_string(rail_put_bytes_[i].load(std::memory_order_relaxed)) + "\n";
+    s += "dfkv_rdma_client_rail_get_ops_total" + labels +
+         std::to_string(rail_get_ops_[i].load(std::memory_order_relaxed)) + "\n";
+    s += "dfkv_rdma_client_rail_get_bytes_total" + labels +
+         std::to_string(rail_get_bytes_[i].load(std::memory_order_relaxed)) + "\n";
   }
   const uint64_t now = rdma::RailPolicy::NowMicros();
   const auto rail_stats = rail_policy_->Snapshot(now);
@@ -2363,6 +2397,10 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
     if (ok) {
       if (out) *out = std::move(attempt_out);
       if (value_len) *value_len = attempt_value_len;
+      if (status == Status::kOk && op == WireOp::kCache)
+        RecordRailTransfer(conn, true, 1, payload_len);
+      else if (status == Status::kOk && op == WireOp::kRange)
+        RecordRailTransfer(conn, false, 1, data_len);
       Release(node, lane, conn);
       if (cross_rail_retry)
         cross_rail_retry_successes_.fetch_add(1,
@@ -2564,6 +2602,14 @@ std::vector<Status> RdmaTransport::CacheMany(
       }
     }
     if (conn_ok) {
+      uint64_t successful_ops = 0;
+      uint64_t successful_bytes = 0;
+      for (size_t i = 0; i < count; ++i) {
+        if (result[i] != Status::kOk) continue;
+        ++successful_ops;
+        successful_bytes += items[i].len;
+      }
+      RecordRailTransfer(conn, true, successful_ops, successful_bytes);
       Release(node, Lane::kData, conn);
       if (cross_rail_retry)
         cross_rail_retry_successes_.fetch_add(1,
@@ -2723,6 +2769,14 @@ std::vector<Status> RdmaTransport::RangeMany(
       }
     }
     if (conn_ok) {
+      uint64_t successful_ops = 0;
+      uint64_t successful_bytes = 0;
+      for (size_t i = 0; i < count; ++i) {
+        if (result[i] != Status::kOk) continue;
+        ++successful_ops;
+        successful_bytes += attempt_outputs[i].size();
+      }
+      RecordRailTransfer(conn, false, successful_ops, successful_bytes);
       *outputs = std::move(attempt_outputs);
       if (value_lens) *value_lens = std::move(attempt_value_lens);
       Release(node, Lane::kData, conn);
@@ -2979,6 +3033,7 @@ std::vector<Status> RdmaTransport::RangeInto(
             pull_read_bytes_.fetch_add(ready.data_len,
                                        std::memory_order_relaxed);
             result[item] = Status::kOk;
+            RecordRailTransfer(conn, false, 1, ready.data_len);
             if (value_lens) (*value_lens)[item] = ready.value_len;
           }
         }
@@ -3193,6 +3248,14 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
       if (conn_ok) completed[item_index] = 1;
     }
     if (conn_ok) {
+      uint64_t successful_ops = 0;
+      uint64_t successful_bytes = 0;
+      for (size_t i = 0; i < count; ++i) {
+        if (!completed[i] || result[i] != Status::kOk) continue;
+        ++successful_ops;
+        successful_bytes += totals[i];
+      }
+      RecordRailTransfer(conn, true, successful_ops, successful_bytes);
       Release(node, Lane::kSgData, conn);
       if (cross_rail_retry)
         cross_rail_retry_successes_.fetch_add(1,
@@ -3378,6 +3441,7 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
           pull_read_bytes_.fetch_add(ready.data_len,
                                      std::memory_order_relaxed);
           result[item] = Status::kOk;
+          RecordRailTransfer(conn, false, 1, ready.data_len);
           if (out_lengths)
             (*out_lengths)[item] = static_cast<size_t>(ready.value_len);
         } else {

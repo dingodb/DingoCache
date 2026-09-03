@@ -199,6 +199,8 @@ class RdmaTransport : public Transport {
                       uint64_t generation, RemoteRailOutcome outcome);
   void RetireIdlePeerRail(const std::string& peer_id, size_t local_rail);
   void CompleteRemoteLease(Conn* c, RemoteRailOutcome outcome);
+  void RecordRailTransfer(Conn* c, bool put, uint64_t operations,
+                          uint64_t bytes);
   bool EvictOneIdle();
   // Keep every idle QP alive while its client process is healthy. This lets a
   // short server-side idle reaper reclaim dead clients without forcing the
@@ -359,6 +361,10 @@ class RdmaTransport : public Transport {
   mutable std::mutex peer_connections_mu_;
   std::map<std::pair<std::string, size_t>, uint64_t> peer_connections_;
   std::unique_ptr<std::atomic<uint64_t>[]> rail_conns_;  // sized to devs_.size()
+  std::unique_ptr<std::atomic<uint64_t>[]> rail_put_ops_;
+  std::unique_ptr<std::atomic<uint64_t>[]> rail_put_bytes_;
+  std::unique_ptr<std::atomic<uint64_t>[]> rail_get_ops_;
+  std::unique_ptr<std::atomic<uint64_t>[]> rail_get_bytes_;
   std::atomic<uint64_t> endpoint_cache_hits_{0};
   std::atomic<uint64_t> endpoint_cache_misses_{0};
   std::atomic<uint64_t> endpoint_cache_evictions_{0};

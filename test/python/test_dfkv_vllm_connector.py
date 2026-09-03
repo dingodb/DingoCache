@@ -121,6 +121,7 @@ def _install_vllm_stubs() -> None:
         get_dcp_group=lambda: Placeholder(),
         get_pcp_group=lambda: Placeholder(),
         get_tensor_model_parallel_rank=lambda: 0,
+        get_world_group=lambda: SimpleNamespace(local_rank=0),
         get_tensor_model_parallel_world_size=lambda: 1,
     )
     stub(

@@ -96,8 +96,129 @@ def _physical_axis(cfg: dict, name: str) -> tuple[int, int]:
         raise ValueError(f"{rank_key} must be in [0, {size})")
     return size, rank
 
+
+def _load_parallel_context():
+    """Return SGLang's initialized parallel context when available."""
+    try:
+        try:
+            from sglang.srt.runtime_context import get_parallel
+        except ImportError:
+            from sglang.srt.distributed import get_parallel
+        return get_parallel()
+    except (ImportError, AttributeError, AssertionError, RuntimeError):
+        return None
+
+
+def _resolve_local_physical_rank(parallel=None) -> int:
+    """Resolve the node-local process/device coordinate used for HCA affinity.
+
+    This is deliberately independent of TP/DP/PCP/DCP semantics. SGLang's
+    world-group local rank is the cross-platform device-assignment coordinate
+    for CUDA/ROCm, NPU, XPU, and MUSA backends.
+    """
+    if parallel is None:
+        parallel = _load_parallel_context()
+    group = None
+    if parallel is not None:
+        try:
+            group = parallel.world_group
+        except (AttributeError, AssertionError, RuntimeError):
+            pass
+    if group is None:
+        try:
+            from sglang.srt.distributed.parallel_state import get_world_group
+            group = get_world_group()
+        except (ImportError, AttributeError, AssertionError, RuntimeError):
+            pass
+    rank = getattr(group, "local_rank", None) if group is not None else None
+    if isinstance(rank, bool):
+        raise ValueError("SGLang world-group local_rank must be an integer")
+    try:
+        rank = int(rank)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "rail_affinity requires SGLang world_group.local_rank; "
+            "TP/DP/PCP/DCP ranks are not physical affinity coordinates"
+        ) from exc
+    if rank < 0:
+        raise ValueError("SGLang world-group local_rank must be non-negative")
+    return rank
+
+
+def _runtime_flag(parallel, name: str):
+    if parallel is None:
+        return None
+    try:
+        value = getattr(parallel, name)
+    except (AttributeError, AssertionError, RuntimeError):
+        return None
+    return bool(value)
+
+
+def _resolve_prefill_cp_storage_layout(
+    cfg: dict,
+    *,
+    is_mla: bool,
+    pcp_size: int,
+    dcp_size: int,
+    parallel,
+) -> Optional[str]:
+    """Validate the explicit CP storage identity contract.
+
+    SGLang's ``is_mla_model`` establishes TP replication, not a permanent
+    promise that every future CP implementation stores replicated bytes. CP
+    deployments therefore declare the storage layout explicitly; ambiguous or
+    truly sharded layouts fail closed instead of aliasing distinct payloads.
+    """
+    raw = cfg.get("prefill_cp_storage_layout")
+    if raw is not None:
+        if not isinstance(raw, str):
+            raise ValueError(
+                "prefill_cp_storage_layout must be 'replicated' or 'sharded'"
+            )
+        raw = raw.strip().lower()
+        if raw not in ("replicated", "sharded"):
+            raise ValueError(
+                "prefill_cp_storage_layout must be 'replicated' or 'sharded'"
+            )
+    if pcp_size <= 1:
+        return raw
+    if not is_mla:
+        if raw is not None:
+            raise ValueError(
+                "prefill_cp_storage_layout is supported only for rank-replicated MLA"
+            )
+        return None
+    if raw is None:
+        raise ValueError(
+            "MLA with attention CP requires explicit "
+            "prefill_cp_storage_layout='replicated'; sharded CP is unsupported"
+        )
+    if raw == "sharded":
+        raise ValueError(
+            "prefill_cp_storage_layout='sharded' is unsupported: SGLang elects "
+            "one MLA storage writer, so dfkv cannot persist every CP shard"
+        )
+    if dcp_size > 1:
+        raise ValueError(
+            "replicated Prefill-CP storage is incompatible with DCP; "
+            "keep distinct DCP storage coordinates"
+        )
+    if _runtime_flag(parallel, "enable_dsa_cache_layer_split"):
+        raise ValueError(
+            "replicated Prefill-CP storage is incompatible with "
+            "enable_dsa_cache_layer_split"
+        )
+    prefill_enabled = _runtime_flag(parallel, "enable_prefill_cp")
+    if prefill_enabled is False:
+        raise ValueError(
+            "prefill_cp_storage_layout='replicated' requires enable_prefill_cp"
+        )
+    return raw
+
 def _resolve_parallel_coordinates(
     cfg: dict,
+    parallel=None,
 ) -> tuple[tuple[int, int], tuple[int, int], Optional[int]]:
     """Resolve SGLang's physical CP coordinates, with explicit overrides.
 
@@ -105,18 +226,8 @@ def _resolve_parallel_coordinates(
     dynamic HiCache backend's ``extra_config``. Discover them from the initialized
     parallel state so sharded ranks cannot alias the default ``0/1`` keys.
     """
-    parallel = None
-    try:
-        try:
-            from sglang.srt.runtime_context import get_parallel
-        except ImportError:
-            # Compatibility with releases that re-export runtime context through
-            # the distributed package.
-            from sglang.srt.distributed import get_parallel
-
-        parallel = get_parallel()
-    except (ImportError, AttributeError, AssertionError, RuntimeError):
-        pass
+    if parallel is None:
+        parallel = _load_parallel_context()
 
     resolved = {}
     runtime_fields = {
@@ -351,18 +462,37 @@ class DfkvHiCache(HiCacheStorage):
         self.tp_rank = int(storage_config.tp_rank)
         self.tp_size = int(storage_config.tp_size)
         self.is_mla = bool(storage_config.is_mla_model)
-        # PCP and DCP split one logical page into distinct physical shards.
-        # SGLang does not forward those coordinates through extra_config, so use
-        # its initialized parallel state unless the operator explicitly supplied
-        # a bounded override.
+        parallel = _load_parallel_context()
+        # Runtime PCP/DCP coordinates describe SGLang's compute topology. The
+        # storage identity may intentionally collapse replicated Prefill-CP
+        # ranks onto the elected writer's key; keep the two concepts separate.
         (
             (self.pcp_size, self.pcp_rank),
             (self.dcp_size, self.dcp_rank),
             attn_tp_rank,
-        ) = _resolve_parallel_coordinates(cfg)
-        # MLA is replicated only inside one effective attention-TP subgroup.
-        # DCP ranks own distinct interleaved shards, so each DCP coordinate elects
-        # its own writer; PCP ranks independently repeat the same election.
+        ) = _resolve_parallel_coordinates(cfg, parallel)
+        self.prefill_cp_storage_layout = _resolve_prefill_cp_storage_layout(
+            cfg,
+            is_mla=self.is_mla,
+            pcp_size=self.pcp_size,
+            dcp_size=self.dcp_size,
+            parallel=parallel,
+        )
+        self._storage_pcp_rank = (
+            0
+            if self.prefill_cp_storage_layout == "replicated"
+            else self.pcp_rank
+        )
+        # Rail affinity is a node-local physical property. Resolve it only when
+        # enabled so storage-only/legacy SGLang deployments remain unaffected.
+        self.physical_rank = (
+            _resolve_local_physical_rank(parallel)
+            if _truthy(cfg.get("rail_affinity"))
+            else None
+        )
+        # MLA payloads are replicated inside one effective attention-TP group.
+        # DCP coordinates remain distinct; replicated Prefill-CP ranks share the
+        # writer key selected above.
         self._mla_replica_writer = _is_mla_replica_writer(
             self.is_mla,
             self.tp_rank,
@@ -394,7 +524,11 @@ class DfkvHiCache(HiCacheStorage):
         # zero-correctness-impact knobs are hot; structural/native knobs are not.
         _hot_config.register("access_log", _access_log_apply_hot)
         _hot_config.start(cfg, tp_rank=self.tp_rank)
-        self._alog_tag = f"r{self.tp_rank}"
+        self._alog_tag = (
+            f"r{self.tp_rank}-p{self.physical_rank}"
+            if self.physical_rank is not None
+            else f"r{self.tp_rank}"
+        )
         # Client-side read/write counters (Prometheus when available). Lets ops
         # confirm SGLang->dfkv volume from /metrics instead of parsing access logs.
         self._metrics = _Metrics(self.tp_rank)
@@ -441,7 +575,9 @@ class DfkvHiCache(HiCacheStorage):
                 f"{self._alog_tag} {self.model} "
                 f"tp={self.tp_rank}/{self.tp_size} "
                 f"pcp={self.pcp_rank}/{self.pcp_size} "
+                f"storage_pcp={self._storage_pcp_rank}/{self.pcp_size} "
                 f"dcp={self.dcp_rank}/{self.dcp_size} "
+                f"physical_rank={self.physical_rank if self.physical_rank is not None else '-'} "
                 f"mla={int(self.is_mla)}")) as r:
             mds = cfg.get("mds_endpoints", "")
             members = cfg.get("members", "")
@@ -457,12 +593,22 @@ class DfkvHiCache(HiCacheStorage):
                 if not _truthy(os.environ.get("DFKV_RDMA")):
                     os.environ["DFKV_RDMA"] = "1"
             # Resolve rank-local affinity before dfkv_open_v2 so each process
-            # registers CUDA pools only on its primary and bounded fallbacks.
-            # DP-attention exposes the physical rank through PCP; plain TP
-            # uses tp_rank.
-            affinity_rank = self.pcp_rank if self.pcp_size > 1 else self.tp_rank
+            # registers pools only on its node-local primary and bounded
+            # fallbacks. Never substitute TP/DP/PCP/DCP for physical rank.
+            affinity_rank = (
+                self.physical_rank
+                if self.physical_rank is not None
+                else self.tp_rank
+            )
             self._rail_affinity = apply_rank_local_rail_affinity(
                 cfg, affinity_rank, os.environ)
+            self._metrics.set_identity(
+                physical_rank=self.physical_rank,
+                pcp_rank=self.pcp_rank,
+                dcp_rank=self.dcp_rank,
+                storage_pcp_rank=self._storage_pcp_rank,
+                primary_dev=self._rail_affinity.primary,
+            )
             if not self._rail_affinity.enabled and cfg.get("rdma_numa"):
                 os.environ.setdefault("DFKV_RDMA_NUMA", "1")
             # Same-host GET rendezvous (phase 5): dedups TP-replicated L3 loads
@@ -748,8 +894,9 @@ class DfkvHiCache(HiCacheStorage):
                 raise RuntimeError("pool page_size must be positive")
             try:
                 import torch as _t
-                indices = _t.arange(page_size, dtype=_t.int64)
-            except ImportError:
+                arange = getattr(_t, "arange")
+                indices = arange(page_size, dtype=_t.int64)
+            except (ImportError, AttributeError):
                 indices = list(range(page_size))
             meta = host_pool.get_page_buffer_meta(indices)
             if _meta_has_no_layout(meta):
@@ -1016,14 +1163,25 @@ class DfkvHiCache(HiCacheStorage):
 
 
     # --- canonical pool-key schema -----------------------------------------
+    def _storage_pcp(self, replicated: bool) -> tuple[int, int]:
+        """Return the CP coordinate encoded in one physical object key."""
+        rank = (
+            getattr(self, "_storage_pcp_rank", 0)
+            if replicated
+            and getattr(self, "prefill_cp_storage_layout", None) == "replicated"
+            else self.pcp_rank
+        )
+        return self.pcp_size, rank
+
     def _keys(self, page_hash: str | bytes) -> List[bytes]:
         tp = -1 if self.is_mla else self.tp_rank
         pp = self.pp_rank if self.enable_pp else 0
+        pcp_size, pcp_rank = self._storage_pcp(self.is_mla)
         components = ["all"] if self.is_mla else ["k", "v"]
         return [
             pool_key(page_hash, pool="kv",
                      tp_size=self.tp_size, tp_rank=tp,
-                     pcp_size=self.pcp_size, pcp_rank=self.pcp_rank,
+                     pcp_size=pcp_size, pcp_rank=pcp_rank,
                      dcp_size=self.dcp_size, dcp_rank=self.dcp_rank,
                      pp_size=self.pp_size if self.enable_pp else 1, pp_rank=pp,
                      component=component)
@@ -1434,6 +1592,7 @@ class DfkvHiCache(HiCacheStorage):
 
     def batch_exists(self, keys, extra_info=None) -> int:
         total = len(keys)
+        t0 = time.perf_counter()
         with _tracing.span("batch_exists", total) as _sp, \
                 access_log("batch_exists", lambda: f"{self._alog_tag} {total} keys") as r:
             # longest contiguous prefix of pages whose every sub-object exists.
@@ -1452,6 +1611,12 @@ class DfkvHiCache(HiCacheStorage):
                 if not ok:
                     break
                 n += 1
+            self._metrics.on_exists(
+                probe_pages=total,
+                present_pages=sum(page_ok),
+                contiguous_pages=n,
+                seconds=time.perf_counter() - t0,
+            )
             r.result = f"prefix={n}/{total}"
             self._log_exist_probe(sks, n, total)
             if _sp:
@@ -1479,11 +1644,13 @@ class DfkvHiCache(HiCacheStorage):
             return self._keys(page_hash)
         components = self._pool_components(pool_name)
         pp = self.pp_rank if self.enable_pp else 0
-        tp = -1 if self._pool_is_replicated(pool_name) else self.tp_rank
+        replicated = self._pool_is_replicated(pool_name)
+        tp = -1 if replicated else self.tp_rank
+        pcp_size, pcp_rank = self._storage_pcp(replicated)
         return [
             pool_key(page_hash, pool=pool_name,
                      tp_size=self.tp_size, tp_rank=tp,
-                     pcp_size=self.pcp_size, pcp_rank=self.pcp_rank,
+                     pcp_size=pcp_size, pcp_rank=pcp_rank,
                      dcp_size=self.dcp_size, dcp_rank=self.dcp_rank,
                      pp_size=self.pp_size if self.enable_pp else 1, pp_rank=pp,
                      component=component)
@@ -1659,6 +1826,7 @@ class DfkvHiCache(HiCacheStorage):
         access-log wrapper, so batch_set_v2_device can reuse it for the anchor KV.
         Returns (per_page_bools, nbytes, seconds). MLA backup_skip on non-zero TP
         rank (replicated latent) short-circuits to all-True, no I/O."""
+        n = len(keys)
         if self.is_mla and not self._mla_replica_writer:
             return [True] * n, 0, 0.0
         from sglang.srt.mem_cache.device_page_meta import (
@@ -1773,6 +1941,7 @@ class DfkvHiCache(HiCacheStorage):
         indexer is layer-first & PAGE-indexed; get_device_sidecar_page_buffer_meta
         yields its per-layer page-row segments from the registered sidecar device
         pool. Returns (per_page_bools, nbytes, seconds)."""
+        n = len(keys)
         if self.is_mla and not self._mla_replica_writer:
             return [True] * n, 0, 0.0
         from sglang.srt.mem_cache.device_page_meta import (
@@ -1815,12 +1984,14 @@ class DfkvHiCache(HiCacheStorage):
         self, page_hash: str | bytes, sub: int,
     ) -> List[bytes]:
         pp = self.pp_rank if self.enable_pp else 0
-        tp = -1 if sub == 1 else self.tp_rank
-        components = ["all"] if sub == 1 else ["k", "v"]
+        replicated = sub == 1
+        tp = -1 if replicated else self.tp_rank
+        pcp_size, pcp_rank = self._storage_pcp(replicated)
+        components = ["all"] if replicated else ["k", "v"]
         return [
             pool_key(page_hash, pool="draft",
                      tp_size=self.tp_size, tp_rank=tp,
-                     pcp_size=self.pcp_size, pcp_rank=self.pcp_rank,
+                     pcp_size=pcp_size, pcp_rank=pcp_rank,
                      dcp_size=self.dcp_size, dcp_rank=self.dcp_rank,
                      pp_size=self.pp_size if self.enable_pp else 1, pp_rank=pp,
                      component=component)
@@ -1842,6 +2013,7 @@ class DfkvHiCache(HiCacheStorage):
             )
             seg_ptrs, seg_sizes = get_device_page_buffer_meta(
                 self.mem_pool_device_draft, device_indices)
+            sub = len(seg_ptrs) // n if n else 1
             if sub == 1 and not self._mla_replica_writer:
                 r.result = "backup_skip"
                 return [True] * n

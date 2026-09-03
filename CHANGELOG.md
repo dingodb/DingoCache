@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### SGLang Prefill-CP storage identity and physical rail affinity
+
+- Fixed SGLang DP-attention rail affinity to use the world-group node-local
+  process rank instead of TP/PCP coordinates. Eight TP-of-1 schedulers no
+  longer collapse onto rail 0; missing physical rank now fails startup.
+- Added the explicit `prefill_cp_storage_layout=replicated` contract for
+  rank-replicated MLA Prefill-CP. All CP readers retain the deployed CP size but
+  address the elected writer's `pcp_rank=0` key. DCP, DSA cache-layer split,
+  sharded, and ambiguous layouts fail closed.
+- Added HiCache parallel-identity and contiguous-prefix existence metrics, plus
+  native per-rail successful logical PUT/GET operation and payload-byte
+  counters.
+- Fixed three latent device-direct backup branches that referenced an
+  uninitialized page count/component count, and refreshed the CPU-only vLLM
+  test shims for the current world-group and asynchronous-load contracts.
+
 ### RDMA receive-pool default capacity
 
 - Raised the default `DFKV_RDMA_RECV_SEGMENT_SIZE` hard budget from 16 GiB to

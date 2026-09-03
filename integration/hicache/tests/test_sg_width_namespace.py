@@ -147,6 +147,8 @@ def _mk_instance(width: int, mla: bool = True):
     inst.pcp_rank = 0
     inst.dcp_size = 1
     inst.dcp_rank = 0
+    inst.prefill_cp_storage_layout = None
+    inst._storage_pcp_rank = 0
     inst._mla_replica_writer = False
     inst.mem_pool_device = object()  # non-None → device (L2-bypass) mode
     inst._metrics = _FakeMetrics()
@@ -204,7 +206,20 @@ class TestParallelCoordinates(unittest.TestCase):
         self.assertEqual(dcp, (1, 0))
         self.assertEqual(attn_tp_rank, 2)
 
-    def test_cp_rank_changes_physical_key(self):
+    def test_prefill_cp_replicated_rank_uses_writer_key(self):
+        left = _mk_instance(29)
+        left.pcp_size = 8
+        left.pcp_rank = 0
+        left.prefill_cp_storage_layout = "replicated"
+        left._storage_pcp_rank = 0
+        right = _mk_instance(29)
+        right.pcp_size = 8
+        right.pcp_rank = 7
+        right.prefill_cp_storage_layout = "replicated"
+        right._storage_pcp_rank = 0
+        self.assertEqual(left._keys("shared-page"), right._keys("shared-page"))
+
+    def test_sharded_pool_keeps_runtime_cp_rank(self):
         left = _mk_instance(29)
         left.pcp_size = 8
         left.pcp_rank = 0
@@ -212,6 +227,50 @@ class TestParallelCoordinates(unittest.TestCase):
         right.pcp_size = 8
         right.pcp_rank = 1
         self.assertNotEqual(left._keys("shared-page"), right._keys("shared-page"))
+
+    def test_world_group_local_rank_is_physical_affinity_rank(self):
+        with _parallel_runtime(
+            tp_rank=0,
+            world_group=types.SimpleNamespace(local_rank=6),
+        ) as _:
+            self.assertEqual(H._resolve_local_physical_rank(), 6)
+
+    def test_missing_world_group_local_rank_fails_closed(self):
+        with _parallel_runtime(tp_rank=0):
+            with self.assertRaisesRegex(ValueError, "world_group.local_rank"):
+                H._resolve_local_physical_rank()
+
+    def test_replicated_cp_layout_requires_explicit_declaration(self):
+        with self.assertRaisesRegex(ValueError, "explicit"):
+            H._resolve_prefill_cp_storage_layout(
+                {},
+                is_mla=True,
+                pcp_size=8,
+                dcp_size=1,
+                parallel=types.SimpleNamespace(enable_prefill_cp=True),
+            )
+
+    def test_replicated_cp_layout_rejects_layer_split_and_dcp(self):
+        cfg = {"prefill_cp_storage_layout": "replicated"}
+        with self.assertRaisesRegex(ValueError, "layer_split"):
+            H._resolve_prefill_cp_storage_layout(
+                cfg,
+                is_mla=True,
+                pcp_size=8,
+                dcp_size=1,
+                parallel=types.SimpleNamespace(
+                    enable_prefill_cp=True,
+                    enable_dsa_cache_layer_split=True,
+                ),
+            )
+        with self.assertRaisesRegex(ValueError, "DCP"):
+            H._resolve_prefill_cp_storage_layout(
+                cfg,
+                is_mla=True,
+                pcp_size=8,
+                dcp_size=2,
+                parallel=types.SimpleNamespace(enable_prefill_cp=True),
+            )
 
     def test_mla_writer_is_elected_per_physical_cp_shard(self):
         self.assertFalse(H._is_mla_replica_writer(True, 3, None, 1, 0))

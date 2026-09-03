@@ -1856,6 +1856,12 @@ TEST(RdmaLoopback, MetricsCountersTrackOps) {
   EXPECT_GE(CounterVal(cli_text, "dfkv_rdma_client_pull_reads_total"), 1);
   EXPECT_GE(CounterVal(cli_text,
                        "dfkv_rdma_client_pull_read_bytes_total"), 2048);
+  EXPECT_GE(MetricSum(cli_text, "dfkv_rdma_client_rail_put_ops_total{"), 1);
+  EXPECT_GE(MetricSum(cli_text, "dfkv_rdma_client_rail_put_bytes_total{"),
+            2048);
+  EXPECT_GE(MetricSum(cli_text, "dfkv_rdma_client_rail_get_ops_total{"), 1);
+  EXPECT_GE(MetricSum(cli_text, "dfkv_rdma_client_rail_get_bytes_total{"),
+            2048);
   EXPECT_GE(CounterVal(cli_text,
                        "dfkv_rdma_client_pool_mr_registrations_total"), 1);
   EXPECT_EQ(CounterVal(cli_text, "dfkv_rdma_client_pool_limit"), 8);
