@@ -9,7 +9,7 @@ _INTEGRATION = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_INTEGRATION / "common" / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dfkv_metrics import ClientStatsPoller
+from dfkv_metrics import ClientStatsPoller, Metrics
 
 
 _SNAPSHOT = """\
@@ -21,6 +21,10 @@ dfkv_client_op_requests_total{op="get"} 8
 dfkv_client_io_errors_total 2
 dfkv_client_peer_errors_total{peer="192.168.5.1:28101"} 3
 dfkv_rdma_client_rail_selections_total{dev="ib7s400p0"} 17
+dfkv_rdma_client_rail_put_ops_total{dev="ib7s400p0"} 4
+dfkv_rdma_client_rail_put_bytes_total{dev="ib7s400p0"} 4096
+dfkv_rdma_client_rail_get_ops_total{dev="ib7s400p0"} 3
+dfkv_rdma_client_rail_get_bytes_total{dev="ib7s400p0"} 3072
 dfkv_rdma_client_rail_errors_total{dev="ib7s400p0"} 1
 dfkv_rdma_client_mr_registered_bytes 134217728
 dfkv_rdma_client_completion_timeouts_total 4
@@ -40,8 +44,43 @@ def test_poller_tracks_native_families_and_reset_safe_deltas():
     assert poller.totals()['dfkv_client_op_requests_total{op="get"}'] == 8
     assert poller.totals()[
         'dfkv_rdma_client_rail_errors_total{dev="ib7s400p0"}'] == 1
+    assert poller.totals()[
+        'dfkv_rdma_client_rail_put_bytes_total{dev="ib7s400p0"}'] == 4096
+    assert poller.totals()[
+        'dfkv_rdma_client_rail_get_bytes_total{dev="ib7s400p0"}'] == 3072
     assert poller.health()["success"] == 1
 
+
+
+def test_hicache_identity_and_exist_outcomes_are_observable():
+    metrics = Metrics(tp_rank=913)
+    metrics.set_identity(
+        physical_rank=6,
+        pcp_rank=6,
+        dcp_rank=0,
+        storage_pcp_rank=0,
+        primary_dev="ib7s400p6",
+    )
+    metrics.on_exists(8, 0, 0, seconds=0.001)
+    metrics.on_exists(8, 6, 4, seconds=0.002)
+    metrics.on_exists(8, 8, 8, seconds=0.003)
+    snapshot = metrics.snapshot()
+    assert snapshot["identity"] == {
+        "tp_rank": "913",
+        "physical_rank": "6",
+        "pcp_rank": "6",
+        "dcp_rank": "0",
+        "storage_pcp_rank": "0",
+        "primary_dev": "ib7s400p6",
+    }
+    assert snapshot["exist_calls"] == 3
+    assert snapshot["exist_probe_pages"] == 24
+    assert snapshot["exist_present_pages"] == 14
+    assert snapshot["exist_contiguous_pages"] == 12
+    assert snapshot["exist_result_full_miss"] == 1
+    assert snapshot["exist_result_partial_prefix"] == 1
+    assert snapshot["exist_result_full_hit"] == 1
+    assert snapshot["exist_observations"] == 3
 
 def test_failed_snapshot_is_observable_and_recovery_clears_failure():
     snapshots = iter(("", _SNAPSHOT))

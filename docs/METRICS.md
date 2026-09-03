@@ -358,6 +358,8 @@ C 客户端快照还含传输级指标（RDMA 构建）：
 | `dfkv_rdma_client_stale_generation_reaps_total` | counter | 无 label；因 Conn 的 peer generation 落后而拒绝 take/repool/keepalive、并经 single-owner lifecycle 回收的 endpoint 数 |
 | `dfkv_rdma_client_keepalive_attempts_total` / `dfkv_rdma_client_keepalive_successes_total` / `dfkv_rdma_client_keepalive_failures_total` | counter | idle pooled QP 的保活尝试 / 成功 / 失败并退役连接；仅 `DFKV_RDMA_KEEPALIVE_MS>0` 时增长 |
 | `dfkv_rdma_client_rail_conns_total{dev}` / `dfkv_rdma_client_rail_selections_total{dev}` | counter | 每 rail 新连接 / 准入分布 |
+| `dfkv_rdma_client_rail_put_ops_total{dev}` / `dfkv_rdma_client_rail_put_bytes_total{dev}` | counter | 每条本地rail成功完成的逻辑PUT对象数/有效payload字节；跨多个WR的SG对象只计一个逻辑op |
+| `dfkv_rdma_client_rail_get_ops_total{dev}` / `dfkv_rdma_client_rail_get_bytes_total{dev}` | counter | 每条本地rail成功完成的逻辑GET对象数/实际返回payload字节；用于验证rank-local affinity是否真正承载业务流量 |
 | `dfkv_rdma_client_rail_inflight{dev}` / `dfkv_rdma_client_rail_credits_available{dev}` | gauge | 当前已租 / 可用 request credits |
 | `dfkv_rdma_client_rail_credits_exhausted_total{dev}` | counter | 因 local candidate credit 不足跳过次数 |
 | `dfkv_rdma_client_rail_errors_total{dev}` / `dfkv_rdma_client_rail_consecutive_errors{dev}` | counter / gauge | **仅本地** device open、QP transition、MR register/refresh、post/CQ verbs API 失败和 local WC 累计 / 当前连续值 |
@@ -387,6 +389,20 @@ family 均是无 label process counter，避免 peer 地址造成无界时序；
 不增加 `dfkv_client_ops_served_total`、`dfkv_client_io_errors_total`、
 `dfkv_client_peer_marked_bad_total` 或 cooldown。endpoint 和 local-rail health
 仍按各自既有 family 分开告警。
+
+SGLang HiCache插件另导出：
+
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `dfkv_hicache_parallel_identity{tp_rank,physical_rank,pcp_rank,dcp_rank,storage_pcp_rank,primary_dev}` | gauge | 每个connector进程的并行坐标、node-local物理rank、存储PCP writer坐标和primary rail；`physical_rank=-1`表示affinity关闭 |
+| `dfkv_hicache_exist_probes_total{tp_rank,result}` | counter | `result=full_miss|partial_prefix|full_hit`的exist probe次数 |
+| `dfkv_hicache_exist_probe_pages_total{tp_rank}` | counter | 候选page总数 |
+| `dfkv_hicache_exist_present_pages_total{tp_rank}` | counter | probe批内任意位置存在的page总数 |
+| `dfkv_hicache_exist_contiguous_pages_total{tp_rank}` | counter | 从首页开始连续、可供SGLang使用的page总数 |
+| `dfkv_hicache_exist_seconds{tp_rank}` | histogram | connector整次`batch_exists`耗时 |
+
+`present_pages - contiguous_pages`直接表达“后页存在但前缀有洞”；不要用
+`prefetched_tokens_total`反推物理RDMA字节。轨道真实读写用上述per-rail bytes。
 
 **retry 语义与告警**：
 

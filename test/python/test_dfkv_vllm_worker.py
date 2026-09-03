@@ -107,6 +107,7 @@ def _install_vllm_stubs() -> None:
         get_dcp_group=lambda: Placeholder(),
         get_pcp_group=lambda: Placeholder(),
         get_tensor_model_parallel_rank=lambda: 0,
+        get_world_group=lambda: SimpleNamespace(local_rank=0),
         get_tensor_model_parallel_world_size=lambda: 1,
     )
     stub("vllm.distributed.kv_events", BlockStored=BlockStored)
@@ -659,6 +660,7 @@ class LogicalChunkTransferTest(unittest.TestCase):
 
         sender.wait_for_inflight_put = short_diagnostic_wait
         worker = DfkvStoreWorker.__new__(DfkvStoreWorker)
+        worker.load_async = True
         worker.kv_recv_thread = None
         worker.kv_send_thread = sender
         worker.lookup_server = None
@@ -1571,6 +1573,7 @@ class ReceiveConcurrencyTest(unittest.TestCase):
             wait_for_inflight_put=lambda _req_id: True,
         )
         worker = DfkvStoreWorker.__new__(DfkvStoreWorker)
+        worker.load_async = True
         worker.kv_send_thread = send_thread
         worker.kv_recv_thread = receiver
         returned = threading.Event()
@@ -1739,7 +1742,7 @@ class LookupAccountingTest(unittest.TestCase):
     def _hash(seed: str) -> BlockHash:
         return BlockHash(hashlib.sha256(seed.encode()).digest())
 
-    def test_lookup_probes_one_v2_key_per_rank_and_keeps_partial_prefix(self) -> None:
+    def test_lookup_probes_each_tp_key_at_own_pp_and_keeps_partial_prefix(self) -> None:
         hashes = [self._hash("one"), self._hash("two")]
         metadata = KeyMetadata(
             model_name="model",
@@ -1764,9 +1767,9 @@ class LookupAccountingTest(unittest.TestCase):
 
             def batch_exist(self, keys):
                 self.keys = list(keys)
-                # Every rank replica of chunk 0 is present. Chunk 1 is only
-                # partially replicated and therefore cannot extend the prefix.
-                return [1, 1, 1, 1, 1, 1, 1, 0]
+                # Both TP objects of chunk 0 are present. Chunk 1 is only
+                # partially present and therefore cannot extend the prefix.
+                return [1, 1, 1, 0]
 
         client = _Client()
         records: list[dict[str, object]] = []
@@ -1811,18 +1814,17 @@ class LookupAccountingTest(unittest.TestCase):
         self.assertEqual(DfkvStoreWorker.lookup(worker, 128, hashes), 64)
         expected_keys = [
             PoolKey(
-                replace(metadata, tp_rank=tp, pp_rank=pp),
+                replace(metadata, tp_rank=tp),
                 value.hex(),
             ).to_bytes()
             for value in hashes
             for tp in range(2)
-            for pp in range(2)
         ]
         self.assertEqual(client.keys, expected_keys)
-        self.assertEqual(len(set(client.keys)), 8)
+        self.assertEqual(len(set(client.keys)), 4)
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["operation"], "lookup_exists")
-        self.assertEqual(records[0]["num_keys"], 8)
+        self.assertEqual(records[0]["num_keys"], 4)
         self.assertEqual(records[0]["num_logical_keys"], 2)
 
 

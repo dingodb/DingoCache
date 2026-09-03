@@ -196,9 +196,10 @@ capability；HCA `max_sge` 低于 dfkv 上限时会缩小宽度，高于上限�
 > 大集群建议显式设定，否则服务端的内存预算完全由客户端决定，而客户端常由别的团队部署、版本不一。
 
 > `rail_affinity=true` 在 native client 创建前把完整 `DFKV_RDMA_DEV` 收窄为
-> 一条 primary 和默认相邻 1 条 fallback。SGLang HiCache 使用其物理 attention
-> coordinate（PCP>1 时 `pcp_rank`，否则 `tp_rank`）；vLLM 使用 world-group
-> per-host `local_rank`，不把可重复的 TP/DCP/PCP/PP 存储坐标误当 HCA 序号。
+> 一条 primary 和默认相邻 1 条 fallback。SGLang HiCache 与 vLLM 都使用
+> SGLang/vLLM world-group 的 per-host `local_rank`；TP/DP/PCP/DCP/PP 是存储或
+> 并行语义坐标，不能作为 HCA 序号。HiCache 在启用 affinity 却无法取得
+> `world_group.local_rank` 时拒绝启动，不再静默退化到 `tp_rank=0` 单轨。
 > `rail_affinity_fallbacks=0` 恢复严格 one-rank/one-rail；connector 设置
 > `DFKV_RDMA_PRIMARY_DEV=<primary>` 和 `DFKV_RDMA_NUMA=0`。
 
@@ -386,8 +387,9 @@ sglang serve ... \
 `pcp_size`/`pcp_rank`、`dcp_size`/`dcp_rank`、`layer_num`（仅 L2-bypass 的 SG
 分组控制，不进 namespace/value）、`lib_path`、`batch_concurrency`、
 `rdma_depth`/`require_rdma`/`rdma_numa`、`rail_affinity`/
-`rail_affinity_fallbacks`，canonical namespace 的可配键 `tenant_id`
-（默认 `default`）、`model_revision`（默认取 model identity），以及
+`rail_affinity_fallbacks`、`prefill_cp_storage_layout`（MLA attention-CP 必须显式
+声明；当前仅接受可执行的`replicated`，`sharded`拒绝启动），canonical namespace
+的可配键 `tenant_id`（默认 `default`）、`model_revision`（默认取 model identity），以及
 identity/layout 字段 `page_size`（默认 64）/`kv_cache_dtype`/`dtype_tag`/
 `head_num`/`head_dim`/`dp_size`——这些都进 canonical namespace，改动即换
 namespace（表现为一次冷缓存）；
@@ -401,7 +403,11 @@ namespace（表现为一次冷缓存）；
 
 `pcp_size`/`dcp_size` 默认 `1`，此时对应 rank 固定为 `0`。任一 size
 大于 `1` 时必须显式提供 `0 <= rank < size`；size/rank 不是整数、越界或缺失
-都会在打开 dfkv client 前拒绝启动。PCP/DCP 是物理分片坐标，同一 page hash
+都会在打开 dfkv client 前拒绝启动。默认分片对象保留运行态PCP/DCP rank。
+对于SGLang明确部署为完整复制的MLA Prefill-CP，必须配置
+`"prefill_cp_storage_layout":"replicated"`：对象key保留运行态`pcp_size`但统一使用
+writer的`pcp_rank=0`，使单writer与所有reader寻址一致。该模式与DCP或
+`enable_dsa_cache_layer_split`不兼容；未知/分片布局fail closed。
 
 #### 多模型/多租户配置（对应 §5 四维度）
 

@@ -66,6 +66,10 @@ if _HAVE_PROM:
         _HIST["get_v2"] = _PromHistogram("dfkv_client_get_v2_seconds",
                                          "batch_get_v2 I/O duration seconds",
                                          ["tp_rank"], buckets=_HIST_BUCKETS)
+        _HIST["exist"] = _PromHistogram(
+            "dfkv_hicache_exist_seconds",
+            "HiCache batch_exists call duration seconds",
+            ["tp_rank"], buckets=_HIST_BUCKETS)
     except Exception:
         _HIST = {}
 
@@ -78,6 +82,10 @@ _SPECS = [
     ("get_pages", "dfkv_client_get_pages_total", "KV pages requested"),
     ("get_hit_pages", "dfkv_client_get_hit_pages_total", "pages returned as hits"),
     ("get_bytes", "dfkv_client_get_bytes_total", "bytes requested on get"),
+    ("exist_calls", "dfkv_hicache_exist_calls_total", "HiCache batch_exists calls"),
+    ("exist_probe_pages", "dfkv_hicache_exist_probe_pages_total", "candidate pages probed by batch_exists"),
+    ("exist_present_pages", "dfkv_hicache_exist_present_pages_total", "pages present anywhere in a batch_exists probe"),
+    ("exist_contiguous_pages", "dfkv_hicache_exist_contiguous_pages_total", "usable contiguous prefix pages from batch_exists"),
     # v2 (hybrid/DSA side-pool) path. For V4/DSA models (e.g. GLM-5.2) the real KV
     # rides batch_set_v2/batch_get_v2 while the v1 "kv" path only writes/reads
     # empty anchor markers, so the *_v1 counters above cannot express the L3
@@ -109,6 +117,28 @@ if _HAVE_PROM:
             _PROM = {}
             break
 
+_IDENTITY_PROM = None
+_EXIST_RESULT_PROM = None
+if _HAVE_PROM:
+    try:
+        _IDENTITY_PROM = _PromGauge(
+            "dfkv_hicache_parallel_identity",
+            "Static HiCache process, storage-coordinate, and primary-rail identity",
+            [
+                "tp_rank", "physical_rank", "pcp_rank", "dcp_rank",
+                "storage_pcp_rank", "primary_dev",
+            ],
+            multiprocess_mode="liveall",
+        )
+        _EXIST_RESULT_PROM = _PromCounter(
+            "dfkv_hicache_exist_probes_total",
+            "HiCache existence probes by usable-prefix outcome",
+            ["tp_rank", "result"],
+        )
+    except Exception:
+        _IDENTITY_PROM = None
+        _EXIST_RESULT_PROM = None
+
 
 class Metrics:
     """Per-plugin-instance counters; mirrors to process-global Prometheus Counters."""
@@ -117,8 +147,14 @@ class Metrics:
         self._rank = str(int(tp_rank))
         self._lock = threading.Lock()
         self._c = {attr: 0 for attr, _, _ in _SPECS}
-        # histogram observation counts (tests/debug)
-        self._obs = {"set": 0, "get": 0, "set_v2": 0, "get_v2": 0}
+        # histogram observation counts and identity (tests/debug)
+        self._obs = {"set": 0, "get": 0, "exist": 0, "set_v2": 0, "get_v2": 0}
+        self._identity = {}
+        self._exist_results = {
+            "full_miss": 0,
+            "partial_prefix": 0,
+            "full_hit": 0,
+        }
 
     def _add(self, **deltas):
         with self._lock:
@@ -135,6 +171,50 @@ class Metrics:
         if _HAVE_PROM and op in _HIST:
             _HIST[op].labels(self._rank).observe(seconds)
 
+
+    def set_identity(
+        self,
+        *,
+        physical_rank,
+        pcp_rank,
+        dcp_rank,
+        storage_pcp_rank,
+        primary_dev,
+    ):
+        identity = {
+            "tp_rank": self._rank,
+            "physical_rank": str(
+                int(physical_rank) if physical_rank is not None else -1
+            ),
+            "pcp_rank": str(int(pcp_rank)),
+            "dcp_rank": str(int(dcp_rank)),
+            "storage_pcp_rank": str(int(storage_pcp_rank)),
+            "primary_dev": str(primary_dev or ""),
+        }
+        with self._lock:
+            self._identity = identity
+        if _IDENTITY_PROM is not None:
+            _IDENTITY_PROM.labels(**identity).set(1)
+
+    def on_exists(self, probe_pages, present_pages, contiguous_pages, seconds=None):
+        if contiguous_pages == 0:
+            result = "full_miss"
+        elif contiguous_pages == probe_pages:
+            result = "full_hit"
+        else:
+            result = "partial_prefix"
+        self._add(
+            exist_calls=1,
+            exist_probe_pages=probe_pages,
+            exist_present_pages=present_pages,
+            exist_contiguous_pages=contiguous_pages,
+        )
+        with self._lock:
+            self._exist_results[result] += 1
+        if _EXIST_RESULT_PROM is not None:
+            _EXIST_RESULT_PROM.labels(self._rank, result).inc()
+        if seconds is not None:
+            self._observe("exist", seconds)
     def on_set(self, pages, ok_pages, nbytes, seconds=None):
         self._add(set_calls=1, set_pages=pages, set_ok_pages=ok_pages, set_bytes=nbytes)
         if seconds is not None:
@@ -165,6 +245,11 @@ class Metrics:
         with self._lock:
             snap = dict(self._c)
             snap.update({f"{op}_observations": cnt for op, cnt in self._obs.items()})
+            snap.update({
+                f"exist_result_{result}": count
+                for result, count in self._exist_results.items()
+            })
+            snap["identity"] = dict(self._identity)
             return snap
 
 
