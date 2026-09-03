@@ -272,6 +272,18 @@ class TestParallelCoordinates(unittest.TestCase):
                 parallel=types.SimpleNamespace(enable_prefill_cp=True),
             )
 
+    def test_replicated_prefill_cp_elects_only_pcp_zero_writer(self):
+        common = dict(
+            is_mla=True,
+            tp_rank=7,
+            attn_tp_rank=0,
+            dcp_size=1,
+            dcp_rank=0,
+            prefill_cp_storage_layout="replicated",
+        )
+        self.assertTrue(H._is_hicache_storage_writer(pcp_rank=0, **common))
+        self.assertFalse(H._is_hicache_storage_writer(pcp_rank=7, **common))
+
     def test_mla_writer_is_elected_per_physical_cp_shard(self):
         self.assertFalse(H._is_mla_replica_writer(True, 3, None, 1, 0))
         self.assertTrue(H._is_mla_replica_writer(True, 3, 0, 1, 0))
