@@ -279,6 +279,29 @@ def _is_mla_replica_writer(
     return rank == (dcp_rank if dcp_size > 1 else 0)
 
 
+
+def _is_hicache_storage_writer(
+    *,
+    is_mla: bool,
+    tp_rank: int,
+    attn_tp_rank: Optional[int],
+    pcp_rank: int,
+    dcp_size: int,
+    dcp_rank: int,
+    prefill_cp_storage_layout: Optional[str],
+) -> bool:
+    writer = _is_mla_replica_writer(
+        is_mla, tp_rank, attn_tp_rank, dcp_size, dcp_rank
+    )
+    if (
+        writer
+        and is_mla
+        and prefill_cp_storage_layout == "replicated"
+        and pcp_rank != 0
+    ):
+        return False
+    return writer
+
 def resolve_node_dedup(cfg_value, env_value, is_mla: bool, tp_size: int):
     """Decide DFKV_CLIENT_NODE_DEDUP: (value_to_set | None, auto_enabled).
 
@@ -490,15 +513,17 @@ class DfkvHiCache(HiCacheStorage):
             if _truthy(cfg.get("rail_affinity"))
             else None
         )
-        # MLA payloads are replicated inside one effective attention-TP group.
-        # DCP coordinates remain distinct; replicated Prefill-CP ranks share the
-        # writer key selected above.
-        self._mla_replica_writer = _is_mla_replica_writer(
-            self.is_mla,
-            self.tp_rank,
-            attn_tp_rank,
-            self.dcp_size,
-            self.dcp_rank,
+        # The connector enforces one physical writer for replicated Prefill-CP
+        # even when an SGLang build invokes every CP rank's backend. This keeps
+        # shared-key identity from turning into eight duplicate PUT streams.
+        self._mla_replica_writer = _is_hicache_storage_writer(
+            is_mla=self.is_mla,
+            tp_rank=self.tp_rank,
+            attn_tp_rank=attn_tp_rank,
+            pcp_rank=self.pcp_rank,
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
+            prefill_cp_storage_layout=self.prefill_cp_storage_layout,
         )
         self._device_direct_requested = _truthy(
             os.environ.get("SGLANG_HICACHE_L2_BYPASS"))

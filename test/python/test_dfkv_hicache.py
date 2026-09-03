@@ -14,6 +14,7 @@ import tempfile
 import time
 import unittest
 import warnings
+from types import SimpleNamespace
 from contextlib import contextmanager
 from unittest.mock import patch
 
@@ -343,8 +344,18 @@ class DingoFSHiCacheTest(unittest.TestCase):
         writer_pool = FakeMlaPool(1, self.PAGE_BYTES, self.PAGE_SIZE)
         reader_pool = FakeMlaPool(1, self.PAGE_BYTES, self.PAGE_SIZE)
         writer_pool.fill_page(0, 0xA7)
-        writer = self._plugin(cfg0, writer_pool)
-        reader = self._plugin(cfg7, reader_pool)
+        parallel = SimpleNamespace(
+            attn_tp_rank=0,
+            enable_prefill_cp=True,
+            enable_dsa_cache_layer_split=False,
+        )
+        with patch.object(
+            dfkv_hicache, "_load_parallel_context", return_value=parallel
+        ):
+            writer = self._plugin(cfg0, writer_pool)
+            reader = self._plugin(cfg7, reader_pool)
+        self.assertTrue(writer._mla_replica_writer)
+        self.assertFalse(reader._mla_replica_writer)
         host_indices = list(range(self.PAGE_SIZE))
         self.assertEqual(writer.batch_set_v1(["shared"], host_indices), [True])
         self.assertEqual(reader.batch_get_v1(["shared"], host_indices), [True])
