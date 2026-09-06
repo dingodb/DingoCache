@@ -1421,12 +1421,22 @@ void RdmaServer::Serve(int boot_fd) {
       lease_put_active_.fetch_add(1, std::memory_order_relaxed);
       lease_put_bytes_active_.fetch_add(state.lease.size(),
                                         std::memory_order_relaxed);
-      // The receive-pool chunk carrying the lease is already registered for
-      // remote writes (recv_segment_mr covers the whole chunk), so the WRITE
-      // needs no extra MR: publish the lease's own address with that rkey.
+      // The lease may live in ANY receive-pool chunk, including one grown
+      // after this connection opened — recv_segment_mr only covers the
+      // chunk carrying the connection's resident slots. Resolve the lease's
+      // own chunk: RegisterRemoteRegion dedupes, so repeated lookups cost
+      // nothing once the chunk is registered for remote writes.
+      ibv_mr* const lease_region_mr = ep.RegisterRemoteRegion(
+          state.lease.segment()->data(), state.lease.segment()->size());
+      if (!lease_region_mr) {
+        release_lease_put(slot);
+        encode_status(Status::kIOError, 0);
+        reply->first_len = response_prefix;
+        return true;
+      }
       const rdma::LeasePutReady ready{
           static_cast<uint32_t>(slot), next_lease_generation(slot),
-          recv_segment_mr->rkey,
+          lease_region_mr->rkey,
           reinterpret_cast<uint64_t>(state.lease.data()),
           state.lease.size()};
       encode_status(Status::kOk, rdma::kLeasePutReadyBytes);

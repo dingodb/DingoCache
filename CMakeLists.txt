@@ -102,6 +102,9 @@ add_executable(dfkv_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/dfkv_bench_main.
 target_link_libraries(dfkv_bench PRIVATE dfkv_core)
 add_executable(dfkv_discover_smoke ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/dfkv_discover_smoke_main.cc)
 target_link_libraries(dfkv_discover_smoke PRIVATE dfkv_core)
+add_executable(dfkvleasebench
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/dfkvleasebench_main.cc)
+target_link_libraries(dfkvleasebench PRIVATE dfkv_core)
 
 # Real-HW lockstep repro for the GPU rendezvous (needs CUDA devices at
 # runtime; builds everywhere — CUDA is dlopen'd).
@@ -110,7 +113,7 @@ target_link_libraries(dfkv_gpu_dedup_repro PRIVATE dfkv_core)
 
 include(GNUInstallDirs)
 install(TARGETS dfkv dfkv_server dfkv_mds dfkv_smoke dfkvctl dfkv_bench
-        dfkv_discover_smoke dfkv_gpu_dedup_repro dfkv_core
+        dfkv_discover_smoke dfkv_gpu_dedup_repro dfkvleasebench dfkv_core
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
