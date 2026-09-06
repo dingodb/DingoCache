@@ -1132,9 +1132,16 @@ void RdmaServer::Serve(int boot_fd) {
     }
 
     const char* frame = ep.rbuf(recv_slot);
-    if (completion.byte_len < kReqPrefix ||
-        !DecodeReqVersion(frame, wire_epoch, &request->fields,
-                          static_cast<uint64_t>(conn_max))) {
+    if (completion.byte_len < kReqPrefix) return false;
+    // A leased-PUT request names the OBJECT size, not an inline payload: its
+    // bound is the process-wide payload ceiling, not this connection's
+    // inline class. Every other control op keeps the conn_max bound.
+    const uint64_t send_max_payload =
+        static_cast<uint8_t>(frame[1]) == static_cast<uint8_t>(WireOp::kLeasePut)
+            ? static_cast<uint64_t>(max_msg_)
+            : static_cast<uint64_t>(conn_max);
+    if (!DecodeReqVersion(frame, wire_epoch, &request->fields,
+                          send_max_payload)) {
       return false;
     }
     if (request->fields.op == static_cast<uint8_t>(WireOp::kRange)) {

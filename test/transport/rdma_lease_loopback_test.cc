@@ -5,6 +5,7 @@
 // store completion, inline/lease bucket split inside one batch, and metric
 // truth on both ends.
 #include "client/kv_client.h"
+#include "client/key_map.h"
 #include "cache/kv_node_server.h"
 #include "cache/rdma_server.h"
 #include "transport/rdma_transport.h"
@@ -32,11 +33,13 @@ constexpr size_t kMsg = 64ull << 20;  // like production rings' --max-msg
 bool HaveRdma() { return RdmaTransport::Available(); }
 std::string SelfHdr() { return "test/model"; }
 
+// rfind lands on the VALUE line emitted after the # HELP / # TYPE lines,
+// exactly like rdma_loopback_test's CounterVal.
 long CounterOf(const RdmaServer& rsrv, const std::string& name) {
   const std::string text = rsrv.MetricsText();
-  const size_t at = text.find(name + " ");
+  const size_t at = text.rfind(name + " ");
   if (at == std::string::npos) return -1;
-  const size_t sp = text.find(' ', at + name.size());
+  const size_t sp = text.find(' ', at);
   if (sp == std::string::npos) return -1;
   return std::strtol(text.c_str() + sp + 1, nullptr, 10);
 }
@@ -52,7 +55,10 @@ struct LeaseNode {
   std::string addr;
 
   explicit LeaseNode(const std::string& tag) {
-    setenv("DFKV_RDMA_RECV_SEGMENT_SIZE", std::to_string(96ull << 20).c_str(),
+    // Production rings raise the declared object ceiling to the business
+    // maximum (64MiB today); the 4MiB default would bound GET connections.
+    setenv("DFKV_RDMA_MAX_BLOCK_BYTES", "67108864", 1);
+    setenv("DFKV_RDMA_RECV_SEGMENT_SIZE", std::to_string(192ull << 20).c_str(),
            1);
     setenv("DFKV_RDMA_RECV_CHUNK_BYTES", std::to_string(32ull << 20).c_str(),
            1);
@@ -180,16 +186,16 @@ TEST(RdmaLeaseLoopback, MultipleLargeObjectsConcurrentWindows) {
 
   // Enough over-threshold objects to exercise multi-window lease pipelines
   // and repeated per-slot generation reuse on one connection.
+  // The values must outlive BatchPut: KV items hold raw pointers, so the
+  // owning strings are built first and the batch references them.
   const size_t kObjects = 12;
-  std::vector<dfkv::KvPutItem> batch;
   std::map<std::string, std::string> sentinel;
-  for (size_t i = 0; i < kObjects; ++i) {
-    const std::string key = "obj" + std::to_string(i);
-    const std::string v = Value(2ull << 20, static_cast<uint8_t>(i));
-    sentinel[key] = v;
-    batch.push_back(
-        dfkv::KvPutItem{key, v.data(), v.size()});
-  }
+  for (size_t i = 0; i < kObjects; ++i)
+    sentinel["obj" + std::to_string(i)] =
+        Value(2ull << 20, static_cast<uint8_t>(i));
+  std::vector<dfkv::KvPutItem> batch;
+  for (const auto& [key, v] : sentinel)
+    batch.push_back(dfkv::KvPutItem{key, v.data(), v.size()});
   const auto sts = c.BatchPut(batch);
   for (size_t i = 0; i < sts.size(); ++i)
     EXPECT_TRUE(sts[i]) << "object " << i;
@@ -207,6 +213,10 @@ TEST(RdmaLeaseLoopback, MultipleLargeObjectsConcurrentWindows) {
 TEST(RdmaLeaseLoopback, DisabledThresholdKeepsLegacyBehavior) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   setenv("DFKV_RDMA_INLINE_PUT_MAX_BYTES", "0", 1);
+  // Without the lease datapath the object ceiling stays the declared block
+  // bound, like every deployed v2.25 client (production raises it to the
+  // business maximum). Mirror production so the 8MiB object remains legal.
+  setenv("DFKV_RDMA_MAX_BLOCK_BYTES", "67108864", 1);
   LeaseNode node("legacy");
   RdmaTransport rt(kMsg);
   KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
@@ -214,7 +224,17 @@ TEST(RdmaLeaseLoopback, DisabledThresholdKeepsLegacyBehavior) {
   // With the datapath disabled the 8MiB object must still succeed through
   // the traditional connection-resident class — same as a v2.25 client.
   const std::string v = Value(8ull << 20, 0x77);
-  ASSERT_TRUE(c.Put("legacy-big", v.data(), v.size()));
+  {
+    // Direct transport-level check first, bypassing routing/health layers.
+    std::vector<dfkv::CacheSrc> probe;
+    probe.push_back(dfkv::CacheSrc{dfkv::ToBlockKey(SelfHdr(), "legacy-big"),
+                                   const_cast<char*>(v.data()),
+                                   v.size()});
+    ASSERT_EQ(rt.CacheFrom(node.addr, probe)[0], Status::kOk);
+  }
+  ASSERT_TRUE(c.Put("legacy-big", v.data(), v.size()))
+      << "\n[client-metrics]\n" << rt.MetricsText()
+      << "\n[server-metrics]\n" << node.rsrv->MetricsText();
   EXPECT_EQ(CounterOf(*node.rsrv, "dfkv_rdma_leaseput_ops_total"), 0);
   std::string out(v.size(), '\0');
   ASSERT_TRUE(c.Get("legacy-big", &out[0], out.size()));

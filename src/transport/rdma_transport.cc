@@ -443,14 +443,31 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
           static_cast<size_t>(declared_))),
       depth_(4) {
   // Optional staged-lease PUT threshold (env DFKV_RDMA_INLINE_PUT_MAX_BYTES,
-  // default 4 MiB; 0 disables). Objects larger than this use the per-op
-  // staging-lease datapath on connections whose peer negotiated it, keeping
-  // the connection-resident receive-slot class at the threshold.
-  inline_put_max_bytes_ = std::min<size_t>(
-      EnvBytes("DFKV_RDMA_INLINE_PUT_MAX_BYTES", 4ull << 20),
-      static_cast<size_t>(declared_));
-  config_dump::RecordResolved("DFKV_RDMA_INLINE_PUT_MAX_BYTES",
-                              std::to_string(inline_put_max_bytes_));
+  // default 4 MiB; explicit 0 disables). Objects larger than this use the
+  // per-op staging-lease datapath on connections whose peer negotiated it,
+  // keeping the connection-resident receive-slot class at the threshold.
+  // Unlike EnvBytes, an explicit 0 must stay 0 (disabled), not fall back.
+  inline_put_max_bytes_ = 4ull << 20;
+  size_t inline_resolved_state = 1;  // 1 = default, 0 = disabled, 2 = value
+  if (const char* const v = std::getenv("DFKV_RDMA_INLINE_PUT_MAX_BYTES")) {
+    if (*v) {
+      errno = 0;
+      char* end = nullptr;
+      const unsigned long long x = std::strtoull(v, &end, 10);
+      if (errno == 0 && end != v && *end == '\0') {
+        inline_put_max_bytes_ = std::min<size_t>(
+            static_cast<size_t>(x), max_payload_);
+        inline_resolved_state = x == 0 ? 0 : 2;
+      }
+    } else {
+      inline_resolved_state = 0;  // set to the empty string: disabled
+    }
+  }
+  config_dump::RecordResolved(
+      "DFKV_RDMA_INLINE_PUT_MAX_BYTES",
+      inline_resolved_state == 0
+          ? std::string("0")
+          : std::to_string(inline_put_max_bytes_));
   std::string list = dev_name;
   if (list.empty()) {
     const char* configured = std::getenv("DFKV_RDMA_DEV");
@@ -2570,9 +2587,13 @@ std::vector<Status> RdmaTransport::CacheMany(
     // attempt 1 (fresh-retry or a lease-incapable peer) falls back to the
     // traditional largest-object connection-resident class.
     const bool want_lease = attempt == 0 && any_over && lease_enabled;
+    // Attempt 0 with lease intent clamps the resident class at the inline
+    // threshold; attempt 1 (fresh retry after a lease-path failure, or a
+    // lease-incapable peer) falls back to the traditional largest-object
+    // class so over-threshold objects still have a path home.
     options.required_data_bytes =
         want_lease ? std::max(max_inline_len, connection_min_block_bytes_)
-                   : required_bytes;
+                   : max_all_len;
     options.request_leased_put = want_lease;
     options.force_new = attempt != 0;
     options.requested_credits = std::min(valid_count, depth_);
@@ -2692,6 +2713,10 @@ std::vector<Status> RdmaTransport::CacheMany(
         size_t item_index = 0;
         uint64_t write_base = 0;
         uint32_t rkey = 0;
+        // The server's lease index (its own receive-slot numbering). The
+        // WRITE immediate and every lease state lookup happen in the
+        // SERVER's slot space, which is not the client's pipeline index.
+        uint32_t server_slot = 0;
       };
       std::vector<LeaseSlot> leases(width);
       size_t accepted = 0;
@@ -2729,7 +2754,8 @@ std::vector<Status> RdmaTransport::CacheMany(
         Status status;
         uint64_t data_len = 0;
         if (reply_bytes[slot] < kRespPrefix ||
-            !conn->Decode(ep.rbuf(slot), &status, &data_len, 0) ||
+            !conn->Decode(ep.rbuf(slot), &status, &data_len,
+                          rdma::kLeasePutReadyBytes) ||
             (status == Status::kOk) !=
                 (data_len == rdma::kLeasePutReadyBytes)) {
           conn_ok = false;
@@ -2743,10 +2769,14 @@ std::vector<Status> RdmaTransport::CacheMany(
           continue;
         }
         rdma::LeasePutReady ready;
+        // ready.slot names the SERVER's receive slot holding this lease; it
+        // is not this client pipeline index and may legitimately differ.
+        // Only bound it by the negotiated depth as fail-closed corruption
+        // defense — the immediate must reach a server-side active lease.
         if (reply_bytes[slot] < kRespPrefix + rdma::kLeasePutReadyBytes ||
             !rdma::DecodeLeasePutReady(ep.rbuf(slot) + kRespPrefix,
                                        &ready) ||
-            ready.slot != static_cast<uint32_t>(slot) ||
+            ready.slot >= static_cast<uint32_t>(conn->depth) ||
             ready.lease_bytes <
                 static_cast<uint64_t>(rdma::kV2DataOffset) +
                     items[item_index].len) {
@@ -2756,16 +2786,21 @@ std::vector<Status> RdmaTransport::CacheMany(
         }
         leases[slot].write_base = ready.write_base;
         leases[slot].rkey = ready.rkey;
+        leases[slot].server_slot = ready.slot;
         ++leaseput_ops_;
         const CacheItem& item = items[item_index];
         ibv_mr* mr = ep.RegisterTransient(const_cast<void*>(item.data),
                                            item.len, /*remote_write=*/false);
         payload_mrs[slot] = mr;
+        // The WRITE window is an ordinary v2 PUT frame aimed at the leased
+        // range: re-encode the request header (phase A left a kLeasePut
+        // request in this send buffer).
+        conn->Encode(ep.sbuf(slot), WireOp::kCache, item.key, 0, 0, item.len);
         if (!mr || !ep.PostRecv(slot) ||
             !ep.PostWriteImmScatter(
                 slot, kReqPrefix, item.data, item.len, mr,
                 leases[slot].write_base + rdma::kV2PutPrefixOffset,
-                leases[slot].rkey, static_cast<uint32_t>(slot))) {
+                leases[slot].rkey, leases[slot].server_slot)) {
           conn_ok = false;
           completion = rdma::RailCompletion::kRailFailure;
           break;
@@ -3520,7 +3555,14 @@ bool RdmaTransport::NoteBlock(size_t n) const {
                   std::to_string(n / 1024) + " KiB); declared bound " +
                   std::to_string(OpBound()) + "B");
   }
-  const size_t bound = OpBound();
+  // With the staged-lease datapath enabled, the logical OBJECT ceiling is
+  // the transport payload bound (--max-msg derived): connection geometry
+  // stops at the inline threshold, so oversize must stop rejecting exactly
+  // the objects the lease path exists to carry. The legacy bound (the
+  // declared connection class) still rejects when the datapath is disabled.
+  const size_t bound =
+      inline_put_max_bytes_ != 0 ? static_cast<size_t>(max_payload_)
+                                 : OpBound();
   if (n <= bound) return false;
   const uint64_t k = oversize_rejects_.fetch_add(1, std::memory_order_relaxed);
   if (k == 0 || (k & 0x3FFu) == 0)  // first, then every 1024th
