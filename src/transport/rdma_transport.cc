@@ -3333,6 +3333,21 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
   }
   if (valid_count == 0) return result;
 
+  // Bucket split (same semantics as CacheMany): over-threshold objects are
+  // candidates for the staged-lease datapath; the SG connection's resident
+  // class must then cover only the largest INLINE object.
+  const bool lease_enabled = inline_put_max_bytes_ != 0;
+  bool any_over = false;
+  size_t max_inline_len = 0;
+  for (size_t i = 0; i < count; ++i) {
+    if (bad[i]) continue;
+    if (lease_enabled && totals[i] > inline_put_max_bytes_) {
+      any_over = true;
+    } else {
+      max_inline_len = std::max(max_inline_len, totals[i]);
+    }
+  }
+
   const auto peer = peer_topologies_->Snapshot(node);
   RailMask excluded(devs_.size(), 0);
   bool cross_rail_retry = false;
@@ -3342,8 +3357,12 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
     // A fresh attempt is possible only before any request is posted;
     // validation results survive while connection-local progress restarts.
     completion_fault.BeginAttempt(attempt);
+    const bool want_lease = attempt == 0 && any_over && lease_enabled;
     AcquireOptions options;
-    options.required_data_bytes = required_bytes;
+    options.required_data_bytes =
+        want_lease ? std::max(max_inline_len, connection_min_block_bytes_)
+                   : required_bytes;
+    options.request_leased_put = want_lease;
     options.force_new = attempt != 0;
     options.requested_credits = 1;
     options.excluded = excluded;
@@ -3363,6 +3382,15 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
       return result;
     }
     Conn* conn = acquired.conn;
+    if (want_lease && !conn->leased_put) {
+      // Lease-incapable peer or a plain pooled connection: fall back to the
+      // traditional largest-object geometry before anything is posted.
+      Release(node, Lane::kSgData, conn);
+      leaseput_path_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+      if (attempt + 1 < 2) continue;
+      MarkClientLocalFailure(&result, Status::kInvalid);
+      return result;
+    }
     if (out_dev) {
       const std::string& attempted_dev = devs_[conn->rail_index];
       if (!out_dev_set) {
@@ -3378,11 +3406,13 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
     bool conn_ok = !InjectLocalRailFailure(attempt);
     bool request_posted = false;
     rdma::RailCompletion completion = rdma::RailCompletion::kRailFailure;
-    const size_t remote_capacity = conn->data_capacity();
 
     for (size_t item_index = 0; item_index < count && conn_ok; ++item_index) {
       if (bad[item_index] || completed[item_index]) continue;
-      if (totals[item_index] > remote_capacity) {
+      const bool use_lease = conn->leased_put &&
+                             totals[item_index] > inline_put_max_bytes_;
+      const size_t remote_capacity = conn->data_capacity();
+      if (!use_lease && totals[item_index] > remote_capacity) {
         result[item_index] = Status::kInvalid;
         completed[item_index] = 1;
         continue;
@@ -3396,6 +3426,63 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
         result[item_index] = Status::kInvalid;
         completed[item_index] = 1;
         continue;
+      }
+
+      // Staged-lease items request an exactly-sized receive range first, then
+      // aim every window WR at that range. Inline items keep the connection's
+      // resident receive slot with immediate 0.
+      uint64_t window_base = conn->put_addr(0);
+      uint32_t window_rkey = conn->recv_segment.rkey;
+      uint32_t window_imm = 0;
+      if (use_lease) {
+        conn->Encode(ep.sbuf(0), WireOp::kLeasePut, source.key, 0, 0,
+                     totals[item_index]);
+        std::vector<uint32_t> ready_bytes;
+        bool ready_timed_out = false;
+        ibv_wc_status ready_status = IBV_WC_SUCCESS;
+        bool ready_had_wcs = false;
+        if (!ep.PostRecv(0) || !ep.PostSend(0, kReqPrefix) ||
+            !ReapPosted(ep, 1, 1, &ready_bytes, BatchTimeout(),
+                        &ready_timed_out, &ready_status, &ready_had_wcs,
+                        &completion_fault)) {
+          conn_ok = false;
+          completion = rdma::ClassifyCompletion(ready_status, ready_had_wcs);
+          break;
+        }
+        Status ready_status_code = Status::kIOError;
+        uint64_t ready_data_len = 0;
+        if (ready_bytes[0] < kRespPrefix ||
+            !conn->Decode(ep.rbuf(0), &ready_status_code, &ready_data_len,
+                          rdma::kLeasePutReadyBytes)) {
+          conn_ok = false;
+          completion = rdma::RailCompletion::kEndpointFailure;
+          break;
+        }
+        if (ready_status_code == Status::kCacheFull) {
+          result[item_index] = Status::kCacheFull;
+          completed[item_index] = 1;
+          continue;
+        }
+        if (ready_status_code != Status::kOk) {
+          result[item_index] = ready_status_code;
+          completed[item_index] = 1;
+          continue;
+        }
+        rdma::LeasePutReady ready;
+        if (ready_bytes[0] < kRespPrefix + rdma::kLeasePutReadyBytes ||
+            !rdma::DecodeLeasePutReady(ep.rbuf(0) + kRespPrefix, &ready) ||
+            ready.slot >= static_cast<uint32_t>(conn->depth) ||
+            ready.lease_bytes <
+                static_cast<uint64_t>(rdma::kV2DataOffset) +
+                    totals[item_index]) {
+          conn_ok = false;
+          completion = rdma::RailCompletion::kEndpointFailure;
+          break;
+        }
+        window_base = ready.write_base + rdma::kV2PutPrefixOffset;
+        window_rkey = ready.rkey;
+        window_imm = ready.slot;
+        ++leaseput_ops_;
       }
 
       conn->Encode(ep.sbuf(0), WireOp::kCache, source.key,
@@ -3434,12 +3521,13 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
         }
         const size_t header_len = window_index == 0 ? kReqPrefix : 0;
         const uint64_t remote_addr =
-            conn->put_addr(0) +
+            window_base +
             (window_index == 0 ? 0 : kReqPrefix + logical_offset);
         if (!ep.PostRecv(0) ||
             !ep.PostWriteImmScatterMulti(
                 0, header_len, segments, mrs, remote_addr,
-                conn->recv_segment.rkey, 0)) {
+                use_lease ? window_rkey : conn->recv_segment.rkey,
+                window_imm)) {
           conn_ok = false;
           break;
         }
