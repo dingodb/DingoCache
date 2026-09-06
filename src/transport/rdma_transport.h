@@ -152,6 +152,12 @@ class RdmaTransport : public Transport {
     bool force_new = false;
     size_t requested_credits = 1;
     size_t required_data_bytes = 0;
+    // Ask for the leased-PUT datapath on this connection: objects above the
+    // inline threshold arrive via per-op staging leases, so the connection
+    // geometry no longer follows the largest object. Honored only when the
+    // peer advertises the capability; the request bit is then echoed on the
+    // bootstrap frame.
+    bool request_leased_put = false;
     RailMask excluded;
     std::shared_ptr<const rdma::PeerRailSnapshot> peer;
   };
@@ -211,7 +217,12 @@ class RdmaTransport : public Transport {
                    uint64_t offset, uint64_t length, const void* payload,
                    uint64_t payload_len, std::string* out,
                    uint64_t* value_len = nullptr);
-  bool ProbeV2(const std::string& node) const;
+  // Probe the node's v2 base capabilities. When leased_put_supported is
+  // non-null it additionally reports the optional staged-lease capability
+  // (still true for the base result when the optional bit is absent, since
+  // old servers advertise only writer-retirement and pull-read).
+  bool ProbeV2(const std::string& node,
+               bool* leased_put_supported = nullptr) const;
   mutable std::mutex mu_;
   // Scalar and SG operations share data endpoints. An acquired connection is
   // never concurrently reused, while operation framing remains self-describing.
@@ -247,6 +258,11 @@ class RdmaTransport : public Transport {
   // Largest block this client has actually handed to the transport.
   mutable std::atomic<uint64_t> max_block_seen_{0};
   mutable std::atomic<uint64_t> oversize_rejects_{0};
+  // Leased-PUT in-flight datapath. Zero disables the optional capability
+  // request and keeps every object on connection-resident receive slots.
+  size_t inline_put_max_bytes_ = 4194304;  // DFKV_RDMA_INLINE_PUT_MAX_BYTES
+  mutable std::atomic<uint64_t> leaseput_ops_{0};
+  mutable std::atomic<uint64_t> leaseput_path_fallbacks_{0};
   // Records n as a candidate high-water mark and reports whether it exceeds the
   // logical bound. Returns true for an oversized block.
   bool NoteBlock(size_t n) const;

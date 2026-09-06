@@ -32,7 +32,10 @@ enum class WireOp : uint8_t {
   kLookup = 14,  // payload-free stored-value metadata lookup
   kListTopology = 15,  // MDS: all members, including health-degraded nodes
   kPullRange = 16,     // RDMA v2: prepare one connection-private pull slot
-  kPullRelease = 17    // RDMA v2: release slot after initiator READ terminal
+  kPullRelease = 17,  // RDMA v2: release slot after initiator READ terminal
+  kLeasePut = 18      // RDMA v2: request one per-op staging lease; the reply
+                      // carries the leased range, the client then sends the
+                      // object as an ordinary v2 multi/single-window PUT WRITE
 };
 
 constexpr uint8_t kNativeProtoTcp = 6;

@@ -23,8 +23,13 @@ constexpr uint8_t kDevProtoV2 = 2;
 // the full 64-bit opaque value used by writer-retirement control frames.
 constexpr uint64_t kDevFrameRequestWriterRetirement = uint64_t{1} << 63;
 constexpr uint64_t kDevFrameRequestPullRead = uint64_t{1} << 62;
+// Bit 61 requests the in-flight leased-PUT datapath: objects larger than the
+// connection's inline class arrive via a per-op staging lease instead of the
+// connection-lifetime receive-slot lease.
+constexpr uint64_t kDevFrameRequestLeasedPut = uint64_t{1} << 61;
 constexpr uint64_t kDevFrameMaxBlockMask =
-    ~(kDevFrameRequestWriterRetirement | kDevFrameRequestPullRead);
+    ~(kDevFrameRequestWriterRetirement | kDevFrameRequestPullRead |
+      kDevFrameRequestLeasedPut);
 
 // Room a device name must leave in the fixed 32-byte frame: NUL terminator +
 // "DCP2" u32 + max_block_bytes u64 + protocol u8. A name at most this long
@@ -99,6 +104,10 @@ inline bool DevFrameRequestsWriterRetirement(
 
 inline bool DevFrameRequestsPullRead(const char in[kDevNameBytes]) {
   return (ParseDevFrameCaps(in) & kDevFrameRequestPullRead) != 0;
+}
+
+inline bool DevFrameRequestsLeasedPut(const char in[kDevNameBytes]) {
+  return (ParseDevFrameCaps(in) & kDevFrameRequestLeasedPut) != 0;
 }
 
 inline uint8_t ParseDevFrameProtocol(const char in[kDevNameBytes]) {
