@@ -597,6 +597,7 @@ void RdmaServer::Serve(int boot_fd) {
   const bool writer_retirement_requested =
       rdma::DevFrameRequestsWriterRetirement(devbuf);
   const bool pull_read_requested = rdma::DevFrameRequestsPullRead(devbuf);
+  const bool leased_put_requested = rdma::DevFrameRequestsLeasedPut(devbuf);
   const uint64_t declared = rdma::ParseDevFrameMaxBlock(devbuf);
   if (rdma::ParseDevFrameProtocol(devbuf) != rdma::kDevProtoV2 ||
       declared == 0) {
@@ -771,6 +772,19 @@ void RdmaServer::Serve(int boot_fd) {
     double completion_elapsed_sec = 0.0;
     PreparedRead completion;
   };
+  // In-flight leased-PUT staging state, one entry per connection recv slot.
+  // `lease` owns a receive-pool range sized for exactly this object; the range
+  // is returned the moment the store holds the bytes (handler returned), so
+  // receive memory tracks data in flight instead of connection count.
+  // `generation` survives slot reuse (monotonic, never 0) for lease
+  // diagnostics and future release/retry extensions.
+  struct LeasePutState {
+    bool active = false;
+    uint64_t generation = 0;
+    BlockKey key;
+    uint64_t payload_len = 0;
+    rdma::RecvSegmentPool::Lease lease;
+  };
   struct PendingCompletion {
     PreparedRead read;
     Status status = Status::kOk;
@@ -788,6 +802,27 @@ void RdmaServer::Serve(int boot_fd) {
   std::vector<MultiGetState> multi_get(K);
   std::vector<int32_t> multi_get_source_owner(K, -1);
   std::vector<PendingCompletion> complete_on_send(K);
+  std::vector<LeasePutState> lease_put(K);
+  auto release_lease_put = [&](size_t slot) {
+    LeasePutState& state = lease_put[slot];
+    if (!state.active || !state.lease) return;
+    lease_put_bytes_active_.fetch_sub(state.lease.size(),
+                                      std::memory_order_relaxed);
+    lease_put_active_.fetch_sub(1, std::memory_order_relaxed);
+    state.active = false;
+    state.key = BlockKey{};
+    state.payload_len = 0;
+    state.lease.Reset();  // range returns to the receive pool immediately
+  };
+  // generation is the only field that survives release: it monotones upward
+  // so every LeasePutReady names a distinct op for diagnostics and any future
+  // release/retry wire extension. Never emit 0 (treated as "absent").
+  auto next_lease_generation = [&](size_t slot) -> uint64_t {
+    uint64_t generation = lease_put[slot].generation + 1;
+    if (generation == 0) ++generation;
+    lease_put[slot].generation = generation;
+    return generation;
+  };
   auto clear_multi_get = [&](size_t operation_id) {
     MultiGetState& state = multi_get[operation_id];
     if (state.active && state.source_uses_slot &&
@@ -977,6 +1012,7 @@ void RdmaServer::Serve(int boot_fd) {
     RdmaGetFields get;
     bool multi_put_window = false;
     bool multi_put_final = false;
+    bool from_lease_put = false;
   };
 
   auto decode_request = [&](const ibv_wc& completion,
@@ -998,8 +1034,25 @@ void RdmaServer::Serve(int boot_fd) {
       const size_t data_slot = static_cast<size_t>(ntohl(completion.imm_data));
       if (data_slot >= K || multi_get_source_owner[data_slot] >= 0)
         return false;
-      const char* frame = recv_lease.data() + data_slot * slot_size +
-                          rdma::kV2PutPrefixOffset;
+      LeasePutState& lstate = lease_put[data_slot];
+      const bool from_lease = lstate.active;
+      const char* frame =
+          from_lease
+              ? lstate.lease.data() + rdma::kV2PutPrefixOffset
+              : recv_lease.data() + data_slot * slot_size +
+                    rdma::kV2PutPrefixOffset;
+      // Destination-region geometry: the leased per-op range when this window
+      // belongs to an in-flight leased-PUT object, the resident receive slot
+      // otherwise. Both size the frame cover check and the logical payload
+      // cap so leased objects are not bounded by the connection class.
+      const size_t put_region_bytes =
+          from_lease ? lstate.lease.size() : slot_size;
+      const uint64_t put_payload_cap =
+          from_lease
+              ? static_cast<uint64_t>(lstate.lease.size() -
+                                      rdma::kV2DataOffset)
+              : static_cast<uint64_t>(logical_data_cap);
+      request->from_lease_put = from_lease;
       MultiPutState& state = multi_put[data_slot];
       uint64_t window_bytes = completion.byte_len;
       if (state.active) {
@@ -1028,8 +1081,16 @@ void RdmaServer::Serve(int boot_fd) {
         if (completion.byte_len < kReqPrefix ||
             !DecodeReqVersion(
                 frame, kNativeProtoRdmaV2, &request->fields,
-                static_cast<uint64_t>(logical_data_cap)) ||
+                put_payload_cap) ||
             request->fields.op != static_cast<uint8_t>(WireOp::kCache)) {
+          return false;
+        }
+        // A leased-PUT window must name the exact object the client asked
+        // the server to stage: any mismatch is a protocol fault, not a
+        // missized retry, so drop the connection (fail closed).
+        if (from_lease &&
+            (request->fields.payload_len != lstate.payload_len ||
+             !(request->fields.Key() == lstate.key))) {
           return false;
         }
         if (request->fields.offset == rdma::kV2MultiWrPutMagic) {
@@ -1055,7 +1116,7 @@ void RdmaServer::Serve(int boot_fd) {
         } else if (!rdma::V2PutCompletionIsValid(
                        write_imm_recv, has_immediate,
                        completion.byte_len, request->fields.payload_len,
-                       logical_data_cap, slot_size)) {
+                       put_payload_cap, put_region_bytes)) {
           return false;
         } else {
           window_bytes = request->fields.payload_len;
@@ -1098,9 +1159,23 @@ void RdmaServer::Serve(int boot_fd) {
       request->contiguous_payload = frame + kReqPrefix;
       return true;
     }
+    if (request->fields.op == static_cast<uint8_t>(WireOp::kLeasePut)) {
+      // Leased-PUT staging request. The object itself arrives later as one
+      // or more WRITE_WITH_IMM windows into the leased range, so this request
+      // only needs to prove the object geometry is legal and the slot has no
+      // in-flight lease/multi-window state. A lease larger than the logical
+      // --max-msg bound is a permanent fault, not backpressure.
+      if (!leased_put_requested ||
+          request->fields.payload_len == 0 ||
+          request->fields.payload_len > static_cast<uint64_t>(max_msg_) ||
+          lease_put[recv_slot].active || multi_put[recv_slot].active)
+        return false;
+      return true;
+    }
     if (request->fields.op == static_cast<uint8_t>(WireOp::kPullRelease)) {
       return completion.byte_len == kReqPrefix;
     }
+
 
 
     if (multi_put[recv_slot].active) return false;
@@ -1311,6 +1386,48 @@ void RdmaServer::Serve(int boot_fd) {
       return true;
     }
 
+    if (fields.op == static_cast<uint8_t>(WireOp::kLeasePut)) {
+      // Stage exactly this object from the shared receive pool. The whole
+      // lease is released by release_lease_put() as soon as the store holds
+      // the bytes, so the hard budget bounds data in flight, not
+      // connections. A failed allocation is backpressure, not a fault: the
+      // client treats kCacheFull like a saturated pull slot and may retry.
+      const size_t slot = request.recv_slot;
+      const uint64_t want = fields.payload_len;
+      const size_t region = rdma::V2SlotSize(want);
+      if (region == 0) return false;
+      LeasePutState& state = lease_put[slot];
+      state.lease = recv_segments_.Allocate(
+          region, rdma::kV2DataOffset, static_cast<int>(rail_index),
+          rail_numa);
+      if (!state.lease) {
+        lease_put_busy_rejects_.fetch_add(1, std::memory_order_relaxed);
+        encode_status(Status::kCacheFull, 0);
+        reply->first_len = response_prefix;
+        return true;
+      }
+      state.active = true;
+      state.key = key;
+      state.payload_len = want;
+      lease_put_ops_.fetch_add(1, std::memory_order_relaxed);
+      lease_put_bytes_.fetch_add(want, std::memory_order_relaxed);
+      lease_put_active_.fetch_add(1, std::memory_order_relaxed);
+      lease_put_bytes_active_.fetch_add(state.lease.size(),
+                                        std::memory_order_relaxed);
+      // The receive-pool chunk carrying the lease is already registered for
+      // remote writes (recv_segment_mr covers the whole chunk), so the WRITE
+      // needs no extra MR: publish the lease's own address with that rkey.
+      const rdma::LeasePutReady ready{
+          static_cast<uint32_t>(slot), next_lease_generation(slot),
+          recv_segment_mr->rkey,
+          reinterpret_cast<uint64_t>(state.lease.data()),
+          state.lease.size()};
+      encode_status(Status::kOk, rdma::kLeasePutReadyBytes);
+      rdma::EncodeLeasePutReady(ready, send_buffer + response_prefix);
+      reply->first_len = response_prefix + rdma::kLeasePutReadyBytes;
+      return true;
+    }
+
     if (fields.op == static_cast<uint8_t>(WireOp::kRange) &&
         request.get.window_index != 0) {
       const size_t operation_id = request.get.operation_id;
@@ -1464,12 +1581,32 @@ void RdmaServer::Serve(int boot_fd) {
 
     if (fields.op == static_cast<uint8_t>(WireOp::kCache) &&
         cache_direct_handler_) {
-      if (!direct_buffer(request.data_slot) ||
-          !direct_mr(request.data_slot) || fields.payload_len == 0 ||
-          fields.payload_len > static_cast<uint64_t>(logical_data_cap))
-        return invalid_reply();
-
-      char* cache_data = direct_buffer(request.data_slot);
+      const bool from_lease = request.from_lease_put;
+      LeasePutState& lstate = lease_put[request.data_slot];
+      char* cache_data = nullptr;
+      size_t cache_cap = 0;
+      if (from_lease) {
+        // decode matched this window to the in-flight lease; losing that
+        // binding now is an internal fault, so release and drop the
+        // connection (fail closed) rather than storing from bad memory.
+        if (!lstate.active || !lstate.lease ||
+            fields.payload_len == 0 ||
+            fields.payload_len > lstate.payload_len ||
+            fields.payload_len >
+                lstate.lease.size() - rdma::kV2DataOffset) {
+          release_lease_put(request.data_slot);
+          return false;
+        }
+        cache_data = lstate.lease.data() + rdma::kV2DataOffset;
+        cache_cap = lstate.lease.size() - rdma::kV2DataOffset;
+      } else {
+        if (!direct_buffer(request.data_slot) ||
+            !direct_mr(request.data_slot) || fields.payload_len == 0 ||
+            fields.payload_len > static_cast<uint64_t>(logical_data_cap))
+          return invalid_reply();
+        cache_data = direct_buffer(request.data_slot);
+        cache_cap = direct_buffer_cap;
+      }
       if (request.contiguous_payload &&
           request.contiguous_payload != cache_data) {
         std::memcpy(cache_data, request.contiguous_payload,
@@ -1477,9 +1614,13 @@ void RdmaServer::Serve(int boot_fd) {
       }
       const Status status = cache_direct_handler_(
           key, cache_data, static_cast<size_t>(fields.payload_len),
-          direct_buffer_cap);
+          cache_cap);
       encode_status(status, 0);
       reply->first_len = response_prefix;
+      // The store consumed the bytes synchronously (O_DIRECT write or RAM
+      // admit copy), so the staging range returns to the pool now — before
+      // the status SEND, which never touches the lease.
+      if (from_lease) release_lease_put(request.data_slot);
       return true;
     }
 
@@ -1493,6 +1634,12 @@ void RdmaServer::Serve(int boot_fd) {
     const Status status =
         handler_(fields.op, key, fields.offset, fields.length, payload,
                  fields.payload_len, &data, &value_len);
+    // The generic handler copies payload bytes synchronously before
+    // returning, so a leased-PUT object is fully consumed here and its
+    // staging range returns to the pool before the status is encoded.
+    if (fields.op == static_cast<uint8_t>(WireOp::kCache) &&
+        request.from_lease_put)
+      release_lease_put(request.data_slot);
     if (fields.op == static_cast<uint8_t>(WireOp::kRange)) {
       if (data.size() > direct_buffer_cap) return invalid_reply();
       if (!data.empty())
@@ -1974,6 +2121,10 @@ void RdmaServer::Serve(int boot_fd) {
       ring.Drain();
     if (metric_inflight != 0)
       uring_inflight_.fetch_sub(metric_inflight, std::memory_order_relaxed);
+    // Any still-active per-op staging leases are connection losses; release
+    // them through the accounting path before RAII teardown so the gauge
+    // pair (lease_put_active / lease_put_bytes_active) stays exact.
+    for (size_t slot = 0; slot < K; ++slot) release_lease_put(slot);
 
     rail_stats.active_conns.fetch_sub(1, std::memory_order_relaxed);
     active_conns_.fetch_sub(1, std::memory_order_relaxed);
@@ -2051,6 +2202,9 @@ sync_serve_loop:;
     }
   }
   // Any prepared sends without completions destructor-abort below.
+  // Same release sweep for the sync loop: active leases were in flight when
+  // the connection ended, so their accounting must unwind before teardown.
+  for (size_t slot = 0; slot < K; ++slot) release_lease_put(slot);
   rail_stats.active_conns.fetch_sub(1, std::memory_order_relaxed);
   active_conns_.fetch_sub(1, std::memory_order_relaxed);
   { std::lock_guard<std::mutex> lk(conn_mu_); live_eps_.erase(&ep); }
@@ -2141,6 +2295,24 @@ std::string RdmaServer::MetricsText() const {
        std::to_string(
            control_connection_bytes_.load(std::memory_order_relaxed)) +
        "\n";
+  s += "dfkv_rdma_connection_bytes{class=\"lease_put_inflight\"} " +
+       std::to_string(
+           lease_put_bytes_active_.load(std::memory_order_relaxed)) +
+       "\n";
+  m(s, "dfkv_rdma_leaseput_ops_total", "counter",
+    "Leased-PUT staging operations served", lease_put_ops_);
+  m(s, "dfkv_rdma_leaseput_bytes_total", "counter",
+    "Logical object bytes delivered via leased-PUT staging",
+    lease_put_bytes_);
+  m(s, "dfkv_rdma_leaseput_busy_rejects_total", "counter",
+    "Leased-PUT requests refused because the receive pool was exhausted",
+    lease_put_busy_rejects_);
+  m(s, "dfkv_rdma_leaseput_active", "gauge",
+    "In-flight leased-PUT staging leases currently held",
+    lease_put_active_);
+  m(s, "dfkv_rdma_leaseput_bytes_active", "gauge",
+    "Receive-pool bytes held by in-flight leased-PUT staging",
+    lease_put_bytes_active_);
   m(s, "dfkv_rdma_v2_ready", "gauge",
     "Whether RDMA v2 has a registered shared receive segment",
     recv_segment_registered_rails_ > 0 ? 1 : 0);

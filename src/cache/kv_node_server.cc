@@ -970,7 +970,8 @@ Status KvNodeServer::ProcessRequestForKey(
     case WireOp::kListTopology:
     case WireOp::kPullRange:
     case WireOp::kPullRelease:
-      st = Status::kInvalid;  // MDS ops are not served by a cache node
+    case WireOp::kLeasePut:
+      st = Status::kInvalid;  // MDS/RDMA-only ops are not served by a cache node
       break;
     }
   if (st == Status::kInvalid) invalid_ops_.fetch_add(1, std::memory_order_relaxed);

@@ -395,6 +395,9 @@ struct RdmaTransport::Conn {
   size_t declared_bytes = 0;
   size_t depth = 1;
   Lane lane = Lane::kData;
+  // Negotiated staged-lease PUT datapath (probe bit + bootstrap request bit).
+  // Off for pooled conns predating the opt-in and for peers without support.
+  bool leased_put = false;
   bool active_counted = false;
   bool live_counted = false;
   bool visited = true;  // guarded by RdmaTransport::mu_ while idle
@@ -439,6 +442,15 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
           EnvBytes("DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES", 256ull << 10),
           static_cast<size_t>(declared_))),
       depth_(4) {
+  // Optional staged-lease PUT threshold (env DFKV_RDMA_INLINE_PUT_MAX_BYTES,
+  // default 4 MiB; 0 disables). Objects larger than this use the per-op
+  // staging-lease datapath on connections whose peer negotiated it, keeping
+  // the connection-resident receive-slot class at the threshold.
+  inline_put_max_bytes_ = std::min<size_t>(
+      EnvBytes("DFKV_RDMA_INLINE_PUT_MAX_BYTES", 4ull << 20),
+      static_cast<size_t>(declared_));
+  config_dump::RecordResolved("DFKV_RDMA_INLINE_PUT_MAX_BYTES",
+                              std::to_string(inline_put_max_bytes_));
   std::string list = dev_name;
   if (list.empty()) {
     const char* configured = std::getenv("DFKV_RDMA_DEV");
@@ -1105,8 +1117,10 @@ void RdmaTransport::NoteNegotiatedDepth(const std::string& node, Lane lane,
   if (it == map.end() || remote_depth < it->second) map[node] = remote_depth;
 }
 
-bool RdmaTransport::ProbeV2(const std::string& node) const {
+bool RdmaTransport::ProbeV2(const std::string& node,
+                             bool* leased_put_supported) const {
   v2_probe_attempts_.fetch_add(1, std::memory_order_relaxed);
+  if (leased_put_supported) *leased_put_supported = false;
   int fd = net::Dial(node, connect_ms_, io_ms_);
   if (fd < 0) {
     v2_probe_failures_.fetch_add(1, std::memory_order_relaxed);
@@ -1121,10 +1135,15 @@ bool RdmaTransport::ProbeV2(const std::string& node) const {
       net::ReadAll(fd, reply, sizeof(reply)) &&
       rdma::V2ProbeSupportsWriterRetirement(reply) &&
       rdma::V2ProbeSupportsPullRead(reply);
+  const bool leased = ok && rdma::V2ProbeSupportsLeasedPut(reply);
   ::close(fd);
-  if (!ok) v2_probe_failures_.fetch_add(1, std::memory_order_relaxed);
+  if (!ok)
+    v2_probe_failures_.fetch_add(1, std::memory_order_relaxed);
+  else if (leased_put_supported)
+    *leased_put_supported = leased;
   return ok;
 }
+
 
 RdmaTransport::AcquireResult RdmaTransport::Acquire(
     const std::string& node, Lane lane, const AcquireOptions& options) {
@@ -1258,6 +1277,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
               candidate->rail_index == ridx &&
               candidate->declared_bytes >= required_bound &&
               candidate->depth >= required_depth &&
+              (!options.request_leased_put || candidate->leased_put) &&
               (candidate->declared_bytes < best_bound ||
                (candidate->declared_bytes == best_bound &&
                 candidate->depth < best_depth))) {
@@ -1351,7 +1371,8 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   }
 
   const std::string& dev = devs_[ridx];
-  if (!ProbeV2(node)) {
+  bool leased_put_supported = false;
+  if (!ProbeV2(node, &leased_put_supported)) {
     DFKV_LOG_ERROR(
         "rdma: peer " + node +
         " does not advertise required v2 writer-retirement and pull-read capabilities");
@@ -1404,9 +1425,12 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   // The probe above proves the peer understands bit 63 before a real QP is
   // created. Echo the request on this bootstrap so a rolling-upgraded server
   // sends the token only to a client that will consume it.
+  const bool want_leased_put =
+      options.request_leased_put && leased_put_supported;
   const uint64_t bootstrap_declared =
       conn_declared | rdma::kDevFrameRequestWriterRetirement |
-      rdma::kDevFrameRequestPullRead;
+      rdma::kDevFrameRequestPullRead |
+      (want_leased_put ? rdma::kDevFrameRequestLeasedPut : 0);
   rdma::EncodeDevFrame(auto_device_ ? std::string() : dev,
                        bootstrap_declared, devbuf, rdma::kDevProtoV2);
   char mine[rdma::kQpInfoBytes], remote_qp_bytes[rdma::kQpInfoBytes];
@@ -1506,6 +1530,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     result.failure = AcquireFailure::kAdmission;
     return result;
   }
+  conn->leased_put = want_leased_put;
   conns_opened_.fetch_add(1, std::memory_order_relaxed);
   MarkClassOpened(conn);
   rail_conns_[ridx].fetch_add(1, std::memory_order_relaxed);
@@ -2050,6 +2075,20 @@ std::string RdmaTransport::MetricsText() const {
   s += "dfkv_rdma_client_oversize_rejects_total " +
        std::to_string(oversize_rejects_.load(std::memory_order_relaxed)) +
        "\n";
+  s += "# HELP dfkv_rdma_client_inline_put_max_bytes Leased-PUT inline threshold (env DFKV_RDMA_INLINE_PUT_MAX_BYTES); objects above it use per-op staging leases\n";
+  s += "# TYPE dfkv_rdma_client_inline_put_max_bytes gauge\n";
+  s += "dfkv_rdma_client_inline_put_max_bytes " +
+       std::to_string(inline_put_max_bytes_) + "\n";
+  s += "# HELP dfkv_rdma_client_leaseput_ops_total Objects delivered through per-op staging leases\n";
+  s += "# TYPE dfkv_rdma_client_leaseput_ops_total counter\n";
+  s += "dfkv_rdma_client_leaseput_ops_total " +
+       std::to_string(leaseput_ops_.load(std::memory_order_relaxed)) +
+       "\n";
+  s += "# HELP dfkv_rdma_client_leaseput_path_fallbacks_total Lease-intent batches that fell back to a traditional largest-object connection\n";
+  s += "# TYPE dfkv_rdma_client_leaseput_path_fallbacks_total counter\n";
+  s += "dfkv_rdma_client_leaseput_path_fallbacks_total " +
+       std::to_string(leaseput_path_fallbacks_.load(std::memory_order_relaxed)) +
+       "\n";
   s += "# HELP dfkv_rdma_client_v2_probe_attempts_total Required-protocol bootstrap probes\n";
   s += "# TYPE dfkv_rdma_client_v2_probe_attempts_total counter\n";
   s += "dfkv_rdma_client_v2_probe_attempts_total " +
@@ -2483,11 +2522,18 @@ Status RdmaTransport::Remove(const std::string& node, const BlockKey& key) {
 std::vector<Status> RdmaTransport::CacheMany(
     const std::string& node, const std::vector<CacheItem>& items) {
   const size_t count = items.size();
-  size_t required_bytes = 0;
+  size_t max_all_len = 0;
+  size_t max_inline_len = 0;
   std::vector<Status> result(count, Status::kIOError);
   if (count == 0) return result;
   std::vector<char> bad(count, 0);
   size_t valid_count = 0;
+  // Bucket split for the staged-lease datapath: objects above the inline
+  // threshold are candidates for per-op staging leases (server memory tracks
+  // in-flight data instead of connection geometry); everything else keeps the
+  // connection-resident receive-slot path unchanged.
+  bool any_over = false;
+  const bool lease_enabled = inline_put_max_bytes_ != 0;
   for (size_t i = 0; i < count; ++i) {
     if (items[i].len == 0 ||
         !ValidBuffer(items[i].data, items[i].len) ||
@@ -2495,11 +2541,20 @@ std::vector<Status> RdmaTransport::CacheMany(
       bad[i] = 1;
       result[i] = Status::kInvalid;
     } else {
-      required_bytes = std::max(required_bytes, items[i].len);
+      max_all_len = std::max(max_all_len, items[i].len);
+      if (lease_enabled && items[i].len > inline_put_max_bytes_) {
+        any_over = true;
+      } else {
+        max_inline_len = std::max(max_inline_len, items[i].len);
+      }
       ++valid_count;
     }
   }
   if (valid_count == 0) return result;
+  // The connection-resident class must cover the largest INLINE object; the
+  // over-threshold bucket never inflates it.
+  const size_t required_bytes =
+      (any_over && lease_enabled) ? max_inline_len : max_all_len;
 
   const auto peer = peer_topologies_->Snapshot(node);
   RailMask excluded(devs_.size(), 0);
@@ -2511,7 +2566,14 @@ std::vector<Status> RdmaTransport::CacheMany(
     for (size_t i = 0; i < count; ++i)
       if (bad[i]) result[i] = Status::kInvalid;
     AcquireOptions options;
-    options.required_data_bytes = required_bytes;
+    // Attempt 0 asks for the staged-lease datapath when the batch needs it;
+    // attempt 1 (fresh-retry or a lease-incapable peer) falls back to the
+    // traditional largest-object connection-resident class.
+    const bool want_lease = attempt == 0 && any_over && lease_enabled;
+    options.required_data_bytes =
+        want_lease ? std::max(max_inline_len, connection_min_block_bytes_)
+                   : required_bytes;
+    options.request_leased_put = want_lease;
     options.force_new = attempt != 0;
     options.requested_credits = std::min(valid_count, depth_);
     options.excluded = excluded;
@@ -2530,6 +2592,17 @@ std::vector<Status> RdmaTransport::CacheMany(
         MarkClientLocalFailure(&result, acquired.status);
       return result;
     }
+    if (want_lease && !acquired.conn->leased_put) {
+      // Peer predates the staged-lease capability (or the pool only had
+      // plain conns). The small-class connection cannot carry the over-
+      // threshold objects, so stop before anything is posted and retry once
+      // with the traditional largest-object geometry. Nothing was committed.
+      Release(node, Lane::kData, acquired.conn);
+      leaseput_path_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+      if (attempt + 1 < 2) continue;
+      MarkClientLocalFailure(&result, Status::kInvalid);
+      return result;
+    }
     Conn* conn = acquired.conn;
     rdma::RcEndpoint& ep = conn->ep;
     const size_t window = std::min(
@@ -2540,13 +2613,22 @@ std::vector<Status> RdmaTransport::CacheMany(
     // local-rail default; a failed reap window is classified from its WC
     // evidence; wire decode failures blame the peer.
     rdma::RailCompletion completion = rdma::RailCompletion::kRailFailure;
-    for (size_t base = 0; base < count && conn_ok; base += window) {
-      const size_t width = std::min(window, count - base);
+    std::vector<size_t> inline_idx;
+    std::vector<size_t> lease_idx;
+    for (size_t i = 0; i < count; ++i) {
+      if (bad[i]) continue;
+      if (conn->leased_put && items[i].len > inline_put_max_bytes_)
+        lease_idx.push_back(i);
+      else
+        inline_idx.push_back(i);
+    }
+    // Inline bucket: the unchanged connection-resident receive-slot pipeline.
+    for (size_t base = 0; base < inline_idx.size() && conn_ok; base += window) {
+      const size_t width = std::min(window, inline_idx.size() - base);
       std::vector<ibv_mr*> payload_mrs(width, nullptr);
       size_t posted = 0;
       for (size_t slot = 0; slot < width; ++slot) {
-        const size_t item_index = base + slot;
-        if (bad[item_index]) continue;
+        const size_t item_index = inline_idx[base + slot];
         const CacheItem& item = items[item_index];
         if (item.len > conn->data_capacity()) {
           bad[item_index] = 1;
@@ -2588,8 +2670,127 @@ std::vector<Status> RdmaTransport::CacheMany(
       if (!conn_ok) break;
       for (ibv_mr* mr : payload_mrs) ep.ReleaseTransient(mr);
       for (size_t slot = 0; slot < width; ++slot) {
-        const size_t item_index = base + slot;
+        const size_t item_index = inline_idx[base + slot];
+        Status status;
+        uint64_t data_len = 0;
+        if (reply_bytes[slot] < kRespPrefix ||
+            !conn->Decode(ep.rbuf(slot), &status, &data_len, 0)) {
+          conn_ok = false;
+          completion = rdma::RailCompletion::kEndpointFailure;
+          break;
+        }
+        result[item_index] = status;
+      }
+    }
+    // Staged-lease bucket, three pipelined phases per window:
+    //   A) request per-op staging leases (one wire RTT for the whole window)
+    //   B) WRITE_WITH_IMM every accepted object into its leased range
+    //   C) reap the status window and release caller-side transients
+    for (size_t base = 0; base < lease_idx.size() && conn_ok; base += window) {
+      const size_t width = std::min(window, lease_idx.size() - base);
+      struct LeaseSlot {
+        size_t item_index = 0;
+        uint64_t write_base = 0;
+        uint32_t rkey = 0;
+      };
+      std::vector<LeaseSlot> leases(width);
+      size_t accepted = 0;
+      for (size_t slot = 0; slot < width && conn_ok; ++slot) {
+        const size_t item_index = lease_idx[base + slot];
+        const CacheItem& item = items[item_index];
+        leases[slot].item_index = item_index;
+        conn->Encode(ep.sbuf(slot), WireOp::kLeasePut, item.key, 0, 0,
+                     item.len);
+        if (!ep.PostRecv(slot) || !ep.PostSend(slot, kReqPrefix)) {
+          conn_ok = false;
+          completion = rdma::RailCompletion::kRailFailure;
+          break;
+        }
+        ++accepted;
+      }
+      std::vector<uint32_t> reply_bytes;
+      bool timed_out = false;
+      ibv_wc_status wc_status = IBV_WC_SUCCESS;
+      bool had_wcs = false;
+      if (conn_ok &&
+          !ReapPosted(ep, accepted, width, &reply_bytes, BatchTimeout(),
+                      &timed_out, &wc_status, &had_wcs, &completion_fault)) {
+        conn_ok = false;
+        completion = rdma::ClassifyCompletion(wc_status, had_wcs);
+      }
+      if (timed_out)
+        completion_timeouts_.fetch_add(1, std::memory_order_relaxed);
+      if (!conn_ok) break;
+      size_t written = 0;
+      std::vector<ibv_mr*> payload_mrs(width, nullptr);
+      for (size_t slot = 0; slot < width && conn_ok; ++slot) {
+        const size_t item_index = leases[slot].item_index;
         if (bad[item_index]) continue;
+        Status status;
+        uint64_t data_len = 0;
+        if (reply_bytes[slot] < kRespPrefix ||
+            !conn->Decode(ep.rbuf(slot), &status, &data_len, 0) ||
+            (status == Status::kOk) !=
+                (data_len == rdma::kLeasePutReadyBytes)) {
+          conn_ok = false;
+          completion = rdma::RailCompletion::kEndpointFailure;
+          break;
+        }
+        // Backpressure (busy pool) and permanent verdicts are per-object
+        // outcomes: record them and move on without tearing the connection.
+        if (status != Status::kOk) {
+          result[item_index] = status;
+          continue;
+        }
+        rdma::LeasePutReady ready;
+        if (reply_bytes[slot] < kRespPrefix + rdma::kLeasePutReadyBytes ||
+            !rdma::DecodeLeasePutReady(ep.rbuf(slot) + kRespPrefix,
+                                       &ready) ||
+            ready.slot != static_cast<uint32_t>(slot) ||
+            ready.lease_bytes <
+                static_cast<uint64_t>(rdma::kV2DataOffset) +
+                    items[item_index].len) {
+          conn_ok = false;
+          completion = rdma::RailCompletion::kEndpointFailure;
+          break;
+        }
+        leases[slot].write_base = ready.write_base;
+        leases[slot].rkey = ready.rkey;
+        ++leaseput_ops_;
+        const CacheItem& item = items[item_index];
+        ibv_mr* mr = ep.RegisterTransient(const_cast<void*>(item.data),
+                                           item.len, /*remote_write=*/false);
+        payload_mrs[slot] = mr;
+        if (!mr || !ep.PostRecv(slot) ||
+            !ep.PostWriteImmScatter(
+                slot, kReqPrefix, item.data, item.len, mr,
+                leases[slot].write_base + rdma::kV2PutPrefixOffset,
+                leases[slot].rkey, static_cast<uint32_t>(slot))) {
+          conn_ok = false;
+          completion = rdma::RailCompletion::kRailFailure;
+          break;
+        }
+        ++written;
+        v2_put_writes_.fetch_add(1, std::memory_order_relaxed);
+        request_posted = true;
+      }
+      if (!conn_ok) break;
+      reply_bytes.clear();
+      timed_out = false;
+      wc_status = IBV_WC_SUCCESS;
+      had_wcs = false;
+      if (!ReapPosted(ep, written, width, &reply_bytes, BatchTimeout(),
+                      &timed_out, &wc_status, &had_wcs, &completion_fault)) {
+        conn_ok = false;
+        completion = rdma::ClassifyCompletion(wc_status, had_wcs);
+      }
+      if (timed_out)
+        completion_timeouts_.fetch_add(1, std::memory_order_relaxed);
+      if (!conn_ok) break;
+      for (ibv_mr* mr : payload_mrs) ep.ReleaseTransient(mr);
+      for (size_t slot = 0; slot < width; ++slot) {
+        const size_t item_index = leases[slot].item_index;
+        if (bad[item_index] || leases[slot].write_base == 0) continue;
         Status status;
         uint64_t data_len = 0;
         if (reply_bytes[slot] < kRespPrefix ||

@@ -44,6 +44,10 @@ constexpr size_t kV2ProbeReplyBytes = 8;
 // new clients fail before real QP bootstrap unless this bit is present.
 constexpr uint8_t kV2ProbeCapWriterRetirement = 1u << 0;
 constexpr uint8_t kV2ProbeCapPullRead = 1u << 1;
+// Bit 2 advertises the per-op staging-lease PUT datapath (kLeasePut). Old
+// clients ignore it; new clients refuse to send lease requests without it and
+// fall back to the connection-resident receive-slot path.
+constexpr uint8_t kV2ProbeCapLeasedPut = 1u << 2;
 
 inline bool IsV2Probe(const char frame[kDevNameBytes]) {
   size_t n = 0;
@@ -54,8 +58,8 @@ inline bool IsV2Probe(const char frame[kDevNameBytes]) {
 
 inline void EncodeV2ProbeReply(
     char out[kV2ProbeReplyBytes],
-    uint8_t capabilities =
-        kV2ProbeCapWriterRetirement | kV2ProbeCapPullRead) {
+    uint8_t capabilities = kV2ProbeCapWriterRetirement |
+                           kV2ProbeCapPullRead | kV2ProbeCapLeasedPut) {
   std::memset(out, 0, kV2ProbeReplyBytes);
   std::memcpy(out, &kV2ProbeMagic, sizeof(kV2ProbeMagic));
   out[4] = static_cast<char>(kDevProtoV2);
@@ -83,6 +87,11 @@ inline bool V2ProbeSupportsWriterRetirement(
 inline bool V2ProbeSupportsPullRead(
     const char in[kV2ProbeReplyBytes]) {
   return (ParseV2ProbeCapabilities(in) & kV2ProbeCapPullRead) != 0;
+}
+
+inline bool V2ProbeSupportsLeasedPut(
+    const char in[kV2ProbeReplyBytes]) {
+  return (ParseV2ProbeCapabilities(in) & kV2ProbeCapLeasedPut) != 0;
 }
 
 // Failure-path writer retirement. The client reconnects with the opaque
@@ -294,6 +303,60 @@ inline bool DecodePullReady(const char in[kPullReadyBytes],
   ready->data_len = net::GetU64(in + 16);
   ready->value_len = net::GetU64(in + 24);
   return ready->slot_generation != 0;
+}
+
+// Per-op staging lease for the in-flight leased-PUT datapath. The server
+// leases exactly one receive-pool range sized for the whole object; the client
+// WRITEs the object into [write_base, write_base+lease_bytes) exactly like an
+// ordinary receive-slot window (frame prefix at +kV2PutPrefixOffset, payload
+// at +kV2DataOffset). The range is freed by the server as soon as the STORE
+// handler returns, so receive memory follows data in flight, not connection
+// count. `slot` echoes the request's recv slot (also the WRITE immediate) and
+// `generation` is a nonzero per-slot monotonically increasing value reserved
+// for future release/retry extensions and log correlation.
+struct LeasePutReady {
+  uint32_t slot = 0;
+  uint64_t generation = 0;
+  uint32_t rkey = 0;
+  uint64_t write_base = 0;
+  uint64_t lease_bytes = 0;
+};
+
+constexpr uint32_t kLeasePutReadyMagic = 0x3252534cu;  // "LSR2" (LE)
+constexpr size_t kLeasePutReadyBytes = 40;
+
+inline void EncodeLeasePutReady(const LeasePutReady& ready,
+                                char out[kLeasePutReadyBytes]) {
+  std::memset(out, 0, kLeasePutReadyBytes);
+  net::PutU32(out, kLeasePutReadyMagic);
+  net::PutU32(out + 4, ready.rkey);
+  net::PutU32(out + 8, ready.slot);
+  net::PutU32(out + 12, 0);
+  net::PutU64(out + 16, ready.write_base);
+  net::PutU64(out + 24, ready.lease_bytes);
+  net::PutU64(out + 32, ready.generation);
+}
+
+inline bool DecodeLeasePutReady(const char in[kLeasePutReadyBytes],
+                                LeasePutReady* ready) {
+  if (net::GetU32(in) != kLeasePutReadyMagic) return false;
+  const uint32_t rkey = net::GetU32(in + 4);
+  const uint64_t write_base = net::GetU64(in + 16);
+  const uint64_t lease_bytes = net::GetU64(in + 24);
+  // A lease always stages at least one payload byte after the frame page, so
+  // a single empty page is geometry no server can produce: reject it here.
+  if (rkey == 0 || write_base == 0 ||
+      lease_bytes < 2 * kV2DataOffset ||
+      lease_bytes % kV2DataOffset != 0 ||
+      write_base >
+          std::numeric_limits<uint64_t>::max() - (lease_bytes - 1))
+    return false;
+  ready->rkey = rkey;
+  ready->slot = net::GetU32(in + 8);
+  ready->write_base = write_base;
+  ready->lease_bytes = lease_bytes;
+  ready->generation = net::GetU64(in + 32);
+  return ready->generation != 0;
 }
 
 // The original readiness response is exactly one ready byte plus the 24-byte

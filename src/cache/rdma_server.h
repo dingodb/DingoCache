@@ -235,6 +235,14 @@ class RdmaServer {
   std::atomic<uint64_t> legacy_connections_{0};
   std::atomic<uint64_t> data_connection_bytes_{0};
   std::atomic<uint64_t> control_connection_bytes_{0};
+  // In-flight leased-PUT staging: receive memory held only while an
+  // object's windows are actually in flight, unlike the connection-lifetime
+  // leases above. Gauges make the pool/non-resident split observable.
+  std::atomic<uint64_t> lease_put_ops_{0};
+  std::atomic<uint64_t> lease_put_bytes_{0};
+  std::atomic<uint64_t> lease_put_busy_rejects_{0};
+  std::atomic<uint64_t> lease_put_active_{0};
+  std::atomic<uint64_t> lease_put_bytes_active_{0};
   // One anchor per resolved rail holds a lifetime shared device reference and
   // registers the initial receive chunk and caller pools on that rail's PD.
   // Later chunks register lazily on the rail of the connection that leases
