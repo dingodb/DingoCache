@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### v2.26.4 — SGLang DeepSeek-V4.1 HiCache deployment guidance
+
+- Add the verified preview-image HiCache/L3 recipe and physical side-pool
+  requirements, including separate DSpark layout isolation.
+- Correct the object-bound configuration: the payload ceiling does not raise
+  the default 4 MiB RDMA object declaration. Explicitly select the data fabric.
+- Correct HiCache size units and distinguish GPU/host write-through from
+  asynchronous L3 backup, and local cache salt from L3 key isolation.
+- Document paired cold/GET-backed hot verification and workload-dependent
+  cache benefits. No connector runtime or functional C++ changes.
+
 ### v2.26.3 — vLLM acceptance coverage
 
 - Replace the forwarding-only preemption test with a source-lifetime regression:

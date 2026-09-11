@@ -374,7 +374,8 @@ export DFKV_RDMA=1                       # 启用 RDMA 数据面（否则 TCP）
 # 数据面设备；多轨用逗号列表（标准节点 8×400G）
 export DFKV_RDMA_DEV=ib7s400p0,ib7s400p1,ib7s400p2,ib7s400p3,ib7s400p4,ib7s400p5,ib7s400p6,ib7s400p7
 export DFKV_RDMA_NUMA=1                   # 可选：多 NUMA 大机 NUMA 选轨（§1.2）
-export DFKV_RDMA_MAX_PAYLOAD_BYTES=67108864  # 可选：单 chunk payload 上限，默认 64MiB
+export DFKV_RDMA_MAX_PAYLOAD_BYTES=67108864  # 总 payload 上限，不会代替下面的对象声明
+export DFKV_RDMA_MAX_BLOCK_BYTES=67108864    # 按最大实际对象配置；默认仅4MiB
 # DFKV_RDMA_DEPTH 可按容量分别设置；握手自动取两侧最小安全窗口
 ```
 
@@ -395,7 +396,7 @@ sglang serve ... \
   --enable-hierarchical-cache --hicache-write-policy write_through \
   --hicache-mem-layout page_first_direct --hicache-io-backend direct \
   --hicache-storage-prefetch-policy timeout \
-  --hicache-size <字节> \
+  --hicache-ratio 2 --hicache-size 0 \
   --hicache-storage-backend dynamic \
   --hicache-storage-backend-extra-config '{
     "backend_name":"dfkv","module_path":"dfkv_hicache","class_name":"DfkvHiCache",
@@ -403,6 +404,42 @@ sglang serve ... \
     "mds_endpoints":"10.0.0.1:9400,10.0.0.2:9400",
     "mds_group":"default" }'
 ```
+
+#### DeepSeek-V4.1-Flash 预览镜像
+
+该模型需要支持它的 SGLang 预览镜像，不要用普通发行版的能力替代验证。
+已核对的镜像为 `lmsysorg/sglang:dev-dsv41`，
+digest `sha256:e56358a68b06427362283c8c8a9d7d706448082ae53098ea1131b5d51aa1fd62`，
+引擎版本 `0.0.0.dev1+ge087e662b`。
+基础启动参数按
+[官方cookbook](https://docs.sglang.io/cookbook/autoregressive/DeepSeek/DeepSeek-V4_1#docker)
+选择；不要自行覆盖模型自动选择的 attention/MoE backend。
+
+- HiCache 使用 `--hicache-ratio 2 --hicache-size 0`；此模型的混合池拒绝正的
+  `--hicache-size`。此预览版通用 `--hicache-size` 单位是十进制 GB（10^9字节），不是字节或GiB。
+- 使用 `page_first_direct` + `direct`、`write_through`、dynamic 后端及
+  `"interface_v1":1`。正确性基准用 `wait_complete`，不把来不及加载的前缀
+  当作已使用的 L3 命中。
+- `DFKV_RDMA_DEV` 必须按部署实际数据网络明确设置。能注册 MR、能访问 MDS
+  或显示 `transport=rdma` 不代表已选中的端口能传输到目标 server。
+- 长前缀并发回载可对照 extra-config `"rdma_depth":1` 与 `"rdma_depth":8`，
+  同时保持输入、缓存布局与服务端配置不变；较大depth增加在途资源需求，
+  只在实际冷热配对结果支持时采用，不将单机收益外推为全局默认值。
+- 必须同时检查 `DFKV_RDMA_MAX_BLOCK_BYTES` 与 payload/server 上限。
+  该模型的 SWA 对象可以超过默认4MiB；仅提高 `MAX_PAYLOAD_BYTES` 不会提高
+  对象声明。超过声明会返回 `kInvalid`，上层可能表现为缓存失败而不是推理报错。
+- 主 `kv` 池是逻辑 marker；真实内容在 `swa`、`deepseek_v4_c1`、
+  `deepseek_v4_c1_indexer`、`deepseek_v4_c2`、`deepseek_v4_c2_indexer`
+  等 v2 侧池。必须核对侧池写入及回载，不能只看 marker 存在。
+- 当前预览版 L3 不支持 DCP>1；先使用 TP/EP 基线。DSpark 要单独验证，
+  不同草稿/池布局配置使用不同 `model_revision`，不混用历史原始KV对象。
+
+冷热测量必须使用相同输入、生成参数、并发和样本数。冷轮要求实际 PUT、
+零 GET；热轮清空 GPU/host 两级缓存或重启引擎，要求实际 GET 和 storage-tier
+命中。`cache_salt` 在该预览版只隔离本地树及事件，不隔离外部 L3 对象；
+新冷轮应使用新 `model_revision` 或首个哈希页不同的输入，禁止清理共享存量数据。
+写回是异步的，测量前应等待其完成。短输入下 L3 的加载成本可能抵消重算收益，
+不要从长前缀结果外推。
 
 **方案 B — 静态成员表（遗留）**：无 MDS 时用 `members` 字段，节点增减需重启 SGLang：
 
@@ -473,11 +510,11 @@ sglang serve /models/glm-5.2-nvfp4 --served-model-name glm-5.2 \
 | flag | 推荐 | 说明 |
 |---|---|---|
 | `--hicache-storage-backend dynamic` | 必填 | 侧载 dfkv 插件，免 fork SGLang |
-| `--hicache-io-backend direct` | `direct` | O_DIRECT 零拷贝读写路径 |
+| `--hicache-io-backend direct` | `direct` | GPU与host之间的复制后端；不决定dfkv server的磁盘I/O模式 |
 | `--hicache-mem-layout page_first_direct` | `page_first_direct` | 配合 direct 后端的内存布局 |
-| `--hicache-write-policy write_through` | `write_through` | 写穿，L3 与 L1/L2 同步 |
+| `--hicache-write-policy write_through` | `write_through` | GPU页写穿到host；L3备份由独立异步队列完成，须另验PUT完成 |
 | `--hicache-storage-prefetch-policy timeout` | `timeout` | prefetch 用 timeout 策略（比 best_effort 更安全的杠杆） |
-| `--hicache-size <字节>` | 按 L2-L1 容量 | L3 prefetch 容量；⚠️ 须满足 L2>L1 硬约束，prefetch 容量比建议 0.8 |
+| `--hicache-size <GB>` / `--hicache-ratio` | 优先按模型支持的ratio配置 | 此预览版size按10^9字节/GB换算，0表示按ratio计算；混合池模型可能禁止正size。容量约束以当前引擎实现为准 |
 
 ### 2.4 必知项与陷阱
 
