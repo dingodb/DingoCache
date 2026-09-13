@@ -40,7 +40,7 @@ deploy/package_release.sh build release
 tar tzf "release/dfkv-$(cat VERSION)-linux-x86_64.tar.gz"
 ldd build/libdfkv.so | grep ibverbs
 ```
-依赖：`libibverbs-dev`（构建期）+ 运行节点装 `rdma-core`。无 RDMA 也可去掉 `-DDFKV_WITH_RDMA` 构建纯 TCP 版。
+依赖：`libibverbs-dev`（构建期）；运行节点须安装 libibverbs 及对应硬件 provider。Ubuntu/Debian 运行包为 `rdma-core libibverbs1 ibverbs-providers`，只装前两项不足以发现设备。发布的 runtime 镜像包含这三项；设备透传不能替代用户态 provider。无 RDMA 也可去掉 `-DDFKV_WITH_RDMA` 构建纯 TCP 版。
 > QP 信息走 TCP bootstrap 交换（非 librdmacm），所以只依赖 libibverbs，不需要 librdmacm。
 > CacheLib/Navy 不是 v2.0.0 的构建依赖，也没有占位 backend/CMake 开关；
 > 评估结论、兼容性差距和重开条件见
@@ -51,7 +51,7 @@ ldd build/libdfkv.so | grep ibverbs
 > 直接构建的二进制不能部署到 glibc 2.35。CI 的 portable job 和仓库根
 > `Dockerfile` 都固定 Ubuntu 22.04 + RDMA + 静态 libstdc++，并构建同一
 > canonical tarball。`DFKV_STATIC_LIBSTDCXX` 只静态链接 libstdc++/libgcc；
-> libibverbs 仍动态加载 provider，运行节点必须安装 rdma-core。
+> libibverbs 仍动态加载 provider，运行节点必须同时具备对应插件。镜像验收要在可用 RDMA 设备上完成真实 PUT/GET；仅 `--version` 或 TCP 冒烟不能证明 RDMA 可用。
 
 ## 2. 每节点：分发 + 缓存目录
 

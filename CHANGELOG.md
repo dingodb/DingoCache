@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### v2.27.0 — Runtime RDMA providers and native hybrid-state integration
+
+- Include `ibverbs-providers` in the runtime image; exposing RDMA devices does
+  not make them discoverable when the userspace hardware plugins are absent.
+- Exercise real RDMA PUT/GET through the built runtime image when the CI
+  hardware probe succeeds, rather than relying on version or TCP-only checks.
+- Refresh the shipped SGLang hybrid Mamba/DSA patch for the pinned native
+  GLM-5.3-Flash image, preserving indexer sidecars and actual scaled-MLA host
+  geometry with the current allocator API.
+- Add a bounded real-GPU offload/poison/restore regression for KV, indexer,
+  temporal and convolution state, without model weights.
+- Ship a targeted native vLLM GLM-5.3-Flash V2-runner patch: exclude the
+  single-block kpool tail from generic position-indexed slot mapping, retaining
+  the dedicated circular metadata builder and existing allocation policy.
+- Document strict patch applicability and fresh cache generations. Native
+  client/server wire formats and connector runtime code are unchanged.
+
 ### v2.26.4 — SGLang DeepSeek-V4.1 HiCache deployment guidance
 
 - Add the verified preview-image HiCache/L3 recipe and physical side-pool

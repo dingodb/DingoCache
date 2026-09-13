@@ -238,6 +238,31 @@ jobs:
           DFKV_SERVER_URING=1 ./build/rdma_lease_loopback_test --gtest_output=xml:lease-uring.xml
           ./build/rdma_lease_client_test --gtest_output=xml:lease-client.xml
           python3 -c 'import xml.etree.ElementTree as E; roots=[E.parse(p).getroot() for p in ("lease-sync.xml","lease-uring.xml","lease-client.xml")]; assert all(int(r.attrib["tests"]) > 0 and not list(r.iter("skipped")) and not list(r.iter("failure")) for r in roots)'
+      - name: Exercise RDMA through the shipped runtime image
+        if: steps.rxe_probe.outputs.ok == 'true'
+        run: |
+          set -eu
+          docker build --target runtime -t dfkv-runtime-rdma .
+          id=$(docker run -d --privileged --network host \
+            --ulimit memlock=-1:-1 -e DFKV_RDMA_DEV=rxe0 \
+            dfkv-runtime-rdma --dir /tmp/dfkv-data \
+            --port 12000 --rdma-port 12001 \
+            --metrics-port 12010 --metrics-bind 127.0.0.1 \
+            --cap 67108864 --store-engine file)
+          trap 'docker logs "$id"; docker rm -f "$id" >/dev/null' EXIT
+          ready=0
+          for attempt in $(seq 1 60); do
+            if docker exec "$id" dfkvctl stat 127.0.0.1:12000 \
+                 | grep -q 'dfkv_server_ready 1'; then
+              ready=1
+              break
+            fi
+            test "$(docker inspect -f '{{.State.Running}}' "$id")" = true
+            sleep 1
+          done
+          test "$ready" = 1
+          docker exec -e DFKV_RDMA=1 -e DFKV_RDMA_DEV=rxe0 "$id" \
+            dfkv_smoke --members n=127.0.0.1:12001 --size 1048576
       - name: Build + run RDMA datapath test under ThreadSanitizer (hard gate when rxe works)
         if: steps.rxe_probe.outputs.ok == 'true'
         run: |

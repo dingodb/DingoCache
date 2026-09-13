@@ -532,23 +532,41 @@ sglang serve /models/glm-5.2-nvfp4 --served-model-name glm-5.2 \
   MR，无 payload memcpy。
 - MLA 下插件自动单对象、无 rank 后缀、`backup_skip`（仅 tp_rank0 写）。decode 共享前缀配同 members。
 - **多池模型**（Mamba/SWA/DeepSeek-V4）用 v2 PoolTransfer 接口（插件已实现）。
-  DSA/DeepSeekV4 主 `kv` 池是无数据的 LogicalHostPool（`get_page_buffer_meta→None`），
-  插件对其 `batch_set_v1` 写空 marker 锚定命中前缀、`batch_get_v1` no-op，真实 KV 走 v2 侧池。
+  部分 DeepSeek-V4 等引擎的主 `kv` 是无数据 LogicalHostPool（`get_page_buffer_meta→None`）：
+  插件写 marker 锚定前缀，主池读取不搬运字节，实际数据走 v2 侧池。普通 MLA/DSA
+  的主 `kv` 可以是真实物理池；必须按运行时布局核对，不能将所有 DSA 都当作 marker。
 - **Mamba＋DSA 混合模型必须同时注册 `KV`、`MAMBA`、`INDEXER`。**
   只恢复 latent 与 recurrent state、遗漏历史 indexer 数据，会出现“所有已请求
   对象均命中，但长提示答案错误”；不能通过增加生成长度或把命中计数当作正确性
   来跳过检查。SGLang 的普通 DSA 路径正确注册 sidecar，不代表混合路径也已注册。
   对尚缺该接线的引擎，随包提供
   [混合 DSA indexer 修复补丁](../integration/hicache/patches/sglang-hybrid-mamba-dsa-indexer.patch)。
-  它修复引擎的 host-pool entry 与 `SidecarPoolSpec` 两处声明，不改变 dfkv
-  value/wire 格式。补丁的实测源文件是
-  `python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py`，
-  原始 SHA256 为 `48456e7ce2cf20f839d100333404c90ba1d65b370a7f8265e9bc044ec18c2216`；
-  应在对应 SGLang 源码树先执行 `git apply --check`，再应用、重建或部署受控
-  overlay。不要盲目覆盖其它引擎版本。启动池描述必须包含 `INDEXER`，并对原始
-  长提示执行完整进程重启后的 L3 回载与答案校验；旧的缺 indexer 缓存不能视为
-  上游 SGLang main（2026-09-08 核对）仍未在 `build_hybrid_mamba_stack` 注册
-  INDEXER，该补丁对当前上游同样适用，并非仅限旧镜像。
+  它补齐 host-pool entry 与 `SidecarPoolSpec`，并让 MLA 宿主页使用设备池实际
+  `kv_cache_dim`，避免带缩放布局被默认维度截断；不改变 dfkv value/wire 格式。
+  当前补丁针对官方 `lmsysorg/sglang:glm-5.3-flash` 的
+  `0.0.0.dev1+gf609d677b` 构建，镜像 digest 为
+  `sha256:a2c0f7d4d9ebce97a2707c5415081d284d741db1033a1008a955453b9b5255bf`。
+  目标文件是 `python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py`，
+  原始 SHA256 为 `6689d642d7868e66a34cd95ef09e5d710ef6f40fd053ca2f1f7d04afe99223ff`。
+  先核对源文件，再严格检查和应用补丁；禁止用 fuzzy apply 跨版本套用。
+  例如在该镜像内将 dfkv 仓库挂载到 `/dfkv` 后：
+
+  ```bash
+  git -C /sgl-workspace/sglang apply --check \
+    /dfkv/integration/hicache/patches/sglang-hybrid-mamba-dsa-indexer.patch
+  git -C /sgl-workspace/sglang apply \
+    /dfkv/integration/hicache/patches/sglang-hybrid-mamba-dsa-indexer.patch
+  python3 /dfkv/integration/hicache/tests/gpu_hybrid_state_roundtrip.py \
+    --include-scaled-mla
+  ```
+
+  [GPU 状态回归](../integration/hicache/tests/gpu_hybrid_state_roundtrip.py)使用真实池、
+  分配器和 CUDA 传输：卸载后改写全部设备字节，再恢复到不同槽位，逐字节验证
+  KV、INDEXER、temporal 与 conv 状态。它不加载模型权重，也不代替整模型、
+  多 rank、L3 或完整进程重启验收。部署时必须记录补丁和派生镜像身份，
+  启动池描述须包含 `INDEXER`；使用新的 `model_revision`，不能复用曾遗漏
+  indexer 或截断状态的旧缓存。其它引擎版本应重新核对接口与状态恢复，不能
+  从此目标构建外推适用性。
 - **identity/layout 必须协同发布。** namespace 使用 SGLang runtime 给出的精确
   `model_name` + `sglang-hicache/raw-v1`；同一模型的 pool/hash/并行坐标/component
   进入 canonical object key。dfkv value 只有 raw bytes，不会检查 page size、
@@ -849,6 +867,17 @@ lsmod | grep nvidia_peermem
 - 引擎可能把一个逻辑 block 降为多个 kernel tile；注册时必须按 allocator 的
   逻辑 block 数折叠物理 tile 轴，完整收集每个逻辑 block 的所有 bytes，不能
   直接把逻辑 block ID 用作 kernel-tile 索引。
+
+#### GLM Flash 原生 V2 runner 的循环尾状态映射
+
+`vllm/vllm-openai:glm53-flash` 的 `g385dce36b` 将 `KpoolTailSpec` 错当作
+普通位置索引缓存：长 prefill 在通用 slot-mapping 内核中越界，异步错误可能
+随后表现为 KDA 投影的 cuBLAS 失败。无 dfkv 连接器也会触发。
+随包提供 [循环尾映射补丁](../integration/vllm/patches/vllm-glm53flash-kpool-tail-slot-mapping.patch)，
+仅让该类型跳过通用映射；已有 `KpoolTailMetadataBuilder` 仍按每请求的
+首块与 `position % kpool` 生成真实尾状态位置。保留原表宽、APC、模型和请求长度。
+补丁针对上述源码版本，应用前运行 `git apply --check`，不盲目应用到其他版本。
+原短—短—长请求故障序列在修复后通过；这项引擎回归不替代 L3 字节完整性和性能验收。
 
 
 #### 混合模型的 KV 加载故障恢复

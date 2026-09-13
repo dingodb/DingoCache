@@ -9,7 +9,7 @@
 # DFKV_STATIC_LIBSTDCXX folds libstdc++/libgcc into the artifacts (those are NOT
 # glibc; static-linking them removes a separate runtime dep). libibverbs CANNOT
 # be static (it dlopen()s provider drivers at runtime), so the run node still
-# needs rdma-core / libibverbs installed.
+# needs rdma-core / libibverbs and their hardware provider plugins installed.
 # ubuntu:22.04, pinned so a release tag always rebuilds from identical bytes.
 ARG DFKV_BASE_IMAGE=docker.io/library/ubuntu@sha256:3b06811b2afd352be909dd088a004166d665dc76d38b13eada33522a9d915c6f
 FROM ${DFKV_BASE_IMAGE} AS build
@@ -29,7 +29,7 @@ RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDFKV_BUILD_TESTS=O
 
 FROM ${DFKV_BASE_IMAGE} AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    rdma-core libibverbs1 && rm -rf /var/lib/apt/lists/*
+    rdma-core libibverbs1 ibverbs-providers && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/ /usr/local/
 RUN ldconfig
 EXPOSE 12000
