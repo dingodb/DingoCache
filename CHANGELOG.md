@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### v2.27.1 — Request-level hybrid KV load recovery
+
+- Adopt vLLM's native `KVConnectorTransferResults` protocol for hybrid and
+  multi-group loads instead of reporting ambiguous, group-less block IDs.
+- Publish paired receive completion/failure only after native writes and the
+  owning CUDA device are fenced; cover misses, malformed results, exceptions,
+  queue rejection and cancellation without losing or duplicating outcomes.
+- Keep `load_async=false` I/O serialized on the model thread while parking
+  hybrid requests until receive completion. Explicit device synchronization
+  also handles runners that defer the load hook until after a forward pass.
+- Bypass failed external hits for the rest of a request and rebuild retry
+  metadata from fresh allocations, including resumed MRV1 and MRV2 requests.
+- Remove the obsolete hybrid invalid-block scheduler patch. This connector
+  requires native `get_transfer_results` / `failed_recving` support throughout
+  the vLLM runner, executor and scheduler; older runtimes need an engine upgrade.
+- Preserve single full-attention block-level recovery and stored-key layout.
+  No functional C++/server, native ABI or wire-format changes.
+
 ### v2.27.0 — Runtime RDMA providers and native hybrid-state integration
 
 - Include `ibverbs-providers` in the runtime image; exposing RDMA devices does
