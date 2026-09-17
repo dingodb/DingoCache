@@ -5,6 +5,7 @@ import pytest
 
 from dfkv_vllm.data import LoadSpec
 from dfkv_vllm.scheduler import DfkvStoreScheduler
+from dfkv_vllm.transfer_protocol import LegacyReceiveFailures
 
 
 def test_new_request_metadata_uses_complete_allocated_block_table():
@@ -334,8 +335,9 @@ def test_load_admission_parks_request_level_layouts(
 
 @pytest.mark.parametrize("cached_resume", [False, True])
 @pytest.mark.parametrize("load_async", [False, True])
+@pytest.mark.parametrize("legacy", [False, True])
 def test_failed_load_bypasses_persistent_hit_and_rebuilds_computed_save(
-    cached_resume, load_async,
+    cached_resume, load_async, legacy,
 ):
     scheduler = object.__new__(DfkvStoreScheduler)
     scheduler.kv_role = "kv_both"
@@ -379,7 +381,14 @@ def test_failed_load_bypasses_persistent_hit_and_rebuilds_computed_save(
     assert pending.requests[0].load_spec.can_load
     assert pending.requests[0].can_save is False
 
-    scheduler.update_connector_output(SimpleNamespace(failed_recving={"retry"}))
+    if legacy:
+        failures = LegacyReceiveFailures(failed_recving={"retry"})
+        # Model the callback packet after the bridge's all-rank receive fence.
+        failures._ready = True
+        output = SimpleNamespace(kv_connector_worker_meta=failures)
+    else:
+        output = SimpleNamespace(failed_recving={"retry"})
+    scheduler.update_connector_output(output)
     assert cached == {}
     assert scheduler.build_connector_meta(step).requests == []
     assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
@@ -427,5 +436,5 @@ def test_failed_load_bypasses_persistent_hit_and_rebuilds_computed_save(
     assert scheduler.build_connector_meta(step).requests == []
     # Late receive completion of an aborted/finalized request cannot resurrect
     # quarantine or stale allocation metadata.
-    scheduler.update_connector_output(SimpleNamespace(failed_recving={"retry"}))
+    scheduler.update_connector_output(output)
     assert scheduler.get_num_new_matched_tokens(request, 0) == (12, True)

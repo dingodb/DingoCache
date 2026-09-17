@@ -41,18 +41,36 @@ device pointers. Set `DFKV_RDMA=1` in every engine process. Construction rejects
 and closes any native handle whose reported transport is not `rdma`; there is no
 TCP or host-bounce fallback for this connector.
 
-Hybrid/multi-group caches and single-group non-full-attention caches require
-vLLM's native request-level load-failure protocol:
-`KVConnectorTransferResults.failed_recving`, its propagation through
-`KVConnectorOutput.failed_recving`, and scheduler recovery of failed
-`WAITING_FOR_REMOTE_KVS` requests. Upgrade to an engine exposing that complete
-API; no out-of-tree invalid-block scheduler patch is supported or required.
-The connector reports failed request IDs together with receive completion only
-after native I/O and GPU writes are fenced, leaving block-ID errors empty for
-these layouts. With `kv_load_failure_policy="recompute"`, the engine releases the
-failed allocation and retries locally; dfkv bypasses the failed remote source
-for the remainder of that request, including subsequent preemptions. The engine's
-`"fail"` policy terminates the affected request instead.
+Hybrid/multi-group caches and single-group non-full-attention caches report
+request-level load failures. One connector wheel automatically selects the
+engine's protocol:
+
+- **Native engines:** `get_transfer_results()` returns
+  `KVConnectorTransferResults.failed_recving` alongside receive completion.
+  The engine propagates `KVConnectorOutput.failed_recving` and performs its
+  native scheduler recovery. No scheduler bridge is installed.
+- **Legacy engines:** `get_finished()` uses the same worker outcome collection;
+  `build_connector_worker_meta()` carries failed request IDs through
+  `KVConnectorWorkerMetadata.aggregate()`. For request-level layouts, the
+  scheduler-role connector installs a capability-checked, in-process bridge.
+  It retains failures across steps until executor-aggregated `finished_recving`
+  confirms all ranks are done, then routes request identities through the
+  engine's existing recovery/error path without inventing block IDs.
+
+The legacy bridge requires worker-metadata aggregation/transport, all-rank
+receive-completion aggregation, and the scheduler's `update_from_output`,
+`_handle_invalid_blocks`, waiting-request recovery and load-failure policy
+hooks. Missing bridge capabilities fail explicitly at startup. It does not
+modify installed vLLM source files or require a manually applied engine patch;
+compatibility is based on these capabilities, not a blanket version cutoff.
+Single-group full-attention retains its existing block-level recovery.
+
+Failed request IDs and receive completion are published only after native I/O
+and GPU writes are fenced. These layouts leave block-ID errors empty. With
+`kv_load_failure_policy="recompute"`, the engine releases the failed allocation
+and retries locally; dfkv bypasses the failed remote source for the remainder
+of that request, including subsequent preemptions. The engine's `"fail"` policy
+terminates the affected request instead.
 The request-level completion fence is mandatory even when the legacy
 `DFKV_GPU_LOAD_FENCE=0` override is present.
 
