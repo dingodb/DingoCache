@@ -53,6 +53,8 @@ these layouts. With `kv_load_failure_policy="recompute"`, the engine releases th
 failed allocation and retries locally; dfkv bypasses the failed remote source
 for the remainder of that request, including subsequent preemptions. The engine's
 `"fail"` policy terminates the affected request instead.
+The request-level completion fence is mandatory even when the legacy
+`DFKV_GPU_LOAD_FENCE=0` override is present.
 
 ## Environment variables (engine process)
 

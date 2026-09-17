@@ -130,6 +130,7 @@ def test_rejection_and_shutdown_cleanup_preserve_paired_outcomes(make_receiver):
 
 
 def test_native_exception_waits_for_owner_gpu_before_atomic_drain(make_receiver, monkeypatch):
+    monkeypatch.setenv("DFKV_GPU_LOAD_FENCE", "0")
     receiver, _ = make_receiver(MemoryClient("native"))
     receiver._cuda_device = 7
     fence_entered = threading.Event()
