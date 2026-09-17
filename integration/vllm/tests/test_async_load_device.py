@@ -12,7 +12,9 @@ from dfkv_vllm.worker import KVCacheStoreRecvingThread
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
-def test_receive_completion_waits_for_the_owning_gpu():
+@pytest.mark.parametrize("request_level_loads", [False, True])
+def test_receive_completion_waits_for_the_owning_gpu(monkeypatch, request_level_loads):
+    monkeypatch.setenv("DFKV_GPU_LOAD_FENCE", "0" if request_level_loads else "1")
     for device in (0, 1):
         with torch.cuda.device(device):
             torch.cuda._sleep(1)
@@ -47,6 +49,7 @@ def test_receive_completion_waits_for_the_owning_gpu():
         receiver = KVCacheStoreRecvingThread(
             PendingDeviceWrite(), coordinator, [database], 64,
             tp_rank=0, ready_event=threading.Event(),
+            request_level_loads=request_level_loads,
         )
     request = ReqMeta(
         req_id="async-device", token_len_chunk=64,

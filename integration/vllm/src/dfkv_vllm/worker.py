@@ -1451,8 +1451,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 # Fence even a failed/partial native batch before publishing
                 # its terminal outcome and allowing destination block reuse.
                 if (
-                    os.environ.get("DFKV_GPU_LOAD_FENCE", "1") == "1"
-                    and self._cuda_device is not None
+                    self._cuda_device is not None
+                    and (
+                        self.request_level_loads
+                        or os.environ.get("DFKV_GPU_LOAD_FENCE", "1") == "1"
+                    )
                 ):
                     torch.cuda.synchronize(self._cuda_device)
 
