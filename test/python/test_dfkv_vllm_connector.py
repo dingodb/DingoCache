@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from importlib import import_module
 from importlib.util import find_spec
 import sys
 import threading
@@ -102,6 +103,20 @@ def _install_vllm_stubs() -> None:
         kv_connector_worker_meta: object = None
         kv_cache_events: object = None
 
+    class KVConnectorFactory:
+        _registry = {}
+
+        @classmethod
+        def register_connector(cls, name, module_path, class_name):
+            if name in cls._registry:
+                raise ValueError("connector already registered")
+            cls._registry[name] = (module_path, class_name)
+
+        @classmethod
+        def get_connector_class_by_name(cls, name):
+            module_path, class_name = cls._registry[name]
+            return getattr(import_module(module_path), class_name)
+
     class SupportsHMA:
         pass
 
@@ -161,6 +176,10 @@ def _install_vllm_stubs() -> None:
     )
     stub("vllm.distributed.kv_transfer")
     stub("vllm.distributed.kv_transfer.kv_connector")
+    stub(
+        "vllm.distributed.kv_transfer.kv_connector.factory",
+        KVConnectorFactory=KVConnectorFactory,
+    )
     stub("vllm.distributed.kv_transfer.kv_connector.v1")
     stub(
         "vllm.distributed.kv_transfer.kv_connector.v1.base",
