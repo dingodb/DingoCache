@@ -23,6 +23,7 @@ from vllm.distributed.kv_events import (
     KVConnectorKVEvents,
     KVEventAggregator,
 )
+from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
@@ -504,3 +505,16 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
         return DfkvStorePromMetrics(
             vllm_config, metric_types, labelnames, per_engine_labelvalues
         )
+
+
+# MultiConnector reconstructs cross-process statistics by class name rather
+# than module path. Register the same external class for that supported route.
+try:
+    KVConnectorFactory.register_connector(
+        "DfkvStoreConnector", __name__, "DfkvStoreConnector"
+    )
+except ValueError:
+    if KVConnectorFactory.get_connector_class_by_name(
+        "DfkvStoreConnector"
+    ) is not DfkvStoreConnector:
+        raise

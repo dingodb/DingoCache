@@ -65,6 +65,13 @@ modify installed vLLM source files or require a manually applied engine patch;
 compatibility is based on these capabilities, not a blanket version cutoff.
 Single-group full-attention retains its existing block-level recovery.
 
+Direct and nested `MultiConnector` compositions preserve failure routing to
+the originating dfkv child without replaying other children's metadata.
+Importing the external module also registers `DfkvStoreConnector` by name so
+MultiConnector can reconstruct serialized statistics in the API process.
+An existing registration of the same class is accepted; a conflicting class
+binding is not silently replaced.
+
 Failed request IDs and receive completion are published only after native I/O
 and GPU writes are fenced. These layouts leave block-ID errors empty. With
 `kv_load_failure_policy="recompute"`, the engine releases the failed allocation

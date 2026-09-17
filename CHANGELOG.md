@@ -12,6 +12,9 @@
   engine source-file patches are used.
 - Preserve originating-child routing through nested `MultiConnector` metadata;
   do not retain or replay other connectors' historical metadata.
+- Register the external connector's canonical name so MultiConnector can
+  reconstruct cross-process statistics without terminating API output handling.
+  Preserve an operator's existing registration of the same class.
 - Keep serialized hybrid loads parked and fenced, quarantine failed external
   hits, and preserve cancellation/deferred-free ownership. Native engines
   continue to use their native request-failure protocol.
