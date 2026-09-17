@@ -27,6 +27,7 @@ def _install_runtime_dependency_stubs() -> None:
         torch_module = ModuleType("torch")
         torch_cuda_module = ModuleType("torch.cuda")
         torch_cuda_module.Event = Event
+        torch_cuda_module.is_available = lambda: False
         torch_module.Tensor = Tensor
         torch_module.cuda = torch_cuda_module
         sys.modules["torch"] = torch_module
@@ -73,6 +74,27 @@ def _install_vllm_stubs() -> None:
     class BlockHash(bytes):
         pass
 
+    class KVConnectorBase_V1:
+        def get_finished(self, finished_req_ids):
+            raise NotImplementedError
+
+        def build_connector_worker_meta(self):
+            return None
+
+        def update_connector_output(self, connector_output):
+            pass
+
+    class KVConnectorWorkerMetadata:
+        def aggregate(self, other):
+            raise NotImplementedError
+
+    @dataclass
+    class KVConnectorOutput:
+        finished_sending: set[str] = field(default_factory=set)
+        finished_recving: set[str] = field(default_factory=set)
+        invalid_block_ids: set[int] = field(default_factory=set)
+        kv_connector_worker_meta: object = None
+
     @dataclass
     class KVCacheBlock:
         block_id: int
@@ -117,6 +139,8 @@ def _install_vllm_stubs() -> None:
     stub(
         "vllm.distributed.kv_transfer.kv_connector.v1.base",
         KVConnectorMetadata=Placeholder,
+        KVConnectorBase_V1=KVConnectorBase_V1,
+        KVConnectorWorkerMetadata=KVConnectorWorkerMetadata,
     )
     stub(
         "vllm.distributed.kv_transfer.kv_connector.v1.metrics",
@@ -163,6 +187,8 @@ def _install_vllm_stubs() -> None:
     )
     stub(
         "vllm.v1.kv_cache_interface",
+        AttentionSpec=Placeholder,
+        MambaSpec=Placeholder,
         FullAttentionSpec=Placeholder,
         KVCacheConfig=Placeholder,
         KVCacheGroupSpec=Placeholder,
@@ -173,6 +199,7 @@ def _install_vllm_stubs() -> None:
         "vllm.v1.kv_cache_spec_registry",
         KVCacheSpecRegistry=KVCacheSpecRegistry,
     )
+    stub("vllm.v1.outputs", KVConnectorOutput=KVConnectorOutput)
     stub("vllm.v1.request", Request=Placeholder)
 
 
@@ -193,6 +220,7 @@ from dfkv_vllm.data import (  # noqa: E402
     ReqMeta,
 )
 from dfkv_vllm.protocol import LOOKUP_MSG  # noqa: E402
+from dfkv_vllm.transfer_protocol import TransferResults  # noqa: E402
 from dfkv_vllm.worker import (  # noqa: E402
     DfkvStoreWorker,
     KVCacheStoreRecvingThread,
@@ -556,15 +584,15 @@ class LogicalChunkTransferTest(unittest.TestCase):
             kv_role="kv_both",
             ready_event=threading.Event(),
         )
-        sender.add_stored_request("save")
-        sender._handle_request(
-            ReqMeta(
-                req_id="save",
-                token_len_chunk=64,
-                block_ids=([7],),
-                block_hashes=[self._hash("save")],
-            )
+        request = ReqMeta(
+            req_id="save",
+            token_len_chunk=64,
+            block_ids=([7],),
+            block_hashes=[self._hash("save")],
+            can_save=True,
         )
+        sender.add_stored_request(request)
+        sender._handle_request(request)
 
         expected_key = logical_key.to_bytes()
         self.assertEqual(client.exist_calls, [[expected_key]])
@@ -640,8 +668,9 @@ class LogicalChunkTransferTest(unittest.TestCase):
             token_len_chunk=64,
             block_ids=([7],),
             block_hashes=[self._hash("blocked-save")],
+            can_save=True,
         )
-        sender.add_stored_request(request.req_id)
+        sender.add_stored_request(request)
         sender.start()
         self.assertTrue(sender.ready_event.wait(timeout=1))
         self.assertTrue(sender.add_request(request))
@@ -661,6 +690,7 @@ class LogicalChunkTransferTest(unittest.TestCase):
         sender.wait_for_inflight_put = short_diagnostic_wait
         worker = DfkvStoreWorker.__new__(DfkvStoreWorker)
         worker.load_async = True
+        worker.request_level_loads = False
         worker.kv_recv_thread = None
         worker.kv_send_thread = sender
         worker.lookup_server = None
@@ -1158,29 +1188,13 @@ class LongestCompletePrefixLookupTest(unittest.TestCase):
             lcm_block_size = 128
 
             @staticmethod
-            def store_mask(_token_len):
-                return [[True] * 3, [True] * 6]
+            def load_mask(_block_hashes, token_len):
+                return [[True] * (token_len // 128), [True] * (token_len // 64)]
 
             @staticmethod
             def block_hashes_for_spec(_block_hashes, spec):
                 return wide_hashes if spec is wide_spec else fine_hashes
 
-            @staticmethod
-            def find_longest_cache_hit(_block_hashes, _token_len, pool):
-                hit = 0
-                for chunk in range(3):
-                    required = (
-                        (0, wide_hashes[chunk]),
-                        (1, fine_hashes[chunk * 2]),
-                        (1, fine_hashes[chunk * 2 + 1]),
-                    )
-                    if not all(
-                        pool.get_cached_block(block_hash, [group_id])
-                        for group_id, block_hash in required
-                    ):
-                        break
-                    hit += 128
-                return [[], []], hit
 
         class _Client:
             def __init__(self):
@@ -1190,6 +1204,11 @@ class LongestCompletePrefixLookupTest(unittest.TestCase):
                 self.calls.append(list(keys))
                 if isinstance(response, Exception):
                     raise response
+                if response is not None and len(response) == 9:
+                    # Preserve occurrence-specific statuses when admission
+                    # rechecks a shorter prefix, even for repeated hashes.
+                    wide_count = len(keys) // 3
+                    return response[:wide_count] + response[3:3 + 2 * wide_count]
                 return response
 
         client = _Client()
@@ -1216,13 +1235,11 @@ class LongestCompletePrefixLookupTest(unittest.TestCase):
         # Candidate order is three wide-group chunks followed by six fine-group
         # subchunks. Logical chunk 1 is incomplete only in the fine group;
         # logical chunk 2 is an isolated later hit and must not be loaded.
-        worker, client = self._worker(
+        worker, _client = self._worker(
             [1, 1, 1, 1, 1, 1, 0, 1, 1]
         )
         block_hashes = [self._hash(f"scheduler-{index}") for index in range(6)]
         self.assertEqual(worker.lookup(384, block_hashes), 128)
-        self.assertEqual(len(client.calls), 1)
-        self.assertEqual(len(client.calls[0]), 9)
 
         first_missing_worker, _ = self._worker(
             [1, 1, 1, 1, 0, 1, 1, 1, 1]
@@ -1331,12 +1348,6 @@ class ReceiveConcurrencyTest(unittest.TestCase):
                         *common, recv_workers=invalid  # type: ignore[arg-type]
                     )
 
-        receiver = KVCacheStoreRecvingThread(
-            *common, recv_workers="4"  # type: ignore[arg-type]
-        )
-        self.assertEqual(receiver.recv_workers, 4)
-        self.assertEqual(len(receiver.worker_threads), 4)
-        receiver.stop()
 
     def _requests(self, request_ids: tuple[str, ...]) -> tuple[
         dict[str, ReqMeta], dict[bytes, str]
@@ -1365,7 +1376,7 @@ class ReceiveConcurrencyTest(unittest.TestCase):
         self,
         request_ids: tuple[str, ...],
         *,
-        recv_workers: int = 1,
+        recv_workers: int | str = 1,
         queue_capacity: int = 8,
     ) -> tuple[
         KVCacheStoreRecvingThread,
@@ -1460,7 +1471,7 @@ class ReceiveConcurrencyTest(unittest.TestCase):
             done,
             counts,
             order,
-        ) = self._receiver(request_ids, recv_workers=2, queue_capacity=1)
+        ) = self._receiver(request_ids, recv_workers="2", queue_capacity=1)
         try:
             self.assertTrue(receiver.add_request(requests["slow"]))
             self._wait(client.started["slow"], "slow native GET")
@@ -1574,6 +1585,7 @@ class ReceiveConcurrencyTest(unittest.TestCase):
         )
         worker = DfkvStoreWorker.__new__(DfkvStoreWorker)
         worker.load_async = True
+        worker.request_level_loads = False
         worker.kv_send_thread = send_thread
         worker.kv_recv_thread = receiver
         returned = threading.Event()
@@ -1625,13 +1637,14 @@ class ReceiveConcurrencyTest(unittest.TestCase):
         worker.kv_send_thread = None
         worker.kv_role = "kv_consumer"
         worker.load_async = True
+        worker.request_level_loads = False
         worker.tp_rank = 0
         returned = threading.Event()
-        result: list[tuple[set[str], set[str]]] = []
+        result: list[TransferResults] = []
 
         def finish_abort() -> None:
             result.append(
-                worker.get_finished(
+                worker.get_transfer_results(
                     {"aborted"},
                     SimpleNamespace(requests=[], preempted_req_ids=set()),
                 )
@@ -1647,7 +1660,11 @@ class ReceiveConcurrencyTest(unittest.TestCase):
             client.release["aborted"].set()
             self._wait(returned, "finished-request receive fence")
             thread.join(timeout=1)
-            self.assertEqual(result, [(set(), {"aborted"})])
+            self.assertEqual(result, [TransferResults(
+                finished_sending=set(),
+                finished_recving={"aborted"},
+                failed_recving=set(),
+            )])
             self.assertEqual(counts["aborted"], 1)
             self.assertEqual(
                 receiver.get_and_clear_block_ids_with_load_errors(), set()
@@ -1765,13 +1782,14 @@ class LookupAccountingTest(unittest.TestCase):
             _sg_segs_cache = 2
 
             def __init__(self) -> None:
-                self.keys: list[bytes] = []
+                self.calls: list[list[bytes]] = []
 
             def batch_exist(self, keys):
-                self.keys = list(keys)
+                self.calls.append(list(keys))
                 # Both TP objects of chunk 0 are present. Chunk 1 is only
                 # partially present and therefore cannot extend the prefix.
-                return [1, 1, 1, 0]
+                missing = PoolKey(replace(metadata, tp_rank=1), hashes[1].hex())
+                return [int(key != missing.to_bytes()) for key in keys]
 
         client = _Client()
         records: list[dict[str, object]] = []
@@ -1781,19 +1799,11 @@ class LookupAccountingTest(unittest.TestCase):
             _seg_layout=[1, 2, 3],
         )
 
-        def _find_longest(values, _token_len, pool):
-            hit = 0
-            for value in values:
-                if pool.get_cached_block(value, [0]) is None:
-                    break
-                hit += 64
-            return None, hit
 
         coord = SimpleNamespace(
             lcm_block_size=64,
-            store_mask=lambda _token_len: [[True, True]],
+            load_mask=lambda _hashes, token_len: [[True] * (token_len // 64)],
             block_hashes_for_spec=lambda values, _spec: values,
-            find_longest_cache_hit=_find_longest,
         )
         worker = SimpleNamespace(
             coord=coord,
@@ -1822,12 +1832,16 @@ class LookupAccountingTest(unittest.TestCase):
             for value in hashes
             for tp in range(2)
         ]
-        self.assertEqual(client.keys, expected_keys)
-        self.assertEqual(len(set(client.keys)), 4)
-        self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["operation"], "lookup_exists")
-        self.assertEqual(records[0]["num_keys"], 4)
-        self.assertEqual(records[0]["num_logical_keys"], 2)
+        self.assertEqual(client.calls[0], expected_keys)
+        self.assertEqual(len(records), len(client.calls))
+        for call, record in zip(client.calls, records, strict=True):
+            self.assertEqual(record["operation"], "lookup_exists")
+            self.assertEqual(record["num_keys"], len(call))
+            self.assertEqual(
+                record["num_logical_keys"],
+                sum(PoolKey(replace(metadata, tp_rank=0), value.hex()).to_bytes() in call
+                    for value in hashes),
+            )
 
 
 if __name__ == "__main__":

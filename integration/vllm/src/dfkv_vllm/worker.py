@@ -48,9 +48,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.distributed.kv_events import BlockStored
-from vllm.distributed.kv_transfer.kv_connector.v1.base import (
-    KVConnectorTransferResults,
-)
 from vllm.logger import init_logger
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.v1.core import kv_cache_utils
@@ -91,6 +88,7 @@ from .dfkv_client import DfkvDeviceClient, SgDescriptorBatch
 from .dfkv_utils import get_dp_engine_index
 from .metrics import DfkvStoreConnectorStats
 from .rail_affinity import physical_affinity_rank
+from .transfer_protocol import TransferResults
 from ._telemetry import config as _tcfg  # connector identity + client_register switch
 from .protocol import (
     LOOKUP_MSG,
@@ -2196,7 +2194,7 @@ class DfkvStoreWorker:
         self,
         finished_req_ids: set[str],
         meta: DfkvStoreConnectorMetadata,
-    ) -> KVConnectorTransferResults:
+    ) -> TransferResults:
         """Submit post-forward I/O and atomically collect receive outcomes.
 
         Mutable and windowed stores finish before the next model step can
@@ -2226,7 +2224,7 @@ class DfkvStoreWorker:
             done_recving, failed_recving = (
                 self.kv_recv_thread.get_and_clear_receive_results()
             )
-        return KVConnectorTransferResults(
+        return TransferResults(
             finished_sending=done_sending,
             finished_recving=done_recving,
             failed_recving=failed_recving,

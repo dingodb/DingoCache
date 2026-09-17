@@ -27,7 +27,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
-    KVConnectorTransferResults,
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
@@ -45,9 +44,19 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
-from .data import DfkvStoreConnectorMetadata, VLLM_RAW_LAYOUT
+from .data import (
+    DfkvStoreConnectorMetadata,
+    VLLM_RAW_LAYOUT,
+    requires_request_level_loads,
+)
 from .metrics import DfkvStoreConnectorStats, DfkvStorePromMetrics
 from .scheduler import DfkvStoreScheduler
+from .transfer_protocol import (
+    HAS_NATIVE_TRANSFER_RESULTS,
+    LegacyReceiveFailures,
+    TransferResults,
+    install_legacy_failure_bridge,
+)
 from .worker import DfkvStoreWorker
 
 logger = init_logger(__name__)
@@ -144,11 +153,17 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self._inflight_calls = 0
         self._shutdown = False
         self._shutdown_complete = False
+        self._legacy_failed_recving: set[str] = set()
 
         self.connector_scheduler: DfkvStoreScheduler | None = None
         self.connector_worker: DfkvStoreWorker | None = None
 
         if role == KVConnectorRole.SCHEDULER:
+            if (
+                not HAS_NATIVE_TRANSFER_RESULTS
+                and requires_request_level_loads(kv_cache_config)
+            ):
+                install_legacy_failure_bridge()
             self.connector_scheduler = DfkvStoreScheduler(
                 vllm_config, kv_cache_config
             )
@@ -361,15 +376,42 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
         finally:
             self._finish_call()
 
-    def get_transfer_results(
-        self, finished_req_ids: set[str]
-    ) -> KVConnectorTransferResults:
+    def _collect_transfer_results(self, finished_req_ids: set[str]) -> TransferResults:
+        assert self.connector_worker is not None
+        metadata = self._get_connector_metadata()
+        assert isinstance(metadata, DfkvStoreConnectorMetadata)
+        return self.connector_worker.get_transfer_results(finished_req_ids, metadata)
+
+    def get_transfer_results(self, finished_req_ids: set[str]) -> TransferResults:
+        """Return native outcomes without also publishing legacy metadata."""
         self._begin_call()
         try:
-            assert self.connector_worker is not None
-            metadata = self._get_connector_metadata()
-            assert isinstance(metadata, DfkvStoreConnectorMetadata)
-            return self.connector_worker.get_transfer_results(finished_req_ids, metadata)
+            return self._collect_transfer_results(finished_req_ids)
+        finally:
+            self._finish_call()
+
+    def get_finished(
+        self, finished_req_ids: set[str]
+    ) -> tuple[set[str], set[str]]:
+        """Adapt one outcome snapshot to the legacy completion/metadata hooks."""
+        self._begin_call()
+        try:
+            results = self._collect_transfer_results(finished_req_ids)
+            with self._shutdown_condition:
+                self._legacy_failed_recving.update(results.failed_recving)
+            return results.finished_sending, results.finished_recving
+        finally:
+            self._finish_call()
+
+    def build_connector_worker_meta(self) -> LegacyReceiveFailures | None:
+        self._begin_call()
+        try:
+            with self._shutdown_condition:
+                failed_recving = self._legacy_failed_recving
+                if not failed_recving:
+                    return None
+                self._legacy_failed_recving = set()
+            return LegacyReceiveFailures(failed_recving=failed_recving)
         finally:
             self._finish_call()
 
@@ -432,6 +474,7 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
                     errors.append(error)
         finally:
             with self._shutdown_condition:
+                self._legacy_failed_recving.clear()
                 self._shutdown_complete = True
                 self._shutdown_condition.notify_all()
 

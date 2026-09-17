@@ -28,6 +28,7 @@ from .data import (
     RequestTracker,
     requires_request_level_loads,
 )
+from .transfer_protocol import failed_requests_from_output
 from .worker import (
     LookupKeyClient,
 )
@@ -190,7 +191,7 @@ class DfkvStoreScheduler:
         """Prevent a failed remote source from being re-admitted on retry."""
         if not self.request_level_loads:
             return
-        for req_id in output.failed_recving or ():
+        for req_id in failed_requests_from_output(output):
             # A receive can finish after an aborted request's final metadata.
             # Such an output must not recreate scheduler-side request state.
             if req_id not in self._unfinished_request_ids:

@@ -19,6 +19,7 @@ from dfkv_vllm.data import (
     ReqMeta,
 )
 from dfkv_vllm.worker import DfkvStoreWorker, KVCacheStoreRecvingThread
+from dfkv_vllm.transfer_protocol import LegacyReceiveFailures
 
 
 BLOCK = 16
@@ -255,13 +256,17 @@ def connector_for(receiver, *, inline):
     connector._shutdown_condition = threading.Condition()
     connector._shutdown = False
     connector._inflight_calls = 0
+    connector._legacy_failed_recving = set()
     metadata = DfkvStoreConnectorMetadata({"load"}, set())
     metadata.add_request(request())
     connector.bind_connector_metadata(metadata)
     return connector
 
 
-def test_inline_parked_load_fences_both_sides_and_reports_once(make_receiver, monkeypatch):
+@pytest.mark.parametrize("legacy", [False, True])
+def test_inline_parked_load_fences_both_sides_and_reports_once(
+    make_receiver, monkeypatch, legacy,
+):
     client = MemoryClient("miss")
     receiver, _ = make_receiver(client)
     receiver._cuda_device = 7
@@ -276,34 +281,88 @@ def test_inline_parked_load_fences_both_sides_and_reports_once(make_receiver, mo
     connector.start_load_kv(None)
     assert client.thread_ids == [threading.get_ident()]
     assert calls_seen_at_fence == [0, 1]
-    result = connector.get_transfer_results(set())
-    assert result.finished_recving == result.failed_recving == {"load"}
-    assert result.finished_sending == set()
+    if legacy:
+        assert connector.get_finished(set()) == (set(), {"load"})
+    else:
+        result = connector.get_transfer_results(set())
+        assert result.finished_recving == result.failed_recving == {"load"}
+        assert result.finished_sending == set()
     # Repeated polling/hooks with the same metadata must not resubmit writes.
     connector.start_load_kv(None)
-    result = connector.get_transfer_results(set())
-    assert result.finished_recving == result.failed_recving == set()
+    if legacy:
+        assert connector.get_finished(set()) == (set(), set())
+        metadata = connector.build_connector_worker_meta()
+        assert isinstance(metadata, LegacyReceiveFailures)
+        assert metadata.failed_recving == {"load"}
+    else:
+        result = connector.get_transfer_results(set())
+        assert result.finished_recving == result.failed_recving == set()
+    assert connector.build_connector_worker_meta() is None
     assert client.calls == 1
     assert connector._inflight_calls == 0
     assert connector.get_block_ids_with_load_errors() == set()
 
 
-def test_pool_workers_emit_one_completion_and_never_resubmit_polled_metadata(make_receiver):
+@pytest.mark.parametrize("legacy", [False, True])
+def test_pool_workers_emit_one_completion_and_never_resubmit_polled_metadata(
+    make_receiver, legacy,
+):
     client = MemoryClient()
     receiver, pool = make_receiver(client, workers=3)
     connector = connector_for(receiver, inline=False)
     receiver.start()
     connector.start_load_kv(None)
     assert client.calls == 0
-    first = connector.get_transfer_results(set())
+    def poll():
+        if legacy:
+            return connector.get_finished(set())[1]
+        result = connector.get_transfer_results(set())
+        assert result.failed_recving == set()
+        return result.finished_recving
+
+    first = poll()
     receiver.request_queue.join()
-    second = connector.get_transfer_results(set())
-    assert first.finished_recving.isdisjoint(second.finished_recving)
-    assert first.finished_recving | second.finished_recving == {"load"}
-    assert first.failed_recving == second.failed_recving == set()
+    second = poll()
+    assert first.isdisjoint(second)
+    assert first | second == {"load"}
     assert ctypes.string_at(ctypes.addressof(pool) + BLOCK, BLOCK) == bytes([17]) * BLOCK
     assert client.calls == 1
-    assert connector.get_transfer_results(set()).finished_recving == set()
+    assert poll() == set()
+    assert connector.build_connector_worker_meta() is None
+
+
+def test_legacy_failure_metadata_unions_multiple_polls_and_drains_once(make_receiver):
+    client = MemoryClient("miss")
+    receiver, _ = make_receiver(client)
+    connector = connector_for(receiver, inline=True)
+    connector.start_load_kv(None)
+    assert connector.get_finished(set()) == (set(), {"load"})
+    receiver.load_request_sync(request("second", 2))
+    assert connector.get_finished(set()) == (set(), {"second"})
+    assert connector.get_finished(set()) == (set(), set())
+    metadata = connector.build_connector_worker_meta()
+    assert metadata.failed_recving == {"load", "second"}
+    assert connector.build_connector_worker_meta() is None
+    # A subsequent drain owns a new batch and cannot mutate the emitted packet.
+    receiver.load_request_sync(request("third", 3))
+    assert connector.get_finished(set()) == (set(), {"third"})
+    assert connector.build_connector_worker_meta().failed_recving == {"third"}
+    assert metadata.failed_recving == {"load", "second"}
+    assert client.calls == 3
+
+
+@pytest.mark.parametrize(
+    "hook", ["get_finished", "get_transfer_results", "build_connector_worker_meta"],
+)
+def test_result_hooks_reject_calls_after_shutdown(make_receiver, hook):
+    client = MemoryClient()
+    receiver, _ = make_receiver(client)
+    connector = connector_for(receiver, inline=True)
+    connector._shutdown = True
+    args = () if hook == "build_connector_worker_meta" else (set(),)
+    with pytest.raises(RuntimeError):
+        getattr(connector, hook)(*args)
+    assert client.calls == 0
 
 
 def test_connector_failure_update_is_not_skipped_without_kv_events():

@@ -882,14 +882,24 @@ lsmod | grep nvidia_peermem
 
 #### 混合模型的 KV 加载故障恢复
 
-- 混合/多 group 和单 group 非 full-attention 布局使用 vLLM 原生请求级失败
-  协议，要求引擎提供 `KVConnectorTransferResults.failed_recving`、
-  `KVConnectorOutput.failed_recving` 的完整透传，以及对
-  `WAITING_FOR_REMOTE_KVS` 请求的调度器恢复处理。请升级到具备完整 API 的
-  引擎；不再提供或要求外置 invalid-blocks 调度器补丁，也不按未经验证的
-  版本号推定支持。
-- 这些布局按 request ID 报错，`invalid_block_ids` 留空；只有原生 I/O 和 GPU
-  写入都经过终止 fence 后，才同时报告 `failed_recving` 与 `finished_recving`。
+- 一个 connector wheel 自动适配两类引擎，不按未经验证的版本号推定支持。
+  混合/多 group 和单 group 非 full-attention 布局始终按 request ID 报错：
+  **原生路径**通过 `get_transfer_results()` 返回
+  `KVConnectorTransferResults.failed_recving`，由引擎透传
+  `KVConnectorOutput.failed_recving` 并恢复等待请求，不安装调度器桥接。
+  **旧引擎路径**通过 `get_finished()` 收集同一份 worker 结果，将失败 ID
+  保存在 `build_connector_worker_meta()` 返回的 worker metadata 中；多次
+  poll 不会丢失尚未上报的失败，原生路径不会重复发送这份 metadata。
+- 旧引擎必须具备 `KVConnectorWorkerMetadata.aggregate()` 及其传输、executor
+  跨 rank receive-completion 聚合，以及调度器 `update_from_output`、
+  `_handle_invalid_blocks`、等待请求恢复和 load-failure policy 接口。
+  仅在旧引擎的 scheduler-role connector 使用请求级布局时，自动安装经过
+  能力检查的进程内桥接；缺失所需能力时启动明确报错。无需修改已安装的
+  vLLM 源文件，也无需手动打引擎补丁，不影响普通 block error 或其他连接器。
+  桥接跨 step 保留失败，直到聚合后的 `finished_recving` 确认所有 rank 完成，
+  才按请求身份交给既有恢复/终止路径，绝不伪造或扫描混合布局的 block ID。
+- 这些布局的 worker `invalid_block_ids` 留空；只有原生 I/O 和 GPU
+  写入都经过终止 fence 后，才发布失败与 receive completion。
   `kv_load_failure_policy="recompute"` 时，引擎释放失败分配并重新本地准入；
   dfkv 丢弃旧 lookup、load spec 和 tracker，按新分配及实际计算前缀重建 SAVE
   状态。失败请求在本次生命周期内（包括后续抢占）不再查询远端命中，避免同一

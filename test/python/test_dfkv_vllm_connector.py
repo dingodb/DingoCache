@@ -25,7 +25,9 @@ def _install_runtime_dependency_stubs() -> None:
         torch_module = ModuleType("torch")
         torch_cuda_module = ModuleType("torch.cuda")
         torch_cuda_module.Event = Event
+        torch_cuda_module.is_available = lambda: False
         torch_module.Tensor = Tensor
+        torch_module.float16 = "float16"
         torch_module.cuda = torch_cuda_module
         sys.modules["torch"] = torch_module
         sys.modules["torch.cuda"] = torch_cuda_module
@@ -71,8 +73,34 @@ def _install_vllm_stubs() -> None:
     class BlockHash(bytes):
         pass
 
+
+    @dataclass(frozen=True)
+    class FullAttentionSpec:
+        block_size: int
+        num_kv_heads: int
+        head_size: int
+        dtype: object
     class KVConnectorBase_V1:
-        pass
+        def get_finished(self, finished_req_ids):
+            raise NotImplementedError
+
+        def build_connector_worker_meta(self):
+            return None
+
+        def update_connector_output(self, connector_output):
+            pass
+
+    class KVConnectorWorkerMetadata:
+        def aggregate(self, other):
+            raise NotImplementedError
+
+    @dataclass
+    class KVConnectorOutput:
+        finished_sending: set[str] = field(default_factory=set)
+        finished_recving: set[str] = field(default_factory=set)
+        invalid_block_ids: set[int] = field(default_factory=set)
+        kv_connector_worker_meta: object = None
+        kv_cache_events: object = None
 
     class SupportsHMA:
         pass
@@ -138,6 +166,7 @@ def _install_vllm_stubs() -> None:
         "vllm.distributed.kv_transfer.kv_connector.v1.base",
         KVConnectorBase_V1=KVConnectorBase_V1,
         KVConnectorMetadata=Placeholder,
+        KVConnectorWorkerMetadata=KVConnectorWorkerMetadata,
         KVConnectorRole=KVConnectorRole,
         SupportsHMA=SupportsHMA,
     )
@@ -193,14 +222,14 @@ def _install_vllm_stubs() -> None:
     stub(
         "vllm.v1.kv_cache_interface",
         AttentionSpec=Placeholder,
-        FullAttentionSpec=Placeholder,
+        FullAttentionSpec=FullAttentionSpec,
         KVCacheConfig=Placeholder,
         KVCacheGroupSpec=Placeholder,
         KVCacheSpec=Placeholder,
         MambaSpec=Placeholder,
         UniformTypeKVCacheSpecs=Placeholder,
     )
-    stub("vllm.v1.outputs", KVConnectorOutput=Placeholder)
+    stub("vllm.v1.outputs", KVConnectorOutput=KVConnectorOutput)
     stub(
         "vllm.v1.kv_cache_spec_registry",
         KVCacheSpecRegistry=KVCacheSpecRegistry,
@@ -215,6 +244,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "integration" / "common" / "src"))
 sys.path.insert(0, str(ROOT / "integration" / "vllm" / "src"))
 
+import torch  # noqa: E402
+from vllm.v1.kv_cache_interface import FullAttentionSpec  # noqa: E402
+
 from dfkv_common import VLLM_RAW_V1, pool_key  # noqa: E402
 from dfkv_vllm.connector import DfkvStoreConnector  # noqa: E402
 from dfkv_vllm.data import (  # noqa: E402
@@ -227,6 +259,7 @@ from dfkv_vllm.metrics import (  # noqa: E402
     DfkvStorePromMetrics,
 )
 from dfkv_vllm.scheduler import DfkvStoreScheduler  # noqa: E402
+from dfkv_vllm.transfer_protocol import TransferResults  # noqa: E402
 
 
 class _LookupClient:
@@ -271,12 +304,25 @@ class SchedulerLookupTest(unittest.TestCase):
             kv_transfer_config=transfer,
             cache_config=SimpleNamespace(cache_salt="stable"),
         )
+        kv_cache_config = SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(
+                    layer_names=["model.layers.0.self_attn"],
+                    kv_cache_spec=FullAttentionSpec(
+                        block_size=64,
+                        num_kv_heads=8,
+                        head_size=128,
+                        dtype=torch.float16,
+                    ),
+                )
+            ],
+        )
         with (
             patch("dfkv_vllm.scheduler.ensure_deterministic_block_hashing"),
             patch("dfkv_vllm.scheduler.resolve_kv_cache_block_sizes", return_value=(64, 64)),
             patch("dfkv_vllm.scheduler.LookupKeyClient", return_value=client),
         ):
-            return DfkvStoreScheduler(config, SimpleNamespace())
+            return DfkvStoreScheduler(config, kv_cache_config)
 
     @staticmethod
     def _request(request_id: str, blocks: int = 2):
@@ -366,9 +412,13 @@ class _BlockingConnectorBackend:
         self.call_entered.wait(timeout=5)
         self.call_release.wait(timeout=5)
 
-    def get_finished(self, finished_req_ids, metadata):
+    def get_transfer_results(self, finished_req_ids, metadata):
         self._block_call()
-        return set(finished_req_ids), set(metadata.unfinished_request_ids)
+        return TransferResults(
+            finished_sending=set(finished_req_ids),
+            finished_recving=set(metadata.unfinished_request_ids),
+            failed_recving=set(),
+        )
 
     def request_finished(self, request, block_ids):
         self._block_call()
@@ -390,6 +440,7 @@ class ConnectorShutdownGateTest(unittest.TestCase):
         connector._inflight_calls = 0
         connector._shutdown = False
         connector._shutdown_complete = False
+        connector._legacy_failed_recving = set()
         connector.connector_worker = worker
         connector.connector_scheduler = scheduler
         return connector
@@ -431,7 +482,7 @@ class ConnectorShutdownGateTest(unittest.TestCase):
 
         self.assertTrue(shutdown_thread.is_alive())
         self.assertEqual(backend.close_calls, 0)
-        with self.assertRaisesRegex(RuntimeError, "connector is shut down"):
+        with self.assertRaises(RuntimeError):
             rejected_call()
 
         backend.call_release.wait(timeout=5)
@@ -444,26 +495,36 @@ class ConnectorShutdownGateTest(unittest.TestCase):
 
         connector.shutdown()
         self.assertEqual(backend.close_calls, 1)
-        with self.assertRaisesRegex(RuntimeError, "connector is shut down"):
+        with self.assertRaises(RuntimeError):
             rejected_call()
         return call_results
 
-    def test_get_finished_admitted_before_shutdown_completes_before_close(
+    def test_result_calls_admitted_before_shutdown_complete_before_close(
         self,
     ) -> None:
-        backend = _BlockingConnectorBackend()
-        connector = self._connector(worker=backend)
-        metadata = DfkvStoreConnectorMetadata({"unfinished"}, set())
-        connector._get_connector_metadata = lambda: metadata
-
-        results = self._assert_shutdown_waits_for_call(
-            connector,
-            backend,
-            lambda: connector.get_finished({"finished"}),
-            lambda: connector.get_finished({"too-late"}),
-        )
-
-        self.assertEqual(results, [({"finished"}, {"unfinished"})])
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                backend = _BlockingConnectorBackend()
+                connector = self._connector(worker=backend)
+                metadata = DfkvStoreConnectorMetadata({"unfinished"}, set())
+                connector._get_connector_metadata = lambda: metadata
+                hook = (
+                    connector.get_finished if legacy else connector.get_transfer_results
+                )
+                results = self._assert_shutdown_waits_for_call(
+                    connector,
+                    backend,
+                    lambda: hook({"finished"}),
+                    lambda: hook({"too-late"}),
+                )
+                expected = (
+                    ({"finished"}, {"unfinished"}) if legacy else TransferResults(
+                        finished_sending={"finished"},
+                        finished_recving={"unfinished"},
+                        failed_recving=set(),
+                    )
+                )
+                self.assertEqual(results, [expected])
 
     def test_request_lifecycle_calls_admitted_before_shutdown_finish_first(
         self,

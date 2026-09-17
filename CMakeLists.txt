@@ -264,6 +264,14 @@ if(DFKV_BUILD_TESTS)
               -p test_client_ranks.py)
     set_tests_properties(python_vllm_client_ranks PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src:${CMAKE_CURRENT_SOURCE_DIR}/integration/vllm/src")
+    add_test(NAME python_vllm_connector_lifecycle
+      COMMAND ${PYTHON3}
+              ${CMAKE_CURRENT_SOURCE_DIR}/test/python/test_dfkv_vllm_connector.py
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME python_vllm_worker_lifecycle
+      COMMAND ${PYTHON3}
+              ${CMAKE_CURRENT_SOURCE_DIR}/test/python/test_dfkv_vllm_worker.py
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     # Shared telemetry layer: pure-python, no build/lib needed (OTel-push test
     # self-skips when the SDK is absent). Includes the vendored-copy drift guard.
     add_test(NAME python_telemetry
