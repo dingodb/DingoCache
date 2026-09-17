@@ -583,7 +583,7 @@ def test_mutable_state_cannot_advance_before_its_put_finishes(hybrid_workers, mo
     metadata = SimpleNamespace(requests=[request], preempted_req_ids=set())
 
     def next_model_step():
-        producer.get_finished(set(), metadata)
+        producer.get_transfer_results(set(), metadata)
         buffers["state"][3].fill_(99)
         advanced.set()
 
@@ -619,13 +619,13 @@ def test_same_step_resume_save_releases_finished_blocks(hybrid_workers, monkeypa
     )
     metadata = SimpleNamespace(requests=[request], preempted_req_ids={request.req_id})
     producer.handle_preemptions(metadata)
-    producer.get_finished(set(), metadata)
+    producer.get_transfer_results(set(), metadata)
     key = PoolKey(producer.token_dbs[1].metadata, hashes[0].hex()).to_bytes()
     assert objects[producer.client.namespace, key] == bytes([30]) * 16
-    done, _ = producer.get_finished(
+    result = producer.get_transfer_results(
         {request.req_id}, SimpleNamespace(requests=[], preempted_req_ids=set()),
     )
-    assert done == {request.req_id}
+    assert result.finished_sending == {request.req_id}
 
 
 def test_cancelled_save_generation_cannot_revive(hybrid_workers, monkeypatch):
@@ -680,7 +680,7 @@ def test_cancelled_save_generation_cannot_revive(hybrid_workers, monkeypatch):
     new_key = PoolKey(producer.token_dbs[0].metadata, hashes[1].hex()).to_bytes()
     assert (producer.client.namespace, old_key) not in objects
     assert objects[producer.client.namespace, new_key] == bytes([22]) * BLOCK
-    done, _ = producer.get_finished(
+    result = producer.get_transfer_results(
         {fresh.req_id}, SimpleNamespace(requests=[], preempted_req_ids=set()),
     )
-    assert done == {fresh.req_id}
+    assert result.finished_sending == {fresh.req_id}

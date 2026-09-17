@@ -17,6 +17,7 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
 from ._determinism import ensure_deterministic_block_hashing
@@ -25,6 +26,7 @@ from .data import (
     DfkvStoreConnectorMetadata,
     ReqMeta,
     RequestTracker,
+    requires_request_level_loads,
 )
 from .worker import (
     LookupKeyClient,
@@ -66,6 +68,7 @@ class DfkvStoreScheduler:
         self.load_async = extra_config.get("load_async", True)
         if not isinstance(self.load_async, bool):
             raise ValueError("dfkv connector: load_async must be a boolean")
+        self.request_level_loads = requires_request_level_loads(kv_cache_config)
         self.lookup_async = extra_config.get("lookup_async", False)
         self.client = LookupKeyClient(vllm_config)
         self._closed = False
@@ -82,6 +85,7 @@ class DfkvStoreScheduler:
         self._unfinished_requests: dict[str, tuple[Request, tuple[list[int], ...]]] = {}
         self._unfinished_request_ids: set[str] = set()
         self._allocated_req_ids: set[str] = set()
+        self._failed_load_req_ids: set[str] = set()
 
     def get_num_new_matched_tokens(
         self,
@@ -93,7 +97,10 @@ class DfkvStoreScheduler:
         Returns ``(None, False)`` while an asynchronous lookup is pending so
         vLLM retries the request on a later scheduler step.
         """
-        if getattr(request, "skip_reading_prefix_cache", False):
+        if (
+            request.request_id in self._failed_load_req_ids
+            or getattr(request, "skip_reading_prefix_cache", False)
+        ):
             self.client.discard(request.request_id)
             self.load_specs.pop(request.request_id, None)
             return 0, False
@@ -141,7 +148,9 @@ class DfkvStoreScheduler:
             can_load=False,
         )
 
-        return need_to_allocate, self.load_async
+        # Request-level failure recovery only applies to waiting requests.
+        # Parking admission is independent of whether the worker overlaps I/O.
+        return need_to_allocate, self.load_async or self.request_level_loads
 
     def update_state_after_alloc(
         self,
@@ -177,6 +186,27 @@ class DfkvStoreScheduler:
 
         self.load_specs[request.request_id].can_load = True
 
+    def update_connector_output(self, output: KVConnectorOutput) -> None:
+        """Prevent a failed remote source from being re-admitted on retry."""
+        if not self.request_level_loads:
+            return
+        for req_id in output.failed_recving or ():
+            # A receive can finish after an aborted request's final metadata.
+            # Such an output must not recreate scheduler-side request state.
+            if req_id not in self._unfinished_request_ids:
+                continue
+            self._failed_load_req_ids.add(req_id)
+            self.client.discard(req_id)
+            self.load_specs.pop(req_id, None)
+            self._request_trackers.pop(req_id, None)
+            self._unfinished_requests.pop(req_id, None)
+            self._allocated_req_ids.discard(req_id)
+            # Upstream frees failed-load blocks and re-admits without emitting
+            # a new preemption. MRV1 may use scheduled_cached_reqs on that retry;
+            # rebuild its tracker from the new allocation and computed prefix,
+            # never from the failed load's advertised token count/block table.
+            self._preempted_req_ids.add(req_id)
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
@@ -190,6 +220,7 @@ class DfkvStoreScheduler:
             self._unfinished_requests.pop(finished_req_id, None)
             self._unfinished_request_ids.discard(finished_req_id)
             self._preempted_req_ids.discard(finished_req_id)
+            self._failed_load_req_ids.discard(finished_req_id)
 
         preempted_ids = scheduler_output.preempted_req_ids or set()
         self._preempted_req_ids.update(preempted_ids)
@@ -375,6 +406,8 @@ class DfkvStoreScheduler:
     ) -> tuple[bool, dict[str, Any] | None]:
         """Determine whether to delay freeing blocks for async save."""
         self.client.discard(request.request_id)
+        self._failed_load_req_ids.discard(request.request_id)
+        self.load_specs.pop(request.request_id, None)
         if self.kv_role == "kv_consumer":
             return False, None
         tracker = self._request_trackers.get(request.request_id)

@@ -298,7 +298,7 @@ class SynchronousLoadTest(unittest.TestCase):
         self.assertEqual(load.load_spec.token_len, 128)
         self.assertEqual(skip.load_spec.token_len, 0)
 
-    def test_async_mode_defers_load_to_get_finished(self):
+    def test_async_mode_defers_load_to_result_collection(self):
         worker = DfkvStoreWorker.__new__(DfkvStoreWorker)
         worker.load_async = True
         worker.kv_recv_thread = self.FakeRecv()

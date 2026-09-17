@@ -31,6 +31,18 @@ logger = init_logger(__name__)
 # they must cold-miss rather than enter the current restore path.
 VLLM_RAW_LAYOUT = b"vllm-multiwr-v4"
 
+
+def requires_request_level_loads(kv_cache_config) -> bool:
+    """Use request identities when physical groups cannot share a block grid."""
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+    groups = getattr(
+        kv_cache_config, "transfer_groups", kv_cache_config.kv_cache_groups
+    )
+    return len(groups) > 1 or any(
+        not isinstance(group.kv_cache_spec, FullAttentionSpec) for group in groups
+    )
+
 def key_diagnostic_label(key: bytes) -> str:
     """Return the standard non-reversible diagnostic label for a store key."""
     try:
