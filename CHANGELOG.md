@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### v2.27.2 — Legacy and native vLLM compatibility
+
+- Restore one connector package for engines with the legacy `get_finished`
+  lifecycle and engines with native `get_transfer_results` support.
+- On legacy V1 engines, carry failed request identities through supported
+  worker metadata and enter the existing scheduler recovery/error path only
+  after all participating workers finish. No fabricated block IDs or installed
+  engine source-file patches are used.
+- Preserve originating-child routing through nested `MultiConnector` metadata;
+  do not retain or replay other connectors' historical metadata.
+- Keep serialized hybrid loads parked and fenced, quarantine failed external
+  hits, and preserve cancellation/deferred-free ownership. Native engines
+  continue to use their native request-failure protocol.
+- Register CPU connector and worker lifecycle regressions in CTest, and cover
+  old/native scheduler and executor behavior in their actual engine runtimes.
+- Correct v2.27.1's native-only connector compatibility restriction. Legacy
+  support requires the V1 worker-metadata, completion aggregation and scheduler
+  recovery hooks; arbitrary V0 engines or partial protocol backports are not
+  implied. No functional C++ changes, ABI/wire changes or stored-key migration.
+
 ### v2.27.1 — Request-level hybrid KV load recovery
 
 - Adopt vLLM's native `KVConnectorTransferResults` protocol for hybrid and
