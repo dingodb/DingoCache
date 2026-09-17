@@ -41,6 +41,19 @@ device pointers. Set `DFKV_RDMA=1` in every engine process. Construction rejects
 and closes any native handle whose reported transport is not `rdma`; there is no
 TCP or host-bounce fallback for this connector.
 
+Hybrid/multi-group caches and single-group non-full-attention caches require
+vLLM's native request-level load-failure protocol:
+`KVConnectorTransferResults.failed_recving`, its propagation through
+`KVConnectorOutput.failed_recving`, and scheduler recovery of failed
+`WAITING_FOR_REMOTE_KVS` requests. Upgrade to an engine exposing that complete
+API; no out-of-tree invalid-block scheduler patch is supported or required.
+The connector reports failed request IDs together with receive completion only
+after native I/O and GPU writes are fenced, leaving block-ID errors empty for
+these layouts. With `kv_load_failure_policy="recompute"`, the engine releases the
+failed allocation and retries locally; dfkv bypasses the failed remote source
+for the remainder of that request, including subsequent preemptions. The engine's
+`"fail"` policy terminates the affected request instead.
+
 ## Environment variables (engine process)
 
 Read by `libdfkv.so` (the C client) and the connector, so set them in **every**
@@ -87,7 +100,7 @@ LMCache connector access logs, so one setting covers every integration. Format:
 | `batch_concurrency` | `0`=auto | client fan-out for batch ops; the real throughput lever (depth is flat). Auto = `min(max(nodes, 8), 32)`: 8-way parallel on single-node, one-per-node on multi-node. Set >0 to pin a fixed value. |
 | `rail_affinity` | `False` | Bind each vLLM worker process to a primary rail selected by world-group local rank; requires an ordered multi-rail `DFKV_RDMA_DEV`. |
 | `rail_affinity_fallbacks` | `1` | Number of ordered neighboring fallback rails when affinity is enabled. `0` keeps strict one-rank/one-rail; values above the available rail count are bounded. |
-| `load_async` | `True` | `True` returns `WAITING_FOR_REMOTE_KVS` and overlaps GPUDirect loads with unrelated model work. `False` performs each requested load synchronously in `start_load_kv`, before the forward pass. Use `False` for hybrid state-cache models when the engine cannot guarantee that remote writes target blocks disjoint from concurrent compute. |
+| `load_async` | `True` | Controls I/O execution, not hybrid admission. `True` overlaps GPUDirect loads with unrelated model work. `False` executes serialized loads on the model thread, fences preceding GPU work before GET, and fences completion before returning; depending on the runner, this may occur after the preceding forward. Hybrid/multi-group and non-full-attention requests still enter `WAITING_FOR_REMOTE_KVS` in either mode, so failed KV is never consumed by their forward pass. Single-group full-attention `False` loads retain synchronous admission. Use `False` for hybrid state-cache models when remote writes cannot safely overlap compute. |
 | `transfer_queue_capacity` | `256` | Maximum queued requests in each direction (`1..65536`). All receive workers consume one shared receive queue of this capacity; capacity is not multiplied by `recv_workers`. Submission is non-blocking: a full queue rejects new saves as completed (releasing finish/free fences) and rejects new loads as load errors (forcing recompute), so overload cannot grow memory or pin blocks indefinitely. Invalid or out-of-range values abort connector construction. |
 | `recv_workers` | `1` | Receive/load worker count (`1..32`). Workers consume the shared bounded receive queue and may execute independent native GETs concurrently. Invalid, boolean, or out-of-range values abort connector construction. |
 | `load_window_keys` | `0` (disabled) | Maximum keys per native GET window (`0..65536`). Use a value whose worst-case result bytes fit inside the node-dedup GPU arena. Windowing lets follower ranks consume published results before the dedup wait deadline instead of re-fetching a large replicated-MLA batch. |

@@ -882,19 +882,23 @@ lsmod | grep nvidia_peermem
 
 #### 混合模型的 KV 加载故障恢复
 
-- vLLM 上游 `_handle_invalid_blocks` 的 `(req_block_ids,) = ...` 解包在多 KV-group
-  模型上必然抛 `ValueError`，导致 EngineCore 死亡。随包提供
-  [混合 invalid-blocks 修复补丁](../integration/vllm/patches/vllm-hybrid-invalid-blocks.patch)：
-  hybrid 请求按 per-group 外层 spec（AttentionSpec 乘 DCP）计算受影响前缀，
-  命中失败时使所有参与 group 的相关 block hash 失效（仅 hash，不释放 DMA 中
-  buffer），`skip_reading_prefix_cache=True` 后复用 `_preempt_request` 回到
-  waiting 队列本地重算；async 请求在 finished_recving 之后由既有
-  `_update_waiting_for_remote_kv` 释放。单 group 请求保留原最长有效前缀与
-  共享 block 优化。fail 策略仅上报受影响请求与 eviction 集合，不做重放。
-  dfkv 调度器同步配合：重放请求查询前丢弃残余 lookup/load_spec 并返回
-  `(0, False)`，不会反复撞同一外部缓存。补丁针对实测镜像
-  `vllm/vllm-openai:glm53-flash` 的 `vllm/v1/core/sched/scheduler.py`，应用前先
-  `git apply --check`；不可盲目覆盖其它引擎版本。
+- 混合/多 group 和单 group 非 full-attention 布局使用 vLLM 原生请求级失败
+  协议，要求引擎提供 `KVConnectorTransferResults.failed_recving`、
+  `KVConnectorOutput.failed_recving` 的完整透传，以及对
+  `WAITING_FOR_REMOTE_KVS` 请求的调度器恢复处理。请升级到具备完整 API 的
+  引擎；不再提供或要求外置 invalid-blocks 调度器补丁，也不按未经验证的
+  版本号推定支持。
+- 这些布局按 request ID 报错，`invalid_block_ids` 留空；只有原生 I/O 和 GPU
+  写入都经过终止 fence 后，才同时报告 `failed_recving` 与 `finished_recving`。
+  `kv_load_failure_policy="recompute"` 时，引擎释放失败分配并重新本地准入；
+  dfkv 丢弃旧 lookup、load spec 和 tracker，按新分配及实际计算前缀重建 SAVE
+  状态。失败请求在本次生命周期内（包括后续抢占）不再查询远端命中，避免同一
+  广告命中不断触发加载—失败循环；最终完成时清理此状态。`"fail"` 策略由引擎
+  终止受影响请求。单 group full-attention 保留既有 block-level 错误恢复。
+- `load_async=False` 只选择串行模型线程 I/O，不取消上述请求的
+  `WAITING_FOR_REMOTE_KVS` 准入。连接器在 GET 前等待先前 GPU 工作完成，
+  GET 后再完成写入 fence；按 runner 调用顺序可能处于前一个 forward 之后，
+  但不与 GPU compute 重叠。失败请求本身在恢复完成前不执行 forward。
 
 ### 3.2 验证
 
@@ -940,7 +944,7 @@ namespace/key 不一致是预期 cold miss。**空环 / MDS 不可达**可直接
 | `batch_concurrency` | `8` | **大池可调高到 ≈ 节点数** | 跨节点 fan-out，**真正的吞吐杠杆**（depth 是平的） |
 | `rail_affinity` | `False` | 多 rank、多 rail 生产设 `true` | 按 vLLM world-group per-host `local_rank` 选择 primary；在 native client 创建前设置每进程独立 rail 环境 |
 | `rail_affinity_fallbacks` | `1` | `1` | 相邻有序 fallback 数；`0`=严格单 rail，超出可用 rail 数时自动收敛 |
-| `load_async` | `True` | 普通 attention 保持 True；hybrid recurrent 模型设 `False` | `False` 在 forward 前同步完成 load，避免 recurrent-state compute 与远端 GPU 写重叠 |
+| `load_async` | `True` | 普通 attention 保持 True；hybrid recurrent 模型设 `False` | `False` 在模型线程串行执行 load，GET 前后均等待 GPU fence，可能位于前一个 forward 之后；hybrid/多 group 和非 full-attention 请求仍进入 `WAITING_FOR_REMOTE_KVS`，不会消费失败 KV。单 group full-attention 保留同步准入。 |
 | `transfer_queue_capacity` | `256` | 保持默认，按压测调 | 每个 worker、每个方向的排队上限（`1..65536`）。满队列时非阻塞拒绝新任务：save 立即释放 finish/free fence，load 标记失败并重算；非法值启动即失败。 |
 | `recv_workers` | `1` | 从 `1` 起压测 | 共享有界 receive queue 的 GET worker 数（`1..32`）；仅在 queue wait 持续升高且后端仍有余量时增加。 |
 | `load_window_keys` | `0`（关闭） | 长上下文 replicated-MLA 按压测设置 | 单次 native GET window 的最大 key 数（`0..65536`）。窗口结果应能放入 `DFKV_NODE_DEDUP_GPU_ARENA_MB`，且在 `DFKV_NODE_DEDUP_WAIT_MS` 内完成，避免 follower rank 超时后重复读取同一批 KV。 |

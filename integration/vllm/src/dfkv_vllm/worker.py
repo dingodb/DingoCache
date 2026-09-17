@@ -48,6 +48,9 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.distributed.kv_events import BlockStored
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorTransferResults,
+)
 from vllm.logger import init_logger
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.v1.core import kv_cache_utils
@@ -81,6 +84,7 @@ from .data import (
     PoolKey,
     ReqMeta,
     key_diagnostic_label,
+    requires_request_level_loads,
     split_block_contiguous_runs,
 )
 from .dfkv_client import DfkvDeviceClient, SgDescriptorBatch
@@ -299,7 +303,7 @@ def _logical_block_ids(
 # Each direction owns one queue. ReqMeta objects retain block/hash lists and
 # CUDA-event references, so an unbounded queue can grow host memory and keep
 # scheduler-owned GPU blocks pinned indefinitely when the native client slows.
-# Reject-new is deliberately non-blocking: blocking get_finished() on queue
+# Reject-new is deliberately non-blocking: blocking result collection on queue
 # capacity would prevent vLLM from observing completions and freeing blocks.
 DEFAULT_TRANSFER_QUEUE_CAPACITY = 256
 MAX_TRANSFER_QUEUE_CAPACITY = 65536
@@ -424,6 +428,7 @@ class _ReceiveRequestState:
     phase: str = "queued"
     cancel_requested: bool = False
     fail_closed_on_cancel: bool = False
+    failed: bool = False
     completion: threading.Event = dataclasses.field(default_factory=threading.Event)
 
 
@@ -963,6 +968,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         load_window_keys: int = DEFAULT_LOAD_WINDOW_KEYS,
         load_window_min_keys: int = DEFAULT_LOAD_WINDOW_MIN_KEYS,
         record_pool_sample: Callable[[str, int], None] | None = None,
+        request_level_loads: bool = False,
     ):
         super().__init__(
             client,
@@ -987,6 +993,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             load_window_min_keys
         )
         self.client_provider = client_provider
+        self.request_level_loads = request_level_loads
+        self._failed_requests: set[str] = set()
         self._invalid_block_ids_lock = threading.Lock()
         self._invalid_block_ids: set[int] = set()
         self.coord = coord
@@ -1057,7 +1065,6 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                         return False
                     self._request_states[request.req_id] = state
                     self._terminalize_locked(state, failed=True)
-                    self._request_states.pop(request.req_id, None)
         logger.warning(
             "%s rejected request %s: transfer queue %s (capacity=%d)",
             self.name,
@@ -1067,15 +1074,22 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         )
         return False
 
-    def get_and_clear_finished_requests(self) -> set[str]:
+    def get_and_clear_receive_results(self) -> tuple[set[str], set[str]]:
+        """Drain terminal completions and failures in one atomic snapshot."""
         with self._request_states_lock:
             with self.done_task_lock:
-                finished = self.finished_requests.copy()
-                self.finished_requests.clear()
+                finished = self.finished_requests
+                failed = self._failed_requests
+                self.finished_requests = set()
+                self._failed_requests = set()
             for req_id in finished:
                 state = self._request_states.get(req_id)
                 if state is not None and state.phase == "terminal":
                     self._request_states.pop(req_id, None)
+        return finished, failed
+
+    def get_and_clear_finished_requests(self) -> set[str]:
+        finished, _ = self.get_and_clear_receive_results()
         return finished
 
     def cancel_requests(
@@ -1116,13 +1130,16 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         req_id = req.req_id if req is not None else None
         state.phase = "terminal"
         state.request = None
-        if failed and state.block_ids:
+        failed = failed or state.failed
+        if failed and not self.request_level_loads and state.block_ids:
             with self._invalid_block_ids_lock:
                 self._invalid_block_ids.update(state.block_ids)
         state.block_ids = ()
         if req_id is not None:
             with self.done_task_lock:
                 self.finished_requests.add(req_id)
+                if failed and self.request_level_loads:
+                    self._failed_requests.add(req_id)
         state.completion.set()
         return True
 
@@ -1206,6 +1223,15 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     for state in self._request_states.values():
                         if state.phase == "active":
                             state.cancel_requested = True
+            # Inline model-thread loads share the ownership fence but are not
+            # among worker_threads; shutdown must also join those native calls.
+            with self._request_states_lock:
+                active_completions = [
+                    state.completion for state in self._request_states.values()
+                    if state.phase == "active"
+                ]
+            for completion in active_completions:
+                completion.wait()
             if self.ident is None:
                 while True:
                     try:
@@ -1240,19 +1266,60 @@ class KVCacheStoreRecvingThread(KVTransferThread):
     close = stop
 
 
-    def _add_load_error_block_ids(self, block_ids: list[int]) -> None:
-        with self._invalid_block_ids_lock:
-            self._invalid_block_ids.update(block_ids)
+    def _record_load_failure(self, req_id: str, block_ids: list[int]) -> None:
+        if self.request_level_loads:
+            with self._request_states_lock:
+                self._request_states[req_id].failed = True
+        else:
+            with self._invalid_block_ids_lock:
+                self._invalid_block_ids.update(block_ids)
 
     def get_and_clear_block_ids_with_load_errors(self) -> set[int]:
+        if self.request_level_loads:
+            return set()
         with self._invalid_block_ids_lock:
             invalid_block_ids = self._invalid_block_ids.copy()
             self._invalid_block_ids.clear()
         return invalid_block_ids
 
     def load_request_sync(self, request: ReqMeta) -> None:
-        """Load one request on the model thread before its forward pass."""
-        self._handle_request(request)
+        """Load on the model thread; parked requests report outcomes later."""
+        if not self.request_level_loads:
+            self._handle_request(request)
+            return
+        with self._stop_lock:
+            with self._request_states_lock:
+                if request.req_id in self._request_states:
+                    return
+                state = _ReceiveRequestState(
+                    request=request,
+                    block_ids=tuple(
+                        block for group in request.block_ids for block in group
+                    ),
+                    phase="active",
+                )
+                self._request_states[request.req_id] = state
+                if not self._accepting:
+                    self._terminalize_locked(state, failed=True)
+                    return
+        failed = False
+        try:
+            if self._cuda_device is not None:
+                # A runner may defer this hook until after forward for parked
+                # loads. Finish outstanding kernels before modifying the pool.
+                torch.cuda.synchronize(self._cuda_device)
+            self._handle_request(request)
+        except Exception:
+            failed = True
+            raise
+        finally:
+            with self._request_states_lock:
+                self._terminalize_locked(
+                    state,
+                    failed=failed or (
+                        state.cancel_requested and state.fail_closed_on_cancel
+                    ),
+                )
 
 
     def _handle_request(self, req_meta: ReqMeta):
@@ -1360,7 +1427,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                         f"keys={len(rotated_keys)} hits={len(hits)} lens={len(lens)}"
                     )
             except Exception as e:
-                self._add_load_error_block_ids(rotated_block_ids)
+                self._record_load_failure(req_id, rotated_block_ids)
                 self._record_operation(
                     "load_get",
                     load_get_start,
@@ -1380,22 +1447,20 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                         e,
                     )
                 return
+            finally:
+                # Fence even a failed/partial native batch before publishing
+                # its terminal outcome and allowing destination block reuse.
+                if (
+                    os.environ.get("DFKV_GPU_LOAD_FENCE", "1") == "1"
+                    and self._cuda_device is not None
+                ):
+                    torch.cuda.synchronize(self._cuda_device)
 
             failed_indices = [
                 i
                 for i, (hit, got_len) in enumerate(zip(hits, lens, strict=True))
                 if hit != 1 or got_len != chunk_totals[i]
             ]
-            # GPUDirect RDMA ordering fence: the CQ completion proves
-            # transmission, not arrival of the BAR writes in device memory;
-            # drivers reject CU_POINTER_ATTRIBUTE_SYNC_MEMOPS on VMM pools, so
-            # synchronize the device before the scheduler launches kernels over
-            # the loaded blocks. DFKV_GPU_LOAD_FENCE=0 disables.
-            if (
-                os.environ.get("DFKV_GPU_LOAD_FENCE", "1") == "1"
-                and self._cuda_device is not None
-            ):
-                torch.cuda.synchronize(self._cuda_device)
             failed_block_ids = [rotated_block_ids[i] for i in failed_indices]
             self._record_operation(
                 "load_get",
@@ -1414,7 +1479,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 len(failed_block_ids),
             )
             if failed_block_ids:
-                self._add_load_error_block_ids(failed_block_ids)
+                self._record_load_failure(req_id, failed_block_ids)
                 if logger.isEnabledFor(logging.WARNING):
                     failed_detail = [
                         (
@@ -1438,12 +1503,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             # Any unexpected failure in the load path -> recompute this
             # request's blocks (never hang vLLM's WAITING_FOR_REMOTE_KVS).
             logger.error("dfkv recv thread failed for req %s: %s", req_id, e)
-            try:
-                self._add_load_error_block_ids(
-                    [b for ids in req_meta.block_ids for b in ids]
-                )
-            except Exception:
-                pass
+            self._record_load_failure(
+                req_id, [b for ids in req_meta.block_ids for b in ids]
+            )
     def _cancel_request(self, req_meta: Any) -> None:
         self.cancel_requests(
             (req_meta.req_id,), wait=False, fail_closed=True
@@ -1552,9 +1614,10 @@ class DfkvStoreWorker:
         self.load_async = extra.get("load_async", True)
         if not isinstance(self.load_async, bool):
             raise ValueError("dfkv connector: load_async must be a boolean")
+        self.request_level_loads = requires_request_level_loads(kv_cache_config)
         logger.info(
             "dfkv load mode: %s",
-            "async-overlap" if self.load_async else "synchronous-before-forward",
+            "async-overlap" if self.load_async else "serialized-model-thread",
         )
         self.cache_config = vllm_config.cache_config
         self.block_size, self.hash_block_size = resolve_kv_cache_block_sizes(
@@ -1865,7 +1928,7 @@ class DfkvStoreWorker:
     def _ensure_client_for_load(self) -> Any:
         """Lazily un-elide: create the dfkv client on an elided producer rank
         the first time a real load reaches it (cross-instance prefix reuse —
-        get_finished has no role gate). Keeps phase 2a's connection savings for
+        get_transfer_results has no role gate). Keeps phase 2a's connection savings for
         the common P-instance case while never trading a whole-span recompute
         for them. Thread-safe; returns None (load misses, vLLM recomputes) if
         creation fails or the rank was never elided-with-kwargs."""
@@ -2074,6 +2137,7 @@ class DfkvStoreWorker:
                 "load_window_min_keys",
                 DEFAULT_LOAD_WINDOW_MIN_KEYS,
             ),
+            request_level_loads=self.request_level_loads,
         )
         self.kv_recv_thread.start()
         ready_event_recving.wait()
@@ -2112,9 +2176,10 @@ class DfkvStoreWorker:
         self,
         metadata: DfkvStoreConnectorMetadata,
     ):
-        """Perform synchronous loads before forward."""
-        if self.load_async:
+        """Serialize native loads on the model thread, never a pool thread."""
+        if self.load_async or getattr(self, "_last_load_metadata", None) is metadata:
             return
+        self._last_load_metadata = metadata
         assert self.kv_recv_thread is not None
         for request in metadata.requests:
             load_spec = request.load_spec
@@ -2124,12 +2189,12 @@ class DfkvStoreWorker:
             self.kv_recv_thread.load_request_sync(request)
 
 
-    def get_finished(
+    def get_transfer_results(
         self,
         finished_req_ids: set[str],
         meta: DfkvStoreConnectorMetadata,
-    ) -> tuple[set[str], set[str]]:
-        """Submit post-forward I/O and collect completed request IDs.
+    ) -> KVConnectorTransferResults:
+        """Submit post-forward I/O and atomically collect receive outcomes.
 
         Mutable and windowed stores finish before the next model step can
         overwrite their sources; full-attention stores retain async overlap.
@@ -2142,8 +2207,31 @@ class DfkvStoreWorker:
                 wait=True,
                 fail_closed=False,
             )
+        if getattr(self, "_last_transfer_metadata", None) is not meta:
+            self._last_transfer_metadata = meta
+            self._submit_transfers(meta)
+
+        done_sending = (
+            self._get_and_clear_finished_sending(finished_req_ids)
+            if self.kv_role in ["kv_producer", "kv_both"]
+            else set()
+        )
+        done_recving, failed_recving = set(), set()
+        if self.kv_recv_thread is not None and (
+            self.load_async or self.request_level_loads
+        ):
+            done_recving, failed_recving = (
+                self.kv_recv_thread.get_and_clear_receive_results()
+            )
+        return KVConnectorTransferResults(
+            finished_sending=done_sending,
+            finished_recving=done_recving,
+            failed_recving=failed_recving,
+        )
+
+    def _submit_transfers(self, meta: DfkvStoreConnectorMetadata) -> None:
         # Async mode overlaps loads with unrelated model work. Synchronous mode
-        # already completed them in start_load_kv, before this forward pass.
+        # executes them inline in start_load_kv, never in the receive pool.
         if self.load_async:
             for request in meta.requests:
                 load_spec = request.load_spec
@@ -2176,25 +2264,6 @@ class DfkvStoreWorker:
                 # Preserve those source bytes until the native PUT completes.
                 self.kv_send_thread.request_queue.join()
 
-        # Check completion of previously queued transfers
-        done_sending = (
-            self._get_and_clear_finished_sending(finished_req_ids)
-            if self.kv_role in ["kv_producer", "kv_both"]
-            else set()
-        )
-
-        done_recving = (
-            self.kv_recv_thread.get_and_clear_finished_requests()
-            if self.load_async and self.kv_recv_thread is not None
-            else set()
-        )
-
-        if done_sending or done_recving:
-            logger.debug(
-                "dfkv get_finished: done_recving=%s done_sending=%s tp=%d",
-                done_recving, done_sending, self.tp_rank,
-            )
-        return done_sending, done_recving
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         if self.kv_recv_thread is None:

@@ -27,6 +27,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    KVConnectorTransferResults,
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
@@ -244,6 +245,8 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
             self._finish_call()
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.update_connector_output(connector_output)
         kv_cache_events = connector_output.kv_cache_events
         if not kv_cache_events or not isinstance(
             kv_cache_events, DfkvStoreKVEvents
@@ -319,8 +322,8 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
         self._begin_call()
         try:
-            # Loads are issued in get_finished() for compute overlap. Synchronous
-            # loads required by this step are submitted here before forward.
+            # Async loads are issued during result collection. Inline loads
+            # fence prior kernels before touching destination blocks.
             assert self.connector_worker is not None
             metadata = self._get_connector_metadata()
             assert isinstance(metadata, DfkvStoreConnectorMetadata)
@@ -353,20 +356,20 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
     def wait_for_save(self):
         self._begin_call()
         try:
-            # get_finished submits stores and fences mutable/windowed sources.
+            # Result collection submits stores and fences mutable/windowed sources.
             return
         finally:
             self._finish_call()
 
-    def get_finished(
+    def get_transfer_results(
         self, finished_req_ids: set[str]
-    ) -> tuple[set[str] | None, set[str] | None]:
+    ) -> KVConnectorTransferResults:
         self._begin_call()
         try:
             assert self.connector_worker is not None
             metadata = self._get_connector_metadata()
             assert isinstance(metadata, DfkvStoreConnectorMetadata)
-            return self.connector_worker.get_finished(finished_req_ids, metadata)
+            return self.connector_worker.get_transfer_results(finished_req_ids, metadata)
         finally:
             self._finish_call()
 

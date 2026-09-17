@@ -186,6 +186,7 @@ def test_cross_layer_registration_uses_real_group_zero_layer(monkeypatch):
     )
     worker = DfkvStoreWorker.__new__(DfkvStoreWorker)
     worker._kv_cache_groups = groups
+    worker.request_level_loads = False
     worker.token_dbs = [db]
     worker.cache_config = SimpleNamespace(num_gpu_blocks=8)
     worker._kv_pool_regions = []
