@@ -10,6 +10,8 @@ import threading
 from typing import Optional, Sequence
 from dfkv_common import make_client_options_v2, make_key_array
 
+from dfkv_common.block_size import get_max_block_bytes, validate_object_sizes
+
 from ._cabi import load_lib, native_version
 from .client_stats import ClientStatsPoller, read_snapshot
 from . import access_log as _alog
@@ -22,6 +24,26 @@ from ._telemetry import tracing as _push_tracing
 c_void_p = ctypes.c_void_p
 c_uint64 = ctypes.c_uint64
 c_int = ctypes.c_int
+
+_hot_config_lock = threading.Lock()
+_hot_config_users = 0
+
+
+def _acquire_hot_config(rank: int) -> None:
+    global _hot_config_users
+    with _hot_config_lock:
+        if _hot_config_users == 0:
+            _hot_config.register("access_log", _alog.apply_hot)
+            _hot_config.start({}, tp_rank=rank)
+        _hot_config_users += 1
+
+
+def _release_hot_config() -> None:
+    global _hot_config_users
+    with _hot_config_lock:
+        _hot_config_users -= 1
+        if _hot_config_users == 0:
+            _hot_config.stop()
 
 
 
@@ -266,6 +288,7 @@ class DfkvDeviceClient:
             )
         self._close_lock = threading.Lock()
         self._telemetry_acquired = False
+        self._hot_config_acquired = False
         self._lib = load_lib(lib_path)
         # ABI v2 constructs one fully configured handle: static membership or
         # MDS discovery, batch fan-out, and optional client registration become
@@ -341,8 +364,8 @@ class DfkvDeviceClient:
         # file toggle it at runtime without restarting vLLM (opt-in via
         # DFKV_HOT_CONFIG). See docs/access_log.md -> 运行时热开关.
         _alog.configure({}, tp_rank=_env_rank())
-        _hot_config.register("access_log", _alog.apply_hot)
-        _hot_config.start({}, tp_rank=_env_rank())
+        _acquire_hot_config(_env_rank())
+        self._hot_config_acquired = True
         # Mirror native operation, peer-health, MDS, RDMA rail, MR, and timeout
         # state onto Prometheus. The sleeping poller stays off the request path;
         # DFKV_CLIENT_STATS_POLL_S=0 disables it.
@@ -375,6 +398,12 @@ class DfkvDeviceClient:
         Logical SG object operations may contain more segments; libdfkv splits
         them into ordered windows of at most this width."""
         return int(self._lib.dfkv_max_sg_segs(self._h))
+
+    def validate_block_sizes(self, sizes, *, context: str) -> None:
+        """Reject an impossible layout before submitting GPU transfers."""
+        if self.transport_mode == "rdma":
+            validate_object_sizes(
+                get_max_block_bytes(self._lib, self._h), sizes, context=context)
 
     def register_memory(self, base: int, size: int) -> None:
         """Register a (host or GPU device) region as an RDMA MR. One call per
@@ -621,22 +650,22 @@ class DfkvDeviceClient:
                 self._stats_poller = None
         except Exception:
             pass
-        try:
-            _hot_config.stop()
-        except Exception:
-            pass
         with self._close_lock:
             handle = getattr(self, "_h", None)
             self._h = None
             telemetry_acquired = getattr(
                 self, "_telemetry_acquired", False)
             self._telemetry_acquired = False
+            hot_config_acquired = getattr(self, "_hot_config_acquired", False)
+            self._hot_config_acquired = False
         if handle:
             with access_log("close", lambda: ""):
                 self._lib.dfkv_close(handle)
         if telemetry_acquired:
             _push_metrics.release()
             _push_tracing.release()
+        if hot_config_acquired:
+            _release_hot_config()
 
     def __del__(self):
         try:

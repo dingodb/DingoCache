@@ -64,6 +64,11 @@ int dfkv_register_memory(dfkv_client_t c, const void* base, uint64_t size);
 // a fixed HCA or transport limit. Returns 0 on a null client.
 uint32_t dfkv_max_sg_segs(dfkv_client_t c);
 
+// Effective client-local logical object ceiling in bytes, not a negotiated
+// server limit. Sum SG segment sizes for one object. Returns 0 for unsupported
+// transports (including TCP), a null client, or an error.
+uint64_t dfkv_max_block_bytes(dfkv_client_t c);
+
 // Actual client transport selected by dfkv_open_v2(), e.g. "rdma",
 // "tcp(rdma-not-requested)", or "injected". Returns "" for null clients.
 const char* dfkv_transport_mode(dfkv_client_t c);

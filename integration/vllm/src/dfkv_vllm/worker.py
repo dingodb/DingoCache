@@ -1943,11 +1943,15 @@ class DfkvStoreWorker:
             if getattr(self, "_closed", False):
                 return None
             if self.client is None:
+                client = None
                 try:
                     client = DfkvDeviceClient(**self._lazy_client_kwargs)
+                    self._validate_cache_block_sizes(client)
                     for base, ln in self._kv_pool_regions:
                         client.register_memory(base, ln)
                 except Exception:
+                    if client is not None:
+                        client.close()
                     logger.exception(
                         "dfkv lazy un-elide failed; loads on this rank miss")
                     return None
@@ -1956,6 +1960,14 @@ class DfkvStoreWorker:
                     "dfkv client un-elided: a load reached this elided "
                     "producer rank (tp_rank=%d)", self.tp_rank)
         return self.client
+
+    def _validate_cache_block_sizes(self, client) -> None:
+        """Each cache group's scheduler block is one logical dfkv object."""
+        for group, db in enumerate(self.token_dbs):
+            if db.cacheable:
+                client.validate_block_sizes(
+                    (db.geometry.logical_bytes_per_block,),
+                    context=f"vLLM cache group {group}")
 
     def register_kv_caches(
         self,
@@ -2086,6 +2098,8 @@ class DfkvStoreWorker:
             ]
             if seg_layout:
                 db.set_seg_layout(seg_layout)
+        if self.client is not None:
+            self._validate_cache_block_sizes(self.client)
         # Start transfer threads
         if self.kv_role in ["kv_producer", "kv_both"]:
             ready_event_sending = threading.Event()

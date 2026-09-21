@@ -220,6 +220,17 @@ capability；HCA `max_sge` 低于 dfkv 上限时会缩小宽度，高于上限�
 典型踩法：照 L2-bypass 实测的 1.02 MiB 调到 2 MiB，切回原版 L2 后
 2.74 MiB 的整页对象全部静默失效。
 
+**注册期对象上限预检**：HiCache 的主机池注册和 vLLM 的 KV group 注册会从
+`dfkv_max_block_bytes(client)` 读取 native client 的有效逻辑上限，按实际布局检查
+每个对象，而不是复制环境变量解析或用整个内存池容量估算。HiCache 的独立
+`temporal` / `convN` 组件分别检查；vLLM 的一个逻辑块需汇总其全部 SG segments。
+对象恰好等于上限合法，超过上限则在启动/注册阶段给出 required/effective bytes
+与配置提示。此检查不自动增大显式上限，也不修改 native 运行期的 `kInvalid` 契约。
+连接器要求加载包含该查询接口的配套 `libdfkv.so`；缺失接口明确报错，不以旧库
+猜测值继续。该上限是 client-local，不等于已验证所有 server 都能接收；仍须
+核对 payload 与服务端容量。被 elide 的 vLLM client 在首次真正创建时、提交 I/O 前
+执行相同检查。
+
 > **服务端侧上限 `--max-msg`**：默认 32 MiB，即"客户端不声明时给多少"。
 > 它同时是本服务端接受的**上限**：客户端声明**高于**它会被**明确拒绝连接**并打日志，
 > 而不是悄悄按小的开——后者会让客户端按自己声明的大小发包、打爆对端 recv buffer（RNR/QP 断）。

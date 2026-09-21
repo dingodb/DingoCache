@@ -143,6 +143,9 @@ class KVClient {
   // exceed it: the transport splits them into one ordered operation internally.
   size_t MaxSgPayloadSegs() const { return t_->MaxSgPayloadSegs(); }
 
+  // Effective client-local logical object ceiling, or zero if unsupported.
+  uint64_t MaxBlockBytes() const { return t_->MaxBlockBytes(); }
+
   // Hot-swap the cluster membership (rebuilds the consistent-hash ring).
   // Thread-safe vs concurrent Put/Get/Exist.
   void SetMembers(std::vector<std::pair<std::string, std::string>> members);

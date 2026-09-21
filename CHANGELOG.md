@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Add a read-only native `dfkv_max_block_bytes` query and startup layout checks
+  for HiCache host pools and vLLM cache groups. Undersized effective object
+  bounds fail before cache traffic instead of only surfacing as runtime misses.
+  Explicit limits and runtime transport rejection remain unchanged. Updated
+  connectors require the matching native library export.
+
 ### v2.27.2 — Legacy and native vLLM compatibility
 
 - Restore one connector package for engines with the legacy `get_finished`

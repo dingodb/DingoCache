@@ -5,6 +5,7 @@
 #include "client/dfkv_c_api.h"
 #include "client/key_map.h"
 #include "client/kv_client.h"
+#include "transport/tcp_transport.h"
 
 #include <gtest/gtest.h>
 
@@ -56,6 +57,10 @@ class CApiTransport final : public dfkv::Transport {
   size_t MaxSgPayloadSegs() const override {
     Throw();
     return 29;
+  }
+  uint64_t MaxBlockBytes() const override {
+    Throw();
+    return 0;
   }
   std::vector<dfkv::Status> RangeIntoMulti(
       const std::string&, const std::vector<dfkv::BlockKey>& keys,
@@ -202,6 +207,7 @@ TEST(CApiGuard, NullAndZeroLengthInputsFailClosedWithSafeOutputs) {
   EXPECT_EQ(dfkv_get(nullptr, "k", 1, nullptr, 0), 0);
   EXPECT_EQ(dfkv_exist(nullptr, "k", 1), 0);
   EXPECT_EQ(dfkv_remove(nullptr, "k", 1), 0);
+  EXPECT_EQ(dfkv_max_block_bytes(nullptr), 0u);
 
   dfkv_client_t c = OpenEmpty();
   ASSERT_NE(c, nullptr);
@@ -306,6 +312,12 @@ TEST(CApiRegistration, PropagatesNativeRegistrationFailure) {
   dfkv_close(c);
 }
 
+TEST(CApiCapabilities, TcpDoesNotExposeBlockCeiling) {
+  dfkv::TcpTransport transport;
+  dfkv::KVClient client({}, kNamespace, &transport, 1);
+  EXPECT_EQ(dfkv_max_block_bytes(&client), 0u);
+}
+
 TEST(CApiNoThrow, EveryOperationFamilyContainsInjectedExceptions) {
   CApiTransport transport;
   dfkv_client_t c = Injected(&transport);
@@ -322,6 +334,7 @@ TEST(CApiNoThrow, EveryOperationFamilyContainsInjectedExceptions) {
   char byte = 0;
   EXPECT_EQ(dfkv_register_memory(c, &byte, 1), -1);
   EXPECT_EQ(dfkv_max_sg_segs(c), 0u);
+  EXPECT_EQ(dfkv_max_block_bytes(c), 0u);
 
   const void* keys[] = {key};
   const uint64_t key_lens[] = {1};
