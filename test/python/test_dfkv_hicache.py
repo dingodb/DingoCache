@@ -623,6 +623,21 @@ class DingoFSHiCacheTest(unittest.TestCase):
         self.assertEqual(m["set_v2_ok_pages"], 0)
         self.assertEqual(m["set_v2_bytes"], 0)
 
+    def test_v2_layout_rejects_oversize_component_before_registration(self):
+        members, _, _ = self._node("boundpreflight")
+        cfg = self._cfg(members, model="hybrid")
+        st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+        st.transport_mode = "rdma"
+        pool = FakeHybridStatePool(2, 4096, 512, self.PAGE_SIZE)
+        with patch.object(dfkv_hicache, "get_max_block_bytes", return_value=4095):
+            with self.assertRaisesRegex(ValueError, "4096 bytes"):
+                st.register_mem_host_pool_v2(pool, "state")
+        self.assertNotIn("state", st.registered_pools)
+        with patch.object(dfkv_hicache, "get_max_block_bytes", return_value=4096):
+            st.register_mem_host_pool_v2(pool, "state")
+        # Separate temporal/conv objects must not be summed into a false reject.
+        self.assertEqual(st._pool_components("state"), ("temporal", "conv0"))
+
     def test_v2_follower_rank_writes_rank_sharded_pool(self):
         # Kimi-K3 hybrid recurrent state is rank-sharded, so every follower rank
         # must persist its own temporal/conv bytes. backup_skip applies only to

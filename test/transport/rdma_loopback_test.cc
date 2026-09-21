@@ -5,6 +5,7 @@
 // no RDMA device is present. Built only when DFKV_WITH_RDMA is defined. Run under
 // ThreadSanitizer to exercise the worker-pool / QP concurrency.
 #include "client/kv_client.h"
+#include "client/dfkv_c_api.h"
 #include "client/cuda_ipc.h"
 #include "client/node_dedup.h"
 #include "client/key_map.h"
@@ -3314,6 +3315,33 @@ std::string PatternValue(size_t size, size_t seed) {
   return value;
 }
 
+TEST(RdmaLoopback, MaxBlockBytesReportsResolvedClientLocalCeiling) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv max_block("DFKV_RDMA_MAX_BLOCK_BYTES", nullptr);
+  ScopedEnv max_payload("DFKV_RDMA_MAX_PAYLOAD_BYTES", nullptr);
+  {
+    RdmaTransport transport(8u << 20);
+    KVClient client({}, SelfHdr(), &transport);
+    EXPECT_EQ(dfkv_max_block_bytes(&client), 4u << 20);
+  }
+  {
+    ScopedEnv explicit_block("DFKV_RDMA_MAX_BLOCK_BYTES", "65536");
+    RdmaTransport transport(kMaxMsg);
+    KVClient client({}, SelfHdr(), &transport);
+    EXPECT_EQ(dfkv_max_block_bytes(&client), 65536u);
+    // The getter reports this client's resolved bound, not the current env.
+    ScopedEnv changed_block("DFKV_RDMA_MAX_BLOCK_BYTES", "131072");
+    EXPECT_EQ(dfkv_max_block_bytes(&client), 65536u);
+  }
+  {
+    ScopedEnv explicit_block("DFKV_RDMA_MAX_BLOCK_BYTES", "8388608");
+    ScopedEnv payload_cap("DFKV_RDMA_MAX_PAYLOAD_BYTES", "131072");
+    RdmaTransport transport(kMaxMsg);
+    KVClient client({}, SelfHdr(), &transport);
+    EXPECT_EQ(dfkv_max_block_bytes(&client), 131072u);
+  }
+}
+
 // DCP2 declared caps: a client that tightens its max block size gets smaller
 // shared slots and must still complete every op within the declaration;
 // oversized ops fail client-side with kInvalid without touching the wire.
@@ -3324,6 +3352,7 @@ TEST(RdmaLoopback, DeclaredCapsRoundTripAndClientSideBound) {
   RdmaTransport rt(kMaxMsg);
   unsetenv("DFKV_RDMA_MAX_BLOCK_BYTES");            // don't leak into other tests
   KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  EXPECT_EQ(dfkv_max_block_bytes(&c), 65536u);
 
   // Within the declaration: normal round-trip on the right-sized connection.
   std::string v(60 * 1024, 'a');
@@ -3338,6 +3367,7 @@ TEST(RdmaLoopback, DeclaredCapsRoundTripAndClientSideBound) {
   EXPECT_FALSE(c.Put("caps-over", big.data(), big.size()));
   ASSERT_TRUE(c.Get("caps-ok", got.data(), got.size())) << "conn must survive the rejected op";
   EXPECT_EQ(got, v);
+  EXPECT_EQ(dfkv_max_block_bytes(&c), 65536u);
 }
 
 TEST(RdmaLoopback, DataConnectionsUseActualBlockSizeClasses) {

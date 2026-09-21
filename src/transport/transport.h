@@ -228,6 +228,10 @@ class Transport {
   // grouping from this instead of hard-coding 29.
   virtual size_t MaxSgPayloadSegs() const { return 29; }
 
+  // Effective client-local logical object ceiling in bytes. Zero means the
+  // transport does not expose one; SG segments belonging to one key are summed.
+  virtual uint64_t MaxBlockBytes() const { return 0; }
+
   // Batch variants for one node. Default = sequential loop; RDMA overrides these
   // to pipeline multiple requests in flight on a single connection. All keys in
   // a RangeMany share (offset, length).

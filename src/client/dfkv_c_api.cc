@@ -255,6 +255,13 @@ uint32_t dfkv_max_sg_segs(dfkv_client_t c) {
   });
 }
 
+uint64_t dfkv_max_block_bytes(dfkv_client_t c) {
+  return NoThrow<uint64_t>(0, [&] {
+    if (!c) return uint64_t{0};
+    return static_cast<KVClient*>(c)->MaxBlockBytes();
+  });
+}
+
 int dfkv_batch_put(dfkv_client_t c, const void* const* keys,
                    const uint64_t* key_lens, const void** ptrs,
                    const uint64_t* sizes, int n, int* out_ok) {

@@ -751,5 +751,79 @@ class ConnectorStatsTest(unittest.TestCase):
             stats.record_observation("request-123", 0.1)
 
 
+class SharedHotConfigLifecycleTest(unittest.TestCase):
+    def test_failed_client_cleanup_preserves_surviving_clients_updates(self):
+        import json
+        import os
+        import tempfile
+        from dfkv_vllm import dfkv_client as client_module
+
+        first_update = threading.Event()
+        next_update = threading.Event()
+
+        def apply_update(value):
+            if value.get("generation") == 1:
+                first_update.set()
+            elif value.get("generation") == 22:
+                next_update.set()
+
+        with tempfile.TemporaryDirectory() as directory:
+            control = Path(directory) / "control.json"
+            control.write_text(json.dumps({"generation": 1}))
+            with patch.dict(os.environ, {
+                "DFKV_HOT_CONFIG": str(control), "DFKV_HOT_CONFIG_POLL_S": "0.01",
+            }), patch.object(client_module._hot_config, "_appliers", []), \
+                    patch.object(client_module._alog, "apply_hot", apply_update):
+                clients = []
+                try:
+                    for _ in range(2):
+                        client = client_module.DfkvDeviceClient.__new__(
+                            client_module.DfkvDeviceClient)
+                        client._close_lock = threading.Lock()
+                        client._h = None
+                        client._telemetry_acquired = False
+                        client_module._acquire_hot_config(0)
+                        client._hot_config_acquired = True
+                        clients.append(client)
+                    self.assertTrue(first_update.wait(2))
+                    clients[0].close()
+                    clients[0].close()  # teardown is idempotent
+                    control.write_text(json.dumps({"generation": 22}))
+                    self.assertTrue(next_update.wait(2))
+                finally:
+                    for client in clients:
+                        client.close()
+
+
+class BlockBoundPreflightTest(unittest.TestCase):
+    def test_complete_group_object_is_checked_not_individual_segments(self):
+        import ctypes
+        from dfkv_vllm.data import ChunkedTokenDatabase
+        from dfkv_vllm.dfkv_client import DfkvDeviceClient
+        from dfkv_vllm.worker import DfkvStoreWorker
+
+        metadata = KeyMetadata(
+            model_name="model", dp_size=1, dp_rank=-1, tp_size=1, tp_rank=0,
+            pcp_size=1, pcp_rank=0, dcp_size=1, dcp_rank=0, pp_size=1, pp_rank=0)
+        db = ChunkedTokenDatabase(metadata, block_size=16)
+        db.set_seg_layout([(0x1000, 512, 100), (0x2000, 512, 200)])
+        limit = 256
+        getter = ctypes.CFUNCTYPE(ctypes.c_uint64, ctypes.c_void_p)(
+            lambda _handle: limit)
+        client = DfkvDeviceClient.__new__(DfkvDeviceClient)
+        client._lib = SimpleNamespace(
+            dfkv_max_block_bytes=getter, dfkv_transport_mode=lambda _: b"rdma")
+        client._h = 1
+        worker = DfkvStoreWorker.__new__(DfkvStoreWorker)
+        worker.token_dbs = [db]
+        try:
+            with self.assertRaisesRegex(ValueError, "300 bytes"):
+                worker._validate_cache_block_sizes(client)
+            limit = 300
+            worker._validate_cache_block_sizes(client)
+        finally:
+            client._h = None
+
+
 if __name__ == "__main__":
     unittest.main()

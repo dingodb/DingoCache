@@ -35,6 +35,7 @@ from dfkv_common import (
     sg_key,
 )
 from dfkv_common.client_metrics import read_native_snapshot
+from dfkv_common.block_size import get_max_block_bytes, validate_object_sizes
 
 from dfkv_access_log import (access_log, configure as _configure_access_log,
                             apply_hot as _access_log_apply_hot,
@@ -910,7 +911,19 @@ class DfkvHiCache(HiCacheStorage):
                 pass
         return done
 
+    def _validate_pool_object_sizes(self, sizes, *, context):
+        if self.transport_mode == "rdma":
+            validate_object_sizes(
+                get_max_block_bytes(self._lib, self._h), sizes, context=context)
+
     def register_mem_pool_host(self, mem_pool_host):
+        if self.transport_mode == "rdma":
+            import torch
+            indices = torch.arange(mem_pool_host.page_size, dtype=torch.int64)
+            meta = mem_pool_host.get_page_buffer_meta(indices)
+            if not _meta_has_no_layout(meta):
+                self._validate_pool_object_sizes(
+                    meta[1], context="HiCache primary host pool")
         self.mem_pool_host = mem_pool_host
         with access_log("register_mem_pool_host",
                         lambda: f"{self._alog_tag}") as r:
@@ -1000,6 +1013,9 @@ class DfkvHiCache(HiCacheStorage):
             getattr(self, "_pool_logical", {}).pop(name, None)
             raise RuntimeError(
                 f"cannot discover physical layout for pool {name!r}") from exc
+
+        self._validate_pool_object_sizes(
+            sizes, context=f"HiCache host pool {name!r} components={tuple(names)}")
 
         self._pool_component_names[name] = tuple(names)
         self._pool_replicated[name] = replicated
