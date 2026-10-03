@@ -79,15 +79,14 @@ void KvNodeServer::InitTcpListenerConfig() {
 
 KvNodeServer::KvNodeServer(const std::string& cache_dir,
                            uint64_t capacity_bytes)
-    : group_(DiskCacheGroup::Options{{cache_dir}, capacity_bytes}) {
-  if (!group_.Healthy()) return;
-  InitRamTier();
-  InitAdmission();
-}
+    : KvNodeServer(DiskCacheGroup::Options{{cache_dir}, capacity_bytes}) {}
 
 KvNodeServer::KvNodeServer(const std::vector<std::string>& cache_dirs,
                            uint64_t capacity_bytes)
-    : group_(DiskCacheGroup::Options{cache_dirs, capacity_bytes}) {
+    : KvNodeServer(DiskCacheGroup::Options{cache_dirs, capacity_bytes}) {}
+
+KvNodeServer::KvNodeServer(DiskCacheGroup::Options options)
+    : group_(std::move(options)) {
   if (!group_.Healthy()) return;
   InitRamTier();
   InitAdmission();
@@ -113,6 +112,23 @@ void KvNodeServer::InitAdmission() {
   // (forced now so their defaults show even before the first coalesced read).
   config_dump::RecordResolved("DFKV_READ_COALESCE", coalesce_enabled_ ? "on" : "off");
   if (coalesce_enabled_) ReadCoalescer::RecordConfig();
+}
+
+bool KvNodeServer::TryBeginPut() {
+  if (put_busy_limit_ == 0) return true;
+  size_t inflight = put_inflight_.load(std::memory_order_relaxed);
+  while (inflight < put_busy_limit_) {
+    if (put_inflight_.compare_exchange_weak(
+            inflight, inflight + 1, std::memory_order_relaxed))
+      return true;
+  }
+  put_busy_.fetch_add(1, std::memory_order_relaxed);
+  return false;
+}
+
+void KvNodeServer::EndPut() {
+  if (put_busy_limit_ != 0)
+    put_inflight_.fetch_sub(1, std::memory_order_relaxed);
 }
 
 void KvNodeServer::InitRamTier() {
@@ -617,7 +633,7 @@ std::string KvNodeServer::MetricsText() const {
   }
   if (put_busy_limit_ > 0)
     metric("dfkv_put_busy_total", "counter",
-           "PUTs rejected by the disk-write admission gate (kCacheFull)",
+           "PUTs rejected before RAM or disk admission (kCacheFull)",
            put_busy_.load(std::memory_order_relaxed));
   // RAM hot tier (P3), emitted only when enabled so a disk-only node's scrape is
   // unchanged. ram_hit/ram_miss let you compute the RAM hit rate; ram_put_bypass
@@ -647,7 +663,7 @@ std::string KvNodeServer::MetricsText() const {
            "PUTs acknowledged from flush-pinned RAM before disk commit",
            ram_->RamAcks());
     metric("dfkv_ram_ack_backpressure_total", "counter",
-           "RAM-ACK PUTs forced to wait for disk at the dirty watermark",
+           "RAM-ACK PUTs rejected at a positive dirty watermark or disk-ACKed at zero",
            ram_->AckBackpressure());
     metric("dfkv_ram_post_ack_flush_failures_total", "counter",
            "Acknowledged RAM PUTs whose background disk flush later failed",
@@ -788,17 +804,25 @@ Status KvNodeServer::ProcessRequestForKey(
         st = Status::kInvalid;
         break;
       }
+      // Reject only before any RAM value or disk write belongs to this PUT.
+      // An admitted conflicting duplicate must never fall back on a deadline.
+      if (!TryBeginPut()) {
+        st = Status::kCacheFull;
+        break;
+      }
       bool samp = lat_sampler_.ShouldSample();
       double t0 = samp ? NowSec() : 0.0;
-      // RAM-ACK mode publishes a flush-pinned copy and returns immediately;
-      // its dirty-byte watermark switches individual requests back to waiting
-      // for disk. Admission failure falls through to the normal disk path.
+      // RAM-ACK publishes a flush-pinned copy. A reached positive watermark
+      // rejects new keys before admission; only a capacity bypass may take
+      // the normal disk path, never a terminal watermark rejection.
       bool needs_disk = true;
-      if (ram_ && group_.TenantQuotaBytes(key.tenant_hash) == 0) {
-        st = ram_ack_enabled_
-                 ? ram_->PutWriteBack(key, payload, payload_len)
-                 : ram_->PutCommitted(key, payload, payload_len);
-        needs_disk = st == Status::kCacheFull;
+      if (ram_write_back_ && ram_ &&
+          group_.TenantQuotaBytes(key.tenant_hash) == 0) {
+        const RamTier::PutResult result =
+            ram_ack_enabled_ ? ram_->PutWriteBack(key, payload, payload_len)
+                             : ram_->PutCommitted(key, payload, payload_len);
+        st = result.status;
+        needs_disk = result.disposition == RamTier::PutDisposition::kBypass;
         if (st == Status::kOk) {
           cache_put_.fetch_add(1, std::memory_order_relaxed);
           bytes_written_.fetch_add(payload_len, std::memory_order_relaxed);
@@ -806,20 +830,8 @@ Status KvNodeServer::ProcessRequestForKey(
           put_io_err_.fetch_add(1, std::memory_order_relaxed);
         }
       }
-      if (needs_disk && put_busy_limit_ > 0 &&
-          disk_put_inflight_.load(std::memory_order_relaxed) >=
-              put_busy_limit_) {
-        // Apply the same admission gate as the RDMA CacheDirect path. TCP is a
-        // diagnostic datapath, not an ungated side door around disk-write
-        // concurrency and backpressure.
-        st = Status::kCacheFull;
-        put_busy_.fetch_add(1, std::memory_order_relaxed);
-        needs_disk = false;
-      }
       if (needs_disk) {
-        disk_put_inflight_.fetch_add(1, std::memory_order_relaxed);
         st = group_.Cache(key, payload, payload_len);
-        disk_put_inflight_.fetch_sub(1, std::memory_order_relaxed);
         if (st == Status::kOk) {
           cache_put_.fetch_add(1, std::memory_order_relaxed);
           bytes_written_.fetch_add(payload_len, std::memory_order_relaxed);
@@ -828,6 +840,7 @@ Status KvNodeServer::ProcessRequestForKey(
         }
       }
       if (samp) put_lat_.Observe(NowSec() - t0);
+      EndPut();
       break;
     }
     case WireOp::kRange: {
@@ -1034,6 +1047,7 @@ Status KvNodeServer::CacheDirectForKey(const BlockKey& key, char* data,
     invalid_ops_.fetch_add(1, std::memory_order_relaxed);
     return Status::kInvalid;
   }
+  if (!TryBeginPut()) return Status::kCacheFull;
   bool samp = lat_sampler_.ShouldSample();
   double t0 = samp ? NowSec() : 0.0;
   // PUT write-around: write directly to disk, skip the synchronous 1 MiB
@@ -1048,11 +1062,13 @@ Status KvNodeServer::CacheDirectForKey(const BlockKey& key, char* data,
   bool needs_disk = true;
   // Write-back admits to the RAM arena first. RAM-ACK returns after the
   // flush-pinned value is visible; disk-ACK waits for the same flush result.
-  // Genuine arena backpressure falls through to direct disk write.
+  // Only capacity bypass falls through; watermark rejection is terminal.
   if (ram_write_back_ && ram_ && quota_ok) {
-    st = ram_ack_enabled_ ? ram_->PutWriteBack(key, data, len)
-                          : ram_->PutCommitted(key, data, len);
-    needs_disk = st == Status::kCacheFull;
+    const RamTier::PutResult result =
+        ram_ack_enabled_ ? ram_->PutWriteBack(key, data, len)
+                         : ram_->PutCommitted(key, data, len);
+    st = result.status;
+    needs_disk = result.disposition == RamTier::PutDisposition::kBypass;
     if (st == Status::kOk) {
       cache_put_.fetch_add(1, std::memory_order_relaxed);
       bytes_written_.fetch_add(len, std::memory_order_relaxed);
@@ -1060,14 +1076,8 @@ Status KvNodeServer::CacheDirectForKey(const BlockKey& key, char* data,
       put_io_err_.fetch_add(1, std::memory_order_relaxed);
     }
   }
-  if (needs_disk && quota_ok && put_busy_limit_ > 0 &&
-      disk_put_inflight_.load(std::memory_order_relaxed) >= put_busy_limit_) {
-    st = Status::kCacheFull;
-    put_busy_.fetch_add(1, std::memory_order_relaxed);
-  } else if (needs_disk && quota_ok) {
-    disk_put_inflight_.fetch_add(1, std::memory_order_relaxed);
+  if (needs_disk && quota_ok) {
     st = group_.CacheDirect(key, data, len, cap);
-    disk_put_inflight_.fetch_sub(1, std::memory_order_relaxed);
     if (st == Status::kOk) {
       cache_put_.fetch_add(1, std::memory_order_relaxed);
       bytes_written_.fetch_add(len, std::memory_order_relaxed);
@@ -1078,9 +1088,24 @@ Status KvNodeServer::CacheDirectForKey(const BlockKey& key, char* data,
     }
   }
   if (samp) put_lat_.Observe(NowSec() - t0);
+  EndPut();
   return st;
 }
 
+
+bool KvNodeServer::RamPinnedHitForKey(const BlockKey& key, uint64_t offset,
+                                      uint64_t length, PreparedRead* out) {
+  if (out == nullptr) return false;
+  *out = PreparedRead{};
+  RamTier::Hit hit;
+  if (!ram_ || !ram_->GetPrep(key, offset, length, &hit,
+                              /*count_access=*/false))
+    return false;
+  if (!hit.in_arena || hit.len == 0) return false;
+  *out = PreparedRead::Ready(hit.ptr, hit.len, hit.value_len, true, nullptr,
+                            0, this, hit.TransferToken(), &FinishPullRamRead);
+  return true;
+}
 
 Status KvNodeServer::RangeDirectForKey(
     const BlockKey& key, uint64_t offset, uint64_t length, char* io_buf,
@@ -1334,6 +1359,20 @@ void KvNodeServer::FinishRamRead(
   (void)data;
   KvNodeServer* server = static_cast<KvNodeServer*>(owner);
   if (server != nullptr && server->ram_) server->ram_->ReleaseToken(token);
+}
+
+void KvNodeServer::FinishPullRamRead(
+    void* owner, uint64_t token, bool committed, Status result,
+    size_t bytes_read, double elapsed_sec, const char* data) noexcept {
+  auto* server = static_cast<KvNodeServer*>(owner);
+  if (server != nullptr && committed && result == Status::kOk) {
+    server->ram_->hits_.fetch_add(1, std::memory_order_relaxed);
+    server->cache_hit_.fetch_add(1, std::memory_order_relaxed);
+    server->bytes_read_.fetch_add(bytes_read, std::memory_order_relaxed);
+    if (server->lat_sampler_.ShouldSample())
+      server->get_lat_.Observe(elapsed_sec);
+  }
+  FinishRamRead(owner, token, committed, result, bytes_read, elapsed_sec, data);
 }
 
 // Keep-alive: serve requests on this connection until the peer closes it.

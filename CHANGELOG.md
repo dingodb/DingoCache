@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Reuse RDMA capability observations only within a known peer publication;
+  invalidate them on endpoint failure, forced recovery and topology changes.
+  Anonymous/static peers retain fresh-QP negotiation.
+- Retain a bounded burst of idle data endpoints, retire excess endpoints after
+  application inactivity, and keep explicit `DFKV_RDMA_POOL_MAX` limits exact.
+  Keepalives no longer extend burst retention.
+- Serve arena-resident dynamic-pull GETs through exact READ grants while keeping
+  their arena pins until grant revocation. Account successful pull reads at
+  release without double-counting fallback probes.
+- Apply the existing foreground PUT admission limit before RAM or disk work.
+  Preserve first-writer completion ownership across conflicting duplicates,
+  cancellation and remove/reinsert; do not bypass an accepted write on a timer.
+  At a positive RAM-ACK dirty watermark, reject only new keys before admission;
+  this rejection never falls through to direct persistence. Zero watermark
+  retains its explicit disk-ACK behavior.
+- Add per-phase connection diagnostics and optional registered PUT-source
+  benchmarking. PUT and GET stall timing uses a monotonic clock and is disabled
+  when not requested.
+
 - Add a read-only native `dfkv_max_block_bytes` query and startup layout checks
   for HiCache host pools and vLLM cache groups. Undersized effective object
   bounds fail before cache traffic instead of only surfacing as runtime misses.

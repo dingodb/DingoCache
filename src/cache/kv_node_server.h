@@ -129,6 +129,11 @@ class KvNodeServer {
                            uint64_t length, char* io_buf, size_t io_cap,
                            const char** out_data, size_t* out_len,
                            size_t* value_len = nullptr);
+  // Observe an arena hit without accounting. The prepared owner holds its pin
+  // until the caller revokes remote access and commits, or fences and aborts.
+  // Misses, dedicated values and registration fallbacks remain uncounted here.
+  bool RamPinnedHitForKey(const BlockKey& key, uint64_t offset,
+                          uint64_t length, PreparedRead* out);
 
   // Prepare one RDMA read against its registered staging destination. The
   // returned move-only transaction owns every disk/RAM/coalescer obligation;
@@ -146,6 +151,10 @@ class KvNodeServer {
   bool ram_ack_enabled() const { return ram_ack_enabled_; }
 
  private:
+  friend class KvNodeServerTestPeer;
+  friend class KvNodeServerWiringTestPeer;
+  // Reuse the storage group's engine factory in focused admission tests.
+  explicit KvNodeServer(DiskCacheGroup::Options options);
   static void FinishDiskRead(void* owner, uint64_t flight, bool committed,
                              Status result, size_t bytes_read,
                              double elapsed_sec, const char* data) noexcept;
@@ -159,6 +168,9 @@ class KvNodeServer {
   static void FinishRamRead(void* owner, uint64_t token, bool committed,
                             Status result, size_t bytes_read,
                             double elapsed_sec, const char* data) noexcept;
+  static void FinishPullRamRead(void* owner, uint64_t token, bool committed,
+                                Status result, size_t bytes_read,
+                                double elapsed_sec, const char* data) noexcept;
   void AcceptLoop();
   // accepted_at stamps the accept() return so the first complete request frame
   // is due within DFKV_TCP_FIRST_REQ_MS of ACCEPT, not of handler scheduling.
@@ -168,6 +180,8 @@ class KvNodeServer {
   // write-around (PUT direct to disk, arena filled by GET read-promotion).
   void set_ram_write_back(bool wb) { ram_write_back_ = wb; }
   void InitAdmission();   // read DFKV_PUT_INFLIGHT_LIMIT (0 = gate off)
+  bool TryBeginPut();
+  void EndPut();
   void ReapDoneLocked();  // join+erase finished handler threads; conn_mu_ held
   void InitTcpListenerConfig();
   std::atomic<size_t> cache_put_{0}, cache_hit_{0}, cache_miss_{0};
@@ -182,11 +196,12 @@ class KvNodeServer {
   }();
   // depth metrics: errors by op, live connections, sampled op latency
   std::atomic<size_t> put_io_err_{0}, get_io_err_{0}, invalid_ops_{0};
-  // PUT admission gate (I6): reject with kCacheFull once this many disk writes
-  // are in flight (0 = unlimited/off). See --put-inflight-limit.
+  // PUT admission gate: reserve before RAM admission or direct disk I/O.
+  // Accepted requests retain their permit through commit/failure; background
+  // flushes never take a permit. 0 = unlimited/off (--put-inflight-limit).
   size_t put_busy_limit_ = 0;
   bool ram_write_back_ = true;  // default write-back; DFKV_RAM_WRITE_MODE=writearound switches
-  std::atomic<size_t> disk_put_inflight_{0};
+  std::atomic<size_t> put_inflight_{0};
   std::atomic<size_t> put_busy_{0};
   std::atomic<size_t> open_connections_{0};
   static constexpr size_t kDefaultTcpMaxConnections = 512;

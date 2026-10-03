@@ -20,9 +20,10 @@
  * Arena pins are maintained by SlabAllocator; dedicated entries maintain the
  * equivalent counters directly.
  *
- * Backpressure (gap 10.3): if the arena is full of non-evictable slots (flush
- * fell behind), Put returns false and the caller falls back to the normal
- * synchronous disk write -- never blocks, never fails read-after-write.
+ * Backpressure: capacity rejection happens before a value is admitted; only
+ * then may the caller fall back to synchronous disk write. Once admitted, a
+ * disk-ACK PUT (including a conflicting duplicate) waits for that value's
+ * terminal flush result. A deadline cannot transfer ownership to another PUT.
  * Alignment (gap 10.4): the arena base is posix_memalign(4096) and slot sizes
  * are 4096-multiples, so a slot address is O_DIRECT-aligned for the flusher.
  *
@@ -87,8 +88,9 @@ class RamTier {
     // without it a full arena runs the CLOCK eviction sweep inline under the
     // shard lock on every admission.
     uint32_t reclaim_interval_ms = 10;
-    // Dirty-byte watermark for RAM-ACK mode. Once reached, new PUTs wait for
-    // their flush result instead of acknowledging asynchronously.
+    // Positive dirty-byte watermark for RAM-ACK mode: reject NEW keys before
+    // admission once reached. Existing owners still resolve normally.
+    // 0 explicitly selects synchronous disk-ACK, not perpetual rejection.
     uint32_t ack_high_watermark_pct = 80;
   };
 
@@ -166,21 +168,29 @@ class RamTier {
   bool ok() const { return ready_; }
   bool healthy() const { return healthy_.load(std::memory_order_acquire); }
 
-  // Asynchronous admission used by standalone tier tests and read-promotion
-  // internals. true means the key was admitted or joined an identical in-flight
-  // PUT; it does NOT claim durability. A duplicate never falls through as
-  // capacity backpressure.
+  // Asynchronous admission used by standalone tier tests. true means the key
+  // was admitted or joined an existing PUT; it does NOT claim durability.
+  // Duplicates keep the first payload, even if their bytes or lengths differ.
   bool Put(const BlockKey& key, const void* data, size_t len);
 
-  // Disk-ACK contract: wait for the admitted key's actual flush result.
-  // kCacheFull is the only disk-fallback result; kIOError means an admitted
-  // leader exhausted its flush retries (duplicates observe the same result).
-  Status PutCommitted(const BlockKey& key, const void* data, size_t len);
+  // Only kBypass permits the caller to persist its own payload directly.
+  // kBackpressure is a terminal pre-admission rejection, even though both
+  // dispositions carry wire status kCacheFull.
+  enum class PutDisposition { kComplete, kBypass, kBackpressure };
+  struct PutResult {
+    Status status;
+    PutDisposition disposition = PutDisposition::kComplete;
+  };
 
-  // Cache RAM-ACK contract: acknowledge after the payload is copied into a
-  // visible, flush-pinned RAM entry. At the dirty-byte high watermark this
-  // request waits for disk commit, bounding acknowledged volatile data.
-  Status PutWriteBack(const BlockKey& key, const void* data, size_t len);
+  // Disk-ACK contract: wait for the admitted key's actual flush result.
+  // Admitted failures/cancellations return kIOError, never disk fallback.
+  PutResult PutCommitted(const BlockKey& key, const void* data, size_t len);
+
+  // Cache RAM-ACK contract: acknowledge a visible, flush-pinned copy. A
+  // positive dirty watermark rejects new keys before admission, without disk
+  // fallback. Duplicates join their first owner's terminal completion; zero
+  // watermark forces disk-ACK for every admission.
+  PutResult PutWriteBack(const BlockKey& key, const void* data, size_t len);
 
   // Read-promotion entry: install a value that is ALREADY durable on disk
   // (a coalesced cold read with fan-in evidence). Same allocation/index logic
@@ -199,7 +209,9 @@ class RamTier {
 
   // On hit, pins the resident allocation and returns one move-only owner.
   // Miss leaves `out` empty.
-  bool GetPrep(const BlockKey& key, uint64_t offset, uint64_t length, Hit* out);
+  // Observational probes acquire the same pin but defer hit/miss accounting.
+  bool GetPrep(const BlockKey& key, uint64_t offset, uint64_t length, Hit* out,
+               bool count_access = true);
 
   bool Contains(const BlockKey& key) const;
   bool Lookup(const BlockKey& key, size_t* value_len) const;
@@ -321,13 +333,14 @@ class RamTier {
   };
 
   friend class KvNodeServer;
+  friend class RamTierTestPeer;
   void ReleaseToken(uint64_t token);
   bool TryReserve(uint64_t bytes);
   bool TryReserveLarge(uint64_t bytes);
   void ReleaseBudget(uint64_t bytes);
   void ReleaseLargeBudget(uint64_t bytes);
   void EraseEvictedLocked(Shard& s, const std::vector<BlockKey>& keys);
-  enum class Admission { kAccepted, kDuplicate, kBypass };
+  enum class Admission { kAccepted, kDuplicate, kBypass, kRejected, kBackpressure };
   Admission Admit(const BlockKey& key, const void* data, size_t len,
                   bool client_ack,
                   std::shared_ptr<PutCompletion>* completion);

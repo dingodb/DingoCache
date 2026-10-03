@@ -454,10 +454,12 @@ void RamTier::CompletePut(
   completion->cv.notify_all();
 }
 
-Status RamTier::WaitPut(
-    const std::shared_ptr<PutCompletion>& completion) {
+Status RamTier::WaitPut(const std::shared_ptr<PutCompletion>& completion) {
   if (!completion) return Status::kIOError;
   std::unique_lock<std::mutex> lk(completion->mu);
+  // The shared completion owns the admitted value, not the caller's payload.
+  // Returning a bypass here could persist conflicting duplicate bytes while
+  // the original flush still owns its slot (or outlive Remove's disk fence).
   completion->cv.wait(lk, [&completion] { return completion->done; });
   return completion->success ? Status::kOk : Status::kIOError;
 }
@@ -468,22 +470,14 @@ RamTier::Admission RamTier::Admit(
   if (out_completion) out_completion->reset();
   if (!arena_ || len == 0 || data == nullptr) return Admission::kBypass;
   uint64_t requested_cap = 0;
-  if (!AlignCapacity(len, opt_.slot_granularity, &requested_cap) ||
-      requested_cap > opt_.bytes) {
-    put_bypass_.fetch_add(1, std::memory_order_relaxed);
-    return Admission::kBypass;
-  }
 
   Shard& s = ShardFor(key);
-  auto completion = std::make_shared<PutCompletion>();
+  std::shared_ptr<PutCompletion> completion;
   {
     std::lock_guard<std::mutex> lk(s.mu);
     auto existing = s.index.find(key);
     if (existing != s.index.end()) {
-      if (existing->second.remove_pending) {
-        put_bypass_.fetch_add(1, std::memory_order_relaxed);
-        return Admission::kBypass;
-      }
+      if (existing->second.remove_pending) return Admission::kRejected;
       if (!existing->second.completion) {
         existing->second.completion = std::make_shared<PutCompletion>();
         CompletePut(existing->second.completion, existing->second.durable);
@@ -496,6 +490,24 @@ RamTier::Admission RamTier::Admit(
       if (out_completion) *out_completion = writing->second;
       return Admission::kDuplicate;
     }
+    if (client_ack && opt_.ack_high_watermark_pct != 0) {
+      const uint64_t high =
+          opt_.bytes * std::min<uint32_t>(opt_.ack_high_watermark_pct, 100) / 100;
+      if (dirty_bytes_.load(std::memory_order_relaxed) >= high) {
+        // Only a NEW key may be rejected. No completion, allocation or flush
+        // ownership has been created, and this is NOT a direct-disk bypass.
+        ack_backpressure_.fetch_add(1, std::memory_order_relaxed);
+        return Admission::kBackpressure;
+      }
+    }
+    // An oversized conflicting duplicate must still join the first value,
+    // rather than bypassing RAM with different bytes.
+    if (!AlignCapacity(len, opt_.slot_granularity, &requested_cap) ||
+        requested_cap > opt_.bytes) {
+      put_bypass_.fetch_add(1, std::memory_order_relaxed);
+      return Admission::kBypass;
+    }
+    completion = std::make_shared<PutCompletion>();
     s.writing.emplace(key, completion);
   }
   if (out_completion) *out_completion = completion;
@@ -545,13 +557,17 @@ RamTier::Admission RamTier::Admit(
   }
 
   if (!admitted) {
+    bool canceled = false;
     {
       std::lock_guard<std::mutex> lk(s.mu);
       auto writing = s.writing.find(key);
       if (writing != s.writing.end() && writing->second == completion)
         s.writing.erase(writing);
+      std::lock_guard<std::mutex> state_lk(completion->mu);
+      canceled = completion->canceled;
     }
     CompletePut(completion, false);
+    if (canceled) return Admission::kRejected;
     put_bypass_.fetch_add(1, std::memory_order_relaxed);
     return Admission::kBypass;
   }
@@ -601,7 +617,7 @@ RamTier::Admission RamTier::Admit(
     else
       ReleaseBudget(cap);
     CompletePut(completion, false);
-    return Admission::kAccepted;
+    return Admission::kRejected;
   }
 
   s.cv.notify_one();
@@ -611,14 +627,18 @@ RamTier::Admission RamTier::Admit(
 
 bool RamTier::Put(const BlockKey& key, const void* data, size_t len) {
   std::shared_ptr<PutCompletion> completion;
-  return Admit(key, data, len, false, &completion) != Admission::kBypass;
+  const Admission admission = Admit(key, data, len, false, &completion);
+  return admission == Admission::kAccepted || admission == Admission::kDuplicate;
 }
 
-Status RamTier::PutCommitted(const BlockKey& key, const void* data, size_t len) {
+RamTier::PutResult RamTier::PutCommitted(
+    const BlockKey& key, const void* data, size_t len) {
   std::shared_ptr<PutCompletion> completion;
   const Admission admission = Admit(key, data, len, false, &completion);
-  if (admission == Admission::kBypass) return Status::kCacheFull;
-  return WaitPut(completion);
+  if (admission == Admission::kBypass)
+    return {Status::kCacheFull, PutDisposition::kBypass};
+  if (admission == Admission::kRejected) return {Status::kIOError};
+  return {WaitPut(completion)};
 }
 
 bool RamTier::ReserveDurable(const BlockKey& key, size_t len,
@@ -762,21 +782,23 @@ void RamTier::AbortReservation(
   CompletePut(state->completion, false);
 }
 
-Status RamTier::PutWriteBack(const BlockKey& key, const void* data, size_t len) {
-  const uint64_t high =
-      opt_.bytes * std::min<uint32_t>(opt_.ack_high_watermark_pct, 100) / 100;
-  const bool synchronous =
-      high == 0 || dirty_bytes_.load(std::memory_order_relaxed) >= high;
+RamTier::PutResult RamTier::PutWriteBack(
+    const BlockKey& key, const void* data, size_t len) {
+  const bool synchronous = opt_.ack_high_watermark_pct == 0;
   std::shared_ptr<PutCompletion> completion;
   const Admission admission =
       Admit(key, data, len, !synchronous, &completion);
-  if (admission == Admission::kBypass) return Status::kCacheFull;
-  if (synchronous) {
-    ack_backpressure_.fetch_add(1, std::memory_order_relaxed);
-    return WaitPut(completion);
+  if (admission == Admission::kBypass)
+    return {Status::kCacheFull, PutDisposition::kBypass};
+  if (admission == Admission::kBackpressure)
+    return {Status::kCacheFull, PutDisposition::kBackpressure};
+  if (admission == Admission::kRejected) return {Status::kIOError};
+  if (synchronous || admission == Admission::kDuplicate) {
+    if (synchronous) ack_backpressure_.fetch_add(1, std::memory_order_relaxed);
+    return {WaitPut(completion)};
   }
   ram_acks_.fetch_add(1, std::memory_order_relaxed);
-  return Status::kOk;
+  return {Status::kOk};
 }
 
 bool RamTier::PutDurable(const BlockKey& key, const void* data, size_t len) {
@@ -894,7 +916,7 @@ bool RamTier::PutDurable(const BlockKey& key, const void* data, size_t len) {
 }
 
 bool RamTier::GetPrep(const BlockKey& key, uint64_t offset, uint64_t length,
-                      Hit* out) {
+                      Hit* out, bool count_access) {
   if (out != nullptr) *out = Hit{};
   if (shards_.empty()) return false;
   const size_t sidx = KeyHash{}(key) % shards_.size();
@@ -902,7 +924,7 @@ bool RamTier::GetPrep(const BlockKey& key, uint64_t offset, uint64_t length,
   std::lock_guard<std::mutex> lk(s.mu);
   auto it = s.index.find(key);
   if (it == s.index.end() || it->second.remove_pending) {
-    misses_.fetch_add(1, std::memory_order_relaxed);
+    if (count_access) misses_.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
   Entry& e = it->second;
@@ -926,7 +948,7 @@ bool RamTier::GetPrep(const BlockKey& key, uint64_t offset, uint64_t length,
     out->token_ =
         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&e));
   }
-  hits_.fetch_add(1, std::memory_order_relaxed);
+  if (count_access) hits_.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 
@@ -1001,13 +1023,11 @@ bool RamTier::Remove(const BlockKey& key) {
   }
   if (completion) (void)WaitPut(completion);
   {
-    // Fallback tombstone: no install path may outlive Remove(). If the key
-    // nevertheless sits in the index untombstoned, mark it now (purging its
-    // queued flush, mirroring phase one) and run the normal drop path, so
-    // Remove never returns while the key is still visible.
+    // A new generation may already have been admitted after this completion
+    // retired. Only the removed generation belongs to this cleanup.
     std::lock_guard<std::mutex> lk(s.mu);
     auto it = s.index.find(key);
-    if (it != s.index.end()) {
+    if (it != s.index.end() && it->second.completion == completion) {
       Entry& e = it->second;
       if (!e.remove_pending) {
         e.remove_pending = true;
@@ -1057,60 +1077,50 @@ void RamTier::FlushLoop(Shard& s) {
   for (;;) {
     // Drain up to kFlushBatchMax queued items in one pass (one worker's batch).
     std::vector<QItem> batch;
+    std::vector<FlushItem> items;
     {
       std::unique_lock<std::mutex> lk(s.mu);
       s.cv.wait(lk, [&s] { return s.stop || !s.flushq.empty(); });
       if (s.stop && s.flushq.empty()) return;
+      const size_t capacity = std::min(s.flushq.size(), kFlushBatchMax);
+      batch.reserve(capacity);
+      items.reserve(capacity);
       while (!s.flushq.empty() && batch.size() < kFlushBatchMax) {
-        batch.push_back(std::move(s.flushq.front()));
+        QItem queued = std::move(s.flushq.front());
         s.flushq.pop_front();
-      }
-      s.flush_inflight += batch.size();
-    }
-
-    // Snapshot the slots (guaranteed present: queued items are flush-pinned,
-    // so they can't be evicted or Removed). live[] marks items still to flush.
-    const size_t B = batch.size();
-    std::vector<FlushItem> items(B);
-    std::vector<char> live(B, 0);
-    {
-      std::lock_guard<std::mutex> lk(s.mu);
-      for (size_t i = 0; i < B; ++i) {
-        auto it = s.index.find(batch[i].key);
+        auto it = s.index.find(queued.key);
         if (it == s.index.end() || it->second.durable ||
             it->second.remove_pending)
           continue;
+        // Dequeue and acquire flush ownership in the same critical section.
+        // Otherwise Remove/reinsert can replace the generation in between.
         it->second.flushing = true;
-        items[i] = FlushItem{batch[i].key, it->second.data(arena_),
-                             static_cast<size_t>(it->second.len),
-                             static_cast<size_t>(it->second.cap)};
-        live[i] = 1;
+        items.push_back(FlushItem{queued.key, it->second.data(arena_),
+                                  static_cast<size_t>(it->second.len),
+                                  static_cast<size_t>(it->second.cap)});
+        batch.push_back(std::move(queued));
       }
+      s.flush_inflight += batch.size();
     }
+    const size_t B = batch.size();
 
     // Flush: batched sink when wired (one store visit for the whole dequeue),
-    // else the per-item sink. Per-item ok/fail semantics identical either way.
+    // else the per-item sink. Every item is owned until this batch completes.
     std::vector<char> ok(B, 0);
-    if (flush_batch_) {
-      std::vector<FlushItem> sub;
-      std::vector<size_t> map;
-      for (size_t i = 0; i < B; ++i)
-        if (live[i]) { sub.push_back(items[i]); map.push_back(i); }
-      if (!sub.empty()) {
-        std::vector<bool> r = flush_batch_(sub);
-        for (size_t m = 0; m < map.size() && m < r.size(); ++m) ok[map[m]] = r[m] ? 1 : 0;
-      }
+    if (flush_batch_ && B != 0) {
+      std::vector<bool> results = flush_batch_(items);
+      for (size_t i = 0; i < B && i < results.size(); ++i)
+        ok[i] = results[i] ? 1 : 0;
     } else {
       for (size_t i = 0; i < B; ++i)
-        if (live[i])
-          ok[i] = (flush_ ? flush_(items[i].key, items[i].data, items[i].len, items[i].cap) : true) ? 1 : 0;
+        ok[i] = (!flush_ ||
+                 flush_(items[i].key, items[i].data, items[i].len,
+                        items[i].cap)) ? 1 : 0;
     }
-    if (!flush_ && !flush_batch_) for (size_t i = 0; i < B; ++i) ok[i] = live[i];
 
     {
       std::lock_guard<std::mutex> lk(s.mu);
       for (size_t i = 0; i < B; ++i) {
-        if (!live[i]) continue;
         auto it = s.index.find(batch[i].key);
         if (it == s.index.end()) continue;  // defensive
         Entry& entry = it->second;

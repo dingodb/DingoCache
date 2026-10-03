@@ -91,7 +91,7 @@ static void PrintUsage(FILE* stream) {
       "usage: dfkv_bench (--members name=ip:port,... | --mds ip:port,... [--group g])\n"
       "                  [--size BYTES] [--count N] [--threads T] [--batch B]\n"
       "                  [--bc N] [--op put|get|both] [--key-seed S]\n"
-      "                  [--ready-timeout SECS]\n");
+      "                  [--ready-timeout SECS] [--put-arena 0|1]\n");
 }
 
 static double Pct(std::vector<double>& v, double p) {
@@ -203,6 +203,22 @@ static void ReportDiagnostics(const char* phase, const std::string& before,
       (unsigned long long)PromMetricValue(
           after, "dfkv_rdma_client_max_block_seen_bytes"),
       (unsigned long long)declared_max_block);
+  // Distinguish connection setup work from steady-state data transfers.
+  std::printf(
+      "DIAG_CONN phase=%s v2_probe_attempts=%llu v2_probe_failures=%llu "
+      "endpoint_cache_hits=%llu endpoint_cache_misses=%llu "
+      "endpoint_cache_evictions=%llu\n",
+      phase,
+      (unsigned long long)CounterDelta(
+          before, after, "dfkv_rdma_client_v2_probe_attempts_total"),
+      (unsigned long long)CounterDelta(
+          before, after, "dfkv_rdma_client_v2_probe_failures_total"),
+      (unsigned long long)CounterDelta(
+          before, after, "dfkv_rdma_endpoint_cache_hits_total"),
+      (unsigned long long)CounterDelta(
+          before, after, "dfkv_rdma_endpoint_cache_misses_total"),
+      (unsigned long long)CounterDelta(
+          before, after, "dfkv_rdma_endpoint_cache_evictions_total"));
 }
 
 int main(int argc, char** argv) {
@@ -216,6 +232,7 @@ int main(int argc, char** argv) {
   }
   std::string members, mds, group = "default", op = "both", key_seed;
   size_t size = 2752512, count = 2000, threads = 8, batch = 1, bc = 0;
+  size_t put_arena = 0;
   size_t ready_timeout_s = 30, mds_poll_ms = 1000;
   for (int i = 1; i < argc; i += 2) {
     const char* flag = argv[i];
@@ -225,7 +242,7 @@ int main(int argc, char** argv) {
         !std::strcmp(flag, "--size") || !std::strcmp(flag, "--count") ||
         !std::strcmp(flag, "--threads") || !std::strcmp(flag, "--batch") ||
         !std::strcmp(flag, "--bc") || !std::strcmp(flag, "--op") ||
-        !std::strcmp(flag, "--key-seed");
+        !std::strcmp(flag, "--key-seed") || !std::strcmp(flag, "--put-arena");
     if (!known) {
       std::fprintf(stderr, "unknown argument: %s\n", flag);
       PrintUsage(stderr);
@@ -250,11 +267,16 @@ int main(int argc, char** argv) {
       else if (!std::strcmp(flag, "--threads")) target = &threads;
       else if (!std::strcmp(flag, "--batch")) target = &batch;
       else if (!std::strcmp(flag, "--bc")) target = &bc;
+      else if (!std::strcmp(flag, "--put-arena")) target = &put_arena;
       if (!ParseSize(value, target)) {
         std::fprintf(stderr, "invalid numeric value for %s: %s\n", flag, value);
         return 2;
       }
     }
+  }
+  if (put_arena > 1) {
+    std::fprintf(stderr, "--put-arena must be 0 or 1\n");
+    return 2;
   }
   if (op != "put" && op != "get" && op != "both") {
     std::fprintf(stderr, "invalid --op: %s (expected put, get, or both)\n", op.c_str());
@@ -354,15 +376,44 @@ int main(int argc, char** argv) {
   std::vector<double> lat;
   std::atomic<size_t> fails{0};
   size_t total_fails = 0;
+  const char* stall_env = std::getenv("DFKV_BENCH_STALL_MS");
+  const long stall_ms = stall_env && *stall_env
+                            ? std::strtol(stall_env, nullptr, 10)
+                            : 0;
 
   if (op == "put" || op == "both") {
     fails.store(0);
     const std::string diag_before = c.MetricsSnapshot();
+    // --put-arena 1: register the shared source buffer so PUT payload SGEs
+    // hit the pool path instead of a per-op ad-hoc MR (ibv_reg_mr per op).
+    // The buffer is read-only for the wire lifetime of each op; a missing or
+    // failed registration invalidates the comparison, so fail closed.
+    if (put_arena) {
+      if (!c.RegisterMemory(val.data(), val.size())) {
+        std::fprintf(stderr,
+                     "dfkv_bench: PUT source arena registration failed "
+                     "(bytes=%zu); refusing an ad-hoc-MR fallback\n",
+                     val.size());
+        ReportDiagnostics("PUT_SETUP", diag_before, c.MetricsSnapshot());
+        return 2;
+      }
+      std::printf("PUT_SETUP registered_source_bytes=%zu\n", val.size());
+    }
     double s = RunPhase(units, threads, [&](size_t u) {
       size_t base = u * batch, w = std::min(batch, count - base);
       std::vector<KvPutItem> items(w);
       for (size_t j = 0; j < w; ++j) items[j] = {key(base + j), val.data(), val.size()};
+      const auto st0 = stall_ms > 0 ? Clock::now() : Clock::time_point{};
       auto oks = c.BatchPut(items);
+      if (stall_ms > 0) {
+        const auto st1 = Clock::now();
+        double ms = std::chrono::duration<double, std::milli>(st1 - st0).count();
+        if (ms >= static_cast<double>(stall_ms))
+          std::fprintf(stderr, "STALL %.3f dur=%.1fms u=%zu phase=PUT\n",
+                       std::chrono::duration<double>(
+                           std::chrono::system_clock::now().time_since_epoch()).count(),
+                       ms, u);
+      }
       size_t succeeded = 0;
       for (size_t j = 0; j < std::min(w, oks.size()); ++j) {
         if (oks[j]) ++succeeded;
@@ -424,18 +475,16 @@ int main(int argc, char** argv) {
         items[j] = {key(base + j), mybuf + j * stride, size};
       // DFKV_BENCH_STALL_MS: log wall-clock timestamps of slow calls to stderr
       // so stalls can be time-correlated across processes/nodes (diagnostics).
-      static const long stall_ms = [] {
-        const char* e = std::getenv("DFKV_BENCH_STALL_MS");
-        return e && *e ? std::strtol(e, nullptr, 10) : 0;
-      }();
-      const auto st0 = std::chrono::system_clock::now();
+      const auto st0 = stall_ms > 0 ? Clock::now() : Clock::time_point{};
       auto hits = c.BatchGet(items);
       if (stall_ms > 0) {
-        const auto st1 = std::chrono::system_clock::now();
+        const auto st1 = Clock::now();
         double ms = std::chrono::duration<double, std::milli>(st1 - st0).count();
         if (ms >= static_cast<double>(stall_ms))
-          std::fprintf(stderr, "STALL %.3f dur=%.1fms u=%zu\n",
-                       std::chrono::duration<double>(st1.time_since_epoch()).count(), ms, u);
+          std::fprintf(stderr, "STALL %.3f dur=%.1fms u=%zu phase=GET\n",
+                       std::chrono::duration<double>(
+                           std::chrono::system_clock::now().time_since_epoch()).count(),
+                       ms, u);
       }
       size_t succeeded = 0;
       for (size_t j = 0; j < std::min(w, hits.size()); ++j) {
