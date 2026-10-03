@@ -4193,6 +4193,93 @@ TEST(RdmaLoopback, ManyAdaptiveDepthOneConnectionsStayBounded) {
             static_cast<long>(count) * 32 * 1024);
 }
 
+static void ExerciseDepthOneReplyCredits(bool use_uring) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+#ifndef DFKV_WITH_URING
+  if (use_uring) GTEST_SKIP() << "io_uring not compiled";
+#endif
+  ScopedEnv uring("DFKV_SERVER_URING", use_uring ? "1" : "0");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "1");
+  ScopedEnv max_block("DFKV_RDMA_MAX_BLOCK_BYTES", "4096");
+  ScopedEnv min_block("DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES", "4096");
+  ScopedEnv ram_on("DFKV_RAM_TIER", "1");
+  ScopedEnv ram_bytes("DFKV_RAM_TIER_BYTES", "134217728");
+  ScopedEnv extent("DFKV_RAM_TIER_EXTENT_BYTES", "1048576");
+  ScopedEnv reserve("DFKV_RAM_TIER_LARGE_RESERVE_BYTES", "0");
+  ScopedEnv shards("DFKV_RAM_TIER_SHARDS", "4");
+  RdmaNode node(use_uring ? "reply-credit-uring" : "reply-credit-sync");
+  constexpr size_t kClients = 32;
+  // Registered source storage outlives every client and transport.
+  std::vector<std::string> values;
+  values.reserve(kClients);
+  for (size_t i = 0; i < kClients; ++i)
+    values.push_back(PatternValue(4096, 101 + i));
+  std::vector<std::unique_ptr<RdmaTransport>> transports;
+  std::vector<std::unique_ptr<KVClient>> clients;
+  for (size_t i = 0; i < kClients; ++i) {
+    auto transport = std::make_unique<RdmaTransport>(
+        kMaxMsg, node.rsrv->DeviceNames().front());
+    auto client = std::make_unique<KVClient>(
+        std::vector<std::pair<std::string, std::string>>{{"n", node.addr}},
+        SelfHdr(), transport.get());
+    ASSERT_TRUE(client->RegisterMemory(values[i].data(), values[i].size()));
+    ASSERT_TRUE(client->Put("reply-" + std::to_string(i),
+                            values[i].data(), values[i].size()));
+    transports.push_back(std::move(transport));
+    clients.push_back(std::move(client));
+  }
+  if (use_uring && CounterVal(node.rsrv->MetricsText(),
+                              "dfkv_uring_init_fallbacks_total") != 0)
+    GTEST_SKIP() << "io_uring unavailable at runtime";
+
+  std::mutex gate_mu;
+  std::condition_variable gate_cv;
+  bool start = false;
+  std::vector<int> failures(kClients, 0);
+  std::vector<std::thread> workers;
+  for (size_t i = 0; i < kClients; ++i) {
+    workers.emplace_back([&, i] {
+      {
+        std::unique_lock<std::mutex> lock(gate_mu);
+        gate_cv.wait(lock, [&] { return start; });
+      }
+      const std::string key = "reply-" + std::to_string(i);
+      const std::vector<KvPutItem> items{{key, values[i].data(), values[i].size()}};
+      for (size_t round = 0; round < 128; ++round) {
+        const auto results = clients[i]->BatchPut(items);
+        if (results.size() != 1 || !results[0]) {
+          ++failures[i];
+          return;
+        }
+      }
+      std::string output(values[i].size(), '\0');
+      if (!clients[i]->Get(key, output.data(), output.size()) ||
+          output != values[i])
+        ++failures[i];
+    });
+  }
+  {
+    std::lock_guard<std::mutex> lock(gate_mu);
+    start = true;
+  }
+  gate_cv.notify_all();
+  for (auto& worker : workers) worker.join();
+  for (size_t i = 0; i < kClients; ++i) {
+    EXPECT_EQ(failures[i], 0) << "client " << i;
+    EXPECT_EQ(CounterVal(transports[i]->MetricsText(),
+                         "dfkv_rdma_client_completion_timeouts_total"), 0)
+        << "client " << i;
+  }
+}
+
+TEST(RdmaLoopback, DepthOneReplyCreditsSurviveConcurrentReuseSync) {
+  ExerciseDepthOneReplyCredits(false);
+}
+
+TEST(RdmaLoopback, DepthOneReplyCreditsSurviveConcurrentReuseUring) {
+  ExerciseDepthOneReplyCredits(true);
+}
+
 TEST(RdmaLoopback, ServerReceivePoolCommitsChunksOnDemand) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   ScopedEnv recv_max("DFKV_RDMA_RECV_SEGMENT_SIZE", "4194304");
