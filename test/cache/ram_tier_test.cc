@@ -15,12 +15,41 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using dfkv::BlockKey;
 using dfkv::RamTier;
 using dfkv::Status;
 using namespace std::chrono_literals;
+
+namespace dfkv {
+// Exercise the admission/completion boundary without scheduling a duplicate
+// into a sleep-sized race window.
+class RamTierTestPeer {
+ public:
+  using Admission = RamTier::Admission;
+  using Completion = std::shared_ptr<RamTier::PutCompletion>;
+
+  static Admission Admit(RamTier& tier, const BlockKey& key,
+                         const std::string& value, Completion* completion,
+                         bool client_ack = false) {
+    return tier.Admit(key, value.data(), value.size(), client_ack, completion);
+  }
+  static bool Done(const Completion& completion) {
+    std::lock_guard<std::mutex> lock(completion->mu);
+    return completion->done;
+  }
+  static bool AwaitDone(const Completion& completion) {
+    std::unique_lock<std::mutex> lock(completion->mu);
+    return completion->cv.wait_for(lock, 2s, [&] { return completion->done; });
+  }
+  static Status Wait(const Completion& completion) {
+    return RamTier::WaitPut(completion);
+  }
+};
+}  // namespace dfkv
+using dfkv::RamTierTestPeer;
 
 namespace {
 BlockKey K(uint64_t id) { return BlockKey{id, 0}; }
@@ -31,23 +60,37 @@ struct FlushSink {
   std::mutex m;
   std::condition_variable cv;
   std::set<std::string> flushed;
+  std::unordered_map<std::string, std::string> values;
   bool gate_open = true;      // when false, flush blocks
   bool fail = false;          // when true, flush returns false
   int calls = 0;
 
   RamTier::FlushFn fn() {
-    return [this](const BlockKey& k, char*, size_t, size_t) {
+    return [this](const BlockKey& k, char* data, size_t len, size_t) {
       std::unique_lock<std::mutex> lk(m);
       ++calls;
+      cv.notify_all();
       cv.wait(lk, [this] { return gate_open; });
       if (fail) return false;
       flushed.insert(k.Filename());
+      values.emplace(k.Filename(), std::string(data, len));
       cv.notify_all();
       return true;
     };
   }
   void open() { { std::lock_guard<std::mutex> lk(m); gate_open = true; } cv.notify_all(); }
   void close() { std::lock_guard<std::mutex> lk(m); gate_open = false; }
+  bool await_calls(int count) {
+    std::unique_lock<std::mutex> lk(m);
+    return cv.wait_for(lk, 2s, [&] { return calls >= count; });
+  }
+};
+
+// Declare after RamTier: fatal assertions must open the sink before the tier
+// destructor joins its flush workers.
+struct OpenFlushOnExit {
+  FlushSink& sink;
+  ~OpenFlushOnExit() { sink.open(); }
 };
 
 // Poll a predicate up to ~2s.
@@ -90,7 +133,7 @@ TEST(RamTier, ShutdownDrainTimeoutAndAckDurabilityLatencyAreObservable) {
   sink.close();
   RamTier rt(Opts(64 * 4096), sink.fn());
   const std::string value(4096, 'd');
-  ASSERT_EQ(rt.PutWriteBack(K(2), value.data(), value.size()), Status::kOk);
+  ASSERT_EQ(rt.PutWriteBack(K(2), value.data(), value.size()).status, Status::kOk);
 
   EXPECT_FALSE(rt.WaitForDrain(10ms));
   EXPECT_EQ(rt.ShutdownDrainTimeouts(), 1u);
@@ -136,7 +179,7 @@ TEST(RamTier, WriteBackAcknowledgesVisiblePinnedRamBeforeFlush) {
   RamTier rt(Opts(64 * 4096), sink.fn());
   const std::string value(4096, 'w');
 
-  EXPECT_EQ(rt.PutWriteBack(K(101), value.data(), value.size()), Status::kOk);
+  EXPECT_EQ(rt.PutWriteBack(K(101), value.data(), value.size()).status, Status::kOk);
   EXPECT_EQ(rt.RamAcks(), 1u);
   EXPECT_EQ(rt.DirtyObjects(), 1u);
   EXPECT_EQ(rt.DirtyBytes(), 4096u);
@@ -151,29 +194,107 @@ TEST(RamTier, WriteBackAcknowledgesVisiblePinnedRamBeforeFlush) {
   EXPECT_EQ(rt.DirtyBytes(), 0u);
 }
 
-TEST(RamTier, WriteBackWatermarkWaitsForDiskCommit) {
+TEST(RamTier, ZeroWatermarkWaitsForDiskCommit) {
   FlushSink sink;
   sink.close();
   RamTier::Options options = Opts(2 * 4096, 4096);
-  options.ack_high_watermark_pct = 50;
+  options.large_reserve_bytes = 0;
+  options.ack_high_watermark_pct = 0;
   RamTier rt(options, sink.fn());
+  OpenFlushOnExit cleanup{sink};
   const std::string value(4096, 'b');
-
-  ASSERT_EQ(rt.PutWriteBack(K(102), value.data(), value.size()), Status::kOk);
-  std::atomic<bool> completed{false};
   Status result = Status::kInvalid;
   std::thread put([&] {
-    result = rt.PutWriteBack(K(103), value.data(), value.size());
-    completed.store(true, std::memory_order_release);
+    result = rt.PutWriteBack(K(103), value.data(), value.size()).status;
   });
-  std::this_thread::sleep_for(10ms);
-  EXPECT_FALSE(completed.load(std::memory_order_acquire));
-  EXPECT_EQ(rt.AckBackpressure(), 1u);
-
+  // The flush callback is the barrier: this request has been admitted and
+  // cannot be durable until we release it. No scheduling sleeps are needed.
+  const bool entered = sink.await_calls(1);
+  EXPECT_TRUE(entered);
+  if (entered) {
+    EXPECT_EQ(rt.RamAcks(), 0u);
+    EXPECT_EQ(rt.DirtyObjects(), 1u);
+  }
   sink.open();
   put.join();
   EXPECT_EQ(result, Status::kOk);
-  EXPECT_TRUE(WaitFor([&] { return rt.DirtyObjects() == 0u; }));
+  EXPECT_EQ(rt.AckBackpressure(), 1u);
+  EXPECT_EQ(rt.DirtyObjects(), 0u);
+}
+
+TEST(RamTier, PositiveWatermarkRejectsNewKeysButPreservesExistingOwners) {
+  FlushSink sink;
+  sink.close();
+  RamTier::Options options = Opts(4 * 4096);
+  options.large_reserve_bytes = 0;
+  options.ack_high_watermark_pct = 25;
+  RamTier rt(options, sink.fn());
+  OpenFlushOnExit cleanup{sink};
+  const std::string first(500, 'a'), different(1000, 'b');
+  const auto accepted = rt.PutWriteBack(K(105), first.data(), first.size());
+  ASSERT_EQ(accepted.status, Status::kOk);
+  EXPECT_EQ(accepted.disposition, RamTier::PutDisposition::kComplete);
+  ASSERT_TRUE(sink.await_calls(1));
+  ASSERT_EQ(rt.DirtyBytes(), 4096u);  // exactly the positive watermark
+
+  // Both payloads resolve to the same pending completion even at saturation.
+  RamTierTestPeer::Completion leader, duplicate, rejected;
+  ASSERT_EQ(RamTierTestPeer::Admit(rt, K(105), first, &leader, true),
+            RamTierTestPeer::Admission::kDuplicate);
+  ASSERT_EQ(RamTierTestPeer::Admit(rt, K(105), different, &duplicate, true),
+            RamTierTestPeer::Admission::kDuplicate);
+  EXPECT_EQ(leader, duplicate);
+  EXPECT_FALSE(RamTierTestPeer::Done(duplicate));
+  ASSERT_EQ(RamTierTestPeer::Admit(rt, K(106), different, &rejected, true),
+            RamTierTestPeer::Admission::kBackpressure);
+  EXPECT_FALSE(rejected);  // rejection created no ownership or flush work
+  EXPECT_FALSE(rt.Contains(K(106)));
+  EXPECT_EQ(rt.DirtyBytes(), 4096u);
+  EXPECT_EQ(rt.PutBypass(), 0u);
+  EXPECT_EQ(rt.AckBackpressure(), 1u);
+
+  // Tombstones also resolve before the watermark and retain their error.
+  ASSERT_TRUE(rt.PutDurable(K(107), first.data(), first.size()));
+  RamTier::Hit pin;
+  ASSERT_TRUE(rt.GetPrep(K(107), 0, 0, &pin));
+  ASSERT_TRUE(rt.Remove(K(107)));
+  const auto removed = rt.PutWriteBack(K(107), different.data(), different.size());
+  EXPECT_EQ(removed.status, Status::kIOError);
+  EXPECT_EQ(removed.disposition, RamTier::PutDisposition::kComplete);
+  pin = RamTier::Hit{};
+  ASSERT_TRUE(rt.GetPrep(K(105), 0, 0, &pin));
+  EXPECT_EQ(std::string(pin.ptr, pin.len), first);
+  pin = RamTier::Hit{};
+
+  sink.open();
+  ASSERT_TRUE(RamTierTestPeer::AwaitDone(leader));
+  EXPECT_EQ(RamTierTestPeer::Wait(duplicate), Status::kOk);
+  EXPECT_EQ(rt.DirtyBytes(), 0u);
+  const auto recovered = rt.PutWriteBack(K(106), different.data(), different.size());
+  EXPECT_EQ(recovered.status, Status::kOk);
+  EXPECT_EQ(recovered.disposition, RamTier::PutDisposition::kComplete);
+  ASSERT_EQ(rt.PutCommitted(K(106), first.data(), first.size()).status,
+            Status::kOk);
+  std::lock_guard<std::mutex> lock(sink.m);
+  EXPECT_EQ(sink.values.at(K(105).Filename()), first);
+  EXPECT_EQ(sink.values.at(K(106).Filename()), different);
+}
+
+TEST(RamTier, CapacityBypassRemainsDistinctFromTerminalBackpressure) {
+  FlushSink sink;
+  RamTier::Options options = Opts(4 * 4096);
+  options.large_reserve_bytes = 0;
+  RamTier rt(options, sink.fn());
+  const std::string too_large(options.bytes + 4096, 'x');
+  for (const auto result : {
+           rt.PutWriteBack(K(108), too_large.data(), too_large.size()),
+           rt.PutCommitted(K(109), too_large.data(), too_large.size())}) {
+    EXPECT_EQ(result.status, Status::kCacheFull);
+    EXPECT_EQ(result.disposition, RamTier::PutDisposition::kBypass);
+  }
+  EXPECT_EQ(rt.Count(), 0u);
+  EXPECT_EQ(rt.DirtyBytes(), 0u);
+  EXPECT_EQ(rt.AckBackpressure(), 0u);
 }
 
 TEST(RamTier, WriteBackFlushFailureIsPostAckAndUnhealthy) {
@@ -184,7 +305,7 @@ TEST(RamTier, WriteBackFlushFailureIsPostAckAndUnhealthy) {
   RamTier rt(options, sink.fn());
   const std::string value(500, 'f');
 
-  EXPECT_EQ(rt.PutWriteBack(K(104), value.data(), value.size()), Status::kOk);
+  EXPECT_EQ(rt.PutWriteBack(K(104), value.data(), value.size()).status, Status::kOk);
   ASSERT_TRUE(WaitFor([&] { return rt.FlushDropped() == 1u; }));
   EXPECT_EQ(rt.PostAckFlushFailures(), 1u);
   EXPECT_EQ(rt.DirtyObjects(), 0u);
@@ -364,86 +485,155 @@ TEST(RamTier, FlushFailureRetriesThenDrops) {
     EXPECT_GE(sink.calls, 3);
   }
 }
-TEST(RamTier, InflightDuplicateWaitsForLeaderCommit) {
+TEST(RamTier, InflightConflictingDuplicateKeepsLeaderPayloadAndCompletion) {
   FlushSink sink;
   sink.close();
-  RamTier rt(Opts(8 * 4096), sink.fn());
+  RamTier::Options options = Opts(8 * 4096);
+  options.large_reserve_bytes = 0;
+  RamTier rt(options, sink.fn());
+  OpenFlushOnExit cleanup{sink};
   const std::string leader(500, 'a');
-  const std::string follower(500, 'b');
-  Status first = Status::kInvalid;
-  Status second = Status::kInvalid;
-  std::atomic<bool> second_done{false};
-  std::thread t1([&] {
-    first = rt.PutCommitted(K(31), leader.data(), leader.size());
-  });
-  ASSERT_TRUE(WaitFor([&] {
-    std::lock_guard<std::mutex> lk(sink.m);
-    return sink.calls == 1;
-  }));
-  std::thread t2([&] {
-    second = rt.PutCommitted(K(31), follower.data(), follower.size());
-    second_done.store(true, std::memory_order_release);
-  });
-  std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  EXPECT_FALSE(second_done.load(std::memory_order_acquire));
+  // A duplicate larger than the entire tier must still join the first value.
+  const std::string follower(options.bytes + 4096, 'b');
+  RamTierTestPeer::Completion first, second;
+  ASSERT_EQ(RamTierTestPeer::Admit(rt, K(31), leader, &first),
+            RamTierTestPeer::Admission::kAccepted);
+  ASSERT_TRUE(sink.await_calls(1));
+  ASSERT_EQ(RamTierTestPeer::Admit(rt, K(31), follower, &second),
+            RamTierTestPeer::Admission::kDuplicate);
+  ASSERT_EQ(first, second);
+  EXPECT_FALSE(RamTierTestPeer::Done(first));
+  EXPECT_EQ(rt.PutBypass(), 0u);
+  RamTier::Hit hit;
+  ASSERT_TRUE(rt.GetPrep(K(31), 0, 0, &hit));
+  EXPECT_EQ(std::string(hit.ptr, hit.len), leader);
+  hit = RamTier::Hit{};
+
   sink.open();
-  t1.join();
-  t2.join();
-  EXPECT_EQ(first, Status::kOk);
-  EXPECT_EQ(second, Status::kOk);
-  RamTier::Hit h;
-  ASSERT_TRUE(rt.GetPrep(K(31), 0, 0, &h));
-  EXPECT_EQ(std::string(h.ptr, h.len), leader);
-  h = RamTier::Hit{};
+  ASSERT_TRUE(RamTierTestPeer::AwaitDone(first));
+  EXPECT_EQ(RamTierTestPeer::Wait(first), Status::kOk);
+  EXPECT_EQ(RamTierTestPeer::Wait(second), Status::kOk);
+  // Both public ACK modes preserve the leader after commit, too.
+  EXPECT_EQ(rt.PutCommitted(K(31), follower.data(), follower.size()).status,
+            Status::kOk);
+  EXPECT_EQ(rt.PutWriteBack(K(31), follower.data(), follower.size()).status,
+            Status::kOk);
+  std::lock_guard<std::mutex> lock(sink.m);
+  EXPECT_EQ(sink.calls, 1);
+  EXPECT_EQ(sink.values.at(K(31).Filename()), leader);
 }
 
 TEST(RamTier, InflightDuplicateSharesTerminalLeaderFailure) {
   FlushSink sink;
   sink.close();
   sink.fail = true;
-  RamTier::Options o = Opts(8 * 4096);
-  o.flush_retries = 1;
-  RamTier rt(o, sink.fn());
-  const std::string value(500, 'f');
-  Status first = Status::kInvalid;
-  Status second = Status::kInvalid;
-  std::atomic<bool> second_done{false};
-  std::thread t1([&] {
-    first = rt.PutCommitted(K(32), value.data(), value.size());
-  });
-  ASSERT_TRUE(WaitFor([&] {
-    std::lock_guard<std::mutex> lk(sink.m);
-    return sink.calls == 1;
-  }));
-  std::thread t2([&] {
-    second = rt.PutCommitted(K(32), value.data(), value.size());
-    second_done.store(true, std::memory_order_release);
-  });
-  std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  EXPECT_FALSE(second_done.load(std::memory_order_acquire));
+  RamTier::Options options = Opts(8 * 4096);
+  options.large_reserve_bytes = 0;
+  options.flush_retries = 1;
+  RamTier rt(options, sink.fn());
+  OpenFlushOnExit cleanup{sink};
+  const std::string leader(500, 'a');
+  const std::string follower(1000, 'b');
+  RamTierTestPeer::Completion first, second;
+  ASSERT_EQ(RamTierTestPeer::Admit(rt, K(32), leader, &first),
+            RamTierTestPeer::Admission::kAccepted);
+  ASSERT_TRUE(sink.await_calls(1));
+  ASSERT_EQ(RamTierTestPeer::Admit(rt, K(32), follower, &second),
+            RamTierTestPeer::Admission::kDuplicate);
+  ASSERT_EQ(first, second);
+  EXPECT_FALSE(RamTierTestPeer::Done(second));
   sink.open();
-  t1.join();
-  t2.join();
-  EXPECT_EQ(first, Status::kIOError);
-  EXPECT_EQ(second, Status::kIOError);
+  ASSERT_TRUE(RamTierTestPeer::AwaitDone(first));
+  EXPECT_EQ(RamTierTestPeer::Wait(first), Status::kIOError);
+  EXPECT_EQ(RamTierTestPeer::Wait(second), Status::kIOError);
+  EXPECT_EQ(rt.PutBypass(), 0u);
   EXPECT_FALSE(rt.healthy());
   EXPECT_FALSE(rt.Contains(K(32)));
 }
 
-TEST(RamTier, RemoveCancelsQueuedEntry) {
+TEST(RamTier, RemoveCancelsQueuedGenerationBeforeReinsert) {
   FlushSink sink;
   sink.close();
-  RamTier rt(Opts(8 * 4096), sink.fn());
-  const std::string value(500, 'q');
-  ASSERT_TRUE(rt.Put(K(33), value.data(), value.size()));
-  ASSERT_TRUE(WaitFor([&] {
-    std::lock_guard<std::mutex> lk(sink.m);
-    return sink.calls == 1;
-  }));
-  ASSERT_TRUE(rt.Put(K(34), value.data(), value.size()));
-  EXPECT_TRUE(rt.Remove(K(34)));
+  RamTier::Options options = Opts(8 * 4096);
+  options.large_reserve_bytes = 0;
+  RamTier rt(options, sink.fn());
+  OpenFlushOnExit cleanup{sink};
+  const std::string old_value(500, 'q');
+  const std::string new_value(700, 'n');
+  ASSERT_TRUE(rt.Put(K(33), old_value.data(), old_value.size()));
+  ASSERT_TRUE(sink.await_calls(1));  // sole flusher owns the blocker
+
+  RamTierTestPeer::Completion old, duplicate, replacement;
+  ASSERT_EQ(RamTierTestPeer::Admit(rt, K(34), old_value, &old),
+            RamTierTestPeer::Admission::kAccepted);
+  ASSERT_EQ(RamTierTestPeer::Admit(rt, K(34), new_value, &duplicate),
+            RamTierTestPeer::Admission::kDuplicate);
+  ASSERT_EQ(old, duplicate);
+  ASSERT_TRUE(rt.Remove(K(34)));  // queued, so cancellation is synchronous
+  EXPECT_EQ(RamTierTestPeer::Wait(old), Status::kIOError);
+  EXPECT_EQ(RamTierTestPeer::Wait(duplicate), Status::kIOError);
   EXPECT_FALSE(rt.Contains(K(34)));
+  ASSERT_EQ(RamTierTestPeer::Admit(rt, K(34), new_value, &replacement),
+            RamTierTestPeer::Admission::kAccepted);
+  EXPECT_NE(old, replacement);
+  EXPECT_FALSE(RamTierTestPeer::Done(replacement));
   sink.open();
+  ASSERT_TRUE(RamTierTestPeer::AwaitDone(replacement));
+  EXPECT_EQ(RamTierTestPeer::Wait(replacement), Status::kOk);
+  EXPECT_EQ(RamTierTestPeer::Wait(old), Status::kIOError);
+  std::lock_guard<std::mutex> lock(sink.m);
+  EXPECT_EQ(sink.calls, 2);
+  EXPECT_EQ(sink.values.at(K(34).Filename()), new_value);
+}
+
+TEST(RamTier, RemovedPinnedGenerationRejectsRatherThanBypassing) {
+  FlushSink sink;
+  RamTier::Options options = Opts(8 * 4096);
+  options.large_reserve_bytes = 0;
+  RamTier rt(options, sink.fn());
+  const std::string first(500, 'a');
+  const std::string conflicting(options.bytes + 4096, 'b');
+  ASSERT_TRUE(rt.PutDurable(K(35), first.data(), first.size()));
+  RamTier::Hit pinned;
+  ASSERT_TRUE(rt.GetPrep(K(35), 0, 0, &pinned));
+  ASSERT_TRUE(rt.Remove(K(35)));
+  EXPECT_FALSE(rt.Contains(K(35)));
+  // Physical ownership has not retired: neither payload size nor ACK mode
+  // permits a direct-disk fallback while the old generation is still pinned.
+  EXPECT_EQ(rt.PutCommitted(K(35), conflicting.data(), conflicting.size()).status,
+            Status::kIOError);
+  EXPECT_EQ(rt.PutWriteBack(K(35), conflicting.data(), conflicting.size()).status,
+            Status::kIOError);
+  EXPECT_EQ(rt.PutBypass(), 0u);
+  EXPECT_EQ(std::string(pinned.ptr, pinned.len), first);
+  pinned = RamTier::Hit{};
+  EXPECT_EQ(rt.UsedBytes(), 0u);
+  const std::string replacement(700, 'n');
+  EXPECT_EQ(rt.PutCommitted(K(35), replacement.data(), replacement.size()).status,
+            Status::kOk);
+  ASSERT_TRUE(rt.GetPrep(K(35), 0, 0, &pinned));
+  EXPECT_EQ(std::string(pinned.ptr, pinned.len), replacement);
+}
+
+TEST(RamTier, DuplicateOfAbortedHiddenReservationSharesFailure) {
+  FlushSink sink;
+  RamTier::Options options = Opts(8 * 4096);
+  options.large_reserve_bytes = 0;
+  RamTier rt(options, sink.fn());
+  RamTier::DurableReservation reservation;
+  ASSERT_TRUE(rt.ReserveDurable(K(36), 4096, &reservation));
+  const std::string duplicate(1000, 'd');
+  RamTierTestPeer::Completion completion;
+  ASSERT_EQ(RamTierTestPeer::Admit(rt, K(36), duplicate, &completion),
+            RamTierTestPeer::Admission::kDuplicate);
+  EXPECT_FALSE(RamTierTestPeer::Done(completion));
+  EXPECT_FALSE(rt.Contains(K(36)));
+  reservation = RamTier::DurableReservation{};
+  ASSERT_TRUE(RamTierTestPeer::Done(completion));
+  EXPECT_EQ(RamTierTestPeer::Wait(completion), Status::kIOError);
+  EXPECT_FALSE(rt.Contains(K(36)));
+  EXPECT_EQ(rt.UsedBytes(), 0u);
+  EXPECT_EQ(rt.PutBypass(), 0u);
 }
 
 TEST(RamTier, RemoveHidesActiveFlushAndDefersPinnedRelease) {
@@ -839,6 +1029,7 @@ TEST(RamTier, BatchFlushDrainsQueueAndRetriesPerItem) {
   EXPECT_FALSE(rt.Contains(K(900))) << "dropped after retries";
   EXPECT_TRUE(rt.Contains(K(901)));
 }
+
 
 // Sharded tier: keys route by hash to independent shards; the whole lifecycle
 // (put -> visible -> flush -> durable -> get/pin/release -> remove) must hold

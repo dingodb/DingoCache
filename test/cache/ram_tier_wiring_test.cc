@@ -4,14 +4,17 @@
 #include "cache/kv_node_server.h"
 #include "client/key_map.h"
 #include "transport/tcp_transport.h"
+#include "transport/transport.h"
 
 #include <gtest/gtest.h>
 
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <atomic>
 #include <thread>
@@ -22,7 +25,96 @@ using namespace dfkv;  // NOLINT
 
 using namespace std::chrono_literals;
 
+namespace dfkv {
+class KvNodeServerWiringTestPeer {
+ public:
+  static std::unique_ptr<KvNodeServer> Create(DiskCacheGroup::Options options) {
+    return std::unique_ptr<KvNodeServer>(new KvNodeServer(std::move(options)));
+  }
+  static void SetLimit(KvNodeServer& server, size_t limit) {
+    server.put_busy_limit_ = limit;
+  }
+  static bool Begin(KvNodeServer& server) { return server.TryBeginPut(); }
+  static void End(KvNodeServer& server) { server.EndPut(); }
+  static void SetRam(KvNodeServer& server, RamTier::FlushFn flush,
+                     bool ram_ack = false, uint32_t watermark_pct = 80) {
+    RamTier::Options options;
+    options.bytes = 16 * 4096;
+    options.large_reserve_bytes = 0;
+    options.reclaim_interval_ms = 0;
+    options.ack_high_watermark_pct = watermark_pct;
+    server.ram_ = std::make_unique<RamTier>(options, std::move(flush));
+    server.ram_write_back_ = true;
+    server.ram_ack_enabled_ = ram_ack;
+  }
+  static bool Resident(KvNodeServer& server, const BlockKey& key) {
+    return server.ram_->Contains(key);
+  }
+  static Status Persist(KvNodeServer& server, const BlockKey& key,
+                        const char* data, size_t len) {
+    return server.group_.Cache(key, data, len);
+  }
+  static Status DiskRead(KvNodeServer& server, const BlockKey& key,
+                         std::string* out) {
+    return server.group_.Range(key, 0, 0, out);
+  }
+  static bool Drain(KvNodeServer& server) {
+    return server.ram_->WaitForDrain(2s);
+  }
+};
+}  // namespace dfkv
+
 namespace {
+// Count actual backend entry, including failed writes; absence of a file alone
+// would not prove a terminal rejection avoided the direct-disk handler.
+class CountingStore : public KVStore {
+ public:
+  CountingStore(const std::string& path, uint64_t capacity,
+                std::atomic<size_t>& calls)
+      : KVStore(Options{path, capacity}), calls_(calls) {}
+  Status Cache(const BlockKey& key, const void* data, size_t len) override {
+    calls_.fetch_add(1, std::memory_order_relaxed);
+    return KVStore::Cache(key, data, len);
+  }
+  Status CacheDirect(const BlockKey& key, char* data, size_t len,
+                     size_t cap) override {
+    calls_.fetch_add(1, std::memory_order_relaxed);
+    return KVStore::CacheDirect(key, data, len, cap);
+  }
+
+ private:
+  std::atomic<size_t>& calls_;
+};
+
+struct FlushBarrier {
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool entered = false;
+  bool released = false;
+  void Block() {
+    std::unique_lock<std::mutex> lock(mutex);
+    entered = true;
+    cv.notify_all();
+    cv.wait(lock, [&] { return released; });
+  }
+  bool AwaitEntry() {
+    std::unique_lock<std::mutex> lock(mutex);
+    return cv.wait_for(lock, 2s, [&] { return entered; });
+  }
+  void Open() {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      released = true;
+    }
+    cv.notify_all();
+  }
+};
+
+struct OpenFlushOnExit {
+  FlushBarrier& barrier;
+  ~OpenFlushOnExit() { barrier.Open(); }
+};
+
 // Extract a single-sample counter/gauge value from Prometheus text (line
 // "<name>{...} <v>" or "<name> <v>"); returns -1 if absent.
 long MetricVal(const std::string& text, const std::string& name) {
@@ -164,47 +256,237 @@ TEST(RamTierWiring, DisabledByDefaultNoRamMetrics) {
   fs::remove_all(dir);
 }
 
-// I6: the PUT admission gate (DFKV_PUT_INFLIGHT_LIMIT) fast-fails concurrent
-// disk writes past the limit with kCacheFull -- a controlled miss, not a queue
-// tail -- and counts them. limit=1 with 8 racing 4 MiB writers makes at least
-// one rejection all but certain.
-TEST(RamTierWiring, PutAdmissionGateRejectsWithCacheFull) {
-  ::setenv("DFKV_PUT_INFLIGHT_LIMIT", "1", 1);
-  auto dir = fs::temp_directory_path() / "dfkv_admission";
+// Hold all acquired permits until every contender has attempted admission.
+// The winner count is exact, independent of disk latency or thread scheduling.
+TEST(RamTierWiring, PutAdmissionGateReservesLimitAtomically) {
+  ::unsetenv("DFKV_RAM_TIER");
+  auto dir = fs::temp_directory_path() / "dfkv_admission_atomic";
   fs::remove_all(dir);
   fs::create_directories(dir);
-  auto s = std::make_unique<KvNodeServer>(dir.string(), 1ull << 30);
-  ::unsetenv("DFKV_PUT_INFLIGHT_LIMIT");
-
-  constexpr int T = 8, N = 20;
-  std::atomic<int> ok{0}, busy{0}, other{0};
-  std::vector<std::thread> ts;
-  for (int t = 0; t < T; ++t) {
-    ts.emplace_back([&, t] {
-      // KVStore::CacheDirect demands a 4 KiB-aligned buffer (O_DIRECT, no
-      // buffered fallback in the file engine).
-      void* mem = nullptr;
-      ASSERT_EQ(posix_memalign(&mem, 4096, 4 << 20), 0);
-      char* buf = static_cast<char*>(mem);
-      std::memset(buf, 'a' + t, 4 << 20);
-      for (int i = 0; i < N; ++i) {
-        Status st = s->CacheDirectForKey(
-            BlockKey{static_cast<uint64_t>(1000 + t * N + i), 0}, buf,
-            4 << 20, 4 << 20);
-        if (st == Status::kOk) ok.fetch_add(1);
-        else if (st == Status::kCacheFull) busy.fetch_add(1);
-        else other.fetch_add(1);
+  auto server = std::make_unique<KvNodeServer>(dir.string(), 1ull << 30);
+  KvNodeServerWiringTestPeer::SetLimit(*server, 1);
+  std::mutex mutex;
+  std::condition_variable cv;
+  int attempted = 0;
+  int admitted = 0;
+  bool release = false;
+  std::vector<std::thread> writers;
+  for (int i = 0; i < 8; ++i) {
+    writers.emplace_back([&] {
+      const bool acquired = KvNodeServerWiringTestPeer::Begin(*server);
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        ++attempted;
+        if (acquired) ++admitted;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release; });
       }
-      free(mem);
+      if (acquired) KvNodeServerWiringTestPeer::End(*server);
     });
   }
-  for (auto& th : ts) th.join();
-  EXPECT_GT(ok.load(), 0);
-  EXPECT_GT(busy.load(), 0) << "8 writers vs limit=1: gate never fired?";
-  EXPECT_EQ(other.load(), 0);
-  const std::string m = s->MetricsText();
-  EXPECT_EQ(MetricVal(m, "dfkv_put_busy_total"), busy.load());
-  s.reset();
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    EXPECT_TRUE(cv.wait_for(lock, 2s, [&] { return attempted == 8; }));
+    release = true;
+  }
+  cv.notify_all();
+  for (auto& writer : writers) writer.join();
+  EXPECT_EQ(admitted, 1);
+  EXPECT_EQ(server->PutBusyTotal(), 7u);
+  const bool acquired = KvNodeServerWiringTestPeer::Begin(*server);
+  EXPECT_TRUE(acquired);
+  if (acquired) KvNodeServerWiringTestPeer::End(*server);
+  server.reset();
+  fs::remove_all(dir);
+}
+
+TEST(RamTierWiring, PutGateRejectsBeforeRamAdmissionAndLeavesFlushUngated) {
+  ::unsetenv("DFKV_RAM_TIER");
+  auto dir = fs::temp_directory_path() / "dfkv_admission_ram";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  auto server = std::make_unique<KvNodeServer>(dir.string(), 1ull << 30);
+  KvNodeServerWiringTestPeer::SetLimit(*server, 1);
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool flushing = false;
+  bool release = false;
+  int rejected_done = 0;
+  KvNodeServerWiringTestPeer::SetRam(
+      *server, [&](const BlockKey& key, char* data, size_t len, size_t) {
+        {
+          std::unique_lock<std::mutex> lock(mutex);
+          flushing = true;
+          cv.notify_all();
+          cv.wait(lock, [&] { return release; });
+        }
+        return KvNodeServerWiringTestPeer::Persist(*server, key, data, len) ==
+               Status::kOk;
+      });
+  const BlockKey first{7001, 0}, direct_key{7002, 0}, tcp_key{7003, 0};
+  std::string original(500, 'a'), conflicting(1000, 'b');
+  auto tcp_put = [&](const BlockKey& key, const std::string& value) {
+    std::string out;
+    return server->ProcessRequestForKey(
+        static_cast<uint8_t>(WireOp::kCache), key, 0, 0, value.data(),
+        value.size(), &out);
+  };
+  Status leader = Status::kInvalid;
+  Status direct_rejected = Status::kInvalid;
+  Status tcp_rejected = Status::kInvalid;
+  std::thread writer([&] {
+    leader = server->CacheDirectForKey(first, original.data(),
+                                      original.size(), original.size());
+  });
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    EXPECT_TRUE(cv.wait_for(lock, 2s, [&] { return flushing; }));
+  }
+  std::thread direct([&] {
+    direct_rejected = server->CacheDirectForKey(
+        direct_key, conflicting.data(), conflicting.size(), conflicting.size());
+    std::lock_guard<std::mutex> lock(mutex);
+    ++rejected_done;
+    cv.notify_all();
+  });
+  std::thread tcp([&] {
+    tcp_rejected = tcp_put(tcp_key, conflicting);
+    std::lock_guard<std::mutex> lock(mutex);
+    ++rejected_done;
+    cv.notify_all();
+  });
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    // This timeout is only a failure guard. The ordering is the explicit
+    // flush/permit barrier, not a sleep chosen to catch a race window.
+    EXPECT_TRUE(cv.wait_for(lock, 2s, [&] { return rejected_done == 2; }));
+  }
+  EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, direct_key));
+  EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, tcp_key));
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    release = true;
+  }
+  cv.notify_all();
+  writer.join();
+  direct.join();
+  tcp.join();
+  EXPECT_EQ(leader, Status::kOk);
+  EXPECT_EQ(direct_rejected, Status::kCacheFull);
+  EXPECT_EQ(tcp_rejected, Status::kCacheFull);
+  EXPECT_EQ(server->PutBusyTotal(), 2u);
+  // The accepted write retained its permit until flush completed, and flush
+  // did not itself need a second permit. Both public paths are usable again.
+  EXPECT_EQ(tcp_put(first, conflicting), Status::kOk);
+  EXPECT_EQ(server->CacheDirectForKey(first, conflicting.data(),
+                                      conflicting.size(), conflicting.size()),
+            Status::kOk);
+  std::string persisted;
+  ASSERT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, first, &persisted),
+            Status::kOk);
+  EXPECT_EQ(persisted, original);
+  EXPECT_EQ(tcp_put(tcp_key, conflicting), Status::kOk);
+  server.reset();
+  fs::remove_all(dir);
+}
+
+TEST(RamTierWiring, DirtyWatermarkRejectsWithoutCallingDiskAndRecovers) {
+  ::unsetenv("DFKV_RAM_TIER");
+  const auto dir = fs::temp_directory_path() / "dfkv_watermark_terminal";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  std::atomic<size_t> disk_calls{0};
+  FlushBarrier barrier;
+  DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+  options.engine_factory = [&](const std::string& path, uint64_t capacity) {
+    return std::make_unique<CountingStore>(path, capacity, disk_calls);
+  };
+  auto server = KvNodeServerWiringTestPeer::Create(std::move(options));
+  auto* node = server.get();
+  OpenFlushOnExit cleanup{barrier};
+  KvNodeServerWiringTestPeer::SetLimit(*server, 0);
+  KvNodeServerWiringTestPeer::SetRam(
+      *server,
+      [&, node](const BlockKey& key, char* data, size_t len, size_t) {
+        barrier.Block();
+        return KvNodeServerWiringTestPeer::Persist(*node, key, data, len) ==
+               Status::kOk;
+      },
+      /*ram_ack=*/true, /*watermark_pct=*/25);
+  const BlockKey first{7101, 0}, tcp_key{7102, 0}, direct_key{7103, 0};
+  std::string original(16 * 1024, 'a'), different(500, 'b');
+  auto tcp_put = [&](const BlockKey& key, const std::string& value) {
+    std::string out;
+    return server->ProcessRequestForKey(
+        static_cast<uint8_t>(WireOp::kCache), key, 0, 0, value.data(),
+        value.size(), &out);
+  };
+  ASSERT_EQ(tcp_put(first, original), Status::kOk);  // RAM-ACK, no live PUT permit
+  ASSERT_TRUE(barrier.AwaitEntry());
+  ASSERT_EQ(disk_calls.load(), 0u);  // durability is deliberately stalled
+
+  Status tcp_status = Status::kInvalid, direct_status = Status::kInvalid;
+  int completed = 0;
+  std::thread tcp([&] {
+    tcp_status = tcp_put(tcp_key, different);
+    std::lock_guard<std::mutex> lock(barrier.mutex);
+    ++completed;
+    barrier.cv.notify_all();
+  });
+  std::thread direct([&] {
+    direct_status = server->CacheDirectForKey(
+        direct_key, different.data(), different.size(), different.size());
+    std::lock_guard<std::mutex> lock(barrier.mutex);
+    ++completed;
+    barrier.cv.notify_all();
+  });
+  {
+    std::unique_lock<std::mutex> lock(barrier.mutex);
+    // A failure guard, not a timing race: flush stays closed until both NEW
+    // requests have had the opportunity to finish without queueing behind it.
+    EXPECT_TRUE(barrier.cv.wait_for(lock, 2s, [&] { return completed == 2; }));
+  }
+  EXPECT_EQ(disk_calls.load(), 0u);
+  EXPECT_EQ(server->Count(), 0u);
+  EXPECT_EQ(server->PutBusyTotal(), 0u);  // not the foreground-count gate
+  EXPECT_TRUE(server->Healthy());
+  EXPECT_TRUE(KvNodeServerWiringTestPeer::Resident(*server, first));
+  EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, tcp_key));
+  EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, direct_key));
+  std::string visible;
+  EXPECT_EQ(server->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kRange), first, 0, 0,
+                nullptr, 0, &visible),
+            Status::kOk);
+  EXPECT_EQ(visible, original);
+  barrier.Open();
+  tcp.join();
+  direct.join();
+  EXPECT_EQ(tcp_status, Status::kCacheFull);
+  EXPECT_EQ(direct_status, Status::kCacheFull);
+  ASSERT_TRUE(KvNodeServerWiringTestPeer::Drain(*server));
+  EXPECT_EQ(disk_calls.load(), 1u);
+
+  // Rejections never claimed these keys. Both entry points can admit them
+  // after drain; conflicting duplicates still preserve the committed leader.
+  EXPECT_EQ(tcp_put(first, different), Status::kOk);
+  EXPECT_EQ(server->CacheDirectForKey(
+                first, different.data(), different.size(), different.size()),
+            Status::kOk);
+  EXPECT_EQ(disk_calls.load(), 1u);
+  std::string persisted;
+  ASSERT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, first, &persisted),
+            Status::kOk);
+  EXPECT_EQ(persisted, original);
+  ASSERT_EQ(tcp_put(tcp_key, different), Status::kOk);
+  ASSERT_TRUE(KvNodeServerWiringTestPeer::Drain(*server));
+  ASSERT_EQ(server->CacheDirectForKey(
+                direct_key, different.data(), different.size(), different.size()),
+            Status::kOk);
+  ASSERT_TRUE(KvNodeServerWiringTestPeer::Drain(*server));
+  EXPECT_EQ(disk_calls.load(), 3u);
+  EXPECT_TRUE(server->Healthy());
+  server.reset();
   fs::remove_all(dir);
 }
 

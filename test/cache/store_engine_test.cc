@@ -215,7 +215,8 @@ TEST_F(EngineTest, BackendRangeConformanceTable) {
   auto ram = std::make_unique<RamTier>(
       ram_options, [](const BlockKey&, char*, size_t, size_t) { return true; });
   ASSERT_TRUE(ram->ok());
-  ASSERT_EQ(ram->PutCommitted(key, value.data(), value.size()), Status::kOk);
+  ASSERT_EQ(ram->PutCommitted(key, value.data(), value.size()).status,
+            Status::kOk);
   RamTier* ram_store = ram.get();
   table.push_back({"ram/GetPrep", [ram_store, key](uint64_t off, uint64_t len) {
     RangeAnswer answer;

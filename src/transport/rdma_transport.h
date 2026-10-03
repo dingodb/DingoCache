@@ -91,11 +91,11 @@ class RdmaTransport : public Transport {
   bool RegisterMemory(void* base, size_t size) override;
   std::string MetricsText() const override;  // dfkv_rdma_client_* (conns, per-rail)
 
-  // Adaptive resource budget: connection demand is nodes x two pools x
-  // max(per-pool retention limit, configured rails), so the process budget
-  // follows the adopted ring instead of a constant.
-  // It raises (never shrinks) every derived budget dimension when the ring
-  // outgrows the current limit. Disabled when
+  // Adaptive resource budget: baseline connection demand is nodes x two pools
+  // x max(pool_max_, configured rails). The temporary data burst allowance is
+  // opportunistic within that process budget, not a reason to raise it.
+  // The budget follows the adopted ring and raises (never shrinks) every
+  // derived dimension when the ring outgrows the current limit. Disabled when
   // the operator pins any budget env explicitly.
   void OnTopologyHint(size_t nodes) override;
   void OnPeerTopology(const PeerTopology& topology) override;
@@ -191,7 +191,9 @@ class RdmaTransport : public Transport {
       RailMask* excluded, bool* cross_rail_retry);
   void Release(const std::string& node, Lane lane, Conn* c,
                RemoteRailOutcome remote_outcome =
-                   RemoteRailOutcome::kSuccess);
+                   RemoteRailOutcome::kSuccess,
+               std::optional<uint64_t> application_use_us =
+                   rdma::RailPolicy::NowMicros());
   void Destroy(Conn* c,
                rdma::RailCompletion completion =
                    rdma::RailCompletion::kAdmission);
@@ -213,9 +215,11 @@ class RdmaTransport : public Transport {
   void RecordRailTransfer(Conn* c, bool put, uint64_t operations,
                           uint64_t bytes);
   bool EvictOneIdle();
-  // Keep every idle QP alive while its client process is healthy. This lets a
-  // short server-side idle reaper reclaim dead clients without forcing the
-  // first cache read after an idle gap to discover and rebuild stale QPs.
+  // Trim burst-only idle endpoints even when keepalives are disabled. Only
+  // application use renews retention; keepalive traffic cannot preserve a
+  // burst's QPs indefinitely.
+  void TrimIdle(uint64_t now_us);
+  void MaintainIdle(uint64_t now_us, bool send_keepalives);
   void KeepaliveLoop();
   bool KeepaliveConn(Conn* c, rdma::RailCompletion* failure);
   Status PullInto(const std::string& node, const BlockKey& key,
@@ -234,8 +238,10 @@ class RdmaTransport : public Transport {
   // Scalar and SG operations share data endpoints. An acquired connection is
   // never concurrently reused, while operation framing remains self-describing.
   std::unordered_map<std::string, std::vector<Conn*>> pool_;
-  // Optional capability observations belong to one peer publication, just like
-  // pooled endpoints. A topology update invalidates both at the same boundary.
+  // Only an identified publication can share capability observations across
+  // new QPs. Static/unpublished peers probe each new QP; warm QPs carry their
+  // own negotiated capabilities. Endpoint failure and forced recovery discard
+  // cached observations, even if membership has not published a new epoch.
   struct PeerCapability {
     std::string peer_id;
     uint64_t publication = 0;
@@ -243,6 +249,9 @@ class RdmaTransport : public Transport {
     bool dynamic_pull = false;
   };
   std::unordered_map<std::string, PeerCapability> peer_capabilities_;
+  void InvalidateCapabilities(const std::string& node,
+                              const std::string& peer_id,
+                              uint64_t publication);
   // Exist/Remove/Members remain isolated from payload transfers.
   std::vector<size_t> IdleDataBounds(const std::string& node) const;
   std::vector<size_t> IdleDataDepths(const std::string& node) const;
@@ -301,7 +310,14 @@ class RdmaTransport : public Transport {
   int BatchTimeout() const {
     return batch_op_timeout_ms_ > 0 ? batch_op_timeout_ms_ : op_timeout_ms_;
   }
-  size_t pool_max_ = 8;               // idle conns kept per peer/pool
+  // Unset POOL_MAX: retain up to 64 data endpoints during recurring bursts,
+  // dropping endpoints unused by applications for 60 s until eight remain.
+  // A positive explicit POOL_MAX fixes both data limits (no silent expansion).
+  // Control always retains at most pool_max_. All endpoints also consume the
+  // process-wide ResourceBudget, which can evict idle entries for admission.
+  size_t pool_max_ = 8;
+  size_t data_pool_max_ = 64;
+  static constexpr uint64_t kBurstIdleUs = 60'000'000;
   // Enabled by default below the recommended 30 s server reaper interval.
   // Set DFKV_RDMA_KEEPALIVE_MS=0 to disable.
   int keepalive_ms_ = 15000;

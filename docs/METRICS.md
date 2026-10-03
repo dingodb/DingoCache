@@ -165,7 +165,9 @@ RDMA-listener scrape inventory。
 | `dfkv_rdma_recv_segment_shrinks_total` / `released_bytes_total` / `chunk_idle_ms` | counter / gauge | 空闲缩容次数 / 已返还字节 / 非初始chunk空闲保留期 |
 | `dfkv_rdma_recv_segment_allocation_failures_total` | counter | grow 后仍无法满足的最终 allocation |
 | `dfkv_rdma_pull_connections` / `dfkv_rdma_legacy_connections` | gauge | 当前 pull-read / legacy responder-write connection 数 |
-| `dfkv_rdma_pull_memory_windows_total` / `dfkv_rdma_pull_mr_fallbacks_total` | counter | exact lease使用type-2 MW隔离 / 硬件不支持时回退per-connection MR |
+| `dfkv_rdma_pull_memory_windows_total` / `dfkv_rdma_pull_mr_fallbacks_total` | counter | legacy 固定 pull arena 的 type-2 MW / per-connection MR 建立次数；dynamic pull 不增加这两个计数 |
+| `dfkv_rdma_pull_zerocopy_served_total` | counter | 为 RAM arena 命中准备的 zero-copy dynamic-pull READY 数，不等于客户端成功完成的 READ 数 |
+| `dfkv_rdma_dynamic_get_mr_active` | gauge | 当前进程存活的 exact dynamic READ MR；PullRelease 先撤销 MR，再释放 RAM pin，断连由 QP 销毁完成 fencing |
 | `dfkv_rdma_connection_bytes{class=\"data|control\"}` | gauge | data/control connection 当前 lease 字节；应随 adaptive class 而非 logical max 增长 |
 | `dfkv_rdma_recv_segment_registered_rails` | gauge | 成功注册初始 receive chunk 的 rail 数；后续 chunk 按使用 rail 惰性注册 |
 | `dfkv_rdma_v2_ready` | gauge | 初始 receive chunk 与 rail anchor 是否就绪 |
@@ -175,6 +177,9 @@ RDMA-listener scrape inventory。
 | `dfkv_rdma_rail_completions_total{dev}` / `dfkv_rdma_rail_completion_errors_total{dev}` | counter | 每 rail 请求完成 / 错误完成 |
 | `dfkv_rdma_rail_put_writes_total{dev}` / `dfkv_rdma_rail_put_bytes_total{dev}` | counter | 每 rail 收到的 PUT one-sided writes / payload bytes |
 | `dfkv_rdma_rail_get_writes_total{dev}` / `dfkv_rdma_rail_get_bytes_total{dev}` | counter | 每 rail 发出的 GET one-sided writes / payload bytes |
+
+RAM zero-copy pull 的 cache-hit、read-bytes 和采样 GET 延迟在有效 PullRelease
+完成时计入。准备阶段探测和失败后 staged fallback 不重复计数；断连中止不当作成功读取。
 
 > **v2 上线判据**：显式 topology 必须
 > `configured == initialized == dfkv_rdma_recv_segment_registered_rails`。
@@ -228,6 +233,7 @@ RAM 热层（**仅 `DFKV_RAM_TIER=1` 时输出**；关时无此系列，向后�
 | `dfkv_ram_hit_total` / `dfkv_ram_miss_total` | counter | GET 命中 RAM / 未命中落盘（命中率 = hit/(hit+miss)） |
 | `dfkv_ram_put_total` | counter | 写直通进 RAM 的 PUT 数 |
 | `dfkv_ram_put_bypass_total` | counter | **背压**：arena 满（flush 落后）→ PUT 旁路直写盘，非零即 flush 跟不上 |
+| `dfkv_ram_ack_backpressure_total` | counter | 正的 RAM-ACK dirty 水位触发的新 key 接纳拒绝；水位为 0 时计数强制等待落盘的请求。已有 key 先解析 owner，不因水位切换覆盖首写者 |
 | `dfkv_ram_promoted_total` | counter | 整值冷读晋升：优先让 O_DIRECT 直接读入隐藏 arena reservation，成功后以 born-durable 身份发布；staged fallback 则读后复制晋升。不进 flushq、零重复刷盘、随时可驱逐；健康冷→热运行中首次读增长，随后应转为 `dfkv_ram_hit_total` 增长且磁盘字节不再增加 |
 | `dfkv_ram_flushed_total` / `dfkv_ram_flush_dropped_total` | counter | RAM slot 落盘转 DURABLE / flush 多次失败后丢弃 |
 | `dfkv_ram_healthy` | gauge | RAM flusher 未发生 terminal failure 时为 1；0 会动态摘除 readiness |
@@ -370,7 +376,7 @@ C 客户端快照还含传输级指标（RDMA 构建）：
 | `dfkv_rdma_client_pipeline_depth` | gauge | 握手解析后的有效 pipeline depth |
 | `dfkv_rdma_client_pool_connections{lane,state=\"idle|active\",dev}` | gauge | endpoint 按最后/当前 operation lane、ownership state 和 rail 分解；active 不含已隔离连接 |
 | `dfkv_rdma_client_peer_connections{peer,dev}` | gauge | 当前 live endpoint 按 MDS stable peer identity 与本地 rail 分解；连接销毁后 series 删除，cardinality 受 endpoint budget 上限约束 |
-| `dfkv_rdma_client_pool_limit` | gauge | 每 peer/pool 的 idle retention 上限（默认 8） |
+| `dfkv_rdma_client_pool_limit` | gauge | 每 peer/pool 的 idle retention 基线（默认 8）；未显式配置 POOL_MAX 时 data pool 可短期保留至 64，超过基线的应用空闲连接在 60 秒后退休，仍受进程资源预算限制 |
 
 TCP 构建或 TCP fallback 的 C 快照 family（同样由插件镜像）：
 

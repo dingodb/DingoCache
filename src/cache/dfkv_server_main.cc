@@ -143,9 +143,9 @@ int main(int argc, char** argv) {
   // value is rejected fail-closed; operators must explicitly use an empty dir.
   std::string slab_gran = args.Get("--slab-granularity", "");
   if (!slab_gran.empty()) ::setenv("DFKV_SLAB_GRANULARITY", slab_gran.c_str(), 1);
-  // PUT admission gate: cap concurrent disk writes; excess PUTs fast-fail with
-  // kCacheFull (client: plain put-failure, no peer cooldown) instead of joining
-  // a deep device queue. 0 = off (default).
+  // PUT admission gate: cap concurrent foreground PUTs before RAM admission
+  // or disk I/O. Excess requests fail with kCacheFull without joining a
+  // pending write; background flush remains ungated. 0 = off (default).
   std::string put_limit = args.Get("--put-inflight-limit", "");
   if (!put_limit.empty()) ::setenv("DFKV_PUT_INFLIGHT_LIMIT", put_limit.c_str(), 1);
   std::string tcp_max_conns = args.Get("--tcp-max-conns", "");
@@ -389,8 +389,17 @@ int main(int argc, char** argv) {
                char* staging, size_t cap) {
           return srv.PrepareReadForKey(key, off, len, staging, cap);
         });
+    // B5-3: dynamic-pull GETs of arena-resident values serve the pinned arena
+    // address instead of staging a payload-sized copy per pull.
+    if (srv.ram_enabled()) {
+      rsrv->set_pinned_ram_handler(
+          [&srv](const dfkv::BlockKey& key, uint64_t off, uint64_t len,
+                 dfkv::PreparedRead* out) {
+            return srv.RamPinnedHitForKey(key, off, len, out);
+          });
+    }
     // RAM arena registration remains transport setup, not per-read ownership.
-    // Arena send pins are carried by PreparedRead through SEND completion.
+    // PreparedRead holds arena pins through SEND or pull-release completion.
     if (srv.ram_enabled()) {
       rsrv->RegisterMemory(srv.ram_arena(), srv.ram_arena_bytes());
       DFKV_LOG_INFO("dfkv_server RAM hot tier: RDMA zero-copy serve enabled (arena " +

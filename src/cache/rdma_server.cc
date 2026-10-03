@@ -819,10 +819,16 @@ void RdmaServer::Serve(int boot_fd) {
     size_t value_len = 0;
     rdma::RecvSegmentPool::Lease lease;
     ibv_mr* mr = nullptr;  // endpoint-owned, revoked before Reset()
+    // B5-3 zero-copy pull: pinned arena source handed to the peer instead of
+    // a staged copy. Empty for staged pulls; the send pin releases exactly
+    // when the slot resets (PullRelease or connection teardown).
+    PreparedRead arena_read;
+    double started_sec = 0.0;
     std::atomic<uint64_t>* active_count = nullptr;
     std::atomic<uint64_t>* active_bytes = nullptr;
     ~PullSlotState() { Reset(); }
     void Reset() {
+      arena_read = PreparedRead{};
       if (lease) {
         active_bytes->fetch_sub(lease.size(), std::memory_order_relaxed);
         active_count->fetch_sub(1, std::memory_order_relaxed);
@@ -881,6 +887,9 @@ void RdmaServer::Serve(int boot_fd) {
   auto release_pull = [&](size_t slot) {
     PullSlotState& state = pull_slots[slot];
     ep.ReleaseLeaseReadRegion(state.mr);
+    if (state.arena_read.owns_cleanup())
+      state.arena_read.Commit(Status::kOk, state.data_len,
+                             NowSteadySec() - state.started_sec);
     state.Reset();
     ++state.generation;
     if (state.generation == 0) ++state.generation;
@@ -1408,6 +1417,46 @@ void RdmaServer::Serve(int boot_fd) {
         encode_status(Status::kCacheFull, 0);
         reply->first_len = response_prefix;
         return true;
+      }
+      // B5-3 zero-copy pull GET: a pinned arena hit serves the value straight
+      // from the RAM arena through an exact, revocable READ registration.
+      // Pin lifetime matches a staged lease: held until PullRelease/reset.
+      // Non-arena or unresolvable sources fall through to the staged path.
+      if (dynamic_pull_requested && pinned_ram_handler_ &&
+          fields.length != 0) {
+        const double started_sec = NowSteadySec();
+        PreparedRead pinned;
+        if (pinned_ram_handler_(key, fields.offset, fields.length, &pinned) &&
+            pinned.payload_len() <= fields.length) {
+          // The peer READs the arena through an exact REMOTE_READ grant on
+          // this object; the receive-pool MRs authorize only local access.
+          // Same per-op registration cost a staged lease pays, but no slot
+          // allocation and no payload memcpy. Revoked at PullRelease/reset
+          // by release_pull(), after the client READ is fenced.
+          state.mr = fail_pinned_registration_for_test_ ? nullptr :
+              ep.RegisterLeaseReadRegion(
+                  const_cast<char*>(pinned.data()), pinned.payload_len());
+          if (state.mr) {
+            state.arena_read = std::move(pinned);
+            state.started_sec = started_sec;
+            state.busy = true;
+            state.data_len = state.arena_read.payload_len();
+            state.value_len = state.arena_read.value_len();
+            const rdma::DynamicPullReady ready{
+                static_cast<uint32_t>(slot), state.generation, state.data_len,
+                state.value_len,
+                reinterpret_cast<uint64_t>(state.arena_read.data()),
+                state.mr->rkey};
+            encode_status(Status::kOk, rdma::kDynamicPullReadyBytes,
+                          state.value_len);
+            rdma::EncodeDynamicPullReady(ready,
+                                         send_buffer + response_prefix);
+            reply->first_len = response_prefix + rdma::kDynamicPullReadyBytes;
+            pull_zerocopy_served_.fetch_add(1, std::memory_order_relaxed);
+            return true;
+          }
+          state.mr = nullptr;
+        }
       }
       size_t target_capacity = slot_size;
       char* target = nullptr;
@@ -2410,6 +2459,9 @@ std::string RdmaServer::MetricsText() const {
   m(s, "dfkv_rdma_leaseput_bytes_active", "gauge",
     "Receive-pool bytes held by in-flight leased-PUT staging",
     lease_put_bytes_active_);
+  m(s, "dfkv_rdma_pull_zerocopy_served_total", "counter",
+    "Dynamic-pull GETs served directly from the pinned RAM arena without a staging copy",
+    pull_zerocopy_served_);
   m(s, "dfkv_rdma_dynamic_get_active", "gauge",
     "In-flight dynamic GET staging operations currently held",
     dynamic_get_active_);

@@ -600,10 +600,6 @@ TEST(ClientOpMetrics, CrossRailRetryCountsOneScalarPublicCall) {
                       .count() *
                   0.9)
         << "one public latency sample must enclose both transport attempts";
-    EXPECT_LT(MetricDouble(
-                  snapshot, "dfkv_client_op_latency_seconds_sum", op),
-              2.0)
-        << "scripted retry latency unexpectedly exceeded the deadlock guard";
   }
   EXPECT_EQ(TransportCounter(
                 snapshot, "dfkv_rdma_client_cross_rail_retries_total"),

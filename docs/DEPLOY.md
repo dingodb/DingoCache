@@ -254,7 +254,7 @@ WantedBy=multi-user.target
 > **存储/加速开关（见 [ARCHITECTURE.md](ARCHITECTURE.md) §5–7）。解析顺序为 flag > 环境变量 > `slab`；运行时真值经 `dfkvctl ring` INFO 列（`engine=`/`wr=`/`ram=`）和 `dfkv_build_info{engine,write_mode}` 审计。**
 > - `--store-engine slab|file`：不设置 flag/env 时所有 store/server 路径默认 `slab`。slab = extent 池 + sparse `slots.tbl` + dirty/clean epoch。**早期格式→v3 tenant-scoped slab 必须使用空缓存目录**；容量、格式或几何不符会拒绝启动而不会改写原数据，也绝不会静默改用 file。`file` 的 48 字符 tenant+object 文件名同样不读取旧 cache，仅作显式诊断/回滚。
 > - `--slab-write direct|buffered`（默认 `direct`）：slab 数据面使用 O_DIRECT；文件系统不支持时整店回退 bounded buffered，以 `wr=` 上报真值。
-> - `--ram-tier on`（默认关）：arena 内对象走 RDMA 零拷贝；配合 `--ram-write-mode writeback|writearound`（默认 `writeback`）选择 PUT 先入 RAM 再落盘，或 PUT 直写盘、后续整值 GET 直接从 NVMe 读入最终 arena slot。`writeback` 默认在数据进入可读且 flush-pinned 的 RAM slot 后返回 PUT `kOk`；dirty bytes 达 `DFKV_RAM_ACK_HIGH_WATERMARK_PCT`（默认 80）后，新请求改为等待落盘。需要严格 durable ACK 时显式设置 `DFKV_PUT_ACK_MODE=disk`。`writearound` 仍以磁盘结果返回。超 extent 大对象走同预算的 dedicated allocation + bounded copy。`--ram-tier-bytes <bytes>` 定总预算；显式请求 RAM 时 allocation 或不支持的 NUMA mode 会拒绝启动，不能静默退成 disk-only。
+> - `--ram-tier on`（默认关）：arena 内对象走 RDMA 零拷贝。`--ram-write-mode writeback|writearound`（默认 `writeback`）选择 PUT 先入 RAM 后落盘，或直接盘写、读时晋升。`writeback` 默认在数据进入可读且 flush-pinned 的 RAM slot 后返回 `kOk`。达到正的 `DFKV_RAM_ACK_HIGH_WATERMARK_PCT`（默认 80）时，只拒绝尚无 owner 的新 key，返回 `kCacheFull`，不转为直接盘写。已有同 key 请求仍加入首写者的完成结果；水位设为 0 保留强制 disk-ACK 语义。需要所有 PUT 都等待持久化时设置 `DFKV_PUT_ACK_MODE=disk`。`--ram-tier-bytes` 限定总预算；超 extent 对象仍受 dedicated allocation 预算约束。显式启用 RAM 后，分配或 NUMA 模式失败会拒绝启动。
 > - `--ram-tier-numa interleave|off`（默认 `interleave`）：这是当前完整 mode 集；不接受数字 node ID。arena 预触并绑策略，须核 `MemoryMax`。
 > - `--ram-flush-threads <n>` / `DFKV_RAM_FLUSH_THREADS`：请求值会提高到至少 shard 数；实际值由 `dfkv_ram_flush_threads` 报告（默认请求=4×盘数，上限 16）。
 > - 微调项（env only）：`DFKV_SLAB_TABLE_SYNC_MS` 控制 table sync 节奏（默认 100 ms，0=关；dirty epoch 重启仍无条件冷重置）。
@@ -264,7 +264,7 @@ WantedBy=multi-user.target
 >   限流；整 extent 只做一次连续 slots.tbl clear，避免高水位小写风暴。
 > - `--slab-reclaim-ms <n>` / `--ram-reclaim-ms <n>`（默认 50 / 10，`0`=关）：后台预回收和类再平衡。allocator 按 useful bytes + decayed read heat 选择 donor，跳过 pinned extent；通常保留默认。
 > - `--slab-granularity <bytes>`（默认 1 MiB）：最小 slot 量子。现有 `slots.tbl` 的 format/geometry 不匹配会 fail closed；修改必须换空目录，服务不会原地冷重建或忽略旧数据。
-> - `--put-inflight-limit <n>`（默认 0=关）：并发盘写超过 n 的 PUT 以 kCacheFull 快速拒绝（客户端视为普通 put 失败、不进 cooldown）= 用受控 miss 换掉过载排队尾延迟。RDMA 与 TCP 两条数据路径同受此门约束；RAM 热层的异步 flusher 落盘**不受**此门限制（否则背压会放大为 flush 丢弃）。
+> - `--put-inflight-limit <n>`（默认 0=关）：在 RAM 接纳或直接盘写之前原子限制前台 PUT 并发；超限返回 `kCacheFull`，不接纳数据、不进入 peer cooldown。TCP 与 RDMA direct PUT 共用此门；后台 flusher 不受限制。已接纳写入和同 key 重复请求仍等待原写入的终态，不以超时将另一份 payload 送入盘写路径。该参数限制接纳量，不是磁盘 I/O 超时保证。
 > - `--tcp-max-conns <n>` / `DFKV_TCP_MAX_CONNS`（默认 512，硬上限 4096）限制
 >   TCP handler/FD；`--tcp-io-timeout-s <n>` / `DFKV_TCP_IO_TIMEOUT_S`（默认
 >   60s，硬上限 3600s）回收 silent/半帧连接。达到上限的新连接会被立即拒绝，
@@ -443,7 +443,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `--ram-tier-numa` / `DFKV_RAM_TIER_NUMA` | `interleave` | NUMA 策略：`interleave`/`off`（不接 node id） |
 | `--ram-tier-shards` / `DFKV_RAM_TIER_SHARDS` | `8`, 硬上限 64 | arena 锁分片数（大 arena ≥100 GiB 建议 16） |
 | `--slab-granularity` / `DFKV_SLAB_GRANULARITY` | `1 MiB` | slab slot 量子；现有目录 geometry 不符启动拒绝 |
-| `--put-inflight-limit` / `DFKV_PUT_INFLIGHT_LIMIT` | `0`=关 | 并发盘写上限，超出返回 kCacheFull 快速拒绝 |
+| `--put-inflight-limit` / `DFKV_PUT_INFLIGHT_LIMIT` | `0`=关 | 前台 PUT 接纳上限（RAM 与直接盘写）；超限在接纳前返回 kCacheFull，后台 flush 不受限 |
 | `--tcp-max-conns` / `DFKV_TCP_MAX_CONNS` | `512`, 硬上限 4096 | cache TCP handler 上限；超限 accept 恒拒 |
 | `--tcp-io-timeout-s` / `DFKV_TCP_IO_TIMEOUT_S` | `60`, 硬上限 3600 | per-syscall RCVTIMEO（秒） |
 | `--rdma-depth` / `DFKV_RDMA_DEPTH` | `4` | server ceiling；client scalar=1，batch按实际window选择depth class后再协商取min |
@@ -473,7 +473,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `DFKV_RDMA_CONNECT_MS` | — | client：IB QP 建连超时 |
 | `DFKV_RDMA_IO_MS` | — | client：控制面帧读写超时 |
 | `DFKV_RDMA_BATCH_OP_TIMEOUT_MS` | 0=跟随 RDMA_OP | client：multi-item Cache/Range/Exist、SG 窗口总期限 |
-| `DFKV_RDMA_POOL_MAX` | `8` | client：每 server、每 pool、跨 rail 的 idle QP 上限；scalar/SG 共用 data pool，7 read workers + 1 warm spare |
+| `DFKV_RDMA_POOL_MAX` | 未设：常驻基线 `8`、data 突发上限 `64` | client：scalar/SG 共用 data pool；超过基线的空闲连接在最后一次应用使用 60 秒后退休，keepalive 不续期。显式正整数同时固定基线与上限；control 仍取基线，全部受进程资源预算约束 |
 | `DFKV_RDMA_RAIL_CREDITS` | 默认 `64`, 硬上限 4096 | client：每 rail outstanding request credits |
 | `DFKV_RDMA_RAIL_TIERS` | unset = homogeneous | client：异构带宽 tier `a|b;c`，只在最高健康 tier 内选轨，不因 credit/quarantine 溢出到低 tier |
 | `DFKV_RDMA_PRIMARY_DEV` | unset | client：必须属于 `DFKV_RDMA_DEV`；所有 operation 优先该 rail，仅在不可准入/失败时使用其余 configured rail |
@@ -749,9 +749,13 @@ Rollback trigger and procedure:
 7. 在**一个受控 SGLang 副本**上切 `dynamic` 后端，发共享长前缀请求看命中上涨，确认后推广。
 
 ### 5b. 候选版本负载回归门
-`DFKV_BENCH_STALL_MS=<毫秒>` 只由 `dfkv_bench` 读取；超过阈值的 GET batch
-会带 wall-clock 时间戳写 stderr，便于和 server/NVMe/IB 指标对齐。它不是
-`dfkv_server` 环境变量。
+`DFKV_BENCH_STALL_MS=<毫秒>` 只由 `dfkv_bench` 读取。PUT 或 GET batch 超过
+阈值时，会带 wall-clock 时间戳和 `phase=PUT|GET` 写 stderr；耗时使用单调时钟。
+未开启时不增加逐操作 wall-clock 采样。该参数不控制 `dfkv_server`。
+
+`--put-arena 0|1` 选择是否预注册共享 PUT 源缓冲区（默认 0）。
+对照必须使用相同模式；注册失败返回非零，不静默退回逐次注册。
+`DIAG_CONN` 报告每阶段 probe 与 endpoint cache 计数；失败 run 不作为成功吞吐样本。
 
 
 `deploy/dfkv_load_regression.py` 对 baseline/candidate 使用完全相同的 size/count/

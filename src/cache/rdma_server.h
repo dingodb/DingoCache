@@ -26,6 +26,7 @@
 #ifdef DFKV_WITH_URING
 #include "cache/uring_reader.h"
 #endif
+#include "cache/ram_tier.h"
 #include "cache/store_engine.h"
 #include "common/kv_types.h"
 #include "common/status.h"
@@ -76,6 +77,16 @@ class RdmaServer {
   }
   void set_prepare_read_handler(PrepareReadHandler h) {
     prepare_read_handler_ = std::move(h);
+  }
+  // Pinned arena hit lookup (B5-3 zero-copy pull GET): returns true with a
+  // send-pinned arena address the dynamic-pull READY can name directly, or
+  // false when the read must use the staging-copy pull path. Optional; when
+  // unset or returning false the pull path stages through the receive pool.
+  using PinnedRamHandler = std::function<bool(
+      const BlockKey& key, uint64_t offset, uint64_t length,
+      PreparedRead* out)>;
+  void set_pinned_ram_handler(PinnedRamHandler h) {
+    pinned_ram_handler_ = std::move(h);
   }
   // Register a caller memory region (the RAM arena) as a pool MR on every
   // connection's PD, so a RAM-hit payload resolves to an MR with no per-op
@@ -201,6 +212,7 @@ class RdmaServer {
   CacheDirectHandler cache_direct_handler_;
   CacheDirectBatchHandler cache_direct_batch_handler_;
   PrepareReadHandler prepare_read_handler_;
+  PinnedRamHandler pinned_ram_handler_;
   std::vector<std::pair<void*, size_t>> user_regions_;  // RAM arena pool MRs (RegisterMemory)
   size_t max_msg_;
   std::string dev_name_;
@@ -245,6 +257,7 @@ class RdmaServer {
   std::atomic<uint64_t> lease_put_bytes_active_{0};
   std::atomic<uint64_t> dynamic_get_active_{0};
   std::atomic<uint64_t> dynamic_get_bytes_active_{0};
+  std::atomic<uint64_t> pull_zerocopy_served_{0};
   // One anchor per resolved rail holds a lifetime shared device reference and
   // registers the initial receive chunk and caller pools on that rail's PD.
   // Later chunks register lazily on the rail of the connection that leases
@@ -269,6 +282,7 @@ class RdmaServer {
 #endif
   friend class RdmaServerTestPeer;
   friend class RdmaLeaseServerTestPeer;
+  bool fail_pinned_registration_for_test_ = false;
   // Test barrier immediately before endpoint destruction; ranges must remain
   // owned while delayed inbound DMA can still reach the QP.
   std::function<void()> before_endpoint_teardown_for_test_;
