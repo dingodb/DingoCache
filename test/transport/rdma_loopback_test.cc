@@ -3280,7 +3280,7 @@ TEST(RdmaLoopback, MultiWrLaterWindowFailureIsAtomicAndReclaimsState) {
     const auto get = c.BatchGetAutoSg(
         {{"sg_later_window_abort", dptrs, sizes}}, &lens);
     ASSERT_EQ(get.size(), 1u);
-    ASSERT_TRUE(get[0]);
+    ASSERT_TRUE(get[0]) << rt.MetricsText();
     ASSERT_EQ(lens.size(), 1u);
     size_t expected_len = 0;
     for (size_t i = 0; i < src.size(); ++i) {
