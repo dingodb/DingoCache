@@ -364,7 +364,8 @@ struct RdmaNode {
 
   std::function<void(size_t)> before_range;
   explicit RdmaNode(const std::string& tag, size_t max_msg = kMaxMsg,
-                    bool fail_pinned_registration = false) {
+                    bool fail_pinned_registration = false,
+                    bool prepare_reads = false) {
     ConfigureTestRecvSegment();
     dir = fs::temp_directory_path() / ("dfkv_rdma_" + tag);
     fs::remove_all(dir);
@@ -403,6 +404,13 @@ struct RdmaNode {
           }
           return srv->CacheDirectForKey(key, data, len, cap);
         });
+    if (prepare_reads) {
+      rsrv->set_prepare_read_handler(
+          [this](const BlockKey& key, uint64_t off, uint64_t len,
+                 char* staging, size_t cap) {
+            return srv->PrepareReadForKey(key, off, len, staging, cap);
+          });
+    }
     if (fail_pinned_registration)
       RdmaServerTestPeer::FailPinnedRegistration(*rsrv);
     if (srv->ram_enabled()) {
@@ -3207,6 +3215,9 @@ TEST(RdmaLoopback, ScatterGatherRoundtripOverRdma) {
 
 TEST(RdmaLoopback, MultiWrLaterWindowFailureIsAtomicAndReclaimsState) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  // Host-pointer classification initializes CUDA lazily. Keep that startup
+  // work outside this deliberately short idle-reaping scenario.
+  (void)CudaLib::Get();
   ScopedEnv idle_reclaim("DFKV_RDMA_IDLE_MS", "2000");
   RdmaNode node("sgabort");
   const uint64_t transient_baseline =
@@ -4209,7 +4220,9 @@ static void ExerciseDepthOneReplyCredits(bool use_uring) {
   ScopedEnv shards("DFKV_RAM_TIER_SHARDS", "4");
   ScopedEnv ram_reclaim("DFKV_RAM_RECLAIM_MS", "0");
   ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "4096");
-  RdmaNode node(use_uring ? "reply-credit-uring" : "reply-credit-sync");
+  RdmaNode node(use_uring ? "reply-credit-uring" : "reply-credit-sync",
+                kMaxMsg, false, use_uring);
+  ASSERT_EQ(node.rsrv->UseUringPath(), use_uring);
   constexpr size_t kClients = 4;
   constexpr size_t kThreadsPerClient = 8;
   constexpr size_t kWorkers = kClients * kThreadsPerClient;
