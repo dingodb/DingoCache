@@ -823,7 +823,7 @@ void RdmaServer::Serve(int boot_fd) {
     // a staged copy. Empty for staged pulls; the send pin releases exactly
     // when the slot resets (PullRelease or connection teardown).
     PreparedRead arena_read;
-    double started_sec = 0.0;
+    double read_elapsed_sec = 0.0;
     std::atomic<uint64_t>* active_count = nullptr;
     std::atomic<uint64_t>* active_bytes = nullptr;
     ~PullSlotState() { Reset(); }
@@ -889,7 +889,7 @@ void RdmaServer::Serve(int boot_fd) {
     ep.ReleaseLeaseReadRegion(state.mr);
     if (state.arena_read.owns_cleanup())
       state.arena_read.Commit(Status::kOk, state.data_len,
-                             NowSteadySec() - state.started_sec);
+                             state.read_elapsed_sec);
     state.Reset();
     ++state.generation;
     if (state.generation == 0) ++state.generation;
@@ -1428,6 +1428,10 @@ void RdmaServer::Serve(int boot_fd) {
         PreparedRead pinned;
         if (pinned_ram_handler_(key, fields.offset, fields.length, &pinned) &&
             pinned.payload_len() <= fields.length) {
+          // Match the staged range handler's latency boundary. Publish this
+          // sample only on successful release, without charging client hold
+          // time or grant registration to the storage handler.
+          const double read_elapsed_sec = NowSteadySec() - started_sec;
           // The peer READs the arena through an exact REMOTE_READ grant on
           // this object; the receive-pool MRs authorize only local access.
           // Same per-op registration cost a staged lease pays, but no slot
@@ -1438,7 +1442,7 @@ void RdmaServer::Serve(int boot_fd) {
                   const_cast<char*>(pinned.data()), pinned.payload_len());
           if (state.mr) {
             state.arena_read = std::move(pinned);
-            state.started_sec = started_sec;
+            state.read_elapsed_sec = read_elapsed_sec;
             state.busy = true;
             state.data_len = state.arena_read.payload_len();
             state.value_len = state.arena_read.value_len();

@@ -1977,6 +1977,48 @@ TEST(RdmaLoopback, CapabilityCacheFollowsIdentityPublicationAndAddress) {
                        "dfkv_rdma_client_v2_probe_attempts_total"), 5);
 }
 
+TEST(RdmaLoopback, CapabilityCacheUnrelatedPublicationPreservesKeepaliveReuse) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv idle_reaper("DFKV_RDMA_IDLE_MS", "0");
+  RdmaNode first("caps-keepalive-first");
+  RdmaNode second("caps-keepalive-second");
+  ASSERT_FALSE(first.rsrv->DeviceNames().empty());
+  RdmaTransport transport(kMaxMsg, first.rsrv->DeviceNames().front());
+  RdmaTransportTestPeer::StopMaintenance(&transport);
+  transport.OnPeerTopology(PublishedPeer(first.addr, "first"));
+  auto topology = PublishedPeer(second.addr, "second");
+  transport.OnPeerTopology(topology);
+  HeldData first_batch(&transport, first.addr);
+  HeldData second_batch(&transport, second.addr);
+  ASSERT_TRUE(first_batch.Acquire(2));
+  ASSERT_TRUE(second_batch.Acquire(2));
+  first_batch.ReleaseAt(0);
+  second_batch.ReleaseAt(0);
+  ASSERT_EQ(CounterVal(transport.MetricsText(),
+                       "dfkv_rdma_client_v2_probe_attempts_total"), 2);
+
+  ++topology.generation;
+  transport.OnPeerTopology(topology);
+  EXPECT_EQ(RdmaTransportTestPeer::DataPoolSize(&transport, first.addr), 2u);
+  EXPECT_TRUE(RdmaTransportTestPeer::HasCapabilities(&transport, first.addr));
+  EXPECT_EQ(RdmaTransportTestPeer::DataPoolSize(&transport, second.addr), 0u);
+  EXPECT_FALSE(RdmaTransportTestPeer::HasCapabilities(&transport, second.addr));
+
+  RdmaTransportTestPeer::MaintainIdle(&transport, 1000, true);
+  EXPECT_EQ(CounterVal(transport.MetricsText(),
+                       "dfkv_rdma_client_keepalive_successes_total"), 2);
+  ASSERT_TRUE(first_batch.Acquire(2));
+  EXPECT_EQ(CounterVal(transport.MetricsText(),
+                       "dfkv_rdma_client_v2_probe_attempts_total"), 2)
+      << "an unrelated publication and successful keepalive preserve warm QPs";
+  ASSERT_TRUE(second_batch.Acquire(1));
+  EXPECT_EQ(CounterVal(transport.MetricsText(),
+                       "dfkv_rdma_client_v2_probe_attempts_total"), 3)
+      << "the replaced peer must negotiate its own fresh capabilities";
+}
+
 TEST(RdmaLoopback, CapabilityCacheDoesNotTrustStaticOrAnonymousPeers) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   ScopedEnv tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
