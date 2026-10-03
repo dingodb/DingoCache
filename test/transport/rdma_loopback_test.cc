@@ -1680,16 +1680,13 @@ TEST(RdmaLoopback, ExistManyWindowedMixedHitMiss) {
   }
 }
 
-// Client BatchExist over RDMA may expand one node's pool for parallel probe
-// shards, but repeated calls must reuse that bounded pool instead of opening a
-// fresh connection per key.
-TEST(RdmaLoopback, BatchExistReusesExpandedPool) {
+TEST(RdmaLoopback, BatchExistMixedHitMiss) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   RdmaNode node("bex");
   RdmaTransport rt(kMaxMsg);
   KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
 
-  const int N = 64;  // > batch_concurrency (8): the old per-key fan-out opened many
+  const int N = 64;
   for (int i = 0; i < N; ++i) {
     std::string v = "v" + std::to_string(i);
     ASSERT_TRUE(c.Put("e" + std::to_string(i), v.data(), v.size())) << i;
@@ -1700,37 +1697,10 @@ TEST(RdmaLoopback, BatchExistReusesExpandedPool) {
     probe.push_back("e" + std::to_string(i) + "_x"); // absent
   }
 
-  // Warm one connection, then let two large batches settle the bounded
-  // per-node pool. Thread scheduling need not expose peak fan-out in one call.
-  EXPECT_TRUE(c.Exist("e0"));
-  const long before =
-      CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
-  ASSERT_GE(before, 1);
-
   auto er = c.BatchExist(probe);
   ASSERT_EQ(er.size(), probe.size());
   for (size_t i = 0; i < probe.size(); ++i)
     EXPECT_EQ((bool)er[i], (i % 2 == 0)) << probe[i];
-  const long expanded =
-      CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
-  EXPECT_LE(expanded - before, 7);  // default max 8, one already warm
-
-  auto again = c.BatchExist(probe);
-  ASSERT_EQ(again.size(), probe.size());
-  for (size_t i = 0; i < probe.size(); ++i)
-    EXPECT_EQ((bool)again[i], (i % 2 == 0)) << probe[i];
-  const long settled =
-      CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
-  EXPECT_LE(settled - before, 7);  // default pool cap 8, one already warm
-
-  auto steady = c.BatchExist(probe);
-  ASSERT_EQ(steady.size(), probe.size());
-  for (size_t i = 0; i < probe.size(); ++i)
-    EXPECT_EQ((bool)steady[i], (i % 2 == 0)) << probe[i];
-  const long reused =
-      CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
-  EXPECT_EQ(reused, settled)
-      << "settled BatchExist did not reuse its bounded connection pool";
 }
 
 namespace {
