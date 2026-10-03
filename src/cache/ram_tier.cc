@@ -473,8 +473,10 @@ RamTier::Admission RamTier::Admit(
 
   Shard& s = ShardFor(key);
   std::shared_ptr<PutCompletion> completion;
+  // Keep admission and the first arena reservation in one critical section;
+  // releasing and immediately reacquiring this shard only adds contention.
+  std::unique_lock<std::mutex> admission_lock(s.mu);
   {
-    std::lock_guard<std::mutex> lk(s.mu);
     auto existing = s.index.find(key);
     if (existing != s.index.end()) {
       if (existing->second.remove_pending) return Admission::kRejected;
@@ -520,6 +522,7 @@ RamTier::Admission RamTier::Admit(
   bool admitted = false;
 
   if (large) {
+    admission_lock.unlock();
     if (!TryReserveLarge(cap)) {
       ReclaimLargeFor(cap);
       admitted = TryReserveLarge(cap);
@@ -538,10 +541,13 @@ RamTier::Admission RamTier::Admit(
   } else {
     for (int attempt = 0; attempt < 2 && !admitted; ++attempt) {
       {
-        std::lock_guard<std::mutex> lk(s.mu);
+        if (!admission_lock.owns_lock()) admission_lock.lock();
         SlabAllocator::SlotRef ref;
         std::vector<BlockKey> evicted;
-        if (!s.alloc->Put(key, len, &ref, &evicted, &slot_handle)) break;
+        if (!s.alloc->Put(key, len, &ref, &evicted, &slot_handle)) {
+          admission_lock.unlock();
+          break;
+        }
         EraseEvictedLocked(s, evicted);
         cap = ref.slot_size;
         if (!TryReserve(cap)) {
@@ -552,6 +558,7 @@ RamTier::Admission RamTier::Admit(
           admitted = true;
         }
       }
+      admission_lock.unlock();
       if (!admitted) ReclaimLargeFor(cap);
     }
   }
