@@ -4207,8 +4207,12 @@ static void ExerciseDepthOneReplyCredits(bool use_uring) {
   ScopedEnv extent("DFKV_RAM_TIER_EXTENT_BYTES", "1048576");
   ScopedEnv reserve("DFKV_RAM_TIER_LARGE_RESERVE_BYTES", "0");
   ScopedEnv shards("DFKV_RAM_TIER_SHARDS", "4");
+  ScopedEnv ram_reclaim("DFKV_RAM_RECLAIM_MS", "0");
+  ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "4096");
   RdmaNode node(use_uring ? "reply-credit-uring" : "reply-credit-sync");
-  constexpr size_t kClients = 32;
+  constexpr size_t kClients = 4;
+  constexpr size_t kThreadsPerClient = 8;
+  constexpr size_t kWorkers = kClients * kThreadsPerClient;
   // Registered source storage outlives every client and transport.
   std::vector<std::string> values;
   values.reserve(kClients);
@@ -4222,6 +4226,7 @@ static void ExerciseDepthOneReplyCredits(bool use_uring) {
     auto client = std::make_unique<KVClient>(
         std::vector<std::pair<std::string, std::string>>{{"n", node.addr}},
         SelfHdr(), transport.get());
+    client->set_batch_concurrency(1);
     ASSERT_TRUE(client->RegisterMemory(values[i].data(), values[i].size()));
     ASSERT_TRUE(client->Put("reply-" + std::to_string(i),
                             values[i].data(), values[i].size()));
@@ -4235,26 +4240,31 @@ static void ExerciseDepthOneReplyCredits(bool use_uring) {
   std::mutex gate_mu;
   std::condition_variable gate_cv;
   bool start = false;
-  std::vector<int> failures(kClients, 0);
+  std::vector<int> failures(kWorkers, 0);
   std::vector<std::thread> workers;
-  for (size_t i = 0; i < kClients; ++i) {
+  for (size_t i = 0; i < kWorkers; ++i) {
     workers.emplace_back([&, i] {
       {
         std::unique_lock<std::mutex> lock(gate_mu);
         gate_cv.wait(lock, [&] { return start; });
       }
-      const std::string key = "reply-" + std::to_string(i);
-      const std::vector<KvPutItem> items{{key, values[i].data(), values[i].size()}};
+      const size_t client_index = i / kThreadsPerClient;
+      const std::string prefix = "reply-" + std::to_string(i) + "-";
+      const auto& value = values[client_index];
+      std::vector<KvPutItem> items{{prefix, value.data(), value.size()}};
+      items[0].key.reserve(prefix.size() + 3);
       for (size_t round = 0; round < 128; ++round) {
-        const auto results = clients[i]->BatchPut(items);
+        items[0].key.assign(prefix);
+        items[0].key.append(std::to_string(round));
+        const auto results = clients[client_index]->BatchPut(items);
         if (results.size() != 1 || !results[0]) {
           ++failures[i];
           return;
         }
       }
-      std::string output(values[i].size(), '\0');
-      if (!clients[i]->Get(key, output.data(), output.size()) ||
-          output != values[i])
+      std::string output(value.size(), '\0');
+      if (!clients[client_index]->Get(items[0].key, output.data(), output.size()) ||
+          output != value)
         ++failures[i];
     });
   }
@@ -4264,8 +4274,9 @@ static void ExerciseDepthOneReplyCredits(bool use_uring) {
   }
   gate_cv.notify_all();
   for (auto& worker : workers) worker.join();
+  for (size_t i = 0; i < kWorkers; ++i)
+    EXPECT_EQ(failures[i], 0) << "worker " << i;
   for (size_t i = 0; i < kClients; ++i) {
-    EXPECT_EQ(failures[i], 0) << "client " << i;
     EXPECT_EQ(CounterVal(transports[i]->MetricsText(),
                          "dfkv_rdma_client_completion_timeouts_total"), 0)
         << "client " << i;
