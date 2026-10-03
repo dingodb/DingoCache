@@ -61,6 +61,9 @@ class KvNodeServerWiringTestPeer {
   static bool Drain(KvNodeServer& server) {
     return server.ram_->WaitForDrain(2s);
   }
+  static bool DropRam(KvNodeServer& server, const BlockKey& key) {
+    return server.ram_->Remove(key);
+  }
 };
 }  // namespace dfkv
 
@@ -234,6 +237,48 @@ TEST(RamTierWiring, ExistAndRemoveSeeRam) {
   ::unsetenv("DFKV_RAM_TIER");
   ::unsetenv("DFKV_RAM_TIER_BYTES");
   fs::remove_all(dir);
+}
+
+TEST(RamTierWiring, PersistedValueSurvivesConflictingPutAfterRamEviction) {
+  ::setenv("DFKV_RAM_TIER", "1", 1);
+  ::setenv("DFKV_RAM_TIER_BYTES", "16777216", 1);
+  for (const char* ack : {"ram", "disk"}) {
+    ::setenv("DFKV_PUT_ACK_MODE", ack, 1);
+    std::string addr;
+    auto dir = fs::temp_directory_path() /
+               (std::string("dfkv_ramwire_retained_") + ack);
+    auto server = Start(dir, &addr);
+    TcpTransport tcp;
+    alignas(4096) char original[4096] = "original";
+    alignas(4096) char conflicting[4096] = "modified";
+    for (bool direct : {false, true}) {
+      const BlockKey key = ToBlockKey("retained-disk", direct ? "direct" : "tcp");
+      const auto put = [&](char* data) {
+        return direct ? server->CacheDirectForKey(key, data, 8, sizeof(original))
+                      : tcp.Cache(addr, key, data, 8);
+      };
+      ASSERT_EQ(put(original), Status::kOk);
+      ASSERT_TRUE(KvNodeServerWiringTestPeer::Drain(*server));
+      std::string disk;
+      ASSERT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, key, &disk), Status::kOk);
+      ASSERT_EQ(disk, "original");
+      ASSERT_TRUE(KvNodeServerWiringTestPeer::DropRam(*server, key));
+      ASSERT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, key));
+
+      ASSERT_EQ(put(conflicting), Status::kOk);
+      ASSERT_TRUE(KvNodeServerWiringTestPeer::Drain(*server));
+      std::string visible;
+      ASSERT_EQ(tcp.Range(addr, key, 0, 8, &visible), Status::kOk);
+      EXPECT_EQ(visible, "original") << ack << " direct=" << direct;
+      ASSERT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, key, &disk), Status::kOk);
+      EXPECT_EQ(disk, visible) << "RAM must not claim durability for different disk bytes";
+    }
+    server.reset();
+    fs::remove_all(dir);
+  }
+  ::unsetenv("DFKV_PUT_ACK_MODE");
+  ::unsetenv("DFKV_RAM_TIER_BYTES");
+  ::unsetenv("DFKV_RAM_TIER");
 }
 
 TEST(RamTierWiring, DisabledByDefaultNoRamMetrics) {
