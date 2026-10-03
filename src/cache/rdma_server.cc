@@ -1258,9 +1258,7 @@ void RdmaServer::Serve(int boot_fd) {
 
   struct Reply {
     bool remote_write = false;
-    bool defer_recv_rearm = false;
     bool release_source_on_send = false;
-    size_t recv_slot = 0;
     size_t source_recv_slot = 0;
     size_t first_len = 0;
     const char* payload = nullptr;
@@ -1302,8 +1300,6 @@ void RdmaServer::Serve(int boot_fd) {
     if (request.get.window_count == 1) {
       if (successful_len != 0) {
         reply->remote_write = true;
-        reply->defer_recv_rearm = source_uses_slot;
-        reply->recv_slot = request.recv_slot;
         reply->payload = data;
         reply->payload_len = successful_len;
         reply->payload_mr = data_mr;
@@ -1346,11 +1342,8 @@ void RdmaServer::Serve(int boot_fd) {
     if (source_uses_slot) {
       multi_get_source_owner[request.data_slot] =
           static_cast<int32_t>(operation_id);
-      // Repost this WQE only after the first write finishes, but keep the
-      // source owner until the logical GET's final SEND completion.
-      reply->defer_recv_rearm = true;
+      // Retain the source owner until the logical GET's final SEND completion.
     }
-    reply->recv_slot = request.recv_slot;
     const size_t bytes =
         std::min<size_t>(successful_len, static_cast<size_t>(window_capacity));
     if (bytes != 0) {
@@ -1632,11 +1625,6 @@ void RdmaServer::Serve(int boot_fd) {
         reply->completion_elapsed_sec = state.completion_elapsed_sec;
         reply->release_source_on_send = state.source_uses_slot;
         reply->source_recv_slot = state.source_slot;
-        if (state.source_uses_slot &&
-            request.recv_slot == state.source_slot) {
-          reply->defer_recv_rearm = true;
-          reply->recv_slot = request.recv_slot;
-        }
         // The source remains protected until this final RDMA WRITE's SEND
         // completion. clear_multi_get must not release its owner early.
         state.source_uses_slot = false;
@@ -1852,6 +1840,9 @@ void RdmaServer::Serve(int boot_fd) {
   // it broke zero-copy correctness for marginal gain; GET scales via connections.)
   std::vector<ibv_wc> wcs(K);
   constexpr size_t kNoSlot = static_cast<size_t>(-1);
+  // A peer can receive a reply and send its next request before we reap the
+  // previous SEND completion. Keep its receive credit until that fence so a
+  // new request cannot arrive while every reply buffer is still owned.
   std::vector<size_t> rearm_on_send(K, kNoSlot);
   std::vector<size_t> release_source_on_send(K, kNoSlot);
   auto rearm_request_recv = [&](size_t slot) {
@@ -2158,11 +2149,7 @@ void RdmaServer::Serve(int boot_fd) {
             next_emit_sequence == std::numeric_limits<uint64_t>::max())
           return false;
         Reply& reply = qd.reply;
-        if (reply.defer_recv_rearm) {
-          rearm_on_send[qd.send_slot] = reply.recv_slot;
-        } else if (!rearm_request_recv(qd.recv_slot)) {
-          return false;
-        }
+        rearm_on_send[qd.send_slot] = qd.recv_slot;
         if (reply.release_source_on_send) {
           if (release_source_on_send[qd.send_slot] != kNoSlot) return false;
           release_source_on_send[qd.send_slot] = reply.source_recv_slot;
@@ -2333,12 +2320,7 @@ sync_serve_loop:;
       Reply reply;
       bool built = build_reply(s, request, &reply, /*try_prepare=*/true);
       if (!built) { fail = true; break; }
-      if (reply.defer_recv_rearm) {
-        rearm_on_send[s] = reply.recv_slot;
-      } else if (!rearm_request_recv(r)) {
-        fail = true;
-        break;  // re-arm (request consumed)
-      }
+      rearm_on_send[s] = r;
       if (reply.release_source_on_send) {
         if (release_source_on_send[s] != kNoSlot) {
           fail = true;
