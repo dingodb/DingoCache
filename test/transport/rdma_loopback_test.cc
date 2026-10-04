@@ -96,6 +96,9 @@ class RdmaServerTestPeer {
   static void FailPinnedRegistration(RdmaServer& server) {
     server.fail_pinned_registration_for_test_ = true;
   }
+  static void SetAfterReplyPost(RdmaServer& server, std::function<void()> hook) {
+    server.after_reply_post_for_test_ = std::move(hook);
+  }
 #ifdef DFKV_WITH_URING
   static void SetUringBackendFactory(
       RdmaServer* server,
@@ -365,7 +368,8 @@ struct RdmaNode {
   std::function<void(size_t)> before_range;
   explicit RdmaNode(const std::string& tag, size_t max_msg = kMaxMsg,
                     bool fail_pinned_registration = false,
-                    bool prepare_reads = false) {
+                    bool prepare_reads = false,
+                    std::function<void()> after_reply_post = {}) {
     ConfigureTestRecvSegment();
     dir = fs::temp_directory_path() / ("dfkv_rdma_" + tag);
     fs::remove_all(dir);
@@ -411,6 +415,7 @@ struct RdmaNode {
             return srv->PrepareReadForKey(key, off, len, staging, cap);
           });
     }
+    RdmaServerTestPeer::SetAfterReplyPost(*rsrv, std::move(after_reply_post));
     if (fail_pinned_registration)
       RdmaServerTestPeer::FailPinnedRegistration(*rsrv);
     if (srv->ram_enabled()) {
@@ -2146,6 +2151,96 @@ struct PinnedPullPeer {
     return Exchange(kReqPrefix, &status, &bytes) && status == Status::kOk;
   }
 };
+
+static void ExerciseControlReceiveBeforeSendFence(bool use_uring) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+#ifndef DFKV_WITH_URING
+  if (use_uring) GTEST_SKIP() << "io_uring not compiled";
+#endif
+  ScopedEnv uring("DFKV_SERVER_URING", use_uring ? "1" : "0");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "1");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool paused = false, resumed = false;
+  std::atomic<size_t> posts{0};
+  RdmaNode node(use_uring ? "control-credit-uring" : "control-credit-sync",
+                kMaxMsg, false, use_uring, [&] {
+                  if (posts.fetch_add(1) != 0) return;
+                  std::unique_lock<std::mutex> lock(mutex);
+                  paused = true;
+                  cv.notify_all();
+                  cv.wait(lock, [&] { return resumed; });
+                });
+  ASSERT_EQ(node.rsrv->UseUringPath(), use_uring);
+  const BlockKey present{9131, 0}, absent{9132, 0};
+  std::string ignored;
+  ASSERT_EQ(node.srv->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), present, 0, 0,
+                "value", 5, &ignored), Status::kOk);
+  PinnedPullPeer peer;
+  ASSERT_TRUE(peer.Open(node));
+  struct ResumeOnExit {
+    std::mutex& mutex;
+    std::condition_variable& cv;
+    bool& resumed;
+    void Open() {
+      std::lock_guard<std::mutex> lock(mutex);
+      resumed = true;
+      cv.notify_all();
+    }
+    ~ResumeOnExit() { Open(); }
+  } release{mutex, cv, resumed};
+  EncodeReqVersion(peer.ep.sbuf(0), kNativeProtoRdmaV2, WireOp::kExist,
+                   present, 0, 0, 0);
+  Status status = Status::kIOError;
+  uint64_t bytes = 0;
+  ASSERT_TRUE(peer.Exchange(kReqPrefix, &status, &bytes));
+  ASSERT_EQ(status, Status::kOk);
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(2), [&] { return paused; }));
+  }
+  if (use_uring && CounterVal(node.rsrv->MetricsText(),
+                              "dfkv_uring_init_fallbacks_total") != 0)
+    GTEST_SKIP() << "io_uring unavailable at runtime";
+  EncodeReqVersion(peer.ep.sbuf(0), kNativeProtoRdmaV2, WireOp::kExist,
+                   absent, 0, 0, 0);
+  ASSERT_TRUE(peer.ep.PostRecv(0));
+  ASSERT_TRUE(peer.ep.PostSend(0, kReqPrefix));
+  ibv_wc wc{};
+  const int ready = peer.ep.WaitComp(&wc, 1, 1000);
+  const bool sent_before_fence = ready == 1 &&
+      wc.status == IBV_WC_SUCCESS && wc.opcode == IBV_WC_SEND;
+  EXPECT_TRUE(sent_before_fence)
+      << "Control ingress must not wait for the prior reply's SEND CQE";
+  release.Open();
+  bool sent = sent_before_fence, received = false;
+  while (!sent || !received) {
+    ASSERT_EQ(peer.ep.WaitComp(&wc, 1, 10000), 1);
+    ASSERT_EQ(wc.status, IBV_WC_SUCCESS);
+    if (wc.opcode == IBV_WC_SEND) {
+      sent = true;
+    } else {
+      ASSERT_EQ(wc.opcode, IBV_WC_RECV);
+      ASSERT_EQ(wc.byte_len, kRespPrefix);
+      ASSERT_TRUE(DecodeRespVersion(peer.ep.rbuf(0), kNativeProtoRdmaV2,
+                                    &status, &bytes));
+      EXPECT_EQ(status, Status::kNotFound);
+      EXPECT_EQ(bytes, 0u);
+      received = true;
+    }
+  }
+  EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
+}
+
+TEST(RdmaLoopback, ControlReceiveDoesNotWaitForReplyFenceSync) {
+  ExerciseControlReceiveBeforeSendFence(false);
+}
+
+TEST(RdmaLoopback, ControlReceiveDoesNotWaitForReplyFenceUring) {
+  ExerciseControlReceiveBeforeSendFence(true);
+}
 
 TEST(RdmaLoopback, DynamicPullPinSurvivesRemoveAndEvictionUntilRelease) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";

@@ -2162,6 +2162,7 @@ void RdmaServer::Serve(int boot_fd) {
           uring_send_post_errors_.fetch_add(1, std::memory_order_relaxed);
           return false;
         }
+        if (after_reply_post_for_test_) after_reply_post_for_test_();
         uring_replies_posted_.fetch_add(1, std::memory_order_relaxed);
         ++posted_sends;
         ++next_emit_sequence;
@@ -2334,6 +2335,7 @@ sync_serve_loop:;
       pending.elapsed_sec = reply.completion_elapsed_sec;
       bool sent = post_reply(s, reply);
       if (!sent) { fail = true; break; }
+      if (after_reply_post_for_test_) after_reply_post_for_test_();
     }
   }
   // Any prepared sends without completions destructor-abort below.
