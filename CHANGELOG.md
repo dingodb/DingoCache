@@ -23,6 +23,9 @@
   this rejection never falls through to direct persistence. Zero watermark
   retains its explicit disk-ACK behavior.
   Keep admission and the first arena reservation under the same shard lock.
+- Preserve the authoritative backing value after RAM eviction. A conflicting
+  duplicate cannot create a RAM copy that differs from an existing disk key
+  and then misinterpret an idempotent disk write as persistence of those bytes.
 - Add per-phase connection diagnostics and optional registered PUT-source
   benchmarking. PUT and GET stall timing uses a monotonic clock and is disabled
   when not requested.
