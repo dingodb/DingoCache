@@ -335,6 +335,12 @@ GET. Existing RAM owners resolve first, including cancellation and duplicate
 completion. For a key without a RAM owner, the committed backing index is
 checked before a new RAM generation is admitted: a retained disk value wins,
 so an idempotent disk `kOk` cannot falsely certify different RAM bytes.
+Foreground write-back PUTs also hold a key-striped mutex through admission and
+any synchronous capacity-bypass write. This covers a disk owner that is not yet
+visible in the committed index. The fixed 1,024 stripes require no per-request
+allocation; unrelated keys can collide on a stripe. Sampled PUT latency includes
+lock wait. Flush workers and REMOVE do not acquire these foreground locks, so
+existing flush completion and cancellation can still unblock a waiting PUT.
 
 **State machine = allocator pin refcount.** The slot lifecycle maps directly onto
 the allocator's pin count — this is why the allocator was built media-agnostic:

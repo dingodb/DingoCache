@@ -26,6 +26,8 @@
 - Preserve the authoritative backing value after RAM eviction. A conflicting
   duplicate cannot create a RAM copy that differs from an existing disk key
   and then misinterpret an idempotent disk write as persistence of those bytes.
+  Serialize foreground same-key PUTs across RAM admission and synchronous
+  capacity bypass, so an in-flight disk owner cannot race a new RAM generation.
 - Add per-phase connection diagnostics and optional registered PUT-source
   benchmarking. PUT and GET stall timing uses a monotonic clock and is disabled
   when not requested.

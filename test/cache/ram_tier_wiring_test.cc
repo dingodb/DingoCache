@@ -328,21 +328,22 @@ TEST(RamTierWiring, CapacityBypassPreservesConcurrentDuplicateValue) {
                    Status::kOk;
           }, ram_ack);
       const BlockKey key{8101, 0};
-      std::string original(128 * 1024, 'a'), conflicting(4096, 'b');
-      auto put = [&](std::string& value) {
+      alignas(4096) char original[128 * 1024], conflicting[4096];
+      std::memset(original, 'a', sizeof(original));
+      std::memset(conflicting, 'b', sizeof(conflicting));
+      auto put = [&](char* value, size_t len) {
         if (direct)
-          return server->CacheDirectForKey(
-              key, value.data(), value.size(), value.size());
+          return server->CacheDirectForKey(key, value, len, len);
         std::string out;
         return server->ProcessRequestForKey(
             static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
-            value.data(), value.size(), &out);
+            value, len, &out);
       };
       Status first_status = Status::kInvalid, second_status = Status::kInvalid;
-      std::thread first([&] { first_status = put(original); });
+      std::thread first([&] { first_status = put(original, sizeof(original)); });
       const bool disk_entered = disk.AwaitEntry();
       EXPECT_TRUE(disk_entered);
-      std::thread second([&] { second_status = put(conflicting); });
+      std::thread second([&] { second_status = put(conflicting, sizeof(conflicting)); });
       // Before the fix, the conflicting value is admitted while the oversized
       // owner is in disk I/O. Hold that flush until the owner commits first.
       // Correct serialization cannot enter this flush before disk is opened.
@@ -360,7 +361,8 @@ TEST(RamTierWiring, CapacityBypassPreservesConcurrentDuplicateValue) {
       ASSERT_EQ(server->ProcessRequestForKey(
                     static_cast<uint8_t>(WireOp::kRange), key, 0, 0,
                     nullptr, 0, &visible), Status::kOk);
-      EXPECT_EQ(persisted, original);
+      ASSERT_EQ(persisted.size(), sizeof(original));
+      EXPECT_EQ(std::memcmp(persisted.data(), original, sizeof(original)), 0);
       EXPECT_EQ(visible, persisted) << "direct=" << direct
                                     << " ram_ack=" << ram_ack;
       server.reset();
