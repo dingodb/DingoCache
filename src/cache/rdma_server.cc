@@ -1258,6 +1258,7 @@ void RdmaServer::Serve(int boot_fd) {
 
   struct Reply {
     bool remote_write = false;
+    bool defer_recv_rearm = false;
     bool release_source_on_send = false;
     size_t source_recv_slot = 0;
     size_t first_len = 0;
@@ -1300,6 +1301,7 @@ void RdmaServer::Serve(int boot_fd) {
     if (request.get.window_count == 1) {
       if (successful_len != 0) {
         reply->remote_write = true;
+        reply->defer_recv_rearm = source_uses_slot;
         reply->payload = data;
         reply->payload_len = successful_len;
         reply->payload_mr = data_mr;
@@ -1343,6 +1345,7 @@ void RdmaServer::Serve(int boot_fd) {
       multi_get_source_owner[request.data_slot] =
           static_cast<int32_t>(operation_id);
       // Retain the source owner until the logical GET's final SEND completion.
+      reply->defer_recv_rearm = true;
     }
     const size_t bytes =
         std::min<size_t>(successful_len, static_cast<size_t>(window_capacity));
@@ -1625,6 +1628,8 @@ void RdmaServer::Serve(int boot_fd) {
         reply->completion_elapsed_sec = state.completion_elapsed_sec;
         reply->release_source_on_send = state.source_uses_slot;
         reply->source_recv_slot = state.source_slot;
+        reply->defer_recv_rearm =
+            state.source_uses_slot && request.recv_slot == state.source_slot;
         // The source remains protected until this final RDMA WRITE's SEND
         // completion. clear_multi_get must not release its owner early.
         state.source_uses_slot = false;
@@ -1831,18 +1836,40 @@ void RdmaServer::Serve(int boot_fd) {
     return ep.PostSend(send_slot, reply.first_len);
   };
 
-  // Single-threaded serve loop: reap completions and process each RECV inline, in
-  // arrival (= request) order, replying on a free send slot. Replies MUST go out
-  // in request order: the pipelined client binds each reply's destination buffer
-  // at recv-post time (zero-copy scatter), so an out-of-order reply would land in
-  // the wrong buffer. Depth K still gives K-in-flight pipelining; we just don't
-  // reorder. (An earlier parallel GET worker pool was removed for this reason —
-  // it broke zero-copy correctness for marginal gain; GET scales via connections.)
+  // Replies preserve receive order because the client binds destinations by
+  // RC SEND order. A consumed control/PUT receive can be posted before its
+  // reply is sent, but the reply buffer remains owned until the SEND CQE.
+  // If the next request arrives first, retain its CQE and receive-buffer
+  // ownership in a depth-bounded FIFO rather than failing or forcing RNR.
   std::vector<ibv_wc> wcs(K);
+  std::vector<ibv_wc> pending_recv(K);
+  size_t pending_recv_head = 0;
+  size_t pending_recv_count = 0;
+  auto dispatch_completions = [&](const ibv_wc* batch, int count,
+                                  auto&& process_wc) -> bool {
+    for (int i = 0; i < count; ++i) {
+      const ibv_wc& wc = batch[i];
+      const bool received = wc.opcode == IBV_WC_RECV ||
+                            wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM;
+      if (wc.status == IBV_WC_SUCCESS && received &&
+          (pending_recv_count != 0 || free_send.empty())) {
+        if (pending_recv_count == K) return false;
+        pending_recv[(pending_recv_head + pending_recv_count) % K] = wc;
+        ++pending_recv_count;
+      } else if (!process_wc(wc)) {
+        return false;
+      }
+    }
+    while (pending_recv_count != 0 && !free_send.empty()) {
+      if (!process_wc(pending_recv[pending_recv_head])) return false;
+      pending_recv_head = (pending_recv_head + 1) % K;
+      --pending_recv_count;
+    }
+    return true;
+  };
   constexpr size_t kNoSlot = static_cast<size_t>(-1);
-  // A peer can receive a reply and send its next request before we reap the
-  // previous SEND completion. Keep its receive credit until that fence so a
-  // new request cannot arrive while every reply buffer is still owned.
+  // A receive that is still an outbound data source keeps its original
+  // SEND-fence protection; unrelated control ingress need not wait for it.
   std::vector<size_t> rearm_on_send(K, kNoSlot);
   std::vector<size_t> release_source_on_send(K, kNoSlot);
   auto rearm_request_recv = [&](size_t slot) {
@@ -2149,7 +2176,11 @@ void RdmaServer::Serve(int boot_fd) {
             next_emit_sequence == std::numeric_limits<uint64_t>::max())
           return false;
         Reply& reply = qd.reply;
-        rearm_on_send[qd.send_slot] = qd.recv_slot;
+        if (reply.defer_recv_rearm) {
+          rearm_on_send[qd.send_slot] = qd.recv_slot;
+        } else if (!rearm_request_recv(qd.recv_slot)) {
+          return false;
+        }
         if (reply.release_source_on_send) {
           if (release_source_on_send[qd.send_slot] != kNoSlot) return false;
           release_source_on_send[qd.send_slot] = reply.source_recv_slot;
@@ -2184,12 +2215,7 @@ void RdmaServer::Serve(int boot_fd) {
       if (g > 0) {
         ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
         progressed = true;
-        for (int w = 0; w < g; ++w) {
-          if (!process_wc(wcs[w])) {
-            fail = true;
-            break;
-          }
-        }
+        if (!dispatch_completions(wcs.data(), g, process_wc)) fail = true;
       }
       if (fail) break;
 
@@ -2252,12 +2278,7 @@ void RdmaServer::Serve(int boot_fd) {
       }
       if (g < 0) break;  // disconnect, endpoint error, or Stop()'s Wake
       ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
-      for (int w = 0; w < g; ++w) {
-        if (!process_wc(wcs[w])) {
-          fail = true;
-          break;
-        }
-      }
+      if (!dispatch_completions(wcs.data(), g, process_wc)) fail = true;
     }
 
     // No synchronous retry is allowed after successful ring initialization:
@@ -2276,67 +2297,67 @@ void RdmaServer::Serve(int boot_fd) {
 sync_serve_loop:;
 #endif  // DFKV_WITH_URING
 
+  auto process_sync_wc = [&](const ibv_wc& wc) -> bool {
+    if (wc.status != IBV_WC_SUCCESS) {
+      completion_errors_.fetch_add(1, std::memory_order_relaxed);
+      rail_stats.completion_errors.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+    if (wc.opcode == IBV_WC_RDMA_WRITE) return true;
+    if (wc.opcode == IBV_WC_SEND) {
+      const size_t sid = static_cast<size_t>(wc.wr_id);
+      if (sid >= K) return false;
+      // Release the old source and reply buffer only at the SEND fence.
+      complete_send(sid);
+      if (release_source_on_send[sid] != kNoSlot) {
+        multi_get_source_owner[release_source_on_send[sid]] = -1;
+        release_source_on_send[sid] = kNoSlot;
+      }
+      if (rearm_on_send[sid] != kNoSlot) {
+        if (!rearm_request_recv(rearm_on_send[sid])) return false;
+        rearm_on_send[sid] = kNoSlot;
+      }
+      free_send.push_back(sid);
+      return true;
+    }
+    Request request;
+    if (!decode_request(wc, &request) || free_send.empty()) return false;
+    completions_.fetch_add(1, std::memory_order_relaxed);
+    rail_stats.completions.fetch_add(1, std::memory_order_relaxed);
+    const size_t r = request.recv_slot;
+    const size_t s = free_send.back();
+    free_send.pop_back();
+    Reply reply;
+    if (!build_reply(s, request, &reply, /*try_prepare=*/true)) return false;
+    if (reply.defer_recv_rearm) {
+      rearm_on_send[s] = r;
+    } else if (!rearm_request_recv(r)) {
+      return false;
+    }
+    if (reply.release_source_on_send) {
+      if (release_source_on_send[s] != kNoSlot) return false;
+      release_source_on_send[s] = reply.source_recv_slot;
+    }
+    PendingCompletion& pending = complete_on_send[s];
+    pending.read = std::move(reply.completion);
+    pending.bytes = pending.read.payload_len();
+    pending.elapsed_sec = reply.completion_elapsed_sec;
+    if (!post_reply(s, reply)) return false;
+    if (after_reply_post_for_test_) after_reply_post_for_test_();
+    return true;
+  };
   while (running_ && !fail) {
-    int g = ep.WaitComp(wcs.data(), static_cast<int>(K), idle_ms);
+    const int wait_ms = pending_recv_count != 0 ? 1 : idle_ms;
+    const int g = ep.WaitComp(wcs.data(), static_cast<int>(K), wait_ms);
     if (g > 0)
       ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
-    if (g == 0) { idle_reclaims_.fetch_add(1, std::memory_order_relaxed); break; }  // idle -> reclaim
-    if (g < 0) break;  // error / Stop()'s Wake()
-    for (int w = 0; w < g && !fail; ++w) {
-      const ibv_wc& wc = wcs[w];
-      if (wc.status != IBV_WC_SUCCESS) {
-        completion_errors_.fetch_add(1, std::memory_order_relaxed);
-        rail_stats.completion_errors.fetch_add(1,
-                                               std::memory_order_relaxed);
-        fail = true; break;
-      }
-      if (wc.opcode == IBV_WC_RDMA_WRITE) continue;
-      if (wc.opcode == IBV_WC_SEND) {
-        size_t sid = static_cast<size_t>(wc.wr_id);
-        // Finish any deferred read while its source slot is still owned and
-        // before reposting a receive that could overwrite completion data.
-        complete_send(sid);
-        if (sid < release_source_on_send.size() &&
-            release_source_on_send[sid] != kNoSlot) {
-          multi_get_source_owner[release_source_on_send[sid]] = -1;
-          release_source_on_send[sid] = kNoSlot;
-        }
-        if (sid < rearm_on_send.size() && rearm_on_send[sid] != kNoSlot) {
-          if (!rearm_request_recv(rearm_on_send[sid])) {
-            fail = true;
-            break;
-          }
-          rearm_on_send[sid] = kNoSlot;
-        }
-        free_send.push_back(sid);
-        continue;
-      }
-      Request request;
-      if (!decode_request(wc, &request)) { fail = true; break; }
-      completions_.fetch_add(1, std::memory_order_relaxed);
-      rail_stats.completions.fetch_add(1, std::memory_order_relaxed);
-      const size_t r = request.recv_slot;
-      if (free_send.empty()) { fail = true; break; }
-      size_t s = free_send.back(); free_send.pop_back();
-      Reply reply;
-      bool built = build_reply(s, request, &reply, /*try_prepare=*/true);
-      if (!built) { fail = true; break; }
-      rearm_on_send[s] = r;
-      if (reply.release_source_on_send) {
-        if (release_source_on_send[s] != kNoSlot) {
-          fail = true;
-          break;
-        }
-        release_source_on_send[s] = reply.source_recv_slot;
-      }
-      PendingCompletion& pending = complete_on_send[s];
-      pending.read = std::move(reply.completion);
-      pending.bytes = pending.read.payload_len();
-      pending.elapsed_sec = reply.completion_elapsed_sec;
-      bool sent = post_reply(s, reply);
-      if (!sent) { fail = true; break; }
-      if (after_reply_post_for_test_) after_reply_post_for_test_();
+    if (g == 0) {
+      if (pending_recv_count != 0) continue;
+      idle_reclaims_.fetch_add(1, std::memory_order_relaxed);
+      break;
     }
+    if (g < 0) break;  // error / Stop()'s Wake()
+    if (!dispatch_completions(wcs.data(), g, process_sync_wc)) fail = true;
   }
   // Any prepared sends without completions destructor-abort below.
   rail_stats.active_conns.fetch_sub(1, std::memory_order_relaxed);
