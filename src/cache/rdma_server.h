@@ -288,6 +288,11 @@ class RdmaServer {
   std::function<void()> before_endpoint_teardown_for_test_;
   // Test barrier after reply posting, before its SEND CQE is processed.
   std::function<void()> after_reply_post_for_test_;
+  // Test-only CQ filter: may withhold and later replay actual polled CQEs.
+  // It never fabricates completions; production leaves this empty.
+  std::function<void(ibv_wc*, int*, size_t)> reorder_cq_for_test_;
+  std::function<void(size_t, size_t, size_t)> after_cq_dispatch_for_test_;
+  std::function<void(size_t)> after_request_rearm_for_test_;
   std::atomic<uint64_t> uring_reads_{0}, uring_read_batches_{0},
       uring_read_batch_max_{0}, uring_completions_{0}, uring_inflight_{0},
       uring_inflight_max_{0}, uring_replies_posted_{0},

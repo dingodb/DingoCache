@@ -99,6 +99,17 @@ class RdmaServerTestPeer {
   static void SetAfterReplyPost(RdmaServer& server, std::function<void()> hook) {
     server.after_reply_post_for_test_ = std::move(hook);
   }
+  static void SetCqHooks(
+      RdmaServer& server,
+      std::function<void(ibv_wc*, int*, size_t)> reorder,
+      std::function<void(size_t, size_t, size_t)> observe) {
+    server.reorder_cq_for_test_ = std::move(reorder);
+    server.after_cq_dispatch_for_test_ = std::move(observe);
+  }
+  static void SetAfterRequestRearm(
+      RdmaServer& server, std::function<void(size_t)> hook) {
+    server.after_request_rearm_for_test_ = std::move(hook);
+  }
 #ifdef DFKV_WITH_URING
   static void SetUringBackendFactory(
       RdmaServer* server,
@@ -369,7 +380,10 @@ struct RdmaNode {
   explicit RdmaNode(const std::string& tag, size_t max_msg = kMaxMsg,
                     bool fail_pinned_registration = false,
                     bool prepare_reads = false,
-                    std::function<void()> after_reply_post = {}) {
+                    std::function<void()> after_reply_post = {},
+                    std::function<void(ibv_wc*, int*, size_t)> reorder = {},
+                    std::function<void(size_t, size_t, size_t)> observe = {},
+                    std::function<void(size_t)> after_rearm = {}) {
     ConfigureTestRecvSegment();
     dir = fs::temp_directory_path() / ("dfkv_rdma_" + tag);
     fs::remove_all(dir);
@@ -416,6 +430,9 @@ struct RdmaNode {
           });
     }
     RdmaServerTestPeer::SetAfterReplyPost(*rsrv, std::move(after_reply_post));
+    RdmaServerTestPeer::SetCqHooks(*rsrv, std::move(reorder),
+                                   std::move(observe));
+    RdmaServerTestPeer::SetAfterRequestRearm(*rsrv, std::move(after_rearm));
     if (fail_pinned_registration)
       RdmaServerTestPeer::FailPinnedRegistration(*rsrv);
     if (srv->ram_enabled()) {
@@ -2078,9 +2095,9 @@ std::string PatternValue(size_t size, size_t seed);
 // automatic release, so removal, eviction and teardown are deterministic.
 struct PinnedPullPeer {
   rdma::RcEndpoint ep;
-  bool Open(const RdmaNode& node) {
+  bool Open(const RdmaNode& node, size_t depth = 1) {
     const auto& dev = node.rsrv->DeviceNames().front();
-    if (!ep.Open(dev.c_str(), rdma::kV2ControlCap, 1)) return false;
+    if (!ep.Open(dev.c_str(), rdma::kV2ControlCap, depth)) return false;
     int fd = net::Dial(node.addr, 10000, 10000);
     if (fd < 0) return false;
     char frame[rdma::kDevNameBytes], mine[rdma::kQpInfoBytes],
@@ -2089,7 +2106,7 @@ struct PinnedPullPeer {
         rdma::kDevFrameRequestPullRead | rdma::kDevFrameRequestDynamicPull,
         frame, rdma::kDevProtoV2);
     auto info = ep.Local();
-    info.depth = 1;
+    info.depth = depth;
     info.protocol_version = rdma::kDevProtoV2;
     rdma::SerializeQpInfo(info, mine);
     rdma::RecvSegmentInfo resident;
@@ -2240,6 +2257,518 @@ TEST(RdmaLoopback, ControlReceiveDoesNotWaitForReplyFenceSync) {
 
 TEST(RdmaLoopback, ControlReceiveDoesNotWaitForReplyFenceUring) {
   ExerciseControlReceiveBeforeSendFence(true);
+}
+
+// Only this fixture has a CQ filter. It stores real polled SEND completions
+// without delivering them to Serve, then replays each exact WC once released.
+// The production dispatcher and actual client QP remain in use.
+struct HeldReplyCqe {
+  std::mutex mu;
+  std::condition_variable cv;
+  std::deque<ibv_wc> held;
+  bool captured = false;
+  bool capture_all = false;
+  bool release_all = false;
+  size_t release_count = 0;
+  size_t queued = 0;
+  size_t free_slots = 0;
+  size_t depth = 0;
+  size_t head = 0;
+  bool release_on_next_recv = false;
+  bool same_batch_recv_and_send = false;
+  void Filter(ibv_wc* batch, int* count, size_t capacity) {
+    std::lock_guard<std::mutex> lock(mu);
+    depth = capacity;
+    int output = 0;
+    for (int i = 0; i < *count; ++i) {
+      if ((capture_all || !captured) &&
+          batch[i].status == IBV_WC_SUCCESS &&
+          batch[i].opcode == IBV_WC_SEND) {
+        held.push_back(batch[i]);
+        captured = true;
+      } else {
+        batch[output++] = batch[i];
+      }
+    }
+    const bool received = std::any_of(batch, batch + output,
+                                      [](const ibv_wc& wc) {
+                                        return wc.status == IBV_WC_SUCCESS &&
+                                            (wc.opcode == IBV_WC_RECV ||
+                                             wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM);
+                                      });
+    if (release_on_next_recv && received) {
+      ++release_count;
+      release_on_next_recv = false;
+    }
+    while (!held.empty() && static_cast<size_t>(output) < capacity &&
+           (release_all || release_count != 0)) {
+      batch[output++] = held.front();
+      held.pop_front();
+      if (received) same_batch_recv_and_send = true;
+      if (release_count != 0) --release_count;
+    }
+    *count = output;
+    cv.notify_all();
+  }
+  void Observe(size_t pending, size_t free, size_t next_head) {
+    std::lock_guard<std::mutex> lock(mu);
+    queued = pending;
+    free_slots = free;
+    head = next_head;
+    cv.notify_all();
+  }
+  void Release() {
+    std::lock_guard<std::mutex> lock(mu);
+    release_all = true;
+    cv.notify_all();
+  }
+  void ReleaseOne() {
+    std::lock_guard<std::mutex> lock(mu);
+    ++release_count;
+    cv.notify_all();
+  }
+};
+
+static void ExerciseRealFifoBehindReplyFence(bool use_uring) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+#ifndef DFKV_WITH_URING
+  if (use_uring) GTEST_SKIP() << "io_uring not compiled";
+#endif
+  ScopedEnv uring("DFKV_SERVER_URING", use_uring ? "1" : "0");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "1");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  HeldReplyCqe reorder;
+  RdmaNode node(use_uring ? "fifo-fence-uring" : "fifo-fence-sync",
+                kMaxMsg, false, use_uring, {},
+                [&](ibv_wc* batch, int* count, size_t capacity) {
+                  reorder.Filter(batch, count, capacity);
+                },
+                [&](size_t pending, size_t free, size_t head) {
+                  reorder.Observe(pending, free, head);
+                });
+  struct ReleaseOnExit {
+    HeldReplyCqe& state;
+    ~ReleaseOnExit() { state.Release(); }
+  } unblock{reorder};
+  ASSERT_EQ(node.rsrv->UseUringPath(), use_uring);
+  const BlockKey present{9311, 0}, absent{9312, 0};
+  std::string ignored;
+  ASSERT_EQ(node.srv->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), present, 0, 0,
+                "A-value", 7, &ignored), Status::kOk);
+  PinnedPullPeer peer;
+  ASSERT_TRUE(peer.Open(node));
+  EncodeReqVersion(peer.ep.sbuf(0), kNativeProtoRdmaV2,
+                   WireOp::kExist, present, 0, 0, 0);
+  Status status = Status::kIOError;
+  uint64_t bytes = 0;
+  ASSERT_TRUE(peer.Exchange(kReqPrefix, &status, &bytes));
+  ASSERT_EQ(status, Status::kOk);
+  {
+    std::unique_lock<std::mutex> lock(reorder.mu);
+    ASSERT_TRUE(reorder.cv.wait_for(lock, std::chrono::seconds(5),
+                                   [&] { return !reorder.held.empty(); }));
+  }
+  if (use_uring && CounterVal(node.rsrv->MetricsText(),
+                              "dfkv_uring_init_fallbacks_total") != 0) {
+    reorder.Release();
+    GTEST_SKIP() << "io_uring unavailable at runtime";
+  }
+  EncodeReqVersion(peer.ep.sbuf(0), kNativeProtoRdmaV2,
+                   WireOp::kExist, absent, 0, 0, 0);
+  ASSERT_TRUE(peer.ep.PostRecv(0));
+  ASSERT_TRUE(peer.ep.PostSend(0, kReqPrefix));
+  {
+    std::unique_lock<std::mutex> lock(reorder.mu);
+    ASSERT_TRUE(reorder.cv.wait_for(
+        lock, std::chrono::seconds(5),
+        [&] { return reorder.queued == 1 && reorder.free_slots == 0; }));
+  }
+  EXPECT_EQ(node.rsrv->Completions(), 1u)
+      << "B must remain a received CQE, not execute before A's SEND fence";
+  ibv_wc wc{};
+  ASSERT_EQ(peer.ep.WaitComp(&wc, 1, 5000), 1);
+  ASSERT_EQ(wc.status, IBV_WC_SUCCESS);
+  EXPECT_EQ(wc.opcode, IBV_WC_SEND);
+  EXPECT_EQ(peer.ep.PollComp(&wc, 1), 0)
+      << "B's reply buffer must not be reused before A's SEND fence";
+  reorder.Release();
+  ASSERT_EQ(peer.ep.WaitComp(&wc, 1, 5000), 1);
+  ASSERT_EQ(wc.status, IBV_WC_SUCCESS);
+  ASSERT_EQ(wc.opcode, IBV_WC_RECV);
+  ASSERT_EQ(wc.byte_len, kRespPrefix);
+  ASSERT_TRUE(DecodeRespVersion(peer.ep.rbuf(0), kNativeProtoRdmaV2,
+                                &status, &bytes));
+  EXPECT_EQ(status, Status::kNotFound);
+  EXPECT_EQ(bytes, 0u);
+  EXPECT_EQ(node.rsrv->Completions(), 2u);
+  {
+    std::unique_lock<std::mutex> lock(reorder.mu);
+    ASSERT_TRUE(reorder.cv.wait_for(
+        lock, std::chrono::seconds(5),
+        [&] { return reorder.queued == 0 && reorder.free_slots == 1; }));
+  }
+  EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
+  std::cout << "FIFO_REAL_CQE_ORDER mode=" << (use_uring ? "uring" : "sync")
+            << " depth=1 A-reply B-queued A-fence B-correct" << '\n';
+}
+
+TEST(RdmaLoopback, RealFifoReceiveBeforeSendFenceSync) {
+  ExerciseRealFifoBehindReplyFence(false);
+}
+TEST(RdmaLoopback, RealFifoReceiveBeforeSendFenceUring) {
+  ExerciseRealFifoBehindReplyFence(true);
+}
+
+static void ExerciseFifoOrderAndWrap() {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "0");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  HeldReplyCqe reorder;
+  reorder.capture_all = true;
+  RdmaNode node("fifo-wrap-sync", kMaxMsg, false, false, {},
+                [&](ibv_wc* batch, int* count, size_t capacity) {
+                  reorder.Filter(batch, count, capacity);
+                },
+                [&](size_t pending, size_t free, size_t head) {
+                  reorder.Observe(pending, free, head);
+                });
+  struct ReleaseOnExit {
+    HeldReplyCqe& state;
+    ~ReleaseOnExit() { state.Release(); }
+  } unblock{reorder};
+  ASSERT_FALSE(node.rsrv->UseUringPath());
+  const BlockKey keys[] = {
+      {9510, 0}, {9511, 0}, {9512, 0}, {9513, 0},
+      {9514, 0}, {9515, 0}, {9516, 0}, {9517, 0}, {9518, 0}};
+  for (const auto& [index, length] :
+       {std::pair<size_t, size_t>{0, 3}, {2, 7}, {5, 11},
+        {6, 13}, {8, 17}}) {
+    std::string value(length, static_cast<char>('a' + index)), ignored;
+    ASSERT_EQ(node.srv->ProcessRequestForKey(
+                  static_cast<uint8_t>(WireOp::kCache), keys[index], 0, 0,
+                  value.data(), value.size(), &ignored), Status::kOk);
+  }
+  PinnedPullPeer peer;
+  ASSERT_TRUE(peer.Open(node, 4));
+  const auto post = [&](size_t slot, size_t key_index) {
+    if (!peer.ep.PostRecv(slot)) return false;
+    EncodeReqVersion(peer.ep.sbuf(slot), kNativeProtoRdmaV2,
+                     WireOp::kExist, keys[key_index], 0, 0, 0);
+    return peer.ep.PostSend(slot, kReqPrefix);
+  };
+  const auto read_one = [&](size_t slot, Status expected,
+                            uint64_t expected_length) {
+    for (int i = 0; i < 16; ++i) {
+      ibv_wc wc{};
+      if (peer.ep.WaitComp(&wc, 1, 5000) != 1 ||
+          wc.status != IBV_WC_SUCCESS) return false;
+      if (wc.opcode == IBV_WC_SEND) continue;
+      if (wc.opcode != IBV_WC_RECV || wc.wr_id != slot ||
+          wc.byte_len != kRespPrefix) return false;
+      Status status = Status::kIOError;
+      uint64_t data_length = 0, value_length = 0;
+      return DecodeRespVersion(peer.ep.rbuf(slot), kNativeProtoRdmaV2,
+                               &status, &data_length, kMaxFrameLen,
+                               &value_length) &&
+          status == expected && data_length == 0 &&
+          value_length == expected_length;
+    }
+    return false;
+  };
+  const auto wait_state = [&](auto predicate) {
+    std::unique_lock<std::mutex> lock(reorder.mu);
+    return reorder.cv.wait_for(lock, std::chrono::seconds(5),
+                               [&] { return predicate(reorder); });
+  };
+  for (size_t slot = 0; slot < 4; ++slot)
+    ASSERT_TRUE(post(slot, slot));
+  for (size_t slot = 0; slot < 4; ++slot)
+    ASSERT_TRUE(read_one(slot, slot % 2 == 0 ? Status::kOk
+                                             : Status::kNotFound,
+                         slot == 0 ? 3 : (slot == 2 ? 7 : 0)));
+  ASSERT_TRUE(wait_state(
+      [](const HeldReplyCqe& state) { return state.held.size() == 4; }));
+  ASSERT_EQ(reorder.depth, 4u);
+  ASSERT_TRUE(post(0, 4));  // B0: absent.
+  ASSERT_TRUE(post(1, 5));  // B1: 11-byte present value.
+  ASSERT_TRUE(wait_state([](const HeldReplyCqe& state) {
+    return state.queued == 2 && state.free_slots == 0;
+  }));
+  {
+    std::lock_guard<std::mutex> lock(reorder.mu);
+    reorder.release_on_next_recv = true;
+  }
+  ASSERT_TRUE(post(2, 6));  // C: 13-byte value arrives behind B0/B1.
+  ASSERT_TRUE(wait_state([](const HeldReplyCqe& state) {
+    return state.same_batch_recv_and_send && state.queued == 2 &&
+           state.head == 1 && state.free_slots == 0;
+  }));
+  ASSERT_TRUE(read_one(0, Status::kNotFound, 0));
+  EXPECT_EQ(node.rsrv->Completions(), 5u);
+  reorder.ReleaseOne();
+  ASSERT_TRUE(wait_state([](const HeldReplyCqe& state) {
+    return state.queued == 1 && state.head == 2;
+  }));
+  ASSERT_TRUE(read_one(1, Status::kOk, 11));
+  reorder.ReleaseOne();
+  ASSERT_TRUE(wait_state([](const HeldReplyCqe& state) {
+    return state.queued == 0 && state.head == 3;
+  }));
+  ASSERT_TRUE(read_one(2, Status::kOk, 13));
+  ASSERT_TRUE(post(0, 7));  // D0: absent.
+  ASSERT_TRUE(post(1, 8));  // D1: 17-byte value.
+  ASSERT_TRUE(wait_state([](const HeldReplyCqe& state) {
+    return state.queued == 2 && state.head == 3;
+  }));
+  reorder.ReleaseOne();
+  ASSERT_TRUE(wait_state([](const HeldReplyCqe& state) {
+    return state.queued == 1 && state.head == 0;
+  }));
+  ASSERT_TRUE(read_one(0, Status::kNotFound, 0));
+  reorder.ReleaseOne();
+  ASSERT_TRUE(wait_state([](const HeldReplyCqe& state) {
+    return state.queued == 0 && state.head == 1;
+  }));
+  ASSERT_TRUE(read_one(1, Status::kOk, 17));
+  reorder.Release();
+  ASSERT_TRUE(wait_state([](const HeldReplyCqe& state) {
+    return state.queued == 0 && state.free_slots == 4;
+  }));
+  EXPECT_EQ(node.rsrv->Completions(), 9u);
+  EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
+  std::cout << "FIFO_REAL_CQE_ORDER mode=sync"
+               " depth=4 old-pending/new-RECV/SEND same batch, partial drain,"
+               " head=3->0->1; all nine responses matched" << '\n';
+}
+
+TEST(RdmaLoopback, RealFifoOrderWrapSync) {
+  ExerciseFifoOrderAndWrap();
+}
+
+TEST(RdmaLoopback, RealReceiveBackedGetKeepsSourceUntilSendFence) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "0");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "2");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  HeldReplyCqe reorder;
+  std::mutex mu;
+  std::condition_variable cv;
+  std::array<size_t, 2> rearmed{};
+  RdmaNode node("fifo-source-sync", kMaxMsg, false, false, {},
+                [&](ibv_wc* batch, int* count, size_t capacity) {
+                  reorder.Filter(batch, count, capacity);
+                },
+                [&](size_t pending, size_t free, size_t head) {
+                  reorder.Observe(pending, free, head);
+                },
+                [&](size_t slot) {
+                  std::lock_guard<std::mutex> lock(mu);
+                  if (slot < rearmed.size()) ++rearmed[slot];
+                  cv.notify_all();
+                });
+  struct ReleaseOnExit {
+    HeldReplyCqe& state;
+    ~ReleaseOnExit() { state.Release(); }
+  } unblock{reorder};
+  ASSERT_FALSE(node.rsrv->UseUringPath());
+  const BlockKey data_key{9631, 0}, absent{9632, 0};
+  const std::string value = PatternValue(8192, 63);
+  std::string ignored;
+  ASSERT_EQ(node.srv->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), data_key, 0, 0,
+                value.data(), value.size(), &ignored), Status::kOk);
+  PinnedPullPeer peer;
+  ASSERT_TRUE(peer.Open(node, 2));
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5),
+                            [&] { return rearmed[0] == 1 &&
+                                           rearmed[1] == 1; }));
+  }
+  std::string output(value.size(), '\0');
+  ibv_mr* mr = peer.ep.RegisterTransient(output.data(), output.size(), true);
+  ASSERT_NE(mr, nullptr);
+  std::vector<RdmaWriteTarget> targets{{
+      reinterpret_cast<uint64_t>(output.data()), mr->rkey,
+      static_cast<uint32_t>(output.size())}};
+  size_t frame_length = 0;
+  ASSERT_TRUE(EncodeRdmaGetReq(peer.ep.sbuf(0), peer.ep.cap(), data_key, 0,
+                               value.size(), targets, &frame_length));
+  ASSERT_TRUE(peer.ep.PostRecv(0));
+  ASSERT_TRUE(peer.ep.PostSend(0, frame_length));
+  bool sent = false, received = false;
+  while (!sent || !received) {
+    ibv_wc wc{};
+    ASSERT_EQ(peer.ep.WaitComp(&wc, 1, 5000), 1);
+    ASSERT_EQ(wc.status, IBV_WC_SUCCESS);
+    if (wc.opcode == IBV_WC_SEND) {
+      sent = true;
+    } else {
+      ASSERT_EQ(wc.opcode, IBV_WC_RECV);
+      ASSERT_EQ(wc.wr_id, 0u);
+      Status status = Status::kIOError;
+      uint64_t bytes = 0;
+      ASSERT_TRUE(DecodeRespVersion(peer.ep.rbuf(0), kNativeProtoRdmaV2,
+                                    &status, &bytes));
+      EXPECT_EQ(status, Status::kOk);
+      EXPECT_EQ(bytes, value.size());
+      received = true;
+    }
+  }
+  EXPECT_EQ(output, value);
+  {
+    std::unique_lock<std::mutex> lock(reorder.mu);
+    ASSERT_TRUE(reorder.cv.wait_for(
+        lock, std::chrono::seconds(5),
+        [&] { return !reorder.held.empty() && reorder.depth == 2; }));
+  }
+  EncodeReqVersion(peer.ep.sbuf(1), kNativeProtoRdmaV2,
+                   WireOp::kExist, absent, 0, 0, 0);
+  ASSERT_TRUE(peer.ep.PostRecv(1));
+  ASSERT_TRUE(peer.ep.PostSend(1, kReqPrefix));
+  sent = false;
+  received = false;
+  while (!sent || !received) {
+    ibv_wc wc{};
+    ASSERT_EQ(peer.ep.WaitComp(&wc, 1, 5000), 1);
+    ASSERT_EQ(wc.status, IBV_WC_SUCCESS);
+    if (wc.opcode == IBV_WC_SEND) {
+      sent = true;
+    } else {
+      ASSERT_EQ(wc.opcode, IBV_WC_RECV);
+      ASSERT_EQ(wc.wr_id, 1u);
+      Status status = Status::kIOError;
+      uint64_t bytes = 0;
+      ASSERT_TRUE(DecodeRespVersion(peer.ep.rbuf(1), kNativeProtoRdmaV2,
+                                    &status, &bytes));
+      EXPECT_EQ(status, Status::kNotFound);
+      EXPECT_EQ(bytes, 0u);
+      received = true;
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    EXPECT_EQ(rearmed[0], 1u)
+        << "Receive-backed GET must not repost its data source before fence";
+    EXPECT_EQ(rearmed[1], 2u);
+  }
+  EXPECT_EQ(output, value);
+  reorder.Release();
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5),
+                            [&] { return rearmed[0] == 2; }));
+  }
+  peer.ep.ReleaseTransient(mr);
+  EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
+  std::cout << "FIFO_SOURCE_FENCE mode=sync depth=2 source_slot=0"
+               " rearmed_only_after_real_SEND_CQE bytes=8192" << '\n';
+}
+
+static void ExerciseQueuedReceiveConnectionClose(bool use_uring) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+#ifndef DFKV_WITH_URING
+  if (use_uring) GTEST_SKIP() << "io_uring not compiled";
+#endif
+  ScopedEnv uring("DFKV_SERVER_URING", use_uring ? "1" : "0");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "1");
+  ScopedEnv idle("DFKV_RDMA_IDLE_MS", "200");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  HeldReplyCqe reorder;
+  RdmaNode node(use_uring ? "fifo-close-uring" : "fifo-close-sync",
+                kMaxMsg, false, use_uring, {},
+                [&](ibv_wc* batch, int* count, size_t capacity) {
+                  reorder.Filter(batch, count, capacity);
+                },
+                [&](size_t pending, size_t free, size_t head) {
+                  reorder.Observe(pending, free, head);
+                });
+  struct ReleaseOnExit {
+    HeldReplyCqe& state;
+    ~ReleaseOnExit() { state.Release(); }
+  } unblock{reorder};
+  ASSERT_EQ(node.rsrv->UseUringPath(), use_uring);
+  const BlockKey present{9731, 0}, absent{9732, 0};
+  std::string ignored;
+  ASSERT_EQ(node.srv->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), present, 0, 0,
+                "persist", 7, &ignored), Status::kOk);
+  {
+    PinnedPullPeer peer;
+    ASSERT_TRUE(peer.Open(node));
+    EncodeReqVersion(peer.ep.sbuf(0), kNativeProtoRdmaV2,
+                     WireOp::kExist, present, 0, 0, 0);
+    Status status = Status::kIOError;
+    uint64_t bytes = 0;
+    ASSERT_TRUE(peer.Exchange(kReqPrefix, &status, &bytes));
+    ASSERT_EQ(status, Status::kOk);
+    {
+      std::unique_lock<std::mutex> lock(reorder.mu);
+      ASSERT_TRUE(reorder.cv.wait_for(
+          lock, std::chrono::seconds(5),
+          [&] { return !reorder.held.empty(); }));
+    }
+    if (use_uring && CounterVal(node.rsrv->MetricsText(),
+                                "dfkv_uring_init_fallbacks_total") != 0) {
+      reorder.Release();
+      GTEST_SKIP() << "io_uring unavailable at runtime";
+    }
+    EncodeReqVersion(peer.ep.sbuf(0), kNativeProtoRdmaV2,
+                     WireOp::kExist, absent, 0, 0, 0);
+    ASSERT_TRUE(peer.ep.PostRecv(0));
+    ASSERT_TRUE(peer.ep.PostSend(0, kReqPrefix));
+    {
+      std::unique_lock<std::mutex> lock(reorder.mu);
+      ASSERT_TRUE(reorder.cv.wait_for(
+          lock, std::chrono::seconds(5),
+          [&] { return reorder.queued == 1 && reorder.free_slots == 0; }));
+    }
+    ibv_wc wc{};
+    ASSERT_EQ(peer.ep.WaitComp(&wc, 1, 5000), 1);
+    ASSERT_EQ(wc.status, IBV_WC_SUCCESS);
+    ASSERT_EQ(wc.opcode, IBV_WC_SEND);
+    // Destroy this real QP with B's receive still held by Serve's FIFO.
+  }
+  reorder.Release();
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (node.rsrv->ActiveConns() != 0 &&
+         std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  ASSERT_EQ(node.rsrv->ActiveConns(), 0u);
+  double receive_used = 0;
+  double exact_mrs = 0;
+  do {
+    const std::string metrics = node.rsrv->MetricsText();
+    receive_used =
+        CounterVal(metrics, "dfkv_rdma_recv_segment_used_bytes");
+    exact_mrs = CounterVal(metrics, "dfkv_rdma_dynamic_get_mr_active");
+    if (receive_used == 0 && exact_mrs == 0) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  } while (std::chrono::steady_clock::now() < deadline);
+  EXPECT_EQ(receive_used, 0);
+  EXPECT_EQ(exact_mrs, 0);
+  {
+    PinnedPullPeer fresh;
+    ASSERT_TRUE(fresh.Open(node));
+    EncodeReqVersion(fresh.ep.sbuf(0), kNativeProtoRdmaV2,
+                     WireOp::kExist, present, 0, 0, 0);
+    Status status = Status::kIOError;
+    uint64_t bytes = 0;
+    ASSERT_TRUE(fresh.Exchange(kReqPrefix, &status, &bytes));
+    EXPECT_EQ(status, Status::kOk);
+  }
+  std::cout << "FIFO_CLOSE_RECOVER mode=" << (use_uring ? "uring" : "sync")
+            << " depth=1 queued=1 old-QP-retired new-QP-responded" << '\n';
+}
+
+TEST(RdmaLoopback, RealFifoQueuedConnectionCloseSync) {
+  ExerciseQueuedReceiveConnectionClose(false);
+}
+TEST(RdmaLoopback, RealFifoQueuedConnectionCloseUring) {
+  ExerciseQueuedReceiveConnectionClose(true);
 }
 
 TEST(RdmaLoopback, DynamicPullPinSurvivesRemoveAndEvictionUntilRelease) {
