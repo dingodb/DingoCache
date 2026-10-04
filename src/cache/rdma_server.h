@@ -286,6 +286,8 @@ class RdmaServer {
   // Test barrier immediately before endpoint destruction; ranges must remain
   // owned while delayed inbound DMA can still reach the QP.
   std::function<void()> before_endpoint_teardown_for_test_;
+  // Test barrier after reply posting, before its SEND CQE is processed.
+  std::function<void()> after_reply_post_for_test_;
   std::atomic<uint64_t> uring_reads_{0}, uring_read_batches_{0},
       uring_read_batch_max_{0}, uring_completions_{0}, uring_inflight_{0},
       uring_inflight_max_{0}, uring_replies_posted_{0},
