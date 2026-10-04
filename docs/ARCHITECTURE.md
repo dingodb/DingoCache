@@ -367,8 +367,13 @@ requested resident bytes, avoiding a staging copy. Successful read accounting
 is committed at PullRelease; connection teardown first fences the endpoint,
 then aborts the pin without counting a successful read. The responder-WRITE
 path still sends arena bytes to advertised client targets and holds its source
-until the final status SEND completes. All replies retain their receive credit
-through that SEND fence so a fast next request cannot exhaust reply buffers.
+until the final status SEND completes. Reply buffers also remain owned until
+their SEND fence, but a consumed control/PUT receive is posted before its reply
+can reach the peer. If the next request arrives before a reply buffer is free,
+a FIFO retains its CQE and receive-buffer ownership (at most the negotiated
+depth, with no per-request allocation). Dispatch preserves receive order.
+Receive slots still used as outbound data sources retain their SEND fence.
+This avoids receiver-not-ready stalls without reusing an in-flight reply.
 With RAM tier off none of the arena path is wired.
 
 **Direct cold-read promotion**: on a whole-value io_uring miss, the server
