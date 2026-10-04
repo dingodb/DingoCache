@@ -973,7 +973,11 @@ void RdmaServer::Serve(int boot_fd) {
     ::close(boot_fd);
     return;
   }
-  auto post_request_recv = [&](size_t slot) { return ep.PostRecv(slot); };
+  auto post_request_recv = [&](size_t slot) {
+    if (!ep.PostRecv(slot)) return false;
+    if (after_request_rearm_for_test_) after_request_rearm_for_test_(slot);
+    return true;
+  };
 
   bool armed = true;
   for (size_t i = 0; i < K; ++i) armed = armed && post_request_recv(i);
@@ -1865,6 +1869,9 @@ void RdmaServer::Serve(int boot_fd) {
       pending_recv_head = (pending_recv_head + 1) % K;
       --pending_recv_count;
     }
+    if (after_cq_dispatch_for_test_)
+      after_cq_dispatch_for_test_(pending_recv_count, free_send.size(),
+                                  pending_recv_head);
     return true;
   };
   constexpr size_t kNoSlot = static_cast<size_t>(-1);
@@ -2212,6 +2219,8 @@ void RdmaServer::Serve(int boot_fd) {
         fail = true;
         break;
       }
+      if (g >= 0 && reorder_cq_for_test_)
+        reorder_cq_for_test_(wcs.data(), &g, K);
       if (g > 0) {
         ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
         progressed = true;
@@ -2269,8 +2278,11 @@ void RdmaServer::Serve(int boot_fd) {
       // after our ready-only PollComp drain, so never put an outstanding SEND
       // fence behind the multi-minute connection-idle wait. A bounded wait
       // blocks (no spin) and its timeout path performs a final CQ poll.
-      const int verbs_wait_ms = posted_sends != 0 ? 1 : idle_ms;
+      const int verbs_wait_ms =
+          posted_sends != 0 || reorder_cq_for_test_ ? 1 : idle_ms;
       g = ep.WaitComp(wcs.data(), static_cast<int>(K), verbs_wait_ms);
+      if (g >= 0 && reorder_cq_for_test_)
+        reorder_cq_for_test_(wcs.data(), &g, K);
       if (g == 0) {
         if (posted_sends != 0) continue;
         idle_reclaims_.fetch_add(1, std::memory_order_relaxed);
@@ -2347,12 +2359,17 @@ sync_serve_loop:;
     return true;
   };
   while (running_ && !fail) {
-    const int wait_ms = pending_recv_count != 0 ? 1 : idle_ms;
-    const int g = ep.WaitComp(wcs.data(), static_cast<int>(K), wait_ms);
+    const bool deferred_for_test =
+        reorder_cq_for_test_ && free_send.size() != K;
+    const int wait_ms =
+        pending_recv_count != 0 || deferred_for_test ? 1 : idle_ms;
+    int g = ep.WaitComp(wcs.data(), static_cast<int>(K), wait_ms);
+    if (g >= 0 && reorder_cq_for_test_)
+      reorder_cq_for_test_(wcs.data(), &g, K);
     if (g > 0)
       ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
     if (g == 0) {
-      if (pending_recv_count != 0) continue;
+      if (pending_recv_count != 0 || deferred_for_test) continue;
       idle_reclaims_.fetch_add(1, std::memory_order_relaxed);
       break;
     }
