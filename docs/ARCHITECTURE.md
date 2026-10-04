@@ -325,13 +325,16 @@ served straight from RAM over RDMA — no open, no pread, no disk. Enabled with
 `DFKV_RAM_TIER=1` (`DFKV_RAM_TIER_BYTES` sizes the arena; default off).
 
 **PUT policy and acknowledgement**: `writeback` (default) admits into a visible,
-flush-pinned RAM slot and, by default, returns `kOk` before the asynchronous disk
-flush completes. At the dirty-byte high watermark (80% by default), new PUTs
-wait for disk so acknowledged volatile data stays bounded. Set
-`DFKV_PUT_ACK_MODE=disk` for durable acknowledgement. `writearound` writes
-straight to disk and populates RAM on a later whole-value GET, so its result
-always reflects the disk write. Overlapping same-key write-back callers share
-the leader's resident value and flush result when waiting is required.
+flush-pinned RAM slot and normally returns `kOk` before asynchronous disk flush.
+At a positive dirty-byte watermark (80% by default), new keys are rejected
+before admission with `kCacheFull`; that rejection never becomes a direct-disk
+fallback. Zero watermark explicitly selects disk-ACK. Set
+`DFKV_PUT_ACK_MODE=disk` for durable acknowledgement of every admitted write.
+`writearound` writes straight to disk and populates RAM on a later whole-value
+GET. Existing RAM owners resolve first, including cancellation and duplicate
+completion. For a key without a RAM owner, the committed backing index is
+checked before a new RAM generation is admitted: a retained disk value wins,
+so an idempotent disk `kOk` cannot falsely certify different RAM bytes.
 
 **State machine = allocator pin refcount.** The slot lifecycle maps directly onto
 the allocator's pin count — this is why the allocator was built media-agnostic:
@@ -347,17 +350,20 @@ the allocator's pin count — this is why the allocator was built media-agnostic
   as durable; on success the same pin becomes the first transfer-pin.
 - **flush-pin** — taken on write-back admission, released when the flush reaches
   disk or is canceled.
-- **transfer-pin** — taken on `GetPrep`, released only after the completion that
-  fences the payload transfer (`IBV_WC_SEND`). REMOVE hides the entry
-  immediately but defers physical reuse until this final pin releases.
+- **transfer-pin** — taken on `GetPrep`; responder-WRITE replies release it at
+  their signaled SEND fence. Dynamic pull holds it through the peer READ and
+  revokes the exact READ MR before releasing the pin on PullRelease. REMOVE
+  hides an entry immediately but cannot reuse its pinned allocation.
 
-**RDMA zero-copy serve**: the arena is registered once on each selected device's
-shared PD; all endpoint QPs on that rail reuse the pool MR. On a v2 RAM hit the
-server RDMA-WRITEs arena bytes directly into the client's advertised targets,
-then sends the small status response. Its signaled SEND completion fences the
-preceding WRITEs and releases the transfer-pin. Connection teardown releases
-any outstanding pins, so a dead QP cannot leak an allocator pin. With RAM tier
-off none of this path is wired.
+**RDMA zero-copy serve**: the arena is registered on each selected device's
+shared PD. Dynamic pull lends an exact, revocable READ capability for the
+requested resident bytes, avoiding a staging copy. Successful read accounting
+is committed at PullRelease; connection teardown first fences the endpoint,
+then aborts the pin without counting a successful read. The responder-WRITE
+path still sends arena bytes to advertised client targets and holds its source
+until the final status SEND completes. All replies retain their receive credit
+through that SEND fence so a fast next request cannot exhaust reply buffers.
+With RAM tier off none of the arena path is wired.
 
 **Direct cold-read promotion**: on a whole-value io_uring miss, the server
 reserves the final arena slot before submitting disk I/O. O_DIRECT reads into
