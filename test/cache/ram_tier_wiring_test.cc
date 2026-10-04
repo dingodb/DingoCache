@@ -43,6 +43,9 @@ class KvNodeServerWiringTestPeer {
     options.large_reserve_bytes = 0;
     options.reclaim_interval_ms = 0;
     options.ack_high_watermark_pct = watermark_pct;
+    options.is_persisted = [&server](const BlockKey& key) {
+      return server.group_.IsCached(key);
+    };
     server.ram_ = std::make_unique<RamTier>(options, std::move(flush));
     server.ram_write_back_ = true;
     server.ram_ack_enabled_ = ram_ack;
@@ -116,6 +119,25 @@ struct FlushBarrier {
 struct OpenFlushOnExit {
   FlushBarrier& barrier;
   ~OpenFlushOnExit() { barrier.Open(); }
+};
+
+class BlockingBypassStore : public KVStore {
+ public:
+  BlockingBypassStore(const std::string& path, uint64_t capacity,
+                      FlushBarrier& barrier)
+      : KVStore(Options{path, capacity}), barrier_(barrier) {}
+  Status Cache(const BlockKey& key, const void* data, size_t len) override {
+    if (len > 64 * 1024) barrier_.Block();
+    return KVStore::Cache(key, data, len);
+  }
+  Status CacheDirect(const BlockKey& key, char* data, size_t len,
+                     size_t cap) override {
+    if (len > 64 * 1024) barrier_.Block();
+    return KVStore::CacheDirect(key, data, len, cap);
+  }
+
+ private:
+  FlushBarrier& barrier_;
 };
 
 // Extract a single-sample counter/gauge value from Prometheus text (line
@@ -279,6 +301,72 @@ TEST(RamTierWiring, PersistedValueSurvivesConflictingPutAfterRamEviction) {
   ::unsetenv("DFKV_PUT_ACK_MODE");
   ::unsetenv("DFKV_RAM_TIER_BYTES");
   ::unsetenv("DFKV_RAM_TIER");
+}
+
+TEST(RamTierWiring, CapacityBypassPreservesConcurrentDuplicateValue) {
+  for (bool direct : {false, true}) {
+    for (bool ram_ack : {false, true}) {
+      auto dir = fs::temp_directory_path() /
+          ("dfkv_ramwire_bypass_" + std::to_string(direct) +
+           "_" + std::to_string(ram_ack));
+      fs::remove_all(dir);
+      fs::create_directories(dir);
+      FlushBarrier disk, flush;
+      DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+      options.engine_factory = [&](const std::string& path, uint64_t capacity) {
+        return std::make_unique<BlockingBypassStore>(path, capacity, disk);
+      };
+      auto server = KvNodeServerWiringTestPeer::Create(std::move(options));
+      auto* node = server.get();
+      OpenFlushOnExit disk_cleanup{disk}, flush_cleanup{flush};
+      KvNodeServerWiringTestPeer::SetLimit(*server, 0);
+      KvNodeServerWiringTestPeer::SetRam(
+          *server,
+          [&, node](const BlockKey& key, char* data, size_t len, size_t) {
+            flush.Block();
+            return KvNodeServerWiringTestPeer::Persist(*node, key, data, len) ==
+                   Status::kOk;
+          }, ram_ack);
+      const BlockKey key{8101, 0};
+      std::string original(128 * 1024, 'a'), conflicting(4096, 'b');
+      auto put = [&](std::string& value) {
+        if (direct)
+          return server->CacheDirectForKey(
+              key, value.data(), value.size(), value.size());
+        std::string out;
+        return server->ProcessRequestForKey(
+            static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
+            value.data(), value.size(), &out);
+      };
+      Status first_status = Status::kInvalid, second_status = Status::kInvalid;
+      std::thread first([&] { first_status = put(original); });
+      const bool disk_entered = disk.AwaitEntry();
+      EXPECT_TRUE(disk_entered);
+      std::thread second([&] { second_status = put(conflicting); });
+      // Before the fix, the conflicting value is admitted while the oversized
+      // owner is in disk I/O. Hold that flush until the owner commits first.
+      // Correct serialization cannot enter this flush before disk is opened.
+      flush.AwaitEntry();
+      disk.Open();
+      first.join();
+      flush.Open();
+      second.join();
+      EXPECT_EQ(first_status, Status::kOk);
+      EXPECT_EQ(second_status, Status::kOk);
+      ASSERT_TRUE(KvNodeServerWiringTestPeer::Drain(*server));
+      std::string persisted, visible;
+      ASSERT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, key, &persisted),
+                Status::kOk);
+      ASSERT_EQ(server->ProcessRequestForKey(
+                    static_cast<uint8_t>(WireOp::kRange), key, 0, 0,
+                    nullptr, 0, &visible), Status::kOk);
+      EXPECT_EQ(persisted, original);
+      EXPECT_EQ(visible, persisted) << "direct=" << direct
+                                    << " ram_ack=" << ram_ack;
+      server.reset();
+      fs::remove_all(dir);
+    }
+  }
 }
 
 TEST(RamTierWiring, DisabledByDefaultNoRamMetrics) {

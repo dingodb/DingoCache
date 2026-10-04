@@ -131,6 +131,12 @@ void KvNodeServer::EndPut() {
     put_inflight_.fetch_sub(1, std::memory_order_relaxed);
 }
 
+std::unique_lock<std::mutex> KvNodeServer::LockPutKey(const BlockKey& key) {
+  if (!ram_write_back_ || !ram_) return {};
+  const uint64_t stripe = key.digest_hi ^ key.digest_lo ^ key.tenant_hash;
+  return std::unique_lock<std::mutex>(put_key_mu_[stripe % kPutKeyStripes]);
+}
+
 void KvNodeServer::InitRamTier() {
   // Off by default. DFKV_RAM_TIER in {1,on,true,yes} enables the RAM hot tier;
   // DFKV_RAM_TIER_BYTES sizes the pre-registered arena (default 16 GiB).
@@ -815,6 +821,7 @@ Status KvNodeServer::ProcessRequestForKey(
       }
       bool samp = lat_sampler_.ShouldSample();
       double t0 = samp ? NowSec() : 0.0;
+      auto key_lock = LockPutKey(key);
       // RAM-ACK publishes a flush-pinned copy. A reached positive watermark
       // rejects new keys before admission; only a capacity bypass may take
       // the normal disk path, never a terminal watermark rejection.
@@ -1053,6 +1060,7 @@ Status KvNodeServer::CacheDirectForKey(const BlockKey& key, char* data,
   if (!TryBeginPut()) return Status::kCacheFull;
   bool samp = lat_sampler_.ShouldSample();
   double t0 = samp ? NowSec() : 0.0;
+  auto key_lock = LockPutKey(key);
   // PUT write-around: write directly to disk, skip the synchronous 1 MiB
   // arena memcpy. The arena is filled lazily by read-promotion on GET miss
   // (RangeDirectForKey), so hot keys still get zero-copy RDMA GET from the
