@@ -492,6 +492,8 @@ RamTier::Admission RamTier::Admit(
       if (out_completion) *out_completion = writing->second;
       return Admission::kDuplicate;
     }
+    if (opt_.is_persisted && opt_.is_persisted(key))
+      return Admission::kPersisted;
     if (client_ack && opt_.ack_high_watermark_pct != 0) {
       const uint64_t high =
           opt_.bytes * std::min<uint32_t>(opt_.ack_high_watermark_pct, 100) / 100;
@@ -635,13 +637,15 @@ RamTier::Admission RamTier::Admit(
 bool RamTier::Put(const BlockKey& key, const void* data, size_t len) {
   std::shared_ptr<PutCompletion> completion;
   const Admission admission = Admit(key, data, len, false, &completion);
-  return admission == Admission::kAccepted || admission == Admission::kDuplicate;
+  return admission == Admission::kAccepted || admission == Admission::kDuplicate ||
+         admission == Admission::kPersisted;
 }
 
 RamTier::PutResult RamTier::PutCommitted(
     const BlockKey& key, const void* data, size_t len) {
   std::shared_ptr<PutCompletion> completion;
   const Admission admission = Admit(key, data, len, false, &completion);
+  if (admission == Admission::kPersisted) return {Status::kOk};
   if (admission == Admission::kBypass)
     return {Status::kCacheFull, PutDisposition::kBypass};
   if (admission == Admission::kRejected) return {Status::kIOError};
@@ -795,6 +799,7 @@ RamTier::PutResult RamTier::PutWriteBack(
   std::shared_ptr<PutCompletion> completion;
   const Admission admission =
       Admit(key, data, len, !synchronous, &completion);
+  if (admission == Admission::kPersisted) return {Status::kOk};
   if (admission == Admission::kBypass)
     return {Status::kCacheFull, PutDisposition::kBypass};
   if (admission == Admission::kBackpressure)

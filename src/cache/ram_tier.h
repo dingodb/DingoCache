@@ -92,6 +92,10 @@ class RamTier {
     // admission once reached. Existing owners still resolve normally.
     // 0 explicitly selects synchronous disk-ACK, not perpetual rejection.
     uint32_t ack_high_watermark_pct = 80;
+    // Optional backing-index check for a key without a RAM owner. Invoked
+    // under its RAM shard lock; must be metadata-only and must not reenter RAM.
+    // An existing disk value is authoritative after RAM eviction.
+    std::function<bool(const BlockKey&)> is_persisted;
   };
 
   // Persists a resident value to disk. `data` is 4 KiB aligned and `cap` is
@@ -169,8 +173,8 @@ class RamTier {
   bool healthy() const { return healthy_.load(std::memory_order_acquire); }
 
   // Asynchronous admission used by standalone tier tests. true means the key
-  // was admitted or joined an existing PUT; it does NOT claim durability.
-  // Duplicates keep the first payload, even if their bytes or lengths differ.
+  // was admitted, joined an existing PUT, or already exists in the backing
+  // store. Admitted duplicates keep the first payload, including its size.
   bool Put(const BlockKey& key, const void* data, size_t len);
 
   // Only kBypass permits the caller to persist its own payload directly.
@@ -340,7 +344,9 @@ class RamTier {
   void ReleaseBudget(uint64_t bytes);
   void ReleaseLargeBudget(uint64_t bytes);
   void EraseEvictedLocked(Shard& s, const std::vector<BlockKey>& keys);
-  enum class Admission { kAccepted, kDuplicate, kBypass, kRejected, kBackpressure };
+  enum class Admission {
+    kAccepted, kDuplicate, kPersisted, kBypass, kRejected, kBackpressure
+  };
   Admission Admit(const BlockKey& key, const void* data, size_t len,
                   bool client_ack,
                   std::shared_ptr<PutCompletion>* completion);
