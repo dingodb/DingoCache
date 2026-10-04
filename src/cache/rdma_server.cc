@@ -1841,8 +1841,8 @@ void RdmaServer::Serve(int boot_fd) {
   // reply is sent, but the reply buffer remains owned until the SEND CQE.
   // If the next request arrives first, retain its CQE and receive-buffer
   // ownership in a depth-bounded FIFO rather than failing or forcing RNR.
-  std::vector<ibv_wc> wcs(K);
-  std::vector<ibv_wc> pending_recv(K);
+  std::vector<ibv_wc> wcs(2 * K);
+  ibv_wc* const pending_recv = wcs.data() + K;
   size_t pending_recv_head = 0;
   size_t pending_recv_count = 0;
   auto dispatch_completions = [&](const ibv_wc* batch, int count,

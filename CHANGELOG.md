@@ -2,9 +2,11 @@
 
 ## Unreleased
 
-- Return receive credits only after the corresponding reply SEND completion.
-  This prevents fast peers from exhausting reply buffers at depth one in both
-  synchronous and io_uring server loops, without adding retries or timeouts.
+- Keep reply buffers behind their SEND fence while queueing early incoming
+  requests in a depth-bounded FIFO. Control/PUT receives are ready before the
+  reply is posted; receive-backed data sources retain their existing fence.
+  This avoids both depth-one reply-buffer races and receiver-not-ready stalls
+  in synchronous and io_uring loops, without timeout or retry changes.
 - Reuse RDMA capability observations only within a known peer publication;
   invalidate them on endpoint failure, forced recovery and topology changes.
   Anonymous/static peers retain fresh-QP negotiation.
