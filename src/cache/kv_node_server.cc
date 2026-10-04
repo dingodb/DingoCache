@@ -200,6 +200,9 @@ void KvNodeServer::InitRamTier() {
   ram_flush_disks_.reserve(group_.DiskCount());
   for (size_t i = 0; i < group_.DiskCount(); ++i)
     ram_flush_disks_.push_back(std::make_unique<RamFlushDiskMetrics>());
+  o.is_persisted = [this](const BlockKey& key) {
+    return group_.IsCached(key);
+  };
   auto tier = std::make_unique<RamTier>(
       o, [this](const BlockKey& k, char* d, size_t l, size_t cap) {
         return group_.CacheDirect(k, d, l, cap) == Status::kOk;
