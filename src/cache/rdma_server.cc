@@ -548,6 +548,59 @@ bool RdmaServer::UseUringPath() const {
 #endif
 }
 
+rdma::RecvSegmentPool::Lease RdmaServer::AllocateReceiveWithPressure(
+    size_t bytes, int rail, int numa_node, uint64_t wait_us) {
+  auto lease = recv_segments_.Allocate(
+      bytes, rdma::kV2DataOffset, rail, numa_node);
+  if (lease || wait_us == 0) return lease;
+
+  // The hard budget is full. An idle QP can be reclaimed immediately, even
+  // if its last successful CQE was recent; active requests, queued disk reads
+  // and outstanding one-sided READ grants are excluded by reclaimable.
+  const uint64_t started = SteadyUs();
+  for (int round = 0; round < 32 && !lease; ++round) {
+    if (SteadyUs() - started >= wait_us) break;
+    {
+      std::lock_guard<std::mutex> lock(conn_mu_);
+      rdma::RcEndpoint* oldest = nullptr;
+      rdma::RcEndpoint* sufficient = nullptr;
+      uint64_t oldest_active = std::numeric_limits<uint64_t>::max();
+      uint64_t sufficient_active = oldest_active;
+      const uint64_t now = SteadyUs();
+      for (const auto& [ep, live] : live_eps_) {
+        if (!live.reclaimable->load(std::memory_order_acquire)) continue;
+        const uint64_t active =
+            ep->last_active_us_.load(std::memory_order_relaxed);
+        // A newly inserted endpoint has not stamped its activity yet.
+        if (active == 0 || active > now) continue;
+        if (active < oldest_active) {
+          oldest = ep;
+          oldest_active = active;
+        }
+        if (live.recv_lease_bytes >= bytes && active < sufficient_active) {
+          sufficient = ep;
+          sufficient_active = active;
+        }
+      }
+      rdma::RcEndpoint* victim = sufficient ? sufficient : oldest;
+      if (!victim) break;  // all remaining leases have active owners
+      live_eps_.erase(victim);  // claim before Wake so concurrent scans skip it
+      // The Serve thread must erase under conn_mu_ before destroying its QP.
+      victim->Wake();
+    }
+    segment_evictions_.fetch_add(1, std::memory_order_relaxed);
+    // The victim's QP destruction must fence inbound DMA before its lease is
+    // released. Give it bounded time to unwind, then try another idle QP.
+    for (int i = 0; i < 100 && !lease; ++i) {
+      if (SteadyUs() - started >= wait_us) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      lease = recv_segments_.Allocate(
+          bytes, rdma::kV2DataOffset, rail, numa_node);
+    }
+  }
+  return lease;
+}
+
 void RdmaServer::Serve(int boot_fd) {
   // Bootstrap: client first names the device it wants us to use (same rail for
   // multi-rail); fall back to our configured default if it sends an empty name.
@@ -659,67 +712,25 @@ void RdmaServer::Serve(int boot_fd) {
     ::close(boot_fd);
     return;
   }
-  rdma::RecvSegmentPool::Lease recv_lease = recv_segments_.Allocate(
-      K * slot_size, rdma::kV2DataOffset, static_cast<int>(rail_index),
-      rail_numa);
+  // Five seconds is below the published v2.28 client's 10-second bootstrap
+  // socket I/O timeout; never wait indefinitely for a dead peer to retire.
+  rdma::RecvSegmentPool::Lease recv_lease = AllocateReceiveWithPressure(
+      K * slot_size, static_cast<int>(rail_index), rail_numa, 5000000);
   if (!recv_lease) {
-    // Segment exhausted: evict the stalest quiescent connection(s) to make
-    // room before refusing. Age alone is insufficient: a disk read or a
-    // client-side one-sided READ can remain in flight without a server CQE.
-    const uint64_t now = SteadyUs();
-    constexpr uint64_t kEvictIdleMinUs = 2000000;
-    const uint64_t evict_started = SteadyUs();
-    for (int round = 0; round < 32 && !recv_lease; ++round) {
-      if (SteadyUs() - evict_started > 5000000) break;  // bound: <= 5 s total
-      {
-        std::lock_guard<std::mutex> lk(conn_mu_);
-        rdma::RcEndpoint* victim = nullptr;
-        uint64_t victim_active = std::numeric_limits<uint64_t>::max();
-        for (const auto& [ep, reclaimable] : live_eps_) {
-          if (!reclaimable->load(std::memory_order_acquire)) continue;
-          const uint64_t a =
-              ep->last_active_us_.load(std::memory_order_relaxed);
-          // a == 0: endpoint inserted but Serve has not stamped it yet.
-          if (a != 0 && a <= now && now - a >= kEvictIdleMinUs &&
-              a < victim_active) {
-            victim = ep;
-            victim_active = a;
-          }
-        }
-        if (!victim) break;  // every connection is recently active; refuse
-        live_eps_.erase(victim);  // claim it: no other evictor can pick it.
-        // Wake under conn_mu_: a Serve thread taking the erase exit (2235/
-        // 2304) must hold conn_mu_ before destroying its stack endpoint, so
-        // an idle waiter cannot retire and free it between unlock and Wake.
-        victim->Wake();  // Serve exits; its Lease destructor returns the range
-      }
-      segment_evictions_.fetch_add(1, std::memory_order_relaxed);
-      // Poll for the freed range (bounded). The victim's Serve thread tears
-      // down its endpoint and releases the lease asynchronously.
-      for (int i = 0; i < 100 && !recv_lease; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        recv_lease = recv_segments_.Allocate(
-            K * slot_size, rdma::kV2DataOffset,
-            static_cast<int>(rail_index), rail_numa);
-      }
-    }
-    if (!recv_lease) {
-      const auto stats = recv_segments_.stats();
-      DFKV_LOG_ERROR(
-          "rdma v2: receive pool exhausted; refusing connection (need=" +
-          std::to_string(K * slot_size) +
-          " free=" + std::to_string(stats.free_bytes) +
-          " committed=" + std::to_string(stats.committed_bytes) +
-          " max=" + std::to_string(stats.max_bytes) + ")");
-      ::close(boot_fd);
-      return;
-    }
+    const auto stats = recv_segments_.stats();
+    DFKV_LOG_ERROR(
+        "rdma v2: receive pool exhausted; refusing connection (need=" +
+        std::to_string(K * slot_size) +
+        " free=" + std::to_string(stats.free_bytes) +
+        " committed=" + std::to_string(stats.committed_bytes) +
+        " max=" + std::to_string(stats.max_bytes) + ")");
+    ::close(boot_fd);
+    return;
   }
   rdma::RecvSegmentPool::Lease pull_lease;
   if (pull_read_requested && !dynamic_pull_requested) {
-    pull_lease = recv_segments_.Allocate(
-        K * slot_size, rdma::kV2DataOffset,
-        static_cast<int>(rail_index), rail_numa);
+    pull_lease = AllocateReceiveWithPressure(
+        K * slot_size, static_cast<int>(rail_index), rail_numa, 5000000);
     if (!pull_lease) {
       const auto stats = recv_segments_.stats();
       DFKV_LOG_ERROR(
@@ -1042,9 +1053,10 @@ void RdmaServer::Serve(int boot_fd) {
   }
   v2_conns_.fetch_add(1, std::memory_order_relaxed);
 
-  // The pressure reclaimer must not classify a QP by its last CQE alone:
-  // request handling and one-sided client READs may outlive that CQE.
-  std::atomic<bool> reclaimable{true};
+  // Fresh QPs have advertised readiness but may already have a first request
+  // in transit. Reclaim only after at least one completed request/reply fence
+  // has established a genuine quiescent point.
+  std::atomic<bool> reclaimable{false};
   // Register this endpoint so Stop() can Wake() us out of WaitComp and join. The
   // running_ check under conn_mu_ closes the race with a concurrent Stop(): either
   // Stop sees us in live_eps_ (and wakes us) or we see running_==false here.
@@ -1054,7 +1066,7 @@ void RdmaServer::Serve(int boot_fd) {
       retire_writer();
       return;
     }
-    live_eps_.emplace(&ep, &reclaimable);
+    live_eps_.emplace(&ep, LiveEndpoint{&reclaimable, recv_lease.size()});
   }
   ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
 
@@ -1474,9 +1486,12 @@ void RdmaServer::Serve(int boot_fd) {
         // logical capacity remains the request length, not connection class.
         target_capacity = rdma::V2SlotSize(fields.length);
         if (target_capacity == 0) return invalid_reply();
-        state.lease = recv_segments_.Allocate(
-            target_capacity, rdma::kV2DataOffset,
-            static_cast<int>(rail_index), rail_numa);
+        // With the pool full of quiescent QPs, reclaim before reporting
+        // genuine backpressure. Keep this below the client's operation
+        // deadline; a stalled active grant must still fail as kCacheFull.
+        state.lease = AllocateReceiveWithPressure(
+            target_capacity, static_cast<int>(rail_index), rail_numa,
+            1000000);
         if (!state.lease) {
           encode_status(Status::kCacheFull, 0);
           reply->first_len = response_prefix;
@@ -1551,9 +1566,8 @@ void RdmaServer::Serve(int boot_fd) {
       const size_t region = rdma::V2SlotSize(want);
       if (region == 0) return false;
       LeasePutState& state = lease_put[slot];
-      state.lease = recv_segments_.Allocate(
-          region, rdma::kV2DataOffset, static_cast<int>(rail_index),
-          rail_numa);
+      state.lease = AllocateReceiveWithPressure(
+          region, static_cast<int>(rail_index), rail_numa, 1000000);
       if (!state.lease) {
         lease_put_busy_rejects_.fetch_add(1, std::memory_order_relaxed);
         encode_status(Status::kCacheFull, 0);

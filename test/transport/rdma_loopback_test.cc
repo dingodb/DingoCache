@@ -110,6 +110,21 @@ class RdmaServerTestPeer {
       RdmaServer& server, std::function<void(size_t)> hook) {
     server.after_request_rearm_for_test_ = std::move(hook);
   }
+  static size_t RefreshQuiescentActivity(RdmaServer& server) {
+    // Deterministically place actual, completed QPs inside the old two-second
+    // grace period without changing any CQE or connection's busy state.
+    const uint64_t now = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    std::lock_guard<std::mutex> lock(server.conn_mu_);
+    size_t count = 0;
+    for (const auto& [ep, live] : server.live_eps_) {
+      if (!live.reclaimable->load(std::memory_order_acquire)) continue;
+      ep->last_active_us_.store(now, std::memory_order_relaxed);
+      ++count;
+    }
+    return count;
+  }
 #ifdef DFKV_WITH_URING
   static void SetUringBackendFactory(
       RdmaServer* server,
@@ -2170,6 +2185,15 @@ struct PinnedPullPeer {
   }
 };
 
+bool PinnedExists(PinnedPullPeer& peer, const BlockKey& key) {
+  EncodeReqVersion(peer.ep.sbuf(0), kNativeProtoRdmaV2,
+                   WireOp::kExist, key, 0, 0, 0);
+  Status status = Status::kIOError;
+  uint64_t bytes = 0;
+  return peer.Exchange(kReqPrefix, &status, &bytes) &&
+         status == Status::kOk;
+}
+
 // Pool pressure may reclaim *idle* QPs, but a client may hold a one-sided READ
 // grant long after the server's reply SEND CQE. CQ age alone would revoke that
 // in-flight data source. Exercise real short-lived QPs and the hard receive
@@ -2247,13 +2271,22 @@ void ExercisePressurePreservesInFlightPull(bool use_uring) {
     {
       PinnedPullPeer recent;
       ASSERT_TRUE(recent.Open(node));
+      ASSERT_TRUE(PinnedExists(recent, key));
+      size_t quiescent = 0;
+      for (int i = 0; i < 1000 && quiescent == 0; ++i) {
+        quiescent = RdmaServerTestPeer::RefreshQuiescentActivity(*node.rsrv);
+        if (quiescent == 0)
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      ASSERT_EQ(quiescent, 1u) << "the held READ grant is not reclaimable";
       PinnedPullPeer excess;
-      EXPECT_FALSE(excess.Open(node))
-          << "a full hard budget must refuse rather than abort an in-flight read";
-      EXPECT_GT(CounterVal(node.rsrv->MetricsText(),
-                           "dfkv_rdma_recv_segment_allocation_failures_total"), 0);
-      EXPECT_EQ(CounterVal(node.rsrv->MetricsText(),
-                           "dfkv_rdma_segment_evictions_total"), 0);
+      ASSERT_TRUE(excess.Open(node))
+          << "recycle the idle QP without revoking the held READ grant";
+      const std::string metrics = node.rsrv->MetricsText();
+      EXPECT_GT(CounterVal(
+                    metrics, "dfkv_rdma_recv_segment_allocation_failures_total"),
+                0);
+      EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_segment_evictions_total"), 1);
     }
     {
       std::lock_guard<std::mutex> lock(mu);
@@ -2287,6 +2320,217 @@ TEST(RdmaLoopback, PressurePreservesInFlightPullSync) {
 
 TEST(RdmaLoopback, PressurePreservesInFlightPullUring) {
   ExercisePressurePreservesInFlightPull(true);
+}
+
+void ExercisePressureRecyclesRecentIdle(bool use_uring) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+#ifndef DFKV_WITH_URING
+  if (use_uring) GTEST_SKIP() << "io_uring not compiled";
+#endif
+  ScopedEnv uring("DFKV_SERVER_URING", use_uring ? "1" : "0");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "1");
+  ScopedEnv idle("DFKV_RDMA_IDLE_MS", "5000");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const std::string budget = std::to_string(2 * rdma::V2SlotSize(kMaxMsg));
+  ScopedEnv segment("DFKV_RDMA_RECV_SEGMENT_SIZE", budget.c_str());
+  RdmaNode node(use_uring ? "recent-idle-uring" : "recent-idle-sync",
+                kMaxMsg, false, use_uring);
+  const BlockKey key{90179, 1};
+  std::string ignored;
+  ASSERT_EQ(node.srv->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
+                "persist", 7, &ignored), Status::kOk);
+  {
+    PinnedPullPeer first, second;
+    ASSERT_TRUE(first.Open(node));
+    ASSERT_TRUE(second.Open(node));
+    ASSERT_TRUE(PinnedExists(first, key));
+    ASSERT_TRUE(PinnedExists(second, key));
+    size_t quiescent = 0;
+    const auto ready_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    do {
+      quiescent = RdmaServerTestPeer::RefreshQuiescentActivity(*node.rsrv);
+      if (quiescent == 2) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < ready_deadline);
+    ASSERT_EQ(quiescent, 2u);
+    if (use_uring && CounterVal(node.rsrv->MetricsText(),
+                                "dfkv_uring_init_fallbacks_total") != 0)
+      GTEST_SKIP() << "io_uring unavailable at runtime";
+    PinnedPullPeer admitted;
+    ASSERT_TRUE(admitted.Open(node))
+        << "pressure must reclaim a quiescent QP without waiting two seconds";
+    EXPECT_TRUE(exists(admitted));
+    const std::string metrics = node.rsrv->MetricsText();
+    EXPECT_GE(CounterVal(metrics, "dfkv_rdma_segment_evictions_total"), 1);
+    EXPECT_GT(CounterVal(
+                  metrics, "dfkv_rdma_recv_segment_allocation_failures_total"),
+              0);
+    EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
+  }
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  long used = -1;
+  while (std::chrono::steady_clock::now() < deadline) {
+    used = CounterVal(node.rsrv->MetricsText(),
+                      "dfkv_rdma_recv_segment_used_bytes");
+    if (node.rsrv->ActiveConns() == 0 && used == 0) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_EQ(node.rsrv->ActiveConns(), 0u);
+  EXPECT_EQ(used, 0);
+}
+
+TEST(RdmaLoopback, PressureRecyclesRecentIdleSync) {
+  ExercisePressureRecyclesRecentIdle(false);
+}
+
+TEST(RdmaLoopback, PressureRecyclesRecentIdleUring) {
+  ExercisePressureRecyclesRecentIdle(true);
+}
+
+void ExercisePullStagingReclaimsIdleQp(bool use_uring) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+#ifndef DFKV_WITH_URING
+  if (use_uring) GTEST_SKIP() << "io_uring not compiled";
+#endif
+  ScopedEnv uring("DFKV_SERVER_URING", use_uring ? "1" : "0");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "1");
+  ScopedEnv idle("DFKV_RDMA_IDLE_MS", "5000");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const std::string budget = std::to_string(2 * rdma::V2SlotSize(kMaxMsg));
+  ScopedEnv segment("DFKV_RDMA_RECV_SEGMENT_SIZE", budget.c_str());
+  RdmaNode node(use_uring ? "pull-pressure-uring" : "pull-pressure-sync",
+                kMaxMsg, false, use_uring);
+  const BlockKey key{90180, 1};
+  const std::string value(4096, 'v');
+  std::string ignored;
+  ASSERT_EQ(node.srv->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
+                value.data(), value.size(), &ignored), Status::kOk);
+  {
+    PinnedPullPeer reader, idle_peer;
+    ASSERT_TRUE(reader.Open(node));
+    ASSERT_TRUE(idle_peer.Open(node));
+    ASSERT_TRUE(PinnedExists(idle_peer, key));
+    size_t quiescent = 0;
+    const auto ready_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    do {
+      quiescent = RdmaServerTestPeer::RefreshQuiescentActivity(*node.rsrv);
+      if (quiescent == 2) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < ready_deadline);
+    ASSERT_EQ(quiescent, 2u);
+    if (use_uring && CounterVal(node.rsrv->MetricsText(),
+                                "dfkv_uring_init_fallbacks_total") != 0)
+      GTEST_SKIP() << "io_uring unavailable at runtime";
+    rdma::DynamicPullReady ready;
+    ASSERT_TRUE(reader.Prepare(key, 0, value.size(), &ready))
+        << "GET staging should reclaim an idle QP before returning kCacheFull";
+    std::string bytes;
+    ASSERT_TRUE(reader.Read(ready, &bytes));
+    EXPECT_EQ(bytes, value);
+    ASSERT_TRUE(reader.Release(key, ready));
+    const std::string metrics = node.rsrv->MetricsText();
+    EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_segment_evictions_total"), 1);
+    EXPECT_GT(CounterVal(
+                  metrics, "dfkv_rdma_recv_segment_allocation_failures_total"),
+              0);
+    EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
+  }
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  long used = -1;
+  while (std::chrono::steady_clock::now() < deadline) {
+    used = CounterVal(node.rsrv->MetricsText(),
+                      "dfkv_rdma_recv_segment_used_bytes");
+    if (node.rsrv->ActiveConns() == 0 && used == 0) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_EQ(node.rsrv->ActiveConns(), 0u);
+  EXPECT_EQ(used, 0);
+}
+
+TEST(RdmaLoopback, PullStagingReclaimsIdleQpSync) {
+  ExercisePullStagingReclaimsIdleQp(false);
+}
+
+TEST(RdmaLoopback, PullStagingReclaimsIdleQpUring) {
+  ExercisePullStagingReclaimsIdleQp(true);
+}
+
+void ExercisePressureRefusesOnlyBusyQps(bool use_uring) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+#ifndef DFKV_WITH_URING
+  if (use_uring) GTEST_SKIP() << "io_uring not compiled";
+#endif
+  ScopedEnv uring("DFKV_SERVER_URING", use_uring ? "1" : "0");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "1");
+  ScopedEnv idle("DFKV_RDMA_IDLE_MS", "5000");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const std::string value(4096, 'z');
+  const std::string budget = std::to_string(
+      2 * (rdma::V2SlotSize(kMaxMsg) + rdma::V2SlotSize(value.size())));
+  ScopedEnv segment("DFKV_RDMA_RECV_SEGMENT_SIZE", budget.c_str());
+  RdmaNode node(use_uring ? "busy-only-uring" : "busy-only-sync",
+                kMaxMsg, false, use_uring);
+  const BlockKey key{90181, 1};
+  std::string ignored;
+  ASSERT_EQ(node.srv->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
+                value.data(), value.size(), &ignored), Status::kOk);
+  {
+    PinnedPullPeer first, second;
+    ASSERT_TRUE(first.Open(node));
+    ASSERT_TRUE(second.Open(node));
+    rdma::DynamicPullReady first_ready, second_ready;
+    ASSERT_TRUE(first.Prepare(key, 0, value.size(), &first_ready));
+    ASSERT_TRUE(second.Prepare(key, 0, value.size(), &second_ready));
+    if (use_uring && CounterVal(node.rsrv->MetricsText(),
+                                "dfkv_uring_init_fallbacks_total") != 0) {
+      first.Release(key, first_ready);
+      second.Release(key, second_ready);
+      GTEST_SKIP() << "io_uring unavailable at runtime";
+    }
+    PinnedPullPeer excess;
+    EXPECT_FALSE(excess.Open(node))
+        << "no quiescent owner: do not reclaim either live READ grant";
+    const std::string metrics = node.rsrv->MetricsText();
+    EXPECT_GT(CounterVal(
+                  metrics, "dfkv_rdma_recv_segment_allocation_failures_total"),
+              0);
+    EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_segment_evictions_total"), 0);
+    for (auto& [peer, ready] :
+         {std::pair<PinnedPullPeer*, rdma::DynamicPullReady*>{&first, &first_ready},
+          {&second, &second_ready}}) {
+      std::string bytes;
+      ASSERT_TRUE(peer->Read(*ready, &bytes));
+      EXPECT_EQ(bytes, value);
+      ASSERT_TRUE(peer->Release(key, *ready));
+    }
+    EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
+  }
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  long used = -1;
+  while (std::chrono::steady_clock::now() < deadline) {
+    used = CounterVal(node.rsrv->MetricsText(),
+                      "dfkv_rdma_recv_segment_used_bytes");
+    if (node.rsrv->ActiveConns() == 0 && used == 0) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_EQ(node.rsrv->ActiveConns(), 0u);
+  EXPECT_EQ(used, 0);
+}
+
+TEST(RdmaLoopback, PressureRefusesOnlyBusyQpsSync) {
+  ExercisePressureRefusesOnlyBusyQps(false);
+}
+
+TEST(RdmaLoopback, PressureRefusesOnlyBusyQpsUring) {
+  ExercisePressureRefusesOnlyBusyQps(true);
 }
 
 static void ExerciseControlReceiveBeforeSendFence(bool use_uring) {
@@ -4758,14 +5002,22 @@ TEST(RdmaLoopback, PressurePreservesSubmittedUringRead) {
     {
       PinnedPullPeer recent;
       ASSERT_TRUE(recent.Open(node));
+      ASSERT_TRUE(PinnedExists(recent, key));
+      size_t quiescent = 0;
+      for (int i = 0; i < 1000 && quiescent == 0; ++i) {
+        quiescent = RdmaServerTestPeer::RefreshQuiescentActivity(*node.rsrv);
+        if (quiescent == 0)
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      ASSERT_EQ(quiescent, 1u) << "the queued disk GET is not reclaimable";
       PinnedPullPeer excess;
-      EXPECT_FALSE(excess.Open(node))
-          << "queued disk data must not be revoked to admit a third QP";
+      ASSERT_TRUE(excess.Open(node))
+          << "recycle the idle QP without aborting a queued disk GET";
       const std::string metrics = node.rsrv->MetricsText();
       EXPECT_GT(CounterVal(
                     metrics, "dfkv_rdma_recv_segment_allocation_failures_total"),
                 0);
-      EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_segment_evictions_total"), 0);
+      EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_segment_evictions_total"), 1);
       EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
     }
     ASSERT_TRUE(backend->CompleteRead(completion.token));

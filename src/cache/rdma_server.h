@@ -174,6 +174,8 @@ class RdmaServer {
   void AcceptLoop();
   void Serve(int boot_fd);
   void ReapDoneLocked();  // join+erase finished Serve threads; conn_mu_ held
+  rdma::RecvSegmentPool::Lease AllocateReceiveWithPressure(
+      size_t bytes, int rail, int numa_node, uint64_t wait_us);
 
   // A live connection: its Serve thread plus a flag the thread sets (last thing
   // it does) so AcceptLoop can tell it has finished and join it without blocking.
@@ -229,9 +231,14 @@ class RdmaServer {
   std::mutex conn_mu_;
   std::vector<Conn> conns_;
   // The Serve thread owns the pointed-to flag until it erases its endpoint
-  // under conn_mu_. A pressure reclaim may wake only a quiescent QP; elapsed
-  // time since a CQE alone cannot distinguish idle from in-flight disk/READ.
-  std::unordered_map<rdma::RcEndpoint*, std::atomic<bool>*> live_eps_;
+  // under conn_mu_. Pressure reclaim considers only quiescent QPs, preferring
+  // leases large enough to satisfy the incoming connection. CQ age alone
+  // cannot distinguish idle from an in-flight disk/READ operation.
+  struct LiveEndpoint {
+    std::atomic<bool>* reclaimable;
+    size_t recv_lease_bytes;
+  };
+  std::unordered_map<rdma::RcEndpoint*, LiveEndpoint> live_eps_;
   std::mutex writer_mu_;
   std::unordered_map<uint64_t, std::shared_ptr<WriterState>> writers_;
   // Receive memory is committed in fixed-size chunks on demand. Connections
