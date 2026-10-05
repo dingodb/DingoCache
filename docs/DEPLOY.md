@@ -375,6 +375,14 @@ journalctl -u dfkv -n 10 --no-pager
 > 在飞 PUT/GET 租约也计入 `DFKV_RDMA_RECV_SEGMENT_SIZE` hard budget。
 > 上线同时观察 committed/used/真实 RSS 与动态租约归还；不能把操作结束后的
 > used_bytes 当作整个运行过程的峰值或 pinned memory。
+> 仅当初始 chunk 容得下最大合法暂存对象，且 hard budget 除初始
+> chunk 外还能为**每条已配置 rail** 保留至少一个连接 chunk、
+> 另有一个暂存余量时，才将初始 chunk 专供动态 GET / leased PUT。
+> 连接驻留 lease 不占据它，预留量**已包含在** hard budget 内；
+> chunk 小于最大对象、总预算小或多 rail 几何不足时保持共享模式。
+> `dfkv_rdma_recv_segment_free_bytes` 含暂存专用空闲，不能拿它判断新连接
+> 能否准入；另看 `connection_free_bytes`、连续空闲范围和 staging
+> reserve 空闲。预算全部由活动连接/暂存占用时仍会如实拒绝，不绕过上限。
 
 ### 3a. 每节点 tenant quota
 
@@ -471,14 +479,14 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 
 | env | 默认 | 说明 |
 |---|---|---|
-| `DFKV_RDMA_RECV_SEGMENT_SIZE` | `128 GiB` | server receive-pool hard budget；不再启动期全量分配 |
-| `DFKV_RDMA_RECV_CHUNK_BYTES` | `256 MiB` | server 启动与增量提交粒度 |
+| `DFKV_RDMA_RECV_SEGMENT_SIZE` | `128 GiB` | server receive-pool hard budget（含单 chunk staging reserve）；不再启动期全量分配 |
+| `DFKV_RDMA_RECV_CHUNK_BYTES` | `256 MiB` | server 启动与增量提交粒度；有足够 QP 余量时首 chunk 专供操作级暂存 |
 | `DFKV_RDMA_RECV_CHUNK_IDLE_MS` | `60000` | 空闲非初始chunk返还延迟；`0`关闭缩容 |
 | `DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES` | `256 KiB` | client adaptive data-QP 最小 class；实际对象向上取 power-of-two |
 | `DFKV_RDMA_INLINE_PUT_MAX_BYTES` | `4 MiB` | client 超阈 PUT 使用操作级 lease；`0`/空值禁用，不改变业务对象上限 |
 | `DFKV_RDMA_DYNAMIC_PULL` | `1` | client 协商动态 direct GET 与显式 release ACK；`0`保留旧 pull arena |
-| `DFKV_RDMA_CONNECT_MS` | — | client：IB QP 建连超时 |
-| `DFKV_RDMA_IO_MS` | — | client：控制面帧读写超时 |
+| `DFKV_RDMA_CONNECT_MS` | `3000` | client TCP bootstrap **建连**超时（毫秒），不覆盖整个 QP 初始化或后续读写 |
+| `DFKV_RDMA_IO_MS` | `10000` | client TCP bootstrap 帧读写超时（毫秒）；RDMA completion 另由 `DFKV_RDMA_OP_TIMEOUT_MS` 限定 |
 | `DFKV_RDMA_BATCH_OP_TIMEOUT_MS` | 0=跟随 RDMA_OP | client：multi-item Cache/Range/Exist、SG 窗口总期限 |
 | `DFKV_RDMA_POOL_MAX` | 未设：常驻基线 `8`、data 突发上限 `64` | client：scalar/SG 共用 data pool；超过基线的空闲连接在最后一次应用使用 60 秒后退休，keepalive 不续期。显式正整数同时固定基线与上限；control 仍取基线，全部受进程资源预算约束 |
 | `DFKV_RDMA_RAIL_CREDITS` | 默认 `64`, 硬上限 4096 | client：每 rail outstanding request credits |
@@ -490,7 +498,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | client-local rail attempts | 固定 `2`（不可配置） | GET/batch/SG 第二次只重试未完成 item/window；PUT 仅在确认 request 未 post 时可换轨，post 后 ambiguous failure 不 replay |
 | `DFKV_RDMA_RAIL_LATENCY_WEIGHT` | — | client：rail selection 的延迟 EWMA 权重 |
 | `DFKV_RDMA_RAIL_ERROR_PENALTY_US` | — | client：rail selection 的错误分数惩罚微秒 |
-| `DFKV_RDMA_IDLE_MS` | — | server：idle QP 重回收周期 |
+| `DFKV_RDMA_IDLE_MS` | `600000` | server 常规空闲 QP 超时（毫秒；`0` 禁用）；接收池压力回收另须保护未完成的 reply/READ |
 
 #### c. TCP 连接池（client 读，但 server 运维也受影响）
 

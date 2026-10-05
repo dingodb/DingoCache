@@ -306,11 +306,15 @@ Status RdmaServer::Start(int port) {
   recv_segment_chunk_bytes_ = RecvChunkBytes(recv_segment_max_bytes_);
   recv_chunk_idle_ms_ = RecvChunkIdleMs();
   const size_t min_slot_bytes = rdma::V2SlotSize(max_msg_);
-  // Keep one existing chunk exclusively for operation-sized dynamic GET/PUT
-  // staging when the remaining hard budget still fits two max-sized QPs.
-  // Tiny constrained configurations retain the original shared-pool geometry.
+  // Reserve one staging chunk only if it can hold the largest legal staged
+  // object and the hard budget still fits one resident chunk per configured
+  // rail plus a spare for concurrent staging. A smaller reserved chunk would
+  // steal capacity without ever serving that object.
+  const size_t reserve_chunks = anchor_devs_.size() + 2;
   const size_t staging_reserve_bytes =
-      recv_segment_chunk_bytes_ < recv_segment_max_bytes_ &&
+      min_slot_bytes <= recv_segment_chunk_bytes_ &&
+              recv_segment_chunk_bytes_ <=
+                  recv_segment_max_bytes_ / reserve_chunks &&
               min_slot_bytes <=
                   (recv_segment_max_bytes_ - recv_segment_chunk_bytes_) / 2
           ? recv_segment_chunk_bytes_

@@ -159,8 +159,10 @@ RDMA-listener scrape inventory。
 | `dfkv_rdma_v2_conns_opened_total` | counter | server 累计打开的 v2 连接 |
 | `dfkv_rdma_v2_put_writes_total` / `dfkv_rdma_v2_get_writes_total` | counter | server 实际收到的 `WRITE_WITH_IMM` PUT / 实际发出的 RDMA WRITE GET payload |
 | `dfkv_rdma_recv_segment_bytes` / `max_bytes` / `chunks` | gauge | receive-pool 当前提交量 / hard budget / 已提交 chunk 数 |
-| `dfkv_rdma_recv_segment_used_bytes` / `free_bytes` | gauge | 已提交 chunk 中 lease 占用 / 空闲字节 |
-| `dfkv_rdma_recv_segment_largest_free_range_bytes` | gauge | 任一 chunk 最大连续 free range |
+| `dfkv_rdma_recv_segment_used_bytes` / `free_bytes` | gauge | 已提交 chunk 中所有 lease 占用 / 全部空闲字节，**含 staging 专用 chunk**；后者不等于连接可分配字节 |
+| `dfkv_rdma_recv_segment_largest_free_range_bytes` | gauge | 任一 chunk 最大连续 free range，含 staging 专用 chunk |
+| `dfkv_rdma_recv_segment_connection_free_bytes` / `connection_largest_free_range_bytes` | gauge | 排除 staging 专用 chunk 后，连接可用的全部 / 单块最大连续空闲字节；排查 bootstrap 连接拒绝时看此组 |
+| `dfkv_rdma_recv_segment_staging_reserved_bytes` / `staging_reserved_free_bytes` | gauge | 初始 chunk 专供动态 GET 和 leased PUT 暂存的总额 / 当前空闲；已计入上述 hard budget，并非新增预算 |
 | `dfkv_rdma_recv_segment_growths_total` / `growth_failures_total` | counter | 启动后 chunk 增长成功 / 因预算或分配失败 |
 | `dfkv_rdma_recv_segment_shrinks_total` / `released_bytes_total` / `chunk_idle_ms` | counter / gauge | 空闲缩容次数 / 已返还字节 / 非初始chunk空闲保留期 |
 | `dfkv_rdma_recv_segment_allocation_failures_total` | counter | grow 后仍无法满足的最终 allocation |
