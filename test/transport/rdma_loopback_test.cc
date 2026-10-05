@@ -2550,7 +2550,7 @@ void ExerciseReservedStagingUnderConcurrentAdmissions(bool use_uring) {
   const size_t slot_bytes = rdma::V2SlotSize(kMaxMsg);
   const size_t chunk_bytes = 4 * slot_bytes;
   const std::string chunk = std::to_string(chunk_bytes);
-  const std::string budget = std::to_string(3 * chunk_bytes);
+  const std::string budget = std::to_string(4 * chunk_bytes);
   ScopedEnv segment("DFKV_RDMA_RECV_SEGMENT_SIZE", budget.c_str());
   ScopedEnv recv_chunk("DFKV_RDMA_RECV_CHUNK_BYTES", chunk.c_str());
   RdmaNode node(use_uring ? "reserve-uring" : "reserve-sync",
@@ -2565,7 +2565,7 @@ void ExerciseReservedStagingUnderConcurrentAdmissions(bool use_uring) {
     PinnedPullPeer reader;
     ASSERT_TRUE(reader.Open(node));
     std::vector<std::unique_ptr<PinnedPullPeer>> connections;
-    for (int i = 0; i < 7; ++i) {
+    for (int i = 0; i < 11; ++i) {
       auto peer = std::make_unique<PinnedPullPeer>();
       ASSERT_TRUE(peer->Open(node));
       connections.push_back(std::move(peer));

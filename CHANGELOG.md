@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Preserve an initial, hard-budgeted receive chunk for dynamic GET and
+  leased-PUT staging when enough connection capacity remains. Connection
+  leases cannot fragment that chunk; pressure recovery reclaims only
+  quiescent, aged QPs and never revokes pending replies, disk reads, or
+  client READ grants. Truly exhausted pools still report backpressure.
+  Separate connection-eligible and staging-reserved free-space gauges.
+- Resume a marked interrupted first slab initialization only when its
+  geometry, empty table, and existing extents prove an unpopulated layout.
+  Preserve unknown or populated stores, and report the original startup
+  syscall errno (including soft file-descriptor exhaustion) instead of
+  silently creating missing data.
+- Add local and peer QP identities to failed server CQ diagnostics without
+  suppressing completion errors. The historical intermittent retry-exceeded
+  failure has not yet been attributed to a particular peer lifecycle.
+
 - Keep reply buffers behind their SEND fence while queueing early incoming
   requests in a depth-bounded FIFO. Control/PUT receives are ready before the
   reply is posted; receive-backed data sources retain their existing fence.
