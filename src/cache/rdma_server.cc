@@ -712,10 +712,14 @@ void RdmaServer::Serve(int boot_fd) {
     ::close(boot_fd);
     return;
   }
-  // Five seconds is below the published v2.28 client's 10-second bootstrap
-  // socket I/O timeout; never wait indefinitely for a dead peer to retire.
+  // Share one bounded pressure window across both resident and old-client
+  // pull leases. The published v2.28 client's bootstrap socket I/O timeout
+  // is 10 seconds, so leave margin for QP setup and readiness transmission.
+  constexpr uint64_t kBootstrapPressureUs = 5000000;
+  const uint64_t admission_started = SteadyUs();
   rdma::RecvSegmentPool::Lease recv_lease = AllocateReceiveWithPressure(
-      K * slot_size, static_cast<int>(rail_index), rail_numa, 5000000);
+      K * slot_size, static_cast<int>(rail_index), rail_numa,
+      kBootstrapPressureUs);
   if (!recv_lease) {
     const auto stats = recv_segments_.stats();
     DFKV_LOG_ERROR(
@@ -729,8 +733,10 @@ void RdmaServer::Serve(int boot_fd) {
   }
   rdma::RecvSegmentPool::Lease pull_lease;
   if (pull_read_requested && !dynamic_pull_requested) {
+    const uint64_t elapsed = SteadyUs() - admission_started;
     pull_lease = AllocateReceiveWithPressure(
-        K * slot_size, static_cast<int>(rail_index), rail_numa, 5000000);
+        K * slot_size, static_cast<int>(rail_index), rail_numa,
+        elapsed < kBootstrapPressureUs ? kBootstrapPressureUs - elapsed : 0);
     if (!pull_lease) {
       const auto stats = recv_segments_.stats();
       DFKV_LOG_ERROR(
