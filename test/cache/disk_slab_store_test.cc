@@ -113,10 +113,10 @@ class DiskSlabTest : public ::testing::Test {
 
   // Fork confines RLIMIT_NOFILE to the failed first startup; the parent
   // retries exactly the on-disk layout the child left behind.
-  std::string InterruptedFirstStartup() {
+  std::string InterruptedFirstStartup(uint64_t extents = 96) {
     int fds[2];
     if (::pipe(fds) != 0) return {};
-    const auto options = Opts(96 * 4096, 4096, 4096);
+    const auto options = Opts(extents * 4096, 4096, 4096);
     const pid_t child = ::fork();
     if (child == 0) {
       ::close(fds[0]);
@@ -515,6 +515,31 @@ TEST_F(DiskSlabTest, InterruptedFreshInitResumesAfterFdLimitRaised) {
   std::string out;
   ASSERT_EQ(warm.Range(K(600), 0, 0, &out), Status::kOk);
   EXPECT_EQ(out, "warm");
+}
+
+TEST_F(DiskSlabTest, InterruptedHighIndexExtentKeepsCanonicalName) {
+  struct rlimit limit {};
+  ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &limit), 0);
+  if (limit.rlim_cur < 40) GTEST_SKIP() << "requires at least 40 descriptors";
+  constexpr uint64_t kExtents = 100001;
+  ASSERT_NE(InterruptedFirstStartup(kExtents).find("errno 24"),
+            std::string::npos);
+  const fs::path high_extent = dir_ / "extents/E100000";
+  const int fd = ::open(high_extent.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::ftruncate(fd, 4096), 0);
+  ::close(fd);
+  struct stat before {};
+  ASSERT_EQ(::stat(high_extent.c_str(), &before), 0);
+
+  // The limited child must get past the canonical 6-digit extent, then fail
+  // on its own descriptor limit instead of rejecting a valid existing extent.
+  const std::string error = InterruptedFirstStartup(kExtents);
+  EXPECT_NE(error.find("errno 24"), std::string::npos) << error;
+  struct stat after {};
+  ASSERT_EQ(::stat(high_extent.c_str(), &after), 0);
+  EXPECT_EQ(before.st_ino, after.st_ino);
+  EXPECT_FALSE(fs::exists(dir_ / "slab_state"));
 }
 
 TEST_F(DiskSlabTest, InterruptedBeforeMetaCreationResumesOnlyWithMarker) {
