@@ -2538,6 +2538,119 @@ TEST(RdmaLoopback, PressureRefusesOnlyBusyQpsUring) {
   ExercisePressureRefusesOnlyBusyQps(true);
 }
 
+void ExerciseReservedStagingUnderConcurrentAdmissions(bool use_uring) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+#ifndef DFKV_WITH_URING
+  if (use_uring) GTEST_SKIP() << "io_uring not compiled";
+#endif
+  ScopedEnv uring("DFKV_SERVER_URING", use_uring ? "1" : "0");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "1");
+  ScopedEnv idle("DFKV_RDMA_IDLE_MS", "5000");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const size_t slot_bytes = rdma::V2SlotSize(kMaxMsg);
+  const size_t chunk_bytes = 4 * slot_bytes;
+  const std::string chunk = std::to_string(chunk_bytes);
+  const std::string budget = std::to_string(3 * chunk_bytes);
+  ScopedEnv segment("DFKV_RDMA_RECV_SEGMENT_SIZE", budget.c_str());
+  ScopedEnv recv_chunk("DFKV_RDMA_RECV_CHUNK_BYTES", chunk.c_str());
+  RdmaNode node(use_uring ? "reserve-uring" : "reserve-sync",
+                kMaxMsg, false, use_uring);
+  const BlockKey key{90184, 1};
+  const std::string value(4096, 'g');
+  std::string ignored;
+  ASSERT_EQ(node.srv->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
+                value.data(), value.size(), &ignored), Status::kOk);
+  {
+    PinnedPullPeer reader;
+    ASSERT_TRUE(reader.Open(node));
+    std::vector<std::unique_ptr<PinnedPullPeer>> connections;
+    for (int i = 0; i < 7; ++i) {
+      auto peer = std::make_unique<PinnedPullPeer>();
+      ASSERT_TRUE(peer->Open(node));
+      connections.push_back(std::move(peer));
+    }
+    if (use_uring && CounterVal(node.rsrv->MetricsText(),
+                                "dfkv_uring_init_fallbacks_total") != 0)
+      GTEST_SKIP() << "io_uring unavailable at runtime";
+    const std::string full = node.rsrv->MetricsText();
+    EXPECT_EQ(CounterVal(
+                  full, "dfkv_rdma_recv_segment_connection_free_bytes"), 0);
+    EXPECT_EQ(CounterVal(
+                  full, "dfkv_rdma_recv_segment_staging_reserved_free_bytes"),
+              static_cast<long>(chunk_bytes));
+
+    std::mutex start_mu;
+    std::condition_variable start_cv;
+    bool start = false;
+    std::array<bool, 4> admitted{};
+    std::vector<std::thread> arrivals;
+    for (size_t i = 0; i < admitted.size(); ++i) {
+      arrivals.emplace_back([&, i] {
+        {
+          std::unique_lock<std::mutex> lock(start_mu);
+          start_cv.wait(lock, [&] { return start; });
+        }
+        PinnedPullPeer arriving;
+        admitted[i] = arriving.Open(node);
+      });
+    }
+    struct JoinArrivals {
+      std::vector<std::thread>& threads;
+      ~JoinArrivals() {
+        for (auto& thread : threads)
+          if (thread.joinable()) thread.join();
+      }
+    } join{arrivals};
+    {
+      std::lock_guard<std::mutex> lock(start_mu);
+      start = true;
+    }
+    start_cv.notify_all();
+    rdma::DynamicPullReady ready;
+    const bool prepared = reader.Prepare(key, 0, value.size(), &ready);
+    std::string bytes;
+    if (prepared) {
+      EXPECT_TRUE(reader.Read(ready, &bytes));
+      EXPECT_EQ(bytes, value);
+      EXPECT_TRUE(reader.Release(key, ready));
+    }
+    for (auto& thread : arrivals) thread.join();
+    ASSERT_TRUE(prepared)
+        << "GET disk fallback must retain contiguous staging headroom";
+    for (bool accepted : admitted) EXPECT_FALSE(accepted);
+    EXPECT_EQ(node.RangeDirectCalls(key), 1u);
+    const std::string after = node.rsrv->MetricsText();
+    EXPECT_EQ(CounterVal(after, "dfkv_rdma_segment_evictions_total"), 0);
+    EXPECT_GE(CounterVal(
+                  after, "dfkv_rdma_recv_segment_allocation_failures_total"),
+              static_cast<long>(admitted.size()));
+    EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
+  }
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  long used = -1;
+  while (std::chrono::steady_clock::now() < deadline) {
+    used = CounterVal(node.rsrv->MetricsText(),
+                      "dfkv_rdma_recv_segment_used_bytes");
+    if (node.rsrv->ActiveConns() == 0 && used == 0) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_EQ(node.rsrv->ActiveConns(), 0u);
+  EXPECT_EQ(used, 0);
+  EXPECT_EQ(CounterVal(node.rsrv->MetricsText(),
+                       "dfkv_rdma_recv_segment_staging_reserved_free_bytes"),
+            static_cast<long>(chunk_bytes));
+}
+
+TEST(RdmaLoopback, ReservedStagingSurvivesConcurrentAdmissionsSync) {
+  ExerciseReservedStagingUnderConcurrentAdmissions(false);
+}
+
+TEST(RdmaLoopback, ReservedStagingSurvivesConcurrentAdmissionsUring) {
+  ExerciseReservedStagingUnderConcurrentAdmissions(true);
+}
+
 void ExercisePressureProtectsImmediatePooledPut(bool use_uring) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
 #ifndef DFKV_WITH_URING

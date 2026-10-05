@@ -175,7 +175,9 @@ class RdmaServer {
   void Serve(int boot_fd);
   void ReapDoneLocked();  // join+erase finished Serve threads; conn_mu_ held
   rdma::RecvSegmentPool::Lease AllocateReceiveWithPressure(
-      size_t bytes, int rail, int numa_node, uint64_t wait_us);
+      size_t bytes, int rail, int numa_node, uint64_t wait_us,
+      rdma::RecvSegmentPool::LeaseClass lease_class =
+          rdma::RecvSegmentPool::LeaseClass::kConnection);
 
   // A live connection: its Serve thread plus a flag the thread sets (last thing
   // it does) so AcceptLoop can tell it has finished and join it without blocking.

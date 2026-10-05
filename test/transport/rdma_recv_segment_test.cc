@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -183,6 +184,69 @@ TEST(RecvSegmentPool, TrimsEmptyNonInitialChunksAfterIdleHold) {
   EXPECT_EQ(stats.committed_bytes, 16u << 10);
   EXPECT_EQ(stats.shrinks, 1u);
   EXPECT_EQ(stats.released_bytes, 32u << 10);
+}
+
+TEST(RecvSegmentPool, ReservedStagingRemainsContiguousWhenConnectionsFillBudget) {
+  RecvSegmentPool pool;
+  constexpr size_t chunk = 64u << 10;
+  ASSERT_TRUE(pool.Init(chunk, 3 * chunk, 4096, chunk));
+  EXPECT_FALSE(pool.Init(chunk, 3 * chunk));
+  EXPECT_EQ(pool.stats().staging_reserved_bytes, chunk);
+
+  // Multiple connection-sized leases fill both general chunks. They cannot
+  // fragment or consume the already committed staging-only initial chunk.
+  std::vector<RecvSegmentPool::Lease> connections;
+  for (int i = 0; i < 8; ++i) {
+    auto lease = pool.Allocate(16u << 10, 4096, 0);
+    ASSERT_TRUE(lease);
+    EXPECT_NE(lease.segment(), pool.initial_segment());
+    connections.push_back(std::move(lease));
+  }
+  EXPECT_FALSE(pool.Allocate(4096, 4096, 0));
+  auto stats = pool.stats();
+  EXPECT_EQ(stats.connection_free_bytes, 0u);
+  EXPECT_EQ(stats.connection_largest_free_range, 0u);
+  EXPECT_EQ(stats.staging_reserved_free_bytes, chunk);
+  EXPECT_EQ(stats.free_bytes, chunk);
+  EXPECT_EQ(stats.allocation_failures, 1u);
+
+  auto read = pool.Allocate(32u << 10, 4096, 0, -1,
+                            RecvSegmentPool::LeaseClass::kStaging);
+  auto write = pool.Allocate(32u << 10, 4096, 0, -1,
+                             RecvSegmentPool::LeaseClass::kStaging);
+  ASSERT_TRUE(read);
+  ASSERT_TRUE(write);
+  EXPECT_EQ(read.segment(), pool.initial_segment());
+  EXPECT_EQ(write.segment(), pool.initial_segment());
+  EXPECT_FALSE(pool.Allocate(4096, 4096, 0, -1,
+                             RecvSegmentPool::LeaseClass::kStaging));
+  EXPECT_EQ(pool.stats().staging_reserved_free_bytes, 0u);
+
+  read.Reset();
+  write.Reset();
+  EXPECT_EQ(pool.stats().staging_reserved_free_bytes, chunk);
+  EXPECT_EQ(pool.stats().connection_free_bytes, 0u);
+
+  // Two nonadjacent general holes contain enough aggregate free bytes, but
+  // neither fits a 32-KiB GET. The staging reservation remains contiguous.
+  connections[0].Reset();
+  connections[2].Reset();
+  stats = pool.stats();
+  EXPECT_EQ(stats.connection_free_bytes, 32u << 10);
+  EXPECT_EQ(stats.connection_largest_free_range, 16u << 10);
+  auto fragmented_read = pool.Allocate(
+      32u << 10, 4096, 0, -1,
+      RecvSegmentPool::LeaseClass::kStaging);
+  ASSERT_TRUE(fragmented_read);
+  EXPECT_EQ(fragmented_read.segment(), pool.initial_segment());
+}
+
+TEST(RecvSegmentPool, RejectsImpossibleStagingReservation) {
+  RecvSegmentPool pool;
+  EXPECT_FALSE(pool.Init(16u << 10, 16u << 10, 4096, 16u << 10));
+  EXPECT_FALSE(pool.Init(16u << 10, 48u << 10, 4096, 8u << 10));
+  ASSERT_TRUE(pool.Init(16u << 10, 48u << 10));
+  EXPECT_EQ(pool.stats().staging_reserved_bytes, 0u);
 }
 
 }  // namespace dfkv::rdma

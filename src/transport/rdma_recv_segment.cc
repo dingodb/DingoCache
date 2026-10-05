@@ -200,32 +200,44 @@ void RecvSegmentPool::Lease::Reset() {
 }
 
 bool RecvSegmentPool::Init(size_t chunk_bytes, size_t max_bytes,
-                           size_t alignment) {
+                           size_t alignment, size_t staging_reserve_bytes) {
   if (!IsPowerOfTwo(alignment) || alignment < sizeof(void*) ||
       chunk_bytes == 0 || max_bytes == 0) {
     return false;
   }
   const size_t aligned_chunk = AlignUpChecked(chunk_bytes, alignment);
   const size_t aligned_max = AlignUpChecked(max_bytes, alignment);
+  const size_t aligned_reserve = staging_reserve_bytes == 0
+                                     ? 0
+                                     : AlignUpChecked(staging_reserve_bytes,
+                                                      alignment);
   if (aligned_chunk == std::numeric_limits<size_t>::max() ||
       aligned_max == std::numeric_limits<size_t>::max() ||
-      aligned_chunk > aligned_max) {
+      aligned_reserve == std::numeric_limits<size_t>::max() ||
+      aligned_chunk > aligned_max ||
+      (aligned_reserve != 0 &&
+       (aligned_reserve != aligned_chunk ||
+        aligned_reserve == aligned_max))) {
     return false;
   }
   std::lock_guard<std::mutex> lock(mu_);
   if (!chunks_.empty()) {
     return chunk_bytes_ == aligned_chunk && max_bytes_ == aligned_max &&
-           alignment_ == alignment;
+           alignment_ == alignment &&
+           staging_reserve_bytes_ == aligned_reserve;
   }
   chunk_bytes_ = aligned_chunk;
   max_bytes_ = aligned_max;
+  staging_reserve_bytes_ = aligned_reserve;
   alignment_ = alignment;
   auto initial = std::make_unique<Chunk>();
   initial->segment = std::make_unique<RecvSegment>();
+  initial->staging_only = staging_reserve_bytes_ != 0;
   if (!initial->segment->Init(chunk_bytes_, alignment_)) {
     chunk_bytes_ = 0;
     max_bytes_ = 0;
     alignment_ = 0;
+    staging_reserve_bytes_ = 0;
     return false;
   }
   chunks_.push_back(std::move(initial));
@@ -252,12 +264,14 @@ std::unique_ptr<RecvSegmentPool::Chunk> RecvSegmentPool::NewChunk(
 RecvSegmentPool::Lease RecvSegmentPool::Allocate(size_t bytes,
                                                  size_t alignment,
                                                  int affinity,
-                                                 int numa_node) {
+                                                 int numa_node,
+                                                 LeaseClass lease_class) {
   if (bytes == 0 || !IsPowerOfTwo(alignment)) return {};
   std::lock_guard<std::mutex> lock(mu_);
-  auto try_chunks = [&](int wanted_affinity) -> Lease {
+  auto try_chunks = [&](int wanted_affinity, bool staging_only) -> Lease {
     for (const auto& chunk : chunks_) {
-      if (chunk->affinity != wanted_affinity) continue;
+      if (chunk->affinity != wanted_affinity ||
+          chunk->staging_only != staging_only) continue;
       auto lease = chunk->segment->Allocate(bytes, alignment);
       if (lease) {
         chunk->empty_since_ms = 0;
@@ -266,11 +280,15 @@ RecvSegmentPool::Lease RecvSegmentPool::Allocate(size_t bytes,
     }
     return {};
   };
+  if (lease_class == LeaseClass::kStaging && staging_reserve_bytes_ != 0) {
+    auto reserved = try_chunks(-1, true);
+    if (reserved) return reserved;
+  }
   if (affinity >= 0) {
-    auto lease = try_chunks(affinity);
+    auto lease = try_chunks(affinity, false);
     if (lease) return lease;
   }
-  auto shared = try_chunks(-1);
+  auto shared = try_chunks(-1, false);
   if (shared) return shared;
   auto chunk = NewChunk(bytes, affinity, numa_node);
   if (!chunk) {
@@ -342,6 +360,15 @@ RecvSegmentPool::Stats RecvSegmentPool::stats() const {
     out.free_bytes += current.free_bytes;
     out.largest_free_range =
         std::max(out.largest_free_range, current.largest_free_range);
+    if (chunk->staging_only) {
+      out.staging_reserved_bytes += current.total_bytes;
+      out.staging_reserved_free_bytes += current.free_bytes;
+    } else {
+      out.connection_free_bytes += current.free_bytes;
+      out.connection_largest_free_range =
+          std::max(out.connection_largest_free_range,
+                   current.largest_free_range);
+    }
   }
   out.growths = growths_.load(std::memory_order_relaxed);
   out.shrinks = shrinks_.load(std::memory_order_relaxed);

@@ -82,6 +82,7 @@ class RecvSegment {
 // only that chunk on the selected rail instead of one monolithic arena.
 class RecvSegmentPool {
  public:
+  enum class LeaseClass { kConnection, kStaging };
   class Lease {
    public:
     Lease() = default;
@@ -114,6 +115,10 @@ class RecvSegmentPool {
     size_t used_bytes = 0;
     size_t free_bytes = 0;
     size_t largest_free_range = 0;
+    size_t connection_free_bytes = 0;
+    size_t connection_largest_free_range = 0;
+    size_t staging_reserved_bytes = 0;
+    size_t staging_reserved_free_bytes = 0;
     size_t chunks = 0;
     uint64_t growths = 0;
     uint64_t shrinks = 0;
@@ -122,10 +127,13 @@ class RecvSegmentPool {
     uint64_t growth_failures = 0;
   };
 
+  // When a whole initial chunk is reserved for staging, connection-lifetime
+  // leases cannot consume it. The reservation stays within max_bytes.
   bool Init(size_t chunk_bytes, size_t max_bytes,
-            size_t alignment = 4096);
+            size_t alignment = 4096, size_t staging_reserve_bytes = 0);
   Lease Allocate(size_t bytes, size_t alignment = 4096,
-                 int affinity = -1, int numa_node = -1);
+                 int affinity = -1, int numa_node = -1,
+                 LeaseClass lease_class = LeaseClass::kConnection);
   size_t TrimIdle(uint64_t idle_ms);
   RecvSegment* initial_segment() const;
   Stats stats() const;
@@ -134,6 +142,7 @@ class RecvSegmentPool {
   struct Chunk {
     std::unique_ptr<RecvSegment> segment;
     int affinity = -1;
+    bool staging_only = false;
     uint64_t empty_since_ms = 0;
   };
   std::unique_ptr<Chunk> NewChunk(size_t minimum_bytes, int affinity,
@@ -142,6 +151,7 @@ class RecvSegmentPool {
 
   size_t chunk_bytes_ = 0;
   size_t max_bytes_ = 0;
+  size_t staging_reserve_bytes_ = 0;
   size_t alignment_ = 0;
   mutable std::mutex mu_;
   std::vector<std::unique_ptr<Chunk>> chunks_;
