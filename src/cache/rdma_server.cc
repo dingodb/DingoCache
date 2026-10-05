@@ -413,7 +413,7 @@ void RdmaServer::Stop() {
   std::vector<Conn> conns;
   {
     std::lock_guard<std::mutex> lk(conn_mu_);
-    for (rdma::RcEndpoint* ep : live_eps_) ep->Wake();
+    for (const auto& live : live_eps_) live.first->Wake();
     conns.swap(conns_);
   }
   for (auto& c : conns) if (c.th.joinable()) c.th.join();
@@ -663,10 +663,9 @@ void RdmaServer::Serve(int boot_fd) {
       K * slot_size, rdma::kV2DataOffset, static_cast<int>(rail_index),
       rail_numa);
   if (!recv_lease) {
-    // Segment exhausted: evict the stalest idle connection(s) to make room
-    // before refusing. Client pooled connections re-dial via the stale-retry
-    // path, so evicting only connections idle longer than kEvictIdleMinUs
-    // (no completions for 2 s -> no in-flight request) is safe.
+    // Segment exhausted: evict the stalest quiescent connection(s) to make
+    // room before refusing. Age alone is insufficient: a disk read or a
+    // client-side one-sided READ can remain in flight without a server CQE.
     const uint64_t now = SteadyUs();
     constexpr uint64_t kEvictIdleMinUs = 2000000;
     const uint64_t evict_started = SteadyUs();
@@ -676,7 +675,8 @@ void RdmaServer::Serve(int boot_fd) {
         std::lock_guard<std::mutex> lk(conn_mu_);
         rdma::RcEndpoint* victim = nullptr;
         uint64_t victim_active = std::numeric_limits<uint64_t>::max();
-        for (rdma::RcEndpoint* ep : live_eps_) {
+        for (const auto& [ep, reclaimable] : live_eps_) {
+          if (!reclaimable->load(std::memory_order_acquire)) continue;
           const uint64_t a =
               ep->last_active_us_.load(std::memory_order_relaxed);
           // a == 0: endpoint inserted but Serve has not stamped it yet.
@@ -933,7 +933,9 @@ void RdmaServer::Serve(int boot_fd) {
                 std::to_string(declared) +
                 " control=" + std::to_string(conn_control) +
                 " shared-slot=" + std::to_string(slot_size) +
-                " qd=" + std::to_string(K));
+                " qd=" + std::to_string(K) +
+                " qp=" + std::to_string(ep.Local().qpn) +
+                " peer_qp=" + std::to_string(peer_info.qpn));
   numa::PinThreadToNode(ep.numa_node());
 
   // QP bootstrap: the peer geometry was consumed before allocation above.
@@ -1040,6 +1042,9 @@ void RdmaServer::Serve(int boot_fd) {
   }
   v2_conns_.fetch_add(1, std::memory_order_relaxed);
 
+  // The pressure reclaimer must not classify a QP by its last CQE alone:
+  // request handling and one-sided client READs may outlive that CQE.
+  std::atomic<bool> reclaimable{true};
   // Register this endpoint so Stop() can Wake() us out of WaitComp and join. The
   // running_ check under conn_mu_ closes the race with a concurrent Stop(): either
   // Stop sees us in live_eps_ (and wakes us) or we see running_==false here.
@@ -1049,7 +1054,7 @@ void RdmaServer::Serve(int boot_fd) {
       retire_writer();
       return;
     }
-    live_eps_.insert(&ep);
+    live_eps_.emplace(&ep, &reclaimable);
   }
   ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
 
@@ -1851,6 +1856,8 @@ void RdmaServer::Serve(int boot_fd) {
   size_t pending_recv_count = 0;
   auto dispatch_completions = [&](const ibv_wc* batch, int count,
                                   auto&& process_wc) -> bool {
+    if (count != 0)
+      reclaimable.store(false, std::memory_order_release);
     for (int i = 0; i < count; ++i) {
       const ibv_wc& wc = batch[i];
       const bool received = wc.opcode == IBV_WC_RECV ||
@@ -1868,6 +1875,19 @@ void RdmaServer::Serve(int boot_fd) {
       if (!process_wc(pending_recv[pending_recv_head])) return false;
       pending_recv_head = (pending_recv_head + 1) % K;
       --pending_recv_count;
+    }
+    if (count != 0 && pending_recv_count == 0 && free_send.size() == K) {
+      const bool holding_data =
+          std::any_of(pull_slots.begin(), pull_slots.end(),
+                      [](const auto& state) { return state.busy; }) ||
+          std::any_of(lease_put.begin(), lease_put.end(),
+                      [](const auto& state) { return state.active; }) ||
+          std::any_of(multi_put.begin(), multi_put.end(),
+                      [](const auto& state) { return state.active; }) ||
+          std::any_of(multi_get.begin(), multi_get.end(),
+                      [](const auto& state) { return state.active; });
+      if (!holding_data)
+        reclaimable.store(true, std::memory_order_release);
     }
     if (after_cq_dispatch_for_test_)
       after_cq_dispatch_for_test_(pending_recv_count, free_send.size(),
@@ -1896,6 +1916,23 @@ void RdmaServer::Serve(int boot_fd) {
   const int idle_ms = ServerIdleMs();
   active_conns_.fetch_add(1, std::memory_order_relaxed);
   rail_stats.active_conns.fetch_add(1, std::memory_order_relaxed);
+  // Failed WCs do not guarantee a meaningful opcode. Retain the raw provider
+  // fields and both QP numbers for correlation with short-lived clients.
+  auto log_completion_error = [&](const ibv_wc& wc, const char* loop,
+                                  size_t posted_sends) {
+    DFKV_LOG_WARN(
+        "rdma server CQ failure loop=" + std::string(loop) +
+        " status=" + std::to_string(wc.status) +
+        " opcode_raw=" + std::to_string(wc.opcode) +
+        " vendor=" + std::to_string(wc.vendor_err) +
+        " wr_id=" + std::to_string(wc.wr_id) +
+        " qp=" + std::to_string(ep.Local().qpn) +
+        " peer_qp=" + std::to_string(peer_info.qpn) +
+        " depth=" + std::to_string(K) +
+        " free_send=" + std::to_string(free_send.size()) +
+        " queued_recv=" + std::to_string(pending_recv_count) +
+        " posted_sends=" + std::to_string(posted_sends));
+  };
 
 #ifdef DFKV_WITH_URING
   // -------------------------------------------------------------------------
@@ -2009,6 +2046,7 @@ void RdmaServer::Serve(int boot_fd) {
 
     auto process_wc = [&](const ibv_wc& wc) -> bool {
       if (wc.status != IBV_WC_SUCCESS) {
+        log_completion_error(wc, "uring", posted_sends);
         completion_errors_.fetch_add(1, std::memory_order_relaxed);
         rail_stats.completion_errors.fetch_add(1,
                                                 std::memory_order_relaxed);
@@ -2311,6 +2349,7 @@ sync_serve_loop:;
 
   auto process_sync_wc = [&](const ibv_wc& wc) -> bool {
     if (wc.status != IBV_WC_SUCCESS) {
+      log_completion_error(wc, "sync", K - free_send.size());
       completion_errors_.fetch_add(1, std::memory_order_relaxed);
       rail_stats.completion_errors.fetch_add(1, std::memory_order_relaxed);
       return false;

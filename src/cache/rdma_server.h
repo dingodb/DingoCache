@@ -19,7 +19,6 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -229,7 +228,10 @@ class RdmaServer {
   // so finished threads are reaped incrementally (see ReapDoneLocked).
   std::mutex conn_mu_;
   std::vector<Conn> conns_;
-  std::unordered_set<rdma::RcEndpoint*> live_eps_;
+  // The Serve thread owns the pointed-to flag until it erases its endpoint
+  // under conn_mu_. A pressure reclaim may wake only a quiescent QP; elapsed
+  // time since a CQE alone cannot distinguish idle from in-flight disk/READ.
+  std::unordered_map<rdma::RcEndpoint*, std::atomic<bool>*> live_eps_;
   std::mutex writer_mu_;
   std::unordered_map<uint64_t, std::shared_ptr<WriterState>> writers_;
   // Receive memory is committed in fixed-size chunks on demand. Connections
