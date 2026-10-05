@@ -2433,6 +2433,8 @@ void ExercisePullStagingReclaimsIdleQp(bool use_uring) {
     ASSERT_TRUE(reader.Read(ready, &bytes));
     EXPECT_EQ(bytes, value);
     ASSERT_TRUE(reader.Release(key, ready));
+    EXPECT_EQ(node.RangeDirectCalls(key), 1u)
+        << "RAM disabled: GET must actually use the disk fallback";
     const std::string metrics = node.rsrv->MetricsText();
     EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_segment_evictions_total"), 1);
     EXPECT_GT(CounterVal(
