@@ -110,9 +110,11 @@ class RdmaServerTestPeer {
       RdmaServer& server, std::function<void(size_t)> hook) {
     server.after_request_rearm_for_test_ = std::move(hook);
   }
-  static size_t RefreshQuiescentActivity(RdmaServer& server) {
-    // Deterministically place actual, completed QPs inside the old two-second
-    // grace period without changing any CQE or connection's busy state.
+  static size_t RefreshQuiescentActivity(RdmaServer& server,
+                                         uint64_t age_ms = 0) {
+    // Shift only the activity timestamps of real, completed QPs. The 1.5 s
+    // pressure case distinguishes the old 2 s grace from the new 1 s grace;
+    // the zero-age case keeps immediate pooled reuse protected.
     const uint64_t now = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -120,7 +122,8 @@ class RdmaServerTestPeer {
     size_t count = 0;
     for (const auto& [ep, live] : server.live_eps_) {
       if (!live.reclaimable->load(std::memory_order_acquire)) continue;
-      ep->last_active_us_.store(now, std::memory_order_relaxed);
+      ep->last_active_us_.store(now - age_ms * 1000,
+                                std::memory_order_relaxed);
       ++count;
     }
     return count;
@@ -2274,7 +2277,7 @@ void ExercisePressurePreservesInFlightPull(bool use_uring) {
       ASSERT_TRUE(PinnedExists(recent, key));
       size_t quiescent = 0;
       for (int i = 0; i < 1000 && quiescent == 0; ++i) {
-        quiescent = RdmaServerTestPeer::RefreshQuiescentActivity(*node.rsrv);
+        quiescent = RdmaServerTestPeer::RefreshQuiescentActivity(*node.rsrv, 1500);
         if (quiescent == 0)
           std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
@@ -2350,7 +2353,7 @@ void ExercisePressureRecyclesRecentIdle(bool use_uring) {
     const auto ready_deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(5);
     do {
-      quiescent = RdmaServerTestPeer::RefreshQuiescentActivity(*node.rsrv);
+      quiescent = RdmaServerTestPeer::RefreshQuiescentActivity(*node.rsrv, 1500);
       if (quiescent == 2) break;
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     } while (std::chrono::steady_clock::now() < ready_deadline);
@@ -2418,7 +2421,7 @@ void ExercisePullStagingReclaimsIdleQp(bool use_uring) {
     const auto ready_deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(5);
     do {
-      quiescent = RdmaServerTestPeer::RefreshQuiescentActivity(*node.rsrv);
+      quiescent = RdmaServerTestPeer::RefreshQuiescentActivity(*node.rsrv, 1500);
       if (quiescent == 2) break;
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     } while (std::chrono::steady_clock::now() < ready_deadline);
@@ -2533,6 +2536,121 @@ TEST(RdmaLoopback, PressureRefusesOnlyBusyQpsSync) {
 
 TEST(RdmaLoopback, PressureRefusesOnlyBusyQpsUring) {
   ExercisePressureRefusesOnlyBusyQps(true);
+}
+
+void ExercisePressureProtectsImmediatePooledPut(bool use_uring) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+#ifndef DFKV_WITH_URING
+  if (use_uring) GTEST_SKIP() << "io_uring not compiled";
+#endif
+  ScopedEnv uring("DFKV_SERVER_URING", use_uring ? "1" : "0");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "1");
+  ScopedEnv idle("DFKV_RDMA_IDLE_MS", "5000");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  ScopedEnv minimum("DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES", "262144");
+  ScopedEnv maximum("DFKV_RDMA_MAX_BLOCK_BYTES", "262144");
+  const std::string budget = std::to_string(2 * rdma::V2SlotSize(kMaxMsg));
+  ScopedEnv segment("DFKV_RDMA_RECV_SEGMENT_SIZE", budget.c_str());
+  std::mutex mu;
+  std::condition_variable cv;
+  bool paused = false, resume = false;
+  RdmaNode node(use_uring ? "reuse-put-uring" : "reuse-put-sync",
+                kMaxMsg, false, use_uring, {}, {},
+                [&](size_t queued, size_t free, size_t) {
+                  if (queued != 0 || free != 1) return;
+                  std::unique_lock<std::mutex> lock(mu);
+                  if (paused) return;
+                  paused = true;
+                  cv.notify_all();
+                  cv.wait(lock, [&] { return resume; });
+                });
+  struct ResumeOnExit {
+    std::mutex& mu;
+    std::condition_variable& cv;
+    bool& resume;
+    void Release() {
+      {
+        std::lock_guard<std::mutex> lock(mu);
+        resume = true;
+      }
+      cv.notify_all();
+    }
+    ~ResumeOnExit() { Release(); }
+  } release{mu, cv, resume};
+  RdmaTransport transport(kMaxMsg, node.rsrv->DeviceNames().front());
+  const BlockKey first_key{90182, 1}, next_key{90183, 1};
+  const std::string first_value(4096, 'a'), next_value(4096, 'b');
+  ASSERT_EQ(transport.Cache(node.addr, first_key, first_value.data(),
+                            first_value.size()), Status::kOk);
+  {
+    std::unique_lock<std::mutex> lock(mu);
+    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5),
+                            [&] { return paused; }));
+  }
+  // The first reply SEND fence is complete, but Serve is paused before its
+  // next RECV poll. A pooled client can already post the next one-sided PUT.
+  const long opened =
+      CounterVal(transport.MetricsText(), "dfkv_rdma_client_conns_opened_total");
+  PinnedPullPeer second;
+  ASSERT_TRUE(second.Open(node));
+  ASSERT_TRUE(PinnedExists(second, first_key));
+  size_t quiescent = 0;
+  const auto ready_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  do {
+    quiescent = RdmaServerTestPeer::RefreshQuiescentActivity(*node.rsrv);
+    if (quiescent == 2) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  } while (std::chrono::steady_clock::now() < ready_deadline);
+  ASSERT_EQ(quiescent, 2u);
+  if (use_uring && CounterVal(node.rsrv->MetricsText(),
+                              "dfkv_uring_init_fallbacks_total") != 0)
+    GTEST_SKIP() << "io_uring unavailable at runtime";
+  Status next_status = Status::kIOError;
+  std::thread writer([&] {
+    next_status = transport.Cache(node.addr, next_key,
+                                  next_value.data(), next_value.size());
+  });
+  struct FinishWriter {
+    ResumeOnExit& release;
+    std::thread& writer;
+    ~FinishWriter() {
+      release.Release();
+      if (writer.joinable()) writer.join();
+    }
+  } finish{release, writer};
+  const auto posted_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (CounterVal(transport.MetricsText(),
+                    "dfkv_rdma_client_v2_put_writes_total") < 2 &&
+         std::chrono::steady_clock::now() < posted_deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  ASSERT_GE(CounterVal(transport.MetricsText(),
+                      "dfkv_rdma_client_v2_put_writes_total"), 2);
+  RdmaServerTestPeer::RefreshQuiescentActivity(*node.rsrv);
+  PinnedPullPeer excess;
+  bool admitted = false;
+  std::thread admission([&] { admitted = excess.Open(node); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_EQ(CounterVal(node.rsrv->MetricsText(),
+                       "dfkv_rdma_segment_evictions_total"), 0)
+      << "a just-reused PUT QP must not be pressure-reclaimed";
+  release.Release();
+  admission.join();
+  writer.join();
+  EXPECT_FALSE(admitted) << "both QPs are inside the pressure idle grace";
+  EXPECT_EQ(next_status, Status::kOk);
+  EXPECT_EQ(CounterVal(transport.MetricsText(),
+                       "dfkv_rdma_client_conns_opened_total"), opened);
+  EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
+}
+
+TEST(RdmaLoopback, PressureProtectsImmediatePooledPutSync) {
+  ExercisePressureProtectsImmediatePooledPut(false);
+}
+
+TEST(RdmaLoopback, PressureProtectsImmediatePooledPutUring) {
+  ExercisePressureProtectsImmediatePooledPut(true);
 }
 
 static void ExerciseControlReceiveBeforeSendFence(bool use_uring) {
@@ -5007,7 +5125,7 @@ TEST(RdmaLoopback, PressurePreservesSubmittedUringRead) {
       ASSERT_TRUE(PinnedExists(recent, key));
       size_t quiescent = 0;
       for (int i = 0; i < 1000 && quiescent == 0; ++i) {
-        quiescent = RdmaServerTestPeer::RefreshQuiescentActivity(*node.rsrv);
+        quiescent = RdmaServerTestPeer::RefreshQuiescentActivity(*node.rsrv, 1500);
         if (quiescent == 0)
           std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
