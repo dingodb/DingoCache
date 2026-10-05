@@ -120,8 +120,12 @@ class DiskSlabStore : public StoreEngine {
   };
 
   // Opens (or creates) the store under Options::dir, pre-allocating extents and
-  // rebuilding the index from slots.tbl. `*ok` (nullable) reports success; on a
-  // fatal open error the store is left empty and every op returns kIOError.
+  // rebuilding the index from slots.tbl. An interrupted first initialization
+  // resumes only with a matching initialization marker, absent slab_state,
+  // zeroed table and strictly validated directory/extent layout; unknown and
+  // previously populated layouts are never auto-recreated. `*ok` (nullable)
+  // reports success; on fatal open error every op returns kIOError and
+  // StartupError() includes the failing syscall's errno when applicable.
   explicit DiskSlabStore(Options opt, bool* ok = nullptr);
   ~DiskSlabStore();
 
@@ -179,6 +183,8 @@ class DiskSlabStore : public StoreEngine {
 
   bool ValidateOptions();
   bool SetStartupError(std::string error);
+  bool SetStartupErrno(std::string error, int saved_errno);
+  bool ClearInitMarker();
   bool OpenOrInit();
   bool Rebuild();
   bool OpenEpochState(bool fresh);
@@ -239,6 +245,7 @@ class DiskSlabStore : public StoreEngine {
   int table_fd_ = -1;                // slots.tbl
   int state_fd_ = -1;                // slab_state clean/dirty epoch marker
   uint64_t run_epoch_ = 0;
+  bool initializing_ = false;        // validated on-disk init marker to clear
   bool unclean_start_ = false;
   // Outstanding asynchronous leases. The opaque id remains entirely internal:
   // ReadLease destruction routes it back through ReleaseReadLeaseThunk.

@@ -8,12 +8,14 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
 
 #ifdef DFKV_WITH_URING
 #include <liburing.h>
 #endif
 
 #include <cerrno>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -107,6 +109,38 @@ class DiskSlabTest : public ::testing::Test {
     o.extent_bytes = extent;
     o.slot_granularity = gran;
     return o;
+  }
+
+  // Fork confines RLIMIT_NOFILE to the failed first startup; the parent
+  // retries exactly the on-disk layout the child left behind.
+  std::string InterruptedFirstStartup() {
+    int fds[2];
+    if (::pipe(fds) != 0) return {};
+    const auto options = Opts(96 * 4096, 4096, 4096);
+    const pid_t child = ::fork();
+    if (child == 0) {
+      ::close(fds[0]);
+      struct rlimit limit {};
+      if (::getrlimit(RLIMIT_NOFILE, &limit) != 0) ::_exit(2);
+      limit.rlim_cur = std::min<rlim_t>(limit.rlim_cur, 48);
+      if (::setrlimit(RLIMIT_NOFILE, &limit) != 0) ::_exit(3);
+      bool ok = true;
+      DiskSlabStore store(options, &ok);
+      const std::string error = store.StartupError();
+      const ssize_t written = ::write(fds[1], error.data(), error.size());
+      ::_exit(!ok && written == static_cast<ssize_t>(error.size()) ? 0 : 4);
+    }
+    ::close(fds[1]);
+    std::string error;
+    char buf[256];
+    ssize_t n;
+    while ((n = ::read(fds[0], buf, sizeof(buf))) > 0) error.append(buf, n);
+    ::close(fds[0]);
+    int status = 0;
+    if (child < 0 || ::waitpid(child, &status, 0) != child ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+      return {};
+    return error;
   }
   fs::path dir_;
 };
@@ -449,6 +483,162 @@ TEST_F(DiskSlabTest, LayoutMismatchRefusesAndPreservesExistingData) {
   std::string out;
   ASSERT_EQ(reopened.Range(K(5), 0, 0, &out), Status::kOk);
   EXPECT_EQ(out, value);
+}
+
+TEST_F(DiskSlabTest, InterruptedFreshInitResumesAfterFdLimitRaised) {
+  struct rlimit limit {};
+  ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &limit), 0);
+  if (limit.rlim_cur < 40) GTEST_SKIP() << "requires at least 40 descriptors";
+  const std::string error = InterruptedFirstStartup();
+  ASSERT_NE(error.find("extent"), std::string::npos) << error;
+  ASSERT_NE(error.find("errno 24"), std::string::npos) << error;
+  ASSERT_NE(error.find("LimitNOFILE"), std::string::npos) << error;
+  ASSERT_TRUE(fs::exists(dir_ / "slab_initializing"));
+  ASSERT_FALSE(fs::exists(dir_ / "slab_state"));
+  struct stat before {};
+  ASSERT_EQ(::stat((dir_ / "extents/E00000").c_str(), &before), 0);
+
+  const auto options = Opts(96 * 4096, 4096, 4096);
+  bool ok = false;
+  {
+    DiskSlabStore resumed(options, &ok);
+    ASSERT_TRUE(ok) << resumed.StartupError();
+    EXPECT_FALSE(fs::exists(dir_ / "slab_initializing"));
+    struct stat after {};
+    ASSERT_EQ(::stat((dir_ / "extents/E00000").c_str(), &after), 0);
+    EXPECT_EQ(before.st_ino, after.st_ino);
+    ASSERT_TRUE(fs::exists(dir_ / "extents/E00095"));
+    ASSERT_EQ(resumed.Cache(K(600), "warm", 4), Status::kOk);
+  }
+  DiskSlabStore warm(options, &ok);
+  ASSERT_TRUE(ok) << warm.StartupError();
+  std::string out;
+  ASSERT_EQ(warm.Range(K(600), 0, 0, &out), Status::kOk);
+  EXPECT_EQ(out, "warm");
+}
+
+TEST_F(DiskSlabTest, InterruptedBeforeMetaCreationResumesOnlyWithMarker) {
+  struct rlimit limit {};
+  ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &limit), 0);
+  if (limit.rlim_cur < 40) GTEST_SKIP() << "requires at least 40 descriptors";
+  ASSERT_NE(InterruptedFirstStartup().find("errno 24"), std::string::npos);
+  // Metadata is created after the zero table. An interruption at this earlier
+  // stage can leave those files but no slab_meta.
+  ASSERT_TRUE(fs::remove(dir_ / "slab_meta"));
+  const auto options = Opts(96 * 4096, 4096, 4096);
+  bool ok = false;
+  DiskSlabStore resumed(options, &ok);
+  ASSERT_TRUE(ok) << resumed.StartupError();
+  EXPECT_TRUE(fs::exists(dir_ / "slab_meta"));
+  EXPECT_FALSE(fs::exists(dir_ / "slab_initializing"));
+}
+
+TEST_F(DiskSlabTest, InterruptedInitWithDataOrTruncatedTableFailsClosed) {
+  struct rlimit limit {};
+  ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &limit), 0);
+  if (limit.rlim_cur < 40) GTEST_SKIP() << "requires at least 40 descriptors";
+  ASSERT_NE(InterruptedFirstStartup().find("errno 24"), std::string::npos);
+  const auto options = Opts(96 * 4096, 4096, 4096);
+  const fs::path extent = dir_ / "extents/E00000";
+  int fd = ::open(extent.c_str(), O_RDWR);
+  ASSERT_GE(fd, 0);
+  const char payload = 'p';
+  ASSERT_EQ(::pwrite(fd, &payload, 1, 123), 1);
+  ::close(fd);
+  const fs::path table = dir_ / "slots.tbl";
+  fd = ::open(table.c_str(), O_RDWR);
+  ASSERT_GE(fd, 0);
+  const char record = 'R';
+  ASSERT_EQ(::pwrite(fd, &record, 1, 0), 1);
+  ::close(fd);
+  bool ok = true;
+  {
+    DiskSlabStore refused(options, &ok);
+    EXPECT_FALSE(ok);
+    EXPECT_NE(refused.StartupError().find("contains data"), std::string::npos);
+  }
+  EXPECT_FALSE(fs::exists(dir_ / "slab_state"));
+  fd = ::open(extent.c_str(), O_RDONLY);
+  ASSERT_GE(fd, 0);
+  char persisted = 0;
+  ASSERT_EQ(::pread(fd, &persisted, 1, 123), 1);
+  ::close(fd);
+  EXPECT_EQ(persisted, payload);
+  fd = ::open(table.c_str(), O_RDONLY);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::pread(fd, &persisted, 1, 0), 1);
+  ::close(fd);
+  EXPECT_EQ(persisted, record);
+  ASSERT_EQ(::truncate(table.c_str(), 1), 0);
+  DiskSlabStore truncated(options, &ok);
+  EXPECT_FALSE(ok);
+  EXPECT_NE(truncated.StartupError().find("size/type"), std::string::npos);
+  EXPECT_EQ(fs::file_size(table), 1u);
+}
+
+TEST_F(DiskSlabTest, UnmarkedOrUnexpectedPartialLayoutIsNeverRecreated) {
+  struct rlimit limit {};
+  ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &limit), 0);
+  if (limit.rlim_cur < 40) GTEST_SKIP() << "requires at least 40 descriptors";
+  ASSERT_NE(InterruptedFirstStartup().find("errno 24"), std::string::npos);
+  const auto options = Opts(96 * 4096, 4096, 4096);
+  const fs::path first_extent = dir_ / "extents/E00000";
+  struct stat before {};
+  ASSERT_EQ(::stat(first_extent.c_str(), &before), 0);
+  {
+    const fs::path unexpected = dir_ / "unknown.data";
+    int fd = ::open(unexpected.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::write(fd, "keep", 4), 4);
+    ::close(fd);
+    bool ok = true;
+    DiskSlabStore refused(options, &ok);
+    EXPECT_FALSE(ok);
+    EXPECT_NE(refused.StartupError().find("unexpected file"), std::string::npos);
+    EXPECT_EQ(fs::file_size(unexpected), 4u);
+    ASSERT_TRUE(fs::remove(unexpected));  // This test's own injected file.
+  }
+  ASSERT_TRUE(fs::remove(dir_ / "slab_initializing"));  // Simulate older partial.
+  bool ok = true;
+  DiskSlabStore refused(options, &ok);
+  EXPECT_FALSE(ok);
+  EXPECT_NE(refused.StartupError().find("errno 2"), std::string::npos)
+      << refused.StartupError();
+  EXPECT_FALSE(fs::exists(dir_ / "slab_state"));
+  struct stat after {};
+  ASSERT_EQ(::stat(first_extent.c_str(), &after), 0);
+  EXPECT_EQ(before.st_ino, after.st_ino);
+  EXPECT_EQ(fs::file_size(dir_ / "slots.tbl"), 96u * 64u);
+}
+
+TEST_F(DiskSlabTest, PopulatedStoreIgnoresStaleInitMarkerWithoutLosingData) {
+  struct rlimit limit {};
+  ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &limit), 0);
+  if (limit.rlim_cur < 40) GTEST_SKIP() << "requires at least 40 descriptors";
+  ASSERT_NE(InterruptedFirstStartup().find("errno 24"), std::string::npos);
+  const fs::path marker = dir_ / "slab_initializing";
+  std::string marker_bytes(64, '\0');
+  int fd = ::open(marker.c_str(), O_RDONLY);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::read(fd, marker_bytes.data(), marker_bytes.size()), 64);
+  ::close(fd);
+  const auto options = Opts(96 * 4096, 4096, 4096);
+  bool ok = false;
+  {
+    DiskSlabStore store(options, &ok);
+    ASSERT_TRUE(ok) << store.StartupError();
+    ASSERT_EQ(store.Cache(K(700), "keep", 4), Status::kOk);
+  }
+  fd = ::open(marker.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::write(fd, marker_bytes.data(), marker_bytes.size()), 64);
+  ::close(fd);
+  DiskSlabStore store(options, &ok);
+  ASSERT_TRUE(ok) << store.StartupError();
+  EXPECT_FALSE(fs::exists(marker));
+  std::string out;
+  ASSERT_EQ(store.Range(K(700), 0, 0, &out), Status::kOk);
+  EXPECT_EQ(out, "keep");
 }
 
 TEST_F(DiskSlabTest, InvalidGeometryIsRejectedBeforeCreatingFiles) {
