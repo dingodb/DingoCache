@@ -554,9 +554,10 @@ rdma::RecvSegmentPool::Lease RdmaServer::AllocateReceiveWithPressure(
       bytes, rdma::kV2DataOffset, rail, numa_node);
   if (lease || wait_us == 0) return lease;
 
-  // The hard budget is full. An idle QP can be reclaimed immediately, even
-  // if its last successful CQE was recent; active requests, queued disk reads
-  // and outstanding one-sided READ grants are excluded by reclaimable.
+  // A pooled peer may post its next (possibly non-replay-safe PUT) operation
+  // immediately after receiving a reply, before we poll its new CQE. Preserve
+  // a one-second pressure-only idle grace, the interval that passed the
+  // short-process hardware run, in addition to the in-flight ownership gate.
   const uint64_t started = SteadyUs();
   for (int round = 0; round < 32 && !lease; ++round) {
     if (SteadyUs() - started >= wait_us) break;
@@ -567,12 +568,14 @@ rdma::RecvSegmentPool::Lease RdmaServer::AllocateReceiveWithPressure(
       uint64_t oldest_active = std::numeric_limits<uint64_t>::max();
       uint64_t sufficient_active = oldest_active;
       const uint64_t now = SteadyUs();
+      constexpr uint64_t kPressureIdleGraceUs = 1000000;
       for (const auto& [ep, live] : live_eps_) {
         if (!live.reclaimable->load(std::memory_order_acquire)) continue;
         const uint64_t active =
             ep->last_active_us_.load(std::memory_order_relaxed);
         // A newly inserted endpoint has not stamped its activity yet.
-        if (active == 0 || active > now) continue;
+        if (active == 0 || active > now ||
+            now - active < kPressureIdleGraceUs) continue;
         if (active < oldest_active) {
           oldest = ep;
           oldest_active = active;
