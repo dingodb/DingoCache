@@ -2169,6 +2169,125 @@ struct PinnedPullPeer {
   }
 };
 
+// Pool pressure may reclaim *idle* QPs, but a client may hold a one-sided READ
+// grant long after the server's reply SEND CQE. CQ age alone would revoke that
+// in-flight data source. Exercise real short-lived QPs and the hard receive
+// budget without fabricating a completion.
+void ExercisePressurePreservesInFlightPull(bool use_uring) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+#ifndef DFKV_WITH_URING
+  if (use_uring) GTEST_SKIP() << "io_uring not compiled";
+#endif
+  ScopedEnv uring("DFKV_SERVER_URING", use_uring ? "1" : "0");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "1");
+  ScopedEnv idle("DFKV_RDMA_IDLE_MS", "5000");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const std::string value(4096, 'p');
+  const size_t budget =
+      2 * rdma::V2SlotSize(kMaxMsg) + rdma::V2SlotSize(value.size());
+  const std::string budget_text = std::to_string(budget);
+  ScopedEnv segment("DFKV_RDMA_RECV_SEGMENT_SIZE", budget_text.c_str());
+  RdmaNode node(use_uring ? "busy-pressure-uring" : "busy-pressure-sync",
+                kMaxMsg, false, use_uring);
+  ASSERT_EQ(node.rsrv->UseUringPath(), use_uring);
+  const BlockKey key{90177, 1};
+  std::string ignored;
+  ASSERT_EQ(node.srv->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
+                value.data(), value.size(), &ignored), Status::kOk);
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool granted = false;
+  bool resume = false;
+  {
+    PinnedPullPeer busy;
+    ASSERT_TRUE(busy.Open(node));
+    bool prepared = false, read_ok = false, released = false;
+    std::string bytes;
+    std::thread reader([&] {
+      rdma::DynamicPullReady ready;
+      prepared = busy.Prepare(key, 0, value.size(), &ready);
+      {
+        std::unique_lock<std::mutex> lock(mu);
+        granted = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return resume; });
+      }
+      if (prepared) {
+        read_ok = busy.Read(ready, &bytes);
+        released = busy.Release(key, ready);
+      }
+    });
+    struct UnblockReader {
+      std::mutex& mu;
+      std::condition_variable& cv;
+      bool& resume;
+      std::thread& reader;
+      ~UnblockReader() {
+        {
+          std::lock_guard<std::mutex> lock(mu);
+          resume = true;
+        }
+        cv.notify_all();
+        if (reader.joinable()) reader.join();
+      }
+    } unblock{mu, cv, resume, reader};
+    {
+      std::unique_lock<std::mutex> lock(mu);
+      ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5),
+                              [&] { return granted; }));
+    }
+    ASSERT_TRUE(prepared);
+    if (use_uring && CounterVal(node.rsrv->MetricsText(),
+                                "dfkv_uring_init_fallbacks_total") != 0)
+      GTEST_SKIP() << "io_uring unavailable at runtime";
+    std::this_thread::sleep_for(std::chrono::milliseconds(2100));
+    {
+      PinnedPullPeer recent;
+      ASSERT_TRUE(recent.Open(node));
+      PinnedPullPeer excess;
+      EXPECT_FALSE(excess.Open(node))
+          << "a full hard budget must refuse rather than abort an in-flight read";
+      EXPECT_GT(CounterVal(node.rsrv->MetricsText(),
+                           "dfkv_rdma_recv_segment_allocation_failures_total"), 0);
+      EXPECT_EQ(CounterVal(node.rsrv->MetricsText(),
+                           "dfkv_rdma_segment_evictions_total"), 0);
+    }
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      resume = true;
+    }
+    cv.notify_all();
+    reader.join();
+    // The guard also handles early ASSERT/SKIP exits; a joined thread is inert.
+    EXPECT_TRUE(prepared);
+    EXPECT_TRUE(read_ok);
+    EXPECT_TRUE(released);
+    EXPECT_EQ(bytes, value);
+    EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
+  }
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  long used = -1;
+  while (std::chrono::steady_clock::now() < deadline) {
+    used = CounterVal(node.rsrv->MetricsText(),
+                      "dfkv_rdma_recv_segment_used_bytes");
+    if (node.rsrv->ActiveConns() == 0 && used == 0) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_EQ(node.rsrv->ActiveConns(), 0u);
+  EXPECT_EQ(used, 0);
+}
+
+TEST(RdmaLoopback, PressurePreservesInFlightPullSync) {
+  ExercisePressurePreservesInFlightPull(false);
+}
+
+TEST(RdmaLoopback, PressurePreservesInFlightPullUring) {
+  ExercisePressurePreservesInFlightPull(true);
+}
+
 static void ExerciseControlReceiveBeforeSendFence(bool use_uring) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
 #ifndef DFKV_WITH_URING
