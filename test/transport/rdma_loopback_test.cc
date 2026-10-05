@@ -2095,7 +2095,8 @@ std::string PatternValue(size_t size, size_t seed);
 // automatic release, so removal, eviction and teardown are deterministic.
 struct PinnedPullPeer {
   rdma::RcEndpoint ep;
-  bool Open(const RdmaNode& node, size_t depth = 1) {
+  template <typename Node>
+  bool Open(const Node& node, size_t depth = 1) {
     const auto& dev = node.rsrv->DeviceNames().front();
     if (!ep.Open(dev.c_str(), rdma::kV2ControlCap, depth)) return false;
     int fd = net::Dial(node.addr, 10000, 10000);
@@ -4706,6 +4707,104 @@ struct RdmaUringNode {
     return found == range_calls.end() ? 0 : found->second;
   }
 };
+
+#ifdef DFKV_WITH_URING
+TEST(RdmaLoopback, PressurePreservesSubmittedUringRead) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "1");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "1");
+  ScopedEnv idle("DFKV_RDMA_IDLE_MS", "5000");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const std::string budget =
+      std::to_string(2 * rdma::V2SlotSize(kMaxMsg));
+  ScopedEnv segment("DFKV_RDMA_RECV_SEGMENT_SIZE", budget.c_str());
+  RdmaUringNode node("pressure-uring-read", kMaxMsg,
+                     [](ControlledRdmaUringBackend*) {});
+  const BlockKey key{90178, 1};
+  const std::string value(4096, 'q');
+  std::string ignored;
+  ASSERT_EQ(node.srv->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
+                value.data(), value.size(), &ignored), Status::kOk);
+  {
+    PinnedPullPeer busy;
+    ASSERT_TRUE(busy.Open(node));
+    std::string output(value.size(), '\0');
+    ibv_mr* mr = busy.ep.RegisterTransient(output.data(), output.size(), true);
+    ASSERT_NE(mr, nullptr);
+    std::vector<RdmaWriteTarget> targets{{
+        reinterpret_cast<uint64_t>(output.data()), mr->rkey,
+        static_cast<uint32_t>(output.size())}};
+    size_t request_bytes = 0;
+    ASSERT_TRUE(EncodeRdmaGetReq(busy.ep.sbuf(0), busy.ep.cap(),
+                                 key, 0, value.size(), targets,
+                                 &request_bytes));
+    ASSERT_TRUE(busy.ep.PostRecv(0));
+    ASSERT_TRUE(busy.ep.PostSend(0, request_bytes));
+    ControlledRdmaUringBackend* backend =
+        node.WaitForBackendWithSubmitted(1);
+    ASSERT_NE(backend, nullptr) << "GET must be owned by the async disk queue";
+    const auto requests = backend->History();
+    ASSERT_EQ(requests.size(), 1u);
+    struct CompleteOnExit {
+      ControlledRdmaUringBackend* backend;
+      UringReader::Token token;
+      bool done = false;
+      ~CompleteOnExit() {
+        if (!done) backend->CompleteRead(token);
+      }
+    } completion{backend, requests[0].token};
+    std::this_thread::sleep_for(std::chrono::milliseconds(2100));
+    {
+      PinnedPullPeer recent;
+      ASSERT_TRUE(recent.Open(node));
+      PinnedPullPeer excess;
+      EXPECT_FALSE(excess.Open(node))
+          << "queued disk data must not be revoked to admit a third QP";
+      const std::string metrics = node.rsrv->MetricsText();
+      EXPECT_GT(CounterVal(
+                    metrics, "dfkv_rdma_recv_segment_allocation_failures_total"),
+                0);
+      EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_segment_evictions_total"), 0);
+      EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
+    }
+    ASSERT_TRUE(backend->CompleteRead(completion.token));
+    completion.done = true;
+    bool sent = false, received = false;
+    while (!sent || !received) {
+      ibv_wc wc{};
+      ASSERT_EQ(busy.ep.WaitComp(&wc, 1, 5000), 1);
+      ASSERT_EQ(wc.status, IBV_WC_SUCCESS);
+      if (wc.opcode == IBV_WC_SEND) {
+        sent = true;
+      } else {
+        ASSERT_EQ(wc.opcode, IBV_WC_RECV);
+        Status status = Status::kIOError;
+        uint64_t bytes = 0;
+        ASSERT_TRUE(DecodeRespVersion(busy.ep.rbuf(0), kNativeProtoRdmaV2,
+                                      &status, &bytes));
+        EXPECT_EQ(status, Status::kOk);
+        EXPECT_EQ(bytes, value.size());
+        received = true;
+      }
+    }
+    EXPECT_EQ(output, value);
+    busy.ep.ReleaseTransient(mr);
+    EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
+  }
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  long used = -1;
+  while (std::chrono::steady_clock::now() < deadline) {
+    used = CounterVal(node.rsrv->MetricsText(),
+                      "dfkv_rdma_recv_segment_used_bytes");
+    if (node.rsrv->ActiveConns() == 0 && used == 0) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_EQ(node.rsrv->ActiveConns(), 0u);
+  EXPECT_EQ(used, 0);
+}
+#endif
 
 struct MultiWindowGet {
   explicit MultiWindowGet(size_t targets_per_window, size_t window_count,
