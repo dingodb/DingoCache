@@ -15,6 +15,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <system_error>
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <vector>
@@ -32,6 +33,7 @@ namespace {
 constexpr uint32_t kRecMagic = 0x334C5453u;  // "STL3"
 constexpr uint32_t kMetaMagic = 0x424C534Du;  // "SLBM"
 constexpr uint32_t kFormatVersion = 3;
+constexpr uint32_t kInitMagic = 0x49424C53u;  // "SLBI", init-in-progress
 constexpr uint32_t kStateMagic = 0x53424C53u;  // "SLBS"
 constexpr uint32_t kStateClean = 1;
 constexpr uint32_t kStateDirty = 2;
@@ -59,7 +61,7 @@ bool PwriteAll(int fd, const void* buf, size_t n, uint64_t off) {
   while (done < n) {
     ssize_t w = ::pwrite(fd, p + done, n - done, static_cast<off_t>(off + done));
     if (w < 0) { if (errno == EINTR) continue; return false; }
-    if (w == 0) return false;
+    if (w == 0) { errno = EIO; return false; }
     done += static_cast<size_t>(w);
   }
   return true;
@@ -71,7 +73,7 @@ bool PreadAll(int fd, void* buf, size_t n, uint64_t off) {
   while (done < n) {
     ssize_t r = ::pread(fd, p + done, n - done, static_cast<off_t>(off + done));
     if (r < 0) { if (errno == EINTR) continue; return false; }
-    if (r == 0) return false;  // short/EOF
+    if (r == 0) { errno = EIO; return false; }  // short/EOF
     done += static_cast<size_t>(r);
   }
   return true;
@@ -214,6 +216,7 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   if (ok_ && unclean_start_) ok_ = ResetUncleanEpoch();
   if (ok_) ok_ = Rebuild();
   if (ok_) ok_ = MarkDirtyEpoch();
+  if (ok_) ok_ = ClearInitMarker();
   if (Healthy() && opt_.table_sync_ms > 0) {
     sync_thread_ = std::thread([this] {
       NameThisThread("slab-sync");
@@ -293,6 +296,32 @@ bool DiskSlabStore::SetStartupError(std::string error) {
   return false;
 }
 
+bool DiskSlabStore::SetStartupErrno(std::string error, int saved_errno) {
+  error += ": " + std::error_code(saved_errno, std::generic_category()).message() +
+           " (errno " + std::to_string(saved_errno) + ")";
+  if (saved_errno == EMFILE)
+    error += "; raise the process soft RLIMIT_NOFILE (systemd LimitNOFILE) "
+             "above the resident extent descriptor count";
+  return SetStartupError(std::move(error));
+}
+
+bool DiskSlabStore::ClearInitMarker() {
+  if (!initializing_) return true;
+  const fs::path marker = fs::path(opt_.dir) / "slab_initializing";
+  if (::unlink(marker.c_str()) != 0)
+    return SetStartupErrno("cannot remove slab initialization marker", errno);
+  int dfd = ::open(opt_.dir.c_str(), O_RDONLY | O_DIRECTORY);
+  if (dfd < 0) return SetStartupErrno("cannot open cache directory for sync", errno);
+  const int rc = ::fsync(dfd);
+  const int saved_errno = errno;
+  ::close(dfd);
+  if (rc != 0)
+    return SetStartupErrno("cannot sync cache directory after initialization",
+                           saved_errno);
+  initializing_ = false;
+  return true;
+}
+
 bool DiskSlabStore::ValidateOptions() {
   if (opt_.dir.empty()) return SetStartupError("cache directory is empty");
   if (opt_.capacity_bytes == 0)
@@ -333,80 +362,226 @@ bool DiskSlabStore::OpenOrInit() {
   const fs::path root(opt_.dir);
   const fs::path extents_dir = root / "extents";
   fs::create_directories(root, ec);
-  if (ec || !fs::is_directory(root, ec))
-    return SetStartupError("cannot create or access cache directory");
+  if (ec) return SetStartupError("cannot create cache directory: " + ec.message());
+  ec.clear();
+  if (!fs::is_directory(root, ec) || ec)
+    return SetStartupError("cannot access cache directory: " + ec.message());
 
   const std::string meta_path = (root / "slab_meta").string();
   const std::string tbl_path = (root / "slots.tbl").string();
+  const std::string marker_path = (root / "slab_initializing").string();
   const uint64_t tbl_bytes =
       static_cast<uint64_t>(num_extents_) * max_slots_per_extent_ * kRecBytes;
-  uint8_t meta[64] = {0};
-  bool fresh = false;
+  uint8_t expected_meta[64] = {0};
+  net::PutU32(reinterpret_cast<char*>(expected_meta), kMetaMagic);
+  net::PutU32(reinterpret_cast<char*>(expected_meta) + 4, kFormatVersion);
+  net::PutU64(reinterpret_cast<char*>(expected_meta) + 8, opt_.extent_bytes);
+  net::PutU64(reinterpret_cast<char*>(expected_meta) + 16, opt_.slot_granularity);
+  net::PutU32(reinterpret_cast<char*>(expected_meta) + 24, num_extents_);
+  uint8_t marker_record[64];
+  std::memcpy(marker_record, expected_meta, sizeof(marker_record));
+  net::PutU32(reinterpret_cast<char*>(marker_record), kInitMagic);
 
-  int mfd = ::open(meta_path.c_str(), O_RDONLY);
-  if (mfd >= 0) {
+  int marker_fd = ::open(marker_path.c_str(), O_RDONLY | O_NOFOLLOW);
+  if (marker_fd >= 0) {
+    uint8_t persisted[64];
     struct stat st {};
-    const bool read_ok =
-        ::fstat(mfd, &st) == 0 && st.st_size == static_cast<off_t>(sizeof(meta)) &&
-        PreadAll(mfd, meta, sizeof(meta), 0);
-    ::close(mfd);
+    if (::fstat(marker_fd, &st) != 0) {
+      const int saved_errno = errno;
+      ::close(marker_fd);
+      return SetStartupErrno("cannot inspect slab initialization marker", saved_errno);
+    }
+    if (!S_ISREG(st.st_mode) ||
+        st.st_size != static_cast<off_t>(sizeof(persisted))) {
+      ::close(marker_fd);
+      return SetStartupError("slab initialization marker size/type invalid");
+    }
+    const bool read_ok = PreadAll(marker_fd, persisted, sizeof(persisted), 0);
+    const int read_errno = errno;
+    ::close(marker_fd);
     if (!read_ok)
-      return SetStartupError("slab_meta is truncated or unreadable");
-    if (net::GetU32(reinterpret_cast<char*>(meta)) != kMetaMagic)
-      return SetStartupError("slab_meta magic mismatch");
-    const uint32_t ver = net::GetU32(reinterpret_cast<char*>(meta) + 4);
-    const uint64_t eb = net::GetU64(reinterpret_cast<char*>(meta) + 8);
-    const uint64_t sg = net::GetU64(reinterpret_cast<char*>(meta) + 16);
-    const uint32_t ne = net::GetU32(reinterpret_cast<char*>(meta) + 24);
-    if (ver != kFormatVersion || eb != opt_.extent_bytes ||
-        sg != opt_.slot_granularity || ne != num_extents_)
-      return SetStartupError(
-          "existing slab layout differs from requested geometry");
-    ec.clear();
-    if (!fs::is_directory(extents_dir, ec) || ec)
-      return SetStartupError("extents directory is missing or unreadable");
-  } else {
-    if (errno != ENOENT)
-      return SetStartupError("cannot open slab_meta");
-    fresh = true;
-    ec.clear();
-    fs::directory_iterator root_it(root, ec);
-    if (ec) return SetStartupError("cannot inspect cache directory");
-    if (root_it != fs::directory_iterator())
-      return SetStartupError(
-          "cache directory contains a different or incomplete store layout");
-    fs::create_directories(extents_dir, ec);
-    if (ec || !fs::is_directory(extents_dir, ec))
-      return SetStartupError("cannot create extents directory");
+      return SetStartupErrno("cannot read slab initialization marker", read_errno);
+    if (std::memcmp(persisted, marker_record, sizeof(persisted)) != 0)
+      return SetStartupError("slab initialization marker geometry mismatch");
+    initializing_ = true;
+  } else if (errno != ENOENT) {
+    return SetStartupErrno("cannot open slab initialization marker", errno);
   }
 
-  if (fresh) {
-    net::PutU32(reinterpret_cast<char*>(meta), kMetaMagic);
-    net::PutU32(reinterpret_cast<char*>(meta) + 4, kFormatVersion);
-    net::PutU64(reinterpret_cast<char*>(meta) + 8, opt_.extent_bytes);
-    net::PutU64(reinterpret_cast<char*>(meta) + 16, opt_.slot_granularity);
-    net::PutU32(reinterpret_cast<char*>(meta) + 24, num_extents_);
-    int wfd =
-        ::open(meta_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
-    if (wfd < 0) return SetStartupError("cannot create slab_meta");
-    const bool meta_ok = PwriteAll(wfd, meta, sizeof(meta), 0) &&
-                         ::fdatasync(wfd) == 0;
-    ::close(wfd);
-    if (!meta_ok) return SetStartupError("cannot persist slab_meta");
+  // Only a marker created before any layout file can distinguish an interrupted
+  // first initialization from a pre-epoch populated store whose state is missing.
+  // A marker never survives into request serving; slab_state is persisted first.
+  int state_check = ::open((root / "slab_state").c_str(), O_RDONLY | O_NOFOLLOW);
+  const bool state_exists = state_check >= 0;
+  if (state_exists) ::close(state_check);
+  else if (errno != ENOENT)
+    return SetStartupErrno("cannot inspect slab_state", errno);
+  const bool resume = initializing_ && !state_exists;
+  if (resume) {
+    if (fs::symlink_status(root, ec).type() != fs::file_type::directory || ec)
+      return SetStartupError("cannot safely resume through cache directory symlink");
+    ec.clear();
+    for (fs::directory_iterator it(root, ec), end; !ec && it != end;
+         it.increment(ec)) {
+      const auto name = it->path().filename().string();
+      if (name != "slab_initializing" && name != "slab_meta" &&
+          name != "slots.tbl" && name != "extents")
+        return SetStartupError("cannot resume incomplete slab: unexpected file " + name);
+    }
+    if (ec) return SetStartupError("cannot inspect cache directory: " + ec.message());
+    ec.clear();
+    const auto type = fs::symlink_status(extents_dir, ec).type();
+    if (type != fs::file_type::not_found && type != fs::file_type::directory)
+      return SetStartupError("cannot resume incomplete slab: extents is not a directory");
+    if (ec && ec != std::errc::no_such_file_or_directory)
+      return SetStartupError("cannot inspect extents directory: " + ec.message());
+    ec.clear();
+    if (type == fs::file_type::directory) {
+      for (fs::directory_iterator it(extents_dir, ec), end; !ec && it != end;
+           it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        if (name.size() != 6 || name[0] != 'E' ||
+            name.find_first_not_of("0123456789", 1) != std::string::npos)
+          return SetStartupError("cannot resume incomplete slab: unexpected extent " +
+                                 name);
+        const unsigned index = static_cast<unsigned>(std::stoul(name.substr(1)));
+        char canonical[32];
+        std::snprintf(canonical, sizeof(canonical), "E%05u", index);
+        if (index >= num_extents_ || name != canonical)
+          return SetStartupError("cannot resume incomplete slab: unexpected extent " +
+                                 name);
+        struct stat st {};
+        if (::lstat(it->path().c_str(), &st) != 0)
+          return SetStartupErrno("cannot inspect extent " + name, errno);
+        if (!S_ISREG(st.st_mode) ||
+            st.st_size != static_cast<off_t>(opt_.extent_bytes))
+          return SetStartupError("cannot resume incomplete slab: extent size/type "
+                                 "differs from geometry: " + name);
+      }
+      if (ec) return SetStartupError("cannot inspect extents: " + ec.message());
+    }
+  }
 
-    table_fd_ =
-        ::open(tbl_path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);
-    if (table_fd_ < 0 ||
-        ::ftruncate(table_fd_, static_cast<off_t>(tbl_bytes)) != 0 ||
-        ::fdatasync(table_fd_) != 0)
-      return SetStartupError("cannot create or size slots.tbl");
-  } else {
-    table_fd_ = ::open(tbl_path.c_str(), O_RDWR);
-    if (table_fd_ < 0) return SetStartupError("cannot open slots.tbl");
+  uint8_t meta[64];
+  bool fresh = false;
+  int mfd = ::open(meta_path.c_str(), O_RDONLY | (resume ? O_NOFOLLOW : 0));
+  if (mfd >= 0) {
     struct stat st {};
-    if (::fstat(table_fd_, &st) != 0 ||
-        st.st_size != static_cast<off_t>(tbl_bytes))
+    if (::fstat(mfd, &st) != 0) {
+      const int saved_errno = errno;
+      ::close(mfd);
+      return SetStartupErrno("cannot inspect slab_meta", saved_errno);
+    }
+    if (!S_ISREG(st.st_mode) ||
+        st.st_size != static_cast<off_t>(sizeof(meta))) {
+      ::close(mfd);
+      return SetStartupError("slab_meta size/type invalid (truncated or unknown)");
+    }
+    const bool read_ok = PreadAll(mfd, meta, sizeof(meta), 0);
+    const int read_errno = errno;
+    ::close(mfd);
+    if (!read_ok) return SetStartupErrno("cannot read slab_meta", read_errno);
+    if (net::GetU32(reinterpret_cast<char*>(meta)) != kMetaMagic)
+      return SetStartupError("slab_meta magic mismatch");
+    if (std::memcmp(meta, expected_meta, 28) != 0)
+      return SetStartupError("existing slab layout differs from requested geometry");
+    if (!resume) {
+      ec.clear();
+      if (!fs::is_directory(extents_dir, ec) || ec)
+        return SetStartupError("extents directory is missing or unreadable: " +
+                               ec.message());
+    }
+  } else {
+    const int saved_errno = errno;
+    if (saved_errno != ENOENT)
+      return SetStartupErrno("cannot open slab_meta", saved_errno);
+    if (state_exists)
+      return SetStartupError("slab_meta missing from an existing store; no automatic "
+                             "reinitialization");
+    fresh = true;
+    if (!initializing_) {
+      fs::directory_iterator root_it(root, ec);
+      if (ec) return SetStartupError("cannot inspect cache directory: " + ec.message());
+      if (root_it != fs::directory_iterator())
+        return SetStartupError(
+            "cache directory contains a different or incomplete store layout; "
+            "inspect the files, do not delete existing data automatically");
+      int fd = ::open(marker_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
+                      0644);
+      if (fd < 0)
+        return SetStartupErrno("cannot create slab initialization marker", errno);
+      const bool wrote = PwriteAll(fd, marker_record, sizeof(marker_record), 0) &&
+                         ::fdatasync(fd) == 0;
+      const int write_errno = errno;
+      ::close(fd);
+      if (!wrote)
+        return SetStartupErrno("cannot persist slab initialization marker", write_errno);
+      initializing_ = true;
+      int dfd = ::open(root.c_str(), O_RDONLY | O_DIRECTORY);
+      if (dfd < 0) return SetStartupErrno("cannot open cache directory for sync", errno);
+      const int rc = ::fsync(dfd);
+      const int sync_errno = errno;
+      ::close(dfd);
+      if (rc != 0)
+        return SetStartupErrno("cannot sync slab initialization marker", sync_errno);
+    }
+  }
+
+  if (resume) {
+    // No request can run before slab_state exists. A nonzero table proves this
+    // is not a pristine initialization, even if a marker happens to be present.
+    table_fd_ = ::open(tbl_path.c_str(), O_RDWR | O_NOFOLLOW);
+    if (table_fd_ < 0 && errno != ENOENT)
+      return SetStartupErrno("cannot open incomplete slots.tbl", errno);
+    if (table_fd_ >= 0) {
+      struct stat st {};
+      if (::fstat(table_fd_, &st) != 0)
+        return SetStartupErrno("cannot inspect incomplete slots.tbl", errno);
+      if (!S_ISREG(st.st_mode) || st.st_size != static_cast<off_t>(tbl_bytes))
+        return SetStartupError("cannot resume incomplete slab: slots.tbl size/type "
+                               "differs from geometry");
+      char chunk[4096];
+      for (uint64_t off = 0; off < tbl_bytes; off += sizeof(chunk)) {
+        const size_t n = std::min<uint64_t>(sizeof(chunk), tbl_bytes - off);
+        if (!PreadAll(table_fd_, chunk, n, off))
+          return SetStartupErrno("cannot read incomplete slots.tbl", errno);
+        if (std::any_of(chunk, chunk + n, [](char c) { return c != 0; }))
+          return SetStartupError("cannot resume incomplete slab: slots.tbl contains "
+                                 "data; preserve the existing store");
+      }
+    }
+  }
+  if (table_fd_ < 0 && initializing_ && !state_exists) {
+    table_fd_ = ::open(tbl_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW,
+                       0644);
+    if (table_fd_ < 0) return SetStartupErrno("cannot create slots.tbl", errno);
+    if (::ftruncate(table_fd_, static_cast<off_t>(tbl_bytes)) != 0)
+      return SetStartupErrno("cannot size slots.tbl", errno);
+    if (::fdatasync(table_fd_) != 0)
+      return SetStartupErrno("cannot persist slots.tbl", errno);
+  } else if (table_fd_ < 0) {
+    table_fd_ = ::open(tbl_path.c_str(), O_RDWR);
+    if (table_fd_ < 0) return SetStartupErrno("cannot open slots.tbl", errno);
+    struct stat st {};
+    if (::fstat(table_fd_, &st) != 0)
+      return SetStartupErrno("cannot inspect slots.tbl", errno);
+    if (st.st_size != static_cast<off_t>(tbl_bytes))
       return SetStartupError("slots.tbl size differs from slab geometry");
+  }
+  if (fresh) {
+    int wfd = ::open(meta_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
+                     0644);
+    if (wfd < 0) return SetStartupErrno("cannot create slab_meta", errno);
+    const bool meta_ok = PwriteAll(wfd, expected_meta, sizeof(expected_meta), 0) &&
+                         ::fdatasync(wfd) == 0;
+    const int saved_errno = errno;
+    ::close(wfd);
+    if (!meta_ok) return SetStartupErrno("cannot persist slab_meta", saved_errno);
+  }
+  if (initializing_ && !state_exists) {
+    ec.clear();
+    fs::create_directories(extents_dir, ec);
+    if (ec) return SetStartupError("cannot create extents directory: " + ec.message());
   }
 
   // Open every extent file once and keep its descriptor resident.
@@ -416,19 +591,29 @@ bool DiskSlabStore::OpenOrInit() {
     char name[32];
     std::snprintf(name, sizeof(name), "E%05u", e);
     const std::string ep = (extents_dir / name).string();
-    const int flags = O_RDWR | (fresh ? (O_CREAT | O_EXCL) : 0);
-    int fd = ::open(ep.c_str(), flags, 0644);
-    if (fd < 0) return SetStartupError("cannot open extent " + ep);
-    struct stat st {};
-    bool sized = ::fstat(fd, &st) == 0;
-    if (fresh) {
-      sized = sized &&
-              ::ftruncate(fd, static_cast<off_t>(opt_.extent_bytes)) == 0;
-    } else {
-      sized = sized &&
-              st.st_size == static_cast<off_t>(opt_.extent_bytes);
+    int fd = ::open(ep.c_str(), O_RDWR | (resume ? O_NOFOLLOW : 0));
+    bool created = false;
+    if (fd < 0 && (fresh || resume) && errno == ENOENT) {
+      fd = ::open(ep.c_str(), O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
+      created = fd >= 0;
     }
-    if (!sized) {
+    if (fd < 0) return SetStartupErrno("cannot open extent " + ep, errno);
+    struct stat st {};
+    if (::fstat(fd, &st) != 0) {
+      const int saved_errno = errno;
+      ::close(fd);
+      return SetStartupErrno("cannot inspect extent " + ep, saved_errno);
+    }
+    if (!S_ISREG(st.st_mode)) {
+      ::close(fd);
+      return SetStartupError("extent is not a regular file: " + ep);
+    }
+    if (created && ::ftruncate(fd, static_cast<off_t>(opt_.extent_bytes)) != 0) {
+      const int saved_errno = errno;
+      ::close(fd);
+      return SetStartupErrno("cannot size extent " + ep, saved_errno);
+    }
+    if (!created && st.st_size != static_cast<off_t>(opt_.extent_bytes)) {
       ::close(fd);
       return SetStartupError("extent size differs from slab geometry: " + ep);
     }
@@ -439,8 +624,9 @@ bool DiskSlabStore::OpenOrInit() {
     if (opt_.direct_writes && !extent_dio_fds_.empty() &&
         ::fallocate(fd, 0, 0, static_cast<off_t>(opt_.extent_bytes)) != 0 &&
         errno != EOPNOTSUPP && errno != ENOSYS && errno != EINVAL) {
+      const int saved_errno = errno;
       ::close(fd);
-      return SetStartupError("cannot materialize extent " + ep);
+      return SetStartupErrno("cannot materialize extent " + ep, saved_errno);
     }
     extent_fds_[e] = fd;
     if (opt_.direct_writes && !extent_dio_fds_.empty()) {
@@ -450,6 +636,11 @@ bool DiskSlabStore::OpenOrInit() {
       // the resolved mode through DirectWritesActive().
       int dfd = ::open(ep.c_str(), O_RDWR | O_DIRECT);
       if (dfd < 0) {
+        const int saved_errno = errno;
+        if (saved_errno != EINVAL && saved_errno != EOPNOTSUPP &&
+            saved_errno != ENOSYS)
+          return SetStartupErrno("cannot open direct extent " + ep,
+                                 saved_errno);
         for (int direct_fd : extent_dio_fds_)
           if (direct_fd >= 0) ::close(direct_fd);
         extent_dio_fds_.clear();
@@ -458,7 +649,7 @@ bool DiskSlabStore::OpenOrInit() {
       }
     }
   }
-  return OpenEpochState(fresh);
+  return OpenEpochState(fresh || resume);
 }
 
 bool DiskSlabStore::WriteEpochState(uint32_t state, uint64_t epoch) {
@@ -476,9 +667,12 @@ bool DiskSlabStore::WriteEpochState(uint32_t state, uint64_t epoch) {
 bool DiskSlabStore::OpenEpochState(bool fresh) {
   const std::string path = (fs::path(opt_.dir) / "slab_state").string();
   if (fresh) {
-    state_fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);
-    if (state_fd_ < 0 || !WriteEpochState(kStateClean, 0))
-      return SetStartupError("cannot create clean slab_state");
+    state_fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW,
+                       0644);
+    if (state_fd_ < 0)
+      return SetStartupErrno("cannot create clean slab_state", errno);
+    if (!WriteEpochState(kStateClean, 0))
+      return SetStartupErrno("cannot persist clean slab_state", errno);
     run_epoch_ = 0;
     return true;
   }
@@ -488,20 +682,24 @@ bool DiskSlabStore::OpenEpochState(bool fresh) {
     // Safe migration from the pre-epoch format: assume the prior process died
     // uncleanly, persist that fact first, then cold-reset slots.tbl.
     state_fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);
+    if (state_fd_ < 0)
+      return SetStartupErrno("cannot create migration slab_state", errno);
     run_epoch_ = 1;
     unclean_start_ = true;
-    if (state_fd_ < 0 || !WriteEpochState(kStateDirty, run_epoch_))
-      return SetStartupError("cannot create migration slab_state");
+    if (!WriteEpochState(kStateDirty, run_epoch_))
+      return SetStartupErrno("cannot persist migration slab_state", errno);
     return true;
   }
-  if (state_fd_ < 0) return SetStartupError("cannot open slab_state");
+  if (state_fd_ < 0) return SetStartupErrno("cannot open slab_state", errno);
 
   struct stat st {};
   uint8_t record[64] = {0};
-  if (::fstat(state_fd_, &st) != 0 ||
-      st.st_size != static_cast<off_t>(sizeof(record)) ||
-      !PreadAll(state_fd_, record, sizeof(record), 0))
-    return SetStartupError("slab_state is truncated or unreadable");
+  if (::fstat(state_fd_, &st) != 0)
+    return SetStartupErrno("cannot inspect slab_state", errno);
+  if (st.st_size != static_cast<off_t>(sizeof(record)))
+    return SetStartupError("slab_state is truncated or has unexpected size");
+  if (!PreadAll(state_fd_, record, sizeof(record), 0))
+    return SetStartupErrno("cannot read slab_state", errno);
   if (net::GetU32(reinterpret_cast<char*>(record)) != kStateMagic ||
       net::GetU32(reinterpret_cast<char*>(record) + 4) != kFormatVersion ||
       net::GetU32(reinterpret_cast<char*>(record) + 60) != Crc32(record, 60))
@@ -525,13 +723,16 @@ bool DiskSlabStore::ResetUncleanEpoch() {
     const size_t n =
         static_cast<size_t>(std::min<uint64_t>(chunk_bytes, bytes - offset));
     if (!PwriteAll(table_fd_, zeros.data(), n, offset)) {
+      const int saved_errno = errno;
       FailMetadata();
-      return SetStartupError("cannot reset slots.tbl after unclean shutdown");
+      return SetStartupErrno("cannot reset slots.tbl after unclean shutdown",
+                             saved_errno);
     }
   }
   if (::fdatasync(table_fd_) != 0) {
+    const int saved_errno = errno;
     FailMetadata();
-    return SetStartupError("cannot persist unclean slots.tbl reset");
+    return SetStartupErrno("cannot persist unclean slots.tbl reset", saved_errno);
   }
   unclean_resets_.fetch_add(1, std::memory_order_relaxed);
   return true;
@@ -542,8 +743,9 @@ bool DiskSlabStore::MarkDirtyEpoch() {
     return SetStartupError("slab_state epoch exhausted");
   ++run_epoch_;
   if (WriteEpochState(kStateDirty, run_epoch_)) return true;
+  const int saved_errno = errno;
   FailMetadata();
-  return SetStartupError("cannot persist dirty slab_state");
+  return SetStartupErrno("cannot persist dirty slab_state", saved_errno);
 }
 
 bool DiskSlabStore::MarkCleanEpoch() {
