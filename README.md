@@ -20,7 +20,7 @@ DingoCache's **dfkv** is a standalone distributed KV cache for LLM inference. Ca
 ## Architecture at a glance
 
 ```mermaid
-flowchart LR
+flowchart TB
     S["SGLang HiCache"] --> A["dfkv HiCache plugin"]
     L["LMCache"] --> B["dfkv remote / L2 adapter"]
     V["vLLM"] --> C["dfkv direct connector"]
