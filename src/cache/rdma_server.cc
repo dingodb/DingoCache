@@ -306,12 +306,21 @@ Status RdmaServer::Start(int port) {
   recv_segment_chunk_bytes_ = RecvChunkBytes(recv_segment_max_bytes_);
   recv_chunk_idle_ms_ = RecvChunkIdleMs();
   const size_t min_slot_bytes = rdma::V2SlotSize(max_msg_);
+  // Keep one existing chunk exclusively for operation-sized dynamic GET/PUT
+  // staging when the remaining hard budget still fits two max-sized QPs.
+  // Tiny constrained configurations retain the original shared-pool geometry.
+  const size_t staging_reserve_bytes =
+      recv_segment_chunk_bytes_ < recv_segment_max_bytes_ &&
+              min_slot_bytes <=
+                  (recv_segment_max_bytes_ - recv_segment_chunk_bytes_) / 2
+          ? recv_segment_chunk_bytes_
+          : 0;
   if (min_slot_bytes == 0 ||
       recv_segment_max_bytes_ < 2 * min_slot_bytes ||
       recv_segment_chunk_bytes_ == 0 ||
       !recv_segments_.Init(recv_segment_chunk_bytes_,
                            recv_segment_max_bytes_,
-                           rdma::kV2DataOffset)) {
+                           rdma::kV2DataOffset, staging_reserve_bytes)) {
     LogTopologySummary(requested_devices.size(), 0, discovery.devices);
     DFKV_LOG_ERROR(
         "rdma: invalid receive-pool geometry max=" +
@@ -549,9 +558,10 @@ bool RdmaServer::UseUringPath() const {
 }
 
 rdma::RecvSegmentPool::Lease RdmaServer::AllocateReceiveWithPressure(
-    size_t bytes, int rail, int numa_node, uint64_t wait_us) {
+    size_t bytes, int rail, int numa_node, uint64_t wait_us,
+    rdma::RecvSegmentPool::LeaseClass lease_class) {
   auto lease = recv_segments_.Allocate(
-      bytes, rdma::kV2DataOffset, rail, numa_node);
+      bytes, rdma::kV2DataOffset, rail, numa_node, lease_class);
   if (lease || wait_us == 0) return lease;
 
   // A pooled peer may post its next (possibly non-replay-safe PUT) operation
@@ -598,7 +608,7 @@ rdma::RecvSegmentPool::Lease RdmaServer::AllocateReceiveWithPressure(
       if (SteadyUs() - started >= wait_us) break;
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
       lease = recv_segments_.Allocate(
-          bytes, rdma::kV2DataOffset, rail, numa_node);
+          bytes, rdma::kV2DataOffset, rail, numa_node, lease_class);
     }
   }
   return lease;
@@ -729,6 +739,8 @@ void RdmaServer::Serve(int boot_fd) {
         "rdma v2: receive pool exhausted; refusing connection (need=" +
         std::to_string(K * slot_size) +
         " free=" + std::to_string(stats.free_bytes) +
+        " connection_free=" +
+        std::to_string(stats.connection_free_bytes) +
         " committed=" + std::to_string(stats.committed_bytes) +
         " max=" + std::to_string(stats.max_bytes) + ")");
     ::close(boot_fd);
@@ -746,6 +758,8 @@ void RdmaServer::Serve(int boot_fd) {
           "rdma v2: pull-read arena unavailable; refusing negotiated "
           "connection (need=" + std::to_string(K * slot_size) +
           " free=" + std::to_string(stats.free_bytes) +
+          " connection_free=" +
+          std::to_string(stats.connection_free_bytes) +
           " committed=" + std::to_string(stats.committed_bytes) +
           " max=" + std::to_string(stats.max_bytes) + ")");
       ::close(boot_fd);
@@ -1500,7 +1514,7 @@ void RdmaServer::Serve(int boot_fd) {
         // deadline; a stalled active grant must still fail as kCacheFull.
         state.lease = AllocateReceiveWithPressure(
             target_capacity, static_cast<int>(rail_index), rail_numa,
-            1000000);
+            1000000, rdma::RecvSegmentPool::LeaseClass::kStaging);
         if (!state.lease) {
           encode_status(Status::kCacheFull, 0);
           reply->first_len = response_prefix;
@@ -1576,7 +1590,8 @@ void RdmaServer::Serve(int boot_fd) {
       if (region == 0) return false;
       LeasePutState& state = lease_put[slot];
       state.lease = AllocateReceiveWithPressure(
-          region, static_cast<int>(rail_index), rail_numa, 1000000);
+          region, static_cast<int>(rail_index), rail_numa, 1000000,
+          rdma::RecvSegmentPool::LeaseClass::kStaging);
       if (!state.lease) {
         lease_put_busy_rejects_.fetch_add(1, std::memory_order_relaxed);
         encode_status(Status::kCacheFull, 0);
@@ -2502,10 +2517,23 @@ std::string RdmaServer::MetricsText() const {
   m(s, "dfkv_rdma_recv_segment_used_bytes", "gauge",
     "Bytes leased from committed receive chunks", segment.used_bytes);
   m(s, "dfkv_rdma_recv_segment_free_bytes", "gauge",
-    "Unleased bytes in committed receive chunks", segment.free_bytes);
+    "Unleased bytes in committed receive chunks (including staging reserve)",
+    segment.free_bytes);
   m(s, "dfkv_rdma_recv_segment_largest_free_range_bytes", "gauge",
     "Largest contiguous unleased range in any receive chunk",
     segment.largest_free_range);
+  m(s, "dfkv_rdma_recv_segment_connection_free_bytes", "gauge",
+    "Unleased receive bytes available to connections (excludes staging reserve)",
+    segment.connection_free_bytes);
+  m(s, "dfkv_rdma_recv_segment_connection_largest_free_range_bytes", "gauge",
+    "Largest contiguous unleased connection range",
+    segment.connection_largest_free_range);
+  m(s, "dfkv_rdma_recv_segment_staging_reserved_bytes", "gauge",
+    "Receive-pool bytes dedicated to in-flight GET/PUT staging",
+    segment.staging_reserved_bytes);
+  m(s, "dfkv_rdma_recv_segment_staging_reserved_free_bytes", "gauge",
+    "Unleased bytes in the staging-only receive chunk",
+    segment.staging_reserved_free_bytes);
   m(s, "dfkv_rdma_recv_segment_growths_total", "counter",
     "Receive chunks committed after startup", segment.growths);
   m(s, "dfkv_rdma_recv_segment_shrinks_total", "counter",
