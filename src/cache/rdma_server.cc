@@ -1855,7 +1855,8 @@ void RdmaServer::Serve(int boot_fd) {
   size_t pending_recv_head = 0;
   size_t pending_recv_count = 0;
   auto dispatch_completions = [&](const ibv_wc* batch, int count,
-                                  auto&& process_wc) -> bool {
+                                  auto&& process_wc,
+                                  auto&& has_async_work) -> bool {
     if (count != 0)
       reclaimable.store(false, std::memory_order_release);
     for (int i = 0; i < count; ++i) {
@@ -1876,7 +1877,8 @@ void RdmaServer::Serve(int boot_fd) {
       pending_recv_head = (pending_recv_head + 1) % K;
       --pending_recv_count;
     }
-    if (count != 0 && pending_recv_count == 0 && free_send.size() == K) {
+    if (count != 0 && pending_recv_count == 0 && free_send.size() == K &&
+        !has_async_work()) {
       const bool holding_data =
           std::any_of(pull_slots.begin(), pull_slots.end(),
                       [](const auto& state) { return state.busy; }) ||
@@ -2262,7 +2264,15 @@ void RdmaServer::Serve(int boot_fd) {
       if (g > 0) {
         ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
         progressed = true;
-        if (!dispatch_completions(wcs.data(), g, process_wc)) fail = true;
+        if (!dispatch_completions(
+                wcs.data(), g, process_wc,
+                [&] {
+                  // A queued descriptor or unretired SEND still owns data
+                  // even if all receive slots appear free.
+                  return !queue.empty() || ring.inflight() != 0 ||
+                         posted_sends != 0;
+                }))
+          fail = true;
       }
       if (fail) break;
 
@@ -2328,7 +2338,13 @@ void RdmaServer::Serve(int boot_fd) {
       }
       if (g < 0) break;  // disconnect, endpoint error, or Stop()'s Wake
       ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
-      if (!dispatch_completions(wcs.data(), g, process_wc)) fail = true;
+      if (!dispatch_completions(
+              wcs.data(), g, process_wc,
+              [&] {
+                return !queue.empty() || ring.inflight() != 0 ||
+                       posted_sends != 0;
+              }))
+        fail = true;
     }
 
     // No synchronous retry is allowed after successful ring initialization:
@@ -2413,7 +2429,9 @@ sync_serve_loop:;
       break;
     }
     if (g < 0) break;  // error / Stop()'s Wake()
-    if (!dispatch_completions(wcs.data(), g, process_sync_wc)) fail = true;
+    if (!dispatch_completions(wcs.data(), g, process_sync_wc,
+                              [] { return false; }))
+      fail = true;
   }
   // Any prepared sends without completions destructor-abort below.
   rail_stats.active_conns.fetch_sub(1, std::memory_order_relaxed);
