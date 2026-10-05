@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -440,11 +441,16 @@ bool DiskSlabStore::OpenOrInit() {
       for (fs::directory_iterator it(extents_dir, ec), end; !ec && it != end;
            it.increment(ec)) {
         const std::string name = it->path().filename().string();
-        if (name.size() != 6 || name[0] != 'E' ||
-            name.find_first_not_of("0123456789", 1) != std::string::npos)
+        if (name.size() < 6 || name.size() > 11 || name[0] != 'E')
           return SetStartupError("cannot resume incomplete slab: unexpected extent " +
                                  name);
-        const unsigned index = static_cast<unsigned>(std::stoul(name.substr(1)));
+        uint32_t index = 0;
+        const auto [parse_end, parse_error] =
+            std::from_chars(name.data() + 1, name.data() + name.size(), index);
+        if (parse_error != std::errc{} ||
+            parse_end != name.data() + name.size())
+          return SetStartupError("cannot resume incomplete slab: unexpected extent " +
+                                 name);
         char canonical[32];
         std::snprintf(canonical, sizeof(canonical), "E%05u", index);
         if (index >= num_extents_ || name != canonical)
