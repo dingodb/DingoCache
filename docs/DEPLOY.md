@@ -253,6 +253,13 @@ WantedBy=multi-user.target
 
 > **存储/加速开关（见 [ARCHITECTURE.md](ARCHITECTURE.md) §5–7）。解析顺序为 flag > 环境变量 > `slab`；运行时真值经 `dfkvctl ring` INFO 列（`engine=`/`wr=`/`ram=`）和 `dfkv_build_info{engine,write_mode}` 审计。**
 > - `--store-engine slab|file`：不设置 flag/env 时所有 store/server 路径默认 `slab`。slab = extent 池 + sparse `slots.tbl` + dirty/clean epoch。**早期格式→v3 tenant-scoped slab 必须使用空缓存目录**；容量、格式或几何不符会拒绝启动而不会改写原数据，也绝不会静默改用 file。`file` 的 48 字符 tenant+object 文件名同样不读取旧 cache，仅作显式诊断/回滚。
+> - **slab 首次初始化中断**：新版从空目录建仓前落盘 `slab_initializing`。
+>   仅当该标记与请求几何一致、`slab_state` 尚不存在、`slots.tbl` 全零且
+>   每个已存在的 extent 形状正确时，重启才补建缺失文件；原文件不截断。
+>   已有业务数据、未知文件、无标记的半成品以及几何不符都拒绝自动恢复。
+>   启动错误包含失败系统调用的 `errno`；遇到 `EMFILE` 先核进程的软
+>   `RLIMIT_NOFILE`（systemd 为 `LimitNOFILE`），再复核同一 store。
+>   不得仅凭“像空仓”删除旧目录，也不得用提高 FD 上限掩盖非 FD 错误。
 > - `--slab-write direct|buffered`（默认 `direct`）：slab 数据面使用 O_DIRECT；文件系统不支持时整店回退 bounded buffered，以 `wr=` 上报真值。
 > - `--ram-tier on`（默认关）：arena 内对象走 RDMA 零拷贝。`--ram-write-mode writeback|writearound`（默认 `writeback`）选择 PUT 先入 RAM 后落盘，或直接盘写、读时晋升。`writeback` 默认在数据进入可读且 flush-pinned 的 RAM slot 后返回 `kOk`。达到正的 `DFKV_RAM_ACK_HIGH_WATERMARK_PCT`（默认 80）时，只拒绝尚无 owner 的新 key，返回 `kCacheFull`，不转为直接盘写。已有同 key 请求仍加入首写者的完成结果；水位设为 0 保留强制 disk-ACK 语义。需要所有 PUT 都等待持久化时设置 `DFKV_PUT_ACK_MODE=disk`。`--ram-tier-bytes` 限定总预算；超 extent 对象仍受 dedicated allocation 预算约束。显式启用 RAM 后，分配或 NUMA 模式失败会拒绝启动。
 > - `--ram-tier-numa interleave|off`（默认 `interleave`）：这是当前完整 mode 集；不接受数字 node ID。arena 预触并绑策略，须核 `MemoryMax`。

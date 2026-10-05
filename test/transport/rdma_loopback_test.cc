@@ -2364,7 +2364,7 @@ void ExercisePressureRecyclesRecentIdle(bool use_uring) {
     PinnedPullPeer admitted;
     ASSERT_TRUE(admitted.Open(node))
         << "pressure must reclaim a quiescent QP without waiting two seconds";
-    EXPECT_TRUE(exists(admitted));
+    EXPECT_TRUE(PinnedExists(admitted, key));
     const std::string metrics = node.rsrv->MetricsText();
     EXPECT_GE(CounterVal(metrics, "dfkv_rdma_segment_evictions_total"), 1);
     EXPECT_GT(CounterVal(
@@ -2422,10 +2422,10 @@ void ExercisePullStagingReclaimsIdleQp(bool use_uring) {
         std::chrono::steady_clock::now() + std::chrono::seconds(5);
     do {
       quiescent = RdmaServerTestPeer::RefreshQuiescentActivity(*node.rsrv, 1500);
-      if (quiescent == 2) break;
+      if (quiescent == 1) break;  // reader has not completed its first request.
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     } while (std::chrono::steady_clock::now() < ready_deadline);
-    ASSERT_EQ(quiescent, 2u);
+    ASSERT_EQ(quiescent, 1u);
     if (use_uring && CounterVal(node.rsrv->MetricsText(),
                                 "dfkv_uring_init_fallbacks_total") != 0)
       GTEST_SKIP() << "io_uring unavailable at runtime";
