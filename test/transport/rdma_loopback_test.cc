@@ -42,6 +42,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -82,13 +83,15 @@ class RdmaServerTestPeer {
   static size_t RegisteredRailCount(const RdmaServer& server) {
     return server.recv_segment_registered_rails_;
   }
-  static uint64_t RegisterWriter(RdmaServer* server) {
-    auto writer = std::make_shared<RdmaServer::WriterState>();
-    return server->RegisterWriter(writer);
+  static uint64_t RegisterLegacyConnection(RdmaServer* server) {
+    return server->RegisterLegacyConnection();
   }
-  static bool HasWriter(RdmaServer* server, uint64_t token) {
-    std::lock_guard<std::mutex> lock(server->writer_mu_);
-    return server->writers_.find(token) != server->writers_.end();
+  static bool HasLegacyConnection(RdmaServer* server, uint64_t token) {
+    std::lock_guard<std::mutex> lock(server->legacy_mu_);
+    return server->legacy_connections_tokens_.count(token) != 0;
+  }
+  static void ForgetLegacyConnection(RdmaServer* server, uint64_t token) {
+    server->ForgetLegacyConnection(token);
   }
   static void ServeBootstrap(RdmaServer* server, int fd) {
     server->Serve(fd);
@@ -317,14 +320,14 @@ void ConfigureTestRecvSegment() {
   ::setenv("DFKV_RDMA_RECV_SEGMENT_SIZE", "33554432", 0);
 }
 
-struct ChildWriterTokenResult {
+struct ChildLegacyTokenResult {
   uint64_t token = 0;
   int status = -1;
   bool transferred = false;
   bool stale_token_found = false;
 };
 
-ChildWriterTokenResult WriterTokenFromFreshProcess(uint64_t stale_token = 0) {
+ChildLegacyTokenResult LegacyTokenFromFreshProcess(uint64_t stale_token = 0) {
   int pipe_fds[2];
   if (::pipe(pipe_fds) != 0) return {};
   const pid_t child = ::fork();
@@ -336,11 +339,11 @@ ChildWriterTokenResult WriterTokenFromFreshProcess(uint64_t stale_token = 0) {
   if (child == 0) {
     ::close(pipe_fds[0]);
     RdmaServer server(RdmaServer::Handler{}, kMaxMsg);
-    const uint64_t token = RdmaServerTestPeer::RegisterWriter(&server);
+    const uint64_t token = RdmaServerTestPeer::RegisterLegacyConnection(&server);
     std::array<char, sizeof(token) + 1> wire{};
     net::PutU64(wire.data(), token);
     wire[sizeof(token)] = static_cast<char>(
-        RdmaServerTestPeer::HasWriter(&server, stale_token));
+        RdmaServerTestPeer::HasLegacyConnection(&server, stale_token));
     size_t written = 0;
     while (written < wire.size()) {
       const ssize_t n =
@@ -356,7 +359,7 @@ ChildWriterTokenResult WriterTokenFromFreshProcess(uint64_t stale_token = 0) {
   }
 
   ::close(pipe_fds[1]);
-  ChildWriterTokenResult result;
+  ChildLegacyTokenResult result;
   std::array<char, sizeof(result.token) + 1> wire{};
   size_t received = 0;
   while (received < wire.size()) {
@@ -380,6 +383,21 @@ ChildWriterTokenResult WriterTokenFromFreshProcess(uint64_t stale_token = 0) {
       received == wire.size() && waited == child &&
       WIFEXITED(result.status) && WEXITSTATUS(result.status) == 0;
   return result;
+}
+
+bool RequestLegacyProof(RdmaServer* server, uint64_t token) {
+  int sockets[2];
+  if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) return false;
+  std::thread serving(
+      [&] { RdmaServerTestPeer::ServeBootstrap(server, sockets[1]); });
+  char request[rdma::kDevNameBytes], proof[rdma::kV2RetireProofBytes];
+  rdma::EncodeDevFrame(rdma::kV2RetireWriterDevice, token, request);
+  const bool proved = net::WriteAll(sockets[0], request, sizeof(request)) &&
+      net::ReadAll(sockets[0], proof, sizeof(proof)) &&
+      rdma::ParseV2RetireProof(proof, token);
+  ::close(sockets[0]);
+  serving.join();
+  return proved;
 }
 
 // A cache node serving RDMA: KvNodeServer owns the DiskCacheGroup; RdmaServer
@@ -444,6 +462,12 @@ struct RdmaNode {
       rsrv->set_prepare_read_handler(
           [this](const BlockKey& key, uint64_t off, uint64_t len,
                  char* staging, size_t cap) {
+            size_t call = 0;
+            {
+              std::lock_guard<std::mutex> lock(observation_mu);
+              call = ++range_direct_calls[key.Filename()];
+            }
+            if (before_range) before_range(call);
             return srv->PrepareReadForKey(key, off, len, staging, cap);
           });
     }
@@ -774,31 +798,31 @@ class ScopedCudaContextRestore {
 
 }  // namespace
 
-TEST(RdmaWriterToken, LiveWritersHaveUniqueNonzeroTokens) {
+TEST(RdmaLegacyConnectionToken, LiveConnectionsHaveUniqueNonzeroTokens) {
   RdmaServer server(RdmaServer::Handler{}, kMaxMsg);
   std::unordered_set<uint64_t> tokens;
-  constexpr size_t kWriterCount = 1024;
-  for (size_t i = 0; i < kWriterCount; ++i) {
-    const uint64_t token = RdmaServerTestPeer::RegisterWriter(&server);
+  constexpr size_t kConnectionCount = 1024;
+  for (size_t i = 0; i < kConnectionCount; ++i) {
+    const uint64_t token = RdmaServerTestPeer::RegisterLegacyConnection(&server);
     EXPECT_NE(token, 0u);
     EXPECT_TRUE(tokens.insert(token).second);
   }
 }
 
-TEST(RdmaWriterToken, FreshProcessesDoNotReuseStaleTokens) {
-  const ChildWriterTokenResult old_process = WriterTokenFromFreshProcess();
+TEST(RdmaLegacyConnectionToken, FreshProcessesDoNotReuseStaleTokens) {
+  const ChildLegacyTokenResult old_process = LegacyTokenFromFreshProcess();
   ASSERT_TRUE(old_process.transferred) << "child status=" << old_process.status;
   ASSERT_NE(old_process.token, 0u);
 
-  const ChildWriterTokenResult new_process =
-      WriterTokenFromFreshProcess(old_process.token);
+  const ChildLegacyTokenResult new_process =
+      LegacyTokenFromFreshProcess(old_process.token);
   ASSERT_TRUE(new_process.transferred) << "child status=" << new_process.status;
   ASSERT_NE(new_process.token, 0u);
   EXPECT_FALSE(new_process.stale_token_found);
   EXPECT_NE(new_process.token, old_process.token);
 }
 
-TEST(RdmaBootstrapCapability, ServerAdvertisesWriterRetirementInProbe) {
+TEST(RdmaBootstrapCapability, ServerAdvertisesDynamicOnlyAndLegacyProofInProbe) {
   RdmaServer server(RdmaServer::Handler{}, kMaxMsg);
   int sockets[2];
   ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);
@@ -815,9 +839,35 @@ TEST(RdmaBootstrapCapability, ServerAdvertisesWriterRetirementInProbe) {
   serving.join();
   ASSERT_TRUE(read);
   EXPECT_TRUE(rdma::V2ProbeSupportsWriterRetirement(reply));
+  EXPECT_TRUE(rdma::V2ProbeSupportsDynamicOnly(reply));
 }
 
-TEST(RdmaBootstrapCapability, UnnegotiatedTokenGetsNoRetirementProof) {
+TEST(RdmaBootstrapCapability, KnownLiveLegacyConnectionGetsProof) {
+  RdmaServer server(RdmaServer::Handler{}, kMaxMsg);
+  const uint64_t token = RdmaServerTestPeer::RegisterLegacyConnection(&server);
+  ASSERT_NE(token, 0u);
+  ASSERT_TRUE(RequestLegacyProof(&server, token));
+  EXPECT_TRUE(RdmaServerTestPeer::HasLegacyConnection(&server, token));
+}
+
+TEST(RdmaBootstrapCapability, DuplicateLegacyProofDoesNotConsumeConnection) {
+  RdmaServer server(RdmaServer::Handler{}, kMaxMsg);
+  const uint64_t token = RdmaServerTestPeer::RegisterLegacyConnection(&server);
+  ASSERT_TRUE(RequestLegacyProof(&server, token));
+  ASSERT_TRUE(RequestLegacyProof(&server, token));
+  EXPECT_TRUE(RdmaServerTestPeer::HasLegacyConnection(&server, token));
+}
+
+TEST(RdmaBootstrapCapability, ClosedLegacyConnectionGetsNoProof) {
+  RdmaServer server(RdmaServer::Handler{}, kMaxMsg);
+  const uint64_t token = RdmaServerTestPeer::RegisterLegacyConnection(&server);
+  ASSERT_TRUE(RequestLegacyProof(&server, token));
+  RdmaServerTestPeer::ForgetLegacyConnection(&server, token);
+  EXPECT_FALSE(RdmaServerTestPeer::HasLegacyConnection(&server, token));
+  EXPECT_FALSE(RequestLegacyProof(&server, token));
+}
+
+TEST(RdmaBootstrapCapability, UnregisteredTokenGetsNoLegacyProof) {
   RdmaServer server(RdmaServer::Handler{}, kMaxMsg);
   int sockets[2];
   ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);
@@ -1871,7 +1921,6 @@ TEST(RdmaLoopback, BurstPoolDefaultCeilingReleasesResourcesImmediately) {
   ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
   ScopedEnv idle_reaper("DFKV_RDMA_IDLE_MS", "0");
   ScopedEnv credits("DFKV_RDMA_RAIL_CREDITS", "128");
-  ScopedEnv dynamic_pull("DFKV_RDMA_DYNAMIC_PULL", "1");
   RdmaNode node("pool-ceiling");
   ASSERT_FALSE(node.rsrv->DeviceNames().empty());
   RdmaTransport transport(kMaxMsg, node.rsrv->DeviceNames().front());
@@ -2112,16 +2161,22 @@ std::string PatternValue(size_t size, size_t seed);
 // Retain an exact READ capability independently of the production client's
 // automatic release, so removal, eviction and teardown are deterministic.
 struct PinnedPullPeer {
-  rdma::RcEndpoint ep;
+  std::optional<rdma::RcEndpoint> endpoint{std::in_place};
+  rdma::RcEndpoint& ep = *endpoint;
+  void Close() { endpoint.reset(); }
   template <typename Node>
-  bool Open(const Node& node, size_t depth = 1) {
+  bool Open(const Node& node, size_t depth = 1, bool legacy = false) {
     const auto& dev = node.rsrv->DeviceNames().front();
     if (!ep.Open(dev.c_str(), rdma::kV2ControlCap, depth)) return false;
     int fd = net::Dial(node.addr, 10000, 10000);
     if (fd < 0) return false;
     char frame[rdma::kDevNameBytes], mine[rdma::kQpInfoBytes],
         remote[rdma::kQpInfoBytes], ready[rdma::kV2RetirementReadinessBytes];
-    rdma::EncodeDevFrame(dev, kMaxMsg | rdma::kDevFrameRequestWriterRetirement |
+    const size_t readiness_bytes = legacy ? sizeof(ready) :
+        rdma::kV2DynamicOnlyReadinessBytes;
+    rdma::EncodeDevFrame(dev, kMaxMsg |
+        (legacy ? rdma::kDevFrameRequestWriterRetirement :
+                  rdma::kDevFrameRequestDynamicOnly) |
         rdma::kDevFrameRequestPullRead | rdma::kDevFrameRequestDynamicPull,
         frame, rdma::kDevProtoV2);
     auto info = ep.Local();
@@ -2129,16 +2184,20 @@ struct PinnedPullPeer {
     info.protocol_version = rdma::kDevProtoV2;
     rdma::SerializeQpInfo(info, mine);
     rdma::RecvSegmentInfo resident;
-    uint64_t token = 0;
+    legacy_token = 0;
     const bool ok = net::WriteAll(fd, frame, sizeof(frame)) &&
         net::WriteAll(fd, mine, sizeof(mine)) &&
         net::ReadAll(fd, remote, sizeof(remote)) &&
         ep.Connect(rdma::ParseQpInfo(remote)) &&
-        net::ReadAll(fd, ready, sizeof(ready)) &&
-        rdma::DecodeV2Readiness(ready, sizeof(ready), true, &resident, &token);
+        net::ReadAll(fd, ready, readiness_bytes) &&
+        (legacy ? rdma::DecodeV2Readiness(
+                      ready, readiness_bytes, &resident, &legacy_token) :
+                  rdma::DecodeV2DynamicOnlyReadiness(
+                      ready, readiness_bytes, &resident));
     ::close(fd);
     return ok;
   }
+  uint64_t legacy_token = 0;
   bool Exchange(size_t request_bytes, Status* status, uint64_t* bytes) {
     if (!ep.PostRecv(0) || !ep.PostSend(0, request_bytes)) return false;
     bool sent = false, received = false;
@@ -2170,6 +2229,7 @@ struct PinnedPullPeer {
   }
   bool Read(const rdma::DynamicPullReady& ready, std::string* out) {
     out->resize(ready.data_len);
+    if (out->empty()) return true;
     ibv_mr* mr = ep.RegisterTransient(out->data(), out->size(), true);
     if (!mr) return false;
     ibv_wc wc{};
@@ -2195,6 +2255,140 @@ bool PinnedExists(PinnedPullPeer& peer, const BlockKey& key) {
   uint64_t bytes = 0;
   return peer.Exchange(kReqPrefix, &status, &bytes) &&
          status == Status::kOk;
+}
+
+TEST(RdmaLoopback, LegacyDynamicHandshakeReadReleaseAndLiveProof) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "0");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  RdmaNode node("legacy-dynamic");
+  const BlockKey key = ToBlockKey(SelfHdr(), "legacy-dynamic");
+  const std::string value = PatternValue(8197, 37);
+  std::string ignored;
+  ASSERT_EQ(node.srv->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
+                value.data(), value.size(), &ignored), Status::kOk);
+  PinnedPullPeer peer;
+  ASSERT_TRUE(peer.Open(node, 1, true));
+  ASSERT_NE(peer.legacy_token, 0u);
+  const auto request_proof = [&] {
+    const int fd = net::Dial(node.addr, 5000, 5000);
+    if (fd < 0) return false;
+    char request[rdma::kDevNameBytes], proof[rdma::kV2RetireProofBytes];
+    rdma::EncodeDevFrame(
+        rdma::kV2RetireWriterDevice, peer.legacy_token, request);
+    const bool proved = net::WriteAll(fd, request, sizeof(request)) &&
+        net::ReadAll(fd, proof, sizeof(proof)) &&
+        rdma::ParseV2RetireProof(proof, peer.legacy_token);
+    ::close(fd);
+    return proved;
+  };
+  rdma::DynamicPullReady ready;
+  const uint64_t baseline = rdma::RcEndpoint::LeaseReadMrActive();
+  ASSERT_TRUE(peer.Prepare(key, 97, 4097, &ready));
+  EXPECT_EQ(ready.value_len, value.size());
+  EXPECT_EQ(rdma::RcEndpoint::LeaseReadMrActive(), baseline + 1);
+  ASSERT_TRUE(request_proof());
+  ASSERT_TRUE(request_proof());
+  // Compatibility proof must neither close the connection nor revoke its READ.
+  std::string output;
+  ASSERT_TRUE(peer.Read(ready, &output));
+  EXPECT_EQ(output, value.substr(97, 4097));
+  ASSERT_TRUE(peer.Release(key, ready));
+  EXPECT_EQ(rdma::RcEndpoint::LeaseReadMrActive(), baseline);
+  EXPECT_TRUE(PinnedExists(peer, key));
+  // Force an observable server-side close. Destroying a manually bootstrapped
+  // RC peer alone does not notify the remote polling loop.
+  EncodeReqVersion(peer.ep.sbuf(0), kNativeProtoRdmaV2, WireOp::kRange,
+                   key, 0, 0, 0);
+  ASSERT_TRUE(peer.ep.PostSend(0, kReqPrefix));
+  ibv_wc sent{};
+  ASSERT_EQ(peer.ep.WaitComp(&sent, 1, 5000), 1);
+  peer.Close();
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (RdmaServerTestPeer::HasLegacyConnection(
+             node.rsrv.get(), peer.legacy_token) &&
+         std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  ASSERT_FALSE(RdmaServerTestPeer::HasLegacyConnection(
+      node.rsrv.get(), peer.legacy_token));
+  EXPECT_FALSE(request_proof());
+}
+
+TEST(RdmaLoopback, HistoricalResponderWriteRangeIsRejectedBeforeDma) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "0");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  RdmaNode node("reject-old-range");
+  const BlockKey key = ToBlockKey(SelfHdr(), "reject-old-range");
+  const std::string value = PatternValue(4096, 19);
+  std::string ignored;
+  ASSERT_EQ(node.srv->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
+                value.data(), value.size(), &ignored), Status::kOk);
+  std::string output(value.size(), '\x5a');
+  PinnedPullPeer peer;
+  ASSERT_TRUE(peer.Open(node));
+  ibv_mr* mr = peer.ep.RegisterTransient(output.data(), output.size(), true);
+  ASSERT_NE(mr, nullptr);
+  // Historical v2 frame: 50-byte prefix, 40-byte window, one 16-byte target.
+  // Keep these bytes local: production must not retain the retired GET codec.
+  std::array<char, 50 + 40 + 16> request{};
+  EncodeReqVersion(request.data(), kNativeProtoRdmaV2, WireOp::kRange,
+                   key, 0, value.size(), 0);
+  net::PutU32(request.data() + 50, 1);
+  net::PutU32(request.data() + 54, 0x3357474du);
+  net::PutU32(request.data() + 66, 1);
+  net::PutU64(request.data() + 82, output.size());
+  net::PutU64(request.data() + 90,
+              reinterpret_cast<uint64_t>(output.data()));
+  net::PutU32(request.data() + 98, mr->rkey);
+  net::PutU32(request.data() + 102, output.size());
+  std::memcpy(peer.ep.sbuf(0), request.data(), request.size());
+  ASSERT_TRUE(peer.ep.PostRecv(0));
+  ASSERT_TRUE(peer.ep.PostSend(0, request.size()));
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (node.rsrv->ActiveConns() != 0 &&
+         std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  EXPECT_EQ(node.rsrv->ActiveConns(), 0u);
+  EXPECT_EQ(node.RangeDirectCalls(key), 0u);
+  EXPECT_EQ(output, std::string(value.size(), '\x5a'));
+  peer.Close();  // fence the historical destination before it is freed
+}
+
+TEST(RdmaLoopback, EmptyEofGrantStillOwnsExactMrUntilExplicitRelease) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "0");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  RdmaNode node("empty-eof-grant");
+  const BlockKey key = ToBlockKey(SelfHdr(), "empty-eof-grant");
+  const std::string value = PatternValue(20, 9);
+  std::string ignored;
+  ASSERT_EQ(node.srv->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
+                value.data(), value.size(), &ignored), Status::kOk);
+  PinnedPullPeer peer;
+  ASSERT_TRUE(peer.Open(node));
+  EXPECT_EQ(peer.legacy_token, 0u);
+  const uint64_t baseline = rdma::RcEndpoint::LeaseReadMrActive();
+  const uint64_t destination_mrs = rdma::RcEndpoint::TransientUserMrActive();
+  rdma::DynamicPullReady ready;
+  ASSERT_TRUE(peer.Prepare(key, value.size(), 0, &ready));
+  EXPECT_EQ(ready.data_len, 0u);
+  EXPECT_EQ(ready.value_len, value.size());
+  EXPECT_NE(ready.rkey, 0u);
+  EXPECT_NE(ready.slot_generation, 0u);
+  EXPECT_EQ(rdma::RcEndpoint::LeaseReadMrActive(), baseline + 1);
+  std::string output = "stale";
+  ASSERT_TRUE(peer.Read(ready, &output));
+  EXPECT_TRUE(output.empty());
+  EXPECT_EQ(rdma::RcEndpoint::TransientUserMrActive(), destination_mrs);
+  ASSERT_TRUE(peer.Release(key, ready));
+  EXPECT_EQ(rdma::RcEndpoint::LeaseReadMrActive(), baseline);
+  EXPECT_TRUE(PinnedExists(peer, key));
 }
 
 // Pool pressure may reclaim *idle* QPs, but a client may hold a one-sided READ
@@ -3144,125 +3338,6 @@ TEST(RdmaLoopback, RealFifoOrderWrapSync) {
   ExerciseFifoOrderAndWrap();
 }
 
-TEST(RdmaLoopback, RealReceiveBackedGetKeepsSourceUntilSendFence) {
-  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
-  ScopedEnv uring("DFKV_SERVER_URING", "0");
-  ScopedEnv depth("DFKV_RDMA_DEPTH", "2");
-  ScopedEnv ram("DFKV_RAM_TIER", "0");
-  HeldReplyCqe reorder;
-  std::mutex mu;
-  std::condition_variable cv;
-  std::array<size_t, 2> rearmed{};
-  RdmaNode node("fifo-source-sync", kMaxMsg, false, false, {},
-                [&](ibv_wc* batch, int* count, size_t capacity) {
-                  reorder.Filter(batch, count, capacity);
-                },
-                [&](size_t pending, size_t free, size_t head) {
-                  reorder.Observe(pending, free, head);
-                },
-                [&](size_t slot) {
-                  std::lock_guard<std::mutex> lock(mu);
-                  if (slot < rearmed.size()) ++rearmed[slot];
-                  cv.notify_all();
-                });
-  struct ReleaseOnExit {
-    HeldReplyCqe& state;
-    ~ReleaseOnExit() { state.Release(); }
-  } unblock{reorder};
-  ASSERT_FALSE(node.rsrv->UseUringPath());
-  const BlockKey data_key{9631, 0}, absent{9632, 0};
-  const std::string value = PatternValue(8192, 63);
-  std::string ignored;
-  ASSERT_EQ(node.srv->ProcessRequestForKey(
-                static_cast<uint8_t>(WireOp::kCache), data_key, 0, 0,
-                value.data(), value.size(), &ignored), Status::kOk);
-  PinnedPullPeer peer;
-  ASSERT_TRUE(peer.Open(node, 2));
-  {
-    std::unique_lock<std::mutex> lock(mu);
-    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5),
-                            [&] { return rearmed[0] == 1 &&
-                                           rearmed[1] == 1; }));
-  }
-  std::string output(value.size(), '\0');
-  ibv_mr* mr = peer.ep.RegisterTransient(output.data(), output.size(), true);
-  ASSERT_NE(mr, nullptr);
-  std::vector<RdmaWriteTarget> targets{{
-      reinterpret_cast<uint64_t>(output.data()), mr->rkey,
-      static_cast<uint32_t>(output.size())}};
-  size_t frame_length = 0;
-  ASSERT_TRUE(EncodeRdmaGetReq(peer.ep.sbuf(0), peer.ep.cap(), data_key, 0,
-                               value.size(), targets, &frame_length));
-  ASSERT_TRUE(peer.ep.PostRecv(0));
-  ASSERT_TRUE(peer.ep.PostSend(0, frame_length));
-  bool sent = false, received = false;
-  while (!sent || !received) {
-    ibv_wc wc{};
-    ASSERT_EQ(peer.ep.WaitComp(&wc, 1, 5000), 1);
-    ASSERT_EQ(wc.status, IBV_WC_SUCCESS);
-    if (wc.opcode == IBV_WC_SEND) {
-      sent = true;
-    } else {
-      ASSERT_EQ(wc.opcode, IBV_WC_RECV);
-      ASSERT_EQ(wc.wr_id, 0u);
-      Status status = Status::kIOError;
-      uint64_t bytes = 0;
-      ASSERT_TRUE(DecodeRespVersion(peer.ep.rbuf(0), kNativeProtoRdmaV2,
-                                    &status, &bytes));
-      EXPECT_EQ(status, Status::kOk);
-      EXPECT_EQ(bytes, value.size());
-      received = true;
-    }
-  }
-  EXPECT_EQ(output, value);
-  {
-    std::unique_lock<std::mutex> lock(reorder.mu);
-    ASSERT_TRUE(reorder.cv.wait_for(
-        lock, std::chrono::seconds(5),
-        [&] { return !reorder.held.empty() && reorder.depth == 2; }));
-  }
-  EncodeReqVersion(peer.ep.sbuf(1), kNativeProtoRdmaV2,
-                   WireOp::kExist, absent, 0, 0, 0);
-  ASSERT_TRUE(peer.ep.PostRecv(1));
-  ASSERT_TRUE(peer.ep.PostSend(1, kReqPrefix));
-  sent = false;
-  received = false;
-  while (!sent || !received) {
-    ibv_wc wc{};
-    ASSERT_EQ(peer.ep.WaitComp(&wc, 1, 5000), 1);
-    ASSERT_EQ(wc.status, IBV_WC_SUCCESS);
-    if (wc.opcode == IBV_WC_SEND) {
-      sent = true;
-    } else {
-      ASSERT_EQ(wc.opcode, IBV_WC_RECV);
-      ASSERT_EQ(wc.wr_id, 1u);
-      Status status = Status::kIOError;
-      uint64_t bytes = 0;
-      ASSERT_TRUE(DecodeRespVersion(peer.ep.rbuf(1), kNativeProtoRdmaV2,
-                                    &status, &bytes));
-      EXPECT_EQ(status, Status::kNotFound);
-      EXPECT_EQ(bytes, 0u);
-      received = true;
-    }
-  }
-  {
-    std::lock_guard<std::mutex> lock(mu);
-    EXPECT_EQ(rearmed[0], 1u)
-        << "Receive-backed GET must not repost its data source before fence";
-    EXPECT_EQ(rearmed[1], 2u);
-  }
-  EXPECT_EQ(output, value);
-  reorder.Release();
-  {
-    std::unique_lock<std::mutex> lock(mu);
-    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5),
-                            [&] { return rearmed[0] == 2; }));
-  }
-  peer.ep.ReleaseTransient(mr);
-  EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
-  std::cout << "FIFO_SOURCE_FENCE mode=sync depth=2 source_slot=0"
-               " rearmed_only_after_real_SEND_CQE bytes=8192" << '\n';
-}
 
 static void ExerciseQueuedReceiveConnectionClose(bool use_uring) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
@@ -3440,7 +3515,7 @@ TEST(RdmaLoopback, DynamicPullTeardownAbortsAccountingAndReleasesPin) {
   EXPECT_EQ(node.srv->m_cache_hit(), hits);
 }
 
-TEST(RdmaLoopback, DynamicPullArenaGrantRejectsReadPastRequestedRange) {
+TEST(RdmaLoopback, DynamicPullExactGrantRejectsReadPastRequestedRange) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   ScopedEnv ram_on("DFKV_RAM_TIER", "1");
   ScopedEnv ram_bytes("DFKV_RAM_TIER_BYTES", "268435456");
@@ -3466,7 +3541,7 @@ TEST(RdmaLoopback, DynamicPullArenaGrantRejectsReadPastRequestedRange) {
     ibv_wc wc{};
     ASSERT_EQ(peer.ep.WaitComp(&wc, 1, 10000), 1);
     EXPECT_NE(wc.status, IBV_WC_SUCCESS)
-        << "the grant exposed arena bytes beyond the requested range";
+        << "the grant exposed bytes beyond the requested range";
   }
   peer.ep.ReleaseTransient(mr);
   node.rsrv->Stop();
@@ -3883,7 +3958,7 @@ TEST(RdmaLoopback, V2CacheAcceptsReadOnlySourceMemory) {
   EXPECT_EQ(::munmap(mapping, 4096), 0);
 }
 
-TEST(RdmaLoopback, DirectSingleCacheRangeUsesV2Writes) {
+TEST(RdmaLoopback, DirectSingleCacheRangeUsesPutWriteAndGetRead) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   RdmaNode node("direct-v2");
   RdmaTransport transport(kMaxMsg);
@@ -3899,7 +3974,136 @@ TEST(RdmaLoopback, DirectSingleCacheRangeUsesV2Writes) {
             Status::kOk);
   EXPECT_EQ(output, stored);
   EXPECT_GE(node.rsrv->V2PutWrites(), 1u);
-  EXPECT_GE(node.rsrv->V2GetWrites(), 1u);
+  EXPECT_GE(CounterVal(transport.MetricsText(),
+                       "dfkv_rdma_client_pull_reads_total"), 1);
+}
+
+TEST(RdmaLoopback, RangeReadsNonalignedHeadTailAndBoundarySlices) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "0");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  RdmaNode node("range-slices");
+  RdmaTransport transport(kMaxMsg);
+  const BlockKey key = ToBlockKey(SelfHdr(), "range-slices");
+  const std::string value = PatternValue(65537, 41);
+  ASSERT_EQ(transport.Cache(node.addr, key, value.data(), value.size()),
+            Status::kOk);
+  struct Slice { uint64_t offset; uint64_t length; Status status; };
+  const std::array<Slice, 6> slices{{
+      {97, 4097, Status::kOk},
+      {0, 13, Status::kOk},
+      {value.size() - 19, 128, Status::kOk},
+      {value.size(), 97, Status::kOk},
+      {value.size() + 1, 97, Status::kInvalid},
+      {std::numeric_limits<uint64_t>::max() - 3, 11, Status::kInvalid}}};
+  for (const auto& slice : slices) {
+    SCOPED_TRACE(slice.offset);
+    std::string output = "stale";
+    uint64_t value_len = 999;
+    ASSERT_EQ(transport.Range(node.addr, key, slice.offset, slice.length,
+                              &output, &value_len), slice.status);
+    if (slice.status == Status::kOk) {
+      EXPECT_EQ(output, value.substr(slice.offset, slice.length));
+      EXPECT_EQ(value_len, value.size());
+    } else {
+      EXPECT_TRUE(output.empty());
+      EXPECT_EQ(value_len, 0u);
+    }
+    EXPECT_EQ(CounterVal(node.rsrv->MetricsText(),
+                         "dfkv_rdma_dynamic_get_mr_active"), 0);
+  }
+}
+
+TEST(RdmaLoopback, RangeManyKeepsMixedHitMissOrderingAndSliceValueLengths) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "0");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
+  RdmaNode node("range-many-slices");
+  RdmaTransport transport(kMaxMsg);
+  const BlockKey first = ToBlockKey(SelfHdr(), "first");
+  const BlockKey second = ToBlockKey(SelfHdr(), "second");
+  const BlockKey missing = ToBlockKey(SelfHdr(), "missing");
+  const std::string a = PatternValue(65537, 27);
+  const std::string b = PatternValue(4113, 28);
+  ASSERT_EQ(transport.Cache(node.addr, first, a.data(), a.size()), Status::kOk);
+  ASSERT_EQ(transport.Cache(node.addr, second, b.data(), b.size()), Status::kOk);
+  const std::vector<BlockKey> keys{first, missing, second, first, missing};
+  const std::array<std::pair<uint64_t, uint64_t>, 6> slices{{
+      {97, 4097}, {0, 13}, {a.size() - 19, 128},
+      {a.size(), 17}, {a.size() + 1, 19},
+      {std::numeric_limits<uint64_t>::max() - 3, 11}}};
+  for (const auto& [offset, length] : slices) {
+    SCOPED_TRACE(offset);
+    std::vector<std::string> outputs(1, "stale");
+    std::vector<uint64_t> value_lens(1, 999);
+    const auto statuses = transport.RangeMany(
+        node.addr, keys, offset, length, &outputs, &value_lens);
+    ASSERT_EQ(statuses.size(), keys.size());
+    ASSERT_EQ(outputs.size(), keys.size());
+    ASSERT_EQ(value_lens.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+      SCOPED_TRACE(i);
+      const bool miss = i == 1 || i == 4;
+      const std::string& stored = i == 2 ? b : a;
+      const Status expected = miss ? Status::kNotFound :
+          offset > stored.size() ? Status::kInvalid : Status::kOk;
+      EXPECT_EQ(statuses[i], expected);
+      if (expected == Status::kOk) {
+        EXPECT_EQ(outputs[i], stored.substr(offset, length));
+        EXPECT_EQ(value_lens[i], stored.size());
+      } else {
+        EXPECT_TRUE(outputs[i].empty());
+        EXPECT_EQ(value_lens[i], 0u);
+      }
+    }
+    EXPECT_EQ(CounterVal(node.rsrv->MetricsText(),
+                         "dfkv_rdma_dynamic_get_mr_active"), 0);
+  }
+}
+
+TEST(RdmaLoopback, ZeroLengthRangeAndRangeManyPreserveStatusAndStoredLength) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "0");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  RdmaNode node("zero-range");
+  RdmaTransport transport(kMaxMsg);
+  const BlockKey present = ToBlockKey(SelfHdr(), "present");
+  const BlockKey missing = ToBlockKey(SelfHdr(), "missing");
+  const std::string value = PatternValue(20, 31);
+  ASSERT_EQ(transport.Cache(node.addr, present, value.data(), value.size()),
+            Status::kOk);
+  const std::array<uint64_t, 5> offsets{
+      0, 7, value.size(), value.size() + 1,
+      std::numeric_limits<uint64_t>::max()};
+  for (uint64_t offset : offsets) {
+    SCOPED_TRACE(offset);
+    const Status expected = offset == value.size() ?
+        Status::kOk : Status::kInvalid;
+    const uint64_t expected_len = expected == Status::kOk ? value.size() : 0;
+    std::string output = "stale";
+    uint64_t value_len = 999;
+    EXPECT_EQ(transport.Range(node.addr, present, offset, 0,
+                              &output, &value_len), expected);
+    EXPECT_TRUE(output.empty());
+    EXPECT_EQ(value_len, expected_len);
+    output = "stale";
+    value_len = 999;
+    EXPECT_EQ(transport.Range(node.addr, missing, offset, 0,
+                              &output, &value_len), Status::kNotFound);
+    EXPECT_TRUE(output.empty());
+    EXPECT_EQ(value_len, 0u);
+    std::vector<std::string> outputs;
+    std::vector<uint64_t> value_lens;
+    EXPECT_EQ(transport.RangeMany(node.addr, {present, missing, present},
+                                  offset, 0, &outputs, &value_lens),
+              std::vector<Status>({expected, Status::kNotFound, expected}));
+    EXPECT_EQ(outputs, std::vector<std::string>(3));
+    EXPECT_EQ(value_lens,
+              std::vector<uint64_t>({expected_len, 0, expected_len}));
+  }
+  EXPECT_EQ(CounterVal(node.rsrv->MetricsText(),
+                       "dfkv_rdma_dynamic_get_mr_active"), 0);
 }
 
 TEST(RdmaLoopback, BatchZeroCopyRoundtrip) {
@@ -5192,13 +5396,13 @@ TEST(RdmaLoopback, PressurePreservesSubmittedUringRead) {
   ScopedEnv depth("DFKV_RDMA_DEPTH", "1");
   ScopedEnv idle("DFKV_RDMA_IDLE_MS", "5000");
   ScopedEnv ram("DFKV_RAM_TIER", "0");
-  const std::string budget =
-      std::to_string(2 * rdma::V2SlotSize(kMaxMsg));
+  const std::string value(4096, 'q');
+  const std::string budget = std::to_string(
+      2 * rdma::V2SlotSize(kMaxMsg) + rdma::V2SlotSize(value.size()));
   ScopedEnv segment("DFKV_RDMA_RECV_SEGMENT_SIZE", budget.c_str());
   RdmaUringNode node("pressure-uring-read", kMaxMsg,
                      [](ControlledRdmaUringBackend*) {});
   const BlockKey key{90178, 1};
-  const std::string value(4096, 'q');
   std::string ignored;
   ASSERT_EQ(node.srv->ProcessRequestForKey(
                 static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
@@ -5206,16 +5410,10 @@ TEST(RdmaLoopback, PressurePreservesSubmittedUringRead) {
   {
     PinnedPullPeer busy;
     ASSERT_TRUE(busy.Open(node));
-    std::string output(value.size(), '\0');
-    ibv_mr* mr = busy.ep.RegisterTransient(output.data(), output.size(), true);
-    ASSERT_NE(mr, nullptr);
-    std::vector<RdmaWriteTarget> targets{{
-        reinterpret_cast<uint64_t>(output.data()), mr->rkey,
-        static_cast<uint32_t>(output.size())}};
-    size_t request_bytes = 0;
-    ASSERT_TRUE(EncodeRdmaGetReq(busy.ep.sbuf(0), busy.ep.cap(),
-                                 key, 0, value.size(), targets,
-                                 &request_bytes));
+    EncodeReqVersion(busy.ep.sbuf(0), kNativeProtoRdmaV2, WireOp::kPullRange,
+                     key, 0, value.size(), rdma::kPullPrepareBytes);
+    rdma::EncodePullPrepareControl({}, busy.ep.sbuf(0) + kReqPrefix);
+    const size_t request_bytes = kReqPrefix + rdma::kPullPrepareBytes;
     ASSERT_TRUE(busy.ep.PostRecv(0));
     ASSERT_TRUE(busy.ep.PostSend(0, request_bytes));
     ControlledRdmaUringBackend* backend =
@@ -5256,6 +5454,7 @@ TEST(RdmaLoopback, PressurePreservesSubmittedUringRead) {
     ASSERT_TRUE(backend->CompleteRead(completion.token));
     completion.done = true;
     bool sent = false, received = false;
+    rdma::DynamicPullReady ready;
     while (!sent || !received) {
       ibv_wc wc{};
       ASSERT_EQ(busy.ep.WaitComp(&wc, 1, 5000), 1);
@@ -5269,12 +5468,19 @@ TEST(RdmaLoopback, PressurePreservesSubmittedUringRead) {
         ASSERT_TRUE(DecodeRespVersion(busy.ep.rbuf(0), kNativeProtoRdmaV2,
                                       &status, &bytes));
         EXPECT_EQ(status, Status::kOk);
-        EXPECT_EQ(bytes, value.size());
+        ASSERT_EQ(bytes, rdma::kDynamicPullReadyBytes);
+        ASSERT_EQ(wc.byte_len, kRespPrefix + bytes);
+        ASSERT_TRUE(rdma::DecodeDynamicPullReady(
+            busy.ep.rbuf(0) + kRespPrefix, &ready));
         received = true;
       }
     }
+    EXPECT_EQ(ready.data_len, value.size());
+    EXPECT_EQ(ready.value_len, value.size());
+    std::string output;
+    ASSERT_TRUE(busy.Read(ready, &output));
     EXPECT_EQ(output, value);
-    busy.ep.ReleaseTransient(mr);
+    ASSERT_TRUE(busy.Release(key, ready));
     EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
   }
   const auto deadline =

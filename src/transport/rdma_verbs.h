@@ -106,12 +106,9 @@ class RcEndpoint {
   // direct_io_buffers is true, also allocate one 4096-aligned registered buffer
   // per slot for O_DIRECT reads/writes that are scatter-transferred without a
   // payload copy. direct_io_cap lets that buffer be larger than the ordinary
-  // control buffers. v2_responder reserves enough SQ WRs for a server to chain
-  // several one-sided GET writes before its signaled status SEND; initiators
-  // need only the depth+1 SQ geometry.
+  // control buffers.
   bool Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib_port = 1,
-            bool direct_io_buffers = false, size_t direct_io_cap = 0,
-            bool v2_responder = false);
+            bool direct_io_buffers = false, size_t direct_io_cap = 0);
 
   QpInfo Local() const { return local_; }              // my QP info (after Open)
   bool Connect(const QpInfo& remote);                  // INIT -> RTR -> RTS
@@ -177,15 +174,6 @@ class RcEndpoint {
   ibv_mr* RegisterLeaseReadRegion(void* base, size_t size);
   void ReleaseLeaseReadRegion(ibv_mr* mr);
   static uint64_t LeaseReadMrActive();
-  // Register an exact connection-private source arena for initiator READ.
-  // Unlike RegisterRemoteRegion this never widens to a shared segment MR.
-  ibv_mr* RegisterRemoteReadRegion(void* base, size_t size);
-  // Register a whole receive-pool chunk once per shared PD with REMOTE_READ.
-  // The broad MR rkey is never published; BindRemoteReadWindow narrows peer
-  // access to one connection's exact lease with a type-2 Memory Window.
-  ibv_mr* RegisterRemoteReadPool(void* base, size_t size);
-  bool BindRemoteReadWindow(ibv_mr* pool_mr, void* base, size_t size,
-                            uint32_t* rkey);
 
   // Cumulative one-shot user MRs registered outside explicit pool regions.
   // These are never cached; TransientUserMrActive is the lifetime invariant.
@@ -215,8 +203,8 @@ class RcEndpoint {
   // current operation. `remote_write=true` is for receive targets; false keeps
   // const/read-only send sources valid. Registered pool MRs with sufficient
   // access are reused. The endpoint owns ad-hoc MRs until ReleaseTransient() or
-  // Close(); ambiguous direct GETs obtain responder-retirement proof before
-  // either happens.
+  // Close(); an abandoned READ keeps its destination MR until QP destruction
+  // fences DMA, while successful operations release after local completion.
   ibv_mr* RegisterTransient(void* addr, size_t len,
                             bool remote_write = true);
   void ReleaseTransient(ibv_mr* mr);
@@ -249,9 +237,8 @@ class RcEndpoint {
       size_t slot, const std::vector<std::pair<void*, uint32_t>>& segs,
       const std::vector<ibv_mr*>& mrs, size_t hdr_bytes);
 
-  // RDMA v2 one-sided primitives. Responder PostWrite is signaled: its CQE is
-  // tracked until DONE on success or explicit writer retirement on ambiguity.
-  // WRITE_WITH_IMM is the client's signaled request operation.
+  // One-sided primitives. PostWrite and WRITE_WITH_IMM are signaled; GET
+  // uses PostRead, while PUT retains its WRITE operations.
   // Initiator-side one-sided READ. `destination_mr` belongs to this endpoint's
   // PD; the remote descriptor must remain leased until the signaled CQE is
   // terminal.
@@ -298,12 +285,6 @@ class RcEndpoint {
   // Unblock a thread sitting in WaitComp (so the server can join its Serve
   // threads at shutdown). Thread-safe vs the waiter.
   void Wake();
-  // Responder retirement protocol. Every PostWrite is signaled. Cancellation
-  // prevents later posts and wakes the owner; RetireResponderWrites moves the QP
-  // to ERR and consumes all tracked WRITE CQEs before the server sends proof to
-  // the client. This is the failure fence; ibv_destroy_qp is cleanup only.
-  void CancelResponderWrites();
-  bool RetireResponderWrites();
   void set_busy_poll(bool v) { busy_poll_ = v; }
   void set_num_qp(size_t n) { num_qp_ = n > 0 ? n : 1; }
   size_t num_qp() const { return num_qp_; }
@@ -345,28 +326,14 @@ class RcEndpoint {
     ibv_mr* mr;
   };
   std::vector<PoolMr> pool_mr_;
-  // Operation-scoped out-of-pool MRs. These are released after a successful
-  // DONE, or after explicit responder-retirement proof on failure.
+  // Operation-scoped out-of-pool MRs, released after local completion or
+  // after endpoint destruction fences an abandoned operation.
   std::vector<ibv_mr*> transient_mr_;
-  std::vector<ibv_mr*> connection_mr_;
-  std::vector<ibv_mw*> connection_mw_;
   std::vector<ibv_mr*> lease_write_mr_;
   std::vector<ibv_mr*> lease_read_mr_;
   QpInfo local_;
-  std::atomic<bool> responder_cancelled_{false};
-  size_t pending_responder_writes_ = 0;  // responder owner thread only
 };
 
-// Deterministic loopback-only responder seam. It blocks the next `count`
-// PostWrite calls before ibv_post_send, allowing tests to hold real remote
-// WRITEs in flight while the client times out, fences, retries, or returns.
-void TestBlockNextResponderWrites(size_t count);
-bool TestWaitForBlockedResponderWrites(size_t count, int timeout_ms);
-bool TestWaitForReleasedResponderWrites(size_t count, int timeout_ms);
-void TestReleaseBlockedResponderWrites();
-bool TestConsumeBlockedResponderWriteFault();
-bool TestWaitForResponderWriteCancellations(size_t count, int timeout_ms);
-void TestReleaseOneBlockedResponderWrite();
 
 }  // namespace rdma
 }  // namespace dfkv

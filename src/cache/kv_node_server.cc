@@ -1140,6 +1140,9 @@ Status KvNodeServer::RangeDirectForKey(
       return Status::kOk;
     }
   }
+  // Promotion needs the same read's full length even when the caller omits it.
+  size_t stored_len = 0;
+  if (value_len == nullptr) value_len = &stored_len;
   Status st;
   if (coalesce_enabled_) {
     // Leader reads into the shared scratch, every rank's convoy copy lands in
@@ -1166,12 +1169,11 @@ Status KvNodeServer::RangeDirectForKey(
   if (st == Status::kOk) {
     cache_hit_.fetch_add(1, std::memory_order_relaxed);
     bytes_read_.fetch_add(*out_len, std::memory_order_relaxed);
-    // Read promotion: install the just-read value into the RAM arena so
-    // subsequent GETs hit the zero-copy RDMA path. Best-effort (a full arena
-    // silently skips); the data is already durable on disk so this costs zero
-    // flush bandwidth.  With the PUT write-around change above, this is the
-    // ONLY way the arena gets populated.
-    if (ram_ && *out_data && *out_len > 0)
+    // Only a complete value may become a durable RAM resident. A slice must
+    // never replace the key's full contents or reported stored length.
+    // Best-effort: the data is already durable, so no flush is needed.
+    if (ram_ && offset == 0 && *out_data && *out_len > 0 &&
+        *out_len == *value_len)
       ram_->PutDurable(key, *out_data, *out_len);
   } else if (st == Status::kNotFound) {
     cache_miss_.fetch_add(1, std::memory_order_relaxed);

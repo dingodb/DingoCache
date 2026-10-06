@@ -15,52 +15,66 @@ TEST(RdmaProtocol, ProbeRoundTrip) {
   EncodeV2ProbeReply(reply);
   EXPECT_TRUE(ParseV2ProbeReply(reply));
   EXPECT_TRUE(V2ProbeSupportsWriterRetirement(reply));
+  EXPECT_TRUE(V2ProbeSupportsDynamicOnly(reply));
+  EXPECT_TRUE(V2ProbeSupportsDynamicPull(reply));
+  EXPECT_TRUE(V2ProbeSupportsPullRead(reply));
+  EXPECT_TRUE(V2ProbeSupportsLeasedPut(reply));
 
-  // An old server's reserved bytes are zero. The base v2 reply remains valid
-  // to old clients, but a new direct-buffer client must reject it.
+  // Old reserved bytes and old dynamic-capable servers remain valid probes,
+  // but cannot satisfy the new dynamic-only client's contract.
   EncodeV2ProbeReply(reply, /*capabilities=*/0);
   EXPECT_TRUE(ParseV2ProbeReply(reply));
   EXPECT_FALSE(V2ProbeSupportsWriterRetirement(reply));
+  EXPECT_FALSE(V2ProbeSupportsDynamicOnly(reply));
+  EncodeV2ProbeReply(reply, kV2ProbeCapWriterRetirement |
+                           kV2ProbeCapPullRead | kV2ProbeCapDynamicPull);
+  EXPECT_TRUE(ParseV2ProbeReply(reply));
+  EXPECT_FALSE(V2ProbeSupportsDynamicOnly(reply));
+  EXPECT_TRUE(V2ProbeSupportsDynamicPull(reply));
 
   reply[4] = 1;
   EXPECT_FALSE(ParseV2ProbeReply(reply));
   EXPECT_FALSE(V2ProbeSupportsWriterRetirement(reply));
 }
 
-TEST(RdmaProtocol, LegacyAndRetirementReadinessHaveExactWireSizes) {
+TEST(RdmaProtocol, DynamicOnlyAndLegacyDynamicHaveExactReadinessSizes) {
   const RecvSegmentInfo expected{0x12345000, 0xAABBCCDD, 4u << 20};
   char wire[kV2RetirementReadinessBytes];
-
-  const size_t legacy_bytes =
-      EncodeV2Readiness(expected, /*writer_token=*/0, wire);
-  EXPECT_EQ(kV2LegacyReadinessBytes, 25u);
-  EXPECT_EQ(legacy_bytes, 25u);
-  EXPECT_EQ(V2ReadinessBytes(/*writer_retirement_negotiated=*/false), 25u);
+  const size_t bytes = EncodeV2DynamicOnlyReadiness(expected, wire);
+  EXPECT_EQ(kV2DynamicOnlyReadinessBytes, 25u);
+  EXPECT_EQ(bytes, 25u);
   RecvSegmentInfo actual;
-  uint64_t token = 99;
-  EXPECT_TRUE(DecodeV2Readiness(
-      wire, legacy_bytes, /*writer_retirement_negotiated=*/false, &actual,
-      &token));
-  EXPECT_EQ(token, 0u);
+  EXPECT_TRUE(DecodeV2DynamicOnlyReadiness(wire, bytes, &actual));
   EXPECT_EQ(actual.base_addr, expected.base_addr);
   EXPECT_EQ(actual.rkey, expected.rkey);
   EXPECT_EQ(actual.slot_size, expected.slot_size);
-  EXPECT_FALSE(DecodeV2Readiness(
-      wire, legacy_bytes, /*writer_retirement_negotiated=*/true, &actual,
-      &token));
+  EXPECT_FALSE(DecodeV2DynamicOnlyReadiness(wire, bytes - 1, &actual));
+  EXPECT_FALSE(DecodeV2DynamicOnlyReadiness(wire, bytes + 1, &actual));
 
-  constexpr uint64_t writer_token = 0x123456789ABCDEF0ull;
-  const size_t retirement_bytes =
-      EncodeV2Readiness(expected, writer_token, wire);
-  EXPECT_EQ(retirement_bytes, 33u);
-  EXPECT_EQ(V2ReadinessBytes(/*writer_retirement_negotiated=*/true), 33u);
-  EXPECT_TRUE(DecodeV2Readiness(
-      wire, retirement_bytes, /*writer_retirement_negotiated=*/true, &actual,
-      &token));
-  EXPECT_EQ(token, writer_token);
-  EXPECT_FALSE(DecodeV2Readiness(
-      wire, retirement_bytes, /*writer_retirement_negotiated=*/false, &actual,
-      &token));
+  constexpr uint64_t legacy_token = 0x123456789ABCDEF0ull;
+  const size_t old_bytes = EncodeV2Readiness(expected, legacy_token, wire);
+  EXPECT_EQ(old_bytes, 33u);
+  uint64_t token = 0;
+  EXPECT_TRUE(DecodeV2Readiness(wire, old_bytes, &actual, &token));
+  EXPECT_EQ(token, legacy_token);
+  EXPECT_FALSE(DecodeV2DynamicOnlyReadiness(wire, old_bytes, &actual));
+  net::PutU64(wire + kV2DynamicOnlyReadinessBytes, 0);
+  EXPECT_FALSE(DecodeV2Readiness(wire, old_bytes, &actual, &token));
+}
+
+TEST(RdmaProtocol, DynamicOnlyRequestIsMaskedFromPayloadGeometry) {
+  char frame[kDevNameBytes];
+  constexpr uint64_t size = 65536;
+  EncodeDevFrame("", size | kDevFrameRequestDynamicOnly |
+                         kDevFrameRequestDynamicPull |
+                         kDevFrameRequestPullRead |
+                         kDevFrameRequestLeasedPut, frame);
+  EXPECT_TRUE(DevFrameRequestsDynamicOnly(frame));
+  EXPECT_TRUE(DevFrameRequestsDynamicPull(frame));
+  EXPECT_TRUE(DevFrameRequestsPullRead(frame));
+  EXPECT_TRUE(DevFrameRequestsLeasedPut(frame));
+  EXPECT_FALSE(DevFrameRequestsWriterRetirement(frame));
+  EXPECT_EQ(ParseDevFrameMaxBlock(frame), size);
 }
 
 TEST(RdmaProtocol, SlotGeometryKeepsPayloadAligned) {
@@ -69,7 +83,6 @@ TEST(RdmaProtocol, SlotGeometryKeepsPayloadAligned) {
   EXPECT_EQ(slot % kV2DataOffset, 0u);
   EXPECT_GE(slot - kV2DataOffset, 4u << 20);
   EXPECT_EQ(kV2PutPrefixOffset + kReqPrefix, kV2DataOffset);
-  EXPECT_EQ(kV2MaxGetTargets, 29u);
 }
 
 TEST(RdmaProtocol, ReceiveSegmentMustFitOneAdvertisedSlot) {

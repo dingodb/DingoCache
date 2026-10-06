@@ -102,9 +102,10 @@ measure before any absolute claims are made:
 - **PUT slot-to-durable latency**: client `WRITE_WITH_IMM` slot submission →
   server commit acknowledgment, at 1 MiB and page-scale payloads, across
   negotiated `qd` values.
-- **Server `RDMA_WRITE` GET**: warm (RAM-tier) and cold (NVMe → stage → WRITE)
-  paths, single connection vs `batch_concurrency` fan-out; compare against the
-  retired two-sided numbers above.
+- **Client dynamic `RDMA_READ` GET**: warm pinned-RAM and cold staged-NVMe
+  paths, scalar vs depth-windowed string batches. Compare against a retained
+  fixed-arena baseline; record registration/release cost without implying
+  removed responder-WRITE or fixed-pull paths remain configurable.
 - **Commit granularity**: per-slot store batches vs depth on the slab
   io_uring write path (`dfkv_slab_uring_write_batches_total`).
 - **Depth curve under v2**: re-prove or refute depth-flatness on the one-sided

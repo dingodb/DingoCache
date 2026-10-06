@@ -88,7 +88,6 @@ tp_rank=..,ver=<lib>`（无 `role`——HiCache 是前缀 L3 缓存，无生产/
 | `DFKV_RDMA_MAX_BLOCK_BYTES` | 4 MiB 逻辑上限 | 覆盖最大合法对象 | 只做 deterministic oversize guard；不再让所有连接按最大值预留。 |
 | `DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES` | 256 KiB | 覆盖常见小块，保持默认起步 | 当前操作最大对象按 power-of-two 向上取 connection class；idle pool 选最小可满足 QP。 |
 | `DFKV_RDMA_INLINE_PUT_MAX_BYTES` | 4 MiB | 保持默认 | 超阈 scalar/SG PUT 协商操作级 staging lease；`0` 或空值禁用。不会放宽 `MAX_BLOCK_BYTES` 的业务上限。 |
-| `DFKV_RDMA_DYNAMIC_PULL` | `1` | 保持默认 | 支持的新 peer 逐 GET 申请 pull lease，READ 完成后显式释放并等待 ACK；`0` 保留旧连接级 pull arena。 |
 | `DFKV_RDMA_RECV_SEGMENT_SIZE` | 128 GiB | 按 peak live/pooled QP 设 hard budget | server receive-pool 最大提交量；不再启动期全量申请。 |
 | `DFKV_RDMA_RECV_CHUNK_BYTES` | 256 MiB | 保持默认，除非常见 connection class 更大 | server 启动只提交一个 chunk，后续 allocation miss 按需增长，不超过 hard budget。 |
 | `DFKV_RDMA_RECV_CHUNK_IDLE_MS` | 60 s | 保持默认 | 空闲非初始chunk到期返还；`0`关闭。增长chunk绑定首次使用rail/NUMA。 |
@@ -101,9 +100,10 @@ tp_rank=..,ver=<lib>`（无 `role`——HiCache 是前缀 L3 缓存，无生产/
 超阈 PUT 在 `kLeasePut` 返回 exact-MR 描述符后，将完整对象写入操作级租约。
 直接 scalar/SG GET 使用 `kPullRange` 返回的地址/rkey 发起 RDMA READ，
 随后发送 `kPullRelease` 并等待 ACK，才将连接归入 idle pool。
-新 peer 的 bootstrap 不再发布常驻 pull arena；旧 peer 保持原 73-byte
-readiness 与连接级 arena。字符串 Range/RangeMany 保持已有 staged-WRITE
-及 offset/length 语义。所有路径共用显式 `DFKV_RDMA_MAX_BLOCK_BYTES` 上限；
+v2.31 新 client 只使用 token-free 25-byte dynamic-only 握手；server 为
+v2.28 默认 dynamic client 暂留原 33-byte readiness，不分配固定 pull arena。
+字符串 Range/RangeMany 同样使用 dynamic READ，保持 offset、完整 stored length
+与实际返回长度的区分。所有路径共用显式 `DFKV_RDMA_MAX_BLOCK_BYTES` 上限；
 不能用提高 inline 阈值绕过它。control response 上限仍为 32 KiB。
 
 **GPUDirect RDMA 内存顺序（所有 device-direct GET）**：RDMA 写入 GPU 显存
@@ -166,12 +166,14 @@ MR 为 exact operation region：成功路径先注销再还内存；异常路径
 QP/MR，再由 RAII 归还区间。数值 rkey 可能被 provider 在新授权中复用，
 不是永久唯一 nonce；release generation 防止控制消息误释放新租约。
 
-滚动升级推荐 server-first；新 client 连接旧 server 时保留旧 wire 和连接池
-复用，不要求同步切换所有客户端。RDMA 能力升级不改变 raw value、slab 或
-原生 namespace/key codec；本版 vLLM 混合模型修复另有下述缓存身份切换，不能
-把 wire 兼容等同于所有旧 Python 缓存对象仍可复用。
-`DFKV_RDMA_DYNAMIC_PULL=0` 与 `DFKV_RDMA_INLINE_PUT_MAX_BYTES=0` 可分别
-关闭两项可选能力，不能替代真实旧版本混跑验收。
+v2.31 升级顺序为 server-first：先验证真实 v2.28 默认 client 与新 server
+读写，再滚动 server，全部完成后滚动 client。新 client 不兼容旧 server，
+因此升级 client 后不能单独回滚 server。旧 client 显式
+`DFKV_RDMA_DYNAMIC_PULL=0`、fixed pull 和旧 WRITE Range 请求被拒绝。
+新 client 不读取该旧配置，也不带旧握手或 token 回退。服务端适配在所有实际
+rank、模板及回滚入口退出旧协议后才能退役。
+PUT 的 `DFKV_RDMA_INLINE_PUT_MAX_BYTES=0` 仍可用。
+wire 兼容不等于旧 Python 对象在变更模型 layout 后仍可复用。
 
 server receive pool 以 `DFKV_RDMA_RECV_CHUNK_BYTES` 惰性提交，累计不超过
 `DFKV_RDMA_RECV_SEGMENT_SIZE`。预算仍按所有 rank/process 的 peak live +

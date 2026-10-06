@@ -165,21 +165,23 @@ struct LeasePeer {
     int fd = net::Dial(node.addr, 10000, 10000);
     if (fd < 0) return false;
     char frame[rdma::kDevNameBytes], mine[rdma::kQpInfoBytes],
-        peer[rdma::kQpInfoBytes], ready[rdma::kV2LegacyReadinessBytes];
+        peer[rdma::kQpInfoBytes], ready[rdma::kV2DynamicOnlyReadinessBytes];
     rdma::EncodeDevFrame(dev, (1u << 20) |
+                                 rdma::kDevFrameRequestDynamicOnly |
+                                 rdma::kDevFrameRequestPullRead |
+                                 rdma::kDevFrameRequestDynamicPull |
                                  rdma::kDevFrameRequestLeasedPut, frame);
     auto info = ep.Local();
     info.depth = 1;
     info.protocol_version = rdma::kDevProtoV2;
     rdma::SerializeQpInfo(info, mine);
-    uint64_t token = 0;
     bool ok = net::WriteAll(fd, frame, sizeof(frame)) &&
               net::WriteAll(fd, mine, sizeof(mine)) &&
               net::ReadAll(fd, peer, sizeof(peer)) &&
               ep.Connect(rdma::ParseQpInfo(peer)) &&
               net::ReadAll(fd, ready, sizeof(ready)) &&
-              rdma::DecodeV2Readiness(ready, sizeof(ready), false,
-                                      &resident, &token);
+              rdma::DecodeV2DynamicOnlyReadiness(ready, sizeof(ready),
+                                                 &resident);
     ::close(fd);
     return ok;
   }
@@ -253,26 +255,27 @@ struct LeasePeer {
 };
 
 struct PullPeer : LeasePeer {
-  rdma::PullArenaInfo arena;
   bool Open(const LeaseNode& node, bool dynamic = true,
-            bool request_pull = true, bool retirement = true) {
+            bool request_pull = true, bool retirement = true,
+            bool dynamic_only = true) {
     const auto& dev = node.rsrv->DeviceNames().front();
     if (!ep.Open(dev.c_str(), rdma::kV2ControlCap, 1)) return false;
     int fd = net::Dial(node.addr, 10000, 10000);
     if (fd < 0) return false;
     char frame[rdma::kDevNameBytes], mine[rdma::kQpInfoBytes],
-        peer[rdma::kQpInfoBytes], ready[rdma::kV2PullReadinessBytes];
+        peer[rdma::kQpInfoBytes], ready[rdma::kV2RetirementReadinessBytes];
     uint64_t declared = 1u << 20;
     if (dynamic) declared |= rdma::kDevFrameRequestDynamicPull;
     if (request_pull) declared |= rdma::kDevFrameRequestPullRead;
-    if (retirement) declared |= rdma::kDevFrameRequestWriterRetirement;
+    if (dynamic_only) declared |= rdma::kDevFrameRequestDynamicOnly;
+    else if (retirement) declared |= rdma::kDevFrameRequestWriterRetirement;
     rdma::EncodeDevFrame(dev, declared, frame);
     auto info = ep.Local();
     info.depth = 1;
     info.protocol_version = rdma::kDevProtoV2;
     rdma::SerializeQpInfo(info, mine);
-    const size_t size = dynamic ? rdma::kV2RetirementReadinessBytes
-                               : rdma::kV2PullReadinessBytes;
+    const size_t size = dynamic_only ? rdma::kV2DynamicOnlyReadinessBytes
+                                    : rdma::kV2RetirementReadinessBytes;
     uint64_t token = 0;
     bool ok = net::WriteAll(fd, frame, sizeof(frame)) &&
               net::WriteAll(fd, mine, sizeof(mine)) &&
@@ -280,10 +283,9 @@ struct PullPeer : LeasePeer {
               ep.Connect(rdma::ParseQpInfo(peer)) &&
               net::ReadAll(fd, ready, size);
     if (ok) {
-      ok = dynamic
-               ? rdma::DecodeV2Readiness(ready, size, true, &resident, &token)
-               : rdma::DecodeV2PullReadiness(ready, size, &resident, &token,
-                                             &arena);
+      ok = dynamic_only
+               ? rdma::DecodeV2DynamicOnlyReadiness(ready, size, &resident)
+               : rdma::DecodeV2Readiness(ready, size, &resident, &token);
       char extra = 0;
       ok = ok && ::read(fd, &extra, 1) == 0;  // exact bootstrap size, then EOF
     }
@@ -697,13 +699,31 @@ TEST_F(RdmaLeaseLoopback, DynamicPullSmallDestinationMissAndGeneration) {
   ASSERT_TRUE(peer.Prepare(key, value.size(), &status, &next));
   ASSERT_EQ(status, Status::kOk);
   EXPECT_NE(next.slot_generation, ready.slot_generation);
-  // Piggyback release must revoke the previous capability even if the next
-  // lookup misses and never publishes another descriptor.
+  // Even the current generation cannot retire a lease through PREPARE.
   ASSERT_TRUE(peer.Prepare(missing, value.size(), &status, &ready,
                            next.slot_generation));
-  EXPECT_EQ(status, Status::kNotFound);
-  ASSERT_TRUE(peer.Prepare(key, 0, &status, &ready));
   EXPECT_EQ(status, Status::kInvalid);
+  EXPECT_EQ(CounterOf(*node.rsrv, "dfkv_rdma_dynamic_get_active"), 1);
+  EXPECT_EQ(rdma::RcEndpoint::LeaseReadMrActive(), 1u);
+  ASSERT_TRUE(peer.Read(next, &out));
+  EXPECT_EQ(out, value);
+  ASSERT_TRUE(peer.Release(next, &status));
+  ASSERT_EQ(status, Status::kOk);
+  // Explicit RELEASE frees the capability before a later lookup misses.
+  ASSERT_TRUE(peer.Prepare(missing, value.size(), &status, &ready));
+  EXPECT_EQ(status, Status::kNotFound);
+  // EOF is a successful empty range, not a universal zero-request error.
+  ASSERT_TRUE(peer.Prepare(key, 4096, &status, &ready, 0, 0, value.size()));
+  ASSERT_EQ(status, Status::kOk);
+  EXPECT_EQ(ready.data_len, 0u);
+  EXPECT_EQ(ready.value_len, value.size());
+  EXPECT_NE(ready.address, 0u);
+  EXPECT_NE(ready.rkey, 0u);
+  EXPECT_EQ(rdma::RcEndpoint::LeaseReadMrActive(), 1u);
+  ASSERT_TRUE(peer.Read(ready, &out));
+  EXPECT_TRUE(out.empty());
+  ASSERT_TRUE(peer.Release(ready, &status));
+  ASSERT_EQ(status, Status::kOk);
   ASSERT_TRUE(peer.Prepare(key, kMsg + 1, &status, &ready));
   EXPECT_EQ(status, Status::kInvalid);
   ASSERT_TRUE(peer.Prepare(key, 4096, &status, &ready, 0, 1));
@@ -843,11 +863,12 @@ TEST_F(RdmaLeaseLoopback, DynamicPullTeardownFencesDelayedRead) {
     EXPECT_EQ(CounterOf(*node.rsrv, "dfkv_rdma_dynamic_get_active"), 1);
     EXPECT_EQ(CounterOf(*node.rsrv, "dfkv_rdma_recv_segment_used_bytes"), held);
     std::string out;
-    // retire_writer has already transitioned the QP to ERR before this
-    // destructor hook. The delayed READ must fail while its storage is still
-    // held, rather than requiring a successful DMA on a fenced endpoint.
+    // The hook runs before endpoint destruction. A READ can still complete
+    // here, but its source must remain held and return the original bytes.
     const bool read_ok = peer.Read(ready, &out);
-    EXPECT_FALSE(read_ok);
+    if (read_ok) {
+      EXPECT_EQ(out, value);
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
     EXPECT_EQ(RdmaLeaseServerTestPeer::Trim(*node.rsrv), 0u);
   }
@@ -859,30 +880,35 @@ TEST_F(RdmaLeaseLoopback, DynamicPullTeardownFencesDelayedRead) {
   EXPECT_EQ(rdma::RcEndpoint::LeaseReadMrActive(), 0u);
 }
 
-TEST_F(RdmaLeaseLoopback, DynamicPullNegotiationPreservesLegacyWire) {
+TEST_F(RdmaLeaseLoopback, DynamicPullNegotiationSupportsNewAndLegacyWire) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   LeaseNode node("dynamic-negotiation");
-  PullPeer no_pull, no_retirement;
-  EXPECT_FALSE(no_pull.Open(node, true, false, true));
-  EXPECT_FALSE(no_retirement.Open(node, true, true, false));
-  PullPeer legacy;
-  ASSERT_TRUE(legacy.Open(node, false));  // exactly 73 bytes, not DPR2
-  EXPECT_EQ(legacy.arena.arena_bytes, legacy.resident.slot_size);
-  Status status = Status::kIOError;
-  rdma::DynamicPullReady ready;
-  ASSERT_TRUE(legacy.Prepare(ToBlockKey(SelfHdr(), "legacy"),
-                             2u << 20, &status, &ready));
-  EXPECT_EQ(status, Status::kInvalid) << "legacy length remains conn_max bound";
-  LeasePeer unnegotiated;
-  ASSERT_TRUE(unnegotiated.Open(node));
-  EncodeReqVersion(unnegotiated.ep.sbuf(0), kNativeProtoRdmaV2,
-                   WireOp::kPullRange, BlockKey{}, 0, 4096,
-                   rdma::kPullPrepareBytes);
-  rdma::EncodePullPrepareControl({}, unnegotiated.ep.sbuf(0) + kReqPrefix);
-  uint64_t bytes = 0;
-  ASSERT_TRUE(unnegotiated.ep.PostRecv(0));
-  ASSERT_TRUE(unnegotiated.ep.PostSend(0, kReqPrefix + rdma::kPullPrepareBytes));
-  ASSERT_TRUE(unnegotiated.Response(&status, &bytes));
-  EXPECT_EQ(status, Status::kInvalid);
-  EXPECT_EQ(CounterOf(*node.rsrv, "dfkv_rdma_dynamic_get_active"), 0);
+  PullPeer no_pull, no_dynamic, fixed, unnegotiated, no_retirement;
+  EXPECT_FALSE(no_pull.Open(node, true, false));
+  EXPECT_FALSE(no_dynamic.Open(node, false));
+  EXPECT_FALSE(fixed.Open(node, false, true, true, false));
+  EXPECT_FALSE(unnegotiated.Open(node, false, false, false, false));
+  EXPECT_FALSE(no_retirement.Open(node, true, true, false, false));
+
+  const BlockKey key = ToBlockKey(SelfHdr(), "negotiated");
+  const std::string value = Value(2u << 20, 0x58);
+  StoreForPull(node, key, value);
+  PullPeer legacy, dynamic_only;
+  ASSERT_TRUE(legacy.Open(node, true, true, true, false));  // exact 33 bytes
+  ASSERT_TRUE(dynamic_only.Open(node, true, true, false));  // exact 25, no writer
+  for (PullPeer* peer : {&legacy, &dynamic_only}) {
+    Status status = Status::kIOError;
+    rdma::DynamicPullReady ready;
+    ASSERT_TRUE(peer->Prepare(key, value.size(), &status, &ready));
+    ASSERT_EQ(status, Status::kOk);
+    EXPECT_EQ(ready.data_len, value.size());
+    EXPECT_EQ(ready.value_len, value.size());
+    std::string out;
+    ASSERT_TRUE(peer->Read(ready, &out));
+    EXPECT_EQ(out, value);
+    ASSERT_TRUE(peer->Release(ready, &status));
+    ASSERT_EQ(status, Status::kOk);
+    EXPECT_EQ(CounterOf(*node.rsrv, "dfkv_rdma_dynamic_get_active"), 0);
+    EXPECT_EQ(rdma::RcEndpoint::LeaseReadMrActive(), 0u);
+  }
 }
