@@ -1,7 +1,7 @@
 /* RDMA client transport — native v2 libibverbs RC. Requests and bounded
  * responses use 32,786-byte SEND/RECV control buffers (18-byte prefix plus a
- * 32-KiB Members payload); PUT uses WRITEs and direct GET uses initiator READs.
- * A peer that cannot negotiate v2 is rejected.
+ * 32-KiB Members payload); PUT uses WRITEs and every GET uses dynamic READ grants.
+ * A peer that cannot negotiate the dynamic-only v2 contract is rejected.
  * An empty DFKV_RDMA_DEV discovers every ACTIVE HCA; an explicit comma list is
  * a whitelist. Device names, not IPs, select the data fabric. QPs bootstrap over
  * a small TCP channel to the node's member address, so the RDMA fabric itself
@@ -159,8 +159,8 @@ class RdmaTransport : public Transport {
     // peer advertises the capability; the request bit is then echoed on the
     // bootstrap frame.
     bool request_leased_put = false;
-    // Direct pull GET demand has no connection-resident payload in dynamic
-    // mode. Logical length still travels in the operation request.
+    // Dynamic-only GET demand has no connection-resident payload. Logical
+    // slice length still travels in the operation request.
     bool request_dynamic_pull = false;
     size_t leased_inline_bytes = 0;
     RailMask excluded;
@@ -201,13 +201,6 @@ class RdmaTransport : public Transport {
   void MarkInactive(Conn* c);
   void MarkLive(Conn* c);
   void MarkDead(Conn* c);
-  // An ambiguous responder WRITE without retirement proof must keep both the
-  // endpoint/MRs and its operation-owned destination alive. The caller-facing
-  // staged GET paths never publish these bytes, so quarantining converts the
-  // failure into a cache miss without exposing a late DMA to caller memory.
-  void QuarantineAmbiguousGet(Conn* c, void* destination_hold,
-                              size_t destination_bytes, const char* path,
-                              rdma::RailCompletion completion);
   void CompleteRemote(const std::string& peer_id, size_t local_rail,
                       uint64_t generation, RemoteRailOutcome outcome);
   void RetireIdlePeerRail(const std::string& peer_id, size_t local_rail);
@@ -222,18 +215,37 @@ class RdmaTransport : public Transport {
   void MaintainIdle(uint64_t now_us, bool send_keepalives);
   void KeepaliveLoop();
   bool KeepaliveConn(Conn* c, rdma::RailCompletion* failure);
+  enum class PullMode { kWholeObject, kSlice };
+  struct PullRequest {
+    const BlockKey* key = nullptr;
+    const RangeDstSegment* segments = nullptr;
+    size_t segment_count = 0;
+    size_t capacity = 0;
+    PullMode mode = PullMode::kWholeObject;
+    uint64_t offset = 0;
+    uint64_t length = 0;
+    Status status = Status::kIOError;
+    uint64_t value_len = 0;
+    uint64_t data_len = 0;
+  };
+  // One exclusively owned endpoint executes prepare, READ and RELEASE windows.
+  // Failure leaves transient MRs with the endpoint until the caller fences it.
+  bool PullWindow(Conn* conn, PullRequest* requests, size_t width,
+                  int timeout_ms, rdma::RailCompletion* failure);
   Status PullInto(const std::string& node, const BlockKey& key,
                   const RangeDstSegment* segments, size_t segment_count,
                   size_t capacity, Lane lane, uint64_t* value_len,
-                  std::string* out_dev = nullptr);
+                  std::string* out_dev = nullptr,
+                  PullMode mode = PullMode::kWholeObject,
+                  uint64_t offset = 0, uint64_t length = 0,
+                  uint64_t* data_len = nullptr);
   Status RoundTrip(const std::string& node, WireOp op, const BlockKey& key,
                    uint64_t offset, uint64_t length, const void* payload,
                    uint64_t payload_len, std::string* out,
                    uint64_t* value_len = nullptr);
   // Probe required base capabilities and report actual optional peer bits.
   bool ProbeV2(const std::string& node,
-               bool* leased_put_supported = nullptr,
-               bool* dynamic_pull_supported = nullptr) const;
+               bool* leased_put_supported = nullptr) const;
   mutable std::mutex mu_;
   // Scalar and SG operations share data endpoints. An acquired connection is
   // never concurrently reused, while operation framing remains self-describing.
@@ -246,7 +258,6 @@ class RdmaTransport : public Transport {
     std::string peer_id;
     uint64_t publication = 0;
     bool leased_put = false;
-    bool dynamic_pull = false;
   };
   std::unordered_map<std::string, PeerCapability> peer_capabilities_;
   void InvalidateCapabilities(const std::string& node,
@@ -286,7 +297,6 @@ class RdmaTransport : public Transport {
   // Leased-PUT in-flight datapath. Zero disables the optional capability
   // request and keeps every object on connection-resident receive slots.
   size_t inline_put_max_bytes_ = 4194304;  // DFKV_RDMA_INLINE_PUT_MAX_BYTES
-  bool dynamic_pull_enabled_ = true;  // DFKV_RDMA_DYNAMIC_PULL=0 disables
   mutable std::atomic<uint64_t> leaseput_ops_{0};
   mutable std::atomic<uint64_t> leaseput_path_fallbacks_{0};
   // Records n as a candidate high-water mark and reports whether it exceeds the
@@ -374,7 +384,7 @@ class RdmaTransport : public Transport {
   uint64_t rail_backpressure_us_ = 10'000;
   // observability (relaxed): connections opened total + per-rail breakdown.
   std::atomic<uint64_t> conns_opened_{0};
-  std::atomic<uint64_t> v2_put_writes_{0}, v2_get_writes_{0};
+  std::atomic<uint64_t> v2_put_writes_{0};
   std::atomic<uint64_t> mr_regions_{0};
   std::atomic<uint64_t> mr_registered_bytes_{0};
   std::atomic<uint64_t> mr_registration_rejections_{0};
@@ -397,14 +407,6 @@ class RdmaTransport : public Transport {
   std::atomic<uint64_t> pull_failures_{0};
   std::atomic<uint64_t> pull_releases_{0};
   std::atomic<uint64_t> pull_release_failures_{0};
-  std::atomic<uint64_t> ambiguous_get_quarantines_{0};
-  std::atomic<uint64_t> ambiguous_get_quarantined_bytes_{0};
-  // Raw ownership is intentional: without retirement proof no in-process
-  // event can prove these MRs/buffers safe to destroy. The OS/HCA reclaims
-  // them atomically with process teardown.
-  std::mutex quarantine_mu_;
-  std::vector<Conn*> quarantined_get_connections_;
-  std::vector<void*> quarantined_get_destinations_;
   std::atomic<uint64_t> keepalive_attempts_{0};
   std::atomic<uint64_t> keepalive_successes_{0};
   std::atomic<uint64_t> keepalive_failures_{0};

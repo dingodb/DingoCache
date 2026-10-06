@@ -28,7 +28,6 @@ TEST(Wire, ReqRoundTrip) {
 TEST(Wire, TenantScopedEpochAndPrefixAreExact) {
   EXPECT_EQ(kNativeProtoTcp, 6);
   EXPECT_EQ(kNativeProtoRdmaV2, 8);
-  EXPECT_EQ(kRdmaGetWindowMagic, 0x3357474du);  // "MGW3" little-endian
   EXPECT_EQ(rdma::kV2ProbeMagic, 0x33564644u);  // "DFV3" little-endian
   EXPECT_EQ(kReqPrefix, 50u);
 }
@@ -136,75 +135,6 @@ TEST(Wire, RespRejectsOversizedData) {
   EXPECT_EQ(dlen, kMaxFrameLen + 1);
 }
 
-TEST(Wire, V2GetScatterRoundTrip) {
-  char buf[512];
-  const BlockKey key{0x1122, 0x33445566778899aaULL,
-                     0xaabbccddeeff0011ULL};
-  const std::vector<RdmaWriteTarget> targets{
-      {0x100000, 0xA1, 1024}, {0x200000, 0xB2, 3072}};
-  size_t encoded = 0;
-  ASSERT_TRUE(EncodeRdmaGetReq(buf, sizeof(buf), key, 0, 4096, targets,
-                               &encoded));
-  EXPECT_EQ(encoded, RdmaGetFrameSize(2));
-
-  ReqFields req{};
-  RdmaGetFields get;
-  ASSERT_TRUE(DecodeRdmaGetReq(buf, encoded, &req, &get));
-  EXPECT_EQ(req.op, static_cast<uint8_t>(WireOp::kRange));
-  EXPECT_EQ(req.Key(), key);
-  EXPECT_EQ(req.length, 4096u);
-  ASSERT_EQ(get.targets.size(), 2u);
-  EXPECT_EQ(get.targets[0].addr, targets[0].addr);
-  EXPECT_EQ(get.targets[1].rkey, targets[1].rkey);
-  EXPECT_EQ(get.Capacity(), 4096u);
-}
-
-TEST(Wire, V2MultiWindowGetCarriesStableOperationIdentity) {
-  char buf[256] = {};
-  const BlockKey key{1, 2, 3};
-  const std::vector<RdmaWriteTarget> targets{
-      {0x1000, 7, 8}, {0x2000, 9, 8}};
-  size_t encoded = 0;
-  ASSERT_TRUE(EncodeRdmaGetReqWindow(
-      buf, sizeof(buf), key, 0, 64, targets,
-      /*operation_id=*/3, /*window_index=*/1, /*window_count=*/4,
-      /*logical_offset=*/16, /*total_capacity=*/64, &encoded));
-  EXPECT_EQ(net::GetU32(buf + kReqPrefix + 4), 0x3357474du);
-  EXPECT_EQ(net::GetU32(buf + kReqPrefix + 8), 3u);
-
-  ReqFields req{};
-  RdmaGetFields get;
-  ASSERT_TRUE(DecodeRdmaGetReq(buf, encoded, &req, &get));
-  EXPECT_EQ(req.Key(), key);
-  EXPECT_EQ(get.operation_id, 3u);
-  EXPECT_EQ(get.window_index, 1u);
-  EXPECT_EQ(get.window_count, 4u);
-  EXPECT_EQ(get.logical_offset, 16u);
-  EXPECT_EQ(get.total_capacity, 64u);
-  EXPECT_EQ(get.Capacity(), 16u);
-
-  net::PutU32(buf + kReqPrefix + 4, 0x3257474du);  // old "MGW2"
-  EXPECT_FALSE(DecodeRdmaGetReq(buf, encoded, &req, &get));
-}
-
-TEST(Wire, V2GetRejectsShortCapacityAndMalformedTarget) {
-  char buf[256];
-  size_t encoded = 0;
-  EXPECT_FALSE(EncodeRdmaGetReq(
-      buf, sizeof(buf), BlockKey{1, 2}, 0, 4096,
-      std::vector<RdmaWriteTarget>{{0x1000, 7, 1024}}, &encoded));
-  EXPECT_FALSE(EncodeRdmaGetReq(
-      buf, sizeof(buf), BlockKey{1, 2}, 0, 48,
-      std::vector<RdmaWriteTarget>{{0, 0, 48}}, &encoded));
-
-  ASSERT_TRUE(EncodeRdmaGetReq(
-      buf, sizeof(buf), BlockKey{1, 2}, 0, 48,
-      std::vector<RdmaWriteTarget>{{0x1000, 7, 48}}, &encoded));
-  net::PutU64(buf + kReqPrefix + kRdmaGetFixed, 0);
-  ReqFields req{};
-  RdmaGetFields get;
-  EXPECT_FALSE(DecodeRdmaGetReq(buf, encoded, &req, &get));
-}
 
 TEST(Wire, RdmaResponseRequiresNegotiatedVersionAndStoredLength) {
   char buf[kRespPrefix];
@@ -222,12 +152,9 @@ TEST(Wire, RdmaResponseRequiresNegotiatedVersionAndStoredLength) {
 
 TEST(Wire, PreviousRdmaEpochIsRejectedWithoutDecoding) {
   char buf[256] = {};
-  size_t encoded = 0;
-  ASSERT_TRUE(EncodeRdmaGetReq(
-      buf, sizeof(buf), BlockKey{1, 2, 3}, 0, 16,
-      std::vector<RdmaWriteTarget>{{0x1000, 7, 16}}, &encoded));
+  EncodeReqVersion(buf, kNativeProtoRdmaV2, WireOp::kPullRange,
+                   BlockKey{1, 2, 3}, 0, 16, rdma::kPullPrepareBytes);
   buf[0] = static_cast<char>(kNativeProtoRdmaV2 - 1);
   ReqFields request{};
-  RdmaGetFields get;
-  EXPECT_FALSE(DecodeRdmaGetReq(buf, encoded, &request, &get));
+  EXPECT_FALSE(DecodeReqVersion(buf, kNativeProtoRdmaV2, &request));
 }

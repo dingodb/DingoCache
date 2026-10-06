@@ -21,9 +21,9 @@ struct ResourceRequest {
 // constant. Scalar and SG payload operations share one exclusive-ownership
 // data pool; control traffic owns a second pool. Endpoint demand is nodes x
 // both pool limits; +25% headroom covers active operations and teardown churn.
-// The other dimensions follow the constructor defaults (QP = endpoints, WR =
-// endpoints x depth, registered = receive + pull arenas = 2 x slot x depth x
-// endpoints). floor_endpoints keeps small rings on the documented default.
+// Constructor admission limits retain conservative registered-byte headroom:
+// QP = endpoints, WR = endpoints x depth, bytes = 2 x slot x depth x endpoints.
+// Dynamic-only connections actually lease one resident receive slot per depth.
 // These are admission LIMITS, not allocations.
 inline ResourceRequest AdaptiveBudgetTarget(size_t nodes,
                                             size_t endpoints_per_pool,

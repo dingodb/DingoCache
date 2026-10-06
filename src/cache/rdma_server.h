@@ -1,7 +1,7 @@
 /* RDMA cache-node listener — native v2 libibverbs RC. Bounded 32,786-byte
  * per-QP control buffers share a process-wide registered payload segment.
  * Peers that cannot negotiate v2 are rejected.
- * The TCP listener bootstraps QPs and proves failed writer generations retired.
+ * The TCP listener bootstraps QPs and adapts v2.28 no-GET-WRITE proofs.
  * Startup discovers the first ACTIVE HCA automatically, or resolves every
  * explicitly configured HCA into a fixed topology (including initially inactive
  * ports), then anchors shared PD/MRs.
@@ -20,6 +20,7 @@
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 
 #ifdef DFKV_WITH_URING
@@ -87,9 +88,9 @@ class RdmaServer {
   void set_pinned_ram_handler(PinnedRamHandler h) {
     pinned_ram_handler_ = std::move(h);
   }
-  // Register a caller memory region (the RAM arena) as a pool MR on every
-  // connection's PD, so a RAM-hit payload resolves to an MR with no per-op
-  // ibv_reg_mr. Call before Start(); regions are applied as each connection opens.
+  // Attach caller memory regions as local pool MRs on each connection's PD.
+  // Dynamic GET always uses a separate exact, revocable remote READ MR even
+  // for a pool-backed RAM source. Call before Start().
   void RegisterMemory(void* base, size_t size);
 
   ~RdmaServer();
@@ -153,12 +154,6 @@ class RdmaServer {
   uint64_t V2PutWrites() const {
     return v2_put_writes_.load(std::memory_order_relaxed);
   }
-  uint64_t V2GetWrites() const {
-    return v2_get_writes_.load(std::memory_order_relaxed);
-  }
-  uint64_t V2GetContinuationSlotChanges() const {
-    return v2_get_continuation_slot_changes_.load(std::memory_order_relaxed);
-  }
   // The server-side pipeline depth (env DFKV_RDMA_DEPTH, default 4) -- surfaced
   // in ring INFO because the CLIENT's depth must not exceed it: excess in-flight
   // requests hit receiver-not-ready retries and degrade SILENTLY (measured 3-4x
@@ -188,15 +183,11 @@ class RdmaServer {
     std::shared_ptr<std::atomic<bool>> done;
   };
 
-  struct WriterState {
-    std::mutex mu;
-    std::condition_variable retired_cv;
-    rdma::RcEndpoint* endpoint = nullptr;
-    bool retired = false;
-  };
-  // Register a writer under an OS-random, nonzero token. Candidate insertion
-  // and collision detection are atomic with respect to retire lookups.
-  uint64_t RegisterWriter(const std::shared_ptr<WriterState>& writer);
+  // Server-only v2.28 transition identities. A live token proves an accepted
+  // dynamic connection, not a writer. No GET WRITE can be submitted anywhere
+  // in this server; close erases the token under the same lock as proof lookup.
+  uint64_t RegisterLegacyConnection();
+  void ForgetLegacyConnection(uint64_t token);
 
   // Per-device counters make a partial rail failure or affinity imbalance
   // visible without polling host counters. The rail set is fixed by Start().
@@ -206,8 +197,6 @@ class RdmaServer {
     std::atomic<uint64_t> completion_errors{0};
     std::atomic<uint64_t> put_writes{0};
     std::atomic<uint64_t> put_bytes{0};
-    std::atomic<uint64_t> get_writes{0};
-    std::atomic<uint64_t> get_bytes{0};
   };
 
   Handler handler_;
@@ -241,8 +230,10 @@ class RdmaServer {
     size_t recv_lease_bytes;
   };
   std::unordered_map<rdma::RcEndpoint*, LiveEndpoint> live_eps_;
-  std::mutex writer_mu_;
-  std::unordered_map<uint64_t, std::shared_ptr<WriterState>> writers_;
+  std::mutex legacy_mu_;
+  std::unordered_set<uint64_t> legacy_connections_tokens_;
+  uint64_t legacy_token_seed_ = 0;
+  uint64_t legacy_token_sequence_ = 0;
   // Receive memory is committed in fixed-size chunks on demand. Connections
   // lease only their negotiated slot geometry from any chunk; the old
   // DFKV_RDMA_RECV_SEGMENT_SIZE remains the hard process budget.
@@ -253,9 +244,6 @@ class RdmaServer {
   uint64_t recv_chunk_idle_ms_ = 60000;
   size_t recv_segment_registered_rails_ = 0;
   std::atomic<uint64_t> pull_connections_{0};
-  std::atomic<uint64_t> pull_memory_windows_{0};
-  std::atomic<uint64_t> pull_mr_fallbacks_{0};
-  std::atomic<uint64_t> legacy_connections_{0};
   std::atomic<uint64_t> data_connection_bytes_{0};
   std::atomic<uint64_t> control_connection_bytes_{0};
   // In-flight leased-PUT staging: receive memory held only while an
@@ -309,8 +297,7 @@ class RdmaServer {
       uring_inflight_max_{0}, uring_replies_posted_{0},
       uring_send_fences_{0}, uring_send_post_errors_{0},
       uring_init_fallbacks_{0};
-  std::atomic<uint64_t> v2_conns_{0}, v2_put_writes_{0}, v2_get_writes_{0};
-  std::atomic<uint64_t> v2_get_continuation_slot_changes_{0};
+  std::atomic<uint64_t> v2_conns_{0}, v2_put_writes_{0};
   std::atomic<uint64_t> completions_{0}, completion_errors_{0}, active_conns_{0},
       idle_reclaims_{0};
 };

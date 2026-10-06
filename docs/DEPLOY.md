@@ -16,11 +16,21 @@ v1.35 two-sided 数据面实测，v2 one-sided 需重测）。
 dfkv 把**控制面**与**数据面**解耦：
 
 - **控制面 = TCP + 两边 SEND/RECV**：bootstrap TCP 只交换设备/QP/receive-segment 描述；RDMA QP 的 request descriptor 有界，response buffer 显式预留 `18-byte prefix + 32 KiB`，使 32-KiB `Members` 在 control lane 完整返回；更大响应直接失败、不截断。
-- **payload = one-sided RDMA**：inline PUT 用 `RDMA_WRITE_WITH_IMM`；大对象通过操作级 lease 接收。直接 GET 由 client RDMA READ 拉取，支持动态 pull 的新 peer 不再保留连接级 pull arena。两项能力均独立协商，旧 peer 保留原数据面。数据 fabric 无需 IP。
+- **payload = one-sided RDMA**：inline PUT 用 `RDMA_WRITE_WITH_IMM`，大对象通过操作级 lease 接收；GET 一律由 client RDMA READ 拉取 exact grant，等待 RELEASE ACK 后连接回池，不保留固定 pull arena。server 只兼容 v2.28 默认 dynamic 握手，不接受旧 WRITE GET。数据 fabric 无需 IP。
 - **设备发现与拓扑**：留空时自动发现保持 `ACTIVE`-only（两端各选本地首个 port 1 `ACTIVE` HCA）；显式逗号白名单定义固定 topology，按首次出现顺序去重，server 会接纳**存在但启动时 DOWN** 的设备完成 anchor/MR 初始化并持续监控。运行期至少一条 initialized rail 健康即可承载 placement；最后一条健康 rail 丢失立即退环，0→非 0 恢复仍通过连续采样门。
 - **失败策略**：未设 `DFKV_RDMA` 时选择 TCP；一旦选择 RDMA，显式设备缺失、open/port/GID query 失败，或任一 configured rail 的 anchor、共享 receive-segment MR、RAM/user MR 初始化失败，均拒绝启动而不缩小 topology。client 配置 `DFKV_RDMA_RAIL_TIERS` 后还要求 MDS 返回完整 HLT1 peer topology；缺失/不完整或无兼容健康轨以 client-local `kNoCompatibleRail` fail closed，不切 TCP、不惩罚 peer。
 
 发现：默认走 **MDS 动态发现**（etcd + dfkv_mds，见 §2b）；静态成员表仍作为遗留/单节点备用路径（见 §4-legacy）。无副本（一致性哈希单属主，节点挂 = 该分片 miss → 重算）。
+
+### v2.31 过渡升级
+
+先升级 server，再升级推理 client。server 过渡层接受 v2.28 默认 dynamic
+client；显式关闭 dynamic 的旧连接不兼容。新 client 只支持新的 token-free
+握手，不能提前部署到旧 server，也不能升级 client 后单独回滚 server。
+逐副本排空请求并重启完整 TP/PP/EP 副本，核对每个 rank 的实际库版本；
+磁盘铺货或切换软链不会更新运行中的进程，不做进程内 `.so` 热替换。
+节点重启时的重连、外部命中恢复和模型请求仍需单独验收。
+
 
 ---
 
@@ -484,7 +494,6 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `DFKV_RDMA_RECV_CHUNK_IDLE_MS` | `60000` | 空闲非初始chunk返还延迟；`0`关闭缩容 |
 | `DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES` | `256 KiB` | client adaptive data-QP 最小 class；实际对象向上取 power-of-two |
 | `DFKV_RDMA_INLINE_PUT_MAX_BYTES` | `4 MiB` | client 超阈 PUT 使用操作级 lease；`0`/空值禁用，不改变业务对象上限 |
-| `DFKV_RDMA_DYNAMIC_PULL` | `1` | client 协商动态 direct GET 与显式 release ACK；`0`保留旧 pull arena |
 | `DFKV_RDMA_CONNECT_MS` | `3000` | client TCP bootstrap **建连**超时（毫秒），不覆盖整个 QP 初始化或后续读写 |
 | `DFKV_RDMA_IO_MS` | `10000` | client TCP bootstrap 帧读写超时（毫秒）；RDMA completion 另由 `DFKV_RDMA_OP_TIMEOUT_MS` 限定 |
 | `DFKV_RDMA_BATCH_OP_TIMEOUT_MS` | 0=跟随 RDMA_OP | client：multi-item Cache/Range/Exist、SG 窗口总期限 |
@@ -555,7 +564,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `DFKV_RDMA_ENDPOINT_CACHE_MAX` | 自适应（下限 `256`） | 所有 client handle 共享的 live endpoint 上限；按 `节点数 × 2 pools × max(pool 上限, configured rails) × 1.25` 自动放大；显式设置任一预算 env 会固定全部预算 |
 | `DFKV_RDMA_QP_BUDGET` | endpoint 上限 | process-wide QP 预算 |
 | `DFKV_RDMA_WR_BUDGET` | endpoint 上限 × depth | process-wide negotiated WR slot 预算 |
-| `DFKV_RDMA_REGISTERED_BYTES_BUDGET` | endpoint 上限 × depth × 2 × receive slot | live endpoint 对端 receive + pull arena lease 字节预算 |
+| `DFKV_RDMA_REGISTERED_BYTES_BUDGET` | endpoint 上限 × depth × 2 × receive slot（沿用保守 admission 上限） | 实际 live endpoint 只租用 resident receive slot；GET exact grant 按操作申请，不保留连接级 pull arena |
 | `DFKV_RDMA_RESOURCE_ACQUIRE_MS` | `10000` | 建立新 QP 前等待全部资源额度的上限；超时明确失败，不超发 |
 | `DFKV_BATCH_CONCURRENCY` | `0`=auto（auto: `min(max(nodes, 8), 32)`） | TCP/write/兼容路径的 batch 分段并发度。RDMA read 的实际 process-wide 并发由 `DFKV_RDMA_READ_WORKERS` 限制 |
 | `DFKV_GET_MISS_RETRIES` | `1` | client GET miss 后发重试次数 |

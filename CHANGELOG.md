@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+
 - Preserve an initial, hard-budgeted receive chunk for dynamic GET and
   leased-PUT staging when enough connection capacity remains. Connection
   leases cannot fragment that chunk; pressure recovery reclaims only
@@ -385,6 +386,29 @@
   pinned until process exit rather than risking release while the driver may
   still reference it. Deployments must provision `RLIMIT_MEMLOCK` for the
   pool's lazy high-water plus other locked memory.
+
+## 2.31.0
+
+- Make every RDMA GET, including string `Range`/`RangeMany`, use dynamic
+  one-sided READ grants with explicit RELEASE/ACK. Remove responder-WRITE GET,
+  fixed pull arenas, writer cancellation/CQ-drain ownership and the
+  `DFKV_RDMA_DYNAMIC_PULL` escape hatch. PUT WRITE operations remain.
+- Give new clients a dynamic-only handshake and token-free 25-byte readiness.
+  Servers retain a bounded v2.28 default-client adapter: legacy dynamic
+  bootstrap gets its original 33-byte readiness and a real live-connection
+  token. Retirement proofs validate that connection and the invariant that
+  this server never issues GET WRITE; unknown/closed tokens fail.
+- Upgrade servers first, then clients. New clients reject old servers;
+  v2.28 clients with dynamic pull disabled and historical WRITE GET APIs are
+  not supported. Do not roll a server back after activating new clients
+  without restoring matching clients.
+- Promote disk reads into the RAM tier only when the returned bytes contain
+  the complete object. Cold slices can no longer replace the whole cached
+  value. Keep offset, full stored length and returned slice length distinct.
+- Preserve io_uring preparation and source ownership for dynamic GET,
+  depth-windowed string batches, whole-object capacity rejection and
+  explicit release of empty EOF grants. Remove retired GET-WRITE/fixed-pull
+  metric series rather than exposing misleading zero aliases.
 
 ## v2.19.0 — 2026-08-13
 

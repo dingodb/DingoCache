@@ -157,7 +157,7 @@ RDMA-listener scrape inventory。
 | `dfkv_rdma_completions_total` / `dfkv_rdma_completion_errors_total` | counter | RDMA 请求完成 / 错误完成 |
 | `dfkv_rdma_active_conns` | gauge | 当前服务中的 RDMA 连接 |
 | `dfkv_rdma_v2_conns_opened_total` | counter | server 累计打开的 v2 连接 |
-| `dfkv_rdma_v2_put_writes_total` / `dfkv_rdma_v2_get_writes_total` | counter | server 实际收到的 `WRITE_WITH_IMM` PUT / 实际发出的 RDMA WRITE GET payload |
+| `dfkv_rdma_v2_put_writes_total` | counter | server 实际收到的 `WRITE_WITH_IMM` PUT |
 | `dfkv_rdma_recv_segment_bytes` / `max_bytes` / `chunks` | gauge | receive-pool 当前提交量 / hard budget / 已提交 chunk 数 |
 | `dfkv_rdma_recv_segment_used_bytes` / `free_bytes` | gauge | 已提交 chunk 中所有 lease 占用 / 全部空闲字节，**含 staging 专用 chunk**；后者不等于连接可分配字节 |
 | `dfkv_rdma_recv_segment_largest_free_range_bytes` | gauge | 任一 chunk 最大连续 free range，含 staging 专用 chunk |
@@ -166,8 +166,7 @@ RDMA-listener scrape inventory。
 | `dfkv_rdma_recv_segment_growths_total` / `growth_failures_total` | counter | 启动后 chunk 增长成功 / 因预算或分配失败 |
 | `dfkv_rdma_recv_segment_shrinks_total` / `released_bytes_total` / `chunk_idle_ms` | counter / gauge | 空闲缩容次数 / 已返还字节 / 非初始chunk空闲保留期 |
 | `dfkv_rdma_recv_segment_allocation_failures_total` | counter | grow 后仍无法满足的最终 allocation |
-| `dfkv_rdma_pull_connections` / `dfkv_rdma_legacy_connections` | gauge | 当前 pull-read / legacy responder-write connection 数 |
-| `dfkv_rdma_pull_memory_windows_total` / `dfkv_rdma_pull_mr_fallbacks_total` | counter | legacy 固定 pull arena 的 type-2 MW / per-connection MR 建立次数；dynamic pull 不增加这两个计数 |
+| `dfkv_rdma_pull_connections` | gauge | 当前 dynamic pull 连接数，包含新握手和 v2.28 dynamic 过渡连接 |
 | `dfkv_rdma_pull_zerocopy_served_total` | counter | 为 RAM arena 命中准备的 zero-copy dynamic-pull READY 数，不等于客户端成功完成的 READ 数 |
 | `dfkv_rdma_dynamic_get_mr_active` | gauge | 当前进程存活的 exact dynamic READ MR；PullRelease 先撤销 MR，再释放 RAM pin，断连由 QP 销毁完成 fencing |
 | `dfkv_op_latency_seconds{op="get"}`（arena pull） | histogram | 记录 RAM handler 准备耗时，与 staged range handler 的计时边界一致；成功 PullRelease 后才提交样本，不包含客户端持有 grant、RDMA READ 或 MR 撤销时间。端到端延迟看客户端 bench，不能用此序列替代 |
@@ -179,10 +178,13 @@ RDMA-listener scrape inventory。
 | `dfkv_rdma_rail_active_conns{dev}` | gauge | 每个本地 HCA 上当前连接数 |
 | `dfkv_rdma_rail_completions_total{dev}` / `dfkv_rdma_rail_completion_errors_total{dev}` | counter | 每 rail 请求完成 / 错误完成 |
 | `dfkv_rdma_rail_put_writes_total{dev}` / `dfkv_rdma_rail_put_bytes_total{dev}` | counter | 每 rail 收到的 PUT one-sided writes / payload bytes |
-| `dfkv_rdma_rail_get_writes_total{dev}` / `dfkv_rdma_rail_get_bytes_total{dev}` | counter | 每 rail 发出的 GET one-sided writes / payload bytes |
 
 RAM zero-copy pull 的 cache-hit、read-bytes 和采样 GET 延迟在有效 PullRelease
 完成时计入。准备阶段探测和失败后 staged fallback 不重复计数；断连中止不当作成功读取。
+
+v2.31 删除 server/client GET-WRITE、固定 pull MR/MW、legacy connection 和
+ambiguous GET quarantine 的专属序列；不保留值为零的兼容别名。GET 传输看
+client pull READ/release 与 server exact-grant/pin 指标。
 
 > **v2 上线判据**：显式 topology 必须
 > `configured == initialized == dfkv_rdma_recv_segment_registered_rails`。
@@ -341,7 +343,7 @@ C 客户端快照还含传输级指标（RDMA 构建）：
 | 指标 | 类型 | 含义 |
 |---|---|---|
 | `dfkv_rdma_client_conns_opened_total` | counter | 累计打开的 RDMA client QP |
-| `dfkv_rdma_client_v2_put_writes_total` / `dfkv_rdma_client_v2_get_writes_total` | counter | 实际发出的 v2 one-sided PUT / GET |
+| `dfkv_rdma_client_v2_put_writes_total` | counter | 实际发出的 v2 one-sided PUT |
 | `dfkv_rdma_client_mr_regions` / `dfkv_rdma_client_mr_registered_bytes` | gauge | 所有 active rail 已成功 anchor 后才发布的 host pool MR 区域数 / 声明字节数；任一 rail 失败时两者保持上次成功值 |
 | `dfkv_rdma_client_mr_registration_rejections_total` | counter | 非法 range、rail anchor 或 `ibv_reg_mr` 失败而未发布（已回滚）的声明次数 |
 | `dfkv_rdma_client_adhoc_user_mr_total` / `dfkv_rdma_client_transient_user_mr_active` | counter / gauge | pool 外实际注册累计 / 当前仍存活的一次性 MR；公开调用返回后 active 必须回到调用前基线 |

@@ -34,6 +34,9 @@ class KvNodeServerWiringTestPeer {
   static void SetLimit(KvNodeServer& server, size_t limit) {
     server.put_busy_limit_ = limit;
   }
+  static void SetCoalescing(KvNodeServer& server, bool enabled) {
+    server.coalesce_enabled_ = enabled;
+  }
   static bool Begin(KvNodeServer& server) { return server.TryBeginPut(); }
   static void End(KvNodeServer& server) { server.EndPut(); }
   static void SetRam(KvNodeServer& server, RamTier::FlushFn flush,
@@ -87,6 +90,14 @@ class CountingStore : public KVStore {
     calls_.fetch_add(1, std::memory_order_relaxed);
     return KVStore::CacheDirect(key, data, len, cap);
   }
+  Status RangeDirect(const BlockKey& key, uint64_t offset, uint64_t length,
+                     char* io_buf, size_t io_cap, const char** out_data,
+                     size_t* out_len, size_t* value_len) override {
+    direct_reads.fetch_add(1, std::memory_order_relaxed);
+    return KVStore::RangeDirect(key, offset, length, io_buf, io_cap, out_data,
+                                out_len, value_len);
+  }
+  std::atomic<size_t> direct_reads{0};
 
  private:
   std::atomic<size_t>& calls_;
@@ -368,6 +379,128 @@ TEST(RamTierWiring, CapacityBypassPreservesConcurrentDuplicateValue) {
       server.reset();
       fs::remove_all(dir);
     }
+  }
+}
+
+TEST(RamTierWiring, ColdDirectSliceDoesNotReplaceWholeValue) {
+  std::string value(8192 + 317, '\0');
+  for (size_t i = 0; i < value.size(); ++i)
+    value[i] = static_cast<char>('!' + i % 90);
+  for (bool coalesce : {false, true}) {
+    for (size_t offset : {size_t{0}, size_t{73}, value.size() - 121}) {
+      SCOPED_TRACE("coalesce=" + std::to_string(coalesce) +
+                   " offset=" + std::to_string(offset));
+      const auto dir = fs::temp_directory_path() /
+          ("dfkv_direct_slice_" + std::to_string(coalesce) +
+           "_" + std::to_string(offset));
+      fs::remove_all(dir);
+      fs::create_directories(dir);
+      std::atomic<size_t> disk_puts{0};
+      CountingStore* store = nullptr;
+      DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+      options.engine_factory = [&](const std::string& path, uint64_t capacity) {
+        auto engine = std::make_unique<CountingStore>(path, capacity, disk_puts);
+        store = engine.get();
+        return engine;
+      };
+      auto server = KvNodeServerWiringTestPeer::Create(std::move(options));
+      KvNodeServerWiringTestPeer::SetCoalescing(*server, coalesce);
+      KvNodeServerWiringTestPeer::SetRam(
+          *server, [](const BlockKey&, char*, size_t, size_t) { return false; });
+      const BlockKey key{8201, 0};
+      // Seed disk directly: the first range is deterministically a cold read.
+      ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(
+                    *server, key, value.data(), value.size()), Status::kOk);
+      ASSERT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, key));
+      alignas(4096) char staging[16 * 1024];
+      const char* data = nullptr;
+      size_t bytes = 0, value_len = 0;
+      const size_t length = offset == 0 ? 233 : 5001;
+      ASSERT_EQ(server->RangeDirectForKey(
+                    key, offset, length, staging, sizeof(staging),
+                    &data, &bytes, &value_len), Status::kOk);
+      ASSERT_NE(data, nullptr);
+      EXPECT_EQ(std::string(data, bytes), value.substr(offset, length));
+      EXPECT_EQ(value_len, value.size());
+      EXPECT_EQ(store->direct_reads.load(), 1u);
+      EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, key))
+          << "Before the fix, a cold slice was installed as the whole value";
+
+      // A complete read must still return the original bytes and stored length,
+      // including when the requested length is larger than the stored value.
+      ASSERT_EQ(server->RangeDirectForKey(
+                    key, 0, value.size() + 4096, staging, sizeof(staging),
+                    &data, &bytes, &value_len), Status::kOk);
+      ASSERT_NE(data, nullptr);
+      EXPECT_EQ(bytes, value.size());
+      EXPECT_EQ(std::string(data, bytes), value);
+      EXPECT_EQ(value_len, value.size());
+      EXPECT_EQ(store->direct_reads.load(), 2u);
+      EXPECT_TRUE(KvNodeServerWiringTestPeer::Resident(*server, key));
+
+      // Behavior, not just membership: promotion exposes the complete pinned
+      // arena value and subsequent direct reads do not enter the disk backend.
+      {
+        PreparedRead pinned;
+        ASSERT_TRUE(server->RamPinnedHitForKey(key, 0, value.size(), &pinned));
+        EXPECT_EQ(pinned.payload_len(), value.size());
+        EXPECT_EQ(pinned.value_len(), value.size());
+        EXPECT_EQ(std::string(pinned.data(), pinned.payload_len()), value);
+      }
+      ASSERT_EQ(server->RangeDirectForKey(
+                    key, 0, value.size(), staging, sizeof(staging),
+                    &data, &bytes, &value_len), Status::kOk);
+      EXPECT_EQ(std::string(data, bytes), value);
+      EXPECT_EQ(value_len, value.size());
+      EXPECT_EQ(store->direct_reads.load(), 2u);
+      server.reset();
+      fs::remove_all(dir);
+    }
+  }
+}
+
+TEST(RamTierWiring, ColdWholeDirectReadPromotesWithoutLengthOutput) {
+  for (bool coalesce : {false, true}) {
+    SCOPED_TRACE("coalesce=" + std::to_string(coalesce));
+    const auto dir = fs::temp_directory_path() /
+        ("dfkv_direct_whole_" + std::to_string(coalesce));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    std::atomic<size_t> disk_puts{0};
+    CountingStore* store = nullptr;
+    DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+    options.engine_factory = [&](const std::string& path, uint64_t capacity) {
+      auto engine = std::make_unique<CountingStore>(path, capacity, disk_puts);
+      store = engine.get();
+      return engine;
+    };
+    auto server = KvNodeServerWiringTestPeer::Create(std::move(options));
+    KvNodeServerWiringTestPeer::SetCoalescing(*server, coalesce);
+    KvNodeServerWiringTestPeer::SetRam(
+        *server, [](const BlockKey&, char*, size_t, size_t) { return false; });
+    const BlockKey key{8202, 0};
+    const std::string value(4096 + 111, 'w');
+    ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(
+                  *server, key, value.data(), value.size()), Status::kOk);
+    ASSERT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, key));
+    alignas(4096) char staging[8192];
+    const char* data = nullptr;
+    size_t bytes = 0;
+    // value_len is optional; omitting it must not suppress whole promotion.
+    ASSERT_EQ(server->RangeDirectForKey(
+                  key, 0, value.size(), staging, sizeof(staging),
+                  &data, &bytes), Status::kOk);
+    ASSERT_NE(data, nullptr);
+    EXPECT_EQ(std::string(data, bytes), value);
+    EXPECT_EQ(store->direct_reads.load(), 1u);
+    EXPECT_TRUE(KvNodeServerWiringTestPeer::Resident(*server, key));
+    ASSERT_EQ(server->RangeDirectForKey(
+                  key, 0, value.size(), staging, sizeof(staging),
+                  &data, &bytes), Status::kOk);
+    EXPECT_EQ(std::string(data, bytes), value);
+    EXPECT_EQ(store->direct_reads.load(), 1u);
+    server.reset();
+    fs::remove_all(dir);
   }
 }
 

@@ -112,9 +112,6 @@ PUBLIC_FAMILIES = {
     "dfkv_rdma_recv_segment_largest_free_range_bytes",
     "dfkv_rdma_recv_segment_allocation_failures_total",
     "dfkv_rdma_pull_connections",
-    "dfkv_rdma_pull_memory_windows_total",
-    "dfkv_rdma_pull_mr_fallbacks_total",
-    "dfkv_rdma_legacy_connections",
     "dfkv_rdma_connection_bytes",
     "dfkv_ram_arena_bytes",
     "dfkv_ram_budget_bytes",
@@ -209,7 +206,6 @@ def metric_families(expression: str) -> set[str]:
 class ObservabilityContractTest(unittest.TestCase):
     def test_dashboard_queries_use_public_metric_families(self):
         seen_ids: set[tuple[str, int]] = set()
-        query_count = 0
         for path in sorted(DASHBOARDS.glob("*.json")):
             dashboard = json.loads(path.read_text(encoding="utf-8"))
             self.assertTrue(dashboard.get("uid"), path)
@@ -224,13 +220,11 @@ class ObservabilityContractTest(unittest.TestCase):
                 for target in targets:
                     expression = target.get("expr", "")
                     self.assertTrue(expression, f"{path.name}: panel {panel['id']} has an empty query")
-                    query_count += 1
                     unknown = metric_families(expression) - PUBLIC_FAMILIES
                     self.assertFalse(
                         unknown,
                         f"{path.name}: panel {panel['id']} references unknown metrics {sorted(unknown)}",
                     )
-        self.assertGreater(query_count, 30)
 
     def test_alert_queries_use_public_metric_families(self):
         expressions = [

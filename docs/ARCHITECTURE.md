@@ -147,7 +147,7 @@ retired identity/value format.
 | path | request/control frame | response/control frame | payload |
 |---|---:|---:|---|
 | native TCP | 50-byte fixed prefix + inline payload | 18-byte stored-length prefix + inline payload | versioned stream |
-| native RDMA v2 | 50-byte prefix; GET adds 4 bytes + 16 bytes per destination | 18-byte stored-length prefix; `Members` allows at most 32 KiB data | PUT `WRITE_WITH_IMM` into a leased server slot; GET server `RDMA_WRITE` into client MRs |
+| native RDMA v2 | 50-byte prefix; GET adds a 16-byte pull prepare | 18-byte stored-length prefix; GET READY adds 48 bytes; `Members` allows at most 32 KiB data | PUT `WRITE_WITH_IMM` into a leased server slot; GET client `RDMA_READ` from an exact server grant |
 
 Both prefixes start with an explicit 1-byte protocol epoch: TCP accepts epoch 6
 and native RDMA v2 accepts epoch 7. An unknown or unexpected epoch fails fast
@@ -172,10 +172,13 @@ Production discovery uses MDS.
 - The client selects a second power-of-two class from the operation's requested
   window: scalar QPs open at depth 1, while batches reuse/open the smallest
   sufficient depth up to the client/server ceiling.
-- Optional PUT and dynamic-pull capabilities are negotiated before geometry
-  selection and cached by peer identity/publication. Legacy peers retain
-  receive plus pull slots and their 73-byte readiness frame. Dynamic peers
-  omit the resident pull arena and use the 33-byte retirement readiness frame.
+- Leased PUT remains optional; dynamic pull is mandatory for GET. New clients
+  require the dynamic-only probe capability and bootstrap request, then read
+  token-free 25-byte readiness. Servers also accept v2.28 default dynamic
+  clients with their original 33-byte readiness and a live connection token.
+  No fixed arena is allocated. Historical WRITE GET is rejected before DMA.
+  Legacy token proof is based on a known connection and the invariant that
+  this server cannot issue GET WRITE, not a retained writer/CQ-drain engine.
 - A resident slot is `align4K(4096 + connection_class)`. Both resident slots
   and transient PUT/GET leases consume the same process hard budget. Empty
   non-initial chunks return after `DFKV_RDMA_RECV_CHUNK_IDLE_MS`.
@@ -221,8 +224,8 @@ Production discovery uses MDS.
   rail — locality is a preference, never an availability gate.
 
 `dfkv_rdma_v2_ready`, receive-segment total/free bytes, registered-rail count,
-opened connections, v2 PUT/GET WRITE counters, client rail-vs-endpoint failure
-and quarantine counters, and bounded NUMA-fallback counters make these
+opened connections, PUT WRITE counters, client READ/release counters,
+rail-vs-endpoint failure and rail quarantine counters, and NUMA-fallback counters make these
 invariants observable. See [CONNECTORS.md](CONNECTORS.md) §1.2.1 for capacity
 arithmetic and [DEPLOY.md](DEPLOY.md) §3 for rollout settings.
 
@@ -356,18 +359,17 @@ the allocator's pin count — this is why the allocator was built media-agnostic
   as durable; on success the same pin becomes the first transfer-pin.
 - **flush-pin** — taken on write-back admission, released when the flush reaches
   disk or is canceled.
-- **transfer-pin** — taken on `GetPrep`; responder-WRITE replies release it at
-  their signaled SEND fence. Dynamic pull holds it through the peer READ and
-  revokes the exact READ MR before releasing the pin on PullRelease. REMOVE
-  hides an entry immediately but cannot reuse its pinned allocation.
+- **transfer-pin** — taken on `GetPrep`; dynamic pull holds it through the peer
+  READ and revokes the exact READ MR before releasing it on PullRelease.
+  REMOVE hides an entry immediately but cannot reuse its pinned allocation.
 
 **RDMA zero-copy serve**: the arena is registered on each selected device's
 shared PD. Dynamic pull lends an exact, revocable READ capability for the
 requested resident bytes, avoiding a staging copy. Successful read accounting
 is committed at PullRelease; connection teardown first fences the endpoint,
-then aborts the pin without counting a successful read. The responder-WRITE
-path still sends arena bytes to advertised client targets and holds its source
-until the final status SEND completes. Reply buffers also remain owned until
+then aborts the pin without counting a successful read. Disk slices are not
+promoted as whole RAM values: promotion requires offset zero and the actual
+returned length equal to the full stored length. Reply buffers remain owned until
 their SEND fence, but a consumed control/PUT receive is posted before its reply
 can reach the peer. If the next request arrives before a reply buffer is free,
 a FIFO retains its CQE and receive-buffer ownership (at most the negotiated

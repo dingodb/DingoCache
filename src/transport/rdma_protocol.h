@@ -16,18 +16,14 @@ namespace dfkv::rdma {
 
 // v2 endpoints keep bounded two-sided request/response buffers. Large PUT
 // payloads land at the aligned data area of a shared server receive segment;
-// GET payloads are RDMA-WRITEd into client-owned memory. Members is the only
-// variable-size two-sided datapath response and has an explicit 32-KiB contract.
+// GET payloads are initiator READs through operation-scoped grants. Members is
+// the only variable-size two-sided response and has a 32-KiB contract.
 // The prefix is included in the registered control-buffer capacity so the exact
 // boundary is representable without truncation or a connection abort.
 constexpr size_t kV2ControlResponseMax = 32u << 10;
 constexpr size_t kV2ControlCap = kRespPrefix + kV2ControlResponseMax;
 constexpr size_t kV2DataOffset = 4096;
 constexpr size_t kV2PutPrefixOffset = kV2DataOffset - kReqPrefix;
-// Fleet-wide protocol bound. A GET target is one server RDMA WRITE WR, not one
-// local QP SGE; tying this to either peer's max_sge breaks heterogeneous HCAs.
-// Keep it equal to the public SG layout's maximum payload width.
-constexpr size_t kV2MaxGetTargets = 29;
 
 // A kCache request with offset=kV2MultiWrPutMagic and length>1 starts an
 // ordered multi-WR PUT. payload_len remains the logical object size; each
@@ -49,6 +45,7 @@ constexpr uint8_t kV2ProbeCapPullRead = 1u << 1;
 // fall back to the connection-resident receive-slot path.
 constexpr uint8_t kV2ProbeCapLeasedPut = 1u << 2;
 constexpr uint8_t kV2ProbeCapDynamicPull = 1u << 3;
+constexpr uint8_t kV2ProbeCapDynamicOnly = 1u << 4;
 
 inline bool IsV2Probe(const char frame[kDevNameBytes]) {
   size_t n = 0;
@@ -61,7 +58,7 @@ inline void EncodeV2ProbeReply(
     char out[kV2ProbeReplyBytes],
     uint8_t capabilities = kV2ProbeCapWriterRetirement |
                            kV2ProbeCapPullRead | kV2ProbeCapLeasedPut |
-                           kV2ProbeCapDynamicPull) {
+                           kV2ProbeCapDynamicPull | kV2ProbeCapDynamicOnly) {
   std::memset(out, 0, kV2ProbeReplyBytes);
   std::memcpy(out, &kV2ProbeMagic, sizeof(kV2ProbeMagic));
   out[4] = static_cast<char>(kDevProtoV2);
@@ -101,11 +98,14 @@ inline bool V2ProbeSupportsDynamicPull(
   return (ParseV2ProbeCapabilities(in) & kV2ProbeCapDynamicPull) != 0;
 }
 
-// Failure-path writer retirement. The client reconnects with the opaque
-// per-QP writer token. The responder cancels later PostWrite calls, transitions
-// that QP to ERR, drains every signaled WRITE CQE, and only then echoes proof.
-// The proof is the protocol fence that permits retry/return with the same
-// caller/CUDA destination; QP destruction and MR teardown are not fences.
+inline bool V2ProbeSupportsDynamicOnly(const char in[kV2ProbeReplyBytes]) {
+  return (ParseV2ProbeCapabilities(in) & kV2ProbeCapDynamicOnly) != 0;
+}
+
+// Server-only v2.28 transition proof. A token names an accepted legacy dynamic
+// connection. Since the server never submits GET WRITEs, known live tokens can
+// be proved immediately; unknown or closed tokens are rejected. Remove this
+// adapter when deployed clients and rollback entries no longer use v2.28.
 constexpr const char* kV2RetireWriterDevice = "__dfkv_retire__";
 constexpr uint64_t kV2RetireProofMagic = 0x32524657564b4644ull;  // "DFKVWFR2"
 constexpr size_t kV2WriterTokenBytes = 8;
@@ -131,12 +131,6 @@ inline bool ParseV2RetireProof(
          net::GetU64(in + 8) == token;
 }
 
-// Multi-window GET IDs name one of the negotiated per-connection logical
-// request slots. Keeping the namespace bounded by queue depth both caps server
-// state and makes duplicate ownership explicit.
-inline bool V2GetOperationIdValid(uint32_t operation_id, size_t depth) {
-  return depth != 0 && operation_id < depth;
-}
 
 inline size_t AlignUp(size_t value, size_t alignment) {
   if (alignment == 0 || (alignment & (alignment - 1)) != 0 ||
@@ -223,41 +217,6 @@ inline bool DecodeRecvSegmentInfo(const char in[kRecvSegmentInfoBytes],
              std::numeric_limits<uint64_t>::max() - (info->slot_size - 1);
 }
 
-struct PullArenaInfo {
-  uint64_t base_addr = 0;
-  uint64_t arena_bytes = 0;
-  uint64_t connection_generation = 0;
-  uint32_t rkey = 0;
-  uint32_t slot_count = 0;
-};
-
-constexpr uint32_t kPullArenaInfoMagic = 0x324c5550u;  // "PUL2" (LE)
-constexpr size_t kPullArenaInfoBytes = 40;
-
-inline void EncodePullArenaInfo(const PullArenaInfo& info,
-                                char out[kPullArenaInfoBytes]) {
-  std::memset(out, 0, kPullArenaInfoBytes);
-  net::PutU32(out, kPullArenaInfoMagic);
-  net::PutU32(out + 4, info.rkey);
-  net::PutU64(out + 8, info.base_addr);
-  net::PutU64(out + 16, info.arena_bytes);
-  net::PutU64(out + 24, info.connection_generation);
-  net::PutU32(out + 32, info.slot_count);
-}
-
-inline bool DecodePullArenaInfo(const char in[kPullArenaInfoBytes],
-                                PullArenaInfo* info) {
-  if (net::GetU32(in) != kPullArenaInfoMagic) return false;
-  info->rkey = net::GetU32(in + 4);
-  info->base_addr = net::GetU64(in + 8);
-  info->arena_bytes = net::GetU64(in + 16);
-  info->connection_generation = net::GetU64(in + 24);
-  info->slot_count = net::GetU32(in + 32);
-  return info->rkey != 0 && info->base_addr != 0 &&
-         info->arena_bytes != 0 && info->connection_generation != 0 &&
-         info->slot_count != 0;
-}
-
 struct PullPrepareControl {
   uint32_t slot_index = 0;
   uint64_t release_generation = 0;
@@ -282,41 +241,6 @@ inline bool DecodePullPrepareControl(
   return true;
 }
 
-struct PullReady {
-  uint32_t slot_index = 0;
-  uint64_t slot_generation = 0;
-  uint64_t data_len = 0;
-  uint64_t value_len = 0;
-};
-
-constexpr uint32_t kPullReadyMagic = 0x32594452u;  // "RDY2" (LE)
-constexpr size_t kPullReadyBytes = 40;
-
-inline void EncodePullReady(const PullReady& ready,
-                            char out[kPullReadyBytes]) {
-  std::memset(out, 0, kPullReadyBytes);
-  net::PutU32(out, kPullReadyMagic);
-  net::PutU32(out + 4, ready.slot_index);
-  net::PutU64(out + 8, ready.slot_generation);
-  net::PutU64(out + 16, ready.data_len);
-  net::PutU64(out + 24, ready.value_len);
-}
-
-inline bool DecodePullReady(const char in[kPullReadyBytes],
-                            PullReady* ready) {
-  if (net::GetU32(in) != kPullReadyMagic) return false;
-  ready->slot_index = net::GetU32(in + 4);
-  ready->slot_generation = net::GetU64(in + 8);
-  ready->data_len = net::GetU64(in + 16);
-  ready->value_len = net::GetU64(in + 24);
-  return ready->slot_generation != 0;
-}
-
-// Negotiated dynamic-pull connections omit the resident PullArenaInfo from
-// bootstrap: readiness is exactly kV2RetirementReadinessBytes (33 bytes).
-// Each kPullRange then publishes an operation-scoped READ capability; client
-// must finish READs and receive kPullRelease acknowledgement before pooling
-// its connection. Legacy connections retain their original 40-byte ready.
 struct DynamicPullReady {
   uint32_t slot_index = 0;
   uint64_t slot_generation = 0;
@@ -412,18 +336,26 @@ inline bool DecodeLeasePutReady(const char in[kLeasePutReadyBytes],
   return ready->generation != 0;
 }
 
-// The original readiness response is exactly one ready byte plus the 24-byte
-// receive-segment descriptor. A negotiated writer-retirement connection
-// appends its nonzero token; an unnegotiated client must see no extra bytes.
-constexpr size_t kV2LegacyReadinessBytes = 1 + kRecvSegmentInfoBytes;
+// New dynamic-only readiness has no writer token. The server-only v2.28
+// adapter appends a real connection token to the same receive descriptor.
+constexpr size_t kV2DynamicOnlyReadinessBytes = 1 + kRecvSegmentInfoBytes;
 constexpr size_t kV2RetirementReadinessBytes =
-    kV2LegacyReadinessBytes + kV2WriterTokenBytes;
-static_assert(kV2LegacyReadinessBytes == 25);
+    kV2DynamicOnlyReadinessBytes + kV2WriterTokenBytes;
+static_assert(kV2DynamicOnlyReadinessBytes == 25);
 
-inline size_t V2ReadinessBytes(bool writer_retirement_negotiated) {
-  return writer_retirement_negotiated ? kV2RetirementReadinessBytes
-                                      : kV2LegacyReadinessBytes;
+inline size_t EncodeV2DynamicOnlyReadiness(
+    const RecvSegmentInfo& info, char out[kV2DynamicOnlyReadinessBytes]) {
+  out[0] = 1;
+  EncodeRecvSegmentInfo(info, out + 1);
+  return kV2DynamicOnlyReadinessBytes;
 }
+
+inline bool DecodeV2DynamicOnlyReadiness(
+    const char* in, size_t bytes, RecvSegmentInfo* info) {
+  return bytes == kV2DynamicOnlyReadinessBytes && in[0] == 1 &&
+         DecodeRecvSegmentInfo(in + 1, info);
+}
+
 
 inline size_t EncodeV2Readiness(
     const RecvSegmentInfo& info, uint64_t writer_token,
@@ -431,45 +363,20 @@ inline size_t EncodeV2Readiness(
   std::memset(out, 0, kV2RetirementReadinessBytes);
   out[0] = 1;
   EncodeRecvSegmentInfo(info, out + 1);
-  if (writer_token == 0) return kV2LegacyReadinessBytes;
-  net::PutU64(out + kV2LegacyReadinessBytes, writer_token);
+  if (writer_token == 0) return 0;
+  net::PutU64(out + kV2DynamicOnlyReadinessBytes, writer_token);
   return kV2RetirementReadinessBytes;
 }
 
-constexpr size_t kV2PullReadinessBytes =
-    kV2RetirementReadinessBytes + kPullArenaInfoBytes;
-
-inline size_t EncodeV2PullReadiness(
-    const RecvSegmentInfo& recv_info, uint64_t writer_token,
-    const PullArenaInfo& pull_info, char out[kV2PullReadinessBytes]) {
-  std::memset(out, 0, kV2PullReadinessBytes);
-  const size_t base = EncodeV2Readiness(recv_info, writer_token, out);
-  if (base != kV2RetirementReadinessBytes) return 0;
-  EncodePullArenaInfo(pull_info, out + base);
-  return kV2PullReadinessBytes;
-}
-
-
 inline bool DecodeV2Readiness(
-    const char* in, size_t bytes, bool writer_retirement_negotiated,
-    RecvSegmentInfo* info, uint64_t* writer_token) {
-  if (bytes != V2ReadinessBytes(writer_retirement_negotiated) || in[0] != 1 ||
+    const char* in, size_t bytes, RecvSegmentInfo* info,
+    uint64_t* writer_token) {
+  if (bytes != kV2RetirementReadinessBytes || in[0] != 1 ||
       !DecodeRecvSegmentInfo(in + 1, info)) {
     return false;
   }
-  *writer_token =
-      writer_retirement_negotiated
-          ? net::GetU64(in + kV2LegacyReadinessBytes)
-          : 0;
-  return !writer_retirement_negotiated || *writer_token != 0;
-}
-inline bool DecodeV2PullReadiness(
-    const char* in, size_t bytes, RecvSegmentInfo* recv_info,
-    uint64_t* writer_token, PullArenaInfo* pull_info) {
-  return bytes == kV2PullReadinessBytes &&
-         DecodeV2Readiness(in, kV2RetirementReadinessBytes, true, recv_info,
-                           writer_token) &&
-         DecodePullArenaInfo(in + kV2RetirementReadinessBytes, pull_info);
+  *writer_token = net::GetU64(in + kV2DynamicOnlyReadinessBytes);
+  return *writer_token != 0;
 }
 
 }  // namespace dfkv::rdma

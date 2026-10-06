@@ -63,7 +63,6 @@ _COUNTERS: dict[str, tuple[str, ...]] = {
     "dfkv_client_mds_unreachable_polls_total": (),
     "dfkv_rdma_client_conns_opened_total": (),
     "dfkv_rdma_client_v2_put_writes_total": (),
-    "dfkv_rdma_client_v2_get_writes_total": (),
     "dfkv_rdma_client_mr_registration_rejections_total": (),
     "dfkv_rdma_client_rail_conns_total": ("dev",),
     "dfkv_rdma_client_rail_selections_total": ("dev",),
