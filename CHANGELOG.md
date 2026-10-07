@@ -387,6 +387,19 @@
   still reference it. Deployments must provision `RLIMIT_MEMLOCK` for the
   pool's lazy high-water plus other locked memory.
 
+## 2.32.0
+
+- Skip synchronous disk-follower queue scans when a connection has no deferred
+  follower. Pinned-RAM dynamic GET and RELEASE replies keep the existing ordered
+  queue, exact READ grants, revocation, and SEND-buffer fences.
+- Cover duplicate sliced disk reads, missing keys, and out-of-order disk
+  completions in one real-RDMA `RangeMany` window with coalescing enabled.
+- Document matched dynamic-GET performance comparisons. Controlled public
+  2.30/2.31 runs did not reproduce a previously observed small-object slowdown;
+  the queue-scan optimization reduces CPU work but does not establish a material
+  end-to-end throughput gain. Protocol and v2.28 default-client compatibility
+  are unchanged.
+
 ## 2.31.0
 
 - Make every RDMA GET, including string `Range`/`RangeMany`, use dynamic

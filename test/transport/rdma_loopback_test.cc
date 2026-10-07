@@ -37,6 +37,7 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <limits>
 #include <map>
 #include <list>
@@ -5494,6 +5495,71 @@ TEST(RdmaLoopback, PressurePreservesSubmittedUringRead) {
   }
   EXPECT_EQ(node.rsrv->ActiveConns(), 0u);
   EXPECT_EQ(used, 0);
+}
+
+TEST(RdmaLoopback, AsyncRangeManyKeepsDiskFollowerAndReadyRepliesOrdered) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "1");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  ScopedEnv coalesce("DFKV_READ_COALESCE", "1");
+  RdmaUringNode node("async-range-follower", kMaxMsg,
+                     [](ControlledRdmaUringBackend*) {});
+  const BlockKey first = ToBlockKey(SelfHdr(), "first");
+  const BlockKey second = ToBlockKey(SelfHdr(), "second");
+  const BlockKey missing = ToBlockKey(SelfHdr(), "missing");
+  const std::string a = PatternValue(8192, 27);
+  const std::string b = PatternValue(8192, 28);
+  std::string ignored;
+  const std::array<std::pair<BlockKey, const std::string*>, 2> stored{{
+      {first, &a}, {second, &b}}};
+  for (const auto& item : stored) {
+    ASSERT_EQ(node.srv->ProcessRequestForKey(
+                  static_cast<uint8_t>(WireOp::kCache), item.first, 0, 0,
+                  item.second->data(), item.second->size(), &ignored),
+              Status::kOk);
+  }
+  RdmaTransport transport(kMaxMsg);
+  const std::vector<BlockKey> keys{first, first, missing, second};
+  std::vector<std::string> outputs;
+  std::vector<uint64_t> value_lens;
+  auto result = std::async(std::launch::async, [&] {
+    return transport.RangeMany(node.addr, keys, 97, 4113,
+                               &outputs, &value_lens);
+  });
+  struct DrainOnFailure {
+    RdmaUringNode& node;
+    bool finished = false;
+    ~DrainOnFailure() {
+      if (finished) return;
+      for (const auto& submission : node.AggregateSubmissions())
+        submission.backend->CompleteRead(submission.request.token);
+      node.rsrv->Stop();
+    }
+  } drain{node};
+  ASSERT_TRUE(node.WaitForAggregateSubmitted(2));
+  const auto submissions = node.AggregateSubmissions();
+  ASSERT_EQ(submissions.size(), 2u);
+  ASSERT_TRUE(submissions[1].backend->CompleteRead(
+      submissions[1].request.token));
+  EXPECT_EQ(result.wait_for(std::chrono::milliseconds(50)),
+            std::future_status::timeout);
+  ASSERT_TRUE(submissions[0].backend->CompleteRead(
+      submissions[0].request.token));
+  ASSERT_EQ(result.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  const auto statuses = result.get();
+  drain.finished = true;
+  EXPECT_EQ(statuses, (std::vector<Status>{
+                         Status::kOk, Status::kOk,
+                         Status::kNotFound, Status::kOk}));
+  EXPECT_EQ(outputs, (std::vector<std::string>{
+                        a.substr(97, 4113), a.substr(97, 4113),
+                        "", b.substr(97, 4113)}));
+  EXPECT_EQ(value_lens, (std::vector<uint64_t>{8192, 8192, 0, 8192}));
+  EXPECT_EQ(CounterVal(node.rsrv->MetricsText(),
+                       "dfkv_rdma_dynamic_get_mr_active"), 0);
+  EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
 }
 #endif
 

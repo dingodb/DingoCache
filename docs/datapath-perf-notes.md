@@ -7,11 +7,13 @@ and status:
 
 - PUT uses client `RDMA_WRITE_WITH_IMM` into a lease from the server's registered
   process-wide receive segment.
-- GET sends the client `{addr,rkey,len}` targets, then the server uses
-  `RDMA_WRITE` to place the value directly into the registered HiCache buffers.
-- Cold values still require a request because their source is NVMe rather than a
-  remotely addressable persistent MR; the server stages the disk read before its
-  one-sided WRITE.
+- GET requests an exact server READ grant, then the client uses `RDMA_READ`
+  into its registered destination. It sends RELEASE and waits for the ACK
+  before reusing the connection.
+- Cold values still require a request because their source is NVMe rather than
+  a remotely addressable persistent MR. Disk completion publishes the grant;
+  pinned RAM values avoid staging. Source ownership and the exact READ MR remain
+  valid until RELEASE revokes the grant.
 
 The retired two-sided payload protocol is not a fallback. Capability, QP,
 receive-segment, or registration mismatch rejects the RDMA connection.
@@ -94,10 +96,46 @@ path — the mechanism premise behind those numbers has changed. They remain
 useful topology guidance, but absolute throughput and latency claims for
 current v2 require a new hardware run.
 
-## v2 datapath performance: TBD
+## Dynamic-GET comparison method and measured scope
 
-No post-cutover hardware run exists yet. The items a v2 perf chapter must
-measure before any absolute claims are made:
+The 2026-10-07 single-host native-RDMA comparison used public 2.30.0 and 2.31.0
+artifacts, one rail, disjoint physical CPU sets on the HCA's NUMA node, and memory
+bound to that node (`--ram-tier-numa off`). Default io_uring stayed enabled.
+Old/old, new-server/old-client, and new/new pairs were interleaved in ABBA order.
+The old client's normal scalar/SG GET was already dynamic pull; it is not a
+responder-WRITE or fixed-arena baseline.
+
+With eight samples per pair, 4 KiB and 64 KiB native `dfkv_bench` scalar/batch
+throughput medians differed by at most 0.2% between public old/old and new/new.
+A separately compiled, identical `dlopen` C-ABI consumer ran 15-second samples
+at 4 KiB, 64 KiB, and 1 MiB. Full payload verification preceded timing; server
+zero-copy grants matched all GETs and the timed interval issued no disk reads.
+That comparison also did not reproduce a material normal-dynamic slowdown.
+These results do not attribute an earlier unmatched development-build result
+to a specific compiler or placement effect.
+
+The 2.32 ready-only queue fast path skips deferred-follower scans when no such
+follower exists. A same-GNU13 baseline/candidate ABBA comparison, with a fixed
+public client and eight 15-second samples per case, reduced server instructions
+per GET by 0.0–0.7%. Throughput medians stayed within 0.8%; no material
+end-to-end speedup is established. Exact MR revocation, reply ordering, and
+SEND-buffer ownership are unchanged.
+
+For further comparisons:
+
+- Match compiler/optimization flags as well as server/client versions. Use one
+  C-ABI consumer executable when native CLI builds would confound the result.
+- Pin CPU and memory independently; record HCA NUMA locality, SMT placement,
+  negotiated depth, cache geometry, and effective RAM NUMA policy.
+- Warm the dataset before the measured interval. Require zero-copy grant
+  increments to match successful GETs and `dfkv_uring_reads_total` to stay flat.
+- Keep samples seconds-long, interleave version pairs, and report operation
+  counts, unrounded elapsed time, throughput, p50/p99, and dispersion.
+- Profile outside the throughput-only campaign, normalize CPU/provider work
+  per successful GET, and retain failed or cold-contaminated samples separately.
+  Do not lower system-wide perf security settings to obtain a profile.
+
+The following dimensions remain outside this warm-RAM comparison:
 
 - **PUT slot-to-durable latency**: client `WRITE_WITH_IMM` slot submission →
   server commit acknowledgment, at 1 MiB and page-scale payloads, across
