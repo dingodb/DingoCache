@@ -1591,6 +1591,7 @@ void RdmaServer::Serve(int boot_fd) {
     // queue owns every PreparedRead and therefore precedes ring: reverse
     // destruction drains/exits the ring before any descriptor owner is freed.
     std::deque<Queued> queue;
+    bool has_sync_fallbacks = false;
     std::vector<UringReader::ReadDesc> submit_descs;
     std::vector<UringReader::Token> submit_tokens;
     std::vector<Queued*> submit_owners;
@@ -1770,6 +1771,7 @@ void RdmaServer::Serve(int boot_fd) {
             });
         if (waiting_for_disk) {
           qd.disk_state = DiskState::kSyncFallback;
+          has_sync_fallbacks = true;
           qd.request = std::move(request);
         } else {
           if (!build_reply(qd.send_slot, request, &qd.reply)) return false;
@@ -1838,6 +1840,7 @@ void RdmaServer::Serve(int boot_fd) {
     };
 
     auto finish_sync_waiting = [&]() -> bool {
+      if (!has_sync_fallbacks) return true;
       if (ring.inflight() != 0 ||
           std::any_of(queue.begin(), queue.end(), [](const Queued& qd) {
             return qd.disk_state == DiskState::kWaiting;
@@ -1848,6 +1851,7 @@ void RdmaServer::Serve(int boot_fd) {
         qd.disk_state = DiskState::kComplete;
         qd.ready = true;
       }
+      has_sync_fallbacks = false;
       return true;
     };
 
