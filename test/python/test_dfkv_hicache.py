@@ -1000,8 +1000,8 @@ class DingoFSHiCacheTest(unittest.TestCase):
         # V4/DSA models (e.g. GLM-5.2): the primary "kv" pool is a logical anchor
         # whose get_page_buffer_meta() returns None. batch_set_v1 must not crash
         # (was: TypeError unpacking None); it writes a one-byte "kv" marker per page
-        # so batch_exists can find the primary prefix, and batch_get_v1 no-ops
-        # (all pages "present" so the hybrid controller loads the real side pools).
+        # so batch_exists can find the primary prefix and batch_get_v1 reads
+        # those markers before the hybrid controller loads real side pools.
         members, _, ndir = self._node("anchor")
         st = self._plugin(self._cfg(members, model="glm-5.2"),
                           FakeLogicalAnchorPool(self.PAGE_SIZE))
@@ -1012,9 +1012,9 @@ class DingoFSHiCacheTest(unittest.TestCase):
         self.assertEqual(_count_objects(ndir), 3)
         self.assertEqual(st.batch_exists(keys), 3)
         self.assertEqual(st.batch_exists(keys + ["kv3"]), 3)  # absent page stops prefix
-        # anchor load is a no-op but reports all pages complete
+        # Anchor load reads markers through native GET.
         self.assertEqual(st.batch_get_v1(keys, hi), [True, True, True])
-        self.assertTrue(st._anchor_noop_warned)
+        self.assertTrue(st._anchor_notice_printed)
 
     def test_v1_logical_anchor_tuple_none_contract(self):
         # SGLang v0.5.17+ (DeepSeekV4PagedHostPool) declares the logical anchor
@@ -1029,7 +1029,7 @@ class DingoFSHiCacheTest(unittest.TestCase):
         self.assertEqual(_count_objects(ndir), 2)
         self.assertEqual(st.batch_exists(keys), 2)
         self.assertEqual(st.batch_get_v1(keys, hi), [True, True])
-        self.assertTrue(st._anchor_noop_warned)
+        self.assertTrue(st._anchor_notice_printed)
 
     def test_register_v2_logical_anchor_marker_only_no_raise(self):
         # The v0.5.17 DSV4 hybrid stack registers the logical "kv" pool through
@@ -1046,7 +1046,7 @@ class DingoFSHiCacheTest(unittest.TestCase):
             FakeTupleNoneAnchorPool(self.PAGE_SIZE), "kv")
         self.assertTrue(st._pool_logical["kv"])
         # v2 writes on the logical pool land one-byte markers that gate the
-        # prefix; v2 reads no-op complete so side pools still get loaded.
+        # prefix; v2 reads those markers before side pools get loaded.
         keys = ["r0", "r1", "r2"]
         hi = list(range(3 * self.PAGE_SIZE))
         res = st.batch_set_v2(
@@ -1057,6 +1057,68 @@ class DingoFSHiCacheTest(unittest.TestCase):
         res = st.batch_get_v2(
             [PoolTransfer(name="kv", host_indices=hi, keys=keys)])
         self.assertEqual(res["kv"], [True, True, True])
+
+    def test_logical_anchor_native_get_missing_and_distinct_destinations(self):
+        from sglang.srt.mem_cache.hicache_storage import PoolTransfer
+        for version in (1, 2):
+            for pool_type in (FakeLogicalAnchorPool, FakeTupleNoneAnchorPool):
+                with self.subTest(version=version, pool=pool_type.__name__):
+                    members, _, _ = self._node("markerget")
+                    cfg = self._cfg(members, model="test/anchor",
+                                    is_mla_model=False)
+                    st = self._plugin(cfg, pool_type(self.PAGE_SIZE))
+                    st.register_mem_host_pool_v2(pool_type(self.PAGE_SIZE), "kv")
+                    keys = ["present0", "missing", "present2"]
+                    hi = list(range(3 * self.PAGE_SIZE))
+                    self.assertEqual(
+                        st.batch_set_v1([keys[0], keys[2]],
+                                        hi[:2 * self.PAGE_SIZE]), [True, True])
+                    side = FakeMlaPool(3, self.PAGE_BYTES, self.PAGE_SIZE)
+                    st.register_mem_host_pool_v2(side, "side")
+                    side_trans = PoolTransfer(name="side", host_indices=hi,
+                                              keys=keys)
+                    expected = []
+                    for i in range(3):
+                        side.fill_page(i, 41 + i)
+                        expected.append(side.page_bytes_at(i))
+                    self.assertEqual(st.batch_set_v2([side_trans])["side"],
+                                     [True, True, True])
+                    side.zero()
+                    original_get = st._lib.dfkv_batch_get
+                    marker_before = dfkv_hicache._MARKER_BUF.raw
+                    calls = []
+
+                    def native_get(handle, karr, klens, ptrs, sizes, n, out):
+                        rc = original_get(handle, karr, klens, ptrs, sizes, n, out)
+                        marker_indices = [i for i in range(n) if sizes[i] == 1]
+                        addresses = [ptrs[i] for i in marker_indices]
+                        self.assertEqual(len(addresses), 6)  # MHA K/V markers
+                        self.assertEqual(len(set(addresses)), len(addresses))
+                        self.assertNotIn(dfkv_hicache._MARKER_PTR, addresses)
+                        # Model independent native workers writing simultaneously:
+                        # each byte must retain its own content after all writes.
+                        for i, address in enumerate(addresses):
+                            ctypes.memmove(address, bytes([i + 1]), 1)
+                        for i, address in enumerate(addresses):
+                            self.assertEqual(ctypes.string_at(address, 1),
+                                             bytes([i + 1]))
+                        calls.append(n)
+                        return rc
+
+                    with patch.object(st._lib, "dfkv_batch_get", native_get):
+                        if version == 1:
+                            result = st.batch_get_v1(keys, hi)
+                        else:
+                            result = st.batch_get_v2([
+                                PoolTransfer(name="kv", host_indices=hi, keys=keys),
+                                side_trans])
+                            self.assertEqual(result["side"], [True, True, True])
+                            for i in range(3):
+                                self.assertEqual(side.page_bytes_at(i), expected[i])
+                            result = result["kv"]
+                    self.assertEqual(result, [True, False, True])
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(dfkv_hicache._MARKER_BUF.raw, marker_before)
 
     def test_register_v2_physical_pool_clears_logical_flag(self):
         # Re-registering the same name with a real layout must drop the

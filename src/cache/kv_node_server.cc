@@ -486,6 +486,40 @@ std::string KvNodeServer::MetricsText() const {
   // unchanged. The dio_*_fallback counters are the "page cache silently crept
   // back in" alarm for direct-mode deployments.
   if (group_.EngineName() == "slab") {
+    // Per-disk observations must not conflate independent high-water crossings.
+    auto header = [&](const char* name, const char* type, const char* help) {
+      s += "# HELP "; s += name; s += " "; s += help; s += "\n";
+      s += "# TYPE "; s += name; s += " "; s += type; s += "\n";
+    };
+    header("dfkv_slab_disk_run_epoch", "gauge", "Dirty run epoch for this store instance");
+    header("dfkv_slab_disk_capacity_bytes", "gauge", "Physical capacity for this store");
+    header("dfkv_slab_disk_watermark_high_bytes", "gauge", "Resolved strict high threshold");
+    header("dfkv_slab_disk_watermark_low_bytes", "gauge", "Resolved drain threshold");
+    header("dfkv_slab_disk_reclaim_interval_ms", "gauge", "Resolved background reclaim cadence");
+    header("dfkv_slab_disk_watermark_active", "gauge", "Current high-to-low drain latch");
+    header("dfkv_slab_disk_watermark_high_observations_total", "counter", "Reclaimer samples directly satisfying used greater than high; not eviction counts");
+    header("dfkv_slab_disk_watermark_last_high_bytes", "gauge", "Latest direct above-high predicate input before eviction");
+    header("dfkv_slab_disk_watermark_peak_high_bytes", "gauge", "Lifetime maximum of sampled above-high inputs; never phase qualification alone");
+    for (size_t i = 0; i < group_.DiskCount(); ++i) {
+      const auto st = group_.DiskWatermarkObservation(i);
+      const std::string labels =
+          "disk=\"" + PromLabelEscape(group_.DiskPath(i)) +
+          "\",disk_index=\"" + std::to_string(i) + "\"";
+      const std::string disk_labels = braces(labels);
+      auto sample = [&](const char* name, uint64_t value) {
+        s += name; s += disk_labels; s += " ";
+        s += std::to_string(value); s += "\n";
+      };
+      sample("dfkv_slab_disk_run_epoch", st.run_epoch);
+      sample("dfkv_slab_disk_capacity_bytes", st.capacity_bytes);
+      sample("dfkv_slab_disk_watermark_high_bytes", st.watermark_high_bytes);
+      sample("dfkv_slab_disk_watermark_low_bytes", st.watermark_low_bytes);
+      sample("dfkv_slab_disk_reclaim_interval_ms", st.reclaim_interval_ms);
+      sample("dfkv_slab_disk_watermark_active", st.watermark_active);
+      sample("dfkv_slab_disk_watermark_high_observations_total", st.watermark_high_observations);
+      sample("dfkv_slab_disk_watermark_last_high_bytes", st.watermark_last_high_bytes);
+      sample("dfkv_slab_disk_watermark_peak_high_bytes", st.watermark_peak_high_bytes);
+    }
     const auto ss = group_.SlabStats();
     metric("dfkv_slab_dio_write_fallback_total", "counter",
            "Direct-mode PUTs that fell back to a buffered write", ss.dio_write_fallbacks);
@@ -499,11 +533,32 @@ std::string KvNodeServer::MetricsText() const {
            "Steals of globally-cold cross-class extents (full-ring self-thrash guard)",
            ss.cold_steals);
     metric("dfkv_slab_watermark_evictions_total", "counter",
-           "Proactive watermark extent evictions (headroom kept ahead of demand)",
+           "Objects removed by proactive watermark reclamation",
            ss.watermark_evictions);
     metric("dfkv_slab_watermark_extent_clears_total", "counter",
-           "Whole-extent metadata clears used by watermark eviction",
+           "Successful whole-extent metadata pwrite callbacks; NOT fdatasync durability",
            ss.watermark_extent_clears);
+    metric("dfkv_slab_watermark_slot_removals_total", "counter",
+           "Committed global allocator slot removals including last-resident extent callback cases",
+           ss.watermark_slot_removals);
+    metric("dfkv_slab_watermark_slot_record_clears_total", "counter",
+           "Successful global partial 64-byte metadata pwrite tombstones; NOT fdatasync durability",
+           ss.watermark_slot_record_clears);
+    metric("dfkv_slab_watermark_record_clear_bytes_total", "counter",
+           "Successful global partial and whole-extent metadata pwrite bytes; NOT durability or exclusive recycling cost",
+           ss.watermark_record_clear_bytes);
+    metric("dfkv_slab_watermark_freed_slot_bytes_total", "counter",
+           "Allocated slot bytes actually removed by global selector calls",
+           ss.watermark_freed_slot_bytes);
+    metric("dfkv_slab_watermark_scan_visits_total", "counter",
+           "Allocator global reclamation scan visits",
+           ss.watermark_scan_visits);
+    metric("dfkv_slab_watermark_max_victims_per_tick", "gauge",
+           "Configured per-disk slot-removal cap per tick",
+           ss.watermark_max_victims_per_tick);
+    metric("dfkv_slab_watermark_max_visits_per_tick", "gauge",
+           "Configured per-disk scan-visit cap per tick, four times slot-removal cap",
+           ss.watermark_max_visits_per_tick);
     metric("dfkv_slab_watermark_ticks_total", "counter",
            "Bounded watermark eviction ticks", ss.watermark_ticks);
     metric("dfkv_slab_watermark_active", "gauge",
@@ -515,9 +570,6 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_watermark_max_tick_us", "gauge",
            "Maximum watermark tick duration in microseconds",
            ss.watermark_max_tick_us);
-    metric("dfkv_slab_watermark_max_extents_per_tick", "gauge",
-           "Configured per-disk extent eviction cap per tick",
-           ss.watermark_max_extents_per_tick);
     metric("dfkv_slab_extent_returns_total", "counter",
            "Fully-free extents returned to the shared pool", ss.extent_returns);
     metric("dfkv_slab_deferred_removes_total", "counter",

@@ -154,7 +154,6 @@ PUBLIC_FAMILIES = {
     "dfkv_slab_watermark_active",
     "dfkv_slab_watermark_last_tick_us",
     "dfkv_slab_watermark_max_tick_us",
-    "dfkv_slab_watermark_max_extents_per_tick",
     "dfkv_storage_healthy",
     "dfkv_tcp_max_connections",
     "dfkv_tcp_rejected_connections_total",

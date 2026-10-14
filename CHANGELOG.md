@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Reclaim globally by bounded slot-level read/write recency instead of dropping
+  whole extents at the disk high watermark. New admissions and successful reads
+  move behind the scan cursor; pins and metadata-invalidation failures still
+  prevent reuse. Successful new writes can renew recent pressure below high,
+  but inactive pressure history expires after 128 completed quiet observations.
+- Replace `DFKV_SLAB_EVICT_MAX_EXTENTS_PER_TICK` with
+  `DFKV_SLAB_EVICT_MAX_VICTIMS_PER_TICK` (default 256 slots; scan cap four times
+  the victim cap). Watermark eviction counts now measure objects; the obsolete
+  max-extents gauge is replaced with victim/visit gauges.
+- Read logical HiCache anchor markers through native GET on consumption,
+  refreshing their recency and propagating missing markers rather than
+  reporting unconditional success. Existence probes remain non-promoting.
 
 - Preserve an initial, hard-budgeted receive chunk for dynamic GET and
   leased-PUT staging when enough connection capacity remains. Connection

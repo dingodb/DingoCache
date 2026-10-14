@@ -561,7 +561,7 @@ class DfkvHiCache(HiCacheStorage):
         self.enable_pp = self.pp_size > 1
         # One-shot guard for the logical-anchor notice (V4/DSA models whose
         # primary "kv" pool holds no host buffer — see _note_logical_anchor_once).
-        self._anchor_noop_warned = False
+        self._anchor_notice_printed = False
         # Access log: idempotent per process (first instance wins). Configured
         # here so tp_rank/model are available for the {rank} path placeholder.
         _configure_access_log(cfg, tp_rank=self.tp_rank, model=self.model)
@@ -963,8 +963,8 @@ class DfkvHiCache(HiCacheStorage):
                 # no host buffer, so there is no layout to discover and nothing
                 # to physically register — but raising here crashes HiCache
                 # setup for the whole scheduler. Record it marker-only: v2
-                # writes ride the one-byte anchor markers, reads no-op (real
-                # data lives in the side pools). Malformed layouts (wrong
+                # writes and reads use one-byte markers; real KV data lives in
+                # the side pools. Malformed layouts (wrong
                 # arity, empty/mismatched components) still fail below.
                 if not hasattr(self, "_pool_logical"):
                     self._pool_logical = {}
@@ -1289,9 +1289,9 @@ class DfkvHiCache(HiCacheStorage):
         This mirrors the reference backend's logical marker semantics.
         Informational, not an error — the path works, but it is newly enabled,
         confirm the hit rate via metrics."""
-        if self._anchor_noop_warned:
+        if self._anchor_notice_printed:
             return
-        self._anchor_noop_warned = True
+        self._anchor_notice_printed = True
         import sys as _sys
         print("[dfkv] NOTE: primary KV pool is a logical anchor "
               "(get_page_buffer_meta -> None) — a V4/DSA multi-pool model "
@@ -1310,8 +1310,8 @@ class DfkvHiCache(HiCacheStorage):
         non-empty so native dfkv charges tenant byte quota for every allocated
         object while preserving SGLang's logical-anchor existence semantics.
         Namespace and object-key identity isolate incompatible writers; the
-        matching read (batch_get_v1) is a no-op. Returns a per-page success list
-        (a page succeeds iff all its sub-object markers were written)."""
+        matching read loads that byte to refresh actual consumption recency.
+        A page succeeds iff all its sub-object markers were written."""
         sub = self._sub()
         sks = [sk for k in keys for sk in self._keys(k)]
         if not sks:
@@ -1607,20 +1607,31 @@ class DfkvHiCache(HiCacheStorage):
                 access_log("batch_get_v1", lambda: f"{self._alog_tag} {n} keys") as r:
             meta = self.mem_pool_host.get_page_buffer_meta(host_indices)
             if _meta_has_no_layout(meta):
-                # Logical anchor pool, no buffer to scatter into (V4/DSA models,
-                # e.g. GLM-5.2). The "kv" prefix was already confirmed present by
-                # batch_exists_v2 (via the one-byte markers written on backup);
-                # there is no anchor payload to load. Report all pages present so
-                # _page_get_zero_copy counts the anchor prefix complete and the
-                # hybrid controller then loads the real KV from side-pools via
-                # batch_get_v2. Returning False here would make kv_completed_pages
-                # < prefix and skip that side-pool load entirely. Inert for
-                # single-pool models (non-None).
+                # Load the one-byte anchors only on this actual read path.
+                # EXISTS remains non-promoting. Each native GET destination is
+                # distinct because batch workers may scatter concurrently.
                 self._note_logical_anchor_once()
-                r.result = "anchor_noop"
+                sub = self._sub()
+                sks = [sk for key in keys for sk in self._keys(key)]
+                if not sks:
+                    return []
+                markers = (ctypes.c_ubyte * len(sks))()
+                base = ctypes.addressof(markers)
+                karr, klens, parr, sarr, out, key_owners = _arrays(
+                    sks, range(base, base + len(sks)), [1] * len(sks))
+                t0 = time.perf_counter()
+                self._lib.dfkv_batch_get(
+                    self._h, karr, klens, parr, sarr, len(sks), out)
+                dur = time.perf_counter() - t0
+                del key_owners
+                res = self._fold([out[i] == 1 for i in range(len(sks))], n, sub)
+                r.result = f"anchor_marker hits={sum(res)}/{n}"
                 if _sp:
-                    _sp.attrs = {"dfkv.anchor_noop": True}
-                return [True] * n
+                    _sp.hits = sum(res); _sp.bytes = len(sks)
+                    _sp.attrs = {"dfkv.anchor_marker": True}
+                self._metrics.on_get(
+                    pages=n, hit_pages=sum(res), nbytes=len(sks), seconds=dur)
+                return res
             # Device-direct PUT writes SG-chunked keys via _flatten_device
             # (_sg_group_key), but this host-buffer GET path uses flat keys
             # via _flatten/_keys. The key namespaces differ, so a host GET
@@ -1770,6 +1781,7 @@ class DfkvHiCache(HiCacheStorage):
         results = {}
         segments = []
         sks, sp, ss = [], [], []
+        marker_buffers = []  # keep per-pool GET destinations alive through native I/O
         for tr in transfers:
             name = str(tr.name)
             keys = tr.keys or []
@@ -1802,16 +1814,18 @@ class DfkvHiCache(HiCacheStorage):
                     self._pool_logical[name] = logical = True
                     self._note_logical_anchor_once()
             if logical:
-                if not putting:
-                    # A logical anchor holds no data to load; report complete so
-                    # the hybrid controller proceeds to the real side pools.
-                    results[name] = [True] * len(keys)
-                    continue
                 sub = self._pool_sub(name)
                 start = len(sks)
+                if putting:
+                    marker_ptr = _MARKER_PTR
+                else:
+                    markers = (ctypes.c_ubyte * (len(keys) * sub))()
+                    marker_buffers.append(markers)
+                    marker_ptr = ctypes.addressof(markers)
                 for k in keys:
                     for sk in self._pool_keys(name, k):
-                        sks.append(sk); sp.append(_MARKER_PTR); ss.append(1)
+                        sp.append(marker_ptr if putting else marker_ptr + len(sks) - start)
+                        sks.append(sk); ss.append(1)
                 segments.append((name, len(keys), sub, start, len(sks)))
                 continue
             ptrs, sizes = meta

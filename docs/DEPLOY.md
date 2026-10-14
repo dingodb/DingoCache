@@ -276,9 +276,9 @@ WantedBy=multi-user.target
 > - `--ram-flush-threads <n>` / `DFKV_RAM_FLUSH_THREADS`：请求值会提高到至少 shard 数；实际值由 `dfkv_ram_flush_threads` 报告（默认请求=4×盘数，上限 16）。
 > - 微调项（env only）：`DFKV_SLAB_TABLE_SYNC_MS` 控制 table sync 节奏（默认 100 ms，0=关；dirty epoch 重启仍无条件冷重置）。
 > - 微调项（env only）：`DFKV_SLAB_EVICT_HIGH_PCT` / `DFKV_SLAB_EVICT_LOW_PCT`
->   （默认 92 / 88；high=0 关）使用 persistent hysteresis：越过 high 后持续后台
->   drain 到 low。每 tick 由 `DFKV_SLAB_EVICT_MAX_EXTENTS_PER_TICK`（默认 1）
->   限流；整 extent 只做一次连续 slots.tbl clear，避免高水位小写风暴。
+>   （默认 92 / 88；high=0 关）：越过 high 后按全局读写最近使用顺序回收 slot 到 low。
+>   新键成功提交可在近期压力状态下重新触发回收；非活跃且连续 128 次无新提交观察后，历史压力失效。
+>   每 tick 由 `DFKV_SLAB_EVICT_MAX_VICTIMS_PER_TICK`（默认 256，范围 1～1024）限制移除对象数，扫描上限为其 4 倍。旧 `DFKV_SLAB_EVICT_MAX_EXTENTS_PER_TICK` 不再读取，升级时须迁移配置。
 > - `--slab-reclaim-ms <n>` / `--ram-reclaim-ms <n>`（默认 50 / 10，`0`=关）：后台预回收和类再平衡。allocator 按 useful bytes + decayed read heat 选择 donor，跳过 pinned extent；通常保留默认。
 > - `--slab-granularity <bytes>`（默认 1 MiB）：最小 slot 量子。现有 `slots.tbl` 的 format/geometry 不匹配会 fail closed；修改必须换空目录，服务不会原地冷重建或忽略旧数据。
 > - `--put-inflight-limit <n>`（默认 0=关）：在 RAM 接纳或直接盘写之前原子限制前台 PUT 并发；超限返回 `kCacheFull`，不接纳数据、不进入 peer cooldown。TCP 与 RDMA direct PUT 共用此门；后台 flusher 不受限制。已接纳写入和同 key 重复请求仍等待原写入的终态，不以超时将另一份 payload 送入盘写路径。该参数限制接纳量，不是磁盘 I/O 超时保证。
@@ -524,7 +524,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | env | 默认 | 说明 |
 |---|---|---|
 | `DFKV_SLAB_EVICT_HIGH_PCT` / `DFKV_SLAB_EVICT_LOW_PCT` | `92` / `88`, high=0 关 | high crossing latch，后台持续 drain 到 low |
-| `DFKV_SLAB_EVICT_MAX_EXTENTS_PER_TICK` | `1` | 每盘每 tick 最多整 extent 淘汰数；平滑前台尾延迟 |
+| `DFKV_SLAB_EVICT_MAX_VICTIMS_PER_TICK` | `256` | 每盘每 tick 最多移除的 slot 数；最多扫描该值的 4 倍，不能据此保证尾延迟不变 |
 | `DFKV_SLAB_COLD_STEAL_WINDOW` | — | 小受害者选择窗口（跨 size class 强占） |
 | `DFKV_SLAB_URING_WRITE` | — | slab io_uring 异步 PUT（需要 `-DDFKV_WITH_URING`） |
 | `DFKV_SLAB_RECLAIM_MS` | `50` | 背景预回收 tick（见 §3） |
