@@ -93,6 +93,10 @@ class DiskCacheGroup {
   const std::string& DiskPath(size_t i) const { return disks_[i]->Dir(); }
   uint64_t DiskUsedBytes(size_t i) const { return disks_[i]->UsedBytes(); }
   size_t DiskObjects(size_t i) const { return disks_[i]->Count(); }
+  // Slab-only, indexed identically to DiskPath; one coherent observation view.
+  DiskSlabStore::WatermarkObservation DiskWatermarkObservation(size_t i) const {
+    return slabs_[i]->GetWatermarkObservation();
+  }
   uint64_t TenantUsedBytes(uint64_t tenant_hash) const;
   uint64_t TenantDefaultQuotaBytes() const { return tenant_default_quota_bytes_; }
   uint64_t TenantQuotaBytes(uint64_t tenant_hash) const {

@@ -546,8 +546,9 @@ sglang serve /models/glm-5.2-nvfp4 --served-model-name glm-5.2 \
 - MLA 下插件自动单对象、无 rank 后缀、`backup_skip`（仅 tp_rank0 写）。decode 共享前缀配同 members。
 - **多池模型**（Mamba/SWA/DeepSeek-V4）用 v2 PoolTransfer 接口（插件已实现）。
   部分 DeepSeek-V4 等引擎的主 `kv` 是无数据 LogicalHostPool（`get_page_buffer_meta→None`）：
-  插件写 marker 锚定前缀，主池读取不搬运字节，实际数据走 v2 侧池。普通 MLA/DSA
-  的主 `kv` 可以是真实物理池；必须按运行时布局核对，不能将所有 DSA 都当作 marker。
+  插件写入单字节 marker 锚定前缀；v1/v2 实际主池读取也通过 native GET 读取 marker，刷新读最近性。
+  每个子对象使用独立目标字节，缺失 marker 按 miss 返回，不再无条件报告成功；EXISTS 探测不更新读顺序。
+  实际 KV 数据仍走 v2 侧池。普通 MLA/DSA 的主 `kv` 可以是真实物理池；必须按运行时布局核对，不能将所有 DSA 都当作 marker。
 - **Mamba＋DSA 混合模型必须同时注册 `KV`、`MAMBA`、`INDEXER`。**
   只恢复 latent 与 recurrent state、遗漏历史 indexer 数据，会出现“所有已请求
   对象均命中，但长提示答案错误”；不能通过增加生成长度或把命中计数当作正确性

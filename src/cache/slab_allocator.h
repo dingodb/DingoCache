@@ -61,8 +61,8 @@ class SlabAllocator {
     // (slot_size - aligned_len) stays below this fraction.
     double max_waste = 0.25;
     std::function<bool(uint32_t extent)> on_extent_bind;
-    // Whole-extent eviction can clear persistent metadata in one contiguous
-    // write. When set, watermark eviction uses this instead of per-slot calls.
+    // A last-resident eviction may clear the whole extent in one write.
+    // Partial eviction requires on_slot_evict when persistence is configured.
     std::function<bool(uint32_t extent, uint32_t total_slots,
                        uint32_t resident_slots)>
         on_extent_evict;
@@ -136,13 +136,14 @@ class SlabAllocator {
   uint64_t Steals() const;
   uint64_t ColdSteals() const;
   uint64_t WatermarkEvictions() const;
-  // Proactive watermark eviction: while useful bytes exceed `target_bytes`,
-  // return the globally coldest fully unpinned extent, ordered by decayed read
-  // heat and then recency. Each call is bounded by `max_extents` so the
-  // reclaimer never monopolizes the allocator lock. Keeping headroom ahead of
-  // demand prevents a write burst from synchronously self-evicting a full pool.
-  size_t EvictColdToTarget(uint64_t target_bytes, size_t max_extents,
+  // Local candidate: reclaim slots in refreshed actual-read/new-write order
+  // until allocated bytes reach target_bytes. A call removes at most max_victims
+  // residents and visits at most 4 * max_victims slots, preserving cursor progress.
+  // Pins are skipped; reference credit belongs only to class-local CLOCK.
+  // Persistence commits before removal. WatermarkEvictions counts slots here.
+  size_t EvictColdToTarget(uint64_t target_bytes, size_t max_victims,
                            std::vector<BlockKey>* evicted);
+  uint64_t WatermarkScanVisits() const;
   uint64_t ExtentReturns() const;
   size_t ClassCount() const;
   uint32_t BoundExtents() const;
@@ -175,7 +176,8 @@ class SlabAllocator {
     BlockKey key;
     SlotRef ref;
     uint64_t useful_bytes = 0;
-    uint64_t put_seq = 0;
+    uint32_t global_prev = kNoSlot;
+    uint32_t global_next = kNoSlot;
     uint32_t free_next = kNoSlot;
     uint64_t read_touches = 0;
     uint32_t refs = 0;
@@ -242,6 +244,8 @@ class SlabAllocator {
                                       std::vector<BlockKey>* evicted);
 
   uint32_t AcquireSlotMetaLocked();
+  void LinkBeforeHandLocked(uint32_t meta_index);
+  void LinkBeforeGlobalHandLocked(uint32_t meta_index);
   void LinkResidentLocked(uint32_t meta_index);
   void FreeSlotLocked(uint32_t meta_index);
   void TouchLocked(uint32_t meta_index);
@@ -291,6 +295,8 @@ class SlabAllocator {
   std::vector<ExtentMeta> extents_;
   std::vector<SlotMeta> slots_;
   uint32_t free_slot_meta_head_ = kNoSlot;
+  uint32_t global_ring_head_ = kNoSlot;
+  uint32_t global_hand_ = kNoSlot;
   FlatKeyIndex index_;
   uint32_t unbound_ = 0;
   uint64_t used_bytes_ = 0;
@@ -298,6 +304,7 @@ class SlabAllocator {
   uint64_t steals_ = 0;
   uint64_t cold_steals_ = 0;
   uint64_t watermark_evictions_ = 0;
+  uint64_t watermark_scan_steps_ = 0;
   uint64_t extent_returns_ = 0;
   uint64_t put_seq_ = 0;
   uint64_t activity_seq_ = 0;

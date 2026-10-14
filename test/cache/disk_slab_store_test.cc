@@ -1545,7 +1545,8 @@ TEST_F(DiskSlabTest, WatermarkEvictionCannotEraseConcurrentRewriteCommit) {
 
 TEST_F(DiskSlabTest, WatermarkEvictionsStayDeadAcrossCleanRestart) {
   ::setenv("DFKV_SLAB_EVICT_HIGH_PCT", "50", 1);
-  ::setenv("DFKV_SLAB_EVICT_LOW_PCT", "25", 1);
+  // Keep one slot below low; capacity / 100 truncates before multiplication.
+  ::setenv("DFKV_SLAB_EVICT_LOW_PCT", "26", 1);
   auto options = Opts(4 * 4096, 4 * 4096, 4096);
   options.reclaim_interval_ms = 0;
   options.table_sync_ms = 0;
@@ -1559,10 +1560,46 @@ TEST_F(DiskSlabTest, WatermarkEvictionsStayDeadAcrossCleanRestart) {
     for (uint64_t i = 0; i < 4; ++i)
       ASSERT_EQ(store.Cache(K(i), value.data(), value.size()), Status::kOk);
     dfkv::DiskSlabStoreTestPeer::ReclaimNow(&store, {});
-    EXPECT_EQ(store.Count(), 0u);
-    EXPECT_EQ(store.GetStats().eviction_record_clears, 4u);
+    EXPECT_EQ(store.Count(), 1u);
+    EXPECT_EQ(store.GetStats().eviction_record_clears, 3u);
   }
 
+  bool ok = false;
+  DiskSlabStore reopened(options, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(reopened.Count(), 1u);
+  for (uint64_t i = 0; i < 3; ++i) EXPECT_FALSE(reopened.IsCached(K(i)));
+  std::string out;
+  ASSERT_EQ(reopened.Range(K(3), 0, 4000, &out), Status::kOk);
+  EXPECT_EQ(out, std::string(4000, 'e'));
+}
+
+TEST_F(DiskSlabTest, SlotWatermarkEvictionRemainsColdAfterDirtyRestart) {
+  auto options = Opts(4 * 4096, 4 * 4096, 4096);
+  options.reclaim_interval_ms = 0;
+  options.table_sync_ms = 0;
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    ::setenv("DFKV_SLAB_EVICT_HIGH_PCT", "50", 1);
+    ::setenv("DFKV_SLAB_EVICT_LOW_PCT", "26", 1);
+    bool ok = false;
+    DiskSlabStore store(options, &ok);
+    if (!ok) ::_exit(1);
+    const std::string value(4000, 'd');
+    for (uint64_t i = 0; i < 4; ++i)
+      if (store.Cache(K(i), value.data(), value.size()) != Status::kOk)
+        ::_exit(2);
+    dfkv::DiskSlabStoreTestPeer::ReclaimNow(&store, {});
+    if (store.Count() != 1 ||
+        store.GetStats().eviction_record_clears != 3)
+      ::_exit(3);
+    ::_exit(0);  // no clean epoch: neither victim nor survivor may resurrect
+  }
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFEXITED(status));
+  ASSERT_EQ(WEXITSTATUS(status), 0);
   bool ok = false;
   DiskSlabStore reopened(options, &ok);
   ASSERT_TRUE(ok);
@@ -1572,8 +1609,8 @@ TEST_F(DiskSlabTest, WatermarkEvictionsStayDeadAcrossCleanRestart) {
 
 TEST_F(DiskSlabTest, WatermarkDrainIsLatchedAndBoundedPerTick) {
   ::setenv("DFKV_SLAB_EVICT_HIGH_PCT", "50", 1);
-  ::setenv("DFKV_SLAB_EVICT_LOW_PCT", "25", 1);
-  ::setenv("DFKV_SLAB_EVICT_MAX_EXTENTS_PER_TICK", "1", 1);
+  ::setenv("DFKV_SLAB_EVICT_LOW_PCT", "26", 1);
+  ::setenv("DFKV_SLAB_EVICT_MAX_VICTIMS_PER_TICK", "1", 1);
   auto options = Opts(8 * 4096, 4096, 4096);
   options.reclaim_interval_ms = 0;
   options.table_sync_ms = 0;
@@ -1581,7 +1618,7 @@ TEST_F(DiskSlabTest, WatermarkDrainIsLatchedAndBoundedPerTick) {
   DiskSlabStore store(options, &ok);
   ::unsetenv("DFKV_SLAB_EVICT_HIGH_PCT");
   ::unsetenv("DFKV_SLAB_EVICT_LOW_PCT");
-  ::unsetenv("DFKV_SLAB_EVICT_MAX_EXTENTS_PER_TICK");
+  ::unsetenv("DFKV_SLAB_EVICT_MAX_VICTIMS_PER_TICK");
   ASSERT_TRUE(ok);
 
   std::string value(4000, 'w');
@@ -1591,21 +1628,80 @@ TEST_F(DiskSlabTest, WatermarkDrainIsLatchedAndBoundedPerTick) {
   dfkv::DiskSlabStoreTestPeer::ReclaimNow(&store, {});
   auto stats = store.GetStats();
   EXPECT_EQ(store.Count(), 6u)
-      << "one bounded watermark extent plus regular free-slot reclaim";
+      << "one bounded watermark victim plus regular free-slot reclaim";
   EXPECT_EQ(stats.watermark_evictions, 1u);
   EXPECT_EQ(stats.watermark_extent_clears, 1u);
   EXPECT_EQ(stats.watermark_active, 1u);
-  EXPECT_EQ(stats.watermark_max_extents_per_tick, 1u);
 
   for (int i = 0; i < 5; ++i)
     dfkv::DiskSlabStoreTestPeer::ReclaimNow(&store, {});
   stats = store.GetStats();
-  EXPECT_EQ(store.Count(), 1u);
-  EXPECT_EQ(stats.watermark_evictions, 6u);
-  EXPECT_EQ(stats.watermark_extent_clears, 6u);
-  EXPECT_EQ(stats.eviction_record_clears, 7u);
-  EXPECT_EQ(stats.watermark_ticks, 6u);
+  EXPECT_EQ(store.Count(), 2u);
+  EXPECT_EQ(stats.watermark_evictions, 5u);
+  EXPECT_EQ(stats.watermark_extent_clears, 5u);
+  EXPECT_EQ(stats.eviction_record_clears, 6u);
+  EXPECT_EQ(stats.watermark_ticks, 5u);
   EXPECT_EQ(stats.watermark_active, 0u);
+}
+
+TEST(NewPutDemandLatch, ExpiresOnlyAfter128CompletedInactiveQuietTicks) {
+  NewPutDemandLatch latch;
+  latch.BeginTick(90, 80, 40, 0);
+  latch.EndTick(40, 40);
+  ASSERT_FALSE(latch.active);
+  for (int tick = 1; tick <= 127; ++tick) {
+    latch.BeginTick(40, 80, 40, 0);
+    latch.EndTick(40, 40);
+  }
+  // Still eligible: successful admission below high must resume draining.
+  auto renewed = latch;
+  renewed.BeginTick(50, 80, 40, 1);
+  EXPECT_TRUE(renewed.active);
+  latch.BeginTick(40, 80, 40, 0);
+  latch.EndTick(40, 40);
+  latch.BeginTick(50, 80, 40, 1);
+  EXPECT_FALSE(latch.active);  // expired history cannot trigger a drain
+}
+
+TEST(NewPutDemandLatch, FreshHighAndNewAdmissionWinAtExpiryBoundary) {
+  NewPutDemandLatch latch;
+  latch.BeginTick(90, 80, 40, 0);
+  latch.EndTick(40, 40);
+  for (int tick = 0; tick < 127; ++tick) {
+    latch.BeginTick(40, 80, 40, 0);
+    latch.EndTick(40, 40);
+  }
+  auto high = latch;
+  high.BeginTick(81, 80, 40, 0);
+  high.EndTick(50, 40);
+  EXPECT_TRUE(high.active);
+  auto admitted = latch;
+  admitted.BeginTick(50, 80, 40, 1);
+  admitted.EndTick(40, 40);
+  EXPECT_TRUE(admitted.active);
+  admitted.BeginTick(40, 80, 40, 0);
+  admitted.EndTick(40, 40);
+  EXPECT_TRUE(admitted.active);  // previous interval still had demand
+  admitted.BeginTick(40, 80, 40, 0);
+  admitted.EndTick(40, 40);
+  EXPECT_FALSE(admitted.active);
+}
+
+TEST(NewPutDemandLatch, QuietExpiryNeverCancelsRequiredActiveDrain) {
+  NewPutDemandLatch latch;
+  latch.BeginTick(90, 80, 40, 0);
+  latch.EndTick(50, 40);
+  for (int tick = 0; tick < 129; ++tick) {
+    latch.BeginTick(50, 80, 40, 0);
+    latch.EndTick(50, 40);
+    EXPECT_TRUE(latch.active);
+  }
+  latch.EndTick(40, 40);
+  EXPECT_FALSE(latch.active);
+  latch.BeginTick(50, 80, 40, 1);
+  EXPECT_FALSE(latch.active);
+  latch.BeginTick(81, 80, 40, 0);
+  EXPECT_TRUE(latch.active);  // a new high crossing works after expiry
 }
 
 // Class rebalance regression (the "new value size retains only a sliver of its

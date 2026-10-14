@@ -279,6 +279,23 @@ size-class lattice and carves them into uniform slots:
   cold-reset rather than risking stale resurrection. Torn/invalid records are
   rejected and cleared durably; metadata I/O failure fails the store closed.
   Format/geometry mismatches are refused without rewriting existing data.
+- **Watermark eviction:** above-high occupancy starts bounded global slot
+  reclamation toward low. New objects and successful GET/Pin operations move
+  behind the global scan cursor; class-local scans use the same admission/read
+  ordering. EXISTS and duplicate PUT do not refresh that ordering. A pinned
+  slot cannot be removed. Each victim's metadata is invalidated before its
+  slot and committed payload accounting are released; only a last resident
+  uses the whole-extent clear callback.
+- **Pressure lifetime:** successful new commits renew a recent pressure episode.
+  They may restart draining above low even without another high crossing.
+  Required active drain (including pinned blockers) is retained; inactive
+  history expires after 128 completed observations with no successful new
+  commit. At the default 50 ms cadence this is nominally 6.4 seconds, not a
+  wall-clock TTL or conversation age. Empty occupancy and reopening reset the
+  process-local history. A tick removes at most 256 slots and visits at most
+  1,024 positions by default. This trades smaller victims for more metadata
+  writes; bounded work does not guarantee unchanged PUT tail latency.
+
 
 Payload I/O uses resident extent descriptors and O_DIRECT by default; a
 filesystem that cannot support it reports and uses the bounded buffered

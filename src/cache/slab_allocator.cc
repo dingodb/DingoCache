@@ -290,15 +290,46 @@ uint32_t SlabAllocator::AcquireSlotMetaLocked() {
   return static_cast<uint32_t>(slots_.size() - 1);
 }
 
+void SlabAllocator::LinkBeforeHandLocked(uint32_t index) {
+  SlotMeta& meta = slots_[index];
+  Class& cls = classes_[meta.ref.cls];
+
+  // Behind the hand in forward sweep order: visit older residents first.
+  if (cls.hand == kNoSlot) {
+    cls.ring_head = cls.hand = index;
+  } else {
+    meta.class_next = cls.hand;
+    meta.class_prev = slots_[cls.hand].class_prev;
+    if (meta.class_prev != kNoSlot)
+      slots_[meta.class_prev].class_next = index;
+    else
+      cls.ring_head = index;
+    slots_[cls.hand].class_prev = index;
+  }
+}
+
+void SlabAllocator::LinkBeforeGlobalHandLocked(uint32_t index) {
+  SlotMeta& meta = slots_[index];
+  if (global_hand_ == kNoSlot) {
+    global_ring_head_ = global_hand_ = index;
+  } else {
+    meta.global_next = global_hand_;
+    meta.global_prev = slots_[global_hand_].global_prev;
+    if (meta.global_prev != kNoSlot)
+      slots_[meta.global_prev].global_next = index;
+    else
+      global_ring_head_ = index;
+    slots_[global_hand_].global_prev = index;
+  }
+}
+
 void SlabAllocator::LinkResidentLocked(uint32_t index) {
   SlotMeta& meta = slots_[index];
   Class& cls = classes_[meta.ref.cls];
   ExtentMeta& extent = extents_[meta.ref.extent];
 
-  meta.class_next = cls.ring_head;
-  if (cls.ring_head != kNoSlot) slots_[cls.ring_head].class_prev = index;
-  cls.ring_head = index;
-  if (cls.hand == kNoSlot) cls.hand = index;
+  LinkBeforeHandLocked(index);
+  LinkBeforeGlobalHandLocked(index);
   ++cls.resident_count;
 
   meta.extent_next = extent.resident_head;
@@ -326,6 +357,43 @@ void SlabAllocator::TouchLocked(uint32_t index) {
   ++meta.read_touches;
 
   Class& cls = classes_[meta.ref.cls];
+  // A reference bit alone forgets actual read order after one sweep. Refresh
+  // the same position used for new writes, without touching extent membership.
+  // The predecessor of the hand is already last in sweep order (singleton
+  // included), so avoid unlinking it.
+  const bool behind_hand =
+      meta.class_next == cls.hand ||
+      (meta.class_next == kNoSlot && cls.hand == cls.ring_head);
+  if (!behind_hand) {
+    const uint32_t next = meta.class_next;
+    if (meta.class_prev != kNoSlot)
+      slots_[meta.class_prev].class_next = next;
+    else
+      cls.ring_head = next;
+    if (next != kNoSlot)
+      slots_[next].class_prev = meta.class_prev;
+    if (cls.hand == index)
+      cls.hand = next != kNoSlot ? next : cls.ring_head;
+    LinkBeforeHandLocked(index);
+  }
+
+  // Global reclaim uses the same real-read/new-admission order across sizes.
+  const bool behind_global_hand =
+      meta.global_next == global_hand_ ||
+      (meta.global_next == kNoSlot && global_hand_ == global_ring_head_);
+  if (!behind_global_hand) {
+    const uint32_t next = meta.global_next;
+    if (meta.global_prev != kNoSlot)
+      slots_[meta.global_prev].global_next = next;
+    else
+      global_ring_head_ = next;
+    if (next != kNoSlot)
+      slots_[next].global_prev = meta.global_prev;
+    if (global_hand_ == index)
+      global_hand_ = next != kNoSlot ? next : global_ring_head_;
+    LinkBeforeGlobalHandLocked(index);
+  }
+
   cls.read_heat = DecayedHeat(cls.read_heat, cls.heat_seq) + kReadHeatUnit;
   cls.heat_seq = activity_seq_;
   ++cls.read_touches;
@@ -471,6 +539,16 @@ void SlabAllocator::FreeSlotLocked(uint32_t index) {
     cls.hand = class_next != kNoSlot ? class_next : cls.ring_head;
   }
   if (cls.resident_count == 0) cls.hand = kNoSlot;
+
+  const uint32_t global_next = meta.global_next;
+  if (meta.global_prev != kNoSlot)
+    slots_[meta.global_prev].global_next = global_next;
+  else
+    global_ring_head_ = global_next;
+  if (global_next != kNoSlot)
+    slots_[global_next].global_prev = meta.global_prev;
+  if (global_hand_ == index)
+    global_hand_ = global_next != kNoSlot ? global_next : global_ring_head_;
 
   if (meta.extent_prev != kNoSlot)
     slots_[meta.extent_prev].extent_next = meta.extent_next;
@@ -715,7 +793,7 @@ bool SlabAllocator::Put(const BlockKey& key, size_t len, SlotRef* out,
   meta.ref.slot_size = classes_[cls_index].slot_size;
   meta.ref.offset = static_cast<uint64_t>(placement.slot) * meta.ref.slot_size;
   meta.useful_bytes = len;
-  meta.put_seq = ++put_seq_;
+  const uint64_t insert_seq = ++put_seq_;
   meta.key = key;
   meta.live = true;
   if (!index_.Insert(key, meta_index)) {
@@ -733,7 +811,7 @@ bool SlabAllocator::Put(const BlockKey& key, size_t len, SlotRef* out,
   cls.useful_bytes += len;
   --extent.free_slots;
   extent.useful_bytes += len;
-  extent.youngest_seq = std::max(extent.youngest_seq, meta.put_seq);
+  extent.youngest_seq = std::max(extent.youngest_seq, insert_seq);
   used_bytes_ += meta.ref.slot_size;
   if (out) *out = meta.ref;
   if (out_handle) out_handle->index = meta_index;
@@ -871,53 +949,45 @@ size_t SlabAllocator::ReclaimClass(size_t cls_index, size_t target_free,
 }
 
 size_t SlabAllocator::EvictColdToTarget(uint64_t target_bytes,
-                                        size_t max_extents,
+                                        size_t max_victims,
                                         std::vector<BlockKey>* evicted) {
   std::lock_guard<std::mutex> lock(mu_);
+  const size_t limit =
+      max_victims > std::numeric_limits<size_t>::max() / 4
+          ? std::numeric_limits<size_t>::max()
+          : 4 * max_victims;
   size_t freed = 0;
-  while (used_bytes_ > target_bytes && freed < max_extents) {
-    // Select the globally coldest fully unpinned extent across all classes.
-    // Read heat wins, then insertion recency and useful bytes break ties. This
-    // class-agnostic choice keeps headroom ahead of demand without evicting a
-    // hotter donor merely because its class was examined first.
-    int best = -1;
-    uint64_t best_heat = std::numeric_limits<uint64_t>::max();
-    uint64_t best_seq = std::numeric_limits<uint64_t>::max();
-    uint64_t best_useful = std::numeric_limits<uint64_t>::max();
-    for (uint32_t e = 0; e < extents_.size(); ++e) {
-      const ExtentMeta& extent = extents_[e];
-      if (extent.cls == kUnbound || extent.pinned != 0 ||
-          extent.resident_count == 0)
-        continue;
-      const uint64_t heat = ExtentHeatLocked(extent);
-      if (best < 0 || heat < best_heat ||
-          (heat == best_heat && extent.youngest_seq < best_seq) ||
-          (heat == best_heat && extent.youngest_seq == best_seq &&
-           extent.useful_bytes < best_useful)) {
-        best = static_cast<int>(e);
-        best_heat = heat;
-        best_seq = extent.youngest_seq;
-        best_useful = extent.useful_bytes;
-      }
+  for (size_t steps = 0;
+       steps < limit && freed < max_victims && used_bytes_ > target_bytes &&
+       global_hand_ != kNoSlot;
+       ++steps) {
+    ++watermark_scan_steps_;
+    const uint32_t index = global_hand_;
+    SlotMeta& meta = slots_[index];
+    const uint32_t next =
+        meta.global_next != kNoSlot ? meta.global_next : global_ring_head_;
+    if (meta.refs > 0) {
+      global_hand_ = next;
+      continue;
     }
-    if (best < 0) break;
-    ExtentMeta& extent = extents_[static_cast<uint32_t>(best)];
-    const bool extent_cleared =
-        opt_.on_extent_evict &&
-        opt_.on_extent_evict(static_cast<uint32_t>(best),
-                             extent.total_slots, extent.resident_count);
-    if (opt_.on_extent_evict && !extent_cleared) return freed;
-    while (extent.resident_head != kNoSlot) {
-      const uint32_t index = extent.resident_head;
-      SlotMeta& meta = slots_[index];
-      if (!extent_cleared && opt_.on_slot_evict &&
-          !opt_.on_slot_evict(meta.ref))
-        return freed;
-      BlockKey victim = meta.key;
-      FreeSlotLocked(index);
-      if (evicted) evicted->push_back(std::move(victim));
-      ++evictions_;
+    // Actual GETs and new admissions already refresh global sweep order.
+    // Leave reference credit to class-local CLOCK; it must not postpone an
+    // older resident past more recent reads or writes here.
+
+    const ExtentMeta& extent = extents_[meta.ref.extent];
+    if (extent.resident_count == 1 && opt_.on_extent_evict) {
+      if (!opt_.on_extent_evict(meta.ref.extent, extent.total_slots, 1))
+        break;
+    } else if (opt_.on_slot_evict) {
+      if (!opt_.on_slot_evict(meta.ref)) break;
+    } else if (opt_.on_extent_evict) {
+      // A whole-extent callback cannot invalidate only this resident safely.
+      break;
     }
+    const BlockKey victim = meta.key;
+    FreeSlotLocked(index);
+    if (evicted) evicted->push_back(victim);
+    ++evictions_;
     ++watermark_evictions_;
     ++freed;
   }
@@ -950,6 +1020,10 @@ uint64_t SlabAllocator::ColdSteals() const {
 uint64_t SlabAllocator::WatermarkEvictions() const {
   std::lock_guard<std::mutex> lock(mu_);
   return watermark_evictions_;
+}
+uint64_t SlabAllocator::WatermarkScanVisits() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return watermark_scan_steps_;
 }
 uint64_t SlabAllocator::ExtentReturns() const {
   std::lock_guard<std::mutex> lock(mu_);

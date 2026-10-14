@@ -206,11 +206,17 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_table_sync_total` | counter | slots.tbl fdatasync 周期数（`DFKV_SLAB_TABLE_SYNC_MS`，默认 100ms；限定崩溃复活毒化窗口） |
 | `dfkv_slab_extent_steals_total` / `dfkv_slab_extent_returns_total` | counter | 跨 class extent 抢占（伴随驱逐，容量失衡信号）/ 全空 extent 主动回池（无损再平衡） |
 | `dfkv_slab_cold_steals_total` | counter | 命中"全局最冷 extent"护栏的跨 class 抢占（donor 全部内容都冷于 `DFKV_SLAB_COLD_STEAL_WINDOW` 窗口才走此路，满环自噬护栏；0=窗口关闭） |
-| `dfkv_slab_watermark_evictions_total` | counter | high crossing 后持续到 low 的主动整 extent 驱逐数 |
-| `dfkv_slab_watermark_extent_clears_total` | counter | watermark 使用单次连续 slots.tbl clear 的 extent 数；应与 watermark eviction 同步 |
+| `dfkv_slab_watermark_evictions_total` / `dfkv_slab_watermark_slot_removals_total` | counter | 全局水位回收移除的对象数，包含最后一个 resident 经整 extent 回调清除的对象；不再以 extent 为单位 |
+| `dfkv_slab_watermark_extent_clears_total` | counter | 成功的整 extent 元数据清除写入数，不等于对象数或 fdatasync 次数 |
 | `dfkv_slab_watermark_ticks_total` / `dfkv_slab_watermark_active` | counter / gauge | bounded eviction tick 数 / hysteresis 是否仍在 drain |
 | `dfkv_slab_watermark_last_tick_us` / `max_tick_us` | gauge | 最近 / 进程最大 watermark 锁区间微秒数 |
-| `dfkv_slab_watermark_max_extents_per_tick` | gauge | 每盘每 tick 配置的 extent 上限 |
+| `dfkv_slab_watermark_max_victims_per_tick` / `dfkv_slab_watermark_max_visits_per_tick` | gauge | 每盘每 tick 的 slot 移除上限 / 扫描上限；替代旧 max-extents gauge |
+| `dfkv_slab_watermark_slot_record_clears_total` / `dfkv_slab_watermark_record_clear_bytes_total` | counter | 全局回收成功的单 slot tombstone 写入数 / 单 slot 与整 extent 元数据写入字节；不代表同步持久化或物理写放大 |
+| `dfkv_slab_watermark_freed_slot_bytes_total` / `dfkv_slab_watermark_scan_visits_total` | counter | 全局回收释放的分配字节 / 扫描位置次数 |
+| `dfkv_slab_disk_run_epoch` / `dfkv_slab_disk_capacity_bytes` | gauge | 按 `disk`、`disk_index` 标记的运行 epoch / 容量 |
+| `dfkv_slab_disk_watermark_high_bytes` / `dfkv_slab_disk_watermark_low_bytes` / `dfkv_slab_disk_reclaim_interval_ms` / `dfkv_slab_disk_watermark_active` | gauge | 每盘解析后的水位、回收周期及活跃状态 |
+| `dfkv_slab_disk_watermark_high_observations_total` | counter | 每盘回收线程实际观察到 used > high 的次数；不等于回收次数 |
+| `dfkv_slab_disk_watermark_last_high_bytes` / `dfkv_slab_disk_watermark_peak_high_bytes` | gauge | 最近 / 本次运行最大超高水位观察值；历史 peak 不能单独证明新阶段跨水位 |
 | `dfkv_slab_table_rebuilt_objects` / `dfkv_slab_rebuild_scanned_bytes` / `dfkv_slab_rebuild_scan_chunks` / `dfkv_slab_rebuild_sparse_ranges` / `dfkv_slab_rebuild_mmap_scans` | gauge | 上次启动冷升从 slots.tbl 恢复的对象数 / 扫描字节 / chunk / sparse range / mmap 的表数（冷升目录规模诊断） |
 | `dfkv_slab_rebuild_corrupt_records_total` / `dfkv_slab_rebuild_rejected_records_total` / `dfkv_slab_rebuild_sequential_fallbacks_total` | counter | 启动 rebuild 丢弃的损坏记录 / 因几何不安全被清除的合法记录 / sparse seek 退化为顺序扫描的次数（任一非零都值得看日志） |
 | `dfkv_slab_deferred_removes_total` | counter | 被在飞 I/O 延迟执行的 Remove |

@@ -29,6 +29,7 @@
 
 #include "cache/slab_allocator.h"
 #include "cache/store_engine.h"
+#include "cache/new_put_demand_latch.h"
 #include "common/kv_types.h"
 #include "common/status.h"
 
@@ -82,11 +83,18 @@ class DiskSlabStore : public StoreEngine {
     uint64_t cold_steals = 0;
     uint64_t watermark_evictions = 0;
     uint64_t watermark_extent_clears = 0;
+    // Global slot reclamation and durable invalidation work.
+    uint64_t watermark_slot_removals = 0;
+    uint64_t watermark_slot_record_clears = 0;
+    uint64_t watermark_record_clear_bytes = 0;
+    uint64_t watermark_freed_slot_bytes = 0;
+    uint64_t watermark_scan_visits = 0;
+    uint64_t watermark_max_victims_per_tick = 0;
+    uint64_t watermark_max_visits_per_tick = 0;
     uint64_t watermark_ticks = 0;
     uint64_t watermark_active = 0;
     uint64_t watermark_last_tick_us = 0;
     uint64_t watermark_max_tick_us = 0;
-    uint64_t watermark_max_extents_per_tick = 0;
     uint64_t extent_returns = 0;
     uint64_t deferred_removes = 0;
     uint64_t inflight = 0;
@@ -118,6 +126,27 @@ class DiskSlabStore : public StoreEngine {
     uint64_t failed_disks = 0;
     bool failed = false;
   };
+
+  // A narrow locked view: no allocator class enumeration or temporary vectors.
+  struct WatermarkObservation {
+    uint64_t watermark_high_observations;
+    uint64_t watermark_last_high_bytes;
+    uint64_t watermark_peak_high_bytes;  // lifetime sampled peak, not phase proof
+    uint64_t run_epoch;
+    uint64_t capacity_bytes;
+    uint64_t watermark_high_bytes;
+    uint64_t watermark_low_bytes;
+    uint64_t reclaim_interval_ms;
+    uint64_t watermark_active;
+  };
+  WatermarkObservation GetWatermarkObservation() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return {watermark_high_observations_, watermark_last_high_bytes_,
+            watermark_peak_high_bytes_, run_epoch_,
+            static_cast<uint64_t>(opt_.extent_bytes) * num_extents_,
+            evict_high_bytes_, evict_low_bytes_, opt_.reclaim_interval_ms,
+            watermark_active_.load(std::memory_order_relaxed) ? 1u : 0u};
+  }
 
   // Opens (or creates) the store under Options::dir, pre-allocating extents and
   // rebuilding the index from slots.tbl. An interrupted first initialization
@@ -295,6 +324,11 @@ class DiskSlabStore : public StoreEngine {
   std::atomic<uint64_t> unclean_resets_{0};
   std::atomic<uint64_t> eviction_record_clears_{0};
   std::atomic<uint64_t> watermark_extent_clears_{0};
+  std::atomic<uint64_t> watermark_slot_record_clears_{0};
+  std::atomic<uint64_t> watermark_record_clear_bytes_{0};
+  std::atomic<uint64_t> watermark_freed_slot_bytes_{0};
+  // Under mu_: shared callbacks count global-selector pwrite completions only.
+  bool watermark_selector_call_ = false;
   // slots.tbl sync thread (see Options::table_sync_ms): fdatasync only when
   uint64_t rebuild_corrupt_records_ = 0;
   uint64_t rebuild_rejected_records_ = 0;
@@ -328,13 +362,20 @@ class DiskSlabStore : public StoreEngine {
   // The batched-write submission ring is thread_local (see disk_slab_store.cc):
   // one per flush worker, no shared lock across the blocking CQE wait.
   std::vector<uint64_t> reclaim_last_puts_;  // reclaim-thread-local puts snapshot
+  NewPutDemandLatch watermark_latch_;  // under mu_
+  uint64_t new_put_bytes_since_tick_ = 0;  // successful NEW commits, under mu_
   uint64_t evict_high_bytes_ = 0;  // high crossing activates eviction
   uint64_t evict_low_bytes_ = 0;   // active eviction drains to this target
-  size_t evict_max_extents_per_tick_ = 1;
+  size_t evict_max_victims_per_tick_ = 256;
+  std::vector<BlockKey> watermark_evicted_;  // bounded reusable output, under mu_
   std::atomic<bool> watermark_active_{false};
   std::atomic<uint64_t> watermark_ticks_{0};
   std::atomic<uint64_t> watermark_last_tick_us_{0};
   std::atomic<uint64_t> watermark_max_tick_us_{0};
+  // Reclaimer observations, read/written together under mu_.
+  uint64_t watermark_high_observations_ = 0;
+  uint64_t watermark_last_high_bytes_ = 0;
+  uint64_t watermark_peak_high_bytes_ = 0;
   std::thread reclaim_thread_;
   std::condition_variable reclaim_cv_;
   std::mutex reclaim_mu_;

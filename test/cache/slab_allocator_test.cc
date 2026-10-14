@@ -295,74 +295,129 @@ TEST(SlabAllocator, ColdStealDisabledFallsBackToSelfEvict) {
   ::unsetenv("DFKV_SLAB_COLD_STEAL_WINDOW");
 }
 
-TEST(SlabAllocator, EvictColdToTargetFreesGloballyColdestFirst) {
-  // Phase 10: proactive watermark eviction. Fill the pool, then evict down to
-  // a target — the OLDEST data must go first, newest survives.
-  SlabAllocator a(Opts(4 * 4096, 8));  // 8 extents, 32 4096-slots
-  std::vector<BlockKey> ev;
-  SlotRef r;
-  for (int i = 0; i < 32; ++i)  // fill: k0 oldest .. k31 newest
-    ASSERT_TRUE(a.Put(Key("k" + std::to_string(i)), 4096, &r, &ev));
-  const uint64_t full = a.UsedBytes();
-  EXPECT_EQ(full, 32u * 4096);
-  ev.clear();
-  // Evict down to ~half. Coldest-first: the low-numbered (oldest) keys go.
-  size_t freed = a.EvictColdToTarget(full / 2, /*max_extents=*/8, &ev);
-  EXPECT_GT(freed, 0u);
-  EXPECT_LE(a.UsedBytes(), full / 2 + 4 * 4096);  // within one extent of target
-  EXPECT_GE(a.WatermarkEvictions(), 1u);
-  ASSERT_FALSE(ev.empty());
-  // Everything evicted is from the older half; the newest key survived.
-  for (const auto& k : ev) {
-    int n = std::stoi(KeyName(k).substr(1));
-    EXPECT_LT(n, 32) << KeyName(k);
-  }
-  EXPECT_TRUE(a.Contains(Key("k31"))) << "newest data must survive proactive eviction";
-}
-
-TEST(SlabAllocator, WholeExtentCallbackReplacesPerSlotMetadataClears) {
-  auto options = Opts(4 * 4096, 2);
-  uint32_t extent_calls = 0;
-  uint32_t slot_calls = 0;
-  uint32_t cleared_residents = 0;
-  options.on_extent_evict =
-      [&](uint32_t, uint32_t total_slots, uint32_t residents) {
-        ++extent_calls;
-        EXPECT_EQ(total_slots, 4u);
-        cleared_residents += residents;
-        return true;
-      };
-  options.on_slot_evict = [&](const SlotRef&) {
-    ++slot_calls;
-    return true;
-  };
-  SlabAllocator allocator(options);
+TEST(SlabAllocator, WatermarkUsesGetRecencyAcrossClasses) {
+  SlabAllocator a(Opts(4 * 4096, 16));
   std::vector<BlockKey> evicted;
   SlotRef ref;
-  for (int i = 0; i < 8; ++i)
-    ASSERT_TRUE(allocator.Put(Key("k" + std::to_string(i)), 4096,
-                              &ref, &evicted));
-
-  evicted.clear();
-  EXPECT_EQ(allocator.EvictColdToTarget(0, 1, &evicted), 1u);
-  EXPECT_EQ(extent_calls, 1u);
-  EXPECT_EQ(slot_calls, 0u);
-  EXPECT_EQ(cleared_residents, 4u);
-  EXPECT_EQ(evicted.size(), 4u);
+  ASSERT_TRUE(a.Put(Key("read"), 4096, &ref, &evicted));
+  ASSERT_TRUE(a.Put(Key("cold"), 8192, &ref, &evicted));
+  ASSERT_TRUE(a.Get(Key("read"), &ref));
+  ASSERT_TRUE(a.Put(Key("new"), 4096, &ref, &evicted));
+  // EXISTS and duplicate PUT are not actual consumption or new admission.
+  EXPECT_TRUE(a.Contains(Key("cold")));
+  ASSERT_TRUE(a.Put(Key("cold"), 8192, &ref, &evicted));
+  EXPECT_EQ(a.EvictColdToTarget(0, 1, &evicted), 1u);
+  ASSERT_EQ(evicted.size(), 1u);
+  EXPECT_EQ(evicted[0], Key("cold"));
+  EXPECT_TRUE(a.Contains(Key("read")));
+  EXPECT_TRUE(a.Contains(Key("new")));
+  EXPECT_EQ(a.UsedBytes(), 2u * 4096);
 }
 
-TEST(SlabAllocator, EvictColdToTargetRespectsPinsAndTarget) {
-  SlabAllocator a(Opts(4 * 4096, 4));  // 4 extents, 16 slots
-  std::vector<BlockKey> ev;
-  SlotRef r;
-  for (int i = 0; i < 16; ++i) ASSERT_TRUE(a.Put(Key("k" + std::to_string(i)), 4096, &r, &ev));
-  ASSERT_TRUE(a.Pin(Key("k0")));  // pins k0's whole extent against eviction
-  ev.clear();
-  const uint64_t used0 = a.UsedBytes();
-  // Target 0 would want to evict everything, but pinned extents can't be freed.
-  a.EvictColdToTarget(0, /*max_extents=*/4, &ev);
-  EXPECT_TRUE(a.Contains(Key("k0"))) << "pinned key never evicted";
-  EXPECT_LT(a.UsedBytes(), used0) << "some cold extents freed";
+TEST(SlabAllocator, WatermarkStopsAtSlotTargetAndVictimBudget) {
+  SlabAllocator a(Opts(4 * 4096, 1));
+  std::vector<BlockKey> evicted;
+  SlotRef ref;
+  for (int i = 0; i < 4; ++i)
+    ASSERT_TRUE(a.Put(Key("k" + std::to_string(i)), 4096, &ref, &evicted));
+  EXPECT_EQ(a.EvictColdToTarget(0, 0, &evicted), 0u);
+  EXPECT_EQ(a.EvictColdToTarget(0, 1, &evicted), 1u);
+  EXPECT_EQ(a.Count(), 3u);
+  EXPECT_EQ(a.EvictColdToTarget(2 * 4096, 4, &evicted), 1u);
+  ASSERT_EQ(evicted.size(), 2u);
+  EXPECT_EQ(evicted[0], Key("k0"));
+  EXPECT_EQ(evicted[1], Key("k1"));
+  EXPECT_EQ(a.UsedBytes(), 2u * 4096);
+  EXPECT_EQ(a.EvictColdToTarget(2 * 4096, 4, &evicted), 0u);
+}
+
+TEST(SlabAllocator, WatermarkSkipsPinnedSlotsWithoutProtectingTheirExtent) {
+  SlabAllocator a(Opts(4 * 4096, 1));
+  std::vector<BlockKey> evicted;
+  SlotRef ref;
+  for (int i = 0; i < 4; ++i)
+    ASSERT_TRUE(a.Put(Key("k" + std::to_string(i)), 4096, &ref, &evicted));
+  ASSERT_TRUE(a.Pin(Key("k0")));
+  EXPECT_EQ(a.EvictColdToTarget(0, 4, &evicted), 3u);
+  EXPECT_TRUE(a.Contains(Key("k0")));
+  EXPECT_EQ(a.Count(), 1u);
+  EXPECT_EQ(a.UsedBytes(), 4096u);
+  ASSERT_TRUE(a.Unpin(Key("k0")));
+  EXPECT_EQ(a.EvictColdToTarget(0, 1, &evicted), 1u);
+  EXPECT_EQ(a.Count(), 0u);
+}
+
+TEST(SlabAllocator, WatermarkBoundedScanContinuesPastPinnedPrefixNextCall) {
+  SlabAllocator a(Opts(8 * 4096, 1));
+  std::vector<BlockKey> evicted;
+  SlotRef ref;
+  for (int i = 0; i < 6; ++i) {
+    ASSERT_TRUE(a.Put(Key("k" + std::to_string(i)), 4096, &ref, &evicted));
+    if (i < 5) ASSERT_TRUE(a.Pin(Key("k" + std::to_string(i))));
+  }
+  // A one-victim call visits at most four slots, even when none are eligible.
+  EXPECT_EQ(a.EvictColdToTarget(0, 1, &evicted), 0u);
+  EXPECT_TRUE(evicted.empty());
+  EXPECT_EQ(a.EvictColdToTarget(0, 1, &evicted), 1u);
+  ASSERT_EQ(evicted.size(), 1u);
+  EXPECT_EQ(evicted[0], Key("k5"));
+  EXPECT_EQ(a.Count(), 5u);
+}
+
+TEST(SlabAllocator, WatermarkClearsIndividualRecordsUntilLastResident) {
+  auto options = Opts(4 * 4096, 1);
+  uint32_t extent_calls = 0;
+  uint32_t slot_calls = 0;
+  bool allow_clear = false;
+  options.on_extent_evict = [&](uint32_t, uint32_t total, uint32_t residents) {
+    ++extent_calls;
+    EXPECT_EQ(total, 4u);
+    EXPECT_EQ(residents, 1u);
+    return allow_clear;
+  };
+  options.on_slot_evict = [&](const SlotRef&) {
+    ++slot_calls;
+    return allow_clear;
+  };
+  SlabAllocator a(options);
+  std::vector<BlockKey> evicted;
+  SlotRef ref;
+  for (int i = 0; i < 4; ++i)
+    ASSERT_TRUE(a.Put(Key("k" + std::to_string(i)), 4096, &ref, &evicted));
+  EXPECT_EQ(a.EvictColdToTarget(0, 4, &evicted), 0u);
+  EXPECT_TRUE(evicted.empty());
+  EXPECT_EQ(a.Count(), 4u);  // failed persistence must not forget a resident
+  allow_clear = true;
+  EXPECT_EQ(a.EvictColdToTarget(4096, 4, &evicted), 3u);
+  EXPECT_EQ(slot_calls, 4u);
+  EXPECT_EQ(extent_calls, 0u);
+  allow_clear = false;
+  EXPECT_EQ(a.EvictColdToTarget(0, 1, &evicted), 0u);
+  EXPECT_TRUE(a.Contains(Key("k3")));
+  allow_clear = true;
+  EXPECT_EQ(a.EvictColdToTarget(0, 1, &evicted), 1u);
+  EXPECT_EQ(extent_calls, 2u);
+  EXPECT_EQ(a.Count(), 0u);
+}
+
+TEST(SlabAllocator, WatermarkCannotWipeLivePeersWithOnlyExtentCallback) {
+  auto options = Opts(2 * 4096, 1);
+  uint32_t extent_calls = 0;
+  options.on_extent_evict = [&](uint32_t, uint32_t, uint32_t) {
+    ++extent_calls;
+    return true;
+  };
+  SlabAllocator a(options);
+  SlotRef ref;
+  std::vector<BlockKey> evicted;
+  ASSERT_TRUE(a.Put(Key("first"), 4096, &ref, &evicted));
+  ASSERT_TRUE(a.Put(Key("peer"), 4096, &ref, &evicted));
+  EXPECT_EQ(a.EvictColdToTarget(4096, 1, &evicted), 0u);
+  EXPECT_EQ(extent_calls, 0u);
+  EXPECT_TRUE(evicted.empty());
+  EXPECT_TRUE(a.Contains(Key("first")));
+  EXPECT_TRUE(a.Contains(Key("peer")));
+  EXPECT_EQ(a.UsedBytes(), 2u * 4096);
 }
 
 TEST(SlabAllocator, OversizeValueRejected) {

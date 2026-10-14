@@ -546,6 +546,17 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.cold_steals += st.cold_steals;
     sum.watermark_evictions += st.watermark_evictions;
     sum.watermark_extent_clears += st.watermark_extent_clears;
+    sum.watermark_slot_removals += st.watermark_slot_removals;
+    sum.watermark_slot_record_clears += st.watermark_slot_record_clears;
+    sum.watermark_record_clear_bytes += st.watermark_record_clear_bytes;
+    sum.watermark_freed_slot_bytes += st.watermark_freed_slot_bytes;
+    sum.watermark_scan_visits += st.watermark_scan_visits;
+    sum.watermark_max_victims_per_tick =
+        std::max(sum.watermark_max_victims_per_tick,
+                 st.watermark_max_victims_per_tick);
+    sum.watermark_max_visits_per_tick =
+        std::max(sum.watermark_max_visits_per_tick,
+                 st.watermark_max_visits_per_tick);
     sum.watermark_ticks += st.watermark_ticks;
     sum.watermark_active =
         std::max(sum.watermark_active, st.watermark_active);
@@ -553,9 +564,6 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
         std::max(sum.watermark_last_tick_us, st.watermark_last_tick_us);
     sum.watermark_max_tick_us =
         std::max(sum.watermark_max_tick_us, st.watermark_max_tick_us);
-    sum.watermark_max_extents_per_tick =
-        std::max(sum.watermark_max_extents_per_tick,
-                 st.watermark_max_extents_per_tick);
     sum.extent_returns += st.extent_returns;
     sum.deferred_removes += st.deferred_removes;
     sum.inflight += st.inflight;
