@@ -411,8 +411,12 @@ bool PublishThroughBounce(const CudaLib* cuda, PublisherCudaState* state,
 bool CudaLib::SetSyncMemops(const void* p) const {
   if (!PointerSetAttribute || !p) return false;
   const int enabled = 1;
-  return PointerSetAttribute(const_cast<void*>(p), kCuPointerAttributeSyncMemops,
-                             &enabled) == kCudaSuccess;
+  // cuPointerSetAttribute(const void *data, CUpointer_attribute attribute,
+  // CUdeviceptr ptr): the attribute value comes first, the target pointer
+  // last. Passing (ptr, attribute, data) silently arms the attribute on a
+  // host stack address and returns success, leaving p unarmed.
+  return PointerSetAttribute(&enabled, kCuPointerAttributeSyncMemops,
+                             reinterpret_cast<CUdeviceptr>(p)) == kCudaSuccess;
 }
 
 PinnedBouncePoolStats GetPinnedBouncePoolStatsForTest() {
@@ -455,7 +459,7 @@ bool CudaLib::Resolve() {
       SymV2(h, "cuIpcOpenMemHandle_v2", "cuIpcOpenMemHandle"));
   IpcCloseMemHandle = reinterpret_cast<CUresult (*)(CUdeviceptr)>(
       ::dlsym(h, "cuIpcCloseMemHandle"));
-  PointerSetAttribute = reinterpret_cast<CUresult (*)(void*, int, const void*)>(
+  PointerSetAttribute = reinterpret_cast<CUresult (*)(const void*, int, CUdeviceptr)>(
       ::dlsym(h, "cuPointerSetAttribute"));
   ctx_get_current_ = reinterpret_cast<CUresult (*)(CUcontext*)>(
       ::dlsym(h, "cuCtxGetCurrent"));
