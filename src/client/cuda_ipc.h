@@ -87,7 +87,7 @@ class CudaLib {
   // that observed an RDMA completion cannot launch a CUDA kernel that reads
   // the destination before the BAR writes are memory-ordered (GPUDirect RDMA
   // design guide, "Synchronization and Memory Ordering").
-  CUresult (*PointerSetAttribute)(void*, int, const void*) = nullptr;
+  CUresult (*PointerSetAttribute)(const void*, int, CUdeviceptr) = nullptr;
 
  private:
   CudaLib() = default;
