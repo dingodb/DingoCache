@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Make vLLM connector KV events survive cross-worker aggregation. Each
+  BlockStored event now chains to its predecessor in the request instead
+  of to the previous chunk this rank stored, so all ranks emit identical
+  events. Replicated (MLA) payloads are striped across TP ranks, so one
+  report per block now suffices for those groups while TP-sharded state
+  still needs every rank; workers with no events still count toward the
+  quorum. Previously, striped MLA events at TP > 1 were almost all dropped.
+
 - Make vLLM connector lookup probe every key coordinate that the TP x PCP
   workers of a pipeline stage write, instead of only the lookup rank's own
   PCP/DCP coordinate. Under MLA with DCP, a prefix missing another DCP
