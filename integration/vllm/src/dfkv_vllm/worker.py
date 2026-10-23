@@ -765,6 +765,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             ends: list[int] = []
             keys: list[bytes] = []
             block_hashes: list[BlockHash] = []
+            parent_hashes: list[BlockHash | None] = []
             group_indices: list[int] = []
             logical_block_ids_per_group: list[list[int]] = []
             stripe_position = 0
@@ -773,9 +774,15 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 logical_block_ids_per_group.append(
                     _logical_block_ids(mask, block_ids_per_group[g_idx])
                 )
+                # KV events chain each block to its predecessor in the request,
+                # not to whichever chunk this rank happened to store before it:
+                # every rank must emit an identical event for aggregation.
+                parent_hash: BlockHash | None = None
                 for chunk_idx, (start, end, key) in enumerate(
                     db.process_tokens(token_len, req_meta.block_hashes)
                 ):
+                    chunk_hash = BlockHash(bytes.fromhex(key.chunk_hash))
+                    chunk_parent, parent_hash = parent_hash, chunk_hash
                     if chunk_idx >= len(mask) or not mask[chunk_idx]:
                         continue
                     # State checkpoints contain this physical TP rank's shard;
@@ -796,7 +803,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     starts.append(start)
                     ends.append(end)
                     keys.append(key.to_bytes())
-                    block_hashes.append(BlockHash(bytes.fromhex(key.chunk_hash)))
+                    block_hashes.append(chunk_hash)
+                    parent_hashes.append(chunk_parent)
                     group_indices.append(g_idx)
 
 
@@ -841,6 +849,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             ends = [ends[i] for i in missing_indices]
             keys = [keys[i] for i in missing_indices]
             block_hashes = [block_hashes[i] for i in missing_indices]
+            parent_hashes = [parent_hashes[i] for i in missing_indices]
             group_indices = [group_indices[i] for i in missing_indices]
 
             logger.debug(
@@ -863,8 +872,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
             ]
             descriptor_batch = SgDescriptorBatch.from_chunks(descriptor_chunks)
             stored_events: list[BlockStored] = []
-            # parent_block_hash chains live within a group, not across.
-            prev_key_per_group: dict[int, Any] = {}
             new_block_hashes = [maybe_convert_block_hash(bh) for bh in block_hashes]
 
             for idx, (s, e, g_idx) in enumerate(
@@ -880,7 +887,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     )
                     stored_event = BlockStored(
                         block_hashes=[new_block_hashes[idx]],
-                        parent_block_hash=prev_key_per_group.get(g_idx),
+                        parent_block_hash=(
+                            maybe_convert_block_hash(parent_hashes[idx])
+                            if parent_hashes[idx] is not None
+                            else None
+                        ),
                         token_ids=token_ids,
                         block_size=db.block_size,
                         lora_id=None,
@@ -889,7 +900,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         group_idx=g_idx,
                     )
                     stored_events.append(stored_event)
-                    prev_key_per_group[g_idx] = new_block_hashes[idx]
 
             if current_event is not None:
                 current_event.synchronize()
@@ -1698,6 +1708,13 @@ class DfkvStoreWorker:
             for g_idx, group in enumerate(kv_cache_config.kv_cache_groups)
             if isinstance(_unwrap_spec(group.kv_cache_spec), MambaSpec)
             and _prefix_cacheable(group.kv_cache_spec)
+        )
+        # KV events: how many TP workers share one stored copy of a group's
+        # block. Replicated payloads are striped across their replica set, so
+        # one worker reports each block; TP-sharded state needs every worker.
+        self.group_tp_replication_factors = tuple(
+            1 if g_idx in self._tp_sharded_groups else key_stripe.stripe_step
+            for g_idx in range(len(kv_cache_config.kv_cache_groups))
         )
         self._kv_cache_groups: list[KVCacheGroupSpec] = [
             dataclasses.replace(

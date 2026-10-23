@@ -205,11 +205,48 @@ def test_noallocation_prefill_kv_events_carry_block_token_ids(hybrid_workers):
 
     assert saved == [BLOCK, 3 * BLOCK]
     events = producer.get_kv_events()
-    assert [event.block_hashes for event in events] == [
-        [worker_module.maybe_convert_block_hash(h)] for h in _hashes(3)
-    ]
+    converted = [worker_module.maybe_convert_block_hash(h) for h in _hashes(3)]
+    assert [event.block_hashes for event in events] == [[h] for h in converted]
+    # Block 1 is the first block of the second SAVE; it still chains to block 0.
+    assert [event.parent_block_hash for event in events] == [None, *converted[:2]]
     assert [event.token_ids for event in events] == [
         prompt[i * BLOCK:(i + 1) * BLOCK] for i in range(3)
+    ]
+
+
+def test_striped_kv_events_survive_aggregation_with_request_parents(hybrid_workers):
+    """Every TP rank stores only its stripe of a replicated (MLA) payload; the
+    published events must still cover every block, chained by request order."""
+    from dfkv_vllm.connector import DfkvStoreKVEvents
+
+    create, _ = hybrid_workers
+    hashes = _hashes(3)
+    tokens = list(range(500, 500 + 3 * BLOCK))
+    combined = None
+    for rank in range(4):
+        producer, _ = create(rank, states=False, kv_events=True)
+        job = ReqMeta(
+            req_id=f"striped-{rank}", token_len_chunk=3 * BLOCK,
+            block_ids=([1, 2, 3],), block_hashes=hashes, token_ids=tokens,
+        )
+        producer.kv_send_thread.add_stored_request(job)
+        producer.kv_send_thread._handle_request(job)
+        container = DfkvStoreKVEvents(
+            1, group_tp_replication_factors=producer.group_tp_replication_factors,
+        )
+        container.add_events(producer.get_kv_events())
+        if combined is None:
+            combined = container
+        else:
+            combined.add_events(container.get_all_events())
+            combined.increment_workers(1)
+
+    events = combined.aggregate().get_all_events()
+    converted = [worker_module.maybe_convert_block_hash(h) for h in hashes]
+    assert [event.block_hashes for event in events] == [[h] for h in converted]
+    assert [event.parent_block_hash for event in events] == [None, *converted[:2]]
+    assert [event.token_ids for event in events] == [
+        tokens[i * BLOCK:(i + 1) * BLOCK] for i in range(3)
     ]
 
 
