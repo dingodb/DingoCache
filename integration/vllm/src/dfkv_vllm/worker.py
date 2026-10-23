@@ -769,6 +769,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             group_indices: list[int] = []
             logical_block_ids_per_group: list[list[int]] = []
             stripe_position = 0
+            skipped_state = False
             for g_idx, db in enumerate(self.token_databases):
                 mask = store_masks[g_idx]
                 logical_block_ids_per_group.append(
@@ -796,6 +797,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     stripe_position += 1
                     if not selected:
                         continue
+                    if g_idx in self.tp_sharded_groups and not req_meta.save_state:
+                        # Fail closed: the state at this boundary was not just
+                        # computed, so its block may hold another position's
+                        # state. Lookup needs the state, so the prefix is not
+                        # admitted.
+                        skipped_state = True
+                        continue
                     if logical_block_ids_per_group[g_idx][chunk_idx] <= 0:
                         # HMA may already have released an earlier window.
                         # Null/padding slots are not valid immutable objects.
@@ -807,6 +815,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     parent_hashes.append(chunk_parent)
                     group_indices.append(g_idx)
 
+            if skipped_state:
+                logger.warning(
+                    "Skipped recurrent-state SAVE for request %s: boundary %d "
+                    "was not computed in this step",
+                    req_id,
+                    token_len,
+                )
 
             if not keys:
                 return
