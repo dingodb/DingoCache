@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- vLLM connector fixes carried over from upstream MooncakeStore and
+  vllm-ascend: skip pending loads that MultiConnector assigned to another
+  connector (no SAVE from blocks it is filling); refuse sleep mode, whose
+  page remap invalidates GPUDirect registrations; key the lookup IPC path
+  by the global DP index so colocated external-LB engines do not share it;
+  and derive the PP stage with PCP in vLLM's rank layout.
+
 - Track cached prefill progress from vLLM's computed token position even
   when a step allocates no new block. Previously the connector skipped the
   update, so one sub-block prefill chunk permanently desynchronized the
