@@ -14,6 +14,7 @@ offload staging, ReplicateConfig/preferred_segment) are dropped.
 """
 
 import dataclasses
+import functools
 import json
 import logging
 import os
@@ -245,6 +246,41 @@ def _key_stripe_identity(
         stripe_idx=stripe_idx,
         stripe_step=len(replica_ranks),
     )
+
+
+@functools.lru_cache(maxsize=None)
+def _key_namespaces(
+    *,
+    tp_size: int,
+    pcp_size: int,
+    dcp_size: int,
+    num_kv_heads: int,
+    use_mla: bool,
+    tp_sharded: bool,
+) -> tuple[tuple[int, int, int], ...]:
+    """Distinct ``(tp_rank, pcp_rank, dcp_rank)`` key coordinates that the
+    ``TP x PCP`` workers of one PP stage write for a cache group.
+
+    A prefix is loadable only if every one of them holds the chunk: each
+    worker later loads from its own coordinate.
+    """
+    namespaces: dict[tuple[int, int, int], None] = {}
+    for pcp_rank in range(pcp_size):
+        for tp_rank in range(tp_size):
+            dcp_rank = (tp_rank * pcp_size + pcp_rank) % dcp_size
+            if not tp_sharded:
+                tp_rank = _key_stripe_identity(
+                    tp_rank=tp_rank,
+                    tp_size=tp_size,
+                    pcp_rank=pcp_rank,
+                    pcp_size=pcp_size,
+                    dcp_rank=dcp_rank,
+                    dcp_size=dcp_size,
+                    num_kv_heads=num_kv_heads,
+                    use_mla=use_mla,
+                ).tp_rank
+            namespaces[(tp_rank, pcp_rank, dcp_rank)] = None
+    return tuple(namespaces)
 
 
 # dfkv: Removed Mooncake-store-only helpers:
@@ -2378,7 +2414,6 @@ class DfkvStoreWorker:
             candidate_keys: list[bytes] = []
             candidate_meta: list[tuple[int, int, int, bytes]] = []
             expected_per_object: dict[tuple[int, int, int, bytes], int] = {}
-            tp_count = min(self.tp_size, self.num_kv_head)
             # SAVE omits volatile draft tails. Admission must instead prove
             # every object LOAD needs at this exact candidate boundary.
             aligned_token_len = (
@@ -2397,20 +2432,23 @@ class DfkvStoreWorker:
                 group_hashes = self.coord.block_hashes_for_spec(
                     block_hashes, self._kv_cache_groups[g_idx].kv_cache_spec
                 )
-                # State pools need every physical TP shard, independently of
-                # attention head replication. MLA retains its canonical -1;
-                # GQA/DCP attention retains its existing head coordinates.
+                # State pools need every physical TP shard; payload pools need
+                # every head/PCP/DCP coordinate (MLA keeps its canonical -1).
                 tp_sharded = isinstance(
                     _unwrap_spec(self._kv_cache_groups[g_idx].kv_cache_spec),
                     MambaSpec,
                 )
-                if tp_sharded:
-                    tp_candidates = range(self.tp_size)
-                elif db.metadata.tp_rank < 0:
-                    tp_candidates = [db.metadata.tp_rank]
-                else:
-                    tp_candidates = range(tp_count)
-                rank_probes = max(1, len(tp_candidates))
+                # Key metadata carries this group's CP geometry; a negative
+                # tp_rank is exactly the canonical replicated-MLA coordinate.
+                namespaces = _key_namespaces(
+                    tp_size=self.tp_size,
+                    pcp_size=db.metadata.pcp_size,
+                    dcp_size=db.metadata.dcp_size,
+                    num_kv_heads=self.num_kv_head,
+                    use_mla=db.metadata.tp_rank < 0,
+                    tp_sharded=tp_sharded,
+                )
+                rank_probes = len(namespaces)
                 processed_chunks = 0
                 for chunk_id, h in enumerate(group_hashes):
                     start_idx = chunk_id * spec_block_size
@@ -2422,20 +2460,13 @@ class DfkvStoreWorker:
                     logical_chunk_idx = start_idx // self.coord.lcm_block_size
                     object_meta = (logical_chunk_idx, g_idx, chunk_id, bytes(h))
                     expected_per_object[object_meta] = rank_probes
-                    for tp in tp_candidates:
+                    for tp, pcp, dcp in namespaces:
                         # Keep this worker's own pp_rank (db.metadata.pp_rank): PP
                         # partitions layers, so each (group, chunk) lives under a
                         # single stage's pp_rank, matching the SAVE/LOAD keys. Probing
                         # every pp_rank matched nothing and forced present=0 on PP>1.
                         md = dataclasses.replace(
-                            db.metadata,
-                            tp_rank=tp,
-                            dcp_rank=(
-                                (tp * db.metadata.pcp_size + db.metadata.pcp_rank)
-                                % db.metadata.dcp_size
-                                if tp_sharded
-                                else db.metadata.dcp_rank
-                            ),
+                            db.metadata, tp_rank=tp, pcp_rank=pcp, dcp_rank=dcp
                         )
                         candidate_keys.append(PoolKey(md, h.hex()).to_bytes())
                         candidate_meta.append(object_meta)

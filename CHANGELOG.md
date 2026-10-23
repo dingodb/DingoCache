@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Make vLLM connector lookup probe every key coordinate that the TP x PCP
+  workers of a pipeline stage write, instead of only the lookup rank's own
+  PCP/DCP coordinate. Under MLA with DCP, a prefix missing another DCP
+  rank's shard was admitted and then failed to load; under GQA with DCP the
+  lookup probed coordinates nobody writes and never reported a hit.
+
 - vLLM connector fixes carried over from upstream MooncakeStore and
   vllm-ascend: skip pending loads that MultiConnector assigned to another
   connector (no SAVE from blocks it is filling); refuse sleep mode, whose
