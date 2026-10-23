@@ -42,7 +42,7 @@ jobs:
             /etc/apt/sources.list.d/ 2>/dev/null | sudo xargs -r rm -f
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build g++ clang python3 python3-numpy git ca-certificates
+            cmake ninja-build g++ clang python3 python3-numpy python3-pytest git ca-certificates
 
       - name: Cache FetchContent (googletest)
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
@@ -173,7 +173,8 @@ jobs:
           sudo grep -rlE 'packages\.microsoft\.com|dl\.google\.com' \
             /etc/apt/sources.list.d/ 2>/dev/null | sudo xargs -r rm -f
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake ninja-build g++ git ca-certificates
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++ git ca-certificates \
+            python3 python3-numpy python3-pytest
       - name: Build with TSan
         run: |
           cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \

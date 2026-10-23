@@ -270,6 +270,24 @@ if(DFKV_BUILD_TESTS)
               -p test_client_ranks.py)
     set_tests_properties(python_vllm_client_ranks PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src:${CMAKE_CURRENT_SOURCE_DIR}/integration/vllm/src")
+    add_test(NAME python_lmcache_key_mapper
+      COMMAND ${PYTHON3}
+              ${CMAKE_CURRENT_SOURCE_DIR}/integration/lmcache/tests/test_key_mapper.py)
+    set_tests_properties(python_lmcache_key_mapper PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
+    add_test(NAME python_hicache_client_stats
+      COMMAND ${PYTHON3} -m pytest -q -p no:cacheprovider
+              ${CMAKE_CURRENT_SOURCE_DIR}/integration/hicache/tests/test_client_stats.py)
+    set_tests_properties(python_hicache_client_stats PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
+    # Pure-python hicache/connector helpers: no lib, GPU or torch needed
+    # (device-direct cases that need a GPU skip themselves).
+    add_test(NAME python_hicache_helpers
+      COMMAND ${PYTHON3} -m unittest test_dfkv_hot_config
+              test_dfkv_hicache_device_direct test_connector_access_log_hot
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
+    set_tests_properties(python_hicache_helpers PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
     add_test(NAME python_vllm_connector_lifecycle
       COMMAND ${PYTHON3}
               ${CMAKE_CURRENT_SOURCE_DIR}/test/python/test_dfkv_vllm_connector.py
