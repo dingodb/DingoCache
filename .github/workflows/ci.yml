@@ -73,6 +73,40 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+      - name: Pull observability images
+        run: |
+          set -eu
+          # The daocloud mirror is occasionally unreachable from hosted
+          # runners (TLS handshake timeouts). Keep the pinned digest and fall
+          # back to Docker Hub; tag locally so the checks below use one name.
+          pull() {
+            image="$1"
+            fallback="$2"
+            local_tag="$3"
+            for attempt in 1 2 3; do
+              if docker pull "$image"; then
+                docker tag "$image" "$local_tag"
+                return 0
+              fi
+              echo "pull failed (attempt $attempt): $image" >&2
+              sleep $((attempt * 5))
+            done
+            echo "mirror unavailable; falling back to $fallback" >&2
+            docker pull "$fallback"
+            docker tag "$fallback" "$local_tag"
+          }
+          pull \
+            "docker.m.daocloud.io/prom/prometheus@sha256:508729e0e2d18e11fd742a5a5ca70e557b940a93948c3c95fd0123a6fd538b69" \
+            "docker.io/prom/prometheus@sha256:508729e0e2d18e11fd742a5a5ca70e557b940a93948c3c95fd0123a6fd538b69" \
+            "dfkv-ci/prometheus:ci"
+          pull \
+            "docker.m.daocloud.io/otel/opentelemetry-collector-contrib@sha256:c5918f78992ee73b0d6f0e599423ac5ec52dd5d9726733114d6eca53d5a32ed5" \
+            "docker.io/otel/opentelemetry-collector-contrib@sha256:c5918f78992ee73b0d6f0e599423ac5ec52dd5d9726733114d6eca53d5a32ed5" \
+            "dfkv-ci/otel-collector:ci"
+          pull \
+            "docker.m.daocloud.io/grafana/tempo@sha256:cda87c212d8c584dc0b89e337e7ed648a5100feb657e5d528480ee4fa03dbbe3" \
+            "docker.io/grafana/tempo@sha256:cda87c212d8c584dc0b89e337e7ed648a5100feb657e5d528480ee4fa03dbbe3" \
+            "dfkv-ci/tempo:ci"
       - name: Validate deployment and alert configuration
         env:
           DFKV_GRAFANA_ADMIN_PASSWORD: ci-validation-only
@@ -81,16 +115,16 @@ jobs:
           docker run --rm \
             -v "$PWD/deploy/observability:/etc/prometheus:ro" \
             --entrypoint promtool \
-            docker.m.daocloud.io/prom/prometheus@sha256:508729e0e2d18e11fd742a5a5ca70e557b940a93948c3c95fd0123a6fd538b69 \
+            dfkv-ci/prometheus:ci \
             check config /etc/prometheus/prometheus.yml
           docker run --rm \
             -v "$PWD/deploy/observability:/etc/dfkv-observability:ro" \
-            docker.m.daocloud.io/otel/opentelemetry-collector-contrib@sha256:c5918f78992ee73b0d6f0e599423ac5ec52dd5d9726733114d6eca53d5a32ed5 \
+            dfkv-ci/otel-collector:ci \
             validate --config=/etc/dfkv-observability/otel-collector-config.yaml
           docker run --rm \
             -v "$PWD/deploy/observability:/etc/dfkv-observability:ro" \
             --entrypoint /tempo \
-            docker.m.daocloud.io/grafana/tempo@sha256:cda87c212d8c584dc0b89e337e7ed648a5100feb657e5d528480ee4fa03dbbe3 \
+            dfkv-ci/tempo:ci \
             -config.file=/etc/dfkv-observability/tempo.yaml -config.verify=true
       - name: Build the shipped runtime image
         run: docker build --target runtime -t dfkv-runtime-smoke .
