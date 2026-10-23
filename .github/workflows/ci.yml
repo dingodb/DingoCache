@@ -320,7 +320,7 @@ jobs:
     # the runner's ubuntu-latest (glibc 2.39) bakes in GLIBC_2.3x symbols that
     # FAIL on older deploy nodes. RDMA-enabled + static libstdc++/libgcc;
     # libibverbs stays dynamic (it dlopen()s provider drivers at runtime).
-    container: m.daocloud.io/docker.io/library/ubuntu@sha256:3b06811b2afd352be909dd088a004166d665dc76d38b13eada33522a9d915c6f # 22.04
+    container: docker.io/library/ubuntu@sha256:3b06811b2afd352be909dd088a004166d665dc76d38b13eada33522a9d915c6f # 22.04
     steps:
       # Bare container: install the toolchain (incl. git, for checkout) first.
       - name: Install build deps
