@@ -1536,11 +1536,13 @@ class DfkvStoreWorker:
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.pp_size = parallel_config.pipeline_parallel_size
-        self.pp_rank = (parallel_config.rank // self.tp_size) % self.pp_size
         self.local_rank = int(get_world_group().local_rank)
 
         self.pcp_size = get_pcp_group().world_size
         self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
+        self.pp_rank = pipeline_rank(
+            parallel_config.rank, self.tp_size, self.pcp_size, self.pp_size
+        )
         self.dcp_size = get_dcp_group().world_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
         self.affinity_rank = physical_affinity_rank(
@@ -2839,6 +2841,11 @@ class LookupKeyClient:
         self.executor.shutdown(wait=True, cancel_futures=True)
         self.socket.close(linger=0)
         self.ctx.term()
+
+
+def pipeline_rank(rank: int, tp_size: int, pcp_size: int, pp_size: int) -> int:
+    """PP stage of a rank in vLLM's ``DP x PP x PCP x TP`` layout."""
+    return rank // (tp_size * pcp_size) % pp_size
 
 
 def get_zmq_rpc_path_lookup(vllm_config: VllmConfig) -> str:
