@@ -13,7 +13,7 @@ enabling prefix caching via hash-based deduplication.
 
 from collections.abc import Iterable
 import threading
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -60,6 +60,9 @@ from .transfer_protocol import (
 )
 from .worker import DfkvStoreWorker
 
+if TYPE_CHECKING:
+    from vllm.config import KVTransferConfig
+
 logger = init_logger(__name__)
 
 
@@ -101,6 +104,13 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
 
     # Wire/storage schema, intentionally not operator-configurable.
     storage_layout_id = VLLM_RAW_LAYOUT
+
+    @classmethod
+    def supports_sleep_mode(cls, kv_transfer_config: "KVTransferConfig") -> bool:
+        # KV pages are registered with the RDMA NIC (GPUDirect) at startup;
+        # sleep/wake remaps them to new physical pages, leaving the memory
+        # registrations stale.
+        return False
 
     @property
     def prefer_cross_layer_blocks(self) -> bool:
