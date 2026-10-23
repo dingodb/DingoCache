@@ -5,6 +5,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -158,6 +159,58 @@ def test_noallocation_prefill_saves_state_before_page_recycling(hybrid_workers, 
         assert torch.all(target["state"][25] == depth // 64)
         assert torch.all(target["wrapped_state"][26] == depth // 64)
     assert saves == [640, 1280, 1920, 2560]
+
+
+def test_noallocation_prefill_kv_events_carry_block_token_ids(hybrid_workers):
+    """KV events from SAVE must name the tokens of each stored block."""
+    from dfkv_vllm.data import RequestTracker
+    from dfkv_vllm.scheduler import DfkvStoreScheduler
+
+    create, _ = hybrid_workers
+    producer, _ = create(0, states=False, kv_events=True)
+    prompt = list(range(1000, 1000 + 3 * BLOCK))
+    request = SimpleNamespace(
+        request_id="events", all_token_ids=prompt + [7, 8],
+        block_hashes=_hashes(3),
+    )
+    scheduler = object.__new__(DfkvStoreScheduler)
+    for name, value in dict(
+        kv_role="kv_producer", _block_size=BLOCK, client=MagicMock(),
+        load_specs={}, _failed_load_req_ids=set(), _preempted_req_ids=set(),
+        _unfinished_request_ids={"events"}, _allocated_req_ids=set(),
+        _unfinished_requests={"events": (request, ([1, 2, 3],))},
+        _request_trackers={"events": RequestTracker(
+            "events", 0, ([1, 2, 3],), token_ids=[],
+            prefill_end_tokens=len(prompt),
+        )},
+    ).items():
+        setattr(scheduler, name, value)
+
+    # All blocks are allocated up front, so every chunk has new_block_ids=None.
+    saved = []
+    for computed, count in ((0, BLOCK // 2), (BLOCK // 2, BLOCK // 2),
+                            (BLOCK, 2 * BLOCK)):
+        metadata = scheduler.build_connector_meta(SimpleNamespace(
+            finished_req_ids=set(), preempted_req_ids=set(), scheduled_new_reqs=[],
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=["events"], new_block_ids=[None],
+                num_computed_tokens=[computed],
+            ),
+            num_scheduled_tokens={"events": count},
+        ))
+        for job in metadata.requests:
+            producer.kv_send_thread.add_stored_request(job)
+            producer.kv_send_thread._handle_request(job)
+            saved.append(job.token_len_chunk)
+
+    assert saved == [BLOCK, 3 * BLOCK]
+    events = producer.get_kv_events()
+    assert [event.block_hashes for event in events] == [
+        [worker_module.maybe_convert_block_hash(h)] for h in _hashes(3)
+    ]
+    assert [event.token_ids for event in events] == [
+        prompt[i * BLOCK:(i + 1) * BLOCK] for i in range(3)
+    ]
 
 
 def test_shorter_prefix_requires_its_own_state_checkpoints():
@@ -322,7 +375,7 @@ def hybrid_workers(monkeypatch):
     monkeypatch.setenv("DFKV_CLIENT_NODE_DEDUP_GPU", "0")
     monkeypatch.setenv("DFKV_CLIENT_LOG_SUFFIX", "state-test")
 
-    def create(tp_rank, *, dcp=1, states=True, attention_block_size=None, scratch=False, kernel_tiles=1, wrapped_attention=False, num_blocks=4):
+    def create(tp_rank, *, dcp=1, states=True, attention_block_size=None, scratch=False, kernel_tiles=1, wrapped_attention=False, num_blocks=4, kv_events=False):
         rank[0], dcp_size[0] = tp_rank, dcp
         physical_block_size = attention_block_size or BLOCK // dcp
         mla = MLAAttentionSpec(
@@ -370,7 +423,9 @@ def hybrid_workers(monkeypatch):
                 num_gpu_blocks=num_blocks, block_size=physical_block_size,
                 enable_prefix_caching=True, prefix_match_unit=None,
             ),
-            kv_events_config=None,
+            kv_events_config=(
+                SimpleNamespace(enable_kv_cache_events=True) if kv_events else None
+            ),
         )
         worker = DfkvStoreWorker(
             config, SimpleNamespace(kv_cache_groups=groups),
