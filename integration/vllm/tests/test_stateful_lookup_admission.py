@@ -250,6 +250,36 @@ def test_striped_kv_events_survive_aggregation_with_request_parents(hybrid_worke
     ]
 
 
+@pytest.mark.parametrize("step_end,save_state", [(2 * BLOCK, True), (2 * BLOCK + 7, False)])
+def test_state_saves_only_at_a_boundary_this_step_computed(step_end, save_state):
+    from dfkv_vllm.data import RequestTracker
+
+    tracker = RequestTracker("r", step_end, ([1, 2, 3],))
+    job = ReqMeta.from_request_tracker(tracker, BLOCK)
+    assert job.token_len_chunk == 2 * BLOCK
+    assert job.save_state is save_state
+
+
+def test_unverified_state_boundary_fails_closed(hybrid_workers):
+    """Attention may still be saved, but without the boundary's recurrent
+    state the prefix must not be admitted."""
+    create, objects = hybrid_workers
+    hashes = _hashes()
+    producer, _ = create(0)
+    job = ReqMeta(
+        req_id="unverified", token_len_chunk=2 * BLOCK,
+        block_ids=([1, 3], [3], [3]), block_hashes=hashes, save_state=False,
+    )
+    producer.kv_send_thread.add_stored_request(job)
+    producer.kv_send_thread._handle_request(job)
+
+    stored = [key for _, key in objects]
+    assert stored  # attention chunks are still saved
+    assert not any(b"mamba" in key for key in stored)
+    consumer, _ = create(0)
+    assert consumer.lookup(2 * BLOCK, hashes) == 0
+
+
 def test_shorter_prefix_requires_its_own_state_checkpoints():
     """A longer prefix's tail mask cannot authorize a shorter resume."""
     hashes = _hashes()[:2]

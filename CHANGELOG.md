@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Fail closed on vLLM connector recurrent-state (Mamba) SAVEs whose
+  boundary was not computed in the current step. The connector locates
+  state blocks by position in an append-only mirror of vLLM's block table,
+  which vLLM align mode does not keep append-only; such a SAVE now skips
+  the state objects (logging a warning) so the prefix is never admitted,
+  instead of possibly publishing another position's state.
+
 - Make vLLM connector KV events survive cross-worker aggregation. Each
   BlockStored event now chains to its predecessor in the request instead
   of to the previous chunk this rank stored, so all ranks emit identical
