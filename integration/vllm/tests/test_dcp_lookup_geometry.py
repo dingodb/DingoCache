@@ -3,8 +3,9 @@
 Under DCP (Decode Context Parallelism) the MLA KV is SHARDED across dcp
 ranks:  rank r stores its shard chunks under keys tagged ``@dcp{r}``
 (worker.py KeyMetadata), while the scheduler-side lookup (worker.py
-``DfkvStoreWorker.lookup``) probes candidates from worker-rank-0's metadata,
-i.e. ``@dcp0``, with tp_count=min(tp_size, num_kv_head)=1 probes per chunk.
+``DfkvStoreWorker.lookup``) runs on worker rank 0
+and must require every ``@dcp{r}`` coordinate: each DCP rank loads its own
+shard of a chunk, so a chunk is loadable only if all shards exist.
 
 This file drives the REAL lookup against synthetic dfkv key-space contents
 modelling the two save geometries, so the coverage contract survives
@@ -13,13 +14,13 @@ refactors instead of living only in tribal knowledge:
 * geometry A (post-#70, default cp_kv_cache_interleave_size=1):
   every rank stores every chunk under its own ``@dcp{r}`` namespace (each
   rank holds 1/dcp of every block's tokens - the shard is per-chunk, not
-  per-token-range).  ``@dcp0`` keys therefore exist for every chunk and the
-  lookup reports the FULL prefix.
+  per-token-range).  Every coordinate exists for every chunk and the lookup
+  reports the FULL prefix.
 * geometry B (pre-#70 put_step=tp_size stride, fixed by #70/v1.10.0):
   chunk c is stored only by the single rank c%dcp under ``@dcp{c%dcp}``.
-  The lookup sees only the dcp=0 quarter/eighth -> the external hit
-  collapses to ~1/dcp of the prompt.  This is the field-reported
-  "low dfkv hit rate with DCP"; deploys on < v1.10.0 show exactly it.
+  No chunk has every shard, so the lookup reports no hit (it previously
+  probed only ``@dcp0`` and reported ~1/dcp of the prompt: the field-reported
+  "low dfkv hit rate with DCP" on deploys < v1.10.0).
 
 Variation B is asserted as a DOCUMENTED NEGATIVE: if a future change
 reintroduces a store stride (or block-grain interleave keyed per owning
@@ -136,14 +137,21 @@ def test_post_70_geometry_lookup_full_prefix():
 
 def test_pre_70_geometry_lookup_collapses():
     """Negative control: chunk c only under @dcp{c%dcp} (the pre-#70 stride
-    or a block-grain interleave) truncates the lookup to ~1/dcp. If this
-    ever turns into a full hit the incident class deserves a fresh look."""
+    or a block-grain interleave). Every DCP rank loads its own shard of every
+    chunk, so no chunk is loadable and the lookup must report no hit."""
     hashes = _hashes()
     store = _make_store("B", hashes)
     hit = _lookup_hit_tokens(store, hashes)
-    assert 0 < hit < NCHUNK * BLOCK // 2, (
-        f"documented-negative geometry should truncate badly, got {hit}"
-    )
+    assert hit == 0, f"no chunk has every DCP shard, got {hit}"
+
+
+def test_lookup_requires_every_dcp_shard():
+    """Geometry A with one DCP rank's shard of a chunk missing: the prefix
+    ends before that chunk, since that rank could not load it."""
+    hashes = _hashes()
+    store = _make_store("A", hashes)
+    store.discard(_onewire_key(_md(DCP - 1), hashes[5]))
+    assert _lookup_hit_tokens(store, hashes) == 5 * BLOCK
 
 
 # Replicated MLA (plain-TP MLA -- put_step==tp_size, no DCP/PCP, e.g.
