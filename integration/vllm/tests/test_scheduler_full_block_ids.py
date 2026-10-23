@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from dfkv_vllm.data import LoadSpec
+from dfkv_vllm.data import LoadSpec, RequestTracker
 from dfkv_vllm.scheduler import DfkvStoreScheduler
 from dfkv_vllm.transfer_protocol import LegacyReceiveFailures
 
@@ -47,6 +47,64 @@ def test_new_request_metadata_uses_complete_allocated_block_table():
     assert len(metadata.requests) == 1
     assert metadata.requests[0].block_ids == complete_block_ids
     assert metadata.requests[0].can_save is True
+
+
+@pytest.mark.parametrize("empty_delta", [None, ([], [])])
+@pytest.mark.parametrize("role", ["kv_both", "kv_consumer"])
+def test_cached_prefill_progress_without_new_blocks(empty_delta, role):
+    scheduler = object.__new__(DfkvStoreScheduler)
+    request = SimpleNamespace(
+        request_id="chunked", all_token_ids=list(range(12)), block_hashes=[],
+    )
+    tracker = RequestTracker(
+        "chunked", 1, ([1], [2]), token_ids=[0], prefill_end_tokens=12,
+    )
+    for name, value in dict(
+        kv_role=role, _block_size=4, client=MagicMock(), load_specs={},
+        _failed_load_req_ids=set(), _preempted_req_ids=set(),
+        _unfinished_request_ids={"chunked"}, _allocated_req_ids=set(),
+        _unfinished_requests={"chunked": (request, ([1], [2]))},
+        _request_trackers={"chunked": tracker},
+    ).items():
+        setattr(scheduler, name, value)
+
+    def tick(computed, count, delta):
+        return scheduler.build_connector_meta(SimpleNamespace(
+            finished_req_ids=set(), preempted_req_ids=set(), scheduled_new_reqs=[],
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=["chunked"], new_block_ids=[delta],
+                num_computed_tokens=[computed],
+            ),
+            num_scheduled_tokens={"chunked": count},
+        )).requests
+
+    for computed in (1, 2, 3):
+        jobs = tick(computed, 1, empty_delta)
+        assert tracker.token_len == computed + 1
+        assert tracker.allocated_block_ids == ([1], [2])
+        assert [job.token_len_chunk for job in jobs] == (
+            [4] if computed == 3 and role != "kv_consumer" else []
+        )
+    # Repeated metadata cannot publish the same checkpoint twice.
+    assert tick(3, 1, empty_delta) == []
+    assert tracker.token_len == 4
+    jobs = tick(4, 4, ([3], [4]))
+    assert tracker.token_len == 8
+    assert tracker.allocated_block_ids == ([1, 3], [2, 4])
+    assert [job.token_len_chunk for job in jobs] == ([8] if role != "kv_consumer" else [])
+    # The upstream computed position is authoritative even if local tracking
+    # lagged; a new allocation must not perpetuate the missing-step offset.
+    tracker.token_len = 5
+    jobs = tick(8, 8, ([5], [6]))  # speculative tail exceeds known prefill
+    assert tracker.token_len == 12
+    assert [job.token_len_chunk for job in jobs] == ([12] if role != "kv_consumer" else [])
+    request.all_token_ids.extend(range(12, 16))
+    assert tick(12, 4, empty_delta) == []  # decode never saves
+    assert tracker.token_len == 12
+    assert tracker.allocated_block_ids == ([1, 3, 5], [2, 4, 6])
+    assert tick(12, 4, ([7], [8])) == []
+    assert tracker.token_len == 12
+    assert tracker.allocated_block_ids == ([1, 3, 5], [2, 4, 6])
 
 
 def test_sampling_tail_does_not_authorize_an_absent_checkpoint():

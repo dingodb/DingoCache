@@ -169,10 +169,14 @@ def test_cross_layer_registration_uses_real_group_zero_layer(monkeypatch):
     ]
     db = ChunkedTokenDatabase(_METADATA, block_size=16)
     registered = []
+    validated = []
 
     class FakeClient:
         def register_memory(self, base, size):
             registered.append((base, size))
+
+        def validate_block_sizes(self, sizes, *, context):
+            validated.append((tuple(sizes), context))
 
     class FakeRecvThread:
         def __init__(self, *args, **_kwargs):
@@ -203,6 +207,7 @@ def test_cross_layer_registration_uses_real_group_zero_layer(monkeypatch):
     region_size = unified.untyped_storage().nbytes()
     block_size = region_size // 8
     assert registered == [(unified.untyped_storage().data_ptr(), region_size)]
+    assert validated == [((block_size,), "vLLM cache group 0")]
     assert db.kv_caches_base_addr == [unified.data_ptr()]
     assert db.block_len == [block_size]
     assert db._seg_layout == [(unified.data_ptr(), block_size, block_size)]
