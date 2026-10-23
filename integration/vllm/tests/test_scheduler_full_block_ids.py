@@ -496,3 +496,33 @@ def test_failed_load_bypasses_persistent_hit_and_rebuilds_computed_save(
     # quarantine or stale allocation metadata.
     scheduler.update_connector_output(output)
     assert scheduler.get_num_new_matched_tokens(request, 0) == (12, True)
+
+
+@pytest.mark.parametrize("can_load", [False, True])
+def test_pending_load_requires_this_connector_to_own_the_load(can_load):
+    """MultiConnector may give the load to another connector (can_load=False);
+    this connector must then neither load nor save the request's blocks."""
+    scheduler = object.__new__(DfkvStoreScheduler)
+    request = SimpleNamespace(request_id="remote", block_hashes=[])
+    for name, value in dict(
+        kv_role="kv_both", _block_size=4, client=MagicMock(),
+        load_specs={"remote": LoadSpec(0, 8, can_load)},
+        _failed_load_req_ids=set(), _preempted_req_ids=set(),
+        _unfinished_request_ids={"remote"}, _allocated_req_ids=set(),
+        _unfinished_requests={"remote": (request, ([1, 2],))},
+        _request_trackers={},
+    ).items():
+        setattr(scheduler, name, value)
+
+    metadata = scheduler.build_connector_meta(SimpleNamespace(
+        finished_req_ids=set(), preempted_req_ids=set(), scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+        num_scheduled_tokens={},
+    ))
+
+    if can_load:
+        assert [r.load_spec.kvpool_cached_tokens for r in metadata.requests] == [8]
+        assert [r.can_save for r in metadata.requests] == [False]
+    else:
+        assert metadata.requests == []
+        assert "remote" not in scheduler._request_trackers
