@@ -280,14 +280,20 @@ if(DFKV_BUILD_TESTS)
               ${CMAKE_CURRENT_SOURCE_DIR}/integration/hicache/tests/test_client_stats.py)
     set_tests_properties(python_hicache_client_stats PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
-    # Pure-python hicache/connector helpers: no lib, GPU or torch needed
-    # (device-direct cases that need a GPU skip themselves).
+    # Pure-python hicache/connector helpers: no lib, GPU or torch needed.
     add_test(NAME python_hicache_helpers
       COMMAND ${PYTHON3} -m unittest test_dfkv_hot_config
-              test_dfkv_hicache_device_direct test_connector_access_log_hot
+              test_connector_access_log_hot
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
     set_tests_properties(python_hicache_helpers PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
+    # Device-direct SAVE against a real dfkv_server via ctypes, like
+    # python_plugin; GPU-only cases skip themselves.
+    add_test(NAME python_hicache_device_direct
+      COMMAND ${PYTHON3} -m unittest test_dfkv_hicache_device_direct
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
+    set_tests_properties(python_hicache_device_direct PROPERTIES
+      ENVIRONMENT "DFKV_BUILD=${CMAKE_BINARY_DIR};DFKV_LIB=${CMAKE_BINARY_DIR}/libdfkv.so;DFKV_STORE_ENGINE=file;DFKV_SLAB_WRITE=buffered;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
     add_test(NAME python_vllm_connector_lifecycle
       COMMAND ${PYTHON3}
               ${CMAKE_CURRENT_SOURCE_DIR}/test/python/test_dfkv_vllm_connector.py
