@@ -289,8 +289,6 @@ class DfkvStoreScheduler:
         cached_reqs = scheduler_output.scheduled_cached_reqs
         for i, req_id in enumerate(cached_reqs.req_ids):
             new_block_ids = cached_reqs.new_block_ids[i]
-            if not new_block_ids and req_id not in self._preempted_req_ids:
-                continue
 
             req_meta = None
             if req_id in self._preempted_req_ids:
@@ -331,26 +329,31 @@ class DfkvStoreScheduler:
             else:
                 # Decode/chunked request
                 request_tracker = self._request_trackers[req_id]
-                num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
-                req_tuple = self._unfinished_requests.get(req_id)
-                if req_tuple:
-                    unfinished_req = req_tuple[0]
-                    num_current_tokens = request_tracker.token_len
-                    new_token_ids = unfinished_req.all_token_ids[
-                        num_current_tokens : num_current_tokens + num_new_tokens
-                    ]
-                    request_tracker.token_len += len(new_token_ids)
-                else:
-                    raise ValueError(
-                        f"Request {req_id} is not in _unfinished_requests"
-                    )
                 num_computed_token = cached_reqs.num_computed_tokens[i]
                 # Use the tracker's snapshot of the prefill range so resumed
                 # requests keep saving past the original prompt boundary.
                 prefill_end = request_tracker.prefill_end_tokens
                 if num_computed_token >= prefill_end:
                     continue
-                request_tracker.update(new_block_ids)
+                req_tuple = self._unfinished_requests.get(req_id)
+                if req_tuple is None:
+                    raise ValueError(
+                        f"Request {req_id} is not in _unfinished_requests"
+                    )
+                unfinished_req = req_tuple[0]
+                # Prefill can advance within already allocated blocks. Account
+                # every scheduled chunk, even when new_block_ids is None, or
+                # SAVE can lag behind and read retired/reused state pages.
+                # Use scheduler progress rather than accumulating tracker state;
+                # never include decode/speculative tokens in the prefill SAVE.
+                request_tracker.token_len = min(
+                    num_computed_token
+                    + scheduler_output.num_scheduled_tokens[req_id],
+                    prefill_end,
+                    len(unfinished_req.all_token_ids),
+                )
+                if new_block_ids:
+                    request_tracker.update(new_block_ids)
 
                 last_chunk_tokens_num = (
                     prefill_end // self._block_size * self._block_size

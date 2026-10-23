@@ -33,6 +33,133 @@ def _hashes(count=2):
 
 
 
+def test_noallocation_prefill_saves_state_before_page_recycling(hybrid_workers, monkeypatch):
+    """Real allocator/serializer steps must SAVE the live state at each boundary."""
+    from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, MambaManager
+    from dfkv_vllm.data import RequestTracker
+    from dfkv_vllm.scheduler import DfkvStoreScheduler
+
+    # Use 640-token pages and a deliberately small 256-token test budget
+    # (not the deployment budget) to force steps without new allocations.
+    monkeypatch.setitem(globals(), "BLOCK", 640)
+    monkeypatch.setattr(worker_module, "get_tensor_model_parallel_world_size", lambda: 1)
+    create, _ = hybrid_workers
+    producer, buffers = create(0, num_blocks=40)
+    hashes = _hashes(20)
+    pools = [BlockPool(40, True, 64) for _ in range(3)]
+    attention = MLAAttentionSpec(
+        block_size=BLOCK, num_kv_heads=1, head_size=1, dtype=torch.uint8,
+    )
+    state = MambaSpec(
+        block_size=BLOCK, shapes=((16,),), dtypes=(torch.uint8,),
+        mamba_cache_mode="align", num_speculative_blocks=5,
+    )
+    managers = [FullAttentionManager(attention, pools[0], True, 0, BLOCK)] + [
+        MambaManager(state, pools[group], enable_caching=True,
+                     kv_cache_group_id=group, scheduler_block_size=BLOCK)
+        for group in (1, 2)
+    ]
+    request = SimpleNamespace(
+        request_id="chunked", num_computed_tokens=0, num_prompt_tokens=4000,
+        num_tokens=4000, shared_prefix_boundary=0, all_token_ids=list(range(4000)),
+        block_hashes=hashes, num_output_tokens=0, num_output_placeholders=0,
+    )
+    upstream = SimpleNamespace(
+        use_pp=False, use_v2_model_runner=False,
+        prev_step_scheduled_req_ids={request.request_id},
+        cache_config=SimpleNamespace(block_size=BLOCK), max_num_scheduled_tokens=256,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        hash_block_size=64, use_eagle_block_drop=False,
+        mamba_has_prefill_checkpoint_blocks=False, mamba_partial_cache_hit=True,
+        mamba_shared_prefix_checkpoint=False,
+    )
+    scheduler = object.__new__(DfkvStoreScheduler)
+    for name, value in dict(
+        kv_role="kv_producer", _block_size=BLOCK,
+        _unfinished_requests={request.request_id: (request, ([], [], []))},
+        _unfinished_request_ids={request.request_id}, _preempted_req_ids=set(),
+        _failed_load_req_ids=set(), _allocated_req_ids=set(), load_specs={},
+        client=SimpleNamespace(discard=lambda _: None),
+        _request_trackers={request.request_id: RequestTracker(
+            request.request_id, 0, ([], [], []), prefill_end_tokens=4000, token_ids=[],
+        )},
+    ).items():
+        setattr(scheduler, name, value)
+    saves, empty_steps, recycled_pages, state_pages = [], 0, set(), set()
+    for _ in range(13):
+        start = request.num_computed_tokens
+        count = Scheduler._mamba_block_aligned_split(upstream, request, 256)
+        end = start + count
+        for manager in managers:
+            manager.remove_skipped_blocks(request.request_id, start, num_prompt_tokens=4000)
+        groups = tuple(manager.allocate_new_blocks(request.request_id, end, end)
+                       for manager in managers)
+        cached = Scheduler._make_cached_request_data(
+            upstream, [request], [], {request.request_id: count}, {},
+            {request.request_id: KVCacheBlocks(groups)},
+        )
+        empty_steps += cached.new_block_ids[0] is None
+        metadata = scheduler.build_connector_meta(SimpleNamespace(
+            finished_req_ids=set(), preempted_req_ids=set(), scheduled_new_reqs=[],
+            scheduled_cached_reqs=cached, num_scheduled_tokens={request.request_id: count},
+        ))
+        # Substitute only numerical kernel output; real managers own page life.
+        for name, manager in zip(("state", "wrapped_state"), managers[1:], strict=True):
+            active = manager.req_to_blocks[request.request_id][(end - 1) // BLOCK].block_id
+            state_pages.add(active)
+            buffers[name][active].fill_(end // 64)
+        for block in managers[0].req_to_blocks[request.request_id]:
+            buffers["mla"][block.block_id].fill_(17)
+        if start >= 2 * BLOCK:
+            for name, pool in zip(("state", "wrapped_state"), pools[1:], strict=True):
+                held = pool.get_new_blocks(pool.get_num_free_blocks())
+                recycled_pages.update(block.block_id for block in held)
+                for block in held:
+                    buffers[name][block.block_id].fill_(231)
+                pool.free_blocks(held)
+        for job in metadata.requests:
+            producer.kv_send_thread.add_stored_request(job)
+            producer.kv_send_thread._handle_request(job)
+            saves.append(job.token_len_chunk)
+        request.num_computed_tokens = end
+    assert empty_steps > 1
+    assert state_pages & recycled_pages  # real state pages were reclaimed
+    assert saves
+
+    # Verify every saved boundary, not merely the final hit or attention stripe.
+    for depth in saves:
+        consumer, target = create(0, num_blocks=40)
+        assert consumer.lookup(depth, hashes) == depth
+        get = consumer.client.batch_get_auto_sg
+        transfers = []
+
+        def checked_get(keys, pointers, capacities):
+            hits, lengths = get(keys, pointers, capacities)
+            assert all(hit and length == sum(caps) for hit, length, caps
+                       in zip(hits, lengths, capacities, strict=True))
+            transfers.extend(keys)
+            return hits, lengths
+
+        monkeypatch.setattr(consumer.client, "batch_get_auto_sg", checked_get)
+        load = ReqMeta(
+            req_id=f"restore-{depth}", token_len_chunk=depth,
+            block_ids=(list(range(20, 20 + depth // BLOCK)), [25], [26]),
+            block_hashes=hashes, load_spec=LoadSpec(0, depth, True, token_len=depth),
+        )
+        consumer.kv_recv_thread.load_request_sync(load)
+        assert transfers
+        assert consumer.get_block_ids_with_load_errors() == set()
+        finished, failed = consumer.kv_recv_thread.get_and_clear_receive_results()
+        assert finished == {load.req_id} and failed == set()
+        assert torch.all(target["mla"][20:20 + depth // BLOCK] == 17)
+        assert torch.all(target["state"][25] == depth // 64)
+        assert torch.all(target["wrapped_state"][26] == depth // 64)
+    assert saves == [640, 1280, 1920, 2560]
+
+
 def test_shorter_prefix_requires_its_own_state_checkpoints():
     """A longer prefix's tail mask cannot authorize a shorter resume."""
     hashes = _hashes()[:2]
@@ -90,6 +217,12 @@ class _MemoryClient:
     def __init__(self, objects, namespace):
         self.objects = objects
         self.namespace = namespace
+
+    def validate_block_sizes(self, sizes, *, context):
+        # CPU objects have no transport size limit, but invalid geometry must
+        # still fail registration rather than being hidden by this substitute.
+        assert context
+        assert all(size > 0 for size in sizes)
 
     def register_memory(self, base, size):
         pass
