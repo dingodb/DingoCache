@@ -341,18 +341,43 @@ class DfkvStoreScheduler:
                         f"Request {req_id} is not in _unfinished_requests"
                     )
                 unfinished_req = req_tuple[0]
+                num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
+                has_new_blocks = bool(new_block_ids) and any(new_block_ids)
+                if num_new_tokens <= 0 and not has_new_blocks:
+                    continue
                 # Prefill can advance within already allocated blocks. Account
                 # every scheduled chunk, even when new_block_ids is None, or
                 # SAVE can lag behind and read retired/reused state pages.
                 # Use scheduler progress rather than accumulating tracker state;
                 # never include decode/speculative tokens in the prefill SAVE.
-                request_tracker.token_len = min(
-                    num_computed_token
-                    + scheduler_output.num_scheduled_tokens[req_id],
+                old_len = request_tracker.token_len
+                new_len = min(
+                    num_computed_token + num_new_tokens,
                     prefill_end,
                     len(unfinished_req.all_token_ids),
                 )
-                if new_block_ids:
+                if old_len < num_computed_token:
+                    logger.warning(
+                        "Resynchronizing DFKV tracker for request %s: "
+                        "tracker_len=%d computed=%d",
+                        req_id,
+                        old_len,
+                        num_computed_token,
+                    )
+                token_ids = request_tracker.token_ids
+                if (
+                    new_len < old_len
+                    or token_ids is None
+                    or len(token_ids) != old_len
+                ):
+                    token_ids = list(unfinished_req.all_token_ids[:new_len])
+                    request_tracker.token_ids = token_ids
+                elif new_len > old_len:
+                    token_ids.extend(
+                        unfinished_req.all_token_ids[old_len:new_len]
+                    )
+                request_tracker.token_len = new_len
+                if has_new_blocks:
                     request_tracker.update(new_block_ids)
 
                 last_chunk_tokens_num = (

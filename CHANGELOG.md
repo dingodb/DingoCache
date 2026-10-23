@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Track cached prefill progress from vLLM's computed token position even
+  when a step allocates no new block. Previously the connector skipped the
+  update, so one sub-block prefill chunk permanently desynchronized the
+  request tracker; a later SAVE could then select a retired source page
+  and publish bytes that did not match the key. Keep the tracker's token
+  IDs in step with that position for KV events, skip zero-token steps
+  without an allocation, and resynchronize a lagging tracker with a
+  warning.
 
 - Preserve an initial, hard-budgeted receive chunk for dynamic GET and
   leased-PUT staging when enough connection capacity remains. Connection
