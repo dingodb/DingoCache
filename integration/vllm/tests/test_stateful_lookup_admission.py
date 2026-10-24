@@ -250,34 +250,94 @@ def test_striped_kv_events_survive_aggregation_with_request_parents(hybrid_worke
     ]
 
 
-@pytest.mark.parametrize("step_end,save_state", [(2 * BLOCK, True), (2 * BLOCK + 7, False)])
-def test_state_saves_only_at_a_boundary_this_step_computed(step_end, save_state):
+def test_req_meta_records_the_step_end():
     from dfkv_vllm.data import RequestTracker
 
-    tracker = RequestTracker("r", step_end, ([1, 2, 3],))
-    job = ReqMeta.from_request_tracker(tracker, BLOCK)
-    assert job.token_len_chunk == 2 * BLOCK
-    assert job.save_state is save_state
+    job = ReqMeta.from_request_tracker(RequestTracker("r", 2 * BLOCK + 7, ([1, 2, 3],)), BLOCK)
+    assert (job.token_len_chunk, job.step_end, job.state_blocks) == (2 * BLOCK, 2 * BLOCK + 7, None)
 
 
-def test_unverified_state_boundary_fails_closed(hybrid_workers):
-    """Attention may still be saved, but without the boundary's recurrent
-    state the prefix must not be admitted."""
+@pytest.mark.parametrize("offloads,expected", [
+    (None, None),                                   # engine without hand-off
+    ({}, {}),                                       # nothing committed
+    ({"r": [(1, 9, 2 * BLOCK), (2, 10, 2 * BLOCK)]}, {1: {2 * BLOCK: 9}, 2: {2 * BLOCK: 10}}),
+])
+def test_scheduler_attaches_the_engine_boundary_state_hand_off(offloads, expected):
+    from unittest.mock import MagicMock
+    from dfkv_vllm.scheduler import DfkvStoreScheduler
+
+    scheduler = object.__new__(DfkvStoreScheduler)
+    request = SimpleNamespace(request_id="r", block_hashes=_hashes(3))
+    for name, value in dict(
+        kv_role="kv_producer", _block_size=BLOCK, client=MagicMock(),
+        load_specs={}, _failed_load_req_ids=set(), _preempted_req_ids=set(),
+        _unfinished_request_ids={"r"}, _allocated_req_ids=set(),
+        _unfinished_requests={"r": (request, ([1, 2, 3], [4], [5]))},
+        _request_trackers={},
+    ).items():
+        setattr(scheduler, name, value)
+    output = SimpleNamespace(
+        finished_req_ids=set(), preempted_req_ids=set(),
+        scheduled_new_reqs=[SimpleNamespace(
+            req_id="r", num_computed_tokens=0, block_ids=([1, 2, 3], [4], [5]),
+            prefill_token_ids=None, prompt_token_ids=list(range(2 * BLOCK + 7)),
+        )],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+        num_scheduled_tokens={"r": 2 * BLOCK + 7},
+    )
+    if offloads is not None:
+        output.kv_connector_block_state = SimpleNamespace(boundary_state_offloads=offloads)
+    (job,) = scheduler.build_connector_meta(output).requests
+    assert job.state_blocks == expected
+
+
+def _save_on_every_rank(create, hashes, **meta):
+    for rank in range(4):  # state is TP-sharded: lookup needs every rank's shard
+        producer, buffers = create(rank)
+        buffers["state"][2].fill_(70 + rank)          # positional mirror slot
+        buffers["state"][1].fill_(90 + rank)          # block the engine names
+        buffers["wrapped_state"][2].fill_(71 + rank)
+        buffers["wrapped_state"][1].fill_(91 + rank)
+        job = ReqMeta(req_id=f"save-{rank}", token_len_chunk=2 * BLOCK,
+                      block_ids=([1, 3], [2], [2]), block_hashes=hashes, **meta)
+        producer.kv_send_thread.add_stored_request(job)
+        producer.kv_send_thread._handle_request(job)
+
+
+def test_state_is_saved_from_the_block_the_engine_hands_off(hybrid_workers):
+    """The engine's boundary block wins over the mirrored positional slot."""
+    create, _ = hybrid_workers
+    hashes = _hashes()
+    _save_on_every_rank(create, hashes, step_end=2 * BLOCK + 7,
+                        state_blocks={1: {2 * BLOCK: 1}, 2: {2 * BLOCK: 1}})
+    for rank in range(4):
+        consumer, buffers = create(rank)
+        assert consumer.lookup(2 * BLOCK, hashes) == 2 * BLOCK
+        consumer.kv_recv_thread.load_request_sync(ReqMeta(
+            req_id=f"load-{rank}", token_len_chunk=2 * BLOCK,
+            block_ids=([1, 2], [3], [3]), block_hashes=hashes,
+            load_spec=LoadSpec(0, 2 * BLOCK, True, token_len=2 * BLOCK),
+        ))
+        assert consumer.get_block_ids_with_load_errors() == set()
+        assert torch.all(buffers["state"][3] == 90 + rank)
+        assert torch.all(buffers["wrapped_state"][3] == 91 + rank)
+
+
+@pytest.mark.parametrize("meta,admitted", [
+    ({"step_end": 2 * BLOCK + 7, "state_blocks": {}}, False),   # no hand-off for it
+    ({"step_end": 2 * BLOCK + 7}, False),                       # legacy engine, mid-step
+    ({"step_end": 2 * BLOCK}, True),                            # legacy engine, step end
+])
+def test_state_without_a_trusted_block_fails_closed(hybrid_workers, meta, admitted):
+    """Attention is always saved; state only from a trusted block."""
     create, objects = hybrid_workers
     hashes = _hashes()
-    producer, _ = create(0)
-    job = ReqMeta(
-        req_id="unverified", token_len_chunk=2 * BLOCK,
-        block_ids=([1, 3], [3], [3]), block_hashes=hashes, save_state=False,
-    )
-    producer.kv_send_thread.add_stored_request(job)
-    producer.kv_send_thread._handle_request(job)
-
+    _save_on_every_rank(create, hashes, **meta)
     stored = [key for _, key in objects]
-    assert stored  # attention chunks are still saved
-    assert not any(b"mamba" in key for key in stored)
+    assert stored
+    assert any(b"mamba" in key for key in stored) is admitted
     consumer, _ = create(0)
-    assert consumer.lookup(2 * BLOCK, hashes) == 0
+    assert consumer.lookup(2 * BLOCK, hashes) == (2 * BLOCK if admitted else 0)
 
 
 def test_shorter_prefix_requires_its_own_state_checkpoints():
