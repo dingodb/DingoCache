@@ -46,7 +46,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build g++ binutils git ca-certificates \
-            libibverbs-dev liburing-dev python3-numpy python3-pip
+            libibverbs-dev liburing-dev python3-numpy python3-pip python3-pytest
 
       - name: Configure and build release binaries
         run: |
