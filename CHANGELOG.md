@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Save vLLM connector recurrent-state (Mamba) objects only from the blocks
+  the engine hands off for committed boundaries (`kv_connector_block_state`),
+  instead of locating them by position in an append-only mirror of the
+  block table. With MTP the engine's last cacheable boundary backs off one
+  block, so a prompt's final chunk can cross a boundary while its slot still
+  holds the running state; the positional save then published that running
+  state under the boundary's key and a cross-instance load decoded garbage
+  (reproduced on GLM-5.3-Flash at the default 8192-token budget with 2.33.1).
+  Engines without the hand-off keep 2.33.2's fail-closed rule; with the
+  hand-off this also restores the external hits 2.33.2 lost for prompts
+  prefilled in one step.
+
 - Fail closed on vLLM connector recurrent-state (Mamba) SAVEs whose
   boundary was not computed in the current step. The connector locates
   state blocks by position in an append-only mirror of vLLM's block table,

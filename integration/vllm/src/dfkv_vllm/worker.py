@@ -779,12 +779,27 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 # not to whichever chunk this rank happened to store before it:
                 # every rank must emit an identical event for aggregation.
                 parent_hash: BlockHash | None = None
+                state_blocks = (
+                    req_meta.state_blocks.get(g_idx, {})
+                    if g_idx in self.tp_sharded_groups
+                    and req_meta.state_blocks is not None
+                    else None
+                )
                 for chunk_idx, (start, end, key) in enumerate(
                     db.process_tokens(token_len, req_meta.block_hashes)
                 ):
                     chunk_hash = BlockHash(bytes.fromhex(key.chunk_hash))
                     chunk_parent, parent_hash = parent_hash, chunk_hash
-                    if chunk_idx >= len(mask) or not mask[chunk_idx]:
+                    if state_blocks is not None:
+                        # Save exactly the boundaries vLLM committed this
+                        # step, from the blocks it named; never infer a state
+                        # block from its position in the mirrored table.
+                        if end not in state_blocks or chunk_idx >= len(mask):
+                            continue
+                        logical_block_ids_per_group[g_idx][chunk_idx] = (
+                            state_blocks[end]
+                        )
+                    elif chunk_idx >= len(mask) or not mask[chunk_idx]:
                         continue
                     # State checkpoints contain this physical TP rank's shard;
                     # every rank must save them. Only payload replicas stripe.
@@ -797,11 +812,16 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     stripe_position += 1
                     if not selected:
                         continue
-                    if g_idx in self.tp_sharded_groups and not req_meta.save_state:
-                        # Fail closed: the state at this boundary was not just
-                        # computed, so its block may hold another position's
-                        # state. Lookup needs the state, so the prefix is not
-                        # admitted.
+                    if (
+                        g_idx in self.tp_sharded_groups
+                        and state_blocks is None
+                        and req_meta.step_end is not None
+                        and end != req_meta.step_end
+                    ):
+                        # No engine hand-off: only a step that ends on the
+                        # boundary is known to leave that boundary's state in
+                        # its positional slot. Fail closed otherwise; lookup
+                        # needs the state, so the prefix is not admitted.
                         skipped_state = True
                         continue
                     if logical_block_ids_per_group[g_idx][chunk_idx] <= 0:
@@ -818,7 +838,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if skipped_state:
                 logger.warning(
                     "Skipped recurrent-state SAVE for request %s: boundary %d "
-                    "was not computed in this step",
+                    "has no engine hand-off and is not the step end",
                     req_id,
                     token_len,
                 )

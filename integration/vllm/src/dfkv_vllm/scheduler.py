@@ -429,8 +429,35 @@ class DfkvStoreScheduler:
                 if req_meta is not None:
                     meta.add_request(req_meta)
 
+        self._attach_state_blocks(meta, scheduler_output)
         self._allocated_req_ids.clear()
         return meta
+
+    @staticmethod
+    def _attach_state_blocks(
+        meta: DfkvStoreConnectorMetadata, scheduler_output: SchedulerOutput
+    ) -> None:
+        """Give each SAVE the exact recurrent-state blocks vLLM committed.
+
+        A Mamba "align" block table is not append-only: interior states are
+        nulled, speculative blocks relocate, and a prompt's last chunk keeps
+        its running state in the slot of the boundary it crossed unless the
+        engine exported a checkpoint there. Engines that hand off committed
+        boundary states (``kv_connector_block_state``) name the exact block
+        per boundary; the hand-off is drained every step and the state is
+        written by this step's forward, which the worker fences before reading.
+        """
+        block_state = getattr(scheduler_output, "kv_connector_block_state", None)
+        if block_state is None:
+            return
+        offloads = block_state.boundary_state_offloads
+        for req_meta in meta.requests:
+            if not req_meta.can_save:
+                continue
+            blocks: dict[int, dict[int, int]] = {}
+            for group_id, block_id, boundary in offloads.get(req_meta.req_id, ()):
+                blocks.setdefault(group_id, {})[boundary] = block_id
+            req_meta.state_blocks = blocks
 
     def request_finished(
         self,

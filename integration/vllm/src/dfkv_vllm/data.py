@@ -454,9 +454,13 @@ class ReqMeta:
     current_event: torch.cuda.Event | None = None
     # Assigned by the worker when registering a SAVE, never a cache-key field.
     save_generation: int = 0
-    # The step ends exactly at the save boundary, so the recurrent-state
-    # blocks at that boundary hold its checkpoint (see from_request_tracker).
-    save_state: bool = True
+    # Position the scheduled step computes up to (the tracker's token length);
+    # None when unknown, which places no step-end restriction.
+    step_end: int | None = None
+    # Recurrent-state blocks vLLM committed in this step, as
+    # {kv cache group: {boundary tokens: block id}}, from the engine's
+    # boundary-state hand-off. None when the engine offers no hand-off.
+    state_blocks: dict[int, dict[int, int]] | None = None
 
     token_ids: list[int] | None = None
 
@@ -518,10 +522,7 @@ class ReqMeta:
             block_hashes=block_hashes,
             is_last_chunk=is_last_chunk,
             token_ids=token_ids,
-            # Mamba state blocks are located by position in an append-only
-            # mirror of the block table; only a boundary this step computed
-            # up to is known to hold that boundary's state.
-            save_state=input_token_len == num_tokens_to_save,
+            step_end=input_token_len,
         )
 
 
