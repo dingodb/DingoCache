@@ -126,6 +126,17 @@ class SlabAllocator {
   // payload index in the same lifecycle transaction.
   size_t ReclaimClass(size_t cls_index, size_t target_free, size_t max_victims,
                       std::vector<BlockKey>* evicted);
+  // Background GROW donor for class `hot`: among classes above the
+  // kStripeWays floor whose write demand is at most a quarter of hot's, the
+  // coldest, then the one with the most extents. Demand is bytes (puts since
+  // the last pass x slot size): a class of large slots admits far fewer
+  // objects for the same capacity, so counts alone would make it look cold and
+  // hand its extents (and newest residents) away. Returns classes.size() when
+  // no class qualifies.
+  static size_t ColdestGrowDonor(const std::vector<ClassStat>& classes,
+                                 const std::vector<uint64_t>& delta,
+                                 const std::vector<uint32_t>& extents,
+                                 size_t hot);
   bool StealFrom(size_t donor_cls, size_t target_cls,
                  std::vector<BlockKey>* evicted);
 
@@ -180,6 +191,9 @@ class SlabAllocator {
     uint32_t global_next = kNoSlot;
     uint32_t free_next = kNoSlot;
     uint64_t read_touches = 0;
+    // activity_seq_ of this resident's admission or latest actual read
+    // (0 for rebuilt residents).
+    uint64_t access_seq = 0;
     uint32_t refs = 0;
     uint32_t class_prev = kNoSlot;
     uint32_t class_next = kNoSlot;
@@ -221,6 +235,10 @@ class SlabAllocator {
     // never lowers it: the conservative age prevents an extent from appearing
     // colder than a recently inserted survivor.
     uint64_t youngest_seq = 0;
+    // Sum of residents' access_seq. Whole-extent steals pick the extent whose
+    // residents are least recently used on average, so a steal cannot wipe a
+    // freshly written extent while extents of old residents survive.
+    uint64_t access_seq_sum = 0;
     uint64_t useful_bytes = 0;
     uint64_t read_heat = 0;
     uint64_t heat_seq = 0;
@@ -251,6 +269,9 @@ class SlabAllocator {
   void TouchLocked(uint32_t meta_index);
   uint64_t DecayedHeat(uint64_t heat, uint64_t heat_seq) const;
   uint64_t ExtentHeatLocked(const ExtentMeta& extent) const;
+  // Steal-victim order: empty first, then oldest mean resident access, then
+  // coldest read heat, then fewest useful bytes.
+  bool StealsBeforeLocked(const ExtentMeta& a, const ExtentMeta& b) const;
 
   void PushFreeLocked(Class& cls, uint32_t extent, uint32_t slot);
   bool PopFreeLocked(Class& cls, Slot* out);

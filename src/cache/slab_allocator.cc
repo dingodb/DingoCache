@@ -350,6 +350,21 @@ uint64_t SlabAllocator::ExtentHeatLocked(const ExtentMeta& extent) const {
   return DecayedHeat(extent.read_heat, extent.heat_seq);
 }
 
+bool SlabAllocator::StealsBeforeLocked(const ExtentMeta& a,
+                                       const ExtentMeta& b) const {
+  if ((a.resident_count == 0) != (b.resident_count == 0))
+    return a.resident_count == 0;
+  // Compare mean access_seq without division: sum_a / n_a < sum_b / n_b.
+  const unsigned __int128 lhs =
+      static_cast<unsigned __int128>(a.access_seq_sum) * b.resident_count;
+  const unsigned __int128 rhs =
+      static_cast<unsigned __int128>(b.access_seq_sum) * a.resident_count;
+  if (lhs != rhs) return lhs < rhs;
+  const uint64_t heat_a = ExtentHeatLocked(a), heat_b = ExtentHeatLocked(b);
+  if (heat_a != heat_b) return heat_a < heat_b;
+  return a.useful_bytes < b.useful_bytes;
+}
+
 void SlabAllocator::TouchLocked(uint32_t index) {
   SlotMeta& meta = slots_[index];
   ++activity_seq_;
@@ -401,6 +416,8 @@ void SlabAllocator::TouchLocked(uint32_t index) {
   ExtentMeta& extent = extents_[meta.ref.extent];
   extent.read_heat = ExtentHeatLocked(extent) + kReadHeatUnit;
   extent.heat_seq = activity_seq_;
+  extent.access_seq_sum += activity_seq_ - meta.access_seq;
+  meta.access_seq = activity_seq_;
 }
 
 SlabAllocator::ExtentBindResult SlabAllocator::BindExtentLocked(
@@ -557,6 +574,7 @@ void SlabAllocator::FreeSlotLocked(uint32_t index) {
   if (meta.extent_next != kNoSlot)
     slots_[meta.extent_next].extent_prev = meta.extent_prev;
   --extent.resident_count;
+  extent.access_seq_sum -= meta.access_seq;
 
   if (meta.refs > 0 && extent.pinned > 0) --extent.pinned;
   index_.Erase(meta.key);
@@ -619,9 +637,6 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealExtentFor(
     size_t target_cls, std::vector<BlockKey>* evicted,
     size_t min_donor_extents) {
   int best = -1;
-  uint64_t best_heat = std::numeric_limits<uint64_t>::max();
-  uint64_t best_useful = std::numeric_limits<uint64_t>::max();
-  uint32_t best_free = 0;
   for (uint32_t e = 0; e < extents_.size(); ++e) {
     const ExtentMeta& extent = extents_[e];
     if (extent.cls == kUnbound || extent.cls == static_cast<int>(target_cls) ||
@@ -630,16 +645,9 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealExtentFor(
     const Class& donor = classes_[static_cast<size_t>(extent.cls)];
     if (min_donor_extents > 0 && donor.bound_extents <= min_donor_extents)
       continue;
-    const uint64_t heat = ExtentHeatLocked(extent);
-    if (best < 0 || heat < best_heat ||
-        (heat == best_heat && extent.useful_bytes < best_useful) ||
-        (heat == best_heat && extent.useful_bytes == best_useful &&
-         extent.free_slots > best_free)) {
+    if (best < 0 ||
+        StealsBeforeLocked(extent, extents_[static_cast<size_t>(best)]))
       best = static_cast<int>(e);
-      best_heat = heat;
-      best_useful = extent.useful_bytes;
-      best_free = extent.free_slots;
-    }
   }
   if (best < 0) return ExtentBindResult::kUnavailable;
   return StealExtentLocked(static_cast<uint32_t>(best), target_cls, evicted);
@@ -717,22 +725,12 @@ bool SlabAllocator::StealFrom(size_t donor_cls, size_t target_cls,
       target_cls >= classes_.size() || classes_[target_cls].slots_per_extent == 0)
     return false;
   int best = -1;
-  uint64_t best_heat = std::numeric_limits<uint64_t>::max();
-  uint64_t best_useful = std::numeric_limits<uint64_t>::max();
-  uint32_t best_free = 0;
   for (uint32_t e = 0; e < extents_.size(); ++e) {
     const ExtentMeta& extent = extents_[e];
     if (extent.cls != static_cast<int>(donor_cls) || extent.pinned != 0) continue;
-    const uint64_t heat = ExtentHeatLocked(extent);
-    if (best < 0 || heat < best_heat ||
-        (heat == best_heat && extent.useful_bytes < best_useful) ||
-        (heat == best_heat && extent.useful_bytes == best_useful &&
-         extent.free_slots > best_free)) {
+    if (best < 0 ||
+        StealsBeforeLocked(extent, extents_[static_cast<size_t>(best)]))
       best = static_cast<int>(e);
-      best_heat = heat;
-      best_useful = extent.useful_bytes;
-      best_free = extent.free_slots;
-    }
   }
   return best >= 0 &&
          StealExtentLocked(static_cast<uint32_t>(best), target_cls, evicted) ==
@@ -812,6 +810,8 @@ bool SlabAllocator::Put(const BlockKey& key, size_t len, SlotRef* out,
   --extent.free_slots;
   extent.useful_bytes += len;
   extent.youngest_seq = std::max(extent.youngest_seq, insert_seq);
+  meta.access_seq = activity_seq_;
+  extent.access_seq_sum += meta.access_seq;
   used_bytes_ += meta.ref.slot_size;
   if (out) *out = meta.ref;
   if (out_handle) out_handle->index = meta_index;
@@ -929,6 +929,27 @@ std::vector<SlabAllocator::ClassStat> SlabAllocator::Classes() const {
     result.push_back(stat);
   }
   return result;
+}
+
+size_t SlabAllocator::ColdestGrowDonor(const std::vector<ClassStat>& classes,
+                                       const std::vector<uint64_t>& delta,
+                                       const std::vector<uint32_t>& extents,
+                                       size_t hot) {
+  const uint64_t hot_demand = delta[hot] * classes[hot].slot_size;
+  size_t donor = classes.size();
+  uint64_t donor_demand = 0;
+  for (size_t d = 0; d < classes.size(); ++d) {
+    if (d == hot || extents[d] <= kStripeWays) continue;
+    const uint64_t demand = delta[d] * classes[d].slot_size;
+    if (demand != 0 && demand * 4 > hot_demand) continue;  // not cold enough
+    if (donor == classes.size() ||
+        std::make_pair(demand, ~uint64_t(extents[d])) <
+            std::make_pair(donor_demand, ~uint64_t(extents[donor]))) {
+      donor = d;
+      donor_demand = demand;
+    }
+  }
+  return donor;
 }
 
 size_t SlabAllocator::ReclaimClass(size_t cls_index, size_t target_free,

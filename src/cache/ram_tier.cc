@@ -308,15 +308,8 @@ void RamTier::ReclaimTick(Shard& s, size_t /*shard_idx*/) {
         (want - free_now + c.slots_per_extent - 1) / c.slots_per_extent;
     need_ext = std::min<size_t>(need_ext, kGrowExtentsPerTick);
     while (need_ext > 0) {
-      size_t donor = classes.size();
-      for (size_t d = 0; d < classes.size(); ++d) {  // coldest, then biggest
-        if (d == i || extents[d] <= SlabAllocator::kStripeWays) continue;
-        if (delta[d] != 0 && delta[d] * 4 > delta[i]) continue;  // not cold enough
-        if (donor == classes.size() ||
-            std::make_pair(delta[d], ~uint64_t(extents[d])) <
-                std::make_pair(delta[donor], ~uint64_t(extents[donor])))
-          donor = d;
-      }
+      const size_t donor =
+          SlabAllocator::ColdestGrowDonor(classes, delta, extents, i);
       if (donor == classes.size()) break;
       std::vector<BlockKey> evicted;
       bool ok;

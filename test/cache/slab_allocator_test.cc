@@ -291,7 +291,11 @@ TEST(SlabAllocator, ColdStealDisabledFallsBackToSelfEvict) {
   for (int i = 32; i < 96; ++i)  // busy class self-evicts its own only
     ASSERT_TRUE(a.Put(Key("hot" + std::to_string(i)), 4096, &r, &ev));
   EXPECT_EQ(a.ColdSteals(), 0u) << "disabled: never cold-steals";
-  EXPECT_TRUE(a.Contains(Key("stale0"))) << "stale cross-class data survives";
+  // Growth back to the striping floor may still take A's least recently used
+  // extents (stale0 is the oldest key), but the busy class must not wipe A.
+  size_t stale_alive = 0;
+  for (int i = 0; i < 16; ++i) stale_alive += a.Contains(Key("stale" + std::to_string(i)));
+  EXPECT_GT(stale_alive, 0u) << "stale cross-class data survives";
   ::unsetenv("DFKV_SLAB_COLD_STEAL_WINDOW");
 }
 
@@ -789,6 +793,75 @@ TEST(SlabAllocator, StealAfterRestoreEvictsRestoredResidents) {
 }
 
 // ---- class rebalance additions (StealFrom mechanism) ----
+
+// A steal must not pick the extent that new writes are still filling just
+// because it holds fewer bytes: that wipes the newest residents while older
+// full extents survive.
+TEST(SlabAllocator, StealFromSparesTheExtentBeingFilled) {
+  SlabAllocator a(Opts(4 * 4096, 2));  // 2 extents x 4 slots
+  std::vector<SlabAllocator::RestoreEntry> records;
+  for (uint32_t s = 0; s < 4; ++s)
+    records.push_back({Key("old" + std::to_string(s)), 4096, 0, s, 4096});
+  records.push_back({Key("old4"), 4096, 1, 0, 4096});
+  ASSERT_TRUE(a.RestoreBulk(records));
+  std::vector<BlockKey> ev;
+  SlotRef r;
+  ASSERT_TRUE(a.Put(Key("new0"), 4096, &r, &ev));
+  ASSERT_TRUE(a.Put(Key("new1"), 4096, &r, &ev));
+  ASSERT_TRUE(ev.empty());
+  ASSERT_EQ(r.extent, 1u);
+
+  ASSERT_TRUE(a.StealFrom(ClassIndex(a, 4096), ClassIndex(a, 16 * 1024), &ev));
+  EXPECT_EQ(ev.size(), 4u);
+  EXPECT_TRUE(a.Contains(Key("new0")));
+  EXPECT_TRUE(a.Contains(Key("new1")));
+  EXPECT_TRUE(a.Contains(Key("old4")));
+  EXPECT_FALSE(a.Contains(Key("old0")));
+}
+
+// The victim is the extent whose residents are least recently used on
+// average, not the one touched least recently: one fresh read must not shield
+// an extent of otherwise old residents.
+TEST(SlabAllocator, StealFromUsesMeanResidentRecency) {
+  SlabAllocator a(Opts(4 * 4096, 2));
+  std::vector<SlabAllocator::RestoreEntry> records;
+  for (uint32_t s = 0; s < 4; ++s) {
+    records.push_back({Key("old" + std::to_string(s)), 4096, 0, s, 4096});
+    records.push_back({Key("mid" + std::to_string(s)), 4096, 1, s, 4096});
+  }
+  ASSERT_TRUE(a.RestoreBulk(records));
+  SlotRef r;
+  for (int s = 0; s < 4; ++s) ASSERT_TRUE(a.Get(Key("mid" + std::to_string(s)), &r));
+  ASSERT_TRUE(a.Get(Key("old0"), &r));  // newest single access, extent 0
+
+  std::vector<BlockKey> ev;
+  ASSERT_TRUE(a.StealFrom(ClassIndex(a, 4096), ClassIndex(a, 16 * 1024), &ev));
+  EXPECT_EQ(ev.size(), 4u);
+  for (int s = 0; s < 4; ++s) {
+    EXPECT_FALSE(a.Contains(Key("old" + std::to_string(s))));
+    EXPECT_TRUE(a.Contains(Key("mid" + std::to_string(s))));
+  }
+}
+
+// GROW donors are judged by bytes written, not object counts: a large-slot
+// class with fewer but bigger writes is not cold.
+TEST(SlabAllocator, GrowDonorComparesDemandInBytes) {
+  std::vector<SlabAllocator::ClassStat> classes(3);
+  classes[0].slot_size = 1u << 20;   // hot by count
+  classes[1].slot_size = 64u << 20;  // fewer, much larger writes
+  classes[2].slot_size = 4u << 20;   // idle
+  const std::vector<uint32_t> extents{100, 100, 100};
+  // 0 wants to grow: 13 MiB/pass vs 64 MiB/pass for class 1 -> only 2 is cold.
+  EXPECT_EQ(SlabAllocator::ColdestGrowDonor(classes, {13, 1, 0}, extents, 0), 2u);
+  // Without an idle class there is no donor for 0.
+  EXPECT_EQ(SlabAllocator::ColdestGrowDonor(classes, {13, 1, 1000}, extents, 0),
+            classes.size());
+  // Class 1 growing may take from the byte-colder class 0.
+  EXPECT_EQ(SlabAllocator::ColdestGrowDonor(classes, {13, 1, 1000}, extents, 1), 0u);
+  // Donors at the striping floor are never used.
+  EXPECT_EQ(SlabAllocator::ColdestGrowDonor(classes, {13, 1, 0}, {100, 100, 8}, 0),
+            classes.size());
+}
 
 // StealFrom moves exactly one extent: the donor's residents on that extent are
 // evicted, the target class gains its capacity, everything else survives.

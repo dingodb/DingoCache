@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Stop whole-extent steals from wiping the newest residents. Cross-class
+  steals (`StealFrom`, `StealExtentFor`) ranked extents by decayed read heat
+  and then by fewest useful bytes; once read heat had decayed, that picked the
+  extent still being filled by new writes, so fresh objects were evicted in
+  bulk while extents of old residents survived. Steals now take an empty
+  extent first, otherwise the extent whose residents are least recently used
+  on average (per-resident admission/read sequence), with heat and useful
+  bytes only breaking ties. The disk and RAM-tier background rebalancers also
+  judge cold donor classes by bytes written instead of object counts, so a
+  large-slot class (for example Kimi-K3 recurrent state next to its KV pages)
+  is no longer treated as cold and drained. Reproduced on a 3-disk slab server
+  with a RAM tier where watermark reclaim stays idle: before, new KV probes
+  were lost while the oldest KV survived 80% capacity of later writes; after,
+  the oldest residents go first.
+
 - Save vLLM connector recurrent-state (Mamba) objects only from the blocks
   the engine hands off for committed boundaries (`kv_connector_block_state`),
   instead of locating them by position in an append-only mirror of the
