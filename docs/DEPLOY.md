@@ -279,7 +279,7 @@ WantedBy=multi-user.target
 >   （默认 92 / 88；high=0 关）：越过 high 后按全局读写最近使用顺序回收 slot 到 low。
 >   新键成功提交可在近期压力状态下重新触发回收；非活跃且连续 128 次无新提交观察后，历史压力失效。
 >   每 tick 由 `DFKV_SLAB_EVICT_MAX_VICTIMS_PER_TICK`（默认 256，范围 1～1024）限制移除对象数，扫描上限为其 4 倍。旧 `DFKV_SLAB_EVICT_MAX_EXTENTS_PER_TICK` 不再读取，升级时须迁移配置。
-> - `--slab-reclaim-ms <n>` / `--ram-reclaim-ms <n>`（默认 50 / 10，`0`=关）：后台预回收和类再平衡。整块抢占优先选空 extent，其次选驻留对象平均最久未访问的 extent（decayed read heat、useful bytes 仅作平手裁决），跳过 pinned extent；后台类再平衡按写入字节（而非对象个数）判断冷 donor class；通常保留默认。
+> - `--slab-reclaim-ms <n>` / `--ram-reclaim-ms <n>`（默认 50 / 10，`0`=关）：后台预回收和类再平衡。类再平衡抢占（`StealFrom`）与 Put 的条带下限/兜底抢占（`StealExtentFor`）优先选空 extent，其次选驻留对象平均最久未访问的 extent（decayed read heat、useful bytes 仅作平手裁决），跳过 pinned extent；这是 extent 级取舍，混在大量旧对象中的少量新对象仍可能随整块淘汰；冷抢占（`StealColdExtentFor`）保持原有入驻年龄门槛与 heat/useful bytes 排序；后台类再平衡按写入字节（而非对象个数）判断冷 donor class；通常保留默认。
 > - `--slab-granularity <bytes>`（默认 1 MiB）：最小 slot 量子。现有 `slots.tbl` 的 format/geometry 不匹配会 fail closed；修改必须换空目录，服务不会原地冷重建或忽略旧数据。
 > - `--put-inflight-limit <n>`（默认 0=关）：在 RAM 接纳或直接盘写之前原子限制前台 PUT 并发；超限返回 `kCacheFull`，不接纳数据、不进入 peer cooldown。TCP 与 RDMA direct PUT 共用此门；后台 flusher 不受限制。已接纳写入和同 key 重复请求仍等待原写入的终态，不以超时将另一份 payload 送入盘写路径。该参数限制接纳量，不是磁盘 I/O 超时保证。
 > - `--tcp-max-conns <n>` / `DFKV_TCP_MAX_CONNS`（默认 512，硬上限 4096）限制
