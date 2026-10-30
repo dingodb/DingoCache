@@ -257,8 +257,11 @@ size-class lattice and carves them into uniform slots:
   key→slot map. There is no per-class key mirror or stale slot-state scan.
 - **Variable-size workloads:** aligned geometric classes keep bounded internal
   waste across partial chunks and mixed model layouts. Placement is independent
-  of request/restore order. Rebalancing uses useful bytes and decayed read heat,
-  not object count alone.
+  of request/restore order. A whole-extent steal takes an empty extent first,
+  otherwise the extent whose residents are least recently used on average
+  (decayed read heat and useful bytes only break ties), so it cannot wipe the
+  extent new writes are filling. Background growth judges cold donor classes
+  by bytes written, not object count.
 - **Concurrent I/O:** payload reads/writes run outside metadata locks while
   slot pins and deferred removal prevent reuse. Prepared disk reads return one
   move-only RAII lease; async completion, fallback, error, and teardown release
