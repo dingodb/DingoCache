@@ -2405,7 +2405,17 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
           v2_put_writes_.fetch_add(1, std::memory_order_relaxed);
       }
     } else {
+      // Control ops carry any payload inline after the prefix (kRetain keys).
+      if (payload_len > 0 &&
+          (payload == nullptr || ep.cap() < kReqPrefix ||
+           payload_len > ep.cap() - kReqPrefix)) {
+        Release(node, lane, conn, RemoteRailOutcome::kAbandon);
+        return Status::kInvalid;
+      }
       conn->Encode(ep.sbuf(0), op, key, offset, length, payload_len);
+      if (payload_len > 0)
+        std::memcpy(ep.sbuf(0) + kReqPrefix, payload,
+                    static_cast<size_t>(payload_len));
       ok = ep.PostRecv(0) &&
            ep.PostSend(0, kReqPrefix + static_cast<size_t>(payload_len));
     }
@@ -2436,7 +2446,9 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
       completion = rdma::RailCompletion::kEndpointFailure;
     }
     const uint64_t response_bound =
-        op == WireOp::kMembers ? rdma::kV2ControlResponseMax : 0;
+        op == WireOp::kMembers || op == WireOp::kRetain
+            ? rdma::kV2ControlResponseMax
+            : 0;
     if (ok && !conn->Decode(
                   ep.rbuf(0), &status, &data_len, response_bound,
                   value_len ? &attempt_value_len : nullptr)) {
@@ -2535,6 +2547,15 @@ Status RdmaTransport::Exist(const std::string& node, const BlockKey& key,
     return Status::kOk;
   }
   return st;
+}
+
+Status RdmaTransport::Retain(const std::string& node, uint64_t tenant_hash,
+                             uint64_t count, const std::string& payload,
+                             std::string* out) {
+  if (out == nullptr || count == 0 || count > kRetainMaxKeys)
+    return Status::kInvalid;
+  return RoundTrip(node, WireOp::kRetain, BlockKey{0, 0, tenant_hash}, 0,
+                   count, payload.data(), payload.size(), out);
 }
 
 Status RdmaTransport::Remove(const std::string& node, const BlockKey& key) {

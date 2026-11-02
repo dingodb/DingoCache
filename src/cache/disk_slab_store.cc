@@ -130,6 +130,11 @@ bool DrainBatchWrites(io_uring* ring, size_t outstanding,
   return outstanding == 0;
 }
 #endif
+uint32_t RetainNowS() {
+  const auto now = std::chrono::system_clock::now().time_since_epoch();
+  return static_cast<uint32_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(now).count());
+}
 }  // namespace
 
 DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
@@ -220,6 +225,40 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
       std::to_string(evict_max_victims_per_tick_));
   if (evict_high_bytes_ != 0)
     watermark_evicted_.reserve(evict_max_victims_per_tick_);
+
+  // Retention (minimum lifetime for RETAIN-protected objects). Inert until a
+  // client sends kRetain; DFKV_RETAIN_ENABLE=0 makes the node answer kRetain
+  // as an unknown op and restores no persisted protection.
+  {
+    auto env_u32 = [](const char* name, uint32_t dflt, uint32_t lo,
+                      uint32_t hi) -> uint32_t {
+      const char* v = std::getenv(name);
+      if (!v || !*v) return dflt;
+      char* end = nullptr;
+      const unsigned long x = std::strtoul(v, &end, 10);
+      if (end == v || *end != '\0' || x < lo || x > hi) return dflt;
+      return static_cast<uint32_t>(x);
+    };
+    SlabAllocator::RetainOptions ro;
+    ro.enabled = env_u32("DFKV_RETAIN_ENABLE", 1, 0, 1) == 1;
+    ro.max_ttl_s = env_u32("DFKV_RETAIN_MAX_TTL_S", 3600, 1, 7 * 86400);
+    const uint32_t pct = env_u32("DFKV_RETAIN_MAX_PCT", 60, 0, 95);
+    ro.budget_bytes = opt_.capacity_bytes / 100 * pct;
+    ro.class_pct = env_u32("DFKV_RETAIN_MAX_CLASS_PCT", 80, 0, 100);
+    ro.persist_min_delta_s =
+        env_u32("DFKV_RETAIN_PERSIST_MIN_DELTA_S", 60, 0, 86400);
+    retain_enabled_ = ro.enabled;
+    retain_max_ttl_s_ = ro.max_ttl_s;
+    alloc_->ConfigureRetention(ro, RetainNowS());
+    config_dump::RecordResolved("DFKV_RETAIN_ENABLE", ro.enabled ? "1" : "0");
+    config_dump::RecordResolved("DFKV_RETAIN_MAX_TTL_S",
+                                std::to_string(ro.max_ttl_s));
+    config_dump::RecordResolved("DFKV_RETAIN_MAX_PCT", std::to_string(pct));
+    config_dump::RecordResolved("DFKV_RETAIN_MAX_CLASS_PCT",
+                                std::to_string(ro.class_pct));
+    config_dump::RecordResolved("DFKV_RETAIN_PERSIST_MIN_DELTA_S",
+                                std::to_string(ro.persist_min_delta_s));
+  }
 
   ok_ = OpenOrInit();
   if (ok_ && unclean_start_) ok_ = ResetUncleanEpoch();
@@ -860,7 +899,12 @@ bool DiskSlabStore::Rebuild() {
       rejected.emplace_back(e, s);
       return;
     }
-    entries.push_back({key, slot_size, e, s, payload_len});
+    const uint32_t retain_until =
+        net::GetU32(reinterpret_cast<const char*>(rec) + 44);
+    const uint32_t retain_ttl_s =
+        net::GetU32(reinterpret_cast<const char*>(rec) + 48);
+    entries.push_back(
+        {key, slot_size, e, s, payload_len, retain_until, retain_ttl_s});
   };
 
   auto scan_range = [&](uint64_t begin, uint64_t end) {
@@ -1023,7 +1067,8 @@ bool DiskSlabStore::SyncTable(uint64_t seen) {
 
 bool DiskSlabStore::WriteRecord(const SlabAllocator::SlotRef& r,
                                 const BlockKey& key, uint32_t payload_len,
-                                bool valid) {
+                                bool valid, uint32_t retain_until,
+                                uint32_t retain_ttl_s) {
   if (!Healthy()) return false;
   if (record_write_hook_for_test_ && !record_write_hook_for_test_())
     return FailMetadata();
@@ -1036,6 +1081,8 @@ bool DiskSlabStore::WriteRecord(const SlabAllocator::SlotRef& r,
   net::PutU64(reinterpret_cast<char*>(rec) + 24, key.digest_lo);
   net::PutU32(reinterpret_cast<char*>(rec) + 32, payload_len);
   net::PutU64(reinterpret_cast<char*>(rec) + 36, key.tenant_hash);
+  net::PutU32(reinterpret_cast<char*>(rec) + 44, retain_until);
+  net::PutU32(reinterpret_cast<char*>(rec) + 48, retain_ttl_s);
   const uint32_t crc = Crc32(rec + 8, kRecBytes - 8);
   net::PutU32(reinterpret_cast<char*>(rec) + 4, crc);
   if (!PwriteAll(table_fd_, rec, kRecBytes, TableOffset(r.extent, r.slot)))
@@ -1589,6 +1636,28 @@ void DiskSlabStore::ReleaseReadLeaseThunk(void* owner,
   static_cast<DiskSlabStore*>(owner)->ReleaseReadLease(token);
 }
 
+uint8_t DiskSlabStore::Retain(const BlockKey& key, uint32_t ttl_s,
+                              uint8_t mode, uint32_t now_s) {
+  using Code = SlabAllocator::RetainCode;
+  if (!retain_enabled_) return kRetainUnsupported;
+  if (!Healthy()) return static_cast<uint8_t>(Code::kMiss);
+  const auto retain_mode = mode == 1 ? SlabAllocator::RetainMode::kRefresh
+                                     : SlabAllocator::RetainMode::kSet;
+  std::lock_guard<std::mutex> lk(mu_);
+  // Only a committed value can be protected: an in-flight PUT or a removed
+  // key is a miss, exactly as a reader would observe it.
+  auto it = payload_len_.find(key.Filename());
+  if (it == payload_len_.end()) return static_cast<uint8_t>(Code::kMiss);
+  const SlabAllocator::RetainOutcome out =
+      alloc_->Retain(key, ttl_s, retain_mode, now_s);
+  if (out.persist &&
+      !WriteRecord(out.ref, key, it->second, /*valid=*/true, out.until,
+                   out.ttl_s)) {
+    return static_cast<uint8_t>(Code::kMiss);
+  }
+  return static_cast<uint8_t>(out.code);
+}
+
 void DiskSlabStore::ReleaseReadLease(uint64_t token) noexcept {
   std::lock_guard<std::mutex> lk(mu_);
   auto it = prep_holds_.find(token);
@@ -1775,6 +1844,7 @@ uint64_t DiskSlabStore::EvictedBytes() const {
 void DiskSlabStore::ReclaimTick(
     const std::function<void()>& after_watermark_evict) {
   if (!Healthy()) return;
+  if (retain_enabled_) alloc_->ExpireRetention(RetainNowS());
   // Successful NEW commits renew pressure eligibility. Inactive history
   // expires after 128 quiet observations; required active drain is preserved.
   // Sampling and composite mutation share mu_.

@@ -9,6 +9,7 @@ import os
 import threading
 from typing import Optional, Sequence
 from dfkv_common import make_client_options_v2, make_key_array
+from dfkv_common import cabi as dfkv_cabi
 
 from dfkv_common.block_size import get_max_block_bytes, validate_object_sizes
 
@@ -290,6 +291,7 @@ class DfkvDeviceClient:
         self._telemetry_acquired = False
         self._hot_config_acquired = False
         self._lib = load_lib(lib_path)
+        self._has_retain = dfkv_cabi.bind_retain(self._lib)
         # ABI v2 constructs one fully configured handle: static membership or
         # MDS discovery, batch fan-out, and optional client registration become
         # visible together instead of mutating a partially initialized client.
@@ -636,6 +638,55 @@ class DfkvDeviceClient:
             del key_owners
             return res
 
+
+    # ---- Retention (kRetain) ----
+    @property
+    def supports_retain(self) -> bool:
+        return self._has_retain
+
+    def batch_retain(self, keys: Sequence[bytes], ttl_s: int, mode: int,
+                     *, flags: int = 0, min_refresh_ms: int = 0) -> list:
+        """Return one DFKV_RET_* code per key.
+
+        REFRESH doubles as an existence check (hit iff the code is in
+        ``RETAIN_HIT_CODES``). With an older libdfkv, REFRESH degrades to
+        ``batch_exist`` and SET reports unsupported.
+        """
+        n = len(keys)
+        if n == 0:
+            return []
+        if not self._has_retain:
+            if mode == dfkv_cabi.DFKV_RETAIN_REFRESH:
+                return [dfkv_cabi.DFKV_RET_HIT_UNPROTECTED if e else
+                        dfkv_cabi.DFKV_RET_MISS for e in self.batch_exist(keys)]
+            return [dfkv_cabi.DFKV_RET_UNSUPPORTED] * n
+        op = "retain_refresh" if mode == dfkv_cabi.DFKV_RETAIN_REFRESH \
+            else "retain_set"
+        with _push_metrics.op("exist" if op == "retain_refresh" else op,
+                              num_keys=n), \
+                _push_tracing.span(op, n) as _sp, \
+                access_log(op, lambda: f"{n} keys ttl={ttl_s}") as r:
+            res = dfkv_cabi.call_batch_retain(
+                self._lib, self._h, keys, ttl_s, mode, flags=flags,
+                min_refresh_ms=min_refresh_ms)
+            hits = sum(1 for c in res if c in dfkv_cabi.RETAIN_HIT_CODES)
+            r.result = f"hits={hits}/{n}"
+            if _sp:
+                _sp.hits = hits
+            return res
+
+    def retain_limits(self) -> tuple:
+        """``(supported, max_ttl_s)`` for the whole ring."""
+        if not self._has_retain:
+            return 0, 0
+        return dfkv_cabi.call_retain_limits(self._lib, self._h)
+
+    def retain_precheck(self, keys: Sequence[bytes],
+                        min_headroom_pct: int = 0) -> bool:
+        if not self._has_retain:
+            return False
+        return dfkv_cabi.call_retain_precheck(
+            self._lib, self._h, keys, min_headroom_pct)
 
     def close(self) -> None:
         try:

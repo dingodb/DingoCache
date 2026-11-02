@@ -159,6 +159,16 @@ class Transport {
     (void)node; (void)key; return Status::kInvalid;
   }
 
+  // One kRetain round trip: `payload` is the encoded kRetain body (see
+  // wire.h) for `count` keys of one tenant; `out` receives the reply data.
+  // A node without retention answers kInvalid. Default: unsupported.
+  virtual Status Retain(const std::string& node, uint64_t tenant_hash,
+                        uint64_t count, const std::string& payload,
+                        std::string* out) {
+    (void)node; (void)tenant_hash; (void)count; (void)payload; (void)out;
+    return Status::kInvalid;
+  }
+
   // Query a node's advertised cluster member list (for discovery). Default: not
   // supported; TCP/RDMA override it. *out = "name=ip:port,name=ip:port,...".
   virtual Status Members(const std::string& node, std::string* out) {

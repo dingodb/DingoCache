@@ -93,13 +93,15 @@ from .transfer_protocol import TransferResults
 from ._telemetry import config as _tcfg  # connector identity + client_register switch
 from .protocol import (
     LOOKUP_MSG,
-    LOOKUP_RESPONSE_BYTES,
     RESET_MSG,
     RESP_ERR,
     RESP_OK,
     _decode_lookup_request,
+    _decode_lookup_response,
     _encode_lookup_request,
+    _encode_lookup_response,
 )
+from dfkv_common import cabi as dfkv_cabi
 
 logger = init_logger(__name__)
 
@@ -625,6 +627,23 @@ class KVTransferThread(threading.Thread):
             num_failed_keys=num_failed_keys,
         )
 
+    def _note_retain_codes(self, operation: str, codes: list) -> None:
+        """Account one retention batch; keys left unprotected count as failed
+        (DENIED, MISS after a put, unsupported, or transport error)."""
+        unprotected = sum(
+            1 for c in codes if c not in dfkv_cabi.RETAIN_PROTECTED_CODES)
+        self._record_operation(
+            operation,
+            time.perf_counter(),
+            len(codes),
+            num_logical_keys=len(codes),
+            status="partial_failure" if unprotected else "ok",
+            num_failed_keys=unprotected,
+        )
+        if unprotected:
+            logger.debug("dfkv %s: %d/%d keys left unprotected (codes=%s)",
+                         operation, unprotected, len(codes), sorted(set(codes)))
+
     def _record_observation(self, name: str, start_time: float) -> None:
         if self._record_observation_cb is not None:
             self._record_observation_cb(name, time.perf_counter() - start_time)
@@ -850,8 +869,21 @@ class KVCacheStoreSendingThread(KVTransferThread):
             # owns any HCA-width windowing, so dedup probes the logical keys
             # directly and a missing object is rewritten as a whole.
             save_exists_start = time.perf_counter()
+            retain_ttl_s = req_meta.retain_ttl_s
             try:
-                exists_states = self.client.batch_exist(keys)
+                if retain_ttl_s > 0:
+                    # SET doubles as the dedup probe: present keys are
+                    # protected in the same round trip (prefix closure keeps
+                    # every saved chunk of this request protected).
+                    codes = self.client.batch_retain(
+                        keys, retain_ttl_s, dfkv_cabi.DFKV_RETAIN_SET)
+                    exists_states = [
+                        1 if c in dfkv_cabi.RETAIN_HIT_CODES else 0
+                        for c in codes
+                    ]
+                    self._note_retain_codes("save_retain_set", codes)
+                else:
+                    exists_states = self.client.batch_exist(keys)
                 if len(exists_states) != len(keys):
                     raise RuntimeError(
                         "batch_exist returned incomplete per-key results: "
@@ -991,6 +1023,15 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         batch_bytes,
                         key_diagnostic_label(keys[0]) if keys else "N/A",
                     )
+                if retain_ttl_s > 0:
+                    stored = [k for k, rc in zip(keys, res, strict=True)
+                              if rc == 0]
+                    if stored:
+                        self._note_retain_codes(
+                            "save_retain_set",
+                            self.client.batch_retain(
+                                stored, retain_ttl_s,
+                                dfkv_cabi.DFKV_RETAIN_SET))
             except Exception as e:
                 self._record_operation(
                     "save_put",
@@ -2450,9 +2491,25 @@ class DfkvStoreWorker:
 
         return finished_sending
 
-    def lookup(self, token_len: int, block_hashes: list[BlockHash]) -> int:
-        """Return a prefix whose length-dependent load objects all exist."""
+    def lookup(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        retain_ttl_s: int = 0,
+    ) -> tuple[int, int]:
+        """Return ``(hit_tokens, applied_ttl_s)``.
+
+        ``hit_tokens`` is a prefix whose length-dependent load objects all
+        exist. The probe is a retention REFRESH, so every object found (also
+        ones served from GPU memory on this instance) has its protection
+        renewed. ``applied_ttl_s`` is the TTL this request's writes will be
+        protected with: 0 without a TTL, on a ring without retention, or when
+        the whole-prefix precheck finds an owner node short of headroom.
+        """
+        first_candidate_keys: list[bytes] | None = None
+
         def lookup_candidate(token_len: int) -> int:
+            nonlocal first_candidate_keys
             """Check how many prefix tokens exist in the store.
     
             Checks across all TP ranks at this worker's own PP rank.
@@ -2537,10 +2594,15 @@ class DfkvStoreWorker:
     
             if not candidate_keys:
                 return 0
+            if first_candidate_keys is None:
+                first_candidate_keys = candidate_keys
     
             lookup_start = time.perf_counter()
             try:
-                res = self.client.batch_exist(candidate_keys)
+                codes = self.client.batch_retain(
+                    candidate_keys, 0, dfkv_cabi.DFKV_RETAIN_REFRESH)
+                res = [1 if c in dfkv_cabi.RETAIN_HIT_CODES else 0
+                       for c in codes]
                 if len(res) != len(candidate_keys):
                     raise RuntimeError(
                         "batch_exist returned incomplete per-key results: "
@@ -2606,15 +2668,31 @@ class DfkvStoreWorker:
             )
             return hit_length
     
+        def applied_ttl() -> int:
+            if retain_ttl_s <= 0 or not first_candidate_keys:
+                return 0
+            try:
+                supported, max_ttl = self.client.retain_limits()
+                if supported != 1 or max_ttl <= 0:
+                    return 0
+                # Decision 9: one owner short of headroom downgrades the whole
+                # request to best-effort rather than protecting a holed prefix.
+                if not self.client.retain_precheck(first_candidate_keys):
+                    return 0
+                return min(retain_ttl_s, max_ttl)
+            except Exception as e:  # never fail a lookup over retention
+                logger.warning("dfkv retention limits/precheck failed: %s", e)
+                return 0
+
         candidate = token_len // self.coord.lcm_block_size * self.coord.lcm_block_size
         while candidate > 0:
             hit = lookup_candidate(candidate)
             if hit == candidate:
-                return hit
+                return hit, applied_ttl()
             # Tail-only state masks move when the candidate prefix shrinks.
             # Revalidate that boundary rather than loading unprobed checkpoints.
             candidate = hit
-        return 0
+        return 0, applied_ttl()
 
     def get_kv_events(self) -> list[BlockStored]:
         if self.enable_kv_events and self.kv_send_thread is not None:
@@ -2752,12 +2830,15 @@ class LookupKeyServer:
                     # reason to terminate the rank-0 admin server.
                     lookup_ipc_start = time.perf_counter()
                     try:
-                        token_len, hash_bytes = _decode_lookup_request(
-                            [frame.buffer for frame in all_frames]
+                        token_len, hash_bytes, retain_ttl_s = (
+                            _decode_lookup_request(
+                                [frame.buffer for frame in all_frames]
+                            )
                         )
                         block_hashes = [BlockHash(value) for value in hash_bytes]
-                        result = self.store_worker.lookup(token_len, block_hashes)
-                        if not 0 <= result < 1 << (8 * LOOKUP_RESPONSE_BYTES):
+                        result, applied = self.store_worker.lookup(
+                            token_len, block_hashes, retain_ttl_s)
+                        if not 0 <= result < 1 << 32:
                             raise ValueError(
                                 f"lookup result is outside uint32: {result}"
                             )
@@ -2765,10 +2846,8 @@ class LookupKeyServer:
                         logger.warning(
                             "LookupKeyServer rejected lookup request: %s", e
                         )
-                        result = 0
-                    self.socket.send(
-                        result.to_bytes(LOOKUP_RESPONSE_BYTES, byteorder="big")
-                    )
+                        result, applied = 0, 0
+                    self.socket.send(_encode_lookup_response(result, applied))
                     self.store_worker._record_kv_connector_observation(
                         "lookup_ipc", time.perf_counter() - lookup_ipc_start
                     )
@@ -2846,18 +2925,14 @@ class LookupKeyClient:
             max_workers=1,
             thread_name_prefix="DfkvLookupClient",
         )
-        self.futures: dict[str, Future[int]] = {}
+        self.futures: dict[str, Future[tuple[int, int]]] = {}
 
-    def _lookup(self, token_len: int, block_hashes: list[BlockHash]) -> int:
-        all_frames = _encode_lookup_request(token_len, block_hashes)
+    def _lookup(self, token_len: int, block_hashes: list[BlockHash],
+                retain_ttl_s: int) -> tuple[int, int]:
+        all_frames = _encode_lookup_request(token_len, block_hashes,
+                                            retain_ttl_s)
         self.socket.send_multipart(all_frames, copy=False)
-        resp = self.socket.recv()
-        if len(resp) != LOOKUP_RESPONSE_BYTES:
-            raise ValueError(
-                f"lookup response has {len(resp)} bytes, "
-                f"expected {LOOKUP_RESPONSE_BYTES}"
-            )
-        return int.from_bytes(resp, byteorder="big")
+        return _decode_lookup_response(bytes(self.socket.recv()))
 
     def lookup(
         self,
@@ -2865,17 +2940,20 @@ class LookupKeyClient:
         token_len: int,
         block_hashes: list[BlockHash],
         non_block: bool = False,
-    ) -> int | None:
-        """Return a hit count, or ``None`` while a non-blocking lookup runs."""
+        retain_ttl_s: int = 0,
+    ) -> tuple[int, int] | None:
+        """Return ``(hit_tokens, applied_ttl_s)``, or ``None`` while a
+        non-blocking lookup runs."""
         with self._close_lock:
             if self._closed:
-                return 0
+                return 0, 0
             future = self.futures.get(req_id)
             if future is None:
                 future = self.executor.submit(
                     self._lookup,
                     token_len,
                     list(block_hashes),
+                    retain_ttl_s,
                 )
                 self.futures[req_id] = future
 
@@ -2885,7 +2963,7 @@ class LookupKeyClient:
             return future.result()
         except Exception as e:
             logger.error("Dfkv lookup failed for %s: %s", req_id, e)
-            return 0
+            return 0, 0
         finally:
             with self._close_lock:
                 if self.futures.get(req_id) is future:

@@ -107,6 +107,36 @@ class KVClient {
   std::vector<bool> BatchGetAuto(const std::vector<KvGetItem>& items,
                                  std::vector<size_t>* out_lens);
   std::vector<bool> BatchExist(const std::vector<std::string>& keys);
+
+  // ---- Retention (kRetain) ----
+  // Per-key result codes (mirrors dfkv_c_api.h DFKV_RET_*).
+  enum RetainResult : uint8_t {
+    kRetMiss = 0, kRetHitUnprotected = 1, kRetProtectedNew = 2,
+    kRetRefreshed = 3, kRetUpgraded = 4, kRetUnchanged = 5, kRetDenied = 6,
+    kRetUnsupported = 7, kRetSkippedDebounce = 8, kRetError = 9,
+  };
+  struct RetainRequest {
+    uint32_t ttl_s = 0;        // SET: requested TTL. REFRESH: debounce hint
+                               // (0 = never debounce; server ignores it)
+    uint8_t mode = 0;          // 0 SET, 1 REFRESH
+    bool no_debounce = false;
+    uint32_t min_refresh_ms = 0;
+  };
+  // Batched RETAIN fanned out per owning node. out[i] is always written.
+  // REFRESH doubles as an existence check: on a node without retention the
+  // keys are probed with Exist instead (hit -> kRetHitUnprotected), so callers
+  // can use it in place of BatchExist. A key is a hit iff its code is one of
+  // 1,2,3,4,5,6,8.
+  void BatchRetain(const std::vector<std::string>& keys,
+                   const RetainRequest& req, uint8_t* out);
+  // Ring-wide limits: *supported 1 = every member answered kRetain, 0 = some
+  // member lacks it, -1 = unknown. *max_ttl_s = smallest cap seen (0 if not
+  // supported). Unknown members are probed once, synchronously.
+  void RetainLimits(int* supported, uint32_t* max_ttl_s);
+  // Local, RPC-free: true iff every owner of `keys` supports retention and its
+  // last reported headroom is >= min_headroom_pct (never-heard nodes pass).
+  bool RetainPrecheck(const std::vector<std::string>& keys,
+                      uint8_t min_headroom_pct);
   // Batched remove, fanned out across owning nodes (grouped per node). Per-item
   // result like BatchExist: true iff the owning node confirmed the op.
   std::vector<bool> BatchRemove(const std::vector<std::string>& keys);
@@ -251,6 +281,27 @@ class KVClient {
   // declarations win, matching a successful same-base growth deterministically.
   mutable std::shared_mutex registered_memory_mu_;
   std::vector<RegisteredMemoryRange> registered_memory_;
+  // Retention per-node view (from kRetain replies) and refresh debounce.
+  struct RetainNodeState {
+    int supported = -1;  // -1 unknown, 0 no, 1 yes
+    uint32_t max_ttl_s = 0;
+    uint8_t headroom_pct = 100;
+    bool heard = false;
+  };
+  mutable std::mutex retain_mu_;
+  std::map<std::string, RetainNodeState> retain_nodes_;
+  struct RetainDebounceEntry { uint64_t protected_at_ms = 0; };
+  static constexpr size_t kRetainDebounceShards = 16;
+  struct RetainDebounceShard {
+    std::mutex mu;
+    std::map<std::pair<uint64_t, uint64_t>, RetainDebounceEntry> entries;
+  };
+  RetainDebounceShard retain_debounce_[kRetainDebounceShards];
+  size_t retain_debounce_cap_ = 0;  // per shard; from DFKV_RETAIN_CACHE_ENTRIES
+  void RetainNode(const std::string& node, uint64_t tenant,
+                  const std::vector<size_t>& idx,
+                  const std::vector<BlockKey>& bkeys,
+                  const RetainRequest& req, uint8_t* out);
   mutable std::mutex ring_mu_;  // guards ring_ + addr_
   ConHash ring_;
   std::map<std::string, std::string> addr_;  // name -> ip:port

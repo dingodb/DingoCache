@@ -1,5 +1,6 @@
 #include "client/dfkv_c_api.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <limits>
 #include <memory>
@@ -366,6 +367,76 @@ int dfkv_batch_exist(dfkv_client_t c, const void* const* keys,
     const auto result = static_cast<KVClient*>(c)->BatchExist(valid_keys);
     for (size_t i = 0; i < positions.size() && i < result.size(); ++i)
       out_exist[positions[i]] = result[i] ? 1 : 0;
+    return 0;
+  });
+}
+
+int dfkv_batch_retain(dfkv_client_t c, const void* const* keys,
+                      const uint64_t* key_lens, int n,
+                      const dfkv_retain_options* opt, uint8_t* out_result) {
+  if (out_result && n > 0)
+    std::fill(out_result, out_result + n, static_cast<uint8_t>(DFKV_RET_ERROR));
+  return NoThrow(-1, [&] {
+    if (!c || n < 0 || !opt) return -1;
+    if (opt->struct_size < sizeof(dfkv_retain_options) ||
+        opt->mode > DFKV_RETAIN_REFRESH)
+      return -1;
+    if (n > 0 && (!keys || !key_lens || !out_result)) return -1;
+    std::vector<std::string> valid_keys;
+    std::vector<size_t> positions;
+    valid_keys.reserve(static_cast<size_t>(n));
+    positions.reserve(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+      if (!ValidKey(keys[i], key_lens[i])) continue;
+      positions.push_back(static_cast<size_t>(i));
+      valid_keys.push_back(CopyKey(keys[i], key_lens[i]));
+    }
+    KVClient::RetainRequest req;
+    req.ttl_s = opt->ttl_s;
+    req.mode = opt->mode;
+    req.no_debounce = (opt->flags & DFKV_RETAIN_F_NO_DEBOUNCE) != 0;
+    req.min_refresh_ms = opt->min_refresh_ms;
+    std::vector<uint8_t> result(valid_keys.size(), DFKV_RET_ERROR);
+    static_cast<KVClient*>(c)->BatchRetain(valid_keys, req, result.data());
+    for (size_t i = 0; i < positions.size(); ++i)
+      out_result[positions[i]] = result[i];
+    return 0;
+  });
+}
+
+int dfkv_retain_limits(dfkv_client_t c, int* supported, uint32_t* max_ttl_s) {
+  if (supported) *supported = -1;
+  if (max_ttl_s) *max_ttl_s = 0;
+  return NoThrow(-1, [&] {
+    if (!c) return -1;
+    static_cast<KVClient*>(c)->RetainLimits(supported, max_ttl_s);
+    return 0;
+  });
+}
+
+int dfkv_retain_precheck(dfkv_client_t c, const void* const* keys,
+                         const uint64_t* key_lens, int n,
+                         uint8_t min_headroom_pct, int* ok) {
+  if (ok) *ok = 0;
+  return NoThrow(-1, [&] {
+    if (!c || n < 0 || !ok) return -1;
+    if (n > 0 && (!keys || !key_lens)) return -1;
+    if (min_headroom_pct == 0) {
+      min_headroom_pct = 5;
+      if (const char* v = std::getenv("DFKV_RETAIN_PRECHECK_MIN_HEADROOM_PCT")) {
+        const long x = std::strtol(v, nullptr, 10);
+        if (x >= 0 && x <= 100) min_headroom_pct = static_cast<uint8_t>(x);
+      }
+    }
+    std::vector<std::string> valid_keys;
+    valid_keys.reserve(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i)
+      if (ValidKey(keys[i], key_lens[i]))
+        valid_keys.push_back(CopyKey(keys[i], key_lens[i]));
+    *ok = static_cast<KVClient*>(c)->RetainPrecheck(valid_keys,
+                                                    min_headroom_pct)
+              ? 1
+              : 0;
     return 0;
   });
 }

@@ -72,14 +72,15 @@ def _lookup(coordinator, tokens, hashes, exists):
             for md, group in zip(metadata, coordinator.kv_cache_groups, strict=True)
         ],
         client=SimpleNamespace(
-            batch_exist=lambda keys: [int(key in objects) for key in keys]
+            batch_exist=lambda keys: [int(key in objects) for key in keys],
+            batch_retain=lambda keys, ttl_s=0, mode=1, **kw: [int(key in objects) for key in keys],
         ),
         tp_size=1,
         num_kv_head=1,
         _kv_cache_groups=coordinator.kv_cache_groups,
         _record_kv_connector_operation=lambda *args, **kwargs: None,
     )
-    return DfkvStoreWorker.lookup(worker, tokens, hashes)
+    return DfkvStoreWorker.lookup(worker, tokens, hashes)[0]
 
 
 def test_equal_block_size_window_excludes_unneeded_prefix():

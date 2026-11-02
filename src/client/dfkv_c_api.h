@@ -92,6 +92,45 @@ int dfkv_batch_exist(dfkv_client_t c, const void* const* keys,
 int dfkv_batch_remove(dfkv_client_t c, const void* const* keys,
                       const uint64_t* key_lens, int n, int* out_ok);
 
+// ---- Retention: per-object minimum lifetime (kRetain) ----
+// SET protects committed objects for ttl_s (clamped by the server cap) from
+// capacity eviction; REFRESH renews with each object's stored TTL and doubles
+// as an existence check (on nodes without retention it falls back to Exist).
+#define DFKV_RETAIN_SET 0
+#define DFKV_RETAIN_REFRESH 1
+#define DFKV_RETAIN_F_NO_DEBOUNCE 1
+typedef struct dfkv_retain_options {
+  uint32_t struct_size;     // = sizeof(dfkv_retain_options)
+  uint32_t ttl_s;           // SET: requested TTL. REFRESH: debounce hint
+                            // (0 = always send; the server ignores it)
+  uint8_t mode;             // DFKV_RETAIN_SET | DFKV_RETAIN_REFRESH
+  uint8_t flags;            // DFKV_RETAIN_F_NO_DEBOUNCE
+  uint16_t reserved0;       // must be 0
+  uint32_t min_refresh_ms;  // debounce floor; 0 = ttl_s/10
+} dfkv_retain_options;
+// Per-key result codes. A key is a hit iff its code is 1,2,3,4,5,6 or 8.
+enum {
+  DFKV_RET_MISS = 0, DFKV_RET_HIT_UNPROTECTED = 1, DFKV_RET_PROTECTED_NEW = 2,
+  DFKV_RET_REFRESHED = 3, DFKV_RET_UPGRADED = 4, DFKV_RET_UNCHANGED = 5,
+  DFKV_RET_DENIED = 6, DFKV_RET_UNSUPPORTED = 7,
+  DFKV_RET_SKIPPED_DEBOUNCE = 8, DFKV_RET_ERROR = 9
+};
+// Fans out per owning node. out_result[i] is always written. Returns 0 when
+// the call was well formed (per-key codes may still be MISS/DENIED/ERROR).
+int dfkv_batch_retain(dfkv_client_t c, const void* const* keys,
+                      const uint64_t* key_lens, int n,
+                      const dfkv_retain_options* opt, uint8_t* out_result);
+// Ring-wide view: *supported 1 = every member supports kRetain, 0 = some
+// member does not, -1 = unknown; *max_ttl_s = smallest server cap (0 unless
+// supported). Probes members never heard from.
+int dfkv_retain_limits(dfkv_client_t c, int* supported, uint32_t* max_ttl_s);
+// Local precheck (no RPC): *ok = 1 iff every owner of the keys supports
+// retention and last reported headroom >= min_headroom_pct (0 = use
+// DFKV_RETAIN_PRECHECK_MIN_HEADROOM_PCT, default 5). Unheard nodes pass.
+int dfkv_retain_precheck(dfkv_client_t c, const void* const* keys,
+                         const uint64_t* key_lens, int n,
+                         uint8_t min_headroom_pct, int* ok);
+
 // Scatter-gather batch put: each of the n keys gathers num_bufs[i] non-contiguous
 // source buffers (ptrs[i][0..num_bufs[i]-1], sizes[i][...]) into one stored blob
 // (the in-order concatenation; segment boundaries are client-side only). Coalesces

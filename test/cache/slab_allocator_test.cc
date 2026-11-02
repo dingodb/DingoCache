@@ -1191,3 +1191,223 @@ TEST(SlabAllocator, SteadyLookupUpdateAndRemoveDoNotAllocateIndexTables) {
   EXPECT_EQ(after.table_allocations, steady.table_allocations);
   EXPECT_EQ(after.rehashes, steady.rehashes);
 }
+
+// ------------------------------------------------------------------ retention
+namespace {
+using RetainCode = SlabAllocator::RetainCode;
+using RetainMode = SlabAllocator::RetainMode;
+
+SlabAllocator::RetainOptions RetainOpts(uint64_t budget_bytes,
+                                        uint32_t max_ttl_s = 3600,
+                                        uint32_t class_pct = 100) {
+  SlabAllocator::RetainOptions o;
+  o.enabled = true;
+  o.budget_bytes = budget_bytes;
+  o.max_ttl_s = max_ttl_s;
+  o.class_pct = class_pct;
+  o.persist_min_delta_s = 60;
+  return o;
+}
+constexpr uint32_t kT0 = 1'000'000;  // arbitrary realtime origin
+}  // namespace
+
+TEST(SlabAllocatorRetention, ProtectedSlotSurvivesClassEviction) {
+  SlabAllocator a(Opts(2 * 4096, 1));  // 2 slots
+  a.ConfigureRetention(RetainOpts(1 << 20), kT0);
+  std::vector<BlockKey> ev;
+  SlotRef r;
+  ASSERT_TRUE(a.Put(Key("keep"), 4096, &r, &ev));
+  ASSERT_TRUE(a.Put(Key("other"), 4096, &r, &ev));
+  EXPECT_EQ(a.Retain(Key("keep"), 300, RetainMode::kSet, kT0).code,
+            RetainCode::kProtectedNew);
+  for (int i = 0; i < 8; ++i) {
+    ev.clear();
+    ASSERT_TRUE(a.Put(Key("churn" + std::to_string(i)), 4096, &r, &ev));
+    for (const BlockKey& k : ev) EXPECT_FALSE(k == Key("keep"));
+  }
+  EXPECT_TRUE(a.Contains(Key("keep")));
+  // With every unpinned slot protected, a Put has nothing to evict.
+  SlabAllocator b(Opts(2 * 4096, 1));
+  b.ConfigureRetention(RetainOpts(1 << 20), kT0);
+  ASSERT_TRUE(b.Put(Key("p1"), 4096, &r, &ev));
+  ASSERT_TRUE(b.Put(Key("p2"), 4096, &r, &ev));
+  EXPECT_EQ(b.Retain(Key("p1"), 60, RetainMode::kSet, kT0).code,
+            RetainCode::kProtectedNew);
+  EXPECT_EQ(b.Retain(Key("p2"), 60, RetainMode::kSet, kT0).code,
+            RetainCode::kProtectedNew);
+  ev.clear();
+  EXPECT_FALSE(b.Put(Key("p3"), 4096, &r, &ev));
+  EXPECT_TRUE(ev.empty());
+}
+
+TEST(SlabAllocatorRetention, ExpiryReturnsSlotToOrdinaryEviction) {
+  SlabAllocator a(Opts(2 * 4096, 1));
+  a.ConfigureRetention(RetainOpts(1 << 20), kT0);
+  std::vector<BlockKey> ev;
+  SlotRef r;
+  ASSERT_TRUE(a.Put(Key("p1"), 4096, &r, &ev));
+  ASSERT_TRUE(a.Put(Key("p2"), 4096, &r, &ev));
+  ASSERT_EQ(a.Retain(Key("p1"), 60, RetainMode::kSet, kT0).code,
+            RetainCode::kProtectedNew);
+  ASSERT_EQ(a.Retain(Key("p2"), 60, RetainMode::kSet, kT0).code,
+            RetainCode::kProtectedNew);
+  // Before the deadline (and within the 10 s bucket slack) nothing expires.
+  EXPECT_EQ(a.ExpireRetention(kT0 + 59), 0u);
+  EXPECT_EQ(a.ExpireRetention(kT0 + 65), 0u);
+  EXPECT_FALSE(a.Put(Key("p3"), 4096, &r, &ev));
+  // Strictly after the deadline's bucket both are released.
+  EXPECT_EQ(a.ExpireRetention(kT0 + 80), 2u);
+  EXPECT_EQ(a.GetRetentionStats().protected_slots, 0u);
+  EXPECT_EQ(a.GetRetentionStats().protected_bytes, 0u);
+  ev.clear();
+  EXPECT_TRUE(a.Put(Key("p3"), 4096, &r, &ev));
+  EXPECT_EQ(ev.size(), 1u);
+}
+
+TEST(SlabAllocatorRetention, RefreshRenewsWithStoredTtlAndNeverShortens) {
+  SlabAllocator a(Opts(4 * 4096, 1));
+  a.ConfigureRetention(RetainOpts(1 << 20), kT0);
+  std::vector<BlockKey> ev;
+  SlotRef r;
+  ASSERT_TRUE(a.Put(Key("k"), 4096, &r, &ev));
+  auto set = a.Retain(Key("k"), 300, RetainMode::kSet, kT0);
+  ASSERT_EQ(set.code, RetainCode::kProtectedNew);
+  EXPECT_EQ(set.until, kT0 + 300);
+  EXPECT_TRUE(set.persist);
+  // REFRESH ignores the request TTL and renews with the stored one.
+  auto ref = a.Retain(Key("k"), 3600, RetainMode::kRefresh, kT0 + 240);
+  EXPECT_EQ(ref.code, RetainCode::kRefreshed);
+  EXPECT_EQ(ref.until, kT0 + 540);
+  EXPECT_EQ(ref.ttl_s, 300u);
+  // A shorter SET never lowers the stored TTL or the deadline.
+  auto shorter = a.Retain(Key("k"), 60, RetainMode::kSet, kT0 + 240);
+  EXPECT_EQ(shorter.code, RetainCode::kUnchanged);
+  EXPECT_EQ(shorter.until, kT0 + 540);
+  // A longer SET upgrades and is always persisted.
+  auto up = a.Retain(Key("k"), 3600, RetainMode::kSet, kT0 + 242);
+  EXPECT_EQ(up.code, RetainCode::kUpgraded);
+  EXPECT_EQ(up.until, kT0 + 242 + 3600);
+  EXPECT_TRUE(up.persist);
+  // The superseded wheel entries do not release the later deadline.
+  EXPECT_EQ(a.ExpireRetention(kT0 + 600), 0u);
+  EXPECT_EQ(a.GetRetentionStats().protected_slots, 1u);
+  EXPECT_EQ(a.ExpireRetention(kT0 + 242 + 3600 + 20), 1u);
+  // After expiry a REFRESH re-protects with the stored TTL.
+  auto again = a.Retain(Key("k"), 0, RetainMode::kRefresh, kT0 + 5000);
+  EXPECT_EQ(again.code, RetainCode::kProtectedNew);
+  EXPECT_EQ(again.until, kT0 + 5000 + 3600);
+}
+
+TEST(SlabAllocatorRetention, TtlClampedToCapAndMissOnAbsentKey) {
+  SlabAllocator a(Opts(4 * 4096, 1));
+  a.ConfigureRetention(RetainOpts(1 << 20, /*max_ttl_s=*/600), kT0);
+  std::vector<BlockKey> ev;
+  SlotRef r;
+  ASSERT_TRUE(a.Put(Key("k"), 4096, &r, &ev));
+  auto out = a.Retain(Key("k"), 3600, RetainMode::kSet, kT0);
+  EXPECT_EQ(out.ttl_s, 600u);
+  EXPECT_EQ(out.until, kT0 + 600);
+  EXPECT_EQ(a.Retain(Key("absent"), 60, RetainMode::kSet, kT0).code,
+            RetainCode::kMiss);
+  // REFRESH of a never-protected key is a plain hit.
+  ASSERT_TRUE(a.Put(Key("plain"), 4096, &r, &ev));
+  EXPECT_EQ(a.Retain(Key("plain"), 60, RetainMode::kRefresh, kT0).code,
+            RetainCode::kHitUnprotected);
+}
+
+TEST(SlabAllocatorRetention, BudgetAndClassCapDeny) {
+  SlabAllocator a(Opts(4 * 4096, 1));
+  // Budget for exactly one 4 KiB slot.
+  a.ConfigureRetention(RetainOpts(4096), kT0);
+  std::vector<BlockKey> ev;
+  SlotRef r;
+  ASSERT_TRUE(a.Put(Key("a"), 4096, &r, &ev));
+  ASSERT_TRUE(a.Put(Key("b"), 4096, &r, &ev));
+  EXPECT_EQ(a.Retain(Key("a"), 60, RetainMode::kSet, kT0).code,
+            RetainCode::kProtectedNew);
+  EXPECT_EQ(a.Retain(Key("b"), 60, RetainMode::kSet, kT0).code,
+            RetainCode::kDenied);
+  // Renewing already-protected bytes is always allowed.
+  EXPECT_EQ(a.Retain(Key("a"), 0, RetainMode::kRefresh, kT0 + 30).code,
+            RetainCode::kRefreshed);
+  EXPECT_EQ(a.RetentionHeadroomPct(), 0u);
+
+  SlabAllocator c(Opts(4 * 4096, 1));
+  // Ample bytes, but at most 50% of the class's 4 slots.
+  c.ConfigureRetention(RetainOpts(1 << 20, 3600, /*class_pct=*/50), kT0);
+  for (const char* k : {"x", "y", "z"}) ASSERT_TRUE(c.Put(Key(k), 4096, &r, &ev));
+  EXPECT_EQ(c.Retain(Key("x"), 60, RetainMode::kSet, kT0).code,
+            RetainCode::kProtectedNew);
+  EXPECT_EQ(c.Retain(Key("y"), 60, RetainMode::kSet, kT0).code,
+            RetainCode::kProtectedNew);
+  EXPECT_EQ(c.Retain(Key("z"), 60, RetainMode::kSet, kT0).code,
+            RetainCode::kDenied);
+}
+
+TEST(SlabAllocatorRetention, RemoveIgnoresProtectionAndReleasesBudget) {
+  SlabAllocator a(Opts(4 * 4096, 1));
+  a.ConfigureRetention(RetainOpts(4096), kT0);
+  std::vector<BlockKey> ev;
+  SlotRef r;
+  ASSERT_TRUE(a.Put(Key("a"), 4096, &r, &ev));
+  ASSERT_TRUE(a.Put(Key("b"), 4096, &r, &ev));
+  ASSERT_EQ(a.Retain(Key("a"), 60, RetainMode::kSet, kT0).code,
+            RetainCode::kProtectedNew);
+  EXPECT_EQ(a.Remove(Key("a")), SlabAllocator::RemoveResult::kRemoved);
+  EXPECT_EQ(a.GetRetentionStats().protected_bytes, 0u);
+  EXPECT_EQ(a.Retain(Key("b"), 60, RetainMode::kSet, kT0).code,
+            RetainCode::kProtectedNew);
+  // The stale wheel entry of the removed key is harmless.
+  EXPECT_EQ(a.ExpireRetention(kT0 + 100), 1u);
+}
+
+TEST(SlabAllocatorRetention, WatermarkAndStealsSkipProtected) {
+  SlabAllocator a(Opts(2 * 4096, 2));  // 2 extents x 2 slots
+  a.ConfigureRetention(RetainOpts(1 << 20), kT0);
+  std::vector<BlockKey> ev;
+  SlotRef r;
+  for (const char* k : {"a", "b", "c", "d"}) ASSERT_TRUE(a.Put(Key(k), 4096, &r, &ev));
+  ASSERT_EQ(a.Retain(Key("a"), 300, RetainMode::kSet, kT0).code,
+            RetainCode::kProtectedNew);
+  ev.clear();
+  a.EvictColdToTarget(0, 16, &ev);
+  for (const BlockKey& k : ev) EXPECT_FALSE(k == Key("a"));
+  EXPECT_TRUE(a.Contains(Key("a")));
+  EXPECT_GE(a.GetRetentionStats().evict_skipped, 1u);
+  EXPECT_EQ(a.GetRetentionStats().extents_pinned, 1u);
+  // A different size class must steal around the protected extent.
+  ev.clear();
+  ASSERT_TRUE(a.Put(Key("big"), 8192, &r, &ev));
+  EXPECT_TRUE(a.Contains(Key("a")));
+}
+
+TEST(SlabAllocatorRetention, RestoreReappliesAndReclampsProtection) {
+  SlabAllocator a(Opts(2 * 4096, 1));
+  a.ConfigureRetention(RetainOpts(1 << 20, /*max_ttl_s=*/600), kT0);
+  std::vector<SlabAllocator::RestoreEntry> entries;
+  SlabAllocator::RestoreEntry live{Key("live"), 4096, 0, 0, 4096, kT0 + 3000, 3600};
+  SlabAllocator::RestoreEntry gone{Key("gone"), 4096, 0, 1, 4096, kT0 - 1, 300};
+  entries.push_back(live);
+  entries.push_back(gone);
+  ASSERT_TRUE(a.RestoreBulk(entries));
+  const auto st = a.GetRetentionStats();
+  EXPECT_EQ(st.protected_slots, 1u);
+  // Re-clamped to now + new cap; the stored TTL also drops to the cap.
+  auto out = a.Retain(Key("live"), 0, RetainMode::kRefresh, kT0);
+  EXPECT_EQ(out.ttl_s, 600u);
+  EXPECT_EQ(out.until, kT0 + 600);
+  // The expired record restores only its TTL, ready for a REFRESH.
+  EXPECT_EQ(a.Retain(Key("gone"), 0, RetainMode::kRefresh, kT0).code,
+            RetainCode::kProtectedNew);
+}
+
+TEST(SlabAllocatorRetention, DisabledRetentionIsInert) {
+  SlabAllocator a(Opts(2 * 4096, 1));
+  std::vector<BlockKey> ev;
+  SlotRef r;
+  ASSERT_TRUE(a.Put(Key("k"), 4096, &r, &ev));
+  EXPECT_EQ(a.Retain(Key("k"), 300, RetainMode::kSet, kT0).code,
+            RetainCode::kHitUnprotected);
+  EXPECT_EQ(a.ExpireRetention(kT0 + 1000), 0u);
+  EXPECT_EQ(a.RetentionHeadroomPct(), 0u);
+}

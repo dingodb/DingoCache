@@ -211,7 +211,9 @@ void KvNodeServer::InitRamTier() {
   };
   auto tier = std::make_unique<RamTier>(
       o, [this](const BlockKey& k, char* d, size_t l, size_t cap) {
-        return group_.CacheDirect(k, d, l, cap) == Status::kOk;
+        const bool ok = group_.CacheDirect(k, d, l, cap) == Status::kOk;
+        ApplyPendingRetain(k, ok);
+        return ok;
       });
   // Batched sink: a flush worker's whole dequeue rides one lock-amortized
   // (and, with a uring build, one-submit) store visit per disk.
@@ -232,7 +234,10 @@ void KvNodeServer::InitRamTier() {
           m.latency.Observe(seconds);
         });
     std::vector<bool> ok(items.size(), false);
-    for (size_t i = 0; i < sts.size(); ++i) ok[i] = (sts[i] == Status::kOk);
+    for (size_t i = 0; i < sts.size(); ++i) {
+      ok[i] = (sts[i] == Status::kOk);
+      ApplyPendingRetain(items[i].key, ok[i]);
+    }
     return ok;
   });
   if (tier->ok()) {
@@ -383,6 +388,50 @@ std::string KvNodeServer::MetricsText() const {
   metric("dfkv_cache_miss_total", "counter", "Range (GET) ops that missed", m_cache_miss());
   metric("dfkv_exist_hit_total", "counter", "Exist checks that hit", m_exist_hit());
   metric("dfkv_exist_miss_total", "counter", "Exist checks that missed", m_exist_miss());
+  {
+    static const char* kModes[2] = {"set", "refresh"};
+    static const char* kResults[8] = {"miss",      "hit_unprotected",
+                                      "protected", "refreshed",
+                                      "upgraded",  "unchanged",
+                                      "denied",    "other"};
+    s += "# HELP dfkv_retain_keys_total kRetain per-key outcomes by mode and result\n";
+    s += "# TYPE dfkv_retain_keys_total counter\n";
+    for (int m = 0; m < 2; ++m)
+      for (int r = 0; r < 8; ++r)
+        s += "dfkv_retain_keys_total" +
+             braces(std::string("mode=\"") + kModes[m] + "\",result=\"" +
+                    kResults[r] + "\"") +
+             " " + std::to_string(rd(retain_keys_[m][r])) + "\n";
+    metric("dfkv_retain_requests_total", "counter", "kRetain requests served",
+           rd(retain_requests_));
+    metric("dfkv_retain_pending_applied_total", "counter",
+           "RAM write-back SETs applied when the flush committed",
+           rd(pending_retain_applied_));
+    const auto rs = group_.RetentionStats();
+    metric("dfkv_retain_enabled", "gauge", "Retention enabled on every disk",
+           group_.RetainEnabled() ? 1 : 0);
+    metric("dfkv_retain_max_ttl_seconds", "gauge", "Cap on any applied TTL",
+           group_.RetainMaxTtl());
+    metric("dfkv_retain_budget_bytes", "gauge", "Protected-bytes budget",
+           rs.budget_bytes);
+    metric("dfkv_retained_bytes", "gauge", "Slot bytes currently protected",
+           rs.protected_bytes);
+    metric("dfkv_retained_slots", "gauge", "Residents currently protected",
+           rs.protected_slots);
+    metric("dfkv_retain_headroom_pct", "gauge",
+           "Remaining retention budget, minimum across disks",
+           group_.RetainHeadroomPct());
+    metric("dfkv_retain_expired_total", "counter",
+           "Protections released by the expiry wheel", rs.expired);
+    metric("dfkv_evict_skipped_protected_total", "counter",
+           "Eviction candidates skipped because they are protected",
+           rs.evict_skipped);
+    metric("dfkv_slab_extents_pinned_by_retention", "gauge",
+           "Extents holding at least one protected resident", rs.extents_pinned);
+    metric("dfkv_retain_wheel_entries", "gauge",
+           "Pending expiry-wheel entries (includes superseded ones)",
+           rs.wheel_entries);
+  }
   metric("dfkv_remove_ok_total", "counter", "Remove ops that dropped a block", m_remove_ok());
   metric("dfkv_remove_miss_total", "counter", "Remove ops for an absent block", m_remove_miss());
   metric("dfkv_bytes_written_total", "counter", "Payload bytes written",
@@ -1002,6 +1051,9 @@ Status KvNodeServer::ProcessRequestForKey(
       if (samp) exist_lat_.Observe(NowSec() - t0);
       break;
     }
+    case WireOp::kRetain:
+      st = ProcessRetain(key, length, payload, payload_len, out_data);
+      break;
     case WireOp::kLookup: {
       ValueMetadata metadata;
       st = LookupForKey(key, &metadata);
@@ -1053,6 +1105,84 @@ Status KvNodeServer::ProcessRequestForKey(
   return st;
 }
 
+
+namespace {
+uint32_t RetainWallNowS() {
+  return static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now()
+                                       .time_since_epoch())
+                                   .count());
+}
+}  // namespace
+
+Status KvNodeServer::ProcessRetain(const BlockKey& prefix_key, uint64_t count,
+                                   const char* payload, uint64_t payload_len,
+                                   std::string* out_data) {
+  // Behave exactly like an older node (unknown op) when retention is off.
+  if (out_data == nullptr || !group_.RetainEnabled()) return Status::kInvalid;
+  if (count == 0 || count > kRetainMaxKeys || payload == nullptr ||
+      payload_len != RetainPayloadBytes(static_cast<size_t>(count)))
+    return Status::kInvalid;
+  const uint32_t ttl_s = net::GetU32(payload);
+  const uint8_t mode = static_cast<uint8_t>(payload[4]);
+  if (mode > kRetainModeRefresh) return Status::kInvalid;
+  retain_requests_.fetch_add(1, std::memory_order_relaxed);
+  const uint32_t now = RetainWallNowS();
+  const uint32_t max_ttl = group_.RetainMaxTtl();
+  out_data->assign(static_cast<size_t>(count) + kRetainTrailerBytes, '\0');
+  const char* k = payload + kRetainHeaderBytes;
+  for (uint64_t i = 0; i < count; ++i, k += kRetainKeyBytes) {
+    const BlockKey key{net::GetU64(k), net::GetU64(k + 8),
+                       prefix_key.tenant_hash};
+    uint8_t code = group_.Retain(key, ttl_s, mode, now);
+    if (code == StoreEngine::kRetainUnsupported) return Status::kInvalid;
+    // Write-back value not flushed yet: a hit. A SET is parked and applied
+    // when the flush commits the disk slot.
+    size_t ram_len = 0;
+    if (code == static_cast<uint8_t>(SlabAllocator::RetainCode::kMiss) && ram_ &&
+        ram_->Lookup(key, &ram_len)) {
+      code = static_cast<uint8_t>(SlabAllocator::RetainCode::kHitUnprotected);
+      if (mode == kRetainModeSet && ttl_s != 0) {
+        std::lock_guard<std::mutex> lk(pending_retain_mu_);
+        auto it = pending_retain_.find(key);
+        if (it != pending_retain_.end()) {
+          it->second = std::max(it->second, std::min(ttl_s, max_ttl));
+          code = static_cast<uint8_t>(SlabAllocator::RetainCode::kProtectedNew);
+        } else if (pending_retain_.size() < kPendingRetainMax) {
+          pending_retain_.emplace(key, std::min(ttl_s, max_ttl));
+          code = static_cast<uint8_t>(SlabAllocator::RetainCode::kProtectedNew);
+        } else {
+          code = static_cast<uint8_t>(SlabAllocator::RetainCode::kDenied);
+        }
+      }
+    }
+    (*out_data)[static_cast<size_t>(i)] = static_cast<char>(code);
+    retain_keys_[mode][code < 8 ? code : 7].fetch_add(
+        1, std::memory_order_relaxed);
+  }
+  RetainTrailer trailer;
+  trailer.server_now_s = now;
+  trailer.max_ttl_s = max_ttl;
+  trailer.headroom_pct = static_cast<uint8_t>(
+      std::min<uint32_t>(group_.RetainHeadroomPct(), 100));
+  EncodeRetainTrailer(&(*out_data)[static_cast<size_t>(count)], trailer);
+  return Status::kOk;
+}
+
+void KvNodeServer::ApplyPendingRetain(const BlockKey& key, bool flushed) {
+  uint32_t ttl_s = 0;
+  {
+    std::lock_guard<std::mutex> lk(pending_retain_mu_);
+    if (pending_retain_.empty()) return;
+    auto it = pending_retain_.find(key);
+    if (it == pending_retain_.end()) return;
+    ttl_s = it->second;
+    pending_retain_.erase(it);
+  }
+  if (!flushed) return;
+  group_.Retain(key, ttl_s, kRetainModeSet, RetainWallNowS());
+  pending_retain_applied_.fetch_add(1, std::memory_order_relaxed);
+}
 
 Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,
                                      uint64_t length, char* dst,

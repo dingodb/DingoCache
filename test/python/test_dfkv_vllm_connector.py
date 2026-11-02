@@ -288,14 +288,14 @@ class _LookupClient:
         self.discarded: list[str] = []
         self.closed = False
 
-    def lookup(self, request_id, token_len, block_hashes, non_block=False):
+    def lookup(self, request_id, token_len, block_hashes, non_block=False,
+               retain_ttl_s=0):
         self.calls.append(
             (request_id, token_len, tuple(bytes(value) for value in block_hashes), non_block)
         )
         values = self.results[request_id]
-        if len(values) == 1:
-            return values[0]
-        return values.pop(0)
+        value = values[0] if len(values) == 1 else values.pop(0)
+        return None if value is None else (value, 0)
 
     def discard(self, request_id: str) -> None:
         self.discarded.append(request_id)

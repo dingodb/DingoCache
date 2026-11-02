@@ -78,6 +78,7 @@ def test_noallocation_prefill_saves_state_before_page_recycling(hybrid_workers, 
         mamba_shared_prefix_checkpoint=False,
     )
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._retention = {}
     for name, value in dict(
         kv_role="kv_producer", _block_size=BLOCK,
         _unfinished_requests={request.request_id: (request, ([], [], []))},
@@ -133,7 +134,7 @@ def test_noallocation_prefill_saves_state_before_page_recycling(hybrid_workers, 
     # Verify every saved boundary, not merely the final hit or attention stripe.
     for depth in saves:
         consumer, target = create(0, num_blocks=40)
-        assert consumer.lookup(depth, hashes) == depth
+        assert consumer.lookup(depth, hashes)[0] == depth
         get = consumer.client.batch_get_auto_sg
         transfers = []
 
@@ -174,6 +175,7 @@ def test_noallocation_prefill_kv_events_carry_block_token_ids(hybrid_workers):
         block_hashes=_hashes(3),
     )
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._retention = {}
     for name, value in dict(
         kv_role="kv_producer", _block_size=BLOCK, client=MagicMock(),
         load_specs={}, _failed_load_req_ids=set(), _preempted_req_ids=set(),
@@ -267,6 +269,7 @@ def test_scheduler_attaches_the_engine_boundary_state_hand_off(offloads, expecte
     from dfkv_vllm.scheduler import DfkvStoreScheduler
 
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._retention = {}
     request = SimpleNamespace(request_id="r", block_hashes=_hashes(3))
     for name, value in dict(
         kv_role="kv_producer", _block_size=BLOCK, client=MagicMock(),
@@ -312,7 +315,7 @@ def test_state_is_saved_from_the_block_the_engine_hands_off(hybrid_workers):
                         state_blocks={1: {2 * BLOCK: 1}, 2: {2 * BLOCK: 1}})
     for rank in range(4):
         consumer, buffers = create(rank)
-        assert consumer.lookup(2 * BLOCK, hashes) == 2 * BLOCK
+        assert consumer.lookup(2 * BLOCK, hashes)[0] == 2 * BLOCK
         consumer.kv_recv_thread.load_request_sync(ReqMeta(
             req_id=f"load-{rank}", token_len_chunk=2 * BLOCK,
             block_ids=([1, 2], [3], [3]), block_hashes=hashes,
@@ -337,7 +340,7 @@ def test_state_without_a_trusted_block_fails_closed(hybrid_workers, meta, admitt
     assert stored
     assert any(b"mamba" in key for key in stored) is admitted
     consumer, _ = create(0)
-    assert consumer.lookup(2 * BLOCK, hashes) == (2 * BLOCK if admitted else 0)
+    assert consumer.lookup(2 * BLOCK, hashes)[0] == (2 * BLOCK if admitted else 0)
 
 
 def test_shorter_prefix_requires_its_own_state_checkpoints():
@@ -373,7 +376,8 @@ def test_shorter_prefix_requires_its_own_state_checkpoints():
             SimpleNamespace(metadata=md, block_size=BLOCK) for md in metadata
         ],
         client=SimpleNamespace(
-            batch_exist=lambda keys: [int(key in store) for key in keys]
+            batch_exist=lambda keys: [int(key in store) for key in keys],
+            batch_retain=lambda keys, ttl_s=0, mode=1, **kw: [int(key in store) for key in keys],
         ),
         tp_size=1,
         num_kv_head=1,
@@ -382,13 +386,13 @@ def test_shorter_prefix_requires_its_own_state_checkpoints():
         ],
         _record_kv_connector_operation=lambda *args, **kwargs: None,
     )
-    assert DfkvStoreWorker.lookup(worker, 2 * BLOCK, hashes) == 0
+    assert DfkvStoreWorker.lookup(worker, 2 * BLOCK, hashes)[0] == 0
     # An actual checkpoint at the earlier boundary makes that prefix safe.
     store.update(
         PoolKey(metadata[group], hashes[0].hex()).to_bytes()
         for group in range(1, 5)
     )
-    assert DfkvStoreWorker.lookup(worker, 2 * BLOCK, hashes) == BLOCK
+    assert DfkvStoreWorker.lookup(worker, 2 * BLOCK, hashes)[0] == BLOCK
 
 
 class _MemoryClient:
@@ -406,6 +410,9 @@ class _MemoryClient:
 
     def register_memory(self, base, size):
         pass
+
+    def batch_retain(self, keys, ttl_s=0, mode=1, **kw):
+        return [1 if e == 1 else 0 for e in self.batch_exist(keys)]
 
     def batch_exist(self, keys):
         return [int((self.namespace, key) in self.objects) for key in keys]
@@ -595,7 +602,7 @@ def test_hybrid_state_round_trip_preserves_every_tp_payload(hybrid_workers, dcp)
 
     for rank in range(4):
         consumer, buffers = create(rank, dcp=dcp)
-        assert consumer.lookup(2 * BLOCK, hashes) == 2 * BLOCK
+        assert consumer.lookup(2 * BLOCK, hashes)[0] == 2 * BLOCK
         request = ReqMeta(
             req_id=f"load-{rank}", token_len_chunk=2 * BLOCK,
             block_ids=([1, 2], [2], [2]), block_hashes=hashes,
@@ -619,7 +626,7 @@ def test_hybrid_state_round_trip_preserves_every_tp_payload(hybrid_workers, dcp)
     objects[victim.client.namespace, legacy_key] = objects.pop((victim.client.namespace, key))
     for rank in range(4):
         consumer, _ = create(rank, dcp=dcp)
-        assert consumer.lookup(2 * BLOCK, hashes) == 0
+        assert consumer.lookup(2 * BLOCK, hashes)[0] == 0
 
 
 @pytest.mark.parametrize("client_ranks", ["1", "4"])
@@ -644,7 +651,7 @@ def test_replicated_mla_round_trip_with_converged_or_striped_writers(
         consumer, buffers = create(rank, states=False)
         # Producer-only elided clients are lazily created when loading.
         consumer._ensure_client_for_load()
-        assert consumer.lookup(2 * BLOCK, hashes) == 2 * BLOCK
+        assert consumer.lookup(2 * BLOCK, hashes)[0] == 2 * BLOCK
         consumer.kv_recv_thread.load_request_sync(ReqMeta(
             req_id=f"mla-load-{rank}", token_len_chunk=2 * BLOCK,
             block_ids=([1, 2],), block_hashes=hashes,
@@ -677,7 +684,7 @@ def test_hybrid_lookup_covers_every_smaller_attention_block(hybrid_workers, dcp)
 
     for rank in range(4):
         consumer, buffers = create(rank, dcp=dcp, attention_block_size=16 // dcp, num_blocks=5)
-        assert consumer.lookup(BLOCK, hashes) == BLOCK
+        assert consumer.lookup(BLOCK, hashes)[0] == BLOCK
         request = ReqMeta(
             req_id=f"mixed-load-{rank}", token_len_chunk=BLOCK,
             block_ids=([1, 2, 3, 4], [1], [1]), block_hashes=hashes,
@@ -713,7 +720,7 @@ def test_nonpersistent_scratch_does_not_constrain_or_overwrite_prefix_cache(hybr
     for rank in range(4):
         consumer, buffers = create(rank, scratch=True)
         buffers["scratch"].fill_(99)
-        assert consumer.lookup(BLOCK, hashes) == BLOCK
+        assert consumer.lookup(BLOCK, hashes)[0] == BLOCK
         request = ReqMeta(
             req_id=f"scratch-load-{rank}", token_len_chunk=BLOCK,
             block_ids=([1], [2], [2], [0]), block_hashes=hashes,
@@ -812,7 +819,7 @@ def test_wrapped_attention_uses_engine_dcp_hash_geometry(hybrid_workers):
 
     for rank in range(4):
         consumer, buffers = create(rank, dcp=2, wrapped_attention=True)
-        assert consumer.lookup(2 * BLOCK, hashes) == 2 * BLOCK
+        assert consumer.lookup(2 * BLOCK, hashes)[0] == 2 * BLOCK
         request = ReqMeta(
             req_id=f"wrapped-load-{rank}", token_len_chunk=2 * BLOCK,
             block_ids=([1, 2], [2], [2]), block_hashes=hashes,
@@ -843,7 +850,7 @@ def test_unallocated_source_is_not_published_as_an_immutable_object(hybrid_worke
     present = PoolKey(metadata, hashes[1].hex()).to_bytes()
     assert (producer.client.namespace, missing) not in objects
     assert objects[producer.client.namespace, present] == bytes([17]) * BLOCK
-    assert producer.lookup(2 * BLOCK, hashes) == 0
+    assert producer.lookup(2 * BLOCK, hashes)[0] == 0
 
 
 def test_unallocated_destination_fails_without_overwriting_null_memory(hybrid_workers):

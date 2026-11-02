@@ -294,3 +294,82 @@ TEST_F(KVClientTest, TwoNodeConsistentHashCrossNodeRead) {
     EXPECT_EQ(out, want);
   }
 }
+
+// kRetain end to end over TCP: SET protects, REFRESH renews and doubles as an
+// existence check, limits and precheck reflect the node's reply trailer.
+TEST_F(KVClientTest, RetainSetRefreshLimitsAndPrecheck) {
+  // Retention lives in the slab engine; unit tests default to the file one.
+  const char* prev = std::getenv("DFKV_STORE_ENGINE");
+  const std::string saved = prev ? prev : "";
+  ::setenv("DFKV_STORE_ENGINE", "slab", 1);
+  nodes_.push_back(StartNode("ret1"));
+  if (prev) ::setenv("DFKV_STORE_ENGINE", saved.c_str(), 1);
+  else ::unsetenv("DFKV_STORE_ENGINE");
+  KVClient c({{"a", nodes_[0]->addr}}, SelfHdr());
+  int supported = -2;
+  uint32_t max_ttl = 0;
+  c.RetainLimits(&supported, &max_ttl);
+  EXPECT_EQ(supported, 1);
+  EXPECT_EQ(max_ttl, 3600u);
+  std::string v(1024, 'p');
+  std::vector<std::string> keys = {"glm-5.1/ret_0", "glm-5.1/ret_1",
+                                   "glm-5.1/ret_absent"};
+  ASSERT_TRUE(c.Put(keys[0], v.data(), v.size()));
+  ASSERT_TRUE(c.Put(keys[1], v.data(), v.size()));
+  uint8_t out[3] = {99, 99, 99};
+  KVClient::RetainRequest set;
+  set.ttl_s = 7200;  // clamped by the server cap
+  set.mode = 0;
+  c.BatchRetain(keys, set, out);
+  EXPECT_EQ(out[0], KVClient::kRetProtectedNew);
+  EXPECT_EQ(out[1], KVClient::kRetProtectedNew);
+  EXPECT_EQ(out[2], KVClient::kRetMiss);
+  // REFRESH without a debounce hint always goes to the node.
+  KVClient::RetainRequest refresh;
+  refresh.mode = 1;
+  c.BatchRetain(keys, refresh, out);
+  EXPECT_TRUE(out[0] == KVClient::kRetUnchanged ||
+              out[0] == KVClient::kRetRefreshed);
+  EXPECT_EQ(out[2], KVClient::kRetMiss);
+  // With a TTL hint, keys protected moments ago are skipped locally.
+  refresh.ttl_s = 300;
+  c.BatchRetain(keys, refresh, out);
+  EXPECT_EQ(out[0], KVClient::kRetSkippedDebounce);
+  EXPECT_EQ(out[1], KVClient::kRetSkippedDebounce);
+  EXPECT_EQ(out[2], KVClient::kRetMiss);
+  EXPECT_TRUE(c.RetainPrecheck(keys, 5));
+  EXPECT_FALSE(c.RetainPrecheck(keys, 101));  // headroom is at most 100
+  const std::string metrics = nodes_[0]->srv->MetricsText();
+  EXPECT_NE(metrics.find("dfkv_retained_slots 2"), std::string::npos);
+  EXPECT_NE(metrics.find("dfkv_retain_enabled 1"), std::string::npos);
+}
+
+// A node without retention answers kRetain like an unknown op: REFRESH falls
+// back to Exist with exact hit/miss, SET reports unsupported, limits say 0.
+TEST_F(KVClientTest, RetainAgainstNodeWithoutRetentionFallsBack) {
+  ::setenv("DFKV_RETAIN_ENABLE", "0", 1);
+  nodes_.push_back(StartNode("ret_off"));
+  ::unsetenv("DFKV_RETAIN_ENABLE");
+  KVClient c({{"a", nodes_[0]->addr}}, SelfHdr());
+  std::string v(512, 'o');
+  std::vector<std::string> keys = {"glm-5.1/off_0", "glm-5.1/off_absent"};
+  ASSERT_TRUE(c.Put(keys[0], v.data(), v.size()));
+  uint8_t out[2] = {99, 99};
+  KVClient::RetainRequest refresh;
+  refresh.mode = 1;
+  c.BatchRetain(keys, refresh, out);
+  EXPECT_EQ(out[0], KVClient::kRetHitUnprotected);
+  EXPECT_EQ(out[1], KVClient::kRetMiss);
+  KVClient::RetainRequest set;
+  set.ttl_s = 300;
+  c.BatchRetain(keys, set, out);
+  EXPECT_EQ(out[0], KVClient::kRetUnsupported);
+  int supported = -2;
+  uint32_t max_ttl = 1;
+  c.RetainLimits(&supported, &max_ttl);
+  EXPECT_EQ(supported, 0);
+  EXPECT_EQ(max_ttl, 0u);
+  EXPECT_FALSE(c.RetainPrecheck(keys, 5));
+  // The connection survived the unknown op: ordinary traffic still works.
+  EXPECT_TRUE(c.Exist(keys[0]));
+}

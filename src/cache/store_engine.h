@@ -347,6 +347,19 @@ class StoreEngine {
   virtual uint64_t Evictions() const = 0;
   virtual uint64_t EvictedBytes() const = 0;
   virtual const std::string& Dir() const = 0;
+
+  // Minimum-lifetime retention (RETAIN). Engines without it report
+  // unsupported; the node then answers kRetain as an unknown op.
+  static constexpr uint8_t kRetainUnsupported = 0xff;
+  virtual bool RetainEnabled() const { return false; }
+  // mode: 0 = SET, 1 = REFRESH. Returns the RetainCode value (0..6).
+  virtual uint8_t Retain(const BlockKey& key, uint32_t ttl_s, uint8_t mode,
+                         uint32_t now_s) {
+    (void)key; (void)ttl_s; (void)mode; (void)now_s;
+    return kRetainUnsupported;
+  }
+  virtual uint32_t RetainHeadroomPct() const { return 0; }
+  virtual uint32_t RetainMaxTtl() const { return 0; }
 };
 
 }  // namespace dfkv

@@ -35,6 +35,21 @@ from .worker import (
 
 logger = init_logger(__name__)
 
+# kv_transfer_params key carrying the per-request retention TTL (seconds),
+# injected by the gateway; absent or 0 = best-effort.
+RETENTION_TTL_PARAM = "dfkv_retention_ttl_s"
+USAGE_PARAM = "dfkv_cache_usage"
+
+
+def _requested_retention_ttl(request: Request) -> int:
+    params = getattr(request, "kv_transfer_params", None)
+    if not isinstance(params, dict):
+        return 0
+    value = params.get(RETENTION_TTL_PARAM, 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return 0
+    return min(value, 0xFFFFFFFF)
+
 
 def _new_req_prefill_tokens(request: NewRequestData) -> list[int]:
     """Tokens this prefill will compute KV for.
@@ -87,6 +102,9 @@ class DfkvStoreScheduler:
         self._unfinished_request_ids: set[str] = set()
         self._allocated_req_ids: set[str] = set()
         self._failed_load_req_ids: set[str] = set()
+        # req_id -> (requested_ttl_s, applied_ttl_s, cached_tokens) for TTL
+        # requests; the applied TTL comes back from the worker's lookup.
+        self._retention: dict[str, tuple[int, int, int]] = {}
 
     def get_num_new_matched_tokens(
         self,
@@ -109,18 +127,30 @@ class DfkvStoreScheduler:
         # Leave the sampling tail before lookup: shortening an already
         # validated hit can select different recurrent-state checkpoint keys.
         token_len = (request.num_tokens - 1) // self._block_size * self._block_size
+        requested_ttl = _requested_retention_ttl(request)
         if token_len < self._block_size:
+            if requested_ttl:
+                self._retention[request.request_id] = (
+                    requested_ttl, 0, num_computed_tokens)
             return 0, False
 
         _lk0 = time.perf_counter()
-        num_external_hit_tokens = self.client.lookup(
+        lookup = self.client.lookup(
             request.request_id,
             token_len,
             request.block_hashes,
             non_block=self.lookup_async,
+            retain_ttl_s=requested_ttl,
         )
-        if num_external_hit_tokens is None:
+        if lookup is None:
             return None, False
+        num_external_hit_tokens, applied_ttl = lookup
+        if requested_ttl:
+            self._retention[request.request_id] = (
+                requested_ttl,
+                applied_ttl if self.kv_role != "kv_consumer" else 0,
+                max(num_computed_tokens, num_external_hit_tokens),
+            )
         logger.debug(
             "dfkv matched: req=%s tokens=%d computed=%d lookup_ms=%.1f hit_tokens=%d",
             request.request_id, request.num_tokens, num_computed_tokens,
@@ -222,6 +252,7 @@ class DfkvStoreScheduler:
             self._unfinished_request_ids.discard(finished_req_id)
             self._preempted_req_ids.discard(finished_req_id)
             self._failed_load_req_ids.discard(finished_req_id)
+            self._retention.pop(finished_req_id, None)
 
         preempted_ids = scheduler_output.preempted_req_ids or set()
         self._preempted_req_ids.update(preempted_ids)
@@ -431,6 +462,10 @@ class DfkvStoreScheduler:
 
         self._attach_state_blocks(meta, scheduler_output)
         self._allocated_req_ids.clear()
+        for req_meta in meta.requests:
+            retention = self._retention.get(req_meta.req_id)
+            if retention is not None:
+                req_meta.retain_ttl_s = retention[1]
         return meta
 
     @staticmethod
@@ -468,14 +503,15 @@ class DfkvStoreScheduler:
         self.client.discard(request.request_id)
         self._failed_load_req_ids.discard(request.request_id)
         self.load_specs.pop(request.request_id, None)
+        usage = self._retention_usage(request)
         if self.kv_role == "kv_consumer":
-            return False, None
+            return False, usage
         tracker = self._request_trackers.get(request.request_id)
         # Missing tracker can happen when the request is aborted before the
         # connector observes the normal finished lifecycle or is preempted
         # before finishing.
         if tracker is None or tracker.num_saved_tokens <= 0:
-            return False, None
+            return False, usage
         total_blocks = sum(len(g) for g in block_ids)
         delay_free_blocks = total_blocks > 0
         if delay_free_blocks:
@@ -484,7 +520,26 @@ class DfkvStoreScheduler:
                 total_blocks,
                 request.request_id,
             )
-        return delay_free_blocks, None
+        return delay_free_blocks, usage
+
+    def _retention_usage(self, request: Request) -> dict[str, Any] | None:
+        """Usage for a TTL request, returned in the response's
+        kv_transfer_params. ``cache_write_tokens`` is the block-aligned part of
+        the prompt not served from cache (what the gateway bills as a write);
+        ``applied_ttl_s`` is 0 when the writes stayed best-effort."""
+        retention = self._retention.pop(request.request_id, None)
+        if retention is None:
+            return None
+        _, applied_ttl, cached = retention
+        prompt = getattr(request, "num_prompt_tokens", 0) or 0
+        aligned = prompt // self._block_size * self._block_size
+        return {
+            USAGE_PARAM: {
+                "cached_tokens": int(cached),
+                "cache_write_tokens": max(0, aligned - int(cached)),
+                "applied_ttl_s": int(applied_ttl),
+            }
+        }
 
     def close(self) -> None:
         """Close the scheduler-side lookup channel once."""

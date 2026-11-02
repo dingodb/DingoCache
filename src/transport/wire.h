@@ -31,9 +31,10 @@ enum class WireOp : uint8_t {
   kListTopology = 15,  // MDS: all members, including health-degraded nodes
   kPullRange = 16,     // RDMA v2: prepare one connection-private pull slot
   kPullRelease = 17,  // RDMA v2: release slot after initiator READ terminal
-  kLeasePut = 18      // RDMA v2: request one per-op staging lease; the reply
+  kLeasePut = 18,     // RDMA v2: request one per-op staging lease; the reply
                       // carries the leased range, the client then sends the
                       // object as an ordinary v2 multi/single-window PUT WRITE
+  kRetain = 19        // batched minimum-lifetime control op (see below)
 };
 
 constexpr uint8_t kNativeProtoTcp = 6;
@@ -150,6 +151,66 @@ inline bool DecodeResp(const char* p, Status* st, uint64_t* data_len,
                        uint64_t* value_len = nullptr) {
   return DecodeRespVersion(p, kNativeProtoTcp, st, data_len, max_data,
                            value_len);
+}
+
+// ---- kRetain (op 19) ----
+// A control op on the TCP lane and the RDMA control lane; the data path is
+// untouched. The prefix key carries only the tenant hash (digests 0) and
+// `length` = key count. A node without retention answers kInvalid, exactly
+// like any unknown op, and keeps the connection.
+//   payload : u32 ttl_s | u8 mode (0 SET, 1 REFRESH) | u8 flags (0)
+//             | u16 reserved (0) | count x {u64 digest_hi, u64 digest_lo}
+//   reply   : count x u8 RetainCode | u32 server_now_s | u32 max_ttl_s
+//             | u8 headroom_pct | 3 x u8 reserved (0)
+// The server clamps ttl_s to max_ttl_s. headroom_pct is the node's remaining
+// retention budget after this request (0..100).
+constexpr size_t kRetainHeaderBytes = 8;
+constexpr size_t kRetainKeyBytes = 16;
+constexpr size_t kRetainTrailerBytes = 12;
+// Fits one RDMA control frame (32 KiB) in both directions.
+constexpr size_t kRetainMaxKeys = 1024;
+constexpr uint8_t kRetainModeSet = 0;
+constexpr uint8_t kRetainModeRefresh = 1;
+
+struct RetainTrailer {
+  uint32_t server_now_s = 0;
+  uint32_t max_ttl_s = 0;
+  uint8_t headroom_pct = 0;
+};
+
+inline size_t RetainPayloadBytes(size_t count) {
+  return kRetainHeaderBytes + count * kRetainKeyBytes;
+}
+
+inline void EncodeRetainPayload(char* p, uint32_t ttl_s, uint8_t mode,
+                                const BlockKey* keys, size_t count) {
+  net::PutU32(p, ttl_s);
+  p[4] = static_cast<char>(mode);
+  p[5] = 0;
+  p[6] = 0;
+  p[7] = 0;
+  char* k = p + kRetainHeaderBytes;
+  for (size_t i = 0; i < count; ++i, k += kRetainKeyBytes) {
+    net::PutU64(k, keys[i].digest_hi);
+    net::PutU64(k + 8, keys[i].digest_lo);
+  }
+}
+
+inline void EncodeRetainTrailer(char* p, const RetainTrailer& t) {
+  net::PutU32(p, t.server_now_s);
+  net::PutU32(p + 4, t.max_ttl_s);
+  p[8] = static_cast<char>(t.headroom_pct);
+  p[9] = 0;
+  p[10] = 0;
+  p[11] = 0;
+}
+
+inline RetainTrailer DecodeRetainTrailer(const char* p) {
+  RetainTrailer t;
+  t.server_now_s = net::GetU32(p);
+  t.max_ttl_s = net::GetU32(p + 4);
+  t.headroom_pct = static_cast<uint8_t>(p[8]);
+  return t;
 }
 
 
