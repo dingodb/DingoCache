@@ -92,6 +92,9 @@ def _lookup_hit_tokens(
         def __init__(self, present: set[bytes]):
             self._present = present
 
+        def batch_retain(self, keys, ttl_s=0, mode=1, **kw):
+            return [1 if e == 1 else 0 for e in self.batch_exist(keys)]
+
         def batch_exist(self, keys):
             return [1 if k in self._present else 0 for k in keys]
 
@@ -118,7 +121,7 @@ def _lookup_hit_tokens(
         _kv_cache_groups=groups,
         _record_kv_connector_operation=lambda *a, **k: None,
     )
-    return DfkvStoreWorker.lookup(self_, NCHUNK * BLOCK, hashes)
+    return DfkvStoreWorker.lookup(self_, NCHUNK * BLOCK, hashes)[0]
 
 
 def _hashes() -> list[BlockHash]:

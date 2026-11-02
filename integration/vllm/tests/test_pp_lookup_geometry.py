@@ -74,6 +74,9 @@ class _RecordingClient:
         self._present = present
         self.probed: list[bytes] = []
 
+    def batch_retain(self, keys, ttl_s=0, mode=1, **kw):
+        return [1 if e == 1 else 0 for e in self.batch_exist(keys)]
+
     def batch_exist(self, keys):
         self.probed.extend(keys)
         return [1 if k in self._present else 0 for k in keys]
@@ -103,7 +106,7 @@ def _run_lookup(
         _kv_cache_groups=groups,
         _record_kv_connector_operation=lambda *a, **k: None,
     )
-    hit = DfkvStoreWorker.lookup(self_, NCHUNK * BLOCK, hashes)
+    hit = DfkvStoreWorker.lookup(self_, NCHUNK * BLOCK, hashes)[0]
     return hit, client.probed
 
 

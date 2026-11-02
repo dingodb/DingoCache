@@ -23,6 +23,7 @@ def _scheduler(
     total_tokens=16,
 ):
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._retention = {}
     scheduler._failed_load_req_ids = set()
     scheduler.kv_role = "kv_both"
     scheduler.client = MagicMock()

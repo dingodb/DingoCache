@@ -463,6 +463,9 @@ class ReqMeta:
     state_blocks: dict[int, dict[int, int]] | None = None
 
     token_ids: list[int] | None = None
+    # Retention TTL the worker applies to this request's saved chunks (SET);
+    # 0 = best-effort. Never part of a cache key.
+    retain_ttl_s: int = 0
 
     @staticmethod
     def from_request_tracker(

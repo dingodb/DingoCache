@@ -13,8 +13,13 @@ HiCacheStorage; the test harness supplies a no-torch shim with the same surface.
 """
 from __future__ import annotations
 
+import collections
+import contextlib
 import ctypes
+import functools
 import hashlib
+import inspect
+import threading
 import logging
 import os
 import sys
@@ -34,6 +39,7 @@ from dfkv_common import (
     pool_key,
     sg_key,
 )
+from dfkv_common import cabi as dfkv_cabi
 from dfkv_common.client_metrics import read_native_snapshot
 from dfkv_common.block_size import get_max_block_bytes, validate_object_sizes
 
@@ -484,7 +490,24 @@ def _key_label(key: bytes) -> str:
     return f"len={len(key)} sha256={hashlib.sha256(key).hexdigest()[:16]}"
 
 
+def _with_retain_scope(method):
+    """Bind the call's extra_info TTL for the nested write helpers."""
+    signature = inspect.signature(method)
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        bound = signature.bind_partial(self, *args, **kwargs)
+        with self._retain_scope(bound.arguments.get("extra_info")):
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
 class DfkvHiCache(HiCacheStorage):
+    # Defaults for instances built without __init__ (tests, subclasses).
+    _has_retain = False
+    _retain_tls = threading.local()
+    _pending_retain = None
+
     def __init__(self, storage_config: HiCacheStorageConfig, kwargs: Optional[dict] = None):
         cfg = (kwargs or {}) or (getattr(storage_config, "extra_config", None) or {})
         self.cfg = cfg
@@ -583,6 +606,14 @@ class DfkvHiCache(HiCacheStorage):
         # later, inside the access-log "init" block. The plugin ships with the dfkv
         # repo, so its package version == the native lib version.
         self._lib = _load_lib(cfg.get("lib_path"))
+        # Retention (kRetain): optional on older libdfkv builds.
+        self._has_retain = dfkv_cabi.bind_retain(self._lib)
+        self._retain_tls = threading.local()
+        # SGLang touches a request's prefix right after insert; pages still
+        # in the backup queue answer MISS and are protected after their write.
+        self._pending_retain: "collections.OrderedDict[bytes, int]" = (
+            collections.OrderedDict())
+        self._pending_lock = threading.Lock()
         native_ver = _native_version(self._lib)
         # Unified fleet metrics pushed over OTLP to the central Collector (off by
         # default; zero cost when DFKV_METRICS_ENABLED is unset). Powers the
@@ -1266,9 +1297,119 @@ class DfkvHiCache(HiCacheStorage):
         """A page succeeds iff all its sub-objects succeeded."""
         return [all(flat_results[i * sub + j] for j in range(sub)) for i in range(npages)]
 
+    # ---- retention ----
+    @staticmethod
+    def _retain_ttl_of(extra_info) -> int:
+        """Per-request TTL carried in HiCacheStorageExtraInfo.extra_info."""
+        if extra_info is None:
+            return 0
+        info = extra_info if isinstance(extra_info, dict) else getattr(
+            extra_info, "extra_info", None)
+        if not isinstance(info, dict):
+            return 0
+        value = info.get("retain_ttl_s", 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return 0
+        return min(value, 0xFFFFFFFF)
+
+    @contextlib.contextmanager
+    def _retain_scope(self, extra_info):
+        prev = getattr(self._retain_tls, "ttl", 0)
+        self._retain_tls.ttl = self._retain_ttl_of(extra_info)
+        try:
+            yield
+        finally:
+            self._retain_tls.ttl = prev
+
+    _PENDING_RETAIN_MAX = 1 << 20
+
+    def _retain_set(self, keys, ttl) -> list:
+        try:
+            codes = dfkv_cabi.call_batch_retain(
+                self._lib, self._h, keys, ttl, dfkv_cabi.DFKV_RETAIN_SET)
+        except Exception as e:  # retention never fails a backup or touch
+            _log.warning("dfkv retain SET failed: %s", e)
+            return [dfkv_cabi.DFKV_RET_ERROR] * len(keys)
+        unprotected = sum(
+            1 for c in codes if c not in dfkv_cabi.RETAIN_PROTECTED_CODES)
+        if unprotected:
+            _log.debug("dfkv retain SET: %d/%d keys unprotected (codes=%s)",
+                       unprotected, len(codes), sorted(set(codes)))
+        return codes
+
+    def _retain_after_write(self, sks, stored) -> None:
+        """SET every stored sub-object of this write that carries a TTL:
+        from the write's extra_info, or parked by an earlier batch_touch."""
+        if not self._has_retain:
+            return
+        ctx_ttl = getattr(self._retain_tls, "ttl", 0)
+        pending = getattr(self, "_pending_retain", None)
+        by_ttl: dict = {}
+        if pending:
+            with self._pending_lock:
+                for sk, ok in zip(sks, stored):
+                    if not ok:
+                        continue
+                    ttl = max(ctx_ttl, pending.pop(sk, 0))
+                    if ttl > 0:
+                        by_ttl.setdefault(ttl, []).append(sk)
+        elif ctx_ttl > 0:
+            by_ttl[ctx_ttl] = [sk for sk, ok in zip(sks, stored) if ok]
+        for ttl, keys in by_ttl.items():
+            if keys:
+                self._retain_set(keys, ttl)
+
+    def batch_touch(self, keys, extra_info=None) -> None:
+        """Renew retention of pages served from device/host memory.
+
+        Called by SGLang for prefix hits that never reach storage. Refreshes
+        the main KV objects and every registered side pool of those pages.
+        A ``retain_ttl_s`` hint in ``extra_info`` enables client debounce.
+        """
+        if not keys or not self._has_retain:
+            return
+        sks = [sk for k in keys for sk in self._keys(k)]
+        for pool in getattr(self, "_pool_component_names", {}):
+            if pool in ("kv", "__default__"):
+                continue
+            for k in keys:
+                sks.extend(self._pool_keys(pool, k))
+        ttl = self._retain_ttl_of(extra_info)
+        try:
+            # Decision 9: protect the whole prefix or none of it.
+            if ttl > 0 and dfkv_cabi.call_retain_precheck(
+                    self._lib, self._h, sks):
+                codes = self._retain_set(sks, ttl)
+                missing = [sk for sk, c in zip(sks, codes)
+                           if c == dfkv_cabi.DFKV_RET_MISS]
+                if missing:
+                    with self._pending_lock:
+                        for sk in missing:
+                            self._pending_retain[sk] = max(
+                                ttl, self._pending_retain.get(sk, 0))
+                            self._pending_retain.move_to_end(sk)
+                        while len(self._pending_retain) > self._PENDING_RETAIN_MAX:
+                            self._pending_retain.popitem(last=False)
+            else:
+                dfkv_cabi.call_batch_retain(
+                    self._lib, self._h, sks, ttl,
+                    dfkv_cabi.DFKV_RETAIN_REFRESH)
+        except Exception as e:
+            _log.warning("dfkv batch_touch failed: %s", e)
+
     def _batch_exist_flat(self, subkeys) -> List[bool]:
         if not subkeys:
             return []
+        if self._has_retain:
+            # Every existence probe is a REFRESH: a hit renews whatever
+            # retention the object carries, at no extra round trip.
+            try:
+                codes = dfkv_cabi.call_batch_retain(
+                    self._lib, self._h, subkeys, 0,
+                    dfkv_cabi.DFKV_RETAIN_REFRESH)
+            except RuntimeError:
+                return [False] * len(subkeys)
+            return [c in dfkv_cabi.RETAIN_HIT_CODES for c in codes]
         karr, klens, key_owners = make_key_array(subkeys)
         out = (ctypes.c_int * len(subkeys))()
         rc = self._lib.dfkv_batch_exist(
@@ -1302,6 +1443,15 @@ class DfkvHiCache(HiCacheStorage):
               file=_sys.stderr, flush=True)
 
     def _write_anchor_markers(self, keys) -> List[bool]:
+        pages = self._write_anchor_markers_impl(keys)
+        if getattr(self._retain_tls, "ttl", 0) > 0:
+            sub = self._sub()
+            self._retain_after_write(
+                [sk for k in keys for sk in self._keys(k)],
+                [ok for ok in pages for _ in range(sub)])
+        return pages
+
+    def _write_anchor_markers_impl(self, keys) -> List[bool]:
         """Write a one-byte marker object per "kv" sub-key so a later
         batch_exists / batch_exists_v2 can find the primary-pool prefix.
 
@@ -1449,6 +1599,11 @@ class DfkvHiCache(HiCacheStorage):
         return [out[i] == 1 for i in range(n)]
 
     def _put_sg_flat(self, sks, seg_ptrs, seg_sizes) -> List[bool]:
+        stored = self._put_sg_flat_impl(sks, seg_ptrs, seg_sizes)
+        self._retain_after_write(sks, stored)
+        return stored
+
+    def _put_sg_flat_impl(self, sks, seg_ptrs, seg_sizes) -> List[bool]:
         """SG put with the same phase-9 exist gate + single transient retry as
         _put_flat (the contiguous host put), so the L2-bypass path inherits the
         identical backup-dedup and burst-failure recovery semantics."""
@@ -1737,6 +1892,11 @@ class DfkvHiCache(HiCacheStorage):
         return len(self._pool_components(pool_name))
 
     def _put_flat(self, sks, sp, ss) -> List[bool]:
+        stored = self._put_flat_impl(sks, sp, ss)
+        self._retain_after_write(sks, stored)
+        return stored
+
+    def _put_flat_impl(self, sks, sp, ss) -> List[bool]:
         """batch_put with the phase-9 exist gate (sub-objects already in L3
         are reported stored without rewriting) and a single retry of failed
         keys. Under a cold-round write burst ~0.1% of puts fail transiently,
@@ -2401,3 +2561,9 @@ class DfkvHiCache(HiCacheStorage):
             res = [self.get(k, t) for k, t in zip(keys, target_locations)]
             r.result = f"hits={sum(1 for x in res if x is not None)}/{n}"
             return res
+
+
+for _name in ("batch_set_v1", "batch_set_v1_device", "batch_set_v2",
+              "batch_set_v2_device", "batch_set_v1_device_draft"):
+    setattr(DfkvHiCache, _name, _with_retain_scope(getattr(DfkvHiCache, _name)))
+del _name

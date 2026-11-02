@@ -15,6 +15,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "cache/disk_cache_group.h"
@@ -187,6 +188,25 @@ class KvNodeServer {
   void InitTcpListenerConfig();
   std::atomic<size_t> cache_put_{0}, cache_hit_{0}, cache_miss_{0};
   std::atomic<size_t> exist_hit_{0}, exist_miss_{0};
+  // kRetain: per-key outcomes by mode (0 SET, 1 REFRESH) and RetainCode.
+  std::atomic<size_t> retain_keys_[2][8] = {};
+  std::atomic<size_t> retain_requests_{0};
+  Status ProcessRetain(const BlockKey& prefix_key, uint64_t count,
+                       const char* payload, uint64_t payload_len,
+                       std::string* out_data);
+  // A SET on a write-back value still only in RAM is applied when its flush
+  // commits (bounded; overflow answers DENIED). Under pending_retain_mu_.
+  struct BlockKeyHasher {
+    size_t operator()(const BlockKey& k) const {
+      return static_cast<size_t>(k.digest_hi ^ (k.digest_lo * 0x9e3779b97f4a7c15ULL) ^
+                                 (k.tenant_hash << 1));
+    }
+  };
+  static constexpr size_t kPendingRetainMax = 1u << 20;
+  std::mutex pending_retain_mu_;
+  std::unordered_map<BlockKey, uint32_t, BlockKeyHasher> pending_retain_;
+  std::atomic<size_t> pending_retain_applied_{0};
+  void ApplyPendingRetain(const BlockKey& key, bool flushed);
   std::atomic<size_t> remove_ok_{0}, remove_miss_{0};
   std::atomic<size_t> bytes_written_{0}, bytes_read_{0};
   // Read-side convoy collapse (env DFKV_READ_COALESCE=1; see read_coalescer.h).

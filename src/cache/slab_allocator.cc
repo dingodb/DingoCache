@@ -530,11 +530,29 @@ bool SlabAllocator::RestoreBulk(const std::vector<RestoreEntry>& entries) {
     extent.useful_bytes += meta.useful_bytes;
     cls.useful_bytes += meta.useful_bytes;
     used_bytes_ += entry.slot_size;
+
+    // A persisted protection still in the future comes back, re-clamped to
+    // the current cap (which may have been lowered across the restart). The
+    // budget is not re-checked: these bytes were admitted under it before.
+    if (retain_.enabled && entry.retain_until > retain_now_s_ &&
+        entry.retain_ttl_s != 0) {
+      const uint32_t ttl = std::min(entry.retain_ttl_s, retain_.max_ttl_s);
+      const uint64_t cap = static_cast<uint64_t>(retain_now_s_) + ttl;
+      meta.retain_ttl_s = ttl;
+      meta.retain_until = static_cast<uint32_t>(
+          std::min<uint64_t>(entry.retain_until, cap));
+      meta.retain_persisted_until = meta.retain_until;
+      ProtectLocked(meta_index);
+      PushWheelLocked(meta.key, meta.retain_until);
+    } else if (retain_.enabled) {
+      meta.retain_ttl_s = std::min(entry.retain_ttl_s, retain_.max_ttl_s);
+    }
   }
   return true;
 }
 
 void SlabAllocator::FreeSlotLocked(uint32_t index) {
+  if (slots_[index].retain_until != 0) UnprotectLocked(index);
   SlotMeta& meta = slots_[index];
   const uint32_t cls_index = meta.ref.cls;
   const uint32_t extent_index = meta.ref.extent;
@@ -609,6 +627,10 @@ bool SlabAllocator::EvictOneFrom(size_t cls_index,
     SlotMeta& meta = slots_[current];
     cls.hand = meta.class_next != kNoSlot ? meta.class_next : cls.ring_head;
     if (meta.refs > 0) continue;
+    if (meta.retain_until != 0) {
+      ++retain_evict_skipped_;
+      continue;
+    }
     if (fallback == kNoSlot) fallback = current;
     if (meta.referenced) {
       meta.referenced = false;
@@ -640,7 +662,7 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealExtentFor(
   for (uint32_t e = 0; e < extents_.size(); ++e) {
     const ExtentMeta& extent = extents_[e];
     if (extent.cls == kUnbound || extent.cls == static_cast<int>(target_cls) ||
-        extent.pinned != 0)
+        extent.pinned != 0 || extent.protected_slots != 0)
       continue;
     const Class& donor = classes_[static_cast<size_t>(extent.cls)];
     if (min_donor_extents > 0 && donor.bound_extents <= min_donor_extents)
@@ -666,8 +688,8 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealColdExtentFor(
   for (uint32_t e = 0; e < extents_.size(); ++e) {
     const ExtentMeta& extent = extents_[e];
     if (extent.cls == kUnbound || extent.cls == static_cast<int>(target_cls) ||
-        extent.pinned != 0 || extent.resident_count == 0 ||
-        extent.youngest_seq >= cold_before)
+        extent.pinned != 0 || extent.protected_slots != 0 ||
+        extent.resident_count == 0 || extent.youngest_seq >= cold_before)
       continue;
     const uint64_t heat = ExtentHeatLocked(extent);
     if (best < 0 || heat < best_heat ||
@@ -693,7 +715,8 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealExtentLocked(
   ExtentMeta& extent = extents_[extent_index];
   const int old_cls = extent.cls;
   if (old_cls == kUnbound || target_cls >= classes_.size() ||
-      classes_[target_cls].slots_per_extent == 0 || extent.pinned != 0)
+      classes_[target_cls].slots_per_extent == 0 || extent.pinned != 0 ||
+      extent.protected_slots != 0)
     return ExtentBindResult::kUnavailable;
 
   // The durable extent wipe happens before any resident is forgotten.
@@ -727,7 +750,9 @@ bool SlabAllocator::StealFrom(size_t donor_cls, size_t target_cls,
   int best = -1;
   for (uint32_t e = 0; e < extents_.size(); ++e) {
     const ExtentMeta& extent = extents_[e];
-    if (extent.cls != static_cast<int>(donor_cls) || extent.pinned != 0) continue;
+    if (extent.cls != static_cast<int>(donor_cls) || extent.pinned != 0 ||
+        extent.protected_slots != 0)
+      continue;
     if (best < 0 ||
         StealsBeforeLocked(extent, extents_[static_cast<size_t>(best)]))
       best = static_cast<int>(e);
@@ -991,6 +1016,11 @@ size_t SlabAllocator::EvictColdToTarget(uint64_t target_bytes,
       global_hand_ = next;
       continue;
     }
+    if (meta.retain_until != 0) {
+      ++retain_evict_skipped_;
+      global_hand_ = next;
+      continue;
+    }
     // Actual GETs and new admissions already refresh global sweep order.
     // Leave reference credit to class-local CLOCK; it must not postpone an
     // older resident past more recent reads or writes here.
@@ -1074,6 +1104,199 @@ SlabAllocator::IndexStats SlabAllocator::IndexStatsForTest() const {
 size_t SlabAllocator::IndexBucketForTest(const BlockKey& key) const {
   std::lock_guard<std::mutex> lock(mu_);
   return index_.BucketForTest(key);
+}
+
+// ---------------------------------------------------------------- retention
+
+void SlabAllocator::ConfigureRetention(const RetainOptions& options,
+                                       uint32_t now_s) {
+  std::lock_guard<std::mutex> lock(mu_);
+  retain_ = options;
+  if (retain_.max_ttl_s == 0) retain_.enabled = false;
+  if (retain_.class_pct > 100) retain_.class_pct = 100;
+  retain_now_s_ = now_s;
+  // Every deadline is <= now + max_ttl, so a ring of max_ttl/10 + 2 buckets
+  // never holds two laps in one bucket.
+  wheel_.assign(retain_.enabled ? retain_.max_ttl_s / kWheelTickS + 2 : 0, {});
+  wheel_entries_ = 0;
+  wheel_tick_ = now_s / kWheelTickS == 0 ? 0 : now_s / kWheelTickS - 1;
+}
+
+uint32_t SlabAllocator::ClassProtectCapLocked(const Class& cls) const {
+  const uint64_t slots =
+      static_cast<uint64_t>(cls.bound_extents) * cls.slots_per_extent;
+  return static_cast<uint32_t>(std::min<uint64_t>(
+      slots * retain_.class_pct / 100, std::numeric_limits<uint32_t>::max()));
+}
+
+void SlabAllocator::ProtectLocked(uint32_t meta_index) {
+  SlotMeta& meta = slots_[meta_index];
+  ++extents_[meta.ref.extent].protected_slots;
+  ++classes_[meta.ref.cls].protected_slots;
+  protected_bytes_ += meta.ref.slot_size;
+  ++protected_slots_;
+}
+
+void SlabAllocator::UnprotectLocked(uint32_t meta_index) {
+  SlotMeta& meta = slots_[meta_index];
+  ExtentMeta& extent = extents_[meta.ref.extent];
+  Class& cls = classes_[meta.ref.cls];
+  if (extent.protected_slots > 0) --extent.protected_slots;
+  if (cls.protected_slots > 0) --cls.protected_slots;
+  protected_bytes_ -= std::min<uint64_t>(protected_bytes_, meta.ref.slot_size);
+  if (protected_slots_ > 0) --protected_slots_;
+  meta.retain_until = 0;
+}
+
+void SlabAllocator::PushWheelLocked(const BlockKey& key, uint32_t until) {
+  if (wheel_.empty()) return;
+  wheel_[(until / kWheelTickS) % wheel_.size()].push_back({key, until});
+  ++wheel_entries_;
+}
+
+SlabAllocator::RetainOutcome SlabAllocator::Retain(const BlockKey& key,
+                                                   uint32_t ttl_s,
+                                                   RetainMode mode,
+                                                   uint32_t now_s) {
+  std::lock_guard<std::mutex> lock(mu_);
+  RetainOutcome out;
+  // A stepped-back realtime clock must not shorten anything already granted.
+  if (now_s > retain_now_s_) retain_now_s_ = now_s;
+  const uint32_t now = retain_now_s_;
+  const uint32_t* found = index_.Find(key);
+  if (found == nullptr || slots_[*found].remove_pending || !retain_.enabled) {
+    out.code = found == nullptr || slots_[*found].remove_pending
+                   ? RetainCode::kMiss
+                   : RetainCode::kHitUnprotected;
+    ++retain_results_[static_cast<size_t>(out.code)];
+    return out;
+  }
+  const uint32_t index = *found;
+  // A REFRESH is an engine-reported hit served from a higher tier: it counts
+  // as an actual read for CLOCK and extent recency. SET does not.
+  if (mode == RetainMode::kRefresh) TouchLocked(index);
+  SlotMeta& meta = slots_[index];
+  out.ref = meta.ref;
+  const uint32_t stored = std::min(meta.retain_ttl_s, retain_.max_ttl_s);
+  const uint32_t requested = std::min(ttl_s, retain_.max_ttl_s);
+  const uint32_t eff =
+      mode == RetainMode::kRefresh ? stored : std::max(stored, requested);
+  if (eff == 0) {
+    out.code = RetainCode::kHitUnprotected;
+    ++retain_results_[static_cast<size_t>(out.code)];
+    return out;
+  }
+  const bool was_protected = meta.retain_until != 0;
+  if (!was_protected) {
+    const Class& cls = classes_[meta.ref.cls];
+    if (protected_bytes_ + meta.ref.slot_size > retain_.budget_bytes ||
+        cls.protected_slots + 1 > ClassProtectCapLocked(cls)) {
+      out.code = RetainCode::kDenied;
+      out.ttl_s = meta.retain_ttl_s;
+      ++retain_results_[static_cast<size_t>(out.code)];
+      return out;
+    }
+  }
+  const uint64_t candidate = static_cast<uint64_t>(now) + eff;
+  const uint32_t new_until = static_cast<uint32_t>(std::max<uint64_t>(
+      meta.retain_until, std::min<uint64_t>(candidate, UINT32_MAX)));
+  if (!was_protected) {
+    out.code = RetainCode::kProtectedNew;
+  } else if (eff > stored) {
+    out.code = RetainCode::kUpgraded;
+  } else if (new_until > meta.retain_until) {
+    out.code = RetainCode::kRefreshed;
+  } else {
+    out.code = RetainCode::kUnchanged;
+  }
+  if (!was_protected) ProtectLocked(index);
+  meta.retain_ttl_s = eff;
+  if (new_until != meta.retain_until || !was_protected) {
+    meta.retain_until = new_until;
+    PushWheelLocked(meta.key, new_until);
+  }
+  // Durable record: always for a new or raised TTL; for renewals only once
+  // the deadline has moved far enough that losing it on restart matters.
+  const uint32_t delta_floor = std::max(retain_.persist_min_delta_s, eff / 4);
+  if (out.code == RetainCode::kProtectedNew ||
+      out.code == RetainCode::kUpgraded ||
+      meta.retain_until >= meta.retain_persisted_until + delta_floor) {
+    out.persist = true;
+    meta.retain_persisted_until = meta.retain_until;
+  }
+  out.until = meta.retain_until;
+  out.ttl_s = meta.retain_ttl_s;
+  ++retain_results_[static_cast<size_t>(out.code)];
+  return out;
+}
+
+size_t SlabAllocator::ExpireRetention(uint32_t now_s) {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (now_s > retain_now_s_) retain_now_s_ = now_s;
+  if (wheel_.empty()) return 0;
+  const uint32_t now = retain_now_s_;
+  // A bucket is drained only once its whole 10 s window lies in the past, so
+  // protection may outlive its deadline by < 10 s, never end early.
+  const uint64_t target = now / kWheelTickS == 0 ? 0 : now / kWheelTickS - 1;
+  if (target <= wheel_tick_) return 0;
+  // After a long stall one full lap visits every bucket; skip the rest.
+  if (target - wheel_tick_ > wheel_.size())
+    wheel_tick_ = target - wheel_.size();
+  size_t cleared = 0;
+  while (wheel_tick_ < target) {
+    ++wheel_tick_;
+    std::vector<WheelEntry>& bucket = wheel_[wheel_tick_ % wheel_.size()];
+    std::vector<WheelEntry> keep;
+    for (const WheelEntry& entry : bucket) {
+      if (entry.until > now) {
+        keep.push_back(entry);  // a later lap (only after a clock step)
+        continue;
+      }
+      --wheel_entries_;
+      const uint32_t* found = index_.Find(entry.key);
+      if (found == nullptr) continue;
+      SlotMeta& meta = slots_[*found];
+      // A refresh or upgrade pushed a later entry; this one is stale.
+      if (!meta.live || meta.retain_until != entry.until) continue;
+      UnprotectLocked(*found);
+      // Rejoin ordinary eviction without leftover reference credit.
+      meta.referenced = false;
+      ++retain_expired_;
+      ++cleared;
+    }
+    bucket.swap(keep);
+  }
+  return cleared;
+}
+
+uint32_t SlabAllocator::RetentionHeadroomPct() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (!retain_.enabled || retain_.budget_bytes == 0) return 0;
+  const uint64_t used = std::min(protected_bytes_, retain_.budget_bytes);
+  return static_cast<uint32_t>((retain_.budget_bytes - used) * 100 /
+                               retain_.budget_bytes);
+}
+
+SlabAllocator::RetentionStats SlabAllocator::GetRetentionStats() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  RetentionStats st;
+  st.enabled = retain_.enabled;
+  st.budget_bytes = retain_.budget_bytes;
+  st.protected_bytes = protected_bytes_;
+  st.protected_slots = protected_slots_;
+  for (const ExtentMeta& extent : extents_)
+    if (extent.protected_slots != 0) ++st.extents_pinned;
+  st.expired = retain_expired_;
+  st.evict_skipped = retain_evict_skipped_;
+  st.wheel_entries = wheel_entries_;
+  st.max_ttl_s = retain_.max_ttl_s;
+  if (retain_.enabled && retain_.budget_bytes != 0) {
+    const uint64_t used = std::min(protected_bytes_, retain_.budget_bytes);
+    st.headroom_pct = static_cast<uint32_t>(
+        (retain_.budget_bytes - used) * 100 / retain_.budget_bytes);
+  }
+  for (size_t i = 0; i < 7; ++i) st.results[i] = retain_results_[i];
+  return st;
 }
 
 }  // namespace dfkv

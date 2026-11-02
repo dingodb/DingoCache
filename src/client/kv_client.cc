@@ -1242,6 +1242,232 @@ std::vector<bool> KVClient::BatchExist(const std::vector<std::string>& keys) {
   return RecordBatch(OpMetrics::kExist, t0, std::move(res), 0);
 }
 
+// ------------------------------------------------------------- retention
+
+namespace {
+size_t RetainDebounceCapPerShard(size_t shards) {
+  static const size_t total = [] {
+    const char* v = std::getenv("DFKV_RETAIN_CACHE_ENTRIES");
+    if (v && *v) {
+      char* end = nullptr;
+      const unsigned long long n = std::strtoull(v, &end, 10);
+      if (end != v && *end == '\0') return static_cast<size_t>(n);
+    }
+    return static_cast<size_t>(1) << 20;
+  }();
+  return total / shards;
+}
+
+bool RetainCodeProtected(uint8_t code) {
+  return code == KVClient::kRetProtectedNew ||
+         code == KVClient::kRetRefreshed || code == KVClient::kRetUpgraded ||
+         code == KVClient::kRetUnchanged;
+}
+}  // namespace
+
+void KVClient::RetainNode(const std::string& node, uint64_t tenant,
+                          const std::vector<size_t>& idx,
+                          const std::vector<BlockKey>& bkeys,
+                          const RetainRequest& req, uint8_t* out) {
+  auto fallback = [&](size_t from) {
+    // Node without kRetain: REFRESH degrades to an existence probe so callers
+    // keep exact hit/miss; SET cannot be honoured.
+    if (req.mode != kRetainModeRefresh) {
+      for (size_t m = from; m < idx.size(); ++m) out[idx[m]] = kRetUnsupported;
+      return;
+    }
+    std::vector<BlockKey> sub;
+    sub.reserve(idx.size() - from);
+    for (size_t m = from; m < idx.size(); ++m) sub.push_back(bkeys[idx[m]]);
+    std::vector<char> ex;
+    const std::vector<Status> sts = t_->ExistMany(node, sub, &ex);
+    bool resp = false, ioerr = false;
+    for (size_t m = 0; m < sub.size(); ++m) {
+      const Status st = m < sts.size() ? sts[m] : Status::kInvalid;
+      uint8_t code = kRetError;
+      if (st == Status::kOk)
+        code = (m < ex.size() && ex[m]) ? kRetHitUnprotected : kRetMiss;
+      else if (st == Status::kNotFound)
+        code = kRetMiss;
+      if (st == Status::kOk || st == Status::kNotFound) resp = true;
+      if (st == Status::kIOError) ioerr = true;
+      out[idx[from + m]] = code;
+    }
+    if (resp)
+      health_.MarkGood(node, NowMs());
+    else if (ioerr)
+      health_.MarkBad(node, NowMs());
+  };
+
+  if (!health_.Healthy(node, NowMs())) {
+    for (size_t k : idx) out[k] = kRetError;
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lk(retain_mu_);
+    if (retain_nodes_[node].supported == 0) {
+      fallback(0);
+      return;
+    }
+  }
+  const size_t cap = RetainDebounceCapPerShard(kRetainDebounceShards);
+  for (size_t begin = 0; begin < idx.size(); begin += kRetainMaxKeys) {
+    const size_t n = std::min(kRetainMaxKeys, idx.size() - begin);
+    std::vector<BlockKey> chunk(n);
+    for (size_t m = 0; m < n; ++m) chunk[m] = bkeys[idx[begin + m]];
+    std::string payload(RetainPayloadBytes(n), '\0');
+    EncodeRetainPayload(&payload[0], req.ttl_s, req.mode, chunk.data(), n);
+    std::string reply;
+    const Status st = t_->Retain(node, tenant, n, payload, &reply);
+    if (st == Status::kInvalid) {
+      {
+        std::lock_guard<std::mutex> lk(retain_mu_);
+        RetainNodeState& ns = retain_nodes_[node];
+        ns.supported = 0;
+        ns.max_ttl_s = 0;
+      }
+      fallback(begin);
+      return;
+    }
+    if (st != Status::kOk || reply.size() != n + kRetainTrailerBytes) {
+      if (st == Status::kIOError) health_.MarkBad(node, NowMs());
+      for (size_t m = 0; m < n; ++m) out[idx[begin + m]] = kRetError;
+      continue;
+    }
+    health_.MarkGood(node, NowMs());
+    const RetainTrailer trailer = DecodeRetainTrailer(reply.data() + n);
+    {
+      std::lock_guard<std::mutex> lk(retain_mu_);
+      RetainNodeState& ns = retain_nodes_[node];
+      ns.supported = 1;
+      ns.max_ttl_s = trailer.max_ttl_s;
+      ns.headroom_pct = trailer.headroom_pct;
+      ns.heard = true;
+    }
+    const uint64_t now = NowMs();
+    for (size_t m = 0; m < n; ++m) {
+      const uint8_t code = static_cast<uint8_t>(reply[m]);
+      out[idx[begin + m]] = code <= kRetDenied ? code : kRetError;
+      const BlockKey& bk = chunk[m];
+      RetainDebounceShard& shard =
+          retain_debounce_[bk.digest_lo % kRetainDebounceShards];
+      std::lock_guard<std::mutex> lk(shard.mu);
+      const auto key = std::make_pair(bk.digest_hi, bk.digest_lo);
+      if (RetainCodeProtected(code)) {
+        if (shard.entries.size() >= cap && shard.entries.count(key) == 0)
+          shard.entries.clear();  // bounded: rare full reset
+        if (cap != 0) shard.entries[key].protected_at_ms = now;
+      } else {
+        shard.entries.erase(key);
+      }
+    }
+  }
+}
+
+void KVClient::BatchRetain(const std::vector<std::string>& keys,
+                           const RetainRequest& req, uint8_t* out) {
+  const size_t n = keys.size();
+  if (out == nullptr || n == 0) return;
+  std::fill(out, out + n, static_cast<uint8_t>(kRetError));
+  const bool debounce = req.mode == kRetainModeRefresh && req.ttl_s != 0 &&
+                        !req.no_debounce;
+  const uint64_t interval = std::max<uint64_t>(
+      req.min_refresh_ms, static_cast<uint64_t>(req.ttl_s) * 100);
+  const uint64_t now = NowMs();
+  std::vector<BlockKey> bks(n);
+  std::map<std::pair<std::string, uint64_t>, std::vector<size_t>> by_node;
+  for (size_t i = 0; i < n; ++i) {
+    bks[i] = ToBlockKey(key_namespace_, keys[i]);
+    if (debounce) {
+      RetainDebounceShard& shard =
+          retain_debounce_[bks[i].digest_lo % kRetainDebounceShards];
+      std::lock_guard<std::mutex> lk(shard.mu);
+      auto it = shard.entries.find(
+          std::make_pair(bks[i].digest_hi, bks[i].digest_lo));
+      // Protected within the last ttl/10: still protected, hence present.
+      if (it != shard.entries.end() &&
+          now - it->second.protected_at_ms < interval) {
+        out[i] = kRetSkippedDebounce;
+        continue;
+      }
+    }
+    std::string node = Route(keys[i]);
+    if (node.empty()) continue;  // stays kRetError
+    by_node[{node, bks[i].tenant_hash}].push_back(i);
+  }
+  std::vector<std::pair<std::pair<std::string, uint64_t>, std::vector<size_t>>>
+      groups(by_node.begin(), by_node.end());
+  RunParallel(groups.size(), BatchWorkers(groups.size()), [&](size_t g) {
+    RetainNode(groups[g].first.first, groups[g].first.second, groups[g].second,
+               bks, req, out);
+  });
+}
+
+void KVClient::RetainLimits(int* supported, uint32_t* max_ttl_s) {
+  std::vector<std::string> nodes;
+  {
+    std::lock_guard<std::mutex> lk(ring_mu_);
+    for (const auto& kv : addr_) nodes.push_back(kv.second);
+  }
+  const uint64_t tenant = ToBlockKey(key_namespace_, "").tenant_hash;
+  for (const std::string& node : nodes) {
+    {
+      std::lock_guard<std::mutex> lk(retain_mu_);
+      if (retain_nodes_[node].supported != -1) continue;
+    }
+    // One-key REFRESH probe of an impossible key: answers MISS plus limits.
+    const BlockKey probe{0, 0, tenant};
+    std::string payload(RetainPayloadBytes(1), '\0');
+    EncodeRetainPayload(&payload[0], 0, kRetainModeRefresh, &probe, 1);
+    std::string reply;
+    const Status st = t_->Retain(node, tenant, 1, payload, &reply);
+    std::lock_guard<std::mutex> lk(retain_mu_);
+    RetainNodeState& ns = retain_nodes_[node];
+    if (st == Status::kInvalid) {
+      ns.supported = 0;
+      ns.max_ttl_s = 0;
+    } else if (st == Status::kOk && reply.size() == 1 + kRetainTrailerBytes) {
+      const RetainTrailer t = DecodeRetainTrailer(reply.data() + 1);
+      ns.supported = 1;
+      ns.max_ttl_s = t.max_ttl_s;
+      ns.headroom_pct = t.headroom_pct;
+      ns.heard = true;
+    }
+  }
+  int sup = nodes.empty() ? -1 : 1;
+  uint32_t ttl = UINT32_MAX;
+  {
+    std::lock_guard<std::mutex> lk(retain_mu_);
+    for (const std::string& node : nodes) {
+      const RetainNodeState& ns = retain_nodes_[node];
+      if (ns.supported == 0) sup = 0;
+      else if (ns.supported == -1 && sup == 1) sup = -1;
+      if (ns.supported == 1) ttl = std::min(ttl, ns.max_ttl_s);
+    }
+  }
+  if (supported) *supported = sup;
+  if (max_ttl_s) *max_ttl_s = sup == 1 ? ttl : 0;
+}
+
+bool KVClient::RetainPrecheck(const std::vector<std::string>& keys,
+                              uint8_t min_headroom_pct) {
+  std::set<std::string> owners;
+  for (const std::string& key : keys) {
+    std::string node = Route(key);
+    if (node.empty()) return false;
+    owners.insert(std::move(node));
+  }
+  std::lock_guard<std::mutex> lk(retain_mu_);
+  for (const std::string& node : owners) {
+    auto it = retain_nodes_.find(node);
+    if (it == retain_nodes_.end()) continue;  // never heard: optimistic
+    if (it->second.supported == 0) return false;
+    if (it->second.heard && it->second.headroom_pct < min_headroom_pct)
+      return false;
+  }
+  return true;
+}
+
 namespace {
 
 // Shared per-node (ip:port) stats for GET/PUT/EXIST. Gated by

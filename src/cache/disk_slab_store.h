@@ -201,6 +201,22 @@ class DiskSlabStore : public StoreEngine {
   bool DirectWritesActive() const { return !extent_dio_fds_.empty(); }
   Stats GetStats() const;
   std::vector<SlabAllocator::ClassStat> ClassStats() const;
+
+  // Retention (DFKV_RETAIN_*). Only committed keys can be retained; a SET or
+  // upgrade rewrites the slot record so protection survives a restart.
+  bool RetainEnabled() const override { return retain_enabled_; }
+  uint8_t Retain(const BlockKey& key, uint32_t ttl_s, uint8_t mode,
+                 uint32_t now_s) override;
+  uint32_t RetainHeadroomPct() const override {
+    return alloc_ ? alloc_->RetentionHeadroomPct() : 0;
+  }
+  uint32_t RetainMaxTtl() const override {
+    return retain_enabled_ ? retain_max_ttl_s_ : 0;
+  }
+  SlabAllocator::RetentionStats RetentionStats() const {
+    return alloc_ ? alloc_->GetRetentionStats()
+                  : SlabAllocator::RetentionStats{};
+  }
   bool Healthy() const override {
     return ok_ && !metadata_failed_.load(std::memory_order_acquire);
   }
@@ -222,8 +238,11 @@ class DiskSlabStore : public StoreEngine {
   bool MarkDirtyEpoch();
   bool MarkCleanEpoch();
   bool SyncPayloads();
+  // Bytes 44..51 carry retain_until/retain_ttl_s (zero = none). They were
+  // always zero and CRC-covered, so older binaries validate and ignore them.
   bool WriteRecord(const SlabAllocator::SlotRef& r, const BlockKey& key,
-                   uint32_t payload_len, bool valid);
+                   uint32_t payload_len, bool valid,
+                   uint32_t retain_until = 0, uint32_t retain_ttl_s = 0);
   bool SyncTable(uint64_t seen);
   bool FailMetadata();
   bool WritePayload(const SlabAllocator::SlotRef& r, const void* data, size_t len);
@@ -265,6 +284,8 @@ class DiskSlabStore : public StoreEngine {
   }
 
   Options opt_;
+  bool retain_enabled_ = false;
+  uint32_t retain_max_ttl_s_ = 0;
   uint32_t num_extents_ = 0;
   uint32_t max_slots_per_extent_ = 0;
   std::vector<char> zero_extent_records_;

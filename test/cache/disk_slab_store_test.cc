@@ -2,6 +2,7 @@
 // Covers data-path semantics, restart warmth, crash/torn-record handling,
 // strict startup geometry, fail-closed metadata I/O, and reclaimer safety.
 #include "cache/disk_slab_store.h"
+#include "utils/net_util.h"
 
 #include <gtest/gtest.h>
 #include <fcntl.h>
@@ -22,6 +23,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <functional>
 #include <mutex>
@@ -1947,3 +1950,65 @@ TEST_F(DiskSlabTest, UringReapDrainMissFailsStoreClosed) {
   for (auto* b : bufs) free(b);
 }
 #endif  // DFKV_WITH_URING
+
+// Retention persists in record bytes 44..51 and comes back on restart; the
+// record stays CRC-valid, so a binary that ignores those bytes still serves it.
+TEST_F(DiskSlabTest, RetentionPersistsAcrossRestart) {
+  const uint32_t now = static_cast<uint32_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+  const std::string v(3000, 'r');
+  {
+    bool ok = false;
+    DiskSlabStore s(Opts(1 << 20, 1 << 20, 4096), &ok);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(s.RetainEnabled());
+    ASSERT_EQ(s.Cache(K(7), v.data(), v.size()), Status::kOk);
+    ASSERT_EQ(s.Cache(K(8), v.data(), v.size()), Status::kOk);
+    EXPECT_EQ(s.Retain(K(7), 600, /*mode=*/0, now),
+              static_cast<uint8_t>(dfkv::SlabAllocator::RetainCode::kProtectedNew));
+    EXPECT_EQ(s.Retain(K(99), 600, 0, now),
+              static_cast<uint8_t>(dfkv::SlabAllocator::RetainCode::kMiss));
+    EXPECT_EQ(s.RetentionStats().protected_slots, 1u);
+  }
+  // Bytes 44..51 of K(7)'s record hold the deadline and TTL.
+  {
+    std::ifstream tbl(dir_ / "slots.tbl", std::ios::binary);
+    ASSERT_TRUE(tbl.good());
+    std::vector<char> all((std::istreambuf_iterator<char>(tbl)),
+                          std::istreambuf_iterator<char>());
+    bool found = false;
+    for (size_t off = 0; off + 64 <= all.size(); off += 64) {
+      const uint32_t ttl = dfkv::net::GetU32(all.data() + off + 48);
+      if (ttl == 600) {
+        EXPECT_GE(dfkv::net::GetU32(all.data() + off + 44), now + 600);
+        found = true;
+      }
+    }
+    EXPECT_TRUE(found);
+  }
+  bool ok = false;
+  DiskSlabStore s2(Opts(1 << 20, 1 << 20, 4096), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(s2.Count(), 2u);
+  EXPECT_EQ(s2.RetentionStats().protected_slots, 1u);
+  std::string out;
+  ASSERT_EQ(s2.Range(K(7), 0, v.size(), &out), Status::kOk);
+  EXPECT_EQ(out, v);
+  // REFRESH renews with the persisted TTL.
+  EXPECT_EQ(s2.Retain(K(7), 0, /*mode=*/1, now + 10),
+            static_cast<uint8_t>(dfkv::SlabAllocator::RetainCode::kRefreshed));
+}
+
+TEST_F(DiskSlabTest, RetentionDisabledByEnvAnswersUnsupported) {
+  ::setenv("DFKV_RETAIN_ENABLE", "0", 1);
+  bool ok = false;
+  DiskSlabStore s(Opts(1 << 20, 1 << 20, 4096), &ok);
+  ::unsetenv("DFKV_RETAIN_ENABLE");
+  ASSERT_TRUE(ok);
+  EXPECT_FALSE(s.RetainEnabled());
+  const std::string v(100, 'x');
+  ASSERT_EQ(s.Cache(K(1), v.data(), v.size()), Status::kOk);
+  EXPECT_EQ(s.Retain(K(1), 60, 0, 1000), dfkv::StoreEngine::kRetainUnsupported);
+}

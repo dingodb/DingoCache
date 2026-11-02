@@ -84,13 +84,72 @@ class SlabAllocator {
   bool Contains(const BlockKey& key) const;
 
   // A rebuild record carrying the authoritative caller-visible stored length.
+  // retain_until/retain_ttl_s restore a persisted minimum-lifetime protection
+  // (0 = none); RestoreBulk re-clamps them to the configured retention cap.
   struct RestoreEntry {
     BlockKey key;
     uint32_t slot_size = 0;
     uint32_t extent = 0;
     uint32_t slot = 0;
     uint64_t value_bytes = 0;
+    uint32_t retain_until = 0;
+    uint32_t retain_ttl_s = 0;
   };
+
+  // ---- Retention: per-object minimum lifetime ----
+  // A retained resident is skipped by every capacity eviction path (class
+  // CLOCK, global watermark, whole-extent steals) until its deadline passes,
+  // then rejoins ordinary eviction. It is never deleted by expiry. Explicit
+  // Remove ignores retention. Protection is bounded by a byte budget so that
+  // best-effort residents always keep evictable capacity.
+  enum class RetainMode : uint8_t { kSet = 0, kRefresh = 1 };
+  enum class RetainCode : uint8_t {
+    kMiss = 0,             // key absent (or being removed)
+    kHitUnprotected = 1,   // present, no TTL to apply (still a hit)
+    kProtectedNew = 2,     // protection started
+    kRefreshed = 3,        // deadline extended with the stored TTL
+    kUpgraded = 4,         // stored TTL raised
+    kUnchanged = 5,        // deadline already later
+    kDenied = 6,           // budget full: stays best-effort
+  };
+  struct RetainOptions {
+    bool enabled = false;
+    uint64_t budget_bytes = 0;       // cap on protected slot bytes
+    uint32_t class_pct = 80;         // cap per class, % of its bound slots
+    uint32_t max_ttl_s = 3600;       // every applied TTL is clamped to this
+    uint32_t persist_min_delta_s = 60;
+  };
+  // Must run before RestoreBulk; `now_s` seeds the expiry wheel.
+  void ConfigureRetention(const RetainOptions& options, uint32_t now_s);
+  struct RetainOutcome {
+    RetainCode code = RetainCode::kMiss;
+    SlotRef ref;
+    uint32_t until = 0;   // deadline after the call (0 = none)
+    uint32_t ttl_s = 0;   // stored TTL after the call
+    bool persist = false; // caller should rewrite the durable record
+  };
+  // `ttl_s` is clamped to max_ttl_s; it is ignored for kRefresh, which renews
+  // with the stored TTL and also counts as a read for eviction recency.
+  RetainOutcome Retain(const BlockKey& key, uint32_t ttl_s, RetainMode mode,
+                       uint32_t now_s);
+  // Clears protections whose 10 s expiry bucket has fully passed. Returns the
+  // number of residents released back to ordinary eviction.
+  size_t ExpireRetention(uint32_t now_s);
+  struct RetentionStats {
+    bool enabled = false;
+    uint64_t budget_bytes = 0;
+    uint64_t protected_bytes = 0;
+    uint64_t protected_slots = 0;
+    uint64_t extents_pinned = 0;   // extents holding >= 1 protected resident
+    uint64_t expired = 0;
+    uint64_t evict_skipped = 0;
+    uint64_t wheel_entries = 0;
+    uint32_t max_ttl_s = 0;
+    uint32_t headroom_pct = 0;
+    uint64_t results[7] = {0, 0, 0, 0, 0, 0, 0};  // by RetainCode
+  };
+  RetentionStats GetRetentionStats() const;
+  uint32_t RetentionHeadroomPct() const;
 
   // Validate the whole batch, reserve the dense metadata/index once, then bind
   // and install it under one lock. On invalid input no resident is installed.
@@ -199,6 +258,12 @@ class SlabAllocator {
     uint32_t class_next = kNoSlot;
     uint32_t extent_prev = kNoSlot;
     uint32_t extent_next = kNoSlot;
+    // Retention deadline in realtime seconds; non-zero means the resident is
+    // protected and counted in the retention budget until the expiry wheel
+    // clears it. retain_ttl_s survives expiry so a later REFRESH can renew.
+    uint32_t retain_until = 0;
+    uint32_t retain_ttl_s = 0;
+    uint32_t retain_persisted_until = 0;
     bool referenced = false;
     bool remove_pending = false;
     bool live = false;
@@ -224,6 +289,7 @@ class SlabAllocator {
     uint64_t heat_seq = 0;
     uint32_t ring_head = kNoSlot;
     uint32_t hand = kNoSlot;
+    uint32_t protected_slots = 0;
   };
 
   struct ExtentMeta {
@@ -244,6 +310,9 @@ class SlabAllocator {
     uint64_t heat_seq = 0;
     uint32_t resident_head = kNoSlot;
     uint32_t resident_count = 0;
+    // Residents with retain_until != 0. Steals skip such extents exactly like
+    // pinned ones, so a protected object is never wiped with its extent.
+    uint32_t protected_slots = 0;
   };
 
   uint32_t CanonicalSlotSize(size_t aligned_len) const;
@@ -272,6 +341,11 @@ class SlabAllocator {
   // Steal-victim order: empty first, then oldest mean resident access, then
   // coldest read heat, then fewest useful bytes.
   bool StealsBeforeLocked(const ExtentMeta& a, const ExtentMeta& b) const;
+
+  void ProtectLocked(uint32_t meta_index);
+  void UnprotectLocked(uint32_t meta_index);
+  void PushWheelLocked(const BlockKey& key, uint32_t until);
+  uint32_t ClassProtectCapLocked(const Class& cls) const;
 
   void PushFreeLocked(Class& cls, uint32_t extent, uint32_t slot);
   bool PopFreeLocked(Class& cls, Slot* out);
@@ -331,6 +405,23 @@ class SlabAllocator {
   uint64_t activity_seq_ = 0;
   uint64_t cold_window_ = 0;
   bool cold_steal_enabled_ = true;
+
+  // Retention state (all under mu_).
+  struct WheelEntry {
+    BlockKey key;
+    uint32_t until = 0;
+  };
+  static constexpr uint32_t kWheelTickS = 10;
+  RetainOptions retain_;
+  uint64_t protected_bytes_ = 0;
+  uint64_t protected_slots_ = 0;
+  uint64_t retain_expired_ = 0;
+  uint64_t retain_evict_skipped_ = 0;
+  uint64_t retain_results_[7] = {0, 0, 0, 0, 0, 0, 0};
+  std::vector<std::vector<WheelEntry>> wheel_;
+  uint64_t wheel_entries_ = 0;
+  uint64_t wheel_tick_ = 0;  // last fully drained 10 s tick
+  uint32_t retain_now_s_ = 0;
 };
 
 }  // namespace dfkv

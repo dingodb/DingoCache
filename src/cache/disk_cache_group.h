@@ -73,6 +73,15 @@ class DiskCacheGroup {
   // removed, kNotFound if absent. Backs the LMCache L2 eviction path.
   Status Remove(const BlockKey& key);
 
+  // Retention routes like Lookup. Enabled only when every disk supports it,
+  // so one RETAIN reply describes the whole node consistently.
+  bool RetainEnabled() const;
+  uint8_t Retain(const BlockKey& key, uint32_t ttl_s, uint8_t mode,
+                 uint32_t now_s);
+  uint32_t RetainHeadroomPct() const;  // minimum across disks
+  uint32_t RetainMaxTtl() const;       // minimum across disks
+  SlabAllocator::RetentionStats RetentionStats() const;  // summed
+
   uint64_t UsedBytes() const;   // summed across disks
   size_t Count() const;         // summed across disks
   size_t DiskCount() const { return disks_.size(); }

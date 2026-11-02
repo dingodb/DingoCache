@@ -297,7 +297,7 @@ class _ControlledLookupSocket:
         token_len = self._local.token_len
         if not self.release[token_len].wait(timeout=1):
             raise TimeoutError(f"lookup {token_len} was not released")
-        return token_len.to_bytes(4, "big")
+        return token_len.to_bytes(4, "big") + (0).to_bytes(4, "big")
 
     def send(self, _frame) -> None:
         raise AssertionError("reset is not used by these tests")
@@ -321,9 +321,10 @@ class _StoreWorker:
         self.kv_send_thread = None
         self.observations: list[tuple[str, float]] = []
 
-    def lookup(self, token_len: int, block_hashes: list[BlockHash]) -> int:
+    def lookup(self, token_len: int, block_hashes: list[BlockHash],
+               retain_ttl_s: int = 0) -> tuple[int, int]:
         self.calls.append((token_len, [bytes(value) for value in block_hashes]))
-        return min(token_len, len(block_hashes) * 64)
+        return min(token_len, len(block_hashes) * 64), 0
     def _record_kv_connector_observation(
         self, name: str, duration_seconds: float
     ) -> None:
@@ -361,7 +362,7 @@ class LookupFrameTest(unittest.TestCase):
     def test_binary_lookup_frame_round_trip(self) -> None:
         hashes = [self._hash("alpha"), self._hash("beta")]
 
-        self.assertEqual(self.client.lookup("round-trip", 160, hashes), 128)
+        self.assertEqual(self.client.lookup("round-trip", 160, hashes), (128, 0))
 
         frames = self.endpoint.last_request
         self.assertIsNotNone(frames)
@@ -373,10 +374,11 @@ class LookupFrameTest(unittest.TestCase):
         self.assertEqual(self.store.calls, [(160, [bytes(value) for value in hashes])])
 
     def test_empty_hash_list_has_canonical_binary_frame(self) -> None:
-        self.assertEqual(self.client.lookup("empty", 64, []), 0)
+        self.assertEqual(self.client.lookup("empty", 64, []), (0, 0))
         self.assertEqual(
             self.endpoint.last_request,
-            [LOOKUP_MSG, (64).to_bytes(4, "big"), (0).to_bytes(2, "big"), b""],
+            [LOOKUP_MSG, (64).to_bytes(4, "big"), (0).to_bytes(2, "big"), b"",
+             (0).to_bytes(4, "big")],
         )
         self.assertEqual(self.store.calls, [(64, [])])
 
@@ -391,11 +393,11 @@ class LookupFrameTest(unittest.TestCase):
         for frames in malformed:
             with self.subTest(frames=frames):
                 self.endpoint.send_multipart(frames)
-                self.assertEqual(self.endpoint.recv(), (0).to_bytes(4, "big"))
+                self.assertEqual(self.endpoint.recv(), (0).to_bytes(8, "big"))
                 self.assertEqual(self.store.calls, [])
 
         valid_hash = self._hash("still-alive")
-        self.assertEqual(self.client.lookup("valid-after-errors", 64, [valid_hash]), 64)
+        self.assertEqual(self.client.lookup("valid-after-errors", 64, [valid_hash]), (64, 0))
 
 class LookupFutureTest(unittest.TestCase):
     @staticmethod
@@ -428,8 +430,8 @@ class LookupFutureTest(unittest.TestCase):
             self.assertEqual(socket.send_count[64], 1)
 
             socket.release[64].set()
-            self.assertEqual(pending.result(timeout=1), 64)
-            self.assertEqual(client.lookup("same", 64, hashes, non_block=True), 64)
+            self.assertEqual(pending.result(timeout=1), (64, 0))
+            self.assertEqual(client.lookup("same", 64, hashes, non_block=True), (64, 0))
             self.assertNotIn("same", client.futures)
         finally:
             socket.release[64].set()
@@ -447,10 +449,10 @@ class LookupFutureTest(unittest.TestCase):
 
             socket.release[64].set()
             socket.release[128].set()
-            self.assertEqual(client.futures["left"].result(timeout=1), 64)
-            self.assertEqual(client.futures["right"].result(timeout=1), 128)
-            self.assertEqual(client.lookup("left", 64, hashes, non_block=True), 64)
-            self.assertEqual(client.lookup("right", 128, hashes, non_block=True), 128)
+            self.assertEqual(client.futures["left"].result(timeout=1), (64, 0))
+            self.assertEqual(client.futures["right"].result(timeout=1), (128, 0))
+            self.assertEqual(client.lookup("left", 64, hashes, non_block=True), (64, 0))
+            self.assertEqual(client.lookup("right", 128, hashes, non_block=True), (128, 0))
         finally:
             socket.release[64].set()
             socket.release[128].set()
@@ -549,6 +551,9 @@ class LogicalChunkTransferTest(unittest.TestCase):
 
             def max_sg_segs(self) -> int:
                 return 29
+
+            def batch_retain(self, keys, ttl_s=0, mode=1, **kw):
+                return self.batch_exist(keys)
 
             def batch_exist(self, keys):
                 self.exist_calls.append(list(keys))
@@ -1200,6 +1205,9 @@ class LongestCompletePrefixLookupTest(unittest.TestCase):
             def __init__(self):
                 self.calls: list[list[bytes]] = []
 
+            def batch_retain(self, keys, ttl_s=0, mode=1, **kw):
+                return self.batch_exist(keys)
+
             def batch_exist(self, keys):
                 self.calls.append(list(keys))
                 if isinstance(response, Exception):
@@ -1239,12 +1247,12 @@ class LongestCompletePrefixLookupTest(unittest.TestCase):
             [1, 1, 1, 1, 1, 1, 0, 1, 1]
         )
         block_hashes = [self._hash(f"scheduler-{index}") for index in range(6)]
-        self.assertEqual(worker.lookup(384, block_hashes), 128)
+        self.assertEqual(worker.lookup(384, block_hashes)[0], 128)
 
         first_missing_worker, _ = self._worker(
             [1, 1, 1, 1, 0, 1, 1, 1, 1]
         )
-        self.assertEqual(first_missing_worker.lookup(384, block_hashes), 0)
+        self.assertEqual(first_missing_worker.lookup(384, block_hashes)[0], 0)
 
     def test_repeated_equal_hashes_do_not_mask_an_incomplete_occurrence(self) -> None:
         worker, _client = self._worker(
@@ -1254,7 +1262,7 @@ class LongestCompletePrefixLookupTest(unittest.TestCase):
             repeated_hashes=True,
         )
         block_hashes = [self._hash("scheduler-repeat")] * 6
-        self.assertEqual(worker.lookup(384, block_hashes), 0)
+        self.assertEqual(worker.lookup(384, block_hashes)[0], 0)
 
     def test_malformed_exist_result_lengths_fail_closed(self) -> None:
         block_hashes = [self._hash(f"scheduler-{index}") for index in range(6)]
@@ -1265,7 +1273,7 @@ class LongestCompletePrefixLookupTest(unittest.TestCase):
         ):
             with self.subTest(result=malformed):
                 worker, _client = self._worker(malformed)
-                self.assertEqual(worker.lookup(384, block_hashes), 0)
+                self.assertEqual(worker.lookup(384, block_hashes)[0], 0)
 
 
 class _BlockingReceiveClient:
@@ -1784,6 +1792,9 @@ class LookupAccountingTest(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls: list[list[bytes]] = []
 
+            def batch_retain(self, keys, ttl_s=0, mode=1, **kw):
+                return self.batch_exist(keys)
+
             def batch_exist(self, keys):
                 self.calls.append(list(keys))
                 # Both TP objects of chunk 0 are present. Chunk 1 is only
@@ -1823,7 +1834,7 @@ class LookupAccountingTest(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(DfkvStoreWorker.lookup(worker, 128, hashes), 64)
+        self.assertEqual(DfkvStoreWorker.lookup(worker, 128, hashes)[0], 64)
         expected_keys = [
             PoolKey(
                 replace(metadata, tp_rank=tp),

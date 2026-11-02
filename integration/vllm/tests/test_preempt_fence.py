@@ -116,6 +116,9 @@ class PreemptFenceTest(unittest.TestCase):
         class DelayedMemoryClient:
             # Substitute only the native boundary: descriptor construction,
             # queue/dequeue, cancellation and in-flight tracking stay real.
+            def batch_retain(self, keys, ttl_s=0, mode=1, **kw):
+                return [1 if e == 1 else 0 for e in self.batch_exist(keys)]
+
             def batch_exist(self, keys):
                 return [0] * len(keys)
 

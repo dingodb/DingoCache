@@ -354,6 +354,54 @@ Status DiskCacheGroup::Remove(const BlockKey& key) {
       tenant_stripes_[TenantStripe(key.tenant_hash)]);
   return d->Remove(key);
 }
+bool DiskCacheGroup::RetainEnabled() const {
+  if (disks_.empty()) return false;
+  for (const auto& d : disks_)
+    if (!d->RetainEnabled()) return false;
+  return true;
+}
+
+uint8_t DiskCacheGroup::Retain(const BlockKey& key, uint32_t ttl_s,
+                               uint8_t mode, uint32_t now_s) {
+  StoreEngine* d = Route(key);
+  if (d == nullptr) return StoreEngine::kRetainUnsupported;
+  return d->Retain(key, ttl_s, mode, now_s);
+}
+
+uint32_t DiskCacheGroup::RetainHeadroomPct() const {
+  uint32_t pct = 100;
+  for (const auto& d : disks_) pct = std::min(pct, d->RetainHeadroomPct());
+  return disks_.empty() ? 0 : pct;
+}
+
+uint32_t DiskCacheGroup::RetainMaxTtl() const {
+  uint32_t ttl = UINT32_MAX;
+  for (const auto& d : disks_) ttl = std::min(ttl, d->RetainMaxTtl());
+  return disks_.empty() ? 0 : ttl;
+}
+
+SlabAllocator::RetentionStats DiskCacheGroup::RetentionStats() const {
+  SlabAllocator::RetentionStats sum;
+  bool first = true;
+  for (const auto* d : slabs_) {
+    const auto st = d->RetentionStats();
+    sum.enabled = first ? st.enabled : (sum.enabled && st.enabled);
+    sum.budget_bytes += st.budget_bytes;
+    sum.protected_bytes += st.protected_bytes;
+    sum.protected_slots += st.protected_slots;
+    sum.extents_pinned += st.extents_pinned;
+    sum.expired += st.expired;
+    sum.evict_skipped += st.evict_skipped;
+    sum.wheel_entries += st.wheel_entries;
+    sum.max_ttl_s = first ? st.max_ttl_s : std::min(sum.max_ttl_s, st.max_ttl_s);
+    sum.headroom_pct =
+        first ? st.headroom_pct : std::min(sum.headroom_pct, st.headroom_pct);
+    for (size_t i = 0; i < 7; ++i) sum.results[i] += st.results[i];
+    first = false;
+  }
+  return sum;
+}
+
 Status DiskCacheGroup::Lookup(const BlockKey& key, ValueMetadata* out) const {
   StoreEngine* d = Route(key);
   if (d == nullptr) return Status::kInvalid;

@@ -59,7 +59,8 @@ def _gqa_dcp_lookup(store):
         ),
         token_dbs=[SimpleNamespace(metadata=md, block_size=BLOCK)],
         client=SimpleNamespace(
-            batch_exist=lambda keys: [int(key in store) for key in keys]
+            batch_exist=lambda keys: [int(key in store) for key in keys],
+            batch_retain=lambda keys, ttl_s=0, mode=1, **kw: [int(key in store) for key in keys],
         ),
         tp_size=8,
         num_kv_head=8,
@@ -81,4 +82,4 @@ def test_gqa_dcp_lookup_hits_what_the_workers_wrote():
         for h in hashes
     }
     _, worker = _gqa_dcp_lookup(store)
-    assert DfkvStoreWorker.lookup(worker, 4 * BLOCK, hashes) == 4 * BLOCK
+    assert DfkvStoreWorker.lookup(worker, 4 * BLOCK, hashes)[0] == 4 * BLOCK

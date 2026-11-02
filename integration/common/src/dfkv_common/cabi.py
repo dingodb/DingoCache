@@ -120,3 +120,126 @@ def make_client_options_v2(
         client_info_bytes,
     )
     return options
+
+
+# ---- Retention (kRetain): mirrors dfkv_retain_options / DFKV_RET_* ----
+DFKV_RETAIN_SET = 0
+DFKV_RETAIN_REFRESH = 1
+DFKV_RETAIN_F_NO_DEBOUNCE = 1
+DFKV_RET_MISS = 0
+DFKV_RET_HIT_UNPROTECTED = 1
+DFKV_RET_PROTECTED_NEW = 2
+DFKV_RET_REFRESHED = 3
+DFKV_RET_UPGRADED = 4
+DFKV_RET_UNCHANGED = 5
+DFKV_RET_DENIED = 6
+DFKV_RET_UNSUPPORTED = 7
+DFKV_RET_SKIPPED_DEBOUNCE = 8
+DFKV_RET_ERROR = 9
+# A key is present iff its REFRESH/SET code is one of these.
+RETAIN_HIT_CODES = frozenset({1, 2, 3, 4, 5, 6, 8})
+# The key is protected after the call.
+RETAIN_PROTECTED_CODES = frozenset({2, 3, 4, 5, 8})
+
+
+class DfkvRetainOptions(ctypes.Structure):
+    """Byte-for-byte mirror of ``dfkv_retain_options`` in dfkv_c_api.h."""
+
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("ttl_s", ctypes.c_uint32),
+        ("mode", ctypes.c_uint8),
+        ("flags", ctypes.c_uint8),
+        ("reserved0", ctypes.c_uint16),
+        ("min_refresh_ms", ctypes.c_uint32),
+    ]
+
+
+def make_retain_options(
+    ttl_s: int, mode: int, *, flags: int = 0, min_refresh_ms: int = 0
+) -> DfkvRetainOptions:
+    if mode not in (DFKV_RETAIN_SET, DFKV_RETAIN_REFRESH):
+        raise ValueError(f"invalid retain mode {mode}")
+    return DfkvRetainOptions(
+        struct_size=ctypes.sizeof(DfkvRetainOptions),
+        ttl_s=max(0, min(int(ttl_s), 0xFFFFFFFF)),
+        mode=mode,
+        flags=flags,
+        reserved0=0,
+        min_refresh_ms=max(0, int(min_refresh_ms)),
+    )
+
+
+def bind_retain(lib: Any) -> bool:
+    """Declare the retention symbols when ``lib`` exports them.
+
+    Returns False for an older libdfkv without kRetain support, in which case
+    callers keep their existence-check paths.
+    """
+    try:
+        batch_retain = lib.dfkv_batch_retain
+        limits = lib.dfkv_retain_limits
+        precheck = lib.dfkv_retain_precheck
+    except AttributeError:
+        return False
+    batch_retain.restype = ctypes.c_int
+    batch_retain.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_uint64), ctypes.c_int,
+        ctypes.POINTER(DfkvRetainOptions), ctypes.POINTER(ctypes.c_uint8),
+    ]
+    limits.restype = ctypes.c_int
+    limits.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    precheck.restype = ctypes.c_int
+    precheck.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_uint64), ctypes.c_int, ctypes.c_uint8,
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    return True
+
+
+def call_batch_retain(lib: Any, handle: Any, keys: Sequence[bytes],
+                      ttl_s: int, mode: int, *, flags: int = 0,
+                      min_refresh_ms: int = 0) -> list[int]:
+    """Run ``dfkv_batch_retain`` and return one result code per key."""
+    n = len(keys)
+    if n == 0:
+        return []
+    key_array, length_array, owners = make_key_array(keys)
+    out = (ctypes.c_uint8 * n)()
+    options = make_retain_options(
+        ttl_s, mode, flags=flags, min_refresh_ms=min_refresh_ms)
+    rc = lib.dfkv_batch_retain(
+        handle, key_array, length_array, n, ctypes.byref(options), out)
+    del owners
+    if rc != 0:
+        raise RuntimeError(f"dfkv_batch_retain rc={rc}")
+    return list(out)
+
+
+def call_retain_limits(lib: Any, handle: Any) -> tuple[int, int]:
+    supported = ctypes.c_int(-1)
+    max_ttl = ctypes.c_uint32(0)
+    rc = lib.dfkv_retain_limits(
+        handle, ctypes.byref(supported), ctypes.byref(max_ttl))
+    if rc != 0:
+        return -1, 0
+    return int(supported.value), int(max_ttl.value)
+
+
+def call_retain_precheck(lib: Any, handle: Any, keys: Sequence[bytes],
+                         min_headroom_pct: int = 0) -> bool:
+    n = len(keys)
+    if n == 0:
+        return True
+    key_array, length_array, owners = make_key_array(keys)
+    ok = ctypes.c_int(0)
+    rc = lib.dfkv_retain_precheck(
+        handle, key_array, length_array, n, int(min_headroom_pct),
+        ctypes.byref(ok))
+    del owners
+    return rc == 0 and ok.value == 1

@@ -10,6 +10,7 @@ from dfkv_vllm.transfer_protocol import LegacyReceiveFailures
 
 def test_new_request_metadata_uses_complete_allocated_block_table():
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._retention = {}
     scheduler._failed_load_req_ids = set()
     scheduler.kv_role = "kv_both"
     scheduler.client = MagicMock()
@@ -53,6 +54,7 @@ def test_new_request_metadata_uses_complete_allocated_block_table():
 @pytest.mark.parametrize("role", ["kv_both", "kv_consumer"])
 def test_cached_prefill_progress_without_new_blocks(empty_delta, role):
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._retention = {}
     request = SimpleNamespace(
         request_id="chunked", all_token_ids=list(range(12)), block_hashes=[],
     )
@@ -109,6 +111,7 @@ def test_cached_prefill_progress_without_new_blocks(empty_delta, role):
 
 def test_sampling_tail_does_not_authorize_an_absent_checkpoint():
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._retention = {}
     scheduler._failed_load_req_ids = set()
     scheduler.request_level_loads = False
     scheduler._block_size = 64
@@ -117,8 +120,9 @@ def test_sampling_tail_does_not_authorize_an_absent_checkpoint():
     scheduler.load_specs = {}
     checkpoints = {128}
     scheduler.client = SimpleNamespace(
-        lookup=lambda request_id, length, hashes, non_block: max(
-            (depth for depth in checkpoints if depth <= length), default=0
+        lookup=lambda request_id, length, hashes, non_block, retain_ttl_s=0: (
+            max((depth for depth in checkpoints if depth <= length), default=0),
+            0,
         )
     )
     request = SimpleNamespace(
@@ -134,6 +138,7 @@ def test_sampling_tail_does_not_authorize_an_absent_checkpoint():
 
 def test_cache_bypass_discards_stale_external_admission():
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._retention = {}
     scheduler._failed_load_req_ids = set()
     scheduler.request_level_loads = False
     scheduler._block_size = 64
@@ -143,7 +148,7 @@ def test_cache_bypass_discards_stale_external_admission():
     other_spec = object()
     scheduler.load_specs = {"replay": object(), "unrelated": other_spec}
     scheduler.client = SimpleNamespace(
-        lookup=lambda request_id, *args, **kwargs: cached[request_id],
+        lookup=lambda request_id, *args, **kwargs: (cached[request_id], 0),
         discard=lambda request_id: cached.pop(request_id, None),
     )
     request = SimpleNamespace(
@@ -161,11 +166,12 @@ def test_consumer_cached_resume_emits_load_without_save(
     async_pending, same_step_preemption,
 ):
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._retention = {}
     scheduler._failed_load_req_ids = set()
     scheduler.request_level_loads = False
     scheduler.kv_role = "kv_consumer"
     scheduler.client = MagicMock()
-    scheduler.client.lookup.return_value = 4
+    scheduler.client.lookup.return_value = (4, 0)
     scheduler.lookup_async = False
     scheduler.load_async = async_pending
     scheduler.load_specs = {}
@@ -267,6 +273,7 @@ def test_consumer_cached_resume_emits_load_without_save(
 @pytest.mark.parametrize("async_pending", [False, True])
 def test_same_step_preemption_keeps_new_allocation_and_load(async_pending, cached_resume):
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._retention = {}
     scheduler._failed_load_req_ids = set()
     scheduler.kv_role = "kv_both"
     scheduler.client = MagicMock()
@@ -383,9 +390,9 @@ def test_load_admission_parks_request_level_layouts(
         SimpleNamespace(kv_cache_groups=groups, transfer_groups=groups),
     )
     request = SimpleNamespace(request_id="load", num_tokens=16, block_hashes=[])
-    client.lookup.return_value = 8
+    client.lookup.return_value = (8, 0)
     assert scheduler.get_num_new_matched_tokens(request, 0) == (8, parked)
-    client.lookup.return_value = 0
+    client.lookup.return_value = (0, 0)
     assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
     client.lookup.return_value = None
     assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
@@ -398,6 +405,7 @@ def test_failed_load_bypasses_persistent_hit_and_rebuilds_computed_save(
     cached_resume, load_async, legacy,
 ):
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._retention = {}
     scheduler.kv_role = "kv_both"
     scheduler.request_level_loads = True
     scheduler.load_async = load_async
@@ -416,7 +424,7 @@ def test_failed_load_bypasses_persistent_hit_and_rebuilds_computed_save(
     def lookup(req_id, *args, **kwargs):
         # Discarding the lookup result alone does not repair a remote server
         # that still advertises keys whose GET failed.
-        return cached.setdefault(req_id, advertised[req_id])
+        return cached.setdefault(req_id, advertised[req_id]), 0
 
     scheduler.client = SimpleNamespace(
         lookup=lookup, discard=lambda req_id: cached.pop(req_id, None),
@@ -503,6 +511,7 @@ def test_pending_load_requires_this_connector_to_own_the_load(can_load):
     """MultiConnector may give the load to another connector (can_load=False);
     this connector must then neither load nor save the request's blocks."""
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._retention = {}
     request = SimpleNamespace(request_id="remote", block_hashes=[])
     for name, value in dict(
         kv_role="kv_both", _block_size=4, client=MagicMock(),

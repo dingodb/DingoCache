@@ -401,6 +401,16 @@ Status TcpTransport::Exist(const std::string& node, const BlockKey& key,
   return st;
 }
 
+Status TcpTransport::Retain(const std::string& node, uint64_t tenant_hash,
+                            uint64_t count, const std::string& payload,
+                            std::string* out) {
+  if (out == nullptr || count == 0 || count > kRetainMaxKeys)
+    return Status::kInvalid;
+  return RoundTrip(node, WireOp::kRetain, BlockKey{0, 0, tenant_hash}, 0,
+                   count, payload.data(), payload.size(), out,
+                   count + kRetainTrailerBytes);
+}
+
 Status TcpTransport::Remove(const std::string& node, const BlockKey& key) {
   // kRemove is a key-only request (no payload), Status-only response: kOk when a
   // block was dropped, kNotFound when it was already absent (both fine for the
