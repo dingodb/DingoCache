@@ -549,7 +549,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `DFKV_CLIENT_NODE_DEDUP_LOG` | `off` | 会合决策 log |
 | `DFKV_NODE_DEDUP_SLOTS` | `65536`（2 的幂） | dedup 表容量（power-of-2 强制） |
 | `DFKV_NODE_DEDUP_GPU_SLOTS` | — | GPU dedup 表容量 |
-| `DFKV_NODE_DEDUP_TTL_MS` | `5000` | dedup entry 过期 |
+| `DFKV_NODE_DEDUP_TTL_MS` | `5000` | dedup entry 过期（从发布时刻算起）；低于 `DFKV_NODE_DEDUP_WAIT_MS` 时启动告警：晚于 TTL 到达的 peer 会重复远端读取 |
 | `DFKV_NODE_DEDUP_WAIT_MS` | — | follower 等待 leader 上限 |
 | `DFKV_NODE_DEDUP_TAKEOVER_MS` | — | leader 失联 follower 接管时间 |
 | `DFKV_NODE_DEDUP_ARENA_MB` / `DFKV_NODE_DEDUP_GPU_ARENA_MB` | — | dedup 复用 staging arena 大小（重点检查 GPU 复本顿） |

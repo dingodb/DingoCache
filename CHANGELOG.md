@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Client: warn at startup when `DFKV_NODE_DEDUP_TTL_MS` is below
+  `DFKV_NODE_DEDUP_WAIT_MS`. A published node-dedup result is claimable only
+  for the TTL; a peer rank that reaches it later (rank skew, a large leader
+  batch) re-fetches the object instead of sharing it. Seen in production as
+  `DFKV_NODE_DEDUP_TTL_MS=100` against the 500 ms default wait.
 - SGLang HiCache: declare `DfkvHiCache.supports_dcp_storage = True` so SGLang
   builds that gate HiCache L3 under decode context parallelism admit the dfkv
   `dynamic` backend, and probe each host pool's layout over one whole logical
