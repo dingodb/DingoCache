@@ -134,6 +134,12 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
         # registrations stale.
         return False
 
+    @classmethod
+    def registers_kv_cache_memory(cls, kv_transfer_config: "KVTransferConfig") -> bool:
+        # The workers register the device KV cache with the RDMA NIC, so the
+        # extensible KV cache must back each segment with one physical chunk.
+        return True
+
     @property
     def prefer_cross_layer_blocks(self) -> bool:
         extra_config = self._kv_transfer_config.kv_connector_extra_config
