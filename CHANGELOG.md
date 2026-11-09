@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- vLLM connector: reuse a waiting request's completed lookup for
+  `lookup_cache_ttl_ms` (default 1000, `0` disables). vLLM re-polls every
+  waiting request on every scheduler step, and each poll was a synchronous
+  rank-0 round trip plus a retention REFRESH of every key of the prefix. With
+  the KV pool full, a 256K-token Kimi K3.1 request was probed ~140 times while
+  queued (5.7% of scheduler wall time, 26x more refreshed keys than fetched
+  keys). Entries are keyed by request, prefix length and retention TTL and are
+  dropped on finish, abort, preemption and failed load; RPC errors are not
+  cached.
+
 - Stop whole-extent steals from wiping the newest residents. Cross-class
   steals (`StealFrom`, `StealExtentFor`) ranked extents by decayed read heat
   and then by fewest useful bytes; once read heat had decayed, that picked the

@@ -974,6 +974,7 @@ namespace/key 不一致是预期 cold miss。**空环 / MDS 不可达**可直接
 | `load_window_keys` | `0`（关闭） | 长上下文 replicated-MLA 按压测设置 | 单次 native GET window 的最大 key 数（`0..65536`）。窗口结果应能放入 `DFKV_NODE_DEDUP_GPU_ARENA_MB`，且在 `DFKV_NODE_DEDUP_WAIT_MS` 内完成，避免 follower rank 超时后重复读取同一批 KV。 |
 | `load_window_min_keys` | `0` | 高于常规请求 key 数 | 仅当请求 key 数达到此阈值时启用 `load_window_keys`（`0..65536`）；让短请求保持单次 GET，长上下文才窗口化。`load_window_keys=0` 时无效。 |
 | `enable_cross_layers_blocks` | `False` | 默认 False | 仅当引擎分页布局层内交错时开 |
+| `lookup_cache_ttl_ms` | `1000` | 默认即可 | 调度器对同一请求、同一前缀长度和保留 TTL 复用已完成 lookup 的时长（`0..60000` ms）。vLLM 每步都会重新询问等待中的请求；复用可省去 rank0 往返以及随之附带的整段前缀 retention REFRESH，KV 池满时排队请求每个窗口只探测一次，而不是每步一次。请求完成、中止、被抢占或 load 失败时清除；窗口内对象被淘汰由 `kv_load_failure_policy` 兜底；`0` 为每步都探测。 |
 | `lookup_rpc_port` | ipc 自动 | 一般不设 | rank0 前缀查询 RPC，仅 socket 名冲突时设 |
 | `client_register` | `1`（MDS 发现时） | 默认即可 | MDS 客户端注册开关（`0` 关；env `DFKV_CLIENT_REGISTER=0` 等价，见 §1.1） |
 | `tenant_id` | `default` | 多租户时显式设 | canonical namespace 的 tenant 字段（§1.4） |

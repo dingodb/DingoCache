@@ -230,6 +230,12 @@ from dfkv_vllm.worker import (  # noqa: E402
 )
 
 
+
+# LookupKeyClient reads its result-reuse window from the connector config.
+_LOOKUP_CLIENT_CONFIG = SimpleNamespace(
+    kv_transfer_config=SimpleNamespace(kv_connector_extra_config={})
+)
+
 class _Frame:
     def __init__(self, value: bytes) -> None:
         self.buffer = value
@@ -347,7 +353,7 @@ class LookupFrameTest(unittest.TestCase):
         for active_patch in patches:
             active_patch.start()
         self.server = LookupKeyServer(self.store, SimpleNamespace())
-        self.client = LookupKeyClient(SimpleNamespace())
+        self.client = LookupKeyClient(_LOOKUP_CLIENT_CONFIG)
 
     def tearDown(self) -> None:
         self.client.close()
@@ -414,7 +420,7 @@ class LookupFutureTest(unittest.TestCase):
             ),
             patch("dfkv_vllm.worker.make_zmq_socket", return_value=socket),
         ):
-            return LookupKeyClient(SimpleNamespace())
+            return LookupKeyClient(_LOOKUP_CLIENT_CONFIG)
 
     def test_only_one_future_is_created_per_request(self) -> None:
         socket = _ControlledLookupSocket((64,))
