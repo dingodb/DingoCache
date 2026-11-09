@@ -349,6 +349,10 @@ DEFAULT_LOAD_WINDOW_KEYS = 0
 MAX_LOAD_WINDOW_KEYS = 65536
 DEFAULT_LOAD_WINDOW_MIN_KEYS = 0
 MAX_LOAD_WINDOW_MIN_KEYS = 65536
+# A waiting request is re-polled every scheduler step; reuse its lookup (and
+# the retention REFRESH it carries) for this long instead of re-probing.
+DEFAULT_LOOKUP_CACHE_TTL_MS = 1000
+MAX_LOOKUP_CACHE_TTL_MS = 60000
 _TRANSFER_STOP = object()
 
 
@@ -413,6 +417,22 @@ def _parse_load_window_min_keys(value: Any) -> int:
             f"[0, {MAX_LOAD_WINDOW_MIN_KEYS}], got {minimum}"
         )
     return minimum
+
+def _parse_lookup_cache_ttl_ms(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("lookup_cache_ttl_ms must be an integer")
+    if isinstance(value, int):
+        ttl_ms = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        ttl_ms = int(value.strip())
+    else:
+        raise ValueError("lookup_cache_ttl_ms must be an integer")
+    if not 0 <= ttl_ms <= MAX_LOOKUP_CACHE_TTL_MS:
+        raise ValueError(
+            "lookup_cache_ttl_ms must be in "
+            f"[0, {MAX_LOOKUP_CACHE_TTL_MS}], got {ttl_ms}"
+        )
+    return ttl_ms
 
 def _load_windows(
     length: int,
@@ -2910,9 +2930,25 @@ class LookupKeyClient:
 
     The single-worker executor is also the sole owner of socket I/O. Async
     scheduler calls retain one future per request and poll it on later steps.
+
+    vLLM re-polls ``get_num_new_matched_tokens`` for every waiting request on
+    every scheduler step. A completed lookup is therefore reused for the same
+    request and prefix length for ``lookup_cache_ttl_ms``; each reuse skips the
+    rank-0 round trip and the whole-prefix retention REFRESH it carries. The
+    entry is dropped by ``discard`` (finish, abort, preemption, failed load),
+    and a changed prefix length or retention TTL is a different lookup.
     """
 
     def __init__(self, vllm_config: VllmConfig):
+        extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self._cache_ttl_s = _parse_lookup_cache_ttl_ms(
+            extra_config.get("lookup_cache_ttl_ms", DEFAULT_LOOKUP_CACHE_TTL_MS)
+        ) / 1000.0
+        self._clock: Callable[[], float] = time.monotonic
+        # req_id -> ((token_len, retain_ttl_s), result, expires_at)
+        self._results: dict[
+            str, tuple[tuple[int, int], tuple[int, int], float]
+        ] = {}
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
         self._close_lock = threading.Lock()
         self._closed = False
@@ -2946,9 +2982,15 @@ class LookupKeyClient:
     ) -> tuple[int, int] | None:
         """Return ``(hit_tokens, applied_ttl_s)``, or ``None`` while a
         non-blocking lookup runs."""
+        signature = (token_len, retain_ttl_s)
         with self._close_lock:
             if self._closed:
                 return 0, 0
+            cached = self._results.get(req_id)
+            if cached is not None:
+                if cached[0] == signature and self._clock() < cached[2]:
+                    return cached[1]
+                del self._results[req_id]
             future = self.futures.get(req_id)
             if future is None:
                 future = self.executor.submit(
@@ -2962,7 +3004,7 @@ class LookupKeyClient:
         if non_block and not future.done():
             return None
         try:
-            return future.result()
+            result = future.result()
         except Exception as e:
             logger.error("Dfkv lookup failed for %s: %s", req_id, e)
             return 0, 0
@@ -2970,10 +3012,20 @@ class LookupKeyClient:
             with self._close_lock:
                 if self.futures.get(req_id) is future:
                     self.futures.pop(req_id)
+        # Only an answered lookup is reusable: an RPC error stays a one-step
+        # miss so the next step probes again.
+        if self._cache_ttl_s > 0:
+            with self._close_lock:
+                if not self._closed:
+                    self._results[req_id] = (
+                        signature, result, self._clock() + self._cache_ttl_s
+                    )
+        return result
 
     def discard(self, req_id: str) -> None:
         """Drop any cached or queued lookup for an aborted request."""
         with self._close_lock:
+            self._results.pop(req_id, None)
             future = self.futures.pop(req_id, None)
         if future is not None:
             future.cancel()
@@ -2999,6 +3051,7 @@ class LookupKeyClient:
             self._closed = True
             futures = tuple(self.futures.values())
             self.futures.clear()
+            self._results.clear()
         for future in futures:
             future.cancel()
         self.executor.shutdown(wait=True, cancel_futures=True)
