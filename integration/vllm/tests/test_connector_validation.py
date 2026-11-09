@@ -34,3 +34,9 @@ def test_accepts_align_mamba_groups_with_distinct_block_size():
 def test_refuses_sleep_mode():
     # GPUDirect memory registrations cannot follow sleep/wake page remaps.
     assert DfkvStoreConnector.supports_sleep_mode(SimpleNamespace()) is False
+
+
+def test_declares_kv_cache_registration():
+    # vLLM then backs each extensible KV cache segment with one physical chunk,
+    # which ibv_reg_mr needs.
+    assert DfkvStoreConnector.registers_kv_cache_memory(SimpleNamespace()) is True
