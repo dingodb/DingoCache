@@ -2119,8 +2119,10 @@ class DfkvStoreWorker:
             assert isinstance(v, torch.Tensor | list)
             return v if isinstance(v, torch.Tensor) else v[0]
 
-        assert self.cache_config.num_gpu_blocks is not None
-        self.num_blocks = self.cache_config.num_gpu_blocks
+        # The committed block count. Under vLLM's extensible KV cache the
+        # connector registers inside extend_kv_cache, before the worker
+        # updates cache_config.num_gpu_blocks from the reserved capacity.
+        self.num_blocks = self._kv_cache_config.num_blocks
 
         # dfkv: map each layer name to its kv_cache_group so that each group's
         # ChunkedTokenDatabase addresses ONLY its own group's layer segments.

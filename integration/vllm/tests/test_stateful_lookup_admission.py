@@ -562,7 +562,7 @@ def hybrid_workers(monkeypatch):
             ),
         )
         worker = DfkvStoreWorker(
-            config, SimpleNamespace(kv_cache_groups=groups),
+            config, SimpleNamespace(kv_cache_groups=groups, num_blocks=num_blocks),
         )
         workers.append(worker)
         buffers = {
