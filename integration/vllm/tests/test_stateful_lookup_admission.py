@@ -73,7 +73,7 @@ def test_noallocation_prefill_saves_state_before_page_recycling(hybrid_workers, 
         prev_step_scheduled_req_ids={request.request_id},
         cache_config=SimpleNamespace(block_size=BLOCK), max_num_scheduled_tokens=256,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
-        hash_block_size=64, use_eagle_block_drop=False,
+        hash_block_size=64, num_hash_lookahead_tokens=0, use_eagle_block_drop=False,
         mamba_has_prefill_checkpoint_blocks=False, mamba_partial_cache_hit=True,
         mamba_shared_prefix_checkpoint=False,
     )
