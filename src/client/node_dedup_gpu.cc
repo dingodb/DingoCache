@@ -128,6 +128,13 @@ std::unique_ptr<GpuNodeDedup> GpuNodeDedup::FromEnv(
   o.wait_ms = static_cast<int>(EnvU64("DFKV_NODE_DEDUP_WAIT_MS", 500));
   o.takeover_ms = static_cast<int>(EnvU64("DFKV_NODE_DEDUP_TAKEOVER_MS", 2000));
   o.ttl_ms = static_cast<int>(EnvU64("DFKV_NODE_DEDUP_TTL_MS", 5000));
+  if (o.ttl_ms < o.wait_ms) {
+    // A published result is claimable only for ttl_ms; a peer rank that
+    // reaches it later (rank skew, a large leader batch) re-fetches it.
+    DFKV_LOG_WARN("gpu-dedup: DFKV_NODE_DEDUP_TTL_MS=" + std::to_string(o.ttl_ms) +
+                  " is below DFKV_NODE_DEDUP_WAIT_MS=" + std::to_string(o.wait_ms) +
+                  "; late peers will re-fetch instead of sharing (default 5000)");
+  }
   o.name = EnvSegmentName(namespace_hash);
   return Open(o);
 }
