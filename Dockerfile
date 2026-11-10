@@ -12,8 +12,14 @@
 # needs rdma-core / libibverbs and their hardware provider plugins installed.
 # ubuntu:22.04, pinned so a release tag always rebuilds from identical bytes.
 ARG DFKV_BASE_IMAGE=docker.io/library/ubuntu@sha256:3b06811b2afd352be909dd088a004166d665dc76d38b13eada33522a9d915c6f
+# Optional Ubuntu archive mirror (e.g. http://azure.archive.ubuntu.com/ubuntu on
+# GitHub runners, where archive.ubuntu.com is intermittently slow/unreachable).
+# Empty keeps the base image's sources untouched.
+ARG UBUNTU_MIRROR=
 FROM ${DFKV_BASE_IMAGE} AS build
-RUN apt-get update && apt-get install -y --no-install-recommends \
+ARG UBUNTU_MIRROR
+RUN if [ -n "$UBUNTU_MIRROR" ]; then sed -i -E "s#https?://(archive|security)\.ubuntu\.com/ubuntu/?#${UBUNTU_MIRROR}/#" /etc/apt/sources.list; fi && \
+    apt-get -o Acquire::Retries=5 update && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
     cmake ninja-build g++ git ca-certificates libibverbs-dev liburing-dev && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /src
@@ -28,7 +34,9 @@ RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDFKV_BUILD_TESTS=O
 #   id=$(docker create dfkv-build) && docker cp $id:/out ./dist && docker rm $id
 
 FROM ${DFKV_BASE_IMAGE} AS runtime
-RUN apt-get update && apt-get install -y --no-install-recommends \
+ARG UBUNTU_MIRROR
+RUN if [ -n "$UBUNTU_MIRROR" ]; then sed -i -E "s#https?://(archive|security)\.ubuntu\.com/ubuntu/?#${UBUNTU_MIRROR}/#" /etc/apt/sources.list; fi && \
+    apt-get -o Acquire::Retries=5 update && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
     rdma-core libibverbs1 ibverbs-providers && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/ /usr/local/
 RUN ldconfig
