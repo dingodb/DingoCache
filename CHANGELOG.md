@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- SGLang HiCache: declare `DfkvHiCache.supports_dcp_storage = True` so SGLang
+  builds that gate HiCache L3 under decode context parallelism admit the dfkv
+  `dynamic` backend, and probe each host pool's layout over one whole logical
+  page (`page_size x dcp_size` slots) at registration; under DCP
+  `get_page_buffer_meta` rejects a bare physical page. The span is computed
+  locally rather than imported from SGLang, so builds without the DCP storage
+  helpers load unchanged; non-DCP keys and transfers are unchanged.
 - Docs: `load_async=True` validated on a KDA+MLA hybrid (Kimi-Linear-48B-A3B,
   TP8): L3-restored prompts reproduce their cold outputs and the same
   external/local/computed token accounting as `False`. Recommendation updated;

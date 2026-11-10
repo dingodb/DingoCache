@@ -624,6 +624,13 @@ sglang serve /models/glm-5.2-nvfp4 --served-model-name glm-5.2 \
 - **`DFKV_RDMA_DEPTH` — 两侧无需强制相等。** 握手取最小值，按共享 segment
   容量和连接 fan-out 分别配置即可。
 - **HiCache 命中/吞吐/延迟与 client 注册指标**已内置，无需额外动作。
+- **Decode context parallel（DCP）下的 L3。** 带 DCP L3 门禁的 SGLang 构建，
+  在 `--dcp-size > 1` 时只接受类上声明 `supports_dcp_storage = True` 的
+  `dynamic` 后端；`DfkvHiCache` 已声明。DCP 下 SGLang 以
+  `page_size × dcp_size` 个 slot 为一个逻辑页寻址 host pool（每个 DCP rank 一个物理页），
+  插件注册 pool 时按整个逻辑页探测布局；对象 key 带 DCP 坐标，MLA 每个 DCP 分片
+  选一个写入者。不带该门禁的 SGLang 忽略此声明，非 DCP 部署的 key 与读写不变。
+  端到端仍需在 DCP 实例上按 §2.5 验证命中与输出一致。
 - **client keepalive 默认开启。** `DFKV_RDMA_KEEPALIVE_MS` 默认 `15000`，每
   15 秒探测 idle pool 中的 QP，低于频繁重建场景推荐的 server
   `DFKV_RDMA_IDLE_MS=30000`。进程退出后探测自然停止，server 仍可在 30 秒后
