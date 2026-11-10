@@ -65,8 +65,17 @@ def _new_req_prefill_tokens(request: NewRequestData) -> list[int]:
     return request.prompt_token_ids
 
 
+# Re-emit the misaligned state hand-off warning at most this often.
+_MISALIGNED_STATE_WARN_INTERVAL_S = 600.0
+
+
 class DfkvStoreScheduler:
     """Scheduler-side component for DfkvStoreConnector."""
+
+    # Recurrent-state boundaries the engine handed off off the scheduler
+    # block grid (never saveable), and when that was last reported.
+    _misaligned_state_boundaries = 0
+    _misaligned_state_warned_at: float | None = None
 
     def __init__(
         self,
@@ -468,9 +477,8 @@ class DfkvStoreScheduler:
                 req_meta.retain_ttl_s = retention[1]
         return meta
 
-    @staticmethod
     def _attach_state_blocks(
-        meta: DfkvStoreConnectorMetadata, scheduler_output: SchedulerOutput
+        self, meta: DfkvStoreConnectorMetadata, scheduler_output: SchedulerOutput
     ) -> None:
         """Give each SAVE the exact recurrent-state blocks vLLM committed.
 
@@ -486,13 +494,44 @@ class DfkvStoreScheduler:
         if block_state is None:
             return
         offloads = block_state.boundary_state_offloads
+        misaligned = 0
         for req_meta in meta.requests:
             if not req_meta.can_save:
                 continue
             blocks: dict[int, dict[int, int]] = {}
             for group_id, block_id, boundary in offloads.get(req_meta.req_id, ()):
                 blocks.setdefault(group_id, {})[boundary] = block_id
+                if boundary % self._block_size:
+                    misaligned += 1
             req_meta.state_blocks = blocks
+        if misaligned:
+            self._warn_misaligned_state_boundaries(misaligned)
+
+    def _warn_misaligned_state_boundaries(self, count: int) -> None:
+        """Report state hand-offs that can never reach the external cache.
+
+        Saves and lookups only happen on ``scheduler_block_size`` multiples
+        (the LCM of the group block sizes). With decode context parallelism
+        that LCM exceeds the recurrent-state block, so a state handed off at,
+        say, a 256-aligned prompt end is never saved and hybrid prefixes
+        never hit. Engines that align the hand-off to the LCM never trigger
+        this.
+        """
+        self._misaligned_state_boundaries += count
+        now = time.monotonic()
+        last = self._misaligned_state_warned_at
+        if last is not None and now - last < _MISALIGNED_STATE_WARN_INTERVAL_S:
+            return
+        self._misaligned_state_warned_at = now
+        logger.warning(
+            "dfkv: %d recurrent-state boundaries handed off off the %d-token "
+            "scheduler block grid so far; they cannot be saved, so hybrid "
+            "(linear-attention) prefixes will not hit the external cache. "
+            "This happens with decode context parallelism unless the engine "
+            "aligns state hand-off to the scheduler block size.",
+            self._misaligned_state_boundaries,
+            self._block_size,
+        )
 
     def request_finished(
         self,
