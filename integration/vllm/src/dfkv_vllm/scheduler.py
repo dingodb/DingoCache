@@ -21,6 +21,7 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
 from ._determinism import ensure_deterministic_block_hashing
+from .coordinator import partial_hash_hits_enabled
 from .data import (
     LoadSpec,
     DfkvStoreConnectorMetadata,
@@ -76,6 +77,8 @@ class DfkvStoreScheduler:
     # block grid (never saveable), and when that was last reported.
     _misaligned_state_boundaries = 0
     _misaligned_state_warned_at: float | None = None
+    # vLLM core lands prefix hits on hash blocks inside a scheduler block.
+    _partial_hash_hits = False
 
     def __init__(
         self,
@@ -101,6 +104,9 @@ class DfkvStoreScheduler:
         # Align with the engine's own scheduler_block_size and hash_block_size.
         self._block_size, self._hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, vllm_config
+        )
+        self._partial_hash_hits = partial_hash_hits_enabled(
+            kv_cache_config, self._block_size
         )
 
         # Per-request state
@@ -135,9 +141,15 @@ class DfkvStoreScheduler:
 
         # Leave the sampling tail before lookup: shortening an already
         # validated hit can select different recurrent-state checkpoint keys.
-        token_len = (request.num_tokens - 1) // self._block_size * self._block_size
+        # Partial hash hits land on hash blocks inside a scheduler block.
+        align = self._hash_block_size if self._partial_hash_hits else self._block_size
+        token_len = (request.num_tokens - 1) // align * align
         requested_ttl = _requested_retention_ttl(request)
-        if token_len < self._block_size:
+        # A local partial hit ends inside a block that core copies on write;
+        # an external load into the same block would race that copy.
+        if token_len < align or (
+            self._partial_hash_hits and num_computed_tokens % self._block_size
+        ):
             if requested_ttl:
                 self._retention[request.request_id] = (
                     requested_ttl, 0, num_computed_tokens)
@@ -319,6 +331,7 @@ class DfkvStoreScheduler:
                 skip_save=force_skip_save,
                 block_hashes=request_real.block_hashes,
                 is_last_chunk=(request_tracker.token_len >= last_chunk_tokens_num),
+                num_prompt_tokens=self._tail_prompt_tokens(request_real),
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
@@ -365,6 +378,7 @@ class DfkvStoreScheduler:
                     is_last_chunk=(
                         request_tracker.token_len >= last_chunk_tokens_num
                     ),
+                    num_prompt_tokens=self._tail_prompt_tokens(request_real),
                 )
             else:
                 # Decode/chunked request
@@ -432,6 +446,7 @@ class DfkvStoreScheduler:
                     is_last_chunk=(
                         request_tracker.token_len >= last_chunk_tokens_num
                     ),
+                    num_prompt_tokens=self._tail_prompt_tokens(unfinished_req),
                 )
 
             if req_meta is not None:
@@ -477,6 +492,11 @@ class DfkvStoreScheduler:
                 req_meta.retain_ttl_s = retention[1]
         return meta
 
+    def _tail_prompt_tokens(self, request: Request) -> int | None:
+        """Prompt length whose partial tail a SAVE may publish (partial hash
+        hits only)."""
+        return request.num_prompt_tokens if self._partial_hash_hits else None
+
     def _attach_state_blocks(
         self, meta: DfkvStoreConnectorMetadata, scheduler_output: SchedulerOutput
     ) -> None:
@@ -489,33 +509,72 @@ class DfkvStoreScheduler:
         boundary states (``kv_connector_block_state``) name the exact block
         per boundary; the hand-off is drained every step and the state is
         written by this step's forward, which the worker fences before reading.
+
+        With partial hash hits, a state off the scheduler block grid (the
+        prompt's checkpoint) is saved even in a step without a SAVE, by an
+        offload-only SAVE (``token_len_chunk=0``) like Mooncake's.
         """
         block_state = getattr(scheduler_output, "kv_connector_block_state", None)
         if block_state is None:
             return
         offloads = block_state.boundary_state_offloads
         misaligned = 0
+        saving: set[str] = set()
         for req_meta in meta.requests:
             if not req_meta.can_save:
                 continue
+            saving.add(req_meta.req_id)
             blocks: dict[int, dict[int, int]] = {}
             for group_id, block_id, boundary in offloads.get(req_meta.req_id, ()):
                 blocks.setdefault(group_id, {})[boundary] = block_id
                 if boundary % self._block_size:
                     misaligned += 1
             req_meta.state_blocks = blocks
-        if misaligned:
-            self._warn_misaligned_state_boundaries(misaligned)
+        if not self._partial_hash_hits:
+            if misaligned:
+                self._warn_misaligned_state_boundaries(misaligned)
+            return
+        if self.kv_role == "kv_consumer":
+            return
+        for req_id, entries in offloads.items():
+            tracker = self._request_trackers.get(req_id)
+            req_tuple = self._unfinished_requests.get(req_id)
+            if req_id in saving:
+                continue
+            if (
+                tracker is None
+                or req_tuple is None
+                or req_id in self._preempted_req_ids
+            ):
+                # Finished or preempted within this step: its blocks are
+                # going away, so the offload is dropped.
+                continue
+            blocks = {}
+            for group_id, block_id, boundary in entries:
+                if boundary % self._block_size:
+                    blocks.setdefault(group_id, {})[boundary] = block_id
+            if not blocks:
+                continue
+            tracker.has_pending_offload = True
+            meta.add_request(ReqMeta(
+                req_id=req_id,
+                token_len_chunk=0,
+                block_ids=tracker.allocated_block_ids,
+                block_hashes=req_tuple[0].block_hashes,
+                can_save=True,
+                state_blocks=blocks,
+            ))
 
     def _warn_misaligned_state_boundaries(self, count: int) -> None:
         """Report state hand-offs that can never reach the external cache.
 
-        Saves and lookups only happen on ``scheduler_block_size`` multiples
-        (the LCM of the group block sizes). With decode context parallelism
-        that LCM exceeds the recurrent-state block, so a state handed off at,
-        say, a 256-aligned prompt end is never saved and hybrid prefixes
-        never hit. Engines that align the hand-off to the LCM never trigger
-        this.
+        Without partial hash hits, saves and lookups only happen on
+        ``scheduler_block_size`` multiples (the LCM of the group block sizes).
+        With decode context parallelism that LCM exceeds the recurrent-state
+        block, so a state handed off at, say, a 256-aligned prompt end is
+        never saved and hybrid prefixes never hit. Engines that align the
+        hand-off to the LCM, or that export hash-block hit alignment, never
+        trigger this.
         """
         self._misaligned_state_boundaries += count
         now = time.monotonic()
@@ -548,8 +607,13 @@ class DfkvStoreScheduler:
         tracker = self._request_trackers.get(request.request_id)
         # Missing tracker can happen when the request is aborted before the
         # connector observes the normal finished lifecycle or is preempted
-        # before finishing.
-        if tracker is None or tracker.num_saved_tokens <= 0:
+        # before finishing. A partial tail or offload-only SAVE reads blocks
+        # even when no scheduler block was saved (a prompt shorter than one).
+        if tracker is None or not (
+            tracker.num_saved_tokens > 0
+            or tracker.partial_tail_sent
+            or tracker.has_pending_offload
+        ):
             return False, usage
         total_blocks = sum(len(g) for g in block_ids)
         delay_free_blocks = total_blocks > 0

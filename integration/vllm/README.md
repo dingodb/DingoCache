@@ -351,15 +351,18 @@ payload layouts.
   (#70) shrinks the stride by dcp_size; coverage under the default
   token-level interleave is guarded by
   `tests/test_dcp_lookup_geometry.py`.
-- **DCP + hybrid linear-attention models (KDA/Mamba) get no external hits
-  yet.** Under DCP the scheduler block (LCM) is the attention block x
-  dcp_size, larger than the state block, while vLLM hands off recurrent state
-  only at the state-block-aligned prompt end. dfkv saves and looks up on LCM
-  boundaries only, so those states are never saved and hybrid prefixes miss.
-  The scheduler logs `recurrent-state boundaries handed off off the ...
-  scheduler block grid` when this happens. Pure-attention models and non-DCP
-  deployments are unaffected; hits need an engine that aligns state hand-off
-  to the scheduler block size.
+- **DCP + hybrid linear-attention models (KDA/Mamba) hit only at hash-block
+  granularity, and only on engines that export it.** Under DCP the scheduler
+  block (LCM) is the attention block x dcp_size, larger than the state block,
+  while vLLM hands off recurrent state only at the state-block-aligned prompt
+  end. When vLLM exports `cache_hit_alignment_tokens` below the scheduler
+  block, dfkv saves the attention block holding that prompt end whole, under
+  the prompt end's hash, together with the handed-off states, and looks up
+  and loads at hash-block granularity, so hybrid prefixes hit there. Engines
+  without it keep LCM-only saves and lookups: those states are never saved,
+  hybrid prefixes miss, and the scheduler logs `recurrent-state boundaries
+  handed off off the ... scheduler block grid`. Pure-attention models and
+  non-DCP deployments are unaffected.
 - **GPUDirect needs nvidia-peermem loaded** on the GPU node (`lsmod | grep
   nvidia_peermem`).
 - **First request per DP rank pays a one-time ~2s Triton JIT** (resumed-prefill +

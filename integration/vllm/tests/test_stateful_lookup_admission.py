@@ -361,6 +361,7 @@ def test_shorter_prefix_requires_its_own_state_checkpoints():
     )
     coord = SimpleNamespace(
         lcm_block_size=BLOCK,
+        enable_partial_hash_hits=False,
         load_mask=lambda hashes, length: [
             [True] * (length // BLOCK),
             *[

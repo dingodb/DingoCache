@@ -15,6 +15,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     SingleTypeKVCacheManager,
 )
 from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
     KVCacheGroupSpec,
     KVCacheSpec,
     UniformTypeKVCacheSpecs,
@@ -57,6 +58,36 @@ class _TemplateBlockPool:
         return [self._present_block] * len(group_ids)
 
 
+class ExternalCachedBlockPool(_TemplateBlockPool):
+    """Duck-typed BlockPool backed by a ``(group_id, hash)`` exists set."""
+
+    def __init__(
+        self, hash_block_size: int, exists: set[tuple[int, bytes]]
+    ) -> None:
+        super().__init__(hash_block_size)
+        self._exists = exists
+
+    def get_cached_block(
+        self,
+        block_hash: BlockHash,
+        group_ids: list[int],
+    ) -> list[KVCacheBlock] | None:
+        # Mirrors BlockPool.get_cached_block: hit only when every group_id
+        # (groups sharing a spec) has the hash cached.
+        h = bytes(block_hash)
+        if all((g, h) in self._exists for g in group_ids):
+            return [self._present_block] * len(group_ids)
+        return None
+
+
+def partial_hash_hits_enabled(kv_cache_config, scheduler_block_size: int) -> bool:
+    """Whether vLLM core lands prefix hits on hash blocks inside a scheduler
+    block. Engines that do not export ``cache_hit_alignment_tokens`` never do.
+    """
+    alignment = getattr(kv_cache_config, "cache_hit_alignment_tokens", None)
+    return alignment is not None and alignment < scheduler_block_size
+
+
 def _prefix_cacheable(spec):
     """Older engines name this participates_in_prefix_caching."""
     for name in ("prefix_cacheable", "participates_in_prefix_caching"):
@@ -74,6 +105,7 @@ class DfkvStoreCoordinator:
         scheduler_block_size: int,
         hash_block_size: int,
         use_eagle: bool = False,
+        enable_partial_hash_hits: bool = False,
     ) -> None:
 
         participating = [
@@ -101,6 +133,12 @@ class DfkvStoreCoordinator:
         self.hash_block_size = hash_block_size
         self.lcm_block_size = scheduler_block_size
         self.use_eagle = use_eagle
+        # Core's decision: whether hits land on the hash block, below the
+        # scheduler block. Regular saves stay on the scheduler block grid.
+        self.enable_partial_hash_hits = enable_partial_hash_hits
+        self.hit_alignment = (
+            hash_block_size if enable_partial_hash_hits else scheduler_block_size
+        )
         self._verify_and_split_kv_cache_groups()
 
     def _verify_and_split_kv_cache_groups(self) -> None:
@@ -140,22 +178,27 @@ class DfkvStoreCoordinator:
         token_len: int,
     ) -> tuple[list[bool], ...]:
         """Restore every group required at the already-admitted hit boundary."""
-        aligned = token_len // self.lcm_block_size * self.lcm_block_size
-        return self._cache_mask(aligned, drop_eagle=False)
+        aligned = token_len // self.hit_alignment * self.hit_alignment
+        return self._cache_mask(
+            aligned, drop_eagle=False, alignment=self.hit_alignment
+        )
 
     def store_mask(self, aligned_token_len: int) -> tuple[list[bool], ...]:
         """Persist only stable context, never a volatile draft/lookahead tail."""
-        return self._cache_mask(aligned_token_len, drop_eagle=True)
+        return self._cache_mask(
+            aligned_token_len, drop_eagle=True, alignment=self.lcm_block_size
+        )
 
     def _cache_mask(
         self,
         aligned_token_len: int,
         *,
         drop_eagle: bool,
+        alignment: int,
     ) -> tuple[list[bool], ...]:
-        assert aligned_token_len % self.lcm_block_size == 0, (
+        assert aligned_token_len % alignment == 0, (
             f"aligned_token_len ({aligned_token_len}) must be a multiple of "
-            f"lcm_block_size ({self.lcm_block_size})"
+            f"the hit alignment ({alignment})"
         )
         if aligned_token_len == 0:
             return tuple([] for _ in self.kv_cache_groups)
@@ -166,7 +209,13 @@ class DfkvStoreCoordinator:
         block_pool = _TemplateBlockPool(hash_block_size=self.hash_block_size)
         masks: list[list[bool]] = [[] for _ in self.kv_cache_groups]
         for idx, (spec, group_ids, manager_cls) in enumerate(self.attention_groups):
-            hashes = self.block_hashes_for_spec(dummy_hashes, spec)
+            # Fine-grained managers probe interior hash boundaries, so they
+            # take the raw hash-block list and view whole blocks themselves.
+            hashes = (
+                dummy_hashes
+                if alignment < self.lcm_block_size
+                else self.block_hashes_for_spec(dummy_hashes, spec)
+            )
             hit_blocks = _unwrap_hit_blocks(
                 manager_cls.find_longest_cache_hit(
                     block_hashes=hashes,
@@ -175,7 +224,7 @@ class DfkvStoreCoordinator:
                     block_pool=cast(BlockPool, block_pool),
                     kv_cache_spec=spec,
                     drop_eagle_block=drop_eagle and idx in self.eagle_attn_group_indices,
-                    alignment_tokens=self.lcm_block_size,
+                    alignment_tokens=alignment,
                 )
             )
             for group_id, blocks in zip(group_ids, hit_blocks, strict=True):
@@ -183,6 +232,71 @@ class DfkvStoreCoordinator:
                     block is not block_pool.null_block for block in blocks
                 ]
         return tuple(masks)
+
+    def find_longest_cache_hit(
+        self,
+        block_hashes: list[BlockHash],
+        max_length: int,
+        block_pool: ExternalCachedBlockPool,
+    ) -> int:
+        """Hash-block-granular hit length over ``block_pool``.
+
+        Converges the registered managers as vLLM core's
+        ``HybridKVCacheCoordinator`` does (ported from the Mooncake store
+        connector); requires ``enable_partial_hash_hits``. No Eagle block is
+        dropped, matching ``load_mask``.
+        """
+        groups = sorted(
+            self.attention_groups,
+            key=lambda g: not isinstance(g[0], FullAttentionSpec),
+        )
+        is_simple_hybrid = len(groups) == 2 and isinstance(
+            groups[0][0], FullAttentionSpec
+        )
+        full_attention_hits: dict[int, int] = {}
+        hit_length = max_length
+        while True:
+            curr_hit_length = hit_length
+            for idx, (spec, group_ids, manager_cls) in enumerate(groups):
+                if idx in full_attention_hits:
+                    # A full-attention hit only shrinks with the bound.
+                    curr_hit_length = min(curr_hit_length, full_attention_hits[idx])
+                    continue
+                _, curr_hit_length = manager_cls.find_longest_cache_hit(
+                    block_hashes=block_hashes,
+                    max_length=curr_hit_length,
+                    kv_cache_group_ids=group_ids,
+                    block_pool=cast(BlockPool, block_pool),
+                    kv_cache_spec=spec,
+                    drop_eagle_block=False,
+                    alignment_tokens=self.hash_block_size,
+                )
+                if isinstance(spec, FullAttentionSpec):
+                    full_attention_hits[idx] = curr_hit_length
+            if curr_hit_length >= hit_length:
+                break
+            hit_length = curr_hit_length
+            if is_simple_hybrid:
+                break
+        return hit_length
+
+    def partial_tail_boundary(self, num_prompt_tokens: int) -> int | None:
+        """The prompt's recurrent-state checkpoint when it ends inside a
+        scheduler block, else None.
+
+        Mirrors core's ``get_mamba_prefill_checkpoint_position``: vLLM hands
+        off the state there, and a resend can hit at most up to it.
+        """
+        if not self.enable_partial_hash_hits:
+            return None
+        hbs = self.hash_block_size
+        if self.use_eagle:
+            boundary = num_prompt_tokens // hbs * hbs - hbs
+        else:
+            boundary = (num_prompt_tokens - 1) // hbs * hbs
+        if boundary <= 0 or boundary % self.lcm_block_size == 0:
+            return None
+        return boundary
 
     def block_hashes_for_spec(
         self, block_hashes: list[BlockHash], spec: KVCacheSpec

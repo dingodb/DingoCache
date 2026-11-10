@@ -225,6 +225,7 @@ class PreemptFenceTest(unittest.TestCase):
 
         class Coord:
             lcm_block_size = 16
+            enable_partial_hash_hits = False
 
             def store_mask(self, token_len):
                 entered.set()
@@ -256,6 +257,7 @@ class PreemptFenceTest(unittest.TestCase):
 
         class Coord:
             lcm_block_size = 16
+            enable_partial_hash_hits = False
 
             def store_mask(self, token_len):
                 calls.append(token_len)
@@ -273,6 +275,7 @@ class PreemptFenceTest(unittest.TestCase):
     def test_fence_is_noop_for_unknown_request(self):
         class Coord:
             lcm_block_size = 16
+            enable_partial_hash_hits = False
 
             def store_mask(self, token_len):
                 return []
