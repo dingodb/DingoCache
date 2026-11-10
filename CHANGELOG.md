@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Docs: `load_async=True` validated on a KDA+MLA hybrid (Kimi-Linear-48B-A3B,
+  TP8): L3-restored prompts reproduce their cold outputs and the same
+  external/local/computed token accounting as `False`. Recommendation updated;
+  DSA-indexer hybrids (Kimi K3.1) stay on `False` until validated.
+
 - vLLM connector: reuse a waiting request's completed lookup for
   `lookup_cache_ttl_ms` (default 1000, `0` disables). vLLM re-polls every
   waiting request on every scheduler step, and each poll was a synchronous
