@@ -968,7 +968,7 @@ namespace/key 不一致是预期 cold miss。**空环 / MDS 不可达**可直接
 | `batch_concurrency` | `8` | **大池可调高到 ≈ 节点数** | 跨节点 fan-out，**真正的吞吐杠杆**（depth 是平的） |
 | `rail_affinity` | `False` | 多 rank、多 rail 生产设 `true` | 按 vLLM world-group per-host `local_rank` 选择 primary；在 native client 创建前设置每进程独立 rail 环境 |
 | `rail_affinity_fallbacks` | `1` | `1` | 相邻有序 fallback 数；`0`=严格单 rail，超出可用 rail 数时自动收敛 |
-| `load_async` | `True` | 普通 attention 保持 True；hybrid recurrent 模型设 `False` | `False` 在模型线程串行执行 load，GET 前后均等待 GPU fence，可能位于前一个 forward 之后；hybrid/多 group 和非 full-attention 请求仍进入 `WAITING_FOR_REMOTE_KVS`，不会消费失败 KV。单 group full-attention 保留同步准入。 |
+| `load_async` | `True` | 普通 attention 保持 True；KDA+MLA hybrid 已验证可用 True（见下）；含 DSA indexer 的模型（Kimi K3.1）未验证前设 `False` | `False` 在模型线程串行执行 load，GET 前后均等待 GPU fence，可能位于前一个 forward 之后；hybrid/多 group 和非 full-attention 请求仍进入 `WAITING_FOR_REMOTE_KVS`，不会消费失败 KV。单 group full-attention 保留同步准入。 |
 | `transfer_queue_capacity` | `256` | 保持默认，按压测调 | 每个 worker、每个方向的排队上限（`1..65536`）。满队列时非阻塞拒绝新任务：save 立即释放 finish/free fence，load 标记失败并重算；非法值启动即失败。 |
 | `recv_workers` | `1` | 从 `1` 起压测 | 共享有界 receive queue 的 GET worker 数（`1..32`）；仅在 queue wait 持续升高且后端仍有余量时增加。 |
 | `load_window_keys` | `0`（关闭） | 长上下文 replicated-MLA 按压测设置 | 单次 native GET window 的最大 key 数（`0..65536`）。窗口结果应能放入 `DFKV_NODE_DEDUP_GPU_ARENA_MB`，且在 `DFKV_NODE_DEDUP_WAIT_MS` 内完成，避免 follower rank 超时后重复读取同一批 KV。 |
@@ -979,6 +979,8 @@ namespace/key 不一致是预期 cold miss。**空环 / MDS 不可达**可直接
 | `client_register` | `1`（MDS 发现时） | 默认即可 | MDS 客户端注册开关（`0` 关；env `DFKV_CLIENT_REGISTER=0` 等价，见 §1.1） |
 | `tenant_id` | `default` | 多租户时显式设 | canonical namespace 的 tenant 字段（§1.4） |
 | `model_revision` | model identity | 模型版本滚动时显式设 | canonical namespace 的模型版本字段（§1.4）；改动即换 namespace（冷缓存） |
+
+`load_async=True` 在 KDA+MLA hybrid 上的验证（2026-11-10，hd04 H800×8，Kimi-Linear-48B-A3B，TP8，alaya vLLM `v0.23.1rc1.dev7153`，dfkv 2.35.1）：并发 1、32K 前缀，冷轮后 reset 本地前缀缓存、热轮整段前缀从 L3 读回（外部命中 262,144 token，仅计算 512 token 后缀），`True` 与 `False` 的热轮输出都与冷轮逐 token 一致（8/8）；并发 16、64K 前缀，两种模式的外部命中、本地命中与计算 token 完全相同，零失败，输出一致率相同（受批形状非确定性影响，两种模式均约 53/64）。DSA indexer 池（Kimi K3.1）尚未覆盖。
 
 DCP（decode context parallel）宽度/Rank **不是**本表键：连接器从 vLLM 运行时取
 （`get_dcp_group().world_size`），与 `tp_rank=-1`（replicated-MLA 存储坐标）一起进入
