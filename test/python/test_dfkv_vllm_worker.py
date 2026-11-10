@@ -582,6 +582,7 @@ class LogicalChunkTransferTest(unittest.TestCase):
         client = _Client()
         coord = SimpleNamespace(
             lcm_block_size=64,
+            enable_partial_hash_hits=False,
             store_mask=lambda _token_len: [[True]],
         )
         sender = KVCacheStoreSendingThread(
@@ -664,6 +665,7 @@ class LogicalChunkTransferTest(unittest.TestCase):
             client,
             SimpleNamespace(
                 lcm_block_size=64,
+                enable_partial_hash_hits=False,
                 store_mask=lambda _token_len: [[True]],
             ),
             [_Database()],
@@ -1197,6 +1199,7 @@ class LongestCompletePrefixLookupTest(unittest.TestCase):
 
         class _Coordinator:
             lcm_block_size = 128
+            enable_partial_hash_hits = False
 
             @staticmethod
             def load_mask(_block_hashes, token_len):
@@ -1819,6 +1822,7 @@ class LookupAccountingTest(unittest.TestCase):
 
         coord = SimpleNamespace(
             lcm_block_size=64,
+            enable_partial_hash_hits=False,
             load_mask=lambda _hashes, token_len: [[True] * (token_len // 64)],
             block_hashes_for_spec=lambda values, _spec: values,
         )
