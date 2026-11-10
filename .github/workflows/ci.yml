@@ -328,8 +328,9 @@ jobs:
         run: |
           # The bare container defaults to archive.ubuntu.com, which is
           # intermittently slow/unreachable from GitHub runners; use the
-          # in-region Azure mirror the runner hosts already use.
-          sed -i -E 's#https?://(archive|security)\.ubuntu\.com/ubuntu/?#http://azure.archive.ubuntu.com/ubuntu/#' /etc/apt/sources.list
+          # in-region Azure mirror the runner hosts already use. security.ubuntu.com
+          # stays upstream: the mirror's -security pocket lags (index ahead of pool -> 404).
+          sed -i -E 's#https?://archive\.ubuntu\.com/ubuntu/?#http://azure.archive.ubuntu.com/ubuntu/#' /etc/apt/sources.list
           apt-get -o Acquire::Retries=5 update
           apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
             cmake ninja-build g++ binutils git ca-certificates libibverbs-dev \
