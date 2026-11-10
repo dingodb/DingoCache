@@ -147,7 +147,8 @@ jobs:
           import dfkv_vllm
           import dfkv_vllm._telemetry.metrics_push
           PY
-          docker build --target runtime -t "dfkv:$version" .
+          docker build --target runtime -t "dfkv:$version" \
+            --build-arg UBUNTU_MIRROR=http://azure.archive.ubuntu.com/ubuntu .
           test "$(docker run --rm --entrypoint dfkv_server "dfkv:$version" --version)" = \
             "dfkv_server $version"
           docker image save -o "release/dfkv-${version}-runtime-image.tar" \
