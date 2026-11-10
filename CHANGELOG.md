@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- vLLM connector: warn (rate-limited, with a running count) when the engine
+  hands off recurrent-state boundaries off the scheduler block grid. Saves and
+  lookups use the LCM of the group block sizes; under decode context
+  parallelism that LCM (attention block x dcp_size, e.g. 2048 or 16384)
+  exceeds the linear-attention state block (256 or 2048), and vLLM hands off
+  state only at the state-block-aligned prompt end, so hybrid prefixes were
+  silently never saved and never hit (Kimi-Linear-48B-A3B, TP8 DCP8: 0
+  external hits). Saves and lookups are unchanged; engines that align the
+  hand-off to the LCM do not trigger the warning.
 - Client: warn at startup when `DFKV_NODE_DEDUP_TTL_MS` is below
   `DFKV_NODE_DEDUP_WAIT_MS`. A published node-dedup result is claimable only
   for the TTL; a peer rank that reaches it later (rank skew, a large leader
