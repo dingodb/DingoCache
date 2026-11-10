@@ -476,6 +476,19 @@ def _is_device_transfer(tr) -> bool:
             and getattr(tr, "device_indices", None) is not None)
 
 
+def _l3_page_span(host_pool) -> int:
+    """Host slots one L3 key covers: the pool's page, widened by its DCP size.
+
+    Under DCP SGLang addresses a host pool by logical pages of
+    ``page_size * dcp_size`` slots (one physical page per DCP rank) and
+    ``get_page_buffer_meta`` asserts whole logical pages. Pools without DCP
+    (and KDA state pools, page 1) keep their page size. Computed here instead
+    of importing SGLang's ``l3_page_span`` so builds without it still load.
+    """
+    page_size = int(getattr(host_pool, "page_size", 1) or 1)
+    return page_size * int(getattr(host_pool, "dcp_size", 1) or 1)
+
+
 def _arrays(subkeys, ptrs, sizes):
     """Build aligned key/length/payload arrays for one batch call."""
     n = len(subkeys)
@@ -507,6 +520,14 @@ class DfkvHiCache(HiCacheStorage):
     _has_retain = False
     _retain_tls = threading.local()
     _pending_retain = None
+
+    # DCP L3 admission. SGLang builds that gate HiCache L3 under DCP accept a
+    # 'dynamic' backend only when its class declares this (read before any
+    # instance exists); other SGLang builds ignore it. Keys already carry the
+    # DCP coordinate, the MLA writer is elected per DCP shard, and pool
+    # registration probes a whole logical page (_l3_page_span), so a
+    # DCP-widened page maps to this rank's physical rows.
+    supports_dcp_storage = True
 
     def __init__(self, storage_config: HiCacheStorageConfig, kwargs: Optional[dict] = None):
         cfg = (kwargs or {}) or (getattr(storage_config, "extra_config", None) or {})
@@ -950,7 +971,8 @@ class DfkvHiCache(HiCacheStorage):
     def register_mem_pool_host(self, mem_pool_host):
         if self.transport_mode == "rdma":
             import torch
-            indices = torch.arange(mem_pool_host.page_size, dtype=torch.int64)
+            indices = torch.arange(
+                _l3_page_span(mem_pool_host), dtype=torch.int64)
             meta = mem_pool_host.get_page_buffer_meta(indices)
             if not _meta_has_no_layout(meta):
                 self._validate_pool_object_sizes(
@@ -981,12 +1003,15 @@ class DfkvHiCache(HiCacheStorage):
             page_size = int(getattr(host_pool, "page_size", 1))
             if page_size <= 0:
                 raise RuntimeError("pool page_size must be positive")
+            span = _l3_page_span(host_pool)
+            if span <= 0:
+                raise RuntimeError("pool logical page span must be positive")
             try:
                 import torch as _t
                 arange = getattr(_t, "arange")
-                indices = arange(page_size, dtype=_t.int64)
+                indices = arange(span, dtype=_t.int64)
             except (ImportError, AttributeError):
-                indices = list(range(page_size))
+                indices = list(range(span))
             meta = host_pool.get_page_buffer_meta(indices)
             if _meta_has_no_layout(meta):
                 # The DSV4/DSA hybrid stack (SGLang v0.5.17+) registers the
