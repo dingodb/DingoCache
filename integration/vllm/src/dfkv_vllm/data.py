@@ -389,6 +389,31 @@ class ChunkedTokenDatabase:
                 continue
             yield start_idx, end_idx, self._make_key_by_hash(h.hex())
 
+    def boundary_chunk(
+        self, boundary: int, block_hashes: list[BlockHash]
+    ) -> tuple[int, int, PoolKey] | None:
+        """The whole block holding a prefix's last token, keyed by the hash
+        of that prefix (``boundary`` tokens) rather than of the block's end.
+
+        A partial hash hit stores and loads the block whole: every object of
+        a group has one size, and a hit ending at ``boundary`` recomputes
+        whatever follows it in the block.
+        """
+        if boundary % self.hash_block_size:
+            raise ValueError(
+                f"boundary {boundary} is not a multiple of "
+                f"hash_block_size={self.hash_block_size}"
+            )
+        if (
+            not self.cacheable
+            or boundary <= 0
+            or boundary > len(block_hashes) * self.hash_block_size
+        ):
+            return None
+        start = (boundary - 1) // self.block_size * self.block_size
+        key_hash = block_hashes[boundary // self.hash_block_size - 1]
+        return start, start + self.block_size, self._make_key_by_hash(key_hash.hex())
+
 
 @dataclass
 class LoadSpec:
@@ -413,6 +438,11 @@ class RequestTracker:
     # For a fresh request this is len(prompt). For a resumed-from-preemption
     # request it includes previously-generated tokens, which are re-prefilled.
     prefill_end_tokens: int = 0
+    # A SAVE published the prompt's partial tail; it is due once per request.
+    partial_tail_sent: bool = False
+    # An offload-only SAVE carries recurrent states off the scheduler block
+    # grid. Like the tail, it may read blocks while num_saved_tokens is 0.
+    has_pending_offload: bool = False
 
     def reset(self) -> None:
         self.token_len = 0
@@ -420,6 +450,8 @@ class RequestTracker:
         self.num_saved_tokens = 0
         self.token_ids = None
         self.prefill_end_tokens = 0
+        self.partial_tail_sent = False
+        self.has_pending_offload = False
 
     def update(
         self,
@@ -466,6 +498,9 @@ class ReqMeta:
     # Retention TTL the worker applies to this request's saved chunks (SET);
     # 0 = best-effort. Never part of a cache key.
     retain_ttl_s: int = 0
+    # Set only on the SAVE that first covers the whole prompt with partial
+    # hash hits enabled: the worker then publishes the prompt's partial tail.
+    num_prompt_tokens: int | None = None
 
     @staticmethod
     def from_request_tracker(
@@ -475,8 +510,14 @@ class ReqMeta:
         skip_save: bool | None = False,
         block_hashes: list[BlockHash] | None = None,
         is_last_chunk: bool | None = None,
+        num_prompt_tokens: int | None = None,
     ) -> "ReqMeta | None":
-        """Create ReqMeta from a RequestTracker."""
+        """Create ReqMeta from a RequestTracker.
+
+        ``num_prompt_tokens`` (partial hash hits only) makes the first SAVE
+        that covers the whole prompt publish its partial tail, even without
+        a new scheduler block to save.
+        """
         if block_hashes is None:
             block_hashes = []
         input_token_len = tracker.token_len
@@ -484,7 +525,14 @@ class ReqMeta:
         chunk_boundary = cdiv(tracker.num_saved_tokens + 1, block_size) * block_size
         num_tokens_to_save = input_token_len // block_size * block_size
 
-        skip_save = skip_save or num_tokens_to_save < chunk_boundary
+        publish_tail = (
+            num_prompt_tokens is not None
+            and not tracker.partial_tail_sent
+            and 0 < num_prompt_tokens <= input_token_len
+        )
+        skip_save = skip_save or (
+            num_tokens_to_save < chunk_boundary and not publish_tail
+        )
         # A ReqMeta must never carry both a save AND a load.
         # The save would also be wasted work — the bytes are being looked up
         # in the store right now. Later cached_reqs steps save new tokens
@@ -496,6 +544,7 @@ class ReqMeta:
 
         if not skip_save:
             tracker.num_saved_tokens = num_tokens_to_save
+            tracker.partial_tail_sent |= publish_tail
 
         token_ids = None
         if tracker.token_ids:
@@ -526,6 +575,9 @@ class ReqMeta:
             is_last_chunk=is_last_chunk,
             token_ids=token_ids,
             step_end=input_token_len,
+            num_prompt_tokens=(
+                num_prompt_tokens if publish_tail and not skip_save else None
+            ),
         )
 
 

@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- vLLM connector: partial hash hits for DCP + hybrid linear-attention models.
+  When vLLM exports `KVCacheConfig.cache_hit_alignment_tokens` below the
+  scheduler block (hash-block prefix hits, e.g. Kimi-Linear-48B-A3B TP8 DCP8:
+  KDA state blocks 256, attention 256 x dcp 8 = 2048), lookups land on the
+  hash block, ported from vLLM's Mooncake store connector: the first SAVE
+  that covers the prompt also stores the attention block holding the prompt
+  checkpoint `floor((P - 1) / 256) * 256` whole, under that checkpoint's
+  hash, next to the recurrent states vLLM hands off there (an offload-only
+  SAVE when the hand-off step has no other SAVE). A hit inside an attention
+  block loads that object into a whole block; core recomputes the rest.
+  Lookups probe whole attention blocks, the hash boundaries inside the first
+  block not stored whole, and states at those and the scheduler block
+  boundaries, under every rank namespace; an external hit is declined when
+  the local prefix hit ends inside a block (core's copy-on-write of that
+  block would race the load), and block free waits for a tail-only SAVE.
+  Object sizes and key formats are unchanged; engines without the attribute,
+  or with hits on the scheduler block, keep the previous behaviour and the
+  off-grid hand-off warning below.
 - vLLM connector: warn (rate-limited, with a running count) when the engine
   hands off recurrent-state boundaries off the scheduler block grid. Saves and
   lookups use the LCM of the group block sizes; under decode context

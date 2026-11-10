@@ -73,7 +73,13 @@ from .client_ranks import (
     resolve_client_ranks,
     should_create_client,
 )
-from .coordinator import DfkvStoreCoordinator, _prefix_cacheable, _unwrap_spec
+from .coordinator import (
+    DfkvStoreCoordinator,
+    ExternalCachedBlockPool,
+    _prefix_cacheable,
+    _unwrap_spec,
+    partial_hash_hits_enabled,
+)
 from .data import (
     VLLM_RAW_LAYOUT,
     ChunkedTokenDatabase,
@@ -769,9 +775,67 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 lambda: self._active_req_id != req_id, timeout_s
             )
 
+    def _partial_tail_chunks(
+        self, req_meta: ReqMeta, token_len: int
+    ) -> list[tuple[int, int, int, PoolKey, int]]:
+        """``(group, start, end, key, block_id)`` of the whole blocks a
+        partial hash hit needs beyond the positional SAVE up to ``token_len``.
+
+        Each is keyed by the hash of the prefix ending at its boundary: the
+        recurrent states vLLM handed off off the scheduler block grid, and,
+        on the SAVE that first covers the prompt, every other group's blocks
+        from the last scheduler block boundary to the prompt checkpoint (the
+        attention block that holds it). Both use the checkpoint vLLM hands
+        off, so a hit there finds its attention tail and states together.
+        """
+        coord = self.coord
+        if not coord.enable_partial_hash_hits:
+            return []
+        chunks: list[tuple[int, int, int, PoolKey, int]] = []
+        for g_idx, blocks in (req_meta.state_blocks or {}).items():
+            if g_idx not in self.tp_sharded_groups:
+                continue
+            db = self.token_databases[g_idx]
+            for boundary, block_id in blocks.items():
+                if boundary <= token_len and boundary % db.block_size == 0:
+                    continue  # the positional SAVE stores it
+                chunk = db.boundary_chunk(boundary, req_meta.block_hashes)
+                if chunk is not None and block_id > 0:
+                    chunks.append((g_idx, *chunk, block_id))
+
+        if req_meta.num_prompt_tokens is None:
+            return chunks
+        boundary = coord.partial_tail_boundary(req_meta.num_prompt_tokens)
+        if boundary is None:
+            return chunks
+        masks = coord.load_mask(req_meta.block_hashes, boundary)
+        first = boundary // coord.lcm_block_size * coord.lcm_block_size
+        for g_idx, db in enumerate(self.token_databases):
+            if g_idx in self.tp_sharded_groups or not db.cacheable:
+                continue
+            mask = masks[g_idx]
+            block_ids = _logical_block_ids(mask, req_meta.block_ids[g_idx])
+            for idx in range(first // db.block_size, len(mask)):
+                # Payload replicas split the tail like positional chunks.
+                if (
+                    not mask[idx]
+                    or block_ids[idx] <= 0
+                    or self.stripe_idx is None
+                    or idx % self.stripe_step != self.stripe_idx
+                ):
+                    continue
+                chunk = db.boundary_chunk(
+                    min((idx + 1) * db.block_size, boundary),
+                    req_meta.block_hashes,
+                )
+                if chunk is not None:
+                    chunks.append((g_idx, *chunk, block_ids[idx]))
+        return chunks
+
     def _handle_request(self, req_meta: ReqMeta):
-        # Cache hits are always a multiple of ``lcm_block_size`` tokens, which
-        # is also ``store_mask``'s precondition.
+        # Positional saves stay on ``lcm_block_size`` multiples, which is
+        # also ``store_mask``'s precondition; partial hash hits add whole
+        # blocks keyed off that grid (``_partial_tail_chunks``).
         lcm_block_size = self.coord.lcm_block_size
         token_len = req_meta.token_len_chunk // lcm_block_size * lcm_block_size
         block_ids_per_group = req_meta.block_ids
@@ -794,7 +858,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # always signals ``task_done``) so the scheduler can release the GPU
         # blocks it pinned for this request even when the store path raises.
         try:
-            if token_len == 0:
+            tail_chunks = self._partial_tail_chunks(req_meta, token_len)
+            if token_len == 0 and not tail_chunks:
                 return
 
             # Within each lcm region only per-spec relevant chunks are loaded
@@ -806,6 +871,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
             block_hashes: list[BlockHash] = []
             parent_hashes: list[BlockHash | None] = []
             group_indices: list[int] = []
+            descriptor_chunks: list[tuple[object, int, int, Sequence[int]]] = []
+            emit_events: list[bool] = []
             logical_block_ids_per_group: list[list[int]] = []
             stripe_position = 0
             skipped_state = False
@@ -873,6 +940,23 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     block_hashes.append(chunk_hash)
                     parent_hashes.append(chunk_parent)
                     group_indices.append(g_idx)
+                    descriptor_chunks.append(
+                        (db, start, end, logical_block_ids_per_group[g_idx])
+                    )
+                    emit_events.append(True)
+
+            # Like vLLM's own partial-block cache entries, objects keyed off
+            # the block grid emit no KV events.
+            for g_idx, start, end, key, block_id in tail_chunks:
+                db = self.token_databases[g_idx]
+                starts.append(start)
+                ends.append(end)
+                keys.append(key.to_bytes())
+                block_hashes.append(BlockHash(bytes.fromhex(key.chunk_hash)))
+                parent_hashes.append(None)
+                group_indices.append(g_idx)
+                descriptor_chunks.append((db, 0, db.block_size, [block_id]))
+                emit_events.append(False)
 
             if skipped_state:
                 logger.warning(
@@ -938,6 +1022,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
             block_hashes = [block_hashes[i] for i in missing_indices]
             parent_hashes = [parent_hashes[i] for i in missing_indices]
             group_indices = [group_indices[i] for i in missing_indices]
+            descriptor_chunks = [descriptor_chunks[i] for i in missing_indices]
+            emit_events = [emit_events[i] for i in missing_indices]
 
             logger.debug(
                 "Storing KV cache for %d blocks (groups=%s) for request %s",
@@ -946,19 +1032,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 req_id,
             )
 
-            descriptor_chunks = [
-                (
-                    self.token_databases[g_idx],
-                    start,
-                    end,
-                    logical_block_ids_per_group[g_idx],
-                )
-                for start, end, g_idx in zip(
-                    starts, ends, group_indices, strict=True
-                )
-            ]
             descriptor_batch = SgDescriptorBatch.from_chunks(descriptor_chunks)
-            stored_events: list[BlockStored] = []
+            # One entry per key when KV events are on; None for keys off the
+            # block grid.
+            stored_events: list[BlockStored | None] = []
             new_block_hashes = [maybe_convert_block_hash(bh) for bh in block_hashes]
 
             for idx, (s, e, g_idx) in enumerate(
@@ -966,7 +1043,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
             ):
                 db = self.token_databases[g_idx]
 
-                if self.enable_kv_event:
+                if self.enable_kv_event and not emit_events[idx]:
+                    stored_events.append(None)
+                elif self.enable_kv_event:
                     token_ids = (
                         req_meta.token_ids[s:e]
                         if req_meta.token_ids is not None
@@ -1012,7 +1091,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     successful_events = [
                         event
                         for event, rc in zip(stored_events, res, strict=True)
-                        if rc == 0
+                        if rc == 0 and event is not None
                     ]
                 self._record_operation(
                     "save_put",
@@ -1490,9 +1569,17 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 logical_block_ids = _logical_block_ids(
                     mask, req_meta.block_ids[g_idx]
                 )
-                for start, end, key in db.process_tokens(
-                    token_len, req_meta.block_hashes, mask_num
-                ):
+                full_len = token_len // db.block_size * db.block_size
+                chunks = list(
+                    db.process_tokens(full_len, req_meta.block_hashes, mask_num)
+                )
+                if full_len != token_len:
+                    # A partial hash hit ends inside this block: it was saved
+                    # whole under the hash of the hit's own prefix.
+                    tail = db.boundary_chunk(token_len, req_meta.block_hashes)
+                    if tail is not None and tail[0] >= mask_num:
+                        chunks.append(tail)
+                for start, end, key in chunks:
                     chunk_idx = start // db.block_size
                     if chunk_idx >= len(mask) or not mask[chunk_idx]:
                         continue
@@ -2036,6 +2123,9 @@ class DfkvStoreWorker:
             scheduler_block_size=self.block_size,
             hash_block_size=self.hash_block_size,
             use_eagle=use_eagle,
+            enable_partial_hash_hits=partial_hash_hits_enabled(
+                kv_cache_config, self.block_size
+            ),
         )
         # One ChunkedTokenDatabase per group; addresses populated in
         # register_kv_caches once the kv-cache layout is known.
@@ -2530,6 +2620,39 @@ class DfkvStoreWorker:
         """
         first_candidate_keys: list[bytes] | None = None
 
+        def probe(candidate_keys: list[bytes], num_logical_keys: int) -> list[int] | None:
+            """Per-key presence (1/0) under a retention REFRESH; None on error."""
+            lookup_start = time.perf_counter()
+            try:
+                codes = self.client.batch_retain(
+                    candidate_keys, 0, dfkv_cabi.DFKV_RETAIN_REFRESH)
+                res = [1 if c in dfkv_cabi.RETAIN_HIT_CODES else 0
+                       for c in codes]
+                if len(res) != len(candidate_keys):
+                    raise RuntimeError(
+                        "batch_exist returned incomplete per-key results: "
+                        f"keys={len(candidate_keys)} statuses={len(res)}"
+                    )
+            except Exception as e:
+                self._record_kv_connector_operation(
+                    "lookup_exists",
+                    time.perf_counter() - lookup_start,
+                    len(candidate_keys),
+                    num_logical_keys=num_logical_keys,
+                    status="error",
+                    num_failed_keys=len(candidate_keys),
+                )
+                logger.error("Remote connection failed in lookup: %s", e)
+                return None
+    
+            self._record_kv_connector_operation(
+                "lookup_exists",
+                time.perf_counter() - lookup_start,
+                len(candidate_keys),
+                num_logical_keys=num_logical_keys,
+            )
+            return res
+
         def lookup_candidate(token_len: int) -> int:
             nonlocal first_candidate_keys
             """Check how many prefix tokens exist in the store.
@@ -2619,35 +2742,9 @@ class DfkvStoreWorker:
             if first_candidate_keys is None:
                 first_candidate_keys = candidate_keys
     
-            lookup_start = time.perf_counter()
-            try:
-                codes = self.client.batch_retain(
-                    candidate_keys, 0, dfkv_cabi.DFKV_RETAIN_REFRESH)
-                res = [1 if c in dfkv_cabi.RETAIN_HIT_CODES else 0
-                       for c in codes]
-                if len(res) != len(candidate_keys):
-                    raise RuntimeError(
-                        "batch_exist returned incomplete per-key results: "
-                        f"keys={len(candidate_keys)} statuses={len(res)}"
-                    )
-            except Exception as e:
-                self._record_kv_connector_operation(
-                    "lookup_exists",
-                    time.perf_counter() - lookup_start,
-                    len(candidate_keys),
-                    num_logical_keys=len(expected_per_object),
-                    status="error",
-                    num_failed_keys=len(candidate_keys),
-                )
-                logger.error("Remote connection failed in lookup: %s", e)
+            res = probe(candidate_keys, len(expected_per_object))
+            if res is None:
                 return 0
-    
-            self._record_kv_connector_operation(
-                "lookup_exists",
-                time.perf_counter() - lookup_start,
-                len(candidate_keys),
-                num_logical_keys=len(expected_per_object),
-            )
     
             # A semantic object exists only if every TP*PP coordinate exists. A
             # logical LCM chunk is complete only if all of its semantic objects do.
@@ -2690,6 +2787,139 @@ class DfkvStoreWorker:
             )
             return hit_length
     
+        def lookup_partial(token_len: int) -> int:
+            """Hash-block-granular hit, converged as vLLM core over the
+            objects present under every rank namespace of their group.
+
+            A hit inside an attention block needs that block stored under
+            the hit's own hash, so only these are probed: each attention
+            group's whole blocks and the interior hash boundaries of its
+            first block not stored whole, and each recurrent state at the
+            scheduler block boundaries below that and at those interior
+            boundaries. A second probe follows only when a whole block is
+            missing below ``token_len``.
+            """
+            coord = self.coord
+            hbs = coord.hash_block_size
+            lcm = coord.lcm_block_size
+            token_len = min(token_len, len(block_hashes) * hbs) // hbs * hbs
+            if token_len <= 0:
+                return 0
+            cacheable = sorted(
+                g for _, group_ids, _ in coord.attention_groups for g in group_ids
+            )
+            state_groups = [
+                g for g in cacheable
+                if isinstance(
+                    _unwrap_spec(self._kv_cache_groups[g].kv_cache_spec), MambaSpec
+                )
+            ]
+            attention_groups = [g for g in cacheable if g not in state_groups]
+            block_sizes = {g: self.token_dbs[g].block_size for g in cacheable}
+            views = {
+                g: coord.block_hashes_for_spec(
+                    block_hashes, self._kv_cache_groups[g].kv_cache_spec
+                )
+                for g in attention_groups
+            }
+            exists: set[tuple[int, bytes]] = set()
+            probed: set[tuple[int, BlockHash]] = set()
+
+            def probe_objects(objects: list[tuple[int, BlockHash]]) -> bool:
+                nonlocal first_candidate_keys
+                objects = [o for o in dict.fromkeys(objects) if o not in probed]
+                probed.update(objects)
+                keys: list[bytes] = []
+                owners: list[tuple[int, BlockHash]] = []
+                for g_idx, h in objects:
+                    db = self.token_dbs[g_idx]
+                    for tp, pcp, dcp in _key_namespaces(
+                        tp_size=self.tp_size,
+                        pcp_size=db.metadata.pcp_size,
+                        dcp_size=db.metadata.dcp_size,
+                        num_kv_heads=self.num_kv_head,
+                        use_mla=db.metadata.tp_rank < 0,
+                        tp_sharded=g_idx in state_groups,
+                    ):
+                        md = dataclasses.replace(
+                            db.metadata, tp_rank=tp, pcp_rank=pcp, dcp_rank=dcp
+                        )
+                        keys.append(PoolKey(md, h.hex()).to_bytes())
+                        owners.append((g_idx, h))
+                if not keys:
+                    return True
+                if first_candidate_keys is None:
+                    first_candidate_keys = keys
+                res = probe(keys, len(objects))
+                if res is None:
+                    return False
+                missing = {o for o, present in zip(owners, res, strict=True)
+                           if present != 1}
+                exists.update(
+                    (g_idx, bytes(h)) for g_idx, h in objects
+                    if (g_idx, h) not in missing
+                )
+                return True
+
+            def candidates(full_blocks: dict[int, int], *, with_full: bool):
+                objects: list[tuple[int, BlockHash]] = []
+                boundaries: set[int] = set()
+                for g in attention_groups:
+                    if with_full:
+                        objects.extend(
+                            (g, views[g][i]) for i in range(full_blocks[g])
+                        )
+                    start = full_blocks[g] * block_sizes[g]
+                    end = min(start + block_sizes[g], token_len + 1)
+                    for c in range(start + hbs, end, hbs):
+                        objects.append((g, block_hashes[c // hbs - 1]))
+                        boundaries.add(c)
+                if with_full:
+                    whole = min(
+                        (full_blocks[g] * block_sizes[g] for g in attention_groups),
+                        default=token_len,
+                    )
+                    boundaries.update(range(lcm, whole // lcm * lcm + 1, lcm))
+                objects.extend(
+                    (g, block_hashes[c // hbs - 1])
+                    for g in state_groups for c in sorted(boundaries)
+                )
+                return objects
+
+            assumed = {g: token_len // block_sizes[g] for g in attention_groups}
+            if not probe_objects(candidates(assumed, with_full=True)):
+                return 0
+            leading: dict[int, int] = {}
+            for g in attention_groups:
+                n = 0
+                while n < assumed[g] and (g, bytes(views[g][n])) in exists:
+                    n += 1
+                leading[g] = n
+            if leading != assumed and not probe_objects(
+                candidates(leading, with_full=False)
+            ):
+                return 0
+
+            pool = ExternalCachedBlockPool(hbs, exists)
+            max_length = token_len
+            while max_length > 0:
+                hit = coord.find_longest_cache_hit(block_hashes, max_length, pool)
+                # LOAD reads a hit inside an attention block from the object
+                # stored under the hit's own hash; core may pair a state with
+                # a longer tail in that block.
+                if all(
+                    hit % block_sizes[g] == 0
+                    or (g, bytes(block_hashes[hit // hbs - 1])) in exists
+                    for g in attention_groups
+                ):
+                    logger.debug(
+                        "dfkv partial lookup: token_len=%d objects=%d -> "
+                        "hit_length=%d", token_len, len(exists), hit,
+                    )
+                    return hit
+                max_length = hit - hbs
+            return 0
+
         def applied_ttl() -> int:
             if retain_ttl_s <= 0 or not first_candidate_keys:
                 return 0
@@ -2706,6 +2936,8 @@ class DfkvStoreWorker:
                 logger.warning("dfkv retention limits/precheck failed: %s", e)
                 return 0
 
+        if self.coord.enable_partial_hash_hits:
+            return lookup_partial(token_len), applied_ttl()
         candidate = token_len // self.coord.lcm_block_size * self.coord.lcm_block_size
         while candidate > 0:
             hit = lookup_candidate(candidate)
