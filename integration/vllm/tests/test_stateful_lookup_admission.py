@@ -1,6 +1,7 @@
 """Hybrid resume admission must validate the checkpoint at the returned depth."""
 import ctypes
 import hashlib
+import inspect
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -67,6 +68,7 @@ def test_noallocation_prefill_saves_state_before_page_recycling(hybrid_workers, 
         request_id="chunked", num_computed_tokens=0, num_prompt_tokens=4000,
         num_tokens=4000, shared_prefix_boundary=0, all_token_ids=list(range(4000)),
         block_hashes=hashes, num_output_tokens=0, num_output_placeholders=0,
+        is_prefill_chunk=False,
     )
     upstream = SimpleNamespace(
         use_pp=False, use_v2_model_runner=False,
@@ -90,6 +92,9 @@ def test_noallocation_prefill_saves_state_before_page_recycling(hybrid_workers, 
         )},
     ).items():
         setattr(scheduler, name, value)
+    # vLLM main dropped the resumed_reqs parameter after the CI pin.
+    signature = inspect.signature(Scheduler._make_cached_request_data)
+    resumed_reqs = {"resumed_reqs": []} if "resumed_reqs" in signature.parameters else {}
     saves, empty_steps, recycled_pages, state_pages = [], 0, set(), set()
     for _ in range(13):
         start = request.num_computed_tokens
@@ -100,8 +105,10 @@ def test_noallocation_prefill_saves_state_before_page_recycling(hybrid_workers, 
         groups = tuple(manager.allocate_new_blocks(request.request_id, end, end)
                        for manager in managers)
         cached = Scheduler._make_cached_request_data(
-            upstream, [request], [], {request.request_id: count}, {},
-            {request.request_id: KVCacheBlocks(groups)},
+            upstream, running_reqs=[request],
+            num_scheduled_tokens={request.request_id: count}, spec_decode_tokens={},
+            req_to_new_blocks={request.request_id: KVCacheBlocks(groups)},
+            **resumed_reqs,
         )
         empty_steps += cached.new_block_ids[0] is None
         metadata = scheduler.build_connector_meta(SimpleNamespace(
