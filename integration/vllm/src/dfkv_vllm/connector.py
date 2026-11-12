@@ -46,6 +46,11 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
+try:
+    from vllm.config.kv_transfer import KVCacheAccess
+except ImportError:  # vLLM before #66605 lists RDMA connectors by name
+    KVCacheAccess = None
+
 from .data import (
     DfkvStoreConnectorMetadata,
     VLLM_RAW_LAYOUT,
@@ -135,10 +140,10 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
         return False
 
     @classmethod
-    def registers_kv_cache_memory(cls, kv_transfer_config: "KVTransferConfig") -> bool:
+    def kv_cache_access(cls, kv_transfer_config: "KVTransferConfig") -> "KVCacheAccess":
         # The workers register the device KV cache with the RDMA NIC, so the
         # extensible KV cache must back each segment with one physical chunk.
-        return True
+        return KVCacheAccess.REGISTERS
 
     @property
     def prefer_cross_layer_blocks(self) -> bool:
@@ -345,6 +350,16 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
             self.connector_worker.register_kv_caches(kv_caches)
         finally:
             self._finish_call()
+
+    def unregister_kv_caches(self) -> None:
+        # vLLM releases the KV cache's physical memory next, and remaps it on
+        # restore_kv_caches: the GPUDirect memory registrations, which cannot
+        # be dropped, would then point at freed pages.
+        raise RuntimeError(
+            "DfkvStoreConnector cannot release the KV cache's memory "
+            "(release_kv_cache_memory, or a weight update borrowing it): its "
+            "RDMA memory registrations cannot follow the remap."
+        )
 
     def register_cross_layers_kv_cache(
         self, kv_cache: torch.Tensor, attn_backend: type
