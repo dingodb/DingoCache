@@ -230,6 +230,46 @@ from dfkv_vllm.worker import (  # noqa: E402
 )
 
 
+_COORDINATOR_SOURCE = (
+    ROOT / "integration" / "vllm" / "src" / "dfkv_vllm" / "coordinator.py"
+)
+
+
+sys.path.insert(0, str(ROOT / "integration" / "vllm" / "tests"))
+from _coordinator_fake import fake_coordinator as _fake_coordinator  # noqa: E402
+
+class CoordinatorFakeDriftTest(unittest.TestCase):
+    def test_fake_defaults_every_real_coordinator_attribute(self) -> None:
+        import ast
+
+        tree = ast.parse(_COORDINATOR_SOURCE.read_text())
+        cls = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "DfkvStoreCoordinator"
+        )
+        real = set()
+        for node in ast.walk(cls):
+            targets = (
+                node.targets if isinstance(node, ast.Assign)
+                else [node.target] if isinstance(node, ast.AnnAssign)
+                else []
+            )
+            for target in targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "self"
+                ):
+                    real.add(target.attr)
+        self.assertTrue(real)
+        missing = real - set(vars(_fake_coordinator()))
+        self.assertFalse(
+            missing,
+            f"_fake_coordinator lacks DfkvStoreCoordinator attributes {sorted(missing)}",
+        )
+
+
 
 # LookupKeyClient reads its result-reuse window from the connector config.
 _LOOKUP_CLIENT_CONFIG = SimpleNamespace(
@@ -580,10 +620,8 @@ class LogicalChunkTransferTest(unittest.TestCase):
                 return [0] * len(keys)
 
         client = _Client()
-        coord = SimpleNamespace(
-            lcm_block_size=64,
-            enable_partial_hash_hits=False,
-            store_mask=lambda _token_len: [[True]],
+        coord = _fake_coordinator(
+            64, store_mask=lambda _token_len: [[True]],
         )
         sender = KVCacheStoreSendingThread(
             client,
@@ -663,10 +701,8 @@ class LogicalChunkTransferTest(unittest.TestCase):
         client = _Client()
         sender = KVCacheStoreSendingThread(
             client,
-            SimpleNamespace(
-                lcm_block_size=64,
-                enable_partial_hash_hits=False,
-                store_mask=lambda _token_len: [[True]],
+            _fake_coordinator(
+                64, store_mask=lambda _token_len: [[True]],
             ),
             [_Database()],
             block_size=64,
@@ -841,8 +877,8 @@ class LogicalChunkTransferTest(unittest.TestCase):
                 return hits, lengths
 
         client = _Client()
-        coord = SimpleNamespace(
-            load_mask=lambda _hashes, _token_len: [[True, True]],
+        coord = _fake_coordinator(
+            64, load_mask=lambda _hashes, _token_len: [[True, True]],
         )
         receiver = KVCacheStoreRecvingThread(
             client,
@@ -1197,17 +1233,15 @@ class LongestCompletePrefixLookupTest(unittest.TestCase):
             fine_hashes = [self._hash(f"fine-{index}") for index in range(6)]
         wide_spec, fine_spec = object(), object()
 
-        class _Coordinator:
-            lcm_block_size = 128
-            enable_partial_hash_hits = False
-
-            @staticmethod
-            def load_mask(_block_hashes, token_len):
-                return [[True] * (token_len // 128), [True] * (token_len // 64)]
-
-            @staticmethod
-            def block_hashes_for_spec(_block_hashes, spec):
-                return wide_hashes if spec is wide_spec else fine_hashes
+        coordinator = _fake_coordinator(
+            128,
+            load_mask=lambda _block_hashes, token_len: [
+                [True] * (token_len // 128), [True] * (token_len // 64)
+            ],
+            block_hashes_for_spec=lambda _block_hashes, spec: (
+                wide_hashes if spec is wide_spec else fine_hashes
+            ),
+        )
 
 
         class _Client:
@@ -1231,7 +1265,7 @@ class LongestCompletePrefixLookupTest(unittest.TestCase):
         client = _Client()
         worker = DfkvStoreWorker.__new__(DfkvStoreWorker)
         worker.client = client
-        worker.coord = _Coordinator()
+        worker.coord = coordinator
         worker.token_dbs = [
             SimpleNamespace(block_size=128, metadata=self._metadata(0)),
             SimpleNamespace(block_size=64, metadata=self._metadata(1)),
@@ -1820,9 +1854,8 @@ class LookupAccountingTest(unittest.TestCase):
         )
 
 
-        coord = SimpleNamespace(
-            lcm_block_size=64,
-            enable_partial_hash_hits=False,
+        coord = _fake_coordinator(
+            64,
             load_mask=lambda _hashes, token_len: [[True] * (token_len // 64)],
             block_hashes_for_spec=lambda values, _spec: values,
         )

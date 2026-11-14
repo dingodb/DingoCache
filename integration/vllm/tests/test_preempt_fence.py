@@ -14,6 +14,8 @@ import types
 import unittest
 from unittest.mock import patch
 
+from _coordinator_fake import fake_coordinator
+
 try:
     import torch
     from vllm.v1.core.kv_cache_utils import BlockHash
@@ -223,16 +225,12 @@ class PreemptFenceTest(unittest.TestCase):
         entered = threading.Event()
         release = threading.Event()
 
-        class Coord:
-            lcm_block_size = 16
-            enable_partial_hash_hits = False
+        def store_mask(token_len):
+            entered.set()
+            release.wait(10)
+            return []
 
-            def store_mask(self, token_len):
-                entered.set()
-                release.wait(10)
-                return []
-
-        t = self._mk_thread(Coord())
+        t = self._mk_thread(fake_coordinator(16, store_mask=store_mask))
         request = _req_meta("r1")
         t.add_stored_request(request)
         t.add_request(request)
@@ -255,15 +253,11 @@ class PreemptFenceTest(unittest.TestCase):
         # before any work (store_mask is the first touch inside the body).
         calls: list[int] = []
 
-        class Coord:
-            lcm_block_size = 16
-            enable_partial_hash_hits = False
+        def store_mask(token_len):
+            calls.append(token_len)
+            return []
 
-            def store_mask(self, token_len):
-                calls.append(token_len)
-                return []
-
-        t = self._mk_thread(Coord())
+        t = self._mk_thread(fake_coordinator(16, store_mask=store_mask))
         request = _req_meta("r2")
         t.add_stored_request(request)
         t.delete_finished_stored_request("r2")  # preempt before dequeue
@@ -273,14 +267,9 @@ class PreemptFenceTest(unittest.TestCase):
         self.assertTrue(t.wait_for_inflight_put("r2", timeout_s=1))
 
     def test_fence_is_noop_for_unknown_request(self):
-        class Coord:
-            lcm_block_size = 16
-            enable_partial_hash_hits = False
-
-            def store_mask(self, token_len):
-                return []
-
-        t = self._mk_thread(Coord())
+        t = self._mk_thread(
+            fake_coordinator(16, store_mask=lambda _token_len: [])
+        )
         self.assertTrue(t.wait_for_inflight_put("never-seen", timeout_s=1))
 
 

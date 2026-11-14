@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+
+from _coordinator_fake import fake_coordinator
 import torch
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import (
@@ -366,9 +368,8 @@ def test_shorter_prefix_requires_its_own_state_checkpoints():
         PoolKey(metadata[group], hashes[1].hex()).to_bytes()
         for group in (1, 2)
     )
-    coord = SimpleNamespace(
-        lcm_block_size=BLOCK,
-        enable_partial_hash_hits=False,
+    coord = fake_coordinator(
+        BLOCK,
         load_mask=lambda hashes, length: [
             [True] * (length // BLOCK),
             *[
