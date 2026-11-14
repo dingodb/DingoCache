@@ -16,6 +16,7 @@ jobs:
   build-test-package:
     name: test and package
     runs-on: ubuntu-22.04
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
@@ -64,7 +65,7 @@ jobs:
       # by release qualification on real RDMA hardware.
       - name: Run release tests
         run: |
-          ctest --test-dir build-release --output-on-failure -j2 \
+          ctest --test-dir build-release --output-on-failure --timeout 300 -j2 \
             --exclude-regex '^RdmaLoopback\.'
 
       - name: Validate observability configuration
@@ -170,6 +171,7 @@ jobs:
     name: publish immutable release
     needs: build-test-package
     runs-on: ubuntu-22.04
+    timeout-minutes: 60
     permissions:
       contents: write
     steps:
