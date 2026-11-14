@@ -18,6 +18,7 @@ jobs:
   build-test:
     name: build & test (${{ matrix.compiler }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -64,11 +65,12 @@ jobs:
         run: cmake --build build -j
 
       - name: Test (C++ gtests + Python plugin)
-        run: ctest --test-dir build --output-on-failure -j
+        run: ctest --test-dir build --output-on-failure --timeout 300 -j
 
   container-deployment-smoke:
     name: runtime container deployment smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -157,6 +159,7 @@ jobs:
   thread-sanitizer:
     name: ThreadSanitizer (race detection)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -183,11 +186,12 @@ jobs:
             -DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=thread
           cmake --build build-tsan -j
       - name: Run C++ suites under TSan (python excluded — ctypes dlopen)
-        run: TSAN_OPTIONS=halt_on_error=1:allocator_may_return_null=1 ctest --test-dir build-tsan -E 'python_plugin|python_hicache_device_direct' --output-on-failure
+        run: TSAN_OPTIONS=halt_on_error=1:allocator_may_return_null=1 ctest --test-dir build-tsan -E 'python_plugin|python_hicache_device_direct' --output-on-failure --timeout 300
 
   rdma-compile:
     name: RDMA build (compile-check)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -217,6 +221,7 @@ jobs:
   rdma-loopback:
     name: RDMA datapath (Soft-RoCE loopback + TSan)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -316,6 +321,7 @@ jobs:
   portable-static-build:
     name: portable static artifacts
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     # Build inside ubuntu:22.04 (glibc 2.35) so the dynamically-linked artifacts
     # have a low glibc floor and run on any node with glibc >= 2.35. Building on
     # the runner's ubuntu-latest (glibc 2.39) bakes in GLIBC_2.3x symbols that
@@ -429,6 +435,7 @@ jobs:
   python-wheels:
     name: connector wheels
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
