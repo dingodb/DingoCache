@@ -2242,6 +2242,9 @@ std::vector<bool> KVClient::BatchExistDirect(
       if (gstat[g].busy_us > a.wall_us) {
         a.wall_us = gstat[g].busy_us;
         a.dev = gstat[g].dev;
+      } else if (a.dev.empty()) {
+        // A shard timed at 0 us (sub-microsecond) still names its rail.
+        a.dev = gstat[g].dev;
       }
       if (gstat[g].issued_keys > 0) a.shards += 1;
       a.hit += gstat[g].hit;
@@ -2473,6 +2476,9 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
       a.busy_us += gstat[g].busy_us;
       if (gstat[g].busy_us > a.wall_us) {
         a.wall_us = gstat[g].busy_us;
+        a.dev = gstat[g].dev;
+      } else if (a.dev.empty()) {
+        // A shard timed at 0 us (sub-microsecond) still names its rail.
         a.dev = gstat[g].dev;
       }
       if (gstat[g].issued_keys > 0) a.shards += 1;
@@ -2865,6 +2871,9 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
         a.busy_us += gstat[g].busy_us;
         if (gstat[g].busy_us > a.wall_us) {
           a.wall_us = gstat[g].busy_us;
+          a.dev = gstat[g].dev;
+        } else if (a.dev.empty()) {
+          // A shard timed at 0 us (sub-microsecond) still names its rail.
           a.dev = gstat[g].dev;
         }
         if (gstat[g].issued_keys > 0) a.shards += 1;

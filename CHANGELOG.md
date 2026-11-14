@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Client per-node stats: a shard timed at 0 us (sub-microsecond) no longer
+  drops its rail from the `pernode-get`/`pernode-exist` line. The merge kept
+  `dev` only from a shard strictly slower than the running maximum, so a
+  0 us shard never set it; this also made
+  `ClientPernodeStats.RetryRailPathPreservesAttemptOrderAndSingleRail` flaky.
 - vLLM connector: partial hash hits for DCP + hybrid linear-attention models.
   When vLLM exports `KVCacheConfig.cache_hit_alignment_tokens` below the
   scheduler block (hash-block prefix hits, e.g. Kimi-Linear-48B-A3B TP8 DCP8:
