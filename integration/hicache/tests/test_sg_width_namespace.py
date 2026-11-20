@@ -311,6 +311,25 @@ class TestParallelCoordinates(unittest.TestCase):
                 attn_tp_rank=0,
             )
 
+    def test_replicated_cp_without_layer_split_stays_accepted(self):
+        # A deployed MLA Prefill-CP configuration: CP4, replicated storage, no
+        # layer split. Accepting this is the pre-existing contract; the
+        # per_cp_rank work must not narrow it.
+        self.assertEqual(
+            H._resolve_prefill_cp_storage_layout(
+                {"prefill_cp_storage_layout": "replicated"},
+                is_mla=True,
+                pcp_size=4,
+                dcp_size=1,
+                parallel=types.SimpleNamespace(
+                    enable_prefill_cp=True,
+                    enable_dsa_cache_layer_split=False,
+                ),
+                attn_tp_rank=0,
+            ),
+            "replicated",
+        )
+
     def test_per_cp_rank_layout_requires_layer_split(self):
         with self.assertRaisesRegex(ValueError, "enable_dsa_cache_layer_split"):
             H._resolve_prefill_cp_storage_layout(
