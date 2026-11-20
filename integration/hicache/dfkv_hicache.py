@@ -189,6 +189,7 @@ def _resolve_prefill_cp_storage_layout(
     pcp_size: int,
     dcp_size: int,
     parallel,
+    attn_tp_rank: Optional[int] = None,
 ) -> Optional[str]:
     """Validate the explicit CP storage identity contract.
 
@@ -196,17 +197,32 @@ def _resolve_prefill_cp_storage_layout(
     promise that every future CP implementation stores replicated bytes. CP
     deployments therefore declare the storage layout explicitly; ambiguous or
     truly sharded layouts fail closed instead of aliasing distinct payloads.
+
+    Two MLA+CP layouts are supported, distinguished by whether the CP ranks
+    hold the same bytes:
+
+    ``replicated``
+        Every CP rank holds identical latent bytes. One rank is elected the
+        writer and all ranks share its key, so L3 stores one copy.
+    ``per_cp_rank``
+        Each CP rank holds a *different* payload, so each rank persists under
+        its own CP key coordinate and every elected replica writer writes.
+        This is the layout required by ``enable_dsa_cache_layer_split``, where
+        the DSA cache is split by layer across the CP ranks; it is rejected
+        without that flag because duplicating replicated bytes ``pcp_size``
+        times would waste L3 capacity rather than enable anything.
     """
+    accepted = ("replicated", "sharded", "per_cp_rank")
     raw = cfg.get("prefill_cp_storage_layout")
     if raw is not None:
         if not isinstance(raw, str):
             raise ValueError(
-                "prefill_cp_storage_layout must be 'replicated' or 'sharded'"
+                "prefill_cp_storage_layout must be one of " + ", ".join(accepted)
             )
         raw = raw.strip().lower()
-        if raw not in ("replicated", "sharded"):
+        if raw not in accepted:
             raise ValueError(
-                "prefill_cp_storage_layout must be 'replicated' or 'sharded'"
+                "prefill_cp_storage_layout must be one of " + ", ".join(accepted)
             )
     if pcp_size <= 1:
         return raw
@@ -216,30 +232,54 @@ def _resolve_prefill_cp_storage_layout(
                 "prefill_cp_storage_layout is supported only for rank-replicated MLA"
             )
         return None
+    layer_split = _runtime_flag(parallel, "enable_dsa_cache_layer_split")
     if raw is None:
         raise ValueError(
-            "MLA with attention CP requires explicit "
-            "prefill_cp_storage_layout='replicated'; sharded CP is unsupported"
+            "MLA with attention CP requires an explicit "
+            "prefill_cp_storage_layout: 'per_cp_rank' when "
+            "enable_dsa_cache_layer_split splits the DSA cache across CP "
+            "ranks, otherwise 'replicated'; sharded CP is unsupported"
         )
     if raw == "sharded":
         raise ValueError(
             "prefill_cp_storage_layout='sharded' is unsupported: SGLang elects "
-            "one MLA storage writer, so dfkv cannot persist every CP shard"
+            "one MLA storage writer, so dfkv cannot persist every CP shard. "
+            "Use 'per_cp_rank' when every CP rank runs its own backend"
         )
     if dcp_size > 1:
+        # Physical object keys carry only the PCP coordinate, so a second CP
+        # axis would alias distinct DCP shards onto one key.
         raise ValueError(
-            "replicated Prefill-CP storage is incompatible with DCP; "
+            f"{raw} Prefill-CP storage is incompatible with DCP; "
             "keep distinct DCP storage coordinates"
-        )
-    if _runtime_flag(parallel, "enable_dsa_cache_layer_split"):
-        raise ValueError(
-            "replicated Prefill-CP storage is incompatible with "
-            "enable_dsa_cache_layer_split"
         )
     prefill_enabled = _runtime_flag(parallel, "enable_prefill_cp")
     if prefill_enabled is False:
         raise ValueError(
-            "prefill_cp_storage_layout='replicated' requires enable_prefill_cp"
+            f"prefill_cp_storage_layout='{raw}' requires enable_prefill_cp"
+        )
+    if raw == "replicated":
+        if layer_split:
+            raise ValueError(
+                "replicated Prefill-CP storage is incompatible with "
+                "enable_dsa_cache_layer_split: the CP ranks hold different "
+                "layers, so use prefill_cp_storage_layout='per_cp_rank'"
+            )
+        return raw
+    if not layer_split:
+        raise ValueError(
+            "prefill_cp_storage_layout='per_cp_rank' requires "
+            "enable_dsa_cache_layer_split; replicated CP ranks hold identical "
+            "bytes and must share one key"
+        )
+    if attn_tp_rank is None:
+        # Writer election compares the attention-TP rank, because the latent is
+        # replicated across attn-TP but not across CP. Without that coordinate
+        # the election degrades to the global tp_rank, electing a single writer
+        # for the whole world and silently dropping pcp_size-1 of the shards.
+        raise ValueError(
+            "prefill_cp_storage_layout='per_cp_rank' requires SGLang's "
+            "attn_tp_rank so one writer is elected per CP rank"
         )
     return raw
 
@@ -565,6 +605,7 @@ class DfkvHiCache(HiCacheStorage):
             pcp_size=self.pcp_size,
             dcp_size=self.dcp_size,
             parallel=parallel,
+            attn_tp_rank=attn_tp_rank,
         )
         self._storage_pcp_rank = (
             0
