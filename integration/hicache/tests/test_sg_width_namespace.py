@@ -436,6 +436,16 @@ class TestParallelCoordinates(unittest.TestCase):
             H.pool_key("page", pool="kv", tp_size=8, tp_rank=-1,
                        pcp_size=8, pcp_rank=3, component="l000"))
 
+    def test_v1_single_object_api_fails_closed_on_a_layer_split_page(self):
+        inst = _mk_instance(29)
+        inst._kv_layer_components = tuple(f"l{i:03d}" for i in range(10))
+        for api in ("set", "get"):
+            with self.assertRaisesRegex(RuntimeError, "layer-split page"):
+                inst._require_single_object_page(api)
+        # The packed schemas keep using the v1 entries unchanged.
+        _mk_instance(29)._require_single_object_page("set")
+        _mk_instance(29, mla=False)._require_single_object_page("get")
+
     def test_packed_kv_pool_keys_are_unchanged(self):
         # Guards the on-disk schema of every existing deployment.
         mla = _mk_instance(29)
