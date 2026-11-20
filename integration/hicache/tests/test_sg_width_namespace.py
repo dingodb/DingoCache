@@ -388,6 +388,69 @@ class TestParallelCoordinates(unittest.TestCase):
         right._storage_pcp_rank = 7
         self.assertNotEqual(left._keys("shared-page"), right._keys("shared-page"))
 
+    def test_layer_first_kv_pool_is_recognized_only_under_per_cp_rank(self):
+        pool = types.SimpleNamespace(
+            kv_buffer=object(), layout="layer_first", layer_num=10)
+        sizes = [41984] * 10
+        inst = _mk_instance(29)
+        inst.prefill_cp_storage_layout = "per_cp_rank"
+        self.assertTrue(inst._is_layer_first_kv_pool(pool, 10, sizes))
+        # Every previously startable configuration keeps the packed schema.
+        for layout in ("replicated", None):
+            inst.prefill_cp_storage_layout = layout
+            self.assertFalse(inst._is_layer_first_kv_pool(pool, 10, sizes))
+
+    def test_layer_first_probe_rejects_shapes_it_cannot_describe(self):
+        inst = _mk_instance(29)
+        inst.prefill_cp_storage_layout = "per_cp_rank"
+        base = dict(kv_buffer=object(), layout="layer_first", layer_num=10)
+        # page_first packs every layer into one object.
+        self.assertFalse(inst._is_layer_first_kv_pool(
+            types.SimpleNamespace(**{**base, "layout": "page_first_direct"}),
+            10, [41984] * 10))
+        # Component count must equal the owned layer count.
+        self.assertFalse(inst._is_layer_first_kv_pool(
+            types.SimpleNamespace(**base), 9, [41984] * 9))
+        # layer_first emits one constant element size per layer.
+        self.assertFalse(inst._is_layer_first_kv_pool(
+            types.SimpleNamespace(**base), 10, [41984] * 9 + [512]))
+        # A single component is the legacy packed layout, not a layer split.
+        self.assertFalse(inst._is_layer_first_kv_pool(
+            types.SimpleNamespace(**{**base, "layer_num": 1}), 1, [41984]))
+
+    def test_layer_split_kv_pool_keys_one_object_per_owned_layer(self):
+        inst = _mk_instance(29)
+        inst.pcp_size = 8
+        inst.pcp_rank = 3
+        inst.prefill_cp_storage_layout = "per_cp_rank"
+        inst._storage_pcp_rank = 3
+        self.assertEqual(inst._sub(), 1)
+        self.assertEqual(len(inst._keys("page")), 1)
+        inst._kv_layer_components = tuple(f"l{i:03d}" for i in range(10))
+        self.assertEqual(inst._sub(), 10)
+        keys = inst._keys("page")
+        self.assertEqual(len(keys), 10)
+        self.assertEqual(len(set(keys)), 10)
+        self.assertEqual(
+            keys[0],
+            H.pool_key("page", pool="kv", tp_size=8, tp_rank=-1,
+                       pcp_size=8, pcp_rank=3, component="l000"))
+
+    def test_packed_kv_pool_keys_are_unchanged(self):
+        # Guards the on-disk schema of every existing deployment.
+        mla = _mk_instance(29)
+        self.assertEqual(mla._sub(), 1)
+        self.assertEqual(
+            mla._keys("page"),
+            [H.pool_key("page", pool="kv", tp_size=8, tp_rank=-1,
+                        component="all")])
+        kv = _mk_instance(29, mla=False)
+        self.assertEqual(kv._sub(), 2)
+        self.assertEqual(
+            kv._keys("page"),
+            [H.pool_key("page", pool="kv", tp_size=8, tp_rank=3,
+                        component=c) for c in ("k", "v")])
+
     def test_mla_writer_is_elected_per_physical_cp_shard(self):
         self.assertFalse(H._is_mla_replica_writer(True, 3, None, 1, 0))
         self.assertTrue(H._is_mla_replica_writer(True, 3, 0, 1, 0))

@@ -1029,6 +1029,28 @@ class DfkvHiCache(HiCacheStorage):
                 return
             r.result = f"registered {n} region(s)" if n else "no backing buffer found"
 
+    def _is_layer_first_kv_pool(self, host_pool, count: int, sizes) -> bool:
+        """Recognize the per-layer component layout of a layer-split MLA pool.
+
+        Only reachable under ``prefill_cp_storage_layout='per_cp_rank'``, which
+        this connector accepts solely for ``enable_dsa_cache_layer_split``. No
+        previously startable configuration can take this branch, so existing
+        key schemas stay byte-identical. ``page_first``/``page_first_direct``
+        pools pack every layer into one object and keep the single-component
+        schema; only ``layer_first`` exposes the layers separately.
+        """
+        if getattr(self, "prefill_cp_storage_layout", None) != "per_cp_rank":
+            return False
+        if not hasattr(host_pool, "kv_buffer"):
+            return False
+        if getattr(host_pool, "layout", None) != "layer_first":
+            return False
+        if count <= 1 or int(getattr(host_pool, "layer_num", 0) or 0) != count:
+            return False
+        # layer_first emits one constant element size per layer; anything else
+        # is a layout this mapping does not describe.
+        return len({int(size) for size in sizes}) == 1
+
     def register_mem_host_pool_v2(self, host_pool, host_pool_name):
         if not hasattr(self, "registered_pools"):
             self.registered_pools = {}
@@ -1086,6 +1108,16 @@ class DfkvHiCache(HiCacheStorage):
                 if int(getattr(host_pool, "temporal_state_elem_size", 0)) > 0:
                     names.insert(0, "temporal")
                 replicated = False
+            elif self._is_layer_first_kv_pool(host_pool, count, sizes):
+                # layer-split DSA: a "layer_first" MLA host pool emits one
+                # pointer per *owned* layer per page (page-major, layer-minor),
+                # which is exactly the order _flatten expects. The layers a CP
+                # rank owns are a shard of the model, so the components are
+                # distinct payloads under this rank's CP key coordinate.
+                names = [f"l{i:03d}" for i in range(count)]
+                replicated = False
+                if name in ("kv", "__default__"):
+                    self._kv_layer_components = tuple(names)
             elif hasattr(host_pool, "v_buffer"):
                 if count != 2:
                     raise RuntimeError(
@@ -1331,11 +1363,23 @@ class DfkvHiCache(HiCacheStorage):
         )
         return self.pcp_size, rank
 
+    def _kv_components(self) -> List[str]:
+        """Components of one physical "kv" page object.
+
+        A layer-split MLA pool stores its owned layers as separate objects (see
+        _is_layer_first_kv_pool); every other pool keeps the legacy packed
+        schema, so their keys are unchanged.
+        """
+        layers = getattr(self, "_kv_layer_components", None)
+        if layers:
+            return list(layers)
+        return ["all"] if self.is_mla else ["k", "v"]
+
     def _keys(self, page_hash: str | bytes) -> List[bytes]:
         tp = -1 if self.is_mla else self.tp_rank
         pp = self.pp_rank if self.enable_pp else 0
         pcp_size, pcp_rank = self._storage_pcp(self.is_mla)
-        components = ["all"] if self.is_mla else ["k", "v"]
+        components = self._kv_components()
         return [
             pool_key(page_hash, pool="kv",
                      tp_size=self.tp_size, tp_rank=tp,
@@ -1347,7 +1391,7 @@ class DfkvHiCache(HiCacheStorage):
         ]
 
     def _sub(self) -> int:
-        return 1 if self.is_mla else 2
+        return len(self._kv_components())
 
     def _flatten(self, keys, ptrs, sizes):
         """Expand per-page keys into per-object (sub) flat arrays."""
