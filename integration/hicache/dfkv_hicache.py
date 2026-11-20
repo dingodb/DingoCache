@@ -1363,7 +1363,7 @@ class DfkvHiCache(HiCacheStorage):
         )
         return self.pcp_size, rank
 
-    def _kv_components(self) -> List[str]:
+    def _kv_components(self) -> tuple[str, ...]:
         """Components of one physical "kv" page object.
 
         A layer-split MLA pool stores its owned layers as separate objects (see
@@ -1372,8 +1372,23 @@ class DfkvHiCache(HiCacheStorage):
         """
         layers = getattr(self, "_kv_layer_components", None)
         if layers:
-            return list(layers)
-        return ["all"] if self.is_mla else ["k", "v"]
+            return layers
+        return ("all",) if self.is_mla else ("k", "v")
+
+    def _require_single_object_page(self, api: str) -> None:
+        """Fail closed where a one-object-per-page API cannot carry a page.
+
+        The v1 set/get entries take a single value and target per key, so they
+        can only address one component. A layer-split page is many components;
+        addressing just the first would store or serve one layer of ten and
+        report success. The zero-copy v2 path carries every component.
+        """
+        if getattr(self, "_kv_layer_components", None):
+            raise RuntimeError(
+                f"{api} cannot address a layer-split page "
+                f"({len(self._kv_components())} per-layer objects); "
+                "this layout requires the zero-copy v2 path"
+            )
 
     def _keys(self, page_hash: str | bytes) -> List[bytes]:
         tp = -1 if self.is_mla else self.tp_rank
@@ -2599,6 +2614,7 @@ class DfkvHiCache(HiCacheStorage):
 
     def set(self, key, value=None, target_location=None, target_sizes=None) -> bool:
         nbytes = 0
+        self._require_single_object_page("set")
         sk = self._keys(key)[0]
         with access_log(
             "set",
@@ -2631,6 +2647,7 @@ class DfkvHiCache(HiCacheStorage):
     def get(self, key, target_location=None, target_sizes=None):
         """Read a generic host page using the exact binary object key."""
         nbytes = 0
+        self._require_single_object_page("get")
         sk = self._keys(key)[0]
         with access_log(
             "get",
