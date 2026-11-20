@@ -284,6 +284,110 @@ class TestParallelCoordinates(unittest.TestCase):
         self.assertTrue(H._is_hicache_storage_writer(pcp_rank=0, **common))
         self.assertFalse(H._is_hicache_storage_writer(pcp_rank=7, **common))
 
+    def test_layer_split_cp_layout_is_per_cp_rank(self):
+        parallel = types.SimpleNamespace(
+            enable_prefill_cp=True,
+            enable_dsa_cache_layer_split=True,
+        )
+        self.assertEqual(
+            H._resolve_prefill_cp_storage_layout(
+                {"prefill_cp_storage_layout": "per_cp_rank"},
+                is_mla=True,
+                pcp_size=8,
+                dcp_size=1,
+                parallel=parallel,
+                attn_tp_rank=0,
+            ),
+            "per_cp_rank",
+        )
+        # The replicated rejection must name the layout that does work.
+        with self.assertRaisesRegex(ValueError, "per_cp_rank"):
+            H._resolve_prefill_cp_storage_layout(
+                {"prefill_cp_storage_layout": "replicated"},
+                is_mla=True,
+                pcp_size=8,
+                dcp_size=1,
+                parallel=parallel,
+                attn_tp_rank=0,
+            )
+
+    def test_per_cp_rank_layout_requires_layer_split(self):
+        with self.assertRaisesRegex(ValueError, "enable_dsa_cache_layer_split"):
+            H._resolve_prefill_cp_storage_layout(
+                {"prefill_cp_storage_layout": "per_cp_rank"},
+                is_mla=True,
+                pcp_size=8,
+                dcp_size=1,
+                parallel=types.SimpleNamespace(
+                    enable_prefill_cp=True,
+                    enable_dsa_cache_layer_split=False,
+                ),
+                attn_tp_rank=0,
+            )
+
+    def test_per_cp_rank_layout_requires_attn_tp_rank(self):
+        with self.assertRaisesRegex(ValueError, "attn_tp_rank"):
+            H._resolve_prefill_cp_storage_layout(
+                {"prefill_cp_storage_layout": "per_cp_rank"},
+                is_mla=True,
+                pcp_size=8,
+                dcp_size=1,
+                parallel=types.SimpleNamespace(
+                    enable_prefill_cp=True,
+                    enable_dsa_cache_layer_split=True,
+                ),
+                attn_tp_rank=None,
+            )
+
+    def test_per_cp_rank_layout_rejects_dcp(self):
+        with self.assertRaisesRegex(ValueError, "DCP"):
+            H._resolve_prefill_cp_storage_layout(
+                {"prefill_cp_storage_layout": "per_cp_rank"},
+                is_mla=True,
+                pcp_size=8,
+                dcp_size=2,
+                parallel=types.SimpleNamespace(
+                    enable_prefill_cp=True,
+                    enable_dsa_cache_layer_split=True,
+                ),
+                attn_tp_rank=0,
+            )
+
+    def test_unknown_cp_layout_lists_accepted_values(self):
+        with self.assertRaisesRegex(ValueError, "per_cp_rank"):
+            H._resolve_prefill_cp_storage_layout(
+                {"prefill_cp_storage_layout": "shard-per-layer"},
+                is_mla=True,
+                pcp_size=8,
+                dcp_size=1,
+                parallel=None,
+            )
+
+    def test_per_cp_rank_keys_and_writers_are_per_cp_shard(self):
+        common = dict(
+            is_mla=True,
+            tp_rank=7,
+            attn_tp_rank=0,
+            dcp_size=1,
+            dcp_rank=0,
+            prefill_cp_storage_layout="per_cp_rank",
+        )
+        # Every CP rank persists its own layer slice, so every one of them is a
+        # writer -- unlike the replicated layout, which elects pcp_rank 0.
+        self.assertTrue(H._is_hicache_storage_writer(pcp_rank=0, **common))
+        self.assertTrue(H._is_hicache_storage_writer(pcp_rank=7, **common))
+        left = _mk_instance(29)
+        left.pcp_size = 8
+        left.pcp_rank = 0
+        left.prefill_cp_storage_layout = "per_cp_rank"
+        left._storage_pcp_rank = 0
+        right = _mk_instance(29)
+        right.pcp_size = 8
+        right.pcp_rank = 7
+        right.prefill_cp_storage_layout = "per_cp_rank"
+        right._storage_pcp_rank = 7
+        self.assertNotEqual(left._keys("shared-page"), right._keys("shared-page"))
+
     def test_mla_writer_is_elected_per_physical_cp_shard(self):
         self.assertFalse(H._is_mla_replica_writer(True, 3, None, 1, 0))
         self.assertTrue(H._is_mla_replica_writer(True, 3, 0, 1, 0))
