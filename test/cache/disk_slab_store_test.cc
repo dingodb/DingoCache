@@ -131,22 +131,16 @@ class DiskSlabTest : public ::testing::Test {
     fs::remove_all(dir_);
   }
   void TearDown() override {
-    struct stat st {};
-    if (::stat(dir_.c_str(), &st) == 0) {  // the trust token of this directory
-      char name[80];
-      std::snprintf(name, sizeof(name), "dfkv-slab-trusted.%llx.%llx",
-                    static_cast<unsigned long long>(st.st_dev),
-                    static_cast<unsigned long long>(st.st_ino));
-      fs::remove(fs::temp_directory_path() / name);
-    }
     fs::remove_all(dir_);
+    fs::remove_all(dir_.string() + "_tokens");
   }
 
   DiskSlabStore::Options Opts(uint64_t cap, uint64_t extent, uint64_t gran) {
     DiskSlabStore::Options o;
     o.dir = dir_.string();
-    // Trust tokens next to the test directories, not in /dev/shm.
-    o.trust_token_dir = fs::temp_directory_path().string();
+    // Trust tokens in a directory of this test's own, not in /dev/shm.
+    o.trust_token_dir = dir_.string() + "_tokens";
+    fs::create_directories(o.trust_token_dir);
     o.capacity_bytes = cap;
     o.extent_bytes = extent;
     o.slot_granularity = gran;
@@ -883,9 +877,8 @@ DiskSlabStore::Options WithIdentity(DiskSlabStore::Options options,
   boot_id.fill(boot);
   options.boot_id = boot_id;
   options.mount_id = mount;
-  // Tokens next to the test directories rather than in /dev/shm, and no
-  // opinion about the filesystem the build machine keeps /tmp on.
-  options.trust_token_dir = fs::temp_directory_path().string();
+  // No opinion about the filesystem the build machine keeps /tmp on. (Opts
+  // already put the trust tokens into this test's own directory.)
   options.require_local_filesystem = false;
   return options;
 }
@@ -898,7 +891,7 @@ fs::path TrustToken(const fs::path& dir) {
   std::snprintf(name, sizeof(name), "dfkv-slab-trusted.%llx.%llx",
                 static_cast<unsigned long long>(st.st_dev),
                 static_cast<unsigned long long>(st.st_ino));
-  return fs::temp_directory_path() / name;
+  return fs::path(dir.string() + "_tokens") / name;
 }
 
 template <typename Body>

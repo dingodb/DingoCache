@@ -202,7 +202,8 @@ DiskSlabStore::Options StressOptions(const fs::path& dir, Variant variant) {
   boot_id.fill(0x42);
   options.boot_id = boot_id;  // "same boot, same mount" on any kernel
   options.mount_id = 0x4242;
-  options.trust_token_dir = fs::temp_directory_path().string();
+  options.trust_token_dir = dir.string() + "_tokens";
+  fs::create_directories(options.trust_token_dir);
   options.require_local_filesystem = false;
   return options;
 }
@@ -369,6 +370,7 @@ void KillUnderTraffic(Variant variant) {
        (variant.direct ? "_direct" : "_buffered") +
        (variant.undersized ? "_undersized" : "_roomy"));
   fs::remove_all(dir);
+  fs::remove_all(dir.string() + "_tokens");
   const DiskSlabStore::Options options = StressOptions(dir, variant);
 
   std::vector<KeyHistory> history(kKeys);  // every key starts absent
@@ -516,6 +518,7 @@ void KillUnderTraffic(Variant variant) {
     }
   }
   fs::remove_all(dir);
+  fs::remove_all(dir.string() + "_tokens");
   std::printf("%s payload writes (O_DIRECT active: %s), %s store: kills=%d "
               "kept=%llu reset_in_table_sync=%llu returned_operations=%llu "
               "failed_puts=%llu objects_verified=%llu\n",
