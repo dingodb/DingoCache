@@ -483,10 +483,10 @@ struct RdmaNode {
     if (fail_pinned_registration)
       RdmaServerTestPeer::FailPinnedRegistration(*rsrv);
     if (srv->ram_enabled()) {
-      // Mirror dfkv_server_main: pool-map the arena per connection and enable
-      // the B5-3 pinned zero-copy pull so RAM-tier fixtures exercise the
-      // production GET path instead of always staging.
-      rsrv->RegisterMemory(srv->ram_arena(), srv->ram_arena_bytes());
+      // Mirror dfkv_server_main: enable the B5-3 pinned zero-copy pull so
+      // RAM-tier fixtures exercise the production GET path instead of always
+      // staging. The arena itself is not registered; each pull registers the
+      // value it serves.
       rsrv->set_pinned_ram_handler(
           [this](const BlockKey& key, uint64_t off, uint64_t len,
                  PreparedRead* out) {

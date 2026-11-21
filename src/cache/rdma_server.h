@@ -88,11 +88,6 @@ class RdmaServer {
   void set_pinned_ram_handler(PinnedRamHandler h) {
     pinned_ram_handler_ = std::move(h);
   }
-  // Attach caller memory regions as local pool MRs on each connection's PD.
-  // Dynamic GET always uses a separate exact, revocable remote READ MR even
-  // for a pool-backed RAM source. Call before Start().
-  void RegisterMemory(void* base, size_t size);
-
   ~RdmaServer();
 
   Status Start(int port);  // TCP bootstrap port
@@ -205,7 +200,6 @@ class RdmaServer {
   CacheDirectBatchHandler cache_direct_batch_handler_;
   PrepareReadHandler prepare_read_handler_;
   PinnedRamHandler pinned_ram_handler_;
-  std::vector<std::pair<void*, size_t>> user_regions_;  // RAM arena pool MRs (RegisterMemory)
   size_t max_msg_;
   std::string dev_name_;
   bool auto_device_ = true;
