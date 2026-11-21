@@ -1164,7 +1164,8 @@ Status DiskSlabStore::WaitPut(const std::shared_ptr<PutFlight>& flight) {
   return flight->result;
 }
 
-// mu_ guards only the in-memory maps; the MB-scale payload I/O runs OUTSIDE it
+// mu_ guards the in-memory maps and the 64 B slots.tbl record writes (commit,
+// invalidation, eviction clears); the MB-scale payload I/O runs OUTSIDE it
 // (same discipline as KVStore::Cache and RamTier::Put), so concurrent ops to one
 // disk overlap in the kernel instead of serializing behind the store lock. The
 // slot bytes are protected across the unlocked window by a write-pin (a pinned
@@ -1289,10 +1290,10 @@ Status DiskSlabStore::CacheDirect(const BlockKey& key, char* data, size_t len,
 //   L1 (one mu_): dedup + allocate + write-pin + inflight for every item;
 //   IO (unlocked): zero-pad + payload writes -- ONE io_uring submit when the
 //     build has uring and DFKV_SLAB_URING_WRITE isn't 0 (small-object flushing
-//     is IOPS-bound at one synchronous DIO write per key), else a loop; then
-//     the 64 B records (buffered pwrites, cheap) in a loop;
-//   L2 (one mu_): per-item deferred-remove check, inflight release, failure
-//     rollback, payload_len_ commit.
+//     is IOPS-bound at one synchronous DIO write per key), else a loop;
+//   L2 (one mu_): per-item deferred-remove check, the 64 B record (a buffered
+//     pwrite, skipped for a write that a Remove cancelled), inflight release,
+//     failure rollback, payload_len_ commit.
 std::vector<Status> DiskSlabStore::CacheDirectBatch(
     const std::vector<CacheBatchItem>& items) {
   const size_t N = items.size();
@@ -1374,7 +1375,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
       }
     }
   }
-  // -- IO: payloads (uring one-submit when possible), then records --
+  // -- IO: payloads (uring one-submit when possible); records follow in L2 --
 #ifdef DFKV_WITH_URING
   size_t direct_n = 0;
   for (size_t i = 0; i < N; ++i) if (st[i].active && st[i].direct) direct_n++;

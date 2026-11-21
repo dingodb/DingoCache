@@ -2,8 +2,10 @@
 
 ## Unreleased
 
-- Server: a `Remove` that has returned now always leaves the key's record
-  invalid in `slots.tbl`. While a read or write of the key was in flight the
+- Server: once a `Remove` has returned successfully, the key's record in
+  `slots.tbl` is invalid as far as the next process to read the table is
+  concerned (the write is in the page cache; syncing it stays with the
+  periodic table sync). While a read or write of the key was in flight the
   removal is deferred, and until the last holder finished the record stayed
   valid (a read in flight) or could briefly become valid (a write in flight
   wrote its record before it learned about the `Remove`). Nothing observed
