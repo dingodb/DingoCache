@@ -251,8 +251,9 @@ class RdmaServer {
   std::atomic<uint64_t> dynamic_get_active_{0};
   std::atomic<uint64_t> dynamic_get_bytes_active_{0};
   std::atomic<uint64_t> pull_zerocopy_served_{0};
+  std::atomic<uint64_t> pull_zerocopy_register_failures_{0};
   // One anchor per resolved rail holds a lifetime shared device reference and
-  // registers the initial receive chunk and caller pools on that rail's PD.
+  // registers the initial receive chunk on that rail's PD.
   // Later chunks register lazily on the rail of the connection that leases
   // them. Auto mode anchors only the first ACTIVE local rail.
   std::vector<std::unique_ptr<rdma::RcEndpoint>> anchors_;
@@ -264,9 +265,8 @@ class RdmaServer {
   std::function<rdma::RdmaDiscoveryResult(
       const std::vector<std::string>&, rdma::RdmaDiscoveryPolicy)>
       discover_for_test_;
-  std::function<std::unique_ptr<rdma::RcEndpoint>(
-      const std::string&, const std::vector<std::pair<void*, size_t>>&,
-      void*, size_t)>
+  std::function<std::unique_ptr<rdma::RcEndpoint>(const std::string&, void*,
+                                                  size_t)>
       initialize_anchor_for_test_;
 #ifdef DFKV_WITH_URING
   // Externally owned backend seam for deterministic queue/completion tests.

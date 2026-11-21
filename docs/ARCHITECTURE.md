@@ -393,7 +393,7 @@ quota admission immediately.
 ## 6. RAM hot tier (opt-in)
 
 A COLD dfkv load is disk-bound (~480 MB/s O_DIRECT) and dominates PD-decode TTFT.
-The RAM tier fronts the disk with a pre-registered RAM arena so a PD-warm GET is
+The RAM tier fronts the disk with a pre-faulted, memory-locked RAM arena so a PD-warm GET is
 served straight from RAM over RDMA — no open, no pread, no disk. Enabled with
 `DFKV_RAM_TIER=1` (`DFKV_RAM_TIER_BYTES` sizes the arena; default off).
 
@@ -433,8 +433,8 @@ the allocator's pin count — this is why the allocator was built media-agnostic
   READ and revokes the exact READ MR before releasing it on PullRelease.
   REMOVE hides an entry immediately but cannot reuse its pinned allocation.
 
-**RDMA zero-copy serve**: the arena is registered on each selected device's
-shared PD. Dynamic pull lends an exact, revocable READ capability for the
+**RDMA zero-copy serve**: the arena as a whole is not registered with the
+NICs. Dynamic pull registers and lends an exact, revocable READ capability for the
 requested resident bytes, avoiding a staging copy. Successful read accounting
 is committed at PullRelease; connection teardown first fences the endpoint,
 then aborts the pin without counting a successful read. Disk slices are not
@@ -460,7 +460,7 @@ timeouts, failures, and same-thread pipelined duplicates retain the bounded
 independent/staging fallback. Identity-checked slot handles and serialized key
 lifecycles prevent a stale reservation or SEND from pinning a replacement slot.
 
-Values no larger than one RAM extent live inside that registered arena and keep
+Values no larger than one RAM extent live inside the arena and keep
 the zero-copy path. Larger accepted values use a dedicated aligned allocation
 charged to the same hard byte budget; they retain the same flush/durable/send-pin
 lifecycle but copy through the connection's bounded registered buffer because
@@ -504,7 +504,7 @@ data plane or the connection fails.
 | RAM flush workers | `--ram-flush-threads` / `DFKV_RAM_FLUSH_THREADS` | 4× disk count, cap 16 | actual count is at least shard count and is reported after adjustment |
 | RAM dedicated-value reserve | `DFKV_RAM_TIER_LARGE_RESERVE_BYTES` | two extents | partitions the hard total budget; `0` disables oversized residency |
 | RAM tier lock shards | `--ram-tier-shards` / `DFKV_RAM_TIER_SHARDS` | 8 | 1-64; auto-halved while a shard would hold <32 extents |
-| read convoy/direct promotion | `DFKV_READ_COALESCE=1` | off | collapses identical reads; with RAM + io_uring, whole-value disk misses read directly into a hidden registered arena reservation |
+| read convoy/direct promotion | `DFKV_READ_COALESCE=1` | off | collapses identical reads; with RAM + io_uring, whole-value disk misses read directly into a hidden arena reservation |
 | RDMA transport | build `-DDFKV_WITH_RDMA=ON`, `DFKV_RDMA=1` | TCP | active-HCA discovery; `DFKV_RDMA_DEV` is an optional whitelist |
 | RDMA v2 | `DFKV_RDMA=1` | TCP when RDMA was not requested | bounded control buffers + adaptive data-QP classes + lazily committed receive chunks |
 | io_uring async GET | build `-DDFKV_WITH_URING`; `DFKV_SERVER_URING=0` disables | on when built, unavailable otherwise | RDMA v2 disk-read path |

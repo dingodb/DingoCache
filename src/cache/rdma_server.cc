@@ -356,8 +356,8 @@ Status RdmaServer::Start(int port) {
   for (const auto& device : anchor_devs_) {
     std::unique_ptr<rdma::RcEndpoint> anchor;
     if (initialize_anchor_for_test_) {
-      anchor = initialize_anchor_for_test_(
-          device, {}, initial_segment->data(), initial_segment->size());
+      anchor = initialize_anchor_for_test_(device, initial_segment->data(),
+                                           initial_segment->size());
     } else {
       anchor = std::make_unique<rdma::RcEndpoint>();
       if (!anchor->Open(device.c_str(), rdma::kV2ControlCap, 1)) {
@@ -1234,7 +1234,13 @@ void RdmaServer::Serve(int boot_fd) {
     state.mr = fail_pinned_registration_for_test_ ? nullptr :
         ep.RegisterLeaseReadRegion(const_cast<char*>(pinned.data()),
                                    pinned.payload_len());
-    if (!state.mr) return false;
+    if (!state.mr) {
+      // Falls back to a staged copy. Worth counting: with the arena no longer
+      // registered up front, a memlock limit or a device MR limit shows up
+      // here, per read, instead of failing startup.
+      pull_zerocopy_register_failures_.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
     state.arena_read = std::move(pinned);
     state.read_elapsed_sec = read_elapsed_sec;
     state.busy = true;
@@ -2141,6 +2147,9 @@ std::string RdmaServer::MetricsText() const {
   m(s, "dfkv_rdma_pull_zerocopy_served_total", "counter",
     "Dynamic-pull GETs served directly from the pinned RAM arena without a staging copy",
     pull_zerocopy_served_);
+  m(s, "dfkv_rdma_pull_zerocopy_register_failures_total", "counter",
+    "RAM arena hits that fell back to a staged copy because the per-read MR could not be registered",
+    pull_zerocopy_register_failures_);
   m(s, "dfkv_rdma_dynamic_get_active", "gauge",
     "In-flight dynamic GET staging operations currently held",
     dynamic_get_active_);
