@@ -246,7 +246,9 @@ bool KVClient::RegisterMemory(void* base, size_t size) {
   // a successful registration cannot slip through the publication gap and
   // initialize/query CUDA on its registered host destination.
   std::unique_lock<std::shared_mutex> lock(registered_memory_mu_);
-  const CudaLib* cuda = CudaLib::Get();
+  // The kind decided here is remembered for the life of the pool, so it must
+  // not be taken from a throttled probe that predates the host's CUDA setup.
+  const CudaLib* cuda = CudaLib::Probe();
   const DestinationMemoryKind kind =
       cuda && cuda->IsDevicePtr(base) ? DestinationMemoryKind::kDevice
                                       : DestinationMemoryKind::kHost;

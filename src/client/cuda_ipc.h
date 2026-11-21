@@ -2,7 +2,8 @@
  * destination publication.
  *
  * libdfkv.so must not link CUDA: SGLang hosts and CPU-only tools load the same
- * library. Everything here resolves from libcuda.so.1 at first use. Optional
+ * library. Everything here resolves from the libcuda.so.1 the host process
+ * loaded and initialized; dfkv never loads or initializes CUDA itself. Optional
  * GPU dedup disables itself when unavailable; an explicitly classified device
  * publication instead returns failure and never reports unpublished bytes.
  * The declarations intentionally mirror cuda.h so no CUDA toolkit is needed at
@@ -37,16 +38,24 @@ constexpr unsigned kCuMemHostRegisterPortable = 0x1;  // CU_MEMHOSTREGISTER_PORT
 
 class CudaLib {
  public:
-  // Attaches to the libcuda.so.1 the host process has already loaded and
-  // resolves the surface once. dfkv never loads or initializes CUDA in a
-  // process that has not done so itself: without the library every pointer is
-  // host memory. nullptr => no CUDA in this process (re-probed later, since a
-  // framework may load it after the client was created) or no usable driver;
-  // callers must degrade silently.
+  // The CUDA surface of this process, or nullptr. dfkv only ever attaches to a
+  // libcuda.so.1 that the host process has loaded *and* initialized; it never
+  // loads the library or calls cuInit itself, so a process that does not use
+  // CUDA is never made to open the driver. nullptr => the host has not
+  // initialized CUDA (yet), the driver is unusable, or this is a child forked
+  // from the attached process. Callers must degrade silently: without CUDA
+  // every pointer is host memory.
+  //
+  // "Not attached" is re-probed, since a framework may initialize CUDA after
+  // the client was created. Get() is for per-operation use and probes at most
+  // every 100 ms, so it can lag the host's initialization by that much.
   static const CudaLib* Get();
+  // Get() without the probe interval: for control-plane calls whose answer is
+  // remembered, such as classifying a pool once at registration.
+  static const CudaLib* Probe();
   // For a process that is itself the CUDA host -- GPU tools and tests with no
-  // framework above them: loads the driver library, then attaches. libdfkv
-  // never calls this on a caller's behalf.
+  // framework above them: loads the driver library, initializes it, then
+  // attaches. libdfkv never calls this on a caller's behalf.
   static const CudaLib* LoadForHost();
 
   // True iff p is a CUDA device pointer (UVA query; host/unknown => false).
@@ -100,6 +109,7 @@ class CudaLib {
  private:
   CudaLib() = default;
   bool Resolve();
+  static const CudaLib* Attach(bool throttled);
 
   CUresult (*ctx_get_current_)(CUcontext*) = nullptr;
   CUresult (*ctx_set_current_)(CUcontext) = nullptr;

@@ -431,11 +431,10 @@ bool CudaLib::Resolve() {
   // driver library cannot own device memory, so there is nothing to classify;
   // loading and initializing CUDA there would open the driver devices, cost
   // startup time, and expose a GPU-less process (scheduler, tool, test) to
-  // driver behaviour it never asked for.
-  void* h = ::dlopen("libcuda.so.1", RTLD_NOLOAD | RTLD_NOW | RTLD_GLOBAL);
+  // driver behaviour it never asked for. No RTLD_GLOBAL: every symbol is
+  // looked up through the handle, so the host's own choice of scope stands.
+  void* h = ::dlopen("libcuda.so.1", RTLD_NOLOAD | RTLD_NOW);
   if (!h) return false;
-  using F = void*;
-  F init = ::dlsym(h, "cuInit");
   MemHostAlloc = reinterpret_cast<CUresult (*)(void**, size_t, unsigned)>(
       ::dlsym(h, "cuMemHostAlloc"));
   MemFreeHost = reinterpret_cast<CUresult (*)(void*)>(
@@ -490,7 +489,7 @@ bool CudaLib::Resolve() {
     HostRegister = nullptr;
     HostUnregister = nullptr;
   }
-  if (!init || !MemAlloc || !MemFree || !Memcpy || !MemcpyAsync ||
+  if (!MemAlloc || !MemFree || !Memcpy || !MemcpyAsync ||
       !StreamCreate || !StreamSynchronize || !StreamDestroy ||
       (!MemHostAlloc && !HostRegister) || !IpcGetMemHandle ||
       !IpcOpenMemHandle || !IpcCloseMemHandle || !ctx_get_current_ ||
@@ -499,62 +498,81 @@ bool CudaLib::Resolve() {
     ::dlclose(h);
     return false;
   }
-  // The host loaded the library, so it is a CUDA process by its own choice.
-  // cuInit is idempotent; the framework normally beat us to it. A failure
-  // here (no device, driver/library mismatch) disables the surface.
-  if (reinterpret_cast<CUresult (*)(unsigned)>(init)(0) != kCudaSuccess) {
+  // Attach only once the host has initialized the driver, and never do it on
+  // its behalf: a process may map the library without ever using CUDA. Before
+  // the host's cuInit -- and in a child forked from an initialized process --
+  // cuCtxGetCurrent reports CUDA_ERROR_NOT_INITIALIZED without opening a
+  // device; the caller simply probes again later.
+  CUcontext ignored = nullptr;
+  if (ctx_get_current_(&ignored) != kCudaSuccess) {
     ::dlclose(h);
     return false;
   }
+  // The handle is kept: it pins the host's library under the cached pointers.
   owner_process_ = static_cast<uint64_t>(::getpid());
   return true;
 }
 
 namespace {
-std::atomic<CudaLib*> resolved{nullptr};
+std::atomic<CudaLib*> attached{nullptr};
 std::atomic<int64_t> next_probe_ns{0};
-std::mutex resolve_mu;
+std::mutex attach_mu;
+// The host may load and initialize CUDA at any point after the client was
+// created, so "not attached" is never final. A probe costs a loader lookup
+// (a path search while the library is absent), which is too much for every
+// GET that classifies an unregistered destination.
+constexpr int64_t kProbeIntervalNs = 100 * 1000 * 1000;
+
+int64_t SteadyNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 }  // namespace
 
-const CudaLib* CudaLib::LoadForHost() {
-  // The caller declares itself the CUDA host of this process. Leak the handle:
-  // the driver library stays mapped for the process lifetime, as it would
-  // under a framework.
-  if (::dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL) == nullptr)
-    return nullptr;
-  next_probe_ns.store(0, std::memory_order_relaxed);
-  return Get();
-}
-
-const CudaLib* CudaLib::Get() {
-  CudaLib* lib = resolved.load(std::memory_order_acquire);
+const CudaLib* CudaLib::Attach(bool throttled) {
+  CudaLib* lib = attached.load(std::memory_order_acquire);
   if (lib == nullptr) {
-    // The host framework may load CUDA after this client was created, so an
-    // absent library is re-probed -- but at most every kAbsentProbeIntervalNs:
-    // unregistered destinations are classified per GET.
-    constexpr int64_t kAbsentProbeIntervalNs = 100 * 1000 * 1000;
-    const int64_t now =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch())
-            .count();
-    if (now < next_probe_ns.load(std::memory_order_relaxed)) return nullptr;
-    std::lock_guard<std::mutex> lock(resolve_mu);
-    lib = resolved.load(std::memory_order_acquire);
+    if (throttled &&
+        SteadyNowNs() < next_probe_ns.load(std::memory_order_relaxed)) {
+      return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(attach_mu);
+    lib = attached.load(std::memory_order_acquire);
     if (lib == nullptr) {
+      // Callers that queued behind a failed probe share its answer.
+      if (throttled &&
+          SteadyNowNs() < next_probe_ns.load(std::memory_order_relaxed)) {
+        return nullptr;
+      }
       auto* candidate = new CudaLib();
-      if (candidate->Resolve()) {
-        resolved.store(candidate, std::memory_order_release);
-        lib = candidate;
-      } else {
+      if (!candidate->Resolve()) {
         delete candidate;
-        next_probe_ns.store(now + kAbsentProbeIntervalNs,
+        next_probe_ns.store(SteadyNowNs() + kProbeIntervalNs,
                             std::memory_order_relaxed);
         return nullptr;
       }
+      attached.store(candidate, std::memory_order_release);
+      lib = candidate;
     }
   }
   return lib->owner_process_ == static_cast<uint64_t>(::getpid()) ? lib
                                                                    : nullptr;
+}
+
+const CudaLib* CudaLib::Get() { return Attach(/*throttled=*/true); }
+
+const CudaLib* CudaLib::Probe() { return Attach(/*throttled=*/false); }
+
+const CudaLib* CudaLib::LoadForHost() {
+  // The caller declares itself the CUDA host of this process, so loading and
+  // initializing the driver is its own decision. The handle is leaked: the
+  // library stays mapped for the process lifetime, as under a framework.
+  void* h = ::dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
+  if (h == nullptr) return nullptr;
+  auto init = reinterpret_cast<CUresult (*)(unsigned)>(::dlsym(h, "cuInit"));
+  if (init == nullptr || init(0) != kCudaSuccess) return nullptr;
+  return Probe();
 }
 
 bool CudaLib::IsDevicePtr(const void* p) const {
