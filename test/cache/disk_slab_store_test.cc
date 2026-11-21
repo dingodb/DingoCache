@@ -1374,6 +1374,7 @@ TEST_F(DiskSlabTest, InconsistentTableOnTheWarmPathFallsBackToAReset) {
   ASSERT_TRUE(ok) << recovered.StartupError();
   EXPECT_EQ(recovered.GetStats().warm_restarts, 0u);
   EXPECT_EQ(recovered.GetStats().unclean_resets, 1u);
+  EXPECT_EQ(recovered.UncleanResetReason(), "slots.tbl is not self-consistent");
   EXPECT_EQ(recovered.Count(), 0u);
   EXPECT_TRUE(PutFilled(recovered, 90, 'z'));
 }

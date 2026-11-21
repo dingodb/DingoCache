@@ -313,6 +313,7 @@ void Report(int fd, uint8_t done, uint8_t op, bool ok, uint32_t key,
 struct Inspection {
   uint32_t opened = 0;         // the store came up
   uint32_t kept = 0;           // ... on a kept table
+  uint32_t token_gone = 0;     // ... or reset because the trust token was gone
   uint32_t direct_active = 0;  // ... writing payloads with O_DIRECT
   uint32_t actual[kKeys];      // 0 absent, kForeignBytes, or the version
 };
@@ -332,6 +333,8 @@ void Inspect(const DiskSlabStore::Options& traffic_options, Variant variant,
   result->opened = ok;
   if (ok) {
     result->kept = store.GetStats().warm_restarts == 1;
+    result->token_gone = store.UncleanResetReason().rfind(
+                             "the previous run's trust token is gone", 0) == 0;
     result->direct_active = store.DirectWritesActive();
     for (uint32_t key = 0; key < kKeys; ++key) {
       std::string found;
@@ -489,7 +492,11 @@ void KillUnderTraffic(Variant variant) {
     ASSERT_TRUE(found.opened) << "the store did not start after the kill";
     direct_active = found.direct_active != 0;
     // A kill that lands inside a table sync finds the trust token taken back,
-    // and the restart resets: everything is gone, which is always allowed.
+    // and the restart resets: everything is gone, which is always allowed. Any
+    // other reason to reset -- records that contradict each other, say -- is
+    // a finding.
+    ASSERT_TRUE(found.kept || found.token_gone)
+        << "the table was reset, and not because the trust token was gone";
     if (found.kept) ++kept_restarts; else ++resets;
     for (uint32_t key = 0; key < kKeys; ++key) {
       const uint32_t actual = found.actual[key];
