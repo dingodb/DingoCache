@@ -1218,8 +1218,16 @@ TEST_F(DiskSlabTest, UnremovableThingAtTheTokenPathLeavesCleanShutdownsClean) {
 }
 
 TEST_F(DiskSlabTest, MissingOrForeignTrustTokenForcesAReset) {
-  for (const bool foreign : {false, true}) {
-    SCOPED_TRACE(foreign ? "token of another run" : "no token");
+  // The name and the epoch of a token can be worked out by anyone who can read
+  // the cache directory, so only a file that nobody else could have written
+  // counts.
+  enum class Tamper { kRemoved, kOtherEpoch, kWritableByOthers };
+  for (const Tamper tamper :
+       {Tamper::kRemoved, Tamper::kOtherEpoch, Tamper::kWritableByOthers}) {
+    SCOPED_TRACE(tamper == Tamper::kRemoved
+                     ? "no token"
+                     : tamper == Tamper::kOtherEpoch ? "token of another run"
+                                                     : "token others can write");
     fs::remove_all(dir_);
     const auto options =
         WithIdentity(Opts(1 << 20, 1 << 20, 4096), WarmRestart::kAuto, 1, 7);
@@ -1228,11 +1236,18 @@ TEST_F(DiskSlabTest, MissingOrForeignTrustTokenForcesAReset) {
     }));
     const fs::path token = TrustToken(dir_);
     ASSERT_TRUE(fs::exists(token)) << "the killed run was vouching";
-    if (foreign) {
-      std::ofstream other(token, std::ios::binary | std::ios::trunc);
-      other.write("\0\0\0\0\0\0\0\x7f", 8);
-    } else {
-      fs::remove(token);
+    switch (tamper) {
+      case Tamper::kRemoved:
+        fs::remove(token);
+        break;
+      case Tamper::kOtherEpoch: {
+        std::ofstream other(token, std::ios::binary | std::ios::trunc);
+        other.write("\0\0\0\0\0\0\0\x7f", 8);
+        break;
+      }
+      case Tamper::kWritableByOthers:
+        ASSERT_EQ(::chmod(token.c_str(), 0666), 0);
+        break;
     }
     bool ok = false;
     DiskSlabStore recovered(options, &ok);
