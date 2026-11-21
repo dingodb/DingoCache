@@ -37,9 +37,17 @@ constexpr unsigned kCuMemHostRegisterPortable = 0x1;  // CU_MEMHOSTREGISTER_PORT
 
 class CudaLib {
  public:
-  // dlopens libcuda.so.1 and resolves the surface exactly once per process.
-  // nullptr => no usable driver; callers must degrade silently.
+  // Attaches to the libcuda.so.1 the host process has already loaded and
+  // resolves the surface once. dfkv never loads or initializes CUDA in a
+  // process that has not done so itself: without the library every pointer is
+  // host memory. nullptr => no CUDA in this process (re-probed later, since a
+  // framework may load it after the client was created) or no usable driver;
+  // callers must degrade silently.
   static const CudaLib* Get();
+  // For a process that is itself the CUDA host -- GPU tools and tests with no
+  // framework above them: loads the driver library, then attaches. libdfkv
+  // never calls this on a caller's behalf.
+  static const CudaLib* LoadForHost();
 
   // True iff p is a CUDA device pointer (UVA query; host/unknown => false).
   bool IsDevicePtr(const void* p) const;

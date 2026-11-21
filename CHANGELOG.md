@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Client: libdfkv no longer loads or initializes CUDA in a process that has
+  not done so itself. Classifying an unregistered GET destination (and
+  `RegisterMemory`) used to `dlopen("libcuda.so.1")` and call `cuInit` on
+  first use, so every dfkv client process on a GPU host -- schedulers, tools,
+  benchmarks, unit tests -- opened the driver devices even though it only
+  ever handled host memory. On one driver build that was enough to hit a
+  kernel NULL dereference in the UVM teardown path when such a process
+  exited. `CudaLib` now attaches with `RTLD_NOLOAD` only to a library the
+  host process already loaded; without one every pointer is host memory. An
+  absent library is re-probed (at most every 100 ms), so a framework that
+  loads CUDA after the client was created is still picked up.
 - Server: a tenant without a node quota no longer serializes on the tenant
   admission stripe. `DiskCacheGroup` took the stripe unconditionally in
   `Cache` / `CacheDirect` / `CacheDirectBatch` / `Remove` and held it across
