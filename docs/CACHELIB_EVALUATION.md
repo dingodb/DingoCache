@@ -89,7 +89,7 @@ An alternative backend is acceptable only if it implements the observable
 | Capacity | Capacity, eviction, and tenant usage are committed payload-byte semantics, not allocator-reserved bytes or an approximate object count. |
 | Tenant admission | Per-node quotas serialize PUT/REMOVE of limited tenants by fixed stripes, charge only new committed keys, roll back failures, subtract eviction/removal, and rebuild from tenant-scoped records. One rejected tenant does not reject unrelated batch items. Tenants without a quota take no stripe, so the backend itself must order same-key PUT/PUT and PUT/REMOVE. |
 | Disk layout | Each disk is a bounded extent pool with resident descriptors, deterministic geometry, v3 CRC-protected fixed records, and no per-object files. Format/geometry mismatch fails closed. |
-| Crash epoch | Startup persists a dirty epoch before serving. Graceful shutdown syncs payload/table then marks clean. An unclean epoch keeps the table only when the previous process provably died under the same kernel boot and mount without a recorded storage failure or crash; otherwise it cold-resets metadata instead of serving possibly stale or torn bytes. |
+| Crash epoch | Startup persists a dirty epoch before serving. Graceful shutdown syncs payload/table then marks clean. An unclean epoch cold-resets metadata instead of serving possibly stale or torn bytes; opt-in (`DFKV_SLAB_WARM_RESTART`), the table is kept when the previous process provably died under the same kernel boot and mount without a recorded storage failure or crash. |
 | RAM/MR ownership | The fixed arena is aligned, prefaulted, bounded, and registered once on every selected rail. Arena slots remain pinned until the completion that fences NIC reads. Oversized allocations never borrow the arena MR. |
 | I/O | Production payload I/O bypasses the page cache with `O_DIRECT`; bounded buffered fallback is observable. io_uring is build-gated and submits prepared reads or direct-write batches without weakening lease/commit semantics. |
 | Operations | Existing `dfkv_*` metrics retain their meanings, including per-disk bytes/objects, tenant limits/usage/rejections, slab allocation/rebuild/epoch failures, direct-I/O fallbacks, io_uring activity, RAM health/backlog/pins, and RDMA registration/resources. |
@@ -173,10 +173,10 @@ owner would regress correctness even if ordinary CacheLib lookups worked.
 
 DiskSlabStore format v3 stores tenant identity, exact payload length, slot
 geometry, and a CRC in each fixed record. `slab_state` has a separate
-CRC-protected clean/dirty epoch. Unclean startup destroys warmth deliberately
-unless the dirty epoch carries the identity of the current boot and mount (the
-process was killed, the kernel and its page cache were not); format or geometry
-mismatch refuses startup.
+CRC-protected clean/dirty epoch. Unclean startup destroys warmth deliberately;
+opt-in, it keeps the table when the dirty epoch carries the identity of the
+current boot and mount (the process was killed, the kernel and its page cache
+were not). Format or geometry mismatch refuses startup.
 
 CacheLib persistence has a different contract and different RAM/NVM format
 epochs. Its documented recoverable path drains all cache access and calls

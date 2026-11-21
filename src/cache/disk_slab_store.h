@@ -76,20 +76,31 @@ class DiskSlabStore : public StoreEngine {
     // What happens to slots.tbl after an unclean exit, i.e. when slab_state
     // still says dirty at startup.
     //   kOff      reset the table: the cache starts empty (every release up to
-    //             2.35 did this unconditionally).
+    //             2.35 did this unconditionally). The default.
     //   kAuto     keep the table when the previous process demonstrably died
     //             with the kernel -- and so the page cache holding its last
     //             record writes -- still up: same boot id, same unique mount
-    //             id, no storage failure and no crash recorded by that run,
-    //             and a clean fdatasync of the table and every extent now.
-    //             Anything short of that resets as kOff does.
-    //   kBootOnly as kAuto, but when the kernel has no unique mount id (before
-    //             Linux 6.8) the boot id alone is accepted. That cannot see a
-    //             filesystem that was shut down and mounted again without a
-    //             reboot, which loses the record writes of its last moments.
+    //             id, same directory, no "untrusted" marker left by a storage
+    //             failure, a crash or an unfinished recovery, a supported
+    //             local filesystem, and a clean fdatasync of the table and
+    //             every extent now. Anything short of that resets as kOff.
+    //   kBootOnly as kAuto, but a run that recorded no unique mount id (a
+    //             kernel before Linux 6.8) is accepted on its boot id. A
+    //             filesystem that died and was mounted again without a reboot
+    //             is then only caught if the old process saw an I/O error
+    //             before it went away (it leaves the marker).
     // DiskCacheGroup resolves DFKV_SLAB_WARM_RESTART into this.
     enum class WarmRestart { kOff, kAuto, kBootOnly };
     WarmRestart warm_restart = WarmRestart::kOff;
+    // Where "this table is not to be trusted" markers go. They must live as
+    // long as the kernel's page cache and must not depend on the cache disk,
+    // which is the thing that just failed: a tmpfs. Empty = /dev/shm, which
+    // is only used if it really is a tmpfs; tests point this elsewhere.
+    std::string trust_marker_dir;
+    // Keeping a table also requires a filesystem known to keep written data
+    // with the local kernel (xfs, ext4, tmpfs). Tests that run on whatever
+    // the build machine offers turn the check off.
+    bool require_local_filesystem = true;
     // Identity of this kernel boot and of the mount holding `dir`. Read from
     // the system when empty; tests set them to stage a reboot or a remount.
     std::optional<std::array<uint8_t, 16>> boot_id;
@@ -246,11 +257,12 @@ class DiskSlabStore : public StoreEngine {
   }
   const std::string& StartupError() const override { return startup_error_; }
 
-  // For a fatal-signal handler: marks the state file of every open store so
-  // that the next start resets its table. A process that crashed on its own
-  // may have misbehaved before it died, and payloads carry no checksum to
-  // catch that. Async-signal-safe (pwrite and fdatasync on prepared records).
-  static void PoisonAllForCrash() noexcept;
+  // For a fatal-signal handler: leaves the "untrusted" marker of every open
+  // store, so that the next start resets its table. A process that crashed on
+  // its own may have misbehaved before it died, and payloads carry no checksum
+  // to catch that. Async-signal-safe: one open(2) per store on prepared paths,
+  // on a tmpfs, so it neither blocks on nor depends on the cache disks.
+  static void MarkAllUntrustedForCrash() noexcept;
 
  private:
   friend class DiskSlabStoreTestPeer;
@@ -265,7 +277,7 @@ class DiskSlabStore : public StoreEngine {
   // twice, mixed slot sizes in one extent, ...), as opposed to an I/O failure.
   bool Rebuild(bool* inconsistent = nullptr);
   bool OpenEpochState(bool fresh);
-  bool LockEpochState();
+  bool LockDirectory();
   bool RecoverUnclean();
   // nullptr when every recorded condition for keeping the table holds;
   // otherwise the reason it has to be reset.
@@ -275,7 +287,11 @@ class DiskSlabStore : public StoreEngine {
   // with_identity stores this boot and mount in the record: only a dirty state
   // written after the table was rebuilt may carry them.
   bool WriteEpochState(uint32_t state, uint64_t epoch, bool with_identity);
-  void PoisonEpochState();
+  // "Do not keep this table": the marker on tmpfs, plus -- best effort, it is
+  // the failing disk -- the identity withdrawn from slab_state. False while
+  // the marker could not be created; callers retry.
+  bool MarkUntrusted();
+  void ClearUntrustedMarker();
   bool MarkDirtyEpoch();
   bool MarkCleanEpoch();
   bool SyncPayloads();
@@ -346,10 +362,15 @@ class DiskSlabStore : public StoreEngine {
   uint64_t mount_id_ = 0;
   std::array<uint8_t, 16> stored_boot_id_{};
   uint64_t stored_mount_id_ = 0;
+  uint64_t stored_dir_ino_ = 0;
+  int dir_fd_ = -1;                  // holds the directory lock
+  bool dir_locked_ = false;
+  uint64_t dir_dev_ = 0, dir_ino_ = 0;
+  std::string marker_path_;          // empty: no usable marker directory
   std::mutex state_mu_;              // serializes slab_state writes
   std::atomic<bool> identity_recorded_{false};  // slab_state carries it now
-  std::atomic<bool> state_poisoned_{false};
-  int crash_slot_ = -1;              // PoisonAllForCrash registration
+  std::atomic<bool> untrusted_marked_{false};
+  int crash_slot_ = -1;              // MarkAllUntrustedForCrash registration
   // Outstanding asynchronous leases. The opaque id remains entirely internal:
   // ReadLease destruction routes it back through ReleaseReadLeaseThunk.
   struct PrepHold { BlockKey key; std::string fn; };

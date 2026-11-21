@@ -35,17 +35,20 @@ using dfkv::Status;
 static volatile sig_atomic_t g_stop = 0;
 static void OnSig(int) { g_stop = 1; }
 
-// A crash of the server itself: have every slab store withdraw the "same boot"
-// identity from its state file before the process dies, so the next start
-// resets those caches instead of keeping tables a misbehaving process wrote.
-// SIGKILL (OOM, stop timeout) never gets here, and does not need to.
+// A crash of the server itself: have every slab store leave its "untrusted"
+// marker before the process dies, so the next start resets those caches
+// instead of keeping tables a misbehaving process wrote. SIGKILL (OOM, stop
+// timeout) never gets here, and does not need to. A stack overflow does not
+// either (no alternate stack) and is then treated like a kill.
 static struct sigaction g_previous_fatal[NSIG];
-static void OnFatalSignal(int sig) {
-  dfkv::DiskSlabStore::PoisonAllForCrash();
-  // Hand the signal on to whoever had it before (the default action, or a
-  // sanitizer's reporter), so the process still dies the way it would have.
+static void OnFatalSignal(int sig, siginfo_t* info, void*) {
+  dfkv::DiskSlabStore::MarkAllUntrustedForCrash();
+  // Hand the signal back to whoever had it before (the default action, or a
+  // sanitizer's reporter). A fault raised by the kernel re-triggers at the
+  // same instruction once this returns, with its real address; one that was
+  // sent to the process has to be sent again.
   ::sigaction(sig, &g_previous_fatal[sig], nullptr);
-  ::raise(sig);
+  if (info == nullptr || info->si_code <= 0) ::raise(sig);
 }
 
 int main(int argc, char** argv) {
@@ -328,8 +331,8 @@ int main(int argc, char** argv) {
   std::signal(SIGTERM, OnSig);
   {
     struct sigaction fatal {};
-    fatal.sa_handler = OnFatalSignal;
-    fatal.sa_flags = SA_NODEFER;  // the handler re-raises
+    fatal.sa_sigaction = OnFatalSignal;
+    fatal.sa_flags = SA_SIGINFO | SA_NODEFER;  // the handler may re-raise
     sigemptyset(&fatal.sa_mask);
     for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT})
       ::sigaction(sig, &fatal, &g_previous_fatal[sig]);
