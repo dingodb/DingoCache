@@ -15,12 +15,14 @@
 #ifndef DFKV_DISK_SLAB_STORE_H_
 #define DFKV_DISK_SLAB_STORE_H_
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -71,6 +73,27 @@ class DiskSlabStore : public StoreEngine {
     // no such window in direct mode (DIO is durable at return); this closes
     // the record side to <= the cadence instead of the ~30s dirty expiry.
     uint32_t table_sync_ms = 100;
+    // What happens to slots.tbl after an unclean exit, i.e. when slab_state
+    // still says dirty at startup.
+    //   kOff      reset the table: the cache starts empty (every release up to
+    //             2.35 did this unconditionally).
+    //   kAuto     keep the table when the previous process demonstrably died
+    //             with the kernel -- and so the page cache holding its last
+    //             record writes -- still up: same boot id, same unique mount
+    //             id, no storage failure and no crash recorded by that run,
+    //             and a clean fdatasync of the table and every extent now.
+    //             Anything short of that resets as kOff does.
+    //   kBootOnly as kAuto, but when the kernel has no unique mount id (before
+    //             Linux 6.8) the boot id alone is accepted. That cannot see a
+    //             filesystem that was shut down and mounted again without a
+    //             reboot, which loses the record writes of its last moments.
+    // DiskCacheGroup resolves DFKV_SLAB_WARM_RESTART into this.
+    enum class WarmRestart { kOff, kAuto, kBootOnly };
+    WarmRestart warm_restart = WarmRestart::kOff;
+    // Identity of this kernel boot and of the mount holding `dir`. Read from
+    // the system when empty; tests set them to stage a reboot or a remount.
+    std::optional<std::array<uint8_t, 16>> boot_id;
+    std::optional<uint64_t> mount_id;
   };
 
   // One store's runtime counters (see KvNodeServer's dfkv_slab_* metrics).
@@ -105,6 +128,7 @@ class DiskSlabStore : public StoreEngine {
     uint64_t uring_write_batches = 0;
     uint64_t metadata_io_errors = 0;
     uint64_t unclean_resets = 0;
+    uint64_t warm_restarts = 0;
     uint64_t eviction_record_clears = 0;
     uint64_t record_writes = 0;
     uint64_t table_rebuilt = 0;
@@ -222,6 +246,12 @@ class DiskSlabStore : public StoreEngine {
   }
   const std::string& StartupError() const override { return startup_error_; }
 
+  // For a fatal-signal handler: marks the state file of every open store so
+  // that the next start resets its table. A process that crashed on its own
+  // may have misbehaved before it died, and payloads carry no checksum to
+  // catch that. Async-signal-safe (pwrite and fdatasync on prepared records).
+  static void PoisonAllForCrash() noexcept;
+
  private:
   friend class DiskSlabStoreTestPeer;
   static constexpr size_t kRecBytes = 64;
@@ -231,10 +261,21 @@ class DiskSlabStore : public StoreEngine {
   bool SetStartupErrno(std::string error, int saved_errno);
   bool ClearInitMarker();
   bool OpenOrInit();
-  bool Rebuild();
+  // *inconsistent is set when the records contradict each other (the same key
+  // twice, mixed slot sizes in one extent, ...), as opposed to an I/O failure.
+  bool Rebuild(bool* inconsistent = nullptr);
   bool OpenEpochState(bool fresh);
+  bool LockEpochState();
+  bool RecoverUnclean();
+  // nullptr when every recorded condition for keeping the table holds;
+  // otherwise the reason it has to be reset.
+  const char* WhyNotWarm() const;
+  bool SyncForWarmRestart();
   bool ResetUncleanEpoch();
-  bool WriteEpochState(uint32_t state, uint64_t epoch);
+  // with_identity stores this boot and mount in the record: only a dirty state
+  // written after the table was rebuilt may carry them.
+  bool WriteEpochState(uint32_t state, uint64_t epoch, bool with_identity);
+  void PoisonEpochState();
   bool MarkDirtyEpoch();
   bool MarkCleanEpoch();
   bool SyncPayloads();
@@ -299,6 +340,16 @@ class DiskSlabStore : public StoreEngine {
   uint64_t run_epoch_ = 0;
   bool initializing_ = false;        // validated on-disk init marker to clear
   bool unclean_start_ = false;
+  // This boot / mount, and what the state file recorded for the previous run
+  // (all-zero / 0 = unknown or deliberately withheld).
+  std::array<uint8_t, 16> boot_id_{};
+  uint64_t mount_id_ = 0;
+  std::array<uint8_t, 16> stored_boot_id_{};
+  uint64_t stored_mount_id_ = 0;
+  std::mutex state_mu_;              // serializes slab_state writes
+  std::atomic<bool> identity_recorded_{false};  // slab_state carries it now
+  std::atomic<bool> state_poisoned_{false};
+  int crash_slot_ = -1;              // PoisonAllForCrash registration
   // Outstanding asynchronous leases. The opaque id remains entirely internal:
   // ReadLease destruction routes it back through ReleaseReadLeaseThunk.
   struct PrepHold { BlockKey key; std::string fn; };
@@ -348,6 +399,7 @@ class DiskSlabStore : public StoreEngine {
   // types out of the header (build-flag-independent class layout).
   std::function<int(void* ring, void* cqe)> uring_reap_hook_for_test_;
   std::atomic<uint64_t> unclean_resets_{0};
+  std::atomic<uint64_t> warm_restarts_{0};
   std::atomic<uint64_t> eviction_record_clears_{0};
   std::atomic<uint64_t> watermark_extent_clears_{0};
   std::atomic<uint64_t> watermark_slot_record_clears_{0};

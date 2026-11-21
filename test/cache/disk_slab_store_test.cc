@@ -16,7 +16,9 @@
 #endif
 
 #include <cerrno>
+#include <csignal>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -844,6 +846,320 @@ TEST_F(DiskSlabTest, DirtyEpochColdResetsAfterProcessCrash) {
   ASSERT_EQ(clean_reopen.Range(K(71), 0, survivor.size(), &out),
             Status::kOk);
   EXPECT_EQ(out, survivor);
+}
+
+// ---- Unclean exit within the same boot: the table may be kept -------------
+//
+// The crashing process is a forked child that leaves through _exit, i.e.
+// without destructors: what a SIGKILLed server leaves behind. Boot and mount
+// identity are injected, so a "reboot" or a "remount" is just another value.
+namespace {
+using WarmRestart = DiskSlabStore::Options::WarmRestart;
+
+DiskSlabStore::Options WithIdentity(DiskSlabStore::Options options,
+                                    WarmRestart policy, uint8_t boot,
+                                    uint64_t mount) {
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  options.warm_restart = policy;
+  std::array<uint8_t, 16> boot_id;
+  boot_id.fill(boot);
+  options.boot_id = boot_id;
+  options.mount_id = mount;
+  return options;
+}
+
+template <typename Body>
+::testing::AssertionResult CrashAfter(const DiskSlabStore::Options& options,
+                                      Body&& body) {
+  const pid_t child = ::fork();
+  if (child < 0) return ::testing::AssertionFailure() << "fork failed";
+  if (child == 0) {
+    bool ok = false;
+    DiskSlabStore store(options, &ok);
+    ::_exit(ok && body(store) ? 0 : 1);
+  }
+  int status = 0;
+  if (::waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+      WEXITSTATUS(status) != 0)
+    return ::testing::AssertionFailure()
+           << "the crashing child failed its own steps";
+  return ::testing::AssertionSuccess();
+}
+
+std::string Payload(char fill) { return std::string(4096, fill); }
+
+bool PutFilled(DiskSlabStore& store, uint64_t id, char fill) {
+  const std::string value = Payload(fill);
+  return store.Cache(K(id), value.data(), value.size()) == Status::kOk;
+}
+
+// Offsets of the valid records in slots.tbl.
+std::vector<off_t> ValidRecordOffsets(const fs::path& dir) {
+  std::ifstream in(dir / "slots.tbl", std::ios::binary);
+  const std::string table((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+  std::vector<off_t> offsets;
+  for (size_t at = 0; at + 64 <= table.size(); at += 64)
+    if (dfkv::net::GetU32(table.data() + at) != 0 && table[at + 8] == 1)
+      offsets.push_back(static_cast<off_t>(at));
+  return offsets;
+}
+}  // namespace
+
+TEST_F(DiskSlabTest, UncleanExitInTheSameBootKeepsTheCache) {
+  const auto options =
+      WithIdentity(Opts(1 << 20, 1 << 20, 4096), WarmRestart::kAuto, 1, 7);
+  ASSERT_TRUE(CrashAfter(options, [](DiskSlabStore& store) {
+    return PutFilled(store, 90, 'a') && PutFilled(store, 91, 'b') &&
+           PutFilled(store, 92, 'c') && store.Remove(K(91)) == Status::kOk;
+  }));
+
+  {
+    bool ok = false;
+    DiskSlabStore recovered(options, &ok);
+    ASSERT_TRUE(ok) << recovered.StartupError();
+    EXPECT_EQ(recovered.GetStats().warm_restarts, 1u);
+    EXPECT_EQ(recovered.GetStats().unclean_resets, 0u);
+    EXPECT_EQ(recovered.Count(), 2u);
+    std::string out;
+    ASSERT_EQ(recovered.Range(K(90), 0, 4096, &out), Status::kOk);
+    EXPECT_EQ(out, Payload('a'));
+    ASSERT_EQ(recovered.Range(K(92), 0, 4096, &out), Status::kOk);
+    EXPECT_EQ(out, Payload('c'));
+    EXPECT_EQ(recovered.Range(K(91), 0, 4096, &out), Status::kNotFound)
+        << "a removed key came back";
+    ASSERT_TRUE(PutFilled(recovered, 91, 'd'));  // and its slot is reusable
+  }
+
+  bool ok = false;
+  DiskSlabStore clean_reopen(options, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(clean_reopen.GetStats().warm_restarts, 0u);
+  EXPECT_EQ(clean_reopen.Count(), 3u);
+  std::string out;
+  ASSERT_EQ(clean_reopen.Range(K(91), 0, 4096, &out), Status::kOk);
+  EXPECT_EQ(out, Payload('d'));
+}
+
+// Every condition short of "same boot, same mount, policy allows it" resets.
+TEST_F(DiskSlabTest, UncleanExitIsResetWhenTheTableCannotBeTrusted) {
+  struct Case {
+    const char* name;
+    WarmRestart policy;
+    uint8_t boot;
+    uint64_t mount;
+    bool kept;
+  };
+  // The crashed run always used kAuto, boot 1, mount 7.
+  const Case cases[] = {
+      {"rebooted", WarmRestart::kAuto, 2, 7, false},
+      {"mounted again", WarmRestart::kAuto, 1, 8, false},
+      {"mounted again, boot-only policy", WarmRestart::kBootOnly, 1, 8, false},
+      {"no mount id now", WarmRestart::kAuto, 1, 0, false},
+      {"no mount id now, boot-only policy", WarmRestart::kBootOnly, 1, 0, true},
+      {"no boot id now", WarmRestart::kBootOnly, 0, 7, false},
+      {"policy off", WarmRestart::kOff, 1, 7, false},
+  };
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.name);
+    fs::remove_all(dir_);
+    const auto base = Opts(1 << 20, 1 << 20, 4096);
+    ASSERT_TRUE(CrashAfter(WithIdentity(base, WarmRestart::kAuto, 1, 7),
+                           [](DiskSlabStore& store) {
+                             return PutFilled(store, 90, 'a');
+                           }));
+    bool ok = false;
+    DiskSlabStore recovered(WithIdentity(base, c.policy, c.boot, c.mount), &ok);
+    ASSERT_TRUE(ok) << recovered.StartupError();
+    EXPECT_EQ(recovered.GetStats().warm_restarts, c.kept ? 1u : 0u);
+    EXPECT_EQ(recovered.GetStats().unclean_resets, c.kept ? 0u : 1u);
+    EXPECT_EQ(recovered.Count(), c.kept ? 1u : 0u);
+  }
+}
+
+// The policy is applied by the run that finds the dirty state: a run with the
+// policy off still records its identity, so the next start may keep its table.
+TEST_F(DiskSlabTest, IdentityIsRecordedWhateverThePolicyOfTheCrashedRun) {
+  const auto base = Opts(1 << 20, 1 << 20, 4096);
+  ASSERT_TRUE(CrashAfter(WithIdentity(base, WarmRestart::kOff, 1, 7),
+                         [](DiskSlabStore& store) {
+                           return PutFilled(store, 90, 'a');
+                         }));
+  bool ok = false;
+  DiskSlabStore recovered(WithIdentity(base, WarmRestart::kAuto, 1, 7), &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(recovered.GetStats().warm_restarts, 1u);
+  EXPECT_EQ(recovered.Count(), 1u);
+}
+
+// A Remove acknowledged while a reader still pinned the slot must hold across
+// the crash: its record was invalidated before the acknowledgement.
+TEST_F(DiskSlabTest, RemoveAcknowledgedBeforeTheCrashStaysRemoved) {
+  const auto options =
+      WithIdentity(Opts(1 << 20, 1 << 20, 4096), WarmRestart::kAuto, 1, 7);
+  ASSERT_TRUE(CrashAfter(options, [](DiskSlabStore& store) {
+    if (!PutFilled(store, 90, 'a') || !PutFilled(store, 91, 'b')) return false;
+    static dfkv::ReadLease reader;  // never released: the process dies first
+    return store.RangeDirectPrep(K(90), 0, 0, 1 << 20, &reader) ==
+               Status::kOk &&
+           store.Remove(K(90)) == Status::kOk;
+  }));
+  bool ok = false;
+  DiskSlabStore recovered(options, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(recovered.GetStats().warm_restarts, 1u);
+  std::string out;
+  EXPECT_EQ(recovered.Range(K(90), 0, 4096, &out), Status::kNotFound);
+  EXPECT_EQ(recovered.Range(K(91), 0, 4096, &out), Status::kOk);
+}
+
+// A run that hit a metadata failure can no longer vouch for what the page
+// cache holds; it withdraws its identity so the next start resets.
+TEST_F(DiskSlabTest, StorageFailureInThePreviousRunForcesAReset) {
+  const auto options =
+      WithIdentity(Opts(1 << 20, 1 << 20, 4096), WarmRestart::kAuto, 1, 7);
+  ASSERT_TRUE(CrashAfter(options, [](DiskSlabStore& store) {
+    if (!PutFilled(store, 90, 'a')) return false;
+    dfkv::DiskSlabStoreTestPeer::BreakTableFd(&store);
+    return !dfkv::DiskSlabStoreTestPeer::SyncTableNow(&store) &&
+           !store.Healthy();
+  }));
+  bool ok = false;
+  DiskSlabStore recovered(options, &ok);
+  ASSERT_TRUE(ok) << recovered.StartupError();
+  EXPECT_EQ(recovered.GetStats().warm_restarts, 0u);
+  EXPECT_EQ(recovered.GetStats().unclean_resets, 1u);
+  EXPECT_EQ(recovered.Count(), 0u);
+}
+
+// What the server's fatal-signal handler does before the process dies.
+TEST_F(DiskSlabTest, CrashOfTheProcessItselfForcesAReset) {
+  const auto options =
+      WithIdentity(Opts(1 << 20, 1 << 20, 4096), WarmRestart::kAuto, 1, 7);
+  ASSERT_TRUE(CrashAfter(options, [](DiskSlabStore& store) {
+    if (!PutFilled(store, 90, 'a')) return false;
+    DiskSlabStore::PoisonAllForCrash();
+    return true;
+  }));
+  bool ok = false;
+  DiskSlabStore recovered(options, &ok);
+  ASSERT_TRUE(ok) << recovered.StartupError();
+  EXPECT_EQ(recovered.GetStats().warm_restarts, 0u);
+  EXPECT_EQ(recovered.GetStats().unclean_resets, 1u);
+  EXPECT_EQ(recovered.Count(), 0u);
+}
+
+// A reset that dies half-way leaves a partly zeroed table next to a state that
+// still looked eligible. The identity is withdrawn before the first zero is
+// written, so the next start finishes the reset instead of keeping the rest.
+TEST_F(DiskSlabTest, InterruptedResetIsFinishedNotKept) {
+  const auto base = Opts(1 << 20, 1 << 20, 4096);
+  const auto options = WithIdentity(base, WarmRestart::kAuto, 1, 7);
+  ASSERT_TRUE(CrashAfter(options, [](DiskSlabStore& store) {
+    return PutFilled(store, 90, 'a') && PutFilled(store, 91, 'b') &&
+           PutFilled(store, 92, 'c');
+  }));
+  ASSERT_EQ(ValidRecordOffsets(dir_).size(), 3u);
+
+  // "Rebooted" start whose reset cannot get past the first bytes of the table.
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    ::signal(SIGXFSZ, SIG_IGN);
+    struct rlimit limit {};
+    limit.rlim_cur = limit.rlim_max = 64;  // slab_state fits, the table does not
+    if (::setrlimit(RLIMIT_FSIZE, &limit) != 0) ::_exit(2);
+    bool ok = true;
+    DiskSlabStore store(WithIdentity(base, WarmRestart::kAuto, 2, 7), &ok);
+    ::_exit(ok ? 3 : 0);  // the reset must have failed
+  }
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFEXITED(status));
+  ASSERT_EQ(WEXITSTATUS(status), 0);
+  ASSERT_FALSE(ValidRecordOffsets(dir_).empty())
+      << "the staged reset was meant to stop early";
+
+  bool ok = false;
+  DiskSlabStore recovered(options, &ok);  // the original boot and mount again
+  ASSERT_TRUE(ok) << recovered.StartupError();
+  EXPECT_EQ(recovered.GetStats().warm_restarts, 0u);
+  EXPECT_EQ(recovered.GetStats().unclean_resets, 1u);
+  EXPECT_EQ(recovered.Count(), 0u);
+}
+
+// Records that contradict each other used to be unreachable after an unclean
+// exit (the table was reset first) and fail startup after a clean one. On the
+// warm path they mean the table cannot be trusted: reset, do not refuse to start.
+TEST_F(DiskSlabTest, InconsistentTableOnTheWarmPathFallsBackToAReset) {
+  const auto options =
+      WithIdentity(Opts(1 << 20, 1 << 20, 4096), WarmRestart::kAuto, 1, 7);
+  ASSERT_TRUE(CrashAfter(options, [](DiskSlabStore& store) {
+    return PutFilled(store, 90, 'a') && PutFilled(store, 91, 'b');
+  }));
+  const std::vector<off_t> records = ValidRecordOffsets(dir_);
+  ASSERT_EQ(records.size(), 2u);
+  {  // the same key in two slots
+    const int fd = ::open((dir_ / "slots.tbl").c_str(), O_RDWR);
+    ASSERT_GE(fd, 0);
+    char record[64];
+    ASSERT_EQ(::pread(fd, record, sizeof(record), records[0]), 64);
+    ASSERT_EQ(::pwrite(fd, record, sizeof(record), records[1]), 64);
+    ::close(fd);
+  }
+  bool ok = false;
+  DiskSlabStore recovered(options, &ok);
+  ASSERT_TRUE(ok) << recovered.StartupError();
+  EXPECT_EQ(recovered.GetStats().warm_restarts, 0u);
+  EXPECT_EQ(recovered.GetStats().unclean_resets, 1u);
+  EXPECT_EQ(recovered.Count(), 0u);
+  EXPECT_TRUE(PutFilled(recovered, 90, 'z'));
+}
+
+// With the system's real identity: kept on a kernel that reports a unique
+// mount id, reset on one that does not -- and correct either way.
+TEST_F(DiskSlabTest, UncleanExitWithTheRealSystemIdentity) {
+  auto options = Opts(1 << 20, 1 << 20, 4096);
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  options.warm_restart = WarmRestart::kAuto;
+  ASSERT_TRUE(CrashAfter(options, [](DiskSlabStore& store) {
+    return PutFilled(store, 90, 'a');
+  }));
+  bool ok = false;
+  DiskSlabStore recovered(options, &ok);
+  ASSERT_TRUE(ok) << recovered.StartupError();
+  const auto stats = recovered.GetStats();
+  ASSERT_EQ(stats.warm_restarts + stats.unclean_resets, 1u);
+  std::string out;
+  if (stats.warm_restarts == 1) {
+    ASSERT_EQ(recovered.Range(K(90), 0, 4096, &out), Status::kOk);
+    EXPECT_EQ(out, Payload('a'));
+  } else {
+    EXPECT_EQ(recovered.Count(), 0u);
+  }
+}
+
+// One process per directory: the state file is locked for the store's life.
+TEST_F(DiskSlabTest, SecondOpenOfALiveDirectoryIsRefused) {
+  auto options = Opts(1 << 20, 1 << 20, 4096);
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  bool ok = false;
+  DiskSlabStore first(options, &ok);
+  ASSERT_TRUE(ok);
+  ASSERT_TRUE(PutFilled(first, 90, 'a'));
+  {
+    bool second_ok = true;
+    DiskSlabStore second(options, &second_ok);
+    EXPECT_FALSE(second_ok);
+    EXPECT_NE(second.StartupError().find("in use"), std::string::npos)
+        << second.StartupError();
+  }
+  std::string out;  // the refused open left the live store alone
+  ASSERT_EQ(first.Range(K(90), 0, 4096, &out), Status::kOk);
+  EXPECT_EQ(out, Payload('a'));
 }
 
 TEST_F(DiskSlabTest, CorruptEpochStateFailsClosed) {

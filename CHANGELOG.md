@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Server: the slab cache survives an unclean exit when the kernel did not go
+  down with the process. A dirty `slab_state` used to reset `slots.tbl`
+  unconditionally, so a server killed by a stop timeout or the OOM killer came
+  back empty. `slab_state` now records the boot id and the unique mount id; if
+  both still match, no storage failure or crash was recorded by that run, and
+  the table and extents sync cleanly, the table is rebuilt as after a clean
+  shutdown. A reboot, a remount, a metadata I/O failure, a crash of the server
+  itself (new fatal-signal handler) or an inconsistent table still reset, and
+  an inconsistent table no longer fails startup on that path.
+  `DFKV_SLAB_WARM_RESTART=auto|boot|off` (default `auto`; `boot` accepts the
+  boot id alone on kernels older than 6.8, `off` is the old behaviour); new
+  counter `dfkv_slab_warm_restarts_total`. The state record stays readable by
+  2.35, whose own records are treated as "reset". A cache directory is now
+  locked: a second process opening it fails to start.
 - Server: once a `Remove` has returned successfully, the key's record in
   `slots.tbl` is invalid as far as the next process to read the table is
   concerned (the write is in the page cache; syncing it stays with the
