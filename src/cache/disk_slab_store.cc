@@ -1227,9 +1227,7 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
   }
   if (!leader) return WaitPut(flight);
 
-  const bool io_ok = write_payload(ref) &&
-                     WriteRecord(ref, key, static_cast<uint32_t>(len),
-                                 /*valid=*/true);
+  bool io_ok = write_payload(ref);
 
   Status result = Status::kIOError;
   {
@@ -1238,6 +1236,14 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
     // owner. ReleaseInflightLocked executes it, so this writer must not publish
     // the key afterwards.
     const bool removed_while_writing = deferred_remove_.count(fn) > 0;
+    // The record is written here, under mu_ and after the Remove check, never
+    // before: once a Remove has returned, slots.tbl must not hold a valid
+    // record for the key again until a later PUT commits. Written ahead of the
+    // lock, the record of a cancelled write stayed valid on disk until this
+    // point, and a process killed in between would have brought the removed
+    // key back on a restart that keeps the table.
+    if (io_ok && !removed_while_writing)
+      io_ok = WriteRecord(ref, key, static_cast<uint32_t>(len), /*valid=*/true);
     const bool release_ok = ReleaseInflightLocked(key, fn);
     if (!io_ok || !release_ok || !Healthy()) {
       if (!removed_while_writing) alloc_->Remove(key);
@@ -1492,8 +1498,6 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
       }
       st[i].io_ok = w;
     }
-    if (st[i].io_ok)
-      st[i].io_ok = WriteRecord(st[i].ref, it.key, static_cast<uint32_t>(it.len), /*valid=*/true);
   }
   // -- L2: commit leaders under one lock, publish their exact result, then let
   // followers observe it without holding the store mutex.
@@ -1502,6 +1506,12 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
     for (size_t i = 0; i < N; ++i) {
       if (!st[i].active) continue;
       const bool removed = deferred_remove_.count(st[i].fn) > 0;
+      // Same rule as the scalar path: the record is written under mu_, and
+      // not at all for a write that a Remove cancelled.
+      if (st[i].io_ok && !removed)
+        st[i].io_ok = WriteRecord(st[i].ref, items[i].key,
+                                  static_cast<uint32_t>(items[i].len),
+                                  /*valid=*/true);
       const bool release_ok =
           ReleaseInflightLocked(items[i].key, st[i].fn);
       if (!st[i].io_ok || !release_ok || !Healthy()) {
@@ -1802,10 +1812,19 @@ Status DiskSlabStore::Remove(const BlockKey& key) {
   SlabAllocator::SlotRef ref;
   if (!alloc_->Get(key, &ref)) return Status::kNotFound;
   if (inflight_.count(fn)) {
-    // An unlocked pread/pwrite holds this slot. Defer durable invalidation and
-    // physical removal to the last releaser; readers gate off immediately via
-    // the payload_len_ erase. SlabAllocator's own deferred-remove state remains
-    // a final defense for callers that miss this higher-level ordering.
+    // An unlocked pread/pwrite holds this slot, so its physical removal is
+    // deferred to the last releaser; readers gate off immediately via the
+    // payload_len_ erase. The record is invalidated before this Remove is
+    // acknowledged: a committed key (readers in flight) has a valid record in
+    // slots.tbl, and leaving it there until the last reader finished meant a
+    // process killed in that window kept a key whose removal it had confirmed.
+    // An uncommitted key (a write in flight) has no record yet; its writer
+    // sees the deferral and never writes one. SlabAllocator's own
+    // deferred-remove state remains a final defense for callers that miss this
+    // higher-level ordering.
+    if (payload_len_.count(fn) != 0 &&
+        !WriteRecord(ref, key, 0, /*valid=*/false))
+      return Status::kIOError;
     deferred_remove_.insert(fn);
     ++deferred_remove_total_;
     ErasePayloadLocked(fn);
