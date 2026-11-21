@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Server: `dfkv_rdma_active_conns` (and the per-rail gauge) now drop only
+- Server: `dfkv_rdma_active_conns` and `dfkv_rdma_rail_active_conns` now drop only
   after a closing connection has released its endpoint, receive-segment lease,
   source pins and connection accounting. They used to drop first, so "no
   active connections" could be observed while `dfkv_rdma_recv_segment_used_bytes`,

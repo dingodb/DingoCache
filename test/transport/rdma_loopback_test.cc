@@ -3875,37 +3875,36 @@ TEST(RdmaLoopback, MetricsCountersTrackOps) {
 }
 
 // dfkv_rdma_active_conns is what an operator (and the test below) waits on to
-// know a connection is gone, so it has to stay up until the connection's
-// resources are released. It used to drop first, which made "no connections"
-// observable while the endpoint and its receive lease were still held.
+// know a connection is gone. This pins the first half of that contract: the
+// gauge must still count a connection when its endpoint teardown starts. It
+// used to drop before. That the receive lease and the connection accounting
+// are released by the time it drops is covered by the next test, which reads
+// those metrics right after the gauge reaches zero.
 TEST(RdmaLoopback, ActiveConnsStaysUpUntilTheEndpointIsTornDown) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   ScopedEnv idle_reclaim("DFKV_RDMA_IDLE_MS", "200");
-  std::atomic<int> teardowns{0};
-  std::atomic<uint64_t> lowest_gauge_at_teardown{
-      std::numeric_limits<uint64_t>::max()};
+  // The hook also runs for a connection that failed its bootstrap and never
+  // served, so count the teardowns that saw a live gauge instead of requiring
+  // it of every call.
+  std::atomic<uint64_t> teardowns_with_live_gauge{0};
   RdmaNode node("active-conns-order");
   RdmaServer* const server = node.rsrv.get();
   RdmaServerTestPeer::SetBeforeEndpointTeardown(server, [&, server] {
-    const uint64_t gauge = server->ActiveConns();
-    uint64_t lowest = lowest_gauge_at_teardown.load();
-    while (gauge < lowest &&
-           !lowest_gauge_at_teardown.compare_exchange_weak(lowest, gauge)) {
-    }
-    teardowns.fetch_add(1);
+    if (server->ActiveConns() >= 1) teardowns_with_live_gauge.fetch_add(1);
   });
+  uint64_t served = 0;
   {
     RdmaTransport transport(kMaxMsg);
     KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
     const std::string value(4096, 'a');
     ASSERT_TRUE(client.Put("active-conns-order", value.data(), value.size()));
+    served = server->ActiveConns();
+    ASSERT_GE(served, 1u);
   }
   for (int i = 0; i < 1000 && server->ActiveConns() != 0; ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   ASSERT_EQ(server->ActiveConns(), 0u);
-  EXPECT_GT(teardowns.load(), 0)
-      << "the gauge reached zero before any endpoint was torn down";
-  EXPECT_GE(lowest_gauge_at_teardown.load(), 1u)
+  EXPECT_GE(teardowns_with_live_gauge.load(), served)
       << "the gauge no longer counted a connection whose endpoint was still "
          "being torn down";
 }
