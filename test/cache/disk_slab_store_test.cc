@@ -91,6 +91,26 @@ class DiskSlabStoreTestPeer {
   static bool MarkCleanNow(DiskSlabStore* store) {
     return store->MarkCleanEpoch();
   }
+  // True iff slots.tbl holds a valid record for key right now. Reads the file,
+  // not the allocator: this is what a rebuild after a restart would find.
+  static bool HasValidRecordOnDisk(DiskSlabStore* store, const BlockKey& key) {
+    struct stat st {};
+    if (::fstat(store->table_fd_, &st) != 0) return false;
+    std::vector<char> table(static_cast<size_t>(st.st_size));
+    if (::pread(store->table_fd_, table.data(), table.size(), 0) !=
+        static_cast<ssize_t>(table.size()))
+      return false;
+    for (size_t at = 0; at + DiskSlabStore::kRecBytes <= table.size();
+         at += DiskSlabStore::kRecBytes) {
+      const char* rec = table.data() + at;
+      if (net::GetU32(rec) == 0 || rec[8] != 1) continue;
+      if (net::GetU64(rec + 16) == key.digest_hi &&
+          net::GetU64(rec + 24) == key.digest_lo &&
+          net::GetU64(rec + 36) == key.tenant_hash)
+        return true;
+    }
+    return false;
+  }
 };
 }  // namespace dfkv
 
@@ -1072,6 +1092,88 @@ TEST_F(DiskSlabTest, ReadLeaseMovesAndReleasesOnDestructionAndError) {
   EXPECT_EQ(stats.inflight, 0u);
   EXPECT_EQ(s.Remove(K(3)), Status::kOk);
   EXPECT_EQ(s.Count(), 0u);
+}
+
+// slots.tbl is what a restart rebuilds from, so a Remove that has returned must
+// leave no valid record for the key there -- also while a reader still pins
+// the slot and the physical removal is deferred. The record used to stay valid
+// until the last reader finished.
+TEST_F(DiskSlabTest, RemoveInvalidatesTheRecordWhileReadersAreInFlight) {
+  auto opts = Opts(1 << 20, 1 << 20, 4096);
+  opts.table_sync_ms = 0;
+  opts.reclaim_interval_ms = 0;
+  bool ok = false;
+  DiskSlabStore s(opts, &ok);
+  ASSERT_TRUE(ok);
+  const std::string value(4096, 'a');
+  ASSERT_EQ(s.Cache(K(80), value.data(), value.size()), Status::kOk);
+  ASSERT_TRUE(dfkv::DiskSlabStoreTestPeer::HasValidRecordOnDisk(&s, K(80)));
+
+  dfkv::ReadLease lease;
+  ASSERT_EQ(s.RangeDirectPrep(K(80), 0, 0, 1 << 20, &lease), Status::kOk);
+  ASSERT_EQ(s.Remove(K(80)), Status::kOk);
+  EXPECT_EQ(s.Count(), 1u);  // the reader still pins the slot
+  EXPECT_FALSE(dfkv::DiskSlabStoreTestPeer::HasValidRecordOnDisk(&s, K(80)))
+      << "Remove returned while slots.tbl still held a valid record";
+  { dfkv::ReadLease drop(std::move(lease)); }
+  EXPECT_EQ(s.Count(), 0u);
+  EXPECT_FALSE(dfkv::DiskSlabStoreTestPeer::HasValidRecordOnDisk(&s, K(80)));
+}
+
+// The same rule for a write in flight: the writer that a Remove cancelled must
+// not put a valid record into slots.tbl after that Remove returned. It used to
+// write the record before it learned about the Remove and invalidate it a
+// moment later. Checked from the record-write hook, which runs right before
+// every record write: none of them may find the key valid on disk.
+TEST_F(DiskSlabTest, WriteCancelledByRemoveNeverWritesAValidRecord) {
+  for (const bool batch : {false, true}) {
+    SCOPED_TRACE(batch ? "batch PUT" : "scalar PUT");
+    fs::remove_all(dir_);
+    auto opts = Opts(1 << 20, 1 << 20, 4096);
+    opts.table_sync_ms = 0;
+    opts.reclaim_interval_ms = 0;
+    bool ok = false;
+    DiskSlabStore s(opts, &ok);
+    ASSERT_TRUE(ok);
+
+    HookGate payload_gate;
+    dfkv::DiskSlabStoreTestPeer::SetPayloadWriteHook(
+        &s, [&] { return payload_gate.Run(); });
+    std::atomic<bool> remove_returned{false};
+    std::atomic<bool> valid_after_remove{false};
+    dfkv::DiskSlabStoreTestPeer::SetRecordWriteHook(&s, [&] {
+      if (remove_returned.load() &&
+          dfkv::DiskSlabStoreTestPeer::HasValidRecordOnDisk(&s, K(81)))
+        valid_after_remove.store(true);
+      return true;
+    });
+
+    std::string value(4096, 'a');
+    Status put = Status::kInvalid;
+    std::thread writer([&] {
+      if (batch) {
+        put = s.CacheDirectBatch(
+            {{K(81), value.data(), value.size(), value.size()}})[0];
+      } else {
+        put = s.Cache(K(81), value.data(), value.size());
+      }
+    });
+    payload_gate.WaitEntered();
+    ASSERT_EQ(s.Remove(K(81)), Status::kOk);  // deferred behind the write
+    remove_returned.store(true);
+    payload_gate.Release(true);
+    writer.join();
+    dfkv::DiskSlabStoreTestPeer::SetPayloadWriteHook(&s, {});
+    dfkv::DiskSlabStoreTestPeer::SetRecordWriteHook(&s, {});
+
+    EXPECT_EQ(put, Status::kOk);
+    EXPECT_FALSE(valid_after_remove.load())
+        << "a valid record for the removed key reached slots.tbl after the "
+           "Remove had returned";
+    EXPECT_FALSE(dfkv::DiskSlabStoreTestPeer::HasValidRecordOnDisk(&s, K(81)));
+    EXPECT_FALSE(s.IsCached(K(81)));
+    EXPECT_EQ(s.Count(), 0u);
+  }
 }
 
 // Deferred-remove re-PUT (#17): Remove(K) while a read lease pins the slot

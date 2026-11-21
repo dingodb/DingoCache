@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Server: a `Remove` that has returned now always leaves the key's record
+  invalid in `slots.tbl`. While a read or write of the key was in flight the
+  removal is deferred, and until the last holder finished the record stayed
+  valid (a read in flight) or could briefly become valid (a write in flight
+  wrote its record before it learned about the `Remove`). Nothing observed
+  this so far, because a restart after an unclean exit resets the table; it
+  is a prerequisite for keeping the cache across such restarts. PUT records
+  are now written at commit, under the store mutex.
 - Server: `dfkv_rdma_active_conns` and `dfkv_rdma_rail_active_conns` now drop only
   after a closing connection has released its endpoint, receive-segment lease,
   source pins and connection accounting. They used to drop first, so "no
