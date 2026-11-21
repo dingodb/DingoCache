@@ -11,7 +11,9 @@
   throughput unchanged. `RdmaServer::RegisterMemory` is gone with it. The
   arena stays resident: it is now locked with `mlock2(MLOCK_ONFAULT)` while it
   is pre-faulted (`DFKV_RAM_TIER_LOCK=off` disables that; a failed lock only
-  warns). New counter `dfkv_rdma_pull_zerocopy_register_failures_total`:
+  warns; `dfkv_ram_arena_locked` shows the outcome). A TCP-only node, whose
+  arena was never pinned, gets the lock as well. New counter
+  `dfkv_rdma_pull_zerocopy_register_failures_total`:
   per-read registrations that failed and fell back to a staged copy -- what a
   too-low memlock limit used to turn into a failed startup.
 - Server: opt-in, the slab cache survives an unclean exit when the kernel did

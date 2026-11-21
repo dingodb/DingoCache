@@ -28,7 +28,7 @@ flowchart TB
     B --> D
     C --> D
     D -->|"TCP or optional RDMA data path"| E["dfkv_server: owning cache node"]
-    E --> R["Optional registered RAM hot tier"]
+    E --> R["Optional RAM hot tier"]
     R --> F["DiskCacheGroup: slab store on local disks"]
     E --> F
     D -. "membership discovery" .-> M["dfkv_mds replicas"]

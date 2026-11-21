@@ -225,6 +225,9 @@ class RamTier {
   // Registers the arena's RDMA MR (set once by the RDMA server after reg_mr).
   void SetArenaMr(void* mr);
   uint64_t arena_bytes() const { return arena_bytes_; }
+  // The arena is locked in memory (mlock2); false if that was turned off or
+  // could not be done.
+  bool arena_locked() const { return arena_locked_; }
   uint64_t budget_bytes() const { return opt_.bytes; }
   uint64_t large_budget_bytes() const { return large_budget_bytes_; }
   uint64_t large_used_bytes() const {
@@ -388,6 +391,7 @@ class RamTier {
   uint64_t arena_bytes_ = 0;
   uint64_t large_budget_bytes_ = 0;
   std::atomic<void*> arena_mr_{nullptr};
+  bool arena_locked_ = false;
   uint64_t extent_bytes_ = 0;   // allocator class/extent upper bound
   std::vector<std::unique_ptr<Shard>> shards_;
   std::vector<std::thread> flushers_;

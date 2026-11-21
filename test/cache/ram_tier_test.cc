@@ -1080,6 +1080,30 @@ TEST(RamTier, RejectsUnsupportedNumaMode) {
   ::unsetenv("DFKV_RAM_TIER_NUMA");
 }
 
+// Locking the arena is best effort and can be turned off; either way the tier
+// comes up.
+TEST(RamTier, ArenaLockIsBestEffortAndCanBeTurnedOff) {
+  FlushSink sink;
+  {
+    ::setenv("DFKV_RAM_TIER_LOCK", "off", 1);
+    RamTier rt(Opts(8 * 4096), sink.fn());
+    EXPECT_TRUE(rt.ok());
+    EXPECT_FALSE(rt.arena_locked());
+  }
+  {
+    ::setenv("DFKV_RAM_TIER_LOCK", "0", 1);
+    RamTier rt(Opts(8 * 4096), sink.fn());
+    EXPECT_TRUE(rt.ok());
+    EXPECT_FALSE(rt.arena_locked());
+  }
+  {
+    ::unsetenv("DFKV_RAM_TIER_LOCK");
+    RamTier rt(Opts(8 * 4096), sink.fn());
+    EXPECT_TRUE(rt.ok());  // locked where the memlock limit allows, fine if not
+  }
+  ::unsetenv("DFKV_RAM_TIER_LOCK");
+}
+
 TEST(RamTier, ShardCountCanExceedLegacyCapOf16) {
   // Phase 10: kTokenShardBits 4->6 lifts the cap 16->64 so read/write-heavy
   // multi-connection deployments can shard past the old ceiling. 32 shards must
