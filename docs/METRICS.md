@@ -257,6 +257,7 @@ RAM 热层（**仅 `DFKV_RAM_TIER=1` 时输出**；关时无此系列，向后�
 | `dfkv_ram_rebalanced_total` | counter | RAM 层类再平衡搬动的 extent 数（增长阶段不受 flush 积压歇拍影响——从冷 donor 搬 durable extent 恰是 flush-gated 时唯一能扩收速的动作） |
 | `dfkv_ram_objects` / `dfkv_ram_flush_backlog` | gauge | 当前 RAM 常驻块 / 待 flush（含已出队、正在 flush，均尚未 DURABLE）的块数 |
 | `dfkv_ram_budget_bytes` / `dfkv_ram_arena_bytes` / `dfkv_ram_large_budget_bytes` | gauge | RAM 层总预算（arena+dedicated）/ arena 固定预留 / 总预算内大对象 dedicated 预留 |
+| `dfkv_ram_arena_locked` | gauge | arena 是否锁在内存里（1/0）；为 0 时开了 swap 的主机在内存紧张时可能把 arena 换出 |
 | `dfkv_ram_used_bytes` / `dfkv_ram_large_used_bytes` | gauge | 已用（常驻 slot + dedicated 分配）/ 其中 dedicated 大对象已用——与上组预算行做水位比 |
 
 > 关键运维信号：COLD `load_get_avg_ms` 骤降 + `dfkv_ram_hit_total` 上升 = RAM 热层生效；`dfkv_ram_put_bypass_total` 或 `dfkv_ram_flush_backlog` 持续升高 = flush 落盘带宽不足，需扩 flush 或降 PUT 速率（见 [docs/ARCHITECTURE.md](ARCHITECTURE.md) §6 背压）。
