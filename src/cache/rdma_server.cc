@@ -357,16 +357,11 @@ Status RdmaServer::Start(int port) {
     std::unique_ptr<rdma::RcEndpoint> anchor;
     if (initialize_anchor_for_test_) {
       anchor = initialize_anchor_for_test_(
-          device, user_regions_, initial_segment->data(),
-          initial_segment->size());
+          device, {}, initial_segment->data(), initial_segment->size());
     } else {
       anchor = std::make_unique<rdma::RcEndpoint>();
       if (!anchor->Open(device.c_str(), rdma::kV2ControlCap, 1)) {
         DFKV_LOG_ERROR("rdma: failed to open required v2 device " + device);
-        anchor.reset();
-      } else if (!anchor->EnsurePoolMrs(user_regions_)) {
-        DFKV_LOG_ERROR("rdma: failed to register explicit user region on " +
-                       device);
         anchor.reset();
       } else if (!anchor->RegisterRemoteRegion(initial_segment->data(),
                                                initial_segment->size())) {
@@ -461,18 +456,6 @@ void RdmaServer::ReapDoneLocked() {
 size_t RdmaServer::live_conn_count() {
   std::lock_guard<std::mutex> lk(conn_mu_);
   return conns_.size();
-}
-
-void RdmaServer::RegisterMemory(void* base, size_t size) {
-  if (!base || size == 0) return;
-  auto existing =
-      std::find_if(user_regions_.begin(), user_regions_.end(),
-                   [base](const auto& region) { return region.first == base; });
-  if (existing == user_regions_.end()) {
-    user_regions_.emplace_back(base, size);
-  } else if (size > existing->second) {
-    existing->second = size;
-  }
 }
 
 void RdmaServer::AcceptLoop() {
@@ -927,11 +910,6 @@ void RdmaServer::Serve(int boot_fd) {
   rdma::SerializeQpInfo(my, mine);
   if (!net::WriteAll(boot_fd, mine, rdma::kQpInfoBytes) ||
       !ep.Connect(peer_info)) {
-    ::close(boot_fd);
-    return;
-  }
-  if (!ep.EnsurePoolMrs(user_regions_)) {
-    DFKV_LOG_ERROR("rdma: connection could not attach explicit user MRs");
     ::close(boot_fd);
     return;
   }

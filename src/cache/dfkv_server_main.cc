@@ -74,8 +74,8 @@ int main(int argc, char** argv) {
       "  --mds-registration-timeout-ms <n>  first MDS registration deadline (default 60000; env DFKV_MDS_REGISTRATION_TIMEOUT_MS)\n"
       "  --store-engine <e>   storage backend: slab | file (default slab)\n"
       "  --slab-write <m>     slab I/O mode: direct | buffered (default direct)\n"
-      "  --ram-tier <on|off>  registered RAM hot tier + RDMA zero-copy GET (default off)\n"
-      "  --ram-tier-bytes <n> RAM arena size in bytes (default 16 GiB; pinned once registered)\n"
+      "  --ram-tier <on|off>  RAM hot tier + RDMA zero-copy GET (default off)\n"
+      "  --ram-tier-bytes <n> RAM arena size in bytes (default 16 GiB; pre-faulted at startup)\n"
       "  --ram-write-mode <m> RAM PUT policy: writeback | writearound (default writeback)\n"
       "  --slab-granularity <n>  slab slot quantum bytes (default 1 MiB; existing mismatched geometry fails startup)\n"
       "  --put-inflight-limit <n>  cap concurrent disk PUTs; excess fast-fail kCacheFull (0 = off)\n"
@@ -423,12 +423,15 @@ int main(int argc, char** argv) {
             return srv.RamPinnedHitForKey(key, off, len, out);
           });
     }
-    // RAM arena registration remains transport setup, not per-read ownership.
-    // PreparedRead holds arena pins through SEND or pull-release completion.
+    // The arena as a whole is not registered with the NICs: every pull gets
+    // an exact, revocable READ MR over just the value it serves, and nothing
+    // else on the server refers to arena memory by MR. Registering the whole
+    // arena on every rail pinned it once per rail for no reader -- tens of
+    // seconds of startup and shutdown on a large tier.
     if (srv.ram_enabled()) {
-      rsrv->RegisterMemory(srv.ram_arena(), srv.ram_arena_bytes());
-      DFKV_LOG_INFO("dfkv_server RAM hot tier: RDMA zero-copy serve enabled (arena " +
-                    std::to_string(srv.ram_arena_bytes()) + " bytes)");
+      DFKV_LOG_INFO("dfkv_server RAM hot tier: RDMA zero-copy GET enabled (arena " +
+                    std::to_string(srv.ram_arena_bytes()) +
+                    " bytes, registered per read)");
     }
     const Status rdma_status = rsrv->Start(rdma_port);
     if (rdma_status != Status::kOk) {

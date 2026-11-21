@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Server: the RAM tier arena is no longer registered as a whole with every
+  RDMA rail. Nothing on the server referred to that registration any more
+  (each zero-copy GET registers an exact MR over the value it serves; PUTs
+  land in the receive pool), but it pinned the arena once per rail, serially,
+  at startup and unpinned it at shutdown. On a 192 GiB arena with eight rails
+  that was 58 s of a 115 s start and 19.5 s of a 41 s stop.
+  `RdmaServer::RegisterMemory` is gone with it.
 - Server: opt-in, the slab cache survives an unclean exit when the kernel did
   not go down with the process. A dirty `slab_state` resets `slots.tbl`, so a
   server killed by a stop timeout or the OOM killer comes back empty. With

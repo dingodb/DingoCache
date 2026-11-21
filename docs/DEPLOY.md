@@ -169,7 +169,7 @@ test -e /etc/dfkv/tenant-quotas ||
 > | READ_COALESCE | 开 | 默认关，经 drop-in 打开（TCP 端共读 convoy） | v2 新增 |
 > | 监听加固 | — | `DFKV_TCP_FIRST_REQ_MS=30000` + `DFKV_METRICS_MAX_CONNS=64` | PR#240 新增 |
 > | slab 驱逐水位 | — | `DFKV_SLAB_EVICT_HIGH_PCT=92` / `LOW_PCT=88` | v2 新增（默认 92/88，显式解释为风控用途） |
-> | systemd Timeout | `TimeoutStartSec=600` / `TimeoutStopSec=600` | 同上 | **arena MR 注册时间在 v2.0.0 显著拉长**（≥64 GiB arena 默认 90s 不够），必须与 arena 大小同步扩大 |
+> | systemd Timeout | `TimeoutStartSec=600` / `TimeoutStopSec=600` | 同上 | **大 arena 的预触页在启动时占时间**（≥64 GiB arena 默认 90s 不够），必须与 arena 大小同步扩大。arena 不再整块注册到各 rail，启动和停止各少一段随 arena 大小和 rail 数增长的时间 |
 > | OOM | `OOMScoreAdjust=-500` | 保留 | 一致 |
 > | tenant quota | `DFKV_TENANT_QUOTAS_FILE` + default=0 | 保留 | 一致 |
 ```ini
@@ -231,7 +231,7 @@ ExecStart=/usr/local/bin/dfkv_server \
 #Environment=DFKV_READ_COALESCE_TIMEOUT_MS=500
 Restart=on-failure
 RestartSec=2
-# 大 arena（≥64 GiB）RAM tier 预触+RDMA MR 注册都起页走：每 16 GiB arena +5-10s 启动时间。
+# 大 arena（≥64 GiB）RAM tier 启动时要预触页：每 16 GiB arena 约 +5s 启动时间。
 # xb01 生产 TimeoutStartSec/TimeoutStopSec=600，90s 默认会 OOM-timeout 掉 dfkv；
 # 配大 arena（≥64 GiB）时必须同步调大。
 TimeoutStartSec=600
@@ -301,7 +301,7 @@ WantedBy=multi-user.target
 >   滴喂的慢连接不再永久占用 handler 槽位（SO_RCVTIMEO 只约束单次 syscall）；
 >   每次读的 per-syscall 预算取 min(base timeout, deadline 剩余）。resolved
 >   值由 `dfkv_tcp_first_req_ms` gauge 上报（见 METRICS.md §3.1）。
-> - RAM 热层 arena 预触 + RDMA MR 注册都在启动期走页：**arena 每 16 GiB 约 +5-10s 启动时间**，配大 arena（≥64 GiB）时同步调大 systemd `TimeoutStartSec`（默认 90s）并让就绪探测等待 metrics 端口。
+> - RAM 热层 arena 在启动期预触页：**arena 每 16 GiB 约 +5s 启动时间**，配大 arena（≥64 GiB）时同步调大 systemd `TimeoutStartSec`（默认 90s）并让就绪探测等待 metrics 端口。
 > GPU 节点推荐：保留默认 slab/direct，按节点突发画像启用 RAM tier 并设置总预算。
 ```bash
 systemctl daemon-reload && systemctl enable --now dfkv
