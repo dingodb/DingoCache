@@ -1189,6 +1189,7 @@ bool DiskSlabStore::RecoverUnclean() {
       }
     }
   }
+  unclean_reset_reason_ = why_reset;
   DFKV_LOG_WARN("slab " + opt_.dir +
                 ": previous run did not shut down cleanly; cache reset (" +
                 why_reset + ")");

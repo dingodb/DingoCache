@@ -259,6 +259,8 @@ class DiskSlabStore : public StoreEngine {
     return ok_ && !metadata_failed_.load(std::memory_order_acquire);
   }
   const std::string& StartupError() const override { return startup_error_; }
+  // Why this start reset the table after an unclean exit; empty if it did not.
+  const std::string& UncleanResetReason() const { return unclean_reset_reason_; }
 
   // For a fatal-signal handler: takes back the trust token of every open
   // store, so that the next start resets its table. A process that crashed on
@@ -381,6 +383,7 @@ class DiskSlabStore : public StoreEngine {
   bool dir_locked_ = false;
   uint64_t dir_dev_ = 0, dir_ino_ = 0;
   std::string token_path_;           // empty: no usable tmpfs for tokens
+  std::string unclean_reset_reason_;
   std::mutex state_mu_;              // serializes slab_state writes
   std::atomic<bool> identity_recorded_{false};  // slab_state carries it now
   mutable std::mutex trust_mu_;      // token + the fields below
