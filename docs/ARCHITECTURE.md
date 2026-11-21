@@ -29,7 +29,7 @@ env/config reference see [CONNECTORS.md](CONNECTORS.md).
    ┌──────────────────────┐        ┌──────────────────────────────────────┐
    │ dfkv_mds (+ etcd)    │        │  dfkv_server (cache node)             │
    │ membership directory │        │  ┌────────────────────────────────┐  │
-   └──────────────────────┘        │  │ RamTier (opt) — registered RAM  │  │
+   └──────────────────────┘        │  │ RamTier (opt) — locked RAM      │  │
                                     │  │ promotion + zero-copy RDMA GET  │  │
                                     │  └───────────────┬────────────────┘  │
                                     │      miss ▼      │ flush (write-back) │
@@ -450,7 +450,7 @@ With RAM tier off none of the arena path is wired.
 
 **Direct cold-read promotion**: on a whole-value io_uring miss, the server
 reserves the final arena slot before submitting disk I/O. O_DIRECT reads into
-that registered slot, completion publishes it as born-durable, and the same pin
+that arena slot, completion publishes it as born-durable, and the same pin
 holds it through the first RDMA SEND. The request therefore performs no
 staging-to-arena `memcpy` and no promotion flush. An identical in-flight
 follower waits only for publication, takes its own transfer-pin, and sends from

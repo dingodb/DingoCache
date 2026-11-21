@@ -3585,6 +3585,11 @@ TEST(RdmaLoopback, DynamicPullFallbackAccountsOneAccess) {
               bytes + static_cast<long>(size));
     EXPECT_EQ(node.RangeDirectCalls(key), 1u);
   }
+  // The injected registration failure made the arena hit fall back to a
+  // staged copy, and that is counted.
+  EXPECT_GE(CounterVal(node.rsrv->MetricsText(),
+                       "dfkv_rdma_pull_zerocopy_register_failures_total"),
+            1);
   const BlockKey cold = ToBlockKey(SelfHdr(), "cold-accounting");
   const std::string cold_value = PatternValue(65537, 31);
   ASSERT_EQ(transport.Cache(node.addr, cold, cold_value.data(), cold_value.size()),

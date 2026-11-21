@@ -302,7 +302,7 @@ WantedBy=multi-user.target
 >   每次读的 per-syscall 预算取 min(base timeout, deadline 剩余）。resolved
 >   值由 `dfkv_tcp_first_req_ms` gauge 上报（见 METRICS.md §3.1）。
 > - RAM 热层 arena 在启动期预触页：**实测 192 GiB 约 55 秒（每 16 GiB 约 4.6 秒）**，配更大的 arena 时同步调大 systemd `TimeoutStartSec`（默认 90s）并让就绪探测等待 metrics 端口。
-> - arena 在预触页时用 `mlock2(MLOCK_ONFAULT)` 锁在内存里，不会被换出（需要足够的 memlock 上限，样例单元里是 `LimitMEMLOCK=infinity`）。锁不上只打一条 WARN，服务照常运行，这时开了 swap 的主机在内存紧张时可能把 arena 换出。`DFKV_RAM_TIER_LOCK=off` 可以关闭。以前这块内存是因为整块注册到各 rail 而被 pin 住的。
+> - arena 在预触页时用 `mlock2(MLOCK_ONFAULT)` 锁在内存里，不会被换出（需要足够的 memlock 上限，样例单元里是 `LimitMEMLOCK=infinity`）。锁不上只打一条 WARN，服务照常运行，这时开了 swap 的主机在内存紧张时可能把 arena 换出。`DFKV_RAM_TIER_LOCK=off` 可以关闭，`dfkv_ram_arena_locked` 指标反映实际有没有锁上。以前这块内存是因为整块注册到各 rail 而被 pin 住的；只走 TCP 的节点以前没有这层保护，现在也会锁。
 > GPU 节点推荐：保留默认 slab/direct，按节点突发画像启用 RAM tier 并设置总预算。
 ```bash
 systemctl daemon-reload && systemctl enable --now dfkv
@@ -476,7 +476,6 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `--slab-write` / `DFKV_SLAB_WRITE` | `direct` | slab 数据面 O_DIRECT / buffered；文件系统不支持 DIO 时整店回退 buffered 并以 `wr=` 上报 |
 | `--ram-tier` / `DFKV_RAM_TIER` | `off` | RAM 热层（写穿+RDMA zero-copy GET） |
 | `--ram-tier-bytes` / `DFKV_RAM_TIER_BYTES` | `16 GiB` | arena 预算（启动时预触页并锁在内存里） |
-| `DFKV_RAM_TIER_LOCK` | `on` | arena 是否用 `mlock2` 锁在内存里；锁不上只告警 |
 | `--ram-tier-numa` / `DFKV_RAM_TIER_NUMA` | `interleave` | NUMA 策略：`interleave`/`off`（不接 node id） |
 | `--ram-tier-shards` / `DFKV_RAM_TIER_SHARDS` | `8`, 硬上限 64 | arena 锁分片数（大 arena ≥100 GiB 建议 16） |
 | `--slab-granularity` / `DFKV_SLAB_GRANULARITY` | `1 MiB` | slab slot 量子；现有目录 geometry 不符启动拒绝 |
@@ -551,6 +550,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `DFKV_RAM_TIER_LARGE_RESERVE_BYTES` | — | 超大对象（超出 arena extent）的 dedicated allocation 预算 |
 | `DFKV_RAM_TIER_SHARDS` | `8`, 硬上限 64 | 锁分片 |
 | `DFKV_RAM_TIER_NUMA` | `interleave` | interleave / off |
+| `DFKV_RAM_TIER_LOCK` | `on` | arena 是否锁在内存里（`mlock2`）；锁不上只告警，`dfkv_ram_arena_locked` 反映实际结果 |
 | `DFKV_RAM_FLUSH_THREADS` | `4×盘数`，钳至 shard 上限 16 | flush 线程 |
 
 #### f. 同主机/会合复本（node dedup，v2.0.0 新生产杠杆）

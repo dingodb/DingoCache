@@ -152,28 +152,20 @@ RamTier::RamTier(Options opt, FlushFn flush)
   // Keep the arena resident. It used to be pinned as a side effect of being
   // registered with every RDMA rail; without that it is ordinary anonymous
   // memory, and a host with swap would page a "RAM tier" out under pressure.
-  // MLOCK_ONFAULT locks each page as the pre-fault below touches it, so this
-  // adds no pass of its own. Best effort: without the privilege or the memlock
-  // limit the tier works as before, just unlocked.
-  const char* lk = std::getenv("DFKV_RAM_TIER_LOCK");
-  const std::string lock_mode = (lk && *lk) ? lk : "on";
-  if (lock_mode != "on" && lock_mode != "off") {
-    config_dump::RecordResolved("DFKV_RAM_TIER_LOCK", "invalid");
-    DFKV_LOG_ERROR("DFKV_RAM_TIER_LOCK must be on or off");
-    return;
-  }
-  config_dump::RecordResolved("DFKV_RAM_TIER_LOCK", lock_mode);
-  bool locked = false;
-  if (lock_mode == "on") {
+  // MLOCK_ONFAULT locks each page as the pre-fault below touches it instead of
+  // faulting the range in itself. Best effort: without the privilege or the
+  // memlock limit the tier works as before, just unlocked.
+  if (config_dump::EnvBool("DFKV_RAM_TIER_LOCK", true)) {
+    int lock_errno = ENOSYS;
 #ifdef SYS_mlock2
     constexpr int kMlockOnFault = 0x01;  // MLOCK_ONFAULT
-    locked = ::syscall(SYS_mlock2, arena_, arena_size, kMlockOnFault) == 0;
-#else
-    errno = ENOSYS;
+    arena_locked_ =
+        ::syscall(SYS_mlock2, arena_, arena_size, kMlockOnFault) == 0;
+    lock_errno = errno;
 #endif
-    if (!locked)
+    if (!arena_locked_)
       DFKV_LOG_WARN(std::string("ram tier arena is not locked in memory (") +
-                    std::strerror(errno) +
+                    std::strerror(lock_errno) +
                     "; check the memlock limit): it can be swapped out under "
                     "memory pressure");
   }
@@ -207,7 +199,7 @@ RamTier::RamTier(Options opt, FlushFn flush)
         (interleave && nodes > 1
              ? "interleave/" + std::to_string(nodes) + "nodes"
              : "default") +
-        ", locked=" + (locked ? "yes" : "no") + ")");
+        ", locked=" + (arena_locked_ ? "yes" : "no") + ")");
   }
 
   const uint64_t total_extents =

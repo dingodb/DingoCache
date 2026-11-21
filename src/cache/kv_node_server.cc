@@ -790,8 +790,11 @@ std::string KvNodeServer::MetricsText() const {
            "Hard total RAM-tier budget across arena and dedicated values",
            ram_->budget_bytes());
     metric("dfkv_ram_arena_bytes", "gauge",
-           "Fixed registered arena bytes reserved from the total budget",
+           "Fixed arena bytes reserved from the total budget",
            ram_->arena_bytes());
+    metric("dfkv_ram_arena_locked", "gauge",
+           "1 if the arena is locked in memory and cannot be swapped out",
+           ram_->arena_locked() ? 1 : 0);
     metric("dfkv_ram_large_budget_bytes", "gauge",
            "Dedicated oversized-value reserve within the total budget",
            ram_->large_budget_bytes());

@@ -41,7 +41,7 @@ class EngineTest : public ::testing::Test {
           "DFKV_RAM_TIER_BYTES", "DFKV_RAM_FLUSH_THREADS",
           "DFKV_RAM_TIER_EXTENT_BYTES",
           "DFKV_RAM_TIER_LARGE_RESERVE_BYTES", "DFKV_RAM_TIER_NUMA",
-          "DFKV_RAM_TIER_SHARDS"})
+          "DFKV_RAM_TIER_LOCK", "DFKV_RAM_TIER_SHARDS"})
       ::unsetenv(name);
   }
   std::vector<std::string> Dirs(int n) {
