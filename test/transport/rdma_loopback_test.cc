@@ -65,8 +65,7 @@ class RdmaServerTestPeer {
   using DiscoverFn = std::function<rdma::RdmaDiscoveryResult(
       const std::vector<std::string>&, rdma::RdmaDiscoveryPolicy)>;
   using InitializeAnchorFn = std::function<std::unique_ptr<rdma::RcEndpoint>(
-      const std::string&, const std::vector<std::pair<void*, size_t>>&,
-      void*, size_t)>;
+      const std::string&, void*, size_t)>;
 
   static void SetDiscovery(RdmaServer* server, DiscoverFn discover) {
     server->discover_for_test_ = std::move(discover);
@@ -921,8 +920,7 @@ TEST(RdmaServerStartup, AutoModeKeepsFirstActiveDeviceSemantics) {
   RdmaServerTestPeer::SetInitializeAnchor(
       &server,
       [&initialized](
-          const std::string& device,
-          const std::vector<std::pair<void*, size_t>>&, void*, size_t) {
+          const std::string& device, void*, size_t) {
         initialized.push_back(device);
         return std::make_unique<rdma::RcEndpoint>();
       });
@@ -964,8 +962,7 @@ TEST(RdmaServerStartup, ExplicitInactiveRailRemainsInFixedTopology) {
   RdmaServerTestPeer::SetInitializeAnchor(
       &server,
       [&initialized](
-          const std::string& device,
-          const std::vector<std::pair<void*, size_t>>&, void*, size_t) {
+          const std::string& device, void*, size_t) {
         initialized.push_back(device);
         return std::make_unique<rdma::RcEndpoint>();
       });
@@ -1005,8 +1002,7 @@ TEST(RdmaServerStartup, PartialAnchorMaterializationFailsAtomically) {
   RdmaServerTestPeer::SetInitializeAnchor(
       &server,
       [&attempts](
-          const std::string&, const std::vector<std::pair<void*, size_t>>&,
-          void*, size_t) -> std::unique_ptr<rdma::RcEndpoint> {
+          const std::string&, void*, size_t) -> std::unique_ptr<rdma::RcEndpoint> {
         if (++attempts == 2) return nullptr;
         return std::make_unique<rdma::RcEndpoint>();
       });
@@ -1046,8 +1042,7 @@ TEST(RdmaServerStartup, ExplicitResolutionFailureNeverShrinksTopology) {
   RdmaServerTestPeer::SetInitializeAnchor(
       &server,
       [&anchor_attempts](
-          const std::string&, const std::vector<std::pair<void*, size_t>>&,
-          void*, size_t) -> std::unique_ptr<rdma::RcEndpoint> {
+          const std::string&, void*, size_t) -> std::unique_ptr<rdma::RcEndpoint> {
         ++anchor_attempts;
         return std::make_unique<rdma::RcEndpoint>();
       });

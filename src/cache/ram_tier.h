@@ -224,7 +224,6 @@ class RamTier {
 
   // Registers the arena's RDMA MR (set once by the RDMA server after reg_mr).
   void SetArenaMr(void* mr);
-  char* arena() const { return arena_; }
   uint64_t arena_bytes() const { return arena_bytes_; }
   uint64_t budget_bytes() const { return opt_.bytes; }
   uint64_t large_budget_bytes() const { return large_budget_bytes_; }

@@ -168,6 +168,7 @@ RDMA-listener scrape inventory。
 | `dfkv_rdma_recv_segment_allocation_failures_total` | counter | grow 后仍无法满足的最终 allocation |
 | `dfkv_rdma_pull_connections` | gauge | 当前 dynamic pull 连接数，包含新握手和 v2.28 dynamic 过渡连接 |
 | `dfkv_rdma_pull_zerocopy_served_total` | counter | 为 RAM arena 命中准备的 zero-copy dynamic-pull READY 数，不等于客户端成功完成的 READ 数 |
+| `dfkv_rdma_pull_zerocopy_register_failures_total` | counter | RAM arena 命中但逐次 MR 注册失败、退回拷贝路径的次数；持续增长通常是 memlock 上限或设备 MR 数量上限不够 |
 | `dfkv_rdma_dynamic_get_mr_active` | gauge | 当前进程存活的 exact dynamic READ MR；PullRelease 先撤销 MR，再释放 RAM pin，断连由 QP 销毁完成 fencing |
 | `dfkv_op_latency_seconds{op="get"}`（arena pull） | histogram | 记录 RAM handler 准备耗时，与 staged range handler 的计时边界一致；成功 PullRelease 后才提交样本，不包含客户端持有 grant、RDMA READ 或 MR 撤销时间。端到端延迟看客户端 bench，不能用此序列替代 |
 | `dfkv_rdma_connection_bytes{class=\"data|control\"}` | gauge | data/control connection 当前 lease 字节；应随 adaptive class 而非 logical max 增长 |

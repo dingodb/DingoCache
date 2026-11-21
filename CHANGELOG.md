@@ -6,9 +6,14 @@
   RDMA rail. Nothing on the server referred to that registration any more
   (each zero-copy GET registers an exact MR over the value it serves; PUTs
   land in the receive pool), but it pinned the arena once per rail, serially,
-  at startup and unpinned it at shutdown. On a 192 GiB arena with eight rails
-  that was 58 s of a 115 s start and 19.5 s of a 41 s stop.
-  `RdmaServer::RegisterMemory` is gone with it.
+  at startup and unpinned it at shutdown. Measured with a 192 GiB arena and
+  eight rails: start to ready 128 s -> 71-87 s, stop 41 s -> 25 s, GET and PUT
+  throughput unchanged. `RdmaServer::RegisterMemory` is gone with it. The
+  arena stays resident: it is now locked with `mlock2(MLOCK_ONFAULT)` while it
+  is pre-faulted (`DFKV_RAM_TIER_LOCK=off` disables that; a failed lock only
+  warns). New counter `dfkv_rdma_pull_zerocopy_register_failures_total`:
+  per-read registrations that failed and fell back to a staged copy -- what a
+  too-low memlock limit used to turn into a failed startup.
 - Server: opt-in, the slab cache survives an unclean exit when the kernel did
   not go down with the process. A dirty `slab_state` resets `slots.tbl`, so a
   server killed by a stop timeout or the OOM killer comes back empty. With

@@ -158,7 +158,7 @@ class RcEndpoint {
   // Atomically ensure all declarations on this endpoint. False leaves its
   // lookup cache exactly as it was before the call.
   bool EnsurePoolMrs(const std::vector<std::pair<void*, size_t>>& regions,
-                     bool remote_write = false);
+                     bool remote_write);
   // Register a shared server receive segment for remote PUT writes and return
   // the MR carrying both the local lkey and peer-visible rkey.
   ibv_mr* RegisterRemoteRegion(void* base, size_t size);
