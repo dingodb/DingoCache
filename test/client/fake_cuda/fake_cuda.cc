@@ -1,9 +1,9 @@
 // A stand-in for libcuda.so.1 used by cuda_attach_test. It exports the driver
 // entry points CudaLib resolves so that "dfkv loaded or initialized CUDA in
 // this process" is observable on any machine, with or without a GPU, and so
-// the test never touches a real driver. Like the driver, everything reports
-// CUDA_ERROR_NOT_INITIALIZED until cuInit ran; after that only the current
-// context and memory-type queries succeed.
+// the test never touches a real driver. Like the driver, the current-context
+// and memory-type queries report CUDA_ERROR_NOT_INITIALIZED until cuInit ran;
+// they are the only entry points that ever succeed.
 #include <cstddef>
 
 extern "C" {

@@ -694,7 +694,8 @@ class CudaGuardedBuffer {
 };
 
 const CudaLib* ActiveCudaForTest() {
-  // The test is the CUDA host here; libdfkv only attaches to a loaded driver.
+  // The test is the CUDA host here; libdfkv only attaches to a driver the
+  // host loaded and initialized.
   const CudaLib* cuda = CudaLib::LoadForHost();
   if (!cuda || !cuda->BindPrimaryCtx(0)) return nullptr;
   return cuda;

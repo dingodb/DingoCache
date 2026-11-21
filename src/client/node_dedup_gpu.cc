@@ -108,9 +108,11 @@ std::unique_ptr<GpuNodeDedup> GpuNodeDedup::FromEnv(
   if (!on || std::strcmp(on, "1") != 0) return nullptr;
   const char* gpu = std::getenv("DFKV_CLIENT_NODE_DEDUP_GPU");
   if (!gpu || std::strcmp(gpu, "1") != 0) return nullptr;
-  const CudaLib* cu = CudaLib::Get();
+  // The caller remembers this answer, so it is not taken from a throttled probe.
+  const CudaLib* cu = CudaLib::Probe();
   if (!cu) {
-    DFKV_LOG_INFO("gpu-dedup: no usable CUDA driver, running without");
+    DFKV_LOG_INFO(
+        "gpu-dedup: CUDA is not initialized in this process, running without");
     return nullptr;
   }
   if (!cu->HasCurrentCtx()) {
@@ -142,7 +144,7 @@ std::unique_ptr<GpuNodeDedup> GpuNodeDedup::FromEnv(
 std::unique_ptr<GpuNodeDedup> GpuNodeDedup::Open(const Options& opt) {
   static_assert(sizeof(Slot) == 64, "shm slot layout is cross-process ABI");
   static_assert(sizeof(ProcEntry) == 128, "shm registry layout is cross-process ABI");
-  const CudaLib* cu = CudaLib::Get();
+  const CudaLib* cu = CudaLib::Probe();
   if (!cu || !cu->HasCurrentCtx()) return nullptr;
 
   const uint32_t nslots = Pow2AtLeast(opt.slots);
