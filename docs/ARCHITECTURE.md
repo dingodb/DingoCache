@@ -463,9 +463,9 @@ lifecycles prevent a stale reservation or SEND from pinning a replacement slot.
 Values no larger than one RAM extent live inside the arena and keep
 the zero-copy path. Larger accepted values use a dedicated aligned allocation
 charged to the same hard byte budget; they retain the same flush/durable/send-pin
-lifecycle but copy through the connection's bounded registered buffer because
-their address is not part of the arena MR. A large pointer is never paired with
-the arena's memory registration.
+lifecycle but copy through the connection's bounded registered buffer: the
+zero-copy path serves arena slots only, and a large pointer is never handed to
+it.
 The fixed arena and dedicated allocations partition `DFKV_RAM_TIER_BYTES`;
 their resident sum cannot exceed that limit. The automatic dedicated reserve is
 two extents. `DFKV_RAM_TIER_LARGE_RESERVE_BYTES=0` gives all bytes to the arena;
