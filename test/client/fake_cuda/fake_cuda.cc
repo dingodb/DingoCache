@@ -1,7 +1,9 @@
 // A stand-in for libcuda.so.1 used by cuda_attach_test. It exports the driver
-// entry points CudaLib resolves so that "dfkv loaded CUDA into this process"
-// is observable on any machine, with or without a GPU, and so the test never
-// touches a real driver. Only cuInit and the memory-type query succeed.
+// entry points CudaLib resolves so that "dfkv loaded or initialized CUDA in
+// this process" is observable on any machine, with or without a GPU, and so
+// the test never touches a real driver. Like the driver, everything reports
+// CUDA_ERROR_NOT_INITIALIZED until cuInit ran; after that only the current
+// context and memory-type queries succeed.
 #include <cstddef>
 
 extern "C" {
@@ -13,6 +15,7 @@ __attribute__((visibility("default"))) int fake_cuda_init_calls = 0;
 #define DFKV_FAKE_EXPORT __attribute__((visibility("default")))
 constexpr int kOk = 0;
 constexpr int kError = 1;
+constexpr int kNotInitialized = 3;  // CUDA_ERROR_NOT_INITIALIZED
 
 DFKV_FAKE_EXPORT int cuInit(unsigned) {
   ++fake_cuda_init_calls;
@@ -22,6 +25,7 @@ DFKV_FAKE_EXPORT int cuPointerGetAttribute(void* data, int attribute,
                                           unsigned long long pointer) {
   constexpr int kMemoryType = 2;       // CU_POINTER_ATTRIBUTE_MEMORY_TYPE
   constexpr unsigned kDevice = 2;      // CU_MEMORYTYPE_DEVICE
+  if (fake_cuda_init_calls == 0) return kNotInitialized;
   if (attribute != kMemoryType || data == nullptr) return kError;
   if (pointer != reinterpret_cast<unsigned long long>(&fake_cuda_device_byte))
     return kError;  // like the driver: unknown host memory fails the query
@@ -53,6 +57,7 @@ DFKV_FAKE_EXPORT int cuPointerSetAttribute(const void*, int, unsigned long long)
   return kError;
 }
 DFKV_FAKE_EXPORT int cuCtxGetCurrent(void** context) {
+  if (fake_cuda_init_calls == 0) return kNotInitialized;
   if (context != nullptr) *context = nullptr;
   return kOk;
 }

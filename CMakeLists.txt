@@ -192,6 +192,12 @@ if(DFKV_BUILD_TESTS)
     get_filename_component(name ${t} NAME_WE)
     add_executable(${name} ${t})
     target_link_libraries(${name} PRIVATE dfkv_core GTest::gtest_main)
+    if(name STREQUAL "cuda_attach_test")
+      # Loads the stand-in driver library from this directory; see its main().
+      add_dependencies(${name} dfkv_fake_cuda)
+      target_compile_definitions(${name} PRIVATE
+        DFKV_FAKE_CUDA_DIR="${CMAKE_BINARY_DIR}/fake_cuda")
+    endif()
     # node_dedup_gpu_test drives real CUDA (arenas, contexts, cross-process
     # IPC via fork+exec). Under `ctest -j N` on the B200 gate it otherwise runs
     # concurrently with the RDMA datapath tests, and the child of the IPC test
@@ -202,16 +208,6 @@ if(DFKV_BUILD_TESTS)
       gtest_discover_tests(${name} PROPERTIES
         RESOURCE_LOCK gpu_rdma_hw
         ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")
-    elseif(name STREQUAL "cuda_attach_test")
-      # Runs against a fake libcuda.so.1 placed first on the loader path, so the
-      # attach-only contract is checked on every host and never touches a real
-      # driver.
-      # A single ENVIRONMENT entry on purpose: gtest_discover_tests forwards a
-      # multi-entry list as separate arguments, of which only the first one
-      # reaches the ENVIRONMENT property.
-      add_dependencies(${name} dfkv_fake_cuda)
-      gtest_discover_tests(${name} PROPERTIES
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/fake_cuda")
     else()
       gtest_discover_tests(${name} PROPERTIES
         ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")
