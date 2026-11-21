@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Server: a tenant without a node quota no longer serializes on the tenant
+  admission stripe. `DiskCacheGroup` took the stripe unconditionally in
+  `Cache` / `CacheDirect` / `CacheDirectBatch` / `Remove` and held it across
+  the storage write, so with a single tenant (the connector default) only one
+  RAM-tier flush batch -- or one direct PUT -- was writing at any time,
+  regardless of `DFKV_RAM_FLUSH_THREADS`. Quotas are immutable after startup;
+  unlimited tenants now skip the stripe and the admission lookup entirely.
+  Tenants with a quota keep the existing strict serialization. Same-key
+  ordering for unlimited tenants is left to the storage engine, and the slab
+  engine closes the one gap that exposed: a PUT arriving after a REMOVE had
+  returned could join the in-flight write that REMOVE cancelled and be told
+  `kOk` for a value that was never published. It now waits out the removal
+  and stores its own bytes.
 - Metrics: `dfkv_evicted_bytes_total` counts watermark evictions again. Since
   v2.0.0 the watermark reclaimer dropped its victims' payload accounting
   without adding it to the counter, so the metric only reflected inline `Put`

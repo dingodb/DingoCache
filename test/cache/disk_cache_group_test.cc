@@ -36,7 +36,7 @@ struct BatchProbe {
         release = true;
         cv.notify_all();
       } else {
-        cv.wait_for(lock, std::chrono::seconds(2), [&] { return release; });
+        cv.wait_for(lock, overlap_wait, [&] { return release; });
       }
     }
     --active;
@@ -47,6 +47,8 @@ struct BatchProbe {
   size_t active = 0;
   size_t max_active = 0;
   bool wait_for_overlap = true;
+  std::chrono::milliseconds overlap_wait{2000};
+  bool probe_scalar = false;  // also probe the scalar CacheDirect entry
   bool release = false;
   std::vector<std::thread::id> threads;
   std::vector<size_t> calls_by_disk;
@@ -84,6 +86,7 @@ class ProbeEngine final : public StoreEngine {
     return Status::kOk;
   }
   Status CacheDirect(const BlockKey&, char*, size_t, size_t) override {
+    if (probe_->probe_scalar) probe_->Enter(disk_);
     return Status::kOk;
   }
   std::vector<Status> CacheDirectBatch(
@@ -310,6 +313,83 @@ TEST_F(DiskGroupTest, SingleDiskBatchRunsInline) {
   ASSERT_EQ(statuses.size(), 2u);
   ASSERT_EQ(probe->threads.size(), 1u);
   EXPECT_EQ(probe->threads[0], caller);
+}
+
+namespace {
+// Two callers write one same-tenant item each to a single-disk group. The probe
+// engine holds the first call inside the engine until a second one overlaps
+// (or its wait expires) and records the peak overlap.
+size_t SameTenantBatchOverlap(const std::string& dir,
+                              std::chrono::milliseconds overlap_wait) {
+  auto probe = std::make_shared<BatchProbe>();
+  probe->calls_by_disk.resize(1);
+  probe->overlap_wait = overlap_wait;
+  DiskCacheGroup::Options options;
+  options.cache_dirs = {dir};
+  options.capacity_bytes = 1ull << 30;
+  options.engine = "file";
+  options.engine_factory = [probe](const std::string& path, uint64_t) {
+    return std::make_unique<ProbeEngine>(path, 0, probe);
+  };
+  DiskCacheGroup group(std::move(options));
+  EXPECT_TRUE(group.Healthy());
+  char value = 'x';
+  auto write = [&](uint64_t id) {
+    std::vector<StoreEngine::CacheBatchItem> items{
+        {BlockKey{0, id}, &value, 1, 1}};
+    EXPECT_EQ(group.CacheDirectBatch(items)[0], Status::kOk);
+  };
+  std::thread first(write, 2), second(write, 4);
+  first.join();
+  second.join();
+  EXPECT_EQ(probe->calls, 2u);
+  return probe->max_active;
+}
+}  // namespace
+
+// Without a quota there is no admission state to protect: same-tenant writes
+// must overlap in the engine. They used to take the tenant stripe
+// unconditionally and hold it across the storage write, so every RAM-tier
+// flush batch of a single-tenant deployment ran one at a time.
+TEST_F(DiskGroupTest, UnlimitedTenantWritesOverlap) {
+  ScopedEnv default_quota("DFKV_TENANT_DEFAULT_QUOTA_BYTES", "0");
+  ScopedEnv quota_file("DFKV_TENANT_QUOTAS_FILE", "");
+  EXPECT_EQ(SameTenantBatchOverlap(Dirs(1)[0], std::chrono::seconds(2)), 2u);
+}
+
+// The scalar direct PUT entry takes the same early return.
+TEST_F(DiskGroupTest, UnlimitedTenantScalarWritesOverlap) {
+  ScopedEnv default_quota("DFKV_TENANT_DEFAULT_QUOTA_BYTES", "0");
+  ScopedEnv quota_file("DFKV_TENANT_QUOTAS_FILE", "");
+  auto probe = std::make_shared<BatchProbe>();
+  probe->calls_by_disk.resize(1);
+  probe->probe_scalar = true;
+  DiskCacheGroup::Options options;
+  options.cache_dirs = Dirs(1);
+  options.capacity_bytes = 1ull << 30;
+  options.engine = "file";
+  options.engine_factory = [probe](const std::string& path, uint64_t) {
+    return std::make_unique<ProbeEngine>(path, 0, probe);
+  };
+  DiskCacheGroup group(std::move(options));
+  ASSERT_TRUE(group.Healthy());
+  char value = 'x';
+  auto write = [&](uint64_t id) {
+    EXPECT_EQ(group.CacheDirect(BlockKey{0, id}, &value, 1, 1), Status::kOk);
+  };
+  std::thread first(write, 2), second(write, 4);
+  first.join();
+  second.join();
+  EXPECT_EQ(probe->max_active, 2u);
+}
+
+// A limited tenant keeps strict serialization: quota admission and the write
+// it admits stay under one stripe hold.
+TEST_F(DiskGroupTest, LimitedTenantWritesStaySerialized) {
+  ScopedEnv default_quota("DFKV_TENANT_DEFAULT_QUOTA_BYTES", "1048576");
+  ScopedEnv quota_file("DFKV_TENANT_QUOTAS_FILE", "");
+  EXPECT_EQ(
+      SameTenantBatchOverlap(Dirs(1)[0], std::chrono::milliseconds(200)), 1u);
 }
 
 TEST_F(DiskGroupTest, QuotaAdmissionSupportsBatchAndRemovalReuse) {

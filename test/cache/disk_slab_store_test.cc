@@ -1127,6 +1127,122 @@ TEST_F(DiskSlabTest, ReputDuringDeferredRemoveWaitsOutWindowThenLands) {
   EXPECT_EQ(out, v3) << "a duplicate PUT must not overwrite committed bytes";
 }
 
+// A PUT that arrives after Remove(K) returned, while the write Remove cancelled
+// is still in flight, must not join that write: its leader reports kOk without
+// publishing K, so a follower would be told kOk for a value that is not stored.
+// The late PUT waits out the removal and then stores its own bytes.
+TEST_F(DiskSlabTest, PutAfterRemoveOfInflightWriteIsStored) {
+  auto opts = Opts(1 << 20, 1 << 20, 4096);
+  opts.table_sync_ms = 0;
+  opts.reclaim_interval_ms = 0;
+  bool ok = false;
+  DiskSlabStore s(opts, &ok);
+  ASSERT_TRUE(ok);
+
+  std::mutex m;
+  std::condition_variable cv;
+  bool entered = false, release = false;
+  std::atomic<int> payload_writes{0};
+  dfkv::DiskSlabStoreTestPeer::SetPayloadWriteHook(&s, [&] {
+    if (payload_writes.fetch_add(1, std::memory_order_relaxed) == 0) {
+      std::unique_lock<std::mutex> lk(m);
+      entered = true;
+      cv.notify_all();
+      cv.wait(lk, [&] { return release; });
+    }
+    return true;
+  });
+
+  const std::string v1(4096, 'a'), v2(4096, 'b');
+  Status first = Status::kInvalid, second = Status::kInvalid;
+  std::thread leader([&] { first = s.Cache(K(70), v1.data(), v1.size()); });
+  {
+    std::unique_lock<std::mutex> lk(m);
+    cv.wait(lk, [&] { return entered; });
+  }
+  EXPECT_EQ(s.Remove(K(70)), Status::kOk);  // deferred behind the write
+  std::atomic<bool> second_done{false};
+  std::thread late([&] {
+    second = s.Cache(K(70), v2.data(), v2.size());
+    second_done.store(true, std::memory_order_release);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_FALSE(second_done.load(std::memory_order_acquire));
+  {
+    std::lock_guard<std::mutex> lk(m);
+    release = true;
+  }
+  cv.notify_all();
+  leader.join();
+  late.join();
+  dfkv::DiskSlabStoreTestPeer::SetPayloadWriteHook(&s, {});
+
+  EXPECT_EQ(first, Status::kOk);
+  EXPECT_EQ(second, Status::kOk);
+  std::string out;
+  ASSERT_EQ(s.Range(K(70), 0, 0, &out), Status::kOk)
+      << "a PUT acknowledged after the Remove must be readable";
+  EXPECT_EQ(out, v2);
+  EXPECT_EQ(s.Count(), 1u);
+}
+
+// Batch entry of the same ordering: the late PUT arrives through
+// CacheDirectBatch while the cancelled scalar write is still in flight.
+TEST_F(DiskSlabTest, BatchPutAfterRemoveOfInflightWriteIsStored) {
+  auto opts = Opts(1 << 20, 1 << 20, 4096);
+  opts.table_sync_ms = 0;
+  opts.reclaim_interval_ms = 0;
+  bool ok = false;
+  DiskSlabStore s(opts, &ok);
+  ASSERT_TRUE(ok);
+
+  std::mutex m;
+  std::condition_variable cv;
+  bool entered = false, release = false;
+  std::atomic<int> payload_writes{0};
+  dfkv::DiskSlabStoreTestPeer::SetPayloadWriteHook(&s, [&] {
+    if (payload_writes.fetch_add(1, std::memory_order_relaxed) == 0) {
+      std::unique_lock<std::mutex> lk(m);
+      entered = true;
+      cv.notify_all();
+      cv.wait(lk, [&] { return release; });
+    }
+    return true;
+  });
+
+  const std::string v1(4096, 'a');
+  std::string v2(4096, 'b');
+  Status first = Status::kInvalid;
+  std::vector<Status> second;
+  std::thread leader([&] { first = s.Cache(K(71), v1.data(), v1.size()); });
+  {
+    std::unique_lock<std::mutex> lk(m);
+    cv.wait(lk, [&] { return entered; });
+  }
+  EXPECT_EQ(s.Remove(K(71)), Status::kOk);  // deferred behind the write
+  std::thread late([&] {
+    second = s.CacheDirectBatch(
+        {{K(71), v2.data(), v2.size(), v2.size()}});
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  {
+    std::lock_guard<std::mutex> lk(m);
+    release = true;
+  }
+  cv.notify_all();
+  leader.join();
+  late.join();
+  dfkv::DiskSlabStoreTestPeer::SetPayloadWriteHook(&s, {});
+
+  EXPECT_EQ(first, Status::kOk);
+  ASSERT_EQ(second.size(), 1u);
+  EXPECT_EQ(second[0], Status::kOk);
+  std::string out;
+  ASSERT_EQ(s.Range(K(71), 0, 0, &out), Status::kOk)
+      << "a batch PUT acknowledged after the Remove must be readable";
+  EXPECT_EQ(out, v2);
+}
+
 // Same window through the batched PUT path: CacheDirectBatch items must wait
 // out a deferred remove exactly like the scalar Cache path.
 TEST_F(DiskSlabTest, BatchReputDuringDeferredRemoveWaitsOutWindowThenLands) {

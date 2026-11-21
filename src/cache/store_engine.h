@@ -294,6 +294,10 @@ struct ValueMetadata {
 };
 
 
+// Concurrency contract: callers do not serialize operations on one key. An
+// engine orders same-key operations on its own: PUT is keep-first, and a PUT
+// that starts after a REMOVE has returned reports kOk only if its value is
+// published after that REMOVE.
 class StoreEngine {
  public:
   virtual ~StoreEngine() = default;

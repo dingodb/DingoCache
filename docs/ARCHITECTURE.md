@@ -333,11 +333,17 @@ attempt after `ENOSPC`.
 unlisted-tenant limit (`0`/unset means unlimited). Quotas are deliberately
 **per cache node**, not a synchronous cluster-global reservation protocol.
 
-Admission uses 256 fixed tenant stripes. PUT/REMOVE for the same stripe
-serialize; GET remains lock-free relative to quota. A batch acquires unique
-stripes in ascending order, charges only new keys, and may reject one tenant
-with `kQuotaExceeded` while admitting unrelated tenants. Locks remain held
-through storage writes, so concurrent single/batch requests cannot oversubscribe.
+Admission uses 256 fixed tenant stripes, taken only by tenants with a non-zero
+quota. PUT/REMOVE of limited tenants on the same stripe serialize; GET remains
+lock-free relative to quota. A batch acquires the unique stripes of its limited
+tenants in ascending order, charges only new keys, and may reject one tenant
+with `kQuotaExceeded` while admitting unrelated tenants. Those locks remain held
+through storage writes, so concurrent single/batch requests of a limited tenant
+cannot oversubscribe. A tenant without a quota takes no stripe at all: its
+writes overlap, and same-key PUT/PUT and PUT/REMOVE ordering is resolved by the
+storage engine: PUT is keep-first, and a PUT that starts after a REMOVE has
+returned reports `kOk` only if its value is published after that REMOVE (slab:
+one leader per in-flight key, and the REMOVE outranks the write it cancelled).
 Both engines account committed payload bytes through publish, failure rollback,
 eviction, removal, and restart rebuild. A limited tenant bypasses the
 asynchronous RAM write-back admission path so the PUT result reflects durable

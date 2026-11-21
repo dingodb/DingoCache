@@ -132,6 +132,10 @@ class DiskCacheGroup {
     return static_cast<size_t>(tenant_hash) & (kTenantStripes - 1);
   }
   uint64_t TenantLimit(uint64_t tenant_hash) const;
+  // Startup-immutable: true when this tenant has a non-zero node quota.
+  bool TenantLimited(uint64_t tenant_hash) const {
+    return TenantLimit(tenant_hash) != 0;
+  }
   bool QuotaAllowsNewLocked(uint64_t tenant_hash, uint64_t current,
                             uint64_t additional) const;
   void RecordQuotaRejectionLocked(uint64_t tenant_hash);

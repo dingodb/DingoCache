@@ -333,6 +333,10 @@ Status DiskCacheGroup::Cache(const BlockKey& key, const void* data, size_t len) 
   if (len == 0 || data == nullptr) return Status::kInvalid;
   StoreEngine* d = Route(key);
   if (d == nullptr) return Status::kInvalid;
+  // Quotas are immutable after construction. A tenant without a limit has no
+  // admission state to protect, so its writes must not serialize on a stripe
+  // held across storage I/O.
+  if (!TenantLimited(key.tenant_hash)) return d->Cache(key, data, len);
   std::lock_guard<std::mutex> tenant_lock(
       tenant_stripes_[TenantStripe(key.tenant_hash)]);
   ValueMetadata metadata;
@@ -350,6 +354,7 @@ Status DiskCacheGroup::Cache(const BlockKey& key, const void* data, size_t len) 
 Status DiskCacheGroup::Remove(const BlockKey& key) {
   StoreEngine* d = Route(key);
   if (d == nullptr) return Status::kInvalid;
+  if (!TenantLimited(key.tenant_hash)) return d->Remove(key);
   std::lock_guard<std::mutex> tenant_lock(
       tenant_stripes_[TenantStripe(key.tenant_hash)]);
   return d->Remove(key);
@@ -414,6 +419,8 @@ Status DiskCacheGroup::CacheDirect(const BlockKey& key, char* data, size_t len,
   if (len == 0 || data == nullptr) return Status::kInvalid;
   StoreEngine* d = Route(key);
   if (d == nullptr) return Status::kInvalid;
+  if (!TenantLimited(key.tenant_hash))
+    return d->CacheDirect(key, data, len, cap);
   std::lock_guard<std::mutex> tenant_lock(
       tenant_stripes_[TenantStripe(key.tenant_hash)]);
   ValueMetadata metadata;
@@ -469,9 +476,15 @@ std::vector<Status> DiskCacheGroup::CacheDirectBatch(
   std::vector<Status> out(items.size(), Status::kInvalid);
   if (items.empty()) return out;
 
+  // Only tenants with a limit take their admission stripe (in ascending order).
+  // The common unlimited batch -- every RAM-tier flush of a deployment without
+  // quotas -- takes no lock here, so flush workers overlap instead of running
+  // one batch at a time behind a stripe held across the disk writes.
   std::array<bool, kTenantStripes> used_stripes{};
-  for (const auto& item : items)
-    used_stripes[TenantStripe(item.key.tenant_hash)] = true;
+  for (const auto& item : items) {
+    if (TenantLimited(item.key.tenant_hash))
+      used_stripes[TenantStripe(item.key.tenant_hash)] = true;
+  }
   std::array<std::unique_lock<std::mutex>, kTenantStripes> locks;
   for (size_t stripe = 0; stripe < kTenantStripes; ++stripe) {
     if (used_stripes[stripe])
@@ -486,6 +499,10 @@ std::vector<Status> DiskCacheGroup::CacheDirectBatch(
     const size_t disk = RouteIndex(item.key);
     if (disk == kInvalidDisk || item.len == 0 || item.data == nullptr)
       continue;
+    if (!TenantLimited(item.key.tenant_hash)) {
+      out[i] = Status::kOk;  // no admission: the engine decides
+      continue;
+    }
     ValueMetadata metadata;
     const Status lookup = disks_[disk]->Lookup(item.key, &metadata);
     if (lookup != Status::kOk && lookup != Status::kNotFound) {

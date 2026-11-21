@@ -1184,12 +1184,17 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
     for (;;) {
       if (!Healthy()) return Status::kIOError;
       if (payload_len_.count(fn) != 0) return Status::kOk;  // keep-first
+      // A Remove that already returned outranks an in-flight write of the
+      // same key: this PUT arrived after it and must not share the result of
+      // the write that Remove cancelled (that leader reports kOk without
+      // publishing). Judge the removal window before joining any flight.
+      const bool removal_pending = deferred_remove_.count(fn) != 0;
       auto existing = put_flights_.find(fn);
-      if (existing != put_flights_.end()) {
+      if (existing != put_flights_.end() && !removal_pending) {
         flight = existing->second;  // follower of the in-flight PUT
         break;
       }
-      if (deferred_remove_.count(fn) != 0) {
+      if (removal_pending) {
         // Deferred-remove window, NOT a duplicate write: a Remove already
         // erased this key's commit state, but an in-flight read/write still
         // pins its slot, so the allocator would still report Contains(key)
@@ -1317,12 +1322,18 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
           out[i] = Status::kOk;
           break;
         }
+        // Same ordering as CacheImpl: a returned Remove outranks an in-flight
+        // write, except for a flight this very batch leads -- waiting for our
+        // own unwritten leader would only time out.
+        bool removal_pending = deferred_remove_.count(st[i].fn) != 0;
+        for (size_t j = 0; removal_pending && j < i; ++j)
+          if (st[j].active && st[j].fn == st[i].fn) removal_pending = false;
         auto existing = put_flights_.find(st[i].fn);
-        if (existing != put_flights_.end()) {
+        if (existing != put_flights_.end() && !removal_pending) {
           st[i].flight = existing->second;  // follower: wait after leader L2
           break;
         }
-        if (deferred_remove_.count(st[i].fn) != 0) {
+        if (removal_pending) {
           // Same deferred-remove window as CacheImpl: the Remove already raced
           // (commit state erased, slot still pinned by in-flight I/O), so this
           // re-PUT must wait the window out -- bounded, see remove_cv_ --
