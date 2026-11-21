@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -72,9 +73,12 @@ void RunInFreshProcess(Scenario&& scenario) {
       << "the scenario failed in its child process; see the failures above";
 }
 
-// Only RegisterMemory is reached by these scenarios.
-class NoIoTransport : public Transport {
+// Records the memory kind the client hands down with a GET destination -- the
+// visible result of its classification. Every read misses.
+class KindRecordingTransport : public Transport {
  public:
+  DestinationMemoryKind last_kind = DestinationMemoryKind::kHost;
+
   Status Cache(const std::string&, const BlockKey&, const void*,
                size_t) override {
     return Status::kIOError;
@@ -89,7 +93,23 @@ class NoIoTransport : public Transport {
   Status Exist(const std::string&, const BlockKey&, bool*) override {
     return Status::kIOError;
   }
+  std::vector<Status> RangeInto(const std::string&,
+                                const std::vector<BlockKey>& keys,
+                                const std::vector<RangeDst>& dsts,
+                                std::vector<uint64_t>* value_lens) override {
+    last_kind = dsts.at(0).memory_kind;
+    value_lens->assign(keys.size(), 0);
+    return std::vector<Status>(keys.size(), Status::kNotFound);
+  }
 };
+
+DestinationMemoryKind KindSeenByGet(KVClient* client,
+                                    KindRecordingTransport* transport,
+                                    void* destination) {
+  size_t got = 0;
+  client->GetAuto("absent", destination, 1, &got);
+  return transport->last_kind;
+}
 
 // Before, the first query dlopen'ed libcuda and ran cuInit in every dfkv
 // client process on a GPU host.
@@ -142,12 +162,12 @@ TEST(CudaAttach, GetAttachesAfterTheHostInitializedCuda) {
 // must not come from a probe older than the host's CUDA setup.
 TEST(CudaAttach, PoolRegisteredRightAfterCudaCameUpIsDeviceMemory) {
   RunInFreshProcess([] {
-    NoIoTransport transport;
+    KindRecordingTransport transport;
     KVClient client({{"n", "10.0.0.1:1"}}, "test/model", &transport);
     char host_byte = 0;
-    // An unregistered destination, classified while the process has no CUDA:
+    // A GET into an unregistered destination while the process has no CUDA:
     // this starts the probe interval.
-    EXPECT_EQ(client.ClassifyDestination(&host_byte, 1),
+    EXPECT_EQ(KindSeenByGet(&client, &transport, &host_byte),
               DestinationMemoryKind::kHost);
 
     void* host = HostLoadsCuda();
@@ -155,7 +175,7 @@ TEST(CudaAttach, PoolRegisteredRightAfterCudaCameUpIsDeviceMemory) {
     ASSERT_TRUE(HostInitializesCuda(host));
     void* pool = DevicePointer(host);
     ASSERT_TRUE(client.RegisterMemory(pool, 1));
-    EXPECT_EQ(client.ClassifyDestination(pool, 1),
+    EXPECT_EQ(KindSeenByGet(&client, &transport, pool),
               DestinationMemoryKind::kDevice)
         << "a device pool registered inside the probe interval was "
            "remembered as host memory";
