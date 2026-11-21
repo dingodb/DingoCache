@@ -22,6 +22,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -866,7 +867,22 @@ DiskSlabStore::Options WithIdentity(DiskSlabStore::Options options,
   boot_id.fill(boot);
   options.boot_id = boot_id;
   options.mount_id = mount;
+  // Markers next to the test directories rather than in /dev/shm, and no
+  // opinion about the filesystem the build machine keeps /tmp on.
+  options.trust_marker_dir = fs::temp_directory_path().string();
+  options.require_local_filesystem = false;
   return options;
+}
+
+// The marker a store leaves for `dir` when its table must not be kept.
+fs::path UntrustedMarker(const fs::path& dir) {
+  struct stat st {};
+  if (::stat(dir.c_str(), &st) != 0) return {};
+  char name[80];
+  std::snprintf(name, sizeof(name), "dfkv-slab-untrusted.%llx.%llx",
+                static_cast<unsigned long long>(st.st_dev),
+                static_cast<unsigned long long>(st.st_ino));
+  return fs::temp_directory_path() / name;
 }
 
 template <typename Body>
@@ -946,29 +962,34 @@ TEST_F(DiskSlabTest, UncleanExitInTheSameBootKeepsTheCache) {
 TEST_F(DiskSlabTest, UncleanExitIsResetWhenTheTableCannotBeTrusted) {
   struct Case {
     const char* name;
+    uint64_t crashed_mount;  // the crashed run: kAuto, boot 1, this mount id
     WarmRestart policy;
     uint8_t boot;
     uint64_t mount;
     bool kept;
   };
-  // The crashed run always used kAuto, boot 1, mount 7.
   const Case cases[] = {
-      {"rebooted", WarmRestart::kAuto, 2, 7, false},
-      {"mounted again", WarmRestart::kAuto, 1, 8, false},
-      {"mounted again, boot-only policy", WarmRestart::kBootOnly, 1, 8, false},
-      {"no mount id now", WarmRestart::kAuto, 1, 0, false},
-      {"no mount id now, boot-only policy", WarmRestart::kBootOnly, 1, 0, true},
-      {"no boot id now", WarmRestart::kBootOnly, 0, 7, false},
-      {"policy off", WarmRestart::kOff, 1, 7, false},
+      {"same boot and mount", 7, WarmRestart::kAuto, 1, 7, true},
+      {"rebooted", 7, WarmRestart::kAuto, 2, 7, false},
+      {"mounted again", 7, WarmRestart::kAuto, 1, 8, false},
+      {"mounted again, boot-only policy", 7, WarmRestart::kBootOnly, 1, 8, false},
+      {"mount id lost", 7, WarmRestart::kAuto, 1, 0, false},
+      {"mount id lost, boot-only policy", 7, WarmRestart::kBootOnly, 1, 0, false},
+      {"never had a mount id", 0, WarmRestart::kAuto, 1, 0, false},
+      {"never had a mount id, boot-only policy", 0, WarmRestart::kBootOnly, 1, 0,
+       true},
+      {"no boot id now", 7, WarmRestart::kBootOnly, 0, 7, false},
+      {"policy off", 7, WarmRestart::kOff, 1, 7, false},
   };
   for (const Case& c : cases) {
     SCOPED_TRACE(c.name);
     fs::remove_all(dir_);
     const auto base = Opts(1 << 20, 1 << 20, 4096);
-    ASSERT_TRUE(CrashAfter(WithIdentity(base, WarmRestart::kAuto, 1, 7),
-                           [](DiskSlabStore& store) {
-                             return PutFilled(store, 90, 'a');
-                           }));
+    ASSERT_TRUE(
+        CrashAfter(WithIdentity(base, WarmRestart::kAuto, 1, c.crashed_mount),
+                   [](DiskSlabStore& store) {
+                     return PutFilled(store, 90, 'a');
+                   }));
     bool ok = false;
     DiskSlabStore recovered(WithIdentity(base, c.policy, c.boot, c.mount), &ok);
     ASSERT_TRUE(ok) << recovered.StartupError();
@@ -1015,12 +1036,15 @@ TEST_F(DiskSlabTest, RemoveAcknowledgedBeforeTheCrashStaysRemoved) {
 }
 
 // A run that hit a metadata failure can no longer vouch for what the page
-// cache holds; it withdraws its identity so the next start resets.
+// cache holds, and the kernel will not repeat the error to the next process.
+// It cannot rely on the failing disk to remember that either: here slab_state
+// is unwritable too, so only the marker carries it.
 TEST_F(DiskSlabTest, StorageFailureInThePreviousRunForcesAReset) {
   const auto options =
       WithIdentity(Opts(1 << 20, 1 << 20, 4096), WarmRestart::kAuto, 1, 7);
   ASSERT_TRUE(CrashAfter(options, [](DiskSlabStore& store) {
     if (!PutFilled(store, 90, 'a')) return false;
+    dfkv::DiskSlabStoreTestPeer::BreakStateFd(&store);
     dfkv::DiskSlabStoreTestPeer::BreakTableFd(&store);
     return !dfkv::DiskSlabStoreTestPeer::SyncTableNow(&store) &&
            !store.Healthy();
@@ -1039,7 +1063,7 @@ TEST_F(DiskSlabTest, CrashOfTheProcessItselfForcesAReset) {
       WithIdentity(Opts(1 << 20, 1 << 20, 4096), WarmRestart::kAuto, 1, 7);
   ASSERT_TRUE(CrashAfter(options, [](DiskSlabStore& store) {
     if (!PutFilled(store, 90, 'a')) return false;
-    DiskSlabStore::PoisonAllForCrash();
+    DiskSlabStore::MarkAllUntrustedForCrash();
     return true;
   }));
   bool ok = false;
@@ -1087,6 +1111,112 @@ TEST_F(DiskSlabTest, InterruptedResetIsFinishedNotKept) {
   EXPECT_EQ(recovered.GetStats().warm_restarts, 0u);
   EXPECT_EQ(recovered.GetStats().unclean_resets, 1u);
   EXPECT_EQ(recovered.Count(), 0u);
+}
+
+// The record of "do not keep this" must not depend on the disk that failed,
+// and the kernel reports a writeback error only once. So it is a marker on a
+// tmpfs, and a start that keeps a table leaves it before its first sync and
+// removes it only when the recovery is complete.
+TEST_F(DiskSlabTest, MarkerLeftByAnEarlierRunForcesAReset) {
+  const auto options =
+      WithIdentity(Opts(1 << 20, 1 << 20, 4096), WarmRestart::kAuto, 1, 7);
+  ASSERT_TRUE(CrashAfter(options, [](DiskSlabStore& store) {
+    return PutFilled(store, 90, 'a');
+  }));
+  const fs::path marker = UntrustedMarker(dir_);
+  ASSERT_FALSE(marker.empty());
+  ASSERT_FALSE(fs::exists(marker)) << "a healthy run leaves no marker";
+  { std::ofstream touch(marker); }
+  {
+    bool ok = false;
+    DiskSlabStore recovered(options, &ok);
+    ASSERT_TRUE(ok) << recovered.StartupError();
+    EXPECT_EQ(recovered.GetStats().warm_restarts, 0u);
+    EXPECT_EQ(recovered.GetStats().unclean_resets, 1u);
+    EXPECT_EQ(recovered.Count(), 0u);
+    EXPECT_FALSE(fs::exists(marker)) << "the reset rebuilt trust";
+  }
+}
+
+TEST_F(DiskSlabTest, WarmRecoveryThatDiesHalfWayForcesAReset) {
+  const auto base = Opts(1 << 20, 1 << 20, 4096);
+  const auto options = WithIdentity(base, WarmRestart::kAuto, 1, 7);
+  ASSERT_TRUE(CrashAfter(options, [](DiskSlabStore& store) {
+    return PutFilled(store, 90, 'a') && PutFilled(store, 91, 'b');
+  }));
+
+  // A start that keeps the table but cannot write slab_state at the end.
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    ::signal(SIGXFSZ, SIG_IGN);
+    struct rlimit limit {};
+    limit.rlim_cur = limit.rlim_max = 0;  // the empty marker still fits
+    if (::setrlimit(RLIMIT_FSIZE, &limit) != 0) ::_exit(2);
+    bool ok = true;
+    DiskSlabStore store(options, &ok);
+    ::_exit(ok ? 3 : 0);
+  }
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFEXITED(status));
+  ASSERT_EQ(WEXITSTATUS(status), 0) << "the staged recovery was meant to fail";
+  ASSERT_EQ(ValidRecordOffsets(dir_).size(), 2u) << "and to leave the table";
+  EXPECT_TRUE(fs::exists(UntrustedMarker(dir_)));
+
+  bool ok = false;
+  DiskSlabStore recovered(options, &ok);
+  ASSERT_TRUE(ok) << recovered.StartupError();
+  EXPECT_EQ(recovered.GetStats().warm_restarts, 0u);
+  EXPECT_EQ(recovered.GetStats().unclean_resets, 1u);
+  EXPECT_EQ(recovered.Count(), 0u);
+}
+
+// Kept, killed again, kept again: the second run re-records its identity and
+// clears the marker, so nothing about the first kill lingers.
+TEST_F(DiskSlabTest, TwoUncleanExitsInARowAreBothKept) {
+  const auto options =
+      WithIdentity(Opts(1 << 20, 1 << 20, 4096), WarmRestart::kAuto, 1, 7);
+  ASSERT_TRUE(CrashAfter(options, [](DiskSlabStore& store) {
+    return PutFilled(store, 90, 'a');
+  }));
+  ASSERT_TRUE(CrashAfter(options, [](DiskSlabStore& store) {
+    return store.GetStats().warm_restarts == 1 && store.Count() == 1 &&
+           PutFilled(store, 91, 'b') && store.Remove(K(90)) == Status::kOk;
+  }));
+  bool ok = false;
+  DiskSlabStore recovered(options, &ok);
+  ASSERT_TRUE(ok) << recovered.StartupError();
+  EXPECT_EQ(recovered.GetStats().warm_restarts, 1u);
+  EXPECT_FALSE(fs::exists(UntrustedMarker(dir_)));
+  std::string out;
+  EXPECT_EQ(recovered.Range(K(90), 0, 4096, &out), Status::kNotFound);
+  ASSERT_EQ(recovered.Range(K(91), 0, 4096, &out), Status::kOk);
+  EXPECT_EQ(out, Payload('b'));
+}
+
+// A copy of a directory taken while its server ran is not that directory: the
+// files were not copied at one instant.
+TEST_F(DiskSlabTest, CopyOfADirectoryIsNotKept) {
+  const auto options =
+      WithIdentity(Opts(1 << 20, 1 << 20, 4096), WarmRestart::kAuto, 1, 7);
+  ASSERT_TRUE(CrashAfter(options, [](DiskSlabStore& store) {
+    return PutFilled(store, 90, 'a');
+  }));
+  const fs::path copy = dir_.string() + "_copy";
+  fs::remove_all(copy);
+  fs::copy(dir_, copy, fs::copy_options::recursive);
+  auto copy_options = options;
+  copy_options.dir = copy.string();
+  {
+    bool ok = false;
+    DiskSlabStore recovered(copy_options, &ok);
+    EXPECT_TRUE(ok) << recovered.StartupError();
+    EXPECT_EQ(recovered.GetStats().warm_restarts, 0u);
+    EXPECT_EQ(recovered.GetStats().unclean_resets, 1u);
+    EXPECT_EQ(recovered.Count(), 0u);
+  }
+  fs::remove_all(copy);
 }
 
 // Records that contradict each other used to be unreachable after an unclean

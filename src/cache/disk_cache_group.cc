@@ -184,12 +184,14 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
       return;
     }
   }
-  // After an unclean exit: keep the table when that is provably safe (auto,
-  // also with the boot id alone: boot) or always reset it (off). See
+  // After an unclean exit: always reset the slab table (off, the default), or
+  // keep it when the previous process provably died under the same boot and
+  // mount (auto; boot also accepts runs without a unique mount id). See
   // DiskSlabStore::Options::WarmRestart.
   using SlabWarmRestart = DiskSlabStore::Options::WarmRestart;
-  SlabWarmRestart slab_warm = SlabWarmRestart::kAuto;
-  if (const char* mode = std::getenv("DFKV_SLAB_WARM_RESTART")) {
+  SlabWarmRestart slab_warm = SlabWarmRestart::kOff;
+  if (const char* mode = std::getenv("DFKV_SLAB_WARM_RESTART");
+      mode != nullptr && *mode != '\0') {
     if (std::strcmp(mode, "auto") == 0) {
       slab_warm = SlabWarmRestart::kAuto;
     } else if (std::strcmp(mode, "boot") == 0) {

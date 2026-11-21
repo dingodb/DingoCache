@@ -275,11 +275,14 @@ WantedBy=multi-user.target
 > - `--ram-tier-numa interleave|off`（默认 `interleave`）：这是当前完整 mode 集；不接受数字 node ID。arena 预触并绑策略，须核 `MemoryMax`。
 > - `--ram-flush-threads <n>` / `DFKV_RAM_FLUSH_THREADS`：请求值会提高到至少 shard 数；实际值由 `dfkv_ram_flush_threads` 报告（默认请求=4×盘数，上限 16）。
 > - 微调项（env only）：`DFKV_SLAB_TABLE_SYNC_MS` 控制 table sync 节奏（默认 100 ms，0=关）。
-> - 非干净退出后的处理（env only）：`DFKV_SLAB_WARM_RESTART=auto|boot|off`，默认 `auto`。
->   - `auto`：进程被杀（停止超时、OOM）而内核没重启、缓存盘没被重新挂载时保留缓存，其余情况清零。判断依据是 `slab_state` 里记录的 boot id 和挂载唯一 ID（内核 6.8 起提供）；内核拿不到挂载唯一 ID 时清零。
->   - `boot`：拿不到挂载唯一 ID 时只凭 boot id 保留。看不出"文件系统被强制下线后没重启就重新挂载"，这种情况下出事前约一个 table sync 周期内被复用的槽可能读到别的 key 的数据。缓存盘出过文件系统错误后，重启服务前先删掉该盘目录下的 `slab_state`。
->   - `off`：一律清零，等同 2.35。
->   - 重启、掉电、上次运行出过元数据 I/O 错误、服务端自身崩溃（SIGSEGV、SIGABRT 等）之后总是清零。一个缓存目录同时只能被一个进程打开。
+> - 非干净退出后的处理（env only）：`DFKV_SLAB_WARM_RESTART=off|auto|boot`，默认 `off`。
+>   - `off`：非干净退出后一律清零，等同 2.35。
+>   - `auto`：进程被杀（停止超时、OOM）而内核没重启时保留缓存，其余情况清零。要同时满足：`slab_state` 里记录的 boot id、挂载唯一 ID（内核 6.8 起提供）和目录 inode 都没变；`/dev/shm` 里没有这个目录的"不可信"标记；文件系统是 xfs、ext4 或 tmpfs；启动时对表和各 extent 的同步没有报错。
+>   - `boot`：在 `auto` 的基础上，接受上次运行没有挂载唯一 ID 的情况（内核 6.8 以前）。这时"文件系统出错下线、没重启就重新挂载"只有在旧进程退出前看到过 I/O 错误时才拦得住；没看到的话，最近一次表同步之后的记录写入、以及内核最近一次回写之后的带缓冲数据写入可能丢失。缓存盘出过文件系统错误后，用 `off` 启动一次再改回来。
+>   - "不可信"标记放在 `/dev/shm`（必须是 tmpfs），随重启消失，不依赖缓存盘。运行中出现元数据 I/O 错误、服务端自身崩溃（SIGSEGV、SIGABRT 等）、保留缓存的启动中途失败，都会留下标记，下次启动清零。
+>   - 容器每次启动、或带挂载沙箱选项的 systemd 单元，挂载唯一 ID 都会变，`auto` 和 `boot` 在这些环境里都等于 `off`。
+>   - 一个缓存目录同时只能被一个进程打开（目录上有排他锁）。
+>   - 建议先在个别节点开 `auto` 观察 `dfkv_slab_warm_restarts_total` 和启动日志，再推广。
 > - 微调项（env only）：`DFKV_SLAB_EVICT_HIGH_PCT` / `DFKV_SLAB_EVICT_LOW_PCT`
 >   （默认 92 / 88；high=0 关）：越过 high 后按全局读写最近使用顺序回收 slot 到 low。
 >   新键成功提交可在近期压力状态下重新触发回收；非活跃且连续 128 次无新提交观察后，历史压力失效。
@@ -484,7 +487,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `--server-uring-depth` / `DFKV_SERVER_URING_DEPTH` | — | uring SQ 深度 |
 | `--ram-flush-threads` / `DFKV_RAM_FLUSH_THREADS` | 默认 4×盘数， 钳至 shard 数上限 16 | RAM tier flush 线程 |
 | `--slab-table-sync-ms` / `DFKV_SLAB_TABLE_SYNC_MS` | `100 ms`, `0`=关 | slab 元数据 sync 节奏 |
-| `DFKV_SLAB_WARM_RESTART` | `auto`（`boot` / `off`） | 非干净退出后保留还是清零 slab 缓存 |
+| `DFKV_SLAB_WARM_RESTART` | `off`（`auto` / `boot`） | 非干净退出后保留还是清零 slab 缓存 |
 | `--slab-reclaim-ms` / `DFKV_SLAB_RECLAIM_MS` | `50 ms`, `0`=关 | slab 后台回收 tick |
 | `--ram-reclaim-ms` / `DFKV_RAM_RECLAIM_MS` | `10 ms`, `0`=关 | RAM tier 后台回收 tick |
 | `--log` / `DFKV_LOG` | `INFO` | INFO/DEBUG/WARN/ERROR |

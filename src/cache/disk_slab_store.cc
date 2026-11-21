@@ -8,6 +8,7 @@
 
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -15,6 +16,7 @@
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -42,12 +44,13 @@ constexpr uint32_t kStateMagic = 0x53424C53u;  // "SLBS"
 constexpr uint32_t kStateClean = 1;
 constexpr uint32_t kStateDirty = 2;
 // slab_state record: magic(0) version(4) epoch(8) state(16) boot_id(20..35)
-// mount_id(36..43) zero(44..59) crc(60). The two identity fields live in bytes
-// that were always zero and CRC-covered, so releases that predate them read
-// the record unchanged; what those releases write carries no identity, which
-// this one treats as "reset the table".
+// mount_id(36..43) dir_ino(44..51) zero(52..59) crc(60). The identity fields
+// live in bytes that were always zero and CRC-covered, so releases that
+// predate them read the record unchanged; what those releases write carries
+// no identity, which this one treats as "reset the table".
 constexpr size_t kStateBootIdOffset = 20;
 constexpr size_t kStateMountIdOffset = 36;
+constexpr size_t kStateDirInoOffset = 44;
 const std::array<uint8_t, 16> kNoBootId{};
 
 // The kernel's boot id: constant until the next boot, which is exactly the
@@ -100,9 +103,36 @@ uint64_t ReadUniqueMountId(const std::string& dir) {
 
 uint32_t Crc32(const uint8_t* p, size_t n);
 
+// Filesystems whose file contents, once written, stay with this kernel until
+// they reach the disk: the premise of keeping a table after a kill. A network
+// or FUSE filesystem buffers in places a local kernel knows nothing about.
+bool PageCacheLivesWithKernel(int fd) {
+  struct statfs fs_info {};
+  if (::fstatfs(fd, &fs_info) != 0) return false;
+  switch (static_cast<uint32_t>(fs_info.f_type)) {
+    case 0x58465342u:  // xfs
+    case 0x0000EF53u:  // ext2/3/4
+    case 0x01021994u:  // tmpfs
+      return true;
+    default:
+      return false;
+  }
+}
+
+// A marker directory is usable if it exists and -- unless the caller chose it
+// explicitly -- is a tmpfs, i.e. is wiped exactly when the page cache is.
+bool MarkerDirUsable(const std::string& dir, bool chosen_explicitly) {
+  struct stat st {};
+  if (::stat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) return false;
+  if (chosen_explicitly) return true;
+  struct statfs fs_info {};
+  return ::statfs(dir.c_str(), &fs_info) == 0 &&
+         static_cast<uint32_t>(fs_info.f_type) == 0x01021994u;
+}
+
 void EncodeEpochState(uint8_t* record, uint32_t state, uint64_t epoch,
                       const std::array<uint8_t, 16>* boot_id,
-                      uint64_t mount_id) {
+                      uint64_t mount_id, uint64_t dir_ino) {
   std::memset(record, 0, 64);
   net::PutU32(reinterpret_cast<char*>(record), kStateMagic);
   net::PutU32(reinterpret_cast<char*>(record) + 4, kFormatVersion);
@@ -111,38 +141,35 @@ void EncodeEpochState(uint8_t* record, uint32_t state, uint64_t epoch,
   if (boot_id != nullptr) {
     std::memcpy(record + kStateBootIdOffset, boot_id->data(), boot_id->size());
     net::PutU64(reinterpret_cast<char*>(record) + kStateMountIdOffset, mount_id);
+    net::PutU64(reinterpret_cast<char*>(record) + kStateDirInoOffset, dir_ino);
   }
   net::PutU32(reinterpret_cast<char*>(record) + 60, Crc32(record, 60));
 }
 
-// State files a fatal-signal handler rewrites (DiskSlabStore::PoisonAllForCrash).
-// fd: -1 free, -2 being filled, >= 0 armed with `record`.
+// Marker paths a fatal-signal handler creates
+// (DiskSlabStore::MarkAllUntrustedForCrash). state: 0 free, 1 being filled or
+// cleared, 2 armed with `path`.
 struct CrashSlot {
-  std::atomic<int> fd{-1};
-  uint8_t record[64];
+  std::atomic<int> state{0};
+  char path[192];
 };
 constexpr int kCrashSlots = 256;
 CrashSlot g_crash_slots[kCrashSlots];
-std::atomic<bool> g_crash_in_progress{false};
 
-int ArmCrashSlot(int fd, const uint8_t* record) {
+int ArmCrashSlot(const std::string& path) {
+  if (path.empty() || path.size() >= sizeof(g_crash_slots[0].path)) return -1;
   for (int i = 0; i < kCrashSlots; ++i) {
-    int expected = -1;
-    if (!g_crash_slots[i].fd.compare_exchange_strong(expected, -2)) continue;
-    std::memcpy(g_crash_slots[i].record, record, sizeof(g_crash_slots[i].record));
-    g_crash_slots[i].fd.store(fd, std::memory_order_release);
+    int expected = 0;
+    if (!g_crash_slots[i].state.compare_exchange_strong(expected, 1)) continue;
+    std::memcpy(g_crash_slots[i].path, path.c_str(), path.size() + 1);
+    g_crash_slots[i].state.store(2);
     return i;
   }
   return -1;  // more stores than slots: those simply are not marked on a crash
 }
 
 void DisarmCrashSlot(int slot) {
-  if (slot < 0) return;
-  g_crash_slots[slot].fd.store(-1, std::memory_order_release);
-  // A handler that already read the fd may still be writing through it. The
-  // process is about to die on that signal; never let this thread go on to
-  // close the fd and have its number reused under the handler.
-  while (g_crash_in_progress.load(std::memory_order_acquire)) ::pause();
+  if (slot >= 0) g_crash_slots[slot].state.store(0);
 }
 
 // Bound on a re-PUT waiting out a deferred-remove window. The window lasts
@@ -370,6 +397,16 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   if (ok_) {
     boot_id_ = opt_.boot_id ? *opt_.boot_id : ReadBootId();
     mount_id_ = opt_.mount_id ? *opt_.mount_id : ReadUniqueMountId(opt_.dir);
+    const bool explicit_dir = !opt_.trust_marker_dir.empty();
+    const std::string marker_dir =
+        explicit_dir ? opt_.trust_marker_dir : std::string("/dev/shm");
+    if (MarkerDirUsable(marker_dir, explicit_dir)) {
+      char name[80];
+      std::snprintf(name, sizeof(name), "/dfkv-slab-untrusted.%llx.%llx",
+                    static_cast<unsigned long long>(dir_dev_),
+                    static_cast<unsigned long long>(dir_ino_));
+      marker_path_ = marker_dir + name;
+    }
   }
   if (ok_) ok_ = unclean_start_ ? RecoverUnclean() : Rebuild();
   if (ok_) ok_ = MarkDirtyEpoch();
@@ -439,8 +476,11 @@ DiskSlabStore::~DiskSlabStore() {
   if (clean) clean = SyncPayloads();
   if (clean)
     clean = SyncTable(record_writes_.load(std::memory_order_relaxed));
-  // From here a crash no longer turns the state dirty-without-identity: the
-  // table and payloads are synced, so whichever marker ends up on disk is true.
+  // A store that failed and could not say so yet gets one more chance.
+  if (!Healthy() && identity_recorded_.load(std::memory_order_acquire))
+    MarkUntrusted();
+  // From here a crash no longer marks this store: the table and payloads are
+  // synced, so whichever state ends up on disk is true.
   DisarmCrashSlot(crash_slot_);
   crash_slot_ = -1;
   if (clean) MarkCleanEpoch();
@@ -450,6 +490,7 @@ DiskSlabStore::~DiskSlabStore() {
     if (fd >= 0) ::close(fd);
   if (table_fd_ >= 0) ::close(table_fd_);
   if (state_fd_ >= 0) ::close(state_fd_);
+  if (dir_fd_ >= 0) ::close(dir_fd_);  // releases the directory lock, last
 }
 
 bool DiskSlabStore::SetStartupError(std::string error) {
@@ -527,6 +568,7 @@ bool DiskSlabStore::OpenOrInit() {
   ec.clear();
   if (!fs::is_directory(root, ec) || ec)
     return SetStartupError("cannot access cache directory: " + ec.message());
+  if (!LockDirectory()) return false;
 
   const std::string meta_path = (root / "slab_meta").string();
   const std::string tbl_path = (root / "slots.tbl").string();
@@ -787,6 +829,12 @@ bool DiskSlabStore::OpenOrInit() {
     // unwritten ranges parallelize on XFS; allocating writes into ftruncate
     // holes serialize on the exclusive inode lock (measured 4.2 vs 2.0 GB/s at
     // 8 writers).
+    // This call does a second job, on every start: XFS and ext4 wait in
+    // fallocate for the file's in-flight direct I/O. io_uring writes of a
+    // killed predecessor can outlive its descriptors (and so the directory
+    // lock); nothing of theirs may land after this run starts reusing slots
+    // in a table it kept. Do not make this conditional on the extent being
+    // new without putting another barrier in its place.
     if (opt_.direct_writes && !extent_dio_fds_.empty() &&
         ::fallocate(fd, 0, 0, static_cast<off_t>(opt_.extent_bytes)) != 0 &&
         errno != EOPNOTSUPP && errno != ENOSYS && errno != EINVAL) {
@@ -823,39 +871,80 @@ bool DiskSlabStore::WriteEpochState(uint32_t state, uint64_t epoch,
   if (state_fd_ < 0) return false;
   uint8_t record[64];
   EncodeEpochState(record, state, epoch, with_identity ? &boot_id_ : nullptr,
-                   mount_id_);
+                   mount_id_, dir_ino_);
   std::lock_guard<std::mutex> lk(state_mu_);
   return PwriteAll(state_fd_, record, sizeof(record), 0) &&
          ::fdatasync(state_fd_) == 0;
 }
 
-// Best effort, once: the store just failed a metadata operation, so what the
-// page cache holds may no longer match the disk. Withdraw the identity so the
-// next start resets the table instead of trusting it.
-void DiskSlabStore::PoisonEpochState() {
-  if (!identity_recorded_.load(std::memory_order_acquire)) return;
-  if (state_poisoned_.exchange(true, std::memory_order_acq_rel)) return;
-  (void)WriteEpochState(kStateDirty, run_epoch_, /*with_identity=*/false);
+// This run can no longer vouch for the table: a metadata operation failed, so
+// what the page cache holds may not match the disk, and the kernel reports a
+// writeback error only once. The fact is recorded where the failing disk
+// cannot lose it -- a marker on tmpfs, gone exactly when the page cache is --
+// and, best effort, by withdrawing the identity from slab_state as well.
+bool DiskSlabStore::MarkUntrusted() {
+  if (untrusted_marked_.load(std::memory_order_acquire)) return true;
+  bool marked = false;
+  if (!marker_path_.empty()) {
+    const int fd = ::open(marker_path_.c_str(),
+                          O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+    if (fd >= 0) {
+      ::close(fd);
+      marked = true;
+    }
+  }
+  // Without a marker directory the on-disk state is the only record there is.
+  const bool withdrawn =
+      WriteEpochState(kStateDirty, run_epoch_, /*with_identity=*/false);
+  if (marker_path_.empty()) marked = withdrawn;
+  if (marked) {
+    untrusted_marked_.store(true, std::memory_order_release);
+  } else {
+    DFKV_LOG_ERROR("slab " + opt_.dir +
+                   ": cannot record that this cache is no longer trustworthy; "
+                   "will retry. Do not restart with DFKV_SLAB_WARM_RESTART "
+                   "enabled before it is reset");
+  }
+  return marked;
 }
 
-// One process per cache directory. Besides the obvious, this is what makes a
-// restart wait for its predecessor: the lock is only released once that
-// process has closed its files, i.e. after its in-flight writes are done.
-bool DiskSlabStore::LockEpochState() {
-  if (::flock(state_fd_, LOCK_EX | LOCK_NB) == 0 || errno != EWOULDBLOCK)
-    return true;  // locked, or a filesystem without flock: carry on as before
-  return SetStartupError(
-      "cache directory is in use by another process (slab_state is locked)");
+void DiskSlabStore::ClearUntrustedMarker() {
+  if (!marker_path_.empty()) ::unlink(marker_path_.c_str());
+  untrusted_marked_.store(false, std::memory_order_release);
 }
 
-void DiskSlabStore::PoisonAllForCrash() noexcept {
-  g_crash_in_progress.store(true, std::memory_order_release);
+// One process per cache directory, taken before any file in it is opened. The
+// lock is on the directory itself, so it does not depend on a file an operator
+// might remove. Its release also orders a restart after its predecessor: that
+// process's synchronous writes end before its descriptors close. (io_uring
+// writes can outlive the descriptors; they exist only with direct writes,
+// where opening the extents fallocates them, which waits for in-flight direct
+// I/O on XFS and ext4 -- see the fallocate in OpenOrInit.)
+bool DiskSlabStore::LockDirectory() {
+  dir_fd_ = ::open(opt_.dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (dir_fd_ < 0)
+    return SetStartupErrno("cannot open cache directory", errno);
+  struct stat st {};
+  if (::fstat(dir_fd_, &st) != 0)
+    return SetStartupErrno("cannot inspect cache directory", errno);
+  dir_dev_ = static_cast<uint64_t>(st.st_dev);
+  dir_ino_ = static_cast<uint64_t>(st.st_ino);
+  if (::flock(dir_fd_, LOCK_EX | LOCK_NB) == 0) {
+    dir_locked_ = true;
+    return true;
+  }
+  if (errno == EWOULDBLOCK)
+    return SetStartupError(
+        "cache directory is in use by another process (it is locked)");
+  // A filesystem without flock: start as before, but never keep a table.
+  return true;
+}
+
+void DiskSlabStore::MarkAllUntrustedForCrash() noexcept {
   for (CrashSlot& slot : g_crash_slots) {
-    const int fd = slot.fd.load(std::memory_order_acquire);
-    if (fd < 0) continue;
-    if (::pwrite(fd, slot.record, sizeof(slot.record), 0) ==
-        static_cast<ssize_t>(sizeof(slot.record)))
-      (void)::fdatasync(fd);
+    if (slot.state.load() != 2) continue;
+    const int fd = ::open(slot.path, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+    if (fd >= 0) ::close(fd);
   }
 }
 
@@ -866,7 +955,6 @@ bool DiskSlabStore::OpenEpochState(bool fresh) {
                        0644);
     if (state_fd_ < 0)
       return SetStartupErrno("cannot create clean slab_state", errno);
-    if (!LockEpochState()) return false;
     if (!WriteEpochState(kStateClean, 0, /*with_identity=*/false))
       return SetStartupErrno("cannot persist clean slab_state", errno);
     run_epoch_ = 0;
@@ -880,7 +968,6 @@ bool DiskSlabStore::OpenEpochState(bool fresh) {
     state_fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);
     if (state_fd_ < 0)
       return SetStartupErrno("cannot create migration slab_state", errno);
-    if (!LockEpochState()) return false;
     run_epoch_ = 1;
     unclean_start_ = true;
     // No identity: this table predates the epoch state and must be reset.
@@ -889,7 +976,6 @@ bool DiskSlabStore::OpenEpochState(bool fresh) {
     return true;
   }
   if (state_fd_ < 0) return SetStartupErrno("cannot open slab_state", errno);
-  if (!LockEpochState()) return false;
 
   struct stat st {};
   uint8_t record[64] = {0};
@@ -913,53 +999,98 @@ bool DiskSlabStore::OpenEpochState(bool fresh) {
               stored_boot_id_.size());
   stored_mount_id_ =
       net::GetU64(reinterpret_cast<char*>(record) + kStateMountIdOffset);
+  stored_dir_ino_ =
+      net::GetU64(reinterpret_cast<char*>(record) + kStateDirInoOffset);
   return true;
 }
 
 const char* DiskSlabStore::WhyNotWarm() const {
   using WarmRestart = Options::WarmRestart;
-  if (opt_.warm_restart == WarmRestart::kOff) return "warm restart is off";
+  if (opt_.warm_restart == WarmRestart::kOff)
+    return "DFKV_SLAB_WARM_RESTART is off";
+  if (!dir_locked_) return "the cache directory could not be locked";
+  if (marker_path_.empty())
+    return "no tmpfs to keep the untrusted marker on (/dev/shm)";
+  if (::access(marker_path_.c_str(), F_OK) == 0)
+    return "a storage failure, a crash or an unfinished recovery was recorded "
+           "for this cache since the last boot";
   if (stored_boot_id_ == kNoBootId)
     return "the previous run left no boot id (an older release, a storage "
-           "failure, a crash, or an interrupted reset)";
+           "failure, or an interrupted reset)";
   if (boot_id_ == kNoBootId) return "this system's boot id is unavailable";
   if (stored_boot_id_ != boot_id_) return "the system has been rebooted";
-  if (stored_mount_id_ != 0 && mount_id_ != 0)
-    return stored_mount_id_ == mount_id_
-               ? nullptr
-               : "the filesystem has been mounted again";
-  if (opt_.warm_restart == WarmRestart::kBootOnly) return nullptr;
-  return "no unique mount id on this kernel (needs Linux 6.8); "
-         "DFKV_SLAB_WARM_RESTART=boot accepts the boot id alone";
+  if (stored_dir_ino_ != dir_ino_)
+    return "this is not the directory the state was written in";
+  if (stored_mount_id_ != 0) {
+    // In a fresh mount namespace (a container start, a sandboxed unit) every
+    // mount has a new id, which is indistinguishable from a remount.
+    if (stored_mount_id_ != mount_id_)
+      return "the mount is not the one the state was written on (remounted, "
+             "or a new mount namespace)";
+  } else if (opt_.warm_restart != WarmRestart::kBootOnly) {
+    return "the previous run had no unique mount id (needs Linux 6.8); "
+           "DFKV_SLAB_WARM_RESTART=boot accepts the boot id alone";
+  }
+  if (opt_.require_local_filesystem && !PageCacheLivesWithKernel(table_fd_))
+    return "not a filesystem known to keep written data with the kernel "
+           "(xfs, ext4, tmpfs)";
+  return nullptr;
 }
 
 // The previous process is gone but the kernel is not, so its record and
 // payload writes are in the page cache or on disk. Push them out now: a
 // writeback error nobody has seen yet surfaces here instead of serving stale
 // data later, and the table is durable before anything new builds on it.
+// Everything has to be on the directory's own filesystem, the one whose mount
+// was checked.
 bool DiskSlabStore::SyncForWarmRestart() {
-  if (::fdatasync(table_fd_) != 0) return false;
+  const auto on_dir_filesystem = [this](int fd) {
+    struct stat st {};
+    return ::fstat(fd, &st) == 0 && static_cast<uint64_t>(st.st_dev) == dir_dev_;
+  };
+  if (!on_dir_filesystem(table_fd_) || ::fdatasync(table_fd_) != 0)
+    return false;
   for (int fd : extent_fds_)
-    if (fd >= 0 && ::fdatasync(fd) != 0) return false;
+    if (fd >= 0 && (!on_dir_filesystem(fd) || ::fdatasync(fd) != 0))
+      return false;
   return true;
 }
 
 bool DiskSlabStore::RecoverUnclean() {
   const char* why_reset = WhyNotWarm();
-  if (why_reset == nullptr && !SyncForWarmRestart())
-    why_reset = "the table or an extent failed to sync";
   if (why_reset == nullptr) {
-    bool inconsistent = false;
-    if (Rebuild(&inconsistent)) {
-      warm_restarts_.fetch_add(1, std::memory_order_relaxed);
-      DFKV_LOG_INFO("slab " + opt_.dir +
-                    ": previous run did not shut down cleanly, same boot; kept " +
-                    std::to_string(alloc_->Count()) + " objects");
-      return true;
+    // From here until MarkDirtyEpoch this run may consume a writeback error or
+    // die half-way; either must leave the next start with a reset. The marker
+    // says so before the first sync and is cleared only by a finished
+    // recovery.
+    if (!MarkUntrusted()) {
+      why_reset = "the untrusted marker could not be written";
+    } else {
+      const auto started = std::chrono::steady_clock::now();
+      if (!SyncForWarmRestart()) {
+        metadata_io_errors_.fetch_add(1, std::memory_order_relaxed);
+        why_reset = "the table or an extent failed to sync, or is on another "
+                    "filesystem";
+      } else {
+        bool inconsistent = false;
+        if (Rebuild(&inconsistent)) {
+          warm_restarts_.fetch_add(1, std::memory_order_relaxed);
+          DFKV_LOG_INFO(
+              "slab " + opt_.dir +
+              ": previous run did not shut down cleanly, same boot; kept " +
+              std::to_string(alloc_->Count()) + " objects (sync+rebuild " +
+              std::to_string(
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - started)
+                      .count()) +
+              " ms)");
+          return true;
+        }
+        if (!inconsistent) return false;  // I/O failure: fails startup as always
+        why_reset = "slots.tbl is not self-consistent";
+        startup_error_.clear();
+      }
     }
-    if (!inconsistent) return false;  // I/O failure: fails startup as always
-    why_reset = "slots.tbl is not self-consistent";
-    startup_error_.clear();
   }
   DFKV_LOG_WARN("slab " + opt_.dir +
                 ": previous run did not shut down cleanly; cache reset (" +
@@ -1010,9 +1141,10 @@ bool DiskSlabStore::MarkDirtyEpoch() {
   // policy is applied by the run that finds the state, not the one that wrote it.
   if (WriteEpochState(kStateDirty, run_epoch_, /*with_identity=*/true)) {
     identity_recorded_.store(true, std::memory_order_release);
-    uint8_t poisoned[64];
-    EncodeEpochState(poisoned, kStateDirty, run_epoch_, nullptr, 0);
-    crash_slot_ = ArmCrashSlot(state_fd_, poisoned);
+    // The table this state describes is one this run rebuilt or reset in
+    // full, so an older marker has done its job.
+    ClearUntrustedMarker();
+    crash_slot_ = ArmCrashSlot(marker_path_);
     return true;
   }
   const int saved_errno = errno;
@@ -1276,7 +1408,10 @@ bool DiskSlabStore::Rebuild(bool* inconsistent) {
 bool DiskSlabStore::FailMetadata() {
   metadata_io_errors_.fetch_add(1, std::memory_order_relaxed);
   metadata_failed_.store(true, std::memory_order_release);
-  PoisonEpochState();
+  // Only a run that recorded its identity has anything to take back; before
+  // that the state on disk already leads to a reset (or was clean, and a
+  // failed startup changes nothing).
+  if (identity_recorded_.load(std::memory_order_acquire)) MarkUntrusted();
   return false;
 }
 

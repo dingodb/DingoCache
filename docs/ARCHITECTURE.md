@@ -286,31 +286,40 @@ size-class lattice and carves them into uniform slots:
   clean only after payload/table sync on graceful shutdown. Torn/invalid records
   are rejected and cleared durably; metadata I/O failure fails the store closed.
   Format/geometry mismatches are refused without rewriting existing data. The
-  directory is `flock`ed through `slab_state`: one process per cache directory.
+  directory itself is `flock`ed: one process per cache directory.
 - **Unclean exit:** a dirty epoch at startup means the previous process did not
-  shut down. What the table is worth then depends on whether the kernel that
-  held its last record writes in the page cache is still the same one:
-  - *Same boot, same mount* (the process was killed: stop timeout, OOM): the
-    table is complete. Every path that frees a slot clears its record before
-    the slot can be reused, a record is written only after its payload, and a
-    `Remove` invalidates the record before it returns -- so no valid record
-    can point at another key's bytes. The table and every extent are synced
-    once (an unseen writeback error surfaces here), then rebuilt as after a
-    clean shutdown. `DFKV_SLAB_WARM_RESTART=auto`.
-  - *Anything else* resets the table, as every release up to 2.35 always did:
-    a reboot or power loss (records of reused slots may never have reached the
-    disk, and payloads carry no checksum), a filesystem that was mounted again,
-    a run that hit a metadata I/O failure, a server that crashed on its own
-    (fatal-signal handler), an interrupted reset, or a table whose records
-    contradict each other.
-  The dirty state records the boot id and the unique mount id
-  (`STATX_MNT_ID_UNIQUE`, Linux 6.8) once the table has been rebuilt; a run
-  that can no longer vouch for the table withdraws them. They occupy bytes of
-  the state record that were always zero, so 2.35 reads the new record and
-  what 2.35 writes is simply reset by this release. Kernels without the unique
-  mount id reset unless `DFKV_SLAB_WARM_RESTART=boot` accepts the boot id
-  alone; that cannot see a filesystem shut down and mounted again without a
-  reboot, which can lose the last ~`DFKV_SLAB_TABLE_SYNC_MS` of record writes.
+  shut down. By default (`DFKV_SLAB_WARM_RESTART=off`) the table is reset, as in
+  every release up to 2.35. With `auto` it is kept when the kernel that held the
+  process's last record writes in its page cache is provably still the same
+  one, and nothing since then made the table doubtful:
+  - Why a kill leaves a complete table: every path that frees a slot clears its
+    record before the slot can be reused, a record is written only after its
+    payload, and a `Remove` invalidates the record before it returns. So no
+    valid record can point at another key's bytes; only losing page-cache
+    contents can change that.
+  - What is recorded: once the table has been rebuilt, the dirty state carries
+    the boot id, the unique mount id (`STATX_MNT_ID_UNIQUE`, Linux 6.8) and the
+    inode of the directory. They occupy bytes of the state record that were
+    always zero, so 2.35 reads the new record and what 2.35 writes is reset.
+  - What withdraws it: an "untrusted" marker on a tmpfs (`/dev/shm`), keyed by
+    the directory. It lives exactly as long as the page cache and does not
+    depend on the cache disk. A run leaves it when a metadata operation fails
+    (the kernel reports a writeback error once and then forgets it), the
+    server's fatal-signal handler leaves it, and a start that keeps a table
+    leaves it before its first sync and removes it only when the recovery is
+    complete. A reset removes it.
+  - Before the rebuild, the table and every extent are synced once (an unseen
+    writeback error surfaces there) and must be on the directory's filesystem,
+    which must be xfs, ext4 or tmpfs.
+  - Everything else resets: a reboot or power loss (records of reused slots may
+    never have reached the disk, and payloads carry no checksum), another mount
+    or mount namespace, a copied directory, a directory that could not be
+    locked, no tmpfs for the marker, records that contradict each other.
+  `boot` additionally accepts a run that had no unique mount id. A filesystem
+  that died and was mounted again without a reboot is then caught only if the
+  old process saw an I/O error before it went away; if it did not, record
+  writes since the last table sync -- and buffered payload writes since the
+  kernel's last writeback -- may be missing.
 - **Watermark eviction:** above-high occupancy starts bounded global slot
   reclamation toward low. New objects and successful GET/Pin operations move
   behind the global scan cursor; class-local scans use the same admission/read
