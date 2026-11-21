@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Server: `dfkv_rdma_active_conns` (and the per-rail gauge) now drop only
+  after a closing connection has released its endpoint, receive-segment lease,
+  source pins and connection accounting. They used to drop first, so "no
+  active connections" could be observed while `dfkv_rdma_recv_segment_used_bytes`,
+  `dfkv_rdma_pull_connections` and `dfkv_rdma_connection_bytes` still counted
+  the connection -- visible to anything that waits on the gauge before reading
+  the others, including one of the loopback tests on a real NIC.
 - Client: libdfkv no longer loads or initializes CUDA. Classifying an
   unregistered GET destination (and `RegisterMemory`) used to
   `dlopen("libcuda.so.1")` and call `cuInit` on first use, so every dfkv

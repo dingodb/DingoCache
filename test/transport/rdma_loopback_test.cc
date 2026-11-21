@@ -71,6 +71,10 @@ class RdmaServerTestPeer {
   static void SetDiscovery(RdmaServer* server, DiscoverFn discover) {
     server->discover_for_test_ = std::move(discover);
   }
+  static void SetBeforeEndpointTeardown(RdmaServer* server,
+                                        std::function<void()> hook) {
+    server->before_endpoint_teardown_for_test_ = std::move(hook);
+  }
   static void SetInitializeAnchor(RdmaServer* server,
                                   InitializeAnchorFn initialize) {
     server->initialize_anchor_for_test_ = std::move(initialize);
@@ -3868,6 +3872,42 @@ TEST(RdmaLoopback, MetricsCountersTrackOps) {
   std::string snap = c.MetricsSnapshot();
   EXPECT_NE(snap.find("dfkv_client_ops_served_total"), std::string::npos) << snap;
   EXPECT_NE(snap.find("dfkv_rdma_client_conns_opened_total"), std::string::npos) << snap;
+}
+
+// dfkv_rdma_active_conns is what an operator (and the test below) waits on to
+// know a connection is gone, so it has to stay up until the connection's
+// resources are released. It used to drop first, which made "no connections"
+// observable while the endpoint and its receive lease were still held.
+TEST(RdmaLoopback, ActiveConnsStaysUpUntilTheEndpointIsTornDown) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv idle_reclaim("DFKV_RDMA_IDLE_MS", "200");
+  std::atomic<int> teardowns{0};
+  std::atomic<uint64_t> lowest_gauge_at_teardown{
+      std::numeric_limits<uint64_t>::max()};
+  RdmaNode node("active-conns-order");
+  RdmaServer* const server = node.rsrv.get();
+  RdmaServerTestPeer::SetBeforeEndpointTeardown(server, [&, server] {
+    const uint64_t gauge = server->ActiveConns();
+    uint64_t lowest = lowest_gauge_at_teardown.load();
+    while (gauge < lowest &&
+           !lowest_gauge_at_teardown.compare_exchange_weak(lowest, gauge)) {
+    }
+    teardowns.fetch_add(1);
+  });
+  {
+    RdmaTransport transport(kMaxMsg);
+    KVClient client({{"n", node.addr}}, SelfHdr(), &transport);
+    const std::string value(4096, 'a');
+    ASSERT_TRUE(client.Put("active-conns-order", value.data(), value.size()));
+  }
+  for (int i = 0; i < 1000 && server->ActiveConns() != 0; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  ASSERT_EQ(server->ActiveConns(), 0u);
+  EXPECT_GT(teardowns.load(), 0)
+      << "the gauge reached zero before any endpoint was torn down";
+  EXPECT_GE(lowest_gauge_at_teardown.load(), 1u)
+      << "the gauge no longer counted a connection whose endpoint was still "
+         "being torn down";
 }
 
 TEST(RdmaLoopback, SegmentOwnershipMetricsReturnToZeroAfterClientTeardown) {
