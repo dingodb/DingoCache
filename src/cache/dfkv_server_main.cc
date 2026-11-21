@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "utils/args.h"
+#include "cache/disk_slab_store.h"
 #include "cache/kv_node_server.h"
 #include "utils/wire_limits.h"
 #include "utils/log.h"
@@ -33,6 +34,19 @@ using dfkv::Status;
 
 static volatile sig_atomic_t g_stop = 0;
 static void OnSig(int) { g_stop = 1; }
+
+// A crash of the server itself: have every slab store withdraw the "same boot"
+// identity from its state file before the process dies, so the next start
+// resets those caches instead of keeping tables a misbehaving process wrote.
+// SIGKILL (OOM, stop timeout) never gets here, and does not need to.
+static struct sigaction g_previous_fatal[NSIG];
+static void OnFatalSignal(int sig) {
+  dfkv::DiskSlabStore::PoisonAllForCrash();
+  // Hand the signal on to whoever had it before (the default action, or a
+  // sanitizer's reporter), so the process still dies the way it would have.
+  ::sigaction(sig, &g_previous_fatal[sig], nullptr);
+  ::raise(sig);
+}
 
 int main(int argc, char** argv) {
   if (dfkv::WantsVersion(argc, argv)) { std::printf("dfkv_server %s\n", dfkv::Version()); return 0; }
@@ -312,6 +326,14 @@ int main(int argc, char** argv) {
   }
   std::signal(SIGINT, OnSig);
   std::signal(SIGTERM, OnSig);
+  {
+    struct sigaction fatal {};
+    fatal.sa_handler = OnFatalSignal;
+    fatal.sa_flags = SA_NODEFER;  // the handler re-raises
+    sigemptyset(&fatal.sa_mask);
+    for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT})
+      ::sigaction(sig, &fatal, &g_previous_fatal[sig]);
+  }
 
   // split --dir on commas into one entry per NVMe SSD
   std::vector<std::string> dirs;

@@ -274,7 +274,12 @@ WantedBy=multi-user.target
 > - `--ram-tier on`（默认关）：arena 内对象走 RDMA 零拷贝。`--ram-write-mode writeback|writearound`（默认 `writeback`）选择 PUT 先入 RAM 后落盘，或直接盘写、读时晋升。`writeback` 默认在数据进入可读且 flush-pinned 的 RAM slot 后返回 `kOk`。达到正的 `DFKV_RAM_ACK_HIGH_WATERMARK_PCT`（默认 80）时，只拒绝尚无 owner 的新 key，返回 `kCacheFull`，不转为直接盘写。已有同 key 请求仍加入首写者的完成结果；水位设为 0 保留强制 disk-ACK 语义。需要所有 PUT 都等待持久化时设置 `DFKV_PUT_ACK_MODE=disk`。`--ram-tier-bytes` 限定总预算；超 extent 对象仍受 dedicated allocation 预算约束。显式启用 RAM 后，分配或 NUMA 模式失败会拒绝启动。
 > - `--ram-tier-numa interleave|off`（默认 `interleave`）：这是当前完整 mode 集；不接受数字 node ID。arena 预触并绑策略，须核 `MemoryMax`。
 > - `--ram-flush-threads <n>` / `DFKV_RAM_FLUSH_THREADS`：请求值会提高到至少 shard 数；实际值由 `dfkv_ram_flush_threads` 报告（默认请求=4×盘数，上限 16）。
-> - 微调项（env only）：`DFKV_SLAB_TABLE_SYNC_MS` 控制 table sync 节奏（默认 100 ms，0=关；dirty epoch 重启仍无条件冷重置）。
+> - 微调项（env only）：`DFKV_SLAB_TABLE_SYNC_MS` 控制 table sync 节奏（默认 100 ms，0=关）。
+> - 非干净退出后的处理（env only）：`DFKV_SLAB_WARM_RESTART=auto|boot|off`，默认 `auto`。
+>   - `auto`：进程被杀（停止超时、OOM）而内核没重启、缓存盘没被重新挂载时保留缓存，其余情况清零。判断依据是 `slab_state` 里记录的 boot id 和挂载唯一 ID（内核 6.8 起提供）；内核拿不到挂载唯一 ID 时清零。
+>   - `boot`：拿不到挂载唯一 ID 时只凭 boot id 保留。看不出"文件系统被强制下线后没重启就重新挂载"，这种情况下出事前约一个 table sync 周期内被复用的槽可能读到别的 key 的数据。缓存盘出过文件系统错误后，重启服务前先删掉该盘目录下的 `slab_state`。
+>   - `off`：一律清零，等同 2.35。
+>   - 重启、掉电、上次运行出过元数据 I/O 错误、服务端自身崩溃（SIGSEGV、SIGABRT 等）之后总是清零。一个缓存目录同时只能被一个进程打开。
 > - 微调项（env only）：`DFKV_SLAB_EVICT_HIGH_PCT` / `DFKV_SLAB_EVICT_LOW_PCT`
 >   （默认 92 / 88；high=0 关）：越过 high 后按全局读写最近使用顺序回收 slot 到 low。
 >   新键成功提交可在近期压力状态下重新触发回收；非活跃且连续 128 次无新提交观察后，历史压力失效。
@@ -479,6 +484,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `--server-uring-depth` / `DFKV_SERVER_URING_DEPTH` | — | uring SQ 深度 |
 | `--ram-flush-threads` / `DFKV_RAM_FLUSH_THREADS` | 默认 4×盘数， 钳至 shard 数上限 16 | RAM tier flush 线程 |
 | `--slab-table-sync-ms` / `DFKV_SLAB_TABLE_SYNC_MS` | `100 ms`, `0`=关 | slab 元数据 sync 节奏 |
+| `DFKV_SLAB_WARM_RESTART` | `auto`（`boot` / `off`） | 非干净退出后保留还是清零 slab 缓存 |
 | `--slab-reclaim-ms` / `DFKV_SLAB_RECLAIM_MS` | `50 ms`, `0`=关 | slab 后台回收 tick |
 | `--ram-reclaim-ms` / `DFKV_RAM_RECLAIM_MS` | `10 ms`, `0`=关 | RAM tier 后台回收 tick |
 | `--log` / `DFKV_LOG` | `INFO` | INFO/DEBUG/WARN/ERROR |

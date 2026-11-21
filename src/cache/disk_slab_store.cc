@@ -7,6 +7,8 @@
 #endif
 
 #include <fcntl.h>
+#include <sys/file.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -21,6 +23,7 @@
 #include <sys/mman.h>
 #include <vector>
 
+#include "utils/log.h"
 #include "utils/net_util.h"
 #include "utils/thread_name.h"  // PutU32/PutU64/GetU32/GetU64 (host-endian codec)
 
@@ -38,6 +41,109 @@ constexpr uint32_t kInitMagic = 0x49424C53u;  // "SLBI", init-in-progress
 constexpr uint32_t kStateMagic = 0x53424C53u;  // "SLBS"
 constexpr uint32_t kStateClean = 1;
 constexpr uint32_t kStateDirty = 2;
+// slab_state record: magic(0) version(4) epoch(8) state(16) boot_id(20..35)
+// mount_id(36..43) zero(44..59) crc(60). The two identity fields live in bytes
+// that were always zero and CRC-covered, so releases that predate them read
+// the record unchanged; what those releases write carries no identity, which
+// this one treats as "reset the table".
+constexpr size_t kStateBootIdOffset = 20;
+constexpr size_t kStateMountIdOffset = 36;
+const std::array<uint8_t, 16> kNoBootId{};
+
+// The kernel's boot id: constant until the next boot, which is exactly the
+// lifetime of the page cache.
+std::array<uint8_t, 16> ReadBootId() {
+  std::array<uint8_t, 16> id{};
+  const int fd = ::open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return id;
+  char text[64];
+  const ssize_t n = ::read(fd, text, sizeof(text));
+  ::close(fd);
+  size_t nibbles = 0;
+  for (ssize_t i = 0; i < n && nibbles < 32; ++i) {
+    const char c = text[i];
+    uint8_t value;
+    if (c >= '0' && c <= '9') value = static_cast<uint8_t>(c - '0');
+    else if (c >= 'a' && c <= 'f') value = static_cast<uint8_t>(c - 'a' + 10);
+    else if (c >= 'A' && c <= 'F') value = static_cast<uint8_t>(c - 'A' + 10);
+    else continue;  // the dashes and the newline
+    id[nibbles / 2] = static_cast<uint8_t>((id[nibbles / 2] << 4) | value);
+    ++nibbles;
+  }
+  if (nibbles != 32) id.fill(0);
+  return id;
+}
+
+// STATX_MNT_ID_UNIQUE (Linux 6.8): a 64-bit mount id that is never reused
+// within a boot, unlike the older mount id. It changes when the filesystem is
+// mounted again, which is the one way the page cache can lose record writes
+// while the boot id stays the same. 0 = the kernel does not provide it.
+// The raw syscall and field offsets keep this independent of libc headers.
+uint64_t ReadUniqueMountId(const std::string& dir) {
+#ifdef SYS_statx
+  constexpr unsigned kStatxMntIdUnique = 0x00004000u;
+  constexpr size_t kMaskOffset = 0, kMntIdOffset = 144;
+  alignas(8) unsigned char stx[256];
+  std::memset(stx, 0, sizeof(stx));
+  if (::syscall(SYS_statx, AT_FDCWD, dir.c_str(), 0, kStatxMntIdUnique, stx) != 0)
+    return 0;
+  uint32_t mask = 0;
+  uint64_t mount_id = 0;
+  std::memcpy(&mask, stx + kMaskOffset, sizeof(mask));
+  std::memcpy(&mount_id, stx + kMntIdOffset, sizeof(mount_id));
+  return (mask & kStatxMntIdUnique) != 0 ? mount_id : 0;
+#else
+  (void)dir;
+  return 0;
+#endif
+}
+
+uint32_t Crc32(const uint8_t* p, size_t n);
+
+void EncodeEpochState(uint8_t* record, uint32_t state, uint64_t epoch,
+                      const std::array<uint8_t, 16>* boot_id,
+                      uint64_t mount_id) {
+  std::memset(record, 0, 64);
+  net::PutU32(reinterpret_cast<char*>(record), kStateMagic);
+  net::PutU32(reinterpret_cast<char*>(record) + 4, kFormatVersion);
+  net::PutU64(reinterpret_cast<char*>(record) + 8, epoch);
+  net::PutU32(reinterpret_cast<char*>(record) + 16, state);
+  if (boot_id != nullptr) {
+    std::memcpy(record + kStateBootIdOffset, boot_id->data(), boot_id->size());
+    net::PutU64(reinterpret_cast<char*>(record) + kStateMountIdOffset, mount_id);
+  }
+  net::PutU32(reinterpret_cast<char*>(record) + 60, Crc32(record, 60));
+}
+
+// State files a fatal-signal handler rewrites (DiskSlabStore::PoisonAllForCrash).
+// fd: -1 free, -2 being filled, >= 0 armed with `record`.
+struct CrashSlot {
+  std::atomic<int> fd{-1};
+  uint8_t record[64];
+};
+constexpr int kCrashSlots = 256;
+CrashSlot g_crash_slots[kCrashSlots];
+std::atomic<bool> g_crash_in_progress{false};
+
+int ArmCrashSlot(int fd, const uint8_t* record) {
+  for (int i = 0; i < kCrashSlots; ++i) {
+    int expected = -1;
+    if (!g_crash_slots[i].fd.compare_exchange_strong(expected, -2)) continue;
+    std::memcpy(g_crash_slots[i].record, record, sizeof(g_crash_slots[i].record));
+    g_crash_slots[i].fd.store(fd, std::memory_order_release);
+    return i;
+  }
+  return -1;  // more stores than slots: those simply are not marked on a crash
+}
+
+void DisarmCrashSlot(int slot) {
+  if (slot < 0) return;
+  g_crash_slots[slot].fd.store(-1, std::memory_order_release);
+  // A handler that already read the fd may still be writing through it. The
+  // process is about to die on that signal; never let this thread go on to
+  // close the fd and have its number reused under the handler.
+  while (g_crash_in_progress.load(std::memory_order_acquire)) ::pause();
+}
 
 // Bound on a re-PUT waiting out a deferred-remove window. The window lasts
 // one in-flight read/write of the slot -- I/O time, even for MiB-scale direct
@@ -261,8 +367,11 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   }
 
   ok_ = OpenOrInit();
-  if (ok_ && unclean_start_) ok_ = ResetUncleanEpoch();
-  if (ok_) ok_ = Rebuild();
+  if (ok_) {
+    boot_id_ = opt_.boot_id ? *opt_.boot_id : ReadBootId();
+    mount_id_ = opt_.mount_id ? *opt_.mount_id : ReadUniqueMountId(opt_.dir);
+  }
+  if (ok_) ok_ = unclean_start_ ? RecoverUnclean() : Rebuild();
   if (ok_) ok_ = MarkDirtyEpoch();
   if (ok_) ok_ = ClearInitMarker();
   if (Healthy() && opt_.table_sync_ms > 0) {
@@ -330,6 +439,10 @@ DiskSlabStore::~DiskSlabStore() {
   if (clean) clean = SyncPayloads();
   if (clean)
     clean = SyncTable(record_writes_.load(std::memory_order_relaxed));
+  // From here a crash no longer turns the state dirty-without-identity: the
+  // table and payloads are synced, so whichever marker ends up on disk is true.
+  DisarmCrashSlot(crash_slot_);
+  crash_slot_ = -1;
   if (clean) MarkCleanEpoch();
   for (int fd : extent_fds_)
     if (fd >= 0) ::close(fd);
@@ -705,16 +818,45 @@ bool DiskSlabStore::OpenOrInit() {
   return OpenEpochState(fresh || resume);
 }
 
-bool DiskSlabStore::WriteEpochState(uint32_t state, uint64_t epoch) {
+bool DiskSlabStore::WriteEpochState(uint32_t state, uint64_t epoch,
+                                    bool with_identity) {
   if (state_fd_ < 0) return false;
-  uint8_t record[64] = {0};
-  net::PutU32(reinterpret_cast<char*>(record), kStateMagic);
-  net::PutU32(reinterpret_cast<char*>(record) + 4, kFormatVersion);
-  net::PutU64(reinterpret_cast<char*>(record) + 8, epoch);
-  net::PutU32(reinterpret_cast<char*>(record) + 16, state);
-  net::PutU32(reinterpret_cast<char*>(record) + 60, Crc32(record, 60));
+  uint8_t record[64];
+  EncodeEpochState(record, state, epoch, with_identity ? &boot_id_ : nullptr,
+                   mount_id_);
+  std::lock_guard<std::mutex> lk(state_mu_);
   return PwriteAll(state_fd_, record, sizeof(record), 0) &&
          ::fdatasync(state_fd_) == 0;
+}
+
+// Best effort, once: the store just failed a metadata operation, so what the
+// page cache holds may no longer match the disk. Withdraw the identity so the
+// next start resets the table instead of trusting it.
+void DiskSlabStore::PoisonEpochState() {
+  if (!identity_recorded_.load(std::memory_order_acquire)) return;
+  if (state_poisoned_.exchange(true, std::memory_order_acq_rel)) return;
+  (void)WriteEpochState(kStateDirty, run_epoch_, /*with_identity=*/false);
+}
+
+// One process per cache directory. Besides the obvious, this is what makes a
+// restart wait for its predecessor: the lock is only released once that
+// process has closed its files, i.e. after its in-flight writes are done.
+bool DiskSlabStore::LockEpochState() {
+  if (::flock(state_fd_, LOCK_EX | LOCK_NB) == 0 || errno != EWOULDBLOCK)
+    return true;  // locked, or a filesystem without flock: carry on as before
+  return SetStartupError(
+      "cache directory is in use by another process (slab_state is locked)");
+}
+
+void DiskSlabStore::PoisonAllForCrash() noexcept {
+  g_crash_in_progress.store(true, std::memory_order_release);
+  for (CrashSlot& slot : g_crash_slots) {
+    const int fd = slot.fd.load(std::memory_order_acquire);
+    if (fd < 0) continue;
+    if (::pwrite(fd, slot.record, sizeof(slot.record), 0) ==
+        static_cast<ssize_t>(sizeof(slot.record)))
+      (void)::fdatasync(fd);
+  }
 }
 
 bool DiskSlabStore::OpenEpochState(bool fresh) {
@@ -724,7 +866,8 @@ bool DiskSlabStore::OpenEpochState(bool fresh) {
                        0644);
     if (state_fd_ < 0)
       return SetStartupErrno("cannot create clean slab_state", errno);
-    if (!WriteEpochState(kStateClean, 0))
+    if (!LockEpochState()) return false;
+    if (!WriteEpochState(kStateClean, 0, /*with_identity=*/false))
       return SetStartupErrno("cannot persist clean slab_state", errno);
     run_epoch_ = 0;
     return true;
@@ -737,13 +880,16 @@ bool DiskSlabStore::OpenEpochState(bool fresh) {
     state_fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);
     if (state_fd_ < 0)
       return SetStartupErrno("cannot create migration slab_state", errno);
+    if (!LockEpochState()) return false;
     run_epoch_ = 1;
     unclean_start_ = true;
-    if (!WriteEpochState(kStateDirty, run_epoch_))
+    // No identity: this table predates the epoch state and must be reset.
+    if (!WriteEpochState(kStateDirty, run_epoch_, /*with_identity=*/false))
       return SetStartupErrno("cannot persist migration slab_state", errno);
     return true;
   }
   if (state_fd_ < 0) return SetStartupErrno("cannot open slab_state", errno);
+  if (!LockEpochState()) return false;
 
   struct stat st {};
   uint8_t record[64] = {0};
@@ -763,10 +909,74 @@ bool DiskSlabStore::OpenEpochState(bool fresh) {
     return SetStartupError("slab_state contains an invalid epoch state");
   run_epoch_ = net::GetU64(reinterpret_cast<char*>(record) + 8);
   unclean_start_ = state == kStateDirty;
+  std::memcpy(stored_boot_id_.data(), record + kStateBootIdOffset,
+              stored_boot_id_.size());
+  stored_mount_id_ =
+      net::GetU64(reinterpret_cast<char*>(record) + kStateMountIdOffset);
   return true;
 }
 
+const char* DiskSlabStore::WhyNotWarm() const {
+  using WarmRestart = Options::WarmRestart;
+  if (opt_.warm_restart == WarmRestart::kOff) return "warm restart is off";
+  if (stored_boot_id_ == kNoBootId)
+    return "the previous run left no boot id (an older release, a storage "
+           "failure, a crash, or an interrupted reset)";
+  if (boot_id_ == kNoBootId) return "this system's boot id is unavailable";
+  if (stored_boot_id_ != boot_id_) return "the system has been rebooted";
+  if (stored_mount_id_ != 0 && mount_id_ != 0)
+    return stored_mount_id_ == mount_id_
+               ? nullptr
+               : "the filesystem has been mounted again";
+  if (opt_.warm_restart == WarmRestart::kBootOnly) return nullptr;
+  return "no unique mount id on this kernel (needs Linux 6.8); "
+         "DFKV_SLAB_WARM_RESTART=boot accepts the boot id alone";
+}
+
+// The previous process is gone but the kernel is not, so its record and
+// payload writes are in the page cache or on disk. Push them out now: a
+// writeback error nobody has seen yet surfaces here instead of serving stale
+// data later, and the table is durable before anything new builds on it.
+bool DiskSlabStore::SyncForWarmRestart() {
+  if (::fdatasync(table_fd_) != 0) return false;
+  for (int fd : extent_fds_)
+    if (fd >= 0 && ::fdatasync(fd) != 0) return false;
+  return true;
+}
+
+bool DiskSlabStore::RecoverUnclean() {
+  const char* why_reset = WhyNotWarm();
+  if (why_reset == nullptr && !SyncForWarmRestart())
+    why_reset = "the table or an extent failed to sync";
+  if (why_reset == nullptr) {
+    bool inconsistent = false;
+    if (Rebuild(&inconsistent)) {
+      warm_restarts_.fetch_add(1, std::memory_order_relaxed);
+      DFKV_LOG_INFO("slab " + opt_.dir +
+                    ": previous run did not shut down cleanly, same boot; kept " +
+                    std::to_string(alloc_->Count()) + " objects");
+      return true;
+    }
+    if (!inconsistent) return false;  // I/O failure: fails startup as always
+    why_reset = "slots.tbl is not self-consistent";
+    startup_error_.clear();
+  }
+  DFKV_LOG_WARN("slab " + opt_.dir +
+                ": previous run did not shut down cleanly; cache reset (" +
+                why_reset + ")");
+  return ResetUncleanEpoch() && Rebuild();
+}
+
 bool DiskSlabStore::ResetUncleanEpoch() {
+  // The table is about to be destroyed piecemeal. Withdraw the identity first,
+  // so that a process killed half-way never has the remainder mistaken for a
+  // table worth keeping.
+  if (!WriteEpochState(kStateDirty, run_epoch_, /*with_identity=*/false)) {
+    const int saved_errno = errno;
+    FailMetadata();
+    return SetStartupErrno("cannot persist the reset marker in slab_state",
+                           saved_errno);
+  }
   const uint64_t bytes =
       static_cast<uint64_t>(num_extents_) * max_slots_per_extent_ * kRecBytes;
   const size_t chunk_bytes =
@@ -795,14 +1005,24 @@ bool DiskSlabStore::MarkDirtyEpoch() {
   if (run_epoch_ == std::numeric_limits<uint64_t>::max())
     return SetStartupError("slab_state epoch exhausted");
   ++run_epoch_;
-  if (WriteEpochState(kStateDirty, run_epoch_)) return true;
+  // The table has just been rebuilt (or reset), so this is the one state that
+  // may carry the identity. It is recorded whatever warm_restart says: the
+  // policy is applied by the run that finds the state, not the one that wrote it.
+  if (WriteEpochState(kStateDirty, run_epoch_, /*with_identity=*/true)) {
+    identity_recorded_.store(true, std::memory_order_release);
+    uint8_t poisoned[64];
+    EncodeEpochState(poisoned, kStateDirty, run_epoch_, nullptr, 0);
+    crash_slot_ = ArmCrashSlot(state_fd_, poisoned);
+    return true;
+  }
   const int saved_errno = errno;
   FailMetadata();
   return SetStartupErrno("cannot persist dirty slab_state", saved_errno);
 }
 
 bool DiskSlabStore::MarkCleanEpoch() {
-  if (WriteEpochState(kStateClean, run_epoch_)) return true;
+  if (WriteEpochState(kStateClean, run_epoch_, /*with_identity=*/false))
+    return true;
   return FailMetadata();
 }
 
@@ -813,7 +1033,7 @@ bool DiskSlabStore::SyncPayloads() {
   return true;
 }
 
-bool DiskSlabStore::Rebuild() {
+bool DiskSlabStore::Rebuild(bool* inconsistent) {
   constexpr size_t kScanChunkBytes = 1u << 20;
   enum class ScanResult { kDone, kUnsupported, kError };
 
@@ -1028,8 +1248,10 @@ bool DiskSlabStore::Rebuild() {
   rebuild_corrupt_records_ = corrupt_records;
   rebuild_rejected_records_ = rejected_records;
 
-  if (!alloc_->RestoreBulk(entries))
+  if (!alloc_->RestoreBulk(entries)) {
+    if (inconsistent != nullptr) *inconsistent = true;
     return SetStartupError("inconsistent slots.tbl records during bulk rebuild");
+  }
 
   for (const auto& entry : entries)
     CommitPayloadLocked(entry.key.Filename(),
@@ -1054,6 +1276,7 @@ bool DiskSlabStore::Rebuild() {
 bool DiskSlabStore::FailMetadata() {
   metadata_io_errors_.fetch_add(1, std::memory_order_relaxed);
   metadata_failed_.store(true, std::memory_order_release);
+  PoisonEpochState();
   return false;
 }
 
@@ -2009,6 +2232,7 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   st.metadata_io_errors =
       metadata_io_errors_.load(std::memory_order_relaxed);
   st.unclean_resets = unclean_resets_.load(std::memory_order_relaxed);
+  st.warm_restarts = warm_restarts_.load(std::memory_order_relaxed);
   st.eviction_record_clears =
       eviction_record_clears_.load(std::memory_order_relaxed);
   st.record_writes = record_writes_.load(std::memory_order_relaxed);

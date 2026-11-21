@@ -644,6 +644,9 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_unclean_resets_total", "counter",
            "Dirty prior epochs discarded during cold recovery",
            ss.unclean_resets);
+    metric("dfkv_slab_warm_restarts_total", "counter",
+           "Dirty prior epochs whose table was kept (same boot, same mount)",
+           ss.warm_restarts);
     metric("dfkv_slab_eviction_record_clears_total", "counter",
            "Slot records durably cleared before allocator reuse",
            ss.eviction_record_clears);

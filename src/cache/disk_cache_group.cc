@@ -184,6 +184,29 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
       return;
     }
   }
+  // After an unclean exit: keep the table when that is provably safe (auto,
+  // also with the boot id alone: boot) or always reset it (off). See
+  // DiskSlabStore::Options::WarmRestart.
+  using SlabWarmRestart = DiskSlabStore::Options::WarmRestart;
+  SlabWarmRestart slab_warm = SlabWarmRestart::kAuto;
+  if (const char* mode = std::getenv("DFKV_SLAB_WARM_RESTART")) {
+    if (std::strcmp(mode, "auto") == 0) {
+      slab_warm = SlabWarmRestart::kAuto;
+    } else if (std::strcmp(mode, "boot") == 0) {
+      slab_warm = SlabWarmRestart::kBootOnly;
+    } else if (std::strcmp(mode, "off") == 0) {
+      slab_warm = SlabWarmRestart::kOff;
+    } else if (use_slab) {
+      fail("DFKV_SLAB_WARM_RESTART must be 'auto', 'boot' or 'off'");
+      return;
+    }
+  }
+  if (use_slab)
+    config_dump::RecordResolved(
+        "DFKV_SLAB_WARM_RESTART",
+        slab_warm == SlabWarmRestart::kAuto
+            ? "auto"
+            : slab_warm == SlabWarmRestart::kBootOnly ? "boot" : "off");
   uint64_t slab_gran = 0;
   if (const char* value = std::getenv("DFKV_SLAB_GRANULARITY")) {
     if (!ParseUnsigned(value, std::numeric_limits<uint32_t>::max(),
@@ -252,6 +275,7 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
       if (slab_gran) so.slot_granularity = slab_gran;
       so.table_sync_ms = sync_ms;
       so.reclaim_interval_ms = reclaim_ms;
+      so.warm_restart = slab_warm;
       auto slab = std::make_unique<DiskSlabStore>(so);
       slabs_.push_back(slab.get());
       if (!slab->DirectWritesActive()) write_mode_ = "buffered";
@@ -642,6 +666,7 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.uring_write_batches += st.uring_write_batches;
     sum.metadata_io_errors += st.metadata_io_errors;
     sum.unclean_resets += st.unclean_resets;
+    sum.warm_restarts += st.warm_restarts;
     sum.eviction_record_clears += st.eviction_record_clears;
     sum.record_writes += st.record_writes;
     sum.table_rebuilt += st.table_rebuilt;
