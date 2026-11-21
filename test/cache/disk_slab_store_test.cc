@@ -1120,6 +1120,26 @@ TEST_F(DiskSlabTest, RemoveInvalidatesTheRecordWhileReadersAreInFlight) {
   EXPECT_FALSE(dfkv::DiskSlabStoreTestPeer::HasValidRecordOnDisk(&s, K(80)));
 }
 
+// If that invalidation cannot be written, the Remove must not be acknowledged.
+TEST_F(DiskSlabTest, RemoveFailsWhenItCannotInvalidateUnderInflightReaders) {
+  auto opts = Opts(1 << 20, 1 << 20, 4096);
+  opts.table_sync_ms = 0;
+  opts.reclaim_interval_ms = 0;
+  bool ok = false;
+  DiskSlabStore s(opts, &ok);
+  ASSERT_TRUE(ok);
+  const std::string value(4096, 'a');
+  ASSERT_EQ(s.Cache(K(82), value.data(), value.size()), Status::kOk);
+  dfkv::ReadLease lease;
+  ASSERT_EQ(s.RangeDirectPrep(K(82), 0, 0, 1 << 20, &lease), Status::kOk);
+  dfkv::DiskSlabStoreTestPeer::SetRecordWriteHook(&s, [] { return false; });
+  EXPECT_EQ(s.Remove(K(82)), Status::kIOError);
+  EXPECT_FALSE(s.Healthy());
+  EXPECT_TRUE(dfkv::DiskSlabStoreTestPeer::HasValidRecordOnDisk(&s, K(82)))
+      << "the record is untouched, which is why the Remove may not succeed";
+  dfkv::DiskSlabStoreTestPeer::SetRecordWriteHook(&s, {});
+}
+
 // The same rule for a write in flight: the writer that a Remove cancelled must
 // not put a valid record into slots.tbl after that Remove returned. It used to
 // write the record before it learned about the Remove and invalidate it a
@@ -1159,7 +1179,7 @@ TEST_F(DiskSlabTest, WriteCancelledByRemoveNeverWritesAValidRecord) {
       }
     });
     payload_gate.WaitEntered();
-    ASSERT_EQ(s.Remove(K(81)), Status::kOk);  // deferred behind the write
+    EXPECT_EQ(s.Remove(K(81)), Status::kOk);  // deferred behind the write
     remove_returned.store(true);
     payload_gate.Release(true);
     writer.join();
@@ -1508,9 +1528,13 @@ TEST_F(DiskSlabTest, DuplicateSharesLeaderMetadataFailure) {
   bool ok = false;
   DiskSlabStore s(opts, &ok);
   ASSERT_TRUE(ok);
+  // The leader is held in its payload write, outside the store mutex, so the
+  // second writer can join its flight. The record write then fails without
+  // blocking: it runs at commit, under the mutex.
   HookGate gate;
-  dfkv::DiskSlabStoreTestPeer::SetRecordWriteHook(
+  dfkv::DiskSlabStoreTestPeer::SetPayloadWriteHook(
       &s, [&gate] { return gate.Run(); });
+  dfkv::DiskSlabStoreTestPeer::SetRecordWriteHook(&s, [] { return false; });
   std::string value(3000, 'm');
   Status leader = Status::kInvalid;
   Status follower = Status::kInvalid;
@@ -1525,7 +1549,7 @@ TEST_F(DiskSlabTest, DuplicateSharesLeaderMetadataFailure) {
   });
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
   EXPECT_FALSE(follower_done.load(std::memory_order_acquire));
-  gate.Release(false);
+  gate.Release(true);
   first.join();
   second.join();
   EXPECT_EQ(leader, Status::kIOError);

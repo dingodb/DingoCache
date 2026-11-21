@@ -271,10 +271,12 @@ class DiskSlabStore : public StoreEngine {
   bool AcquireForRead(const BlockKey& key, const std::string& fn,
                       SlabAllocator::SlotRef* ref, uint32_t* plen);
   // Drop one in-flight hold on fn (unpin + count). The LAST releaser performs
-  // the durable invalidation for a Remove that arrived while I/O was active.
-  // SlabAllocator itself also defers pinned removal, but this caller-level state
-  // is still required to order the slots.tbl record before physical reuse.
-  // Call with mu_ held.
+  // the physical removal for a Remove that arrived while I/O was active. The
+  // record itself is already invalid by then (Remove invalidates a committed
+  // key before it returns, and a cancelled write never writes one); it is
+  // written once more here, which orders it before the slot can be reused.
+  // SlabAllocator itself also defers pinned removal, but this caller-level
+  // state is still required for that ordering. Call with mu_ held.
   bool ReleaseInflightLocked(const BlockKey& key, const std::string& fn);
   static void ReleaseReadLeaseThunk(void* owner, uint64_t token) noexcept;
   void ReleaseReadLease(uint64_t token) noexcept;
@@ -317,10 +319,11 @@ class DiskSlabStore : public StoreEngine {
   // A reserved-but-uncommitted key has exactly one leader. Scalar and batch
   // duplicates join this flight and observe its real commit result.
   std::unordered_map<std::string, std::shared_ptr<PutFlight>> put_flights_;
-  // Guards the in-memory maps and the allocate/lookup+pin step ONLY -- never
-  // held across payload I/O (a pin protects the slot from eviction in the
-  // unlocked window, inflight_/deferred_remove_ protect it from Remove;
-  // payload_len_ install after the write is the reader-visible commit).
+  // Guards the in-memory maps, the allocate/lookup+pin step and the 64 B
+  // slots.tbl record writes -- never held across payload I/O (a pin protects
+  // the slot from eviction in the unlocked window, inflight_/deferred_remove_
+  // protect it from Remove). The record write and the payload_len_ install
+  // form one critical section: that is the commit, on disk and for readers.
   mutable std::mutex mu_;
   uint64_t committed_payload_bytes_ = 0;  // under mu_
   bool ok_ = false;
@@ -335,6 +338,8 @@ class DiskSlabStore : public StoreEngine {
   std::atomic<uint64_t> bind_wipes_{0};
   std::atomic<uint64_t> metadata_io_errors_{0};
   std::function<bool()> payload_write_hook_for_test_;
+  // Runs under mu_ (records are written at commit): it must not call back into
+  // the store, and blocking in it blocks every operation on this disk.
   std::function<bool()> record_write_hook_for_test_;
   // Test-only seam (never set in production; same discipline as the hooks
   // above): when set, replaces EVERY CQE reap of the batched io_uring write
