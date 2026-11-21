@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Server: a tenant with a node quota can PUT over RDMA again when the RAM
+  tier is enabled. `CacheDirectForKey` gated both the RAM write-back branch and
+  the disk branch on "tenant has no quota", so a limited tenant skipped both:
+  every direct PUT returned `kCacheFull`, stored nothing, and was not counted
+  as an error or a quota rejection. The TCP entry was not affected. Limited
+  tenants still bypass RAM write-back admission and now fall through to the
+  quota-checked disk write, which reports `kQuotaExceeded` when over quota.
 - Client per-node stats: a shard timed at 0 us (sub-microsecond) no longer
   drops its rail from the `pernode-get`/`pernode-exist` line. The merge kept
   `dev` only from a shard strictly slower than the running maximum, so a

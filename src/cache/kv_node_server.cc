@@ -1251,12 +1251,15 @@ Status KvNodeServer::CacheDirectForKey(const BlockKey& key, char* data,
   // asynchronously — the 1 MiB memcpy was 44% of serve-thread CPU and
   // capped single-node PUT at 3.4 GB/s vs 4.4 GB/s direct-disk.
   Status st = Status::kCacheFull;
-  const bool quota_ok = !ram_ || group_.TenantQuotaBytes(key.tenant_hash) == 0;
+  // A tenant with a node quota never takes RAM write-back admission: its PUT
+  // result must reflect the quota-checked durable write. It still has to reach
+  // that write -- the disk group owns quota admission for every caller.
+  const bool unlimited = group_.TenantQuotaBytes(key.tenant_hash) == 0;
   bool needs_disk = true;
   // Write-back admits to the RAM arena first. RAM-ACK returns after the
   // flush-pinned value is visible; disk-ACK waits for the same flush result.
   // Only capacity bypass falls through; watermark rejection is terminal.
-  if (ram_write_back_ && ram_ && quota_ok) {
+  if (ram_write_back_ && ram_ && unlimited) {
     const RamTier::PutResult result =
         ram_ack_enabled_ ? ram_->PutWriteBack(key, data, len)
                          : ram_->PutCommitted(key, data, len);
@@ -1269,7 +1272,7 @@ Status KvNodeServer::CacheDirectForKey(const BlockKey& key, char* data,
       put_io_err_.fetch_add(1, std::memory_order_relaxed);
     }
   }
-  if (needs_disk && quota_ok) {
+  if (needs_disk) {
     st = group_.CacheDirect(key, data, len, cap);
     if (st == Status::kOk) {
       cache_put_.fetch_add(1, std::memory_order_relaxed);
