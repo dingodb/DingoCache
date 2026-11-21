@@ -732,6 +732,27 @@ void RdmaServer::Serve(int boot_fd) {
     ::close(boot_fd);
     return;
   }
+  // Declared ahead of every per-connection resource so that it unwinds after
+  // all of them: by the time dfkv_rdma_active_conns drops, this connection's
+  // endpoint, receive lease, source pins and segment accounting are released.
+  // Dropping the gauge first let an observer see "no connections" while the
+  // connection still held memory.
+  struct ActiveConnection {
+    std::atomic<uint64_t>* server = nullptr;
+    std::atomic<uint64_t>* rail = nullptr;
+    void Enter(std::atomic<uint64_t>* server_gauge,
+               std::atomic<uint64_t>* rail_gauge) {
+      server = server_gauge;
+      rail = rail_gauge;
+      server->fetch_add(1, std::memory_order_relaxed);
+      rail->fetch_add(1, std::memory_order_relaxed);
+    }
+    ~ActiveConnection() {
+      if (server == nullptr) return;
+      rail->fetch_sub(1, std::memory_order_relaxed);
+      server->fetch_sub(1, std::memory_order_relaxed);
+    }
+  } active_connection;
   // Leave margin within v2.28's ten-second bootstrap timeout.
   constexpr uint64_t kBootstrapPressureUs = 5000000;
   rdma::RecvSegmentPool::Lease recv_lease = AllocateReceiveWithPressure(
@@ -1539,8 +1560,7 @@ void RdmaServer::Serve(int boot_fd) {
   };
   bool fail = false;
   const int idle_ms = ServerIdleMs();
-  active_conns_.fetch_add(1, std::memory_order_relaxed);
-  rail_stats.active_conns.fetch_add(1, std::memory_order_relaxed);
+  active_connection.Enter(&active_conns_, &rail_stats.active_conns);
   // Failed WCs do not guarantee a meaningful opcode. Retain the raw provider
   // fields and both QP numbers for correlation with short-lived clients.
   auto log_completion_error = [&](const ibv_wc& wc, const char* loop,
@@ -1982,8 +2002,6 @@ void RdmaServer::Serve(int boot_fd) {
       ring.Drain();
     if (metric_inflight != 0)
       uring_inflight_.fetch_sub(metric_inflight, std::memory_order_relaxed);
-    rail_stats.active_conns.fetch_sub(1, std::memory_order_relaxed);
-    active_conns_.fetch_sub(1, std::memory_order_relaxed);
     { std::lock_guard<std::mutex> lk(conn_mu_); live_eps_.erase(&ep); }
     return;
   }
@@ -2038,8 +2056,6 @@ sync_serve_loop:;
       fail = true;
   }
   // Any prepared sends without completions destructor-abort below.
-  rail_stats.active_conns.fetch_sub(1, std::memory_order_relaxed);
-  active_conns_.fetch_sub(1, std::memory_order_relaxed);
   { std::lock_guard<std::mutex> lk(conn_mu_); live_eps_.erase(&ep); }
   // ep destruction fences inbound DMA and revokes exact MRs before operation
   // lease/pin RAII owners unwind.
