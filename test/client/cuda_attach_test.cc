@@ -78,6 +78,7 @@ void RunInFreshProcess(Scenario&& scenario) {
 class KindRecordingTransport : public Transport {
  public:
   DestinationMemoryKind last_kind = DestinationMemoryKind::kHost;
+  int reads = 0;
 
   Status Cache(const std::string&, const BlockKey&, const void*,
                size_t) override {
@@ -97,6 +98,7 @@ class KindRecordingTransport : public Transport {
                                 const std::vector<BlockKey>& keys,
                                 const std::vector<RangeDst>& dsts,
                                 std::vector<uint64_t>* value_lens) override {
+    ++reads;
     last_kind = dsts.at(0).memory_kind;
     value_lens->assign(keys.size(), 0);
     return std::vector<Status>(keys.size(), Status::kNotFound);
@@ -106,8 +108,11 @@ class KindRecordingTransport : public Transport {
 DestinationMemoryKind KindSeenByGet(KVClient* client,
                                     KindRecordingTransport* transport,
                                     void* destination) {
+  const int reads_before = transport->reads;
   size_t got = 0;
   client->GetAuto("absent", destination, 1, &got);
+  EXPECT_EQ(transport->reads, reads_before + 1)
+      << "the GET never reached the transport";
   return transport->last_kind;
 }
 
@@ -213,6 +218,15 @@ int main(int argc, char** argv) {
     ::execv("/proc/self/exe", argv);
     std::perror("cuda_attach_test: re-exec");
     return 127;
+  }
+  // Without the fake in place a by-name lookup would fall through to whatever
+  // libcuda.so.1 the system has; refuse to run rather than risk that.
+  if (::access(dfkv::kFakeLibrary, R_OK) != 0) {
+    std::fprintf(stderr,
+                 "cuda_attach_test: %s is missing; run from the build tree it "
+                 "was built in\n",
+                 dfkv::kFakeLibrary);
+    return 2;
   }
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
