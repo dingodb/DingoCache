@@ -761,6 +761,60 @@ TEST(RamTierWiring, DirtyWatermarkRejectsWithoutCallingDiskAndRecovers) {
 // PreparedRead unifies RAM and disk ownership. A RAM-resident value is returned
 // ready with a send pin; an absent key proceeds to disk after exactly one RAM
 // miss. Destroying the ready owner exercises connection-abort cleanup.
+// A tenant with a node quota skips RAM write-back admission. The direct (RDMA)
+// PUT entry must still reach the quota-checked disk write: before the fix both
+// branches were gated on "no quota", so every such PUT returned kCacheFull and
+// stored nothing while the TCP entry worked.
+TEST(RamTierWiring, LimitedTenantDirectPutReachesDiskWhenRamEnabled) {
+  for (bool ram_ack : {false, true}) {
+    auto dir = fs::temp_directory_path() /
+        ("dfkv_ramwire_quota_direct_" + std::to_string(ram_ack));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    ::unsetenv("DFKV_TENANT_QUOTAS_FILE");
+    ::setenv("DFKV_TENANT_DEFAULT_QUOTA_BYTES", "65536", 1);
+    DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+    auto server = KvNodeServerWiringTestPeer::Create(std::move(options));
+    ::unsetenv("DFKV_TENANT_DEFAULT_QUOTA_BYTES");
+    auto* node = server.get();
+    KvNodeServerWiringTestPeer::SetLimit(*server, 0);
+    std::atomic<size_t> flushes{0};
+    KvNodeServerWiringTestPeer::SetRam(
+        *server,
+        [&, node](const BlockKey& key, char* data, size_t len, size_t) {
+          flushes.fetch_add(1, std::memory_order_relaxed);
+          return KvNodeServerWiringTestPeer::Persist(*node, key, data, len) ==
+                 Status::kOk;
+        },
+        ram_ack);
+
+    const BlockKey key{8201, 0};
+    alignas(4096) char value[4096];
+    std::memset(value, 'q', sizeof(value));
+    EXPECT_EQ(server->CacheDirectForKey(key, value, 1024, sizeof(value)),
+              Status::kOk)
+        << "ram_ack=" << ram_ack;
+    std::string out;
+    EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, key, &out),
+              Status::kOk);
+    EXPECT_EQ(out, std::string(1024, 'q'));
+    // The limited tenant never entered RAM write-back.
+    EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, key));
+    EXPECT_EQ(flushes.load(std::memory_order_relaxed), 0u);
+
+    // Exceeding the quota is reported as such, not as a full cache.
+    const BlockKey big{8202, 0};
+    alignas(4096) static char large[128 * 1024];
+    std::memset(large, 'r', sizeof(large));
+    EXPECT_EQ(server->CacheDirectForKey(big, large, sizeof(large), sizeof(large)),
+              Status::kQuotaExceeded)
+        << "ram_ack=" << ram_ack;
+
+    server.reset();
+    fs::remove_all(dir);
+  }
+}
+
 TEST(RamTierWiring, PreparedReadCountsRamMissesAndOwnsRamPin) {
   ::setenv("DFKV_RAM_TIER", "1", 1);
   ::setenv("DFKV_RAM_TIER_BYTES", "8388608", 1);
