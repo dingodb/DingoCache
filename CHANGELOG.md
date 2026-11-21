@@ -7,10 +7,11 @@
   server killed by a stop timeout or the OOM killer comes back empty. With
   `DFKV_SLAB_WARM_RESTART=auto` the table is instead rebuilt as after a clean
   shutdown, provided that the boot id, the unique mount id (Linux 6.8) and the
-  directory recorded in `slab_state` still match, no "untrusted" marker was
-  left on `/dev/shm` (by a metadata I/O failure, by the new fatal-signal
-  handler when the server itself crashes, or by an unfinished recovery), the
-  filesystem is xfs, ext4 or tmpfs, and the table and extents sync cleanly.
+  directory recorded in `slab_state` still match, the previous run's trust
+  token is still on `/dev/shm` (a run gives it up on a metadata I/O failure,
+  during every table sync, in the new fatal-signal handler when the server
+  itself crashes, and while a recovery is unfinished), the filesystem is xfs,
+  ext4 or tmpfs, and the table and extents sync cleanly.
   Everything else still resets, and records that contradict each other reset
   on that path rather than failing startup. `boot` also accepts runs without
   a unique mount id; `off` is the default and the behaviour of 2.35. New

@@ -21,7 +21,9 @@
 // may then also be absent at any time, but what is present must still be right.
 //
 // Most restarts are inspected by a process that exits without shutting down,
-// so the next run again starts on a kept table: kept, killed, kept, ...
+// so the next run again starts on a kept table: kept, killed, kept, ... A kill
+// that lands inside a table sync finds the trust token taken back; that
+// restart resets, and then every key has to be gone.
 //
 // DFKV_SLAB_KILL_ITERATIONS sets the number of kills per variant (default: a
 // few seconds' worth in total; soak runs use thousands).
@@ -360,6 +362,7 @@ void KillUnderTraffic(Variant variant) {
     key_history.set_evictable(variant.undersized);
   std::mt19937 rng(20261122);
   uint64_t operations = 0, failed_puts = 0, verified = 0, kept_restarts = 0;
+  uint64_t resets = 0;
   bool direct_active = false;
   bool last_exit_unclean = false;  // how the previous process on `dir` ended
   for (int iteration = 0; iteration < iterations; ++iteration) {
@@ -378,7 +381,7 @@ void KillUnderTraffic(Variant variant) {
     ::close(report[1]);
 
     // Drain the report while the traffic runs; kill at a random moment after
-    // the first operation returned (so the kill lands in traffic, not in the
+    // the first PUT succeeded (so the kill lands in traffic, not in the
     // store's start), then read what is left in the pipe.
     std::vector<Note> notes;
     const auto kill_delay = std::chrono::milliseconds(rng() % 40);
@@ -408,7 +411,7 @@ void KillUnderTraffic(Variant variant) {
                  "kept table, after a clean one on a clean start";
           continue;
         }
-        if (note.done == kReturned &&
+        if (note.done == kReturned && note.op == kPut && note.ok != 0 &&
             kill_at == std::chrono::steady_clock::time_point::max())
           kill_at = std::chrono::steady_clock::now() + kill_delay;
         notes.push_back(note);
@@ -473,13 +476,19 @@ void KillUnderTraffic(Variant variant) {
     }
     last_exit_unclean = !inspect_here;
     ASSERT_TRUE(found.opened) << "the store did not start after the kill";
-    ASSERT_TRUE(found.kept) << "the table was reset instead of kept";
-    ++kept_restarts;
     direct_active = found.direct_active != 0;
+    // A kill that lands inside a table sync finds the trust token taken back,
+    // and the restart resets: everything is gone, which is always allowed.
+    if (found.kept) ++kept_restarts; else ++resets;
     for (uint32_t key = 0; key < kKeys; ++key) {
       const uint32_t actual = found.actual[key];
       ASSERT_NE(actual, kForeignBytes)
           << "key " << key << " returned torn bytes or another key's bytes";
+      if (!found.kept) {
+        ASSERT_EQ(actual, 0u) << "key " << key << " survived a reset";
+        history[key].Settle(0);
+        continue;
+      }
       ASSERT_TRUE(history[key].Allows(actual))
           << "key " << key << ": found version " << actual
           << " (0 = absent); the report only allows: "
@@ -490,16 +499,18 @@ void KillUnderTraffic(Variant variant) {
   }
   fs::remove_all(dir);
   std::printf("%s payload writes (O_DIRECT active: %s), %s store: kills=%d "
-              "kept_restarts=%llu returned_operations=%llu failed_puts=%llu "
-              "objects_verified=%llu\n",
+              "kept=%llu reset_in_table_sync=%llu returned_operations=%llu "
+              "failed_puts=%llu objects_verified=%llu\n",
               variant.direct ? "direct" : "buffered",
               direct_active ? "yes" : "no",
               variant.undersized ? "undersized" : "roomy", iterations,
               static_cast<unsigned long long>(kept_restarts),
+              static_cast<unsigned long long>(resets),
               static_cast<unsigned long long>(operations),
               static_cast<unsigned long long>(failed_puts),
               static_cast<unsigned long long>(verified));
-  EXPECT_GT(operations, 0u);
+  EXPECT_GT(kept_restarts, 0u) << "no restart ever kept its table";
+  EXPECT_GT(verified, 0u) << "no object was ever read back and checked";
 }
 
 TEST(SlabWarmRestartStress, KilledUnderBufferedTrafficKeepsWhatItAcknowledged) {

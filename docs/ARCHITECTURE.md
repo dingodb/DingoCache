@@ -301,25 +301,31 @@ size-class lattice and carves them into uniform slots:
     the boot id, the unique mount id (`STATX_MNT_ID_UNIQUE`, Linux 6.8) and the
     inode of the directory. They occupy bytes of the state record that were
     always zero, so 2.35 reads the new record and what 2.35 writes is reset.
-  - What withdraws it: an "untrusted" marker on a tmpfs (`/dev/shm`), keyed by
-    the directory. It lives exactly as long as the page cache and does not
-    depend on the cache disk. A run leaves it when a metadata operation fails
-    (the kernel reports a writeback error once and then forgets it), the
-    server's fatal-signal handler leaves it, and a start that keeps a table
-    leaves it before its first sync and removes it only when the recovery is
-    complete. A reset removes it.
+  - What it additionally takes: a trust token, a small file on a tmpfs
+    (`/dev/shm`) named after the directory and holding the run's epoch. A run
+    holds it exactly while it vouches for its table: it is granted once the
+    table has been rebuilt, and taken back when a metadata operation fails
+    (the kernel reports a writeback error once and then forgets it), around
+    every sync of the table (a process killed inside `fdatasync` consumes the
+    error without seeing it), by the server's fatal-signal handler, and when a
+    start begins to keep a table, until that recovery is complete. Keeping
+    requires the token of the run that wrote the dirty state. A tmpfs is wiped
+    exactly when the host's page cache is and does not depend on the cache
+    disk; because the token has to be present, losing it for any other reason
+    -- a container's private `/dev/shm`, a cleanup -- only costs a reset.
   - Before the rebuild, the table and every extent are synced once (an unseen
     writeback error surfaces there) and must be on the directory's filesystem,
     which must be xfs, ext4 or tmpfs.
   - Everything else resets: a reboot or power loss (records of reused slots may
     never have reached the disk, and payloads carry no checksum), another mount
     or mount namespace, a copied directory, a directory that could not be
-    locked, no tmpfs for the marker, records that contradict each other.
+    locked, no tmpfs for the token, records that contradict each other.
   `boot` additionally accepts a run that had no unique mount id. A filesystem
   that died and was mounted again without a reboot is then caught only if the
-  old process saw an I/O error before it went away; if it did not, record
-  writes since the last table sync -- and buffered payload writes since the
-  kernel's last writeback -- may be missing.
+  old process noticed before it went away -- an I/O error, or a table sync in
+  progress, either of which takes the token back; if it did not, record writes
+  since the last table sync, and buffered payload writes since the kernel's
+  last writeback, may be missing.
 - **Watermark eviction:** above-high occupancy starts bounded global slot
   reclamation toward low. New objects and successful GET/Pin operations move
   behind the global scan cursor; class-local scans use the same admission/read

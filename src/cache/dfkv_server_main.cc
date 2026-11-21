@@ -35,14 +35,14 @@ using dfkv::Status;
 static volatile sig_atomic_t g_stop = 0;
 static void OnSig(int) { g_stop = 1; }
 
-// A crash of the server itself: have every slab store leave its "untrusted"
-// marker before the process dies, so the next start resets those caches
+// A crash of the server itself: have every slab store take back its trust
+// token before the process dies, so the next start resets those caches
 // instead of keeping tables a misbehaving process wrote. SIGKILL (OOM, stop
 // timeout) never gets here, and does not need to. A stack overflow does not
 // either (no alternate stack) and is then treated like a kill.
 static struct sigaction g_previous_fatal[NSIG];
 static void OnFatalSignal(int sig, siginfo_t* info, void*) {
-  dfkv::DiskSlabStore::MarkAllUntrustedForCrash();
+  dfkv::DiskSlabStore::RevokeAllTrustForCrash();
   // Hand the signal back to whoever had it before (the default action, or a
   // sanitizer's reporter). A fault raised by the kernel re-triggers at the
   // same instruction once this returns, with its real address; one that was

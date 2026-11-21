@@ -82,13 +82,13 @@ std::array<uint8_t, 16> ReadBootId() {
 // mounted again, which is the one way the page cache can lose record writes
 // while the boot id stays the same. 0 = the kernel does not provide it.
 // The raw syscall and field offsets keep this independent of libc headers.
-uint64_t ReadUniqueMountId(const std::string& dir) {
+uint64_t ReadUniqueMountId(int dir_fd) {
 #ifdef SYS_statx
   constexpr unsigned kStatxMntIdUnique = 0x00004000u;
   constexpr size_t kMaskOffset = 0, kMntIdOffset = 144;
   alignas(8) unsigned char stx[256];
   std::memset(stx, 0, sizeof(stx));
-  if (::syscall(SYS_statx, AT_FDCWD, dir.c_str(), 0, kStatxMntIdUnique, stx) != 0)
+  if (::syscall(SYS_statx, dir_fd, "", AT_EMPTY_PATH, kStatxMntIdUnique, stx) != 0)
     return 0;
   uint32_t mask = 0;
   uint64_t mount_id = 0;
@@ -96,7 +96,7 @@ uint64_t ReadUniqueMountId(const std::string& dir) {
   std::memcpy(&mount_id, stx + kMntIdOffset, sizeof(mount_id));
   return (mask & kStatxMntIdUnique) != 0 ? mount_id : 0;
 #else
-  (void)dir;
+  (void)dir_fd;
   return 0;
 #endif
 }
@@ -119,9 +119,9 @@ bool PageCacheLivesWithKernel(int fd) {
   }
 }
 
-// A marker directory is usable if it exists and -- unless the caller chose it
+// A token directory is usable if it exists and -- unless the caller chose it
 // explicitly -- is a tmpfs, i.e. is wiped exactly when the page cache is.
-bool MarkerDirUsable(const std::string& dir, bool chosen_explicitly) {
+bool TokenDirUsable(const std::string& dir, bool chosen_explicitly) {
   struct stat st {};
   if (::stat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) return false;
   if (chosen_explicitly) return true;
@@ -146,8 +146,8 @@ void EncodeEpochState(uint8_t* record, uint32_t state, uint64_t epoch,
   net::PutU32(reinterpret_cast<char*>(record) + 60, Crc32(record, 60));
 }
 
-// Marker paths a fatal-signal handler creates
-// (DiskSlabStore::MarkAllUntrustedForCrash). state: 0 free, 1 being filled or
+// Token paths a fatal-signal handler unlinks
+// (DiskSlabStore::RevokeAllTrustForCrash). state: 0 free, 1 being filled or
 // cleared, 2 armed with `path`.
 struct CrashSlot {
   std::atomic<int> state{0};
@@ -155,6 +155,9 @@ struct CrashSlot {
 };
 constexpr int kCrashSlots = 256;
 CrashSlot g_crash_slots[kCrashSlots];
+// Set by the fatal-signal handler: no token may be (re)created any more, even
+// by a thread that is still finishing a table sync while the process dies.
+std::atomic<bool> g_crashing{false};
 
 int ArmCrashSlot(const std::string& path) {
   if (path.empty() || path.size() >= sizeof(g_crash_slots[0].path)) return -1;
@@ -295,7 +298,7 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
     if (!PwriteAll(table_fd_, zero_extent_records_.data(),
                    zero_extent_records_.size(), TableOffset(e, 0)))
       return FailMetadata();
-    if (::fdatasync(table_fd_) != 0) return FailMetadata();
+    if (!SyncTableFile()) return FailMetadata();
     bind_wipes_.fetch_add(1, std::memory_order_relaxed);
     return true;
   };
@@ -396,16 +399,16 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   ok_ = OpenOrInit();
   if (ok_) {
     boot_id_ = opt_.boot_id ? *opt_.boot_id : ReadBootId();
-    mount_id_ = opt_.mount_id ? *opt_.mount_id : ReadUniqueMountId(opt_.dir);
+    mount_id_ = opt_.mount_id ? *opt_.mount_id : ReadUniqueMountId(dir_fd_);
     const bool explicit_dir = !opt_.trust_marker_dir.empty();
-    const std::string marker_dir =
+    const std::string token_dir =
         explicit_dir ? opt_.trust_marker_dir : std::string("/dev/shm");
-    if (MarkerDirUsable(marker_dir, explicit_dir)) {
+    if (TokenDirUsable(token_dir, explicit_dir)) {
       char name[80];
-      std::snprintf(name, sizeof(name), "/dfkv-slab-untrusted.%llx.%llx",
+      std::snprintf(name, sizeof(name), "/dfkv-slab-trusted.%llx.%llx",
                     static_cast<unsigned long long>(dir_dev_),
                     static_cast<unsigned long long>(dir_ino_));
-      marker_path_ = marker_dir + name;
+      token_path_ = token_dir + name;
     }
   }
   if (ok_) ok_ = unclean_start_ ? RecoverUnclean() : Rebuild();
@@ -473,17 +476,22 @@ DiskSlabStore::~DiskSlabStore() {
     sync_thread_.join();
   }
   bool clean = Healthy();
+  // Extents only hold dirty pages if this run wrote payloads buffered; then
+  // their sync can consume a writeback error just as the table's can.
+  if (clean && buffered_payload_written_.load(std::memory_order_acquire))
+    RevokeTrust(/*forfeit=*/true);
   if (clean) clean = SyncPayloads();
   if (clean)
     clean = SyncTable(record_writes_.load(std::memory_order_relaxed));
-  // A store that failed and could not say so yet gets one more chance.
-  if (!Healthy() && identity_recorded_.load(std::memory_order_acquire))
-    MarkUntrusted();
-  // From here a crash no longer marks this store: the table and payloads are
+  // A store that failed makes sure its token is gone (and retries a revoke
+  // that did not work the first time).
+  if (!Healthy()) RevokeTrust(/*forfeit=*/true);
+  // From here a crash no longer touches the token: the table and payloads are
   // synced, so whichever state ends up on disk is true.
   DisarmCrashSlot(crash_slot_);
   crash_slot_ = -1;
-  if (clean) MarkCleanEpoch();
+  // A clean start needs no token.
+  if (clean && MarkCleanEpoch()) RevokeTrust(/*forfeit=*/true);
   for (int fd : extent_fds_)
     if (fd >= 0) ::close(fd);
   for (int fd : extent_dio_fds_)
@@ -877,40 +885,93 @@ bool DiskSlabStore::WriteEpochState(uint32_t state, uint64_t epoch,
          ::fdatasync(state_fd_) == 0;
 }
 
-// This run can no longer vouch for the table: a metadata operation failed, so
-// what the page cache holds may not match the disk, and the kernel reports a
-// writeback error only once. The fact is recorded where the failing disk
-// cannot lose it -- a marker on tmpfs, gone exactly when the page cache is --
-// and, best effort, by withdrawing the identity from slab_state as well.
-bool DiskSlabStore::MarkUntrusted() {
-  if (untrusted_marked_.load(std::memory_order_acquire)) return true;
-  bool marked = false;
-  if (!marker_path_.empty()) {
-    const int fd = ::open(marker_path_.c_str(),
-                          O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
-    if (fd >= 0) {
-      ::close(fd);
-      marked = true;
-    }
+// The trust token: an 8-byte file on a tmpfs, named after the directory,
+// holding the epoch of the run that vouches for the table. Keeping a table
+// requires the token of the run that wrote the dirty state. It is granted once
+// the table has been rebuilt and the identity is durable, and taken back
+// - when a metadata operation fails: what the page cache holds may no longer
+//   match the disk, and the kernel reports a writeback error only once;
+// - around every sync of the table, for the same reason: a process killed
+//   inside fdatasync consumes the error without ever seeing it;
+// - when a start begins to keep a table, until that recovery is complete;
+// - by the server's fatal-signal handler.
+// A tmpfs is wiped exactly when the page cache is, and does not depend on the
+// cache disk. Because the token must be PRESENT, losing the tmpfs contents for
+// any reason (a private /dev/shm of a recreated container, a cleanup) only
+// ever costs a reset.
+bool DiskSlabStore::GrantTrust() {
+  std::lock_guard<std::mutex> lk(trust_mu_);
+  if (token_path_.empty() || trust_forfeited_ || table_syncs_in_flight_ > 0 ||
+      g_crashing.load())
+    return false;
+  const int fd = ::open(token_path_.c_str(),
+                        O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
+                        0600);
+  if (fd < 0) return false;
+  char epoch[8];
+  net::PutU64(epoch, run_epoch_);
+  const bool written = PwriteAll(fd, epoch, sizeof(epoch), 0);
+  ::close(fd);
+  // The handler sets the flag before it unlinks, so whichever of the two ran
+  // last, the token is gone.
+  if (!written || g_crashing.load()) {
+    ::unlink(token_path_.c_str());
+    return false;
   }
-  // Without a marker directory the on-disk state is the only record there is.
-  const bool withdrawn =
-      WriteEpochState(kStateDirty, run_epoch_, /*with_identity=*/false);
-  if (marker_path_.empty()) marked = withdrawn;
-  if (marked) {
-    untrusted_marked_.store(true, std::memory_order_release);
-  } else {
-    DFKV_LOG_ERROR("slab " + opt_.dir +
-                   ": cannot record that this cache is no longer trustworthy; "
-                   "will retry. Do not restart with DFKV_SLAB_WARM_RESTART "
-                   "enabled before it is reset");
-  }
-  return marked;
+  return true;
 }
 
-void DiskSlabStore::ClearUntrustedMarker() {
-  if (!marker_path_.empty()) ::unlink(marker_path_.c_str());
-  untrusted_marked_.store(false, std::memory_order_release);
+bool DiskSlabStore::RevokeTrust(bool forfeit) {
+  std::lock_guard<std::mutex> lk(trust_mu_);
+  if (forfeit) trust_forfeited_ = true;
+  bool revoked = token_path_.empty() ||
+                 ::unlink(token_path_.c_str()) == 0 || errno == ENOENT;
+  // A token that cannot be removed (it never should be the case on a tmpfs)
+  // leaves the identity in slab_state as the only thing to take back.
+  if (!revoked)
+    revoked = WriteEpochState(kStateDirty, run_epoch_, /*with_identity=*/false);
+  if (!revoked && !trust_revoke_failed_)
+    DFKV_LOG_ERROR("slab " + opt_.dir +
+                   ": cannot take back the trust token " + token_path_ +
+                   "; remove it before restarting with DFKV_SLAB_WARM_RESTART "
+                   "enabled");
+  trust_revoke_failed_ = !revoked;
+  return revoked;
+}
+
+bool DiskSlabStore::TrustTokenMatches(uint64_t epoch) const {
+  if (token_path_.empty()) return false;
+  const int fd = ::open(token_path_.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) return false;
+  char stored[8];
+  const bool matches = PreadAll(fd, stored, sizeof(stored), 0) &&
+                       net::GetU64(stored) == epoch;
+  ::close(fd);
+  return matches;
+}
+
+bool DiskSlabStore::SyncTableFile() {
+  // Before the identity is recorded (startup) there is no token to manage.
+  const bool vouching = identity_recorded_.load(std::memory_order_acquire);
+  if (vouching) {
+    std::lock_guard<std::mutex> lk(trust_mu_);
+    if (table_syncs_in_flight_++ == 0 && !token_path_.empty())
+      ::unlink(token_path_.c_str());
+  }
+  if (table_sync_hook_for_test_) table_sync_hook_for_test_();
+  const bool synced = ::fdatasync(table_fd_) == 0;
+  if (vouching) {
+    bool last = false;
+    {
+      std::lock_guard<std::mutex> lk(trust_mu_);
+      // A failed sync is final right here, not when the caller gets around to
+      // FailMetadata: another sync finishing in between must not re-grant.
+      if (!synced) trust_forfeited_ = true;
+      last = --table_syncs_in_flight_ == 0;
+    }
+    if (last && synced) GrantTrust();
+  }
+  return synced;
 }
 
 // One process per cache directory, taken before any file in it is opened. The
@@ -940,12 +1001,10 @@ bool DiskSlabStore::LockDirectory() {
   return true;
 }
 
-void DiskSlabStore::MarkAllUntrustedForCrash() noexcept {
-  for (CrashSlot& slot : g_crash_slots) {
-    if (slot.state.load() != 2) continue;
-    const int fd = ::open(slot.path, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
-    if (fd >= 0) ::close(fd);
-  }
+void DiskSlabStore::RevokeAllTrustForCrash() noexcept {
+  g_crashing.store(true);
+  for (CrashSlot& slot : g_crash_slots)
+    if (slot.state.load() == 2) ::unlink(slot.path);
 }
 
 bool DiskSlabStore::OpenEpochState(bool fresh) {
@@ -1009,11 +1068,12 @@ const char* DiskSlabStore::WhyNotWarm() const {
   if (opt_.warm_restart == WarmRestart::kOff)
     return "DFKV_SLAB_WARM_RESTART is off";
   if (!dir_locked_) return "the cache directory could not be locked";
-  if (marker_path_.empty())
-    return "no tmpfs to keep the untrusted marker on (/dev/shm)";
-  if (::access(marker_path_.c_str(), F_OK) == 0)
-    return "a storage failure, a crash or an unfinished recovery was recorded "
-           "for this cache since the last boot";
+  if (token_path_.empty()) return "no tmpfs for the trust token (/dev/shm)";
+  // run_epoch_ still is the epoch read from slab_state: the previous run's.
+  if (!TrustTokenMatches(run_epoch_))
+    return "the previous run's trust token is gone (a storage failure, a "
+           "crash, a table sync or a recovery in progress when it died, or "
+           "the tmpfs was cleared)";
   if (stored_boot_id_ == kNoBootId)
     return "the previous run left no boot id (an older release, a storage "
            "failure, or an interrupted reset)";
@@ -1045,6 +1105,7 @@ const char* DiskSlabStore::WhyNotWarm() const {
 // was checked.
 bool DiskSlabStore::SyncForWarmRestart() {
   const auto on_dir_filesystem = [this](int fd) {
+    if (!opt_.require_local_filesystem) return true;
     struct stat st {};
     return ::fstat(fd, &st) == 0 && static_cast<uint64_t>(st.st_dev) == dir_dev_;
   };
@@ -1060,11 +1121,10 @@ bool DiskSlabStore::RecoverUnclean() {
   const char* why_reset = WhyNotWarm();
   if (why_reset == nullptr) {
     // From here until MarkDirtyEpoch this run may consume a writeback error or
-    // die half-way; either must leave the next start with a reset. The marker
-    // says so before the first sync and is cleared only by a finished
-    // recovery.
-    if (!MarkUntrusted()) {
-      why_reset = "the untrusted marker could not be written";
+    // die half-way; either must leave the next start with a reset. So the
+    // token goes before the first sync; a finished recovery grants a new one.
+    if (!RevokeTrust(/*forfeit=*/false)) {
+      why_reset = "the trust token could not be taken back";
     } else {
       const auto started = std::chrono::steady_clock::now();
       if (!SyncForWarmRestart()) {
@@ -1099,9 +1159,10 @@ bool DiskSlabStore::RecoverUnclean() {
 }
 
 bool DiskSlabStore::ResetUncleanEpoch() {
-  // The table is about to be destroyed piecemeal. Withdraw the identity first,
-  // so that a process killed half-way never has the remainder mistaken for a
-  // table worth keeping.
+  // The table is about to be destroyed piecemeal. Take the token back and
+  // withdraw the identity first, so that a process killed half-way never has
+  // the remainder mistaken for a table worth keeping.
+  RevokeTrust(/*forfeit=*/false);
   if (!WriteEpochState(kStateDirty, run_epoch_, /*with_identity=*/false)) {
     const int saved_errno = errno;
     FailMetadata();
@@ -1142,9 +1203,9 @@ bool DiskSlabStore::MarkDirtyEpoch() {
   if (WriteEpochState(kStateDirty, run_epoch_, /*with_identity=*/true)) {
     identity_recorded_.store(true, std::memory_order_release);
     // The table this state describes is one this run rebuilt or reset in
-    // full, so an older marker has done its job.
-    ClearUntrustedMarker();
-    crash_slot_ = ArmCrashSlot(marker_path_);
+    // full: from here on it vouches for it.
+    crash_slot_ = ArmCrashSlot(token_path_);
+    GrantTrust();
     return true;
   }
   const int saved_errno = errno;
@@ -1408,16 +1469,17 @@ bool DiskSlabStore::Rebuild(bool* inconsistent) {
 bool DiskSlabStore::FailMetadata() {
   metadata_io_errors_.fetch_add(1, std::memory_order_relaxed);
   metadata_failed_.store(true, std::memory_order_release);
-  // Only a run that recorded its identity has anything to take back; before
+  // Only a run that recorded its identity has a token to take back; before
   // that the state on disk already leads to a reset (or was clean, and a
   // failed startup changes nothing).
-  if (identity_recorded_.load(std::memory_order_acquire)) MarkUntrusted();
+  if (identity_recorded_.load(std::memory_order_acquire))
+    RevokeTrust(/*forfeit=*/true);
   return false;
 }
 
 bool DiskSlabStore::SyncTable(uint64_t seen) {
   if (!Healthy()) return false;
-  if (::fdatasync(table_fd_) != 0) return FailMetadata();
+  if (!SyncTableFile()) return FailMetadata();
   synced_marker_ = seen;
   table_syncs_.fetch_add(1, std::memory_order_relaxed);
   return true;
@@ -1454,6 +1516,7 @@ bool DiskSlabStore::WritePayload(const SlabAllocator::SlotRef& r, const void* da
   if (payload_write_hook_for_test_ && !payload_write_hook_for_test_())
     return false;
   if (len == 0) return true;
+  buffered_payload_written_.store(true, std::memory_order_release);
   return PwriteAll(extent_fds_[r.extent], data, len, r.offset);
 }
 

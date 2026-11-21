@@ -80,22 +80,24 @@ class DiskSlabStore : public StoreEngine {
     //   kAuto     keep the table when the previous process demonstrably died
     //             with the kernel -- and so the page cache holding its last
     //             record writes -- still up: same boot id, same unique mount
-    //             id, same directory, no "untrusted" marker left by a storage
-    //             failure, a crash or an unfinished recovery, a supported
-    //             local filesystem, and a clean fdatasync of the table and
-    //             every extent now. Anything short of that resets as kOff.
+    //             id, same directory, its trust token still on the tmpfs, a
+    //             supported local filesystem, and a clean fdatasync of the
+    //             table and every extent now. Anything short of that resets
+    //             as kOff does.
     //   kBootOnly as kAuto, but a run that recorded no unique mount id (a
     //             kernel before Linux 6.8) is accepted on its boot id. A
     //             filesystem that died and was mounted again without a reboot
-    //             is then only caught if the old process saw an I/O error
-    //             before it went away (it leaves the marker).
+    //             is then only caught if the old process noticed -- an I/O
+    //             error, or a table sync in progress -- before it went away
+    //             (either takes the token back).
     // DiskCacheGroup resolves DFKV_SLAB_WARM_RESTART into this.
     enum class WarmRestart { kOff, kAuto, kBootOnly };
     WarmRestart warm_restart = WarmRestart::kOff;
-    // Where "this table is not to be trusted" markers go. They must live as
-    // long as the kernel's page cache and must not depend on the cache disk,
-    // which is the thing that just failed: a tmpfs. Empty = /dev/shm, which
-    // is only used if it really is a tmpfs; tests point this elsewhere.
+    // Where trust tokens go. A token says "the table of this directory may be
+    // kept"; a run holds one only while it can vouch for the table. It has to
+    // vanish with the kernel's page cache and must not depend on the cache
+    // disk, which is the thing that fails: a tmpfs. Empty = /dev/shm, used
+    // only if it really is a tmpfs; tests point this elsewhere.
     std::string trust_marker_dir;
     // Keeping a table also requires a filesystem known to keep written data
     // with the local kernel (xfs, ext4, tmpfs). Tests that run on whatever
@@ -257,12 +259,12 @@ class DiskSlabStore : public StoreEngine {
   }
   const std::string& StartupError() const override { return startup_error_; }
 
-  // For a fatal-signal handler: leaves the "untrusted" marker of every open
+  // For a fatal-signal handler: takes back the trust token of every open
   // store, so that the next start resets its table. A process that crashed on
   // its own may have misbehaved before it died, and payloads carry no checksum
-  // to catch that. Async-signal-safe: one open(2) per store on prepared paths,
-  // on a tmpfs, so it neither blocks on nor depends on the cache disks.
-  static void MarkAllUntrustedForCrash() noexcept;
+  // to catch that. Async-signal-safe: one unlink(2) per store on prepared
+  // paths, on a tmpfs, so it neither blocks on nor depends on the cache disks.
+  static void RevokeAllTrustForCrash() noexcept;
 
  private:
   friend class DiskSlabStoreTestPeer;
@@ -287,11 +289,18 @@ class DiskSlabStore : public StoreEngine {
   // with_identity stores this boot and mount in the record: only a dirty state
   // written after the table was rebuilt may carry them.
   bool WriteEpochState(uint32_t state, uint64_t epoch, bool with_identity);
-  // "Do not keep this table": the marker on tmpfs, plus -- best effort, it is
-  // the failing disk -- the identity withdrawn from slab_state. False while
-  // the marker could not be created; callers retry.
-  bool MarkUntrusted();
-  void ClearUntrustedMarker();
+  // The trust token on tmpfs: present, and carrying this run's epoch, exactly
+  // while the run vouches for the table (see Options::trust_marker_dir).
+  bool GrantTrust();
+  // forfeit: for good -- this run will not vouch for the table again. False
+  // only if the token could be neither removed nor the identity in slab_state
+  // withdrawn in its place; callers retry.
+  bool RevokeTrust(bool forfeit);
+  bool TrustTokenMatches(uint64_t epoch) const;
+  // fdatasync(table_fd_) with the token taken back for its duration: the
+  // kernel reports a writeback error once, to this very call, and a process
+  // killed inside it never gets to act on that.
+  bool SyncTableFile();
   bool MarkDirtyEpoch();
   bool MarkCleanEpoch();
   bool SyncPayloads();
@@ -366,11 +375,15 @@ class DiskSlabStore : public StoreEngine {
   int dir_fd_ = -1;                  // holds the directory lock
   bool dir_locked_ = false;
   uint64_t dir_dev_ = 0, dir_ino_ = 0;
-  std::string marker_path_;          // empty: no usable marker directory
+  std::string token_path_;           // empty: no usable tmpfs for tokens
   std::mutex state_mu_;              // serializes slab_state writes
   std::atomic<bool> identity_recorded_{false};  // slab_state carries it now
-  std::atomic<bool> untrusted_marked_{false};
-  int crash_slot_ = -1;              // MarkAllUntrustedForCrash registration
+  std::mutex trust_mu_;              // token + the three fields below
+  bool trust_forfeited_ = false;     // this run no longer vouches for the table
+  int table_syncs_in_flight_ = 0;    // the token is absent while > 0
+  bool trust_revoke_failed_ = false; // could not take the token back: retry
+  std::atomic<bool> buffered_payload_written_{false};  // extents may be dirty
+  int crash_slot_ = -1;              // RevokeAllTrustForCrash registration
   // Outstanding asynchronous leases. The opaque id remains entirely internal:
   // ReadLease destruction routes it back through ReleaseReadLeaseThunk.
   struct PrepHold { BlockKey key; std::string fn; };
@@ -410,6 +423,8 @@ class DiskSlabStore : public StoreEngine {
   std::atomic<uint64_t> bind_wipes_{0};
   std::atomic<uint64_t> metadata_io_errors_{0};
   std::function<bool()> payload_write_hook_for_test_;
+  // Runs inside SyncTableFile, after the token was taken back.
+  std::function<void()> table_sync_hook_for_test_;
   // Runs under mu_ (records are written at commit): it must not call back into
   // the store, and blocking in it blocks every operation on this disk.
   std::function<bool()> record_write_hook_for_test_;

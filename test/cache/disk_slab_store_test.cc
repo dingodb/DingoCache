@@ -94,6 +94,10 @@ class DiskSlabStoreTestPeer {
   static bool MarkCleanNow(DiskSlabStore* store) {
     return store->MarkCleanEpoch();
   }
+  static void SetTableSyncHook(DiskSlabStore* store,
+                               std::function<void()> hook) {
+    store->table_sync_hook_for_test_ = std::move(hook);
+  }
   // True iff slots.tbl holds a valid record for key right now. Reads the file,
   // not the allocator: this is what a rebuild after a restart would find.
   static bool HasValidRecordOnDisk(DiskSlabStore* store, const BlockKey& key) {
@@ -126,11 +130,23 @@ class DiskSlabTest : public ::testing::Test {
                                               ->current_test_info()->line()));
     fs::remove_all(dir_);
   }
-  void TearDown() override { fs::remove_all(dir_); }
+  void TearDown() override {
+    struct stat st {};
+    if (::stat(dir_.c_str(), &st) == 0) {  // the trust token of this directory
+      char name[80];
+      std::snprintf(name, sizeof(name), "dfkv-slab-trusted.%llx.%llx",
+                    static_cast<unsigned long long>(st.st_dev),
+                    static_cast<unsigned long long>(st.st_ino));
+      fs::remove(fs::temp_directory_path() / name);
+    }
+    fs::remove_all(dir_);
+  }
 
   DiskSlabStore::Options Opts(uint64_t cap, uint64_t extent, uint64_t gran) {
     DiskSlabStore::Options o;
     o.dir = dir_.string();
+    // Trust tokens next to the test directories, not in /dev/shm.
+    o.trust_marker_dir = fs::temp_directory_path().string();
     o.capacity_bytes = cap;
     o.extent_bytes = extent;
     o.slot_granularity = gran;
@@ -867,19 +883,19 @@ DiskSlabStore::Options WithIdentity(DiskSlabStore::Options options,
   boot_id.fill(boot);
   options.boot_id = boot_id;
   options.mount_id = mount;
-  // Markers next to the test directories rather than in /dev/shm, and no
+  // Tokens next to the test directories rather than in /dev/shm, and no
   // opinion about the filesystem the build machine keeps /tmp on.
   options.trust_marker_dir = fs::temp_directory_path().string();
   options.require_local_filesystem = false;
   return options;
 }
 
-// The marker a store leaves for `dir` when its table must not be kept.
-fs::path UntrustedMarker(const fs::path& dir) {
+// The token a store holds for `dir` while it vouches for its table.
+fs::path TrustToken(const fs::path& dir) {
   struct stat st {};
   if (::stat(dir.c_str(), &st) != 0) return {};
   char name[80];
-  std::snprintf(name, sizeof(name), "dfkv-slab-untrusted.%llx.%llx",
+  std::snprintf(name, sizeof(name), "dfkv-slab-trusted.%llx.%llx",
                 static_cast<unsigned long long>(st.st_dev),
                 static_cast<unsigned long long>(st.st_ino));
   return fs::temp_directory_path() / name;
@@ -1038,7 +1054,7 @@ TEST_F(DiskSlabTest, RemoveAcknowledgedBeforeTheCrashStaysRemoved) {
 // A run that hit a metadata failure can no longer vouch for what the page
 // cache holds, and the kernel will not repeat the error to the next process.
 // It cannot rely on the failing disk to remember that either: here slab_state
-// is unwritable too, so only the marker carries it.
+// is unwritable too, so only the token being gone carries it.
 TEST_F(DiskSlabTest, StorageFailureInThePreviousRunForcesAReset) {
   const auto options =
       WithIdentity(Opts(1 << 20, 1 << 20, 4096), WarmRestart::kAuto, 1, 7);
@@ -1063,7 +1079,7 @@ TEST_F(DiskSlabTest, CrashOfTheProcessItselfForcesAReset) {
       WithIdentity(Opts(1 << 20, 1 << 20, 4096), WarmRestart::kAuto, 1, 7);
   ASSERT_TRUE(CrashAfter(options, [](DiskSlabStore& store) {
     if (!PutFilled(store, 90, 'a')) return false;
-    DiskSlabStore::MarkAllUntrustedForCrash();
+    DiskSlabStore::RevokeAllTrustForCrash();
     return true;
   }));
   bool ok = false;
@@ -1113,29 +1129,76 @@ TEST_F(DiskSlabTest, InterruptedResetIsFinishedNotKept) {
   EXPECT_EQ(recovered.Count(), 0u);
 }
 
-// The record of "do not keep this" must not depend on the disk that failed,
-// and the kernel reports a writeback error only once. So it is a marker on a
-// tmpfs, and a start that keeps a table leaves it before its first sync and
-// removes it only when the recovery is complete.
-TEST_F(DiskSlabTest, MarkerLeftByAnEarlierRunForcesAReset) {
+// Whether a table may be kept must not depend on the disk that failed, and the
+// kernel reports a writeback error only once. So a run holds a token on a
+// tmpfs exactly while it vouches for its table, and keeping requires the token
+// of the run that wrote the dirty state.
+TEST_F(DiskSlabTest, RunHoldsItsTrustTokenWhileItVouchesForTheTable) {
   const auto options =
       WithIdentity(Opts(1 << 20, 1 << 20, 4096), WarmRestart::kAuto, 1, 7);
-  ASSERT_TRUE(CrashAfter(options, [](DiskSlabStore& store) {
-    return PutFilled(store, 90, 'a');
-  }));
-  const fs::path marker = UntrustedMarker(dir_);
-  ASSERT_FALSE(marker.empty());
-  ASSERT_FALSE(fs::exists(marker)) << "a healthy run leaves no marker";
-  { std::ofstream touch(marker); }
+  fs::path token;
   {
+    bool ok = false;
+    DiskSlabStore store(options, &ok);
+    ASSERT_TRUE(ok);
+    token = TrustToken(dir_);
+    ASSERT_FALSE(token.empty());
+    EXPECT_TRUE(fs::exists(token));
+    ASSERT_TRUE(PutFilled(store, 90, 'a'));
+    bool present_inside_sync = true;
+    dfkv::DiskSlabStoreTestPeer::SetTableSyncHook(
+        &store, [&] { present_inside_sync = fs::exists(token); });
+    ASSERT_TRUE(dfkv::DiskSlabStoreTestPeer::SyncTableNow(&store));
+    dfkv::DiskSlabStoreTestPeer::SetTableSyncHook(&store, {});
+    EXPECT_FALSE(present_inside_sync) << "a sync could consume an error unseen";
+    EXPECT_TRUE(fs::exists(token)) << "a clean sync gives the token back";
+  }
+  EXPECT_FALSE(fs::exists(token)) << "a clean shutdown needs no token";
+}
+
+TEST_F(DiskSlabTest, MissingOrForeignTrustTokenForcesAReset) {
+  for (const bool foreign : {false, true}) {
+    SCOPED_TRACE(foreign ? "token of another run" : "no token");
+    fs::remove_all(dir_);
+    const auto options =
+        WithIdentity(Opts(1 << 20, 1 << 20, 4096), WarmRestart::kAuto, 1, 7);
+    ASSERT_TRUE(CrashAfter(options, [](DiskSlabStore& store) {
+      return PutFilled(store, 90, 'a');
+    }));
+    const fs::path token = TrustToken(dir_);
+    ASSERT_TRUE(fs::exists(token)) << "the killed run was vouching";
+    if (foreign) {
+      std::ofstream other(token, std::ios::binary | std::ios::trunc);
+      other.write("\0\0\0\0\0\0\0\x7f", 8);
+    } else {
+      fs::remove(token);
+    }
     bool ok = false;
     DiskSlabStore recovered(options, &ok);
     ASSERT_TRUE(ok) << recovered.StartupError();
     EXPECT_EQ(recovered.GetStats().warm_restarts, 0u);
     EXPECT_EQ(recovered.GetStats().unclean_resets, 1u);
     EXPECT_EQ(recovered.Count(), 0u);
-    EXPECT_FALSE(fs::exists(marker)) << "the reset rebuilt trust";
   }
+}
+
+// A process killed inside the table's fdatasync has consumed whatever error
+// that call was about to return, and never got to act on it.
+TEST_F(DiskSlabTest, KilledInsideATableSyncForcesAReset) {
+  const auto options =
+      WithIdentity(Opts(1 << 20, 1 << 20, 4096), WarmRestart::kAuto, 1, 7);
+  ASSERT_TRUE(CrashAfter(options, [](DiskSlabStore& store) {
+    if (!PutFilled(store, 90, 'a')) return false;
+    dfkv::DiskSlabStoreTestPeer::SetTableSyncHook(&store, [] { ::_exit(0); });
+    dfkv::DiskSlabStoreTestPeer::SyncTableNow(&store);
+    return false;  // not reached
+  }));
+  bool ok = false;
+  DiskSlabStore recovered(options, &ok);
+  ASSERT_TRUE(ok) << recovered.StartupError();
+  EXPECT_EQ(recovered.GetStats().warm_restarts, 0u);
+  EXPECT_EQ(recovered.GetStats().unclean_resets, 1u);
+  EXPECT_EQ(recovered.Count(), 0u);
 }
 
 TEST_F(DiskSlabTest, WarmRecoveryThatDiesHalfWayForcesAReset) {
@@ -1162,7 +1225,7 @@ TEST_F(DiskSlabTest, WarmRecoveryThatDiesHalfWayForcesAReset) {
   ASSERT_TRUE(WIFEXITED(status));
   ASSERT_EQ(WEXITSTATUS(status), 0) << "the staged recovery was meant to fail";
   ASSERT_EQ(ValidRecordOffsets(dir_).size(), 2u) << "and to leave the table";
-  EXPECT_TRUE(fs::exists(UntrustedMarker(dir_)));
+  EXPECT_FALSE(fs::exists(TrustToken(dir_)));
 
   bool ok = false;
   DiskSlabStore recovered(options, &ok);
@@ -1172,8 +1235,8 @@ TEST_F(DiskSlabTest, WarmRecoveryThatDiesHalfWayForcesAReset) {
   EXPECT_EQ(recovered.Count(), 0u);
 }
 
-// Kept, killed again, kept again: the second run re-records its identity and
-// clears the marker, so nothing about the first kill lingers.
+// Kept, killed again, kept again: the second run records its own identity and
+// holds its own token, so nothing about the first kill lingers.
 TEST_F(DiskSlabTest, TwoUncleanExitsInARowAreBothKept) {
   const auto options =
       WithIdentity(Opts(1 << 20, 1 << 20, 4096), WarmRestart::kAuto, 1, 7);
@@ -1188,7 +1251,7 @@ TEST_F(DiskSlabTest, TwoUncleanExitsInARowAreBothKept) {
   DiskSlabStore recovered(options, &ok);
   ASSERT_TRUE(ok) << recovered.StartupError();
   EXPECT_EQ(recovered.GetStats().warm_restarts, 1u);
-  EXPECT_FALSE(fs::exists(UntrustedMarker(dir_)));
+  EXPECT_TRUE(fs::exists(TrustToken(dir_)));
   std::string out;
   EXPECT_EQ(recovered.Range(K(90), 0, 4096, &out), Status::kNotFound);
   ASSERT_EQ(recovered.Range(K(91), 0, 4096, &out), Status::kOk);
@@ -1254,6 +1317,7 @@ TEST_F(DiskSlabTest, UncleanExitWithTheRealSystemIdentity) {
   options.table_sync_ms = 0;
   options.reclaim_interval_ms = 0;
   options.warm_restart = WarmRestart::kAuto;
+  options.trust_marker_dir.clear();  // /dev/shm, if it is a tmpfs
   ASSERT_TRUE(CrashAfter(options, [](DiskSlabStore& store) {
     return PutFilled(store, 90, 'a');
   }));
