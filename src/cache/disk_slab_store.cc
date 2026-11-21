@@ -400,9 +400,9 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   if (ok_) {
     boot_id_ = opt_.boot_id ? *opt_.boot_id : ReadBootId();
     mount_id_ = opt_.mount_id ? *opt_.mount_id : ReadUniqueMountId(dir_fd_);
-    const bool explicit_dir = !opt_.trust_marker_dir.empty();
+    const bool explicit_dir = !opt_.trust_token_dir.empty();
     const std::string token_dir =
-        explicit_dir ? opt_.trust_marker_dir : std::string("/dev/shm");
+        explicit_dir ? opt_.trust_token_dir : std::string("/dev/shm");
     if (TokenDirUsable(token_dir, explicit_dir)) {
       char name[80];
       std::snprintf(name, sizeof(name), "/dfkv-slab-trusted.%llx.%llx",
@@ -479,19 +479,25 @@ DiskSlabStore::~DiskSlabStore() {
   // Extents only hold dirty pages if this run wrote payloads buffered; then
   // their sync can consume a writeback error just as the table's can.
   if (clean && buffered_payload_written_.load(std::memory_order_acquire))
-    RevokeTrust(/*forfeit=*/true);
+    RevokeTrust(/*forfeit=*/true, /*withdraw=*/true);
   if (clean) clean = SyncPayloads();
   if (clean)
     clean = SyncTable(record_writes_.load(std::memory_order_relaxed));
   // A store that failed makes sure its token is gone (and retries a revoke
   // that did not work the first time).
-  if (!Healthy()) RevokeTrust(/*forfeit=*/true);
+  // Only a run that got as far as recording its identity may touch the
+  // state: a start that failed on a clean state leaves it as it found it.
+  if (!Healthy())
+    RevokeTrust(/*forfeit=*/true,
+                /*withdraw=*/identity_recorded_.load(std::memory_order_acquire));
   // From here a crash no longer touches the token: the table and payloads are
   // synced, so whichever state ends up on disk is true.
   DisarmCrashSlot(crash_slot_);
   crash_slot_ = -1;
-  // A clean start needs no token.
-  if (clean && MarkCleanEpoch()) RevokeTrust(/*forfeit=*/true);
+  // A clean start needs no token. The state is clean now and stays so: a
+  // token that will not go away is harmless, the next run has another epoch.
+  if (clean && MarkCleanEpoch())
+    RevokeTrust(/*forfeit=*/true, /*withdraw=*/false);
   for (int fd : extent_fds_)
     if (fd >= 0) ::close(fd);
   for (int fd : extent_dio_fds_)
@@ -904,48 +910,76 @@ bool DiskSlabStore::GrantTrust() {
   if (token_path_.empty() || trust_forfeited_ || table_syncs_in_flight_ > 0 ||
       g_crashing.load())
     return false;
+  // Always a file of our own making: whatever sits at the path goes first, and
+  // O_EXCL refuses anything that could not be removed.
+  ::unlink(token_path_.c_str());
   const int fd = ::open(token_path_.c_str(),
-                        O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
+                        O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC,
                         0600);
-  if (fd < 0) return false;
-  char epoch[8];
-  net::PutU64(epoch, run_epoch_);
-  const bool written = PwriteAll(fd, epoch, sizeof(epoch), 0);
-  ::close(fd);
+  bool written = false;
+  if (fd >= 0) {
+    char epoch[8];
+    net::PutU64(epoch, run_epoch_);
+    written = PwriteAll(fd, epoch, sizeof(epoch), 0);
+    ::close(fd);
+  }
   // The handler sets the flag before it unlinks, so whichever of the two ran
   // last, the token is gone.
-  if (!written || g_crashing.load()) {
+  if (fd >= 0 && (!written || g_crashing.load())) {
     ::unlink(token_path_.c_str());
-    return false;
+    written = false;
   }
-  return true;
+  if (!written && !trust_failure_logged_) {
+    trust_failure_logged_ = true;
+    DFKV_LOG_WARN("slab " + opt_.dir + ": cannot create the trust token " +
+                  token_path_ + " (" + std::strerror(errno) +
+                  "); an unclean exit of this run will reset the cache");
+  }
+  trust_token_held_ = written;
+  return written;
 }
 
-bool DiskSlabStore::RevokeTrust(bool forfeit) {
+bool DiskSlabStore::RevokeTrust(bool forfeit, bool withdraw_identity_if_stuck) {
   std::lock_guard<std::mutex> lk(trust_mu_);
-  if (forfeit) trust_forfeited_ = true;
-  bool revoked = token_path_.empty() ||
-                 ::unlink(token_path_.c_str()) == 0 || errno == ENOENT;
-  // A token that cannot be removed (it never should be the case on a tmpfs)
-  // leaves the identity in slab_state as the only thing to take back.
-  if (!revoked)
-    revoked = WriteEpochState(kStateDirty, run_epoch_, /*with_identity=*/false);
-  if (!revoked && !trust_revoke_failed_)
-    DFKV_LOG_ERROR("slab " + opt_.dir +
-                   ": cannot take back the trust token " + token_path_ +
-                   "; remove it before restarting with DFKV_SLAB_WARM_RESTART "
-                   "enabled");
-  trust_revoke_failed_ = !revoked;
-  return revoked;
+  return RevokeTrustLocked(forfeit, withdraw_identity_if_stuck);
 }
 
+bool DiskSlabStore::RevokeTrustLocked(bool forfeit,
+                                      bool withdraw_identity_if_stuck) {
+  if (forfeit) trust_forfeited_ = true;
+  trust_token_held_ = false;
+  if (token_path_.empty() || ::unlink(token_path_.c_str()) == 0 ||
+      errno == ENOENT)
+    return true;
+  // Something sits at the token path that cannot be removed (it never should
+  // on a tmpfs: a foreign file in the sticky directory, a directory). It is
+  // not a token of ours -- TrustTokenMatches checks the owner -- but be sure:
+  // take the identity out of slab_state, where that state still carries one.
+  const bool withdrawn =
+      withdraw_identity_if_stuck &&
+      WriteEpochState(kStateDirty, run_epoch_, /*with_identity=*/false);
+  if (!trust_failure_logged_) {
+    trust_failure_logged_ = true;
+    DFKV_LOG_ERROR("slab " + opt_.dir + ": cannot remove " + token_path_ +
+                   "; remove it by hand, the cache cannot be kept across an "
+                   "unclean exit while it is there");
+  }
+  return withdrawn;
+}
+
+// Only a regular file of this user that nobody else can write counts: the
+// name and the epoch can be worked out by anyone who can read the directory.
 bool DiskSlabStore::TrustTokenMatches(uint64_t epoch) const {
   if (token_path_.empty()) return false;
   const int fd = ::open(token_path_.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
   if (fd < 0) return false;
+  struct stat st {};
   char stored[8];
-  const bool matches = PreadAll(fd, stored, sizeof(stored), 0) &&
-                       net::GetU64(stored) == epoch;
+  const bool matches =
+      ::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+      st.st_uid == ::geteuid() && (st.st_mode & (S_IWGRP | S_IWOTH)) == 0 &&
+      st.st_size == static_cast<off_t>(sizeof(stored)) &&
+      PreadAll(fd, stored, sizeof(stored), 0) && net::GetU64(stored) == epoch;
   ::close(fd);
   return matches;
 }
@@ -955,8 +989,11 @@ bool DiskSlabStore::SyncTableFile() {
   const bool vouching = identity_recorded_.load(std::memory_order_acquire);
   if (vouching) {
     std::lock_guard<std::mutex> lk(trust_mu_);
-    if (table_syncs_in_flight_++ == 0 && !token_path_.empty())
-      ::unlink(token_path_.c_str());
+    // The state on disk is this run's dirty one, so a token that will not go
+    // away costs the identity (and the rest of this run's vouching) instead.
+    if (table_syncs_in_flight_++ == 0 &&
+        !RevokeTrustLocked(/*forfeit=*/false, /*withdraw=*/true))
+      trust_forfeited_ = true;
   }
   if (table_sync_hook_for_test_) table_sync_hook_for_test_();
   const bool synced = ::fdatasync(table_fd_) == 0;
@@ -1123,7 +1160,7 @@ bool DiskSlabStore::RecoverUnclean() {
     // From here until MarkDirtyEpoch this run may consume a writeback error or
     // die half-way; either must leave the next start with a reset. So the
     // token goes before the first sync; a finished recovery grants a new one.
-    if (!RevokeTrust(/*forfeit=*/false)) {
+    if (!RevokeTrust(/*forfeit=*/false, /*withdraw=*/true)) {
       why_reset = "the trust token could not be taken back";
     } else {
       const auto started = std::chrono::steady_clock::now();
@@ -1162,7 +1199,7 @@ bool DiskSlabStore::ResetUncleanEpoch() {
   // The table is about to be destroyed piecemeal. Take the token back and
   // withdraw the identity first, so that a process killed half-way never has
   // the remainder mistaken for a table worth keeping.
-  RevokeTrust(/*forfeit=*/false);
+  RevokeTrust(/*forfeit=*/false, /*withdraw=*/false);
   if (!WriteEpochState(kStateDirty, run_epoch_, /*with_identity=*/false)) {
     const int saved_errno = errno;
     FailMetadata();
@@ -1473,7 +1510,7 @@ bool DiskSlabStore::FailMetadata() {
   // that the state on disk already leads to a reset (or was clean, and a
   // failed startup changes nothing).
   if (identity_recorded_.load(std::memory_order_acquire))
-    RevokeTrust(/*forfeit=*/true);
+    RevokeTrust(/*forfeit=*/true, /*withdraw=*/true);
   return false;
 }
 
@@ -2431,6 +2468,10 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
       metadata_io_errors_.load(std::memory_order_relaxed);
   st.unclean_resets = unclean_resets_.load(std::memory_order_relaxed);
   st.warm_restarts = warm_restarts_.load(std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lk(trust_mu_);
+    st.trust_tokens_held = trust_token_held_ ? 1 : 0;
+  }
   st.eviction_record_clears =
       eviction_record_clears_.load(std::memory_order_relaxed);
   st.record_writes = record_writes_.load(std::memory_order_relaxed);

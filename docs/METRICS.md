@@ -227,6 +227,7 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_bind_wipes_total` | counter | extent 绑定新 class 前完成的旧 slot-grid 清理 |
 | `dfkv_slab_metadata_io_errors_total` / `dfkv_slab_unclean_resets_total` | counter | slots.tbl/epoch 持久化失败 / 冷升时丢弃 dirty epoch |
 | `dfkv_slab_warm_restarts_total` | counter | 非干净退出后保留了缓存的盘数（`DFKV_SLAB_WARM_RESTART` 为 `auto` 或 `boot` 时才会非零）；与 `unclean_resets` 互斥，清零的原因见启动日志 |
+| `dfkv_slab_trust_tokens_held` | gauge | 当前持有可信令牌的盘数。正常运行时等于盘数（同步表的瞬间会短暂变少）；长期偏少说明令牌建不出来或该盘出过元数据错误，此时非干净退出会清零 |
 | `dfkv_slab_eviction_record_clears_total` / `dfkv_slab_record_writes_total` | counter | allocator 复用前持久清除记录 / 已提交 slots.tbl record 写数 |
 | `dfkv_slab_capacity_bytes` / `dfkv_slab_allocated_bytes` / `dfkv_slab_payload_bytes` / `dfkv_slab_internal_fragmentation_bytes` | gauge | 物理 payload 容量 / 已占 slot / 逻辑 payload / 内部碎片 |
 | `dfkv_slab_allocator_objects` / `dfkv_slab_committed_objects` | gauge | allocator resident（含未提交写）/ reader-visible 已提交对象 |

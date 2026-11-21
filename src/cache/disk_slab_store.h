@@ -98,7 +98,7 @@ class DiskSlabStore : public StoreEngine {
     // vanish with the kernel's page cache and must not depend on the cache
     // disk, which is the thing that fails: a tmpfs. Empty = /dev/shm, used
     // only if it really is a tmpfs; tests point this elsewhere.
-    std::string trust_marker_dir;
+    std::string trust_token_dir;
     // Keeping a table also requires a filesystem known to keep written data
     // with the local kernel (xfs, ext4, tmpfs). Tests that run on whatever
     // the build machine offers turn the check off.
@@ -142,6 +142,7 @@ class DiskSlabStore : public StoreEngine {
     uint64_t metadata_io_errors = 0;
     uint64_t unclean_resets = 0;
     uint64_t warm_restarts = 0;
+    uint64_t trust_tokens_held = 0;  // 1 while this store holds its token
     uint64_t eviction_record_clears = 0;
     uint64_t record_writes = 0;
     uint64_t table_rebuilt = 0;
@@ -290,12 +291,16 @@ class DiskSlabStore : public StoreEngine {
   // written after the table was rebuilt may carry them.
   bool WriteEpochState(uint32_t state, uint64_t epoch, bool with_identity);
   // The trust token on tmpfs: present, and carrying this run's epoch, exactly
-  // while the run vouches for the table (see Options::trust_marker_dir).
+  // while the run vouches for the table (see Options::trust_token_dir).
   bool GrantTrust();
-  // forfeit: for good -- this run will not vouch for the table again. False
-  // only if the token could be neither removed nor the identity in slab_state
-  // withdrawn in its place; callers retry.
-  bool RevokeTrust(bool forfeit);
+  // forfeit: for good -- this run will not vouch for the table again.
+  // withdraw_identity_if_stuck: if the token cannot be removed, take the
+  // identity out of slab_state instead. Only valid while that state is a
+  // dirty one carrying an identity; never after the clean marker was written,
+  // which it would overwrite. False if the token is still there and nothing
+  // was withdrawn in its place.
+  bool RevokeTrust(bool forfeit, bool withdraw_identity_if_stuck);
+  bool RevokeTrustLocked(bool forfeit, bool withdraw_identity_if_stuck);
   bool TrustTokenMatches(uint64_t epoch) const;
   // fdatasync(table_fd_) with the token taken back for its duration: the
   // kernel reports a writeback error once, to this very call, and a process
@@ -378,10 +383,11 @@ class DiskSlabStore : public StoreEngine {
   std::string token_path_;           // empty: no usable tmpfs for tokens
   std::mutex state_mu_;              // serializes slab_state writes
   std::atomic<bool> identity_recorded_{false};  // slab_state carries it now
-  std::mutex trust_mu_;              // token + the three fields below
+  mutable std::mutex trust_mu_;      // token + the fields below
   bool trust_forfeited_ = false;     // this run no longer vouches for the table
   int table_syncs_in_flight_ = 0;    // the token is absent while > 0
-  bool trust_revoke_failed_ = false; // could not take the token back: retry
+  bool trust_token_held_ = false;    // the token file exists, written by us
+  bool trust_failure_logged_ = false;
   std::atomic<bool> buffered_payload_written_{false};  // extents may be dirty
   int crash_slot_ = -1;              // RevokeAllTrustForCrash registration
   // Outstanding asynchronous leases. The opaque id remains entirely internal:
