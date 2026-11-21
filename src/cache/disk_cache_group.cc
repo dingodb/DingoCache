@@ -669,6 +669,7 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.metadata_io_errors += st.metadata_io_errors;
     sum.unclean_resets += st.unclean_resets;
     sum.warm_restarts += st.warm_restarts;
+    sum.trust_tokens_held += st.trust_tokens_held;
     sum.eviction_record_clears += st.eviction_record_clears;
     sum.record_writes += st.record_writes;
     sum.table_rebuilt += st.table_rebuilt;

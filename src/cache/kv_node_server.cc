@@ -647,6 +647,10 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_warm_restarts_total", "counter",
            "Dirty prior epochs whose table was kept (DFKV_SLAB_WARM_RESTART)",
            ss.warm_restarts);
+    metric("dfkv_slab_trust_tokens_held", "gauge",
+           "Slab stores holding their trust token: an unclean exit right now "
+           "could keep their cache",
+           ss.trust_tokens_held);
     metric("dfkv_slab_eviction_record_clears_total", "counter",
            "Slot records durably cleared before allocator reuse",
            ss.eviction_record_clears);

@@ -146,7 +146,7 @@ class DiskSlabTest : public ::testing::Test {
     DiskSlabStore::Options o;
     o.dir = dir_.string();
     // Trust tokens next to the test directories, not in /dev/shm.
-    o.trust_marker_dir = fs::temp_directory_path().string();
+    o.trust_token_dir = fs::temp_directory_path().string();
     o.capacity_bytes = cap;
     o.extent_bytes = extent;
     o.slot_granularity = gran;
@@ -885,7 +885,7 @@ DiskSlabStore::Options WithIdentity(DiskSlabStore::Options options,
   options.mount_id = mount;
   // Tokens next to the test directories rather than in /dev/shm, and no
   // opinion about the filesystem the build machine keeps /tmp on.
-  options.trust_marker_dir = fs::temp_directory_path().string();
+  options.trust_token_dir = fs::temp_directory_path().string();
   options.require_local_filesystem = false;
   return options;
 }
@@ -1144,6 +1144,7 @@ TEST_F(DiskSlabTest, RunHoldsItsTrustTokenWhileItVouchesForTheTable) {
     token = TrustToken(dir_);
     ASSERT_FALSE(token.empty());
     EXPECT_TRUE(fs::exists(token));
+    EXPECT_EQ(store.GetStats().trust_tokens_held, 1u);
     ASSERT_TRUE(PutFilled(store, 90, 'a'));
     bool present_inside_sync = true;
     dfkv::DiskSlabStoreTestPeer::SetTableSyncHook(
@@ -1154,6 +1155,73 @@ TEST_F(DiskSlabTest, RunHoldsItsTrustTokenWhileItVouchesForTheTable) {
     EXPECT_TRUE(fs::exists(token)) << "a clean sync gives the token back";
   }
   EXPECT_FALSE(fs::exists(token)) << "a clean shutdown needs no token";
+}
+
+// While any table sync is in flight the token stays away: the one that
+// finishes first must not hand it back under the other.
+TEST_F(DiskSlabTest, OverlappingTableSyncsReturnTheTokenOnlyAfterTheLast) {
+  const auto options =
+      WithIdentity(Opts(1 << 20, 1 << 20, 4096), WarmRestart::kAuto, 1, 7);
+  bool ok = false;
+  DiskSlabStore store(options, &ok);
+  ASSERT_TRUE(ok);
+  const fs::path token = TrustToken(dir_);
+  ASSERT_TRUE(PutFilled(store, 90, 'a'));
+
+  HookGate first_sync;
+  std::atomic<int> syncs{0};
+  dfkv::DiskSlabStoreTestPeer::SetTableSyncHook(&store, [&] {
+    if (syncs.fetch_add(1) == 0) first_sync.Run();  // only the first one waits
+  });
+  std::thread slow([&] { dfkv::DiskSlabStoreTestPeer::SyncTableNow(&store); });
+  first_sync.WaitEntered();
+  ASSERT_TRUE(dfkv::DiskSlabStoreTestPeer::SyncTableNow(&store));
+  EXPECT_FALSE(fs::exists(token))
+      << "a finished sync returned the token while another was in flight";
+  first_sync.Release(true);
+  slow.join();
+  dfkv::DiskSlabStoreTestPeer::SetTableSyncHook(&store, {});
+  EXPECT_TRUE(fs::exists(token));
+}
+
+// Something undeletable at the token path (here: a directory) must not cost
+// more than the ability to keep the cache. In particular a clean shutdown
+// stays a clean shutdown.
+TEST_F(DiskSlabTest, UnremovableThingAtTheTokenPathLeavesCleanShutdownsClean) {
+  const auto options =
+      WithIdentity(Opts(1 << 20, 1 << 20, 4096), WarmRestart::kAuto, 1, 7);
+  fs::create_directories(dir_);
+  const fs::path token = TrustToken(dir_);
+  ASSERT_FALSE(token.empty());
+  fs::create_directory(token);
+  {
+    bool ok = false;
+    DiskSlabStore store(options, &ok);
+    ASSERT_TRUE(ok) << store.StartupError();
+    EXPECT_EQ(store.GetStats().trust_tokens_held, 0u);
+    ASSERT_TRUE(PutFilled(store, 90, 'a'));
+    ASSERT_TRUE(dfkv::DiskSlabStoreTestPeer::SyncTableNow(&store));
+  }
+  {
+    bool ok = false;
+    DiskSlabStore reopened(options, &ok);
+    ASSERT_TRUE(ok) << reopened.StartupError();
+    EXPECT_EQ(reopened.GetStats().unclean_resets, 0u)
+        << "the clean state was overwritten on the way out";
+    EXPECT_EQ(reopened.Count(), 1u);
+  }
+  // And an unclean exit of such a run resets: nothing vouches for it.
+  ASSERT_TRUE(CrashAfter(options, [](DiskSlabStore& store) {
+    return store.Count() == 1 && PutFilled(store, 91, 'b');
+  }));
+  {
+    bool ok = false;
+    DiskSlabStore recovered(options, &ok);
+    ASSERT_TRUE(ok) << recovered.StartupError();
+    EXPECT_EQ(recovered.GetStats().warm_restarts, 0u);
+    EXPECT_EQ(recovered.GetStats().unclean_resets, 1u);
+  }
+  fs::remove(token);
 }
 
 TEST_F(DiskSlabTest, MissingOrForeignTrustTokenForcesAReset) {
@@ -1317,7 +1385,7 @@ TEST_F(DiskSlabTest, UncleanExitWithTheRealSystemIdentity) {
   options.table_sync_ms = 0;
   options.reclaim_interval_ms = 0;
   options.warm_restart = WarmRestart::kAuto;
-  options.trust_marker_dir.clear();  // /dev/shm, if it is a tmpfs
+  options.trust_token_dir.clear();  // /dev/shm, if it is a tmpfs
   ASSERT_TRUE(CrashAfter(options, [](DiskSlabStore& store) {
     return PutFilled(store, 90, 'a');
   }));

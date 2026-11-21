@@ -15,7 +15,8 @@
   Everything else still resets, and records that contradict each other reset
   on that path rather than failing startup. `boot` also accepts runs without
   a unique mount id; `off` is the default and the behaviour of 2.35. New
-  counter `dfkv_slab_warm_restarts_total`; the reason for a reset is logged.
+  counter `dfkv_slab_warm_restarts_total` and gauge
+  `dfkv_slab_trust_tokens_held`; the reason for a reset is logged.
   The state record stays readable by 2.35, whose own records are treated as
   "reset". Independent of the setting, a cache directory is now locked: a
   second process opening it fails to start.

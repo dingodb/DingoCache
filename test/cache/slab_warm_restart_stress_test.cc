@@ -191,12 +191,18 @@ DiskSlabStore::Options StressOptions(const fs::path& dir, Variant variant) {
     options.capacity_bytes = 32ull << 20;
     options.reclaim_interval_ms = 0;
   }
+  // Table syncs take the trust token back for their duration, and a kill
+  // inside one costs a reset. Frequent enough to be hit, rare enough that most
+  // restarts keep the table on a slow disk; DFKV_SLAB_KILL_SYNC_MS overrides.
+  options.table_sync_ms = 20;
+  if (const char* value = std::getenv("DFKV_SLAB_KILL_SYNC_MS"))
+    options.table_sync_ms = static_cast<uint32_t>(std::max(1, std::atoi(value)));
   options.warm_restart = DiskSlabStore::Options::WarmRestart::kAuto;
   std::array<uint8_t, 16> boot_id;
   boot_id.fill(0x42);
   options.boot_id = boot_id;  // "same boot, same mount" on any kernel
   options.mount_id = 0x4242;
-  options.trust_marker_dir = fs::temp_directory_path().string();
+  options.trust_token_dir = fs::temp_directory_path().string();
   options.require_local_filesystem = false;
   return options;
 }
@@ -314,8 +320,13 @@ struct Inspection {
 // Opens the store and reads every key. With `result_pipe` >= 0 this is a
 // process of its own that sends the result and exits WITHOUT shutting the
 // store down, so the next run starts on a kept table again.
-void Inspect(const DiskSlabStore::Options& options, Variant variant,
+void Inspect(const DiskSlabStore::Options& traffic_options, Variant variant,
              Inspection* result, int result_pipe) {
+  // No background work: this process only reads, and when it exits without
+  // shutting down it must not be in the middle of a table sync of its own.
+  DiskSlabStore::Options options = traffic_options;
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
   bool ok = false;
   DiskSlabStore store(options, &ok);
   result->opened = ok;
