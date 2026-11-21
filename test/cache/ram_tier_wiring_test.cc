@@ -53,6 +53,9 @@ class KvNodeServerWiringTestPeer {
     server.ram_write_back_ = true;
     server.ram_ack_enabled_ = ram_ack;
   }
+  static void SetWriteBack(KvNodeServer& server, bool write_back) {
+    server.ram_write_back_ = write_back;
+  }
   static bool Resident(KvNodeServer& server, const BlockKey& key) {
     return server.ram_->Contains(key);
   }
@@ -758,17 +761,14 @@ TEST(RamTierWiring, DirtyWatermarkRejectsWithoutCallingDiskAndRecovers) {
   fs::remove_all(dir);
 }
 
-// PreparedRead unifies RAM and disk ownership. A RAM-resident value is returned
-// ready with a send pin; an absent key proceeds to disk after exactly one RAM
-// miss. Destroying the ready owner exercises connection-abort cleanup.
 // A tenant with a node quota skips RAM write-back admission. The direct (RDMA)
 // PUT entry must still reach the quota-checked disk write: before the fix both
 // branches were gated on "no quota", so every such PUT returned kCacheFull and
-// stored nothing while the TCP entry worked.
+// stored nothing while the TCP entry worked. Write-around took the same path.
 TEST(RamTierWiring, LimitedTenantDirectPutReachesDiskWhenRamEnabled) {
-  for (bool ram_ack : {false, true}) {
+  for (bool write_back : {true, false}) {
     auto dir = fs::temp_directory_path() /
-        ("dfkv_ramwire_quota_direct_" + std::to_string(ram_ack));
+        ("dfkv_ramwire_quota_direct_" + std::to_string(write_back));
     fs::remove_all(dir);
     fs::create_directories(dir);
     ::unsetenv("DFKV_TENANT_QUOTAS_FILE");
@@ -785,15 +785,15 @@ TEST(RamTierWiring, LimitedTenantDirectPutReachesDiskWhenRamEnabled) {
           flushes.fetch_add(1, std::memory_order_relaxed);
           return KvNodeServerWiringTestPeer::Persist(*node, key, data, len) ==
                  Status::kOk;
-        },
-        ram_ack);
+        });
+    KvNodeServerWiringTestPeer::SetWriteBack(*server, write_back);
 
     const BlockKey key{8201, 0};
     alignas(4096) char value[4096];
     std::memset(value, 'q', sizeof(value));
     EXPECT_EQ(server->CacheDirectForKey(key, value, 1024, sizeof(value)),
               Status::kOk)
-        << "ram_ack=" << ram_ack;
+        << "write_back=" << write_back;
     std::string out;
     EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, key, &out),
               Status::kOk);
@@ -802,19 +802,28 @@ TEST(RamTierWiring, LimitedTenantDirectPutReachesDiskWhenRamEnabled) {
     EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, key));
     EXPECT_EQ(flushes.load(std::memory_order_relaxed), 0u);
 
-    // Exceeding the quota is reported as such, not as a full cache.
+    // Exceeding the quota is reported and counted as such, not as a full
+    // cache, and stores nothing.
     const BlockKey big{8202, 0};
-    alignas(4096) static char large[128 * 1024];
+    alignas(4096) char large[128 * 1024];
     std::memset(large, 'r', sizeof(large));
     EXPECT_EQ(server->CacheDirectForKey(big, large, sizeof(large), sizeof(large)),
               Status::kQuotaExceeded)
-        << "ram_ack=" << ram_ack;
+        << "write_back=" << write_back;
+    EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, big, &out),
+              Status::kNotFound);
+    const std::string metrics = server->MetricsText();
+    EXPECT_EQ(MetricVal(metrics, "dfkv_cache_put_total"), 1);
+    EXPECT_EQ(MetricVal(metrics, "dfkv_tenant_quota_rejections_total"), 1);
 
     server.reset();
     fs::remove_all(dir);
   }
 }
 
+// PreparedRead unifies RAM and disk ownership. A RAM-resident value is returned
+// ready with a send pin; an absent key proceeds to disk after exactly one RAM
+// miss. Destroying the ready owner exercises connection-abort cleanup.
 TEST(RamTierWiring, PreparedReadCountsRamMissesAndOwnsRamPin) {
   ::setenv("DFKV_RAM_TIER", "1", 1);
   ::setenv("DFKV_RAM_TIER_BYTES", "8388608", 1);
