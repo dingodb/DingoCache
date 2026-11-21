@@ -167,6 +167,15 @@ if(DFKV_BUILD_TESTS)
   FetchContent_MakeAvailable(googletest)
   include(GoogleTest)
 
+  # Stand-in driver library for cuda_attach_test (never installed).
+  add_library(dfkv_fake_cuda SHARED
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/client/fake_cuda/fake_cuda.cc)
+  set_target_properties(dfkv_fake_cuda PROPERTIES
+    OUTPUT_NAME cuda
+    VERSION 1
+    SOVERSION 1
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/fake_cuda)
+
   file(GLOB_RECURSE DFKV_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/*_test.cc)
   # rdma_loopback_test needs the RDMA transport/server symbols -> RDMA build only.
   list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_loopback_test.cc)
@@ -193,6 +202,16 @@ if(DFKV_BUILD_TESTS)
       gtest_discover_tests(${name} PROPERTIES
         RESOURCE_LOCK gpu_rdma_hw
         ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")
+    elseif(name STREQUAL "cuda_attach_test")
+      # Runs against a fake libcuda.so.1 placed first on the loader path, so the
+      # attach-only contract is checked on every host and never touches a real
+      # driver.
+      # A single ENVIRONMENT entry on purpose: gtest_discover_tests forwards a
+      # multi-entry list as separate arguments, of which only the first one
+      # reaches the ENVIRONMENT property.
+      add_dependencies(${name} dfkv_fake_cuda)
+      gtest_discover_tests(${name} PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/fake_cuda")
     else()
       gtest_discover_tests(${name} PROPERTIES
         ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")

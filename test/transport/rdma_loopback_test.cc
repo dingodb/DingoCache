@@ -694,7 +694,8 @@ class CudaGuardedBuffer {
 };
 
 const CudaLib* ActiveCudaForTest() {
-  const CudaLib* cuda = CudaLib::Get();
+  // The test is the CUDA host here; libdfkv only attaches to a loaded driver.
+  const CudaLib* cuda = CudaLib::LoadForHost();
   if (!cuda || !cuda->BindPrimaryCtx(0)) return nullptr;
   return cuda;
 }
@@ -4611,9 +4612,6 @@ TEST(RdmaLoopback, ScatterGatherRoundtripOverRdma) {
 
 TEST(RdmaLoopback, MultiWrLaterWindowFailureIsAtomicAndReclaimsState) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
-  // Host-pointer classification initializes CUDA lazily. Keep that startup
-  // work outside this deliberately short idle-reaping scenario.
-  (void)CudaLib::Get();
   ScopedEnv idle_reclaim("DFKV_RDMA_IDLE_MS", "2000");
   RdmaNode node("sgabort");
   const uint64_t transient_baseline =

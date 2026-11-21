@@ -58,7 +58,8 @@ char PatByte(size_t key, size_t off) {
 
 
 int Child(const Args& a) {
-  const CudaLib* cu = CudaLib::Get();
+  // This tool is the CUDA host of its own process.
+  const CudaLib* cu = CudaLib::LoadForHost();
   if (!cu || !cu->BindPrimaryCtx(a.rank)) {
     std::fprintf(stderr, "rank %d: no CUDA ctx on device %d\n", a.rank, a.rank);
     return 2;
