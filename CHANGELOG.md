@@ -7,8 +7,8 @@
   (each zero-copy GET registers an exact MR over the value it serves; PUTs
   land in the receive pool), but it pinned the arena once per rail, serially,
   at startup and unpinned it at shutdown. Measured with a 192 GiB arena and
-  eight rails: start to ready 128 s -> 71-87 s, stop 41 s -> 25 s, GET and PUT
-  throughput unchanged. `RdmaServer::RegisterMemory` is gone with it. The
+  eight rails: start to ready 128-142 s -> 69-88 s, stop under load 34-42 s ->
+  about 25 s, GET and PUT throughput unchanged. `RdmaServer::RegisterMemory` is gone with it. The
   arena stays resident: it is now locked with `mlock2(MLOCK_ONFAULT)` while it
   is pre-faulted (`DFKV_RAM_TIER_LOCK=off` disables that; a failed lock only
   warns; `dfkv_ram_arena_locked` shows the outcome). A TCP-only node, whose
