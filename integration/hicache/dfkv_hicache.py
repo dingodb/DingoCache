@@ -1453,7 +1453,7 @@ class DfkvHiCache(HiCacheStorage):
             codes = dfkv_cabi.call_batch_retain(
                 self._lib, self._h, keys, ttl, dfkv_cabi.DFKV_RETAIN_SET)
         except Exception as e:  # retention never fails a backup or touch
-            _log.warning("dfkv retain SET failed: %s", e)
+            self._warn_retain("retain SET", e)
             return [dfkv_cabi.DFKV_RET_ERROR] * len(keys)
         unprotected = sum(
             1 for c in codes if c not in dfkv_cabi.RETAIN_PROTECTED_CODES)
@@ -1484,21 +1484,116 @@ class DfkvHiCache(HiCacheStorage):
             if keys:
                 self._retain_set(keys, ttl)
 
+    _RETAIN_WARN_INTERVAL_S = 60.0
+
+    def _warn_retain(self, what: str, exc: Exception) -> None:
+        """Rate-limited warning for retention calls on the request path."""
+        now = time.monotonic()
+        if now - getattr(self, "_retain_warn_at", float("-inf")) < self._RETAIN_WARN_INTERVAL_S:
+            self._retain_warn_suppressed = getattr(self, "_retain_warn_suppressed", 0) + 1
+            return
+        suppressed = getattr(self, "_retain_warn_suppressed", 0)
+        self._retain_warn_at = now
+        self._retain_warn_suppressed = 0
+        _log.warning("dfkv %s failed: %s (%d similar suppressed)", what, exc, suppressed)
+
+    # --- retention ownership: exactly the objects this rank writes ---------
+    def _rank_writes_kv(self) -> bool:
+        """Whether this rank writes main-KV objects.
+
+        Replicated MLA latent has one elected writer per physical CP/DCP
+        coordinate; every other layout writes on every rank.
+        """
+        return not self.is_mla or self._mla_replica_writer
+
+    def _rank_writes_pool(self, name: str) -> bool:
+        """Write gate of one v2 pool: followers still write rank-sharded state."""
+        return self._rank_writes_kv() or not self._pool_is_replicated(name)
+
+    def _retain_side_pools(self):
+        for name in getattr(self, "_pool_component_names", ()):
+            if name not in ("kv", "__default__") and self._rank_writes_pool(name):
+                yield name
+
+    def _stored_keys(self, pool: str, page_hash) -> List[bytes]:
+        """Physical keys one page occupies in ``pool``, in the form written.
+
+        Device-direct (L2-bypass) writes store SG-chunked keys, so retention on
+        the bare key would miss them. The chunk count is recorded by
+        _flatten_device; a page this process serves from device/host memory was
+        written or loaded through it, so batch_touch always sees the recorded
+        count. Before the first device I/O only chunk 0 is known.
+        """
+        if pool in ("kv", "__default__"):
+            base = self._keys(page_hash)
+            device = getattr(self, "mem_pool_device", None) is not None
+            pool = "kv"
+        else:
+            base = self._pool_keys(pool, page_hash)
+            device = pool in getattr(self, "_sidecar_device_pools", {})
+        if not device:
+            return base
+        chunks = getattr(self, "_sg_chunks", {}).get(pool, 1)
+        return [self._sg_group_key(sk, ci) for sk in base for ci in range(chunks)]
+
+    def _retain_object_keys(self, keys) -> List[bytes]:
+        """Every object of these pages that this rank writes, and nothing else."""
+        sks = ([sk for k in keys for sk in self._stored_keys("kv", k)]
+               if self._rank_writes_kv() else [])
+        for pool in self._retain_side_pools():
+            for k in keys:
+                sks.extend(self._stored_keys(pool, k))
+        return sks
+
+    def retain_owns_objects(self) -> bool:
+        """Whether this rank writes any object and so must vote on a TTL.
+
+        A follower may skip replicated MLA KV yet own rank-sharded side-pool
+        state (e.g. KDA). Ownership depends on the registered pools, so asking
+        before any pool is registered is a caller ordering bug, not a no.
+        """
+        if (getattr(self, "mem_pool_host", None) is None
+                and getattr(self, "mem_pool_device", None) is None
+                and not getattr(self, "_pool_component_names", None)):
+            raise RuntimeError(
+                "retain_owns_objects() called before any HiCache pool was registered")
+        return self._rank_writes_kv() or next(self._retain_side_pools(), None) is not None
+
+    def retain_precheck(self, keys, extra_info=None) -> int:
+        """TTL this rank admits for the whole prefix ``keys``, without a write.
+
+        Returns min(requested, ring cap) when the ring supports retention and
+        every owner of this rank's objects reported enough headroom; otherwise
+        0 (do not promise or bill a TTL). Advisory: capacity can change before
+        the asynchronous SET, and the caller combines all owning ranks' votes.
+        """
+        ttl = self._retain_ttl_of(extra_info)
+        if not ttl or not keys or not self._has_retain:
+            return 0
+        try:
+            supported, cap = dfkv_cabi.call_retain_limits(self._lib, self._h)
+            if supported != 1 or cap <= 0:
+                return 0
+            sks = self._retain_object_keys(keys)
+            if sks and dfkv_cabi.call_retain_precheck(self._lib, self._h, sks):
+                return min(ttl, cap)
+        except Exception as e:
+            self._warn_retain("retention precheck", e)
+        return 0
+
     def batch_touch(self, keys, extra_info=None) -> None:
         """Renew retention of pages served from device/host memory.
 
         Called by SGLang for prefix hits that never reach storage. Refreshes
-        the main KV objects and every registered side pool of those pages.
-        A ``retain_ttl_s`` hint in ``extra_info`` enables client debounce.
+        the objects of those pages that this rank writes (main KV and side
+        pools). A ``retain_ttl_s`` hint in ``extra_info`` enables client
+        debounce.
         """
         if not keys or not self._has_retain:
             return
-        sks = [sk for k in keys for sk in self._keys(k)]
-        for pool in getattr(self, "_pool_component_names", {}):
-            if pool in ("kv", "__default__"):
-                continue
-            for k in keys:
-                sks.extend(self._pool_keys(pool, k))
+        sks = self._retain_object_keys(keys)
+        if not sks:
+            return
         ttl = self._retain_ttl_of(extra_info)
         try:
             # Decision 9: protect the whole prefix or none of it.
@@ -1520,7 +1615,7 @@ class DfkvHiCache(HiCacheStorage):
                     self._lib, self._h, sks, ttl,
                     dfkv_cabi.DFKV_RETAIN_REFRESH)
         except Exception as e:
-            _log.warning("dfkv batch_touch failed: %s", e)
+            self._warn_retain("batch_touch", e)
 
     def _batch_exist_flat(self, subkeys) -> List[bool]:
         if not subkeys:
@@ -1660,7 +1755,8 @@ class DfkvHiCache(HiCacheStorage):
     def _sg_group_key(self, sk: bytes, ci: int) -> bytes:
         return sg_key(sk, self._sg_width(), ci)
 
-    def _flatten_device(self, keys, seg_ptrs, seg_sizes, keys_fn=None, sub=None):
+    def _flatten_device(self, keys, seg_ptrs, seg_sizes, keys_fn=None, sub=None,
+                        pool="kv"):
         """Expand per-page keys into per-sub-object (k[/v]) sub-keys, pairing each
         with its per-layer device segment list. Parallel to _flatten, but every
         entry is a segment LIST (one per layer), not a single (ptr, size).
@@ -1677,7 +1773,9 @@ class DfkvHiCache(HiCacheStorage):
 
         keys_fn/sub default to the main-KV key scheme (self._keys / self._sub);
         DSA indexer and EAGLE draft sidecars pass their own key builder and
-        object count while reusing the same SG chunking.
+        object count while reusing the same SG chunking. ``pool`` names the
+        retained pool whose chunk count is recorded for _stored_keys (None for
+        the draft, which retention does not cover).
         """
         keys_fn = keys_fn or self._keys
         sub = self._sub() if sub is None else sub
@@ -1694,6 +1792,10 @@ class DfkvHiCache(HiCacheStorage):
                     sks.append(self._sg_group_key(sk, ci))
                     sp.append(p[ci * w:(ci + 1) * w])
                     ss.append(s[ci * w:(ci + 1) * w])
+        if pool is not None and keys:
+            if not hasattr(self, "_sg_chunks"):
+                self._sg_chunks = {}
+            self._sg_chunks[pool] = nchunks
         return sub * nchunks, sks, sp, ss
 
     def _batch_put_sg(self, sks, seg_ptrs, seg_sizes) -> List[bool]:
@@ -2078,12 +2180,7 @@ class DfkvHiCache(HiCacheStorage):
             # Replication is inferred from the registered host layout, not a
             # model-name allowlist, and _pool_keys carries the matching
             # component/rank coordinates. Thus the write gate and collision
-            if (
-                putting
-                and self.is_mla
-                and not self._mla_replica_writer
-                and self._pool_is_replicated(name)
-            ):
+            if putting and not self._rank_writes_pool(name):
                 results[name] = [True] * len(keys)
                 continue
             pool = self.registered_pools[name]
@@ -2313,7 +2410,8 @@ class DfkvHiCache(HiCacheStorage):
         seg_ptrs, seg_sizes = get_device_sidecar_page_buffer_meta(pool, device_indices)
         stride, sks, sp, ss = self._flatten_device(
             keys, seg_ptrs, seg_sizes,
-            keys_fn=lambda h: self._pool_keys(name, h), sub=self._pool_sub(name))
+            keys_fn=lambda h: self._pool_keys(name, h), sub=self._pool_sub(name),
+            pool=str(name))
         nbytes = sum(sum(s) for s in ss)
         t0 = time.perf_counter()
         flat = self._put_sg_flat(sks, sp, ss)
@@ -2333,7 +2431,8 @@ class DfkvHiCache(HiCacheStorage):
         seg_ptrs, seg_caps = get_device_sidecar_page_buffer_meta(pool, device_indices)
         stride, sks, sp, sc = self._flatten_device(
             keys, seg_ptrs, seg_caps,
-            keys_fn=lambda h: self._pool_keys(name, h), sub=self._pool_sub(name))
+            keys_fn=lambda h: self._pool_keys(name, h), sub=self._pool_sub(name),
+            pool=str(name))
         want = [sum(c) for c in sc]
         t0 = time.perf_counter()
         hits, lens = self._batch_get_sg(sks, sp, sc)
@@ -2381,7 +2480,7 @@ class DfkvHiCache(HiCacheStorage):
                 return [True] * n
             stride, sks, sp, ss = self._flatten_device(
                 keys, seg_ptrs, seg_sizes,
-                keys_fn=lambda h: self._draft_keys(h, sub), sub=sub)
+                keys_fn=lambda h: self._draft_keys(h, sub), sub=sub, pool=None)
             flat = self._put_sg_flat(sks, sp, ss)
             res = self._fold(flat, n, stride)
             r.result = f"ok {sum(res)}/{n} (draft device-direct)"
@@ -2409,7 +2508,7 @@ class DfkvHiCache(HiCacheStorage):
             sub = len(seg_ptrs) // n if n else 1
             stride, sks, sp, sc = self._flatten_device(
                 keys, seg_ptrs, seg_caps,
-                keys_fn=lambda h: self._draft_keys(h, sub), sub=sub)
+                keys_fn=lambda h: self._draft_keys(h, sub), sub=sub, pool=None)
             want = [sum(c) for c in sc]
             hits, lens = self._batch_get_sg(sks, sp, sc)
             flat_ok = [hits[i] == 1 and lens[i] >= want[i] for i in range(len(sks))]

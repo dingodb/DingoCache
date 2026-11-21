@@ -280,6 +280,11 @@ if(DFKV_BUILD_TESTS)
               ${CMAKE_CURRENT_SOURCE_DIR}/integration/hicache/tests/test_client_stats.py)
     set_tests_properties(python_hicache_client_stats PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
+    add_test(NAME python_hicache_retain_ownership
+      COMMAND ${PYTHON3}
+              ${CMAKE_CURRENT_SOURCE_DIR}/integration/hicache/tests/test_retain_ownership.py)
+    set_tests_properties(python_hicache_retain_ownership PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
     # Pure-python hicache/connector helpers: no lib, GPU or torch needed.
     add_test(NAME python_hicache_helpers
       COMMAND ${PYTHON3} -m unittest test_dfkv_hot_config
