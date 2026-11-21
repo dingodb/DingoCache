@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Metrics: `dfkv_evicted_bytes_total` counts watermark evictions again. Since
+  v2.0.0 the watermark reclaimer dropped its victims' payload accounting
+  without adding it to the counter, so the metric only reflected inline `Put`
+  eviction (single and batch), extent rebalance and class-local reclaim while
+  `dfkv_evictions_total` counted every victim. Expect the rate of this
+  counter to step up after upgrading; that is the corrected value.
 - Server: a tenant with a node quota can PUT over RDMA again when the RAM
   tier is enabled. `CacheDirectForKey` gated both the RAM write-back branch and
   the disk branch on "tenant has no quota", so a limited tenant skipped both:

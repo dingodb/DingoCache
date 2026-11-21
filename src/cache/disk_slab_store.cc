@@ -1877,7 +1877,7 @@ void DiskSlabStore::ReclaimTick(
       if (!evicted.empty()) {
         if (after_watermark_evict) after_watermark_evict();
         for (const BlockKey& key : evicted)
-          ErasePayloadLocked(key.Filename());
+          evicted_bytes_ += ErasePayloadLocked(key.Filename());
       }
       watermark_latch_.EndTick(alloc_->UsedBytes(), evict_low_bytes_);
       watermark_active_.store(watermark_latch_.active, std::memory_order_relaxed);

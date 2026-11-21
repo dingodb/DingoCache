@@ -1647,6 +1647,40 @@ TEST_F(DiskSlabTest, WatermarkDrainIsLatchedAndBoundedPerTick) {
   EXPECT_EQ(stats.watermark_active, 0u);
 }
 
+// EvictedBytes() backs dfkv_evicted_bytes_total. Watermark reclamation used to
+// erase the victims' payload accounting without adding it to the counter, so
+// the metric only reflected inline Put eviction, extent rebalance and
+// class-local reclaim.
+TEST_F(DiskSlabTest, WatermarkEvictionCountsEvictedBytes) {
+  ::setenv("DFKV_SLAB_EVICT_HIGH_PCT", "50", 1);
+  ::setenv("DFKV_SLAB_EVICT_LOW_PCT", "26", 1);
+  ::setenv("DFKV_SLAB_EVICT_MAX_VICTIMS_PER_TICK", "8", 1);
+  auto options = Opts(8 * 4096, 4096, 4096);
+  options.reclaim_interval_ms = 0;
+  options.table_sync_ms = 0;
+  bool ok = false;
+  DiskSlabStore store(options, &ok);
+  ::unsetenv("DFKV_SLAB_EVICT_HIGH_PCT");
+  ::unsetenv("DFKV_SLAB_EVICT_LOW_PCT");
+  ::unsetenv("DFKV_SLAB_EVICT_MAX_VICTIMS_PER_TICK");
+  ASSERT_TRUE(ok);
+
+  const std::string value(4000, 'e');
+  for (uint64_t i = 0; i < 8; ++i)
+    ASSERT_EQ(store.Cache(K(i), value.data(), value.size()), Status::kOk);
+  ASSERT_EQ(store.EvictedBytes(), 0u);
+
+  dfkv::DiskSlabStoreTestPeer::ReclaimNow(&store, {});
+  const auto stats = store.GetStats();
+  // One tick drains to the low mark; class-local reclaim has nothing left to
+  // do, so every eviction here is a watermark eviction.
+  ASSERT_EQ(stats.watermark_evictions, 6u);
+  ASSERT_EQ(stats.reclaimed_slots, 0u);
+  EXPECT_EQ(store.Count(), 2u);
+  EXPECT_EQ(store.Evictions(), 6u);
+  EXPECT_EQ(store.EvictedBytes(), 6u * value.size());
+}
+
 TEST(NewPutDemandLatch, ExpiresOnlyAfter128CompletedInactiveQuietTicks) {
   NewPutDemandLatch latch;
   latch.BeginTick(90, 80, 40, 0);
