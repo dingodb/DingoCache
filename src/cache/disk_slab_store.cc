@@ -297,8 +297,8 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   ao.on_extent_bind = [this](uint32_t e) {
     if (!PwriteAll(table_fd_, zero_extent_records_.data(),
                    zero_extent_records_.size(), TableOffset(e, 0)))
-      return FailMetadata();
-    if (!SyncTableFile()) return FailMetadata();
+      return FailMetadata("clear slots.tbl records of a rebound extent");
+    if (!SyncTableFile()) return FailMetadata("sync slots.tbl after an extent rebind");
     bind_wipes_.fetch_add(1, std::memory_order_relaxed);
     return true;
   };
@@ -307,7 +307,7 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
         if (!PwriteAll(table_fd_, zero_extent_records_.data(),
                        zero_extent_records_.size(),
                        TableOffset(extent, 0)))
-          return FailMetadata();
+          return FailMetadata("clear slots.tbl records of an evicted extent");
         record_writes_.fetch_add(std::max<uint32_t>(residents, 1),
                                  std::memory_order_relaxed);
         eviction_record_clears_.fetch_add(residents,
@@ -323,7 +323,7 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
     const uint8_t zero[kRecBytes] = {0};
     if (!PwriteAll(table_fd_, zero, sizeof(zero),
                    TableOffset(ref.extent, ref.slot)))
-      return FailMetadata();
+      return FailMetadata("clear the slots.tbl record of an evicted slot");
     record_writes_.fetch_add(1, std::memory_order_relaxed);
     eviction_record_clears_.fetch_add(1, std::memory_order_relaxed);
     if (watermark_selector_call_) {
@@ -1214,7 +1214,7 @@ bool DiskSlabStore::ResetUncleanEpoch() {
   RevokeTrust(/*forfeit=*/false, /*withdraw=*/false);
   if (!WriteEpochState(kStateDirty, run_epoch_, /*with_identity=*/false)) {
     const int saved_errno = errno;
-    FailMetadata();
+    FailMetadata("persist the reset marker in slab_state", saved_errno);
     return SetStartupErrno("cannot persist the reset marker in slab_state",
                            saved_errno);
   }
@@ -1228,14 +1228,14 @@ bool DiskSlabStore::ResetUncleanEpoch() {
         static_cast<size_t>(std::min<uint64_t>(chunk_bytes, bytes - offset));
     if (!PwriteAll(table_fd_, zeros.data(), n, offset)) {
       const int saved_errno = errno;
-      FailMetadata();
+      FailMetadata("reset slots.tbl", saved_errno);
       return SetStartupErrno("cannot reset slots.tbl after unclean shutdown",
                              saved_errno);
     }
   }
   if (::fdatasync(table_fd_) != 0) {
     const int saved_errno = errno;
-    FailMetadata();
+    FailMetadata("sync the slots.tbl reset", saved_errno);
     return SetStartupErrno("cannot persist unclean slots.tbl reset", saved_errno);
   }
   unclean_resets_.fetch_add(1, std::memory_order_relaxed);
@@ -1258,19 +1258,19 @@ bool DiskSlabStore::MarkDirtyEpoch() {
     return true;
   }
   const int saved_errno = errno;
-  FailMetadata();
+  FailMetadata("persist dirty slab_state", saved_errno);
   return SetStartupErrno("cannot persist dirty slab_state", saved_errno);
 }
 
 bool DiskSlabStore::MarkCleanEpoch() {
   if (WriteEpochState(kStateClean, run_epoch_, /*with_identity=*/false))
     return true;
-  return FailMetadata();
+  return FailMetadata("persist clean slab_state");
 }
 
 bool DiskSlabStore::SyncPayloads() {
   for (int fd : extent_fds_) {
-    if (fd >= 0 && ::fdatasync(fd) != 0) return FailMetadata();
+    if (fd >= 0 && ::fdatasync(fd) != 0) return FailMetadata("sync an extent file");
   }
   return true;
 }
@@ -1476,7 +1476,7 @@ bool DiskSlabStore::Rebuild(bool* inconsistent) {
     else result = ScanResult::kDone;
   }
   if (result == ScanResult::kError) {
-    FailMetadata();
+    FailMetadata("scan slots.tbl", 0);
     if (read_failed)
       return SetStartupError("cannot read slots.tbl during rebuild");
     if (seek_failed)
@@ -1504,20 +1504,27 @@ bool DiskSlabStore::Rebuild(bool* inconsistent) {
   for (const auto& location : rejected) {
     if (!PwriteAll(table_fd_, zero, kRecBytes,
                    TableOffset(location.first, location.second))) {
-      FailMetadata();
+      FailMetadata("clear a rejected slots.tbl record");
       return SetStartupError("cannot clear rejected slots.tbl record");
     }
   }
   if (!rejected.empty() && ::fdatasync(table_fd_) != 0) {
-    FailMetadata();
+    FailMetadata("sync slots.tbl rebuild repairs");
     return SetStartupError("cannot persist slots.tbl rebuild repairs");
   }
   return true;
 }
 
-bool DiskSlabStore::FailMetadata() {
+bool DiskSlabStore::FailMetadata(const char* op, int err) {
   metadata_io_errors_.fetch_add(1, std::memory_order_relaxed);
-  metadata_failed_.store(true, std::memory_order_release);
+  if (!metadata_failed_.exchange(true, std::memory_order_acq_rel)) {
+    DFKV_LOG_ERROR(
+        "slab " + opt_.dir + ": disk store failed for good: cannot " + op +
+        (err != 0 ? ": errno=" + std::to_string(err) + " (" +
+                        std::strerror(err) + ")"
+                  : std::string()) +
+        "; it stores and reads nothing more until the process is restarted");
+  }
   // Only a run that recorded its identity has a token to take back; before
   // that the state on disk already leads to a reset (or was clean, and a
   // failed startup changes nothing).
@@ -1528,7 +1535,7 @@ bool DiskSlabStore::FailMetadata() {
 
 bool DiskSlabStore::SyncTable(uint64_t seen) {
   if (!Healthy()) return false;
-  if (!SyncTableFile()) return FailMetadata();
+  if (!SyncTableFile()) return FailMetadata("sync slots.tbl");
   synced_marker_ = seen;
   table_syncs_.fetch_add(1, std::memory_order_relaxed);
   return true;
@@ -1540,7 +1547,7 @@ bool DiskSlabStore::WriteRecord(const SlabAllocator::SlotRef& r,
                                 uint32_t retain_ttl_s) {
   if (!Healthy()) return false;
   if (record_write_hook_for_test_ && !record_write_hook_for_test_())
-    return FailMetadata();
+    return FailMetadata("write a slots.tbl record", 0);
   uint8_t rec[kRecBytes];
   std::memset(rec, 0, sizeof(rec));
   net::PutU32(reinterpret_cast<char*>(rec), kRecMagic);
@@ -1555,7 +1562,7 @@ bool DiskSlabStore::WriteRecord(const SlabAllocator::SlotRef& r,
   const uint32_t crc = Crc32(rec + 8, kRecBytes - 8);
   net::PutU32(reinterpret_cast<char*>(rec) + 4, crc);
   if (!PwriteAll(table_fd_, rec, kRecBytes, TableOffset(r.extent, r.slot)))
-    return FailMetadata();
+    return FailMetadata("write a slots.tbl record");
   record_writes_.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
@@ -1927,7 +1934,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
           // bytes a late landing wrote over a committed payload.
           if (!DrainBatchWrites(ring, expect - done,
                                 uring_reap_hook_for_test_))
-            FailMetadata();
+            FailMetadata("reap io_uring write completions", 0);
           tls_uring_w.Reset();
         } else if (expect != submitted) {
           // Short submit is the SAFE half: `expect` counts exactly the SQEs

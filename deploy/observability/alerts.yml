@@ -16,7 +16,7 @@ groups:
           severity: critical
         annotations:
           summary: "dfkv server local storage is unhealthy"
-          description: "{{ $labels.instance }} reports terminal disk or required RAM-tier failure."
+          description: "{{ $labels.instance }} reports terminal disk or required RAM-tier failure. With a failed disk store it has reported itself out of the placement ring (dfkv_server_ring_eligible is 0) and needs a restart or a replacement; with only the RAM tier unhealthy it keeps serving and stays in the ring."
       - alert: DfkvMdsUnavailable
         expr: (up{job="dfkv_mds"} == 0) or (dfkv_mds_ready == 0) or (absent(up{job="dfkv_mds"}) == 1)
         for: 1m
@@ -46,6 +46,18 @@ groups:
         annotations:
           summary: "dfkv MDS is withholding member lists"
           description: "{{ $labels.instance }} has for minutes received member heartbeats that etcd did not accept, and those members have expired from etcd. Clients stay on their last ring and new clients get none until etcd accepts writes again (check its space quota and alarms)."
+      # A member that renews its lease but is left out of the list clients
+      # build their ring from: it lost its last healthy RDMA rail, or a disk
+      # store failed (INFO then carries store=failed). The second kind does
+      # not come back without a restart.
+      - alert: DfkvGroupMembersOutOfPlacement
+        expr: max by (group) (dfkv_mds_group_degraded_nodes) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "dfkv group has registered members that are out of placement"
+          description: "Group {{ $labels.group }} has {{ $value }} member(s) registered but not ring-eligible; their share of the keys moved to the other members. `dfkvctl ring` lists them as DEGRADED."
       - alert: DfkvGroupVersionSkew
         expr: max by (group) (dfkv_mds_group_version_skew) > 1
         for: 2m

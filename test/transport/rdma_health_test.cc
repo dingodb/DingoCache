@@ -97,6 +97,17 @@ TEST(RdmaHealth, QueryFailureFailsClosed) {
             std::string::npos);
 }
 
+TEST(RdmaHealth, EligibilityGaugeAlsoNeedsTheNodeItself) {
+  rdma::RdmaHealthMonitor monitor(
+      [] { return std::vector<IbDeviceHealth>{Device("ib0", 4, 5)}; });
+  ASSERT_TRUE(monitor.Sample().ring_eligible);
+  EXPECT_NE(monitor.MetricsText().find("dfkv_server_ring_eligible 1"),
+            std::string::npos);
+  const std::string text = monitor.MetricsText(/*node_eligible=*/false);
+  EXPECT_NE(text.find("dfkv_server_ring_eligible 0"), std::string::npos);
+  EXPECT_NE(text.find("dfkv_server_rdma_rails_active 1"), std::string::npos);
+}
+
 TEST(RemoteRailHealth, EndpointFailureIsIsolatedByPeerAndSiblingRail) {
   RemoteRailHealth health(
       RemoteRailHealthConfig{/*base_cooldown_us=*/100,

@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+- Membership: a cache node whose disk store has failed for good now leaves
+  the placement ring. A slab store whose metadata could not be written or
+  synced (or that lost io_uring completions) stores and reads nothing more
+  until the process is restarted: PUT and GET fail with an I/O error, Exist
+  and Retain answer a miss, and only what a RAM tier in front of it still
+  holds is served. The node kept renewing its membership as ring-eligible
+  all the same: clients kept routing its share of the keys to it, where
+  writes failed and reads missed for as long as the process ran. The store
+  now also logs one ERROR line when it fails, naming the cache directory,
+  the operation and the errno. Only RDMA
+  rail health was part of the heartbeat, and a node without an RDMA listener
+  reported no health at all. Now the next heartbeat (within 10 s) reports the
+  node as not ring-eligible, through the existing health extension of the
+  member record (HLT1), so the MDS and clients need no change: the MDS leaves
+  the node out of the list clients build their ring from, and its keys move
+  to the other members once. The node stays registered: `dfkvctl ring` shows
+  it as `DEGRADED` with `store=failed` appended to INFO, until it is
+  restarted or replaced (`deploy/dfkv_node_replace.py` handles an old node
+  that is registered but out of placement). The process does not exit on its
+  own: a restart resets the failed store and rejoins, and with a disk that
+  is really broken a supervisor's restart loop would move the keys back and
+  forth. The condition is a latch that only failed local metadata I/O sets
+  and nothing clears, so it cannot make the ring flap. One failed disk of a
+  multi-disk node takes the whole node out. A RAM tier that dropped an entry
+  it could not flush still turns `/healthz` to 503 but does not take the
+  node out of placement, because that node serves every request. Not
+  covered: data-plane threads that are stuck while the process is alive.
+  `dfkv_server_ring_eligible` is now what the node reports (no failed disk
+  store and, with an RDMA listener, a healthy rail) and is also emitted by
+  nodes without an RDMA listener. New alert `DfkvGroupMembersOutOfPlacement`
+  on `dfkv_mds_group_degraded_nodes`. Mixed versions: an MDS older than
+  2.15.0 ignores the health extension and keeps the node in the ring as
+  before; a healthy node sends exactly what it sent before. See
+  `docs/DEPLOY.md`.
 - Server: once its disks are clean, a stopping `dfkv_server` exits instead of
   running destructors. What was left after the clean marker was only giving
   memory back, and most of that time went into freeing the disk indexes one
