@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dfkv-connector"
-version = "2.41.0"
+version = "2.42.0"
 description = "LMCache RemoteConnector for the dfkv KV cache (ctypes over libdfkv.so)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -14,7 +14,7 @@ authors = [{ name = "Wine93", email = "wine93.info@gmail.com" }]
 # runtime by path (DFKV_LIB / remote_storage_plugin.dfkv.lib). No bundled .so,
 # no CPython extension, so the wheel is platform-independent.
 dependencies = [
-  "dfkv-common==2.41.0",
+  "dfkv-common==2.42.0",
   # Checked against LMCache's L2AdapterInterface of 0.4.7-0.5.6. 0.5.7 adds
   # an abstract method the L2 adapter does not implement and moves
   # lmcache.v1.storage_backend to lmcache.inprocess.v1.storage_backend, so the
