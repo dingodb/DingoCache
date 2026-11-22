@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- vLLM connector: a lookup that backs off probes each object once. A
+  recurrent-state group's load mask is true only at the candidate's tail,
+  so a missing state there makes the lookup try a shorter candidate; each
+  round probed (and built the keys of) the whole prefix again, in the
+  scheduler's lookup path. The first candidate is now probed as before; if
+  it fails and a group's load mask moves with the candidate (a recurrent
+  state's tail, a window), that group's chunks below the hit are probed in
+  one call, and the rounds are answered from what was found. Pure full
+  attention needs no second probe. Hits are
+  unchanged (400 randomized lookups: identical results). Stand-in
+  benchmark, 128 LCM chunks with no state saved: 128 probes of 8384 keys
+  before, 2 probes of 256 keys after; a full hit still takes one probe.
+
 - vLLM connector: a LOAD split by `load_window_keys` no longer re-marshals
   its descriptors window by window. Slicing the flat descriptor batch gave
   plain lists, so each window rebuilt its pointer and size arrays segment by
