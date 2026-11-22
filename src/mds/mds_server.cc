@@ -160,6 +160,10 @@ bool EtcdProbeCache::Get() {
 }
 
 MdsServer::MdsServer(const std::string& etcd_addr, int etcd_timeout_ms)
+    : MdsServer(etcd_addr, etcd_timeout_ms, SteadyNowMs) {}
+
+MdsServer::MdsServer(const std::string& etcd_addr, int etcd_timeout_ms,
+                     UnwrittenMembers::Clock hold_clock)
     : http_(etcd_addr, etcd_timeout_ms),
       etcd_(&http_),
       accept_legacy_(config_dump::EnvBool("DFKV_MDS_ACCEPT_LEGACY", false)),
@@ -180,7 +184,7 @@ MdsServer::MdsServer(const std::string& etcd_addr, int etcd_timeout_ms)
                      config_dump::EnvU64("DFKV_MDS_UNWRITTEN_HOLD_MS",
                                          kUnwrittenHoldMs),
                      600000),
-                 SteadyNowMs) {}
+                 std::move(hold_clock)) {}
 
 MdsServer::~MdsServer() { Stop(); }
 
@@ -325,17 +329,23 @@ void MdsServer::AcceptLoop() {
   }
 }
 
-Status MdsServer::Upsert(const std::string& group, const MemberInfo& m) {
+Status MdsServer::Upsert(const std::string& group, const MemberInfo& m,
+                         bool heartbeat) {
   // Reject before the id/group reach the etcd key: an unrestricted token can
   // contain '/' and escape its own key subtree (phantom-member injection).
   if (!IsValidGroupOrId(group) || !IsValidGroupOrId(m.id)) return Status::kInvalid;
   const std::string key = MemberKey(group, m.id);
   const Status st = UpsertLeased(key, m, leases_, false);
-  // The member is alive either way: it just heartbeat. If etcd did not take
-  // the write, ListMembers has to know (see UnwrittenMembers).
+  // A heartbeat etcd did not take is recorded for ListMembers (see
+  // UnwrittenMembers). A failed register is not. A registrar heartbeats only
+  // after a register of the same process went through, so a heartbeat comes
+  // from a node that was listed; a register may come from one that never was
+  // (a new node, or one back after its key ran out). Counting that one as a
+  // missing member would withhold the group's list from everybody for as long
+  // as it keeps trying to get in.
   if (st == Status::kOk)
     unwritten_.Remove(key);
-  else
+  else if (heartbeat)
     unwritten_.Add(key);
   return st;
 }
@@ -711,7 +721,7 @@ void MdsServer::Handle(int fd, long io_timeout_s,
       std::string group;
       MemberInfo m;
       if (DecodeMemberReq(payload.data(), rq.payload_len, &group, &m))
-        st = Upsert(group, m);
+        st = Upsert(group, m, op == WireOp::kHeartbeat);
     } else if (op == WireOp::kClientRegister || op == WireOp::kClientHeartbeat) {
       if (op == WireOp::kClientRegister)
         metrics_.client_register_requests.fetch_add(1, std::memory_order_relaxed);

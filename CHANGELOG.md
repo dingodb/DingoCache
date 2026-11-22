@@ -10,6 +10,33 @@
   and `ListTopology` returned the shrinking, finally empty view with `kOk`;
   clients dropped the missing peers' connections at the first such answer and
   adopted an empty ring after three polls, with every cache node healthy. The
+  MDS now remembers each member whose heartbeat it received but could not
+  write, and answers `kIOError` to a member list from which such a member is
+  missing. Only heartbeats count: a registrar sends one only after a
+  registration of the same process went through, so a node that cannot get in
+  (a first registration that keeps failing) is not taken for a missing member.
+  Clients of every version keep their last ring when a list fails, so deployed
+  clients are covered once all MDS instances run this version; an MDS that has
+  not been upgraded still serves the broken view. The list is served again
+  when each of those members is back in etcd, written by this or another MDS,
+  or has not heartbeat at this MDS for `DFKV_MDS_UNWRITTEN_HOLD_MS` (default
+  120000, four lease TTLs; `0` restores the previous behaviour; it has to
+  exceed the number of MDS endpoints times the 10 s heartbeat interval). A
+  failed heartbeat whose member etcd still lists withholds nothing; other
+  groups and `ListClients` are unaffected. Members leave as before, with one
+  exception: after a member's heartbeat failed at an MDS and the member then
+  really went away, that MDS withholds the list for up to the hold. Not
+  covered: an MDS that has no record (just started, or not among the
+  registrars' endpoints) serves the etcd view as before; nodes restarted
+  during the outage only register, so a group whose nodes were all restarted
+  is still served as empty; with four or more MDS endpoints the MDS that last
+  wrote a member hears from it again only after its key has run out and may,
+  for about 10 s per endpoint beyond three, serve a list without it. While a
+  list is withheld a newly started client gets no ring and `dfkvctl` reports a
+  failed MDS query. New counter `dfkv_mds_list_withheld_total`, gauge
+  `dfkv_mds_unwritten_members`, a WARN line at most every 30 s, and the alert
+  `DfkvMdsMemberListWithheld` (lists withheld for four minutes). No protocol
+  change.
   MDS now remembers each member whose register or heartbeat it received but
   could not write, and answers `kIOError` to a member list from which such a
   member is missing. Clients of every version keep their last ring when a

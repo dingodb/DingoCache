@@ -141,16 +141,21 @@ journalctl -u dfkv_mds -n 5 --no-pager   # 应见 "dfkv_mds listening on 9400, e
 > **etcd 拒绝写入时的 member list**：etcd 空间配额用尽后只接受读和删除，Put 与
 > lease grant 被拒，已有 lease 照常到期。节点心跳续不上，member key 会在节点
 > 完全健康的情况下从 etcd 消失；registrar 在 3 个及以上 MDS 端点间轮转时，全部
-> member 在一个 TTL 内消失。MDS 会记住“register/heartbeat 已到达本 MDS、但没能
-> 写进 etcd”的 member：`ListMembers`/`ListTopology` 读到的 etcd 视图缺少这样的
-> member 时返回 `kIOError`，不把残缺或空的视图当作成员表下发。各版本客户端在
+> member 在一个 TTL 内消失。MDS 会记住“heartbeat 已到达本 MDS、但没能写进
+> etcd”的 member：`ListMembers`/`ListTopology` 读到的 etcd 视图缺少这样的
+> member 时返回 `kIOError`，不把残缺或空的视图当作成员表下发。只记 heartbeat、
+> 不记 register：registrar 只在本进程注册成功之后才发 heartbeat，所以
+> heartbeat 一定来自曾在成员表里的节点；首次注册一直失败的节点（新节点，或
+> key 过期后才回来的节点）从未进入成员表，不会让 list 被扣住。各版本客户端在
 > list 失败时都保留 last-good ring，所以**全部** MDS 副本升级后现网客户端即受
 > 保护；未升级的副本仍会下发残缺视图。
 > - 恢复：这些 member 全部回到 etcd（由本 MDS 或其他 MDS 写入均可），或已有
 >   `DFKV_MDS_UNWRITTEN_HOLD_MS`（默认 120000 ms = 4×TTL，钳制上限 600000；
->   `0`=关闭，恢复 2.36 及之前的行为）没再向本 MDS 心跳。etcd 恢复写入后各
->   节点在下一次心跳（10s 内）重新写入，无需重启 MDS、节点或客户端。期间真正
->   下线的节点会让 list 最多再多扣一个窗口。
+>   `0`=关闭，恢复 2.36 及之前的行为）没再向本 MDS 心跳。该窗口必须大于
+>   “MDS 端点数 × 10s 心跳间隔”（registrar 轮转一圈的时间），否则记录会在节点
+>   回到本 MDS 之前失效。etcd 恢复写入后各节点在下一次心跳（10s 内）重新写入，
+>   无需重启 MDS、节点或客户端。心跳在某个 MDS 上失败之后真正下线的节点，会让
+>   该 MDS 的 list 最多再扣一个窗口，之后照常移除。
 > - 不受影响：心跳写失败但 etcd 仍列出该 member（lease 尚未到期）时 list 照常
 >   下发；节点正常下线、其他 group、`ListClients` 不变。
 > - 期间的表现：新启动的客户端拿不到 ring（全部按 miss 运行），`dfkvctl
@@ -158,9 +163,18 @@ journalctl -u dfkv_mds -n 5 --no-pager   # 应见 "dfkv_mds listening on 9400, e
 >   `dfkv_mds_heartbeat_healthy`。
 > - 观测：`dfkv_mds_list_withheld_total`、`dfkv_mds_unwritten_members`
 >   （docs/METRICS.md §3.2），MDS 日志 `withholding the member list of
->   group=...`（至多每 30s 一条），告警 `DfkvMdsMemberListWithheld`。
-> - 局限：MDS 只了解向它心跳过的 member。刚启动、尚未收到心跳的 MDS，以及
->   节点 registrar 端点列表里没有的 MDS，没有记录可依，照常下发 etcd 视图。
+>   group=...`（至多每 30s 一条），告警 `DfkvMdsMemberListWithheld`（list
+>   连续被扣约 4 分钟后触发；单个节点下线引起的至多一个窗口的扣留不触发）。
+> - 局限：
+>   - MDS 只了解向它心跳过的 member。刚启动、尚未收到心跳的 MDS，以及节点
+>     registrar 端点列表里没有的 MDS，没有记录可依，照常下发 etcd 视图。
+>   - 故障期间重启的节点只会发 register，不被记录；一个 group 的节点若在故障
+>     期间全部重启，该 group 仍会被下发为空视图。etcd 拒绝写入期间不要重启
+>     cache 节点。
+>   - MDS 端点为 4 个及以上时，最后一次写入某 member 的那台 MDS 要等该 member
+>     的 key 过期之后才再次收到它的心跳（超过 3 个后每多一个端点约晚 10s），这段时间它
+>     可能下发缺少该 member 的 list；恰好轮询到它的客户端会采纳略小的 ring，
+>     直到 list 恢复下发。
 
 > **混合代际滚动（v1.x ↔ v2）**：`DFKV_MDS_ACCEPT_LEGACY=1` 把 MDS 控制面版本闸
 > 按已知 epoch 放宽一档——v1.x 节点/客户端以旧 42/10 字节帧直接被服务（操作码、
@@ -622,7 +636,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `DFKV_READ_SHARD_KEYS` | `16` | client 每个 read shard 的目标 key 数；server 不读取 |
 | `DFKV_MDS_IO_TIMEOUT_S` | `60` | MDS 控制面帧读写超时（MDS 进程该） |
 | `DFKV_MDS_ETCD_PROBE_MS` | `30000` | MDS 与 etcd 存活探测窗（MDS 进程该） |
-| `DFKV_MDS_UNWRITTEN_HOLD_MS` | `120000` | MDS 把心跳已到但没写进 etcd 的 member 视为存活的时长；期间 etcd 缺少该 member 则 member list 返回错误（`0`=关，上限 600000；见 §2b） |
+| `DFKV_MDS_UNWRITTEN_HOLD_MS` | `120000` | MDS 把心跳已到但没写进 etcd 的 member 视为存活的时长；期间 etcd 缺少该 member 则 member list 返回错误（`0`=关，上限 600000；须大于 MDS 端点数 × 10s 心跳间隔；见 §2b） |
 | `DFKV_RDMA_HEALTH_RECOVERY_SAMPLES` | `3` | 仅 RDMA listener 生效。任一 initialized rail 健康即可 placement；部分掉轨保持 `PARTIAL`。最后一条健康 rail 丢失立即 `DEGRADED`；0→非 0 恢复要求连续成功样本，通过后 `PARTIAL`/`ACTIVE` 回环 |
 | `DFKV_RDMA_HEALTH_FILE` | 未设置（生产必须未设置） | 仅受控故障注入；逐 initialized device 提供 `device port_state phys_state`，生产从 sysfs 读取 |
 | `DFKV_TENANT_QUOTAS_COUNT` | — | tenant 配额文件预期条数（容量校验） |

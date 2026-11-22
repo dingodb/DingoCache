@@ -95,6 +95,8 @@ class EtcdProbeCache {
 // a recorded member that etcd no longer lists means the view is not the
 // member list.
 //
+// Only heartbeats are recorded, never registrations: see MdsServer::Upsert.
+//
 // A record goes away when the member's next write here succeeds, or `hold_ms`
 // after the failed heartbeat: by then a live member would have come back (its
 // registrar rotates over the MDS endpoints), so it has stopped heartbeating
@@ -137,6 +139,10 @@ class MdsServer {
   // gate by exactly one epoch: v1.x peers are served with the legacy
   // 42/10-byte framing via wire_legacy.h. Off = historic strict behavior.
   explicit MdsServer(const std::string& etcd_addr, int etcd_timeout_ms = 2000);
+  // Same, with the clock behind the unwritten-member hold supplied: tests let
+  // the hold pass without waiting for it.
+  MdsServer(const std::string& etcd_addr, int etcd_timeout_ms,
+            UnwrittenMembers::Clock hold_clock);
   ~MdsServer();
 
   Status Start(int port);
@@ -187,7 +193,8 @@ class MdsServer {
   void Handle(int fd, long io_timeout_s,
               std::chrono::steady_clock::time_point first_frame_deadline);
   void ReapDoneLocked();  // join+erase finished handler threads; conn_mu_ held
-  Status Upsert(const std::string& group, const MemberInfo& m);
+  // heartbeat: the op was kHeartbeat rather than kRegister.
+  Status Upsert(const std::string& group, const MemberInfo& m, bool heartbeat);
   Status ListMembers(const std::string& group, std::string* out,
                      bool include_degraded = false);
   // Client (consumer) registration — same lease/keepalive contract as Upsert/
