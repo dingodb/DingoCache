@@ -3,6 +3,18 @@
 ## Unreleased
 
 
+- vLLM connector: a LOAD that is rejected (receive queue full, connector
+  closing), cancelled, or fails unexpectedly reports only its own
+  destination blocks as invalid. It reported the request's whole block
+  table, including the blocks of its local prefix-cache hit. Those are
+  shared with other running requests: vLLM rolled each of them back (with
+  `kv_load_failure_policy=fail`, failed them) and dropped the blocks from its
+  prefix cache, e.g. every request sharing a system prompt with one whose
+  load overflowed the queue after a restart. Misses and short reads already
+  reported their own blocks only. If a request's load geometry cannot be
+  resolved, its whole block table is still reported. Block 0, vLLM's shared
+  null block, is never reported.
+
 - vLLM connector: two settings that reorder an object's bytes without
   changing its length are now part of the namespace. Under DCP or PCP,
   `cp_kv_cache_interleave_size` decides which tokens each rank's block

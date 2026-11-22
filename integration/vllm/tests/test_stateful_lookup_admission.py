@@ -881,7 +881,9 @@ def test_unallocated_destination_fails_without_overwriting_null_memory(hybrid_wo
         block_ids=([0],), block_hashes=hashes,
         load_spec=LoadSpec(0, BLOCK, True, token_len=BLOCK),
     ))
-    assert consumer.get_block_ids_with_load_errors() == {0}
+    # Block 0 is vLLM's shared null block: never reported as invalid, since
+    # every request that pads with it would be rolled back.
+    assert consumer.get_block_ids_with_load_errors() == set()
     assert torch.equal(target["mla"], before)
 
 

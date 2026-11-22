@@ -81,6 +81,11 @@ terminates the affected request instead.
 The request-level completion fence is mandatory even when the legacy
 `DFKV_GPU_LOAD_FENCE=0` override is present.
 
+Layouts that report block-ID errors (single-group full attention) report a
+failed, rejected or cancelled LOAD with its own destination blocks only, never
+the blocks of the request's local prefix-cache hit: those are shared with other
+running requests, which vLLM would roll back too.
+
 ## Environment variables (engine process)
 
 Read by `libdfkv.so` (the C client) and the connector, so set them in **every**
