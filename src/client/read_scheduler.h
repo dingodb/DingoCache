@@ -6,6 +6,15 @@
  * the process. Jobs are requeued one shard at a time, giving concurrent batches
  * round-robin progress instead of allowing one large batch to monopolize the
  * workers.
+ *
+ * One cache node may not hold every worker. A shard blocks its worker for as
+ * long as its node takes to answer, and a batch reaches one node through up to
+ * eight shards: a node that answers slowly would otherwise occupy all workers,
+ * and reads of every other node would wait behind it for the length of one of
+ * its operations. Shards of one node run on at most WorkerCount() - 1 workers
+ * at a time, so one worker is always free for the others, also for a read
+ * that arrives while the slow node's batch is running. Shards submitted
+ * without a node are not limited.
  */
 #ifndef DFKV_CLIENT_READ_SCHEDULER_H_
 #define DFKV_CLIENT_READ_SCHEDULER_H_
@@ -21,6 +30,7 @@
 #include <string>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "common/config_dump.h"
@@ -46,12 +56,24 @@ class ReadScheduler {
       if (worker.joinable()) worker.join();
   }
 
-  void Run(size_t count, const std::function<void(size_t)>& function) {
+  // node_of(i) names the cache node shard i talks to; it is what the per-node
+  // limit counts by. Without it the shards are not attributed to a node and
+  // are not limited.
+  void Run(size_t count, const std::function<void(size_t)>& function,
+           const std::function<const std::string&(size_t)>& node_of = nullptr) {
     if (count == 0) return;
     auto job = std::make_shared<Job>();
     job->count = count;
     job->function = function;
     job->enqueued_at = Clock::now();
+    job->node.assign(count, kNoNode);
+    if (node_of) {
+      for (size_t i = 0; i < count; ++i) {
+        const uint64_t key = std::hash<std::string>{}(node_of(i));
+        job->node[i] = key == kNoNode ? 1 : key;
+      }
+    }
+    for (size_t i = 0; i < count; ++i) job->pending.push_back(i);
     pending_batches_.fetch_add(1, std::memory_order_relaxed);
     pending_shards_.fetch_add(count, std::memory_order_relaxed);
     {
@@ -93,6 +115,10 @@ class ReadScheduler {
     counter("dfkv_read_scheduler_fairness_yields_total",
             "Shard-level job requeues that yield to another batch",
             fairness_yields_.load());
+    counter("dfkv_read_scheduler_node_limit_waits_total",
+            "Free read-worker wake-ups that found only shards of nodes at "
+            "their per-node limit",
+            node_limit_waits_.load());
     return out;
   }
 
@@ -115,13 +141,22 @@ class ReadScheduler {
     return value;
   }
 
+  // Most workers shards of one node may hold at a time: all but one. With a
+  // single worker nothing is reserved.
+  static size_t NodeLimit() {
+    const size_t workers = WorkerCount();
+    return workers > 1 ? workers - 1 : 1;
+  }
+
  private:
   using Clock = std::chrono::steady_clock;
+  static constexpr uint64_t kNoNode = 0;
 
   struct Job {
     size_t count = 0;
     std::function<void(size_t)> function;
-    std::atomic<size_t> next{0};
+    std::vector<uint64_t> node;   // per shard: its node's key, or kNoNode
+    std::deque<size_t> pending;   // shards not started yet (guarded by mu_)
     std::atomic<size_t> done{0};
     std::mutex mu;
     std::condition_variable done_cv;
@@ -138,22 +173,51 @@ class ReadScheduler {
     }
   }
 
+  // Picks the next shard to run: the first one, in queue order, whose node
+  // is below its limit. A job that still has shards left goes to the back of
+  // the queue, as before. Caller holds mu_.
+  bool TakeLocked(std::shared_ptr<Job>* job, size_t* index, uint64_t* node) {
+    const size_t limit = NodeLimit();
+    for (auto it = queue_.begin(); it != queue_.end(); ++it) {
+      Job& candidate = **it;
+      for (auto shard = candidate.pending.begin();
+           shard != candidate.pending.end(); ++shard) {
+        const uint64_t key = candidate.node[*shard];
+        if (key != kNoNode) {
+          const auto active = active_by_node_.find(key);
+          if (active != active_by_node_.end() && active->second >= limit)
+            continue;
+        }
+        *index = *shard;
+        *node = key;
+        candidate.pending.erase(shard);
+        *job = *it;
+        queue_.erase(it);
+        if (key != kNoNode) ++active_by_node_[key];
+        pending_shards_.fetch_sub(1, std::memory_order_relaxed);
+        if (!(*job)->pending.empty()) {
+          queue_.push_back(*job);
+          fairness_yields_.fetch_add(1, std::memory_order_relaxed);
+          ready_.notify_one();
+        }
+        return true;
+      }
+    }
+    if (!queue_.empty())
+      node_limit_waits_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+
   void WorkerLoop() {
     for (;;) {
       std::shared_ptr<Job> job;
       size_t index = 0;
+      uint64_t node = kNoNode;
       {
         std::unique_lock<std::mutex> lock(mu_);
-        ready_.wait(lock, [&] { return stop_ || !queue_.empty(); });
-        if (stop_ && queue_.empty()) return;
-        job = std::move(queue_.front());
-        queue_.pop_front();
-        index = job->next.fetch_add(1, std::memory_order_relaxed);
-        pending_shards_.fetch_sub(1, std::memory_order_relaxed);
-        if (index + 1 < job->count) {
-          queue_.push_back(job);
-          fairness_yields_.fetch_add(1, std::memory_order_relaxed);
-          ready_.notify_one();
+        while (!TakeLocked(&job, &index, &node)) {
+          if (stop_ && queue_.empty()) return;
+          ready_.wait(lock);
         }
       }
 
@@ -170,6 +234,17 @@ class ReadScheduler {
         // Batch shard functions encode failures in their output slots.
       }
       active_shards_.fetch_sub(1, std::memory_order_relaxed);
+      if (node != kNoNode) {
+        {
+          std::lock_guard<std::mutex> lock(mu_);
+          // The entry stays at zero: no allocation per shard under mu_. The
+          // keys are the nodes read from, bounded by the ring and its churn.
+          --active_by_node_.find(node)->second;
+        }
+        // A worker may be waiting for exactly this node to drop below its
+        // limit.
+        ready_.notify_one();
+      }
       if (job->done.fetch_add(1, std::memory_order_acq_rel) + 1 == job->count) {
         pending_batches_.fetch_sub(1, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lock(job->mu);
@@ -183,16 +258,20 @@ class ReadScheduler {
   std::deque<std::shared_ptr<Job>> queue_;
   std::vector<std::thread> workers_;
   bool stop_ = false;
+  // Shards running now, per node key (guarded by mu_).
+  std::unordered_map<uint64_t, size_t> active_by_node_;
   std::atomic<uint64_t> pending_batches_{0};
   std::atomic<uint64_t> pending_shards_{0};
   std::atomic<uint64_t> active_shards_{0};
   std::atomic<uint64_t> queue_delay_us_{0};
   std::atomic<uint64_t> fairness_yields_{0};
+  std::atomic<uint64_t> node_limit_waits_{0};
 };
 
-inline void RunReadScheduled(size_t count,
-                             const std::function<void(size_t)>& function) {
-  ReadScheduler::Instance().Run(count, function);
+inline void RunReadScheduled(
+    size_t count, const std::function<void(size_t)>& function,
+    const std::function<const std::string&(size_t)>& node_of = nullptr) {
+  ReadScheduler::Instance().Run(count, function, node_of);
 }
 }  // namespace dfkv
 

@@ -225,7 +225,7 @@ std::vector<bool> ReadBatch(KVClient* client, const std::string& prefix,
 
 }  // namespace
 
-// Seven shards of one batch fail together on a node that has just gone away.
+// Six shards of one batch fail together on a node that has just gone away.
 // That is one incident: the node is tried again after the base period.
 void FailuresThatLandTogetherAreOneIncident(bool mds_managed) {
   ScaledHealthEnv();
@@ -233,13 +233,13 @@ void FailuresThatLandTogetherAreOneIncident(bool mds_managed) {
   OneNodeRing ring(mds_managed, "stall/incident", &transport);
   ScriptedTransport::Node gone;
   gone.read = Status::kIOError;
-  gone.together = 7;  // the read scheduler runs seven shards at a time
+  gone.together = 6;  // one node's shards run on six of the seven workers
   transport.Set(ring.addr, gone);
 
   ReadBatch(ring.client.get(), "k", 128);
   const auto failed_at = Clock::now();
   const int first = transport.Reads(ring.addr);
-  ASSERT_GE(first, 7);
+  ASSERT_GE(first, 6);
 
   gone.together = 0;
   transport.Set(ring.addr, gone);
@@ -287,8 +287,9 @@ void OneRequestTriesARecoveringNode(bool mds_managed) {
 
   std::vector<bool> got;
   std::thread batch([&] { got = ReadBatch(x.client.get(), "k", 128); });
-  // Up to seven shards of that batch can be inside the dead node now.
-  transport.WaitInflight(x.addr, 7, 150ms);
+  // Without the trial, six shards of that batch would be inside the dead
+  // node now (the per-node share of the read workers).
+  transport.WaitInflight(x.addr, 6, 150ms);
   const auto t0 = Clock::now();
   ReadBatch(y.client.get(), "k", 16);
   const int64_t other_ms = MsSince(t0);
@@ -524,4 +525,38 @@ TEST(PeerHealthStall, CacheFullAnswersShowTheNodeIsAlive) {
   EXPECT_EQ(transport.Reads(ring.addr), before + 1)
       << "after " << answered << " cache-full answers in 600 ms, the last one "
          "about 10 ms earlier, one failed read made the client avoid the node";
+}
+
+// A node that is alive but slow: every shard takes 600 ms and succeeds. Its
+// batch may not hold every read worker of the process: one stays free, and a
+// read of another node is served at once.
+TEST(PeerHealthStall, SlowNodeLeavesAWorkerForOtherNodes) {
+  ScaledHealthEnv();
+  ScriptedTransport transport;
+  OneNodeRing x(/*mds_managed=*/false, "stall/slow", &transport, 29001);
+  OneNodeRing y(/*mds_managed=*/false, "stall/slow", &transport, 29002);
+  ScriptedTransport::Node slow;
+  slow.delay = 600ms;
+  transport.Set(x.addr, slow);
+  transport.Set(y.addr, ScriptedTransport::Node{});
+
+  // Nothing else is being read when the slow node's batch starts.
+  std::thread batch([&] { ReadBatch(x.client.get(), "k", 128); });
+  if (!transport.WaitInflight(x.addr, 6, 2s)) {
+    batch.join();
+    FAIL() << "the slow node never had six shards in flight";
+  }
+  const auto t0 = Clock::now();
+  ReadBatch(y.client.get(), "k", 16);
+  const int64_t other_ms = MsSince(t0);
+  batch.join();
+
+  const int concurrent = transport.MaxConcurrentReads(x.addr);
+  // Printed for the record; ctest shows it with --verbose or on failure.
+  std::printf("[ measured ] read of another node took %lld ms beside a slow "
+              "node; %d shards inside the slow node at once\n",
+              static_cast<long long>(other_ms), concurrent);
+  EXPECT_EQ(concurrent, 6) << "of the seven read workers";
+  EXPECT_LT(other_ms, 200) << "a read of another node waited " << other_ms
+                           << " ms behind a slow node";
 }

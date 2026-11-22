@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Client: a cache node that answers slowly no longer holds up reads of the
+  other nodes. Batch reads over RDMA run on a fixed set of workers shared by
+  the whole process (`DFKV_RDMA_READ_WORKERS`, 7 by default), and a batch
+  reaches one node through up to eight shards. A node whose operations take
+  long could occupy every worker; reads of all other nodes then waited for
+  one of its operations to finish. Shards of one node now run on at most
+  all but one of the workers (6 by default), so one worker is always free
+  for the others, also for a read that arrives while the slow node's batch
+  is running. A process whose ring is a single node therefore reads from it
+  with one worker fewer than before (raise `DFKV_RDMA_READ_WORKERS` if that
+  matters); with `DFKV_RDMA_READ_WORKERS=1` nothing is reserved, with 2
+  one node's shards run on one worker at a time. With a
+  scripted transport: beside a node whose shards took 600 ms each, a read
+  of another node used to wait the full 600 ms and is now served at once
+  (the test requires under 200 ms). Limit: two slow nodes at the same time
+  can still take every worker between them (six and one), and reads of
+  other nodes then wait for one of their operations. New counter
+  `dfkv_read_scheduler_node_limit_waits_total`. No setting, API or wire
+  change. See `docs/DEPLOY.md` and `docs/METRICS.md`.
 - Server, RAM tier: a PUT that waits for the value owning its key no longer
   blocks other keys, waits without limit, or holds up a stop. In disk-ACK mode
   (`DFKV_PUT_ACK_MODE=disk`, or a zero RAM-ACK watermark) every admitted PUT,

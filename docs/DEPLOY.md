@@ -719,7 +719,7 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 |---|---|---|
 | `DFKV_LOG` | `INFO` | log level（debug/info/warn/error，大小写均可） |
 | `DFKV_FANOUT_THREADS` | `32` | TCP batch、RDMA write 和兼容路径共用的 process-wide helper 上限；RDMA read 不再使用该线程池 |
-| `DFKV_RDMA_READ_WORKERS` | `7` | process-wide RDMA GET/GET-Auto/SG-GET/Exist shard worker 硬上限；caller 不参与执行，并发 batch 不会继续推高活跃 read QP；batch 间按 shard round-robin |
+| `DFKV_RDMA_READ_WORKERS` | `7` | process-wide RDMA GET/GET-Auto/SG-GET/Exist shard worker 硬上限；caller 不参与执行，并发 batch 不会继续推高活跃 read QP；batch 间按 shard round-robin。同一节点的 shard 同时最多占用 worker 数减一（默认 6），留一个 worker 给其他节点：一个慢节点占不满全部 worker，但两个慢节点同时存在时仍可能合计占满全部 worker，其他节点的读会排队。代价：环里只有一个节点的进程对它只用 worker 数减一个并发读，如有影响可调大本项。设为 1 时不预留；设为 2 时单节点上限为 1。未标明节点的 shard 不受此限 |
 | `DFKV_RDMA_ENDPOINT_CACHE_MAX` | 自适应（下限 `256`） | 所有 client handle 共享的 live endpoint 上限；按 `节点数 × 2 pools × max(pool 上限, configured rails) × 1.25` 自动放大；显式设置任一预算 env 会固定全部预算 |
 | `DFKV_RDMA_QP_BUDGET` | endpoint 上限 | process-wide QP 预算 |
 | `DFKV_RDMA_WR_BUDGET` | endpoint 上限 × depth | process-wide negotiated WR slot 预算 |
