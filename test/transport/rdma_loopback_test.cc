@@ -20,6 +20,7 @@
 #include "utils/accept_guard.h"
 #include "utils/net_util.h"
 
+#include "../client/scripted_topology_mds.h"
 #include "../utils/fd_exhaustion.h"
 
 #include <gtest/gtest.h>
@@ -2162,6 +2163,104 @@ TEST(RdmaLoopback, CapabilityCacheUnrelatedPublicationPreservesKeepaliveReuse) {
   EXPECT_EQ(CounterVal(transport.MetricsText(),
                        "dfkv_rdma_client_v2_probe_attempts_total"), 3)
       << "the replaced peer must negotiate its own fresh capabilities";
+}
+
+// End to end, with real queue pairs: the client learns from the MDS that one
+// of three members changed (it reports one more rail). Only that member's
+// pooled connections are torn down; the other two keep theirs and reuse them.
+TEST(RdmaLoopback, OneMemberTopologyChangeKeepsOtherPeersPooledConnections) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv idle_reaper("DFKV_RDMA_IDLE_MS", "0");
+  ScopedEnv pool_max("DFKV_RDMA_POOL_MAX", "8");
+  RdmaNode first("topology-one-of-n-first");
+  RdmaNode second("topology-one-of-n-second");
+  RdmaNode changed("topology-one-of-n-changed");
+  ASSERT_FALSE(first.rsrv->DeviceNames().empty());
+  const std::string device = first.rsrv->DeviceNames().front();
+  RdmaTransport transport(kMaxMsg, device);
+  RdmaTransportTestPeer::StopMaintenance(&transport);
+
+  const auto member = [&](const std::string& id, const std::string& addr) {
+    const size_t colon = addr.rfind(':');
+    MemberInfo m{id, addr.substr(0, colon),
+                 static_cast<uint32_t>(std::stoul(addr.substr(colon + 1))), 1};
+    m.has_health = true;
+    m.health.ring_eligible = true;
+    m.health.ib_devices = {{device, 4, 5, true}};
+    return m;
+  };
+  // The client publishes members in the order the MDS lists them; the one
+  // that changes is last, so once its publication has moved the others have
+  // been handled too.
+  std::vector<MemberInfo> members = {member("first", first.addr),
+                                     member("second", second.addr),
+                                     member("changed", changed.addr)};
+  ScriptedTopologyMds mds(members);
+  KVClient client(std::vector<std::pair<std::string, std::string>>{},
+                  SelfHdr(), &transport);
+  client.StartMdsDiscovery({mds.endpoint()}, "one-of-n-rdma-test", 10);
+  const auto wait_for = [](const std::function<bool()>& done) {
+    for (int i = 0; i < 5000 && !done(); ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    return done();
+  };
+  ASSERT_TRUE(wait_for([&] {
+    return RdmaTransportTestPeer::PeerPublication(transport, changed.addr) != 0;
+  }));
+  const uint64_t first_publication =
+      RdmaTransportTestPeer::PeerPublication(transport, first.addr);
+  const uint64_t second_publication =
+      RdmaTransportTestPeer::PeerPublication(transport, second.addr);
+  const uint64_t changed_publication =
+      RdmaTransportTestPeer::PeerPublication(transport, changed.addr);
+  ASSERT_NE(first_publication, 0u);
+  ASSERT_NE(second_publication, 0u);
+
+  HeldData first_batch(&transport, first.addr);
+  HeldData second_batch(&transport, second.addr);
+  HeldData changed_batch(&transport, changed.addr);
+  ASSERT_TRUE(first_batch.Acquire(2));
+  ASSERT_TRUE(second_batch.Acquire(2));
+  ASSERT_TRUE(changed_batch.Acquire(2));
+  first_batch.ReleaseAt(0);
+  second_batch.ReleaseAt(0);
+  changed_batch.ReleaseAt(0);
+  ASSERT_EQ(RdmaTransportTestPeer::DataPoolSize(&transport, first.addr), 2u);
+  ASSERT_EQ(RdmaTransportTestPeer::DataPoolSize(&transport, second.addr), 2u);
+  ASSERT_EQ(RdmaTransportTestPeer::DataPoolSize(&transport, changed.addr), 2u);
+  const long reaped = CounterVal(
+      transport.MetricsText(), "dfkv_rdma_client_stale_generation_reaps_total");
+  const long opened = CounterVal(
+      transport.MetricsText(), "dfkv_rdma_client_conns_opened_total");
+
+  // One more rail on the changed member, down and unknown to this client:
+  // its entry differs, its usable rails do not.
+  members[2].health.ib_devices.push_back({"rail-not-present-here", 1, 2, true});
+  mds.SetMembers(members);
+  ASSERT_TRUE(wait_for([&] {
+    return RdmaTransportTestPeer::PeerPublication(transport, changed.addr) !=
+           changed_publication;
+  }));
+  client.StopMdsDiscovery();
+
+  EXPECT_EQ(RdmaTransportTestPeer::PeerPublication(transport, first.addr),
+            first_publication);
+  EXPECT_EQ(RdmaTransportTestPeer::PeerPublication(transport, second.addr),
+            second_publication);
+  EXPECT_EQ(RdmaTransportTestPeer::DataPoolSize(&transport, first.addr), 2u);
+  EXPECT_EQ(RdmaTransportTestPeer::DataPoolSize(&transport, second.addr), 2u);
+  EXPECT_EQ(RdmaTransportTestPeer::DataPoolSize(&transport, changed.addr), 0u);
+  EXPECT_EQ(CounterVal(transport.MetricsText(),
+                       "dfkv_rdma_client_stale_generation_reaps_total") -
+                reaped, 2)
+      << "connections torn down for a change of one member of three";
+  ASSERT_TRUE(first_batch.Acquire(2));
+  ASSERT_TRUE(second_batch.Acquire(2));
+  EXPECT_EQ(CounterVal(transport.MetricsText(),
+                       "dfkv_rdma_client_conns_opened_total") - opened, 0)
+      << "the unchanged members are served from their warm connections";
 }
 
 TEST(RdmaLoopback, CapabilityCacheDoesNotTrustStaticOrAnonymousPeers) {

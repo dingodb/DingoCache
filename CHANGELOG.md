@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- Client, RDMA: a topology change of one cache node no longer makes a client
+  drop its pooled connections to every node. The client published each member
+  to the transport under the epoch of the whole member list, and that epoch
+  changes when anything about any member does (a port state, an address, a
+  node joining or leaving). The transport therefore saw a new generation for
+  every peer: it tore down all idle connections, retired the active ones as
+  they were released, and forgot what it had learned about each server's
+  capabilities, so one port flap on one node made every client reconnect to
+  all nodes at once. Each member is now published under an epoch of its own
+  entry (`MemberTopologyEpoch`: id, address, weight, eligibility and rails
+  with their states, the same fields as before, of that member only). A member
+  whose entry is unchanged keeps its connections; the member that changed, was
+  removed, or was removed and added again loses its own, as before. The order
+  in which the MDS lists members does not matter, and a list the MDS withholds
+  changes nothing. No wire or MDS change, and nothing to configure. A server
+  that restarts without any change to its entry was not announced by the MDS
+  before either, unless some other member happened to change at the same time:
+  the client notices through the failure of the first request or keepalive on
+  a dead connection, which drops that node's idle connections on that rail and
+  its cached capabilities. Idle connections on the node's other rails are not
+  dropped then; each fails on its own first use.
+  `dfkv_rdma_client_stale_generation_reaps_total` and
+  `dfkv_rdma_client_peer_topology_updates_total` now grow by the affected
+  member only.
 - Client, host and GPU dedup (`DFKV_CLIENT_NODE_DEDUP=1`), the publishing
   side: three ways a process that fetched a key for the others could do
   damage after the key had been written or removed in the meantime.

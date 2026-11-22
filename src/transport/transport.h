@@ -122,8 +122,10 @@ struct PeerRailTopology {
   bool healthy = false;
 };
 
-// Complete peer-specific topology update. generation is the canonical
-// membership topology epoch, not a transport-local counter. Transports must
+// Complete peer-specific topology update. generation is a content token of
+// this peer's own membership entry (MemberTopologyEpoch), not a transport-
+// local counter and not the epoch of the whole member list: it is equal for
+// two updates exactly when nothing about this peer changed. Transports must
 // treat snapshots as immutable so one logical operation cannot mix epochs.
 struct PeerTopology {
   std::string peer_addr;
