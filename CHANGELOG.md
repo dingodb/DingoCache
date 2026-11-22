@@ -3,6 +3,29 @@
 ## Unreleased
 
 
+- vLLM connector: a recurrent-state layer with several state tensors is
+  saved and loaded whole. In vLLM 0.26.x and earlier such a layer (Mamba2,
+  GDN, KDA, ...) reaches the connector as a list of views into one page, one
+  per state (conv state, SSM / recurrent state); the connector transferred
+  the first only. On a hit the other states kept whatever the target block
+  held, and the model continued from a wrong state with nothing reported.
+  Every tensor's bytes are in the object now. Objects saved before hold the
+  first tensor only under the same chunk hashes: a load would reject them on
+  length, but a SAVE finds them present and never replaces them, so those
+  groups use a pool of their own (`mamba-states`) and start cold once. From
+  vLLM 0.27 a layer is one view over its whole page (the layer splits it
+  into its states itself); that was saved in full before, and its keys are
+  unchanged. A deployment that ran 0.26.x with an older connector and
+  upgrades vLLM can still meet first-tensor objects under the `mamba` pool,
+  if its namespace did not change with the upgrade (the MambaSpec fields
+  are the same in 0.26.0 and 0.27.0). A load that finds a shorter object
+  under its key (by the stored length the server reports) now removes it,
+  in the background and best effort, on rings with the remove RPC
+  (`load_remove_stale` in the connector's operation metrics), so the next
+  SAVE writes it again: one failed load per such object instead of failed
+  loads until the server evicts it. A longer object is a miss and is left
+  alone.
+
 - Server, RAM tier: a disk that is healthy but has no slot for a value is no
   longer treated as a failing disk. The flush of a RAM value now gets the
   disk's status instead of a yes or no. A slab disk answers `kCacheFull` when

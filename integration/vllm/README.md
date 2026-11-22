@@ -302,7 +302,18 @@ SAVE persists only stable context, excluding the volatile speculative tail.
 LOOKUP checks the actual objects required by the shorter candidate boundary;
 LOAD restores every group needed at that admitted boundary. Missing required
 source blocks cannot publish a complete logical chunk, and unallocated LOAD
-destinations fail before writing memory. Windowed or recurrent SAVE sources
+destinations fail before writing memory. A recurrent-state layer is saved and
+loaded with every state tensor it has: in vLLM 0.26.x and earlier such a layer
+comes as a list of views (conv state, SSM / recurrent state) into one page, and
+only the first was transferred before. Those groups now use the `mamba-states`
+pool, so objects that hold the first tensor only are not found again (one cold
+start); from vLLM 0.27 a layer is one view of its page and its keys are
+unchanged. A load that finds a shorter object under its key (by the stored
+length the server reports) removes it in the background, best effort, where
+the ring has the remove RPC (`load_remove_stale` operation metric), so that the
+next SAVE writes it again instead of finding it present. A longer object is a
+miss and is left alone.
+Windowed or recurrent SAVE sources
 remain protected until the native PUT finishes, before the next model step
 can recycle or overwrite them. Asynchronous GET completion fences the CUDA
 device captured from the model thread, not the receive thread's default GPU.

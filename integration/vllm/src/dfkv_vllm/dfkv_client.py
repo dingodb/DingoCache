@@ -638,6 +638,23 @@ class DfkvDeviceClient:
             del key_owners
             return res
 
+    def supports_remove(self) -> bool:
+        """True iff the loaded libdfkv.so has the remove RPC."""
+        return hasattr(self._lib, "dfkv_batch_remove")
+
+    def batch_remove(self, keys: Sequence[bytes]) -> list:
+        """Remove ``keys``; ``[1|0]`` per key (1 = removed)."""
+        n = len(keys)
+        with access_log("batch_remove", lambda: f"{n} keys") as r:
+            karr, klens, key_owners = make_key_array(keys)
+            out = (c_int * n)()
+            rc = self._lib.dfkv_batch_remove(self._h, karr, klens, n, out)
+            if rc != 0:
+                raise RuntimeError(f"dfkv_batch_remove rc={rc}")
+            res = list(out)
+            r.result = f"removed={res.count(1)}/{n}"
+            del key_owners
+            return res
 
     # ---- Retention (kRetain) ----
     @property

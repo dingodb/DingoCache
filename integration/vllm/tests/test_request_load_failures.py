@@ -56,6 +56,10 @@ class MemoryClient:
         )
         return [True] * len(keys), [length] * len(keys)
 
+    def supports_remove(self):
+        # A wrong-length hit is removed when the ring can; this one cannot.
+        return False
+
 
 @pytest.fixture
 def make_receiver(monkeypatch):

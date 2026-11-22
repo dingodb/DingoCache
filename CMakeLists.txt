@@ -382,6 +382,10 @@ if(DFKV_BUILD_TESTS)
       COMMAND ${PYTHON3}
               ${CMAKE_CURRENT_SOURCE_DIR}/test/python/test_dfkv_vllm_worker.py
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME python_vllm_hybrid_state
+      COMMAND ${PYTHON3}
+              ${CMAKE_CURRENT_SOURCE_DIR}/test/python/test_dfkv_vllm_hybrid_state.py
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     # Shared telemetry layer: pure-python, no build/lib needed (OTel-push test
     # self-skips when the SDK is absent). Includes the vendored-copy drift guard.
     add_test(NAME python_telemetry

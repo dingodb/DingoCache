@@ -73,6 +73,12 @@ def load_lib(lib_path: Optional[str] = None) -> ctypes.CDLL:
     lib.dfkv_batch_exist.argtypes = [
         c_void_p, POINTER(c_void_p), POINTER(c_uint64),
         c_int, POINTER(c_int)]
+    # Remove RPC; absent from libraries that predate it.
+    if hasattr(lib, "dfkv_batch_remove"):
+        lib.dfkv_batch_remove.restype = c_int
+        lib.dfkv_batch_remove.argtypes = [
+            c_void_p, POINTER(c_void_p), POINTER(c_uint64),
+            c_int, POINTER(c_int)]
 
     # Scatter-gather: one key gathers num_bufs[i] non-contiguous source buffers
     # (ptrs[i][..], sizes[i][..]) on put / scatters into num_dsts[i] destination
