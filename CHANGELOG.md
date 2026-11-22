@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 2.41.0 — 2026-11-23
+
 
 - Server, RAM tier: a REMOVE is no longer undone by a read of the key that
   was in flight. A whole-value read of a key that is only on disk installs
