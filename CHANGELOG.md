@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 2.39.1 — 2026-11-22
+
 - Client, GPU dedup (`DFKV_CLIENT_NODE_DEDUP_GPU=1`): a process killed while
   it published a key no longer blocks that key, except in the cases listed
   at the end of this entry. A publisher holds its
