@@ -111,6 +111,7 @@ class KVStore : public StoreEngine {
     std::string path;
     uint64_t size = 0;
     uint64_t tenant_hash = 0;
+    uint64_t generation = 0;  // see ValueMetadata
     std::atomic<bool> referenced{false};  // CLOCK bit: set on access (read lock)
     // This entry's own node in Shard::ring. std::list iterators are stable
     // across other insert/erase, so Remove() drops the ring node in O(1)
@@ -152,6 +153,7 @@ class KVStore : public StoreEngine {
   std::string startup_error_;
   std::vector<std::unique_ptr<Shard>> shards_;  // fixed after construction
   std::atomic<uint64_t> tmp_seq_{0};  // unique suffix for concurrent lock-free writes
+  std::atomic<uint64_t> next_generation_{0};  // see Entry::generation
   // Eviction counters (relaxed): incremented in EvictLocked across shards.
   std::atomic<uint64_t> evictions_{0}, evicted_bytes_{0};
   std::atomic<uint64_t> tmp_reclaimed_{0};   // orphan .tmp removed at startup

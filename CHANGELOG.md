@@ -3,6 +3,26 @@
 ## Unreleased
 
 
+- Server, RAM tier: a REMOVE is no longer undone by a read of the key that
+  was in flight. A whole-value read of a key that is only on disk installs
+  a copy in RAM when it is done. If a REMOVE of the key returned while the
+  disk read was in flight, or ran while the copy was installed between the
+  RAM and the disk step of the REMOVE, the copy was installed anyway: after
+  a successful REMOVE, EXISTS and GET found the key, and a later PUT of it
+  was answered from RAM as a duplicate without reaching the disk. Now a
+  copy is installed only if the disk still has the key, judged under the
+  RAM lock (for the copied promotion and for the reserved, zero-copy one),
+  and a REMOVE drops a written RAM copy of the key once more after the disk
+  remove. A value still to be written is not touched by that second step.
+  The check is of the value, not only the key: a copy is not installed
+  either if the key was removed and written again during the read with a
+  value that reached the disk without passing through RAM (a quota tenant,
+  a capacity bypass); the copy would have hidden the new value. Each stored
+  value now carries an in-memory generation (nothing changes on disk), and
+  a reader that joined another reader's coalesced read does not promote
+  the bytes it was handed under its own generation.
+  No setting, API or wire change.
+
 - Client, GPU dedup (`DFKV_CLIENT_NODE_DEDUP_GPU=1`): restarting the
   inference processes in place no longer uses up the GPU dedup registry.
   Each process holds one of 64 registry entries, and an entry is reclaimed

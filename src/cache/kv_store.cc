@@ -328,6 +328,7 @@ bool KVStore::RebuildIndex() {  // constructor-time, single-threaded: no locks
     }
     sh.ring.push_front(fname);
     entry->second.it = sh.ring.begin();
+    entry->second.generation = ++next_generation_;
     sh.used_bytes += sz;
     sh.tenant_used_bytes[parsed_key.tenant_hash] += sz;
   }
@@ -539,6 +540,7 @@ Status KVStore::Cache(const BlockKey& key, const void* data, size_t len) {
     auto res =
         sh.index.try_emplace(fname, full.string(), len, key.tenant_hash);
     res.first->second.it = sh.ring.begin();  // O(1) removal handle
+    res.first->second.generation = ++next_generation_;
     sh.used_bytes += len;
     sh.tenant_used_bytes[key.tenant_hash] += len;
     eviction_ok = EvictLocked(sh, &trash);
@@ -651,6 +653,7 @@ Status KVStore::CacheDirect(const BlockKey& key, char* data, size_t len,
     auto res =
         sh.index.try_emplace(fname, full.string(), len, key.tenant_hash);
     res.first->second.it = sh.ring.begin();
+    res.first->second.generation = ++next_generation_;
     sh.used_bytes += len;
     sh.tenant_used_bytes[key.tenant_hash] += len;
     direct_eviction_ok = EvictLocked(sh, &trash);
@@ -827,6 +830,7 @@ Status KVStore::Lookup(const BlockKey& key, ValueMetadata* out) const {
   auto it = sh.index.find(fname);
   if (it == sh.index.end()) return Status::kNotFound;
   out->value_len = it->second.size;
+  out->generation = it->second.generation;
   return Status::kOk;
 }
 

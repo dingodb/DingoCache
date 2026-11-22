@@ -111,6 +111,9 @@ class KvNodeServerWiringTestPeer {
     options.is_persisted = [&server](const BlockKey& key) {
       return server.group_.IsCached(key);
     };
+    options.disk_generation = [&server](const BlockKey& key) {
+      return server.DiskGeneration(key);
+    };
     server.ram_ = std::make_unique<RamTier>(options, std::move(flush));
     server.ram_write_back_ = true;
     server.ram_ack_enabled_ = ram_ack;
@@ -2014,4 +2017,224 @@ TEST(RamTierFlushFailure, ARetainParkedForAValueWhoseFlushIsRetriedIsApplied) {
   }));
   EXPECT_EQ(node.Metric("dfkv_ram_post_ack_flush_failures_total"), 0);
   EXPECT_EQ(node.Metric("dfkv_retain_pending_applied_total"), 1);
+}
+
+// ---- REMOVE against a read promotion in flight (REQ-09) ---------------------
+namespace {
+// A file store whose reads and removes the test can hold: a read after its
+// bytes are in the caller's buffer, a remove before it touches the disk.
+class HoldingStore : public KVStore {
+ public:
+  HoldingStore(const std::string& path, uint64_t capacity)
+      : KVStore(Options{path, capacity}) {}
+  Status RangeDirect(const BlockKey& key, uint64_t offset, uint64_t length,
+                     char* io_buf, size_t io_cap, const char** out_data,
+                     size_t* out_len, size_t* value_len) override {
+    const Status st = KVStore::RangeDirect(key, offset, length, io_buf, io_cap,
+                                           out_data, out_len, value_len);
+    if (hold_read.exchange(false)) read.Block();
+    return st;
+  }
+  Status Remove(const BlockKey& key) override {
+    if (hold_remove.exchange(false)) remove.Block();
+    return KVStore::Remove(key);
+  }
+  std::atomic<bool> hold_read{false}, hold_remove{false};
+  FlushBarrier read, remove;
+};
+}  // namespace
+
+// A whole-value read of a key that is only on disk promotes the value into
+// RAM when the read is done. A REMOVE of the key that returns while the read
+// is in flight must not be undone by that promotion: after it, the key is
+// gone from both tiers. The promotion used to install the value anyway, and
+// EXISTS and GET then found a removed key. Both orders: the REMOVE completes
+// during the disk read, and the promotion lands while the REMOVE is between
+// the RAM tier and the disk.
+TEST(RamTierWiring, ARemoveIsNotUndoneByAReadPromotionInFlight) {
+  for (bool promotion_during_remove : {false, true}) {
+    SCOPED_TRACE(promotion_during_remove ? "promotion during the remove"
+                                         : "remove during the read");
+    const auto dir = fs::temp_directory_path() /
+        ("dfkv_remove_promote_" + std::to_string(promotion_during_remove));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    HoldingStore* store = nullptr;
+    DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+    options.engine_factory = [&](const std::string& path, uint64_t capacity) {
+      auto engine = std::make_unique<HoldingStore>(path, capacity);
+      store = engine.get();
+      return engine;
+    };
+    auto server = KvNodeServerWiringTestPeer::Create(std::move(options));
+    KvNodeServerWiringTestPeer::SetCoalescing(*server, false);
+    KvNodeServerWiringTestPeer::SetRam(
+        *server, [](const BlockKey&, char*, size_t, size_t) {
+          return Status::kOk;
+        });
+    const BlockKey key{8301, 0};
+    const std::string value(4096 + 111, 'q');
+    ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*server, key, value.data(),
+                                                  value.size()),
+              Status::kOk);
+    alignas(4096) static char staging[16 * 1024];
+    auto read = [&] {
+      const char* data = nullptr;
+      size_t bytes = 0, value_len = 0;
+      return server->RangeDirectForKey(key, 0, value.size(), staging,
+                                       sizeof(staging), &data, &bytes,
+                                       &value_len);
+    };
+    auto remove = [&] {
+      std::string out;
+      return server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRemove),
+                                          key, 0, 0, nullptr, 0, &out);
+    };
+    if (!promotion_during_remove) {
+      store->hold_read = true;
+      std::thread reader([&] { EXPECT_EQ(read(), Status::kOk); });
+      ASSERT_TRUE(store->read.AwaitEntry());
+      EXPECT_EQ(remove(), Status::kOk);
+      store->read.Open();
+      reader.join();
+    } else {
+      store->hold_remove = true;
+      Status removed = Status::kIOError;
+      std::thread remover([&] { removed = remove(); });
+      ASSERT_TRUE(store->remove.AwaitEntry());  // RAM done, disk not yet
+      EXPECT_EQ(read(), Status::kOk);           // promotes: disk still has it
+      store->remove.Open();
+      remover.join();
+      EXPECT_EQ(removed, Status::kOk);
+    }
+    EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*server, key))
+        << "the removed key came back into RAM";
+    std::string out;
+    EXPECT_EQ(server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRange),
+                                           key, 0, 0, nullptr, 0, &out),
+              Status::kNotFound);
+    server.reset();
+    fs::remove_all(dir);
+  }
+}
+
+
+// The same read, and between its disk read and its promotion the key is
+// removed and written again with a new value that reaches the disk without
+// passing through RAM (a quota tenant, a capacity bypass). The promotion
+// carries the old value and must not be installed over the new one: a GET
+// returns what the disk now holds. It used to return the old value from RAM.
+TEST(RamTierWiring, AReadPromotionDoesNotInstallAValueTheDiskHasReplaced) {
+  const auto dir = fs::temp_directory_path() / "dfkv_promote_replaced";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  HoldingStore* store = nullptr;
+  DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+  options.engine_factory = [&](const std::string& path, uint64_t capacity) {
+    auto engine = std::make_unique<HoldingStore>(path, capacity);
+    store = engine.get();
+    return engine;
+  };
+  auto server = KvNodeServerWiringTestPeer::Create(std::move(options));
+  KvNodeServerWiringTestPeer::SetCoalescing(*server, false);
+  KvNodeServerWiringTestPeer::SetRam(
+      *server, [](const BlockKey&, char*, size_t, size_t) {
+        return Status::kOk;
+      });
+  const BlockKey key{8302, 0};
+  const std::string v1(4096 + 111, '1'), v2(4096 + 111, '2');
+  ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*server, key, v1.data(),
+                                                v1.size()),
+            Status::kOk);
+  alignas(4096) static char staging[16 * 1024];
+  store->hold_read = true;
+  std::thread reader([&] {
+    const char* data = nullptr;
+    size_t bytes = 0, value_len = 0;
+    EXPECT_EQ(server->RangeDirectForKey(key, 0, v1.size(), staging,
+                                        sizeof(staging), &data, &bytes,
+                                        &value_len),
+              Status::kOk);
+  });
+  ASSERT_TRUE(store->read.AwaitEntry());  // has read v1
+  std::string out;
+  ASSERT_EQ(server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRemove),
+                                         key, 0, 0, nullptr, 0, &out),
+            Status::kOk);
+  ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*server, key, v2.data(),
+                                                v2.size()),
+            Status::kOk);  // disk only
+  store->read.Open();
+  reader.join();
+  out.clear();
+  ASSERT_EQ(server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRange),
+                                         key, 0, 0, nullptr, 0, &out),
+            Status::kOk);
+  EXPECT_EQ(out, v2) << "the old value was installed over the new one";
+  server.reset();
+  fs::remove_all(dir);
+}
+
+// The same race through a coalesced read: a second reader of the key arrives
+// after the REMOVE and the new value, takes the new value's generation, and
+// joins the read that is still running for the old one. It gets the old
+// bytes (it overlapped the change), but must not promote them under the new
+// generation: a GET afterwards returns what the disk holds.
+TEST(RamTierWiring, ACoalescedReaderDoesNotPromoteTheLeadersOldValue) {
+  const auto dir = fs::temp_directory_path() / "dfkv_promote_follower";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  HoldingStore* store = nullptr;
+  DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+  options.engine_factory = [&](const std::string& path, uint64_t capacity) {
+    auto engine = std::make_unique<HoldingStore>(path, capacity);
+    store = engine.get();
+    return engine;
+  };
+  auto server = KvNodeServerWiringTestPeer::Create(std::move(options));
+  KvNodeServerWiringTestPeer::SetCoalescing(*server, true);
+  KvNodeServerWiringTestPeer::SetRam(
+      *server, [](const BlockKey&, char*, size_t, size_t) {
+        return Status::kOk;
+      });
+  const BlockKey key{8303, 0};
+  const std::string v1(4096 + 111, '1'), v2(4096 + 111, '2');
+  ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*server, key, v1.data(),
+                                                v1.size()),
+            Status::kOk);
+  auto read = [&](char* buf, size_t cap) {
+    const char* data = nullptr;
+    size_t bytes = 0, value_len = 0;
+    return server->RangeDirectForKey(key, 0, v1.size(), buf, cap, &data,
+                                     &bytes, &value_len);
+  };
+  alignas(4096) static char leader_buf[16 * 1024];
+  alignas(4096) static char follower_buf[16 * 1024];
+  store->hold_read = true;
+  std::thread leader([&] {
+    EXPECT_EQ(read(leader_buf, sizeof(leader_buf)), Status::kOk);
+  });
+  ASSERT_TRUE(store->read.AwaitEntry());  // the leader has read v1
+  std::string out;
+  ASSERT_EQ(server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRemove),
+                                         key, 0, 0, nullptr, 0, &out),
+            Status::kOk);
+  ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(*server, key, v2.data(),
+                                                v2.size()),
+            Status::kOk);  // disk only
+  std::thread follower([&] {
+    EXPECT_EQ(read(follower_buf, sizeof(follower_buf)), Status::kOk);
+  });
+  // The follower joins the flight; it waits up to 500 ms for the leader.
+  std::this_thread::sleep_for(100ms);
+  store->read.Open();
+  leader.join();
+  follower.join();
+  out.clear();
+  ASSERT_EQ(server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRange),
+                                         key, 0, 0, nullptr, 0, &out),
+            Status::kOk);
+  EXPECT_EQ(out, v2) << "the leader's old value was promoted by a follower";
+  server.reset();
+  fs::remove_all(dir);
 }

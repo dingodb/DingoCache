@@ -291,6 +291,10 @@ class PreparedRead {
 };
 struct ValueMetadata {
   uint64_t value_len = 0;
+  // Which value of the key this is: a value written after a REMOVE (or an
+  // eviction) has another one. Kept in memory only, so it is not stable
+  // across restarts. 0 when the engine does not tell.
+  uint64_t generation = 0;
 };
 
 

@@ -2554,3 +2554,35 @@ TEST(RamTierFlushFailure, GivenUpIsNotCalledForAValueRemovedDuringItsFlush) {
   std::lock_guard<std::mutex> lk(mu);
   EXPECT_EQ(given_up, std::vector<uint64_t>{2});
 }
+
+// ---- Promotions and the disk (REQ-09) ----------------------------------------
+// A promotion installs a copy of what the disk holds. If the disk no longer
+// holds the key when the copy is installed (it was removed meanwhile), the
+// copy is not installed: it would bring a removed key back.
+TEST(RamTier, APromotionOfAValueTheDiskNoLongerHoldsIsNotInstalled) {
+  FlushSink sink;
+  std::atomic<uint64_t> on_disk{0};  // generation of the disk value, 0 none
+  RamTier::Options o = Opts(64 * 4096);
+  o.disk_generation = [&](const BlockKey&) { return on_disk.load(); };
+  RamTier rt(o, sink.fn());
+  const std::string v(5000, 'p');
+  // Read generation 7; the disk then lost the key, or holds generation 8.
+  for (uint64_t now : {uint64_t{0}, uint64_t{8}}) {
+    SCOPED_TRACE(now == 0 ? "removed" : "replaced");
+    on_disk = now;
+    const uint64_t id = 10 * now;
+    rt.PutDurable(K(id + 1), v.data(), v.size(), 7);
+    EXPECT_FALSE(rt.Contains(K(id + 1))) << "a copied promotion";
+    {
+      RamTier::DurableReservation reservation;
+      ASSERT_TRUE(rt.ReserveDurable(K(id + 2), v.size(), &reservation, 7));
+      std::memcpy(reservation.data(), v.data(), v.size());
+      EXPECT_FALSE(reservation.Commit());
+    }
+    EXPECT_FALSE(rt.Contains(K(id + 2))) << "a reserved promotion";
+  }
+  on_disk = 7;
+  EXPECT_TRUE(rt.PutDurable(K(3), v.data(), v.size(), 7));
+  EXPECT_TRUE(rt.Contains(K(3))) << "the disk still holds it: installed";
+}
+

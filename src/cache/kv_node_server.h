@@ -286,6 +286,8 @@ class KvNodeServer {
   std::unordered_map<BlockKey, uint32_t, BlockKeyHasher> pending_retain_;
   std::atomic<size_t> pending_retain_applied_{0};
   void ApplyPendingRetain(const BlockKey& key, bool flushed);
+  // The generation of the disk's value for a key (ValueMetadata), 0 if none.
+  uint64_t DiskGeneration(const BlockKey& key) const;
   std::atomic<size_t> remove_ok_{0}, remove_miss_{0};
   std::atomic<size_t> bytes_written_{0}, bytes_read_{0};
   // Read-side convoy collapse (env DFKV_READ_COALESCE=1; see read_coalescer.h).

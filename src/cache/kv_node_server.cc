@@ -329,6 +329,9 @@ std::future<std::unique_ptr<RamTier>> KvNodeServer::StartRamTier() {
   o.is_persisted = [this](const BlockKey& key) {
     return group_.IsCached(key);
   };
+  o.disk_generation = [this](const BlockKey& key) {
+    return DiskGeneration(key);
+  };
   o.cancel_start = [this] { return RamStartUnwanted(); };
   // A flush to a disk store that has failed for good is not tried again.
   o.flush_target_failed = [this](const BlockKey& key) {
@@ -1386,6 +1389,10 @@ Status KvNodeServer::ProcessRequestForKey(
       if (ram_) ApplyPendingRetain(key, /*flushed=*/false);
       const bool ram_had = ram_ && ram_->Remove(key);
       const Status disk_status = group_.Remove(key);
+      // A read of the key that was in flight may have promoted it into RAM
+      // between the two removes; a promotion after the disk remove is not
+      // installed (it checks the disk), one before it is dropped here.
+      if (ram_) ram_->DropDurableCopy(key);
       if (disk_status == Status::kOk ||
           (disk_status == Status::kNotFound && ram_had)) {
         st = Status::kOk;
@@ -1627,6 +1634,13 @@ bool KvNodeServer::RamPinnedHitForKey(const BlockKey& key, uint64_t offset,
   return true;
 }
 
+uint64_t KvNodeServer::DiskGeneration(const BlockKey& key) const {
+  ValueMetadata metadata;
+  if (group_.Lookup(key, &metadata) != Status::kOk) return 0;
+  // An engine that does not tell the generation still tells presence.
+  return metadata.generation != 0 ? metadata.generation : 1;
+}
+
 Status KvNodeServer::RangeDirectForKey(
     const BlockKey& key, uint64_t offset, uint64_t length, char* io_buf,
     size_t io_cap, const char** out_data, size_t* out_len, size_t* value_len) {
@@ -1649,13 +1663,21 @@ Status KvNodeServer::RangeDirectForKey(
       return Status::kOk;
     }
   }
-  // Promotion needs the same read's full length even when the caller omits it.
+  // Promotion needs the same read's full length even when the caller omits it,
+  // and which disk value it reads, taken before the read.
   size_t stored_len = 0;
   if (value_len == nullptr) value_len = &stored_len;
+  const uint64_t generation = ram_ ? DiskGeneration(key) : 0;
   Status st;
+  // Only bytes this call read itself may be promoted under its generation: a
+  // follower of a coalesced read gets the leader's bytes, which may be of an
+  // older value than the one the follower's generation names (the key was
+  // removed and written again during the leader's read). The leader promotes.
+  bool own_read = true;
   if (coalesce_enabled_) {
     // Leader reads into the shared scratch, every rank's convoy copy lands in
     // its own registered io_buf; *out_data must point at io_buf either way.
+    ReadCoalescer::Outcome outcome;
     st = read_coalescer_.Read(
         key, offset, length, io_buf, io_cap, out_len, value_len,
         [&](char* buf, size_t cap, size_t* n, size_t* stored_len) {
@@ -1669,7 +1691,9 @@ Status KvNodeServer::RangeDirectForKey(
           if (s == Status::kOk && p && p != buf && *n > 0)
             std::memmove(buf, p, *n < cap ? *n : cap);
           return s;
-        });
+        },
+        &outcome);
+    own_read = outcome.leader;
     if (st == Status::kOk && out_data) *out_data = io_buf;
   } else {
     st = group_.RangeDirect(key, offset, length, io_buf, io_cap, out_data,
@@ -1681,9 +1705,9 @@ Status KvNodeServer::RangeDirectForKey(
     // Only a complete value may become a durable RAM resident. A slice must
     // never replace the key's full contents or reported stored length.
     // Best-effort: the data is already durable, so no flush is needed.
-    if (ram_ && offset == 0 && *out_data && *out_len > 0 &&
+    if (ram_ && own_read && offset == 0 && *out_data && *out_len > 0 &&
         *out_len == *value_len)
-      ram_->PutDurable(key, *out_data, *out_len);
+      ram_->PutDurable(key, *out_data, *out_len, generation);
   } else if (st == Status::kNotFound) {
     cache_miss_.fetch_add(1, std::memory_order_relaxed);
   } else if (st == Status::kIOError) {
@@ -1750,6 +1774,9 @@ PreparedRead KvNodeServer::PrepareReadForKey(
       read_coalescer_.InFlight(key, offset, length))
     return PreparedRead::Result(Status::kInvalid);
 
+  // Which disk value is read, taken before the read: a promotion is installed
+  // only if the disk still holds that value when it lands.
+  const uint64_t generation = ram_ ? DiskGeneration(key) : 0;
   ReadLease lease;
   const Status st =
       group_.RangeDirectPrep(key, offset, length, staging_cap, &lease);
@@ -1769,7 +1796,7 @@ PreparedRead KvNodeServer::PrepareReadForKey(
   RamTier::DurableReservation reservation;
   bool direct_reservation = false;
   if (ram_ && whole && lease.head == 0 &&
-      ram_->ReserveDurable(key, lease.value_len, &reservation)) {
+      ram_->ReserveDurable(key, lease.value_len, &reservation, generation)) {
     direct_reservation = lease.aligned_len <= reservation.capacity();
     if (!direct_reservation)
       reservation = RamTier::DurableReservation{};
@@ -1780,7 +1807,8 @@ PreparedRead KvNodeServer::PrepareReadForKey(
       lease.payload_len != 0 && lease.aligned_len <= staging_cap &&
       lease.aligned_len <= std::numeric_limits<unsigned>::max()) {
     flight = read_coalescer_.TryRegisterAsync(
-        key, offset, length, whole, lease.value_len, direct_reservation);
+        key, offset, length, whole, lease.value_len, direct_reservation,
+        generation);
     if (flight == 0) {
       // The lease and any hidden reservation release on return.
       return PreparedRead::Result(Status::kInvalid);
@@ -1829,11 +1857,12 @@ void KvNodeServer::FinishDiskRead(
     BlockKey key;
     bool whole = false;
     bool recurrent = false;
+    uint64_t generation = 0;
     (void)server->read_coalescer_.CompleteAsync(
         flight, ok ? Status::kOk : Status::kIOError, data, bytes_read, &key,
-        &whole, &recurrent);
+        &whole, &recurrent, &generation);
     if (ok && whole && server->ram_ && data && bytes_read) {
-      server->ram_->PutDurable(key, data, bytes_read);
+      server->ram_->PutDurable(key, data, bytes_read, generation);
     }
   }
   if (server->lat_sampler_.ShouldSample())

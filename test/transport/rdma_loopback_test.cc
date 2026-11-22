@@ -61,6 +61,16 @@ namespace dfkv {
 class KvNodeServerTestPeer {
  public:
   static RamTier& Ram(KvNodeServer& server) { return *server.ram_; }
+  // A RAM promotion copies what the disk holds, so the disk gets the value
+  // first: a copy of a value the disk does not hold is not installed. The
+  // result is that of the RAM install alone; the disk write must succeed.
+  static bool Promote(KvNodeServer& server, const BlockKey& key,
+                      const std::string& value) {
+    EXPECT_EQ(server.group_.Cache(key, value.data(), value.size()),
+              Status::kOk);
+    return server.ram_->PutDurable(key, value.data(), value.size(),
+                                   server.DiskGeneration(key));
+  }
   static uint64_t GetLatencyCount(const KvNodeServer& server) {
     return server.get_lat_.Count();
   }
@@ -3667,7 +3677,7 @@ TEST(RdmaLoopback, DynamicPullPinSurvivesRemoveAndEvictionUntilRelease) {
   const BlockKey replacement = ToBlockKey(SelfHdr(), "replacement");
   const std::string value = PatternValue(700000, 73);
   const std::string other = PatternValue(value.size(), 74);
-  ASSERT_TRUE(ram.PutDurable(key, value.data(), value.size()));
+  ASSERT_TRUE(KvNodeServerTestPeer::Promote(*node.srv, key, value));
   PinnedPullPeer peer;
   ASSERT_TRUE(peer.Open(node));
   const uint64_t baseline = rdma::RcEndpoint::LeaseReadMrActive();
@@ -3681,12 +3691,12 @@ TEST(RdmaLoopback, DynamicPullPinSurvivesRemoveAndEvictionUntilRelease) {
   EXPECT_EQ(ram.Hits(), 0u);
   EXPECT_EQ(KvNodeServerTestPeer::GetLatencyCount(*node.srv), 0u);
   // One extent, one class slot: pressure cannot evict the pinned source.
-  EXPECT_FALSE(ram.PutDurable(replacement, other.data(), other.size()));
+  EXPECT_FALSE(KvNodeServerTestPeer::Promote(*node.srv, replacement, other));
   EXPECT_TRUE(ram.Contains(key));
   EXPECT_TRUE(ram.Remove(key));
   EXPECT_FALSE(ram.Contains(key));
   EXPECT_GT(ram.UsedBytes(), 0u);
-  EXPECT_FALSE(ram.PutDurable(replacement, other.data(), other.size()));
+  EXPECT_FALSE(KvNodeServerTestPeer::Promote(*node.srv, replacement, other));
   std::string out;
   ASSERT_TRUE(peer.Read(ready, &out));
   EXPECT_EQ(out, value.substr(97, 200013));
@@ -3697,7 +3707,7 @@ TEST(RdmaLoopback, DynamicPullPinSurvivesRemoveAndEvictionUntilRelease) {
   EXPECT_EQ(KvNodeServerTestPeer::GetLatencyCount(*node.srv), 1u);
   EXPECT_EQ(CounterVal(node.srv->MetricsText(), "dfkv_bytes_read_total"), 200013);
   EXPECT_EQ(ram.UsedBytes(), 0u);
-  ASSERT_TRUE(ram.PutDurable(replacement, other.data(), other.size()));
+  ASSERT_TRUE(KvNodeServerTestPeer::Promote(*node.srv, replacement, other));
 }
 
 TEST(RdmaLoopback, DynamicPullTeardownAbortsAccountingAndReleasesPin) {
@@ -3708,7 +3718,7 @@ TEST(RdmaLoopback, DynamicPullTeardownAbortsAccountingAndReleasesPin) {
   auto& ram = KvNodeServerTestPeer::Ram(*node.srv);
   const BlockKey key = ToBlockKey(SelfHdr(), "aborted");
   const std::string value = PatternValue(65537, 51);
-  ASSERT_TRUE(ram.PutDurable(key, value.data(), value.size()));
+  ASSERT_TRUE(KvNodeServerTestPeer::Promote(*node.srv, key, value));
   PinnedPullPeer peer;
   ASSERT_TRUE(peer.Open(node));
   const uint64_t baseline = rdma::RcEndpoint::LeaseReadMrActive();
@@ -3733,7 +3743,7 @@ TEST(RdmaLoopback, DynamicPullExactGrantRejectsReadPastRequestedRange) {
   auto& ram = KvNodeServerTestPeer::Ram(*node.srv);
   const BlockKey key = ToBlockKey(SelfHdr(), "bounded");
   const std::string value = PatternValue(65537, 85);
-  ASSERT_TRUE(ram.PutDurable(key, value.data(), value.size()));
+  ASSERT_TRUE(KvNodeServerTestPeer::Promote(*node.srv, key, value));
   PinnedPullPeer peer;
   ASSERT_TRUE(peer.Open(node));
   const uint64_t baseline = rdma::RcEndpoint::LeaseReadMrActive();
@@ -3775,7 +3785,7 @@ TEST(RdmaLoopback, DynamicPullFallbackAccountsOneAccess) {
   for (size_t size : {size_t{65537}, size_t{1048577}}) {
     const BlockKey key = ToBlockKey(SelfHdr(), std::to_string(size));
     const std::string value = PatternValue(size, 29);
-    ASSERT_TRUE(ram.PutDurable(key, value.data(), value.size()));
+    ASSERT_TRUE(KvNodeServerTestPeer::Promote(*node.srv, key, value));
     PreparedRead probe;
     EXPECT_EQ(node.srv->RamPinnedHitForKey(key, 0, size, &probe),
               size < 1048576);

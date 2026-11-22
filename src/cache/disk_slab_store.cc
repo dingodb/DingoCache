@@ -2575,6 +2575,7 @@ Status DiskSlabStore::Lookup(const BlockKey& key, ValueMetadata* out) const {
   auto it = payload_len_.find(key);
   if (it == payload_len_.end()) return Status::kNotFound;
   out->value_len = it->second;
+  out->generation = alloc_->Generation(key);
   return Status::kOk;
 }
 
