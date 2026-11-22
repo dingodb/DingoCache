@@ -34,3 +34,9 @@ for dst in "${HOT_DSTS[@]}"; do
   cp "$HOT_SRC" "$dst"
   echo "synced $HOT_SRC -> $dst"
 done
+
+# Connector access log: the vLLM copy is canonical (HiCache has its own).
+ACCESS_SRC="integration/vllm/src/dfkv_vllm/access_log.py"
+ACCESS_DST="integration/lmcache/src/dfkv_connector/access_log.py"
+cp "$ACCESS_SRC" "$ACCESS_DST"
+echo "synced $ACCESS_SRC -> $ACCESS_DST"

@@ -56,5 +56,22 @@ class HotConfigVendorSyncTest(unittest.TestCase):
                 "{} drifted from canonical; run deploy/sync_telemetry.sh".format(path))
 
 
+# Connector access log: the vLLM copy is canonical, LMCache vendors it.
+ACCESS_CANON = os.path.join(ROOT, "integration", "vllm", "src", "dfkv_vllm", "access_log.py")
+ACCESS_VENDORED = os.path.join(
+    ROOT, "integration", "lmcache", "src", "dfkv_connector", "access_log.py")
+
+
+class AccessLogVendorSyncTest(unittest.TestCase):
+    def test_lmcache_access_log_is_byte_identical(self):
+        with open(ACCESS_CANON, "rb") as fh:
+            canon = fh.read()
+        with open(ACCESS_VENDORED, "rb") as fh:
+            got = fh.read()
+        self.assertEqual(
+            got, canon,
+            "{} drifted from canonical; run deploy/sync_telemetry.sh".format(ACCESS_VENDORED))
+
+
 if __name__ == "__main__":
     unittest.main()

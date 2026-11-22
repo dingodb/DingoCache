@@ -1,17 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Per-operation access log for the dfkv LMCache connector.
+"""Per-operation access log for the dfkv vLLM and LMCache connectors.
+
+This file is shared: integration/vllm/src/dfkv_vllm/access_log.py is the
+canonical copy and deploy/sync_telemetry.sh copies it byte for byte into the
+LMCache connector (test_telemetry_vendor_sync guards drift).
 
 Mirrors the format used by dfkv's HiCache / dingofs vfs access log, one line
-per operation:
+per operation::
 
     <op>(<args>) : <result> <duration_seconds>
 
 e.g.::
 
+    batch_get_auto_sg(20 keys) : hits=20/20, 1310720 bytes <0.007234>
+    batch_put_sg(1 keys, 65536 bytes) : ok=1/1 <0.000821>
     batched_get(20 keys) : hits=20/20 <0.007234>
-    native.batch_set(1 keys, 65536 bytes) : ok <0.000821>
     get(model@1@0@cafebabe) : not_found <0.001012>
-    put(model@1@0@cafebabe, 4194304) : FAIL RuntimeError: IoError <0.001230>
+    batch_put(8 keys, 524288 bytes) : FAIL RuntimeError: dfkv_batch_put rc=-1 <0.001230>
 
 Off by default. The SAME environment variables as every other dfkv access log,
 so one setting covers all integrations:
@@ -132,7 +137,7 @@ def _build_sink(path: str, max_bytes: int, backup_count: int,
     _listener = None
     log = logging.getLogger("dfkv.access")
     log.setLevel(logging.INFO)
-    log.propagate = False  # keep out of root logger / LMCache's stack
+    log.propagate = False  # keep out of the root logger and the engine's logging stack
     for h in list(log.handlers):
         log.removeHandler(h)
 

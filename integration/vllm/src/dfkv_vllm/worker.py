@@ -502,99 +502,36 @@ MAX_LOOKUP_TIMEOUT_MS = 600000
 _TRANSFER_STOP = object()
 
 
-def _parse_transfer_queue_capacity(value: Any) -> int:
+def _parse_bounded_int(name: str, value: Any, low: int, high: int) -> int:
     if isinstance(value, bool):
-        raise ValueError("transfer_queue_capacity must be an integer")
+        raise ValueError(f"{name} must be an integer")
     if isinstance(value, int):
-        capacity = value
+        parsed = value
     elif isinstance(value, str) and value.strip().isdigit():
-        capacity = int(value.strip())
+        parsed = int(value.strip())
     else:
-        raise ValueError("transfer_queue_capacity must be an integer")
-    if not 1 <= capacity <= MAX_TRANSFER_QUEUE_CAPACITY:
-        raise ValueError(
-            "transfer_queue_capacity must be in "
-            f"[1, {MAX_TRANSFER_QUEUE_CAPACITY}], got {capacity}"
-        )
-    return capacity
+        raise ValueError(f"{name} must be an integer")
+    if not low <= parsed <= high:
+        raise ValueError(f"{name} must be in [{low}, {high}], got {parsed}")
+    return parsed
+
+def _parse_transfer_queue_capacity(value: Any) -> int:
+    return _parse_bounded_int("transfer_queue_capacity", value, 1, MAX_TRANSFER_QUEUE_CAPACITY)
 
 def _parse_recv_workers(value: Any) -> int:
-    if isinstance(value, bool):
-        raise ValueError("recv_workers must be an integer")
-    if isinstance(value, int):
-        workers = value
-    elif isinstance(value, str) and value.strip().isdigit():
-        workers = int(value.strip())
-    else:
-        raise ValueError("recv_workers must be an integer")
-    if not 1 <= workers <= MAX_RECV_WORKERS:
-        raise ValueError(
-            f"recv_workers must be in [1, {MAX_RECV_WORKERS}], got {workers}"
-        )
-    return workers
+    return _parse_bounded_int("recv_workers", value, 1, MAX_RECV_WORKERS)
 
 def _parse_load_window_keys(value: Any) -> int:
-    if isinstance(value, bool):
-        raise ValueError("load_window_keys must be an integer")
-    if isinstance(value, int):
-        window = value
-    elif isinstance(value, str) and value.strip().isdigit():
-        window = int(value.strip())
-    else:
-        raise ValueError("load_window_keys must be an integer")
-    if not 0 <= window <= MAX_LOAD_WINDOW_KEYS:
-        raise ValueError(
-            f"load_window_keys must be in [0, {MAX_LOAD_WINDOW_KEYS}], got {window}"
-        )
-    return window
+    return _parse_bounded_int("load_window_keys", value, 0, MAX_LOAD_WINDOW_KEYS)
 
 def _parse_load_window_min_keys(value: Any) -> int:
-    if isinstance(value, bool):
-        raise ValueError("load_window_min_keys must be an integer")
-    if isinstance(value, int):
-        minimum = value
-    elif isinstance(value, str) and value.strip().isdigit():
-        minimum = int(value.strip())
-    else:
-        raise ValueError("load_window_min_keys must be an integer")
-    if not 0 <= minimum <= MAX_LOAD_WINDOW_MIN_KEYS:
-        raise ValueError(
-            "load_window_min_keys must be in "
-            f"[0, {MAX_LOAD_WINDOW_MIN_KEYS}], got {minimum}"
-        )
-    return minimum
+    return _parse_bounded_int("load_window_min_keys", value, 0, MAX_LOAD_WINDOW_MIN_KEYS)
 
 def _parse_lookup_cache_ttl_ms(value: Any) -> int:
-    if isinstance(value, bool):
-        raise ValueError("lookup_cache_ttl_ms must be an integer")
-    if isinstance(value, int):
-        ttl_ms = value
-    elif isinstance(value, str) and value.strip().isdigit():
-        ttl_ms = int(value.strip())
-    else:
-        raise ValueError("lookup_cache_ttl_ms must be an integer")
-    if not 0 <= ttl_ms <= MAX_LOOKUP_CACHE_TTL_MS:
-        raise ValueError(
-            "lookup_cache_ttl_ms must be in "
-            f"[0, {MAX_LOOKUP_CACHE_TTL_MS}], got {ttl_ms}"
-        )
-    return ttl_ms
+    return _parse_bounded_int("lookup_cache_ttl_ms", value, 0, MAX_LOOKUP_CACHE_TTL_MS)
 
 def _parse_lookup_timeout_ms(value: Any) -> int:
-    if isinstance(value, bool):
-        raise ValueError("lookup_timeout_ms must be an integer")
-    if isinstance(value, int):
-        timeout_ms = value
-    elif isinstance(value, str) and value.strip().isdigit():
-        timeout_ms = int(value.strip())
-    else:
-        raise ValueError("lookup_timeout_ms must be an integer")
-    if not 0 <= timeout_ms <= MAX_LOOKUP_TIMEOUT_MS:
-        raise ValueError(
-            "lookup_timeout_ms must be in "
-            f"[0, {MAX_LOOKUP_TIMEOUT_MS}], got {timeout_ms}"
-        )
-    return timeout_ms
+    return _parse_bounded_int("lookup_timeout_ms", value, 0, MAX_LOOKUP_TIMEOUT_MS)
 
 def _load_windows(
     length: int,
