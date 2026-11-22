@@ -895,6 +895,9 @@ _DEDUP_COUNTERS = (
     "dfkv_client_gpu_dedup_fetches_total",
     "dfkv_client_gpu_dedup_wait_hits_total",
     "dfkv_client_gpu_dedup_wait_timeouts_total",
+    "dfkv_client_gpu_dedup_load_fences_total",
+    "dfkv_client_gpu_dedup_load_fence_failures_total",
+    "dfkv_client_gpu_dedup_invalidate_stuck_total",
 )
 
 

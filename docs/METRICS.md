@@ -557,6 +557,7 @@ homogeneous 兼容；configured tiers 对该 member fail closed。legacy MDS 不
 | `dfkv_client_peer_latency_seconds_count` / `dfkv_client_peer_latency_seconds_sum` | counter | `peer` | C++ 累计 peer probe 样本数 / 时长 |
 | `dfkv_connector_dedup_hits_total` / `dfkv_connector_dedup_fetches_total` / `dfkv_connector_dedup_wait_hits_total` / `dfkv_connector_dedup_wait_timeouts_total` | counter | — | host rendezvous dedup 漏斗 |
 | `dfkv_connector_gpu_dedup_hits_total` / `dfkv_connector_gpu_dedup_fetches_total` / `dfkv_connector_gpu_dedup_wait_hits_total` / `dfkv_connector_gpu_dedup_wait_timeouts_total` | counter | — | CUDA IPC rendezvous 漏斗 |
+| `dfkv_connector_gpu_dedup_load_fences_total` / `dfkv_connector_gpu_dedup_load_fence_failures_total` / `dfkv_connector_gpu_dedup_invalidate_stuck_total` | counter | — | 原生 `dfkv_client_gpu_dedup_*` 同名计数的转发（含义见 §3 客户端表）。原生库不输出的计数不上报：`invalidate_stuck` 要等原生库开始输出它之后才有数据 |
 
 其余原生状态/传输 family 由 §3.3 的 allowlist **一一**导出，名称映射是公开契约：
 

@@ -30,6 +30,21 @@ class ClientMetricsTest(unittest.TestCase):
             ],
         )
 
+    def test_parser_accepts_gpu_dedup_fence_and_stuck_counters(self):
+        text = (
+            'dfkv_client_gpu_dedup_load_fences_total 12\n'
+            'dfkv_client_gpu_dedup_load_fence_failures_total 1\n'
+            'dfkv_client_gpu_dedup_invalidate_stuck_total 2\n'
+        )
+        self.assertEqual(
+            [(sample.name, sample.value) for sample in parse_snapshot(text)],
+            [
+                ("dfkv_client_gpu_dedup_load_fences_total", 12.0),
+                ("dfkv_client_gpu_dedup_load_fence_failures_total", 1.0),
+                ("dfkv_client_gpu_dedup_invalidate_stuck_total", 2.0),
+            ],
+        )
+
     def test_delta_handles_labels_and_native_counter_reset(self):
         delta = SnapshotDelta()
         first = delta.consume(

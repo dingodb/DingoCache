@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Connectors (vLLM, LMCache, SGLang HiCache): the GPU dedup counters added
+  in 2.39.1, `dfkv_client_gpu_dedup_load_fences_total` and
+  `dfkv_client_gpu_dedup_load_fence_failures_total`, are now forwarded
+  like the other dedup counters: to the metrics push as
+  `dfkv_connector_gpu_dedup_load_fences_total` and
+  `dfkv_connector_gpu_dedup_load_fence_failures_total`, and to the
+  inference server's metrics endpoint under their native names. They were
+  in the native snapshot only. `dfkv_client_gpu_dedup_invalidate_stuck_total`
+  is forwarded the same way once the native client reports it; a counter
+  the native client does not report is not sent.
+
 ## 2.39.1 — 2026-11-22
 
 - Client, GPU dedup (`DFKV_CLIENT_NODE_DEDUP_GPU=1`): a process killed while
