@@ -298,6 +298,11 @@ if(DFKV_BUILD_TESTS)
               ${CMAKE_CURRENT_SOURCE_DIR}/integration/lmcache/tests/test_exists_cache.py)
     set_tests_properties(python_lmcache_exists_cache PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
+    add_test(NAME python_lmcache_l2_key_and_length
+      COMMAND ${PYTHON3}
+              ${CMAKE_CURRENT_SOURCE_DIR}/integration/lmcache/tests/test_l2_key_and_length.py)
+    set_tests_properties(python_lmcache_l2_key_and_length PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
     add_test(NAME python_lmcache_key_mapper
       COMMAND ${PYTHON3}
               ${CMAKE_CURRENT_SOURCE_DIR}/integration/lmcache/tests/test_key_mapper.py)

@@ -28,6 +28,23 @@
   (`DFKV_CONNECTOR_EXISTS_TTL_S`, `0` = no expiry), so a key that is never
   read again is still re-checked. More `exists` calls reach the ring than
   before: at most one per key per TTL.
+- LMCache MP-server L2 adapter: a load no longer reports an object loaded
+  when the stored value has another length than its buffer. The adapter
+  ignored the length that came back, so a value stored under the same key
+  for another layout (a dtype change without a new `model_revision`) or a
+  truncated one was handed to LMCache as the object. A hit must now have
+  exactly the buffer's length; others count as misses
+  (`load_length_mismatches`, one warning). With a `serde_config` (serialized,
+  variable-length values) the check is off. The object key also did not
+  include `ObjectKey.model_name`: two models served through one adapter
+  shared a key wherever chunk hash, rank, group and salt agreed. The new
+  `adapter_params.key_includes_model` (default `false`) adds it; the adapter
+  warns once when it sees a second model name while it is off. It is off by
+  default because it changes every key: an upgraded deployment keeps finding
+  what it stored, and turning it on costs one cold start.
+  With it on, a `cache_salt` that would push the key component past 256 bytes
+  goes into the key as its SHA-256 (`salth-<hex>`); with it off a salt over
+  251 bytes is still refused, as before.
 
 ## 2.39.0 — 2026-11-22
 

@@ -100,7 +100,8 @@ vllm serve <model> --tensor-parallel-size 8 --no-enable-prefix-caching \
 `membership` (`mds`|`static`), `lib` (else `DFKV_LIB`), required `model_name`
 (MP-server does not supply runtime model metadata), `mds_poll_ms` (3000),
 `num_workers` (8), and `max_capacity_gb` (0 = dfkv manages capacity; >0 enables
-aggregate L2 eviction). The MP-server API does not expose enough model/PP
+aggregate L2 eviction), and `key_includes_model` (false; see below). The
+MP-server API does not expose enough model/PP
 metadata to prove byte-identical MLA replication, so object keys always retain
 the `world_size/global_rank` identity and the adapter rejects manual folding.
 The server's pinned L1 arena is auto-registered for RDMA zero-copy when LMCache
@@ -108,6 +109,22 @@ passes an `l1_memory_desc`. Only `dfkv_register_memory` return code `0` counts
 as registered; any native MR rejection fails startup instead of silently using
 the arena. Validated on GLM-5.2 (vLLM 0.23.0 + LMCache 0.4.7):
 store → restart (L1 wiped) → reload from dfkv with prefill skipped.
+
+`key_includes_model: true` puts `ObjectKey.model_name` into every object key.
+Turn it on when one MP server serves more than one model through this adapter:
+without it two models share a key wherever chunk hash, rank, group and salt
+agree, and one reads the other's bytes (the adapter warns once when it sees a
+second model name). It is off by default because it changes every key: after
+turning it on, nothing stored before is found (one cold start). Giving each
+model its own adapter (its own `model_name`, so its own namespace) avoids the
+collision as well.
+With the switch on, a `cache_salt` too long to fit next to the model part
+(over 212 bytes) goes into the key as its SHA-256.
+
+A load accepts a hit only if its length equals the destination buffer's (a
+store writes the whole `byte_array`); anything else is reported not found and
+counted in `load_length_mismatches`. With a `serde_config` (LMCache then wraps
+the adapter and stores serialized, variable-length values) this check is off.
 
 ## Identity and raw-value contract
 
