@@ -1787,8 +1787,13 @@ class DfkvHiCache(HiCacheStorage):
         ttl = self._retain_ttl_of(extra_info)
         prefix = None
         if ttl > 0:
-            # Exact identity of the prefix without building its object keys.
-            prefix = (len(keys), keys[0], keys[-1], hash(tuple(keys)))
+            # Exact identity of the prefix without building its object keys,
+            # and of the key form those keys take: a prefix protected while
+            # its pages were bare keys, or while only SG group 0 was known,
+            # was not protected in the form written later.
+            prefix = (len(keys), keys[0], keys[-1], hash(tuple(keys)),
+                      self._device_direct_active(),
+                      tuple(sorted(getattr(self, "_sg_chunks", {}).items())))
             if self._touch_is_fresh(prefix, ttl):
                 return
         sks = self._retain_object_keys(keys)
