@@ -652,17 +652,15 @@ int main(int argc, char** argv) {
 #ifdef DFKV_WITH_RDMA
   if (rsrv) {
     rsrv->Quiesce();
-    DFKV_LOG_INFO("shutdown: RDMA requests stopped " + stop_seconds() +
-                  " after the signal");
+    DFKV_LOG_INFO("shutdown: RDMA requests stopped after " + stop_seconds());
   }
 #endif
   if (srv.Shutdown()) {
-    DFKV_LOG_INFO("dfkv_server shut down cleanly " + stop_seconds() +
-                  " after the signal; releasing memory");
+    DFKV_LOG_INFO("dfkv_server shut down cleanly in " + stop_seconds() +
+                  "; releasing memory");
   } else {
-    DFKV_LOG_WARN("dfkv_server stopped " + stop_seconds() +
-                  " after the signal, but not every disk is clean; "
-                  "releasing memory");
+    DFKV_LOG_WARN("dfkv_server stopped in " + stop_seconds() +
+                  ", but not every disk is clean; releasing memory");
   }
 #ifdef DFKV_WITH_RDMA
   if (rsrv) rsrv->Stop();
