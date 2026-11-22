@@ -63,6 +63,12 @@ struct NodeDedup::Header {
   uint32_t pad;
 };
 
+uint32_t NodeDedup::ProbeStart(const BlockKey& key, Kind kind) {
+  return static_cast<uint32_t>(
+      key.digest_hi ^ (key.digest_hi >> 32) ^ key.digest_lo ^
+      (key.digest_lo >> 32) ^ (static_cast<uint32_t>(kind) << 13));
+}
+
 uint64_t NodeDedup::NowMs() {
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -184,9 +190,7 @@ NodeDedup::~NodeDedup() {
 
 NodeDedup::Slot* NodeDedup::Find(const BlockKey& key, Kind kind) const {
   const uint32_t mask = nslots_ - 1;
-  uint32_t idx = static_cast<uint32_t>(
-      key.digest_hi ^ (key.digest_hi >> 32) ^ key.digest_lo ^
-      (key.digest_lo >> 32) ^ (static_cast<uint32_t>(kind) << 13)) & mask;
+  uint32_t idx = ProbeStart(key, kind) & mask;
   for (int probe = 0; probe < 8; ++probe, idx = (idx + 1) & mask) {
     Slot& s = slots_[idx];
     if (s.state.load(std::memory_order_acquire) == kStateEmpty) continue;
@@ -200,9 +204,7 @@ NodeDedup::Slot* NodeDedup::Find(const BlockKey& key, Kind kind) const {
 NodeDedup::Slot* NodeDedup::Reserve(const BlockKey& key, Kind kind) {
   const uint64_t now = NowMs();
   const uint32_t mask = nslots_ - 1;
-  uint32_t idx = static_cast<uint32_t>(
-      key.digest_hi ^ (key.digest_hi >> 32) ^ key.digest_lo ^
-      (key.digest_lo >> 32) ^ (static_cast<uint32_t>(kind) << 13)) & mask;
+  uint32_t idx = ProbeStart(key, kind) & mask;
   for (int probe = 0; probe < 8; ++probe, idx = (idx + 1) & mask) {
     Slot& s = slots_[idx];
     uint32_t st = s.state.load(std::memory_order_acquire);
@@ -233,11 +235,18 @@ NodeDedup::Slot* NodeDedup::Reserve(const BlockKey& key, Kind kind) {
   return nullptr;  // probe window full: run without dedup for this key
 }
 
-bool NodeDedup::CopyOut(Slot* s, size_t cap, size_t strict_n, char* dst,
-                        size_t* got) const {
+bool NodeDedup::CopyOut(Slot* s, const BlockKey& key, Kind kind, size_t cap,
+                        size_t strict_n, char* dst, size_t* got) const {
   const uint64_t g0 = s->gen.load(std::memory_order_acquire);
   if (g0 & 1) return false;  // writer active
   if (s->state.load(std::memory_order_acquire) != kStateReady) return false;
+  // The caller looked this slot up by key before it got here, and the slot
+  // may have been recycled for another key since. Identity is rewritten only
+  // under an odd generation, so reading it between the two generation checks
+  // ties the bytes copied below to the key they are returned for.
+  if (s->key_hi != key.digest_hi || s->key_lo != key.digest_lo ||
+      s->kind != static_cast<uint32_t>(kind))
+    return false;
   const size_t n = s->len;
   if (strict_n != kAnyLen && n != strict_n) return false;
   if (n > cap) return false;
@@ -269,7 +278,7 @@ NodeDedup::Role NodeDedup::ClaimImpl(const BlockKey& key, Kind kind, size_t cap,
     if (st == kStateReady) {
       if (now - s->fetch_start_ms.load(std::memory_order_relaxed) <=
               static_cast<uint64_t>(ttl_ms_) &&
-          CopyOut(s, cap, strict_n, dst, got)) {
+          CopyOut(s, key, kind, cap, strict_n, dst, got)) {
         hits_.fetch_add(1, std::memory_order_relaxed);
         return Role::kHit;
       }
@@ -380,25 +389,37 @@ void NodeDedup::Abort(const BlockKey& key, Kind kind, uint64_t token) {
 }
 
 void NodeDedup::InvalidateKind(const BlockKey& key, Kind kind) {
-  for (;;) {
-    Slot* s = Find(key, kind);
-    if (!s) return;
-    uint32_t st = s->state.load(std::memory_order_acquire);
-    if (st == kStatePublishing) {
-      std::this_thread::yield();
-      continue;
+  // A key can occupy more than one slot of its probe window: a claimer that
+  // cannot use the published entry (expired, or another length) reserves the
+  // first free position, which may lie before the entry it leaves behind,
+  // and two lockstep claimers can each keep a slot. Lookups stop at the
+  // first match, so an entry left behind comes back into view as soon as the
+  // one in front of it goes. Every entry of the key is removed here.
+  const uint32_t mask = nslots_ - 1;
+  uint32_t idx = ProbeStart(key, kind) & mask;
+  for (int probe = 0; probe < 8; ++probe, idx = (idx + 1) & mask) {
+    Slot& s = slots_[idx];
+    for (;;) {
+      uint32_t st = s.state.load(std::memory_order_acquire);
+      if (st == kStateEmpty) break;
+      if (s.key_hi != key.digest_hi || s.key_lo != key.digest_lo ||
+          s.kind != static_cast<uint32_t>(kind))
+        break;
+      if (st == kStatePublishing) {
+        std::this_thread::yield();
+        continue;
+      }
+      if (!s.state.compare_exchange_weak(st, kStatePublishing,
+                                         std::memory_order_acq_rel))
+        continue;
+      // Supersede every outstanding ownership token before making the slot
+      // reusable. A late publisher can find a newly claimed slot for this
+      // key, but its old token can never publish into that generation.
+      s.gen.fetch_add(1, std::memory_order_acq_rel);
+      s.gen.fetch_add(1, std::memory_order_release);
+      s.state.store(kStateEmpty, std::memory_order_release);
+      break;
     }
-    if (st != kStateFetching && st != kStateReady) return;
-    if (!s->state.compare_exchange_weak(st, kStatePublishing,
-                                        std::memory_order_acq_rel))
-      continue;
-    // Supersede every outstanding ownership token before making the slot
-    // reusable. A late publisher can find a newly claimed slot for this key,
-    // but its old token can never publish into that generation.
-    s->gen.fetch_add(1, std::memory_order_acq_rel);
-    s->gen.fetch_add(1, std::memory_order_release);
-    s->state.store(kStateEmpty, std::memory_order_release);
-    return;
   }
 }
 
@@ -418,11 +439,16 @@ bool NodeDedup::WaitImpl(const BlockKey& key, Kind kind, size_t cap,
     const uint32_t st =
         s ? s->state.load(std::memory_order_acquire) : kStateEmpty;
     if (st == kStateReady) {
-      if (CopyOut(s, cap, strict_n, dst, got)) {
+      // Same freshness rule as a claim. What a waiter finds is normally the
+      // result just published for it, but when that fetch was aborted it can
+      // be an older entry of the key further along the probe window.
+      if (NowMs() - s->fetch_start_ms.load(std::memory_order_relaxed) <=
+              static_cast<uint64_t>(ttl_ms_) &&
+          CopyOut(s, key, kind, cap, strict_n, dst, got)) {
         wait_hits_.fetch_add(1, std::memory_order_relaxed);
         return true;
       }
-      break;  // lapped, recycled or another length: it will not heal
+      break;  // expired, lapped, recycled or another length: it will not heal
     }
     if (st == kStateFetching || st == kStatePublishing) {
       gone = false;

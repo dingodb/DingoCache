@@ -20,6 +20,21 @@ using dfkv::BlockKey;
 using dfkv::NodeDedup;
 using namespace std::chrono_literals;
 
+namespace dfkv {
+// A reader looks a slot up and then copies out of it; these are the two
+// stages, so a test can change the slot in between.
+struct NodeDedupTestAccess {
+  static auto Find(NodeDedup& d, const BlockKey& key, NodeDedup::Kind kind) {
+    return d.Find(key, kind);
+  }
+  template <typename SlotPtr>
+  static bool CopyOut(NodeDedup& d, SlotPtr slot, const BlockKey& key,
+                      NodeDedup::Kind kind, size_t n, char* dst) {
+    return d.CopyOut(slot, key, kind, n, n, dst, nullptr);
+  }
+};
+}  // namespace dfkv
+
 namespace {
 
 struct ShmGuard {
@@ -404,4 +419,149 @@ TEST(NodeDedup, SegmentIsEagerlyBackedNotSparse) {
   ::close(fd);
   EXPECT_GE(static_cast<uint64_t>(st.st_blocks) * 512, static_cast<uint64_t>(st.st_size))
       << "segment is sparse: a full tmpfs would SIGBUS at publish time";
+}
+
+// K(id) and Neighbour(id) start their probe at the same slot of the 1024-slot
+// test table.
+BlockKey Neighbour(uint64_t id) { return K(id + 1024); }
+
+// Leaves K(id) published (v_old) at its second probe position with the first
+// one free again: the neighbour held the first position while K(id) was
+// claimed and has since gone.
+void PublishAtSecondPosition(NodeDedup* d, uint64_t id,
+                             const std::string& v_old) {
+  std::string dst(v_old.size(), '\0');
+  uint64_t neighbour = 0, token = 0;
+  ASSERT_EQ(d->Claim(Neighbour(id), dst.size(), &dst[0], &neighbour),
+            NodeDedup::Role::kFetch);
+  ASSERT_EQ(d->Claim(K(id), v_old.size(), &dst[0], &token),
+            NodeDedup::Role::kFetch);
+  d->Publish(K(id), NodeDedup::Kind::kData, token, v_old.data(),
+             v_old.size());
+  d->Abort(Neighbour(id), NodeDedup::Kind::kData, neighbour);
+}
+
+TEST(NodeDedup, InvalidateRemovesEveryEntryOfTheKey) {
+  ShmGuard g("inv-all");
+  auto a = NodeDedup::Open(Opts(g.name));
+  auto b = NodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  const std::string v_old = Val(30, 4096);
+  PublishAtSecondPosition(a.get(), 30, v_old);
+  // A reader of another length cannot use that entry and fetches for itself.
+  // Its claim takes the free first position: the key now has two entries.
+  std::string big(8192, 'n');
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(b->Claim(K(30), big.size(), &big[0], &token),
+            NodeDedup::Role::kFetch);
+  b->Publish(K(30), NodeDedup::Kind::kData, token, big.data(), big.size());
+  // The key is overwritten or removed on the server.
+  a->Invalidate(K(30));
+  std::string out(v_old.size(), '\0');
+  EXPECT_NE(b->Claim(K(30), out.size(), &out[0], &ignored),
+            NodeDedup::Role::kHit)
+      << "served the entry from before the invalidation";
+}
+
+TEST(NodeDedup, InvalidateLeavesOtherKeysOfTheWindowAlone) {
+  ShmGuard g("inv-other");
+  auto a = NodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a);
+  const std::string v = Val(33, 4096), w = Val(34, 4096);
+  std::string out(v.size(), '\0');
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->Claim(K(33), v.size(), &out[0], &token),
+            NodeDedup::Role::kFetch);
+  a->Publish(K(33), NodeDedup::Kind::kData, token, v.data(), v.size());
+  ASSERT_EQ(a->Claim(Neighbour(33), w.size(), &out[0], &token),
+            NodeDedup::Role::kFetch);
+  a->Publish(Neighbour(33), NodeDedup::Kind::kData, token, w.data(),
+             w.size());
+  a->Invalidate(K(33));
+  EXPECT_NE(a->Claim(K(33), out.size(), &out[0], &ignored),
+            NodeDedup::Role::kHit);
+  ASSERT_EQ(a->Claim(Neighbour(33), out.size(), &out[0], &ignored),
+            NodeDedup::Role::kHit);
+  EXPECT_EQ(out, w);
+}
+
+TEST(NodeDedup, InvalidateRemovesTheEntryBehindAFetchInFlight) {
+  ShmGuard g("inv-wait");
+  auto a = NodeDedup::Open(Opts(g.name));
+  auto b = NodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  const std::string v_old = Val(31, 4096);
+  PublishAtSecondPosition(a.get(), 31, v_old);
+  // A reader of another length fetches the key for itself; its claim takes
+  // the free first position and is still in flight.
+  std::string big(8192, '\0'), out(v_old.size(), '\0');
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->Claim(K(31), big.size(), &big[0], &token),
+            NodeDedup::Role::kFetch);
+  ASSERT_EQ(b->Claim(K(31), out.size(), &out[0], &ignored),
+            NodeDedup::Role::kWait);
+  // The key is overwritten while that fetch is in flight. The entry behind
+  // it is well inside its TTL, so only the invalidation can keep it from the
+  // waiter.
+  a->Invalidate(K(31));
+  EXPECT_FALSE(b->WaitCopy(K(31), out.size(), &out[0]))
+      << "the waiter copied the entry from before the invalidation";
+}
+
+TEST(NodeDedup, WaiterDoesNotCopyAnExpiredEntry) {
+  ShmGuard g("wait-ttl");
+  auto o = Opts(g.name);
+  o.ttl_ms = 100;
+  auto a = NodeDedup::Open(o);
+  auto b = NodeDedup::Open(o);
+  ASSERT_TRUE(a && b);
+  const std::string v_old = Val(32, 4096);
+  PublishAtSecondPosition(a.get(), 32, v_old);
+  std::this_thread::sleep_for(150ms);  // > ttl
+  std::string out(v_old.size(), '\0');
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->Claim(K(32), out.size(), &out[0], &token),
+            NodeDedup::Role::kFetch);
+  ASSERT_EQ(b->Claim(K(32), out.size(), &out[0], &ignored),
+            NodeDedup::Role::kWait);
+  // The re-fetch fails. The expired entry behind it is what the waiter now
+  // finds; a claimer would refuse it, and so must a waiter.
+  a->Abort(K(32), NodeDedup::Kind::kData, token);
+  EXPECT_FALSE(b->WaitCopy(K(32), out.size(), &out[0]));
+}
+
+TEST(NodeDedup, CopyOutRefusesASlotRecycledForAnotherKey) {
+  ShmGuard g("recycle");
+  auto a = NodeDedup::Open(Opts(g.name));
+  auto b = NodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  const std::string v1 = Val(40, 4096), v2 = Val(41, 4096);
+  std::string out(v1.size(), '\0');
+  uint64_t token = 0;
+  ASSERT_EQ(a->Claim(K(40), v1.size(), &out[0], &token),
+            NodeDedup::Role::kFetch);
+  a->Publish(K(40), NodeDedup::Kind::kData, token, v1.data(), v1.size());
+
+  // A reader has looked the key up ...
+  const auto slot =
+      dfkv::NodeDedupTestAccess::Find(*a, K(40), NodeDedup::Kind::kData);
+  ASSERT_NE(slot, nullptr);
+  // ... and before it copies, the entry goes and another process publishes a
+  // different key of the same length into the same slot.
+  b->Invalidate(K(40));
+  ASSERT_EQ(b->Claim(Neighbour(40), v2.size(), &out[0], &token),
+            NodeDedup::Role::kFetch);
+  b->Publish(Neighbour(40), NodeDedup::Kind::kData, token, v2.data(),
+             v2.size());
+  ASSERT_EQ(dfkv::NodeDedupTestAccess::Find(*a, Neighbour(40),
+                                            NodeDedup::Kind::kData),
+            slot);
+
+  EXPECT_FALSE(dfkv::NodeDedupTestAccess::CopyOut(
+      *a, slot, K(40), NodeDedup::Kind::kData, v1.size(), &out[0]))
+      << "copied another key's bytes";
+  // The slot's present owner is still readable through it.
+  EXPECT_TRUE(dfkv::NodeDedupTestAccess::CopyOut(
+      *a, slot, Neighbour(40), NodeDedup::Kind::kData, v2.size(), &out[0]));
+  EXPECT_EQ(out, v2);
 }

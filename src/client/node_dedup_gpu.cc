@@ -39,6 +39,12 @@ uint32_t Pow2AtLeast(uint32_t v) {
   return p;
 }
 
+// First slot of a key's 8-slot probe window, before masking.
+uint32_t ProbeStart(const BlockKey& key) {
+  return static_cast<uint32_t>(key.digest_hi ^ (key.digest_hi >> 32) ^
+                               key.digest_lo ^ (key.digest_lo >> 32));
+}
+
 bool PidDead(uint32_t pid) {
   return ::kill(static_cast<pid_t>(pid), 0) != 0 && errno == ESRCH;
 }
@@ -284,9 +290,7 @@ CUstream GpuNodeDedup::Stream() {
 
 GpuNodeDedup::Slot* GpuNodeDedup::Find(const BlockKey& key) const {
   const uint32_t mask = nslots_ - 1;
-  uint32_t idx = static_cast<uint32_t>(
-      key.digest_hi ^ (key.digest_hi >> 32) ^ key.digest_lo ^
-      (key.digest_lo >> 32)) & mask;
+  uint32_t idx = ProbeStart(key) & mask;
   for (int probe = 0; probe < 8; ++probe, idx = (idx + 1) & mask) {
     Slot& s = slots_[idx];
     if (s.state.load(std::memory_order_acquire) == kStateEmpty) continue;
@@ -298,9 +302,7 @@ GpuNodeDedup::Slot* GpuNodeDedup::Find(const BlockKey& key) const {
 GpuNodeDedup::Slot* GpuNodeDedup::Reserve(const BlockKey& key) {
   const uint64_t now = NowMs();
   const uint32_t mask = nslots_ - 1;
-  uint32_t idx = static_cast<uint32_t>(
-      key.digest_hi ^ (key.digest_hi >> 32) ^ key.digest_lo ^
-      (key.digest_lo >> 32)) & mask;
+  uint32_t idx = ProbeStart(key) & mask;
   for (int probe = 0; probe < 8; ++probe, idx = (idx + 1) & mask) {
     Slot& s = slots_[idx];
     uint32_t st = s.state.load(std::memory_order_acquire);
@@ -368,11 +370,16 @@ CUdeviceptr GpuNodeDedup::PeerBase(uint32_t idx, uint64_t gen) {
   return base;
 }
 
-bool GpuNodeDedup::IssueCopySg(Slot* s, const Seg* segs, size_t nsegs,
-                               size_t total_cap, CUstream st, CopySnap* snap) {
+bool GpuNodeDedup::IssueCopySg(Slot* s, const BlockKey& key, const Seg* segs,
+                               size_t nsegs, size_t total_cap, CUstream st,
+                               CopySnap* snap) {
   const uint64_t g0 = s->gen.load(std::memory_order_acquire);
   if (g0 & 1) return false;
   if (s->state.load(std::memory_order_acquire) != kStateReady) return false;
+  // The slot was looked up by key earlier and may have been recycled for
+  // another key since. Identity is rewritten only under an odd generation,
+  // and ValidateCopy re-reads the generation after the copy.
+  if (s->key_hi != key.digest_hi || s->key_lo != key.digest_lo) return false;
   const size_t n = s->len;
   if (n == 0 || n > total_cap) return false;
   const uint32_t oi = s->owner_idx;
@@ -417,12 +424,12 @@ bool GpuNodeDedup::ValidateCopy(const CopySnap& snap) const {
   return true;
 }
 
-bool GpuNodeDedup::CopyOutSg(Slot* s, const Seg* segs, size_t nsegs,
-                             size_t total_cap, size_t* got) {
+bool GpuNodeDedup::CopyOutSg(Slot* s, const BlockKey& key, const Seg* segs,
+                             size_t nsegs, size_t total_cap, size_t* got) {
   CUstream st = Stream();
   if (!st) return false;
   CopySnap snap{};
-  if (!IssueCopySg(s, segs, nsegs, total_cap, st, &snap)) return false;
+  if (!IssueCopySg(s, key, segs, nsegs, total_cap, st, &snap)) return false;
   // The scatter must be ON the device before we declare a hit — async D2D
   // "returns" immediately; the framework would otherwise consume the blocks
   // before the bytes land.
@@ -463,8 +470,12 @@ void GpuNodeDedup::WaitManySg(WaitItem* items, size_t n) {
       WaitItem& it = items[idx];
       Slot* s = Find(it.key);
       CopySnap snap{};
+      // Same freshness rule as a claim: with the fetch in front of it
+      // aborted, a waiter can find an older entry of the key.
       if (s && s->state.load(std::memory_order_acquire) == kStateReady &&
-          IssueCopySg(s, it.segs, it.nsegs, it.total_cap, st, &snap)) {
+          NowMs() - s->fetch_start_ms.load(std::memory_order_relaxed) <=
+              static_cast<uint64_t>(ttl_ms_) &&
+          IssueCopySg(s, it.key, it.segs, it.nsegs, it.total_cap, st, &snap)) {
         inflight.push_back(InFlight{idx, snap});
       } else {
         pending[w++] = idx;  // not published yet (or torn): retry next round
@@ -507,7 +518,7 @@ GpuNodeDedup::Role GpuNodeDedup::ClaimSg(const BlockKey& key, const Seg* segs,
     if (st == kStateReady) {
       if (now - s->fetch_start_ms.load(std::memory_order_relaxed) <=
               static_cast<uint64_t>(ttl_ms_) &&
-          CopyOutSg(s, segs, nsegs, total_cap, got)) {
+          CopyOutSg(s, key, segs, nsegs, total_cap, got)) {
         hits_.fetch_add(1, std::memory_order_relaxed);
         return Role::kHit;
       }
@@ -622,22 +633,28 @@ void GpuNodeDedup::Abort(const BlockKey& key, uint64_t token) {
 }
 
 void GpuNodeDedup::Invalidate(const BlockKey& key) {
-  for (;;) {
-    Slot* s = Find(key);
-    if (!s) return;
-    uint32_t st = s->state.load(std::memory_order_acquire);
-    if (st == kStatePublishing) {
-      std::this_thread::yield();
-      continue;
+  // Every entry of the key in its probe window, not only the first one a
+  // lookup finds: see NodeDedup::InvalidateKind.
+  const uint32_t mask = nslots_ - 1;
+  uint32_t idx = ProbeStart(key) & mask;
+  for (int probe = 0; probe < 8; ++probe, idx = (idx + 1) & mask) {
+    Slot& s = slots_[idx];
+    for (;;) {
+      uint32_t st = s.state.load(std::memory_order_acquire);
+      if (st == kStateEmpty) break;
+      if (s.key_hi != key.digest_hi || s.key_lo != key.digest_lo) break;
+      if (st == kStatePublishing) {
+        std::this_thread::yield();
+        continue;
+      }
+      if (!s.state.compare_exchange_weak(st, kStatePublishing,
+                                         std::memory_order_acq_rel))
+        continue;
+      s.gen.fetch_add(1, std::memory_order_acq_rel);
+      s.gen.fetch_add(1, std::memory_order_release);
+      s.state.store(kStateEmpty, std::memory_order_release);
+      break;
     }
-    if (st != kStateFetching && st != kStateReady) return;
-    if (!s->state.compare_exchange_weak(st, kStatePublishing,
-                                        std::memory_order_acq_rel))
-      continue;
-    s->gen.fetch_add(1, std::memory_order_acq_rel);
-    s->gen.fetch_add(1, std::memory_order_release);
-    s->state.store(kStateEmpty, std::memory_order_release);
-    return;
   }
 }
 
@@ -649,7 +666,9 @@ bool GpuNodeDedup::WaitSg(const BlockKey& key, const Seg* segs, size_t nsegs,
   for (;;) {
     Slot* s = Find(key);
     if (s && s->state.load(std::memory_order_acquire) == kStateReady &&
-        CopyOutSg(s, segs, nsegs, total_cap, got)) {
+        NowMs() - s->fetch_start_ms.load(std::memory_order_relaxed) <=
+            static_cast<uint64_t>(ttl_ms_) &&
+        CopyOutSg(s, key, segs, nsegs, total_cap, got)) {
       wait_hits_.fetch_add(1, std::memory_order_relaxed);
       return true;
     }

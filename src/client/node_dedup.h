@@ -15,7 +15,9 @@
  *
  * Correctness model (lock-free, crash-robust):
  *  - Index slot identity is (key, kind); the payload length is an attribute
- *    (strict readers require len == n, auto readers accept len <= cap).
+ *    (strict readers require len == n, auto readers accept len <= cap). A
+ *    reader re-checks identity inside its generation-validated copy: the
+ *    slot it looked up may have been recycled for another key meanwhile.
  *  - State machine EMPTY -> FETCHING -> READY guarded by CAS; a FETCHING
  *    older than takeover_ms (fetcher died/hung) can be re-claimed.
  *  - A waiter waits only while a fetch is in flight (FETCHING/PUBLISHING).
@@ -121,8 +123,9 @@ class NodeDedup {
   void Publish(const BlockKey& key, Kind kind, uint64_t token,
                const char* data, size_t n);
   void Abort(const BlockKey& key, Kind kind, uint64_t token);
-  // Eviction barrier: removes READY data/exist answers and supersedes any
-  // FETCHING owner. A publisher already copying is joined before return.
+  // Eviction barrier: removes every READY data/exist answer of the key and
+  // supersedes every FETCHING owner (a key can hold more than one slot of its
+  // probe window). A publisher already copying is joined before return.
   void Invalidate(const BlockKey& key);
 
   // diagnostics (relaxed; process-local)
@@ -134,19 +137,24 @@ class NodeDedup {
  private:
   struct Slot;    // 64-byte shm index slot
   struct Header;  // shm header
+  friend struct NodeDedupTestAccess;  // steps a reader one stage at a time
   NodeDedup() = default;
 
   Slot* Find(const BlockKey& key, Kind kind) const;
   Slot* Reserve(const BlockKey& key, Kind kind);
-  // Validated copy. strict_n: exact length required (SIZE_MAX = any <= cap).
-  // Returns payload length via *got on success.
-  bool CopyOut(Slot* s, size_t cap, size_t strict_n, char* dst, size_t* got) const;
+  // Validated copy of (key, kind)'s payload out of slot s. strict_n: exact
+  // length required (SIZE_MAX = any <= cap). Returns payload length via *got
+  // on success.
+  bool CopyOut(Slot* s, const BlockKey& key, Kind kind, size_t cap,
+               size_t strict_n, char* dst, size_t* got) const;
   Role ClaimImpl(const BlockKey& key, Kind kind, size_t cap, size_t strict_n,
                  char* dst, size_t* got, uint64_t* token);
   bool WaitImpl(const BlockKey& key, Kind kind, size_t cap, size_t strict_n,
                 char* dst, size_t* got, uint64_t deadline_ms);
   void InvalidateKind(const BlockKey& key, Kind kind);
   static uint64_t NowMs();
+  // First slot of the key's 8-slot probe window, before masking.
+  static uint32_t ProbeStart(const BlockKey& key, Kind kind);
 
   Header* hdr_ = nullptr;
   Slot* slots_ = nullptr;
