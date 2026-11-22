@@ -45,18 +45,25 @@
   elected the writer by `tp_rank`: in a deployment with context parallelism
   every rank then shared one key, one rank wrote, and the others read that
   rank's shard as their own (same size, so the read check passes). Now the
-  coordinates come from `HiCacheStorageConfig` where it carries them: PCP
-  from `attn_cp_size`/`attn_cp_rank`, DCP from `dcp_size`/`dcp_rank`. A
-  WARNING at start names the source of each coordinate, and
-  `dfkv_hicache_parallel_context_fallbacks_total` counts the rank. Without
-  DCP fields there, DCP is 0/1 if the SGLang build has no parallel-context
-  API at all (such builds have no decode CP); if the API is there but fails
-  (state not initialized yet, or changed), the DCP coordinate is unknown and
-  the backend refuses to be created unless `dcp_size`/`dcp_rank` are given
-  in the extra_config. A host pool that
-  declares a `dcp_size` above 1 different from the resolved one is refused at
-  registration. Deployments whose coordinates were read from the parallel
-  context, or given in the extra_config, are unaffected.
+  coordinates come from `HiCacheStorageConfig` where it carries both size
+  and rank of an axis: PCP from `attn_cp_size`/`attn_cp_rank`, DCP from
+  `dcp_size`/`dcp_rank`. Each storage backend created this way logs a
+  WARNING naming the source of each coordinate, and
+  `dfkv_hicache_parallel_context_fallbacks_total` counts it. Without DCP
+  fields there, DCP is 0/1 if the SGLang build has no parallel-context API
+  at all (such builds have no decode CP); if the API is there but fails
+  (state not initialized yet, or changed), or a field of the context raises
+  when read, the DCP coordinate is unknown and the backend refuses to be
+  created unless `dcp_size`/`dcp_rank` are given in the extra_config. A host
+  pool that declares a `dcp_size` above 1 different from the resolved one is
+  refused at registration. Deployments whose coordinates were read from the
+  parallel context, or given in the extra_config, are unaffected. One case
+  that started before now refuses to: an SGLang build without the
+  parallel-context API, an MLA model and `attn_cp_size` above 1 in
+  `HiCacheStorageConfig`. The prefill CP axis is now seen there, and MLA
+  with prefill CP needs an explicit `prefill_cp_storage_layout` in the
+  extra_config, as it already did when the coordinates came from the context
+  or the extra_config.
 - SGLang HiCache connector: a v2 backup and a v2 prefetch that run at the same
   time no longer take each other's result. The pool-aware transfer
   (`batch_set_v2`, `batch_get_v2`, and the host side pools of the `_device`

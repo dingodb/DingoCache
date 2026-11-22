@@ -434,13 +434,68 @@ class ParallelCoordinates(unittest.TestCase):
         config = types.SimpleNamespace(
             tp_rank=1, tp_size=8, attn_cp_size=1, attn_cp_rank=0,
             dcp_size=2, dcp_rank=1)
-        for api in (_uninitialized, None):
+        for api, context in ((_uninitialized, "failed"), (None, "missing")):
             sources = {}
             with (_parallel_api(api) if api else contextlib.nullcontext()):
                 got = self.resolve({}, storage_config=config, sources=sources)
             self.assertEqual(got, ((1, 0), (2, 1), None))
             self.assertEqual(
-                sources, {"pcp": "storage_config", "dcp": "storage_config"})
+                sources, {"pcp": "storage_config", "dcp": "storage_config",
+                          "context": context})
+
+    def test_context_whose_fields_raise_is_a_failed_context(self):
+        class Uninitialized:
+            attn_cp_size = 4
+            attn_cp_rank = 1
+
+            @property
+            def attn_dcp_size(self):
+                raise AssertionError("decode CP group is not initialized")
+
+            attn_dcp_rank = attn_dcp_size
+            attn_tp_rank = 0
+
+        with _parallel_api(Uninitialized):
+            # The DCP coordinate is unknown: refuse, as for get_parallel
+            # itself raising.
+            with self.assertRaisesRegex(RuntimeError, "dcp coordinate"):
+                self.resolve({}, storage_config=_storage_config())
+            # With the coordinates given elsewhere it resolves, and nothing
+            # is taken from the failed context (not even attn_tp_rank).
+            sources = {}
+            got = self.resolve(
+                {"dcp_size": 2, "dcp_rank": 1},
+                storage_config=_storage_config(attn_cp_size=2, attn_cp_rank=1),
+                sources=sources)
+        self.assertEqual(got, ((2, 1), (2, 1), None))
+        self.assertEqual(sources, {"pcp": "storage_config",
+                                   "dcp": "extra_config", "context": "failed"})
+
+    def test_storage_config_axis_needs_both_size_and_rank(self):
+        # A size without a rank is not a coordinate; never rank 0 by default.
+        config = types.SimpleNamespace(
+            tp_rank=1, tp_size=8, attn_cp_size=1, attn_cp_rank=0, dcp_size=2)
+        with _parallel_api(_uninitialized):
+            with self.assertRaisesRegex(RuntimeError, "dcp coordinate"):
+                self.resolve({}, storage_config=config)
+
+    def test_a_given_probe_is_used_and_not_repeated(self):
+        def probed_again():
+            raise AssertionError("probed twice")
+
+        with _parallel_api(probed_again):
+            got = self.resolve({}, probe=(None, None),
+                               storage_config=_storage_config())
+        self.assertEqual(got, ((1, 0), (1, 0), None))
+
+    def test_mla_cp_from_the_storage_config_needs_an_explicit_layout(self):
+        # Without the API, attn_cp_size>1 now reaches the CP layout check.
+        pcp, dcp, _rank = self.resolve(
+            {}, storage_config=_storage_config(attn_cp_size=2, attn_cp_rank=1))
+        with self.assertRaisesRegex(Exception, "prefill_cp_storage_layout"):
+            dfkv_hicache._resolve_prefill_cp_storage_layout(
+                {}, is_mla=True, pcp_size=pcp[0], dcp_size=dcp[0],
+                parallel=None)
 
     def test_api_present_but_failing_accepts_explicit_coordinates(self):
         sources = {}
@@ -451,7 +506,8 @@ class ParallelCoordinates(unittest.TestCase):
                 sources=sources)
         self.assertEqual((pcp, dcp, attn_tp_rank), ((4, 2), (2, 1), None))
         self.assertEqual(
-            sources, {"pcp": "storage_config", "dcp": "extra_config"})
+            sources, {"pcp": "storage_config", "dcp": "extra_config",
+                      "context": "failed"})
 
     def test_build_without_the_api_takes_pcp_from_the_storage_config(self):
         # The test shim has no parallel-context module at all.
@@ -460,7 +516,8 @@ class ParallelCoordinates(unittest.TestCase):
             {}, storage_config=_storage_config(attn_cp_size=4, attn_cp_rank=3),
             sources=sources)
         self.assertEqual((pcp, dcp, attn_tp_rank), ((4, 3), (1, 0), None))
-        self.assertEqual(sources, {"pcp": "storage_config", "dcp": "default"})
+        self.assertEqual(sources, {"pcp": "storage_config", "dcp": "default",
+                                   "context": "missing"})
 
     def test_build_without_the_api_and_no_cp_is_unsharded(self):
         sources = {}
@@ -486,7 +543,8 @@ class ParallelCoordinates(unittest.TestCase):
                 {}, storage_config=_storage_config(), sources=sources)
         self.assertEqual(got, ((8, 3), (2, 1), 0))
         self.assertEqual(
-            sources, {"pcp": "parallel_context", "dcp": "parallel_context"})
+            sources, {"pcp": "parallel_context", "dcp": "parallel_context",
+                      "context": "available"})
 
     def test_probe_tells_a_missing_api_from_a_failing_one(self):
         self.assertEqual(dfkv_hicache._probe_parallel_context(), (None, None))

@@ -350,7 +350,8 @@ class DingoFSHiCacheTest(unittest.TestCase):
             enable_dsa_cache_layer_split=False,
         )
         with patch.object(
-            dfkv_hicache, "_load_parallel_context", return_value=parallel
+            dfkv_hicache, "_probe_parallel_context",
+            return_value=(parallel, None)
         ):
             writer = self._plugin(cfg0, writer_pool)
             reader = self._plugin(cfg7, reader_pool)
