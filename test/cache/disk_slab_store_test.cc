@@ -2941,3 +2941,281 @@ TEST_F(DiskSlabTest, RetentionDisabledByEnvAnswersUnsupported) {
   ASSERT_EQ(s.Cache(K(1), v.data(), v.size()), Status::kOk);
   EXPECT_EQ(s.Retain(K(1), 60, 0, 1000), dfkv::StoreEngine::kRetainUnsupported);
 }
+
+// ---- Open cost: which extents are fallocated again at open ----------------
+//
+// In direct mode every open used to fallocate every extent file. That call
+// allocates a fresh extent and, after an unclean exit, waits for direct writes
+// the previous process left in flight. It may be left out only when neither
+// job exists: the previous run closed clean and the file has all its blocks.
+namespace {
+constexpr uint64_t kOpenCostExtentBytes = 1 << 16;
+constexpr uint32_t kOpenCostExtents = 8;
+
+uint64_t AllocatedBytes(const fs::path& dir, uint32_t extent) {
+  char name[32];
+  std::snprintf(name, sizeof(name), "E%05u", extent);
+  struct stat st {};
+  if (::stat((dir / "extents" / name).c_str(), &st) != 0) return 0;
+  return static_cast<uint64_t>(st.st_blocks) * 512;
+}
+
+int OpenExtent(const fs::path& dir, uint32_t extent) {
+  char name[32];
+  std::snprintf(name, sizeof(name), "E%05u", extent);
+  return ::open((dir / "extents" / name).c_str(), O_RDWR);
+}
+
+bool EveryExtentAllocated(const fs::path& dir) {
+  for (uint32_t e = 0; e < kOpenCostExtents; ++e)
+    if (AllocatedBytes(dir, e) < kOpenCostExtentBytes) return false;
+  return true;
+}
+}  // namespace
+
+// Creates the store in direct mode, writes two values and closes it clean.
+// Skips the test where the filesystem under the test directory cannot show
+// the behaviour: no O_DIRECT, or no preallocation.
+#define DFKV_OPEN_COST_PREPARE(options)                                       \
+  do {                                                                        \
+    bool prepared = false;                                                    \
+    {                                                                         \
+      DiskSlabStore first(options, &prepared);                                \
+      ASSERT_TRUE(prepared) << first.StartupError();                          \
+      if (!first.DirectWritesActive())                                        \
+        GTEST_SKIP() << "the test directory does not take O_DIRECT";          \
+      EXPECT_EQ(first.GetStats().open_fallocate_skipped, 0u)                  \
+          << "a new extent has to be allocated";                              \
+      ASSERT_TRUE(PutFilled(first, 1, 'a'));                                  \
+      ASSERT_TRUE(PutFilled(first, 2, 'b'));                                  \
+    }                                                                         \
+    if (!EveryExtentAllocated(dir_))                                          \
+      GTEST_SKIP() << "the test directory does not preallocate";              \
+  } while (0)
+
+TEST_F(DiskSlabTest, CleanReopenLeavesAllocatedExtentsAlone) {
+  auto options = Opts(kOpenCostExtents * kOpenCostExtentBytes,
+                      kOpenCostExtentBytes, 4096);
+  options.direct_writes = true;
+  DFKV_OPEN_COST_PREPARE(options);
+
+  for (int round = 0; round < 2; ++round) {
+    bool ok = false;
+    DiskSlabStore reopened(options, &ok);
+    ASSERT_TRUE(ok) << reopened.StartupError();
+    EXPECT_EQ(reopened.GetStats().open_fallocate_skipped, kOpenCostExtents);
+    EXPECT_EQ(reopened.Count(), 2u + static_cast<size_t>(round));
+    std::string out;
+    ASSERT_EQ(reopened.Range(K(1), 0, 4096, &out), Status::kOk);
+    EXPECT_EQ(out, Payload('a'));
+    ASSERT_EQ(reopened.Range(K(2), 0, 4096, &out), Status::kOk);
+    EXPECT_EQ(out, Payload('b'));
+    ASSERT_TRUE(PutFilled(reopened, 10 + round, 'c'));
+  }
+  EXPECT_TRUE(EveryExtentAllocated(dir_));
+}
+
+// After an unclean exit the fallocate is the barrier against the previous
+// process's in-flight direct writes: it runs for every extent, whether the
+// table is then kept or reset. The clean start after that skips again.
+TEST_F(DiskSlabTest, UncleanReopenAllocatesEveryExtentAgain) {
+  for (const WarmRestart policy : {WarmRestart::kAuto, WarmRestart::kOff}) {
+    SCOPED_TRACE(policy == WarmRestart::kAuto ? "table kept" : "table reset");
+    fs::remove_all(dir_);
+    auto options = WithIdentity(Opts(kOpenCostExtents * kOpenCostExtentBytes,
+                                     kOpenCostExtentBytes, 4096),
+                                policy, 1, 7);
+    options.direct_writes = true;
+    DFKV_OPEN_COST_PREPARE(options);
+    ASSERT_TRUE(CrashAfter(options, [](DiskSlabStore& store) {
+      return PutFilled(store, 3, 'c');
+    }));
+    ASSERT_TRUE(EveryExtentAllocated(dir_));
+    {
+      bool ok = false;
+      DiskSlabStore recovered(options, &ok);
+      ASSERT_TRUE(ok) << recovered.StartupError();
+      const auto stats = recovered.GetStats();
+      EXPECT_EQ(stats.open_fallocate_skipped, 0u);
+      if (policy == WarmRestart::kAuto) {
+        EXPECT_EQ(stats.warm_restarts, 1u);
+        EXPECT_EQ(recovered.Count(), 3u);
+      } else {
+        EXPECT_EQ(stats.unclean_resets, 1u);
+        EXPECT_EQ(recovered.Count(), 0u);
+      }
+    }
+    bool ok = false;
+    DiskSlabStore clean_reopen(options, &ok);
+    ASSERT_TRUE(ok) << clean_reopen.StartupError();
+    EXPECT_EQ(clean_reopen.GetStats().open_fallocate_skipped, kOpenCostExtents);
+  }
+}
+
+// The clean marker is what lets the next start leave the fallocate out, so
+// Close() must not write it while a payload write is still in flight: that
+// write could land after the next run has reused the slot. Such a close is
+// an unclean exit to the next start, which then allocates (and so waits)
+// again. A close with no writer in flight is clean as before.
+TEST_F(DiskSlabTest, CloseWithAPayloadWriteInFlightIsNotClean) {
+  for (const bool batch : {false, true}) {
+    SCOPED_TRACE(batch ? "batch write" : "scalar write");
+    fs::remove_all(dir_);
+    auto options = WithIdentity(Opts(kOpenCostExtents * kOpenCostExtentBytes,
+                                     kOpenCostExtentBytes, 4096),
+                                WarmRestart::kAuto, 1, 7);
+    options.direct_writes = true;
+    DFKV_OPEN_COST_PREPARE(options);
+    {
+      bool ok = false;
+      DiskSlabStore store(options, &ok);
+      ASSERT_TRUE(ok) << store.StartupError();
+      ASSERT_EQ(store.GetStats().open_fallocate_skipped, kOpenCostExtents);
+      HookGate gate;
+      dfkv::DiskSlabStoreTestPeer::SetPayloadWriteHook(
+          &store, [&gate] { return gate.Run(); });
+      std::string value = Payload('w');
+      std::thread writer([&] {
+        if (batch)
+          store.CacheDirectBatch(
+              {{K(50), value.data(), value.size(), value.size()}});
+        else
+          store.Cache(K(50), value.data(), value.size());
+      });
+      gate.WaitEntered();
+      EXPECT_FALSE(store.Close()) << "clean with a write in flight";
+      // The store still vouches for its table and its writers still run, so
+      // a fatal signal must still take the token back. The handler's step
+      // runs in a forked child: it disables tokens for the whole process.
+      const fs::path token = TrustToken(dir_);
+      ASSERT_TRUE(fs::exists(token)) << "the declined close dropped the token";
+      const pid_t crashing = ::fork();
+      ASSERT_GE(crashing, 0);
+      if (crashing == 0) {
+        DiskSlabStore::RevokeAllTrustForCrash();
+        ::_exit(0);
+      }
+      int status = 0;
+      ASSERT_EQ(::waitpid(crashing, &status, 0), crashing);
+      EXPECT_FALSE(fs::exists(token))
+          << "the crash handler was disarmed while writers ran";
+      gate.Release(true);
+      writer.join();
+      dfkv::DiskSlabStoreTestPeer::SetPayloadWriteHook(&store, {});
+    }
+    {
+      bool ok = false;
+      DiskSlabStore next(options, &ok);
+      ASSERT_TRUE(ok) << next.StartupError();
+      const auto stats = next.GetStats();
+      EXPECT_EQ(stats.warm_restarts + stats.unclean_resets, 1u)
+          << "the next start took the clean path";
+      EXPECT_EQ(stats.open_fallocate_skipped, 0u);
+      EXPECT_TRUE(next.Close());
+    }
+    bool ok = false;
+    DiskSlabStore after_clean(options, &ok);
+    ASSERT_TRUE(ok) << after_clean.StartupError();
+    const auto stats = after_clean.GetStats();
+    EXPECT_EQ(stats.warm_restarts + stats.unclean_resets, 0u);
+    EXPECT_EQ(stats.open_fallocate_skipped, kOpenCostExtents);
+  }
+}
+
+// A clean close does not vouch for the files: an extent that lost blocks in
+// the meantime (a hole punched, or cut to nothing and grown back) is
+// allocated again, the others are left alone.
+TEST_F(DiskSlabTest, CleanReopenAllocatesASparseExtentAgain) {
+  auto options = Opts(kOpenCostExtents * kOpenCostExtentBytes,
+                      kOpenCostExtentBytes, 4096);
+  options.direct_writes = true;
+  DFKV_OPEN_COST_PREPARE(options);
+
+  const int punched = OpenExtent(dir_, 3);
+  ASSERT_GE(punched, 0);
+  const int punch_rc =
+      ::fallocate(punched, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 4096,
+                  8192);
+  ::close(punched);
+  if (punch_rc != 0) GTEST_SKIP() << "the test directory cannot punch holes";
+  const int regrown = OpenExtent(dir_, 5);
+  ASSERT_GE(regrown, 0);
+  ASSERT_EQ(::ftruncate(regrown, 0), 0);
+  ASSERT_EQ(::ftruncate(regrown, static_cast<off_t>(kOpenCostExtentBytes)), 0);
+  ::close(regrown);
+  ASSERT_LT(AllocatedBytes(dir_, 3), kOpenCostExtentBytes);
+  ASSERT_LT(AllocatedBytes(dir_, 5), kOpenCostExtentBytes);
+
+  bool ok = false;
+  DiskSlabStore reopened(options, &ok);
+  ASSERT_TRUE(ok) << reopened.StartupError();
+  EXPECT_EQ(reopened.GetStats().open_fallocate_skipped, kOpenCostExtents - 2);
+  EXPECT_TRUE(EveryExtentAllocated(dir_));
+  EXPECT_EQ(reopened.Count(), 2u);
+}
+
+// An extent cut short is, as before, a startup failure and not something the
+// open repairs.
+TEST_F(DiskSlabTest, CleanReopenStillRefusesAShortExtent) {
+  auto options = Opts(kOpenCostExtents * kOpenCostExtentBytes,
+                      kOpenCostExtentBytes, 4096);
+  options.direct_writes = true;
+  DFKV_OPEN_COST_PREPARE(options);
+  const int cut = OpenExtent(dir_, 2);
+  ASSERT_GE(cut, 0);
+  ASSERT_EQ(::ftruncate(cut, static_cast<off_t>(kOpenCostExtentBytes / 2)), 0);
+  ::close(cut);
+  bool ok = true;
+  DiskSlabStore reopened(options, &ok);
+  EXPECT_FALSE(ok);
+  EXPECT_NE(reopened.StartupError().find("extent size differs"),
+            std::string::npos)
+      << reopened.StartupError();
+}
+
+// Not a correctness test: prints how long a clean reopen of a populated store
+// takes. Set DFKV_SLAB_OPEN_BENCH_OBJECTS (for example 400000) to run it; it
+// needs about 5 KiB of disk per object under the temporary directory. The
+// store's own "opened in" log line splits each reopen into its phases.
+TEST_F(DiskSlabTest, OpenCostBench) {
+  const char* requested = std::getenv("DFKV_SLAB_OPEN_BENCH_OBJECTS");
+  if (requested == nullptr || *requested == '\0')
+    GTEST_SKIP() << "set DFKV_SLAB_OPEN_BENCH_OBJECTS to run";
+  const uint64_t objects = std::strtoull(requested, nullptr, 10);
+  ASSERT_GT(objects, 0u);
+  constexpr uint64_t kExtent = 1 << 20;  // 256 objects of 4 KiB each
+  const uint64_t extents = objects / 256 * 5 / 4 + 16;  // stay off the watermark
+  struct rlimit limit {};
+  ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &limit), 0);
+  limit.rlim_cur = limit.rlim_max;
+  ASSERT_EQ(::setrlimit(RLIMIT_NOFILE, &limit), 0);
+  if (limit.rlim_cur < 2 * extents + 64)
+    GTEST_SKIP() << "needs " << 2 * extents + 64 << " descriptors";
+  auto options = Opts(extents * kExtent, kExtent, 4096);
+  options.direct_writes = true;
+  options.reclaim_interval_ms = 0;
+  {
+    bool ok = false;
+    DiskSlabStore store(options, &ok);
+    ASSERT_TRUE(ok) << store.StartupError();
+    const std::string value = Payload('v');
+    for (uint64_t i = 1; i <= objects; ++i)
+      ASSERT_EQ(store.Cache(BlockKey{i * 0x9E3779B97F4A7C15ull, i, i % 7},
+                            value.data(), value.size()),
+                Status::kOk);
+  }
+  for (int round = 0; round < 4; ++round) {
+    const auto started = std::chrono::steady_clock::now();
+    bool ok = false;
+    DiskSlabStore store(options, &ok);
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - started)
+                          .count();
+    ASSERT_TRUE(ok) << store.StartupError();
+    std::printf("OPEN_BENCH round=%d objects=%llu extents=%llu direct=%d "
+                "reopen_ms=%.1f\n",
+                round, static_cast<unsigned long long>(store.Count()),
+                static_cast<unsigned long long>(extents),
+                store.DirectWritesActive() ? 1 : 0, ms);
+  }
+}

@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+- Server: opening a slab disk at startup costs less. Nothing changes on disk
+  or on the wire: older releases open a directory written by this one and
+  the other way round.
+  - Checksum: the CRC-32 of each 64-byte table record is computed eight bytes
+    per step from tables instead of one bit at a time. Same polynomial, same
+    values.
+  - Index: the per-object length index is keyed by the 24-byte key instead of
+    its 48-character name, so restoring an object no longer builds and hashes
+    a string, and the index is sized once instead of rehashing as it grows.
+  - `fallocate`: in direct mode an extent file is no longer passed to it when
+    the previous run closed clean and the file already has all its blocks. On
+    XFS the call cost a transaction per extent file even when it allocated
+    nothing. After an unclean exit every extent is still passed to it,
+    because there the call also waits for direct writes the previous process
+    left in flight; a new extent and one with holes are allocated as before.
+  - Clean close: since a clean marker now lets the next start leave that
+    call out, a store that is closed while a payload write call is still in
+    flight does not write the marker. It logs a WARN with the number of
+    write calls (a batch is one call) and the next start takes the unclean
+    path, as after a kill. The server stops its request paths and RAM-tier
+    flushers before it closes the disks, so an orderly stop is not affected.
+  - Measured with the test `DiskSlabTest.OpenCostBench` (400,000 objects of
+    4 KiB in 1,968 extent files, clean reopen, direct mode): 871-945 ms
+    before, 257-321 ms after, of which 15 ms for the extents, 18-31 ms for
+    the table scan and about 225 ms for the restore (the allocator's own bulk
+    restore is most of that and is unchanged).
+  - New INFO line per disk at startup: `slab <dir>: opened in N ms, K objects
+    restored (extents A ms, allocation skipped for S of E; table scan B ms;
+    restore C ms)`. The `allocation skipped` part appears in direct mode
+    only. See `docs/DEPLOY.md`.
 - Server and MDS: the accept loops of the RDMA bootstrap listener
   (`dfkv_server`) and of `dfkv_mds` no longer take the process down or spin
   when the host runs short of threads or file descriptors.

@@ -20,11 +20,13 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <random>
 #include <system_error>
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <vector>
 
+#include "utils/crc32.h"
 #include "utils/log.h"
 #include "utils/net_util.h"
 #include "utils/thread_name.h"  // PutU32/PutU64/GetU32/GetU64 (host-endian codec)
@@ -101,7 +103,31 @@ uint64_t ReadUniqueMountId(int dir_fd) {
 #endif
 }
 
-uint32_t Crc32(const uint8_t* p, size_t n);
+uint64_t ElapsedUs(std::chrono::steady_clock::time_point from,
+                   std::chrono::steady_clock::time_point to) {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(to - from).count());
+}
+
+// True only for a slab_state that is readable, intact and says "clean": the
+// run that last opened this directory finished Close() with its payloads and
+// table synced. Anything else -- missing, short, damaged, dirty -- is false.
+bool StateFileSaysClean(const std::string& path) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) return false;
+  uint8_t record[65];
+  ssize_t got;
+  do {
+    got = ::pread(fd, record, sizeof(record), 0);
+  } while (got < 0 && errno == EINTR);
+  ::close(fd);
+  return got == 64 &&
+         net::GetU32(reinterpret_cast<char*>(record)) == kStateMagic &&
+         net::GetU32(reinterpret_cast<char*>(record) + 4) == kFormatVersion &&
+         net::GetU32(reinterpret_cast<char*>(record) + 60) ==
+             Crc32(record, 60) &&
+         net::GetU32(reinterpret_cast<char*>(record) + 16) == kStateClean;
+}
 
 // Filesystems whose file contents, once written, stay with this kernel until
 // they reach the disk: the premise of keeping a table after a kill. A network
@@ -181,16 +207,6 @@ void DisarmCrashSlot(int slot) {
 // behind a stuck holder, so on expiry the PUT falls back to the pre-wait
 // behavior (kIOError) instead of blocking forever.
 constexpr auto kDeferredRemoveWaitMax = std::chrono::seconds(5);
-
-// Small CRC32 (IEEE, reflected) over a byte range; enough to catch a torn record.
-uint32_t Crc32(const uint8_t* p, size_t n) {
-  uint32_t crc = 0xFFFFFFFFu;
-  for (size_t i = 0; i < n; ++i) {
-    crc ^= p[i];
-    for (int k = 0; k < 8; ++k) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
-  }
-  return crc ^ 0xFFFFFFFFu;
-}
 
 bool PwriteAll(int fd, const void* buf, size_t n, uint64_t off) {
   const char* p = static_cast<const char*>(buf);
@@ -273,7 +289,21 @@ uint32_t RetainNowS() {
 }
 }  // namespace
 
+uint64_t DiskSlabStore::BlockKeyHash::Seed() noexcept {
+  try {
+    std::random_device device;
+    return (static_cast<uint64_t>(device()) << 32) | device();
+  } catch (...) {
+    // No entropy source: still differs between processes and runs.
+    const int local = 0;
+    return static_cast<uint64_t>(
+               std::chrono::steady_clock::now().time_since_epoch().count()) ^
+           reinterpret_cast<uintptr_t>(&local);
+  }
+}
+
 DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
+  const auto open_started = std::chrono::steady_clock::now();
   if (!ValidateOptions()) {
     if (ok) *ok = false;
     return;
@@ -414,6 +444,25 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   if (ok_) ok_ = unclean_start_ ? RecoverUnclean() : Rebuild();
   if (ok_) ok_ = MarkDirtyEpoch();
   if (ok_) ok_ = ClearInitMarker();
+  if (ok_) {
+    // Only direct mode allocates extents at open, so only there is there
+    // something to say about allocations left out.
+    char allocation[64] = "";
+    if (!extent_dio_fds_.empty())
+      std::snprintf(allocation, sizeof(allocation),
+                    ", allocation skipped for %u of %u",
+                    open_fallocate_skipped_, num_extents_);
+    char text[256];
+    std::snprintf(
+        text, sizeof(text),
+        ": opened in %.1f ms, %llu objects restored (extents %.1f ms%s; "
+        "table scan %.1f ms; restore %.1f ms)",
+        ElapsedUs(open_started, std::chrono::steady_clock::now()) / 1000.0,
+        static_cast<unsigned long long>(table_rebuilt_),
+        open_extents_us_ / 1000.0, allocation, open_scan_us_ / 1000.0,
+        open_restore_us_ / 1000.0);
+    DFKV_LOG_INFO("slab " + opt_.dir + text);
+  }
   if (Healthy() && opt_.table_sync_ms > 0) {
     sync_thread_ = std::thread([this] {
       NameThisThread("slab-sync");
@@ -460,6 +509,7 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
 
 DiskSlabStore::~DiskSlabStore() {
   Close();
+  DisarmCrashSlot(crash_slot_);  // still armed if Close() found writers
   for (int fd : extent_fds_)
     if (fd >= 0) ::close(fd);
   for (int fd : extent_dio_fds_)
@@ -503,10 +553,29 @@ bool DiskSlabStore::Close() {
   if (!Healthy())
     RevokeTrust(/*forfeit=*/true,
                 /*withdraw=*/identity_recorded_.load(std::memory_order_acquire));
+  // A clean state promises the next start that no payload write of this run
+  // is still on its way: that start then opens the extents without the
+  // fallocate that would wait for one. A caller that has not stopped its
+  // writers gets a dirty state instead, as if the process had been killed.
+  const uint32_t writers = payload_writers_.load();
+  const bool writers_remain = clean && writers != 0;
+  if (writers_remain) {
+    DFKV_LOG_WARN("slab " + opt_.dir + ": closed with " +
+                  std::to_string(writers) +
+                  " payload write call(s) still in flight; not recording a "
+                  "clean shutdown, the next start treats it as an unclean "
+                  "exit");
+    clean = false;
+  }
   // From here a crash no longer touches the token: the table and payloads are
-  // synced, so whichever state ends up on disk is true.
-  DisarmCrashSlot(crash_slot_);
-  crash_slot_ = -1;
+  // synced, so whichever state ends up on disk is true. Not so with writers
+  // still running: the state stays dirty and they go on changing the store,
+  // so a fatal signal must still be able to take the token back. That slot
+  // is released by the destructor.
+  if (!writers_remain) {
+    DisarmCrashSlot(crash_slot_);
+    crash_slot_ = -1;
+  }
   // A clean start needs no token. The state is clean now and stays so: a
   // token that will not go away is harmless, the next run has another epoch.
   if (clean && MarkCleanEpoch()) {
@@ -817,6 +886,13 @@ bool DiskSlabStore::OpenOrInit() {
     if (ec) return SetStartupError("cannot create extents directory: " + ec.message());
   }
 
+  // Whether the per-extent fallocate below may be left out; see there. The
+  // directory lock makes this answer the one OpenEpochState reads afterwards:
+  // only the lock holder writes slab_state.
+  const bool closed_clean = !fresh && !resume && dir_locked_ &&
+                            StateFileSaysClean((root / "slab_state").string());
+  const auto extents_started = std::chrono::steady_clock::now();
+
   // Open every extent file once and keep its descriptor resident.
   extent_fds_.assign(num_extents_, -1);
   if (opt_.direct_writes) extent_dio_fds_.assign(num_extents_, -1);
@@ -860,12 +936,37 @@ bool DiskSlabStore::OpenOrInit() {
     // lock); nothing of theirs may land after this run starts reusing slots
     // in a table it kept. Do not make this conditional on the extent being
     // new without putting another barrier in its place.
-    if (opt_.direct_writes && !extent_dio_fds_.empty() &&
-        ::fallocate(fd, 0, 0, static_cast<off_t>(opt_.extent_bytes)) != 0 &&
-        errno != EOPNOTSUPP && errno != ENOSYS && errno != EINVAL) {
-      const int saved_errno = errno;
-      ::close(fd);
-      return SetStartupErrno("cannot materialize extent " + ep, saved_errno);
+    //
+    // The one case in which neither job exists, and the call is left out
+    // (on XFS it costs a transaction per extent file even when it allocates
+    // nothing; with thousands of extents that was a third of a disk's open
+    // time): the previous run closed clean AND the file already has every
+    // block. Close() runs after the callers have stopped writing, and inside
+    // the store every io_uring write is reaped by the batch that submitted
+    // it; a batch that cannot reap fails the store, which then never records
+    // a clean close; and Close() itself refuses to record clean while a
+    // payload write is in flight. So a clean state leaves no direct I/O to
+    // wait for. After an unclean exit the call always runs, whether the table
+    // is kept or reset.
+    //
+    // st_blocks is a count, not a map of holes: metadata blocks and
+    // preallocation rounding count too, so a file with a hole smaller than
+    // that passes. The cost is direct writes that allocate into the hole
+    // (slower; on a full filesystem a failed PUT), never a wrong read: the
+    // barrier above depends on the clean close alone.
+    const bool fully_allocated =
+        !created && static_cast<uint64_t>(st.st_blocks) * 512 >=
+                        static_cast<uint64_t>(st.st_size);
+    if (opt_.direct_writes && !extent_dio_fds_.empty()) {
+      if (closed_clean && fully_allocated) {
+        ++open_fallocate_skipped_;
+      } else if (::fallocate(fd, 0, 0, static_cast<off_t>(opt_.extent_bytes)) !=
+                     0 &&
+                 errno != EOPNOTSUPP && errno != ENOSYS && errno != EINVAL) {
+        const int saved_errno = errno;
+        ::close(fd);
+        return SetStartupErrno("cannot materialize extent " + ep, saved_errno);
+      }
     }
     extent_fds_[e] = fd;
     if (opt_.direct_writes && !extent_dio_fds_.empty()) {
@@ -888,6 +989,8 @@ bool DiskSlabStore::OpenOrInit() {
       }
     }
   }
+  open_extents_us_ =
+      ElapsedUs(extents_started, std::chrono::steady_clock::now());
   return OpenEpochState(fresh || resume);
 }
 
@@ -1028,7 +1131,9 @@ bool DiskSlabStore::SyncTableFile() {
 // process's synchronous writes end before its descriptors close. (io_uring
 // writes can outlive the descriptors; they exist only with direct writes,
 // where opening the extents fallocates them, which waits for in-flight direct
-// I/O on XFS and ext4 -- see the fallocate in OpenOrInit.)
+// I/O on XFS and ext4 -- see the fallocate in OpenOrInit. The one start that
+// leaves the fallocate out is the one after a clean close, and Close() does
+// not record clean while a payload write is in flight.)
 bool DiskSlabStore::LockDirectory() {
   dir_fd_ = ::open(opt_.dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   if (dir_fd_ < 0)
@@ -1277,6 +1382,7 @@ bool DiskSlabStore::SyncPayloads() {
 
 bool DiskSlabStore::Rebuild(bool* inconsistent) {
   constexpr size_t kScanChunkBytes = 1u << 20;
+  const auto scan_started = std::chrono::steady_clock::now();
   enum class ScanResult { kDone, kUnsupported, kError };
 
   std::vector<SlabAllocator::RestoreEntry> entries;
@@ -1489,16 +1595,21 @@ bool DiskSlabStore::Rebuild(bool* inconsistent) {
   rebuild_sparse_ranges_ = sparse_ranges;
   rebuild_corrupt_records_ = corrupt_records;
   rebuild_rejected_records_ = rejected_records;
+  const auto restore_started = std::chrono::steady_clock::now();
+  open_scan_us_ = ElapsedUs(scan_started, restore_started);
 
   if (!alloc_->RestoreBulk(entries)) {
     if (inconsistent != nullptr) *inconsistent = true;
     return SetStartupError("inconsistent slots.tbl records during bulk rebuild");
   }
 
+  // One bucket array for the whole table instead of a rehash at every
+  // doubling on the way there.
+  payload_len_.reserve(payload_len_.size() + entries.size());
   for (const auto& entry : entries)
-    CommitPayloadLocked(entry.key.Filename(),
-                        static_cast<uint32_t>(entry.value_bytes));
+    CommitPayloadLocked(entry.key, static_cast<uint32_t>(entry.value_bytes));
   table_rebuilt_ += entries.size();
+  open_restore_us_ = ElapsedUs(restore_started, std::chrono::steady_clock::now());
 
   uint8_t zero[kRecBytes] = {0};
   for (const auto& location : rejected) {
@@ -1587,38 +1698,31 @@ bool DiskSlabStore::WritePayloadDirect(const SlabAllocator::SlotRef& r, char* da
   return PwriteAll(extent_dio_fds_[r.extent], data, alen, r.offset);
 }
 
-void DiskSlabStore::CommitPayloadLocked(const std::string& key,
+void DiskSlabStore::CommitPayloadLocked(const BlockKey& key,
                                         uint32_t payload_len) {
   auto [it, inserted] = payload_len_.try_emplace(key, payload_len);
   if (inserted) {
     committed_payload_bytes_ += payload_len;
-    BlockKey parsed;
-    if (BlockKey::ParseFilename(key, &parsed))
-      tenant_used_bytes_[parsed.tenant_hash] += payload_len;
+    tenant_used_bytes_[key.tenant_hash] += payload_len;
     return;
   }
-  BlockKey parsed;
-  if (BlockKey::ParseFilename(key, &parsed)) {
-    tenant_used_bytes_[parsed.tenant_hash] -= it->second;
-    tenant_used_bytes_[parsed.tenant_hash] += payload_len;
-  }
+  uint64_t& tenant_bytes = tenant_used_bytes_[key.tenant_hash];
+  tenant_bytes -= it->second;
+  tenant_bytes += payload_len;
   committed_payload_bytes_ -= it->second;
   it->second = payload_len;
   committed_payload_bytes_ += payload_len;
 }
 
-uint32_t DiskSlabStore::ErasePayloadLocked(const std::string& key) {
+uint32_t DiskSlabStore::ErasePayloadLocked(const BlockKey& key) {
   const auto it = payload_len_.find(key);
   if (it == payload_len_.end()) return 0;
   const uint32_t payload_len = it->second;
   committed_payload_bytes_ -= payload_len;
-  BlockKey parsed;
-  if (BlockKey::ParseFilename(key, &parsed)) {
-    auto tenant = tenant_used_bytes_.find(parsed.tenant_hash);
-    if (tenant != tenant_used_bytes_.end()) {
-      tenant->second -= payload_len;
-      if (tenant->second == 0) tenant_used_bytes_.erase(tenant);
-    }
+  auto tenant = tenant_used_bytes_.find(key.tenant_hash);
+  if (tenant != tenant_used_bytes_.end()) {
+    tenant->second -= payload_len;
+    if (tenant->second == 0) tenant_used_bytes_.erase(tenant);
   }
   payload_len_.erase(it);
   return payload_len;
@@ -1661,7 +1765,7 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
     std::unique_lock<std::mutex> lk(mu_);
     for (;;) {
       if (!Healthy()) return Status::kIOError;
-      if (payload_len_.count(fn) != 0) return Status::kOk;  // keep-first
+      if (payload_len_.count(key) != 0) return Status::kOk;  // keep-first
       // A Remove that already returned outranks an in-flight write of the
       // same key: this PUT arrived after it and must not share the result of
       // the write that Remove cancelled (that leader reports kOk without
@@ -1699,13 +1803,15 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
       alloc_->Pin(key);  // write-pin for the unlocked I/O below
       inflight_[fn]++;
       for (const BlockKey& ev : evicted)
-        evicted_bytes_ += ErasePayloadLocked(ev.Filename());
+        evicted_bytes_ += ErasePayloadLocked(ev);
       break;
     }
   }
   if (!leader) return WaitPut(flight);
 
+  payload_writers_.fetch_add(1);
   bool io_ok = write_payload(ref);
+  payload_writers_.fetch_sub(1);
 
   Status result = Status::kIOError;
   {
@@ -1727,7 +1833,7 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
       if (!removed_while_writing) alloc_->Remove(key);
     } else {
       if (!removed_while_writing) {
-        CommitPayloadLocked(fn, static_cast<uint32_t>(len));
+        CommitPayloadLocked(key, static_cast<uint32_t>(len));
         new_put_bytes_since_tick_ += ref.slot_size;
       }
       result = Status::kOk;
@@ -1802,7 +1908,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
           out[i] = Status::kIOError;
           break;
         }
-        if (payload_len_.count(st[i].fn) != 0) {
+        if (payload_len_.count(it.key) != 0) {
           out[i] = Status::kOk;
           break;
         }
@@ -1841,7 +1947,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
         alloc_->Pin(it.key);
         inflight_[st[i].fn]++;
         for (const BlockKey& ev : evicted)
-          evicted_bytes_ += ErasePayloadLocked(ev.Filename());
+          evicted_bytes_ += ErasePayloadLocked(ev);
         st[i].active = true;
         // Same alignment and padded-capacity eligibility as CacheDirect.
         const size_t alen = (it.len + 4095) & ~static_cast<size_t>(4095);
@@ -1853,6 +1959,10 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
     }
   }
   // -- IO: payloads (uring one-submit when possible); records follow in L2 --
+  // Counted from before the first write is issued until the last has
+  // completed or failed (Close() looks at it). A batch that leaves a write
+  // behind in the kernel has failed the store by then.
+  payload_writers_.fetch_add(1);
 #ifdef DFKV_WITH_URING
   size_t direct_n = 0;
   for (size_t i = 0; i < N; ++i) if (st[i].active && st[i].direct) direct_n++;
@@ -1977,6 +2087,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
       st[i].io_ok = w;
     }
   }
+  payload_writers_.fetch_sub(1);
   // -- L2: commit leaders under one lock, publish their exact result, then let
   // followers observe it without holding the store mutex.
   {
@@ -1997,7 +2108,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
         out[i] = Status::kIOError;
       } else {
         if (!removed) {
-          CommitPayloadLocked(st[i].fn,
+          CommitPayloadLocked(items[i].key,
                               static_cast<uint32_t>(items[i].len));
           new_put_bytes_since_tick_ += st[i].ref.slot_size;
         }
@@ -2145,7 +2256,7 @@ uint8_t DiskSlabStore::Retain(const BlockKey& key, uint32_t ttl_s,
   std::lock_guard<std::mutex> lk(mu_);
   // Only a committed value can be protected: an in-flight PUT or a removed
   // key is a miss, exactly as a reader would observe it.
-  auto it = payload_len_.find(key.Filename());
+  auto it = payload_len_.find(key);
   if (it == payload_len_.end()) return static_cast<uint8_t>(Code::kMiss);
   const SlabAllocator::RetainOutcome out =
       alloc_->Retain(key, ttl_s, retain_mode, now_s);
@@ -2174,7 +2285,7 @@ bool DiskSlabStore::AcquireForRead(const BlockKey& key, const std::string& fn,
                                    uint32_t* plen) {
   if (!Healthy()) return false;
   std::lock_guard<std::mutex> lk(mu_);
-  auto it = payload_len_.find(fn);
+  auto it = payload_len_.find(key);
   if (it == payload_len_.end()) return false;  // in-flight write / removed: no commit
   if (!alloc_->GetAndPin(key, ref)) return false;
   *plen = it->second;
@@ -2201,7 +2312,7 @@ bool DiskSlabStore::ReleaseInflightLocked(const BlockKey& key,
     else
       alloc_->Remove(key);
   }
-  ErasePayloadLocked(fn);
+  ErasePayloadLocked(key);
   remove_cv_.notify_all();
   return release_ok;
 }
@@ -2270,13 +2381,13 @@ bool DiskSlabStore::IsCached(const BlockKey& key) const {
   std::lock_guard<std::mutex> lk(mu_);
   // Commit-gated (matches what a Range would hit): an in-flight write or a
   // deferred-removed key reads as absent.
-  return payload_len_.count(key.Filename()) > 0;
+  return payload_len_.count(key) > 0;
 }
 Status DiskSlabStore::Lookup(const BlockKey& key, ValueMetadata* out) const {
   if (!Healthy()) return Status::kIOError;
   if (out == nullptr) return Status::kInvalid;
   std::lock_guard<std::mutex> lk(mu_);
-  auto it = payload_len_.find(key.Filename());
+  auto it = payload_len_.find(key);
   if (it == payload_len_.end()) return Status::kNotFound;
   out->value_len = it->second;
   return Status::kOk;
@@ -2300,18 +2411,18 @@ Status DiskSlabStore::Remove(const BlockKey& key) {
     // sees the deferral and never writes one. SlabAllocator's own
     // deferred-remove state remains a final defense for callers that miss this
     // higher-level ordering.
-    if (payload_len_.count(fn) != 0 &&
+    if (payload_len_.count(key) != 0 &&
         !WriteRecord(ref, key, 0, /*valid=*/false))
       return Status::kIOError;
     deferred_remove_.insert(fn);
     ++deferred_remove_total_;
-    ErasePayloadLocked(fn);
+    ErasePayloadLocked(key);
     return Status::kOk;
   }
   if (!WriteRecord(ref, key, 0, /*valid=*/false))
     return Status::kIOError;
   alloc_->Remove(key);
-  ErasePayloadLocked(fn);
+  ErasePayloadLocked(key);
   return Status::kOk;
 }
 
@@ -2385,7 +2496,7 @@ void DiskSlabStore::ReclaimTick(
       if (!evicted.empty()) {
         if (after_watermark_evict) after_watermark_evict();
         for (const BlockKey& key : evicted)
-          evicted_bytes_ += ErasePayloadLocked(key.Filename());
+          evicted_bytes_ += ErasePayloadLocked(key);
       }
       watermark_latch_.EndTick(alloc_->UsedBytes(), evict_low_bytes_);
       watermark_active_.store(watermark_latch_.active, std::memory_order_relaxed);
@@ -2436,7 +2547,7 @@ void DiskSlabStore::ReclaimTick(
           std::lock_guard<std::mutex> lk(mu_);
           ok = alloc_->StealFrom(donor, i, &evicted);
           for (const BlockKey& key : evicted)
-            evicted_bytes_ += ErasePayloadLocked(key.Filename());
+            evicted_bytes_ += ErasePayloadLocked(key);
         }
         if (!ok) { extents[donor] = 0; continue; }  // donor all pinned: try next
         extents[donor]--;
@@ -2458,7 +2569,7 @@ void DiskSlabStore::ReclaimTick(
         std::lock_guard<std::mutex> lk(mu_);
         got = alloc_->ReclaimClass(i, target, batch, &evicted);
         for (const BlockKey& key : evicted)
-          evicted_bytes_ += ErasePayloadLocked(key.Filename());
+          evicted_bytes_ += ErasePayloadLocked(key);
       }
       if (got > 0) reclaimed_.fetch_add(got, std::memory_order_relaxed);
       budget -= std::min(budget, got);
@@ -2502,6 +2613,10 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   st.rebuild_sparse_ranges = rebuild_sparse_ranges_;
   st.rebuild_sequential_fallbacks = rebuild_sequential_fallbacks_;
   st.rebuild_mmap_scans = rebuild_mmap_scans_;
+  st.open_fallocate_skipped = open_fallocate_skipped_;
+  st.open_extents_us = open_extents_us_;
+  st.open_scan_us = open_scan_us_;
+  st.open_restore_us = open_restore_us_;
   st.capacity_bytes =
       static_cast<uint64_t>(opt_.extent_bytes) * num_extents_;
   st.failed = !Healthy();
