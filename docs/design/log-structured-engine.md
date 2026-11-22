@@ -246,7 +246,10 @@ header is durable.
 | inline payload | ≤ 4096 − header_len | when flag bit 0 is set |
 | reserved | … | zero |
 
-A non-inline payload starts at the next 4 KiB boundary after the header block
+A payload is inline exactly when it fits, that is when value_len ≤ 4096 −
+header_len; a decoder refuses a record whose flag says otherwise, and a
+value_len larger than the segment can hold. A non-inline payload starts at
+the next 4 KiB boundary after the header block
 and is padded with zeros to a 4 KiB multiple. The next record starts after the
 padding. So a record occupies `4096 + round_up(value_len, 4096)` bytes, or
 exactly 4096 bytes when the payload fits inline (any value up to about
@@ -259,7 +262,9 @@ the whole value is an aligned read with no head offset (§5).
 
 **Summary** (sealed segments): an array of 64-byte entries, one per record in
 the segment (key, value_len, generation, write_lsn, offset in 4 KiB units,
-payload_crc, flags), followed by its own CRC32C. Room for it is reserved as
+payload_crc, flags). It carries no checksum of its own: its CRC32C is the
+trailer's summary CRC, so a summary is trusted only through a valid trailer.
+Room for it is reserved as
 records are placed (§6.1), so it always fits. **Trailer** (fixed last 4 KiB):
 magic `DFLSEND1`, store_uuid, incarnation, record count, summary offset,
 summary length, summary CRC, last write_lsn, trailer CRC. The trailer is
