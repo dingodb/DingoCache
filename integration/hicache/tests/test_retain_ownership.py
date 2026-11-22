@@ -21,8 +21,10 @@ Runs without SGLang, torch or libdfkv:
 
 from __future__ import annotations
 
+import collections
 import os
 import sys
+import threading
 import types
 import unittest
 
@@ -313,6 +315,41 @@ class BatchTouch(unittest.TestCase):
         (keys, _ttl, mode), = c.retain_calls
         self.assertEqual(mode, H.dfkv_cabi.DFKV_RETAIN_REFRESH)
         self.assertEqual(keys, b._retain_object_keys(PAGES))
+
+
+class AnchorMarkerRetention(unittest.TestCase):
+    """A touch before the logical-anchor marker exists parks its TTL; the
+    marker's write must apply it, as every other write does. It was applied
+    only when the write itself carried a TTL."""
+
+    def _backend(self):
+        b = _backend(kda=False, indexer=False)
+        b._has_retain = True
+        b._pending_retain = collections.OrderedDict()
+        b._pending_lock = threading.Lock()
+        b.mem_pool_host = types.SimpleNamespace(
+            get_page_buffer_meta=lambda indices: None)   # logical anchor
+        b._anchor_notice_printed = True
+        b._write_anchor_markers_impl = lambda keys: [True] * len(keys)
+        return b
+
+    def test_parked_ttl_is_applied_by_the_marker_write(self):
+        b = self._backend()
+        markers = [sk for k in PAGES for sk in b._keys(k)]
+        for sk in markers:
+            b._pending_retain[sk] = 3600
+        with _Cabi() as c:
+            self.assertEqual(b.batch_set_v1(PAGES, list(range(3))),
+                             [True] * 3)
+        self.assertEqual(c.retain_calls,
+                         [(markers, 3600, H.dfkv_cabi.DFKV_RETAIN_SET)])
+        self.assertEqual(len(b._pending_retain), 0)
+
+    def test_without_any_ttl_nothing_is_sent(self):
+        b = self._backend()
+        with _Cabi() as c:
+            b.batch_set_v1(PAGES, list(range(3)))
+        self.assertEqual(c.retain_calls, [])
 
 
 class BatchTouchDebounce(unittest.TestCase):
