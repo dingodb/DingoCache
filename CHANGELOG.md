@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Client, GPU dedup (`DFKV_CLIENT_NODE_DEDUP_GPU=1`): a lookup that another
+  process on the host is fetching no longer waits out
+  `DFKV_NODE_DEDUP_WAIT_MS` (500 ms by default) when that process has
+  nothing to share. The host-memory path got this in 2.38.0; the device
+  path still treated only a published result as final, so a batch waited
+  the full time, once, whenever the owner of any of its keys gave up (a
+  miss, a node in cooldown, an I/O error, or a device that could not be
+  synchronized before publishing). A waiter now returns a key at once when
+  no fetch is in flight for it any more, or when the published entry is one
+  it cannot use (expired, overwritten, larger than its buffers), and the
+  caller fetches those keys in one direct batch as before; the keys that
+  were published are still delivered. `dfkv_client_gpu_dedup_wait_timeouts_total`
+  keeps counting every wait that ended in a direct fetch, early or not.
+  Mixed versions on one host are safe: only the waiting side behaves
+  differently.
 - Client, GPU dedup (`DFKV_CLIENT_NODE_DEDUP_GPU=1`): the process that
   fetched a key for the others published it before the fetched bytes were
   known to have reached device memory. A GPUDirect read writes the caller's

@@ -39,7 +39,7 @@ exist 命中 **≠** 数据真被拉回。SGLang HiCache 的 `prefetch-policy=ti
 
 **判读**：
 - 会合（node-dedup）**默认关**（R2 A/B 实测 2026-07-17：推理批形状下会合协调开销反噬——dedup-on 热轮 TTFT +19-36% 恶化、批 p99 22s；dedup-off 直连 8× 读放大反而 TTFT −43%、吞吐 +50-71%）。仅多节点环 fabric 带宽吃紧时显式开 `DFKV_CLIENT_NODE_DEDUP=1`，且必须实测热轮为正收益。开了之后才看 `dedup_hits/wait_hits/fetches` 三兄弟。
-- `wait_timeouts` 高 = 会合等待后回退直连。host 路径下它既包含等满 `DFKV_NODE_DEDUP_WAIT_MS` 的 key（读回带宽跟不上，见第③层），也包含 leader 放弃后立即回退的 key（leader 自己未命中、目标节点在冷却或读失败）；后一种不产生等待，先对照 GET 未命中与节点冷却指标再归因到带宽。
+- `wait_timeouts` 高 = 会合等待后回退直连。host 与 GPU 路径下它都既包含等满 `DFKV_NODE_DEDUP_WAIT_MS` 的 key（读回带宽跟不上，见第③层），也包含 leader 放弃后立即回退的 key（leader 自己未命中、目标节点在冷却或读失败）；后一种不产生等待，先对照 GET 未命中与节点冷却指标再归因到带宽。
 
 ---
 

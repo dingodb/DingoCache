@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -90,6 +91,16 @@ GpuNodeDedup::Options Opts(const std::string& name) {
   o.wait_ms = 300;
   o.takeover_ms = 200;
   o.ttl_ms = 30000;  // outlives a child-process exec in the cross-proc test
+  return o;
+}
+
+// A waiter whose deadline is far beyond any scheduling delay, and claims
+// that are never taken over: a test that expects a wait to end early can use
+// a bound that is generous and still well short of the deadline.
+GpuNodeDedup::Options LongWait(const std::string& name) {
+  GpuNodeDedup::Options o = Opts(name);
+  o.wait_ms = 5000;
+  o.takeover_ms = 600000;
   return o;
 }
 
@@ -395,6 +406,130 @@ TEST(GpuNodeDedup, CrossProcessIpcHit) {
   ASSERT_EQ(::waitpid(pid, &st, 0), pid);
   ASSERT_TRUE(WIFEXITED(st));
   EXPECT_EQ(WEXITSTATUS(st), 0) << "child (IPC reader) failed";
+}
+
+// ---- a waiter whose owner gives up ----------------------------------------
+
+TEST(GpuNodeDedup, AbortEndsAWaitAtOnce) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("wait-abort");
+  auto a = GpuNodeDedup::Open(LongWait(g.name));
+  auto b = GpuNodeDedup::Open(LongWait(g.name));
+  ASSERT_TRUE(a && b);
+  DevBuf d(4096);
+  GpuNodeDedup::Seg s{reinterpret_cast<void*>(d.p), 4096};
+  size_t got = 0;
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->ClaimSg(K(40), &s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  ASSERT_EQ(b->ClaimSg(K(40), &s, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kWait);
+  a->Abort(K(40), token);
+  // Nothing will be published: the waiter falls back now, not after its
+  // wait_ms (5 s).
+  const auto t0 = std::chrono::steady_clock::now();
+  EXPECT_FALSE(b->WaitSg(K(40), &s, 1, 4096, &got));
+  EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(2));
+  EXPECT_EQ(b->wait_timeouts(), 1u);
+}
+
+TEST(GpuNodeDedup, AbortDuringAWaitEndsIt) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("wait-abort-late");
+  auto a = GpuNodeDedup::Open(LongWait(g.name));
+  auto b = GpuNodeDedup::Open(LongWait(g.name));
+  ASSERT_TRUE(a && b);
+  DevBuf d(4096);
+  GpuNodeDedup::Seg s{reinterpret_cast<void*>(d.p), 4096};
+  size_t got = 0;
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->ClaimSg(K(41), &s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  ASSERT_EQ(b->ClaimSg(K(41), &s, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kWait);
+  const auto t0 = std::chrono::steady_clock::now();
+  std::thread abort([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    a->Abort(K(41), token);
+  });
+  GpuNodeDedup::WaitItem item{K(41), &s, 1, 4096, false, 0};
+  b->WaitManySg(&item, 1);
+  const auto waited = std::chrono::steady_clock::now() - t0;
+  abort.join();
+  EXPECT_FALSE(item.ok);
+  EXPECT_GE(waited, std::chrono::milliseconds(50));  // a fetch in flight is waited for
+  EXPECT_LT(waited, std::chrono::seconds(2));        // and its abort ends the wait
+}
+
+// A batch waits for many keys. The ones whose owner gave up are returned at
+// once for the caller to fetch; the published ones are still delivered.
+TEST(GpuNodeDedup, WaitManyGivesUpOnAbortedKeysAndDeliversTheRest) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("wait-many-abort");
+  auto a = GpuNodeDedup::Open(LongWait(g.name));
+  auto b = GpuNodeDedup::Open(LongWait(g.name));
+  ASSERT_TRUE(a && b);
+  constexpr size_t kN = 16, kLen = 4096;
+  std::vector<std::unique_ptr<DevBuf>> src, dst;
+  std::vector<GpuNodeDedup::Seg> ssegs(kN), dsegs(kN);
+  std::vector<uint64_t> tokens(kN, 0);
+  size_t got = 0;
+  uint64_t ignored = 0;
+  for (size_t i = 0; i < kN; ++i) {
+    src.push_back(std::make_unique<DevBuf>(kLen));
+    dst.push_back(std::make_unique<DevBuf>(kLen));
+    src[i]->Up(Val(200 + i, kLen));
+    ssegs[i] = {reinterpret_cast<void*>(src[i]->p), kLen};
+    dsegs[i] = {reinterpret_cast<void*>(dst[i]->p), kLen};
+    ASSERT_EQ(a->ClaimSg(K(200 + i), &ssegs[i], 1, kLen, &got, &tokens[i]),
+              GpuNodeDedup::Role::kFetch);
+    ASSERT_EQ(b->ClaimSg(K(200 + i), &dsegs[i], 1, kLen, &got, &ignored),
+              GpuNodeDedup::Role::kWait);
+  }
+  // The owner gets half of its keys and gives the other half up.
+  for (size_t i = 0; i < kN; ++i) {
+    if (i % 2 == 0)
+      a->PublishSg(K(200 + i), tokens[i], &ssegs[i], 1, kLen);
+    else
+      a->Abort(K(200 + i), tokens[i]);
+  }
+  std::vector<GpuNodeDedup::WaitItem> items(kN);
+  for (size_t i = 0; i < kN; ++i)
+    items[i] = GpuNodeDedup::WaitItem{K(200 + i), &dsegs[i], 1, kLen, false, 0};
+  const auto t0 = std::chrono::steady_clock::now();
+  b->WaitManySg(items.data(), items.size());
+  EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(2))
+      << "the batch waited out its deadline for keys nobody is fetching";
+  for (size_t i = 0; i < kN; ++i) {
+    EXPECT_EQ(items[i].ok, i % 2 == 0) << i;
+    if (i % 2 == 0) {
+      EXPECT_EQ(items[i].got, kLen);
+      EXPECT_EQ(dst[i]->Down(kLen), Val(200 + i, kLen)) << i;
+    }
+  }
+  EXPECT_EQ(b->wait_hits(), kN / 2);
+  EXPECT_EQ(b->wait_timeouts(), kN / 2);
+}
+
+TEST(GpuNodeDedup, PublishedEntryTheWaiterCannotUseEndsTheWaitAtOnce) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("wait-unusable");
+  auto a = GpuNodeDedup::Open(LongWait(g.name));
+  auto b = GpuNodeDedup::Open(LongWait(g.name));
+  ASSERT_TRUE(a && b);
+  DevBuf src(4096), small(1024);
+  src.Up(Val(42, 4096));
+  GpuNodeDedup::Seg s{reinterpret_cast<void*>(src.p), 4096};
+  GpuNodeDedup::Seg d{reinterpret_cast<void*>(small.p), 1024};
+  size_t got = 0;
+  uint64_t token = 0;
+  ASSERT_EQ(a->ClaimSg(K(42), &s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  a->PublishSg(K(42), token, &s, 1, 4096);
+  // 4096 bytes do not fit the waiter's 1024: it can never copy this entry.
+  const auto t0 = std::chrono::steady_clock::now();
+  EXPECT_FALSE(b->WaitSg(K(42), &d, 1, 1024, &got));
+  EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(2));
 }
 
 // ---- through KVClient: a fetch that lands in device memory -----------------
