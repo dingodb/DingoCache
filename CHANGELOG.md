@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- Client RDMA: a failure is charged to the peer's rail only when it says
+  something about that rail, and one event counts once.
+  - A pooled connection that fails when it is reused, before anything has
+    succeeded on it again (the server reclaimed it while idle, or restarted),
+    no longer cools the (peer, rail) pair. Cooling
+    it also refused the retry on a fresh connection wherever that rail was the
+    only one usable for the peer (one rail configured, or one rail in common),
+    so for a peer known by identity through the MDS a single stale connection
+    failed the operation with "no compatible rail" and kept the peer unusable
+    for the cooldown; with several rails it pushed traffic off the preferred
+    rail for the cooldown. Now the dead connection is discarded and the
+    retry runs; the pair is cooled only if a connection made now fails as
+    well. For a peer known by identity the other idle connections to it on
+    that rail are discarded with it. New counter
+    `dfkv_rdma_client_stale_pool_connections_total`. Peers given as a static
+    address list were never cooled and still are not; their other idle
+    connections are left in the pool as before, and each is counted when it
+    is found dead. A failed keepalive on an idle connection is treated as
+    before.
+    Behaviour change to be aware of: a rail on which pooled connections keep
+    dying while new connections work is no longer cooled at all. The counter
+    above is the signal for that, not
+    `dfkv_rdma_client_remote_rail_cooldowns_total`.
+  - Operations that were in flight when a peer rail failed and then fail too
+    are observations of the same failure. They are still counted in
+    `dfkv_rdma_client_remote_rail_failures_total` but no longer double the
+    cooldown each: five operations failing together used to give a 30 s
+    cooldown where one gave the base 2 s. The cooldown now grows only when the
+    single recovery probe made after it fails.
+    Behaviour change to be aware of: the cooldown of a failing rail is the
+    base one however many operations fail with it, also when the rail has
+    just recovered through a successful probe and then fails again; it used
+    to be longer the more operations were in flight.
+  No wire change; retry counts, rail choice on retry and local rail
+  quarantine are unchanged.
 - Server: a stop signal (SIGTERM or SIGINT) that arrives while the server
   is still starting now cancels the start. Until now the signal was only
   looked at once the server was fully up: the start ran to its end (disks

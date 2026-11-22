@@ -367,6 +367,11 @@ struct RdmaTransport::Conn {
   uint64_t remote_lease_generation = 0;
   bool remote_lease_held = false;
   bool remote_recovery_probe = false;
+  // This acquisition took the connection from the pool, at the given count
+  // of successful completions. Until that count moves nothing says the peer
+  // still has the other end.
+  bool reused_from_pool = false;
+  uint64_t completions_at_reuse = 0;
   rdma::RailLease lease;
   uint64_t lease_started_us = 0;
   bool credit_held = false;
@@ -838,6 +843,7 @@ void RdmaTransport::MaintainIdle(uint64_t now_us, bool send_keepalives) {
       conn->remote_lease_held = true;
       conn->remote_recovery_probe = remote->recovery_probe;
     }
+    conn->reused_from_pool = false;  // a keepalive is judged as before
     rdma::RailCompletion failure = rdma::RailCompletion::kAdmission;
     if (!KeepaliveConn(conn, &failure))
       Destroy(conn, failure);
@@ -1053,8 +1059,23 @@ void RdmaTransport::Destroy(Conn* c, rdma::RailCompletion completion) {
   const uint64_t lease_started_us = c->lease_started_us;
   const bool release_budget = c->budget_held;
   const rdma::ResourceRequest budget_request = c->budget_request;
+  // A pooled connection that fails on reuse, before a single completion has
+  // succeeded on it, says that this connection is gone, which is what a peer
+  // does when it reclaims an idle connection or restarts. It does not say
+  // that the peer cannot be reached over this rail:
+  // only a connection made now can say that, and the caller's retry makes
+  // one. So the peer rail is not cooled, which would also refuse that retry
+  // where the rail is the only usable one. The other idle connections to the
+  // peer on this rail are as old as this one and are dropped, so that the
+  // next operations do not each find a dead one.
+  const bool stale_pooled =
+      completion == rdma::RailCompletion::kEndpointFailure &&
+      c->reused_from_pool &&
+      c->ep.succeeded_completions() == c->completions_at_reuse;
+  const std::string stale_peer_id = stale_pooled ? c->peer_id : std::string();
+  const size_t stale_rail = c->rail_index;
   CompleteRemoteLease(
-      c, completion == rdma::RailCompletion::kEndpointFailure
+      c, completion == rdma::RailCompletion::kEndpointFailure && !stale_pooled
              ? RemoteRailOutcome::kEndpointFailure
              : RemoteRailOutcome::kAbandon);
 
@@ -1066,6 +1087,10 @@ void RdmaTransport::Destroy(Conn* c, rdma::RailCompletion completion) {
     rail_policy_->Complete(lease, now - lease_started_us, completion, now);
   }
   if (release_budget) resource_budget_->Release(budget_request);
+  if (stale_pooled) {
+    stale_pool_connections_.fetch_add(1, std::memory_order_relaxed);
+    RetireIdlePeerRail(stale_peer_id, stale_rail);
+  }
 }
 
 
@@ -1420,6 +1445,8 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     pooled->remote_lease_held = remote_lease.has_value();
     pooled->remote_recovery_probe =
         remote_lease && remote_lease->recovery_probe;
+    pooled->reused_from_pool = true;
+    pooled->completions_at_reuse = pooled->ep.succeeded_completions();
     result.from_pool = true;
     if (!pooled->ep.EnsurePoolMrs(pools, true)) {
       Destroy(pooled, rdma::RailCompletion::kRailFailure);
@@ -2245,6 +2272,12 @@ std::string RdmaTransport::MetricsText() const {
   s += "# TYPE dfkv_rdma_client_v2_probe_failures_total counter\n";
   s += "dfkv_rdma_client_v2_probe_failures_total " +
        std::to_string(v2_probe_failures_.load(std::memory_order_relaxed)) +
+       "\n";
+  s += "# HELP dfkv_rdma_client_stale_pool_connections_total Pooled connections that failed on reuse and were discarded without cooling the peer rail\n";
+  s += "# TYPE dfkv_rdma_client_stale_pool_connections_total counter\n";
+  s += "dfkv_rdma_client_stale_pool_connections_total " +
+       std::to_string(
+           stale_pool_connections_.load(std::memory_order_relaxed)) +
        "\n";
   s += "# HELP dfkv_rdma_client_stale_pool_retries_total Fresh-connection retries after a pooled QP failure\n";
   s += "# TYPE dfkv_rdma_client_stale_pool_retries_total counter\n";

@@ -1037,7 +1037,10 @@ int RcEndpoint::ObserveCompletions(ibv_wc* out, int got) {
                                std::memory_order_relaxed);
     uint64_t failed = 0;
     for (int i = 0; i < got; ++i) {
-      if (out[i].status == IBV_WC_SUCCESS) continue;
+      if (out[i].status == IBV_WC_SUCCESS) {
+        ++succeeded_completions_;
+        continue;
+      }
       ++failed;
       // Remember the cause, not the flush that follows it (see failed_wc()).
       if (!has_failed_wc_) {

@@ -276,6 +276,75 @@ TEST(RemoteRailHealth, FailedProbeRecoolsWithCappedFakeClockBackoff) {
                   RemoteRailOutcome::kAbandon, 590);
 }
 
+// Several operations in flight when a peer goes away all fail. That is one
+// event: the cooldown is the base one, not the base doubled once per
+// operation that happened to be running.
+TEST(RemoteRailHealth, FailuresOfOneEventDoNotLengthenTheCooldown) {
+  RemoteRailHealth health(
+      RemoteRailHealthConfig{/*base_cooldown_us=*/100,
+                             /*max_cooldown_us=*/3000});
+  std::vector<RemoteRailLease> in_flight;
+  for (int i = 0; i < 5; ++i) {
+    auto lease = health.TryAcquire("peer", 0, 1);
+    ASSERT_TRUE(lease);
+    ASSERT_FALSE(lease->recovery_probe);
+    in_flight.push_back(*lease);
+  }
+
+  auto completion = health.Complete("peer", 0, in_flight[0].generation,
+                                    RemoteRailOutcome::kEndpointFailure, 10);
+  EXPECT_EQ(completion.transition, RemoteRailTransition::kCooled);
+  EXPECT_EQ(completion.cooldown_until_us, 110u);
+  for (size_t i = 1; i < in_flight.size(); ++i) {
+    completion =
+        health.Complete("peer", 0, in_flight[i].generation,
+                        RemoteRailOutcome::kEndpointFailure, 10 + i);
+    EXPECT_EQ(completion.transition, RemoteRailTransition::kNone) << i;
+    EXPECT_EQ(completion.cooldown_until_us, 110u) << i;
+  }
+  EXPECT_FALSE(health.TryAcquire("peer", 0, 109));
+
+  // The probe after the cooldown is a new attempt. Failing it is the second
+  // failure, whatever the number of operations that saw the first.
+  auto probe = health.TryAcquire("peer", 0, 110);
+  ASSERT_TRUE(probe);
+  ASSERT_TRUE(probe->recovery_probe);
+  completion = health.Complete("peer", 0, probe->generation,
+                               RemoteRailOutcome::kEndpointFailure, 120);
+  EXPECT_EQ(completion.transition, RemoteRailTransition::kCooled);
+  EXPECT_EQ(completion.cooldown_until_us, 320u);
+
+  const std::string metrics = health.MetricsText({"rail0"});
+  EXPECT_NE(metrics.find("dfkv_rdma_client_remote_rail_failures_total 6\n"),
+            std::string::npos)
+      << "every failed lease is still counted";
+  EXPECT_NE(metrics.find("dfkv_rdma_client_remote_rail_cooldowns_total 2\n"),
+            std::string::npos);
+}
+
+// An operation that was already running when the rail failed and fails only
+// after the cooldown has run out still belongs to the old event.
+TEST(RemoteRailHealth, LateFailureOfTheSameEventDoesNotRecool) {
+  RemoteRailHealth health(
+      RemoteRailHealthConfig{/*base_cooldown_us=*/100,
+                             /*max_cooldown_us=*/3000});
+  auto first = health.TryAcquire("peer", 0, 1);
+  auto slow = health.TryAcquire("peer", 0, 1);
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(slow);
+  health.Complete("peer", 0, first->generation,
+                  RemoteRailOutcome::kEndpointFailure, 10);
+  const auto late = health.Complete("peer", 0, slow->generation,
+                                    RemoteRailOutcome::kEndpointFailure, 500);
+  EXPECT_EQ(late.transition, RemoteRailTransition::kNone);
+  EXPECT_EQ(late.cooldown_until_us, 110u);
+  auto probe = health.TryAcquire("peer", 0, 500);
+  ASSERT_TRUE(probe) << "the cooldown ended at 110 and was not restarted";
+  EXPECT_TRUE(probe->recovery_probe);
+  health.Complete("peer", 0, probe->generation, RemoteRailOutcome::kAbandon,
+                  500);
+}
+
 TEST(RemoteRailHealth, ConfiguredCooldownIsHardCappedAtThirtySeconds) {
   RemoteRailHealth health(
       RemoteRailHealthConfig{/*base_cooldown_us=*/60'000'000,

@@ -399,6 +399,7 @@ class RdmaTransport : public Transport {
   mutable std::atomic<uint64_t> v2_probe_attempts_{0};
   mutable std::atomic<uint64_t> v2_probe_failures_{0};
   std::atomic<uint64_t> stale_pool_retries_{0};
+  std::atomic<uint64_t> stale_pool_connections_{0};
   std::atomic<uint64_t> cross_rail_retries_{0};
   std::atomic<uint64_t> cross_rail_retry_successes_{0};
   std::atomic<uint64_t> cross_rail_retry_exhausted_{0};
