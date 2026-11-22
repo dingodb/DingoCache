@@ -291,9 +291,14 @@ size-class lattice and carves them into uniform slots:
   gives the RAM tier `DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S` (default 30) to write
   its backlog (what is still only in RAM after that is dropped), then syncs
   all disks at the same time and marks them clean (`KvNodeServer::Shutdown`,
-  `DiskCacheGroup::Close`, `StoreEngine::Close`). Memory (RDMA registrations,
-  the RAM tier arena) is released only after that, so a stop that is killed
-  while unmapping a large arena still finds a clean cache at the next start.
+  `DiskCacheGroup::Close`, `StoreEngine::Close`). The rails with their
+  receive-pool registrations and the RAM tier arena are released only after
+  that (per-connection queue pairs and registrations go earlier, with their
+  connections), so a stop that is killed while unmapping a large arena still
+  finds a clean cache at the next start. The drain limit counts from the
+  start of the stop; stopping the request paths can itself wait for PUTs that
+  are parked until their value is on disk, and that wait has no limit of its
+  own yet.
 - **Unclean exit:** a dirty epoch at startup means the previous process did not
   shut down. By default (`DFKV_SLAB_WARM_RESTART=off`) the table is reset, as in
   every release up to 2.35. With `auto` it is kept when the kernel that held the

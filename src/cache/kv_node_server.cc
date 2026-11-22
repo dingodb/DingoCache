@@ -25,6 +25,34 @@
 namespace dfkv {
 
 namespace {
+// How long a stopping server lets the RAM tier write its backlog. Parsed
+// strictly: the value decides how much is dropped, and "abc" or "5m" must not
+// quietly become 0 or 5 seconds.
+uint64_t ResolveShutdownDrainTimeoutSeconds() {
+  constexpr uint64_t kDefault = 30;
+  constexpr uint64_t kMax = 3600;
+  const char* const name = "DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S";
+  uint64_t seconds = kDefault;
+  const char* value = std::getenv(name);
+  if (value != nullptr && *value != '\0') {
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (*value < '0' || *value > '9' || errno != 0 || *end != '\0') {
+      DFKV_LOG_WARN(std::string("invalid ") + name + "='" + value +
+                    "'; using " + std::to_string(kDefault));
+    } else if (parsed > kMax) {
+      DFKV_LOG_WARN(std::string(name) + " clamped to hard maximum " +
+                    std::to_string(kMax));
+      seconds = kMax;
+    } else {
+      seconds = parsed;
+    }
+  }
+  config_dump::RecordResolved(name, std::to_string(seconds));
+  return seconds;
+}
+
 // Monotonic seconds; only read on the ~1/64 sampled ops, so the cost is amortized
 // away on the hot path.
 inline double NowSec() {
@@ -88,6 +116,7 @@ KvNodeServer::KvNodeServer(const std::vector<std::string>& cache_dirs,
 
 KvNodeServer::KvNodeServer(DiskCacheGroup::Options options)
     : group_(std::move(options)) {
+  shutdown_drain_timeout_s_ = ResolveShutdownDrainTimeoutSeconds();
   if (!group_.Healthy()) return;
   InitRamTier();
   InitAdmission();
@@ -282,15 +311,6 @@ Status KvNodeServer::Start(int port) {
 }
 
 namespace {
-uint64_t ShutdownDrainTimeoutSeconds() {
-  uint64_t timeout_seconds = 30;
-  if (const char* value = std::getenv("DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S")) {
-    const unsigned long parsed = std::strtoul(value, nullptr, 10);
-    if (parsed <= 3600) timeout_seconds = parsed;
-  }
-  return timeout_seconds;
-}
-
 std::string Seconds(std::chrono::steady_clock::time_point since) {
   char text[32];
   std::snprintf(text, sizeof(text), "%.2f s",
@@ -303,7 +323,7 @@ std::string Seconds(std::chrono::steady_clock::time_point since) {
 void KvNodeServer::Stop() {
   if (!StopRequests()) return;  // idempotent
   if (ram_) {
-    const uint64_t timeout_seconds = ShutdownDrainTimeoutSeconds();
+    const uint64_t timeout_seconds = shutdown_drain_timeout_s_;
     const bool drained = ram_->WaitForDrain(
         std::chrono::seconds(timeout_seconds));
     if (!drained) {
@@ -315,7 +335,7 @@ void KvNodeServer::Stop() {
   }
 }
 
-bool KvNodeServer::Shutdown() {
+bool KvNodeServer::Shutdown(std::chrono::steady_clock::time_point started) {
   if (shutdown_done_) return shutdown_clean_;
   shutdown_done_ = true;
   using Clock = std::chrono::steady_clock;
@@ -325,8 +345,10 @@ bool KvNodeServer::Shutdown() {
 
   if (ram_) {
     stage = Clock::now();
-    const uint64_t timeout_seconds = ShutdownDrainTimeoutSeconds();
-    const auto deadline = stage + std::chrono::seconds(timeout_seconds);
+    const uint64_t timeout_seconds = shutdown_drain_timeout_s_;
+    // The flushers have been writing since `started`: stopping the request
+    // paths waits for PUTs that are parked until their value is on disk.
+    const auto deadline = started + std::chrono::seconds(timeout_seconds);
     const uint64_t objects_before = ram_->DirtyObjects();
     const uint64_t bytes_before = ram_->DirtyBytes();
     auto next_progress = stage + std::chrono::seconds(5);
@@ -357,7 +379,7 @@ bool KvNodeServer::Shutdown() {
       DFKV_LOG_WARN(
           "shutdown: RAM tier not written to disk within " +
           std::to_string(timeout_seconds) +
-          " s (DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S); dropping the " +
+          " s of the stop (DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S); dropping the " +
           std::to_string(ram_->DirtyObjects()) + " objects (" +
           std::to_string(ram_->DirtyBytes()) +
           " bytes) that are only in RAM, of " +
@@ -379,8 +401,7 @@ bool KvNodeServer::Shutdown() {
     } else {
       DFKV_LOG_WARN("shutdown: disk " + disk.dir +
                     " could not record a clean shutdown (" + seconds +
-                    "); its cache is reset at the next start unless "
-                    "DFKV_SLAB_WARM_RESTART keeps it");
+                    "); the next start treats it as an unclean exit");
     }
   }
   DFKV_LOG_INFO("shutdown: " + std::to_string(clean) + " of " +

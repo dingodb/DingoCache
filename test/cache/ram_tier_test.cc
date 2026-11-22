@@ -169,9 +169,10 @@ TEST(RamTier, StopBackgroundCanLeaveTheBacklogBehind) {
     ASSERT_EQ(rt.DirtyObjects(), static_cast<uint64_t>(kObjects));
 
     std::thread stopper([&] { rt.StopBackground(/*abandon_backlog=*/true); });
-    ASSERT_TRUE(WaitFor([&] { return rt.background_stopping(); }));
+    const bool stopping = WaitFor([&] { return rt.background_stopping(); });
     sink.open();
     stopper.join();
+    ASSERT_TRUE(stopping);
 
     EXPECT_EQ(sink.calls, 1);  // the object in hand, and only that one
     EXPECT_EQ(rt.DirtyObjects(), static_cast<uint64_t>(kObjects - 1));
@@ -197,9 +198,10 @@ TEST(RamTier, StopBackgroundWritesTheBacklogUnlessToldOtherwise) {
     ASSERT_EQ(rt.PutWriteBack(K(200 + i), value.data(), value.size()).status,
               Status::kOk);
   std::thread stopper([&] { rt.StopBackground(/*abandon_backlog=*/false); });
-  ASSERT_TRUE(WaitFor([&] { return rt.background_stopping(); }));
+  const bool stopping = WaitFor([&] { return rt.background_stopping(); });
   sink.open();
   stopper.join();
+  ASSERT_TRUE(stopping);
   EXPECT_EQ(rt.DirtyObjects(), 0u);
   std::lock_guard<std::mutex> lock(sink.m);
   EXPECT_EQ(sink.flushed.size(), static_cast<size_t>(kObjects));

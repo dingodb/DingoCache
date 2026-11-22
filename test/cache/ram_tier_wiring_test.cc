@@ -85,6 +85,12 @@ class KvNodeServerWiringTestPeer {
   static uint64_t UncleanResets(KvNodeServer& server) {
     return server.group_.SlabStats().unclean_resets;
   }
+  static uint64_t WarmRestarts(KvNodeServer& server) {
+    return server.group_.SlabStats().warm_restarts;
+  }
+  static uint64_t DrainLimitSeconds(KvNodeServer& server) {
+    return server.shutdown_drain_timeout_s_;
+  }
 };
 }  // namespace dfkv
 
@@ -937,6 +943,7 @@ TEST(RamTierWiring, ShutdownLeavesTheDisksCleanWithoutDestruction) {
       DiskCacheGroup::Options{{dir.string()}, 1ull << 30, "slab"});
   ASSERT_TRUE(reopened->Healthy());
   EXPECT_EQ(KvNodeServerWiringTestPeer::UncleanResets(*reopened), 0u);
+  EXPECT_EQ(KvNodeServerWiringTestPeer::WarmRestarts(*reopened), 0u);
   for (int i = 0; i < kObjects; ++i) {
     std::string out;
     ASSERT_EQ(KvNodeServerWiringTestPeer::DiskRead(
@@ -954,7 +961,11 @@ TEST(RamTierWiring, ShutdownLeavesTheDisksCleanWithoutDestruction) {
 // flush runs after Shutdown() returned.
 TEST(RamTierWiring, ShutdownDropsWhatMissesTheDrainTimeout) {
   ::unsetenv("DFKV_RAM_TIER");
+  ::unsetenv("DFKV_SLAB_WARM_RESTART");
   ::setenv("DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S", "0", 1);
+  struct RestoreEnv {
+    ~RestoreEnv() { ::unsetenv("DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S"); }
+  } restore_env;
   const auto dir = fs::temp_directory_path() / "dfkv_shutdown_abandon";
   fs::remove_all(dir);
   fs::create_directories(dir);
@@ -989,22 +1000,24 @@ TEST(RamTierWiring, ShutdownDropsWhatMissesTheDrainTimeout) {
 
     bool clean = false;
     std::thread stopper([&] { clean = server->Shutdown(); });
-    ASSERT_TRUE(WaitFor(
-        [&] { return KvNodeServerWiringTestPeer::RamStopping(*server); }));
+    const bool stopping = WaitFor(
+        [&] { return KvNodeServerWiringTestPeer::RamStopping(*server); });
     barrier.Open();
     stopper.join();
+    ASSERT_TRUE(stopping);
+    // The disks were marked clean by Shutdown() itself, not by the destructor.
     EXPECT_TRUE(clean);
     EXPECT_EQ(flushes.load(), 1);
     EXPECT_EQ(KvNodeServerWiringTestPeer::RamDirty(*server),
               static_cast<uint64_t>(kObjects - 1));
   }
-  ::unsetenv("DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S");
   EXPECT_EQ(flushes.load(), 1);  // destruction did not resume the drain
 
   auto reopened = KvNodeServerWiringTestPeer::Create(
       DiskCacheGroup::Options{{dir.string()}, 1ull << 30, "slab"});
   ASSERT_TRUE(reopened->Healthy());
   EXPECT_EQ(KvNodeServerWiringTestPeer::UncleanResets(*reopened), 0u);
+  EXPECT_EQ(KvNodeServerWiringTestPeer::WarmRestarts(*reopened), 0u);
   std::string out;
   EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*reopened, BlockKey{7400, 0},
                                                  &out),
@@ -1016,6 +1029,37 @@ TEST(RamTierWiring, ShutdownDropsWhatMissesTheDrainTimeout) {
               Status::kNotFound)
         << i;
   reopened.reset();
+  fs::remove_all(dir);
+}
+
+// The limit decides how much of the backlog a stop drops, so a typo must not
+// turn into "drop everything at once".
+TEST(RamTierWiring, ShutdownDrainLimitIsParsedStrictly) {
+  const auto dir = fs::temp_directory_path() / "dfkv_shutdown_limit";
+  struct RestoreEnv {
+    ~RestoreEnv() { ::unsetenv("DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S"); }
+  } restore_env;
+  auto limit = [&](const char* value) {
+    if (value)
+      ::setenv("DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S", value, 1);
+    else
+      ::unsetenv("DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S");
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    auto server = KvNodeServerWiringTestPeer::Create(
+        DiskCacheGroup::Options{{dir.string()}, 1ull << 30, "file"});
+    return KvNodeServerWiringTestPeer::DrainLimitSeconds(*server);
+  };
+  EXPECT_EQ(limit(nullptr), 30u);
+  EXPECT_EQ(limit(""), 30u);
+  EXPECT_EQ(limit("0"), 0u);     // "do not wait" is a legitimate choice
+  EXPECT_EQ(limit("120"), 120u);
+  EXPECT_EQ(limit("3600"), 3600u);
+  EXPECT_EQ(limit("7200"), 3600u);  // clamped, not ignored
+  EXPECT_EQ(limit("abc"), 30u);     // used to be read as 0
+  EXPECT_EQ(limit("5m"), 30u);      // used to be read as 5
+  EXPECT_EQ(limit("-1"), 30u);
+  EXPECT_EQ(limit(" 10"), 30u);
   fs::remove_all(dir);
 }
 }  // namespace

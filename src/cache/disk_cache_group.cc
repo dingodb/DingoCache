@@ -10,6 +10,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <system_error>
 #include <thread>
 
 #include "cache/disk_slab_store.h"
@@ -332,7 +333,15 @@ std::vector<DiskCacheGroup::CloseReport> DiskCacheGroup::Close() {
   };
   std::vector<std::thread> helpers;
   helpers.reserve(disks_.empty() ? 0 : disks_.size() - 1);
-  for (size_t i = 1; i < disks_.size(); ++i) helpers.emplace_back(close_one, i);
+  for (size_t i = 1; i < disks_.size(); ++i) {
+    // This also runs from the destructor: a thread that cannot be created
+    // must not end the process, the disk is closed here instead.
+    try {
+      helpers.emplace_back(close_one, i);
+    } catch (const std::system_error&) {
+      close_one(i);
+    }
+  }
   if (!disks_.empty()) close_one(0);
   for (auto& helper : helpers) helper.join();
   return report;

@@ -15,7 +15,11 @@
     only in RAM is dropped and the disks are closed clean; until now the
     timeout only logged a warning and the flush went on without a limit, with
     the clean marker behind it. Raise the setting (up to 3600) to keep the old
-    trade-off; keep it below the service manager's stop timeout.
+    trade-off; keep it below the service manager's stop timeout. The limit
+    counts from the start of the stop. The value is now parsed strictly: a
+    non-number or a value with a unit falls back to 30 with a warning instead
+    of being read as 0 or as its leading digits, and a value above 3600 is
+    clamped instead of ignored.
   - Every step logs one `shutdown: ...` line with its duration, the drain
     reports its progress every 5 s, and `dfkv_server shut down cleanly ...
     releasing memory` marks the point after which a kill is harmless.

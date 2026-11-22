@@ -421,10 +421,14 @@ Status RdmaServer::Start(int port) {
 
 void RdmaServer::Stop() {
   Quiesce();
+  // Under the same lock: a second caller must not release the rails while the
+  // first is still joining connection threads.
+  std::lock_guard<std::mutex> lk(stop_mu_);
   anchors_.clear();  // drop the lifetime device refs (frees pool MRs last)
 }
 
 void RdmaServer::Quiesce() {
+  std::lock_guard<std::mutex> lk(stop_mu_);
   if (!running_.exchange(false)) return;
   recv_trim_cv_.notify_all();
   if (listen_fd_ >= 0) ::shutdown(listen_fd_, SHUT_RDWR);  // wake accept()
