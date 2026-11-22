@@ -297,10 +297,13 @@ size-class lattice and carves them into uniform slots:
   written therefore keeps its extents against one that is only written, and
   a class that is read less than a newer one is used gives way to it; the
   margin keeps two classes of similar age from handing an extent back and
-  forth. The floor of `kStripeWays` extents per donor in the background
-  growth and the write-age gate of the cold steal are unchanged. Two steals
+  forth. In the background growth a donor that is being written keeps
+  its striping width (`Options::stripe_ways`: 8 extents on a disk, 1 in the
+  RAM tier, whose writes are memory copies); an idle donor, written nothing
+  since the last pass, has no floor and gives its empty extents first. The
+  write-age gate of the cold steal is unchanged. Two steals
   inside `Put` (`StealExtentFor`) make no such comparison: the one that
-  brings a class with fewer than `kStripeWays` extents up to that floor,
+  brings a class with fewer than `stripe_ways` extents up to that floor,
   and the last resort of an admission that found neither a free slot nor
   anything of its own class to evict. The growing class is measured by an
   extent it could lose: one with a pinned slot or a resident under retention

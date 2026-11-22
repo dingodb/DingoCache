@@ -148,6 +148,7 @@ SlabAllocator::SlabAllocator(Options opt) : opt_(std::move(opt)) {
   if (opt_.align == 0) opt_.align = 1;
   if (opt_.num_extents == 0) opt_.num_extents = 1;
   if (opt_.max_waste < 0) opt_.max_waste = 0;
+  if (opt_.stripe_ways == 0) opt_.stripe_ways = 1;
   extents_.assign(opt_.num_extents, ExtentMeta{});
   unbound_ = opt_.num_extents;
 
@@ -733,7 +734,7 @@ void SlabAllocator::FreeSlotLocked(uint32_t index) {
   free_slot_meta_head_ = index;
 
   if (extent.free_slots == extent.total_slots &&
-      cls.ext_rr.size() > kStripeWays) {
+      cls.ext_rr.size() > opt_.stripe_ways) {
     DropExtentFreeLocked(cls, extent_index);
     --cls.bound_extents;
     --cls.empty_extents;
@@ -826,7 +827,7 @@ SlabAllocator::ExtentBindResult SlabAllocator::TakeEmptyExtentFor(
     const Class& cls = classes_[c];
     if (c == target_cls || cls.empty_extents == 0) continue;
     const bool idle = put_seq_ - cls.last_put_seq > window;
-    if (idle || cls.ext_rr.size() > kStripeWays) donor = static_cast<int>(c);
+    if (idle || cls.ext_rr.size() > opt_.stripe_ways) donor = static_cast<int>(c);
   }
   if (donor < 0) return ExtentBindResult::kUnavailable;
   for (uint32_t e = 0; e < extents_.size(); ++e) {
@@ -956,7 +957,7 @@ bool SlabAllocator::Put(const BlockKey& key, size_t len, SlotRef* out,
   Slot placement{0, 0};
   for (;;) {
     Class& cls = classes_[cls_index];
-    while (cls.ext_rr.size() < kStripeWays) {
+    while (cls.ext_rr.size() < opt_.stripe_ways) {
       const ExtentBindResult bind = BindFreeExtent(cls_index);
       if (bind == ExtentBindResult::kBound) continue;
       if (bind == ExtentBindResult::kPersistenceError) return false;
@@ -971,9 +972,9 @@ bool SlabAllocator::Put(const BlockKey& key, size_t len, SlotRef* out,
       if (empty == ExtentBindResult::kBound) continue;
       if (empty == ExtentBindResult::kPersistenceError) return false;
     }
-    if (cls.bound_extents < kStripeWays) {
+    if (cls.bound_extents < opt_.stripe_ways) {
       const ExtentBindResult grow =
-          StealExtentFor(cls_index, evicted, kStripeWays);
+          StealExtentFor(cls_index, evicted, opt_.stripe_ways);
       if (grow == ExtentBindResult::kBound) continue;
       if (grow == ExtentBindResult::kPersistenceError) return false;
     }
@@ -1173,13 +1174,14 @@ std::vector<SlabAllocator::ClassStat> SlabAllocator::Classes() const {
 size_t SlabAllocator::ColdestGrowDonor(const std::vector<ClassStat>& classes,
                                        const std::vector<uint64_t>& delta,
                                        const std::vector<uint32_t>& extents,
-                                       size_t hot) {
+                                       size_t hot, size_t floor) {
   const uint64_t hot_demand = delta[hot] * classes[hot].slot_size;
   size_t donor = classes.size();
   uint64_t donor_demand = 0;
   for (size_t d = 0; d < classes.size(); ++d) {
-    if (d == hot || extents[d] <= kStripeWays) continue;
+    if (d == hot || extents[d] == 0) continue;
     const uint64_t demand = delta[d] * classes[d].slot_size;
+    if (demand != 0 && extents[d] <= floor) continue;  // keeps its stripes
     if (demand != 0 && demand * 4 > hot_demand) continue;  // not cold enough
     if (donor == classes.size() ||
         std::make_pair(demand, ~uint64_t(extents[d])) <

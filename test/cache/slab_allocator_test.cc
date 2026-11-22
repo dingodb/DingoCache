@@ -1334,14 +1334,27 @@ TEST(SlabAllocator, GrowDonorComparesDemandInBytes) {
   classes[2].slot_size = 4u << 20;   // idle
   const std::vector<uint32_t> extents{100, 100, 100};
   // 0 wants to grow: 13 MiB/pass vs 64 MiB/pass for class 1 -> only 2 is cold.
-  EXPECT_EQ(SlabAllocator::ColdestGrowDonor(classes, {13, 1, 0}, extents, 0), 2u);
+  EXPECT_EQ(SlabAllocator::ColdestGrowDonor(classes, {13, 1, 0}, extents, 0, 8),
+            2u);
   // Without an idle class there is no donor for 0.
-  EXPECT_EQ(SlabAllocator::ColdestGrowDonor(classes, {13, 1, 1000}, extents, 0),
-            classes.size());
+  EXPECT_EQ(
+      SlabAllocator::ColdestGrowDonor(classes, {13, 1, 1000}, extents, 0, 8),
+      classes.size());
   // Class 1 growing may take from the byte-colder class 0.
-  EXPECT_EQ(SlabAllocator::ColdestGrowDonor(classes, {13, 1, 1000}, extents, 1), 0u);
-  // Donors at the striping floor are never used.
-  EXPECT_EQ(SlabAllocator::ColdestGrowDonor(classes, {13, 1, 0}, {100, 100, 8}, 0),
+  EXPECT_EQ(
+      SlabAllocator::ColdestGrowDonor(classes, {13, 1, 1000}, extents, 1, 8),
+      0u);
+  // A donor that is being written keeps its striping floor.
+  EXPECT_EQ(
+      SlabAllocator::ColdestGrowDonor(classes, {13, 1, 1000}, {8, 8, 100}, 2,
+                                      8),
+      classes.size());
+  // An idle one has no floor: it gives down to its last extent.
+  EXPECT_EQ(SlabAllocator::ColdestGrowDonor(classes, {13, 1, 0}, {100, 100, 1}, 0,
+                                            8),
+            2u);
+  EXPECT_EQ(SlabAllocator::ColdestGrowDonor(classes, {13, 1, 0}, {100, 100, 0}, 0,
+                                            8),
             classes.size());
 }
 
@@ -1608,6 +1621,34 @@ TEST(SlabAllocator, AClassBeingWrittenKeepsItsEmptyStripes) {
   EXPECT_EQ(a.Classes()[ClassIndex(a, sa)].extents, 8u);
   ASSERT_EQ(ev.size(), 1u);
   EXPECT_EQ(KeyName(ev[0]).rfind("b", 0), 0u);
+}
+
+// With Options::stripe_ways 1 (the RAM tier) a class binds the extents it
+// fills and one more at most, not eight empty ones besides.
+TEST(SlabAllocator, OneStripeWayBindsOnlyWhatTheClassFills) {
+  SlabAllocator::Options o = Opts(64 * 1024, 16);
+  o.stripe_ways = 1;
+  SlabAllocator a(o);
+  ASSERT_EQ(a.StripeWays(), 1u);
+  uint32_t sa = 0;
+  for (const auto& c : a.Classes())
+    if (c.slots_per_extent == 1) { sa = c.slot_size; break; }
+  ASSERT_NE(sa, 0u);
+  std::vector<BlockKey> ev;
+  SlotRef r;
+  for (int i = 0; i < 6; ++i)
+    ASSERT_TRUE(a.Put(Key("a" + std::to_string(i)), sa, &r, &ev));
+  EXPECT_LE(a.Classes()[ClassIndex(a, sa)].extents, 7u);
+  EXPECT_GE(a.PoolExtents(), 9u);
+  std::printf("one way: %u extents for 6 values\n",
+              a.Classes()[ClassIndex(a, sa)].extents);
+  // The default keeps eight extents with free slots.
+  SlabAllocator d(Opts(64 * 1024, 16));
+  for (int i = 0; i < 6; ++i)
+    ASSERT_TRUE(d.Put(Key("a" + std::to_string(i)), sa, &r, &ev));
+  EXPECT_GE(d.Classes()[ClassIndex(d, sa)].extents, 8u);
+  std::printf("eight ways: %u extents for 6 values\n",
+              d.Classes()[ClassIndex(d, sa)].extents);
 }
 
 TEST(SlabAllocator, MatureClassStillSelfEvicts) {
@@ -1989,6 +2030,55 @@ TEST(SlabAllocator, RestoreBulkBench) {
     std::printf("RESTORE_BENCH round=%d objects=%zu extents=%u restore_ms=%.1f\n",
                 round, entries.size(), extents, ms);
   }
+}
+
+// Not a correctness test: prints the time one Put holds the allocator (the
+// RAM tier holds its shard lock for exactly that long) on a full allocator of
+// RAM tier shape: one stripe way, 32 MiB extents, two size classes written
+// three to one, every admission evicting. Set DFKV_SLAB_PUT_BENCH_EXTENTS (for
+// example 1024) to run it.
+TEST(SlabAllocator, FullPutBench) {
+  const char* requested = std::getenv("DFKV_SLAB_PUT_BENCH_EXTENTS");
+  if (requested == nullptr || *requested == '\0')
+    GTEST_SKIP() << "set DFKV_SLAB_PUT_BENCH_EXTENTS to run";
+  const uint32_t extents =
+      static_cast<uint32_t>(std::strtoull(requested, nullptr, 10));
+  ASSERT_GT(extents, 0u);
+  SlabAllocator::Options o = Opts(32ull << 20, extents);
+  o.stripe_ways = 1;
+  SlabAllocator a(o);
+  constexpr size_t kBig = 2873360, kSmall = 1u << 20;
+  std::vector<BlockKey> ev;
+  SlotRef r;
+  uint64_t next = 0;
+  auto put = [&] {
+    ev.clear();
+    const size_t len = next % 4 == 3 ? kSmall : kBig;
+    return a.Put(BlockKey{next++, 0x5bd1e995, 1}, len, &r, &ev);
+  };
+  while (a.Evictions() == 0) ASSERT_TRUE(put());
+  for (int i = 0; i < 100000; ++i) ASSERT_TRUE(put());  // settle
+  constexpr int kMeasured = 400000;
+  std::vector<uint64_t> ns(kMeasured);
+  for (int i = 0; i < kMeasured; ++i) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = put();
+    ns[i] = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - t0)
+                                      .count());
+    ASSERT_TRUE(ok);
+  }
+  std::sort(ns.begin(), ns.end());
+  uint64_t sum = 0;
+  for (const uint64_t v : ns) sum += v;
+  std::printf("PUT_BENCH extents=%u residents=%zu p50_ns=%llu p99_ns=%llu "
+              "p999_ns=%llu mean_ns=%llu steals=%llu\n",
+              extents, a.Count(),
+              static_cast<unsigned long long>(ns[kMeasured / 2]),
+              static_cast<unsigned long long>(ns[kMeasured * 99 / 100]),
+              static_cast<unsigned long long>(ns[kMeasured * 999 / 1000]),
+              static_cast<unsigned long long>(sum / kMeasured),
+              static_cast<unsigned long long>(a.Steals()));
 }
 
 // ---- Bulk restore leaves exactly the state it always did ------------------
@@ -2485,7 +2575,8 @@ struct HeatScenario {
       size_t taken = 0;
       while (taken < max_extents) {
         const size_t donor =
-            SlabAllocator::ColdestGrowDonor(classes, delta, extents, hot);
+            SlabAllocator::ColdestGrowDonor(classes, delta, extents, hot,
+                                            a.StripeWays());
         if (donor == classes.size()) break;
         std::vector<BlockKey> evicted;
         const bool ok = a.StealFrom(donor, hot, &evicted);
@@ -2681,10 +2772,9 @@ TEST(SlabAllocatorExtentMoves, AnUnusedClassStillGivesItsExtents) {
         if (path == StealPath::kBackgroundGrow) s.GrowTick();
       }
       s.Report("A unused, B written");
-      if (path == StealPath::kBackgroundGrow)
-        EXPECT_EQ(s.Extents(s.A), SlabAllocator::kStripeWays);
-      else
-        EXPECT_LT(s.Extents(s.A), SlabAllocator::kStripeWays);
+      // Both ways below the striping floor: A writes nothing, so it has
+      // nothing to stripe.
+      EXPECT_LT(s.Extents(s.A), SlabAllocator::kStripeWays);
     }
   }
 }

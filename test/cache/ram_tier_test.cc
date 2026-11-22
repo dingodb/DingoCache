@@ -58,6 +58,12 @@ class RamTierTestPeer {
     for (size_t i = 0; i < tier.shards_.size(); ++i)
       tier.ReclaimTick(*tier.shards_[i], i);
   }
+  // Extents admissions took from colder classes (not background growth).
+  static uint64_t ColdSteals(const RamTier& tier) {
+    uint64_t n = 0;
+    for (const auto& shard : tier.shards_) n += shard->alloc->ColdSteals();
+    return n;
+  }
 };
 }  // namespace dfkv
 using dfkv::RamTierTestPeer;
@@ -480,8 +486,8 @@ TEST(RamTier, VaryingSizesCoexistNoChurn) {
   RamTier rt(Opts(256ull << 20), sink.fn());             // 256 MiB arena -> ~128 extents
   ASSERT_TRUE(rt.ok());
   // 6 distinct size classes x 4 keys each (models a real KV mix: a handful of
-  // block sizes, many blocks each). 6 classes * kStripeWays(8) = 48 extents of
-  // headroom vs 128 available. Each value < the 2 MiB extent.
+  // block sizes, many blocks each). 6 classes need far fewer than the 128
+  // extents available. Each value < the 2 MiB extent.
   const size_t sizes[6] = {40000, 90000, 200000, 380000, 560000, 730000};
   std::vector<std::pair<uint64_t, size_t>> items;
   for (int i = 0; i < 24; ++i) {
@@ -1864,7 +1870,8 @@ TEST(RamTier, ReclaimTickCapsClearLimitedCalls) {
 // the reclaimer freed only one slot per tick while it sweeps the reference
 // bits, admissions would run out of free slots, and an admission without a
 // free slot takes a whole cold extent of another class before it evicts its
-// own. The cold class must keep every resident.
+// own. No admission may take one. (The cold class, idle and much colder,
+// does give its extents to the background growth, a few per tick.)
 TEST(RamTier, WritesAfterFullReadDoNotStealFromAColdClass) {
   FlushSink sink;
   RamTier::Options o;
@@ -1907,7 +1914,7 @@ TEST(RamTier, WritesAfterFullReadDoNotStealFromAColdClass) {
   };
   ASSERT_TRUE(write_hot(8000));
   ASSERT_GT(rt.Evictions(), 1000u) << "the hot class never turned over";
-  ASSERT_EQ(cold_resident(), cold);
+  ASSERT_EQ(RamTierTestPeer::ColdSteals(rt), 0u);
 
   // Read every resident of the hot class, then keep writing at the same
   // rate: the sweep now has to clear a reference bit on every slot.
@@ -1919,14 +1926,17 @@ TEST(RamTier, WritesAfterFullReadDoNotStealFromAColdClass) {
   ASSERT_GT(read, 8 * uint64_t{RamTier::kEvictClearLimit})
       << "too few slots for the sweep to take several reclaim calls";
   ASSERT_TRUE(write_hot(10 * per_tick));
-  EXPECT_EQ(cold_resident(), cold) << "a cold extent was taken";
+  EXPECT_EQ(RamTierTestPeer::ColdSteals(rt), 0u)
+      << "an admission took a cold extent";
+  EXPECT_LT(cold_resident(), cold) << "the idle class gave nothing";
+  EXPECT_GT(rt.Rebalanced(), 0u);
 }
 
 // The same scenario above the reclaimer's per-tick cap: the read class is too
 // large to sweep in one tick, so the tick frees only
 // kReclaimClearLimitedCalls slots, and admissions arrive faster than that.
 // They evict inline, one slot of their own class per admission, and the cold
-// class still keeps every resident.
+// class, read along with the other, keeps every resident.
 TEST(RamTier, WritesFasterThanTheReclaimCapEvictTheirOwnClass) {
   FlushSink sink;
   RamTier::Options o;
@@ -1944,7 +1954,7 @@ TEST(RamTier, WritesFasterThanTheReclaimCapEvictTheirOwnClass) {
   ASSERT_TRUE(rt.ok());
   ASSERT_EQ(rt.shards(), 1u);
 
-  // Cold class: 512 values in 8 extents, never written again.
+  // Cold class: 512 values in 4 extents, never written again.
   const uint64_t cold = 512;
   std::string big(8000, 'c');
   for (uint64_t i = 0; i < cold; ++i)
@@ -1955,7 +1965,7 @@ TEST(RamTier, WritesFasterThanTheReclaimCapEvictTheirOwnClass) {
     return n;
   };
 
-  // Read class: the other 168 extents, 43,008 slots. Fill it and turn it
+  // Read class: the other 172 extents, 44,032 slots. Fill it and turn it
   // over at 64 admissions per tick; the reclaimer keeps 128 slots free.
   const uint64_t cap = RamTier::kReclaimClearLimitedCalls;
   std::string small(4000, 'h');
@@ -1974,6 +1984,13 @@ TEST(RamTier, WritesFasterThanTheReclaimCapEvictTheirOwnClass) {
   for (uint64_t id = 100000; id < next; ++id) {
     RamTier::Hit h;
     if (rt.GetPrep(K(id), 0, small.size(), &h)) ++read;
+  }
+  // The cold class is read as well: otherwise, now much colder than the read
+  // class, it would give its extents to the background growth in the ticks
+  // below, and their slots would change the counts.
+  for (uint64_t i = 0; i < cold; ++i) {
+    RamTier::Hit h;
+    ASSERT_TRUE(rt.GetPrep(K(1 + i), 0, big.size(), &h));
   }
   ASSERT_GT(read, (cap + 8) * RamTier::kEvictClearLimit)
       << "one tick could sweep the whole class";

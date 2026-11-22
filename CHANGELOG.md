@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Server, slab store and RAM tier: a size class that is not being written
+  gives its extents to one that is. The background growth took extents only
+  from classes holding more than eight, so a class written once and then
+  only read, or not at all, kept eight extents of each disk for good, most
+  of their slots free, while the classes being written evicted their own
+  values.
+  A class written since the last pass keeps its eight; an idle one gives
+  its empty extents first and then, as before, only extents much colder
+  than the growing class's own. The RAM tier keeps one extent with free
+  slots per class instead of eight (its writes are memory copies, there is
+  nothing to stripe), so a small arena no longer binds eight extents to
+  every class it has seen; for the same reason a RAM tier class being
+  written keeps one extent against the background growth, not eight.
 - Server, slab store: a cold steal (a growing size class taking an extent
   from a much colder class) now takes the qualifying extent whose residents
   were used least recently, as the other extent steals do. It ordered the
