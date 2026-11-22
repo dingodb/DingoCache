@@ -42,6 +42,15 @@ NodeDedup::Options Opts(const std::string& name, uint64_t arena = 4 << 20) {
   return o;
 }
 
+// A waiter whose deadline is far beyond any scheduling delay: a test that
+// expects the wait to end early can then use a bound that is generous and
+// still well short of the deadline.
+NodeDedup::Options LongWait(const std::string& name) {
+  NodeDedup::Options o = Opts(name);
+  o.wait_ms = 5000;
+  return o;
+}
+
 BlockKey K(uint64_t id) { return BlockKey{id, 0}; }
 
 std::string Val(uint64_t id, size_t n) {
@@ -93,10 +102,10 @@ TEST(NodeDedup, WaiterCopiesAfterPublish) {
   EXPECT_EQ(b->wait_hits(), 1u);
 }
 
-TEST(NodeDedup, AbortLetsWaiterFallBack) {
+TEST(NodeDedup, AbortEndsWaitAtOnce) {
   ShmGuard g("abort");
   auto a = NodeDedup::Open(Opts(g.name));
-  auto b = NodeDedup::Open(Opts(g.name));
+  auto b = NodeDedup::Open(LongWait(g.name));
   ASSERT_TRUE(a && b);
   std::string dst(4096, '\0');
   uint64_t token = 0, ignored = 0;
@@ -105,10 +114,82 @@ TEST(NodeDedup, AbortLetsWaiterFallBack) {
   ASSERT_EQ(b->Claim(K(3), dst.size(), &dst[0], &ignored),
             NodeDedup::Role::kWait);
   a->Abort(K(3), NodeDedup::Kind::kData, token);
-  // The waiter's bounded poll must return false (fall back to a direct fetch),
-  // never hang.
+  // Nothing will be published: the waiter must fall back to its own fetch
+  // now, not after its wait_ms (5 s).
+  const auto t0 = std::chrono::steady_clock::now();
   EXPECT_FALSE(b->WaitCopy(K(3), dst.size(), &dst[0]));
+  EXPECT_LT(std::chrono::steady_clock::now() - t0, 2s);
   EXPECT_EQ(b->wait_timeouts(), 1u);
+}
+
+TEST(NodeDedup, AbortDuringWaitEndsIt) {
+  ShmGuard g("abort-late");
+  auto a = NodeDedup::Open(Opts(g.name));
+  auto b = NodeDedup::Open(LongWait(g.name));
+  ASSERT_TRUE(a && b);
+  bool val = false;
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->ClaimExist(K(14), &val, &token), NodeDedup::Role::kFetch);
+  ASSERT_EQ(b->ClaimExist(K(14), &val, &ignored), NodeDedup::Role::kWait);
+  const auto t0 = std::chrono::steady_clock::now();
+  std::thread abort([&] {
+    std::this_thread::sleep_for(50ms);
+    a->Abort(K(14), NodeDedup::Kind::kExist, token);
+  });
+  EXPECT_FALSE(b->WaitExist(K(14), &val));
+  const auto waited = std::chrono::steady_clock::now() - t0;
+  abort.join();
+  EXPECT_GE(waited, 50ms);  // a fetch in flight is waited for
+  EXPECT_LT(waited, 2s);    // and its abort ends the wait (wait_ms 5 s)
+}
+
+TEST(NodeDedup, UnusablePublishedEntryEndsWaitAtOnce) {
+  ShmGuard g("unusable");
+  auto a = NodeDedup::Open(Opts(g.name));
+  auto b = NodeDedup::Open(LongWait(g.name));
+  ASSERT_TRUE(a && b);
+  const std::string v = Val(15, 4096);
+  std::string dst(8192, '\0');
+  uint64_t token = 0;
+  ASSERT_EQ(a->Claim(K(15), v.size(), &dst[0], &token),
+            NodeDedup::Role::kFetch);
+  a->Publish(K(15), NodeDedup::Kind::kData, token, v.data(), v.size());
+  // A strict reader of another length can never copy this entry out.
+  const auto t0 = std::chrono::steady_clock::now();
+  EXPECT_FALSE(b->WaitCopy(K(15), dst.size(), &dst[0]));
+  EXPECT_LT(std::chrono::steady_clock::now() - t0, 2s);  // wait_ms 5 s
+}
+
+TEST(NodeDedup, SharedDeadlineBoundsWaitAcrossKeys) {
+  ShmGuard g("deadline");
+  auto a = NodeDedup::Open(Opts(g.name));
+  auto b = NodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  const int n = 8;
+  const std::string v = Val(20, 4096);
+  std::string dst(v.size(), '\0');
+  std::vector<uint64_t> tokens(n, 0);
+  uint64_t ignored = 0;
+  for (int i = 0; i < n; ++i) {
+    ASSERT_EQ(a->Claim(K(20 + i), v.size(), &dst[0], &tokens[i]),
+              NodeDedup::Role::kFetch);
+    ASSERT_EQ(b->Claim(K(20 + i), v.size(), &dst[0], &ignored),
+              NodeDedup::Role::kWait);
+  }
+  // The owner hangs on every key but the last, which it publishes only after
+  // the deadline has passed.
+  const auto t0 = std::chrono::steady_clock::now();
+  const uint64_t deadline = b->WaitDeadline();
+  for (int i = 0; i < n - 1; ++i)
+    EXPECT_FALSE(b->WaitCopy(K(20 + i), v.size(), &dst[0], deadline));
+  const auto waited = std::chrono::steady_clock::now() - t0;
+  EXPECT_GE(waited, 280ms);  // wait_ms 300, once
+  EXPECT_LT(waited, 600ms);  // not once per key
+  a->Publish(K(20 + n - 1), NodeDedup::Kind::kData, tokens[n - 1], v.data(),
+             v.size());
+  // A key reached after the deadline is still looked at once.
+  EXPECT_TRUE(b->WaitCopy(K(20 + n - 1), v.size(), &dst[0], deadline));
+  EXPECT_EQ(dst, v);
 }
 
 TEST(NodeDedup, DeadFetcherIsTakenOver) {

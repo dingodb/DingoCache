@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+- Client, host dedup (`DFKV_CLIENT_NODE_DEDUP=1`): a lookup that another
+  process on the host is fetching no longer waits out
+  `DFKV_NODE_DEDUP_WAIT_MS` (default 500 ms) when that process has nothing
+  to share. Until now a waiter treated only a published result as final, and
+  `dfkv_batch_get`, `dfkv_batch_get_auto` and `dfkv_batch_exist` waited key
+  by key, each key with a deadline of its own, then fetched the key with one
+  scalar call. Every key whose owner gave up (a miss, a peer in cooldown, an
+  empty ring, an I/O error) therefore cost the other processes the full wait:
+  a batch with a hundred such keys took close to a minute where the same
+  call without dedup takes milliseconds. Three changes:
+  - a waiter returns as soon as no fetch is in flight for its key (the owner
+    aborted, or the entry was invalidated) or the published entry is one it
+    cannot use (overwritten in the arena, or another length), and fetches
+    for itself;
+  - a batch has one deadline for all the keys it waits on, and the keys it
+    did not get are fetched in one direct batch. A hung or killed owner now
+    costs a batch one wait instead of one per key;
+  - `dfkv_batch_exist` shares "does not exist" whichever way the transport
+    reports it. Over TCP it arrives with an OK status, which was treated as
+    a failure, so every absent key was aborted and never shared.
+  The one deadline has a cost when the owner is slow rather than failed. An
+  owner publishes its keys only after its whole direct batch has returned.
+  If that takes longer than `DFKV_NODE_DEDUP_WAIT_MS`, every key still being
+  fetched is read again by each waiting process in one direct batch at the
+  deadline, and nothing of that batch is shared. Before, the key-by-key
+  waits added up, so a waiter usually outlasted a slow owner and shared most
+  of the keys. Set `DFKV_NODE_DEDUP_WAIT_MS` to at least the time the
+  largest batch takes; a batch that takes longer is read twice. The default
+  is unchanged.
+  Mixed versions on one host are safe: the shared-memory layout, the slot
+  states and the segment name are unchanged, and only the waiting side
+  behaves differently. An older process next to a newer one keeps its old
+  waiting behaviour and the newer one returns early whichever of them owns
+  the fetch. `dfkv_client_dedup_wait_timeouts_total` keeps counting every
+  wait that ended in a direct fetch, early or not. The device (GPU dedup)
+  path is unchanged: it already had one deadline and one fallback batch,
+  and still waits that deadline once when an owner gives up. Processes that
+  do not enable dedup are unaffected; the wire protocol is unchanged.
 - Membership: a cache node whose disk store has failed for good now leaves
   the placement ring. A slab store whose metadata could not be written or
   synced (or that lost io_uring completions) stores and reads nothing more

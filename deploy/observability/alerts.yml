@@ -195,7 +195,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "dfkv same-host dedup rendezvous timed out"
+          summary: "dfkv same-host dedup waits ended in direct fetches"
           description: "Connector {{ $labels.dfkv_connector_id }} is falling back to duplicated fetches."
       - alert: DfkvConnectorNativeIoErrors
         expr: increase(dfkv_connector_io_errors_total[5m]) > 0
