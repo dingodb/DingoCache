@@ -5,6 +5,7 @@ in for libdfkv and small stubs for the SGLang pools the connector is handed.
 """
 
 import contextlib
+import ctypes
 import os
 import sys
 import threading
@@ -97,9 +98,11 @@ class _Tensor:
 class _MlaDevicePool:
     """A layer-first MLA device pool, as the test device_page_meta reads it."""
 
-    def __init__(self, layers, page_size=2, kv_cache_dim=8):
+    def __init__(self, layers, page_size=2, kv_cache_dim=8,
+                 dtype="torch.float8_e4m3fn"):
         self.page_size = page_size
         self.kv_cache_dim = kv_cache_dim
+        self.dtype = dtype
         self.kv_buffer = [_Tensor(0x100000 * (i + 1)) for i in range(layers)]
 
 
@@ -339,6 +342,225 @@ class ConcurrentV2Transfers(unittest.TestCase):
 class _Metrics2(_RecordingMetrics):
     def on_set(self, **kwargs):
         self.calls.append(("set", kwargs))
+
+
+class _ObjectStore:
+    """A native client that stores object sizes by key: an exact-size GET of
+    a stored key hits, as in libdfkv. No bytes move (pointers are fake)."""
+
+    def __init__(self):
+        self.objects = {}
+
+    def dfkv_max_sg_segs(self, _handle):
+        return 4
+
+    @staticmethod
+    def _key(karr, klens, i):
+        return ctypes.string_at(karr[i], klens[i])
+
+    def dfkv_batch_put(self, _h, karr, klens, _parr, sarr, n, out):
+        for i in range(n):
+            self.objects[self._key(karr, klens, i)] = sarr[i]
+            out[i] = 1
+        return 0
+
+    def dfkv_batch_get(self, _h, karr, klens, _parr, sarr, n, out):
+        for i in range(n):
+            out[i] = int(self.objects.get(self._key(karr, klens, i)) == sarr[i])
+        return 0
+
+    def dfkv_batch_exist(self, _h, karr, klens, n, out):
+        for i in range(n):
+            out[i] = int(self._key(karr, klens, i) in self.objects)
+        return 0
+
+
+class _LaidOutHostPool(_HostPool):
+    """An MHA host pool: two objects (k, v) per page of the same size in
+    every layout, but bytes in an order that depends on the layout."""
+
+    def __init__(self, layout, dtype="torch.bfloat16"):
+        super().__init__(components=2, nbytes=4096)
+        self.layout = layout
+        self.dtype = dtype
+        self.page_size = 64
+
+
+class RuntimeLayoutBinding(unittest.TestCase):
+    """bind_runtime_layout: objects of a pool with another byte format (same
+    size, so the exact-size read accepts them) are not served as this
+    pool's. Off by default: then the keys are exactly today's."""
+
+    def _plugin(self, store, pool, bind):
+        st = _plugin(is_mla=False, _lib=store, transport_mode="tcp",
+                     _backup_exist_gate=False, _put_retry_recovered=0,
+                     _registered_regions=set(), _bind_runtime_layout=bind)
+        st.register_mem_pool_host(pool)
+        return st
+
+    def _write_then_read(self, writer_pool, reader_pool, bind):
+        store = _ObjectStore()
+        writer = self._plugin(store, writer_pool, bind)
+        reader = self._plugin(store, reader_pool, bind)
+        self.assertEqual(writer.batch_set_v1(["page"], [0]), [True])
+        return reader.batch_get_v1(["page"], [0]), reader.batch_exists(["page"])
+
+    def test_default_keys_are_unchanged(self):
+        st = self._plugin(_ObjectStore(), _LaidOutHostPool("page_first"),
+                          bind=False)
+        self.assertEqual(st._keys("page"), [
+            dfkv_hicache.pool_key("page", pool="kv", tp_size=1, tp_rank=0,
+                                  component=c) for c in ("k", "v")])
+
+    def test_without_binding_another_layout_is_served(self):
+        # The hazard the switch closes: same size, other byte order, a hit.
+        got = self._write_then_read(_LaidOutHostPool("page_first"),
+                                    _LaidOutHostPool("page_first_direct"),
+                                    bind=False)
+        self.assertEqual(got, ([True], 1))
+
+    def test_another_layout_or_dtype_misses(self):
+        for reader in (_LaidOutHostPool("page_first_direct"),
+                       _LaidOutHostPool("page_head"),
+                       _LaidOutHostPool("page_first", dtype="torch.float16")):
+            got = self._write_then_read(_LaidOutHostPool("page_first"),
+                                        reader, bind=True)
+            self.assertEqual(got, ([False], 0), reader.layout)
+
+    def test_same_layout_still_hits(self):
+        got = self._write_then_read(_LaidOutHostPool("page_first"),
+                                    _LaidOutHostPool("page_first"), bind=True)
+        self.assertEqual(got, ([True], 1))
+
+    def test_side_pools_are_bound_by_their_own_pool(self):
+        store = _ObjectStore()
+        keys = []
+        for layout in ("layer_first", "page_first"):
+            st = self._plugin(store, _LaidOutHostPool("page_first"), bind=True)
+            st._pool_component_names = {"state": ("all",)}
+            st._pool_replicated = {"state": False}
+            st._note_pool_layout("state", _LaidOutHostPool(layout))
+            keys.append(st._pool_keys("state", "page"))
+        self.assertNotEqual(keys[0], keys[1])
+
+    def test_another_pool_class_with_the_same_strings_misses(self):
+        class PackedHostPool(_LaidOutHostPool):
+            """Same layout and dtype strings, another packing."""
+
+        got = self._write_then_read(_LaidOutHostPool("page_first"),
+                                    PackedHostPool("page_first"), bind=True)
+        self.assertEqual(got, ([False], 0))
+
+    def test_objects_per_page_are_part_of_the_tag(self):
+        st = self._plugin(_ObjectStore(), _LaidOutHostPool("page_first"),
+                          bind=True)
+        self.assertNotEqual(st._pool_id("kv", 1), st._pool_id("kv", 2))
+
+    def _device_form(self, device_pool, host_layout="page_first"):
+        st = self._plugin(_ObjectStore(), _LaidOutHostPool(host_layout),
+                          bind=True)
+        st.is_mla = True
+        st._device_direct_requested = True
+        st.register_memory = lambda base, size: True
+        st.register_mem_pool_device(device_pool)
+        return st
+
+    def test_device_form_keys_are_tagged_by_the_device_pool(self):
+        # Equal host pools, device pools that segment a page differently:
+        # the device-form objects differ, so must their keys; the host-form
+        # keys stay tagged by the (equal) host pool.
+        a = self._device_form(_MlaDevicePool(layers=6, kv_cache_dim=8))
+        b = self._device_form(_MlaDevicePool(layers=6, kv_cache_dim=4))
+        self.assertTrue(a._device_direct_active())
+        self.assertNotEqual(a._stored_keys("kv", "p"), b._stored_keys("kv", "p"))
+        self.assertEqual(a._keys("p"), b._keys("p"))
+        self.assertNotEqual(a._keys("p", device=True), a._keys("p"))
+        dtype_b = _MlaDevicePool(layers=6, kv_cache_dim=8)
+        dtype_b.dtype = "torch.float8_e5m2"
+        b = self._device_form(dtype_b)
+        self.assertNotEqual(a._stored_keys("kv", "p"), b._stored_keys("kv", "p"))
+
+    def test_device_form_is_shared_across_host_layouts(self):
+        # The device-form objects do not depend on the host layout: no miss
+        # between instances that differ only there. Host-form keys differ.
+        a = self._device_form(_MlaDevicePool(layers=6), "page_first")
+        b = self._device_form(_MlaDevicePool(layers=6), "page_first_direct")
+        self.assertEqual(a._stored_keys("kv", "p"), b._stored_keys("kv", "p"))
+        self.assertNotEqual(a._keys("p"), b._keys("p"))
+        # Another device pool class, or another layer count, does not share.
+        class OtherDevicePool(_MlaDevicePool):
+            pass
+
+        for other in (OtherDevicePool(layers=6), _MlaDevicePool(layers=5)):
+            c = self._device_form(other)
+            self.assertNotEqual(a._keys("p", device=True),
+                                c._keys("p", device=True), type(other))
+
+    def test_sidecar_draft_and_device_form_keys_carry_the_tag(self):
+        st = self._device_form(_MlaDevicePool(layers=6))
+        st._pool_component_names = {"indexer": ("all",)}
+        st._pool_replicated = {"indexer": True}
+        st._sidecar_device_pools = {"indexer": object()}
+        st._note_pool_layout("indexer", _MlaDevicePool(layers=6), device=True)
+        st._note_pool_layout("draft", _MlaDevicePool(layers=2), device=True)
+        tagged = {
+            "sidecar": st._pool_keys("indexer", "p", True),
+            "sidecar stored": st._stored_keys("indexer", "p"),
+            "draft": st._draft_keys("p", 1),
+            "kv stored": st._stored_keys("kv", "p"),
+        }
+        st._bind_runtime_layout = False
+        untagged = {
+            "sidecar": st._pool_keys("indexer", "p", True),
+            "sidecar stored": st._stored_keys("indexer", "p"),
+            "draft": st._draft_keys("p", 1),
+            "kv stored": st._stored_keys("kv", "p"),
+        }
+        for form, keys in tagged.items():
+            self.assertNotEqual(keys, untagged[form], form)
+            self.assertTrue(all(b"@" in k for k in keys), form)
+
+    def test_missing_fields_are_warned_once_per_pool(self):
+        class Bare:
+            page_size = 64
+
+            def get_page_buffer_meta(self, indices):
+                return [0x1000] * 2, [4096] * 2
+
+        st = _plugin(is_mla=False, _lib=_ObjectStore(), transport_mode="tcp",
+                     _registered_regions=set(), _bind_runtime_layout=True)
+        with self.assertLogs(dfkv_hicache._log, "WARNING") as logs:
+            st.register_mem_pool_host(Bare())
+            st.register_mem_pool_host(Bare())
+        self.assertEqual(len(logs.output), 2, logs.output)
+        self.assertIn("'layout'", logs.output[0])
+        self.assertIn("'dtype'", logs.output[1])
+
+    def test_device_pools_are_not_warned_for_layout(self):
+        # Device pools have no layout choice and no `layout` attribute:
+        # only a missing dtype is reported.
+        st = self._plugin(_ObjectStore(), _LaidOutHostPool("page_first"),
+                          bind=True)
+        with self.assertNoLogs(dfkv_hicache._log, "WARNING"):
+            st._note_pool_layout("indexer", _MlaDevicePool(layers=2),
+                                 device=True)
+        no_dtype = _MlaDevicePool(layers=2)
+        del no_dtype.dtype
+        with self.assertLogs(dfkv_hicache._log, "WARNING") as logs:
+            st._note_pool_layout("draft", no_dtype, device=True)
+        self.assertEqual(len(logs.output), 1, logs.output)
+        self.assertIn("'dtype'", logs.output[0])
+
+    def test_keys_of_an_unregistered_pool_are_refused(self):
+        st = _plugin(is_mla=False, _bind_runtime_layout=True)
+        with self.assertRaisesRegex(RuntimeError, "before the pool"):
+            st._keys("page")
+
+    def test_reregistering_another_format_is_refused(self):
+        st = self._plugin(_ObjectStore(), _LaidOutHostPool("page_first"),
+                          bind=True)
+        with self.assertRaisesRegex(RuntimeError, "another layout"):
+            st.register_mem_pool_host(_LaidOutHostPool("page_head"))
 
 
 class DeviceReadsReturnTheirIo(unittest.TestCase):
