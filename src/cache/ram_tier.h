@@ -201,6 +201,11 @@ class RamTier {
     // under its RAM shard lock; must be metadata-only and must not reenter RAM.
     // An existing disk value is authoritative after RAM eviction.
     std::function<bool(const BlockKey&)> is_persisted;
+    // The generation of the value the disk holds for a key (ValueMetadata),
+    // 0 if it holds none. A promotion is installed only if this still equals
+    // the generation its read was given: the disk has neither lost the key
+    // nor taken a new value of it since. Same calling rules as is_persisted.
+    std::function<uint64_t(const BlockKey&)> disk_generation;
     // Asked while the arena is being faulted in (once per 2 MiB and thread):
     // true gives the start up. The constructor then returns without the
     // arena ready and without threads; ok() is false and start_cancelled()
@@ -374,14 +379,19 @@ class RamTier {
   // holds a flush-pin, so it costs zero DIO write bandwidth and is evictable
   // by CLOCK the moment no send is in flight. Best-effort: a full shard
   // declines (false) and the promotion is silently skipped; promoted slots can
-  // never crowd out the write path's flush resources.
-  bool PutDurable(const BlockKey& key, const void* data, size_t len);
+  // never crowd out the write path's flush resources. `generation`: that of
+  // the disk value the copy was read from, taken before the read. With
+  // Options::disk_generation set, the copy is not installed unless the disk
+  // still holds that value (not if it was removed, or removed and written
+  // again, during the read); the same holds for a reservation's Commit.
+  bool PutDurable(const BlockKey& key, const void* data, size_t len,
+                  uint64_t generation = 0);
 
   // Reserve a registered-arena slot before an O_DIRECT read, so the read can
   // populate the durable RAM entry in place. Oversized values live outside the
   // registered arena and intentionally decline this zero-copy path.
   bool ReserveDurable(const BlockKey& key, size_t len,
-                      DurableReservation* out);
+                      DurableReservation* out, uint64_t generation = 0);
 
   // On hit with `out`, pins the resident allocation, marks an arena slot
   // referenced for CLOCK eviction, and returns one move-only owner. Without
@@ -394,6 +404,11 @@ class RamTier {
   bool Contains(const BlockKey& key) const;
   bool Lookup(const BlockKey& key, size_t* value_len) const;
   bool Remove(const BlockKey& key);  // drop from RAM (cache); true if present
+  // Drops the key's entry if it is a written (durable) copy, as a cache may;
+  // a value still to be written is left alone. The second step of a REMOVE,
+  // after the disk remove: it takes out a promotion that was installed while
+  // the REMOVE was between the tiers. True if a copy was dropped.
+  bool DropDurableCopy(const BlockKey& key);
 
 
   // Registers the arena's RDMA MR (set once by the RDMA server after reg_mr).
@@ -585,6 +600,13 @@ class RamTier {
                   bool client_ack,
                   std::shared_ptr<PutCompletion>* completion);
   // The bool form is kFlushed or kCanceled.
+  // Whether a promotion read from disk value `generation` may be installed.
+  // Under the key's shard lock.
+  bool DiskStillHolds(const BlockKey& key, uint64_t generation) const {
+    if (!opt_.disk_generation) return true;
+    const uint64_t current = opt_.disk_generation(key);
+    return current != 0 && current == generation;
+  }
   static void CompletePut(const std::shared_ptr<PutCompletion>& completion,
                           bool success);
   static void CompletePut(const std::shared_ptr<PutCompletion>& completion,

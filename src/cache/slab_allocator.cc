@@ -639,6 +639,7 @@ bool SlabAllocator::RestoreBulk(const std::vector<RestoreEntry>& entries) {
     meta.ref.offset = static_cast<uint64_t>(entry.slot) * entry.slot_size;
     meta.useful_bytes = entry.value_bytes;
     meta.key = entry.key;
+    meta.generation = ++next_generation_;
     meta.live = true;
     if (!index_.Insert(entry.key, meta_index)) return false;
     LinkResidentLocked(meta_index);
@@ -956,6 +957,7 @@ bool SlabAllocator::Put(const BlockKey& key, size_t len, SlotRef* out,
   meta.useful_bytes = len;
   const uint64_t insert_seq = ++put_seq_;
   meta.key = key;
+  meta.generation = ++next_generation_;
   meta.live = true;
   if (!index_.Insert(key, meta_index)) {
     meta = SlotMeta{};
@@ -1001,6 +1003,14 @@ bool SlabAllocator::GetAndPin(const BlockKey& key, SlotRef* out) {
   ++meta.refs;
   if (out) *out = meta.ref;
   return true;
+}
+
+uint64_t SlabAllocator::Generation(const BlockKey& key) const {
+  std::lock_guard<std::mutex> lock(mu_);
+  const uint32_t* index = index_.Find(key);
+  return index != nullptr && !slots_[*index].remove_pending
+             ? slots_[*index].generation
+             : 0;
 }
 
 bool SlabAllocator::Contains(const BlockKey& key) const {

@@ -103,6 +103,7 @@ struct RamTier::DurableReservation::State {
   uint64_t cap = 0;
   SlabAllocator::SlotHandle slot_handle;
   std::shared_ptr<PutCompletion> completion;
+  uint64_t generation = 0;  // of the disk value being read
   bool finished = false;
   bool installed = false;
 };
@@ -955,7 +956,7 @@ RamTier::PutResult RamTier::PutCommitted(
 }
 
 bool RamTier::ReserveDurable(const BlockKey& key, size_t len,
-                             DurableReservation* out) {
+                             DurableReservation* out, uint64_t generation) {
   if (out == nullptr) return false;
   out->Reset();
   if (!arena_ || len == 0 || static_cast<uint64_t>(len) > extent_bytes_)
@@ -1006,6 +1007,7 @@ bool RamTier::ReserveDurable(const BlockKey& key, size_t len,
   state->cap = cap;
   state->slot_handle = slot_handle;
   state->completion = std::move(completion);
+  state->generation = generation;
   out->state_ = std::move(state);
   return true;
 }
@@ -1024,6 +1026,9 @@ bool RamTier::CommitReservation(
       std::lock_guard<std::mutex> state_lk(state.completion->mu);
       canceled = state.completion->canceled;
     }
+    // As in PutDurable: only a copy of the value the disk still holds.
+    if (!canceled && !DiskStillHolds(state.key, state.generation))
+      canceled = true;
     auto writing = s.writing.find(state.key);
     if (writing != s.writing.end() &&
         writing->second == state.completion)
@@ -1135,7 +1140,8 @@ RamTier::PutResult RamTier::PutWriteBack(
   return {Status::kOk};
 }
 
-bool RamTier::PutDurable(const BlockKey& key, const void* data, size_t len) {
+bool RamTier::PutDurable(const BlockKey& key, const void* data, size_t len,
+                         uint64_t generation) {
   if (!arena_ || len == 0 || data == nullptr) return false;
   uint64_t requested_cap = 0;
   if (!AlignCapacity(len, opt_.slot_granularity, &requested_cap) ||
@@ -1211,6 +1217,11 @@ bool RamTier::PutDurable(const BlockKey& key, const void* data, size_t len) {
   // Same cancel/install atomicity as Admit(): a Remove() that flagged the
   // shared completion while the copy ran must suppress the install -- before
   // this the promotion installed unconditionally and revived a Removed key.
+  // A copy of a value the disk no longer holds is not installed either: the
+  // key was removed while it was read (it would come back), or removed and
+  // written again (the copy would hide the new value). Judged under the
+  // shard lock, so a Remove that follows its disk remove with
+  // DropDurableCopy() either finds the copy or it is never installed.
   bool canceled = false;
   {
     std::lock_guard<std::mutex> lk(s.mu);
@@ -1218,6 +1229,7 @@ bool RamTier::PutDurable(const BlockKey& key, const void* data, size_t len) {
       std::lock_guard<std::mutex> state_lk(completion->mu);
       canceled = completion->canceled;
     }
+    if (!canceled && !DiskStillHolds(key, generation)) canceled = true;
     s.writing.erase(key);
     if (!canceled) {
       Entry e;
@@ -1387,6 +1399,19 @@ bool RamTier::Remove(const BlockKey& key) {
     }
   }
   return had;
+}
+
+bool RamTier::DropDurableCopy(const BlockKey& key) {
+  if (shards_.empty()) return false;
+  Shard& s = ShardFor(key);
+  std::lock_guard<std::mutex> lk(s.mu);
+  auto it = s.index.find(key);
+  if (it == s.index.end() || it->second.remove_pending ||
+      !it->second.durable)
+    return false;
+  it->second.remove_pending = true;  // hidden now; gone with its last send
+  DropLocked(s, key);
+  return true;
 }
 
 void RamTier::DropLocked(Shard& s, const BlockKey& key) {

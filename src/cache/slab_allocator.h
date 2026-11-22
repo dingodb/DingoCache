@@ -95,6 +95,8 @@ class SlabAllocator {
   bool Get(const BlockKey& key, SlotRef* out);
   bool GetAndPin(const BlockKey& key, SlotRef* out);
   bool Contains(const BlockKey& key) const;
+  // The generation of the key's resident (see ValueMetadata), 0 if absent.
+  uint64_t Generation(const BlockKey& key) const;
 
   // A rebuild record carrying the authoritative caller-visible stored length.
   // retain_until/retain_ttl_s restore a persisted minimum-lifetime protection
@@ -285,6 +287,7 @@ class SlabAllocator {
   struct SlotMeta {
     BlockKey key;
     SlotRef ref;
+    uint64_t generation = 0;  // from next_generation_, set on admission
     uint64_t useful_bytes = 0;
     uint32_t global_prev = kNoSlot;
     uint32_t global_next = kNoSlot;
@@ -457,6 +460,7 @@ class SlabAllocator {
   uint64_t watermark_scan_steps_ = 0;
   uint64_t extent_returns_ = 0;
   uint64_t put_seq_ = 0;
+  uint64_t next_generation_ = 0;
   uint64_t activity_seq_ = 0;
   uint64_t cold_window_ = 0;
   bool cold_steal_enabled_ = true;

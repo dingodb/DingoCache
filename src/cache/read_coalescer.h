@@ -106,10 +106,13 @@ class ReadCoalescer {
   // `whole_value` records whether this read covers the entire stored value.
   // `publishes_to_ram` is an immutable promise: successful completion publishes
   // the bytes before waking no-copy followers.
+  // `generation`: of the disk value being read (ValueMetadata), handed back
+  // by CompleteAsync for the RAM promotion.
   uint64_t TryRegisterAsync(const BlockKey& bk, uint64_t offset,
                             uint64_t length, bool whole_value,
                             size_t value_len = 0,
-                            bool publishes_to_ram = false) {
+                            bool publishes_to_ram = false,
+                            uint64_t generation = 0) {
     Key k{bk.digest_hi, bk.digest_lo, bk.tenant_hash, offset, length};
     std::lock_guard<std::mutex> lk(mu_);
     if (map_.find(k) != map_.end()) return 0;
@@ -119,6 +122,7 @@ class ReadCoalescer {
     f->leader_tid = std::this_thread::get_id();
     f->value_len = value_len;
     f->publishes_to_ram = publishes_to_ram;
+    f->generation = generation;
     // A staged convoy whose ranks drift past the in-flight window never
     // produces a waiter. A completed no-waiter whole read leaves a key
     // fingerprint (not a payload; that is what keeps the window seconds-cheap)
@@ -153,7 +157,8 @@ class ReadCoalescer {
   // mechanism.
   bool CompleteAsync(uint64_t token, Status st, const char* data, size_t len,
                      BlockKey* key = nullptr, bool* whole = nullptr,
-                     bool* recurrent = nullptr) {
+                     bool* recurrent = nullptr,
+                     uint64_t* generation = nullptr) {
     std::shared_ptr<Flight> f;
     bool waiters = false;
     {
@@ -202,6 +207,7 @@ class ReadCoalescer {
           BlockKey{f->key.digest_hi, f->key.digest_lo, f->key.tenant_hash};
     if (whole) *whole = f->whole;
     if (recurrent) *recurrent = f->recurrent;
+    if (generation) *generation = f->generation;
     return waiters;
   }
 
@@ -352,6 +358,7 @@ class ReadCoalescer {
     bool whole = false;
     bool recurrent = false;  // registered while a recurrence tombstone was live
     bool publishes_to_ram = false;
+    uint64_t generation = 0;
     std::thread::id leader_tid;
     std::atomic<int> waiters{0};
     std::atomic<int> copy_waiters{0};
