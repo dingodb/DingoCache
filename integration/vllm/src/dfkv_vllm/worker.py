@@ -3040,10 +3040,79 @@ class DfkvStoreWorker:
             )
             return res
 
+        # Presence of each physical object, by (group, chunk, tp, pcp, dcp),
+        # as far as this lookup has probed it: a shorter candidate re-uses
+        # what longer ones found instead of probing (and building the keys of)
+        # the whole prefix again.
+        presence: dict[tuple[int, int, int, int, int], int] = {}
+
+        def probe_into(objects: dict, num_logical_keys: int) -> bool:
+            """Probe ``objects`` (object -> key) and record their presence."""
+            res = probe(list(objects.values()), num_logical_keys)
+            if res is None:
+                return False
+            presence.update(zip(objects, res, strict=True))
+            return True
+
+        def group_namespaces(g_idx: int):
+            # State pools need every physical TP shard; payload pools need
+            # every head/PCP/DCP coordinate (MLA keeps its canonical -1).
+            db = self.token_dbs[g_idx]
+            return _key_namespaces(
+                tp_size=self.tp_size,
+                pcp_size=db.metadata.pcp_size,
+                dcp_size=db.metadata.dcp_size,
+                num_kv_heads=self.num_kv_head,
+                use_mla=db.metadata.tp_rank < 0,
+                tp_sharded=isinstance(
+                    _unwrap_spec(self._kv_cache_groups[g_idx].kv_cache_spec),
+                    MambaSpec,
+                ),
+            )
+
+        def object_key(g_idx: int, h, tp: int, pcp: int, dcp: int) -> bytes:
+            # Keep this worker's own pp_rank (db.metadata.pp_rank): PP
+            # partitions layers, so each (group, chunk) lives under a single
+            # stage's pp_rank, matching the SAVE/LOAD keys. Probing every
+            # pp_rank matched nothing and forced present=0 on PP>1.
+            md = dataclasses.replace(
+                self.token_dbs[g_idx].metadata,
+                tp_rank=tp, pcp_rank=pcp, dcp_rank=dcp,
+            )
+            return PoolKey(md, h.hex()).to_bytes()
+
+        def prefetch_moving_groups(candidate: int, hit: int) -> bool:
+            """After a failed candidate: probe, in one call, every chunk below
+            ``hit`` of the groups whose load mask moves with the candidate
+            (a recurrent state's tail, a window), so the shorter candidates
+            the loop tries next are answered locally. A group whose mask at
+            ``hit`` is the prefix of its mask at ``candidate`` (full
+            attention) needs nothing new: every one of its chunks below
+            ``hit`` was probed already. One linear pass over those groups'
+            chunks; False if the probe failed."""
+            long_masks = self.coord.load_mask(block_hashes, candidate)
+            short_masks = self.coord.load_mask(block_hashes, hit)
+            pending: dict[tuple[int, int, int, int, int], bytes] = {}
+            for g_idx, db in enumerate(self.token_dbs):
+                short = list(short_masks[g_idx])
+                if short == list(long_masks[g_idx])[: len(short)]:
+                    continue
+                group_hashes = self.coord.block_hashes_for_spec(
+                    block_hashes, self._kv_cache_groups[g_idx].kv_cache_spec
+                )
+                namespaces = group_namespaces(g_idx)
+                for chunk_id in range(min(hit // db.block_size, len(group_hashes))):
+                    h = group_hashes[chunk_id]
+                    for tp, pcp, dcp in namespaces:
+                        physical = (g_idx, chunk_id, tp, pcp, dcp)
+                        if physical not in presence and physical not in pending:
+                            pending[physical] = object_key(g_idx, h, tp, pcp, dcp)
+            return not pending or probe_into(pending, len(pending))
+
         def lookup_candidate(token_len: int) -> int:
             nonlocal first_candidate_keys
             """Check how many prefix tokens exist in the store.
-    
+
             Checks across all TP ranks at this worker's own PP rank.
             """
             if not block_hashes or token_len <= 0:
@@ -3052,7 +3121,8 @@ class DfkvStoreWorker:
             # Build every physical object required by each logical LCM chunk.
             # Object metadata retains the logical chunk index so repeated hashes
             # cannot collapse accounting across distinct prefix positions.
-            candidate_keys: list[bytes] = []
+            candidate_objects: list[tuple[int, int, int, int, int]] = []
+            unknown: dict[tuple[int, int, int, int, int], bytes] = {}
             candidate_meta: list[tuple[int, int, int, bytes]] = []
             expected_per_object: dict[tuple[int, int, int, bytes], int] = {}
             # SAVE omits volatile draft tails. Admission must instead prove
@@ -3073,22 +3143,9 @@ class DfkvStoreWorker:
                 group_hashes = self.coord.block_hashes_for_spec(
                     block_hashes, self._kv_cache_groups[g_idx].kv_cache_spec
                 )
-                # State pools need every physical TP shard; payload pools need
-                # every head/PCP/DCP coordinate (MLA keeps its canonical -1).
-                tp_sharded = isinstance(
-                    _unwrap_spec(self._kv_cache_groups[g_idx].kv_cache_spec),
-                    MambaSpec,
-                )
                 # Key metadata carries this group's CP geometry; a negative
                 # tp_rank is exactly the canonical replicated-MLA coordinate.
-                namespaces = _key_namespaces(
-                    tp_size=self.tp_size,
-                    pcp_size=db.metadata.pcp_size,
-                    dcp_size=db.metadata.dcp_size,
-                    num_kv_heads=self.num_kv_head,
-                    use_mla=db.metadata.tp_rank < 0,
-                    tp_sharded=tp_sharded,
-                )
+                namespaces = group_namespaces(g_idx)
                 rank_probes = len(namespaces)
                 processed_chunks = 0
                 for chunk_id, h in enumerate(group_hashes):
@@ -3102,15 +3159,11 @@ class DfkvStoreWorker:
                     object_meta = (logical_chunk_idx, g_idx, chunk_id, bytes(h))
                     expected_per_object[object_meta] = rank_probes
                     for tp, pcp, dcp in namespaces:
-                        # Keep this worker's own pp_rank (db.metadata.pp_rank): PP
-                        # partitions layers, so each (group, chunk) lives under a
-                        # single stage's pp_rank, matching the SAVE/LOAD keys. Probing
-                        # every pp_rank matched nothing and forced present=0 on PP>1.
-                        md = dataclasses.replace(
-                            db.metadata, tp_rank=tp, pcp_rank=pcp, dcp_rank=dcp
-                        )
-                        candidate_keys.append(PoolKey(md, h.hex()).to_bytes())
+                        physical = (g_idx, chunk_id, tp, pcp, dcp)
+                        candidate_objects.append(physical)
                         candidate_meta.append(object_meta)
+                        if physical not in presence and physical not in unknown:
+                            unknown[physical] = object_key(g_idx, h, tp, pcp, dcp)
                 # A truncated hash vector is malformed metadata. Mark only its
                 # ungenerated required suffix chunks incomplete; the normal path
                 # has no second full mask scan.
@@ -3124,14 +3177,13 @@ class DfkvStoreWorker:
                         )
                         missing_required_per_chunk[logical_chunk_idx] = True
     
-            if not candidate_keys:
+            if not candidate_objects:
                 return 0
             if first_candidate_keys is None:
-                first_candidate_keys = candidate_keys
-    
-            res = probe(candidate_keys, len(expected_per_object))
-            if res is None:
+                first_candidate_keys = list(unknown.values())
+            if unknown and not probe_into(unknown, len(expected_per_object)):
                 return 0
+            res = [presence[physical] for physical in candidate_objects]
     
             # A semantic object exists only if every TP*PP coordinate exists. A
             # logical LCM chunk is complete only if all of its semantic objects do.
@@ -3167,7 +3219,7 @@ class DfkvStoreWorker:
                 "dfkv lookup: token_len=%d candidates=%d complete_chunks=%d/%d "
                 "-> hit_length=%d",
                 token_len,
-                len(candidate_keys),
+                len(candidate_objects),
                 prefix_chunks,
                 num_prefix_chunks,
                 hit_length,
@@ -3325,11 +3377,17 @@ class DfkvStoreWorker:
 
         if self.coord.enable_partial_hash_hits:
             return lookup_partial(token_len), applied_ttl()
-        candidate = token_len // self.coord.lcm_block_size * self.coord.lcm_block_size
+        lcm = self.coord.lcm_block_size
+        candidate = token_len // lcm * lcm
+        prefetched = False
         while candidate > 0:
             hit = lookup_candidate(candidate)
             if hit == candidate:
                 return hit, applied_ttl()
+            if not prefetched and hit > 0:
+                prefetched = True
+                if not prefetch_moving_groups(candidate, hit):
+                    return 0, applied_ttl()
             # Tail-only state masks move when the candidate prefix shrinks.
             # Revalidate that boundary rather than loading unprobed checkpoints.
             candidate = hit
