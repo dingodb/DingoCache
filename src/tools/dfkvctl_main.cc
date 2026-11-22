@@ -11,6 +11,7 @@
  *     reaches nodes automatically even in RDMA deploys. --stat-port <p> stays as a manual
  *     override (e.g. for older servers that predate tcp_port registration).
  * Native data commands require --namespace <model/raw-layout schema identity>. */
+#include <cerrno>
 #include <cstdlib>
 #include <cstdint>
 #include <cstdio>
@@ -584,9 +585,23 @@ int main(int argc, char** argv) {
   std::vector<std::string> pos;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
-    // strtoull/strtoul (not stoull/stoul): the std:: variants THROW on a
-    // non-numeric arg, terminating the tool; strto* return 0 instead.
-    auto nv32 = [&](uint32_t* d) { if (i + 1 < argc) *d = (uint32_t)std::strtoul(argv[++i], nullptr, 0); };
+    // A port, 1..65535 (strtoul, not stoul: the std:: variant throws). A value
+    // that is not one used to be read as 0, "use the member's own port", or
+    // truncated to 16 bits.
+    auto nv32 = [&](uint32_t* d) {
+      if (i + 1 >= argc) return;
+      const char* text = argv[++i];
+      errno = 0;
+      char* end = nullptr;
+      const unsigned long v = std::strtoul(text, &end, 0);
+      if (errno != 0 || end == text || *end != '\0' || *text == '-' ||
+          v < 1 || v > 65535) {
+        std::fprintf(stderr, "%s must be a port (1..65535), got '%s'\n",
+                     a.c_str(), text);
+        std::exit(2);
+      }
+      *d = static_cast<uint32_t>(v);
+    };
     if (a == "--members" && i + 1 < argc) members = argv[++i];
     else if (a == "--mds" && i + 1 < argc) mds = argv[++i];
     else if (a == "--group" && i + 1 < argc) {

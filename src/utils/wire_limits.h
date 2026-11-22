@@ -16,6 +16,8 @@
 #include <cstdlib>
 #include <limits>
 
+#include "utils/env_parse.h"
+
 
 namespace dfkv {
 namespace wire_limits {
@@ -30,14 +32,15 @@ constexpr size_t kPayloadHardCap = static_cast<size_t>(
     std::numeric_limits<uint32_t>::max() - 2 * kIoAlign);
 
 inline size_t EnvBytes(const char* name, size_t dflt) {
-  const char* v = std::getenv(name);
-  if (!v || !*v) return dflt;
-  errno = 0;
-  char* end = nullptr;
-  unsigned long long x = std::strtoull(v, &end, 10);
-  if (errno != 0 || end == v || x == 0) return dflt;
-  if (x > kPayloadHardCap) x = kPayloadHardCap;
-  return static_cast<size_t>(x);
+  envparse::U64Spec spec;
+  spec.fallback = dflt;
+  spec.min = 1;
+  spec.max = kPayloadHardCap;
+  spec.above = envparse::Above::kClamp;
+  spec.legacy = envparse::Legacy::kPrefix;
+  spec.negative = envparse::Negative::kWraps;
+  spec.overflow_is_default = true;
+  return static_cast<size_t>(envparse::EnvU64(name, spec));
 }
 
 // The server's max value payload: configured (0 = 64 MiB default), then the

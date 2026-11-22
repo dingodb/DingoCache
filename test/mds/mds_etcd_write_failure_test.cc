@@ -33,6 +33,7 @@
 #include "transport/wire.h"
 #include "transport/wire_legacy.h"
 #include "utils/base64.h"
+#include "utils/env_parse.h"
 #include "utils/json_min.h"
 #include "utils/net_util.h"
 
@@ -419,8 +420,16 @@ TEST(MdsEtcdWriteFailure, HoldIsTakenFromTheEnvironmentAndClamped) {
   EXPECT_EQ(withheld_for("45000"), 45000u);
   EXPECT_EQ(withheld_for("3000000"), 600000u);  // clamped to ten minutes
   // A negative value parses to a huge unsigned one and is clamped as well; it
-  // must not hold a list for the life of the process.
+  // must not hold a list for the life of the process. That reading is kept,
+  // and reported.
+  envparse::ForgetWarningsForTest();
+  testing::internal::CaptureStderr();
   EXPECT_EQ(withheld_for("-1"), 600000u);
+  const std::string log = testing::internal::GetCapturedStderr();
+  EXPECT_NE(log.find("invalid DFKV_MDS_UNWRITTEN_HOLD_MS='-1'"),
+            std::string::npos)
+      << log;
+  EXPECT_NE(log.find("as before"), std::string::npos) << log;
 }
 
 TEST(MdsEtcdWriteFailure, LegacyFramedPeersAreTreatedTheSame) {

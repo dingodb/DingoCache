@@ -1,3 +1,4 @@
+#include "utils/env_parse.h"
 #include "utils/metrics_http.h"
 
 #include <netinet/in.h>
@@ -22,28 +23,13 @@ namespace {
 // clamp. Same parse policy as the cache TCP listener knobs (kv_node_server.cc).
 uint64_t BoundedEnv(const char* name, uint64_t fallback, uint64_t hard_max,
                     bool allow_zero) {
-  const char* value = std::getenv(name);
-  if (value == nullptr || *value == '\0') return fallback;
-  if (*value < '0' || *value > '9') {
-    DFKV_LOG_WARN(std::string("invalid ") + name + "='" + value + "'; using " +
-                  std::to_string(fallback));
-    return fallback;
-  }
-  errno = 0;
-  char* end = nullptr;
-  const unsigned long long parsed = std::strtoull(value, &end, 10);
-  if (errno != 0 || end == value || *end != '\0' ||
-      (parsed == 0 && !allow_zero)) {
-    DFKV_LOG_WARN(std::string("invalid ") + name + "='" + value + "'; using " +
-                  std::to_string(fallback));
-    return fallback;
-  }
-  if (parsed > hard_max) {
-    DFKV_LOG_WARN(std::string(name) + " clamped to hard maximum " +
-                  std::to_string(hard_max));
-    return hard_max;
-  }
-  return parsed;
+  envparse::U64Spec spec;
+  spec.fallback = fallback;
+  spec.min = allow_zero ? 0 : 1;
+  spec.max = hard_max;
+  spec.above = envparse::Above::kClamp;
+  spec.overflow_is_default = true;
+  return envparse::EnvU64(name, spec);
 }
 constexpr size_t kMaxHttpRequestHeadBytes = 32 * 1024;
 

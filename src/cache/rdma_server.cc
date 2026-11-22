@@ -1,3 +1,5 @@
+#include "cache/rdma_server_env.h"
+#include "utils/env_parse.h"
 #include "common/config_dump.h"
 #include "cache/rdma_server.h"
 
@@ -83,9 +85,8 @@ inline double NowSteadySec() {
 
 size_t RecvSegmentBytes() {
   constexpr size_t kDefault = 128ull << 30;
-  const size_t bytes = rdma::ResolveRecvSegmentBytes(
-      std::getenv("DFKV_RDMA_RECV_SEGMENT_SIZE"), kDefault,
-      rdma::kV2DataOffset);
+  const size_t bytes =
+      RecvBytesFromEnv("DFKV_RDMA_RECV_SEGMENT_SIZE", kDefault);
   config_dump::RecordResolved("DFKV_RDMA_RECV_SEGMENT_SIZE",
                               std::to_string(bytes));
   return bytes;
@@ -94,9 +95,8 @@ size_t RecvSegmentBytes() {
 size_t RecvChunkBytes(size_t max_bytes) {
   constexpr size_t kDefault = 256ull << 20;
   const size_t fallback = std::min(kDefault, max_bytes);
-  const size_t parsed = rdma::ResolveRecvSegmentBytes(
-      std::getenv("DFKV_RDMA_RECV_CHUNK_BYTES"), fallback,
-      rdma::kV2DataOffset);
+  const size_t parsed =
+      RecvBytesFromEnv("DFKV_RDMA_RECV_CHUNK_BYTES", fallback);
   const size_t bytes = parsed == 0 ? 0 : std::min(parsed, max_bytes);
   config_dump::RecordResolved("DFKV_RDMA_RECV_CHUNK_BYTES",
                               std::to_string(bytes));
@@ -106,34 +106,25 @@ size_t RecvChunkBytes(size_t max_bytes) {
 // Strict parse: anything but a plain number keeps the default, so a typo can
 // neither lift the limit nor set it to something tiny.
 uint64_t MaxPendingHandshakes(uint64_t fallback) {
-  const char* value = std::getenv("DFKV_RDMA_MAX_PENDING_HANDSHAKES");
-  uint64_t out = fallback;
-  if (value && *value) {
-    errno = 0;
-    char* end = nullptr;
-    const unsigned long long parsed = std::strtoull(value, &end, 10);
-    if (*value >= '0' && *value <= '9' && errno == 0 && *end == '\0')
-      out = parsed;
-    else
-      DFKV_LOG_WARN(std::string("invalid DFKV_RDMA_MAX_PENDING_HANDSHAKES='") +
-                    value + "'; using " + std::to_string(fallback));
-  }
+  envparse::U64Spec spec;
+  spec.overflow_is_default = true;
+  spec.fallback = fallback;
+  const uint64_t out =
+      envparse::EnvU64("DFKV_RDMA_MAX_PENDING_HANDSHAKES", spec);
   config_dump::RecordResolved("DFKV_RDMA_MAX_PENDING_HANDSHAKES",
                               std::to_string(out));
   return out;
 }
 
 uint64_t RecvChunkIdleMs() {
-  constexpr uint64_t kDefault = 60000;
-  const char* value = std::getenv("DFKV_RDMA_RECV_CHUNK_IDLE_MS");
-  uint64_t out = kDefault;
-  if (value && *value) {
-    errno = 0;
-    char* end = nullptr;
-    const unsigned long long parsed = std::strtoull(value, &end, 10);
-    if (errno == 0 && end != value && *end == '\0')
-      out = std::min<uint64_t>(parsed, 86400000);
-  }
+  envparse::U64Spec spec;
+  spec.overflow_is_default = true;
+  spec.legacy = envparse::Legacy::kFull;
+  spec.negative = envparse::Negative::kWraps;
+  spec.fallback = 60000;
+  spec.max = 86400000;
+  spec.above = envparse::Above::kClamp;
+  const uint64_t out = envparse::EnvU64("DFKV_RDMA_RECV_CHUNK_IDLE_MS", spec);
   config_dump::RecordResolved("DFKV_RDMA_RECV_CHUNK_IDLE_MS",
                               std::to_string(out));
   return out;
@@ -547,9 +538,13 @@ size_t ServerDepth() {
   // pages failed" on GLM-5.2-NVFP4 with depth=1 server vs depth=4 client,
   // resulting in hot-round L3 prefetch failures and -29.8% throughput vs cold).
   size_t out = 4;
-  const char* e = std::getenv("DFKV_RDMA_DEPTH");
-  if (e && *e) { long v = std::strtol(e, nullptr, 10); if (v >= 1 && v <= 256) out = (size_t)v; }
-  return out;
+  envparse::U64Spec spec;
+  spec.representable_max = envparse::kSignedMax;  // read with strtol
+  spec.legacy = envparse::Legacy::kPrefixOrZero;
+  spec.fallback = out;
+  spec.min = 1;
+  spec.max = 256;
+  return static_cast<size_t>(envparse::EnvU64("DFKV_RDMA_DEPTH", spec));
 }
 
 int ServerIdleMs() {
@@ -562,13 +557,7 @@ int ServerIdleMs() {
   // the client re-dials a stale pooled connection via RdmaTransport's 2-attempt
   // retry. Default 10 min keeps active/recently-used pooled conns alive; set
   // DFKV_RDMA_IDLE_MS=0 disables the reaper and waits indefinitely.
-  int out = 600000;  // 10 min; K8s launcher exports DFKV_RDMA_IDLE_MS=30000 explicitly
-  const char* e = std::getenv("DFKV_RDMA_IDLE_MS");
-  if (e && *e) {
-    long v = std::strtol(e, nullptr, 10);
-    if (v <= 0) out = -1;                     // disabled => block forever
-    else out = static_cast<int>(v > 86400000 ? 86400000 : v);  // clamp to 24h
-  }
+  const int out = RdmaIdleMsFromEnv();  // default 10 min
   config_dump::RecordResolved("DFKV_RDMA_IDLE_MS", std::to_string(out));
   return out;
 }
@@ -580,11 +569,13 @@ int ServerIdleMs() {
 // operators may select 32 (or another [1, 256] value) independently.
 size_t UringDepth() {
   size_t out = 16;
-  const char* e = std::getenv("DFKV_SERVER_URING_DEPTH");
-  if (e && *e) {
-    long v = std::strtol(e, nullptr, 10);
-    if (v >= 1 && v <= 256) out = static_cast<size_t>(v);
-  }
+  envparse::U64Spec spec;
+  spec.representable_max = envparse::kSignedMax;  // read with strtol
+  spec.legacy = envparse::Legacy::kPrefixOrZero;
+  spec.fallback = out;
+  spec.min = 1;
+  spec.max = 256;
+  out = static_cast<size_t>(envparse::EnvU64("DFKV_SERVER_URING_DEPTH", spec));
   config_dump::RecordResolved("DFKV_SERVER_URING_DEPTH", std::to_string(out));
   return out;
 }
@@ -603,8 +594,7 @@ bool RdmaServer::UseUringPath() const {
   // the first SQE; an infrastructure error after admission drops the connection
   // after draining rather than exposing mixed async/synchronous staging bytes.
   // DFKV_SERVER_URING=0 forces the synchronous read loop.
-  const char* e = std::getenv("DFKV_SERVER_URING");
-  const bool out = !(e && std::strcmp(e, "0") == 0);
+  const bool out = ServerUringFromEnv();
   config_dump::RecordResolved("DFKV_SERVER_URING", out ? "on" : "off");
   return out;
 #else

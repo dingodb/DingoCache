@@ -2,13 +2,16 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <string>
 #include <vector>
 
+#include "utils/env_parse.h"
 #include "utils/log.h"
 
 extern char** environ;
@@ -60,44 +63,65 @@ std::string EnvStr(const char* name, const std::string& def) {
   return val;
 }
 
+// How these helpers always read a value is kept (utils/env_parse.h): a
+// leading number is used and the rest ignored, a negative unsigned wraps (the
+// callers clamp), and every word but 0/false/no/off is on. What is new is the
+// WARN for a value that is not clean.
+namespace {
+bool IsSet(const char* name) {
+  const char* e = std::getenv(name);
+  return e != nullptr && *e != '\0';
+}
+}  // namespace
+
 int64_t EnvI64(const char* name, int64_t def) {
+  // The one signed reader. Its strtoll stays as it was; what is added is the
+  // check whether the text is a plain number, and the report if it is not.
   const char* e = std::getenv(name);
   int64_t val = def;
   Source src = Source::kDefault;
   if (e != nullptr && *e != '\0') {
+    errno = 0;
     char* end = nullptr;
-    long long parsed = std::strtoll(e, &end, 10);
-    if (end != e) { val = static_cast<int64_t>(parsed); src = Source::kEnv; }
+    const long long parsed = std::strtoll(e, &end, 10);
+    const bool converted = end != e;
+    const bool out_of_range = errno == ERANGE;
+    if (converted) { val = static_cast<int64_t>(parsed); src = Source::kEnv; }
+    const char* p = e;
+    if (*p == '-') ++p;
+    bool clean = converted && !out_of_range && *end == '\0' &&
+                 *p >= '0' && *p <= '9';
+    if (!clean) {
+      envparse::WarnOnce(
+          name,
+          "invalid " + envparse::detail::Quoted(name, e) +
+              ": only a plain decimal number is valid; using " +
+              (converted ? std::to_string(val) + " as before. A later "
+                           "release will not accept this value."
+                         : "the default " + std::to_string(def)));
+    }
   }
   Record(name, std::to_string(val), src);
   return val;
 }
 
 uint64_t EnvU64(const char* name, uint64_t def) {
-  const char* e = std::getenv(name);
-  uint64_t val = def;
-  Source src = Source::kDefault;
-  if (e != nullptr && *e != '\0') {
-    char* end = nullptr;
-    unsigned long long parsed = std::strtoull(e, &end, 10);
-    if (end != e) { val = static_cast<uint64_t>(parsed); src = Source::kEnv; }
-  }
-  Record(name, std::to_string(val), src);
+  envparse::U64Spec spec;
+  spec.fallback = def;
+  spec.above = envparse::Above::kClamp;  // strtoull saturates
+  spec.legacy = envparse::Legacy::kPrefix;
+  spec.negative = envparse::Negative::kWraps;
+  bool from_env = false;
+  const uint64_t val = envparse::EnvU64(name, spec, &from_env);
+  Record(name, std::to_string(val),
+         from_env ? Source::kEnv : Source::kDefault);
   return val;
 }
 
 bool EnvBool(const char* name, bool def) {
-  const char* e = std::getenv(name);
-  bool val = def;
-  Source src = Source::kDefault;
-  if (e != nullptr && *e != '\0') {
-    std::string s(e);
-    std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    val = !(s == "0" || s == "false" || s == "no" || s == "off");
-    src = Source::kEnv;
-  }
-  Record(name, val ? "1" : "0", src);
+  const bool val =
+      envparse::EnvSwitch(name, def, envparse::OffWhen::kOffWord);
+  Record(name, val ? "1" : "0", IsSet(name) ? Source::kEnv : Source::kDefault);
   return val;
 }
 

@@ -21,14 +21,18 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "utils/env_parse.h"
+
 namespace dfkv {
 namespace numa {
 
+// DFKV_RDMA_NUMA as the environment has it now. Only "0" is off.
+inline bool EnabledFromEnv() {
+  return envparse::EnvSwitch("DFKV_RDMA_NUMA", false,
+                             envparse::OffWhen::kExactlyZero);
+}
 inline bool Enabled() {
-  static const bool v = [] {
-    const char* e = std::getenv("DFKV_RDMA_NUMA");
-    return e && *e && std::strcmp(e, "0") != 0;
-  }();
+  static const bool v = EnabledFromEnv();
   return v;
 }
 

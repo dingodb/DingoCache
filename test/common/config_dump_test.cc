@@ -1,4 +1,5 @@
 #include "common/config_dump.h"
+#include "utils/env_parse.h"
 
 #include <cstdlib>
 #include <string>
@@ -55,6 +56,47 @@ TEST_F(ConfigDumpTest, EnvU64StrBool) {
   ::unsetenv("DFKV_TEST_B");
   EXPECT_TRUE(cd::EnvBool("DFKV_TEST_B", true));    // unset -> default
   EXPECT_FALSE(cd::EnvBool("DFKV_TEST_B", false));
+}
+
+// What these helpers did with a value that is not clean is kept -- a leading
+// number is used, a negative unsigned wraps, a non-number is the default, a
+// word that is not an off word reads as on -- and is now reported.
+TEST_F(ConfigDumpTest, UncleanValuesKeepTheirReadingAndAreReported) {
+  auto logged = [](const char* name, const char* value, auto read) {
+    dfkv::envparse::ForgetWarningsForTest();
+    ::setenv(name, value, 1);
+    testing::internal::CaptureStderr();
+    read();
+    const std::string log = testing::internal::GetCapturedStderr();
+    ::unsetenv(name);
+    return log.find(std::string(name) + "='" + value + "'") !=
+           std::string::npos;
+  };
+  EXPECT_TRUE(logged("DFKV_TEST_U", "2500ms", [] {
+    EXPECT_EQ(cd::EnvU64("DFKV_TEST_U", 9), 2500u);
+  }));
+  EXPECT_TRUE(logged("DFKV_TEST_U", "-1", [] {
+    EXPECT_EQ(cd::EnvU64("DFKV_TEST_U", 9), 18446744073709551615ull);
+  }));
+  EXPECT_TRUE(logged("DFKV_TEST_U", "abc", [] {
+    EXPECT_EQ(cd::EnvU64("DFKV_TEST_U", 9), 9u);
+  }));
+  EXPECT_TRUE(logged("DFKV_TEST_I", "30000ms", [] {
+    EXPECT_EQ(cd::EnvI64("DFKV_TEST_I", 7), 30000);
+  }));
+  EXPECT_TRUE(logged("DFKV_TEST_B", "enabled", [] {
+    EXPECT_TRUE(cd::EnvBool("DFKV_TEST_B", false));
+  }));
+  // Clean values are not reported.
+  EXPECT_FALSE(logged("DFKV_TEST_U", "2500", [] {
+    EXPECT_EQ(cd::EnvU64("DFKV_TEST_U", 9), 2500u);
+  }));
+  EXPECT_FALSE(logged("DFKV_TEST_I", "-5", [] {
+    EXPECT_EQ(cd::EnvI64("DFKV_TEST_I", 7), -5);
+  }));
+  EXPECT_FALSE(logged("DFKV_TEST_B", "OFF", [] {
+    EXPECT_FALSE(cd::EnvBool("DFKV_TEST_B", true));
+  }));
 }
 
 TEST_F(ConfigDumpTest, EmitShowsRecordsWithSourceAndFoldsEnvScan) {

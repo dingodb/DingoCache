@@ -40,11 +40,14 @@ void RecordResolved(const std::string& name, const std::string& value);
 // Env helpers: read env `name`, record (value + kEnv/kDefault source), and
 // return the resolved value. An unset OR empty env string yields `def` (the
 // `e && *e` convention that dominates the codebase). Numeric helpers parse
-// base-10 via strtoll/strtoull; an unparseable value falls back to `def`.
+// with utils/env_parse.h, which keeps what these helpers always did with an
+// unclean value and adds a WARN: a number followed by other characters keeps
+// the number, a negative EnvU64 wraps, anything else falls back to `def`.
 std::string EnvStr(const char* name, const std::string& def = "");
 int64_t     EnvI64(const char* name, int64_t def);
 uint64_t    EnvU64(const char* name, uint64_t def);
-// Truthy iff set and not one of {0,false,no,off} (case-insensitive).
+// 1/on/true/yes and 0/off/false/no in any case; any other word reads as on
+// (as it always did), with a WARN.
 bool        EnvBool(const char* name, bool def);
 
 // Log all records at INFO under a `<section>` header (one line per parameter,

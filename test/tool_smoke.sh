@@ -68,8 +68,12 @@ done_line=$(grep -n 'dfkv_server shut down cleanly' "$D/srv.out" | head -1 | cut
   exit 1
 }
 : > "$D/srv2.out"
-env -u DFKV_STORE_ENGINE -u DFKV_SLAB_WRITE -u DFKV_SLAB_WARM_RESTART "$BUILD/dfkv_server" \
-  --dir "$D/cache" --port 0 --cap 1073741824 >>"$D/srv2.out" 2>&1 &
+# This start also carries environment values that are not numbers and the log
+# level as --help spells it: it must come up all the same (checked below).
+env -u DFKV_STORE_ENGINE -u DFKV_SLAB_WRITE -u DFKV_SLAB_WARM_RESTART \
+  DFKV_TCP_MAX_CONNS=-3 DFKV_TCP_IO_TIMEOUT_S=60s DFKV_RAM_RECLAIM_MS=abc \
+  "$BUILD/dfkv_server" \
+  --dir "$D/cache" --port 0 --cap 1073741824 --log WARN >>"$D/srv2.out" 2>&1 &
 PID=$!
 P=""
 for i in $(seq 1 100); do P=$(awk '/PORT/{print $2}' "$D/srv2.out" 2>/dev/null || true); [ -n "$P" ] && break; sleep 0.05; done
@@ -83,6 +87,20 @@ got=$("$BUILD/dfkvctl" --members "n=127.0.0.1:$P" --namespace "dfkv/smoke" get k
   exit 1
 }
 echo "clean-shutdown smoke OK"
+
+# An invalid environment value never stops a start: it is reported once and
+# the default is used. And --log takes the level in upper case.
+grep -q "invalid DFKV_TCP_MAX_CONNS='-3'" "$D/srv2.out" || {
+  echo "no warning for an invalid DFKV_TCP_MAX_CONNS"; cat "$D/srv2.out"; exit 1; }
+grep -q "invalid DFKV_TCP_IO_TIMEOUT_S='60s'" "$D/srv2.out" || {
+  echo "no warning for an invalid DFKV_TCP_IO_TIMEOUT_S"; cat "$D/srv2.out"; exit 1; }
+"$BUILD/dfkvctl" stat "127.0.0.1:$P" | grep -Eq '^dfkv_tcp_max_connections(\{[^}]*\})? 512$' || {
+  echo "an invalid DFKV_TCP_MAX_CONNS did not fall back to the default"
+  "$BUILD/dfkvctl" stat "127.0.0.1:$P" | grep tcp_max || true; exit 1; }
+if grep -q '\[INFO\]' "$D/srv2.out"; then
+  echo "--log WARN still logs INFO lines"; cat "$D/srv2.out"; exit 1
+fi
+echo "invalid-environment smoke OK"
 
 # Strict arg parsing: an unknown flag / bad number / bad --advertise must fail
 # fast (exit 2), not run with silent defaults. (`set -e` is on, so guard the
@@ -105,6 +123,24 @@ rc=0; "$BUILD/dfkv_server" --dir "$D" --port 0 --cap 5 \
   echo "dfkv_server out-of-range MDS registration timeout: expected exit 2, got $rc"
   exit 1
 }
+# A port outside 0..65535 was truncated to 16 bits, a negative capacity
+# wrapped to 2^64-1.
+rc=0; "$BUILD/dfkv_server" --dir "$D" --cap 5 --port 70000 >/dev/null 2>&1 || rc=$?
+[ "$rc" = 2 ] || { echo "dfkv_server --port 70000: expected exit 2, got $rc"; exit 1; }
+rc=0; "$BUILD/dfkv_server" --dir "$D" --cap -1 --port 0 >/dev/null 2>&1 || rc=$?
+[ "$rc" = 2 ] || { echo "dfkv_server --cap -1: expected exit 2, got $rc"; exit 1; }
+rc=0; "$BUILD/dfkv_server" --dir "$D" --cap 5 --port 0 --max-msg -1 >/dev/null 2>&1 || rc=$?
+[ "$rc" = 2 ] || { echo "dfkv_server --max-msg -1: expected exit 2, got $rc"; exit 1; }
+rc=0; "$BUILD/dfkv_mds" --listen 70000 >/dev/null 2>&1 || rc=$?
+[ "$rc" = 2 ] || { echo "dfkv_mds --listen 70000: expected exit 2, got $rc"; exit 1; }
+rc=0; "$BUILD/dfkvctl" --stat-port abc stat --all --mds 127.0.0.1:1 >/dev/null 2>&1 || rc=$?
+[ "$rc" = 2 ] || { echo "dfkvctl --stat-port abc: expected exit 2, got $rc"; exit 1; }
+# --mds without --id/--advertise is refused before any disk is opened.
+mkdir "$D/unopened"
+rc=0; timeout 10s "$BUILD/dfkv_server" --dir "$D/unopened" --cap 1073741824 --port 0 \
+  --mds 127.0.0.1:1 >/dev/null 2>&1 || rc=$?
+[ "$rc" = 1 ] || { echo "dfkv_server --mds without --id: expected exit 1, got $rc"; exit 1; }
+[ ! -e "$D/unopened/slots.tbl" ] || { echo "--mds without --id opened the cache directory"; exit 1; }
 echo "strict-args smoke OK"
 # Invalid slab geometry must refuse startup, and the explicit flag must beat a
 # conflicting file environment. A hidden fallback would run until timeout 124.

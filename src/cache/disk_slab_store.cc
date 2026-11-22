@@ -1,3 +1,4 @@
+#include "utils/env_parse.h"
 #include "cache/disk_slab_store.h"
 
 #include "common/config_dump.h"
@@ -369,22 +370,27 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   // victim and scan work per tick. Pins and durable invalidation gate removal.
   // DFKV_SLAB_EVICT_HIGH_PCT / _LOW_PCT (of capacity); high=0 disables.
   auto env_pct = [](const char* name, unsigned dflt) -> unsigned {
-    const char* v = std::getenv(name);
-    if (!v || !*v) return dflt;
-    long x = std::strtol(v, nullptr, 10);
-    return (x >= 0 && x <= 100) ? static_cast<unsigned>(x) : dflt;
+    envparse::U64Spec spec;
+    spec.fallback = dflt;
+    spec.max = 100;
+    spec.legacy = envparse::Legacy::kPrefixOrZero;
+    spec.representable_max = envparse::kSignedMax;  // read with strtol
+    return static_cast<unsigned>(envparse::EnvU64(name, spec));
   };
   const unsigned high_pct = env_pct("DFKV_SLAB_EVICT_HIGH_PCT", 92);
   unsigned low_pct = env_pct("DFKV_SLAB_EVICT_LOW_PCT", 88);
   if (low_pct >= high_pct && high_pct > 0) low_pct = high_pct - 1;
   evict_high_bytes_ = high_pct ? opt_.capacity_bytes / 100 * high_pct : 0;
   evict_low_bytes_ = opt_.capacity_bytes / 100 * low_pct;
-  if (const char* value =
-          std::getenv("DFKV_SLAB_EVICT_MAX_VICTIMS_PER_TICK")) {
-    char* end = nullptr;
-    const unsigned long parsed = std::strtoul(value, &end, 10);
-    if (end != value && *end == '\0' && parsed > 0 && parsed <= 1024)
-      evict_max_victims_per_tick_ = static_cast<size_t>(parsed);
+  {
+    envparse::U64Spec spec;
+    spec.legacy = envparse::Legacy::kFull;
+    spec.negative = envparse::Negative::kWraps;
+    spec.fallback = evict_max_victims_per_tick_;
+    spec.min = 1;
+    spec.max = 1024;
+    evict_max_victims_per_tick_ = static_cast<size_t>(
+        envparse::EnvU64("DFKV_SLAB_EVICT_MAX_VICTIMS_PER_TICK", spec));
   }
   config_dump::RecordResolved(
       "DFKV_SLAB_EVICT_MAX_VICTIMS_PER_TICK",
@@ -398,12 +404,13 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   {
     auto env_u32 = [](const char* name, uint32_t dflt, uint32_t lo,
                       uint32_t hi) -> uint32_t {
-      const char* v = std::getenv(name);
-      if (!v || !*v) return dflt;
-      char* end = nullptr;
-      const unsigned long x = std::strtoul(v, &end, 10);
-      if (end == v || *end != '\0' || x < lo || x > hi) return dflt;
-      return static_cast<uint32_t>(x);
+      envparse::U64Spec spec;
+      spec.fallback = dflt;
+      spec.min = lo;
+      spec.max = hi;
+      spec.legacy = envparse::Legacy::kFull;
+      spec.negative = envparse::Negative::kWraps;
+      return static_cast<uint32_t>(envparse::EnvU64(name, spec));
     };
     SlabAllocator::RetainOptions ro;
     ro.enabled = env_u32("DFKV_RETAIN_ENABLE", 1, 0, 1) == 1;
@@ -484,8 +491,8 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   // build AND direct mode; DFKV_SLAB_URING_WRITE=0 is the kill switch.
 #ifdef DFKV_WITH_URING
   {
-    const char* v = std::getenv("DFKV_SLAB_URING_WRITE");
-    uring_write_enabled_ = !(v && *v == '0');
+    uring_write_enabled_ = envparse::EnvSwitch(
+        "DFKV_SLAB_URING_WRITE", true, envparse::OffWhen::kStartsWithZero);
     config_dump::RecordResolved("DFKV_SLAB_URING_WRITE",
                                 uring_write_enabled_ ? "on" : "off");
   }

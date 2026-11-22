@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -67,11 +68,28 @@ class Args {
     errno = 0;
     char* end = nullptr;
     long v = std::strtol(it->second.c_str(), &end, 10);
-    if (errno != 0 || end == it->second.c_str() || *end != '\0') {
+    // Out of int range is an error too: the cast below used to wrap, so that
+    // 4294967297 was read as 1.
+    if (errno != 0 || end == it->second.c_str() || *end != '\0' ||
+        v < std::numeric_limits<int>::min() ||
+        v > std::numeric_limits<int>::max()) {
       Fail("invalid integer for " + flag + ": '" + it->second + "'");
       return dflt;
     }
     return static_cast<int>(v);
+  }
+  // A TCP port: 0..65535 (0 = let the system choose, where the caller allows
+  // it). A port outside that range used to be truncated to 16 bits by the
+  // socket call: --port 70000 listened on 4464.
+  int GetPort(const std::string& flag, int dflt) {
+    const int v = GetInt(flag, dflt);
+    // The caller's default (-1 = "off" for the optional listeners) may also be
+    // written out.
+    if (values_.count(flag) && ok_ && v != dflt && (v < 0 || v > 65535)) {
+      Fail("invalid port for " + flag + " (0..65535): '" + values_[flag] + "'");
+      return dflt;
+    }
+    return v;
   }
   uint64_t GetU64(const std::string& flag, uint64_t dflt) {
     auto it = values_.find(flag);
@@ -79,7 +97,9 @@ class Args {
     errno = 0;
     char* end = nullptr;
     unsigned long long v = std::strtoull(it->second.c_str(), &end, 10);
-    if (errno != 0 || end == it->second.c_str() || *end != '\0') {
+    // strtoull accepts a sign and negates: "-1" used to be read as 2^64-1.
+    if (errno != 0 || end == it->second.c_str() || *end != '\0' ||
+        it->second.find('-') != std::string::npos) {
       Fail("invalid number for " + flag + " (expects bytes, decimal): '" +
            it->second + "'");
       return dflt;

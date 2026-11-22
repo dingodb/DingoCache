@@ -16,6 +16,7 @@
 
 #include "common/config_dump.h"
 #include "utils/log.h"
+#include "utils/env_parse.h"
 #include "utils/net_util.h"
 #include "utils/thread_name.h"
 #include "utils/wire_limits.h"
@@ -29,26 +30,12 @@ namespace {
 // strictly: the value decides how much is dropped, and "abc" or "5m" must not
 // quietly become 0 or 5 seconds.
 uint64_t ResolveShutdownDrainTimeoutSeconds() {
-  constexpr uint64_t kDefault = 30;
-  constexpr uint64_t kMax = 3600;
   const char* const name = "DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S";
-  uint64_t seconds = kDefault;
-  const char* value = std::getenv(name);
-  if (value != nullptr && *value != '\0') {
-    errno = 0;
-    char* end = nullptr;
-    const unsigned long long parsed = std::strtoull(value, &end, 10);
-    if (*value < '0' || *value > '9' || *end != '\0') {
-      DFKV_LOG_WARN(std::string("invalid ") + name + "='" + value +
-                    "'; using " + std::to_string(kDefault));
-    } else if (errno == ERANGE || parsed > kMax) {
-      DFKV_LOG_WARN(std::string(name) + " clamped to hard maximum " +
-                    std::to_string(kMax));
-      seconds = kMax;
-    } else {
-      seconds = parsed;
-    }
-  }
+  envparse::U64Spec spec;
+  spec.fallback = 30;
+  spec.max = 3600;
+  spec.above = envparse::Above::kClamp;
+  const uint64_t seconds = envparse::EnvU64(name, spec);
   config_dump::RecordResolved(name, std::to_string(seconds));
   return seconds;
 }
@@ -66,28 +53,13 @@ void KvNodeServer::InitTcpListenerConfig() {
   // first-frame deadline) keep 0 instead of falling back with a warning.
   auto bounded = [](const char* name, uint64_t fallback, uint64_t hard_max,
                     bool allow_zero = false) -> uint64_t {
-    const char* value = std::getenv(name);
-    if (value == nullptr || *value == '\0') return fallback;
-    if (*value < '0' || *value > '9') {
-      DFKV_LOG_WARN(std::string("invalid ") + name + "='" + value +
-                    "'; using " + std::to_string(fallback));
-      return fallback;
-    }
-    errno = 0;
-    char* end = nullptr;
-    const unsigned long long parsed = std::strtoull(value, &end, 10);
-    if (errno != 0 || end == value || *end != '\0' ||
-        (parsed == 0 && !allow_zero)) {
-      DFKV_LOG_WARN(std::string("invalid ") + name + "='" + value +
-                    "'; using " + std::to_string(fallback));
-      return fallback;
-    }
-    if (parsed > hard_max) {
-      DFKV_LOG_WARN(std::string(name) + " clamped to hard maximum " +
-                    std::to_string(hard_max));
-      return hard_max;
-    }
-    return parsed;
+    envparse::U64Spec spec;
+    spec.fallback = fallback;
+    spec.min = allow_zero ? 0 : 1;
+    spec.max = hard_max;
+    spec.above = envparse::Above::kClamp;
+    spec.overflow_is_default = true;
+    return envparse::EnvU64(name, spec);
   };
   tcp_max_connections_ = static_cast<size_t>(
       bounded("DFKV_TCP_MAX_CONNS", kDefaultTcpMaxConnections,
@@ -159,9 +131,14 @@ KvNodeServer::~KvNodeServer() {
 }
 
 void KvNodeServer::InitAdmission() {
-  if (const char* v = std::getenv("DFKV_PUT_INFLIGHT_LIMIT")) {
-    unsigned long long n = std::strtoull(v, nullptr, 10);
-    put_busy_limit_ = static_cast<size_t>(n);
+  {
+    envparse::U64Spec spec;  // 0 = off, also the default
+    spec.above = envparse::Above::kClamp;  // strtoull saturates
+    spec.legacy = envparse::Legacy::kPrefixOrZero;
+    spec.negative = envparse::Negative::kWraps;
+    spec.fallback = put_busy_limit_;
+    put_busy_limit_ = static_cast<size_t>(
+        envparse::EnvU64("DFKV_PUT_INFLIGHT_LIMIT", spec));
   }
   config_dump::RecordResolved("DFKV_PUT_INFLIGHT_LIMIT",
                               std::to_string(put_busy_limit_));
@@ -194,19 +171,64 @@ std::unique_lock<std::mutex> KvNodeServer::LockPutKey(const BlockKey& key) {
   return std::unique_lock<std::mutex>(put_key_mu_[stripe % kPutKeyStripes]);
 }
 
+// DFKV_RAM_RECLAIM_MS: background free-slot reclaimer cadence, ms; 0
+// disables. Read with an unchecked strtoul and stored in 32 bits up to 2.38,
+// which is kept: an empty or non-numeric value is 0 (reclaim off), and a
+// number is cut to its low 32 bits -- so that -1 is 4294967295 and
+// 4294967296 is 0. All of those are reported, with the value really used.
+static uint32_t RamReclaimMsFromEnv(uint32_t fallback) {
+  const char* const name = "DFKV_RAM_RECLAIM_MS";
+  const char* text = std::getenv(name);
+  envparse::U64Spec spec;
+  spec.fallback = fallback;
+  spec.legacy = envparse::Legacy::kPrefixOrZero;
+  spec.negative = envparse::Negative::kWraps;
+  spec.empty_is_zero = true;
+  spec.zero_means = "no background reclaim";
+  std::string warning;
+  const uint64_t read = envparse::ParseU64(name, text, spec, &warning);
+  const uint32_t used = static_cast<uint32_t>(read);
+  if (used != read) {
+    warning = "invalid " + envparse::detail::Quoted(name, text) +
+              ": does not fit 32 bits; using " + std::to_string(used) +
+              " as before" +
+              (used == 0 ? ", which means no background reclaim (write 0 if "
+                           "that is intended)"
+                         : "") +
+              ". A later release will not accept this value.";
+  }
+  envparse::WarnOnce(name, warning);
+  return used;
+}
+
 KvNodeServer::RamTierPlan KvNodeServer::PlanRamTier(size_t disk_count) {
   RamTierPlan plan;
   // Off by default. DFKV_RAM_TIER in {1,on,true,yes} enables the RAM hot tier;
   // DFKV_RAM_TIER_BYTES sizes the pre-registered arena (default 16 GiB).
+  // The words are matched in lower case only, as they always were: a value
+  // in another case used to leave the tier off, and turning a multi-gigabyte
+  // locked arena on at an upgrade could fail a start that works. It still
+  // leaves the tier off, but no longer without saying so.
   const char* e = std::getenv("DFKV_RAM_TIER");
   const std::string v = (e && *e) ? std::string(e) : "";
   plan.enabled = (v == "1" || v == "on" || v == "true" || v == "yes");
+  if (!plan.enabled && !v.empty() && v != "0" && v != "off" && v != "false" &&
+      v != "no")
+    envparse::WarnOnce(
+        "DFKV_RAM_TIER",
+        "invalid DFKV_RAM_TIER='" + v +
+            "': the RAM tier stays off, as before. Only 1, on, true and yes "
+            "in lower case switch it on.");
   config_dump::RecordResolved("DFKV_RAM_TIER", plan.enabled ? "on" : "off");
   if (!plan.enabled) return plan;
   RamTier::Options& o = plan.options;
-  if (const char* b = std::getenv("DFKV_RAM_TIER_BYTES")) {
-    unsigned long long n = std::strtoull(b, nullptr, 10);
-    if (n > 0) o.bytes = n;
+  {
+    envparse::U64Spec spec;
+    spec.negative = envparse::Negative::kWraps;
+    spec.legacy = envparse::Legacy::kPrefixOrZero;
+    spec.fallback = o.bytes;
+    spec.min = 1;
+    o.bytes = envparse::EnvU64("DFKV_RAM_TIER_BYTES", spec);
   }
   // RAM write policy: writeback (default) admits PUT into the arena and flushes
   // asynchronously; writearound writes directly to disk and fills the arena via
@@ -230,13 +252,17 @@ KvNodeServer::RamTierPlan KvNodeServer::PlanRamTier(size_t disk_count) {
   // opened while this tier is built, and a start with fewer does not go on.
   o.flush_threads = static_cast<uint32_t>(
       std::min<size_t>(4 * (disk_count ? disk_count : 1), 16));
-  if (const char* f = std::getenv("DFKV_RAM_FLUSH_THREADS")) {
-    unsigned long long n = std::strtoull(f, nullptr, 10);
-    if (n > 0 && n <= 64) o.flush_threads = static_cast<uint32_t>(n);
+  {
+    envparse::U64Spec spec;
+    spec.negative = envparse::Negative::kWraps;
+    spec.legacy = envparse::Legacy::kPrefixOrZero;
+    spec.fallback = o.flush_threads;
+    spec.min = 1;
+    spec.max = 64;
+    o.flush_threads =
+        static_cast<uint32_t>(envparse::EnvU64("DFKV_RAM_FLUSH_THREADS", spec));
   }
-  // Background free-slot reclaimer cadence (ms; 0 disables). Default 10.
-  if (const char* r = std::getenv("DFKV_RAM_RECLAIM_MS"))
-    o.reclaim_interval_ms = static_cast<uint32_t>(std::strtoul(r, nullptr, 10));
+  o.reclaim_interval_ms = RamReclaimMsFromEnv(o.reclaim_interval_ms);
   const char* ack_env = std::getenv("DFKV_PUT_ACK_MODE");
   const std::string ack = ack_env ? std::string(ack_env) : "";
   if (ack.empty()) {
@@ -248,9 +274,18 @@ KvNodeServer::RamTierPlan KvNodeServer::PlanRamTier(size_t disk_count) {
                   "' not recognized; using RAM-ACK for writeback");
     plan.ack_enabled = plan.write_back;
   }
-  if (const char* p = std::getenv("DFKV_RAM_ACK_HIGH_WATERMARK_PCT")) {
-    const unsigned long n = std::strtoul(p, nullptr, 10);
-    if (n <= 100) o.ack_high_watermark_pct = static_cast<uint32_t>(n);
+  // 0 means "acknowledge from disk". An empty or non-numeric value reads as
+  // 0 and so changes the ACK mode, as it always did; the parser now says so.
+  {
+    envparse::U64Spec spec;
+    spec.negative = envparse::Negative::kWraps;
+    spec.legacy = envparse::Legacy::kPrefixOrZero;
+    spec.empty_is_zero = true;
+    spec.zero_means = "every PUT is acknowledged from disk";
+    spec.fallback = o.ack_high_watermark_pct;
+    spec.max = 100;
+    o.ack_high_watermark_pct = static_cast<uint32_t>(
+        envparse::EnvU64("DFKV_RAM_ACK_HIGH_WATERMARK_PCT", spec));
   }
   config_dump::RecordResolved("DFKV_PUT_ACK_MODE",
                               plan.ack_enabled ? "ram" : "disk");
