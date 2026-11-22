@@ -65,8 +65,9 @@ class _CpuBackend:
     def __init__(self) -> None:
         self.allocations = []
 
-    def allocate(self, shapes, dtypes, fmt=None):
+    def allocate(self, shapes, dtypes, fmt=None, busy_loop=True):
         self.allocations.append((shapes, dtypes, fmt))
+        self.busy_loop = busy_loop
         return _Obj(_nbytes(shapes, dtypes))
 
 
@@ -152,6 +153,23 @@ class MultiGroupChunks(unittest.TestCase):
         obj = _run(connector.get(b"p"))
         self.assertIsNotNone(obj)
         self.assertEqual(obj.valid_bytes, full // TOKENS)
+
+
+class AllocationDoesNotBlockTheLoop(unittest.TestCase):
+    def test_the_arena_is_asked_not_to_busy_loop(self) -> None:
+        # LMCache's allocate retries in time.sleep(0.1) steps by default;
+        # on the event loop that stalls every request. A full arena is a miss.
+        connector = _connector()
+        connector._client.objects[b"k"] = b"x" * FULL
+        _run(connector.get(b"k"))
+        self.assertIs(connector._local_cpu_backend.busy_loop, False)
+
+    def test_a_full_arena_is_a_miss(self) -> None:
+        connector = _connector()
+        connector._local_cpu_backend.allocate = lambda *a, **k: None
+        connector._client.objects[b"k"] = b"x" * FULL
+        self.assertIsNone(_run(connector.get(b"k")))
+        self.assertEqual(_run(connector.batched_get([b"k"])), [None])
 
 
 class UnsupportedConfigurations(unittest.TestCase):

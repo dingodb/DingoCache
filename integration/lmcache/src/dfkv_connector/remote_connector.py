@@ -827,10 +827,15 @@ class DfkvConnector(RemoteConnector):
     def _allocate_chunk(self) -> Optional[MemoryObj]:
         # Every KV layer group's shape: a PUT stores all groups' bytes, so a
         # buffer of group 0 alone is too small for the stored chunk.
+        # busy_loop=False: this runs on LMCache's event loop, where the
+        # default retry loop (time.sleep(0.1) until memory frees) would
+        # stall every other request. A full arena is a miss instead; the
+        # callers handle None as such.
         return self._local_cpu_backend.allocate(
             self.meta_shapes,
             self.meta_dtypes,
             self.meta_fmt,
+            busy_loop=False,
         )
 
     def _batch_slices(self, n: int):

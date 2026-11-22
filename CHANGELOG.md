@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- LMCache connector (in-process): a GET no longer stalls LMCache's event
+  loop when the CPU arena is full. The connector allocated its buffer with
+  LMCache's default `busy_loop=True`, which retries in `time.sleep(0.1)`
+  steps until memory frees: on the event loop that held every other
+  request. It now asks with `busy_loop=False`, and a full arena is a miss
+  (the connector's existing allocation-failure path). In a stand-in
+  benchmark with an arena that frees after one second, the event loop was
+  stalled 975 ms before and 12 ms after.
+
 
 - Server, RAM tier: a PUT of a key whose RAM copy is still there after the
   disk evicted the key now reaches the disk. A value written from RAM stays
