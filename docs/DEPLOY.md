@@ -718,6 +718,8 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 
 #### f. 同主机/会合复本（node dedup，v2.0.0 新生产杠杆）
 
+> 共享同一个 dedup 段（`/dev/shm` 里按 uid 和命名空间区分）的进程必须在同一个 PID 命名空间里（同一个 pod，或 `hostPID`）。判断段的创建者、取数者、发布者和 GPU 注册项是否还活着，用的都是 pid；PID 命名空间不同而共享 `/dev/shm` 的容器会把对方活着的条目当成已死或已换人而收回（dedup 时好时坏，不会返回错的数据）。段的创建者在创建中途被杀时，下一个进程等 1 秒后接手完成（创建者已死，或段还是空的）；更早版本创建、尺寸已定但没写完的段仍按原样放弃（这次进程不走 dedup）。
+
 | env | 默认 | 说明 |
 |---|---|---|
 | `DFKV_CLIENT_NODE_DEDUP` | `off` | 主开关：跨 rank/process 的同主机同 key 请求会合（仅 client 侧；vLLM replicated-MLA 拓扑自动开） |

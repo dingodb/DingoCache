@@ -3,6 +3,30 @@
 ## Unreleased
 
 
+- Client, host and GPU dedup: a process killed while it created the
+  shared segment no longer switches dedup off on the host. The first
+  process creates the segment and sizes it in `/dev/shm` (512 MiB by
+  default on the host path, which takes a while); killed before it
+  finished, it left a segment that every later process waited one second
+  for and then ran without dedup, until the segment was removed by hand.
+  A process now finds the segment unfinished, sees that the process named
+  as its creator has died (or that the segment was never even sized), and
+  finishes it. Two processes of this release starting at the same moment
+  no longer both take themselves for the creator. Laying a segment out a
+  second time, which can still happen with older releases on the host (an
+  older process that starts in the first microseconds of a creation takes
+  itself for the creator too), no longer rewinds the host ring: the
+  second layout used to reset the allocation cursor under processes that
+  were already sharing entries, so that new entries reused the bytes of
+  published ones and a lookup could return another key's data. A segment
+  whose older-release creator died after sizing it does not name its
+  creator and is waited for as before. A process of an older release
+  that starts while a current one is creating the segment (a few
+  milliseconds) runs without dedup for as long as it runs; it does not
+  try again. The processes that share a segment must share a PID
+  namespace (one pod, or `hostPID`), as all of dedup's liveness checks
+  compare pids. Layout and segment names are unchanged.
+
 - Client, host dedup (`DFKV_CLIENT_NODE_DEDUP=1`) and GPU dedup: a shared
   entry that can no longer be copied no longer keeps its key from being
   shared, and fetches whose process died no longer fill up the table. An

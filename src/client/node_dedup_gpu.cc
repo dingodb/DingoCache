@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 
+#include "client/dedup_segment.h"
 #include "client/dedup_token.h"
 #include "utils/log.h"
 #include "utils/env_parse.h"
@@ -115,7 +116,9 @@ struct GpuNodeDedup::Header {
   uint32_t nslots;
   uint64_t arena_bytes;  // configured per-process arena size (must match)
   std::atomic<uint32_t> init_done;
-  uint32_t pad;
+  // pid of the creating process (dedup_segment.h). Padding in older
+  // releases, which leave it 0.
+  std::atomic<uint32_t> creator;
 };
 
 uint64_t GpuNodeDedup::NowMs() {
@@ -180,31 +183,13 @@ std::unique_ptr<GpuNodeDedup> GpuNodeDedup::Open(const Options& opt) {
   if (!cu || !cu->HasCurrentCtx()) return nullptr;
 
   const uint32_t nslots = Pow2AtLeast(opt.slots);
-  const size_t len = sizeof(Header) + sizeof(ProcEntry) * kMaxProcs +
-                     static_cast<size_t>(nslots) * sizeof(Slot);
-  int fd = ::shm_open(opt.name.c_str(), O_RDWR | O_CREAT, 0600);
-  if (fd < 0) return nullptr;
-  struct stat st{};
-  if (::fstat(fd, &st) != 0) { ::close(fd); return nullptr; }
-  const bool creator = (st.st_size == 0);
-  if (creator) {
-    // Small segment (~1-2 MiB: descriptors only, payloads live in GPU
-    // memory), but the eager-backing rule from the host flavor still holds:
-    // ENOSPC here beats a SIGBUS mid-publish.
-    if (::ftruncate(fd, static_cast<off_t>(len)) != 0 ||
-        ::posix_fallocate(fd, 0, static_cast<off_t>(len)) != 0) {
-      ::close(fd);
-      ::shm_unlink(opt.name.c_str());
-      return nullptr;
-    }
-  } else if (static_cast<size_t>(st.st_size) != len) {
-    DFKV_LOG_INFO("gpu-dedup: existing segment layout mismatch, running without");
-    ::close(fd);
-    return nullptr;
-  }
-  void* base = ::mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-  ::close(fd);
-  if (base == MAP_FAILED) return nullptr;
+  const size_t len = SegmentBytes(opt);
+  // Small segment (~1-2 MiB: descriptors only, payloads live in GPU memory),
+  // created and backed as the host flavor's is (dedup_segment.h).
+  bool creator = false;
+  void* base = dedup_segment::Attach(opt.name, SegmentLayout(len), "gpu-dedup",
+                                     &creator);
+  if (!base) return nullptr;
 
   auto d = std::unique_ptr<GpuNodeDedup>(new GpuNodeDedup());
   d->cu_ = cu;
@@ -226,8 +211,6 @@ std::unique_ptr<GpuNodeDedup> GpuNodeDedup::Open(const Options& opt) {
     d->hdr_->magic = kMagic;
     d->hdr_->init_done.store(1, std::memory_order_release);
   } else {
-    for (int spin = 0; spin < 1000 && d->hdr_->init_done.load(std::memory_order_acquire) != 1; ++spin)
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
     if (d->hdr_->magic != kMagic || d->hdr_->nslots != nslots ||
         d->hdr_->arena_bytes != opt.arena_bytes) {
       DFKV_LOG_INFO("gpu-dedup: segment header mismatch, running without");
@@ -279,6 +262,16 @@ std::unique_ptr<GpuNodeDedup> GpuNodeDedup::Open(const Options& opt) {
                 std::to_string(d->reg_[d->self_idx_].device) + ", entry " +
                 std::to_string(d->self_idx_) + ")");
   return d;
+}
+
+size_t GpuNodeDedup::SegmentBytes(const Options& opt) {
+  return sizeof(Header) + sizeof(ProcEntry) * kMaxProcs +
+         static_cast<size_t>(Pow2AtLeast(opt.slots)) * sizeof(Slot);
+}
+
+dedup_segment::Layout GpuNodeDedup::SegmentLayout(size_t len) {
+  return dedup_segment::Layout{len, offsetof(Header, init_done),
+                               offsetof(Header, creator)};
 }
 
 GpuNodeDedup::~GpuNodeDedup() {
