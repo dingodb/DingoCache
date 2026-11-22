@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 2.40.0 — 2026-11-23
+
 
 - vLLM connector, hybrid models (recurrent state or sliding window next to
   full attention): a step that saves no longer waits on the model thread
