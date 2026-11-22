@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -18,6 +19,47 @@
 
 namespace dfkv {
 namespace {
+constexpr size_t kHugePageBytes = 2u << 20;
+
+// Anonymous memory of this process that is backed by transparent huge pages,
+// in bytes; 0 if the kernel does not say.
+uint64_t AnonHugePageBytes() {
+  std::FILE* f = std::fopen("/proc/self/smaps_rollup", "r");
+  if (f == nullptr) return 0;
+  char line[256];
+  unsigned long long kb = 0;
+  while (std::fgets(line, sizeof(line), f) != nullptr) {
+    if (std::sscanf(line, "AnonHugePages: %llu kB", &kb) == 1) break;
+    kb = 0;
+  }
+  std::fclose(f);
+  return kb << 10;
+}
+
+// The bracketed (active) value of a transparent_hugepage sysfs setting, for
+// example "never" out of "always madvise [never]"; empty if it cannot be read.
+std::string ActiveHugePageSetting(const char* path) {
+  std::FILE* f = std::fopen(path, "r");
+  if (f == nullptr) return {};
+  char line[128] = {0};
+  const bool read = std::fgets(line, sizeof(line), f) != nullptr;
+  std::fclose(f);
+  if (!read) return {};
+  const char* open = std::strchr(line, '[');
+  const char* close = open ? std::strchr(open, ']') : nullptr;
+  return close ? std::string(open + 1, close) : std::string();
+}
+
+// The system never gives a 2 MiB huge page: madvise is accepted but there is
+// nothing to measure. The per-size setting (kernels from 6.8) wins over the
+// global one unless it says "inherit". Unknown counts as "may give".
+bool SystemHugePagesNever() {
+  const std::string per_size = ActiveHugePageSetting(
+      "/sys/kernel/mm/transparent_hugepage/hugepages-2048kB/enabled");
+  if (!per_size.empty() && per_size != "inherit") return per_size == "never";
+  return ActiveHugePageSetting(
+             "/sys/kernel/mm/transparent_hugepage/enabled") == "never";
+}
 bool AlignCapacity(size_t len, uint64_t align, uint64_t* out) {
   if (align == 0 || len > UINT64_MAX - (align - 1)) return false;
   uint64_t cap = (static_cast<uint64_t>(len) + align - 1) / align * align;
@@ -129,10 +171,39 @@ RamTier::RamTier(Options opt, FlushFn flush)
     return;
   const size_t arena_size = static_cast<size_t>(arena_bytes_);
   void* p = nullptr;
+  // Transparent huge pages: with 4 KiB pages the kernel hands out about
+  // 4 GiB/s however many threads touch the arena (192 GiB: 39-47 s) and needs
+  // another 13-21 s to get the pages back at exit; with 2 MiB pages the same
+  // arena is resident in seconds and gone in about one. Asked for with
+  // madvise, so it works where the system setting is "madvise" or "always"
+  // and is a no-op where it is "never" or the kernel has no huge page to give
+  // (the fault then falls back to small pages, page by page). An arena
+  // smaller than one huge page does not ask. Not asking does not mean small
+  // pages: under "always" the kernel uses huge pages for the arena anyway.
+  arena_hugepages_requested_ =
+      config_dump::EnvBool("DFKV_RAM_TIER_HUGEPAGES", true) &&
+      arena_size >= kHugePageBytes;
   // 4096-aligned base => slot addresses (offset is a slot_size multiple, itself
-  // a granularity multiple) are O_DIRECT-aligned for the flusher.
-  if (posix_memalign(&p, 4096, arena_size) != 0 || p == nullptr) return;
+  // a granularity multiple) are O_DIRECT-aligned for the flusher. Aligned to
+  // the huge page size when huge pages are wanted, so the first one is whole.
+  if (posix_memalign(&p, arena_hugepages_requested_ ? kHugePageBytes : 4096,
+                     arena_size) != 0 ||
+      p == nullptr)
+    return;
   arena_ = static_cast<char*>(p);
+#ifdef MADV_HUGEPAGE
+  if (arena_hugepages_requested_ &&
+      ::madvise(arena_, arena_size, MADV_HUGEPAGE) != 0) {
+    // A kernel built without transparent huge pages: small pages, as before.
+    const int refused_errno = errno;
+    DFKV_LOG_WARN(std::string("ram tier arena: the kernel refused "
+                              "transparent huge pages (") +
+                  std::strerror(refused_errno) + "); using small pages");
+    arena_hugepages_requested_ = false;
+  }
+#else
+  arena_hugepages_requested_ = false;
+#endif
   // Interleave the fixed-slot arena across NUMA nodes before first touch. A
   // single prefaulting thread would otherwise place every page on its socket,
   // charging remote CPU workers and NIC rails an interconnect hop on every
@@ -170,6 +241,12 @@ RamTier::RamTier(Options opt, FlushFn flush)
                     "memory pressure");
   }
   {
+    // Reading smaps_rollup walks the page tables of everything mapped, which
+    // costs seconds for an arena on small pages: skipped where the answer is
+    // known to be zero.
+    const bool measure_huge =
+        arena_hugepages_requested_ && !SystemHugePagesNever();
+    const uint64_t huge_before = measure_huge ? AnonHugePageBytes() : 0;
     const auto t0 = std::chrono::steady_clock::now();
     const unsigned hw = std::thread::hardware_concurrency();
     const size_t nt =
@@ -182,13 +259,27 @@ RamTier::RamTier(Options opt, FlushFn flush)
       if (off >= arena_size) break;
       const size_t n = std::min(chunk, arena_size - off);
       ws.emplace_back([this, off, n] {
-        std::memset(arena_ + off, 0, n);
+        // One write per small page faults every page, huge or not. The
+        // contents do not matter: nothing reads arena bytes it has not
+        // written. volatile, so the store cannot be turned into "store only
+        // if it differs", which would map the shared zero page and never
+        // allocate.
+        volatile char* const base = arena_ + off;
+        for (size_t at = 0; at < n; at += 4096) base[at] = 0;
       });
     }
     for (auto& worker : ws) worker.join();
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - t0)
                         .count();
+    if (measure_huge) {
+      // What the pre-fault added to the process's huge-page-backed memory.
+      // Nothing else of this size is being touched at this point.
+      const uint64_t huge_after = AnonHugePageBytes();
+      arena_hugepage_bytes_ = std::min<uint64_t>(
+          huge_after > huge_before ? huge_after - huge_before : 0,
+          arena_bytes_);
+    }
     DFKV_LOG_INFO(
         "ram tier arena pre-faulted: " +
         std::to_string(arena_bytes_ >> 20) + " MiB (total budget " +
@@ -199,7 +290,11 @@ RamTier::RamTier(Options opt, FlushFn flush)
         (interleave && nodes > 1
              ? "interleave/" + std::to_string(nodes) + "nodes"
              : "default") +
-        ", locked=" + (arena_locked_ ? "yes" : "no") + ")");
+        ", locked=" + (arena_locked_ ? "yes" : "no") + ", huge pages=" +
+        (arena_hugepages_requested_
+             ? std::to_string(arena_hugepage_bytes_ >> 20) + " MiB"
+             : std::string("not requested")) +
+        ")");
   }
 
   const uint64_t total_extents =

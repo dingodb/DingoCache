@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <condition_variable>
 #include <mutex>
@@ -47,6 +48,7 @@ class RamTierTestPeer {
   static Status Wait(const Completion& completion) {
     return RamTier::WaitPut(completion);
   }
+  static const char* ArenaBase(const RamTier& tier) { return tier.arena_; }
 };
 }  // namespace dfkv
 using dfkv::RamTierTestPeer;
@@ -1164,6 +1166,44 @@ TEST(RamTier, ArenaLockIsBestEffortAndCanBeTurnedOff) {
     EXPECT_TRUE(rt.ok());  // locked where the memlock limit allows, fine if not
   }
   ::unsetenv("DFKV_RAM_TIER_LOCK");
+}
+
+// Huge pages are asked for, never required: the tier comes up with whatever
+// the kernel gives, reports it, and can be told not to ask.
+TEST(RamTier, ArenaHugePagesAreBestEffortAndCanBeTurnedOff) {
+  FlushSink sink;
+  const uint64_t kArena = 8ull << 20;  // four huge pages
+  {
+    ::unsetenv("DFKV_RAM_TIER_HUGEPAGES");
+    RamTier rt(Opts(kArena), sink.fn());
+    ASSERT_TRUE(rt.ok());
+    EXPECT_TRUE(rt.arena_hugepages_requested());
+    EXPECT_LE(rt.arena_hugepage_bytes(), rt.arena_bytes());
+    // The arena starts on a huge page boundary, so none is cut in two.
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(RamTierTestPeer::ArenaBase(rt)) %
+                  (2u << 20),
+              0u);
+    const std::string value(4096, 'h');
+    ASSERT_TRUE(rt.Put(K(1), value.data(), value.size()));
+    RamTier::Hit hit;
+    ASSERT_TRUE(rt.GetPrep(K(1), 0, value.size(), &hit));
+    EXPECT_EQ(std::string(hit.ptr, hit.len), value);
+  }
+  for (const char* off : {"off", "0"}) {
+    ::setenv("DFKV_RAM_TIER_HUGEPAGES", off, 1);
+    RamTier rt(Opts(kArena), sink.fn());
+    EXPECT_TRUE(rt.ok());
+    EXPECT_FALSE(rt.arena_hugepages_requested());
+    EXPECT_EQ(rt.arena_hugepage_bytes(), 0u);
+  }
+  {
+    // Smaller than one huge page: nothing to ask for.
+    ::unsetenv("DFKV_RAM_TIER_HUGEPAGES");
+    RamTier rt(Opts(8 * 4096), sink.fn());
+    EXPECT_TRUE(rt.ok());
+    EXPECT_FALSE(rt.arena_hugepages_requested());
+  }
+  ::unsetenv("DFKV_RAM_TIER_HUGEPAGES");
 }
 
 TEST(RamTier, ShardCountCanExceedLegacyCapOf16) {

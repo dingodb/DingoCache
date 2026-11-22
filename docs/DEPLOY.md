@@ -207,7 +207,7 @@ test -e /etc/dfkv/tenant-quotas ||
 > | READ_COALESCE | 开 | 默认关，经 drop-in 打开（TCP 端共读 convoy） | v2 新增 |
 > | 监听加固 | — | `DFKV_TCP_FIRST_REQ_MS=30000` + `DFKV_METRICS_MAX_CONNS=64` | PR#240 新增 |
 > | slab 驱逐水位 | — | `DFKV_SLAB_EVICT_HIGH_PCT=92` / `LOW_PCT=88` | v2 新增（默认 92/88，显式解释为风控用途） |
-> | systemd Timeout | `TimeoutStartSec=600` / `TimeoutStopSec=600` | 同上 | **大 arena 的预触页在启动时占时间**（实测 192 GiB 约 45–55 秒，启动到就绪共 70–90 秒），systemd 默认 90s 对更大的 arena 不够，要与 arena 大小同步扩大。arena 不再整块注册到各 rail，启动和停止各少一段随 arena 大小和 rail 数增长的时间 |
+> | systemd Timeout | `TimeoutStartSec=600` / `TimeoutStopSec=600` | 同上 | **大 arena 的预触页在启动时占时间**（4K 页时实测 192 GiB 约 39–47 秒，启动到就绪约 54 秒；拿到透明大页时只要几秒，但大页是尽力而为的，超时仍按 4K 页的耗时来定，并留余量），systemd 默认 90s 对更大的 arena 不够，要与 arena 大小同步扩大。arena 不再整块注册到各 rail，启动和停止各少一段随 arena 大小和 rail 数增长的时间 |
 > | OOM | `OOMScoreAdjust=-500` | 保留 | 一致 |
 > | tenant quota | `DFKV_TENANT_QUOTAS_FILE` + default=0 | 保留 | 一致 |
 ```ini
@@ -269,7 +269,8 @@ ExecStart=/usr/local/bin/dfkv_server \
 #Environment=DFKV_READ_COALESCE_TIMEOUT_MS=500
 Restart=on-failure
 RestartSec=2
-# 大 arena RAM tier 启动时要预触页：实测 192 GiB 约 45–55 秒（每 16 GiB 约 4–5 秒）。
+# 大 arena RAM tier 启动时要预触页：4K 页时实测 192 GiB 约 39–47 秒（每 16 GiB 约 4 秒）；
+# 拿到透明大页时只要几秒，但大页拿不拿得到看内存状况，超时按 4K 页的耗时来定。
 # xb01 生产 TimeoutStartSec/TimeoutStopSec=600，90s 默认会 OOM-timeout 掉 dfkv；
 # 配大 arena（≥64 GiB）时必须同步调大。
 TimeoutStartSec=600
@@ -342,9 +343,10 @@ WantedBy=multi-user.target
 >   滴喂的慢连接不再永久占用 handler 槽位（SO_RCVTIMEO 只约束单次 syscall）；
 >   每次读的 per-syscall 预算取 min(base timeout, deadline 剩余）。resolved
 >   值由 `dfkv_tcp_first_req_ms` gauge 上报（见 METRICS.md §3.1）。
-> - RAM 热层 arena 在启动期预触页：**实测 192 GiB 约 45–55 秒（每 16 GiB 约 4–5 秒）**，配更大的 arena 时同步调大 systemd `TimeoutStartSec`（默认 90s）并让就绪探测等待 metrics 端口。
+> - RAM 热层 arena 在启动期预触页：**4K 页时实测 192 GiB 约 39–47 秒（每 16 GiB 约 4 秒）**，拿到透明大页时只要几秒（见下）。大页是尽力而为的，所以 systemd `TimeoutStartSec`（默认 90s）仍按 4K 页的耗时随 arena 调大，并让就绪探测等待 metrics 端口。
 > - arena 在预触页时用 `mlock2(MLOCK_ONFAULT)` 锁在内存里，不会被换出（需要足够的 memlock 上限，样例单元里是 `LimitMEMLOCK=infinity`）。锁不上只打一条 WARN，服务照常运行，这时开了 swap 的主机在内存紧张时可能把 arena 换出。`DFKV_RAM_TIER_LOCK=off` 可以关闭，`dfkv_ram_arena_locked` 指标反映实际有没有锁上。以前这块内存是因为整块注册到各 rail 而被 pin 住的；只走 TCP 的节点以前没有这层保护，现在也会锁。
 > - 停止顺序（收到 SIGTERM 之后）：停 RDMA 和 TCP 请求 → RAM 层积压刷盘（时限 `DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S`，默认 30 秒，超时丢弃剩余）→ 各盘同时同步并写 clean → 最后才释放内存。每一步在日志里有一行 `shutdown: ...` 和耗时（INFO 级别）；看到 `dfkv_server shut down cleanly ... releasing memory` 之后，进程即使在释放大 arena 的那几十秒里被 `TimeoutStopSec` 杀掉，下次启动也是干净启动，缓存保留。以前 clean 标记写在释放内存之后，这段时间被杀会清空全部缓存。
+> - arena 默认申请透明大页。4K 页下内核每秒只能给出约 4 GiB，加线程没有用，退出时归还也慢；2 MiB 页下 192 GiB 的 arena 实测 3.3 秒常驻、约 1 秒归还（4K 页是 39–47 秒和 13–21 秒），从 RAM 层读 1 MiB 对象的吞吐高 30–40%。启动日志 `ram tier arena pre-faulted: ... huge pages=N MiB` 和指标 `dfkv_ram_arena_hugepage_bytes` 给出实际由大页承载的量：系统设置是 `never` 时为 0；空闲内存碎片化时会小于 arena，而且内核在分配时做内存规整，预触页可能比 4K 页还慢（没有实测过这种主机）。遇到这种情况可以设 `DFKV_RAM_TIER_HUGEPAGES=off`：不再申请，页大小回到由系统设置决定（`madvise` 下是 4K 页；`always` 下 arena 本来就在大页上，页大小关不掉，但不申请之后内核在缺页时不再同步做内存规整，指标因为没有测量而读 0）。
 > GPU 节点推荐：保留默认 slab/direct，按节点突发画像启用 RAM tier 并设置总预算。
 ```bash
 systemctl daemon-reload && systemctl enable --now dfkv
@@ -593,6 +595,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `DFKV_RAM_TIER_SHARDS` | `8`, 硬上限 64 | 锁分片 |
 | `DFKV_RAM_TIER_NUMA` | `interleave` | interleave / off |
 | `DFKV_RAM_TIER_LOCK` | `on` | arena 是否锁在内存里（`mlock2`）；锁不上只告警，`dfkv_ram_arena_locked` 反映实际结果 |
+| `DFKV_RAM_TIER_HUGEPAGES` | `on` | arena 是否申请透明大页（`madvise(MADV_HUGEPAGE)`）。系统的 `transparent_hugepage/enabled` 是 `madvise` 或 `always` 时生效，是 `never` 时等于没开；内核给不出大页的部分自动退回 4K 页。设成 `off` 只是不申请，页大小由系统设置决定：`madvise` 下是 4K 页，`always` 下仍然是大页。实际大页承载量看启动日志和 `dfkv_ram_arena_hugepage_bytes` |
 | `DFKV_RAM_FLUSH_THREADS` | `4×盘数`，钳至 shard 上限 16 | flush 线程 |
 | `DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S` | `30`，上限 3600，`0` 表示不等 | 停止时给 RAM 层积压刷盘的时限，从开始停止算起。到时还只在内存里的对象直接丢弃（缓存语义，日志里有数量），然后各盘照常同步并写 clean。要小于 `TimeoutStopSec` 减去停请求和各盘同步的时间；默认值按 systemd 默认的 90 秒停止超时取的，`TimeoutStopSec` 调大了就一起调大。非法值（非数字、带单位）告警后用默认值 |
 

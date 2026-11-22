@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Server: the RAM tier arena asks for transparent huge pages
+  (`madvise(MADV_HUGEPAGE)`, effective where the system setting is `madvise`
+  or `always`). With 4 KiB pages the kernel hands out about 4 GiB/s no matter
+  how many threads touch the arena, and taking the pages back at exit is slow
+  as well. Measured with 192 GiB: resident in 3.3 s instead of
+  39-47 s, released in about 1 s instead of 13-21 s; more threads, batched
+  population and parallel release did not help with small pages. On a serving
+  node the stop went from 27 s to 5-6 s. Reads from the RAM tier got faster as
+  well: GET of 1 MiB objects by 30-40 %, of 2.74 MiB objects by 5-20 %; PUT
+  and 64 KiB objects did not change. The startup log line and the new gauge
+  `dfkv_ram_arena_hugepage_bytes` say how much of the arena huge pages
+  actually back: the kernel falls back to small pages where it has none to
+  give, and on a host with fragmented free memory it compacts memory while the
+  arena is pre-faulted, which can take longer than small pages did (not
+  measured; size the start timeout for at least the small-page time, with
+  margin). `DFKV_RAM_TIER_HUGEPAGES=off` does not ask; the system setting then
+  decides, as before this change (with `always` the arena is on huge pages
+  either way, and the gauge reads 0 because nothing is measured). The
+  pre-fault now writes one byte per page instead of the whole arena.
 - MDS: a member list that has lost members because etcd stopped taking writes
   is no longer handed out. Once its space quota is exhausted etcd refuses
   writes and lease grants but still answers reads and keeps expiring leases.
