@@ -305,6 +305,12 @@ class StoreEngine {
   // A node must refuse readiness when any configured engine is unhealthy.
   virtual bool Healthy() const = 0;
   virtual const std::string& StartupError() const = 0;
+  // Brings everything the engine holds to disk and records a clean shutdown,
+  // without releasing the object. Same precondition as destruction: no call
+  // is in flight and none follows, except the destructor (which calls it
+  // itself if nobody did). Idempotent. Returns false if the engine could not
+  // record a clean shutdown; the next start then treats it as unclean.
+  virtual bool Close() { return true; }
 
   virtual Status Cache(const BlockKey& key, const void* data, size_t len) = 0;
   virtual Status CacheDirect(const BlockKey& key, char* data, size_t len,

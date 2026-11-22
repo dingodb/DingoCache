@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <charconv>
+#include <chrono>
 #include <memory>
 #include <vector>
 
@@ -634,12 +635,37 @@ int main(int argc, char** argv) {
   } else {
     DFKV_LOG_INFO("dfkv_server shutting down");
   }
+  // Order: stop everything that calls into the store, get the disks clean,
+  // and only then release memory. Releasing a large RAM tier takes tens of
+  // seconds; a stop that is killed during that must not cost the cache.
+  const auto stop_started = std::chrono::steady_clock::now();
+  auto stop_seconds = [stop_started] {
+    char text[32];
+    std::snprintf(text, sizeof(text), "%.2f s",
+                  std::chrono::duration<double>(
+                      std::chrono::steady_clock::now() - stop_started).count());
+    return std::string(text);
+  };
   if (mhttp) mhttp->Stop();
   registrar_metrics->store(nullptr, std::memory_order_release);
   if (registrar) registrar->Stop();
 #ifdef DFKV_WITH_RDMA
+  if (rsrv) {
+    rsrv->Quiesce();
+    DFKV_LOG_INFO("shutdown: RDMA requests stopped " + stop_seconds() +
+                  " after the signal");
+  }
+#endif
+  if (srv.Shutdown()) {
+    DFKV_LOG_INFO("dfkv_server shut down cleanly " + stop_seconds() +
+                  " after the signal; releasing memory");
+  } else {
+    DFKV_LOG_WARN("dfkv_server stopped " + stop_seconds() +
+                  " after the signal, but not every disk is clean; "
+                  "releasing memory");
+  }
+#ifdef DFKV_WITH_RDMA
   if (rsrv) rsrv->Stop();
 #endif
-  srv.Stop();
   return registration_timed_out ? 1 : 0;
 }

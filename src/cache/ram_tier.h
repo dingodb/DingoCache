@@ -164,7 +164,17 @@ class RamTier {
   };
 
   RamTier(Options opt, FlushFn flush);
-  ~RamTier();                // stops the flushers, joins
+  ~RamTier();                // StopBackground(false), then frees the arena
+  // Stops the reclaim and flush threads and keeps the arena. Without
+  // `abandon_backlog` the flushers first write out everything that is queued,
+  // however long that takes; with it they finish the batch in hand and leave
+  // the rest dirty in RAM, to be discarded with the tier. Precondition, as for
+  // destruction: no request is in flight. Idempotent.
+  void StopBackground(bool abandon_backlog);
+  // The flushers have been told to stop (test/diagnostic).
+  bool background_stopping() const {
+    return background_stopping_.load(std::memory_order_acquire);
+  }
 
   RamTier(const RamTier&) = delete;
   RamTier& operator=(const RamTier&) = delete;
@@ -335,6 +345,7 @@ class RamTier {
     size_t flush_inflight = 0;
     std::condition_variable cv;
     bool stop = false;
+    bool abandon = false;  // with stop: leave the queue instead of draining it
     std::vector<uint64_t> reclaim_last_puts;  // reclaim-thread-local snapshot
   };
 
@@ -411,6 +422,7 @@ class RamTier {
   std::atomic<uint64_t> ram_acks_{0}, ack_backpressure_{0};
   std::atomic<uint64_t> post_ack_flush_failures_{0};
   std::atomic<uint64_t> shutdown_drain_timeouts_{0};
+  std::atomic<bool> background_stopping_{false};
   LatencyHist ack_to_durable_latency_;
 };
 

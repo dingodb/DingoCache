@@ -859,6 +859,59 @@ TEST_F(DiskSlabTest, DirtyEpochColdResetsAfterProcessCrash) {
   EXPECT_EQ(out, survivor);
 }
 
+// Close() is the destructor's work without the destructor: once it has
+// returned, the process may die in any way and the next start is a clean one.
+// (A server calls it before it releases a RAM tier that takes tens of seconds
+// to unmap; a stop timeout that fires meanwhile must not cost the cache.)
+TEST_F(DiskSlabTest, CloseMakesTheStoreCleanBeforeItIsDestroyed) {
+  auto options = Opts(1 << 20, 1 << 20, 4096);
+  const std::string value(4096, 'k');
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    bool ok = false;
+    DiskSlabStore store(options, &ok);
+    const bool closed =
+        ok &&
+        store.Cache(K(72), value.data(), value.size()) == Status::kOk &&
+        store.Close() &&
+        store.Close();  // idempotent, same answer
+    ::_exit(closed ? 0 : 1);  // no destructor: the process is killed here
+  }
+  int child_status = 0;
+  ASSERT_EQ(::waitpid(child, &child_status, 0), child);
+  ASSERT_TRUE(WIFEXITED(child_status));
+  ASSERT_EQ(WEXITSTATUS(child_status), 0);
+
+  bool ok = false;
+  DiskSlabStore reopened(options, &ok);  // warm restart is off by default
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(reopened.GetStats().unclean_resets, 0u);
+  EXPECT_EQ(reopened.Count(), 1u);
+  std::string out;
+  ASSERT_EQ(reopened.Range(K(72), 0, value.size(), &out), Status::kOk);
+  EXPECT_EQ(out, value);
+}
+
+TEST_F(DiskSlabTest, DestructionAfterCloseLeavesTheStoreClean) {
+  auto options = Opts(1 << 20, 1 << 20, 4096);
+  const std::string value(4096, 'm');
+  {
+    bool ok = false;
+    DiskSlabStore store(options, &ok);
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(store.Cache(K(73), value.data(), value.size()), Status::kOk);
+    EXPECT_TRUE(store.Close());
+  }
+  bool ok = false;
+  DiskSlabStore reopened(options, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(reopened.GetStats().unclean_resets, 0u);
+  std::string out;
+  ASSERT_EQ(reopened.Range(K(73), 0, value.size(), &out), Status::kOk);
+  EXPECT_EQ(out, value);
+}
+
 // ---- Unclean exit within the same boot: the table may be kept -------------
 //
 // The crashing process is a forked child that leaves through _exit, i.e.
@@ -2246,6 +2299,19 @@ TEST_F(DiskSlabTest, CleanEpochWriteFailureLeavesStoreFailed) {
   EXPECT_FALSE(dfkv::DiskSlabStoreTestPeer::MarkCleanNow(&store));
   EXPECT_FALSE(store.Healthy());
   EXPECT_EQ(store.GetStats().metadata_io_errors, 1u);
+}
+
+TEST_F(DiskSlabTest, CloseReportsAStoreThatCouldNotBeMarkedClean) {
+  auto options = Opts(1 << 20, 1 << 20, 4096);
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  bool ok = false;
+  DiskSlabStore store(options, &ok);
+  ASSERT_TRUE(ok);
+  dfkv::DiskSlabStoreTestPeer::BreakStateFd(&store);
+  EXPECT_FALSE(store.Close());
+  EXPECT_FALSE(store.Close());  // the answer does not change
+  EXPECT_FALSE(store.Healthy());
 }
 
 // A whole extent stolen to a new class must durably wipe its prior slot-grid

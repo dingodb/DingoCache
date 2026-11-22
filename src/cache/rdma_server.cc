@@ -420,6 +420,11 @@ Status RdmaServer::Start(int port) {
 }
 
 void RdmaServer::Stop() {
+  Quiesce();
+  anchors_.clear();  // drop the lifetime device refs (frees pool MRs last)
+}
+
+void RdmaServer::Quiesce() {
   if (!running_.exchange(false)) return;
   recv_trim_cv_.notify_all();
   if (listen_fd_ >= 0) ::shutdown(listen_fd_, SHUT_RDWR);  // wake accept()
@@ -435,7 +440,6 @@ void RdmaServer::Stop() {
     conns.swap(conns_);
   }
   for (auto& c : conns) if (c.th.joinable()) c.th.join();
-  anchors_.clear();  // drop the lifetime device refs (frees pool MRs last)
 }
 
 // Join and drop any Serve threads that have already finished. Called from

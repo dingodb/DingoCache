@@ -92,6 +92,11 @@ class RdmaServer {
 
   Status Start(int port);  // TCP bootstrap port
   void Stop();
+  // First half of Stop(): stops accepting and joins every connection thread,
+  // so no handler runs once it returns. The rails and their receive-pool
+  // registrations stay until Stop(); a server that is shutting down gets its
+  // disks clean in between.
+  void Quiesce();
   int port() const { return port_; }
   // Explicit-mode failures retain the complete requested order; diagnostic
   // probe evidence never replaces this with a partially discovered topology.
