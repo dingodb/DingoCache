@@ -486,6 +486,70 @@ class DeviceDirectState(unittest.TestCase):
         self.assertFalse(st._device_direct_active())
 
 
+class ExistsV2Window(unittest.TestCase):
+    """batch_exists_v2 reports a prefix every pool can serve. Each side
+    pool's boundary used to be taken on its own and the minimum returned,
+    which can be a length where a TRAILING_PAGES window is incomplete."""
+
+    PAGES = [f"p{i}" for i in range(10)]
+
+    def _plugin(self, present):
+        st = _plugin(_pool_component_names={"swa": ("all",), "dsa": ("all",)},
+                     _pool_replicated={"swa": False, "dsa": False},
+                     _metrics=types.SimpleNamespace(
+                         on_exists_v2=lambda **k: None,
+                         on_exists=lambda **k: None))
+        st._batch_exist_flat = lambda sks: [present(sk) for sk in sks]
+        return st
+
+    def _present(self, dsa_missing, swa_pages):
+        def present(sk):
+            for i, page in enumerate(self.PAGES):
+                if page.encode() not in sk:
+                    continue
+                if b"dsa" in sk:
+                    return i not in dsa_missing
+                if b"swa" in sk:
+                    return i in swa_pages
+                return True     # primary KV
+            raise AssertionError(sk)
+        return present
+
+    def _transfers(self):
+        from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy
+        return [PoolTransfer("dsa", keys=self.PAGES),
+                PoolTransfer("swa", keys=self.PAGES[-1:],
+                             hit_policy=PoolHitPolicy.TRAILING_PAGES)]
+
+    def test_prefix_satisfies_the_trailing_window(self):
+        # dsa page 7 evicted: prefixes 1..6 complete. The swa state exists
+        # only at pages 4 and 10. 6 has no window; 4 is the longest usable.
+        st = self._plugin(self._present(dsa_missing={6}, swa_pages={3, 9}))
+        res = st.batch_exists_v2(self.PAGES, self._transfers())
+        self.assertEqual(res.kv_hit_pages, 4)
+
+    def test_no_common_prefix_is_a_miss(self):
+        st = self._plugin(self._present(dsa_missing={6}, swa_pages={9}))
+        self.assertEqual(
+            st.batch_exists_v2(self.PAGES, self._transfers()).kv_hit_pages, 0)
+
+    def test_restorable_lengths_are_reported_when_sglang_has_the_field(self):
+        import dataclasses
+
+        @dataclasses.dataclass
+        class WithRestorable:
+            kv_hit_pages: int
+            extra_pool_hit_pages: dict
+            restorable_prefix_pages: list = None
+
+        import sglang.srt.mem_cache.hicache_storage as hs
+        st = self._plugin(self._present(dsa_missing=set(), swa_pages={3, 9}))
+        with unittest.mock.patch.object(hs, "PoolTransferResult", WithRestorable):
+            res = st.batch_exists_v2(self.PAGES, self._transfers())
+        self.assertEqual(res.kv_hit_pages, 10)
+        self.assertEqual(res.restorable_prefix_pages, [4, 10])
+
+
 class _RecordingMetrics:
     """Collects the v2 metric calls with their arguments."""
 
