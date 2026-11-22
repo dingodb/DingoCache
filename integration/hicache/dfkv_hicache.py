@@ -492,6 +492,11 @@ _MARKER_BUF = ctypes.create_string_buffer(1)
 _MARKER_PTR = ctypes.addressof(_MARKER_BUF)
 
 
+# What one _v2_io() transfer did: bytes moved, seconds in native I/O, and the
+# names of the pools that did I/O (a skipped replicated pool is not among them).
+_V2Io = collections.namedtuple("_V2Io", ("nbytes", "seconds", "pools"))
+
+
 def _meta_has_no_layout(meta) -> bool:
     """True when get_page_buffer_meta() explicitly declares "no physical layout".
 
@@ -780,12 +785,6 @@ class DfkvHiCache(HiCacheStorage):
                 cfg.get("backup_exist_gate",
                         os.environ.get("DFKV_BACKUP_EXIST_GATE", "1")))
             self._put_retry_recovered = 0  # last _put_flat's retry recoveries
-            # last _v2_io()'s transferred bytes + I/O seconds, read by
-            # batch_set_v2/batch_get_v2 to feed the v2 metrics (mirrors the
-            # _put_retry_recovered instance-state handoff pattern).
-            self._v2_io_bytes = 0
-            self._v2_io_seconds = 0.0
-            self._v2_io_pools = ()  # pool names that actually did I/O last _v2_io()
             # self._lib was loaded above (before configure) so the native version
             # could be reported; dfkv_open uses that same handle here.
             # Namespace aliases are not configurable: this binary identity is
@@ -2198,6 +2197,13 @@ class DfkvHiCache(HiCacheStorage):
         return present
 
     def _v2_io(self, transfers, putting):
+        """One host-buffer v2 transfer: (per-pool page results, _V2Io).
+
+        The I/O volume is returned, never left on the instance: SGLang runs
+        backup (set) and prefetch (get) on different threads, and a set that
+        read the instance after a concurrent get had finished took the get's
+        bytes, seconds and pool names for its own.
+        """
         results = {}
         segments = []
         sks, sp, ss = [], [], []
@@ -2261,39 +2267,38 @@ class DfkvHiCache(HiCacheStorage):
             flat = [out[i] == 1 for i in range(len(sks))]
         else:
             flat = []
-        # Expose the actual I/O cost/volume for the v2 metrics (the caller reads
-        # these). ss covers only pools that did I/O (MLA backup_skip pools were
-        # `continue`d before appending), so bytes are 0 on a pure skip.
-        self._v2_io_bytes = sum(ss)
-        self._v2_io_seconds = time.perf_counter() - t0
-        self._v2_io_pools = tuple(seg[0] for seg in segments)
+        # The actual I/O cost/volume for the v2 metrics. ss covers only pools
+        # that did I/O (MLA backup_skip pools were `continue`d before
+        # appending), so bytes are 0 on a pure skip.
+        io = _V2Io(nbytes=sum(ss), seconds=time.perf_counter() - t0,
+                   pools=tuple(seg[0] for seg in segments))
         for name, nkeys, sub, start, end in segments:
             results[name] = self._fold(flat[start:end], nkeys, sub)
-        return results
+        return results, io
 
     def batch_set_v2(self, transfers, extra_info=None) -> dict:
         nkeys = sum(len(tr.keys or []) for tr in (transfers or []))
         with _tracing.span("batch_set_v2", nkeys) as _sp, \
                 access_log("batch_set_v2",
                            lambda: f"{self._alog_tag} {_fmt_pools(transfers)}") as r:
-            res = self._v2_io(transfers, putting=True)
+            res, io = self._v2_io(transfers, putting=True)
             r.result = _fmt_pool_results(res)
             if self._put_retry_recovered:
                 r.result += f" retry_ok={self._put_retry_recovered}"
             if _sp:
                 _sp.hits = sum(sum(rs) for rs in res.values())
             # Pool-granular metrics: report exactly the pools that performed I/O
-            # (_v2_io_pools). The MLA rank!=0 replicated latent stays a no-op skip
+            # (io.pools). The MLA rank!=0 replicated latent stays a no-op skip
             # ([True] markers, excluded), but rank-sharded sidecars such as
             # Kimi-K3's mamba/KDA state do real writes on follower ranks — a
             # whole-call tp_rank gate here would hide that write bandwidth
             # entirely from the v2 set metrics.
-            io_pages = sum(len(res[name]) for name in self._v2_io_pools)
+            io_pages = sum(len(res[name]) for name in io.pools)
             if io_pages:
                 self._metrics.on_set_v2(
                     pages=io_pages,
-                    ok_pages=sum(sum(res[name]) for name in self._v2_io_pools),
-                    nbytes=self._v2_io_bytes, seconds=self._v2_io_seconds)
+                    ok_pages=sum(sum(res[name]) for name in io.pools),
+                    nbytes=io.nbytes, seconds=io.seconds)
             return res
 
     def batch_get_v2(self, transfers, extra_info=None) -> dict:
@@ -2301,7 +2306,7 @@ class DfkvHiCache(HiCacheStorage):
         with _tracing.span("batch_get_v2", nkeys) as _sp, \
                 access_log("batch_get_v2",
                            lambda: f"{self._alog_tag} {_fmt_pools(transfers)}") as r:
-            res = self._v2_io(transfers, putting=False)
+            res, io = self._v2_io(transfers, putting=False)
             r.result = _fmt_pool_results(res)
             if _sp:
                 _sp.hits = sum(sum(rs) for rs in res.values())
@@ -2309,7 +2314,7 @@ class DfkvHiCache(HiCacheStorage):
                 self._metrics.on_get_v2(
                     pages=sum(len(rs) for rs in res.values()),
                     hit_pages=sum(sum(rs) for rs in res.values()),
-                    nbytes=self._v2_io_bytes, seconds=self._v2_io_seconds)
+                    nbytes=io.nbytes, seconds=io.seconds)
             return res
 
     # --- DSA L2-bypass: main KV device-direct + sidecar host, one logical op ----
@@ -2605,7 +2610,7 @@ class DfkvHiCache(HiCacheStorage):
                 side_pages += len(res); side_ok += sum(res)
                 side_bytes += nb; side_secs += secs
             if host_side:
-                side = self._v2_io(host_side, putting=True)
+                side, _io = self._v2_io(host_side, putting=True)
                 results.update(side)
                 side_pages += sum(len(rs) for rs in side.values())
                 side_ok += sum(sum(rs) for rs in side.values())
@@ -2656,11 +2661,11 @@ class DfkvHiCache(HiCacheStorage):
                 side_pages += len(res); side_hit += sum(res)
                 side_bytes += nb; side_secs += secs
             if host_side:
-                side = self._v2_io(host_side, putting=False)
+                side, io = self._v2_io(host_side, putting=False)
                 results.update(side)
                 side_pages += sum(len(rs) for rs in side.values())
                 side_hit += sum(sum(rs) for rs in side.values())
-                side_bytes += self._v2_io_bytes; side_secs += self._v2_io_seconds
+                side_bytes += io.nbytes; side_secs += io.seconds
             if side_pages:
                 self._metrics.on_get_v2(
                     pages=side_pages, hit_pages=side_hit,

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- SGLang HiCache connector: a v2 backup and a v2 prefetch that run at the same
+  time no longer take each other's result. The pool-aware transfer
+  (`batch_set_v2`, `batch_get_v2`, and the host side pools of the `_device`
+  variants) handed its byte count, I/O time and the names of the pools it
+  touched to its caller through attributes of the storage object. SGLang backs
+  up and prefetches on different threads, so a set that had finished its
+  transfer could read what a concurrent get had just left there: its metrics
+  counted the get's bytes, and when the two calls carried different pools the
+  set failed with a `KeyError` and the backup was lost. The transfer now
+  returns these values.
 - SGLang HiCache connector, device-direct (L2-bypass): the host read no
   longer reports pages as retrieved that are not in the store, and the key
   form no longer follows from a device pool merely being registered.
