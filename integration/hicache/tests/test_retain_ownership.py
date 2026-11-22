@@ -317,6 +317,58 @@ class BatchTouch(unittest.TestCase):
         self.assertEqual(keys, b._retain_object_keys(PAGES))
 
 
+class RetainResultsAreCounted(unittest.TestCase):
+    """A retention SET's per-key results were only logged at debug level:
+    a denied, failed or unsupported retention went unnoticed."""
+
+    def _run(self, codes):
+        b = _backend()
+        b._has_retain = True
+        b._metrics = H._Metrics(0)
+        with _Cabi() as c:
+            H.dfkv_cabi.call_batch_retain = (
+                lambda lib, h, keys, ttl, mode, **k: list(codes))
+            b._retain_set([b"k%d" % i for i in range(len(codes))], 3600)
+        return b._metrics.snapshot()
+
+    def test_results_by_code(self):
+        R = H.dfkv_cabi
+        snap = self._run([R.DFKV_RET_PROTECTED_NEW, R.DFKV_RET_REFRESHED,
+                          R.DFKV_RET_MISS, R.DFKV_RET_HIT_UNPROTECTED,
+                          R.DFKV_RET_DENIED, R.DFKV_RET_UNSUPPORTED,
+                          R.DFKV_RET_ERROR])
+        self.assertEqual(
+            {k: v for k, v in snap.items() if k.startswith("retain_")},
+            {"retain_protected_keys": 2, "retain_miss_keys": 1,
+             "retain_unprotected_keys": 1, "retain_denied_keys": 1,
+             "retain_unsupported_keys": 1, "retain_error_keys": 1})
+
+    def test_a_retention_not_had_is_warned(self):
+        R = H.dfkv_cabi
+        with self.assertLogs(H._log, "WARNING") as logs:
+            self._run([R.DFKV_RET_PROTECTED_NEW, R.DFKV_RET_DENIED])
+        self.assertIn("1/2 keys not protected", logs.output[0])
+
+    def test_protected_or_parked_is_not_warned(self):
+        R = H.dfkv_cabi
+        with self.assertNoLogs(H._log, "WARNING"):
+            self._run([R.DFKV_RET_PROTECTED_NEW, R.DFKV_RET_MISS])
+
+    def test_a_native_failure_counts_every_key_as_error(self):
+        b = _backend()
+        b._has_retain = True
+        b._metrics = H._Metrics(0)
+
+        def boom(*a, **k):
+            raise RuntimeError("down")
+
+        with _Cabi():
+            H.dfkv_cabi.call_batch_retain = boom
+            with self.assertLogs(H._log, "WARNING"):
+                b._retain_set([b"a", b"b"], 60)
+        self.assertEqual(b._metrics.snapshot()["retain_error_keys"], 2)
+
+
 class AnchorMarkerRetention(unittest.TestCase):
     """A touch before the logical-anchor marker exists parks its TTL; the
     marker's write must apply it, as every other write does. It was applied

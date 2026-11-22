@@ -25,7 +25,8 @@ namespace dfkv {
 
 class OpMetrics {
  public:
-  enum Op { kPut = 0, kGet = 1, kExist = 2, kRemove = 3, kNumOps = 4 };
+  enum Op { kPut = 0, kGet = 1, kExist = 2, kRemove = 3, kRetain = 4,
+            kNumOps = 5 };
 
   void Record(Op op, uint64_t keys, uint64_t hits, uint64_t bytes,
               double seconds) {
@@ -61,14 +62,15 @@ class OpMetrics {
   Scope Begin(Op op) { return Scope(this, op); }
 
   std::string Render() const {
-    static const char* kName[kNumOps] = {"put", "get", "exist", "remove"};
+    static const char* kName[kNumOps] = {"put", "get", "exist", "remove",
+                                          "retain"};
     std::string s;
     Counter(s, "dfkv_client_op_requests_total", "client ops issued, by op",
             [](const M& m) { return m.requests.load(std::memory_order_relaxed); });
     Counter(s, "dfkv_client_op_keys_total", "keys submitted, by op",
             [](const M& m) { return m.keys.load(std::memory_order_relaxed); });
     Counter(s, "dfkv_client_op_hits_total",
-            "keys confirmed (put/remove) / hit (get) / present (exist), by op",
+            "keys confirmed (put/remove) / hit (get) / present (exist, retain), by op",
             [](const M& m) { return m.hits.load(std::memory_order_relaxed); });
     Counter(s, "dfkv_client_op_bytes_total", "bytes moved, by op",
             [](const M& m) { return m.bytes.load(std::memory_order_relaxed); });
@@ -94,7 +96,8 @@ class OpMetrics {
   template <class Pick>
   void Counter(std::string& s, const char* name, const char* help,
                Pick pick) const {
-    static const char* kName[kNumOps] = {"put", "get", "exist", "remove"};
+    static const char* kName[kNumOps] = {"put", "get", "exist", "remove",
+                                          "retain"};
     s += "# HELP "; s += name; s += " "; s += help; s += "\n";
     s += "# TYPE "; s += name; s += " counter\n";
     for (int o = 0; o < kNumOps; ++o)

@@ -342,6 +342,19 @@ TEST_F(KVClientTest, RetainSetRefreshLimitsAndPrecheck) {
   const std::string metrics = nodes_[0]->srv->MetricsText();
   EXPECT_NE(metrics.find("dfkv_retained_slots 2"), std::string::npos);
   EXPECT_NE(metrics.find("dfkv_retain_enabled 1"), std::string::npos);
+  // Each BatchRetain is one op: the REFRESH without a TTL is an existence
+  // probe (2 of 3 present), the SET and the hinted REFRESH are retain ops.
+  const std::string ops = c.MetricsSnapshot();
+  EXPECT_NE(ops.find("dfkv_client_op_requests_total{op=\"exist\"} 1\n"),
+            std::string::npos) << ops;
+  EXPECT_NE(ops.find("dfkv_client_op_keys_total{op=\"exist\"} 3\n"),
+            std::string::npos) << ops;
+  EXPECT_NE(ops.find("dfkv_client_op_hits_total{op=\"exist\"} 2\n"),
+            std::string::npos) << ops;
+  EXPECT_NE(ops.find("dfkv_client_op_requests_total{op=\"retain\"} 2\n"),
+            std::string::npos) << ops;
+  EXPECT_NE(ops.find("dfkv_client_op_hits_total{op=\"retain\"} 4\n"),
+            std::string::npos) << ops;
 }
 
 // A node without retention answers kRetain like an unknown op: REFRESH falls
