@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Server: once its disks are clean, a stopping `dfkv_server` exits instead of
+  running destructors. What was left after the clean marker was only giving
+  memory back, and most of that time went into freeing the disk indexes one
+  heap node per cached object: about 4 s of a 5 s stop with 13 million
+  objects. The kernel releases the same memory when the process ends. On a
+  serving node the stop went from 5.2-7.5 s to 1.6-1.7 s. Sanitizer builds
+  still return from `main` and run the destructors.
 - Observability: a failed RDMA work completion can now be attributed to a
   peer, a local device and a completion status on both sides. Until now the
   client logged nothing for it and counted it only in the process-wide

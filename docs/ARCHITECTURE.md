@@ -295,7 +295,9 @@ size-class lattice and carves them into uniform slots:
   receive-pool registrations and the RAM tier arena are released only after
   that (per-connection queue pairs and registrations go earlier, with their
   connections), so a stop that is killed while unmapping a large arena still
-  finds a clean cache at the next start. The drain limit counts from the
+  finds a clean cache at the next start. `dfkv_server` then exits without
+  running destructors: the kernel gives the memory back faster than freeing
+  the per-object index nodes one by one (sanitizer builds excepted). The drain limit counts from the
   start of the stop; stopping the request paths can itself wait for PUTs that
   are parked until their value is on disk, and that wait has no limit of its
   own yet.

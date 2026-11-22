@@ -4,6 +4,7 @@
  *   --cap is the TOTAL capacity, split evenly across the disks.
  * Prints "PORT <port>" on stdout once listening, then runs until SIGTERM/SIGINT. */
 #include <csignal>
+#include <unistd.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -32,6 +33,20 @@
 
 using dfkv::KvNodeServer;
 using dfkv::Status;
+
+// Sanitizers report at normal process exit (leaks, exit codes); with one of
+// them compiled in, main returns and the destructors run.
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define DFKV_EXIT_RUNS_DESTRUCTORS 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || \
+    __has_feature(memory_sanitizer)
+#define DFKV_EXIT_RUNS_DESTRUCTORS 1
+#endif
+#endif
+#ifndef DFKV_EXIT_RUNS_DESTRUCTORS
+#define DFKV_EXIT_RUNS_DESTRUCTORS 0
+#endif
 
 static volatile sig_atomic_t g_stop = 0;
 static void OnSig(int) { g_stop = 1; }
@@ -657,6 +672,7 @@ int main(int argc, char** argv) {
     DFKV_LOG_INFO("shutdown: RDMA requests stopped after " + stop_seconds());
   }
 #endif
+  const int exit_code = registration_timed_out ? 1 : 0;
   if (srv.Shutdown(stop_started)) {
     DFKV_LOG_INFO("dfkv_server shut down cleanly in " + stop_seconds() +
                   "; releasing memory");
@@ -664,8 +680,21 @@ int main(int argc, char** argv) {
     DFKV_LOG_WARN("dfkv_server stopped in " + stop_seconds() +
                   ", but not every disk is clean; releasing memory");
   }
+#if !DFKV_EXIT_RUNS_DESTRUCTORS
+  // Everything that has to outlive the process is on disk now, and every
+  // thread that touches the store has been joined. What is left is giving
+  // memory back: one heap node per cached object in every disk's index, the
+  // RAM tier arena, the RDMA registrations. The kernel does that in one go
+  // when the process ends; walking the indexes object by object in destructors
+  // took seconds with millions of objects. Sanitizer builds keep the orderly
+  // teardown: their end-of-process reports hang off it.
+  std::fflush(stdout);
+  std::fflush(stderr);
+  ::_exit(exit_code);
+#else
 #ifdef DFKV_WITH_RDMA
   if (rsrv) rsrv->Stop();
 #endif
-  return registration_timed_out ? 1 : 0;
+  return exit_code;
+#endif
 }
