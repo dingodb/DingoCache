@@ -1010,6 +1010,9 @@ std::vector<bool> KVClient::BatchGetDirect(const std::vector<KvGetItem>& items) 
       by[{node, items[i].n}].push_back(i);
     }
     std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>> groups = ShardReadGroups(std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>>(by.begin(), by.end()));
+    const auto node_of = [&](size_t g) -> const std::string& {
+      return groups[g].first.first;
+    };
     RunReadScheduled(groups.size(), [&](size_t g) {
       const std::string& node = groups[g].first.first;
       uint64_t now = NowMs();
@@ -1035,7 +1038,7 @@ std::vector<bool> KVClient::BatchGetDirect(const std::vector<KvGetItem>& items) 
             value_lens[m] == n)
           hit[idx[m]] = 1;
       }
-    });
+    }, node_of);
   };
   std::vector<size_t> all(N);
   for (size_t i = 0; i < N; ++i) all[i] = i;
@@ -1176,6 +1179,9 @@ std::vector<bool> KVClient::BatchGetAutoDirect(const std::vector<KvGetItem>& ite
     by[{node, items[i].n}].push_back(i);
   }
   std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>> groups = ShardReadGroups(std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>>(by.begin(), by.end()));
+  const auto node_of = [&](size_t g) -> const std::string& {
+    return groups[g].first.first;
+  };
   RunReadScheduled(groups.size(), [&](size_t g) {
     const std::string& node = groups[g].first.first;
     uint64_t now = NowMs();
@@ -1201,7 +1207,7 @@ std::vector<bool> KVClient::BatchGetAutoDirect(const std::vector<KvGetItem>& ite
       lens[idx[m]] = static_cast<size_t>(value_lens[m]);
       hit[idx[m]] = 1;
     }
-  });
+  }, node_of);
   if (out_lens) *out_lens = std::move(lens);
   return std::vector<bool>(hit.begin(), hit.end());
 }
@@ -2194,6 +2200,9 @@ std::vector<bool> KVClient::BatchExistDirect(
       ShardReadGroups(std::vector<std::pair<std::string, std::vector<size_t>>>(
           by_node.begin(), by_node.end()));
   std::vector<PernodeStat> gstat(pernode_on ? groups.size() : 0);
+  const auto node_of = [&](size_t g) -> const std::string& {
+    return groups[g].first;
+  };
   RunReadScheduled(groups.size(), [&](size_t g) {
     const std::string& node = groups[g].first;
     const std::vector<size_t>& idx = groups[g].second;
@@ -2264,7 +2273,7 @@ std::vector<bool> KVClient::BatchExistDirect(
               ? 1
               : 0;
     }
-  });
+  }, node_of);
   if (pernode_on) {
     std::map<std::string, PernodeStat> per;
     for (size_t g = 0; g < groups.size(); ++g) {
@@ -2773,6 +2782,9 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
             std::vector<std::pair<std::pair<std::string, size_t>,
                                   std::vector<size_t>>>(by.begin(), by.end()));
     std::vector<PernodeStat> gstat(pernode_on ? groups.size() : 0);
+    const auto node_of = [&](size_t g) -> const std::string& {
+      return groups[g].first.first;
+    };
     RunReadScheduled(groups.size(), [&](size_t g) {
       const std::string& node = groups[g].first.first;
       const std::vector<size_t>& idx = groups[g].second;
@@ -2875,7 +2887,7 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
         lens[idx[m]] = value_lens[m];
         hit[idx[m]] = 1;
       }
-    });
+    }, node_of);
     if (pernode_on) {
       for (size_t g = 0; g < groups.size(); ++g) {
         if (gstat[g].issued_keys == 0 && gstat[g].nonissued_fail == 0) continue;
