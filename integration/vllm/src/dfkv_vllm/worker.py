@@ -207,6 +207,53 @@ def _save_needs_step_fence(spec) -> bool:
     )
 
 
+def _identity_dp_size(extra_config: Any, dp_size: int) -> int:
+    """The data-parallel size the object identity carries.
+
+    Each DP replica computes the same bytes for the same prefix (``dp_rank``
+    is already -1 in every key), so the DP size does not change an object;
+    binding it only makes deployments of different DP sizes miss each
+    other's objects. ``share_across_dp_sizes`` drops it. Off by default,
+    because it changes every key: objects stored so far are not found once.
+    """
+    if _tcfg.truthy(extra_config.get("share_across_dp_sizes", False)):
+        return 1
+    return dp_size
+
+
+def _resolve_model_revision(extra_config: Any, model_config: Any) -> str:
+    """The weights version the namespace binds.
+
+    Explicit ``model_revision``, else the engine's revision, else the commit
+    hash of a hub checkout, else the model identity itself. That last
+    fallback is a weights version only for a hub id: for a local directory
+    it stays the same when other weights are put there, and objects computed
+    with the old weights would be loaded for the new ones. Then a warning,
+    or with ``require_model_revision`` a startup error.
+    """
+    model_identity = str(model_config.model)
+    hf_config = getattr(model_config, "hf_config", None)
+    revision = (
+        extra_config.get("model_revision")
+        or getattr(model_config, "revision", None)
+        or getattr(hf_config, "_commit_hash", None)
+    )
+    if revision:
+        return str(revision)
+    if os.path.exists(model_identity):
+        message = (
+            f"dfkv: model {model_identity!r} is a local path and no weights "
+            "version is known (no model_revision, revision or commit hash): "
+            "the cache namespace cannot tell other weights in that path apart. "
+            "Set kv_connector_extra_config.model_revision"
+        )
+        if _tcfg.truthy(extra_config.get("require_model_revision", False)):
+            raise ValueError(message + ".")
+        logger.warning("%s (require_model_revision=true makes this an error).",
+                       message)
+    return model_identity
+
+
 def _cache_group_layout(groups: Sequence[KVCacheGroupSpec]) -> str:
     """Bind cached bytes to full per-group geometry, not only block size."""
     def encode(value):
@@ -2222,7 +2269,10 @@ class DfkvStoreWorker:
 
         self.metadata = KeyMetadata(
             model_name=model_config.model.rstrip("/").split("/")[-1],
-            dp_size=self.dp_size,
+            dp_size=_identity_dp_size(
+                vllm_config.kv_transfer_config.kv_connector_extra_config,
+                self.dp_size,
+            ),
             dp_rank=-1,
             tp_size=self.tp_size,
             tp_rank=self.head_or_tp_rank,
@@ -2263,13 +2313,7 @@ class DfkvStoreWorker:
         model_identity = str(model_config.model)
         _tcfg.require_isolation_name(
             model_identity, field="model_name")
-        _hf_config = getattr(model_config, "hf_config", None)
-        _model_revision = (
-            extra.get("model_revision")
-            or getattr(model_config, "revision", None)
-            or getattr(_hf_config, "_commit_hash", None)
-            or model_identity
-        )
+        _model_revision = _resolve_model_revision(extra, model_config)
         _cache_dtype = str(
             getattr(self.cache_config, "cache_dtype", "unknown"))
         _group_layout = _cache_group_layout(kv_cache_config.kv_cache_groups)
@@ -2282,7 +2326,7 @@ class DfkvStoreWorker:
             block_tokens=max(1, self.block_size),
             layer_count=max(1, self.num_layers),
             tp_size=self.tp_size,
-            dp_size=self.dp_size,
+            dp_size=_identity_dp_size(extra, self.dp_size),
             pp_size=self.pp_size,
             layout_fields={
                 "storage_layout": VLLM_RAW_LAYOUT.decode("ascii"),

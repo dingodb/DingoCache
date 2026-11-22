@@ -3,6 +3,19 @@
 ## Unreleased
 
 
+- vLLM connector, object identity: `share_across_dp_sizes` (default off)
+  leaves the data-parallel size out of the namespace and keys. Every DP
+  replica writes the same bytes for a prefix (`dp_rank` is already -1 in
+  every key), but the DP size was always bound, so deployments of different
+  DP sizes, or one scaled to another, missed each other's objects. Turning
+  it on changes every key (one cold start); the default keeps today's keys.
+  The weights version fell back to the model path when neither
+  `model_revision`, the engine's revision nor a hub commit hash was known:
+  for a local directory that stays the same when other weights are put
+  there, and objects computed with the old weights were loaded for the new
+  ones. That now logs a warning at startup, or with `require_model_revision`
+  fails it. Keys are unchanged.
+
 - vLLM connector: which cache groups' SAVE must finish inside the model step
   is now decided default-deny. Only full attention (exactly
   `FullAttentionSpec` / `MLAAttentionSpec`, without a window or chunk size),
