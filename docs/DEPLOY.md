@@ -710,7 +710,7 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | `DFKV_NODE_DEDUP_GPU_SLOTS` | — | GPU dedup 表容量 |
 | `DFKV_NODE_DEDUP_TTL_MS` | `5000` | dedup entry 过期（从发布时刻算起）；低于 `DFKV_NODE_DEDUP_WAIT_MS` 时启动告警：晚于 TTL 到达的 peer 会重复远端读取 |
 | `DFKV_NODE_DEDUP_WAIT_MS` | `500` | follower 等待 leader 的上限。一次批量调用整批共用这一个上限（不是每个 key 各等一次；host 与 GPU 路径相同），超时的 key 合并成一次直连批量读取；leader 放弃（未命中、目标节点冷却、I/O 失败，GPU 路径还有发布前设备同步失败）时 follower 立即回退，不等满。**取值不小于最大一批读取的耗时**：leader 要等自己整批直连读取返回后才发布这批 key，耗时超过本值时，各 follower 在到期时把仍在读取的 key 合成一批自行重读，这一批不再共享（等于读了两遍） |
-| `DFKV_NODE_DEDUP_TAKEOVER_MS` | — | leader 失联 follower 接管时间 |
+| `DFKV_NODE_DEDUP_TAKEOVER_MS` | — | leader 失联 follower 接管时间。也用于发布中被杀的 leader：发布（拷入 staging arena）超过这个时间的 slot 由下一次查找收回，写入或删除该 key 时立即收回（host 与 GPU 路径相同）。GPU 路径下收回 slot 的进程本身被杀时，超过这个时间后由下一次写入、删除或查找代为完成。已知仍会卡住该 key 的情形：同机更早版本的发布者（不能收回，仍按原样等待）；当前版本进程恰好在几个只有几条指令长的窗口里被杀（锁住 slot 之后、打标记之前；提交或放弃的代际交换之后、最后一次写入之前；收回 slot 之后、打标记之前；完成收回时代际交换之后、最后一次写入之前） |
 | `DFKV_NODE_DEDUP_ARENA_MB` / `DFKV_NODE_DEDUP_GPU_ARENA_MB` | — | dedup 复用 staging arena 大小（重点检查 GPU 复本顿） |
 
 #### g. 一般基础设施

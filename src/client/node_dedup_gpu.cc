@@ -27,6 +27,21 @@ constexpr uint32_t kStateEmpty = 0;
 constexpr uint32_t kStateFetching = 1;
 constexpr uint32_t kStateReady = 2;
 constexpr uint32_t kStatePublishing = 3;
+// Slot::alloc_seq while a publisher that can be fenced holds PUBLISHING (see
+// MarkedFenceable). An arena cursor never reaches the top bit, so no release
+// writes this value there for any other reason, and an older reader that
+// meets it in a torn snapshot fails its lap check.
+constexpr uint64_t kFenceablePublisher = 0x8000000046454e43ull;
+// Slot::alloc_seq while a claim or an invalidation is taking a slot from such
+// a publisher (ForceOutBegin until ForceOutFinish; see
+// RecoverStrandedForceOut): the two top bits set and the odd generation the
+// force-out holds. It names that one generation, so once anyone has moved the
+// generation on, the slot no longer reads as that force-out. The top bit has
+// the same reasons as above; the second one keeps it apart from
+// kFenceablePublisher (a generation would need 2^62 steps to wrap the tag).
+constexpr uint64_t ForcingOutTag(uint64_t odd_gen) {
+  return 0xC000000000000000ull | (odd_gen & 0x3FFFFFFFFFFFFFFFull);
+}
 
 uint64_t EnvU64(const char* name, uint64_t dflt) {
   const char* v = std::getenv(name);
@@ -66,9 +81,13 @@ struct GpuNodeDedup::Slot {
   uint64_t key_lo;
   std::atomic<uint64_t> fetch_start_ms;
   uint64_t payload_off;   // offset into the OWNER's GPU arena
-  uint64_t alloc_seq;     // owner's arena cursor value at allocation (lap check)
-  uint32_t owner_idx;     // registry entry of the publishing process
-  uint32_t owner_gen32;   // truncated entry generation at publish time
+  // Owner's arena cursor value at allocation (lap check), valid in READY.
+  // kFenceablePublisher while a publisher that can be fenced holds the slot.
+  uint64_t alloc_seq;
+  // Registry entry of the publishing process and its truncated generation.
+  // Valid in READY; kMaxProcs otherwise.
+  uint32_t owner_idx;
+  uint32_t owner_gen32;
 };
 
 // One per participating process. pid claims the entry (CAS, dead pids are
@@ -329,7 +348,7 @@ GpuNodeDedup::Slot* GpuNodeDedup::Reserve(const BlockKey& key) {
     s.key_lo = key.digest_lo;
     s.len = 0;
     s.payload_off = 0;
-    s.alloc_seq = 0;
+    __atomic_store_n(&s.alloc_seq, 0, __ATOMIC_RELAXED);
     s.owner_idx = kMaxProcs;
     s.owner_gen32 = 0;
     s.fetch_start_ms.store(now, std::memory_order_relaxed);
@@ -392,7 +411,7 @@ bool GpuNodeDedup::IssueCopySg(Slot* s, const BlockKey& key, const Seg* segs,
   const uint32_t oi = s->owner_idx;
   const uint32_t og = s->owner_gen32;
   const uint64_t off = s->payload_off;
-  const uint64_t seq = s->alloc_seq;
+  const uint64_t seq = __atomic_load_n(&s->alloc_seq, __ATOMIC_RELAXED);
   if (oi >= kMaxProcs) return false;
   ProcEntry& e = reg_[oi];
   const uint64_t egen = e.generation.load(std::memory_order_acquire);
@@ -573,7 +592,28 @@ GpuNodeDedup::Role GpuNodeDedup::ClaimSg(const BlockKey& key, const Seg* segs,
       }
       return Role::kWait;
     } else if (st == kStatePublishing) {
-      return Role::kWait;
+      // A publisher killed inside PublishSg never leaves this state. Once it
+      // has been publishing for longer than the takeover age, take the slot
+      // away from it (possible only for a publisher that can be fenced) and
+      // fetch. The generation is read first and is the value the swap in
+      // ForceOutBegin expects: if the swap succeeds, the mark and the stamp
+      // read in between belong to the publish that held the slot then, not
+      // to a newer one that took the slot while this thread was descheduled.
+      // The mark is read before the stamp: PublishBegin writes the stamp
+      // first, so a marked slot carries the time this publish began.
+      // (`now` was read before the lookup: a publish begun since is newer.)
+      const uint64_t g = s->gen.load(std::memory_order_acquire);
+      if (!RecoverStrandedForceOut(s, now)) {
+        if (g & 1) return Role::kWait;
+        if (!MarkedFenceable(s)) return Role::kWait;  // (an acquire load)
+        const uint64_t started =
+            s->fetch_start_ms.load(std::memory_order_relaxed);
+        if (started >= now ||
+            now - started <= static_cast<uint64_t>(takeover_ms_) ||
+            !ForceOutBegin(s, g))
+          return Role::kWait;
+        ForceOutFinish(s, g + 1);
+      }
     }
   }
   if (Slot* mine = Reserve(key)) {
@@ -655,15 +695,140 @@ bool GpuNodeDedup::FenceLoads() {
   return true;
 }
 
-void GpuNodeDedup::PublishSg(const BlockKey& key, uint64_t token,
-                             const Seg* segs, size_t nsegs, size_t len) {
-  if (!dedup_token::Valid(token)) return;
-  EnsureThreadCtx();
+// A publisher that can be fenced says so in the slot while it holds it: it
+// stores kFenceablePublisher into alloc_seq as soon as it has the slot. The
+// slot has no spare field, but alloc_seq is read by nobody outside READY, and
+// every other value it ever holds, in any release, is 0 (Reserve) or an arena
+// cursor (a commit). The mark therefore cannot be mistaken for part of an
+// older release's commit, whose stores another core may see in any order
+// (owner fields before len, say), nor for a READY entry that an invalidation
+// holds PUBLISHING for a moment. A slot held without the mark belongs to an
+// older release, whose commit is a set of unconditional stores: it is never
+// taken away, and a killed one blocks its key as before. So does a current
+// publisher killed between LockOwned and the mark, or inside the odd-
+// generation window of its commit or of PublishAbandon.
+bool GpuNodeDedup::MarkedFenceable(const Slot* s) {
+  return __atomic_load_n(&s->alloc_seq, __ATOMIC_ACQUIRE) ==
+         kFenceablePublisher;
+}
+
+bool GpuNodeDedup::ForceOutBegin(Slot* s, uint64_t g) {
+  // g was read before the state and the mark: every way out of PUBLISHING
+  // moves the generation, so if it still has this value at the swap below,
+  // the state and the mark read in between belong to one and the same
+  // publish.
+  if (g & 1) return false;  // a publisher or another forcer is mid-write
+  if (s->state.load(std::memory_order_acquire) != kStatePublishing)
+    return false;
+  if (!MarkedFenceable(s)) return false;
+  // The publisher commits, and gives up, by swapping gen from g to g + 1; so
+  // does this. Exactly one swap succeeds. If it is this one, the publisher,
+  // alive or not, writes nothing more to the slot, and the odd generation
+  // keeps every other forcer and every reader out until ForceOutFinish.
+  if (!s->gen.compare_exchange_strong(g, g + 1, std::memory_order_acq_rel))
+    return false;
+  // Say so in the slot, with the time, so that a forcer killed before it
+  // finishes can be finished for (RecoverStrandedForceOut).
+  s->fetch_start_ms.store(NowMs(), std::memory_order_relaxed);
+  __atomic_store_n(&s->alloc_seq, ForcingOutTag(g + 1), __ATOMIC_RELEASE);
+  return true;
+}
+
+bool GpuNodeDedup::ForceOutFinish(Slot* s, uint64_t odd) {
+  // A swap again, from the odd value the force-out left, to the next odd
+  // one: the forcer and a recoverer (RecoverStrandedForceOut) may both try
+  // to finish, and exactly one does. A forcer that comes back after a
+  // recoverer finished for it finds the generation moved and writes nothing.
+  uint64_t g = odd;
+  if (!s->gen.compare_exchange_strong(g, odd + 2, std::memory_order_acq_rel))
+    return false;
+  // The sentinel goes before the slot leaves this odd window. Left in an
+  // EMPTY slot, it would still be there while a Reserve that has swapped
+  // the state and not yet cleared alloc_seq races an invalidation of the
+  // old key, which holds the slot PUBLISHING with an odd generation: that
+  // looks exactly like a stranded force-out, and a recovery would step the
+  // generation under the other two.
+  __atomic_store_n(&s->alloc_seq, 0, __ATOMIC_RELAXED);
+  s->gen.fetch_add(1, std::memory_order_release);  // even: token superseded
+  s->state.store(kStateEmpty, std::memory_order_release);
+  return true;
+}
+
+bool GpuNodeDedup::ForceOutPublisher(Slot* s) {
+  const uint64_t g = s->gen.load(std::memory_order_acquire);
+  if (!ForceOutBegin(s, g)) return false;
+  ForceOutFinish(s, g + 1);  // false: a recoverer finished for it
+  return true;
+}
+
+bool GpuNodeDedup::RecoverStrandedForceOut(Slot* s, uint64_t now) {
+  // A forcer killed between its swap and its finish leaves the slot
+  // PUBLISHING with an odd generation for good. Nobody can commit to it: a
+  // commit or an abandon needs the swap from the even value the forcer
+  // already moved. The forcer marked the slot with the tag of its odd
+  // generation and stamped it (only it writes in this odd window, and the
+  // mark is a release store after the stamp); once that is older than the
+  // takeover age, finish for it. If it is merely slow, the swap in
+  // ForceOutFinish decides which of the two finishes. The tag must name the
+  // generation read here: the winning finisher's swap moves the generation
+  // to the next odd value before it clears the tag, and a second party that
+  // looks in between must not take that for a stranded force-out too (it
+  // would finish the same release a second time and leave the generation
+  // odd at rest). The tag exists only inside a force-out's own odd window
+  // (ForceOutFinish clears it before it leaves). A forcer killed after its
+  // swap and before its mark, or a finisher killed after its swap and
+  // before its last store, still strands the slot.
+  const uint64_t g = s->gen.load(std::memory_order_acquire);
+  if (!(g & 1)) return false;
+  if (s->state.load(std::memory_order_acquire) != kStatePublishing)
+    return false;
+  if (__atomic_load_n(&s->alloc_seq, __ATOMIC_ACQUIRE) != ForcingOutTag(g))
+    return false;
+  const uint64_t started = s->fetch_start_ms.load(std::memory_order_relaxed);
+  if (started >= now || now - started <= static_cast<uint64_t>(takeover_ms_))
+    return false;
+  return ForceOutFinish(s, g);
+}
+
+bool GpuNodeDedup::PublishBegin(const BlockKey& key, uint64_t token,
+                                size_t len, PublishHold* hold) {
   Slot* s = OwnedSlot(token);
-  if (!s || !LockOwned(s, key, token)) return;
-  const size_t n = len;
-  auto abandon = [&] { s->state.store(kStateEmpty, std::memory_order_release); };
-  if (n == 0 || n > arena_bytes_ / 2) return abandon();
+  if (!s || !LockOwned(s, key, token)) return false;
+  if (len == 0 || len > arena_bytes_ / 2) {
+    // Held without the mark: nobody can have taken the slot.
+    s->state.store(kStateEmpty, std::memory_order_release);
+    return false;
+  }
+  hold->slot = s;
+  hold->gen = s->gen.load(std::memory_order_acquire);
+  hold->len = len;
+  // The age of a PUBLISHING slot is the time spent publishing, not the time
+  // the fetch took before: a claim gives the copy takeover_ms from here. The
+  // stamp is written before the mark (a release store), so whoever sees the
+  // mark sees this stamp.
+  s->fetch_start_ms.store(NowMs(), std::memory_order_relaxed);
+  // From here an invalidation may take the slot at any moment.
+  __atomic_store_n(&s->alloc_seq, kFenceablePublisher, __ATOMIC_RELEASE);
+  return true;
+}
+
+void GpuNodeDedup::PublishAbandon(const PublishHold& hold) {
+  // The same swap as a commit. If an invalidation has taken the slot it may
+  // already be someone else's claim: then there is nothing to give up.
+  Slot* s = hold.slot;
+  uint64_t g = hold.gen;
+  if (!s->gen.compare_exchange_strong(g, hold.gen + 1,
+                                      std::memory_order_acq_rel))
+    return;
+  __atomic_store_n(&s->alloc_seq, 0, __ATOMIC_RELAXED);
+  s->gen.fetch_add(1, std::memory_order_release);
+  s->state.store(kStateEmpty, std::memory_order_release);
+}
+
+void GpuNodeDedup::PublishFinish(const PublishHold& hold, const Seg* segs,
+                                 size_t nsegs) {
+  Slot* s = hold.slot;
+  const size_t n = hold.len;
   ProcEntry& e = reg_[self_idx_];
   // Ring-allocate on this process's arena cursor. Skip the tail remainder when
   // a lap boundary would split one payload, matching the host rendezvous.
@@ -685,7 +850,7 @@ void GpuNodeDedup::PublishSg(const BlockKey& key, uint64_t token,
   // synchronization, peers can copy stale arena bytes; this was observed as
   // silently corrupted KV payloads rather than a transport error.
   CUstream st = Stream();
-  if (!st) return abandon();
+  if (!st) return PublishAbandon(hold);
   size_t done = 0;
   for (size_t j = 0; j < nsegs && done < n; ++j) {
     const size_t m = std::min(n - done, segs[j].cap);
@@ -693,19 +858,93 @@ void GpuNodeDedup::PublishSg(const BlockKey& key, uint64_t token,
     if (cu_->MemcpyAsync(arena_base_ + off + done,
                          reinterpret_cast<CUdeviceptr>(segs[j].ptr), m,
                          st) != kCudaSuccess)
-      return abandon();
+      return PublishAbandon(hold);
     done += m;
   }
-  if (done != n || cu_->StreamSynchronize(st) != kCudaSuccess) return abandon();
-  s->gen.fetch_add(1, std::memory_order_acq_rel);
+  if (done != n || cu_->StreamSynchronize(st) != kCudaSuccess)
+    return PublishAbandon(hold);
+  // Commit. A failed swap means an invalidation (or a claim past the takeover
+  // age) took the slot during the copy: it is no longer this publisher's, so
+  // nothing more is written.
+  uint64_t g = hold.gen;
+  if (!s->gen.compare_exchange_strong(g, hold.gen + 1,
+                                      std::memory_order_acq_rel))
+    return;
   s->len = static_cast<uint32_t>(n);
   s->payload_off = off;
-  s->alloc_seq = seq;
+  __atomic_store_n(&s->alloc_seq, seq, __ATOMIC_RELAXED);  // replaces the mark
   s->owner_idx = self_idx_;
   s->owner_gen32 = static_cast<uint32_t>(self_gen_);
   s->fetch_start_ms.store(NowMs(), std::memory_order_relaxed);
   s->gen.fetch_add(1, std::memory_order_release);
   s->state.store(kStateReady, std::memory_order_release);
+}
+
+void GpuNodeDedup::PublishSg(const BlockKey& key, uint64_t token,
+                             const Seg* segs, size_t nsegs, size_t len) {
+  if (!dedup_token::Valid(token)) return;
+  EnsureThreadCtx();
+  PublishHold hold;
+  if (PublishBegin(key, token, len, &hold)) PublishFinish(hold, segs, nsegs);
+}
+
+void GpuNodeDedup::InterleaveForTest(const PublishHold& hold, int step) {
+  Slot* s = hold.slot;
+  switch (step) {
+    case 0: {  // Reserve: the state swap
+      uint32_t st = kStateEmpty;
+      s->state.compare_exchange_strong(st, kStateFetching,
+                                       std::memory_order_acq_rel);
+      break;
+    }
+    case 1: {  // Invalidate of the old key: the state swap, first step
+      uint32_t st = kStateFetching;
+      s->state.compare_exchange_strong(st, kStatePublishing,
+                                       std::memory_order_acq_rel);
+      s->gen.fetch_add(1, std::memory_order_acq_rel);
+      break;
+    }
+    case 2:  // Invalidate: the rest
+      s->gen.fetch_add(1, std::memory_order_release);
+      s->state.store(kStateEmpty, std::memory_order_release);
+      break;
+    case 3:  // Reserve: the rest
+      s->gen.fetch_add(1, std::memory_order_acq_rel);
+      __atomic_store_n(&s->alloc_seq, 0, __ATOMIC_RELAXED);
+      s->gen.fetch_add(1, std::memory_order_release);
+      break;
+    case 4: {  // a finisher of a stranded force-out: its swap only
+      uint64_t g = s->gen.load(std::memory_order_acquire);
+      s->gen.compare_exchange_strong(g, g + 2, std::memory_order_acq_rel);
+      break;
+    }
+    case 5:  // that finisher: the rest
+      __atomic_store_n(&s->alloc_seq, 0, __ATOMIC_RELAXED);
+      s->gen.fetch_add(1, std::memory_order_release);
+      s->state.store(kStateEmpty, std::memory_order_release);
+      break;
+  }
+}
+
+bool GpuNodeDedup::RecoverForTest(const PublishHold& hold) {
+  return RecoverStrandedForceOut(hold.slot, NowMs());
+}
+
+bool GpuNodeDedup::GenEvenForTest(const PublishHold& hold) const {
+  return (hold.slot->gen.load(std::memory_order_acquire) & 1) == 0;
+}
+
+void GpuNodeDedup::SetFenceableForTest(const PublishHold& hold, bool on) {
+  if (on) {
+    __atomic_store_n(&hold.slot->alloc_seq, kFenceablePublisher,
+                     __ATOMIC_RELEASE);
+    return;
+  }
+  // An older release's publisher as another core may see it in its commit:
+  // the owner fields already stored, len and alloc_seq not yet.
+  __atomic_store_n(&hold.slot->alloc_seq, 0, __ATOMIC_RELAXED);
+  hold.slot->owner_idx = self_idx_;
+  hold.slot->owner_gen32 = static_cast<uint32_t>(self_gen_);
 }
 
 void GpuNodeDedup::Abort(const BlockKey& key, uint64_t token) {
@@ -726,6 +965,14 @@ void GpuNodeDedup::Invalidate(const BlockKey& key) {
       if (st == kStateEmpty) break;
       if (s.key_hi != key.digest_hi || s.key_lo != key.digest_lo) break;
       if (st == kStatePublishing) {
+        // What is being published is from before this invalidation. A
+        // publisher that can be fenced loses the slot here and now, whether
+        // it is still running or was killed. A force-out whose forcer was
+        // killed is finished once it is older than the takeover age. Any
+        // other holder is waited for, without bound: an older release's
+        // publisher, or one of the short windows listed at MarkedFenceable.
+        if (ForceOutPublisher(&s) || RecoverStrandedForceOut(&s, NowMs()))
+          break;
         std::this_thread::yield();
         continue;
       }

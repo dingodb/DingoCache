@@ -380,7 +380,7 @@ Prometheus 调用。vLLM 使用同一 allowlist，区别只是在 family 前加 
 | `dfkv_read_scheduler_node_limit_waits_total` | counter | 空闲 read worker 被唤醒后，发现待执行的 shard 全部属于已达单节点上限的节点的次数。正常运行中也会出现（例如小环上对单个节点的大 batch）；若其他节点的读同时变慢且该计数持续高速增长，说明有慢节点 |
 | `dfkv_client_ring_members` / `dfkv_client_mds_reachable` / `dfkv_client_mds_unreachable_polls_total` | gauge / gauge / counter | 当前环节点数 / 最近发现轮询是否可达 MDS / 不可达轮询累计 |
 | `dfkv_client_dedup_hits_total` / `dfkv_client_dedup_fetches_total` / `dfkv_client_dedup_wait_hits_total` / `dfkv_client_dedup_wait_timeouts_total` | counter | host rendezvous 命中、真实 fetch、等待后命中、等待后回退直连（等满 `DFKV_NODE_DEDUP_WAIT_MS`，或 leader 放弃 / 已发布条目不可用而提前回退，两者不区分） |
-| `dfkv_client_gpu_dedup_hits_total` / `dfkv_client_gpu_dedup_fetches_total` / `dfkv_client_gpu_dedup_wait_hits_total` / `dfkv_client_gpu_dedup_wait_timeouts_total` | counter | 同上 CUDA IPC rendezvous |
+| `dfkv_client_gpu_dedup_hits_total` / `dfkv_client_gpu_dedup_fetches_total` / `dfkv_client_gpu_dedup_wait_hits_total` / `dfkv_client_gpu_dedup_wait_timeouts_total` | counter | 同上 CUDA IPC rendezvous。另：发布中的 slot 被收回（发布者超过 `DFKV_NODE_DEDUP_TAKEOVER_MS` 或该 key 被写入/删除）之后，到下一次 fetch 认领之前 slot 读作空，正在等的 follower 复查一次后放弃并自行读取，计入 wait_timeouts，也多一次远端读取 |
 | `dfkv_client_gpu_dedup_load_fences_total` / `dfkv_client_gpu_dedup_load_fence_failures_total` | counter | leader 在把一次 fetch 的结果发布到 GPU rendezvous 之前做的设备同步次数（每批一次）/ 设备同步失败、该批结果因此不发布的次数（follower 自行读取） |
 
 原生 `KVClient` 的收敛操作指标（`op="put|get|exist|remove"`）：

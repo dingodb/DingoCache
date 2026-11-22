@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+- Client, GPU dedup (`DFKV_CLIENT_NODE_DEDUP_GPU=1`): a process killed while
+  it published a key no longer blocks that key, except in the cases listed
+  at the end of this entry. A publisher holds its
+  shared slot locked while it copies the fetched bytes into the staging
+  arena and synchronizes the stream, which takes milliseconds or more
+  under load. Killed there, it left the slot locked for good: every later
+  write or remove of the key spun forever in the client, and every lookup
+  of it waited out `DFKV_NODE_DEDUP_WAIT_MS`. The host-memory path got a
+  remedy in 2.38.0; the device path now has the same one. A publisher
+  marks the slot as its own while it copies and commits in a way that can
+  be refused. An invalidation takes the slot from a publisher that is
+  copying, whether it is alive or not (what it was about to publish is from
+  before the write), and a lookup does the same once the publisher has been
+  copying for longer than `DFKV_NODE_DEDUP_TAKEOVER_MS`; a publisher that
+  lost its slot writes nothing more to it. A process killed while it takes a
+  slot away leaves a second mark; once that is older than
+  `DFKV_NODE_DEDUP_TAKEOVER_MS`, an invalidation or a lookup completes the
+  release for it, and a process that was only slow and comes back finds
+  the slot no longer its own and writes nothing. The shared-memory layout,
+  the slot states and the segment name are unchanged: the marks are values
+  that no release ever writes for another reason, kept in a slot field that
+  is otherwise read only once an entry is published. After a slot is taken
+  away it reads empty until the next fetch claims it, so a process that
+  was waiting for the key may fetch it itself (counted in
+  `dfkv_client_gpu_dedup_wait_timeouts_total`, one more read of the key).
+  Known cases that still block the key (a write or remove of it then does
+  not return, and lookups wait out `DFKV_NODE_DEDUP_WAIT_MS`): a publisher
+  of an older release on the same host, which cannot be refused and is
+  waited for as before; and a current process killed in one of a few
+  windows of a few instructions each: after it locked the slot and before
+  it marked it, inside its commit or its giving up after a CUDA error
+  (between the generation swap and the last store), after it took a slot
+  away and before it marked that, or, completing a release, after its swap
+  and before its last store.
 - Client, GPU dedup (`DFKV_CLIENT_NODE_DEDUP_GPU=1`): a lookup that another
   process on the host is fetching no longer waits out
   `DFKV_NODE_DEDUP_WAIT_MS` (500 ms by default) when that process has
