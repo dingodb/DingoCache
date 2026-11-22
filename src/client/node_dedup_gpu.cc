@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <random>
 #include <cstdlib>
 #include <cstring>
 #include <thread>
@@ -69,6 +70,38 @@ uint32_t ProbeStart(const BlockKey& key) {
 bool PidDead(uint32_t pid) {
   return ::kill(static_cast<pid_t>(pid), 0) != 0 && errno == ESRCH;
 }
+
+// Start time of a process (field 22 of /proc/<pid>/stat, clock ticks since
+// boot), 0 if it cannot be read. Unchanged by exec; differs between two
+// processes that had the same pid one after the other.
+uint64_t StartTicks(uint32_t pid) {
+  char path[64];
+  std::snprintf(path, sizeof(path), "/proc/%u/stat", pid);
+  FILE* f = std::fopen(path, "r");
+  if (!f) return 0;
+  char buf[1024];
+  const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+  std::fclose(f);
+  buf[n] = '\0';
+  const char* p = std::strrchr(buf, ')');  // the command name may hold anything
+  if (!p) return 0;
+  ++p;
+  for (int field = 2; field < 21 && p; ++field) {  // to the start of field 22
+    p = std::strchr(p + 1, ' ');
+  }
+  return p ? std::strtoull(p + 1, nullptr, 10) : 0;
+}
+
+// Random, fixed for the life of this process image (a new one after exec).
+uint32_t ImageNonce() {
+  static const uint32_t nonce = [] {
+    std::random_device rd;
+    uint32_t v = 0;
+    while (v == 0) v = rd();
+    return v;
+  }();
+  return nonce;
+}
 }  // namespace
 
 // Same 64-byte seqlock slot as the host flavor, but the payload location is a
@@ -102,13 +135,20 @@ struct GpuNodeDedup::ProcEntry {
   std::atomic<uint64_t> alloc_cursor;
   uint64_t arena_bytes;
   int32_t device;
-  uint32_t pad0;
+  // Which process holds the entry, beyond its pid: the claimant's image
+  // nonce (ImageNonce) and start time (StartTicks), valid when identity_gen
+  // equals generation. They were padding in older releases, which neither
+  // write nor read them; an entry an older release claimed therefore shows
+  // an identity_gen of a previous claim, and is judged by its pid alone.
+  uint32_t image;
   CUipcMemHandle handle;
   // The exporter's own arena VA: cuIpcOpenMemHandle refuses handles from the
   // EXPORTING process, so a second instance in the same process (same address
-  // space) reads through this pointer directly. Only trusted when pid matches.
+  // space) reads through this pointer directly. Only trusted for an entry of
+  // this very process image (pid, identity and image nonce all match).
   uint64_t owner_va;
-  uint64_t pad1[2];  // -> 128 B (cross-process ABI)
+  uint64_t start_ticks;
+  uint64_t identity_gen;  // -> 128 B (cross-process ABI)
 };
 
 struct GpuNodeDedup::Header {
@@ -231,23 +271,43 @@ std::unique_ptr<GpuNodeDedup> GpuNodeDedup::Open(const Options& opt) {
     return nullptr;  // dtor frees the arena
   }
 
-  // Claim a registry entry: a free one, or one whose owner died.
+  // Claim a registry entry: a free one, one whose owner died, or one whose
+  // owner is provably gone although its pid is in use (see Stale).
   const uint32_t mypid = static_cast<uint32_t>(::getpid());
   for (uint32_t i = 0; i < kMaxProcs && d->self_idx_ == kMaxProcs; ++i) {
     ProcEntry& e = d->reg_[i];
     uint32_t cur = e.pid.load(std::memory_order_acquire);
-    if (cur == mypid) continue;  // stale self entry from an exec'd ancestor: skip
-    if (cur != 0 && !PidDead(cur)) continue;
-    if (!e.pid.compare_exchange_strong(cur, mypid, std::memory_order_acq_rel))
-      continue;
-    e.ready.store(0, std::memory_order_release);
-    d->self_gen_ = e.generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (cur == 0 || (cur != mypid && PidDead(cur))) {
+      if (!e.pid.compare_exchange_strong(cur, mypid, std::memory_order_acq_rel))
+        continue;
+      e.ready.store(0, std::memory_order_release);
+      d->self_gen_ = e.generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    } else {
+      // The pid is in use. Several claimants may judge the entry stale at
+      // once (instances of this process, for its own pid), so the claim is
+      // a swap of the generation the judgement was made at; then the pid,
+      // in case the owner died meanwhile and an older release took the
+      // entry by its pid.
+      uint64_t g = e.generation.load(std::memory_order_acquire);
+      if (!Stale(e, cur, g) ||
+          !e.generation.compare_exchange_strong(g, g + 1,
+                                                std::memory_order_acq_rel) ||
+          !e.pid.compare_exchange_strong(cur, mypid, std::memory_order_acq_rel))
+        continue;
+      e.ready.store(0, std::memory_order_release);
+      d->self_gen_ = g + 1;
+    }
     e.alloc_cursor.store(0, std::memory_order_relaxed);
     e.arena_bytes = opt.arena_bytes;
     e.device = cu->CurrentDevice();
     d->self_device_ = e.device;
     std::memcpy(&e.handle, &handle, sizeof(handle));
     e.owner_va = static_cast<uint64_t>(d->arena_base_);
+    e.image = ImageNonce();
+    e.start_ticks = StartTicks(mypid);
+    // Last, and a release store: whoever sees identity_gen equal to the
+    // generation sees the image and start time written for it (Stale).
+    __atomic_store_n(&e.identity_gen, d->self_gen_, __ATOMIC_RELEASE);
     e.ready.store(1, std::memory_order_release);
     d->self_idx_ = i;
   }
@@ -272,6 +332,56 @@ size_t GpuNodeDedup::SegmentBytes(const Options& opt) {
 dedup_segment::Layout GpuNodeDedup::SegmentLayout(size_t len) {
   return dedup_segment::Layout{len, offsetof(Header, init_done),
                                offsetof(Header, creator)};
+}
+
+// The holder of an entry whose pid cur is in use is gone when the entry's
+// identity (written by a claimant of this or a later release, for generation
+// g) names another process: for this process's own pid another image nonce
+// (a previous process with the same pid, typically a container restarted in
+// place, or this process before an exec); for another pid another start time
+// (the pid was reused). An entry without an identity for g, written by an
+// older release, is judged by its pid alone, as before.
+bool GpuNodeDedup::Stale(const ProcEntry& e, uint32_t cur, uint64_t g) {
+  // Acquire: pairs with the claimant's release store of identity_gen, after
+  // its image and start time (otherwise a sibling's fresh entry could be
+  // judged by the fields of its previous holder).
+  if (__atomic_load_n(&e.identity_gen, __ATOMIC_ACQUIRE) != g) return false;
+  if (cur == static_cast<uint32_t>(::getpid())) return e.image != ImageNonce();
+  const uint64_t t = StartTicks(cur);
+  return t != 0 && t != e.start_ticks;
+}
+
+void GpuNodeDedup::ForgeRegistryForTest(int how) {
+  const uint32_t me = static_cast<uint32_t>(::getpid());
+  const uint32_t parent = static_cast<uint32_t>(::getppid());
+  for (uint32_t i = 0; i < kMaxProcs; ++i) {
+    ProcEntry& e = reg_[i];
+    if (how == 4 && i != self_idx_) continue;
+    const uint64_t g = e.generation.load(std::memory_order_acquire);
+    switch (how) {
+      case 0:  // a previous process with this pid
+      case 4:  // ... in this entry only
+        e.pid.store(me);
+        e.image = ImageNonce() + 1;
+        e.identity_gen = g;
+        break;
+      case 1:  // an older release's process with this pid
+        e.pid.store(me);
+        e.identity_gen = g + 1;
+        break;
+      case 2:  // a process whose pid now belongs to another (live) one
+        e.pid.store(parent);
+        e.start_ticks = StartTicks(parent) + 1;
+        e.identity_gen = g;
+        break;
+      case 3:  // a live process
+        e.pid.store(parent);
+        e.start_ticks = StartTicks(parent);
+        e.identity_gen = g;
+        break;
+    }
+    e.ready.store(1, std::memory_order_release);
+  }
 }
 
 GpuNodeDedup::~GpuNodeDedup() {
@@ -389,8 +499,13 @@ CUdeviceptr GpuNodeDedup::PeerBase(uint32_t idx, uint64_t gen) {
     ProcEntry& e = reg_[idx];
     if (e.pid.load(std::memory_order_acquire) ==
         static_cast<uint32_t>(::getpid())) {
+      // Same pid is not same process: an entry left by a previous process
+      // with this pid, or by this process before an exec, carries an
+      // address of an address space that is gone.
       if (e.ready.load(std::memory_order_acquire) != 1 ||
-          e.generation.load(std::memory_order_acquire) != gen)
+          e.generation.load(std::memory_order_acquire) != gen ||
+          __atomic_load_n(&e.identity_gen, __ATOMIC_ACQUIRE) != gen ||
+          e.image != ImageNonce())
         return 0;
       return static_cast<CUdeviceptr>(e.owner_va);
     }
