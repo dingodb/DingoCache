@@ -16,10 +16,11 @@
   ring-eligible no longer counts as being in the ring.
 - Tools: `deploy/dfkv_node_replace.py` no longer waits for `systemctl stop`
   under `--command-timeout` (10 s by default, while a stop takes tens of
-  seconds). The timeout started a rollback whose `systemctl start` queued
-  behind the running stop and timed out too: the script exited with "rollback
-  also failed" and the old node came back next to its replacement. Stops and
-  starts are now queued with `--no-block`, and the script polls the unit's
+  seconds). The timeout started a rollback that asked systemd to start the
+  node it was still stopping and timed out on that as well, so the script
+  exited with "rollback also failed"; systemd runs such a start once the stop
+  is over, which can bring the old node back next to its replacement. Stops
+  and starts are now queued with `--no-block`, and the script polls the unit's
   `ActiveState` within `--timeout` -- stopped before it looks at the ring,
   active again before a rollback trusts it.
 - Server: the disks of a node are opened at the same time instead of one after
