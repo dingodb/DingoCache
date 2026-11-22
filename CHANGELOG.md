@@ -130,6 +130,9 @@
   `dfkv_rdma_client_stale_generation_reaps_total` and
   `dfkv_rdma_client_peer_topology_updates_total` now grow by the affected
   member only.
+
+## 2.38.0 — 2026-11-22
+
 - Client, host and GPU dedup (`DFKV_CLIENT_NODE_DEDUP=1`), the publishing
   side: three ways a process that fetched a key for the others could do
   damage after the key had been written or removed in the meantime.
@@ -443,6 +446,9 @@
   objects. The kernel releases the same memory when the process ends. On a
   serving node the stop went from 5.2-7.5 s to 1.6-1.7 s. Sanitizer builds
   still return from `main` and run the destructors.
+
+## 2.37.0 — 2026-11-22
+
 - Observability: a failed RDMA work completion can now be attributed to a
   peer, a local device and a completion status on both sides. Until now the
   client logged nothing for it and counted it only in the process-wide
@@ -619,6 +625,9 @@
     `StoreEngine::Close()`, `RamTier::StopBackground()` and
     `RdmaServer::Quiesce()` are the pieces; `Stop()` and destruction behave as
     before for embedders and tests that do not call them.
+
+## 2.36.0 — 2026-11-22
+
 - Server: the RAM tier arena is no longer registered as a whole with every
   RDMA rail. Nothing on the server referred to that registration any more
   (each zero-copy GET registers an exact MR over the value it serves; PUTs
@@ -709,11 +718,17 @@
   as an error or a quota rejection. The TCP entry was not affected. Limited
   tenants still bypass RAM write-back admission and now fall through to the
   quota-checked disk write, which reports `kQuotaExceeded` when over quota.
+
+## 2.35.6 — 2026-11-15
+
 - Client per-node stats: a shard timed at 0 us (sub-microsecond) no longer
   drops its rail from the `pernode-get`/`pernode-exist` line. The merge kept
   `dev` only from a shard strictly slower than the running maximum, so a
   0 us shard never set it; this also made
   `ClientPernodeStats.RetryRailPathPreservesAttemptOrderAndSingleRail` flaky.
+
+## 2.35.4 — 2026-11-11
+
 - vLLM connector: partial hash hits for DCP + hybrid linear-attention models.
   When vLLM exports `KVCacheConfig.cache_hit_alignment_tokens` below the
   scheduler block (hash-block prefix hits, e.g. Kimi-Linear-48B-A3B TP8 DCP8:
@@ -732,6 +747,9 @@
   Object sizes and key formats are unchanged; engines without the attribute,
   or with hits on the scheduler block, keep the previous behaviour and the
   off-grid hand-off warning below.
+
+## 2.35.3 — 2026-11-10
+
 - vLLM connector: warn (rate-limited, with a running count) when the engine
   hands off recurrent-state boundaries off the scheduler block grid. Saves and
   lookups use the LCM of the group block sizes; under decode context
@@ -741,6 +759,9 @@
   silently never saved and never hit (Kimi-Linear-48B-A3B, TP8 DCP8: 0
   external hits). Saves and lookups are unchanged; engines that align the
   hand-off to the LCM do not trigger the warning.
+
+## 2.35.2 — 2026-11-10
+
 - Client: warn at startup when `DFKV_NODE_DEDUP_TTL_MS` is below
   `DFKV_NODE_DEDUP_WAIT_MS`. A published node-dedup result is claimable only
   for the TTL; a peer rank that reaches it later (rank skew, a large leader
@@ -768,6 +789,8 @@
   dropped on finish, abort, preemption and failed load; RPC errors are not
   cached.
 
+## 2.34.0 — 2026-10-30
+
 - Stop whole-extent steals from wiping the newest residents. Cross-class
   steals (`StealFrom`, `StealExtentFor`) ranked extents by decayed read heat
   and then by fewest useful bytes; once read heat had decayed, that picked the
@@ -783,6 +806,8 @@
   were lost while the oldest KV survived 80% capacity of later writes; after,
   the oldest residents go first.
 
+## 2.33.3 — 2026-10-24
+
 - Save vLLM connector recurrent-state (Mamba) objects only from the blocks
   the engine hands off for committed boundaries (`kv_connector_block_state`),
   instead of locating them by position in an append-only mirror of the
@@ -794,6 +819,8 @@
   Engines without the hand-off keep 2.33.2's fail-closed rule; with the
   hand-off this also restores the external hits 2.33.2 lost for prompts
   prefilled in one step.
+
+## 2.33.2 — 2026-10-24
 
 - Fail closed on vLLM connector recurrent-state (Mamba) SAVEs whose
   boundary was not computed in the current step. The connector locates
@@ -831,390 +858,6 @@
   IDs in step with that position for KV events, skip zero-token steps
   without an allocation, and resynchronize a lagging tracker with a
   warning.
-
-- Preserve an initial, hard-budgeted receive chunk for dynamic GET and
-  leased-PUT staging when enough connection capacity remains. Connection
-  leases cannot fragment that chunk; pressure recovery reclaims only
-  quiescent, aged QPs and never revokes pending replies, disk reads, or
-  client READ grants. Truly exhausted pools still report backpressure.
-  Separate connection-eligible and staging-reserved free-space gauges.
-- Resume a marked interrupted first slab initialization only when its
-  geometry, empty table, and existing extents prove an unpopulated layout.
-  Preserve unknown or populated stores, and report the original startup
-  syscall errno (including soft file-descriptor exhaustion) instead of
-  silently creating missing data.
-- Add local and peer QP identities to failed server CQ diagnostics without
-  suppressing completion errors. The historical intermittent retry-exceeded
-  failure has not yet been attributed to a particular peer lifecycle.
-
-- Keep reply buffers behind their SEND fence while queueing early incoming
-  requests in a depth-bounded FIFO. Control/PUT receives are ready before the
-  reply is posted; receive-backed data sources retain their existing fence.
-  This avoids both depth-one reply-buffer races and receiver-not-ready stalls
-  in synchronous and io_uring loops, without timeout or retry changes.
-- Reuse RDMA capability observations only within a known peer publication;
-  invalidate them on endpoint failure, forced recovery and topology changes.
-  Anonymous/static peers retain fresh-QP negotiation.
-- Retain a bounded burst of idle data endpoints, retire excess endpoints after
-  application inactivity, and keep explicit `DFKV_RDMA_POOL_MAX` limits exact.
-  Keepalives no longer extend burst retention.
-- Serve arena-resident dynamic-pull GETs through exact READ grants while keeping
-  their arena pins until grant revocation. Account successful pull reads at
-  release without double-counting fallback probes.
-  Preserve the storage-handler latency boundary independently of client grant
-  hold time.
-- Apply the existing foreground PUT admission limit before RAM or disk work.
-  Preserve admitted RAM first-writer completion ownership across conflicting
-  duplicates, cancellation and remove/reinsert; do not bypass on a timer.
-  At a positive RAM-ACK dirty watermark, reject only new keys before admission;
-  this rejection never falls through to direct persistence. Zero watermark
-  retains its explicit disk-ACK behavior.
-  Keep admission and the first arena reservation under the same shard lock.
-- Preserve the authoritative backing value after RAM eviction. A conflicting
-  duplicate cannot create a RAM copy that differs from an existing disk key
-  and then misinterpret an idempotent disk write as persistence of those bytes.
-  Serialize foreground same-key PUTs across RAM admission and synchronous
-  capacity bypass, so an in-flight disk owner cannot race a new RAM generation.
-- Add per-phase connection diagnostics and optional registered PUT-source
-  benchmarking. PUT and GET stall timing uses a monotonic clock and is disabled
-  when not requested.
-
-- Add a read-only native `dfkv_max_block_bytes` query and startup layout checks
-  for HiCache host pools and vLLM cache groups. Undersized effective object
-  bounds fail before cache traffic instead of only surfacing as runtime misses.
-  Explicit limits and runtime transport rejection remain unchanged. Updated
-  connectors require the matching native library export.
-
-### v2.27.2 — Legacy and native vLLM compatibility
-
-- Restore one connector package for engines with the legacy `get_finished`
-  lifecycle and engines with native `get_transfer_results` support.
-- On legacy V1 engines, carry failed request identities through supported
-  worker metadata and enter the existing scheduler recovery/error path only
-  after all participating workers finish. No fabricated block IDs or installed
-  engine source-file patches are used.
-- Preserve originating-child routing through nested `MultiConnector` metadata;
-  do not retain or replay other connectors' historical metadata.
-- Register the external connector's canonical name so MultiConnector can
-  reconstruct cross-process statistics without terminating API output handling.
-  Preserve an operator's existing registration of the same class.
-- Keep serialized hybrid loads parked and fenced, quarantine failed external
-  hits, and preserve cancellation/deferred-free ownership. Native engines
-  continue to use their native request-failure protocol.
-- Register CPU connector and worker lifecycle regressions in CTest, and cover
-  old/native scheduler and executor behavior in their actual engine runtimes.
-- Correct v2.27.1's native-only connector compatibility restriction. Legacy
-  support requires the V1 worker-metadata, completion aggregation and scheduler
-  recovery hooks; arbitrary V0 engines or partial protocol backports are not
-  implied. No functional C++ changes, ABI/wire changes or stored-key migration.
-
-### v2.27.1 — Request-level hybrid KV load recovery
-
-- Adopt vLLM's native `KVConnectorTransferResults` protocol for hybrid and
-  multi-group loads instead of reporting ambiguous, group-less block IDs.
-- Publish paired receive completion/failure only after native writes and the
-  owning CUDA device are fenced; cover misses, malformed results, exceptions,
-  queue rejection and cancellation without losing or duplicating outcomes.
-- Keep `load_async=false` I/O serialized on the model thread while parking
-  hybrid requests until receive completion. Explicit device synchronization
-  also handles runners that defer the load hook until after a forward pass.
-- Bypass failed external hits for the rest of a request and rebuild retry
-  metadata from fresh allocations, including resumed MRV1 and MRV2 requests.
-- Remove the obsolete hybrid invalid-block scheduler patch. This connector
-  requires native `get_transfer_results` / `failed_recving` support throughout
-  the vLLM runner, executor and scheduler; older runtimes need an engine upgrade.
-- Preserve single full-attention block-level recovery and stored-key layout.
-  No functional C++/server, native ABI or wire-format changes.
-
-### v2.27.0 — Runtime RDMA providers and native hybrid-state integration
-
-- Include `ibverbs-providers` in the runtime image; exposing RDMA devices does
-  not make them discoverable when the userspace hardware plugins are absent.
-- Exercise real RDMA PUT/GET through the built runtime image when the CI
-  hardware probe succeeds, rather than relying on version or TCP-only checks.
-- Refresh the shipped SGLang hybrid Mamba/DSA patch for the pinned native
-  GLM-5.3-Flash image, preserving indexer sidecars and actual scaled-MLA host
-  geometry with the current allocator API.
-- Add a bounded real-GPU offload/poison/restore regression for KV, indexer,
-  temporal and convolution state, without model weights.
-- Ship a targeted native vLLM GLM-5.3-Flash V2-runner patch: exclude the
-  single-block kpool tail from generic position-indexed slot mapping, retaining
-  the dedicated circular metadata builder and existing allocation policy.
-- Document strict patch applicability and fresh cache generations. Native
-  client/server wire formats and connector runtime code are unchanged.
-
-### v2.26.4 — SGLang DeepSeek-V4.1 HiCache deployment guidance
-
-- Add the verified preview-image HiCache/L3 recipe and physical side-pool
-  requirements, including separate DSpark layout isolation.
-- Correct the object-bound configuration: the payload ceiling does not raise
-  the default 4 MiB RDMA object declaration. Explicitly select the data fabric.
-- Correct HiCache size units and distinguish GPU/host write-through from
-  asynchronous L3 backup, and local cache salt from L3 key isolation.
-- Document paired cold/GET-backed hot verification and workload-dependent
-  cache benefits. No connector runtime or functional C++ changes.
-
-### v2.26.3 — vLLM acceptance coverage
-
-- Replace the forwarding-only preemption test with a source-lifetime regression:
-  block reuse must wait for the old SAVE, which must retain the original bytes.
-- Cover consumer MRV1 synchronous/asynchronous recovery, prior-step/same-step
-  preemption, continued prefill, decode and completion without duplicate LOAD
-  or unauthorized SAVE.
-- Clarify that compatible object layouts do not validate old cache contents.
-  This release changes tests and documentation, not connector runtime behavior.
-
-### vLLM preemption safety
-
-- Fence cancelled receive work and in-flight SAVE sources through vLLM's
-  pre-forward `handle_preemptions` hook, before recycled blocks can be
-  overwritten. Synchronous LOAD submission remains in `start_load_kv`.
-- Preserve LOAD metadata for consumer-only MRV1 requests resumed through the
-  cached-request path while continuing to suppress SAVE work for that role.
-
-### vLLM stable hybrid and speculative cache restoration
-
-- Separate stable SAVE masks from LOAD requirements; exclude volatile draft
-  state and validate required objects at each shortened lookup boundary.
-- Bind full effective cache-spec geometry, including wrapped/DCP-adjusted
-  specs, into the `vllm-multiwr-v4` identity. Earlier Python layouts cold-miss;
-  the native C ABI and server wire protocol are unchanged.
-- Reject unallocated LOAD destinations and incomplete source chunks instead
-  of reading or publishing invalid cache state.
-- Drain mutable/windowed SAVE sources before the next model step can overwrite
-  them, while retaining overlap for immutable full-attention sources.
-- Fence asynchronous GET completion on the owning CUDA device captured from
-  the model thread, rather than the receive thread's default device.
-- Preserve fresh allocation and LOAD state when preemption and resumption
-  happen in the same scheduler step; clear the resume marker when MRV2
-  introduces the request again.
-- Restore MRV1 resumed requests from the complete allocated block table,
-  including asynchronously loaded blocks, rather than the step's delta.
-- Keep resumed SAVE completion accounting until finished GPU blocks can be
-  released; invalidate old SAVE generations before reuse so queued or cancelled
-  work cannot revive or decrement a new generation's counter.
-
-### Operation-scoped RDMA staging
-
-- Large scalar and scatter/gather PUTs negotiate exact operation-scoped
-  staging leases. Successful STORE revokes the remote MR before recycling
-  storage; failed connections keep storage until QP/MR teardown completes.
-- Direct scalar/SG GETs negotiate dynamic pull descriptors and explicitly
-  acknowledge release after local READ completions. Supported endpoints no
-  longer reserve a connection-lifetime pull arena.
-- `DFKV_RDMA_MAX_BLOCK_BYTES` remains the common PUT/GET object ceiling.
-  `DFKV_RDMA_INLINE_PUT_MAX_BYTES` defaults to 4 MiB (0 disables leased PUT);
-  `DFKV_RDMA_DYNAMIC_PULL` defaults to enabled (0 retains legacy pull).
-  Both capabilities are optional and negotiated before connection sizing.
-- Preserve mixed-batch invalid results and first-write-wins ordering; reuse
-  pooled legacy endpoints without repeated capability-probe/QP churn.
-  Insufficient GET capacity returns `kInvalid` without cooling a healthy peer.
-- Add delayed-DMA, MR/chunk reclamation, pressure, generation, old-peer and
-  posted-READ abandonment regressions. Hardware CI invokes the lease suites
-  in SYNC/io_uring and TSan modes and distinguishes skipped hardware probes.
-- Replace the in-process memory benchmark with an external-server client:
-  retain clients during idle sampling, record sampled server RSS/committed/
-  leased peaks, and validate every successful PUT with byte-exact GET.
-  Samples are not exact hardware high-water counters.
-
-### Hybrid inference cache correctness
-
-- Revalidate vLLM's length-dependent state mask after shortening a lookup
-  prefix, and reserve the sampling tail before lookup rather than truncating
-  an already validated hit.
-- Preserve each cache group's effective physical block coverage instead of
-  treating a small attention block as a whole scheduler-LCM region. Respect
-  nonpersistent scratch pools without forcing them into the hash geometry.
-- Store every TP-sharded recurrent checkpoint under its physical rank in the
-  `mamba` pool; retain attention replica striping without eliding required
-  state-shard clients. Old collapsed state keys and affected underfilled
-  heterogeneous layouts cold-miss after the identity correction; native wire,
-  raw payload and C ABI formats remain compatible.
-- Include the tested SGLang engine patch registering the missing DSA indexer
-  sidecar in hybrid Mamba stacks. Correct recurrent bytes alone do not make a
-  complete DSA cache; the indexer must survive the same fresh-process reload.
-
-### GPUDirect load memory ordering
-
-- Fence device-direct GET completions with a post-batch device
-  synchronization so kernels launched after the load observe the RDMA BAR
-  writes; arming `CU_POINTER_ATTRIBUTE_SYNC_MEMOPS` at registration where the
-  driver accepts it (VMM/cuMemMap pools reject it with a one-shot warning).
-  Observed live as exact-hit loads whose generation degraded into empty
-  reasoning until reordered. `DFKV_GPU_LOAD_FENCE=0` disables the fence.
-
-
-### SGLang Prefill-CP storage identity and physical rail affinity
-
-- Fixed SGLang DP-attention rail affinity to use the world-group node-local
-  process rank instead of TP/PCP coordinates. Eight TP-of-1 schedulers no
-  longer collapse onto rail 0; missing physical rank now fails startup.
-- Added the explicit `prefill_cp_storage_layout=replicated` contract for
-  rank-replicated MLA Prefill-CP. All CP readers retain the deployed CP size but
-  address the elected writer's `pcp_rank=0` key. DCP, DSA cache-layer split,
-  sharded, and ambiguous layouts fail closed.
-- Added HiCache parallel-identity and contiguous-prefix existence metrics, plus
-  native per-rail successful logical PUT/GET operation and payload-byte
-  counters.
-- Fixed three latent device-direct backup branches that referenced an
-  uninitialized page count/component count, and refreshed the CPU-only vLLM
-  test shims for the current world-group and asynchronous-load contracts.
-
-### RDMA receive-pool default capacity
-
-- Raised the default `DFKV_RDMA_RECV_SEGMENT_SIZE` hard budget from 16 GiB to
-  128 GiB. The receive pool remains lazy: startup commits only the initial
-  256 MiB chunk, so the larger default expands the growth ceiling without
-  eagerly pinning or registering 128 GiB. Explicit operator overrides are
-  unchanged.
-
-### vLLM long-context node-dedup load windows
-
-- Added opt-in `load_window_keys` and `load_window_min_keys` connector settings.
-  Large replicated loads can now publish bounded native GET results before the
-  same-host GPU dedup wait deadline, while short requests retain one native GET.
-- Defaults remain disabled. Values are validated at startup, preserve key/result
-  order, and retain one outer connector metric for the logical load.
-- On xb01-0064, a 1,000,000-token TP8 GLM-5.3 hot load with 128-key windows
-  reduced TTFT from 39.35 s to 22.92 s and reduced native remote fetches from
-  approximately eight copies to one, with zero dedup fallback. A 4,096-key
-  threshold kept the 65,536-token/C10 path unwindowed at 35,622 total tok/s.
-
-### Adaptive RDMA receive capacity and bounded high-water reclaim
-
-- Replaced the eagerly committed monolithic RDMA receive segment with a lazy
-  chunk pool. `DFKV_RDMA_RECV_SEGMENT_SIZE` remains the hard process budget;
-  `DFKV_RDMA_RECV_CHUNK_BYTES` (default 256 MiB) controls incremental commits.
-  Each connection publishes and registers only the chunk containing its lease.
-- Decoupled `DFKV_RDMA_MAX_BLOCK_BYTES` from physical connection geometry. It
-  remains the logical safety ceiling, while data QPs now negotiate a
-  power-of-two class sized to the current operation, with
-  `DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES` (default 256 KiB) as the floor.
-- Idle endpoint reuse selects the smallest sufficient class, and a full idle
-  pool prefers a smaller returning QP over its largest retained QP.
-- Extended adaptive geometry to QP depth: scalar operations open depth-1 QPs,
-  while batched operations select the smallest sufficient power-of-two depth.
-  Pool reuse and resource accounting now match both block and depth classes,
-  with bounded per-class opened/active/idle metrics.
-- Replaced per-connection pull-read MR registration with type-2 Memory Windows
-  over shared per-PD chunk MRs. Hardware without Memory Window support retains
-  the exact-range MR fallback and exposes which path each connection used.
-- Affinitized growth chunks to their first rail/NUMA node, and added idle
-  shrinking for empty non-initial chunks (`DFKV_RDMA_RECV_CHUNK_IDLE_MS`,
-  default 60 s). The initial shared chunk is never released.
-- Changed watermark eviction to a persistent high/low hysteresis drain bounded
-  by `DFKV_SLAB_EVICT_MAX_EXTENTS_PER_TICK` (default one). Whole extents clear
-  `slots.tbl` in one contiguous write instead of one 64-byte pwrite per slot.
-- Added receive-pool growth/shrink/budget, pull Memory Window/fallback,
-  adaptive connection-class, and watermark active/tick/duration/clear metrics.
-- Reused one preallocated zero-record buffer for extent metadata clears,
-  removing allocation and repeated zero-fill work from the watermark lock.
-- Completed vLLM replicated-MLA rank convergence: converged client-rank mode
-  automatically enables native same-host GPU rendezvous, so one rank performs
-  each remote GET and CUDA IPC publishes identical bytes to TP followers.
-- On xb01-0064, 80 live 1 MiB data QPs under a 64 MiB logical ceiling used
-  674 MiB across three lazy chunks and completed 10,000/10,000 PUTs; v2.23.3's
-  fixed geometry exhausted an 8 GiB segment at roughly 15 such QPs. Sustained
-  64 GiB high-water PUT improved from 5.39 to 6.71 GB/s, p99 from 63.8 to
-  24.1 ms, and max latency from 496.8 to 50.8 ms.
-
-### vLLM hybrid state and explicit TCP staging
-
-- Accepted align-mode hybrid cache groups whose Mamba block size differs from
-  the attention cache block size. The connector already resolves the scheduler
-  LCM and preserves each group's physical block geometry; the old equality
-  gate incorrectly rejected Qwen3.8-Flash-Next (`400` vs `4`) at startup.
-- Added opt-in `require_rdma=false` for the vLLM connector. The default remains
-  fail-closed GPUDirect RDMA; the opt-in path uses libdfkv's bounded host
-  staging plus final CUDA publication and enables a correctness-first fallback
-  when a platform's inbound GPUDirect GET path is unusable.
-
-### LMCache rank-local rail affinity
-
-- Added opt-in `rail_affinity` and `rail_affinity_fallbacks` plugin settings to
-  the in-process LMCache dfkv connector. Each worker now uses LMCache's explicit
-  per-host `local_worker_id` to apply the shared primary/fallback policy before
-  opening the native client; missing or invalid local metadata fails closed.
-- Kept the MP-server L2 adapter unchanged because it owns one shared dfkv
-  client and has no single physical GPU rank at construction.
-
-### vLLM rank-local rail affinity
-
-- Added `rail_affinity` and `rail_affinity_fallbacks` to
-  `DfkvStoreConnector`. Before opening the native client, each vLLM worker now
-  maps its world-group local rank to one primary plus a bounded ordered
-  fallback set, then sets `DFKV_RDMA_DEV`, `DFKV_RDMA_PRIMARY_DEV`, and
-  `DFKV_RDMA_NUMA=0`.
-- Moved the rail-list parsing, fallback bounds, duplicate rejection, and
-  environment update contract into `dfkv-common`; SGLang HiCache and vLLM now
-  share one implementation while retaining their framework-specific physical
-  rank resolution.
-
-### RDMA connection capacity
-
-- Unified scalar and scatter-gather data operations on one exclusive-ownership
-  endpoint pool. Control operations remain isolated. Ring autoscaling now sizes
-  `nodes × 2 pools × max(pool limit, rails) × 1.25`.
-- Lowered the per-peer/pool idle default from 16 to 8: seven process-wide read
-  workers plus one warm spare avoid reconnect churn, while a cap of four is
-  proven to reopen three endpoints under a seven-way concurrent wave.
-- With 4 MiB blocks and depth four, one pull data connection leases
-  33,587,200 bytes. The xb01 14×TP8, per-pool-limit-8 envelope is 896 data plus
-  896 smaller control connections per server. Including 25% churn consumes
-  37,984,665,600 bytes (35.4 GiB), so xb01's 64 GiB setting remains sufficient;
-  increasing it to 128 GiB is unnecessary.
-- On xb01-gpu-200b-0064, 64 GiB and 128 GiB segments both registered on
-  `ib7s400p6` with zero allocation failures. Readiness took 21 s and 43 s
-  respectively, so 128 GiB doubles the pinned MR and adds 22 s startup latency
-  without serving the current capacity envelope.
-- Added client idle/active pool gauges by operation lane and rail, live
-  connection gauges by peer and local rail, and the pool limit. Added server
-  receive-segment used/free/largest-range, allocation-failure, pull/legacy
-  connection, and data/control leased-byte metrics.
-- `rail_affinity=true` now assigns each rank one primary plus one ordered
-  neighboring fallback HCA by default. `rail_affinity_fallbacks=0` restores
-  strict one-rank/one-rail binding; larger values remain bounded by the
-  configured HCA list.
-
-### Metrics HTTP clean close
-
-- Consume the complete HTTP request-head section, bounded to 32 KiB and by the
-  existing accept-time absolute deadline, before rendering server or MDS
-  metrics. Closing no longer leaves unread Prometheus headers that force Linux
-  to send a TCP RST and truncate large remote scrapes.
-- Preserve the existing one-request connection model, connection cap,
-  slow-drip protection, health/readiness semantics, and send timeout. Successful
-  responses now finish with an explicit write-side shutdown and clean EOF.
-- Add realistic Prometheus headers, a 256 KiB byte-exact response, clean-EOF,
-  split-header, header-drip, and oversized unterminated-header regressions.
-
-### CUDA GET pinned publication pool
-
-- Replaced per-operation CUDA host registration for GET publication with a
-  process-wide, bounded, reusable portable-pinned bounce pool. Slots are fixed
-  size, allocated and pinned/registered once on first use, exclusively leased,
-  and returned only after the stream-ordered host-to-device copy synchronizes.
-- Added `DFKV_CUDA_PINNED_POOL_BYTES` (default 67108864, 64 MiB; maximum
-  4 GiB) and `DFKV_CUDA_PINNED_SLOT_BYTES` (default 4194304, 4 MiB; accepted
-  range 4 KiB–64 MiB). Values are positive decimal byte counts; the budget
-  rounds down to whole slots with at least one and at most 4096 slots. Invalid
-  sizing warns and falls back to both defaults. Allocation is lazy, so
-  pinned-memory and memlock consumption grows only to the concurrent high-water
-  and remains bounded by that rounded per-process budget.
-- When every slot is leased and the budget is exhausted, CUDA GET publication
-  blocks until a slot is returned rather than allocating beyond the bound.
-  Payloads larger than one slot are published in fixed-size chunks.
-- Kept RDMA retry data in operation-owned pageable staging. Only the final
-  winning attempt is copied through the pinned pool to caller CUDA memory, so a
-  failed rail cannot partially publish into the caller buffer. Direct
-  GPUDirect GET would violate that retry fence; GPUDirect PUT remains unchanged.
-- CUDA context preservation, multi-device publication, byte-exact mixed
-  scatter-gather behavior, synchronous completion, fail-closed CUDA errors,
-  parent-process teardown, and fail-closed post-fork child behavior are
-  preserved. A slot whose stream synchronization fails is quarantined and kept
-  pinned until process exit rather than risking release while the driver may
-  still reference it. Deployments must provision `RLIMIT_MEMLOCK` for the
-  pool's lazy high-water plus other locked memory.
 
 ## 2.33.0
 
@@ -1273,6 +916,430 @@
   depth-windowed string batches, whole-object capacity rejection and
   explicit release of empty EOF grants. Remove retired GET-WRITE/fixed-pull
   metric series rather than exposing misleading zero aliases.
+
+## 2.30.0 — 2026-10-05
+
+- Preserve an initial, hard-budgeted receive chunk for dynamic GET and
+  leased-PUT staging when enough connection capacity remains. Connection
+  leases cannot fragment that chunk; pressure recovery reclaims only
+  quiescent, aged QPs and never revokes pending replies, disk reads, or
+  client READ grants. Truly exhausted pools still report backpressure.
+  Separate connection-eligible and staging-reserved free-space gauges.
+- Resume a marked interrupted first slab initialization only when its
+  geometry, empty table, and existing extents prove an unpopulated layout.
+  Preserve unknown or populated stores, and report the original startup
+  syscall errno (including soft file-descriptor exhaustion) instead of
+  silently creating missing data.
+- Add local and peer QP identities to failed server CQ diagnostics without
+  suppressing completion errors. The historical intermittent retry-exceeded
+  failure has not yet been attributed to a particular peer lifecycle.
+
+## 2.29.0 — 2026-10-04
+
+- Keep reply buffers behind their SEND fence while queueing early incoming
+  requests in a depth-bounded FIFO. Control/PUT receives are ready before the
+  reply is posted; receive-backed data sources retain their existing fence.
+  This avoids both depth-one reply-buffer races and receiver-not-ready stalls
+  in synchronous and io_uring loops, without timeout or retry changes.
+- Reuse RDMA capability observations only within a known peer publication;
+  invalidate them on endpoint failure, forced recovery and topology changes.
+  Anonymous/static peers retain fresh-QP negotiation.
+- Retain a bounded burst of idle data endpoints, retire excess endpoints after
+  application inactivity, and keep explicit `DFKV_RDMA_POOL_MAX` limits exact.
+  Keepalives no longer extend burst retention.
+- Serve arena-resident dynamic-pull GETs through exact READ grants while keeping
+  their arena pins until grant revocation. Account successful pull reads at
+  release without double-counting fallback probes.
+  Preserve the storage-handler latency boundary independently of client grant
+  hold time.
+- Apply the existing foreground PUT admission limit before RAM or disk work.
+  Preserve admitted RAM first-writer completion ownership across conflicting
+  duplicates, cancellation and remove/reinsert; do not bypass on a timer.
+  At a positive RAM-ACK dirty watermark, reject only new keys before admission;
+  this rejection never falls through to direct persistence. Zero watermark
+  retains its explicit disk-ACK behavior.
+  Keep admission and the first arena reservation under the same shard lock.
+- Preserve the authoritative backing value after RAM eviction. A conflicting
+  duplicate cannot create a RAM copy that differs from an existing disk key
+  and then misinterpret an idempotent disk write as persistence of those bytes.
+  Serialize foreground same-key PUTs across RAM admission and synchronous
+  capacity bypass, so an in-flight disk owner cannot race a new RAM generation.
+- Add per-phase connection diagnostics and optional registered PUT-source
+  benchmarking. PUT and GET stall timing uses a monotonic clock and is disabled
+  when not requested.
+
+## 2.28.0 — 2026-09-22
+
+- Add a read-only native `dfkv_max_block_bytes` query and startup layout checks
+  for HiCache host pools and vLLM cache groups. Undersized effective object
+  bounds fail before cache traffic instead of only surfacing as runtime misses.
+  Explicit limits and runtime transport rejection remain unchanged. Updated
+  connectors require the matching native library export.
+
+## 2.27.2 — 2026-09-17
+
+### v2.27.2 — Legacy and native vLLM compatibility
+
+- Restore one connector package for engines with the legacy `get_finished`
+  lifecycle and engines with native `get_transfer_results` support.
+- On legacy V1 engines, carry failed request identities through supported
+  worker metadata and enter the existing scheduler recovery/error path only
+  after all participating workers finish. No fabricated block IDs or installed
+  engine source-file patches are used.
+- Preserve originating-child routing through nested `MultiConnector` metadata;
+  do not retain or replay other connectors' historical metadata.
+- Register the external connector's canonical name so MultiConnector can
+  reconstruct cross-process statistics without terminating API output handling.
+  Preserve an operator's existing registration of the same class.
+- Keep serialized hybrid loads parked and fenced, quarantine failed external
+  hits, and preserve cancellation/deferred-free ownership. Native engines
+  continue to use their native request-failure protocol.
+- Register CPU connector and worker lifecycle regressions in CTest, and cover
+  old/native scheduler and executor behavior in their actual engine runtimes.
+- Correct v2.27.1's native-only connector compatibility restriction. Legacy
+  support requires the V1 worker-metadata, completion aggregation and scheduler
+  recovery hooks; arbitrary V0 engines or partial protocol backports are not
+  implied. No functional C++ changes, ABI/wire changes or stored-key migration.
+
+## 2.27.1 — 2026-09-17
+
+### v2.27.1 — Request-level hybrid KV load recovery
+
+- Adopt vLLM's native `KVConnectorTransferResults` protocol for hybrid and
+  multi-group loads instead of reporting ambiguous, group-less block IDs.
+- Publish paired receive completion/failure only after native writes and the
+  owning CUDA device are fenced; cover misses, malformed results, exceptions,
+  queue rejection and cancellation without losing or duplicating outcomes.
+- Keep `load_async=false` I/O serialized on the model thread while parking
+  hybrid requests until receive completion. Explicit device synchronization
+  also handles runners that defer the load hook until after a forward pass.
+- Bypass failed external hits for the rest of a request and rebuild retry
+  metadata from fresh allocations, including resumed MRV1 and MRV2 requests.
+- Remove the obsolete hybrid invalid-block scheduler patch. This connector
+  requires native `get_transfer_results` / `failed_recving` support throughout
+  the vLLM runner, executor and scheduler; older runtimes need an engine upgrade.
+- Preserve single full-attention block-level recovery and stored-key layout.
+  No functional C++/server, native ABI or wire-format changes.
+
+## 2.27.0 — 2026-09-13
+
+### v2.27.0 — Runtime RDMA providers and native hybrid-state integration
+
+- Include `ibverbs-providers` in the runtime image; exposing RDMA devices does
+  not make them discoverable when the userspace hardware plugins are absent.
+- Exercise real RDMA PUT/GET through the built runtime image when the CI
+  hardware probe succeeds, rather than relying on version or TCP-only checks.
+- Refresh the shipped SGLang hybrid Mamba/DSA patch for the pinned native
+  GLM-5.3-Flash image, preserving indexer sidecars and actual scaled-MLA host
+  geometry with the current allocator API.
+- Add a bounded real-GPU offload/poison/restore regression for KV, indexer,
+  temporal and convolution state, without model weights.
+- Ship a targeted native vLLM GLM-5.3-Flash V2-runner patch: exclude the
+  single-block kpool tail from generic position-indexed slot mapping, retaining
+  the dedicated circular metadata builder and existing allocation policy.
+- Document strict patch applicability and fresh cache generations. Native
+  client/server wire formats and connector runtime code are unchanged.
+
+## 2.26.4 — 2026-09-11
+
+### v2.26.4 — SGLang DeepSeek-V4.1 HiCache deployment guidance
+
+- Add the verified preview-image HiCache/L3 recipe and physical side-pool
+  requirements, including separate DSpark layout isolation.
+- Correct the object-bound configuration: the payload ceiling does not raise
+  the default 4 MiB RDMA object declaration. Explicitly select the data fabric.
+- Correct HiCache size units and distinguish GPU/host write-through from
+  asynchronous L3 backup, and local cache salt from L3 key isolation.
+- Document paired cold/GET-backed hot verification and workload-dependent
+  cache benefits. No connector runtime or functional C++ changes.
+
+## 2.26.3 — 2026-09-11
+
+### v2.26.3 — vLLM acceptance coverage
+
+- Replace the forwarding-only preemption test with a source-lifetime regression:
+  block reuse must wait for the old SAVE, which must retain the original bytes.
+- Cover consumer MRV1 synchronous/asynchronous recovery, prior-step/same-step
+  preemption, continued prefill, decode and completion without duplicate LOAD
+  or unauthorized SAVE.
+- Clarify that compatible object layouts do not validate old cache contents.
+  This release changes tests and documentation, not connector runtime behavior.
+
+## 2.26.2 — 2026-09-11
+
+### vLLM preemption safety
+
+- Fence cancelled receive work and in-flight SAVE sources through vLLM's
+  pre-forward `handle_preemptions` hook, before recycled blocks can be
+  overwritten. Synchronous LOAD submission remains in `start_load_kv`.
+- Preserve LOAD metadata for consumer-only MRV1 requests resumed through the
+  cached-request path while continuing to suppress SAVE work for that role.
+
+## 2.26.1 — 2026-09-11
+
+### vLLM stable hybrid and speculative cache restoration
+
+- Separate stable SAVE masks from LOAD requirements; exclude volatile draft
+  state and validate required objects at each shortened lookup boundary.
+- Bind full effective cache-spec geometry, including wrapped/DCP-adjusted
+  specs, into the `vllm-multiwr-v4` identity. Earlier Python layouts cold-miss;
+  the native C ABI and server wire protocol are unchanged.
+- Reject unallocated LOAD destinations and incomplete source chunks instead
+  of reading or publishing invalid cache state.
+- Drain mutable/windowed SAVE sources before the next model step can overwrite
+  them, while retaining overlap for immutable full-attention sources.
+- Fence asynchronous GET completion on the owning CUDA device captured from
+  the model thread, rather than the receive thread's default device.
+- Preserve fresh allocation and LOAD state when preemption and resumption
+  happen in the same scheduler step; clear the resume marker when MRV2
+  introduces the request again.
+- Restore MRV1 resumed requests from the complete allocated block table,
+  including asynchronously loaded blocks, rather than the step's delta.
+- Keep resumed SAVE completion accounting until finished GPU blocks can be
+  released; invalidate old SAVE generations before reuse so queued or cancelled
+  work cannot revive or decrement a new generation's counter.
+
+## 2.26.0 — 2026-09-08
+
+### Operation-scoped RDMA staging
+
+- Large scalar and scatter/gather PUTs negotiate exact operation-scoped
+  staging leases. Successful STORE revokes the remote MR before recycling
+  storage; failed connections keep storage until QP/MR teardown completes.
+- Direct scalar/SG GETs negotiate dynamic pull descriptors and explicitly
+  acknowledge release after local READ completions. Supported endpoints no
+  longer reserve a connection-lifetime pull arena.
+- `DFKV_RDMA_MAX_BLOCK_BYTES` remains the common PUT/GET object ceiling.
+  `DFKV_RDMA_INLINE_PUT_MAX_BYTES` defaults to 4 MiB (0 disables leased PUT);
+  `DFKV_RDMA_DYNAMIC_PULL` defaults to enabled (0 retains legacy pull).
+  Both capabilities are optional and negotiated before connection sizing.
+- Preserve mixed-batch invalid results and first-write-wins ordering; reuse
+  pooled legacy endpoints without repeated capability-probe/QP churn.
+  Insufficient GET capacity returns `kInvalid` without cooling a healthy peer.
+- Add delayed-DMA, MR/chunk reclamation, pressure, generation, old-peer and
+  posted-READ abandonment regressions. Hardware CI invokes the lease suites
+  in SYNC/io_uring and TSan modes and distinguishes skipped hardware probes.
+- Replace the in-process memory benchmark with an external-server client:
+  retain clients during idle sampling, record sampled server RSS/committed/
+  leased peaks, and validate every successful PUT with byte-exact GET.
+  Samples are not exact hardware high-water counters.
+
+### Hybrid inference cache correctness
+
+- Revalidate vLLM's length-dependent state mask after shortening a lookup
+  prefix, and reserve the sampling tail before lookup rather than truncating
+  an already validated hit.
+- Preserve each cache group's effective physical block coverage instead of
+  treating a small attention block as a whole scheduler-LCM region. Respect
+  nonpersistent scratch pools without forcing them into the hash geometry.
+- Store every TP-sharded recurrent checkpoint under its physical rank in the
+  `mamba` pool; retain attention replica striping without eliding required
+  state-shard clients. Old collapsed state keys and affected underfilled
+  heterogeneous layouts cold-miss after the identity correction; native wire,
+  raw payload and C ABI formats remain compatible.
+- Include the tested SGLang engine patch registering the missing DSA indexer
+  sidecar in hybrid Mamba stacks. Correct recurrent bytes alone do not make a
+  complete DSA cache; the indexer must survive the same fresh-process reload.
+
+### GPUDirect load memory ordering
+
+- Fence device-direct GET completions with a post-batch device
+  synchronization so kernels launched after the load observe the RDMA BAR
+  writes; arming `CU_POINTER_ATTRIBUTE_SYNC_MEMOPS` at registration where the
+  driver accepts it (VMM/cuMemMap pools reject it with a one-shot warning).
+  Observed live as exact-hit loads whose generation degraded into empty
+  reasoning until reordered. `DFKV_GPU_LOAD_FENCE=0` disables the fence.
+
+
+## 2.25.0 — 2026-09-03
+
+### SGLang Prefill-CP storage identity and physical rail affinity
+
+- Fixed SGLang DP-attention rail affinity to use the world-group node-local
+  process rank instead of TP/PCP coordinates. Eight TP-of-1 schedulers no
+  longer collapse onto rail 0; missing physical rank now fails startup.
+- Added the explicit `prefill_cp_storage_layout=replicated` contract for
+  rank-replicated MLA Prefill-CP. All CP readers retain the deployed CP size but
+  address the elected writer's `pcp_rank=0` key. DCP, DSA cache-layer split,
+  sharded, and ambiguous layouts fail closed.
+- Added HiCache parallel-identity and contiguous-prefix existence metrics, plus
+  native per-rail successful logical PUT/GET operation and payload-byte
+  counters.
+- Fixed three latent device-direct backup branches that referenced an
+  uninitialized page count/component count, and refreshed the CPU-only vLLM
+  test shims for the current world-group and asynchronous-load contracts.
+
+## 2.24.2 — 2026-08-30
+
+### RDMA receive-pool default capacity
+
+- Raised the default `DFKV_RDMA_RECV_SEGMENT_SIZE` hard budget from 16 GiB to
+  128 GiB. The receive pool remains lazy: startup commits only the initial
+  256 MiB chunk, so the larger default expands the growth ceiling without
+  eagerly pinning or registering 128 GiB. Explicit operator overrides are
+  unchanged.
+
+## 2.24.1 — 2026-08-30
+
+### vLLM long-context node-dedup load windows
+
+- Added opt-in `load_window_keys` and `load_window_min_keys` connector settings.
+  Large replicated loads can now publish bounded native GET results before the
+  same-host GPU dedup wait deadline, while short requests retain one native GET.
+- Defaults remain disabled. Values are validated at startup, preserve key/result
+  order, and retain one outer connector metric for the logical load.
+- On xb01-0064, a 1,000,000-token TP8 GLM-5.3 hot load with 128-key windows
+  reduced TTFT from 39.35 s to 22.92 s and reduced native remote fetches from
+  approximately eight copies to one, with zero dedup fallback. A 4,096-key
+  threshold kept the 65,536-token/C10 path unwindowed at 35,622 total tok/s.
+
+## 2.24.0 — 2026-08-28
+
+### Adaptive RDMA receive capacity and bounded high-water reclaim
+
+- Replaced the eagerly committed monolithic RDMA receive segment with a lazy
+  chunk pool. `DFKV_RDMA_RECV_SEGMENT_SIZE` remains the hard process budget;
+  `DFKV_RDMA_RECV_CHUNK_BYTES` (default 256 MiB) controls incremental commits.
+  Each connection publishes and registers only the chunk containing its lease.
+- Decoupled `DFKV_RDMA_MAX_BLOCK_BYTES` from physical connection geometry. It
+  remains the logical safety ceiling, while data QPs now negotiate a
+  power-of-two class sized to the current operation, with
+  `DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES` (default 256 KiB) as the floor.
+- Idle endpoint reuse selects the smallest sufficient class, and a full idle
+  pool prefers a smaller returning QP over its largest retained QP.
+- Extended adaptive geometry to QP depth: scalar operations open depth-1 QPs,
+  while batched operations select the smallest sufficient power-of-two depth.
+  Pool reuse and resource accounting now match both block and depth classes,
+  with bounded per-class opened/active/idle metrics.
+- Replaced per-connection pull-read MR registration with type-2 Memory Windows
+  over shared per-PD chunk MRs. Hardware without Memory Window support retains
+  the exact-range MR fallback and exposes which path each connection used.
+- Affinitized growth chunks to their first rail/NUMA node, and added idle
+  shrinking for empty non-initial chunks (`DFKV_RDMA_RECV_CHUNK_IDLE_MS`,
+  default 60 s). The initial shared chunk is never released.
+- Changed watermark eviction to a persistent high/low hysteresis drain bounded
+  by `DFKV_SLAB_EVICT_MAX_EXTENTS_PER_TICK` (default one). Whole extents clear
+  `slots.tbl` in one contiguous write instead of one 64-byte pwrite per slot.
+- Added receive-pool growth/shrink/budget, pull Memory Window/fallback,
+  adaptive connection-class, and watermark active/tick/duration/clear metrics.
+- Reused one preallocated zero-record buffer for extent metadata clears,
+  removing allocation and repeated zero-fill work from the watermark lock.
+- Completed vLLM replicated-MLA rank convergence: converged client-rank mode
+  automatically enables native same-host GPU rendezvous, so one rank performs
+  each remote GET and CUDA IPC publishes identical bytes to TP followers.
+- On xb01-0064, 80 live 1 MiB data QPs under a 64 MiB logical ceiling used
+  674 MiB across three lazy chunks and completed 10,000/10,000 PUTs; v2.23.3's
+  fixed geometry exhausted an 8 GiB segment at roughly 15 such QPs. Sustained
+  64 GiB high-water PUT improved from 5.39 to 6.71 GB/s, p99 from 63.8 to
+  24.1 ms, and max latency from 496.8 to 50.8 ms.
+
+## 2.23.3 — 2026-08-28
+
+### vLLM hybrid state and explicit TCP staging
+
+- Accepted align-mode hybrid cache groups whose Mamba block size differs from
+  the attention cache block size. The connector already resolves the scheduler
+  LCM and preserves each group's physical block geometry; the old equality
+  gate incorrectly rejected Qwen3.8-Flash-Next (`400` vs `4`) at startup.
+- Added opt-in `require_rdma=false` for the vLLM connector. The default remains
+  fail-closed GPUDirect RDMA; the opt-in path uses libdfkv's bounded host
+  staging plus final CUDA publication and enables a correctness-first fallback
+  when a platform's inbound GPUDirect GET path is unusable.
+
+## 2.23.2 — 2026-08-19
+
+### LMCache rank-local rail affinity
+
+- Added opt-in `rail_affinity` and `rail_affinity_fallbacks` plugin settings to
+  the in-process LMCache dfkv connector. Each worker now uses LMCache's explicit
+  per-host `local_worker_id` to apply the shared primary/fallback policy before
+  opening the native client; missing or invalid local metadata fails closed.
+- Kept the MP-server L2 adapter unchanged because it owns one shared dfkv
+  client and has no single physical GPU rank at construction.
+
+## 2.23.1 — 2026-08-19
+
+### vLLM rank-local rail affinity
+
+- Added `rail_affinity` and `rail_affinity_fallbacks` to
+  `DfkvStoreConnector`. Before opening the native client, each vLLM worker now
+  maps its world-group local rank to one primary plus a bounded ordered
+  fallback set, then sets `DFKV_RDMA_DEV`, `DFKV_RDMA_PRIMARY_DEV`, and
+  `DFKV_RDMA_NUMA=0`.
+- Moved the rail-list parsing, fallback bounds, duplicate rejection, and
+  environment update contract into `dfkv-common`; SGLang HiCache and vLLM now
+  share one implementation while retaining their framework-specific physical
+  rank resolution.
+
+## 2.23.0 — 2026-08-18
+
+### RDMA connection capacity
+
+- Unified scalar and scatter-gather data operations on one exclusive-ownership
+  endpoint pool. Control operations remain isolated. Ring autoscaling now sizes
+  `nodes × 2 pools × max(pool limit, rails) × 1.25`.
+- Lowered the per-peer/pool idle default from 16 to 8: seven process-wide read
+  workers plus one warm spare avoid reconnect churn, while a cap of four is
+  proven to reopen three endpoints under a seven-way concurrent wave.
+- With 4 MiB blocks and depth four, one pull data connection leases
+  33,587,200 bytes. The xb01 14×TP8, per-pool-limit-8 envelope is 896 data plus
+  896 smaller control connections per server. Including 25% churn consumes
+  37,984,665,600 bytes (35.4 GiB), so xb01's 64 GiB setting remains sufficient;
+  increasing it to 128 GiB is unnecessary.
+- On xb01-gpu-200b-0064, 64 GiB and 128 GiB segments both registered on
+  `ib7s400p6` with zero allocation failures. Readiness took 21 s and 43 s
+  respectively, so 128 GiB doubles the pinned MR and adds 22 s startup latency
+  without serving the current capacity envelope.
+- Added client idle/active pool gauges by operation lane and rail, live
+  connection gauges by peer and local rail, and the pool limit. Added server
+  receive-segment used/free/largest-range, allocation-failure, pull/legacy
+  connection, and data/control leased-byte metrics.
+- `rail_affinity=true` now assigns each rank one primary plus one ordered
+  neighboring fallback HCA by default. `rail_affinity_fallbacks=0` restores
+  strict one-rank/one-rail binding; larger values remain bounded by the
+  configured HCA list.
+
+### Metrics HTTP clean close
+
+- Consume the complete HTTP request-head section, bounded to 32 KiB and by the
+  existing accept-time absolute deadline, before rendering server or MDS
+  metrics. Closing no longer leaves unread Prometheus headers that force Linux
+  to send a TCP RST and truncate large remote scrapes.
+- Preserve the existing one-request connection model, connection cap,
+  slow-drip protection, health/readiness semantics, and send timeout. Successful
+  responses now finish with an explicit write-side shutdown and clean EOF.
+- Add realistic Prometheus headers, a 256 KiB byte-exact response, clean-EOF,
+  split-header, header-drip, and oversized unterminated-header regressions.
+
+## 2.20.0 — 2026-08-14
+
+### CUDA GET pinned publication pool
+
+- Replaced per-operation CUDA host registration for GET publication with a
+  process-wide, bounded, reusable portable-pinned bounce pool. Slots are fixed
+  size, allocated and pinned/registered once on first use, exclusively leased,
+  and returned only after the stream-ordered host-to-device copy synchronizes.
+- Added `DFKV_CUDA_PINNED_POOL_BYTES` (default 67108864, 64 MiB; maximum
+  4 GiB) and `DFKV_CUDA_PINNED_SLOT_BYTES` (default 4194304, 4 MiB; accepted
+  range 4 KiB–64 MiB). Values are positive decimal byte counts; the budget
+  rounds down to whole slots with at least one and at most 4096 slots. Invalid
+  sizing warns and falls back to both defaults. Allocation is lazy, so
+  pinned-memory and memlock consumption grows only to the concurrent high-water
+  and remains bounded by that rounded per-process budget.
+- When every slot is leased and the budget is exhausted, CUDA GET publication
+  blocks until a slot is returned rather than allocating beyond the bound.
+  Payloads larger than one slot are published in fixed-size chunks.
+- Kept RDMA retry data in operation-owned pageable staging. Only the final
+  winning attempt is copied through the pinned pool to caller CUDA memory, so a
+  failed rail cannot partially publish into the caller buffer. Direct
+  GPUDirect GET would violate that retry fence; GPUDirect PUT remains unchanged.
+- CUDA context preservation, multi-device publication, byte-exact mixed
+  scatter-gather behavior, synchronous completion, fail-closed CUDA errors,
+  parent-process teardown, and fail-closed post-fork child behavior are
+  preserved. A slot whose stream synchronization fails is quarantined and kept
+  pinned until process exit rather than risking release while the driver may
+  still reference it. Deployments must provision `RLIMIT_MEMLOCK` for the
+  pool's lazy high-water plus other locked memory.
 
 ## v2.19.0 — 2026-08-13
 

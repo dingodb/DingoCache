@@ -39,6 +39,21 @@ class ReleaseVersionContractTest(unittest.TestCase):
         for manifest in manifests[1:]:
             self.assertIn(required, manifest.read_text(encoding="utf-8"), manifest)
 
+    def test_changelog_has_a_section_for_the_current_version(self):
+        # The commit that bumps VERSION also closes "## Unreleased": it puts
+        # a "## <version> — <date>" heading above the entries the release
+        # ships and leaves "## Unreleased" on top for what comes next.
+        version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        headings = [line for line in changelog.splitlines() if line.startswith("## ")]
+        self.assertEqual(headings[0], "## Unreleased")
+        self.assertRegex(
+            headings[1],
+            rf"^## {re.escape(version)} — \d{{4}}-\d{{2}}-\d{{2}}$",
+            "CHANGELOG.md: the first heading after '## Unreleased' must be "
+            f"'## {version} — <YYYY-MM-DD>' (VERSION is {version})",
+        )
+
     def test_release_workflow_checks_tag_version(self):
         workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8"
