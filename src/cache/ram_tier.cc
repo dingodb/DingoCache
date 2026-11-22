@@ -775,7 +775,22 @@ RamTier::Admission RamTier::Admit(
   {
     auto existing = s.index.find(key);
     if (existing != s.index.end()) {
-      if (existing->second.remove_pending) return Admission::kRejected;
+      // A stale copy (below) that a reader still holds goes on to the disk
+      // as well; only a copy a REMOVE is taking out refuses the PUT.
+      if (existing->second.remove_pending)
+        return existing->second.stale ? Admission::kBypass
+                                      : Admission::kRejected;
+      // A written copy of a key the disk no longer has (it evicted the key,
+      // or the key was removed from the disk alone): this PUT is not a
+      // duplicate of a stored value. The stale copy goes, and the PUT goes
+      // to the disk like any new key there.
+      if (existing->second.durable && opt_.is_persisted &&
+          !opt_.is_persisted(key)) {
+        existing->second.remove_pending = true;
+        existing->second.stale = true;
+        DropLocked(s, key);
+        return Admission::kBypass;
+      }
       if (!existing->second.completion) {
         existing->second.completion = std::make_shared<PutCompletion>();
         CompletePut(existing->second.completion, existing->second.durable);

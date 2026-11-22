@@ -2324,3 +2324,27 @@ TEST(RamTierWiring, ARamFlushReachesADirectModeSlabThroughTheGroup) {
   ::unsetenv("DFKV_SLAB_WRITE");
   fs::remove_all(dir);
 }
+
+// ---- The RAM tier and a disk that evicted its copy (REQ-17) -----------------
+// A value in RAM as a written copy whose disk copy is gone (the disk evicted
+// it, or it was removed from the disk alone). A PUT of the key is not a
+// duplicate of something stored: the stale copy is dropped and the PUT is
+// written to the disk. It used to be answered kOk as a duplicate of the RAM copy and
+// never reached the disk, so the key was lost once RAM evicted it.
+TEST(RamTierFlushFailure, APutOfAKeyTheDiskNoLongerHasReachesTheDisk) {
+  FlushFailNode node("disk_evicted");
+  ASSERT_TRUE(node.server->ram_enabled());
+  const BlockKey key{1, 0};
+  ASSERT_EQ(node.Put(1), Status::kOk);
+  ASSERT_TRUE(node.Settled());
+  ASSERT_EQ(node.Metric("dfkv_ram_flushed_total"), 1);
+  ASSERT_EQ(node.stores[0]->Remove(key), Status::kOk);  // disk only
+  ASSERT_TRUE(KvNodeServerWiringTestPeer::Resident(*node.server, key));
+  ASSERT_FALSE(node.stores[0]->IsCached(key));
+  EXPECT_EQ(node.Put(1), Status::kOk);
+  ASSERT_TRUE(node.Settled());
+  EXPECT_TRUE(node.stores[0]->IsCached(key)) << "the PUT never reached the disk";
+  EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*node.server, key))
+      << "the stale RAM copy is gone; the PUT was written to the disk itself";
+  EXPECT_EQ(node.Get(1), Status::kOk);
+}

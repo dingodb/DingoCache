@@ -3,6 +3,16 @@
 ## Unreleased
 
 
+- Server, RAM tier: a PUT of a key whose RAM copy is still there after the
+  disk evicted the key now reaches the disk. A value written from RAM stays
+  in RAM as a written copy; when the disk evicted its copy (or the key was
+  removed from the disk alone), a later PUT of the key was answered `kOk`
+  as a duplicate of the RAM copy and never written, so the key was gone
+  once RAM evicted it too. Now such a PUT drops the stale RAM copy and is
+  written to the disk directly, as a PUT of a new key the RAM tier cannot
+  take is. A PUT of a key whose RAM value is still to be written is a
+  duplicate as before. No setting, API or wire change.
+
 - MDS: what etcd answers when it refuses a request is now logged, and
   refused writes and damaged member records are visible as metrics and
   alerts. The MDS request path logged nothing: an etcd out of space only

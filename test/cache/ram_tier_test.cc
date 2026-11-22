@@ -2662,3 +2662,24 @@ TEST(RamTierFlushFailure, AValueTheDiskRefusesIsDroppedAtOnceNotLost) {
     EXPECT_TRUE(rt.healthy());
   }
 }
+
+// A written copy of a key the disk no longer has is dropped by the next PUT,
+// which goes to the disk. If a reader still holds the copy, the drop is
+// deferred until the reader lets go; a further PUT meanwhile must go to the
+// disk as well, not be refused as if the key were being removed (that answer
+// is kIOError, on which clients cool the node down).
+TEST(RamTier, APutAfterAStaleCopyWasDroppedUnderAReaderGoesToTheDisk) {
+  FlushSink sink;
+  RamTier::Options o = Opts(64 * 4096);
+  o.is_persisted = [](const BlockKey&) { return false; };  // the disk lost it
+  RamTier rt(o, sink.fn());
+  const std::string v(5000, 's');
+  ASSERT_TRUE(rt.PutDurable(K(1), v.data(), v.size()));
+  RamTier::Hit reader;
+  ASSERT_TRUE(rt.GetPrep(K(1), 0, v.size(), &reader));  // holds a send pin
+  RamTier::PutResult first = rt.PutWriteBack(K(1), v.data(), v.size());
+  EXPECT_EQ(first.disposition, RamTier::PutDisposition::kBypass);
+  RamTier::PutResult second = rt.PutWriteBack(K(1), v.data(), v.size());
+  EXPECT_NE(second.status, Status::kIOError);
+  EXPECT_EQ(second.disposition, RamTier::PutDisposition::kBypass);
+}
