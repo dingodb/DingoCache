@@ -3758,8 +3758,18 @@ Status RdmaTransport::PullInto(
     }
     Conn* conn = acquired.conn;
     if (out_dev) {
-      if (!out_dev->empty()) *out_dev += "->";
-      *out_dev += devs_[conn->rail_index];
+      // One out_dev spans every key of a RangeIntoMulti call: record a rail
+      // only when it differs from the last one, so the string names the
+      // sequence of rails used, not one entry per key.
+      const std::string& dev = devs_[conn->rail_index];
+      const size_t arrow = out_dev->rfind("->");
+      const size_t last = arrow == std::string::npos ? 0 : arrow + 2;
+      if (out_dev->empty()) {
+        *out_dev = dev;
+      } else if (out_dev->compare(last, std::string::npos, dev) != 0) {
+        *out_dev += "->";
+        *out_dev += dev;
+      }
     }
     PullRequest request{&key, segments, segment_count, capacity, mode,
                         mode == PullMode::kWholeObject ? 0 : offset,
