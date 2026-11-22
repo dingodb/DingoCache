@@ -62,7 +62,7 @@ class _Arena:
         self.double_frees = 0
         self._lock = threading.Lock()
 
-    def allocate(self, *_shape_dtype_fmt):
+    def allocate(self, *_shape_dtype_fmt, **_options):
         with self._lock:
             if not self._free:
                 return None

@@ -110,7 +110,7 @@ class _Obj:
 
 
 class _Backend:
-    def allocate(self, *_args):
+    def allocate(self, *_args, **_options):
         return _Obj()
 
 
