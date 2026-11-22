@@ -133,14 +133,14 @@ def _run_until(dfkvctl: Path, mds_port: int, predicate, timeout: float = 15.0):
     raise RuntimeError(f"dfkvctl stat --all did not reach expected state\n{detail}")
 
 
-def _registration(node_id: str, ip: str, port: int, info: str) -> bytes:
+def _registration(node_id: str, ip: str, port: int, info: bytes) -> bytes:
     """An etcd registration value as the MDS writes it: EncodeMembers of one member."""
     value = struct.pack("=QI", 0, 1)
     for text in (node_id.encode(), ip.encode()):
         value += struct.pack("=I", len(text)) + text
     value += struct.pack("=II", port, 1)
     value += struct.pack("=II", 0x54435031, 0)
-    value += struct.pack("=II", 0x4E464F31, len(info)) + info.encode()
+    value += struct.pack("=II", 0x4E464F31, len(info)) + info
     return value
 
 
@@ -175,7 +175,7 @@ def _check_operational_tools(dfkvctl: Path, mds: str, etcd: str, state: _EtcdSta
     # A registered consumer, so that `dfkvctl clients` has a row to print.
     with state.lock:
         state.values[b"/dfkv/v1/groups/alpha/clients/client-1"] = _registration(
-            "client-1", "127.0.0.1", 0, "type=vllm,model=m")
+            "client-1", "127.0.0.1", 0, b"type=vllm,model=m")
     workflow = Replacer(SimpleNamespace(
         dfkvctl=str(dfkvctl), mds=mds, group="alpha", command_timeout=10.0))
     view = workflow.ring()
@@ -212,15 +212,62 @@ def _check_operational_tools(dfkvctl: Path, mds: str, etcd: str, state: _EtcdSta
             "--json outside ring must be refused", "")
 
     report_path = root / "membership-audit.json"
-    status = audit_main([
+    audit_arguments = [
         "--mds", mds, "--etcd", etcd, "--group", "alpha", "--dfkvctl", str(dfkvctl),
-        "--timeout", "10", "--output", str(report_path)])
+        "--timeout", "10", "--output", str(report_path)]
+    status = audit_main(audit_arguments)
     report = json.loads(report_path.read_text())
     require(
         status == 0 and report["healthy"] and not report["issues"]
         and report["ring_epoch"] == view.epoch
         and [item["node_id"] for item in report["registrations"]] == ["alpha-node"],
         "membership audit of a consistent group", report)
+
+    # A second member that is registered but not there: nothing listens on its
+    # port, and part of its self-description is not text. `stat --all` then
+    # exits 1, which must not hide the row of the healthy member.
+    ghost_key = b"/dfkv/v1/groups/alpha/members/ghost"
+    ghost_port = _free_port()
+    with state.lock:
+        state.values[ghost_key] = _registration(
+            "ghost", "127.0.0.1", ghost_port, b"ver=0.0,note=\xff\xfe")
+    try:
+        stat = ctl("stat", "--all", "--group", "alpha")
+        rows = [line.split() for line in stat.stdout.splitlines()]
+        require(
+            stat.returncode == 1
+            and rows[0] == [
+                "ID", "ADDR", "VERSION", "READY", "HEALTH", "MDS", "RDMA", "RD-ERR",
+                "USED_MB", "OBJECTS", "HITS", "MISSES", "HIT%"]
+            and [len(row) for row in rows if row[0] == "alpha-node"] == [len(rows[0])]
+            and ["ghost", f"127.0.0.1:{ghost_port}", "0.0", "(unreachable)"] in rows,
+            "stat --all table with an unreachable member", stat)
+        require(workflow.healthy("alpha-node") is True and workflow.healthy("ghost") is False,
+                "readiness of one member next to an unreachable one", stat)
+        infos = {item.node_id: item.info for item in workflow.ring().members}
+        require(infos.get("ghost") == "ver=0.0,note=\xff\xfe",
+                "ring --json of bytes that are not UTF-8", infos)
+        status = audit_main(audit_arguments)
+        issues = json.loads(report_path.read_text())["issues"]
+        require(
+            status == 2
+            and [(issue["code"], issue.get("node")) for issue in issues]
+            == [("self_report_incomplete", "ghost")],
+            "membership audit next to a member with a non-text self-description", issues)
+    finally:
+        with state.lock:
+            del state.values[ghost_key]
+
+    # No table at all is dfkvctl failing, not a verdict on the members.
+    no_mds = Replacer(SimpleNamespace(
+        dfkvctl=str(dfkvctl), mds=f"127.0.0.1:{_free_port()}", group="alpha",
+        command_timeout=10.0))
+    try:
+        no_mds.healthy("alpha-node")
+    except RuntimeError as error:
+        require("MDS query failed" in str(error), "stat --all without an MDS", error)
+    else:
+        raise RuntimeError("stat --all without an MDS must stay an error")
 
 
 def main() -> int:

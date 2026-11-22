@@ -24,13 +24,14 @@ from dfkv_membership_audit import decode_registration, info_fields, range_end  #
 from dfkv_node_replace import Replacer, WorkflowError, main as replace_main  # noqa: E402
 from dfkv_tenant_quota import load_quotas, main as quota_main  # noqa: E402
 from dfkv_ops_common import (  # noqa: E402
+    CommandError,
     atomic_write,
     atomic_write_with_checksum,
     parse_bench,
     parse_bench_diagnostics,
     parse_clients,
     parse_ring,
-    parse_stat_reachability,
+    parse_stat_health,
 )
 
 
@@ -78,11 +79,38 @@ host-a_1                     vllm       model-a                  producer       
 host-b_1                     sglang     model-a                  -              8        type=sglang,model=model-a
 """
 
-STATS = """ID             ADDR                    USED_MB   OBJECTS      HITS    MISSES   HIT%
-n1             10.0.0.1:28000             1.0        10         9         1  90.0%
-n2             10.0.0.2:28000       (unreachable)
-TOTAL used=1.0MB objects=10 hits=9 misses=1 hit%=90.0 bytes_w=1 bytes_r=1
-"""
+# `dfkvctl stat --all --group` in the layout of its printf formats; the header
+# and the unreachable row are pinned to the real binary by
+# test_dfkvctl_all_groups.py.
+STAT_HEADER = "%-14s %-20s %-10s %6s %6s %5s %5s %7s %10s %9s %9s %9s %6s\n" % (
+    "ID", "ADDR", "VERSION", "READY", "HEALTH", "MDS", "RDMA", "RD-ERR",
+    "USED_MB", "OBJECTS", "HITS", "MISSES", "HIT%")
+STAT_TOTAL = (
+    "TOTAL used=1.0MB objects=10 hits=9 misses=1 hit%=90.0 bytes_w=1 bytes_r=1 "
+    "unreachable=1 unhealthy=3 health-unknown=1\n")
+
+
+def stat_row(node_id: str, ip: str, ready: str = "yes", health: str = "yes",
+             mds: str = "yes", rdma: str = "-") -> str:
+    return "%-14s %-20s %-10s %6s %6s %5s %5s %7d %10.1f %9d %9d %9d %5.1f%%\n" % (
+        node_id, f"{ip}:28000", "2.0", ready, health, mds, rdma, 0, 1.0, 10, 9, 1, 90.0)
+
+
+def stat_unreachable(node_id: str, ip: str) -> str:
+    return "%-14s %-20s %-10s   (unreachable)\n" % (node_id, f"{ip}:28000", "2.0")
+
+
+STATS = (
+    STAT_HEADER
+    + stat_row("n1", "10.0.0.1")
+    + stat_unreachable("n2", "10.0.0.2")
+    + stat_row("n3", "10.0.0.3", ready="NO")
+    + stat_row("n4", "10.0.0.4", ready="-", health="-", mds="-")
+    + stat_row("n5", "10.0.0.5", mds="NO")
+    + stat_row("n6", "10.0.0.6", rdma="NO")
+    + stat_row("n7", "10.0.0.7", rdma="yes")
+    + STAT_TOTAL
+)
 
 BENCH = """dfkv_bench transport=tcp members=2
 PUT   n=8000 size=4096 threads=8 batch=4 | 1.000s  goodput 0.03 GB/s  8000 ok-ops/s  call-lat ms p50=0.100 p99=0.900 max=1.100  ok=8000 fails=0
@@ -114,7 +142,16 @@ class CommonParserTest(unittest.TestCase):
         # The epoch is dfkvctl's, bit for bit: 2**64 - 59 does not fit a double.
         self.assertEqual(view.epoch, 2**64 - 59)
         self.assertEqual(parse_clients(CLIENTS), ("glm", ("host-a_1", "host-b_1")))
-        self.assertEqual(parse_stat_reachability(STATS), {"n1": True, "n2": False})
+        # One row is healthy exactly when dfkvctl counts it as neither
+        # unreachable, unhealthy nor health-unknown.
+        self.assertEqual(
+            parse_stat_health(STATS),
+            {"n1": True, "n2": False, "n3": False, "n4": False, "n5": False, "n6": False, "n7": True},
+        )
+        short_row = STAT_HEADER + stat_row("n1", "10.0.0.1").rsplit(None, 1)[0] + "\n"
+        for text in ("", STATS.replace("READY", "READY?"), short_row):
+            with self.assertRaises(ValueError, msg=text):
+                parse_stat_health(text)
         empty = parse_ring(EMPTY_RING)
         self.assertEqual(empty.group, "glm")
         self.assertEqual(empty.members, ())
@@ -134,8 +171,32 @@ class CommonParserTest(unittest.TestCase):
         del document["members"][0]["vnodes"]
         duplicate = json.loads(RING)
         duplicate["members"][1]["id"] = "n1"
-        for text in (RING_TABLE, "", "[]", json.dumps(document), json.dumps(duplicate),
-                     RING.replace(str(2**64 - 59), "soon")):
+        for text in (RING_TABLE, "", "[]", json.dumps(document), json.dumps(duplicate)):
+            with self.assertRaises(ValueError, msg=text):
+                parse_ring(text)
+
+    def test_ring_parser_rejects_values_of_the_wrong_type(self) -> None:
+        def with_member(name: str, value: object) -> str:
+            document = json.loads(RING)
+            document["members"][0][name] = value
+            return json.dumps(document)
+
+        def with_top(name: str, value: object) -> str:
+            document = json.loads(RING)
+            document[name] = value
+            return json.dumps(document)
+
+        for text in (
+            with_member("id", 5), with_member("id", ["n1"]), with_member("ip", None),
+            with_member("port", "abc"), with_member("weight", "heavy"), with_member("weight", True),
+            with_member("vnodes", 1.5), with_member("share_percent", "33.3"),
+            with_member("info", 0), with_member("eligible", "false"), with_member("eligible", 1),
+            with_top("members", {}), with_top("group", 1), with_top("ring_points", "300"),
+            with_top("placement_epoch", 7), with_top("placement_epoch", 1.5),
+            with_top("placement_epoch", True), with_top("placement_epoch", "-5"),
+            with_top("placement_epoch", "soon"), with_top("placement_epoch", ""),
+            RING.replace(f'"{2**64 - 59}"', "Infinity"), RING.replace(f'"{2**64 - 59}"', "1e400"),
+        ):
             with self.assertRaises(ValueError, msg=text):
                 parse_ring(text)
 
@@ -225,70 +286,114 @@ class TenantQuotaToolTest(unittest.TestCase):
             self.assertEqual(path.read_bytes(), b"new")
 
 
-class FakeFleet:
-    """Stands in for run_command: one MDS group and two hosts running the unit.
+class FakeUnit:
+    def __init__(self, member: dict, running: bool, answers: bool = True) -> None:
+        self.member = member
+        self.state = "active" if running else "inactive"
+        self.ready_at = 0  # from this tick the running process is registered and serves
+        self.stopped_at = 0
+        self.lease_until = 0
+        self.serves_until = 0
+        self.start_queued = False
+        self.answers = answers
+        self.starts = 0
 
-    A stop takes ``stop_polls`` state queries; until it is over the server is
-    still registered and still answers, as one draining for tens of seconds
-    is. systemctl without --no-block waits for its job, so under a command
-    timeout shorter than the stop the caller times out while the job stays
-    queued -- a start queued behind a stop runs once the stop is over.
+
+class FakeFleet:
+    """Stands in for run_command: one MDS group and hosts running the unit.
+
+    Time is the number of commands issued, so a stop makes progress whatever a
+    workflow polls. A server registers and serves START ticks after its unit
+    was started. A stopping one behaves like the real server: heartbeats stop
+    at once, so the registration is gone after LEASE; requests are refused
+    after GRACE; the unit stays deactivating for ``stop_ticks``. `stat --all`
+    lists the placement members and exits 1 with its table if any of them is
+    unreachable. systemctl without --no-block waits for its job, so under a
+    command timeout shorter than the job the caller times out while the job
+    stays queued -- and a start queued behind a stop runs when the stop is over.
     """
 
-    MEMBER = {"old": N1, "new": N2}
+    START, GRACE, LEASE = 3, 6, 8
 
-    def __init__(self, stop_polls: int = 5) -> None:
-        self.state = {"old": "active", "new": "inactive"}
-        self.stop_polls = stop_polls
-        self.stopping: dict[str, int] = {}
-        self.start_queued: set[str] = set()
+    def __init__(self, *, stop_ticks: int = 20, old_eligible: bool = True,
+                 bystander: bool = False) -> None:
+        self.now = 0
+        self.stop_ticks = stop_ticks
         self.jobs: list[tuple[str, ...]] = []
+        old = N1 if old_eligible else ring_member("n1", "10.0.0.1", 1, 0, 0.0, eligible=False)
+        self.units = {"old": FakeUnit(old, True), "new": FakeUnit(N2, False)}
+        if bystander:  # a member nobody is replacing, whose stat port is dead
+            self.units["other"] = FakeUnit(
+                ring_member("n3", "10.0.0.3", 1, 100, 33.3), True, answers=False)
+
+    def registered(self, unit: FakeUnit) -> bool:
+        return (unit.state == "active" and self.now >= unit.ready_at) or self.now < unit.lease_until
+
+    def serving(self, unit: FakeUnit) -> bool:
+        return unit.answers and (
+            (unit.state == "active" and self.now >= unit.ready_at) or self.now < unit.serves_until)
+
+    def start(self, unit: FakeUnit) -> None:
+        unit.state, unit.ready_at, unit.start_queued = "active", self.now + self.START, False
+        unit.starts += 1
 
     def run_command(self, argv, timeout, **_) -> str:
         argv = list(argv)
+        self.now += 1
+        for unit in self.units.values():
+            if unit.state == "deactivating" and self.now >= unit.stopped_at + self.stop_ticks:
+                unit.state = "inactive"
+                if unit.start_queued:
+                    self.start(unit)
         if argv[0] == "dfkvctl":
-            return self.dfkvctl(argv[1:])
+            return self.dfkvctl(argv)
         host = argv[argv.index("--") + 1]
+        unit = self.units[host]
         arguments = argv[argv.index("systemctl") + 1:-1]
         if arguments[0] == "show":
-            return f"ActiveState={self.poll(host)}\n"
+            return f"ActiveState={unit.state}\n"
         self.jobs.append((host, *arguments))
         waits = False
-        if arguments[0] == "stop" and self.state[host] == "active":
-            self.state[host] = "deactivating"
-            self.stopping[host] = self.stop_polls
+        if arguments[0] == "stop" and unit.state == "active":
+            up = self.now >= unit.ready_at
+            unit.state, unit.stopped_at = "deactivating", self.now
+            unit.lease_until = self.now + (self.LEASE if up else 0)
+            unit.serves_until = self.now + (self.GRACE if up else 0)
             waits = True
-        elif arguments[0] == "start" and self.state[host] == "deactivating":
-            self.start_queued.add(host)
+        elif arguments[0] == "start" and unit.state == "deactivating":
+            unit.start_queued = True
             waits = True
-        elif arguments[0] == "start":
-            self.state[host] = "active"
+        elif arguments[0] == "start" and unit.state == "inactive":
+            self.start(unit)
         if waits and "--no-block" not in arguments:
             raise subprocess.TimeoutExpired(argv, timeout)
         return ""
 
-    def poll(self, host: str) -> str:
-        if self.state[host] == "deactivating":
-            self.stopping[host] -= 1
-            if self.stopping[host] <= 0:
-                self.state[host] = "active" if host in self.start_queued else "inactive"
-                self.start_queued.discard(host)
-        return self.state[host]
-
-    def dfkvctl(self, arguments: list[str]) -> str:
-        up = [self.MEMBER[host] for host in ("old", "new") if self.state[host] != "inactive"]
-        if arguments[0] == "ring":
-            return ring_document(len(up), *up) if "--json" in arguments else RING_TABLE
-        if arguments[0] == "clients":
+    def dfkvctl(self, argv: list[str]) -> str:
+        registered = [unit for unit in self.units.values() if self.registered(unit)]
+        if argv[1] == "ring":
+            if "--json" not in argv:
+                return RING_TABLE
+            return ring_document(len(registered), *(unit.member for unit in registered))
+        if argv[1] == "clients":
             return CLIENTS
-        rows = "".join(f"{member['id']} {member['ip']}:28000 2.0 yes\n" for member in up)
-        return "ID ADDR VERSION READY\n" + rows + "TOTAL used=0.0MB\n"
+        placement = [unit for unit in registered if unit.member["eligible"]]
+        if not placement:
+            raise CommandError(argv, 1, "", "stat --all: group=glm has an empty placement ring")
+        table = STAT_HEADER + "".join(
+            (stat_row if self.serving(unit) else stat_unreachable)(
+                unit.member["id"], unit.member["ip"])
+            for unit in placement
+        ) + STAT_TOTAL
+        if not all(self.serving(unit) for unit in placement):
+            raise CommandError(argv, 1, table, "")
+        return table
 
 
 class ReplacementWorkflowTest(unittest.TestCase):
     ARGV = [
         "--mds", "mds:1", "--group", "glm", "--old-id", "n1", "--new-id", "n2",
-        "--old-host", "old", "--new-host", "new", "--timeout", "10",
+        "--old-host", "old", "--new-host", "new", "--timeout", "10", "--stop-timeout", "10",
         "--command-timeout", "1", "--poll-interval", "0.01", "--stable-samples", "1",
     ]
 
@@ -303,7 +408,7 @@ class ReplacementWorkflowTest(unittest.TestCase):
     def args(dry_run: bool = True) -> SimpleNamespace:
         return SimpleNamespace(
             old_id="n1", new_id="n2", old_host="old", new_host="new",
-            dry_run=dry_run, min_clients=0, timeout=10.0, command_timeout=1.0,
+            dry_run=dry_run, min_clients=0, timeout=10.0, stop_timeout=10.0, command_timeout=1.0,
             poll_interval=0.01, stable_samples=1, state_file=None,
             dfkvctl="dfkvctl", mds="mds:1", group="glm", ssh="ssh", service="dfkv",
         )
@@ -323,7 +428,7 @@ class ReplacementWorkflowTest(unittest.TestCase):
             def healthy(self, node_id):
                 return True
 
-            def wait_stable_ring(self, required, forbidden):
+            def wait_stable_ring(self, **sets):
                 return parse_ring(RING)
 
             def remote(self, host, action):
@@ -344,18 +449,18 @@ class ReplacementWorkflowTest(unittest.TestCase):
             def remote(self, host, action):
                 self.actions.append((host, action))
 
-            def wait_stable_ring(self, required, forbidden):
-                self.required.append(required)
+            def wait_stable_ring(self, **sets):
+                self.required.append(sets)
                 return parse_ring(RING)
 
-            def wait_for(self, description, predicate):
+            def wait_for(self, description, predicate, timeout=None):
                 return True
 
         workflow = Fixture(self.args(dry_run=False))
         workflow.old_stopped = True
         workflow.rollback(RuntimeError("cutover failed"))
         self.assertEqual(workflow.actions, [("old", "start")])
-        self.assertEqual(workflow.required, [{"n1"}])
+        self.assertEqual(workflow.required, [{"placed": {"n1"}}])
 
     def test_start_timeout_marks_started_new_and_rollback_stops_replacement(self) -> None:
         class Fixture(Replacer):
@@ -404,10 +509,10 @@ class ReplacementWorkflowTest(unittest.TestCase):
             def remote(self, host, action):
                 self.actions.append((host, action))
 
-            def wait_stable_ring(self, required, forbidden):
+            def wait_stable_ring(self, **sets):
                 return parse_ring(RING)
 
-            def wait_for(self, description, predicate):
+            def wait_for(self, description, predicate, timeout=None):
                 return True
 
         workflow = Fixture(self.args(dry_run=False))
@@ -461,38 +566,146 @@ class ReplacementWorkflowTest(unittest.TestCase):
         self.assertEqual([member.node_id for member in view.members], ["n1", "n2"])
         self.assertEqual(command.call_count, 3)
 
-    def test_stop_longer_than_the_command_timeout_is_observed_not_awaited(self) -> None:
-        fleet = FakeFleet()
+    def test_success_does_not_depend_on_how_long_the_old_unit_takes_to_stop(self) -> None:
+        fleet = FakeFleet(stop_ticks=10**9)
         with patch("dfkv_node_replace.run_command", side_effect=fleet.run_command):
             status = replace_main(self.ARGV)
         self.assertEqual(status, 0)
         self.assertEqual(
             fleet.jobs, [("new", "start", "--no-block"), ("old", "stop", "--no-block")])
-        self.assertEqual(fleet.state, {"old": "inactive", "new": "active"})
+        old = fleet.units["old"]
+        self.assertEqual((old.state, fleet.registered(old)), ("deactivating", False))
 
-    def test_rollback_start_waits_behind_a_stop_in_progress(self) -> None:
-        fleet = FakeFleet()
-        fleet.state = {"old": "deactivating", "new": "active"}
-        fleet.stopping["old"] = fleet.stop_polls
+    def test_readiness_is_judged_on_the_replacement_not_on_the_whole_group(self) -> None:
+        # stat --all exits 1 for as long as any member is unreachable.
+        fleet = FakeFleet(bystander=True)
+        with patch("dfkv_node_replace.run_command", side_effect=fleet.run_command):
+            status = replace_main(self.ARGV)
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            fleet.jobs, [("new", "start", "--no-block"), ("old", "stop", "--no-block")])
+
+    def test_readiness_takes_the_table_of_exit_1_and_nothing_else(self) -> None:
+        workflow = Replacer(self.args())
+        verdict = CommandError(["dfkvctl", "stat"], 1, STATS, "")
+        with patch("dfkv_node_replace.run_command", side_effect=verdict):
+            self.assertTrue(workflow.healthy("n1"))
+            self.assertFalse(workflow.healthy("n2"))
+            self.assertFalse(workflow.healthy("absent"))
+        for failure in (
+            CommandError(["dfkvctl", "stat"], 1, "", "stat --all: MDS query failed"),
+            CommandError(["dfkvctl", "stat"], 2, STATS, "stat --all needs --mds ip:port[,...]"),
+        ):
+            with patch("dfkv_node_replace.run_command", side_effect=failure):
+                with self.assertRaises(CommandError):
+                    workflow.healthy("n1")
+
+    def test_an_old_node_already_out_of_placement_can_be_replaced(self) -> None:
+        fleet = FakeFleet(old_eligible=False)
         with patch("dfkv_node_replace.run_command", side_effect=fleet.run_command):
             workflow = Replacer(self.args(dry_run=False))
+            workflow.run()
+        self.assertEqual(
+            fleet.jobs, [("new", "start", "--no-block"), ("old", "stop", "--no-block")])
+        self.assertFalse(workflow.old_placed)
+        self.assertFalse(fleet.registered(fleet.units["old"]))
+        self.assertEqual(workflow.events[-1]["phase"], "complete")
+
+    def test_rollback_waits_for_the_restarted_process_not_the_one_going_away(self) -> None:
+        fleet = FakeFleet()
+        fleet.units["new"].state = "active"
+        with patch("dfkv_node_replace.run_command", side_effect=fleet.run_command):
+            workflow = Replacer(self.args(dry_run=False))
+            workflow.remote("old", "stop")
             workflow.old_stopped = True
             workflow.rollback(RuntimeError("cutover failed"))
-        self.assertEqual(fleet.jobs, [("old", "start", "--no-block")])
-        # Not declared restored on the registration of the process going away.
-        self.assertEqual(fleet.state["old"], "active")
+        self.assertEqual(
+            fleet.jobs, [("old", "stop", "--no-block"), ("old", "start", "--no-block")])
+        # When the rollback began, the process being stopped was still
+        # registered and still answering; restored is the one started after it.
+        old = fleet.units["old"]
+        self.assertEqual((old.state, old.starts), ("active", 1))
+        self.assertTrue(fleet.registered(old) and fleet.serving(old))
         self.assertIn("old node restored", str(workflow.events[-1]["message"]))
 
-    def test_stable_ring_requires_placed_members_and_forbids_registered_ones(self) -> None:
+    def test_rollback_outlasts_a_stop_longer_than_the_transition_timeout(self) -> None:
+        args = self.args(dry_run=False)
+        args.timeout = 0.5  # 80 polls take at least 0.8 s
+        fleet = FakeFleet(stop_ticks=80)
+        fleet.units["new"].state = "active"
+        with patch("dfkv_node_replace.run_command", side_effect=fleet.run_command):
+            workflow = Replacer(args)
+            workflow.remote("old", "stop")
+            workflow.old_stopped = True
+            workflow.rollback(RuntimeError("cutover failed"))
+        self.assertEqual((fleet.units["old"].state, fleet.units["old"].starts), ("active", 1))
+
+    def test_rollback_of_an_old_node_out_of_placement_only_needs_it_registered(self) -> None:
+        fleet = FakeFleet(old_eligible=False)
+        fleet.units["new"].state = "active"
+        with patch("dfkv_node_replace.run_command", side_effect=fleet.run_command):
+            workflow = Replacer(self.args(dry_run=False))
+            workflow.old_placed = False
+            workflow.remote("old", "stop")
+            workflow.old_stopped = True
+            workflow.rollback(RuntimeError("cutover failed"))
+        old = fleet.units["old"]
+        self.assertEqual((old.state, old.starts, fleet.registered(old)), ("active", 1, True))
+
+    def test_unconfirmed_rollback_reports_what_systemd_already_has(self) -> None:
+        class Fixture(Replacer):
+            def remote(self, host, action):
+                pass
+
+            def unit_state(self, host):
+                return "deactivating"
+
+        args = self.args(dry_run=False)
+        args.timeout = args.stop_timeout = 0.02
+        workflow = Fixture(args)
+        workflow.old_stopped = True
+        with self.assertRaises(WorkflowError) as raised:
+            workflow.rollback(RuntimeError("cutover failed"))
+        message = str(raised.exception)
+        self.assertIn("CRITICAL rollback not confirmed", message)
+        self.assertIn("systemd accepted the start of dfkv on old", message)
+        self.assertNotIn("immediately", message)
+
+        workflow = Fixture(args)
+        workflow.started_new = True
+        with self.assertRaises(WorkflowError) as raised:
+            workflow.rollback(RuntimeError("join failed"))
+        message = str(raised.exception)
+        self.assertIn("accepted by systemd but not seen to finish", message)
+        self.assertIn("check that dfkv on new stops", message)
+        self.assertNotIn("manually", message)
+
+    def test_rollback_whose_start_command_fails_asks_for_a_manual_start(self) -> None:
+        class Fixture(Replacer):
+            def remote(self, host, action):
+                raise subprocess.TimeoutExpired(["ssh", host], 1.0)
+
+        workflow = Fixture(self.args(dry_run=False))
+        workflow.old_stopped = True
+        with self.assertRaises(WorkflowError) as raised:
+            workflow.rollback(RuntimeError("cutover failed"))
+        self.assertIn("CRITICAL rollback also failed", str(raised.exception))
+        self.assertIn("start dfkv on old immediately", str(raised.exception))
+
+    def test_stable_ring_tells_placed_from_merely_registered(self) -> None:
         args = self.args()
         args.timeout = 0.05
         with patch("dfkv_node_replace.run_command", return_value=RING_DEGRADED):
             workflow = Replacer(args)
-            self.assertEqual(workflow.wait_stable_ring({"n1"}, set()).group, "glm")
+            # n2 is registered but owns no vnodes.
+            self.assertEqual(
+                workflow.wait_stable_ring(placed={"n1"}, registered={"n2"}).group, "glm")
             with self.assertRaises(WorkflowError):
-                workflow.wait_stable_ring({"n1", "n2"}, set())
+                workflow.wait_stable_ring(placed={"n1", "n2"})
             with self.assertRaises(WorkflowError):
-                workflow.wait_stable_ring({"n1"}, {"n2"})
+                workflow.wait_stable_ring(placed={"n1"}, forbidden={"n2"})
+            with self.assertRaises(WorkflowError):
+                workflow.wait_stable_ring(registered={"n3"})
 
 
 class AtomicArtifactTest(unittest.TestCase):
@@ -531,6 +744,9 @@ class MembershipDecodeTest(unittest.TestCase):
         member = decode_registration(self.registration())
         self.assertEqual((member.node_id, member.address, member.weight), ("node-7", "10.2.3.7:28001", 3))
         self.assertEqual(info_fields(member.info)["engine"], "slab")
+        # Bytes that are not UTF-8 read as `dfkvctl ring --json` writes them.
+        garbled = decode_registration(self.registration().replace(b"engine=slab", b"engine=\xffl\xfeb"))
+        self.assertEqual(info_fields(garbled.info)["engine"], "\xffl\xfeb")
         with self.assertRaises(ValueError):
             decode_registration(self.registration()[:15])
 

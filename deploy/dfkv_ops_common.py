@@ -69,6 +69,17 @@ _LEGACY_BENCH_LINE = re.compile(
 _BENCH_DIAG = re.compile(r"^DIAG phase=(READY|SETTLE|GET_SETUP|PUT|GET)\s+(.+)$")
 
 
+class CommandError(RuntimeError):
+    """A command exited non-zero. Its output is kept: some exit codes are a
+    verdict on what was printed rather than a failure to print it."""
+
+    def __init__(self, argv: Sequence[str], returncode: int, stdout: str, stderr: str):
+        detail = stderr.strip() or stdout.strip() or "no diagnostic"
+        super().__init__(f"command exited {returncode}: {' '.join(argv)}: {detail}")
+        self.returncode = returncode
+        self.stdout = stdout
+
+
 def run_command(argv: Sequence[str], timeout: float, *, env: dict[str, str] | None = None) -> str:
     if timeout <= 0:
         raise ValueError("timeout must be positive")
@@ -82,8 +93,7 @@ def run_command(argv: Sequence[str], timeout: float, *, env: dict[str, str] | No
         check=False,
     )
     if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip() or "no diagnostic"
-        raise RuntimeError(f"command exited {completed.returncode}: {' '.join(argv)}: {detail}")
+        raise CommandError(argv, completed.returncode, completed.stdout, completed.stderr)
     return completed.stdout
 
 
@@ -95,25 +105,34 @@ def parse_ring(text: str) -> RingView:
         raise ValueError(
             f"dfkvctl ring --json did not print JSON (dfkvctl without --json support?): {error}"
         ) from error
+    def field(source: dict, name: str, kind: type):
+        value = source[name]
+        if type(value) is not kind:
+            raise TypeError(f"{name} must be {kind.__name__}, got {value!r}")
+        return value
+
     try:
         members = tuple(
             RingMember(
-                node_id=item["id"],
-                address=f"{item['ip']}:{item['port']}",
-                weight=item["weight"],
-                vnodes=item["vnodes"],
-                share_percent=item["share_percent"],
+                node_id=field(item, "id", str),
+                address=f"{field(item, 'ip', str)}:{field(item, 'port', int)}",
+                weight=field(item, "weight", int),
+                vnodes=field(item, "vnodes", int),
+                share_percent=field(item, "share_percent", float),
                 # "-" = the node reports no self-description.
-                info=item["info"] or "-",
-                eligible=item["eligible"] is True,
+                info=field(item, "info", str) or "-",
+                eligible=field(item, "eligible", bool),
             )
-            for item in document["members"]
+            for item in field(document, "members", list)
         )
+        epoch = field(document, "placement_epoch", str)
+        if not re.fullmatch(r"[0-9]+", epoch):
+            raise TypeError(f"placement_epoch must be a decimal string, got {epoch!r}")
         view = RingView(
-            document["group"], document["ring_points"], members, int(document["placement_epoch"])
+            field(document, "group", str), field(document, "ring_points", int), members, int(epoch)
         )
     except (KeyError, TypeError) as error:
-        raise ValueError(f"invalid dfkvctl ring --json document: {error!r}") from error
+        raise ValueError(f"invalid dfkvctl ring --json document: {error}") from error
     if len({member.node_id for member in members}) != len(members):
         raise ValueError("ring contains duplicate node IDs")
     return view
@@ -137,20 +156,32 @@ def parse_clients(text: str) -> tuple[str, tuple[str, ...]]:
     return group, tuple(sorted(ids))
 
 
-def parse_stat_reachability(text: str) -> dict[str, bool]:
+def parse_stat_health(text: str) -> dict[str, bool]:
+    """Per member of ``dfkvctl stat --all --group``, the verdict dfkvctl itself
+    applies to that row for its exit status: reachable, READY and HEALTH known
+    and yes, MDS and RDMA not NO."""
     result: dict[str, bool] = {}
-    in_rows = False
+    header: list[str] | None = None
     for line in text.splitlines():
         columns = line.split()
         if columns[:2] == ["ID", "ADDR"]:
-            in_rows = True
+            header = columns
+            if not {"READY", "HEALTH", "MDS", "RDMA"}.issubset(header):
+                raise ValueError(f"dfkvctl stat --all has no readiness columns: {line!r}")
             continue
-        if not in_rows or not columns or columns[0] == "TOTAL":
+        if header is None or not columns or columns[0] == "TOTAL":
             continue
-        if len(columns) < 3:
+        if "(unreachable)" in columns:
+            result[columns[0]] = False
+            continue
+        if len(columns) != len(header):
             raise ValueError(f"invalid dfkvctl stat --all row: {line!r}")
-        result[columns[0]] = "(unreachable)" not in line
-    if not in_rows:
+        row = dict(zip(header, columns))
+        result[row["ID"]] = (
+            row["READY"] == "yes" and row["HEALTH"] == "yes"
+            and row["MDS"] != "NO" and row["RDMA"] != "NO"
+        )
+    if header is None:
         raise ValueError("dfkvctl stat --all column header is missing")
     return result
 

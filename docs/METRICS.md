@@ -85,6 +85,8 @@ dfkvctl stat <ip:port>                        # 单节点原始 /metrics 文本�
   64 位）。
 - `eligible=false` 的成员已注册但不在放置环里（`vnodes` 为 0）；`status`、`ib_health` 与表格
   的 `STATUS`、`IB-HEALTH` 列相同；节点没有自报时 `info` 为空字符串（表格里是 `-`）。
+- 字符串字段按字节输出：可打印 ASCII 以外的字节一律写成 `\u00XX`（值即该字节），所以节点
+  上报的内容即使不是合法 UTF-8，文档仍是合法 JSON。
 - 字段只增不改，使用方应忽略不认识的字段。退出码与表格模式相同：空环或没有 eligible 成员时
   为 1（仍会输出文档），加 `--allow-empty` 为 0。`--json` 只支持 `ring`/`topology`，用在
   其他子命令上以 2 退出。
