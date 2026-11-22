@@ -24,8 +24,9 @@
  * then may the caller fall back to synchronous disk write. Once admitted, a
  * disk-ACK PUT (including a conflicting duplicate) waits for that value's
  * terminal flush result. A deadline cannot transfer ownership to another PUT.
- * Alignment (gap 10.4): the arena base is posix_memalign(4096) and slot sizes
- * are 4096-multiples, so a slot address is O_DIRECT-aligned for the flusher.
+ * Alignment (gap 10.4): the arena base is aligned to 4096 (to 2 MiB when
+ * huge pages are asked for) and slot sizes are 4096-multiples, so a slot
+ * address is O_DIRECT-aligned for the flusher.
  *
  * SHARDING: every op used to funnel through ONE mutex (index/alloc/flushq/pins)
  * — with 16 serve threads + 16 flush workers the single lock was the measured
@@ -238,6 +239,15 @@ class RamTier {
   // The arena is locked in memory (mlock2); false if that was turned off or
   // could not be done.
   bool arena_locked() const { return arena_locked_; }
+  // Transparent huge pages were asked for and the kernel accepted the request
+  // (DFKV_RAM_TIER_HUGEPAGES, default on; never for an arena smaller than one
+  // huge page), and how much of the arena they backed right after the
+  // pre-fault. The kernel gives what it has: 0 with the system setting
+  // "never", less than the arena when free memory is fragmented. Without a
+  // request nothing is measured, so 0 then says nothing about the page size:
+  // under the system setting "always" the arena is on huge pages regardless.
+  bool arena_hugepages_requested() const { return arena_hugepages_requested_; }
+  uint64_t arena_hugepage_bytes() const { return arena_hugepage_bytes_; }
   uint64_t budget_bytes() const { return opt_.bytes; }
   uint64_t large_budget_bytes() const { return large_budget_bytes_; }
   uint64_t large_used_bytes() const {
@@ -403,6 +413,8 @@ class RamTier {
   uint64_t large_budget_bytes_ = 0;
   std::atomic<void*> arena_mr_{nullptr};
   bool arena_locked_ = false;
+  bool arena_hugepages_requested_ = false;
+  uint64_t arena_hugepage_bytes_ = 0;
   uint64_t extent_bytes_ = 0;   // allocator class/extent upper bound
   std::vector<std::unique_ptr<Shard>> shards_;
   std::vector<std::thread> flushers_;
