@@ -60,7 +60,7 @@ class KvNodeServerWiringTestPeer {
     options.is_persisted = [](const BlockKey&) { return false; };
     server.ram_ = std::make_unique<RamTier>(
         options, [](const BlockKey&, char*, size_t, size_t) {
-          return false;
+          return Status::kIOError;
         });
     server.ram_write_back_ = true;
     server.ram_ack_enabled_ = false;

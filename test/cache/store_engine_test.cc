@@ -214,7 +214,7 @@ TEST_F(EngineTest, BackendRangeConformanceTable) {
   ram_options.bytes = 8ull << 20;
   ram_options.large_reserve_bytes = 0;
   auto ram = std::make_unique<RamTier>(
-      ram_options, [](const BlockKey&, char*, size_t, size_t) { return true; });
+      ram_options, [](const BlockKey&, char*, size_t, size_t) { return Status::kOk; });
   ASSERT_TRUE(ram->ok());
   ASSERT_EQ(ram->PutCommitted(key, value.data(), value.size()).status,
             Status::kOk);

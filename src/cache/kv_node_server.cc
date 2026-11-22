@@ -334,6 +334,10 @@ std::future<std::unique_ptr<RamTier>> KvNodeServer::StartRamTier() {
   o.flush_target_failed = [this](const BlockKey& key) {
     return group_.DiskFailedFor(key);
   };
+  // A value that will not be written takes its parked RETAIN SET with it.
+  o.flush_given_up = [this](const BlockKey& key) {
+    ApplyPendingRetain(key, /*flushed=*/false);
+  };
   return std::async(std::launch::async, [this, o] {
     // Flusher persists a RAM slot to the disk group. CacheDirect (not Cache):
     // the arena slot is 4 KiB-aligned with cap slack, so a direct-mode slab
@@ -342,9 +346,11 @@ std::future<std::unique_ptr<RamTier>> KvNodeServer::StartRamTier() {
     // purpose of keeping memory use bounded and explicit on GPU nodes.
     return std::make_unique<RamTier>(
         o, [this](const BlockKey& k, char* d, size_t l, size_t cap) {
-          const bool ok = group_.CacheDirect(k, d, l, cap) == Status::kOk;
-          ApplyPendingRetain(k, ok);
-          return ok;
+          // Only a written value: a refused or failed attempt may be followed
+          // by another one, and the parked SET is for the value that lands.
+          const Status st = group_.CacheDirect(k, d, l, cap);
+          if (st == Status::kOk) ApplyPendingRetain(k, /*flushed=*/true);
+          return st;
         });
   });
 }
@@ -373,12 +379,10 @@ void KvNodeServer::AdoptRamTier(std::unique_ptr<RamTier> tier) {
           m.failures.fetch_add(failures, std::memory_order_relaxed);
           m.latency.Observe(seconds);
         });
-    std::vector<bool> ok(items.size(), false);
-    for (size_t i = 0; i < sts.size(); ++i) {
-      ok[i] = (sts[i] == Status::kOk);
-      ApplyPendingRetain(items[i].key, ok[i]);
-    }
-    return ok;
+    for (size_t i = 0; i < sts.size(); ++i)
+      if (sts[i] == Status::kOk)  // see the per-item sink above
+        ApplyPendingRetain(items[i].key, /*flushed=*/true);
+    return sts;
   });
   if (tier->ok()) {
     ram_ = std::move(tier);
@@ -1050,6 +1054,14 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_ram_flush_retries_total", "counter",
            "Failed RAM flush attempts that were followed by another attempt",
            ram_->FlushRetries());
+    metric("dfkv_ram_flush_no_room_total", "counter",
+           "RAM flush attempts the disk answered CacheFull (no slot for the "
+           "value now); not failures",
+           ram_->FlushNoRoom());
+    metric("dfkv_ram_flush_no_room_dropped_total", "counter",
+           "RAM values dropped because the disk had no room: disk-ACK PUTs "
+           "answered CacheFull, acknowledged values after the hold time",
+           ram_->FlushNoRoomDropped());
     s += ram_->AckToDurableLatencyMetrics(idlabels);
     metric("dfkv_ram_budget_bytes", "gauge",
            "Hard total RAM-tier budget across arena and dedicated values",
@@ -1364,6 +1376,9 @@ Status KvNodeServer::ProcessRequestForKey(
       // RamTier hides the key first and waits out/cancels any flush. The disk
       // remove therefore compensates a flush that reached durable storage just
       // before the fence; after it returns no later RAM worker can republish.
+      // A parked RETAIN SET goes first: forgotten after the RAM remove, it
+      // could be one made for the next value of the key.
+      if (ram_) ApplyPendingRetain(key, /*flushed=*/false);
       const bool ram_had = ram_ && ram_->Remove(key);
       const Status disk_status = group_.Remove(key);
       if (disk_status == Status::kOk ||

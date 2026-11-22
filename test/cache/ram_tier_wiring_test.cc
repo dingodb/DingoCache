@@ -7,6 +7,7 @@
 #include "client/key_map.h"
 #include "transport/tcp_transport.h"
 #include "transport/transport.h"
+#include "transport/wire.h"
 
 #include <gtest/gtest.h>
 
@@ -418,8 +419,7 @@ TEST(RamTierWiring, CapacityBypassPreservesConcurrentDuplicateValue) {
           *server,
           [&, node](const BlockKey& key, char* data, size_t len, size_t) {
             flush.Block();
-            return KvNodeServerWiringTestPeer::Persist(*node, key, data, len) ==
-                   Status::kOk;
+            return KvNodeServerWiringTestPeer::Persist(*node, key, data, len);
           }, ram_ack);
       const BlockKey key{8101, 0};
       alignas(4096) char original[128 * 1024], conflicting[4096];
@@ -489,7 +489,9 @@ TEST(RamTierWiring, ColdDirectSliceDoesNotReplaceWholeValue) {
       auto server = KvNodeServerWiringTestPeer::Create(std::move(options));
       KvNodeServerWiringTestPeer::SetCoalescing(*server, coalesce);
       KvNodeServerWiringTestPeer::SetRam(
-          *server, [](const BlockKey&, char*, size_t, size_t) { return false; });
+          *server, [](const BlockKey&, char*, size_t, size_t) {
+            return Status::kIOError;
+          });
       const BlockKey key{8201, 0};
       // Seed disk directly: the first range is deterministically a cold read.
       ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(
@@ -560,7 +562,9 @@ TEST(RamTierWiring, ColdWholeDirectReadPromotesWithoutLengthOutput) {
     auto server = KvNodeServerWiringTestPeer::Create(std::move(options));
     KvNodeServerWiringTestPeer::SetCoalescing(*server, coalesce);
     KvNodeServerWiringTestPeer::SetRam(
-        *server, [](const BlockKey&, char*, size_t, size_t) { return false; });
+        *server, [](const BlockKey&, char*, size_t, size_t) {
+          return Status::kIOError;
+        });
     const BlockKey key{8202, 0};
     const std::string value(4096 + 111, 'w');
     ASSERT_EQ(KvNodeServerWiringTestPeer::Persist(
@@ -671,8 +675,7 @@ TEST(RamTierWiring, PutGateRejectsBeforeRamAdmissionAndLeavesFlushUngated) {
           cv.notify_all();
           cv.wait(lock, [&] { return release; });
         }
-        return KvNodeServerWiringTestPeer::Persist(*server, key, data, len) ==
-               Status::kOk;
+        return KvNodeServerWiringTestPeer::Persist(*server, key, data, len);
       });
   const BlockKey first{7001, 0}, direct_key{7002, 0}, tcp_key{7003, 0};
   std::string original(500, 'a'), conflicting(1000, 'b');
@@ -760,8 +763,7 @@ TEST(RamTierWiring, DirtyWatermarkRejectsWithoutCallingDiskAndRecovers) {
       *server,
       [&, node](const BlockKey& key, char* data, size_t len, size_t) {
         barrier.Block();
-        return KvNodeServerWiringTestPeer::Persist(*node, key, data, len) ==
-               Status::kOk;
+        return KvNodeServerWiringTestPeer::Persist(*node, key, data, len);
       },
       /*ram_ack=*/true, /*watermark_pct=*/25);
   const BlockKey first{7101, 0}, tcp_key{7102, 0}, direct_key{7103, 0};
@@ -863,8 +865,7 @@ TEST(RamTierWiring, LimitedTenantDirectPutReachesDiskWhenRamEnabled) {
         *server,
         [&, node](const BlockKey& key, char* data, size_t len, size_t) {
           flushes.fetch_add(1, std::memory_order_relaxed);
-          return KvNodeServerWiringTestPeer::Persist(*node, key, data, len) ==
-                 Status::kOk;
+          return KvNodeServerWiringTestPeer::Persist(*node, key, data, len);
         });
     KvNodeServerWiringTestPeer::SetWriteBack(*server, write_back);
 
@@ -978,8 +979,7 @@ TEST(RamTierWiring, ShutdownLeavesTheDisksCleanWithoutDestruction) {
     KvNodeServerWiringTestPeer::SetRam(
         *server,
         [node](const BlockKey& key, char* data, size_t len, size_t) {
-          return KvNodeServerWiringTestPeer::Persist(*node, key, data, len) ==
-                 Status::kOk;
+          return KvNodeServerWiringTestPeer::Persist(*node, key, data, len);
         },
         /*ram_ack=*/true);
     bool ok = server->Start(0) == Status::kOk;
@@ -1045,8 +1045,7 @@ TEST(RamTierWiring, ShutdownDropsWhatMissesTheDrainTimeout) {
         [&, node](const BlockKey& key, char* data, size_t len, size_t) {
           barrier.Block();
           flushes.fetch_add(1);
-          return KvNodeServerWiringTestPeer::Persist(*node, key, data, len) ==
-                 Status::kOk;
+          return KvNodeServerWiringTestPeer::Persist(*node, key, data, len);
         },
         /*ram_ack=*/true);
     auto put = [&](int i) {
@@ -1112,8 +1111,7 @@ TEST(RamTierWiring, ParkedPutDoesNotBlockItsStripe) {
       *server,
       [&, node](const BlockKey& key, char* data, size_t len, size_t) {
         barrier.Block();
-        return KvNodeServerWiringTestPeer::Persist(*node, key, data, len) ==
-               Status::kOk;
+        return KvNodeServerWiringTestPeer::Persist(*node, key, data, len);
       },
       /*ram_ack=*/false, /*watermark_pct=*/80, /*put_wait_ms=*/0);
   const BlockKey first{7600, 0};
@@ -1187,8 +1185,7 @@ TEST(RamTierWiring, ShutdownAnswersParkedPutsInsteadOfWaitingForTheirFlush) {
         *server,
         [&, node](const BlockKey& k, char* data, size_t len, size_t) {
           barrier.Block();
-          return KvNodeServerWiringTestPeer::Persist(*node, k, data, len) ==
-                 Status::kOk;
+          return KvNodeServerWiringTestPeer::Persist(*node, k, data, len);
         },
         /*ram_ack=*/false, /*watermark_pct=*/80, /*put_wait_ms=*/0);
     ASSERT_EQ(server->Start(0), Status::kOk);
@@ -1685,7 +1682,9 @@ struct FlushFailNode {
   std::mutex mu;
   std::unique_ptr<KvNodeServer> server;
 
-  explicit FlushFailNode(const char* name, size_t disks = 1) {
+  explicit FlushFailNode(const char* name, size_t disks = 1,
+                         uint64_t capacity = 64 << 20,
+                         uint64_t extent = 1 << 20) {
     root = fs::temp_directory_path() / (std::string("dfkv_flushfail_") + name);
     fs::remove_all(root);
     fs::create_directories(root / "tokens");
@@ -1693,15 +1692,15 @@ struct FlushFailNode {
     for (size_t i = 0; i < disks; ++i)
       dirs.push_back((root / ("disk" + std::to_string(i))).string());
     stores.assign(disks, nullptr);
-    DiskCacheGroup::Options options{dirs, disks * (64ull << 20), "slab"};
+    DiskCacheGroup::Options options{dirs, disks * capacity, "slab"};
     options.engine_factory =
-        [this, dirs](const std::string& dir,
-                     uint64_t) -> std::unique_ptr<StoreEngine> {
+        [this, dirs, capacity, extent](
+            const std::string& dir, uint64_t) -> std::unique_ptr<StoreEngine> {
       DiskSlabStore::Options o;
       o.dir = dir;
       o.trust_token_dir = (root / "tokens").string();
-      o.capacity_bytes = 64 << 20;
-      o.extent_bytes = 1 << 20;
+      o.capacity_bytes = capacity;
+      o.extent_bytes = extent;
       o.slot_granularity = 4096;
       o.table_sync_ms = 0;
       o.reclaim_interval_ms = 0;
@@ -1732,6 +1731,18 @@ struct FlushFailNode {
   }
   long Metric(const char* name) {
     return MetricVal(server->MetricsText(), name);
+  }
+  // RETAIN SET of one key; the key's code in the reply, or -1.
+  int RetainSet(uint64_t id, uint32_t ttl_s) {
+    const BlockKey key{id, 0};
+    std::string payload(RetainPayloadBytes(1), '\0');
+    EncodeRetainPayload(&payload[0], ttl_s, kRetainModeSet, &key, 1);
+    std::string out;
+    const Status st = server->ProcessRequestForKey(
+        static_cast<uint8_t>(WireOp::kRetain), key, 0, 1, payload.data(),
+        payload.size(), &out);
+    return st == Status::kOk && !out.empty() ? static_cast<uint8_t>(out[0])
+                                             : -1;
   }
   bool Settled() {
     return WaitFor([&] { return Metric("dfkv_ram_flush_backlog") == 0; });
@@ -1886,4 +1897,121 @@ TEST(RamTierFlushFailure, RepeatedPutsOfAKeyDoNotParkBehindItsFailingFlush) {
   EXPECT_LT(slowest_us.load(), 500000) << "a repeated PUT was parked";
   EXPECT_LT(slowest_other_us, 500000)
       << "a PUT of another key waited behind a parked one on its stripe";
+}
+
+// A disk that is healthy but has no slot for the value at the moment: every
+// slot of its size class is held by an operation in flight. A value that was
+// acknowledged from RAM stays in RAM and is written once a slot is free; it is
+// not counted as lost and the tier does not report itself unhealthy. It used
+// to be tried five times over 4.25 s like a failing disk and then dropped.
+TEST(RamTierFlushFailure, AnAcknowledgedValueWaitsInRamForADiskWithNoSlot) {
+  FlushFailNode node("noslot_ack", 1, 4 * 4096, 4 * 4096);  // four slots
+  ASSERT_TRUE(node.server->ram_enabled());
+  for (uint64_t id = 0; id < 4; ++id) {
+    ASSERT_EQ(node.Put(id), Status::kOk);
+    ASSERT_TRUE(node.Settled());
+    ASSERT_TRUE(DiskSlabStoreTestPeer::PinSlot(node.stores[0], BlockKey{id, 0}));
+  }
+  ASSERT_EQ(node.Metric("dfkv_ram_flushed_total"), 4);
+  ASSERT_EQ(node.Put(10), Status::kOk);  // acknowledged from RAM
+  std::this_thread::sleep_for(5s);       // longer than all failure retries
+  EXPECT_GT(node.Metric("dfkv_ram_flush_no_room_total"), 0);
+  EXPECT_EQ(node.Metric("dfkv_ram_flush_dropped_total"), 0);
+  EXPECT_EQ(node.Metric("dfkv_ram_post_ack_flush_failures_total"), 0);
+  EXPECT_EQ(node.Metric("dfkv_ram_healthy"), 1);
+  EXPECT_TRUE(node.server->Healthy());
+  EXPECT_EQ(node.Get(10), Status::kOk) << "still served from RAM";
+
+  for (uint64_t id = 0; id < 4; ++id)
+    DiskSlabStoreTestPeer::UnpinSlot(node.stores[0], BlockKey{id, 0});
+  bool flushed = false;
+  for (int i = 0; i < 5 && !flushed; ++i)
+    flushed = WaitFor([&] { return node.Metric("dfkv_ram_flushed_total") == 5; });
+  EXPECT_TRUE(flushed) << "written once the disk had a slot again";
+  EXPECT_TRUE(node.Settled());
+  EXPECT_EQ(node.Metric("dfkv_ram_post_ack_flush_failures_total"), 0);
+  EXPECT_EQ(node.Metric("dfkv_ram_healthy"), 1);
+}
+
+// The same disk with disk-ACK: the PUT waits for its flush and is answered
+// kCacheFull, as the disk answers it without a RAM tier, at once and without
+// making the tier unhealthy. It used to get kIOError after five attempts and
+// leave the tier reporting itself unhealthy for 30 s.
+TEST(RamTierFlushFailure, ADiskAckPutForADiskWithNoSlotIsCacheFull) {
+  ::setenv("DFKV_PUT_ACK_MODE", "disk", 1);
+  {
+    FlushFailNode node("noslot_disk", 1, 4 * 4096, 4 * 4096);
+    ASSERT_TRUE(node.server->ram_enabled());
+    for (uint64_t id = 0; id < 4; ++id) {
+      ASSERT_EQ(node.Put(id), Status::kOk);
+      ASSERT_TRUE(
+          DiskSlabStoreTestPeer::PinSlot(node.stores[0], BlockKey{id, 0}));
+    }
+    EXPECT_EQ(node.Put(10), Status::kCacheFull);
+    EXPECT_TRUE(node.Settled());
+    EXPECT_EQ(node.Metric("dfkv_ram_flush_retries_total"), 0);
+    EXPECT_EQ(node.Metric("dfkv_ram_flush_dropped_total"), 0);
+    EXPECT_EQ(node.Metric("dfkv_ram_healthy"), 1);
+    EXPECT_TRUE(node.server->Healthy());
+    EXPECT_EQ(
+        MetricVal(node.server->MetricsText(),
+                  "dfkv_errors_total{op=\"put\",status=\"io\"}"),
+        0);
+    for (uint64_t id = 0; id < 4; ++id)
+      DiskSlabStoreTestPeer::UnpinSlot(node.stores[0], BlockKey{id, 0});
+    EXPECT_EQ(node.Put(10), Status::kOk);
+  }
+  ::unsetenv("DFKV_PUT_ACK_MODE");
+}
+
+// A RETAIN SET for a value that is only in RAM is parked and applied when the
+// value is written. A flush attempt the disk refuses for want of a slot, or
+// one that fails and is tried again, must leave it parked: the value that
+// lands later is the one the client asked to protect. It used to be thrown
+// away on the first attempt that did not succeed.
+TEST(RamTierFlushFailure, ARetainParkedForAValueWaitingForRoomIsApplied) {
+  FlushFailNode node("retain_noroom", 1, 4 * 4096, 4 * 4096);
+  ASSERT_TRUE(node.server->ram_enabled());
+  for (uint64_t id = 0; id < 4; ++id) {
+    ASSERT_EQ(node.Put(id), Status::kOk);
+    ASSERT_TRUE(node.Settled());
+    ASSERT_TRUE(DiskSlabStoreTestPeer::PinSlot(node.stores[0], BlockKey{id, 0}));
+  }
+  ASSERT_EQ(node.Put(10), Status::kOk);
+  EXPECT_EQ(node.RetainSet(10, 600),
+            static_cast<int>(SlabAllocator::RetainCode::kProtectedNew));
+  ASSERT_TRUE(WaitFor([&] {
+    return node.Metric("dfkv_ram_flush_no_room_total") >= 2;
+  }));
+  for (uint64_t id = 0; id < 4; ++id)
+    DiskSlabStoreTestPeer::UnpinSlot(node.stores[0], BlockKey{id, 0});
+  bool flushed = false;
+  for (int i = 0; i < 5 && !flushed; ++i)
+    flushed = WaitFor([&] { return node.Metric("dfkv_ram_flushed_total") == 5; });
+  ASSERT_TRUE(flushed);
+  EXPECT_EQ(node.Metric("dfkv_retain_pending_applied_total"), 1);
+  EXPECT_NE(node.RetainSet(10, 600),
+            static_cast<int>(SlabAllocator::RetainCode::kProtectedNew))
+      << "the written value is protected already";
+}
+
+TEST(RamTierFlushFailure, ARetainParkedForAValueWhoseFlushIsRetriedIsApplied) {
+  FlushFailNode node("retain_retry");
+  ASSERT_TRUE(node.server->ram_enabled());
+  std::atomic<int> writes{0};
+  std::atomic<bool> fail{true};
+  DiskSlabStoreTestPeer::SetPayloadWriteHook(node.stores[0], [&] {
+    writes.fetch_add(1);
+    return !fail.load();
+  });
+  ASSERT_EQ(node.Put(1), Status::kOk);
+  EXPECT_EQ(node.RetainSet(1, 600),
+            static_cast<int>(SlabAllocator::RetainCode::kProtectedNew));
+  ASSERT_TRUE(WaitFor([&] { return writes.load() >= 2; }));
+  fail = false;
+  ASSERT_TRUE(WaitFor([&] {
+    return node.Metric("dfkv_ram_flushed_total") == 1;
+  }));
+  EXPECT_EQ(node.Metric("dfkv_ram_post_ack_flush_failures_total"), 0);
+  EXPECT_EQ(node.Metric("dfkv_retain_pending_applied_total"), 1);
 }

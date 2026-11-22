@@ -300,8 +300,10 @@ RAM 热层（**仅 `DFKV_RAM_TIER=1` 时输出**；关时无此系列，向后�
 | `dfkv_ram_promoted_total` | counter | 整值冷读晋升：优先让 O_DIRECT 直接读入隐藏 arena reservation，成功后以 born-durable 身份发布；staged fallback 则读后复制晋升。不进 flushq、零重复刷盘、随时可驱逐；健康冷→热运行中首次读增长，随后应转为 `dfkv_ram_hit_total` 增长且磁盘字节不再增加 |
 | `dfkv_ram_flushed_total` / `dfkv_ram_flush_dropped_total` | counter | RAM slot 落盘转 DURABLE / flush 全部尝试失败（或目标盘 store 已终态故障）后丢弃 |
 | `dfkv_ram_flush_retries_total` | counter | 失败后还会再试的 flush 尝试次数。已 RAM-ACK 的值按 50 ms、200 ms、800 ms、3.2 s 间隔重试（共 5 次尝试，约 4.25 s），期间对象仍可读、仍计入 dirty；仍在等落盘结果的 PUT（disk-ACK）不加间隔。增长而 `dfkv_ram_flush_dropped_total` 不涨 = 盘侧有瞬时写失败但没有丢数据 |
+| `dfkv_ram_flush_no_room_total` | counter | 盘回 `kCacheFull`（健康但此刻没有可用的槽）的 flush 尝试次数。不算失败：不计入 `dfkv_ram_flush_retries_total`，不影响 `dfkv_ram_healthy`；已 RAM-ACK 的值留在 RAM 里按 50 ms→3.2 s 的间隔继续试，最长 60 秒；停止排空期间改为不加间隔再试 5 次（`flush_retries`） |
+| `dfkv_ram_flush_no_room_dropped_total` | counter | 因盘没有槽而丢弃的值：disk-ACK 下等落盘的 PUT 得到 `kCacheFull` 的值、60 秒内一直没等到槽的已确认值，以及停止排空期间不加间隔再试 5 次仍没有槽的已确认值。后者之后的 GET 会 miss，相当于被淘汰；不计入 `dfkv_ram_post_ack_flush_failures_total` |
 | `dfkv_ram_ack_total` | counter | 在落盘前由 RAM 确认的 PUT 数。同一 key 的重复 PUT 在其值已确认、仍在等落盘时也立即得到确认并计入这里，所以它数的是 PUT，不是值；丢失的值看下一行（按值计，每个值一次） |
-| `dfkv_ram_post_ack_flush_failures_total` | counter | **已向 client 确认（RAM-ACK）、随后因落盘失败被丢弃的值**，即已确认但丢失的数据；每次丢弃另有限速 WARN `ram tier: dropped N object(s) ...`。告警 `DfkvRamAcknowledgedDataLost` |
+| `dfkv_ram_post_ack_flush_failures_total` | counter | **已向 client 确认（RAM-ACK）、随后因落盘失败被丢弃的值**（盘没有槽而丢弃的不在此列，见 `dfkv_ram_flush_no_room_dropped_total`），即已确认但丢失的数据；每次丢弃另有限速 WARN `ram tier: dropped N object(s) ...`。告警 `DfkvRamAcknowledgedDataLost` |
 | `dfkv_ram_healthy` | gauge | 发生丢弃后为 0，直到距最后一次丢弃至少 30 秒且连续 64 次 flush 成功（中间没有任何失败尝试）才恢复为 1；0 时 `/healthz`、`/readyz` 为 503。不再是“直到重启” |
 | `dfkv_ram_flush_threads` | gauge | shard 最小值调整后的实际 flusher 数（不是原始请求值） |
 | `dfkv_ram_evictions_total` | counter | RAM slot 容量压力淘汰数（含内联与后台回收两路） |

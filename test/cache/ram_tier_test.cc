@@ -82,11 +82,11 @@ struct FlushSink {
       ++calls;
       cv.notify_all();
       cv.wait(lk, [this] { return gate_open; });
-      if (fail) return false;
+      if (fail) return Status::kIOError;
       flushed.insert(k.Filename());
       values.emplace(k.Filename(), std::string(data, len));
       cv.notify_all();
-      return true;
+      return Status::kOk;
     };
   }
   void open() { { std::lock_guard<std::mutex> lk(m); gate_open = true; } cv.notify_all(); }
@@ -1094,7 +1094,7 @@ TEST(RamTier, LargeValueReadRangeFlushAndRemoveIsByteExact) {
                flushed.assign(data, len);
                flushed_len = len;
                flushed_cap = cap;
-               return true;
+               return Status::kOk;
              });
   ::unsetenv("DFKV_RAM_TIER_EXTENT_BYTES");
   ASSERT_TRUE(rt.ok());
@@ -1313,12 +1313,12 @@ TEST(RamTier, BatchFlushDrainsQueueAndRetriesPerItem) {
     }
     std::lock_guard<std::mutex> lk(m);
     batch_sizes.push_back(items.size());
-    std::vector<bool> ok(items.size(), true);
+    std::vector<Status> ok(items.size(), Status::kOk);
     for (size_t i = 0; i < items.size(); ++i)
       if (fail_key >= 0 &&
           items[i].key.digest_hi ==
               static_cast<uint64_t>(fail_key.load()))
-        ok[i] = false;
+        ok[i] = Status::kIOError;
     return ok;
   });
   ASSERT_TRUE(rt.ok());
@@ -2001,7 +2001,8 @@ struct FailingSink {
     return [this](const BlockKey& key, char*, size_t, size_t) {
       std::lock_guard<std::mutex> lk(m);
       calls.push_back(std::chrono::steady_clock::now());
-      return ok(key, static_cast<int>(calls.size()));
+      return ok(key, static_cast<int>(calls.size())) ? Status::kOk
+                                                      : Status::kIOError;
     };
   }
   size_t count() {
@@ -2033,7 +2034,7 @@ struct HeldSink {
       const int call = entered.fetch_add(1) + 1;
       while (call >= hold_from.load() && !release.load())
         std::this_thread::sleep_for(1ms);
-      return false;
+      return Status::kIOError;
     };
   }
 };
@@ -2382,4 +2383,174 @@ TEST(RamTierFlushFailure, SecondWriterOfAnAcknowledgedValueDoesNotWait) {
   EXPECT_EQ(rt.PostAckFlushFailures(), 1u);
   // Once it is gone, a PUT of the key is a new value, not a duplicate.
   EXPECT_FALSE(rt.Contains(K(1)));
+}
+
+// A disk that answers kCacheFull has no slot for the value now; it has not
+// failed. Such attempts are neither retries nor failures and do not touch the
+// tier's health.
+namespace {
+struct NoRoomSink {
+  std::atomic<int> calls{0};
+  std::function<Status(int call)> answer = [](int) {
+    return Status::kCacheFull;
+  };
+  RamTier::FlushFn fn() {
+    return [this](const BlockKey&, char*, size_t, size_t) {
+      return answer(calls.fetch_add(1) + 1);
+    };
+  }
+};
+}  // namespace
+
+// An acknowledged value waits in RAM for room, readable, until the hold time
+// is over; then it is dropped like an eviction, not counted as lost.
+TEST(RamTierFlushFailure, AcknowledgedValueWaitsForRoomThenIsDroppedNotLost) {
+  NoRoomSink sink;
+  RamTier::Options options = RetryOpts(3, 10);
+  options.flush_no_room_hold_ms = 300;  // attempts at 0, 10, 50, 210, 850 ms
+  RamTier rt(options, sink.fn());
+  const std::string value(500, 'n');
+  ASSERT_EQ(rt.PutWriteBack(K(1), value.data(), value.size()).status,
+            Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return sink.calls.load() >= 3; }));
+  EXPECT_TRUE(rt.Contains(K(1))) << "readable while it waits for room";
+  ASSERT_TRUE(WaitFor([&] { return rt.FlushNoRoomDropped() == 1u; }));
+  EXPECT_EQ(sink.calls.load(), 5) << "more attempts than flush_retries";
+  EXPECT_EQ(rt.FlushNoRoom(), static_cast<uint64_t>(sink.calls.load()));
+  EXPECT_EQ(rt.FlushRetries(), 0u);
+  EXPECT_EQ(rt.FlushDropped(), 0u);
+  EXPECT_EQ(rt.PostAckFlushFailures(), 0u);
+  EXPECT_TRUE(rt.healthy());
+  EXPECT_FALSE(rt.Contains(K(1)));
+  EXPECT_EQ(rt.DirtyObjects(), 0u);
+  EXPECT_EQ(rt.FlushBacklog(), 0u);
+}
+
+// Room again before the hold time is over: written, nothing dropped.
+TEST(RamTierFlushFailure, AcknowledgedValueIsWrittenOnceThereIsRoom) {
+  NoRoomSink sink;
+  sink.answer = [](int call) {
+    return call > 3 ? Status::kOk : Status::kCacheFull;
+  };
+  RamTier rt(RetryOpts(2, 5), sink.fn());  // fewer failures than refusals
+  const std::string value(500, 'r');
+  ASSERT_EQ(rt.PutWriteBack(K(1), value.data(), value.size()).status,
+            Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return rt.Flushed() == 1u; }));
+  EXPECT_EQ(sink.calls.load(), 4);
+  EXPECT_EQ(rt.FlushNoRoom(), 3u);
+  EXPECT_EQ(rt.FlushNoRoomDropped(), 0u);
+  EXPECT_EQ(rt.FlushDropped(), 0u);
+  EXPECT_EQ(rt.DirtyObjects(), 0u);
+  EXPECT_TRUE(rt.healthy());
+}
+
+// A PUT that waits for its flush (disk-ACK) is answered kCacheFull at once,
+// as the disk would answer it, and the value is not kept.
+TEST(RamTierFlushFailure, WaitingPutForADiskWithNoRoomIsCacheFull) {
+  NoRoomSink sink;
+  RamTier rt(RetryOpts(5, 60000), sink.fn());
+  const std::string value(500, 'w');
+  const RamTier::PutResult result =
+      rt.PutCommitted(K(1), value.data(), value.size());
+  EXPECT_EQ(result.status, Status::kCacheFull);
+  EXPECT_EQ(result.flush, RamTier::FlushOutcome::kNoRoom);
+  EXPECT_EQ(sink.calls.load(), 1);
+  EXPECT_EQ(rt.FlushNoRoomDropped(), 1u);
+  EXPECT_EQ(rt.FlushDropped(), 0u);
+  EXPECT_FALSE(rt.Contains(K(1)));
+  EXPECT_TRUE(rt.healthy());
+}
+
+// A real failure after refusals is still a failure: the attempts that failed
+// count against flush_retries, and the value is dropped and counted as lost.
+TEST(RamTierFlushFailure, FailuresAfterRefusalsStillEndInALoss) {
+  NoRoomSink sink;
+  sink.answer = [](int call) {
+    return call <= 2 ? Status::kCacheFull : Status::kIOError;
+  };
+  RamTier rt(RetryOpts(3, 5), sink.fn());
+  const std::string value(500, 'f');
+  ASSERT_EQ(rt.PutWriteBack(K(1), value.data(), value.size()).status,
+            Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return rt.FlushDropped() == 1u; }));
+  EXPECT_EQ(sink.calls.load(), 5);
+  EXPECT_EQ(rt.FlushNoRoom(), 2u);
+  EXPECT_EQ(rt.FlushRetries(), 2u);
+  EXPECT_EQ(rt.PostAckFlushFailures(), 1u);
+  EXPECT_FALSE(rt.healthy());
+}
+
+// While the tier drains for a stop there is no time to wait for room: an
+// acknowledged value the disk has no slot for gets flush_retries attempts
+// without pauses, as a failing one does, and is then dropped as one the disk
+// had no room for, not as lost.
+TEST(RamTierFlushFailure, WhileDrainingAValueWithNoRoomGetsUnpacedAttempts) {
+  for (bool room_later : {false, true}) {
+    SCOPED_TRACE(room_later ? "room on the third attempt" : "never room");
+    NoRoomSink sink;
+    std::atomic<bool> go{false};
+    sink.answer = [&](int call) {
+      while (call == 1 && !go.load()) std::this_thread::sleep_for(1ms);
+      return room_later && call == 3 ? Status::kOk : Status::kCacheFull;
+    };
+    RamTier rt(RetryOpts(3, 60000), sink.fn());  // pauses would be minutes
+    const std::string value(500, 'd');
+    ASSERT_EQ(rt.PutWriteBack(K(1), value.data(), value.size()).status,
+              Status::kOk);
+    ASSERT_TRUE(WaitFor([&] { return sink.calls.load() == 1; }));
+    bool drained = false;
+    std::thread drain([&] { drained = rt.WaitForDrain(5s); });
+    std::this_thread::sleep_for(50ms);  // the drain has begun
+    go = true;
+    drain.join();
+    EXPECT_TRUE(drained);
+    EXPECT_EQ(sink.calls.load(), 3);
+    EXPECT_EQ(rt.Flushed(), room_later ? 1u : 0u);
+    EXPECT_EQ(rt.FlushNoRoomDropped(), room_later ? 0u : 1u);
+    EXPECT_EQ(rt.FlushDropped(), 0u);
+    EXPECT_EQ(rt.PostAckFlushFailures(), 0u);
+    EXPECT_TRUE(rt.healthy());
+  }
+}
+
+// flush_given_up is called once for a value dropped without having been
+// written, and not for one that was removed while its flush was in flight:
+// the remover takes care of that key itself.
+TEST(RamTierFlushFailure, GivenUpIsNotCalledForAValueRemovedDuringItsFlush) {
+  NoRoomSink sink;
+  std::atomic<bool> go{false};
+  sink.answer = [&](int call) {
+    while (call == 1 && !go.load()) std::this_thread::sleep_for(1ms);
+    return Status::kIOError;
+  };
+  std::mutex mu;
+  std::vector<uint64_t> given_up;
+  RamTier::Options options = RetryOpts(2, 1);
+  options.flush_given_up = [&](const BlockKey& key) {
+    std::lock_guard<std::mutex> lk(mu);
+    given_up.push_back(key.digest_hi);
+  };
+  RamTier rt(options, sink.fn());
+  const std::string value(500, 'g');
+  ASSERT_EQ(rt.PutWriteBack(K(1), value.data(), value.size()).status,
+            Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return sink.calls.load() == 1; }));  // in flight
+  std::thread remover([&] { EXPECT_TRUE(rt.Remove(K(1))); });
+  std::this_thread::sleep_for(50ms);  // the remove waits for that attempt
+  go = true;
+  remover.join();
+  EXPECT_FALSE(rt.Contains(K(1)));
+  EXPECT_EQ(rt.FlushDropped(), 0u);
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    EXPECT_TRUE(given_up.empty()) << "a removed value is not given up";
+  }
+
+  // A value whose attempts all fail: given up, once.
+  ASSERT_EQ(rt.PutWriteBack(K(2), value.data(), value.size()).status,
+            Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return rt.FlushDropped() == 1u; }));
+  std::lock_guard<std::mutex> lk(mu);
+  EXPECT_EQ(given_up, std::vector<uint64_t>{2});
 }

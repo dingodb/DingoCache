@@ -713,7 +713,10 @@ RamTier::PutResult RamTier::AwaitPut(
   bool ended = false, timed_out = false;
   if (completion->done) {
     result.flush = completion->outcome;
-    result.status = completion->success ? Status::kOk : Status::kIOError;
+    result.status = completion->success ? Status::kOk
+                    : completion->outcome == FlushOutcome::kNoRoom
+                        ? Status::kCacheFull
+                        : Status::kIOError;
   } else if (answered()) {
     result.flush = FlushOutcome::kNone;  // acknowledged from RAM
     result.status = Status::kOk;
@@ -1460,24 +1463,29 @@ void RamTier::FlushLoop(Shard& s) {
 
     // Flush: batched sink when wired (one store visit for the whole dequeue),
     // else the per-item sink. Every item is owned until this batch completes.
-    std::vector<char> ok(B, 0);
+    std::vector<Status> result(B, Status::kIOError);
     if (flush_batch_ && B != 0) {
-      std::vector<bool> results = flush_batch_(items);
+      std::vector<Status> results = flush_batch_(items);
       for (size_t i = 0; i < B && i < results.size(); ++i)
-        ok[i] = results[i] ? 1 : 0;
+        result[i] = results[i];
     } else {
       for (size_t i = 0; i < B; ++i)
-        ok[i] = (!flush_ ||
-                 flush_(items[i].key, items[i].data, items[i].len,
-                        items[i].cap)) ? 1 : 0;
+        result[i] = flush_ ? flush_(items[i].key, items[i].data, items[i].len,
+                                    items[i].cap)
+                           : Status::kOk;
     }
 
     // Outside the shard lock: the health streak, and whether a failed
-    // object's disk has failed for good (then it is not tried again).
+    // object's disk has failed for good (then it is not tried again). A disk
+    // with no room has done neither.
     std::vector<char> target_failed(B, 0);
     for (size_t i = 0; i < B; ++i) {
-      NoteFlushOutcome(ok[i] != 0);
-      if (!ok[i] && opt_.flush_target_failed)
+      if (result[i] == Status::kCacheFull) {
+        flush_no_room_.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+      NoteFlushOutcome(result[i] == Status::kOk);
+      if (result[i] != Status::kOk && opt_.flush_target_failed)
         target_failed[i] = opt_.flush_target_failed(batch[i].key) ? 1 : 0;
     }
     bool dropped_now = false, dropped_target_failed = false;
@@ -1496,7 +1504,7 @@ void RamTier::FlushLoop(Shard& s) {
           }
           CompletePut(entry.completion, false);
           if (entry.send_pins == 0) DropLocked(s, batch[i].key);
-        } else if (ok[i]) {
+        } else if (result[i] == Status::kOk) {
           entry.durable = true;
           if (entry.client_acked) {
             const double seconds =
@@ -1515,6 +1523,47 @@ void RamTier::FlushLoop(Shard& s) {
           }
           CompletePut(entry.completion, true);
           flushed_.fetch_add(1, std::memory_order_relaxed);
+        } else if (result[i] == Status::kCacheFull) {
+          // No room on a healthy disk. An acknowledged value waits for room,
+          // for a while, or while the tier drains for a stop gets
+          // flush_retries attempts without pauses, as a failing one does; a
+          // waiting PUT is told kCacheFull now.
+          const auto now = std::chrono::steady_clock::now();
+          QItem& item = batch[i];
+          if (item.no_room_tries++ == 0) item.no_room_since = now;
+          const bool draining = draining_.load(std::memory_order_acquire);
+          if (draining) ++item.no_room_drain_tries;
+          const bool hold =
+              entry.client_acked &&
+              (draining
+                   ? item.no_room_drain_tries < opt_.flush_retries
+                   : now - item.no_room_since <
+                         std::chrono::milliseconds(opt_.flush_no_room_hold_ms));
+          if (hold) {
+            const uint64_t shift =
+                2 * std::min<uint32_t>(item.no_room_tries - 1, 3);
+            item.not_before =
+                draining
+                    ? now
+                    : now + std::chrono::milliseconds(
+                                static_cast<uint64_t>(opt_.flush_retry_base_ms)
+                                << shift);
+            const BlockKey retry_key = item.key;
+            const auto due = item.not_before;
+            s.retry_at[retry_key] = s.retryq.emplace(due, std::move(item));
+            s.cv.notify_one();
+          } else {
+            const auto completion = entry.completion;
+            if (entry.flush_pin) {
+              if (entry.in_arena())
+                s.alloc->Unpin(entry.key, entry.slot_handle);
+              entry.flush_pin = false;
+            }
+            if (opt_.flush_given_up) opt_.flush_given_up(item.key);
+            DropLocked(s, item.key);
+            flush_no_room_dropped_.fetch_add(1, std::memory_order_relaxed);
+            CompletePut(completion, FlushOutcome::kNoRoom);
+          }
         } else if (!target_failed[i] &&
                    ++batch[i].tries < opt_.flush_retries) {
           // Try again: after a pause if the value was acknowledged already,
@@ -1543,6 +1592,7 @@ void RamTier::FlushLoop(Shard& s) {
           }
           if (client_acked)
             post_ack_flush_failures_.fetch_add(1, std::memory_order_relaxed);
+          if (opt_.flush_given_up) opt_.flush_given_up(batch[i].key);
           DropLocked(s, batch[i].key);
           NoteDrop();
           flush_dropped_.fetch_add(1, std::memory_order_relaxed);
