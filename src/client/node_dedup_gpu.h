@@ -143,6 +143,10 @@ class GpuNodeDedup {
   uint64_t fetches() const { return fetches_.load(std::memory_order_relaxed); }
   uint64_t wait_hits() const { return wait_hits_.load(std::memory_order_relaxed); }
   uint64_t wait_timeouts() const { return wait_timeouts_.load(std::memory_order_relaxed); }
+  // Lookups that found their key published with a length they do not expect.
+  uint64_t length_mismatches() const {
+    return length_mismatches_.load(std::memory_order_relaxed);
+  }
   uint64_t load_fences() const { return load_fences_.load(std::memory_order_relaxed); }
   // Invalidations that waited for one slot longer than takeover_ms, or left
   // behind a slot whose release has been past its finishing swap for longer
@@ -281,6 +285,7 @@ class GpuNodeDedup {
   PeerMap peer_map_[kMaxProcs];
 
   std::atomic<uint64_t> hits_{0}, fetches_{0}, wait_hits_{0}, wait_timeouts_{0};
+  mutable std::atomic<uint64_t> length_mismatches_{0};
   std::atomic<uint64_t> load_fences_{0}, load_fence_failures_{0};
   std::atomic<uint64_t> invalidate_stuck_{0};
 };

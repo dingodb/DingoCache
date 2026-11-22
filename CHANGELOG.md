@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Client, host and GPU dedup: a key that two processes on the host expect
+  with different lengths is now reported. Dedup rests on one key meaning
+  the same bytes in every process; keys that leave out a rank axis of a
+  sharded payload break that, and so far nothing said so. Such a lookup
+  already ignored the entry and fetched for itself; it is now also counted
+  (`dfkv_client_dedup_length_mismatches_total`,
+  `dfkv_client_gpu_dedup_length_mismatches_total`) and the first one is
+  logged as a WARN. Keys that disagree only in content, not in length,
+  cannot be detected this way.
 - Client: a timestamp another thread or process wrote a moment after this
   one read its clock is no longer taken for one from the distant past. The
   clock was read before the lookup or lock that found the stamp, and the

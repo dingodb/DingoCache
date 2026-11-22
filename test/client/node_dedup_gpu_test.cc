@@ -1401,6 +1401,29 @@ TEST(GpuNodeDedup, EntryStampedFarAheadExpires) {
       << "an entry stamped ten minutes ahead was served";
 }
 
+// ---- the precondition: one key, the same bytes in every process ------------
+
+TEST(GpuNodeDedup, LengthDisagreementIsCountedAndNotServed) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("len-disagree");
+  auto a = GpuNodeDedup::Open(Opts(g.name));
+  auto b = GpuNodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  KeyBufs k(89);
+  size_t got = 0;
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->ClaimSg(K(89), &k.s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  a->PublishSg(K(89), token, &k.s, 1, 4096);
+  GpuNodeDedup::Seg small{k.d.ptr, 1024};
+  EXPECT_NE(b->ClaimSg(K(89), &small, 1, 1024, &got, &ignored),
+            GpuNodeDedup::Role::kHit);
+  EXPECT_EQ(b->length_mismatches(), 1u);
+  ASSERT_EQ(b->ClaimSg(K(89), &k.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kHit);
+  EXPECT_EQ(b->length_mismatches(), 1u);
+}
+
 // ---- through KVClient: a fetch that lands in device memory -----------------
 
 namespace {
