@@ -333,14 +333,26 @@ GpuNodeDedup::Slot* GpuNodeDedup::Reserve(const BlockKey& key) {
     Slot& s = slots_[idx];
     uint32_t st = s.state.load(std::memory_order_acquire);
     bool claim = false;
+    bool locked = false;  // claimed a stale fetch: holds PUBLISHING (below)
     if (st == kStateEmpty) {
       claim = s.state.compare_exchange_strong(st, kStateFetching,
                                               std::memory_order_acq_rel);
     } else if (st == kStateReady &&
-               now - s.fetch_start_ms.load(std::memory_order_relaxed) >
-                   static_cast<uint64_t>(ttl_ms_)) {
+               (now - s.fetch_start_ms.load(std::memory_order_relaxed) >
+                    static_cast<uint64_t>(ttl_ms_) ||
+                Unusable(s))) {
+      // Expired, or nobody can copy it any more (see Unusable): left in
+      // place it would only keep the key from being shared until it expires.
       claim = s.state.compare_exchange_strong(st, kStateFetching,
                                               std::memory_order_acq_rel);
+    } else if (st == kStateFetching) {
+      // A fetch older than the takeover age, of any key: see NodeDedup::
+      // Reserve. Taken under PUBLISHING, as a takeover is.
+      const uint64_t started = s.fetch_start_ms.load(std::memory_order_relaxed);
+      if (started < now && now - started > static_cast<uint64_t>(takeover_ms_)) {
+        claim = locked = s.state.compare_exchange_strong(
+            st, kStatePublishing, std::memory_order_acq_rel);
+      }
     }
     if (!claim) continue;
     s.gen.fetch_add(1, std::memory_order_acq_rel);  // odd: mutating identity
@@ -353,9 +365,26 @@ GpuNodeDedup::Slot* GpuNodeDedup::Reserve(const BlockKey& key) {
     s.owner_gen32 = 0;
     s.fetch_start_ms.store(now, std::memory_order_relaxed);
     s.gen.fetch_add(1, std::memory_order_release);  // even: coherent
+    if (locked) s.state.store(kStateFetching, std::memory_order_release);
     return &s;
   }
   return nullptr;
+}
+
+// A READY entry no reader can copy any more: its owner's registry entry is
+// gone or has another occupant, or the owner's arena ring has overwritten the
+// payload. Read in READY, where the descriptor is not written.
+bool GpuNodeDedup::Unusable(const Slot& s) const {
+  const uint32_t oi = s.owner_idx;
+  if (oi >= kMaxProcs) return true;
+  const ProcEntry& e = reg_[oi];
+  if (e.ready.load(std::memory_order_acquire) != 1 ||
+      static_cast<uint32_t>(e.generation.load(std::memory_order_acquire)) !=
+          s.owner_gen32)
+    return true;
+  return e.alloc_cursor.load(std::memory_order_acquire) -
+             __atomic_load_n(&s.alloc_seq, __ATOMIC_RELAXED) >
+         e.arena_bytes - s.len;
 }
 
 CUdeviceptr GpuNodeDedup::PeerBase(uint32_t idx, uint64_t gen) {

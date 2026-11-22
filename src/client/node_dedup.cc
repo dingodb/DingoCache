@@ -225,14 +225,32 @@ NodeDedup::Slot* NodeDedup::Reserve(const BlockKey& key, Kind kind) {
     Slot& s = slots_[idx];
     uint32_t st = s.state.load(std::memory_order_acquire);
     bool claim = false;
+    bool locked = false;  // claimed a stale fetch: holds PUBLISHING (below)
     if (st == kStateEmpty) {
       claim = s.state.compare_exchange_strong(st, kStateFetching,
                                               std::memory_order_acq_rel);
     } else if (st == kStateReady &&
-               now - s.fetch_start_ms.load(std::memory_order_relaxed) >
-                   static_cast<uint64_t>(ttl_ms_)) {
+               (now - s.fetch_start_ms.load(std::memory_order_relaxed) >
+                    static_cast<uint64_t>(ttl_ms_) ||
+                Lapped(s))) {
+      // Expired, or overwritten in the ring: nobody can copy it any more,
+      // and leaving it in place would only keep the key from being shared
+      // until it expires (every later claim finds it first and fetches for
+      // itself).
       claim = s.state.compare_exchange_strong(st, kStateFetching,
                                               std::memory_order_acq_rel);
+    } else if (st == kStateFetching) {
+      // A fetch older than the takeover age, of any key: its owner is dead or
+      // hung (a claim of its own key would take it over the same way). Left
+      // alone, such slots fill the probe window of keys nobody asks for
+      // again. Taken like a takeover does, under PUBLISHING, so that no
+      // takeover or late publish of the old claim acts on the slot while its
+      // identity changes; the old owner's token no longer matches after.
+      const uint64_t started = s.fetch_start_ms.load(std::memory_order_relaxed);
+      if (started < now && now - started > static_cast<uint64_t>(takeover_ms_)) {
+        claim = locked = s.state.compare_exchange_strong(
+            st, kStatePublishing, std::memory_order_acq_rel);
+      }
     }
     if (!claim) continue;
     // Slot reserved: mutate identity under an odd generation so a concurrent
@@ -246,9 +264,17 @@ NodeDedup::Slot* NodeDedup::Reserve(const BlockKey& key, Kind kind) {
     s.alloc_seq = 0;
     s.fetch_start_ms.store(now, std::memory_order_relaxed);
     s.gen.fetch_add(1, std::memory_order_release);  // -> even, coherent
+    if (locked) s.state.store(kStateFetching, std::memory_order_release);
     return &s;
   }
   return nullptr;  // probe window full: run without dedup for this key
+}
+
+// Read in READY, where payload_off, alloc_seq and len are not written (they
+// change only after a claim has swapped the state away from READY).
+bool NodeDedup::Lapped(const Slot& s) const {
+  return hdr_->alloc_cursor.load(std::memory_order_acquire) - s.alloc_seq >
+         arena_bytes_ - s.len;
 }
 
 bool NodeDedup::CopyOut(Slot* s, const BlockKey& key, Kind kind, size_t cap,

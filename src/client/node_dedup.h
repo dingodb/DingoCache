@@ -146,6 +146,8 @@ class NodeDedup {
 
   Slot* Find(const BlockKey& key, Kind kind) const;
   Slot* Reserve(const BlockKey& key, Kind kind);
+  // A READY entry whose payload the ring has overwritten since.
+  bool Lapped(const Slot& s) const;
   // Validated copy of (key, kind)'s payload out of slot s. strict_n: exact
   // length required (SIZE_MAX = any <= cap). Returns payload length via *got
   // on success.
