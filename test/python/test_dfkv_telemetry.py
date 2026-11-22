@@ -596,6 +596,32 @@ class ClientOpForwardTest(TelemetryTestBase):
         # op-labeled lines must be excluded (they belong to parse_client_ops)
         self.assertNotIn("dfkv_client_op_requests_total", d)
 
+    GPU_DEDUP_SNAP = (
+        'dfkv_client_gpu_dedup_load_fences_total 40\n'
+        'dfkv_client_gpu_dedup_load_fence_failures_total 1\n'
+        'dfkv_client_gpu_dedup_invalidate_stuck_total 2\n'
+    )
+
+    def test_gpu_dedup_fence_and_stuck_counters_forwarded_to_otlp(self):
+        from dfkv_telemetry import otlp_json
+        d = metrics.parse_client_dedup(self.GPU_DEDUP_SNAP)
+        self.assertEqual(d["dfkv_client_gpu_dedup_load_fences_total"], 40.0)
+        self.assertEqual(
+            d["dfkv_client_gpu_dedup_load_fence_failures_total"], 1.0)
+        self.assertEqual(d["dfkv_client_gpu_dedup_invalidate_stuck_total"], 2.0)
+        os.environ[config.ENV_METRICS_ENABLED] = "1"
+        metrics.configure({}, connector_type=config.TYPE_VLLM, tp_rank=0, model="m")
+        rec = metrics._recorder
+        rec.update_client_dedup(d)
+        payload = otlp_json.build_payload(rec, rec.export_snapshot(), 1, 2)
+        names = {m["name"] for m in
+                 payload["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]}
+        self.assertIn("dfkv_connector_gpu_dedup_load_fences_total", names)
+        self.assertIn("dfkv_connector_gpu_dedup_load_fence_failures_total", names)
+        self.assertIn("dfkv_connector_gpu_dedup_invalidate_stuck_total", names)
+        # Not a second time through the generic client-status forwarding.
+        self.assertEqual(metrics.parse_client_status(self.GPU_DEDUP_SNAP), [])
+
     def test_dedup_forwarded_to_otlp(self):
         from dfkv_telemetry import otlp_json
         os.environ[config.ENV_METRICS_ENABLED] = "1"
