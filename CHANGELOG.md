@@ -272,6 +272,14 @@
   pooled connection and a peer without identity, where `verdict=endpoint`
   only says that the local rail is not to blame. No setting, API or wire
   change.
+- RDMA client: a keepalive round no longer empties the connection pools. It
+  took every idle connection out of the pools first and then probed them one
+  after another, so for the whole round, which lasts 100 ms for each
+  connection that does not answer, an operation to any node found no pooled
+  connection and dialed a new one; those were later retired as surplus. Now
+  each connection leaves its pool only for its own probe. A connection that
+  an operation is using when its turn comes is skipped in that round. No
+  setting, metric, API or wire change.
 
 ## 2.39.0 — 2026-11-22
 
