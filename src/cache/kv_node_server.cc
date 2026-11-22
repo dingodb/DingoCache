@@ -831,6 +831,11 @@ std::string KvNodeServer::MetricsText() const {
            "Disk PUTs (client PUTs and RAM-tier flush attempts, retries "
            "included) refused with kCacheFull for want of a slot",
            ss.put_no_slot);
+    metric("dfkv_slab_put_busy_total", "counter",
+           "Disk PUTs refused with kCacheFull because the key could not be "
+           "taken yet (a slot still held by an unfinished operation, or a "
+           "deferred removal past its wait bound)",
+           ss.put_busy);
     metric("dfkv_slab_table_sync_total", "counter",
            "slots.tbl fdatasync cycles performed", ss.table_syncs);
     metric("dfkv_slab_extent_steals_total", "counter",

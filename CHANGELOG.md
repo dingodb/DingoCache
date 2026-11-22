@@ -36,6 +36,17 @@
   the RAM-ACK watermark like a disk that refuses writes, and new keys are
   then answered `kCacheFull`. No setting, API or wire change. See
   `docs/DEPLOY.md` and `docs/METRICS.md`.
+- Server, slab: two more answers of a healthy store that cannot take a key
+  yet are `kCacheFull` instead of `kIOError`, on which clients cool the
+  node down. A PUT of a key that still holds a slot from an earlier
+  operation that has not let go, and a PUT of a key whose removal waits for
+  a read or write in flight that outlasts the 5 s bound. Both used to be
+  `kIOError`. `kCacheFull` has been a wire status since the first release;
+  clients of 2.35 and later count it as "not stored" and keep using the
+  node, as they do for a full disk. Counted in the new
+  `dfkv_slab_put_busy_total`, so a pin or slot that never lets go shows;
+  not in `dfkv_slab_put_no_slot_total`: neither is a missing slot. No
+  setting, API or wire change.
 
 - Client, GPU dedup (`DFKV_CLIENT_NODE_DEDUP_GPU=1`): a write or remove of
   a key that hangs on a blocked shared slot is no longer silent, and one
