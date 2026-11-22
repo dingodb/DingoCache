@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 import re
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -82,6 +85,88 @@ class ReleaseVersionContractTest(unittest.TestCase):
         self.assertIn("refusing to replace immutable assets", release)
         self.assertNotIn("gh release upload \"$tag\" release/* --clobber\n"
                          "          else", release)
+    def _pull_images(self, failing_hosts):
+        """Runs the workflow pull script against a stand-in `docker` that
+        fails every pull from `failing_hosts`; returns (rc, docker calls)."""
+        script = ROOT / ".github" / "scripts" / "pull_observability_images.sh"
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / "calls"
+            log.touch()
+            fake = Path(temp) / "docker"
+            fake.write_text(
+                "#!/usr/bin/env bash\n"
+                'echo "$*" >> "$FAKE_LOG"\n'
+                'if [ "$1" = pull ]; then\n'
+                '  for h in $FAKE_FAIL; do case "$2" in "$h"/*) exit 1;; esac; done\n'
+                "fi\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+            env = dict(
+                os.environ,
+                PATH=f"{temp}{os.pathsep}{os.environ['PATH']}",
+                FAKE_LOG=str(log),
+                FAKE_FAIL=" ".join(failing_hosts),
+                DFKV_CI_PULL_BACKOFF_S="0",
+            )
+            env.pop("DFKV_CI_IMAGE_SOURCES", None)
+            result = subprocess.run(
+                ["bash", str(script)], cwd=ROOT, env=env, capture_output=True,
+                text=True, timeout=60, check=False,
+            )
+            return result.returncode, log.read_text(encoding="utf-8").splitlines()
+
+    def test_observability_image_pulls_retry_and_fall_back(self):
+        compose = (
+            ROOT / "deploy" / "observability" / "docker-compose.yml"
+        ).read_text(encoding="utf-8")
+        pinned = {
+            name: re.search(rf"/({re.escape(name)}@sha256:[0-9a-f]{{64}})", compose).group(1)
+            for name in ("prom/prometheus", "otel/opentelemetry-collector-contrib",
+                         "grafana/tempo")
+        }
+        mirror, canonical = "docker.m.daocloud.io", "docker.io"
+
+        # All healthy: one pull per image, from the canonical registry, by
+        # digest.
+        rc, calls = self._pull_images([])
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            [call for call in calls if call.startswith("pull ")],
+            [f"pull {canonical}/{ref}" for ref in pinned.values()],
+        )
+        self.assertEqual(
+            [call.split()[-1] for call in calls if call.startswith("tag ")],
+            ["dfkv-ci/prometheus:ci", "dfkv-ci/otel-collector:ci", "dfkv-ci/tempo:ci"],
+        )
+
+        # Canonical registry down: each image is retried there, then comes
+        # from the mirror under the same digest.
+        rc, calls = self._pull_images([canonical])
+        self.assertEqual(rc, 0)
+        for ref in pinned.values():
+            self.assertEqual(calls.count(f"pull {canonical}/{ref}"), 3, ref)
+            self.assertEqual(calls.count(f"pull {mirror}/{ref}"), 1, ref)
+        self.assertEqual(sum(call.startswith("tag ") for call in calls), 3)
+
+        # Everything down: bounded, and a failure, not a silent pass.
+        rc, calls = self._pull_images([mirror, canonical])
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(len(calls), 5)
+
+        # Both workflows validate with what the script pulled, and neither
+        # runs an image straight from a registry.
+        for name in ("ci.yml", "release.yml"):
+            workflow = (ROOT / ".github" / "workflows" / name).read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("bash .github/scripts/pull_observability_images.sh", workflow)
+            for tag in ("dfkv-ci/prometheus:ci", "dfkv-ci/otel-collector:ci",
+                        "dfkv-ci/tempo:ci"):
+                self.assertIn(tag, workflow, name)
+            self.assertNotIn("docker.m.daocloud.io", workflow, name)
+            self.assertNotIn("docker pull", workflow, name)
 
 if __name__ == "__main__":
     unittest.main()
