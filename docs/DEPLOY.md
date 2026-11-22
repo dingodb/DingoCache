@@ -320,13 +320,13 @@ WantedBy=multi-user.target
 > - `--ram-tier on`（默认关）：arena 内对象走 RDMA 零拷贝。`--ram-write-mode writeback|writearound`（默认 `writeback`）选择 PUT 先入 RAM 后落盘，或直接盘写、读时晋升。`writeback` 默认在数据进入可读且 flush-pinned 的 RAM slot 后返回 `kOk`。达到正的 `DFKV_RAM_ACK_HIGH_WATERMARK_PCT`（默认 80）时，只拒绝尚无 owner 的新 key，返回 `kCacheFull`，不转为直接盘写。已有同 key 请求仍加入首写者的完成结果；水位设为 0 保留强制 disk-ACK 语义。需要所有 PUT 都等待持久化时设置 `DFKV_PUT_ACK_MODE=disk`。`--ram-tier-bytes` 限定总预算；超 extent 对象仍受 dedicated allocation 预算约束。显式启用 RAM 后，分配或 NUMA 模式失败会拒绝启动。
 > - `--ram-tier-numa interleave|off`（默认 `interleave`）：这是当前完整 mode 集；不接受数字 node ID。arena 预触并绑策略，须核 `MemoryMax`。
 > - `--ram-flush-threads <n>` / `DFKV_RAM_FLUSH_THREADS`：请求值会提高到至少 shard 数；实际值由 `dfkv_ram_flush_threads` 报告（默认请求=4×盘数，上限 16）。
-> - 微调项（env only）：`DFKV_SLAB_TABLE_SYNC_MS` 控制 table sync 节奏（默认 100 ms，0=关）。
+> - 微调项（env only）：`DFKV_SLAB_TABLE_SYNC_MS` 控制运行期对 `slots.tbl` 的周期同步（0=关）。默认 `DFKV_SLAB_WARM_RESTART=boot` 时 100 ms，`auto` 时 5 s，`off` 时关：`off` 在非干净退出后一律清零，`auto` 只在内核和挂载都没变（页缓存还在）时保留表，两者的恢复都不依赖 100 ms 的同步；`auto` 留下 5 s 一次的慢同步，是为了在运行期间就发现表的后台回写错误（EIO），不必等到停止或重启时的同步才发现（错误只报一次，回写失败的页也可能随之丢掉，之后再读到的就是旧记录）。干净停止和 extent 改绑时表照常同步。
 > - 非干净退出后的处理（env only）：`DFKV_SLAB_WARM_RESTART=off|auto|boot`，默认 `off`。
 >   - `off`：非干净退出后一律清零，等同 2.35。
 >   - `auto`：进程被杀（停止超时、OOM）而内核没重启时保留缓存，其余情况清零。要同时满足：`slab_state` 里记录的 boot id、挂载唯一 ID（内核 6.8 起提供）和目录 inode 都没变；`/dev/shm` 里有上次运行留下的可信令牌；文件系统是 xfs、ext4 或 tmpfs；启动时对表和各 extent 的同步没有报错。
 >   - `boot`：在 `auto` 的基础上，接受上次运行没有挂载唯一 ID 的情况（内核 6.8 以前）。这时"文件系统出错下线、没重启就重新挂载"只有在旧进程退出前察觉到时才拦得住（看到过 I/O 错误，或者正在同步表，两种情况令牌都已收回）；没察觉的话，最近一次表同步之后的记录写入、以及内核最近一次回写之后的带缓冲数据写入可能丢失。缓存盘出过文件系统错误后，用 `off` 启动一次再改回来。
 >   - 可信令牌是 `/dev/shm`（必须是 tmpfs）里按缓存目录命名的小文件，随重启消失，不依赖缓存盘。服务端只在能为缓存担保期间持有它：恢复完成后建立；出现元数据 I/O 错误、每次同步表期间、服务端自身崩溃（SIGSEGV、SIGABRT 等）、保留缓存的启动尚未完成时都会收回。令牌不在就清零，所以 `/dev/shm` 被清理只会多清一次缓存。
->   - 进程在同步表期间被杀也会清零（令牌此时已收回）。同步每 `DFKV_SLAB_TABLE_SYNC_MS` 做一次，写入压力大或 extent 频繁改绑时占的时间比例会上升，清零的原因可以在启动日志里看到。带缓冲写过数据的运行，在关闭阶段同步 extent 期间被杀同样清零。
+>   - 进程在同步表期间被杀也会清零（令牌此时已收回）。`auto` 下默认 5 s 同步一次，被杀正好落在同步里的机会很小；`boot` 下同步每 `DFKV_SLAB_TABLE_SYNC_MS` 做一次，写入压力大或 extent 频繁改绑时占的时间比例会上升。清零的原因可以在启动日志里看到。带缓冲写过数据的运行，在关闭阶段同步 extent 期间被杀同样清零。
 >   - 服务以普通用户运行且 logind 的 `RemoveIPC=yes` 时，该用户最后一个登录会话结束会清掉 `/dev/shm` 里的令牌，之后的非干净退出都会清零；用 root 或系统用户运行不受影响。`dfkv_slab_trust_tokens_held` 可以看当前有几块盘持有令牌。
 >   - 容器里 `/dev/shm` 通常是容器（或 pod）私有的，容器重建后令牌消失，`auto` 和 `boot` 都等于 `off`；内核 6.8 及以上，容器每次启动或带挂载沙箱选项的 systemd 单元挂载唯一 ID 也会变。要在容器里保留缓存，需要把宿主机的 `/dev/shm` 挂进去，并且只在内核 6.8 以前用 `boot`。
 >   - 一个缓存目录同时只能被一个进程打开（目录上有排他锁）。
@@ -649,7 +649,7 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | `--server-uring` / `DFKV_SERVER_URING` | `0` | io_uring async-GET（编须 `-DDFKV_WITH_URING`） |
 | `--server-uring-depth` / `DFKV_SERVER_URING_DEPTH` | — | uring SQ 深度 |
 | `--ram-flush-threads` / `DFKV_RAM_FLUSH_THREADS` | 默认 4×盘数， 钳至 shard 数上限 16 | RAM tier flush 线程 |
-| `--slab-table-sync-ms` / `DFKV_SLAB_TABLE_SYNC_MS` | `100 ms`, `0`=关 | slab 元数据 sync 节奏 |
+| `--slab-table-sync-ms` / `DFKV_SLAB_TABLE_SYNC_MS` | `boot` 下 `100 ms`，`auto` 下 `5 s`，`off` 下 `0`（关） | 运行期 `slots.tbl` 周期同步节奏；`boot` 的恢复靠它，`auto` 的 5 s 用来及时发现表的回写错误 |
 | `DFKV_SLAB_WARM_RESTART` | `off`（`auto` / `boot`） | 非干净退出后保留还是清零 slab 缓存 |
 | `--slab-reclaim-ms` / `DFKV_SLAB_RECLAIM_MS` | `50 ms`, `0`=关 | slab 后台回收 tick |
 | `--ram-reclaim-ms` / `DFKV_RAM_RECLAIM_MS` | `10 ms`, `0`=关 | RAM tier 后台回收 tick |

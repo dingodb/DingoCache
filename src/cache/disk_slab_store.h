@@ -68,12 +68,16 @@ class DiskSlabStore : public StoreEngine {
     // CLOCK eviction sweep inline under the store lock (the measured write-
     // path serialization on a full store).
     uint32_t reclaim_interval_ms = 50;
-    // slots.tbl fdatasync cadence (ms; 0 = off). Bounds the crash window in
-    // which a REUSED slot's new payload is on disk while the reused record is
-    // still page-cache-only -- rebuild would then resurrect the PREVIOUS
-    // occupant's key pointing at the new occupant's bytes. Payload writes give
-    // no such window in direct mode (DIO is durable at return); this closes
-    // the record side to <= the cadence instead of the ~30s dirty expiry.
+    // slots.tbl fdatasync cadence (ms; 0 = off). Bounds how many record writes
+    // can be missing from the table on disk while the process runs. That
+    // matters to a recovery only where a table is kept without the page cache
+    // that holds those writes: warm_restart kBootOnly accepting a run without
+    // a unique mount id, whose filesystem may have died and been mounted
+    // again. A reset (kOff, or any start after an OS crash) and a kAuto keep
+    // (same kernel and mount, so the same page cache) do not depend on it.
+    // DiskCacheGroup therefore defaults it to 100 under kBootOnly, to 5000
+    // under kAuto (only to find a writeback error of the table during the
+    // run) and to 0 under kOff; a store used on its own keeps 100.
     uint32_t table_sync_ms = 100;
     // What happens to slots.tbl after an unclean exit, i.e. when slab_state
     // still says dirty at startup.
