@@ -68,6 +68,13 @@ jobs:
           ctest --test-dir build-release --output-on-failure --timeout 300 -j2 \
             --exclude-regex '^RdmaLoopback\.'
 
+      # Retries each pinned image, on the canonical registry and then on the
+      # mirror, and tags it dfkv-ci/<name>:ci for the checks below. A failed
+      # pull must not cost a release run: the build and tests above take most
+      # of an hour.
+      - name: Pull observability images
+        run: bash .github/scripts/pull_observability_images.sh
+
       - name: Validate observability configuration
         env:
           DFKV_GRAFANA_ADMIN_PASSWORD: ci-validation-only
@@ -77,16 +84,16 @@ jobs:
           docker run --rm \
             -v "$PWD/deploy/observability:/etc/prometheus:ro" \
             --entrypoint promtool \
-            docker.m.daocloud.io/prom/prometheus@sha256:508729e0e2d18e11fd742a5a5ca70e557b940a93948c3c95fd0123a6fd538b69 \
+            dfkv-ci/prometheus:ci \
             check config /etc/prometheus/prometheus.yml
           docker run --rm \
             -v "$PWD/deploy/observability:/etc/dfkv-observability:ro" \
-            docker.m.daocloud.io/otel/opentelemetry-collector-contrib@sha256:c5918f78992ee73b0d6f0e599423ac5ec52dd5d9726733114d6eca53d5a32ed5 \
+            dfkv-ci/otel-collector:ci \
             validate --config=/etc/dfkv-observability/otel-collector-config.yaml
           docker run --rm \
             -v "$PWD/deploy/observability:/etc/dfkv-observability:ro" \
             --entrypoint /tempo \
-            docker.m.daocloud.io/grafana/tempo@sha256:cda87c212d8c584dc0b89e337e7ed648a5100feb657e5d528480ee4fa03dbbe3 \
+            dfkv-ci/tempo:ci \
             -config.file=/etc/dfkv-observability/tempo.yaml -config.verify=true
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
