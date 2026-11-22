@@ -86,6 +86,9 @@ class PeerHealth {
   // busy_grace_ms; a peer that answered recently is alive-busy, and the
   // failed op's honest error still reaches its caller. Dead peers never
   // MarkGood, so their first failure cools down exactly as before.
+  // How far ahead of a caller's clock another thread's stamp may be and
+  // still be taken as current.
+  static constexpr uint64_t kStampSkewMs = 1000;
   explicit PeerHealth(uint64_t base_cooldown_ms = 2000,
                       uint64_t max_cooldown_ms = 30000,
                       uint64_t busy_grace_ms = 1000)
@@ -119,7 +122,12 @@ class PeerHealth {
     // error but do NOT engage the cooldown (which would instant-fail every
     // subsequent op to it, including the caller's retry).
     auto lg = last_good_.find(peer);
-    if (lg != last_good_.end() && now_ms - lg->second < busy_grace_ms_) {
+    // (now_ms may be a little older than the last answer: it was read before
+    // the lock, and another thread recorded the answer since. Only a small
+    // skew counts as "just answered"; a stamp far ahead is no answer.)
+    if (lg != last_good_.end() &&
+        (lg->second > now_ms ? lg->second - now_ms <= kStampSkewMs
+                             : now_ms - lg->second < busy_grace_ms_)) {
       busy_suppressed_.fetch_add(1, std::memory_order_relaxed);
       return;
     }

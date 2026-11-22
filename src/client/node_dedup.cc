@@ -38,6 +38,18 @@ uint64_t EnvU64(const char* name, uint64_t dflt) {
   return resolved;
 }
 
+// Age of a stamp taken by another thread or process. `now` is often read
+// before the lookup or lock that finds the stamp, so the stamp can be a
+// little newer than now: within kStampSkewMs it is fresh (age 0), not
+// ~2^64 ms old. A stamp further ahead is no skew (a torn write, a clock of
+// another time namespace): it counts as ancient, so that an entry carrying
+// it expires instead of being served for good.
+constexpr uint64_t kStampSkewMs = 1000;
+uint64_t AgeMs(uint64_t now, uint64_t then) {
+  if (then <= now) return now - then;
+  return then - now <= kStampSkewMs ? 0 : UINT64_MAX;
+}
+
 uint32_t Pow2AtLeast(uint32_t v) {
   uint32_t p = 1024;
   while (p < v && p < (1u << 24)) p <<= 1;
@@ -218,7 +230,7 @@ NodeDedup::Slot* NodeDedup::Reserve(const BlockKey& key, Kind kind) {
       claim = s.state.compare_exchange_strong(st, kStateFetching,
                                               std::memory_order_acq_rel);
     } else if (st == kStateReady &&
-               (now - s.fetch_start_ms.load(std::memory_order_relaxed) >
+               (AgeMs(now, s.fetch_start_ms.load(std::memory_order_relaxed)) >
                     static_cast<uint64_t>(ttl_ms_) ||
                 Lapped(s))) {
       // Expired, or overwritten in the ring: nobody can copy it any more,
@@ -306,7 +318,7 @@ NodeDedup::Role NodeDedup::ClaimImpl(const BlockKey& key, Kind kind, size_t cap,
   if (Slot* s = Find(key, kind)) {
     const uint32_t st = s->state.load(std::memory_order_acquire);
     if (st == kStateReady) {
-      if (now - s->fetch_start_ms.load(std::memory_order_relaxed) <=
+      if (AgeMs(now, s->fetch_start_ms.load(std::memory_order_relaxed)) <=
               static_cast<uint64_t>(ttl_ms_) &&
           CopyOut(s, key, kind, cap, strict_n, dst, got)) {
         hits_.fetch_add(1, std::memory_order_relaxed);
@@ -493,6 +505,15 @@ void NodeDedup::UnlockSlotForTest(Slot* s) {
   s->state.store(kStateFetching, std::memory_order_release);
 }
 
+bool NodeDedup::ShiftStampForTest(const BlockKey& key, Kind kind,
+                                  int64_t delta_ms) {
+  Slot* s = Find(key, kind);
+  if (!s) return false;
+  s->fetch_start_ms.fetch_add(static_cast<uint64_t>(delta_ms),
+                              std::memory_order_relaxed);
+  return true;
+}
+
 void NodeDedup::SetFenceableForTest(const PublishHold& hold, bool on) {
   hold.slot->publisher.store(on ? kFenceablePublisher : 0,
                              std::memory_order_release);
@@ -608,7 +629,7 @@ bool NodeDedup::WaitImpl(const BlockKey& key, Kind kind, size_t cap,
       // Same freshness rule as a claim. What a waiter finds is normally the
       // result just published for it, but when that fetch was aborted it can
       // be an older entry of the key further along the probe window.
-      if (NowMs() - s->fetch_start_ms.load(std::memory_order_relaxed) <=
+      if (AgeMs(NowMs(), s->fetch_start_ms.load(std::memory_order_relaxed)) <=
               static_cast<uint64_t>(ttl_ms_) &&
           CopyOut(s, key, kind, cap, strict_n, dst, got)) {
         wait_hits_.fetch_add(1, std::memory_order_relaxed);

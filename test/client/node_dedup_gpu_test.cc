@@ -79,6 +79,9 @@ struct GpuNodeDedupTestAccess {
   static bool GenEven(const GpuNodeDedup& d, const Hold& h) {
     return d.GenEvenForTest(h.hold);
   }
+  static bool ShiftStamp(GpuNodeDedup& d, const BlockKey& key, int64_t ms) {
+    return d.ShiftStampForTest(key, ms);
+  }
   static void LookLikeAnOlderRelease(GpuNodeDedup& d, const Hold& h) {
     d.SetFenceableForTest(h.hold, false);
   }
@@ -1354,6 +1357,48 @@ TEST(GpuNodeDedup, AnEntryOfAPreviousProcessWithThisPidIsNotReadDirectly) {
   EXPECT_NE(b->ClaimSg(K(87), &k.d, 1, 4096, &got, &ignored),
             GpuNodeDedup::Role::kHit)
       << "read through the address an entry of another process image gives";
+}
+
+// ---- a stamp a little newer than the reader's clock -----------------------
+
+TEST(GpuNodeDedup, EntryStampedAfterTheReadersClockIsFresh) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("stamp-ahead");
+  auto a = GpuNodeDedup::Open(Opts(g.name));
+  auto b = GpuNodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  KeyBufs k(88);
+  size_t got = 0;
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->ClaimSg(K(88), &k.s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  a->PublishSg(K(88), token, &k.s, 1, 4096);
+  ASSERT_TRUE(GpuNodeDedupTestAccess::ShiftStamp(*a, K(88), 500));
+  ASSERT_EQ(b->ClaimSg(K(88), &k.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kHit)
+      << "a fresh entry was taken for an expired one";
+  EXPECT_EQ(k.dst.Down(4096), k.value);
+  GpuNodeDedup::WaitItem item{K(88), &k.d, 1, 4096, false, 0};
+  b->WaitManySg(&item, 1);
+  EXPECT_TRUE(item.ok);
+}
+
+TEST(GpuNodeDedup, EntryStampedFarAheadExpires) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("stamp-far-ahead");
+  auto a = GpuNodeDedup::Open(Opts(g.name));
+  auto b = GpuNodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  KeyBufs k(90);
+  size_t got = 0;
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->ClaimSg(K(90), &k.s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  a->PublishSg(K(90), token, &k.s, 1, 4096);
+  ASSERT_TRUE(GpuNodeDedupTestAccess::ShiftStamp(*a, K(90), 600000));
+  EXPECT_EQ(b->ClaimSg(K(90), &k.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kFetch)
+      << "an entry stamped ten minutes ahead was served";
 }
 
 // ---- through KVClient: a fetch that lands in device memory -----------------

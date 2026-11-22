@@ -187,6 +187,9 @@ class NodeDedup {
   // Makes a held slot look like the publisher of an older release, which
   // does not mark itself as fenceable.
   void SetFenceableForTest(const PublishHold& hold, bool on);
+  // Moves the stamp of key's entry by delta_ms (as another process's clock
+  // read would place it). False: no entry.
+  bool ShiftStampForTest(const BlockKey& key, Kind kind, int64_t delta_ms);
   // A stale Publish/Abort of another process inside its re-check: the slot
   // is PUBLISHING for a moment and then FETCHING again.
   bool LockSlotForTest(Slot* s);

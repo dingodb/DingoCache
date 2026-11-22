@@ -55,6 +55,18 @@ uint64_t EnvU64(const char* name, uint64_t dflt) {
   return resolved;
 }
 
+// Age of a stamp taken by another thread or process. `now` is often read
+// before the lookup or lock that finds the stamp, so the stamp can be a
+// little newer than now: within kStampSkewMs it is fresh (age 0), not
+// ~2^64 ms old. A stamp further ahead is no skew (a torn write, a clock of
+// another time namespace): it counts as ancient, so that an entry carrying
+// it expires instead of being served for good.
+constexpr uint64_t kStampSkewMs = 1000;
+uint64_t AgeMs(uint64_t now, uint64_t then) {
+  if (then <= now) return now - then;
+  return then - now <= kStampSkewMs ? 0 : UINT64_MAX;
+}
+
 uint32_t Pow2AtLeast(uint32_t v) {
   uint32_t p = 1024;
   while (p < v && p < (1u << 24)) p <<= 1;
@@ -441,7 +453,7 @@ GpuNodeDedup::Slot* GpuNodeDedup::Reserve(const BlockKey& key) {
       claim = s.state.compare_exchange_strong(st, kStateFetching,
                                               std::memory_order_acq_rel);
     } else if (st == kStateReady &&
-               (now - s.fetch_start_ms.load(std::memory_order_relaxed) >
+               (AgeMs(now, s.fetch_start_ms.load(std::memory_order_relaxed)) >
                     static_cast<uint64_t>(ttl_ms_) ||
                 Unusable(s))) {
       // Expired, or nobody can copy it any more (see Unusable): left in
@@ -642,7 +654,7 @@ void GpuNodeDedup::WaitManySg(WaitItem* items, size_t n) {
         CopySnap snap{};
         // Same freshness rule as a claim: with the fetch in front of it
         // aborted, a waiter can find an older entry of the key.
-        if (NowMs() - s->fetch_start_ms.load(std::memory_order_relaxed) <=
+        if (AgeMs(NowMs(), s->fetch_start_ms.load(std::memory_order_relaxed)) <=
                 static_cast<uint64_t>(ttl_ms_) &&
             IssueCopySg(s, it.key, it.segs, it.nsegs, it.total_cap, st,
                         &snap)) {
@@ -704,7 +716,7 @@ GpuNodeDedup::Role GpuNodeDedup::ClaimSg(const BlockKey& key, const Seg* segs,
   if (Slot* s = Find(key)) {
     const uint32_t st = s->state.load(std::memory_order_acquire);
     if (st == kStateReady) {
-      if (now - s->fetch_start_ms.load(std::memory_order_relaxed) <=
+      if (AgeMs(now, s->fetch_start_ms.load(std::memory_order_relaxed)) <=
               static_cast<uint64_t>(ttl_ms_) &&
           CopyOutSg(s, key, segs, nsegs, total_cap, got)) {
         hits_.fetch_add(1, std::memory_order_relaxed);
@@ -1079,6 +1091,14 @@ bool GpuNodeDedup::GenEvenForTest(const PublishHold& hold) const {
   return (hold.slot->gen.load(std::memory_order_acquire) & 1) == 0;
 }
 
+bool GpuNodeDedup::ShiftStampForTest(const BlockKey& key, int64_t delta_ms) {
+  Slot* s = Find(key);
+  if (!s) return false;
+  s->fetch_start_ms.fetch_add(static_cast<uint64_t>(delta_ms),
+                              std::memory_order_relaxed);
+  return true;
+}
+
 void GpuNodeDedup::SetFenceableForTest(const PublishHold& hold, bool on) {
   if (on) {
     __atomic_store_n(&hold.slot->alloc_seq, kFenceablePublisher,
@@ -1213,7 +1233,7 @@ bool GpuNodeDedup::WaitSg(const BlockKey& key, const Seg* segs, size_t nsegs,
     const uint32_t state =
         s ? s->state.load(std::memory_order_acquire) : kStateEmpty;
     if (state == kStateReady) {
-      if (NowMs() - s->fetch_start_ms.load(std::memory_order_relaxed) <=
+      if (AgeMs(NowMs(), s->fetch_start_ms.load(std::memory_order_relaxed)) <=
               static_cast<uint64_t>(ttl_ms_) &&
           CopyOutSg(s, key, segs, nsegs, total_cap, got)) {
         wait_hits_.fetch_add(1, std::memory_order_relaxed);

@@ -236,6 +236,8 @@ class GpuNodeDedup {
   // on = false makes a held slot look like the publisher of an older
   // release, which does not mark itself, caught in the middle of its commit.
   void SetFenceableForTest(const PublishHold& hold, bool on);
+  // Moves the stamp of key's entry by delta_ms. False: no entry.
+  bool ShiftStampForTest(const BlockKey& key, int64_t delta_ms);
   // Steps 0-3 of a Reserve of hold's slot interleaved with an invalidation
   // of the key the slot still names: Reserve's state swap, the
   // invalidation's swap and first increment, its second increment and
