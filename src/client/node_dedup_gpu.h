@@ -169,6 +169,8 @@ class GpuNodeDedup {
   CUstream Stream();
   Slot* Find(const BlockKey& key) const;
   Slot* Reserve(const BlockKey& key);
+  // A READY entry that no reader can copy any more (see the .cc).
+  bool Unusable(const Slot& s) const;
   // Split copy-out: Issue pre-validates and ENQUEUES the scatter on st (no
   // sync); Validate re-checks lap/generation AFTER the caller synchronized.
   // CopyOutSg composes them for the single-key path; WaitManySg amortizes one

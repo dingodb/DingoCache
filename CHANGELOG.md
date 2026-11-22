@@ -3,6 +3,31 @@
 ## Unreleased
 
 
+- Client, host dedup (`DFKV_CLIENT_NODE_DEDUP=1`) and GPU dedup: a shared
+  entry that can no longer be copied no longer keeps its key from being
+  shared, and fetches whose process died no longer fill up the table. An
+  entry is unusable once the staging ring has overwritten its bytes (a
+  batch larger than `DFKV_NODE_DEDUP_ARENA_MB` /
+  `DFKV_NODE_DEDUP_GPU_ARENA_MB`, or a rank that falls behind by a full
+  ring) or, on the GPU path, once its publishing process has exited. Until
+  it expired (`DFKV_NODE_DEDUP_TTL_MS`, 5 s), every later lookup of the key
+  found it first and fetched the key for itself, without waiting (since
+  2.38.0, 2.39.1 on the GPU path) but also without sharing. The next lookup
+  now fetches the key again in that slot and the others wait for it. A
+  fetch whose process died stayed in the table until its own key was asked
+  for again; keys that never were filled their eight-slot probe window
+  with such entries, and other keys landing there ran without dedup. A
+  claim of any key now takes over a fetch older than
+  `DFKV_NODE_DEDUP_TAKEOVER_MS`, as a lookup of the same key already did.
+  A fetch that is merely slow and is taken over loses its chance to share
+  its result, as before. So may a fetch that is only just starting: until
+  its claim has written its own time, the slot shows the time of the
+  previous occupant, and a claim of any key in that moment can take it
+  over (both then fetch, and at most one of them publishes). Mixed
+  versions on one host are safe: the slots
+  are taken the way an expired entry or a takeover already took them, and
+  the layout and segment names are unchanged.
+
 - vLLM connector: a scheduler lookup that rank 0 does not answer within
   `lookup_timeout_ms` (new, default 10 s; `0` = wait forever) is a miss.
   The scheduler asked rank 0 over a ZMQ REQ socket with no receive timeout:

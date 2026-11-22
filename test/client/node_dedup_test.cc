@@ -960,3 +960,72 @@ TEST(NodeDedup, OwnerPublishWaitsOutAStaleRecheck) {
       << "the owner gave up and its fetch was never published";
   EXPECT_EQ(out, v);
 }
+
+// ---- slots nobody can use any more are claimed again ----------------------
+
+// An entry the ring has overwritten can never be copied. The next claim of
+// the key fetches it again in that slot, and the claims after it wait for
+// that fetch, instead of each one fetching for itself until the entry
+// expires.
+TEST(NodeDedup, LappedEntryIsFetchedAgainAndShared) {
+  ShmGuard g("lap-share");
+  NodeDedup::Options o = Opts(g.name, /*arena=*/1 << 20);
+  o.ttl_ms = 60000;      // the entry is not merely expired
+  o.wait_ms = 5000;
+  o.takeover_ms = 600000;
+  auto a = NodeDedup::Open(o);
+  auto b = NodeDedup::Open(o);
+  auto c = NodeDedup::Open(o);
+  ASSERT_TRUE(a && b && c);
+  const std::string v = Val(6, 128 * 1024);
+  std::string dst(v.size(), '\0');
+  uint64_t token = 0;
+  ASSERT_EQ(a->Claim(K(6), v.size(), &dst[0], &token),
+            NodeDedup::Role::kFetch);
+  a->Publish(K(6), NodeDedup::Kind::kData, token, v.data(), v.size());
+  for (uint64_t i = 100; i < 100 + 12; ++i) {  // laps the 1 MiB ring
+    const std::string w = Val(i, 128 * 1024);
+    std::string tmp(w.size(), '\0');
+    uint64_t other = 0;
+    if (a->Claim(K(i), w.size(), &tmp[0], &other) == NodeDedup::Role::kFetch)
+      a->Publish(K(i), NodeDedup::Kind::kData, other, w.data(), w.size());
+  }
+  uint64_t token_b = 0, ignored = 0;
+  ASSERT_EQ(b->Claim(K(6), v.size(), &dst[0], &token_b),
+            NodeDedup::Role::kFetch)
+      << "the overwritten entry still holds the key";
+  EXPECT_NE(token_b, 0u) << "fetched without a slot to publish into";
+  ASSERT_EQ(c->Claim(K(6), v.size(), &dst[0], &ignored),
+            NodeDedup::Role::kWait);
+  b->Publish(K(6), NodeDedup::Kind::kData, token_b, v.data(), v.size());
+  std::string out(v.size(), '\0');
+  ASSERT_TRUE(c->WaitCopy(K(6), out.size(), &out[0]));
+  EXPECT_EQ(out, v);
+}
+
+// A fetch whose owner died is taken over only when its own key is asked for
+// again. Fetches of keys nobody asks for again must not fill a probe window
+// for good: past the takeover age, a claim of another key takes the slot.
+TEST(NodeDedup, StaleFetchesDoNotFillTheProbeWindow) {
+  ShmGuard g("stale-window");
+  auto a = NodeDedup::Open(Opts(g.name));  // takeover_ms 200
+  auto b = NodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  std::string dst(4096, '\0');
+  uint64_t token = 0, ignored = 0;
+  for (uint64_t j = 0; j < 8; ++j)  // every position of the window, then dead
+    ASSERT_EQ(a->Claim(K(7 + 1024 * j), dst.size(), &dst[0], &ignored),
+              NodeDedup::Role::kFetch);
+  std::this_thread::sleep_for(250ms);
+  const BlockKey other = K(7 + 1024 * 8);
+  ASSERT_EQ(b->Claim(other, dst.size(), &dst[0], &token),
+            NodeDedup::Role::kFetch);
+  EXPECT_NE(token, 0u) << "the window is full of dead fetches";
+  EXPECT_EQ(a->Claim(other, dst.size(), &dst[0], &ignored),
+            NodeDedup::Role::kWait);
+  const std::string v = Val(7, 4096);
+  b->Publish(other, NodeDedup::Kind::kData, token, v.data(), v.size());
+  ASSERT_EQ(a->Claim(other, dst.size(), &dst[0], &ignored),
+            NodeDedup::Role::kHit);
+  EXPECT_EQ(dst, v);
+}

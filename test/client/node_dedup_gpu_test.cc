@@ -1191,6 +1191,62 @@ TEST(GpuNodeDedup, LatePublishDoesNotFollowTheKeyToAnotherSlot) {
   EXPECT_EQ(v_old.dst.Down(4096), v_new.value);
 }
 
+// ---- slots nobody can use any more are claimed again ----------------------
+
+// An entry whose owner has gone can never be copied. The next claim of the
+// key fetches it again in that slot, and the claims after it wait for that
+// fetch, instead of each one fetching for itself until the entry expires.
+TEST(GpuNodeDedup, EntryOfAGoneOwnerIsFetchedAgainAndShared) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("gone-owner");
+  auto a = GpuNodeDedup::Open(LongWait(g.name));  // ttl_ms 30 s
+  auto b = GpuNodeDedup::Open(LongWait(g.name));
+  auto c = GpuNodeDedup::Open(LongWait(g.name));
+  ASSERT_TRUE(a && b && c);
+  KeyBufs k(83);
+  size_t got = 0;
+  uint64_t token = 0, token_b = 0, ignored = 0;
+  ASSERT_EQ(a->ClaimSg(K(83), &k.s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  a->PublishSg(K(83), token, &k.s, 1, 4096);
+  a.reset();  // the publisher exits: its arena goes
+  ASSERT_EQ(b->ClaimSg(K(83), &k.d, 1, 4096, &got, &token_b),
+            GpuNodeDedup::Role::kFetch)
+      << "the entry of a gone owner still holds the key";
+  EXPECT_NE(token_b, 0u) << "fetched without a slot to publish into";
+  ASSERT_EQ(c->ClaimSg(K(83), &k.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kWait);
+  b->PublishSg(K(83), token_b, &k.s, 1, 4096);
+  ASSERT_EQ(c->ClaimSg(K(83), &k.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kHit);
+  EXPECT_EQ(k.dst.Down(4096), k.value);
+}
+
+TEST(GpuNodeDedup, StaleFetchesDoNotFillTheProbeWindow) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("stale-window");
+  auto a = GpuNodeDedup::Open(Opts(g.name));  // takeover_ms 200
+  auto b = GpuNodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  KeyBufs k(84);
+  size_t got = 0;
+  uint64_t token = 0, ignored = 0;
+  for (uint64_t j = 0; j < 8; ++j)  // every position of the window, then dead
+    ASSERT_EQ(a->ClaimSg(K(84 + 1024 * j), &k.s, 1, 4096, &got, &ignored),
+              GpuNodeDedup::Role::kFetch);
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  const BlockKey other = K(84 + 1024 * 8);
+  ASSERT_EQ(b->ClaimSg(other, &k.s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  EXPECT_NE(token, 0u) << "the window is full of dead fetches";
+  EXPECT_EQ(a->ClaimSg(other, &k.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kWait);
+  b->PublishSg(other, token, &k.s, 1, 4096);
+  ASSERT_EQ(a->ClaimSg(other, &k.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kHit);
+  EXPECT_EQ(k.dst.Down(4096), k.value);
+}
+
 // ---- through KVClient: a fetch that lands in device memory -----------------
 
 namespace {
