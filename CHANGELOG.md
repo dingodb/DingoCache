@@ -3,6 +3,24 @@
 ## Unreleased
 
 
+- vLLM connector, hybrid models (recurrent state or sliding window next to
+  full attention): a step that saves no longer waits on the model thread
+  for every PUT. It waited for the whole send queue -- exists probe, PUT
+  and retention of every group of every request saving in that step, and
+  whatever earlier steps had left queued -- while only the state and window
+  sources can change under a running request. The full-attention blocks
+  stay with the request until it is reported finished sending. A SAVE is
+  now split: the state and window groups go to a send worker of their own,
+  and the step waits for exactly those; the attention part runs on the
+  regular send worker and overlaps the following steps. A request is
+  reported finished sending only when both parts are done, and each part's
+  failures are counted on their own (a failed state PUT no longer fails the
+  attention PUT of the same batch, and the reverse). The regular send queue
+  can now fill while state PUTs still go through; an attention part it
+  rejects is counted as the `save_rejected` operation, and that prefix is
+  not admitted by LOOKUP. KV events of attention groups arrive when their
+  PUT completes, possibly a later step than the state's.
+
 - vLLM connector: a recurrent-state layer with several state tensors is
   saved and loaded whole. In vLLM 0.26.x and earlier such a layer (Mamba2,
   GDN, KDA, ...) reaches the connector as a list of views into one page, one

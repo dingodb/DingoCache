@@ -29,6 +29,7 @@ DFKV_OPERATION_NAMES = frozenset(
         "lookup_exists",
         "save_retain_set",
         "load_remove_stale",
+        "save_rejected",
     }
 )
 DFKV_OPERATION_STATUSES = frozenset(

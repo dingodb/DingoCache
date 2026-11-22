@@ -538,11 +538,14 @@ class KVTransferThread(threading.Thread):
         scheduler cleanup progressing instead of pinning blocks behind a full
         queue.
         """
+        return self._submit(self.request_queue, request)
+
+    def _submit(self, target: "queue.Queue[Any]", request: ReqMeta) -> bool:
         reason = "closed"
         with self._stop_lock:
             if self._accepting:
                 try:
-                    self.request_queue.put_nowait(request)
+                    target.put_nowait(request)
                     return True
                 except queue.Full:
                     reason = "saturated"
@@ -552,7 +555,7 @@ class KVTransferThread(threading.Thread):
             self.name,
             getattr(request, "req_id", "<unknown>"),
             reason,
-            self.request_queue.maxsize,
+            target.maxsize,
         )
         return False
 
@@ -568,8 +571,11 @@ class KVTransferThread(threading.Thread):
 
     def run(self):
         self.ready_event.set()
+        self._serve(self.request_queue)
+
+    def _serve(self, source: "queue.Queue[Any]") -> None:
         while True:
-            request_data = self.request_queue.get()
+            request_data = source.get()
             try:
                 if request_data is _TRANSFER_STOP:
                     return
@@ -577,7 +583,7 @@ class KVTransferThread(threading.Thread):
             except Exception as e:
                 logger.error("Error in %s: %s", self.name, e)
             finally:
-                self.request_queue.task_done()
+                source.task_done()
 
     def _handle_request(self, req_meta: Any):
         raise NotImplementedError
@@ -734,8 +740,77 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # done_task_lock together with the dequeue gate below, so a request is
         # either dropped at the gate or visibly in flight to
         # wait_for_inflight_put() -- never invisibly both.
-        self._active_req_id: str | None = None
+        # Requests _handle_request is executing, by worker thread.
+        self._active_req_ids: dict[int, str] = {}
         self._active_cv = threading.Condition(self.done_task_lock)
+        # SAVEs whose sources the next model step can change (recurrent
+        # state, window blocks) get a worker of their own: the model thread
+        # waits for exactly those (fence_queue.join()), never behind a PUT of
+        # immutable attention blocks that is already running on this thread.
+        self.fence_queue: queue.Queue[Any] = queue.Queue(maxsize=queue_capacity)
+        self._fence_worker = threading.Thread(
+            target=self._serve_fenced,
+            daemon=False,
+            name="KVCacheStoreSendingThread-fence",
+        )
+        self._fence_stop_enqueued = False
+
+    def run(self):
+        self._fence_worker.start()
+        super().run()
+
+    def _serve_fenced(self) -> None:
+        self._serve(self.fence_queue)
+
+    def add_fenced_request(self, request: ReqMeta) -> bool:
+        """Submit a SAVE the caller will wait for with ``fence_queue.join()``."""
+        return self._submit(self.fence_queue, request)
+
+    def _submit(self, target: "queue.Queue[Any]", request: ReqMeta) -> bool:
+        # A rejected SAVE (queue full, or closing) stores nothing; for a
+        # hybrid model the attention part can be rejected while the state
+        # part was stored. Counted as the save_rejected operation.
+        if super()._submit(target, request):
+            return True
+        self._record_operation(
+            "save_rejected", time.perf_counter(), 0, num_logical_keys=0,
+            status="error",
+        )
+        return False
+
+    def stop(self, *, cancel_pending: bool = True) -> None:
+        worker = self._fence_worker
+        with self._stop_lock:
+            self._accepting = False
+            first_stop = not self._fence_stop_enqueued
+            self._fence_stop_enqueued = True
+            if first_stop:
+                if cancel_pending or worker.ident is None:
+                    while True:
+                        try:
+                            pending = self.fence_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        try:
+                            if pending is not _TRANSFER_STOP:
+                                self._cancel_request(pending)
+                        except Exception:
+                            logger.exception(
+                                "%s failed to resolve cancelled request %s",
+                                self.name,
+                                getattr(pending, "req_id", "<unknown>"),
+                            )
+                        finally:
+                            self.fence_queue.task_done()
+                if worker.ident is not None:
+                    self.fence_queue.put(_TRANSFER_STOP)
+        if worker.ident is not None:
+            self.fence_queue.join()
+            if threading.current_thread() is not worker:
+                worker.join()
+        super().stop(cancel_pending=cancel_pending)
+
+    close = stop
 
     def add_stored_request(self, request: ReqMeta):
         with self.done_task_lock:
@@ -772,7 +847,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         """
         with self._active_cv:
             return self._active_cv.wait_for(
-                lambda: self._active_req_id != req_id, timeout_s
+                lambda: req_id not in self._active_req_ids.values(), timeout_s
             )
 
     def _partial_tail_chunks(
@@ -845,20 +920,28 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # Publish the active request under the same lock as the generation
         # gate. A preemption either invalidates this generation before any GPU
         # read or observes it in flight and waits for it to complete.
+        worker_id = threading.get_ident()
         with self.done_task_lock:
-            self._active_req_id = req_id
+            self._active_req_ids[worker_id] = req_id
             gate_ok = self._save_generations.get(req_id) == req_meta.save_generation
         if not gate_ok:
             with self._active_cv:
-                self._active_req_id = None
+                del self._active_req_ids[worker_id]
                 self._active_cv.notify_all()
             return
 
         # Decrement the in-flight counter in ``finally`` (the base run loop
         # always signals ``task_done``) so the scheduler can release the GPU
         # blocks it pinned for this request even when the store path raises.
+        # A SAVE split by the worker covers only its own groups; the stripe
+        # positions above still count every group's chunks.
+        save_groups = req_meta.save_groups
         try:
-            tail_chunks = self._partial_tail_chunks(req_meta, token_len)
+            tail_chunks = [
+                chunk
+                for chunk in self._partial_tail_chunks(req_meta, token_len)
+                if save_groups is None or chunk[0] in save_groups
+            ]
             if token_len == 0 and not tail_chunks:
                 return
 
@@ -917,6 +1000,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     )
                     stripe_position += 1
                     if not selected:
+                        continue
+                    if save_groups is not None and g_idx not in save_groups:
                         continue
                     if (
                         g_idx in self.tp_sharded_groups
@@ -1151,7 +1236,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 self.update_kv_event(successful_events)
         finally:
             with self._active_cv:
-                self._active_req_id = None
+                del self._active_req_ids[worker_id]
                 self._active_cv.notify_all()
             self.dec_stored_request(req_meta)
 
@@ -1980,8 +2065,13 @@ class DfkvStoreWorker:
             )
             for group in kv_cache_config.kv_cache_groups
         ]
-        self._store_requires_step_fence = False
-        for group in self._kv_cache_groups:
+        # Groups whose SAVE sources the next model step may change: recurrent
+        # state is updated or copied into blocks, windows free blocks that are
+        # reused at once, both while the request is still running. Their
+        # PUTs finish before the step returns; the others' blocks stay with
+        # the request until vLLM is told the save is done.
+        fenced: set[int] = set()
+        for g_idx, group in enumerate(self._kv_cache_groups):
             group_spec = group.kv_cache_spec
             if not _prefix_cacheable(group_spec):
                 continue
@@ -1998,8 +2088,8 @@ class DfkvStoreWorker:
                 )
                 for spec in specs
             ):
-                self._store_requires_step_fence = True
-                break
+                fenced.add(g_idx)
+        self._fenced_store_groups = frozenset(fenced)
 
         # CLIENT_RANKS (issue #111): converge store-side dfkv clients onto a
         # subset of ranks when the KV object is fully TP-replicated.
@@ -2600,19 +2690,36 @@ class DfkvStoreWorker:
                     current_event.record()
                     break
 
+            send_thread = self.kv_send_thread
+            fenced = self._fenced_store_groups if current_event is not None else ()
             for request in meta.requests:
                 if not request.can_save:
                     continue
                 request.current_event = current_event
-                assert self.kv_send_thread is not None
-                self.kv_send_thread.add_stored_request(request)
-                self.kv_send_thread.add_request(request)
-
-            if current_event is not None and self._store_requires_step_fence:
+                assert send_thread is not None
+                if not fenced:
+                    send_thread.add_stored_request(request)
+                    send_thread.add_request(request)
+                    continue
                 # A following step may update recurrent state or free/reuse
-                # a window block even while this request is still running.
-                # Preserve those source bytes until the native PUT completes.
-                self.kv_send_thread.request_queue.join()
+                # a window block even while this request is still running:
+                # those PUTs finish before this step returns. Attention blocks
+                # stay with the request until it is reported finished sending,
+                # so their PUT overlaps the following steps. Each part counts
+                # as one pending save of the request.
+                part = dataclasses.replace(request, save_groups=fenced)
+                send_thread.add_stored_request(part)
+                send_thread.add_fenced_request(part)
+                unfenced = frozenset(
+                    g for g, db in enumerate(self.token_dbs) if db.cacheable
+                ) - fenced
+                if unfenced:
+                    rest = dataclasses.replace(request, save_groups=unfenced)
+                    send_thread.add_stored_request(rest)
+                    send_thread.add_request(rest)
+
+            if fenced:
+                send_thread.fence_queue.join()
 
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -3211,8 +3318,10 @@ class LookupKeyServer:
                     # still drain in-flight puts to honor the ordering contract,
                     # then NACK so callers know the hard reset was not applied.
                     try:
-                        if self.store_worker.kv_send_thread is not None:
-                            self.store_worker.kv_send_thread.request_queue.join()
+                        send_thread = self.store_worker.kv_send_thread
+                        if send_thread is not None:
+                            send_thread.fence_queue.join()
+                            send_thread.request_queue.join()
                     except Exception as e:
                         logger.error("Dfkv reset drain failed: %s", e)
                     logger.warning(
