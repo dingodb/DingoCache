@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- LMCache connector (in-process): lookups no longer queue behind I/O, and
+  the synchronous `batched_contains` is supported. PUT, GET and existence
+  probes shared one executor (`DFKV_CONNECTOR_GET_PARALLELISM` workers, 1 by
+  default), so a lookup waited for any PUT or GET in flight. Existence
+  probes now have a worker of their own; PUTs (and removes) and GETs each
+  have `DFKV_CONNECTOR_GET_PARALLELISM` workers, so no deployment has less
+  PUT concurrency than before. The synchronous native calls (`exists_sync`,
+  the new `batch_exists_sync`, `remove_sync`) are admitted only while the
+  client is open, and `close()` waits for those in flight before closing
+  the native handle.
+  LMCache's RemoteBackend, seeing no `batched_contains`, asked `contains`
+  key by key: one round trip per chunk of the prefix. It now gets the same
+  answer as `batched_async_contains` (exists-cache prefix, then one batched
+  probe per `DFKV_CONNECTOR_BATCH_MAX_KEYS` slice). Stand-in benchmark: a
+  contains check over 256 chunks went from 256 round trips (224 ms) to 1
+  (1 ms); an exists probe issued during a 1 s PUT waited 959 ms before and
+  1 ms after.
+
 - LMCache connector (in-process): a GET no longer stalls LMCache's event
   loop when the CPU arena is full. The connector allocated its buffer with
   LMCache's default `busy_loop=True`, which retries in `time.sleep(0.1)`

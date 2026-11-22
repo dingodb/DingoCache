@@ -1417,7 +1417,7 @@ vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `DFKV_CONNECTOR_GET_PARALLELISM` | 1 | 并行 batched-get 组数（提高可降 TTFT） |
+| `DFKV_CONNECTOR_GET_PARALLELISM` | 1 | 并行 batched-get 组数（GET worker 数，提高可降 TTFT；PUT 另有同样数量的 worker，exists 探测单独一个 worker，lookup 不排在 GET/PUT 之后） |
 | `DFKV_CONNECTOR_BATCH_MAX_KEYS` | 512 | 单次 native 批量最大 key 数 |
 | `DFKV_CONNECTOR_ASSUME_EXISTS` | 0 | 跳过远程 contains 检查（调试） |
 | `DFKV_CONNECTOR_EXISTS_TTL_S` | 60 | 进程内 exists 缓存里“存在”结论的有效期（秒），到期后重新问 ring；`0` = 不过期。无论取值，GET 未命中会立即忘掉该 key。此前该缓存没有过期：server 淘汰后同一前缀一直“报命中 → 加载失败 → 重算 → 不重存”，直到进程重启 |

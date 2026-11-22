@@ -24,6 +24,8 @@ import hashlib
 import logging
 import os
 import concurrent.futures
+import contextlib
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, List, Optional, Sequence, Tuple
 from dfkv_common import (
@@ -209,6 +211,11 @@ class DfkvNativeClient:
             self._lib = load_lib(lib_path)
             self._loop = loop or asyncio.get_running_loop()
             self._closed = False
+            # Synchronous native calls (exists_sync, batch_exists_sync,
+            # remove_sync) run on LMCache's threads, not on an executor that
+            # close() drains: close() waits for them before dfkv_close.
+            self._sync_cv = threading.Condition()
+            self._sync_inflight = 0
             self._telemetry_acquired = False
             if not key_namespace:
                 raise ValueError(
@@ -267,10 +274,19 @@ class DfkvNativeClient:
                 self._h = None
                 raise
 
+            # GETs and writes (PUT, remove) run on get_parallelism workers
+            # each, existence probes on one of their own: a large PUT or a
+            # slow GET does not hold up lookups, and lookups do not hold up
+            # I/O.
             self._executor = ThreadPoolExecutor(
                 max_workers=max(1, int(get_parallelism)),
                 thread_name_prefix="dfkv-io",
             )
+            self._write_executor = ThreadPoolExecutor(
+                max_workers=max(1, int(get_parallelism)),
+                thread_name_prefix="dfkv-put")
+            self._exists_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="dfkv-exists")
             # Unified fleet metrics pushed over OTLP (off by default; zero cost
             # when DFKV_METRICS_ENABLED is unset). LMCache had no dfkv metrics
             # before — this gives it parity with the SGLang/vLLM connectors. Report
@@ -425,7 +441,7 @@ class DfkvNativeClient:
                 _m.bytes = _nb
                 _sp.bytes = _nb
             ok, per_key = await self._loop.run_in_executor(
-                self._executor, self._batch_set_blocking, list(keys), list(bufs)
+                self._write_executor, self._batch_set_blocking, list(keys), list(bufs)
             )
             r.result = "ok" if ok else "partial_fail"
             if not ok:
@@ -558,7 +574,7 @@ class DfkvNativeClient:
                 _push_tracing.span("batch_exists", n) as _sp, \
                 access_log("native.batch_exists", lambda: f"{n} keys") as r:
             per_key = await self._loop.run_in_executor(
-                self._executor, self._batch_exists_blocking, list(keys)
+                self._exists_executor, self._batch_exists_blocking, list(keys)
             )
             hits = sum(1 for b in per_key if b)
             r.result = f"hits={hits}/{n}"
@@ -585,7 +601,7 @@ class DfkvNativeClient:
                 _push_tracing.span("batch_remove", n) as _sp, \
                 access_log("native.batch_remove", lambda: f"{n} keys") as r:
             per_key = await self._loop.run_in_executor(
-                self._executor, self._batch_remove_blocking, list(keys)
+                self._write_executor, self._batch_remove_blocking, list(keys)
             )
             ok = sum(1 for b in per_key if b)
             r.result = f"ok={ok}/{n}"
@@ -593,8 +609,32 @@ class DfkvNativeClient:
                 _sp.hits = ok
             return per_key
 
+    @contextlib.contextmanager
+    def _sync_call(self):
+        """Admit one synchronous native call; close() waits for it."""
+        with self._sync_cv:
+            if self._closed or not self._h:
+                raise RuntimeError("dfkv client is closed")
+            self._sync_inflight += 1
+        try:
+            yield
+        finally:
+            with self._sync_cv:
+                self._sync_inflight -= 1
+                self._sync_cv.notify_all()
+
+    def batch_exists_sync(self, keys: Sequence[bytes]) -> List[bool]:
+        """batch_exists on the calling thread (not the event loop's)."""
+        n = len(keys)
+        with self._sync_call(), _push_metrics.op("exist", num_keys=n), \
+                access_log("native.batch_exists_sync", lambda: f"{n} keys") as r:
+            per_key = self._batch_exists_blocking(list(keys))
+            r.result = f"hits={sum(1 for b in per_key if b)}/{n}"
+            return per_key
+
     def exists_sync(self, key: bytes) -> bool:
-        with access_log("native.exists_sync", lambda: _key_label(key)) as r:
+        with self._sync_call(), \
+                access_log("native.exists_sync", lambda: _key_label(key)) as r:
             key_ptr, key_owner = make_key_buffer(key)
             found = self._lib.dfkv_exist(
                 self._h, key_ptr, c_uint64(len(key))) == 1
@@ -607,7 +647,8 @@ class DfkvNativeClient:
         (removed or already absent). Raises if the lib has no remove RPC."""
         if not self.supports_remove():
             raise RuntimeError("libdfkv.so has no dfkv_remove")
-        with access_log("native.remove_sync", lambda: _key_label(key)) as r:
+        with self._sync_call(), \
+                access_log("native.remove_sync", lambda: _key_label(key)) as r:
             key_ptr, key_owner = make_key_buffer(key)
             ok = self._lib.dfkv_remove(
                 self._h, key_ptr, c_uint64(len(key))) == 1
@@ -652,11 +693,16 @@ class DfkvNativeClient:
         except Exception:  # pragma: no cover
             pass
         with access_log("native.close", lambda: ""):
-            self._closed = True
-            try:
-                self._executor.shutdown(wait=True)
-            except Exception:  # pragma: no cover
-                pass
+            with self._sync_cv:
+                self._closed = True
+                self._sync_cv.wait_for(lambda: self._sync_inflight == 0)
+            for executor in (
+                self._executor, self._write_executor, self._exists_executor,
+            ):
+                try:
+                    executor.shutdown(wait=True)
+                except Exception:  # pragma: no cover
+                    pass
             try:
                 if self._h:
                     self._lib.dfkv_close(self._h)
