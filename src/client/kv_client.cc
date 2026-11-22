@@ -949,11 +949,26 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
         dedup_->Abort(bks[i], NodeDedup::Kind::kData, tokens[i]);
     }
   }
-  for (size_t i : wait_list) {
-    if (dedup_->WaitCopy(bks[i], items[i].n, static_cast<char*>(items[i].out)))
-      res[i] = true;
-    else  // fetcher failed/slow: bounded fallback to a direct read
-      res[i] = GetDirect(items[i].key, items[i].out, items[i].n);
+  // One deadline for the whole wait list and one direct batch for the keys
+  // the owner did not deliver: a failed or slow owner costs this call at most
+  // one wait, not one per key.
+  if (!wait_list.empty()) {
+    const uint64_t deadline = dedup_->WaitDeadline();
+    std::vector<size_t> fb;
+    std::vector<KvGetItem> rest;
+    for (size_t i : wait_list) {
+      if (dedup_->WaitCopy(bks[i], items[i].n,
+                           static_cast<char*>(items[i].out), deadline)) {
+        res[i] = true;
+      } else {
+        fb.push_back(i);
+        rest.push_back(items[i]);
+      }
+    }
+    if (!rest.empty()) {
+      auto rr = BatchGetDirect(rest);
+      for (size_t m = 0; m < fb.size(); ++m) res[fb[m]] = rr[m];
+    }
   }
   uint64_t bytes = 0;
   for (size_t i = 0; i < N; ++i) if (res[i]) bytes += items[i].n;
@@ -1094,15 +1109,30 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
       }
     }
   }
-  for (size_t i : wait_list) {
-    size_t got = 0;
-    if (dedup_->WaitCopyAuto(bks[i], items[i].n, static_cast<char*>(items[i].out), &got)) {
-      res[i] = true;
-      lens[i] = got;
-    } else {  // fetcher failed/slow: bounded fallback to a direct read
-      size_t got2 = 0;
-      res[i] = GetAutoDirect(items[i].key, items[i].out, items[i].n, &got2);
-      if (res[i]) lens[i] = got2;
+  // One deadline and one direct fallback batch, as in BatchGet.
+  if (!wait_list.empty()) {
+    const uint64_t deadline = dedup_->WaitDeadline();
+    std::vector<size_t> fb;
+    std::vector<KvGetItem> rest;
+    for (size_t i : wait_list) {
+      size_t got = 0;
+      if (dedup_->WaitCopyAuto(bks[i], items[i].n,
+                               static_cast<char*>(items[i].out), &got,
+                               deadline)) {
+        res[i] = true;
+        lens[i] = got;
+      } else {
+        fb.push_back(i);
+        rest.push_back(items[i]);
+      }
+    }
+    if (!rest.empty()) {
+      std::vector<size_t> rl;
+      auto rr = BatchGetAutoDirect(rest, &rl);
+      for (size_t m = 0; m < fb.size(); ++m) {
+        res[fb[m]] = rr[m];
+        if (rr[m]) lens[fb[m]] = rl[m];
+      }
     }
   }
   uint64_t bytes = 0;
@@ -1180,7 +1210,7 @@ std::vector<bool> KVClient::BatchExist(const std::vector<std::string>& keys) {
     auto result = BatchExistDirect(keys, nullptr);
     return RecordBatch(OpMetrics::kExist, t0, std::move(result), 0);
   }
-  // Only authoritative native outcomes are published. A transient route,
+  // Only an answer the server gave is published. A transient route,
   // cooldown, invalid, or I/O failure aborts the slot and retries directly on
   // the next public call rather than masquerading as cached absence.
   const size_t N = keys.size();
@@ -1220,25 +1250,34 @@ std::vector<bool> KVClient::BatchExist(const std::vector<std::string>& keys) {
     for (size_t m = 0; m < fetch_map.size(); ++m) {
       const size_t i = fetch_map[m];
       res[i] = r[m];
-      if (statuses[m] == Status::kOk && r[m]) {
-        const char present = 1;
+      // "Does not exist" arrives as kNotFound or as kOk with exists=false,
+      // depending on the transport and the probe path; both are answers.
+      if (statuses[m] == Status::kOk || statuses[m] == Status::kNotFound) {
+        const char answer = r[m] ? 1 : 0;
         dedup_->Publish(bks[i], NodeDedup::Kind::kExist, tokens[i],
-                        &present, 1);
-      } else if (statuses[m] == Status::kNotFound) {
-        const char absent = 0;
-        dedup_->Publish(bks[i], NodeDedup::Kind::kExist, tokens[i],
-                        &absent, 1);
+                        &answer, 1);
       } else {
         dedup_->Abort(bks[i], NodeDedup::Kind::kExist, tokens[i]);
       }
     }
   }
-  for (size_t i : wait_list) {
-    bool val = false;
-    if (dedup_->WaitExist(bks[i], &val)) res[i] = val;
-    else {
-      Status status = Status::kInvalid;
-      res[i] = ExistDirect(keys[i], &status);
+  // One deadline and one direct fallback batch, as in BatchGet.
+  if (!wait_list.empty()) {
+    const uint64_t deadline = dedup_->WaitDeadline();
+    std::vector<size_t> fb;
+    std::vector<std::string> rest;
+    for (size_t i : wait_list) {
+      bool val = false;
+      if (dedup_->WaitExist(bks[i], &val, deadline)) {
+        res[i] = val;
+      } else {
+        fb.push_back(i);
+        rest.push_back(keys[i]);
+      }
+    }
+    if (!rest.empty()) {
+      auto rr = BatchExistDirect(rest, nullptr);
+      for (size_t m = 0; m < fb.size(); ++m) res[fb[m]] = rr[m];
     }
   }
   return RecordBatch(OpMetrics::kExist, t0, std::move(res), 0);

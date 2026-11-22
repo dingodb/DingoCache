@@ -1198,7 +1198,7 @@
             "uid": "prometheus"
           },
           "expr": "sum(rate(dfkv_connector_dedup_wait_timeouts_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\", dfkv_model=~\"$model\", dfkv_deployment=~\"$deployment\", dfkv_cache_role=~\"$cache_role\", dfkv_team=~\"$team\"}[$__rate_interval]))",
-          "legendFormat": "host timeout"
+          "legendFormat": "host wait fell back"
         },
         {
           "refId": "E",

@@ -408,36 +408,61 @@ void NodeDedup::Invalidate(const BlockKey& key) {
 }
 
 bool NodeDedup::WaitImpl(const BlockKey& key, Kind kind, size_t cap,
-                         size_t strict_n, char* dst, size_t* got) {
-  const uint64_t deadline = NowMs() + static_cast<uint64_t>(wait_ms_);
+                         size_t strict_n, char* dst, size_t* got,
+                         uint64_t deadline_ms) {
+  const uint64_t deadline = deadline_ms ? deadline_ms : WaitDeadline();
   int backoff_us = 50;
+  bool gone = false;
   for (;;) {
     Slot* s = Find(key, kind);
-    if (s && s->state.load(std::memory_order_acquire) == kStateReady &&
-        CopyOut(s, cap, strict_n, dst, got)) {
-      wait_hits_.fetch_add(1, std::memory_order_relaxed);
-      return true;
+    const uint32_t st =
+        s ? s->state.load(std::memory_order_acquire) : kStateEmpty;
+    if (st == kStateReady) {
+      if (CopyOut(s, cap, strict_n, dst, got)) {
+        wait_hits_.fetch_add(1, std::memory_order_relaxed);
+        return true;
+      }
+      break;  // lapped, recycled or another length: it will not heal
     }
-    if (NowMs() >= deadline) {
-      wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
-      return false;
+    if (st == kStateFetching || st == kStatePublishing) {
+      gone = false;
+      if (NowMs() >= deadline) break;
+      std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
+      if (backoff_us < 1000) backoff_us *= 2;
+      continue;
     }
-    std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
-    if (backoff_us < 1000) backoff_us *= 2;
+    // No fetch in flight for this key: the owner aborted (or the entry was
+    // invalidated), so nothing will be published and waiting out the deadline
+    // only delays the caller's own fetch. A live slot never passes through
+    // EMPTY, but two lockstep claimers may hold one slot each for an instant
+    // until the higher probe position is released; a probe that crosses that
+    // release sees neither, so look once more before giving up.
+    if (gone) break;
+    gone = true;
   }
+  wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
+  return false;
 }
 
-bool NodeDedup::WaitCopy(const BlockKey& key, size_t n, char* dst) {
-  return WaitImpl(key, Kind::kData, n, n, dst, nullptr);
+uint64_t NodeDedup::WaitDeadline() const {
+  return NowMs() + static_cast<uint64_t>(wait_ms_);
 }
 
-bool NodeDedup::WaitCopyAuto(const BlockKey& key, size_t cap, char* dst, size_t* got) {
-  return WaitImpl(key, Kind::kData, cap, kAnyLen, dst, got);
+bool NodeDedup::WaitCopy(const BlockKey& key, size_t n, char* dst,
+                         uint64_t deadline_ms) {
+  return WaitImpl(key, Kind::kData, n, n, dst, nullptr, deadline_ms);
 }
 
-bool NodeDedup::WaitExist(const BlockKey& key, bool* val) {
+bool NodeDedup::WaitCopyAuto(const BlockKey& key, size_t cap, char* dst,
+                             size_t* got, uint64_t deadline_ms) {
+  return WaitImpl(key, Kind::kData, cap, kAnyLen, dst, got, deadline_ms);
+}
+
+bool NodeDedup::WaitExist(const BlockKey& key, bool* val,
+                          uint64_t deadline_ms) {
   char b = 0;
-  if (!WaitImpl(key, Kind::kExist, 1, 1, &b, nullptr)) return false;
+  if (!WaitImpl(key, Kind::kExist, 1, 1, &b, nullptr, deadline_ms))
+    return false;
   if (val) *val = (b != 0);
   return true;
 }

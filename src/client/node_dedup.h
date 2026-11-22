@@ -18,6 +18,9 @@
  *    (strict readers require len == n, auto readers accept len <= cap).
  *  - State machine EMPTY -> FETCHING -> READY guarded by CAS; a FETCHING
  *    older than takeover_ms (fetcher died/hung) can be re-claimed.
+ *  - A waiter waits only while a fetch is in flight (FETCHING/PUBLISHING).
+ *    An owner that has nothing to publish aborts its slot back to EMPTY, and
+ *    the waiter then returns at once instead of running out its deadline.
  *  - Payload arena is a ring with a MONOTONIC allocation cursor; readers
  *    validate "my payload's lap has not been overwritten" (cursor - alloc_seq
  *    <= arena - len) before AND after the copy, plus a per-slot seqlock
@@ -90,18 +93,28 @@ class NodeDedup {
   // Strict GET (BatchGet semantics: exact n bytes). A published payload of a
   // different length is not a hit (lockstep peers request the same n).
   Role Claim(const BlockKey& key, size_t n, char* dst, uint64_t* token);
-  bool WaitCopy(const BlockKey& key, size_t n, char* dst);
+  // Wait* return true once the owner's result has been copied out, false
+  // when the caller must fetch for itself: the owner aborted, the published
+  // entry is unusable, or the deadline passed. deadline_ms is a WaitDeadline()
+  // value shared by every key of one batch, so a batch waits wait_ms in
+  // total, not per key; 0 gives the call a deadline of its own. A key reached
+  // after the deadline still gets one look at its slot.
+  uint64_t WaitDeadline() const;
+  bool WaitCopy(const BlockKey& key, size_t n, char* dst,
+                uint64_t deadline_ms = 0);
 
   // Variable-size GET (BatchGetAuto semantics): hit iff published len <= cap;
   // *got receives the payload length.
   Role ClaimAuto(const BlockKey& key, size_t cap, char* dst, size_t* got,
                  uint64_t* token);
-  bool WaitCopyAuto(const BlockKey& key, size_t cap, char* dst, size_t* got);
+  bool WaitCopyAuto(const BlockKey& key, size_t cap, char* dst, size_t* got,
+                    uint64_t deadline_ms = 0);
 
-  // EXIST probe (1-byte answer). Only authoritative native outcomes may be
-  // published by the caller (kOk/present or kNotFound/absent).
+  // EXIST probe (1-byte answer). Only an answer the server gave may be
+  // published by the caller: present, or absent in either form a transport
+  // reports it (kNotFound, or kOk with exists=false).
   Role ClaimExist(const BlockKey& key, bool* val, uint64_t* token);
-  bool WaitExist(const BlockKey& key, bool* val);
+  bool WaitExist(const BlockKey& key, bool* val, uint64_t deadline_ms = 0);
 
   // Fetch outcomes for keys claimed as kFetch (kind selects the namespace;
   // exist publishes a 1-byte payload). token=0 is an unclaimed/direct fetch.
@@ -131,7 +144,7 @@ class NodeDedup {
   Role ClaimImpl(const BlockKey& key, Kind kind, size_t cap, size_t strict_n,
                  char* dst, size_t* got, uint64_t* token);
   bool WaitImpl(const BlockKey& key, Kind kind, size_t cap, size_t strict_n,
-                char* dst, size_t* got);
+                char* dst, size_t* got, uint64_t deadline_ms);
   void InvalidateKind(const BlockKey& key, Kind kind);
   static uint64_t NowMs();
 
