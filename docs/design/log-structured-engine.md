@@ -1,6 +1,6 @@
 # Log-structured storage engine (`log`): design
 
-Status: design, revision 2 (after review round 1). No code exists yet. Nothing
+Status: design, revision 3 (after review rounds 1 and 2). No code exists yet. Nothing
 here changes the behaviour of a released binary until the stages in §14 land,
 and the default engine changes only after the acceptance measurements in §13.
 
@@ -10,7 +10,7 @@ the existing `StoreEngine` interface. It covers the on-disk format, the read
 and write paths, eviction and segment cleaning, crash consistency and
 recovery, interaction with the RAM tier and with RETAIN, the rule that picks an
 engine per directory, the test plan, the measurement plan, and a staged
-implementation plan. §16 lists what changed in this revision.
+implementation plan. §16 lists what changed in each revision.
 
 Terms: a *value* is the payload a PUT stores under a `BlockKey`; a *record* is
 a value as laid out on disk; a *segment* is a fixed-size region of the disk
@@ -197,6 +197,7 @@ except the rare reservation bumps below.
 | incarnation_reserved | 8 | every incarnation ever written to a segment header is below this |
 | lsn_reserved | 8 | every LSN ever assigned (record `generation`, `write_lsn`, journal entries) is below this |
 | clean | 4 | 1 if the last run closed cleanly (§8.5) |
+| reset_in_progress | 4 | 1 while a reset of the store to empty is under way (§4.5); an open that finds it set redoes the reset |
 | created_by | 32 | version string of the release that created the store |
 | reserved | … | zero |
 | crc | 4 | CRC32C of the 4 KiB copy with this field zero |
@@ -301,23 +302,68 @@ has fewer entries than fit in a block still uses a block of its own. The file is
 created and synced (with its directory) at initialization.
 
 **One ordered writer.** All journal writes go through one writer thread per
-store. It takes what has accumulated (the group), writes it as the next block
-with `O_DIRECT | RWF_DSYNC`, and only when that write is durable acknowledges
-the group's waiters and starts the next block. So block *N*+1 is never written,
-let alone acknowledged, before block *N* is durable, and a crash can lose only
-blocks that nobody was told were durable: a suffix of the file.
+store. Entries are handed to it in a queue, each with a *journal ticket* (its
+position in the queue). The writer takes what has accumulated (the group) and
+writes it as the next block, one block per write, with
+`O_DIRECT | RWF_DSYNC`; a group larger than a block becomes several blocks
+written one after the other. Only when a write is durable does the writer
+advance the *durable ticket* and wake the waiters whose tickets it covers, and
+only then does it write the next block. So block *N*+1 is never written, let
+alone acknowledged, before block *N* is durable, blocks of one group cannot
+tear out of order, and a crash can lose only blocks that nobody was told were
+durable: a suffix of the file.
+
+**Ordering with the store.** KILL entries are enqueued **while the store mutex
+is held**, by the operation that decided them (REMOVE, a PUT killing shadows,
+§6.1, §6.6), so journal order follows the order in which the store made its
+decisions. Every REMOVE, including one that returns `kNotFound`, takes under
+the mutex the ticket of the last entry enqueued so far, and returns only when
+the durable ticket has reached it. A REMOVE therefore never returns before any
+kill decided before it, by itself or by anyone else, is durable (I2; crash
+point C34).
 
 **Reading.** Recovery reads blocks in sequence order from the start of the file
 and stops at the first block that is not a valid block of this store with the
-next sequence number. Everything before it is the durable journal. If any valid
-block of this store *with a higher sequence number* appears after the stopping
-point, a block inside the durable range has been damaged after it was written
-(media corruption: the ordered writer cannot produce that state). The engine
-then cannot know which kills it lost, and it treats the store as empty:
-`Activate()` gives every segment a fresh incarnation (§8.3 step 7), logs the
-event, and counts it (`dfkv_lse_journal_integrity_resets_total`). Correctness
-outranks keeping the cache. An I/O error while reading the journal fails the
-open.
+next sequence number (the *stopping offset*). Everything before it is the
+durable journal. If any valid block of this store *with a higher sequence
+number* appears after the stopping offset, a block inside the durable range has
+been damaged after it was written (media corruption: the ordered writer cannot
+produce that state). The engine then cannot know which kills it lost, and it
+**resets the store to empty** (below). An I/O error while reading the journal
+leads to the same reset rather than to an unhealthy store, by the same
+argument: after a reset nothing is served, so nothing wrong can be.
+
+**Resuming after a crash.** `Activate()` truncates the journal to the stopping
+offset (`ftruncate`, `fdatasync`) before the writer appends anything, and the
+writer continues there with the next sequence number. So the unacknowledged
+tail a crash left (torn or partly written blocks) is discarded, and no block
+beyond the new tail can survive to look like damage at the next open: two
+ordinary crashes in a row never cause a reset.
+
+**Reset to empty**, after damage or an I/O error, in an order that survives a
+crash at any step (crash point C35):
+
+1. Write the superblock with `reset_in_progress = 1` and the incarnation
+   reservation raised by at least the number of segments plus a range
+   (§4.2); durable.
+2. Give every segment a fresh header with a new incarnation, each durable.
+3. Create the new, empty journal as `lse_journal.new`, `fdatasync`, rename it
+   over `lse_journal`, `fsync` the directory.
+4. Write the superblock with `reset_in_progress = 0`; durable.
+
+An open that finds `reset_in_progress = 1` treats the store as empty without
+reading the journal and repeats steps 2–4. The reset is logged and counted
+(`dfkv_lse_journal_integrity_resets_total`).
+
+**Residual risk.** Damage confined to the *last* durable block or blocks
+cannot be told apart from a torn, unacknowledged tail: the reader stops there
+and no valid higher block follows. The kills in those blocks would be lost
+silently, and the values they removed could come back. NVMe devices report
+unreadable data as an uncorrectable read error rather than returning wrong
+bytes, and an I/O error resets the store (above), so the case left is silent
+corruption of the tail of the journal by the device. It is accepted and
+documented; it could be closed later by writing every journal block to two
+places through the same ordered writer, at twice the journal's write cost.
 
 **Liveness.** A `KILL` entry is live while the incarnation it names is still
 the durable current incarnation of its segment; once that segment's next header
@@ -333,7 +379,7 @@ directory, and only then resumes, appending to the new file. A REMOVE that
 arrives during compaction is therefore written to the new file after the rename
 is durable, never to the old one. Compaction rewrites the live set, which is
 bounded by the records on disk (§15 Q1), so its pause is bounded; §13 measures
-it as part of REMOVE latency.
+it as part of REMOVE latency, with an explicit criterion (§13).
 
 ### 4.6 Why these choices
 
@@ -514,9 +560,13 @@ write header and payload with one `pwritev` at the reserved offset
 - if a REMOVE of the key arrived meanwhile, do not publish; the record is on
   disk and is covered by the REMOVE's kill (§6.6);
 - otherwise, if the key has shadows (older values that a crash could bring
-  back, §7.5): take them, release the mutex, append `KILL` entries for them and
-  wait until they are durable, then retake the mutex and check for a REMOVE
-  again (§8.1 I3). Shadows from eviction exist only while a reclaim is in
+  back, §7.5): enqueue `KILL` entries for them **while still holding the
+  mutex** (§4.5), keep them in the shadow set marked *kill pending*, release the
+  mutex, wait until the durable ticket covers them, then retake the mutex,
+  drop them from the set and check for a REMOVE again (§8.1 I3). A REMOVE that
+  runs meanwhile still finds them (kill pending) and in any case waits for
+  every kill enqueued before it (§4.5). Shadows from eviction exist only while
+  a reclaim is in
   progress (seconds); the others are rare (§7.5 table). So this wait happens
   only when a key is stored again within seconds of being evicted, or after a
   CRC failure or an interrupted reclaim;
@@ -575,8 +625,12 @@ The engine relies only on these properties of the filesystem:
   `fdatasync` (or the write's own `RWF_DSYNC`) has completed. There is no
   ordering between files. Every step that needs one file's write durable before
   another file's write is issued waits explicitly for the first.
-- Segments are preallocated with `fallocate` (mode 0), so their data area
-  starts as unwritten extents. A completed `O_DIRECT` write into such an extent
+- In direct mode, segments are preallocated with `fallocate` (mode 0), so
+  their data area starts as unwritten extents. In buffered mode (tests, tmpfs)
+  segment files are created when first opened for writing and not
+  preallocated, and the open-time barrier is skipped (it exists only for
+  direct I/O, §8.3 step 2): preallocating would take the whole capacity in RAM
+  on tmpfs. A completed `O_DIRECT` write into such an extent
   is in the device, but the extent conversion that makes it readable after a
   crash is metadata, durable only with that file's next `fdatasync`. So for
   power-loss purposes a record is durable only when its segment file has been
@@ -596,13 +650,18 @@ Under the mutex: erase the index entry (later reads miss at once), and mark any
 in-flight PUT of the key as cancelled. Collect every disk location that could
 hold a recoverable value of the key: the committed record, a record being
 written by a cancelled PUT, the destination of a relocation in progress
-(§7.4), and the key's shadows (§7.5). Release the mutex. Append one `KILL`
-entry per location to the journal and wait until the block holding them is
-durable (§4.5: one ordered writer; concurrent REMOVEs share a block and its
-write). Then return.
+(§7.4), and the key's shadows (§7.5), including those whose kill is already
+pending. Enqueue one `KILL` entry per location **while still holding the
+mutex**, and take the journal ticket of the last entry enqueued so far (by this
+REMOVE or by anyone before it). Release the mutex, wait until the durable
+ticket reaches that ticket (§4.5: one ordered writer; concurrent REMOVEs share
+blocks), then return. A REMOVE that finds nothing to kill (`kNotFound`) still
+takes and waits for the ticket.
 
 So a REMOVE that returned is durable against any crash (I2 in §8.1),
-including when it returned `kNotFound` because the key had just been evicted.
+including when it returned `kNotFound` because the key had just been evicted or
+because another REMOVE of the same key, whose kill was not yet durable, got
+there first (crash point C34).
 
 REMOVE waits on the request dispatch thread today
 (`KvNodeServer::ProcessRequestForKey`), so its latency, and its effect on the
@@ -749,7 +808,8 @@ any point leaves a store that opens:
   header), `fdatasync` them, `fsync` `segments/` and the directory, then write
   the superblock with the higher `segment_count`. Files beyond `segment_count`
   found at open are leftovers of an interrupted grow: they are ignored, and the
-  next grow reuses them.
+  next grow reuses them, writing a fresh header with a new incarnation into
+  each (never keeping a leftover's header).
 - **Shrink**: reclaim (evict, with shadows and kills handled as in §7.5) the
   highest-numbered segments, write the superblock with the lower count, then
   remove their files and `fsync` the directories. Files beyond `segment_count`
@@ -767,7 +827,10 @@ frequent. So when a PUT finds no client-usable free segment (§6.1 step 5), it
 reclaims one itself before giving up: the oldest sealed segment that has no
 pins and no protected records, evict-only (no relocation): every live record is
 evicted and shadowed, and steps 3, 4 and 6 of §7.5 follow (step 2 has nothing to
-sync). The PUT pays one synchronous header write. Only if no such segment
+sync). The victim is claimed under the store mutex (marked *reclaiming*, which
+the cleaner skips and which no second inline reclaim can claim), and the header
+write is done after releasing the mutex. The PUT pays one synchronous header
+write. Only if no such segment
 exists does the PUT get `kCacheFull`. The `kCacheFull` rate and the inline
 reclaims are counted and are acceptance metrics (§13).
 
@@ -861,7 +924,7 @@ among themselves; nothing is ordered across files).
 | C19 | any | device returns an I/O error | the store fails closed (unhealthy, `kIOError`), as slab | — |
 | C20 | reclaim | victim's new header durable, relocated copy not | impossible: the relocation segment is synced first (§7.5 step 2) | same; the copy is durable before the victim's old records are given up |
 | C21 | reclaim | victim's new header torn | header invalid at open: segment classed free; at `Activate` it gets a fresh incarnation from the reserved range (never the torn one's), and its old records are rejected for ever; its kills are kept until then | same |
-| C22 | any PUT or relocation | process killed with `O_DIRECT` / io_uring writes in flight | the open-time barrier (§8.3 step 2) waits for them before anything is read or reused | — (writes in flight are lost or torn) |
+| C22 | any PUT or relocation | process killed with `O_DIRECT` / io_uring writes in flight | the open-time barrier (§8.3 step 2) waits for them before anything is read or reused; tested with real kills on each supported filesystem (§11.3) | — (writes in flight are lost or torn) |
 | C23 | journal | group *N*+1 pending while block *N* in flight | block *N*+1 is not written before *N* is durable (§4.5): acknowledged kills survive | a lost suffix holds only unacknowledged groups; a damaged block before a valid one resets the store (§4.5) |
 | C24 | journal compaction | REMOVE arrives during compaction | waits; written to the new file after the rename is durable | same |
 | C25 | segment reuse | new header not durable, records being written | no record is written before its header is durable (§4.3) | records of the new incarnation without their header: rejected |
@@ -873,6 +936,9 @@ among themselves; nothing is ordered across files).
 | C31 | PUT of a key with shadows | shadow kills not durable | PUT not acknowledged: old value may come back (allowed) | same |
 | C32 | CRC failure on read | location shadowed | REMOVE and re-PUT kill it | same |
 | C33 | reservation bump | superblock with the higher bound not durable | numbers above the old bound were not used (§4.2) | same |
+| C34 | REMOVE while a PUT's shadow kill (or another REMOVE's kill) of the same key is pending | the later REMOVE waits for every kill enqueued before it (§4.5) and so returns only after the pending kill is durable | same |
+| C35 | reset to empty | interrupted at any of its steps | `reset_in_progress` is set from step 1 to step 4: the next open treats the store as empty and repeats the reset | same |
+| C36 | journal resume | two crashes in a row with torn tails | `Activate` truncates the journal to its stopping offset before appending: no stale block survives beyond the tail, no false reset | same |
 
 ### 8.3 Recovery procedure
 
@@ -889,7 +955,12 @@ the kind of repeatable allocation slab's open also does):
    and ext4 this waits for direct I/O still in flight on the file, including
    io_uring writes that a killed predecessor submitted (the property slab's
    open already relies on, see `DiskSlabStore::LockDirectory`). Nothing is read
-   before the barrier has passed for that file.
+   before the barrier has passed for that file. The assumption is tested with
+   real kills (C22, §11.3); if it fails on a supported kernel and filesystem,
+   the fallback is to quarantine every segment that was open at the crash
+   (seal it with what the walk found and never reuse it until a later open
+   after a clean close), at the cost of their space for one more run. Buffered
+   mode skips the barrier (§6.5).
 3. Read the journal (§4.5): build the kill set {(segment, incarnation,
    offset)} and the retention map; detect a damaged block inside the durable
    range (marks the store for reset at `Activate`).
@@ -925,25 +996,31 @@ the kind of repeatable allocation slab's open also does):
    referenced bits start cleared.
 6. Rebuild the free list (free-classed segments and segments with no live
    records), the seal FIFO (by last write_lsn), and set `next_incarnation` and
-   `next_lsn` to the superblock's reserved bounds (§4.2).
+   `next_lsn` to the superblock's reserved bounds (§4.2). A segment on the free
+   list is not yet reusable as it stands: every opening from the free list
+   writes a fresh header with a new incarnation, durable, before its first
+   record (§4.3), and the kills of the incarnation it replaces are collected
+   only after that.
 
 The store is now opened: counts and stats are available and no data operation
 is admitted. **Activation** (`Activate()`) does every write:
 
-7. If step 3 found a damaged journal block, give every segment a fresh header
-   (the store becomes empty) and start a new journal; log it.
-8. Raise the reservation bounds in the superblock (one write) so this run's
-   numbers start in a fresh range, and write `clean = 0`; both durable before
-   anything else.
+7. First, one durable superblock write: `clean = 0`, and the reservation
+   bounds raised so this run's numbers start in a fresh range, with the
+   incarnation bound raised by at least the number of headers steps 8 and 10
+   are about to write (which can be thousands, more than one range).
+8. If the open found journal damage or a journal I/O error, or
+   `reset_in_progress` set, reset the store to empty (§4.5, steps 1–4 there).
+   Then truncate the journal to its stopping offset (§4.5).
 9. Seal every walked segment as it is: write a summary of the records the walk
    kept and a trailer, `fdatasync`. A walked segment is never appended to again
    within its incarnation, so whatever lies between or after its recovered
    records (torn writes, holes) can never be reached by a later walk or mixed
    with new records.
-10. Give every free-classed segment a fresh header with a new incarnation
-    (durable), so that "free" always means "its current header is durable and
-    names an incarnation with no records"; then collect the kills of the
-    incarnations so replaced.
+10. Give every segment whose header was invalid (free-classed in step 4) a
+    fresh header with a new incarnation (durable); then collect the kills of
+    the incarnations so replaced. (Segments that are free because they hold no
+    live records get their fresh header when they are opened, step 6.)
 11. Open *K* fresh client segments and the relocation segment from the free
     list, start the sealer, the cleaner and the journal writer, and admit
     operations.
@@ -968,7 +1045,7 @@ sealed segments and loads their summaries.
 
 The clean flag is only an expectation: whatever it says, the open walks every
 segment that lacks a valid trailer for its incarnation. `Activate()` makes
-`clean = 0` durable before it admits the first operation (§8.3 step 8).
+`clean = 0` durable before it admits the first operation (§8.3 step 7).
 
 A segment, once it has a trailer, is never appended to again within that
 incarnation, after a clean close as after a walk. The price is the unused space
@@ -1077,6 +1154,12 @@ names directly inside it:
 | slab and log markers both | CONFLICT |
 | none of the above | FOREIGN |
 
+"No entry other than `lost+found`" is EMPTY for the classification, but the
+slab engine's own open of a new store still refuses a directory that is not
+completely empty (`OpenOrInit` requires an empty root), so under `slab`, and
+under `auto` before acceptance (when EMPTY maps to slab), such a directory is
+refused as it is today; the log engine accepts it.
+
 "Whatever else is present" keeps today's behaviour for slab: a slab directory
 with extra entries, such as `lost+found`, opens today (the slab open path does
 not enumerate the root of an existing store), and it must keep opening under
@@ -1147,7 +1230,10 @@ The existing storage-interface tests run against both engines:
 - These are parameterized over the engine (`slab`, `log`; `file` where it
   applies today). The tests' store sizes (1–3 GiB) are within the log engine's
   geometry (§4.7); a test that needs values above its store's `MaxValueBytes`
-  sets `DFKV_LSE_SEGMENT_BYTES`.
+  sets `DFKV_LSE_SEGMENT_BYTES`. The parameterization is not purely mechanical:
+  tests that build slab stores below 32 MiB (for example the 1 MiB stores of
+  the RAM tier wiring tests) set a capacity of at least 32 MiB in their log
+  variants.
 - Tests of slab internals (classes, steals, trust tokens, `slots.tbl` rebuild)
   stay slab-only; each gets a log-engine counterpart where the property applies
   (for example "a REMOVE during an in-flight read never serves torn bytes",
@@ -1168,8 +1254,10 @@ Every row of the table in §8.2 is a test. The engine has named crash hooks
 (in the style of slab's crash slots): a test arms a hook, runs the operation in
 a child process that `_exit`s at the hook, reopens the directory in the parent
 and checks the outcome column. Power-loss rows run under §11.4. C22 (late
-writes) is tested by a child that submits io_uring writes and is killed before
-they complete, with a parent that opens while they may still be in flight.
+writes) is tested by a child that submits io_uring batch writes (including
+ones the kernel punts to its worker threads) and is killed with SIGKILL before
+they complete, with a parent that opens while they may still be in flight and
+verifies every byte; it runs on XFS and on ext4 on the kernels in use.
 
 ### 11.4 Simulated power loss
 
@@ -1295,19 +1383,23 @@ spread, and a difference smaller than the larger spread is reported as noise.
 - RAM tier off and on, for throughput and for eviction quality.
 - **Steady state**: after writing twice the capacity and then 10 minutes of
   continued load with evictions running.
+- **First fill and reuse separately**: throughput is measured both while the
+  store is first filled (writes into unwritten extents, whose conversion is
+  committed with each sync, §4.6) and at steady state (every segment reused),
+  and reported per phase.
 
 **Metrics and proposed criteria** (to be confirmed in review before measuring):
 
 | Metric | Measured as | Proposed criterion |
 |---|---|---|
-| Effective capacity | committed payload bytes / configured capacity at steady state, per size and for the mix; object count | log ≥ slab + 10 percentage points for every real size except the 1 B marker, where the object count is compared |
+| Effective capacity | committed payload bytes / configured capacity at steady state, per size and for the mix; object count | against the slab engine of 2.41 (geometric classes): log ≥ slab + 10 percentage points for every real size except the 1 B marker, where the object count is compared; against a slab baseline with exact-size classes, if merged by then: log ≥ slab |
 | Write throughput | `dfkv_bench` PUT over RDMA (direct write path) and TCP; 1, 8 and 32 clients; 1.02, 2.74 and 25.9 MiB; at steady state and during cleaning | GB/s within 10% of slab, p50 within 10%, p99 within 20%, in every cell |
 | Read throughput | cold GETs from disk, RDMA prepared reads and TCP, random keys over a full disk; same client counts and sizes; with and without read verification | as for writes, with verification on |
 | Eviction quality | object and byte hit ratio, reusable prefix tokens per request, for each scenario and overcommit, RAM tier off and on | reusable tokens ≥ slab − 1 percentage point in every case |
-| Restart time | time from start to serving per disk and per node, after clean stop, kill -9 and simulated power loss (dm target where available), at full disk; with the fraction of objects recovered | after clean stop and kill -9: ≤ slab's time; recovered fraction after kill -9 ≥ 99% of what was acknowledged; after power loss: every sealed object recovered (slab recovers 0%) |
+| Restart time | time from start to serving per disk and per node, after clean stop, kill -9 and simulated power loss (dm target where available), at full disk; with the fraction of objects recovered | after clean stop and kill -9: ≤ slab's time; after kill -9: every acknowledged object that was not evicted or removed is recovered (100%); after power loss: every sealed object recovered (slab recovers 0%) |
 | PUT `kCacheFull` rate | share of PUTs answered `kCacheFull` at steady state, inline reclaims per second | < 0.1% of PUTs with the cleaner within its budget |
 | Write amplification | relocated bytes per client byte | within `DFKV_LSE_RELOCATE_PCT` |
-| REMOVE latency | REMOVE p50/p99, and GET p99 on the same connections during a REMOVE burst | REMOVE p99 and the GET p99 change reported; decides §15 Q4 |
+| REMOVE latency | REMOVE p50/p99, and GET p99 on the same connections during a REMOVE burst; separately, the worst REMOVE wait during a journal compaction with a large live set | REMOVE p99 and the GET p99 change reported, compaction pause included; decides §15 Q8 |
 | Resources | index and shadow memory per million objects; CPU per GB written and read | reported |
 
 If a criterion is not met, the report says which, by how much, and why, and the
@@ -1331,10 +1423,10 @@ emptied by the operator).
 |---|---|---|
 | 1 | Engine-neutral `EngineStats` in place of the group's direct `DiskSlabStore` use; `DFKV_STORE_ENGINE=auto|log` parsing and the directory classification of §10.1 (selecting `log` refuses with "not built yet") | classification table including `lost+found` and `blocks`, refusal messages, unchanged slab behaviour |
 | 2 | Format library: CRC32C (hardware and software), superblock with reservations, segment header and trailer, record header, summary, journal block | unit tests, test vectors, fuzz targets, CRC throughput benchmark |
-| 3 | `IoBackend` and the crash-image generator; `LogStore` core: init and resume, the open/activate split with the barrier, one open segment, buffered and direct appends, index, keep-first and flights, all read calls, the journal (ordered writer, write-once blocks), REMOVE with kills, `Close`; recovery by walking every segment; no eviction yet (a full store answers `kCacheFull`) | conformance suites of §11.1 over `log`; crash points C1–C8, C16, C19, C22, C23, C25, C29, C33 including their power-loss images; downgrade refusal via the slab open path |
+| 3 | `IoBackend` and the crash-image generator; `LogStore` core: init and resume, the open/activate split with the barrier, one open segment, buffered and direct appends, index, keep-first and flights, all read calls, the journal (ordered writer, write-once blocks, tickets enqueued under the store mutex, truncation to the stopping offset at `Activate`), REMOVE with kills, `Close`; recovery by walking every segment; no eviction yet (a full store answers `kCacheFull`) | conformance suites of §11.1 over `log`; crash points C1–C8, C16, C19, C22, C23, C25, C29, C33, C36 including their power-loss images; downgrade refusal via the slab open path |
 | 4 | Several open segments, zero-copy `CacheDirect`, `CacheDirectBatch` (io_uring), `RangeDirectPrep` leases and segment pins, read verification and the `ReadLease` verifier hook in `KvNodeServer` | RDMA loopback and RAM tier wiring over `log`; lease and pin tests; C32 |
 | 5 | Asynchronous sealing, summary reservation, summaries and trailers, clean close, summary-based recovery, sealing of walked segments at `Activate` | C9, C10, C18, C28; restart-time test at scale |
-| 6 | Cleaner: reserves, victim FIFO with pin and protection skips, second-chance relocation, budget, reclaim with the step 2 sync, shadows, inline reclaim, re-PUT shadow kills, journal compaction, capacity growth and shrink, metrics | C11–C15, C20, C21, C24, C26, C27, C30, C31; fill-and-evict endurance |
+| 6 | Cleaner: reserves, victim FIFO with pin and protection skips, second-chance relocation, budget, reclaim with the step 2 sync, shadows, inline reclaim, re-PUT shadow kills, journal compaction, the reset to empty, capacity growth and shrink, metrics | C11–C15, C20, C21, C24, C26, C27, C30, C31, C34, C35; fill-and-evict endurance |
 | 7 | RETAIN and TTL with footprint budget and protected-eviction fallback, generation semantics, tenant accounting | retention conformance against slab's tests; C17 |
 | 8 | kill -9 soak tool, dm-target script, the long power-loss runs | §11.4 at full scale and §11.5 |
 | 9 | Measurements of §13 on the development node; results added to this document | — |
@@ -1382,7 +1474,9 @@ Still open:
 
 ---
 
-## 16. Changes in revision 2
+## 16. Revision history
+
+### Changes in revision 2 (review round 1)
 
 Review round 1 found six must-fix problems, fifteen should-fix items and four
 questions. All are addressed; where this revision does something other than
@@ -1412,3 +1506,23 @@ what the review proposed, the reason is given in place.
 | S14 stages | experimental flag and development-format bit until stage 10; `IoBackend` and crash images from stage 3; downgrade refusal tested from stage 3 (§14) |
 | S15 measurement | baseline, scenarios, steady state, noise band, cells and thresholds, RAM tier on and off, recovered fraction, `kCacheFull` rate, write amplification, REMOVE latency, memory and CPU (§13) |
 | Verified points | downgrade refusal from 2.33.3 and the `DFKV_STORE_ENGINE` rollback caveat (§10.3); generation's restart stability stated as having no current use (§9.3); resynchronization skips by a header's length and runs to the end (§8.3 step 4); "never appended after a trailer" stated per incarnation (§4.3, §8.5) |
+
+### Changes in revision 3 (review round 2)
+
+| Item | Change |
+|---|---|
+| MF1 shadow kill durable after a later REMOVE | KILL entries are enqueued under the store mutex with journal tickets; every REMOVE, also one returning `kNotFound`, waits until all kills enqueued before it are durable; taken shadows stay in the set as *kill pending* (§4.5, §6.1, §6.6); C34 |
+| MF2 crash-safe reset | reset ordered behind a durable `reset_in_progress` flag: superblock flag and incarnation bump, fresh headers, new journal, flag cleared; an open that finds the flag repeats it (§4.2, §4.5, §8.3 step 8); C35 |
+| Divergence (b) conditions | residual risk of silent damage to the last journal blocks documented; a journal I/O error resets instead of failing the open (§4.5) |
+| Divergence (a) condition | first fill and steady-state reuse measured separately (§13) |
+| S1 barrier assumption | C22 is a real SIGKILL test with io_uring batch writes on XFS and ext4; quarantine of open segments as the fallback (§8.3 step 2, §11.3) |
+| S2 buffered preallocation | buffered mode creates segment files on first use, without preallocation and without the barrier (§6.5) |
+| S3 false resets | one block per journal write; the journal is truncated to its stopping offset at `Activate` before appending (§4.5); C36 |
+| S4 activation order | the reservation bump, sized to the headers about to be written, is the first write of `Activate` (§8.3 step 7) |
+| S5 inline reclaim | victim claimed under the mutex and excluded from the cleaner, header written outside it (§7.7) |
+| S6 criteria | kill -9 criterion is 100% of acknowledged, not evicted, not removed; capacity criterion stated against both possible slab baselines (§13) |
+| S7 free definition | every opening from the free list writes a fresh header first; `Activate` refreshes only invalid headers (§8.3 steps 6, 10) |
+| S8 `lost+found` | slab's own open still refuses a non-empty root for a new store; stated (§10.1) |
+| S9 compaction pause | part of the REMOVE latency criterion (§4.5, §13) |
+| Open question | a grow that reuses a leftover file writes a fresh-incarnation header into it (§7.6) |
+| §11.1 | log variants of tests with slab stores below 32 MiB set their own capacity |
