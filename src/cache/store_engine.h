@@ -311,6 +311,12 @@ class StoreEngine {
   // itself if nobody did). Idempotent. Returns false if the engine could not
   // record a clean shutdown; the next start then treats it as unclean.
   virtual bool Close() { return true; }
+  // An engine may come up in two steps: opened (state read, nothing changed
+  // on disk, no operation admitted) and activated (serving; an exit without
+  // Close() from here on is an unclean one). Called once every disk of a node
+  // is open and the node is about to serve. Engines without the distinction
+  // are active from construction. False if the engine cannot serve.
+  virtual bool Activate() { return true; }
 
   virtual Status Cache(const BlockKey& key, const void* data, size_t len) = 0;
   virtual Status CacheDirect(const BlockKey& key, char* data, size_t len,

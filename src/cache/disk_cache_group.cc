@@ -297,6 +297,8 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
         so.table_sync_ms = sync_ms;
         so.reclaim_interval_ms = reclaim_ms;
         so.warm_restart = slab_warm;
+        // Activated by Activate(), with the other disks, not by its own open.
+        so.defer_activation = true;
         auto slab = std::make_unique<DiskSlabStore>(so);
         opened[i].slab = slab.get();
         opened[i].store = std::move(slab);
@@ -394,9 +396,35 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
                   ", points min=" + std::to_string(min_points) +
                   " max=" + std::to_string(max_points));
   }
+  if (!opt.defer_activation) Activate();
 }
 
 DiskCacheGroup::~DiskCacheGroup() { Close(); }
+
+bool DiskCacheGroup::Activate() {
+  if (activated_) return Healthy();
+  // A start in which a disk failed to open does not go on: the disks that
+  // did open stay as they were found.
+  if (!Healthy() || closed_) return false;
+  const auto started = std::chrono::steady_clock::now();
+  for (const auto& disk : disks_) {
+    if (disk->Activate()) continue;
+    healthy_ = false;
+    const std::string error = disk->Dir() + ": " + disk->StartupError();
+    if (startup_error_.empty()) startup_error_ = error;
+    DFKV_LOG_ERROR("disk store could not be activated: " + error);
+    return false;
+  }
+  activated_ = true;
+  char text[64];
+  std::snprintf(text, sizeof(text), " in %.1f ms",
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - started).count());
+  DFKV_LOG_INFO("disk stores activated: " + std::to_string(disks_.size()) +
+                text + "; an exit without a clean stop is an unclean exit "
+                "from here on");
+  return true;
+}
 
 std::vector<DiskCacheGroup::CloseReport> DiskCacheGroup::Close() {
   std::vector<CloseReport> report;

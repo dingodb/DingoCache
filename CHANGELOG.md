@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+- Server: a slab disk is marked in use only when the server is about to
+  serve, not when the disk has been opened. Until now each disk recorded
+  the dirty state at the end of its own open. From then until the rest of
+  the start was done (the other disks, the RAM tier arena, on small pages
+  tens of seconds) a process that was killed, by SIGKILL or for lack of
+  memory, left that disk dirty although it had not written a byte, and with
+  `DFKV_SLAB_WARM_RESTART=off`, the default, the next start emptied it.
+  - Opening a disk now changes nothing a cleanly stopped run left behind:
+    `slab_state` stays as found, no trust token is written, no background
+    thread runs, and the store refuses every operation. What an open may
+    still do is what every open could always do again: allocate missing
+    extent blocks, reserve the table's space, and clear table records that
+    fail their checks. All disks are activated together once every disk
+    is open and the RAM tier is ready, right before the server starts
+    listening: the dirty state and this run's identity are written and
+    synced, the trust token is granted, and only then do the sync and
+    reclaim threads start and operations pass.
+    From that point an exit without a clean stop is an unclean exit, as
+    before.
+  - A start that is killed before that point, is cancelled by a stop signal,
+    or fails (a disk that does not open, a RAM tier that cannot be set up)
+    leaves every disk exactly as its previous run closed it: the next start
+    is a clean start with the cache in place, whatever
+    `DFKV_SLAB_WARM_RESTART` says. Before, a failed or cancelled start
+    relied on an orderly close of the disks it had already marked.
+  - A disk found dirty (the previous run did not stop cleanly) is treated as
+    before: its open resets it or keeps its table, and marks it in use at
+    once.
+  - New INFO line `disk stores activated: N in X ms; an exit without a clean
+    stop is an unclean exit from here on`.
+  No change to the files on disk; older releases open a directory written by
+  this one and the other way round.
 - Configuration: a mistyped setting of `dfkv_server` or `dfkv_mds` is no
   longer read as something else without a word. Numbers were parsed in
   several ways, most of them with `strtol`/`atoi` and little checking: a
@@ -143,9 +175,10 @@
     TCP requests in the first case and never registers in any of them. A
     signal that arrives after the registration loop has started is an
     ordinary stop, as before.
-  - Every disk that was opened is synced and marked clean, so the next
-    start is a clean start. The last log line is `dfkv_server start
-    cancelled: not registered with the MDS, every opened disk closed clean,
+  - Every disk that was opened is synced and left as it was found (it has
+    not been marked in use yet), so the next start is a clean start. The
+    last log line is `dfkv_server start cancelled: not registered with the
+    MDS, every opened disk closed clean,
     N s after the process started; exiting`, and the exit status is 0, as
     for any stop that was asked for. If a disk failed to open or could not
     be closed clean, the line is a WARN (`... but a disk failed to open or
@@ -154,9 +187,7 @@
     pre-fault begins; `ram tier arena pre-fault given up: the start is not
     going ahead` when it is abandoned, which also happens when a disk fails
     to open: a failed start no longer waits for the arena.
-  Not changed: a process that is killed (SIGKILL, out of memory) after a
-  disk has finished opening still leaves that disk dirty, even if nothing
-  was written. See `docs/DEPLOY.md`.
+  See `docs/DEPLOY.md`.
 - Client, RDMA: a topology change of one cache node no longer makes a client
   drop its pooled connections to every node. The client published each member
   to the transport under the epoch of the whole member list, and that epoch

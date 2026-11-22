@@ -230,6 +230,10 @@ class KvNodeServer {
     RamTier::Options options;
   };
   static RamTierPlan PlanRamTier(size_t disk_count);
+  // The disk group is told to open its disks without activating them; the
+  // constructor activates them once the RAM tier is ready too.
+  static DiskCacheGroup::Options OpenedNotActivated(
+      DiskCacheGroup::Options options);
   // The tier under construction should give up: the caller cancelled the
   // start, or a disk failed to open and the start is over anyway.
   bool RamStartUnwanted() const {

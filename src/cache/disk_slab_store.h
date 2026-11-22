@@ -104,6 +104,11 @@ class DiskSlabStore : public StoreEngine {
     // with the local kernel (xfs, ext4, tmpfs). Tests that run on whatever
     // the build machine offers turn the check off.
     bool require_local_filesystem = true;
+    // Leave a store that is found clean un-activated: see Activate().
+    // DiskCacheGroup sets this and activates its disks together. The default
+    // activates at the end of the constructor, as a store used on its own
+    // expects.
+    bool defer_activation = false;
     // Identity of this kernel boot and of the mount holding `dir`. Read from
     // the system when empty; tests set them to stage a reboot or a remount.
     std::optional<std::array<uint8_t, 16>> boot_id;
@@ -212,6 +217,8 @@ class DiskSlabStore : public StoreEngine {
   // Stops the background threads, syncs payloads and table, and writes the
   // clean marker. Split from the destructor so a server can have its disks
   // clean before it spends time releasing memory; see StoreEngine::Close.
+  // A store that was never activated only syncs what its open wrote and
+  // leaves slab_state as found, which is clean; it reports clean.
   // Contract: every Cache/CacheDirect/batch write has returned before this is
   // called, and none starts afterwards. The clean marker tells the next start
   // that nothing of this run is still being written (it then skips the
@@ -281,6 +288,31 @@ class DiskSlabStore : public StoreEngine {
   }
   bool Healthy() const override {
     return ok_ && !metadata_failed_.load(std::memory_order_acquire);
+  }
+  // Open and activate are two steps.
+  //
+  // The open (the constructor) reads the state, rebuilds the index and
+  // changes nothing a cleanly closed run left behind: slab_state stays as
+  // found, no token is written, no thread runs. It may allocate missing
+  // extent blocks and clear table records that fail their checks, as every
+  // open may; both are repeatable. An opened store answers Count(), stats and
+  // health; every data operation is refused (kIOError, a miss) and nothing
+  // can write to it.
+  //
+  // Activate() makes the store serve: it records this run's identity and the
+  // dirty state durably, grants the trust token, and only then starts the
+  // sync and reclaim threads and admits operations. From that moment an exit
+  // without Close() is an unclean exit, exactly as before the split; before
+  // it, a kill leaves the directory as the previous run closed it.
+  //
+  // A store found dirty (the previous run did not close) is recovered or
+  // reset by its open, which rewrites slab_state and withdraws that run's
+  // token; it is activated by the constructor whatever defer_activation
+  // says. Idempotent; false if the dirty state could not be recorded (the
+  // store is then unhealthy) or the store is closed.
+  bool Activate() override;
+  bool Activated() const {
+    return activated_.load(std::memory_order_acquire);
   }
   const std::string& StartupError() const override { return startup_error_; }
   // Why this start reset the table after an unclean exit; empty if it did not.
@@ -424,6 +456,13 @@ class DiskSlabStore : public StoreEngine {
   // completion or failure. Writers only: inflight_ also counts readers and
   // prepared-read leases, which Close() has no reason to wait out.
   std::atomic<uint32_t> payload_writers_{0};
+  // Set by Activate() once the dirty state is durable; never cleared.
+  std::atomic<bool> activated_{false};
+  // What every data operation asks first.
+  bool Serving() const {
+    return Healthy() && activated_.load(std::memory_order_acquire);
+  }
+  bool MayMutate();
   int crash_slot_ = -1;              // RevokeAllTrustForCrash registration
   bool closed_ = false;              // Close() ran; closed_clean_ is its result
   bool closed_clean_ = false;

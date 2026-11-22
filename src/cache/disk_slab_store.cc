@@ -326,6 +326,7 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   // rebinds are rare (workload-mix shifts), so the ms-scale sync under the
   // allocator lock is acceptable.
   ao.on_extent_bind = [this](uint32_t e) {
+    if (!MayMutate()) return false;
     if (!PwriteAll(table_fd_, zero_extent_records_.data(),
                    zero_extent_records_.size(), TableOffset(e, 0)))
       return FailMetadata("clear slots.tbl records of a rebound extent");
@@ -335,6 +336,7 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   };
   ao.on_extent_evict =
       [this](uint32_t extent, uint32_t, uint32_t residents) {
+        if (!MayMutate()) return false;
         if (!PwriteAll(table_fd_, zero_extent_records_.data(),
                        zero_extent_records_.size(),
                        TableOffset(extent, 0)))
@@ -351,6 +353,7 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
         return true;
       };
   ao.on_slot_evict = [this](const SlabAllocator::SlotRef& ref) {
+    if (!MayMutate()) return false;
     const uint8_t zero[kRecBytes] = {0};
     if (!PwriteAll(table_fd_, zero, sizeof(zero),
                    TableOffset(ref.extent, ref.slot)))
@@ -449,7 +452,9 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
     }
   }
   if (ok_) ok_ = unclean_start_ ? RecoverUnclean() : Rebuild();
-  if (ok_) ok_ = MarkDirtyEpoch();
+  // Everything a first initialization created is in place and slab_state is
+  // durable: the marker's job is done, whether or not this run goes on to
+  // serve.
   if (ok_) ok_ = ClearInitMarker();
   if (ok_) {
     // Only direct mode allocates extents at open, so only there is there
@@ -470,7 +475,40 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
         open_restore_us_ / 1000.0);
     DFKV_LOG_INFO("slab " + opt_.dir + text);
   }
-  if (Healthy() && opt_.table_sync_ms > 0) {
+  // Batched-write submit path (io_uring). Only meaningful with a DFKV_WITH_URING
+  // build AND direct mode; DFKV_SLAB_URING_WRITE=0 is the kill switch.
+#ifdef DFKV_WITH_URING
+  {
+    uring_write_enabled_ = envparse::EnvSwitch(
+        "DFKV_SLAB_URING_WRITE", true, envparse::OffWhen::kStartsWithZero);
+    config_dump::RecordResolved("DFKV_SLAB_URING_WRITE",
+                                uring_write_enabled_ ? "on" : "off");
+  }
+#endif
+  // Up to here nothing the previous run left has been changed, apart from
+  // what an open always may do again (allocate missing blocks, clear records
+  // that fail their checks): the state file is as found. A store found clean
+  // stays that way until Activate(), so a process that is killed before it
+  // serves costs nothing. A store found dirty has just been recovered or
+  // reset, which rewrote the state and took the previous run's token away;
+  // nothing is gained by leaving it without a token of its own, so it is
+  // activated at once, as it always was.
+  if (ok_ && (!opt_.defer_activation || unclean_start_)) Activate();
+  if (ok) *ok = Healthy();
+}
+
+bool DiskSlabStore::Activate() {
+  if (activated_.load(std::memory_order_acquire)) return Healthy();
+  if (!Healthy() || closed_) return false;
+  // Durably dirty first (MarkDirtyEpoch syncs the state file), and only then
+  // anything that can change the table or the extents: the two threads below
+  // and, through `activated_`, every operation.
+  if (!MarkDirtyEpoch()) {
+    ok_ = false;
+    return false;
+  }
+  activated_.store(true, std::memory_order_release);
+  if (opt_.table_sync_ms > 0) {
     sync_thread_ = std::thread([this] {
       NameThisThread("slab-sync");
       std::unique_lock<std::mutex> lk(sync_mu_);
@@ -487,17 +525,7 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
       }
     });
   }
-  // Batched-write submit path (io_uring). Only meaningful with a DFKV_WITH_URING
-  // build AND direct mode; DFKV_SLAB_URING_WRITE=0 is the kill switch.
-#ifdef DFKV_WITH_URING
-  {
-    uring_write_enabled_ = envparse::EnvSwitch(
-        "DFKV_SLAB_URING_WRITE", true, envparse::OffWhen::kStartsWithZero);
-    config_dump::RecordResolved("DFKV_SLAB_URING_WRITE",
-                                uring_write_enabled_ ? "on" : "off");
-  }
-#endif
-  if (Healthy() && opt_.reclaim_interval_ms > 0) {
+  if (opt_.reclaim_interval_ms > 0) {
     reclaim_thread_ = std::thread([this] {
       NameThisThread("slab-reclaim");
       std::unique_lock<std::mutex> lk(reclaim_mu_);
@@ -511,7 +539,7 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
       }
     });
   }
-  if (ok) *ok = Healthy();
+  return true;
 }
 
 DiskSlabStore::~DiskSlabStore() {
@@ -544,6 +572,17 @@ bool DiskSlabStore::Close() {
     }
     sync_cv_.notify_all();
     sync_thread_.join();
+  }
+  if (!activated_.load(std::memory_order_acquire)) {
+    // Never activated: this run changed nothing a previous run left, wrote
+    // no state and holds no token, so there is nothing to record. What the
+    // open itself may have written (a first initialization, cleared records)
+    // is made durable; the state file stays byte for byte as found, which is
+    // clean -- a store found dirty is activated by its open.
+    closed_clean_ = Healthy() && SyncPayloads() &&
+                    (::fdatasync(table_fd_) == 0 ||
+                     FailMetadata("sync slots.tbl of a store that never served"));
+    return closed_clean_;
   }
   bool clean = Healthy();
   // Extents only hold dirty pages if this run wrote payloads buffered; then
@@ -1724,6 +1763,17 @@ bool DiskSlabStore::Rebuild(bool* inconsistent) {
   return true;
 }
 
+// The last line of defence behind `Serving()`: every write to the table or
+// to an extent after the open passes through here. A store that is not
+// activated has a clean state file on disk; a write under it would be taken
+// for part of a cleanly closed table by the next start. No caller gets this
+// far (they are refused at their entry), so getting here is a defect, and
+// the store fails for good without having written.
+bool DiskSlabStore::MayMutate() {
+  if (activated_.load(std::memory_order_acquire)) return true;
+  return FailMetadata("change the store before it was activated");
+}
+
 bool DiskSlabStore::FailMetadata(const char* op, int err) {
   metadata_io_errors_.fetch_add(1, std::memory_order_relaxed);
   if (!metadata_failed_.exchange(true, std::memory_order_acq_rel)) {
@@ -1743,7 +1793,7 @@ bool DiskSlabStore::FailMetadata(const char* op, int err) {
 }
 
 bool DiskSlabStore::SyncTable(uint64_t seen) {
-  if (!Healthy()) return false;
+  if (!Serving()) return false;
   if (!SyncTableFile()) return FailMetadata("sync slots.tbl");
   synced_marker_ = seen;
   table_syncs_.fetch_add(1, std::memory_order_relaxed);
@@ -1754,7 +1804,7 @@ bool DiskSlabStore::WriteRecord(const SlabAllocator::SlotRef& r,
                                 const BlockKey& key, uint32_t payload_len,
                                 bool valid, uint32_t retain_until,
                                 uint32_t retain_ttl_s) {
-  if (!Healthy()) return false;
+  if (!Healthy() || !MayMutate()) return false;
   if (record_write_hook_for_test_ && !record_write_hook_for_test_())
     return FailMetadata("write a slots.tbl record", 0);
   uint8_t rec[kRecBytes];
@@ -1778,6 +1828,7 @@ bool DiskSlabStore::WriteRecord(const SlabAllocator::SlotRef& r,
 
 bool DiskSlabStore::WritePayload(const SlabAllocator::SlotRef& r, const void* data,
                                  size_t len) {
+  if (!MayMutate()) return false;
   if (payload_write_hook_for_test_ && !payload_write_hook_for_test_())
     return false;
   if (len == 0) return true;
@@ -1787,6 +1838,7 @@ bool DiskSlabStore::WritePayload(const SlabAllocator::SlotRef& r, const void* da
 
 bool DiskSlabStore::WritePayloadDirect(const SlabAllocator::SlotRef& r, char* data,
                                        size_t len) {
+  if (!MayMutate()) return false;
   if (payload_write_hook_for_test_ && !payload_write_hook_for_test_())
     return false;
   const size_t alen = (len + 4095) & ~static_cast<size_t>(4095);
@@ -1854,7 +1906,7 @@ Status DiskSlabStore::WaitPut(const std::shared_ptr<PutFlight>& flight) {
 template <typename WriteFn>
 Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
                                 const WriteFn& write_payload) {
-  if (!Healthy()) return Status::kIOError;
+  if (!Serving()) return Status::kIOError;
   const std::string fn = key.Filename();
   SlabAllocator::SlotRef ref;
   std::shared_ptr<PutFlight> flight;
@@ -1862,7 +1914,7 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
   {
     std::unique_lock<std::mutex> lk(mu_);
     for (;;) {
-      if (!Healthy()) return Status::kIOError;
+      if (!Serving()) return Status::kIOError;
       if (payload_len_.count(key) != 0) return Status::kOk;  // keep-first
       // A Remove that already returned outranks an in-flight write of the
       // same key: this PUT arrived after it and must not share the result of
@@ -1884,7 +1936,7 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
         // remove_cv_, then re-judge from scratch. A genuine duplicate (no
         // deferred remove in play) keeps the existing semantics below.
         if (remove_cv_.wait_for(lk, kDeferredRemoveWaitMax, [&] {
-              return deferred_remove_.count(fn) == 0 || !Healthy();
+              return deferred_remove_.count(fn) == 0 || !Serving();
             }))
           continue;  // window closed: the slot is gone; fresh judgment
         return Status::kIOError;  // pin outlived the bound: fail as before
@@ -1927,7 +1979,7 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
     if (io_ok && !removed_while_writing)
       io_ok = WriteRecord(ref, key, static_cast<uint32_t>(len), /*valid=*/true);
     const bool release_ok = ReleaseInflightLocked(key, fn);
-    if (!io_ok || !release_ok || !Healthy()) {
+    if (!io_ok || !release_ok || !Serving()) {
       if (!removed_while_writing) alloc_->Remove(key);
     } else {
       if (!removed_while_writing) {
@@ -1979,7 +2031,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
     const std::vector<CacheBatchItem>& items) {
   const size_t N = items.size();
   std::vector<Status> out(N, Status::kIOError);
-  if (!Healthy() || N == 0) return out;
+  if (!Serving() || N == 0) return out;
   struct Slot {
     std::string fn;
     SlabAllocator::SlotRef ref;
@@ -2002,7 +2054,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
       // Per-item judgment, re-run (once per closed window) when the item sat
       // out a deferred-remove window.
       for (;;) {
-        if (!Healthy()) {
+        if (!Serving()) {
           out[i] = Status::kIOError;
           break;
         }
@@ -2027,7 +2079,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
           // re-PUT must wait the window out -- bounded, see remove_cv_ --
           // instead of hard-failing on the allocator's still-resident slot.
           if (remove_cv_.wait_for(lk, kDeferredRemoveWaitMax, [&] {
-                return deferred_remove_.count(st[i].fn) == 0 || !Healthy();
+                return deferred_remove_.count(st[i].fn) == 0 || !Serving();
               }))
             continue;  // window closed: re-judge this item from scratch
           out[i] = Status::kIOError;  // pin outlived the bound: fail as before
@@ -2065,7 +2117,8 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
   size_t direct_n = 0;
   for (size_t i = 0; i < N; ++i) if (st[i].active && st[i].direct) direct_n++;
   bool did_uring = false;
-  if (uring_write_enabled_ && direct_n >= 2) {
+  // MayMutate: the writes submitted here do not pass through WritePayload*.
+  if (uring_write_enabled_ && direct_n >= 2 && MayMutate()) {
     // One submission ring PER THREAD: the previous single shared ring + mutex
     // serialized every flush worker behind one lock held ACROSS the blocking
     // CQE wait — at any instant only one worker was doing uring IO, which
@@ -2201,7 +2254,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
                                   /*valid=*/true);
       const bool release_ok =
           ReleaseInflightLocked(items[i].key, st[i].fn);
-      if (!st[i].io_ok || !release_ok || !Healthy()) {
+      if (!st[i].io_ok || !release_ok || !Serving()) {
         if (!removed) alloc_->Remove(items[i].key);
         out[i] = Status::kIOError;
       } else {
@@ -2231,13 +2284,13 @@ Status DiskSlabStore::RangeDirect(
   // Direct mode + aligned io_buf (the RDMA path's contract): O_DIRECT read of
   // the slot-absolute aligned window, payload pointer trimmed by head -- the
   // GET path stays page-cache-free. Anything else: buffered RangeInto.
-  if (!extent_dio_fds_.empty() && Healthy() &&
+  if (!extent_dio_fds_.empty() && Serving() &&
       (reinterpret_cast<uintptr_t>(io_buf) & 4095) == 0) {
     const std::string fn = key.Filename();
     SlabAllocator::SlotRef ref;
     uint32_t plen = 0;
     if (!AcquireForRead(key, fn, &ref, &plen))
-      return Healthy() ? Status::kNotFound : Status::kIOError;
+      return Serving() ? Status::kNotFound : Status::kIOError;
     Status st = Status::kOk;
     size_t got = 0, head = 0;
     if (offset > plen) {
@@ -2274,7 +2327,7 @@ Status DiskSlabStore::RangeDirect(
     if (out_len) *out_len = got;
     return Status::kOk;
   }
-  if (!extent_dio_fds_.empty() && Healthy())
+  if (!extent_dio_fds_.empty() && Serving())
     dio_read_fallbacks_.fetch_add(1, std::memory_order_relaxed);  // unaligned io_buf
   size_t got = 0;
   Status st = RangeInto(key, offset, length, io_buf, io_cap, &got, value_len);
@@ -2287,12 +2340,12 @@ Status DiskSlabStore::RangeDirectPrep(const BlockKey& key, uint64_t offset,
                                       ReadLease* out) {
   if (out == nullptr) return Status::kInvalid;
   *out = ReadLease{};
-  if (!Healthy()) return Status::kIOError;
+  if (!Serving()) return Status::kIOError;
   const std::string fn = key.Filename();
   SlabAllocator::SlotRef ref;
   uint32_t plen = 0;
   if (!AcquireForRead(key, fn, &ref, &plen))
-    return Healthy() ? Status::kNotFound : Status::kIOError;
+    return Serving() ? Status::kNotFound : Status::kIOError;
   auto bail = [&](Status status) {
     std::lock_guard<std::mutex> lk(mu_);
     return ReleaseInflightLocked(key, fn) ? status : Status::kIOError;
@@ -2348,7 +2401,7 @@ uint8_t DiskSlabStore::Retain(const BlockKey& key, uint32_t ttl_s,
                               uint8_t mode, uint32_t now_s) {
   using Code = SlabAllocator::RetainCode;
   if (!retain_enabled_) return kRetainUnsupported;
-  if (!Healthy()) return static_cast<uint8_t>(Code::kMiss);
+  if (!Serving()) return static_cast<uint8_t>(Code::kMiss);
   const auto retain_mode = mode == 1 ? SlabAllocator::RetainMode::kRefresh
                                      : SlabAllocator::RetainMode::kSet;
   std::lock_guard<std::mutex> lk(mu_);
@@ -2381,7 +2434,7 @@ void DiskSlabStore::ReleaseReadLease(uint64_t token) noexcept {
 bool DiskSlabStore::AcquireForRead(const BlockKey& key, const std::string& fn,
                                    SlabAllocator::SlotRef* ref,
                                    uint32_t* plen) {
-  if (!Healthy()) return false;
+  if (!Serving()) return false;
   std::lock_guard<std::mutex> lk(mu_);
   auto it = payload_len_.find(key);
   if (it == payload_len_.end()) return false;  // in-flight write / removed: no commit
@@ -2418,12 +2471,12 @@ bool DiskSlabStore::ReleaseInflightLocked(const BlockKey& key,
 Status DiskSlabStore::Range(const BlockKey& key, uint64_t offset,
                             uint64_t length, std::string* out,
                             size_t* value_len) {
-  if (!Healthy()) return Status::kIOError;
+  if (!Serving()) return Status::kIOError;
   const std::string fn = key.Filename();
   SlabAllocator::SlotRef ref;
   uint32_t plen = 0;
   if (!AcquireForRead(key, fn, &ref, &plen))
-    return Healthy() ? Status::kNotFound : Status::kIOError;
+    return Serving() ? Status::kNotFound : Status::kIOError;
   Status st = Status::kOk;
   if (offset > plen) {
     st = Status::kInvalid;
@@ -2448,12 +2501,12 @@ Status DiskSlabStore::RangeInto(const BlockKey& key, uint64_t offset,
                                 uint64_t length, char* dst, size_t dst_cap,
                                 size_t* out_len, size_t* value_len) {
   if (out_len) *out_len = 0;
-  if (!Healthy()) return Status::kIOError;
+  if (!Serving()) return Status::kIOError;
   const std::string fn = key.Filename();
   SlabAllocator::SlotRef ref;
   uint32_t plen = 0;
   if (!AcquireForRead(key, fn, &ref, &plen))
-    return Healthy() ? Status::kNotFound : Status::kIOError;
+    return Serving() ? Status::kNotFound : Status::kIOError;
   Status st = Status::kOk;
   size_t got = 0;
   if (offset > plen) {
@@ -2475,14 +2528,14 @@ Status DiskSlabStore::RangeInto(const BlockKey& key, uint64_t offset,
 }
 
 bool DiskSlabStore::IsCached(const BlockKey& key) const {
-  if (!Healthy()) return false;
+  if (!Serving()) return false;
   std::lock_guard<std::mutex> lk(mu_);
   // Commit-gated (matches what a Range would hit): an in-flight write or a
   // deferred-removed key reads as absent.
   return payload_len_.count(key) > 0;
 }
 Status DiskSlabStore::Lookup(const BlockKey& key, ValueMetadata* out) const {
-  if (!Healthy()) return Status::kIOError;
+  if (!Serving()) return Status::kIOError;
   if (out == nullptr) return Status::kInvalid;
   std::lock_guard<std::mutex> lk(mu_);
   auto it = payload_len_.find(key);
@@ -2493,7 +2546,7 @@ Status DiskSlabStore::Lookup(const BlockKey& key, ValueMetadata* out) const {
 
 
 Status DiskSlabStore::Remove(const BlockKey& key) {
-  if (!Healthy()) return Status::kIOError;
+  if (!Serving()) return Status::kIOError;
   const std::string fn = key.Filename();
   std::lock_guard<std::mutex> lk(mu_);
   SlabAllocator::SlotRef ref;
@@ -2560,7 +2613,7 @@ uint64_t DiskSlabStore::EvictedBytes() const {
 // lock hold, so Put never waits behind an inline CLOCK sweep.
 void DiskSlabStore::ReclaimTick(
     const std::function<void()>& after_watermark_evict) {
-  if (!Healthy()) return;
+  if (!Serving()) return;
   if (retain_enabled_) alloc_->ExpireRetention(RetainNowS());
   // Successful NEW commits renew pressure eligibility. Inactive history
   // expires after 128 quiet observations; required active drain is preserved.
