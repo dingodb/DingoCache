@@ -139,6 +139,12 @@ class GpuNodeDedup {
   uint64_t wait_hits() const { return wait_hits_.load(std::memory_order_relaxed); }
   uint64_t wait_timeouts() const { return wait_timeouts_.load(std::memory_order_relaxed); }
   uint64_t load_fences() const { return load_fences_.load(std::memory_order_relaxed); }
+  // Invalidations that waited for one slot longer than takeover_ms, or left
+  // behind a slot whose release has been past its finishing swap for longer
+  // than takeover_ms (each logged). Short waits are not counted.
+  uint64_t invalidate_stuck() const {
+    return invalidate_stuck_.load(std::memory_order_relaxed);
+  }
   uint64_t load_fence_failures() const {
     return load_fence_failures_.load(std::memory_order_relaxed);
   }
@@ -208,6 +214,10 @@ class GpuNodeDedup {
   // Finishes a force-out whose forcer was killed, once it is older than
   // takeover_ms. True: the slot is EMPTY now.
   bool RecoverStrandedForceOut(Slot* s, uint64_t now);
+  // A finisher of a force-out has made its swap and not yet emptied the
+  // slot: it can only end EMPTY (see the .cc).
+  bool FinishingRelease(const Slot* s) const;
+  void ReportStuck(uint32_t idx, const Slot* s, const char* what);
   // on = false makes a held slot look like the publisher of an older
   // release, which does not mark itself, caught in the middle of its commit.
   void SetFenceableForTest(const PublishHold& hold, bool on);
@@ -215,7 +225,8 @@ class GpuNodeDedup {
   // of the key the slot still names: Reserve's state swap, the
   // invalidation's swap and first increment, its second increment and
   // EMPTY store, then the rest of the Reserve. Steps 4-5: a finisher of a
-  // stranded force-out, its swap, then the rest.
+  // stranded force-out, its swap, then the rest. Step 6: a forcer's swap
+  // and tag, without checking for the publisher's mark.
   void InterleaveForTest(const PublishHold& hold, int step);
   bool RecoverForTest(const PublishHold& hold);
   bool GenEvenForTest(const PublishHold& hold) const;
@@ -254,6 +265,7 @@ class GpuNodeDedup {
 
   std::atomic<uint64_t> hits_{0}, fetches_{0}, wait_hits_{0}, wait_timeouts_{0};
   std::atomic<uint64_t> load_fences_{0}, load_fence_failures_{0};
+  std::atomic<uint64_t> invalidate_stuck_{0};
 };
 
 }  // namespace dfkv

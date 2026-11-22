@@ -895,6 +895,138 @@ TEST(GpuNodeDedup, ClaimFinishesForAForcerThatWasKilled) {
 // A stranded force-out is finished by one party at a time. While a finisher
 // is between its swap and the rest of its stores, a second party that looks
 // at the slot must not finish the same release again.
+// An invalidation that has to wait for a holder it cannot take the slot from
+// (here a publisher of an older release, seen in the middle of its commit)
+// still waits, but says so once it has waited longer than the takeover age.
+TEST(GpuNodeDedup, AnInvalidationThatWaitsTooLongIsReported) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("invalidate-stuck");
+  auto a = GpuNodeDedup::Open(Opts(g.name));  // takeover_ms 200
+  auto b = GpuNodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  KeyBufs k(76);
+  size_t got = 0;
+  uint64_t token = 0;
+  ASSERT_EQ(a->ClaimSg(K(76), &k.s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  const auto held = GpuNodeDedupTestAccess::PublishBegin(*a, K(76), token, 4096);
+  ASSERT_TRUE(held.taken);
+  GpuNodeDedupTestAccess::LookLikeAnOlderRelease(*a, held);
+
+  InvalidateInBackground inv(b.get(), K(76));
+  EXPECT_FALSE(inv.ReturnedWithin(std::chrono::milliseconds(500)))
+      << "the invalidation gave up on a holder that may still commit";
+  EXPECT_EQ(b->invalidate_stuck(), 1u) << "the long wait was not reported";
+  GpuNodeDedupTestAccess::PublishFinish(*a, held, &k.s, 1);
+  inv.done.wait();
+  EXPECT_EQ(b->invalidate_stuck(), 1u) << "reported more than once";
+  EXPECT_NE(b->ClaimSg(K(76), &k.d, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kHit);
+}
+
+// A release of a slot taken from a publisher is past its finishing swap: the
+// slot can only end EMPTY. Once that has lasted longer than the takeover age
+// the finisher is taken to be dead and an invalidation stops waiting, so one
+// killed finisher does not hang every write of the key.
+TEST(GpuNodeDedup, InvalidateDoesNotWaitForAReleasePastItsFinishingSwap) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("invalidate-finishing");
+  auto a = GpuNodeDedup::Open(Opts(g.name));  // takeover_ms 200
+  auto b = GpuNodeDedup::Open(Opts(g.name));
+  auto c = GpuNodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b && c);
+  KeyBufs k(77);
+  size_t got = 0;
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->ClaimSg(K(77), &k.s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  const auto held = GpuNodeDedupTestAccess::PublishBegin(*a, K(77), token, 4096);
+  ASSERT_TRUE(held.taken);
+  ASSERT_TRUE(GpuNodeDedupTestAccess::ForceOutBegin(*b, held));
+  GpuNodeDedupTestAccess::Interleave(*b, held, 4);  // finisher's swap, then killed
+
+  InvalidateInBackground inv(c.get(), K(77));
+  EXPECT_FALSE(inv.ReturnedWithin(std::chrono::milliseconds(100)))
+      << "gave up on the finisher before the takeover age";
+  const bool returned = inv.ReturnedWithin(std::chrono::seconds(2));
+  EXPECT_TRUE(returned) << "a write or remove of this key would never return";
+  if (!returned) GpuNodeDedupTestAccess::Interleave(*b, held, 5);
+  inv.done.wait();
+  EXPECT_EQ(c->invalidate_stuck(), 1u);
+  EXPECT_NE(c->ClaimSg(K(77), &k.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kHit);
+  // The finisher was only slow: it ends the release, and the slot works.
+  if (returned) GpuNodeDedupTestAccess::Interleave(*b, held, 5);
+  EXPECT_TRUE(GpuNodeDedupTestAccess::GenEven(*a, held));
+  uint64_t t2 = 0;
+  ASSERT_EQ(a->ClaimSg(K(77), &k.s, 1, 4096, &got, &t2),
+            GpuNodeDedup::Role::kFetch);
+  a->PublishSg(K(77), t2, &k.s, 1, 4096);
+  ASSERT_EQ(c->ClaimSg(K(77), &k.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kHit);
+  EXPECT_EQ(k.dst.Down(4096), k.value);
+}
+
+// A finisher that is only passing through that state is waited for, and
+// the wait is not reported as stuck.
+TEST(GpuNodeDedup, InvalidateWaitsForAFinisherAtWorkWithoutReportingIt) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("invalidate-finisher-live");
+  auto a = GpuNodeDedup::Open(Opts(g.name));  // takeover_ms 200
+  auto b = GpuNodeDedup::Open(Opts(g.name));
+  auto c = GpuNodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b && c);
+  KeyBufs k(78);
+  size_t got = 0;
+  uint64_t token = 0;
+  ASSERT_EQ(a->ClaimSg(K(78), &k.s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  const auto held = GpuNodeDedupTestAccess::PublishBegin(*a, K(78), token, 4096);
+  ASSERT_TRUE(held.taken);
+  ASSERT_TRUE(GpuNodeDedupTestAccess::ForceOutBegin(*b, held));
+  GpuNodeDedupTestAccess::Interleave(*b, held, 4);  // finisher's swap
+
+  InvalidateInBackground inv(c.get(), K(78));
+  EXPECT_FALSE(inv.ReturnedWithin(std::chrono::milliseconds(50)));
+  GpuNodeDedupTestAccess::Interleave(*b, held, 5);  // and its last stores
+  EXPECT_TRUE(inv.ReturnedWithin(std::chrono::seconds(2)));
+  inv.done.wait();
+  EXPECT_EQ(c->invalidate_stuck(), 0u)
+      << "a release that was going on normally was reported as stuck";
+  EXPECT_TRUE(GpuNodeDedupTestAccess::GenEven(*a, held));
+}
+
+// One invalidation reports one slot once. Here the slot is first held by a
+// publisher it cannot take the slot from, past the takeover age (reported),
+// and then turns into a release past its finishing swap whose finisher dies:
+// the invalidation stops waiting without a second report.
+TEST(GpuNodeDedup, AnInvalidationReportsASlotOnce) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("invalidate-report-once");
+  auto a = GpuNodeDedup::Open(Opts(g.name));  // takeover_ms 200
+  auto c = GpuNodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && c);
+  KeyBufs k(79);
+  size_t got = 0;
+  uint64_t token = 0;
+  ASSERT_EQ(a->ClaimSg(K(79), &k.s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  const auto held = GpuNodeDedupTestAccess::PublishBegin(*a, K(79), token, 4096);
+  ASSERT_TRUE(held.taken);
+  GpuNodeDedupTestAccess::LookLikeAnOlderRelease(*a, held);
+
+  InvalidateInBackground inv(c.get(), K(79));
+  EXPECT_FALSE(inv.ReturnedWithin(std::chrono::milliseconds(400)));
+  EXPECT_EQ(c->invalidate_stuck(), 1u);
+  GpuNodeDedupTestAccess::Interleave(*a, held, 6);  // a forcer takes it
+  GpuNodeDedupTestAccess::Interleave(*a, held, 4);  // a finisher's swap, then dies
+  const bool returned = inv.ReturnedWithin(std::chrono::seconds(2));
+  EXPECT_TRUE(returned);
+  if (!returned) GpuNodeDedupTestAccess::Interleave(*a, held, 5);
+  inv.done.wait();
+  EXPECT_EQ(c->invalidate_stuck(), 1u) << "the same slot was reported twice";
+}
+
 TEST(GpuNodeDedup, AStrandedForceOutIsFinishedOnce) {
   if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
   ShmGuard g("forcer-dead-twice");

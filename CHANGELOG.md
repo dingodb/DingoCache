@@ -3,6 +3,27 @@
 ## Unreleased
 
 
+- Client, GPU dedup (`DFKV_CLIENT_NODE_DEDUP_GPU=1`): a write or remove of
+  a key that hangs on a blocked shared slot is no longer silent, and one
+  such case no longer hangs. Before a write or remove, the client removes
+  the key's shared entries; a slot held by a party it cannot take the slot
+  from is waited for without limit, because that party may still publish
+  the bytes from before the write. Those parties are a publisher of an
+  older release on the same host and a process killed in one of the short
+  windows listed for 2.39.1. Once the wait for one slot exceeds
+  `DFKV_NODE_DEDUP_TAKEOVER_MS`, the client now logs one WARN line
+  (`gpu-dedup: invalidation, slot ...`, with the slot's state) and counts
+  it in the new `dfkv_client_gpu_dedup_invalidate_stuck_total`; it keeps
+  waiting. One of the windows is no longer waited for without limit: a
+  process killed while completing the release of a slot taken from a
+  publisher, after its last decisive step. Such a slot can only end empty,
+  never published, so once it has stayed in that state for longer than
+  `DFKV_NODE_DEDUP_TAKEOVER_MS` the write or remove goes ahead (also
+  logged and counted; a process that is merely completing the release is
+  waited for and not counted). The slot itself stays blocked for lookups
+  of the key, which fetch for themselves. The counter is in the native
+  metrics snapshot.
+
 - SGLang HiCache connector: new extra_config switch `bind_runtime_layout`
   (default `false`). Objects are found by key, and a read accepts an object
   only if its length is exact, so a reader with another page size, layer

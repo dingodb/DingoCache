@@ -918,6 +918,14 @@ void GpuNodeDedup::InterleaveForTest(const PublishHold& hold, int step) {
       s->gen.compare_exchange_strong(g, g + 2, std::memory_order_acq_rel);
       break;
     }
+    case 6: {  // a forcer's swap and tag, whatever the slot's mark
+      uint64_t g = s->gen.load(std::memory_order_acquire);
+      if (s->gen.compare_exchange_strong(g, g + 1, std::memory_order_acq_rel)) {
+        s->fetch_start_ms.store(NowMs(), std::memory_order_relaxed);
+        __atomic_store_n(&s->alloc_seq, ForcingOutTag(g + 1), __ATOMIC_RELEASE);
+      }
+      break;
+    }
     case 5:  // that finisher: the rest
       __atomic_store_n(&s->alloc_seq, 0, __ATOMIC_RELAXED);
       s->gen.fetch_add(1, std::memory_order_release);
@@ -960,6 +968,9 @@ void GpuNodeDedup::Invalidate(const BlockKey& key) {
   uint32_t idx = ProbeStart(key) & mask;
   for (int probe = 0; probe < 8; ++probe, idx = (idx + 1) & mask) {
     Slot& s = slots_[idx];
+    uint64_t spin_since = 0;  // when this call began to wait for the slot
+    uint64_t finishing_since = 0;  // since when FinishingRelease has held
+    bool reported = false;
     for (;;) {
       uint32_t st = s.state.load(std::memory_order_acquire);
       if (st == kStateEmpty) break;
@@ -968,11 +979,43 @@ void GpuNodeDedup::Invalidate(const BlockKey& key) {
         // What is being published is from before this invalidation. A
         // publisher that can be fenced loses the slot here and now, whether
         // it is still running or was killed. A force-out whose forcer was
-        // killed is finished once it is older than the takeover age. Any
-        // other holder is waited for, without bound: an older release's
-        // publisher, or one of the short windows listed at MarkedFenceable.
-        if (ForceOutPublisher(&s) || RecoverStrandedForceOut(&s, NowMs()))
+        // killed is finished once it is older than the takeover age. A
+        // release that is past its finishing swap can only end EMPTY: a live
+        // finisher is through in a few instructions, so it is waited for
+        // like any holder, but once that state has held for longer than the
+        // takeover age the finisher is taken to be dead, and the slot is
+        // left behind (reported). Any other holder is waited for, without bound:
+        // an older release's publisher, or one of the short windows listed
+        // at MarkedFenceable. Past the takeover age that is reported once.
+        const uint64_t now = NowMs();
+        if (ForceOutPublisher(&s) || RecoverStrandedForceOut(&s, now))
           break;
+        if (FinishingRelease(&s)) {
+          if (finishing_since == 0) {
+            finishing_since = now;
+          } else if (now - finishing_since >
+                     static_cast<uint64_t>(takeover_ms_)) {
+            if (!reported)  // at most one report per slot and call
+              ReportStuck(idx, &s,
+                          "a release past its finishing swap has not ended "
+                          "within DFKV_NODE_DEDUP_TAKEOVER_MS; it can only "
+                          "end EMPTY, so not waiting for it any longer");
+            break;
+          }
+          std::this_thread::yield();
+          continue;
+        }
+        finishing_since = 0;
+        if (spin_since == 0) {
+          spin_since = now;
+        } else if (!reported &&
+                   now - spin_since > static_cast<uint64_t>(takeover_ms_)) {
+          ReportStuck(idx, &s,
+                      "waited longer than DFKV_NODE_DEDUP_TAKEOVER_MS for its "
+                      "holder (an older release's publisher, or a process "
+                      "killed in a short window); still waiting");
+          reported = true;
+        }
         std::this_thread::yield();
         continue;
       }
@@ -985,6 +1028,41 @@ void GpuNodeDedup::Invalidate(const BlockKey& key) {
       break;
     }
   }
+}
+
+// A finisher (ForceOutFinish) has swapped the generation from the force-out's
+// odd value g - 2 to g and not yet cleared the force-out's tag: the slot is
+// PUBLISHING at odd g with alloc_seq == ForcingOutTag(g - 2). Only that
+// finisher writes the slot from here, and only to clear the tag, step the
+// generation and store EMPTY: nothing can make it READY again. Nobody else
+// can produce the combination: the tag is written only by ForceOutBegin, for
+// the odd generation its own swap made, and older releases never write it.
+// A commit, an abandon or an older release's publisher is told apart this
+// way and is still waited for: their odd windows can end READY.
+bool GpuNodeDedup::FinishingRelease(const Slot* s) const {
+  const uint64_t g = s->gen.load(std::memory_order_acquire);
+  if (!(g & 1)) return false;
+  if (s->state.load(std::memory_order_acquire) != kStatePublishing)
+    return false;
+  if (__atomic_load_n(&s->alloc_seq, __ATOMIC_ACQUIRE) != ForcingOutTag(g - 2))
+    return false;
+  return s->gen.load(std::memory_order_acquire) == g;
+}
+
+void GpuNodeDedup::ReportStuck(uint32_t idx, const Slot* s, const char* what) {
+  invalidate_stuck_.fetch_add(1, std::memory_order_relaxed);
+  char line[256];
+  std::snprintf(
+      line, sizeof(line),
+      "gpu-dedup: invalidation, slot %u (gen=%llu state=%u "
+      "alloc_seq=0x%016llx): %s",
+      idx,
+      static_cast<unsigned long long>(s->gen.load(std::memory_order_acquire)),
+      s->state.load(std::memory_order_acquire),
+      static_cast<unsigned long long>(
+          __atomic_load_n(&s->alloc_seq, __ATOMIC_RELAXED)),
+      what);
+  DFKV_LOG_WARN(line);
 }
 
 bool GpuNodeDedup::WaitSg(const BlockKey& key, const Seg* segs, size_t nsegs,
