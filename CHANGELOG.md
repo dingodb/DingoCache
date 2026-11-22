@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- vLLM connector, namespace: each cache group's object size
+  (`logical_bytes_per_block`) is not in the namespace. It is not added now:
+  that changes every key and so waits for the next layout-ID bump, which
+  cold-starts every deployment anyway; until then an object of another size
+  is caught by the exact-length load and a shorter one is removed. A test
+  now fails if the layout ID changes without the field.
+
 - vLLM connector, scheduler step cost. A request's token ids, read only by
   KV events, were pickled to every worker every step: a 32k-token request's
   metadata was about 115 KiB, now 19 KiB without KV events. The scan for
