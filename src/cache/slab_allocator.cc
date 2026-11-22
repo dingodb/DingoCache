@@ -1,3 +1,4 @@
+#include "utils/env_parse.h"
 #include "cache/slab_allocator.h"
 
 #include <algorithm>
@@ -169,12 +170,18 @@ SlabAllocator::SlabAllocator(Options opt) : opt_(std::move(opt)) {
     slot_size = next;
   }
 
-  if (const char* w = std::getenv("DFKV_SLAB_COLD_STEAL_WINDOW")) {
-    char* end = nullptr;
-    const unsigned long long v = std::strtoull(w, &end, 10);
-    if (end != w) {
+  {
+    // 0 = cold steal off; unset or invalid leaves the window to be derived.
+    envparse::U64Spec spec;
+    spec.legacy = envparse::Legacy::kPrefix;
+    spec.negative = envparse::Negative::kWraps;
+    spec.above = envparse::Above::kClamp;  // strtoull saturates
+    bool given = false;
+    const uint64_t v =
+        envparse::EnvU64("DFKV_SLAB_COLD_STEAL_WINDOW", spec, &given);
+    if (given) {
       if (v == 0) cold_steal_enabled_ = false;
-      else cold_window_ = static_cast<uint64_t>(v);
+      else cold_window_ = v;
     }
   }
   config_dump::RecordResolved(

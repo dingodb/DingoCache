@@ -529,6 +529,57 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 按 CONNECTORS.md §1 的 vLLM/SGLang/LMCache 通用表设置**，本表只列 **dfkv_server / dfkv_mds**
 进程读到的组。
 
+**值的格式（dfkv_server / dfkv_mds）。** 数值一律是十进制非负整数，不带单位、符号、
+小数或指数（字节数写全，`64G`、`30s`、`1e3` 都不是合法值）；开关写 `1` 或 `0`；
+`--log` / `DFKV_LOG` 的级别大小写均可。未设置等于取默认值。
+
+**环境变量（以及作为其 facade 的 flag）：本版本只增加可见性，不改变任何取值。** 2.38 及
+之前这些值由各处 `strtol`/`atoi` 宽松解析，写错的值会被悄悄读成别的东西。现在统一经
+`src/utils/env_parse.h` 解析：凡是今天能启动的写法，解析结果与此前完全相同；凡是不规范
+的写法，每个变量每进程打一行 WARN，指出变量、值和实际采用的值：
+
+- `invalid NAME='值': ...; using N as before ... a later release will not accept this value`
+  ——仍按此前的读法采用 N；
+- `invalid NAME='值': ...; using the default D`——此前就被忽略而取默认值，现在说明了；
+- `NAME='值' clamped to the maximum M`——此前就收敛到上限。
+
+升级后在启动日志里 `grep -E "invalid DFKV_|clamped to the maximum"` 即可找出要清理的项。
+**下表这些“带 WARN 兼容接受”的写法将在以后的版本收紧（按字面含义解析或直接拒绝），请
+提前清理配置：**
+
+| 写法 | 涉及的变量 | 现在（与此前相同）的结果 | 应改成 |
+|---|---|---|---|
+| 空串（`NAME=`） | `DFKV_RAM_ACK_HIGH_WATERMARK_PCT`、`DFKV_RAM_RECLAIM_MS` | 读成 `0`：强制 disk-ACK / 关闭 RAM 后台回收 | 要 0 就写 `0`；要默认值就删掉该行 |
+| 非数字（`abc`、只有空白） | `DFKV_RAM_ACK_HIGH_WATERMARK_PCT`、`DFKV_RAM_RECLAIM_MS`、`DFKV_RDMA_IDLE_MS`（0 = 关 idle reaper）、`DFKV_SLAB_EVICT_HIGH_PCT`（0 = 关水位驱逐）、`DFKV_SLAB_EVICT_LOW_PCT`、`DFKV_READ_COALESCE_RECUR_MS`、`DFKV_PUT_INFLIGHT_LIMIT` | 读成 `0` | 写数字，或删掉该行 |
+| 数字后带别的字符（`30s`、`60%`、`64G`、`1e3`） | 上一行各项，以及 `DFKV_RAM_TIER_BYTES`、`DFKV_RAM_TIER_EXTENT_BYTES`、`DFKV_RAM_TIER_SHARDS`、`DFKV_RAM_FLUSH_THREADS`、`DFKV_SLAB_COLD_STEAL_WINDOW`、`DFKV_RDMA_DEPTH`、`DFKV_SERVER_URING_DEPTH`、`DFKV_READ_COALESCE_TIMEOUT_MS`、`DFKV_RDMA_MAX_PAYLOAD_BYTES`、`DFKV_MDS_MAX_CONNS`、`DFKV_MDS_IO_TIMEOUT_S`、`DFKV_MDS_PROBE_CACHE_MS`、`DFKV_MDS_UNWRITTEN_HOLD_MS`、`DFKV_MDS_ETCD_PROBE_MS` | 只取前面的数字（`64G` = 64 字节） | 写完整的十进制数 |
+| 负数（`-1`） | `DFKV_MDS_PROBE_CACHE_MS`、`DFKV_MDS_UNWRITTEN_HOLD_MS`、`DFKV_RDMA_RECV_CHUNK_IDLE_MS`、`DFKV_RDMA_MAX_PAYLOAD_BYTES` | 回绕成极大值后收敛到上限 | 写想要的值 |
+| 负数（`-1`） | `DFKV_PUT_INFLIGHT_LIMIT`、`DFKV_RAM_RECLAIM_MS`、`DFKV_RAM_TIER_EXTENT_BYTES`、`DFKV_SLAB_COLD_STEAL_WINDOW` | 回绕成极大值（等于不限 / 几乎不回收 / 单 extent） | 写想要的值 |
+| 负数 | `DFKV_RDMA_IDLE_MS` | 等于 `0`（关 idle reaper） | 写 `0` |
+| 前导 `+` | 除“首字符必须是数字”的几项外的全部数值项 | 忽略符号 | 去掉 `+` |
+| `off` / `false` / `no`（任意大小写） | `DFKV_READ_COALESCE`、`DFKV_RDMA_NUMA`、`DFKV_SERVER_URING`、`DFKV_SLAB_URING_WRITE` | **读成开**：这四项只把 `0` 当关 | 要关写 `0` |
+| `00`、`0abc` 等以 `0` 开头的值 | `DFKV_READ_COALESCE`、`DFKV_SLAB_URING_WRITE` | 读成关（看首字符） | 写 `0` |
+| `00`、`0abc` | `DFKV_RDMA_NUMA`、`DFKV_SERVER_URING` | 读成开（只认恰好 `0`） | 写 `0` 或 `1` |
+| 其他任意词（`enable`、`2`） | 上述四项，以及 `DFKV_RAM_TIER_LOCK`、`DFKV_RAM_TIER_HUGEPAGES`、`DFKV_MDS_ACCEPT_LEGACY` | 读成开 | 写 `1` |
+| `ON`、`True`、`2` 等 | `DFKV_RAM_TIER` / `--ram-tier` | **RAM tier 不开**：只认小写 `1/on/true/yes` | 写 `on` |
+
+其余写错的值行为同样不变，只是多了 WARN：负数在用 `strtoull` 读的各项上照旧回绕
+（`DFKV_RAM_TIER_BYTES=-1` 仍是 2^64−1 字节的 arena，分配不出来，启动照旧失败；回绕后
+落在合法范围内的负数照旧取那个数），在用 `strtol` 读的各项上照旧取默认；
+`DFKV_RDMA_RECV_SEGMENT_SIZE` / `DFKV_RDMA_RECV_CHUNK_BYTES` 不是纯数字时照旧取默认值，
+WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 位（`-1` = 4294967295，
+`4294967296` = 0 即关闭回收），照旧，现在会报；超出范围的值照旧取默认或收敛到上限；存储几何与语义类（`DFKV_STORE_ENGINE`、
+`DFKV_SLAB_WRITE`、`DFKV_SLAB_GRANULARITY`、`DFKV_SLAB_TABLE_SYNC_MS`、
+`DFKV_SLAB_RECLAIM_MS`、`DFKV_SLAB_WARM_RESTART`、`DFKV_DISK_HASH_WEIGHT`、tenant quota、
+`DFKV_RAM_TIER_NUMA`）和 `DFKV_MDS_REGISTRATION_TIMEOUT_MS` 写错时照旧报错退出。
+
+**直接解析的命令行参数：此前被悄悄截断或回绕的值现在报错退出（exit 2）。** `--port`、
+`--rdma-port`、`--metrics-port`、`dfkv_mds --listen` 必须在 0..65535（此前 `--port 70000`
+实际监听 4464；可选监听项显式写 `-1` 仍表示不开）；`--cap`、`--max-msg` 不接受负数（此前
+`--cap -1` 回绕成 2^64−1）；放不进 int 的整数不再回绕；`dfkvctl --stat-port` 必须是
+1..65535（此前非数字被读成“用成员自己的端口”）。`--mds` 缺 `--id`/`--advertise` 在打开任何
+盘之前就报错（exit 1，此前在盘和 RAM tier 都起来之后）。未给 `--dir`/`--cap` 仍用默认值
+启动，但会打 WARN。仓库自带的 Dockerfile、`deploy/` 脚本和示例 unit 里的参数值都不受影响。
+
 #### a. 核心必填/常用（`dfkv_server --help` 全集）
 
 | flag/env 孪生 | 默认 | 说明 |
@@ -568,7 +619,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `DFKV_SLAB_WARM_RESTART` | `off`（`auto` / `boot`） | 非干净退出后保留还是清零 slab 缓存 |
 | `--slab-reclaim-ms` / `DFKV_SLAB_RECLAIM_MS` | `50 ms`, `0`=关 | slab 后台回收 tick |
 | `--ram-reclaim-ms` / `DFKV_RAM_RECLAIM_MS` | `10 ms`, `0`=关 | RAM tier 后台回收 tick |
-| `--log` / `DFKV_LOG` | `INFO` | INFO/DEBUG/WARN/ERROR |
+| `--log` / `DFKV_LOG` | `INFO` | INFO/DEBUG/WARN/ERROR，大小写均可；不认识的词按 INFO 并在 stderr 提示 |
 | `--max-msg`（或 `DFKV_RDMA_MAX_PAYLOAD_BYTES`） | `32 MiB` | 单笔 payload 硬上限（RDMA 与 TCP 数据路径同受此限） |
 | `--version, -V` / `--help` | — | 打印版本/帮助并退出 |
 
@@ -648,7 +699,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 
 | env | 默认 | 说明 |
 |---|---|---|
-| `DFKV_LOG` | `INFO` | log level |
+| `DFKV_LOG` | `INFO` | log level（debug/info/warn/error，大小写均可） |
 | `DFKV_FANOUT_THREADS` | `32` | TCP batch、RDMA write 和兼容路径共用的 process-wide helper 上限；RDMA read 不再使用该线程池 |
 | `DFKV_RDMA_READ_WORKERS` | `7` | process-wide RDMA GET/GET-Auto/SG-GET/Exist shard worker 硬上限；caller 不参与执行，并发 batch 不会继续推高活跃 read QP；batch 间按 shard round-robin |
 | `DFKV_RDMA_ENDPOINT_CACHE_MAX` | 自适应（下限 `256`） | 所有 client handle 共享的 live endpoint 上限；按 `节点数 × 2 pools × max(pool 上限, configured rails) × 1.25` 自动放大；显式设置任一预算 env 会固定全部预算 |

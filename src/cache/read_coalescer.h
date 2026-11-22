@@ -46,6 +46,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "utils/env_parse.h"
 #include "common/config_dump.h"
 #include "common/kv_types.h"
 #include "common/status.h"
@@ -369,11 +370,14 @@ class ReadCoalescer {
   static int WaitMs() {
     static const int ms = [] {
       int out = 500;
-      const char* e = std::getenv("DFKV_READ_COALESCE_TIMEOUT_MS");
-      if (e && *e) {
-        long v = std::strtol(e, nullptr, 10);
-        if (v >= 10 && v <= 60000) out = static_cast<int>(v);
-      }
+      envparse::U64Spec spec;
+      spec.representable_max = envparse::kSignedMax;  // read with strtol
+      spec.legacy = envparse::Legacy::kPrefixOrZero;
+      spec.fallback = static_cast<uint64_t>(out);
+      spec.min = 10;
+      spec.max = 60000;
+      out = static_cast<int>(
+          envparse::EnvU64("DFKV_READ_COALESCE_TIMEOUT_MS", spec));
       config_dump::RecordResolved("DFKV_READ_COALESCE_TIMEOUT_MS", std::to_string(out));
       return out;
     }();
@@ -388,11 +392,13 @@ class ReadCoalescer {
   static int RecurMs() {
     static const int ms = [] {
       int out = 1000;
-      const char* e = std::getenv("DFKV_READ_COALESCE_RECUR_MS");
-      if (e && *e) {
-        long v = std::strtol(e, nullptr, 10);
-        if (v >= 0 && v <= 60000) out = static_cast<int>(v);
-      }
+      envparse::U64Spec spec;
+      spec.representable_max = envparse::kSignedMax;  // read with strtol
+      spec.legacy = envparse::Legacy::kPrefixOrZero;
+      spec.fallback = static_cast<uint64_t>(out);
+      spec.max = 60000;
+      out = static_cast<int>(
+          envparse::EnvU64("DFKV_READ_COALESCE_RECUR_MS", spec));
       config_dump::RecordResolved("DFKV_READ_COALESCE_RECUR_MS", std::to_string(out));
       return out;
     }();

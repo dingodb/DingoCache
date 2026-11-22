@@ -1,3 +1,4 @@
+#include "utils/env_parse.h"
 #include "cache/ram_tier.h"
 
 #include <sys/mman.h>
@@ -143,19 +144,25 @@ RamTier::RamTier(Options opt, FlushFn flush)
   uint64_t ext = 32ull << 20;
   const bool extent_explicit =
       std::getenv("DFKV_RAM_TIER_EXTENT_BYTES") != nullptr;
-  if (const char* e = std::getenv("DFKV_RAM_TIER_EXTENT_BYTES")) {
-    const uint64_t value = std::strtoull(e, nullptr, 10);
-    if (value >= (1ull << 20)) ext = value;
+  {
+    envparse::U64Spec spec;
+    spec.above = envparse::Above::kClamp;  // strtoull saturates
+    spec.legacy = envparse::Legacy::kPrefixOrZero;
+    spec.negative = envparse::Negative::kWraps;
+    spec.fallback = ext;
+    spec.min = 1ull << 20;
+    ext = envparse::EnvU64("DFKV_RAM_TIER_EXTENT_BYTES", spec);
   }
   ext = std::min(ext, opt_.bytes);
 
   uint64_t large_reserve = opt_.large_reserve_bytes;
-  if (const char* value =
-          std::getenv("DFKV_RAM_TIER_LARGE_RESERVE_BYTES")) {
-    char* end = nullptr;
-    const unsigned long long parsed = std::strtoull(value, &end, 10);
-    if (end != value && *end == '\0')
-      large_reserve = static_cast<uint64_t>(parsed);
+  {
+    envparse::U64Spec spec;
+    spec.above = envparse::Above::kClamp;  // strtoull saturates
+    spec.legacy = envparse::Legacy::kFull;
+    spec.negative = envparse::Negative::kWraps;
+    spec.fallback = large_reserve;
+    large_reserve = envparse::EnvU64("DFKV_RAM_TIER_LARGE_RESERVE_BYTES", spec);
   }
   if (large_reserve == UINT64_MAX) {
     if (!extent_explicit && ext == opt_.bytes) {
@@ -335,10 +342,14 @@ RamTier::RamTier(Options opt, FlushFn flush)
   // Shard count: enough shards to take the single lock off the hot path, few
   // enough that every shard keeps a deep extent pool for class coexistence.
   size_t nshards = 8;
-  if (const char* s = std::getenv("DFKV_RAM_TIER_SHARDS")) {
-    const long value = std::strtol(s, nullptr, 10);
-    if (value >= 1 && value <= static_cast<long>(kMaxShards))
-      nshards = static_cast<size_t>(value);
+  {
+    envparse::U64Spec spec;
+    spec.representable_max = envparse::kSignedMax;  // read with strtol
+    spec.legacy = envparse::Legacy::kPrefixOrZero;
+    spec.fallback = nshards;
+    spec.min = 1;
+    spec.max = kMaxShards;
+    nshards = static_cast<size_t>(envparse::EnvU64("DFKV_RAM_TIER_SHARDS", spec));
   }
   nshards = std::min(nshards, kMaxShards);
   while (nshards > 1 && total_extents / nshards < 32) nshards /= 2;

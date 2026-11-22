@@ -18,6 +18,7 @@
 #include <memory>
 #include <vector>
 
+#include "utils/env_parse.h"
 #include "utils/args.h"
 #include "cache/disk_slab_store.h"
 #include "cache/kv_node_server.h"
@@ -201,10 +202,14 @@ int main(int argc, char** argv) {
   std::string advertise = args.Get("--advertise", "");
   std::string metrics_bind = args.Get("--metrics-bind", "");
   int weight = args.GetInt("--weight", 1);
-  int port = args.GetInt("--port", 0);
-  int rdma_port = args.GetInt("--rdma-port", -1);
-  int metrics_port = args.GetInt("--metrics-port", -1);
+  int port = args.GetPort("--port", 0);
+  int rdma_port = args.GetPort("--rdma-port", -1);
+  int metrics_port = args.GetPort("--metrics-port", -1);
   unsigned long long cap = args.GetU64("--cap", 1ull << 30);
+  // Read here, before the one args.ok() check below, in every build: a value
+  // that does not parse must stop the start, not become the default.
+  const unsigned long long max_msg = args.GetU64("--max-msg", 32ull << 20);
+  (void)max_msg;  // the hard payload ceiling of the RDMA server
   // The explicit flag wins over DFKV_STORE_ENGINE. With neither present,
   // DiskCacheGroup resolves the single production default, "slab".
   std::string store_engine = args.Get("--store-engine", "");
@@ -372,6 +377,22 @@ int main(int argc, char** argv) {
                  "got '%s'\n", advertise.c_str());
     return 2;
   }
+  // Before anything is opened: this used to be found out only after the disks
+  // and the RAM tier had been brought up.
+  if (!mds.empty() && (node_id.empty() || advertise.empty())) {
+    std::fprintf(stderr, "--mds requires --id and --advertise <ip:port>\n");
+    return 1;
+  }
+  // Starting without these is allowed (and used by tests), but in a deployment
+  // it is nearly always a unit file that lost a line.
+  if (!args.Has("--dir"))
+    DFKV_LOG_WARN("--dir not given; using the default " + dir);
+  if (!args.Has("--cap"))
+    DFKV_LOG_WARN("--cap not given; using the default " + std::to_string(cap) +
+                  " bytes");
+  if (weight < 1)
+    DFKV_LOG_WARN("--weight " + std::to_string(weight) +
+                  " is below 1; using 1");
   (void)rdma_port;
   // Record the direct (non-env-facade) flags for the startup config dump.
   // Source is flag ONLY when the flag was actually passed, else default — so the
@@ -463,7 +484,6 @@ int main(int argc, char** argv) {
 #ifdef DFKV_WITH_RDMA
   // --max-msg is the hard payload ceiling. RDMA v2 leases slots from one
   // process-wide receive segment sized by DFKV_RDMA_RECV_SEGMENT_SIZE.
-  const unsigned long long max_msg = args.GetU64("--max-msg", 32ull << 20);
   std::unique_ptr<dfkv::RdmaServer> rsrv;
   std::unique_ptr<dfkv::rdma::RdmaHealthMonitor> rdma_health;
   if (rdma_port >= 0) {
@@ -535,13 +555,15 @@ int main(int argc, char** argv) {
     const std::vector<std::string> health_devices = rsrv->DeviceNames();
     const char* override_env = std::getenv("DFKV_RDMA_HEALTH_FILE");
     const std::string health_file = override_env ? override_env : "";
-    uint32_t recovery_samples = 3;
-    if (const char* value = std::getenv("DFKV_RDMA_HEALTH_RECOVERY_SAMPLES")) {
-      char* end = nullptr;
-      const unsigned long parsed = std::strtoul(value, &end, 10);
-      if (end != value && *end == '\0' && parsed > 0 && parsed <= 100)
-        recovery_samples = static_cast<uint32_t>(parsed);
-    }
+    dfkv::envparse::U64Spec recovery_spec;
+    recovery_spec.fallback = 3;
+    recovery_spec.min = 1;
+    recovery_spec.max = 100;
+    recovery_spec.legacy = dfkv::envparse::Legacy::kFull;
+    recovery_spec.negative = dfkv::envparse::Negative::kWraps;
+    const uint32_t recovery_samples = static_cast<uint32_t>(
+        dfkv::envparse::EnvU64("DFKV_RDMA_HEALTH_RECOVERY_SAMPLES",
+                               recovery_spec));
     rdma_health = std::make_unique<dfkv::rdma::RdmaHealthMonitor>(
         [health_devices, health_file] {
           return dfkv::rdma::ProbeIbDeviceHealth(health_devices, health_file);
@@ -646,11 +668,6 @@ int main(int argc, char** argv) {
 
   std::unique_ptr<dfkv::MdsRegistrar> registrar;
   if (!mds.empty()) {
-    if (node_id.empty() || advertise.empty()) {
-      std::fprintf(stderr, "--mds requires --id and --advertise <ip:port>\n");
-      srv.Stop();
-      return 1;
-    }
     size_t colon = advertise.rfind(':');
     std::string aip = advertise.substr(0, colon);
     uint32_t aport = static_cast<uint32_t>(std::atoi(advertise.c_str() + colon + 1));

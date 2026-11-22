@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "utils/env_parse.h"
 #include "common/config_dump.h"
 #include "utils/thread_name.h"
 
@@ -70,14 +71,14 @@ class ParallelExecutor {
 
   static size_t MaxThreads() {
     static const size_t value = [] {
-      size_t result = 32;
-      const char* text = std::getenv("DFKV_FANOUT_THREADS");
-      if (text && *text) {
-        char* end = nullptr;
-        const unsigned long parsed = std::strtoul(text, &end, 10);
-        if (end != text && *end == '\0' && parsed >= 1 && parsed <= 1024)
-          result = static_cast<size_t>(parsed);
-      }
+      envparse::U64Spec spec;
+      spec.legacy = envparse::Legacy::kFull;
+      spec.negative = envparse::Negative::kWraps;
+      spec.fallback = 32;
+      spec.min = 1;
+      spec.max = 1024;
+      const size_t result =
+          static_cast<size_t>(envparse::EnvU64("DFKV_FANOUT_THREADS", spec));
       config_dump::RecordResolved("DFKV_FANOUT_THREADS",
                                   std::to_string(result));
       return result;

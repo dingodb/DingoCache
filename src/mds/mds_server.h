@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "utils/env_parse.h"
 #include "mds/etcd_client.h"
 #include "utils/http_client.h"
 #include "common/status.h"
@@ -134,6 +135,22 @@ class UnwrittenMembers {
 // node). The MDS is the only etcd client; it holds each member's lease on the
 // node's behalf. The {key->leaseID} map is reconstructable from heartbeats, so
 // the MDS keeps no durable state. Liveness = the lease (TTL kTtlSeconds).
+// DFKV_MDS_FIRST_REQ_MS: the first-frame deadline of a connection, ms. 0
+// disables it; garbage or a negative value falls back to the default (it
+// must never DISABLE the safeguard); hard-clamped at 1 h so the accept+ms
+// deadline cannot wrap. Read with strtol and an errno check up to 2.38, so a
+// number that does not fit a long was the default too.
+inline long MdsFirstReqMsFromEnv() {
+  envparse::U64Spec spec;
+  spec.fallback = 30000;
+  spec.max = 3600000;
+  spec.above = envparse::Above::kClamp;
+  spec.legacy = envparse::Legacy::kFull;
+  spec.representable_max = envparse::kSignedMax;
+  spec.overflow_is_default = true;
+  return static_cast<long>(envparse::EnvU64("DFKV_MDS_FIRST_REQ_MS", spec));
+}
+
 // Open files the MDS needs to serve `max_conns` connections: each handler
 // holds its client socket and, while it works on a request, one socket to
 // etcd. The reserve is an estimate, about 128, for the listeners, the metrics

@@ -131,3 +131,49 @@ TEST(Args, MdsFlagFacadesAllAccepted) {
     EXPECT_EQ(args.Get(f, ""), "1") << "flag " << f << " lost its value";
   }
 }
+
+// A port outside 0..65535 used to be truncated by the socket call.
+TEST(Args, PortOutOfRangeIsAnError) {
+  for (const char* bad : {"70000", "65536", "-5", "8080x", "", "4294967297"}) {
+    Argv a({"prog", "--port", bad});
+    Args args(a.argc(), a.argv(), {"--port"});
+    EXPECT_EQ(args.GetPort("--port", 0), 0) << bad;
+    EXPECT_FALSE(args.ok()) << bad;
+  }
+  for (const char* good : {"0", "1", "65535", "8080"}) {
+    Argv a({"prog", "--port", good});
+    Args args(a.argc(), a.argv(), {"--port"});
+    EXPECT_EQ(args.GetPort("--port", 0), std::atoi(good));
+    EXPECT_TRUE(args.ok()) << good << ": " << args.error();
+  }
+  // The "off" default of an optional listener may be written out.
+  Argv a({"prog", "--metrics-port", "-1"});
+  Args args(a.argc(), a.argv(), {"--metrics-port"});
+  EXPECT_EQ(args.GetPort("--metrics-port", -1), -1);
+  EXPECT_TRUE(args.ok()) << args.error();
+  Args absent(1, a.argv(), {"--metrics-port"});
+  EXPECT_EQ(absent.GetPort("--metrics-port", -1), -1);
+  EXPECT_TRUE(absent.ok());
+}
+
+// strtol's long was cast to int, and strtoull negates a signed value.
+TEST(Args, IntegerOverflowAndNegativeUnsignedAreErrors) {
+  {
+    Argv a({"prog", "--n", "4294967297"});
+    Args args(a.argc(), a.argv(), {"--n"});
+    EXPECT_EQ(args.GetInt("--n", 3), 3);
+    EXPECT_FALSE(args.ok());
+  }
+  {
+    Argv a({"prog", "--n", "-7"});
+    Args args(a.argc(), a.argv(), {"--n"});
+    EXPECT_EQ(args.GetInt("--n", 3), -7);
+    EXPECT_TRUE(args.ok());
+  }
+  for (const char* bad : {"-1", " -1", "-0"}) {
+    Argv a({"prog", "--cap", bad});
+    Args args(a.argc(), a.argv(), {"--cap"});
+    EXPECT_EQ(args.GetU64("--cap", 9), 9u) << bad;
+    EXPECT_FALSE(args.ok()) << bad;
+  }
+}

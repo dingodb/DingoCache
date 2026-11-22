@@ -1,3 +1,4 @@
+#include "utils/env_parse.h"
 #include "common/config_dump.h"
 #include "mds/mds_server.h"
 
@@ -170,8 +171,8 @@ MdsServer::MdsServer(const std::string& etcd_addr, int etcd_timeout_ms,
       accept_legacy_(config_dump::EnvBool("DFKV_MDS_ACCEPT_LEGACY", false)),
       // DFKV_MDS_PROBE_CACHE_MS: /readyz probe debounce, default 2500 ms,
       // 0 disables caching (ProbeEtcdCached then behaves like ProbeEtcd).
-      // Clamped at 10 min: a negative env value wraps strtoull into ~2^64 and
-      // would pin /readyz on its first result for the process lifetime.
+      // Clamped at 10 min: a negative env value wraps into ~2^64 and would
+      // pin /readyz on its first result for the process lifetime.
       probe_cache_(std::min<uint64_t>(
                        config_dump::EnvU64("DFKV_MDS_PROBE_CACHE_MS", 2500),
                        600000),
@@ -220,9 +221,13 @@ Status MdsServer::Start(int port) {
   // with the descriptor limit here: a cap the process has no descriptors for
   // is not a cap, it is accept() and the etcd dials failing together.
   size_t max_conns = kDefaultMaxConns;
-  if (const char* v = std::getenv("DFKV_MDS_MAX_CONNS")) {
-    const long m = std::atol(v);
-    if (m > 0) max_conns = static_cast<size_t>(m);
+  {
+    envparse::U64Spec spec;
+    spec.legacy = envparse::Legacy::kPrefixOrZero;
+    spec.fallback = max_conns;
+    spec.min = 1;
+    spec.representable_max = envparse::kSignedMax;  // read with atol
+    max_conns = static_cast<size_t>(envparse::EnvU64("DFKV_MDS_MAX_CONNS", spec));
   }
   rlimit nofile{};
   if (::getrlimit(RLIMIT_NOFILE, &nofile) == 0) {
@@ -301,9 +306,13 @@ void MdsServer::AcceptLoop() {
   // returns false and the handler closes the conn (the client re-dials).
   // DFKV_MDS_IO_TIMEOUT_S tunes it (tests use 1).
   long tmo_s = 60;
-  if (const char* v = std::getenv("DFKV_MDS_IO_TIMEOUT_S")) {
-    const long t = std::atol(v);
-    if (t > 0) tmo_s = t;
+  {
+    envparse::U64Spec spec;
+    spec.legacy = envparse::Legacy::kPrefixOrZero;
+    spec.fallback = static_cast<uint64_t>(tmo_s);
+    spec.min = 1;
+    spec.representable_max = envparse::kSignedMax;  // read with atol
+    tmo_s = static_cast<long>(envparse::EnvU64("DFKV_MDS_IO_TIMEOUT_S", spec));
   }
   // First-frame ABSOLUTE deadline (DFKV_MDS_FIRST_REQ_MS, default 30000,
   // 0=disabled): the per-syscall SO_RCVTIMEO above only bounds ONE recv, so a
@@ -311,17 +320,7 @@ void MdsServer::AcceptLoop() {
   // thread forever. With the knob on, the first COMPLETE frame must arrive
   // within this budget counted from accept(); steady-state traffic is
   // untouched (plain per-syscall timeout, same as before).
-  long first_req_ms = 30000;
-  if (const char* v = std::getenv("DFKV_MDS_FIRST_REQ_MS")) {
-    errno = 0;
-    char* end = nullptr;
-    const long t = std::strtol(v, &end, 10);
-    // Strict full-string parse: garbage or a negative value falls back to the
-    // default (it must never silently DISABLE the safeguard); an explicit 0
-    // disables it. Hard-clamped at 1 h so the accept+ms deadline can't wrap.
-    if (errno == 0 && end != v && *end == '\0' && t >= 0)
-      first_req_ms = t > 3600000 ? 3600000 : t;
-  }
+  const long first_req_ms = MdsFirstReqMsFromEnv();
   // Recorded from the accept thread's prologue (runs at Start, before main
   // reaches Emit after its network etcd probe) so the dump shows these defaults.
   config_dump::RecordResolved("DFKV_MDS_IO_TIMEOUT_S", std::to_string(tmo_s));

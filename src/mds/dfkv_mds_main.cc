@@ -41,8 +41,8 @@ int main(int argc, char** argv) {
                    "--etcd-probe-ms"});
   std::string etcd = args.Get("--etcd", "127.0.0.1:2379");
   std::string metrics_bind = args.Get("--metrics-bind", "");
-  int port = args.GetInt("--listen", 0);
-  int metrics_port = args.GetInt("--metrics-port", -1);
+  int port = args.GetPort("--listen", 0);
+  int metrics_port = args.GetPort("--metrics-port", -1);
   // etcd probe window: flag wins over a pre-set DFKV_MDS_ETCD_PROBE_MS.
   std::string etcd_probe_ms = args.Get("--etcd-probe-ms", "");
   if (!etcd_probe_ms.empty()) ::setenv("DFKV_MDS_ETCD_PROBE_MS", etcd_probe_ms.c_str(), 1);

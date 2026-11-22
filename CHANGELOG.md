@@ -2,6 +2,57 @@
 
 ## Unreleased
 
+- Configuration: a mistyped setting of `dfkv_server` or `dfkv_mds` is no
+  longer read as something else without a word. Numbers were parsed in
+  several ways, most of them with `strtol`/`atoi` and little checking: a
+  value that is not a number read as 0, a negative one wrapped, text after
+  the number was dropped, an out-of-range port was truncated. The rule of
+  this change:
+  - ENVIRONMENT values (and the flags that are passed on as their variable):
+    nothing changes its effective value. Every input that starts a server
+    today resolves to exactly what it resolved to before. What is new is
+    one WARN per variable and process for every value that is not a plain
+    decimal number in range, or not `1`/`0` for a switch, naming the
+    variable, the value and what is used: `invalid NAME='v': ...; using N as
+    before`, `...; using the default D`, or `NAME='v' clamped to the maximum
+    M`. After an upgrade, `grep -E "invalid DFKV_|clamped to the maximum"`
+    in the start-up log finds what to clean up. A later release will read
+    these by their meaning or reject them; `docs/DEPLOY.md` §3b has the
+    table of inputs that are accepted with a WARN until then. The ones most
+    worth looking for: an empty or non-numeric
+    `DFKV_RAM_ACK_HIGH_WATERMARK_PCT` or `DFKV_RAM_RECLAIM_MS` reads as 0
+    (acknowledge from disk; no background reclaim); a non-numeric or
+    negative `DFKV_RDMA_IDLE_MS` reads as 0 (no idle reaper); `off`, `false`
+    and `no` switch `DFKV_READ_COALESCE`, `DFKV_RDMA_NUMA`,
+    `DFKV_SERVER_URING` and `DFKV_SLAB_URING_WRITE` ON, because only `0` is
+    off for them; `DFKV_RAM_TIER=ON` leaves the RAM tier off, because its
+    words are lower case; `64G` is 64.
+  - `--log` / `DFKV_LOG` take the level in any case. `--log WARN`, the
+    spelling `--help` gives, was read as INFO. This is the one environment
+    value whose effect changes: a level that was asked for now applies.
+    This reaches users of the client library too: a host process that has
+    had `DFKV_LOG=DEBUG` (or `Warn`, `ERROR`) set without effect now gets
+    debug lines on stderr (or only warnings, or only errors).
+  - COMMAND-LINE values that are parsed directly and were silently
+    truncated or wrapped now stop the start with exit 2: `--port`,
+    `--rdma-port`, `--metrics-port` and `dfkv_mds --listen` outside 0..65535
+    (`--port 70000` listened on 4464; an explicit `-1` for the optional
+    listeners still means off), a negative `--cap` or `--max-msg` (`--cap
+    -1` was 2^64-1), an integer that does not fit an int (4294967297 was 1),
+    and a `dfkvctl --stat-port` that is not a port in 1..65535 (it was read
+    as "use the member's port"). `--mds` without `--id`/`--advertise` is
+    refused (exit 1, as before) before any disk is opened instead of after.
+    A start without `--dir` or `--cap` still uses the defaults but logs a
+    WARN. The values in the shipped Dockerfile and `deploy/` scripts are
+    unaffected.
+  Settings that already refused to start on a bad value (storage engine and
+  slab geometry, tenant quotas, the first-registration timeout) still do. No
+  setting is renamed and no default changes. All of this goes through one
+  parser, `src/utils/env_parse.h`, which the existing strict parsers now use
+  as well. The variables the client library shares with the server
+  (`DFKV_LOG`, `DFKV_RDMA_NUMA`, `DFKV_FANOUT_THREADS`, the payload limits)
+  are reported the same way there and never abort the host process; the
+  client-only variables are not part of this change.
 - Client RDMA: three kinds of failure that have nothing to do with a rail are
   no longer charged to one.
   - The TCP connect to a peer's bootstrap address fails (node down, listener
