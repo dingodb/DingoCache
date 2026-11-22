@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 
+#include "cache/retention_stats.h"
 #include "common/kv_types.h"
 #include "common/status.h"
 
@@ -382,6 +383,12 @@ class StoreEngine {
   virtual uint32_t RetainMaxTtl() const { return 0; }
   // The largest value this engine can ever store; a larger PUT is kInvalid.
   virtual uint64_t MaxValueBytes() const { return UINT64_MAX; }
+
+  // Engine-neutral views, so that the disk group and the metrics need not know
+  // which engine a disk runs. EngineName: "slab", "file", ...; the name the
+  // per-disk engine metric reports.
+  virtual const char* EngineName() const { return "unknown"; }
+  virtual RetentionStats GetRetentionStats() const { return {}; }
 };
 
 }  // namespace dfkv

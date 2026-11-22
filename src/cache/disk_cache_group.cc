@@ -16,6 +16,7 @@
 #include <thread>
 
 #include "cache/disk_slab_store.h"
+#include "cache/store_dir_class.h"
 #include "common/config_dump.h"
 #include "utils/log.h"
 #include "utils/parallel_for.h"
@@ -165,12 +166,84 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
     const char* value = std::getenv("DFKV_STORE_ENGINE");
     engine = (value && *value) ? value : "slab";
   }
-  if (engine != "file" && engine != "slab") {
+  if (engine != "file" && engine != "slab" && engine != "auto" &&
+      engine != "log") {
     fail("DFKV_STORE_ENGINE must be 'file' or 'slab'");
     return;
   }
-  engine_ = engine;
-  const bool use_slab = engine == "slab";
+  if (engine == "auto" || engine == "log") {
+    const char* experimental = std::getenv("DFKV_LSE_EXPERIMENTAL");
+    if (experimental == nullptr || std::strcmp(experimental, "1") != 0) {
+      fail("DFKV_STORE_ENGINE=" + engine +
+           " is experimental (the log-structured engine is under "
+           "construction); it needs DFKV_LSE_EXPERIMENTAL=1");
+      return;
+    }
+  }
+  // The engine of each disk. "auto" and "log" decide it per directory from
+  // what the directory holds (docs/design/log-structured-engine.md §10.1);
+  // "slab" and "file" use one engine for every disk and leave the checks to
+  // the engine, as they always did.
+  std::vector<std::string> disk_engine(opt.cache_dirs.size(), engine);
+  if ((engine == "auto" || engine == "log") && !opt.engine_factory) {
+    for (size_t i = 0; i < opt.cache_dirs.size(); ++i) {
+      const std::string& dir = opt.cache_dirs[i];
+      StoreDirClassification found;
+      std::string error;
+      if (!ClassifyStoreDir(dir, &found, &error)) {
+        fail(error);
+        return;
+      }
+      std::string names;
+      for (const auto& name : found.deciding)
+        names += (names.empty() ? "" : ", ") + name;
+      const std::string why =
+          dir + " holds " + StoreDirClassName(found.cls) + " data (" +
+          names + ")";
+      switch (found.cls) {
+        case StoreDirClass::kEmpty:
+          // Until the log engine is accepted, an empty directory under
+          // "auto" gets the slab engine, the default.
+          disk_engine[i] = engine == "log" ? "log" : "slab";
+          break;
+        case StoreDirClass::kSlab:
+        case StoreDirClass::kFile:
+          if (engine == "log") {
+            fail("DFKV_STORE_ENGINE=log, but " + why +
+                 "; empty the directory or use another one");
+            return;
+          }
+          disk_engine[i] =
+              found.cls == StoreDirClass::kSlab ? "slab" : "file";
+          break;
+        case StoreDirClass::kLog:
+          disk_engine[i] = "log";
+          break;
+        case StoreDirClass::kConflict:
+        case StoreDirClass::kForeign:
+          fail("cannot choose a storage engine: " + why +
+               "; inspect the files, nothing was changed");
+          return;
+      }
+      if (disk_engine[i] == "log" && found.lost_found_in_use) {
+        fail("cannot open " + dir + " with the log-structured engine: its "
+             "lost+found holds files (or cannot be listed); inspect them, "
+             "nothing was changed");
+        return;
+      }
+      if (disk_engine[i] == "log") {
+        fail(dir + ": the log-structured engine is not built yet");
+        return;
+      }
+    }
+  }
+  engine_ = disk_engine.empty() ? engine : disk_engine.front();
+  for (const auto& name : disk_engine)
+    if (name != engine_) engine_ = "mixed";
+  has_slab_ = std::find(disk_engine.begin(), disk_engine.end(), "slab") !=
+              disk_engine.end();
+  // Whether slab settings are read and checked: some disk may be slab.
+  const bool use_slab = has_slab_;
 
   int disk_weight = 1;
   if (!ResolveDiskHashWeight(&disk_weight)) {
@@ -288,7 +361,7 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
     try {
       if (opt.engine_factory) {
         opened[i].store = opt.engine_factory(dir, disk_capacity);
-      } else if (use_slab) {
+      } else if (disk_engine[i] == "slab") {
         DiskSlabStore::Options so;
         so.dir = dir;
         so.capacity_bytes = disk_capacity;
@@ -356,6 +429,7 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
       return;
     }
     std::unique_ptr<StoreEngine> store = std::move(opened[i].store);
+    slab_of_disk_.push_back(opened[i].slab);
     if (opened[i].slab) {
       slabs_.push_back(opened[i].slab);
       if (!opened[i].slab->DirectWritesActive()) write_mode_ = "buffered";
@@ -569,8 +643,11 @@ uint32_t DiskCacheGroup::RetainMaxTtl() const {
 SlabAllocator::RetentionStats DiskCacheGroup::RetentionStats() const {
   SlabAllocator::RetentionStats sum;
   bool first = true;
-  for (const auto* d : slabs_) {
-    const auto st = d->RetentionStats();
+  for (size_t i = 0; i < disks_.size(); ++i) {
+    // With slab disks on the node, theirs: the other engines keep no
+    // retention, and would report it disabled with no TTL.
+    if (!slabs_.empty() && slab_of_disk_[i] == nullptr) continue;
+    const auto st = disks_[i]->GetRetentionStats();
     sum.enabled = first ? st.enabled : (sum.enabled && st.enabled);
     sum.budget_bytes += st.budget_bytes;
     sum.protected_bytes += st.protected_bytes;

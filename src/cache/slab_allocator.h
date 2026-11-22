@@ -20,6 +20,7 @@
 #ifndef DFKV_SLAB_ALLOCATOR_H_
 #define DFKV_SLAB_ALLOCATOR_H_
 
+#include "cache/retention_stats.h"
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -155,19 +156,7 @@ class SlabAllocator {
   // in one bucket, and every operation on the store waits for this lock.
   size_t ExpireRetention(uint32_t now_s, size_t max_entries = SIZE_MAX,
                          bool* more = nullptr);
-  struct RetentionStats {
-    bool enabled = false;
-    uint64_t budget_bytes = 0;
-    uint64_t protected_bytes = 0;
-    uint64_t protected_slots = 0;
-    uint64_t extents_pinned = 0;   // extents holding >= 1 protected resident
-    uint64_t expired = 0;
-    uint64_t evict_skipped = 0;
-    uint64_t wheel_entries = 0;
-    uint32_t max_ttl_s = 0;
-    uint32_t headroom_pct = 0;
-    uint64_t results[7] = {0, 0, 0, 0, 0, 0, 0};  // by RetainCode
-  };
+  using RetentionStats = ::dfkv::RetentionStats;
   RetentionStats GetRetentionStats() const;
   uint32_t RetentionHeadroomPct() const;
 

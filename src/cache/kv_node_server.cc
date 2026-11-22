@@ -788,6 +788,14 @@ std::string KvNodeServer::MetricsText() const {
   for (size_t i = 0; i < group_.DiskCount(); ++i)
     s += "dfkv_disk_objects" + braces("disk=\"" + PromLabelEscape(group_.DiskPath(i)) + "\"") + " " +
          std::to_string(group_.DiskObjects(i)) + "\n";
+  s += "# HELP dfkv_disk_engine_info Storage engine of each backing disk (constant 1)\n";
+  s += "# TYPE dfkv_disk_engine_info gauge\n";
+  for (size_t i = 0; i < group_.DiskCount(); ++i)
+    s += "dfkv_disk_engine_info" +
+         braces("disk=\"" + PromLabelEscape(group_.DiskPath(i)) +
+                "\",engine=\"" + PromLabelEscape(group_.DiskEngineName(i)) +
+                "\"") +
+         " 1\n";
   // sampled op latency histograms (op label merged with identity); one HELP/TYPE,
   // two label sets (get/put).
   {
@@ -803,7 +811,7 @@ std::string KvNodeServer::MetricsText() const {
   // Slab engine internals, emitted only for slab so a file-engine scrape is
   // unchanged. The dio_*_fallback counters are the "page cache silently crept
   // back in" alarm for direct-mode deployments.
-  if (group_.EngineName() == "slab") {
+  if (group_.HasSlabDisks()) {
     // Per-disk observations must not conflate independent high-water crossings.
     auto header = [&](const char* name, const char* type, const char* help) {
       s += "# HELP "; s += name; s += " "; s += help; s += "\n";
@@ -819,6 +827,9 @@ std::string KvNodeServer::MetricsText() const {
     header("dfkv_slab_disk_watermark_last_high_bytes", "gauge", "Latest direct above-high predicate input before eviction");
     header("dfkv_slab_disk_watermark_peak_high_bytes", "gauge", "Lifetime maximum of sampled above-high inputs; never phase qualification alone");
     for (size_t i = 0; i < group_.DiskCount(); ++i) {
+      // On a node whose disks run different engines, only slab disks have
+      // these: no zero samples for the others.
+      if (group_.DiskEngineName(i) != "slab") continue;
       const auto st = group_.DiskWatermarkObservation(i);
       const std::string labels =
           "disk=\"" + PromLabelEscape(group_.DiskPath(i)) +

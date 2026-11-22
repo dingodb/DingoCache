@@ -96,6 +96,7 @@ class KVStore : public StoreEngine {
   // PUTs that hit a real ENOSPC, force-evicted, and retried successfully.
   uint64_t EnospcEvictions() const { return enospc_evictions_.load(std::memory_order_relaxed); }
   const std::string& Dir() const override { return opt_.cache_dir; }
+  const char* EngineName() const override { return "file"; }
 
   // Test-only write override shared by Cache and CacheDirect. It reports errno
   // so both paths can exercise the same bounded ENOSPC force-evict + retry.

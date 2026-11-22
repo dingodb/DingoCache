@@ -139,6 +139,7 @@ dfkvctl stat <ip:port>                        # 单节点原始 /metrics 文本�
 | `dfkv_errors_total{op,status}` | counter | 失败 op（put/get io、invalid） |
 | `dfkv_objects` / `dfkv_used_bytes` / `dfkv_disks` | gauge | 对象数 / 占用 / 盘数 |
 | `dfkv_disk_used_bytes{disk}` / `dfkv_disk_objects{disk}` | gauge | 每盘占用 / 对象 |
+| `dfkv_disk_engine_info{disk,engine}` | gauge | 恒为 1：每块盘实际运行的存储引擎（`slab`、`file`）。`DFKV_STORE_ENGINE=auto`（实验性）按目录选引擎时，各盘可能不同 |
 | `dfkv_tenant_default_quota_bytes` | gauge | 本节点未显式列出 tenant 的 quota；0=无限 |
 | `dfkv_tenant_quota_rejections_total` | counter | 本节点所有 tenant 的 `kQuotaExceeded` item 总数 |
 | `dfkv_tenant_quota_limit_bytes{tenant_hash}` | gauge | 配置文件中该 16 位小写 hex tenant hash 的 per-node limit；0=无限 |
@@ -264,7 +265,7 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_watermark_max_victims_per_tick` / `dfkv_slab_watermark_max_visits_per_tick` | gauge | 每盘每 tick 的 slot 移除上限 / 扫描上限；替代旧 max-extents gauge |
 | `dfkv_slab_watermark_slot_record_clears_total` / `dfkv_slab_watermark_record_clear_bytes_total` | counter | 全局回收成功的单 slot tombstone 写入数 / 单 slot 与整 extent 元数据写入字节；不代表同步持久化或物理写放大 |
 | `dfkv_slab_watermark_freed_slot_bytes_total` / `dfkv_slab_watermark_scan_visits_total` | counter | 全局回收释放的分配字节 / 扫描位置次数 |
-| `dfkv_slab_disk_run_epoch` / `dfkv_slab_disk_capacity_bytes` | gauge | 按 `disk`、`disk_index` 标记的运行 epoch / 容量 |
+| `dfkv_slab_disk_run_epoch` / `dfkv_slab_disk_capacity_bytes` | gauge | 按 `disk`、`disk_index` 标记的运行 epoch / 容量；各盘引擎不同时只列 slab 盘 |
 | `dfkv_slab_disk_watermark_high_bytes` / `dfkv_slab_disk_watermark_low_bytes` / `dfkv_slab_disk_reclaim_interval_ms` / `dfkv_slab_disk_watermark_active` | gauge | 每盘解析后的水位、回收周期及活跃状态 |
 | `dfkv_slab_disk_watermark_high_observations_total` | counter | 每盘回收线程实际观察到 used > high 的次数；不等于回收次数 |
 | `dfkv_slab_disk_watermark_last_high_bytes` / `dfkv_slab_disk_watermark_peak_high_bytes` | gauge | 最近 / 本次运行最大超高水位观察值；历史 peak 不能单独证明新阶段跨水位 |
