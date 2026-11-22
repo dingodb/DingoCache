@@ -779,6 +779,7 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
   for (const auto* d : slabs_) {
     const auto st = d->GetStats();
     sum.dio_write_fallbacks += st.dio_write_fallbacks;
+    sum.put_no_slot += st.put_no_slot;
     sum.dio_read_fallbacks += st.dio_read_fallbacks;
     sum.table_syncs += st.table_syncs;
     sum.bind_wipes += st.bind_wipes;

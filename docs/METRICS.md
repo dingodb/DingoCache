@@ -248,6 +248,7 @@ client pull READ/release 与 server exact-grant/pin 指标。
 slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际引擎判定，不设 flag/env 的默认也命中；file 引擎无此系列）：
 | 指标 | 类型 | 含义 |
 |------|------|------|
+| `dfkv_slab_put_no_slot_total` | counter | 盘层因分配不到槽而以 `kCacheFull` 拒绝的写入：既有客户端 PUT，也有 RAM 层向盘刷写的每一次尝试（重试各算一次）。分配不到槽指该 size class 的槽全部被在途读写 pin 住或被留存（`DFKV_RETAIN_*`）保护，也没有可以挪用的 extent；分配器极少见的索引插入失败也计入这里。节点是健康的，客户端把被拒的 PUT 算作未存、不冷却节点；2.38 及更早版本这里返回 `kIOError`，会被客户端当成节点故障。持续升高说明留存预算或并发占满了某个 size class |
 | `dfkv_slab_dio_write_fallback_total` / `dfkv_slab_dio_read_fallback_total` | counter | direct 模式下回退 buffered 的写/读——**非零升高 = page cache 悄悄回来了**（对齐条件被破坏），direct 部署重点盯 |
 | `dfkv_slab_table_sync_total` | counter | slots.tbl fdatasync 周期数（`DFKV_SLAB_TABLE_SYNC_MS`，默认 100ms；限定崩溃复活毒化窗口） |
 | `dfkv_slab_extent_steals_total` / `dfkv_slab_extent_returns_total` | counter | 跨 class extent 抢占（伴随驱逐，容量失衡信号）/ 全空 extent 主动回池（无损再平衡） |

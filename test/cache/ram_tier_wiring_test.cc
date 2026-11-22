@@ -54,6 +54,15 @@ class DiskSlabStoreTestPeer {
                                   std::function<bool()> hook) {
     store->payload_write_hook_for_test_ = std::move(hook);
   }
+  // A read or write in flight holds its slot like this.
+  static bool PinSlot(DiskSlabStore* store, const BlockKey& key) {
+    std::lock_guard<std::mutex> lock(store->mu_);
+    return store->alloc_->Pin(key);
+  }
+  static bool UnpinSlot(DiskSlabStore* store, const BlockKey& key) {
+    std::lock_guard<std::mutex> lock(store->mu_);
+    return store->alloc_->Unpin(key);
+  }
 };
 }  // namespace dfkv
 
@@ -1462,6 +1471,61 @@ TEST(RamTierWiring, AServerWhoseDiskCannotBeActivatedRefusesToStart) {
     fs::remove_all(dir);
     fs::remove_all(dir.string() + "_tokens");
   }
+}
+
+// A disk on which nothing can be evicted (every slot held by an operation in
+// flight): the server answers a PUT with kCacheFull on the request path the
+// TCP handler and the RDMA handler share, and on the direct-write path of
+// RDMA; it does not count an I/O error, and it stays healthy. Clients mark a
+// node bad on kIOError only.
+TEST(RamTierWiring, APutTheDiskHasNoSlotForIsCacheFullNotAnIoError) {
+  const auto dir = fs::temp_directory_path() / "dfkv_ramwire_no_slot";
+  fs::remove_all(dir);
+  fs::remove_all(dir.string() + "_tokens");
+  DiskSlabStore* slab = nullptr;
+  // The store comes from the factory, so the group renders no per-slab
+  // metrics for it; the store is asked directly below.
+  DiskCacheGroup::Options options{{dir.string()}, 4 * 4096, "slab"};
+  options.engine_factory =
+      [&](const std::string& path, uint64_t) -> std::unique_ptr<StoreEngine> {
+    auto store_options = CancelSlab(path);
+    store_options.capacity_bytes = 4 * 4096;  // one extent, four slots
+    store_options.extent_bytes = 4 * 4096;
+    store_options.reclaim_interval_ms = 0;
+    auto store = std::make_unique<DiskSlabStore>(store_options);
+    slab = store.get();
+    return store;
+  };
+  auto server = KvNodeServerWiringTestPeer::Create(std::move(options));
+  ASSERT_TRUE(server->Healthy());
+  ASSERT_NE(slab, nullptr);
+  std::string value(4000, 'n');
+  auto put = [&](uint64_t id) {
+    std::string out;
+    return server->ProcessRequestForKey(
+        static_cast<uint8_t>(WireOp::kCache), BlockKey{id, 5}, 0, 0,
+        value.data(), value.size(), &out);
+  };
+  for (uint64_t id = 0; id < 4; ++id) {
+    ASSERT_EQ(put(id), Status::kOk);
+    ASSERT_TRUE(DiskSlabStoreTestPeer::PinSlot(slab, BlockKey{id, 5}));
+  }
+  EXPECT_EQ(put(10), Status::kCacheFull);
+  EXPECT_EQ(server->CacheDirectForKey(BlockKey{11, 5}, value.data(),
+                                      value.size(), value.size()),
+            Status::kCacheFull);
+  EXPECT_TRUE(server->Healthy());
+  EXPECT_EQ(slab->GetStats().put_no_slot, 2u);
+  const std::string metrics = server->MetricsText();
+  EXPECT_NE(metrics.find("dfkv_errors_total{op=\"put\",status=\"io\"} 0"),
+            std::string::npos)
+      << "a full disk was counted as an I/O error";
+  for (uint64_t id = 0; id < 4; ++id)
+    DiskSlabStoreTestPeer::UnpinSlot(slab, BlockKey{id, 5});
+  EXPECT_EQ(put(10), Status::kOk);
+  server.reset();
+  fs::remove_all(dir);
+  fs::remove_all(dir.string() + "_tokens");
 }
 }  // namespace
 

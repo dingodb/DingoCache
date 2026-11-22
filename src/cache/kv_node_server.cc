@@ -805,6 +805,10 @@ std::string KvNodeServer::MetricsText() const {
            "Direct-mode PUTs that fell back to a buffered write", ss.dio_write_fallbacks);
     metric("dfkv_slab_dio_read_fallback_total", "counter",
            "Direct-mode aligned GETs that fell back to a buffered read", ss.dio_read_fallbacks);
+    metric("dfkv_slab_put_no_slot_total", "counter",
+           "Disk PUTs (client PUTs and RAM-tier flush attempts, retries "
+           "included) refused with kCacheFull for want of a slot",
+           ss.put_no_slot);
     metric("dfkv_slab_table_sync_total", "counter",
            "slots.tbl fdatasync cycles performed", ss.table_syncs);
     metric("dfkv_slab_extent_steals_total", "counter",
@@ -1212,6 +1216,8 @@ Status KvNodeServer::ProcessRequestForKey(
           bytes_written_.fetch_add(payload_len, std::memory_order_relaxed);
         } else if (st == Status::kIOError) {
           put_io_err_.fetch_add(1, std::memory_order_relaxed);
+        } else if (st == Status::kInvalid) {
+          invalid_ops_.fetch_add(1, std::memory_order_relaxed);
         }
       }
       if (samp) put_lat_.Observe(NowSec() - t0);
