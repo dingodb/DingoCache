@@ -3,6 +3,15 @@
 ## Unreleased
 
 
+- vLLM connector, pipeline parallelism: the scheduler's lookup checks the
+  objects of the first pipeline stage only, and this is now documented and
+  warned about. Each stage's cache groups list only its own layers, so the
+  other stages' objects are in namespaces of their own and rank 0 cannot
+  probe them. A prefix another stage has lost is admitted and that stage's
+  load fails; with `kv_load_failure_policy="fail"`, vLLM's default, the
+  request fails rather than recomputing. With PP > 1 and that policy the
+  connector now logs a warning at startup recommending `"recompute"`.
+
 - vLLM connector, object identity: `share_across_dp_sizes` (default off)
   leaves the data-parallel size out of the namespace and keys. Every DP
   replica writes the same bytes for a prefix (`dp_rank` is already -1 in

@@ -86,6 +86,14 @@ failed, rejected or cancelled LOAD with its own destination blocks only, never
 the blocks of the request's local prefix-cache hit: those are shared with other
 running requests, which vLLM would roll back too.
 
+With pipeline parallelism the scheduler's lookup, which runs on rank 0, checks
+the objects of the first pipeline stage only: each stage's cache groups list
+only its own layers, so the other stages' objects are in namespaces of their
+own. A prefix whose objects another stage has lost is admitted and that
+stage's load fails. With `kv_load_failure_policy="fail"` (vLLM's default) the
+request then fails; the connector warns at startup in that configuration. Use
+`kv_load_failure_policy="recompute"` with PP > 1.
+
 ## Environment variables (engine process)
 
 Read by `libdfkv.so` (the C client) and the connector, so set them in **every**
