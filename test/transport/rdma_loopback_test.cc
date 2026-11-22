@@ -1892,6 +1892,32 @@ TEST(RdmaLoopback, ExistManyWindowedMixedHitMiss) {
   }
 }
 
+// out_dev names the rails a call used. One rail for every key of a batch is
+// one name, not one "->name" per key.
+TEST(RdmaLoopback, RangeIntoMultiNamesEachRailOnce) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaNode node("rimdev");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  constexpr int kKeys = 8;
+  std::vector<BlockKey> keys;
+  std::vector<std::string> bufs(kKeys, std::string(4096, '\0'));
+  std::vector<RangeDstMulti> dsts(kKeys);
+  for (int i = 0; i < kKeys; ++i) {
+    const std::string v(4096, static_cast<char>('a' + i));
+    ASSERT_TRUE(c.Put("rim" + std::to_string(i), v.data(), v.size())) << i;
+    keys.push_back(ToBlockKey(SelfHdr(), "rim" + std::to_string(i)));
+    dsts[i].payloads.emplace_back(&bufs[i][0], bufs[i].size());
+  }
+  std::vector<size_t> lens;
+  std::string dev;
+  const auto sts = rt.RangeIntoMulti(node.addr, keys, dsts, &lens, &dev);
+  for (int i = 0; i < kKeys; ++i) ASSERT_EQ(sts[i], Status::kOk) << i;
+  EXPECT_FALSE(dev.empty());
+  EXPECT_EQ(dev.find("->"), std::string::npos)
+      << "one rail named once per key: " << dev;
+}
+
 TEST(RdmaLoopback, BatchExistMixedHitMiss) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   RdmaNode node("bex");

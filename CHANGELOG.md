@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Client, RDMA: the rail name a scatter-gather batch read reports (the
+  `dev` field of the per-node read statistics) no longer repeats the rail
+  once per key ("ib0->ib0->ib0..." for a batch of N keys on one rail). It
+  names the sequence of rails the call used.
 - vLLM connector: a request's SAVEs resume where its earlier steps left
   off. Each step enumerated the prefix from chunk 0, built every chunk's key
   and probed the existence of all of them, so a chunked prefill cost
