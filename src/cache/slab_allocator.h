@@ -83,6 +83,10 @@ class SlabAllocator {
   // per-class capacity floor for rebalance: a donor is never shrunk below its
   // striping width.
   static constexpr size_t kStripeWays = 8;
+  // An extent moves to another size class only if its residents are, on
+  // average, this many times longer unused than those of the extent the
+  // other class would lose first of its own.
+  static constexpr unsigned kStealAgeMargin = 2;
 
   explicit SlabAllocator(Options opt);
 
@@ -171,8 +175,10 @@ class SlabAllocator {
   // Pin for a read served from the slot: also gives the resident its CLOCK
   // reference bit, so the class hand passes it over once before it becomes a
   // victim again. Unlike Get/GetAndPin this moves nothing in the sweep order
-  // and feeds no class or extent read heat; it adds no work to Pin beyond
-  // that bit, which is stored only while clear.
+  // and feeds no read heat. It does record when the resident was last read,
+  // which is what whole-extent moves between size classes compare. Neither
+  // the bit nor the time is stored again by a repeated read: the bit while
+  // it is set, the time until the next admission moves the clock.
   bool PinForRead(const BlockKey& key, SlotHandle handle);
   bool Unpin(const BlockKey& key, SlotHandle handle);
 
@@ -218,6 +224,12 @@ class SlabAllocator {
                                  const std::vector<uint64_t>& delta,
                                  const std::vector<uint32_t>& extents,
                                  size_t hot);
+  // Moves the donor's least recently used extent (an empty one first) to
+  // `target_cls`, evicting its residents. False if the donor has no extent
+  // that may go: all pinned or protected, or even its least recently used
+  // one is not much colder (kStealAgeMargin) than the one `target_cls` would
+  // lose first of its own. The target then evicts from its own slots, and
+  // the donor is not cold for it, whatever its write demand says.
   bool StealFrom(size_t donor_cls, size_t target_cls,
                  std::vector<BlockKey>* evicted);
 
@@ -371,6 +383,11 @@ class SlabAllocator {
   // Steal-victim order: empty first, then oldest mean resident access, then
   // coldest read heat, then fewest useful bytes.
   bool StealsBeforeLocked(const ExtentMeta& a, const ExtentMeta& b) const;
+  // Whether `donor` may go to the class that owns `own` (that class's least
+  // recently used extent): its residents' mean age is more than
+  // kStealAgeMargin times that of `own`. See the definition.
+  bool MuchColderLocked(const ExtentMeta& donor, const ExtentMeta& own) const;
+  int LeastRecentlyUsedExtentLocked(size_t cls) const;
 
   void ProtectLocked(uint32_t meta_index);
   void UnprotectLocked(uint32_t meta_index);

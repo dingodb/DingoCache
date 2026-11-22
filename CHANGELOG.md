@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+- Server, RAM tier and slab disks: whole extents now move between size
+  classes toward the data that is used, not away from the class that is not
+  written. Two paths move an extent from one size class to another and
+  evict everything on it: the background growth of a class that is short of
+  free slots, and the cold steal an admission tries before it evicts from
+  its own class. Both judged "cold" by writes alone: the growth picked a
+  donor class by the bytes written to it in the last tick, the cold steal
+  by how long ago an extent was last written. Reads only ordered the
+  candidates, and in the RAM tier not even that, because its reads recorded
+  nothing but the per-slot reference bit. With one model's pages written
+  and then only read while another page size was being written, the first
+  lost extents until it was at its floor of 8 (growth) or had none left
+  (cold steal); and two classes written in turns handed the same extents
+  back and forth.
+  - A donor's extent is now taken only if its residents are much colder
+    than what the growing class would otherwise evict of its own: the mean
+    time since they were last read or written must be more than twice that
+    of the growing class's own least recently used extent (among those it
+    could lose: not one with a pinned slot or a retained value). Otherwise
+    the growing class evicts from its own slots. Two steals inside an
+    admission make no such comparison, as before: the one that brings a
+    class with fewer than 8 extents up to 8, and the last resort when the
+    class has neither a free slot nor anything of its own to evict.
+  - After a restart, restored values carry no access time, so a growing
+    class takes no extent from another until its own least recently used
+    extent holds values written since the restart, about one turnover of
+    that class. On a disk behind a RAM tier, recency sees only the reads
+    the RAM tier misses.
+  - So a class that is read and not written keeps its extents against a
+    class that is only written; a class that is read less than a newer one
+    is used still gives way to it, down to the same floors as before; and
+    classes of about the same age no longer trade extents.
+  - RAM-tier reads now record when a slot was last read. This costs no
+    additional lock and touches no memory a read did not already write: the
+    time goes into the slot and extent records that the read's pin updates
+    anyway, and it is stored again only after an admission has moved the
+    allocator's clock.
+  - Unchanged: the order of eviction inside a class, the 8-extent floor of
+    a donor in the background growth, the write-age gate of the cold steal
+    (`DFKV_SLAB_COLD_STEAL_WINDOW`), and a class that is neither read nor
+    written, which gives its extents as before.
+  See `docs/ARCHITECTURE.md`.
 - Server, RAM tier: a failed flush to disk is handled less rigidly, and a
   node no longer acknowledges PUTs it can never store. Until now a flush
   that failed was tried three times within microseconds, then the object

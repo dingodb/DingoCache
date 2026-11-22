@@ -2221,3 +2221,343 @@ TEST(SlabAllocatorRestoreEquivalence, TwoKeysWithOneHashAreTwoKeys) {
       SlabAllocatorTestPeer::ReferenceRestore(&refused.reference, entries));
   EXPECT_EQ(SlabAllocatorTestPeer::Dump(refused.restore), before);
 }
+
+// ---- Whole extents follow the data that is used ----------------------------
+//
+// Two paths move a whole extent (and evict everything on it) from one size
+// class to another that is being written: the background GROW of the tiers'
+// reclaim tick (ColdestGrowDonor names a class by write demand, StealFrom
+// takes an extent from it) and the cold steal inside Put. Both used to judge
+// "cold" by writes alone, so a class that everybody reads and nobody writes
+// lost its extents. Now an extent goes only if its residents are much colder
+// than what the growing class would evict of its own.
+//
+// The scenarios run with two classes on 24 extents: A (4 KiB slots, 16 per
+// extent) starts with 16 extents, B (16 KiB slots, 4 per extent) with its
+// floor of 8. The disk tier reads through Get, the RAM tier through
+// PinForRead; both are run.
+namespace {
+enum class ReadStyle { kDiskGet, kRamPinForRead };
+const ReadStyle kBothStyles[] = {ReadStyle::kDiskGet,
+                                 ReadStyle::kRamPinForRead};
+const char* StyleName(ReadStyle style) {
+  return style == ReadStyle::kDiskGet ? "disk-tier reads (Get)"
+                                      : "RAM-tier reads (PinForRead)";
+}
+
+constexpr uint32_t kHeatExtents = 24;
+
+struct HeatClass {
+  size_t slot_size = 0;
+  uint64_t tag = 0;  // digest_lo of this class's keys
+  uint64_t next = 0;
+  std::map<uint64_t, SlabAllocator::SlotHandle> live;
+  size_t evicted = 0;
+};
+
+struct HeatScenario {
+  explicit HeatScenario(ReadStyle read_style)
+      : style(read_style), a(Opts(64 << 10, kHeatExtents)) {
+    a.ConfigureRetention(RetainOpts(1 << 20, 3600), kT0);
+    A.slot_size = 4096;
+    A.tag = 1;
+    B.slot_size = 16384;
+    B.tag = 2;
+    // A takes every extent, then B takes its floor of kStripeWays extents
+    // from A's oldest (that part is by design and not what is measured).
+    for (uint64_t i = 0; i < kHeatExtents * 16; ++i) Put(A);
+    for (int i = 0; i < 32; ++i) Put(B);
+    const auto classes = a.Classes();
+    last_puts.assign(classes.size(), 0);
+    for (size_t c = 0; c < classes.size(); ++c) last_puts[c] = classes[c].puts;
+    A.evicted = B.evicted = 0;
+    moved = 0;
+    a_extents_at_start = Extents(A);
+    b_extents_at_start = Extents(B);
+  }
+  void Forget(const std::vector<BlockKey>& evicted) {
+    for (const BlockKey& key : evicted) {
+      HeatClass& cls = key.digest_lo == A.tag ? A : B;
+      if (cls.live.erase(key.digest_hi) != 0) ++cls.evicted;
+    }
+  }
+  void Put(HeatClass& cls) {
+    const BlockKey key{cls.next, cls.tag, 0};
+    SlotRef ref;
+    SlabAllocator::SlotHandle handle;
+    std::vector<BlockKey> evicted;
+    ASSERT_TRUE(a.Put(key, cls.slot_size, &ref, &evicted, &handle));
+    cls.live[cls.next++] = handle;
+    Forget(evicted);
+  }
+  void Read(const HeatClass& cls, uint64_t id) {
+    const BlockKey key{id, cls.tag, 0};
+    if (style == ReadStyle::kDiskGet) {
+      SlotRef ref;
+      ASSERT_TRUE(a.Get(key, &ref));
+    } else {
+      const auto handle = cls.live.at(id);
+      ASSERT_TRUE(a.PinForRead(key, handle));
+      ASSERT_TRUE(a.Unpin(key, handle));
+    }
+  }
+  // One round of traffic, in an order drawn from a fixed seed so that reads
+  // of the two classes and the writes are mixed as real traffic mixes them
+  // (a class read wholly after the other would look younger than it is):
+  // every `a_one_in`-th resident of A and every `b_one_in`-th of B is read
+  // once (0 = none; the part read rotates with `round`), and `writes` new
+  // values are admitted to `writer`.
+  void Round(int round, size_t a_one_in, size_t b_one_in, HeatClass* writer,
+             int writes) {
+    struct Op {
+      HeatClass* cls;
+      uint64_t id;
+      bool write;
+    };
+    std::vector<Op> ops;
+    auto reads = [&](HeatClass& cls, size_t one_in) {
+      if (one_in == 0) return;
+      size_t n = 0;
+      for (const auto& [id, handle] : cls.live) {
+        (void)handle;
+        if (n++ % one_in == static_cast<size_t>(round) % one_in)
+          ops.push_back({&cls, id, false});
+      }
+    };
+    reads(A, a_one_in);
+    reads(B, b_one_in);
+    for (int i = 0; i < writes; ++i) ops.push_back({writer, 0, true});
+    // Shuffled by hand: std::shuffle draws its numbers in a way that is left
+    // to the standard library, and the assertions below are exact.
+    for (size_t i = ops.size(); i > 1; --i)
+      std::swap(ops[i - 1], ops[static_cast<size_t>(rng() % i)]);
+    for (const Op& op : ops) {
+      if (op.write)
+        Put(*op.cls);
+      else if (op.cls->live.count(op.id) != 0)  // not evicted meanwhile
+        Read(*op.cls, op.id);
+    }
+  }
+  // What a tier's reclaim tick does for every class that was written since
+  // the last tick and is short of free slots: up to `max_extents` whole
+  // extents from the donor ColdestGrowDonor names.
+  void GrowTick() {
+    const size_t max_extents = style == ReadStyle::kDiskGet ? 2 : 8;
+    const auto classes = a.Classes();
+    std::vector<uint64_t> delta(classes.size(), 0);
+    std::vector<uint32_t> extents(classes.size(), 0);
+    for (size_t c = 0; c < classes.size(); ++c) {
+      delta[c] = classes[c].puts - last_puts[c];
+      last_puts[c] = classes[c].puts;
+      extents[c] = classes[c].extents;
+    }
+    for (size_t hot = 0; hot < classes.size(); ++hot) {
+      if (delta[hot] == 0) continue;
+      const size_t want = std::max<size_t>(64, 2 * delta[hot]);
+      if (classes[hot].free_slots >= want) continue;
+      size_t taken = 0;
+      while (taken < max_extents) {
+        const size_t donor =
+            SlabAllocator::ColdestGrowDonor(classes, delta, extents, hot);
+        if (donor == classes.size()) break;
+        std::vector<BlockKey> evicted;
+        const bool ok = a.StealFrom(donor, hot, &evicted);
+        Forget(evicted);
+        if (!ok) {
+          extents[donor] = 0;
+          continue;
+        }
+        --extents[donor];
+        ++taken;
+        ++moved;
+      }
+    }
+  }
+  uint32_t Extents(const HeatClass& cls) const {
+    for (const auto& stat : a.Classes())
+      if (stat.slot_size == cls.slot_size) return stat.extents;
+    return 0;
+  }
+  // Extents that changed class since the scenario was set up, by either path.
+  uint64_t Moves() const { return moved + a.ColdSteals(); }
+  void Report(const char* what) const {
+    std::printf(
+        "EXTENT_MOVES %s, %s: A %u -> %u extents (%zu residents evicted), "
+        "B %u -> %u (%zu evicted); %llu by GROW, %llu cold steals\n",
+        what, StyleName(style), a_extents_at_start, Extents(A), A.evicted,
+        b_extents_at_start, Extents(B), B.evicted,
+        static_cast<unsigned long long>(moved),
+        static_cast<unsigned long long>(a.ColdSteals()));
+  }
+
+  ReadStyle style;
+  SlabAllocator a;
+  HeatClass A, B;
+  std::mt19937_64 rng{20261122};
+  std::vector<uint64_t> last_puts;
+  uint64_t moved = 0;
+  uint32_t a_extents_at_start = 0, b_extents_at_start = 0;
+};
+
+// The two paths are exercised separately: the GROW variant switches the
+// cold steal off, the other never runs a tick.
+enum class StealPath { kInlineColdSteal, kBackgroundGrow };
+const StealPath kBothPaths[] = {StealPath::kInlineColdSteal,
+                                StealPath::kBackgroundGrow};
+const char* PathName(StealPath path) {
+  return path == StealPath::kInlineColdSteal ? "inline cold steal"
+                                             : "background GROW";
+}
+struct ScopedColdSteal {
+  explicit ScopedColdSteal(StealPath path) {
+    const char* before = std::getenv("DFKV_SLAB_COLD_STEAL_WINDOW");
+    was_set = before != nullptr;
+    if (was_set) previous = before;
+    // Each path on its own, whatever the environment says: the cold steal
+    // off for the GROW variant, its window derived for the other.
+    if (path == StealPath::kBackgroundGrow)
+      ::setenv("DFKV_SLAB_COLD_STEAL_WINDOW", "0", 1);
+    else
+      ::unsetenv("DFKV_SLAB_COLD_STEAL_WINDOW");
+  }
+  ~ScopedColdSteal() {
+    if (was_set)
+      ::setenv("DFKV_SLAB_COLD_STEAL_WINDOW", previous.c_str(), 1);
+    else
+      ::unsetenv("DFKV_SLAB_COLD_STEAL_WINDOW");
+  }
+  bool was_set = false;
+  std::string previous;
+};
+}  // namespace
+
+// The finding. A is read all the time and never written; B is written and
+// never read. A keeps every extent: B's writes replace B's own residents.
+TEST(SlabAllocatorExtentMoves, AClassThatIsReadIsNotDrainedByOneThatIsWritten) {
+  for (const StealPath path : kBothPaths) {
+    for (const ReadStyle style : kBothStyles) {
+      SCOPED_TRACE(std::string(PathName(path)) + ", " + StyleName(style));
+      ScopedColdSteal cold_steal(path);
+      HeatScenario s(style);
+      ASSERT_EQ(s.a_extents_at_start, kHeatExtents - SlabAllocator::kStripeWays);
+      for (int round = 0; round < 64; ++round) {
+        s.Round(round, /*A*/ 1, /*B*/ 0, &s.B, 8);
+        if (path == StealPath::kBackgroundGrow) s.GrowTick();
+      }
+      s.Report("A read, B written");
+      EXPECT_EQ(s.Extents(s.A), s.a_extents_at_start);
+      EXPECT_EQ(s.A.evicted, 0u);
+      EXPECT_EQ(s.Moves(), 0u);
+    }
+  }
+}
+
+// The other failure a rule could have: freezing the layout. A is established
+// and read at a moderate rate (an eighth of it per round); B is new, written,
+// and all of it is read every round. B's data is used far more recently than
+// A's least used extent, so B grows beyond its floor at A's expense.
+TEST(SlabAllocatorExtentMoves, AHotterClassGrowsAtTheExpenseOfOneReadLess) {
+  for (const StealPath path : kBothPaths) {
+    for (const ReadStyle style : kBothStyles) {
+      SCOPED_TRACE(std::string(PathName(path)) + ", " + StyleName(style));
+      ScopedColdSteal cold_steal(path);
+      HeatScenario s(style);
+      for (int round = 0; round < 64; ++round) {
+        s.Round(round, /*A*/ 8, /*B*/ 1, &s.B, 8);
+        if (path == StealPath::kBackgroundGrow) s.GrowTick();
+      }
+      s.Report("A read a little, B written and read");
+      EXPECT_GT(s.Extents(s.B), s.b_extents_at_start);
+      EXPECT_LT(s.Extents(s.A), s.a_extents_at_start);
+      EXPECT_GT(s.Moves(), 0u);
+    }
+  }
+}
+
+// No ping-pong. Both classes are read in full every round and take turns
+// being written, eight rounds each. Neither is colder than the other by the
+// margin, so no extent changes hands, however often the writer changes.
+TEST(SlabAllocatorExtentMoves, EquallyUsedClassesDoNotTradeExtents) {
+  for (const StealPath path : kBothPaths) {
+    for (const ReadStyle style : kBothStyles) {
+      SCOPED_TRACE(std::string(PathName(path)) + ", " + StyleName(style));
+      ScopedColdSteal cold_steal(path);
+      HeatScenario s(style);
+      for (int round = 0; round < 128; ++round) {
+        HeatClass& writer = (round / 8) % 2 == 0 ? s.B : s.A;
+        s.Round(round, /*A*/ 1, /*B*/ 1, &writer, 8);
+        if (path == StealPath::kBackgroundGrow) s.GrowTick();
+      }
+      s.Report("both read, written in turns");
+      EXPECT_EQ(s.Moves(), 0u);
+      EXPECT_EQ(s.Extents(s.A), s.a_extents_at_start);
+      EXPECT_EQ(s.Extents(s.B), s.b_extents_at_start);
+    }
+  }
+}
+
+// What the growing class is measured against is an extent it could lose. B
+// holds one extent whose four residents are all under retention: nothing on
+// it can be evicted or stolen, and it only grows older. Compared with that
+// one, the unused class A would never be "much colder" and B would be left
+// evicting its own values for as long as the retention lasts. B's least
+// recently used extent among those it can lose is the comparison, and A
+// gives its extents as any unused class does.
+TEST(SlabAllocatorExtentMoves, AnExtentHeldByRetentionIsNotTheMeasure) {
+  for (const StealPath path : kBothPaths) {
+    for (const ReadStyle style : kBothStyles) {
+      SCOPED_TRACE(std::string(PathName(path)) + ", " + StyleName(style));
+      ScopedColdSteal cold_steal(path);
+      HeatScenario s(style);
+      // All residents of one of B's extents.
+      std::map<uint32_t, std::vector<uint64_t>> by_extent;
+      for (const auto& [id, handle] : s.B.live) {
+        (void)handle;
+        SlotRef ref;
+        ASSERT_TRUE(s.a.Get(BlockKey{id, s.B.tag, 0}, &ref));
+        by_extent[ref.extent].push_back(id);
+      }
+      const auto& held = by_extent.begin()->second;
+      ASSERT_EQ(held.size(), 4u);
+      for (uint64_t id : held)
+        ASSERT_EQ(s.a.Retain(BlockKey{id, s.B.tag, 0}, 3000, RetainMode::kSet,
+                             kT0)
+                      .code,
+                  RetainCode::kProtectedNew);
+      // A is read once, now, and never again: it and the retained extent
+      // start level and age together.
+      s.Round(0, /*A*/ 1, /*B*/ 0, &s.B, 0);
+      for (int round = 0; round < 128; ++round) {
+        s.Round(round, /*A*/ 0, /*B*/ 0, &s.B, 8);
+        if (path == StealPath::kBackgroundGrow) s.GrowTick();
+      }
+      s.Report("A unused, B written, one extent of B retained");
+      EXPECT_GT(s.Extents(s.B), s.b_extents_at_start);
+      EXPECT_LT(s.Extents(s.A), s.a_extents_at_start);
+      for (uint64_t id : held)
+        EXPECT_TRUE(s.a.Contains(BlockKey{id, s.B.tag, 0})) << "retained";
+    }
+  }
+}
+
+// A class that is neither written nor read is cold, and still gives its
+// extents to the one that is written: by GROW down to its floor, by the cold
+// steal without one, as before.
+TEST(SlabAllocatorExtentMoves, AnUnusedClassStillGivesItsExtents) {
+  for (const StealPath path : kBothPaths) {
+    for (const ReadStyle style : kBothStyles) {
+      SCOPED_TRACE(std::string(PathName(path)) + ", " + StyleName(style));
+      ScopedColdSteal cold_steal(path);
+      HeatScenario s(style);
+      for (int round = 0; round < 128; ++round) {
+        s.Round(round, /*A*/ 0, /*B*/ 0, &s.B, 8);
+        if (path == StealPath::kBackgroundGrow) s.GrowTick();
+      }
+      s.Report("A unused, B written");
+      if (path == StealPath::kBackgroundGrow)
+        EXPECT_EQ(s.Extents(s.A), SlabAllocator::kStripeWays);
+      else
+        EXPECT_LT(s.Extents(s.A), SlabAllocator::kStripeWays);
+    }
+  }
+}
