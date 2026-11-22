@@ -613,6 +613,9 @@ std::string KVClient::MetricsSnapshot() const {
     s += "# HELP dfkv_client_gpu_dedup_load_fence_failures_total Fetches not published to the GPU rendezvous because the device could not be synchronized\n";
     s += "# TYPE dfkv_client_gpu_dedup_load_fence_failures_total counter\n";
     s += "dfkv_client_gpu_dedup_load_fence_failures_total " + std::to_string(gd->load_fence_failures()) + "\n";
+    s += "# HELP dfkv_client_gpu_dedup_invalidate_stuck_total Invalidations that waited for one slot longer than the takeover age, or left a slot whose release can only end empty\n";
+    s += "# TYPE dfkv_client_gpu_dedup_invalidate_stuck_total counter\n";
+    s += "dfkv_client_gpu_dedup_invalidate_stuck_total " + std::to_string(gd->invalidate_stuck()) + "\n";
   }
   // MDS discovery / placement-ring health. An empty ring means every put/get
   // routes to nowhere and silently reports ok=0, so surface both the current
