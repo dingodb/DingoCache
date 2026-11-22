@@ -895,6 +895,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.kv_role = kv_role
         self.stored_requests: defaultdict[str, int] = defaultdict(int)
         self._save_generations: dict[str, int] = {}
+        # Per request: (save generation, {group: tokens}) -- how far this
+        # rank's chunks of each full-attention or window group are known
+        # stored (PUT or found). A SAVE starts each such group there instead
+        # of at chunk 0: the earlier chunks are neither keyed nor probed again.
+        # A chunk whose PUT failed holds the mark back, so a later step of the
+        # request still retries it.
+        self._saved_upto: dict[str, tuple[int, dict[int, int]]] = {}
         self._next_save_generation = 0
         self.enable_kv_event = enable_kv_event
         # Which request _handle_request is executing right now. Published under
@@ -993,6 +1000,26 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if req_id in self.stored_requests:
                 del self.stored_requests[req_id]
             self._save_generations.pop(req_id, None)
+            self._saved_upto.pop(req_id, None)
+
+    def _saved_marks(self, req_meta: ReqMeta) -> dict[int, int]:
+        with self.done_task_lock:
+            entry = self._saved_upto.get(req_meta.req_id)
+        if entry is None or entry[0] != req_meta.save_generation:
+            return {}
+        return dict(entry[1])
+
+    def _advance_saved_marks(self, req_meta: ReqMeta, marks: dict[int, int]) -> None:
+        with self.done_task_lock:
+            if self._save_generations.get(req_meta.req_id) != req_meta.save_generation:
+                return  # preempted or finished meanwhile
+            entry = self._saved_upto.get(req_meta.req_id)
+            if entry is None or entry[0] != req_meta.save_generation:
+                entry = (req_meta.save_generation, {})
+                self._saved_upto[req_meta.req_id] = entry
+            for g_idx, upto in marks.items():
+                if upto > entry[1].get(g_idx, 0):
+                    entry[1][g_idx] = upto
 
     def wait_for_inflight_put(self, req_id: str, timeout_s: float = 30.0) -> bool:
         """Block until no store for ``req_id`` is currently executing.
@@ -1120,6 +1147,12 @@ class KVCacheStoreSendingThread(KVTransferThread):
             logical_block_ids_per_group: list[list[int]] = []
             stripe_position = 0
             skipped_state = False
+            saved_marks = self._saved_marks(req_meta)
+            # Per marked group: the first chunk start that is not done (not
+            # masked in yet, or this rank's and not confirmed stored), and
+            # this pass's chunks of it as (start, index into keys).
+            blocked: dict[int, int] = {}
+            marked_chunks: dict[int, list[tuple[int, int]]] = {}
             for g_idx, db in enumerate(self.token_databases):
                 mask = store_masks[g_idx]
                 logical_block_ids_per_group.append(
@@ -1135,9 +1168,36 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     and req_meta.state_blocks is not None
                     else None
                 )
-                for chunk_idx, (start, end, key) in enumerate(
-                    db.process_tokens(token_len, req_meta.block_hashes)
+                # Recurrent states are saved at a few boundaries and keep no
+                # mark; other groups resume where the request's earlier steps
+                # left off. Skipped chunks still count stripe positions and
+                # the chain of parent hashes, exactly as if enumerated.
+                marked = (
+                    g_idx not in self.tp_sharded_groups
+                    and (save_groups is None or g_idx in save_groups)
+                )
+                # With a retention TTL the SAVE's SET re-protects every chunk
+                # of the prefix (prefix closure: early chunks must not expire
+                # before later ones), so nothing is skipped.
+                skip = (
+                    min(saved_marks.get(g_idx, 0), token_len)
+                    if marked and req_meta.retain_ttl_s <= 0
+                    else 0
+                )
+                if skip:
+                    skipped = skip // db.block_size
+                    stripe_position += sum(
+                        1 for i in range(min(skipped, len(mask))) if mask[i]
+                    )
+                    parent_hash = BlockHash(
+                        bytes(db.chunk_hash(skipped - 1, req_meta.block_hashes))
+                    )
+                if marked:
+                    marked_chunks[g_idx] = []
+                for start, end, key in db.process_tokens(
+                    token_len, req_meta.block_hashes, skip
                 ):
+                    chunk_idx = start // db.block_size
                     chunk_hash = BlockHash(bytes.fromhex(key.chunk_hash))
                     chunk_parent, parent_hash = parent_hash, chunk_hash
                     if state_blocks is not None:
@@ -1150,6 +1210,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
                             state_blocks[end]
                         )
                     elif chunk_idx >= len(mask) or not mask[chunk_idx]:
+                        if marked and g_idx not in blocked:
+                            blocked[g_idx] = start
                         continue
                     # State checkpoints contain this physical TP rank's shard;
                     # every rank must save them. Only payload replicas stripe.
@@ -1180,6 +1242,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         # HMA may already have released an earlier window.
                         # Null/padding slots are not valid immutable objects.
                         continue
+                    if marked:
+                        marked_chunks[g_idx].append((start, len(keys)))
                     starts.append(start)
                     ends.append(end)
                     keys.append(key.to_bytes())
@@ -1190,6 +1254,19 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         (db, start, end, logical_block_ids_per_group[g_idx])
                     )
                     emit_events.append(True)
+
+            def advance_marks(confirmed: list[bool]) -> None:
+                """Move each marked group's mark to its first chunk not done."""
+                marks = {}
+                for g_idx, chunks in marked_chunks.items():
+                    upto = min(token_len, blocked.get(g_idx, token_len))
+                    for start, index in chunks:
+                        if not confirmed[index]:
+                            upto = min(upto, start)
+                            break
+                    marks[g_idx] = upto
+                if marks:
+                    self._advance_saved_marks(req_meta, marks)
 
             # Like vLLM's own partial-block cache entries, objects keyed off
             # the block grid emit no KV events.
@@ -1258,8 +1335,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
             missing_indices = [
                 i for i, exists in enumerate(exists_states) if exists != 1
             ]
+            confirmed = [exists == 1 for exists in exists_states]
 
             if not missing_indices:
+                advance_marks(confirmed)
                 return
 
             starts = [starts[i] for i in missing_indices]
@@ -1333,6 +1412,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         f"keys={len(keys)} statuses={len(res)}"
                     )
                 failed = _put_failed_indices(res)
+                for i, rc in zip(missing_indices, res, strict=True):
+                    confirmed[i] = rc == 0
+                advance_marks(confirmed)
                 if stored_events:
                     successful_events = [
                         event

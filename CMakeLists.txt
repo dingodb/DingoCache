@@ -434,6 +434,10 @@ if(DFKV_BUILD_TESTS)
       COMMAND ${PYTHON3}
               ${CMAKE_CURRENT_SOURCE_DIR}/test/python/test_dfkv_vllm_lookup_backoff.py
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME python_vllm_save_marks
+      COMMAND ${PYTHON3}
+              ${CMAKE_CURRENT_SOURCE_DIR}/test/python/test_dfkv_vllm_save_marks.py
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME python_vllm_hybrid_state
       COMMAND ${PYTHON3}
               ${CMAKE_CURRENT_SOURCE_DIR}/test/python/test_dfkv_vllm_hybrid_state.py
