@@ -466,26 +466,50 @@ void GpuNodeDedup::WaitManySg(WaitItem* items, size_t n) {
   };
   std::vector<InFlight> inflight;
   inflight.reserve(n);
+  // Per key: its slot was not there on the previous look (see below).
+  std::vector<char> gone(n, 0);
   const uint64_t deadline = NowMs() + static_cast<uint64_t>(wait_ms_);
   int backoff_us = 50;
   size_t failed_final = 0;
   while (!pending.empty()) {
-    // Issue round: enqueue every key that is READY right now.
+    // Issue round: enqueue every key that is READY right now, keep the keys
+    // whose fetch is still in flight, and give up on the rest.
     size_t w = 0;
+    bool look_again = false;
     for (size_t r = 0; r < pending.size(); ++r) {
       const size_t idx = pending[r];
       WaitItem& it = items[idx];
       Slot* s = Find(it.key);
-      CopySnap snap{};
-      // Same freshness rule as a claim: with the fetch in front of it
-      // aborted, a waiter can find an older entry of the key.
-      if (s && s->state.load(std::memory_order_acquire) == kStateReady &&
-          NowMs() - s->fetch_start_ms.load(std::memory_order_relaxed) <=
-              static_cast<uint64_t>(ttl_ms_) &&
-          IssueCopySg(s, it.key, it.segs, it.nsegs, it.total_cap, st, &snap)) {
-        inflight.push_back(InFlight{idx, snap});
+      const uint32_t state =
+          s ? s->state.load(std::memory_order_acquire) : kStateEmpty;
+      if (state == kStateReady) {
+        CopySnap snap{};
+        // Same freshness rule as a claim: with the fetch in front of it
+        // aborted, a waiter can find an older entry of the key.
+        if (NowMs() - s->fetch_start_ms.load(std::memory_order_relaxed) <=
+                static_cast<uint64_t>(ttl_ms_) &&
+            IssueCopySg(s, it.key, it.segs, it.nsegs, it.total_cap, st,
+                        &snap)) {
+          inflight.push_back(InFlight{idx, snap});
+        } else {
+          ++failed_final;  // expired, lapped, recycled, too long: will not heal
+        }
+      } else if (state == kStateFetching || state == kStatePublishing) {
+        gone[idx] = 0;
+        pending[w++] = idx;  // not published yet
+      } else if (gone[idx]) {
+        // No fetch in flight for this key: the owner aborted, or the entry
+        // was invalidated. Nothing will be published, and waiting out the
+        // deadline only delays the caller's own fetch.
+        ++failed_final;
       } else {
-        pending[w++] = idx;  // not published yet (or torn): retry next round
+        // A live slot never passes through EMPTY, but two lockstep claimers
+        // may hold one slot each for an instant until the higher probe
+        // position is released; a look that crosses that release sees
+        // neither. Look once more, at once, before giving up.
+        gone[idx] = 1;
+        look_again = true;
+        pending[w++] = idx;
       }
     }
     pending.resize(w);
@@ -505,7 +529,8 @@ void GpuNodeDedup::WaitManySg(WaitItem* items, size_t n) {
       backoff_us = 50;  // publishes are flowing; poll eagerly
       continue;
     }
-    if (NowMs() >= deadline) break;
+    if (look_again) continue;
+    if (pending.empty() || NowMs() >= deadline) break;
     std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
     if (backoff_us < 1000) backoff_us *= 2;
   }
@@ -720,22 +745,34 @@ bool GpuNodeDedup::WaitSg(const BlockKey& key, const Seg* segs, size_t nsegs,
   EnsureThreadCtx();
   const uint64_t deadline = NowMs() + static_cast<uint64_t>(wait_ms_);
   int backoff_us = 50;
+  bool gone = false;
   for (;;) {
     Slot* s = Find(key);
-    if (s && s->state.load(std::memory_order_acquire) == kStateReady &&
-        NowMs() - s->fetch_start_ms.load(std::memory_order_relaxed) <=
-            static_cast<uint64_t>(ttl_ms_) &&
-        CopyOutSg(s, key, segs, nsegs, total_cap, got)) {
-      wait_hits_.fetch_add(1, std::memory_order_relaxed);
-      return true;
+    const uint32_t state =
+        s ? s->state.load(std::memory_order_acquire) : kStateEmpty;
+    if (state == kStateReady) {
+      if (NowMs() - s->fetch_start_ms.load(std::memory_order_relaxed) <=
+              static_cast<uint64_t>(ttl_ms_) &&
+          CopyOutSg(s, key, segs, nsegs, total_cap, got)) {
+        wait_hits_.fetch_add(1, std::memory_order_relaxed);
+        return true;
+      }
+      break;  // expired, lapped, recycled or too long: it will not heal
     }
-    if (NowMs() >= deadline) {
-      wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
-      return false;
+    if (state == kStateFetching || state == kStatePublishing) {
+      gone = false;
+      if (NowMs() >= deadline) break;
+      std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
+      if (backoff_us < 1000) backoff_us *= 2;
+      continue;
     }
-    std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
-    if (backoff_us < 1000) backoff_us *= 2;
+    // No fetch in flight for this key (see WaitManySg): look once more, then
+    // give up at once.
+    if (gone) break;
+    gone = true;
   }
+  wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
+  return false;
 }
 
 }  // namespace dfkv

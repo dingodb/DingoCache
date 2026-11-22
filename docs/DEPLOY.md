@@ -709,7 +709,7 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | `DFKV_NODE_DEDUP_SLOTS` | `65536`（2 的幂） | dedup 表容量（power-of-2 强制） |
 | `DFKV_NODE_DEDUP_GPU_SLOTS` | — | GPU dedup 表容量 |
 | `DFKV_NODE_DEDUP_TTL_MS` | `5000` | dedup entry 过期（从发布时刻算起）；低于 `DFKV_NODE_DEDUP_WAIT_MS` 时启动告警：晚于 TTL 到达的 peer 会重复远端读取 |
-| `DFKV_NODE_DEDUP_WAIT_MS` | `500` | follower 等待 leader 的上限。host 路径下一次批量调用整批共用这一个上限（不是每个 key 各等一次），超时的 key 合并成一次直连批量读取；leader 放弃（未命中、目标节点冷却、I/O 失败）时 follower 立即回退，不等满。**取值不小于最大一批读取的耗时**：leader 要等自己整批直连读取返回后才发布这批 key，耗时超过本值时，各 follower 在到期时把仍在读取的 key 合成一批自行重读，这一批不再共享（等于读了两遍） |
+| `DFKV_NODE_DEDUP_WAIT_MS` | `500` | follower 等待 leader 的上限。一次批量调用整批共用这一个上限（不是每个 key 各等一次；host 与 GPU 路径相同），超时的 key 合并成一次直连批量读取；leader 放弃（未命中、目标节点冷却、I/O 失败，GPU 路径还有发布前设备同步失败）时 follower 立即回退，不等满。**取值不小于最大一批读取的耗时**：leader 要等自己整批直连读取返回后才发布这批 key，耗时超过本值时，各 follower 在到期时把仍在读取的 key 合成一批自行重读，这一批不再共享（等于读了两遍） |
 | `DFKV_NODE_DEDUP_TAKEOVER_MS` | — | leader 失联 follower 接管时间 |
 | `DFKV_NODE_DEDUP_ARENA_MB` / `DFKV_NODE_DEDUP_GPU_ARENA_MB` | — | dedup 复用 staging arena 大小（重点检查 GPU 复本顿） |
 
