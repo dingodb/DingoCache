@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- Server: a stop signal (SIGTERM or SIGINT) that arrives while the server
+  is still starting now cancels the start. Until now the signal was only
+  looked at once the server was fully up: the start ran to its end (disks
+  opened, RAM tier arena faulted in, RDMA listener started, registration
+  with the MDS begun) and only then was undone. With a large arena on 4 KiB
+  pages that is tens of seconds, and a service manager whose stop timeout
+  is shorter killed the process with its disks marked dirty, which costs
+  the cache unless `DFKV_SLAB_WARM_RESTART` is `auto` or `boot`.
+  - The arena pre-fault is given up within one 2 MiB step of the signal.
+    The disk opens are not interrupted: they take seconds, and a disk that
+    has finished opening is closed clean again.
+  - The signal is acted on after the disks are open, after the RDMA listener
+    has started, and right before the health endpoints come up and the
+    registration with the MDS begins. A cancelled start never listens for
+    TCP requests in the first case and never registers in any of them. A
+    signal that arrives after the registration loop has started is an
+    ordinary stop, as before.
+  - Every disk that was opened is synced and marked clean, so the next
+    start is a clean start. The last log line is `dfkv_server start
+    cancelled: not registered with the MDS, every opened disk closed clean,
+    N s after the process started; exiting`, and the exit status is 0, as
+    for any stop that was asked for. If a disk failed to open or could not
+    be closed clean, the line is a WARN (`... but a disk failed to open or
+    is not clean ...`) and the status is 1.
+  - New INFO line `ram tier arena: faulting in N MiB (threads=T)` when the
+    pre-fault begins; `ram tier arena pre-fault given up: the start is not
+    going ahead` when it is abandoned, which also happens when a disk fails
+    to open: a failed start no longer waits for the arena.
+  Not changed: a process that is killed (SIGKILL, out of memory) after a
+  disk has finished opening still leaves that disk dirty, even if nothing
+  was written. See `docs/DEPLOY.md`.
 - Client, RDMA: a topology change of one cache node no longer makes a client
   drop its pooled connections to every node. The client published each member
   to the transport under the epoch of the whole member list, and that epoch

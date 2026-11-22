@@ -32,8 +32,14 @@ class KvNodeServer {
   // single disk (back-compat)
   KvNodeServer(const std::string& cache_dir, uint64_t capacity_bytes);
   // multiple NVMe SSDs on this node (total capacity split across disks)
+  // `cancel_start` (optional, must outlive the constructor call): becomes
+  // true when the start is no longer wanted, typically from a signal handler.
+  // The constructor then gives up faulting in the RAM tier arena, still lets
+  // the disks finish opening (seconds; they are closed again by Shutdown),
+  // and returns with start_cancelled() true. Such a server never starts.
   KvNodeServer(const std::vector<std::string>& cache_dirs,
-               uint64_t capacity_bytes);
+               uint64_t capacity_bytes,
+               const std::atomic<bool>* cancel_start = nullptr);
   ~KvNodeServer();
 
   Status Start(int port);  // port 0 => ephemeral; query with port()
@@ -46,7 +52,8 @@ class KvNodeServer {
   //     loses every disk's cache instead of the newest few objects.
   //  2. All disks sync and record a clean shutdown, at the same time.
   // Each step is logged with its duration. Returns true if every disk is
-  // clean. Precondition: whatever else calls into this server (an RDMA server)
+  // clean; false also when a disk failed to open and so is not there to be
+  // closed. Precondition: whatever else calls into this server (an RDMA server)
   // has been stopped. Afterwards the server can only be destroyed.
   // `started` is when the caller began stopping: the time it spent stopping
   // other request paths counts against the drain limit, because the flushers
@@ -74,9 +81,12 @@ class KvNodeServer {
   // intentionally excluded: only the first successful registration gates
   // readiness; terminal local store/RAM failures remove it.
   bool Healthy() const {
-    return group_.Healthy() && !ram_required_failed_ &&
+    return group_.Healthy() && !ram_required_failed_ && !start_cancelled_ &&
            (!ram_ || ram_->healthy());
   }
+  // The constructor saw its cancel_start flag set. The disks that opened are
+  // open; Shutdown() closes them clean. Start() refuses.
+  bool start_cancelled() const { return start_cancelled_; }
   // False once a disk store has failed for good: it then stores and reads
   // nothing more until the process is restarted, so the keys placed on it
   // are lost to clients for as long as this node stays in the placement
@@ -184,7 +194,8 @@ class KvNodeServer {
   friend class KvNodeServerTestPeer;
   friend class KvNodeServerWiringTestPeer;
   // Reuse the storage group's engine factory in focused admission tests.
-  explicit KvNodeServer(DiskCacheGroup::Options options);
+  explicit KvNodeServer(DiskCacheGroup::Options options,
+                        const std::atomic<bool>* cancel_start = nullptr);
   static void FinishDiskRead(void* owner, uint64_t flight, bool committed,
                              Status result, size_t bytes_read,
                              double elapsed_sec, const char* data) noexcept;
@@ -218,6 +229,13 @@ class KvNodeServer {
     RamTier::Options options;
   };
   static RamTierPlan PlanRamTier(size_t disk_count);
+  // The tier under construction should give up: the caller cancelled the
+  // start, or a disk failed to open and the start is over anyway.
+  bool RamStartUnwanted() const {
+    return ram_start_abandoned_.load(std::memory_order_relaxed) ||
+           (cancel_start_ != nullptr &&
+            cancel_start_->load(std::memory_order_relaxed));
+  }
   std::future<std::unique_ptr<RamTier>> StartRamTier();
   void AdoptRamTier(std::unique_ptr<RamTier> tier);
   // RAM tier write policy: write-back (PUT lands in arena, async flush) or
@@ -312,6 +330,8 @@ class KvNodeServer {
   // Declared BEFORE group_ on purpose: members are constructed in declaration
   // order, and the arena has to start faulting in before the disks start
   // opening for the two to overlap. Empty again once the constructor is done.
+  const std::atomic<bool>* cancel_start_ = nullptr;
+  std::atomic<bool> ram_start_abandoned_{false};
   RamTierPlan ram_plan_;
   std::future<std::unique_ptr<RamTier>> ram_starting_;
   DiskCacheGroup group_;
@@ -323,6 +343,7 @@ class KvNodeServer {
   std::unique_ptr<RamTier> ram_;
   bool ram_ack_enabled_ = false;
   bool ram_required_failed_ = false;
+  bool start_cancelled_ = false;
   int listen_fd_ = -1;
   int port_ = 0;
   std::atomic<bool> running_{false};

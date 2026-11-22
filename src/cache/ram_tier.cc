@@ -270,6 +270,11 @@ RamTier::RamTier(Options opt, FlushFn flush)
     const size_t chunk =
         arena_size / nt + (arena_size % nt != 0 ? 1 : 0);
     std::vector<std::thread> ws;
+    // Said before, not only after: on small pages this takes tens of seconds
+    // for a large arena, during which the log would otherwise be silent.
+    DFKV_LOG_INFO("ram tier arena: faulting in " +
+                  std::to_string(arena_bytes_ >> 20) + " MiB (threads=" +
+                  std::to_string(nt) + ")");
     for (size_t i = 0; i < nt; ++i) {
       const size_t off = i * chunk;
       if (off >= arena_size) break;
@@ -281,10 +286,22 @@ RamTier::RamTier(Options opt, FlushFn flush)
         // if it differs", which would map the shared zero page and never
         // allocate.
         volatile char* const base = arena_ + off;
-        for (size_t at = 0; at < n; at += 4096) base[at] = 0;
+        for (size_t at = 0; at < n; at += 4096) {
+          // A cancelled start stops here, at most 2 MiB later.
+          if (at % kHugePageBytes == 0 && opt_.cancel_start &&
+              opt_.cancel_start())
+            return;
+          base[at] = 0;
+        }
       });
     }
     for (auto& worker : ws) worker.join();
+    if (opt_.cancel_start && opt_.cancel_start()) {
+      start_cancelled_ = true;
+      DFKV_LOG_INFO("ram tier arena pre-fault given up: the start is not "
+                    "going ahead");
+      return;
+    }
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - t0)
                         .count();

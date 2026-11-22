@@ -21,7 +21,18 @@ mkdir "$D/cache"
 env -u DFKV_STORE_ENGINE -u DFKV_SLAB_WRITE -u DFKV_LOG "$BUILD/dfkv_server" \
   --dir "$D/cache" --port 0 --cap 1073741824 >>"$D/srv.out" 2>&1 &
 PID=$!
-trap 'kill $PID 2>/dev/null; rm -rf "$D"' EXIT
+# The server of the moment is asked to stop, and killed if it has not within
+# two seconds: one that is blocked in an open does not act on SIGTERM.
+cleanup() {
+  kill $PID 2>/dev/null || true
+  for _ in $(seq 1 40); do
+    kill -0 $PID 2>/dev/null || break
+    sleep 0.05
+  done
+  kill -KILL $PID 2>/dev/null || true
+  rm -rf "$D"
+}
+trap cleanup EXIT
 P=""
 # `|| true`: a transient awk read must never trip `set -e` before the server prints PORT.
 for i in $(seq 1 100); do P=$(awk '/PORT/{print $2}' "$D/srv.out" 2>/dev/null || true); [ -n "$P" ] && break; sleep 0.05; done
@@ -215,3 +226,122 @@ rc=0; DFKV_MDS_ETCD_PROBE_MS=500 "$BUILD/dfkv_mds" --listen 0 --etcd 127.0.0.1:9
   >/dev/null 2>&1 || rc=$?
 [ "$rc" = 1 ] || { echo "dfkv_mds bad etcd: expected exit 1, got $rc"; exit 1; }
 echo "mds etcd-probe smoke OK"
+
+# A stop signal during startup cancels the start: the server never listens,
+# closes the disks it opened clean, says so in its last line and exits 0; the
+# next start is a clean one and still has the data. The signal is sent when
+# the server logs that it has begun to fault its RAM tier arena in: 1 GiB on
+# small pages takes far longer than delivering a signal, and only what has
+# been touched by then is ever used. Should this script be stalled for longer
+# than the whole start all the same, the server is listening before the
+# signal is sent; that is looked for first, said, and not failed. A signal
+# that is merely too late for the pre-fault still cancels the start (that the
+# pre-fault itself is given up is proven by a unit test).
+kill $PID 2>/dev/null || true
+wait $PID 2>/dev/null || true
+SRV_ENV=(env -u DFKV_STORE_ENGINE -u DFKV_SLAB_WRITE -u DFKV_SLAB_WARM_RESTART -u DFKV_LOG)
+mkdir "$D/c1"
+: > "$D/c1.out"
+"${SRV_ENV[@]}" "$BUILD/dfkv_server" --dir "$D/c1" --port 0 --cap 1073741824 >>"$D/c1.out" 2>&1 &
+PID=$!
+P=""
+for i in $(seq 1 100); do P=$(awk '/PORT/{print $2}' "$D/c1.out" 2>/dev/null || true); [ -n "$P" ] && break; sleep 0.05; done
+[ -n "$P" ] || { echo "server did not report PORT"; cat "$D/c1.out"; exit 1; }
+"$BUILD/dfkvctl" --members "n=127.0.0.1:$P" --namespace "dfkv/smoke" put kept v-kept
+kill -TERM $PID
+rc=0; wait $PID || rc=$?
+[ "$rc" = 0 ] || { echo "dfkv_server after SIGTERM: expected exit 0, got $rc"; cat "$D/c1.out"; exit 1; }
+
+: > "$D/cancel.out"
+"${SRV_ENV[@]}" DFKV_RAM_TIER=1 DFKV_RAM_TIER_BYTES=1073741824 \
+  DFKV_RAM_TIER_HUGEPAGES=off DFKV_RAM_TIER_LOCK=off "$BUILD/dfkv_server" \
+  --dir "$D/c1" --port 0 --cap 1073741824 >>"$D/cancel.out" 2>&1 &
+PID=$!
+faulting=""
+for i in $(seq 1 2000); do
+  grep -q 'ram tier arena: faulting in' "$D/cancel.out" 2>/dev/null && { faulting=1; break; }
+  sleep 0.005
+done
+[ -n "$faulting" ] || { echo "the arena pre-fault did not begin"; cat "$D/cancel.out"; exit 1; }
+late=""
+grep -q '^PORT ' "$D/cancel.out" && late=1
+kill -TERM $PID
+rc=0; wait $PID || rc=$?
+[ "$rc" = 0 ] || { echo "cancelled start: expected exit 0, got $rc"; cat "$D/cancel.out"; exit 1; }
+if [ -n "$late" ]; then
+  echo "cancelled-start smoke: the server was listening before the signal was sent (stalled runner); not checked"
+else
+  tail -n 1 "$D/cancel.out" | grep -q 'dfkv_server start cancelled: .*every opened disk closed clean' || {
+    echo "cancelled start: the last line does not say so"
+    cat "$D/cancel.out"
+    exit 1
+  }
+  if grep -Eq '^PORT |dfkv_server listening on port' "$D/cancel.out"; then
+    echo "cancelled start: the server started listening"
+    cat "$D/cancel.out"
+    exit 1
+  fi
+  grep -q 'ram tier arena pre-fault given up' "$D/cancel.out" ||
+    echo "cancelled-start smoke: the signal arrived after the pre-fault"
+fi
+
+# The same with a disk that fails to open: the start is cancelled, the disk
+# that did open is closed clean, but the last line is a warning and the exit
+# status 1. Held in place without timing: the second directory's
+# initialization marker is a FIFO, on which the open blocks until somebody
+# opens the other end (and then fails: a FIFO is no marker).
+mkdir "$D/c2"
+mkfifo "$D/c2/slab_initializing"
+: > "$D/cancel2.out"
+"${SRV_ENV[@]}" "$BUILD/dfkv_server" --dir "$D/c1,$D/c2" --port 0 --cap 2147483648 >>"$D/cancel2.out" 2>&1 &
+PID=$!
+opened=""
+for i in $(seq 1 400); do
+  grep -q "slab $D/c1: opened in" "$D/cancel2.out" 2>/dev/null && { opened=1; break; }
+  sleep 0.05
+done
+[ -n "$opened" ] || { echo "the first disk did not open"; cat "$D/cancel2.out"; exit 1; }
+kill -TERM $PID
+timeout 10 bash -c ': > "$1"' _ "$D/c2/slab_initializing" || {
+  # Nobody was reading: the server is not where this test put it, and may be
+  # blocked for good. It is killed, not waited for.
+  kill -KILL $PID 2>/dev/null || true
+  echo "cancelled start with a failed disk: the blocked open could not be released"
+  cat "$D/cancel2.out"
+  exit 1
+}
+rc=0; wait $PID || rc=$?
+[ "$rc" = 1 ] || { echo "cancelled start with a failed disk: expected exit 1, got $rc"; cat "$D/cancel2.out"; exit 1; }
+tail -n 1 "$D/cancel2.out" | grep -q 'WARN.*dfkv_server start cancelled: .*a disk failed to open or is not clean' || {
+  echo "cancelled start with a failed disk: the last line does not say so"
+  cat "$D/cancel2.out"
+  exit 1
+}
+grep -q "shutdown: disk $D/c1 synced and clean" "$D/cancel2.out" || {
+  echo "cancelled start with a failed disk: the disk that opened was not closed clean"
+  cat "$D/cancel2.out"
+  exit 1
+}
+if grep -Eq '^PORT |dfkv_server listening on port' "$D/cancel2.out"; then
+  echo "cancelled start with a failed disk: the server started listening"
+  cat "$D/cancel2.out"
+  exit 1
+fi
+: > "$D/c1b.out"
+"${SRV_ENV[@]}" "$BUILD/dfkv_server" --dir "$D/c1" --port 0 --cap 1073741824 >>"$D/c1b.out" 2>&1 &
+PID=$!
+P=""
+for i in $(seq 1 100); do P=$(awk '/PORT/{print $2}' "$D/c1b.out" 2>/dev/null || true); [ -n "$P" ] && break; sleep 0.05; done
+[ -n "$P" ] || { echo "server did not report PORT after a cancelled start"; cat "$D/c1b.out"; exit 1; }
+got=$("$BUILD/dfkvctl" --members "n=127.0.0.1:$P" --namespace "dfkv/smoke" get kept)
+[ "$got" = "v-kept" ] || { echo "value lost across a cancelled start: '$got'"; cat "$D/c1b.out"; exit 1; }
+stat_out=$("$BUILD/dfkvctl" stat "127.0.0.1:$P")
+{ echo "$stat_out" | grep -Eq '^dfkv_slab_unclean_resets_total(\{[^}]*\})? 0$' &&
+  echo "$stat_out" | grep -Eq '^dfkv_slab_warm_restarts_total(\{[^}]*\})? 0$'; } || {
+  echo "the start after a cancelled start was not a clean start"
+  echo "$stat_out" | grep -E 'unclean|warm' || true
+  cat "$D/cancel.out" "$D/cancel2.out" "$D/c1b.out"
+  exit 1
+}
+echo "cancelled-start smoke OK"
+# The server of the last check is left to the EXIT trap, like the one before.

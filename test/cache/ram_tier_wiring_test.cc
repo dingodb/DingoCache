@@ -2,6 +2,7 @@
 // to RAM (sync-visible, async-flushed) and GET is served from RAM; disabled by
 // default the node behaves exactly as before. End-to-end over the TCP transport.
 #include "cache/kv_node_server.h"
+#include "cache/disk_slab_store.h"
 #include "cache/kv_store.h"
 #include "client/key_map.h"
 #include "transport/tcp_transport.h"
@@ -35,6 +36,11 @@ class KvNodeServerWiringTestPeer {
  public:
   static std::unique_ptr<KvNodeServer> Create(DiskCacheGroup::Options options) {
     return std::unique_ptr<KvNodeServer>(new KvNodeServer(std::move(options)));
+  }
+  static std::unique_ptr<KvNodeServer> Create(
+      DiskCacheGroup::Options options, const std::atomic<bool>* cancel_start) {
+    return std::unique_ptr<KvNodeServer>(
+        new KvNodeServer(std::move(options), cancel_start));
   }
   static void SetLimit(KvNodeServer& server, size_t limit) {
     server.put_busy_limit_ = limit;
@@ -1180,6 +1186,124 @@ TEST(RamTierWiring, AFailedArenaEndsTheStartWithTheDisksOpen) {
   EXPECT_FALSE(server->Healthy());
   EXPECT_FALSE(server->ram_enabled());
   EXPECT_EQ(server->Start(0), Status::kIOError);
+  server.reset();
+  fs::remove_all(dir);
+}
+
+// ---- A start that is cancelled (a stop signal during startup) --------------
+namespace {
+DiskSlabStore::Options CancelSlab(const std::string& dir) {
+  DiskSlabStore::Options options;
+  options.dir = dir;
+  options.trust_token_dir = dir + "_tokens";
+  fs::create_directories(options.trust_token_dir);
+  options.capacity_bytes = 1 << 20;
+  options.extent_bytes = 1 << 20;
+  options.slot_granularity = 4096;
+  return options;
+}
+}  // namespace
+
+// The cancel flag is set while a disk is being opened, as a signal handler
+// would. The disk finishes opening (it is marked dirty by then); the server
+// comes back cancelled, refuses to start, and its Shutdown closes the disk
+// clean: the next open is a clean start with the data in place.
+TEST(RamTierWiring, ACancelledStartClosesTheOpenedDisksClean) {
+  RamTierEnv env;
+  const auto dir = fs::temp_directory_path() / "dfkv_ramwire_cancel";
+  fs::remove_all(dir);
+  fs::remove_all(dir.string() + "_tokens");
+  const std::string value(3000, 'c');
+  {
+    bool ok = false;
+    DiskSlabStore store(CancelSlab(dir.string()), &ok);
+    ASSERT_TRUE(ok) << store.StartupError();
+    ASSERT_EQ(store.Cache(BlockKey{7, 7}, value.data(), value.size()),
+              Status::kOk);
+  }
+  std::atomic<bool> cancel{false};
+  DiskCacheGroup::Options options{{dir.string()}, 1ull << 20, "slab"};
+  options.engine_factory =
+      [&](const std::string& path, uint64_t) -> std::unique_ptr<StoreEngine> {
+    auto store = std::make_unique<DiskSlabStore>(CancelSlab(path));
+    cancel.store(true);  // the signal arrives while the disk is being opened
+    return store;
+  };
+  auto server =
+      KvNodeServerWiringTestPeer::Create(std::move(options), &cancel);
+  EXPECT_TRUE(server->start_cancelled());
+  EXPECT_TRUE(server->DisksHealthy());
+  EXPECT_FALSE(server->Healthy());
+  EXPECT_FALSE(server->ram_enabled());
+  EXPECT_EQ(server->Start(0), Status::kIOError) << "a cancelled start started";
+  EXPECT_TRUE(server->Shutdown()) << "the opened disk was not closed clean";
+  server.reset();
+
+  bool ok = false;
+  DiskSlabStore reopened(CancelSlab(dir.string()), &ok);
+  ASSERT_TRUE(ok) << reopened.StartupError();
+  const auto stats = reopened.GetStats();
+  EXPECT_EQ(stats.unclean_resets, 0u);
+  EXPECT_EQ(stats.warm_restarts, 0u);
+  std::string out;
+  ASSERT_EQ(reopened.Range(BlockKey{7, 7}, 0, value.size(), &out), Status::kOk);
+  EXPECT_EQ(out, value);
+  fs::remove_all(dir);
+  fs::remove_all(dir.string() + "_tokens");
+}
+
+// A cancelled start in which a disk failed to open. The group does not keep
+// a disk whose open threw, so every disk it has closes clean; Shutdown must
+// still not answer "all clean", because dfkv_server takes the exit status
+// and the last log line of a cancelled start from it.
+TEST(RamTierWiring, ACancelledStartWithAFailedDiskIsNotAllClean) {
+  RamTierEnv env;
+  const auto good = fs::temp_directory_path() / "dfkv_ramwire_cancel_good";
+  const auto bad = fs::temp_directory_path() / "dfkv_ramwire_cancel_bad";
+  for (const auto& dir : {good, bad}) {
+    fs::remove_all(dir);
+    fs::remove_all(dir.string() + "_tokens");
+  }
+  std::atomic<bool> cancel{false};
+  DiskCacheGroup::Options options{{good.string(), bad.string()}, 2ull << 20,
+                                  "slab"};
+  options.engine_factory =
+      [&](const std::string& path, uint64_t) -> std::unique_ptr<StoreEngine> {
+    cancel.store(true);
+    if (path == bad.string()) throw std::runtime_error("cannot open this disk");
+    return std::make_unique<DiskSlabStore>(CancelSlab(path));
+  };
+  auto server =
+      KvNodeServerWiringTestPeer::Create(std::move(options), &cancel);
+  EXPECT_TRUE(server->start_cancelled());
+  EXPECT_FALSE(server->DisksHealthy());
+  EXPECT_FALSE(server->Shutdown()) << "a disk failed to open: not all clean";
+  server.reset();
+
+  bool ok = false;
+  DiskSlabStore reopened(CancelSlab(good.string()), &ok);
+  ASSERT_TRUE(ok) << reopened.StartupError();
+  EXPECT_EQ(reopened.GetStats().unclean_resets, 0u);
+  EXPECT_EQ(reopened.GetStats().warm_restarts, 0u);
+  for (const auto& dir : {good, bad}) {
+    fs::remove_all(dir);
+    fs::remove_all(dir.string() + "_tokens");
+  }
+}
+
+// Without the flag, or with the flag never set, nothing changes.
+TEST(RamTierWiring, AStartThatIsNotCancelledIsAnOrdinaryStart) {
+  RamTierEnv env;
+  const auto dir = fs::temp_directory_path() / "dfkv_ramwire_not_cancelled";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  std::atomic<bool> cancel{false};
+  auto server = KvNodeServerWiringTestPeer::Create(
+      DiskCacheGroup::Options{{dir.string()}, 1ull << 30, "file"}, &cancel);
+  EXPECT_FALSE(server->start_cancelled());
+  EXPECT_TRUE(server->Healthy());
+  EXPECT_TRUE(server->ram_enabled());
+  EXPECT_EQ(server->Start(0), Status::kOk);
   server.reset();
   fs::remove_all(dir);
 }
