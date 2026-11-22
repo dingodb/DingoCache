@@ -386,6 +386,9 @@ RamTier::RamTier(Options opt, FlushFn flush)
     allocator_options.align = opt_.slot_granularity;
     allocator_options.max_waste = 0.25;
     allocator_options.evict_clear_limit = kEvictClearLimit;
+    // Writes here are memory copies: nothing to stripe, so a class keeps one
+    // extent with free slots, not eight, and gives up all but one to others.
+    allocator_options.stripe_ways = 1;
     shard->alloc =
         std::make_unique<SlabAllocator>(allocator_options);
     shards_.push_back(std::move(shard));
@@ -495,7 +498,8 @@ void RamTier::ReclaimTick(Shard& s, size_t /*shard_idx*/) {
     need_ext = std::min<size_t>(need_ext, kGrowExtentsPerTick);
     while (need_ext > 0) {
       const size_t donor =
-          SlabAllocator::ColdestGrowDonor(classes, delta, extents, i);
+          SlabAllocator::ColdestGrowDonor(classes, delta, extents, i,
+                                          s.alloc->StripeWays());
       if (donor == classes.size()) break;
       std::vector<BlockKey> evicted;
       bool ok;

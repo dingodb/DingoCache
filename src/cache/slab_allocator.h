@@ -54,6 +54,11 @@ class SlabAllocator {
 
   enum class RemoveResult { kRemoved, kDeferred, kNotFound };
 
+  // Default target write parallelism per class (Options::stripe_ways): Put
+  // keeps up to this many extents with free slots so concurrent writers
+  // stripe across inodes.
+  static constexpr size_t kStripeWays = 8;
+
   struct Options {
     uint64_t extent_bytes = (1ull << 30);
     uint32_t num_extents = 8;
@@ -70,6 +75,12 @@ class SlabAllocator {
     // member even if an unreferenced one lies further on. ReclaimClass ends
     // a call once it has cleared this many and tells its caller so.
     uint32_t evict_clear_limit = 0;
+    // Extents with free slots Put keeps per class, so that concurrent
+    // writers stripe across files (kStripeWays). Also the floor below which
+    // a class that is being written gives no extent to background growth or
+    // to another class's floor steal. A tier whose writes are memory copies
+    // has nothing to stripe and sets 1. 0 is taken as 1.
+    size_t stripe_ways = kStripeWays;
     std::function<bool(uint32_t extent)> on_extent_bind;
     // A last-resident eviction may clear the whole extent in one write.
     // Partial eviction requires on_slot_evict when persistence is configured.
@@ -79,11 +90,6 @@ class SlabAllocator {
     std::function<bool(const SlotRef&)> on_slot_evict;
   };
 
-  // Target write parallelism per class: Put keeps up to this many extents with
-  // free slots so concurrent writers stripe across inodes. This is also the
-  // per-class capacity floor for rebalance: a donor is never shrunk below its
-  // striping width.
-  static constexpr size_t kStripeWays = 8;
   // An extent moves to another size class only if its residents are, on
   // average, this many times longer unused than those of the extent the
   // other class would lose first of its own.
@@ -209,9 +215,11 @@ class SlabAllocator {
   size_t ReclaimClass(size_t cls_index, size_t target_free, size_t max_victims,
                       std::vector<BlockKey>* evicted,
                       bool* clear_limited = nullptr);
-  // Background GROW donor for class `hot`: among classes above the
-  // kStripeWays floor whose write demand is at most a quarter of hot's, the
-  // coldest, then the one with the most extents. Demand is bytes (puts since
+  // Background GROW donor for class `hot`: among classes whose write demand
+  // is at most a quarter of hot's, the coldest, then the one with the most
+  // extents. A class with write demand must hold more than `floor` extents
+  // (the allocator's StripeWays()); one without any (`delta` 0) is idle and
+  // may give every extent, emptiest first (StealFrom). Demand is bytes (puts since
   // the last pass x slot size): a class of large slots admits far fewer
   // objects for the same capacity, so counts alone would make it look cold and
   // hand its extents (and newest residents) away. Returns classes.size() when
@@ -219,7 +227,7 @@ class SlabAllocator {
   static size_t ColdestGrowDonor(const std::vector<ClassStat>& classes,
                                  const std::vector<uint64_t>& delta,
                                  const std::vector<uint32_t>& extents,
-                                 size_t hot);
+                                 size_t hot, size_t floor);
   // Moves the donor's least recently used extent (an empty one first) to
   // `target_cls`, evicting its residents. False if the donor has no extent
   // that may go: all pinned or protected, or even its least recently used
@@ -250,6 +258,7 @@ class SlabAllocator {
   uint64_t WatermarkScanVisits() const;
   uint64_t ExtentReturns() const;
   size_t ClassCount() const;
+  size_t StripeWays() const { return opt_.stripe_ways; }
   uint32_t BoundExtents() const;
 
   struct IndexStats {

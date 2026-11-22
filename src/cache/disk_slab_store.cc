@@ -2672,8 +2672,10 @@ uint64_t DiskSlabStore::EvictedBytes() const {
 // forever (self-eviction always succeeds once it has any unpinned resident),
 // so a workload's new value size retains only a sliver of its writes. Move up
 // to kGrowExtentsPerTick extents per tick from the coldest donors (no recent
-// inserts, or 4x less demand) whose capacity stays above the kStripeWays
-// striping floor -- that floor is the per-class quota protection.
+// inserts, or 4x less demand). A donor that is being written keeps its
+// striping width (StripeWays) of extents; an idle one (no insert since the
+// last pass) gives any, its empty ones first. StealFrom still refuses an
+// extent whose residents are not much colder than the hot class's own.
 //
 // RECLAIM: then top free slots up to the demand-driven watermark (~2 intervals
 // of the insert rate, capped at 1/4 of bound capacity) in bounded batches per
@@ -2772,7 +2774,8 @@ void DiskSlabStore::ReclaimTick(
       need_ext = std::min<size_t>(need_ext, kGrowExtentsPerTick);
       while (need_ext > 0) {
         const size_t donor =
-            SlabAllocator::ColdestGrowDonor(classes, delta, extents, i);
+            SlabAllocator::ColdestGrowDonor(classes, delta, extents, i,
+                                            alloc_->StripeWays());
         if (donor == classes.size()) break;
         std::vector<BlockKey> evicted;
         bool ok;
