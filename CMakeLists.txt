@@ -176,6 +176,17 @@ if(DFKV_BUILD_TESTS)
     SOVERSION 1
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/fake_cuda)
 
+  # Simulated driver library for node_dedup_gpu_sim_test (never installed):
+  # host memory stands in for device memory, so the GPU dedup tests run on
+  # machines without a GPU.
+  add_library(dfkv_sim_cuda SHARED
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/client/sim_cuda/sim_cuda.cc)
+  set_target_properties(dfkv_sim_cuda PROPERTIES
+    OUTPUT_NAME cuda
+    VERSION 1
+    SOVERSION 1
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/sim_cuda)
+
   file(GLOB_RECURSE DFKV_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/*_test.cc)
   # rdma_loopback_test needs the RDMA transport/server symbols -> RDMA build only.
   list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_loopback_test.cc)
@@ -192,6 +203,12 @@ if(DFKV_BUILD_TESTS)
     get_filename_component(name ${t} NAME_WE)
     add_executable(${name} ${t})
     target_link_libraries(${name} PRIVATE dfkv_core GTest::gtest_main)
+    if(name STREQUAL "node_dedup_gpu_sim_test")
+      # Re-executes itself with the simulated driver first on the library path.
+      add_dependencies(${name} dfkv_sim_cuda)
+      target_compile_definitions(${name} PRIVATE
+        DFKV_SIM_CUDA_DIR="${CMAKE_BINARY_DIR}/sim_cuda")
+    endif()
     if(name STREQUAL "cuda_attach_test")
       # Loads the stand-in driver library from this directory; see its main().
       add_dependencies(${name} dfkv_fake_cuda)
@@ -208,6 +225,10 @@ if(DFKV_BUILD_TESTS)
       gtest_discover_tests(${name} PROPERTIES
         RESOURCE_LOCK gpu_rdma_hw
         ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")
+    elseif(name STREQUAL "node_dedup_gpu_sim_test")
+      # The same suites as node_dedup_gpu_test: the prefix keeps the names apart.
+      gtest_discover_tests(${name} TEST_PREFIX "Sim."
+        PROPERTIES ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")
     else()
       gtest_discover_tests(${name} PROPERTIES
         ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")
