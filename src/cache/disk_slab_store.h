@@ -122,6 +122,9 @@ class DiskSlabStore : public StoreEngine {
   // One store's runtime counters (see KvNodeServer's dfkv_slab_* metrics).
   struct Stats {
     uint64_t dio_write_fallbacks = 0;
+    // PUTs answered kCacheFull because the allocator had no slot to give:
+    // everything evictable was pinned or protected by retention.
+    uint64_t put_no_slot = 0;
     uint64_t dio_read_fallbacks = 0;
     uint64_t table_syncs = 0;
     uint64_t bind_wipes = 0;
@@ -463,6 +466,7 @@ class DiskSlabStore : public StoreEngine {
     return Healthy() && activated_.load(std::memory_order_acquire);
   }
   bool MayMutate();
+  Status NoSlotStatusLocked(bool resident);
   int crash_slot_ = -1;              // RevokeAllTrustForCrash registration
   bool closed_ = false;              // Close() ran; closed_clean_ is its result
   bool closed_clean_ = false;
@@ -522,6 +526,7 @@ class DiskSlabStore : public StoreEngine {
   uint64_t evicted_bytes_ = 0;
   uint64_t deferred_remove_total_ = 0;  // under mu_
   std::atomic<uint64_t> dio_write_fallbacks_{0};
+  std::atomic<uint64_t> put_no_slot_{0};
   std::atomic<uint64_t> dio_read_fallbacks_{0};
   std::atomic<uint64_t> table_syncs_{0};
   std::atomic<uint64_t> bind_wipes_{0};

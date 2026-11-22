@@ -1903,10 +1903,29 @@ Status DiskSlabStore::WaitPut(const std::shared_ptr<PutFlight>& flight) {
 // slot is never evicted/reused), and payload_len_ -- installed only after the
 // I/O lands -- is the commit point readers gate on, so an in-flight key reads
 // as a clean miss, never as torn bytes.
+// What a PUT is told when the allocator gave it no slot. The allocator
+// refuses for one of two reasons. Either there is no slot to be had: every
+// slot of the class is pinned by a read or write in flight or protected by
+// retention, and no extent can be taken from another class. The store is
+// healthy and merely cannot take this value now, which is kCacheFull: a
+// client counts the value as not stored and keeps using the node. Or making
+// room failed on the way (an eviction's table record, an extent rebind), in
+// which case that write has failed the store for good, and the answer is the
+// I/O error it is. `resident`: the key still holds a slot from an earlier
+// operation that has not let go; that is neither, and stays kIOError.
+Status DiskSlabStore::NoSlotStatusLocked(bool resident) {
+  if (resident || !Serving()) return Status::kIOError;
+  put_no_slot_.fetch_add(1, std::memory_order_relaxed);
+  return Status::kCacheFull;
+}
+
 template <typename WriteFn>
 Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
                                 const WriteFn& write_payload) {
   if (!Serving()) return Status::kIOError;
+  // Larger than an extent can never be stored: not a full cache, not an I/O
+  // error, and the same answer however often it is asked.
+  if (len > opt_.extent_bytes) return Status::kInvalid;
   const std::string fn = key.Filename();
   SlabAllocator::SlotRef ref;
   std::shared_ptr<PutFlight> flight;
@@ -1945,10 +1964,12 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
       put_flights_.emplace(fn, flight);
       leader = true;
       std::vector<BlockKey> evicted;
-      if (alloc_->Contains(key) || !alloc_->Put(key, len, &ref, &evicted)) {
+      const bool resident = alloc_->Contains(key);
+      if (resident || !alloc_->Put(key, len, &ref, &evicted)) {
+        const Status refused = NoSlotStatusLocked(resident);
         put_flights_.erase(fn);
-        CompletePut(flight, Status::kIOError);
-        return Status::kIOError;
+        CompletePut(flight, refused);
+        return refused;
       }
       alloc_->Pin(key);  // write-pin for the unlocked I/O below
       inflight_[fn]++;
@@ -2046,7 +2067,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
     std::unique_lock<std::mutex> lk(mu_);
     for (size_t i = 0; i < N; ++i) {
       const auto& it = items[i];
-      if (it.len == 0 || it.data == nullptr) {
+      if (it.len == 0 || it.data == nullptr || it.len > opt_.extent_bytes) {
         out[i] = Status::kInvalid;
         continue;
       }
@@ -2088,10 +2109,11 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
         st[i].flight = std::make_shared<PutFlight>();
         put_flights_.emplace(st[i].fn, st[i].flight);
         std::vector<BlockKey> evicted;
-        if (alloc_->Contains(it.key) ||
-            !alloc_->Put(it.key, it.len, &st[i].ref, &evicted)) {
+        const bool resident = alloc_->Contains(it.key);
+        if (resident || !alloc_->Put(it.key, it.len, &st[i].ref, &evicted)) {
+          out[i] = NoSlotStatusLocked(resident);
           put_flights_.erase(st[i].fn);
-          CompletePut(st[i].flight, Status::kIOError);
+          CompletePut(st[i].flight, out[i]);
           break;
         }
         alloc_->Pin(it.key);
@@ -2741,6 +2763,7 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   Stats st;
   st.dio_write_fallbacks =
       dio_write_fallbacks_.load(std::memory_order_relaxed);
+  st.put_no_slot = put_no_slot_.load(std::memory_order_relaxed);
   st.dio_read_fallbacks =
       dio_read_fallbacks_.load(std::memory_order_relaxed);
   st.table_syncs = table_syncs_.load(std::memory_order_relaxed);

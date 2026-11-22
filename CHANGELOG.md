@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- Server, slab disks: a PUT that finds no slot is answered `kCacheFull`, not
+  `kIOError`. When every slot of a size class is held by a read or write in
+  flight or is protected by retention (`DFKV_RETAIN_*`), and no extent can
+  be taken from another class, the disk cannot take another value. It
+  answered that with the status of a failed disk. Clients (every release so
+  far) mark a node bad on `kIOError` and stay away from it for 2 s and up,
+  reads included, although the node was healthy; `kCacheFull` they count as
+  "not stored" and go on using the node.
+  - The status is now `kCacheFull` on every path that reaches the disk: TCP
+    and RDMA, single and batched writes, and the RAM tier's bypass to disk.
+    New counter `dfkv_slab_put_no_slot_total`; these PUTs no longer count in
+    `dfkv_errors_total{op="put",status="io"}`.
+  - A failure while room is being made (the table record of an eviction, an
+    extent rebind) is still `kIOError`, and the store is unhealthy
+    afterwards, as before.
+  - A value larger than one extent is answered `kInvalid`; it was `kIOError`
+    too.
+  - Not changed: the RAM tier's flush to disk treats this refusal like any
+    failed flush (it retries with pauses, then drops the value), whatever
+    the status.
+  No client change is needed; `kCacheFull` has always been part of the
+  protocol.
 - Server, RAM tier and slab disks: whole extents now move between size
   classes toward the data that is used, not away from the class that is not
   written. Two paths move an extent from one size class to another and

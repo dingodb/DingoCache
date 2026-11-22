@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -45,6 +46,15 @@ class DiskSlabStoreTestPeer {
   static void ReclaimNow(DiskSlabStore* store,
                          const std::function<void()>& after_watermark_evict) {
     store->ReclaimTick(after_watermark_evict);
+  }
+  // A read or write in flight holds its slot like this.
+  static bool PinSlot(DiskSlabStore* store, const BlockKey& key) {
+    std::lock_guard<std::mutex> lock(store->mu_);
+    return store->alloc_->Pin(key);
+  }
+  static bool UnpinSlot(DiskSlabStore* store, const BlockKey& key) {
+    std::lock_guard<std::mutex> lock(store->mu_);
+    return store->alloc_->Unpin(key);
   }
   static void BreakTableFd(DiskSlabStore* store) {
     if (store->table_fd_ >= 0) ::close(store->table_fd_);
@@ -1565,10 +1575,116 @@ TEST_F(DiskSlabTest, OversizeValueRejected) {
   bool ok = false;
   DiskSlabStore s(Opts(4096, 4096, 4096), &ok);  // one 4096 slot per extent
   ASSERT_TRUE(ok);
+  // A value that no extent can hold is an invalid request, the same however
+  // often it is made: not an I/O error (a client would stop using the node)
+  // and not a full cache (it would try again).
   std::string big(4097, 'b');
-  EXPECT_EQ(s.Cache(K(1), big.data(), big.size()), Status::kIOError);
+  EXPECT_EQ(s.Cache(K(1), big.data(), big.size()), Status::kInvalid);
+  const auto batch = s.CacheDirectBatch({{K(1), big.data(), big.size(), 8192}});
+  ASSERT_EQ(batch.size(), 1u);
+  EXPECT_EQ(batch[0], Status::kInvalid);
+  EXPECT_TRUE(s.Healthy());
   std::string okv(4096, 'o');
   EXPECT_EQ(s.Cache(K(2), okv.data(), okv.size()), Status::kOk);
+}
+
+// Every slot is held by an operation in flight and there is no extent to
+// take: the store is healthy and cannot take another value right now. That
+// is kCacheFull, which a client counts as "not stored" and goes on using the
+// node; kIOError would have it mark the node bad and stay away from it.
+TEST_F(DiskSlabTest, APutThatFindsNoSlotIsToldTheCacheIsFull) {
+  auto options = Opts(4 * 4096, 4 * 4096, 4096);  // one extent, four slots
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  bool ok = false;
+  DiskSlabStore store(options, &ok);
+  ASSERT_TRUE(ok);
+  std::string value(4000, 'p');
+  for (uint64_t i = 0; i < 4; ++i) {
+    ASSERT_EQ(store.Cache(K(i), value.data(), value.size()), Status::kOk);
+    ASSERT_TRUE(dfkv::DiskSlabStoreTestPeer::PinSlot(&store, K(i)));
+  }
+  EXPECT_EQ(store.Cache(K(10), value.data(), value.size()),
+            Status::kCacheFull);
+  EXPECT_EQ(store.CacheDirect(K(11), value.data(), value.size(), value.size()),
+            Status::kCacheFull);
+  const auto batch = store.CacheDirectBatch(
+      {{K(12), value.data(), value.size(), value.size()},
+       {K(13), value.data(), value.size(), value.size()}});
+  ASSERT_EQ(batch.size(), 2u);
+  EXPECT_EQ(batch[0], Status::kCacheFull);
+  EXPECT_EQ(batch[1], Status::kCacheFull);
+  EXPECT_TRUE(store.Healthy()) << "nothing failed: there was no room";
+  EXPECT_EQ(store.GetStats().put_no_slot, 4u);
+  EXPECT_EQ(store.GetStats().metadata_io_errors, 0u);
+  EXPECT_EQ(store.Count(), 4u);
+  std::string out;
+  for (uint64_t i = 0; i < 4; ++i)
+    EXPECT_EQ(store.Range(K(i), 0, 0, &out), Status::kOk);
+
+  // Room again once one of them lets go.
+  ASSERT_TRUE(dfkv::DiskSlabStoreTestPeer::UnpinSlot(&store, K(0)));
+  EXPECT_EQ(store.Cache(K(10), value.data(), value.size()), Status::kOk);
+  EXPECT_EQ(store.GetStats().put_no_slot, 4u);
+  for (uint64_t i = 1; i < 4; ++i)
+    ASSERT_TRUE(dfkv::DiskSlabStoreTestPeer::UnpinSlot(&store, K(i)));
+}
+
+// Protected by retention is the same case: nothing may be evicted, the node
+// is fine.
+TEST_F(DiskSlabTest, APutIntoAStoreFullOfRetainedValuesIsToldTheCacheIsFull) {
+  ::setenv("DFKV_RETAIN_MAX_PCT", "95", 1);
+  ::setenv("DFKV_RETAIN_MAX_CLASS_PCT", "100", 1);
+  auto options = Opts(64 * 4096, 64 * 4096, 4096);  // one extent, 64 slots
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  bool ok = false;
+  DiskSlabStore store(options, &ok);
+  ::unsetenv("DFKV_RETAIN_MAX_PCT");
+  ::unsetenv("DFKV_RETAIN_MAX_CLASS_PCT");
+  ASSERT_TRUE(ok);
+  std::string value(4000, 'r');
+  const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+  size_t protected_count = 0;
+  for (uint64_t i = 0; i < 64; ++i) {
+    ASSERT_EQ(store.Cache(K(i), value.data(), value.size()), Status::kOk);
+    const uint8_t code = store.Retain(K(i), 600, /*mode=*/0, now);
+    if (code == static_cast<uint8_t>(
+                    dfkv::SlabAllocator::RetainCode::kProtectedNew))
+      ++protected_count;
+    else  // beyond the budget: held by a reader instead
+      ASSERT_TRUE(dfkv::DiskSlabStoreTestPeer::PinSlot(&store, K(i)));
+  }
+  ASSERT_GE(protected_count, 32u);
+  EXPECT_EQ(store.Cache(K(100), value.data(), value.size()),
+            Status::kCacheFull);
+  EXPECT_TRUE(store.Healthy());
+  EXPECT_EQ(store.GetStats().put_no_slot, 1u);
+  for (uint64_t i = 0; i < 64; ++i)
+    dfkv::DiskSlabStoreTestPeer::UnpinSlot(&store, K(i));
+}
+
+// A real failure while room is being made is still an I/O error, and the
+// store is unhealthy afterwards: the two are told apart by what happened,
+// not by where the refusal came from. (EvictionRecordClearFailure... above
+// covers the scalar path; this is the batch.)
+TEST_F(DiskSlabTest, AFailedEvictionDuringABatchPutIsStillAnIoError) {
+  auto options = Opts(4 * 4096, 4 * 4096, 4096);
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  bool ok = false;
+  DiskSlabStore store(options, &ok);
+  ASSERT_TRUE(ok);
+  std::string value(4000, 'e');
+  for (uint64_t i = 0; i < 4; ++i)
+    ASSERT_EQ(store.Cache(K(i), value.data(), value.size()), Status::kOk);
+  dfkv::DiskSlabStoreTestPeer::BreakTableFd(&store);
+  const auto batch = store.CacheDirectBatch(
+      {{K(4), value.data(), value.size(), value.size()}});
+  ASSERT_EQ(batch.size(), 1u);
+  EXPECT_EQ(batch[0], Status::kIOError);
+  EXPECT_FALSE(store.Healthy());
+  EXPECT_EQ(store.GetStats().put_no_slot, 0u);
 }
 
 // The data-path I/O runs OUTSIDE the store lock (pin + inflight-count protect
