@@ -1688,6 +1688,30 @@ class DfkvHiCache(HiCacheStorage):
                 "retain_owns_objects() called before any HiCache pool was registered")
         return self._rank_writes_kv() or next(self._retain_side_pools(), None) is not None
 
+    # Prefixes batch_touch protected recently: identity -> (ttl, monotonic s).
+    _TOUCH_DEBOUNCE_MAX = 4096
+    _touch_seen = None
+    _touch_lock = threading.Lock()
+
+    def _touch_is_fresh(self, prefix, ttl: int) -> bool:
+        with self._touch_lock:
+            seen = self._touch_seen
+            entry = seen.get(prefix) if seen else None
+        if entry is None:
+            return False
+        seen_ttl, at = entry
+        return seen_ttl >= ttl and time.monotonic() - at < ttl / 10.0
+
+    def _touch_note(self, prefix, ttl: int) -> None:
+        with self._touch_lock:
+            if self._touch_seen is None:
+                self._touch_seen = collections.OrderedDict()
+            seen = self._touch_seen
+            seen[prefix] = (ttl, time.monotonic())
+            seen.move_to_end(prefix)
+            while len(seen) > self._TOUCH_DEBOUNCE_MAX:
+                seen.popitem(last=False)
+
     def retain_precheck(self, keys, extra_info=None) -> int:
         """TTL this rank admits for the whole prefix ``keys``, without a write.
 
@@ -1715,20 +1739,39 @@ class DfkvHiCache(HiCacheStorage):
 
         Called by SGLang for prefix hits that never reach storage. Refreshes
         the objects of those pages that this rank writes (main KV and side
-        pools). A ``retain_ttl_s`` hint in ``extra_info`` enables client
-        debounce.
+        pools).
+
+        With a ``retain_ttl_s`` in ``extra_info`` the prefix is protected
+        with a SET, which the native client never debounces, and every call
+        rebuilt the keys of the whole prefix for it: on a hot prefix that is
+        thousands of keys and two round trips per request. A prefix that this
+        process protected for at least that TTL within the last tenth of it
+        is therefore skipped before any key is built -- the same renewal
+        interval the native client applies to a REFRESH with a TTL hint.
         """
         if not keys or not self._has_retain:
             return
+        ttl = self._retain_ttl_of(extra_info)
+        prefix = None
+        if ttl > 0:
+            # Exact identity of the prefix without building its object keys.
+            prefix = (len(keys), keys[0], keys[-1], hash(tuple(keys)))
+            if self._touch_is_fresh(prefix, ttl):
+                return
         sks = self._retain_object_keys(keys)
         if not sks:
             return
-        ttl = self._retain_ttl_of(extra_info)
         try:
             # Decision 9: protect the whole prefix or none of it.
             if ttl > 0 and dfkv_cabi.call_retain_precheck(
                     self._lib, self._h, sks):
                 codes = self._retain_set(sks, ttl)
+                # Skip the next touches only if this one left nothing undone:
+                # every object protected, or parked below to be protected by
+                # its write.
+                if all(c in dfkv_cabi.RETAIN_PROTECTED_CODES
+                       or c == dfkv_cabi.DFKV_RET_MISS for c in codes):
+                    self._touch_note(prefix, ttl)
                 missing = [sk for sk, c in zip(sks, codes)
                            if c == dfkv_cabi.DFKV_RET_MISS]
                 if missing:

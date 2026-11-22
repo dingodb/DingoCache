@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- SGLang HiCache connector: `batch_touch` with a retention TTL no longer
+  repeats its whole work on every request. To protect a prefix it sends a SET,
+  which the native client does not debounce (only a REFRESH with a TTL hint
+  is), and before that it built the object keys of the entire prefix: for a
+  long prefix on a writer rank thousands of keys, a precheck and a SET per
+  request, under the GIL. A prefix this process has protected for at least the
+  requested TTL within the last tenth of that TTL is now skipped before any
+  key is built; the interval is the one the native client uses for refreshes.
+  A touch whose SET left an object unprotected, or whose precheck was refused,
+  is not remembered and is repeated. The table is bounded (4,096 prefixes per
+  process). Touches without a TTL and `retain_precheck` are unchanged.
 - SGLang HiCache connector: storage coordinates are no longer assumed when
   SGLang's parallel context cannot be read. The connector takes the
   context-parallel coordinates of a rank (prefill CP, decode CP) and the
