@@ -5452,10 +5452,15 @@ TEST(RdmaLoopback, UnreachablePeerIsANodeFailureNotARailFailure) {
   const std::vector<BlockKey> keys = {ToBlockKey(SelfHdr(), "absent")};
   std::vector<char> exists;
   EXPECT_EQ(rt.ExistMany(dead_addr, keys, &exists)[0], Status::kIOError);
+  // That was a connect that failed, not a refusal.
+  EXPECT_FALSE(rt.TakeUnreachableRefusal());
   // While the address is held as unreachable it is not dialed again: the
   // next operation, or the client's background probe of the node, fails at
   // once and does not wait for another connect.
   EXPECT_EQ(rt.ExistMany(dead_addr, keys, &exists)[0], Status::kIOError);
+  // The same status, but nothing was tried: the caller can tell, once.
+  EXPECT_TRUE(rt.TakeUnreachableRefusal());
+  EXPECT_FALSE(rt.TakeUnreachableRefusal());
 
   std::string metrics = rt.MetricsText();
   EXPECT_EQ(
@@ -5478,6 +5483,7 @@ TEST(RdmaLoopback, UnreachablePeerIsANodeFailureNotARailFailure) {
   dialing.OnPeerTopology(PublishedPeer(dead_addr, peer_id));
   EXPECT_EQ(dialing.ExistMany(dead_addr, keys, &exists)[0], Status::kIOError);
   EXPECT_EQ(dialing.ExistMany(dead_addr, keys, &exists)[0], Status::kIOError);
+  EXPECT_FALSE(dialing.TakeUnreachableRefusal());
   metrics = dialing.MetricsText();
   EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_peer_unreachable_total"), 2);
   EXPECT_EQ(

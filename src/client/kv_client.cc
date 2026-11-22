@@ -500,6 +500,20 @@ void KVClient::StopClientRegistration() {
 
 KVClient::~KVClient() { StopProbe(); StopClientRegistration(); StopMdsDiscovery(); }
 
+// Every operation reports here what its statuses say about the node it was
+// sent to: PeerHealth::Report is the one place that turns statuses into a
+// verdict. A failure that the transport refused without dialing (the address
+// was held after an earlier failed connect) is not evidence of anything new.
+// The transport's record of this thread's operation is taken on every report,
+// whatever the status, so that it never outlives the operation it describes.
+void KVClient::ReportPeer(const std::string& node, const Status* statuses,
+                          size_t count) {
+  PeerOutcome outcome;
+  for (size_t i = 0; i < count; ++i) outcome.Add(statuses[i]);
+  const bool refused = t_->TakeUnreachableRefusal();
+  health_.Report(node, outcome, NowMs(), outcome.failed && refused);
+}
+
 void KVClient::StartProbe(int interval_ms) {
   if (interval_ms <= 0 || probe_running_.load(std::memory_order_relaxed)) return;
   probe_interval_ms_ = interval_ms;
@@ -529,20 +543,24 @@ void KVClient::ProbeLoop() {
       bool e = false;
       auto t0 = std::chrono::steady_clock::now();
       Status st = t_->Exist(a, probe, &e);
+      // The probe reports nothing to PeerHealth: drop the transport's record
+      // of this operation, as ReportPeer does for the data path.
+      t_->TakeUnreachableRefusal();
       double sec = std::chrono::duration<double>(
                        std::chrono::steady_clock::now() - t0).count();
       // Only record real round trips; a transport IO error (e.g. connect refused)
       // is fast and would skew latency, and is already counted by PeerHealth.
-      // A non-IO reply also means the peer is reachable: clear its data-path
-      // cooldown here (off the data path) so recovery never depends on a data
-      // request re-dialing a peer that is still inside its backed-off cooldown.
+      // A non-IO reply also means the peer is reachable: end its data-path
+      // cooldown early, so that the next request tries it instead of waiting
+      // out a backed-off cooldown. The probe does not decide that the peer is
+      // healthy: a node with a failed store answers this query with a miss.
       // kResourceExhausted and kNoCompatibleRail never dialed the peer at all:
       // their wall time is local resource/topology selection and would poison
       // the latency EWMA; neither proves anything about peer reachability.
       if (st != Status::kIOError && st != Status::kResourceExhausted &&
           st != Status::kNoCompatibleRail) {
         peer_lat_.Observe(a, sec);
-        health_.MarkProbeAlive(a);
+        health_.MarkProbeAlive(a, NowMs());
       }
     }
     std::unique_lock<std::mutex> lk(probe_mu_);
@@ -633,7 +651,9 @@ uint64_t KVClient::NowMs() const {
 
 bool KVClient::RefreshMembers(const std::string& seed_addr) {
   std::string text;
-  if (t_->Members(seed_addr, &text) != Status::kOk) return false;
+  const Status st = t_->Members(seed_addr, &text);
+  t_->TakeUnreachableRefusal();  // not reported to PeerHealth; see ReportPeer
+  if (st != Status::kOk) return false;
   std::vector<std::pair<std::string, std::string>> members;
   for (size_t i = 0; i <= text.size();) {  // parse "name=ip:port,name=ip:port,..."
     size_t c = text.find(',', i);
@@ -680,12 +700,10 @@ bool KVClient::PutDirect(const std::string& key, const void* value, size_t n) {
   } else {
     st = t_->Cache(node, bk, value, n);
   }
+  ReportPeer(node, st);
   if (st == Status::kIOError) {
-    health_.MarkBad(node, NowMs());
     return false;
   }
-  if (st == Status::kOk || st == Status::kNotFound)
-    health_.MarkGood(node, NowMs());
   const bool ok = st == Status::kOk;
   if (ok) InvalidateRendezvous(bk);
   return ok;
@@ -712,12 +730,10 @@ bool KVClient::GetDirect(const std::string& key, void* out, size_t n) {
   std::vector<uint64_t> value_lens;
   const Status st = t_->RangeInto(node, keys, dsts, &value_lens)[0];
   if (!value_lens.empty()) value_len = value_lens[0];
+  ReportPeer(node, st);
   if (st == Status::kIOError) {
-    health_.MarkBad(node, NowMs());
     return false;
   }
-  if (st == Status::kOk || st == Status::kNotFound)
-    health_.MarkGood(node, NowMs());
   return st == Status::kOk && value_len == n;
 }
 
@@ -746,13 +762,11 @@ bool KVClient::GetAutoDirect(const std::string& key, std::string* out,
   std::vector<uint64_t> value_lens;
   const Status st = t_->RangeInto(node, keys, dsts, &value_lens)[0];
   if (!value_lens.empty()) value_len = value_lens[0];
+  ReportPeer(node, st);
   if (st == Status::kIOError) {
-    health_.MarkBad(node, NowMs());
     out->clear();
     return false;
   }
-  if (st == Status::kOk || st == Status::kNotFound)
-    health_.MarkGood(node, NowMs());
   if (st != Status::kOk || value_len > max_bytes ||
       out->size() < value_len) {
     out->clear();
@@ -788,12 +802,10 @@ bool KVClient::GetAutoDirect(const std::string& key, void* out, size_t cap,
   std::vector<uint64_t> value_lens;
   const Status st = t_->RangeInto(node, keys, dsts, &value_lens)[0];
   if (!value_lens.empty()) value_len = value_lens[0];
+  ReportPeer(node, st);
   if (st == Status::kIOError) {
-    health_.MarkBad(node, NowMs());
     return false;
   }
-  if (st == Status::kOk || st == Status::kNotFound)
-    health_.MarkGood(node, NowMs());
   if (st != Status::kOk || value_len > cap) return false;
   if (out_len) *out_len = static_cast<size_t>(value_len);
   return true;
@@ -816,12 +828,10 @@ bool KVClient::ExistDirect(const std::string& key, Status* status) {
   bool exists = false;
   const Status st = t_->Exist(node, ToBlockKey(key_namespace_, key), &exists);
   if (status) *status = st;
+  ReportPeer(node, st);
   if (st == Status::kIOError) {
-    health_.MarkBad(node, NowMs());
     return false;
   }
-  if (st == Status::kOk || st == Status::kNotFound)
-    health_.MarkGood(node, NowMs());
   return st == Status::kOk && exists;
 }
 
@@ -845,12 +855,10 @@ bool KVClient::RemoveDirect(const std::string& key) {
   if (!health_.Healthy(node, now)) return false;
   const BlockKey block_key = ToBlockKey(key_namespace_, key);
   const Status st = t_->Remove(node, block_key);
+  ReportPeer(node, st);
   if (st == Status::kIOError) {
-    health_.MarkBad(node, NowMs());
     return false;
   }
-  if (st == Status::kOk || st == Status::kNotFound)
-    health_.MarkGood(node, NowMs());
   const bool ok = st == Status::kOk || st == Status::kNotFound;
   if (ok) InvalidateRendezvous(block_key);
   return ok;
@@ -891,14 +899,7 @@ std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
       ok[idx[m]] = (sts[m] == Status::kOk) ? 1 : 0;
       if (ok[idx[m]]) InvalidateRendezvous(srcs[m].key);
     }
-    bool resp = false, ioerr = false;
-    // kInvalid (oversize/per-item guard) is neither: it must not clear the
-    // peer cooldown (resp) nor trip MarkBad (ioerr).
-    for (Status s : sts) {
-      if (s == Status::kIOError) ioerr = true;
-      else if (s == Status::kOk || s == Status::kNotFound) resp = true;
-    }
-    if (resp) health_.MarkGood(node, NowMs()); else if (ioerr) health_.MarkBad(node, NowMs());
+    ReportPeer(node, sts);
   });
   }
   uint64_t bytes = 0;
@@ -1028,14 +1029,7 @@ std::vector<bool> KVClient::BatchGetDirect(const std::vector<KvGetItem>& items) 
       // host or CUDA destination before returning the authoritative size.
       std::vector<uint64_t> value_lens;
       std::vector<Status> sts = t_->RangeInto(node, keys, dsts, &value_lens);
-      bool resp = false, ioerr = false;
-      // kInvalid (oversize/per-item guard) is neither: it must not clear the
-      // peer cooldown (resp) nor trip MarkBad (ioerr).
-      for (Status s : sts) {
-        if (s == Status::kIOError) ioerr = true;
-        else if (s == Status::kOk || s == Status::kNotFound) resp = true;
-      }
-      if (resp) health_.MarkGood(node, NowMs()); else if (ioerr) health_.MarkBad(node, NowMs());
+      ReportPeer(node, sts);
       for (size_t m = 0; m < idx.size(); ++m) {
         if (sts[m] == Status::kOk && m < value_lens.size() &&
             value_lens[m] == n)
@@ -1199,14 +1193,7 @@ std::vector<bool> KVClient::BatchGetAutoDirect(const std::vector<KvGetItem>& ite
     }
     std::vector<uint64_t> value_lens;
     std::vector<Status> sts = t_->RangeInto(node, keys, dsts, &value_lens);
-    bool resp = false, ioerr = false;
-    // kInvalid (oversize/per-item guard) is neither: it must not clear the
-    // peer cooldown (resp) nor trip MarkBad (ioerr).
-    for (Status s : sts) {
-      if (s == Status::kIOError) ioerr = true;
-      else if (s == Status::kOk || s == Status::kNotFound) resp = true;
-    }
-    if (resp) health_.MarkGood(node, NowMs()); else if (ioerr) health_.MarkBad(node, NowMs());
+    ReportPeer(node, sts);
     for (size_t m = 0; m < idx.size(); ++m) {
       if (sts[m] != Status::kOk || m >= value_lens.size() ||
           value_lens[m] > cap)
@@ -1341,7 +1328,6 @@ void KVClient::RetainNode(const std::string& node, uint64_t tenant,
     for (size_t m = from; m < idx.size(); ++m) sub.push_back(bkeys[idx[m]]);
     std::vector<char> ex;
     const std::vector<Status> sts = t_->ExistMany(node, sub, &ex);
-    bool resp = false, ioerr = false;
     for (size_t m = 0; m < sub.size(); ++m) {
       const Status st = m < sts.size() ? sts[m] : Status::kInvalid;
       uint8_t code = kRetError;
@@ -1349,14 +1335,9 @@ void KVClient::RetainNode(const std::string& node, uint64_t tenant,
         code = (m < ex.size() && ex[m]) ? kRetHitUnprotected : kRetMiss;
       else if (st == Status::kNotFound)
         code = kRetMiss;
-      if (st == Status::kOk || st == Status::kNotFound) resp = true;
-      if (st == Status::kIOError) ioerr = true;
       out[idx[from + m]] = code;
     }
-    if (resp)
-      health_.MarkGood(node, NowMs());
-    else if (ioerr)
-      health_.MarkBad(node, NowMs());
+    ReportPeer(node, sts);
   };
 
   if (!health_.Healthy(node, NowMs())) {
@@ -1390,11 +1371,11 @@ void KVClient::RetainNode(const std::string& node, uint64_t tenant,
       return;
     }
     if (st != Status::kOk || reply.size() != n + kRetainTrailerBytes) {
-      if (st == Status::kIOError) health_.MarkBad(node, NowMs());
+      ReportPeer(node, st);
       for (size_t m = 0; m < n; ++m) out[idx[begin + m]] = kRetError;
       continue;
     }
-    health_.MarkGood(node, NowMs());
+    ReportPeer(node, st);
     const RetainTrailer trailer = DecodeRetainTrailer(reply.data() + n);
     {
       std::lock_guard<std::mutex> lk(retain_mu_);
@@ -1481,6 +1462,7 @@ void KVClient::RetainLimits(int* supported, uint32_t* max_ttl_s) {
     EncodeRetainPayload(&payload[0], 0, kRetainModeRefresh, &probe, 1);
     std::string reply;
     const Status st = t_->Retain(node, tenant, 1, payload, &reply);
+    t_->TakeUnreachableRefusal();  // not reported to PeerHealth; see ReportPeer
     std::lock_guard<std::mutex> lk(retain_mu_);
     RetainNodeState& ns = retain_nodes_[node];
     if (st == Status::kInvalid) {
@@ -2273,19 +2255,7 @@ std::vector<bool> KVClient::BatchExistDirect(
         gstat[g].first_fail = std::move(first_fail);
       gstat[g].dev = std::move(shard_dev);
     }
-    bool resp = false, ioerr = false;
-    // kInvalid (oversize/per-item guard) is neither: it must not clear the
-    // peer cooldown (resp) nor trip MarkBad (ioerr).
-    for (Status status : sts) {
-      if (status == Status::kIOError)
-        ioerr = true;
-      else if (status == Status::kOk || status == Status::kNotFound)
-        resp = true;
-    }
-    if (resp)
-      health_.MarkGood(node, NowMs());
-    else if (ioerr)
-      health_.MarkBad(node, NowMs());
+    ReportPeer(node, sts);
     for (size_t m = 0; m < idx.size(); ++m) {
       if (m < sts.size()) raw[idx[m]] = sts[m];
       e[idx[m]] =
@@ -2362,14 +2332,7 @@ std::vector<bool> KVClient::BatchRemove(const std::vector<std::string>& keys) {
     bkeys.reserve(idx.size());
     for (size_t k : idx) bkeys.push_back(ToBlockKey(key_namespace_, keys[k]));
     std::vector<Status> sts = t_->RemoveMany(node, bkeys);
-    bool resp = false, ioerr = false;
-    // kInvalid (oversize/per-item guard) is neither: it must not clear the
-    // peer cooldown (resp) nor trip MarkBad (ioerr).
-    for (Status s : sts) {
-      if (s == Status::kIOError) ioerr = true;
-      else if (s == Status::kOk || s == Status::kNotFound) resp = true;
-    }
-    if (resp) health_.MarkGood(node, NowMs()); else if (ioerr) health_.MarkBad(node, NowMs());
+    ReportPeer(node, sts);
     for (size_t m = 0; m < idx.size(); ++m) {
       const bool removed =
           m < sts.size() &&
@@ -2520,14 +2483,7 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
           (m < sts.size() && sts[m] == Status::kOk) ? 1 : 0;
       if (ok[idx[m]]) InvalidateRendezvous(srcs[m].key);
     }
-    bool resp = false, ioerr = false;
-    // kInvalid (oversize/per-item guard) is neither: it must not clear the
-    // peer cooldown (resp) nor trip MarkBad (ioerr).
-    for (Status s : sts) {
-      if (s == Status::kIOError) ioerr = true;
-      else if (s == Status::kOk || s == Status::kNotFound) resp = true;
-    }
-    if (resp) health_.MarkGood(node, NowMs()); else if (ioerr) health_.MarkBad(node, NowMs());
+    ReportPeer(node, sts);
   });
   if (pernode_on) {
     std::map<std::string, PernodeStat> per;
@@ -2910,15 +2866,7 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
           gstat[g].first_fail = std::move(first_fail);
         gstat[g].dev = std::move(shard_dev);
       }
-      bool resp = false, ioerr = false;
-      // kInvalid (oversize/per-item guard) is neither: it must not clear the
-      // peer cooldown (resp) nor trip MarkBad (ioerr).
-      for (Status s : sts) {
-        if (s == Status::kIOError) ioerr = true;
-        else if (s == Status::kOk || s == Status::kNotFound) resp = true;
-      }
-      if (resp) health_.MarkGood(node, NowMs());
-      else if (ioerr) health_.MarkBad(node, NowMs());
+      ReportPeer(node, sts);
       for (size_t m = 0; m < idx.size(); ++m) {
         const size_t cap = groups[g].first.second;
         if (m >= sts.size() || sts[m] != Status::kOk ||

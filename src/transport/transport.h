@@ -228,6 +228,15 @@ class Transport {
     (void)live_peer_ids;
   }
 
+  // True when an operation that just failed with kIOError on the calling
+  // thread never reached its peer: the transport refused it because a connect
+  // to that address had failed shortly before. Such a failure repeats what is
+  // already known; a caller that keeps a health record for the peer must not
+  // count it as another failed attempt. Reading it clears it; a caller takes
+  // it after every operation, so that it never describes an earlier one.
+  // Transports that never refuse without dialing keep the default.
+  virtual bool TakeUnreachableRefusal() { return false; }
+
   // True if CacheMany/RangeMany pipeline requests on one connection (RDMA). When
   // false (TCP), the client parallelizes batches across items with its own
   // threads instead, since the per-node loop here would be sequential.

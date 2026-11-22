@@ -336,6 +336,14 @@ class KVClient {
   std::atomic<GpuNodeDedup*> gpu_dedup_raw_{nullptr};
   std::unique_ptr<MdsRegistrar> client_registrar_;  // consumer identity lease (best-effort)
   PeerHealth health_;
+  // Reports an operation's statuses for `node` to health_ (see the .cc).
+  void ReportPeer(const std::string& node, const Status* statuses, size_t count);
+  void ReportPeer(const std::string& node, Status status) {
+    ReportPeer(node, &status, 1);
+  }
+  void ReportPeer(const std::string& node, const std::vector<Status>& statuses) {
+    ReportPeer(node, statuses.data(), statuses.size());
+  }
   OpMetrics op_stats_;  // every public put/get/exist/remove call, exactly once
   int get_miss_retries_ = 1;
 
