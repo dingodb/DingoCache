@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 2.39.0 — 2026-11-22
+
 - Client: a cache node that answers slowly no longer holds up reads of the
   other nodes. Batch reads over RDMA run on a fixed set of workers shared by
   the whole process (`DFKV_RDMA_READ_WORKERS`, 7 by default), and a batch
