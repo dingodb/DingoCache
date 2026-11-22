@@ -1375,10 +1375,15 @@ class DfkvHiCache(HiCacheStorage):
                 names = ["k", "v"]
                 replicated = False
             elif count == 1:
-                # The metadata API itself proves the legacy packed single-buffer
-                # layout. This is the only safe replicated fallback.
+                # One object per page: the packed single-buffer layout. It is
+                # the same on every TP rank only for an MLA model, whose
+                # attention state is not split by heads. Elsewhere a single
+                # buffer can hold this rank's heads (the sparse index-K pool
+                # of an MHA model splits its heads over TP): stored under one
+                # replicated key, every rank would overwrite the others' and
+                # read a different rank's heads back at the same size.
                 names = ["all"]
-                replicated = True
+                replicated = self.is_mla
             else:
                 raise RuntimeError(
                     f"ambiguous {count}-component pool without layout metadata")
@@ -1604,6 +1609,30 @@ class DfkvHiCache(HiCacheStorage):
             self._sg_chunks = {}
         self._sg_chunks["kv"] = max(1, (segments + w - 1) // w)
 
+    def _set_sidecar_components(self, key: str) -> None:
+        """Components of a device sidecar: one object per page.
+
+        A host pool registered under the same name has already discovered
+        its layout; the device registration must agree with it rather than
+        overwrite it.
+        """
+        if not hasattr(self, "_pool_component_names"):
+            self._pool_component_names = {}
+        if not hasattr(self, "_pool_replicated"):
+            self._pool_replicated = {}
+        layout = (("all",), bool(self.is_mla))
+        if key in self._pool_component_names:
+            host = (tuple(self._pool_component_names[key]),
+                    bool(self._pool_replicated.get(key)))
+            if host != layout:
+                raise RuntimeError(
+                    f"device sidecar {key!r} has one replicated={layout[1]} "
+                    f"object per page, but its host pool registered "
+                    f"components={host[0]} replicated={host[1]}")
+            return
+        self._pool_component_names[key] = layout[0]
+        self._pool_replicated[key] = layout[1]
+
     def register_mem_pool_device_sidecar(self, name, device_pool):
         """Register a DSA sidecar GPU pool, strictly in requested bypass mode."""
         from sglang.srt.mem_cache.device_page_meta import sidecar_device_pool_regions
@@ -1623,13 +1652,10 @@ class DfkvHiCache(HiCacheStorage):
             self._note_load_device(device_pool)
             self._note_pool_layout(key, device_pool, device=True)
             # The sidecar metadata API returns one logical object per page; its
-            # layers are SG segments, not independent pool components.
-            if not hasattr(self, "_pool_component_names"):
-                self._pool_component_names = {}
-            if not hasattr(self, "_pool_replicated"):
-                self._pool_replicated = {}
-            self._pool_component_names[key] = ("all",)
-            self._pool_replicated[key] = True
+            # layers are SG segments, not independent pool components. Like a
+            # one-object host pool it is the same on every TP rank only for an
+            # MLA model.
+            self._set_sidecar_components(key)
             result.result = (
                 f"registered {registered} sidecar device region(s)"
                 if registered else "no sidecar device buffer registered")
@@ -1673,12 +1699,7 @@ class DfkvHiCache(HiCacheStorage):
             self._sidecar_device_pools[name] = mem_pool_device_draft
             self._note_pool_layout(name, mem_pool_device_draft, device=True)
             # Same API-proven one-object layout as the target indexer sidecar.
-            if not hasattr(self, "_pool_component_names"):
-                self._pool_component_names = {}
-            if not hasattr(self, "_pool_replicated"):
-                self._pool_replicated = {}
-            self._pool_component_names[name] = ("all",)
-            self._pool_replicated[name] = True
+            self._set_sidecar_components(name)
             result.result = (
                 f"registered {registered} draft indexer region(s)"
                 if registered else "no draft indexer buffer registered")

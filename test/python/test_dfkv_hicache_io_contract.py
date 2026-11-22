@@ -297,6 +297,96 @@ class GpuLoadFenceDevice(unittest.TestCase):
         self.assertEqual((got, synchronized, native), ([True], [5], 5))
 
 
+class _SingleObjectPool:
+    """A host side pool with one object per page (one buffer)."""
+
+    page_size = 4
+
+    def get_page_buffer_meta(self, indices):
+        n = max(1, len(list(indices)) // self.page_size)
+        return [0x1000] * n, [256] * n
+
+
+class SingleObjectSidePool(unittest.TestCase):
+    """One object per page means TP-replicated only for an MLA model. An MHA
+    model's single-buffer side pool (the sparse index-K pool splits its heads
+    over TP) holds each rank's own heads; under one replicated key every rank
+    overwrote the others and read another rank's heads back."""
+
+    def _keys(self, is_mla, tp_rank):
+        st = _plugin(is_mla=is_mla, tp_size=2, tp_rank=tp_rank,
+                     _mla_replica_writer=tp_rank == 0)
+        st._validate_pool_object_sizes = lambda sizes, context: None
+        st._register_pool_buffers = lambda pool: 0
+        st.register_mem_host_pool_v2(_SingleObjectPool(), "indexer")
+        return st, st._pool_keys("indexer", "page")
+
+    def test_mha_single_object_pool_is_per_rank(self):
+        r0, k0 = self._keys(is_mla=False, tp_rank=0)
+        r1, k1 = self._keys(is_mla=False, tp_rank=1)
+        self.assertFalse(r0._pool_is_replicated("indexer"))
+        self.assertNotEqual(k0, k1)
+        self.assertTrue(r0._rank_writes_pool("indexer"))
+        self.assertTrue(r1._rank_writes_pool("indexer"))
+
+    def test_mla_single_object_pool_stays_replicated(self):
+        r0, k0 = self._keys(is_mla=True, tp_rank=0)
+        r1, k1 = self._keys(is_mla=True, tp_rank=1)
+        self.assertTrue(r0._pool_is_replicated("indexer"))
+        self.assertEqual(k0, k1)
+        self.assertTrue(r0._rank_writes_pool("indexer"))
+        self.assertFalse(r1._rank_writes_pool("indexer"), "one writer")
+
+
+class _SidecarDevicePool:
+    page_size = 4
+
+    def __init__(self):
+        self.index_k_with_scale_buffer = [_Tensor(0x200000), _Tensor(0x300000)]
+
+
+class DeviceSidecarComponents(unittest.TestCase):
+    """A device sidecar is TP-replicated only for an MLA model, and does not
+    overwrite what its host pool of the same name registered."""
+
+    def _plugin(self, is_mla, tp_rank=0):
+        st = _plugin(is_mla=is_mla, tp_size=2, tp_rank=tp_rank,
+                     _mla_replica_writer=tp_rank == 0,
+                     _registered_regions=set())
+        st.register_memory = lambda base, size: True
+        st._validate_pool_object_sizes = lambda sizes, context: None
+        st._register_pool_buffers = lambda pool: 0
+        return st
+
+    def test_non_mla_device_sidecar_is_per_rank(self):
+        keys = []
+        for rank in (0, 1):
+            st = self._plugin(is_mla=False, tp_rank=rank)
+            st.register_mem_pool_device_sidecar("indexer", _SidecarDevicePool())
+            self.assertFalse(st._pool_is_replicated("indexer"))
+            keys.append(st._pool_keys("indexer", "page", True))
+        self.assertNotEqual(keys[0], keys[1])
+
+    def test_mla_device_sidecar_stays_replicated(self):
+        st = self._plugin(is_mla=True)
+        st.register_mem_pool_device_sidecar("indexer", _SidecarDevicePool())
+        self.assertTrue(st._pool_is_replicated("indexer"))
+
+    def test_host_registration_is_not_overwritten(self):
+        st = self._plugin(is_mla=False)
+        st.register_mem_host_pool_v2(_SingleObjectPool(), "indexer")
+        st.register_mem_pool_device_sidecar("indexer", _SidecarDevicePool())
+        self.assertFalse(st._pool_is_replicated("indexer"))
+        self.assertEqual(st._pool_components("indexer"), ("all",))
+
+    def test_disagreeing_registrations_are_refused(self):
+        st = self._plugin(is_mla=True)
+        st._pool_component_names = {"indexer": ("l000", "l001")}
+        st._pool_replicated = {"indexer": False}
+        with self.assertRaisesRegex(RuntimeError, "host pool registered"):
+            st.register_mem_pool_device_sidecar("indexer", _SidecarDevicePool())
+
+
 class DeviceDirectState(unittest.TestCase):
     """Which key form is in use is explicit, not "a device pool exists"."""
 

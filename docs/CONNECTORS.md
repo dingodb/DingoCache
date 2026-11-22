@@ -629,6 +629,9 @@ fp8）而非 KV 的元素类型，同宽度的 fp8 变体分不出，仍需在 e
   io_uring 直读入注册 buffer，RDMA v2 以 one-sided WRITE 直落 client 目标
   MR，无 payload memcpy。
 - MLA 下插件自动单对象、无 rank 后缀、`backup_skip`（仅 tp_rank0 写）。decode 共享前缀配同 members。
+- 多池模型的侧池：每页只有一个对象的 host pool，只在 MLA 模型下按 TP 复制（共享 key、
+  单一写入者）；非 MLA 模型的单对象侧池（如稀疏注意力的 index-K pool，index head 按
+  TP 切分）按 rank 存储，每个 rank 都写。
 - **多池模型**（Mamba/SWA/DeepSeek-V4）用 v2 PoolTransfer 接口（插件已实现）。
   部分 DeepSeek-V4 等引擎的主 `kv` 是无数据 LogicalHostPool（`get_page_buffer_meta→None`）：
   插件写入单字节 marker 锚定前缀；v1/v2 实际主池读取也通过 native GET 读取 marker，刷新读最近性。
