@@ -953,6 +953,8 @@ def test_same_step_resume_save_releases_finished_blocks(hybrid_workers, monkeypa
     producer.get_transfer_results(set(), metadata)
     key = PoolKey(producer.token_dbs[1].metadata, hashes[0].hex()).to_bytes()
     assert objects[producer.client.namespace, key] == bytes([30]) * 16
+    # The attention part of the SAVE does not hold up the step; let it finish.
+    sender.request_queue.join()
     result = producer.get_transfer_results(
         {request.req_id}, SimpleNamespace(requests=[], preempted_req_ids=set()),
     )

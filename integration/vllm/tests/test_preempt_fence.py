@@ -37,16 +37,15 @@ except ImportError:  # pragma: no cover - vllm not installed
     HAVE_VLLM = False
 
 
-def _req_meta(req_id: str) -> "types.SimpleNamespace":
-    # The fields _handle_request touches before it bails out on empty
-    # token_databases (masks come from coord.store_mask; the db loop is empty).
-    return types.SimpleNamespace(
+def _req_meta(req_id: str) -> "ReqMeta":
+    # _handle_request bails out on empty token_databases (masks come from
+    # coord.store_mask; the db loop is empty). A real ReqMeta, so that every
+    # field the send path reads has its production default.
+    return ReqMeta(
         req_id=req_id,
         token_len_chunk=32,
         block_ids=(),
         block_hashes=[],
-        current_event=None,
-        token_ids=None,
     )
 
 

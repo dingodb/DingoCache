@@ -501,6 +501,10 @@ class ReqMeta:
     # Set only on the SAVE that first covers the whole prompt with partial
     # hash hits enabled: the worker then publishes the prompt's partial tail.
     num_prompt_tokens: int | None = None
+    # Cache groups this SAVE covers; None = all. The worker splits a SAVE of
+    # a hybrid model into its mutable-source groups, which the model step
+    # waits for, and the rest, which it does not.
+    save_groups: frozenset[int] | None = None
 
     @staticmethod
     def from_request_tracker(

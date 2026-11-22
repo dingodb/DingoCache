@@ -24,11 +24,13 @@ from dfkv_vllm.data import (  # noqa: E402
     ChunkedTokenDatabase,
     KeyMetadata,
     LoadSpec,
+    PoolKey,
     ReqMeta,
 )
 from dfkv_vllm.worker import (  # noqa: E402
     DfkvStoreWorker,
     KVCacheStoreRecvingThread,
+    KVCacheStoreSendingThread,
 )
 from vllm.v1.core.kv_cache_utils import BlockHash  # noqa: E402
 
@@ -356,6 +358,330 @@ class AnObjectOfTheOldLayoutIsNotLoaded(unittest.TestCase):
         client.remove_release.set()
         receiver.stop()
         self.assertEqual(client.removed, [[key]])
+
+
+# --------------------------------------------------------------------------
+# SAVE of a hybrid model: what the model thread waits for
+# --------------------------------------------------------------------------
+
+ATTENTION, STATE = 0, 1
+ADDR = {ATTENTION: 0x1000, STATE: 0x9000}
+
+
+class _GroupDb:
+    """One cache group of one block: a single segment at ADDR[group]."""
+
+    block_size = 64
+
+    def __init__(self, group: int) -> None:
+        self.group = group
+        self.metadata = _metadata("kv" if group == ATTENTION else "mamba")
+        self.metadata = KeyMetadata(**{**self.metadata.__dict__, "group_id": group})
+        self.cacheable = True
+        self._seg_layout = [(ADDR[group], 64, 64)]
+
+    def process_tokens(self, token_len, block_hashes):
+        if token_len < 64:
+            return []
+        return [(0, 64, PoolKey(self.metadata, bytes(block_hashes[0]).hex()))]
+
+    def descriptor_shape(self, _start, _end, block_ids):
+        return 1, 64, block_ids[0]
+
+    def fill_descriptors(self, _start, _end, _block_ids, pointers, sizes, offset=0):
+        pointers[offset] = ADDR[self.group]
+        sizes[offset] = 64
+        return offset + 1
+
+
+class _UncachedDb(_GroupDb):
+    def __init__(self) -> None:
+        super().__init__(ATTENTION)
+        self.metadata = KeyMetadata(**{**self.metadata.__dict__, "group_id": 2})
+        self.cacheable = False
+
+    def process_tokens(self, token_len, block_hashes):
+        return []
+
+
+class _Client:
+    """PUTs of a group can be held until released, or fail."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.stored: dict[bytes, int] = {}
+        self.hold = {ATTENTION: threading.Event(), STATE: threading.Event()}
+        self.hold[ATTENTION].set()
+        self.hold[STATE].set()
+        self.entered = {ATTENTION: threading.Event(), STATE: threading.Event()}
+        self.fail_group: int | None = None
+
+    def batch_exist(self, keys):
+        with self.lock:
+            return [1 if k in self.stored else 0 for k in keys]
+
+    def batch_put_sg(self, keys, ptrs, _sizes):
+        groups = {
+            g for g, addr in ADDR.items() for p in ptrs if list(p)[0] == addr
+        }
+        for g in groups:
+            self.entered[g].set()
+        for g in groups:
+            assert self.hold[g].wait(10), "a held PUT was never released"
+        if self.fail_group in groups:
+            raise RuntimeError("injected PUT failure")
+        with self.lock:
+            for key, p in zip(keys, ptrs):
+                self.stored[key] = list(p)[0]
+        return [0] * len(keys)
+
+
+class _Event:
+    def record(self) -> None:
+        pass
+
+    def synchronize(self) -> None:
+        pass
+
+
+def _hash(seed: str) -> BlockHash:
+    import hashlib
+    return BlockHash(hashlib.sha256(seed.encode()).digest())
+
+
+class _SaveRig:
+    """The SAVE half of a worker for a model with one attention group and
+    one recurrent-state group, over a real sending thread."""
+
+    def __init__(
+        self,
+        test: unittest.TestCase,
+        *,
+        fenced=frozenset({STATE}),
+        uncached_group: bool = False,
+        queue_capacity: int = 64,
+    ) -> None:
+        self.client = _Client()
+        self.operations: list[tuple[str, str]] = []
+        self.dbs = [_GroupDb(ATTENTION), _GroupDb(STATE)]
+        masks = [[True], [True]]
+        if uncached_group:
+            # Never cached (a scratch / circular-buffer pool): no objects.
+            self.dbs.append(_UncachedDb())
+            masks.append([False])
+        coord = fake_coordinator(64, store_mask=lambda _n: masks)
+        self.sender = KVCacheStoreSendingThread(
+            self.client, coord, self.dbs, block_size=64, tp_rank=0,
+            stripe_idx=0, stripe_step=1, kv_role="kv_both",
+            ready_event=threading.Event(),
+            record_operation=lambda operation, status="ok", **_kw:
+                self.operations.append((operation, status)),
+            queue_capacity=queue_capacity,
+        )
+        worker = object.__new__(DfkvStoreWorker)
+        worker.load_async = False
+        worker.kv_role = "kv_both"
+        worker.kv_send_thread = self.sender
+        worker.kv_recv_thread = None
+        worker._fenced_store_groups = frozenset(fenced)
+        worker.token_dbs = self.dbs
+        worker.finished_store_req = set()
+        self.worker = worker
+        self.sender.start()
+        assert self.sender.ready_event.wait(5)
+        test.addCleanup(self.close)
+        patcher = patch.object(worker_module.torch.cuda, "Event", _Event, create=True)
+        patcher.start()
+        test.addCleanup(patcher.stop)
+
+    def close(self) -> None:
+        for event in self.client.hold.values():
+            event.set()
+        self.sender.stop(cancel_pending=False)
+
+    def request(self, name: str) -> ReqMeta:
+        return ReqMeta(
+            req_id=name, token_len_chunk=64,
+            block_ids=tuple([g + 1] for g in range(len(self.dbs))),
+            block_hashes=[_hash(name)], can_save=True,
+        )
+
+    def key(self, group: int, name: str) -> bytes:
+        return PoolKey(self.dbs[group].metadata, bytes(_hash(name)).hex()).to_bytes()
+
+    def submit_in_background(self, *requests: ReqMeta):
+        done = threading.Event()
+        errors: list[BaseException] = []
+
+        def step() -> None:
+            try:
+                self.worker._submit_transfers(SimpleNamespace(requests=list(requests)))
+            except BaseException as exc:  # pragma: no cover - reported below
+                errors.append(exc)
+            finally:
+                done.set()
+
+        threading.Thread(target=step, daemon=True).start()
+        return done, errors
+
+    def finished(self, names) -> set:
+        return self.worker._get_and_clear_finished_sending(set(names))
+
+
+class HybridSaveFencesOnlyTheMutableState(unittest.TestCase):
+    def test_the_model_step_does_not_wait_for_the_attention_put(self) -> None:
+        rig = _SaveRig(self)
+        rig.client.hold[ATTENTION].clear()
+        done, errors = rig.submit_in_background(rig.request("r"))
+        self.assertTrue(rig.client.entered[ATTENTION].wait(5))
+        self.assertTrue(
+            done.wait(2),
+            "the model step waited for the PUT of immutable attention blocks",
+        )
+        self.assertEqual(errors, [])
+        # The state is stored before the step returns.
+        self.assertIn(rig.key(STATE, "r"), rig.client.stored)
+        self.assertNotIn(rig.key(ATTENTION, "r"), rig.client.stored)
+        # The request is not reported finished while its attention PUT runs:
+        # vLLM keeps those blocks until then.
+        self.assertEqual(rig.finished({"r"}), set())
+        rig.client.hold[ATTENTION].set()
+        rig.sender.request_queue.join()
+        self.assertIn(rig.key(ATTENTION, "r"), rig.client.stored)
+        self.assertEqual(rig.finished(set()), {"r"})
+
+    def test_the_model_step_waits_for_the_state_put(self) -> None:
+        rig = _SaveRig(self)
+        rig.client.hold[STATE].clear()
+        done, errors = rig.submit_in_background(rig.request("r"))
+        self.assertTrue(rig.client.entered[STATE].wait(5))
+        self.assertFalse(
+            done.wait(0.5),
+            "the next step could overwrite the state before its PUT is done",
+        )
+        rig.client.hold[STATE].set()
+        self.assertTrue(done.wait(5))
+        self.assertEqual(errors, [])
+        self.assertIn(rig.key(STATE, "r"), rig.client.stored)
+
+    def test_a_running_attention_put_of_an_earlier_step_is_not_waited_for(self) -> None:
+        rig = _SaveRig(self)
+        rig.client.hold[ATTENTION].clear()
+        first, _ = rig.submit_in_background(rig.request("a"))
+        self.assertTrue(first.wait(2))
+        self.assertTrue(rig.client.entered[ATTENTION].wait(5))
+        second, errors = rig.submit_in_background(rig.request("b"))
+        self.assertTrue(
+            second.wait(2),
+            "the state fence waited behind another request's attention PUT",
+        )
+        self.assertEqual(errors, [])
+        self.assertIn(rig.key(STATE, "b"), rig.client.stored)
+
+    def test_a_failed_state_put_releases_the_step_and_is_accounted(self) -> None:
+        rig = _SaveRig(self)
+        rig.client.fail_group = STATE
+        done, errors = rig.submit_in_background(rig.request("r"))
+        self.assertTrue(done.wait(5))
+        self.assertEqual(errors, [])
+        rig.sender.request_queue.join()
+        self.assertNotIn(rig.key(STATE, "r"), rig.client.stored)
+        self.assertIn(rig.key(ATTENTION, "r"), rig.client.stored)
+        self.assertIn(("save_put", "error"), rig.operations)
+        self.assertEqual(rig.finished({"r"}), {"r"})
+
+    def test_preemption_waits_for_either_part_in_flight(self) -> None:
+        rig = _SaveRig(self)
+        rig.client.hold[ATTENTION].clear()
+        done, _ = rig.submit_in_background(rig.request("r"))
+        self.assertTrue(done.wait(2))
+        self.assertTrue(rig.client.entered[ATTENTION].wait(5))
+        self.assertFalse(rig.sender.wait_for_inflight_put("r", timeout_s=0.2))
+        rig.client.hold[ATTENTION].set()
+        self.assertTrue(rig.sender.wait_for_inflight_put("r", timeout_s=5))
+
+    def test_no_attention_part_when_every_cached_group_is_fenced(self) -> None:
+        rig = _SaveRig(
+            self, fenced=frozenset({ATTENTION, STATE}), uncached_group=True,
+        )
+        queued = []
+        add_request = rig.sender.add_request
+        rig.sender.add_request = lambda request: (
+            queued.append(request), add_request(request))[1]
+        done, errors = rig.submit_in_background(rig.request("r"))
+        self.assertTrue(done.wait(5))
+        self.assertEqual(errors, [])
+        self.assertEqual(queued, [], "an empty attention part was queued")
+        self.assertEqual(rig.finished({"r"}), {"r"})
+
+    def test_preempted_while_the_attention_part_is_still_queued(self) -> None:
+        rig = _SaveRig(self)
+        rig.client.hold[ATTENTION].clear()
+        first, _ = rig.submit_in_background(rig.request("a"))
+        self.assertTrue(first.wait(2))
+        self.assertTrue(rig.client.entered[ATTENTION].wait(5))
+        # "b": its state is stored in the step, its attention part waits
+        # behind "a"'s PUT on the regular worker.
+        second, errors = rig.submit_in_background(rig.request("b"))
+        self.assertTrue(second.wait(2))
+        self.assertEqual(errors, [])
+        rig.worker.handle_preemptions(
+            SimpleNamespace(preempted_req_ids={"b"}, requests=[])
+        )
+        rig.client.hold[ATTENTION].set()
+        rig.sender.request_queue.join()
+        # The queued part was dropped at the generation gate: no PUT read
+        # the preempted request's blocks, and no counter went negative.
+        self.assertNotIn(rig.key(ATTENTION, "b"), rig.client.stored)
+        self.assertNotIn("b", rig.sender.stored_requests)
+        self.assertTrue(all(n >= 0 for n in rig.sender.stored_requests.values()))
+        # Resumed under the same id, it saves and finishes normally.
+        third, errors = rig.submit_in_background(rig.request("b"))
+        self.assertTrue(third.wait(5))
+        rig.sender.request_queue.join()
+        self.assertIn(rig.key(ATTENTION, "b"), rig.client.stored)
+        self.assertEqual(rig.finished({"a", "b"}), {"a", "b"})
+
+    def test_stop_releases_a_step_waiting_for_its_state_puts(self) -> None:
+        rig = _SaveRig(self)
+        rig.client.hold[STATE].clear()
+        done, errors = rig.submit_in_background(rig.request("a"), rig.request("b"))
+        self.assertTrue(rig.client.entered[STATE].wait(5))
+        # "a"'s state PUT is running, "b"'s waits in the fence queue.
+        stopped = threading.Event()
+
+        def stop() -> None:
+            rig.sender.stop(cancel_pending=True)
+            stopped.set()
+
+        threading.Thread(target=stop, daemon=True).start()
+        self.assertFalse(done.wait(0.3), "returned while a state PUT runs")
+        rig.client.hold[STATE].set()
+        self.assertTrue(done.wait(5), "the step stayed in fence_queue.join()")
+        self.assertTrue(stopped.wait(5))
+        self.assertEqual(errors, [])
+        self.assertIn(rig.key(STATE, "a"), rig.client.stored)
+        self.assertNotIn(rig.key(STATE, "b"), rig.client.stored)
+
+    def test_a_rejected_attention_part_still_finishes_the_request(self) -> None:
+        rig = _SaveRig(self, queue_capacity=1)
+        rig.client.hold[ATTENTION].clear()
+        first, _ = rig.submit_in_background(rig.request("a"))
+        self.assertTrue(first.wait(2))
+        self.assertTrue(rig.client.entered[ATTENTION].wait(5))
+        second, _ = rig.submit_in_background(rig.request("b"))  # fills it
+        self.assertTrue(second.wait(2))
+        third, errors = rig.submit_in_background(rig.request("c"))
+        self.assertTrue(third.wait(2))
+        self.assertEqual(errors, [])
+        self.assertIn(("save_rejected", "error"), rig.operations)
+        self.assertIn(rig.key(STATE, "c"), rig.client.stored)
+        self.assertNotIn(rig.key(ATTENTION, "c"), rig.client.stored)
+        self.assertEqual(rig.finished({"c"}), {"c"})
+        rig.client.hold[ATTENTION].set()
+        rig.sender.request_queue.join()
+        self.assertEqual(rig.finished({"a", "b"}), {"a", "b"})
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

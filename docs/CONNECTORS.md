@@ -986,6 +986,14 @@ lsmod | grep nvidia_peermem
   MambaSpec 字段相同）时，在 ring 支持 remove RPC 的情况下于后台尽力删除它（operation 指标
   `load_remove_stale`），下一次 SAVE 重新写入；否则每次命中都要 load 失败，直到被淘汰。更长的对象
   按未命中处理，不删除。
+- 混合模型的 SAVE 拆成两部分：recurrent state 和滑窗 group（下一步可能被改写或回收）交给独立的
+  send worker，模型线程每步只等这部分 PUT 完成；full-attention 部分走常规 send worker，与后续步重叠
+  （这些块在请求报告 finished sending 之前一直归该请求）。此前每步在模型线程上等整个发送队列。
+  常规发送队列满时（`transfer_queue_capacity`）会拒绝 attention 部分而 state 部分照常写入：
+  计入 operation 指标 `save_rejected`（`vllm:dfkv_store_operation_total{operation="save_rejected"}`），
+  该前缀只有 state 没有 attention 对象，LOOKUP 不会命中。attention group 的 KV event 在其 PUT
+  完成时发出，可能晚于 state 所在的步；跨 TP rank 的事件聚合只在一步之内计数，各 rank 在不同步
+  完成的块可能漏报（纯 attention 模型此前即如此）。
 - lookup 缩短候选前缀后，必须重验该边界的 state mask。采样保留尾部在 lookup
   前处理，不能在验证后再次把命中长度截短为另一个未经验证的 checkpoint。
 - 本版使用 `vllm-multiwr-v4` raw-layout ID，并把完整有效 cache-spec 几何绑定到

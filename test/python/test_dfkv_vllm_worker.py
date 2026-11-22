@@ -219,7 +219,7 @@ from dfkv_vllm.data import (  # noqa: E402
     PoolKey,
     ReqMeta,
 )
-from dfkv_vllm.protocol import LOOKUP_MSG  # noqa: E402
+from dfkv_vllm.protocol import LOOKUP_MSG, RESET_MSG  # noqa: E402
 from dfkv_vllm.transfer_protocol import TransferResults  # noqa: E402
 from dfkv_vllm.worker import (  # noqa: E402
     DfkvStoreWorker,
@@ -444,6 +444,24 @@ class LookupFrameTest(unittest.TestCase):
 
         valid_hash = self._hash("still-alive")
         self.assertEqual(self.client.lookup("valid-after-errors", 64, [valid_hash]), (64, 0))
+
+    def test_reset_drains_the_fence_queue_and_the_send_queue(self) -> None:
+        joined: list[str] = []
+
+        class _Queue:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def join(self) -> None:
+                joined.append(self.name)
+
+        self.store.kv_send_thread = SimpleNamespace(
+            fence_queue=_Queue("fence"), request_queue=_Queue("send"),
+        )
+        self.endpoint.send_multipart([RESET_MSG])
+        # The ring has no global wipe: the reset is drained, then refused.
+        self.assertEqual(self.endpoint.recv(), b"\x00")
+        self.assertEqual(joined, ["fence", "send"])
 
 class LookupFutureTest(unittest.TestCase):
     @staticmethod
@@ -796,7 +814,7 @@ class LogicalChunkTransferTest(unittest.TestCase):
             self.assertEqual(close_errors, [])
             self.assertGreaterEqual(wait_outcomes.count(False), 1)
             self.assertEqual(wait_outcomes.count(True), 1)
-            self.assertIsNone(sender._active_req_id)
+            self.assertEqual(sender._active_req_ids, {})
             self.assertFalse(sender.is_alive())
             self.assertTrue(client_closed.is_set())
             self.assertIsNone(worker.kv_send_thread)

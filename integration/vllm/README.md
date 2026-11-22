@@ -315,7 +315,19 @@ next SAVE writes it again instead of finding it present. A longer object is a
 miss and is left alone.
 Windowed or recurrent SAVE sources
 remain protected until the native PUT finishes, before the next model step
-can recycle or overwrite them. Asynchronous GET completion fences the CUDA
+can recycle or overwrite them. Only those groups' PUTs are waited for, on a
+send worker of their own: the full-attention part of the same SAVE runs on the
+regular send worker and overlaps the following steps (vLLM keeps those blocks
+until the request is reported finished sending). Two consequences: the regular
+send queue (`transfer_queue_capacity`) can fill while the state part still
+goes through, and an attention part it rejects is counted as the
+`save_rejected` operation (`vllm:dfkv_store_operation_total{operation=
+"save_rejected"}`); its prefix then has states but no attention objects and is
+not admitted by LOOKUP. And KV events of the attention groups are emitted
+when their PUT completes, possibly a later step than the state's; event
+aggregation across TP ranks counts within one step, so a block whose ranks
+finish in different steps can go unreported, as for attention-only models.
+Asynchronous GET completion fences the CUDA
 device captured from the model thread, not the receive thread's default GPU.
 Same-step preemption/resumption preserves fresh allocation and LOAD metadata;
 both runner formats restore from the complete block table, not an allocation
