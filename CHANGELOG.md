@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Server, slab store: a disk whose background thread cannot be started (the
+  process or its cgroup at its thread limit) now fails to start like any
+  other disk error, instead of ending the process. Starting the table sync
+  thread and then failing to start the reclaim thread terminated the server
+  (`std::terminate` on a joinable thread); failing to start the first one
+  threw out of the store's constructor, past the code that closes the
+  disk's files and releases its directory lock. The disk is left marked as
+  in use, so its next start treats this one as an unclean exit.
+
 - Server, storage: the on-disk format library of the log-structured engine
   (superblock, segment header, record header, summary, trailer, journal
   block; CRC-32C with the CPU instruction where there is one) is added with

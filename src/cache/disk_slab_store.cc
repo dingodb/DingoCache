@@ -508,8 +508,8 @@ bool DiskSlabStore::Activate() {
     return false;
   }
   activated_.store(true, std::memory_order_release);
-  if (opt_.table_sync_ms > 0) {
-    sync_thread_ = std::thread([this] {
+  if (opt_.table_sync_ms > 0 &&
+      !StartThread(&sync_thread_, 1, "slab-sync", [this] {
       NameThisThread("slab-sync");
       std::unique_lock<std::mutex> lk(sync_mu_);
       for (;;) {
@@ -523,10 +523,10 @@ bool DiskSlabStore::Activate() {
         lk.lock();
         if (!synced) return;
       }
-    });
-  }
-  if (opt_.reclaim_interval_ms > 0) {
-    reclaim_thread_ = std::thread([this] {
+    }))
+    return false;
+  if (opt_.reclaim_interval_ms > 0 &&
+      !StartThread(&reclaim_thread_, 2, "slab-reclaim", [this] {
       NameThisThread("slab-reclaim");
       std::unique_lock<std::mutex> lk(reclaim_mu_);
       for (;;) {
@@ -537,9 +537,56 @@ bool DiskSlabStore::Activate() {
         ReclaimTick();
         lk.lock();
       }
-    });
+    })) {
+    StopThreads();
+    return false;
   }
   return true;
+}
+
+// A refused thread (std::system_error, e.g. EAGAIN at the process or cgroup
+// thread limit) must not escape: thrown from the constructor's activation it
+// would leave a joinable sync_thread_ behind (std::terminate) or skip the
+// destructor that closes the descriptors and releases the directory lock.
+// The store fails instead. It is dirty by now, so the next start treats this
+// one as an unclean exit, as it would a crash.
+template <typename Body>
+bool DiskSlabStore::StartThread(std::thread* thread, int which,
+                                const char* name, Body body) {
+  try {
+    if (opt_.fail_thread_start_for_test == which)
+      throw std::system_error(
+          std::make_error_code(std::errc::resource_unavailable_try_again));
+    *thread = std::thread(std::move(body));
+    return true;
+  } catch (const std::system_error& e) {
+    ok_ = false;
+    SetStartupError(std::string("cannot start the ") + name +
+                    " thread: " + e.what());
+    DFKV_LOG_ERROR("slab " + opt_.dir + ": " + startup_error_);
+    return false;
+  }
+}
+
+// Stops and joins whichever background threads run (Close() and a failed
+// Activate()).
+void DiskSlabStore::StopThreads() {
+  if (reclaim_thread_.joinable()) {
+    {
+      std::lock_guard<std::mutex> lk(reclaim_mu_);
+      reclaim_stop_ = true;
+    }
+    reclaim_cv_.notify_all();
+    reclaim_thread_.join();
+  }
+  if (sync_thread_.joinable()) {
+    {
+      std::lock_guard<std::mutex> lk(sync_mu_);
+      sync_stop_ = true;
+    }
+    sync_cv_.notify_all();
+    sync_thread_.join();
+  }
 }
 
 DiskSlabStore::~DiskSlabStore() {
@@ -557,22 +604,7 @@ DiskSlabStore::~DiskSlabStore() {
 bool DiskSlabStore::Close() {
   if (closed_) return closed_clean_;
   closed_ = true;
-  if (reclaim_thread_.joinable()) {
-    {
-      std::lock_guard<std::mutex> lk(reclaim_mu_);
-      reclaim_stop_ = true;
-    }
-    reclaim_cv_.notify_all();
-    reclaim_thread_.join();
-  }
-  if (sync_thread_.joinable()) {
-    {
-      std::lock_guard<std::mutex> lk(sync_mu_);
-      sync_stop_ = true;
-    }
-    sync_cv_.notify_all();
-    sync_thread_.join();
-  }
+  StopThreads();
   if (!activated_.load(std::memory_order_acquire)) {
     // Never activated: this run changed nothing a previous run left, wrote
     // no state and holds no token, so there is nothing to record. What the
