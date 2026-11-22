@@ -730,6 +730,19 @@ device segment 分组，不写入 namespace 或 raw value。
 `supports_device_transfer()` 能力，不能静默回落并继续宣称 device-direct。
 只有未请求 bypass 的可选注册和 host pool 预注册保留 best-effort。
 
+主 KV 用哪种 key 形态由明确的状态决定，不再由“注册过 device pool”推断：请求了
+bypass 且注册成功，或者本进程已经对主 KV 做过一次 device 传输，才按 device 形态
+（SG 分组 key）做存在性探测、retention 和 host 读；否则即使注册了 device pool，
+也按 host 形态（裸 key）。未请求 bypass 而 SGLang 仍注册了 device pool 时，host
+路径写入的页因此能被探测和读到。
+
+device 形态下 host 入口 `batch_get_v1` 不读取任何数据（device 对象是按层排列的
+SG 分组，读不进 host buffer），它只回答“这一页在 L3 里是否存在”：本进程做过
+device 传输、知道一页分几组之后，要求全部 SG 分组都存在；在此之前与存在性探测
+一样只查第 0 组。缺组或探测失败都报 False。真正的 KV 由 device 入口
+（`batch_get_v1_device` / `batch_get_v2`）加载，并逐组校验长度。此前这个入口对
+所有页一律报 True。
+
 #### 冷连接池
 
 server 启动只注册首个 receive chunk；新 data QP 租当前 operation class 对应的

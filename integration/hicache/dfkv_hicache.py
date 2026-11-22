@@ -634,6 +634,9 @@ class DfkvHiCache(HiCacheStorage):
         self._device_direct_requested = _truthy(
             os.environ.get("SGLANG_HICACHE_L2_BYPASS"))
         self._device_registration_failed = False
+        # Set by the first primary-KV device transfer; see
+        # _device_direct_active().
+        self._device_direct_used = False
         # Pipeline-parallel rank/size. PP splits the model across stages by
         # layer, so each pp_rank holds a *different* slice of KV (unlike TP,
         # where MLA latent is replicated). Storage keys MUST therefore carry
@@ -1233,6 +1236,24 @@ class DfkvHiCache(HiCacheStorage):
                 label, exc)
             return 0
 
+    def _device_direct_active(self) -> bool:
+        """Whether this process stores primary KV in the device-direct form.
+
+        Device-direct objects are scatter-gather groups under their own keys;
+        host objects are bare keys. Probes, retention and the host read must
+        address the form that is actually written. A registered device pool
+        does not say which: SGLang may register it without using the bypass,
+        and the host path then writes bare keys. The form is device-direct
+        when the bypass was requested and its registration held, or once this
+        process has done a primary-KV device transfer.
+        """
+        if getattr(self, "mem_pool_device", None) is None:
+            return False
+        if getattr(self, "_device_registration_failed", False):
+            return False
+        return bool(getattr(self, "_device_direct_requested", False)
+                    or getattr(self, "_device_direct_used", False))
+
     def register_mem_pool_device(self, mem_pool_device):
         """Register the primary GPU KV pool; bypass makes every MR required."""
         from sglang.srt.mem_cache.device_page_meta import device_pool_regions
@@ -1526,7 +1547,7 @@ class DfkvHiCache(HiCacheStorage):
         """
         if pool in ("kv", "__default__"):
             base = self._keys(page_hash)
-            device = getattr(self, "mem_pool_device", None) is not None
+            device = self._device_direct_active()
             pool = "kv"
         else:
             base = self._pool_keys(pool, page_hash)
@@ -1890,6 +1911,8 @@ class DfkvHiCache(HiCacheStorage):
             seg_ptrs, seg_sizes = get_device_page_buffer_meta(
                 self.mem_pool_device, device_indices)
             sub, sks, sp, ss = self._flatten_device(keys, seg_ptrs, seg_sizes)
+            # After _flatten_device: it records the group count probes use.
+            self._device_direct_used = True
             nbytes = sum(sum(s) for s in ss)
             t0 = time.perf_counter()
             flat = self._put_sg_flat(sks, sp, ss)
@@ -1963,6 +1986,8 @@ class DfkvHiCache(HiCacheStorage):
             seg_ptrs, seg_caps = get_device_page_buffer_meta(
                 self.mem_pool_device, device_indices)
             sub, sks, sp, sc = self._flatten_device(keys, seg_ptrs, seg_caps)
+            # After _flatten_device: it records the group count probes use.
+            self._device_direct_used = True
             # Per sub-key expected byte length = sum of its per-layer segment caps.
             want = [sum(c) for c in sc]
             t0 = time.perf_counter()
@@ -2017,18 +2042,26 @@ class DfkvHiCache(HiCacheStorage):
             # Device-direct PUT writes SG-chunked keys via _flatten_device
             # (_sg_group_key), but this host-buffer GET path uses flat keys
             # via _flatten/_keys. The key namespaces differ, so a host GET
-            # would miss every page that device-direct PUT wrote. Return
-            # all-present so the prefetch controller counts the anchor prefix
-            # complete and the hybrid controller loads real KV via the v2
-            # side-pool path (batch_get_v2). Without this, the prefetch
-            # reports "failed to retrieve page" for every hot-round page and
-            # falls back to cold compute, making hot throughput worse than
-            # cold (observed -29.8% on GLM-5.2-NVFP4 B200 single-node).
-            if getattr(self, "mem_pool_device", None) is not None:
-                r.result = "device_direct_anchor"
+            # would miss every page that device-direct PUT wrote, and the
+            # stored bytes are layer-major, not this buffer's layout. So this
+            # call loads nothing into the host buffer: it is the presence
+            # anchor the prefetch controller counts, and the real KV is
+            # loaded through the device path. A page is reported present only
+            # if its stored objects exist: every SG group once this process
+            # has done a device transfer and so knows the group count, group
+            # 0 before that (as batch_exists probes). A page that is not in
+            # the store must not be reported as retrieved; the device read
+            # checks every group's length.
+            if self._device_direct_active():
+                sks = [sk for key in keys
+                       for sk in self._stored_keys("kv", key)]
+                per_page = len(sks) // n if n else 0
+                res = self._fold(self._batch_exist_flat(sks), n, per_page)
+                r.result = f"device_direct_anchor present={sum(res)}/{n}"
                 if _sp:
+                    _sp.hits = sum(res)
                     _sp.attrs = {"dfkv.device_direct_anchor": True}
-                return [True] * n
+                return res
             ptrs, sizes = meta
             sub, sks, sp, ss = self._flatten(keys, ptrs, sizes)
             karr, klens, parr, sarr, out, key_owners = _arrays(sks, sp, ss)
@@ -2057,7 +2090,7 @@ class DfkvHiCache(HiCacheStorage):
             # cannot match a chunked store; a different negotiated width is a
             # cold miss rather than a corrupt read. One probe form suffices.
             sub = self._sub()
-            if getattr(self, "mem_pool_device", None) is not None:
+            if self._device_direct_active():
                 sks = [self._sg_group_key(sk, 0) for k in keys for sk in self._keys(k)]
             else:
                 sks = [sk for k in keys for sk in self._keys(k)]
@@ -2294,6 +2327,8 @@ class DfkvHiCache(HiCacheStorage):
         seg_ptrs, seg_sizes = get_device_page_buffer_meta(
             self.mem_pool_device, device_indices)
         sub, sks, sp, ss = self._flatten_device(keys, seg_ptrs, seg_sizes)
+        # After _flatten_device: it records the group count probes use.
+        self._device_direct_used = True
         nbytes = sum(sum(s) for s in ss)
         t0 = time.perf_counter()
         flat = self._put_sg_flat(sks, sp, ss)
@@ -2326,6 +2361,8 @@ class DfkvHiCache(HiCacheStorage):
         seg_ptrs, seg_caps = get_device_page_buffer_meta(
             self.mem_pool_device, device_indices)
         sub, sks, sp, sc = self._flatten_device(keys, seg_ptrs, seg_caps)
+        # After _flatten_device: it records the group count probes use.
+        self._device_direct_used = True
         want = [sum(c) for c in sc]
         t0 = time.perf_counter()
         hits, lens = self._batch_get_sg(sks, sp, sc)

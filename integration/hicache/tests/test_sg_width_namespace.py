@@ -150,7 +150,10 @@ def _mk_instance(width: int, mla: bool = True):
     inst.prefill_cp_storage_layout = None
     inst._storage_pcp_rank = 0
     inst._mla_replica_writer = False
-    inst.mem_pool_device = object()  # non-None → device (L2-bypass) mode
+    # Device (L2-bypass) mode: the pool is registered and the bypass was
+    # requested. A registered pool alone does not select the SG key form.
+    inst.mem_pool_device = object()
+    inst._device_direct_requested = True
     inst._metrics = _FakeMetrics()
     inst._alog_tag = "test"
     inst._log_exist_probe = lambda *a, **k: None

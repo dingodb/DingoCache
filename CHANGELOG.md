@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- SGLang HiCache connector, device-direct (L2-bypass): the host read no
+  longer reports pages as retrieved that are not in the store, and the key
+  form no longer follows from a device pool merely being registered.
+  `batch_get_v1` cannot load device-direct objects into a host buffer; with
+  a device pool registered it returned True for every page without any I/O.
+  It still loads nothing, but now answers per page whether the page is
+  stored: every scatter-gather group of it once the process has done a
+  device transfer (and so knows how many groups a page has), group 0 before
+  that, as existence probes do. A missing group or a failed probe is a miss.
+  The KV itself is loaded, and every group length-checked, by the device
+  entries as before. Second, existence probes, retention and that host read
+  switched to the device key form as soon as a primary device pool was
+  registered. SGLang can register the pool without using the bypass; the
+  host path then wrote bare keys that the probes never found (no L3 hits,
+  retention sent to keys that do not exist). The device form is now used
+  only when `SGLANG_HICACHE_L2_BYPASS` was requested and its registration
+  held, or once the process has done a device transfer of primary KV. Cost:
+  one existence round trip per `batch_get_v1` call in device-direct mode,
+  where there was none.
 - LMCache connector (in-process `RemoteConnector`): a cancelled GET no
   longer gives its buffer back to the L1 arena while the transport is still
   writing into it. LMCache cancels a `get` that exceeds its blocking timeout
