@@ -38,6 +38,7 @@
 #include <string>
 
 #include "client/cuda_ipc.h"
+#include "client/dedup_segment.h"
 #include "common/kv_types.h"
 
 namespace dfkv {
@@ -74,6 +75,10 @@ class GpuNodeDedup {
                                                const void* device_dst_hint);
   static std::string EnvSegmentName(uint64_t namespace_hash);
   static std::unique_ptr<GpuNodeDedup> Open(const Options& opt);
+  // Size of the segment Open maps for opt, and where its header keeps the
+  // fields dedup_segment needs (tests leave a creation unfinished with it).
+  static size_t SegmentBytes(const Options& opt);
+  static dedup_segment::Layout SegmentLayout(size_t len);
   ~GpuNodeDedup();
 
   GpuNodeDedup(const GpuNodeDedup&) = delete;

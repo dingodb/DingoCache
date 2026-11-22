@@ -11,6 +11,7 @@
 #include <cstring>
 #include <thread>
 
+#include "client/dedup_segment.h"
 #include "client/dedup_token.h"
 #include "utils/log.h"
 #include "utils/env_parse.h"
@@ -74,7 +75,9 @@ struct NodeDedup::Header {
   uint64_t arena_bytes;
   std::atomic<uint64_t> alloc_cursor;  // monotonic bytes allocated (ring = mod arena)
   std::atomic<uint32_t> init_done;     // 1 once the creator finished laying out
-  uint32_t pad;
+  // pid of the creating process (dedup_segment.h). Padding in older
+  // releases, which leave it 0.
+  std::atomic<uint32_t> creator;
 };
 
 uint32_t NodeDedup::ProbeStart(const BlockKey& key, Kind kind) {
@@ -126,42 +129,14 @@ std::unique_ptr<NodeDedup> NodeDedup::FromEnv(uint64_t namespace_hash) {
 std::unique_ptr<NodeDedup> NodeDedup::Open(const Options& opt) {
   static_assert(sizeof(Slot) == 64, "shm slot layout is cross-process ABI");
   const uint32_t nslots = Pow2AtLeast(opt.slots);
-  const size_t len = sizeof(Header) + static_cast<size_t>(nslots) * sizeof(Slot) +
-                     opt.arena_bytes;
-  int fd = ::shm_open(opt.name.c_str(), O_RDWR | O_CREAT, 0600);
-  if (fd < 0) return nullptr;
-  struct stat st{};
-  if (::fstat(fd, &st) != 0) { ::close(fd); return nullptr; }
-  const bool creator = (st.st_size == 0);
-  if (creator && ::ftruncate(fd, static_cast<off_t>(len)) != 0) {
-    ::close(fd);
-    return nullptr;
-  }
-  if (creator) {
-    // Eagerly back the whole segment with pages. tmpfs allocates lazily on
-    // first write: with /dev/shm full (other tenants), ftruncate+mmap succeed
-    // and the process later takes a SIGBUS on a page fault mid-publish —
-    // a crash, not a degrade. posix_fallocate converts that into a clean
-    // ENOSPC HERE, where returning nullptr just runs without dedup. Cost:
-    // the segment occupies its full size from creation (bounded, documented).
-    const int frc = ::posix_fallocate(fd, 0, static_cast<off_t>(len));
-    if (frc != 0) {
-      DFKV_LOG_INFO("node-dedup: cannot pre-reserve " +
-                    std::to_string(len >> 20) + " MiB in /dev/shm (" +
-                    std::to_string(frc) + "), running without");
-      ::close(fd);
-      ::shm_unlink(opt.name.c_str());  // don't leave a half-backed segment
-      return nullptr;
-    }
-  }
-  if (!creator && static_cast<size_t>(st.st_size) != len) {
-    DFKV_LOG_INFO("node-dedup: existing segment layout mismatch, running without");
-    ::close(fd);
-    return nullptr;
-  }
-  void* base = ::mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-  ::close(fd);
-  if (base == MAP_FAILED) return nullptr;
+  const size_t len = SegmentBytes(opt);
+  // One creator, which backs the whole segment eagerly (a full /dev/shm is
+  // a clean failure here, not a SIGBUS mid-publish); see dedup_segment.h,
+  // also for a creator that died before it finished.
+  bool creator = false;
+  void* base = dedup_segment::Attach(opt.name, SegmentLayout(len), "node-dedup",
+                                     &creator);
+  if (!base) return nullptr;
 
   auto d = std::unique_ptr<NodeDedup>(new NodeDedup());
   d->map_base_ = base;
@@ -176,16 +151,18 @@ std::unique_ptr<NodeDedup> NodeDedup::Open(const Options& opt) {
   d->ttl_ms_ = opt.ttl_ms;
 
   if (creator) {
-    // Fresh (ftruncate zero-fills): stamp the header last so concurrent
-    // openers either spin briefly on init_done or see a finished layout.
+    // Stamp the header last so concurrent openers either spin briefly on
+    // init_done or see a finished layout. The ring cursor is not written:
+    // ftruncate zero-filled it, and a segment laid out a second time (one
+    // whose creator died, or one an older release's opener laid out inside
+    // this creator's window) may already be in use; a rewound cursor would
+    // hand the bytes of published entries to new allocations while their
+    // lap check still passes.
     d->hdr_->nslots = nslots;
     d->hdr_->arena_bytes = opt.arena_bytes;
-    d->hdr_->alloc_cursor.store(0, std::memory_order_relaxed);
     d->hdr_->magic = kMagic;
     d->hdr_->init_done.store(1, std::memory_order_release);
   } else {
-    for (int spin = 0; spin < 1000 && d->hdr_->init_done.load(std::memory_order_acquire) != 1; ++spin)
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
     if (d->hdr_->magic != kMagic || d->hdr_->nslots != nslots ||
         d->hdr_->arena_bytes != opt.arena_bytes) {
       DFKV_LOG_INFO("node-dedup: segment header mismatch, running without");
@@ -196,6 +173,17 @@ std::unique_ptr<NodeDedup> NodeDedup::Open(const Options& opt) {
                 std::to_string(nslots) + ", arena=" +
                 std::to_string(opt.arena_bytes >> 20) + " MiB)");
   return d;
+}
+
+dedup_segment::Layout NodeDedup::SegmentLayout(size_t len) {
+  return dedup_segment::Layout{len, offsetof(Header, init_done),
+                               offsetof(Header, creator)};
+}
+
+size_t NodeDedup::SegmentBytes(const Options& opt) {
+  return sizeof(Header) +
+         static_cast<size_t>(Pow2AtLeast(opt.slots)) * sizeof(Slot) +
+         opt.arena_bytes;
 }
 
 NodeDedup::~NodeDedup() {

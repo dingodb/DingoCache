@@ -44,6 +44,7 @@
 #include <memory>
 #include <string>
 
+#include "client/dedup_segment.h"
 #include "client/dedup_token.h"
 #include "common/kv_types.h"
 
@@ -79,6 +80,10 @@ class NodeDedup {
   // caller just runs without dedup. A parameter mismatch with an existing
   // segment also returns nullptr (never reinterpret another config's layout).
   static std::unique_ptr<NodeDedup> Open(const Options& opt);
+  // Size of the segment Open maps for opt, and where its header keeps the
+  // fields dedup_segment needs (tests leave a creation unfinished with it).
+  static size_t SegmentBytes(const Options& opt);
+  static dedup_segment::Layout SegmentLayout(size_t len);
   ~NodeDedup();
 
   NodeDedup(const NodeDedup&) = delete;

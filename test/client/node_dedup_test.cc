@@ -1029,3 +1029,106 @@ TEST(NodeDedup, StaleFetchesDoNotFillTheProbeWindow) {
             NodeDedup::Role::kHit);
   EXPECT_EQ(dst, v);
 }
+
+// ---- a segment whose creation did not finish ------------------------------
+
+namespace {
+
+// The pid of a process that has exited (and been reaped).
+pid_t DeadPid() {
+  const pid_t pid = ::fork();
+  if (pid == 0) ::_exit(0);
+  int st = 0;
+  ::waitpid(pid, &st, 0);
+  return pid;
+}
+
+void ExpectSharing(NodeDedup* a, NodeDedup* b, uint64_t id) {
+  const std::string v = Val(id, 4096);
+  std::string out(v.size(), '\0');
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->Claim(K(id), v.size(), &out[0], &token),
+            NodeDedup::Role::kFetch);
+  a->Publish(K(id), NodeDedup::Kind::kData, token, v.data(), v.size());
+  ASSERT_EQ(b->Claim(K(id), v.size(), &out[0], &ignored),
+            NodeDedup::Role::kHit);
+  EXPECT_EQ(out, v);
+}
+
+}  // namespace
+
+// The creator of the segment was killed after it had named itself and sized
+// the segment, before the header was laid out. The next process finishes the
+// creation instead of every process running without dedup from then on.
+TEST(NodeDedup, SegmentLeftUnfinishedByADeadCreatorIsFinished) {
+  for (const bool sized : {true, false}) {
+    ShmGuard g(sized ? "dead-creator-sized" : "dead-creator-named");
+    const NodeDedup::Options o = Opts(g.name);
+    ASSERT_TRUE(dfkv::dedup_segment::AbandonForTest(
+        g.name, NodeDedup::SegmentLayout(NodeDedup::SegmentBytes(o)),
+        DeadPid(), sized));
+    auto a = NodeDedup::Open(o);
+    ASSERT_TRUE(a) << "every process would run without dedup (sized=" << sized
+                   << ")";
+    auto b = NodeDedup::Open(o);
+    ASSERT_TRUE(b);
+    ExpectSharing(a.get(), b.get(), 90);
+  }
+}
+
+// A creator killed right after its create, before it named itself, leaves a
+// segment of size 0 that names nobody. While a creator could still be at
+// work (the wait), an opener does not lay the segment out a second time;
+// after it, the segment is adopted, as a size-0 segment always was.
+TEST(NodeDedup, SegmentLeftEmptyByACreatorIsAdoptedAfterTheWait) {
+  ShmGuard g("empty-creator");
+  const int fd = ::shm_open(g.name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+  ASSERT_GE(fd, 0);  // created, never sized, nobody named
+  auto opening = std::async(std::launch::async,
+                            [&] { return NodeDedup::Open(Opts(g.name)); });
+  std::this_thread::sleep_for(300ms);
+  struct stat st{};
+  ASSERT_EQ(::fstat(fd, &st), 0);
+  EXPECT_EQ(st.st_size, 0) << "laid out while a creator could still be at work";
+  ::close(fd);
+  auto a = opening.get();
+  ASSERT_TRUE(a) << "every process would run without dedup";
+  auto b = NodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(b);
+  ExpectSharing(a.get(), b.get(), 92);
+}
+
+// Finishing a segment whose creator died must not rewind its ring: a process
+// may already be using it (an older release attaches once it sees the
+// header's magic, without init_done), and a rewound cursor hands the bytes
+// of its published entries to new allocations while their lap check still
+// passes.
+TEST(NodeDedup, FinishingADeadCreatorsSegmentKeepsItsRing) {
+  ShmGuard g("finish-keeps-ring");
+  NodeDedup::Options o = Opts(g.name);
+  o.ttl_ms = 60000;  // outlives the finisher's wait
+  auto a = NodeDedup::Open(o);
+  ASSERT_TRUE(a);
+  const std::string v1 = Val(93, 4096), v2 = Val(94, 4096);
+  std::string out(v1.size(), '\0');
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->Claim(K(93), v1.size(), &out[0], &token),
+            NodeDedup::Role::kFetch);
+  a->Publish(K(93), NodeDedup::Kind::kData, token, v1.data(), v1.size());
+  // The segment now looks left unfinished by a creator that died.
+  const auto l = NodeDedup::SegmentLayout(NodeDedup::SegmentBytes(o));
+  const int fd = ::shm_open(g.name.c_str(), O_RDWR, 0600);
+  ASSERT_GE(fd, 0);
+  const uint32_t zero = 0, dead = static_cast<uint32_t>(DeadPid());
+  ASSERT_EQ(::pwrite(fd, &zero, 4, static_cast<off_t>(l.init_done_off)), 4);
+  ASSERT_EQ(::pwrite(fd, &dead, 4, static_cast<off_t>(l.creator_off)), 4);
+  ::close(fd);
+  auto b = NodeDedup::Open(o);  // finishes the creation
+  ASSERT_TRUE(b);
+  ASSERT_EQ(b->Claim(K(94), v2.size(), &out[0], &token),
+            NodeDedup::Role::kFetch);
+  b->Publish(K(94), NodeDedup::Kind::kData, token, v2.data(), v2.size());
+  ASSERT_EQ(a->Claim(K(93), v1.size(), &out[0], &ignored),
+            NodeDedup::Role::kHit);
+  EXPECT_EQ(out, v1) << "an entry was served with another key's bytes";
+}

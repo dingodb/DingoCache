@@ -1247,6 +1247,34 @@ TEST(GpuNodeDedup, StaleFetchesDoNotFillTheProbeWindow) {
   EXPECT_EQ(k.dst.Down(4096), k.value);
 }
 
+// ---- a segment whose creation did not finish ------------------------------
+
+TEST(GpuNodeDedup, SegmentLeftUnfinishedByADeadCreatorIsFinished) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("dead-creator");
+  const GpuNodeDedup::Options o = Opts(g.name);
+  pid_t dead = ::fork();
+  if (dead == 0) ::_exit(0);
+  int st = 0;
+  ::waitpid(dead, &st, 0);
+  ASSERT_TRUE(dfkv::dedup_segment::AbandonForTest(
+      g.name, GpuNodeDedup::SegmentLayout(GpuNodeDedup::SegmentBytes(o)), dead,
+      /*sized=*/true));
+  auto a = GpuNodeDedup::Open(o);
+  ASSERT_TRUE(a) << "every process would run without GPU dedup";
+  auto b = GpuNodeDedup::Open(o);
+  ASSERT_TRUE(b);
+  KeyBufs k(85);
+  size_t got = 0;
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->ClaimSg(K(85), &k.s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  a->PublishSg(K(85), token, &k.s, 1, 4096);
+  ASSERT_EQ(b->ClaimSg(K(85), &k.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kHit);
+  EXPECT_EQ(k.dst.Down(4096), k.value);
+}
+
 // ---- through KVClient: a fetch that lands in device memory -----------------
 
 namespace {
