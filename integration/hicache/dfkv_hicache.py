@@ -115,6 +115,44 @@ def _truthy(v) -> bool:
         return v.strip().lower() not in ("", "0", "false", "no", "off")
     return bool(v)
 
+# extra_config keys that select the stored bytes' identity. A misspelt one is
+# not read, its default applies, and instances that should be told apart
+# share keys; so a key that is not one of them but nearly is fails startup.
+_IDENTITY_KEYS = ("model_revision", "tenant_id", "kv_cache_dtype",
+                  "prefill_cp_storage_layout", "bind_runtime_layout")
+# extra_config keys read as integers.
+_INTEGER_KEYS = ("page_size", "layer_num", "dtype_tag", "head_num", "head_dim",
+                 "dp_size", "mds_poll_ms", "batch_concurrency", "rdma_depth")
+
+
+def _validate_extra_config(cfg: dict) -> None:
+    """Refuse a misspelt identity key and a non-integer integer key."""
+    import difflib
+    for key in cfg:
+        if key in _IDENTITY_KEYS:
+            continue
+        close = difflib.get_close_matches(str(key), _IDENTITY_KEYS, n=1,
+                                          cutoff=0.8)
+        if close:
+            raise ValueError(
+                f"extra_config key {key!r} is not known; did you mean "
+                f"{close[0]!r}? Unread, its default would apply and instances "
+                f"that should be told apart would share keys")
+    for key in _INTEGER_KEYS:
+        if key not in cfg:
+            continue
+        value = cfg[key]
+        try:
+            ok = not isinstance(value, bool) and int(value) == float(value)
+        except (TypeError, ValueError, OverflowError):
+            ok = False
+        if not ok:
+            hint = (" (a dtype name goes in kv_cache_dtype)"
+                    if key == "dtype_tag" else "")
+            raise ValueError(
+                f"extra_config {key} must be an integer, got {value!r}{hint}")
+
+
 def _physical_axis(cfg: dict, name: str) -> tuple[int, int]:
     """Parse one physical sharding axis without accepting lossy coercions."""
     size_key = f"{name}_size"
@@ -745,6 +783,7 @@ class DfkvHiCache(HiCacheStorage):
         # correct, but slower (extra host copies) and for MLA every TP rank writes
         # the page redundantly. Fail fast so a launch-config omission can't quietly
         # degrade to the copy path.
+        _validate_extra_config(cfg)
         if not cfg.get("interface_v1"):
             raise ValueError(
                 "dfkv requires extra_config interface_v1=1 to select the zero-copy "
@@ -938,7 +977,7 @@ class DfkvHiCache(HiCacheStorage):
                 storage_pcp_rank=self._storage_pcp_rank,
                 primary_dev=self._rail_affinity.primary,
             )
-            if not self._rail_affinity.enabled and cfg.get("rdma_numa"):
+            if not self._rail_affinity.enabled and _truthy(cfg.get("rdma_numa")):
                 os.environ.setdefault("DFKV_RDMA_NUMA", "1")
             # Same-host GET rendezvous (phase 5): dedups TP-replicated L3 loads
             # across the rank processes of one node (HiCache destinations are
@@ -1280,8 +1319,31 @@ class DfkvHiCache(HiCacheStorage):
                 f"before the pool was registered")
         return f"{name}@{_layout_tag(facts, objects)}"
 
+    def _check_pool_page_size(self, pool) -> None:
+        """Refuse a primary pool whose page size contradicts extra_config's.
+
+        ``page_size`` in extra_config goes into the namespace; a pool paging
+        differently means the declared identity is not the one stored. The
+        host pool's ``page_size`` is SGLang's ``--page-size`` (under decode
+        CP the pool divides its widened page by ``dcp_size`` back to it);
+        its logical page is ``page_size × dcp_size``. Either is accepted.
+        Checked only when extra_config gives it.
+        """
+        cfg = getattr(self, "cfg", None) or {}
+        if "page_size" not in cfg or getattr(pool, "page_size", None) is None:
+            return
+        declared = int(cfg["page_size"])
+        physical = int(pool.page_size)
+        logical = _l3_page_span(pool)
+        if declared not in (physical, logical):
+            raise RuntimeError(
+                f"HiCache primary host pool pages {physical} tokens "
+                f"(logical page {logical} under decode CP), extra_config "
+                f"page_size is {declared}; set it to the SGLang --page-size")
+
     def register_mem_pool_host(self, mem_pool_host):
         self._check_pool_dcp(mem_pool_host, "HiCache primary host pool")
+        self._check_pool_page_size(mem_pool_host)
         self._note_pool_layout("kv", mem_pool_host)
         if self.transport_mode == "rdma":
             import torch

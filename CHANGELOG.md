@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- SGLang HiCache connector: concrete extra_config checks at startup. A key
+  that is not one of `model_revision`, `tenant_id`, `kv_cache_dtype`,
+  `prefill_cp_storage_layout`, `bind_runtime_layout` but differs from one by
+  a character or two (`modle_revision`) is refused: it was ignored, the
+  default applied, and instances that should be told apart shared keys. An
+  integer key (`page_size`, `layer_num`, `dtype_tag`, `head_num`,
+  `head_dim`, `dp_size`, `mds_poll_ms`, `batch_concurrency`, `rdma_depth`)
+  that is not an integer is refused with the key named; `"dtype_tag":"fp8"`
+  used to fail with a bare int() error. `"rdma_numa":"0"` turned NUMA rail
+  selection on (any non-empty string was true); it is now off, like `0`,
+  `false`, `no` and `off` for the other switches. When `page_size` is given,
+  it must be the primary host pool's page size (SGLang's `--page-size`) or,
+  under decode CP, its logical page (`page_size × dcp_size`); otherwise
+  registration is refused with both numbers. The docs now state that
+  HiCache's `rdma_depth` defaults to 1, not to the native default of 4.
+
 - Connectors (SGLang HiCache, vLLM, LMCache), client metrics: every counter
   and gauge the native client declares is mirrored to the inference server's
   `/metrics`. The allowlist had fallen behind by 45 families, among them the
