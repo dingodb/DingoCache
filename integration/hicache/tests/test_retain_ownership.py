@@ -391,6 +391,23 @@ class BatchTouchDebounce(unittest.TestCase):
             self.b.batch_touch(PAGES, None)
         self.assertEqual(len(c.retain_calls), 2)
 
+    def test_a_changed_key_form_is_touched_again(self):
+        # Protected while only SG group 0 of a page was known: once the
+        # group count is known the other groups are unprotected, so the
+        # prefix is not skipped.
+        b = _backend(writer=True, device=True)
+        b._has_retain = True
+        b._device_direct_requested = True
+        with _Cabi() as c:
+            b.batch_touch(PAGES, TTL)
+            b.batch_touch(PAGES, TTL)
+            self.assertEqual(len(c.retain_calls), 1)
+            one_group = len(c.retain_calls[0][0])
+            b._sg_chunks = dict(getattr(b, "_sg_chunks", {}), kv=2)
+            b.batch_touch(PAGES, TTL)
+            self.assertEqual(len(c.retain_calls), 2)
+            self.assertGreater(len(c.retain_calls[1][0]), one_group)
+
     def test_remembered_prefixes_are_bounded(self):
         self.b._TOUCH_DEBOUNCE_MAX = 3
         with _Cabi():

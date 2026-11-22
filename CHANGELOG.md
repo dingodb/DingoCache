@@ -32,8 +32,11 @@
   requested TTL within the last tenth of that TTL is now skipped before any
   key is built; the interval is the one the native client uses for refreshes.
   A touch whose SET left an object unprotected, or whose precheck was refused,
-  is not remembered and is repeated. The table is bounded (4,096 prefixes per
-  process). Touches without a TTL and `retain_precheck` are unchanged.
+  is not remembered and is repeated. A prefix is remembered with the key form
+  of its objects (bare or scatter-gather keys, and the number of groups), so
+  it is touched again when that form changes. The table is bounded (4,096
+  prefixes per storage backend). Touches without a TTL and `retain_precheck`
+  are unchanged.
 - SGLang HiCache connector: storage coordinates are no longer assumed when
   SGLang's parallel context cannot be read. The connector takes the
   context-parallel coordinates of a rank (prefill CP, decode CP) and the
