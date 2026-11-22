@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 2.42.0 — 2026-11-23
+
 - Client, RDMA: the rail name a scatter-gather batch read reports (the
   `dev` field of the per-node read statistics) no longer repeats the rail
   once per key ("ib0->ib0->ib0..." for a batch of N keys on one rail). It
