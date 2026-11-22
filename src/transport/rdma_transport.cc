@@ -13,6 +13,7 @@
 #include <stdexcept>
 
 #include "utils/log.h"
+#include "utils/env_parse.h"
 #include "utils/net_util.h"     // Dial / WriteAll / ReadAll / Put*/Get*
 #include "utils/numa_util.h"
 #include "utils/prom_escape.h"
@@ -31,7 +32,10 @@ int EnvInt(const char* name, int dflt) {
   const char* v = std::getenv(name);
   if (!v || !*v) return dflt;
   long x = std::strtol(v, nullptr, 10);
-  return x > 0 ? static_cast<int>(x) : dflt;
+  const int resolved = x > 0 ? static_cast<int>(x) : dflt;
+  envparse::ReportUnlessPlain(name, 1, std::numeric_limits<int>::max(),
+                              std::to_string(resolved));
+  return resolved;
 }
 
 int EnvBoundedInt(const char* name, int dflt, int upper) {
@@ -40,8 +44,15 @@ int EnvBoundedInt(const char* name, int dflt, int upper) {
   errno = 0;
   char* end = nullptr;
   long x = std::strtol(v, &end, 10);
-  if (errno != 0 || end == v || *end != '\0' || x <= 0) return dflt;
-  return static_cast<int>(std::min<long>(x, upper));
+  const int resolved =
+      (errno != 0 || end == v || *end != '\0' || x <= 0)
+          ? dflt
+          : static_cast<int>(std::min<long>(x, upper));
+  // A default of 0 means "not set" to the caller, so 0 is a clean value.
+  envparse::ReportUnlessPlain(name, dflt == 0 ? 0 : 1,
+                              static_cast<uint64_t>(upper),
+                              std::to_string(resolved));
+  return resolved;
 }
 
 size_t EnvBytes(const char* name, size_t dflt) {
@@ -50,12 +61,14 @@ size_t EnvBytes(const char* name, size_t dflt) {
   errno = 0;
   char* end = nullptr;
   unsigned long long x = std::strtoull(v, &end, 10);
-  if (errno != 0 || end == v || x == 0) return dflt;
   constexpr unsigned long long kMaxSge =
       static_cast<unsigned long long>(std::numeric_limits<uint32_t>::max() -
                                       2 * rdma::kDirectIoAlign);
-  if (x > kMaxSge) x = kMaxSge;
-  return static_cast<size_t>(x);
+  size_t resolved = dflt;
+  if (!(errno != 0 || end == v || x == 0))
+    resolved = static_cast<size_t>(x > kMaxSge ? kMaxSge : x);
+  envparse::ReportUnlessPlain(name, 1, kMaxSge, std::to_string(resolved));
+  return resolved;
 }
 uint64_t EnvU64(const char* name, uint64_t dflt) {
   const char* value = std::getenv(name);
@@ -63,9 +76,13 @@ uint64_t EnvU64(const char* name, uint64_t dflt) {
   errno = 0;
   char* end = nullptr;
   const unsigned long long parsed = std::strtoull(value, &end, 10);
-  return errno == 0 && end != value && *end == '\0' && parsed > 0
-             ? static_cast<uint64_t>(parsed)
-             : dflt;
+  const uint64_t resolved =
+      errno == 0 && end != value && *end == '\0' && parsed > 0
+          ? static_cast<uint64_t>(parsed)
+          : dflt;
+  envparse::ReportUnlessPlain(name, 1, std::numeric_limits<uint64_t>::max(),
+                              std::to_string(resolved));
+  return resolved;
 }
 
 
@@ -471,6 +488,12 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
       inline_resolved_state = 0;  // set to the empty string: disabled
     }
   }
+  // 0 disables, and so does an empty value (it does not mean "unset" here).
+  envparse::ReportUnlessPlain(
+      "DFKV_RDMA_INLINE_PUT_MAX_BYTES", 0, std::numeric_limits<uint64_t>::max(),
+      inline_resolved_state == 0 ? std::string("0 (disabled)")
+                                 : std::to_string(inline_put_max_bytes_),
+      /*empty_is_unset=*/false);
   config_dump::RecordResolved(
       "DFKV_RDMA_INLINE_PUT_MAX_BYTES",
       inline_resolved_state == 0
@@ -569,6 +592,8 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   config_dump::RecordResolved(
       "DFKV_RDMA_PRIMARY_DEV",
       preferred_rail_ ? devs_[*preferred_rail_] : std::string(""));
+  envparse::ReportUnlessPlain("DFKV_RDMA_DEPTH", 1, 256,
+                              std::to_string(depth_));
   config_dump::RecordResolved("DFKV_RDMA_DEPTH", std::to_string(depth_));
   config_dump::RecordResolved(
       "DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES",
@@ -599,6 +624,20 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   // Any explicitly pinned budget dimension turns the whole autoscale off:
   // partial-manual sizing recreated exactly the "QP raised but WR/registered
   // still starve" trap of 0812-002 §6.1, so explicit config wins wholesale.
+  // Being set at all is what counts here, also to an empty or invalid value
+  // that leaves the budget itself at its default: say so for the empty one
+  // (an invalid one is reported by its reader above).
+  for (const char* name :
+       {"DFKV_RDMA_ENDPOINT_CACHE_MAX", "DFKV_RDMA_QP_BUDGET",
+        "DFKV_RDMA_WR_BUDGET", "DFKV_RDMA_REGISTERED_BYTES_BUDGET"}) {
+    const char* value = std::getenv(name);
+    if (value && !*value)
+      envparse::WarnOnce(
+          name, std::string("invalid ") + name +
+                    "='': set but empty; the budget keeps its default, and "
+                    "being set switches the automatic budget scaling off, as "
+                    "before. Unset it or give it a number.");
+  }
   budget_autoscale_enabled_ =
       !std::getenv("DFKV_RDMA_ENDPOINT_CACHE_MAX") &&
       !std::getenv("DFKV_RDMA_QP_BUDGET") &&
@@ -676,6 +715,18 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
       }
     }
   }
+  // 0 means no deadline, and so does a value that is not a number at all;
+  // a negative one means 5000.
+  envparse::ReportUnlessPlain(
+      "DFKV_RDMA_OP_TIMEOUT_MS", 0, std::numeric_limits<int>::max(),
+      op_timeout_ms_ < 0 ? std::string("no deadline")
+                         : std::to_string(op_timeout_ms_));
+  // 0 (the default) follows DFKV_RDMA_OP_TIMEOUT_MS.
+  envparse::ReportUnlessPlain(
+      "DFKV_RDMA_BATCH_OP_TIMEOUT_MS", 0, std::numeric_limits<int>::max(),
+      batch_op_timeout_ms_ == 0
+          ? std::string("0 (follows DFKV_RDMA_OP_TIMEOUT_MS)")
+          : std::to_string(batch_op_timeout_ms_));
   config_dump::RecordResolved("DFKV_RDMA_OP_TIMEOUT_MS",
                               std::to_string(op_timeout_ms_));
   config_dump::RecordResolved("DFKV_RDMA_BATCH_OP_TIMEOUT_MS",
@@ -692,6 +743,9 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
           std::min<long>(parsed, std::numeric_limits<int>::max()));
     }
   }
+  envparse::ReportUnlessPlain("DFKV_RDMA_KEEPALIVE_MS", 0,
+                              std::numeric_limits<int>::max(),
+                              std::to_string(keepalive_ms_));
   config_dump::RecordResolved("DFKV_RDMA_KEEPALIVE_MS",
                               std::to_string(keepalive_ms_));
   // An explicit limit remains a hard per-pool retention limit. With no
@@ -1691,8 +1745,15 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     return result;
   }
   {
+    // Read for every connection that is opened; reported once.
     const char* bp = std::getenv("DFKV_RDMA_BUSY_POLL");
-    if (bp && *bp && *bp != '0') conn->ep.set_busy_poll(true);
+    const bool busy_poll = bp && *bp && *bp != '0';
+    static const bool reported =
+        (envparse::ReportSwitch("DFKV_RDMA_BUSY_POLL", busy_poll,
+                                "only a value starting with 0 is off"),
+         true);
+    (void)reported;
+    if (busy_poll) conn->ep.set_busy_poll(true);
   }
 
   char devbuf[rdma::kDevNameBytes];

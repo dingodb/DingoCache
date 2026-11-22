@@ -2,6 +2,7 @@
 
 #include "common/config_dump.h"
 #include "transport/endpoint_schedule.h"
+#include "utils/env_parse.h"
 #include "utils/wire_limits.h"
 
 #include <unistd.h>
@@ -78,6 +79,7 @@ uint64_t PoolEnv(const char* name, uint64_t dflt, uint64_t lo, uint64_t hi) {
       from_env = true;
     }
   }
+  envparse::ReportUnlessPlain(name, lo, hi, std::to_string(resolved));
   config_dump::Record(name, std::to_string(resolved),
                       from_env ? config_dump::Source::kEnv
                                : config_dump::Source::kDefault);

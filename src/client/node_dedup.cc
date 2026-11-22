@@ -13,6 +13,7 @@
 
 #include "client/dedup_token.h"
 #include "utils/log.h"
+#include "utils/env_parse.h"
 
 namespace dfkv {
 
@@ -30,7 +31,10 @@ uint64_t EnvU64(const char* name, uint64_t dflt) {
   const char* v = std::getenv(name);
   if (!v || !*v) return dflt;
   unsigned long long x = std::strtoull(v, nullptr, 10);
-  return x > 0 ? static_cast<uint64_t>(x) : dflt;
+  const uint64_t resolved = x > 0 ? static_cast<uint64_t>(x) : dflt;
+  envparse::ReportUnlessPlain(name, 1, std::numeric_limits<uint64_t>::max(),
+                              std::to_string(resolved));
+  return resolved;
 }
 
 uint32_t Pow2AtLeast(uint32_t v) {
@@ -99,7 +103,9 @@ std::string NodeDedup::EnvSegmentName(uint64_t namespace_hash) {
 
 std::unique_ptr<NodeDedup> NodeDedup::FromEnv(uint64_t namespace_hash) {
   const char* on = std::getenv("DFKV_CLIENT_NODE_DEDUP");
-  if (!on || std::strcmp(on, "1") != 0) return nullptr;
+  const bool enabled = on && std::strcmp(on, "1") == 0;
+  envparse::ReportSwitch("DFKV_CLIENT_NODE_DEDUP", enabled, "only 1 is on");
+  if (!enabled) return nullptr;
   Options o;
   o.arena_bytes = EnvU64("DFKV_NODE_DEDUP_ARENA_MB", 512) << 20;
   o.slots = static_cast<uint32_t>(EnvU64("DFKV_NODE_DEDUP_SLOTS", 65536));

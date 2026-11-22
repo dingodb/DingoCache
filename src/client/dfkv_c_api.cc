@@ -11,6 +11,7 @@
 #include "client/kv_client.h"
 #include "common/membership.h"
 #include "common/version.h"
+#include "utils/env_parse.h"
 #include "utils/log.h"
 
 using dfkv::KVClient;
@@ -166,7 +167,12 @@ dfkv_client_t dfkv_open_v2(const dfkv_client_options_v2* options) {
         const unsigned long long v = std::strtoull(e, &end, 10);
         if (end != e) ring_wait_ms = static_cast<uint64_t>(v);
       }
-      if (ring_wait_ms > 0 && !client->WaitForRing(static_cast<int>(ring_wait_ms))) {
+      // What is waited for is the int below, which a larger number wraps.
+      const int ring_wait_arg = static_cast<int>(ring_wait_ms);
+      dfkv::envparse::ReportUnlessPlain("DFKV_OPEN_RING_WAIT_MS", 0,
+                                        std::numeric_limits<int>::max(),
+                                        std::to_string(ring_wait_arg));
+      if (ring_wait_ms > 0 && !client->WaitForRing(ring_wait_arg)) {
         DFKV_LOG_WARN("dfkv_open_v2: ring still empty after "
                       + std::to_string(ring_wait_ms)
                       + "ms; ops will silently fail until MDS populates the ring");
@@ -427,6 +433,14 @@ int dfkv_retain_precheck(dfkv_client_t c, const void* const* keys,
         const long x = std::strtol(v, nullptr, 10);
         if (x >= 0 && x <= 100) min_headroom_pct = static_cast<uint8_t>(x);
       }
+      // This is read on every call; the report is made on the first.
+      static const bool reported =
+          (dfkv::envparse::ReportUnlessPlain(
+               "DFKV_RETAIN_PRECHECK_MIN_HEADROOM_PCT", 0, 100,
+               std::to_string(static_cast<unsigned>(min_headroom_pct)),
+               /*empty_is_unset=*/false),  // strtol("") is 0, not the default
+           true);
+      (void)reported;
     }
     std::vector<std::string> valid_keys;
     valid_keys.reserve(static_cast<size_t>(n));

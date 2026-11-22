@@ -17,6 +17,7 @@
 
 #include "client/dedup_token.h"
 #include "utils/log.h"
+#include "utils/env_parse.h"
 
 namespace dfkv {
 
@@ -31,7 +32,10 @@ uint64_t EnvU64(const char* name, uint64_t dflt) {
   const char* v = std::getenv(name);
   if (!v || !*v) return dflt;
   unsigned long long x = std::strtoull(v, nullptr, 10);
-  return x > 0 ? static_cast<uint64_t>(x) : dflt;
+  const uint64_t resolved = x > 0 ? static_cast<uint64_t>(x) : dflt;
+  envparse::ReportUnlessPlain(name, 1, std::numeric_limits<uint64_t>::max(),
+                              std::to_string(resolved));
+  return resolved;
 }
 
 uint32_t Pow2AtLeast(uint32_t v) {
@@ -112,9 +116,11 @@ std::string GpuNodeDedup::EnvSegmentName(uint64_t namespace_hash) {
 std::unique_ptr<GpuNodeDedup> GpuNodeDedup::FromEnv(
     uint64_t namespace_hash, const void* device_dst_hint) {
   const char* on = std::getenv("DFKV_CLIENT_NODE_DEDUP");
-  if (!on || std::strcmp(on, "1") != 0) return nullptr;
+  if (!on || std::strcmp(on, "1") != 0) return nullptr;  // reported by NodeDedup::FromEnv, which KVClient calls first
   const char* gpu = std::getenv("DFKV_CLIENT_NODE_DEDUP_GPU");
-  if (!gpu || std::strcmp(gpu, "1") != 0) return nullptr;
+  const bool enabled = gpu && std::strcmp(gpu, "1") == 0;
+  envparse::ReportSwitch("DFKV_CLIENT_NODE_DEDUP_GPU", enabled, "only 1 is on");
+  if (!enabled) return nullptr;
   // The caller remembers this answer, so it is not taken from a throttled probe.
   const CudaLib* cu = CudaLib::Probe();
   if (!cu) {
