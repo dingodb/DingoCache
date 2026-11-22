@@ -405,6 +405,16 @@ inline uint64_t MembersTopologyEpoch(std::vector<MemberInfo> ms) {
   return h;
 }
 
+// One member's own part of the topology view: everything MembersTopologyEpoch
+// hashes for it (id, address, weight, eligibility, whether it reports health,
+// and its rails with their states), and nothing about any other member. It is
+// the generation a client publishes for that peer, so a change of one member
+// invalidates the transport state of that member only. Same value on every
+// client and independent of the order in which the MDS lists members.
+inline uint64_t MemberTopologyEpoch(const MemberInfo& member) {
+  return MembersTopologyEpoch(std::vector<MemberInfo>{member});
+}
+
 }  // namespace dfkv
 
 #endif  // DFKV_MEMBERSHIP_H_

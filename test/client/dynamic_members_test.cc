@@ -1,6 +1,7 @@
 // TDD R12 — dynamic membership: KVClient.SetMembers() rebuilds the ring at
 // runtime so adding a node re-routes new keys without recreating the client.
 #include "client/kv_client.h"
+#include "scripted_topology_mds.h"
 #include "cache/kv_node_server.h"
 #include "common/membership.h"
 #include "mds/mds_member_poller.h"
@@ -39,86 +40,6 @@ std::unique_ptr<Node> Start(const std::string& tag) {
   n->addr = "127.0.0.1:" + std::to_string(n->srv->port());
   return n;
 }
-
-// A local MDS with a mutable topology response. The client's background poller
-// is synchronized through the recording transport below, so the test never
-// sleeps or depends on lease timing.
-class ScriptedTopologyMds {
- public:
-  explicit ScriptedTopologyMds(std::vector<MemberInfo> members)
-      : members_(std::move(members)) {
-    lfd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    sockaddr_in sa{};
-    sa.sin_family = AF_INET;
-    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    ::bind(lfd_, reinterpret_cast<sockaddr*>(&sa), sizeof(sa));
-    ::listen(lfd_, 8);
-    socklen_t sl = sizeof(sa);
-    ::getsockname(lfd_, reinterpret_cast<sockaddr*>(&sa), &sl);
-    port_ = ntohs(sa.sin_port);
-    thread_ = std::thread([this] { Serve(); });
-  }
-
-  ~ScriptedTopologyMds() {
-    ::shutdown(lfd_, SHUT_RDWR);
-    ::close(lfd_);
-    if (thread_.joinable()) thread_.join();
-  }
-
-  std::string endpoint() const {
-    return "127.0.0.1:" + std::to_string(port_);
-  }
-
-  void SetMembers(std::vector<MemberInfo> members) {
-    std::lock_guard<std::mutex> lock(mu_);
-    members_ = std::move(members);
-  }
-
-  bool only_topology_requests() const {
-    return only_topology_requests_.load();
-  }
-
- private:
-  void Serve() {
-    for (;;) {
-      const int fd = ::accept(lfd_, nullptr, nullptr);
-      if (fd < 0) return;
-      char prefix[kReqPrefix];
-      ReqFields request{};
-      bool ok = net::ReadAll(fd, prefix, sizeof(prefix)) &&
-                DecodeReq(prefix, &request);
-      if (ok && request.payload_len != 0) {
-        std::string payload(request.payload_len, '\0');
-        ok = net::ReadAll(fd, &payload[0], payload.size());
-      }
-      if (ok) {
-        if (request.op != static_cast<uint8_t>(WireOp::kListTopology))
-          only_topology_requests_.store(false);
-        std::vector<MemberInfo> members;
-        {
-          std::lock_guard<std::mutex> lock(mu_);
-          members = members_;
-        }
-        const std::string data =
-            EncodeMembers(members, MembersTopologyEpoch(members));
-        char response[kRespPrefix];
-        EncodeResp(response, Status::kOk, data.size());
-        ok = net::WriteAll(fd, response, sizeof(response)) &&
-             (data.empty() ||
-              net::WriteAll(fd, data.data(), data.size()));
-      }
-      (void)ok;
-      ::close(fd);
-    }
-  }
-
-  mutable std::mutex mu_;
-  std::vector<MemberInfo> members_;
-  std::atomic<bool> only_topology_requests_{true};
-  int lfd_ = -1;
-  int port_ = 0;
-  std::thread thread_;
-};
 
 // Emulates an MDS predating kListTopology. It either returns the legacy
 // unknown-op response (kInvalid) or drops that request, and records whether the
@@ -331,6 +252,15 @@ struct HintRecordingTransport : dfkv::Transport {
   std::shared_ptr<const rdma::PeerRailSnapshot> PeerSnapshot(
       const std::string& address) const {
     return topology_store.Snapshot(address);
+  }
+  uint64_t Publication(const std::string& address) const {
+    return topology_store.Snapshot(address)->publication;
+  }
+  // What a pooled connection remembers of its peer; the transport drops the
+  // connection once this is no longer current.
+  bool Current(const std::string& address, const std::string& peer_id,
+               uint64_t publication) const {
+    return topology_store.IsCurrent(address, peer_id, publication);
   }
   mutable std::mutex mu;
   std::condition_variable cv;
@@ -657,4 +587,156 @@ TEST(DynamicMembers, GuardRejectedShrinkInvalidatesOmittedRoutablePeers) {
             routed.end());
   EXPECT_NE(std::find(routed.begin(), routed.end(), "127.0.0.1:28203"),
             routed.end());
+}
+
+namespace {
+MemberInfo HealthyPeer(int index, uint32_t base_port) {
+  MemberInfo peer{"n" + std::to_string(index), "127.0.0.1",
+                  base_port + static_cast<uint32_t>(index), 1};
+  peer.has_health = true;
+  peer.health.ring_eligible = true;
+  peer.health.ib_devices = {{"ib0", 4, 5, true}};
+  return peer;
+}
+std::string AddressOf(const MemberInfo& peer) {
+  return peer.ip + ":" + std::to_string(peer.port);
+}
+// Wait until the client has applied whatever the MDS was last told to say.
+// The MDS counts an answer after it has written it and closed the socket. A
+// request already in flight may still carry the previous answer (first
+// count); the next one carries the new answer, but it is counted before the
+// client has decoded it and run its callback (second count). The poller is
+// serial, so it asks a third time only after it has finished with the second.
+bool Applied(ScriptedTopologyMds* mds) {
+  return mds->WaitForAnswered(mds->Answered() + 3);
+}
+}  // namespace
+
+// A change of one member must not invalidate what the transport holds for
+// the others. The pooled connections of a transport are bound to the
+// publication of their peer and are torn down when it moves on; count them.
+TEST(DynamicMembers, OneMemberChangeTearsDownOnlyThatPeersConnections) {
+  using P = std::vector<std::pair<std::string, std::string>>;
+  const int kPeers = 8;
+  const int kConnectionsPerPeer = 4;
+  std::vector<MemberInfo> peers;
+  for (int i = 0; i < kPeers; ++i) peers.push_back(HealthyPeer(i, 28401));
+  ScriptedTopologyMds mds(peers);
+  HintRecordingTransport transport;
+  KVClient client(P{}, Hdr(), &transport);
+  client.StartMdsDiscovery({mds.endpoint()}, "one-of-n-test", 10);
+  ASSERT_TRUE(transport.WaitForPeerTopologies(kPeers));
+
+  struct PooledConnection {
+    std::string address;
+    std::string peer_id;
+    uint64_t publication;
+  };
+  std::vector<PooledConnection> pool;
+  for (const auto& peer : peers) {
+    const uint64_t publication = transport.Publication(AddressOf(peer));
+    ASSERT_NE(publication, 0u);
+    for (int i = 0; i < kConnectionsPerPeer; ++i)
+      pool.push_back({AddressOf(peer), peer.id, publication});
+  }
+
+  // One port of n3 goes down. Every member is republished.
+  peers[3].health.ib_devices[0] = {"ib0", 1, 2, true};
+  mds.SetMembers(peers);
+  ASSERT_TRUE(transport.WaitForPeerTopologies(2 * kPeers));
+  client.StopMdsDiscovery();
+
+  int torn_down = 0;
+  for (const auto& connection : pool) {
+    if (!transport.Current(connection.address, connection.peer_id,
+                           connection.publication)) {
+      ++torn_down;
+      EXPECT_EQ(connection.peer_id, "n3");
+    }
+  }
+  EXPECT_EQ(torn_down, kConnectionsPerPeer)
+      << "of " << pool.size() << " pooled connections";
+  EXPECT_FALSE(transport.PeerSnapshot(AddressOf(peers[3]))->peer_healthy[0]);
+}
+
+// The per-peer generation covers what the generation of the whole view did,
+// peer by peer.
+TEST(DynamicMembers, PeerPublicationFollowsOnlyItsOwnMember) {
+  using P = std::vector<std::pair<std::string, std::string>>;
+  std::vector<MemberInfo> peers;
+  for (int i = 0; i < 4; ++i) peers.push_back(HealthyPeer(i, 28501));
+  ScriptedTopologyMds mds(peers);
+  HintRecordingTransport transport;
+  KVClient client(P{}, Hdr(), &transport);
+  client.StartMdsDiscovery({mds.endpoint()}, "per-peer-test", 10);
+  ASSERT_TRUE(transport.WaitForPeerTopologies(4));
+  ASSERT_TRUE(Applied(&mds));
+
+  std::vector<std::string> address;
+  std::vector<uint64_t> publication;
+  for (const auto& peer : peers) {
+    address.push_back(AddressOf(peer));
+    publication.push_back(transport.Publication(address.back()));
+    ASSERT_NE(publication.back(), 0u);
+  }
+  const auto unchanged = [&](int i) {
+    return transport.Publication(address[i]) == publication[i];
+  };
+
+  // The same members in another order: not a change at all.
+  size_t updates = transport.PeerTopologies().size();
+  mds.SetMembers({peers[3], peers[1], peers[0], peers[2]});
+  ASSERT_TRUE(Applied(&mds));
+  EXPECT_EQ(transport.PeerTopologies().size(), updates);
+  for (int i = 0; i < 4; ++i) EXPECT_TRUE(unchanged(i)) << i;
+
+  // An MDS that answers an error instead of a list: the last view stays.
+  mds.SetStatus(Status::kIOError);
+  ASSERT_TRUE(Applied(&mds));
+  mds.SetStatus(Status::kOk);
+  ASSERT_TRUE(Applied(&mds));
+  EXPECT_EQ(transport.PeerTopologies().size(), updates);
+  for (int i = 0; i < 4; ++i) EXPECT_TRUE(unchanged(i)) << i;
+
+  // n1 reports one more rail, in another order than before.
+  peers[1].health.ib_devices = {{"ib1", 4, 5, true}, {"ib0", 4, 5, true}};
+  mds.SetMembers(peers);
+  ASSERT_TRUE(Applied(&mds));
+  EXPECT_GT(transport.Publication(address[1]), publication[1]);
+  publication[1] = transport.Publication(address[1]);
+  EXPECT_TRUE(unchanged(0));
+  EXPECT_TRUE(unchanged(2));
+  EXPECT_TRUE(unchanged(3));
+
+  // n2 leaves and comes back unchanged at the same address: a new
+  // incarnation, although its entry is byte for byte what it was.
+  mds.SetMembers({peers[0], peers[1], peers[3]});
+  ASSERT_TRUE(Applied(&mds));
+  EXPECT_TRUE(transport.PeerSnapshot(address[2])->peer_id.empty());
+  EXPECT_FALSE(transport.Current(address[2], "n2", publication[2]));
+  mds.SetMembers(peers);
+  ASSERT_TRUE(Applied(&mds));
+  EXPECT_EQ(transport.PeerSnapshot(address[2])->peer_id, "n2");
+  EXPECT_GT(transport.Publication(address[2]), publication[2]);
+  publication[2] = transport.Publication(address[2]);
+  EXPECT_TRUE(unchanged(0));
+  EXPECT_TRUE(unchanged(1));
+  EXPECT_TRUE(unchanged(3));
+
+  // n3 leaves and comes back at another address.
+  mds.SetMembers({peers[0], peers[1], peers[2]});
+  ASSERT_TRUE(Applied(&mds));
+  const std::string old_address = address[3];
+  peers[3].port = 28599;
+  address[3] = AddressOf(peers[3]);
+  mds.SetMembers(peers);
+  ASSERT_TRUE(Applied(&mds));
+  client.StopMdsDiscovery();
+  EXPECT_TRUE(transport.PeerSnapshot(old_address)->peer_id.empty());
+  EXPECT_FALSE(transport.Current(old_address, "n3", publication[3]));
+  EXPECT_EQ(transport.PeerSnapshot(address[3])->peer_id, "n3");
+  EXPECT_GT(transport.Publication(address[3]), publication[3]);
+  EXPECT_TRUE(unchanged(0));
+  EXPECT_TRUE(unchanged(1));
+  EXPECT_TRUE(unchanged(2));
 }

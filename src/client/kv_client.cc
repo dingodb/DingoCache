@@ -371,7 +371,10 @@ void KVClient::PublishPeerTopologies(
   for (const auto& member : topology) {
     PeerTopology peer;
     peer.peer_addr = member.ip + ":" + std::to_string(member.port);
-    peer.generation = generation;
+    // Not the epoch of the whole view: that changes when any member does,
+    // and the transport would then drop every peer's pooled connections for
+    // a change that concerns one of them.
+    peer.generation = MemberTopologyEpoch(member);
     peer.complete = member.has_health;
     peer.rails.reserve(member.health.ib_devices.size());
     for (const auto& device : member.health.ib_devices)

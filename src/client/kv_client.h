@@ -238,6 +238,9 @@ class KVClient {
   // retired, and the complete live-id set is reconciled after publication.
   // Peers omitted while still held by a guard-rejected ring are retired from
   // topology state, so strict selection falls back closed without stale rails.
+  // Each present peer is published under its own MemberTopologyEpoch, so the
+  // transport sees a new generation only for members whose own entry changed;
+  // `generation`, the epoch of the whole view, only labels retirements.
   void PublishPeerTopologies(const std::vector<MemberInfo>& topology,
                              uint64_t generation);
   // Scalar transport bodies. Public scalar methods add exactly one metric;

@@ -196,10 +196,13 @@ class PeerTopologyStore {
 
     std::lock_guard<std::mutex> lock(mu_);
     const auto found = snapshots_.find(topology.peer_addr);
-    // generation is a canonical FNV topology token, not a numeric sequence.
-    // MdsMemberPoller publishes callbacks in order; compare equality only to
-    // deduplicate the same immutable identity snapshot. Ordering it with < or >
-    // would reject arbitrary valid topology changes.
+    // generation is a canonical FNV token of this peer's membership entry,
+    // not a numeric sequence. MdsMemberPoller publishes callbacks in order;
+    // compare equality only to deduplicate the same immutable identity
+    // snapshot. Ordering it with < or > would reject arbitrary valid topology
+    // changes. An equal token keeps the publication, and with it the peer's
+    // pooled connections and capability cache: the client republishes every
+    // member whenever any one of them changes.
     if (found != snapshots_.end() &&
         topology.generation == found->second->generation &&
         topology.peer_id == found->second->peer_id)
