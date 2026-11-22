@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- LMCache connector (in-process `RemoteConnector`): a cancelled GET no
+  longer gives its buffer back to the L1 arena while the transport is still
+  writing into it. LMCache cancels a `get` that exceeds its blocking timeout
+  (10 s by default); the native GET runs on a worker thread and does not
+  stop. The connector released the buffer at the cancellation, so the late
+  write landed in a chunk the arena had already handed to another request:
+  memory corruption in the host process, whenever a GET to a slow or
+  degraded node outlived the timeout. On `batched_get` and
+  `batched_get_non_blocking` a cancellation skipped the release instead and
+  leaked the whole batch, and a failing chunk released the buffers of its
+  still-running siblings. Buffers are now released only when the native
+  call can no longer touch them: when it returns, or at once if it had not
+  started. Nothing waits on the event loop for that. The uncancelled paths
+  are unchanged.
+
 ## 2.39.0 — 2026-11-22
 
 - Client: a cache node that answers slowly no longer holds up reads of the

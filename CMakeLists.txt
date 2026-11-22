@@ -285,6 +285,14 @@ if(DFKV_BUILD_TESTS)
               -p test_client_ranks.py)
     set_tests_properties(python_vllm_client_ranks PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src:${CMAKE_CURRENT_SOURCE_DIR}/integration/vllm/src")
+    # LMCache connector logic over fake clients. With no LMCache installed
+    # these run on a stand-in for the LMCache modules the connector imports
+    # (integration/lmcache/tests/_lmcache_stub.py).
+    add_test(NAME python_lmcache_get_cancel
+      COMMAND ${PYTHON3}
+              ${CMAKE_CURRENT_SOURCE_DIR}/integration/lmcache/tests/test_get_cancel.py)
+    set_tests_properties(python_lmcache_get_cancel PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
     add_test(NAME python_lmcache_key_mapper
       COMMAND ${PYTHON3}
               ${CMAKE_CURRENT_SOURCE_DIR}/integration/lmcache/tests/test_key_mapper.py)
