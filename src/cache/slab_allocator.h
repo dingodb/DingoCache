@@ -233,7 +233,11 @@ class SlabAllocator {
   uint64_t UsedBytes() const;
   uint64_t Capacity() const;
   uint64_t Evictions() const;
+  // Every extent moved from one class to another, whatever the path.
   uint64_t Steals() const;
+  // Only the cold steals inside Put (StealColdExtentFor): not the empty
+  // extents Put takes first (TakeEmptyExtentFor), not the floor or last
+  // resort steals and not the background growth (StealFrom).
   uint64_t ColdSteals() const;
   uint64_t WatermarkEvictions() const;
   // Local candidate: reclaim slots in refreshed actual-read/new-write order
@@ -316,6 +320,11 @@ class SlabAllocator {
     size_t free_count = 0;
     size_t resident_count = 0;
     uint32_t bound_extents = 0;
+    // Bound extents of this class with no resident (so with no pin and no
+    // protected slot either), and the admission clock at its latest Put:
+    // what TakeEmptyExtentFor needs to know without visiting extents.
+    uint32_t empty_extents = 0;
+    uint64_t last_put_seq = 0;
     uint64_t puts = 0;
     uint64_t useful_bytes = 0;
     uint64_t read_touches = 0;
@@ -368,6 +377,7 @@ class SlabAllocator {
                                   size_t min_donor_extents = 0);
   ExtentBindResult StealColdExtentFor(size_t cls,
                                       std::vector<BlockKey>* evicted);
+  ExtentBindResult TakeEmptyExtentFor(size_t cls);
   ExtentBindResult StealExtentLocked(uint32_t extent, size_t target_cls,
                                       std::vector<BlockKey>* evicted);
 
@@ -445,6 +455,7 @@ class SlabAllocator {
   uint64_t evictions_ = 0;
   uint64_t steals_ = 0;
   uint64_t cold_steals_ = 0;
+  uint32_t empty_extents_ = 0;  // sum of Class::empty_extents
   uint64_t watermark_evictions_ = 0;
   uint64_t watermark_scan_steps_ = 0;
   uint64_t extent_returns_ = 0;

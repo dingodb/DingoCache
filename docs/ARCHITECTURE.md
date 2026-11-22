@@ -273,9 +273,16 @@ size-class lattice and carves them into uniform slots:
   an extent merely because it is still being filled and holds fewer useful
   bytes; it is an extent-level choice, so a few new residents mixed into an
   extent of mostly old ones can still go with it. The cold-steal path
-  (`StealColdExtentFor`) keeps its admission-age gate and heat/useful-bytes
-  order. Background growth judges cold donor classes by bytes written, not
+  (`StealColdExtentFor`) keeps its admission-age gate and picks in the
+  same order. Background growth judges cold donor classes by bytes written, not
   object count.
+- **Where a write finds room:** a free slot of its class; an unbound extent;
+  an extent another class holds empty, which costs no value, if that class
+  has written nothing for a cold window or holds more than its striping
+  width of extents with free slots; then the floor steal below; then
+  the cold steal, when another class's extent is much older than this
+  class's own oldest; then this class's own CLOCK eviction; then the last
+  resort steal.
 - **Whole extents follow the data that is used:** both ways of moving a
   whole extent to a class that is being written, the background growth
   (`StealFrom`) and the cold steal inside `Put`, take a donor's extent only
