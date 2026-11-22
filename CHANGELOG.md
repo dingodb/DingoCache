@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+
+- Client, MDS membership: the ring is no longer rebuilt on every view of a
+  recovery ramp, and the first members back after an empty ring are no
+  longer frozen in as the whole ring. A smaller view than the trusted
+  reference used to be adopted at once unless it dropped more than
+  `DFKV_MDS_SHRINK_GUARD_PCT` (50%) of it; after an outage, members
+  re-registering one by one gave a run of such views, each adopted and each
+  rebuilding the ring on an incomplete view. Such a view is now adopted
+  once it repeats on two polls in a row, so a single member loss reaches
+  the ring one poll (3 s) later than before, a steady decline of one
+  member per poll is adopted only once it stops, and a member flapping
+  between present and absent stays in the ring; clients still skip a dead
+  member through their peer-health cooldown, so the cost is misses on its
+  keys. After an empty ring had been
+  believed, the first non-empty view (perhaps 2 or 3 members) became the
+  reference at once, and the growth arm then held every larger view back
+  until one repeated three times, leaving all keys on those members for
+  about 16 s. The views of the returning members are now adopted as they
+  come, and the reference anchors on a view that repeats three times; until
+  then the last adopted view is the reference for shrinking, so one bad
+  poll during the ramp does not shrink the ring. No setting, API or wire
+  change. See `docs/DEPLOY.md`.
 - Client, host and GPU dedup: on weakly ordered CPUs (aarch64) a copy out
   of a shared entry that raced a writer could pass its check and return
   torn bytes. The copy re-reads the entry's generation and the ring cursor
