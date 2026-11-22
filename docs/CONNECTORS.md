@@ -1341,6 +1341,7 @@ vllm serve <model> --tensor-parallel-size 8 --no-enable-prefix-caching \
 | `mds_poll_ms` | — | `3000` | 客户端 MDS 环重新发现间隔（毫秒） |
 | `num_workers` | — | `8` | 客户端 I/O 并发度 |
 | `max_capacity_gb` | — | `0` | > 0 时启用 LMCache 聚合 L2 切割（见 §4.6.6）；0 = 容量交给 dfkv 自管 |
+| `key_includes_model` | — | `false` | 把 `ObjectKey.model_name` 编进每个对象 key。一个 MP server 经同一 adapter 服务多个模型时必须打开：关闭时 key 只含 chunk hash、rank、group、salt，两个模型在这几项相同时共用 key，一个读到另一个的字节（adapter 看到第二个 model name 时告警一次）。默认关闭是为了升级不丢缓存：打开后每个 key 都变了，此前存的对象全部找不到（相当于冷启动一次）。也可以每个模型用自己的 adapter（不同 `model_name` 即不同 namespace）。打开后 `cache_salt` 超过 212 字节（放不进 256 字节的 key 分量）时以其 SHA-256 入 key |
 
 **MDS 列表的填写规则**：全部可用 MDS 副本的 `ip:port` 以逗号拼接，无空格。
 client 启动时挨个尝试，失败自动下位。若以后只改了一处且其他已死/未在，
@@ -1393,6 +1394,7 @@ in-process 上游 metadata 无这两项（见 §4.3 🔴）。对生产参与 te
 参数变化隔离场景的**唯一选项是本 adapter**。MP-server API 不提供足以证明 byte-identical MLA replica 的 model/PP
 元数据，因此对象 key 始终保留 `world_size/global_rank` identity，并拒绝手工折叠开关。
 server 的 pinned L1 arena 在 LMCache 传入 `l1_memory_desc` 时自动注册 RDMA 零拷贝。
+load 校验长度：命中的值长度必须等于目标 buffer 的长度（store 写的是整个 `byte_array`），否则按未命中报告并计入 `load_length_mismatches`（首次告警）——同 key 下另一布局（dtype、模型）存的值或被截断的值不再被当作本对象加载。adapter 配了 `serde_config`（LMCache 套 serde wrapper，值是序列化后变长的）时不做此校验。
 
 实现要点：dfkv 无原生 eventfd，`DfkvL2Adapter` 用**后台 asyncio loop + 三个
 `create_event_notifier`（store/lookup/load）+ done-callback** 把同步 ctypes 客户端桥接到

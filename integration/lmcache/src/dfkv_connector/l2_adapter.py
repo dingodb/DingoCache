@@ -37,6 +37,7 @@ Design notes:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import threading
 from concurrent.futures import Future as _CFuture
 from typing import TYPE_CHECKING, List, Optional
@@ -66,12 +67,40 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _object_key_to_bytes(key: ObjectKey) -> bytes:
-    """Encode an ObjectKey using dfkv's canonical binary pool-key schema."""
+def _model_component(model_name: str) -> str:
+    """The key component that tells one ObjectKey.model_name from another."""
+    digest = hashlib.sha256(str(model_name).encode("utf-8")).hexdigest()
+    return f"model-{digest[:32]}"
+
+
+# pool_key() refuses a component longer than this (bytes).
+_COMPONENT_MAX_BYTES = 256
+
+
+def _object_key_to_bytes(key: ObjectKey, include_model: bool = False) -> bytes:
+    """Encode an ObjectKey using dfkv's canonical binary pool-key schema.
+
+    ``include_model`` adds ``ObjectKey.model_name`` to the key. Without it two
+    models served through one adapter (one namespace) share a key whenever
+    their chunk hash, rank, group and salt agree, and one reads the other's
+    bytes. It is a switch (``key_includes_model``) because it changes the key
+    of every object: what was stored without it is not found with it.
+
+    With ``include_model`` the model part takes 39 bytes of the component, so
+    a long ``cache_salt`` would no longer fit: where model and salt together
+    exceed pool_key's 256-byte limit, the salt is replaced by its SHA-256
+    (``salth-<64 hex>``). Keys without ``include_model`` are unchanged.
+    """
     global_rank = (int(key.kv_rank) >> 16) & 0xFF
     component = "all"
     if key.cache_salt:
         component = f"salt-{key.cache_salt}"
+    if include_model:
+        model = _model_component(key.model_name)
+        if len(f"{model}/{component}".encode("utf-8")) > _COMPONENT_MAX_BYTES:
+            digest = hashlib.sha256(str(key.cache_salt).encode("utf-8")).hexdigest()
+            component = f"salth-{digest}"
+        component = f"{model}/{component}"
     return pool_key(
         key.chunk_hash.hex(),
         pool="kv",
@@ -122,6 +151,12 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
       - num_workers (int): client I/O parallelism (default 8).
       - max_capacity_gb (float): if > 0, enables aggregate usage reporting /
         global eviction; default 0 (dfkv manages its own capacity).
+      - key_includes_model (bool): put ``ObjectKey.model_name`` into every
+        object key. Needed when one MP server serves more than one model
+        through this adapter: without it their objects can collide. Default
+        ``false`` for now, because turning it on changes every key (objects
+        stored before are not found once). The adapter warns when it sees a
+        second model name while this is off.
     """
 
     def __init__(
@@ -135,6 +170,7 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
         mds_poll_ms: int = 3000,
         num_workers: int = 8,
         max_capacity_gb: float = 0.0,
+        key_includes_model: bool = False,
     ) -> None:
         self.url = url
         self.membership = membership
@@ -145,6 +181,7 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
         self.mds_poll_ms = mds_poll_ms
         self.num_workers = num_workers
         self.max_capacity_gb = max_capacity_gb
+        self.key_includes_model = key_includes_model
 
     @classmethod
     def from_dict(cls, d: dict) -> "DfkvL2AdapterConfig":
@@ -191,6 +228,12 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
                 "dfkv L2 adapter: 'max_capacity_gb' must be a non-negative number"
             )
 
+        key_includes_model = d.get("key_includes_model", False)
+        if not isinstance(key_includes_model, bool):
+            raise ValueError(
+                "dfkv L2 adapter: 'key_includes_model' must be true or false"
+            )
+
         # Reject the retired rank-folding knob instead of ignoring it.
         if "mla_canonical_keys" in d:
             raise ValueError(
@@ -208,6 +251,7 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
             mds_poll_ms=mds_poll_ms,
             num_workers=num_workers,
             max_capacity_gb=float(max_capacity_gb),
+            key_includes_model=key_includes_model,
         )
 
     @classmethod
@@ -223,7 +267,10 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
             "- mds_poll_ms (int): MDS rediscovery interval (default 3000)\n"
             "- num_workers (int): client I/O parallelism (default 8)\n"
             "- max_capacity_gb (float): >0 enables aggregate eviction "
-            "(default 0 = dfkv manages capacity)"
+            "(default 0 = dfkv manages capacity)\n"
+            "- key_includes_model (bool): put ObjectKey.model_name into the "
+            "object key; required when one server caches several models "
+            "(default false; changes every key)"
         )
 
 
@@ -265,6 +312,19 @@ class DfkvL2Adapter(L2AdapterInterface):
         self._key_sizes: dict[ObjectKey, int] = {}
         self._warned_no_remove = False
         self._lock = threading.Lock()
+        # ObjectKey.model_name values seen, to notice a second model while
+        # the key does not tell models apart (key_includes_model off).
+        self._key_includes_model = bool(getattr(config, "key_includes_model", False))
+        self._model_names_seen: set = set()
+        self._warned_model_collision = False
+        # Loads refused because the stored length was not the buffer's.
+        self.load_length_mismatches = 0
+        # LMCache wraps the adapter in its serde wrapper when the adapter's
+        # config has a serde_config (it sets the attribute after from_dict):
+        # values are then serialized and shorter than the load buffer.
+        self._variable_length_values = (
+            getattr(config, "serde_config", None) is not None
+        )
 
         # Background asyncio loop that runs the client's batch_* coroutines.
         self._loop = asyncio.new_event_loop()
@@ -314,6 +374,40 @@ class DfkvL2Adapter(L2AdapterInterface):
         )
 
     # ------------------------------------------------------------------
+    # Keys
+    # ------------------------------------------------------------------
+
+    def _binary_keys(self, keys: List[ObjectKey]) -> List[bytes]:
+        if not self._key_includes_model:
+            self._note_model_names(keys)
+        return [
+            _object_key_to_bytes(k, include_model=self._key_includes_model)
+            for k in keys
+        ]
+
+    def _note_model_names(self, keys: List[ObjectKey]) -> None:
+        """Warn, once, when a second ObjectKey.model_name shows up while the
+        key does not carry it: from then on two models share keys."""
+        if self._warned_model_collision:
+            return
+        names = {getattr(k, "model_name", None) for k in keys}
+        with self._lock:
+            self._model_names_seen |= names
+            if len(self._model_names_seen) < 2 or self._warned_model_collision:
+                return
+            self._warned_model_collision = True
+            seen = sorted(str(n) for n in self._model_names_seen)
+        logger.warning(
+            "dfkv L2 adapter: objects of more than one model (%s) go through "
+            "this adapter, and the object key does not include the model "
+            "name: where chunk hash, rank, group and salt agree, one model "
+            "reads the other's bytes. Set adapter_params.key_includes_model "
+            "to true (objects stored so far are then not found once), or "
+            "give each model its own adapter.",
+            ", ".join(seen),
+        )
+
+    # ------------------------------------------------------------------
     # Event Fd Interface
     # ------------------------------------------------------------------
 
@@ -333,7 +427,7 @@ class DfkvL2Adapter(L2AdapterInterface):
     def submit_store_task(
         self, keys: List[ObjectKey], objects: List[MemoryObj]
     ) -> L2TaskId:
-        binary_keys = [_object_key_to_bytes(k) for k in keys]
+        binary_keys = self._binary_keys(keys)
         views = [obj.byte_array for obj in objects]
         sizes = [obj.get_size() for obj in objects]
         with self._lock:
@@ -397,7 +491,7 @@ class DfkvL2Adapter(L2AdapterInterface):
     # ------------------------------------------------------------------
 
     def submit_lookup_and_lock_task(self, keys: List[ObjectKey]) -> L2TaskId:
-        binary_keys = [_object_key_to_bytes(k) for k in keys]
+        binary_keys = self._binary_keys(keys)
         with self._lock:
             task_id = self._next_task_id
             self._next_task_id += 1
@@ -452,8 +546,17 @@ class DfkvL2Adapter(L2AdapterInterface):
     def submit_load_task(
         self, keys: List[ObjectKey], objects: List[MemoryObj]
     ) -> L2TaskId:
-        binary_keys = [_object_key_to_bytes(k) for k in keys]
+        binary_keys = self._binary_keys(keys)
         views = [obj.byte_array for obj in objects]
+        # The length a stored value of each object has: the store writes
+        # ``byte_array`` (get_size() bytes), and the load buffer of the same
+        # layout has the same length. Under LMCache's serde wrapper values
+        # are serialized, shorter than the buffer it loads them into and
+        # self-describing: their length is not checked here.
+        sizes = (
+            None if self._variable_length_values
+            else [view.nbytes for view in views]
+        )
         with self._lock:
             task_id = self._next_task_id
             self._next_task_id += 1
@@ -462,7 +565,7 @@ class DfkvL2Adapter(L2AdapterInterface):
         )
         # Keep ``objects`` alive until the C call finishes writing into them.
         fut.add_done_callback(
-            lambda f: self._on_load_done(f, task_id, list(keys), objects)
+            lambda f: self._on_load_done(f, task_id, list(keys), objects, sizes)
         )
         return task_id
 
@@ -472,20 +575,42 @@ class DfkvL2Adapter(L2AdapterInterface):
         task_id: L2TaskId,
         keys: List[ObjectKey],
         _objects_keepalive: List[MemoryObj],
+        sizes: Optional[List[int]],
     ) -> None:
         n = len(keys)
         bitmap = Bitmap(n)
         accessed: List[ObjectKey] = []
+        mismatched = 0
         try:
-            _ok, per_key, _lengths = fut.result()
+            _ok, per_key, lengths = fut.result()
         except Exception as e:  # pragma: no cover
             logger.warning("dfkv L2 load task %d failed: %s", task_id, e)
-            per_key = None
-        if per_key is not None:
-            for i, loaded in enumerate(per_key):
-                if loaded:
-                    bitmap.set(i)
-                    accessed.append(keys[i])
+            per_key = []
+        for i, loaded in enumerate(per_key):
+            if not loaded:
+                continue
+            # A hit of another length is not this object: a value stored for
+            # another layout (dtype, model) under the same key, or a truncated
+            # one. Its bytes are in the buffer, but the object is reported not
+            # loaded, so they are never used.
+            if sizes is not None and int(lengths[i]) != sizes[i]:
+                mismatched += 1
+                continue
+            bitmap.set(i)
+            accessed.append(keys[i])
+        if mismatched:
+            with self._lock:
+                first = self.load_length_mismatches == 0
+                self.load_length_mismatches += mismatched
+            if first:
+                logger.warning(
+                    "dfkv L2 load task %d: %d object(s) came back with a "
+                    "length other than their buffer's and are treated as not "
+                    "found (stored for another model or layout under the same "
+                    "key?). Further ones are only counted.",
+                    task_id,
+                    mismatched,
+                )
         with self._lock:
             self._completed_loads[task_id] = bitmap
         if accessed:
@@ -517,7 +642,7 @@ class DfkvL2Adapter(L2AdapterInterface):
                     "eviction is a no-op. Rebuild dfkv with the remove RPC."
                 )
             return
-        binary_keys = [_object_key_to_bytes(k) for k in keys]
+        binary_keys = self._binary_keys(keys)
         fut = asyncio.run_coroutine_threadsafe(
             self._client.batch_remove(binary_keys), self._loop
         )
