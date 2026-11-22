@@ -256,3 +256,22 @@ TEST(PeerHealth, UniqueFailingAddressFloodBoundsEveryMapAndEvictsLru) {
   EXPECT_EQ(h.failure_streak_peers_for_test(), 4096u);
   EXPECT_EQ(h.error_peers_for_test(), 4096u);
 }
+
+// A failure is reported with a clock read before the lock; another thread
+// may have recorded an answer since, a little later than that clock. The
+// peer answered within the grace period: no cooldown.
+TEST(PeerHealth, AnswerNewerThanTheFailuresClockIsWithinGrace) {
+  PeerHealth h(/*cooldown_ms=*/2000, /*max=*/30000, /*grace=*/1000);
+  h.MarkGood("a", 5001);
+  h.MarkBad("a", 5000);
+  EXPECT_TRUE(h.Healthy("a", 5000)) << "a peer that just answered cooled down";
+}
+
+// An answer stamped far ahead of the failure's clock is no skew: the grace
+// does not apply.
+TEST(PeerHealth, AnswerFarAheadOfTheFailuresClockIsNoGrace) {
+  PeerHealth h(/*cooldown_ms=*/2000, /*max=*/30000, /*grace=*/1000);
+  h.MarkGood("a", 65000);
+  h.MarkBad("a", 5000);
+  EXPECT_FALSE(h.Healthy("a", 5000));
+}

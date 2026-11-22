@@ -83,6 +83,9 @@ struct NodeDedupTestAccess {
   static void SetLockWait(NodeDedup& d, std::chrono::milliseconds wait) {
     d.lock_wait_ms_ = static_cast<int>(wait.count());
   }
+  static bool ShiftStamp(NodeDedup& d, const BlockKey& key, int64_t ms) {
+    return d.ShiftStampForTest(key, NodeDedup::Kind::kData, ms);
+  }
   static void LookLikeAnOlderRelease(NodeDedup& d, const Hold& h) {
     d.SetFenceableForTest(h.hold, false);
   }
@@ -1131,4 +1134,48 @@ TEST(NodeDedup, FinishingADeadCreatorsSegmentKeepsItsRing) {
   ASSERT_EQ(a->Claim(K(93), v1.size(), &out[0], &ignored),
             NodeDedup::Role::kHit);
   EXPECT_EQ(out, v1) << "an entry was served with another key's bytes";
+}
+
+// ---- a stamp a little newer than the reader's clock -----------------------
+
+// A claim reads its clock before it looks the key up, and another process
+// may publish in between: the entry's stamp is then newer than that clock.
+// It is fresh, not taken for an entry that expired ages ago (and recycled).
+TEST(NodeDedup, EntryStampedAfterTheReadersClockIsFresh) {
+  ShmGuard g("stamp-ahead");
+  auto a = NodeDedup::Open(Opts(g.name));
+  auto b = NodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  const std::string v = Val(95, 4096);
+  std::string out(v.size(), '\0');
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->Claim(K(95), v.size(), &out[0], &token),
+            NodeDedup::Role::kFetch);
+  a->Publish(K(95), NodeDedup::Kind::kData, token, v.data(), v.size());
+  ASSERT_TRUE(dfkv::NodeDedupTestAccess::ShiftStamp(*a, K(95), 500));
+  ASSERT_EQ(b->Claim(K(95), v.size(), &out[0], &ignored),
+            NodeDedup::Role::kHit)
+      << "a fresh entry was taken for an expired one";
+  EXPECT_EQ(out, v);
+  std::string w(v.size(), '\0');
+  EXPECT_TRUE(b->WaitCopy(K(95), w.size(), &w[0]));
+}
+
+// A stamp far ahead of the clock is no skew (a torn write, another time
+// namespace's clock): the entry expires rather than being served for good.
+TEST(NodeDedup, EntryStampedFarAheadExpires) {
+  ShmGuard g("stamp-far-ahead");
+  auto a = NodeDedup::Open(Opts(g.name));
+  auto b = NodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  const std::string v = Val(97, 4096);
+  std::string out(v.size(), '\0');
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->Claim(K(97), v.size(), &out[0], &token),
+            NodeDedup::Role::kFetch);
+  a->Publish(K(97), NodeDedup::Kind::kData, token, v.data(), v.size());
+  ASSERT_TRUE(dfkv::NodeDedupTestAccess::ShiftStamp(*a, K(97), 60000));
+  EXPECT_EQ(b->Claim(K(97), v.size(), &out[0], &ignored),
+            NodeDedup::Role::kFetch)
+      << "an entry stamped a minute ahead was served";
 }

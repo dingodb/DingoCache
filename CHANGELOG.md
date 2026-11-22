@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Client: a timestamp another thread or process wrote a moment after this
+  one read its clock is no longer taken for one from the distant past. The
+  clock was read before the lookup or lock that found the stamp, and the
+  unsigned difference of the two then came out near 2^64 milliseconds. A
+  node that had just answered was put in cooldown after a failure as if it
+  had been silent for long (`DFKV_PEER_BAD_GRACE_MS` did not apply), and a
+  dedup entry published at that moment was treated as expired: the lookup
+  fetched the key itself and recycled the fresh entry, and a waiter gave
+  up on it. Such a stamp now counts as current when it is at most one
+  second ahead; a stamp further ahead (a torn write, a clock of another
+  time namespace) counts as ancient, as before, so that an entry carrying
+  it expires rather than being served for good.
 - Client, batch reads: the one retry of missed keys (`DFKV_GET_MISS_RETRIES`)
   now covers only the transient misses it exists for, on all three batch
   read paths: a key the node reported absent (a block moving between the
