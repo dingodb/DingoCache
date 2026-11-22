@@ -90,9 +90,10 @@ bounded trace data for retry, and emit a recovery warning; no request is blocked
 ## Health and alert rules
 
 Prometheus loads `alerts.yml` from this directory. It evaluates server readiness/
-storage health, MDS scrape and etcd readiness, version skew, missing heartbeat
-stats, RDMA completion/receive-segment failures, connector poll staleness, empty
-rings, MDS reachability, transport backoff, and rendezvous timeouts.
+storage health, MDS scrape and etcd readiness, member lists withheld because
+etcd refuses writes, version skew, missing heartbeat stats, RDMA
+completion/receive-segment failures, connector poll staleness, empty rings, MDS
+reachability, transport backoff, and rendezvous timeouts.
 
 Rules are visible under Prometheus **Alerts** and as the `ALERTS` series. This
 local stack intentionally does not embed an Alertmanager destination; production

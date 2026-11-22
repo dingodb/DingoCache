@@ -14,6 +14,7 @@
 
 #include "common/membership.h"
 #include "mds/mds_proto.h"
+#include "utils/log.h"
 #include "utils/net_util.h"
 #include "utils/thread_name.h"
 #include "utils/wire_limits.h"
@@ -80,6 +81,60 @@ size_t LocalLeaseMap::Size() const {
   return entries_.size();
 }
 
+void UnwrittenMembers::Add(const std::string& key) {
+  if (hold_ms_ == 0) return;
+  const uint64_t now_ms = clock_();
+  std::lock_guard<std::mutex> lk(mu_);
+  if (now_ms >= next_prune_ms_) {
+    // Once per hold: forget members that stopped heartbeating here. Under() and
+    // Count() skip them anyway; this only bounds the map under id churn.
+    for (auto it = failed_at_ms_.begin(); it != failed_at_ms_.end();) {
+      if (Held(it->second, now_ms))
+        ++it;
+      else
+        it = failed_at_ms_.erase(it);
+    }
+    next_prune_ms_ =
+        now_ms > UINT64_MAX - hold_ms_ ? UINT64_MAX : now_ms + hold_ms_;
+  }
+  failed_at_ms_[key] = now_ms;
+}
+
+void UnwrittenMembers::Remove(const std::string& key) {
+  std::lock_guard<std::mutex> lk(mu_);
+  failed_at_ms_.erase(key);
+}
+
+std::vector<std::string> UnwrittenMembers::Under(
+    const std::string& prefix) const {
+  std::vector<std::string> keys;
+  std::lock_guard<std::mutex> lk(mu_);
+  if (failed_at_ms_.empty()) return keys;  // the normal case: no clock read
+  const uint64_t now_ms = clock_();
+  for (auto it = failed_at_ms_.lower_bound(prefix);
+       it != failed_at_ms_.end() &&
+       it->first.compare(0, prefix.size(), prefix) == 0;
+       ++it) {
+    if (Held(it->second, now_ms)) keys.push_back(it->first);
+  }
+  return keys;
+}
+
+size_t UnwrittenMembers::Count() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (failed_at_ms_.empty()) return 0;
+  const uint64_t now_ms = clock_();
+  size_t held = 0;
+  for (const auto& entry : failed_at_ms_)
+    if (Held(entry.second, now_ms)) ++held;
+  return held;
+}
+
+size_t UnwrittenMembers::Size() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return failed_at_ms_.size();
+}
+
 bool EtcdProbeCache::Get() {
   if (ttl_ms_ == 0) return prober_();  // caching off: live probe, old behavior
   std::unique_lock<std::mutex> lk(mu_);
@@ -116,7 +171,16 @@ MdsServer::MdsServer(const std::string& etcd_addr, int etcd_timeout_ms)
                        config_dump::EnvU64("DFKV_MDS_PROBE_CACHE_MS", 2500),
                        600000),
                    SteadyNowMs,
-                   [this] { return ProbeEtcd(); }) {}
+                   [this] { return ProbeEtcd(); }),
+      // DFKV_MDS_UNWRITTEN_HOLD_MS: how long a member whose heartbeat etcd did
+      // not take still counts as alive here (see UnwrittenMembers). 0 = never
+      // withhold a member list, the behavior up to 2.36. Clamped like the
+      // probe cache above, for the same reason.
+      unwritten_(std::min<uint64_t>(
+                     config_dump::EnvU64("DFKV_MDS_UNWRITTEN_HOLD_MS",
+                                         kUnwrittenHoldMs),
+                     600000),
+                 SteadyNowMs) {}
 
 MdsServer::~MdsServer() { Stop(); }
 
@@ -265,7 +329,15 @@ Status MdsServer::Upsert(const std::string& group, const MemberInfo& m) {
   // Reject before the id/group reach the etcd key: an unrestricted token can
   // contain '/' and escape its own key subtree (phantom-member injection).
   if (!IsValidGroupOrId(group) || !IsValidGroupOrId(m.id)) return Status::kInvalid;
-  return UpsertLeased(MemberKey(group, m.id), m, leases_, false);
+  const std::string key = MemberKey(group, m.id);
+  const Status st = UpsertLeased(key, m, leases_, false);
+  // The member is alive either way: it just heartbeat. If etcd did not take
+  // the write, ListMembers has to know (see UnwrittenMembers).
+  if (st == Status::kOk)
+    unwritten_.Remove(key);
+  else
+    unwritten_.Add(key);
+  return st;
 }
 
 Status MdsServer::UpsertClient(const std::string& group, const MemberInfo& m) {
@@ -335,8 +407,48 @@ Status MdsServer::ListMembers(const std::string& group, std::string* out,
   // subtrees; reject it the same way Upsert does.
   if (!IsValidGroupOrId(group)) return Status::kInvalid;
   std::string prefix = "/dfkv/v1/groups/" + group + "/members/";
+  // Read before the range, so that a member written in between is judged
+  // against a view that may predate its write: the list is then withheld for
+  // one more poll instead of being served without that member.
+  const std::vector<std::string> unwritten = unwritten_.Under(prefix);
   auto r = etcd_.RangePrefix(prefix);
   if (!r) { metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed); return Status::kIOError; }
+  if (!unwritten.empty()) {
+    // Members of this group heartbeat here but etcd did not take the write.
+    // As long as etcd still lists all of them (their old lease is alive, or
+    // another MDS wrote them) the view is complete. Once one is missing, it
+    // expired because it could not be renewed, not because the node left: the
+    // view is not the member list. Answer as for an unreadable etcd; a client
+    // keeps its last ring on any failed list, including clients that predate
+    // this check.
+    std::vector<char> listed(unwritten.size(), 0);
+    for (const auto& kv : r->kvs) {
+      const auto it =
+          std::lower_bound(unwritten.begin(), unwritten.end(), kv.first);
+      if (it != unwritten.end() && *it == kv.first)
+        listed[static_cast<size_t>(it - unwritten.begin())] = 1;
+    }
+    const auto first_missing = std::find(listed.begin(), listed.end(), 0);
+    if (first_missing != listed.end()) {
+      metrics_.lists_withheld.fetch_add(1, std::memory_order_relaxed);
+      const uint64_t now_ms = SteadyNowMs();
+      uint64_t last_ms = withheld_log_ms_.load(std::memory_order_relaxed);
+      if ((last_ms == 0 || now_ms - last_ms >= 30000) &&
+          withheld_log_ms_.compare_exchange_strong(last_ms, now_ms)) {
+        DFKV_LOG_WARN(
+            "mds: withholding the member list of group=" + group + ": " +
+            std::to_string(unwritten.size()) +
+            " member(s) heartbeat here but etcd did not take the write, and " +
+            std::to_string(std::count(listed.begin(), listed.end(), 0)) +
+            " of them (e.g. " +
+            unwritten[static_cast<size_t>(first_missing - listed.begin())]
+                .substr(prefix.size()) +
+            ") are no longer in etcd. Clients keep their last ring until "
+            "etcd accepts writes again (check its space quota and alarms).");
+      }
+      return Status::kIOError;
+    }
+  }
   std::vector<MemberInfo> members;
   for (const auto& kv : r->kvs) {
     std::vector<MemberInfo> one;

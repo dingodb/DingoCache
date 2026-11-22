@@ -35,6 +35,11 @@ struct MdsMetrics {
   // drain to zero as the last v1 ring retires, then drop
   // DFKV_MDS_ACCEPT_LEGACY.
   std::atomic<uint64_t> legacy_frames{0};
+  // etcd refusing writes: member lists answered with an error because etcd no
+  // longer listed a member whose heartbeat this MDS received but could not
+  // write, and how many members are in that unwritten state here right now.
+  std::atomic<uint64_t> lists_withheld{0};
+  std::atomic<uint64_t> unwritten_members{0};
 
   std::string Render() const {
     std::string s;
@@ -66,6 +71,8 @@ struct MdsMetrics {
     m("dfkv_mds_local_member_leases_pruned_total", "counter", "Idle member lease shortcuts discarded locally", ld(local_member_leases_pruned));
     m("dfkv_mds_local_client_leases_pruned_total", "counter", "Idle client lease shortcuts discarded locally", ld(local_client_leases_pruned));
     m("dfkv_mds_legacy_frames_total", "counter", "Control frames served in the legacy v1.x control-plane encoding", ld(legacy_frames));
+    m("dfkv_mds_list_withheld_total", "counter", "Member lists not served because etcd no longer listed a member whose heartbeat could not be written", ld(lists_withheld));
+    m("dfkv_mds_unwritten_members", "gauge", "Members whose latest heartbeat at this MDS could not be written to etcd", ld(unwritten_members));
     return s;
   }
 };

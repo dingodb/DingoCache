@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- MDS: a member list that has lost members because etcd stopped taking writes
+  is no longer handed out. Once its space quota is exhausted etcd refuses
+  writes and lease grants but still answers reads and keeps expiring leases.
+  Members then cannot renew, and where registrars rotate over three or more
+  MDS endpoints every member key runs out within one lease TTL. `ListMembers`
+  and `ListTopology` returned the shrinking, finally empty view with `kOk`;
+  clients dropped the missing peers' connections at the first such answer and
+  adopted an empty ring after three polls, with every cache node healthy. The
+  MDS now remembers each member whose register or heartbeat it received but
+  could not write, and answers `kIOError` to a member list from which such a
+  member is missing. Clients of every version keep their last ring when a
+  list fails, so deployed clients are covered once all MDS instances run this
+  version; an MDS that has not been upgraded still serves the broken view.
+  The list is served again when each of those members is back in etcd,
+  written by this or another MDS, or has not heartbeat at this MDS for
+  `DFKV_MDS_UNWRITTEN_HOLD_MS` (default 120000, four lease TTLs; `0` restores
+  the previous behaviour). A failed heartbeat whose member etcd still lists,
+  members that really leave, other groups and `ListClients` are unaffected.
+  While a list is withheld a newly started client gets no ring and `dfkvctl`
+  reports a failed MDS query. New counter `dfkv_mds_list_withheld_total`,
+  gauge `dfkv_mds_unwritten_members`, a WARN line at most every 30 s, and the
+  alert `DfkvMdsMemberListWithheld`. No protocol change.
 - Tools: `deploy/dfkv_membership_audit.py` and `deploy/dfkv_node_replace.py`
   work again. Both parsed the table printed by `dfkvctl ring`, whose header
   and columns have since gained eligibility, status and IB health: with a

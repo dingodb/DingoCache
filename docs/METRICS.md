@@ -45,6 +45,7 @@ etcd 读负载。运行期依赖丢失时 `/readyz` 从 200 变 503，scheduler 
 | `DFKV_MDS_FIRST_REQ_MS` | 30000（0=关，硬上限 3600000） | `dfkv_mds` 控制面首帧 absolute deadline |
 | `DFKV_MDS_MAX_CONNS` | 4096 | `dfkv_mds` 并发连接上限 |
 | `DFKV_MDS_PROBE_CACHE_MS` | 2500（0=逐请求现场 probe，钳制上限 600000） | `dfkv_mds` `/readyz` etcd probe TTL 去抖 |
+| `DFKV_MDS_UNWRITTEN_HOLD_MS` | 120000（4×lease TTL；0=关，钳制上限 600000） | `dfkv_mds` 把“心跳已到但没写进 etcd”的 member 视为存活的时长；期间 etcd 视图缺少该 member 则 member list 返回 `kIOError`（见 §3.2） |
 | `DFKV_TCP_FIRST_REQ_MS` | 30000（0=关，硬上限 3600000） | `dfkv_server` 数据面首帧 absolute deadline；resolved 值见 `dfkv_tcp_first_req_ms` |
 
 ```bash
@@ -329,6 +330,8 @@ TTL-debounced etcd probe 判定（`DFKV_MDS_PROBE_CACHE_MS`，默认 2500 ms 内
 | `dfkv_mds_local_member_leases` / `dfkv_mds_local_client_leases` | gauge | 本 MDS 进程当前缓存的 member/client lease shortcut 数；只是 etcd 权威状态的有界优化 |
 | `dfkv_mds_local_member_leases_pruned_total` / `dfkv_mds_local_client_leases_pruned_total` | counter | 因多个 TTL 未在本 MDS 使用而丢弃的本地 shortcut；churn 下增长正常，下次心跳会 fresh grant+Put |
 | `dfkv_mds_legacy_frames_total` | counter | 以 v1.x 旧控制面帧（42/10 字节帧）服务的请求数；仅在 `DFKV_MDS_ACCEPT_LEGACY=1` 的混合代际迁移期出现，**归零后应撤掉该 env** |
+| `dfkv_mds_list_withheld_total` | counter | 被拒绝下发的 member list 次数（`ListMembers`/`ListTopology` 返回 `kIOError`）：etcd 视图里缺少“心跳已到本 MDS、但 etcd 没接受写入”的 member。**增长 = etcd 拒绝写入（典型为空间配额用尽）且成员 lease 已开始过期**，客户端此时停在 last-good ring；告警 `DfkvMdsMemberListWithheld` |
+| `dfkv_mds_unwritten_members` | gauge | 本 MDS 上最近一次心跳没能写进 etcd 的 member 数（`DFKV_MDS_UNWRITTEN_HOLD_MS` 窗口内）。>0 而上一行不增长 = 写入失败但 etcd 仍列出这些 member（旧 lease 尚在或已由其他 MDS 写入），list 照常下发 |
 
 ### 3.3 客户端（SGLang 插件 `/metrics` 与原生 C 快照）
 SGLang 后台线程每 `client_stats_poll_s`（默认 10s，0=关）读取一次 C 客户端快照，

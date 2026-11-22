@@ -33,6 +33,14 @@ groups:
         annotations:
           summary: "dfkv MDS cannot complete etcd requests"
           description: "{{ $labels.instance }} has etcd transport/status errors for operation {{ $labels.op }}."
+      - alert: DfkvMdsMemberListWithheld
+        expr: increase(dfkv_mds_list_withheld_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "dfkv MDS is withholding member lists"
+          description: "{{ $labels.instance }} received member heartbeats that etcd did not accept, and those members have expired from etcd. Clients stay on their last ring and new clients get none until etcd accepts writes again (check its space quota and alarms)."
       - alert: DfkvGroupVersionSkew
         expr: max by (group) (dfkv_mds_group_version_skew) > 1
         for: 2m
