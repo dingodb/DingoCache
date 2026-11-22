@@ -321,13 +321,48 @@ else
     echo "cancelled-start smoke: the signal arrived after the pre-fault"
 fi
 
-# The same with a disk that fails to open: the start is cancelled, the disk
-# that did open is closed clean, but the last line is a warning and the exit
-# status 1. Held in place without timing: the second directory's
+# A start is held in place without timing: the second directory's
 # initialization marker is a FIFO, on which the open blocks until somebody
-# opens the other end (and then fails: a FIFO is no marker).
+# opens the other end (and then fails: a FIFO is no marker). The first disk
+# is open by then.
 mkdir "$D/c2"
 mkfifo "$D/c2/slab_initializing"
+
+# Killed (SIGKILL) while it is held there: a disk that has been opened but is
+# not serving yet has not been marked in use, so the next start is a clean
+# one and has the data even with DFKV_SLAB_WARM_RESTART=off.
+: > "$D/killed.out"
+"${SRV_ENV[@]}" "$BUILD/dfkv_server" --dir "$D/c1,$D/c2" --port 0 --cap 2147483648 >>"$D/killed.out" 2>&1 &
+PID=$!
+opened=""
+for i in $(seq 1 400); do
+  grep -q "slab $D/c1: opened in" "$D/killed.out" 2>/dev/null && { opened=1; break; }
+  sleep 0.05
+done
+[ -n "$opened" ] || { echo "the first disk did not open"; cat "$D/killed.out"; exit 1; }
+kill -KILL $PID
+wait $PID 2>/dev/null || true
+: > "$D/c1k.out"
+"${SRV_ENV[@]}" DFKV_SLAB_WARM_RESTART=off "$BUILD/dfkv_server" --dir "$D/c1" --port 0 --cap 1073741824 >>"$D/c1k.out" 2>&1 &
+PID=$!
+P=""
+for i in $(seq 1 100); do P=$(awk '/PORT/{print $2}' "$D/c1k.out" 2>/dev/null || true); [ -n "$P" ] && break; sleep 0.05; done
+[ -n "$P" ] || { echo "server did not report PORT after a killed start"; cat "$D/c1k.out"; exit 1; }
+got=$("$BUILD/dfkvctl" --members "n=127.0.0.1:$P" --namespace "dfkv/smoke" get kept || true)
+[ "$got" = "v-kept" ] || { echo "value lost by a start that was killed before it served: '$got'"; cat "$D/killed.out" "$D/c1k.out"; exit 1; }
+"$BUILD/dfkvctl" stat "127.0.0.1:$P" | grep -Eq '^dfkv_slab_unclean_resets_total(\{[^}]*\})? 0$' || {
+  echo "the start after a killed start reset the cache"
+  cat "$D/killed.out" "$D/c1k.out"
+  exit 1
+}
+kill -TERM $PID
+rc=0; wait $PID || rc=$?
+[ "$rc" = 0 ] || { echo "dfkv_server after SIGTERM: expected exit 0, got $rc"; cat "$D/c1k.out"; exit 1; }
+echo "killed-start smoke OK"
+
+# The same held start with SIGTERM and a disk that then fails to open: the
+# start is cancelled, the disk that did open is closed clean, but the last
+# line is a warning and the exit status 1.
 : > "$D/cancel2.out"
 "${SRV_ENV[@]}" "$BUILD/dfkv_server" --dir "$D/c1,$D/c2" --port 0 --cap 2147483648 >>"$D/cancel2.out" 2>&1 &
 PID=$!

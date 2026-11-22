@@ -18,6 +18,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -30,6 +32,31 @@ namespace fs = std::filesystem;
 using namespace dfkv;  // NOLINT
 
 using namespace std::chrono_literals;
+
+namespace dfkv {
+// Named like the store's test peer (its friend): breaks the state file
+// descriptor, so the next write of slab_state fails.
+class DiskSlabStoreTestPeer {
+ public:
+  static void BreakStateFd(DiskSlabStore* store) {
+    if (store->state_fd_ >= 0) ::close(store->state_fd_);
+    store->state_fd_ = -1;
+  }
+};
+}  // namespace dfkv
+
+namespace {
+// A slab store that opens like any other and whose activation fails where a
+// failing disk would make it fail: writing the dirty state.
+class CannotBeActivated : public DiskSlabStore {
+ public:
+  using DiskSlabStore::DiskSlabStore;
+  bool Activate() override {
+    DiskSlabStoreTestPeer::BreakStateFd(this);
+    return DiskSlabStore::Activate();
+  }
+};
+}  // namespace
 
 namespace dfkv {
 class KvNodeServerWiringTestPeer {
@@ -1306,5 +1333,122 @@ TEST(RamTierWiring, AStartThatIsNotCancelledIsAnOrdinaryStart) {
   EXPECT_EQ(server->Start(0), Status::kOk);
   server.reset();
   fs::remove_all(dir);
+}
+
+// ---- The disks are marked in use only when the server is about to serve ----
+namespace {
+std::string SlabStateFile(const fs::path& dir) {
+  std::ifstream in(dir / "slab_state", std::ios::binary);
+  return std::string((std::istreambuf_iterator<char>(in)),
+                     std::istreambuf_iterator<char>());
+}
+
+// A slab directory with one value in it, closed clean; returns its state file.
+std::string CleanSlabDir(const fs::path& dir, const BlockKey& key,
+                         const std::string& value) {
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  {
+    DiskCacheGroup group({{dir.string()}, 1ull << 30, "slab"});
+    EXPECT_TRUE(group.Healthy()) << group.StartupError();
+    EXPECT_EQ(group.Cache(key, value.data(), value.size()), Status::kOk);
+  }
+  return SlabStateFile(dir);
+}
+}  // namespace
+
+// A server that comes up has its disks activated by the time its constructor
+// returns: the state file is the dirty one, and requests are taken.
+TEST(RamTierWiring, AServerThatComesUpHasActivatedItsDisks) {
+  const auto dir = fs::temp_directory_path() / "dfkv_ramwire_activated";
+  const BlockKey key{31, 31};
+  const std::string value(3000, 'k');
+  const std::string clean = CleanSlabDir(dir, key, value);
+  {
+    auto server = KvNodeServerWiringTestPeer::Create(
+        DiskCacheGroup::Options{{dir.string()}, 1ull << 30, "slab"});
+    ASSERT_TRUE(server->Healthy());
+    EXPECT_NE(SlabStateFile(dir), clean);
+    EXPECT_EQ(server->Count(), 1u);
+    ASSERT_EQ(server->Start(0), Status::kOk);
+  }
+  DiskCacheGroup reopened({{dir.string()}, 1ull << 30, "slab"});
+  ASSERT_TRUE(reopened.Healthy()) << reopened.StartupError();
+  EXPECT_EQ(reopened.SlabStats().unclean_resets, 0u);
+  EXPECT_EQ(reopened.Count(), 1u);
+  fs::remove_all(dir);
+}
+
+// A start that is cancelled, or fails on its RAM tier, never activates: the
+// state file is byte for byte what the previous run wrote, while the server
+// object lives and after it is shut down, and Shutdown reports clean.
+TEST(RamTierWiring, AStartThatDoesNotGoAheadLeavesTheDisksAsFound) {
+  RamTierEnv env;
+  const auto dir = fs::temp_directory_path() / "dfkv_ramwire_as_found";
+  const BlockKey key{32, 32};
+  const std::string value(3000, 'f');
+  for (const bool cancelled : {true, false}) {
+    SCOPED_TRACE(cancelled ? "cancelled" : "RAM tier failed");
+    ::unsetenv("DFKV_RAM_TIER_NUMA");
+    const std::string clean = CleanSlabDir(dir, key, value);
+    if (!cancelled)
+      ::setenv("DFKV_RAM_TIER_NUMA", "neither-off-nor-interleave", 1);
+    std::atomic<bool> cancel{cancelled};
+    auto server = KvNodeServerWiringTestPeer::Create(
+        DiskCacheGroup::Options{{dir.string()}, 1ull << 30, "slab"}, &cancel);
+    EXPECT_EQ(server->start_cancelled(), cancelled);
+    EXPECT_TRUE(server->DisksHealthy());
+    EXPECT_FALSE(server->Healthy());
+    EXPECT_EQ(server->Count(), 1u);
+    EXPECT_EQ(SlabStateFile(dir), clean) << "the disk was marked in use";
+    EXPECT_EQ(server->Start(0), Status::kIOError);
+    EXPECT_TRUE(server->Shutdown());
+    EXPECT_EQ(SlabStateFile(dir), clean);
+    server.reset();
+    EXPECT_EQ(SlabStateFile(dir), clean);
+
+    DiskCacheGroup reopened({{dir.string()}, 1ull << 30, "slab"});
+    ASSERT_TRUE(reopened.Healthy()) << reopened.StartupError();
+    EXPECT_EQ(reopened.SlabStats().unclean_resets, 0u);
+    EXPECT_EQ(reopened.SlabStats().warm_restarts, 0u);
+    EXPECT_EQ(reopened.Count(), 1u);
+  }
+  fs::remove_all(dir);
+}
+
+// A disk whose activation fails: the server is unhealthy and refuses to
+// start; shutting it down does not report every disk clean.
+TEST(RamTierWiring, AServerWhoseDiskCannotBeActivatedRefusesToStart) {
+  const auto good = fs::temp_directory_path() / "dfkv_ramwire_act_good";
+  const auto bad = fs::temp_directory_path() / "dfkv_ramwire_act_bad";
+  for (const auto& dir : {good, bad}) {
+    fs::remove_all(dir);
+    fs::remove_all(dir.string() + "_tokens");
+  }
+  DiskCacheGroup::Options options{{good.string(), bad.string()}, 2ull << 20,
+                                  "slab"};
+  options.engine_factory =
+      [&](const std::string& path, uint64_t) -> std::unique_ptr<StoreEngine> {
+    auto slab = CancelSlab(path);
+    slab.defer_activation = true;
+    if (path == bad.string()) return std::make_unique<CannotBeActivated>(slab);
+    return std::make_unique<DiskSlabStore>(slab);
+  };
+  auto server = KvNodeServerWiringTestPeer::Create(std::move(options));
+  EXPECT_FALSE(server->DisksHealthy());
+  EXPECT_FALSE(server->Healthy());
+  EXPECT_EQ(server->Start(0), Status::kIOError);
+  EXPECT_FALSE(server->Shutdown());
+  server.reset();
+  // The disk that was activated was closed clean, the ordinary way.
+  bool ok = false;
+  DiskSlabStore reopened(CancelSlab(good.string()), &ok);
+  ASSERT_TRUE(ok) << reopened.StartupError();
+  EXPECT_EQ(reopened.GetStats().unclean_resets, 0u);
+  EXPECT_EQ(reopened.GetStats().warm_restarts, 0u);
+  for (const auto& dir : {good, bad}) {
+    fs::remove_all(dir);
+    fs::remove_all(dir.string() + "_tokens");
+  }
 }
 }  // namespace

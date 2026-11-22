@@ -98,7 +98,7 @@ KvNodeServer::KvNodeServer(DiskCacheGroup::Options options,
     : cancel_start_(cancel_start),
       ram_plan_(PlanRamTier(options.cache_dirs.size())),
       ram_starting_(StartRamTier()),
-      group_(std::move(options)) {
+      group_(OpenedNotActivated(std::move(options))) {
   shutdown_drain_timeout_s_ = ResolveShutdownDrainTimeoutSeconds();
   // With a disk that failed to open the start is over: the arena need not be
   // faulted in to the end just to be dropped.
@@ -118,7 +118,18 @@ KvNodeServer::KvNodeServer(DiskCacheGroup::Options options,
   // the one built meanwhile holds nothing and is dropped here.
   if (!group_.Healthy()) return;
   if (ram_plan_.enabled) AdoptRamTier(std::move(tier));
+  // Everything slow is behind us and nothing has failed: only now are the
+  // disks marked in use. Up to here they were open but unchanged, so a start
+  // that was killed, cancelled, or failed on a disk or on the RAM tier left
+  // every cache exactly as its previous run closed it.
+  if (!ram_required_failed_) group_.Activate();
   InitAdmission();
+}
+
+DiskCacheGroup::Options KvNodeServer::OpenedNotActivated(
+    DiskCacheGroup::Options options) {
+  options.defer_activation = true;
+  return options;
 }
 
 KvNodeServer::~KvNodeServer() {

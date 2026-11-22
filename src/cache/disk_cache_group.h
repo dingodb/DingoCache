@@ -40,6 +40,9 @@ class DiskCacheGroup {
     // exception it throws is reported as that directory's startup failure.
     std::function<std::unique_ptr<StoreEngine>(const std::string&, uint64_t)>
         engine_factory{};
+    // Leave the disks opened but not activated; the owner calls Activate()
+    // when the node is about to serve. See Activate().
+    bool defer_activation = false;
   };
 
   explicit DiskCacheGroup(Options opt);
@@ -53,6 +56,14 @@ class DiskCacheGroup {
     double seconds = 0;
   };
   std::vector<CloseReport> Close();
+  // Opening a disk changes nothing on it; activating it (StoreEngine::
+  // Activate) marks it in use and lets it serve. All disks are activated
+  // here, one after the other, and only if every one of them opened: until
+  // then a process that is killed, or a start that fails or is cancelled,
+  // leaves every disk as its previous run closed it. The constructor does
+  // this itself unless Options::defer_activation is set. Idempotent; false
+  // (and the group unhealthy) if a disk could not be activated.
+  bool Activate();
   bool Healthy() const;
   const std::string& StartupError() const { return startup_error_; }
 
@@ -153,6 +164,7 @@ class DiskCacheGroup {
   void RecordQuotaRejectionLocked(uint64_t tenant_hash);
   bool healthy_ = true;
   bool closed_ = false;
+  bool activated_ = false;
   std::string startup_error_;
   std::string engine_;      // resolved backend name (see EngineName)
   std::string write_mode_;  // resolved slab I/O mode (see WriteMode)

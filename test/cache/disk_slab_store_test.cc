@@ -3438,3 +3438,322 @@ TEST_F(DiskSlabTest, OpenCostBench) {
                 store.DirectWritesActive() ? 1 : 0, ms);
   }
 }
+
+// ---- Open and activate are two steps ---------------------------------------
+//
+// The open reads; Activate() marks the store in use (dirty state, identity,
+// trust token, background threads) and admits operations. A process that is
+// killed in between has changed nothing: the next start finds the directory
+// as the previous run closed it, whatever DFKV_SLAB_WARM_RESTART says. The
+// crashing process is the forked child of CrashAfter, as above.
+namespace {
+std::string FileBytes(const fs::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  return std::string((std::istreambuf_iterator<char>(in)),
+                     std::istreambuf_iterator<char>());
+}
+
+// What a store leaves on disk for the next start to judge it by.
+struct OnDisk {
+  explicit OnDisk(const fs::path& dir)
+      : state(FileBytes(dir / "slab_state")),
+        table(FileBytes(dir / "slots.tbl")),
+        token(fs::exists(TrustToken(dir))) {}
+  bool operator==(const OnDisk& other) const {
+    return state == other.state && table == other.table && token == other.token;
+  }
+  std::string state;
+  std::string table;
+  bool token;
+};
+
+DiskSlabStore::Options Deferred(DiskSlabStore::Options options) {
+  options.defer_activation = true;
+  return options;
+}
+
+const WarmRestart kEveryPolicy[] = {WarmRestart::kOff, WarmRestart::kAuto,
+                                    WarmRestart::kBootOnly};
+const char* PolicyName(WarmRestart policy) {
+  return policy == WarmRestart::kOff    ? "warm restart off"
+         : policy == WarmRestart::kAuto ? "warm restart auto"
+                                        : "warm restart boot";
+}
+}  // namespace
+
+// Two objects, closed clean: what every kill-point test starts from.
+#define DFKV_CLEAN_STORE_WITH_TWO_OBJECTS(options)                            \
+  do {                                                                        \
+    fs::remove_all(dir_);                                                     \
+    fs::remove_all(dir_.string() + "_tokens");                                \
+    fs::create_directories(dir_.string() + "_tokens");                        \
+    bool created = false;                                                     \
+    DiskSlabStore first(options, &created);                                   \
+    ASSERT_TRUE(created) << first.StartupError();                             \
+    ASSERT_TRUE(PutFilled(first, 1, 'a'));                                    \
+    ASSERT_TRUE(PutFilled(first, 2, 'b'));                                    \
+  } while (0)
+
+#define DFKV_EXPECT_BOTH_OBJECTS(store)                                       \
+  do {                                                                        \
+    std::string read_back;                                                    \
+    EXPECT_EQ(store.Count(), 2u);                                             \
+    ASSERT_EQ(store.Range(K(1), 0, 4096, &read_back), Status::kOk);           \
+    EXPECT_EQ(read_back, Payload('a'));                                       \
+    ASSERT_EQ(store.Range(K(2), 0, 4096, &read_back), Status::kOk);           \
+    EXPECT_EQ(read_back, Payload('b'));                                       \
+  } while (0)
+
+// Kill point: after the open, before Activate(). Nothing on disk has changed
+// and the next start is a clean one with the data, under every policy.
+TEST_F(DiskSlabTest, KilledBetweenOpenAndActivateCostsNothing) {
+  for (const WarmRestart policy : kEveryPolicy) {
+    SCOPED_TRACE(PolicyName(policy));
+    const auto options =
+        WithIdentity(Opts(1 << 20, 1 << 20, 4096), policy, 1, 7);
+    DFKV_CLEAN_STORE_WITH_TWO_OBJECTS(options);
+    const OnDisk before(dir_);
+    ASSERT_FALSE(before.token) << "a cleanly closed store keeps no token";
+
+    ASSERT_TRUE(CrashAfter(Deferred(options), [](DiskSlabStore& store) {
+      return store.Healthy() && !store.Activated() && store.Count() == 2;
+    }));
+    EXPECT_TRUE(OnDisk(dir_) == before)
+        << "an open without activation changed the directory";
+
+    bool ok = false;
+    DiskSlabStore next(options, &ok);
+    ASSERT_TRUE(ok) << next.StartupError();
+    EXPECT_EQ(next.GetStats().unclean_resets, 0u);
+    EXPECT_EQ(next.GetStats().warm_restarts, 0u);
+    DFKV_EXPECT_BOTH_OBJECTS(next);
+  }
+}
+
+// Kill point: after Activate(), with or without a write. This is the unclean
+// exit it always was: reset when warm restart is off, kept otherwise.
+TEST_F(DiskSlabTest, KilledAfterActivateIsAnUncleanExit) {
+  for (const bool wrote : {false, true}) {
+    for (const WarmRestart policy : kEveryPolicy) {
+      SCOPED_TRACE(std::string(PolicyName(policy)) +
+                   (wrote ? ", a write after activation" : ", no write"));
+      const auto options =
+          WithIdentity(Opts(1 << 20, 1 << 20, 4096), policy, 1, 7);
+      DFKV_CLEAN_STORE_WITH_TWO_OBJECTS(options);
+      const OnDisk before(dir_);
+      ASSERT_TRUE(CrashAfter(Deferred(options), [wrote](DiskSlabStore& store) {
+        if (!store.Activate() || !store.Activated()) return false;
+        return !wrote || PutFilled(store, 3, 'c');
+      }));
+      const OnDisk after(dir_);
+      EXPECT_NE(after.state, before.state) << "activation left no dirty state";
+      EXPECT_TRUE(after.token) << "activation granted no token";
+
+      bool ok = false;
+      DiskSlabStore next(options, &ok);
+      ASSERT_TRUE(ok) << next.StartupError();
+      const auto stats = next.GetStats();
+      if (policy == WarmRestart::kOff) {
+        EXPECT_EQ(stats.unclean_resets, 1u);
+        EXPECT_EQ(next.Count(), 0u);
+      } else {
+        EXPECT_EQ(stats.warm_restarts, 1u);
+        EXPECT_EQ(stats.unclean_resets, 0u);
+        EXPECT_EQ(next.Count(), wrote ? 3u : 2u);
+      }
+    }
+  }
+}
+
+// A store found dirty is recovered or reset by its open, which rewrites the
+// state and takes the previous run's token away. It is activated right there
+// even when activation was to be deferred: left alone it would sit without a
+// token of its own, and a second kill would cost a cache the first one did
+// not.
+TEST_F(DiskSlabTest, AStoreFoundDirtyIsActivatedByItsOpen) {
+  for (const WarmRestart policy : kEveryPolicy) {
+    SCOPED_TRACE(PolicyName(policy));
+    const auto options =
+        WithIdentity(Opts(1 << 20, 1 << 20, 4096), policy, 1, 7);
+    DFKV_CLEAN_STORE_WITH_TWO_OBJECTS(options);
+    ASSERT_TRUE(CrashAfter(options, [](DiskSlabStore&) { return true; }));
+    // Killed again, in an open that asked for deferral and never activated.
+    ASSERT_TRUE(CrashAfter(Deferred(options), [](DiskSlabStore& store) {
+      return store.Healthy() && store.Activated();
+    }));
+    bool ok = false;
+    DiskSlabStore next(Deferred(options), &ok);
+    ASSERT_TRUE(ok) << next.StartupError();
+    EXPECT_TRUE(next.Activated());
+    const auto stats = next.GetStats();
+    if (policy == WarmRestart::kOff) {
+      EXPECT_EQ(stats.unclean_resets, 1u);
+      EXPECT_EQ(next.Count(), 0u);
+    } else {
+      EXPECT_EQ(stats.warm_restarts, 1u) << next.UncleanResetReason();
+      DFKV_EXPECT_BOTH_OBJECTS(next);
+    }
+  }
+}
+
+// Between open and activate the store answers questions about itself and
+// nothing else: every operation is refused, no thread runs, and neither the
+// state file, the table nor a token changes. Closing it leaves the directory
+// as found and reports clean; the next start is a clean one.
+TEST_F(DiskSlabTest, AnOpenedStoreRefusesEveryOperationAndWritesNothing) {
+  auto options = Opts(1 << 20, 1 << 20, 4096);
+  options.table_sync_ms = 1;        // the threads would run at once ...
+  options.reclaim_interval_ms = 1;  // ... if they were started
+  options.require_local_filesystem = false;
+  DFKV_CLEAN_STORE_WITH_TWO_OBJECTS(options);
+  const OnDisk before(dir_);
+  {
+    bool ok = false;
+    DiskSlabStore store(Deferred(options), &ok);
+    ASSERT_TRUE(ok) << store.StartupError();
+    EXPECT_FALSE(store.Activated());
+    EXPECT_TRUE(store.Healthy());
+    EXPECT_EQ(store.Count(), 2u);
+    EXPECT_EQ(store.GetStats().committed_objects, 2u);
+
+    std::string value = Payload('x');
+    std::string out;
+    size_t got = 0;
+    EXPECT_EQ(store.Cache(K(9), value.data(), value.size()), Status::kIOError);
+    EXPECT_EQ(store.CacheDirect(K(9), value.data(), value.size(), value.size()),
+              Status::kIOError);
+    const auto batch = store.CacheDirectBatch(
+        {{K(9), value.data(), value.size(), value.size()}});
+    ASSERT_EQ(batch.size(), 1u);
+    EXPECT_NE(batch[0], Status::kOk);
+    EXPECT_EQ(store.Remove(K(1)), Status::kIOError);
+    EXPECT_EQ(store.Retain(K(1), 60, 0, 1000),
+              static_cast<uint8_t>(dfkv::SlabAllocator::RetainCode::kMiss));
+    EXPECT_EQ(store.Range(K(1), 0, 4096, &out), Status::kIOError);
+    EXPECT_EQ(store.RangeInto(K(1), 0, 4096, value.data(), value.size(), &got),
+              Status::kIOError);
+    EXPECT_FALSE(store.IsCached(K(1)));
+    dfkv::DiskSlabStoreTestPeer::ReclaimNow(&store, {});
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    EXPECT_EQ(store.GetStats().record_writes, 0u);
+    EXPECT_EQ(store.GetStats().table_syncs, 0u);
+    EXPECT_TRUE(store.Healthy());
+    EXPECT_TRUE(OnDisk(dir_) == before);
+    EXPECT_TRUE(store.Close()) << "a store that never served is clean";
+    EXPECT_TRUE(OnDisk(dir_) == before) << "Close changed what it found";
+  }
+  EXPECT_TRUE(OnDisk(dir_) == before);
+  bool ok = false;
+  DiskSlabStore next(options, &ok);
+  ASSERT_TRUE(ok) << next.StartupError();
+  EXPECT_EQ(next.GetStats().unclean_resets, 0u);
+  EXPECT_EQ(next.GetStats().warm_restarts, 0u);
+  DFKV_EXPECT_BOTH_OBJECTS(next);
+}
+
+// The refusal at every operation's entry is not the only thing between an
+// opened store and its files: the functions that write check for themselves,
+// and a write that gets that far fails the store for good without writing.
+TEST_F(DiskSlabTest, AWriteBeforeActivationFailsTheStoreAndWritesNothing) {
+  auto options = Opts(1 << 20, 1 << 20, 4096);
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  DFKV_CLEAN_STORE_WITH_TWO_OBJECTS(options);
+  const OnDisk before(dir_);
+  {
+    bool ok = false;
+    DiskSlabStore store(Deferred(options), &ok);
+    ASSERT_TRUE(ok) << store.StartupError();
+    // Past the entry checks, as a defect in a caller would be: allocate a
+    // slot, write its payload and its record.
+    EXPECT_FALSE(dfkv::DiskSlabStoreTestPeer::WriteCrashStage(
+        &store, K(9), Payload('x'), /*include_record=*/true));
+    EXPECT_FALSE(store.Healthy());
+    EXPECT_FALSE(store.Activate()) << "a failed store was activated";
+    EXPECT_FALSE(store.Close());
+  }
+  EXPECT_TRUE(OnDisk(dir_) == before);
+  bool ok = false;
+  DiskSlabStore next(options, &ok);
+  ASSERT_TRUE(ok) << next.StartupError();
+  EXPECT_EQ(next.GetStats().unclean_resets, 0u);
+  DFKV_EXPECT_BOTH_OBJECTS(next);
+}
+
+// Activation: dirty state and token first, then operations; twice is once;
+// the close after it is the ordinary clean close.
+TEST_F(DiskSlabTest, ActivateMakesTheStoreServe) {
+  const auto options =
+      WithIdentity(Opts(1 << 20, 1 << 20, 4096), WarmRestart::kAuto, 1, 7);
+  DFKV_CLEAN_STORE_WITH_TWO_OBJECTS(options);
+  const OnDisk before(dir_);
+  {
+    bool ok = false;
+    DiskSlabStore store(Deferred(options), &ok);
+    ASSERT_TRUE(ok) << store.StartupError();
+    ASSERT_TRUE(store.Activate());
+    EXPECT_TRUE(store.Activated());
+    const OnDisk active(dir_);
+    EXPECT_NE(active.state, before.state);
+    EXPECT_TRUE(active.token);
+    ASSERT_TRUE(store.Activate());
+    EXPECT_EQ(OnDisk(dir_).state, active.state) << "activated twice";
+    DFKV_EXPECT_BOTH_OBJECTS(store);
+    ASSERT_TRUE(PutFilled(store, 3, 'c'));
+    EXPECT_TRUE(store.Close());
+    EXPECT_FALSE(OnDisk(dir_).token);
+  }
+  bool ok = false;
+  DiskSlabStore next(options, &ok);
+  ASSERT_TRUE(ok) << next.StartupError();
+  EXPECT_EQ(next.GetStats().unclean_resets, 0u);
+  EXPECT_EQ(next.GetStats().warm_restarts, 0u);
+  EXPECT_EQ(next.Count(), 3u);
+}
+
+// Kill point: inside the activation. The dirty state is one 64-byte record
+// written and synced before anything else happens, so the directory is either
+// still clean or already dirty. A state file that cannot be written leaves
+// the store clean on disk, unhealthy in memory, and never serving.
+TEST_F(DiskSlabTest, AnActivationThatCannotRecordTheDirtyStateDoesNotServe) {
+  const auto options =
+      WithIdentity(Opts(1 << 20, 1 << 20, 4096), WarmRestart::kOff, 1, 7);
+  DFKV_CLEAN_STORE_WITH_TWO_OBJECTS(options);
+  const OnDisk before(dir_);
+  {
+    bool ok = false;
+    DiskSlabStore store(Deferred(options), &ok);
+    ASSERT_TRUE(ok) << store.StartupError();
+    dfkv::DiskSlabStoreTestPeer::BreakStateFd(&store);
+    EXPECT_FALSE(store.Activate());
+    EXPECT_FALSE(store.Activated());
+    EXPECT_FALSE(store.Healthy());
+    std::string value = Payload('x');
+    EXPECT_EQ(store.Cache(K(9), value.data(), value.size()), Status::kIOError);
+  }
+  EXPECT_TRUE(OnDisk(dir_) == before);
+  bool ok = false;
+  DiskSlabStore next(options, &ok);
+  ASSERT_TRUE(ok) << next.StartupError();
+  EXPECT_EQ(next.GetStats().unclean_resets, 0u);
+  DFKV_EXPECT_BOTH_OBJECTS(next);
+}
+
+// A directory that did not exist: the open initializes it, and without an
+// activation it is left as a clean, empty store with no marker of an
+// unfinished initialization.
+TEST_F(DiskSlabTest, ANewDirectoryThatIsNeverActivatedIsACleanEmptyStore) {
+  const auto options =
+      WithIdentity(Opts(1 << 20, 1 << 20, 4096), WarmRestart::kOff, 1, 7);
+  ASSERT_TRUE(CrashAfter(Deferred(options), [](DiskSlabStore& store) {
+    return store.Healthy() && !store.Activated();
+  }));
+  EXPECT_FALSE(fs::exists(dir_ / "slab_initializing"));
+  bool ok = false;
+  DiskSlabStore next(options, &ok);
+  ASSERT_TRUE(ok) << next.StartupError();
+  EXPECT_EQ(next.GetStats().unclean_resets, 0u);
+  EXPECT_EQ(next.GetStats().warm_restarts, 0u);
+  EXPECT_EQ(next.Count(), 0u);
+  ASSERT_TRUE(PutFilled(next, 1, 'a'));
+}

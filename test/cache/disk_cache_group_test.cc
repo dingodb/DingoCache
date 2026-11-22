@@ -2,8 +2,10 @@
 // dingo-cache's intra-node Ketama across --cache_dir=d1,d2,d3 (each disk an
 // independent KVStore with its own LRU; total capacity split across disks).
 #include "cache/disk_cache_group.h"
+#include "cache/disk_slab_store.h"
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -13,6 +15,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -721,4 +724,208 @@ TEST_F(DiskGroupTest, RealSlabDisksOpenedTogetherKeepTheirData) {
         << i;
     EXPECT_EQ(out, value);
   }
+}
+
+// ---- Disks are opened first and activated together -------------------------
+namespace {
+std::string StateFile(const std::string& dir) {
+  std::ifstream in(fs::path(dir) / "slab_state", std::ios::binary);
+  return std::string((std::istreambuf_iterator<char>(in)),
+                     std::istreambuf_iterator<char>());
+}
+}  // namespace
+
+// A group told to defer activation opens its disks and changes none of them:
+// every state file is as the previous run left it and no operation is taken.
+// Activate() marks all of them in use; after that the group serves.
+TEST_F(DiskGroupTest, DisksAreOpenedFirstAndActivatedTogether) {
+  const auto dirs = Dirs(2);
+  const uint64_t kCapacity = 2ull << 30;
+  const std::string value(4096, 'a');
+  {
+    DiskCacheGroup group({dirs, kCapacity, "slab"});
+    ASSERT_TRUE(group.Healthy()) << group.StartupError();
+    for (uint64_t i = 0; i < 32; ++i)
+      ASSERT_EQ(group.Cache(BlockKey{9300 + i, 0}, value.data(), value.size()),
+                Status::kOk);
+  }
+  const std::vector<std::string> clean{StateFile(dirs[0]), StateFile(dirs[1])};
+  {
+    DiskCacheGroup::Options options{dirs, kCapacity, "slab"};
+    options.defer_activation = true;
+    DiskCacheGroup group(std::move(options));
+    ASSERT_TRUE(group.Healthy()) << group.StartupError();
+    EXPECT_EQ(group.Count(), 32u);
+    EXPECT_EQ(StateFile(dirs[0]), clean[0]);
+    EXPECT_EQ(StateFile(dirs[1]), clean[1]);
+    EXPECT_EQ(group.Cache(BlockKey{9400, 0}, value.data(), value.size()),
+              Status::kIOError)
+        << "a disk that is not activated took a write";
+    EXPECT_EQ(StateFile(dirs[0]), clean[0]);
+    EXPECT_EQ(StateFile(dirs[1]), clean[1]);
+
+    ASSERT_TRUE(group.Activate());
+    EXPECT_NE(StateFile(dirs[0]), clean[0]);
+    EXPECT_NE(StateFile(dirs[1]), clean[1]);
+    EXPECT_TRUE(group.Activate());
+    for (uint64_t i = 0; i < 8; ++i)
+      ASSERT_EQ(group.Cache(BlockKey{9400 + i, 0}, value.data(), value.size()),
+                Status::kOk);
+  }
+  DiskCacheGroup reopened({dirs, kCapacity, "slab"});
+  ASSERT_TRUE(reopened.Healthy()) << reopened.StartupError();
+  EXPECT_EQ(reopened.SlabStats().unclean_resets, 0u);
+  EXPECT_EQ(reopened.Count(), 40u);
+}
+
+// A group that defers and is never activated (a cancelled or failed start)
+// closes its disks as it found them, and says they are clean.
+TEST_F(DiskGroupTest, AGroupThatIsNeverActivatedLeavesItsDisksAsFound) {
+  const auto dirs = Dirs(2);
+  const uint64_t kCapacity = 2ull << 30;
+  const std::string value(4096, 'b');
+  {
+    DiskCacheGroup group({dirs, kCapacity, "slab"});
+    ASSERT_TRUE(group.Healthy()) << group.StartupError();
+    for (uint64_t i = 0; i < 32; ++i)
+      ASSERT_EQ(group.Cache(BlockKey{9500 + i, 0}, value.data(), value.size()),
+                Status::kOk);
+  }
+  const std::vector<std::string> clean{StateFile(dirs[0]), StateFile(dirs[1])};
+  {
+    DiskCacheGroup::Options options{dirs, kCapacity, "slab"};
+    options.defer_activation = true;
+    DiskCacheGroup group(std::move(options));
+    ASSERT_TRUE(group.Healthy()) << group.StartupError();
+    const auto report = group.Close();
+    ASSERT_EQ(report.size(), 2u);
+    EXPECT_TRUE(report[0].clean);
+    EXPECT_TRUE(report[1].clean);
+    EXPECT_FALSE(group.Activate()) << "a closed group was activated";
+  }
+  EXPECT_EQ(StateFile(dirs[0]), clean[0]);
+  EXPECT_EQ(StateFile(dirs[1]), clean[1]);
+}
+
+// With one disk that fails to open, a group does not activate the others,
+// deferred or not: their state files stay as found.
+TEST_F(DiskGroupTest, ADiskThatFailsToOpenKeepsTheOthersFromBeingActivated) {
+  const auto dirs = Dirs(3);
+  const uint64_t kCapacity = 3ull << 30;
+  const std::string value(4096, 'c');
+  {
+    DiskCacheGroup group({dirs, kCapacity, "slab"});
+    ASSERT_TRUE(group.Healthy()) << group.StartupError();
+    for (uint64_t i = 0; i < 48; ++i)
+      ASSERT_EQ(group.Cache(BlockKey{9600 + i, 0}, value.data(), value.size()),
+                Status::kOk);
+  }
+  const std::vector<std::string> clean{StateFile(dirs[0]), StateFile(dirs[1]),
+                                       StateFile(dirs[2])};
+  // The third directory no longer holds what its meta file says: the open
+  // of that disk fails, the group is unhealthy.
+  fs::remove(fs::path(dirs[2]) / "slots.tbl");
+  for (const bool defer : {false, true}) {
+    SCOPED_TRACE(defer ? "deferred" : "activated by the constructor");
+    DiskCacheGroup::Options options{dirs, kCapacity, "slab"};
+    options.defer_activation = defer;
+    DiskCacheGroup group(std::move(options));
+    EXPECT_FALSE(group.Healthy());
+    EXPECT_FALSE(group.Activate());
+    EXPECT_EQ(StateFile(dirs[0]), clean[0]);
+    EXPECT_EQ(StateFile(dirs[1]), clean[1]);
+    EXPECT_EQ(StateFile(dirs[2]), clean[2]);
+  }
+}
+
+namespace dfkv {
+// Named like the store's test peer (its friend): breaks the state file
+// descriptor, so the next write of slab_state fails.
+class DiskSlabStoreTestPeer {
+ public:
+  static void BreakStateFd(DiskSlabStore* store) {
+    if (store->state_fd_ >= 0) ::close(store->state_fd_);
+    store->state_fd_ = -1;
+  }
+};
+}  // namespace dfkv
+
+namespace {
+// A slab store that opens like any other and whose activation fails where a
+// failing disk would make it fail: writing the dirty state.
+class CannotBeActivated : public dfkv::DiskSlabStore {
+ public:
+  using dfkv::DiskSlabStore::DiskSlabStore;
+  bool Activate() override {
+    dfkv::DiskSlabStoreTestPeer::BreakStateFd(this);
+    return dfkv::DiskSlabStore::Activate();
+  }
+};
+}  // namespace
+
+// The activation of the second of three disks fails. The first is in use by
+// then, the third is never reached; the group is unhealthy. Closing it closes
+// the first the ordinary way (clean), and leaves the other two with nothing
+// changed. The next start finds all three clean with their data.
+TEST_F(DiskGroupTest, AFailedActivationStopsAtThatDisk) {
+  const auto dirs = Dirs(3);
+  const uint64_t kCapacity = 3ull << 30;
+  const std::string value(4096, 'd');
+  auto slab_options = [](const std::string& dir, uint64_t capacity) {
+    DiskSlabStore::Options so;
+    so.dir = dir;
+    so.capacity_bytes = capacity;
+    so.defer_activation = true;
+    return so;
+  };
+  {
+    DiskCacheGroup::Options options{dirs, kCapacity, "slab"};
+    options.engine_factory =
+        [&](const std::string& dir,
+            uint64_t capacity) -> std::unique_ptr<StoreEngine> {
+      return std::make_unique<DiskSlabStore>(slab_options(dir, capacity));
+    };
+    DiskCacheGroup group(std::move(options));
+    ASSERT_TRUE(group.Healthy()) << group.StartupError();
+    for (uint64_t i = 0; i < 48; ++i)
+      ASSERT_EQ(group.Cache(BlockKey{9700 + i, 0}, value.data(), value.size()),
+                Status::kOk);
+  }
+  const std::vector<std::string> clean{StateFile(dirs[0]), StateFile(dirs[1]),
+                                       StateFile(dirs[2])};
+  {
+    DiskCacheGroup::Options options{dirs, kCapacity, "slab"};
+    options.defer_activation = true;
+    options.engine_factory =
+        [&](const std::string& dir,
+            uint64_t capacity) -> std::unique_ptr<StoreEngine> {
+      if (dir == dirs[1])
+        return std::make_unique<CannotBeActivated>(slab_options(dir, capacity));
+      return std::make_unique<DiskSlabStore>(slab_options(dir, capacity));
+    };
+    DiskCacheGroup group(std::move(options));
+    ASSERT_TRUE(group.Healthy()) << group.StartupError();
+    EXPECT_FALSE(group.Activate());
+    EXPECT_FALSE(group.Healthy());
+    EXPECT_NE(group.StartupError().find(dirs[1]), std::string::npos)
+        << group.StartupError();
+    EXPECT_FALSE(group.Activate()) << "an unhealthy group was activated";
+    EXPECT_NE(StateFile(dirs[0]), clean[0]) << "the first disk is in use";
+    EXPECT_EQ(StateFile(dirs[1]), clean[1]) << "the failed disk was changed";
+    EXPECT_EQ(StateFile(dirs[2]), clean[2]) << "the third disk was reached";
+
+    const auto report = group.Close();
+    ASSERT_EQ(report.size(), 3u);
+    EXPECT_TRUE(report[0].clean) << "the activated disk closes clean";
+    EXPECT_FALSE(report[1].clean) << "the failed disk does not claim to be";
+    EXPECT_TRUE(report[2].clean) << "the untouched disk is as it was";
+  }
+  EXPECT_NE(StateFile(dirs[0]), clean[0]) << "a clean close of a new epoch";
+  EXPECT_EQ(StateFile(dirs[1]), clean[1]);
+  EXPECT_EQ(StateFile(dirs[2]), clean[2]);
+  DiskCacheGroup reopened({dirs, kCapacity, "slab"});
+  ASSERT_TRUE(reopened.Healthy()) << reopened.StartupError();
+  EXPECT_EQ(reopened.SlabStats().unclean_resets, 0u);
+  EXPECT_EQ(reopened.SlabStats().warm_restarts, 0u);
+  EXPECT_EQ(reopened.Count(), 48u);
 }
