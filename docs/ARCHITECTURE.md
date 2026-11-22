@@ -297,8 +297,8 @@ size-class lattice and carves them into uniform slots:
   connections), so a stop that is killed while unmapping a large arena still
   finds a clean cache at the next start. `dfkv_server` then exits without
   running destructors: the kernel gives the memory back faster than freeing
-  the per-object index nodes one by one (sanitizer builds excepted). The drain limit counts from the
-  start of the stop; stopping the request paths can itself wait for PUTs that
+  the per-object index nodes one by one (sanitizer builds excepted). The
+  drain limit counts from the start of the stop; stopping the request paths can itself wait for PUTs that
   are parked until their value is on disk, and that wait has no limit of its
   own yet.
 - **Unclean exit:** a dirty epoch at startup means the previous process did not

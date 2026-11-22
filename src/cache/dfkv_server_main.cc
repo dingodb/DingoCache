@@ -3,8 +3,9 @@
  *   --dir accepts comma-separated NVMe SSD paths (like dingo-cache --cache_dir);
  *   --cap is the TOTAL capacity, split evenly across the disks.
  * Prints "PORT <port>" on stdout once listening, then runs until SIGTERM/SIGINT. */
-#include <csignal>
 #include <unistd.h>
+
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -673,12 +674,15 @@ int main(int argc, char** argv) {
   }
 #endif
   const int exit_code = registration_timed_out ? 1 : 0;
+  // The last line of a stop. From here a kill costs nothing.
+  const char* const next_step =
+      DFKV_EXIT_RUNS_DESTRUCTORS ? "; releasing memory" : "; exiting";
   if (srv.Shutdown(stop_started)) {
     DFKV_LOG_INFO("dfkv_server shut down cleanly in " + stop_seconds() +
-                  "; releasing memory");
+                  next_step);
   } else {
     DFKV_LOG_WARN("dfkv_server stopped in " + stop_seconds() +
-                  ", but not every disk is clean; releasing memory");
+                  ", but not every disk is clean" + next_step);
   }
 #if !DFKV_EXIT_RUNS_DESTRUCTORS
   // Everything that has to outlive the process is on disk now, and every

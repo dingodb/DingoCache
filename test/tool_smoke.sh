@@ -43,9 +43,9 @@ got=$("$BUILD/dfkvctl" --members "n=127.0.0.1:$P" --namespace "dfkv/smoke" get k
 "$BUILD/dfkvctl" stat "127.0.0.1:$P" | grep -q dfkv_cache_put_total
 echo "tool_smoke OK (port $P)"
 
-# SIGTERM: the server must have its disks clean before it starts releasing
-# memory, exit 0, and a restart on the same directory must be a clean start
-# that still has the data.
+# SIGTERM: the server must report its disks clean before it exits, exit 0,
+# and a restart on the same directory must be a clean start that still has
+# the data.
 kill -TERM $PID
 rc=0; wait $PID || rc=$?
 [ "$rc" = 0 ] || { echo "dfkv_server after SIGTERM: expected exit 0, got $rc"; cat "$D/srv.out"; exit 1; }
