@@ -67,6 +67,35 @@ jobs:
       - name: Test (C++ gtests + Python plugin)
         run: ctest --test-dir build --output-on-failure --timeout 300 -j
 
+  arm64-format:
+    name: arm64 build & on-disk format tests
+    # The CRC-32C instruction path for AArch64 is compiled only here: every
+    # other job runs on x86-64. The on-disk format tests check the
+    # little-endian encoding and the checksums on that path.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install build & test deps
+        run: |
+          sudo grep -rlE 'packages\.microsoft\.com|dl\.google\.com' \
+            /etc/apt/sources.list.d/ 2>/dev/null | sudo xargs -r rm -f
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ git ca-certificates
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j --target crc32c_test lse_format_test
+      - name: Test (the hardware CRC path must be the one that ran)
+        env:
+          DFKV_TEST_EXPECT_CRC32C_HARDWARE: "1"
+        run: |
+          ./build/crc32c_test
+          ./build/lse_format_test
+
   container-deployment-smoke:
     name: runtime container deployment smoke
     runs-on: ubuntu-latest

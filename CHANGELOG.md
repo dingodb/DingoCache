@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Server, storage: the on-disk format library of the log-structured engine
+  (superblock, segment header, record header, summary, trailer, journal
+  block; CRC-32C with the CPU instruction where there is one) is added with
+  its tests. Nothing uses it yet.
 
 - Server, storage: groundwork for the log-structured storage engine
   (`docs/design/log-structured-engine.md`), with no change for any existing
