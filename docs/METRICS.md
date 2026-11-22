@@ -66,9 +66,29 @@ curl -s 127.0.0.1:9100/metrics
 
 ```bash
 dfkvctl ring     --mds <ep,...> --group <g>   # 成员表 + 一致性哈希环 vnode 分布/占比
+dfkvctl ring --json --mds <ep,...> --group <g> # 同一视图的 JSON 文档（给脚本；表格格式不变）
 dfkvctl stat --all --mds <ep,...> --group <g> # 逐节点指标 + 集群聚合（容量/对象/命中率）
 dfkvctl stat <ip:port>                        # 单节点原始 /metrics 文本（旧用法不变）
 ```
+
+`ring --json`（`topology --json` 相同）输出一份 JSON 文档，内容与表格一致：
+
+```json
+{"group":"g","ring_points":320,"placement_epoch":"17505949231424193949","members":[
+{"id":"n1","ip":"10.0.0.1","port":28001,"status":"ACTIVE","eligible":true,"weight":1,"vnodes":160,"share_percent":50.0,"ib_health":"unknown","info":"ver=…,engine=…"},
+{"id":"n2","ip":"10.0.0.2","port":28001,"status":"ACTIVE","eligible":true,"weight":1,"vnodes":160,"share_percent":50.0,"ib_health":"unknown","info":"ver=…,engine=…"}
+]}
+```
+
+- `placement_epoch` 是对 eligible 成员计算的 `MembersEpoch`，也就是 MDS 和客户端用来判断环
+  是否变化的那个值。它是 64 位无符号整数，以十进制字符串给出（按 double 读数字的工具放不下
+  64 位）。
+- `eligible=false` 的成员已注册但不在放置环里（`vnodes` 为 0）；`status`、`ib_health` 与表格
+  的 `STATUS`、`IB-HEALTH` 列相同；节点没有自报时 `info` 为空字符串（表格里是 `-`）。
+- 字段只增不改，使用方应忽略不认识的字段。退出码与表格模式相同：空环或没有 eligible 成员时
+  为 1（仍会输出文档），加 `--allow-empty` 为 0。`--json` 只支持 `ring`/`topology`，用在
+  其他子命令上以 2 退出。
+- `deploy/` 下的运维脚本读这份文档，不解析表格。
 
 ## 3. 指标清单
 
@@ -527,7 +547,7 @@ allow-listed counter/gauge，而不是只镜像 ring/MDS。名称固定为
 |---|---|---|
 | `dfkv_membership_audit_ok{group}` | gauge | 每个 MDS placement view、etcd 注册、自报 INFO、ring epoch 全部一致时为 1 |
 | `dfkv_membership_audit_issues{group,severity}` | gauge | 最近一次巡检的 critical / warning 数 |
-| `dfkv_membership_ring_epoch{group}` | gauge | 按 placement 内容计算的 FNV-1a ring epoch（主要用于变更关联；Prometheus float 可能舍入 64-bit 低位） |
+| `dfkv_membership_ring_epoch{group}` | gauge | 按 placement 内容计算的 FNV-1a ring epoch，取自 `dfkvctl ring --json` 的 `placement_epoch`（主要用于变更关联；Prometheus float 可能舍入 64-bit 低位） |
 | `dfkv_membership_registration_revision{group,node}` | gauge | etcd 中该节点注册 key 的最新 `mod_revision`，可关联停止更新/大面积重注册事件 |
 
 建议 cron/systemd timer 每分钟运行一次，命令本身用 `--timeout 5`；同时对

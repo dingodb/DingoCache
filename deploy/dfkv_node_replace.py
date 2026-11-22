@@ -45,6 +45,8 @@ class Replacer:
         argv = [self.args.dfkvctl, command, "--mds", self.args.mds, "--group", self.args.group]
         if command == "stat":
             argv.insert(2, "--all")
+        if command == "ring":
+            argv.insert(2, "--json")
         return run_command(argv, self.args.command_timeout)
 
     def ring(self) -> RingView:
@@ -62,18 +64,41 @@ class Replacer:
     def healthy(self, node_id: str) -> bool:
         return parse_stat_reachability(self.ctl("stat")).get(node_id, False)
 
-    def remote(self, host: str, action: str) -> None:
-        command = [
+    def systemctl(self, host: str, *arguments: str) -> list[str]:
+        return [
             self.args.ssh,
             "-o", "BatchMode=yes",
             "-o", f"ConnectTimeout={max(1, int(self.args.command_timeout))}",
             "--", host,
-            "systemctl", action, self.args.service,
+            "systemctl", *arguments, self.args.service,
         ]
+
+    def remote(self, host: str, action: str) -> None:
+        # --no-block: systemd queues the job and returns. A blocking stop
+        # outlasts the command timeout, and a blocking start issued while the
+        # unit is still stopping waits behind that stop; either would be
+        # reported as a failure of a job that is in fact running. The outcome
+        # is observed through wait_unit() and the MDS view instead.
+        command = self.systemctl(host, action, "--no-block")
         if self.args.dry_run:
             self.record("dry-run", shlex.join(command))
             return
         run_command(command, self.args.command_timeout)
+
+    def unit_state(self, host: str) -> str:
+        output = run_command(
+            self.systemctl(host, "show", "--property=ActiveState"), self.args.command_timeout
+        )
+        name, _, state = output.strip().partition("=")
+        if name != "ActiveState" or not state:
+            raise ValueError(f"unexpected systemctl show output: {output!r}")
+        return state
+
+    def wait_unit(self, host: str, *states: str) -> None:
+        self.wait_for(
+            f"{self.args.service} on {host} to become {'/'.join(states)}",
+            lambda: self.unit_state(host) in states,
+        )
 
     def wait_for(self, description: str, predicate) -> object:
         deadline = time.monotonic() + self.args.timeout
@@ -99,8 +124,10 @@ class Replacer:
         def sample() -> RingView | None:
             nonlocal stable, previous, final
             view = self.ring()
-            ids = {member.node_id for member in view.members}
-            if not required.issubset(ids) or forbidden.intersection(ids):
+            registered = {member.node_id for member in view.members}
+            # A registered member that is not ring-eligible owns no vnodes.
+            placed = {member.node_id for member in view.members if member.eligible}
+            if not required.issubset(placed) or forbidden.intersection(registered):
                 stable = 0
                 previous = ""
                 return None
@@ -137,6 +164,8 @@ class Replacer:
             )
             try:
                 self.remote(self.args.new_host, "stop")
+                if not self.args.dry_run:
+                    self.wait_unit(self.args.new_host, "inactive", "failed")
                 self.record("rollback", "replacement stopped; ring back to old-only membership")
             except BaseException as rollback_error:
                 raise WorkflowError(
@@ -149,6 +178,10 @@ class Replacer:
         try:
             self.remote(self.args.old_host, "start")
             if not self.args.dry_run:
+                # The start may be queued behind a stop that is still running;
+                # until it has run, the ring can still show the registration
+                # of the process that is going away.
+                self.wait_unit(self.args.old_host, "active")
                 self.wait_stable_ring({self.args.old_id}, set())
                 self.wait_for("old node readiness after rollback", lambda: self.healthy(self.args.old_id))
             self.record("rollback", "old node restored; replacement left running to avoid another ring shrink")
@@ -209,6 +242,7 @@ class Replacer:
         # when the local SSH command times out or is interrupted.
         self.old_stopped = True
         self.remote(self.args.old_host, "stop")
+        self.wait_unit(self.args.old_host, "inactive", "failed")
         final = self.wait_stable_ring({self.args.new_id}, {self.args.old_id})
         self.wait_for("replacement readiness after old-node lease expiry", lambda: self.healthy(self.args.new_id))
         self.verify_clients()
@@ -237,8 +271,14 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--service", default="dfkv", help="systemd unit name (default: dfkv)")
     result.add_argument("--dfkvctl", default="dfkvctl", help="dfkvctl executable")
     result.add_argument("--ssh", default="ssh", help="SSH executable")
-    result.add_argument("--timeout", type=float, default=180.0, help="timeout for each observed transition in seconds")
-    result.add_argument("--command-timeout", type=float, default=10.0, help="timeout for each CLI/SSH command in seconds")
+    result.add_argument(
+        "--timeout", type=float, default=180.0,
+        help="timeout for each observed transition in seconds; a service stop or start is one transition",
+    )
+    result.add_argument(
+        "--command-timeout", type=float, default=10.0,
+        help="timeout for each CLI/SSH command in seconds; systemctl jobs are queued, not awaited",
+    )
     result.add_argument("--poll-interval", type=float, default=3.0, help="observation interval in seconds")
     result.add_argument("--stable-samples", type=int, default=2, help="identical consecutive ring views required")
     result.add_argument("--min-clients", type=int, default=0, help="minimum registered clients required throughout")

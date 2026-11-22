@@ -658,6 +658,14 @@ SSH 前置位）：旧节点未停且新节点未标记启动 = safe abort 直�
 新节点保留在线，避免回滚再制造一次环缩容。
 重复执行时若旧节点已退出且新节点健康会直接成功。
 
+`systemctl start`/`stop` 都带 `--no-block` 下发：systemd 只把作业排进队列就返回，脚本
+不等作业结束，而是自己轮询 unit 的 `ActiveState`。停旧节点后要等它变为 `inactive`/
+`failed` 才去看环；回滚重启旧节点时要等它变回 `active` 才看环和就绪——启动作业可能
+排在还没结束的停止作业后面，而这段时间环里还留着正在退出的那个进程的注册。所以停止
+耗时算在 `--timeout` 里，不受 `--command-timeout` 约束：`--timeout` 要大于 unit 实际的
+停止时间（最坏是 `TimeoutStopSec`）；`--command-timeout` 只约束单条 `dfkvctl`/SSH
+命令，这些命令都很快返回。已注册但不在放置环里（非 eligible）的成员不算“已入环”。
+
 ```bash
 # 先做只读预检并打印会执行的 SSH/systemctl 动作
 deploy/dfkv_node_replace.py --mds 10.0.0.1:9400,10.0.0.2:9400 --group glm \
@@ -671,7 +679,8 @@ deploy/dfkv_node_replace.py --mds 10.0.0.1:9400,10.0.0.2:9400 --group glm \
   --state-file /var/lib/dfkv/node-replace.json
 ```
 
-前提：目标机已安装并配置同名 `dfkv.service`，执行机可 BatchMode SSH；新旧节点 ID
+前提：目标机已安装并配置同名 `dfkv.service`，执行机可 BatchMode SSH，执行机上的
+`dfkvctl` 支持 `ring --json`（与脚本同一发行版）；新旧节点 ID
 必须不同（同 ID 会争抢 etcd lease，脚本拒绝）。`--timeout` 是**每个状态迁移**的
 上限而不是无限等待；`--min-clients 0` 允许还未升级客户端注册能力的旧车队，但脚本
 仍会调用 `dfkvctl clients`，并保证执行前已观察到的 client 在切换后没有消失。
@@ -681,7 +690,8 @@ deploy/dfkv_node_replace.py --mds 10.0.0.1:9400,10.0.0.2:9400 --group glm \
 `deploy/dfkv_membership_audit.py` 分别查询每个 MDS（不是把 endpoints 当故障转移
 列表只取一个），并从 etcd v3 gateway 只读 `/dfkv/v1/groups/<g>/members/`：
 比较 placement view、节点注册值中的自报 INFO、etcd registration `mod_revision`
-和按 C++ 同算法计算的 ring content epoch。任一 MDS 不可达、视图分裂、MDS/etcd
+和 `dfkvctl ring --json` 给出的 placement epoch（MDS 与客户端比较的同一个值，
+需要与脚本同一发行版的 `dfkvctl`）。任一 MDS 不可达、视图分裂、MDS/etcd
 成员或自报不一致均退出 `2`；工具/解析错误退出 `1`；健康退出 `0`。
 
 ```bash

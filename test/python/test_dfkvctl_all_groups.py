@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Live multi-group readiness/version/failure coverage for ``dfkvctl stat --all``."""
+"""Live multi-group readiness/version/failure coverage for ``dfkvctl stat --all``,
+and the deploy/ operational scripts run against what the real ``dfkvctl`` prints."""
 
 from __future__ import annotations
 
@@ -8,12 +9,20 @@ import json
 import os
 from pathlib import Path
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "deploy"))
+
+from dfkv_membership_audit import main as audit_main  # noqa: E402
+from dfkv_node_replace import Replacer  # noqa: E402
+from dfkv_ops_common import parse_ring  # noqa: E402
 
 
 class _EtcdState:
@@ -124,6 +133,96 @@ def _run_until(dfkvctl: Path, mds_port: int, predicate, timeout: float = 15.0):
     raise RuntimeError(f"dfkvctl stat --all did not reach expected state\n{detail}")
 
 
+def _registration(node_id: str, ip: str, port: int, info: str) -> bytes:
+    """An etcd registration value as the MDS writes it: EncodeMembers of one member."""
+    value = struct.pack("=QI", 0, 1)
+    for text in (node_id.encode(), ip.encode()):
+        value += struct.pack("=I", len(text)) + text
+    value += struct.pack("=II", port, 1)
+    value += struct.pack("=II", 0x54435031, 0)
+    value += struct.pack("=II", 0x4E464F31, len(info)) + info.encode()
+    return value
+
+
+def _members_epoch(members) -> int:
+    """MembersEpoch of src/common/membership.h, restated: FNV-1a over the
+    eligible members in id order. Scripts take the epoch from dfkvctl; this is
+    here so that a change of the definition does not pass unnoticed."""
+    value = 1469598103934665603
+    for member in sorted((m for m in members if m.eligible), key=lambda m: m.node_id):
+        fields = (
+            struct.pack("=I", len(member.node_id)) + member.node_id.encode()
+            + struct.pack("=I", len(member.ip)) + member.ip.encode()
+            + struct.pack("=II", member.port, member.weight) + b"\x01"
+        )
+        for byte in fields:
+            value = ((value ^ byte) * 1099511628211) % 2**64
+    return value
+
+
+def _check_operational_tools(dfkvctl: Path, mds: str, etcd: str, state: _EtcdState,
+                             address: str, version: str, root: Path) -> None:
+    """deploy/ scripts read `ring --json`, `clients` and `stat --all` of the real binary."""
+    def ctl(*arguments: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [str(dfkvctl), *arguments, "--mds", mds], text=True, capture_output=True,
+            timeout=10, check=False)
+
+    def require(condition: bool, what: str, detail: object) -> None:
+        if not condition:
+            raise RuntimeError(f"{what}\n{detail}")
+
+    # A registered consumer, so that `dfkvctl clients` has a row to print.
+    with state.lock:
+        state.values[b"/dfkv/v1/groups/alpha/clients/client-1"] = _registration(
+            "client-1", "127.0.0.1", 0, "type=vllm,model=m")
+    workflow = Replacer(SimpleNamespace(
+        dfkvctl=str(dfkvctl), mds=mds, group="alpha", command_timeout=10.0))
+    view = workflow.ring()
+    require(len(view.members) == 1, "ring --json member count", view)
+    member = view.members[0]
+    require(
+        (member.node_id, member.address, member.weight, member.eligible)
+        == ("alpha-node", address, 1, True)
+        and member.vnodes == view.ring_points > 0 and member.share_percent == 100.0
+        and f"ver={version}" in member.info,
+        "ring --json member", view)
+    require(view.epoch == _members_epoch(view.members), "ring --json placement_epoch", view)
+    require(workflow.clients() == {"client-1"}, "clients", ctl("clients", "--group", "alpha"))
+    require(workflow.healthy("alpha-node") is True, "stat --all readiness",
+            ctl("stat", "--all", "--group", "alpha"))
+
+    # The table is what people and scripts outside this repository read.
+    table = ctl("ring", "--group", "alpha").stdout.splitlines()
+    require(
+        len(table) == 3
+        and table[0] == f"group=alpha members=1 eligible=1 ring_points={view.ring_points}"
+        and table[1].split() == [
+            "ID", "ADDR", "STATUS", "WEIGHT", "VNODES", "SHARE", "IB-HEALTH", "INFO"]
+        and table[2].split()[:3] == ["alpha-node", address, "ACTIVE"],
+        "ring table changed", table)
+
+    empty = ctl("ring", "--json", "--group", "unused")
+    require(empty.returncode == 1 and parse_ring(empty.stdout).members == (),
+            "ring --json of an empty group", empty)
+    empty = ctl("ring", "--json", "--allow-empty", "--group", "unused")
+    require(empty.returncode == 0 and parse_ring(empty.stdout).members == (),
+            "ring --json --allow-empty", empty)
+    require(ctl("clients", "--json", "--group", "alpha").returncode == 2,
+            "--json outside ring must be refused", "")
+
+    report_path = root / "membership-audit.json"
+    status = audit_main([
+        "--mds", mds, "--etcd", etcd, "--group", "alpha", "--dfkvctl", str(dfkvctl),
+        "--timeout", "10", "--output", str(report_path)])
+    report = json.loads(report_path.read_text())
+    require(
+        status == 0 and report["healthy"] and not report["issues"]
+        and report["ring_epoch"] == view.epoch
+        and [item["node_id"] for item in report["registrations"]] == ["alpha-node"],
+        "membership audit of a consistent group", report)
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         raise SystemExit("usage: test_dfkvctl_all_groups.py <build-dir>")
@@ -159,8 +258,10 @@ def main() -> int:
             _wait_port(mds_port, mds)
 
             servers = []
+            addresses = {}
             for group, node in (("alpha", "alpha-node"), ("beta", "beta-node")):
                 port = _free_port()
+                addresses[node] = f"127.0.0.1:{port}"
                 data = root / node
                 data.mkdir()
                 log = (root / f"{node}.log").open("w+")
@@ -194,6 +295,10 @@ def main() -> int:
             )
             if "unreachable=0 unhealthy=0 health-unknown=0" not in healthy.stdout:
                 raise RuntimeError(f"healthy fleet summary missing\n{healthy.stdout}")
+
+            _check_operational_tools(
+                dfkvctl, f"127.0.0.1:{mds_port}", f"http://127.0.0.1:{etcd.server_port}",
+                state, addresses["alpha-node"], version, root)
 
             stopped_server = servers[1]
             _stop(stopped_server)
@@ -229,7 +334,7 @@ def main() -> int:
         etcd_thread.join(timeout=5)
         for log in logs:
             log.close()
-    print("dfkvctl multi-group readiness/version/failure smoke OK")
+    print("dfkvctl multi-group readiness/version/failure and operational-tools smoke OK")
     return 0
 
 

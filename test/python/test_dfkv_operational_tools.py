@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import struct
@@ -20,12 +21,11 @@ sys.path.insert(0, str(DEPLOY))
 
 from dfkv_load_regression import bench_once, histogram_delta, histogram_quantile, percentile  # noqa: E402
 from dfkv_membership_audit import decode_registration, info_fields, range_end  # noqa: E402
-from dfkv_node_replace import Replacer, WorkflowError  # noqa: E402
+from dfkv_node_replace import Replacer, WorkflowError, main as replace_main  # noqa: E402
 from dfkv_tenant_quota import load_quotas, main as quota_main  # noqa: E402
 from dfkv_ops_common import (  # noqa: E402
     atomic_write,
     atomic_write_with_checksum,
-    members_epoch,
     parse_bench,
     parse_bench_diagnostics,
     parse_clients,
@@ -34,15 +34,42 @@ from dfkv_ops_common import (  # noqa: E402
 )
 
 
-RING = """group=glm members=2 ring_points=300
-ID               ADDR                   WEIGHT   VNODES   SHARE  INFO
-n1               10.0.0.1:28001             1      100   33.3%  ver=2.0,engine=slab,disks=3,cap=9,ram=0,rdma=on
-n2               10.0.0.2:28001             2      200   66.7%  ver=2.0,engine=slab,disks=3,cap=9,ram=0,rdma=on
-"""
+# `dfkvctl ring --json` documents. test_dfkvctl_all_groups.py feeds the real
+# binary's output through the same parsers; these only drive the workflows.
+INFO = "ver=2.0,engine=slab,disks=3,cap=9,ram=0,rdma=on"
 
-RING_OLD = """group=glm members=1 ring_points=300
-ID               ADDR                   WEIGHT   VNODES   SHARE  INFO
-n1               10.0.0.1:28001             1      300  100.0%  ver=2.0,engine=slab,disks=3,cap=9,ram=0,rdma=on
+
+def ring_member(node_id: str, ip: str, weight: int, vnodes: int, share: float,
+                *, eligible: bool = True, info: str = INFO) -> dict:
+    return {
+        "id": node_id, "ip": ip, "port": 28001,
+        "status": "ACTIVE" if eligible else "DEGRADED", "eligible": eligible,
+        "weight": weight, "vnodes": vnodes, "share_percent": share,
+        "ib_health": "unknown", "info": info,
+    }
+
+
+def ring_document(epoch: int, *members: dict) -> str:
+    return json.dumps({
+        "group": "glm", "ring_points": 300 if members else 0,
+        "placement_epoch": str(epoch), "members": list(members),
+    })
+
+
+N1 = ring_member("n1", "10.0.0.1", 1, 100, 33.3)
+N2 = ring_member("n2", "10.0.0.2", 2, 200, 66.7)
+N1_ALONE = ring_member("n1", "10.0.0.1", 1, 300, 100.0)
+RING = ring_document(2**64 - 59, N1, N2)
+RING_OLD = ring_document(7, N1_ALONE)
+# n2 is registered but held out of placement: it owns no vnodes.
+RING_DEGRADED = ring_document(
+    7, N1_ALONE, ring_member("n2", "10.0.0.2", 2, 0, 0.0, eligible=False, info=""))
+EMPTY_RING = ring_document(1469598103934665603)
+
+# What a dfkvctl without --json prints for the same command: the table.
+RING_TABLE = f"""group=glm members=1 eligible=1 ring_points=300
+ID               ADDR                   STATUS    WEIGHT   VNODES   SHARE IB-HEALTH                      INFO
+n1               10.0.0.1:28001         ACTIVE         1      300  100.0% unknown                        {INFO}
 """
 
 CLIENTS = """group=glm clients=2 (only upgraded clients register)
@@ -68,9 +95,6 @@ PUT   n=8000 size=4096 threads=8 batch=4 | 1.000s 0.03 GB/s 8000 ops/s call-lat 
 GET   n=8000 size=4096 threads=8 batch=4 | 0.500s 0.07 GB/s 15996 ops/s call-lat ms p50=0.050 p99=0.400 max=0.800 ok=7998 fails=2
 """
 
-EMPTY_RING = """group=glm members=0 ring_points=0
-ID               ADDR                   WEIGHT   VNODES   SHARE  INFO
-"""
 
 
 
@@ -79,14 +103,41 @@ class CommonParserTest(unittest.TestCase):
     def test_ring_clients_and_readiness(self) -> None:
         view = parse_ring(RING)
         self.assertEqual(view.group, "glm")
+        self.assertEqual(view.ring_points, 300)
         self.assertEqual([member.node_id for member in view.members], ["n1", "n2"])
-        self.assertEqual(view.epoch, members_epoch(reversed(view.members)))
-        self.assertNotEqual(view.epoch, 0)
+        self.assertEqual(
+            [(m.address, m.ip, m.port, m.weight, m.vnodes, m.share_percent, m.info, m.eligible)
+             for m in view.members],
+            [("10.0.0.1:28001", "10.0.0.1", 28001, 1, 100, 33.3, INFO, True),
+             ("10.0.0.2:28001", "10.0.0.2", 28001, 2, 200, 66.7, INFO, True)],
+        )
+        # The epoch is dfkvctl's, bit for bit: 2**64 - 59 does not fit a double.
+        self.assertEqual(view.epoch, 2**64 - 59)
         self.assertEqual(parse_clients(CLIENTS), ("glm", ("host-a_1", "host-b_1")))
         self.assertEqual(parse_stat_reachability(STATS), {"n1": True, "n2": False})
         empty = parse_ring(EMPTY_RING)
         self.assertEqual(empty.group, "glm")
         self.assertEqual(empty.members, ())
+
+    def test_ring_eligibility_and_missing_self_description(self) -> None:
+        active, degraded = parse_ring(RING_DEGRADED).members
+        self.assertTrue(active.eligible)
+        self.assertFalse(degraded.eligible)
+        self.assertEqual(degraded.info, "-")
+        self.assertNotEqual(
+            parse_ring(RING_DEGRADED).fingerprint(),
+            parse_ring(ring_document(7, N1_ALONE, ring_member("n2", "10.0.0.2", 2, 0, 0.0, info=""))).fingerprint(),
+        )
+
+    def test_ring_parser_rejects_anything_but_the_json_document(self) -> None:
+        document = json.loads(RING)
+        del document["members"][0]["vnodes"]
+        duplicate = json.loads(RING)
+        duplicate["members"][1]["id"] = "n1"
+        for text in (RING_TABLE, "", "[]", json.dumps(document), json.dumps(duplicate),
+                     RING.replace(str(2**64 - 59), "soon")):
+            with self.assertRaises(ValueError, msg=text):
+                parse_ring(text)
 
 
     def test_bench_parser_rejects_partial_output(self) -> None:
@@ -174,7 +225,80 @@ class TenantQuotaToolTest(unittest.TestCase):
             self.assertEqual(path.read_bytes(), b"new")
 
 
+class FakeFleet:
+    """Stands in for run_command: one MDS group and two hosts running the unit.
+
+    A stop takes ``stop_polls`` state queries; until it is over the server is
+    still registered and still answers, as one draining for tens of seconds
+    is. systemctl without --no-block waits for its job, so under a command
+    timeout shorter than the stop the caller times out while the job stays
+    queued -- a start queued behind a stop runs once the stop is over.
+    """
+
+    MEMBER = {"old": N1, "new": N2}
+
+    def __init__(self, stop_polls: int = 5) -> None:
+        self.state = {"old": "active", "new": "inactive"}
+        self.stop_polls = stop_polls
+        self.stopping: dict[str, int] = {}
+        self.start_queued: set[str] = set()
+        self.jobs: list[tuple[str, ...]] = []
+
+    def run_command(self, argv, timeout, **_) -> str:
+        argv = list(argv)
+        if argv[0] == "dfkvctl":
+            return self.dfkvctl(argv[1:])
+        host = argv[argv.index("--") + 1]
+        arguments = argv[argv.index("systemctl") + 1:-1]
+        if arguments[0] == "show":
+            return f"ActiveState={self.poll(host)}\n"
+        self.jobs.append((host, *arguments))
+        waits = False
+        if arguments[0] == "stop" and self.state[host] == "active":
+            self.state[host] = "deactivating"
+            self.stopping[host] = self.stop_polls
+            waits = True
+        elif arguments[0] == "start" and self.state[host] == "deactivating":
+            self.start_queued.add(host)
+            waits = True
+        elif arguments[0] == "start":
+            self.state[host] = "active"
+        if waits and "--no-block" not in arguments:
+            raise subprocess.TimeoutExpired(argv, timeout)
+        return ""
+
+    def poll(self, host: str) -> str:
+        if self.state[host] == "deactivating":
+            self.stopping[host] -= 1
+            if self.stopping[host] <= 0:
+                self.state[host] = "active" if host in self.start_queued else "inactive"
+                self.start_queued.discard(host)
+        return self.state[host]
+
+    def dfkvctl(self, arguments: list[str]) -> str:
+        up = [self.MEMBER[host] for host in ("old", "new") if self.state[host] != "inactive"]
+        if arguments[0] == "ring":
+            return ring_document(len(up), *up) if "--json" in arguments else RING_TABLE
+        if arguments[0] == "clients":
+            return CLIENTS
+        rows = "".join(f"{member['id']} {member['ip']}:28000 2.0 yes\n" for member in up)
+        return "ID ADDR VERSION READY\n" + rows + "TOTAL used=0.0MB\n"
+
+
 class ReplacementWorkflowTest(unittest.TestCase):
+    ARGV = [
+        "--mds", "mds:1", "--group", "glm", "--old-id", "n1", "--new-id", "n2",
+        "--old-host", "old", "--new-host", "new", "--timeout", "10",
+        "--command-timeout", "1", "--poll-interval", "0.01", "--stable-samples", "1",
+    ]
+
+    def setUp(self) -> None:
+        # No test may reach a real dfkvctl or ssh.
+        blocked = patch(
+            "dfkv_node_replace.run_command", side_effect=AssertionError("unmocked command"))
+        blocked.start()
+        self.addCleanup(blocked.stop)
+
     @staticmethod
     def args(dry_run: bool = True) -> SimpleNamespace:
         return SimpleNamespace(
@@ -249,6 +373,9 @@ class ReplacementWorkflowTest(unittest.TestCase):
                 self.actions.append((host, action))
                 if (host, action) == ("new", "start"):
                     raise subprocess.TimeoutExpired(["ssh", "new"], 1.0)
+
+            def unit_state(self, host):
+                return "inactive"
 
         workflow = Fixture(self.args(dry_run=False))
         with self.assertRaises(subprocess.TimeoutExpired):
@@ -333,6 +460,39 @@ class ReplacementWorkflowTest(unittest.TestCase):
             view = workflow.wait_for("replacement ring", workflow.ring)
         self.assertEqual([member.node_id for member in view.members], ["n1", "n2"])
         self.assertEqual(command.call_count, 3)
+
+    def test_stop_longer_than_the_command_timeout_is_observed_not_awaited(self) -> None:
+        fleet = FakeFleet()
+        with patch("dfkv_node_replace.run_command", side_effect=fleet.run_command):
+            status = replace_main(self.ARGV)
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            fleet.jobs, [("new", "start", "--no-block"), ("old", "stop", "--no-block")])
+        self.assertEqual(fleet.state, {"old": "inactive", "new": "active"})
+
+    def test_rollback_start_waits_behind_a_stop_in_progress(self) -> None:
+        fleet = FakeFleet()
+        fleet.state = {"old": "deactivating", "new": "active"}
+        fleet.stopping["old"] = fleet.stop_polls
+        with patch("dfkv_node_replace.run_command", side_effect=fleet.run_command):
+            workflow = Replacer(self.args(dry_run=False))
+            workflow.old_stopped = True
+            workflow.rollback(RuntimeError("cutover failed"))
+        self.assertEqual(fleet.jobs, [("old", "start", "--no-block")])
+        # Not declared restored on the registration of the process going away.
+        self.assertEqual(fleet.state["old"], "active")
+        self.assertIn("old node restored", str(workflow.events[-1]["message"]))
+
+    def test_stable_ring_requires_placed_members_and_forbids_registered_ones(self) -> None:
+        args = self.args()
+        args.timeout = 0.05
+        with patch("dfkv_node_replace.run_command", return_value=RING_DEGRADED):
+            workflow = Replacer(args)
+            self.assertEqual(workflow.wait_stable_ring({"n1"}, set()).group, "glm")
+            with self.assertRaises(WorkflowError):
+                workflow.wait_stable_ring({"n1", "n2"}, set())
+            with self.assertRaises(WorkflowError):
+                workflow.wait_stable_ring({"n1"}, {"n2"})
 
 
 class AtomicArtifactTest(unittest.TestCase):
