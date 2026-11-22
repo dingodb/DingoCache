@@ -644,6 +644,49 @@ TEST_F(DiskGroupTest, AnEngineThatThrowsWhileOpeningIsAStartupFailure) {
   }
 }
 
+// The reason a throw is not rethrown: the stores that did open must be closed
+// in order. Real slab stores with data; one directory's engine throws; the
+// next start must find the others clean and complete, whichever disk failed.
+TEST_F(DiskGroupTest, ADiskThatThrowsDoesNotCostTheOthersTheirCache) {
+  const auto dirs = Dirs(3);
+  const uint64_t kCapacity = 3ull << 30;
+  const std::string value(4096, 't');
+  {
+    DiskCacheGroup group({dirs, kCapacity, "slab"});
+    ASSERT_TRUE(group.Healthy()) << group.StartupError();
+    for (uint64_t i = 0; i < 64; ++i)
+      ASSERT_EQ(group.Cache(BlockKey{9100 + i, 0}, value.data(), value.size()),
+                Status::kOk);
+  }
+  for (size_t thrower = 0; thrower < dirs.size(); ++thrower) {
+    {
+      DiskCacheGroup::Options options;
+      options.cache_dirs = dirs;
+      options.capacity_bytes = kCapacity;
+      options.engine = "slab";
+      options.engine_factory =
+          [&dirs, thrower](const std::string& dir,
+                           uint64_t capacity) -> std::unique_ptr<StoreEngine> {
+        if (dir == dirs[thrower]) {
+          // Give the other disks time to open and mark themselves dirty.
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          throw std::runtime_error("cannot open");
+        }
+        DiskSlabStore::Options so;
+        so.dir = dir;
+        so.capacity_bytes = capacity;
+        return std::make_unique<DiskSlabStore>(so);
+      };
+      DiskCacheGroup group(std::move(options));
+      EXPECT_FALSE(group.Healthy());
+    }
+    DiskCacheGroup reopened({dirs, kCapacity, "slab"});
+    ASSERT_TRUE(reopened.Healthy()) << reopened.StartupError();
+    EXPECT_EQ(reopened.SlabStats().unclean_resets, 0u) << "thrower " << thrower;
+    EXPECT_EQ(reopened.Count(), 64u) << "thrower " << thrower;
+  }
+}
+
 // Two names for one directory: whichever store gets the directory lock, the
 // other fails, and the node refuses to start. Decided by a race now, not by
 // order, so only the outcome is asserted.

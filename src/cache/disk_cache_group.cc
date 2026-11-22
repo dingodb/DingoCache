@@ -326,13 +326,20 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
           NameThisThread("disk-open-", i);
           open_one(i);
         });
-      } catch (const std::system_error&) {
+      } catch (const std::system_error& error) {
+        DFKV_LOG_WARN("no thread to open " + opt.cache_dirs[i] + " (" +
+                      error.what() + "); opening it in turn");
         open_one(i);
       }
     }
     open_one(0);
     for (auto& helper : helpers) helper.join();
   }
+  // Every disk that threw is logged, not only the first one reported below.
+  for (size_t i = 0; i < n; ++i)
+    if (opened[i].threw)
+      DFKV_LOG_ERROR("disk store startup failed: " + opt.cache_dirs[i] + ": " +
+                     opened[i].error);
   size_t slowest = 0;
   for (size_t i = 0; i < n; ++i) {
     const std::string& dir = opt.cache_dirs[i];
@@ -344,8 +351,6 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
       // exception escaping to a caller that does not catch it would abort the
       // process and cost every one of them its cache.
       fail(dir + ": " + opened[i].error);
-      DFKV_LOG_ERROR("disk store startup failed: " + dir + ": " +
-                     opened[i].error);
       return;
     }
     std::unique_ptr<StoreEngine> store = std::move(opened[i].store);
