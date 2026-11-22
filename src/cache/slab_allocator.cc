@@ -661,7 +661,7 @@ bool SlabAllocator::RestoreBulk(const std::vector<RestoreEntry>& entries) {
           std::min<uint64_t>(entry.retain_until, cap));
       meta.retain_persisted_until = meta.retain_until;
       ProtectLocked(meta_index);
-      PushWheelLocked(meta.key, meta.retain_until);
+      PushWheelLocked(meta_index);
     } else if (retain_.enabled) {
       meta.retain_ttl_s = std::min(entry.retain_ttl_s, retain_.max_ttl_s);
     }
@@ -1289,6 +1289,7 @@ void SlabAllocator::ConfigureRetention(const RetainOptions& options,
   // never holds two laps in one bucket.
   wheel_.assign(retain_.enabled ? retain_.max_ttl_s / kWheelTickS + 2 : 0, {});
   wheel_entries_ = 0;
+  wheel_cursor_ = wheel_keep_ = 0;
   wheel_tick_ = now_s / kWheelTickS == 0 ? 0 : now_s / kWheelTickS - 1;
 }
 
@@ -1318,9 +1319,19 @@ void SlabAllocator::UnprotectLocked(uint32_t meta_index) {
   meta.retain_until = 0;
 }
 
-void SlabAllocator::PushWheelLocked(const BlockKey& key, uint32_t until) {
+// A protected resident has exactly one entry on the wheel: in the bucket of
+// the deadline it had when the entry was pushed, which the slot remembers
+// (retain_wheel_until). A later deadline (refresh, raised TTL) does not push
+// another one; the expiry finds the entry, sees that the deadline has moved
+// on, and pushes it forward then. An entry whose `until` is not the one its
+// slot remembers belongs to a protection that is gone (the key was removed,
+// perhaps put and protected again) and is dropped when its bucket comes up.
+void SlabAllocator::PushWheelLocked(uint32_t meta_index) {
   if (wheel_.empty()) return;
-  wheel_[(until / kWheelTickS) % wheel_.size()].push_back({key, until});
+  SlotMeta& meta = slots_[meta_index];
+  meta.retain_wheel_until = meta.retain_until;
+  wheel_[(meta.retain_until / kWheelTickS) % wheel_.size()].push_back(
+      {meta.key, meta.retain_until});
   ++wheel_entries_;
 }
 
@@ -1381,10 +1392,12 @@ SlabAllocator::RetainOutcome SlabAllocator::Retain(const BlockKey& key,
   }
   if (!was_protected) ProtectLocked(index);
   meta.retain_ttl_s = eff;
-  if (new_until != meta.retain_until || !was_protected) {
-    meta.retain_until = new_until;
-    PushWheelLocked(meta.key, new_until);
-  }
+  meta.retain_until = new_until;
+  // Only a new protection goes on the wheel. Pushing an entry for every
+  // deadline that moved left one behind per refresh, each to be looked at
+  // when its bucket expired: an object renewed once a second for an hour had
+  // thousands.
+  if (!was_protected) PushWheelLocked(index);
   // Durable record: always for a new or raised TTL; for renewals only once
   // the deadline has moved far enough that losing it on restart matters.
   const uint32_t delta_floor = std::max(retain_.persist_min_delta_s, eff / 4);
@@ -1400,8 +1413,10 @@ SlabAllocator::RetainOutcome SlabAllocator::Retain(const BlockKey& key,
   return out;
 }
 
-size_t SlabAllocator::ExpireRetention(uint32_t now_s) {
+size_t SlabAllocator::ExpireRetention(uint32_t now_s, size_t max_entries,
+                                      bool* more) {
   std::lock_guard<std::mutex> lock(mu_);
+  if (more) *more = false;
   if (now_s > retain_now_s_) retain_now_s_ = now_s;
   if (wheel_.empty()) return 0;
   const uint32_t now = retain_now_s_;
@@ -1409,32 +1424,62 @@ size_t SlabAllocator::ExpireRetention(uint32_t now_s) {
   // protection may outlive its deadline by < 10 s, never end early.
   const uint64_t target = now / kWheelTickS == 0 ? 0 : now / kWheelTickS - 1;
   if (target <= wheel_tick_) return 0;
-  // After a long stall one full lap visits every bucket; skip the rest.
-  if (target - wheel_tick_ > wheel_.size())
+  // After a long stall one full lap visits every bucket; skip the rest. Not
+  // in the middle of a bucket: that one is finished first.
+  if (wheel_cursor_ == 0 && target - wheel_tick_ > wheel_.size())
     wheel_tick_ = target - wheel_.size();
   size_t cleared = 0;
+  size_t visited = 0;
+  // wheel_tick_ is the last bucket that is done. The one after it may be
+  // half done from an earlier call: entries before wheel_keep_ stay, those
+  // from wheel_cursor_ on are still to be looked at.
   while (wheel_tick_ < target) {
-    ++wheel_tick_;
-    std::vector<WheelEntry>& bucket = wheel_[wheel_tick_ % wheel_.size()];
-    std::vector<WheelEntry> keep;
-    for (const WheelEntry& entry : bucket) {
+    const uint64_t tick = wheel_tick_ + 1;
+    std::vector<WheelEntry>& bucket = wheel_[tick % wheel_.size()];
+    while (wheel_cursor_ < bucket.size()) {
+      if (visited == max_entries) {
+        // Enough for one hold of the lock; the caller comes back.
+        if (more) *more = true;
+        return cleared;
+      }
+      ++visited;
+      const WheelEntry entry = bucket[wheel_cursor_++];
       if (entry.until > now) {
-        keep.push_back(entry);  // a later lap (only after a clock step)
+        bucket[wheel_keep_++] = entry;  // a later lap (only after a clock step)
         continue;
       }
       --wheel_entries_;
       const uint32_t* found = index_.Find(entry.key);
       if (found == nullptr) continue;
       SlotMeta& meta = slots_[*found];
-      // A refresh or upgrade pushed a later entry; this one is stale.
-      if (!meta.live || meta.retain_until != entry.until) continue;
+      // Not this slot's entry: the protection it was pushed for is gone.
+      if (!meta.live || meta.retain_until == 0 ||
+          meta.retain_wheel_until != entry.until)
+        continue;
+      const uint64_t due_tick = meta.retain_until / kWheelTickS;
+      if (due_tick > tick) {
+        // Renewed since: the deadline lies in a bucket that is not due yet.
+        // The entry moves there; the resident stays protected. If that is
+        // this very bucket a lap later, it stays where it is (appended, it
+        // would be looked at again in this pass).
+        if (due_tick % wheel_.size() == tick % wheel_.size()) {
+          meta.retain_wheel_until = meta.retain_until;
+          bucket[wheel_keep_++] = {entry.key, meta.retain_until};
+          ++wheel_entries_;
+        } else {
+          PushWheelLocked(*found);
+        }
+        continue;
+      }
       UnprotectLocked(*found);
       // Rejoin ordinary eviction without leftover reference credit.
       meta.referenced = false;
       ++retain_expired_;
       ++cleared;
     }
-    bucket.swap(keep);
+    bucket.resize(wheel_keep_);
+    wheel_cursor_ = wheel_keep_ = 0;
+    wheel_tick_ = tick;
   }
   return cleared;
 }

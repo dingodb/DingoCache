@@ -146,8 +146,13 @@ class SlabAllocator {
   RetainOutcome Retain(const BlockKey& key, uint32_t ttl_s, RetainMode mode,
                        uint32_t now_s);
   // Clears protections whose 10 s expiry bucket has fully passed. Returns the
-  // number of residents released back to ordinary eviction.
-  size_t ExpireRetention(uint32_t now_s);
+  // number of residents released back to ordinary eviction. Looks at no more
+  // than `max_entries` wheel entries under one hold of the lock and sets
+  // `*more` when it stopped for that reason; calling again continues where
+  // it left off. Thousands of residents protected with one deadline expire
+  // in one bucket, and every operation on the store waits for this lock.
+  size_t ExpireRetention(uint32_t now_s, size_t max_entries = SIZE_MAX,
+                         bool* more = nullptr);
   struct RetentionStats {
     bool enabled = false;
     uint64_t budget_bytes = 0;
@@ -299,6 +304,8 @@ class SlabAllocator {
     uint32_t retain_until = 0;
     uint32_t retain_ttl_s = 0;
     uint32_t retain_persisted_until = 0;
+    // The deadline this resident's one wheel entry was pushed with.
+    uint32_t retain_wheel_until = 0;
     bool referenced = false;
     bool remove_pending = false;
     bool live = false;
@@ -391,7 +398,7 @@ class SlabAllocator {
 
   void ProtectLocked(uint32_t meta_index);
   void UnprotectLocked(uint32_t meta_index);
-  void PushWheelLocked(const BlockKey& key, uint32_t until);
+  void PushWheelLocked(uint32_t meta_index);
   uint32_t ClassProtectCapLocked(const Class& cls) const;
 
   void PushFreeLocked(Class& cls, uint32_t extent, uint32_t slot);
@@ -469,6 +476,11 @@ class SlabAllocator {
   std::vector<std::vector<WheelEntry>> wheel_;
   uint64_t wheel_entries_ = 0;
   uint64_t wheel_tick_ = 0;  // last fully drained 10 s tick
+  // Progress inside the bucket after wheel_tick_, when an expiry stopped at
+  // its entry limit: entries before wheel_keep_ stay in the bucket, those
+  // from wheel_cursor_ on have not been looked at.
+  size_t wheel_cursor_ = 0;
+  size_t wheel_keep_ = 0;
   uint32_t retain_now_s_ = 0;
 };
 

@@ -2636,7 +2636,22 @@ uint64_t DiskSlabStore::EvictedBytes() const {
 void DiskSlabStore::ReclaimTick(
     const std::function<void()>& after_watermark_evict) {
   if (!Serving()) return;
-  if (retain_enabled_) alloc_->ExpireRetention(RetainNowS());
+  if (retain_enabled_) {
+    // In batches, letting go of the allocator's lock in between: a bucket can
+    // hold every resident that was protected with one deadline, and reads
+    // and writes wait for that lock. The pause is what lets them have it: a
+    // thread that unlocks and locks again at once, or merely yields, takes
+    // the mutex back before a waiter has woken up (measured: batches without
+    // a pause kept a reader waiting as long as one unbroken hold did). The
+    // price: a large bucket now takes longer to expire in wall time, and the
+    // duties below (watermark eviction, rebalancing) wait that much longer.
+    const uint32_t now_s = RetainNowS();
+    bool more = false;
+    do {
+      alloc_->ExpireRetention(now_s, kRetainExpireBatch, &more);
+      if (more) std::this_thread::sleep_for(kRetainExpirePause);
+    } while (more);
+  }
   // Successful NEW commits renew pressure eligibility. Inactive history
   // expires after 128 quiet observations; required active drain is preserved.
   // Sampling and composite mutation share mu_.

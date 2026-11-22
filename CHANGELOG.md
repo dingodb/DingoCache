@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- Server, retention (`DFKV_RETAIN_*`): the expiry wheel no longer grows with
+  every renewal, and expiring a full bucket no longer holds up the disk.
+  - Every renewal that moved a deadline (one per second and object at most)
+    left an entry on the wheel until its bucket expired; an object renewed
+    once a second for an hour had thousands, each 32 bytes and each looked
+    at again at expiry. In a test, 500 objects renewed once a second for ten
+    minutes had 300,500 entries. A protected object now has exactly one
+    entry; a renewal only moves its deadline, and the expiry moves the entry
+    on when it finds the deadline later than the bucket. The same test now
+    has 500. `dfkv_retain_wheel_entries` is the number of protected objects
+    plus the entries of protected objects that were removed, which stay
+    until their bucket expires (at most the maximum TTL).
+  - Objects protected with one deadline expire in one bucket, and the whole
+    bucket was processed under the allocator's lock, which every read and
+    write of that disk waits for: 45-72 ms for a million objects in the
+    test. The expiry now looks at 1,024 entries per hold of the lock and
+    pauses 50 microseconds in between. In the same test the longest hold is
+    0.24 ms and a concurrent reader waited at most 1.7 ms; the expiry as a
+    whole takes longer (180 ms), in the background. Without the pause the
+    batches did not help: the expiring thread took the lock back before a
+    waiter woke up.
+  - Retention itself is unchanged: an object is protected until its latest
+    deadline and at most 10 s beyond it, and is released then.
 - Server, slab disks: a PUT that finds no slot is answered `kCacheFull`, not
   `kIOError`. When every slot of a size class is held by a read or write in
   flight or is protected by retention (`DFKV_RETAIN_*`), and no extent can
