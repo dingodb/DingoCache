@@ -293,11 +293,26 @@ class KVClient {
   };
   mutable std::mutex retain_mu_;
   std::map<std::string, RetainNodeState> retain_nodes_;
-  struct RetainDebounceEntry { uint64_t protected_at_ms = 0; };
+  // A key the node answered as protected: when, by which node (a hash of its
+  // address, so that a key whose owner changed is asked again), and for how
+  // long the protection can at most last (the TTL the SET was granted, or
+  // the node's cap when only a REFRESH was seen). A write or remove of the
+  // key through this client drops it.
+  struct RetainDebounceEntry {
+    uint64_t protected_at_ms = 0;
+    uint64_t valid_ms = 0;
+    uint64_t node_id = 0;
+  };
+  void ForgetRetained(const BlockKey& key);
   static constexpr size_t kRetainDebounceShards = 16;
   struct RetainDebounceShard {
     std::mutex mu;
     std::map<std::pair<uint64_t, uint64_t>, RetainDebounceEntry> entries;
+    // Bumped by every ForgetRetained of a key of this shard. A kRetain reply
+    // records an entry only if no forget happened since its request was
+    // built: the reply describes the value from before a PUT or remove that
+    // raced it.
+    uint64_t forget_epoch = 0;
   };
   RetainDebounceShard retain_debounce_[kRetainDebounceShards];
   size_t retain_debounce_cap_ = 0;  // per shard; from DFKV_RETAIN_CACHE_ENTRIES

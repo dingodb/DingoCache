@@ -852,6 +852,7 @@ bool KVClient::Remove(const std::string& key) {
 }
 
 void KVClient::InvalidateRendezvous(const BlockKey& key) {
+  ForgetRetained(key);
   if (dedup_) dedup_->Invalidate(key);
   if (GpuNodeDedup* gd = gpu_dedup_raw_.load(std::memory_order_acquire))
     gd->Invalidate(key);
@@ -1373,6 +1374,11 @@ void KVClient::RetainNode(const std::string& node, uint64_t tenant,
     for (size_t m = 0; m < n; ++m) chunk[m] = bkeys[idx[begin + m]];
     std::string payload(RetainPayloadBytes(n), '\0');
     EncodeRetainPayload(&payload[0], req.ttl_s, req.mode, chunk.data(), n);
+    uint64_t epochs[kRetainDebounceShards];
+    for (size_t sh = 0; sh < kRetainDebounceShards; ++sh) {
+      std::lock_guard<std::mutex> lk(retain_debounce_[sh].mu);
+      epochs[sh] = retain_debounce_[sh].forget_epoch;
+    }
     std::string reply;
     const Status st = t_->Retain(node, tenant, n, payload, &reply);
     if (st == Status::kInvalid) {
@@ -1401,18 +1407,36 @@ void KVClient::RetainNode(const std::string& node, uint64_t tenant,
       ns.heard = true;
     }
     const uint64_t now = NowMs();
+    // How long a protection just confirmed can last at most: a SET was
+    // granted its TTL clamped to the node's cap; a REFRESH keeps whatever
+    // the SET was granted, which the cap bounds.
+    const uint64_t cap_s = trailer.max_ttl_s;
+    const uint64_t valid_ms =
+        1000 * (req.mode == kRetainModeRefresh
+                    ? cap_s
+                    : std::min<uint64_t>(req.ttl_s, cap_s));
+    const uint64_t node_id = std::hash<std::string>{}(node);
     for (size_t m = 0; m < n; ++m) {
       const uint8_t code = static_cast<uint8_t>(reply[m]);
       out[idx[begin + m]] = code <= kRetDenied ? code : kRetError;
       const BlockKey& bk = chunk[m];
-      RetainDebounceShard& shard =
-          retain_debounce_[bk.digest_lo % kRetainDebounceShards];
+      const size_t sh = bk.digest_lo % kRetainDebounceShards;
+      RetainDebounceShard& shard = retain_debounce_[sh];
       std::lock_guard<std::mutex> lk(shard.mu);
       const auto key = std::make_pair(bk.digest_hi, bk.digest_lo);
-      if (RetainCodeProtected(code)) {
+      if (shard.forget_epoch != epochs[sh]) {
+        // A PUT or remove of a key of this shard ran while the request was
+        // out: the reply may be about the value it replaced.
+        shard.entries.erase(key);
+      } else if (RetainCodeProtected(code)) {
         if (shard.entries.size() >= cap && shard.entries.count(key) == 0)
           shard.entries.clear();  // bounded: rare full reset
-        if (cap != 0) shard.entries[key].protected_at_ms = now;
+        if (cap != 0) {
+          RetainDebounceEntry& e = shard.entries[key];
+          e.protected_at_ms = now;
+          e.valid_ms = valid_ms;
+          e.node_id = node_id;
+        }
       } else {
         shard.entries.erase(key);
       }
@@ -1459,21 +1483,26 @@ void KVClient::BatchRetain(const std::vector<std::string>& keys,
   std::map<std::pair<std::string, uint64_t>, std::vector<size_t>> by_node;
   for (size_t i = 0; i < n; ++i) {
     bks[i] = ToBlockKey(key_namespace_, keys[i]);
+    std::string node = Route(keys[i]);
+    if (node.empty()) continue;  // stays kRetError
     if (debounce) {
       RetainDebounceShard& shard =
           retain_debounce_[bks[i].digest_lo % kRetainDebounceShards];
       std::lock_guard<std::mutex> lk(shard.mu);
       auto it = shard.entries.find(
           std::make_pair(bks[i].digest_hi, bks[i].digest_lo));
-      // Protected within the last ttl/10: still protected, hence present.
+      // Protected by its present owner within the last ttl/10, and not for
+      // longer than that protection can last: still protected, hence
+      // present. (`now` was read first: an entry written since is newer.)
       if (it != shard.entries.end() &&
-          now - it->second.protected_at_ms < interval) {
+          it->second.node_id == std::hash<std::string>{}(node) &&
+          (it->second.protected_at_ms >= now ||
+           now - it->second.protected_at_ms <
+               std::min(interval, it->second.valid_ms))) {
         out[i] = kRetSkippedDebounce;
         continue;
       }
     }
-    std::string node = Route(keys[i]);
-    if (node.empty()) continue;  // stays kRetError
     by_node[{node, bks[i].tenant_hash}].push_back(i);
   }
   std::vector<std::pair<std::pair<std::string, uint64_t>, std::vector<size_t>>>
@@ -1482,6 +1511,14 @@ void KVClient::BatchRetain(const std::vector<std::string>& keys,
     RetainNode(groups[g].first.first, groups[g].first.second, groups[g].second,
                bks, req, out);
   });
+}
+
+void KVClient::ForgetRetained(const BlockKey& key) {
+  RetainDebounceShard& shard =
+      retain_debounce_[key.digest_lo % kRetainDebounceShards];
+  std::lock_guard<std::mutex> lk(shard.mu);
+  shard.entries.erase(std::make_pair(key.digest_hi, key.digest_lo));
+  ++shard.forget_epoch;
 }
 
 void KVClient::RetainLimits(int* supported, uint32_t* max_ttl_s) {

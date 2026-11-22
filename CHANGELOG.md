@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Client, retention (`dfkv_batch_retain`, REFRESH with a TTL hint): a
+  REFRESH skipped by the client's debounce no longer reports a key present
+  that is gone or has moved. A REFRESH that finds the key protected counts
+  as a hit, and the client skips asking the node again for a tenth of the
+  hinted TTL. That cache knew only the key: after the key was removed or
+  written again through the same client, after its owner changed in the
+  ring, or once the protection the node actually granted (the SET's TTL,
+  clamped to the node's cap) had run out, the skip still said "present".
+  The cache now also records the owner and the most the protection can
+  last, a skip needs both to match, and a successful PUT or remove of the
+  key drops it, also when it races a retention call still on its way (the
+  reply about the old value is then not recorded). A node that restarted and lost its protections is not
+  noticed until the skip interval has passed, as before.
 - SGLang HiCache connector: concrete extra_config checks at startup. A key
   that is not one of `model_revision`, `tenant_id`, `kv_cache_dtype`,
   `prefill_cp_storage_layout`, `bind_runtime_layout` but differs from one by

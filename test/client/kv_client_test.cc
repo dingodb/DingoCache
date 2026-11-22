@@ -386,3 +386,90 @@ TEST_F(KVClientTest, RetainAgainstNodeWithoutRetentionFallsBack) {
   // The connection survived the unknown op: ordinary traffic still works.
   EXPECT_TRUE(c.Exist(keys[0]));
 }
+
+// ---- the REFRESH debounce answers only for what it knows ------------------
+
+namespace {
+
+// A node with retention (the slab engine), optionally with its TTL cap.
+std::unique_ptr<Node> StartRetainNode(const std::string& tag,
+                                      const char* max_ttl_s = nullptr) {
+  const char* prev = std::getenv("DFKV_STORE_ENGINE");
+  const std::string saved = prev ? prev : "";
+  ::setenv("DFKV_STORE_ENGINE", "slab", 1);
+  if (max_ttl_s) ::setenv("DFKV_RETAIN_MAX_TTL_S", max_ttl_s, 1);
+  auto n = StartNode(tag);
+  ::unsetenv("DFKV_RETAIN_MAX_TTL_S");
+  if (prev) ::setenv("DFKV_STORE_ENGINE", saved.c_str(), 1);
+  else ::unsetenv("DFKV_STORE_ENGINE");
+  return n;
+}
+
+KVClient::RetainRequest RetainSet(uint32_t ttl_s) {
+  KVClient::RetainRequest r;
+  r.ttl_s = ttl_s;
+  r.mode = 0;
+  return r;
+}
+
+KVClient::RetainRequest RetainRefresh(uint32_t ttl_hint_s) {
+  KVClient::RetainRequest r;
+  r.ttl_s = ttl_hint_s;
+  r.mode = 1;
+  return r;
+}
+
+}  // namespace
+
+// A REFRESH skipped by the debounce counts as a hit. After the key was
+// removed through this very client it must ask the node again.
+TEST_F(KVClientTest, RetainDebounceForgetsARemovedKey) {
+  nodes_.push_back(StartRetainNode("deb_remove"));
+  KVClient c({{"a", nodes_[0]->addr}}, SelfHdr());
+  const std::vector<std::string> keys = {"glm-5.1/deb_rm"};
+  const std::string v(1024, 'r');
+  ASSERT_TRUE(c.Put(keys[0], v.data(), v.size()));
+  uint8_t out[1] = {99};
+  c.BatchRetain(keys, RetainSet(300), out);
+  ASSERT_EQ(out[0], KVClient::kRetProtectedNew);
+  c.BatchRetain(keys, RetainRefresh(300), out);
+  ASSERT_EQ(out[0], KVClient::kRetSkippedDebounce);
+  ASSERT_TRUE(c.Remove(keys[0]));
+  c.BatchRetain(keys, RetainRefresh(300), out);
+  EXPECT_EQ(out[0], KVClient::kRetMiss) << "a removed key reported present";
+}
+
+// The hint is the caller's idea of the TTL; the node may have granted less.
+// The debounce never outlasts what the node can have granted.
+TEST_F(KVClientTest, RetainDebounceDoesNotOutlastTheGrantedTtl) {
+  nodes_.push_back(StartRetainNode("deb_cap", "1"));  // the node caps at 1 s
+  KVClient c({{"a", nodes_[0]->addr}}, SelfHdr());
+  const std::vector<std::string> keys = {"glm-5.1/deb_cap"};
+  const std::string v(1024, 'c');
+  ASSERT_TRUE(c.Put(keys[0], v.data(), v.size()));
+  uint8_t out[1] = {99};
+  c.BatchRetain(keys, RetainSet(3600), out);
+  ASSERT_EQ(out[0], KVClient::kRetProtectedNew);
+  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+  c.BatchRetain(keys, RetainRefresh(3600), out);  // debounce interval 360 s
+  EXPECT_NE(out[0], KVClient::kRetSkippedDebounce)
+      << "skipped although the protection the node granted has run out";
+}
+
+// A key whose owner changed is asked of its new owner.
+TEST_F(KVClientTest, RetainDebounceAsksANewOwner) {
+  nodes_.push_back(StartRetainNode("deb_own_a"));
+  nodes_.push_back(StartRetainNode("deb_own_b"));
+  KVClient c({{"a", nodes_[0]->addr}}, SelfHdr());
+  const std::vector<std::string> keys = {"glm-5.1/deb_owner"};
+  const std::string v(1024, 'o');
+  ASSERT_TRUE(c.Put(keys[0], v.data(), v.size()));
+  uint8_t out[1] = {99};
+  c.BatchRetain(keys, RetainSet(300), out);
+  ASSERT_EQ(out[0], KVClient::kRetProtectedNew);
+  c.SetMembers(std::vector<std::pair<std::string, std::string>>{
+      {"b", nodes_[1]->addr}});  // the key now belongs to b, which lacks it
+  c.BatchRetain(keys, RetainRefresh(300), out);
+  EXPECT_EQ(out[0], KVClient::kRetMiss)
+      << "reported present on the strength of another node's answer";
+}
