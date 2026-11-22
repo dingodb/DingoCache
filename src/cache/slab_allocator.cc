@@ -332,7 +332,10 @@ void SlabAllocator::LinkResidentLocked(uint32_t index) {
   if (extent.resident_head != kNoSlot)
     slots_[extent.resident_head].extent_prev = index;
   extent.resident_head = index;
-  ++extent.resident_count;
+  if (extent.resident_count++ == 0) {
+    --cls.empty_extents;
+    --empty_extents_;
+  }
 }
 
 uint64_t SlabAllocator::DecayedHeat(uint64_t heat, uint64_t heat_seq) const {
@@ -494,6 +497,8 @@ SlabAllocator::ExtentBindResult SlabAllocator::BindExtentLocked(
   extent.total_slots = cls.slots_per_extent;
   extent.free_slots = cls.slots_per_extent;
   ++cls.bound_extents;
+  ++cls.empty_extents;
+  ++empty_extents_;
   --unbound_;
   for (uint32_t slot = 0; slot < cls.slots_per_extent; ++slot)
     PushFreeLocked(cls, extent_index, slot);
@@ -710,7 +715,10 @@ void SlabAllocator::FreeSlotLocked(uint32_t index) {
     extent.resident_head = meta.extent_next;
   if (meta.extent_next != kNoSlot)
     slots_[meta.extent_next].extent_prev = meta.extent_prev;
-  --extent.resident_count;
+  if (--extent.resident_count == 0) {
+    ++cls.empty_extents;
+    ++empty_extents_;
+  }
   extent.access_seq_sum -= meta.access_seq;
 
   if (meta.refs > 0 && extent.pinned > 0) --extent.pinned;
@@ -728,6 +736,8 @@ void SlabAllocator::FreeSlotLocked(uint32_t index) {
       cls.ext_rr.size() > kStripeWays) {
     DropExtentFreeLocked(cls, extent_index);
     --cls.bound_extents;
+    --cls.empty_extents;
+    --empty_extents_;
     extent = ExtentMeta{};
     ++unbound_;
     ++extent_returns_;
@@ -801,6 +811,32 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealExtentFor(
   return StealExtentLocked(static_cast<uint32_t>(best), target_cls, evicted);
 }
 
+// An extent of another class with no resident (hence no pin and no
+// protection): moving it loses no value. A class that is being written keeps
+// its striping width of extents with free slots (Options::stripe_ways); an
+// idle one, without a Put for one cold window, gives every empty extent.
+// The counts keep the common case, no candidate at all, off the extents.
+SlabAllocator::ExtentBindResult SlabAllocator::TakeEmptyExtentFor(
+    size_t target_cls) {
+  if (empty_extents_ == classes_[target_cls].empty_extents)
+    return ExtentBindResult::kUnavailable;
+  const uint64_t window = cold_window_ ? cold_window_ : index_.size();
+  int donor = -1;
+  for (size_t c = 0; c < classes_.size() && donor < 0; ++c) {
+    const Class& cls = classes_[c];
+    if (c == target_cls || cls.empty_extents == 0) continue;
+    const bool idle = put_seq_ - cls.last_put_seq > window;
+    if (idle || cls.ext_rr.size() > kStripeWays) donor = static_cast<int>(c);
+  }
+  if (donor < 0) return ExtentBindResult::kUnavailable;
+  for (uint32_t e = 0; e < extents_.size(); ++e) {
+    const ExtentMeta& extent = extents_[e];
+    if (extent.cls == donor && extent.resident_count == 0)
+      return StealExtentLocked(e, target_cls, nullptr);
+  }
+  return ExtentBindResult::kUnavailable;
+}
+
 SlabAllocator::ExtentBindResult SlabAllocator::StealColdExtentFor(
     size_t target_cls, std::vector<BlockKey>* evicted) {
   if (!cold_steal_enabled_) return ExtentBindResult::kUnavailable;
@@ -809,10 +845,12 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealColdExtentFor(
   const uint64_t cold_before = put_seq_ - window;
   // What this class would evict instead: a candidate has to be much colder.
   const int own = LeastRecentlyUsedExtentLocked(target_cls);
+  // Of the extents that qualify, the least recently used on average, as the
+  // other steals choose. Read heat decays to nothing within about 700
+  // operations, so ordering by it (and then by fewest useful bytes) took, at
+  // any realistic operation rate, the emptiest qualifying extent however
+  // recently it had been read.
   int best = -1;
-  uint64_t best_heat = std::numeric_limits<uint64_t>::max();
-  uint64_t best_useful = std::numeric_limits<uint64_t>::max();
-  uint64_t best_seq = std::numeric_limits<uint64_t>::max();
   for (uint32_t e = 0; e < extents_.size(); ++e) {
     const ExtentMeta& extent = extents_[e];
     if (extent.cls == kUnbound || extent.cls == static_cast<int>(target_cls) ||
@@ -821,16 +859,9 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealColdExtentFor(
         (own >= 0 &&
          !MuchColderLocked(extent, extents_[static_cast<size_t>(own)])))
       continue;
-    const uint64_t heat = ExtentHeatLocked(extent);
-    if (best < 0 || heat < best_heat ||
-        (heat == best_heat && extent.useful_bytes < best_useful) ||
-        (heat == best_heat && extent.useful_bytes == best_useful &&
-         extent.youngest_seq < best_seq)) {
+    if (best < 0 ||
+        StealsBeforeLocked(extent, extents_[static_cast<size_t>(best)]))
       best = static_cast<int>(e);
-      best_heat = heat;
-      best_useful = extent.useful_bytes;
-      best_seq = extent.youngest_seq;
-    }
   }
   if (best < 0) return ExtentBindResult::kUnavailable;
   const ExtentBindResult result =
@@ -860,8 +891,11 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealExtentLocked(
     ++evictions_;
   }
   if (extents_[extent_index].cls != kUnbound) {
-    DropExtentFreeLocked(classes_[static_cast<size_t>(old_cls)], extent_index);
-    --classes_[static_cast<size_t>(old_cls)].bound_extents;
+    Class& old_class = classes_[static_cast<size_t>(old_cls)];
+    DropExtentFreeLocked(old_class, extent_index);
+    --old_class.bound_extents;
+    --old_class.empty_extents;  // its residents were all freed above
+    --empty_extents_;
     extents_[extent_index] = ExtentMeta{};
     ++unbound_;
   }
@@ -929,6 +963,14 @@ bool SlabAllocator::Put(const BlockKey& key, size_t len, SlotRef* out,
       break;
     }
     if (PopFreeLocked(cls, &placement)) break;
+    // No free slot of its own and none unbound: first an extent another
+    // class holds empty, which costs nobody a value; then (below) values,
+    // the oldest of this class unless another class's are much older.
+    {
+      const ExtentBindResult empty = TakeEmptyExtentFor(cls_index);
+      if (empty == ExtentBindResult::kBound) continue;
+      if (empty == ExtentBindResult::kPersistenceError) return false;
+    }
     if (cls.bound_extents < kStripeWays) {
       const ExtentBindResult grow =
           StealExtentFor(cls_index, evicted, kStripeWays);
@@ -971,6 +1013,7 @@ bool SlabAllocator::Put(const BlockKey& key, size_t len, SlotRef* out,
   Class& cls = classes_[cls_index];
   ExtentMeta& extent = extents_[placement.extent];
   ++cls.puts;
+  cls.last_put_seq = insert_seq;
   cls.useful_bytes += len;
   --extent.free_slots;
   extent.useful_bytes += len;

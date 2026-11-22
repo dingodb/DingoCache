@@ -699,6 +699,71 @@ TEST(SlabAllocator, ColdDonorStolenBeforeSelfEviction) {
   ::unsetenv("DFKV_SLAB_COLD_STEAL_WINDOW");
 }
 
+// The cold steal takes the qualifying extent whose residents are least
+// recently used, like every other steal. Read heat decays within a few
+// hundred operations, and ordering by it and then by fewest useful bytes
+// took the emptiest qualifying extent, here one read more recently than all
+// the others.
+TEST(SlabAllocator, ColdStealTakesTheLeastRecentlyUsedExtent) {
+  ::setenv("DFKV_SLAB_COLD_STEAL_WINDOW", "6", 1);
+  SlabAllocator a(Opts(4 * 4096, 16));
+  ::unsetenv("DFKV_SLAB_COLD_STEAL_WINDOW");
+  std::vector<BlockKey> ev;
+  SlotRef r;
+  std::vector<uint32_t> extent_of(16);
+  for (int i = 0; i < 16; ++i) {  // A: 8192-byte slots, 2 per extent
+    ASSERT_TRUE(a.Put(Key("stale" + std::to_string(i)), 8192, &r, &ev));
+    extent_of[i] = r.extent;
+  }
+  for (int i = 0; i < 32; ++i)  // B: 4096-byte slots, 4 per extent
+    ASSERT_TRUE(a.Put(Key("hot" + std::to_string(i)), 4096, &r, &ev));
+  // One A extent loses a resident and has its other one read: it holds the
+  // fewest useful bytes, and it is the most recently used of A. (Filling B
+  // took some A extents; pick one whose two residents are both still there.)
+  auto present = [&](int i) {
+    return a.Contains(Key("stale" + std::to_string(i)));
+  };
+  int lost = -1, partner = -1;
+  for (int i = 0; i < 16 && partner < 0; ++i)
+    for (int j = i + 1; j < 16 && partner < 0; ++j)
+      if (extent_of[i] == extent_of[j] && present(i) && present(j)) {
+        lost = i;
+        partner = j;
+      }
+  ASSERT_GE(partner, 0);
+  // Every other A extent left with one resident gives it up, so that the
+  // extent of `partner` is the only one of A with fewer useful bytes.
+  for (int i = 0; i < 16; ++i) {
+    if (!present(i)) continue;
+    bool alone = true;
+    for (int j = 0; j < 16; ++j)
+      if (j != i && extent_of[j] == extent_of[i] && present(j)) alone = false;
+    if (alone)
+      ASSERT_EQ(a.Remove(Key("stale" + std::to_string(i))),
+                SlabAllocator::RemoveResult::kRemoved);
+  }
+  ASSERT_EQ(a.Remove(Key("stale" + std::to_string(lost))),
+            SlabAllocator::RemoveResult::kRemoved);
+  ASSERT_TRUE(a.Get(Key("stale" + std::to_string(partner)), &r));
+  // Long enough for read heat to decay away; B stays the warmest class.
+  for (int round = 0; round < 40; ++round)
+    for (int i = 0; i < 32; ++i)
+      ASSERT_TRUE(a.Get(Key("hot" + std::to_string(i)), &r));
+  // B writes on with no free slot: one A extent is stolen.
+  const uint64_t cold_steals = a.ColdSteals();
+  bool stolen = false;
+  for (int i = 32; i < 96 && !stolen; ++i) {
+    ev.clear();
+    ASSERT_TRUE(a.Put(Key("hot" + std::to_string(i)), 4096, &r, &ev));
+    for (const auto& k : ev)
+      if (KeyName(k).rfind("stale", 0) == 0) stolen = true;
+  }
+  ASSERT_TRUE(stolen);
+  EXPECT_EQ(a.ColdSteals(), cold_steals + 1);
+  EXPECT_TRUE(a.Contains(Key("stale" + std::to_string(partner))))
+      << "the most recently read A extent went first (fewest useful bytes)";
+}
+
 TEST(SlabAllocator, ColdStealDisabledFallsBackToSelfEvict) {
   ::setenv("DFKV_SLAB_COLD_STEAL_WINDOW", "0", 1);  // disable
   SlabAllocator a(Opts(4 * 4096, 16));
@@ -1484,6 +1549,67 @@ TEST(SlabAllocator, GrowthFirstRespectsDonorFloor) {
 
 // A class at or above kStripeWays extents behaves exactly as before: steady-
 // state churn is self-eviction, not stealing (growth-first is bootstrap-only).
+// A class without a free slot takes an extent another class holds empty
+// before it evicts anything, even when the other class is down to its
+// striping floor, if that class has written nothing for a cold window:
+// moving an empty extent costs no value.
+TEST(SlabAllocator, PutTakesAnEmptyExtentOfAnotherClassBeforeEvicting) {
+  ::setenv("DFKV_SLAB_COLD_STEAL_WINDOW", "4", 1);
+  SlabAllocator a(Opts(64 * 1024, 16));  // 16 extents
+  ::unsetenv("DFKV_SLAB_COLD_STEAL_WINDOW");
+  std::vector<uint32_t> one_slot;        // slot sizes with one slot per extent
+  for (const auto& c : a.Classes())
+    if (c.slots_per_extent == 1) one_slot.push_back(c.slot_size);
+  ASSERT_GE(one_slot.size(), 3u);
+  const uint32_t sa = one_slot[0], sb = one_slot[1], sc = one_slot[2];
+  std::vector<BlockKey> ev;
+  SlotRef r;
+  // A binds its striping width of empty extents beyond what it fills.
+  for (int i = 0; i < 6; ++i)
+    ASSERT_TRUE(a.Put(Key("a" + std::to_string(i)), sa, &r, &ev));
+  for (int i = 0; i < 6; ++i)
+    ASSERT_TRUE(a.Put(Key("b" + std::to_string(i)), sb, &r, &ev));
+  // A holds 10 extents now, 4 of them empty, and 15 values need 15 of the
+  // 16 extents. Taking two of A's empty extents brings A to its floor of 8
+  // (2 empty); the third C value used to evict one of C's own.
+  ASSERT_EQ(a.Classes()[ClassIndex(a, sa)].extents, 10u);
+  for (int i = 0; i < 3; ++i)
+    ASSERT_TRUE(a.Put(Key("c" + std::to_string(i)), sc, &r, &ev));
+  EXPECT_TRUE(ev.empty()) << "a value was evicted with an empty extent left";
+  EXPECT_EQ(a.Evictions(), 0u);
+  for (int i = 0; i < 3; ++i)
+    EXPECT_TRUE(a.Contains(Key("c" + std::to_string(i)))) << i;
+}
+
+// ...but a class that is being written keeps its striping width of extents
+// with free slots, empty or not: the writer evicts from its own class.
+TEST(SlabAllocator, AClassBeingWrittenKeepsItsEmptyStripes) {
+  SlabAllocator a(Opts(64 * 1024, 16));  // 16 extents
+  std::vector<uint32_t> one_slot;
+  for (const auto& c : a.Classes())
+    if (c.slots_per_extent == 1) one_slot.push_back(c.slot_size);
+  ASSERT_GE(one_slot.size(), 2u);
+  const uint32_t sa = one_slot[0], sb = one_slot[1];
+  std::vector<BlockKey> ev;
+  SlotRef r;
+  // A: 2 values, and 7 empty extents of striping headroom.
+  for (int i = 0; i < 2; ++i)
+    ASSERT_TRUE(a.Put(Key("a" + std::to_string(i)), sa, &r, &ev));
+  ASSERT_EQ(a.Classes()[ClassIndex(a, sa)].extents, 9u);
+  // B takes the other 7, and one of A's through its floor steal (A has more
+  // than 8).
+  for (int i = 0; i < 8; ++i)
+    ASSERT_TRUE(a.Put(Key("b" + std::to_string(i)), sb, &r, &ev));
+  ASSERT_EQ(a.Classes()[ClassIndex(a, sa)].extents, 8u);
+  ASSERT_TRUE(ev.empty());
+  // A writes on. B, at its floor, evicts its own value: A keeps 8.
+  ASSERT_TRUE(a.Put(Key("a2"), sa, &r, &ev));
+  ASSERT_TRUE(a.Put(Key("b8"), sb, &r, &ev));
+  EXPECT_EQ(a.Classes()[ClassIndex(a, sa)].extents, 8u);
+  ASSERT_EQ(ev.size(), 1u);
+  EXPECT_EQ(KeyName(ev[0]).rfind("b", 0), 0u);
+}
+
 TEST(SlabAllocator, MatureClassStillSelfEvicts) {
   SlabAllocator a(Opts(4096, 16));  // 16 extents x 1 slot, one class
   std::vector<BlockKey> ev;

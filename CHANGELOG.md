@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Server, slab store: a cold steal (a growing size class taking an extent
+  from a much colder class) now takes the qualifying extent whose residents
+  were used least recently, as the other extent steals do. It ordered the
+  candidates by read heat and then by fewest useful bytes; read heat decays
+  to nothing within some hundreds of operations, so it took the emptiest
+  qualifying extent, however recently its residents had been read. And a
+  write that finds no free slot of its class and no unbound extent now
+  takes an extent another class holds empty before it evicts anything, if
+  that class has written nothing for a cold window (a class that is being
+  written keeps its striping width of extents with free slots); it evicted
+  one of its own values when the other class was at its floor of eight
+  extents.
 - Docs: `docs/ARCHITECTURE.md` no longer says that a PUT through the RAM
   tier waits for its disk flush. In the default write-back mode it returns
   once the value is in RAM (RAM-ACK); `DFKV_PUT_ACK_MODE=disk` or a zero
