@@ -283,6 +283,10 @@ size-class lattice and carves them into uniform slots:
   the cold steal, when another class's extent is much older than this
   class's own oldest; then this class's own CLOCK eviction; then the last
   resort steal.
+- **Free-slot headroom:** every 50 ms (disk) or 10 ms (RAM tier) a
+  background pass evicts ahead of the writers of each class written since
+  the last pass, up to twice the admissions of a pass, but at least 64 MiB
+  and at most 1 GiB of slots, and at most a quarter of the class.
 - **Whole extents follow the data that is used:** both ways of moving a
   whole extent to a class that is being written, the background growth
   (`StealFrom`) and the cold steal inside `Put`, take a donor's extent only

@@ -490,7 +490,8 @@ void RamTier::ReclaimTick(Shard& s, size_t /*shard_idx*/) {
     if (delta[i] == 0) continue;
     const auto& c = classes[i];
     size_t free_now = c.free_slots;
-    const size_t want = std::max<size_t>(64, static_cast<size_t>(2 * delta[i]));
+    const size_t want = SlabAllocator::FreeSlotTarget(
+        delta[i], c.slot_size, std::numeric_limits<size_t>::max());
     if (free_now >= want || c.slots_per_extent == 0 || s.alloc->PoolExtents() > 0)
       continue;
     size_t need_ext =
@@ -527,9 +528,8 @@ void RamTier::ReclaimTick(Shard& s, size_t /*shard_idx*/) {
   for (size_t i = 0; i < classes.size(); ++i) {
     if (delta[i] == 0) continue;  // no write demand on this class
     const auto& c = classes[i];
-    const size_t capacity = c.resident + c.free_slots;
-    size_t target = std::max<size_t>(64, static_cast<size_t>(2 * delta[i]));
-    target = std::min(target, capacity / 4);
+    const size_t target = SlabAllocator::FreeSlotTarget(
+        delta[i], c.slot_size, c.resident + c.free_slots);
     if (c.free_slots >= target) continue;
     size_t budget = 4096;  // per-tick per-class bound
     size_t clear_limited_calls = 0;

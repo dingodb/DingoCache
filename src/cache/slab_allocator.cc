@@ -1193,6 +1193,16 @@ size_t SlabAllocator::ColdestGrowDonor(const std::vector<ClassStat>& classes,
   return donor;
 }
 
+size_t SlabAllocator::FreeSlotTarget(uint64_t puts, uint32_t slot_size,
+                                     size_t capacity) {
+  if (slot_size == 0) return 0;
+  const uint64_t floor = std::clamp<uint64_t>(
+      (kFreeTargetFloorBytes + slot_size - 1) / slot_size, 2, 64);
+  const uint64_t cap = std::max<uint64_t>(floor, kFreeTargetCapBytes / slot_size);
+  const uint64_t want = std::min(std::max(2 * puts, floor), cap);
+  return static_cast<size_t>(std::min<uint64_t>(want, capacity / 4));
+}
+
 size_t SlabAllocator::ReclaimClass(size_t cls_index, size_t target_free,
                                    size_t max_victims,
                                    std::vector<BlockKey>* evicted,

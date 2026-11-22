@@ -1358,6 +1358,30 @@ TEST(SlabAllocator, GrowDonorComparesDemandInBytes) {
             classes.size());
 }
 
+// The free slots a reclaim pass keeps ahead of a class's writers are bounded
+// in bytes: two passes of admissions, at least 64 MiB and at most 1 GiB of
+// slots (and at most a quarter of the class). A fixed floor of 64 slots was
+// 2 GiB of 32 MiB slots evicted ahead of need, and twice a pass of small
+// admissions could hold a quarter of a large class free.
+TEST(SlabAllocator, FreeSlotTargetIsBoundedInBytes) {
+  const size_t big = std::numeric_limits<size_t>::max();
+  constexpr uint32_t kSmall = 4096, kLarge = 32u << 20;
+  // Small slots: the floor stays 64 slots; the cap is 1 GiB of them.
+  EXPECT_EQ(SlabAllocator::FreeSlotTarget(10, kSmall, big), 64u);
+  EXPECT_EQ(SlabAllocator::FreeSlotTarget(1000, kSmall, big), 2000u);
+  EXPECT_EQ(SlabAllocator::FreeSlotTarget(1000000, kSmall, big),
+            (1u << 30) / kSmall);
+  // Large slots: a floor of 64 MiB (2 slots), a cap of 1 GiB (32 slots).
+  EXPECT_EQ(SlabAllocator::FreeSlotTarget(0, kLarge, big), 2u);
+  EXPECT_EQ(SlabAllocator::FreeSlotTarget(1, kLarge, big), 2u);
+  EXPECT_EQ(SlabAllocator::FreeSlotTarget(10, kLarge, big), 20u);
+  EXPECT_EQ(SlabAllocator::FreeSlotTarget(100, kLarge, big), 32u);
+  // Never more than a quarter of the class.
+  EXPECT_EQ(SlabAllocator::FreeSlotTarget(10, kSmall, 100), 25u);
+  EXPECT_EQ(SlabAllocator::FreeSlotTarget(100, kLarge, 40), 10u);
+  EXPECT_EQ(SlabAllocator::FreeSlotTarget(10, 0, big), 0u);
+}
+
 // StealFrom moves exactly one extent: the donor's residents on that extent are
 // evicted, the target class gains its capacity, everything else survives.
 TEST(SlabAllocator, StealFromMovesOneExtentDonorToTarget) {
@@ -2570,7 +2594,9 @@ struct HeatScenario {
     }
     for (size_t hot = 0; hot < classes.size(); ++hot) {
       if (delta[hot] == 0) continue;
-      const size_t want = std::max<size_t>(64, 2 * delta[hot]);
+      const size_t want = SlabAllocator::FreeSlotTarget(
+          delta[hot], classes[hot].slot_size,
+          std::numeric_limits<size_t>::max());
       if (classes[hot].free_slots >= want) continue;
       size_t taken = 0;
       while (taken < max_extents) {

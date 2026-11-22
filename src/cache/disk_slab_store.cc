@@ -2677,8 +2677,9 @@ uint64_t DiskSlabStore::EvictedBytes() const {
 // last pass) gives any, its empty ones first. StealFrom still refuses an
 // extent whose residents are not much colder than the hot class's own.
 //
-// RECLAIM: then top free slots up to the demand-driven watermark (~2 intervals
-// of the insert rate, capped at 1/4 of bound capacity) in bounded batches per
+// RECLAIM: then top free slots up to the demand-driven watermark
+// (SlabAllocator::FreeSlotTarget: ~2 intervals of the insert rate, between
+// 64 MiB and 1 GiB of slots, at most 1/4 of the class) in bounded batches per
 // lock hold, so Put never waits behind an inline CLOCK sweep.
 void DiskSlabStore::ReclaimTick(
     const std::function<void()>& after_watermark_evict) {
@@ -2766,7 +2767,10 @@ void DiskSlabStore::ReclaimTick(
     if (delta[i] == 0) continue;  // no write demand on this class
     const auto& c = classes[i];
     size_t free_now = c.free_slots;
-    const size_t want = std::max<size_t>(64, static_cast<size_t>(2 * delta[i]));
+    // Growth aims at the free-slot target without its quarter-of-the-class
+    // bound: a class too small for its writers is what growth is for.
+    const size_t want = SlabAllocator::FreeSlotTarget(
+        delta[i], c.slot_size, std::numeric_limits<size_t>::max());
     // -- GROW --
     if (free_now < want && c.slots_per_extent > 0 && alloc_->PoolExtents() == 0) {
       size_t need_ext =
@@ -2793,8 +2797,8 @@ void DiskSlabStore::ReclaimTick(
       }
     }
     // -- RECLAIM --
-    const size_t capacity = c.resident + free_now;
-    const size_t target = std::min(want, capacity / 4);
+    const size_t target = SlabAllocator::FreeSlotTarget(
+        delta[i], c.slot_size, c.resident + free_now);
     if (free_now >= target) continue;
     size_t budget = 4096;  // per-tick per-class bound
     for (;;) {

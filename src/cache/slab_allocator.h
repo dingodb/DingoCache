@@ -228,6 +228,18 @@ class SlabAllocator {
                                  const std::vector<uint64_t>& delta,
                                  const std::vector<uint32_t>& extents,
                                  size_t hot, size_t floor);
+  // Free slots a tier's reclaim pass keeps ahead of the writers of a class
+  // with `slot_size` slots, `capacity` slots (resident plus free) and
+  // `puts` admissions since the last pass: two passes of admissions, but at
+  // least kFreeTargetFloorBytes and at most kFreeTargetCapBytes of slots,
+  // and never more than a quarter of the class. The bounds are in bytes so
+  // that a class of 64 KiB slots and one of 32 MiB slots keep the same
+  // headroom, not the same number of slots (64 slots of 32 MiB were 2 GiB
+  // evicted ahead of need).
+  static constexpr uint64_t kFreeTargetFloorBytes = 64ull << 20;
+  static constexpr uint64_t kFreeTargetCapBytes = 1ull << 30;
+  static size_t FreeSlotTarget(uint64_t puts, uint32_t slot_size,
+                               size_t capacity);
   // Moves the donor's least recently used extent (an empty one first) to
   // `target_cls`, evicting its residents. False if the donor has no extent
   // that may go: all pinned or protected, or even its least recently used
