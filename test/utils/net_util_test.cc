@@ -73,3 +73,61 @@ TEST(NetDial, TimedConnectWorksWithFdAboveFdSetsize) {
   for (int d : hold) ::close(d);
   ::close(lfd);
 }
+
+TEST(NetPeerAddress, NamesTheRemoteEndOfAConnectedSocket) {
+  auto [lfd, port] = Listen();
+  const int client = net::Dial("127.0.0.1:" + std::to_string(port), 1000, 1000);
+  ASSERT_GE(client, 0);
+  const int accepted = ::accept(lfd, nullptr, nullptr);
+  ASSERT_GE(accepted, 0);
+
+  EXPECT_EQ(net::PeerAddress(client), "127.0.0.1:" + std::to_string(port));
+  // The accepted side sees the client's ephemeral port: what a server logs.
+  sockaddr_in local{};
+  socklen_t length = sizeof(local);
+  ASSERT_EQ(::getsockname(client, reinterpret_cast<sockaddr*>(&local), &length),
+            0);
+  EXPECT_EQ(net::PeerAddress(accepted),
+            "127.0.0.1:" + std::to_string(ntohs(local.sin_port)));
+
+  ::close(accepted);
+  ::close(client);
+  ::close(lfd);
+}
+
+TEST(NetPeerAddress, SocketsWithoutAnIpPeerAreUnknown) {
+  auto [lfd, port] = Listen();
+  (void)port;
+  EXPECT_EQ(net::PeerAddress(lfd), "unknown") << "listening, not connected";
+  ::close(lfd);
+  int pair[2] = {-1, -1};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair), 0);
+  EXPECT_EQ(net::PeerAddress(pair[0]), "unknown");
+  ::close(pair[0]);
+  ::close(pair[1]);
+  EXPECT_EQ(net::PeerAddress(-1), "unknown");
+}
+
+TEST(NetPeerAddress, BracketsAnIpv6Peer) {
+  const int lfd = ::socket(AF_INET6, SOCK_STREAM, 0);
+  if (lfd < 0) GTEST_SKIP() << "no IPv6 sockets";
+  sockaddr_in6 sa{};
+  sa.sin6_family = AF_INET6;
+  sa.sin6_addr = in6addr_loopback;
+  if (::bind(lfd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
+    ::close(lfd);
+    GTEST_SKIP() << "no IPv6 loopback address";
+  }
+  ASSERT_EQ(::listen(lfd, 1), 0);
+  socklen_t length = sizeof(sa);
+  ASSERT_EQ(::getsockname(lfd, reinterpret_cast<sockaddr*>(&sa), &length), 0);
+  const int client = ::socket(AF_INET6, SOCK_STREAM, 0);
+  ASSERT_GE(client, 0);
+  ASSERT_EQ(::connect(client, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)), 0);
+
+  EXPECT_EQ(net::PeerAddress(client),
+            "[::1]:" + std::to_string(ntohs(sa.sin6_port)));
+
+  ::close(client);
+  ::close(lfd);
+}

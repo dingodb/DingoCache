@@ -144,6 +144,29 @@ inline int Dial(const std::string& addr, int connect_ms = 0, int io_ms = 0) {
   return fd;
 }
 
+// Remote address of a connected socket as "ip:port" ("[ip]:port" for IPv6),
+// or "unknown" when the socket has no IP peer (unconnected, AF_UNIX). For log
+// lines only: one syscall plus formatting, so not for a per-request path.
+inline std::string PeerAddress(int fd) {
+  sockaddr_storage storage{};
+  socklen_t length = sizeof(storage);
+  if (::getpeername(fd, reinterpret_cast<sockaddr*>(&storage), &length) != 0)
+    return "unknown";
+  char ip[INET6_ADDRSTRLEN] = {0};
+  if (storage.ss_family == AF_INET) {
+    const auto* v4 = reinterpret_cast<const sockaddr_in*>(&storage);
+    if (!::inet_ntop(AF_INET, &v4->sin_addr, ip, sizeof(ip))) return "unknown";
+    return std::string(ip) + ":" + std::to_string(ntohs(v4->sin_port));
+  }
+  if (storage.ss_family == AF_INET6) {
+    const auto* v6 = reinterpret_cast<const sockaddr_in6*>(&storage);
+    if (!::inet_ntop(AF_INET6, &v6->sin6_addr, ip, sizeof(ip)))
+      return "unknown";
+    return "[" + std::string(ip) + "]:" + std::to_string(ntohs(v6->sin6_port));
+  }
+  return "unknown";
+}
+
 }  // namespace net
 }  // namespace dfkv
 

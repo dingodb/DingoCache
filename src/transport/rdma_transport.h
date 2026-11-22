@@ -27,7 +27,9 @@
 #include "transport/transport.h"
 #include "transport/rail_select.h"
 #include "transport/rdma_resource_budget.h"
+#include "transport/rdma_wc_status.h"
 #include "transport/remote_rail_health.h"
+#include "utils/log_throttle.h"
 
 namespace dfkv {
 namespace rdma {
@@ -199,6 +201,10 @@ class RdmaTransport : public Transport {
   void Destroy(Conn* c,
                rdma::RailCompletion completion =
                    rdma::RailCompletion::kAdmission);
+  // Counts and logs the failed work completion, if any, that the endpoint of
+  // a connection about to be destroyed reaped. Observation only: it reads the
+  // verdict the caller already reached and changes no retry or health state.
+  void NoteFailedCompletion(Conn& c, rdma::RailCompletion completion);
   void MarkActive(Conn* c, Lane lane);
   void MarkInactive(Conn* c);
   void MarkLive(Conn* c);
@@ -428,6 +434,15 @@ class RdmaTransport : public Transport {
   // RailPolicy::Snapshot rather than labeled by arbitrary node addresses.
   std::atomic<uint64_t> numa_caller_unknown_fallbacks_{0};
   std::atomic<uint64_t> numa_no_local_fallbacks_{0};
+  // Connections lost to a failed work completion, per local rail and status of
+  // the first failed completion (rail * rdma::kWcStatusSlots + status slot).
+  // Peers are deliberately not a dimension: their addresses are unbounded and
+  // go to the throttled log line instead.
+  std::unique_ptr<std::atomic<uint64_t>[]> rail_wc_errors_;
+  // Bounds that log line; keyed by peer, rail, status and vendor syndrome.
+  // Both are touched only when a connection dies, and are declared last so
+  // the counters above, which operations update, keep their layout.
+  LogThrottle completion_error_log_;
   // #1: async CQ reaper for high-concurrency batch operations
 };
 

@@ -203,6 +203,7 @@ RDMA-listener scrape inventory。
 | `dfkv_uring_reads_total` / `dfkv_uring_init_fallbacks_total` | counter | io_uring 路径实际读 / 初始化失败回退同步连接数 |
 | `dfkv_rdma_rail_active_conns{dev}` | gauge | 每个本地 HCA 上当前连接数 |
 | `dfkv_rdma_rail_completions_total{dev}` / `dfkv_rdma_rail_completion_errors_total{dev}` | counter | 每 rail 请求完成 / 错误完成 |
+| `dfkv_rdma_rail_wc_errors_total{dev,status}` | counter | 上一行错误完成按 work completion status 分解；每条连接在首个失败完成处终止，所以同一 `dev` 各 `status` 之和等于 `dfkv_rdma_rail_completion_errors_total{dev}`。series 在首次出现时才导出，告警用上一行的总量；对端地址不做 label，见 §3.7 |
 | `dfkv_rdma_rail_put_writes_total{dev}` / `dfkv_rdma_rail_put_bytes_total{dev}` | counter | 每 rail 收到的 PUT one-sided writes / payload bytes |
 
 RAM zero-copy pull 的 cache-hit、read-bytes 和采样 GET 延迟在有效 PullRelease
@@ -416,6 +417,7 @@ C 客户端快照还含传输级指标（RDMA 构建）：
 | `dfkv_rdma_client_rail_quarantines_total{dev}` / `dfkv_rdma_client_rail_quarantined{dev}` / `dfkv_rdma_client_rail_recovery_probe{dev}` / `dfkv_rdma_client_rail_recoveries_total{dev}` | counter / gauge / gauge / counter | 连续 3 次 client-local failure 后隔离（默认 cooldown 5000 ms）/ 隔离状态 / cooldown 到期后唯一真实 probe / probe 成功恢复；probe local failure 重启 cooldown，endpoint failure 只释放 probe ownership |
 | `dfkv_rdma_client_numa_fallbacks_total{reason="caller_unknown\|no_local_rail"}` | counter | `DFKV_RDMA_NUMA=1` 无法建立 local mask 而回退全部 enabled rails |
 | `dfkv_rdma_cq_completions_total` / `dfkv_rdma_cq_errors_total` | counter | client CQ 完成 / 错误完成 |
+| `dfkv_rdma_client_rail_wc_errors_total{dev,status}` | counter | 因 work completion 失败而销毁的连接数，按本地 rail 和首个失败完成的 status 分解（随后被 flush 的完成不重复计，所以不等于 `dfkv_rdma_cq_errors_total`）。series 在首次出现时才导出，告警用 `dfkv_rdma_cq_errors_total`；对端地址不做 label，见 §3.7。目前只在原生 C 快照里，未加入插件镜像 allowlist |
 | `dfkv_rdma_client_pipeline_depth` | gauge | 握手解析后的有效 pipeline depth |
 | `dfkv_rdma_client_pool_connections{lane,state=\"idle|active\",dev}` | gauge | endpoint 按最后/当前 operation lane、ownership state 和 rail 分解；active 不含已隔离连接 |
 | `dfkv_rdma_client_peer_connections{peer,dev}` | gauge | 当前 live endpoint 按 MDS stable peer identity 与本地 rail 分解；连接销毁后 series 删除，cardinality 受 endpoint budget 上限约束 |
@@ -564,11 +566,85 @@ allow-listed counter/gauge，而不是只镜像 ring/MDS。名称固定为
 split-brain、MDS/etcd 漂移和自报不一致均由脚本以 `critical` + exit `2` 给出，
 JSON `issues[].code/message` 包含具体 endpoint/node 和处置方向。
 
+### 3.7 RDMA 失败完成的归因（日志行 + 分 status 计数）
+
+一次 work completion 失败（例如 `IBV_WC_RETRY_EXC_ERR`，status 12）后，要回答的是
+“哪个对端、本地哪条 rail、哪个操作、什么 status”。计数器回答 rail 和 status，
+日志行补上对端和操作：
+
+- 计数：client `dfkv_rdma_client_rail_wc_errors_total{dev,status}`，server
+  `dfkv_rdma_rail_wc_errors_total{dev,status}`。`status` 取 verbs 枚举名去掉
+  `IBV_WC_` 前缀的小写形式，共 24 个已知值，表外的值一律记为 `other`，label 集合
+  有上界。常见值：`wr_flush_err`(5)、`rem_access_err`(10)、`retry_exc_err`(12)、
+  `rnr_retry_exc_err`(13)、`resp_timeout_err`(20)、`general_err`(21)。
+- 这两个 family 的 series 在某个 (`dev`, `status`) 第一次失败时才出现，初值就是 1，
+  `increase()` / `rate()` 会漏掉每个组合的第一次失败。**告警用一直存在的总量**：
+  server `dfkv_rdma_rail_completion_errors_total{dev}`（或
+  `dfkv_rdma_completion_errors_total`），client `dfkv_rdma_cq_errors_total`；分 status
+  的 series 用来在告警之后做分解。
+- 对端地址数量没有上界（server 侧是来来去去的 client），所以**不做 label**，只进
+  日志。
+
+client（WARN，连接因失败完成被销毁时打印）：
+
+```
+rdma client CQ failure peer=<ip:port> peer_id=<MDS identity 或 -> dev=<本地 rail> op=<操作>
+  status=<数字> status_name=<名字> vendor=<vendor_err> wr_id=<slot> qp=<本端 QPN>
+  lane=<payload|sg|control> pooled=<0|1> idle_ms=<n> verdict=<rail|endpoint|neutral> suppressed=<n>
+```
+
+- `op`：失败时该 slot 上在途的请求，取值 `put` / `lease_put` / `pull_range` /
+  `pull_release` / `exist` / `lookup` / `remove` / `retain` / `members` /
+  `keepalive` / `unknown`。GET 的 one-sided READ 阶段记为 `pull_range`。
+- `pooled=1` 表示这条连接此前完成过业务操作（来自连接池）；`idle_ms` 是距上一次
+  业务操作完成的时间，`pooled=0` 时为 0。
+- `verdict` 是这次失败记到了哪一边：`rail` 对应
+  `dfkv_rdma_client_rail_errors_total`，`endpoint` 对应
+  `dfkv_rdma_client_endpoint_errors_total`。
+- 只有 deadline 超时、没有失败完成的窗口不打印这一行，看
+  `dfkv_rdma_client_completion_timeouts_total`。保活探测最多等 100 ms，而对端 QP
+  已不存在时重传耗尽要更久，所以这种探测多数以超时结束，只计入
+  `dfkv_rdma_client_keepalive_failures_total`；`op=keepalive` 只在失败完成赶在这
+  100 ms 内到达时出现。
+- 这一行限频（每个 transport 实例各自计）：10 秒窗口内同一
+  (对端, rail, status, vendor) 只打一行，同一 status 下 vendor 不同算不同的失败、各打
+  一行；一个窗口最多 32 个不同组合，超出的组合在该窗口内不打印。没打出来的次数
+  不分对端和 status 合计成一个数，由下一条打印出来的行在 `suppressed` 里带出（可能
+  隔很久、也可能是别的对端的行）。计数器不受限频影响，数量以计数器为准。
+
+server（WARN，每条失败的连接各打一行，不限频；原有字段和顺序不变，在行尾追加
+`status_name` 起的 4 个字段）：
+
+```
+rdma server CQ failure loop=<sync|uring> status=<数字> opcode_raw=<n> vendor=<vendor_err> wr_id=<slot>
+  qp=<本端 QPN> peer_qp=<对端 QPN> depth=<n> free_send=<n> queued_recv=<n> posted_sends=<n>
+  status_name=<名字> dev=<本地 rail> peer=<ip:port> age_ms=<连接存活时间>
+```
+
+建连行 `rdma conn: ... qp=<n> peer_qp=<n>` 同样追加了 `dev=<本地 rail> peer=<ip:port>`。
+失败完成不保证带有效 opcode，所以 server 行没有操作名，只有 `loop` 和原始字段。
+
+读法：
+
+- client 行的 `qp` 就是 server 两条日志里的 `peer_qp`，可以把同一条连接在两端的记录
+  对上。client 行的 `peer` 是 server 的 bootstrap 地址；server 行的 `peer` 是 client
+  的 IP 加这条连接 bootstrap 时用的临时端口。
+- `retry_exc_err` 且 `pooled=1`、`idle_ms` 不小于 server 的空闲回收窗口
+  （`DFKV_RDMA_IDLE_MS`）：通常是 server 已回收这条空闲连接，对照该 server 的
+  `dfkv_rdma_idle_reclaims_total`、`dfkv_rdma_segment_evictions_total`。
+- `retry_exc_err` 且 `pooled=0`：新建连接上的请求始终没有送达，优先查这条 rail 到
+  该对端的路径，以及对端同名 rail 的状态。
+- 同一 `dev` 上对多个对端同时出现，指向本地 rail 或其上游；只有一个对端，指向那个
+  对端。
+
 ## 4. 性能保证
 
 - 热路径计数：`std::atomic` relaxed `fetch_add`，零锁零分配（与既有模式一致）。
 - 延迟：1/64 采样（`Sampler` 掩码），仅采样到的 op 读 vDSO 时钟。
 - HTTP `/metrics`：独立端口 + 线程，仅 scrape 时把原子读成文本。
 - 客户端计数搭在 `PeerHealth` 既有锁段上（无新增锁）；per-peer 仅错误路径（罕见）。
+- RDMA 失败完成的归因（§3.7）只在失败之后执行：成功路径不加锁、不分配、不格式化；
+  日志格式化和 client 的限频锁都在连接已经要销毁的分支里，新增的计数器和状态放在
+  各结构原有成员之后，不挪动请求路径上的热计数器。
 - 插件轮询线程睡眠态、按间隔触发，不在 per-batch/per-page 路径。
 - 验证：每 PR 跑 RDMA Soft-RoCE loopback + ThreadSanitizer 全绿。

@@ -700,6 +700,10 @@ void RdmaServer::Serve(int boot_fd) {
       static_cast<size_t>(std::distance(anchor_devs_.begin(), rail_it));
   RailStats& rail_stats = *rail_stats_[rail_index];
   const int rail_numa = anchors_[rail_index]->numa_node();
+  // Resolved once per real connection, while the bootstrap socket is still
+  // open, so a later failed completion can be attributed to its peer.
+  const std::string peer_addr = net::PeerAddress(boot_fd);
+  const uint64_t accepted_us = SteadyUs();
 
   // The client sends QpInfo first. Read and validate its mandatory v2 depth
   // before allocating per-connection control slots or leasing shared receive
@@ -905,7 +909,8 @@ void RdmaServer::Serve(int boot_fd) {
                 " shared-slot=" + std::to_string(slot_size) +
                 " qd=" + std::to_string(K) +
                 " qp=" + std::to_string(ep.Local().qpn) +
-                " peer_qp=" + std::to_string(peer_info.qpn));
+                " peer_qp=" + std::to_string(peer_info.qpn) +
+                " dev=" + dev + " peer=" + peer_addr);
   numa::PinThreadToNode(ep.numa_node());
 
   // QP bootstrap: the peer geometry was consumed before allocation above.
@@ -1554,9 +1559,17 @@ void RdmaServer::Serve(int boot_fd) {
   const int idle_ms = ServerIdleMs();
   active_connection.Enter(&active_conns_, &rail_stats.active_conns);
   // Failed WCs do not guarantee a meaningful opcode. Retain the raw provider
-  // fields and both QP numbers for correlation with short-lived clients.
-  auto log_completion_error = [&](const ibv_wc& wc, const char* loop,
-                                  size_t posted_sends) {
+  // fields and both QP numbers for correlation with short-lived clients, and
+  // name the peer and the local device so the failure can be attributed. One
+  // line per failed connection, never throttled: it fires once in a
+  // connection's life and is the only record of how that connection failed
+  // (vendor syndrome, failed slot, queue state).
+  auto note_completion_error = [&](const ibv_wc& wc, const char* loop,
+                                   size_t posted_sends) {
+    completion_errors_.fetch_add(1, std::memory_order_relaxed);
+    rail_stats.completion_errors.fetch_add(1, std::memory_order_relaxed);
+    rail_stats.wc_errors[rdma::WcStatusSlot(wc.status)].fetch_add(
+        1, std::memory_order_relaxed);
     DFKV_LOG_WARN(
         "rdma server CQ failure loop=" + std::string(loop) +
         " status=" + std::to_string(wc.status) +
@@ -1568,7 +1581,10 @@ void RdmaServer::Serve(int boot_fd) {
         " depth=" + std::to_string(K) +
         " free_send=" + std::to_string(free_send.size()) +
         " queued_recv=" + std::to_string(pending_recv_count) +
-        " posted_sends=" + std::to_string(posted_sends));
+        " posted_sends=" + std::to_string(posted_sends) +
+        " status_name=" + rdma::WcStatusName(wc.status) +
+        " dev=" + dev + " peer=" + peer_addr +
+        " age_ms=" + std::to_string((SteadyUs() - accepted_us) / 1000));
   };
 
 #ifdef DFKV_WITH_URING
@@ -1672,10 +1688,7 @@ void RdmaServer::Serve(int boot_fd) {
 
     auto process_wc = [&](const ibv_wc& wc) -> bool {
       if (wc.status != IBV_WC_SUCCESS) {
-        log_completion_error(wc, "uring", posted_sends);
-        completion_errors_.fetch_add(1, std::memory_order_relaxed);
-        rail_stats.completion_errors.fetch_add(1,
-                                                std::memory_order_relaxed);
+        note_completion_error(wc, "uring", posted_sends);
         return false;
       }
       if (wc.opcode == IBV_WC_SEND) {
@@ -2002,9 +2015,7 @@ sync_serve_loop:;
 
   auto process_sync_wc = [&](const ibv_wc& wc) -> bool {
     if (wc.status != IBV_WC_SUCCESS) {
-      log_completion_error(wc, "sync", K - free_send.size());
-      completion_errors_.fetch_add(1, std::memory_order_relaxed);
-      rail_stats.completion_errors.fetch_add(1, std::memory_order_relaxed);
+      note_completion_error(wc, "sync", K - free_send.size());
       return false;
     }
     if (wc.opcode == IBV_WC_SEND) {
@@ -2232,6 +2243,22 @@ std::string RdmaServer::MetricsText() const {
               [](const RailStats& r) {
                 return r.completion_errors.load(std::memory_order_relaxed);
               });
+  // Lazily populated: a series appears with its first failure, so the label
+  // set stays at (devices x statuses that actually occurred).
+  s += "# HELP dfkv_rdma_rail_wc_errors_total RDMA error completions on each "
+       "local device by work-completion status\n";
+  s += "# TYPE dfkv_rdma_rail_wc_errors_total counter\n";
+  for (size_t i = 0; i < rail_stats_.size(); ++i) {
+    for (size_t slot = 0; slot < rdma::kWcStatusSlots; ++slot) {
+      const uint64_t count =
+          rail_stats_[i]->wc_errors[slot].load(std::memory_order_relaxed);
+      if (count == 0) continue;
+      s += "dfkv_rdma_rail_wc_errors_total{dev=\"" +
+           PromLabelEscape(anchor_devs_[i]) + "\",status=\"" +
+           rdma::WcStatusName(static_cast<int>(slot)) + "\"} " +
+           std::to_string(count) + "\n";
+    }
+  }
   rail_metric("dfkv_rdma_rail_put_writes_total", "counter",
               "PUT requests received by RDMA WRITE_WITH_IMM on each local device",
               [](const RailStats& r) {

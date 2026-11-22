@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- Observability: a failed RDMA work completion can now be attributed to a
+  peer, a local device and a completion status on both sides. Until now the
+  client logged nothing for it and counted it only in the process-wide
+  `dfkv_rdma_cq_errors_total`; the server logged the status number without
+  the peer address or the device and counted it without the status.
+  Client: new WARN line `rdma client CQ failure peer=... dev=... op=...
+  status=<n> status_name=<name> vendor=<n> ...` when a connection is torn
+  down because a completion failed, and new counter
+  `dfkv_rdma_client_rail_wc_errors_total{dev,status}`. Server: the existing
+  `rdma server CQ failure` line, still one per failed connection, keeps its
+  fields and gains `status_name=`, `dev=`, `peer=<ip:port>` and `age_ms=` at
+  the end; the `rdma conn:` line gains `dev=` and `peer=`; new counter
+  `dfkv_rdma_rail_wc_errors_total{dev,status}`, which adds up to
+  `dfkv_rdma_rail_completion_errors_total{dev}`. `status` is the verbs
+  status name without its `IBV_WC_` prefix (`retry_exc_err` is status 12).
+  Peer addresses are not a metric label; they are in the log lines. The new
+  client line is limited to one line per (peer, device, status, vendor
+  syndrome) and 32 such combinations per 10 s; `suppressed=` on a line is the
+  number of failures not logged since the previous line. The per-status
+  series appear with the first failure of a (device, status) pair, so keep
+  alerting on the existing totals and use the new series to break an alert
+  down.
+  Existing metrics and their labels are unchanged; retry, cooldown and
+  failover behaviour are unchanged. See `docs/METRICS.md`.
 - Server: the RAM tier arena asks for transparent huge pages
   (`madvise(MADV_HUGEPAGE)`, effective where the system setting is `madvise`
   or `always`). With 4 KiB pages the kernel hands out about 4 GiB/s no matter
