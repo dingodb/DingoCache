@@ -252,6 +252,7 @@ class SlabAllocator {
   size_t IndexBucketForTest(const BlockKey& key) const;
 
  private:
+  friend class SlabAllocatorTestPeer;
   static constexpr int kUnbound = -1;
   static constexpr uint32_t kNoSlot = UINT32_MAX;
   static constexpr uint64_t kReadHeatUnit = 1024;
@@ -378,7 +379,6 @@ class SlabAllocator {
 
   void PushFreeLocked(Class& cls, uint32_t extent, uint32_t slot);
   bool PopFreeLocked(Class& cls, Slot* out);
-  bool TakeFreeSlotLocked(Class& cls, uint32_t extent, uint32_t slot);
   void DropExtentFreeLocked(Class& cls, uint32_t extent);
   void DropFromRotationLocked(Class& cls, uint32_t extent);
 
@@ -401,9 +401,11 @@ class SlabAllocator {
     size_t size() const { return size_; }
     IndexStats stats() const;
     size_t BucketForTest(const BlockKey& key) const;
+    // Asks the CPU for the bucket `key` hashes to. Changes nothing.
+    void Prefetch(const BlockKey& key) const;
+    static uint64_t Hash(const BlockKey& key);
 
    private:
-    static uint64_t Hash(const BlockKey& key);
     void Rehash(size_t capacity);
 
     std::vector<Entry> entries_;

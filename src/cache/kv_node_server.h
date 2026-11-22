@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -207,7 +208,18 @@ class KvNodeServer {
   // accepted_at stamps the accept() return so the first complete request frame
   // is due within DFKV_TCP_FIRST_REQ_MS of ACCEPT, not of handler scheduling.
   void Handle(int fd, std::chrono::steady_clock::time_point accepted_at);
-  void InitRamTier();     // construct ram_ if DFKV_RAM_TIER is enabled (env)
+  // What the environment asks of the RAM tier, read once before anything
+  // slow starts. The tier itself is then built by StartRamTier on its own
+  // thread while the disks open, and wired to this server by AdoptRamTier.
+  struct RamTierPlan {
+    bool enabled = false;
+    bool write_back = true;
+    bool ack_enabled = false;
+    RamTier::Options options;
+  };
+  static RamTierPlan PlanRamTier(size_t disk_count);
+  std::future<std::unique_ptr<RamTier>> StartRamTier();
+  void AdoptRamTier(std::unique_ptr<RamTier> tier);
   // RAM tier write policy: write-back (PUT lands in arena, async flush) or
   // write-around (PUT direct to disk, arena filled by GET read-promotion).
   void set_ram_write_back(bool wb) { ram_write_back_ = wb; }
@@ -297,6 +309,11 @@ class KvNodeServer {
   };
   std::vector<std::unique_ptr<RamFlushDiskMetrics>> ram_flush_disks_;
 
+  // Declared BEFORE group_ on purpose: members are constructed in declaration
+  // order, and the arena has to start faulting in before the disks start
+  // opening for the two to overlap. Empty again once the constructor is done.
+  RamTierPlan ram_plan_;
+  std::future<std::unique_ptr<RamTier>> ram_starting_;
   DiskCacheGroup group_;
   // Optional RAM hot tier (P3). Declared AFTER group_ so it is destroyed FIRST:
   // ~RamTier stops+joins the flusher, whose callback calls group_.Cache, before

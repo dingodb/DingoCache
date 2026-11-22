@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- Server: a start with a RAM tier and populated slab disks takes less time.
+  Nothing changes on disk or on the wire, and a restarted node holds exactly
+  the state it held before: same eviction order, same order in which free
+  slots are handed out.
+  - The RAM tier arena is faulted in while the disks are opened, instead of
+    after them. The two were independent and each took seconds (192 GiB
+    arena: about 3 s; a disk with 2.3 million objects: 2-3 s). A start now
+    takes about as long as the slower of the two. A disk that fails to open,
+    or an arena that cannot be set up, still ends the start as before; in
+    the first case the process now also waits for the arena to finish
+    faulting in before it exits. The memory a disk needs only while its
+    table is being restored (up to about 250 MiB per disk at that size) is
+    now in use while the arena is faulted in, not released before.
+    `dfkv_ram_arena_hugepage_bytes` and the `huge pages=N MiB` figure of the
+    arena log line are now read from the arena's own mappings; as a change
+    of the whole process they would have included what the disk opens
+    allocate meanwhile.
+  - Restoring a disk's table into the allocator is faster: the per-object
+    bookkeeping of the restore no longer allocates a heap node per object,
+    taking a slot out of an extent's free list no longer searches the list,
+    duplicate keys are found by sorting 8-byte hashes instead of 24-byte
+    keys, and index buckets are prefetched. Measured with the test
+    `SlabAllocator.RestoreBulkBench` (2.3 million objects in 2,808 extents of
+    1 MiB slots, no disk involved) on a machine that was not idle: 1.47-2.13 s
+    before, 0.64-1.12 s after; runs taken back to back were about 1.6 s and
+    0.95 s.
 - Server: the slab slot table (`slots.tbl`) has all of its space reserved
   when a disk is opened. It was sized with `ftruncate` and written through
   the page cache, so its blocks were allocated when an extent was first
