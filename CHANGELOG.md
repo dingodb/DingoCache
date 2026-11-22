@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Server, slab store and RAM tier: the free slots the background pass keeps
+  ahead of a size class's writers are bounded in bytes, at least 64 MiB and
+  at most 1 GiB of slots (still at most a quarter of the class), instead of
+  at least 64 slots. A class of 32 MiB slots kept 2 GiB of each disk, or a
+  quarter of the class, evicted and empty ahead of need; one of small slots
+  written fast could hold a quarter of its capacity free.
 - Server, slab store and RAM tier: a size class that is not being written
   gives its extents to one that is. The background growth took extents only
   from classes holding more than eight, so a class written once and then
