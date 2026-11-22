@@ -559,3 +559,24 @@ TEST(MdsEtcdWriteFailure, ClientKeepsItsRingThroughTheOutage) {
   EXPECT_EQ(rings, (std::vector<size_t>{3}));  // same members: nothing to rebuild
   mds.Stop();
 }
+
+// A member record the MDS cannot decode is skipped, as before, but no longer
+// silently: it is counted and logged with its key.
+TEST(MdsMemberRecords, AnUndecodableMemberIsCountedAndLogged) {
+  FakeEtcd etcd;
+  MdsServer mds(etcd.ep());
+  ASSERT_EQ(mds.Start(0), Status::kOk);
+  ASSERT_EQ(Beat(mds, WireOp::kRegister, "dec", kA), Status::kOk);
+  etcd.SetRaw(MemberKey("dec", "broken"), "not a member record");
+  testing::internal::CaptureStderr();
+  Ids ids;
+  EXPECT_EQ(List(mds, WireOp::kListMembers, "dec", &ids), Status::kOk);
+  const std::string log = testing::internal::GetCapturedStderr();
+  EXPECT_EQ(ids, Ids({"na"}));
+  EXPECT_NE(log.find(MemberKey("dec", "broken")), std::string::npos) << log;
+  const std::string metrics = mds.MetricsText();
+  EXPECT_NE(metrics.find("dfkv_mds_member_decode_errors_total 1\n"),
+            std::string::npos)
+      << metrics;
+  mds.Stop();
+}

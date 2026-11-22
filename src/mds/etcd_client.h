@@ -3,6 +3,7 @@
 
 #include <array>
 #include <atomic>
+#include <mutex>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -23,7 +24,11 @@ struct RangeResult {
 // HttpTransport so it is unit-testable with a fake. Every call is one POST.
 class EtcdClient {
  public:
-  explicit EtcdClient(HttpTransport* http) : http_(http) {}
+  // write_idle_window_ms: see dfkv_mds_etcd_write_failing_seconds in
+  // MetricsText(). The default is the member lease TTL.
+  explicit EtcdClient(HttpTransport* http,
+                      uint64_t write_idle_window_ms = 30000)
+      : http_(http), write_idle_window_ms_(write_idle_window_ms) {}
 
   std::optional<int64_t> LeaseGrant(int ttl_seconds);
   bool LeaseKeepAlive(int64_t lease_id);
@@ -48,10 +53,26 @@ class EtcdClient {
   std::optional<RangeResult> RangePrefixAs(
       const std::string& prefix, Op op);
 
+  // A refused or failed request, logged with what etcd said, at most once
+  // per operation every kFailureLogEveryMs (with the number not logged).
+  void NoteFailure(Op op, bool transported, const HttpResponse& response);
+  static constexpr uint64_t kFailureLogEveryMs = 10000;
+  static uint64_t NowMs();
+
   HttpTransport* http_;  // not owned
   std::array<LatencyHist, static_cast<size_t>(Op::kCount)> latency_;
   std::array<std::atomic<uint64_t>, static_cast<size_t>(Op::kCount)> requests_{};
   std::array<std::atomic<uint64_t>, static_cast<size_t>(Op::kCount)> errors_{};
+  std::mutex failure_log_mu_;
+  std::array<uint64_t, static_cast<size_t>(Op::kCount)> failure_logged_ms_{};
+  std::array<uint64_t, static_cast<size_t>(Op::kCount)> failures_unlogged_{};
+  // Since when writes (lease grant, keepalive, put) have been failing: the
+  // first failed write after the last successful one; 0 while they succeed.
+  std::atomic<uint64_t> write_failing_since_ms_{0};
+  // The last write attempted, successful or not; and how long without one
+  // before an ongoing failure is no longer reported (nothing is being lost).
+  std::atomic<uint64_t> last_write_attempt_ms_{0};
+  const uint64_t write_idle_window_ms_;
 };
 
 }  // namespace dfkv

@@ -369,6 +369,8 @@ TTL-debounced etcd probe 判定（`DFKV_MDS_PROBE_CACHE_MS`，默认 2500 ms 内
 | `dfkv_mds_local_member_leases_pruned_total` / `dfkv_mds_local_client_leases_pruned_total` | counter | 因多个 TTL 未在本 MDS 使用而丢弃的本地 shortcut；churn 下增长正常，下次心跳会 fresh grant+Put |
 | `dfkv_mds_legacy_frames_total` | counter | 以 v1.x 旧控制面帧（42/10 字节帧）服务的请求数；仅在 `DFKV_MDS_ACCEPT_LEGACY=1` 的混合代际迁移期出现，**归零后应撤掉该 env** |
 | `dfkv_mds_list_withheld_total` | counter | 被拒绝下发的 member list 次数（`ListMembers`/`ListTopology` 返回 `kIOError`）：etcd 视图里缺少“心跳已到本 MDS、但 etcd 没接受写入”的 member。**增长 = etcd 拒绝写入（典型为空间配额用尽）且成员 lease 已开始过期**，客户端此时停在 last-good ring；连续约 4 分钟触发告警 `DfkvMdsMemberListWithheld`。心跳在本 MDS 失败之后真正下线的节点也会让它增长，至多一个 `DFKV_MDS_UNWRITTEN_HOLD_MS` 窗口 |
+| `dfkv_mds_etcd_write_failing_seconds` | gauge | etcd 拒绝或写失败（lease grant / keepalive / put）已持续的秒数：上次写成功之后第一次失败起算；写成功时为 0；最近 30 秒（成员 lease TTL）内没有任何写入尝试时也回到 0（没有心跳要写，就没有成员会因此过期），不会在空闲的 MDS 上一直增长。成员 lease 30 秒到期后就会从 etcd 消失，超过 10 秒触发 `DfkvMdsEtcdWritesRefused`。etcd 的回答（HTTP 状态和错误体，例如 `database space exceeded`）记在 MDS 日志 `mds: etcd <op> failed: ...`，每种操作 10 秒至多一行 |
+| `dfkv_mds_member_decode_errors_total` | counter | 成员或客户端列表请求中遇到无法解码、被跳过的 etcd 记录的次数：每次列表请求对每条坏记录各计一次（反映暴露次数，不是不同坏记录的个数）；日志 `mds: skipped a record in etcd ...` 给出键名（30 秒至多一行），告警 `DfkvMdsMemberRecordsUndecodable` |
 | `dfkv_mds_unwritten_members` | gauge | 本 MDS 上最近一次心跳没能写进 etcd 的 member 数（`DFKV_MDS_UNWRITTEN_HOLD_MS` 窗口内；只计 heartbeat，注册失败不计）。>0 而上一行不增长 = 写入失败但 etcd 仍列出这些 member（旧 lease 尚在或已由其他 MDS 写入），list 照常下发 |
 
 ### 3.3 客户端（SGLang 插件 `/metrics` 与原生 C 快照）

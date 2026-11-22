@@ -55,6 +55,11 @@ class FakeEtcd {
     leases_.clear();
     kvs_.clear();
   }
+  // Store a value under a key as it is, without a lease (a damaged record).
+  void SetRaw(const std::string& key, const std::string& value) {
+    std::lock_guard<std::mutex> lk(mu_);
+    kvs_[key] = {Base64Encode(value), 0};
+  }
   // The lease holding this one key runs out.
   void ExpireKey(const std::string& key) {
     std::lock_guard<std::mutex> lk(mu_);

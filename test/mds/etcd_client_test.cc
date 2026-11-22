@@ -1,7 +1,9 @@
 #include "mds/etcd_client.h"
 #include "utils/base64.h"
 #include <gtest/gtest.h>
+#include <chrono>
 #include <cstdlib>
+#include <thread>
 #include <memory>
 #include <string>
 #include <vector>
@@ -140,4 +142,71 @@ TEST(EtcdClient, IntegrationRealEtcd) {
   for (auto& kv : r->kvs) if (kv.first == key && kv.second == "hello") found = true;
   EXPECT_TRUE(found);
   EXPECT_GT(r->revision, 0);
+}
+
+namespace {
+size_t Count(const std::string& text, const std::string& what) {
+  size_t n = 0;
+  for (size_t at = text.find(what); at != std::string::npos;
+       at = text.find(what, at + 1))
+    ++n;
+  return n;
+}
+double Gauge(const std::string& text, const std::string& name) {
+  const size_t at = text.find("\n" + name + " ");
+  if (at == std::string::npos) return -1;
+  return std::strtod(text.c_str() + at + name.size() + 2, nullptr);
+}
+}  // namespace
+
+// What etcd answers when it refuses a request is logged, with the operation
+// and the HTTP status, at most once per operation in a while. It used to be
+// counted only: an etcd out of space left nothing in the MDS log.
+TEST(EtcdClient, AFailedRequestIsLoggedWithWhatEtcdSaid) {
+  FakeHttp h;
+  const HttpResponse nospace{
+      429, R"({"error":"etcdserver: mvcc: database space exceeded","code":8})"};
+  h.canned = {nospace, nospace, nospace};
+  EtcdClient c(&h);
+  testing::internal::CaptureStderr();
+  EXPECT_FALSE(c.Put("/k", "v", 1));
+  EXPECT_FALSE(c.Put("/k", "v", 1));
+  EXPECT_FALSE(c.Put("/k", "v", 1));
+  const std::string log = testing::internal::GetCapturedStderr();
+  EXPECT_EQ(Count(log, "database space exceeded"), 1u) << log;
+  EXPECT_NE(log.find("put"), std::string::npos) << log;
+  EXPECT_NE(log.find("429"), std::string::npos) << log;
+}
+
+// How long etcd has been refusing writes: 0 while writes succeed (or none are
+// made), the time since the first refused write after the last success
+// otherwise. Members drop out of etcd once their lease runs out (30 s), so
+// this is what to alert on before they do.
+TEST(EtcdClient, WriteFailingSecondsTracksAnOngoingRefusal) {
+  FakeHttp h;
+  h.canned = {{429, "{}"}, {429, "{}"}, {200, "{}"}};
+  EtcdClient c(&h);
+  EXPECT_EQ(Gauge(c.MetricsText(), "dfkv_mds_etcd_write_failing_seconds"), 0);
+  EXPECT_FALSE(c.Put("/k", "v", 1));
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+  EXPECT_FALSE(c.Put("/k", "v", 1));
+  EXPECT_GE(Gauge(c.MetricsText(), "dfkv_mds_etcd_write_failing_seconds"), 1);
+  EXPECT_TRUE(c.Put("/k", "v", 1));
+  EXPECT_EQ(Gauge(c.MetricsText(), "dfkv_mds_etcd_write_failing_seconds"), 0);
+}
+
+// One refused write, then nothing to write (an idle MDS, or one whose members
+// all left): the gauge goes back to 0 once no write has been attempted for the
+// idle window, instead of growing for ever and keeping the alert firing.
+TEST(EtcdClient, WriteFailingSecondsIsZeroOnceNoWriteIsAttempted) {
+  FakeHttp h;
+  h.canned = {{429, "{}"}, {429, "{}"}};
+  EtcdClient c(&h, /*write_idle_window_ms=*/1500);
+  EXPECT_FALSE(c.Put("/k", "v", 1));
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+  EXPECT_FALSE(c.Put("/k", "v", 1));  // still failing, and still writing
+  EXPECT_GE(Gauge(c.MetricsText(), "dfkv_mds_etcd_write_failing_seconds"), 1);
+  std::this_thread::sleep_for(std::chrono::milliseconds(1700));
+  EXPECT_EQ(Gauge(c.MetricsText(), "dfkv_mds_etcd_write_failing_seconds"), 0)
+      << "no write attempted for longer than the idle window";
 }

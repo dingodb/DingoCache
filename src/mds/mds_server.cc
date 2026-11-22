@@ -507,10 +507,12 @@ Status MdsServer::ListMembers(const std::string& group, std::string* out,
   for (const auto& kv : r->kvs) {
     std::vector<MemberInfo> one;
     uint64_t e = 0;
-    if (DecodeMembers(kv.second.data(), kv.second.size(), &one, &e) &&
-        one.size() == 1 &&
-        (include_degraded || one[0].RingEligible()))
-      members.push_back(one[0]);
+    if (!DecodeMembers(kv.second.data(), kv.second.size(), &one, &e) ||
+        one.size() != 1) {
+      NoteUndecodable(kv.first);
+      continue;
+    }
+    if (include_degraded || one[0].RingEligible()) members.push_back(one[0]);
   }
   // Placement and topology have separate canonical generations. The legacy
   // kListMembers view is filtered to eligible members and keeps its placement
@@ -523,6 +525,21 @@ Status MdsServer::ListMembers(const std::string& group, std::string* out,
                              : MembersEpoch(members);
   *out = EncodeMembers(members, epoch);
   return Status::kOk;
+}
+
+// A member or client record that cannot be decoded is skipped; it is counted,
+// and logged with its key at most once every 30 s.
+void MdsServer::NoteUndecodable(const std::string& key) {
+  metrics_.member_decode_errors.fetch_add(1, std::memory_order_relaxed);
+  const uint64_t now = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+  uint64_t last = undecodable_logged_ms_.load(std::memory_order_relaxed);
+  if (last != 0 && now - last < 30000) return;
+  if (!undecodable_logged_ms_.compare_exchange_strong(last, now)) return;
+  DFKV_LOG_WARN("mds: skipped a record in etcd that is not a member record: " +
+                key + " (dfkv_mds_member_decode_errors_total counts them)");
 }
 
 Status MdsServer::ListClients(const std::string& group, std::string* out) {
@@ -539,6 +556,8 @@ Status MdsServer::ListClients(const std::string& group, std::string* out) {
     uint64_t e = 0;
     if (DecodeMembers(kv.second.data(), kv.second.size(), &one, &e) && one.size() == 1)
       clients.push_back(one[0]);
+    else
+      NoteUndecodable(kv.first);
   }
   // Clients carry no placement semantics, so the epoch is a content hash over the
   // identity set only — `dfkvctl clients` re-fetches every run, so a changing

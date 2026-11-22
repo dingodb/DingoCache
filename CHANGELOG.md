@@ -3,6 +3,24 @@
 ## Unreleased
 
 
+- MDS: what etcd answers when it refuses a request is now logged, and
+  refused writes and damaged member records are visible as metrics and
+  alerts. The MDS request path logged nothing: an etcd out of space only
+  raised `dfkv_mds_etcd_request_errors_total`, and the error body
+  (`database space exceeded`) was dropped. Now each failed etcd request is
+  logged with its operation, HTTP status and the first 256 bytes of etcd's
+  answer, at most one line per operation every 10 s (with the number of
+  failures not logged). New gauge `dfkv_mds_etcd_write_failing_seconds`:
+  how long writes (lease grant, keepalive, put) have been failing, 0 while
+  they succeed or when none was attempted in the last 30 s; alert `DfkvMdsEtcdWritesRefused` at 10 s, before members
+  drop out of etcd when their 30 s lease runs out. A member or client
+  record that cannot be decoded is still skipped, but counted
+  (`dfkv_mds_member_decode_errors_total`, alert
+  `DfkvMdsMemberRecordsUndecodable`) and logged with its key. New alert
+  `DfkvMdsGroupMembersDropped`: a group has fewer than 80% of its members
+  of the last 15 minutes (`dfkv_mds_group_nodes`). No setting, API or wire
+  change. See `docs/METRICS.md`.
+
 - Client, MDS membership: the ring is no longer rebuilt on every view of a
   recovery ramp, and the first members back after an empty ring are no
   longer frozen in as the whole ring. A smaller view than the trusted

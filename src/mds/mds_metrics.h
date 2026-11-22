@@ -40,6 +40,8 @@ struct MdsMetrics {
   // write, and how many members are in that unwritten state here right now.
   std::atomic<uint64_t> lists_withheld{0};
   std::atomic<uint64_t> unwritten_members{0};
+  // Member or client records in etcd that could not be decoded (skipped).
+  std::atomic<uint64_t> member_decode_errors{0};
 
   std::string Render() const {
     std::string s;
@@ -73,6 +75,7 @@ struct MdsMetrics {
     m("dfkv_mds_legacy_frames_total", "counter", "Control frames served in the legacy v1.x control-plane encoding", ld(legacy_frames));
     m("dfkv_mds_list_withheld_total", "counter", "Member lists not served because etcd no longer listed a member whose heartbeat could not be written", ld(lists_withheld));
     m("dfkv_mds_unwritten_members", "gauge", "Members whose latest heartbeat at this MDS could not be written to etcd", ld(unwritten_members));
+    m("dfkv_mds_member_decode_errors_total", "counter", "Member or client records in etcd that could not be decoded and were skipped", ld(member_decode_errors));
     return s;
   }
 };
