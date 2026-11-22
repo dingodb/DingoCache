@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- SGLang HiCache connector, MLA with decode context parallelism (DCP): a
+  rank layout under which some DCP shards would have no writer now refuses
+  to start. The writer of DCP shard d is the attention-TP rank d, which
+  gives every shard exactly one writer per attention group when the DCP rank
+  is the attention-TP rank modulo the DCP width, as SGLang builds it
+  (checked against its rank derivation). Under another mapping, for example
+  DCP coordinates given in the extra_config in blocks, some shards were
+  never written while backup reported them done, so they never hit. A rank
+  whose DCP rank is not its attention-TP rank modulo the DCP width is
+  refused with the coordinates in the message. Deployments with SGLang's own
+  coordinates are unaffected.
 - SGLang HiCache connector: a side pool with one object per page is taken as
   the same on every TP rank only for an MLA model. For any model it was
   stored under one key shared by all TP ranks. An MHA model's single-buffer

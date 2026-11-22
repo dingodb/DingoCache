@@ -717,7 +717,9 @@ fp8）而非 KV 的元素类型，同宽度的 fp8 变体分不出，仍需在 e
   `dynamic` 后端；`DfkvHiCache` 已声明。DCP 下 SGLang 以
   `page_size × dcp_size` 个 slot 为一个逻辑页寻址 host pool（每个 DCP rank 一个物理页），
   插件注册 pool 时按整个逻辑页探测布局；对象 key 带 DCP 坐标，MLA 每个 DCP 分片
-  选一个写入者。不带该门禁的 SGLang 忽略此声明，非 DCP 部署的 key 与读写不变。
+  选一个写入者：分片 d 由 attention-TP rank d 写。这要求 DCP rank 等于 attention-TP
+  rank 对 DCP 宽度取模（SGLang 的 DCP 组是 TP 组的连续切片）；坐标不满足时插件拒绝
+  启动，否则会有分片没人写、永远不命中。不带该门禁的 SGLang 忽略此声明，非 DCP 部署的 key 与读写不变。
   端到端仍需在 DCP 实例上按 §2.5 验证命中与输出一致。
 - **client keepalive 默认开启。** `DFKV_RDMA_KEEPALIVE_MS` 默认 `15000`，每
   15 秒探测 idle pool 中的 QP，低于频繁重建场景推荐的 server
