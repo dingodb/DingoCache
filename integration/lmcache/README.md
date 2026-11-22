@@ -175,7 +175,7 @@ payloads.
 | Variable | Default | Meaning |
 |---|---|---|
 | `DFKV_LIB` | `$DFKV_BUILD/libdfkv.so` | path to `libdfkv.so` |
-| `DFKV_CONNECTOR_GET_PARALLELISM` | 1 | concurrent batched-get groups (executor workers) |
+| `DFKV_CONNECTOR_GET_PARALLELISM` | 1 | concurrent batched-get groups (GET workers; PUTs get as many workers of their own, existence probes one, so lookups wait neither for GETs nor for PUTs) |
 | `DFKV_CONNECTOR_BATCH_MAX_KEYS` | 512 | max keys per native batch call |
 | `DFKV_CONNECTOR_ASSUME_EXISTS` | 0 | skip remote contains checks (debug) |
 | `DFKV_CONNECTOR_EXISTS_TTL_S` | 60 | seconds a "present" answer of the per-process exists cache stays valid before the ring is asked again; `0` = no expiry. A GET that misses forgets the key at once either way |

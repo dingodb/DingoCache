@@ -810,15 +810,38 @@ class DfkvConnector(RemoteConnector):
             return ok
 
     def support_batched_contains(self) -> bool:
-        return False
+        return True
 
     def batched_contains(self, keys: List[CacheEngineKey]) -> int:
+        """Prefix length present, synchronously (LMCache's RemoteBackend
+        calls it off the event loop). Without it RemoteBackend asks contains
+        key by key: one round trip per key. Same answers as
+        batched_async_contains: exists-cache prefix, then one batched probe
+        per batch_max_keys slice."""
         n = len(keys)
         with access_log("batched_contains", lambda: f"{n} keys") as r:
-            r.result = "FAIL NotImplementedError"
-            raise NotImplementedError(
-                "dfkv connector does not support sync batched_contains"
-            )
+            if not keys:
+                r.result = "empty"
+                return 0
+            if self._assume_exists:
+                r.result = f"prefix={n} (assume_exists)"
+                return n
+            binary_keys = [self._key(k) for k in keys]
+            i = self._exists_lru.prefix_len(binary_keys)
+            remaining = binary_keys[i:]
+            for start, end in self._batch_slices(len(remaining)):
+                chunk = remaining[start:end]
+                per_key = self._client.batch_exists_sync(chunk)
+                found = 0
+                while found < min(len(per_key), len(chunk)) and per_key[found]:
+                    found += 1
+                if found:
+                    self._exists_lru.add_many(chunk[:found])
+                if found < len(chunk):
+                    r.result = f"prefix={i + start + found} (lru={i})"
+                    return i + start + found
+            r.result = f"prefix={n} (lru={i})"
+            return n
 
     # ------------------------------------------------------------------
     # helpers

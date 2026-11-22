@@ -329,6 +329,11 @@ if(DFKV_BUILD_TESTS)
               ${CMAKE_CURRENT_SOURCE_DIR}/integration/lmcache/tests/test_connector_construction.py)
     set_tests_properties(python_lmcache_connector_construction PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
+    add_test(NAME python_lmcache_contains_and_pools
+      COMMAND ${PYTHON3}
+              ${CMAKE_CURRENT_SOURCE_DIR}/integration/lmcache/tests/test_contains_and_pools.py)
+    set_tests_properties(python_lmcache_contains_and_pools PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
     add_test(NAME python_lmcache_multi_group_chunk
       COMMAND ${PYTHON3}
               ${CMAKE_CURRENT_SOURCE_DIR}/integration/lmcache/tests/test_multi_group_chunk.py)

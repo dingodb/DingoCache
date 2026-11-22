@@ -53,6 +53,7 @@ def _client(put_result, transport="tcp", limit=None):
     loop = asyncio.new_event_loop()
     client._loop = loop
     client._executor = ThreadPoolExecutor(max_workers=1)
+    client._write_executor = client._exists_executor = client._executor
     client._batch_set_blocking = lambda keys, bufs: put_result
     client.transport_mode = transport
 
