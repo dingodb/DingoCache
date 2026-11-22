@@ -242,6 +242,7 @@ def _install_vllm_stubs() -> None:
         "vllm.v1.kv_cache_interface",
         AttentionSpec=Placeholder,
         FullAttentionSpec=FullAttentionSpec,
+        MLAAttentionSpec=Placeholder,
         KVCacheConfig=Placeholder,
         KVCacheGroupSpec=Placeholder,
         KVCacheSpec=Placeholder,

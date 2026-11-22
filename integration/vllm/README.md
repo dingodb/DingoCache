@@ -329,7 +329,10 @@ next SAVE writes it again instead of finding it present. A longer object is a
 miss and is left alone.
 Windowed or recurrent SAVE sources
 remain protected until the native PUT finishes, before the next model step
-can recycle or overwrite them. Only those groups' PUTs are waited for, on a
+can recycle or overwrite them. Which groups those are is decided default-deny: only
+full attention (`FullAttentionSpec` / `MLAAttentionSpec` without a window or
+chunk size) is saved asynchronously; every other spec type, including ones the
+connector does not know, is fenced. Only those groups' PUTs are waited for, on a
 send worker of their own: the full-attention part of the same SAVE runs on the
 regular send worker and overlaps the following steps (vLLM keeps those blocks
 until the request is reported finished sending). Two consequences: the regular
