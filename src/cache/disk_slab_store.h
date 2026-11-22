@@ -126,6 +126,10 @@ class DiskSlabStore : public StoreEngine {
     // PUTs answered kCacheFull because the allocator had no slot to give:
     // everything evictable was pinned or protected by retention.
     uint64_t put_no_slot = 0;
+    // PUTs answered kCacheFull because the key could not be taken yet: it
+    // still holds a slot from an unfinished operation, or its deferred
+    // removal outlasted the wait bound.
+    uint64_t put_busy = 0;
     uint64_t dio_read_fallbacks = 0;
     uint64_t table_syncs = 0;
     uint64_t bind_wipes = 0;
@@ -468,6 +472,7 @@ class DiskSlabStore : public StoreEngine {
   }
   bool MayMutate();
   Status NoSlotStatusLocked(bool resident);
+  Status BusyStatus();
   int crash_slot_ = -1;              // RevokeAllTrustForCrash registration
   bool closed_ = false;              // Close() ran; closed_clean_ is its result
   bool closed_clean_ = false;
@@ -528,6 +533,7 @@ class DiskSlabStore : public StoreEngine {
   uint64_t deferred_remove_total_ = 0;  // under mu_
   std::atomic<uint64_t> dio_write_fallbacks_{0};
   std::atomic<uint64_t> put_no_slot_{0};
+  std::atomic<uint64_t> put_busy_{0};
   std::atomic<uint64_t> dio_read_fallbacks_{0};
   std::atomic<uint64_t> table_syncs_{0};
   std::atomic<uint64_t> bind_wipes_{0};

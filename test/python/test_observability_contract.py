@@ -155,6 +155,7 @@ PUBLIC_FAMILIES = {
     "dfkv_slab_payload_bytes",
     "dfkv_slab_prep_holds",
     "dfkv_slab_put_no_slot_total",
+    "dfkv_slab_put_busy_total",
     "dfkv_slab_rebuild_corrupt_records_total",
     "dfkv_slab_rebuild_rejected_records_total",
     "dfkv_slab_unclean_resets_total",

@@ -2156,6 +2156,50 @@ TEST_F(DiskSlabTest, BatchReputDuringDeferredRemoveWaitsOutWindowThenLands) {
   EXPECT_EQ(out, v2);
 }
 
+// A healthy store that cannot take a key yet answers kCacheFull, on the
+// scalar and on the batched path: when a deferred remove of the key outlasts
+// the wait bound, and when the key still holds a slot from an earlier
+// operation that has not let go. Clients cool a node down on kIOError; these
+// used to be kIOError.
+TEST_F(DiskSlabTest, AKeyTheStoreCannotTakeYetIsCacheFullNotAnIoError) {
+  auto opts = Opts(1 << 20, 1 << 20, 4096);
+  opts.table_sync_ms = 0;
+  opts.reclaim_interval_ms = 0;
+  bool ok = false;
+  DiskSlabStore s(opts, &ok);
+  ASSERT_TRUE(ok);
+  std::string v(4096, 'a');
+  ASSERT_EQ(s.Cache(K(62), v.data(), v.size()), Status::kOk);
+  dfkv::ReadLease lease;
+  ASSERT_EQ(s.RangeDirectPrep(K(62), 0, 0, 1 << 20, &lease), Status::kOk);
+  ASSERT_EQ(s.Remove(K(62)), Status::kOk);  // deferred: the lease pins it
+  Status scalar = Status::kOk;
+  std::vector<Status> batch;
+  std::thread a([&] { scalar = s.Cache(K(62), v.data(), v.size()); });
+  std::thread b([&] {
+    batch = s.CacheDirectBatch({{K(62), v.data(), v.size(), v.size()}});
+  });
+  a.join();
+  b.join();  // both waited out the 5 s bound
+  EXPECT_EQ(scalar, Status::kCacheFull);
+  ASSERT_EQ(batch.size(), 1u);
+  EXPECT_EQ(batch[0], Status::kCacheFull);
+  EXPECT_TRUE(s.Healthy());
+  { dfkv::ReadLease drop(std::move(lease)); }
+  EXPECT_EQ(s.Cache(K(62), v.data(), v.size()), Status::kOk);
+
+  // A slot taken and written, its operation not finished (no record, still
+  // pinned and in flight).
+  ASSERT_TRUE(dfkv::DiskSlabStoreTestPeer::WriteCrashStage(&s, K(63), v, false));
+  EXPECT_EQ(s.Cache(K(63), v.data(), v.size()), Status::kCacheFull);
+  const auto sts = s.CacheDirectBatch({{K(63), v.data(), v.size(), v.size()}});
+  ASSERT_EQ(sts.size(), 1u);
+  EXPECT_EQ(sts[0], Status::kCacheFull);
+  EXPECT_TRUE(s.Healthy());
+  EXPECT_EQ(s.GetStats().put_no_slot, 0u) << "neither is a missing slot";
+  EXPECT_EQ(s.GetStats().put_busy, 4u);
+}
+
 // Direct-mode RangeDirect: O_DIRECT aligned-window read with head trim -- the
 // returned pointer must land exactly on the requested offset's bytes, including
 // a non-4KiB-aligned client offset (head != 0).

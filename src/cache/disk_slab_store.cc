@@ -205,8 +205,8 @@ void DisarmCrashSlot(int slot) {
 // Bound on a re-PUT waiting out a deferred-remove window. The window lasts
 // one in-flight read/write of the slot -- I/O time, even for MiB-scale direct
 // reads -- so this is generous; but a request-serving thread must never park
-// behind a stuck holder, so on expiry the PUT falls back to the pre-wait
-// behavior (kIOError) instead of blocking forever.
+// behind a stuck holder, so on expiry the PUT is answered kCacheFull (not
+// stored; the store is healthy) instead of blocking forever.
 constexpr auto kDeferredRemoveWaitMax = std::chrono::seconds(5);
 
 bool PwriteAll(int fd, const void* buf, size_t n, uint64_t off) {
@@ -1912,9 +1912,18 @@ Status DiskSlabStore::WaitPut(const std::shared_ptr<PutFlight>& flight) {
 // room failed on the way (an eviction's table record, an extent rebind), in
 // which case that write has failed the store for good, and the answer is the
 // I/O error it is. `resident`: the key still holds a slot from an earlier
-// operation that has not let go; that is neither, and stays kIOError.
+// operation that has not let go. The store is healthy and cannot take this
+// PUT yet, which is kCacheFull as well, but not a missing slot.
+// kCacheFull for a PUT of a key the store cannot take yet, counted: a pin or
+// slot that never lets go shows as a counter that keeps rising.
+Status DiskSlabStore::BusyStatus() {
+  put_busy_.fetch_add(1, std::memory_order_relaxed);
+  return Status::kCacheFull;
+}
+
 Status DiskSlabStore::NoSlotStatusLocked(bool resident) {
-  if (resident || !Serving()) return Status::kIOError;
+  if (!Serving()) return Status::kIOError;
+  if (resident) return BusyStatus();
   put_no_slot_.fetch_add(1, std::memory_order_relaxed);
   return Status::kCacheFull;
 }
@@ -1958,7 +1967,9 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
               return deferred_remove_.count(fn) == 0 || !Serving();
             }))
           continue;  // window closed: the slot is gone; fresh judgment
-        return Status::kIOError;  // pin outlived the bound: fail as before
+        // The pin outlived the bound. The store is healthy and cannot take
+        // the key yet: kCacheFull, not stored, the node is fine.
+        return Serving() ? BusyStatus() : Status::kIOError;
       }
       flight = std::make_shared<PutFlight>();
       put_flights_.emplace(fn, flight);
@@ -2103,7 +2114,8 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
                 return deferred_remove_.count(st[i].fn) == 0 || !Serving();
               }))
             continue;  // window closed: re-judge this item from scratch
-          out[i] = Status::kIOError;  // pin outlived the bound: fail as before
+          // The pin outlived the bound: kCacheFull, as in CacheImpl.
+          out[i] = Serving() ? BusyStatus() : Status::kIOError;
           break;
         }
         st[i].flight = std::make_shared<PutFlight>();
@@ -2779,6 +2791,7 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   st.dio_write_fallbacks =
       dio_write_fallbacks_.load(std::memory_order_relaxed);
   st.put_no_slot = put_no_slot_.load(std::memory_order_relaxed);
+  st.put_busy = put_busy_.load(std::memory_order_relaxed);
   st.dio_read_fallbacks =
       dio_read_fallbacks_.load(std::memory_order_relaxed);
   st.table_syncs = table_syncs_.load(std::memory_order_relaxed);
