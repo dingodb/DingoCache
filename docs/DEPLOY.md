@@ -110,6 +110,10 @@ Type=simple
 ExecStart=/usr/local/bin/dfkv_mds --listen 9400 --etcd 127.0.0.1:2379 --metrics-port 9410
 Restart=on-failure
 RestartSec=2
+# N 个连接最多占 2N+128 个 fd（每个 handler 处理请求时还要连一次 etcd），默认
+# DFKV_MDS_MAX_CONNS=4096 需要 8320。systemd 默认软上限通常只有 1024；dfkv_mds 启动时
+# 会把软上限提到硬上限以内够用的值，硬上限仍不够则下调连接上限并打 WARN。这里显式给足。
+LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 ```
@@ -544,6 +548,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `--put-inflight-limit` / `DFKV_PUT_INFLIGHT_LIMIT` | `0`=关 | 前台 PUT 接纳上限（RAM 与直接盘写）；超限在接纳前返回 kCacheFull，后台 flush 不受限 |
 | `--tcp-max-conns` / `DFKV_TCP_MAX_CONNS` | `512`, 硬上限 4096 | cache TCP handler 上限；超限 accept 恒拒 |
 | `--tcp-io-timeout-s` / `DFKV_TCP_IO_TIMEOUT_S` | `60`, 硬上限 3600 | per-syscall RCVTIMEO（秒） |
+| `DFKV_RDMA_MAX_PENDING_HANDSHAKES` | `4096`，`0`=不限 | RDMA bootstrap 监听上“已 accept、bootstrap 帧尚未收齐”的连接数上限；超限的新连接不建线程直接关闭并计入 `dfkv_rdma_rejected_connections_total`。只计还没发完帧的连接，已建立的 RDMA 连接数不受它限制。客户端 connect 之后要先建好自己的 QP 才发帧，所以名额从 accept 一直占到客户端 QP 创建完成；大批客户端同时重连（例如 server 重启后）时，在途数约等于 accept 速率 × 客户端建 QP 的耗时。被拒的客户端表现为 bootstrap 失败并重试。此上限用来挡只连接不发帧的对端；`dfkv_rdma_rejected_connections_total` 在集中重连期间增长说明上限偏小，应调大。bootstrap 帧须在 accept 后 10 s 内收齐（absolute deadline，不可配） |
 | `--rdma-depth` / `DFKV_RDMA_DEPTH` | `4` | server ceiling；client scalar=1，batch按实际window选择depth class后再协商取min |
 | `--rdma-numa` / `DFKV_RDMA_NUMA` | `0` | NUMA-aware rail choice（off/1） |
 | `--rdma-idle-ms` / `DFKV_RDMA_IDLE_MS` | — | idle connection reaper tick |

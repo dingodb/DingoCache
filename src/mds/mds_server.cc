@@ -9,6 +9,7 @@
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -214,6 +215,46 @@ Status MdsServer::Start(int port) {
   socklen_t sl = sizeof(sa);
   ::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&sa), &sl);
   port_ = ntohs(sa.sin_port);
+  // DFKV_MDS_MAX_CONNS caps the handler-thread count so a connect flood
+  // degrades to refused conns instead of unbounded threads. It is reconciled
+  // with the descriptor limit here: a cap the process has no descriptors for
+  // is not a cap, it is accept() and the etcd dials failing together.
+  size_t max_conns = kDefaultMaxConns;
+  if (const char* v = std::getenv("DFKV_MDS_MAX_CONNS")) {
+    const long m = std::atol(v);
+    if (m > 0) max_conns = static_cast<size_t>(m);
+  }
+  rlimit nofile{};
+  if (::getrlimit(RLIMIT_NOFILE, &nofile) == 0) {
+    const MdsDescriptorPlan plan =
+        PlanMdsDescriptors(max_conns, nofile.rlim_cur, nofile.rlim_max);
+    if (plan.soft_limit != nofile.rlim_cur) {
+      rlimit raised = nofile;
+      raised.rlim_cur = static_cast<rlim_t>(plan.soft_limit);
+      if (::setrlimit(RLIMIT_NOFILE, &raised) == 0) {
+        DFKV_LOG_INFO("mds: raised the open-file soft limit from " +
+                      std::to_string(nofile.rlim_cur) + " to " +
+                      std::to_string(plan.soft_limit) + " for " +
+                      std::to_string(max_conns) + " connections");
+        nofile = raised;
+      }
+    }
+    // Recomputed from the limit actually in force, in case the raise failed.
+    const size_t fits =
+        PlanMdsDescriptors(max_conns, nofile.rlim_cur, nofile.rlim_cur)
+            .max_conns;
+    if (fits < max_conns) {
+      DFKV_LOG_WARN("mds: DFKV_MDS_MAX_CONNS=" + std::to_string(max_conns) +
+                    " needs " + std::to_string(MdsDescriptorsFor(max_conns)) +
+                    " open files but the limit is " +
+                    std::to_string(nofile.rlim_cur) +
+                    "; serving at most " + std::to_string(fits) +
+                    " connections. Raise LimitNOFILE (ulimit -n) to lift this.");
+      max_conns = fits;
+    }
+  }
+  max_conns_ = max_conns;
+  config_dump::RecordResolved("DFKV_MDS_MAX_CONNS", std::to_string(max_conns_));
   running_ = true;
   accept_thread_ = std::thread([this] { NameThisThread("mds-accept"); AcceptLoop(); });
   return Status::kOk;
@@ -258,18 +299,11 @@ void MdsServer::AcceptLoop() {
   // bootstrap does. Legit clients speak every few seconds (member poll /
   // heartbeat), far inside the 60 s default; a timed-out ReadAll/WriteAll
   // returns false and the handler closes the conn (the client re-dials).
-  // DFKV_MDS_IO_TIMEOUT_S tunes it (tests use 1); DFKV_MDS_MAX_CONNS caps the
-  // handler-thread count so a connect flood degrades to refused conns instead
-  // of unbounded threads.
+  // DFKV_MDS_IO_TIMEOUT_S tunes it (tests use 1).
   long tmo_s = 60;
   if (const char* v = std::getenv("DFKV_MDS_IO_TIMEOUT_S")) {
     const long t = std::atol(v);
     if (t > 0) tmo_s = t;
-  }
-  size_t max_conns = 4096;
-  if (const char* v = std::getenv("DFKV_MDS_MAX_CONNS")) {
-    const long m = std::atol(v);
-    if (m > 0) max_conns = static_cast<size_t>(m);
   }
   // First-frame ABSOLUTE deadline (DFKV_MDS_FIRST_REQ_MS, default 30000,
   // 0=disabled): the per-syscall SO_RCVTIMEO above only bounds ONE recv, so a
@@ -291,11 +325,15 @@ void MdsServer::AcceptLoop() {
   // Recorded from the accept thread's prologue (runs at Start, before main
   // reaches Emit after its network etcd probe) so the dump shows these defaults.
   config_dump::RecordResolved("DFKV_MDS_IO_TIMEOUT_S", std::to_string(tmo_s));
-  config_dump::RecordResolved("DFKV_MDS_MAX_CONNS", std::to_string(max_conns));
   config_dump::RecordResolved("DFKV_MDS_FIRST_REQ_MS", std::to_string(first_req_ms));
   while (running_) {
     int fd = ::accept(listen_fd_, nullptr, nullptr);
-    if (fd < 0) { if (!running_) break; continue; }
+    if (fd < 0) {
+      const int err = errno;
+      if (!running_) break;
+      accept_guard_.OnAcceptError(err, running_);
+      continue;
+    }
     int one = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     timeval tv{tmo_s, 0};
@@ -304,8 +342,7 @@ void MdsServer::AcceptLoop() {
     std::lock_guard<std::mutex> lk(conn_mu_);
     if (!running_) { ::close(fd); break; }
     ReapDoneLocked();  // join handlers that finished since the last accept
-    if (conns_.size() >= max_conns) { ::close(fd); continue; }
-    conn_fds_.push_back(fd);
+    if (conns_.size() >= max_conns_) { ::close(fd); continue; }
     // The deadline is stamped at ACCEPT time (before the handler thread even
     // starts), so a thread-start delay can never extend it.
     const auto first_req_deadline =
@@ -314,18 +351,26 @@ void MdsServer::AcceptLoop() {
                   std::chrono::milliseconds(first_req_ms)
             : std::chrono::steady_clock::time_point::max();
     auto done = std::make_shared<std::atomic<bool>>(false);
-    conns_.push_back({std::thread([this, fd, done, tmo_s, first_req_deadline] {
-                        NameThisThread("mds-conn");
-                        Handle(fd, tmo_s, first_req_deadline);
-                        {
-                          std::lock_guard<std::mutex> lk(conn_mu_);
-                          for (auto it = conn_fds_.begin(); it != conn_fds_.end(); ++it)
-                            if (*it == fd) { conn_fds_.erase(it); break; }
-                        }
-                        ::close(fd);
-                        done->store(true, std::memory_order_release);  // last act
-                      }),
-                      done});
+    std::thread handling;
+    if (!net::StartThread(&handling, [this, fd, done, tmo_s, first_req_deadline] {
+          NameThisThread("mds-conn");
+          Handle(fd, tmo_s, first_req_deadline);
+          {
+            // Taken only after the accept loop, which holds conn_mu_ across
+            // the thread start, has recorded this fd.
+            std::lock_guard<std::mutex> lk(conn_mu_);
+            for (auto it = conn_fds_.begin(); it != conn_fds_.end(); ++it)
+              if (*it == fd) { conn_fds_.erase(it); break; }
+          }
+          ::close(fd);
+          done->store(true, std::memory_order_release);  // last act
+        })) {
+      accept_guard_.OnThreadStartFailure();
+      ::close(fd);
+      continue;
+    }
+    conn_fds_.push_back(fd);
+    conns_.push_back({std::move(handling), done});
   }
 }
 
@@ -524,6 +569,27 @@ Status MdsServer::ListGroups(std::string* out) {
   }
   *out = std::move(joined);
   return Status::kOk;
+}
+
+std::string MdsServer::ListenerMetricsText() const {
+  std::string s;
+  auto m = [&](const char* name, const char* type, const char* help,
+               uint64_t v) {
+    s += "# HELP "; s += name; s += " "; s += help; s += "\n";
+    s += "# TYPE "; s += name; s += " "; s += type; s += "\n";
+    s += name; s += " "; s += std::to_string(v); s += "\n";
+  };
+  m("dfkv_mds_max_conns", "gauge",
+    "Connection cap in force (DFKV_MDS_MAX_CONNS fitted to the open-file limit)",
+    max_conns_);
+  m("dfkv_mds_accept_failures_total", "counter",
+    "accept() failures from descriptor or memory exhaustion; the listener "
+    "backed off after each",
+    AcceptFailures());
+  m("dfkv_mds_thread_start_failures_total", "counter",
+    "Connections refused because their handler thread could not be created",
+    ThreadStartFailures());
+  return s;
 }
 
 std::string MdsServer::GroupMetricsText(bool* etcd_reachable) {

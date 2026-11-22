@@ -17,9 +17,13 @@
 #include "transport/rdma_topology.h"
 #include "transport/rdma_protocol.h"
 #include "transport/rdma_verbs.h"
+#include "utils/accept_guard.h"
 #include "utils/net_util.h"
 
+#include "../utils/fd_exhaustion.h"
+
 #include <gtest/gtest.h>
+#include <poll.h>
 #include <sys/mman.h>  // shm_unlink (node-dedup test)
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -98,7 +102,18 @@ class RdmaServerTestPeer {
     server->ForgetLegacyConnection(token);
   }
   static void ServeBootstrap(RdmaServer* server, int fd) {
-    server->Serve(fd);
+    server->Serve(fd, std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(
+                              RdmaServer::kBootstrapReadMs));
+  }
+  static void SetBootstrapReadMs(RdmaServer* server, int ms) {
+    server->bootstrap_read_ms_ = ms;
+  }
+  static void SetMaxPendingHandshakes(RdmaServer* server, uint64_t limit) {
+    server->max_pending_handshakes_ = limit;
+  }
+  static uint64_t MaxPendingHandshakes(const RdmaServer& server) {
+    return server.max_pending_handshakes_;
   }
   static void FailPinnedRegistration(RdmaServer& server) {
     server.fail_pinned_registration_for_test_ = true;
@@ -7076,4 +7091,264 @@ TEST(RdmaLoopback,
   EXPECT_FALSE(posted_put.retry);
   EXPECT_FALSE(posted_put.cross_rail);
   EXPECT_EQ(posted_put.excluded, (std::vector<uint8_t>{0, 0}));
+}
+
+// The bootstrap listener of a started server, without a verbs device: rail
+// discovery and anchors are faked, the TCP accept loop and Serve() are real.
+// Capability probes are answered before any QP is created, so they tell
+// whether the listener is serving.
+struct BootstrapListener {
+  ScopedEnv configured_device{"DFKV_RDMA_DEV", nullptr};
+  ScopedEnv recv_segment{"DFKV_RDMA_RECV_SEGMENT_SIZE", "1048576"};
+  RdmaServer server{RdmaServer::Handler{}, kMaxMsg};
+
+  BootstrapListener() {
+    RdmaServerTestPeer::SetDiscovery(
+        &server, [](const std::vector<std::string>&, rdma::RdmaDiscoveryPolicy) {
+          rdma::RdmaDevInfo device;
+          device.name = "fake_rail";
+          device.active = true;
+          rdma::RdmaDiscoveryResult result;
+          result.devices = {device};
+          return result;
+        });
+    RdmaServerTestPeer::SetInitializeAnchor(
+        &server, [](const std::string&, void*, size_t) {
+          return std::make_unique<rdma::RcEndpoint>();
+        });
+  }
+
+  int Connect() const {
+    return net::Dial("127.0.0.1:" + std::to_string(server.port()), 2000, 2000);
+  }
+  // Sends a capability probe on `fd`; true when the server answered it.
+  static bool ProbeOn(int fd) {
+    char request[rdma::kDevNameBytes];
+    rdma::EncodeDevFrame(rdma::kV2ProbeDevice, 4u << 20, request);
+    char reply[rdma::kV2ProbeReplyBytes];
+    return net::WriteAll(fd, request, sizeof(request)) &&
+           net::ReadAll(fd, reply, sizeof(reply)) &&
+           rdma::ParseV2ProbeReply(reply);
+  }
+  // Blocks until the server has closed its end of `fd`. The server's
+  // descriptor for the connection is free again by then, which matters to a
+  // test that counts free descriptors.
+  static void WaitServerClosed(int fd) {
+    char byte;
+    while (::recv(fd, &byte, 1, 0) > 0) {
+    }
+  }
+  bool Probe() const {
+    const int fd = Connect();
+    if (fd < 0) return false;
+    const bool answered = ProbeOn(fd);
+    WaitServerClosed(fd);
+    ::close(fd);
+    return answered;
+  }
+};
+
+template <class Predicate>
+bool EventuallyTrue(Predicate predicate, int timeout_ms = 3000) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(timeout_ms);
+  while (!predicate()) {
+    if (std::chrono::steady_clock::now() >= deadline) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return true;
+}
+
+TEST(RdmaBootstrapListener, ThreadThatCannotStartRefusesOnlyThatConnection) {
+  BootstrapListener listener;
+  ASSERT_EQ(listener.server.Start(0), Status::kOk);
+  ASSERT_TRUE(listener.Probe());
+
+  net::g_fail_thread_starts_for_test.store(1);
+  EXPECT_FALSE(listener.Probe()) << "the connection without a thread is closed";
+  net::g_fail_thread_starts_for_test.store(0);
+  EXPECT_EQ(listener.server.ThreadStartFailures(), 1u);
+  EXPECT_EQ(listener.server.PendingHandshakes(), 0u);
+
+  EXPECT_TRUE(listener.Probe()) << "the server keeps serving";
+  EXPECT_NE(listener.server.MetricsText().find(
+                "dfkv_rdma_thread_start_failures_total 1\n"),
+            std::string::npos);
+  listener.server.Stop();
+}
+
+TEST(RdmaBootstrapListener, PendingHandshakeLimitRefusesAndRecovers) {
+  BootstrapListener listener;
+  RdmaServerTestPeer::SetMaxPendingHandshakes(&listener.server, 2);
+  ASSERT_EQ(listener.server.Start(0), Status::kOk);
+
+  // Two peers that connect and send nothing use the limit up.
+  const int silent_a = listener.Connect();
+  const int silent_b = listener.Connect();
+  ASSERT_GE(silent_a, 0);
+  ASSERT_GE(silent_b, 0);
+  ASSERT_TRUE(EventuallyTrue(
+      [&] { return listener.server.PendingHandshakes() == 2; }));
+
+  EXPECT_FALSE(listener.Probe());
+  EXPECT_EQ(listener.server.RejectedConnections(), 1u);
+  EXPECT_EQ(listener.server.PendingHandshakes(), 2u)
+      << "a refused connection takes no slot";
+
+  // One of them goes away: its slot is free again.
+  ::close(silent_a);
+  ASSERT_TRUE(EventuallyTrue(
+      [&] { return listener.server.PendingHandshakes() == 1; }));
+  EXPECT_TRUE(listener.Probe());
+  ASSERT_TRUE(EventuallyTrue(
+      [&] { return listener.server.PendingHandshakes() == 1; }))
+      << "an answered probe gives its slot back";
+  EXPECT_EQ(listener.server.RejectedConnections(), 1u);
+  const std::string metrics = listener.server.MetricsText();
+  EXPECT_NE(metrics.find("dfkv_rdma_rejected_connections_total 1\n"),
+            std::string::npos);
+  EXPECT_NE(metrics.find("dfkv_rdma_pending_handshakes 1\n"),
+            std::string::npos);
+  ::close(silent_b);
+  listener.server.Stop();
+}
+
+TEST(RdmaBootstrapListener, PendingHandshakeLimitZeroIsUnlimited) {
+  BootstrapListener listener;
+  RdmaServerTestPeer::SetMaxPendingHandshakes(&listener.server, 0);
+  ASSERT_EQ(listener.server.Start(0), Status::kOk);
+  std::vector<int> silent;
+  for (int i = 0; i < 8; ++i) silent.push_back(listener.Connect());
+  ASSERT_TRUE(EventuallyTrue(
+      [&] { return listener.server.PendingHandshakes() == 8; }));
+  EXPECT_TRUE(listener.Probe());
+  EXPECT_EQ(listener.server.RejectedConnections(), 0u);
+  for (int fd : silent) ::close(fd);
+  listener.server.Stop();
+}
+
+TEST(RdmaBootstrapListener, PendingHandshakeLimitComesFromTheEnvironment) {
+  {
+    ScopedEnv limit("DFKV_RDMA_MAX_PENDING_HANDSHAKES", "7");
+    RdmaServer server(RdmaServer::Handler{}, kMaxMsg);
+    EXPECT_EQ(RdmaServerTestPeer::MaxPendingHandshakes(server), 7u);
+  }
+  {
+    ScopedEnv limit("DFKV_RDMA_MAX_PENDING_HANDSHAKES", "-1");
+    RdmaServer server(RdmaServer::Handler{}, kMaxMsg);
+    EXPECT_EQ(RdmaServerTestPeer::MaxPendingHandshakes(server), 4096u)
+        << "a value that is not a number keeps the default";
+  }
+  {
+    ScopedEnv limit("DFKV_RDMA_MAX_PENDING_HANDSHAKES", "0");
+    RdmaServer server(RdmaServer::Handler{}, kMaxMsg);
+    EXPECT_EQ(RdmaServerTestPeer::MaxPendingHandshakes(server), 0u);
+  }
+}
+
+// A peer that sends one byte at a time stays inside any per-recv timeout. The
+// bootstrap frames have to be complete by the deadline however they arrive.
+TEST(RdmaBootstrapListener, SlowDripPeerIsDroppedAtTheBootstrapDeadline) {
+  BootstrapListener listener;
+  RdmaServerTestPeer::SetBootstrapReadMs(&listener.server, 300);
+  ASSERT_EQ(listener.server.Start(0), Status::kOk);
+  const int fd = listener.Connect();
+  ASSERT_GE(fd, 0);
+
+  char frame[rdma::kDevNameBytes];
+  rdma::EncodeDevFrame(rdma::kV2ProbeDevice, 4u << 20, frame);
+  const auto started = std::chrono::steady_clock::now();
+  bool closed = false;
+  // At 100 ms a byte the 32-byte frame would take 3.2 s to arrive.
+  for (size_t i = 0; i < sizeof(frame) && !closed; ++i) {
+    if (!net::WriteAll(fd, frame + i, 1)) {
+      closed = true;
+      break;
+    }
+    pollfd waiting{fd, POLLIN, 0};
+    if (::poll(&waiting, 1, 100) > 0) {
+      char byte;
+      closed = ::recv(fd, &byte, 1, 0) <= 0;
+    }
+  }
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started);
+  ::close(fd);
+  EXPECT_TRUE(closed);
+  EXPECT_LT(elapsed.count(), 3000);
+  EXPECT_TRUE(EventuallyTrue(
+      [&] { return listener.server.PendingHandshakes() == 0; }));
+  listener.server.Stop();
+}
+
+// With no descriptor left accept() fails at once, every time, while the peer
+// stays queued. The listener has to wait between attempts instead of spinning,
+// serve the queued peer once descriptors are back, and still stop promptly.
+TEST(RdmaBootstrapListener, DescriptorExhaustionBacksOffAndRecovers) {
+  const int result = testing_fd::RunInChild([] {
+    BootstrapListener listener;
+    if (listener.server.Start(0) != Status::kOk) return 10;
+    if (!listener.Probe()) return 11;
+
+    // Dial() needs a descriptor, so open the sockets before taking them away.
+    const int queued = listener.Connect();
+    const int second = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (queued < 0 || second < 0) return 12;
+    // `queued` may already have its thread; wait until it is counted so that
+    // the accept loop is back in accept() when the limit drops.
+    if (!EventuallyTrue(
+            [&] { return listener.server.PendingHandshakes() == 1; }))
+      return 13;
+
+    testing_fd::NoFreeDescriptors exhausted;
+    if (!exhausted.active()) return 14;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(static_cast<uint16_t>(listener.server.port()));
+    if (::connect(second, reinterpret_cast<sockaddr*>(&address),
+                  sizeof(address)) != 0)
+      return 15;
+
+    const double cpu_before = testing_fd::ProcessCpuSeconds();
+    const auto wall_before = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const double cpu_used = testing_fd::ProcessCpuSeconds() - cpu_before;
+    const uint64_t failures = listener.server.AcceptFailures();
+    if (failures == 0) return 16;   // the failure was not seen or not counted
+    // One attempt per backoff, however long this thread actually slept.
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - wall_before)
+            .count();
+    if (failures > static_cast<uint64_t>(elapsed_ms) /
+                           net::AcceptGuard::kBackoffMs + 2)
+      return 17;  // retried without waiting
+    if (cpu_used > 0.2) return 18;  // spun instead of sleeping
+
+    exhausted.Restore();
+    if (!BootstrapListener::ProbeOn(second)) return 19;  // served afterwards
+    if (!BootstrapListener::ProbeOn(queued)) return 20;
+    BootstrapListener::WaitServerClosed(second);
+    BootstrapListener::WaitServerClosed(queued);
+
+    // Stopping while the loop is backing off must not wait out anything long.
+    const int third = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (third < 0) return 21;
+    testing_fd::NoFreeDescriptors exhausted_again;
+    if (!exhausted_again.active()) return 22;
+    if (::connect(third, reinterpret_cast<sockaddr*>(&address),
+                  sizeof(address)) != 0)
+      return 23;
+    if (!EventuallyTrue(
+            [&] { return listener.server.AcceptFailures() > failures; }))
+      return 24;
+    const auto stop_started = std::chrono::steady_clock::now();
+    listener.server.Stop();
+    if (std::chrono::steady_clock::now() - stop_started >
+        std::chrono::seconds(2))
+      return 25;
+    return 0;
+  });
+  EXPECT_EQ(result, 0) << "step code from the child, see the test body";
 }

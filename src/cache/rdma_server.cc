@@ -103,6 +103,26 @@ size_t RecvChunkBytes(size_t max_bytes) {
   return bytes;
 }
 
+// Strict parse: anything but a plain number keeps the default, so a typo can
+// neither lift the limit nor set it to something tiny.
+uint64_t MaxPendingHandshakes(uint64_t fallback) {
+  const char* value = std::getenv("DFKV_RDMA_MAX_PENDING_HANDSHAKES");
+  uint64_t out = fallback;
+  if (value && *value) {
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (*value >= '0' && *value <= '9' && errno == 0 && *end == '\0')
+      out = parsed;
+    else
+      DFKV_LOG_WARN(std::string("invalid DFKV_RDMA_MAX_PENDING_HANDSHAKES='") +
+                    value + "'; using " + std::to_string(fallback));
+  }
+  config_dump::RecordResolved("DFKV_RDMA_MAX_PENDING_HANDSHAKES",
+                              std::to_string(out));
+  return out;
+}
+
 uint64_t RecvChunkIdleMs() {
   constexpr uint64_t kDefault = 60000;
   const char* value = std::getenv("DFKV_RDMA_RECV_CHUNK_IDLE_MS");
@@ -197,6 +217,7 @@ RdmaServer::RdmaServer(Handler handler, size_t max_msg,
     if (e && *e) dev_name_ = e;
   }
   auto_device_ = dev_name_.empty();
+  max_pending_handshakes_ = MaxPendingHandshakes(kDefaultMaxPendingHandshakes);
   config_dump::RecordResolved("DFKV_RDMA_DEV",
                               dev_name_.empty() ? "(auto)" : dev_name_);
   // --rdma-dev accepts a comma list; every selected device gets a lifetime
@@ -469,21 +490,50 @@ size_t RdmaServer::live_conn_count() {
 void RdmaServer::AcceptLoop() {
   while (running_) {
     int fd = ::accept(listen_fd_, nullptr, nullptr);
-    if (fd < 0) { if (!running_) break; continue; }
+    if (fd < 0) {
+      const int err = errno;
+      if (!running_) break;
+      accept_guard_.OnAcceptError(err, running_);
+      continue;
+    }
+    // Anchored at accept: time spent waiting for the thread counts against the
+    // peer's budget.
+    const auto bootstrap_deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(bootstrap_read_ms_);
+    // Refuse before spending a thread. Only connections whose bootstrap frames
+    // are still outstanding count, so established connections, however many,
+    // never use this limit up.
+    if (max_pending_handshakes_ != 0 &&
+        pending_handshakes_.load(std::memory_order_relaxed) >=
+            max_pending_handshakes_) {
+      rejected_connections_.fetch_add(1, std::memory_order_relaxed);
+      accept_guard_.LogRejected(
+          "refusing connection: " + std::to_string(max_pending_handshakes_) +
+          " connections have not sent their bootstrap frames "
+          "(DFKV_RDMA_MAX_PENDING_HANDSHAKES)");
+      ::close(fd);
+      continue;
+    }
     int one = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    timeval tv{10, 0};  // bound the bootstrap handshake so a stalled client
-    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));  // can't hang Stop()
     std::lock_guard<std::mutex> lk(conn_mu_);
     if (!running_) { ::close(fd); break; }
     ReapDoneLocked();  // reap connections that finished since the last accept
     auto done = std::make_shared<std::atomic<bool>>(false);
-    conns_.push_back({std::thread([this, fd, done] {
-                        NameThisThread("rdma-serve");
-                        Serve(fd);
-                        done->store(true, std::memory_order_release);  // last act
-                      }),
-                      done});
+    pending_handshakes_.fetch_add(1, std::memory_order_relaxed);
+    std::thread serving;
+    if (!net::StartThread(&serving, [this, fd, done, bootstrap_deadline] {
+          NameThisThread("rdma-serve");
+          Serve(fd, bootstrap_deadline, &pending_handshakes_);
+          done->store(true, std::memory_order_release);  // last act
+        })) {
+      pending_handshakes_.fetch_sub(1, std::memory_order_relaxed);
+      accept_guard_.OnThreadStartFailure();
+      ::close(fd);
+      continue;
+    }
+    conns_.push_back({std::move(serving), done});
   }
 }
 
@@ -619,11 +669,27 @@ rdma::RecvSegmentPool::Lease RdmaServer::AllocateReceiveWithPressure(
   return lease;
 }
 
-void RdmaServer::Serve(int boot_fd) {
+void RdmaServer::Serve(
+    int boot_fd, std::chrono::steady_clock::time_point bootstrap_deadline,
+    std::atomic<uint64_t>* pending) {
+  // Leaves the pending count once the peer's frames are in, or on any earlier
+  // return.
+  struct PendingHandshake {
+    std::atomic<uint64_t>* count;
+    void Release() {
+      if (count) count->fetch_sub(1, std::memory_order_relaxed);
+      count = nullptr;
+    }
+    ~PendingHandshake() { Release(); }
+  } pending_handshake{pending};
+  // Both reads below share one absolute deadline: a per-recv timeout would let
+  // a peer that sends a byte every few seconds hold this thread for minutes.
+  const timeval no_per_recv_cap{0, 0};
   // Bootstrap: client first names the device it wants us to use (same rail for
   // multi-rail); fall back to our configured default if it sends an empty name.
   char devbuf[rdma::kDevNameBytes];
-  if (!net::ReadAll(boot_fd, devbuf, rdma::kDevNameBytes)) {
+  if (!net::ReadAllWithin(boot_fd, devbuf, rdma::kDevNameBytes,
+                          no_per_recv_cap, bootstrap_deadline)) {
     ::close(boot_fd);
     return;
   }
@@ -709,10 +775,12 @@ void RdmaServer::Serve(int boot_fd) {
   // before allocating per-connection control slots or leasing shared receive
   // space; a client advertising depth 1 must consume one slot, not ServerDepth.
   char peer[rdma::kQpInfoBytes];
-  if (!net::ReadAll(boot_fd, peer, sizeof(peer))) {
+  if (!net::ReadAllWithin(boot_fd, peer, sizeof(peer), no_per_recv_cap,
+                          bootstrap_deadline)) {
     ::close(boot_fd);
     return;
   }
+  pending_handshake.Release();
   const rdma::QpInfo peer_info = rdma::ParseQpInfo(peer);
   if (peer_info.protocol_version != rdma::kDevProtoV2 ||
       peer_info.depth == 0) {
@@ -2084,6 +2152,19 @@ std::string RdmaServer::MetricsText() const {
     InitializedRailCount());
   m(s, "dfkv_rdma_v2_conns_opened_total", "counter",
     "RDMA v2 connections opened", V2Conns());
+  m(s, "dfkv_rdma_pending_handshakes", "gauge",
+    "Accepted bootstrap connections whose bootstrap frames have not arrived",
+    PendingHandshakes());
+  m(s, "dfkv_rdma_rejected_connections_total", "counter",
+    "Bootstrap connections refused at the pending-handshake limit",
+    RejectedConnections());
+  m(s, "dfkv_rdma_accept_failures_total", "counter",
+    "accept() failures from descriptor or memory exhaustion; the bootstrap "
+    "listener backed off after each",
+    AcceptFailures());
+  m(s, "dfkv_rdma_thread_start_failures_total", "counter",
+    "Bootstrap connections refused because their thread could not be created",
+    ThreadStartFailures());
   m(s, "dfkv_rdma_v2_put_writes_total", "counter",
     "PUT requests received by RDMA WRITE_WITH_IMM", V2PutWrites());
   const rdma::RecvSegmentPool::Stats segment = recv_segments_.stats();

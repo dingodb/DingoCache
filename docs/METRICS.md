@@ -51,7 +51,8 @@ etcd 读负载。运行期依赖丢失时 `/readyz` 从 200 变 503，scheduler 
 | `DFKV_METRICS_FIRST_REQ_MS` | 30000（0=关，硬上限 3600000） | metrics HTTP 首行请求 absolute deadline（accept 起算），防 drip/silent 连接占 handler |
 | `DFKV_METRICS_MAX_CONNS` | 64（硬上限 4096） | metrics HTTP 并发连接上限，超限直接关闭 |
 | `DFKV_MDS_FIRST_REQ_MS` | 30000（0=关，硬上限 3600000） | `dfkv_mds` 控制面首帧 absolute deadline |
-| `DFKV_MDS_MAX_CONNS` | 4096 | `dfkv_mds` 并发连接上限 |
+| `DFKV_MDS_MAX_CONNS` | 4096 | `dfkv_mds` 并发连接上限。N 个连接最多需要 2N+128 个 fd；启动时软上限不足会先在硬上限内提高，仍不足则下调本上限并打 WARN，生效值见 `dfkv_mds_max_conns` |
+| `DFKV_RDMA_MAX_PENDING_HANDSHAKES` | 4096（0=不限） | `dfkv_server` RDMA bootstrap 监听上尚未收齐 bootstrap 帧的连接数上限，超限直接关闭；不限制已建立的 RDMA 连接数 |
 | `DFKV_MDS_PROBE_CACHE_MS` | 2500（0=逐请求现场 probe，钳制上限 600000） | `dfkv_mds` `/readyz` etcd probe TTL 去抖 |
 | `DFKV_MDS_UNWRITTEN_HOLD_MS` | 120000（4×lease TTL；0=关，钳制上限 600000） | `dfkv_mds` 把“心跳已到但没写进 etcd”的 member 视为存活的时长；期间 etcd 视图缺少该 member 则 member list 返回 `kIOError`（见 §3.2）。须大于 MDS 端点数 × 10s 心跳间隔 |
 | `DFKV_TCP_FIRST_REQ_MS` | 30000（0=关，硬上限 3600000） | `dfkv_server` 数据面首帧 absolute deadline；resolved 值见 `dfkv_tcp_first_req_ms` |
@@ -194,6 +195,10 @@ RDMA-listener scrape inventory。
 | `dfkv_rdma_completions_total` / `dfkv_rdma_completion_errors_total` | counter | RDMA 请求完成 / 错误完成 |
 | `dfkv_rdma_active_conns` | gauge | 当前服务中的 RDMA 连接；连接关闭时，要等它占用的 endpoint、接收段和连接计量都释放之后才减 |
 | `dfkv_rdma_v2_conns_opened_total` | counter | server 累计打开的 v2 连接 |
+| `dfkv_rdma_pending_handshakes` | gauge | 已 accept、bootstrap 帧尚未收齐的连接数。正常接近 0；集中重连时会短暂升高（客户端建 QP 期间一直计入）；持续偏高 = 有只连接不发帧的对端（端口扫描、只做 TCP connect 的探活、卡住的客户端） |
+| `dfkv_rdma_rejected_connections_total` | counter | 达到 `DFKV_RDMA_MAX_PENDING_HANDSHAKES` 后被直接关闭的 bootstrap 连接；增长时先看上一行是谁占住了名额。名额从 accept 占到客户端建完 QP 并发出帧为止，所以在大批客户端集中重连期间增长说明上限偏小，应调大 |
+| `dfkv_rdma_accept_failures_total` | counter | bootstrap 监听 `accept()` 因 fd 或内存耗尽（EMFILE/ENFILE/ENOBUFS/ENOMEM 等非单连接错误）失败的次数；每次失败后退避 100 ms 再试。增长 = 进程 fd 上限或主机内存不足 |
+| `dfkv_rdma_thread_start_failures_total` | counter | 因线程创建失败而拒绝的 bootstrap 连接（进程继续运行）。增长 = 触到线程数上限（systemd `TasksMax`、cgroup `pids.max`）或内存不足 |
 | `dfkv_rdma_v2_put_writes_total` | counter | server 实际收到的 `WRITE_WITH_IMM` PUT |
 | `dfkv_rdma_recv_segment_bytes` / `max_bytes` / `chunks` | gauge | receive-pool 当前提交量 / hard budget / 已提交 chunk 数 |
 | `dfkv_rdma_recv_segment_used_bytes` / `free_bytes` | gauge | 已提交 chunk 中所有 lease 占用 / 全部空闲字节，**含 staging 专用 chunk**；后者不等于连接可分配字节 |
@@ -336,6 +341,9 @@ TTL-debounced etcd probe 判定（`DFKV_MDS_PROBE_CACHE_MS`，默认 2500 ms 内
 | `dfkv_mds_list_requests_total` | counter | ListMembers 次数 |
 | `dfkv_mds_lease_grants_total` | counter | etcd lease 授予 |
 | `dfkv_mds_etcd_errors_total` | counter | etcd I/O 失败 |
+| `dfkv_mds_max_conns` | gauge | 生效的并发连接上限：`DFKV_MDS_MAX_CONNS` 按进程 fd 上限折算后的值；小于配置值说明 `LimitNOFILE` 不够 |
+| `dfkv_mds_accept_failures_total` | counter | MDS 监听 `accept()` 因 fd 或内存耗尽失败的次数；每次失败后退避 100 ms 再试。增长 = fd 上限不足，同时 MDS 连 etcd 也可能失败 |
+| `dfkv_mds_thread_start_failures_total` | counter | 因 handler 线程创建失败而拒绝的连接（进程继续运行） |
 | `dfkv_mds_members` | gauge | 上次 List 返回的成员数 |
 | `dfkv_mds_client_register_requests_total` / `dfkv_mds_client_keepalives_total` / `dfkv_mds_client_list_requests_total` | counter | consumer 注册 / 心跳 / ListClients |
 | `dfkv_mds_clients` | gauge | 上次 ListClients 返回的 consumer 数 |

@@ -21,6 +21,7 @@
 #include "common/config_dump.h"
 #include "mds/mds_metrics.h"
 #include "common/membership.h"
+#include "utils/accept_guard.h"
 
 
 namespace dfkv {
@@ -133,6 +134,40 @@ class UnwrittenMembers {
 // node). The MDS is the only etcd client; it holds each member's lease on the
 // node's behalf. The {key->leaseID} map is reconstructable from heartbeats, so
 // the MDS keeps no durable state. Liveness = the lease (TTL kTtlSeconds).
+// Open files the MDS needs to serve `max_conns` connections: each handler
+// holds its client socket and, while it works on a request, one socket to
+// etcd. The reserve is an estimate, about 128, for the listeners, the metrics
+// port's own connections (64 by default), the startup probe and stdio.
+constexpr uint64_t kMdsReservedDescriptors = 128;
+constexpr uint64_t MdsDescriptorsFor(uint64_t max_conns) {
+  return 2 * max_conns + kMdsReservedDescriptors;
+}
+
+struct MdsDescriptorPlan {
+  uint64_t soft_limit;  // RLIMIT_NOFILE soft limit to run with
+  size_t max_conns;     // connection cap that fits under it, at least 1
+};
+
+// Fits the requested connection cap to the open-file limit: raise the soft
+// limit toward the hard limit as far as needed (never lower it), and if even
+// the hard limit is short, shrink the cap so the etcd sockets and the
+// reserve still fit. Pure, so the arithmetic is testable without touching
+// the process's limits.
+inline MdsDescriptorPlan PlanMdsDescriptors(size_t max_conns, uint64_t soft,
+                                            uint64_t hard) {
+  const uint64_t need = MdsDescriptorsFor(max_conns);
+  MdsDescriptorPlan plan{soft, max_conns};
+  if (soft >= need) return plan;
+  plan.soft_limit = need < hard ? need : hard;
+  if (plan.soft_limit < soft) plan.soft_limit = soft;
+  if (plan.soft_limit >= need) return plan;
+  const uint64_t fits = plan.soft_limit > kMdsReservedDescriptors
+                            ? (plan.soft_limit - kMdsReservedDescriptors) / 2
+                            : 0;
+  plan.max_conns = fits == 0 ? 1 : static_cast<size_t>(fits);
+  return plan;
+}
+
 class MdsServer {
  public:
   // DFKV_MDS_ACCEPT_LEGACY (default off) widens the control-plane version
@@ -160,17 +195,26 @@ class MdsServer {
                                      std::memory_order_relaxed);
     bool ready = false;
     const std::string group_metrics = GroupMetricsText(&ready);
-    std::string out = metrics_.Render() + etcd_.MetricsText() + group_metrics;
+    std::string out = metrics_.Render() + ListenerMetricsText() +
+                      etcd_.MetricsText() + group_metrics;
     out += "# HELP dfkv_mds_ready Whether the MDS can currently reach etcd\n";
     out += "# TYPE dfkv_mds_ready gauge\n";
     out += std::string("dfkv_mds_ready ") + (ready ? "1\n" : "0\n");
     return out;
   }
   std::string GroupMetricsText(bool* etcd_reachable = nullptr);
+  std::string ListenerMetricsText() const;  // dfkv_mds_accept_*, thread starts
   // kListGroups backend: distinct group names under /dfkv/v1/groups/ (newline-
   // joined). Feeds `dfkvctl stats --all`.
   Status ListGroups(std::string* out);
   size_t live_conn_count();  // handler threads not yet reaped (test/diagnostic)
+  // DFKV_MDS_MAX_CONNS as in force after Start() fitted it to the open-file
+  // limit.
+  size_t max_conns() const { return max_conns_; }
+  uint64_t AcceptFailures() const { return accept_guard_.accept_failures(); }
+  uint64_t ThreadStartFailures() const {
+    return accept_guard_.thread_start_failures();
+  }
   // One read against etcd (a bounded RangePrefix on a probe key). Returns true
   // iff etcd answered. Used at startup to fail loud on a misconfigured --etcd
   // (a wrong endpoint/scheme otherwise runs "healthy" while every registration
@@ -220,6 +264,9 @@ class MdsServer {
   int listen_fd_ = -1;
   int port_ = 0;
   std::thread accept_thread_;
+  net::AcceptGuard accept_guard_{"mds listener"};
+  static constexpr size_t kDefaultMaxConns = 4096;
+  size_t max_conns_ = kDefaultMaxConns;  // set by Start(), then read-only
   struct Conn {
     std::thread th;
     std::shared_ptr<std::atomic<bool>> done;
