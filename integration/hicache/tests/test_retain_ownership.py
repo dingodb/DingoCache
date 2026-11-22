@@ -144,7 +144,6 @@ def _backend(*, mla=True, writer=True, tp_rank=0, kda=True, indexer=True,
     b._alog_tag = "test"
     b._has_retain = False  # writes below must not issue native RETAIN
     b._backup_exist_gate = False
-    b._put_retry_recovered = 0
     b._pool_component_names = {}
     b._pool_replicated = {}
     b.registered_pools = {}
@@ -166,7 +165,7 @@ def _backend(*, mla=True, writer=True, tp_rank=0, kda=True, indexer=True,
 
     def put(sks, *_):
         written.extend(sks)
-        return [True] * len(sks)
+        return [True] * len(sks), 0
 
     b._put_flat_impl = put
     b._put_sg_flat_impl = put

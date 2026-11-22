@@ -556,9 +556,11 @@ _MARKER_BUF = ctypes.create_string_buffer(1)
 _MARKER_PTR = ctypes.addressof(_MARKER_BUF)
 
 
-# What one _v2_io() transfer did: bytes moved, seconds in native I/O, and the
-# names of the pools that did I/O (a skipped replicated pool is not among them).
-_V2Io = collections.namedtuple("_V2Io", ("nbytes", "seconds", "pools"))
+# What one transfer did: bytes moved, seconds in native I/O, the names of the
+# pools that did I/O (a skipped replicated pool is not among them), and the
+# objects whose put failed once and succeeded on the retry.
+_V2Io = collections.namedtuple(
+    "_V2Io", ("nbytes", "seconds", "pools", "recovered"))
 
 
 def _meta_has_no_layout(meta) -> bool:
@@ -866,7 +868,6 @@ class DfkvHiCache(HiCacheStorage):
             self._backup_exist_gate = _truthy(
                 cfg.get("backup_exist_gate",
                         os.environ.get("DFKV_BACKUP_EXIST_GATE", "1")))
-            self._put_retry_recovered = 0  # last _put_flat's retry recoveries
             # self._lib was loaded above (before configure) so the native version
             # could be reported; dfkv_open uses that same handle here.
             # Namespace aliases are not configurable: this binary identity is
@@ -1463,7 +1464,7 @@ class DfkvHiCache(HiCacheStorage):
         if not name:
             return None
         try:
-            res, _nb, _s = self._sidecar_device_set(name, keys, device_indices)
+            res, _io = self._sidecar_device_set(name, keys, device_indices)
             return res
         except Exception:
             return [False] * len(keys)
@@ -1898,12 +1899,12 @@ class DfkvHiCache(HiCacheStorage):
             ptrs, sizes = meta
             sub, sks, sp, ss = self._flatten(keys, ptrs, sizes)
             t0 = time.perf_counter()
-            flat = self._put_flat(sks, sp, ss)
+            flat, recovered = self._put_flat(sks, sp, ss)
             dur = time.perf_counter() - t0
             res = self._fold(flat, n, sub)
             r.result = f"ok {sum(res)}/{n}"
-            if self._put_retry_recovered:
-                r.result += f" retry_ok={self._put_retry_recovered}"
+            if recovered:
+                r.result += f" retry_ok={recovered}"
             if _sp:
                 _sp.hits = sum(res); _sp.bytes = sum(ss)
             self._metrics.on_set(pages=n, ok_pages=sum(res), nbytes=sum(ss), seconds=dur)
@@ -1997,23 +1998,24 @@ class DfkvHiCache(HiCacheStorage):
         del key_owners
         return [out[i] == 1 for i in range(n)]
 
-    def _put_sg_flat(self, sks, seg_ptrs, seg_sizes) -> List[bool]:
-        stored = self._put_sg_flat_impl(sks, seg_ptrs, seg_sizes)
+    def _put_sg_flat(self, sks, seg_ptrs, seg_sizes):
+        """(stored per sub-key, retry recoveries); see _put_flat."""
+        stored, recovered = self._put_sg_flat_impl(sks, seg_ptrs, seg_sizes)
         self._retain_after_write(sks, stored)
-        return stored
+        return stored, recovered
 
-    def _put_sg_flat_impl(self, sks, seg_ptrs, seg_sizes) -> List[bool]:
+    def _put_sg_flat_impl(self, sks, seg_ptrs, seg_sizes):
         """SG put with the same phase-9 exist gate + single transient retry as
         _put_flat (the contiguous host put), so the L2-bypass path inherits the
         identical backup-dedup and burst-failure recovery semantics."""
-        self._put_retry_recovered = 0
+        recovered = 0
         if not sks:
-            return []
+            return [], 0
         if self._backup_exist_gate:
             present = list(self._batch_exist_flat(sks))
             todo = [i for i, p in enumerate(present) if not p]
             if not todo:
-                return [True] * len(sks)
+                return [True] * len(sks), 0
         else:
             present = [False] * len(sks)
             todo = list(range(len(sks)))
@@ -2031,9 +2033,9 @@ class DfkvHiCache(HiCacheStorage):
                 if not present[i]:
                     failed.append(i)
                 elif attempt:
-                    self._put_retry_recovered += 1
+                    recovered += 1
             todo = failed
-        return present
+        return present, recovered
 
     def batch_set_v1_device(self, keys, device_indices, extra_info=None) -> List[bool]:
         """L2-bypass write-through: RDMA a page straight from its GPU KV slots to L3
@@ -2066,12 +2068,12 @@ class DfkvHiCache(HiCacheStorage):
             self._device_direct_used = True
             nbytes = sum(sum(s) for s in ss)
             t0 = time.perf_counter()
-            flat = self._put_sg_flat(sks, sp, ss)
+            flat, recovered = self._put_sg_flat(sks, sp, ss)
             dur = time.perf_counter() - t0
             res = self._fold(flat, n, sub)
             r.result = f"ok {sum(res)}/{n} (device-direct)"
-            if self._put_retry_recovered:
-                r.result += f" retry_ok={self._put_retry_recovered}"
+            if recovered:
+                r.result += f" retry_ok={recovered}"
             if _sp:
                 _sp.hits = sum(res); _sp.bytes = nbytes
             self._metrics.on_set(pages=n, ok_pages=sum(res), nbytes=nbytes,
@@ -2302,12 +2304,17 @@ class DfkvHiCache(HiCacheStorage):
             return self._sub()
         return len(self._pool_components(pool_name))
 
-    def _put_flat(self, sks, sp, ss) -> List[bool]:
-        stored = self._put_flat_impl(sks, sp, ss)
-        self._retain_after_write(sks, stored)
-        return stored
+    def _put_flat(self, sks, sp, ss):
+        """(stored per sub-key, objects recovered by the retry).
 
-    def _put_flat_impl(self, sks, sp, ss) -> List[bool]:
+        The recovery count is returned with the result, not left on the
+        instance, where a concurrent put would overwrite it.
+        """
+        stored, recovered = self._put_flat_impl(sks, sp, ss)
+        self._retain_after_write(sks, stored)
+        return stored, recovered
+
+    def _put_flat_impl(self, sks, sp, ss):
         """batch_put with the phase-9 exist gate (sub-objects already in L3
         are reported stored without rewriting) and a single retry of failed
         keys. Under a cold-round write burst ~0.1% of puts fail transiently,
@@ -2316,14 +2323,14 @@ class DfkvHiCache(HiCacheStorage):
         then fails to retrieve (R1 finding, 2026-07-17). The burst is
         momentary, so one delayed retry recovers almost all of them; keys
         still failing stay False (honest result, as before)."""
-        self._put_retry_recovered = 0
+        recovered = 0
         if not sks:
-            return []
+            return [], 0
         if self._backup_exist_gate:
             present = list(self._batch_exist_flat(sks))
             todo = [i for i, p in enumerate(present) if not p]
             if not todo:
-                return [True] * len(sks)
+                return [True] * len(sks), 0
         else:
             present = [False] * len(sks)
             todo = list(range(len(sks)))
@@ -2344,9 +2351,9 @@ class DfkvHiCache(HiCacheStorage):
                 if not present[i]:
                     failed.append(i)
                 elif attempt:
-                    self._put_retry_recovered += 1
+                    recovered += 1
             todo = failed
-        return present
+        return present, recovered
 
     def _v2_io(self, transfers, putting):
         """One host-buffer v2 transfer: (per-pool page results, _V2Io).
@@ -2409,8 +2416,9 @@ class DfkvHiCache(HiCacheStorage):
                     sks.append(sk); sp.append(int(ptrs[i * sub + j])); ss.append(int(sizes[i * sub + j]))
             segments.append((name, len(keys), sub, start, len(sks)))
         t0 = time.perf_counter()
+        recovered = 0
         if sks and putting:
-            flat = self._put_flat(sks, sp, ss)
+            flat, recovered = self._put_flat(sks, sp, ss)
         elif sks:
             karr, klens, parr, sarr, out, key_owners = _arrays(sks, sp, ss)
             self._lib.dfkv_batch_get(
@@ -2423,7 +2431,8 @@ class DfkvHiCache(HiCacheStorage):
         # that did I/O (MLA backup_skip pools were `continue`d before
         # appending), so bytes are 0 on a pure skip.
         io = _V2Io(nbytes=sum(ss), seconds=time.perf_counter() - t0,
-                   pools=tuple(seg[0] for seg in segments))
+                   pools=tuple(seg[0] for seg in segments),
+                   recovered=recovered)
         for name, nkeys, sub, start, end in segments:
             results[name] = self._fold(flat[start:end], nkeys, sub)
         return results, io
@@ -2435,8 +2444,8 @@ class DfkvHiCache(HiCacheStorage):
                            lambda: f"{self._alog_tag} {_fmt_pools(transfers)}") as r:
             res, io = self._v2_io(transfers, putting=True)
             r.result = _fmt_pool_results(res)
-            if self._put_retry_recovered:
-                r.result += f" retry_ok={self._put_retry_recovered}"
+            if io.recovered:
+                r.result += f" retry_ok={io.recovered}"
             if _sp:
                 _sp.hits = sum(sum(rs) for rs in res.values())
             # Pool-granular metrics: report exactly the pools that performed I/O
@@ -2473,11 +2482,11 @@ class DfkvHiCache(HiCacheStorage):
     def _kv_device_set(self, keys, device_indices):
         """Core of batch_set_v1_device (device-direct SG put) without the tracing /
         access-log wrapper, so batch_set_v2_device can reuse it for the anchor KV.
-        Returns (per_page_bools, nbytes, seconds). MLA backup_skip on non-zero TP
+        Returns (per_page_bools, _V2Io). MLA backup_skip on non-zero TP
         rank (replicated latent) short-circuits to all-True, no I/O."""
         n = len(keys)
         if self.is_mla and not self._mla_replica_writer:
-            return [True] * n, 0, 0.0
+            return [True] * n, _V2Io(0, 0.0, (), 0)
         from sglang.srt.mem_cache.device_page_meta import (
             get_device_page_buffer_meta,
         )
@@ -2488,10 +2497,10 @@ class DfkvHiCache(HiCacheStorage):
         self._device_direct_used = True
         nbytes = sum(sum(s) for s in ss)
         t0 = time.perf_counter()
-        flat = self._put_sg_flat(sks, sp, ss)
+        flat, recovered = self._put_sg_flat(sks, sp, ss)
         dur = time.perf_counter() - t0
         self._log_write_keys(sks, flat, len(sks))
-        return self._fold(flat, n, sub), nbytes, dur
+        return self._fold(flat, n, sub), _V2Io(nbytes, dur, ("kv",), recovered)
 
     def _log_write_keys(self, sks, flat, nmain):
         """Log deterministic digests for the first and last written keys."""
@@ -2593,10 +2602,10 @@ class DfkvHiCache(HiCacheStorage):
         own binary pool/SG identity. The
         indexer is layer-first & PAGE-indexed; get_device_sidecar_page_buffer_meta
         yields its per-layer page-row segments from the registered sidecar device
-        pool. Returns (per_page_bools, nbytes, seconds)."""
+        pool. Returns (per_page_bools, _V2Io); no I/O on a replica follower."""
         n = len(keys)
         if self.is_mla and not self._mla_replica_writer:
-            return [True] * n, 0, 0.0
+            return [True] * n, _V2Io(0, 0.0, (), 0)
         from sglang.srt.mem_cache.device_page_meta import (
             get_device_sidecar_page_buffer_meta,
         )
@@ -2608,9 +2617,10 @@ class DfkvHiCache(HiCacheStorage):
             pool=str(name))
         nbytes = sum(sum(s) for s in ss)
         t0 = time.perf_counter()
-        flat = self._put_sg_flat(sks, sp, ss)
+        flat, recovered = self._put_sg_flat(sks, sp, ss)
         dur = time.perf_counter() - t0
-        return self._fold(flat, n, stride), nbytes, dur
+        return self._fold(flat, n, stride), _V2Io(
+            nbytes, dur, (str(name),), recovered)
 
     def _sidecar_device_get(self, name, keys, device_indices):
         """Device-direct SG get of the DSA indexer sidecar `name`: RDMA its stored
@@ -2675,9 +2685,11 @@ class DfkvHiCache(HiCacheStorage):
             stride, sks, sp, ss = self._flatten_device(
                 keys, seg_ptrs, seg_sizes,
                 keys_fn=lambda h: self._draft_keys(h, sub), sub=sub, pool=None)
-            flat = self._put_sg_flat(sks, sp, ss)
+            flat, recovered = self._put_sg_flat(sks, sp, ss)
             res = self._fold(flat, n, stride)
             r.result = f"ok {sum(res)}/{n} (draft device-direct)"
+            if recovered:
+                r.result += f" retry_ok={recovered}"
             # DSA-draft: also store the draft indexer sidecar device-direct so the
             # loaded draft page is coherent (latent + indexer). None => dense draft.
             side = self._draft_sidecar_device_set(keys, device_indices)
@@ -2740,13 +2752,14 @@ class DfkvHiCache(HiCacheStorage):
                 access_log("batch_set_v2_device",
                            lambda: f"{self._alog_tag} kv={n} "
                                    f"{_fmt_pools(sidecar_transfers)}") as r:
-            kv_res, kv_bytes, kv_secs = self._kv_device_set(kv_keys, kv_device_indices)
+            kv_res, kv_io = self._kv_device_set(kv_keys, kv_device_indices)
             results = {"kv": kv_res}
+            recovered = kv_io.recovered
             # Main-KV device write reports on_set (v1-device), matching stock DSA's
-            # anchor attribution; skip the metric on a replicated MLA follower.
-            if n and (not self.is_mla or self._mla_replica_writer):
+            # anchor attribution; no metric when it did no I/O (replica follower).
+            if n and kv_io.pools:
                 self._metrics.on_set(pages=n, ok_pages=sum(kv_res),
-                                     nbytes=kv_bytes, seconds=kv_secs)
+                                     nbytes=kv_io.nbytes, seconds=kv_io.seconds)
             # Sidecar. Task 4: a DEVICE sidecar transfer (device_indices set,
             # host_indices None) RDMAs straight from its GPU index buffer; a host
             # sidecar transfer keeps the stock host v2 path. In bypass every sidecar
@@ -2755,28 +2768,35 @@ class DfkvHiCache(HiCacheStorage):
             host_side = [tr for tr in sidecar_transfers if not _is_device_transfer(tr)]
             side_pages = side_ok = side_bytes = 0
             side_secs = 0.0
+            # Sidecar metrics count exactly the pools that did I/O: a
+            # replicated sidecar is skipped on a follower, but a rank-sharded
+            # host sidecar is written by every rank and must be counted there.
+            side_ios = []
             for tr in dev_side:
                 name = str(tr.name)
-                res, nb, secs = self._sidecar_device_set(name, tr.keys, tr.device_indices)
+                res, io = self._sidecar_device_set(name, tr.keys, tr.device_indices)
                 results[name] = res
-                side_pages += len(res); side_ok += sum(res)
-                side_bytes += nb; side_secs += secs
+                side_ios.append(({name: res}, io))
             if host_side:
-                side, _io = self._v2_io(host_side, putting=True)
+                side, io = self._v2_io(host_side, putting=True)
                 results.update(side)
-                side_pages += sum(len(rs) for rs in side.values())
-                side_ok += sum(sum(rs) for rs in side.values())
-            if side_pages and (not self.is_mla or self._mla_replica_writer):
+                side_ios.append((side, io))
+            for side, io in side_ios:
+                side_pages += sum(len(side[name]) for name in io.pools)
+                side_ok += sum(sum(side[name]) for name in io.pools)
+                side_bytes += io.nbytes; side_secs += io.seconds
+                recovered += io.recovered
+            if side_pages:
                 self._metrics.on_set_v2(
                     pages=side_pages, ok_pages=side_ok,
                     nbytes=side_bytes, seconds=side_secs)
             r.result = f"kv {sum(kv_res)}/{n} (device-direct); " + _fmt_pool_results(
                 {k: v for k, v in results.items() if k != "kv"})
-            if self._put_retry_recovered:
-                r.result += f" retry_ok={self._put_retry_recovered}"
+            if recovered:
+                r.result += f" retry_ok={recovered}"
             if _sp:
                 _sp.hits = sum(sum(rs) for rs in results.values())
-                _sp.bytes = kv_bytes + side_bytes
+                _sp.bytes = kv_io.nbytes + side_bytes
             return results
 
     def batch_get_v2_device(
