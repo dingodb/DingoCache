@@ -416,6 +416,7 @@ C 客户端快照还含传输级指标（RDMA 构建）：
 | `dfkv_rdma_client_oversize_rejects_total` | counter | 分配、注册或发帖前因超过声明上限而拒绝的操作 |
 | `dfkv_rdma_client_v2_probe_attempts_total` / `dfkv_rdma_client_v2_probe_failures_total` | counter | 必选 v2 bootstrap probe 尝试 / 失败 |
 | `dfkv_rdma_client_stale_pool_retries_total` | counter | pooled QP 失败后改用 fresh connection 的重试 |
+| `dfkv_rdma_client_stale_pool_connections_total` | counter | 从池里取出复用时即失败的连接数（对端回收了空闲连接或已重启）。这类失败只丢弃该连接，不冷却对端 rail；对端有身份（经 MDS 发现）时同 (peer, rail) 的其余空闲连接一并丢弃，静态地址列表里的对端则不丢弃其余连接，它们各自被发现失效时各计一次；随后的 fresh connection 若也失败才计入 `dfkv_rdma_client_remote_rail_failures_total` 并冷却。持续增长 = server 的空闲回收（`DFKV_RDMA_IDLE_MS`）短于 client 的连接空闲时间，可开 `DFKV_RDMA_KEEPALIVE_MS` |
 | `dfkv_rdma_client_cross_rail_retries_total` | counter | 无 label；client-local `kRailFailure` 后真正启动的 cross-rail logical retry。GET 可重试未完成 work；PUT 只有 request 未 post 才计入 |
 | `dfkv_rdma_client_cross_rail_retry_successes_total` | counter | 无 label；上述 retry 最终成功的 logical operation 数 |
 | `dfkv_rdma_client_cross_rail_retry_exhausted_total` | counter | 无 label；上述 retry 的第二次物理尝试仍失败 |

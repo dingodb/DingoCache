@@ -5226,6 +5226,153 @@ TEST(RdmaLoopback, BatchRetriesAfterServerReclaim) {
 
 }
 
+// Polls until the server serves no RDMA connection any more: its idle
+// reclaim has destroyed its side of every connection the client pooled.
+bool ServerHasNoConnections(const RdmaNode& node, int timeout_ms = 5000) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(timeout_ms);
+  while (node.rsrv->ActiveConns() != 0) {
+    if (std::chrono::steady_clock::now() >= deadline) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return true;
+}
+
+// A peer known by identity, reachable over one rail only, reclaims an idle
+// pooled connection. The operation that finds the dead connection must get
+// through on a new one over the same rail: the failure says the connection is
+// gone, not that the peer is unreachable over the rail. Cooling the rail on
+// it refused the retry and every other operation to the peer for the
+// cooldown. Static members have no peer identity and never showed this.
+TEST(RdmaLoopback, StalePooledConnectionOnTheOnlyRailRecoversOnTheRetry) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv idle_reclaim("DFKV_RDMA_IDLE_MS", "120");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  // The failed completion has to arrive before the window deadline, however
+  // long this HCA takes to exhaust its retries.
+  ScopedEnv op_timeout("DFKV_RDMA_OP_TIMEOUT_MS", "60000");
+  ScopedEnv batch_timeout("DFKV_RDMA_BATCH_OP_TIMEOUT_MS", nullptr);
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  const auto discovered = rdma::RdmaTopology::Discover(
+      {}, rdma::RdmaDiscoveryPolicy::kActiveOnly);
+  if (discovered.status != rdma::RdmaDiscoveryStatus::kOk ||
+      discovered.devices.empty())
+    GTEST_SKIP() << "no ACTIVE RDMA device";
+  const char* configured = std::getenv("DFKV_RDMA_DEV");
+  const std::string rail =
+      configured && *configured && std::strchr(configured, ',') == nullptr
+          ? configured
+          : discovered.devices.front().name;
+  ScopedEnv one_rail("DFKV_RDMA_DEV", rail.c_str());
+  RdmaNode node("stale-single-rail");
+  RdmaTransport rt(kMaxMsg, rail);
+  const std::string peer_id = "identified-peer";
+  rt.OnPeerTopology(PublishedPeer(node.addr, peer_id));
+  const std::vector<BlockKey> keys = {ToBlockKey(SelfHdr(), "absent")};
+  std::vector<char> exists;
+
+  // What a served probe for an absent key returns; every later probe must
+  // return the same.
+  const Status served = rt.ExistMany(node.addr, keys, &exists)[0];
+  ASSERT_NE(served, Status::kIOError);
+  ASSERT_NE(served, Status::kNoCompatibleRail);
+  ASSERT_EQ(
+      CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total"), 1);
+
+  // Wait until the server has destroyed its side of the pooled connection;
+  // the client only finds out when it sends.
+  ASSERT_TRUE(ServerHasNoConnections(node));
+  EXPECT_EQ(rt.ExistMany(node.addr, keys, &exists)[0], served)
+      << "the retry on a new connection over the same rail must succeed";
+
+  std::string metrics = rt.MetricsText();
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_conns_opened_total"), 2);
+  EXPECT_EQ(
+      CounterVal(metrics, "dfkv_rdma_client_stale_pool_connections_total"), 1);
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_stale_pool_retries_total"),
+            1);
+  EXPECT_EQ(
+      CounterVal(metrics, "dfkv_rdma_client_remote_rail_cooldowns_total"), 0)
+      << "a dead pooled connection is no evidence against the peer's rail";
+  EXPECT_EQ(
+      CounterVal(metrics, "dfkv_rdma_client_remote_rail_failures_total"), 0);
+  EXPECT_EQ(RdmaTransportTestPeer::RemoteAllowed(
+                rt, peer_id, {1}, rdma::RailPolicy::NowMicros()),
+            (std::vector<uint8_t>{1}));
+
+  // The peer stays usable for the operations that follow.
+  EXPECT_EQ(rt.ExistMany(node.addr, keys, &exists)[0], served);
+  metrics = rt.MetricsText();
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_conns_opened_total"), 2);
+  EXPECT_EQ(
+      CounterVal(metrics, "dfkv_rdma_client_remote_rail_admissions_denied_total"),
+      0);
+}
+
+// The other half of the rule above: when the connection made for the retry
+// fails too, the failure is about the peer and not about one old connection,
+// and the peer rail is cooled, once. Here the server has reclaimed the pooled
+// connection and then refuses new ones, being at its limit of connections
+// that have not finished their handshake.
+TEST(RdmaLoopback, FreshConnectionFailingAfterAStaleOneCoolsThePeerRail) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv idle_reclaim("DFKV_RDMA_IDLE_MS", "120");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv op_timeout("DFKV_RDMA_OP_TIMEOUT_MS", "60000");
+  ScopedEnv batch_timeout("DFKV_RDMA_BATCH_OP_TIMEOUT_MS", nullptr);
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  const auto discovered = rdma::RdmaTopology::Discover(
+      {}, rdma::RdmaDiscoveryPolicy::kActiveOnly);
+  if (discovered.status != rdma::RdmaDiscoveryStatus::kOk ||
+      discovered.devices.empty())
+    GTEST_SKIP() << "no ACTIVE RDMA device";
+  const char* configured = std::getenv("DFKV_RDMA_DEV");
+  const std::string rail =
+      configured && *configured && std::strchr(configured, ',') == nullptr
+          ? configured
+          : discovered.devices.front().name;
+  ScopedEnv one_rail("DFKV_RDMA_DEV", rail.c_str());
+  RdmaNode node("stale-then-refused");
+  // One handshake at a time is enough for this client and lets a single
+  // silent peer close the door later.
+  RdmaServerTestPeer::SetMaxPendingHandshakes(node.rsrv.get(), 1);
+  RdmaTransport rt(kMaxMsg, rail);
+  const std::string peer_id = "identified-peer";
+  rt.OnPeerTopology(PublishedPeer(node.addr, peer_id));
+  const std::vector<BlockKey> keys = {ToBlockKey(SelfHdr(), "absent")};
+  std::vector<char> exists;
+
+  const Status served = rt.ExistMany(node.addr, keys, &exists)[0];
+  ASSERT_NE(served, Status::kIOError);
+  ASSERT_NE(served, Status::kNoCompatibleRail);
+  ASSERT_TRUE(ServerHasNoConnections(node));
+
+  // From now on the server refuses every new bootstrap connection: one peer
+  // that connects and sends nothing holds the only handshake slot.
+  const int silent = net::Dial(node.addr, 2000, 2000);
+  ASSERT_GE(silent, 0);
+  for (int i = 0; i < 1000 && node.rsrv->PendingHandshakes() != 1; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  ASSERT_EQ(node.rsrv->PendingHandshakes(), 1u);
+
+  EXPECT_EQ(rt.ExistMany(node.addr, keys, &exists)[0], Status::kIOError);
+  ::close(silent);
+
+  const std::string metrics = rt.MetricsText();
+  EXPECT_EQ(
+      CounterVal(metrics, "dfkv_rdma_client_stale_pool_connections_total"), 1);
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_stale_pool_retries_total"),
+            1);
+  EXPECT_EQ(
+      CounterVal(metrics, "dfkv_rdma_client_remote_rail_failures_total"), 1)
+      << "the stale connection is not charged, the fresh one is";
+  EXPECT_EQ(
+      CounterVal(metrics, "dfkv_rdma_client_remote_rail_cooldowns_total"), 1);
+  EXPECT_EQ(RdmaTransportTestPeer::RemoteAllowed(
+                rt, peer_id, {1}, rdma::RailPolicy::NowMicros()),
+            (std::vector<uint8_t>{0}));
+}
+
 // A failed work completion on the client must stay attributable afterwards:
 // which peer, which local device, which operation and which completion status.
 // The failures are real, not injected: the server reclaims two idle pooled

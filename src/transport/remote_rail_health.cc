@@ -145,6 +145,17 @@ RemoteRailCompletion RemoteRailHealth::Complete(
     return {};
   }
 
+  // Ordinary leases are granted only while the rail is healthy. One that
+  // fails after the rail has already failed was therefore in flight when that
+  // failure happened: it is another observation of the same event, not a
+  // further failure. It is counted, but only a failed recovery probe, which
+  // is a new attempt made after the cooldown, lengthens the cooldown.
+  if (!completed_lease.recovery_probe && state.consecutive_failures != 0) {
+    ++total_counters_.endpoint_failures;
+    ++rail_counters.endpoint_failures;
+    return {RemoteRailTransition::kNone, state.cooldown_until_us};
+  }
+
   const bool entering_cooldown = state.cooldown_until_us <= now_us;
   if (completed_lease.recovery_probe) state.recovery_probe_active = false;
   if (state.consecutive_failures != std::numeric_limits<uint64_t>::max())

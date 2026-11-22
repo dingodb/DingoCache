@@ -290,6 +290,11 @@ class RcEndpoint {
   const ibv_wc* failed_wc() const {
     return has_failed_wc_ ? &failed_wc_ : nullptr;
   }
+  // Work completions this endpoint reaped with a success status. On an RC QP
+  // each one needed the peer's QP to answer, so a change in this number over
+  // an interval shows that the peer had the other end during it. Owner-thread
+  // only.
+  uint64_t succeeded_completions() const { return succeeded_completions_; }
   // Unblock a thread sitting in WaitComp (so the server can join its Serve
   // threads at shutdown). Thread-safe vs the waiter.
   void Wake();
@@ -344,6 +349,7 @@ class RcEndpoint {
   // members every post and poll reads stay where they were.
   ibv_wc failed_wc_{};
   bool has_failed_wc_ = false;
+  uint64_t succeeded_completions_ = 0;
 };
 
 

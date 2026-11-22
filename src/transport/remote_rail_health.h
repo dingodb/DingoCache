@@ -58,7 +58,10 @@ class RemoteRailHealth {
 
   // Completes a lease at most once. Unknown generations, completions after
   // Reconcile removed an identity, and endpoint failures from health epochs
-  // superseded by a successful recovery probe are ignored.
+  // superseded by a successful recovery probe are ignored. The first endpoint
+  // failure of a healthy rail starts the base cooldown; failures of other
+  // leases that were in flight at that moment are counted but leave the
+  // cooldown as it is, and each failed recovery probe doubles it.
   RemoteRailCompletion Complete(const std::string& peer_id, size_t local_rail,
                                 uint64_t generation,
                                 RemoteRailOutcome outcome, uint64_t now_us);
