@@ -82,6 +82,15 @@ struct GpuNodeDedupTestAccess {
   static void LookLikeAnOlderRelease(GpuNodeDedup& d, const Hold& h) {
     d.SetFenceableForTest(h.hold, false);
   }
+  // A reader looks a slot up and then copies out of it: the two stages.
+  static auto Find(GpuNodeDedup& d, const BlockKey& key) { return d.Find(key); }
+  template <typename SlotPtr>
+  static bool CopyOut(GpuNodeDedup& d, SlotPtr slot, const BlockKey& key,
+                      const GpuNodeDedup::Seg& seg) {
+    d.EnsureThreadCtx();
+    size_t got = 0;
+    return d.CopyOutSg(slot, key, &seg, 1, seg.cap, &got);
+  }
 };
 }  // namespace dfkv
 using dfkv::GpuNodeDedupTestAccess;
@@ -1100,6 +1109,86 @@ TEST(GpuNodeDedup, ReusedSlotIsNotTakenForAStrandedForceOut) {
             GpuNodeDedup::Role::kHit)
       << "the slot's generation is odd at rest";
   EXPECT_EQ(k.dst.Down(4096), k.value);
+}
+
+// ---- a slot that changes hands between a lookup and its use ---------------
+
+// K(id) and Neighbour(id) start their probe at the same slot of the 1024-slot
+// test table.
+BlockKey Neighbour(uint64_t id) { return K(id + 1024); }
+
+TEST(GpuNodeDedup, CopyOutRefusesASlotRecycledForAnotherKey) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("recycle");
+  auto a = GpuNodeDedup::Open(Opts(g.name));
+  auto b = GpuNodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  KeyBufs k(80), other(80 + 1024);
+  size_t got = 0;
+  uint64_t token = 0;
+  ASSERT_EQ(a->ClaimSg(K(80), &k.s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  a->PublishSg(K(80), token, &k.s, 1, 4096);
+  // A reader has looked the key up ...
+  const auto slot = GpuNodeDedupTestAccess::Find(*a, K(80));
+  ASSERT_NE(slot, nullptr);
+  // ... and before it copies, the entry goes and another process publishes a
+  // different key of the same length into the same slot.
+  b->Invalidate(K(80));
+  ASSERT_EQ(b->ClaimSg(Neighbour(80), &other.s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  b->PublishSg(Neighbour(80), token, &other.s, 1, 4096);
+  ASSERT_EQ(GpuNodeDedupTestAccess::Find(*a, Neighbour(80)), slot);
+
+  EXPECT_FALSE(GpuNodeDedupTestAccess::CopyOut(*a, slot, K(80), k.d))
+      << "copied another key's bytes";
+  // The slot's present owner is still readable through it.
+  EXPECT_TRUE(GpuNodeDedupTestAccess::CopyOut(*a, slot, Neighbour(80), k.d));
+  EXPECT_EQ(k.dst.Down(4096), other.value);
+}
+
+// A token is good for the slot it was issued for only. Generations are small
+// per-slot counters, so the slot a key has moved to can carry the very value
+// an older claim of the key holds.
+TEST(GpuNodeDedup, LatePublishDoesNotFollowTheKeyToAnotherSlot) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("token-slot");
+  auto a = GpuNodeDedup::Open(LongWait(g.name));
+  auto b = GpuNodeDedup::Open(LongWait(g.name));
+  ASSERT_TRUE(a && b);
+  KeyBufs v_old(81), v_new(82), n(81 + 1024);
+  size_t got = 0;
+  uint64_t neighbour = 0, token_a = 0, token_b = 0, ignored = 0;
+  // The neighbour holds the first position: the key lives at the second.
+  ASSERT_EQ(a->ClaimSg(Neighbour(81), &n.s, 1, 4096, &got, &neighbour),
+            GpuNodeDedup::Role::kFetch);
+  // One claim-and-invalidate round on the second position, then the claim
+  // this test is about: it is that slot's third generation step.
+  ASSERT_EQ(a->ClaimSg(K(81), &v_old.s, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kFetch);
+  a->Invalidate(K(81));
+  ASSERT_EQ(a->ClaimSg(K(81), &v_old.s, 1, 4096, &got, &token_a),
+            GpuNodeDedup::Role::kFetch);
+  // The neighbour goes, comes back and goes again: the first position is
+  // free and two steps along.
+  a->Abort(Neighbour(81), neighbour);
+  ASSERT_EQ(a->ClaimSg(Neighbour(81), &n.s, 1, 4096, &got, &neighbour),
+            GpuNodeDedup::Role::kFetch);
+  a->Abort(Neighbour(81), neighbour);
+  // The key is overwritten, and the next fetch of it claims the first
+  // position, which thereby reaches the generation the old claim holds.
+  b->Invalidate(K(81));
+  ASSERT_EQ(b->ClaimSg(K(81), &v_new.s, 1, 4096, &got, &token_b),
+            GpuNodeDedup::Role::kFetch);
+  // The old fetch completes late with the bytes from before the overwrite.
+  a->PublishSg(K(81), token_a, &v_old.s, 1, 4096);
+  EXPECT_EQ(a->ClaimSg(K(81), &v_old.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kWait)
+      << "bytes from before the invalidation were published";
+  b->PublishSg(K(81), token_b, &v_new.s, 1, 4096);
+  ASSERT_EQ(a->ClaimSg(K(81), &v_old.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kHit);
+  EXPECT_EQ(v_old.dst.Down(4096), v_new.value);
 }
 
 // ---- through KVClient: a fetch that lands in device memory -----------------
