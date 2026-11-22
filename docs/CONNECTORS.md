@@ -1114,6 +1114,9 @@ namespace/key 不一致是预期 cold miss。**空环 / MDS 不可达**可直接
 | `lookup_cache_ttl_ms` | `1000` | 默认即可 | 调度器对同一请求、同一前缀长度和保留 TTL 复用已完成 lookup 的时长（`0..60000` ms）。vLLM 每步都会重新询问等待中的请求；复用可省去 rank0 往返以及随之附带的整段前缀 retention REFRESH，KV 池满时排队请求每个窗口只探测一次，而不是每步一次。请求完成、中止、被抢占或 load 失败时清除；窗口内对象被淘汰由 `kv_load_failure_policy` 兜底；`0` 为每步都探测。 |
 | `lookup_timeout_ms` | `10000` | 默认即可 | 调度器等待 rank0 回答 lookup 的上限（`0..600000` ms）。超时按未命中处理（该请求自己算前缀）并重建 lookup socket；此后一个超时周期内所有 lookup 立即按未命中返回（lookup 共用一个 socket 线程，否则会逐个各等满一次超时），周期结束后的第一个 lookup 重新询问 rank0；`0` 为无限等待，rank0 server 卡住或退出时调度器随之卡死。`lookup_async` 为 false（默认）时 lookup 在调度线程上同步执行；为 true 时调度器在后续步轮询结果，其间继续调度。 |
 | `lookup_async` | `false` | 按需 | 不阻塞调度步地询问 rank0：请求在后续若干步里等待结果。 |
+| `model_revision` | 引擎 revision，否则 hub commit hash，否则模型路径 | 本地目录必设 | namespace 绑定的权重版本。本地目录换权重时路径不变，旧 KV 会被新权重读走；没有可知版本的本地路径启动时告警。 |
+| `require_model_revision` | `false` | 按需 | 本地模型路径且无可知权重版本时启动报错，而不是告警。 |
+| `share_across_dp_sizes` | `false` | 按需 | 对象身份不再包含 DP 大小，使不同 DP 规模的部署共用对象（各 DP 副本写的字节相同）。打开会改变所有 key：此前存的对象找不到一次。 |
 | `lookup_rpc_port` | ipc 自动 | 一般不设 | rank0 前缀查询 RPC，仅 socket 名冲突时设 |
 | `client_register` | `1`（MDS 发现时） | 默认即可 | MDS 客户端注册开关（`0` 关；env `DFKV_CLIENT_REGISTER=0` 等价，见 §1.1） |
 | `tenant_id` | `default` | 多租户时显式设 | canonical namespace 的 tenant 字段（§1.4） |
