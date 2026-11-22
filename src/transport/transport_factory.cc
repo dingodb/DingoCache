@@ -6,6 +6,7 @@
 #include <string>
 
 #include "transport/tcp_transport.h"
+#include "utils/env_parse.h"
 
 #ifdef DFKV_WITH_RDMA
 #include "transport/rdma_transport.h"  // native verbs: device-by-name, 400G-capable
@@ -16,8 +17,12 @@ namespace dfkv {
 namespace {
 bool EnvTruthy(const char* name) {
   const char* v = std::getenv(name);
-  return v && *v && std::strcmp(v, "0") != 0 &&
-         std::strcmp(v, "false") != 0 && std::strcmp(v, "no") != 0;
+  const bool on = v && *v && std::strcmp(v, "0") != 0 &&
+                  std::strcmp(v, "false") != 0 && std::strcmp(v, "no") != 0;
+  // "off", "FALSE" and "No" are read as on.
+  envparse::ReportSwitch(name, on,
+                         "only 0, false and no in lower case are off");
+  return on;
 }
 
 #ifdef DFKV_WITH_RDMA

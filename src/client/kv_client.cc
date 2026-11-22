@@ -29,6 +29,7 @@
 #include "client/key_map.h"
 #include "client/read_scheduler.h"
 #include "utils/log.h"
+#include "utils/env_parse.h"
 #include "utils/sha256.h"
 #include "utils/thread_name.h"
 #include "utils/parallel_for.h"
@@ -101,6 +102,8 @@ size_t EnvSize(const char* name, size_t dflt) {
     unsigned long long x = std::strtoull(v, &end, 10);
     if (end != v && x > 0) { out = static_cast<size_t>(x); from_env = true; }
   }
+  envparse::ReportUnlessPlain(name, 1, std::numeric_limits<uint64_t>::max(),
+                              std::to_string(out));
   config_dump::Record(name, std::to_string(out),
                       from_env ? config_dump::Source::kEnv
                                : config_dump::Source::kDefault);
@@ -133,6 +136,7 @@ int EnvNonnegativeInt(const char* name, int dflt) {
       from_env = true;
     }
   }
+  envparse::ReportUnlessPlain(name, 0, INT_MAX, std::to_string(out));
   config_dump::Record(name, std::to_string(out),
                       from_env ? config_dump::Source::kEnv
                                : config_dump::Source::kDefault);
@@ -206,11 +210,19 @@ KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
         x <= std::numeric_limits<size_t>::max())
       batch_concurrency_.store(static_cast<size_t>(x),
                                std::memory_order_relaxed);
+    // 0 is documented as auto (the default); it leaves the default in place.
+    const size_t resolved = batch_concurrency_.load(std::memory_order_relaxed);
+    envparse::ReportUnlessPlain(
+        "DFKV_BATCH_CONCURRENCY", 0, std::numeric_limits<size_t>::max(),
+        resolved == 0 ? std::string("0 (auto)") : std::to_string(resolved));
   }
   // Opt-in active per-peer latency probe. Off unless DFKV_PROBE_INTERVAL_MS>0,
   // so default behavior is unchanged (no background traffic).
   int probe_ms = 0;
   if (const char* pe = std::getenv("DFKV_PROBE_INTERVAL_MS")) probe_ms = std::atoi(pe);
+  envparse::ReportUnlessPlain(
+      "DFKV_PROBE_INTERVAL_MS", 0, INT_MAX,
+      probe_ms > 0 ? std::to_string(probe_ms) : std::string("0 (no probe)"));
   if (probe_ms > 0) StartProbe(probe_ms);
   // Record the resolved client env knobs (defaults included). FanoutPool's is a
   // lazy static, so force it now rather than wait for the first fan-out.
@@ -1292,12 +1304,16 @@ namespace {
 size_t RetainDebounceCapPerShard(size_t shards) {
   static const size_t total = [] {
     const char* v = std::getenv("DFKV_RETAIN_CACHE_ENTRIES");
+    size_t resolved = static_cast<size_t>(1) << 20;
     if (v && *v) {
       char* end = nullptr;
       const unsigned long long n = std::strtoull(v, &end, 10);
-      if (end != v && *end == '\0') return static_cast<size_t>(n);
+      if (end != v && *end == '\0') resolved = static_cast<size_t>(n);
     }
-    return static_cast<size_t>(1) << 20;
+    envparse::ReportUnlessPlain("DFKV_RETAIN_CACHE_ENTRIES", 0,
+                                std::numeric_limits<uint64_t>::max(),
+                                std::to_string(resolved));
+    return resolved;
   }();
   return total / shards;
 }
@@ -1520,7 +1536,10 @@ namespace {
 bool PernodeOn() {
   static const bool on = [] {
     const char* e = std::getenv("DFKV_CLIENT_PERNODE_STATS");
-    return e && *e && *e != '0';
+    const bool enabled = e && *e && *e != '0';
+    envparse::ReportSwitch("DFKV_CLIENT_PERNODE_STATS", enabled,
+                           "only a value starting with 0 is off");
+    return enabled;
   }();
   return on;
 }
@@ -2707,7 +2726,10 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
   // counters look wrong — cheap enough to leave on in a canary.
   static const bool log_split = [] {
     const char* v = std::getenv("DFKV_CLIENT_NODE_DEDUP_LOG");
-    return v && std::strcmp(v, "1") == 0;
+    const bool enabled = v && std::strcmp(v, "1") == 0;
+    envparse::ReportSwitch("DFKV_CLIENT_NODE_DEDUP_LOG", enabled,
+                           "only 1 is on");
+    return enabled;
   }();
   if (log_split) {
     size_t hits0 = 0;

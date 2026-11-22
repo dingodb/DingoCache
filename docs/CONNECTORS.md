@@ -333,6 +333,30 @@ page/chunk size、shape、层顺序或内存布局是**operator error**，不会
 以上三条为 **native C 客户端**（`libdfkv.so`）knob，对 HiCache / LMCache / vLLM
 三条接入路径同等生效；生产漂移排查时先看启动 config dump（全 knob 带来源打印）。
 
+**客户端 env 的值格式与 WARN。** 数值写十进制非负整数（不带单位、符号、小数、指数），
+开关写 `1` / `0`。客户端库（`libdfkv`）运行在宿主进程（推理引擎）里：写错的值**不会**
+让它抛异常或退出，也**不改变**此前的解析结果；但宿主的 stderr 里现在会出现 WARN，每个
+变量每进程最多一行，经库自己的 logger 输出（`DFKV_LOG=error` 可关），形如
+`[WARN] dfkv: invalid DFKV_X='值': not a plain decimal number from A to B; using N, as
+before. A later release will not accept this value.` 以后的版本会收紧这些写法，看到就
+清理。最值得注意的几类（现在的结果与此前相同）：
+
+| 写法 | 现在（与此前相同）的结果 | 应改成 |
+|---|---|---|
+| `DFKV_RDMA=off` / `FALSE` / `No` / 任意别的词 | **请求 RDMA**：只有小写 `0`、`false`、`no` 是关 | `0` |
+| `DFKV_CLIENT_NODE_DEDUP=true` / `on` / `yes`（`_GPU`、`_LOG` 同） | **不开**：只有 `1` 是开 | `1` |
+| `DFKV_CLIENT_PERNODE_STATS=off`、`DFKV_RDMA_BUSY_POLL=off` | **开**：只有以 `0` 开头的值是关 | `0` |
+| 数字后带单位：`DFKV_PEER_COOLDOWN_MS=2s`、`DFKV_RDMA_CONNECT_MS=3s`、`DFKV_PEER_BAD_GRACE_MS=1e3` | 只取前面的数字（2 ms、3 ms、1 ms） | 完整的十进制数 |
+| `DFKV_RDMA_OP_TIMEOUT_MS=abc`（非数字） | 读成 0：**没有单操作超时**；负数则是 5000 | `0` 或想要的毫秒数 |
+| `DFKV_MDS_SHRINK_GUARD_PCT=abc` 或空串 | 读成 0：**关掉成员骤减/骤增保护**（空视图保护仍在） | `0`..`99` |
+| `DFKV_RDMA_INLINE_PUT_MAX_BYTES=`（空串） | 关闭 inline PUT（这里空串不是“未设置”） | `0` 或删掉该行 |
+| `DFKV_RETAIN_PRECHECK_MIN_HEADROOM_PCT=`（空串） | 读成 0，不是默认的 5 | 数字，或删掉该行 |
+| `DFKV_RDMA_QP_BUDGET=`、`_WR_BUDGET=`、`_ENDPOINT_CACHE_MAX=`、`_REGISTERED_BYTES_BUDGET=`（空串） | 预算仍是默认值，但“已设置”本身会**关掉预算自动伸缩** | 给数字，或删掉该行 |
+| 超出范围或非数字的其余数值项（`DFKV_TCP_POOL_*`、`DFKV_RDMA_RAIL_*`、`DFKV_READ_*`、`DFKV_NODE_DEDUP_*` 等） | 取默认值，或收敛到上限 | 范围内的数字 |
+
+测试钩子 `DFKV_RDMA_TEST_*` 和字符串类变量（`DFKV_RDMA_DEV`、`DFKV_RDMA_RAIL_TIERS` 等，各有
+自己的校验）不在此列。
+
 ### 1.6 可观测性（opt-in，全部不占数据路径）
 
 三条路径共用同一套观测设施；差别只在**配置入口**：HiCache 插件支持 extra_config 键

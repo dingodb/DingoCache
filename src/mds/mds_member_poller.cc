@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "common/status.h"
+#include "utils/env_parse.h"
 #include "utils/log.h"
 #include "utils/net_util.h"
 #include "utils/thread_name.h"
@@ -32,11 +33,16 @@ int ShrinkGuardPct() {
   // already emitted. It is therefore not recorded here (the record would land
   // in an already-cleared registry). If set via env it still shows in the dump
   // via Emit()'s environ scan; only its unset default is not surfaced.
+  int resolved = 50;
   if (const char* v = std::getenv("DFKV_MDS_SHRINK_GUARD_PCT")) {
     const long p = std::atol(v);
-    if (p >= 0 && p <= 99) return static_cast<int>(p);
+    if (p >= 0 && p <= 99) resolved = static_cast<int>(p);
   }
-  return 50;
+  // atol("") is 0, which switches the guard off: empty is not unset here.
+  envparse::ReportUnlessPlain("DFKV_MDS_SHRINK_GUARD_PCT", 0, 99,
+                              std::to_string(resolved),
+                              /*empty_is_unset=*/false);
+  return resolved;
 }
 }  // namespace
 

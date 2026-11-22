@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+- Client library and transports: a mistyped `DFKV_*` setting is now reported.
+  This is the client-side half of the configuration change for `dfkv_server`
+  and `dfkv_mds` (see that entry below), with the same rule: nothing changes
+  its effective value. Every reader keeps the parse it had; what is new is a
+  check next to it that logs when the text is not a plain decimal number in
+  the range the reader accepts, or not `1`/`0` (or a word that says the same)
+  for a switch.
+  For users of the client library (`libdfkv` inside an inference engine):
+  the HOST PROCESS MAY NOW SEE WARN LINES it did not see before, at most
+  one per variable and process, through the library's logger on stderr
+  (never stdout; `DFKV_LOG=error` hides them): `[WARN] dfkv: invalid
+  DFKV_X='v': not a plain decimal number from A to B; using N, as before. A
+  later release will not accept this value.` A bad value still never makes
+  the library throw, abort or exit, and nothing is logged on a
+  per-operation path: the settings that are read per call or per connection
+  (`DFKV_RETAIN_PRECHECK_MIN_HEADROOM_PCT`, `DFKV_RDMA_BUSY_POLL`) are
+  still read there, but reported only the first time. No value is cached
+  that was not cached before.
+  The inputs most worth looking for, all read as they always were:
+  `DFKV_RDMA=off` (or any word but lower-case `0`, `false`, `no`) asks for
+  RDMA; `DFKV_CLIENT_NODE_DEDUP=true` leaves dedup off, only `1` is on;
+  `DFKV_CLIENT_PERNODE_STATS=off` and `DFKV_RDMA_BUSY_POLL=off` switch
+  those ON; `DFKV_PEER_COOLDOWN_MS=2s` is 2 ms; a non-numeric
+  `DFKV_RDMA_OP_TIMEOUT_MS` means no per-operation deadline and a
+  non-numeric or empty `DFKV_MDS_SHRINK_GUARD_PCT` switches the member
+  shrink guard off; an empty `DFKV_RETAIN_PRECHECK_MIN_HEADROOM_PCT` is 0,
+  not the default 5; an empty `DFKV_RDMA_INLINE_PUT_MAX_BYTES` disables inline PUT; an
+  RDMA budget variable that is set but empty switches the automatic budget
+  scaling off. A 0 that is documented to mean something (auto, off, no
+  deadline, follow another setting) is a clean value and is not reported.
+  `docs/CONNECTORS.md` §1.5 has the table.
+  Covered: the client (`src/client`), the TCP and RDMA client transports,
+  the transport choice, and `DFKV_MDS_SHRINK_GUARD_PCT`. Not covered: the
+  `DFKV_RDMA_TEST_*` hooks, string-valued settings (device lists, rail
+  tiers, paths), the CUDA bounce-pool sizes (they already warn, on every
+  pool construction), and the bench and smoke tools.
 - Server, retention (`DFKV_RETAIN_*`): the expiry wheel no longer grows with
   every renewal, and expiring a full bucket no longer holds up the disk.
   - Every renewal that moved a deadline (one per second and object at most)

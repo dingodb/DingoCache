@@ -313,6 +313,56 @@ inline bool EnvSwitch(const char* name, bool fallback, OffWhen off_when) {
   return value;
 }
 
+// ---- report only ------------------------------------------------------------
+//
+// For a reader that keeps its own parse (the client library and the
+// transports, whose readers differ in small ways that are not worth a spec
+// each): the value is whatever that reader resolved, untouched. These only
+// say, once per setting and process, that the text is not a clean one.
+
+// A plain decimal number, nothing else, in [min, max].
+inline bool IsPlainNumber(const char* text, uint64_t min, uint64_t max) {
+  if (text == nullptr || *text < '0' || *text > '9') return false;
+  uint64_t value = 0;
+  bool overflow = false;
+  const char* rest = detail::Digits(text, &value, &overflow);
+  return *rest == '\0' && !overflow && value >= min && value <= max;
+}
+
+// `used` is what the reader resolved, as it should be shown. An empty value
+// counts as unset unless the reader gives it a meaning of its own.
+inline void ReportUnlessPlain(const char* name, uint64_t min, uint64_t max,
+                              const std::string& used,
+                              bool empty_is_unset = true) {
+  const char* text = std::getenv(name);
+  if (text == nullptr) return;
+  if (*text == '\0' && empty_is_unset) return;
+  if (IsPlainNumber(text, min, max)) return;
+  WarnOnce(name,
+           "invalid " + detail::Quoted(name, text) + ": " +
+               (*text == '\0' ? std::string("set but empty")
+                              : "not a plain decimal number from " +
+                                    std::to_string(min) + " to " +
+                                    std::to_string(max)) +
+               "; using " + used +
+               ", as before. A later release will not accept this value.");
+}
+
+// `on` is what the reader resolved; `rule` says in words what it looks at.
+inline void ReportSwitch(const char* name, bool on, const char* rule) {
+  const char* text = std::getenv(name);
+  // A word that says what the reader did with it is clean, in any case.
+  const Word word = ParseWord(text);
+  if (word == Word::kUnset || (word == Word::kOn && on) ||
+      (word == Word::kOff && !on))
+    return;
+  WarnOnce(name,
+           "invalid " + detail::Quoted(name, text) + ": read as " +
+               (on ? "on" : "off") + ", as before (" + rule +
+               "). Write 1 or 0; a later release will read on/off words by "
+               "their meaning and not accept other values.");
+}
+
 }  // namespace envparse
 }  // namespace dfkv
 

@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <functional>
 #include <limits>
 #include <string>
 
@@ -426,3 +427,101 @@ TEST(LogLevel, IsReadInAnyCase) {
 }
 
 }  // namespace
+
+// ---- report only: the reader keeps its own parse ------------------------------
+namespace {
+// What ReportUnlessPlain / ReportSwitch logged for one value of one variable.
+std::string Reported(const char* value, const std::function<void()>& report) {
+  ForgetWarningsForTest();
+  if (value != nullptr)
+    ::setenv("DFKV_REPORT_TEST", value, 1);
+  else
+    ::unsetenv("DFKV_REPORT_TEST");
+  testing::internal::CaptureStderr();
+  report();
+  std::string log = testing::internal::GetCapturedStderr();
+  ::unsetenv("DFKV_REPORT_TEST");
+  return log;
+}
+}  // namespace
+
+TEST(EnvReport, PlainNumberIsDigitsOnlyAndInRange) {
+  EXPECT_TRUE(IsPlainNumber("0", 0, 10));
+  EXPECT_TRUE(IsPlainNumber("10", 0, 10));
+  EXPECT_TRUE(IsPlainNumber("007", 0, 10));
+  EXPECT_TRUE(IsPlainNumber("18446744073709551615", 0, kTop));
+  for (const char* bad : {"", " 5", "5 ", "+5", "-5", "5s", "1e3", "0x5", "abc",
+                          "11", "18446744073709551616", "5.0"})
+    EXPECT_FALSE(IsPlainNumber(bad, 0, 10)) << bad;
+  EXPECT_FALSE(IsPlainNumber(nullptr, 0, 10));
+  EXPECT_FALSE(IsPlainNumber("0", 1, 10));
+}
+
+TEST(EnvReport, NumberIsReportedUnlessPlainWithTheValueInUse) {
+  auto report = [] { ReportUnlessPlain("DFKV_REPORT_TEST", 1, 64, "8"); };
+  for (const char* clean : {static_cast<const char*>(nullptr), "", "1", "64"})
+    EXPECT_EQ(Reported(clean, report), "") << (clean ? clean : "(unset)");
+  for (const char* bad : {"abc", "-1", "0", "65", "8 ", " 8", "8k", "+8",
+                          "99999999999999999999999999"}) {
+    const std::string log = Reported(bad, report);
+    EXPECT_NE(log.find("DFKV_REPORT_TEST='" + std::string(bad) + "'"),
+              std::string::npos)
+        << bad << ": " << log;
+    EXPECT_NE(log.find("not a plain decimal number from 1 to 64"),
+              std::string::npos)
+        << log;
+    EXPECT_NE(log.find("using 8, as before"), std::string::npos) << log;
+    EXPECT_NE(log.find("[WARN]"), std::string::npos) << log;
+  }
+  // An empty value where the reader gives it a meaning.
+  const std::string log = Reported("", [] {
+    ReportUnlessPlain("DFKV_REPORT_TEST", 0, 64, "0 (disabled)", false);
+  });
+  EXPECT_NE(log.find("DFKV_REPORT_TEST=''"), std::string::npos) << log;
+  EXPECT_NE(log.find("set but empty"), std::string::npos) << log;
+  EXPECT_NE(log.find("using 0 (disabled), as before"), std::string::npos) << log;
+}
+
+TEST(EnvReport, SwitchIsReportedUnlessTheWordSaysWhatWasDone) {
+  auto on = [] { ReportSwitch("DFKV_REPORT_TEST", true, "only 0 is off"); };
+  auto off = [] { ReportSwitch("DFKV_REPORT_TEST", false, "only 1 is on"); };
+  for (const char* word : {static_cast<const char*>(nullptr), "", "1", "on",
+                           "true", "TRUE", "Yes"})
+    EXPECT_EQ(Reported(word, on), "") << (word ? word : "(unset)");
+  for (const char* word : {static_cast<const char*>(nullptr), "", "0", "off",
+                           "false", "No"})
+    EXPECT_EQ(Reported(word, off), "") << (word ? word : "(unset)");
+  // The word says the opposite of what the reader did, or nothing at all.
+  for (const char* word : {"off", "false", "NO", "0", "enable", "2", " 1"}) {
+    const std::string log = Reported(word, on);
+    EXPECT_NE(log.find("DFKV_REPORT_TEST='" + std::string(word) + "'"),
+              std::string::npos)
+        << word << ": " << log;
+    EXPECT_NE(log.find("read as on, as before (only 0 is off)"),
+              std::string::npos)
+        << log;
+  }
+  for (const char* word : {"on", "true", "YES", "1", "enable", "2"}) {
+    const std::string log = Reported(word, off);
+    EXPECT_NE(log.find("read as off, as before (only 1 is on)"),
+              std::string::npos)
+        << word << ": " << log;
+  }
+}
+
+TEST(EnvReport, IsMadeOncePerSettingAndProcess) {
+  ForgetWarningsForTest();
+  ::setenv("DFKV_REPORT_TEST", "nope", 1);
+  testing::internal::CaptureStderr();
+  for (int i = 0; i < 50; ++i) {
+    ReportUnlessPlain("DFKV_REPORT_TEST", 1, 64, "8");
+    ReportSwitch("DFKV_REPORT_TEST", true, "only 0 is off");
+  }
+  const std::string log = testing::internal::GetCapturedStderr();
+  ::unsetenv("DFKV_REPORT_TEST");
+  size_t lines = 0;
+  for (size_t at = log.find("DFKV_REPORT_TEST='nope'"); at != std::string::npos;
+       at = log.find("DFKV_REPORT_TEST='nope'", at + 1))
+    ++lines;
+  EXPECT_EQ(lines, 1u) << log;
+}

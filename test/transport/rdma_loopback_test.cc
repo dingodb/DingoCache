@@ -7941,3 +7941,91 @@ TEST(RdmaBootstrapListener, DescriptorExhaustionBacksOffAndRecovers) {
   });
   EXPECT_EQ(result, 0) << "step code from the child, see the test body";
 }
+
+// The RDMA client's settings set to garbage: the transport is built, a PUT
+// and a GET work, nothing is thrown, and each name is reported once at WARN
+// however many transports are built and connections opened.
+TEST(RdmaLoopback, ClientSettingsSetToGarbageAreReportedOnceAndHarmless) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const std::vector<std::pair<const char*, const char*>> garbage = {
+      {"DFKV_RDMA_CONNECT_MS", "soon"},
+      {"DFKV_RDMA_IO_MS", "later"},
+      {"DFKV_RDMA_OP_TIMEOUT_MS", "-5"},        // read as 5000
+      {"DFKV_RDMA_BATCH_OP_TIMEOUT_MS", "long"},
+      {"DFKV_RDMA_KEEPALIVE_MS", "15s"},
+      {"DFKV_RDMA_DEPTH", "deep"},
+      {"DFKV_RDMA_RAIL_CREDITS", "many"},
+      {"DFKV_RDMA_RAIL_COOLDOWN_MS", "5s"},
+      {"DFKV_RDMA_POOL_MAX", "big"},
+      {"DFKV_RDMA_RESOURCE_ACQUIRE_MS", "10s"},
+      {"DFKV_RDMA_INLINE_PUT_MAX_BYTES", "4M"},
+      {"DFKV_RDMA_MAX_BLOCK_BYTES", "big"},
+      {"DFKV_RDMA_BUSY_POLL", "off"},           // read as on
+  };
+  RdmaNode node("garbage-env");
+  for (const auto& [name, value] : garbage) ::setenv(name, value, 1);
+  dfkv::envparse::ForgetWarningsForTest();
+  testing::internal::CaptureStderr();
+  for (int round = 0; round < 2; ++round) {
+    std::unique_ptr<RdmaTransport> rt;
+    ASSERT_NO_THROW(rt = std::make_unique<RdmaTransport>(kMaxMsg));
+    KVClient c({{"n", node.addr}}, SelfHdr(), rt.get());
+    const std::string value(8192, 'g');
+    for (int i = 0; i < 8; ++i) {
+      const std::string key = "garbage-" + std::to_string(round * 100 + i);
+      ASSERT_TRUE(c.Put(key, value.data(), value.size())) << key;
+      std::string out(value.size(), 0);
+      ASSERT_TRUE(c.Get(key, &out[0], out.size())) << key;
+      ASSERT_EQ(out, value);
+    }
+  }
+  const std::string log = testing::internal::GetCapturedStderr();
+  for (const auto& [name, value] : garbage) ::unsetenv(name);
+  for (const auto& [name, value] : garbage) {
+    const std::string quoted = std::string(name) + "='" + value + "'";
+    size_t lines = 0;
+    for (size_t at = log.find(quoted); at != std::string::npos;
+         at = log.find(quoted, at + 1))
+      ++lines;
+    EXPECT_EQ(lines, 1u) << quoted << "\n" << log;
+  }
+  EXPECT_NE(log.find("DFKV_RDMA_OP_TIMEOUT_MS='-5': not a plain decimal "
+                     "number from 0 to 2147483647; using 5000, as before"),
+            std::string::npos)
+      << log;
+  EXPECT_NE(log.find("DFKV_RDMA_BUSY_POLL='off': read as on, as before"),
+            std::string::npos)
+      << log;
+  EXPECT_NE(log.find("DFKV_RDMA_DEPTH='deep'"), std::string::npos) << log;
+  EXPECT_NE(log.find("using 4, as before"), std::string::npos) << log;
+}
+
+// The RDMA client's settings whose 0 is documented to mean something are
+// clean at 0: no WARN, and the transport works.
+TEST(RdmaLoopback, ClientSettingsAtAMeaningfulZeroAreNotGarbage) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const char* const names[] = {
+      "DFKV_RDMA_OP_TIMEOUT_MS",         // 0 = no deadline
+      "DFKV_RDMA_BATCH_OP_TIMEOUT_MS",   // 0 = follows DFKV_RDMA_OP_TIMEOUT_MS
+      "DFKV_RDMA_KEEPALIVE_MS",          // 0 = no keepalive
+      "DFKV_RDMA_POOL_MAX",              // 0 = no override
+      "DFKV_RDMA_INLINE_PUT_MAX_BYTES",  // 0 = inline PUT off
+  };
+  RdmaNode node("meaningful-zero-env");
+  for (const char* name : names) ::setenv(name, "0", 1);
+  dfkv::envparse::ForgetWarningsForTest();
+  testing::internal::CaptureStderr();
+  {
+    std::unique_ptr<RdmaTransport> rt;
+    ASSERT_NO_THROW(rt = std::make_unique<RdmaTransport>(kMaxMsg));
+    KVClient c({{"n", node.addr}}, SelfHdr(), rt.get());
+    const std::string value(8192, 'z');
+    ASSERT_TRUE(c.Put("zero-0", value.data(), value.size()));
+    std::string out(value.size(), 0);
+    ASSERT_TRUE(c.Get("zero-0", &out[0], out.size()));
+    ASSERT_EQ(out, value);
+  }
+  const std::string log = testing::internal::GetCapturedStderr();
+  for (const char* name : names) ::unsetenv(name);
+  EXPECT_EQ(log.find("invalid DFKV_"), std::string::npos) << log;
+}

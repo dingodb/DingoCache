@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "common/config_dump.h"
+#include "utils/env_parse.h"
 #include "utils/thread_name.h"
 
 namespace dfkv {
@@ -105,6 +106,8 @@ class ReadScheduler {
         if (end != text && *end == '\0' && parsed >= 1 && parsed <= 64)
           result = static_cast<size_t>(parsed);
       }
+      envparse::ReportUnlessPlain("DFKV_RDMA_READ_WORKERS", 1, 64,
+                                  std::to_string(result));
       config_dump::RecordResolved("DFKV_RDMA_READ_WORKERS",
                                   std::to_string(result));
       return result;
