@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- SGLang HiCache connector, device-direct (L2-bypass): a process that has
+  not moved a page yet now addresses every scatter-gather group of a page.
+  With `SGLANG_HICACHE_L2_BYPASS` requested, registering the device pool
+  records how many groups a page is stored in (from the segments of one
+  page, no I/O); before, the count was known only after the first device
+  transfer, so until then existence probes, the presence answer of
+  `batch_get_v1` and retention addressed group 0 only. `batch_exists` now
+  probes every known group of a page, like `batch_get_v1`; on hardware whose
+  scatter-gather width is below the layer count that is one key more per
+  group per page and probe. If the SGLang build's device page metadata
+  cannot be called at registration, a WARNING says so and the previous
+  behaviour applies until the first transfer.
 - SGLang HiCache connector, `batch_set_v2_device`: the side-pool write metric
   (`on_set_v2` counters) now counts every side pool that did I/O, with its
   bytes and time. Host side pools were counted without their bytes and time,
@@ -57,10 +69,9 @@
   form no longer follows from a device pool merely being registered.
   `batch_get_v1` cannot load device-direct objects into a host buffer; with
   a device pool registered it returned True for every page without any I/O.
-  It still loads nothing, but now answers per page whether the page is
-  stored: every scatter-gather group of it once the process has done a
-  device transfer (and so knows how many groups a page has), group 0 before
-  that, as existence probes do. A missing group or a failed probe is a miss.
+  It still loads nothing, but now answers per page whether every
+  scatter-gather group of it is stored. A missing group or a failed probe is
+  a miss.
   The KV itself is loaded, and every group length-checked, by the device
   entries as before. Second, existence probes, retention and that host read
   switched to the device key form as soon as a primary device pool was

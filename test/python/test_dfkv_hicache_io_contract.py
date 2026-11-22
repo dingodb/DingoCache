@@ -90,6 +90,9 @@ class _Tensor:
     def element_size(self):
         return 1
 
+    def numel(self):
+        return 4096
+
 
 class _MlaDevicePool:
     """A layer-first MLA device pool, as the test device_page_meta reads it."""
@@ -150,6 +153,37 @@ class DeviceDirectHostGet(unittest.TestCase):
     def test_empty_request(self):
         st, _store = self._device_direct()
         self.assertEqual(st.batch_get_v1([], []), [])
+
+
+class DeviceDirectGroupsBeforeTheFirstTransfer(unittest.TestCase):
+    """A process that has not moved a page yet (it reads what other
+    instances wrote) must still address every SG group of a page."""
+
+    def _registered(self, pool):
+        st = _plugin(_device_direct_requested=True, _registered_regions=set())
+        st.register_memory = lambda base, size: True
+        st.register_mem_pool_device(pool)
+        return st, _Store(st)
+
+    def test_registration_records_the_group_count(self):
+        st, store = self._registered(_MlaDevicePool(layers=6))
+        groups = st._stored_keys("kv", "page")
+        self.assertEqual(len(groups), 2, "6 layers in groups of 4")
+        store.present.add(groups[0])
+        self.assertEqual(st.batch_exists(["page"]), 0)
+        self.assertEqual(st.batch_get_v1(["page"], [0]), [False])
+        store.present.add(groups[1])
+        self.assertEqual(st.batch_exists(["page"]), 1)
+        self.assertEqual(st.batch_get_v1(["page"], [0]), [True])
+        self.assertEqual(store.probes[-1], groups)
+
+    def test_unknown_count_keeps_group_zero(self):
+        pool = _MlaDevicePool(layers=6)
+        pool.page_size = "not a size"   # the metadata call cannot be made
+        with self.assertLogs(dfkv_hicache._log, "WARNING"):
+            st, _store = self._registered(pool)
+        self.assertEqual(st._stored_keys("kv", "page"),
+                         [st._sg_group_key(sk, 0) for sk in st._keys("page")])
 
 
 class DeviceDirectState(unittest.TestCase):

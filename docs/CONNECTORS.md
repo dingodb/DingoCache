@@ -753,11 +753,15 @@ bypass 且注册成功，或者本进程已经对主 KV 做过一次 device 传�
 路径写入的页因此能被探测和读到。
 
 device 形态下 host 入口 `batch_get_v1` 不读取任何数据（device 对象是按层排列的
-SG 分组，读不进 host buffer），它只回答“这一页在 L3 里是否存在”：本进程做过
-device 传输、知道一页分几组之后，要求全部 SG 分组都存在；在此之前与存在性探测
-一样只查第 0 组。缺组或探测失败都报 False。真正的 KV 由 device 入口
-（`batch_get_v1_device` / `batch_get_v2`）加载，并逐组校验长度。此前这个入口对
-所有页一律报 True。
+SG 分组，读不进 host buffer），它只回答“这一页在 L3 里是否存在”：一页的全部 SG
+分组都存在才报 True，缺组或探测失败都报 False。`batch_exists` 和 retention 用同一组
+key。真正的 KV 由 device 入口（`batch_get_v1_device` / `batch_get_v2`）加载，并逐组
+校验长度。此前这个入口对所有页一律报 True。
+
+一页分几组：请求 bypass 时，注册 device pool 就用一页（第 0 页的 token slot，只算
+指针，不做 I/O）的 per-layer segment 数除以 SG 宽度得出；之后每次 device 传输也会
+记录。SGLang 构建的 device page metadata 在注册时调用不了的，打一条 WARNING，
+在首次 device 传输前只探测、只保留第 0 组（旧行为）。
 
 #### 冷连接池
 

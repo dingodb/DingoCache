@@ -1379,6 +1379,38 @@ class DfkvHiCache(HiCacheStorage):
             result.result = (
                 f"registered {registered} device region(s)"
                 if registered else "no device buffer registered")
+            if getattr(self, "_device_direct_requested", False):
+                self._record_kv_sg_groups(mem_pool_device)
+
+    def _record_kv_sg_groups(self, mem_pool_device) -> None:
+        """Record how many SG groups a primary-KV page is stored in.
+
+        Device transfers record it (_flatten_device), but a process probes,
+        reads the presence anchor and retains pages before its first one,
+        e.g. pages other instances wrote. The count is that of one page's
+        per-layer segments, from the same metadata function the transfers
+        use, called with the token slots of page 0 (pointer arithmetic, no
+        I/O). If that call is not possible with this SGLang build the count
+        stays unknown and group 0 alone is addressed until the first
+        transfer, as before.
+        """
+        from sglang.srt.mem_cache.device_page_meta import (
+            get_device_page_buffer_meta,
+        )
+        try:
+            page = list(range(int(mem_pool_device.page_size)))
+            seg_ptrs, _sizes = get_device_page_buffer_meta(mem_pool_device, page)
+            segments = len(seg_ptrs[0])
+        except Exception as exc:
+            _log.warning(
+                "dfkv: SG group count of the device pool unknown until the "
+                "first device transfer (%s: %s); until then only group 0 "
+                "of a page is probed and retained", type(exc).__name__, exc)
+            return
+        w = self._sg_width()
+        if not hasattr(self, "_sg_chunks"):
+            self._sg_chunks = {}
+        self._sg_chunks["kv"] = max(1, (segments + w - 1) // w)
 
     def register_mem_pool_device_sidecar(self, name, device_pool):
         """Register a DSA sidecar GPU pool, strictly in requested bypass mode."""
@@ -1650,9 +1682,9 @@ class DfkvHiCache(HiCacheStorage):
 
         Device-direct (L2-bypass) writes store SG-chunked keys, so retention on
         the bare key would miss them. The chunk count is recorded by
-        _flatten_device; a page this process serves from device/host memory was
-        written or loaded through it, so batch_touch always sees the recorded
-        count. Before the first device I/O only chunk 0 is known.
+        _flatten_device, and for primary KV also when the device pool is
+        registered with the bypass requested (_record_kv_sg_groups). Where
+        neither has happened only chunk 0 is known.
         """
         if pool in ("kv", "__default__"):
             base = self._keys(page_hash)
@@ -2238,16 +2270,14 @@ class DfkvHiCache(HiCacheStorage):
         with _tracing.span("batch_exists", total) as _sp, \
                 access_log("batch_exists", lambda: f"{self._alog_tag} {total} keys") as r:
             # longest contiguous prefix of pages whose every sub-object exists.
-            # Device-direct writes use explicit binary SG coordinates, so
-            # existence probes group 0. The bare object key
-            # cannot match a chunked store; a different negotiated width is a
-            # cold miss rather than a corrupt read. One probe form suffices.
-            sub = self._sub()
-            if self._device_direct_active():
-                sks = [self._sg_group_key(sk, 0) for k in keys for sk in self._keys(k)]
-            else:
-                sks = [sk for k in keys for sk in self._keys(k)]
-            page_ok = self._fold(self._batch_exist_flat(sks), total, sub)
+            # Device-direct writes use explicit binary SG coordinates: every
+            # known SG group of a page is probed, the same keys as the
+            # presence anchor in batch_get_v1 and retention. The bare object
+            # key cannot match a chunked store; a different negotiated width
+            # is a cold miss rather than a corrupt read.
+            sks = [sk for k in keys for sk in self._stored_keys("kv", k)]
+            per_page = len(sks) // total if total else 0
+            page_ok = self._fold(self._batch_exist_flat(sks), total, per_page)
             n = 0
             for ok in page_ok:
                 if not ok:
