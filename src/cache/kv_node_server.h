@@ -46,7 +46,11 @@ class KvNodeServer {
   // Each step is logged with its duration. Returns true if every disk is
   // clean. Precondition: whatever else calls into this server (an RDMA server)
   // has been stopped. Afterwards the server can only be destroyed.
-  bool Shutdown();
+  // `started` is when the caller began stopping: the time it spent stopping
+  // other request paths counts against the drain limit, because the flushers
+  // were already writing the backlog then.
+  bool Shutdown(std::chrono::steady_clock::time_point started =
+                    std::chrono::steady_clock::now());
   // Cluster member list this node advertises for discovery (kMembers wire op):
   // "name=ip:port,name=ip:port,...". Clients query any node to learn the cluster.
   void set_members(const std::string& members) { members_ = members; }
@@ -291,6 +295,7 @@ class KvNodeServer {
   int listen_fd_ = -1;
   int port_ = 0;
   std::atomic<bool> running_{false};
+  uint64_t shutdown_drain_timeout_s_ = 30;  // DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S
   bool shutdown_done_ = false;       // Shutdown() ran; shutdown_clean_ is its result
   bool shutdown_clean_ = false;
   std::atomic<size_t> accept_count_{0};

@@ -236,6 +236,9 @@ RestartSec=2
 # 配大 arena（≥64 GiB）时必须同步调大。
 TimeoutStartSec=600
 TimeoutStopSec=600
+# 停止时给 RAM 层积压刷盘的时限（默认 30 秒，超时丢弃剩余）。停止超时放到 600 秒之后，
+# 这里跟着放大，留出停请求、各盘同步和释放内存的时间。
+Environment=DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S=300
 # OOM 调整：内存压力下 Linux OOM Killer 倾向杀占内存过多的进程，dfkv 的 RAM arena 会被白锁。
 # xb01 生产-500，降低 dfkv 被错杀风险（NVMe cache-process 死了 模型自己还能重算，预 pin 大 RAM 的
 # dfkv arena 更不该成为被出手的对象）
@@ -303,7 +306,7 @@ WantedBy=multi-user.target
 >   值由 `dfkv_tcp_first_req_ms` gauge 上报（见 METRICS.md §3.1）。
 > - RAM 热层 arena 在启动期预触页：**实测 192 GiB 约 45–55 秒（每 16 GiB 约 4–5 秒）**，配更大的 arena 时同步调大 systemd `TimeoutStartSec`（默认 90s）并让就绪探测等待 metrics 端口。
 > - arena 在预触页时用 `mlock2(MLOCK_ONFAULT)` 锁在内存里，不会被换出（需要足够的 memlock 上限，样例单元里是 `LimitMEMLOCK=infinity`）。锁不上只打一条 WARN，服务照常运行，这时开了 swap 的主机在内存紧张时可能把 arena 换出。`DFKV_RAM_TIER_LOCK=off` 可以关闭，`dfkv_ram_arena_locked` 指标反映实际有没有锁上。以前这块内存是因为整块注册到各 rail 而被 pin 住的；只走 TCP 的节点以前没有这层保护，现在也会锁。
-> - 停止顺序（收到 SIGTERM 之后）：停 RDMA 和 TCP 请求 → RAM 层积压刷盘（时限 `DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S`，默认 30 秒，超时丢弃剩余）→ 各盘同时同步并写 clean → 最后才释放内存。每一步在日志里有一行 `shutdown: ...` 和耗时；看到 `dfkv_server shut down cleanly ... releasing memory` 之后，进程即使在释放大 arena 的那几十秒里被 `TimeoutStopSec` 杀掉，下次启动也是干净启动，缓存保留。以前 clean 标记写在释放内存之后，这段时间被杀会清空全部缓存。
+> - 停止顺序（收到 SIGTERM 之后）：停 RDMA 和 TCP 请求 → RAM 层积压刷盘（时限 `DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S`，默认 30 秒，超时丢弃剩余）→ 各盘同时同步并写 clean → 最后才释放内存。每一步在日志里有一行 `shutdown: ...` 和耗时（INFO 级别）；看到 `dfkv_server shut down cleanly ... releasing memory` 之后，进程即使在释放大 arena 的那几十秒里被 `TimeoutStopSec` 杀掉，下次启动也是干净启动，缓存保留。以前 clean 标记写在释放内存之后，这段时间被杀会清空全部缓存。
 > GPU 节点推荐：保留默认 slab/direct，按节点突发画像启用 RAM tier 并设置总预算。
 ```bash
 systemctl daemon-reload && systemctl enable --now dfkv
@@ -553,7 +556,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `DFKV_RAM_TIER_NUMA` | `interleave` | interleave / off |
 | `DFKV_RAM_TIER_LOCK` | `on` | arena 是否锁在内存里（`mlock2`）；锁不上只告警，`dfkv_ram_arena_locked` 反映实际结果 |
 | `DFKV_RAM_FLUSH_THREADS` | `4×盘数`，钳至 shard 上限 16 | flush 线程 |
-| `DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S` | `30`，上限 3600 | 停止时给 RAM 层积压刷盘的时限。到时还只在内存里的对象直接丢弃（缓存语义，日志里有数量），然后各盘照常同步并写 clean。要小于 `TimeoutStopSec` 减去各盘同步的时间 |
+| `DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S` | `30`，上限 3600，`0` 表示不等 | 停止时给 RAM 层积压刷盘的时限，从开始停止算起。到时还只在内存里的对象直接丢弃（缓存语义，日志里有数量），然后各盘照常同步并写 clean。要小于 `TimeoutStopSec` 减去停请求和各盘同步的时间；默认值按 systemd 默认的 90 秒停止超时取的，`TimeoutStopSec` 调大了就一起调大。非法值（非数字、带单位）告警后用默认值 |
 
 #### f. 同主机/会合复本（node dedup，v2.0.0 新生产杠杆）
 

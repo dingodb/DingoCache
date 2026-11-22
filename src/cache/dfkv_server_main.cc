@@ -655,7 +655,7 @@ int main(int argc, char** argv) {
     DFKV_LOG_INFO("shutdown: RDMA requests stopped after " + stop_seconds());
   }
 #endif
-  if (srv.Shutdown()) {
+  if (srv.Shutdown(stop_started)) {
     DFKV_LOG_INFO("dfkv_server shut down cleanly in " + stop_seconds() +
                   "; releasing memory");
   } else {

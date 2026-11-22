@@ -42,6 +42,36 @@ got=$("$BUILD/dfkvctl" --members "n=127.0.0.1:$P" --namespace "dfkv/smoke" get k
 "$BUILD/dfkvctl" stat "127.0.0.1:$P" | grep -q dfkv_cache_put_total
 echo "tool_smoke OK (port $P)"
 
+# SIGTERM: the server must have its disks clean before it starts releasing
+# memory, exit 0, and a restart on the same directory must be a clean start
+# that still has the data.
+kill -TERM $PID
+rc=0; wait $PID || rc=$?
+[ "$rc" = 0 ] || { echo "dfkv_server after SIGTERM: expected exit 0, got $rc"; cat "$D/srv.out"; exit 1; }
+clean_line=$(grep -n 'shutdown: 1 of 1 disks clean' "$D/srv.out" | head -1 | cut -d: -f1)
+done_line=$(grep -n 'dfkv_server shut down cleanly' "$D/srv.out" | head -1 | cut -d: -f1)
+[ -n "$clean_line" ] && [ -n "$done_line" ] && [ "$clean_line" -lt "$done_line" ] || {
+  echo "dfkv_server did not report a clean shutdown in order"
+  cat "$D/srv.out"
+  exit 1
+}
+: > "$D/srv2.out"
+env -u DFKV_STORE_ENGINE -u DFKV_SLAB_WRITE -u DFKV_SLAB_WARM_RESTART "$BUILD/dfkv_server" \
+  --dir "$D/cache" --port 0 --cap 1073741824 >>"$D/srv2.out" 2>&1 &
+PID=$!
+P=""
+for i in $(seq 1 100); do P=$(awk '/PORT/{print $2}' "$D/srv2.out" 2>/dev/null || true); [ -n "$P" ] && break; sleep 0.05; done
+[ -n "$P" ] || { echo "restarted server did not report PORT"; cat "$D/srv2.out"; exit 1; }
+got=$("$BUILD/dfkvctl" --members "n=127.0.0.1:$P" --namespace "dfkv/smoke" get k)
+[ "$got" = "v12345" ] || { echo "value lost across a clean restart: '$got'"; cat "$D/srv2.out"; exit 1; }
+"$BUILD/dfkvctl" stat "127.0.0.1:$P" | grep -Eq '^dfkv_slab_unclean_resets_total(\{[^}]*\})? 0$' || {
+  echo "restart after SIGTERM was not a clean start"
+  "$BUILD/dfkvctl" stat "127.0.0.1:$P" | grep unclean || true
+  cat "$D/srv2.out"
+  exit 1
+}
+echo "clean-shutdown smoke OK"
+
 # Strict arg parsing: an unknown flag / bad number / bad --advertise must fail
 # fast (exit 2), not run with silent defaults. (`set -e` is on, so guard the
 # expected-nonzero calls.)

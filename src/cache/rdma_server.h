@@ -262,6 +262,7 @@ class RdmaServer {
   // Later chunks register lazily on the rail of the connection that leases
   // them. Auto mode anchors only the first ACTIVE local rail.
   std::vector<std::unique_ptr<rdma::RcEndpoint>> anchors_;
+  std::mutex stop_mu_;  // serializes Quiesce() and the release in Stop()
   std::vector<std::string> anchor_devs_;  // fixed resolved rail names
   std::vector<std::unique_ptr<RailStats>> rail_stats_;  // indexed with anchor_devs_
   // Narrow hardware-free startup seams, private and reachable only through the
