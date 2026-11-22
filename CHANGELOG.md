@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+
+- vLLM connector: which cache groups' SAVE must finish inside the model step
+  is now decided default-deny. Only full attention (exactly
+  `FullAttentionSpec` / `MLAAttentionSpec`, without a window or chunk size),
+  whose blocks vLLM keeps with the request until it finishes, is saved
+  asynchronously. Every other spec type is fenced, including subclasses and
+  types the connector does not know. The old list allowed by default: a
+  group was fenced only for `MambaSpec` or a `sliding_window` /
+  `attention_chunk_size` / `rswa_window` field, so a new spec type that
+  frees or rewrites blocks while its request runs would have been read
+  after its blocks were reused, and stored under a valid key. Spec types of
+  current vLLM affected: subclasses such as the hidden-state cache and sink
+  attention are now fenced too (correct, a little slower).
 ## 2.41.0 — 2026-11-23
 
 

@@ -58,8 +58,8 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_kv_cache_block_sizes,
 )
 from vllm.v1.kv_cache_interface import (
-    AttentionSpec, KVCacheConfig, KVCacheGroupSpec, MambaSpec,
-    UniformTypeKVCacheSpecs,
+    AttentionSpec, FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec,
+    MambaSpec, MLAAttentionSpec, UniformTypeKVCacheSpecs,
 )
 
 # dfkv: get_dp_engine_index replaces mooncake_utils.get_mooncake_dp_engine_index;
@@ -173,6 +173,38 @@ def _effective_cache_spec(spec, dcp_size: int):
     if dcp_size == 1 or not isinstance(spec, AttentionSpec):
         return spec
     return dataclasses.replace(spec, block_size=spec.block_size * dcp_size)
+
+
+# Spec types whose blocks vLLM keeps with a request until it finishes (its
+# FullAttentionManager never frees or rewrites them while the request runs):
+# their SAVE may run past the step. Exact types: a subclass can bring its own
+# manager (RSWA, sink attention) and is fenced until it is reviewed.
+_SAVE_ASYNC_SPEC_TYPES = (FullAttentionSpec, MLAAttentionSpec)
+
+
+def _save_needs_step_fence(spec) -> bool:
+    """Whether a group's SAVE has to finish before the next model step.
+
+    Default deny: only full attention whose blocks stay with the request may
+    be saved asynchronously. Everything else -- recurrent state, windows,
+    chunked local attention, and any spec type this connector does not know
+    -- may be freed, reused or rewritten while the request still runs, and an
+    asynchronous PUT would then store bytes of another request under a valid
+    key.
+    """
+    specs = (
+        spec.kv_cache_specs.values()
+        if isinstance(spec, UniformTypeKVCacheSpecs)
+        else (spec,)
+    )
+    return any(
+        type(inner) not in _SAVE_ASYNC_SPEC_TYPES
+        or any(
+            getattr(inner, field, None) is not None
+            for field in ("sliding_window", "attention_chunk_size", "rswa_window")
+        )
+        for inner in specs
+    )
 
 
 def _cache_group_layout(groups: Sequence[KVCacheGroupSpec]) -> str:
@@ -2159,26 +2191,12 @@ class DfkvStoreWorker:
         # reused at once, both while the request is still running. Their
         # PUTs finish before the step returns; the others' blocks stay with
         # the request until vLLM is told the save is done.
-        fenced: set[int] = set()
-        for g_idx, group in enumerate(self._kv_cache_groups):
-            group_spec = group.kv_cache_spec
-            if not _prefix_cacheable(group_spec):
-                continue
-            specs = (
-                group_spec.kv_cache_specs.values()
-                if isinstance(group_spec, UniformTypeKVCacheSpecs)
-                else (group_spec,)
-            )
-            if any(
-                isinstance(spec, MambaSpec)
-                or any(
-                    getattr(spec, field, None) is not None
-                    for field in ("sliding_window", "attention_chunk_size", "rswa_window")
-                )
-                for spec in specs
-            ):
-                fenced.add(g_idx)
-        self._fenced_store_groups = frozenset(fenced)
+        self._fenced_store_groups = frozenset(
+            g_idx
+            for g_idx, group in enumerate(self._kv_cache_groups)
+            if _prefix_cacheable(group.kv_cache_spec)
+            and _save_needs_step_fence(group.kv_cache_spec)
+        )
 
         # CLIENT_RANKS (issue #111): converge store-side dfkv clients onto a
         # subset of ranks when the KV object is fully TP-replicated.

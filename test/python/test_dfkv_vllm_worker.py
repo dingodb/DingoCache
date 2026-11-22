@@ -191,6 +191,7 @@ def _install_vllm_stubs() -> None:
         AttentionSpec=Placeholder,
         MambaSpec=Placeholder,
         FullAttentionSpec=Placeholder,
+        MLAAttentionSpec=Placeholder,
         KVCacheConfig=Placeholder,
         KVCacheGroupSpec=Placeholder,
         KVCacheSpec=Placeholder,
