@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- SGLang HiCache connector: storage coordinates are no longer assumed when
+  SGLang's parallel context cannot be read. The connector takes the
+  context-parallel coordinates of a rank (prefill CP, decode CP) and the
+  attention-TP rank used to elect the MLA writer from that context. When
+  reading it failed for any reason, it silently used pcp=0/1 and dcp=0/1 and
+  elected the writer by `tp_rank`: in a deployment with context parallelism
+  every rank then shared one key, one rank wrote, and the others read that
+  rank's shard as their own (same size, so the read check passes). Now the
+  coordinates come from `HiCacheStorageConfig` where it carries them: PCP
+  from `attn_cp_size`/`attn_cp_rank`, DCP from `dcp_size`/`dcp_rank`. A
+  WARNING at start names the source of each coordinate, and
+  `dfkv_hicache_parallel_context_fallbacks_total` counts the rank. Without
+  DCP fields there, DCP is 0/1 if the SGLang build has no parallel-context
+  API at all (such builds have no decode CP); if the API is there but fails
+  (state not initialized yet, or changed), the DCP coordinate is unknown and
+  the backend refuses to be created unless `dcp_size`/`dcp_rank` are given
+  in the extra_config. A host pool that
+  declares a `dcp_size` above 1 different from the resolved one is refused at
+  registration. Deployments whose coordinates were read from the parallel
+  context, or given in the extra_config, are unaffected.
 - SGLang HiCache connector: a v2 backup and a v2 prefetch that run at the same
   time no longer take each other's result. The pool-aware transfer
   (`batch_set_v2`, `batch_get_v2`, and the host side pools of the `_device`
