@@ -287,6 +287,9 @@ class KVClient {
   // Retention per-node view (from kRetain replies) and refresh debounce.
   struct RetainNodeState {
     int supported = -1;  // -1 unknown, 0 no, 1 yes
+    // When "no" was learned. A "no" older than retain_reprobe_ms_ is asked
+    // again (the node may have been upgraded or replaced since).
+    uint64_t unsupported_at_ms = 0;
     uint32_t max_ttl_s = 0;
     uint8_t headroom_pct = 100;
     bool heard = false;
@@ -361,6 +364,9 @@ class KVClient {
   }
   OpMetrics op_stats_;  // every public put/get/exist/remove call, exactly once
   int get_miss_retries_ = 1;
+  uint64_t retain_reprobe_ms_ = 30000;  // DFKV_RETAIN_REPROBE_MS
+  // supported == 0, learned less than retain_reprobe_ms_ ago. retain_mu_.
+  bool KnownUnsupported(const RetainNodeState& ns, uint64_t now) const;
 
   // Active per-peer latency prober (off the datapath; own thread).
   PeerLatency peer_lat_;
