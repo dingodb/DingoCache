@@ -301,3 +301,95 @@ TEST(KVClientRetain, UnsupportedVerdictIsAskedAgain) {
   cl.c->BatchRetain(keys, set, out);
   EXPECT_EQ(out[0], KVClient::kRetMiss) << "SET still reported unsupported";
 }
+
+// ---- which misses are read a second time ----------------------------------
+
+// The retry exists for two transients: a block that reads absent for an
+// instant while the node moves it between tiers, and a read lost to
+// connection turnover (an I/O error). A refused request is not retried.
+TEST(KVClientRetry, BatchGetRetriesTransientMissesOnly) {
+  Client cl("get");
+  std::vector<std::string> keys;
+  for (int i = 0; i < 10; ++i) keys.push_back("k" + std::to_string(i));
+  for (const auto& k : keys) cl.Store(k, std::string(64, k[1]));
+  cl.t.plans[cl.Name("k7")] = ScriptedTransport::Plan::kInvalid;
+  cl.t.plans[cl.Name("k8")] = ScriptedTransport::Plan::kMissOnce;
+  cl.t.plans[cl.Name("k9")] = ScriptedTransport::Plan::kIOErrorOnce;
+  std::vector<std::string> bufs(keys.size(), std::string(64, '\0'));
+  std::vector<KvGetItem> items;
+  for (size_t i = 0; i < keys.size(); ++i)
+    items.push_back(KvGetItem{keys[i], &bufs[i][0], 64});
+  const std::vector<bool> got = cl.c->BatchGet(items);
+  EXPECT_TRUE(got[8]) << "the transient miss was not retried";
+  EXPECT_TRUE(got[9]) << "the read lost to turnover was not retried";
+  EXPECT_FALSE(got[7]);
+  EXPECT_EQ(cl.Reads("k7"), 1) << "a refused read was sent again";
+  EXPECT_EQ(cl.Reads("k8"), 2);
+  EXPECT_EQ(cl.Reads("k9"), 2);
+}
+
+// A node whose whole shard failed is in cooldown after the pass: its keys
+// are not sent to it again, while a transient miss elsewhere is retried.
+TEST(KVClientRetry, BatchGetDoesNotResendToANodeInCooldown) {
+  Client cl("get-cooldown", 4);
+  cl.t.failing_node = "127.0.0.1:4";
+  cl.t.miss_once_first_healthy = true;
+  std::vector<std::string> keys;
+  for (int i = 0; i < 40; ++i) keys.push_back("c" + std::to_string(i));
+  for (const auto& k : keys) cl.Store(k, std::string(64, 'c'));
+  std::vector<std::string> bufs(keys.size(), std::string(64, '\0'));
+  std::vector<KvGetItem> items;
+  for (size_t i = 0; i < keys.size(); ++i)
+    items.push_back(KvGetItem{keys[i], &bufs[i][0], 64});
+  cl.c->BatchGet(items);
+  int on_failing = 0;
+  for (const auto& k : keys) {
+    if (cl.t.node_of[cl.Name(k)] != cl.t.failing_node) continue;
+    ++on_failing;
+    EXPECT_EQ(cl.Reads(k), 1) << "sent again to a node in cooldown";
+  }
+  EXPECT_GT(on_failing, 0);
+  EXPECT_EQ(cl.t.reads[cl.t.miss_once_key], 2) << "no retry pass ran";
+}
+
+// The variable-length batch path retries a transient miss as the others do.
+TEST(KVClientRetry, BatchGetAutoRetriesATransientMiss) {
+  Client cl("auto");
+  std::vector<std::string> keys;
+  for (int i = 0; i < 10; ++i) keys.push_back("k" + std::to_string(i));
+  for (const auto& k : keys) cl.Store(k, std::string(48, k[1]));
+  cl.t.plans[cl.Name("k8")] = ScriptedTransport::Plan::kMissOnce;
+  cl.t.plans[cl.Name("k9")] = ScriptedTransport::Plan::kInvalid;
+  std::vector<std::string> bufs(keys.size(), std::string(64, '\0'));
+  std::vector<KvGetItem> items;
+  for (size_t i = 0; i < keys.size(); ++i)
+    items.push_back(KvGetItem{keys[i], &bufs[i][0], 64});
+  std::vector<size_t> lens;
+  const std::vector<bool> got = cl.c->BatchGetAuto(items, &lens);
+  EXPECT_TRUE(got[8]) << "the transient miss was not retried";
+  EXPECT_EQ(lens[8], 48u);
+  EXPECT_FALSE(got[9]);
+  EXPECT_EQ(cl.Reads("k9"), 1) << "a refused read was sent again";
+}
+
+TEST(KVClientRetry, BatchGetAutoSgRetriesTransientMissesOnly) {
+  Client cl("sg");
+  std::vector<std::string> keys;
+  for (int i = 0; i < 10; ++i) keys.push_back("k" + std::to_string(i));
+  for (const auto& k : keys) cl.Store(k, std::string(64, k[1]));
+  cl.t.plans[cl.Name("k7")] = ScriptedTransport::Plan::kInvalid;
+  cl.t.plans[cl.Name("k8")] = ScriptedTransport::Plan::kMissOnce;
+  cl.t.plans[cl.Name("k9")] = ScriptedTransport::Plan::kIOErrorOnce;
+  std::vector<std::string> a(keys.size(), std::string(32, '\0')),
+      b(keys.size(), std::string(32, '\0'));
+  std::vector<KvGetItemSg> items;
+  for (size_t i = 0; i < keys.size(); ++i)
+    items.push_back(KvGetItemSg{keys[i], {&a[i][0], &b[i][0]}, {32, 32}});
+  std::vector<size_t> lens;
+  const std::vector<bool> got = cl.c->BatchGetAutoSg(items, &lens);
+  EXPECT_TRUE(got[8]);
+  EXPECT_TRUE(got[9]);
+  EXPECT_FALSE(got[7]);
+  EXPECT_EQ(cl.Reads("k7"), 1) << "a refused read was sent again";
+  EXPECT_EQ(cl.Reads("k9"), 2);
+}

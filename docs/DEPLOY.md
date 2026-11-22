@@ -745,7 +745,7 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | `DFKV_RDMA_REGISTERED_BYTES_BUDGET` | endpoint 上限 × depth × 2 × receive slot（沿用保守 admission 上限） | 实际 live endpoint 只租用 resident receive slot；GET exact grant 按操作申请，不保留连接级 pull arena |
 | `DFKV_RDMA_RESOURCE_ACQUIRE_MS` | `10000` | 建立新 QP 前等待全部资源额度的上限；超时明确失败，不超发 |
 | `DFKV_BATCH_CONCURRENCY` | `0`=auto（auto: `min(max(nodes, 8), 32)`） | TCP/write/兼容路径的 batch 分段并发度。RDMA read 的实际 process-wide 并发由 `DFKV_RDMA_READ_WORKERS` 限制 |
-| `DFKV_GET_MISS_RETRIES` | `1` | client GET miss 后发重试次数 |
+| `DFKV_GET_MISS_RETRIES` | `1` | client 批量 GET 对节点回答“不存在”的 key 的重试次数（只重试两种瞬态：节点回答“不存在”，以及节点仍健康时的 I/O 错误（连接更替；客户端分不清超时和断连，所以刚应答过的节点上超时的分片也会重发一次）；被拒、长度不符、节点已进入冷却都不重试；未命中超过一半的批次不重试）。三条批量读路径（定长、变长、SG）相同 |
 | `DFKV_RETAIN_REPROBE_MS` | `30000` | 某个节点被判定不支持 retention（kRetain）之后，过这么久再问一次（节点可能已升级或被替换）；在此之前对它的 REFRESH 退化为 Exist，SET 返回 unsupported。`0` 表示每次都问 |
 | `DFKV_PROBE_INTERVAL_MS` | `0`=关 | client 对 server 的主动 probe 间隔（一次 Exist 往返）。用途是逐 peer 延迟指标，以及让回避中的节点提前被试探：probe 得到应答只把该节点的回避期提前结束一次，下一个请求作为试探，由试探结果决定是否恢复；probe 本身不判定节点健康（store 已失败的节点对 Exist 仍应答未命中）。probe 促成的那次试探一旦失败，在有请求成功之前，probe 应答不能再缩短这次事故的回避期，回避按正常的翻倍节奏走完 |
 | `DFKV_PEER_COOLDOWN_MS` | `2000` | PeerHealth endpoint 快速回避窗口。一次事故只算一步：回避期内到达的失败（同一批的其他分片、当时在途的请求）不再延长回避。回避期结束后只放行一个请求作为试探，其余请求继续跳过该节点（返回未命中，与回避期内相同），直到试探成功（恢复）或失败（进入下一档回避）。并发上限是每个本窗口一个试探请求，不是总共一个：试探卡在超时里超过一个本窗口，下一个请求接着试探；卡住的那个最终失败时若下一档回避已经过完，算作又一次失败。试探若对节点没有结论（请求被本进程的传输预算拒绝、没有可用 rail、或传输层因该地址刚连接失败而未拨号直接拒绝），立即把试探机会让给下一个请求，回避不加长。节点给出的任何状态（命中、未命中、cache full、quota exceeded）都算节点存活 |
