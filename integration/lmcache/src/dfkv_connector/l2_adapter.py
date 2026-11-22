@@ -50,7 +50,11 @@ from dfkv_common import (
 )
 
 from lmcache.logging import init_logger
-from lmcache.native_storage_ops import Bitmap
+
+try:  # LMCache >= 0.5.4
+    from lmcache.lmcache_native import Bitmap
+except ImportError:  # LMCache 0.4.7 - 0.5.3
+    from lmcache.native_storage_ops import Bitmap
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.internal_api import L2StoreResult
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
@@ -490,7 +494,13 @@ class DfkvL2Adapter(L2AdapterInterface):
     # Lookup and Lock
     # ------------------------------------------------------------------
 
-    def submit_lookup_and_lock_task(self, keys: List[ObjectKey]) -> L2TaskId:
+    def submit_lookup_and_lock_task(
+        self, keys: List[ObjectKey], *_layout_hint, **_layout_hint_kw
+    ) -> L2TaskId:
+        """Look ``keys`` up. LMCache 0.5.0 and later pass a second argument,
+        the memory layout (``layout_desc``, from 0.5.3 ``group_layout_descs``
+        per object group); 0.4.7 does not. It is advisory, and dfkv objects
+        are opaque bytes: it is accepted in either form and not used."""
         binary_keys = self._binary_keys(keys)
         with self._lock:
             task_id = self._next_task_id

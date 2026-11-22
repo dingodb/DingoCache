@@ -1175,7 +1175,7 @@ direct-GPU retry fencing 落地前的已知性能取舍，不应按旧版 direct
 
 | 角色 | 跑什么 | 要求 |
 |---|---|---|
-| **推理节点** | vLLM + LMCache + dfkv connector | GPU；vLLM、LMCache（≥0.4.5）；connector 纯 Python（ctypes 调 `libdfkv.so`），无 ABI 匹配问题 |
+| **推理节点** | vLLM + LMCache + dfkv connector | GPU；vLLM、LMCache（`>=0.4.5,<0.5.7`；MP-server L2 adapter 需 ≥0.4.7，其接口按 0.4.7 / 0.5.0 / 0.5.3 / 0.5.4 的签名测试，真机端到端为 0.4.7；上限排除 0.5.7：它新增 adapter 未实现的抽象方法，且把 `lmcache.v1.storage_backend` 移到 `lmcache.inprocess.v1.storage_backend`，in-process connector 也无法 import。因此新装会解析到 0.5.6，要求 LMCache ≥0.5.7 的 vLLM 环境会出现依赖冲突）；connector 纯 Python（ctypes 调 `libdfkv.so`），无 ABI 匹配问题 |
 
 网络：推理节点须能 TCP 连到每台缓存节点的 dfkv 端口；走 RDMA 则两端须在同一 IB/RoCE 网络。
 
@@ -1400,7 +1400,8 @@ load 校验长度：命中的值长度必须等于目标 buffer 的长度（stor
 `create_event_notifier`（store/lookup/load）+ done-callback** 把同步 ctypes 客户端桥接到
 `L2AdapterInterface`；`ObjectKey` 经统一 codec 渲染为 §1.4 的 canonical object key。
 已在 GLM-5.2（vLLM 0.23.0 + LMCache 0.4.7）真机验证：store → 重启（L1 清空）→ 从 dfkv
-回载、prefill 跳过。单测 `integration/lmcache/tests/test_l2_adapter.py`（fake client）+
+回载、prefill 跳过。单测 `integration/lmcache/tests/test_l2_adapter.py`（fake client）、
+`test_l2_adapter_api.py`（对 LMCache 0.4.7 / 0.5.0 / 0.5.3 / 0.5.4 的 `L2AdapterInterface` 签名逐一校验：0.5.0 起 `submit_lookup_and_lock_task` 多一个位置参数 layout（0.5.3 起为 `group_layout_descs`），0.5.4 起 `Bitmap` 移到 `lmcache.lmcache_native`；此前 adapter 在 0.5.x 上能启动、第一次 prefetch 抛 `TypeError`，0.5.4 起直接 import 失败）+
 集成测试 `test_l2_adapter_integration.py`（`DFKV_L2_URL`/`DFKV_L2_MEMBERSHIP` 指向真环）。
 
 MP-server L2 adapter 只有一个共享 dfkv client，构造时没有单一物理 GPU local

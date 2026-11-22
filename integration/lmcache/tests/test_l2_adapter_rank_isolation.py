@@ -20,6 +20,12 @@ import unittest
 # Make ``import dfkv_connector`` work when run from the repo without install.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+# Without LMCache installed, run on the stand-in for its modules.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _lmcache_stub  # noqa: E402
+
+_lmcache_stub.install()
+
 import dfkv_connector.l2_adapter as l2mod  # noqa: E402
 from dfkv_connector.l2_adapter import (  # noqa: E402
     DfkvL2Adapter,

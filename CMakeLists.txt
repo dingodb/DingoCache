@@ -303,6 +303,26 @@ if(DFKV_BUILD_TESTS)
               ${CMAKE_CURRENT_SOURCE_DIR}/integration/lmcache/tests/test_l2_key_and_length.py)
     set_tests_properties(python_lmcache_l2_key_and_length PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
+    # The L2 adapter against the L2AdapterInterface of each supported LMCache
+    # release (stand-in per release; the installed LMCache if there is one).
+    foreach(_lmc_api 0.4.7 0.5.0 0.5.3 0.5.4)
+      string(REPLACE "." "_" _lmc_api_name "${_lmc_api}")
+      add_test(NAME python_lmcache_l2_api_${_lmc_api_name}
+        COMMAND ${PYTHON3}
+                ${CMAKE_CURRENT_SOURCE_DIR}/integration/lmcache/tests/test_l2_adapter_api.py)
+      set_tests_properties(python_lmcache_l2_api_${_lmc_api_name} PROPERTIES
+        ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src;DFKV_TEST_LMCACHE_API=${_lmc_api}")
+    endforeach()
+    add_test(NAME python_lmcache_l2_adapter
+      COMMAND ${PYTHON3}
+              ${CMAKE_CURRENT_SOURCE_DIR}/integration/lmcache/tests/test_l2_adapter.py)
+    set_tests_properties(python_lmcache_l2_adapter PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
+    add_test(NAME python_lmcache_l2_rank_isolation
+      COMMAND ${PYTHON3}
+              ${CMAKE_CURRENT_SOURCE_DIR}/integration/lmcache/tests/test_l2_adapter_rank_isolation.py)
+    set_tests_properties(python_lmcache_l2_rank_isolation PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
     add_test(NAME python_lmcache_key_mapper
       COMMAND ${PYTHON3}
               ${CMAKE_CURRENT_SOURCE_DIR}/integration/lmcache/tests/test_key_mapper.py)

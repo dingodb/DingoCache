@@ -15,12 +15,18 @@ adapter has to follow:
   ``submit_lookup_and_lock_task(self, keys, layout_desc)``         0.5.0-0.5.2
   ``submit_lookup_and_lock_task(self, keys, group_layout_descs)``  0.5.3-0.5.6
 
-and in where ``Bitmap`` is imported from (``lmcache.native_storage_ops`` up
-to 0.5.3, ``lmcache.lmcache_native`` from 0.5.4). ``install(api=...)`` selects
-one of ``"0.4.7"``, ``"0.5.0"``, ``"0.5.3"``, ``"0.5.4"``; the environment
-variable ``DFKV_TEST_LMCACHE_API`` is the default. The abstract methods, the
-constructor and the ``_notify_*`` hooks are the same in all of them, checked
-against the sources of 0.4.7 through 0.5.6.
+(LMCache's controllers pass the second argument positionally), and in where
+``Bitmap`` is imported from (``lmcache.native_storage_ops`` up to 0.5.3,
+``lmcache.lmcache_native`` from 0.5.4). ``install(api=...)`` selects one of
+``"0.4.7"``, ``"0.5.0"``, ``"0.5.3"``, ``"0.5.4"``; the environment variable
+``DFKV_TEST_LMCACHE_API`` is the default. The other abstract methods, the
+constructor, ``L2StoreResult`` and the base class's byte accounting
+(``_notify_keys_*``, ``get_usage``) are the same in all of them; they are
+reproduced from ``l2_adapters/base.py`` and ``internal_api.py`` of 0.4.7,
+0.5.0, 0.5.2, 0.5.4 and 0.5.6. 0.5.7 adds an abstract ``get_memory_tags``
+the adapter does not implement and moves the in-process storage backend to
+``lmcache.inprocess.v1.storage_backend``, which is why the dependency stops
+before it.
 """
 
 from __future__ import annotations
@@ -30,8 +36,11 @@ import importlib.util
 import logging
 import os
 import sys
+import threading
 import types
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Mapping
 
 APIS = ("0.4.7", "0.5.0", "0.5.3", "0.5.4")
 
@@ -77,6 +86,25 @@ class L2StoreResult(int):
 
     def is_successful(self) -> bool:
         return int(self) >= 0
+
+    def bytes_transferred(self) -> int:
+        value = int(self)
+        return value if value >= 0 else 0
+
+
+@dataclass(frozen=True)
+class AdapterUsage:
+    total_bytes_used: int
+    total_capacity_bytes: int
+    bytes_by_cache_salt: Mapping[str, int] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+
+    @property
+    def usage_fraction(self) -> float:
+        if self.total_capacity_bytes <= 0:
+            return -1.0
+        return self.total_bytes_used / self.total_capacity_bytes
 
 
 @dataclass(frozen=True)
@@ -125,10 +153,11 @@ class _EventNotifier:
 def _l2_interface(api: str):
     class L2AdapterInterface(abc.ABC):
         def __init__(self, max_capacity_bytes: int = 0) -> None:
+            self._listeners = []
             self._max_capacity_bytes = max_capacity_bytes
-            self.stored_notifications = []
-            self.accessed_notifications = []
-            self.deleted_notifications = []
+            self._total_bytes_used = 0
+            self._bytes_by_cache_salt = {}
+            self._usage_lock = threading.Lock()
 
         @abc.abstractmethod
         def get_store_event_fd(self) -> int: ...
@@ -160,19 +189,69 @@ def _l2_interface(api: str):
         @abc.abstractmethod
         def close(self) -> None: ...
 
+        def register_listener(self, listener) -> None:
+            self._listeners.append(listener)
+
         def _notify_keys_stored(self, keys, sizes) -> None:
-            self.stored_notifications.append((list(keys), list(sizes)))
+            with self._usage_lock:
+                for key, size in zip(keys, sizes):
+                    self._total_bytes_used += size
+                    salt = key.cache_salt
+                    self._bytes_by_cache_salt[salt] = (
+                        self._bytes_by_cache_salt.get(salt, 0) + size
+                    )
+            for listener in self._listeners:
+                listener.on_l2_keys_stored(keys, sizes)
 
         def _notify_keys_accessed(self, keys) -> None:
-            self.accessed_notifications.append(list(keys))
+            for listener in self._listeners:
+                listener.on_l2_keys_accessed(keys)
 
         def _notify_keys_deleted(self, keys, sizes) -> None:
-            self.deleted_notifications.append((list(keys), list(sizes)))
+            with self._usage_lock:
+                for key, size in zip(keys, sizes):
+                    self._total_bytes_used -= size
+                    salt = key.cache_salt
+                    left = self._bytes_by_cache_salt.get(salt, 0) - size
+                    if left <= 0:
+                        self._bytes_by_cache_salt.pop(salt, None)
+                    else:
+                        self._bytes_by_cache_salt[salt] = left
+                if self._total_bytes_used < 0:
+                    self._total_bytes_used = 0
+            for listener in self._listeners:
+                listener.on_l2_keys_deleted(keys)
+
+        @property
+        def supports_global_eviction(self) -> bool:
+            return self._max_capacity_bytes > 0
+
+        def delete(self, keys) -> None:
+            pass
+
+        def get_usage(self) -> AdapterUsage:
+            with self._usage_lock:
+                return AdapterUsage(
+                    total_bytes_used=self._total_bytes_used,
+                    total_capacity_bytes=self._max_capacity_bytes,
+                    bytes_by_cache_salt=MappingProxyType(
+                        {k: v for k, v in self._bytes_by_cache_salt.items() if v > 0}
+                    ),
+                )
+
+        def report_status(self) -> dict:
+            return {}
+
+    if api == "0.5.4":
+        def set_backend_identity(self, name, shared) -> None:
+            pass
+
+        L2AdapterInterface.set_backend_identity = set_backend_identity
 
     # The one method whose signature differs between releases.
     if api == "0.4.7":
         def submit_lookup_and_lock_task(self, keys): ...
-    elif api in ("0.5.0",):
+    elif api == "0.5.0":
         def submit_lookup_and_lock_task(self, keys, layout_desc): ...
     else:
         def submit_lookup_and_lock_task(self, keys, group_layout_descs): ...
@@ -280,6 +359,7 @@ def install(api: str | None = None) -> str:
     base = _module("lmcache.v1.distributed.l2_adapters.base")
     base.L2AdapterInterface = _l2_interface(api)
     base.L2TaskId = int
+    base.AdapterUsage = AdapterUsage
 
     class L2AdapterConfigBase:
         pass

@@ -33,6 +33,18 @@ python -m pip install ../common .
 # python -m pip install -e ../common -e .
 ```
 
+Supported LMCache: `>=0.4.5,<0.5.7` (pinned in `pyproject.toml`). The MP-server
+L2 adapter needs 0.4.7 or later. Its interface changed in 0.5.0, 0.5.3 and
+0.5.4 (`submit_lookup_and_lock_task` gained a layout argument, which changed
+form in 0.5.3; `Bitmap` moved to `lmcache.lmcache_native` in 0.5.4); the
+adapter follows all of them, and its unit tests run against a stand-in of each
+(`DFKV_TEST_LMCACHE_API`). End-to-end runs have been on 0.4.7. 0.5.7 is
+excluded: it adds an abstract L2 method the adapter does not implement, and
+moves `lmcache.v1.storage_backend` to `lmcache.inprocess.v1.storage_backend`,
+so the in-process connector would not import either. Consequences: a fresh
+install resolves LMCache to 0.5.6, not the latest release; an environment
+whose vLLM requires LMCache 0.5.7 or later gets a resolver conflict.
+
 ## Configure LMCache (plugin mode)
 
 ```yaml
