@@ -82,6 +82,9 @@ struct GpuNodeDedupTestAccess {
   static void LookLikeAnOlderRelease(GpuNodeDedup& d, const Hold& h) {
     d.SetFenceableForTest(h.hold, false);
   }
+  static void ForgeRegistry(GpuNodeDedup& d, int how) {
+    d.ForgeRegistryForTest(how);
+  }
   // A reader looks a slot up and then copies out of it: the two stages.
   static auto Find(GpuNodeDedup& d, const BlockKey& key) { return d.Find(key); }
   template <typename SlotPtr>
@@ -1273,6 +1276,84 @@ TEST(GpuNodeDedup, SegmentLeftUnfinishedByADeadCreatorIsFinished) {
   ASSERT_EQ(b->ClaimSg(K(85), &k.d, 1, 4096, &got, &ignored),
             GpuNodeDedup::Role::kHit);
   EXPECT_EQ(k.dst.Down(4096), k.value);
+}
+
+// ---- registry entries whose pid is in use by another process --------------
+
+// Every registry entry looks held (pid in use): which of them a new process
+// may take. Without taking any, it runs without GPU dedup.
+std::unique_ptr<GpuNodeDedup> OpenWithRegistryForged(const std::string& name,
+                                                     int how) {
+  // The instance whose registry is forged stands for processes that are
+  // gone or elsewhere: it must not run its destructor, which would release
+  // its own entry under whoever holds it now.
+  GpuNodeDedup* first = GpuNodeDedup::Open(Opts(name)).release();
+  if (!first) return nullptr;
+  GpuNodeDedupTestAccess::ForgeRegistry(*first, how);
+  return GpuNodeDedup::Open(Opts(name));
+}
+
+// A container restarted in place gets the same pids: the entries of the
+// previous processes carry the pids of the new ones. They are reclaimed, not
+// skipped as this process's own (7 such restarts of 8 ranks used to fill the
+// registry and switch GPU dedup off for good).
+TEST(GpuNodeDedup, RegistryReclaimsEntriesOfAPreviousProcessWithTheSamePid) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("reg-same-pid");
+  auto b = OpenWithRegistryForged(g.name, 0);
+  ASSERT_TRUE(b) << "registry full of a previous process's entries";
+  auto c = GpuNodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(c);
+  KeyBufs k(86);
+  size_t got = 0;
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(b->ClaimSg(K(86), &k.s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  b->PublishSg(K(86), token, &k.s, 1, 4096);
+  ASSERT_EQ(c->ClaimSg(K(86), &k.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kHit);
+  EXPECT_EQ(k.dst.Down(4096), k.value);
+}
+
+TEST(GpuNodeDedup, RegistryReclaimsEntriesWhosePidAnotherProcessNowHas) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("reg-reused-pid");
+  EXPECT_TRUE(OpenWithRegistryForged(g.name, 2));
+}
+
+// What cannot be proven gone is left alone: a live process, and an entry of
+// an older release (which records no identity) with this process's pid.
+TEST(GpuNodeDedup, RegistryKeepsEntriesItCannotProveGone) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  {
+    ShmGuard g("reg-live");
+    EXPECT_FALSE(OpenWithRegistryForged(g.name, 3)) << "took a live entry";
+  }
+  {
+    ShmGuard g("reg-older");
+    EXPECT_FALSE(OpenWithRegistryForged(g.name, 1))
+        << "took an older release's entry by its pid";
+  }
+}
+
+// An entry of a previous process with this pid names an arena address of
+// an address space that is gone: it must not be read through.
+TEST(GpuNodeDedup, AnEntryOfAPreviousProcessWithThisPidIsNotReadDirectly) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("reg-same-pid-va");
+  auto a = GpuNodeDedup::Open(Opts(g.name));
+  auto b = GpuNodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  KeyBufs k(87);
+  size_t got = 0;
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->ClaimSg(K(87), &k.s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  a->PublishSg(K(87), token, &k.s, 1, 4096);
+  GpuNodeDedupTestAccess::ForgeRegistry(*a, 4);  // a's entry: another image
+  EXPECT_NE(b->ClaimSg(K(87), &k.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kHit)
+      << "read through the address an entry of another process image gives";
 }
 
 // ---- through KVClient: a fetch that lands in device memory -----------------

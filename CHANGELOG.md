@@ -3,6 +3,26 @@
 ## Unreleased
 
 
+- Client, GPU dedup (`DFKV_CLIENT_NODE_DEDUP_GPU=1`): restarting the
+  inference processes in place no longer uses up the GPU dedup registry.
+  Each process holds one of 64 registry entries, and an entry is reclaimed
+  when its process has died. A container restarted in place gets the same
+  pids, so the entries its previous processes left behind looked like
+  entries of the new processes (whose pids they carry) and were neither
+  reused nor reclaimed: with eight ranks, the registry was full after
+  about seven such restarts, and from then on every process ran without
+  GPU dedup, with one INFO line. An entry now also records which process
+  holds it (its start time and a random value of the process image), and
+  one whose pid is in use by another process (or by a new image of this
+  one) is reclaimed. Such an entry is also no longer read through the
+  arena address it records, which belongs to an address space that is
+  gone. Entries left by older releases record no such identity and are
+  still judged by their pid only, so the first restart after an upgrade
+  can still leave entries behind. The processes sharing the registry must
+  share a PID namespace (one pod, or `hostPID`): with separate ones, a
+  process can take another's live entry (dedup then comes and goes; no
+  wrong data). Layout and segment name are unchanged.
+
 - Client, host and GPU dedup: a process killed while it created the
   shared segment no longer switches dedup off on the host. The first
   process creates the segment and sizes it in `/dev/shm` (512 MiB by

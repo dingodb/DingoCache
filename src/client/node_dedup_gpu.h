@@ -176,6 +176,14 @@ class GpuNodeDedup {
   Slot* Reserve(const BlockKey& key);
   // A READY entry that no reader can copy any more (see the .cc).
   bool Unusable(const Slot& s) const;
+  // Whether the holder of registry entry e, whose pid cur is in use, is
+  // provably gone (judged for generation g; see the .cc).
+  static bool Stale(const ProcEntry& e, uint32_t cur, uint64_t g);
+  // Rewrites registry entries as other processes would have left them:
+  // 0 a previous process with this pid, 1 the same written by an older
+  // release, 2 a process whose pid a live process now has, 3 a live
+  // process; 4 as 0 for this instance's own entry only.
+  void ForgeRegistryForTest(int how);
   // Split copy-out: Issue pre-validates and ENQUEUES the scatter on st (no
   // sync); Validate re-checks lap/generation AFTER the caller synchronized.
   // CopyOutSg composes them for the single-key path; WaitManySg amortizes one
