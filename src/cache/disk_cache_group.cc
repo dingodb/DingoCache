@@ -19,6 +19,7 @@
 #include "common/config_dump.h"
 #include "utils/log.h"
 #include "utils/parallel_for.h"
+#include "utils/thread_name.h"
 
 namespace dfkv {
 
@@ -268,18 +269,22 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
   write_mode_ = use_slab ? "direct" : "";
   // Every disk is opened on its own thread. A slab store reads its whole table
   // back before it can serve (seconds per disk with millions of objects), and
-  // the disks share nothing; one after the other, startup grew with the number
-  // of disks.
+  // the stores share nothing but the synchronized process-wide registries
+  // (resolved configuration, crash slots, the logger); one after the other,
+  // startup grew with the number of disks.
   struct Opened {
     std::unique_ptr<StoreEngine> store;
     DiskSlabStore* slab = nullptr;
-    std::exception_ptr error;
+    std::string error;  // what the engine threw while opening, if anything
+    bool threw = false;
+    double seconds = 0;
   };
   std::vector<Opened> opened(n);
   auto open_one = [&](size_t i) {
     const std::string& dir = opt.cache_dirs[i];
     const uint64_t disk_capacity =
         base_capacity + (i < capacity_remainder ? 1 : 0);
+    const auto started = std::chrono::steady_clock::now();
     try {
       if (opt.engine_factory) {
         opened[i].store = opt.engine_factory(dir, disk_capacity);
@@ -299,24 +304,50 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
         opened[i].store =
             std::make_unique<KVStore>(KVStore::Options{dir, disk_capacity});
       }
+    } catch (const std::exception& error) {
+      opened[i].threw = true;
+      opened[i].error = error.what();
     } catch (...) {
-      opened[i].error = std::current_exception();
+      opened[i].threw = true;
+      opened[i].error = "unknown exception";
     }
+    opened[i].seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
   };
   const auto open_started = std::chrono::steady_clock::now();
   {
     std::vector<std::thread> helpers;
     helpers.reserve(n - 1);
-    for (size_t i = 1; i < n; ++i) helpers.emplace_back(open_one, i);
+    for (size_t i = 1; i < n; ++i) {
+      // A thread that cannot be created must not end the process with the
+      // other disks half open: that disk is opened here instead.
+      try {
+        helpers.emplace_back([&open_one, i] {
+          NameThisThread("disk-open-", i);
+          open_one(i);
+        });
+      } catch (const std::system_error&) {
+        open_one(i);
+      }
+    }
     open_one(0);
     for (auto& helper : helpers) helper.join();
   }
-  // What an engine threw is rethrown here, on the constructing thread, as it
-  // was when the disks were opened in a loop.
-  for (auto& disk : opened)
-    if (disk.error) std::rethrow_exception(disk.error);
+  size_t slowest = 0;
   for (size_t i = 0; i < n; ++i) {
     const std::string& dir = opt.cache_dirs[i];
+    if (opened[i].seconds > opened[slowest].seconds) slowest = i;
+    if (opened[i].threw) {
+      // Reported like any other startup failure, not rethrown: the disks that
+      // did open are marked dirty by now, and only an orderly teardown (the
+      // rest of `opened` here, disks_ in the destructor) leaves them clean. An
+      // exception escaping to a caller that does not catch it would abort the
+      // process and cost every one of them its cache.
+      fail(dir + ": " + opened[i].error);
+      DFKV_LOG_ERROR("disk store startup failed: " + dir + ": " +
+                     opened[i].error);
+      return;
+    }
     std::unique_ptr<StoreEngine> store = std::move(opened[i].store);
     if (opened[i].slab) {
       slabs_.push_back(opened[i].slab);
@@ -335,13 +366,14 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
     disks_.push_back(std::move(store));
     ring_.AddNode(dir, disk_weight);
   }
-  if (n > 1) {
-    char seconds[32];
-    std::snprintf(seconds, sizeof(seconds), "%.2f",
+  if (n > 1 && healthy_) {
+    char text[96];
+    std::snprintf(text, sizeof(text), " disks in %.2f s (slowest %.2f s: ",
                   std::chrono::duration<double>(
-                      std::chrono::steady_clock::now() - open_started).count());
-    DFKV_LOG_INFO("disk stores opened: " + std::to_string(n) + " disks in " +
-                  seconds + " s");
+                      std::chrono::steady_clock::now() - open_started).count(),
+                  opened[slowest].seconds);
+    DFKV_LOG_INFO("disk stores opened: " + std::to_string(n) + text +
+                  opt.cache_dirs[slowest] + ")");
   }
   ring_.Build();
   if (disks_.size() > 1) {

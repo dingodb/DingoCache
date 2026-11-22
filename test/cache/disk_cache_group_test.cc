@@ -596,12 +596,13 @@ TEST_F(DiskGroupTest, OpensAllDisksAtOnceAndKeepsTheirOrder) {
         std::find(dirs.begin(), dirs.end(), dir) - dirs.begin());
     // A factory call returns only once all four are inside, or after 10 s.
     probe->EnterOpen();
+    // The last directory finishes first: the group must not be assembled in
+    // completion order.
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(30 * (dirs.size() - 1 - disk)));
     return std::make_unique<ProbeEngine>(dir, disk, probe);
   };
-  const auto started = std::chrono::steady_clock::now();
   DiskCacheGroup group(std::move(options));
-  EXPECT_LT(std::chrono::steady_clock::now() - started,
-            std::chrono::seconds(5));
   ASSERT_TRUE(group.Healthy());
   ASSERT_EQ(group.DiskCount(), dirs.size());
   for (size_t i = 0; i < dirs.size(); ++i) EXPECT_EQ(group.DiskPath(i), dirs[i]);
@@ -609,23 +610,51 @@ TEST_F(DiskGroupTest, OpensAllDisksAtOnceAndKeepsTheirOrder) {
   EXPECT_EQ(probe->open_max_active, dirs.size());
 }
 
-TEST_F(DiskGroupTest, AnEngineThatThrowsWhileOpeningFailsConstruction) {
+// What an engine throws while it opens is a startup failure of that disk, as
+// if the store had come up unhealthy. It is not rethrown: the other disks are
+// open (and marked dirty) by then, and only an orderly teardown leaves them
+// clean.
+TEST_F(DiskGroupTest, AnEngineThatThrowsWhileOpeningIsAStartupFailure) {
   const auto dirs = Dirs(3);
-  auto probe = std::make_shared<BatchProbe>();
-  DiskCacheGroup::Options options;
-  options.cache_dirs = dirs;
-  options.capacity_bytes = 1ull << 30;
-  options.engine = "file";
-  options.engine_factory =
-      [probe, dirs](const std::string& dir,
-                    uint64_t) -> std::unique_ptr<StoreEngine> {
-    if (dir == dirs[1]) throw std::runtime_error("cannot open " + dir);
-    return std::make_unique<ProbeEngine>(dir, 0, probe);
-  };
-  // Thrown on a helper thread, it must still reach the caller instead of
-  // terminating the process.
-  EXPECT_THROW({ DiskCacheGroup group(std::move(options)); },
-               std::runtime_error);
+  for (const std::vector<size_t>& throwers :
+       {std::vector<size_t>{1}, std::vector<size_t>{0},
+        std::vector<size_t>{2, 1}}) {
+    auto probe = std::make_shared<BatchProbe>();
+    probe->open_overlap = dirs.size();
+    DiskCacheGroup::Options options;
+    options.cache_dirs = dirs;
+    options.capacity_bytes = 1ull << 30;
+    options.engine = "file";
+    options.engine_factory =
+        [probe, dirs, throwers](const std::string& dir,
+                                uint64_t) -> std::unique_ptr<StoreEngine> {
+      const size_t disk = static_cast<size_t>(
+          std::find(dirs.begin(), dirs.end(), dir) - dirs.begin());
+      probe->EnterOpen();  // the throw happens while the others are opening
+      if (std::find(throwers.begin(), throwers.end(), disk) != throwers.end())
+        throw std::runtime_error("cannot open disk " + std::to_string(disk));
+      return std::make_unique<ProbeEngine>(dir, disk, probe);
+    };
+    DiskCacheGroup group(std::move(options));  // does not throw
+    EXPECT_FALSE(group.Healthy());
+    // The first failing directory in configured order is the one reported.
+    const size_t first = *std::min_element(throwers.begin(), throwers.end());
+    EXPECT_EQ(group.StartupError(),
+              dirs[first] + ": cannot open disk " + std::to_string(first));
+  }
+}
+
+// Two names for one directory: whichever store gets the directory lock, the
+// other fails, and the node refuses to start. Decided by a race now, not by
+// order, so only the outcome is asserted.
+TEST_F(DiskGroupTest, OneDirectoryUnderTwoNamesStillRefusesToStart) {
+  const auto dirs = Dirs(1);
+  const std::string alias = (base_ / "alias").string();
+  fs::create_directory_symlink(dirs[0], alias);
+  DiskCacheGroup group({{dirs[0], alias}, 2ull << 30, "slab"});
+  EXPECT_FALSE(group.Healthy());
+  EXPECT_NE(group.StartupError().find("in use"), std::string::npos)
+      << group.StartupError();
 }
 
 TEST_F(DiskGroupTest, RealSlabDisksOpenedTogetherKeepTheirData) {
