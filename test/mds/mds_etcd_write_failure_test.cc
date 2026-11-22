@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <map>
 #include <mutex>
@@ -29,6 +30,7 @@
 #include "mds/mds_member_poller.h"
 #include "mds/mds_proto.h"
 #include "transport/wire.h"
+#include "transport/wire_legacy.h"
 #include "utils/base64.h"
 #include "utils/json_min.h"
 #include "utils/net_util.h"
@@ -201,6 +203,28 @@ bool DoReq(int port, WireOp op, const std::string& payload, Status* st,
   if (ok) {
     data->resize(dlen);
     ok = dlen == 0 || net::ReadAll(fd, &(*data)[0], dlen);
+  }
+  ::close(fd);
+  return ok;
+}
+
+// The same exchange as a v1.x peer frames it: 42-byte request prefix, 10-byte
+// response prefix, status in the v1 byte order (0 = ok, 3 = I/O error).
+bool DoLegacyReq(int port, WireOp op, const std::string& payload,
+                 uint8_t* status, std::string* data) {
+  const int fd = net::Dial("127.0.0.1:" + std::to_string(port), 2000, 5000);
+  if (fd < 0) return false;
+  char pre[kLegacyReqPrefix];
+  EncodeLegacyReq(pre, op, payload.size());
+  bool ok = net::WriteAll(fd, pre, kLegacyReqPrefix) &&
+            (payload.empty() ||
+             net::WriteAll(fd, payload.data(), payload.size()));
+  char rp[kLegacyRespPrefix];
+  ok = ok && net::ReadAll(fd, rp, kLegacyRespPrefix);
+  if (ok) {
+    *status = static_cast<uint8_t>(rp[1]);
+    data->resize(net::GetU64(rp + 2));
+    ok = data->empty() || net::ReadAll(fd, &(*data)[0], data->size());
   }
   ::close(fd);
   return ok;
@@ -427,13 +451,72 @@ TEST(MdsEtcdWriteFailure, MembersThatReallyLeaveStillShrinkTheList) {
   mds.Stop();
 }
 
-TEST(MdsEtcdWriteFailure, MemberThatStoppedHeartbeatingIsLetGoAfterTheHold) {
-  // A member whose last heartbeat here failed and who then went away for real
-  // must not block the list for good.
-  ::setenv("DFKV_MDS_UNWRITTEN_HOLD_MS", "1000", 1);
+TEST(MdsEtcdWriteFailure, FailedRegistrationIsNoEvidenceOfAMember) {
+  // The state with one or two MDS endpoints: etcd refuses writes, keepalives
+  // still hold the members' leases, and the lists are complete.
   FakeEtcd etcd;
   MdsServer mds(etcd.ep());
-  ::unsetenv("DFKV_MDS_UNWRITTEN_HOLD_MS");
+  ASSERT_EQ(mds.Start(0), Status::kOk);
+  const std::string g = "g";
+  for (const auto& m : {kA, kB})
+    ASSERT_EQ(Beat(mds, WireOp::kRegister, g, m), Status::kOk);
+  etcd.RejectWrites(true);
+  EXPECT_EQ(Beat(mds, WireOp::kHeartbeat, g, kA), Status::kIOError);
+
+  // A node that is not listed keeps trying to get in. It never was a member;
+  // the list without it is the member list and must keep being served.
+  for (int i = 0; i < 3; ++i)
+    EXPECT_EQ(Beat(mds, WireOp::kRegister, g, kC), Status::kIOError);
+  Ids ids;
+  ASSERT_EQ(List(mds, WireOp::kListMembers, g, &ids), Status::kOk);
+  EXPECT_EQ(ids, (Ids{"na", "nb"}));
+  ASSERT_EQ(List(mds, WireOp::kListTopology, g, &ids), Status::kOk);
+  EXPECT_EQ(ids, (Ids{"na", "nb"}));
+
+  // The price: a member whose process restarted registers again, which says
+  // nothing about its past. If its key then runs out, the list goes on
+  // without it.
+  EXPECT_EQ(Beat(mds, WireOp::kRegister, g, kB), Status::kIOError);
+  etcd.ExpireKey(MemberKey(g, "nb"));
+  ASSERT_EQ(List(mds, WireOp::kListTopology, g, &ids), Status::kOk);
+  EXPECT_EQ(ids, (Ids{"na"}));
+
+  const std::string metrics = mds.MetricsText();
+  EXPECT_NE(metrics.find("dfkv_mds_list_withheld_total 0\n"),
+            std::string::npos) << metrics;
+  EXPECT_NE(metrics.find("dfkv_mds_unwritten_members 1\n"),
+            std::string::npos) << metrics;
+  mds.Stop();
+}
+
+TEST(MdsEtcdWriteFailure, RegistrationThatGoesThroughClearsTheRecord) {
+  // A recorded member comes back as a new process: its register is a write
+  // like any other and ends the record.
+  FakeEtcd etcd;
+  MdsServer mds(etcd.ep());
+  ASSERT_EQ(mds.Start(0), Status::kOk);
+  const std::string g = "g";
+  ASSERT_EQ(Beat(mds, WireOp::kRegister, g, kA), Status::kOk);
+  etcd.RejectWrites(true);
+  EXPECT_EQ(Beat(mds, WireOp::kHeartbeat, g, kA), Status::kIOError);
+  etcd.ExpireAllLeases();
+  Ids ids;
+  EXPECT_EQ(List(mds, WireOp::kListMembers, g, &ids), Status::kIOError);
+
+  etcd.RejectWrites(false);
+  ASSERT_EQ(Beat(mds, WireOp::kRegister, g, kA), Status::kOk);
+  etcd.ExpireKey(MemberKey(g, "na"));  // and now it leaves for real
+  ASSERT_EQ(List(mds, WireOp::kListMembers, g, &ids), Status::kOk);
+  EXPECT_TRUE(ids.empty());
+  mds.Stop();
+}
+
+TEST(MdsEtcdWriteFailure, MemberThatStoppedHeartbeatingIsLetGoAfterTheHold) {
+  // A member whose last heartbeat here failed and who then went away for real
+  // must not block the list for good. Default hold, clock supplied.
+  std::atomic<uint64_t> now_ms{1000};
+  FakeEtcd etcd;
+  MdsServer mds(etcd.ep(), 2000, [&] { return now_ms.load(); });
   ASSERT_EQ(mds.Start(0), Status::kOk);
   const std::string g = "g";
   for (const auto& m : {kA, kB})
@@ -444,10 +527,91 @@ TEST(MdsEtcdWriteFailure, MemberThatStoppedHeartbeatingIsLetGoAfterTheHold) {
   etcd.ExpireKey(MemberKey(g, "nb"));
   Ids ids;
   EXPECT_EQ(List(mds, WireOp::kListMembers, g, &ids), Status::kIOError);
-
-  ::usleep(1300 * 1000);  // nb stays silent for longer than the hold
+  now_ms += MdsServer::kUnwrittenHoldMs;  // silent for exactly the hold
+  EXPECT_EQ(List(mds, WireOp::kListMembers, g, &ids), Status::kIOError);
+  now_ms += 1;
   ASSERT_EQ(List(mds, WireOp::kListMembers, g, &ids), Status::kOk);
   EXPECT_EQ(ids, (Ids{"na"}));
+  mds.Stop();
+}
+
+TEST(MdsEtcdWriteFailure, HoldIsTakenFromTheEnvironmentAndClamped) {
+  const std::string g = "g";
+  const auto withheld_for = [&](const char* env) -> uint64_t {
+    // How long after one failed heartbeat the list stays withheld, to the
+    // millisecond: the largest age at which it still is.
+    ::setenv("DFKV_MDS_UNWRITTEN_HOLD_MS", env, 1);
+    std::atomic<uint64_t> now_ms{1000};
+    FakeEtcd etcd;
+    MdsServer mds(etcd.ep(), 2000, [&] { return now_ms.load(); });
+    ::unsetenv("DFKV_MDS_UNWRITTEN_HOLD_MS");
+    EXPECT_EQ(mds.Start(0), Status::kOk);
+    EXPECT_EQ(Beat(mds, WireOp::kRegister, g, kA), Status::kOk);
+    etcd.RejectWrites(true);
+    EXPECT_EQ(Beat(mds, WireOp::kHeartbeat, g, kA), Status::kIOError);
+    etcd.ExpireAllLeases();
+    Ids ids;
+    uint64_t lo = 0, hi = 3600000;  // withheld at age lo, served at age hi
+    EXPECT_EQ(List(mds, WireOp::kListMembers, g, &ids), Status::kIOError);
+    while (hi - lo > 1) {
+      const uint64_t mid = lo + (hi - lo) / 2;
+      now_ms = 1000 + mid;
+      if (List(mds, WireOp::kListMembers, g, &ids) == Status::kIOError)
+        lo = mid;
+      else
+        hi = mid;
+    }
+    mds.Stop();
+    return lo;
+  };
+  EXPECT_EQ(withheld_for("45000"), 45000u);
+  EXPECT_EQ(withheld_for("3000000"), 600000u);  // clamped to ten minutes
+  // A negative value parses to a huge unsigned one and is clamped as well; it
+  // must not hold a list for the life of the process.
+  EXPECT_EQ(withheld_for("-1"), 600000u);
+}
+
+TEST(MdsEtcdWriteFailure, LegacyFramedPeersAreTreatedTheSame) {
+  // v1.x nodes send the same register and heartbeat ops in the old framing;
+  // a v1.x client gets the withheld list as its own I/O error byte.
+  ::setenv("DFKV_MDS_ACCEPT_LEGACY", "1", 1);
+  FakeEtcd etcd;
+  MdsServer mds(etcd.ep());
+  ::unsetenv("DFKV_MDS_ACCEPT_LEGACY");
+  ASSERT_EQ(mds.Start(0), Status::kOk);
+  const std::string g = "g";
+  constexpr uint8_t kLegacyOk = 0, kLegacyIOError = 3;
+  uint8_t status = 0xFF;
+  std::string data;
+  ASSERT_TRUE(DoLegacyReq(mds.port(), WireOp::kRegister,
+                          EncodeMemberReq(g, kA), &status, &data));
+  ASSERT_EQ(status, kLegacyOk);
+
+  etcd.RejectWrites(true);
+  ASSERT_TRUE(DoLegacyReq(mds.port(), WireOp::kRegister,
+                          EncodeMemberReq(g, kB), &status, &data));
+  EXPECT_EQ(status, kLegacyIOError);  // never listed: not recorded
+  ASSERT_TRUE(DoLegacyReq(mds.port(), WireOp::kListMembers, g, &status, &data));
+  EXPECT_EQ(status, kLegacyOk);
+  ASSERT_TRUE(DoLegacyReq(mds.port(), WireOp::kHeartbeat,
+                          EncodeMemberReq(g, kA), &status, &data));
+  EXPECT_EQ(status, kLegacyIOError);  // was listed: recorded
+  etcd.ExpireAllLeases();
+  ASSERT_TRUE(DoLegacyReq(mds.port(), WireOp::kListMembers, g, &status, &data));
+  EXPECT_EQ(status, kLegacyIOError);
+  EXPECT_TRUE(data.empty());
+
+  etcd.RejectWrites(false);
+  ASSERT_TRUE(DoLegacyReq(mds.port(), WireOp::kHeartbeat,
+                          EncodeMemberReq(g, kA), &status, &data));
+  EXPECT_EQ(status, kLegacyOk);
+  ASSERT_TRUE(DoLegacyReq(mds.port(), WireOp::kListMembers, g, &status, &data));
+  ASSERT_EQ(status, kLegacyOk);
+  std::vector<MemberInfo> members;
+  uint64_t epoch = 0;
+  ASSERT_TRUE(DecodeMembers(data.data(), data.size(), &members, &epoch));
+  ASSERT_EQ(members.size(), 1u);
+  EXPECT_EQ(members[0].id, "na");
   mds.Stop();
 }
 
