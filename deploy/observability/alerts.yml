@@ -114,6 +114,15 @@ groups:
         annotations:
           summary: "dfkv slab direct I/O fell back to buffered I/O"
           description: "{{ $labels.instance }} is no longer using the configured direct path for every request."
+      # Values that a client was told were stored and that were then dropped
+      # because the disk would not take them. Every one is a later GET miss.
+      - alert: DfkvRamAcknowledgedDataLost
+        expr: increase(dfkv_ram_post_ack_flush_failures_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "dfkv RAM tier dropped values it had acknowledged"
+          description: "{{ $labels.instance }} dropped {{ $value }} acknowledged value(s) in 5 minutes because their flush to disk kept failing. Check the disk store errors of that node (a failed store, a full filesystem); dfkv_ram_flush_retries_total rising without this counter means failures that passed."
       - alert: DfkvRamFlushBacklog
         expr: dfkv_ram_flush_backlog > 4096
         for: 5m

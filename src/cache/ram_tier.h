@@ -63,6 +63,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -117,7 +118,39 @@ class RamTier {
     // residency. DFKV_RAM_TIER_LARGE_RESERVE_BYTES overrides this value.
     uint64_t large_reserve_bytes = UINT64_MAX;
     uint32_t slot_granularity = 4096;    // slot quantum (>= O_DIRECT align)
-    uint32_t flush_retries = 3;          // per-item flush attempts before drop
+    // A flush that fails is tried again, flush_retries attempts in all.
+    //
+    // For a value that was already acknowledged to the client (RAM-ACK) a
+    // drop is a silent loss, so the attempts are spaced out:
+    // flush_retry_base_ms before the second one, four times the previous
+    // pause before each further one. The defaults give 50 + 200 + 800 + 3200
+    // ms = 4.25 s for the disk to take the write after all (an I/O error
+    // that passes, a store that could not place the value under load). The
+    // object stays readable and pinned meanwhile and counts as dirty, so the
+    // ACK watermark turns a disk that keeps refusing into backpressure. The
+    // span is short on purpose: a second PUT of the same key waits for the
+    // outcome, under its put-key stripe.
+    //
+    // A value whose PUT is still waiting for the flush (disk-ACK) is tried
+    // again without pauses, as it always was: the client gets its error at
+    // once and nothing is lost by failing fast.
+    //
+    // After the last attempt the object is dropped and counted.
+    uint32_t flush_retries = 5;
+    uint32_t flush_retry_base_ms = 50;
+    // Whether the disk a key is written to has failed for good. A flush that
+    // fails and gets true here is not tried again: nothing will change until
+    // the process is restarted. Called from a flush worker, without locks.
+    std::function<bool(const BlockKey&)> flush_target_failed;
+    // After an object has been dropped the tier reports itself unhealthy
+    // until this many flushes in a row have succeeded with no failed attempt
+    // in between: a failure that has passed stops being reported, one that
+    // keeps hitting part of the writes does not. And for at least
+    // health_recovery_min_ms after the last drop, whatever the flush rate: a
+    // busy node runs through 64 flushes in milliseconds, and the unhealthy
+    // state has to last long enough to be scraped and not to flap.
+    uint32_t health_recovery_flushes = 64;
+    uint32_t health_recovery_min_ms = 30000;
     // Flush worker threads draining the shard queues (distributed round-robin
     // over the shards, at least one per shard). One DIO stream sustains only
     // ~1.6-3 GB/s -- far below the arena's ingest -- so the drain rate, not
@@ -229,7 +262,11 @@ class RamTier {
   bool ok() const { return ready_; }
   // The constructor gave up because Options::cancel_start said so.
   bool start_cancelled() const { return start_cancelled_; }
-  bool healthy() const { return healthy_.load(std::memory_order_acquire); }
+  // False from a dropped flush until health_recovery_flushes flushes in a row
+  // have succeeded and health_recovery_min_ms have passed since the last
+  // drop. Evaluated here as well as on a flush, so that a node that goes
+  // idle after its streak still recovers when the time is up.
+  bool healthy() const;
 
   // Asynchronous admission used by standalone tier tests. true means the key
   // was admitted, joined an existing PUT, or already exists in the backing
@@ -240,9 +277,21 @@ class RamTier {
   // kBackpressure is a terminal pre-admission rejection, even though both
   // dispositions carry wire status kCacheFull.
   enum class PutDisposition { kComplete, kBypass, kBackpressure };
+  // How the flush of an admitted value ended. A PUT that waited for it (a
+  // disk-ACK writer, or a second writer of the same key) gets this next to
+  // its status; anything but kFlushed is a failure of that PUT.
+  enum class FlushOutcome {
+    kNone,              // this PUT did not wait for a flush
+    kFlushed,           // written to disk
+    kDroppedAfterRetries,   // every attempt failed; the value is gone
+    kDroppedStoreFailed,    // its disk store has failed for good; gone
+    kDroppedAtShutdown,     // still failing when the tier was being drained
+    kCanceled,          // removed, or given up before it was admitted
+  };
   struct PutResult {
     Status status;
     PutDisposition disposition = PutDisposition::kComplete;
+    FlushOutcome flush = FlushOutcome::kNone;
   };
 
   // Disk-ACK contract: wait for the admitted key's actual flush result.
@@ -336,6 +385,10 @@ class RamTier {
   uint64_t PostAckFlushFailures() const {
     return post_ack_flush_failures_.load(std::memory_order_relaxed);
   }
+  // Failed flush attempts that were followed by another attempt.
+  uint64_t FlushRetries() const {
+    return flush_retries_.load(std::memory_order_relaxed);
+  }
   std::string AckToDurableLatencyMetrics(const std::string& labels) const {
     return ack_to_durable_latency_.Render(
         "dfkv_ram_ack_to_durable_latency_seconds", labels);
@@ -356,6 +409,12 @@ class RamTier {
     bool done = false;
     bool success = false;
     bool canceled = false;
+    // Set with `done`: kFlushed exactly when `success`.
+    FlushOutcome outcome = FlushOutcome::kNone;
+    // The value is resident and was acknowledged from RAM to its first
+    // writer. A second RAM-ACK writer of the key is given the same
+    // acknowledgement at this point instead of waiting for the flush.
+    bool acked_resident = false;
   };
   struct Entry {
     BlockKey key;
@@ -390,7 +449,12 @@ class RamTier {
       return static_cast<size_t>(mix(hash));
     }
   };
-  struct QItem { BlockKey key; uint32_t tries = 0; };
+  struct QItem {
+    BlockKey key;
+    uint32_t tries = 0;
+    // For an item waiting to be tried again: not before this.
+    std::chrono::steady_clock::time_point not_before{};
+  };
 
   // One independent slice of the tier. All state a key's lifecycle touches
   // (allocator, index, writing set, send-pins, flush queue) lives here, under
@@ -402,6 +466,15 @@ class RamTier {
     std::unordered_map<BlockKey, Entry, KeyHash> index;
     std::unordered_map<BlockKey, std::shared_ptr<PutCompletion>, KeyHash> writing;
     std::deque<QItem> flushq;
+    // Items whose flush failed and that wait for their next attempt, by the
+    // time it is due; still resident, dirty and flush-pinned. With a disk
+    // that refuses writes this holds every dirty object of that disk, so the
+    // flusher takes the due ones from the front and Remove finds its key
+    // through retry_at.
+    using RetryQueue =
+        std::multimap<std::chrono::steady_clock::time_point, QItem>;
+    RetryQueue retryq;
+    std::unordered_map<BlockKey, RetryQueue::iterator, KeyHash> retry_at;
     size_t flush_inflight = 0;
     std::condition_variable cv;
     bool stop = false;
@@ -423,9 +496,13 @@ class RamTier {
   Admission Admit(const BlockKey& key, const void* data, size_t len,
                   bool client_ack,
                   std::shared_ptr<PutCompletion>* completion);
+  // The bool form is kFlushed or kCanceled.
   static void CompletePut(const std::shared_ptr<PutCompletion>& completion,
                           bool success);
-  static Status WaitPut(const std::shared_ptr<PutCompletion>& completion);
+  static void CompletePut(const std::shared_ptr<PutCompletion>& completion,
+                          FlushOutcome outcome);
+  static Status WaitPut(const std::shared_ptr<PutCompletion>& completion,
+                        FlushOutcome* outcome = nullptr);
   bool CommitReservation(DurableReservation* reservation) noexcept;
   void AbortReservation(DurableReservation* reservation) noexcept;
   void ReclaimLargeFor(uint64_t bytes);
@@ -438,6 +515,17 @@ class RamTier {
   }
 
   void FlushLoop(Shard& s);
+  static void EraseRetry(Shard& s, const BlockKey& key) {
+    const auto at = s.retry_at.find(key);
+    if (at == s.retry_at.end()) return;
+    s.retryq.erase(at->second);
+    s.retry_at.erase(at);
+  }
+  // For a second RAM-ACK writer of a key: until the first writer's value is
+  // resident and acknowledged (true), or its PUT has ended (*status).
+  static bool WaitAckedResident(
+      const std::shared_ptr<PutCompletion>& completion, Status* status,
+      FlushOutcome* outcome);
   // Max items one flush worker drains per store visit. Big enough to amortize
   // the two store-lock hops + reach a useful uring submit width, small enough
   // that a batch's slots stay flush-pinned only briefly.
@@ -458,7 +546,15 @@ class RamTier {
   FlushBatchFn flush_batch_;
   char* arena_ = nullptr;
   bool ready_ = false;
-  std::atomic<bool> healthy_{true};
+  // The health state: the flag for the fast path, the rest under health_mu_.
+  // A drop, a failed attempt and the recovery all take the mutex, so a drop
+  // that races with a recovery always wins.
+  mutable std::atomic<bool> healthy_{true};
+  mutable std::mutex health_mu_;
+  uint32_t healthy_streak_ = 0;   // successes since the last failed attempt
+  uint64_t last_drop_ms_ = 0;     // steady clock
+  void NoteDrop();
+  bool RecoveredLocked() const;
   uint64_t arena_bytes_ = 0;
   uint64_t large_budget_bytes_ = 0;
   std::atomic<void*> arena_mr_{nullptr};
@@ -484,6 +580,16 @@ class RamTier {
   std::atomic<uint64_t> dirty_bytes_{0}, dirty_objects_{0};
   std::atomic<uint64_t> ram_acks_{0}, ack_backpressure_{0};
   std::atomic<uint64_t> post_ack_flush_failures_{0};
+  std::atomic<uint64_t> flush_retries_{0};
+  // The stop sequence is waiting for the backlog (WaitForDrain): attempts
+  // are no longer spaced out, so a failing object is given up at once
+  // instead of holding the stop for its backoff.
+  std::atomic<bool> draining_{false};
+  // Drops are logged at most once per interval, with what the line stands for.
+  std::atomic<uint64_t> drop_log_ms_{0};
+  std::atomic<uint64_t> drop_logged_total_{0}, drop_logged_acked_{0};
+  void NoteFlushOutcome(bool ok);
+  void LogDrop(bool target_failed);
   std::atomic<uint64_t> shutdown_drain_timeouts_{0};
   std::atomic<bool> background_stopping_{false};
   LatencyHist ack_to_durable_latency_;

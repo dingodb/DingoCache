@@ -52,6 +52,13 @@ uint64_t AnonHugePageBytesIn(const void* start, size_t bytes) {
 }
 
 namespace {
+uint64_t SteadyMs() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
 constexpr size_t kHugePageBytes = 2u << 20;
 
 // The bracketed (active) value of a transparent_hugepage sysfs setting, for
@@ -435,6 +442,14 @@ void RamTier::StopBackground(bool abandon_backlog) {
 }
 
 bool RamTier::WaitForDrain(std::chrono::milliseconds timeout) {
+  // From here on a failed flush is tried again at once: a stop does not wait
+  // out a backoff, it gives the failing object its remaining attempts and
+  // drops it, as it did before there was a backoff.
+  draining_.store(true, std::memory_order_release);
+  for (auto& sh : shards_) {
+    std::lock_guard<std::mutex> lk(sh->mu);
+    sh->cv.notify_all();
+  }
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (DirtyObjects() != 0) {
     if (std::chrono::steady_clock::now() >= deadline) {
@@ -620,23 +635,51 @@ void RamTier::ReclaimLargeFor(uint64_t bytes) {
 
 void RamTier::CompletePut(
     const std::shared_ptr<PutCompletion>& completion, bool success) {
+  CompletePut(completion, success ? FlushOutcome::kFlushed
+                                  : FlushOutcome::kCanceled);
+}
+
+void RamTier::CompletePut(
+    const std::shared_ptr<PutCompletion>& completion, FlushOutcome outcome) {
   if (!completion) return;
   {
     std::lock_guard<std::mutex> lk(completion->mu);
     if (completion->done) return;
-    completion->success = success;
+    completion->success = outcome == FlushOutcome::kFlushed;
+    completion->outcome = outcome;
     completion->done = true;
   }
   completion->cv.notify_all();
 }
 
-Status RamTier::WaitPut(const std::shared_ptr<PutCompletion>& completion) {
+bool RamTier::WaitAckedResident(
+    const std::shared_ptr<PutCompletion>& completion, Status* status,
+    FlushOutcome* outcome) {
+  *status = Status::kIOError;
+  *outcome = FlushOutcome::kCanceled;
+  if (!completion) return false;
+  std::unique_lock<std::mutex> lk(completion->mu);
+  completion->cv.wait(lk, [&completion] {
+    return completion->done || completion->acked_resident;
+  });
+  if (completion->done) {
+    *outcome = completion->outcome;
+    *status = completion->success ? Status::kOk : Status::kIOError;
+    return false;
+  }
+  return true;
+}
+
+Status RamTier::WaitPut(const std::shared_ptr<PutCompletion>& completion,
+                        FlushOutcome* outcome) {
+  if (outcome) *outcome = FlushOutcome::kCanceled;
   if (!completion) return Status::kIOError;
   std::unique_lock<std::mutex> lk(completion->mu);
   // The shared completion owns the admitted value, not the caller's payload.
   // Returning a bypass here could persist conflicting duplicate bytes while
   // the original flush still owns its slot (or outlive Remove's disk fence).
   completion->cv.wait(lk, [&completion] { return completion->done; });
+  if (outcome) *outcome = completion->outcome;
   return completion->success ? Status::kOk : Status::kIOError;
 }
 
@@ -787,6 +830,14 @@ RamTier::Admission RamTier::Admit(
       e.flush_pin = true;
       e.client_acked = client_ack;
       e.dirty_since = std::chrono::steady_clock::now();
+      if (client_ack) {
+        // Second RAM-ACK writers of this key need not wait any longer.
+        {
+          std::lock_guard<std::mutex> state_lk(completion->mu);
+          completion->acked_resident = true;
+        }
+        completion->cv.notify_all();
+      }
       s.index.emplace(key, std::move(e));
       s.flushq.push_back(QItem{key, 0});
       dirty_bytes_.fetch_add(cap, std::memory_order_relaxed);
@@ -825,7 +876,9 @@ RamTier::PutResult RamTier::PutCommitted(
   if (admission == Admission::kBypass)
     return {Status::kCacheFull, PutDisposition::kBypass};
   if (admission == Admission::kRejected) return {Status::kIOError};
-  return {WaitPut(completion)};
+  PutResult result{Status::kIOError};
+  result.status = WaitPut(completion, &result.flush);
+  return result;
 }
 
 bool RamTier::ReserveDurable(const BlockKey& key, size_t len,
@@ -981,9 +1034,28 @@ RamTier::PutResult RamTier::PutWriteBack(
   if (admission == Admission::kBackpressure)
     return {Status::kCacheFull, PutDisposition::kBackpressure};
   if (admission == Admission::kRejected) return {Status::kIOError};
-  if (synchronous || admission == Admission::kDuplicate) {
-    if (synchronous) ack_backpressure_.fetch_add(1, std::memory_order_relaxed);
-    return {WaitPut(completion)};
+  if (synchronous) {
+    ack_backpressure_.fetch_add(1, std::memory_order_relaxed);
+    PutResult result{Status::kIOError};
+    result.status = WaitPut(completion, &result.flush);
+    return result;
+  }
+  if (admission == Admission::kDuplicate) {
+    // A second writer of a key whose first value is in the tier. If that
+    // value was acknowledged from RAM, this writer gets the same
+    // acknowledgement, with the same guarantee: the value is resident and
+    // its flush is pending. It does not wait for that flush, which can now
+    // take seconds while failed attempts are spaced out -- the caller holds
+    // a put-key stripe and a handler thread. If the value is dropped later,
+    // that is one lost acknowledged value in the counter, whoever wrote it.
+    // Otherwise (the first PUT has ended, or its value is not acknowledged
+    // from RAM) the outcome of the first PUT is this one's too.
+    PutResult result{Status::kIOError};
+    if (WaitAckedResident(completion, &result.status, &result.flush)) {
+      ram_acks_.fetch_add(1, std::memory_order_relaxed);
+      return {Status::kOk};
+    }
+    return result;
   }
   ram_acks_.fetch_add(1, std::memory_order_relaxed);
   return {Status::kOk};
@@ -1201,6 +1273,7 @@ bool RamTier::Remove(const BlockKey& key) {
         else
           ++q;
       }
+      EraseRetry(s, key);
       if (!e.flushing) {
         if (e.flush_pin) {
           if (e.in_arena()) s.alloc->Unpin(e.key, e.slot_handle);
@@ -1227,6 +1300,7 @@ bool RamTier::Remove(const BlockKey& key) {
           else
             ++q;
         }
+        EraseRetry(s, key);
         if (!e.flushing) {
           if (e.flush_pin) {
             if (e.in_arena()) s.alloc->Unpin(e.key, e.slot_handle);
@@ -1270,7 +1344,26 @@ void RamTier::FlushLoop(Shard& s) {
     std::vector<FlushItem> items;
     {
       std::unique_lock<std::mutex> lk(s.mu);
-      s.cv.wait(lk, [&s] { return s.stop || !s.flushq.empty(); });
+      for (;;) {
+        // Items whose pause is over go back to the queue. Once the tier is
+        // stopping or draining there are no pauses left to wait out.
+        const bool hurry =
+            s.stop || draining_.load(std::memory_order_acquire);
+        const auto now = std::chrono::steady_clock::now();
+        while (!s.retryq.empty() &&
+               (hurry || s.retryq.begin()->first <= now)) {
+          s.retry_at.erase(s.retryq.begin()->second.key);
+          s.flushq.push_back(std::move(s.retryq.begin()->second));
+          s.retryq.erase(s.retryq.begin());
+        }
+        if (s.stop || !s.flushq.empty()) break;
+        if (s.retryq.empty()) {
+          s.cv.wait(lk);
+        } else {
+          const auto earliest = s.retryq.begin()->first;
+          s.cv.wait_until(lk, earliest);
+        }
+      }
       if (s.stop && (s.abandon || s.flushq.empty())) return;
       const size_t capacity = std::min(s.flushq.size(), kFlushBatchMax);
       batch.reserve(capacity);
@@ -1308,6 +1401,15 @@ void RamTier::FlushLoop(Shard& s) {
                         items[i].cap)) ? 1 : 0;
     }
 
+    // Outside the shard lock: the health streak, and whether a failed
+    // object's disk has failed for good (then it is not tried again).
+    std::vector<char> target_failed(B, 0);
+    for (size_t i = 0; i < B; ++i) {
+      NoteFlushOutcome(ok[i] != 0);
+      if (!ok[i] && opt_.flush_target_failed)
+        target_failed[i] = opt_.flush_target_failed(batch[i].key) ? 1 : 0;
+    }
+    bool dropped_now = false, dropped_target_failed = false;
     {
       std::lock_guard<std::mutex> lk(s.mu);
       for (size_t i = 0; i < B; ++i) {
@@ -1342,8 +1444,23 @@ void RamTier::FlushLoop(Shard& s) {
           }
           CompletePut(entry.completion, true);
           flushed_.fetch_add(1, std::memory_order_relaxed);
-        } else if (++batch[i].tries < opt_.flush_retries) {
-          s.flushq.push_back(std::move(batch[i]));  // retry later
+        } else if (!target_failed[i] &&
+                   ++batch[i].tries < opt_.flush_retries) {
+          // Try again: after a pause if the value was acknowledged already,
+          // at once if its PUT is still waiting or the tier is being drained
+          // for a stop. The object stays resident, dirty and pinned.
+          flush_retries_.fetch_add(1, std::memory_order_relaxed);
+          const uint64_t shift = 2 * std::min<uint32_t>(batch[i].tries - 1, 10);
+          const bool pause = entry.client_acked &&
+                             !draining_.load(std::memory_order_acquire);
+          const uint64_t pause_ms =
+              pause ? static_cast<uint64_t>(opt_.flush_retry_base_ms) << shift
+                    : 0;
+          batch[i].not_before = std::chrono::steady_clock::now() +
+                                std::chrono::milliseconds(pause_ms);
+          const BlockKey retry_key = batch[i].key;
+          const auto due = batch[i].not_before;
+          s.retry_at[retry_key] = s.retryq.emplace(due, std::move(batch[i]));
           s.cv.notify_one();
         } else {
           const auto completion = entry.completion;
@@ -1356,16 +1473,98 @@ void RamTier::FlushLoop(Shard& s) {
           if (client_acked)
             post_ack_flush_failures_.fetch_add(1, std::memory_order_relaxed);
           DropLocked(s, batch[i].key);
-          healthy_.store(false, std::memory_order_release);
+          NoteDrop();
           flush_dropped_.fetch_add(1, std::memory_order_relaxed);
+          dropped_now = true;
+          dropped_target_failed = dropped_target_failed || target_failed[i];
           // Publish every terminal side effect before waking PutCommitted()
-          // leaders and duplicate followers.
-          CompletePut(completion, false);
+          // leaders and duplicate followers, and tell them why.
+          CompletePut(completion,
+                      target_failed[i]
+                          ? FlushOutcome::kDroppedStoreFailed
+                          : draining_.load(std::memory_order_acquire)
+                                ? FlushOutcome::kDroppedAtShutdown
+                                : FlushOutcome::kDroppedAfterRetries);
         }
       }
       s.flush_inflight -= B;
     }
+    if (dropped_now) LogDrop(dropped_target_failed);
   }
+}
+
+// Health follows the flushes: a drop makes the tier unhealthy (in FlushLoop);
+// health_recovery_flushes successes in a row, no sooner than
+// health_recovery_min_ms after the last drop, make it healthy again. A failed
+// attempt, also one that is retried, starts the count again.
+void RamTier::NoteFlushOutcome(bool ok) {
+  // The usual case: healthy and the flush succeeded. No lock.
+  if (ok && healthy_.load(std::memory_order_acquire)) return;
+  std::lock_guard<std::mutex> lk(health_mu_);
+  if (!ok) {
+    healthy_streak_ = 0;
+    return;
+  }
+  if (healthy_streak_ < opt_.health_recovery_flushes) ++healthy_streak_;
+  (void)RecoveredLocked();
+}
+
+void RamTier::NoteDrop() {
+  std::lock_guard<std::mutex> lk(health_mu_);
+  last_drop_ms_ = SteadyMs();
+  healthy_streak_ = 0;
+  healthy_.store(false, std::memory_order_release);
+}
+
+// With health_mu_ held: whether the tier is healthy, making it so when the
+// streak is complete and the minimum time since the last drop has passed.
+bool RamTier::RecoveredLocked() const {
+  if (healthy_.load(std::memory_order_acquire)) return true;
+  if (healthy_streak_ < opt_.health_recovery_flushes) return false;
+  if (SteadyMs() - last_drop_ms_ < opt_.health_recovery_min_ms) return false;
+  healthy_.store(true, std::memory_order_release);
+  DFKV_LOG_INFO("ram tier: no object dropped for " +
+                std::to_string(opt_.health_recovery_min_ms / 1000) +
+                " s and " + std::to_string(opt_.health_recovery_flushes) +
+                " flushes in a row have succeeded; the tier reports itself "
+                "healthy again");
+  return true;
+}
+
+bool RamTier::healthy() const {
+  if (healthy_.load(std::memory_order_acquire)) return true;
+  std::lock_guard<std::mutex> lk(health_mu_);
+  return RecoveredLocked();
+}
+
+// One line per interval for the objects dropped since the previous line.
+// Their counters (dfkv_ram_flush_dropped_total,
+// dfkv_ram_post_ack_flush_failures_total) see every one.
+void RamTier::LogDrop(bool target_failed) {
+  constexpr uint64_t kIntervalMs = 10000;
+  const uint64_t now_ms = SteadyMs();
+  uint64_t last = drop_log_ms_.load(std::memory_order_relaxed);
+  if (last != 0 && now_ms - last < kIntervalMs) return;
+  if (!drop_log_ms_.compare_exchange_strong(last, now_ms == 0 ? 1 : now_ms))
+    return;
+  const uint64_t total = flush_dropped_.load(std::memory_order_relaxed);
+  const uint64_t acked =
+      post_ack_flush_failures_.load(std::memory_order_relaxed);
+  const uint64_t new_total =
+      total - drop_logged_total_.exchange(total, std::memory_order_relaxed);
+  const uint64_t new_acked =
+      acked - drop_logged_acked_.exchange(acked, std::memory_order_relaxed);
+  DFKV_LOG_WARN(
+      "ram tier: dropped " + std::to_string(new_total) +
+      " object(s) that could not be written to disk, " +
+      std::to_string(new_acked) +
+      " of them already acknowledged to the client (now lost: a later GET "
+      "misses)" +
+      (target_failed
+           ? "; the disk store they belong to has failed for good"
+           : "; every attempt to write them failed, see the disk store's "
+             "errors") +
+      ". The tier reports itself unhealthy until flushes succeed again.");
 }
 
 uint64_t RamTier::Evictions() const {
@@ -1392,7 +1591,7 @@ size_t RamTier::FlushBacklog() const {
   size_t n = 0;
   for (const auto& sh : shards_) {
     std::lock_guard<std::mutex> lk(sh->mu);
-    n += sh->flushq.size() + sh->flush_inflight;
+    n += sh->flushq.size() + sh->retryq.size() + sh->flush_inflight;
   }
   return n;
 }

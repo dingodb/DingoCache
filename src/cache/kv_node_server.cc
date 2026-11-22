@@ -319,6 +319,10 @@ std::future<std::unique_ptr<RamTier>> KvNodeServer::StartRamTier() {
     return group_.IsCached(key);
   };
   o.cancel_start = [this] { return RamStartUnwanted(); };
+  // A flush to a disk store that has failed for good is not tried again.
+  o.flush_target_failed = [this](const BlockKey& key) {
+    return group_.DiskFailedFor(key);
+  };
   return std::async(std::launch::async, [this, o] {
     // Flusher persists a RAM slot to the disk group. CacheDirect (not Cache):
     // the arena slot is 4 KiB-aligned with cap slack, so a direct-mode slab
@@ -1010,8 +1014,11 @@ std::string KvNodeServer::MetricsText() const {
            "RAM-ACK PUTs rejected at a positive dirty watermark or disk-ACKed at zero",
            ram_->AckBackpressure());
     metric("dfkv_ram_post_ack_flush_failures_total", "counter",
-           "Acknowledged RAM PUTs whose background disk flush later failed",
+           "Acknowledged RAM PUTs whose value was dropped because its disk flush kept failing (lost)",
            ram_->PostAckFlushFailures());
+    metric("dfkv_ram_flush_retries_total", "counter",
+           "Failed RAM flush attempts that were followed by another attempt",
+           ram_->FlushRetries());
     s += ram_->AckToDurableLatencyMetrics(idlabels);
     metric("dfkv_ram_budget_bytes", "gauge",
            "Hard total RAM-tier budget across arena and dedicated values",
@@ -1035,7 +1042,7 @@ std::string KvNodeServer::MetricsText() const {
            "Resident dedicated oversized allocation bytes",
            ram_->large_used_bytes());
     metric("dfkv_ram_healthy", "gauge",
-           "Whether the RAM tier has avoided a terminal flush failure",
+           "0 from a dropped flush until flushes have succeeded again in a row",
            ram_->healthy() ? 1 : 0);
     metric("dfkv_ram_flush_threads", "gauge",
            "Actual RAM flusher count after the per-shard minimum adjustment",
@@ -1179,9 +1186,13 @@ Status KvNodeServer::ProcessRequestForKey(
       // RAM-ACK publishes a flush-pinned copy. A reached positive watermark
       // rejects new keys before admission; only a capacity bypass may take
       // the normal disk path, never a terminal watermark rejection.
+      // Nor may RAM acknowledge a value that can never reach its disk: once
+      // that disk's store has failed for good the PUT goes the disk path and
+      // gets the store's I/O error, as it would without a RAM tier.
       bool needs_disk = true;
       if (ram_write_back_ && ram_ &&
-          group_.TenantQuotaBytes(key.tenant_hash) == 0) {
+          group_.TenantQuotaBytes(key.tenant_hash) == 0 &&
+          !group_.DiskFailedFor(key)) {
         const RamTier::PutResult result =
             ram_ack_enabled_ ? ram_->PutWriteBack(key, payload, payload_len)
                              : ram_->PutCommitted(key, payload, payload_len);
@@ -1512,7 +1523,9 @@ Status KvNodeServer::CacheDirectForKey(const BlockKey& key, char* data,
   // Write-back admits to the RAM arena first. RAM-ACK returns after the
   // flush-pinned value is visible; disk-ACK waits for the same flush result.
   // Only capacity bypass falls through; watermark rejection is terminal.
-  if (ram_write_back_ && ram_ && unlimited) {
+  // A disk whose store has failed for good takes no RAM admission either: the
+  // value could never be flushed, so the PUT gets the store's I/O error.
+  if (ram_write_back_ && ram_ && unlimited && !group_.DiskFailedFor(key)) {
     const RamTier::PutResult result =
         ram_ack_enabled_ ? ram_->PutWriteBack(key, data, len)
                          : ram_->PutCommitted(key, data, len);

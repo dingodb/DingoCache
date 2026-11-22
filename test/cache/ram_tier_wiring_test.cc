@@ -13,12 +13,14 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -34,13 +36,23 @@ using namespace dfkv;  // NOLINT
 using namespace std::chrono_literals;
 
 namespace dfkv {
-// Named like the store's test peer (its friend): breaks the state file
-// descriptor, so the next write of slab_state fails.
+// Named like the store's test peer (its friend). BreakStateFd breaks the
+// state file descriptor, so the next write of slab_state fails.
 class DiskSlabStoreTestPeer {
  public:
   static void BreakStateFd(DiskSlabStore* store) {
     if (store->state_fd_ >= 0) ::close(store->state_fd_);
     store->state_fd_ = -1;
+  }
+  // Fail the store's writes: `record` is the metadata failure that fails a
+  // store for good, `payload` a write that fails and may work again.
+  static void SetRecordWriteHook(DiskSlabStore* store,
+                                 std::function<bool()> hook) {
+    store->record_write_hook_for_test_ = std::move(hook);
+  }
+  static void SetPayloadWriteHook(DiskSlabStore* store,
+                                  std::function<bool()> hook) {
+    store->payload_write_hook_for_test_ = std::move(hook);
   }
 };
 }  // namespace dfkv
@@ -1452,3 +1464,218 @@ TEST(RamTierWiring, AServerWhoseDiskCannotBeActivatedRefusesToStart) {
   }
 }
 }  // namespace
+
+// ---- A RAM-acknowledging server whose disk refuses writes --------------------
+namespace {
+// A server with the RAM tier (RAM-ACK, the default) over slab stores whose
+// writes the test can fail: `payload` for a write that fails and may work
+// again, `record` for the metadata failure that fails a store for good.
+struct FlushFailNode {
+  RamTierEnv env;
+  fs::path root;
+  std::vector<DiskSlabStore*> stores;
+  std::mutex mu;
+  std::unique_ptr<KvNodeServer> server;
+
+  explicit FlushFailNode(const char* name, size_t disks = 1) {
+    root = fs::temp_directory_path() / (std::string("dfkv_flushfail_") + name);
+    fs::remove_all(root);
+    fs::create_directories(root / "tokens");
+    std::vector<std::string> dirs;
+    for (size_t i = 0; i < disks; ++i)
+      dirs.push_back((root / ("disk" + std::to_string(i))).string());
+    stores.assign(disks, nullptr);
+    DiskCacheGroup::Options options{dirs, disks * (64ull << 20), "slab"};
+    options.engine_factory =
+        [this, dirs](const std::string& dir,
+                     uint64_t) -> std::unique_ptr<StoreEngine> {
+      DiskSlabStore::Options o;
+      o.dir = dir;
+      o.trust_token_dir = (root / "tokens").string();
+      o.capacity_bytes = 64 << 20;
+      o.extent_bytes = 1 << 20;
+      o.slot_granularity = 4096;
+      o.table_sync_ms = 0;
+      o.reclaim_interval_ms = 0;
+      auto store = std::make_unique<DiskSlabStore>(o);
+      std::lock_guard<std::mutex> lk(mu);
+      for (size_t i = 0; i < dirs.size(); ++i)
+        if (dirs[i] == dir) stores[i] = store.get();
+      return store;
+    };
+    server = KvNodeServerWiringTestPeer::Create(std::move(options));
+  }
+  ~FlushFailNode() {
+    server.reset();
+    fs::remove_all(root);
+  }
+  Status Put(uint64_t id) {
+    const std::string value(4096, 'v');
+    std::string out;
+    return server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kCache),
+                                        BlockKey{id, 0}, 0, 0, value.data(),
+                                        value.size(), &out);
+  }
+  Status Get(uint64_t id) {
+    std::string out;
+    return server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kRange),
+                                        BlockKey{id, 0}, 0, 4096, nullptr, 0,
+                                        &out);
+  }
+  long Metric(const char* name) {
+    return MetricVal(server->MetricsText(), name);
+  }
+  bool Settled() {
+    return WaitFor([&] { return Metric("dfkv_ram_flush_backlog") == 0; });
+  }
+};
+}  // namespace
+
+// Once a disk's store has failed for good, a PUT for that disk is no longer
+// acknowledged from RAM: it gets the store's I/O error. It used to be
+// acknowledged, and its value dropped microseconds later.
+TEST(RamTierFlushFailure, PutIsRefusedOnceItsDiskStoreHasFailed) {
+  FlushFailNode node("refused");
+  ASSERT_TRUE(node.server->ram_enabled());
+  ASSERT_EQ(node.Put(1), Status::kOk);
+  ASSERT_TRUE(node.Settled());
+  ASSERT_EQ(node.Metric("dfkv_ram_flushed_total"), 1);
+
+  // The store fails while one acknowledged value is on its way to it. That
+  // one cannot be saved: it was acknowledged before anything had failed. It
+  // is dropped at once (no retries against a failed store) and counted.
+  DiskSlabStoreTestPeer::SetRecordWriteHook(node.stores[0],
+                                            [] { return false; });
+  ASSERT_EQ(node.Put(2), Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return !node.server->DisksHealthy(); }));
+  DiskSlabStoreTestPeer::SetRecordWriteHook(node.stores[0], {});
+  ASSERT_TRUE(node.Settled());
+  EXPECT_EQ(node.Metric("dfkv_ram_post_ack_flush_failures_total"), 1);
+  EXPECT_EQ(node.Metric("dfkv_ram_flush_retries_total"), 0);
+
+  const long acks = node.Metric("dfkv_ram_ack_total");
+  for (uint64_t id = 10; id < 30; ++id)
+    EXPECT_EQ(node.Put(id), Status::kIOError) << id;
+  EXPECT_EQ(node.Metric("dfkv_ram_ack_total"), acks)
+      << "nothing more was acknowledged from RAM";
+  EXPECT_EQ(node.Metric("dfkv_ram_post_ack_flush_failures_total"), 1)
+      << "and so nothing more was lost after an acknowledgement";
+  EXPECT_EQ(node.Metric("dfkv_ram_flush_dropped_total"), 1);
+  // What was flushed before the failure is still served from RAM.
+  EXPECT_EQ(node.Get(1), Status::kOk);
+}
+
+// With several disks, only the keys of the failed one are refused.
+TEST(RamTierFlushFailure, OtherDisksKeepTheirRamAcknowledgement) {
+  FlushFailNode node("otherdisks", 2);
+  ASSERT_TRUE(node.server->ram_enabled());
+  // Fail the store of whichever disk key 1 is written to.
+  for (DiskSlabStore* store : node.stores)
+    DiskSlabStoreTestPeer::SetRecordWriteHook(store, [] {
+      return false;
+    });
+  ASSERT_EQ(node.Put(1), Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return !node.server->DisksHealthy(); }));
+  for (DiskSlabStore* store : node.stores)
+    DiskSlabStoreTestPeer::SetRecordWriteHook(store, {});
+  ASSERT_TRUE(node.Settled());
+  ASSERT_NE(node.stores[0]->Healthy(), node.stores[1]->Healthy())
+      << "exactly one store failed";
+
+  int refused = 0, acknowledged = 0;
+  for (uint64_t id = 100; id < 164; ++id) {
+    const Status st = node.Put(id);
+    if (st == Status::kIOError) ++refused;
+    if (st == Status::kOk) ++acknowledged;
+  }
+  EXPECT_EQ(refused + acknowledged, 64);
+  EXPECT_GT(refused, 0);
+  EXPECT_GT(acknowledged, 0);
+  ASSERT_TRUE(node.Settled());
+  EXPECT_EQ(node.Metric("dfkv_ram_flushed_total"), acknowledged)
+      << "every acknowledged value reached its (healthy) disk";
+  EXPECT_EQ(node.Metric("dfkv_ram_post_ack_flush_failures_total"), 1);
+}
+
+// A write that fails and then works: the acknowledged value is kept in RAM,
+// written on a later attempt, and the node stays healthy. It used to be
+// dropped after three attempts in a row, and the node unhealthy for good.
+TEST(RamTierFlushFailure, DiskErrorThatPassesLosesNothing) {
+  FlushFailNode node("passes");
+  ASSERT_TRUE(node.server->ram_enabled());
+  std::atomic<int> writes{0};
+  // Fails for long enough to outlast three attempts in a row.
+  DiskSlabStoreTestPeer::SetPayloadWriteHook(
+      node.stores[0], [&] { return writes.fetch_add(1) >= 3; });
+  ASSERT_EQ(node.Put(1), Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return writes.load() >= 2; }));
+  EXPECT_EQ(node.Get(1), Status::kOk) << "readable while its flush is retried";
+  ASSERT_TRUE(WaitFor([&] {
+    return node.Metric("dfkv_ram_flushed_total") == 1;
+  }));
+  EXPECT_EQ(writes.load(), 4);
+  EXPECT_EQ(node.Metric("dfkv_ram_flush_retries_total"), 3);
+  EXPECT_EQ(node.Metric("dfkv_ram_flush_dropped_total"), 0);
+  EXPECT_EQ(node.Metric("dfkv_ram_post_ack_flush_failures_total"), 0);
+  EXPECT_EQ(node.Metric("dfkv_ram_healthy"), 1);
+  EXPECT_TRUE(node.server->Healthy());
+  EXPECT_EQ(node.Get(1), Status::kOk);
+}
+
+// A disk that refuses writes, and clients that send the same keys again and
+// again: none of those PUTs may be parked for the seconds the flush is being
+// retried, and a PUT of another key that shares a put-key stripe with one of
+// them must not be held up behind them.
+TEST(RamTierFlushFailure, RepeatedPutsOfAKeyDoNotParkBehindItsFailingFlush) {
+  FlushFailNode node("parked");
+  ASSERT_TRUE(node.server->ram_enabled());
+  DiskSlabStoreTestPeer::SetPayloadWriteHook(node.stores[0],
+                                             [] { return false; });
+  const uint64_t keys[] = {5001, 5002, 5003, 5004};
+  for (uint64_t key : keys) ASSERT_EQ(node.Put(key), Status::kOk);
+  // Every one of them is now between two attempts.
+  ASSERT_TRUE(WaitFor([&] {
+    return node.Metric("dfkv_ram_flush_retries_total") >= 4;
+  }));
+
+  std::atomic<bool> stop{false};
+  std::atomic<long> slowest_us{0}, repeats{0}, not_ok{0};
+  std::vector<std::thread> clients;
+  for (int t = 0; t < 6; ++t) {
+    clients.emplace_back([&, t] {
+      for (int i = 0; !stop.load(); ++i) {
+        const auto started = std::chrono::steady_clock::now();
+        if (node.Put(keys[(t + i) % 4]) != Status::kOk) ++not_ok;
+        const long us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - started)
+                            .count();
+        long seen = slowest_us.load();
+        while (us > seen && !slowest_us.compare_exchange_weak(seen, us)) {
+        }
+        ++repeats;
+      }
+    });
+  }
+  // The stripe is (digest_hi ^ digest_lo ^ tenant) % 1024: these keys share
+  // theirs with the four above and are otherwise unrelated.
+  long slowest_other_us = 0;
+  for (int round = 0; round < 20; ++round) {
+    const uint64_t other = keys[round % 4] + 1024ull * (round + 1);
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_EQ(node.Put(other), Status::kOk) << other;
+    slowest_other_us = std::max<long>(
+        slowest_other_us,
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count());
+    std::this_thread::sleep_for(20ms);
+  }
+  stop = true;
+  for (auto& client : clients) client.join();
+  EXPECT_GT(repeats.load(), 100);
+  EXPECT_EQ(not_ok.load(), 0)
+      << "the value is resident and acknowledged: so is a repeated PUT of it";
+  EXPECT_LT(slowest_us.load(), 500000) << "a repeated PUT was parked";
+  EXPECT_LT(slowest_other_us, 500000)
+      << "a PUT of another key waited behind a parked one on its stripe";
+}

@@ -65,6 +65,11 @@ class DiskCacheGroup {
   // (and the group unhealthy) if a disk could not be activated.
   bool Activate();
   bool Healthy() const;
+  // Whether the disk this key is written to has failed for good (its store
+  // refuses every write until the process is restarted). Callers ask on
+  // every PUT: one atomic read per disk while all are healthy, and the key
+  // is routed only once one has failed.
+  bool DiskFailedFor(const BlockKey& key) const;
   const std::string& StartupError() const { return startup_error_; }
 
   Status Cache(const BlockKey& key, const void* data, size_t len);
@@ -126,8 +131,11 @@ class DiskCacheGroup {
   uint64_t DiskUsedBytes(size_t i) const { return disks_[i]->UsedBytes(); }
   size_t DiskObjects(size_t i) const { return disks_[i]->Count(); }
   // Slab-only, indexed identically to DiskPath; one coherent observation view.
+  // A store that an engine_factory built is not in the typed view: it has
+  // no observation here, whatever its type.
   DiskSlabStore::WatermarkObservation DiskWatermarkObservation(size_t i) const {
-    return slabs_[i]->GetWatermarkObservation();
+    return i < slabs_.size() ? slabs_[i]->GetWatermarkObservation()
+                             : DiskSlabStore::WatermarkObservation{};
   }
   uint64_t TenantUsedBytes(uint64_t tenant_hash) const;
   uint64_t TenantDefaultQuotaBytes() const { return tenant_default_quota_bytes_; }
