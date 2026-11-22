@@ -272,6 +272,9 @@ class KvNodeServer {
                        std::string* out_data);
   // A SET on a write-back value still only in RAM is applied when its flush
   // commits (bounded; overflow answers DENIED). Under pending_retain_mu_.
+  // ApplyPendingRetain takes the parked SET of a key: applied when the value
+  // was written, forgotten when it was dropped unwritten or removed. Refused
+  // and failed attempts that are tried again leave it parked.
   struct BlockKeyHasher {
     size_t operator()(const BlockKey& k) const {
       return static_cast<size_t>(k.digest_hi ^ (k.digest_lo * 0x9e3779b97f4a7c15ULL) ^

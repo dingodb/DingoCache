@@ -121,6 +121,8 @@ PUBLIC_FAMILIES = {
     "dfkv_ram_flush_backlog",
     "dfkv_ram_flush_dropped_total",
     "dfkv_ram_flush_retries_total",
+    "dfkv_ram_flush_no_room_total",
+    "dfkv_ram_flush_no_room_dropped_total",
     "dfkv_ram_healthy",
     "dfkv_ram_large_used_bytes",
     "dfkv_ram_parked_puts",

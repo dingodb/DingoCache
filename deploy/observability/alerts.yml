@@ -122,7 +122,7 @@ groups:
           severity: critical
         annotations:
           summary: "dfkv RAM tier dropped values it had acknowledged"
-          description: "{{ $labels.instance }} dropped {{ $value }} acknowledged value(s) in 5 minutes because their flush to disk kept failing. Check the disk store errors of that node (a failed store, a full filesystem); dfkv_ram_flush_retries_total rising without this counter means failures that passed."
+          description: "{{ $labels.instance }} dropped {{ $value }} acknowledged value(s) in 5 minutes because their flush to disk kept failing. Check the disk store errors of that node (a failed store, a full filesystem); dfkv_ram_flush_retries_total rising without this counter means failures that passed. A disk that is healthy but has no slot for a value does not count here (dfkv_ram_flush_no_room_dropped_total)."
       - alert: DfkvRamFlushBacklog
         expr: dfkv_ram_flush_backlog > 4096
         for: 5m

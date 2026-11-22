@@ -136,12 +136,34 @@ class RamTier {
     // once and nothing is lost by failing fast.
     //
     // After the last attempt the object is dropped and counted.
+    //
+    // A disk that answers kCacheFull has not failed: it has no slot for the
+    // value now (every slot of its size class is held by an operation in
+    // flight or protected by retention). Such an attempt is not a failure
+    // and does not count against flush_retries or the tier's health. A value
+    // whose PUT waits for the flush is not tried again: that PUT is answered
+    // kCacheFull, as the disk would answer it without a RAM tier. An
+    // acknowledged value stays resident, readable and dirty, and is tried
+    // again with the same pauses, at most 3.2 s apart, for up to
+    // flush_no_room_hold_ms from the first refusal; then it is dropped like
+    // a value the cache evicts, counted apart from the lost ones. While the
+    // tier drains for a stop it gets flush_retries more attempts without
+    // pauses, as a failing value does, and is then dropped the same way.
     uint32_t flush_retries = 5;
     uint32_t flush_retry_base_ms = 50;
+    uint32_t flush_no_room_hold_ms = 60000;
     // Whether the disk a key is written to has failed for good. A flush that
     // fails and gets true here is not tried again: nothing will change until
     // the process is restarted. Called from a flush worker, without locks.
     std::function<bool(const BlockKey&)> flush_target_failed;
+    // Called for every value dropped without having been written: its
+    // flush failed for good, or the disk had no room for it. Not for a
+    // removed value (Remove's caller knows) and not for a value written
+    // after refused or failed attempts. From a flush worker, under the shard
+    // lock of the key, in the same hold that drops the value: a new PUT of
+    // the key, and anything the caller does for it, comes after the call.
+    // Must not call into the tier.
+    std::function<void(const BlockKey&)> flush_given_up;
     // After an object has been dropped the tier reports itself unhealthy
     // until this many flushes in a row have succeeded with no failed attempt
     // in between: a failure that has passed stops being reported, one that
@@ -191,15 +213,18 @@ class RamTier {
   // the allocation's full aligned size. Ordinary data points into the arena;
   // oversize data points into a dedicated allocation. Both may use O_DIRECT.
   // Zeroing padding bytes inside [len, cap) is fine; readers only see [0, len).
-  using FlushFn =
-      std::function<bool(const BlockKey& key, char* data, size_t len, size_t cap)>;
+  // Returns the disk's answer: kOk written, kCacheFull no room for it now
+  // (see Options::flush_no_room_hold_ms), anything else a failed attempt.
+  using FlushFn = std::function<Status(const BlockKey& key, char* data,
+                                       size_t len, size_t cap)>;
   // Batched flush sink (optional). One resident allocation per item, same
   // contract as FlushFn; the server wires this to CacheDirectBatch so a
   // worker's whole dequeue rides one lock-amortized (and, with uring, one-
   // submit) store visit -- small-object flushing is IOPS-bound at one
   // synchronous DIO write per key otherwise. Unset = per-item FlushFn.
   struct FlushItem { BlockKey key; char* data; size_t len; size_t cap; };
-  using FlushBatchFn = std::function<std::vector<bool>(const std::vector<FlushItem>&)>;
+  using FlushBatchFn =
+      std::function<std::vector<Status>(const std::vector<FlushItem>&)>;
   void set_flush_batch(FlushBatchFn fn) { flush_batch_ = std::move(fn); }
 
   // A move-only pinned RAM location. Destruction releases the send pin; moving
@@ -296,6 +321,9 @@ class RamTier {
     kDroppedStoreFailed,    // its disk store has failed for good; gone
     kDroppedAtShutdown,     // still failing when the tier was being drained
     kCanceled,          // removed, or given up before it was admitted
+    // The disk had no room for it (kCacheFull); the value is gone and the
+    // PUT is answered kCacheFull: not stored, the node is fine.
+    kNoRoom,
     // The PUT stopped waiting before the flush ended (Options::put_wait_ms
     // passed, or the server is stopping). Status kCacheFull: the value still
     // owns the key and may yet reach disk; this PUT did not see it.
@@ -436,6 +464,14 @@ class RamTier {
   uint64_t FlushRetries() const {
     return flush_retries_.load(std::memory_order_relaxed);
   }
+  // Flush attempts the disk answered kCacheFull (no room now), and the values
+  // dropped for that reason (acknowledged ones after flush_no_room_hold_ms).
+  uint64_t FlushNoRoom() const {
+    return flush_no_room_.load(std::memory_order_relaxed);
+  }
+  uint64_t FlushNoRoomDropped() const {
+    return flush_no_room_dropped_.load(std::memory_order_relaxed);
+  }
   std::string AckToDurableLatencyMetrics(const std::string& labels) const {
     return ack_to_durable_latency_.Render(
         "dfkv_ram_ack_to_durable_latency_seconds", labels);
@@ -499,6 +535,11 @@ class RamTier {
   struct QItem {
     BlockKey key;
     uint32_t tries = 0;
+    // Attempts the disk answered kCacheFull, and when the first of them was.
+    uint32_t no_room_tries = 0;
+    std::chrono::steady_clock::time_point no_room_since{};
+    // Refused attempts since the tier began to drain for a stop.
+    uint32_t no_room_drain_tries = 0;
     // For an item waiting to be tried again: not before this.
     std::chrono::steady_clock::time_point not_before{};
   };
@@ -639,6 +680,8 @@ class RamTier {
   std::atomic<uint64_t> put_wait_timeouts_{0}, put_waits_canceled_{0};
   std::atomic<uint64_t> post_ack_flush_failures_{0};
   std::atomic<uint64_t> flush_retries_{0};
+  std::atomic<uint64_t> flush_no_room_{0};
+  std::atomic<uint64_t> flush_no_room_dropped_{0};
   // The stop sequence is waiting for the backlog (WaitForDrain): attempts
   // are no longer spaced out, so a failing object is given up at once
   // instead of holding the stop for its backoff.

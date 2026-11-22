@@ -3,6 +3,40 @@
 ## Unreleased
 
 
+- Server, RAM tier: a disk that is healthy but has no slot for a value is no
+  longer treated as a failing disk. The flush of a RAM value now gets the
+  disk's status instead of a yes or no. A slab disk answers `kCacheFull` when
+  every slot of the value's size class is held by a read or write in flight
+  or protected by retention (`dfkv_slab_put_no_slot_total`). The RAM tier
+  took that for a failed write: an acknowledged value was tried five times
+  over 4.25 s and then dropped, counted as acknowledged data lost
+  (`dfkv_ram_post_ack_flush_failures_total`, alert
+  `DfkvRamAcknowledgedDataLost`), and the tier reported itself unhealthy
+  (`/healthz` 503) for at least 30 s; a disk-ACK PUT got `kIOError`, on
+  which clients cool the node down. Now such an attempt is neither a failure
+  nor a retry and does not touch the tier's health. An acknowledged value
+  stays in RAM, readable and dirty, and is tried again with the same pauses,
+  at most 3.2 s apart, for up to 60 s; if the disk has no slot for it all
+  that time it is dropped like an evicted value and counted in the new
+  `dfkv_ram_flush_no_room_dropped_total`, not as lost. A disk-ACK PUT is
+  answered `kCacheFull` at once, as the disk answers it without a RAM tier.
+  While the tier drains for a stop there is no waiting for room: such a
+  value gets `flush_retries` (5) more attempts without pauses, as a failing
+  one does, and is then dropped and counted the same way. Attempts the disk
+  refuses this way are counted in the new `dfkv_ram_flush_no_room_total`.
+  A RETAIN SET parked for a value that is only in RAM (answered
+  `kProtectedNew`) is now applied when the value is written, also after
+  refused or failed attempts; it used to be thrown away on the first
+  attempt that did not succeed, so the value landed without protection and
+  could be evicted early. This was true for retried write failures as well
+  (2.39). A parked SET is forgotten when its value is dropped unwritten or
+  removed. Failed writes keep the behaviour of 2.39
+  (retries with pauses, drop, loss counter, health). Limit: while values
+  wait for room they count as dirty, so a disk without room for long fills
+  the RAM-ACK watermark like a disk that refuses writes, and new keys are
+  then answered `kCacheFull`. No setting, API or wire change. See
+  `docs/DEPLOY.md` and `docs/METRICS.md`.
+
 - Client, GPU dedup (`DFKV_CLIENT_NODE_DEDUP_GPU=1`): a write or remove of
   a key that hangs on a blocked shared slot is no longer silent, and one
   such case no longer hangs. Before a write or remove, the client removes

@@ -422,6 +422,16 @@ journalctl -u dfkv -n 10 --no-pager
 > tier 一个数，不分盘**：多盘节点上只要一块盘不收写就可能把它占满，此时该节点**所有盘**
 > 的新 key 都得到 `kCacheFull`，直到那块盘的值被丢弃或写入为止。同一 key 的重复 PUT
 > 在其值已由 RAM 确认、仍在等落盘时立即得到同样的确认，不等待落盘。
+> 盘**健康但暂时没有槽**（slab 盘回 `kCacheFull`：该 size class 的槽全被在途读写 pin
+> 住或被留存保护）不算写失败：不计重试次数、不影响 `dfkv_ram_healthy`。已确认的值留在
+> RAM 里按同样的间隔（最长 3.2 s 一次）继续试，最长 60 秒，期间可读、计入 dirty；
+> 60 秒内仍没有槽才丢弃，计入 `dfkv_ram_flush_no_room_dropped_total`（相当于一次淘汰，
+> 不计入 `dfkv_ram_post_ack_flush_failures_total`，不触发 `DfkvRamAcknowledgedDataLost`）。
+> 停止时排空（drain）期间不再等槽：这样的值和写失败的值一样不加间隔再试
+> `flush_retries`（默认 5）次，仍没有槽就丢弃，同样只计入
+> `dfkv_ram_flush_no_room_dropped_total`。挂在这类值上的 RETAIN SET 保留到值真正写入
+> 时才生效，值最终被丢弃或删除时一并作废。
+> 等落盘结果的 PUT（disk-ACK）则立即得到 `kCacheFull`，与没有 RAM tier 时盘的回答相同。
 > **行为变化**：`dfkv_ram_healthy` 以及由它决定的 `/healthz`、`/readyz` 不再是“一旦为 0
 > 直到重启”，依赖 503 保持不变的探针应改看 `dfkv_ram_flush_dropped_total` /
 > `dfkv_ram_post_ack_flush_failures_total`（两者保持单调）。数据面线程卡死而进程存活的情况不在此检测范围内，依赖
