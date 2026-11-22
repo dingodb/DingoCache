@@ -473,8 +473,15 @@ journalctl -u dfkv -n 10 --no-pager
 > 物理尝试总数仍固定至多 2。已完成的 GET/batch/SG item/window 保留 byte-exact
 > 结果，第二次只提交未完成工作。PUT 只有在确认 request 尚未 post 时才可换轨；
 > post 后 failure 的远端 commit 状态不明确，必须原样失败，**不得跨轨 replay**。
-> 这不扩大 pooled stale-QP 的既有 fresh retry，也不承诺 exactly-once 或
-> concurrent-writer isolation。
+> 唯一例外是 stale pooled QP：连接从池里取出后没有任何 completion 成功（连对端
+> 网卡对请求的确认都没有）就失败，请求几乎可以肯定没有送达（对端已回收该连接或
+> 已重启），这样的 PUT 在 fresh connection 上再发一次，与读相同。若它其实送达了
+> （只是回程的确认全部丢失，或请求的 completion 恰在窗口期限到时才到），再发的
+> 是同一 key、同一字节，server 按已有的那份应答；送达的第一份仍可能晚于第二份
+> 才被处理，这与此前 client 放弃的 PUT 是同一种情况。直接写入调用方内存的整对象
+> GET 同样只在这种情况下重试一次。这类 PUT、批量 PUT 和整对象 GET 的最坏耗时
+> 加倍：第一个窗口要先失败（等到重传耗尽或窗口期限），再跑一个完整的第二窗口。
+> 这不承诺 exactly-once 或 concurrent-writer isolation。
 >
 > client-local rail quarantine 仍由本地 Open/QP/MR/post/CQ 和 local WC 证据
 > 驱动；peer/bootstrap/protocol、remote/RNR/timeout、admission、
@@ -659,7 +666,7 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | `DFKV_RDMA_RAIL_BACKPRESSURE_MS` | `10` | client：Acquire 失败重试 backoff |
 | `DFKV_RDMA_RAIL_COOLDOWN_MS` | `5000` | client-local rail quarantine 冷却期；冷却期间不准入，期满仅允许 1 个真实 operation 作为 recovery probe |
 | `DFKV_RDMA_RAIL_ERROR_THRESHOLD` | `3` | client：连续 `kRailFailure` 达到该值才 quarantine；peer/endpoint、admission、timeout（无 local-error WC）、cancel 和 invalid input 不计入 |
-| client-local rail attempts | 固定 `2`（不可配置） | GET/batch/SG 第二次只重试未完成 item/window；PUT 仅在确认 request 未 post 时可换轨，post 后 ambiguous failure 不 replay |
+| client-local rail attempts | 固定 `2`（不可配置） | GET/batch/SG 第二次只重试未完成 item/window；PUT 仅在确认 request 未 post、或所用 pooled QP 自出池后无任何 completion 成功（stale）时重发，其余 post 后 ambiguous failure 不 replay |
 | `DFKV_RDMA_RAIL_LATENCY_WEIGHT` | — | client：rail selection 的延迟 EWMA 权重 |
 | `DFKV_RDMA_RAIL_ERROR_PENALTY_US` | — | client：rail selection 的错误分数惩罚微秒 |
 | `DFKV_RDMA_IDLE_MS` | `600000` | server 常规空闲 QP 超时（毫秒；`0` 禁用）；接收池压力回收另须保护未完成的 reply/READ |

@@ -225,6 +225,32 @@
   and an environment whose vLLM requires LMCache 0.5.7 or later gets a
   resolver conflict. Unit tests check the adapter against the interface of
   0.4.7, 0.5.0, 0.5.3 and 0.5.4; end-to-end runs so far are on 0.4.7.
+- RDMA client: a PUT, and a read into the caller's memory, that find a pooled
+  connection the server has reclaimed or lost in a restart are made again on
+  a new connection instead of failing. Reads through staging buffers and
+  existence checks were already tried again on such a stale pooled
+  connection, and since 2.39.0 it no longer cools the peer rail. A PUT that
+  had been posted was not tried again: in general it is unknown whether the
+  server stored it. Nor
+  was a whole-object read into caller memory (`RangeInto`,
+  `RangeIntoMulti`, the zero-copy and scatter-gather GET), which had a
+  single attempt. Both failed with `kIOError` after the transport's
+  retries ran out (`status=12 status_name=retry_exc_err` in the CQ failure
+  line). Now, when nothing has succeeded on the connection since it was
+  taken from the pool, not even the peer NIC's acknowledgement of the
+  request, the request was almost certainly not delivered, and it is sent
+  once more on a new connection (same rail when it is the only usable one).
+  If it was delivered after all (every acknowledgement lost on the way back,
+  or its completion arriving just as the window's deadline ran out), the PUT
+  sent again carries the same key and bytes, and the server answers it from
+  the value it already has; the first copy may still be handled after the
+  second, as could any PUT the client gave up on before this change. Such a
+  PUT, batch or whole-object read can take twice as long in the worst case:
+  the first window has to fail, then the second runs in full. A PUT that
+  failed on a connection on which something had succeeded is still not sent
+  again, and a whole-object read is still not tried again after any other
+  failure. The retries count in `dfkv_rdma_client_stale_pool_retries_total`.
+  No setting, API or wire change; servers of any version are unaffected.
 
 ## 2.39.0 — 2026-11-22
 
