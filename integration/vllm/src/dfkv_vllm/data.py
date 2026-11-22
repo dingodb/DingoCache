@@ -389,6 +389,14 @@ class ChunkedTokenDatabase:
                 continue
             yield start_idx, end_idx, self._make_key_by_hash(h.hex())
 
+    def chunk_hash(self, chunk_id: int, block_hashes: list[BlockHash]) -> BlockHash:
+        """The hash ``process_tokens`` keys chunk ``chunk_id`` by."""
+        if self.block_size == self.hash_block_size:
+            return block_hashes[chunk_id]
+        return BlockHashListWithBlockSize(
+            block_hashes, self.hash_block_size, self.block_size
+        )[chunk_id]
+
     def boundary_chunk(
         self, boundary: int, block_hashes: list[BlockHash]
     ) -> tuple[int, int, PoolKey] | None:

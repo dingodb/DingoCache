@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- vLLM connector: a request's SAVEs resume where its earlier steps left
+  off. Each step enumerated the prefix from chunk 0, built every chunk's key
+  and probed the existence of all of them, so a chunked prefill cost
+  exists keys (and Python time) quadratic in the prompt length. Per request
+  and cache group the worker now keeps how far this rank's chunks are known
+  stored, by a PUT or a probe, and starts there. A chunk whose PUT failed,
+  or that the store mask left out (a volatile tail), holds the mark back, so
+  a later step still saves it; stripe positions and KV-event parents are
+  those of a full enumeration, and recurrent-state groups keep no mark. A
+  request with a retention TTL still enumerates its whole prefix, so its
+  SET keeps re-protecting the early chunks (prefix closure). One
+  change: a chunk below the mark that the ring evicts while the request is
+  still running is not stored again by that request. Stand-in benchmark,
+  1024 blocks in prefill steps of 32: 16896 keys probed (45 ms) before, 1024
+  (7 ms) after; the same 1024 keys are put.
+
 - vLLM connector: a lookup that backs off probes each object once. A
   recurrent-state group's load mask is true only at the candidate's tail,
   so a missing state there makes the lookup try a shorter candidate; each

@@ -380,10 +380,13 @@ class _GroupDb:
         self.cacheable = True
         self._seg_layout = [(ADDR[group], 64, 64)]
 
-    def process_tokens(self, token_len, block_hashes):
-        if token_len < 64:
+    def process_tokens(self, token_len, block_hashes, mask_num=0):
+        if token_len < 64 or mask_num >= 64:
             return []
         return [(0, 64, PoolKey(self.metadata, bytes(block_hashes[0]).hex()))]
+
+    def chunk_hash(self, chunk_id, block_hashes):
+        return block_hashes[chunk_id]
 
     def descriptor_shape(self, _start, _end, block_ids):
         return 1, 64, block_ids[0]
@@ -400,7 +403,7 @@ class _UncachedDb(_GroupDb):
         self.metadata = KeyMetadata(**{**self.metadata.__dict__, "group_id": 2})
         self.cacheable = False
 
-    def process_tokens(self, token_len, block_hashes):
+    def process_tokens(self, token_len, block_hashes, mask_num=0):
         return []
 
 
