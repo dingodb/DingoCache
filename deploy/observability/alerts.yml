@@ -33,6 +33,35 @@ groups:
         annotations:
           summary: "dfkv MDS cannot complete etcd requests"
           description: "{{ $labels.instance }} has etcd transport/status errors for operation {{ $labels.op }}."
+      # etcd has been refusing this MDS's writes for 10 s: heartbeats are not
+      # being recorded, and members drop out of etcd when their lease (30 s)
+      # runs out. Fires well before DfkvMdsMemberListWithheld. The MDS log
+      # has what etcd answered ("mds: etcd put failed: HTTP ...").
+      - alert: DfkvMdsEtcdWritesRefused
+        expr: max by (instance) (dfkv_mds_etcd_write_failing_seconds) > 10
+        labels:
+          severity: critical
+        annotations:
+          summary: "etcd refuses the dfkv MDS's writes"
+          description: "{{ $labels.instance }} has had its etcd writes (lease grant, keepalive, put) fail for {{ $value }} s. Members expire from etcd 30 s after their last recorded heartbeat. Check the MDS log for etcd's answer, and etcd's space quota and alarms."
+      # A group lost a fifth of its registered members within 15 minutes.
+      - alert: DfkvMdsGroupMembersDropped
+        expr: max by (group) (dfkv_mds_group_nodes) < 0.8 * max by (group) (max_over_time(dfkv_mds_group_nodes[15m]))
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "dfkv group lost members"
+          description: "Group {{ $labels.group }} has {{ $value }} registered members, under 80% of its count in the last 15 minutes."
+      # Records under a group's member or client keys that the MDS cannot
+      # decode; they are skipped. The MDS log names the key.
+      - alert: DfkvMdsMemberRecordsUndecodable
+        expr: increase(dfkv_mds_member_decode_errors_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "dfkv MDS skips member records it cannot decode"
+          description: "{{ $labels.instance }} skipped member or client records in etcd it could not decode. The MDS log names the key."
       # Withheld continuously for minutes: etcd takes no writes. A member that
       # really left after a failed heartbeat withholds for one hold (120 s by
       # default) and stays below `for`; with a longer DFKV_MDS_UNWRITTEN_HOLD_MS

@@ -296,6 +296,8 @@ class MdsServer {
   UnwrittenMembers unwritten_;  // hold resolved in the ctor (env knob)
   std::atomic<uint64_t> withheld_log_ms_{0};  // rate limit of the WARN line
   MdsMetrics metrics_;
+  void NoteUndecodable(const std::string& key);
+  std::atomic<uint64_t> undecodable_logged_ms_{0};
 };
 
 }  // namespace dfkv

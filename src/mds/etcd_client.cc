@@ -5,6 +5,7 @@
 
 #include "utils/base64.h"
 #include "utils/json_min.h"
+#include "utils/log.h"
 
 namespace dfkv {
 
@@ -32,9 +33,62 @@ bool EtcdClient::Post(Op op, const std::string& path, const std::string& body,
   const size_t i = static_cast<size_t>(op);
   latency_[i].Observe(seconds);
   requests_[i].fetch_add(1, std::memory_order_relaxed);
-  if (!transported || response->status != 200)
+  const bool ok = transported && response->status == 200;
+  if (!ok) {
     errors_[i].fetch_add(1, std::memory_order_relaxed);
-  return transported && response->status == 200;
+    NoteFailure(op, transported, *response);
+  }
+  if (op == Op::kLeaseGrant || op == Op::kLeaseKeepAlive || op == Op::kPut) {
+    last_write_attempt_ms_.store(NowMs(), std::memory_order_relaxed);
+    if (ok) {
+      write_failing_since_ms_.store(0, std::memory_order_relaxed);
+    } else {
+      uint64_t none = 0;
+      write_failing_since_ms_.compare_exchange_strong(
+          none, NowMs(), std::memory_order_relaxed);
+    }
+  }
+  return ok;
+}
+
+uint64_t EtcdClient::NowMs() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+void EtcdClient::NoteFailure(Op op, bool transported,
+                             const HttpResponse& response) {
+  const size_t i = static_cast<size_t>(op);
+  const uint64_t now = NowMs();
+  uint64_t unlogged = 0;
+  {
+    std::lock_guard<std::mutex> lk(failure_log_mu_);
+    if (failure_logged_ms_[i] != 0 &&
+        now - failure_logged_ms_[i] < kFailureLogEveryMs) {
+      ++failures_unlogged_[i];
+      return;
+    }
+    failure_logged_ms_[i] = now;
+    unlogged = failures_unlogged_[i];
+    failures_unlogged_[i] = 0;
+  }
+  std::string what;
+  if (!transported) {
+    what = "no answer";
+  } else {
+    // What etcd said, on one line and bounded.
+    std::string body = response.body.substr(0, 256);
+    for (char& c : body)
+      if (c == '\n' || c == '\r') c = ' ';
+    what = "HTTP " + std::to_string(response.status) + ": " + body;
+  }
+  DFKV_LOG_WARN("mds: etcd " + std::string(kOpNames[i]) + " failed: " + what +
+                (unlogged ? " (" + std::to_string(unlogged) +
+                                " more failure(s) of this operation since "
+                                "the last such line)"
+                          : std::string()));
 }
 
 std::string EtcdClient::MetricsText() const {
@@ -55,6 +109,26 @@ std::string EtcdClient::MetricsText() const {
            std::to_string(errors_[i].load(std::memory_order_relaxed)) + "\n";
     out += latency_[i].RenderBody(latency_name, labels);
   }
+  // Writes failing for how long: from the first failed write after the last
+  // success, while writes are still being attempted. An MDS with nothing left
+  // to write (no member heartbeats here) loses nothing, so after the idle
+  // window without a write attempt it reads 0 again.
+  const uint64_t since = write_failing_since_ms_.load(std::memory_order_relaxed);
+  const uint64_t now = NowMs();
+  const uint64_t last_attempt =
+      last_write_attempt_ms_.load(std::memory_order_relaxed);
+  const bool attempting =
+      last_attempt != 0 && now - last_attempt <= write_idle_window_ms_;
+  out +=
+      "# HELP dfkv_mds_etcd_write_failing_seconds How long etcd has been "
+      "refusing or failing this MDS's writes (lease grant, keepalive, put); 0 "
+      "while they succeed, or when none was attempted for the idle window\n"
+      "# TYPE dfkv_mds_etcd_write_failing_seconds gauge\n"
+      "dfkv_mds_etcd_write_failing_seconds " +
+      std::to_string(since != 0 && attempting && now > since
+                         ? (now - since) / 1000
+                         : 0) +
+      "\n";
   return out;
 }
 
