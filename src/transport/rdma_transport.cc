@@ -870,32 +870,48 @@ void RdmaTransport::TrimIdle(uint64_t now_us) {
 void RdmaTransport::MaintainIdle(uint64_t now_us, bool send_keepalives) {
   TrimIdle(now_us);
   if (!send_keepalives) return;
-  std::vector<Conn*> idle;
+  // The connections idle now are probed one after another, and each is taken
+  // out of its pool only for its own probe. The others stay usable meanwhile;
+  // a probe that waits for a late answer would otherwise leave operations to
+  // every node without a pooled connection. A listed connection that an
+  // operation has taken in the meantime is skipped, as is one that is gone:
+  // it is looked for in its pool, never dereferenced before.
+  struct Listed {
+    bool control;
+    std::string node;
+    Conn* conn;
+  };
+  std::vector<Listed> listed;
   {
     std::lock_guard<std::mutex> lock(mu_);
-    const auto collect = [&](auto& pools) {
-      for (auto& [node, connections] : pools) {
-        (void)node;
-        for (Conn* conn : connections) {
-          if (conn->lifecycle.Activate()) {
-            MarkActive(conn, conn->lane);
-            idle.push_back(conn);
-          }
-        }
-        connections.clear();
-      }
+    const auto list = [&](bool control) {
+      for (const auto& [node, connections] :
+           control ? control_pool_ : pool_)
+        for (Conn* conn : connections)
+          listed.push_back({control, node, conn});
     };
-    collect(pool_);
-    collect(control_pool_);
+    list(false);
+    list(true);
   }
-  for (Conn* conn : idle) {
+  for (const Listed& entry : listed) {
+    if (keepalive_stop_.load(std::memory_order_relaxed)) return;
+    Conn* conn = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      auto& pools = entry.control ? control_pool_ : pool_;
+      const auto found = pools.find(entry.node);
+      if (found == pools.end()) continue;
+      auto& connections = found->second;
+      const auto it =
+          std::find(connections.begin(), connections.end(), entry.conn);
+      if (it == connections.end() || !(*it)->lifecycle.Activate()) continue;
+      conn = *it;
+      connections.erase(it);
+      MarkActive(conn, conn->lane);
+    }
     if (!peer_topologies_->IsCurrent(conn->node, conn->peer_id,
                                      conn->peer_publication)) {
       stale_publication_reaps_.fetch_add(1, std::memory_order_relaxed);
-      Destroy(conn, rdma::RailCompletion::kAdmission);
-      continue;
-    }
-    if (keepalive_stop_.load(std::memory_order_relaxed)) {
       Destroy(conn, rdma::RailCompletion::kAdmission);
       continue;
     }

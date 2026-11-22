@@ -5763,6 +5763,72 @@ TEST(RdmaLoopback, KeepaliveOnAConnectionTheServerReclaimedDoesNotCoolTheRail) {
   EXPECT_EQ(rt.ExistMany(node.addr, keys, &exists)[0], served);
 }
 
+// A keepalive round takes an idle connection out of its pool only for its
+// own probe. While the round waits for the answer of a busy node, the
+// pooled connections to other nodes stay in the pool, and an operation on
+// one of them uses it instead of dialing a new connection.
+TEST(RdmaLoopback, KeepaliveWaitingOnOneNodeLeavesOtherConnectionsPooled) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  // Rounds a second apart: each starts well after the setup before it.
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "1000");
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  const std::string rail = SingleTestRail();
+  if (rail.empty()) GTEST_SKIP() << "no ACTIVE RDMA device";
+  ScopedEnv one_rail("DFKV_RDMA_DEV", rail.c_str());
+  RdmaNode fast("keepalive-fast");
+  RdmaNode slow("keepalive-slow");
+  RdmaTransport rt(kMaxMsg, rail);
+  const BlockKey key = ToBlockKey(SelfHdr(), "keepalive-round");
+  const std::string value(4096, 'r');
+  const auto counter = [&](const std::string& name) {
+    return CounterVal(rt.MetricsText(), name);
+  };
+  // A round probes data connections before control connections: the slow
+  // node gets a data connection, the fast node only a control connection.
+  // The slow node answers its keepalives late (its PUTs are not delayed).
+  bool exist = false;
+  ASSERT_EQ(rt.Exist(fast.addr, key, &exist), Status::kOk);
+  slow.handler_delay_ms = 300;
+
+  // The operation on the fast node must run while the round waits on the
+  // slow node's probe (100 ms). On a loaded host it may miss that window;
+  // only an observation made inside it counts, and a missed one is retried
+  // in the next round.
+  bool observed = false;
+  for (int round = 0; round < 5 && !observed; ++round) {
+    ASSERT_EQ(rt.Cache(slow.addr, key, value.data(), value.size()),
+              Status::kOk);
+    const long attempts = counter("dfkv_rdma_client_keepalive_attempts_total");
+    const long failures = counter("dfkv_rdma_client_keepalive_failures_total");
+    const long successes =
+        counter("dfkv_rdma_client_keepalive_successes_total");
+    const long opened = counter("dfkv_rdma_client_conns_opened_total");
+
+    ASSERT_TRUE(WaitForCounter(
+        rt, "dfkv_rdma_client_keepalive_attempts_total", attempts + 1));
+    ASSERT_EQ(rt.Exist(fast.addr, key, &exist), Status::kOk);
+    const std::string metrics = rt.MetricsText();
+    // Still the slow node's probe: the round has not got further.
+    observed =
+        CounterVal(metrics, "dfkv_rdma_client_keepalive_attempts_total") ==
+            attempts + 1 &&
+        CounterVal(metrics, "dfkv_rdma_client_keepalive_failures_total") ==
+            failures;
+    if (observed)
+      EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_conns_opened_total"),
+                opened)
+          << "the fast node's pooled connection was out of the pool";
+
+    // Let the round finish: the slow probe fails, the fast one answers.
+    ASSERT_TRUE(WaitForCounter(
+        rt, "dfkv_rdma_client_keepalive_failures_total", failures + 1));
+    ASSERT_TRUE(WaitForCounter(
+        rt, "dfkv_rdma_client_keepalive_successes_total", successes + 1));
+  }
+  if (!observed)
+    GTEST_SKIP() << "no operation ran inside a slow keepalive probe";
+}
+
 // A TCP connect that fails says the node is not there. It says nothing about
 // a rail: every rail dials the same address. So no peer rail is charged and
 // nothing is dialed a second time; the caller gets kIOError, which is what

@@ -442,7 +442,7 @@ C 客户端快照还含传输级指标（RDMA 构建）：
 | `dfkv_rdma_client_peer_topology_updates_total` | counter | 无 label；接纳的新 peer immutable topology generation 数；同 generation 重复通知不增加。generation 按成员各自的拓扑条目计算，某个成员变化时只有它自己计数，其余成员的重复发布不计 |
 | `dfkv_rdma_client_no_compatible_rail_total` | counter | 无 label；configured tiers 因 absent/incomplete peer topology 或最高可用交集为空而返回 `kNoCompatibleRail` 的次数；不计 peer health failure |
 | `dfkv_rdma_client_stale_generation_reaps_total` | counter | 无 label；因 Conn 的 peer generation 落后而拒绝 take/repool/keepalive、并经 single-owner lifecycle 回收的 endpoint 数；只涉及拓扑条目发生变化（或被移除、重新加入）的那个成员的连接 |
-| `dfkv_rdma_client_keepalive_attempts_total` / `dfkv_rdma_client_keepalive_successes_total` / `dfkv_rdma_client_keepalive_failures_total` | counter | idle pooled QP 的保活尝试 / 成功 / 失败并退役连接；仅 `DFKV_RDMA_KEEPALIVE_MS>0` 时增长。保活失败只丢弃该连接，不冷却对端 rail（不计入 `remote_rail_failures_total`） |
+| `dfkv_rdma_client_keepalive_attempts_total` / `dfkv_rdma_client_keepalive_successes_total` / `dfkv_rdma_client_keepalive_failures_total` | counter | idle pooled QP 的保活尝试 / 成功 / 失败并退役连接；仅 `DFKV_RDMA_KEEPALIVE_MS>0` 时增长。保活失败只丢弃该连接，不冷却对端 rail（不计入 `remote_rail_failures_total`）；一轮保活逐条探测，每条只在自己被探测时离开连接池 |
 | `dfkv_rdma_client_rail_conns_total{dev}` / `dfkv_rdma_client_rail_selections_total{dev}` | counter | 每 rail 新连接 / 准入分布 |
 | `dfkv_rdma_client_rail_put_ops_total{dev}` / `dfkv_rdma_client_rail_put_bytes_total{dev}` | counter | 每条本地rail成功完成的逻辑PUT对象数/有效payload字节；跨多个WR的SG对象只计一个逻辑op |
 | `dfkv_rdma_client_rail_get_ops_total{dev}` / `dfkv_rdma_client_rail_get_bytes_total{dev}` | counter | 每条本地rail成功完成的逻辑GET对象数/实际返回payload字节；用于验证rank-local affinity是否真正承载业务流量 |
