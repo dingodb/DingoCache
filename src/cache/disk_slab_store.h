@@ -17,6 +17,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cerrno>
 #include <condition_variable>
 #include <cstdint>
@@ -580,6 +581,10 @@ class DiskSlabStore : public StoreEngine {
   // a donor extent's residents + wipes its table region under the lock, so it
   // is deliberately slow-drip (converges in seconds at the 50 ms tick).
   static constexpr size_t kGrowExtentsPerTick = 2;
+  // Wheel entries one retention expiry looks at per hold of the allocator's
+  // lock (about a hundred microseconds of work).
+  static constexpr size_t kRetainExpireBatch = 1024;
+  static constexpr std::chrono::microseconds kRetainExpirePause{50};
   std::atomic<uint64_t> reclaimed_{0};
   std::atomic<uint64_t> rebalanced_{0};
   std::atomic<uint64_t> batched_writes_{0};

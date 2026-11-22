@@ -127,7 +127,7 @@ class SlabAllocatorTestPeer {
             std::min<uint64_t>(entry.retain_until, cap));
         meta.retain_persisted_until = meta.retain_until;
         a->ProtectLocked(meta_index);
-        a->PushWheelLocked(meta.key, meta.retain_until);
+        a->PushWheelLocked(meta_index);
       } else if (a->retain_.enabled) {
         meta.retain_ttl_s = std::min(entry.retain_ttl_s, a->retain_.max_ttl_s);
       }
@@ -203,7 +203,8 @@ class SlabAllocatorTestPeer {
         << " r=" << m.refs << " c=" << m.class_prev << ',' << m.class_next
         << " e=" << m.extent_prev << ',' << m.extent_next << " ret="
         << m.retain_until << ',' << m.retain_ttl_s << ','
-        << m.retain_persisted_until << ' ' << m.referenced << m.remove_pending
+        << m.retain_persisted_until << ',' << m.retain_wheel_until << ' '
+        << m.referenced << m.remove_pending
         << m.live;
       if (m.live) {
         const uint32_t* found = a.index_.Find(m.key);
@@ -2559,5 +2560,203 @@ TEST(SlabAllocatorExtentMoves, AnUnusedClassStillGivesItsExtents) {
       else
         EXPECT_LT(s.Extents(s.A), SlabAllocator::kStripeWays);
     }
+  }
+}
+
+// ---- The retention wheel: one entry per protected resident, bounded expiry --
+namespace {
+// `count` residents of 4 KiB in an allocator large enough for them, with a
+// retention budget that covers them all.
+struct RetainedStore {
+  explicit RetainedStore(uint64_t count, uint32_t max_ttl_s = 3600)
+      : a(Opts(64 << 10, static_cast<uint32_t>(count / 16 + 9))) {
+    a.ConfigureRetention(RetainOpts(count * 4096 * 2, max_ttl_s), kT0);
+    for (uint64_t i = 0; i < count; ++i) {
+      SlotRef ref;
+      std::vector<BlockKey> evicted;
+      EXPECT_TRUE(a.Put(BlockKey{i, 9, 0}, 4096, &ref, &evicted));
+    }
+  }
+  SlabAllocator a;
+};
+}  // namespace
+
+// A resident that is renewed over and over has one entry on the wheel, not
+// one per renewal. Before, every renewal that moved the deadline (one per
+// second at most) left an entry behind until its bucket expired.
+TEST(SlabAllocatorRetainWheel, RenewalsDoNotPileUpEntries) {
+  constexpr uint64_t kCount = 500;
+  RetainedStore store(kCount, 600);
+  for (uint64_t i = 0; i < kCount; ++i)
+    ASSERT_EQ(store.a.Retain(BlockKey{i, 9, 0}, 600, RetainMode::kSet, kT0).code,
+              RetainCode::kProtectedNew);
+  EXPECT_EQ(store.a.GetRetentionStats().wheel_entries, kCount);
+  // Ten minutes of one renewal per second and resident, with the expiry
+  // running every second as the store's reclaim tick does.
+  uint64_t most = 0;
+  for (uint32_t second = 1; second <= 600; ++second) {
+    for (uint64_t i = 0; i < kCount; ++i)
+      store.a.Retain(BlockKey{i, 9, 0}, 0, RetainMode::kRefresh, kT0 + second);
+    EXPECT_EQ(store.a.ExpireRetention(kT0 + second), 0u) << "second " << second;
+    most = std::max(most, store.a.GetRetentionStats().wheel_entries);
+  }
+  std::printf("RETAIN_WHEEL %llu residents renewed once a second for 600 s: "
+              "at most %llu wheel entries\n",
+              static_cast<unsigned long long>(kCount),
+              static_cast<unsigned long long>(most));
+  EXPECT_EQ(most, kCount);
+  EXPECT_EQ(store.a.GetRetentionStats().protected_slots, kCount);
+  // Renewals stop: everything expires once its last deadline has passed, and
+  // the wheel is empty.
+  EXPECT_EQ(store.a.ExpireRetention(kT0 + 600 + 600 + 20), kCount);
+  EXPECT_EQ(store.a.GetRetentionStats().protected_slots, 0u);
+  EXPECT_EQ(store.a.GetRetentionStats().wheel_entries, 0u);
+}
+
+// The deadline that counts is the latest one. A resident renewed after its
+// entry was pushed stays protected when the bucket of its first deadline is
+// drained, and is released when the bucket of its last one is: never early,
+// never kept past it.
+TEST(SlabAllocatorRetainWheel, ARenewedResidentIsHeldUntilItsLastDeadline) {
+  RetainedStore store(4, 600);
+  const BlockKey renewed{0, 9, 0}, plain{1, 9, 0};
+  ASSERT_EQ(store.a.Retain(renewed, 60, RetainMode::kSet, kT0).code,
+            RetainCode::kProtectedNew);
+  ASSERT_EQ(store.a.Retain(plain, 60, RetainMode::kSet, kT0).code,
+            RetainCode::kProtectedNew);
+  // Renewed at +50: the deadline moves from +60 to +110.
+  ASSERT_EQ(store.a.Retain(renewed, 0, RetainMode::kRefresh, kT0 + 50).code,
+            RetainCode::kRefreshed);
+  // The bucket of +60 is due at +80: `plain` goes, `renewed` stays.
+  EXPECT_EQ(store.a.ExpireRetention(kT0 + 80), 1u);
+  EXPECT_EQ(store.a.GetRetentionStats().protected_slots, 1u);
+  EXPECT_EQ(store.a.GetRetentionStats().wheel_entries, 1u);
+  EXPECT_EQ(store.a.ExpireRetention(kT0 + 109), 0u);
+  EXPECT_EQ(store.a.ExpireRetention(kT0 + 119), 0u) << "its bucket is not past";
+  EXPECT_EQ(store.a.ExpireRetention(kT0 + 130), 1u);
+  EXPECT_EQ(store.a.GetRetentionStats().protected_slots, 0u);
+  EXPECT_EQ(store.a.GetRetentionStats().wheel_entries, 0u);
+}
+
+// The entry of a protection that is gone (the key was removed, then put and
+// protected again) neither releases the new protection early nor stays on
+// the wheel: it is dropped when its bucket comes up.
+TEST(SlabAllocatorRetainWheel, AnEntryOfARemovedResidentIsDroppedAndHarmless) {
+  RetainedStore store(4, 600);
+  const BlockKey key{0, 9, 0};
+  ASSERT_EQ(store.a.Retain(key, 60, RetainMode::kSet, kT0).code,
+            RetainCode::kProtectedNew);
+  ASSERT_EQ(store.a.Remove(key), SlabAllocator::RemoveResult::kRemoved);
+  EXPECT_EQ(store.a.GetRetentionStats().protected_slots, 0u);
+  EXPECT_EQ(store.a.GetRetentionStats().wheel_entries, 1u) << "left behind";
+  SlotRef ref;
+  std::vector<BlockKey> evicted;
+  ASSERT_TRUE(store.a.Put(key, 4096, &ref, &evicted));
+  ASSERT_EQ(store.a.Retain(key, 300, RetainMode::kSet, kT0 + 10).code,
+            RetainCode::kProtectedNew);
+  EXPECT_EQ(store.a.GetRetentionStats().wheel_entries, 2u);
+  // The old entry's bucket (+60) is due: nothing is released, it is gone.
+  EXPECT_EQ(store.a.ExpireRetention(kT0 + 80), 0u);
+  EXPECT_EQ(store.a.GetRetentionStats().protected_slots, 1u);
+  EXPECT_EQ(store.a.GetRetentionStats().wheel_entries, 1u);
+  // The new protection ends at +310.
+  EXPECT_EQ(store.a.ExpireRetention(kT0 + 300), 0u);
+  EXPECT_EQ(store.a.ExpireRetention(kT0 + 330), 1u);
+  EXPECT_EQ(store.a.GetRetentionStats().wheel_entries, 0u);
+}
+
+// Many residents protected with one deadline expire in one bucket. An expiry
+// looks at no more than it is told to under one hold of the lock, says that
+// it has more to do, and continues where it stopped; the sum is the same as
+// in one go, and operations get the lock in between.
+TEST(SlabAllocatorRetainWheel, ExpiryWorksInBoundedBatches) {
+  constexpr uint64_t kCount = 20000;
+  constexpr size_t kBatch = 1024;
+  RetainedStore store(kCount, 600);
+  for (uint64_t i = 0; i < kCount; ++i)
+    ASSERT_EQ(store.a.Retain(BlockKey{i, 9, 0}, 60, RetainMode::kSet, kT0).code,
+              RetainCode::kProtectedNew);
+  SlotRef ref;
+  bool more = true;
+  size_t calls = 0, released = 0;
+  while (more) {
+    const size_t got = store.a.ExpireRetention(kT0 + 80, kBatch, &more);
+    EXPECT_LE(got, kBatch);
+    released += got;
+    ++calls;
+    // Between two batches the store is usable and consistent: a read and an
+    // admission go through, and what is still protected is still counted.
+    ASSERT_TRUE(store.a.Get(BlockKey{0, 9, 0}, &ref));
+    EXPECT_EQ(store.a.GetRetentionStats().protected_slots, kCount - released);
+    ASSERT_LT(calls, 1000u);
+  }
+  EXPECT_EQ(released, kCount);
+  EXPECT_GE(calls, kCount / kBatch);
+  EXPECT_EQ(store.a.GetRetentionStats().protected_slots, 0u);
+  EXPECT_EQ(store.a.GetRetentionStats().wheel_entries, 0u);
+  EXPECT_EQ(store.a.GetRetentionStats().expired, kCount);
+  // Nothing is left to do, and without a limit it is one call as before.
+  EXPECT_EQ(store.a.ExpireRetention(kT0 + 80, kBatch, &more), 0u);
+  EXPECT_FALSE(more);
+}
+
+// Not a correctness test: how long the lock is held to expire one bucket,
+// in one go and in batches, and how long a reader waits meanwhile. Set
+// DFKV_RETAIN_WHEEL_BENCH_OBJECTS (for example 1000000) to run it.
+TEST(SlabAllocatorRetainWheel, ExpiryLockHoldBench) {
+  const char* requested = std::getenv("DFKV_RETAIN_WHEEL_BENCH_OBJECTS");
+  if (requested == nullptr || *requested == '\0')
+    GTEST_SKIP() << "set DFKV_RETAIN_WHEEL_BENCH_OBJECTS to run";
+  const uint64_t count = std::strtoull(requested, nullptr, 10);
+  ASSERT_GT(count, 0u);
+  for (const size_t batch : {size_t{0}, size_t{1024}}) {
+    RetainedStore store(count, 600);
+    for (uint64_t i = 0; i < count; ++i)
+      store.a.Retain(BlockKey{i, 9, 0}, 60, RetainMode::kSet, kT0);
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> worst_ns{0}, reads{0};
+    std::thread reader([&] {
+      std::mt19937_64 rng(3);
+      while (!stop.load(std::memory_order_relaxed)) {
+        SlotRef ref;
+        const auto t0 = std::chrono::steady_clock::now();
+        store.a.Get(BlockKey{rng() % count, 9, 0}, &ref);
+        const uint64_t ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count());
+        if (ns > worst_ns.load(std::memory_order_relaxed)) worst_ns = ns;
+        reads.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    worst_ns = 0;
+    const auto started = std::chrono::steady_clock::now();
+    double longest_hold_ms = 0;
+    size_t released = 0;
+    bool more = true;
+    while (more) {
+      const auto t0 = std::chrono::steady_clock::now();
+      released += store.a.ExpireRetention(kT0 + 80, batch ? batch : SIZE_MAX,
+                                          &more);
+      longest_hold_ms = std::max(
+          longest_hold_ms, std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - t0)
+                               .count());
+      // As the store does between batches; see DiskSlabStore::ReclaimTick.
+      if (more) std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+    const double total_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - started)
+                                .count();
+    stop = true;
+    reader.join();
+    ASSERT_EQ(released, count);
+    std::printf("RETAIN_WHEEL_BENCH %llu residents in one bucket, %s: expiry "
+                "%.1f ms in all, longest hold %.3f ms, a reader waited at "
+                "most %.3f ms\n",
+                static_cast<unsigned long long>(count),
+                batch ? "batches of 1024" : "one hold", total_ms,
+                longest_hold_ms, worst_ns.load() / 1e6);
   }
 }

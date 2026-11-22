@@ -652,7 +652,8 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_extents_pinned_by_retention", "gauge",
            "Extents holding at least one protected resident", rs.extents_pinned);
     metric("dfkv_retain_wheel_entries", "gauge",
-           "Pending expiry-wheel entries (includes superseded ones)",
+           "Expiry-wheel entries: one per protected resident, plus those of "
+           "protected residents that were removed, until their bucket expires",
            rs.wheel_entries);
   }
   metric("dfkv_remove_ok_total", "counter", "Remove ops that dropped a block", m_remove_ok());
