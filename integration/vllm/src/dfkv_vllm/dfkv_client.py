@@ -337,6 +337,7 @@ class DfkvDeviceClient:
         model: str = "",
         cache_role: str = "",
         require_rdma: bool = True,
+        tp_rank: Optional[int] = None,
     ):
         if not key_namespace:
             raise ValueError("DfkvDeviceClient requires a non-empty key namespace")
@@ -346,6 +347,10 @@ class DfkvDeviceClient:
                 "'members' (static list)"
             )
         self._close_lock = threading.Lock()
+        # The TP rank labels metrics and names this process's access log:
+        # given by the worker; the environment is only a fallback (vLLM sets
+        # none of those variables, and every rank used to be rank 0).
+        rank = _env_rank() if tp_rank is None else int(tp_rank)
         self._telemetry_acquired = False
         self._hot_config_acquired = False
         self._lib = load_lib(lib_path)
@@ -402,14 +407,14 @@ class DfkvDeviceClient:
         try:
             metrics_acquired = True
             _push_metrics.configure(
-                {}, connector_type=_tcfg.TYPE_VLLM, tp_rank=_env_rank(),
+                {}, connector_type=_tcfg.TYPE_VLLM, tp_rank=rank,
                 model=model, cache_role=cache_role,
                 version=_tcfg.dist_version("dfkv-vllm"),
                 native_version=native_version(self._lib))
             # Spans for slow / sampled / failed ops pushed over OTLP /v1/traces.
             tracing_acquired = True
             _push_tracing.configure(
-                {}, connector_type=_tcfg.TYPE_VLLM, tp_rank=_env_rank(),
+                {}, connector_type=_tcfg.TYPE_VLLM, tp_rank=rank,
                 model=model, cache_role=cache_role,
                 version=_tcfg.dist_version("dfkv-vllm"),
                 native_version=native_version(self._lib))
@@ -423,8 +428,8 @@ class DfkvDeviceClient:
         # Access log: parse the launch baseline (env-driven), then let a control
         # file toggle it at runtime without restarting vLLM (opt-in via
         # DFKV_HOT_CONFIG). See docs/access_log.md -> 运行时热开关.
-        _alog.configure({}, tp_rank=_env_rank())
-        _acquire_hot_config(_env_rank())
+        _alog.configure({}, tp_rank=rank)
+        _acquire_hot_config(rank)
         self._hot_config_acquired = True
         # Mirror native operation, peer-health, MDS, RDMA rail, MR, and timeout
         # state onto Prometheus. The sleeping poller stays off the request path;
@@ -436,7 +441,7 @@ class DfkvDeviceClient:
             poll_s = 15.0
         if poll_s > 0:
             self._stats_poller = ClientStatsPoller(
-                lambda: read_snapshot(self._lib, self._h), _env_rank(),
+                lambda: read_snapshot(self._lib, self._h), rank,
                 interval_s=poll_s)
             self._stats_poller.start()
         self._peer_lat_poller = None

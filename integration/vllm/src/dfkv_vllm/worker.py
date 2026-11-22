@@ -820,14 +820,17 @@ class KVTransferThread(threading.Thread):
             num_failed_keys=num_failed_keys,
         )
 
-    def _note_retain_codes(self, operation: str, codes: list) -> None:
-        """Account one retention batch; keys left unprotected count as failed
-        (DENIED, MISS after a put, unsupported, or transport error)."""
+    def _note_retain_codes(
+        self, operation: str, codes: list, start_time: float
+    ) -> None:
+        """Account one retention batch started at ``start_time``; keys left
+        unprotected count as failed (DENIED, MISS after a put, unsupported,
+        or transport error)."""
         unprotected = sum(
             1 for c in codes if c not in dfkv_cabi.RETAIN_PROTECTED_CODES)
         self._record_operation(
             operation,
-            time.perf_counter(),
+            start_time,
             len(codes),
             num_logical_keys=len(codes),
             status="partial_failure" if unprotected else "ok",
@@ -1308,7 +1311,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         1 if c in dfkv_cabi.RETAIN_HIT_CODES else 0
                         for c in codes
                     ]
-                    self._note_retain_codes("save_retain_set", codes)
+                    self._note_retain_codes(
+                        "save_retain_set", codes, save_exists_start)
                 else:
                     exists_states = self.client.batch_exist(keys)
                 if len(exists_states) != len(keys):
@@ -1454,11 +1458,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     stored = [k for k, rc in zip(keys, res, strict=True)
                               if rc == 0]
                     if stored:
+                        retain_start = time.perf_counter()
                         self._note_retain_codes(
                             "save_retain_set",
                             self.client.batch_retain(
                                 stored, retain_ttl_s,
-                                dfkv_cabi.DFKV_RETAIN_SET))
+                                dfkv_cabi.DFKV_RETAIN_SET),
+                            retain_start)
             except Exception as e:
                 self._record_operation(
                     "save_put",
@@ -2504,6 +2510,7 @@ class DfkvStoreWorker:
             model=model_identity,
             cache_role=str(self.kv_role),
             require_rdma=_tcfg.truthy(extra.get("require_rdma", True)),
+            tp_rank=self.tp_rank,
         )
         # Converged replicated layouts enable native same-host GPU rendezvous:
         # one TP rank performs each remote GET and CUDA IPC publishes identical

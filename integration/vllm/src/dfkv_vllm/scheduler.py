@@ -21,6 +21,7 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
 from ._determinism import ensure_deterministic_block_hashing
+from ._telemetry import config as _tcfg
 from .coordinator import partial_hash_hits_enabled
 from .data import (
     LoadSpec,
@@ -97,7 +98,9 @@ class DfkvStoreScheduler:
         if not isinstance(self.load_async, bool):
             raise ValueError("dfkv connector: load_async must be a boolean")
         self.request_level_loads = requires_request_level_loads(kv_cache_config)
-        self.lookup_async = extra_config.get("lookup_async", False)
+        # A string such as "false" is truthy as a value: parse it as the
+        # other boolean options are.
+        self.lookup_async = _tcfg.truthy(extra_config.get("lookup_async", False))
         self.client = LookupKeyClient(vllm_config)
         self._closed = False
 

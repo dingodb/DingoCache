@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- vLLM connector, small fixes. The client took its TP rank from the
+  environment (`DFKV_TP_RANK` / `LOCAL_RANK` / `RANK`, none of which vLLM
+  sets): every rank labelled its metrics rank 0 and wrote the same
+  access-log file; the worker now passes its TP rank. The retention SET of a
+  SAVE is timed from its start (`save_retain_set` durations were always 0).
+  `lookup_async` is parsed as a boolean (the string "false" turned it on).
+  The hot-config watcher (all three copies) kept its stop event in
+  `threading.Thread._stop`, which Python up to 3.12 calls from `join()`;
+  it is renamed. Corrected docs: `require_rdma=false` does allow the TCP
+  transport (the vLLM README said there was no fallback), and the C header
+  no longer says SG vectors wider than `dfkv_max_sg_segs` fail (they are
+  posted as several work requests).
 
 - Server, RDMA: with the default inline threshold, a PUT over RDMA of an
   object larger than the server's `--max-msg` (default 32 MiB) is answered
@@ -163,7 +175,6 @@
   (the connector's existing allocation-failure path). In a stand-in
   benchmark with an arena that frees after one second, the event loop was
   stalled 975 ms before and 12 ms after.
-
 
 - Server, RAM tier: a PUT of a key whose RAM copy is still there after the
   disk evicted the key now reaches the disk. A value written from RAM stays
@@ -418,7 +429,6 @@
   attention are now fenced too (correct, a little slower).
 ## 2.41.0 — 2026-11-23
 
-
 - Server, RAM tier: a REMOVE is no longer undone by a read of the key that
   was in flight. A whole-value read of a key that is only on disk installs
   a copy in RAM when it is done. If a REMOVE of the key returned while the
@@ -651,7 +661,6 @@
   fences off; the read still runs on the recorded device. Without CUDA
   nothing changes.
 ## 2.40.0 — 2026-11-23
-
 
 - vLLM connector, hybrid models (recurrent state or sliding window next to
   full attention): a step that saves no longer waits on the model thread
@@ -2613,7 +2622,6 @@
   driver accepts it (VMM/cuMemMap pools reject it with a one-shot warning).
   Observed live as exact-hit loads whose generation degraded into empty
   reasoning until reordered. `DFKV_GPU_LOAD_FENCE=0` disables the fence.
-
 
 ## 2.25.0 — 2026-09-03
 
