@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Docs: `docs/ARCHITECTURE.md` no longer says that a PUT through the RAM
+  tier waits for its disk flush. In the default write-back mode it returns
+  once the value is in RAM (RAM-ACK); `DFKV_PUT_ACK_MODE=disk` or a zero
+  watermark makes it wait. At the dirty watermark new keys are refused
+  with `kCacheFull`, not made to wait, as the configuration table said.
 - Server, slab store: the periodic sync of the slot table (`slots.tbl`,
   every 100 ms) now keeps that cadence by default only with
   `DFKV_SLAB_WARM_RESTART=boot`, the one mode whose recovery depends on it.
