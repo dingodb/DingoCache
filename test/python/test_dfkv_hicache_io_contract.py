@@ -11,6 +11,7 @@ import sys
 import threading
 import types
 import unittest
+import unittest.mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -106,6 +107,46 @@ class _MlaDevicePool:
         self.kv_buffer = [_Tensor(0x100000 * (i + 1)) for i in range(layers)]
 
 
+class _FakeTorch:
+    """torch as the GPU fence uses it: a per-thread current CUDA device
+    (0 in a thread that never set one, as in CUDA), torch.cuda.device()
+    and a synchronize that records which device it ordered."""
+
+    def __init__(self, available=True):
+        fake = self
+        self.local = threading.local()
+        self.synchronized = []
+
+        class _Device:
+            def __init__(self, index):
+                if not available:
+                    raise RuntimeError("Torch not compiled with CUDA enabled")
+                self.index = index
+
+            def __enter__(self):
+                self.saved = fake.current()
+                fake.local.device = self.index
+
+            def __exit__(self, *exc):
+                fake.local.device = self.saved
+
+        self.cuda = types.SimpleNamespace(
+            is_available=lambda: available,
+            current_device=self.current,
+            device=_Device,
+            synchronize=lambda device=None: self.synchronized.append(
+                self.current() if device is None else device))
+
+    def current(self):
+        return getattr(self.local, "device", 0)
+
+
+class _GpuTensor(_Tensor):
+    def __init__(self, ptr, index, device_type="cuda"):
+        super().__init__(ptr)
+        self.device = types.SimpleNamespace(type=device_type, index=index)
+
+
 class _Store:
     """The keys that exist in the cache, as the existence probe sees them."""
 
@@ -187,6 +228,73 @@ class DeviceDirectGroupsBeforeTheFirstTransfer(unittest.TestCase):
             st, _store = self._registered(pool)
         self.assertEqual(st._stored_keys("kv", "page"),
                          [st._sg_group_key(sk, 0) for sk in st._keys("page")])
+
+
+class GpuLoadFenceDevice(unittest.TestCase):
+    """The fence after a device-direct read orders the GPU the bytes landed
+    on, not the calling thread's current device. SGLang's storage threads
+    never set a device, so on a rank whose GPU is not 0 the fence used to
+    synchronize GPU 0."""
+
+    def _read_from_storage_thread(self, pool, register_on=0, fence="1",
+                                  available=True):
+        torch = _FakeTorch(available)
+        seen = {}
+        st = _plugin(_registered_regions=set())
+        st.register_memory = lambda base, size: True
+
+        def native_get(_h, _k, _l, _p, _c, _n, n, out_hit, out_len):
+            seen["native"] = torch.current()   # the native dedup fence's device
+            for i in range(n):
+                out_hit[i] = 1
+                out_len[i] = 96
+            return 0
+
+        st._lib.dfkv_batch_get_auto_sg = native_get
+        with unittest.mock.patch.dict(sys.modules, {"torch": torch}), \
+                unittest.mock.patch.dict(os.environ,
+                                         {"DFKV_GPU_LOAD_FENCE": fence}):
+            torch.local.device = register_on   # the rank's own thread
+            st.register_mem_pool_device(pool)
+            result = {}
+            reader = threading.Thread(target=lambda: result.update(
+                got=st.batch_get_v1_device(["p"], [0, 1])))
+            reader.start()
+            reader.join(5)
+        self.assertIn("got", result, "the read raised")
+        return result["got"], torch.synchronized, seen["native"]
+
+    def test_fence_orders_the_destination_gpu(self):
+        pool = _MlaDevicePool(layers=6)
+        pool.kv_buffer = [_GpuTensor(0x100000 * (i + 1), 3) for i in range(6)]
+        got, synchronized, native = self._read_from_storage_thread(pool)
+        self.assertEqual(got, [True])
+        self.assertEqual(synchronized, [3])
+        self.assertEqual(native, 3, "the native read runs on that GPU too")
+
+    def test_device_scope_does_not_depend_on_the_fence(self):
+        # DFKV_GPU_LOAD_FENCE=0 turns the synchronizes off, not the device
+        # the read runs on (the native dedup fence has its own switch).
+        pool = _MlaDevicePool(layers=6)
+        pool.kv_buffer = [_GpuTensor(0x100000 * (i + 1), 3) for i in range(6)]
+        got, synchronized, native = self._read_from_storage_thread(
+            pool, fence="0")
+        self.assertEqual((got, synchronized, native), ([True], [], 3))
+
+    def test_non_cuda_buffers_do_not_enter_a_cuda_device(self):
+        # A device-direct pool on another accelerator: its device index is
+        # not a CUDA device, and without CUDA no CUDA scope is entered.
+        pool = _MlaDevicePool(layers=6)
+        pool.kv_buffer = [_GpuTensor(0x100000 * (i + 1), 0, "npu")
+                          for i in range(6)]
+        got, synchronized, native = self._read_from_storage_thread(
+            pool, available=False)
+        self.assertEqual((got, synchronized, native), ([True], [], 0))
+
+    def test_without_device_on_the_buffers_the_registering_thread_says(self):
+        got, synchronized, native = self._read_from_storage_thread(
+            _MlaDevicePool(layers=6), register_on=5)
+        self.assertEqual((got, synchronized, native), ([True], [5], 5))
 
 
 class DeviceDirectState(unittest.TestCase):

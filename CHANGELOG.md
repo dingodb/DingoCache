@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- SGLang HiCache connector, device-direct (L2-bypass): the ordering fence
+  after a read orders the GPU the bytes landed on. It synchronized the
+  calling thread's current CUDA device, which is per thread; SGLang's
+  storage threads do not set it, and a thread that never did is on device 0.
+  On a rank whose GPU is not 0 the fence therefore waited for GPU 0 and not
+  for the GPUDirect writes, which can leave kernels reading KV that has not
+  arrived (all pages hit, output degraded); the native GPU dedup's fence
+  before it publishes had the same assumption. The CUDA device is now
+  recorded when the device pool is registered (from the pool's buffers if
+  they are CUDA tensors, else the registering thread's current device), each
+  device-direct read runs the native call with that device current, and the
+  fence synchronizes only it. `DFKV_GPU_LOAD_FENCE=0` still turns both
+  fences off; the read still runs on the recorded device. Without CUDA
+  nothing changes.
 ## 2.40.0 — 2026-11-23
 
 
