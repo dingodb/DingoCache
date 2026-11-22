@@ -16,6 +16,7 @@
 #include <thread>
 
 #include "cache/disk_slab_store.h"
+#include "cache/log_store.h"
 #include "cache/store_dir_class.h"
 #include "common/config_dump.h"
 #include "utils/log.h"
@@ -231,10 +232,6 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
              "nothing was changed");
         return;
       }
-      if (disk_engine[i] == "log") {
-        fail(dir + ": the log-structured engine is not built yet");
-        return;
-      }
     }
   }
   engine_ = disk_engine.empty() ? engine : disk_engine.front();
@@ -257,7 +254,10 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
       slab_direct = true;
     } else if (std::strcmp(mode, "buffered") == 0) {
       slab_direct = false;
-    } else if (use_slab) {
+    } else if (use_slab ||
+               std::find(disk_engine.begin(), disk_engine.end(), "log") !=
+                   disk_engine.end()) {
+      // The log engine takes the same setting.
       fail("DFKV_SLAB_WRITE must be 'direct' or 'buffered'");
       return;
     }
@@ -374,6 +374,16 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
     try {
       if (opt.engine_factory) {
         opened[i].store = opt.engine_factory(dir, disk_capacity);
+      } else if (disk_engine[i] == "log") {
+        // Experimental (DFKV_LSE_EXPERIMENTAL=1, checked above). Writes are
+        // direct or buffered as DFKV_SLAB_WRITE says, as for slab.
+        LogStore::Options lo;
+        lo.dir = dir;
+        lo.capacity_bytes = disk_capacity;
+        lo.direct_writes = slab_direct;
+        lo.defer_activation = true;
+        LogStore::ApplyEnvironment(&lo);
+        opened[i].store = std::make_unique<LogStore>(lo);
       } else if (disk_engine[i] == "slab") {
         DiskSlabStore::Options so;
         so.dir = dir;

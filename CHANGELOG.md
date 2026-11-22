@@ -138,6 +138,23 @@
   whose disks run different engines labels them correctly; on such a node
   they are emitted for the slab disks only, retention metrics are the slab
   disks', and the registered self-description keeps the slab write mode.
+
+- Server, storage: the log-structured engine's core, selectable only with
+  `DFKV_LSE_EXPERIMENTAL=1` (`DFKV_STORE_ENGINE=log`, or `auto` on a
+  directory that already holds a log store). Stores carry a development-
+  format bit that later builds refuse until the format is frozen. This
+  stage writes checksummed records to one open segment, keeps the index in
+  memory and rebuilds it by walking every segment, journals REMOVE as
+  durable kills (a REMOVE returns once every earlier kill is durable), and
+  answers `kCacheFull` when full (no eviction yet). The open segment is
+  synced every `DFKV_LSE_SYNC_MS` (default 1000), which bounds what a power
+  loss can take of acknowledged writes. Whole-value reads through `Range`,
+  `RangeInto` and `RangeDirect` are checked against the stored checksum;
+  prepared reads (`RangeDirectPrep`: RDMA pulls and the RAM tier's direct
+  promotion) are not checked yet, so the engine is not for real data. The
+  slab engine refuses a log store's directory without changing it. Nothing
+  changes for any configuration that does not select the engine.
+
 ## 2.42.0 — 2026-11-23
 
 - Client, RDMA: the rail name a scatter-gather batch read reports (the
