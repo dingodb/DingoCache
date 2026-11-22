@@ -137,6 +137,12 @@ class RamTier {
     // under its RAM shard lock; must be metadata-only and must not reenter RAM.
     // An existing disk value is authoritative after RAM eviction.
     std::function<bool(const BlockKey&)> is_persisted;
+    // Asked while the arena is being faulted in (once per 2 MiB and thread):
+    // true gives the start up. The constructor then returns without the
+    // arena ready and without threads; ok() is false and start_cancelled()
+    // true. Faulting in a large arena on small pages takes tens of seconds,
+    // which a stop request during startup should not have to wait for.
+    std::function<bool()> cancel_start;
   };
 
   // Persists a resident value to disk. `data` is 4 KiB aligned and `cap` is
@@ -221,6 +227,8 @@ class RamTier {
   RamTier& operator=(const RamTier&) = delete;
 
   bool ok() const { return ready_; }
+  // The constructor gave up because Options::cancel_start said so.
+  bool start_cancelled() const { return start_cancelled_; }
   bool healthy() const { return healthy_.load(std::memory_order_acquire); }
 
   // Asynchronous admission used by standalone tier tests. true means the key
@@ -457,6 +465,7 @@ class RamTier {
   bool arena_locked_ = false;
   bool arena_hugepages_requested_ = false;
   uint64_t arena_hugepage_bytes_ = 0;
+  bool start_cancelled_ = false;
   uint64_t extent_bytes_ = 0;   // allocator class/extent upper bound
   std::vector<std::unique_ptr<Shard>> shards_;
   std::vector<std::thread> flushers_;

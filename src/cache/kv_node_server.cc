@@ -111,23 +111,37 @@ KvNodeServer::KvNodeServer(const std::string& cache_dir,
     : KvNodeServer(DiskCacheGroup::Options{{cache_dir}, capacity_bytes}) {}
 
 KvNodeServer::KvNodeServer(const std::vector<std::string>& cache_dirs,
-                           uint64_t capacity_bytes)
-    : KvNodeServer(DiskCacheGroup::Options{cache_dirs, capacity_bytes}) {}
+                           uint64_t capacity_bytes,
+                           const std::atomic<bool>* cancel_start)
+    : KvNodeServer(DiskCacheGroup::Options{cache_dirs, capacity_bytes},
+                   cancel_start) {}
 
 // The two slow parts of a start are independent of each other: faulting in
 // the RAM tier arena and opening the disks (one thread per disk). They run
 // side by side. The members are initialized in this order: the plan (the
 // environment, read once), the tier under construction on its own thread,
 // then group_, whose constructor returns when every disk is open.
-KvNodeServer::KvNodeServer(DiskCacheGroup::Options options)
-    : ram_plan_(PlanRamTier(options.cache_dirs.size())),
+KvNodeServer::KvNodeServer(DiskCacheGroup::Options options,
+                           const std::atomic<bool>* cancel_start)
+    : cancel_start_(cancel_start),
+      ram_plan_(PlanRamTier(options.cache_dirs.size())),
       ram_starting_(StartRamTier()),
       group_(std::move(options)) {
   shutdown_drain_timeout_s_ = ResolveShutdownDrainTimeoutSeconds();
+  // With a disk that failed to open the start is over: the arena need not be
+  // faulted in to the end just to be dropped.
+  if (!group_.Healthy())
+    ram_start_abandoned_.store(true, std::memory_order_relaxed);
   // Always waited for, whatever the disks did: the tier's threads must be
   // gone before this object can be.
   std::unique_ptr<RamTier> tier;
   if (ram_starting_.valid()) tier = ram_starting_.get();
+  // A cancelled start keeps what the disks opened, for Shutdown() to close
+  // clean, and nothing else. Read once, here: what the tier saw of the flag
+  // while it was being built does not matter after this.
+  start_cancelled_ = cancel_start_ != nullptr &&
+                     cancel_start_->load(std::memory_order_relaxed);
+  if (start_cancelled_) return;
   // A disk that failed to open ends the start as before, without a RAM tier;
   // the one built meanwhile holds nothing and is dropped here.
   if (!group_.Healthy()) return;
@@ -258,6 +272,7 @@ std::future<std::unique_ptr<RamTier>> KvNodeServer::StartRamTier() {
   o.is_persisted = [this](const BlockKey& key) {
     return group_.IsCached(key);
   };
+  o.cancel_start = [this] { return RamStartUnwanted(); };
   return std::async(std::launch::async, [this, o] {
     // Flusher persists a RAM slot to the disk group. CacheDirect (not Cache):
     // the arena slot is 4 KiB-aligned with cap slack, so a direct-mode slab
@@ -441,7 +456,15 @@ bool KvNodeServer::Shutdown(std::chrono::steady_clock::time_point started) {
   DFKV_LOG_INFO("shutdown: " + std::to_string(clean) + " of " +
                 std::to_string(report.size()) + " disks clean in " +
                 Seconds(stage));
-  shutdown_clean_ = clean == report.size();
+  // The report covers the disks the group has. One whose open threw is not
+  // among them, and a group that lost a disk that way is not "all clean"
+  // however the others closed. (A disk that failed later, while serving, is
+  // in the report and has said so itself.)
+  const bool all_closed_clean = clean == report.size();
+  const bool disk_missing = all_closed_clean && !group_.Healthy();
+  if (disk_missing)
+    DFKV_LOG_WARN("shutdown: a disk that failed to open is not among them");
+  shutdown_clean_ = all_closed_clean && !disk_missing;
   return shutdown_clean_;
 }
 

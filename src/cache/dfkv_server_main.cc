@@ -51,8 +51,56 @@ using dfkv::Status;
 #define DFKV_EXIT_RUNS_DESTRUCTORS 0
 #endif
 
-static volatile sig_atomic_t g_stop = 0;
-static void OnSig(int) { g_stop = 1; }
+// Set by SIGTERM/SIGINT. Read by the main loop, between the stages of a
+// start, and by the RAM tier while it faults its arena in (other threads,
+// hence atomic; lock-free, so storing to it in a signal handler is allowed).
+static std::atomic<bool> g_stop{false};
+static_assert(std::atomic<bool>::is_always_lock_free,
+              "the stop flag is written from a signal handler");
+static void OnSig(int) { g_stop.store(true, std::memory_order_relaxed); }
+
+// A stop signal arrived before the server was up: the start is not carried
+// to its end only to be undone. Whatever accepts requests is stopped, the
+// disks that were opened are synced and marked clean (the next start is a
+// clean one), and the node is never registered with the MDS -- every call
+// site is ahead of the registration. Returns the exit status: 0 when every
+// configured disk opened and is clean, as for any stop that was asked for
+// and carried out; 1 otherwise.
+static int EndCancelledStart(KvNodeServer& srv, const char* stage,
+                             std::chrono::steady_clock::time_point started,
+                             const std::function<void()>& stop_frontends) {
+  auto seconds = [started] {
+    char text[32];
+    std::snprintf(text, sizeof(text), "%.2f s",
+                  std::chrono::duration<double>(
+                      std::chrono::steady_clock::now() - started).count());
+    return std::string(text);
+  };
+  DFKV_LOG_INFO(std::string("dfkv_server start cancelled by a stop signal (") +
+                stage + ", " + seconds() + " into the start); closing the disks");
+  if (stop_frontends) stop_frontends();
+  // False as well when a disk failed to open: a start in which that happened
+  // does not end with "every disk clean" and status 0.
+  const bool clean = srv.Shutdown(std::chrono::steady_clock::now());
+  // The last line of a cancelled start. From here a kill costs nothing.
+  if (clean) {
+    DFKV_LOG_INFO("dfkv_server start cancelled: not registered with the MDS, "
+                  "every opened disk closed clean, " + seconds() +
+                  " after the process started; exiting");
+  } else {
+    DFKV_LOG_WARN("dfkv_server start cancelled: not registered with the MDS, "
+                  "but a disk failed to open or is not clean, " + seconds() +
+                  " after the process started; exiting");
+  }
+  const int exit_code = clean ? 0 : 1;
+#if !DFKV_EXIT_RUNS_DESTRUCTORS
+  // As at the end of an ordinary stop: nothing left but giving memory back.
+  std::fflush(stdout);
+  std::fflush(stderr);
+  ::_exit(exit_code);
+#endif
+  return exit_code;
+}
 
 // A crash of the server itself: have every slab store take back its trust
 // token before the process dies, so the next start resets those caches
@@ -71,6 +119,7 @@ static void OnFatalSignal(int sig, siginfo_t* info, void*) {
 }
 
 int main(int argc, char** argv) {
+  const auto process_started = std::chrono::steady_clock::now();
   if (dfkv::WantsVersion(argc, argv)) { std::printf("dfkv_server %s\n", dfkv::Version()); return 0; }
   // No args or --help: print usage and exit, rather than silently starting a
   // server with default config (the old behavior — a foot-gun).
@@ -369,7 +418,13 @@ int main(int argc, char** argv) {
   }
   if (dirs.empty()) dirs.push_back(dir);
 
-  KvNodeServer srv(dirs, cap);
+  // The slow part of a start: the disks are opened and the RAM tier arena is
+  // faulted in. A stop signal during it gives the arena up at once; the disk
+  // opens run to their end (seconds) and are then closed again.
+  KvNodeServer srv(dirs, cap, &g_stop);
+  if (g_stop)
+    return EndCancelledStart(srv, "while opening the disks", process_started,
+                             {});
   // TCP request frames share the RDMA path's resolved max-value bound (OOM-DoS
   // guard; see utils/wire_limits.h).
   srv.set_max_request_payload(dfkv::wire_limits::MaxRequestPayload());
@@ -466,6 +521,13 @@ int main(int argc, char** argv) {
     DFKV_LOG_INFO("dfkv_server RDMA listening (TCP bootstrap) on port " +
                   std::to_string(rsrv->port()) +
                   (rdma_dev.empty() ? "" : ", dev=" + rdma_dev));
+    if (g_stop) {
+      const int exit_code = EndCancelledStart(
+          srv, "while starting the RDMA listener", process_started,
+          [&rsrv] { rsrv->Quiesce(); });
+      rsrv->Stop();
+      return exit_code;
+    }
     // Force-resolve the RDMA depth/uring knobs so their defaults land in the
     // config dump (they are otherwise read lazily on the serve path, after Emit).
     (void)rsrv->PipelineDepth();
@@ -550,6 +612,24 @@ int main(int argc, char** argv) {
           startup && registered && healthy);
     return s;
   });
+  // The last point at which a stop signal cancels the start, ahead of the
+  // health endpoints (a start that is being cancelled must not answer ready
+  // for an instant) and of the registration with the MDS. Past it the node
+  // may be registered, and a stop is the ordinary one of the main loop below
+  // (the registration loop is stopped; the membership lapses with its lease,
+  // there is no explicit deregistration).
+  if (g_stop) {
+    const int exit_code = EndCancelledStart(
+        srv, "before registering with the MDS", process_started, [&] {
+#ifdef DFKV_WITH_RDMA
+          if (rsrv) rsrv->Quiesce();
+#endif
+        });
+#ifdef DFKV_WITH_RDMA
+    if (rsrv) rsrv->Stop();
+#endif
+    return exit_code;
+  }
   if (metrics_port >= 0) {
     mhttp = std::make_unique<dfkv::MetricsHttpServer>(
         [&srv] { return srv.FullMetricsText(); });

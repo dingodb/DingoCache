@@ -1306,6 +1306,38 @@ TEST(RamTier, HugePageBytesAreCountedInTheGivenRangeOnly) {
   EXPECT_EQ(dfkv::AnonHugePageBytesIn(region.base + 4096, 8 * 4096), 0u);
 }
 
+// A start that is cancelled while the arena is being faulted in stops there:
+// the constructor returns at once, not ready, and has started no thread.
+TEST(RamTier, ACancelledStartGivesThePreFaultUp) {
+  ::setenv("DFKV_RAM_TIER_LOCK", "off", 1);
+  FlushSink sink;
+  const uint64_t kArena = 256ull << 20;  // 128 steps of 2 MiB
+  std::atomic<uint64_t> asked{0};
+  {
+    auto options = Opts(kArena);
+    // The third step is the last one wanted.
+    options.cancel_start = [&asked] { return asked.fetch_add(1) >= 3; };
+    RamTier rt(options, sink.fn());
+    EXPECT_FALSE(rt.ok());
+    EXPECT_TRUE(rt.start_cancelled());
+    // Every thread found out at its next step: a few questions, not 128.
+    EXPECT_LT(asked.load(), 64u);
+  }
+  {
+    auto options = Opts(8ull << 20);
+    asked = 0;
+    options.cancel_start = [&asked] {
+      asked.fetch_add(1);
+      return false;
+    };
+    RamTier rt(options, sink.fn());
+    EXPECT_TRUE(rt.ok());
+    EXPECT_FALSE(rt.start_cancelled());
+    EXPECT_GE(asked.load(), 4u);  // asked once per 2 MiB, and never said yes
+  }
+  ::unsetenv("DFKV_RAM_TIER_LOCK");
+}
+
 // The arena's figure with other huge-page-backed memory appearing in the
 // process while the arena is faulted in, as the disk opens now do.
 TEST(RamTier, ArenaHugePageFigureIgnoresConcurrentAllocations) {
