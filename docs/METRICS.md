@@ -391,7 +391,7 @@ Prometheus 调用。vLLM 使用同一 allowlist，区别只是在 family 前加 
 | `dfkv_client_gpu_dedup_load_fences_total` / `dfkv_client_gpu_dedup_load_fence_failures_total` | counter | leader 在把一次 fetch 的结果发布到 GPU rendezvous 之前做的设备同步次数（每批一次）/ 设备同步失败、该批结果因此不发布的次数（follower 自行读取） |
 | `dfkv_client_gpu_dedup_invalidate_stuck_total` | counter | 写入或删除一个 key 时的失效操作在某个 slot 上等了超过 `DFKV_NODE_DEDUP_TAKEOVER_MS` 的次数（每次失效每个 slot 最多记一次，同时打一条 WARN `gpu-dedup: invalidation, slot ...`，含 slot 序号、gen、state、alloc_seq）；或者一个只会以空 slot 结束的收回过程停在那里超过同一时间、失效不再等它的次数（同样打 WARN；正常进行中的收回会被等待，不计数）。前者说明持有者是同机更早版本的发布者，或是在已知的几条指令窗口里被杀的进程：失效会一直等下去，这次写入或删除不返回。非零就要查 WARN 和同机进程 |
 
-原生 `KVClient` 的收敛操作指标（`op="put|get|exist|remove"`）：
+原生 `KVClient` 的收敛操作指标（`op="put|get|exist|remove|retain"`）。retention 调用（`BatchRetain`）也计数：不带 TTL 的 REFRESH 是 ring 有 retention 时连接器的存在性探测，计入 `op="exist"`；SET 和带 TTL 的 REFRESH 计入 `op="retain"`，命中数是存在的 key 数：
 
 | 指标 | 含义 |
 |---|---|
@@ -491,6 +491,7 @@ SGLang HiCache插件另导出：
 |---|---|---|
 | `dfkv_hicache_parallel_identity{tp_rank,physical_rank,pcp_rank,dcp_rank,storage_pcp_rank,primary_dev}` | gauge | 每个connector进程的并行坐标、node-local物理rank、存储PCP writer坐标和primary rail；`physical_rank=-1`表示affinity关闭 |
 | `dfkv_hicache_exist_probes_total{tp_rank,result}` | counter | `result=full_miss|partial_prefix|full_hit`的exist probe次数 |
+| `dfkv_hicache_retain_keys_total{tp_rank,result}` | counter | retention SET 的 key 数，按结果：`protected`、`miss`（尚未写入，TTL 挂起等写入时施加）、`unprotected`（在服务端策略内未保护）、`denied`、`unsupported`、`error`。后三者表示请求的保留时长没有兑现，同时打限频 WARNING |
 | `dfkv_hicache_exist_probe_pages_total{tp_rank}` | counter | 候选page总数 |
 | `dfkv_hicache_exist_present_pages_total{tp_rank}` | counter | probe批内任意位置存在的page总数 |
 | `dfkv_hicache_exist_contiguous_pages_total{tp_rank}` | counter | 从首页开始连续、可供SGLang使用的page总数 |

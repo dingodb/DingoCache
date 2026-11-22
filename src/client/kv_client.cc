@@ -1422,7 +1422,32 @@ void KVClient::RetainNode(const std::string& node, uint64_t tenant,
 
 void KVClient::BatchRetain(const std::vector<std::string>& keys,
                            const RetainRequest& req, uint8_t* out) {
+  const auto t0 = std::chrono::steady_clock::now();
   const size_t n = keys.size();
+  // Counted once like every public call. A REFRESH without a TTL is how the
+  // connectors probe existence when the ring has retention, so it counts as
+  // exist (op="exist" would otherwise lose those probes); SET and a REFRESH
+  // with a TTL count as retain. Hits are the keys that are present.
+  const OpMetrics::Op op = req.mode == kRetainModeRefresh && req.ttl_s == 0
+                               ? OpMetrics::kExist
+                               : OpMetrics::kRetain;
+  struct Record {
+    OpMetrics* m;
+    OpMetrics::Op op;
+    std::chrono::steady_clock::time_point t0;
+    const uint8_t* out;
+    size_t n;
+    ~Record() {
+      uint64_t hits = 0;
+      for (size_t i = 0; out != nullptr && i < n; ++i)
+        if (out[i] != kRetMiss && out[i] != kRetUnsupported &&
+            out[i] != kRetError)
+          ++hits;
+      m->Record(op, n, hits, 0,
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t0).count());
+    }
+  } record{&op_stats_, op, t0, out, n};
   if (out == nullptr || n == 0) return;
   std::fill(out, out + n, static_cast<uint8_t>(kRetError));
   const bool debounce = req.mode == kRetainModeRefresh && req.ttl_s != 0 &&

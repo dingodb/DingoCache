@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- SGLang HiCache connector and client: retention results and calls are
+  counted. A retention SET's per-key result was logged at debug level only,
+  so a denied, failed or unsupported retention went unnoticed.
+  `dfkv_hicache_retain_keys_total{result}` now counts the keys of every SET
+  by result (protected, miss = parked for the write, unprotected, denied,
+  unsupported, error), and a denied, failed or unsupported key logs a
+  rate-limited WARNING. In the native client `BatchRetain` was not counted
+  in `dfkv_client_op_*`, so once a ring had retention the connectors'
+  existence probes (REFRESH without a TTL) disappeared from `op="exist"`. A
+  REFRESH without a TTL now counts as `op="exist"`; a SET or a REFRESH with
+  a TTL counts as the new `op="retain"`. On rings with retention the
+  `op="exist"` request and key rates therefore step up after the upgrade:
+  the probes were always sent, they are only counted now, and the step is
+  not a load increase. A REFRESH with a TTL whose keys are all skipped by
+  the client's debounce counts as an `op="retain"` request although no RPC
+  is sent.
+
 - SGLang HiCache connector, models whose primary KV pool is a logical
   anchor: the anchor's one-byte markers get the retention a `batch_touch`
   asked for before they were written. A touch that finds a page not yet

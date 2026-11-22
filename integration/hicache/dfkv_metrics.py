@@ -123,6 +123,15 @@ if _HAVE_PROM:
 
 _IDENTITY_PROM = None
 _EXIST_RESULT_PROM = None
+_RETAIN_RESULT_PROM = None
+# Result of one key of a retention SET, from its native code (DFKV_RET_*).
+# "miss": not stored yet, the TTL is parked for its write.
+RETAIN_RESULTS = ("protected", "miss", "unprotected", "denied", "unsupported",
+                  "error")
+_RETAIN_RESULT_OF_CODE = {0: "miss", 1: "unprotected", 2: "protected",
+                          3: "protected", 4: "protected", 5: "protected",
+                          6: "denied", 7: "unsupported", 8: "protected",
+                          9: "error"}
 if _HAVE_PROM:
     try:
         _IDENTITY_PROM = _PromGauge(
@@ -139,9 +148,15 @@ if _HAVE_PROM:
             "HiCache existence probes by usable-prefix outcome",
             ["tp_rank", "result"],
         )
+        _RETAIN_RESULT_PROM = _PromCounter(
+            "dfkv_hicache_retain_keys_total",
+            "Keys of HiCache retention SETs by result",
+            ["tp_rank", "result"],
+        )
     except Exception:
         _IDENTITY_PROM = None
         _EXIST_RESULT_PROM = None
+        _RETAIN_RESULT_PROM = None
 
 
 class Metrics:
@@ -159,6 +174,7 @@ class Metrics:
             "partial_prefix": 0,
             "full_hit": 0,
         }
+        self._retain_results = {result: 0 for result in RETAIN_RESULTS}
 
     def _add(self, **deltas):
         with self._lock:
@@ -219,6 +235,20 @@ class Metrics:
             _EXIST_RESULT_PROM.labels(self._rank, result).inc()
         if seconds is not None:
             self._observe("exist", seconds)
+    def on_retain(self, codes):
+        """Count the keys of one retention SET by result."""
+        counts = {}
+        for code in codes:
+            result = _RETAIN_RESULT_OF_CODE.get(int(code), "error")
+            counts[result] = counts.get(result, 0) + 1
+        with self._lock:
+            for result, n in counts.items():
+                self._retain_results[result] += n
+        if _RETAIN_RESULT_PROM is not None:
+            for result, n in counts.items():
+                _RETAIN_RESULT_PROM.labels(self._rank, result).inc(n)
+        return counts
+
     def on_parallel_context_fallback(self):
         self._add(parallel_context_fallbacks=1)
 
@@ -255,6 +285,10 @@ class Metrics:
             snap.update({
                 f"exist_result_{result}": count
                 for result, count in self._exist_results.items()
+            })
+            snap.update({
+                f"retain_{result}_keys": count
+                for result, count in self._retain_results.items()
             })
             snap["identity"] = dict(self._identity)
             return snap

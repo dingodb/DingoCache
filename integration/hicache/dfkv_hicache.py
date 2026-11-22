@@ -1860,12 +1860,19 @@ class DfkvHiCache(HiCacheStorage):
                 self._lib, self._h, keys, ttl, dfkv_cabi.DFKV_RETAIN_SET)
         except Exception as e:  # retention never fails a backup or touch
             self._warn_retain("retain SET", e)
-            return [dfkv_cabi.DFKV_RET_ERROR] * len(keys)
-        unprotected = sum(
-            1 for c in codes if c not in dfkv_cabi.RETAIN_PROTECTED_CODES)
-        if unprotected:
-            _log.debug("dfkv retain SET: %d/%d keys unprotected (codes=%s)",
-                       unprotected, len(codes), sorted(set(codes)))
+            codes = [dfkv_cabi.DFKV_RET_ERROR] * len(keys)
+            self._metrics.on_retain(codes)
+            return codes
+        counts = self._metrics.on_retain(codes) or {}
+        # A key not stored yet ("miss") is parked for its write; "unprotected"
+        # is an answer within the server's policy. A denial, an error or a
+        # node without retention means the requested lifetime is not had.
+        failed = {r: counts[r] for r in ("denied", "unsupported", "error")
+                  if counts.get(r)}
+        if failed:
+            self._warn_retain(
+                "retain SET", f"{sum(failed.values())}/{len(codes)} keys not "
+                f"protected for {ttl}s ({failed})")
         return codes
 
     def _retain_after_write(self, sks, stored) -> None:
