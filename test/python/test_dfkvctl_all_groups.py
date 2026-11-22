@@ -88,23 +88,83 @@ class _EtcdHandler(BaseHTTPRequestHandler):
         self.send_error(404)
 
 
+# A port number that was free a moment ago is not a port this test owns: the
+# kernel hands the same number to the next listener or outgoing connection on
+# the host. So nothing here is started on a number picked in advance and then
+# trusted. A process that can report its own port listens on port 0; one that
+# must be told its port beforehand is restarted on another number when the
+# first is gone; and a port that must stay closed is held bound for as long
+# as the test needs it closed.
+
+
 def _free_port() -> int:
+    """A candidate only: it may be taken before the caller listens on it."""
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
 
 
-def _wait_port(port: int, process: subprocess.Popen, timeout: float = 10.0) -> None:
+class _ClosedPort:
+    """A port nothing listens on, and nothing else can take, while open."""
+
+    def __enter__(self) -> int:
+        self._sock = socket.socket()
+        self._sock.bind(("127.0.0.1", 0))  # bound, never listening: refuses
+        return int(self._sock.getsockname()[1])
+
+    def __exit__(self, *exc) -> None:
+        self._sock.close()
+
+
+class _Exited(RuntimeError):
+    pass
+
+
+def _wait_line(log: Path, process: subprocess.Popen, prefix: str,
+               timeout: float = 10.0) -> str:
+    """The first line of `log` starting with `prefix`: what the process prints
+    once it is listening. A connect to the port would also succeed against a
+    stranger that took the number first."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        for line in log.read_text(errors="replace").splitlines():
+            if line.startswith(prefix):
+                return line
         if process.poll() is not None:
-            raise RuntimeError(f"process exited {process.returncode} before port {port} opened")
+            raise _Exited(
+                f"process exited {process.returncode} before printing {prefix!r}")
+        time.sleep(0.05)
+    raise RuntimeError(f"{prefix!r} not printed within {timeout}s")
+
+
+def _start_server(dfkv_server: Path, root: Path, node: str, group: str,
+                  mds_port: int, processes: list, logs: list):
+    """dfkv_server registers the address it is given, so its port is chosen
+    before it starts; when that port has been taken meanwhile, try another."""
+    data = root / node
+    data.mkdir()
+    for attempt in range(1, 6):
+        port = _free_port()
+        log = (root / f"{node}.{attempt}.log").open("w+")
+        logs.append(log)
+        process = subprocess.Popen(
+            [str(dfkv_server), "--dir", str(data), "--port", str(port),
+             "--cap", str(64 << 20), "--store-engine", "file",
+             "--mds", f"127.0.0.1:{mds_port}", "--group", group,
+             "--id", node, "--advertise", f"127.0.0.1:{port}",
+             "--mds-registration-timeout-ms", "5000"],
+            stdout=log, stderr=subprocess.STDOUT, text=True,
+            env={**os.environ, "DFKV_LOG_LEVEL": "ERROR"},
+        )
+        processes.append(process)
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
-                return
-        except OSError:
-            time.sleep(0.05)
-    raise RuntimeError(f"port {port} did not open within {timeout}s")
+            _wait_line(Path(log.name), process, "PORT ")
+            return process, port
+        except _Exited:
+            if f"failed to start on port {port}" not in Path(log.name).read_text(
+                    errors="replace"):
+                raise
+    raise RuntimeError(f"{node}: no free port in 5 attempts")
 
 
 def _stop(process: subprocess.Popen | None) -> None:
@@ -227,7 +287,8 @@ def _check_operational_tools(dfkvctl: Path, mds: str, etcd: str, state: _EtcdSta
     # port, and part of its self-description is not text. `stat --all` then
     # exits 1, which must not hide the row of the healthy member.
     ghost_key = b"/dfkv/v1/groups/alpha/members/ghost"
-    ghost_port = _free_port()
+    closed = _ClosedPort()
+    ghost_port = closed.__enter__()
     with state.lock:
         state.values[ghost_key] = _registration(
             "ghost", "127.0.0.1", ghost_port, b"ver=0.0,note=\xff\xfe")
@@ -257,17 +318,19 @@ def _check_operational_tools(dfkvctl: Path, mds: str, etcd: str, state: _EtcdSta
     finally:
         with state.lock:
             del state.values[ghost_key]
+        closed.__exit__()
 
     # No table at all is dfkvctl failing, not a verdict on the members.
-    no_mds = Replacer(SimpleNamespace(
-        dfkvctl=str(dfkvctl), mds=f"127.0.0.1:{_free_port()}", group="alpha",
-        command_timeout=10.0))
-    try:
-        no_mds.healthy("alpha-node")
-    except RuntimeError as error:
-        require("MDS query failed" in str(error), "stat --all without an MDS", error)
-    else:
-        raise RuntimeError("stat --all without an MDS must stay an error")
+    with _ClosedPort() as no_mds_port:
+        no_mds = Replacer(SimpleNamespace(
+            dfkvctl=str(dfkvctl), mds=f"127.0.0.1:{no_mds_port}", group="alpha",
+            command_timeout=10.0))
+        try:
+            no_mds.healthy("alpha-node")
+        except RuntimeError as error:
+            require("MDS query failed" in str(error), "stat --all without an MDS", error)
+        else:
+            raise RuntimeError("stat --all without an MDS must stay an error")
 
 
 def main() -> int:
@@ -293,38 +356,25 @@ def main() -> int:
     try:
         with tempfile.TemporaryDirectory(prefix="dfkvctl-all-groups-") as temp:
             root = Path(temp)
-            mds_port = _free_port()
+            # The MDS says which port it got: let the kernel choose it.
             mds_log = (root / "mds.log").open("w+")
             logs.append(mds_log)
             mds = subprocess.Popen(
-                [str(dfkv_mds), "--listen", str(mds_port), "--etcd",
+                [str(dfkv_mds), "--listen", "0", "--etcd",
                  f"127.0.0.1:{etcd.server_port}"],
                 stdout=mds_log, stderr=subprocess.STDOUT, text=True,
             )
             processes.append(mds)
-            _wait_port(mds_port, mds)
+            listening = _wait_line(root / "mds.log", mds, "dfkv_mds listening on ")
+            mds_port = int(listening.split()[3].rstrip(","))
 
             servers = []
             addresses = {}
             for group, node in (("alpha", "alpha-node"), ("beta", "beta-node")):
-                port = _free_port()
+                process, port = _start_server(
+                    dfkv_server, root, node, group, mds_port, processes, logs)
                 addresses[node] = f"127.0.0.1:{port}"
-                data = root / node
-                data.mkdir()
-                log = (root / f"{node}.log").open("w+")
-                logs.append(log)
-                process = subprocess.Popen(
-                    [str(dfkv_server), "--dir", str(data), "--port", str(port),
-                     "--cap", str(64 << 20), "--store-engine", "file",
-                     "--mds", f"127.0.0.1:{mds_port}", "--group", group,
-                     "--id", node, "--advertise", f"127.0.0.1:{port}",
-                     "--mds-registration-timeout-ms", "5000"],
-                    stdout=log, stderr=subprocess.STDOUT, text=True,
-                    env={**os.environ, "DFKV_LOG_LEVEL": "ERROR"},
-                )
-                processes.append(process)
                 servers.append(process)
-                _wait_port(port, process)
 
             version = subprocess.check_output(
                 [str(dfkvctl), "--version"], text=True, timeout=5).strip().split()[1]
