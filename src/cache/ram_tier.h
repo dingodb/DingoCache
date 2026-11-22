@@ -544,6 +544,9 @@ class RamTier {
     bool client_acked = false;
     std::chrono::steady_clock::time_point dirty_since;
     bool remove_pending = false;  // hidden immediately; physical free after pins
+    // remove_pending because the disk no longer had the key (a stale written
+    // copy dropped by a PUT), not because of a REMOVE.
+    bool stale = false;
     bool in_arena() const { return !large; }
     char* data(char* arena) const { return large ? large.get() : arena + offset; }
   };
