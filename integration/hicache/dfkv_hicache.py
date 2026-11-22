@@ -447,10 +447,26 @@ def _is_mla_replica_writer(
     dcp_size: int,
     dcp_rank: int,
 ) -> bool:
-    """Elect one writer for each physical PCP/DCP shard."""
+    """Elect one writer for each physical PCP/DCP shard.
+
+    Under DCP the writer of shard ``d`` is the attention-TP rank ``d``. That
+    gives every shard exactly one writer only if the DCP rank is the
+    attention-TP rank modulo the DCP width, as SGLang builds it (DCP groups
+    are contiguous slices of the TP group, attention-TP ranks change
+    fastest). Under another mapping some shards would have no writer and
+    never hit, with backup reported done, so a rank whose coordinates do not
+    follow it is refused.
+    """
     if not is_mla:
         return True
     rank = attn_tp_rank if attn_tp_rank is not None else tp_rank
+    if dcp_size > 1 and dcp_rank != rank % dcp_size:
+        raise RuntimeError(
+            f"MLA writer election under DCP needs dcp_rank == attention-TP "
+            f"rank % dcp_size; this rank has dcp_rank={dcp_rank}, rank={rank}, "
+            f"dcp_size={dcp_size}. Another rank layout would leave DCP shards "
+            f"without a writer; check dcp_size/dcp_rank in the HiCache "
+            f"extra_config")
     return rank == (dcp_rank if dcp_size > 1 else 0)
 
 

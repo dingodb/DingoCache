@@ -338,6 +338,50 @@ class SingleObjectSidePool(unittest.TestCase):
         self.assertFalse(r1._rank_writes_pool("indexer"), "one writer")
 
 
+class DcpWriterElection(unittest.TestCase):
+    """MLA under DCP elects the attention-TP rank d as the writer of DCP
+    shard d. Correct only under SGLang's rank mapping; under another one
+    some shards had no writer, and were silently never stored."""
+
+    writer = staticmethod(dfkv_hicache._is_mla_replica_writer)
+
+    @staticmethod
+    def _sglang_ranks(tp_size, dcp_size, attn_tp_size):
+        # runtime_context: dcp_rank = tp_rank % dcp_size (contiguous DCP
+        # slices of the TP group); attn_tp_rank = tp_rank % attn_tp_size.
+        for tp_rank in range(tp_size):
+            yield (tp_rank, tp_rank // attn_tp_size, tp_rank % attn_tp_size,
+                   tp_rank % dcp_size)
+
+    def test_one_writer_per_shard_and_attention_group(self):
+        for tp_size, dcp_size, attn_tp_size in (
+                (8, 2, 8), (8, 4, 8), (8, 8, 8), (8, 2, 4), (16, 4, 8)):
+            writers = {}
+            for tp_rank, group, attn_rank, dcp_rank in self._sglang_ranks(
+                    tp_size, dcp_size, attn_tp_size):
+                if self.writer(True, tp_rank, attn_rank, dcp_size, dcp_rank):
+                    writers.setdefault((group, dcp_rank), []).append(tp_rank)
+            groups = tp_size // attn_tp_size
+            self.assertEqual(
+                sorted(writers), [(g, d) for g in range(groups)
+                                  for d in range(dcp_size)],
+                (tp_size, dcp_size, attn_tp_size))
+            self.assertTrue(all(len(w) == 1 for w in writers.values()))
+
+    def test_another_rank_mapping_is_refused(self):
+        # Blocked mapping (dcp_rank = attn_tp_rank // 4 for tp 8, dcp 2):
+        # shard 1 would be elected nowhere.
+        with self.assertRaisesRegex(RuntimeError, "dcp_rank"):
+            self.writer(True, 4, 4, 2, 1)
+        with self.assertRaisesRegex(RuntimeError, "dcp_rank"):
+            self.writer(True, 1, 1, 2, 0)
+
+    def test_non_mla_and_no_dcp_are_unchanged(self):
+        self.assertTrue(self.writer(False, 4, 4, 2, 1))
+        self.assertTrue(self.writer(True, 0, 0, 1, 0))
+        self.assertFalse(self.writer(True, 3, 3, 1, 0))
+
+
 class _SidecarDevicePool:
     page_size = 4
 
