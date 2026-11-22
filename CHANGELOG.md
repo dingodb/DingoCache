@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- Client, host and GPU dedup (`DFKV_CLIENT_NODE_DEDUP=1`): two ways a lookup
+  could be answered from shared memory with bytes it should not have got.
+  Both need an unusual interleaving.
+  - A write or a remove of a key cleared only the first shared entry of that
+    key. A key can have a second, older entry further along its probe
+    window, left behind when a process that could not use it (expired, or
+    another length) fetched the key again into an earlier free slot. That
+    entry survived the invalidation and was served, with the bytes from
+    before the write, once the entry in front of it was gone. An
+    invalidation now removes every entry of the key.
+  - A reader looks a slot up by key and then copies out of it. If the slot
+    was recycled and republished for another key of the same length in
+    between, the reader got that key's bytes. The copy now re-checks the
+    slot's key under the same generation check that already guards the
+    bytes.
+  A process waiting for another's fetch also no longer accepts an entry
+  older than `DFKV_NODE_DEDUP_TTL_MS`, on the host and the GPU path; a claim
+  never did.
+  The shared-memory layout, the slot states and the segment names are
+  unchanged, and processes of older versions can share a segment with this
+  one. Each fix protects the process that runs it: an older process still
+  clears only the first entry when it invalidates, and still copies without
+  the key check, until it is upgraded.
 - RAM tier: eviction now honours reads. A GET served from the RAM tier pinned
   its slot but never set the slot's CLOCK reference bit, so the class hand
   never met a referenced slot and the tier evicted in strict admission order:

@@ -112,7 +112,7 @@ class GpuNodeDedup {
   void PublishSg(const BlockKey& key, uint64_t token, const Seg* segs,
                  size_t nsegs, size_t len);
   void Abort(const BlockKey& key, uint64_t token);
-  // Eviction barrier for READY and in-flight entries.
+  // Eviction barrier for every READY and in-flight entry of the key.
   void Invalidate(const BlockKey& key);
 
   int wait_ms() const { return wait_ms_; }
@@ -154,11 +154,11 @@ class GpuNodeDedup {
     uint64_t seq;
     size_t n;
   };
-  bool IssueCopySg(Slot* s, const Seg* segs, size_t nsegs, size_t total_cap,
-                   CUstream st, CopySnap* snap);
+  bool IssueCopySg(Slot* s, const BlockKey& key, const Seg* segs, size_t nsegs,
+                   size_t total_cap, CUstream st, CopySnap* snap);
   bool ValidateCopy(const CopySnap& snap) const;
-  bool CopyOutSg(Slot* s, const Seg* segs, size_t nsegs, size_t total_cap,
-                 size_t* got);
+  bool CopyOutSg(Slot* s, const BlockKey& key, const Seg* segs, size_t nsegs,
+                 size_t total_cap, size_t* got);
   // Cached cuIpcOpenMemHandle of registry entry idx at generation gen;
   // 0 on any failure. Self resolves to arena_base_ without an IPC open.
   CUdeviceptr PeerBase(uint32_t idx, uint64_t gen);
