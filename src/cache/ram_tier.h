@@ -515,6 +515,10 @@ class RamTier {
     // writer. A second RAM-ACK writer of the key is given the same
     // acknowledgement at this point instead of waiting for the flush.
     bool acked_resident = false;
+    // The completion of a cold-read reservation (ReserveDurable). Only the
+    // thread that holds the reservation finishes it, after its disk read and
+    // reply, so nothing else may wait for it: that thread may be the waiter.
+    bool reservation = false;
   };
   struct Entry {
     BlockKey key;

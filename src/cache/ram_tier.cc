@@ -781,6 +781,10 @@ RamTier::Admission RamTier::Admit(
     }
     auto writing = s.writing.find(key);
     if (writing != s.writing.end()) {
+      // A cold read is filling a reserved slot with what the disk holds. Its
+      // holder may be this very thread, so do not wait for it: the PUT goes
+      // to the disk, which answers it as for any key it has.
+      if (writing->second->reservation) return Admission::kBypass;
       if (out_completion) *out_completion = writing->second;
       return Admission::kDuplicate;
     }
@@ -970,6 +974,7 @@ bool RamTier::ReserveDurable(const BlockKey& key, size_t len,
   const size_t shard_index = KeyHash{}(key) % shards_.size();
   Shard& s = *shards_[shard_index];
   auto completion = std::make_shared<PutCompletion>();
+  completion->reservation = true;
   uint64_t offset = 0;
   uint64_t cap = requested_cap;
   SlabAllocator::SlotHandle slot_handle;
@@ -1348,6 +1353,10 @@ bool RamTier::Remove(const BlockKey& key) {
       had = true;
       std::lock_guard<std::mutex> state_lk(completion->mu);
       completion->canceled = true;
+      // A canceled reservation is never installed (CommitReservation sees
+      // the flag under this lock). Its holder may be this very thread: do
+      // not wait for it.
+      if (completion->reservation) return true;
     } else {
       auto it = s.index.find(key);
       if (it == s.index.end() || it->second.remove_pending) return false;
