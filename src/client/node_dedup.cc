@@ -297,6 +297,7 @@ bool NodeDedup::CopyOut(Slot* s, const BlockKey& key, Kind kind, size_t cap,
     // leaves out a rank axis of a sharded payload breaks it), so this is
     // reported. The entry is not used either way. The generation is read
     // again so that a slot being recycled under the reader is not reported.
+    std::atomic_thread_fence(std::memory_order_acquire);  // len before gen
     if (s->gen.load(std::memory_order_acquire) == g0)
       NoteLengthMismatch(&length_mismatches_, "node-dedup", n,
                          strict_n != kAnyLen ? strict_n : cap);
@@ -311,7 +312,12 @@ bool NodeDedup::CopyOut(Slot* s, const BlockKey& key, Kind kind, size_t cap,
     return false;
   std::memcpy(dst, arena_ + off, n);
   // ... and AFTER: the copy is only valid if the payload stayed un-lapped and
-  // the slot generation did not move during the copy.
+  // the slot generation did not move during the copy. The fence keeps the
+  // copy's (and the identity's) plain loads before the re-reads below: an
+  // acquire load orders only what follows it, so on a weakly ordered CPU
+  // the copy could otherwise read bytes written after a re-read that still
+  // saw the old cursor and generation, and a torn copy would validate.
+  std::atomic_thread_fence(std::memory_order_acquire);
   if (hdr_->alloc_cursor.load(std::memory_order_acquire) - seq > arena_bytes_ - n)
     return false;
   if (s->gen.load(std::memory_order_acquire) != g0) return false;
