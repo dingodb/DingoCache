@@ -38,10 +38,10 @@ uint64_t ResolveShutdownDrainTimeoutSeconds() {
     errno = 0;
     char* end = nullptr;
     const unsigned long long parsed = std::strtoull(value, &end, 10);
-    if (*value < '0' || *value > '9' || errno != 0 || *end != '\0') {
+    if (*value < '0' || *value > '9' || *end != '\0') {
       DFKV_LOG_WARN(std::string("invalid ") + name + "='" + value +
                     "'; using " + std::to_string(kDefault));
-    } else if (parsed > kMax) {
+    } else if (errno == ERANGE || parsed > kMax) {
       DFKV_LOG_WARN(std::string(name) + " clamped to hard maximum " +
                     std::to_string(kMax));
       seconds = kMax;

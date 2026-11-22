@@ -1035,6 +1035,7 @@ TEST(RamTierWiring, ShutdownDropsWhatMissesTheDrainTimeout) {
 // The limit decides how much of the backlog a stop drops, so a typo must not
 // turn into "drop everything at once".
 TEST(RamTierWiring, ShutdownDrainLimitIsParsedStrictly) {
+  ::unsetenv("DFKV_RAM_TIER");
   const auto dir = fs::temp_directory_path() / "dfkv_shutdown_limit";
   struct RestoreEnv {
     ~RestoreEnv() { ::unsetenv("DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S"); }
@@ -1056,6 +1057,7 @@ TEST(RamTierWiring, ShutdownDrainLimitIsParsedStrictly) {
   EXPECT_EQ(limit("120"), 120u);
   EXPECT_EQ(limit("3600"), 3600u);
   EXPECT_EQ(limit("7200"), 3600u);  // clamped, not ignored
+  EXPECT_EQ(limit("99999999999999999999999999"), 3600u);  // so is overflow
   EXPECT_EQ(limit("abc"), 30u);     // used to be read as 0
   EXPECT_EQ(limit("5m"), 30u);      // used to be read as 5
   EXPECT_EQ(limit("-1"), 30u);

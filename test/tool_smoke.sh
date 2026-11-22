@@ -17,7 +17,8 @@ echo "version smoke OK"
 D=$(mktemp -d)
 mkdir "$D/cache"
 : > "$D/srv.out"   # pre-create so the awk below can't fail on a missing file under `set -e`
-env -u DFKV_STORE_ENGINE -u DFKV_SLAB_WRITE "$BUILD/dfkv_server" \
+# -u DFKV_LOG: the clean-shutdown check below reads INFO lines.
+env -u DFKV_STORE_ENGINE -u DFKV_SLAB_WRITE -u DFKV_LOG "$BUILD/dfkv_server" \
   --dir "$D/cache" --port 0 --cap 1073741824 >>"$D/srv.out" 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null; rm -rf "$D"' EXIT
