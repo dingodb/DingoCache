@@ -22,6 +22,20 @@
   a reader that joined another reader's coalesced read does not promote
   the bytes it was handed under its own generation.
   No setting, API or wire change.
+- Server, RETAIN: a SET for a value that is in RAM but not on disk is parked
+  only when the value is still to be written, and is no longer lost when
+  the write lands at the same time. A value in RAM as a written copy of a
+  key the disk no longer has (evicted there, or removed from the disk
+  alone) was answered `kProtectedNew` and its SET parked for good: no flush
+  would ever apply it, and parked SETs that are never taken fill the table
+  (2^20 entries), after which every SET for a RAM-only value is `kDenied`.
+  Such a SET is now answered as a hit without protection, or by the disk
+  if the write has landed meanwhile. A SET parked just as its value's
+  write landed, after the flush had looked for parked SETs, stayed parked
+  without effect; the SET is now applied at once in that case. New
+  `dfkv_retain_pending_denied_total` (parked SETs the disk denied when they
+  were applied) and `dfkv_retain_pending_entries` (SETs parked now). No
+  setting, API or wire change.
 
 - Client, GPU dedup (`DFKV_CLIENT_NODE_DEDUP_GPU=1`): restarting the
   inference processes in place no longer uses up the GPU dedup registry.

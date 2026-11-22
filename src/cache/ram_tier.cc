@@ -1322,13 +1322,15 @@ bool RamTier::Contains(const BlockKey& key) const {
   auto it = s.index.find(key);
   return it != s.index.end() && !it->second.remove_pending;
 }
-bool RamTier::Lookup(const BlockKey& key, size_t* value_len) const {
+bool RamTier::Lookup(const BlockKey& key, size_t* value_len,
+                     bool* dirty) const {
   if (shards_.empty() || value_len == nullptr) return false;
   const Shard& s = ShardFor(key);
   std::lock_guard<std::mutex> lk(s.mu);
   auto it = s.index.find(key);
   if (it == s.index.end() || it->second.remove_pending) return false;
   *value_len = static_cast<size_t>(it->second.len);
+  if (dirty) *dirty = !it->second.durable;
   return true;
 }
 

@@ -402,7 +402,9 @@ class RamTier {
                bool count_access = true);
 
   bool Contains(const BlockKey& key) const;
-  bool Lookup(const BlockKey& key, size_t* value_len) const;
+  // `dirty`, if given: the value is still to be written to disk.
+  bool Lookup(const BlockKey& key, size_t* value_len,
+              bool* dirty = nullptr) const;
   bool Remove(const BlockKey& key);  // drop from RAM (cache); true if present
   // Drops the key's entry if it is a written (durable) copy, as a cache may;
   // a value still to be written is left alone. The second step of a REMOVE,

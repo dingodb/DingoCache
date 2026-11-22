@@ -654,6 +654,19 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_retain_pending_applied_total", "counter",
            "RAM write-back SETs applied when the flush committed",
            rd(pending_retain_applied_));
+    metric("dfkv_retain_pending_denied_total", "counter",
+           "Parked RAM write-back SETs the disk denied when they were applied "
+           "(retention budget full)",
+           rd(pending_retain_denied_));
+    {
+      size_t parked = 0;
+      {
+        std::lock_guard<std::mutex> lk(pending_retain_mu_);
+        parked = pending_retain_.size();
+      }
+      metric("dfkv_retain_pending_entries", "gauge",
+             "SETs parked for RAM values still to be written", parked);
+    }
     const auto rs = group_.RetentionStats();
     metric("dfkv_retain_enabled", "gauge", "Retention enabled on every disk",
            group_.RetainEnabled() ? 1 : 0);
@@ -1462,23 +1475,46 @@ Status KvNodeServer::ProcessRetain(const BlockKey& prefix_key, uint64_t count,
                        prefix_key.tenant_hash};
     uint8_t code = group_.Retain(key, ttl_s, mode, now);
     if (code == StoreEngine::kRetainUnsupported) return Status::kInvalid;
-    // Write-back value not flushed yet: a hit. A SET is parked and applied
-    // when the flush commits the disk slot.
+    // A miss on disk with the value in RAM: a hit. If the value is still to
+    // be written, a SET is parked and applied when the flush commits the disk
+    // slot. A written RAM copy of a key the disk no longer has can be
+    // protected by nothing, and no flush will come for it: unprotected, not
+    // parked. Its write may have landed since the disk was asked (it is no
+    // longer dirty, or it landed just as the SET was parked): then the disk
+    // is asked again.
     size_t ram_len = 0;
+    bool dirty = false;
     if (code == static_cast<uint8_t>(SlabAllocator::RetainCode::kMiss) && ram_ &&
-        ram_->Lookup(key, &ram_len)) {
+        ram_->Lookup(key, &ram_len, &dirty)) {
       code = static_cast<uint8_t>(SlabAllocator::RetainCode::kHitUnprotected);
-      if (mode == kRetainModeSet && ttl_s != 0) {
-        std::lock_guard<std::mutex> lk(pending_retain_mu_);
-        auto it = pending_retain_.find(key);
-        if (it != pending_retain_.end()) {
-          it->second = std::max(it->second, std::min(ttl_s, max_ttl));
-          code = static_cast<uint8_t>(SlabAllocator::RetainCode::kProtectedNew);
-        } else if (pending_retain_.size() < kPendingRetainMax) {
-          pending_retain_.emplace(key, std::min(ttl_s, max_ttl));
-          code = static_cast<uint8_t>(SlabAllocator::RetainCode::kProtectedNew);
-        } else {
-          code = static_cast<uint8_t>(SlabAllocator::RetainCode::kDenied);
+      if (!dirty) {
+        // Asked again only if the write has landed, so a copy the disk does
+        // not have is not counted twice in the store's retention results.
+        if (group_.IsCached(key)) code = group_.Retain(key, ttl_s, mode, now);
+      } else if (mode == kRetainModeSet && ttl_s != 0) {
+        {
+          std::lock_guard<std::mutex> lk(pending_retain_mu_);
+          auto it = pending_retain_.find(key);
+          if (it != pending_retain_.end()) {
+            it->second = std::max(it->second, std::min(ttl_s, max_ttl));
+            code =
+                static_cast<uint8_t>(SlabAllocator::RetainCode::kProtectedNew);
+          } else if (pending_retain_.size() < kPendingRetainMax) {
+            pending_retain_.emplace(key, std::min(ttl_s, max_ttl));
+            code =
+                static_cast<uint8_t>(SlabAllocator::RetainCode::kProtectedNew);
+          } else {
+            code = static_cast<uint8_t>(SlabAllocator::RetainCode::kDenied);
+          }
+        }
+        // Landed between the disk's miss and the park: no flush will apply
+        // the parked SET any more. Take it back and apply it here, unless the
+        // flush took it first (then it was applied there).
+        if (code ==
+                static_cast<uint8_t>(SlabAllocator::RetainCode::kProtectedNew) &&
+            group_.IsCached(key)) {
+          const int applied = ApplyPendingRetain(key, /*flushed=*/true);
+          if (applied >= 0) code = static_cast<uint8_t>(applied);
         }
       }
     }
@@ -1495,19 +1531,23 @@ Status KvNodeServer::ProcessRetain(const BlockKey& prefix_key, uint64_t count,
   return Status::kOk;
 }
 
-void KvNodeServer::ApplyPendingRetain(const BlockKey& key, bool flushed) {
+int KvNodeServer::ApplyPendingRetain(const BlockKey& key, bool flushed) {
   uint32_t ttl_s = 0;
   {
     std::lock_guard<std::mutex> lk(pending_retain_mu_);
-    if (pending_retain_.empty()) return;
+    if (pending_retain_.empty()) return -1;
     auto it = pending_retain_.find(key);
-    if (it == pending_retain_.end()) return;
+    if (it == pending_retain_.end()) return -1;
     ttl_s = it->second;
     pending_retain_.erase(it);
   }
-  if (!flushed) return;
-  group_.Retain(key, ttl_s, kRetainModeSet, RetainWallNowS());
+  if (!flushed) return -1;
+  const uint8_t code =
+      group_.Retain(key, ttl_s, kRetainModeSet, RetainWallNowS());
   pending_retain_applied_.fetch_add(1, std::memory_order_relaxed);
+  if (code == static_cast<uint8_t>(SlabAllocator::RetainCode::kDenied))
+    pending_retain_denied_.fetch_add(1, std::memory_order_relaxed);
+  return code;
 }
 
 Status KvNodeServer::RangeIntoForKey(const BlockKey& key, uint64_t offset,

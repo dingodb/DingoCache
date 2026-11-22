@@ -282,10 +282,12 @@ class KvNodeServer {
     }
   };
   static constexpr size_t kPendingRetainMax = 1u << 20;
-  std::mutex pending_retain_mu_;
+  mutable std::mutex pending_retain_mu_;  // also read by MetricsText()
   std::unordered_map<BlockKey, uint32_t, BlockKeyHasher> pending_retain_;
   std::atomic<size_t> pending_retain_applied_{0};
-  void ApplyPendingRetain(const BlockKey& key, bool flushed);
+  std::atomic<size_t> pending_retain_denied_{0};
+  // The retention code of the applied SET; -1 when none was applied.
+  int ApplyPendingRetain(const BlockKey& key, bool flushed);
   // The generation of the disk's value for a key (ValueMetadata), 0 if none.
   uint64_t DiskGeneration(const BlockKey& key) const;
   std::atomic<size_t> remove_ok_{0}, remove_miss_{0};
