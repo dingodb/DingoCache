@@ -282,15 +282,17 @@ static int CmdStatsAllGroups(const std::string& mds) {
   return rc;
 }
 
-// A JSON string literal. Member fields come off the wire, so nothing about
-// their bytes is assumed beyond what JSON itself requires to be escaped.
+// A JSON string literal. Member fields come off the wire and are bytes, not
+// text: anything outside printable ASCII is written as \u00XX of the byte, so
+// the document is valid JSON whatever a node reported (a byte >= 0x80 reads
+// back as the code point of the same value).
 static std::string JsonString(const std::string& s) {
   std::string out = "\"";
   for (unsigned char c : s) {
     if (c == '"' || c == '\\') {
       out += '\\';
       out += static_cast<char>(c);
-    } else if (c < 0x20) {
+    } else if (c < 0x20 || c >= 0x7f) {
       char escaped[8];
       std::snprintf(escaped, sizeof(escaped), "\\u%04x", c);
       out += escaped;

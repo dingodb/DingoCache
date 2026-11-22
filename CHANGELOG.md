@@ -12,17 +12,36 @@
   unchanged. The scripts need the `dfkvctl` of this release. The ring epoch
   they report is now the document's `placement_epoch`, the value the MDS and
   clients compare; their own calculation left out eligibility, never matched
-  it, and is gone. For a replacement, a member that is registered but not
-  ring-eligible no longer counts as being in the ring.
+  it, and is gone.
+- Tools: what `deploy/dfkv_node_replace.py` requires of the two nodes.
+  - The replacement has to be ring-eligible (own vnodes) before the old node
+    is stopped. The old node only has to be registered: one the MDS already
+    holds out of placement, with all its rails down for instance, can be
+    replaced, and a rollback then only waits for it to register again.
+  - Readiness is the replacement's own row of `dfkvctl stat --all`. That
+    command exits 1 as soon as any member of the group is unreachable,
+    unhealthy or of unknown health, and the script took the exit status for a
+    failed command: one such member -- the node being replaced, say -- kept the
+    replacement from ever counting as ready. The row has to show what
+    `dfkvctl` itself requires of it (reachable, READY and HEALTH `yes`, MDS
+    and RDMA not `NO`).
 - Tools: `deploy/dfkv_node_replace.py` no longer waits for `systemctl stop`
-  under `--command-timeout` (10 s by default, while a stop takes tens of
-  seconds). The timeout started a rollback that asked systemd to start the
-  node it was still stopping and timed out on that as well, so the script
-  exited with "rollback also failed"; systemd runs such a start once the stop
-  is over, which can bring the old node back next to its replacement. Stops
-  and starts are now queued with `--no-block`, and the script polls the unit's
-  `ActiveState` within `--timeout` -- stopped before it looks at the ring,
-  active again before a rollback trusts it.
+  under `--command-timeout` (10 s by default, while a stop takes from tens of
+  seconds to minutes). The timeout started a rollback that asked systemd to
+  start the node it was still stopping and timed out on that as well, so the
+  script exited with "rollback also failed"; systemd runs such a start once
+  the stop is over, which can bring the old node back next to its
+  replacement. Stops and starts are now queued with `--no-block`.
+  - A replacement is complete when the old node's registration has expired
+    and the replacement is placed and ready. A stopping server stops
+    heartbeating first, so that takes about the lease time however long the
+    unit goes on flushing; the script does not wait for the unit.
+  - A rollback has to see the old unit through its stop, because systemd runs
+    the start only then. It waits for the unit to be active again for up to
+    the new `--stop-timeout` (660 s by default; set it above the unit's
+    `TimeoutStopSec`) plus `--timeout`, and only then looks at the ring.
+    When it cannot confirm the restart, the error says that systemd already
+    has the start instead of asking for one.
 - Server: the disks of a node are opened at the same time instead of one after
   the other. A slab store reads its whole table back before it can serve, so
   startup grew by seconds per disk: with six disks and 13.5 million objects,

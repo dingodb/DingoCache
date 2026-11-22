@@ -56,10 +56,9 @@ def decode_registration(data: bytes) -> RingMember:
         size, offset = _take_u32(data, offset)
         if offset + size > len(data):
             raise ValueError("truncated membership string")
-        try:
-            value = data[offset : offset + size].decode()
-        except UnicodeDecodeError as error:
-            raise ValueError("membership string is not UTF-8") from error
+        # Bytes, read the way `dfkvctl ring --json` writes them: one code
+        # point per byte, so the two views of a member compare equal.
+        value = data[offset : offset + size].decode("latin-1")
         offset += size
         return value
 
@@ -77,7 +76,7 @@ def decode_registration(data: bytes) -> RingMember:
             size, offset = _take_u32(data, offset)
             if offset + size > len(data):
                 raise ValueError("truncated registration info")
-            info = data[offset : offset + size].decode()
+            info = data[offset : offset + size].decode("latin-1")
             offset += size
         elif tag == 0x31415453:  # STA1; not needed for identity comparison
             if offset >= len(data):

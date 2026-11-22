@@ -659,12 +659,30 @@ SSH 前置位）：旧节点未停且新节点未标记启动 = safe abort 直�
 重复执行时若旧节点已退出且新节点健康会直接成功。
 
 `systemctl start`/`stop` 都带 `--no-block` 下发：systemd 只把作业排进队列就返回，脚本
-不等作业结束，而是自己轮询 unit 的 `ActiveState`。停旧节点后要等它变为 `inactive`/
-`failed` 才去看环；回滚重启旧节点时要等它变回 `active` 才看环和就绪——启动作业可能
-排在还没结束的停止作业后面，而这段时间环里还留着正在退出的那个进程的注册。所以停止
-耗时算在 `--timeout` 里，不受 `--command-timeout` 约束：`--timeout` 要大于 unit 实际的
-停止时间（最坏是 `TimeoutStopSec`）；`--command-timeout` 只约束单条 `dfkvctl`/SSH
-命令，这些命令都很快返回。已注册但不在放置环里（非 eligible）的成员不算“已入环”。
+不等作业结束。`--command-timeout` 只约束单条 `dfkvctl`/SSH 命令，这些命令都很快返回。
+
+- **成功不等旧 unit 停完。** 停止中的 `dfkv_server` 先停心跳，旧节点的注册在租约到期
+  （约 30 秒）后就从环里消失，而 unit 可能还要刷几分钟积压
+  （`DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S`，最坏到 `TimeoutStopSec`）。旧节点注册消失、
+  新节点在放置环内且就绪、client 没少，脚本即成功退出，并在结束事件里注明旧 unit 可能
+  还在停止；它会自己停完，不用再做什么。所以 `--timeout`（每个状态迁移的上限，默认
+  180 秒）不需要覆盖 unit 的停止时间。
+- **回滚要等旧 unit 停完再起来。** 停旧之后失败，脚本下发 `systemctl start --no-block`；
+  unit 还在停止时，systemd 把这个启动排在停止之后，停完才执行。脚本先等 unit 变回
+  `active`（上限为 `--stop-timeout` 加 `--timeout`），再等它重新入环并就绪——在这之前，
+  环里可能还留着正在退出的那个进程的注册。`--stop-timeout` 默认 660 秒，要大于 unit 的
+  `TimeoutStopSec`（示例 unit 是 600）。超过上限时以 4 退出，报错会说明 systemd 已经
+  接受了这次启动、停完后会执行，需要人工确认节点回环；只有启动命令本身没发出去时才要求
+  手工启动。
+- **新节点已启动、旧节点未停时失败：** 脚本停掉新节点并等它的 unit 停完（上限
+  `--stop-timeout`），它的注册随租约过期。
+- **就绪只看被问的那个节点。** `dfkvctl stat --all` 只要组内有成员不可达、不健康或健康
+  未知就以 1 退出，但表格照常打印。脚本读该节点自己那一行（可达，`READY`、`HEALTH` 为
+  `yes`，`MDS`、`RDMA` 不为 `NO`），别的成员——包括正在被替换的那个——不影响判断。没有
+  表格的非零退出（连不上 MDS、空环）仍按命令失败处理。
+- **新节点要在放置环内（eligible），旧节点只需已注册。** 旧节点可以已经被 MDS 移出
+  放置环（例如 IB 轨全断），这正是常见的替换原因；这时停它不改变放置，回滚也只要求它
+  重新注册。
 
 ```bash
 # 先做只读预检并打印会执行的 SSH/systemctl 动作
