@@ -102,6 +102,50 @@ _COUNTERS: dict[str, tuple[str, ...]] = {
     "dfkv_rdma_endpoint_cache_hits_total": (),
     "dfkv_rdma_endpoint_cache_misses_total": (),
     "dfkv_rdma_endpoint_cache_evictions_total": (),
+    # Rail and peer failure signals. Without them a rank cut off from a
+    # server's rails (no compatible rail) or a server's failing rails were
+    # invisible at the inference endpoint.
+    "dfkv_rdma_client_no_compatible_rail_total": (),
+    "dfkv_rdma_client_admission_failures_total": (),
+    "dfkv_rdma_client_local_resource_failures_total": (),
+    "dfkv_rdma_client_rail_wc_errors_total": ("dev", "status"),
+    "dfkv_rdma_client_cross_rail_retries_total": (),
+    "dfkv_rdma_client_cross_rail_retry_successes_total": (),
+    "dfkv_rdma_client_cross_rail_retry_exhausted_total": (),
+    "dfkv_rdma_client_peer_unreachable_total": (),
+    "dfkv_rdma_client_peer_unreachable_skips_total": (),
+    "dfkv_rdma_client_peer_busy_total": (),
+    "dfkv_rdma_client_peer_topology_updates_total": (),
+    "dfkv_rdma_client_remote_rail_normal_leases_total": (),
+    "dfkv_rdma_client_remote_rail_admissions_denied_total": (),
+    "dfkv_rdma_client_remote_rail_successes_total": (),
+    "dfkv_rdma_client_remote_rail_failures_total": (),
+    "dfkv_rdma_client_remote_rail_cooldowns_total": (),
+    "dfkv_rdma_client_remote_rail_recovery_probes_total": (),
+    "dfkv_rdma_client_remote_rail_recoveries_total": (),
+    "dfkv_rdma_client_remote_rail_abandons_total": (),
+    "dfkv_rdma_client_remote_rail_normal_leases_by_rail_total": ("dev",),
+    "dfkv_rdma_client_remote_rail_admissions_denied_by_rail_total": ("dev",),
+    "dfkv_rdma_client_remote_rail_successes_by_rail_total": ("dev",),
+    "dfkv_rdma_client_remote_rail_failures_by_rail_total": ("dev",),
+    "dfkv_rdma_client_remote_rail_cooldowns_by_rail_total": ("dev",),
+    "dfkv_rdma_client_remote_rail_recovery_probes_by_rail_total": ("dev",),
+    "dfkv_rdma_client_remote_rail_recoveries_by_rail_total": ("dev",),
+    "dfkv_rdma_client_remote_rail_abandons_by_rail_total": ("dev",),
+    # Data path, connection and pull accounting.
+    "dfkv_rdma_client_pull_prepares_total": (),
+    "dfkv_rdma_client_pull_reads_total": (),
+    "dfkv_rdma_client_pull_read_bytes_total": (),
+    "dfkv_rdma_client_pull_failures_total": (),
+    "dfkv_rdma_client_pull_releases_total": (),
+    "dfkv_rdma_client_pull_release_failures_total": (),
+    "dfkv_rdma_client_leaseput_ops_total": (),
+    "dfkv_rdma_client_leaseput_path_fallbacks_total": (),
+    "dfkv_rdma_client_stale_pool_connections_total": (),
+    "dfkv_rdma_client_stale_generation_reaps_total": (),
+    "dfkv_rdma_client_depth_refunds_total": (),
+    "dfkv_rdma_client_resource_budget_raises_total": (),
+    "dfkv_rdma_client_connection_class_opened_total": ("block_bytes", "depth"),
 }
 
 _GAUGES: dict[str, tuple[str, ...]] = {
@@ -136,6 +180,11 @@ _GAUGES: dict[str, tuple[str, ...]] = {
     "dfkv_rdma_client_pool_connections": ("lane", "state", "dev"),
     "dfkv_rdma_client_peer_connections": ("peer", "dev"),
     "dfkv_rdma_client_pool_limit": (),
+    "dfkv_rdma_client_topology_nodes": (),
+    "dfkv_rdma_client_inline_put_max_bytes": (),
+    "dfkv_rdma_client_connection_min_block_bytes": (),
+    "dfkv_rdma_client_connection_class_active": ("block_bytes", "depth"),
+    "dfkv_rdma_client_connection_class_idle": ("block_bytes", "depth"),
 }
 
 CLIENT_METRIC_SPECS: dict[str, MetricSpec] = {

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Connectors (SGLang HiCache, vLLM, LMCache), client metrics: every counter
+  and gauge the native client declares is mirrored to the inference server's
+  `/metrics`. The allowlist had fallen behind by 45 families, among them the
+  rail failure signals: `dfkv_rdma_client_no_compatible_rail_total` (a rank
+  that shares no healthy rail with a server), the
+  `dfkv_rdma_client_remote_rail_*` health counters, the cross-rail retry
+  counters, admission and pull failures, and
+  `dfkv_rdma_client_rail_wc_errors_total{dev,status}`. They were only in the
+  native snapshot. A test now scans the native sources for declared families
+  and fails on one that is neither mirrored nor listed as deliberately not
+  mirrored.
+
 - SGLang HiCache connector and client: retention results and calls are
   counted. A retention SET's per-key result was logged at debug level only,
   so a denied, failed or unsupported retention went unnoticed.

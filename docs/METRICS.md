@@ -375,6 +375,12 @@ TTL-debounced etcd probe 判定（`DFKV_MDS_PROBE_CACHE_MS`，默认 2500 ms 内
 SGLang 后台线程每 `client_stats_poll_s`（默认 10s，0=关）读取一次 C 客户端快照，
 把下列有界 family 镜像到插件 `/metrics` 并追加 `{tp_rank}`；request path 不做
 Prometheus 调用。vLLM 使用同一 allowlist，区别只是在 family 前加 `vllm:`，见 §3.5。
+原生客户端声明的每个 counter/gauge family 都在 allowlist 里，或在
+`integration/common/tests/test_client_metrics.py` 的 `_NOT_MIRRORED` 里写明原因；
+测试扫描原生源码中的 `# TYPE` 声明来检查。rail 与 peer 故障信号（
+`dfkv_rdma_client_no_compatible_rail_total`、`dfkv_rdma_client_remote_rail_*`、
+`dfkv_rdma_client_cross_rail_retr*`、`dfkv_rdma_client_admission_failures_total`、
+`dfkv_rdma_client_pull_failures_total` 等）因此也出现在插件 `/metrics` 上。
 
 | 指标 | 类型 | 含义 |
 |---|---|---|
@@ -461,7 +467,7 @@ C 客户端快照还含传输级指标（RDMA 构建）：
 | `dfkv_rdma_client_rail_quarantines_total{dev}` / `dfkv_rdma_client_rail_quarantined{dev}` / `dfkv_rdma_client_rail_recovery_probe{dev}` / `dfkv_rdma_client_rail_recoveries_total{dev}` | counter / gauge / gauge / counter | 连续 3 次 client-local failure 后隔离（默认 cooldown 5000 ms）/ 隔离状态 / cooldown 到期后唯一真实 probe / probe 成功恢复；probe local failure 重启 cooldown，endpoint failure 只释放 probe ownership |
 | `dfkv_rdma_client_numa_fallbacks_total{reason="caller_unknown\|no_local_rail"}` | counter | `DFKV_RDMA_NUMA=1` 无法建立 local mask 而回退全部 enabled rails |
 | `dfkv_rdma_cq_completions_total` / `dfkv_rdma_cq_errors_total` | counter | client CQ 完成 / 错误完成 |
-| `dfkv_rdma_client_rail_wc_errors_total{dev,status}` | counter | 因 work completion 失败而销毁的连接数，按本地 rail 和首个失败完成的 status 分解（随后被 flush 的完成不重复计，所以不等于 `dfkv_rdma_cq_errors_total`）。series 在首次出现时才导出，告警用 `dfkv_rdma_cq_errors_total`；对端地址不做 label，见 §3.7。目前只在原生 C 快照里，未加入插件镜像 allowlist |
+| `dfkv_rdma_client_rail_wc_errors_total{dev,status}` | counter | 因 work completion 失败而销毁的连接数，按本地 rail 和首个失败完成的 status 分解（随后被 flush 的完成不重复计，所以不等于 `dfkv_rdma_cq_errors_total`）。series 在首次出现时才导出，告警用 `dfkv_rdma_cq_errors_total`；对端地址不做 label，见 §3.7 |
 | `dfkv_rdma_client_pipeline_depth` | gauge | 握手解析后的有效 pipeline depth |
 | `dfkv_rdma_client_pool_connections{lane,state=\"idle|active\",dev}` | gauge | endpoint 按最后/当前 operation lane、ownership state 和 rail 分解；active 不含已隔离连接 |
 | `dfkv_rdma_client_peer_connections{peer,dev}` | gauge | 当前 live endpoint 按 MDS stable peer identity 与本地 rail 分解；连接销毁后 series 删除，cardinality 受 endpoint budget 上限约束 |
