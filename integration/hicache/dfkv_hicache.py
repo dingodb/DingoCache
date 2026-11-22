@@ -60,7 +60,11 @@ from dfkv_telemetry import tracing as _tracing
 _log = logging.getLogger(__name__)
 
 
-def _gpu_load_fence() -> None:
+def _gpu_load_fence_enabled() -> bool:
+    return os.environ.get("DFKV_GPU_LOAD_FENCE", "1") == "1"
+
+
+def _gpu_load_fence(device=None) -> None:
     """Order GPUDirect RDMA writes before subsequent CUDA kernels.
 
     The GPUDirect RDMA design guide (Synchronization and Memory Ordering)
@@ -69,13 +73,30 @@ def _gpu_load_fence() -> None:
     CQ proves transmission, not arrival in device memory. Drivers reject
     CU_POINTER_ATTRIBUTE_SYNC_MEMOPS on VMM/cuMemMap pools (vLLM LBHNC), so
     the connector issues a device synchronization as the ordering fence
-    after any hit scatter. Disable with DFKV_GPU_LOAD_FENCE=0.
+    after any hit scatter. ``device`` is the GPU the bytes landed on; None
+    synchronizes the calling thread's current device. Disable with
+    DFKV_GPU_LOAD_FENCE=0.
     """
-    if os.environ.get("DFKV_GPU_LOAD_FENCE", "1") != "1":
+    if not _gpu_load_fence_enabled():
         return
     import torch
     if torch.cuda.is_available():
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(device)
+
+
+def _cuda_device_of(pool) -> Optional[int]:
+    """CUDA device index of a device pool's buffers, if they say."""
+    for attr in ("kv_buffer", "k_buffer", "index_k_with_scale_buffer"):
+        tensors = getattr(pool, attr, None)
+        if tensors is None or len(tensors) == 0:
+            continue
+        device = getattr(tensors[0], "device", None)
+        if getattr(device, "type", None) != "cuda":
+            return None
+        index = getattr(device, "index", None)
+        if isinstance(index, int) and not isinstance(index, bool):
+            return index
+    return None
 
 
 _FLAG_IS_MLA = 0x1
@@ -1428,6 +1449,29 @@ class DfkvHiCache(HiCacheStorage):
                   file=sys.stderr, flush=True)
         return True
 
+    def _note_load_device(self, pool) -> None:
+        """Remember the GPU device-direct reads land on.
+
+        CUDA's current device is per thread, and SGLang's storage threads
+        do not set it: a thread that never did is on device 0. The ordering
+        fence after a device-direct read, and the native GPU dedup's fence
+        before it publishes, synchronize the current device; on a rank whose
+        GPU is not 0 they would order the wrong GPU. The device is taken
+        from the pool's buffers, else from the registering thread (SGLang
+        registers from the rank's own thread, which has set its device).
+        """
+        if getattr(self, "_load_device", None) is not None:
+            return
+        index = _cuda_device_of(pool)
+        if index is None:
+            try:
+                import torch
+            except ImportError:
+                return
+            if torch.cuda.is_available():
+                index = int(torch.cuda.current_device())
+        self._load_device = index
+
     def _register_device_regions(self, regions, label: str) -> int:
         """Register GPU regions, failing closed when bypass was requested."""
         required = getattr(self, "_device_direct_requested", False)
@@ -1493,6 +1537,7 @@ class DfkvHiCache(HiCacheStorage):
                 result.result = f"failed ({type(exc).__name__})"
                 raise
             self.mem_pool_device = mem_pool_device
+            self._note_load_device(mem_pool_device)
             self._note_pool_layout(
                 "kv", mem_pool_device, device=True,
                 extra=self._device_segment_facts(mem_pool_device))
@@ -1575,6 +1620,7 @@ class DfkvHiCache(HiCacheStorage):
             if not hasattr(self, "_sidecar_device_pools"):
                 self._sidecar_device_pools = {}
             self._sidecar_device_pools[key] = device_pool
+            self._note_load_device(device_pool)
             self._note_pool_layout(key, device_pool, device=True)
             # The sidecar metadata API returns one logical object per page; its
             # layers are SG segments, not independent pool components.
@@ -1601,6 +1647,7 @@ class DfkvHiCache(HiCacheStorage):
                 result.result = f"failed ({type(exc).__name__})"
                 raise
             self.mem_pool_device_draft = mem_pool_device_draft
+            self._note_load_device(mem_pool_device_draft)
             self._note_pool_layout("draft", mem_pool_device_draft, device=True)
             result.result = (
                 f"registered {registered} draft device region(s)"
@@ -2290,13 +2337,23 @@ class DfkvHiCache(HiCacheStorage):
         narr = (ctypes.c_int * n)(*[len(p) for p in seg_ptrs])
         out_hit = (ctypes.c_int * n)()
         out_len = (ctypes.c_uint64 * n)()
-        rc = self._lib.dfkv_batch_get_auto_sg(
-            self._h, karr, klens, parr, carr, narr, n, out_hit, out_len)
-        if rc != 0:
-            return [0] * n, [0] * n
-        del inner_p; del inner_c; del parr; del carr; del narr
-        if any(h == 1 for h in out_hit):
-            _gpu_load_fence()
+        device = getattr(self, "_load_device", None)
+        scope = contextlib.nullcontext()
+        if device is not None:
+            # The read and both fences (the native GPU dedup's before it
+            # publishes, ours after) act on the current device: make it the
+            # destination's for the call, whatever this thread was on.
+            import torch
+            if torch.cuda.is_available():
+                scope = torch.cuda.device(device)
+        with scope:
+            rc = self._lib.dfkv_batch_get_auto_sg(
+                self._h, karr, klens, parr, carr, narr, n, out_hit, out_len)
+            if rc != 0:
+                return [0] * n, [0] * n
+            del inner_p; del inner_c; del parr; del carr; del narr
+            if any(h == 1 for h in out_hit):
+                _gpu_load_fence(device)
         return [out_hit[i] for i in range(n)], [int(out_len[i]) for i in range(n)]
 
     def batch_get_v1_device(self, keys, device_indices, extra_info=None) -> List[bool]:

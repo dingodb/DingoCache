@@ -124,7 +124,11 @@ scatter 后执行设备同步作为排序栅栏；`DFKV_GPU_LOAD_FENCE=0` 可关
 自行读取。这次同步是 `cuCtxSynchronize`（leader 读取线程的当前 context），
 会等该 context 里的全部工作，包括框架正在跑的 kernel；这段时间算在 follower
 的 `DFKV_NODE_DEDUP_WAIT_MS` 里，设备很忙时 follower 可能等不到发布而自行读取。
-它假定目的显存在当前设备上，与连接器自己的栅栏相同。
+它假定目的显存在当前设备上，与连接器自己的栅栏相同。CUDA 的当前设备是线程级的，
+SGLang 的存储线程不设置它（从未设置过的线程在 0 号卡上），所以 HiCache 连接器在注册
+device pool 时记下目的 GPU（取自 pool 的 buffer，否则取注册线程的当前设备），每次
+device-direct 读在该 GPU 上执行原生调用并只同步该 GPU；vLLM 连接器同样按模型所在设备
+同步。
 
 **CUDA GET publication 要区分传输路径**：原生 RDMA scalar/SG GET 可直接 READ
 到调用方已注册的 CUDA buffer。READ 完成后才报告命中；失败会 fence QP/MR，
