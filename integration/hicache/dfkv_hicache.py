@@ -648,6 +648,16 @@ _V2Io = collections.namedtuple(
     "_V2Io", ("nbytes", "seconds", "pools", "recovered"))
 
 
+def _pool_transfer_result(cls, final, hit, restorable):
+    """A PoolTransferResult, with the restorable prefix lengths if the
+    SGLang build has that field: with a trailing pool they are not every
+    length up to ``final``, and the controller intersects them across
+    ranks instead of taking each rank's longest."""
+    if "restorable_prefix_pages" in getattr(cls, "__dataclass_fields__", {}):
+        return cls(final, hit, restorable)
+    return cls(final, hit)
+
+
 def _meta_has_no_layout(meta) -> bool:
     """True when get_page_buffer_meta() explicitly declares "no physical layout".
 
@@ -3142,9 +3152,15 @@ class DfkvHiCache(HiCacheStorage):
             # primary KV prefix
             kv_pages = self.batch_exists(keys)
             hit = {"kv": kv_pages} if kv_pages else {}
-            final = kv_pages
+            # Prefix lengths every pool can serve. An ALL_PAGES pool serves a
+            # prefix when all its pages are present; a TRAILING_PAGES pool
+            # (SWA window, Mamba state) when the window ending at the prefix
+            # is. Each pool's own boundary taken separately and their minimum
+            # is not enough: the minimum can be a length at which a trailing
+            # window is incomplete, so the load of that length would miss.
+            restorable = set(range(1, kv_pages + 1))
             for tr in (pool_transfers or []):
-                if final == 0:
+                if not restorable:
                     break
                 name = str(tr.name)
                 sub = self._pool_sub(name)
@@ -3158,27 +3174,27 @@ class DfkvHiCache(HiCacheStorage):
                 present = self._fold(self._batch_exist_flat(sks), kv_pages, sub)
                 if tr.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                     # Only the *last* `trailing` pages of a candidate prefix need
-                    # this pool (e.g. SWA sliding window / Mamba state) — matches
-                    # SGLang's reference batch_exists_v2. The previous `all(present)`
-                    # wrongly required every prefix page, collapsing SWA hits to 0
-                    # once early window pages had been evicted.
+                    # this pool, as in SGLang's reference batch_exists_v2.
                     trailing = max(1, len(tr.keys) if tr.keys else 1)
-                    boundary = 0
-                    for prefix_len in range(kv_pages, 0, -1):
+                    serves = {
+                        prefix_len for prefix_len in range(1, kv_pages + 1)
                         if all(present[i] for i in
-                               range(max(0, prefix_len - trailing), prefix_len)):
-                            boundary = prefix_len
-                            break
+                               range(max(0, prefix_len - trailing), prefix_len))
+                    }
+                    boundary = max(serves, default=0)
                 else:  # ALL_PAGES
                     boundary = 0
                     for ok in present:
                         if not ok:
                             break
                         boundary += 1
+                    serves = set(range(1, boundary + 1))
                 if boundary:
                     hit[name] = boundary
-                final = min(final, boundary)
-            result = PoolTransferResult(final, hit)
+                restorable &= serves
+            final = max(restorable, default=0)
+            result = _pool_transfer_result(
+                PoolTransferResult, final, hit, sorted(restorable))
             r.result = (f"kv={result.kv_hit_pages}/{total} "
                         + ",".join(f"{k}={v}" for k, v in hit.items()
                                    if k != "kv")).strip()

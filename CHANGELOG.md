@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- SGLang HiCache connector, `batch_exists_v2`: the reported prefix is one
+  every side pool can serve. Each pool's boundary was computed on its own
+  and the minimum returned: with an ALL_PAGES pool complete up to page 6 and
+  a TRAILING_PAGES pool (sliding window, recurrent state) whose window is
+  complete only at pages 4 and 10, it reported 6, where the window is
+  missing, so the load that followed missed. It now reports the longest
+  prefix length at which every ALL_PAGES pool is complete and every trailing
+  window is (4 in the example). On SGLang builds whose `PoolTransferResult`
+  has `restorable_prefix_pages`, all such lengths are returned too: with a
+  trailing pool they are not every length up to the longest, and the
+  controller intersects them across ranks rather than taking the minimum of
+  each rank's longest.
 
 - LMCache connector, construction and the L2 adapter's size map. In
   LMCache's scheduler role the in-process connector failed with
