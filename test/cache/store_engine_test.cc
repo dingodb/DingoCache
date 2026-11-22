@@ -210,6 +210,8 @@ TEST_F(EngineTest, BackendRangeConformanceTable) {
 
   add_disk_backend("file", base_ / "file");
   add_disk_backend("slab", base_ / "slab");
+  ::setenv("DFKV_LSE_EXPERIMENTAL", "1", 1);
+  add_disk_backend("log", base_ / "log");
 
   RamTier::Options ram_options;
   ram_options.bytes = 8ull << 20;
@@ -465,8 +467,7 @@ TEST_F(EngineTest, AutoAndLogRefuseWhatTheyDoNotOwn) {
   const std::vector<Case> cases = {
       {"auto", {"notes.txt"}, "foreign"},
       {"auto", {"slab_meta", "lse_super"}, "slab and log"},
-      {"auto", {"lse_super"}, "not built yet"},
-      {"log", {}, "not built yet"},
+      {"auto", {"lse_super"}, "lse_super"},  // not a usable superblock
       {"log", {"slab_meta"}, "slab data"},
       // A file system check's leftovers: refused for the log engine only.
       {"auto", {"lse_super", "lost+found/#4711"}, "lost+found"},
@@ -601,4 +602,30 @@ TEST_F(EngineTest, MixedNodeReportsSlabViewsForSlabDisksOnly) {
       << "no zero samples for the file disk";
   EXPECT_NE(m.find("dfkv_disk_engine_info{" + file_disk + ",engine=\"file\"}"),
             std::string::npos);
+}
+
+// The log engine behind the group: the same round trips as the others, a
+// restart keeps what was stored, and "auto" finds the log directory again.
+TEST_F(EngineTest, LogEngineRoundTripsAcrossDisksAndRestarts) {
+  ::setenv("DFKV_LSE_EXPERIMENTAL", "1", 1);
+  DiskCacheGroup::Options o;
+  o.cache_dirs = Dirs(3);
+  o.capacity_bytes = 3ull << 30;
+  o.engine = "log";
+  {
+    DiskCacheGroup g(o);
+    ASSERT_TRUE(g.Healthy()) << g.StartupError();
+    EXPECT_EQ(g.EngineName(), "log");
+    EXPECT_FALSE(g.HasSlabDisks());
+    ExerciseGroup(g);
+    std::string v(5000, 'k');
+    ASSERT_EQ(g.Cache(BlockKey{77, 7}, v.data(), v.size()), Status::kOk);
+  }
+  o.engine = "auto";
+  DiskCacheGroup again(o);
+  ASSERT_TRUE(again.Healthy()) << again.StartupError();
+  EXPECT_EQ(again.EngineName(), "log");
+  std::string out;
+  ASSERT_EQ(again.Range(BlockKey{77, 7}, 0, 0, &out), Status::kOk);
+  EXPECT_EQ(out, std::string(5000, 'k'));
 }

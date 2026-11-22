@@ -27,6 +27,7 @@ namespace dfkv {
 class DiskSlabStore;
 class KvNodeServer;
 class KVStore;
+class LogStore;
 
 // Move-only ownership returned by the cheap prep half of RangeDirect. The lease
 // owns the opened descriptor and, for slot-based engines, the storage pin that
@@ -61,6 +62,7 @@ class ReadLease {
  private:
   friend class DiskSlabStore;
   friend class KVStore;
+  friend class LogStore;
   using ReleaseFn = void (*)(void* owner, uint64_t token) noexcept;
   static ReadLease Adopt(int fd, void* owner = nullptr, uint64_t token = 0,
                          ReleaseFn release = nullptr) noexcept {
