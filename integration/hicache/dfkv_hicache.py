@@ -124,16 +124,32 @@ def _physical_axis(cfg: dict, name: str) -> tuple[int, int]:
     return size, rank
 
 
-def _load_parallel_context():
-    """Return SGLang's initialized parallel context when available."""
+def _probe_parallel_context():
+    """SGLang's parallel context, and why there is none.
+
+    Returns ``(context, None)``, or ``(None, None)`` when this SGLang build
+    has no parallel-context API at all, or ``(None, exc)`` when the API is
+    there and did not deliver: the state is not initialized yet, or it has
+    changed shape. The two failures are not alike. A build without the API
+    describes its only CP axis in ``HiCacheStorageConfig``; a build with it
+    may run decode CP, whose coordinates exist nowhere else.
+    """
     try:
         try:
             from sglang.srt.runtime_context import get_parallel
         except ImportError:
             from sglang.srt.distributed import get_parallel
-        return get_parallel()
-    except (ImportError, AttributeError, AssertionError, RuntimeError):
-        return None
+    except ImportError:
+        return None, None
+    try:
+        return get_parallel(), None
+    except (ImportError, AttributeError, AssertionError, RuntimeError) as exc:
+        return None, exc
+
+
+def _load_parallel_context():
+    """Return SGLang's initialized parallel context when available."""
+    return _probe_parallel_context()[0]
 
 
 def _resolve_local_physical_rank(parallel=None) -> int:
@@ -286,25 +302,51 @@ def _resolve_prefill_cp_storage_layout(
 def _resolve_parallel_coordinates(
     cfg: dict,
     parallel=None,
+    *,
+    storage_config=None,
+    sources: Optional[dict] = None,
 ) -> tuple[tuple[int, int], tuple[int, int], Optional[int]]:
     """Resolve SGLang's physical CP coordinates, with explicit overrides.
 
     Recent SGLang releases do not copy attention-CP/DCP coordinates into the
     dynamic HiCache backend's ``extra_config``. Discover them from the initialized
     parallel state so sharded ranks cannot alias the default ``0/1`` keys.
+
+    Without the parallel state an axis that ``extra_config`` does not give is
+    never assumed to be unsharded just because nothing said otherwise: a rank
+    of a sharded deployment that stores under ``0/1`` reads another rank's
+    bytes as its own, with matching sizes. An axis is then taken from
+    ``storage_config`` where it carries it: PCP from ``attn_cp_size``/
+    ``attn_cp_rank`` (which SGLang always passes), DCP from ``dcp_size``/
+    ``dcp_rank`` (which builds with decode CP pass). Otherwise DCP is ``0/1``
+    only on a build that has no parallel-context API and so no decode CP;
+    when the API is there but failed, the coordinate is unknown and
+    resolution raises. ``sources``, if given, receives where each axis came
+    from.
     """
+    failure = None
     if parallel is None:
-        parallel = _load_parallel_context()
+        parallel, failure = _probe_parallel_context()
+
+    def note(name, source):
+        if sources is not None:
+            sources[name] = source
 
     resolved = {}
     runtime_fields = {
         "pcp": ("attn_cp_size", "attn_cp_rank"),
         "dcp": ("attn_dcp_size", "attn_dcp_rank"),
     }
+    storage_fields = {
+        "pcp": ("attn_cp_size", "attn_cp_rank"),
+        "dcp": ("dcp_size", "dcp_rank"),
+    }
     for name, (size_attr, rank_attr) in runtime_fields.items():
         if f"{name}_size" in cfg or f"{name}_rank" in cfg:
             resolved[name] = _physical_axis(cfg, name)
+            note(name, "extra_config")
         elif parallel is not None:
+            note(name, "parallel_context")
             size_value = getattr(parallel, size_attr, None)
             rank_value = getattr(parallel, rank_attr, None)
             if name == "dcp" and size_value is None and rank_value is None:
@@ -321,8 +363,30 @@ def _resolve_parallel_coordinates(
                     },
                     name,
                 )
+        elif (storage_config is not None
+              and hasattr(storage_config, storage_fields[name][0])):
+            size_attr, rank_attr = storage_fields[name]
+            resolved[name] = _physical_axis(
+                {
+                    f"{name}_size": getattr(storage_config, size_attr),
+                    f"{name}_rank": getattr(storage_config, rank_attr, 0),
+                },
+                name,
+            )
+            note(name, "storage_config")
+        elif failure is not None:
+            raise RuntimeError(
+                f"SGLang's parallel context could not be read "
+                f"({type(failure).__name__}: {failure}), so the {name} "
+                f"coordinate of this rank is unknown. Storing under "
+                f"{name}=0/1 could serve another rank's KV as this rank's. "
+                f"Pass {name}_size and {name}_rank in the HiCache "
+                f"extra_config, or create the storage backend after SGLang "
+                f"has initialized its parallel state"
+            ) from failure
         else:
             resolved[name] = (1, 0)
+            note(name, "default")
 
     attn_tp_rank = (
         int(getattr(parallel, "attn_tp_rank"))
@@ -599,11 +663,27 @@ class DfkvHiCache(HiCacheStorage):
         # Runtime PCP/DCP coordinates describe SGLang's compute topology. The
         # storage identity may intentionally collapse replicated Prefill-CP
         # ranks onto the elected writer's key; keep the two concepts separate.
+        self._coordinate_sources = {}
         (
             (self.pcp_size, self.pcp_rank),
             (self.dcp_size, self.dcp_rank),
             attn_tp_rank,
-        ) = _resolve_parallel_coordinates(cfg, parallel)
+        ) = _resolve_parallel_coordinates(
+            cfg, parallel, storage_config=storage_config,
+            sources=self._coordinate_sources)
+        self._parallel_context_missing = parallel is None
+        if parallel is None:
+            # Once per process. The coordinates decide which rank writes and
+            # which bytes a rank reads, so say where they came from.
+            _log.warning(
+                "dfkv: SGLang's parallel context is not available; storage "
+                "coordinates pcp=%d/%d (from %s) dcp=%d/%d (from %s); the "
+                "MLA writer is elected by tp_rank=%d because attn_tp_rank "
+                "is unknown",
+                self.pcp_rank, self.pcp_size,
+                self._coordinate_sources.get("pcp"),
+                self.dcp_rank, self.dcp_size,
+                self._coordinate_sources.get("dcp"), self.tp_rank)
         self.prefill_cp_storage_layout = _resolve_prefill_cp_storage_layout(
             cfg,
             is_mla=self.is_mla,
@@ -671,6 +751,8 @@ class DfkvHiCache(HiCacheStorage):
         # Client-side read/write counters (Prometheus when available). Lets ops
         # confirm SGLang->dfkv volume from /metrics instead of parsing access logs.
         self._metrics = _Metrics(self.tp_rank)
+        if self._parallel_context_missing:
+            self._metrics.on_parallel_context_fallback()
         # Load the native lib up front so its version can ride on the fleet-metrics
         # resource (dfkv_native_version). The actual client (dfkv_open) is created
         # later, inside the access-log "init" block. The plugin ships with the dfkv
@@ -1011,7 +1093,33 @@ class DfkvHiCache(HiCacheStorage):
             validate_object_sizes(
                 get_max_block_bytes(self._lib, self._h), sizes, context=context)
 
+    def _check_pool_dcp(self, pool, label: str) -> None:
+        """Refuse a pool whose DCP width contradicts this rank's coordinates.
+
+        Under decode CP SGLang sizes a host pool's logical page by its
+        ``dcp_size``. A pool that says DCP while this backend resolved another
+        width means the coordinates are wrong (not discovered, or misstated in
+        extra_config), and every key of this rank would carry them.
+        """
+        resolved = getattr(self, "dcp_size", None)
+        if resolved is None:
+            return
+        try:
+            pool_dcp = int(getattr(pool, "dcp_size", 1) or 1)
+        except (TypeError, ValueError):
+            return
+        if pool_dcp > 1 and pool_dcp != resolved:
+            raise RuntimeError(
+                f"{label} is laid out for dcp_size={pool_dcp}, but this "
+                f"backend resolved dcp={getattr(self, 'dcp_rank', 0)}/"
+                f"{resolved} (from "
+                f"{getattr(self, '_coordinate_sources', {}).get('dcp', '?')}"
+                f"). Storing with the wrong DCP coordinate would mix the KV "
+                f"of different ranks; pass dcp_size and dcp_rank in the "
+                f"HiCache extra_config")
+
     def register_mem_pool_host(self, mem_pool_host):
+        self._check_pool_dcp(mem_pool_host, "HiCache primary host pool")
         if self.transport_mode == "rdma":
             import torch
             indices = torch.arange(
@@ -1057,6 +1165,7 @@ class DfkvHiCache(HiCacheStorage):
         if not hasattr(self, "registered_pools"):
             self.registered_pools = {}
         name = str(host_pool_name)
+        self._check_pool_dcp(host_pool, f"HiCache host pool {name!r}")
         # Per-page component count for this pool. Multi-pool layouts are never
         # guessed: a bad probe would otherwise collapse independent components
         # into one replicated "all" object and serve corrupt/incomplete state.

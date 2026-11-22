@@ -4,9 +4,11 @@ Pure Python: no libdfkv, server, torch or numpy. A fake native client stands
 in for libdfkv and small stubs for the SGLang pools the connector is handed.
 """
 
+import contextlib
 import os
 import sys
 import threading
+import types
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -14,7 +16,8 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "..", "integration", "hicache"))
 
 import dfkv_hicache  # noqa: E402
-from sglang.srt.mem_cache.hicache_storage import PoolTransfer  # noqa: E402
+from sglang.srt.mem_cache.hicache_storage import (  # noqa: E402
+    HiCacheStorageConfig, PoolTransfer)
 
 
 class _HostPool:
@@ -298,6 +301,145 @@ class ConcurrentV2Transfers(unittest.TestCase):
         self.assertEqual(results, {"state": [True]})
         self.assertEqual((io.nbytes, io.pools), (64, ("state",)))
         self.assertEqual(set(vars(st)), before)
+
+
+@contextlib.contextmanager
+def _parallel_api(get_parallel):
+    """An SGLang build whose parallel-context API is ``get_parallel``."""
+    name = "sglang.srt.runtime_context"
+    previous = sys.modules.get(name)
+    module = types.ModuleType(name)
+    module.get_parallel = get_parallel
+    sys.modules[name] = module
+    try:
+        yield
+    finally:
+        if previous is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
+
+
+def _uninitialized():
+    raise AssertionError("parallel state is not initialized")
+
+
+def _storage_config(**kwargs):
+    return HiCacheStorageConfig(tp_rank=0, tp_size=8, **kwargs)
+
+
+class ParallelCoordinates(unittest.TestCase):
+    """Storage coordinates when SGLang's parallel context cannot be read.
+
+    They used to fall back to pcp=0/1 and dcp=0/1 without a word. A rank of
+    a sharded deployment then stored and read under another rank's keys.
+    """
+
+    resolve = staticmethod(dfkv_hicache._resolve_parallel_coordinates)
+
+    def test_api_present_but_failing_refuses_unknown_coordinates(self):
+        with _parallel_api(_uninitialized):
+            # Without the storage config, PCP is unknown as well. This used
+            # to resolve to pcp=0/1 and dcp=0/1.
+            with self.assertRaisesRegex(RuntimeError, "pcp coordinate"):
+                self.resolve({})
+            with self.assertRaisesRegex(RuntimeError, "dcp coordinate"):
+                self.resolve({}, storage_config=_storage_config())
+
+    def test_dcp_carried_by_the_storage_config_is_used(self):
+        # Current SGLang passes dcp_size/dcp_rank in HiCacheStorageConfig.
+        config = types.SimpleNamespace(
+            tp_rank=1, tp_size=8, attn_cp_size=1, attn_cp_rank=0,
+            dcp_size=2, dcp_rank=1)
+        for api in (_uninitialized, None):
+            sources = {}
+            with (_parallel_api(api) if api else contextlib.nullcontext()):
+                got = self.resolve({}, storage_config=config, sources=sources)
+            self.assertEqual(got, ((1, 0), (2, 1), None))
+            self.assertEqual(
+                sources, {"pcp": "storage_config", "dcp": "storage_config"})
+
+    def test_api_present_but_failing_accepts_explicit_coordinates(self):
+        sources = {}
+        with _parallel_api(_uninitialized):
+            pcp, dcp, attn_tp_rank = self.resolve(
+                {"dcp_size": 2, "dcp_rank": 1},
+                storage_config=_storage_config(attn_cp_size=4, attn_cp_rank=2),
+                sources=sources)
+        self.assertEqual((pcp, dcp, attn_tp_rank), ((4, 2), (2, 1), None))
+        self.assertEqual(
+            sources, {"pcp": "storage_config", "dcp": "extra_config"})
+
+    def test_build_without_the_api_takes_pcp_from_the_storage_config(self):
+        # The test shim has no parallel-context module at all.
+        sources = {}
+        pcp, dcp, attn_tp_rank = self.resolve(
+            {}, storage_config=_storage_config(attn_cp_size=4, attn_cp_rank=3),
+            sources=sources)
+        self.assertEqual((pcp, dcp, attn_tp_rank), ((4, 3), (1, 0), None))
+        self.assertEqual(sources, {"pcp": "storage_config", "dcp": "default"})
+
+    def test_build_without_the_api_and_no_cp_is_unsharded(self):
+        sources = {}
+        self.assertEqual(
+            self.resolve({}, storage_config=_storage_config(),
+                         sources=sources),
+            ((1, 0), (1, 0), None))
+        self.assertEqual(self.resolve({}), ((1, 0), (1, 0), None))
+
+    def test_invalid_storage_config_axis_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.resolve(
+                {}, storage_config=_storage_config(attn_cp_size=4,
+                                                   attn_cp_rank=4))
+
+    def test_available_context_is_still_the_source(self):
+        context = types.SimpleNamespace(
+            attn_cp_size=8, attn_cp_rank=3, attn_dcp_size=2, attn_dcp_rank=1,
+            attn_tp_rank=0)
+        sources = {}
+        with _parallel_api(lambda: context):
+            got = self.resolve(
+                {}, storage_config=_storage_config(), sources=sources)
+        self.assertEqual(got, ((8, 3), (2, 1), 0))
+        self.assertEqual(
+            sources, {"pcp": "parallel_context", "dcp": "parallel_context"})
+
+    def test_probe_tells_a_missing_api_from_a_failing_one(self):
+        self.assertEqual(dfkv_hicache._probe_parallel_context(), (None, None))
+        with _parallel_api(_uninitialized):
+            context, failure = dfkv_hicache._probe_parallel_context()
+        self.assertIsNone(context)
+        self.assertIsInstance(failure, AssertionError)
+
+    def test_fallback_is_counted(self):
+        metrics = dfkv_hicache._Metrics(0)
+        metrics.on_parallel_context_fallback()
+        self.assertEqual(metrics._c["parallel_context_fallbacks"], 1)
+
+
+class _DcpPool:
+    def __init__(self, dcp_size):
+        self.page_size = 4
+        self.dcp_size = dcp_size
+
+
+class PoolDcpCrossCheck(unittest.TestCase):
+    """A pool laid out for decode CP contradicts coordinates without it."""
+
+    def test_pool_with_another_dcp_width_is_refused(self):
+        st = _plugin(dcp_size=1, _coordinate_sources={"dcp": "default"})
+        with self.assertRaisesRegex(RuntimeError, "dcp_size=2"):
+            st.register_mem_host_pool_v2(_DcpPool(2), "state")
+        st.transport_mode = "tcp"
+        with self.assertRaisesRegex(RuntimeError, "dcp_size=2"):
+            st.register_mem_pool_host(_DcpPool(2))
+
+    def test_matching_or_absent_width_passes(self):
+        st = _plugin(dcp_size=2, dcp_rank=1)
+        st._check_pool_dcp(_DcpPool(2), "pool")
+        st._check_pool_dcp(object(), "pool")   # e.g. a state pool, page 1
+        st._check_pool_dcp(_DcpPool(1), "pool")
 
 
 if __name__ == "__main__":
