@@ -219,6 +219,35 @@ struct HookGate {
 };
 }  // namespace
 
+// A background thread that the system refuses to start (thread limit) fails
+// the store instead of terminating the process. Whichever of the two threads
+// is refused, the open reports a failure, the object can be destroyed (which
+// releases the directory), and the next open of the directory works.
+TEST_F(DiskSlabTest, RefusedBackgroundThreadFailsTheStoreNotTheProcess) {
+  for (const int which : {1, 2}) {
+    fs::remove_all(dir_);
+    {
+      // Activated by the constructor, where a refused thread used to escape
+      // as an exception.
+      DiskSlabStore::Options o = Opts(1 << 20, 1 << 20, 4096);
+      o.fail_thread_start_for_test = which;
+      bool ok = true;
+      DiskSlabStore s(o, &ok);
+      EXPECT_FALSE(ok) << "thread " << which << " refused, yet the store serves";
+      EXPECT_FALSE(s.Healthy());
+      EXPECT_NE(s.StartupError().find("thread"), std::string::npos)
+          << s.StartupError();
+    }
+    bool ok = false;
+    DiskSlabStore again(Opts(1 << 20, 1 << 20, 4096), &ok);
+    EXPECT_TRUE(ok) << "the directory is still locked or unusable (" << which
+                    << ")";
+    const std::string v(4096, 'r');
+    EXPECT_EQ(again.Cache(K(static_cast<uint64_t>(which)), v.data(), v.size()),
+              Status::kOk);
+  }
+}
+
 TEST_F(DiskSlabTest, PutGetRemoveRoundTrip) {
   bool ok = false;
   DiskSlabStore s(Opts(1 << 20, 1 << 20, 4096), &ok);

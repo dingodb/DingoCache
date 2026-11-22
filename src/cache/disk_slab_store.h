@@ -105,6 +105,9 @@ class DiskSlabStore : public StoreEngine {
     // with the local kernel (xfs, ext4, tmpfs). Tests that run on whatever
     // the build machine offers turn the check off.
     bool require_local_filesystem = true;
+    // Tests: make the start of the n-th background thread of Activate() fail
+    // as a refused thread creation does (1 = slab-sync, 2 = slab-reclaim).
+    int fail_thread_start_for_test = 0;
     // Leave a store that is found clean un-activated: see Activate().
     // DiskCacheGroup sets this and activates its disks together. The default
     // activates at the end of the constructor, as a store used on its own
@@ -324,6 +327,12 @@ class DiskSlabStore : public StoreEngine {
   // says. Idempotent; false if the dirty state could not be recorded (the
   // store is then unhealthy) or the store is closed.
   bool Activate() override;
+  // Starts one of Activate()'s background threads (which: 1 sync, 2
+  // reclaim). False, with the store failed, if the system refuses it.
+  template <typename Body>
+  bool StartThread(std::thread* thread, int which, const char* name,
+                   Body body);
+  void StopThreads();
   bool Activated() const {
     return activated_.load(std::memory_order_acquire);
   }
