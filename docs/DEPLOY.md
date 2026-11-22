@@ -674,6 +674,11 @@ SSH 前置位）：旧节点未停且新节点未标记启动 = safe abort 直�
   `TimeoutStopSec`（示例 unit 是 600）。超过上限时以 4 退出，报错会说明 systemd 已经
   接受了这次启动、停完后会执行，需要人工确认节点回环；只有启动命令本身没发出去时才要求
   手工启动。
+  **以 4 退出且报错是 “rollback not confirmed … systemd accepted the start” 时，等旧 unit
+  稳定下来再重跑脚本**（`systemctl show --property=ActiveState dfkv` 不再是
+  `deactivating`/`activating`，并看清旧节点有没有回到环里）。这段时间旧节点还没注册，
+  重跑会按“旧节点已退出、新节点健康”打印 nothing to do 并以 0 退出，而排着队的启动之后
+  仍会把旧节点带回环里。
 - **新节点已启动、旧节点未停时失败：** 脚本停掉新节点并等它的 unit 停完（上限
   `--stop-timeout`），它的注册随租约过期。
 - **就绪只看被问的那个节点。** `dfkvctl stat --all` 只要组内有成员不可达、不健康或健康

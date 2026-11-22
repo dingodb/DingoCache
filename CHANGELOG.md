@@ -12,7 +12,12 @@
   unchanged. The scripts need the `dfkvctl` of this release. The ring epoch
   they report is now the document's `placement_epoch`, the value the MDS and
   clients compare; their own calculation left out eligibility, never matched
-  it, and is gone.
+  it, and is gone. The audit also reads a registration whose strings are not
+  UTF-8 instead of giving up on it: byte for byte, the way `ring --json`
+  writes such strings (`\u00XX` for every byte outside printable ASCII), so
+  that member is compared like any other and gets the issues that are its
+  own. One such registration used to make the audit report the whole group as
+  `etcd_unreachable_or_invalid`.
 - Tools: what `deploy/dfkv_node_replace.py` requires of the two nodes.
   - The replacement has to be ring-eligible (own vnodes) before the old node
     is stopped. The old node only has to be registered: one the MDS already
