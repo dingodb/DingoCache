@@ -15,13 +15,14 @@ TEST(MemberViewGuard, FirstViewAdoptedAsIs) {
   EXPECT_TRUE(g2.Admit(64));
 }
 
-TEST(MemberViewGuard, GrowthAndSmallShrinkPassImmediately) {
+TEST(MemberViewGuard, GrowthPassesAndASmallShrinkOnceItRepeats) {
   MemberViewGuard g(3, 50);
   EXPECT_TRUE(g.Admit(64));
   EXPECT_TRUE(g.Admit(80));   // growth
-  EXPECT_TRUE(g.Admit(79));   // single-node failure must propagate fast
-  EXPECT_TRUE(g.Admit(41));   // 48% drop: below the 50% bar, adopt
-  EXPECT_EQ(g.rejected_shrink(), 0u);
+  EXPECT_TRUE(g.Admit(79));   // still above the 64 reference
+  EXPECT_FALSE(g.Admit(41));  // 36% below the reference: under the bar...
+  EXPECT_TRUE(g.Admit(41));   // ...believed on its second poll
+  EXPECT_EQ(g.rejected_shrink(), 1u);
 }
 
 TEST(MemberViewGuard, MassShrinkNeedsPersistence) {
@@ -32,7 +33,8 @@ TEST(MemberViewGuard, MassShrinkNeedsPersistence) {
   EXPECT_FALSE(g.Admit(5));   // poll 2: still suspect
   EXPECT_TRUE(g.Admit(5));    // poll 3: persisted -> believe the drain
   EXPECT_EQ(g.rejected_shrink(), 2u);
-  // Baseline moved to 5: a further small change passes.
+  // Reference moved to 5: a further small shrink needs only two polls.
+  EXPECT_FALSE(g.Admit(4));
   EXPECT_TRUE(g.Admit(4));
 }
 
@@ -40,7 +42,7 @@ TEST(MemberViewGuard, RecoveryDuringHysteresisResetsStreak) {
   MemberViewGuard g(3, 50);
   EXPECT_TRUE(g.Admit(64));
   EXPECT_FALSE(g.Admit(5));   // transient collapse
-  EXPECT_TRUE(g.Admit(63));   // etcd recovered: adopt, streak resets
+  EXPECT_TRUE(g.Admit(64));   // etcd recovered: adopt, streak resets
   EXPECT_FALSE(g.Admit(5));   // a NEW collapse restarts its own hysteresis
   EXPECT_FALSE(g.Admit(5));
   EXPECT_TRUE(g.Admit(5));
@@ -91,18 +93,22 @@ TEST(MemberViewGuard, OddAndSmallRingsUseExactPercentage) {
 
   MemberViewGuard boundary(3, 50);
   EXPECT_TRUE(boundary.Admit(2));
-  EXPECT_TRUE(boundary.Admit(1)) << "exactly 50% shrink is not over threshold";
+  EXPECT_FALSE(boundary.Admit(1));
+  EXPECT_TRUE(boundary.Admit(1)) << "exactly 50% is not a mass shrink";
 }
 
 TEST(MemberViewGuard, NonHalfBoundaryIsExact) {
   MemberViewGuard boundary(3, 33);
   EXPECT_TRUE(boundary.Admit(100));
-  EXPECT_TRUE(boundary.Admit(67)) << "exactly 33% shrink is not over threshold";
+  EXPECT_FALSE(boundary.Admit(67));
+  EXPECT_TRUE(boundary.Admit(67)) << "exactly 33% is not a mass shrink";
 
   MemberViewGuard odd(3, 34);
   EXPECT_TRUE(odd.Admit(3));
+  EXPECT_FALSE(odd.Admit(2));
   EXPECT_TRUE(odd.Admit(2));
   EXPECT_FALSE(odd.Admit(1));
+  EXPECT_FALSE(odd.Admit(1)) << "below the bar of the 3 reference";
 }
 
 TEST(MemberViewGuard, CrossMultiplicationDoesNotOverflowSizeT) {
@@ -113,7 +119,8 @@ TEST(MemberViewGuard, CrossMultiplicationDoesNotOverflowSizeT) {
 
   MemberViewGuard boundary(3, 50);
   EXPECT_TRUE(boundary.Admit(max - 1));
-  EXPECT_TRUE(boundary.Admit((max - 1) / 2));
+  EXPECT_FALSE(boundary.Admit((max - 1) / 2));
+  EXPECT_TRUE(boundary.Admit((max - 1) / 2)) << "not a mass shrink";
 }
 
 TEST(MemberViewGuard, DiffuseDecayChainFreezesReference) {
@@ -123,20 +130,19 @@ TEST(MemberViewGuard, DiffuseDecayChainFreezesReference) {
   // repeated value crosses the bar.
   MemberViewGuard g(3, 50);
   EXPECT_TRUE(g.Admit(64));
+  // Every hop is above the bar but none repeats: none is adopted.
   for (size_t v : {60ul, 56ul, 52ul, 48ul, 44ul, 40ul, 36ul, 33ul}) {
-    EXPECT_TRUE(g.Admit(v)) << "hop " << v << " is legal vs its neighbor";
+    EXPECT_FALSE(g.Admit(v)) << "hop " << v << " adopted without repeating";
   }
-  EXPECT_EQ(g.rejected_shrink(), 0u);
-  // The reference did NOT slide along: a bounce back toward it is adopted
-  // immediately (against a ratcheted ~33 anchor this +50% jump would itself
-  // trip hysteresis).
-  EXPECT_TRUE(g.Admit(50));
+  EXPECT_EQ(g.rejected_shrink(), 8u);
+  // The reference did NOT slide along: back at it, the view is adopted.
+  EXPECT_TRUE(g.Admit(64));
   // 31 first crosses below 50% of the frozen 64 reference: hysteresis until
-  // ONE value persists, even though every prior hop was legal.
+  // ONE value persists.
   EXPECT_FALSE(g.Admit(31));
   EXPECT_FALSE(g.Admit(31));
   EXPECT_TRUE(g.Admit(31));   // persisted: real mass drain
-  EXPECT_EQ(g.rejected_shrink(), 2u);
+  EXPECT_EQ(g.rejected_shrink(), 10u);
 }
 
 TEST(MemberViewGuard, SuspiciousViewMustRepeatOneValue) {
@@ -176,10 +182,11 @@ TEST(MemberViewGuard, RecoveryRampAdoptsOnceAtPlateau) {
   EXPECT_EQ(g.rejected_growth(), 4u);
 }
 
-TEST(MemberViewGuard, SingleNodeEventsPassImmediately) {
+TEST(MemberViewGuard, SingleNodeEvents) {
   MemberViewGuard down(3, 50);
   EXPECT_TRUE(down.Admit(64));
-  EXPECT_TRUE(down.Admit(63));  // single-node failure propagates fast
+  EXPECT_FALSE(down.Admit(63));  // a single-node failure takes two polls
+  EXPECT_TRUE(down.Admit(63));
 
   MemberViewGuard up(3, 50);
   EXPECT_TRUE(up.Admit(64));
@@ -204,6 +211,66 @@ TEST(MemberViewGuard, GrowthArmWideMathDoesNotOverflow) {
   // Hundreds of nodes: exact percentage math, no float fuzz.
   MemberViewGuard big(3, 50);
   EXPECT_TRUE(big.Admit(300));
+  EXPECT_FALSE(big.Admit(299));
   EXPECT_TRUE(big.Admit(299));
   EXPECT_FALSE(big.Admit(100));  // -67% of the 300 reference: hysteresis
+}
+
+// A recovery ramp after an outage that the guard did not see as a mass
+// shrink (every view above the bar, members re-registering one by one) must
+// not be adopted view by view: each adoption rebuilds the ring on an
+// incomplete view. A shrink below the reference is believed once it repeats;
+// the ramp's views do not, and the full view is ordinary traffic again.
+TEST(MemberViewGuard, ARecoveryRampAboveTheShrinkBarIsNotAdoptedViewByView) {
+  MemberViewGuard g(3, 50);
+  EXPECT_TRUE(g.Admit(64));
+  for (size_t v : {40ul, 50ul, 60ul}) {
+    EXPECT_FALSE(g.Admit(v)) << "incomplete view " << v << " adopted";
+  }
+  EXPECT_TRUE(g.Admit(64));
+  EXPECT_EQ(g.rejected_shrink(), 3u);
+}
+
+// A real member loss still gets through, one poll later than before: the
+// smaller view is believed when it repeats.
+TEST(MemberViewGuard, AMemberLossIsBelievedWhenItsViewRepeats) {
+  MemberViewGuard g(3, 50);
+  EXPECT_TRUE(g.Admit(64));
+  EXPECT_FALSE(g.Admit(63));
+  EXPECT_TRUE(g.Admit(63));
+  EXPECT_TRUE(g.Admit(63));
+}
+
+// After a believed empty ring the first members to come back must not be
+// frozen in as the whole ring: the ring follows them as more register, and
+// the reference anchors only on a view that repeats.
+TEST(MemberViewGuard, AfterAnEmptyRingTheRingFollowsTheReturningMembers) {
+  MemberViewGuard g(3, 50);
+  EXPECT_TRUE(g.Admit(64));
+  EXPECT_FALSE(g.Admit(0));
+  EXPECT_FALSE(g.Admit(0));
+  EXPECT_TRUE(g.Admit(0));  // teardown believed
+  for (size_t v : {2ul, 5ul, 9ul, 20ul, 64ul}) {
+    EXPECT_TRUE(g.Admit(v)) << "view " << v << " held back after an empty ring";
+  }
+  EXPECT_EQ(g.rejected_growth(), 0u);
+  EXPECT_TRUE(g.Admit(64));
+  EXPECT_TRUE(g.Admit(64));  // repeated: the reference is 64 now
+  EXPECT_FALSE(g.Admit(5));  // so a collapse to 5 is a mass shrink again
+}
+
+// While the reference is not anchored yet (members coming back after an
+// empty ring), the last adopted view stands in for it on the shrink side: one
+// bad poll that shows far fewer members is held back like any mass shrink,
+// and the ramp's growth stays free.
+TEST(MemberViewGuard, AfterAnEmptyRingOneBadPollDoesNotShrinkTheRing) {
+  MemberViewGuard g(3, 50);
+  EXPECT_TRUE(g.Admit(64));
+  EXPECT_FALSE(g.Admit(0));
+  EXPECT_FALSE(g.Admit(0));
+  EXPECT_TRUE(g.Admit(0));
+  for (size_t v : {2ul, 5ul, 9ul, 20ul, 40ul}) EXPECT_TRUE(g.Admit(v)) << v;
+  EXPECT_FALSE(g.Admit(3)) << "one bad poll rebuilt the ring";
+  EXPECT_TRUE(g.Admit(40));
+  EXPECT_TRUE(g.Admit(50)) << "growth stays free";
 }

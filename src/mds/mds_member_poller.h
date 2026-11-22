@@ -1,6 +1,7 @@
 #ifndef DFKV_MDS_MEMBER_POLLER_H_
 #define DFKV_MDS_MEMBER_POLLER_H_
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -31,8 +32,23 @@ namespace dfkv {
 // adjacent-hop guard has: diffuse mass expiry (heartbeat phases spread over
 // polls, each hop below the bar) can no longer walk the anchor down hop by
 // hop, and a recovery ramp of ever-changing views can no longer rebuild the
-// ring once per epoch. Small deviations still pass through immediately —
-// single-node failures propagate fast. Pure logic; unit-tested without etcd.
+// ring once per epoch. Growth below the bar passes through immediately. A
+// smaller view than the reference that is not a mass shrink is believed once
+// it repeats (two polls in a row), so a recovery ramp whose views all sit
+// above the shrink bar (members re-registering one by one) is not adopted view
+// by view. The price: a member loss reaches the ring one poll later, and a
+// view that keeps changing is not adopted while it changes. A steady decline
+// (N-1, N-2, ... one member per poll) is adopted only once it stops, and a
+// member flapping between N and N-1 never drops out of the ring. Clients
+// still skip a dead member at once through their peer-health cooldown
+// (PeerHealth), so the cost is misses on its keys, not wrong placement of
+// data. After a believed empty ring the views of the returning members are
+// adopted as they come (better than no ring); the last adopted view then
+// stands in for the reference on the shrink side, so one bad poll far below
+// the ramp is still held back, and the reference anchors only on a view that
+// repeats views_to_accept_ times: the first few members back are not frozen
+// in as the whole ring by the growth arm. Pure logic; unit-tested without
+// etcd.
 class MemberViewGuard {
  public:
   MemberViewGuard(int views_to_accept, int shrink_pct)
@@ -70,6 +86,34 @@ class MemberViewGuard {
     empty_streak_ = 0;
 
     using Wide = unsigned __int128;
+    // Before the reference has anchored (stable_ref_ == 0, members coming
+    // back after a believed teardown) the last adopted view stands in for it,
+    // on the shrink side only: one bad poll far below the ramp is held back,
+    // and the ramp's growth stays free.
+    if (shrink_pct_ > 0 && stable_ref_ == 0 && baseline_ > 0) {
+      const Wide scaled = static_cast<Wide>(incoming) * 100;
+      const Wide ref = static_cast<Wide>(baseline_);
+      if (scaled < ref * static_cast<unsigned>(100 - shrink_pct_)) {
+        if (incoming == suspect_value_) {
+          ++suspect_streak_;
+        } else {
+          suspect_value_ = incoming;
+          suspect_streak_ = 1;
+        }
+        if (suspect_streak_ < views_to_accept_) {
+          ++rejected_shrink_;
+          return false;
+        }
+        suspect_streak_ = 0;  // persisted: the ramp really fell back
+      } else if (incoming < baseline_ &&
+                 same_streak_ < std::min(views_to_accept_, kShrinkRepeats)) {
+        suspect_streak_ = 0;
+        ++rejected_shrink_;
+        return false;
+      } else {
+        suspect_streak_ = 0;
+      }
+    }
     if (shrink_pct_ > 0 && stable_ref_ > 0) {
       // Deviation arms vs the FROZEN reference: a shrink below (100-pct)% of
       // it, or symmetric growth past (100+pct)% — wide math, no overflow.
@@ -98,15 +142,19 @@ class MemberViewGuard {
         return false;
       }
       suspect_streak_ = 0;
+      // A smaller view above the bar: believed once it repeats.
+      if (incoming < stable_ref_ &&
+          same_streak_ < std::min(views_to_accept_, kShrinkRepeats)) {
+        ++rejected_shrink_;
+        return false;
+      }
     }
 
     baseline_ = incoming;
-    if (stable_ref_ == 0 || same_streak_ >= views_to_accept_) {
-      // stable_ref_ == 0: re-registration after a believed teardown reanchors
-      // immediately (mirrors the first view). Otherwise the reference only
-      // advances to a value that proved stable across consecutive polls.
-      stable_ref_ = incoming;
-    }
+    // The reference only advances to a value that proved stable across
+    // consecutive polls, also after a believed teardown (stable_ref_ == 0),
+    // where the views of returning members are adopted meanwhile.
+    if (same_streak_ >= views_to_accept_) stable_ref_ = incoming;
     return true;
   }
 
@@ -115,8 +163,10 @@ class MemberViewGuard {
   uint64_t rejected_growth() const { return rejected_growth_; }
 
  private:
+  // Polls in a row a smaller view above the shrink bar must appear for.
+  static constexpr int kShrinkRepeats = 2;
   const int views_to_accept_;
-  const int shrink_pct_;  // 0 disables both deviation arms (empty arm stays on)
+  const int shrink_pct_;  // 0 disables the deviation arms (empty arm stays on)
   bool have_baseline_ = false;
   size_t baseline_ = 0;       // last admitted view's member count
   size_t stable_ref_ = 0;     // trusted reference; frozen while under suspicion

@@ -785,7 +785,12 @@ member 因缺少 HLT1 而产生 incomplete topology：未配置 tiers 时 homoge
 `kListTopology`，modern poll 失败并保留 last-good ring；rollout 必须 MDS-first。
 两层离线检测：
 - **层 2（权威）**：etcd lease 到期（TTL 30s）→ 下次 MDS poll（默认 3s）→
-  placement-content epoch 推进 → 环重建。小幅缩容通常约 TTL+一次 poll；
+  placement-content epoch 推进 → 环重建。小幅缩容要**同一值连续 2 次 poll**
+  才采纳（通常约 TTL+两次 poll）：停机恢复时成员逐个重注册、每个视图都在
+  阈值以内的斜坡因此不会逐个视图重建环；小幅扩容立即采纳。代价：一直在变的
+  视图在变化期间不会被采纳。每次 poll 少一个成员的持续下降要等它停下来才采纳；
+  在 N 和 N−1 之间来回抖动的成员一直不会被移出环。客户端仍会经 `PeerHealth`
+  的 cooldown 立即跳过已死的节点，所以代价是这些 key 的 miss，不是数据放错；
   偏离 `DFKV_MDS_SHRINK_GUARD_PCT`（默认 50，0=同时关闭 shrink/growth
   两臂，空视图臂常在）的批量视图要走 adoption guard：比较基准是**冻结的
   trusted reference**（不随每跳下移，挡住 diffuse mass-expiry 逐跳蚕食），
@@ -793,6 +798,10 @@ member 因缺少 HLT1 而产生 incomplete topology：未配置 tiers 时 homoge
   **同一值连续 3 次 poll** 才采纳；仍在逐跳变化的缩容/恢复斜坡每次 poll
   重置 streak，到 plateau 才一次采纳、中途不重建环。批量缩容被 guard
   挂起时默认最坏约 30s+3×3s，而不是固定“≤30s”。
+  客户端已采信空环之后，回来的成员视图边来边采纳（总比没有环好），
+  trusted reference 要等某个值连续 3 次 poll 才锚定，不会把最先回来的几个
+  节点当成整个环冻结住；锚定之前，缩容一侧以上一次采纳的视图为临时基准，
+  斜坡中途一次远低于它的坏视图仍会被挡住。
   etcd 拒绝写入造成的 lease 批量过期不依赖这道 guard：MDS 直接拒绝下发残缺
   视图（list 返回错误，客户端保留 last-good ring 与 peer topology），见 §2b。
 - **层 1（快速）**：`PeerHealth` 传输 IO 失败即短路该节点为 miss 并进入 cooldown，不触发环重建
