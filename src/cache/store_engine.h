@@ -380,6 +380,8 @@ class StoreEngine {
   }
   virtual uint32_t RetainHeadroomPct() const { return 0; }
   virtual uint32_t RetainMaxTtl() const { return 0; }
+  // The largest value this engine can ever store; a larger PUT is kInvalid.
+  virtual uint64_t MaxValueBytes() const { return UINT64_MAX; }
 };
 
 }  // namespace dfkv

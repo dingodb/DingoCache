@@ -1083,6 +1083,10 @@ std::string KvNodeServer::MetricsText() const {
            "RAM values dropped because the disk had no room: disk-ACK PUTs "
            "answered CacheFull, acknowledged values after the hold time",
            ram_->FlushNoRoomDropped());
+    metric("dfkv_ram_flush_refused_total", "counter",
+           "RAM values dropped because the disk will never take them "
+           "(Invalid: too large for it, or QuotaExceeded); not failures",
+           ram_->FlushRefused());
     s += ram_->AckToDurableLatencyMetrics(idlabels);
     metric("dfkv_ram_budget_bytes", "gauge",
            "Hard total RAM-tier budget across arena and dedicated values",
@@ -1252,10 +1256,12 @@ Status KvNodeServer::ProcessRequestForKey(
       // the normal disk path, never a terminal watermark rejection.
       // Nor may RAM acknowledge a value that can never reach its disk: once
       // that disk's store has failed for good the PUT goes the disk path and
-      // gets the store's I/O error, as it would without a RAM tier.
+      // gets the store's I/O error, as it would without a RAM tier; and a
+      // value larger than the disks can store gets their kInvalid.
       bool needs_disk = true;
       if (ram_write_back_ && ram_ &&
           group_.TenantQuotaBytes(key.tenant_hash) == 0 &&
+          payload_len <= group_.MaxValueBytes() &&
           !group_.DiskFailedFor(key)) {
         // The RAM tier releases key_lock before it waits for a flush.
         const RamTier::PutResult result =
@@ -1627,8 +1633,10 @@ Status KvNodeServer::CacheDirectForKey(
   // flush-pinned value is visible; disk-ACK waits for the same flush result.
   // Only capacity bypass falls through; watermark rejection is terminal.
   // A disk whose store has failed for good takes no RAM admission either: the
-  // value could never be flushed, so the PUT gets the store's I/O error.
-  if (ram_write_back_ && ram_ && unlimited && !group_.DiskFailedFor(key)) {
+  // value could never be flushed, so the PUT gets the store's I/O error. Nor
+  // does a value larger than the disks can store: it gets their kInvalid.
+  if (ram_write_back_ && ram_ && unlimited && len <= group_.MaxValueBytes() &&
+      !group_.DiskFailedFor(key)) {
     // The RAM tier releases key_lock before it waits for a flush.
     const RamTier::PutResult result =
         ram_ack_enabled_

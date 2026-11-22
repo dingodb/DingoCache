@@ -48,6 +48,19 @@
   already holds the key and answers it as for any key it has. Stock
   clients send these on separate connections; a peer that pipelines them
   on one could hang a server thread. No setting, API or wire change.
+- Server, RAM tier: a value the disks can never store is no longer
+  acknowledged from RAM and then lost. A PUT larger than a slab disk's
+  extent was taken into RAM (answered `kOk` with RAM-ACK), and its flush
+  got `kInvalid`; the tier treated that as a failed write, tried five
+  times over 4.25 s, dropped the value as acknowledged data lost
+  (`DfkvRamAcknowledgedDataLost`) and reported itself unhealthy for at
+  least 30 s. Such a PUT now skips the RAM tier and gets the disk's
+  `kInvalid` at once, as without a RAM tier. A flush the disk answers
+  `kInvalid` or `kQuotaExceeded` all the same (neither should reach it now:
+  tenants with a quota already skip RAM write-back) is a final answer of a
+  healthy disk: the value is dropped at once, without retries or health
+  change, counted in the new `dfkv_ram_flush_refused_total` and not as
+  lost, and a waiting PUT gets that answer. No setting, API or wire change.
 
 - Client, GPU dedup (`DFKV_CLIENT_NODE_DEDUP_GPU=1`): restarting the
   inference processes in place no longer uses up the GPU dedup registry.

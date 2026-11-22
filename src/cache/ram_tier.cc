@@ -641,13 +641,15 @@ void RamTier::CompletePut(
 }
 
 void RamTier::CompletePut(
-    const std::shared_ptr<PutCompletion>& completion, FlushOutcome outcome) {
+    const std::shared_ptr<PutCompletion>& completion, FlushOutcome outcome,
+    Status refused) {
   if (!completion) return;
   {
     std::lock_guard<std::mutex> lk(completion->mu);
     if (completion->done) return;
     completion->success = outcome == FlushOutcome::kFlushed;
     completion->outcome = outcome;
+    completion->refused = refused;
     completion->done = true;
   }
   completion->cv.notify_all();
@@ -717,6 +719,8 @@ RamTier::PutResult RamTier::AwaitPut(
     result.status = completion->success ? Status::kOk
                     : completion->outcome == FlushOutcome::kNoRoom
                         ? Status::kCacheFull
+                    : completion->outcome == FlushOutcome::kRefused
+                        ? completion->refused
                         : Status::kIOError;
   } else if (answered()) {
     result.flush = FlushOutcome::kNone;  // acknowledged from RAM
@@ -1520,6 +1524,7 @@ void RamTier::FlushLoop(Shard& s) {
         flush_no_room_.fetch_add(1, std::memory_order_relaxed);
         continue;
       }
+      if (Refused(result[i])) continue;
       NoteFlushOutcome(result[i] == Status::kOk);
       if (result[i] != Status::kOk && opt_.flush_target_failed)
         target_failed[i] = opt_.flush_target_failed(batch[i].key) ? 1 : 0;
@@ -1600,6 +1605,20 @@ void RamTier::FlushLoop(Shard& s) {
             flush_no_room_dropped_.fetch_add(1, std::memory_order_relaxed);
             CompletePut(completion, FlushOutcome::kNoRoom);
           }
+        } else if (Refused(result[i])) {
+          // The disk is fine and will never take this value (too large for
+          // it, or over its tenant's quota): no retry, no health change, and
+          // a waiting PUT gets the disk's answer.
+          const auto completion = entry.completion;
+          if (entry.flush_pin) {
+            if (entry.in_arena())
+              s.alloc->Unpin(entry.key, entry.slot_handle);
+            entry.flush_pin = false;
+          }
+          if (opt_.flush_given_up) opt_.flush_given_up(batch[i].key);
+          DropLocked(s, batch[i].key);
+          flush_refused_.fetch_add(1, std::memory_order_relaxed);
+          CompletePut(completion, FlushOutcome::kRefused, result[i]);
         } else if (!target_failed[i] &&
                    ++batch[i].tries < opt_.flush_retries) {
           // Try again: after a pause if the value was acknowledged already,
