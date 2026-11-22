@@ -2118,7 +2118,12 @@ class DfkvHiCache(HiCacheStorage):
 
     def _write_anchor_markers(self, keys) -> List[bool]:
         pages = self._write_anchor_markers_impl(keys)
-        if getattr(self._retain_tls, "ttl", 0) > 0:
+        # Like every other write: retain with this write's TTL, or with the
+        # one a batch_touch parked for these markers before they existed.
+        # Only the first was done; a parked TTL was never applied, and an
+        # evicted marker zeroes the hit prefix of side pools it protects.
+        if (getattr(self._retain_tls, "ttl", 0) > 0
+                or getattr(self, "_pending_retain", None)):
             sub = self._sub()
             self._retain_after_write(
                 [sk for k in keys for sk in self._keys(k)],

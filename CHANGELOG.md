@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- SGLang HiCache connector, models whose primary KV pool is a logical
+  anchor: the anchor's one-byte markers get the retention a `batch_touch`
+  asked for before they were written. A touch that finds a page not yet
+  stored parks its TTL, and the page's write applies it; the marker write
+  applied a TTL only when the write itself carried one. With the touch first
+  and a backup without a TTL, the side pools were protected and the markers
+  were not; an evicted marker makes the prefix a miss, so the protected side
+  pools held capacity no read could use.
+
 - SGLang HiCache connector, `batch_exists_v2`: the reported prefix is one
   every side pool can serve. Each pool's boundary was computed on its own
   and the minimum returned: with an ALL_PAGES pool complete up to page 6 and
