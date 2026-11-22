@@ -974,6 +974,18 @@ lsmod | grep nvidia_peermem
 - Mamba/KDA 使用独立 `mamba` pool 和物理 TP rank，所有状态分片都必须存在。
   MLA latent 的复制语义不能用于 recurrent state；混合模型不能通过客户端
   收敛或 elision 丢弃状态分片。复制型 attention 保持原来的 writer striping。
+- 一个 recurrent-state 层的每个状态张量都进对象。vLLM 0.26.x 及以前把这类层
+  （Mamba2、GDN、KDA 等）交给 connector 时是同一页内依次排列的多个张量视图
+  （conv state、SSM / recurrent state），0.27 起是覆盖整页的单个视图（由层自己
+  拆成各状态）。此前只存取列表里的第一个张量，命中后其余状态留着目标块的旧字节。
+  多张量形态的 group 改用 `mamba-states` pool：旧对象只含第一个张量，长度更短，load 会按长度拒绝，
+  但 SAVE 的 exists 探测会把它当作已存在而永不覆盖，所以不再寻址它们（这类部署冷启动一次）。
+  单视图形态（vLLM ≥0.27）的对象此前就是完整的，key 不变。
+- load 发现 key 下对象比本布局短（按 server 报告的存储长度；例如旧 connector 在 vLLM 0.26.x 上存的
+  只含第一个状态张量的对象，升级到 vLLM ≥0.27 后若 namespace 未变会再次被寻址，0.26.0 与 0.27.0 的
+  MambaSpec 字段相同）时，在 ring 支持 remove RPC 的情况下于后台尽力删除它（operation 指标
+  `load_remove_stale`），下一次 SAVE 重新写入；否则每次命中都要 load 失败，直到被淘汰。更长的对象
+  按未命中处理，不删除。
 - lookup 缩短候选前缀后，必须重验该边界的 state mask。采样保留尾部在 lookup
   前处理，不能在验证后再次把命中长度截短为另一个未经验证的 checkpoint。
 - 本版使用 `vllm-multiwr-v4` raw-layout ID，并把完整有效 cache-spec 几何绑定到

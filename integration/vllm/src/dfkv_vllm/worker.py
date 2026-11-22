@@ -1223,6 +1223,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         self._pool_stop_lock = threading.Lock()
         self._pool_stop_started = False
         self._pool_stop_done = threading.Event()
+        # Removes of stale objects (see _remove_stale) run here, off the
+        # thread that loads: a load can run on the model thread.
+        self._stale_remover: ThreadPoolExecutor | None = None
+        self._stale_remover_lock = threading.Lock()
+        self._warned_stale_remove = False
         self._peer_threads = [
             threading.Thread(
                 target=self._run_receive_worker,
@@ -1480,6 +1485,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             self._record_pool_sample("receive_queue_depth", 0)
             self._record_pool_sample("receive_active_workers", 0)
         finally:
+            self._shutdown_stale_remover()
             self._pool_stop_done.set()
 
     close = stop
@@ -1728,6 +1734,16 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                         len(rotated_keys),
                         failed_detail,
                     )
+                # A hit is only reported for an object read whole whose
+                # stored length (as the server reports it) fits the
+                # destination, so a mismatch here is a shorter object.
+                stale = [
+                    rotated_keys[i]
+                    for i in failed_indices
+                    if hits[i] == 1 and lens[i] < chunk_totals[i]
+                ]
+                if stale:
+                    self._schedule_stale_removal(client, stale)
 
         except Exception as e:
             # Any unexpected failure in the load path -> recompute this
@@ -1739,6 +1755,65 @@ class KVCacheStoreRecvingThread(KVTransferThread):
     def _cancel_request(self, req_meta: Any) -> None:
         self.cancel_requests(
             (req_meta.req_id,), wait=False, fail_closed=True
+        )
+
+    def _schedule_stale_removal(self, client: Any, keys: list[bytes]) -> None:
+        """Hand ``keys`` to the background remover; never blocks the load."""
+        with self._stale_remover_lock:
+            if self._pool_stop_started:
+                return
+            if self._stale_remover is None:
+                self._stale_remover = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="dfkv-stale-remove"
+                )
+            self._stale_remover.submit(self._remove_stale, client, keys)
+
+    def _shutdown_stale_remover(self) -> None:
+        # Queued removes are dropped; one already in the native client is
+        # waited for, so it cannot outlive the client handle.
+        with self._stale_remover_lock:
+            remover, self._stale_remover = self._stale_remover, None
+        if remover is not None:
+            remover.shutdown(wait=True, cancel_futures=True)
+
+    def _remove_stale(self, client: Any, keys: list[bytes]) -> None:
+        """Remove objects found under their key shorter than this layout's.
+
+        The namespace binds the cache geometry, so a shorter object under a
+        key is not a variant some other reader can use: it is
+        one written by an older connector or engine layout (a recurrent-state
+        object of the first state tensor only, from before every tensor was
+        saved). Left in place, every SAVE's exists probe would keep finding it
+        and never write the right one, and every hit would fail its load
+        until the server evicted it. Removed, the next SAVE writes it again.
+        """
+        start = time.perf_counter()
+        # This runs as a background future, whose exceptions nobody reads:
+        # every failure is caught here, counted and logged.
+        try:
+            if not client.supports_remove():
+                self._record_operation(
+                    "load_remove_stale", start, len(keys),
+                    status="unsupported", num_failed_keys=len(keys),
+                )
+                return
+            removed = client.batch_remove(keys)
+            not_removed = sum(1 for rc in removed if rc != 1)
+        except Exception as e:
+            # Best effort: the object is only left in place.
+            self._record_operation(
+                "load_remove_stale", start, len(keys),
+                status="error", num_failed_keys=len(keys),
+            )
+            log = logger.debug if self._warned_stale_remove else logger.warning
+            self._warned_stale_remove = True
+            log("dfkv stale-object remove failed (further failures are only "
+                "counted as load_remove_stale errors): %r", e)
+            return
+        self._record_operation(
+            "load_remove_stale", start, len(keys),
+            status="partial_failure" if not_removed else "ok",
+            num_failed_keys=not_removed,
         )
 
 
@@ -2221,13 +2296,15 @@ class DfkvStoreWorker:
             logger.warning("No KV caches to offload.")
             return
 
-        # Resolve each entry to a representative tensor for storage
-        # deduplication. For attention layers the value is already a tensor;
-        # for Mamba layers it is a list of tensors that all share the same
-        # underlying raw storage, so we take the first one.
-        def _repr_tensor(v: torch.Tensor | list[torch.Tensor]) -> torch.Tensor:
-            assert isinstance(v, torch.Tensor | list)
-            return v if isinstance(v, torch.Tensor) else v[0]
+        # An attention layer is one tensor. A recurrent-state layer (Mamba,
+        # GDN, KDA, ...) is, in vLLM 0.26.x and earlier, a list of tensors --
+        # conv state, SSM / recurrent state -- that are views of one page
+        # buffer at successive offsets; from 0.27 it is one view over the
+        # whole page.
+        # Every tensor's bytes belong to the object: a hit that restored only
+        # the first would leave the others' bytes stale in the target block.
+        def _layer_tensors(v) -> list:
+            return list(v) if isinstance(v, list | tuple) else [v]
 
         # The committed block count. Under vLLM's extensible KV cache the
         # connector registers inside extend_kv_cache, before the worker
@@ -2265,6 +2342,8 @@ class DfkvStoreWorker:
         group_seg_layouts: list[list[tuple[int, int, int]]] = [
             [] for _ in self.token_dbs
         ]
+        # Groups whose layers came as several state tensors: see below.
+        multi_tensor_groups: set[int] = set()
 
         # Dict insertion order is not a storage-layout contract. Canonicalize by
         # semantic layer name so independently constructed producer/consumer
@@ -2273,56 +2352,60 @@ class DfkvStoreWorker:
             g_idx = layer_to_group[layer_name]
             if not self.token_dbs[g_idx].cacheable:
                 continue
-            cache = _repr_tensor(kv_caches[layer_name])
-            cache_storage = cache.untyped_storage()
-            base_addr = cache_storage.data_ptr()
-            region_len = cache_storage.nbytes()
+            tensors = _layer_tensors(kv_caches[layer_name])
+            if len(tensors) > 1:
+                multi_tensor_groups.add(g_idx)
+            for cache in tensors:
+                cache_storage = cache.untyped_storage()
+                base_addr = cache_storage.data_ptr()
+                region_len = cache_storage.nbytes()
 
-            # register_memory raises on failure (vs Mooncake's int return), so
-            # a failed GPUDirect MR registration aborts bring-up loudly. Register
-            # each physical storage region ONCE (aliased groups reuse the MR).
-            if base_addr not in registered_ptrs:
-                registered_ptrs.add(base_addr)
-                # Recorded even when the client is elided: a lazy un-elide
-                # (load reaching an elided rank) must replay these
-                # registrations before its first GET.
-                self._kv_pool_regions.append((base_addr, region_len))
-                if self.client is not None:
-                    self.client.register_memory(base_addr, region_len)
+                # register_memory raises on failure (vs Mooncake's int return), so
+                # a failed GPUDirect MR registration aborts bring-up loudly. Register
+                # each physical storage region ONCE (aliased groups reuse the MR).
+                if base_addr not in registered_ptrs:
+                    registered_ptrs.add(base_addr)
+                    # Recorded even when the client is elided: a lazy un-elide
+                    # (load reaching an elided rank) must replay these
+                    # registrations before its first GET.
+                    self._kv_pool_regions.append((base_addr, region_len))
+                    if self.client is not None:
+                        self.client.register_memory(base_addr, region_len)
 
-            layer_addr = cache.data_ptr()
-            el = cache.element_size()
-            page_size_bytes = region_len // self.num_blocks
-            outer_dims = [
-                d for d in range(cache.ndim) if cache.stride(d) * el > page_size_bytes
-            ]
-            if not outer_dims:
-                # Blocks-first layout (FlashInfer / MLA): one segment.
-                group_addrs[g_idx].append(layer_addr)
-                group_block_lens[g_idx].append(page_size_bytes)
-                # Exact geometry for blocks-first layouts. A layer may contain
-                # several disjoint contiguous runs inside one block (padding /
-                # transpose); represent every run explicitly rather than
-                # silently transferring the whole stride and crossing slots.
-                block_stride, runs = split_block_contiguous_runs(
-                    cache.shape, cache.stride(), el, logical_blocks=self.num_blocks
-                )
-                for offset, content in runs:
-                    group_seg_layouts[g_idx].append(
-                        (layer_addr + offset, block_stride, content)
+                layer_addr = cache.data_ptr()
+                el = cache.element_size()
+                page_size_bytes = region_len // self.num_blocks
+                outer_dims = [
+                    d for d in range(cache.ndim)
+                    if cache.stride(d) * el > page_size_bytes
+                ]
+                if not outer_dims:
+                    # Blocks-first layout (FlashInfer / MLA): one segment.
+                    group_addrs[g_idx].append(layer_addr)
+                    group_block_lens[g_idx].append(page_size_bytes)
+                    # Exact geometry for blocks-first layouts. A layer may contain
+                    # several disjoint contiguous runs inside one block (padding /
+                    # transpose); represent every run explicitly rather than
+                    # silently transferring the whole stride and crossing slots.
+                    block_stride, runs = split_block_contiguous_runs(
+                        cache.shape, cache.stride(), el, logical_blocks=self.num_blocks
                     )
-            else:
-                # K/V-first layout (FlashAttn / ROCm): split segments.
-                seg_stride = cache.stride(outer_dims[0]) * el
-                for idx in range(cache.shape[outer_dims[0]]):
-                    group_addrs[g_idx].append(layer_addr + idx * seg_stride)
-                    group_block_lens[g_idx].append(seg_stride // self.num_blocks)
-                    # Packed triple: per-block dense content equals the
-                    # legacy block_len for K/V-first layouts.
-                    packed = seg_stride // self.num_blocks
-                    group_seg_layouts[g_idx].append(
-                        (layer_addr + idx * seg_stride, packed, packed)
-                    )
+                    for offset, content in runs:
+                        group_seg_layouts[g_idx].append(
+                            (layer_addr + offset, block_stride, content)
+                        )
+                else:
+                    # K/V-first layout (FlashAttn / ROCm): split segments.
+                    seg_stride = cache.stride(outer_dims[0]) * el
+                    for idx in range(cache.shape[outer_dims[0]]):
+                        group_addrs[g_idx].append(layer_addr + idx * seg_stride)
+                        group_block_lens[g_idx].append(seg_stride // self.num_blocks)
+                        # Packed triple: per-block dense content equals the
+                        # legacy block_len for K/V-first layouts.
+                        packed = seg_stride // self.num_blocks
+                        group_seg_layouts[g_idx].append(
+                            (layer_addr + idx * seg_stride, packed, packed)
+                        )
 
         logger.info(
             "Registered KV caches: num_groups=%d, segments_per_group=%s, num_blocks=%d",
@@ -2341,6 +2424,15 @@ class DfkvStoreWorker:
             ]
             if seg_layout:
                 db.set_seg_layout(seg_layout)
+            if g_idx in multi_tensor_groups:
+                # Objects saved before every state tensor was included hold
+                # the first one only, under the same chunk hashes and of a
+                # shorter length. A load would reject them on length, but a
+                # SAVE finds them present and never replaces them: keep them
+                # out of reach under a pool of their own.
+                db.metadata = dataclasses.replace(
+                    db.metadata, pool_name=f"{db.metadata.pool_name}-states"
+                )
         if self.client is not None:
             self._validate_cache_block_sizes(self.client)
         # Start transfer threads
