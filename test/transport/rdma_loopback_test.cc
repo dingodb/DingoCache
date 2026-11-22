@@ -6102,12 +6102,27 @@ TEST(RdmaLoopback, EndpointOpenWithoutDescriptorsIsALocalFailure) {
     std::vector<char> exists;
     // A served operation leaves the peer's capabilities known, so the next
     // connection needs no probe, and its connection is then kept busy so
-    // that the next operation has to open another.
+    // that the next operation has to open another. With more than one rail
+    // an acquisition may choose a rail without an idle connection and open
+    // a new one, leaving the served connection in the pool for the next
+    // operation: connections are held until the pooled one is among them.
     const Status served = rt.ExistMany(node.addr, keys, &exists)[0];
     if (served == Status::kIOError || served == Status::kResourceExhausted)
       return 10;
-    auto* held = RdmaTransportTestPeer::AcquireControl(&rt, node.addr);
-    if (!held) return 11;
+    const auto pool_hits = [&] {
+      return CounterVal(rt.MetricsText(),
+                        "dfkv_rdma_endpoint_cache_hits_total");
+    };
+    const long hits_before = pool_hits();
+    std::vector<decltype(RdmaTransportTestPeer::AcquireControl(
+        &rt, node.addr))>
+        held;
+    while (pool_hits() == hits_before && held.size() < 16) {
+      auto* conn = RdmaTransportTestPeer::AcquireControl(&rt, node.addr);
+      if (!conn) return 11;
+      held.push_back(conn);
+    }
+    if (pool_hits() == hits_before) return 18;
 
     Status starved = Status::kOk;
     {
@@ -6125,9 +6140,13 @@ TEST(RdmaLoopback, EndpointOpenWithoutDescriptorsIsALocalFailure) {
     if (CounterVal(metrics, "dfkv_rdma_client_remote_rail_failures_total") !=
         0)
       return 16;
+    // Another rail would run out of descriptors the same way: not tried.
+    if (CounterVal(metrics, "dfkv_rdma_client_cross_rail_retries_total") != 0)
+      return 19;
     // With descriptors back the same operation is served.
     if (rt.ExistMany(node.addr, keys, &exists)[0] != served) return 17;
-    RdmaTransportTestPeer::ReleaseControl(&rt, node.addr, held);
+    for (auto* conn : held)
+      RdmaTransportTestPeer::ReleaseControl(&rt, node.addr, conn);
     return 0;
   });
   if (result == kNoDevice) GTEST_SKIP() << "no RDMA device";
