@@ -19,23 +19,39 @@
 #include "utils/numa_util.h"
 
 namespace dfkv {
-namespace {
-constexpr size_t kHugePageBytes = 2u << 20;
 
-// Anonymous memory of this process that is backed by transparent huge pages,
-// in bytes; 0 if the kernel does not say.
-uint64_t AnonHugePageBytes() {
-  std::FILE* f = std::fopen("/proc/self/smaps_rollup", "r");
+uint64_t AnonHugePageBytesIn(const void* start, size_t bytes) {
+  std::FILE* f = std::fopen("/proc/self/smaps", "r");
   if (f == nullptr) return 0;
-  char line[256];
-  unsigned long long kb = 0;
+  const auto first = reinterpret_cast<uintptr_t>(start);
+  // To the end of the last page: the kernel rounds the length of an madvise,
+  // mlock or mbind up to whole pages, so a mapping made by one of them for
+  // this range ends there, not at start + bytes.
+  const auto page = static_cast<uintptr_t>(::sysconf(_SC_PAGESIZE));
+  const uintptr_t last = (first + bytes + page - 1) / page * page;
+  char line[512];
+  bool inside = false;
+  uint64_t kb_total = 0;
   while (std::fgets(line, sizeof(line), f) != nullptr) {
-    if (std::sscanf(line, "AnonHugePages: %llu kB", &kb) == 1) break;
-    kb = 0;
+    unsigned long long from = 0, to = 0, kb = 0;
+    char perms[8];
+    // A mapping starts with "from-to perms ..."; its counters follow, each
+    // on a line of its own, until the next mapping. Mappings are listed in
+    // address order, so the first one past the range ends the pass.
+    if (std::sscanf(line, "%llx-%llx %7s", &from, &to, perms) == 3) {
+      if (from >= last) break;
+      inside = from >= first && to <= last;
+    } else if (inside &&
+               std::sscanf(line, "AnonHugePages: %llu kB", &kb) == 1) {
+      kb_total += kb;
+    }
   }
   std::fclose(f);
-  return kb << 10;
+  return kb_total << 10;
 }
+
+namespace {
+constexpr size_t kHugePageBytes = 2u << 20;
 
 // The bracketed (active) value of a transparent_hugepage sysfs setting, for
 // example "never" out of "always madvise [never]"; empty if it cannot be read.
@@ -242,12 +258,11 @@ RamTier::RamTier(Options opt, FlushFn flush)
                     "memory pressure");
   }
   {
-    // Reading smaps_rollup walks the page tables of everything mapped, which
-    // costs seconds for an arena on small pages: skipped where the answer is
-    // known to be zero.
+    // Reading smaps walks the page tables of what it lists, which costs
+    // seconds for an arena on small pages: skipped where the answer is known
+    // to be zero.
     const bool measure_huge =
         arena_hugepages_requested_ && !SystemHugePagesNever();
-    const uint64_t huge_before = measure_huge ? AnonHugePageBytes() : 0;
     const auto t0 = std::chrono::steady_clock::now();
     const unsigned hw = std::thread::hardware_concurrency();
     const size_t nt =
@@ -274,12 +289,11 @@ RamTier::RamTier(Options opt, FlushFn flush)
                         std::chrono::steady_clock::now() - t0)
                         .count();
     if (measure_huge) {
-      // What the pre-fault added to the process's huge-page-backed memory.
-      // Nothing else of this size is being touched at this point.
-      const uint64_t huge_after = AnonHugePageBytes();
-      arena_hugepage_bytes_ = std::min<uint64_t>(
-          huge_after > huge_before ? huge_after - huge_before : 0,
-          arena_bytes_);
+      // Counted in the arena's own mappings, not as a change of the whole
+      // process: the disks are opened while the arena is faulted in, and
+      // what they allocate meanwhile may sit on huge pages too. The madvise
+      // above gave the arena mappings of its own, split at its two ends.
+      arena_hugepage_bytes_ = AnonHugePageBytesIn(arena_, arena_size);
     }
     DFKV_LOG_INFO(
         "ram tier arena pre-faulted: " +

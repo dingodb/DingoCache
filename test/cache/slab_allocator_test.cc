@@ -7,10 +7,16 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <map>
+#include <random>
 #include <set>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -19,6 +25,219 @@
 using dfkv::BlockKey;
 using dfkv::SlabAllocator;
 using SlotRef = SlabAllocator::SlotRef;
+
+namespace dfkv {
+// Reads the allocator's private state for the bulk-restore equivalence tests
+// and carries the reference they compare against.
+class SlabAllocatorTestPeer {
+ public:
+  // RestoreBulk as it was through release 2.37: per-entry hash set of
+  // placements, sorted keys, and a linear search of the extent's free list
+  // for every slot taken. The production function must leave the allocator
+  // in exactly the state this one does.
+  // Once a release has shipped with the new restore this copy can go, and
+  // the comparison with it be replaced by a test of invariants (per-class
+  // resident counts, free lists, hand positions, per-key lookups).
+  static bool ReferenceRestore(
+      SlabAllocator* a, const std::vector<SlabAllocator::RestoreEntry>& entries) {
+    using RestoreEntry = SlabAllocator::RestoreEntry;
+    if (entries.empty()) return true;
+    std::vector<BlockKey> keys;
+    std::set<uint64_t> placements;
+    std::map<uint32_t, uint32_t> batch_extent_sizes;
+    for (const RestoreEntry& entry : entries) {
+      if (entry.slot_size == 0 || entry.extent >= a->extents_.size() ||
+          entry.slot_size > a->opt_.extent_bytes ||
+          entry.value_bytes > entry.slot_size ||
+          a->CanonicalSlotSize(entry.slot_size) != entry.slot_size ||
+          a->ClassForExactSize(entry.slot_size) == a->classes_.size() ||
+          entry.slot >= a->opt_.extent_bytes / entry.slot_size ||
+          a->index_.Find(entry.key) != nullptr)
+        return false;
+      keys.push_back(entry.key);
+      const uint64_t placement =
+          (static_cast<uint64_t>(entry.extent) << 32) | entry.slot;
+      if (!placements.emplace(placement).second) return false;
+      auto batch = batch_extent_sizes.emplace(entry.extent, entry.slot_size);
+      if (!batch.second && batch.first->second != entry.slot_size) return false;
+      const auto& extent = a->extents_[entry.extent];
+      if (extent.cls != SlabAllocator::kUnbound) {
+        const auto& cls = a->classes_[static_cast<size_t>(extent.cls)];
+        if (cls.slot_size != entry.slot_size) return false;
+        auto free_it = cls.free_by_ext.find(entry.extent);
+        if (free_it == cls.free_by_ext.end() ||
+            std::find(free_it->second.begin(), free_it->second.end(),
+                      entry.slot) == free_it->second.end())
+          return false;
+      }
+    }
+    std::sort(keys.begin(), keys.end(),
+              [](const BlockKey& x, const BlockKey& y) {
+                if (x.tenant_hash != y.tenant_hash)
+                  return x.tenant_hash < y.tenant_hash;
+                if (x.digest_hi != y.digest_hi) return x.digest_hi < y.digest_hi;
+                return x.digest_lo < y.digest_lo;
+              });
+    if (std::adjacent_find(keys.begin(), keys.end()) != keys.end()) return false;
+
+    a->slots_.reserve(a->slots_.size() + entries.size());
+    a->index_.Reserve(a->index_.size() + entries.size());
+    for (const RestoreEntry& entry : entries) {
+      const size_t cls_index = a->ClassForExactSize(entry.slot_size);
+      if (a->extents_[entry.extent].cls == SlabAllocator::kUnbound) {
+        if (a->BindExtentLocked(cls_index, entry.extent, true) !=
+            SlabAllocator::ExtentBindResult::kBound)
+          return false;
+      }
+      auto& cls = a->classes_[cls_index];
+      {
+        auto it = cls.free_by_ext.find(entry.extent);
+        if (it == cls.free_by_ext.end()) return false;
+        std::vector<uint32_t>& slots = it->second;
+        auto found = std::find(slots.begin(), slots.end(), entry.slot);
+        if (found == slots.end()) return false;
+        *found = slots.back();
+        slots.pop_back();
+        --cls.free_count;
+        if (slots.empty()) a->DropFromRotationLocked(cls, entry.extent);
+      }
+      const uint32_t meta_index = a->AcquireSlotMetaLocked();
+      auto& meta = a->slots_[meta_index];
+      meta.ref.cls = static_cast<uint32_t>(cls_index);
+      meta.ref.extent = entry.extent;
+      meta.ref.slot = entry.slot;
+      meta.ref.slot_size = entry.slot_size;
+      meta.ref.offset = static_cast<uint64_t>(entry.slot) * entry.slot_size;
+      meta.useful_bytes = entry.value_bytes;
+      meta.key = entry.key;
+      meta.live = true;
+      if (!a->index_.Insert(entry.key, meta_index)) return false;
+      a->LinkResidentLocked(meta_index);
+      auto& extent = a->extents_[entry.extent];
+      --extent.free_slots;
+      extent.useful_bytes += meta.useful_bytes;
+      cls.useful_bytes += meta.useful_bytes;
+      a->used_bytes_ += entry.slot_size;
+      if (a->retain_.enabled && entry.retain_until > a->retain_now_s_ &&
+          entry.retain_ttl_s != 0) {
+        const uint32_t ttl = std::min(entry.retain_ttl_s, a->retain_.max_ttl_s);
+        const uint64_t cap = static_cast<uint64_t>(a->retain_now_s_) + ttl;
+        meta.retain_ttl_s = ttl;
+        meta.retain_until = static_cast<uint32_t>(
+            std::min<uint64_t>(entry.retain_until, cap));
+        meta.retain_persisted_until = meta.retain_until;
+        a->ProtectLocked(meta_index);
+        a->PushWheelLocked(meta.key, meta.retain_until);
+      } else if (a->retain_.enabled) {
+        meta.retain_ttl_s = std::min(entry.retain_ttl_s, a->retain_.max_ttl_s);
+      }
+    }
+    return true;
+  }
+
+  static std::vector<uint32_t> UnboundExtents(const SlabAllocator& a) {
+    std::vector<uint32_t> out;
+    for (size_t e = 0; e < a.extents_.size(); ++e)
+      if (a.extents_[e].cls == SlabAllocator::kUnbound)
+        out.push_back(static_cast<uint32_t>(e));
+    return out;
+  }
+
+  static uint64_t IndexHash(const BlockKey& key) {
+    return SlabAllocator::FlatKeyIndex::Hash(key);
+  }
+
+  // Free slots of bound extents as (extent, slot, slot size), in a fixed order.
+  static std::vector<std::array<uint32_t, 3>> FreeSlots(const SlabAllocator& a) {
+    std::vector<std::array<uint32_t, 3>> out;
+    for (const auto& cls : a.classes_)
+      for (const auto& [extent, slots] : cls.free_by_ext)
+        for (uint32_t slot : slots) out.push_back({extent, slot, cls.slot_size});
+    std::sort(out.begin(), out.end());
+    return out;
+  }
+
+  // Every piece of state that decides what the allocator does next: free
+  // lists in their order, the rotation, every ring and hand, every slot
+  // record, the index layout, the retention wheel and the counters.
+  static std::string Dump(const SlabAllocator& a) {
+    std::ostringstream o;
+    auto key = [&o](const BlockKey& k) {
+      o << k.digest_hi << ':' << k.digest_lo << ':' << k.tenant_hash;
+    };
+    for (size_t c = 0; c < a.classes_.size(); ++c) {
+      const auto& cls = a.classes_[c];
+      o << "class " << c << ' ' << cls.slot_size << ' ' << cls.slots_per_extent
+        << " rr_next=" << cls.rr_next << " free=" << cls.free_count
+        << " resident=" << cls.resident_count << " bound=" << cls.bound_extents
+        << " puts=" << cls.puts << " useful=" << cls.useful_bytes
+        << " touches=" << cls.read_touches << " heat=" << cls.read_heat << '@'
+        << cls.heat_seq << " head=" << cls.ring_head << " hand=" << cls.hand
+        << " protected=" << cls.protected_slots << " clear_limited="
+        << cls.reclaim_clear_limited << "\n rotation";
+      for (uint32_t extent : cls.ext_rr) o << ' ' << extent;
+      std::map<uint32_t, const std::vector<uint32_t>*> lists;
+      for (const auto& [extent, slots] : cls.free_by_ext) lists[extent] = &slots;
+      for (const auto& [extent, slots] : lists) {
+        o << "\n free[" << extent << "]";
+        for (uint32_t slot : *slots) o << ' ' << slot;
+      }
+      o << '\n';
+    }
+    for (size_t e = 0; e < a.extents_.size(); ++e) {
+      const auto& x = a.extents_[e];
+      o << "extent " << e << ' ' << x.cls << ' ' << x.free_slots << ' '
+        << x.total_slots << ' ' << x.pinned << ' ' << x.youngest_seq << ' '
+        << x.access_seq_sum << ' ' << x.useful_bytes << ' ' << x.read_heat
+        << '@' << x.heat_seq << ' ' << x.resident_head << ' '
+        << x.resident_count << ' ' << x.protected_slots << '\n';
+    }
+    for (size_t i = 0; i < a.slots_.size(); ++i) {
+      const auto& m = a.slots_[i];
+      o << "slot " << i << ' ';
+      key(m.key);
+      o << ' ' << m.ref.cls << ' ' << m.ref.extent << ' ' << m.ref.slot << ' '
+        << m.ref.slot_size << ' ' << m.ref.offset << ' ' << m.useful_bytes
+        << " g=" << m.global_prev << ',' << m.global_next << " f="
+        << m.free_next << " t=" << m.read_touches << " a=" << m.access_seq
+        << " r=" << m.refs << " c=" << m.class_prev << ',' << m.class_next
+        << " e=" << m.extent_prev << ',' << m.extent_next << " ret="
+        << m.retain_until << ',' << m.retain_ttl_s << ','
+        << m.retain_persisted_until << ' ' << m.referenced << m.remove_pending
+        << m.live;
+      if (m.live) {
+        const uint32_t* found = a.index_.Find(m.key);
+        o << " index=" << (found ? static_cast<long long>(*found) : -1)
+          << " bucket=" << a.index_.BucketForTest(m.key);
+      }
+      o << '\n';
+    }
+    const auto index = a.index_.stats();
+    o << "index " << index.size << ' ' << index.capacity << ' '
+      << index.tombstones << ' ' << index.table_allocations << ' '
+      << index.rehashes << '\n';
+    o << "heads " << a.free_slot_meta_head_ << ' ' << a.global_ring_head_ << ' '
+      << a.global_hand_ << " unbound=" << a.unbound_ << " used="
+      << a.used_bytes_ << " seq=" << a.put_seq_ << ',' << a.activity_seq_
+      << " counters=" << a.evictions_ << ',' << a.steals_ << ','
+      << a.cold_steals_ << ',' << a.watermark_evictions_ << ','
+      << a.extent_returns_ << " retain=" << a.protected_bytes_ << ','
+      << a.protected_slots_ << ',' << a.wheel_entries_ << ',' << a.wheel_tick_
+      << '\n';
+    for (size_t t = 0; t < a.wheel_.size(); ++t) {
+      if (a.wheel_[t].empty()) continue;
+      o << "wheel " << t;
+      for (const auto& entry : a.wheel_[t]) {
+        o << ' ';
+        key(entry.key);
+        o << '@' << entry.until;
+      }
+      o << '\n';
+    }
+    return o.str();
+  }
+};
+}  // namespace dfkv
 
 namespace {
 BlockKey Key(std::string_view text) {
@@ -1607,4 +1826,398 @@ TEST(SlabAllocatorRetention, DisabledRetentionIsInert) {
             RetainCode::kHitUnprotected);
   EXPECT_EQ(a.ExpireRetention(kT0 + 1000), 0u);
   EXPECT_EQ(a.RetentionHeadroomPct(), 0u);
+}
+
+// Not a correctness test: prints how long RestoreBulk takes for a store of
+// production shape (1 GiB extents of 1 MiB slots, four in five slots
+// resident, records in table order). Set DFKV_SLAB_RESTORE_BENCH_OBJECTS (for
+// example 2300000) to run it; it needs no disk.
+TEST(SlabAllocator, RestoreBulkBench) {
+  const char* requested = std::getenv("DFKV_SLAB_RESTORE_BENCH_OBJECTS");
+  if (requested == nullptr || *requested == '\0')
+    GTEST_SKIP() << "set DFKV_SLAB_RESTORE_BENCH_OBJECTS to run";
+  const uint64_t objects = std::strtoull(requested, nullptr, 10);
+  ASSERT_GT(objects, 0u);
+  constexpr uint32_t kSlot = 1u << 20;
+  constexpr uint32_t kSlotsPerExtent = 1024;
+  const uint32_t extents =
+      static_cast<uint32_t>(objects * 5 / 4 / kSlotsPerExtent + 1);
+  std::mt19937_64 rng(25);
+  std::vector<SlabAllocator::RestoreEntry> entries;
+  entries.reserve(objects);
+  for (uint32_t e = 0; e < extents && entries.size() < objects; ++e)
+    for (uint32_t s = 0; s < kSlotsPerExtent && entries.size() < objects; ++s)
+      if (rng() % 5 != 0)
+        entries.push_back({BlockKey{rng(), rng(), rng() % 7}, kSlot, e, s,
+                           kSlot - 100});
+  for (int round = 0; round < 3; ++round) {
+    SlabAllocator allocator(
+        Opts(uint64_t{kSlot} * kSlotsPerExtent, extents, kSlot));
+    const auto started = std::chrono::steady_clock::now();
+    ASSERT_TRUE(allocator.RestoreBulk(entries));
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - started)
+                          .count();
+    ASSERT_EQ(allocator.Count(), entries.size());
+    std::printf("RESTORE_BENCH round=%d objects=%zu extents=%u restore_ms=%.1f\n",
+                round, entries.size(), extents, ms);
+  }
+}
+
+// ---- Bulk restore leaves exactly the state it always did ------------------
+//
+// RestoreBulk was rewritten for speed. Eviction order, the order free slots
+// are handed out in and the index layout after a restart all follow from the
+// state it leaves, so that state is compared, field by field, with the one
+// the previous implementation (kept in SlabAllocatorTestPeer) produces from
+// the same records; then both allocators are driven through the same
+// operations and compared again.
+namespace {
+using dfkv::SlabAllocatorTestPeer;
+using RestoreEntry = SlabAllocator::RestoreEntry;
+
+constexpr uint64_t kEqExtentBytes = 64 << 10;
+constexpr uint32_t kEqExtents = 24;
+constexpr uint32_t kEqNow = 1'000'000;
+
+std::string FirstDifference(const std::string& a, const std::string& b) {
+  std::istringstream left(a), right(b);
+  std::string x, y;
+  for (size_t line = 1;; ++line) {
+    const bool has_x = static_cast<bool>(std::getline(left, x));
+    const bool has_y = static_cast<bool>(std::getline(right, y));
+    if (!has_x && !has_y) return "identical";
+    if (!has_x || !has_y || x != y)
+      return "line " + std::to_string(line) + "\n  restore:   " +
+             (has_x ? x : "<end>") + "\n  reference: " + (has_y ? y : "<end>");
+  }
+}
+
+// The slot sizes this geometry really has (requests are rounded up to them).
+std::vector<uint32_t> EqSlotSizes() {
+  SlabAllocator probe(Opts(kEqExtentBytes, 8));
+  std::vector<uint32_t> sizes;
+  for (size_t len : {4096u, 8192u, 16384u, 30000u}) {
+    SlotRef ref;
+    std::vector<BlockKey> evicted;
+    if (probe.Put(BlockKey{len, 1, 0}, len, &ref, &evicted))
+      sizes.push_back(ref.slot_size);
+  }
+  std::sort(sizes.begin(), sizes.end());
+  sizes.erase(std::unique(sizes.begin(), sizes.end()), sizes.end());
+  return sizes;
+}
+
+// What both allocators went through before the restore: residents, reads,
+// removals, so extents are bound and their free lists are not in slot order.
+void EqPriorOps(SlabAllocator& a, uint64_t seed, int puts) {
+  std::mt19937_64 rng(seed);
+  const auto sizes = EqSlotSizes();
+  std::vector<BlockKey> keys;
+  for (int i = 0; i < puts; ++i) {
+    const BlockKey key{rng(), rng(), rng() % 3};
+    SlotRef ref;
+    std::vector<BlockKey> evicted;
+    if (a.Put(key, sizes[rng() % sizes.size()] - rng() % 100, &ref, &evicted))
+      keys.push_back(key);
+  }
+  for (size_t i = 0; i < keys.size(); ++i) {
+    SlotRef ref;
+    if (rng() % 4 == 0) a.Get(keys[i], &ref);
+    if (rng() % 3 == 0) a.Remove(keys[i]);
+  }
+}
+
+// Records for free slots of bound extents and for extents not bound yet.
+std::vector<RestoreEntry> EqEntries(const SlabAllocator& a, uint64_t seed,
+                                    bool retention, bool shuffled) {
+  std::mt19937_64 rng(seed);
+  const auto sizes = EqSlotSizes();
+  std::vector<RestoreEntry> entries;
+  auto add = [&](uint32_t extent, uint32_t slot, uint32_t slot_size) {
+    RestoreEntry entry;
+    entry.key = BlockKey{rng(), rng(), rng() % 3};
+    entry.slot_size = slot_size;
+    entry.extent = extent;
+    entry.slot = slot;
+    entry.value_bytes = slot_size - rng() % 200;
+    if (retention && rng() % 3 == 0) {
+      // Past, near and beyond-the-cap deadlines, and a zero TTL.
+      entry.retain_until = kEqNow - 50 + static_cast<uint32_t>(rng() % 5000);
+      entry.retain_ttl_s = static_cast<uint32_t>(rng() % 4000);
+    }
+    entries.push_back(entry);
+  };
+  for (const auto& free_slot : SlabAllocatorTestPeer::FreeSlots(a))
+    if (rng() % 2 == 0) add(free_slot[0], free_slot[1], free_slot[2]);
+  for (uint32_t extent : SlabAllocatorTestPeer::UnboundExtents(a)) {
+    if (rng() % 5 == 0) continue;  // stays unbound
+    const uint32_t slot_size = sizes[rng() % sizes.size()];
+    const uint32_t slots = static_cast<uint32_t>(kEqExtentBytes / slot_size);
+    // Some extents filled completely, some sparsely.
+    const uint64_t keep_one_in = 1 + rng() % 4;
+    for (uint32_t slot = 0; slot < slots; ++slot)
+      if (rng() % keep_one_in == 0) add(extent, slot, slot_size);
+  }
+  if (shuffled) std::shuffle(entries.begin(), entries.end(), rng);
+  return entries;
+}
+
+// The same operations on both allocators afterwards; returns what they
+// answered, so that the answers are compared as well as the final state.
+std::string EqLaterOps(SlabAllocator& a, const std::vector<RestoreEntry>& entries,
+                       uint64_t seed) {
+  std::mt19937_64 rng(seed);
+  const auto sizes = EqSlotSizes();
+  std::ostringstream out;
+  for (size_t i = 0; i < entries.size(); i += 3) {
+    SlotRef ref;
+    out << a.Get(entries[i].key, &ref) << ref.extent << '/' << ref.slot << ' ';
+  }
+  for (size_t i = 1; i < entries.size(); i += 7)
+    out << static_cast<int>(a.Remove(entries[i].key)) << ' ';
+  for (int i = 0; i < 600; ++i) {
+    SlotRef ref;
+    std::vector<BlockKey> evicted;
+    const bool ok = a.Put(BlockKey{rng(), rng(), rng() % 3},
+                          sizes[rng() % sizes.size()] - rng() % 100, &ref,
+                          &evicted);
+    out << ok << ref.extent << '/' << ref.slot;
+    for (const BlockKey& key : evicted) out << " -" << key.digest_hi;
+    out << '\n';
+  }
+  for (size_t cls = 0; cls < a.ClassCount(); ++cls) {
+    std::vector<BlockKey> evicted;
+    out << a.ReclaimClass(cls, 3, 5, &evicted);
+    for (const BlockKey& key : evicted) out << " -" << key.digest_hi;
+    out << '\n';
+  }
+  std::vector<BlockKey> evicted;
+  out << a.EvictColdToTarget(a.UsedBytes() / 2, 40, &evicted);
+  for (const BlockKey& key : evicted) out << " -" << key.digest_hi;
+  out << ' ' << a.ExpireRetention(kEqNow + 100000) << '\n';
+  return out.str();
+}
+
+struct EqPair {
+  explicit EqPair(bool retention)
+      : restore(Opts(kEqExtentBytes, kEqExtents)),
+        reference(Opts(kEqExtentBytes, kEqExtents)) {
+    if (!retention) return;
+    for (SlabAllocator* a : {&restore, &reference})
+      a->ConfigureRetention(RetainOpts(1 << 20, 3600), kEqNow);
+  }
+  ::testing::AssertionResult Same(const char* when) {
+    const std::string difference =
+        FirstDifference(SlabAllocatorTestPeer::Dump(restore),
+                        SlabAllocatorTestPeer::Dump(reference));
+    if (difference == "identical") return ::testing::AssertionSuccess();
+    return ::testing::AssertionFailure()
+           << "state differs " << when << " at " << difference;
+  }
+  SlabAllocator restore;    // goes through RestoreBulk
+  SlabAllocator reference;  // goes through the previous implementation
+};
+}  // namespace
+
+TEST(SlabAllocatorRestoreEquivalence, SameStateAndSameBehaviourAfterwards) {
+  size_t restored = 0;
+  for (uint64_t seed = 1; seed <= 40; ++seed) {
+    const bool retention = seed % 2 == 0;
+    const bool shuffled = seed % 3 == 0;
+    const int prior_puts = seed % 4 == 0 ? 0 : static_cast<int>(seed * 7 % 90);
+    SCOPED_TRACE("seed " + std::to_string(seed));
+    EqPair pair(retention);
+    EqPriorOps(pair.restore, seed, prior_puts);
+    EqPriorOps(pair.reference, seed, prior_puts);
+    ASSERT_TRUE(pair.Same("before the restore"));
+
+    const auto entries =
+        EqEntries(pair.restore, seed + 1000, retention, shuffled);
+    ASSERT_TRUE(pair.restore.RestoreBulk(entries));
+    ASSERT_TRUE(SlabAllocatorTestPeer::ReferenceRestore(&pair.reference, entries));
+    ASSERT_TRUE(pair.Same("after the restore"));
+    restored += entries.size();
+
+    // A second batch into the allocator the first one left.
+    const auto more = EqEntries(pair.restore, seed + 2000, retention, !shuffled);
+    ASSERT_TRUE(pair.restore.RestoreBulk(more));
+    ASSERT_TRUE(SlabAllocatorTestPeer::ReferenceRestore(&pair.reference, more));
+    ASSERT_TRUE(pair.Same("after the second restore"));
+
+    EXPECT_EQ(EqLaterOps(pair.restore, entries, seed + 3000),
+              EqLaterOps(pair.reference, entries, seed + 3000));
+    ASSERT_TRUE(pair.Same("after the later operations"));
+  }
+  EXPECT_GT(restored, 2000u) << "the cases restored next to nothing";
+}
+
+// A batch that is refused is refused by both, and neither has touched the
+// allocator: one case per reason, each planted at the front, in the middle
+// and at the end of an otherwise valid batch.
+TEST(SlabAllocatorRestoreEquivalence, RefusedBatchesLeaveTheStateAlone) {
+  enum Fault { kSameKey, kSamePlacement, kSecondSlotSize, kSlotTaken,
+               kSlotOutOfRange, kKeyResident, kFaults };
+  size_t refused = 0;
+  for (uint64_t seed = 1; seed <= 12; ++seed) {
+    for (int fault = 0; fault < kFaults; ++fault) {
+      for (int where = 0; where < 3; ++where) {
+        SCOPED_TRACE("seed " + std::to_string(seed) + " fault " +
+                     std::to_string(fault) + " where " + std::to_string(where));
+        EqPair pair(seed % 2 == 0);
+        EqPriorOps(pair.restore, seed, 60);
+        EqPriorOps(pair.reference, seed, 60);
+        auto entries = EqEntries(pair.restore, seed + 1000, seed % 2 == 0,
+                                 seed % 3 == 0);
+        ASSERT_GT(entries.size(), 8u);
+        const std::string before = SlabAllocatorTestPeer::Dump(pair.restore);
+        const size_t at = where == 0 ? 0
+                          : where == 1 ? entries.size() / 2
+                                       : entries.size() - 1;
+        const size_t other = at == 0 ? entries.size() - 1 : at - 1;
+        const auto sizes = EqSlotSizes();
+        switch (fault) {
+          case kSameKey:
+            entries[at].key = entries[other].key;
+            break;
+          case kSamePlacement:
+            entries[at].extent = entries[other].extent;
+            entries[at].slot = entries[other].slot;
+            entries[at].slot_size = entries[other].slot_size;
+            entries[at].value_bytes = 1;
+            break;
+          case kSecondSlotSize:
+            entries[at].slot_size = entries[at].slot_size == sizes[0]
+                                        ? sizes[1] : sizes[0];
+            entries[at].slot = 0;
+            entries[at].value_bytes = 1;
+            break;
+          case kSlotTaken: {
+            // The slot of something that is already resident.
+            SlotRef ref;
+            std::vector<BlockKey> evicted;
+            const BlockKey resident{seed, 77, 0};
+            ASSERT_TRUE(pair.restore.Put(resident, sizes[0], &ref, &evicted));
+            ASSERT_TRUE(pair.reference.Put(resident, sizes[0], &ref, &evicted));
+            entries = EqEntries(pair.restore, seed + 1000, false, false);
+            entries.insert(entries.begin() +
+                               static_cast<long>(std::min(at, entries.size())),
+                           RestoreEntry{BlockKey{seed, 78, 0}, ref.slot_size,
+                                        ref.extent, ref.slot, 1});
+            break;
+          }
+          case kSlotOutOfRange:
+            entries[at].slot =
+                static_cast<uint32_t>(kEqExtentBytes / entries[at].slot_size);
+            break;
+          case kKeyResident: {
+            SlotRef ref;
+            std::vector<BlockKey> evicted;
+            const BlockKey resident{seed, 79, 0};
+            ASSERT_TRUE(pair.restore.Put(resident, sizes[0], &ref, &evicted));
+            ASSERT_TRUE(pair.reference.Put(resident, sizes[0], &ref, &evicted));
+            entries = EqEntries(pair.restore, seed + 1000, false, false);
+            ASSERT_GT(entries.size(), 2u);
+            entries[std::min(at, entries.size() - 1)].key = resident;
+            break;
+          }
+        }
+        const std::string untouched = fault == kSlotTaken || fault == kKeyResident
+                                          ? SlabAllocatorTestPeer::Dump(pair.restore)
+                                          : before;
+        const bool restore_ok = pair.restore.RestoreBulk(entries);
+        const bool reference_ok =
+            SlabAllocatorTestPeer::ReferenceRestore(&pair.reference, entries);
+        EXPECT_EQ(restore_ok, reference_ok);
+        ASSERT_TRUE(pair.Same("after the refused batch"));
+        if (!restore_ok) {
+          ++refused;
+          EXPECT_EQ(SlabAllocatorTestPeer::Dump(pair.restore), untouched)
+              << "a refused batch changed the allocator";
+        }
+      }
+    }
+  }
+  // Nearly every planted fault must really be one (a second slot size on an
+  // extent with a single record, for example, is not).
+  EXPECT_GT(refused, 12u * kFaults * 3 * 8 / 10);
+}
+
+// Duplicate keys are found through equal 64-bit hashes, and equal hashes
+// alone prove nothing. The index hash is a chain of invertible steps, so a
+// second key with the hash of a given one can be computed; such a pair must
+// be restored like any two keys, and a real duplicate beside it still be
+// refused.
+namespace {
+uint64_t InverseOdd(uint64_t x) {  // x * InverseOdd(x) == 1 (mod 2^64)
+  uint64_t inverse = x;
+  for (int i = 0; i < 6; ++i) inverse *= 2 - x * inverse;
+  return inverse;
+}
+uint64_t UndoXorShift(uint64_t value, int shift) {
+  uint64_t out = value;
+  for (int i = shift; i < 64; i += shift) out = value ^ (out >> shift);
+  return out;
+}
+// The index hash's mixing step and its inverse.
+uint64_t IndexMix(uint64_t value) {
+  value ^= value >> 30;
+  value *= 0xbf58476d1ce4e5b9ULL;
+  value ^= value >> 27;
+  value *= 0x94d049bb133111ebULL;
+  return value ^ (value >> 31);
+}
+uint64_t IndexUnmix(uint64_t value) {
+  value = UndoXorShift(value, 31);
+  value *= InverseOdd(0x94d049bb133111ebULL);
+  value = UndoXorShift(value, 27);
+  value *= InverseOdd(0xbf58476d1ce4e5b9ULL);
+  return UndoXorShift(value, 30);
+}
+// Another key with the index hash of `key`: digest_hi is chosen freely and
+// digest_lo solved for.
+BlockKey SameIndexHash(const BlockKey& key, uint64_t other_digest_hi) {
+  const uint64_t lo_term = IndexMix(key.digest_hi + 0x9e3779b97f4a7c15ULL) ^
+                           IndexMix(key.digest_lo + 0x3c6ef372fe94f82aULL) ^
+                           IndexMix(other_digest_hi + 0x9e3779b97f4a7c15ULL);
+  return BlockKey{other_digest_hi, IndexUnmix(lo_term) - 0x3c6ef372fe94f82aULL,
+                  key.tenant_hash};
+}
+}  // namespace
+
+TEST(SlabAllocatorRestoreEquivalence, TwoKeysWithOneHashAreTwoKeys) {
+  const BlockKey first{0x1111, 0x2222, 3};
+  const BlockKey second = SameIndexHash(first, 0x9999);
+  ASSERT_FALSE(first == second);
+  ASSERT_EQ(SlabAllocatorTestPeer::IndexHash(first),
+            SlabAllocatorTestPeer::IndexHash(second))
+      << "the index hash changed; this test's inverse has to follow it";
+  const uint32_t slot_size = EqSlotSizes().front();
+
+  EqPair pair(false);
+  std::vector<RestoreEntry> entries{
+      {BlockKey{1, 1, 0}, slot_size, 0, 0, 100},
+      {first, slot_size, 0, 1, 200},
+      {BlockKey{2, 2, 0}, slot_size, 1, 0, 300},
+      {second, slot_size, 1, 3, 400},
+  };
+  ASSERT_TRUE(pair.restore.RestoreBulk(entries));
+  ASSERT_TRUE(SlabAllocatorTestPeer::ReferenceRestore(&pair.reference, entries));
+  ASSERT_TRUE(pair.Same("after restoring two keys with one hash"));
+  SlotRef ref;
+  ASSERT_TRUE(pair.restore.Get(first, &ref));
+  EXPECT_EQ(ref.extent, 0u);
+  EXPECT_EQ(ref.slot, 1u);
+  ASSERT_TRUE(pair.restore.Get(second, &ref));
+  EXPECT_EQ(ref.extent, 1u);
+  EXPECT_EQ(ref.slot, 3u);
+
+  // The same pair with a key that really occurs twice: refused, untouched.
+  EqPair refused(false);
+  const std::string before = SlabAllocatorTestPeer::Dump(refused.restore);
+  entries.push_back({BlockKey{1, 1, 0}, slot_size, 2, 0, 500});
+  EXPECT_FALSE(refused.restore.RestoreBulk(entries));
+  EXPECT_FALSE(
+      SlabAllocatorTestPeer::ReferenceRestore(&refused.reference, entries));
+  EXPECT_EQ(SlabAllocatorTestPeer::Dump(refused.restore), before);
 }

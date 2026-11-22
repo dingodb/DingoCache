@@ -4,7 +4,6 @@
 #include <cstdlib>
 #include <limits>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 
 #include "common/config_dump.h"
@@ -32,6 +31,12 @@ uint64_t SlabAllocator::FlatKeyIndex::Hash(const BlockKey& key) {
   hash ^= mix(key.digest_lo + 0x3c6ef372fe94f82aULL);
   hash ^= mix(key.tenant_hash + 0xdaa66d2c7ddef743ULL);
   return mix(hash);
+}
+
+void SlabAllocator::FlatKeyIndex::Prefetch(const BlockKey& key) const {
+  if (entries_.empty()) return;
+  __builtin_prefetch(
+      &entries_[static_cast<size_t>(Hash(key)) & (entries_.size() - 1)], 1);
 }
 
 uint32_t* SlabAllocator::FlatKeyIndex::Find(const BlockKey& key) {
@@ -214,22 +219,6 @@ void SlabAllocator::DropFromRotationLocked(Class& cls, uint32_t extent) {
     if (cls.rr_next >= cls.ext_rr.size() && !cls.ext_rr.empty()) cls.rr_next = 0;
     return;
   }
-}
-
-bool SlabAllocator::TakeFreeSlotLocked(Class& cls, uint32_t extent,
-                                       uint32_t slot) {
-  auto it = cls.free_by_ext.find(extent);
-  if (it == cls.free_by_ext.end()) return false;
-  std::vector<uint32_t>& slots = it->second;
-  auto found = std::find(slots.begin(), slots.end(), slot);
-  if (found == slots.end()) return false;
-  *found = slots.back();
-  slots.pop_back();
-  --cls.free_count;
-  if (slots.empty()) {
-    DropFromRotationLocked(cls, extent);
-  }
-  return true;
 }
 
 void SlabAllocator::DropExtentFreeLocked(Class& cls, uint32_t extent) {
@@ -457,12 +446,15 @@ bool SlabAllocator::RestoreBulk(const std::vector<RestoreEntry>& entries) {
   std::lock_guard<std::mutex> lock(mu_);
   if (entries.empty()) return true;
 
-  std::vector<BlockKey> keys;
-  std::unordered_set<uint64_t> placements;
-  std::unordered_map<uint32_t, uint32_t> batch_extent_sizes;
-  keys.reserve(entries.size());
-  placements.reserve(entries.size());
-  batch_extent_sizes.reserve(entries.size());
+  // Everything this pass keeps is flat and sized by the batch or by the
+  // geometry, never one heap node per entry: a restart restores millions.
+  // fingerprints: one hash per key, to find a key that occurs twice.
+  // batch_slot_size: the slot size this batch gave each extent (0 = none yet).
+  // placed: per extent, one bit per slot this batch has already placed.
+  std::vector<uint64_t> fingerprints;
+  std::vector<uint32_t> batch_slot_size(extents_.size(), 0);
+  std::vector<std::vector<uint64_t>> placed(extents_.size());
+  fingerprints.reserve(entries.size());
 
   for (const RestoreEntry& entry : entries) {
     if (entry.slot_size == 0 || entry.extent >= extents_.size() ||
@@ -473,13 +465,19 @@ bool SlabAllocator::RestoreBulk(const std::vector<RestoreEntry>& entries) {
         entry.slot >= opt_.extent_bytes / entry.slot_size ||
         index_.Find(entry.key) != nullptr)
       return false;
-    keys.push_back(entry.key);
-    const uint64_t placement =
-        (static_cast<uint64_t>(entry.extent) << 32) | entry.slot;
-    if (!placements.emplace(placement).second) return false;
-
-    auto batch = batch_extent_sizes.emplace(entry.extent, entry.slot_size);
-    if (!batch.second && batch.first->second != entry.slot_size) return false;
+    fingerprints.push_back(FlatKeyIndex::Hash(entry.key));
+    std::vector<uint64_t>& bits = placed[entry.extent];
+    if (bits.empty())
+      bits.assign(opt_.extent_bytes / entry.slot_size / 64 + 1, 0);
+    // A second slot size on the extent is refused just below, so the bitmap
+    // sized by the first one fits every slot that gets this far.
+    uint32_t& extent_slot_size = batch_slot_size[entry.extent];
+    if (extent_slot_size == 0) extent_slot_size = entry.slot_size;
+    if (extent_slot_size != entry.slot_size) return false;
+    uint64_t& word = bits[entry.slot / 64];
+    const uint64_t bit = uint64_t{1} << (entry.slot % 64);
+    if ((word & bit) != 0) return false;
+    word |= bit;
     const ExtentMeta& extent = extents_[entry.extent];
     if (extent.cls != kUnbound) {
       const Class& cls = classes_[static_cast<size_t>(extent.cls)];
@@ -491,18 +489,52 @@ bool SlabAllocator::RestoreBulk(const std::vector<RestoreEntry>& entries) {
         return false;
     }
   }
-  std::sort(keys.begin(), keys.end(), [](const BlockKey& a, const BlockKey& b) {
-    if (a.tenant_hash != b.tenant_hash) return a.tenant_hash < b.tenant_hash;
-    if (a.digest_hi != b.digest_hi) return a.digest_hi < b.digest_hi;
-    return a.digest_lo < b.digest_lo;
-  });
-  if (std::adjacent_find(keys.begin(), keys.end()) != keys.end()) return false;
+  // A key that occurs twice has two equal fingerprints; sorting 8-byte
+  // hashes finds that much faster than sorting the 24-byte keys. Two equal
+  // fingerprints are almost always that, but they prove nothing by
+  // themselves, so only then are the keys themselves sorted and compared.
+  std::sort(fingerprints.begin(), fingerprints.end());
+  if (std::adjacent_find(fingerprints.begin(), fingerprints.end()) !=
+      fingerprints.end()) {
+    std::vector<BlockKey> keys;
+    keys.reserve(entries.size());
+    for (const RestoreEntry& entry : entries) keys.push_back(entry.key);
+    std::sort(keys.begin(), keys.end(),
+              [](const BlockKey& a, const BlockKey& b) {
+                if (a.tenant_hash != b.tenant_hash)
+                  return a.tenant_hash < b.tenant_hash;
+                if (a.digest_hi != b.digest_hi) return a.digest_hi < b.digest_hi;
+                return a.digest_lo < b.digest_lo;
+              });
+    if (std::adjacent_find(keys.begin(), keys.end()) != keys.end())
+      return false;
+  }
+  fingerprints = {};
+  placed = {};
 
   slots_.reserve(slots_.size() + entries.size());
   index_.Reserve(index_.size() + entries.size());
 
+  // Taking a given slot out of an extent's free list: where each free slot
+  // sits in the list is kept beside it, so the take is one swap instead of a
+  // search of the list. The list ends up exactly as the search-and-swap left
+  // it. `free` stays valid while extents are bound below: free_by_ext only
+  // gains keys here, and an unordered_map never moves its values.
+  struct ExtentFree {
+    std::vector<uint32_t>* free = nullptr;
+    std::vector<uint32_t> position;  // slot -> index in *free, or kNoSlot
+  };
+  std::vector<ExtentFree> extent_free(extents_.size());
+  // The index is far larger than the CPU caches and keys land in it at
+  // random; asking for a later entry's bucket now has it there when its turn
+  // comes.
+  constexpr size_t kPrefetchAhead = 16;
 
-  for (const RestoreEntry& entry : entries) {
+
+  for (size_t at = 0; at < entries.size(); ++at) {
+    const RestoreEntry& entry = entries[at];
+    if (at + kPrefetchAhead < entries.size())
+      index_.Prefetch(entries[at + kPrefetchAhead].key);
     const size_t cls_index = ClassForExactSize(entry.slot_size);
     if (extents_[entry.extent].cls == kUnbound) {
       if (BindExtentLocked(cls_index, entry.extent, true) !=
@@ -510,7 +542,25 @@ bool SlabAllocator::RestoreBulk(const std::vector<RestoreEntry>& entries) {
         return false;
     }
     Class& cls = classes_[cls_index];
-    if (!TakeFreeSlotLocked(cls, entry.extent, entry.slot)) return false;
+    ExtentFree& from = extent_free[entry.extent];
+    if (from.free == nullptr) {
+      auto it = cls.free_by_ext.find(entry.extent);
+      if (it == cls.free_by_ext.end()) return false;
+      from.free = &it->second;
+      from.position.assign(cls.slots_per_extent, kNoSlot);
+      for (size_t i = 0; i < from.free->size(); ++i)
+        from.position[(*from.free)[i]] = static_cast<uint32_t>(i);
+    }
+    if (entry.slot >= from.position.size()) return false;
+    const uint32_t free_at = from.position[entry.slot];
+    if (free_at == kNoSlot) return false;
+    const uint32_t moved = from.free->back();
+    (*from.free)[free_at] = moved;
+    from.position[moved] = free_at;
+    from.position[entry.slot] = kNoSlot;
+    from.free->pop_back();
+    --cls.free_count;
+    if (from.free->empty()) DropFromRotationLocked(cls, entry.extent);
 
     const uint32_t meta_index = AcquireSlotMetaLocked();
     SlotMeta& meta = slots_[meta_index];

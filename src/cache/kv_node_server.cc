@@ -114,11 +114,24 @@ KvNodeServer::KvNodeServer(const std::vector<std::string>& cache_dirs,
                            uint64_t capacity_bytes)
     : KvNodeServer(DiskCacheGroup::Options{cache_dirs, capacity_bytes}) {}
 
+// The two slow parts of a start are independent of each other: faulting in
+// the RAM tier arena and opening the disks (one thread per disk). They run
+// side by side. The members are initialized in this order: the plan (the
+// environment, read once), the tier under construction on its own thread,
+// then group_, whose constructor returns when every disk is open.
 KvNodeServer::KvNodeServer(DiskCacheGroup::Options options)
-    : group_(std::move(options)) {
+    : ram_plan_(PlanRamTier(options.cache_dirs.size())),
+      ram_starting_(StartRamTier()),
+      group_(std::move(options)) {
   shutdown_drain_timeout_s_ = ResolveShutdownDrainTimeoutSeconds();
+  // Always waited for, whatever the disks did: the tier's threads must be
+  // gone before this object can be.
+  std::unique_ptr<RamTier> tier;
+  if (ram_starting_.valid()) tier = ram_starting_.get();
+  // A disk that failed to open ends the start as before, without a RAM tier;
+  // the one built meanwhile holds nothing and is dropped here.
   if (!group_.Healthy()) return;
-  InitRamTier();
+  if (ram_plan_.enabled) AdoptRamTier(std::move(tier));
   InitAdmission();
 }
 
@@ -167,15 +180,16 @@ std::unique_lock<std::mutex> KvNodeServer::LockPutKey(const BlockKey& key) {
   return std::unique_lock<std::mutex>(put_key_mu_[stripe % kPutKeyStripes]);
 }
 
-void KvNodeServer::InitRamTier() {
+KvNodeServer::RamTierPlan KvNodeServer::PlanRamTier(size_t disk_count) {
+  RamTierPlan plan;
   // Off by default. DFKV_RAM_TIER in {1,on,true,yes} enables the RAM hot tier;
   // DFKV_RAM_TIER_BYTES sizes the pre-registered arena (default 16 GiB).
   const char* e = std::getenv("DFKV_RAM_TIER");
   const std::string v = (e && *e) ? std::string(e) : "";
-  const bool enabled = (v == "1" || v == "on" || v == "true" || v == "yes");
-  config_dump::RecordResolved("DFKV_RAM_TIER", enabled ? "on" : "off");
-  if (!enabled) return;
-  RamTier::Options o;
+  plan.enabled = (v == "1" || v == "on" || v == "true" || v == "yes");
+  config_dump::RecordResolved("DFKV_RAM_TIER", plan.enabled ? "on" : "off");
+  if (!plan.enabled) return plan;
+  RamTier::Options& o = plan.options;
   if (const char* b = std::getenv("DFKV_RAM_TIER_BYTES")) {
     unsigned long long n = std::strtoull(b, nullptr, 10);
     if (n > 0) o.bytes = n;
@@ -191,15 +205,17 @@ void KvNodeServer::InitRamTier() {
                     "' not recognized; using writeback");
     mode = "writeback";
   }
-  ram_write_back_ = mode == "writeback";
+  plan.write_back = mode == "writeback";
   config_dump::RecordResolved("DFKV_RAM_WRITE_MODE", mode);
   // Flush workers default to 4x the disk count (cap 16). One sync DIO stream
   // per worker leaves NVMe queues nearly idle for small objects; measured on a
   // 3-disk node (64 KiB saturated writes): 3 workers 6.8k ops/s -> 16 workers
   // 11.7k ops/s (+73%), PUT p99 95 -> 37 ms. The old disk-count default dated
   // from when the ingest path's lock contention masked any worker scaling.
+  // The count is that of the configured directories: the disks are being
+  // opened while this tier is built, and a start with fewer does not go on.
   o.flush_threads = static_cast<uint32_t>(
-      std::min<size_t>(4 * (group_.DiskCount() ? group_.DiskCount() : 1), 16));
+      std::min<size_t>(4 * (disk_count ? disk_count : 1), 16));
   if (const char* f = std::getenv("DFKV_RAM_FLUSH_THREADS")) {
     unsigned long long n = std::strtoull(f, nullptr, 10);
     if (n > 0 && n <= 64) o.flush_threads = static_cast<uint32_t>(n);
@@ -210,41 +226,59 @@ void KvNodeServer::InitRamTier() {
   const char* ack_env = std::getenv("DFKV_PUT_ACK_MODE");
   const std::string ack = ack_env ? std::string(ack_env) : "";
   if (ack.empty()) {
-    ram_ack_enabled_ = ram_write_back_;
+    plan.ack_enabled = plan.write_back;
   } else if (ack == "ram" || ack == "disk") {
-    ram_ack_enabled_ = ack == "ram";
+    plan.ack_enabled = ack == "ram";
   } else {
     DFKV_LOG_WARN("DFKV_PUT_ACK_MODE='" + ack +
                   "' not recognized; using RAM-ACK for writeback");
-    ram_ack_enabled_ = ram_write_back_;
+    plan.ack_enabled = plan.write_back;
   }
   if (const char* p = std::getenv("DFKV_RAM_ACK_HIGH_WATERMARK_PCT")) {
     const unsigned long n = std::strtoul(p, nullptr, 10);
     if (n <= 100) o.ack_high_watermark_pct = static_cast<uint32_t>(n);
   }
   config_dump::RecordResolved("DFKV_PUT_ACK_MODE",
-                              ram_ack_enabled_ ? "ram" : "disk");
+                              plan.ack_enabled ? "ram" : "disk");
   config_dump::RecordResolved("DFKV_RAM_ACK_HIGH_WATERMARK_PCT",
                               std::to_string(o.ack_high_watermark_pct));
   config_dump::RecordResolved("DFKV_RAM_TIER_BYTES", std::to_string(o.bytes));
   config_dump::RecordResolved("DFKV_RAM_RECLAIM_MS", std::to_string(o.reclaim_interval_ms));
-  // Flusher persists a RAM slot to the disk group. CacheDirect (not Cache): the
-  // arena slot is 4 KiB-aligned with cap slack, so a direct-mode slab lands it
-  // via O_DIRECT -- a buffered flush would route the RAM tier's entire write
-  // volume back through the page cache, defeating the tier's purpose of keeping
-  // memory use bounded and explicit on GPU nodes.
-  ram_flush_disks_.reserve(group_.DiskCount());
-  for (size_t i = 0; i < group_.DiskCount(); ++i)
-    ram_flush_disks_.push_back(std::make_unique<RamFlushDiskMetrics>());
+  return plan;
+}
+
+// Runs while group_ is still being constructed. The callbacks handed to the
+// tier name group_ and other members of this object, which is safe for one
+// reason only: the tier calls them for objects it holds, and it holds none
+// until the server takes requests, long after the constructor has returned.
+// Nothing else here may touch a member declared after ram_starting_.
+std::future<std::unique_ptr<RamTier>> KvNodeServer::StartRamTier() {
+  if (!ram_plan_.enabled) return {};
+  RamTier::Options o = ram_plan_.options;
   o.is_persisted = [this](const BlockKey& key) {
     return group_.IsCached(key);
   };
-  auto tier = std::make_unique<RamTier>(
-      o, [this](const BlockKey& k, char* d, size_t l, size_t cap) {
-        const bool ok = group_.CacheDirect(k, d, l, cap) == Status::kOk;
-        ApplyPendingRetain(k, ok);
-        return ok;
-      });
+  return std::async(std::launch::async, [this, o] {
+    // Flusher persists a RAM slot to the disk group. CacheDirect (not Cache):
+    // the arena slot is 4 KiB-aligned with cap slack, so a direct-mode slab
+    // lands it via O_DIRECT -- a buffered flush would route the RAM tier's
+    // entire write volume back through the page cache, defeating the tier's
+    // purpose of keeping memory use bounded and explicit on GPU nodes.
+    return std::make_unique<RamTier>(
+        o, [this](const BlockKey& k, char* d, size_t l, size_t cap) {
+          const bool ok = group_.CacheDirect(k, d, l, cap) == Status::kOk;
+          ApplyPendingRetain(k, ok);
+          return ok;
+        });
+  });
+}
+
+void KvNodeServer::AdoptRamTier(std::unique_ptr<RamTier> tier) {
+  ram_write_back_ = ram_plan_.write_back;
+  ram_ack_enabled_ = ram_plan_.ack_enabled;
+  ram_flush_disks_.reserve(group_.DiskCount());
+  for (size_t i = 0; i < group_.DiskCount(); ++i)
+    ram_flush_disks_.push_back(std::make_unique<RamFlushDiskMetrics>());
   // Batched sink: a flush worker's whole dequeue rides one lock-amortized
   // (and, with a uring build, one-submit) store visit per disk.
   tier->set_flush_batch([this](const std::vector<RamTier::FlushItem>& items) {

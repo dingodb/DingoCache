@@ -77,6 +77,14 @@
 #include "utils/latency_hist.h"
 
 namespace dfkv {
+
+// Bytes backed by transparent huge pages in the mappings of this process
+// that lie entirely inside [start, start + bytes), from one pass over
+// /proc/self/smaps. A range that mbind, mlock or madvise split into several
+// mappings is the sum of them; a mapping that reaches outside the range is
+// not counted. The range ends with the page that holds its last byte. 0 if
+// the kernel does not say.
+uint64_t AnonHugePageBytesIn(const void* start, size_t bytes);
 class KvNodeServer;
 
 class RamTier {

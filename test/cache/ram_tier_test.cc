@@ -6,6 +6,7 @@
 #include "cache/ram_tier.h"
 
 #include <gtest/gtest.h>
+#include <sys/mman.h>
 
 #include <atomic>
 #include <chrono>
@@ -1236,6 +1237,102 @@ TEST(RamTier, ArenaHugePagesAreBestEffortAndCanBeTurnedOff) {
     EXPECT_FALSE(rt.arena_hugepages_requested());
   }
   ::unsetenv("DFKV_RAM_TIER_HUGEPAGES");
+}
+
+namespace {
+// An anonymous mapping of `bytes` on a huge page boundary that asks for huge
+// pages and has every page touched. The pages around it are mapped without
+// the request, so the kernel cannot merge it with a neighbour.
+struct HugeRegion {
+  explicit HugeRegion(size_t bytes) : size(bytes), raw_size(bytes + (4u << 20)) {
+    raw = ::mmap(nullptr, raw_size, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (raw == MAP_FAILED) return;
+    const uintptr_t aligned =
+        (reinterpret_cast<uintptr_t>(raw) + 4096 + (2u << 20) - 1) &
+        ~static_cast<uintptr_t>((2u << 20) - 1);
+    base = reinterpret_cast<char*>(aligned);
+#ifdef MADV_HUGEPAGE
+    ::madvise(base, size, MADV_HUGEPAGE);
+#endif
+    for (size_t at = 0; at < size; at += 4096) base[at] = 1;
+  }
+  ~HugeRegion() {
+    if (raw != MAP_FAILED) ::munmap(raw, raw_size);
+  }
+  size_t size;
+  size_t raw_size;
+  void* raw = MAP_FAILED;
+  char* base = nullptr;
+};
+}  // namespace
+
+// The figure is that of the range asked for: other huge-page-backed memory
+// of the process, allocated before or after, is not in it, and a range that
+// has been split into several mappings is their sum.
+TEST(RamTier, HugePageBytesAreCountedInTheGivenRangeOnly) {
+  constexpr size_t kRegion = 16u << 20;
+  constexpr size_t kOther = 64u << 20;
+  HugeRegion region(kRegion);
+  ASSERT_NE(region.base, nullptr);
+  const uint64_t alone = dfkv::AnonHugePageBytesIn(region.base, kRegion);
+  if (alone == 0) GTEST_SKIP() << "no transparent huge pages on this system";
+  EXPECT_LE(alone, kRegion);
+
+  HugeRegion other(kOther);  // four times the region, on huge pages too
+  ASSERT_NE(other.base, nullptr);
+  const uint64_t beside = dfkv::AnonHugePageBytesIn(region.base, kRegion);
+  EXPECT_GE(beside, alone);  // the kernel may have completed a huge page
+  EXPECT_LE(beside, kRegion) << "memory outside the range was counted";
+
+  // Two mappings now (the second half got another flag): still the sum.
+  ASSERT_EQ(::madvise(region.base + kRegion / 2, kRegion / 2, MADV_DONTFORK), 0);
+  const uint64_t split = dfkv::AnonHugePageBytesIn(region.base, kRegion);
+  EXPECT_GE(split, beside);
+  EXPECT_LE(split, kRegion);
+  // A length that is not a whole number of pages reaches to the end of its
+  // last page, as the kernel's own rounding of the length does: the second
+  // mapping ends there and is still inside.
+  EXPECT_GE(dfkv::AnonHugePageBytesIn(region.base, kRegion - 100), split);
+  EXPECT_GE(dfkv::AnonHugePageBytesIn(region.base, kRegion - 4095), split);
+  // Each half is a whole mapping and is counted for itself.
+  const uint64_t first = dfkv::AnonHugePageBytesIn(region.base, kRegion / 2);
+  const uint64_t second =
+      dfkv::AnonHugePageBytesIn(region.base + kRegion / 2, kRegion / 2);
+  EXPECT_LE(first, kRegion / 2);
+  EXPECT_LE(second, kRegion / 2);
+  EXPECT_GE(first + second, split);
+  // A range that holds no whole mapping counts nothing.
+  EXPECT_EQ(dfkv::AnonHugePageBytesIn(region.base + 4096, 8 * 4096), 0u);
+}
+
+// The arena's figure with other huge-page-backed memory appearing in the
+// process while the arena is faulted in, as the disk opens now do.
+TEST(RamTier, ArenaHugePageFigureIgnoresConcurrentAllocations) {
+  ::unsetenv("DFKV_RAM_TIER_HUGEPAGES");
+  FlushSink sink;
+  std::atomic<bool> stop{false};
+  std::thread other([&stop] {
+    std::vector<std::unique_ptr<HugeRegion>> held;
+    while (!stop.load()) {
+      if (held.size() < 8)
+        held.push_back(std::make_unique<HugeRegion>(32u << 20));
+      else
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  });
+  const uint64_t kArena = 32ull << 20;
+  RamTier rt(Opts(kArena), sink.fn());
+  const uint64_t in_arena = dfkv::AnonHugePageBytesIn(
+      RamTierTestPeer::ArenaBase(rt), rt.arena_bytes());
+  stop.store(true);
+  other.join();
+  ASSERT_TRUE(rt.ok());
+  if (in_arena == 0) GTEST_SKIP() << "no transparent huge pages on this system";
+  EXPECT_LE(rt.arena_hugepage_bytes(), rt.arena_bytes());
+  // Read again right after: nothing but the arena itself may be in it.
+  EXPECT_LE(rt.arena_hugepage_bytes(), in_arena);
+  EXPECT_GT(rt.arena_hugepage_bytes(), 0u);
 }
 
 TEST(RamTier, ShardCountCanExceedLegacyCapOf16) {

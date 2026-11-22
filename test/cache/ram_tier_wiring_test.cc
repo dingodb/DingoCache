@@ -2,6 +2,7 @@
 // to RAM (sync-visible, async-flushed) and GET is served from RAM; disabled by
 // default the node behaves exactly as before. End-to-end over the TCP transport.
 #include "cache/kv_node_server.h"
+#include "cache/kv_store.h"
 #include "client/key_map.h"
 #include "transport/tcp_transport.h"
 #include "transport/transport.h"
@@ -18,6 +19,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <atomic>
 #include <thread>
@@ -1062,6 +1064,123 @@ TEST(RamTierWiring, ShutdownDrainLimitIsParsedStrictly) {
   EXPECT_EQ(limit("5m"), 30u);      // used to be read as 5
   EXPECT_EQ(limit("-1"), 30u);
   EXPECT_EQ(limit(" 10"), 30u);
+  fs::remove_all(dir);
+}
+
+// ---- The arena is faulted in while the disks open --------------------------
+namespace {
+// Threads of this process right now.
+size_t ThreadCount() {
+  size_t count = 0;
+  for (const auto& entry : fs::directory_iterator("/proc/self/task")) {
+    (void)entry;
+    ++count;
+  }
+  return count;
+}
+
+struct RamTierEnv {
+  RamTierEnv() {
+    ::setenv("DFKV_RAM_TIER", "1", 1);
+    ::setenv("DFKV_RAM_TIER_BYTES", "8388608", 1);
+  }
+  ~RamTierEnv() {
+    ::unsetenv("DFKV_RAM_TIER");
+    ::unsetenv("DFKV_RAM_TIER_BYTES");
+    ::unsetenv("DFKV_RAM_TIER_NUMA");
+  }
+};
+
+std::unique_ptr<StoreEngine> FileEngine(const std::string& dir, uint64_t cap) {
+  KVStore::Options options;
+  options.cache_dir = dir;
+  options.capacity_bytes = cap;
+  return std::make_unique<KVStore>(options);
+}
+}  // namespace
+
+// The disk "opens" until another thread exists in the process: the one that
+// builds the RAM tier (and the ones it starts to fault the arena in). One
+// directory is opened on the constructing thread itself, so with the tier
+// built after the disks, as it used to be, no other thread appears during
+// the open.
+TEST(RamTierWiring, ArenaIsFaultedInWhileTheDisksOpen) {
+  RamTierEnv env;
+  const auto dir = fs::temp_directory_path() / "dfkv_ramwire_beside";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  std::atomic<bool> tier_started_during_open{false};
+  const size_t threads_before = ThreadCount();
+  DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+  options.engine_factory = [&](const std::string& path, uint64_t cap) {
+    for (int i = 0; i < 5000 && !tier_started_during_open; ++i) {
+      if (ThreadCount() > threads_before)
+        tier_started_during_open = true;
+      else
+        std::this_thread::sleep_for(1ms);
+    }
+    return FileEngine(path, cap);
+  };
+  auto server = KvNodeServerWiringTestPeer::Create(std::move(options));
+  EXPECT_TRUE(tier_started_during_open);
+  EXPECT_TRUE(server->Healthy());
+  EXPECT_TRUE(server->ram_enabled());
+  // And the pair works: a value goes through RAM to the disk.
+  ASSERT_EQ(server->Start(0), Status::kOk);
+  const std::string addr = "127.0.0.1:" + std::to_string(server->port());
+  TcpTransport t;
+  const std::string v(300, 's');
+  ASSERT_EQ(t.Cache(addr, ToBlockKey("test/model", "beside"), v.data(), v.size()),
+            Status::kOk);
+  EXPECT_TRUE(WaitFor([&] {
+    return MetricVal(server->MetricsText(), "dfkv_ram_flushed_total") >= 1;
+  }));
+  server.reset();
+  fs::remove_all(dir);
+}
+
+// A disk that fails to open while the arena is being faulted in: the start
+// fails as before, and the tier built meanwhile is not kept.
+TEST(RamTierWiring, AFailedDiskEndsTheStartWithoutARamTier) {
+  RamTierEnv env;
+  const auto good = fs::temp_directory_path() / "dfkv_ramwire_faildisk_a";
+  const auto bad = fs::temp_directory_path() / "dfkv_ramwire_faildisk_b";
+  for (const auto& dir : {good, bad}) {
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+  }
+  DiskCacheGroup::Options options{{good.string(), bad.string()}, 1ull << 30,
+                                  "file"};
+  options.engine_factory =
+      [&](const std::string& path, uint64_t cap) -> std::unique_ptr<StoreEngine> {
+    if (path == bad.string()) throw std::runtime_error("cannot open this disk");
+    return FileEngine(path, cap);
+  };
+  auto server = KvNodeServerWiringTestPeer::Create(std::move(options));
+  EXPECT_FALSE(server->Healthy());
+  EXPECT_FALSE(server->DisksHealthy());
+  EXPECT_FALSE(server->ram_enabled());
+  EXPECT_EQ(server->Start(0), Status::kIOError);
+  server.reset();
+  fs::remove_all(good);
+  fs::remove_all(bad);
+}
+
+// The arena fails while the disks open fine: no disk-only start, and the
+// disks are closed in order by the destructor.
+TEST(RamTierWiring, AFailedArenaEndsTheStartWithTheDisksOpen) {
+  RamTierEnv env;
+  ::setenv("DFKV_RAM_TIER_NUMA", "neither-off-nor-interleave", 1);
+  const auto dir = fs::temp_directory_path() / "dfkv_ramwire_failarena";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  auto server = KvNodeServerWiringTestPeer::Create(
+      DiskCacheGroup::Options{{dir.string()}, 1ull << 30, "file"});
+  EXPECT_TRUE(server->DisksHealthy());
+  EXPECT_FALSE(server->Healthy());
+  EXPECT_FALSE(server->ram_enabled());
+  EXPECT_EQ(server->Start(0), Status::kIOError);
+  server.reset();
   fs::remove_all(dir);
 }
 }  // namespace
