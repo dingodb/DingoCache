@@ -197,12 +197,15 @@ if(DFKV_BUILD_TESTS)
   # Backend semantics have dedicated tests below. Keep unrelated functional
   # tests on the explicit file backend so a full CTest run does not accumulate
   # 1 GiB production extents in /tmp and become order/host-capacity dependent.
-  set(DFKV_UNIT_TEST_ENV
-      "DFKV_STORE_ENGINE=file;DFKV_SLAB_WRITE=buffered")
+  # That environment (file backend, buffered slab writes) is set in code,
+  # linked into each unit test binary; see the file for why not ENVIRONMENT.
+  add_library(dfkv_unit_test_defaults OBJECT
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/support/unit_test_defaults.cc)
   foreach(t ${DFKV_TESTS})
     get_filename_component(name ${t} NAME_WE)
     add_executable(${name} ${t})
-    target_link_libraries(${name} PRIVATE dfkv_core GTest::gtest_main)
+    target_link_libraries(${name} PRIVATE dfkv_core GTest::gtest_main
+                          dfkv_unit_test_defaults)
     if(name STREQUAL "node_dedup_gpu_sim_test")
       # Re-executes itself with the simulated driver first on the library path.
       add_dependencies(${name} dfkv_sim_cuda)
@@ -223,15 +226,12 @@ if(DFKV_BUILD_TESTS)
     # GPU/RDMA-touching test against each other while the rest still parallelize.
     if(name STREQUAL "node_dedup_gpu_test")
       gtest_discover_tests(${name} PROPERTIES
-        RESOURCE_LOCK gpu_rdma_hw
-        ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")
+        RESOURCE_LOCK gpu_rdma_hw)
     elseif(name STREQUAL "node_dedup_gpu_sim_test")
       # The same suites as node_dedup_gpu_test: the prefix keeps the names apart.
-      gtest_discover_tests(${name} TEST_PREFIX "Sim."
-        PROPERTIES ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")
+      gtest_discover_tests(${name} TEST_PREFIX "Sim.")
     else()
-      gtest_discover_tests(${name} PROPERTIES
-        ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")
+      gtest_discover_tests(${name})
     endif()
   endforeach()
   if(DFKV_WITH_RDMA)  # exercised in CI under Soft-RoCE (rdma_rxe); skips if no device
@@ -240,26 +240,26 @@ if(DFKV_BUILD_TESTS)
       ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_lease_loopback_test.cc)
     add_executable(rdma_lease_client_test
       ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_lease_client_test.cc)
-    target_link_libraries(rdma_loopback_test PRIVATE dfkv_core GTest::gtest_main)
-    target_link_libraries(rdma_lease_loopback_test PRIVATE dfkv_core GTest::gtest_main)
-    target_link_libraries(rdma_lease_client_test PRIVATE dfkv_core GTest::gtest_main)
+    target_link_libraries(rdma_loopback_test PRIVATE dfkv_core GTest::gtest_main
+                          dfkv_unit_test_defaults)
+    target_link_libraries(rdma_lease_loopback_test PRIVATE dfkv_core GTest::gtest_main
+                          dfkv_unit_test_defaults)
+    target_link_libraries(rdma_lease_client_test PRIVATE dfkv_core GTest::gtest_main
+                          dfkv_unit_test_defaults)
     gtest_discover_tests(rdma_loopback_test PROPERTIES
-      RESOURCE_LOCK gpu_rdma_hw
-      ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")
+      RESOURCE_LOCK gpu_rdma_hw)
     gtest_discover_tests(rdma_lease_loopback_test PROPERTIES
-      RESOURCE_LOCK gpu_rdma_hw
-      ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")
+      RESOURCE_LOCK gpu_rdma_hw)
     gtest_discover_tests(rdma_lease_client_test PROPERTIES
-      RESOURCE_LOCK gpu_rdma_hw
-      ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")
+      RESOURCE_LOCK gpu_rdma_hw)
     add_executable(qp_depth_negotiation_test ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/qp_depth_negotiation_test.cc)
-    target_link_libraries(qp_depth_negotiation_test PRIVATE dfkv_core GTest::gtest_main)
-    gtest_discover_tests(qp_depth_negotiation_test PROPERTIES
-      ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")
+    target_link_libraries(qp_depth_negotiation_test PRIVATE dfkv_core GTest::gtest_main
+                          dfkv_unit_test_defaults)
+    gtest_discover_tests(qp_depth_negotiation_test)
     add_executable(rdma_topology_test ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_topology_test.cc)
-    target_link_libraries(rdma_topology_test PRIVATE dfkv_core GTest::gtest_main)
-    gtest_discover_tests(rdma_topology_test PROPERTIES
-      ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")
+    target_link_libraries(rdma_topology_test PRIVATE dfkv_core GTest::gtest_main
+                          dfkv_unit_test_defaults)
+    gtest_discover_tests(rdma_topology_test)
   endif()
 
   # Python plugin test (ctypes -> libdfkv.so -> dfkv_server). No GPU/torch.
