@@ -166,6 +166,15 @@ class RamTier {
     // admission once reached. Existing owners still resolve normally.
     // 0 explicitly selects synchronous disk-ACK, not perpetual rejection.
     uint32_t ack_high_watermark_pct = 80;
+    // Longest a PUT waits for the value that owns its key: in disk-ACK mode
+    // every admitted PUT, first writer or duplicate, waits for the flush; a
+    // second RAM-ACK writer waits until the first value is resident. After
+    // that it is answered kCacheFull -- not stored as far as this request
+    // knows, try again -- and the value's flush goes on. The time counts from
+    // the arrival of the request batch the PUT came in, so the parked PUTs of
+    // one batch share it. Keep it below the clients' operation timeout: a
+    // client that times out first treats the node as failed. 0 = no limit.
+    uint32_t put_wait_ms = 3000;
     // Optional backing-index check for a key without a RAM owner. Invoked
     // under its RAM shard lock; must be metadata-only and must not reenter RAM.
     // An existing disk value is authoritative after RAM eviction.
@@ -287,6 +296,10 @@ class RamTier {
     kDroppedStoreFailed,    // its disk store has failed for good; gone
     kDroppedAtShutdown,     // still failing when the tier was being drained
     kCanceled,          // removed, or given up before it was admitted
+    // The PUT stopped waiting before the flush ended (Options::put_wait_ms
+    // passed, or the server is stopping). Status kCacheFull: the value still
+    // owns the key and may yet reach disk; this PUT did not see it.
+    kWaitEnded,
   };
   struct PutResult {
     Status status;
@@ -296,13 +309,36 @@ class RamTier {
 
   // Disk-ACK contract: wait for the admitted key's actual flush result.
   // Admitted failures/cancellations return kIOError, never disk fallback.
-  PutResult PutCommitted(const BlockKey& key, const void* data, size_t len);
+  //
+  // Both PUT entries may have to wait for a flush. `admission_lock`, if
+  // given and held, is the caller's lock serializing PUTs of this key; it is
+  // released before such a wait, because from then on this PUT writes
+  // nothing: the key's owner is in the RAM index or still being written, and
+  // every later PUT of the key joins it. The wait ends with the flush result
+  // (kOk / kIOError), or with kCacheFull, disposition kComplete and flush
+  // kWaitEnded when Options::put_wait_ms has passed or CancelPutWaits() was
+  // called: the value is not known to be on disk, and the caller must not
+  // write it itself.
+  // put_wait_ms counts from `arrival`, when the request batch this PUT came
+  // in arrived (the PUTs of one batch are served one after another and share
+  // the client's deadline); a default `arrival` means the start of the wait.
+  PutResult PutCommitted(const BlockKey& key, const void* data, size_t len,
+                         std::unique_lock<std::mutex>* admission_lock = nullptr,
+                         std::chrono::steady_clock::time_point arrival = {});
 
   // Cache RAM-ACK contract: acknowledge a visible, flush-pinned copy. A
   // positive dirty watermark rejects new keys before admission, without disk
   // fallback. Duplicates join their first owner's terminal completion; zero
   // watermark forces disk-ACK for every admission.
-  PutResult PutWriteBack(const BlockKey& key, const void* data, size_t len);
+  PutResult PutWriteBack(const BlockKey& key, const void* data, size_t len,
+                         std::unique_lock<std::mutex>* admission_lock = nullptr,
+                         std::chrono::steady_clock::time_point arrival = {});
+
+  // The server is stopping: answer every PUT that waits for a flush, now and
+  // from here on, with kCacheFull instead of making the stop wait for it.
+  // Flushing itself is not affected, and a PUT whose flush has already
+  // ended, or which RAM may acknowledge, still gets that answer.
+  void CancelPutWaits();
 
   // Read-promotion entry: install a value that is ALREADY durable on disk
   // (a coalesced cold read with fan-in evidence). Same allocation/index logic
@@ -381,6 +417,17 @@ class RamTier {
   }
   uint64_t AckBackpressure() const {
     return ack_backpressure_.load(std::memory_order_relaxed);
+  }
+  // PUTs parked right now, waiting for the value that owns their key.
+  size_t ParkedPuts() const {
+    std::lock_guard<std::mutex> lk(put_wait_mu_);
+    return put_waiters_.size();
+  }
+  uint64_t PutWaitTimeouts() const {
+    return put_wait_timeouts_.load(std::memory_order_relaxed);
+  }
+  uint64_t PutWaitsCanceled() const {
+    return put_waits_canceled_.load(std::memory_order_relaxed);
   }
   uint64_t PostAckFlushFailures() const {
     return post_ack_flush_failures_.load(std::memory_order_relaxed);
@@ -503,6 +550,16 @@ class RamTier {
                           FlushOutcome outcome);
   static Status WaitPut(const std::shared_ptr<PutCompletion>& completion,
                         FlushOutcome* outcome = nullptr);
+  // Every wait of a PUT for the value that owns its key: bounded by
+  // Options::put_wait_ms, ended by CancelPutWaits(), and without the
+  // caller's admission lock. With `accept_acked_resident` (a second RAM-ACK
+  // writer) the wait also ends, with kOk and flush kNone, as soon as that
+  // value is resident and acknowledged from RAM. A PUT whose answer is
+  // already there (the common RAM-ACK duplicate) is not registered as parked.
+  PutResult AwaitPut(const std::shared_ptr<PutCompletion>& completion,
+                     bool accept_acked_resident,
+                     std::unique_lock<std::mutex>* admission_lock,
+                     std::chrono::steady_clock::time_point arrival);
   bool CommitReservation(DurableReservation* reservation) noexcept;
   void AbortReservation(DurableReservation* reservation) noexcept;
   void ReclaimLargeFor(uint64_t bytes);
@@ -521,11 +578,6 @@ class RamTier {
     s.retryq.erase(at->second);
     s.retry_at.erase(at);
   }
-  // For a second RAM-ACK writer of a key: until the first writer's value is
-  // resident and acknowledged (true), or its PUT has ended (*status).
-  static bool WaitAckedResident(
-      const std::shared_ptr<PutCompletion>& completion, Status* status,
-      FlushOutcome* outcome);
   // Max items one flush worker drains per store visit. Big enough to amortize
   // the two store-lock hops + reach a useful uring submit width, small enough
   // that a batch's slots stay flush-pinned only briefly.
@@ -579,6 +631,12 @@ class RamTier {
   std::atomic<uint64_t> flushed_{0}, flush_dropped_{0}, reclaimed_{0}, rebalanced_{0};
   std::atomic<uint64_t> dirty_bytes_{0}, dirty_objects_{0};
   std::atomic<uint64_t> ram_acks_{0}, ack_backpressure_{0};
+  // PUTs parked in AwaitPut, so CancelPutWaits can wake exactly them. Lock
+  // order: put_wait_mu_ before a completion's mutex.
+  mutable std::mutex put_wait_mu_;
+  std::unordered_multiset<PutCompletion*> put_waiters_;
+  std::atomic<bool> put_waits_stopped_{false};
+  std::atomic<uint64_t> put_wait_timeouts_{0}, put_waits_canceled_{0};
   std::atomic<uint64_t> post_ack_flush_failures_{0};
   std::atomic<uint64_t> flush_retries_{0};
   // The stop sequence is waiting for the backlog (WaitForDrain): attempts

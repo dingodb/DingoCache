@@ -652,24 +652,6 @@ void RamTier::CompletePut(
   completion->cv.notify_all();
 }
 
-bool RamTier::WaitAckedResident(
-    const std::shared_ptr<PutCompletion>& completion, Status* status,
-    FlushOutcome* outcome) {
-  *status = Status::kIOError;
-  *outcome = FlushOutcome::kCanceled;
-  if (!completion) return false;
-  std::unique_lock<std::mutex> lk(completion->mu);
-  completion->cv.wait(lk, [&completion] {
-    return completion->done || completion->acked_resident;
-  });
-  if (completion->done) {
-    *outcome = completion->outcome;
-    *status = completion->success ? Status::kOk : Status::kIOError;
-    return false;
-  }
-  return true;
-}
-
 Status RamTier::WaitPut(const std::shared_ptr<PutCompletion>& completion,
                         FlushOutcome* outcome) {
   if (outcome) *outcome = FlushOutcome::kCanceled;
@@ -681,6 +663,93 @@ Status RamTier::WaitPut(const std::shared_ptr<PutCompletion>& completion,
   completion->cv.wait(lk, [&completion] { return completion->done; });
   if (outcome) *outcome = completion->outcome;
   return completion->success ? Status::kOk : Status::kIOError;
+}
+
+RamTier::PutResult RamTier::AwaitPut(
+    const std::shared_ptr<PutCompletion>& completion,
+    bool accept_acked_resident,
+    std::unique_lock<std::mutex>* admission_lock,
+    std::chrono::steady_clock::time_point arrival) {
+  using Clock = std::chrono::steady_clock;
+  PutResult result{Status::kIOError};
+  result.flush = FlushOutcome::kCanceled;
+  if (!completion) return result;
+  // The shared completion owns the admitted value, not the caller's payload:
+  // this PUT writes nothing from here on, so nothing needs the lock that
+  // serializes PUTs of the key. Every later PUT of it finds the same owner.
+  if (admission_lock && admission_lock->owns_lock()) admission_lock->unlock();
+  const bool bounded = opt_.put_wait_ms != 0;
+  const Clock::time_point deadline =
+      (arrival == Clock::time_point{} ? Clock::now() : arrival) +
+      std::chrono::milliseconds(opt_.put_wait_ms);
+  const auto answered = [&] {
+    return completion->done ||
+           (accept_acked_resident && completion->acked_resident);
+  };
+  const auto ready = [&] {
+    return answered() || put_waits_stopped_.load(std::memory_order_acquire);
+  };
+  const auto expired = [&] { return bounded && Clock::now() >= deadline; };
+  std::unique_lock<std::mutex> lk(completion->mu);
+  // Only a PUT that has to wait is registered, so an answer that is already
+  // there (a RAM-ACK duplicate of a resident value) costs no global lock.
+  const bool parked = !ready() && !expired();
+  if (parked) {
+    // Lock order: put_wait_mu_ before a completion's mutex. ready() is
+    // checked again under the completion's mutex before every wait, after
+    // registering: CancelPutWaits either finds this waiter or this waiter
+    // sees its flag.
+    lk.unlock();
+    {
+      std::lock_guard<std::mutex> wl(put_wait_mu_);
+      put_waiters_.insert(completion.get());
+    }
+    lk.lock();
+    if (bounded)
+      completion->cv.wait_until(lk, deadline, ready);
+    else
+      completion->cv.wait(lk, ready);
+  }
+  bool ended = false, timed_out = false;
+  if (completion->done) {
+    result.flush = completion->outcome;
+    result.status = completion->success ? Status::kOk : Status::kIOError;
+  } else if (answered()) {
+    result.flush = FlushOutcome::kNone;  // acknowledged from RAM
+    result.status = Status::kOk;
+  } else {
+    // Ran out of time, or the server is stopping. A wait whose time was up
+    // counts as a timeout even if the stop has begun meanwhile.
+    ended = true;
+    timed_out = expired();
+    result.status = Status::kCacheFull;
+    result.flush = FlushOutcome::kWaitEnded;
+  }
+  lk.unlock();
+  if (parked) {
+    std::lock_guard<std::mutex> wl(put_wait_mu_);
+    put_waiters_.erase(put_waiters_.find(completion.get()));
+  }
+  if (!ended) return result;
+  // Returning a bypass here could persist conflicting duplicate bytes while
+  // the original flush still owns its slot (or outlive Remove's disk fence).
+  // The caller is only told that this PUT did not see the value reach disk.
+  if (timed_out)
+    put_wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
+  else
+    put_waits_canceled_.fetch_add(1, std::memory_order_relaxed);
+  return result;
+}
+
+void RamTier::CancelPutWaits() {
+  put_waits_stopped_.store(true, std::memory_order_release);
+  std::lock_guard<std::mutex> lk(put_wait_mu_);
+  for (PutCompletion* completion : put_waiters_) {
+    // Taking the waiter's mutex orders this wake-up after its check of the
+    // flag: it either saw the flag or is waiting and gets the notification.
+    { std::lock_guard<std::mutex> state_lk(completion->mu); }
+    completion->cv.notify_all();
+  }
 }
 
 RamTier::Admission RamTier::Admit(
@@ -869,16 +938,17 @@ bool RamTier::Put(const BlockKey& key, const void* data, size_t len) {
 }
 
 RamTier::PutResult RamTier::PutCommitted(
-    const BlockKey& key, const void* data, size_t len) {
+    const BlockKey& key, const void* data, size_t len,
+    std::unique_lock<std::mutex>* admission_lock,
+    std::chrono::steady_clock::time_point arrival) {
   std::shared_ptr<PutCompletion> completion;
   const Admission admission = Admit(key, data, len, false, &completion);
   if (admission == Admission::kPersisted) return {Status::kOk};
   if (admission == Admission::kBypass)
     return {Status::kCacheFull, PutDisposition::kBypass};
   if (admission == Admission::kRejected) return {Status::kIOError};
-  PutResult result{Status::kIOError};
-  result.status = WaitPut(completion, &result.flush);
-  return result;
+  return AwaitPut(completion, /*accept_acked_resident=*/false,
+                  admission_lock, arrival);
 }
 
 bool RamTier::ReserveDurable(const BlockKey& key, size_t len,
@@ -1023,7 +1093,9 @@ void RamTier::AbortReservation(
 }
 
 RamTier::PutResult RamTier::PutWriteBack(
-    const BlockKey& key, const void* data, size_t len) {
+    const BlockKey& key, const void* data, size_t len,
+    std::unique_lock<std::mutex>* admission_lock,
+    std::chrono::steady_clock::time_point arrival) {
   const bool synchronous = opt_.ack_high_watermark_pct == 0;
   std::shared_ptr<PutCompletion> completion;
   const Admission admission =
@@ -1036,25 +1108,24 @@ RamTier::PutResult RamTier::PutWriteBack(
   if (admission == Admission::kRejected) return {Status::kIOError};
   if (synchronous) {
     ack_backpressure_.fetch_add(1, std::memory_order_relaxed);
-    PutResult result{Status::kIOError};
-    result.status = WaitPut(completion, &result.flush);
-    return result;
+    return AwaitPut(completion, /*accept_acked_resident=*/false,
+                    admission_lock, arrival);
   }
   if (admission == Admission::kDuplicate) {
     // A second writer of a key whose first value is in the tier. If that
     // value was acknowledged from RAM, this writer gets the same
     // acknowledgement, with the same guarantee: the value is resident and
     // its flush is pending. It does not wait for that flush, which can now
-    // take seconds while failed attempts are spaced out -- the caller holds
-    // a put-key stripe and a handler thread. If the value is dropped later,
-    // that is one lost acknowledged value in the counter, whoever wrote it.
-    // Otherwise (the first PUT has ended, or its value is not acknowledged
-    // from RAM) the outcome of the first PUT is this one's too.
-    PutResult result{Status::kIOError};
-    if (WaitAckedResident(completion, &result.status, &result.flush)) {
+    // take seconds while failed attempts are spaced out. If the value is
+    // dropped later, that is one lost acknowledged value in the counter,
+    // whoever wrote it. Otherwise (the first PUT has ended, or its value is
+    // not acknowledged from RAM) the outcome of the first PUT is this one's
+    // too.
+    const PutResult result =
+        AwaitPut(completion, /*accept_acked_resident=*/true, admission_lock,
+                 arrival);
+    if (result.status == Status::kOk && result.flush == FlushOutcome::kNone)
       ram_acks_.fetch_add(1, std::memory_order_relaxed);
-      return {Status::kOk};
-    }
     return result;
   }
   ram_acks_.fetch_add(1, std::memory_order_relaxed);

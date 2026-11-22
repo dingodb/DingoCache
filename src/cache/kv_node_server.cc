@@ -298,6 +298,17 @@ KvNodeServer::RamTierPlan KvNodeServer::PlanRamTier(size_t disk_count) {
     o.ack_high_watermark_pct = static_cast<uint32_t>(
         envparse::EnvU64("DFKV_RAM_ACK_HIGH_WATERMARK_PCT", spec));
   }
+  // Longest a PUT is parked for the value that owns its key (ms).
+  {
+    envparse::U64Spec spec;
+    spec.zero_means = "a parked PUT waits without limit";
+    spec.fallback = o.put_wait_ms;
+    spec.max = 3600000;
+    o.put_wait_ms =
+        static_cast<uint32_t>(envparse::EnvU64("DFKV_RAM_PUT_WAIT_MS", spec));
+  }
+  config_dump::RecordResolved("DFKV_RAM_PUT_WAIT_MS",
+                              std::to_string(o.put_wait_ms));
   config_dump::RecordResolved("DFKV_PUT_ACK_MODE",
                               plan.ack_enabled ? "ram" : "disk");
   config_dump::RecordResolved("DFKV_RAM_ACK_HIGH_WATERMARK_PCT",
@@ -419,7 +430,12 @@ std::string Seconds(std::chrono::steady_clock::time_point since) {
 }
 }  // namespace
 
+void KvNodeServer::CancelParkedPuts() {
+  if (ram_) ram_->CancelPutWaits();
+}
+
 void KvNodeServer::Stop() {
+  CancelParkedPuts();
   if (!StopRequests()) return;  // idempotent
   if (ram_) {
     const uint64_t timeout_seconds = shutdown_drain_timeout_s_;
@@ -439,6 +455,7 @@ bool KvNodeServer::Shutdown(std::chrono::steady_clock::time_point started) {
   shutdown_done_ = true;
   using Clock = std::chrono::steady_clock;
   auto stage = Clock::now();
+  CancelParkedPuts();
   StopRequests();
   DFKV_LOG_INFO("shutdown: TCP requests stopped in " + Seconds(stage));
 
@@ -1018,6 +1035,15 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_ram_ack_backpressure_total", "counter",
            "RAM-ACK PUTs rejected at a positive dirty watermark or disk-ACKed at zero",
            ram_->AckBackpressure());
+    metric("dfkv_ram_parked_puts", "gauge",
+           "PUTs waiting for the value that owns their key (disk-ACK PUTs waiting for its flush)",
+           ram_->ParkedPuts());
+    metric("dfkv_ram_put_wait_timeouts_total", "counter",
+           "PUTs answered CacheFull once DFKV_RAM_PUT_WAIT_MS from the arrival of their request batch had passed",
+           ram_->PutWaitTimeouts());
+    metric("dfkv_ram_put_waits_canceled_total", "counter",
+           "PUTs waiting for a flush that were answered CacheFull because the server is stopping",
+           ram_->PutWaitsCanceled());
     metric("dfkv_ram_post_ack_flush_failures_total", "counter",
            "Acknowledged RAM PUTs whose value was dropped because its disk flush kept failing (lost)",
            ram_->PostAckFlushFailures());
@@ -1198,9 +1224,11 @@ Status KvNodeServer::ProcessRequestForKey(
       if (ram_write_back_ && ram_ &&
           group_.TenantQuotaBytes(key.tenant_hash) == 0 &&
           !group_.DiskFailedFor(key)) {
+        // The RAM tier releases key_lock before it waits for a flush.
         const RamTier::PutResult result =
-            ram_ack_enabled_ ? ram_->PutWriteBack(key, payload, payload_len)
-                             : ram_->PutCommitted(key, payload, payload_len);
+            ram_ack_enabled_
+                ? ram_->PutWriteBack(key, payload, payload_len, &key_lock)
+                : ram_->PutCommitted(key, payload, payload_len, &key_lock);
         st = result.status;
         needs_disk = result.disposition == RamTier::PutDisposition::kBypass;
         if (st == Status::kOk) {
@@ -1504,8 +1532,9 @@ std::vector<Status> KvNodeServer::CacheDirectBatchForKeys(
   return group_.CacheDirectBatch(items);
 }
 
-Status KvNodeServer::CacheDirectForKey(const BlockKey& key, char* data,
-                                       size_t len, size_t cap) {
+Status KvNodeServer::CacheDirectForKey(
+    const BlockKey& key, char* data, size_t len, size_t cap,
+    std::chrono::steady_clock::time_point batch_arrival) {
   if (len == 0 || data == nullptr) {
     invalid_ops_.fetch_add(1, std::memory_order_relaxed);
     return Status::kInvalid;
@@ -1533,9 +1562,11 @@ Status KvNodeServer::CacheDirectForKey(const BlockKey& key, char* data,
   // A disk whose store has failed for good takes no RAM admission either: the
   // value could never be flushed, so the PUT gets the store's I/O error.
   if (ram_write_back_ && ram_ && unlimited && !group_.DiskFailedFor(key)) {
+    // The RAM tier releases key_lock before it waits for a flush.
     const RamTier::PutResult result =
-        ram_ack_enabled_ ? ram_->PutWriteBack(key, data, len)
-                         : ram_->PutCommitted(key, data, len);
+        ram_ack_enabled_
+            ? ram_->PutWriteBack(key, data, len, &key_lock, batch_arrival)
+            : ram_->PutCommitted(key, data, len, &key_lock, batch_arrival);
     st = result.status;
     needs_disk = result.disposition == RamTier::PutDisposition::kBypass;
     if (st == Status::kOk) {

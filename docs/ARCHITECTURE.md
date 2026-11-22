@@ -325,7 +325,9 @@ size-class lattice and carves them into uniform slots:
   are rejected and cleared durably; metadata I/O failure fails the store closed.
   Format/geometry mismatches are refused without rewriting existing data. The
   directory itself is `flock`ed: one process per cache directory.
-- **Shutdown order:** on SIGTERM `dfkv_server` stops RDMA and TCP requests,
+- **Shutdown order:** on SIGTERM `dfkv_server` answers the PUTs that are
+  parked waiting for a flush with `kCacheFull` (so that stopping a request
+  path never waits for a flush), stops RDMA and TCP requests,
   gives the RAM tier `DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S` (default 30) to write
   its backlog (what is still only in RAM after that is dropped), then syncs
   all disks at the same time and marks them clean (`KvNodeServer::Shutdown`,
@@ -466,6 +468,29 @@ visible in the committed index. The fixed 1,024 stripes require no per-request
 allocation; unrelated keys can collide on a stripe. Sampled PUT latency includes
 lock wait. Flush workers and REMOVE do not acquire these foreground locks, so
 existing flush completion and cancellation can still unblock a waiting PUT.
+
+A PUT that has to wait for the value that owns its key is *parked*. In
+disk-ACK mode that is every admitted PUT, first writer or duplicate: it is
+answered with the result of the value's flush. In RAM-ACK mode a duplicate
+of a value acknowledged from RAM is acknowledged at once; it waits only
+until that value is resident. A parked PUT releases the key-striped mutex
+before it waits: it writes nothing from then on, the key's owner is in the
+RAM index or still being written, and any later PUT of the key joins the
+same owner. The wait ends with the flush result (`kOk`, or `kIOError` if the
+flush failed or the key was removed), or with `kCacheFull` when
+`DFKV_RAM_PUT_WAIT_MS` (default 3000, `0` = no limit) has passed or the
+server is stopping. The limit counts from the arrival of the request batch
+the PUT came in: an RDMA connection serves the requests of a client window
+one after another, and the client gives the window one deadline, so the
+parked PUTs of one window share the limit instead of each getting it anew
+(a batch is the requests a connection receives while it still owes a
+reply). `kCacheFull` here
+means "not stored as far as this request knows, try again": the value that
+owns the key stays in RAM and its flush goes on, the request's own bytes are
+never written by another path, and clients do not treat the node as failed
+(they do for `kIOError` and for their own operation timeout, 5 s by default,
+which is why the limit is below it). The first writer always wins: a
+duplicate with different bytes gets the first value's result.
 
 **State machine = allocator pin refcount.** The slot lifecycle maps directly onto
 the allocator's pin count — this is why the allocator was built media-agnostic:

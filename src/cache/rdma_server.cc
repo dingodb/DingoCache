@@ -1063,6 +1063,7 @@ void RdmaServer::Serve(
     bool multi_put_window = false;
     bool multi_put_final = false;
     bool from_lease_put = false;
+    std::chrono::steady_clock::time_point batch_arrival{};
   };
 
   auto decode_request = [&](const ibv_wc& completion,
@@ -1522,7 +1523,7 @@ void RdmaServer::Serve(
       }
       const Status status = cache_direct_handler_(
           key, cache_data, static_cast<size_t>(fields.payload_len),
-          cache_cap);
+          cache_cap, request.batch_arrival);
       encode_status(status, 0);
       reply->first_len = response_prefix;
       // The store consumed the bytes synchronously (O_DIRECT write or RAM
@@ -1573,6 +1574,21 @@ void RdmaServer::Serve(
   ibv_wc* const pending_recv = wcs.data() + K;
   size_t pending_recv_head = 0;
   size_t pending_recv_count = 0;
+
+  // A request that arrives while this connection owes no reply (every
+  // received request answered and every reply SEND completed) starts a
+  // batch; the requests that arrive before that is true again belong to it.
+  // The client sends a batch at once under one deadline, and this thread
+  // serves it in order, so a PUT parked for a flush counts its wait from the
+  // batch's arrival, not from its own turn. A reply's SEND completes before a
+  // request the client sends after reading it arrives, so a later batch does
+  // not join an earlier one.
+  std::chrono::steady_clock::time_point batch_arrival{};
+  auto note_arrival = [&](Request* request) {
+    if (free_send.size() == K && pending_recv_count == 0)
+      batch_arrival = std::chrono::steady_clock::now();
+    request->batch_arrival = batch_arrival;
+  };
   auto dispatch_completions = [&](const ibv_wc* batch, int count,
                                   auto&& process_wc,
                                   auto&& has_async_work) -> bool {
@@ -1763,6 +1779,7 @@ void RdmaServer::Serve(
       if (!decode_request(wc, &request) || free_send.empty() ||
           next_sequence == std::numeric_limits<uint64_t>::max())
         return false;
+      note_arrival(&request);
       completions_.fetch_add(1, std::memory_order_relaxed);
       rail_stats.completions.fetch_add(1, std::memory_order_relaxed);
 
@@ -2084,6 +2101,7 @@ sync_serve_loop:;
     }
     Request request;
     if (!decode_request(wc, &request) || free_send.empty()) return false;
+    note_arrival(&request);
     completions_.fetch_add(1, std::memory_order_relaxed);
     rail_stats.completions.fetch_add(1, std::memory_order_relaxed);
     const size_t r = request.recv_slot;

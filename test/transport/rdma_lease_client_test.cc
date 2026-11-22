@@ -156,8 +156,10 @@ class RdmaLeaseClient : public testing::Test {
                                               payload_len, out, value_len);
         }, kMaxMsg);
     server_->set_cache_direct_handler(
-        [this](const BlockKey& key, char* data, size_t len, size_t capacity) {
-          return store_->CacheDirectForKey(key, data, len, capacity);
+        [this](const BlockKey& key, char* data, size_t len, size_t capacity,
+               std::chrono::steady_clock::time_point batch_arrival) {
+          return store_->CacheDirectForKey(key, data, len, capacity,
+                                           batch_arrival);
         });
     server_->set_range_handler(
         [this](const BlockKey& key, uint64_t off, uint64_t len, char* buffer,
