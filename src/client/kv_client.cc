@@ -607,6 +607,12 @@ std::string KVClient::MetricsSnapshot() const {
     s += "# HELP dfkv_client_gpu_dedup_wait_timeouts_total Waits that fell back to a direct fetch\n";
     s += "# TYPE dfkv_client_gpu_dedup_wait_timeouts_total counter\n";
     s += "dfkv_client_gpu_dedup_wait_timeouts_total " + std::to_string(gd->wait_timeouts()) + "\n";
+    s += "# HELP dfkv_client_gpu_dedup_load_fences_total Device synchronizations made before publishing a fetch to the GPU rendezvous\n";
+    s += "# TYPE dfkv_client_gpu_dedup_load_fences_total counter\n";
+    s += "dfkv_client_gpu_dedup_load_fences_total " + std::to_string(gd->load_fences()) + "\n";
+    s += "# HELP dfkv_client_gpu_dedup_load_fence_failures_total Fetches not published to the GPU rendezvous because the device could not be synchronized\n";
+    s += "# TYPE dfkv_client_gpu_dedup_load_fence_failures_total counter\n";
+    s += "dfkv_client_gpu_dedup_load_fence_failures_total " + std::to_string(gd->load_fence_failures()) + "\n";
   }
   // MDS discovery / placement-ring health. An empty ring means every put/get
   // routes to nowhere and silently reports ok=0, so surface both the current
@@ -2636,11 +2642,21 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
   if (!fetch_items.empty()) {
     std::vector<size_t> flens;
     auto r = BatchGetAutoSgDirect(fetch_items, &flens);
+    // The fetch may have landed in these device destinations over GPUDirect.
+    // Publishing gathers them with a CUDA copy, which must not run ahead of
+    // those writes: order them first, once for the batch. If that cannot be
+    // done nothing is published, and the waiters fetch for themselves. The
+    // caller's own result does not depend on it: its connector fences before
+    // it uses the destinations.
+    bool anything_to_publish = false;
+    for (size_t m = 0; m < fetch_map.size(); ++m)
+      if (r[m] && tokens[fetch_map[m]] != 0) anything_to_publish = true;
+    const bool settled = !anything_to_publish || gd->FenceLoads();
     for (size_t m = 0; m < fetch_map.size(); ++m) {
       const size_t i = fetch_map[m];
       res[i] = r[m];
       if (r[m]) lens[i] = flens[m];
-      if (r[m]) {
+      if (r[m] && settled) {
         segs_of(items[i]);
         gd->PublishSg(bks[i], tokens[i], segs.data(), segs.size(), flens[m]);
       } else {

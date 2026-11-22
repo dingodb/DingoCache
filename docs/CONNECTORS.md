@@ -116,7 +116,15 @@ v2.28 默认 dynamic client 暂留原 33-byte readiness，不分配固定 pull a
 `CU_POINTER_ATTRIBUTE_SYNC_MEMOPS`（普通 cudaMalloc 分配可用；vLLM 的
 LBHNC/VMM `cuMemMap` 池会被驱动拒绝并告警一次），连接器在每次命中
 scatter 后执行设备同步作为排序栅栏；`DFKV_GPU_LOAD_FENCE=0` 可关闭
-栅栏，仅建议在确认无 GPUDirect 直载读路径时使用。
+栅栏，仅建议在确认无 GPUDirect 直载读路径时使用。开启 GPU node-dedup
+（`DFKV_CLIENT_NODE_DEDUP_GPU=1`）时，原生库在 leader 把读回的结果发布给
+同机其他进程之前也做一次同样的设备同步（每批一次，同一开关控制）：发布是
+一次从目的显存到 staging arena 的设备拷贝，它同样不能跑在 GPUDirect 写入
+之前，否则 follower 拿到的是尚未到达的字节。同步失败则该批不发布，follower
+自行读取。这次同步是 `cuCtxSynchronize`（leader 读取线程的当前 context），
+会等该 context 里的全部工作，包括框架正在跑的 kernel；这段时间算在 follower
+的 `DFKV_NODE_DEDUP_WAIT_MS` 里，设备很忙时 follower 可能等不到发布而自行读取。
+它假定目的显存在当前设备上，与连接器自己的栅栏相同。
 
 **CUDA GET publication 要区分传输路径**：原生 RDMA scalar/SG GET 可直接 READ
 到调用方已注册的 CUDA buffer。READ 完成后才报告命中；失败会 fence QP/MR，

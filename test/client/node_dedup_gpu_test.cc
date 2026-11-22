@@ -17,15 +17,21 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "client/cuda_ipc.h"
+#include "client/key_map.h"
+#include "client/kv_client.h"
+#include "transport/transport.h"
 
 using dfkv::BlockKey;
 using dfkv::CudaLib;
@@ -389,6 +395,220 @@ TEST(GpuNodeDedup, CrossProcessIpcHit) {
   ASSERT_EQ(::waitpid(pid, &st, 0), pid);
   ASSERT_TRUE(WIFEXITED(st));
   EXPECT_EQ(WEXITSTATUS(st), 0) << "child (IPC reader) failed";
+}
+
+// ---- through KVClient: a fetch that lands in device memory -----------------
+
+namespace {
+
+// A transport whose scatter-gather read writes the value into the caller's
+// device segments, as a GPUDirect read does. With the simulated driver the
+// write is held back until the next CUDA synchronization, which is the
+// ordering hazard the load fence exists for; on real hardware it is a plain
+// device copy. The client calls the transport on its read workers, threads
+// that have no CUDA context: the copy binds one first (a NIC needs none).
+class DeviceWritingTransport final : public dfkv::Transport {
+ public:
+  std::map<std::string, std::string> values;  // by block key file name
+  int reads = 0;
+
+  bool pipelined() const override { return true; }
+  dfkv::Status Cache(const std::string&, const BlockKey&, const void*,
+                     size_t) override {
+    return dfkv::Status::kInvalid;
+  }
+  dfkv::Status Range(const std::string&, const BlockKey&, uint64_t, uint64_t,
+                     std::string*, uint64_t*) override {
+    return dfkv::Status::kInvalid;
+  }
+  dfkv::Status Lookup(const std::string&, const BlockKey&, uint64_t*) override {
+    return dfkv::Status::kInvalid;
+  }
+  dfkv::Status Exist(const std::string&, const BlockKey&, bool*) override {
+    return dfkv::Status::kInvalid;
+  }
+  std::vector<dfkv::Status> RangeIntoMulti(
+      const std::string&, const std::vector<BlockKey>& keys,
+      const std::vector<dfkv::RangeDstMulti>& dsts,
+      std::vector<size_t>* out_lens, std::string* out_dev) override {
+    using Write = void(void*, const void*, size_t);
+    Write* held_back = SimSymbol<Write>("sim_cuda_gpudirect_write");
+    std::lock_guard<std::mutex> lock(mu_);
+    if (out_dev) out_dev->clear();
+    if (out_lens) out_lens->assign(keys.size(), 0);
+    std::vector<dfkv::Status> result(keys.size(), dfkv::Status::kNotFound);
+    for (size_t i = 0; i < keys.size(); ++i) {
+      ++reads;
+      const auto found = values.find(keys[i].Filename());
+      if (found == values.end()) continue;
+      const std::string& v = found->second;
+      size_t done = 0;
+      for (const auto& seg : dsts[i].payloads) {
+        const size_t n = std::min(seg.second, v.size() - done);
+        if (n == 0) break;
+        if (held_back) {
+          held_back(seg.first, v.data() + done, n);
+        } else if (!EnsureCudaCtx() ||
+                   CudaLib::Get()->Memcpy(
+                       reinterpret_cast<CUdeviceptr>(seg.first),
+                       reinterpret_cast<CUdeviceptr>(v.data() + done),
+                       n) != kCudaSuccess) {
+          ADD_FAILURE() << "the transport could not write the destination";
+          result[i] = dfkv::Status::kIOError;
+          break;
+        }
+        done += n;
+      }
+      if (result[i] == dfkv::Status::kIOError) continue;
+      if (out_lens) (*out_lens)[i] = v.size();
+      result[i] = dfkv::Status::kOk;
+    }
+    return result;
+  }
+
+ private:
+  std::mutex mu_;
+};
+
+// Two client handles of one process, on the GPU rendezvous of a private
+// namespace: the leader fetches, the follower is served by it.
+struct TwoClients {
+  std::string key_namespace;
+  std::string segment;
+  DeviceWritingTransport transport;
+  std::unique_ptr<dfkv::KVClient> leader, follower;
+
+  explicit TwoClients(const std::string& tag)
+      : key_namespace("gpu-dedup-test/" + tag + "/" +
+                      std::to_string(::getpid())) {
+    ::setenv("DFKV_CLIENT_NODE_DEDUP", "1", 1);
+    ::setenv("DFKV_CLIENT_NODE_DEDUP_GPU", "1", 1);
+    ::setenv("DFKV_NODE_DEDUP_GPU_ARENA_MB", "16", 1);
+    segment = GpuNodeDedup::EnvSegmentName(
+        dfkv::ToBlockKey(key_namespace, "").digest_hi);
+    ::shm_unlink(segment.c_str());
+    using Members = std::vector<std::pair<std::string, std::string>>;
+    leader = std::make_unique<dfkv::KVClient>(Members{{"n", "127.0.0.1:1"}},
+                                              key_namespace, &transport);
+    follower = std::make_unique<dfkv::KVClient>(Members{{"n", "127.0.0.1:1"}},
+                                                key_namespace, &transport);
+  }
+  ~TwoClients() {
+    leader.reset();
+    follower.reset();
+    ::shm_unlink(segment.c_str());
+    ::unsetenv("DFKV_CLIENT_NODE_DEDUP");
+    ::unsetenv("DFKV_CLIENT_NODE_DEDUP_GPU");
+    ::unsetenv("DFKV_NODE_DEDUP_GPU_ARENA_MB");
+    ::unsetenv("DFKV_GPU_LOAD_FENCE");
+  }
+  void Store(const std::string& key, const std::string& value) {
+    transport.values[dfkv::ToBlockKey(key_namespace, key).Filename()] = value;
+  }
+  // One key into two device segments of 20000 bytes each.
+  bool Get(dfkv::KVClient* client, const std::string& key, DevBuf* d0,
+           DevBuf* d1, size_t* len) {
+    std::vector<dfkv::KvGetItemSg> items{
+        {key,
+         {reinterpret_cast<void*>(d0->p), reinterpret_cast<void*>(d1->p)},
+         {20000, 20000}}};
+    std::vector<size_t> lens;
+    const std::vector<bool> got = client->BatchGetAutoSg(items, &lens);
+    *len = lens.empty() ? 0 : lens[0];
+    return !got.empty() && got[0];
+  }
+};
+
+uint64_t ClientCounter(const dfkv::KVClient& client, const std::string& name) {
+  const std::string text = client.MetricsSnapshot();
+  const size_t at = text.find("\n" + name + " ");
+  EXPECT_NE(at, std::string::npos) << name;
+  if (at == std::string::npos) return 0;
+  return std::stoull(text.substr(at + name.size() + 2));
+}
+
+// What the connector does after a load before it uses the destinations.
+void ConnectorFence() {
+  ASSERT_NE(CudaLib::Get()->CtxSynchronize, nullptr);
+  ASSERT_EQ(CudaLib::Get()->CtxSynchronize(), kCudaSuccess);
+}
+
+}  // namespace
+
+TEST(GpuNodeDedup, LoadFenceSynchronizesTheDevice) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("fence");
+  auto a = GpuNodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a);
+  int* synchronized = SimSymbol<int>("sim_cuda_ctx_synchronize_calls");
+  const int before = synchronized ? *synchronized : 0;
+  ::unsetenv("DFKV_GPU_LOAD_FENCE");
+  EXPECT_TRUE(a->FenceLoads());
+  EXPECT_EQ(a->load_fences(), 1u);
+  if (synchronized) EXPECT_EQ(*synchronized, before + 1);
+  // The switch that turns the connectors' fence off turns this one off too.
+  ::setenv("DFKV_GPU_LOAD_FENCE", "0", 1);
+  EXPECT_TRUE(a->FenceLoads());
+  EXPECT_EQ(a->load_fences(), 1u);
+  if (synchronized) EXPECT_EQ(*synchronized, before + 1);
+  ::unsetenv("DFKV_GPU_LOAD_FENCE");
+}
+
+// The leader's fetch lands in its device destinations and is then published
+// to the rendezvous with a device copy. That copy must see the bytes: the
+// follower gets what the leader fetched, not what the destinations held
+// before the write arrived. Only the simulated driver holds a write back, so
+// only there does this test exercise the fence; on real hardware the
+// transport's plain copy does not reproduce a late GPUDirect write, and the
+// test checks the data path end to end.
+TEST(GpuDedupClient, FollowerGetsTheBytesTheLeaderFetched) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  TwoClients c("fence");
+  const std::string v = Val(21, 40000);
+  c.Store("k", v);
+  DevBuf l0(20000), l1(20000), f0(20000), f1(20000);
+  const std::string before(20000, '\0');
+  l0.Up(before); l1.Up(before); f0.Up(before); f1.Up(before);
+
+  size_t len = 0;
+  ASSERT_TRUE(c.Get(c.leader.get(), "k", &l0, &l1, &len));
+  EXPECT_EQ(len, v.size());
+  ASSERT_TRUE(c.Get(c.follower.get(), "k", &f0, &f1, &len));
+  EXPECT_EQ(len, v.size());
+  EXPECT_EQ(c.transport.reads, 1) << "the follower was served by the leader";
+  EXPECT_EQ(f0.Down(20000), v.substr(0, 20000))
+      << "the follower got bytes from before the leader's fetch arrived";
+  EXPECT_EQ(f1.Down(20000), v.substr(20000));
+  EXPECT_EQ(ClientCounter(*c.leader, "dfkv_client_gpu_dedup_load_fences_total"),
+            1u);
+  ConnectorFence();
+  EXPECT_EQ(l0.Down(20000), v.substr(0, 20000));
+  EXPECT_EQ(l1.Down(20000), v.substr(20000));
+}
+
+// When the device cannot be synchronized, nothing is published: the follower
+// fetches for itself instead of being handed bytes of unknown state.
+TEST(GpuDedupClient, NothingIsPublishedWhenTheDeviceCannotBeSynchronized) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  int* fail = SimSymbol<int>("sim_cuda_fail_ctx_synchronize");
+  if (!fail) GTEST_SKIP() << "needs the simulated driver to fail a synchronize";
+  TwoClients c("fence-fails");
+  const std::string v = Val(22, 40000);
+  c.Store("k", v);
+  DevBuf l0(20000), l1(20000), f0(20000), f1(20000);
+
+  *fail = 1;
+  size_t len = 0;
+  EXPECT_TRUE(c.Get(c.leader.get(), "k", &l0, &l1, &len));  // its own result
+  EXPECT_TRUE(c.Get(c.follower.get(), "k", &f0, &f1, &len));
+  *fail = 0;
+  EXPECT_EQ(c.transport.reads, 2) << "the follower fetched for itself";
+  EXPECT_EQ(ClientCounter(*c.leader,
+                          "dfkv_client_gpu_dedup_load_fence_failures_total"),
+            1u);
+  ConnectorFence();
+  EXPECT_EQ(f0.Down(20000), v.substr(0, 20000));
+  EXPECT_EQ(f1.Down(20000), v.substr(20000));
 }
 
 #ifdef DFKV_GPU_TEST_SIMULATED

@@ -454,6 +454,8 @@ bool CudaLib::Resolve() {
       ::dlsym(h, "cuStreamSynchronize"));
   StreamDestroy = reinterpret_cast<CUresult (*)(CUstream)>(
       SymV2(h, "cuStreamDestroy_v2", "cuStreamDestroy"));
+  CtxSynchronize =
+      reinterpret_cast<CUresult (*)()>(::dlsym(h, "cuCtxSynchronize"));
   HostRegister = reinterpret_cast<CUresult (*)(void*, size_t, unsigned)>(
       ::dlsym(h, "cuMemHostRegister"));
   HostUnregister = reinterpret_cast<CUresult (*)(void*)>(
