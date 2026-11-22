@@ -1408,6 +1408,13 @@ rank，因此不应用 rank-local affinity；`adapter_params` 中也不接受这
 
 connector 移植自 dingofs 项目的 LMCache connector，与 HiCache 插件走同一套底层 KV 客户端。
 
+**被取消 / 超时的 GET 与 L1 buffer。** LMCache 的阻塞 get 超过 `blocking_timeout_secs` 会
+取消协程，但 native GET 在 worker 线程里停不下来，会继续往拿到的 L1 buffer 里写，直到返回。
+connector 因此不在取消时把 buffer 还给 arena，而是等 native 调用返回后再还（还没开始执行的
+调用立即还）；`batched_get`、`batched_get_non_blocking` 以及 native 调用抛错时同样处理。
+此前取消时 buffer 立刻归还，迟到的写入会落在已被复用的 chunk 上（宿主进程内存损坏），批量
+路径则在取消时整批不归还。
+
 #### 4.6.1 整体架构（in-process 路径）
 
 ```

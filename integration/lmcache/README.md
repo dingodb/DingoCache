@@ -152,6 +152,18 @@ payloads.
 | `DFKV_ACCESS_LOG_PATH` | (stderr) | access-log file path |
 | `DFKV_RDMA_DEV` | first local ACTIVE HCA | ordered full per-host list; narrowed per worker when in-process affinity is enabled |
 
+## Cancelled and timed-out GETs
+
+LMCache cancels a `get` that exceeds its `blocking_timeout_secs`. The native
+GET runs on a worker thread and cannot be stopped; it keeps writing into the
+L1 buffers it was given until it returns. The connector therefore does not
+return those buffers to the arena at the cancellation: they are released when
+the native call has returned (at once if it had not started yet). Until then
+they stay allocated, so a ring that answers slowly can hold up to
+`blocking_timeout`-many in-flight GETs' worth of L1 chunks a little longer
+than LMCache's own accounting suggests. The same holds for the batched get
+paths, and for a native call that fails.
+
 ## Limitations
 
 - Two integration paths, pick by LMCache mode: the in-process

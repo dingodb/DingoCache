@@ -59,6 +59,44 @@ def _key_label(key: bytes) -> str:
     return f"len={len(key)} sha256={hashlib.sha256(key).hexdigest()[:16]}"
 
 
+class _GetBuffers:
+    """The MemoryObjs one native GET writes into, and who may release them.
+
+    The native call writes into these buffers on a worker thread until it
+    returns, whatever happens to the coroutine that awaits it. Returning a
+    buffer to the arena while that call is still running hands memory that is
+    about to be overwritten to the next allocation. So while a GET is in
+    flight the buffers belong to the client (``in_flight``): if the await is
+    cancelled or raises, the client releases them once the native call has
+    returned. Only after a normal return do they belong to the connector
+    again, which hands the hits on and releases the rest.
+    """
+
+    __slots__ = ("objs", "in_flight", "_released")
+
+    def __init__(self, objs: List[MemoryObj]) -> None:
+        self.objs = list(objs)
+        self.in_flight = False
+        self._released = False
+
+    @property
+    def views(self) -> List[memoryview]:
+        return [obj.byte_array for obj in self.objs]
+
+    def release(self) -> None:
+        """Give every buffer back. At most once."""
+        if self._released:
+            return
+        self._released = True
+        for obj in self.objs:
+            obj.ref_count_down()
+
+    def settle(self) -> None:
+        """The connector has dealt with each buffer itself (handed on or
+        released): nothing is left for release() to do."""
+        self._released = True
+
+
 class DfkvConnector(RemoteConnector):
     """RemoteConnector talking to a dfkv cache cluster via the C ABI."""
 
@@ -347,11 +385,14 @@ class DfkvConnector(RemoteConnector):
                 r.result = "alloc_failed"
                 return None
 
+            # If this await is cancelled (LMCache cancels a get that exceeds
+            # its blocking timeout) or raises, the buffer is released by the
+            # client once the native call has returned -- not here.
+            _ok, per_key, lengths = await self._get_into(
+                [key_bytes], _GetBuffers([memory_obj])
+            )
             handed_off = False
             try:
-                _ok, per_key, lengths = await self._client.batch_get(
-                    [key_bytes], [memory_obj.byte_array]
-                )
                 if per_key and per_key[0]:
                     reshaped = self._reshape_hit(memory_obj, lengths[0])
                     if reshaped is not None:
@@ -455,12 +496,14 @@ class DfkvConnector(RemoteConnector):
                     return [None] * n
                 objs.append(obj)
 
-            views = [o.byte_array for o in objs]
+            leases = [
+                _GetBuffers(objs[start:end]) for start, end in self._batch_slices(n)
+            ]
             out: List[Optional[MemoryObj]] = [None] * n
             hit_keys: List[bytes] = []
             try:
                 for start, _end, per_key_list, lengths in await self._batch_get_chunks(
-                    binary_keys, views
+                    binary_keys, leases
                 ):
                     for local_i, found in enumerate(per_key_list):
                         i = start + local_i
@@ -469,11 +512,15 @@ class DfkvConnector(RemoteConnector):
                             if reshaped is not None:
                                 out[i] = reshaped
                                 hit_keys.append(binary_keys[i])
-            except Exception:
-                for o in objs:
-                    o.ref_count_down()
+            except BaseException:
+                # Cancelled or failed. The chunks whose native call may still
+                # be running are released by the client when it returns; the
+                # others (never sent, or already back) are released here.
+                self._release_idle(leases)
                 raise
 
+            for lease in leases:
+                lease.settle()
             for i, obj in enumerate(objs):
                 if out[i] is None:
                     obj.ref_count_down()
@@ -551,7 +598,6 @@ class DfkvConnector(RemoteConnector):
             for group_start in range(0, len(ranges), self._get_parallelism):
                 group = ranges[group_start : group_start + self._get_parallelism]
                 group_objs: List[List[MemoryObj]] = []
-                group_views: List[List[memoryview]] = []
                 for start, end in group:
                     objs: List[MemoryObj] = []
                     for _ in range(start, end):
@@ -568,21 +614,21 @@ class DfkvConnector(RemoteConnector):
                             return out
                         objs.append(obj)
                     group_objs.append(objs)
-                    group_views.append([o.byte_array for o in objs])
+                leases = [_GetBuffers(objs) for objs in group_objs]
                 try:
-                    results = await asyncio.gather(
-                        *(
-                            self._client.batch_get(binary_keys[start:end], views)
-                            for (start, end), views in zip(group, group_views)
-                        )
+                    results = await self._gather_gets(
+                        [binary_keys[start:end] for start, end in group], leases
                     )
-                except Exception:
-                    for chunk_objs in group_objs:
-                        for o in chunk_objs:
-                            o.ref_count_down()
+                except BaseException:
+                    # As in batched_get: what may still be written to is the
+                    # client's to release; the rest, and the prefix collected
+                    # from earlier groups, is released here.
+                    self._release_idle(leases)
                     for o in out:
                         o.ref_count_down()
                     raise
+                for lease in leases:
+                    lease.settle()
 
                 for idx, (((start, _end), objs), (_ok, per_key, lengths)) in enumerate(
                     zip(zip(group, group_objs), results)
@@ -668,16 +714,45 @@ class DfkvConnector(RemoteConnector):
         for start in range(0, n, step):
             yield start, min(start + step, n)
 
-    async def _batch_get_chunks(self, binary_keys, views):
+    async def _get_into(self, keys: List[bytes], buffers: _GetBuffers):
+        """One native GET into ``buffers``. While it is in flight the buffers
+        are the client's: see _GetBuffers."""
+        buffers.in_flight = True
+        result = await self._client.batch_get(
+            keys, buffers.views, release_buffers=buffers.release
+        )
+        buffers.in_flight = False
+        return result
+
+    async def _gather_gets(self, key_chunks, leases: List[_GetBuffers]):
+        """Several native GETs at once. All of them are waited for before a
+        failure of one is raised, so that none is left running with buffers
+        nobody will release."""
+        results = await asyncio.gather(
+            *(self._get_into(keys, lease) for keys, lease in zip(key_chunks, leases)),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        return results
+
+    @staticmethod
+    def _release_idle(leases: List[_GetBuffers]) -> None:
+        """Release the buffers no native GET can be writing into."""
+        for lease in leases:
+            if not lease.in_flight:
+                lease.release()
+
+    async def _batch_get_chunks(self, binary_keys, leases: List[_GetBuffers]):
+        """``leases[i]`` holds the buffers of the i-th slice of the keys."""
         ranges = list(self._batch_slices(len(binary_keys)))
         out = []
         for group_start in range(0, len(ranges), self._get_parallelism):
             group = ranges[group_start : group_start + self._get_parallelism]
-            results = await asyncio.gather(
-                *(
-                    self._client.batch_get(binary_keys[start:end], views[start:end])
-                    for start, end in group
-                )
+            results = await self._gather_gets(
+                [binary_keys[start:end] for start, end in group],
+                leases[group_start : group_start + len(group)],
             )
             for (start, end), (_ok, per_key, lengths) in zip(group, results):
                 out.append((start, end, list(per_key or []), list(lengths or [])))

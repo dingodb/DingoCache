@@ -18,12 +18,14 @@ RDMA zero-copy datapath.
 
 from __future__ import annotations
 
+import asyncio
 import ctypes
 import hashlib
 import logging
 import os
+import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 from dfkv_common import (
     DfkvClientOptionsV2,
     make_client_options_v2,
@@ -175,6 +177,10 @@ def _key_label(key: bytes) -> str:
 
 class DfkvNativeClient:
     """Awaitable interface over libdfkv.so (ctypes + thread-pool executor)."""
+
+    # GET buffers whose release had to wait for a native call that was still
+    # running when its caller was cancelled (see batch_get).
+    deferred_buffer_releases = 0
 
     def __init__(
         self,
@@ -420,24 +426,118 @@ class DfkvNativeClient:
             return ok, per_key
 
     async def batch_get(
-        self, keys: Sequence[bytes], bufs: Sequence[memoryview]
+        self,
+        keys: Sequence[bytes],
+        bufs: Sequence[memoryview],
+        *,
+        release_buffers: Optional[Callable[[], None]] = None,
     ) -> Tuple[bool, Optional[List[bool]], List[int]]:
+        """Read ``keys`` into ``bufs``.
+
+        The native call runs on a worker thread and writes into ``bufs`` until
+        it returns; cancelling this coroutine does not stop it. A caller that
+        hands ``bufs`` back to an allocator must therefore not do so when this
+        coroutine is cancelled or raises: the transport may still be writing,
+        and the next owner of that memory would get those bytes.
+
+        ``release_buffers``, if given, is how such a caller gives the buffers
+        up. When this coroutine does not return normally it is called exactly
+        once, and only once the native call can no longer touch ``bufs``: at
+        once if the call never started or has already returned, otherwise
+        when it returns. It is not called on a normal return (the caller owns
+        the buffers again). It runs on the client's event loop, or on the
+        worker thread if that loop is already closed.
+        """
         n = len(keys)
-        with _push_metrics.op("get", num_keys=n) as _m, \
-                _push_tracing.span("batch_get", n) as _sp, \
-                access_log("native.batch_get",
-                           lambda: f"{n} keys, {_total_size(bufs)} bytes") as r:
-            ok, per_key, lengths = await self._loop.run_in_executor(
-                self._executor, self._batch_get_blocking, list(keys), list(bufs)
-            )
-            hits = sum(1 for b in per_key if b)
-            if _m or _sp:
-                _nb = sum(lengths)
-                _m.bytes = _nb
-                _sp.bytes = _nb
-                _sp.hits = hits
-            r.result = f"hits={hits}/{n}"
-            return ok, per_key, lengths
+        native: Optional[concurrent.futures.Future] = None
+        try:
+            with _push_metrics.op("get", num_keys=n) as _m, \
+                    _push_tracing.span("batch_get", n) as _sp, \
+                    access_log("native.batch_get",
+                               lambda: f"{n} keys, {_total_size(bufs)} bytes") as r:
+                native = self._executor.submit(
+                    self._batch_get_blocking, list(keys), list(bufs)
+                )
+                ok, per_key, lengths = await self._outcome_of(native)
+                hits = sum(1 for b in per_key if b)
+                if _m or _sp:
+                    _nb = sum(lengths)
+                    _m.bytes = _nb
+                    _sp.bytes = _nb
+                    _sp.hits = hits
+                r.result = f"hits={hits}/{n}"
+                return ok, per_key, lengths
+        except BaseException:
+            # Anything that ends this coroutine abnormally -- a cancellation,
+            # a native failure, a submit refused because the client is being
+            # closed, a raising context manager -- leaves the buffers to
+            # release_buffers, once no native call can touch them.
+            if release_buffers is not None:
+                self._release_when_native_done(native, release_buffers)
+            raise
+
+    def _outcome_of(self, native: "concurrent.futures.Future") -> "asyncio.Future":
+        """An asyncio future that gets ``native``'s outcome, unless it is done
+        (cancelled) by then.
+
+        Cancelling an await of it cancels only it, never the native call --
+        and, unlike ``asyncio.shield``, a native failure that comes after the
+        cancellation is not reported to the loop's exception handler: it is
+        never handed to an asyncio future. (``_release_when_native_done``
+        still waits for the call.)
+        """
+        outer = self._loop.create_future()
+
+        def settle(done: "concurrent.futures.Future") -> None:
+            if outer.done():
+                return
+            if done.cancelled():
+                outer.cancel()
+            elif done.exception() is not None:
+                outer.set_exception(done.exception())
+            else:
+                outer.set_result(done.result())
+
+        def on_native_done(done: "concurrent.futures.Future") -> None:
+            try:
+                self._loop.call_soon_threadsafe(settle, done)
+            except RuntimeError:  # the loop is closed: nobody awaits it
+                pass
+
+        native.add_done_callback(on_native_done)
+        return outer
+
+    def _release_when_native_done(
+        self,
+        native: "Optional[concurrent.futures.Future]",
+        release: Callable[[], None],
+    ) -> None:
+        """Call ``release`` once ``native`` can no longer write into the
+        buffers it was given (see :meth:`batch_get`). ``None``: no native
+        call was submitted."""
+
+        def run_release() -> None:
+            try:
+                release()
+            except Exception:  # pragma: no cover - a release must not raise
+                logger.exception("releasing GET buffers failed")
+
+        if native is None or native.cancel():
+            # Never submitted, or still queued: it will never run, nothing
+            # will touch the buffers.
+            run_release()
+            return
+        if not native.done():
+            self.deferred_buffer_releases += 1
+
+        def on_done(_future) -> None:
+            # Worker thread (or this thread, if the call is already done).
+            try:
+                self._loop.call_soon_threadsafe(run_release)
+            except RuntimeError:  # the loop is closed
+                run_release()
+
+        native.add_done_callback(on_done)
 
     async def batch_exists(
         self, keys: Sequence[bytes]
