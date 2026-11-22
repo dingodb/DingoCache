@@ -35,7 +35,8 @@ class DiskCacheGroup {
     // "file" remains available only when explicitly requested for diagnostics.
     std::string engine{};
     // Dependency injection for focused concurrency tests. Production leaves
-    // this empty and constructs the selected file/slab engine normally.
+    // this empty and constructs the selected file/slab engine normally. Called
+    // once per directory, from one thread per directory at the same time.
     std::function<std::unique_ptr<StoreEngine>(const std::string&, uint64_t)>
         engine_factory{};
   };

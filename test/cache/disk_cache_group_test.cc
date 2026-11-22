@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -58,6 +59,19 @@ struct BatchProbe {
   size_t close_max_active = 0;
   size_t close_overlap = 0;
   std::set<size_t> unclean_disks;
+  // Opening: a factory call stays inside until `open_overlap` of them are.
+  void EnterOpen() {
+    std::unique_lock<std::mutex> lock(mu);
+    ++open_active;
+    open_max_active = std::max(open_max_active, open_active);
+    cv.notify_all();
+    cv.wait_for(lock, std::chrono::seconds(10),
+                [&] { return open_max_active >= open_overlap; });
+    --open_active;
+  }
+  size_t open_active = 0;
+  size_t open_max_active = 0;
+  size_t open_overlap = 0;
 };
 
 class ScopedEnv {
@@ -564,4 +578,75 @@ TEST_F(DiskGroupTest, DestructionClosesDisksThatNobodyClosed) {
   std::lock_guard<std::mutex> lock(probe->mu);
   EXPECT_EQ(probe->close_calls, dirs.size());
   EXPECT_EQ(probe->close_max_active, dirs.size());
+}
+
+
+// A slab store reads its whole table back when it is opened. With the disks
+// opened one after the other, startup grew by seconds per disk.
+TEST_F(DiskGroupTest, OpensAllDisksAtOnceAndKeepsTheirOrder) {
+  const auto dirs = Dirs(4);
+  auto probe = std::make_shared<BatchProbe>();
+  probe->open_overlap = dirs.size();
+  DiskCacheGroup::Options options;
+  options.cache_dirs = dirs;
+  options.capacity_bytes = 1ull << 30;
+  options.engine = "file";
+  options.engine_factory = [probe, dirs](const std::string& dir, uint64_t) {
+    const size_t disk = static_cast<size_t>(
+        std::find(dirs.begin(), dirs.end(), dir) - dirs.begin());
+    // A factory call returns only once all four are inside, or after 10 s.
+    probe->EnterOpen();
+    return std::make_unique<ProbeEngine>(dir, disk, probe);
+  };
+  const auto started = std::chrono::steady_clock::now();
+  DiskCacheGroup group(std::move(options));
+  EXPECT_LT(std::chrono::steady_clock::now() - started,
+            std::chrono::seconds(5));
+  ASSERT_TRUE(group.Healthy());
+  ASSERT_EQ(group.DiskCount(), dirs.size());
+  for (size_t i = 0; i < dirs.size(); ++i) EXPECT_EQ(group.DiskPath(i), dirs[i]);
+  std::lock_guard<std::mutex> lock(probe->mu);
+  EXPECT_EQ(probe->open_max_active, dirs.size());
+}
+
+TEST_F(DiskGroupTest, AnEngineThatThrowsWhileOpeningFailsConstruction) {
+  const auto dirs = Dirs(3);
+  auto probe = std::make_shared<BatchProbe>();
+  DiskCacheGroup::Options options;
+  options.cache_dirs = dirs;
+  options.capacity_bytes = 1ull << 30;
+  options.engine = "file";
+  options.engine_factory =
+      [probe, dirs](const std::string& dir,
+                    uint64_t) -> std::unique_ptr<StoreEngine> {
+    if (dir == dirs[1]) throw std::runtime_error("cannot open " + dir);
+    return std::make_unique<ProbeEngine>(dir, 0, probe);
+  };
+  // Thrown on a helper thread, it must still reach the caller instead of
+  // terminating the process.
+  EXPECT_THROW({ DiskCacheGroup group(std::move(options)); },
+               std::runtime_error);
+}
+
+TEST_F(DiskGroupTest, RealSlabDisksOpenedTogetherKeepTheirData) {
+  const auto dirs = Dirs(3);
+  const std::string value(4096, 'p');
+  {
+    DiskCacheGroup group({dirs, 3ull << 30, "slab"});
+    ASSERT_TRUE(group.Healthy()) << group.StartupError();
+    for (uint64_t i = 0; i < 64; ++i)
+      ASSERT_EQ(group.Cache(BlockKey{9000 + i, 0}, value.data(), value.size()),
+                Status::kOk);
+  }
+  DiskCacheGroup reopened({dirs, 3ull << 30, "slab"});
+  ASSERT_TRUE(reopened.Healthy()) << reopened.StartupError();
+  EXPECT_EQ(reopened.Count(), 64u);
+  for (size_t i = 0; i < dirs.size(); ++i) EXPECT_EQ(reopened.DiskPath(i), dirs[i]);
+  for (uint64_t i = 0; i < 64; ++i) {
+    std::string out;
+    ASSERT_EQ(reopened.Range(BlockKey{9000 + i, 0}, 0, value.size(), &out),
+              Status::kOk)
+        << i;
+    EXPECT_EQ(out, value);
+  }
 }
