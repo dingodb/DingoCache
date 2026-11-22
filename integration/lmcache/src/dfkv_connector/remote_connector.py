@@ -105,6 +105,10 @@ class DfkvConnector(RemoteConnector):
     _DEFAULT_GET_PARALLELISM = 1
     _ENV_GET_PARALLELISM = "DFKV_CONNECTOR_GET_PARALLELISM"
     _ENV_ASSUME_EXISTS = "DFKV_CONNECTOR_ASSUME_EXISTS"
+    # How long a positive answer of the exists cache stays valid, seconds.
+    # 0 keeps it until the key is evicted from the cache or a GET misses.
+    _DEFAULT_EXISTS_TTL_S = 60.0
+    _ENV_EXISTS_TTL_S = "DFKV_CONNECTOR_EXISTS_TTL_S"
 
     def __init__(
         self,
@@ -182,7 +186,10 @@ class DfkvConnector(RemoteConnector):
             )
 
             self._local_cpu_backend = local_cpu_backend
-            self._exists_lru = ExistsLRU(capacity=exists_cache_capacity)
+            self._exists_lru = ExistsLRU(
+                capacity=exists_cache_capacity,
+                ttl_s=self._resolve_exists_ttl_s(),
+            )
             self._client = DfkvNativeClient(
                 raw_endpoint=endpoint.raw_endpoint,
                 group=endpoint.group,
@@ -263,6 +270,28 @@ class DfkvConnector(RemoteConnector):
         if n <= 0:
             raise ValueError(f"{env_name} must be positive, got {n}")
         return n
+
+    @classmethod
+    def _resolve_exists_ttl_s(cls) -> float:
+        """DFKV_CONNECTOR_EXISTS_TTL_S, seconds; 0 = no expiry. A value that is
+        not a non-negative number keeps the default, with a warning: this
+        runs inside the engine process and must not stop it."""
+        raw = os.environ.get(cls._ENV_EXISTS_TTL_S)
+        if raw is None or raw == "":
+            return cls._DEFAULT_EXISTS_TTL_S
+        try:
+            ttl = float(raw)
+        except ValueError:
+            ttl = -1.0
+        if ttl < 0 or ttl != ttl or ttl == float("inf"):
+            logger.warning(
+                "invalid %s=%r: expected seconds >= 0; using %s",
+                cls._ENV_EXISTS_TTL_S,
+                raw,
+                cls._DEFAULT_EXISTS_TTL_S,
+            )
+            return cls._DEFAULT_EXISTS_TTL_S
+        return ttl
 
     @staticmethod
     def _resolve_bool_env(env_name: str) -> bool:
@@ -401,8 +430,12 @@ class DfkvConnector(RemoteConnector):
                         r.result = f"ok {_fmt_bytes(lengths[0])}"
                         return reshaped
                     r.result = "bad_length"
+                    self._exists_lru.discard(key_bytes)
                     return None
                 r.result = "not_found"
+                # The server does not have it (any more): forget the positive,
+                # or LMCache keeps being told it exists and never stores it.
+                self._exists_lru.discard(key_bytes)
                 return None  # NotFound — caller treats as cache miss
             finally:
                 if not handed_off:
@@ -521,9 +554,13 @@ class DfkvConnector(RemoteConnector):
 
             for lease in leases:
                 lease.settle()
+            missed: List[bytes] = []
             for i, obj in enumerate(objs):
                 if out[i] is None:
                     obj.ref_count_down()
+                    missed.append(binary_keys[i])
+            if missed:
+                self._exists_lru.discard_many(missed)
             if hit_keys:
                 self._exists_lru.add_many(hit_keys)
             r.result = f"hits={len(hit_keys)}/{n}"
@@ -653,6 +690,15 @@ class DfkvConnector(RemoteConnector):
                             binary_keys[start : start + local_prefix]
                         )
                         out.extend(objs[:local_prefix])
+                    # The keys of this chunk the server answered "not there"
+                    # for, and a hit that came back with an unusable length:
+                    # forget them. A key with no answer at all stays as it is.
+                    self._exists_lru.discard_many(
+                        binary_keys[start + i]
+                        for i in range(local_prefix, len(per_key_list))
+                        if i < len(objs)
+                        and (not per_key_list[i] or i == local_prefix)
+                    )
 
                     if local_prefix < len(objs):
                         for obj in objs[local_prefix:]:

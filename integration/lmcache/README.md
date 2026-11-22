@@ -148,6 +148,7 @@ payloads.
 | `DFKV_CONNECTOR_GET_PARALLELISM` | 1 | concurrent batched-get groups (executor workers) |
 | `DFKV_CONNECTOR_BATCH_MAX_KEYS` | 512 | max keys per native batch call |
 | `DFKV_CONNECTOR_ASSUME_EXISTS` | 0 | skip remote contains checks (debug) |
+| `DFKV_CONNECTOR_EXISTS_TTL_S` | 60 | seconds a "present" answer of the per-process exists cache stays valid before the ring is asked again; `0` = no expiry. A GET that misses forgets the key at once either way |
 | `DFKV_ACCESS_LOG_ENABLED` | 0 | per-op access log |
 | `DFKV_ACCESS_LOG_PATH` | (stderr) | access-log file path |
 | `DFKV_RDMA_DEV` | first local ACTIVE HCA | ordered full per-host list; narrowed per worker when in-process affinity is enabled |
