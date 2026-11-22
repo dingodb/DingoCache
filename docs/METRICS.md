@@ -424,7 +424,7 @@ C 客户端快照还含传输级指标（RDMA 构建）：
 | `dfkv_rdma_client_connection_class_active{block_bytes,depth}` / `connection_class_idle{block_bytes,depth}` | gauge | 当前执行中 / idle pool内的二维class分布；label集合受power-of-two class限制 |
 | `dfkv_rdma_client_oversize_rejects_total` | counter | 分配、注册或发帖前因超过声明上限而拒绝的操作 |
 | `dfkv_rdma_client_v2_probe_attempts_total` / `dfkv_rdma_client_v2_probe_failures_total` | counter | 必选 v2 bootstrap probe 尝试 / 失败 |
-| `dfkv_rdma_client_stale_pool_retries_total` | counter | pooled QP 失败后改用 fresh connection 的重试 |
+| `dfkv_rdma_client_stale_pool_retries_total` | counter | pooled QP 失败后改用 fresh connection 的重试；含已 post 的 PUT 与直接写入调用方内存的整对象 GET，二者只在连接是 stale pooled（见下一行）时重试 |
 | `dfkv_rdma_client_stale_pool_connections_total` | counter | 从池里取出复用时即失败的连接数（对端回收了空闲连接或已重启）。这类失败只丢弃该连接，不冷却对端 rail；对端有身份（经 MDS 发现）时同 (peer, rail) 的其余空闲连接一并丢弃，静态地址列表里的对端则不丢弃其余连接，它们各自被发现失效时各计一次；随后的 fresh connection 若也失败才计入 `dfkv_rdma_client_remote_rail_failures_total` 并冷却。持续增长 = server 的空闲回收（`DFKV_RDMA_IDLE_MS`）短于 client 的连接空闲时间，可开 `DFKV_RDMA_KEEPALIVE_MS` |
 | `dfkv_rdma_client_peer_unreachable_total` | counter | 新建连接时到对端 bootstrap 地址的 TCP connect 失败的次数（含能力探测）。这是节点级故障：不计任何 rail、不重试（各 rail 拨的是同一个地址），操作返回 `kIOError`，由上层按节点冷却。失败后该地址在 `DFKV_RDMA_REMOTE_RAIL_COOLDOWN_MS`（默认 2 s）内不再拨号 |
 | `dfkv_rdma_client_peer_unreachable_skips_total` | counter | 因同一地址刚 connect 失败（上一行的保持期内）而没有发起的建连次数；这些操作和后台节点探测立即返回 `kIOError`，不再各等一次 connect 超时。已建立的连接不受影响 |
@@ -499,7 +499,11 @@ SGLang HiCache插件另导出：
   operation 捕获一个 peer generation，物理尝试最多 2 次。
 - GET/batch/SG 保留已完成 item/window 的 byte-exact staged 结果，fresh 第二次只
   提交未完成集合。PUT 仅在明确 request 尚未 post 时允许换轨；post 后 completion
-  不明的 PUT 不 cross-rail replay，避免扩大 ambiguous write 语义。
+  不明的 PUT 不 cross-rail replay，避免扩大 ambiguous write 语义。例外是 stale
+  pooled QP（出池后无任何 completion 成功即失败，见
+  `stale_pool_connections_total`）：请求几乎可以肯定未送达，PUT 与整对象直接 GET
+  都在 fresh connection 上再做一次（同一 key、同一字节），计入
+  `stale_pool_retries_total`。
 - Conn 绑定 peer generation；pool 中旧代 endpoint 永不复用或回池，并通过既有
   single-owner lifecycle 销毁。topology update 不在别的线程直接双重 teardown。
 - `Status::kNoCompatibleRail` 是 client-local（不上 wire）、peer-health neutral：

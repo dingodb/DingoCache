@@ -212,7 +212,9 @@ class RdmaTransport : public Transport {
                    RemoteRailOutcome::kSuccess,
                std::optional<uint64_t> application_use_us =
                    rdma::RailPolicy::NowMicros());
-  void Destroy(Conn* c,
+  // Returns true when the connection was a stale pooled one: taken from the
+  // pool, failed by its peer before any completion succeeded on it since.
+  bool Destroy(Conn* c,
                rdma::RailCompletion completion =
                    rdma::RailCompletion::kAdmission);
   // Counts and logs the failed work completion, if any, that the endpoint of

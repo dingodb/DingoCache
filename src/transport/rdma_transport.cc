@@ -1112,8 +1112,8 @@ void RdmaTransport::NoteFailedCompletion(Conn& c,
       " suppressed=" + std::to_string(suppressed));
 }
 
-void RdmaTransport::Destroy(Conn* c, rdma::RailCompletion completion) {
-  if (!c) return;
+bool RdmaTransport::Destroy(Conn* c, rdma::RailCompletion completion) {
+  if (!c) return false;
   if (c->local_resource_failure)
     completion = rdma::RailCompletion::kAdmission;
   NoteFailedCompletion(*c, completion);
@@ -1160,6 +1160,7 @@ void RdmaTransport::Destroy(Conn* c, rdma::RailCompletion completion) {
     stale_pool_connections_.fetch_add(1, std::memory_order_relaxed);
     RetireIdlePeerRail(stale_peer_id, stale_rail);
   }
+  return stale_pooled;
 }
 
 
@@ -1911,6 +1912,19 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   return result;
 }
 
+// A PUT that was posted is not sent again: whether the server stored it is
+// not known. Callers pass request_posted false for a PUT whose connection
+// Destroy found to be a stale pooled one. Nothing succeeded on that
+// connection since it left the pool, not even the acknowledgement of the
+// request by the peer's NIC, which a peer that still has the connection
+// sends as the request arrives. So the request was almost certainly not
+// delivered: the server has reclaimed the connection or restarted. It may
+// have been, if only the acknowledgements were lost on the way back, or if
+// the completion of the request arrived just as the window's deadline ran
+// out (the reap does not poll once more then). The PUT sent again carries
+// the same key and bytes, which the server answers with the result of the
+// value it has. A first copy that was delivered may still be handled after
+// the second, as any PUT whose client gave up on it could be before.
 bool RdmaTransport::PrepareRetry(
     int attempt, bool from_pool, std::optional<size_t> attempted_rail,
     AcquireFailure failure, ReplaySafety replay_safety, bool request_posted,
@@ -2850,7 +2864,7 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
 
     const size_t failed_rail = conn->rail_index;
     const bool local_resource = conn->local_resource_failure;
-    Destroy(conn, completion);
+    const bool stale_pooled = Destroy(conn, completion);
     if (local_resource) {
       // Another rail or another attempt would fail the same way.
       if (cross_rail_retry)
@@ -2863,8 +2877,8 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
             ? AcquireFailure::kLocalRail
             : AcquireFailure::kEndpoint;
     if (PrepareRetry(attempt, acquired.from_pool, failed_rail, failure,
-                     replay_safety, request_posted, peer, &excluded,
-                     &cross_rail_retry)) {
+                     replay_safety, request_posted && !stale_pooled, peer,
+                     &excluded, &cross_rail_retry)) {
       continue;
     }
     if (cross_rail_retry)
@@ -3251,7 +3265,7 @@ std::vector<Status> RdmaTransport::CacheMany(
     }
     const size_t failed_rail = conn->rail_index;
     const bool local_resource = conn->local_resource_failure;
-    Destroy(conn, completion);
+    const bool stale_pooled = Destroy(conn, completion);
     if (local_resource) {
       // Another rail or another attempt would fail the same way. Items that
       // already have their answer keep it.
@@ -3265,7 +3279,8 @@ std::vector<Status> RdmaTransport::CacheMany(
             ? AcquireFailure::kLocalRail
             : AcquireFailure::kEndpoint;
     if (PrepareRetry(attempt, acquired.from_pool, failed_rail, failure,
-                     ReplaySafety::kUnsafeAfterPost, request_posted, peer,
+                     ReplaySafety::kUnsafeAfterPost,
+                     request_posted && !stale_pooled, peer,
                      &excluded, &cross_rail_retry))
       continue;
     if (cross_rail_retry)
@@ -3691,12 +3706,13 @@ Status RdmaTransport::PullInto(
   if (mode == PullMode::kWholeObject && capacity == 0)
     return Status::kInvalid;
   const auto peer = peer_topologies_->Snapshot(node);
-  RailMask excluded(mode == PullMode::kSlice ? devs_.size() : 0, 0);
+  RailMask excluded(devs_.size(), 0);
   bool cross_rail_retry = false;
-  // String slices retain their former bounded replay-safe recovery. Whole-
-  // object direct destinations retain the existing single-attempt contract.
-  for (int attempt = 0; attempt < (mode == PullMode::kSlice ? 2 : 1);
-       ++attempt) {
+  // String slices retain their former bounded replay-safe recovery. A whole
+  // object read into the caller's destination is tried once more only when
+  // it found a stale pooled connection (see Destroy): the READs on it are
+  // fenced, and the second attempt writes the whole destination again.
+  for (int attempt = 0; attempt < 2; ++attempt) {
     AcquireOptions options;
     options.required_data_bytes = capacity;
     options.request_dynamic_pull = true;
@@ -3732,14 +3748,14 @@ Status RdmaTransport::PullInto(
       const size_t failed_rail = conn->rail_index;
       const bool local_resource = conn->local_resource_failure;
       // Fence the READ before the staged destination can be reused or freed.
-      Destroy(conn, failure);
+      const bool stale_pooled = Destroy(conn, failure);
       if (local_resource) {
         if (cross_rail_retry)
           cross_rail_retry_exhausted_.fetch_add(1,
                                                 std::memory_order_relaxed);
         return Status::kResourceExhausted;
       }
-      if (mode == PullMode::kSlice &&
+      if ((mode == PullMode::kSlice || stale_pooled) &&
           PrepareRetry(attempt, acquired.from_pool, failed_rail,
                        failure == rdma::RailCompletion::kRailFailure
                            ? AcquireFailure::kLocalRail
@@ -4078,7 +4094,7 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
     }
     const size_t failed_rail = conn->rail_index;
     const bool local_resource = conn->local_resource_failure;
-    Destroy(conn, completion);
+    const bool stale_pooled = Destroy(conn, completion);
     for (size_t i = 0; i < count; ++i) {
       if (!bad[i] && !completed[i])
         result[i] = local_resource ? Status::kResourceExhausted
@@ -4094,7 +4110,8 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
             ? AcquireFailure::kLocalRail
             : AcquireFailure::kEndpoint;
     if (PrepareRetry(attempt, acquired.from_pool, failed_rail, failure,
-                     ReplaySafety::kUnsafeAfterPost, request_posted, peer,
+                     ReplaySafety::kUnsafeAfterPost,
+                     request_posted && !stale_pooled, peer,
                      &excluded, &cross_rail_retry))
       continue;
     if (cross_rail_retry)

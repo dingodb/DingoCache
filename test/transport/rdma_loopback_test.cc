@@ -5476,6 +5476,214 @@ std::string SingleTestRail() {
              : discovered.devices.front().name;
 }
 
+// Settings for the tests below: the server reclaims a connection after
+// 120 ms without traffic, the client sends no keepalive that would prevent
+// it, and the failed completion on the dead connection arrives before any
+// window deadline, however long this HCA takes to exhaust its retries.
+struct ReclaimingServerEnv {
+  ScopedEnv idle_reclaim{"DFKV_RDMA_IDLE_MS", "120"};
+  ScopedEnv keepalive{"DFKV_RDMA_KEEPALIVE_MS", "0"};
+  ScopedEnv op_timeout{"DFKV_RDMA_OP_TIMEOUT_MS", "60000"};
+  ScopedEnv batch_timeout{"DFKV_RDMA_BATCH_OP_TIMEOUT_MS", nullptr};
+  ScopedEnv rail_tiers{"DFKV_RDMA_RAIL_TIERS", nullptr};
+};
+
+// A PUT posted on a pooled connection that the server has reclaimed gets no
+// acknowledgement and fails with retry exceeded. Nothing reached a server
+// that could store it, so it is sent once more on a new connection, and the
+// server sees each PUT exactly once.
+TEST(RdmaLoopback, PutsOnAConnectionTheServerReclaimedAreSentOnANewOne) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ReclaimingServerEnv env;
+  const std::string rail = SingleTestRail();
+  if (rail.empty()) GTEST_SKIP() << "no ACTIVE RDMA device";
+  ScopedEnv one_rail("DFKV_RDMA_DEV", rail.c_str());
+  RdmaNode node("stale-put");
+  RdmaTransport rt(kMaxMsg, rail);
+  rt.OnPeerTopology(PublishedPeer(node.addr, "stale-put-peer"));
+  const std::string value = PatternValue(64 * 1024 + 7, 3);
+  const auto key = [](const std::string& name) {
+    return ToBlockKey(SelfHdr(), name);
+  };
+  ASSERT_EQ(rt.Cache(node.addr, key("warm"), value.data(), value.size()),
+            Status::kOk);
+
+  // One PUT.
+  ASSERT_TRUE(ServerHasNoConnections(node));
+  const auto started = std::chrono::steady_clock::now();
+  EXPECT_EQ(rt.Cache(node.addr, key("single"), value.data(), value.size()),
+            Status::kOk);
+  std::cout << "[ info ] PUT on the reclaimed connection and its retry took "
+            << std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - started)
+                   .count()
+            << " ms\n";
+  EXPECT_EQ(node.CacheDirectCalls(key("single")), 1u);
+
+  // A batch of PUTs.
+  ASSERT_TRUE(ServerHasNoConnections(node));
+  const std::vector<CacheItem> batch = {
+      {key("batch-0"), value.data(), value.size()},
+      {key("batch-1"), value.data(), value.size()},
+      {key("batch-2"), value.data(), value.size()}};
+  EXPECT_EQ(rt.CacheMany(node.addr, batch),
+            std::vector<Status>(batch.size(), Status::kOk));
+  for (const auto& item : batch)
+    EXPECT_EQ(node.CacheDirectCalls(item.key), 1u);
+
+  // A scatter-gather PUT, after a first one that pools its connection.
+  const size_t half = value.size() / 2;
+  const auto source = [&](const std::string& name) {
+    return CacheSrcMulti{key(name),
+                         {{value.data(), half},
+                          {value.data() + half, value.size() - half}}};
+  };
+  ASSERT_EQ(rt.CacheFromMulti(node.addr, {source("sg-warm")}),
+            std::vector<Status>{Status::kOk});
+  ASSERT_TRUE(ServerHasNoConnections(node));
+  EXPECT_EQ(rt.CacheFromMulti(node.addr, {source("sg")}),
+            std::vector<Status>{Status::kOk});
+  EXPECT_EQ(node.CacheDirectCalls(key("sg")), 1u);
+
+  const std::string metrics = rt.MetricsText();
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_stale_pool_retries_total"),
+            3);
+  EXPECT_EQ(
+      CounterVal(metrics, "dfkv_rdma_client_remote_rail_cooldowns_total"), 0);
+  for (const char* name : {"single", "batch-0", "batch-1", "batch-2", "sg"}) {
+    std::string out;
+    EXPECT_EQ(rt.Range(node.addr, key(name), 0, value.size(), &out),
+              Status::kOk)
+        << name;
+    EXPECT_EQ(out, value) << name;
+  }
+}
+
+// A read into the caller's memory that finds a pooled connection the server
+// has reclaimed is made again on a new connection, for one destination and
+// for a scatter-gather one.
+TEST(RdmaLoopback, DirectReadsOnAConnectionTheServerReclaimedSucceed) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ReclaimingServerEnv env;
+  const std::string rail = SingleTestRail();
+  if (rail.empty()) GTEST_SKIP() << "no ACTIVE RDMA device";
+  ScopedEnv one_rail("DFKV_RDMA_DEV", rail.c_str());
+  RdmaNode node("stale-direct-read");
+  RdmaTransport rt(kMaxMsg, rail);
+  rt.OnPeerTopology(PublishedPeer(node.addr, "stale-direct-read-peer"));
+  const std::string value = PatternValue(64 * 1024 + 7, 5);
+  const BlockKey key = ToBlockKey(SelfHdr(), "direct");
+  ASSERT_EQ(rt.Cache(node.addr, key, value.data(), value.size()),
+            Status::kOk);
+
+  ASSERT_TRUE(ServerHasNoConnections(node));
+  std::string out(value.size(), '\0');
+  std::vector<uint64_t> value_lens;
+  EXPECT_EQ(rt.RangeInto(node.addr, {key}, {{out.data(), out.size()}},
+                         &value_lens),
+            std::vector<Status>{Status::kOk});
+  EXPECT_EQ(value_lens, std::vector<uint64_t>{value.size()});
+  EXPECT_EQ(out, value);
+
+  // The scatter-gather lane has its own pool: read once to pool a
+  // connection there, then again after the server has reclaimed it.
+  const size_t half = value.size() / 2;
+  std::string first(half, '\0'), second(value.size() - half, '\0');
+  const auto read_sg = [&] {
+    first.assign(half, '\0');
+    second.assign(value.size() - half, '\0');
+    std::vector<size_t> lengths;
+    const auto statuses = rt.RangeIntoMulti(
+        node.addr, {key},
+        {RangeDstMulti{{{first.data(), first.size()},
+                        {second.data(), second.size()}}}},
+        &lengths);
+    return statuses.size() == 1 && statuses[0] == Status::kOk &&
+           lengths == std::vector<size_t>{value.size()} &&
+           first + second == value;
+  };
+  ASSERT_TRUE(read_sg());
+  ASSERT_TRUE(ServerHasNoConnections(node));
+  EXPECT_TRUE(read_sg());
+
+  const std::string metrics = rt.MetricsText();
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_stale_pool_retries_total"),
+            2);
+  EXPECT_EQ(
+      CounterVal(metrics, "dfkv_rdma_client_remote_rail_cooldowns_total"), 0);
+}
+
+// The other half of the rule above: a PUT posted on a pooled connection on
+// which something has succeeded since it left the pool is not sent again,
+// whatever fails afterwards. Here every completion of the request arrives
+// and the server stores the value; the failure is injected after that, as a
+// remote error completion. The single PUT is the first request on its
+// reused connection; in the batch the first window succeeds and the second
+// fails.
+TEST(RdmaLoopback, PutPostedOnAProvenPooledConnectionIsNotSentAgain) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
+  ScopedEnv local_fault("DFKV_RDMA_TEST_COMPLETION_FAULT", nullptr);
+  ScopedEnv endpoint_fault("DFKV_RDMA_TEST_ENDPOINT_COMPLETION_FAULT",
+                           nullptr);
+  const std::string rail = SingleTestRail();
+  if (rail.empty()) GTEST_SKIP() << "no ACTIVE RDMA device";
+  ScopedEnv one_rail("DFKV_RDMA_DEV", rail.c_str());
+  RdmaNode node("proven-put");
+  RdmaTransport rt(kMaxMsg, rail);
+  const std::string value = PatternValue(16 * 1024 + 3, 9);
+  const auto key = [](const std::string& name) {
+    return ToBlockKey(SelfHdr(), name);
+  };
+  const auto items = [&](const std::string& prefix) {
+    std::vector<CacheItem> batch;
+    for (int i = 0; i < 8; ++i)
+      batch.push_back({key(prefix + std::to_string(i)), value.data(),
+                       value.size()});
+    return batch;
+  };
+  const auto counter = [&](const std::string& name) {
+    return CounterVal(rt.MetricsText(), name);
+  };
+
+  ASSERT_EQ(rt.Cache(node.addr, key("warm"), value.data(), value.size()),
+            Status::kOk);
+  long hits = counter("dfkv_rdma_endpoint_cache_hits_total");
+  long writes = counter("dfkv_rdma_client_v2_put_writes_total");
+  {
+    ScopedEnv fault("DFKV_RDMA_TEST_ENDPOINT_COMPLETION_FAULT", "1:1:1");
+    EXPECT_EQ(rt.Cache(node.addr, key("single"), value.data(), value.size()),
+              Status::kIOError);
+  }
+  EXPECT_EQ(counter("dfkv_rdma_endpoint_cache_hits_total"), hits + 1)
+      << "the PUT ran on the pooled connection";
+  EXPECT_EQ(counter("dfkv_rdma_client_v2_put_writes_total"), writes + 1)
+      << "the PUT was not posted again";
+  EXPECT_EQ(node.CacheDirectCalls(key("single")), 1u);
+
+  ASSERT_EQ(rt.CacheMany(node.addr, items("warm-batch-")),
+            std::vector<Status>(8, Status::kOk));
+  const auto batch = items("batch-");
+  hits = counter("dfkv_rdma_endpoint_cache_hits_total");
+  writes = counter("dfkv_rdma_client_v2_put_writes_total");
+  std::vector<Status> statuses;
+  {
+    ScopedEnv fault("DFKV_RDMA_TEST_ENDPOINT_COMPLETION_FAULT", "2:1:2");
+    statuses = rt.CacheMany(node.addr, batch);
+  }
+  std::vector<Status> expected(4, Status::kOk);
+  expected.resize(8, Status::kIOError);
+  EXPECT_EQ(statuses, expected);
+  EXPECT_EQ(counter("dfkv_rdma_endpoint_cache_hits_total"), hits + 1);
+  EXPECT_EQ(counter("dfkv_rdma_client_v2_put_writes_total"), writes + 8)
+      << "no item of the batch was posted twice";
+  for (const auto& item : batch) EXPECT_EQ(node.CacheDirectCalls(item.key), 1u);
+  EXPECT_EQ(counter("dfkv_rdma_client_stale_pool_retries_total"), 0);
+  EXPECT_EQ(counter("dfkv_rdma_client_stale_pool_connections_total"), 0);
+}
+
 // A TCP connect that fails says the node is not there. It says nothing about
 // a rail: every rail dials the same address. So no peer rail is charged and
 // nothing is dialed a second time; the caller gets kIOError, which is what
