@@ -180,25 +180,19 @@ TEST(ConnectionPool, SurvivesStalePooledConnection) {
   n->srv->Stop();
 }
 
-TEST(ConnectionPool, ConcurrentLoadGrowsToBoundThenReusesAndShrinks) {
-  auto n = Start("adaptive");
-  EndpointPoolOptions options;
-  options.min_connections = 1;
-  options.max_connections = 3;
-  options.idle_timeout_ms = 2;
-  options.acquire_timeout_ms = 10000;
-  TcpTransport t(options);
-
-  constexpr size_t kCalls = 12;
+namespace {
+// kCalls concurrent 4 MiB PUTs released at the same instant.
+constexpr size_t kBurstCalls = 12;
+void RunBurst(TcpTransport* t, const std::string& addr) {
   std::string value(4u << 20, 'a');
-  std::vector<Status> statuses(kCalls, Status::kIOError);
+  std::vector<Status> statuses(kBurstCalls, Status::kIOError);
   std::mutex start_mu;
   std::condition_variable start_cv;
   size_t ready = 0;
   bool go = false;
   std::vector<std::thread> threads;
-  threads.reserve(kCalls);
-  for (size_t i = 0; i < kCalls; ++i) {
+  threads.reserve(kBurstCalls);
+  for (size_t i = 0; i < kBurstCalls; ++i) {
     threads.emplace_back([&, i] {
       {
         std::unique_lock<std::mutex> lk(start_mu);
@@ -208,63 +202,118 @@ TEST(ConnectionPool, ConcurrentLoadGrowsToBoundThenReusesAndShrinks) {
       }
       const BlockKey key =
           ToBlockKey("test/model", "parallel-" + std::to_string(i));
-      statuses[i] = t.Cache(n->addr, key, value.data(), value.size());
+      statuses[i] = t->Cache(addr, key, value.data(), value.size());
     });
   }
   {
     std::unique_lock<std::mutex> lk(start_mu);
-    start_cv.wait(lk, [&] { return ready == kCalls; });
+    start_cv.wait(lk, [&] { return ready == kBurstCalls; });
     go = true;
   }
   start_cv.notify_all();
   for (auto& thread : threads) thread.join();
   for (Status status : statuses) EXPECT_EQ(status, Status::kOk);
+}
+}  // namespace
+
+// The pool never holds more than max_connections. With idle retirement out of
+// the picture nothing is ever closed, so the number of connections the server
+// accepted IS the peak, and the bound can be asserted exactly. (With a short
+// idle timeout a connection that sits idle for a moment during the burst is
+// legitimately retired and redialed, and the accept count exceeds the bound
+// while the pool never does; that is the next test.)
+TEST(ConnectionPool, ConcurrentLoadGrowsToBoundAndReuses) {
+  auto n = Start("adaptive-grow");
+  EndpointPoolOptions options;
+  options.min_connections = 1;
+  options.max_connections = 3;
+  options.idle_timeout_ms = 60000;
+  options.acquire_timeout_ms = 10000;
+  TcpTransport t(options);
+
+  RunBurst(&t, n->addr);
 
   const size_t accepts_after_burst = n->srv->AcceptCount();
   EXPECT_GE(accepts_after_burst, 2u);
   EXPECT_LE(accepts_after_burst, options.max_connections);
   std::string metrics = t.MetricsText();
-  EXPECT_GE(MetricValue(metrics, "dfkv_transport_pool_connections"), 2u);
-  EXPECT_LE(MetricValue(metrics, "dfkv_transport_pool_connections"),
-            options.max_connections);
+  EXPECT_EQ(MetricValue(metrics, "dfkv_transport_pool_connections"),
+            accepts_after_burst);
   EXPECT_EQ(MetricValue(metrics, "dfkv_transport_pool_inflight"), 0u);
   EXPECT_EQ(MetricValue(metrics, "dfkv_transport_pool_selections_total"),
-            kCalls);
+            kBurstCalls);
+  EXPECT_EQ(MetricValue(
+                metrics,
+                "dfkv_transport_pool_retirements_total{reason=\"idle\"}"),
+            0u);
+  EXPECT_EQ(MetricValue(
+                metrics,
+                "dfkv_transport_pool_retirements_total{reason=\"error\"}"),
+            0u);
 
   // Steady-state calls reuse existing sockets: no connection per operation.
   for (size_t i = 0; i < 20; ++i) {
     bool exists = false;
     EXPECT_EQ(t.Exist(n->addr,
                       ToBlockKey("test/model",
-                                 "parallel-" + std::to_string(i % kCalls)),
+                                 "parallel-" + std::to_string(i % kBurstCalls)),
                       &exists),
               Status::kOk);
     EXPECT_TRUE(exists);
   }
   EXPECT_EQ(n->srv->AcceptCount(), accepts_after_burst);
+  n->srv->Stop();
+}
 
-  // The next acquisition performs opportunistic idle retirement, retaining the
-  // configured warm minimum rather than the burst-sized pool.
+// Idle connections are retired opportunistically at the next acquisition, down
+// to the warm minimum. A retirement may already happen during the burst, so
+// the accept count is not bounded here; the accounting is: every connection
+// ever opened beyond the minimum has been retired as idle.
+TEST(ConnectionPool, IdleConnectionsRetireDownToTheWarmMinimum) {
+  auto n = Start("adaptive-shrink");
+  EndpointPoolOptions options;
+  options.min_connections = 1;
+  options.max_connections = 3;
+  options.idle_timeout_ms = 2;
+  options.acquire_timeout_ms = 10000;
+  TcpTransport t(options);
+
+  RunBurst(&t, n->addr);
+
+  std::string metrics = t.MetricsText();
+  EXPECT_LE(MetricValue(metrics, "dfkv_transport_pool_connections"),
+            options.max_connections);
+  EXPECT_EQ(MetricValue(metrics, "dfkv_transport_pool_inflight"), 0u);
+
   std::this_thread::sleep_for(std::chrono::milliseconds(5));
   bool exists = false;
   EXPECT_EQ(t.Exist(n->addr, ToBlockKey("test/model", "parallel-0"), &exists),
             Status::kOk);
   EXPECT_TRUE(exists);
   metrics = t.MetricsText();
-  EXPECT_EQ(MetricValue(metrics, "dfkv_transport_pool_connections"), 1u);
+  EXPECT_EQ(MetricValue(metrics, "dfkv_transport_pool_connections"),
+            options.min_connections);
+  EXPECT_EQ(MetricValue(
+                metrics,
+                "dfkv_transport_pool_retirements_total{reason=\"error\"}"),
+            0u);
   EXPECT_EQ(
       MetricValue(
           metrics,
           "dfkv_transport_pool_retirements_total{reason=\"idle\"}"),
-      accepts_after_burst - options.min_connections);
+      n->srv->AcceptCount() - options.min_connections);
   n->srv->Stop();
 }
 
 TEST(ConnectionPool, FailedDialEntersBackoffAndSuppressesImmediateRetry) {
+  // The windows are wide on purpose: the second call of each pair must land
+  // inside the backoff the first one started (200 ms, then 400 ms), and the
+  // sleep between the pairs must outlast the first backoff. A few milliseconds
+  // are not enough under a sanitizer on a loaded machine.
   EndpointPoolOptions options;
   options.max_connections = 4;
-  options.backoff_base_ms = 5;
-  options.backoff_max_ms = 20;
+  options.backoff_base_ms = 200;
+  options.backoff_max_ms = 800;
   TcpTransport t(options);
   t.set_timeouts(50, 50);
   const std::string node =
@@ -274,7 +323,7 @@ TEST(ConnectionPool, FailedDialEntersBackoffAndSuppressesImmediateRetry) {
             Status::kIOError);
   EXPECT_EQ(t.Exist(node, ToBlockKey("test/model", "down"), &exists),
             Status::kIOError);
-  std::this_thread::sleep_for(std::chrono::milliseconds(8));
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));
   EXPECT_EQ(t.Exist(node, ToBlockKey("test/model", "down"), &exists),
             Status::kIOError);
   EXPECT_EQ(t.Exist(node, ToBlockKey("test/model", "down"), &exists),
