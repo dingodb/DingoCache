@@ -20,8 +20,10 @@ sys.path.insert(0, os.path.join(HERE, "..", "..", "integration", "hicache"))
 os.environ.setdefault("DFKV_CLIENT_NODE_DEDUP", "0")
 
 import ctypes  # noqa: E402
+import re  # noqa: E402
 import subprocess  # noqa: E402
 import tempfile  # noqa: E402
+import time  # noqa: E402
 import shutil  # noqa: E402
 
 import numpy as np  # noqa: E402
@@ -29,8 +31,37 @@ import numpy as np  # noqa: E402
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig  # noqa: E402
 import dfkv_hicache  # noqa: E402
 
+_FENCE_ENV = "DFKV_GPU_LOAD_FENCE"
+_saved_fence = None
+
+
+def setUpModule():
+    # The fake device pools are host numpy buffers: no CUDA write to order
+    # (and no torch needed). Restored afterwards, so tests of the fence that
+    # run later in the same process still see the fence.
+    global _saved_fence
+    _saved_fence = os.environ.get(_FENCE_ENV)
+    os.environ[_FENCE_ENV] = "0"
+
+
+def tearDownModule():
+    if _saved_fence is None:
+        os.environ.pop(_FENCE_ENV, None)
+    else:
+        os.environ[_FENCE_ENV] = _saved_fence
+
+
 BUILD = os.environ.get("DFKV_BUILD", os.path.join(HERE, "..", "..", "build"))
 SERVER_BIN = os.path.join(BUILD, "dfkv_server")
+_RDMA_LISTENING = re.compile(r"RDMA listening \(TCP bootstrap\) on port (\d+)")
+
+
+def _rdma_device_present() -> bool:
+    """An RDMA device is visible to this host (Linux sysfs)."""
+    try:
+        return bool(os.listdir("/sys/class/infiniband"))
+    except OSError:
+        return False
 
 
 def _bare(**attrs):
@@ -388,6 +419,18 @@ class FakePageFirstHostSidecarPool:
         return bytes(self._arr[off:off + self.page_bytes])
 
 
+class _NumpyHostPool:
+    """A host pool of one page-sized numpy buffer: every page maps onto it."""
+
+    def __init__(self, page_bytes):
+        self.page_bytes = page_bytes
+        self.arr = np.zeros(page_bytes, dtype=np.uint8)
+
+    def get_page_buffer_meta(self, indices):
+        n = len(list(indices))
+        return [self.arr.ctypes.data] * n, [self.page_bytes] * n
+
+
 class FakeLayerFirstMlaDevicePool:
     """Layer-first MLA GPU pool emulated with host numpy per-layer buffers, so the
     device-direct SG write path can be exercised end-to-end without a GPU."""
@@ -455,6 +498,7 @@ class TestDeviceDirectEndToEnd(unittest.TestCase):
     def setUpClass(cls):
         cls.procs = []
         cls.dirs = []
+        cls.rdma_members = set()
 
     @classmethod
     def tearDownClass(cls):
@@ -471,27 +515,74 @@ class TestDeviceDirectEndToEnd(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
     def _node(self, tag):
+        """Start a cache node; its member string addresses the RDMA listener
+        when this host has an RDMA device and the binary supports it."""
+        if _rdma_device_present():
+            member = self._spawn(tag, rdma=True)
+            if member is not None:
+                return member
+        return self._spawn(tag, rdma=False)
+
+    def _spawn(self, tag, rdma):
         d = tempfile.mkdtemp(prefix=f"dfkv_dd_{tag}_")
-        p = subprocess.Popen(
-            [SERVER_BIN, "--dir", d, "--port", "0", "--cap", str(1 << 30)],
-            stdout=subprocess.PIPE, text=True)
-        line = p.stdout.readline().strip()
-        assert line.startswith("PORT "), f"bad server greeting: {line!r}"
-        self.procs.append(p)
         self.dirs.append(d)
-        return f"{tag}=127.0.0.1:{int(line.split()[1])}"
+        # Not in the store directory: the server refuses foreign files there.
+        log_dir = tempfile.mkdtemp(prefix=f"dfkv_dd_{tag}_log_")
+        self.dirs.append(log_dir)
+        log_path = os.path.join(log_dir, "server.log")
+        argv = [SERVER_BIN, "--dir", d, "--port", "0", "--cap", str(1 << 30)]
+        if rdma:
+            argv += ["--rdma-port", "0"]
+        with open(log_path, "w") as log:
+            p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=log,
+                                 text=True)
+        self.procs.append(p)
+        line = p.stdout.readline().strip()
+        if not rdma:
+            if not line.startswith("PORT "):
+                p.wait(timeout=5)
+                with open(log_path) as log:
+                    raise AssertionError(
+                        f"bad server greeting: {line!r} rc={p.returncode} "
+                        f"log: {log.read()[-2000:]}")
+            return f"{tag}=127.0.0.1:{int(line.split()[1])}"
+        # The RDMA listener starts after the TCP greeting and logs its port.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            with open(log_path) as log:
+                m = _RDMA_LISTENING.search(log.read())
+            if m:
+                self.rdma_members.add(tag)
+                return f"{tag}=127.0.0.1:{int(m.group(1))}"
+            if p.poll() is not None:
+                break
+            time.sleep(0.05)
+        p.terminate()
+        p.wait(timeout=5)
+        with open(log_path) as log:
+            sys.stderr.write(f"[{tag}] no RDMA listener (greeting {line!r}, "
+                             f"rc={p.returncode}); TCP only. "
+                             f"Log: {log.read()[-2000:]}\n")
+        return None   # no RDMA listener: binary without RDMA, or no usable HCA
 
     def _plugin(self, members):
+        rdma = members.split("=", 1)[0] in self.rdma_members
+        extra = {
+            "members": members, "dtype_tag": 0,
+            "page_size": self.PAGE_SIZE, "layer_num": self.LAYER_NUM,
+            "head_num": 1, "head_dim": self.KV_DIM, "interface_v1": 1,
+        }
+        if rdma:
+            # The node serves RDMA: the client must use it, not fall back.
+            extra["require_rdma"] = 1
         cfg = HiCacheStorageConfig(
             tp_rank=0, tp_size=1, is_mla_model=True, is_page_first_layout=False,
-            model_name="dd-mla", pp_rank=0, pp_size=1,
-            extra_config={
-                "members": members, "dtype_tag": 0,
-                "page_size": self.PAGE_SIZE, "layer_num": self.LAYER_NUM,
-                "head_num": 1, "head_dim": self.KV_DIM, "interface_v1": 1,
-            })
+            model_name="dd-mla", pp_rank=0, pp_size=1, extra_config=extra)
         st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
         if not st.supports_device_transfer():
+            if rdma:
+                self.fail("RDMA node, yet device-direct transfer is "
+                          f"unsupported (transport={st.transport_mode})")
             self.skipTest(
                 f"device-direct requires RDMA; transport={st.transport_mode}")
         return st
@@ -578,6 +669,42 @@ class TestDeviceDirectEndToEnd(unittest.TestCase):
                 dst.layer_page_bytes(L, 0, self.PAGE_SIZE),
                 src.layer_page_bytes(L, 0, self.PAGE_SIZE),
                 f"layer {L} page mismatch after device-direct roundtrip")
+
+    def _mla_device_pool(self):
+        return FakeLayerFirstMlaDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM)
+
+    def test_host_read_reports_only_stored_pages_present(self):
+        """In device-direct mode the host entry batch_get_v1 loads nothing (the
+        objects are layer-major SG groups). It must still report a page as
+        retrieved only if the page is stored; it used to report every page."""
+        st = self._plugin(self._node("anchor"))
+        st.register_mem_pool_device(self._mla_device_pool())
+        st.mem_pool_host = _NumpyHostPool(
+            self.LAYER_NUM * self.PAGE_SIZE * self.KV_DIM)
+        self.assertEqual(
+            st.batch_set_v1_device(["stored"], list(range(self.PAGE_SIZE))),
+            [True])
+        self.assertEqual(
+            st.batch_get_v1(["stored", "never_written"], [0, 1]),
+            [True, False])
+
+    def test_registered_device_pool_without_bypass_keeps_host_keys(self):
+        """SGLang may register the device pool without using the bypass. The
+        host path then stores bare keys, and the existence probe must look
+        for them, not for SG group keys."""
+        st = self._plugin(self._node("hostform"))
+        self.assertFalse(st._device_direct_requested)
+        st.register_mem_pool_device(self._mla_device_pool())
+        host = _NumpyHostPool(self.LAYER_NUM * self.PAGE_SIZE * self.KV_DIM)
+        st.mem_pool_host = host
+        host.arr[:] = 7
+        self.assertEqual(st.batch_set_v1(["page"], [0]), [True])
+        self.assertEqual(st.batch_exists(["page", "absent"]), 1)
+        host.arr[:] = 0
+        self.assertEqual(st.batch_get_v1(["page"], [0]), [True])
+        self.assertTrue((host.arr == 7).all(), "host read loaded the page")
 
     def test_device_direct_read_miss_returns_false(self):
         """A key never written must read back as a miss (not a phantom hit) so the
