@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <future>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -39,6 +40,51 @@ using dfkv::CudaLib;
 using dfkv::CUdeviceptr;
 using dfkv::GpuNodeDedup;
 using dfkv::kCudaSuccess;
+
+namespace dfkv {
+// A publisher runs in two stages, and so does an invalidation that takes a
+// slot from it; these let a test stop between them.
+struct GpuNodeDedupTestAccess {
+  struct Hold {
+    GpuNodeDedup::PublishHold hold;
+    bool taken = false;
+  };
+  // A publisher that has taken its slot and not yet copied. Never calling
+  // PublishFinish is a publisher killed there.
+  static Hold PublishBegin(GpuNodeDedup& d, const BlockKey& key, uint64_t token,
+                           size_t len) {
+    Hold h;
+    h.taken = d.PublishBegin(key, token, len, &h.hold);
+    return h;
+  }
+  static void PublishFinish(GpuNodeDedup& d, const Hold& h,
+                            const GpuNodeDedup::Seg* segs, size_t nsegs) {
+    d.PublishFinish(h.hold, segs, nsegs);
+  }
+  // A forcer that has taken the slot from h's publisher and not yet
+  // released it. Never calling ForceOutFinish is a forcer killed there.
+  static bool ForceOutBegin(GpuNodeDedup& d, const Hold& h) {
+    return d.ForceOutBegin(h.hold.slot, h.hold.gen);
+  }
+  static bool ForceOutFinish(GpuNodeDedup& d, const Hold& h) {
+    return d.ForceOutFinish(h.hold.slot, h.hold.gen + 1);
+  }
+  // ... seen in the middle of its commit: owner fields stored, len not yet.
+  static void Interleave(GpuNodeDedup& d, const Hold& h, int step) {
+    d.InterleaveForTest(h.hold, step);
+  }
+  static bool Recover(GpuNodeDedup& d, const Hold& h) {
+    return d.RecoverForTest(h.hold);
+  }
+  static bool GenEven(const GpuNodeDedup& d, const Hold& h) {
+    return d.GenEvenForTest(h.hold);
+  }
+  static void LookLikeAnOlderRelease(GpuNodeDedup& d, const Hold& h) {
+    d.SetFenceableForTest(h.hold, false);
+  }
+};
+}  // namespace dfkv
+using dfkv::GpuNodeDedupTestAccess;
 
 namespace {
 
@@ -530,6 +576,398 @@ TEST(GpuNodeDedup, PublishedEntryTheWaiterCannotUseEndsTheWaitAtOnce) {
   const auto t0 = std::chrono::steady_clock::now();
   EXPECT_FALSE(b->WaitSg(K(42), &d, 1, 1024, &got));
   EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(2));
+}
+
+// ---- a publisher that stops inside PublishSg -------------------------------
+
+namespace {
+
+// Runs Invalidate on its own thread (with a CUDA context, like any caller).
+struct InvalidateInBackground {
+  std::future<void> done;
+  InvalidateInBackground(GpuNodeDedup* d, BlockKey key)
+      : done(std::async(std::launch::async, [d, key] {
+          EnsureCudaCtx();
+          d->Invalidate(key);
+        })) {}
+  bool ReturnedWithin(std::chrono::milliseconds bound) {
+    return done.wait_for(bound) == std::future_status::ready;
+  }
+};
+
+// One key's worth of device buffers: a source holding `value` and a
+// destination of the same size.
+struct KeyBufs {
+  std::string value;
+  DevBuf src, dst;
+  GpuNodeDedup::Seg s, d;
+  explicit KeyBufs(uint64_t id, size_t n = 4096)
+      : value(Val(id, n)), src(n), dst(n),
+        s{reinterpret_cast<void*>(src.p), n},
+        d{reinterpret_cast<void*>(dst.p), n} {
+    src.Up(value);
+  }
+};
+
+}  // namespace
+
+TEST(GpuNodeDedup, InvalidateDoesNotWaitForAKilledPublisher) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("pub-dead");
+  auto a = GpuNodeDedup::Open(Opts(g.name));
+  auto b = GpuNodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  KeyBufs k(60);
+  size_t got = 0;
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->ClaimSg(K(60), &k.s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  // The publisher takes its slot and is killed before it commits.
+  const auto held = GpuNodeDedupTestAccess::PublishBegin(*a, K(60), token, 4096);
+  ASSERT_TRUE(held.taken);
+
+  InvalidateInBackground inv(b.get(), K(60));
+  const bool returned = inv.ReturnedWithin(std::chrono::seconds(2));
+  EXPECT_TRUE(returned) << "a write or remove of this key would never return";
+  if (!returned)  // let the thread go so the test can end
+    GpuNodeDedupTestAccess::PublishFinish(*a, held, &k.s, 1);
+  inv.done.wait();
+  // The slot is usable again.
+  EXPECT_EQ(b->ClaimSg(K(60), &k.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kFetch);
+}
+
+TEST(GpuNodeDedup, InvalidateFencesAPublisherThatIsStillCopying) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("pub-slow");
+  auto a = GpuNodeDedup::Open(Opts(g.name));
+  auto b = GpuNodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  KeyBufs old_value(61), new_value(62);
+  size_t got = 0;
+  uint64_t token_a = 0, token_b = 0, ignored = 0;
+  ASSERT_EQ(a->ClaimSg(K(61), &old_value.s, 1, 4096, &got, &token_a),
+            GpuNodeDedup::Role::kFetch);
+  const auto held =
+      GpuNodeDedupTestAccess::PublishBegin(*a, K(61), token_a, 4096);
+  ASSERT_TRUE(held.taken);
+
+  // The key is overwritten while the publisher copies, and fetched again.
+  InvalidateInBackground inv(b.get(), K(61));
+  const bool returned = inv.ReturnedWithin(std::chrono::seconds(2));
+  EXPECT_TRUE(returned);
+  if (returned) {
+    ASSERT_EQ(b->ClaimSg(K(61), &new_value.s, 1, 4096, &got, &token_b),
+              GpuNodeDedup::Role::kFetch);
+    b->PublishSg(K(61), token_b, &new_value.s, 1, 4096);
+  }
+  // The publisher was alive all along and now commits: nothing may come of it.
+  GpuNodeDedupTestAccess::PublishFinish(*a, held, &old_value.s, 1);
+  inv.done.wait();
+  if (returned) {
+    ASSERT_EQ(a->ClaimSg(K(61), &old_value.d, 1, 4096, &got, &ignored),
+              GpuNodeDedup::Role::kHit);
+    EXPECT_EQ(old_value.dst.Down(4096), new_value.value);
+  }
+}
+
+// A publisher that was fenced and then fails its copy gives up a slot that is
+// no longer its own: it must leave the claim that took its place alone.
+TEST(GpuNodeDedup, FencedPublisherThatFailsLeavesTheNextClaimAlone) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("pub-abandon");
+  auto a = GpuNodeDedup::Open(Opts(g.name));
+  auto b = GpuNodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  KeyBufs old_value(63), new_value(64);
+  size_t got = 0;
+  uint64_t token_a = 0, token_b = 0, ignored = 0;
+  ASSERT_EQ(a->ClaimSg(K(63), &old_value.s, 1, 4096, &got, &token_a),
+            GpuNodeDedup::Role::kFetch);
+  const auto held =
+      GpuNodeDedupTestAccess::PublishBegin(*a, K(63), token_a, 4096);
+  ASSERT_TRUE(held.taken);
+  // The key is overwritten: the invalidation takes the slot from the
+  // publisher, and the next fetch claims it.
+  InvalidateInBackground inv(b.get(), K(63));
+  if (!inv.ReturnedWithin(std::chrono::seconds(2))) {
+    ADD_FAILURE() << "the invalidation waits for the publisher";
+    GpuNodeDedupTestAccess::PublishFinish(*a, held, &old_value.s, 1);
+    inv.done.wait();
+    return;
+  }
+  ASSERT_EQ(b->ClaimSg(K(63), &new_value.s, 1, 4096, &got, &token_b),
+            GpuNodeDedup::Role::kFetch);
+  // The old publisher's gather comes up short (its segments hold less than it
+  // announced), which makes it give the slot up.
+  GpuNodeDedup::Seg short_segment{old_value.s.ptr, 1024};
+  GpuNodeDedupTestAccess::PublishFinish(*a, held, &short_segment, 1);
+  // The new claim is still there and publishes.
+  b->PublishSg(K(63), token_b, &new_value.s, 1, 4096);
+  ASSERT_EQ(a->ClaimSg(K(63), &old_value.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kHit)
+      << "the fenced publisher dropped the claim that replaced it";
+  EXPECT_EQ(old_value.dst.Down(4096), new_value.value);
+}
+
+TEST(GpuNodeDedup, ClaimTakesOverFromAKilledPublisher) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("pub-dead-claim");
+  auto a = GpuNodeDedup::Open(Opts(g.name));
+  auto b = GpuNodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  KeyBufs k(65);
+  size_t got = 0;
+  uint64_t token = 0, taken_over = 0;
+  ASSERT_EQ(a->ClaimSg(K(65), &k.s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  const auto held = GpuNodeDedupTestAccess::PublishBegin(*a, K(65), token, 4096);
+  ASSERT_TRUE(held.taken);
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));  // > takeover_ms(200)
+  EXPECT_EQ(b->ClaimSg(K(65), &k.d, 1, 4096, &got, &taken_over),
+            GpuNodeDedup::Role::kFetch)
+      << "every later lookup of this key would wait out its deadline";
+}
+
+// The takeover age of a PUBLISHING slot is time spent publishing. A fetch
+// that itself took longer than takeover_ms is not taken away the moment its
+// owner starts to copy.
+TEST(GpuNodeDedup, SlowFetchIsNotForcedOutDuringItsCopy) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("pub-slow-fetch");
+  auto a = GpuNodeDedup::Open(LongWait(g.name));  // nobody steals the fetch
+  auto o = Opts(g.name);
+  o.takeover_ms = 500;
+  auto b = GpuNodeDedup::Open(o);
+  ASSERT_TRUE(a && b);
+  KeyBufs k(66);
+  size_t got = 0;
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->ClaimSg(K(66), &k.s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));  // the fetch
+  const auto held = GpuNodeDedupTestAccess::PublishBegin(*a, K(66), token, 4096);
+  ASSERT_TRUE(held.taken);
+  EXPECT_EQ(b->ClaimSg(K(66), &k.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kWait)
+      << "a copy that had only just begun was taken away";
+  GpuNodeDedupTestAccess::PublishFinish(*a, held, &k.s, 1);
+  ASSERT_EQ(b->ClaimSg(K(66), &k.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kHit);
+  EXPECT_EQ(k.dst.Down(4096), k.value);
+}
+
+// A publisher of an older release commits with unconditional stores: taking
+// its slot away would let those stores land on whoever owns the slot next.
+// It is waited for, as before, also when another core already sees some of
+// its commit stores (here the owner fields) and not yet the others (len).
+TEST(GpuNodeDedup, PublisherOfAnOlderReleaseIsNeverForcedOut) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("pub-old");
+  auto a = GpuNodeDedup::Open(Opts(g.name));
+  auto b = GpuNodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  KeyBufs k(67);
+  size_t got = 0;
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->ClaimSg(K(67), &k.s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  const auto held = GpuNodeDedupTestAccess::PublishBegin(*a, K(67), token, 4096);
+  ASSERT_TRUE(held.taken);
+  GpuNodeDedupTestAccess::LookLikeAnOlderRelease(*a, held);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));  // > takeover_ms(200)
+  EXPECT_EQ(b->ClaimSg(K(67), &k.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kWait);
+  InvalidateInBackground inv(b.get(), K(67));
+  EXPECT_FALSE(inv.ReturnedWithin(std::chrono::milliseconds(150)));
+  // It commits; the invalidation then removes what it published.
+  GpuNodeDedupTestAccess::PublishFinish(*a, held, &k.s, 1);
+  inv.done.wait();
+  EXPECT_NE(b->ClaimSg(K(67), &k.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kHit);
+}
+
+// Two invalidations of one key meet at a publisher's slot. Only one may take
+// it: the other must not act on the slot until the first is through.
+TEST(GpuNodeDedup, TwoInvalidationsDoNotBothTakeAPublishersSlot) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("pub-two-forcers");
+  // The first forcer is not stranded here: no recovery within the test.
+  GpuNodeDedup::Options o = Opts(g.name);
+  o.takeover_ms = 60000;
+  auto a = GpuNodeDedup::Open(o);
+  auto b = GpuNodeDedup::Open(o);
+  auto c = GpuNodeDedup::Open(o);
+  ASSERT_TRUE(a && b && c);
+  KeyBufs k(68), fresh(69);
+  size_t got = 0;
+  uint64_t token_a = 0, token_c = 0, ignored = 0;
+  ASSERT_EQ(a->ClaimSg(K(68), &k.s, 1, 4096, &got, &token_a),
+            GpuNodeDedup::Role::kFetch);
+  const auto held =
+      GpuNodeDedupTestAccess::PublishBegin(*a, K(68), token_a, 4096);
+  ASSERT_TRUE(held.taken);
+
+  // The first invalidation has won the slot and not yet released it.
+  ASSERT_TRUE(GpuNodeDedupTestAccess::ForceOutBegin(*b, held));
+  InvalidateInBackground second(c.get(), K(68));
+  const bool second_acted = second.ReturnedWithin(std::chrono::milliseconds(150));
+  EXPECT_FALSE(second_acted) << "a second invalidation took the slot as well";
+  if (second_acted) {
+    ASSERT_EQ(c->ClaimSg(K(68), &fresh.s, 1, 4096, &got, &token_c),
+              GpuNodeDedup::Role::kFetch);
+  }
+  EXPECT_TRUE(GpuNodeDedupTestAccess::ForceOutFinish(*b, held));
+  second.done.wait();
+  if (!second_acted) {
+    ASSERT_EQ(c->ClaimSg(K(68), &fresh.s, 1, 4096, &got, &token_c),
+              GpuNodeDedup::Role::kFetch);
+  }
+  c->PublishSg(K(68), token_c, &fresh.s, 1, 4096);
+  ASSERT_EQ(a->ClaimSg(K(68), &k.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kHit)
+      << "the claim made after the invalidations was wiped";
+  EXPECT_EQ(k.dst.Down(4096), fresh.value);
+}
+
+// A forcer killed after it took a publisher's slot and before it released
+// it leaves the slot PUBLISHING with an odd generation. Once that is older
+// than the takeover age, an invalidation finishes the release for it. If the
+// forcer was only slow, it comes back to a slot that is someone else's and
+// leaves it alone.
+TEST(GpuNodeDedup, InvalidateFinishesForAForcerThatWasKilled) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("forcer-dead-invalidate");
+  auto a = GpuNodeDedup::Open(Opts(g.name));  // takeover_ms 200
+  auto b = GpuNodeDedup::Open(Opts(g.name));
+  auto c = GpuNodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b && c);
+  KeyBufs k(70), fresh(71);
+  size_t got = 0;
+  uint64_t token_a = 0, token_c = 0, ignored = 0;
+  ASSERT_EQ(a->ClaimSg(K(70), &k.s, 1, 4096, &got, &token_a),
+            GpuNodeDedup::Role::kFetch);
+  const auto held =
+      GpuNodeDedupTestAccess::PublishBegin(*a, K(70), token_a, 4096);
+  ASSERT_TRUE(held.taken);
+  ASSERT_TRUE(GpuNodeDedupTestAccess::ForceOutBegin(*b, held));
+
+  InvalidateInBackground inv(c.get(), K(70));
+  const bool returned = inv.ReturnedWithin(std::chrono::seconds(2));
+  EXPECT_TRUE(returned) << "a write or remove of this key would never return";
+  if (!returned) GpuNodeDedupTestAccess::ForceOutFinish(*b, held);
+  inv.done.wait();
+  ASSERT_EQ(c->ClaimSg(K(70), &fresh.s, 1, 4096, &got, &token_c),
+            GpuNodeDedup::Role::kFetch);
+  // The forcer was only slow: its finish now must not touch the new claim.
+  EXPECT_FALSE(GpuNodeDedupTestAccess::ForceOutFinish(*b, held));
+  c->PublishSg(K(70), token_c, &fresh.s, 1, 4096);
+  ASSERT_EQ(a->ClaimSg(K(70), &k.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kHit)
+      << "the late forcer wiped the claim made after the recovery";
+  EXPECT_EQ(k.dst.Down(4096), fresh.value);
+}
+
+TEST(GpuNodeDedup, ClaimFinishesForAForcerThatWasKilled) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("forcer-dead-claim");
+  auto a = GpuNodeDedup::Open(Opts(g.name));  // takeover_ms 200
+  auto b = GpuNodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  KeyBufs k(72);
+  size_t got = 0;
+  uint64_t token = 0, taken_over = 0;
+  ASSERT_EQ(a->ClaimSg(K(72), &k.s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  const auto held = GpuNodeDedupTestAccess::PublishBegin(*a, K(72), token, 4096);
+  ASSERT_TRUE(held.taken);
+  ASSERT_TRUE(GpuNodeDedupTestAccess::ForceOutBegin(*b, held));
+  // Younger than the takeover age: the forcer may still be at work.
+  EXPECT_EQ(b->ClaimSg(K(72), &k.d, 1, 4096, &got, &taken_over),
+            GpuNodeDedup::Role::kWait);
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));  // > takeover_ms
+  EXPECT_EQ(b->ClaimSg(K(72), &k.d, 1, 4096, &got, &taken_over),
+            GpuNodeDedup::Role::kFetch)
+      << "every later lookup of this key would wait out its deadline";
+}
+
+// A stranded force-out is finished by one party at a time. While a finisher
+// is between its swap and the rest of its stores, a second party that looks
+// at the slot must not finish the same release again.
+TEST(GpuNodeDedup, AStrandedForceOutIsFinishedOnce) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("forcer-dead-twice");
+  auto a = GpuNodeDedup::Open(Opts(g.name));  // takeover_ms 200
+  auto b = GpuNodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  KeyBufs k(74);
+  size_t got = 0;
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->ClaimSg(K(74), &k.s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  const auto held = GpuNodeDedupTestAccess::PublishBegin(*a, K(74), token, 4096);
+  ASSERT_TRUE(held.taken);
+  ASSERT_TRUE(GpuNodeDedupTestAccess::ForceOutBegin(*b, held));  // then killed
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));    // > takeover_ms
+
+  GpuNodeDedupTestAccess::Interleave(*a, held, 4);  // a finisher's swap
+  EXPECT_FALSE(GpuNodeDedupTestAccess::Recover(*b, held))
+      << "a second party finished the same force-out";
+  GpuNodeDedupTestAccess::Interleave(*a, held, 5);  // the finisher's rest
+  EXPECT_TRUE(GpuNodeDedupTestAccess::GenEven(*a, held))
+      << "the slot's generation is odd at rest";
+
+  uint64_t t2 = 0;
+  ASSERT_EQ(a->ClaimSg(K(74), &k.s, 1, 4096, &got, &t2),
+            GpuNodeDedup::Role::kFetch);
+  a->PublishSg(K(74), t2, &k.s, 1, 4096);
+  ASSERT_EQ(b->ClaimSg(K(74), &k.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kHit);
+  EXPECT_EQ(k.dst.Down(4096), k.value);
+}
+
+// A slot that went through a force-out is claimed again. While the claim's
+// Reserve is between its state swap and the rest of its stores, an
+// invalidation of the key the slot still names holds it PUBLISHING with an
+// odd generation. That is not a stranded force-out, even once the force-out
+// is older than the takeover age: a recovery there would step the
+// generation under the other two and leave it odd at rest, after which no
+// entry in the slot can be read.
+TEST(GpuNodeDedup, ReusedSlotIsNotTakenForAStrandedForceOut) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("forcer-reuse");
+  auto a = GpuNodeDedup::Open(Opts(g.name));  // takeover_ms 200
+  auto b = GpuNodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  KeyBufs k(73);
+  size_t got = 0;
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->ClaimSg(K(73), &k.s, 1, 4096, &got, &token),
+            GpuNodeDedup::Role::kFetch);
+  const auto held = GpuNodeDedupTestAccess::PublishBegin(*a, K(73), token, 4096);
+  ASSERT_TRUE(held.taken);
+  ASSERT_TRUE(GpuNodeDedupTestAccess::ForceOutBegin(*b, held));
+  ASSERT_TRUE(GpuNodeDedupTestAccess::ForceOutFinish(*b, held));
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));  // > takeover_ms
+
+  GpuNodeDedupTestAccess::Interleave(*a, held, 0);  // Reserve swaps the state
+  GpuNodeDedupTestAccess::Interleave(*a, held, 1);  // Invalidate holds it
+  EXPECT_EQ(b->ClaimSg(K(73), &k.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kWait)
+      << "an invalidation in progress was taken for a stranded force-out";
+  GpuNodeDedupTestAccess::Interleave(*a, held, 2);
+  GpuNodeDedupTestAccess::Interleave(*a, held, 3);
+
+  // The slot works as before.
+  uint64_t t2 = 0;
+  ASSERT_EQ(a->ClaimSg(K(73), &k.s, 1, 4096, &got, &t2),
+            GpuNodeDedup::Role::kFetch);
+  a->PublishSg(K(73), t2, &k.s, 1, 4096);
+  ASSERT_EQ(b->ClaimSg(K(73), &k.d, 1, 4096, &got, &ignored),
+            GpuNodeDedup::Role::kHit)
+      << "the slot's generation is odd at rest";
+  EXPECT_EQ(k.dst.Down(4096), k.value);
 }
 
 // ---- through KVClient: a fetch that lands in device memory -----------------

@@ -126,7 +126,9 @@ class GpuNodeDedup {
   void PublishSg(const BlockKey& key, uint64_t token, const Seg* segs,
                  size_t nsegs, size_t len);
   void Abort(const BlockKey& key, uint64_t token);
-  // Eviction barrier for every READY and in-flight entry of the key.
+  // Eviction barrier for every READY and in-flight entry of the key. A
+  // publisher already copying loses its slot and commits nothing; a publisher
+  // of a release that cannot be fenced is joined.
   void Invalidate(const BlockKey& key);
 
   int wait_ms() const { return wait_ms_; }
@@ -144,6 +146,7 @@ class GpuNodeDedup {
   static constexpr uint32_t kMaxProcs = 64;
 
  private:
+  friend struct GpuNodeDedupTestAccess;  // steps a publisher stage by stage
   struct Slot;       // 64-byte shm index slot (owner-descriptor flavor)
   struct ProcEntry;  // 128-byte shm registry entry (one per process)
   struct Header;
@@ -180,6 +183,42 @@ class GpuNodeDedup {
   uint64_t TokenFor(const Slot* s, uint64_t gen) const;
   Slot* OwnedSlot(uint64_t token) const;
   bool LockOwned(Slot* s, const BlockKey& key, uint64_t token);
+  // PublishSg in two stages: take the slot and mark it (PublishBegin), then
+  // gather, synchronize and commit (PublishFinish), or give the slot up
+  // (PublishAbandon). Between the two an invalidation, or a claim once the
+  // publish is older than takeover_ms, can take the slot away
+  // (ForceOutPublisher: Begin wins it, Finish releases it); the publisher
+  // then writes nothing more. See the .cc for the mark.
+  struct PublishHold {
+    Slot* slot = nullptr;
+    uint64_t gen = 0;
+    size_t len = 0;
+  };
+  bool PublishBegin(const BlockKey& key, uint64_t token, size_t len,
+                    PublishHold* hold);
+  void PublishFinish(const PublishHold& hold, const Seg* segs, size_t nsegs);
+  void PublishAbandon(const PublishHold& hold);
+  static bool MarkedFenceable(const Slot* s);
+  bool ForceOutPublisher(Slot* s);
+  // g: the generation read before the state and the mark. Finish takes the
+  // odd generation Begin left (g + 1) and returns false when another party
+  // finished first.
+  bool ForceOutBegin(Slot* s, uint64_t g);
+  bool ForceOutFinish(Slot* s, uint64_t odd);
+  // Finishes a force-out whose forcer was killed, once it is older than
+  // takeover_ms. True: the slot is EMPTY now.
+  bool RecoverStrandedForceOut(Slot* s, uint64_t now);
+  // on = false makes a held slot look like the publisher of an older
+  // release, which does not mark itself, caught in the middle of its commit.
+  void SetFenceableForTest(const PublishHold& hold, bool on);
+  // Steps 0-3 of a Reserve of hold's slot interleaved with an invalidation
+  // of the key the slot still names: Reserve's state swap, the
+  // invalidation's swap and first increment, its second increment and
+  // EMPTY store, then the rest of the Reserve. Steps 4-5: a finisher of a
+  // stranded force-out, its swap, then the rest.
+  void InterleaveForTest(const PublishHold& hold, int step);
+  bool RecoverForTest(const PublishHold& hold);
+  bool GenEvenForTest(const PublishHold& hold) const;
   bool CopyOutSg(Slot* s, const BlockKey& key, const Seg* segs, size_t nsegs,
                  size_t total_cap, size_t* got);
   // Cached cuIpcOpenMemHandle of registry entry idx at generation gen;
