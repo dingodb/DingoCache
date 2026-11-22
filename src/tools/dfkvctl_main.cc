@@ -3,7 +3,8 @@
  *   dfkvctl --members "n=ip:port,..." get   <key>
  *   dfkvctl --members "n=ip:port,..." exist <key>
  *   dfkvctl stat <node-ip:port>           # fetch a node's Prometheus metrics
- *   dfkvctl ring --mds <ep,...> --group <g> [--allow-empty]  # show the cluster ring + vnode share
+ *   dfkvctl ring --mds <ep,...> --group <g> [--allow-empty] [--json]  # show the cluster ring + vnode share
+ *     --json prints the same view as one JSON document for scripts; the table is for people.
  *   dfkvctl clients --mds <ep,...> --group <g>        # list cache consumers (inference instances)
  *   dfkvctl stat --all --mds <ep,...> --group <g> [--stat-port <p>]  # per-node metrics + aggregate
  *     The MDS now hands back each node's TCP stat port (MemberInfo.tcp_port), so stat --all
@@ -14,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -280,15 +282,73 @@ static int CmdStatsAllGroups(const std::string& mds) {
   return rc;
 }
 
+// A JSON string literal. Member fields come off the wire, so nothing about
+// their bytes is assumed beyond what JSON itself requires to be escaped.
+static std::string JsonString(const std::string& s) {
+  std::string out = "\"";
+  for (unsigned char c : s) {
+    if (c == '"' || c == '\\') {
+      out += '\\';
+      out += static_cast<char>(c);
+    } else if (c < 0x20) {
+      char escaped[8];
+      std::snprintf(escaped, sizeof(escaped), "\\u%04x", c);
+      out += escaped;
+    } else {
+      out += static_cast<char>(c);
+    }
+  }
+  return out + "\"";
+}
+
+// `ring --json`: the table's content as one document. Fields are only ever
+// added. placement_epoch is MembersEpoch over the eligible members -- the
+// value the MDS and clients compare to detect a ring change -- and is a
+// string because consumers that read numbers as doubles cannot hold 64 bits.
+static void PrintRingJson(const std::string& group,
+                          const std::vector<MemberInfo>& ms,
+                          const std::map<std::string, size_t>& points,
+                          size_t total) {
+  std::vector<MemberInfo> placement;
+  for (const auto& m : ms)
+    if (m.RingEligible()) placement.push_back(m);
+  std::printf("{\"group\":%s,\"ring_points\":%zu,\"placement_epoch\":\"%llu\","
+              "\"members\":[",
+              JsonString(group).c_str(), total,
+              static_cast<unsigned long long>(MembersEpoch(placement)));
+  bool first = true;
+  for (const auto& m : ms) {
+    const auto it = points.find(m.id);
+    const size_t v = it == points.end() ? 0 : it->second;
+    const double share =
+        total ? 100.0 * static_cast<double>(v) / static_cast<double>(total)
+              : 0.0;
+    std::printf("%s\n{\"id\":%s,\"ip\":%s,\"port\":%u,\"status\":\"%s\","
+                "\"eligible\":%s,\"weight\":%u,\"vnodes\":%zu,"
+                "\"share_percent\":%.1f,\"ib_health\":%s,\"info\":%s}",
+                first ? "" : ",", JsonString(m.id).c_str(),
+                JsonString(m.ip).c_str(), m.port, MemberStatus(m),
+                m.RingEligible() ? "true" : "false", m.weight, v, share,
+                JsonString(IbHealthSummary(m)).c_str(),
+                JsonString(m.info).c_str());
+    first = false;
+  }
+  std::printf("%s]}\n", first ? "" : "\n");
+}
+
 static int CmdRing(const std::string& mds, const std::string& group,
-                   bool allow_empty) {
+                   bool allow_empty, bool json) {
   if (mds.empty()) { std::fprintf(stderr, "ring needs --mds ip:port[,...]\n"); return 2; }
   std::vector<MemberInfo> ms;
   if (!QueryTopology(mds, group, &ms)) { std::fprintf(stderr, "ring: MDS query failed\n"); return 1; }
   if (ms.empty()) {
-    std::printf("group=%s members=0 ring_points=0\n", group.c_str());
-    std::printf("%-16s %-22s %6s %8s %7s  %s\n",
-                "ID", "ADDR", "WEIGHT", "VNODES", "SHARE", "INFO");
+    if (json) {
+      PrintRingJson(group, ms, {}, 0);
+    } else {
+      std::printf("group=%s members=0 ring_points=0\n", group.c_str());
+      std::printf("%-16s %-22s %6s %8s %7s  %s\n",
+                  "ID", "ADDR", "WEIGHT", "VNODES", "SHARE", "INFO");
+    }
     if (!allow_empty) {
       std::fprintf(stderr, "ring: group=%s has no registered cache nodes\n",
                    group.c_str());
@@ -306,22 +366,26 @@ static int CmdRing(const std::string& mds, const std::string& group,
   ring.Build();
   auto pc = ring.NodePointCounts();
   size_t total = ring.RingSize();
-  std::printf("group=%s members=%zu eligible=%zu ring_points=%zu\n",
-              group.c_str(), ms.size(), eligible, total);
-  std::printf("%-16s %-22s %-9s %6s %8s %7s %-30s %s\n",
-              "ID", "ADDR", "STATUS", "WEIGHT", "VNODES", "SHARE",
-              "IB-HEALTH", "INFO");
-  for (const auto& m : ms) {
-    std::string addr = m.ip + ":" + std::to_string(m.port);
-    size_t v = pc.count(m.id) ? pc[m.id] : 0;
-    double share = total ? 100.0 * static_cast<double>(v) / static_cast<double>(total) : 0.0;
-    // INFO = the node's self-description from register/heartbeat (version, engine,
-    // cap, ...). "-" = node predates info reporting (itself a version signal).
-    std::printf("%-16s %-22s %-9s %6u %8zu %6.1f%% %-30s %s\n",
-                m.id.c_str(), addr.c_str(),
-                MemberStatus(m), m.weight, v, share,
-                IbHealthSummary(m).c_str(),
-                m.info.empty() ? "-" : m.info.c_str());
+  if (json) {
+    PrintRingJson(group, ms, pc, total);
+  } else {
+    std::printf("group=%s members=%zu eligible=%zu ring_points=%zu\n",
+                group.c_str(), ms.size(), eligible, total);
+    std::printf("%-16s %-22s %-9s %6s %8s %7s %-30s %s\n",
+                "ID", "ADDR", "STATUS", "WEIGHT", "VNODES", "SHARE",
+                "IB-HEALTH", "INFO");
+    for (const auto& m : ms) {
+      std::string addr = m.ip + ":" + std::to_string(m.port);
+      size_t v = pc.count(m.id) ? pc[m.id] : 0;
+      double share = total ? 100.0 * static_cast<double>(v) / static_cast<double>(total) : 0.0;
+      // INFO = the node's self-description from register/heartbeat (version, engine,
+      // cap, ...). "-" = node predates info reporting (itself a version signal).
+      std::printf("%-16s %-22s %-9s %6u %8zu %6.1f%% %-30s %s\n",
+                  m.id.c_str(), addr.c_str(),
+                  MemberStatus(m), m.weight, v, share,
+                  IbHealthSummary(m).c_str(),
+                  m.info.empty() ? "-" : m.info.c_str());
+    }
   }
   if (eligible == 0 && !allow_empty) {
     std::fprintf(stderr,
@@ -512,6 +576,7 @@ int main(int argc, char** argv) {
   std::string mds, group = "default";
   bool all = false;
   bool allow_empty = false;
+  bool json = false;
   bool group_explicit = false;
   uint32_t stat_port = 0;  // override; 0 = use MDS-provided tcp_port, else the member's port
   std::vector<std::string> pos;
@@ -528,15 +593,20 @@ int main(int argc, char** argv) {
     }
     else if (a == "--all") all = true;
     else if (a == "--allow-empty") allow_empty = true;
+    else if (a == "--json") json = true;
     else if (a == "--stat-port") nv32(&stat_port);
     else if (a == "--namespace" && i + 1 < argc) key_namespace = argv[++i];
     else pos.push_back(a);
   }
   if (pos.empty()) { std::fprintf(stderr, "usage: dfkvctl [--members ...] [--namespace ...] put|get|exist|stat|stats|ring|topology ...\n"); return 2; }
   const std::string& cmd = pos[0];
+  if (json && cmd != "ring" && cmd != "topology") {
+    std::fprintf(stderr, "--json is only supported by ring/topology\n");
+    return 2;
+  }
 
   if (cmd == "ring" || cmd == "topology")
-    return CmdRing(mds, group, allow_empty);
+    return CmdRing(mds, group, allow_empty, json);
   if (cmd == "clients") return CmdClients(mds, group);
 
   if (cmd == "stats") {

@@ -162,7 +162,7 @@ def audit(args: argparse.Namespace) -> tuple[dict[str, object], int]:
     for endpoint in [item for item in args.mds.split(",") if item]:
         try:
             command = [
-                args.dfkvctl, "ring", "--mds", endpoint,
+                args.dfkvctl, "ring", "--json", "--mds", endpoint,
                 "--group", args.group,
             ]
             if args.allow_empty:

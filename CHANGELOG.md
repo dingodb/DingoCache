@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- Tools: `deploy/dfkv_membership_audit.py` and `deploy/dfkv_node_replace.py`
+  work again. Both parsed the table printed by `dfkvctl ring`, whose header
+  and columns have since gained eligibility, status and IB health: with a
+  non-empty ring the audit reported every MDS as `mds_unreachable`
+  (`dfkv_membership_audit_ok` stayed 0) and a replacement stopped in its
+  preflight. `dfkvctl ring --json` (and `topology --json`) prints the same view
+  as one JSON document, and the scripts read that; the table itself is
+  unchanged. The scripts need the `dfkvctl` of this release. The ring epoch
+  they report is now the document's `placement_epoch`, the value the MDS and
+  clients compare; their own calculation left out eligibility, never matched
+  it, and is gone. For a replacement, a member that is registered but not
+  ring-eligible no longer counts as being in the ring.
+- Tools: `deploy/dfkv_node_replace.py` no longer waits for `systemctl stop`
+  under `--command-timeout` (10 s by default, while a stop takes tens of
+  seconds). The timeout started a rollback whose `systemctl start` queued
+  behind the running stop and timed out too: the script exited with "rollback
+  also failed" and the old node came back next to its replacement. Stops and
+  starts are now queued with `--no-block`, and the script polls the unit's
+  `ActiveState` within `--timeout` -- stopped before it looks at the ring,
+  active again before a rollback trusts it.
 - Server: the disks of a node are opened at the same time instead of one after
   the other. A slab store reads its whole table back before it can serve, so
   startup grew by seconds per disk: with six disks and 13.5 million objects,
