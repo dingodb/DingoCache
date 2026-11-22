@@ -1003,6 +1003,15 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
   return RecordBatch(OpMetrics::kGet, t0, std::move(res), bytes);
 }
 
+namespace {
+// A read outcome the bounded miss retry is for: a block that read absent for
+// an instant while the node moved it between tiers, or a read lost to
+// connection turnover (see BatchGetDirect).
+bool TransientReadMiss(Status st) {
+  return st == Status::kNotFound || st == Status::kIOError;
+}
+}  // namespace
+
 std::vector<bool> KVClient::BatchGetDirect(const std::vector<KvGetItem>& items) {
   const size_t N = items.size();
   std::vector<char> hit(N, 0);
@@ -1014,6 +1023,8 @@ std::vector<bool> KVClient::BatchGetDirect(const std::vector<KvGetItem>& items) 
   }
   // RDMA: group by (node, n) so each group shares the Range length, then pipeline.
   // Resolve one set of item indices -> hit[]. Reused for the miss-retry pass.
+  // retry[i]: the last pass may have failed this key transiently (see below).
+  std::vector<char> retry(N, 0);
   auto run_pass = [&](const std::vector<size_t>& todo) {
     std::map<std::pair<std::string, size_t>, std::vector<size_t>> by;
     for (size_t i : todo) {
@@ -1046,6 +1057,7 @@ std::vector<bool> KVClient::BatchGetDirect(const std::vector<KvGetItem>& items) 
       std::vector<Status> sts = t_->RangeInto(node, keys, dsts, &value_lens);
       ReportPeer(node, sts);
       for (size_t m = 0; m < idx.size(); ++m) {
+        retry[idx[m]] = TransientReadMiss(sts[m]);
         if (sts[m] == Status::kOk && m < value_lens.size() &&
             value_lens[m] == n)
           hit[idx[m]] = 1;
@@ -1062,10 +1074,16 @@ std::vector<bool> KVClient::BatchGetDirect(const std::vector<KvGetItem>& items) 
   // miss). One re-resolve of the missed subset recovers it. Guarded to a MINORITY
   // of the batch so a genuinely cold batch (mostly missing) is not re-fetched
   // wholesale -- the transient is a sprinkle in an otherwise-hit batch. Off with
-  // DFKV_GET_MISS_RETRIES=0.
+  // DFKV_GET_MISS_RETRIES=0. Connection turnover is the other transient: a
+  // subset of a batch fails with kIOError on a connection being replaced
+  // (Status has no separate timeout, so a timed-out shard reads the same).
+  // Only those two outcomes are retried, and an I/O error only while its node
+  // is still healthy: the pass checks that before it sends, and a node whose
+  // shard failed outright is in cooldown by then. A refused request
+  // (kInvalid, resource exhaustion) or a length mismatch is not retried.
   for (int r = 0; r < get_miss_retries_; ++r) {
     std::vector<size_t> missed;
-    for (size_t i = 0; i < N; ++i) if (!hit[i]) missed.push_back(i);
+    for (size_t i = 0; i < N; ++i) if (!hit[i] && retry[i]) missed.push_back(i);
     if (missed.empty() || missed.size() > N / 2) break;  // none, or a cold batch
     run_pass(missed);
   }
@@ -1184,8 +1202,11 @@ std::vector<bool> KVClient::BatchGetAutoDirect(const std::vector<KvGetItem>& ite
   // RDMA: group by (node, cap) so each group shares the Range length, then
   // pipeline. Same staged-publication datapath as BatchGet; the only
   // difference is accepting payload_len <= cap and reporting the true length.
+  // The same bounded retry of transient misses as BatchGet.
+  std::vector<char> retry(N, 0);
+  auto run_pass = [&](const std::vector<size_t>& todo) {
   std::map<std::pair<std::string, size_t>, std::vector<size_t>> by;
-  for (size_t i = 0; i < N; ++i) {
+  for (size_t i : todo) {
     std::string node = Route(items[i].key);
     if (node.empty()) continue;
     by[{node, items[i].n}].push_back(i);
@@ -1213,6 +1234,7 @@ std::vector<bool> KVClient::BatchGetAutoDirect(const std::vector<KvGetItem>& ite
     std::vector<Status> sts = t_->RangeInto(node, keys, dsts, &value_lens);
     ReportPeer(node, sts);
     for (size_t m = 0; m < idx.size(); ++m) {
+      retry[idx[m]] = TransientReadMiss(sts[m]);
       if (sts[m] != Status::kOk || m >= value_lens.size() ||
           value_lens[m] > cap)
         continue;
@@ -1220,6 +1242,16 @@ std::vector<bool> KVClient::BatchGetAutoDirect(const std::vector<KvGetItem>& ite
       hit[idx[m]] = 1;
     }
   }, node_of);
+  };
+  std::vector<size_t> all(N);
+  for (size_t i = 0; i < N; ++i) all[i] = i;
+  run_pass(all);
+  for (int r = 0; r < get_miss_retries_; ++r) {
+    std::vector<size_t> missed;
+    for (size_t i = 0; i < N; ++i) if (!hit[i] && retry[i]) missed.push_back(i);
+    if (missed.empty() || missed.size() > N / 2) break;  // none, or a cold batch
+    run_pass(missed);
+  }
   if (out_lens) *out_lens = std::move(lens);
   return std::vector<bool>(hit.begin(), hit.end());
 }
@@ -2853,6 +2885,7 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
 
   // Group by (node, total_cap): a group shares the Range length (= sum of caps)
   // so the existing RangeInto windowing/pipelining applies unchanged.
+  std::vector<char> retry(N, 0);  // see BatchGetDirect
   auto run_pass = [&](const std::vector<size_t>& todo) {
     std::map<std::pair<std::string, size_t>, std::vector<size_t>> by;
     for (size_t i : todo) {
@@ -2980,6 +3013,7 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
       ReportPeer(node, sts);
       for (size_t m = 0; m < idx.size(); ++m) {
         const size_t cap = groups[g].first.second;
+        retry[idx[m]] = m < sts.size() && TransientReadMiss(sts[m]);
         if (m >= sts.size() || sts[m] != Status::kOk ||
             m >= value_lens.size() || value_lens[m] > cap)
           continue;
@@ -3023,10 +3057,12 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
   // RAM flush/reclaim or connection turnover a small subset can return absent
   // for one pass even though the server serves it immediately on retry. Retry
   // only a minority; a genuinely cold SG batch must remain a single probe.
+  // Only those two transients (absent, or an I/O error on a node that is
+  // still healthy): see BatchGetDirect.
   for (int r = 0; r < get_miss_retries_; ++r) {
     std::vector<size_t> missed;
     for (size_t i = 0; i < N; ++i)
-      if (!over[i] && !hit[i]) missed.push_back(i);
+      if (!over[i] && !hit[i] && retry[i]) missed.push_back(i);
     if (missed.empty() || missed.size() > N / 2) break;
     run_pass(missed);
   }

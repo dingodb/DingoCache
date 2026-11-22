@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Client, batch reads: the one retry of missed keys (`DFKV_GET_MISS_RETRIES`)
+  now covers only the transient misses it exists for, on all three batch
+  read paths: a key the node reported absent (a block moving between the
+  node's tiers), and a key whose read failed with an I/O error (a
+  connection being replaced) while its node is still healthy. It used to
+  re-send every key that was not a hit, also keys whose request was
+  refused or whose length did not match, and keys of a node that had just
+  been put in cooldown. A read error of a node that answered for other keys
+  of the batch moments before (within `DFKV_PEER_BAD_GRACE_MS`) still
+  leaves the node healthy and is retried: the client cannot tell a timeout
+  from a lost connection, so such a batch can still take two operation
+  timeouts. The variable-length batch read (`BatchGetAuto`) had no retry;
+  it now has the same one.
 - Client, retention: a node found without retention support is asked
   again after `DFKV_RETAIN_REPROBE_MS` (new, default 30000; `0` asks every
   time), and the existence fallback for such a node no longer holds up the
