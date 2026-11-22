@@ -507,6 +507,7 @@ digest `sha256:e56358a68b06427362283c8c8a9d7d706448082ae53098ea1131b5d51aa1fd62`
 identity/layout 字段 `page_size`（默认 64）/`kv_cache_dtype`/`dtype_tag`/
 `head_num`/`head_dim`/`dp_size`——这些都进 canonical namespace，改动即换
 namespace（表现为一次冷缓存）；
+`bind_runtime_layout`（默认 `false`，见 §2.2 末尾；改变对象 key）、
 `node_dedup`（对应 env `DFKV_CLIENT_NODE_DEDUP`，见 §1.5）、
 `backup_exist_gate`（save 前的 exist 探测门）、
 `client_stats_poll_s`（10s，`0`=关）、
@@ -570,6 +571,33 @@ sglang serve /models/glm-5.2-nvfp4 --served-model-name glm-5.2 \
 布局参数变化（dtype/量化/层数/TP）**必须 bump `model_revision`**，
 同 model_name+ 默认 revision = 自动隐含同 layout，可能命中 byte-incompatible bytes。
 在不同 rank 上生成不同 canonical object bytes，不能依赖默认 rank。
+
+**哪些不一致会被自动挡住，哪些不会。** namespace 自动带上的只有 model_name（SGLang
+传入；unified 布局时含其 storage format tag）、`tp_size`、`pp_size`、是否 MLA、
+`pcp_size`/`dcp_size`；对象 key 另带各轴 rank、pool 和组件。`page_size`、
+`kv_cache_dtype`、`layer_num`、`head_num`/`head_dim` 只取自 extra_config（不填即默认
+值）。读取一律按字节长度精确匹配（host 读要求长度相等，device 读要求每组读满），所以：
+
+- 只会变成冷 miss（安全）：page_size 不同（页哈希和对象大小都变）、层数或每层宽度
+  不同、kv dtype 字节宽度不同（如 bf16 与 fp8）、TP/PP/CP 切分不同。
+- 会被当成命中、读进错误字节：同一 served name 换了权重或权重量化；同宽度的 kv dtype
+  （fp8 e4m3 与 e5m2、bf16 与 fp16）；host pool 布局不同而页大小相同（MHA 的
+  `page_first` 按 token 排、`page_first_direct`/`page_head` 按层或按头排）。
+
+权重和量化只能靠 `model_revision`：连接器从 HiCache 接口拿不到权重身份。pool 的字节
+格式可以由 `bind_runtime_layout`（extra_config，默认 `false`）绑定：打开后，排列某个对象
+的 pool 算出一个标签，写进该对象 key 的 pool 字段；格式不同的读者因此 miss。哪个 pool
+给哪种 key 打标签：host 形态的 key（裸对象 key）用 host pool 的类名、`layout`、`dtype`
+和每页对象数；device 形态的 key（L2-bypass 的 SG 对象，按 device pool 排列）用 device
+pool 的类名、`dtype`，主 KV 另加每 token 的 stride 和层数。device pool 没有布局可选，
+所以只在 host 布局上不同的实例仍共享 device 形态的对象；类名不同（同行宽、不同打包）则
+不共享。只有其中一种 pool 的（device-only sidecar、draft、只有 host 的侧池）两种形态
+都用那一个。host pool 缺 `layout` 或 `dtype`、device pool 缺 `dtype` 时，每个 pool 打
+一条 WARNING 说明缺哪个字段。默认关闭是因为它改变所有对象 key：打开后此前存的对象都
+找不到（一次冷启动），所以同一 namespace 下的实例要一起打开；打开期间，SGLang 升级若
+改了 pool 类名，同样是一次冷启动。限制：pool 的 `dtype` 若是存储类型（如以 uint8 存
+fp8）而非 KV 的元素类型，同宽度的 fp8 变体分不出，仍需在 extra_config 写
+`kv_cache_dtype` 或换 `model_revision`；在注册 pool 之前构造 key 会报错。
 
 ### 2.3 HiCache 关键 flag
 

@@ -575,6 +575,31 @@ def _read_snapshot(lib, h) -> str:
 # One-byte marker for the logical-anchor "kv" pool of V4/DSA models. Native
 # dfkv rejects zero-length PUTs because they allocate objects without consuming
 # byte quota; charging one byte preserves the existence-marker semantics.
+_LAYOUT_FIELDS = ("layout", "dtype")
+
+
+def _runtime_layout_facts(pool, fields=_LAYOUT_FIELDS) -> tuple:
+    """What one registered pool states about the byte format of its objects.
+
+    Same-size objects can hold different bytes: an MHA host pool in
+    ``page_first`` (token-major) and one in ``page_first_direct`` or
+    ``page_head`` give pages of the same size in different orders, two
+    element types of one width (bf16 and fp16) differ only in value, and
+    two pool classes can pack the same layout and dtype differently (an
+    MXFP8 MHA pool, a DSA pool). The exact-size read check cannot tell them
+    apart; these facts can: the pool's class, ``layout`` and ``dtype``.
+    A field the pool does not have is recorded as absent. Device pools have
+    no layout choice and are described by class and ``dtype`` only.
+    """
+    return (("class", type(pool).__name__),) + tuple(
+        (field, str(getattr(pool, field, ""))) for field in fields)
+
+
+def _layout_tag(facts, objects: int) -> str:
+    """Key tag of one pool format: its facts and its objects per page."""
+    return hashlib.sha256(repr((facts, int(objects))).encode()).hexdigest()[:16]
+
+
 _MARKER_BUF = ctypes.create_string_buffer(1)
 _MARKER_PTR = ctypes.addressof(_MARKER_BUF)
 
@@ -891,6 +916,10 @@ class DfkvHiCache(HiCacheStorage):
             # per hot round on the canary — write pressure that starved the
             # very reads the cache exists for). One batch_exist (collapsed by
             # the rendezvous) filters them out. backup_exist_gate=0 disables.
+            # Off by default because it changes every object key: see
+            # _pool_id() and docs/CONNECTORS.md.
+            self._bind_runtime_layout = _truthy(
+                cfg.get("bind_runtime_layout", False))
             self._backup_exist_gate = _truthy(
                 cfg.get("backup_exist_gate",
                         os.environ.get("DFKV_BACKUP_EXIST_GATE", "1")))
@@ -1145,8 +1174,68 @@ class DfkvHiCache(HiCacheStorage):
                 f"of different ranks; pass dcp_size and dcp_rank in the "
                 f"HiCache extra_config")
 
+    def _note_pool_layout(self, name: str, pool, *, device=False,
+                          extra=()) -> None:
+        """Record a pool's format facts for its keys (bind_runtime_layout).
+
+        Which pool tags which key form: host-form keys (bare object keys)
+        take the host pool's facts (class, layout, dtype); device-form keys
+        (the scatter-gather objects of L2-bypass, laid out by the device
+        pool) take the device pool's (class, dtype, and for the primary KV
+        the per-token strides and layer count of a page). So instances that
+        differ only in host layout share device-form objects, and a device
+        pool class that packs rows differently does not. This holds for the
+        primary KV and for side pools. A pool that has only one of the two
+        (a device-only sidecar, the draft, a host-only side pool) is tagged
+        by that one in both forms.
+        """
+        if not getattr(self, "_bind_runtime_layout", False):
+            return
+        attr = "_device_layout_facts" if device else "_host_layout_facts"
+        if not hasattr(self, attr):
+            setattr(self, attr, {})
+        fields = ("dtype",) if device else _LAYOUT_FIELDS
+        facts = _runtime_layout_facts(pool, fields) + tuple(extra)
+        known = getattr(self, attr).setdefault(name, facts)
+        if known != facts:
+            raise RuntimeError(
+                f"pool {name!r} registered again with another layout, dtype "
+                f"or class ({known} -> {facts}); its object keys would change")
+        if known is facts:
+            for field in fields:
+                if not hasattr(pool, field):
+                    _log.warning(
+                        "dfkv: bind_runtime_layout: %s pool %r has no %r; its "
+                        "keys do not tell that field apart",
+                        "device" if device else "host", name, field)
+
+    def _pool_id(self, name, objects: int, device: bool = False):
+        """The pool field of an object key.
+
+        With ``bind_runtime_layout`` the format tag of the pool that lays out
+        the key's objects is part of it (see _note_pool_layout for which pool
+        that is), so a reader whose pool stores another byte format (same
+        object size, different bytes) misses instead of loading the bytes as
+        its own. Keys are only built for registered pools; one that is not
+        yet registered has no known format and is an error, not an untagged
+        key.
+        """
+        if not getattr(self, "_bind_runtime_layout", False):
+            return name
+        if isinstance(name, bytes):
+            name = name.decode()
+        host = getattr(self, "_host_layout_facts", {}).get(name)
+        dev = getattr(self, "_device_layout_facts", {}).get(name)
+        facts = (dev or host) if device else (host or dev)
+        if facts is None:
+            raise RuntimeError(
+                f"bind_runtime_layout: object keys of pool {name!r} asked for "
+                f"before the pool was registered")
+        return f"{name}@{_layout_tag(facts, objects)}"
+
     def register_mem_pool_host(self, mem_pool_host):
         self._check_pool_dcp(mem_pool_host, "HiCache primary host pool")
+        self._note_pool_layout("kv", mem_pool_host)
         if self.transport_mode == "rdma":
             import torch
             indices = torch.arange(
@@ -1193,6 +1282,8 @@ class DfkvHiCache(HiCacheStorage):
             self.registered_pools = {}
         name = str(host_pool_name)
         self._check_pool_dcp(host_pool, f"HiCache host pool {name!r}")
+        self._note_pool_layout(
+            "kv" if name in ("kv", "__default__") else name, host_pool)
         # Per-page component count for this pool. Multi-pool layouts are never
         # guessed: a bad probe would otherwise collapse independent components
         # into one replicated "all" object and serve corrupt/incomplete state.
@@ -1402,11 +1493,41 @@ class DfkvHiCache(HiCacheStorage):
                 result.result = f"failed ({type(exc).__name__})"
                 raise
             self.mem_pool_device = mem_pool_device
+            self._note_pool_layout(
+                "kv", mem_pool_device, device=True,
+                extra=self._device_segment_facts(mem_pool_device))
             result.result = (
                 f"registered {registered} device region(s)"
                 if registered else "no device buffer registered")
             if getattr(self, "_device_direct_requested", False):
                 self._record_kv_sg_groups(mem_pool_device)
+
+    def _device_segment_facts(self, mem_pool_device) -> tuple:
+        """Per-token strides and layer count of a primary-KV device page.
+
+        Device-form objects concatenate one segment per layer, each
+        ``page_size * stride`` bytes, so these say how a page is packed.
+        Taken from the metadata function the transfers use, with the token
+        slots of page 0 (no I/O); () when that call is not possible with
+        this SGLang build.
+        """
+        if not getattr(self, "_bind_runtime_layout", False):
+            return ()
+        from sglang.srt.mem_cache.device_page_meta import (
+            get_device_page_buffer_meta,
+        )
+        try:
+            page_size = int(mem_pool_device.page_size)
+            _ptrs, sizes = get_device_page_buffer_meta(
+                mem_pool_device, list(range(page_size)))
+            strides = tuple(int(seg[0]) // page_size for seg in sizes)
+            return (("strides", strides), ("layers", len(sizes[0])))
+        except Exception as exc:
+            _log.warning(
+                "dfkv: bind_runtime_layout: page geometry of the device pool "
+                "unknown (%s: %s); its keys are tagged without it",
+                type(exc).__name__, exc)
+            return ()
 
     def _record_kv_sg_groups(self, mem_pool_device) -> None:
         """Record how many SG groups a primary-KV page is stored in.
@@ -1454,6 +1575,7 @@ class DfkvHiCache(HiCacheStorage):
             if not hasattr(self, "_sidecar_device_pools"):
                 self._sidecar_device_pools = {}
             self._sidecar_device_pools[key] = device_pool
+            self._note_pool_layout(key, device_pool, device=True)
             # The sidecar metadata API returns one logical object per page; its
             # layers are SG segments, not independent pool components.
             if not hasattr(self, "_pool_component_names"):
@@ -1479,6 +1601,7 @@ class DfkvHiCache(HiCacheStorage):
                 result.result = f"failed ({type(exc).__name__})"
                 raise
             self.mem_pool_device_draft = mem_pool_device_draft
+            self._note_pool_layout("draft", mem_pool_device_draft, device=True)
             result.result = (
                 f"registered {registered} draft device region(s)"
                 if registered else "no draft device buffer registered")
@@ -1501,6 +1624,7 @@ class DfkvHiCache(HiCacheStorage):
                 self._sidecar_device_pools = {}
             self._draft_sidecar_name = name
             self._sidecar_device_pools[name] = mem_pool_device_draft
+            self._note_pool_layout(name, mem_pool_device_draft, device=True)
             # Same API-proven one-object layout as the target indexer sidecar.
             if not hasattr(self, "_pool_component_names"):
                 self._pool_component_names = {}
@@ -1578,13 +1702,13 @@ class DfkvHiCache(HiCacheStorage):
                 "this layout requires the zero-copy v2 path"
             )
 
-    def _keys(self, page_hash: str | bytes) -> List[bytes]:
+    def _keys(self, page_hash: str | bytes, device: bool = False) -> List[bytes]:
         tp = -1 if self.is_mla else self.tp_rank
         pp = self.pp_rank if self.enable_pp else 0
         pcp_size, pcp_rank = self._storage_pcp(self.is_mla)
         components = self._kv_components()
         return [
-            pool_key(page_hash, pool="kv",
+            pool_key(page_hash, pool=self._pool_id("kv", len(components), device),
                      tp_size=self.tp_size, tp_rank=tp,
                      pcp_size=pcp_size, pcp_rank=pcp_rank,
                      dcp_size=self.dcp_size, dcp_rank=self.dcp_rank,
@@ -1713,12 +1837,12 @@ class DfkvHiCache(HiCacheStorage):
         neither has happened only chunk 0 is known.
         """
         if pool in ("kv", "__default__"):
-            base = self._keys(page_hash)
             device = self._device_direct_active()
+            base = self._keys(page_hash, device)
             pool = "kv"
         else:
-            base = self._pool_keys(pool, page_hash)
             device = pool in getattr(self, "_sidecar_device_pools", {})
+            base = self._pool_keys(pool, page_hash, device)
         if not device:
             return base
         chunks = getattr(self, "_sg_chunks", {}).get(pool, 1)
@@ -2013,7 +2137,7 @@ class DfkvHiCache(HiCacheStorage):
         retained pool whose chunk count is recorded for _stored_keys (None for
         the draft, which retention does not cover).
         """
-        keys_fn = keys_fn or self._keys
+        keys_fn = keys_fn or (lambda h: self._keys(h, device=True))
         sub = self._sub() if sub is None else sub
         assert len(seg_ptrs) == len(keys) * sub, (len(seg_ptrs), len(keys), sub)
         w = self._sg_width()
@@ -2342,16 +2466,18 @@ class DfkvHiCache(HiCacheStorage):
 
     def _pool_keys(
         self, pool_name: str | bytes, page_hash: str | bytes,
+        device: bool = False,
     ) -> List[bytes]:
         if pool_name in ("kv", "__default__"):
-            return self._keys(page_hash)
+            return self._keys(page_hash, device)
         components = self._pool_components(pool_name)
         pp = self.pp_rank if self.enable_pp else 0
         replicated = self._pool_is_replicated(pool_name)
         tp = -1 if replicated else self.tp_rank
         pcp_size, pcp_rank = self._storage_pcp(replicated)
         return [
-            pool_key(page_hash, pool=pool_name,
+            pool_key(page_hash,
+                     pool=self._pool_id(pool_name, len(components), device),
                      tp_size=self.tp_size, tp_rank=tp,
                      pcp_size=pcp_size, pcp_rank=pcp_rank,
                      dcp_size=self.dcp_size, dcp_rank=self.dcp_rank,
@@ -2675,7 +2801,7 @@ class DfkvHiCache(HiCacheStorage):
         seg_ptrs, seg_sizes = get_device_sidecar_page_buffer_meta(pool, device_indices)
         stride, sks, sp, ss = self._flatten_device(
             keys, seg_ptrs, seg_sizes,
-            keys_fn=lambda h: self._pool_keys(name, h), sub=self._pool_sub(name),
+            keys_fn=lambda h: self._pool_keys(name, h, True), sub=self._pool_sub(name),
             pool=str(name))
         nbytes = sum(sum(s) for s in ss)
         t0 = time.perf_counter()
@@ -2697,7 +2823,7 @@ class DfkvHiCache(HiCacheStorage):
         seg_ptrs, seg_caps = get_device_sidecar_page_buffer_meta(pool, device_indices)
         stride, sks, sp, sc = self._flatten_device(
             keys, seg_ptrs, seg_caps,
-            keys_fn=lambda h: self._pool_keys(name, h), sub=self._pool_sub(name),
+            keys_fn=lambda h: self._pool_keys(name, h, True), sub=self._pool_sub(name),
             pool=str(name))
         want = [sum(c) for c in sc]
         t0 = time.perf_counter()
@@ -2717,7 +2843,8 @@ class DfkvHiCache(HiCacheStorage):
         pcp_size, pcp_rank = self._storage_pcp(replicated)
         components = ["all"] if replicated else ["k", "v"]
         return [
-            pool_key(page_hash, pool="draft",
+            pool_key(page_hash,
+                     pool=self._pool_id("draft", len(components), True),
                      tp_size=self.tp_size, tp_rank=tp,
                      pcp_size=pcp_size, pcp_rank=pcp_rank,
                      dcp_size=self.dcp_size, dcp_rank=self.dcp_rank,
@@ -2933,7 +3060,7 @@ class DfkvHiCache(HiCacheStorage):
                 dev_side = name in getattr(self, "_sidecar_device_pools", {})
                 sks = [self._sg_group_key(sk, 0) if dev_side else sk
                        for k in keys[:kv_pages]
-                       for sk in self._pool_keys(name, k)]
+                       for sk in self._pool_keys(name, k, dev_side)]
                 present = self._fold(self._batch_exist_flat(sks), kv_pages, sub)
                 if tr.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                     # Only the *last* `trailing` pages of a candidate prefix need

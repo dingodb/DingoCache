@@ -331,6 +331,29 @@ class DingoFSHiCacheTest(unittest.TestCase):
             ),
         )
 
+    def test_bind_runtime_layout_separates_host_layouts(self):
+        """Pages of a pool in another host layout have the size of this
+        pool's and different bytes. Without bind_runtime_layout (the default)
+        they are served; with it they miss."""
+        members, _, _ = self._node("layoutbind")
+        for bind, expected in ((None, [True]), (True, [False])):
+            model = f"layout-bind-{bind}"
+            pools, plugins = [], []
+            for layout in ("page_first", "page_first_direct"):
+                cfg = self._cfg(members, model=model)
+                if bind is not None:
+                    cfg.extra_config["bind_runtime_layout"] = bind
+                pool = FakeMlaPool(1, self.PAGE_BYTES, self.PAGE_SIZE)
+                pool.layout = layout
+                pools.append(pool)
+                plugins.append(self._plugin(cfg, pool))
+            writer, reader = plugins
+            self.assertEqual(writer._bind_runtime_layout, bool(bind))
+            pools[0].fill_page(0, 0x5A)
+            idx = list(range(self.PAGE_SIZE))
+            self.assertEqual(writer.batch_set_v1(["p"], idx), [True])
+            self.assertEqual(reader.batch_get_v1(["p"], idx), expected, bind)
+
     def test_prefill_cp_replicated_writer_key_cross_rank_roundtrip(self):
         members, _, _ = self._node("cpreplicated")
         cfg0 = self._cfg(members, tp_rank=0, tp_size=8, model="glm-cp")

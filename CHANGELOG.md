@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+
+- SGLang HiCache connector: new extra_config switch `bind_runtime_layout`
+  (default `false`). Objects are found by key, and a read accepts an object
+  only if its length is exact, so a reader with another page size, layer
+  count, element width or TP/PP/CP split misses. It did not miss when the
+  byte format differs at the same length: an MHA host pool in `page_first`
+  (token-major) and one in `page_first_direct` or `page_head` (layer- or
+  head-major), and an MLA host pool in `page_first` and `page_first_direct`,
+  give pages of the same size in different orders, as element types of one
+  width (bf16 and fp16) and pool classes that pack rows of one width
+  differently do; such pages were served as hits with the wrong bytes,
+  unless `model_revision` or `kv_cache_dtype` in the extra_config told them
+  apart. With the switch on, a tag of the pool that lays out an object goes
+  into the pool field of its key. Host-form keys are tagged by the host pool
+  (class, `layout`, `dtype`, objects per page); the scatter-gather objects
+  of L2-bypass by the device pool (class, `dtype`, and for the primary KV
+  the per-token strides and layer count), so instances that differ only in
+  host layout still share them. A reader with another format misses. A pool
+  without one of these fields is reported by a WARNING naming it. It is off
+  by default because it changes every object key: when it is turned on,
+  nothing stored before is found (one cold start), so turn it on for all
+  instances of a namespace together; while it is on, an SGLang upgrade that
+  renames a pool class is one cold start as well. Not covered: another
+  weight version or weight quantization under the same served model name
+  (the connector cannot see the weights; set `model_revision`), and fp8
+  variants where the pool's `dtype` is the storage type (uint8). See
+  docs/CONNECTORS.md §2.2.
 - Connectors (vLLM, LMCache, SGLang HiCache): the GPU dedup counters added
   in 2.39.1, `dfkv_client_gpu_dedup_load_fences_total` and
   `dfkv_client_gpu_dedup_load_fence_failures_total`, are now forwarded
