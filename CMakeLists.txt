@@ -342,6 +342,7 @@ if(DFKV_BUILD_TESTS)
     add_test(NAME python_hicache_helpers
       COMMAND ${PYTHON3} -m unittest test_dfkv_hot_config
               test_connector_access_log_hot test_dfkv_hicache_dcp
+              test_dfkv_hicache_io_contract
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
     set_tests_properties(python_hicache_helpers PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
