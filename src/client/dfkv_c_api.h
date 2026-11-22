@@ -59,9 +59,10 @@ int dfkv_remove(dfkv_client_t c, const void* key, uint64_t key_len);  // 1/0
 // startup after allocation and before traffic. Copying transports succeed
 // without work. Returns 0 only when the full range is ready, -1 otherwise.
 int dfkv_register_memory(dfkv_client_t c, const void* base, uint64_t size);
-// Runtime payload-segment limit reported by this client's active transport.
-// Size batch_put_sg / batch_get_auto_sg grouping from this value; do not assume
-// a fixed HCA or transport limit. Returns 0 on a null client.
+// Payload segments one transport work request carries on this client (the
+// negotiated HCA SGE limit, less one). Informational: batch_put_sg and
+// batch_get_auto_sg take wider descriptor vectors and post them as several
+// work requests under one object. Returns 0 on a null client.
 uint32_t dfkv_max_sg_segs(dfkv_client_t c);
 
 // Effective client-local logical object ceiling in bytes, not a negotiated
@@ -134,10 +135,10 @@ int dfkv_retain_precheck(dfkv_client_t c, const void* const* keys,
 // Scatter-gather batch put: each of the n keys gathers num_bufs[i] non-contiguous
 // source buffers (ptrs[i][0..num_bufs[i]-1], sizes[i][...]) into one stored blob
 // (the in-order concatenation; segment boundaries are client-side only). Coalesces
-// many tiny KV chunks into one key + one transport SG op. A key exceeding
-// dfkv_max_sg_segs(c), whose total byte length is zero, or whose total overflows
-// size_t reports out_ok[i]=0 without affecting valid siblings. Return 0 on call
-// success.
+// many tiny KV chunks into one key. A vector wider than dfkv_max_sg_segs(c) is
+// posted as several bounded work requests under one object completion. A key
+// whose total byte length is zero, or whose total overflows size_t, reports
+// out_ok[i]=0 without affecting valid siblings. Return 0 on call success.
 int dfkv_batch_put_sg(dfkv_client_t c, const void* const* keys,
                       const uint64_t* key_lens, const void*** ptrs,
                       const uint64_t** sizes, const int* num_bufs, int n,
@@ -146,8 +147,9 @@ int dfkv_batch_put_sg(dfkv_client_t c, const void* const* keys,
 // across num_dsts[i] destination buffers (dsts[i][...], caps[i][...]) in order
 // (segment sizes define the split). Accepts any stored size <= sum(caps[i]).
 // out_hit[i]=1/0; out_len[i] receives the true stored payload byte length (0 on
-// miss). A key exceeding the runtime SG limit, or whose capacity sum overflows
-// size_t, is a miss. Return 0 on success.
+// miss). A vector wider than dfkv_max_sg_segs(c) is read in several bounded
+// work requests; a key whose capacity sum overflows size_t is a miss. Return 0
+// on success.
 int dfkv_batch_get_auto_sg(dfkv_client_t c, const void* const* keys,
                            const uint64_t* key_lens, void*** dsts,
                            const uint64_t** caps, const int* num_dsts, int n,

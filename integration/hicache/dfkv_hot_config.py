@@ -67,12 +67,14 @@ class _Watcher(threading.Thread):
         self._path = path
         self._interval = float(poll_s)
         self._tp_rank = tp_rank
-        self._stop = threading.Event()
+        # Not ``_stop``: that name is threading.Thread's own (a method it
+        # calls from join() up to Python 3.12).
+        self._stop_event = threading.Event()
         # (mtime, size) of the file at the last successful apply; None = absent.
         self._seen: object = "<never>"  # sentinel: force an apply on first tick
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
 
     def _read(self) -> Optional[dict]:
         """Return the override dict ({} if the file is absent), or None on a
@@ -105,7 +107,7 @@ class _Watcher(threading.Thread):
 
     def run(self) -> None:
         first = True
-        while first or not self._stop.wait(self._interval):
+        while first or not self._stop_event.wait(self._interval):
             first = False
             try:
                 st = os.stat(self._path)

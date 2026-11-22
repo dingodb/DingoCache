@@ -36,10 +36,12 @@ that single object operation; it does not split the chunk into physical keys.
 }'
 ```
 
-`DfkvStoreConnector` is RDMA-only because every data method receives raw GPU
-device pointers. Set `DFKV_RDMA=1` in every engine process. Construction rejects
-and closes any native handle whose reported transport is not `rdma`; there is no
-TCP or host-bounce fallback for this connector.
+Every data method of `DfkvStoreConnector` receives raw GPU device pointers, so
+it is meant for GPUDirect RDMA: set `DFKV_RDMA=1` in every engine process. With
+the default `require_rdma=true`, construction rejects and closes any native
+handle whose reported transport is not `rdma`. `require_rdma=false` explicitly
+allows the TCP transport with host staging (correct, without GPUDirect
+zero-copy), as docs/CONNECTORS.md describes.
 
 Hybrid/multi-group caches and single-group non-full-attention caches report
 request-level load failures. One connector wheel automatically selects the
@@ -108,7 +110,7 @@ traffic if either requirement is missing.
 
 | env | default | meaning |
 |---|---|---|
-| `DFKV_RDMA` | **required: `1`** | Selects the required GPUDirect RDMA transport. Unset/TCP is rejected during connector construction; there is no TCP fallback. |
+| `DFKV_RDMA` | **`1`** | Selects the GPUDirect RDMA transport. Unset/TCP is rejected during connector construction unless `require_rdma=false`. |
 | `PYTHONHASHSEED` | **required: fixed value** | Stabilizes vLLM's root block hash across processes and restarts. Use the same value (for example `0`) on every producer and consumer sharing a store. |
 | `DFKV_RDMA_DEV` | first local `ACTIVE` HCA | Optional ordered device/fabric list. With `rail_affinity=true`, the connector narrows this full per-host list to the worker's world-group local-rank primary plus bounded fallbacks before native open. |
 | `DFKV_RDMA_DEPTH` | `4` ceiling | Scalar QPs open at depth1; batches select the smallest sufficient power-of-two depth up to this ceiling and the server cap. |
