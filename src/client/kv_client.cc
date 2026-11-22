@@ -595,6 +595,9 @@ std::string KVClient::MetricsSnapshot() const {
     s += "# HELP dfkv_client_dedup_wait_timeouts_total Waits that fell back to a direct fetch\n";
     s += "# TYPE dfkv_client_dedup_wait_timeouts_total counter\n";
     s += "dfkv_client_dedup_wait_timeouts_total " + std::to_string(dedup_->wait_timeouts()) + "\n";
+    s += "# HELP dfkv_client_dedup_length_mismatches_total Lookups that found their key published with a length they do not expect\n";
+    s += "# TYPE dfkv_client_dedup_length_mismatches_total counter\n";
+    s += "dfkv_client_dedup_length_mismatches_total " + std::to_string(dedup_->length_mismatches()) + "\n";
   }
   if (const GpuNodeDedup* gd = gpu_dedup_raw_.load(std::memory_order_acquire)) {
     s += "# HELP dfkv_client_gpu_dedup_hits_total GPU rendezvous results served via CUDA IPC\n";
@@ -609,6 +612,9 @@ std::string KVClient::MetricsSnapshot() const {
     s += "# HELP dfkv_client_gpu_dedup_wait_timeouts_total Waits that fell back to a direct fetch\n";
     s += "# TYPE dfkv_client_gpu_dedup_wait_timeouts_total counter\n";
     s += "dfkv_client_gpu_dedup_wait_timeouts_total " + std::to_string(gd->wait_timeouts()) + "\n";
+    s += "# HELP dfkv_client_gpu_dedup_length_mismatches_total Lookups that found their key published longer than their segments hold\n";
+    s += "# TYPE dfkv_client_gpu_dedup_length_mismatches_total counter\n";
+    s += "dfkv_client_gpu_dedup_length_mismatches_total " + std::to_string(gd->length_mismatches()) + "\n";
     s += "# HELP dfkv_client_gpu_dedup_load_fences_total Device synchronizations made before publishing a fetch to the GPU rendezvous\n";
     s += "# TYPE dfkv_client_gpu_dedup_load_fences_total counter\n";
     s += "dfkv_client_gpu_dedup_load_fences_total " + std::to_string(gd->load_fences()) + "\n";

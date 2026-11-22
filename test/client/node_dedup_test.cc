@@ -1179,3 +1179,30 @@ TEST(NodeDedup, EntryStampedFarAheadExpires) {
             NodeDedup::Role::kFetch)
       << "an entry stamped a minute ahead was served";
 }
+
+// ---- the precondition: one key, the same bytes in every process ------------
+
+// Two processes that expect different lengths for one key disagree about
+// what it holds (as when the keys leave out a rank axis of a sharded
+// payload). The entry is not used, and the disagreement is counted.
+TEST(NodeDedup, LengthDisagreementIsCountedAndNotServed) {
+  ShmGuard g("len-disagree");
+  auto a = NodeDedup::Open(Opts(g.name));
+  auto b = NodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  const std::string v = Val(96, 4096);
+  std::string out(8192, '\0');
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->Claim(K(96), v.size(), &out[0], &token),
+            NodeDedup::Role::kFetch);
+  a->Publish(K(96), NodeDedup::Kind::kData, token, v.data(), v.size());
+  EXPECT_NE(b->Claim(K(96), 8192, &out[0], &ignored), NodeDedup::Role::kHit);
+  EXPECT_EQ(b->length_mismatches(), 1u);
+  // Agreeing readers are not counted.
+  ASSERT_EQ(b->Claim(K(96), v.size(), &out[0], &ignored),
+            NodeDedup::Role::kHit);
+  size_t got = 0;
+  ASSERT_EQ(b->ClaimAuto(K(96), 8192, &out[0], &got, &ignored),
+            NodeDedup::Role::kHit);
+  EXPECT_EQ(b->length_mismatches(), 1u);
+}

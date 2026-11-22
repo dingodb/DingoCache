@@ -15,6 +15,8 @@
 #ifndef DFKV_DEDUP_TOKEN_H_
 #define DFKV_DEDUP_TOKEN_H_
 
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
 
 namespace dfkv {
@@ -38,6 +40,12 @@ inline bool SameGen(uint64_t token, uint64_t gen) {
 }
 
 }  // namespace dedup_token
+
+// Counts a lookup that found its key published with a length it does not
+// expect, and says so once per process: dedup assumes that one key holds the
+// same bytes in every process of the host. Defined in node_dedup.cc.
+void NoteLengthMismatch(std::atomic<uint64_t>* counter, const char* tag,
+                        size_t published, size_t expected);
 
 // Longest a Publish/Abort waits for its slot while another process's stale
 // Publish/Abort holds it for a re-check (a few instructions, unless that

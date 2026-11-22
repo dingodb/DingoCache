@@ -290,8 +290,18 @@ bool NodeDedup::CopyOut(Slot* s, const BlockKey& key, Kind kind, size_t cap,
       s->kind != static_cast<uint32_t>(kind))
     return false;
   const size_t n = s->len;
-  if (strict_n != kAnyLen && n != strict_n) return false;
-  if (n > cap) return false;
+  if ((strict_n != kAnyLen && n != strict_n) || n > cap) {
+    // Another process published this key with a length this reader does not
+    // expect: the two disagree about what the key holds. Dedup rests on one
+    // key meaning the same bytes in every process of the host (a key that
+    // leaves out a rank axis of a sharded payload breaks it), so this is
+    // reported. The entry is not used either way. The generation is read
+    // again so that a slot being recycled under the reader is not reported.
+    if (s->gen.load(std::memory_order_acquire) == g0)
+      NoteLengthMismatch(&length_mismatches_, "node-dedup", n,
+                         strict_n != kAnyLen ? strict_n : cap);
+    return false;
+  }
   const uint64_t off = s->payload_off;
   const uint64_t seq = s->alloc_seq;
   if (off + n > arena_bytes_) return false;  // torn metadata: bail
@@ -307,6 +317,21 @@ bool NodeDedup::CopyOut(Slot* s, const BlockKey& key, Kind kind, size_t cap,
   if (s->gen.load(std::memory_order_acquire) != g0) return false;
   if (got) *got = n;
   return true;
+}
+
+void NoteLengthMismatch(std::atomic<uint64_t>* counter, const char* tag,
+                        size_t published, size_t expected) {
+  counter->fetch_add(1, std::memory_order_relaxed);
+  static std::atomic<bool> said{false};
+  if (said.exchange(true, std::memory_order_relaxed)) return;
+  DFKV_LOG_WARN(std::string(tag) + ": a key was published by another process "
+                "on this host with " + std::to_string(published) +
+                " bytes where this one expects " + std::to_string(expected) +
+                ". Same-host dedup assumes that a key holds the same bytes in "
+                "every process; if the keys leave out a rank axis of a "
+                "sharded payload, turn dedup off. (Logged once; counted in "
+                "dfkv_client_dedup_length_mismatches_total / "
+                "dfkv_client_gpu_dedup_length_mismatches_total.)");
 }
 
 NodeDedup::Role NodeDedup::ClaimImpl(const BlockKey& key, Kind kind, size_t cap,

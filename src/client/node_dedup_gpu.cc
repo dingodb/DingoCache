@@ -556,7 +556,14 @@ bool GpuNodeDedup::IssueCopySg(Slot* s, const BlockKey& key, const Seg* segs,
   // and ValidateCopy re-reads the generation after the copy.
   if (s->key_hi != key.digest_hi || s->key_lo != key.digest_lo) return false;
   const size_t n = s->len;
-  if (n == 0 || n > total_cap) return false;
+  if (n == 0) return false;
+  if (n > total_cap) {
+    // Published longer than this reader's segments hold: the processes
+    // disagree about what the key holds (see NodeDedup::CopyOut).
+    if (s->gen.load(std::memory_order_acquire) == g0)
+      NoteLengthMismatch(&length_mismatches_, "gpu-dedup", n, total_cap);
+    return false;
+  }
   const uint32_t oi = s->owner_idx;
   const uint32_t og = s->owner_gen32;
   const uint64_t off = s->payload_off;

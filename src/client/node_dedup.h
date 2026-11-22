@@ -142,6 +142,10 @@ class NodeDedup {
   uint64_t fetches() const { return fetches_.load(std::memory_order_relaxed); }
   uint64_t wait_hits() const { return wait_hits_.load(std::memory_order_relaxed); }
   uint64_t wait_timeouts() const { return wait_timeouts_.load(std::memory_order_relaxed); }
+  // Lookups that found their key published with a length they do not expect.
+  uint64_t length_mismatches() const {
+    return length_mismatches_.load(std::memory_order_relaxed);
+  }
 
  private:
   struct Slot;    // 64-byte shm index slot
@@ -215,6 +219,7 @@ class NodeDedup {
   size_t map_len_ = 0;
 
   std::atomic<uint64_t> hits_{0}, fetches_{0}, wait_hits_{0}, wait_timeouts_{0};
+  mutable std::atomic<uint64_t> length_mismatches_{0};
 };
 
 }  // namespace dfkv
