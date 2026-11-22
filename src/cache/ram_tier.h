@@ -20,6 +20,18 @@
  * Arena pins are maintained by SlabAllocator; dedicated entries maintain the
  * equivalent counters directly.
  *
+ * Eviction among evictable arena slots is per-size-class CLOCK second chance:
+ * a GetPrep hit that hands out a pin (out != nullptr) on an arena slot sets
+ * the slot's reference bit, and the class hand clears a set bit and moves on
+ * instead of evicting. Existence probes (out == nullptr) and dedicated large
+ * values set nothing. A slot read at least once per lap of the hand stays;
+ * one that is no longer read goes within one more lap. The sweep runs under
+ * the shard lock that reads take, so one eviction clears at most
+ * kEvictClearLimit bits and then evicts the first evictable slot it met.
+ * Reads do not reorder the ring and do not feed the allocator's class/extent
+ * read heat, so whole-extent rebalancing between size classes still judges a
+ * class by its writes only.
+ *
  * Backpressure: capacity rejection happens before a value is admitted; only
  * then may the caller fall back to synchronous disk write. Once admitted, a
  * disk-ACK PUT (including a conflicting duplicate) waits for that value's
@@ -69,6 +81,26 @@ class KvNodeServer;
 
 class RamTier {
  public:
+  // Reference bits one eviction may clear (SlabAllocator::Options::
+  // evict_clear_limit). The sweep holds the shard and allocator locks, which
+  // every read of the shard takes twice, and each step loads one 128-byte
+  // slot record from a table far larger than the CPU caches. 512 bounds the
+  // bits an inline eviction clears, and a background reclaim call clears
+  // fewer than 2 x 512, however many slots the class has (estimated, not
+  // measured: about 0.1 us per step, so about 0.05 ms and 0.1 ms). Slots
+  // pinned by an unfinished flush are skipped without counting, so a flush
+  // backlog at the hand can still lengthen one call, as before. A referenced
+  // slot is only evicted when 512 referenced slots in a row stand at the
+  // hand; a class in that state evicts in admission order, as it did before
+  // reads were recorded.
+  static constexpr uint32_t kEvictClearLimit = 512;
+  // Reclaim calls per class and tick that may end on that bound before the
+  // tick gives up on the class, each call in its own lock hold. A call can
+  // clear up to 2 x 512 - 1 bits, so a tick clears just under 64 x 1024 per
+  // class and shard; while 512 referenced slots stand at the hand each call
+  // frees one slot, so such a tick frees 64.
+  static constexpr size_t kReclaimClearLimitedCalls = 64;
+
   struct Options {
     uint64_t bytes = (16ull << 30);       // total RAM-tier byte budget
     // Bytes reserved outside the registered fixed-slot arena for dedicated
@@ -222,7 +254,9 @@ class RamTier {
   bool ReserveDurable(const BlockKey& key, size_t len,
                       DurableReservation* out);
 
-  // On hit, pins the resident allocation and returns one move-only owner.
+  // On hit with `out`, pins the resident allocation, marks an arena slot
+  // referenced for CLOCK eviction, and returns one move-only owner. Without
+  // `out` it is an existence probe: no pin, no reference.
   // Miss leaves `out` empty.
   // Observational probes acquire the same pin but defer hit/miss accounting.
   bool GetPrep(const BlockKey& key, uint64_t offset, uint64_t length, Hit* out,

@@ -10,8 +10,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -49,6 +51,11 @@ class RamTierTestPeer {
     return RamTier::WaitPut(completion);
   }
   static const char* ArenaBase(const RamTier& tier) { return tier.arena_; }
+  // One reclaimer pass over every shard, as the background thread runs it.
+  static void ReclaimTick(RamTier& tier) {
+    for (size_t i = 0; i < tier.shards_.size(); ++i)
+      tier.ReclaimTick(*tier.shards_[i], i);
+  }
 };
 }  // namespace dfkv
 using dfkv::RamTierTestPeer;
@@ -104,6 +111,31 @@ bool WaitFor(F pred) {
   }
   return pred();
 }
+
+// Set an environment variable for a scope and put back what was there.
+class ScopedEnv {
+ public:
+  ScopedEnv(const char* name, const char* value) : name_(name) {
+    if (const char* old = std::getenv(name)) {
+      had_ = true;
+      old_ = old;
+    }
+    setenv(name, value, 1);
+  }
+  ~ScopedEnv() {
+    if (had_)
+      setenv(name_, old_.c_str(), 1);
+    else
+      unsetenv(name_);
+  }
+  ScopedEnv(const ScopedEnv&) = delete;
+  ScopedEnv& operator=(const ScopedEnv&) = delete;
+
+ private:
+  const char* name_;
+  bool had_ = false;
+  std::string old_;
+};
 
 RamTier::Options Opts(uint64_t bytes, uint32_t gran = 4096) {
   RamTier::Options o;
@@ -1324,4 +1356,285 @@ TEST(RamTier, PutDurableDedupsAgainstResident) {
   EXPECT_TRUE(rt.PutDurable(K(91), v.data(), v.size()));  // resident -> no-op true
   EXPECT_EQ(rt.UsedBytes(), used);                        // no second slot
   EXPECT_EQ(rt.Promoted(), 0u);                           // dedup is not a promotion
+}
+
+// Eviction honours reads: a key read during every turnover of its class stays
+// resident while the unread keys admitted around it are evicted. Promoted
+// (born-durable) entries are used so no flush pin is involved, and the
+// background reclaimer is off so admissions alone drive the hand.
+TEST(RamTier, ReadKeepsHotKeyResidentAcrossClassTurnover) {
+  FlushSink sink;
+  const uint64_t slots = 16;
+  auto o = Opts(slots * 4096);  // one extent, one class
+  o.reclaim_interval_ms = 0;
+  RamTier rt(o, sink.fn());
+  ASSERT_TRUE(rt.ok());
+  std::string v(4000, 'h');
+  const BlockKey hot = K(1);
+  ASSERT_TRUE(rt.PutDurable(hot, v.data(), v.size()));  // oldest resident
+  for (uint64_t i = 1; i < slots; ++i)
+    ASSERT_TRUE(rt.PutDurable(K(100 + i), v.data(), v.size()));
+  ASSERT_EQ(rt.Count(), slots);
+  ASSERT_EQ(rt.Evictions(), 0u);
+
+  for (uint64_t i = 0; i < 3 * slots; ++i) {  // three full turnovers
+    RamTier::Hit h;
+    ASSERT_TRUE(rt.GetPrep(hot, 0, v.size(), &h))
+        << "hot key evicted after " << i << " admissions";
+    h = RamTier::Hit{};
+    ASSERT_TRUE(rt.PutDurable(K(1000 + i), v.data(), v.size()));
+  }
+  EXPECT_TRUE(rt.Contains(hot));
+  EXPECT_EQ(rt.Evictions(), 3 * slots);
+  for (uint64_t i = 1; i < slots; ++i)
+    EXPECT_FALSE(rt.Contains(K(100 + i))) << "unread key " << i;
+  EXPECT_FALSE(rt.Contains(K(1000)));  // unread, admitted two turnovers ago
+  EXPECT_TRUE(rt.Contains(K(1000 + 3 * slots - 1)));
+}
+
+// Second chance, not immunity: after its last read a key survives the
+// evictions an unread key of the same age would not, and is gone within one
+// pass of the hand over its class.
+TEST(RamTier, KeyThatStopsBeingReadIsEvictedWithinOnePass) {
+  FlushSink sink;
+  const uint64_t slots = 16;
+  auto o = Opts(slots * 4096);
+  o.reclaim_interval_ms = 0;
+  RamTier rt(o, sink.fn());
+  ASSERT_TRUE(rt.ok());
+  std::string v(4000, 'c');
+  const BlockKey once = K(1);
+  ASSERT_TRUE(rt.PutDurable(once, v.data(), v.size()));  // oldest resident
+  for (uint64_t i = 1; i < slots; ++i)
+    ASSERT_TRUE(rt.PutDurable(K(100 + i), v.data(), v.size()));
+  ASSERT_EQ(rt.Evictions(), 0u);
+  {
+    RamTier::Hit h;
+    ASSERT_TRUE(rt.GetPrep(once, 0, v.size(), &h));  // the last read
+  }
+
+  ASSERT_TRUE(rt.PutDurable(K(1000), v.data(), v.size()));
+  EXPECT_TRUE(rt.Contains(once)) << "the oldest key was read: spare it once";
+  EXPECT_FALSE(rt.Contains(K(101))) << "the oldest unread key goes instead";
+  uint64_t admitted = 1;
+  while (rt.Contains(once) && admitted < 2 * slots) {
+    ASSERT_TRUE(rt.PutDurable(K(1000 + admitted), v.data(), v.size()));
+    ++admitted;
+  }
+  EXPECT_FALSE(rt.Contains(once));
+  EXPECT_LE(admitted, slots) << "one read must not buy more than one pass";
+}
+
+// The RAM tier bounds the reference bits one eviction clears, because the
+// sweep runs under the shard lock its readers take. With every slot of a
+// class larger than the bound read, each admission evicts the slot at the
+// hand and moves the hand on by the bound.
+TEST(RamTier, EvictionSweepIsBoundedWhenEverySlotWasRead) {
+  FlushSink sink;
+  const uint64_t limit = RamTier::kEvictClearLimit;
+  const uint64_t slots = 4 * limit;
+  auto o = Opts(slots * 4096);  // one class, one shard
+  o.large_reserve_bytes = 0;
+  o.reclaim_interval_ms = 0;
+  RamTier rt(o, sink.fn());
+  ASSERT_TRUE(rt.ok());
+  ASSERT_EQ(rt.shards(), 1u);
+  std::string v(4000, 'b');
+  for (uint64_t i = 0; i < slots; ++i)
+    ASSERT_TRUE(rt.PutDurable(K(1 + i), v.data(), v.size()));
+  ASSERT_EQ(rt.Evictions(), 0u);
+  for (uint64_t i = 0; i < slots; ++i) {
+    RamTier::Hit h;
+    ASSERT_TRUE(rt.GetPrep(K(1 + i), 0, v.size(), &h));
+  }
+  for (uint64_t i = 0; i < 3; ++i) {
+    ASSERT_TRUE(rt.PutDurable(K(100000 + i), v.data(), v.size()));
+    EXPECT_EQ(rt.Evictions(), i + 1);
+    EXPECT_FALSE(rt.Contains(K(1 + i * limit))) << "admission " << i;
+  }
+  EXPECT_TRUE(rt.Contains(K(2)));  // passed by the first sweep, not evicted
+  EXPECT_EQ(rt.Count(), slots);
+}
+
+// The reclaimer keeps going when a call ends on the reference-clearing
+// bound: a class whose every slot was read still reaches its free-slot target
+// in one tick (here a quarter of the class), not one slot per tick.
+TEST(RamTier, ReclaimTickReachesTargetInAFullyReadClass) {
+  FlushSink sink;
+  const uint64_t slots = 4 * RamTier::kEvictClearLimit;
+  auto o = Opts(slots * 4096);
+  o.large_reserve_bytes = 0;
+  o.reclaim_interval_ms = 0;  // ticks are driven by the test
+  RamTier rt(o, sink.fn());
+  ASSERT_TRUE(rt.ok());
+  ASSERT_EQ(rt.shards(), 1u);
+  std::string v(4000, 't');
+  for (uint64_t i = 0; i < slots; ++i)
+    ASSERT_TRUE(rt.PutDurable(K(1 + i), v.data(), v.size()));
+  ASSERT_EQ(rt.Evictions(), 0u);
+  for (uint64_t i = 0; i < slots; ++i) {
+    RamTier::Hit h;
+    ASSERT_TRUE(rt.GetPrep(K(1 + i), 0, v.size(), &h));
+  }
+  RamTierTestPeer::ReclaimTick(rt);
+  EXPECT_EQ(rt.Reclaimed(), slots / 4);
+  EXPECT_EQ(rt.Count(), slots - slots / 4);
+}
+
+// ...but only up to kReclaimClearLimitedCalls calls per class and tick. In a
+// fully read class each such call clears kEvictClearLimit bits and frees one
+// slot, so a class too large to sweep in one tick gives exactly that many.
+TEST(RamTier, ReclaimTickCapsClearLimitedCalls) {
+  FlushSink sink;
+  const uint64_t cap = RamTier::kReclaimClearLimitedCalls;
+  const uint64_t slots = (cap + 16) * RamTier::kEvictClearLimit;
+  auto o = Opts(slots * 4096);
+  o.large_reserve_bytes = 0;
+  o.reclaim_interval_ms = 0;
+  RamTier rt(o, sink.fn());
+  ASSERT_TRUE(rt.ok());
+  ASSERT_EQ(rt.shards(), 1u);
+  std::string v(4000, 'u');
+  for (uint64_t i = 0; i < slots; ++i)
+    ASSERT_TRUE(rt.PutDurable(K(1 + i), v.data(), v.size()));
+  ASSERT_EQ(rt.Evictions(), 0u);
+  for (uint64_t i = 0; i < slots; ++i) {
+    RamTier::Hit h;
+    ASSERT_TRUE(rt.GetPrep(K(1 + i), 0, v.size(), &h));
+  }
+  RamTierTestPeer::ReclaimTick(rt);
+  EXPECT_EQ(rt.Reclaimed(), cap);
+  EXPECT_EQ(rt.Count(), slots - cap);
+}
+
+// The scenario behind the two tests above. A cold class sits next to a class
+// that is read in full and then written faster than one slot per tick. If
+// the reclaimer freed only one slot per tick while it sweeps the reference
+// bits, admissions would run out of free slots, and an admission without a
+// free slot takes a whole cold extent of another class before it evicts its
+// own. The cold class must keep every resident.
+TEST(RamTier, WritesAfterFullReadDoNotStealFromAColdClass) {
+  FlushSink sink;
+  RamTier::Options o;
+  o.bytes = 48ull << 20;
+  o.large_reserve_bytes = 0;
+  o.slot_granularity = 4096;
+  o.reclaim_interval_ms = 0;
+  std::unique_ptr<RamTier> tier;
+  {
+    ScopedEnv extent("DFKV_RAM_TIER_EXTENT_BYTES", "1048576");  // 48 x 1 MiB
+    tier = std::make_unique<RamTier>(o, sink.fn());
+  }
+  RamTier& rt = *tier;
+  ASSERT_TRUE(rt.ok());
+  ASSERT_EQ(rt.shards(), 1u);
+
+  // Cold class: 512 small values, never written again.
+  const uint64_t cold = 512;
+  std::string small(4000, 'c');
+  for (uint64_t i = 0; i < cold; ++i)
+    ASSERT_TRUE(rt.PutDurable(K(1 + i), small.data(), small.size()));
+  auto cold_resident = [&] {
+    uint64_t n = 0;
+    for (uint64_t i = 0; i < cold; ++i) n += rt.Contains(K(1 + i));
+    return n;
+  };
+
+  // Hot class: fill the rest of the arena and turn it over, one tick per 32
+  // admissions. The reclaimer keeps up, so nothing is taken from the cold
+  // class although it is by now old enough to be a cold-steal victim.
+  const uint64_t per_tick = 32;
+  std::string big(8000, 'h');
+  uint64_t next = 100000;
+  auto write_hot = [&](uint64_t count) {
+    for (uint64_t i = 0; i < count; ++i) {
+      if (!rt.PutDurable(K(next++), big.data(), big.size())) return false;
+      if ((i + 1) % per_tick == 0) RamTierTestPeer::ReclaimTick(rt);
+    }
+    return true;
+  };
+  ASSERT_TRUE(write_hot(8000));
+  ASSERT_GT(rt.Evictions(), 1000u) << "the hot class never turned over";
+  ASSERT_EQ(cold_resident(), cold);
+
+  // Read every resident of the hot class, then keep writing at the same
+  // rate: the sweep now has to clear a reference bit on every slot.
+  uint64_t read = 0;
+  for (uint64_t id = 100000; id < next; ++id) {
+    RamTier::Hit h;
+    if (rt.GetPrep(K(id), 0, big.size(), &h)) ++read;
+  }
+  ASSERT_GT(read, 8 * uint64_t{RamTier::kEvictClearLimit})
+      << "too few slots for the sweep to take several reclaim calls";
+  ASSERT_TRUE(write_hot(10 * per_tick));
+  EXPECT_EQ(cold_resident(), cold) << "a cold extent was taken";
+}
+
+// The same scenario above the reclaimer's per-tick cap: the read class is too
+// large to sweep in one tick, so the tick frees only
+// kReclaimClearLimitedCalls slots, and admissions arrive faster than that.
+// They evict inline, one slot of their own class per admission, and the cold
+// class still keeps every resident.
+TEST(RamTier, WritesFasterThanTheReclaimCapEvictTheirOwnClass) {
+  FlushSink sink;
+  RamTier::Options o;
+  o.bytes = 176ull << 20;
+  o.large_reserve_bytes = 0;
+  o.slot_granularity = 4096;
+  o.reclaim_interval_ms = 0;
+  std::unique_ptr<RamTier> tier;
+  {
+    ScopedEnv extent("DFKV_RAM_TIER_EXTENT_BYTES", "1048576");  // 176 x 1 MiB
+    ScopedEnv shards("DFKV_RAM_TIER_SHARDS", "1");
+    tier = std::make_unique<RamTier>(o, sink.fn());
+  }
+  RamTier& rt = *tier;
+  ASSERT_TRUE(rt.ok());
+  ASSERT_EQ(rt.shards(), 1u);
+
+  // Cold class: 512 values in 8 extents, never written again.
+  const uint64_t cold = 512;
+  std::string big(8000, 'c');
+  for (uint64_t i = 0; i < cold; ++i)
+    ASSERT_TRUE(rt.PutDurable(K(1 + i), big.data(), big.size()));
+  auto cold_resident = [&] {
+    uint64_t n = 0;
+    for (uint64_t i = 0; i < cold; ++i) n += rt.Contains(K(1 + i));
+    return n;
+  };
+
+  // Read class: the other 168 extents, 43,008 slots. Fill it and turn it
+  // over at 64 admissions per tick; the reclaimer keeps 128 slots free.
+  const uint64_t cap = RamTier::kReclaimClearLimitedCalls;
+  std::string small(4000, 'h');
+  uint64_t next = 100000;
+  auto write_hot = [&](uint64_t count, bool tick_after) {
+    for (uint64_t i = 0; i < count; ++i)
+      if (!rt.PutDurable(K(next++), small.data(), small.size())) return false;
+    if (tick_after) RamTierTestPeer::ReclaimTick(rt);
+    return true;
+  };
+  for (int i = 0; i < 704; ++i) ASSERT_TRUE(write_hot(cap, true));
+  ASSERT_GT(rt.Evictions(), 1000u) << "the read class never turned over";
+  ASSERT_EQ(cold_resident(), cold);
+
+  uint64_t read = 0;
+  for (uint64_t id = 100000; id < next; ++id) {
+    RamTier::Hit h;
+    if (rt.GetPrep(K(id), 0, small.size(), &h)) ++read;
+  }
+  ASSERT_GT(read, (cap + 8) * RamTier::kEvictClearLimit)
+      << "one tick could sweep the whole class";
+
+  // 128 admissions use up the free slots; the tick that follows wants 256
+  // free but stops at its cap with 64. Then 512 admissions without a tick:
+  // 64 take a free slot, 448 evict inline.
+  const uint64_t before = rt.Evictions();
+  const uint64_t reclaimed = rt.Reclaimed();
+  ASSERT_TRUE(write_hot(2 * cap, true));
+  EXPECT_EQ(rt.Reclaimed() - reclaimed, cap);
+  ASSERT_TRUE(write_hot(512, false));
+  EXPECT_EQ(cold_resident(), cold) << "a cold extent was taken";
+  EXPECT_EQ(rt.Evictions() - before, 512u)
+      << "640 admissions, 128 free slots: one eviction for each of the rest";
 }

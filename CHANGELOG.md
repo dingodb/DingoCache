@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+- RAM tier: eviction now honours reads. A GET served from the RAM tier pinned
+  its slot but never set the slot's CLOCK reference bit, so the class hand
+  never met a referenced slot and the tier evicted in strict admission order:
+  a value that every request reads was pushed out after one turnover of its
+  size class, read from disk and promoted again, repeatedly. A RAM hit now
+  sets the reference bit (`SlabAllocator::PinForRead`), under the allocator
+  lock the pin already takes and only when the bit is clear; the hand clears
+  it and passes the slot over once. A value read at least once per lap of the
+  hand over its size class stays resident; one that stops being read is
+  evicted within one further lap. Pins taken for writes (copy window, flush)
+  give no such credit. Reads still do not reorder the ring or feed the
+  class/extent read heat, so whole-extent rebalancing between size classes is
+  unchanged and can still take an extent whose values are read but no longer
+  written. The disk tier already recorded reads and is unchanged. Expect
+  `dfkv_ram_promoted_total` and disk reads to drop for workloads that reread a
+  hot subset while writing. The sweep that clears reference bits runs under
+  the shard lock that reads take, so in the RAM tier one eviction clears at
+  most 512 bits (new `SlabAllocator::Options::evict_clear_limit`, unbounded by
+  default and in the disk tier) and then evicts the first evictable slot it
+  met. A background reclaim call ends after 512 clears and releases the lock;
+  the reclaimer repeats such calls, up to 64 per class and tick. While 512
+  referenced slots stand at the hand each call frees one slot, so a tick frees
+  at most 64 slots per class and shard; admissions beyond that evict inline
+  under the same bound, from their own class, without first taking a whole
+  cold extent from another size class as an admission without a free slot
+  otherwise does. In a class where nearly every slot has been read, a
+  referenced slot can therefore be evicted, and the hand laps faster than
+  slots are evicted: there reads give no protection and values leave in about
+  the order they were admitted, as before this change. A value that now stays
+  in RAM is no longer re-read from disk once per turnover, so those re-reads
+  no longer refresh the recency of its disk copy: the disk tier may evict it,
+  and it is then absent after a restart until it is written again.
 - Server: opening a slab disk at startup costs less. Nothing changes on disk
   or on the wire: older releases open a directory written by this one and
   the other way round.

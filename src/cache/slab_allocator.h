@@ -60,6 +60,15 @@ class SlabAllocator {
     // Reuse an existing larger class when its internal waste
     // (slot_size - aligned_len) stays below this fraction.
     double max_waste = 0.25;
+    // Most reference bits one class eviction may clear before it stops
+    // looking for an unreferenced victim and takes the first evictable
+    // resident it met (whose bit it has just cleared). 0 = unbounded: the
+    // sweep clears up to a whole lap. A caller whose readers wait on the lock
+    // held across the sweep sets this to cap that hold; the price is that a
+    // run of this many referenced residents at the hand loses its oldest
+    // member even if an unreferenced one lies further on. ReclaimClass ends
+    // a call once it has cleared this many and tells its caller so.
+    uint32_t evict_clear_limit = 0;
     std::function<bool(uint32_t extent)> on_extent_bind;
     // A last-resident eviction may clear the whole extent in one write.
     // Partial eviction requires on_slot_evict when persistence is configured.
@@ -159,6 +168,12 @@ class SlabAllocator {
   bool Pin(const BlockKey& key);
   bool Unpin(const BlockKey& key);
   bool Pin(const BlockKey& key, SlotHandle handle);
+  // Pin for a read served from the slot: also gives the resident its CLOCK
+  // reference bit, so the class hand passes it over once before it becomes a
+  // victim again. Unlike Get/GetAndPin this moves nothing in the sweep order
+  // and feeds no class or extent read heat; it adds no work to Pin beyond
+  // that bit, which is stored only while clear.
+  bool PinForRead(const BlockKey& key, SlotHandle handle);
   bool Unpin(const BlockKey& key, SlotHandle handle);
 
   struct ClassStat {
@@ -181,10 +196,17 @@ class SlabAllocator {
   // sweep keeps Put on the pop-free-slot fast path. It is a no-op while an
   // unbound extent remains, because binding grows capacity without losing
   // residency. If reclaim frees an entire extent, stop before cascading into a
-  // second class shrink. Evicted keys are returned so the caller can remove its
-  // payload index in the same lifecycle transaction.
+  // second class shrink. With Options::evict_clear_limit set, stop as well once
+  // the call has cleared that many reference bits (so one call clears fewer
+  // than twice the limit); `clear_limited` is then set if the target is still
+  // unmet, and calling again continues the sweep. Until a later call for the
+  // class ends otherwise, Put does not take cold extents of other classes
+  // for it: it would do so only because this sweep is slow, not because the
+  // class has nothing of its own to evict. Evicted keys are returned so
+  // the caller can remove its payload index in the same lifecycle transaction.
   size_t ReclaimClass(size_t cls_index, size_t target_free, size_t max_victims,
-                      std::vector<BlockKey>* evicted);
+                      std::vector<BlockKey>* evicted,
+                      bool* clear_limited = nullptr);
   // Background GROW donor for class `hot`: among classes above the
   // kStripeWays floor whose write demand is at most a quarter of hot's, the
   // coldest, then the one with the most extents. Demand is bytes (puts since
@@ -290,6 +312,11 @@ class SlabAllocator {
     uint32_t ring_head = kNoSlot;
     uint32_t hand = kNoSlot;
     uint32_t protected_slots = 0;
+    // The latest ReclaimClass call for this class ended on evict_clear_limit
+    // with its target unmet: the class is full of referenced residents and
+    // the background sweep is behind. Put then evicts from the class itself
+    // instead of first taking a cold extent from another class.
+    bool reclaim_clear_limited = false;
   };
 
   struct ExtentMeta {
@@ -321,7 +348,9 @@ class SlabAllocator {
   ExtentBindResult BindExtentLocked(size_t cls, uint32_t extent,
                                     bool metadata_prepared);
   ExtentBindResult BindFreeExtent(size_t cls);
-  bool EvictOneFrom(size_t cls, std::vector<BlockKey>* evicted);
+  // `cleared`, when given, is advanced by the reference bits this call cleared.
+  bool EvictOneFrom(size_t cls, std::vector<BlockKey>* evicted,
+                    size_t* cleared = nullptr);
   ExtentBindResult StealExtentFor(size_t cls,
                                   std::vector<BlockKey>* evicted,
                                   size_t min_donor_extents = 0);

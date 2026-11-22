@@ -228,6 +228,203 @@ TEST(SlabAllocator, SlotHandlePinsOnlyItsLiveKey) {
   EXPECT_TRUE(a.Unpin(second, second_handle));
 }
 
+// A read pin by handle (the RAM tier's read path) is a CLOCK reference: the
+// hand spares the resident once, then treats it like any other.
+TEST(SlabAllocator, PinForReadGivesOneSecondChance) {
+  SlabAllocator a(Opts(4 * 4096, 1));
+  std::vector<BlockKey> ev;
+  SlotRef r;
+  SlabAllocator::SlotHandle h0;
+  ASSERT_TRUE(a.Put(Key("k0"), 4096, &r, &ev, &h0));
+  for (int i = 1; i < 4; ++i)
+    ASSERT_TRUE(a.Put(Key("k" + std::to_string(i)), 4096, &r, &ev));
+  ASSERT_TRUE(a.PinForRead(Key("k0"), h0));
+  ASSERT_TRUE(a.PinForRead(Key("k0"), h0));  // a second read adds no credit
+  ASSERT_TRUE(a.Unpin(Key("k0"), h0));
+  ASSERT_TRUE(a.Unpin(Key("k0"), h0));
+
+  ASSERT_TRUE(a.Put(Key("n0"), 4096, &r, &ev));
+  ASSERT_EQ(ev.size(), 1u);
+  EXPECT_TRUE(ev[0] == Key("k1")) << "oldest unread resident goes first";
+  EXPECT_TRUE(a.Contains(Key("k0")));
+
+  // No further read: k0 is the victim once the hand comes round again, after
+  // the residents that were already ahead of it and before any newer one.
+  ASSERT_TRUE(a.Put(Key("n1"), 4096, &r, &ev));
+  ASSERT_TRUE(a.Put(Key("n2"), 4096, &r, &ev));
+  EXPECT_TRUE(a.Contains(Key("k0")));
+  ASSERT_TRUE(a.Put(Key("n3"), 4096, &r, &ev));
+  ASSERT_EQ(ev.size(), 4u);
+  EXPECT_TRUE(ev[3] == Key("k0"));
+  EXPECT_TRUE(a.Contains(Key("n0")));
+}
+
+// Pins taken for writes (copy window, flush) are not reads: they must not
+// hand every new resident a second chance.
+TEST(SlabAllocator, PlainHandlePinIsNotAClockReference) {
+  SlabAllocator a(Opts(4 * 4096, 1));
+  std::vector<BlockKey> ev;
+  SlotRef r;
+  SlabAllocator::SlotHandle h0;
+  ASSERT_TRUE(a.Put(Key("k0"), 4096, &r, &ev, &h0));
+  for (int i = 1; i < 4; ++i)
+    ASSERT_TRUE(a.Put(Key("k" + std::to_string(i)), 4096, &r, &ev));
+  ASSERT_TRUE(a.Pin(Key("k0"), h0));
+  ASSERT_TRUE(a.Unpin(Key("k0"), h0));
+  ASSERT_TRUE(a.Put(Key("n0"), 4096, &r, &ev));
+  ASSERT_EQ(ev.size(), 1u);
+  EXPECT_TRUE(ev[0] == Key("k0"));
+}
+
+// Every resident referenced: one admission still evicts exactly one victim
+// (the sweep clears the bits in one lap and takes the first resident it
+// reaches again), and the cleared residents carry no leftover credit.
+TEST(SlabAllocator, FullyReferencedClassStillEvictsOnePerAdmission) {
+  SlabAllocator a(Opts(4 * 4096, 1));
+  std::vector<BlockKey> ev;
+  SlotRef r;
+  SlabAllocator::SlotHandle h[4];
+  for (int i = 0; i < 4; ++i)
+    ASSERT_TRUE(a.Put(Key("k" + std::to_string(i)), 4096, &r, &ev, &h[i]));
+  for (int i = 0; i < 4; ++i) {
+    const BlockKey key = Key("k" + std::to_string(i));
+    ASSERT_TRUE(a.PinForRead(key, h[i]));
+    ASSERT_TRUE(a.Unpin(key, h[i]));
+  }
+  ASSERT_TRUE(a.Put(Key("n0"), 4096, &r, &ev));
+  ASSERT_EQ(ev.size(), 1u);
+  EXPECT_TRUE(ev[0] == Key("k0"));
+  EXPECT_EQ(a.Count(), 4u);
+  ASSERT_TRUE(a.Put(Key("n1"), 4096, &r, &ev));
+  ASSERT_EQ(ev.size(), 2u);
+  EXPECT_TRUE(ev[1] == Key("k1"));
+}
+
+namespace {
+// 16 one-slot residents k0..k15 of one class, admitted in that order (which
+// is also the order the hand visits them), all read once.
+void FillAndReadSixteen(SlabAllocator& a) {
+  std::vector<BlockKey> ev;
+  SlotRef r;
+  for (int i = 0; i < 16; ++i) {
+    const BlockKey key = Key("k" + std::to_string(i));
+    SlabAllocator::SlotHandle h;
+    ASSERT_TRUE(a.Put(key, 4096, &r, &ev, &h));
+    ASSERT_TRUE(a.PinForRead(key, h));
+    ASSERT_TRUE(a.Unpin(key, h));
+  }
+  ASSERT_TRUE(ev.empty());
+}
+}  // namespace
+
+// evict_clear_limit: with every resident referenced, one admission clears
+// only `limit` bits and evicts the first resident it met. The bits beyond
+// stay set: the next admission has to clear another `limit` of them, so its
+// victim is again the resident at the hand, not one that was already passed.
+TEST(SlabAllocator, EvictClearLimitBoundsTheSweepAndKeepsLaterBits) {
+  auto o = Opts(16 * 4096, 1);
+  o.evict_clear_limit = 4;
+  SlabAllocator a(o);
+  FillAndReadSixteen(a);
+  std::vector<BlockKey> ev;
+  SlotRef r;
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_TRUE(a.Put(Key("n" + std::to_string(i)), 4096, &r, &ev));
+    ASSERT_EQ(ev.size(), static_cast<size_t>(i + 1)) << "one victim each";
+    EXPECT_EQ(KeyName(ev.back()), "k" + std::to_string(4 * i));
+    EXPECT_EQ(a.Count(), 16u);
+  }
+  // The lap is complete: k1 was cleared by the first sweep and not read since.
+  ASSERT_TRUE(a.Put(Key("n4"), 4096, &r, &ev));
+  EXPECT_EQ(KeyName(ev.back()), "k1");
+}
+
+// Pinned residents are skipped without using up the bound: a pinned run
+// longer than the bound at the hand must not make the eviction fail.
+TEST(SlabAllocator, EvictClearLimitDoesNotCountPinnedSkips) {
+  auto o = Opts(16 * 4096, 1);
+  o.evict_clear_limit = 2;
+  SlabAllocator a(o);
+  FillAndReadSixteen(a);
+  for (int i = 0; i < 6; ++i) ASSERT_TRUE(a.Pin(Key("k" + std::to_string(i))));
+  std::vector<BlockKey> ev;
+  SlotRef r;
+  ASSERT_TRUE(a.Put(Key("n0"), 4096, &r, &ev));
+  ASSERT_EQ(ev.size(), 1u);
+  EXPECT_EQ(KeyName(ev[0]), "k6");
+  for (int i = 0; i < 6; ++i)
+    EXPECT_TRUE(a.Contains(Key("k" + std::to_string(i))));
+}
+
+// A background reclaim call ends once it has cleared `limit` bits, however
+// many victims it was allowed.
+TEST(SlabAllocator, ReclaimClassStopsAtEvictClearLimit) {
+  auto o = Opts(16 * 4096, 1);
+  o.evict_clear_limit = 4;
+  SlabAllocator a(o);
+  FillAndReadSixteen(a);
+  std::vector<BlockKey> ev;
+  bool clear_limited = false;
+  EXPECT_EQ(a.ReclaimClass(0, 8, 8, &ev, &clear_limited), 1u);
+  EXPECT_TRUE(clear_limited) << "target unmet: the caller may continue";
+  ASSERT_EQ(ev.size(), 1u);
+  EXPECT_EQ(KeyName(ev[0]), "k0");
+  // The hand stands at k4, whose bit and those after it are still set.
+  EXPECT_EQ(a.ReclaimClass(0, 8, 8, &ev), 1u);
+  ASSERT_EQ(ev.size(), 2u);
+  EXPECT_EQ(KeyName(ev[1]), "k4");
+}
+
+// While the background sweep of a class is behind (its last ReclaimClass call
+// ended on evict_clear_limit with the target unmet), an admission without a
+// free slot evicts from that class and leaves cold extents of other classes
+// alone: one eviction per admission. Once a reclaim call ends for any other
+// reason, the cold steal is back.
+TEST(SlabAllocator, ClearLimitedClassEvictsItselfInsteadOfStealingCold) {
+  auto o = Opts(16 * 4096, 10);
+  o.evict_clear_limit = 4;
+  SlabAllocator a(o);
+  std::vector<BlockKey> ev;
+  SlotRef r;
+  // Cold class: one resident in each of its 8 extents.
+  for (int i = 0; i < 8; ++i)
+    ASSERT_TRUE(a.Put(Key("b" + std::to_string(i)), 8192, &r, &ev));
+  // Read class: the 2 remaining extents, 32 slots, every resident read.
+  size_t read_cls = 0;
+  for (int i = 0; i < 32; ++i) {
+    const BlockKey key = Key("a" + std::to_string(i));
+    SlabAllocator::SlotHandle h;
+    ASSERT_TRUE(a.Put(key, 4096, &r, &ev, &h));
+    read_cls = r.cls;
+    ASSERT_TRUE(a.PinForRead(key, h));
+    ASSERT_TRUE(a.Unpin(key, h));
+  }
+  ASSERT_TRUE(ev.empty());
+  ASSERT_EQ(a.PoolExtents(), 0u);
+
+  bool clear_limited = false;
+  ASSERT_EQ(a.ReclaimClass(read_cls, 8, 8, &ev, &clear_limited), 1u);
+  ASSERT_TRUE(clear_limited);
+  ASSERT_TRUE(a.Put(Key("x0"), 4096, &r, &ev));  // takes the one free slot
+  ASSERT_EQ(ev.size(), 1u);
+  for (int i = 1; i <= 4; ++i) {
+    ASSERT_TRUE(a.Put(Key("x" + std::to_string(i)), 4096, &r, &ev));
+    ASSERT_EQ(ev.size(), static_cast<size_t>(i + 1)) << "one victim each";
+    EXPECT_EQ(KeyName(ev.back()), "a" + std::to_string(4 * i));
+  }
+  for (int i = 0; i < 8; ++i)
+    EXPECT_TRUE(a.Contains(Key("b" + std::to_string(i))));
+  EXPECT_EQ(a.ColdSteals(), 0u);
+
+  // A reclaim call that ends for another reason (here: nothing to do) lifts
+  // the exemption, and the cold extents were eligible all along.
+  EXPECT_EQ(a.ReclaimClass(read_cls, 0, 8, &ev, &clear_limited), 0u);
+  EXPECT_FALSE(clear_limited);
+  ASSERT_TRUE(a.Put(Key("x5"), 4096, &r, &ev));
+  EXPECT_EQ(a.ColdSteals(), 1u);
+  EXPECT_EQ(KeyName(ev.back()), "b0");
+}
+
 TEST(SlabAllocator, CrossClassStealWhenPoolEmpty) {
   // 2 extents. Fill both with class-A (4096) keys. Then a class-B (8192) key
   // with the pool empty must STEAL a fully-unpinned A extent and rebind it.
