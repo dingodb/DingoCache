@@ -929,3 +929,39 @@ TEST_F(DiskGroupTest, AFailedActivationStopsAtThatDisk) {
   EXPECT_EQ(reopened.SlabStats().warm_restarts, 0u);
   EXPECT_EQ(reopened.Count(), 48u);
 }
+
+// The periodic table sync runs by default only where a recovery can depend
+// on it: DFKV_SLAB_WARM_RESTART=boot. Elsewhere the table is synced by a
+// clean stop (and extent rebinds) only.
+TEST_F(DiskGroupTest, PeriodicTableSyncRunsOnlyWhereARecoveryUsesIt) {
+  const std::string value(4096, 's');
+  for (const char* mode : {"off", "auto", "boot"}) {
+    fs::remove_all(base_);
+    const auto dirs = Dirs(1);
+    ::setenv("DFKV_SLAB_WARM_RESTART", mode, 1);
+    ::unsetenv("DFKV_SLAB_TABLE_SYNC_MS");
+    const auto opened = std::chrono::steady_clock::now();
+    DiskCacheGroup group({dirs, 1ull << 30, "slab"});
+    ::unsetenv("DFKV_SLAB_WARM_RESTART");
+    ASSERT_TRUE(group.Healthy()) << group.StartupError();
+    for (int round = 0; round < 5; ++round) {
+      for (uint64_t i = 0; i < 8; ++i)
+        ASSERT_EQ(group.Cache(BlockKey{9500 + round * 8 + i, 0}, value.data(),
+                              value.size()),
+                  Status::kOk);
+      std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    }
+    const std::string m(mode);
+    const uint64_t syncs = group.SlabStats().table_syncs;
+    if (m == "boot") {
+      EXPECT_GT(syncs, 0u) << "boot syncs every 100 ms";
+    } else {
+      EXPECT_EQ(syncs, 0u) << mode << ": synced at the 100 ms cadence";
+    }
+    if (m == "auto") {
+      // A slow sync (5 s) to find a writeback error during the run.
+      std::this_thread::sleep_until(opened + std::chrono::milliseconds(5600));
+      EXPECT_GT(group.SlabStats().table_syncs, 0u) << "auto: no slow sync";
+    }
+  }
+}

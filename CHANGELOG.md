@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Server, slab store: the periodic sync of the slot table (`slots.tbl`,
+  every 100 ms) now keeps that cadence by default only with
+  `DFKV_SLAB_WARM_RESTART=boot`, the one mode whose recovery depends on it.
+  Under `off` (the default) an unclean exit resets the table anyway, and
+  the sync is off. `auto` keeps a table only when the kernel and the mount
+  survived, whose page cache holds every record write whether synced or
+  not; it syncs every 5 s, only to find a writeback error of the table
+  during the run rather than at the next stop or restart. A server killed
+  under `auto` is far less likely to lose its cache because the kill fell
+  into one of these syncs, and each disk saves most of the syncs' I/O.
+  Clean stops and extent rebinds still sync the table;
+  `DFKV_SLAB_TABLE_SYNC_MS` still sets the cadence explicitly.
 - Server, slab store: a disk whose background thread cannot be started (the
   process or its cgroup at its thread limit) now fails to start like any
   other disk error, instead of ending the process. Starting the table sync

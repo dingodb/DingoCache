@@ -300,7 +300,20 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
     }
   }
   uint64_t parsed = 0;
-  uint32_t sync_ms = 100;
+  // The periodic fdatasync of slots.tbl contributes to recovery only under
+  // `boot`: there, for a run without a unique mount id, it bounds what a
+  // filesystem that died and was mounted again without a reboot can have
+  // lost from the table (and a sync in progress takes the trust token back),
+  // so it runs every 100 ms. `off` resets the table after every unclean exit,
+  // and `auto` keeps it only when the kernel, the mount and with them the
+  // page cache survived, which holds every record write whether synced or
+  // not. Under `auto` a slow sync (5 s) remains to find a background
+  // writeback error of the table during the run, rather than only at the
+  // next sync of a stop or a restart. Clean stops and extent rebinds sync
+  // the table themselves. DFKV_SLAB_TABLE_SYNC_MS still sets it explicitly.
+  uint32_t sync_ms = slab_warm == SlabWarmRestart::kBootOnly ? 100
+                     : slab_warm == SlabWarmRestart::kAuto  ? 5000
+                                                            : 0;
   if (const char* value = std::getenv("DFKV_SLAB_TABLE_SYNC_MS")) {
     if (!ParseUnsigned(value, std::numeric_limits<uint32_t>::max(), &parsed)) {
       if (use_slab) {

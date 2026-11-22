@@ -255,7 +255,7 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_retain_pending_entries` | gauge | 当前挂起、等值落盘的 SET 数。值落盘、被丢弃或被删除时移出；上限 2^20，满后对只在 RAM 的值的 SET 一律 `kDenied` |
 | `dfkv_slab_put_no_slot_total` | counter | 盘层因分配不到槽而以 `kCacheFull` 拒绝的写入：既有客户端 PUT，也有 RAM 层向盘刷写的每一次尝试（重试各算一次）。分配不到槽指该 size class 的槽全部被在途读写 pin 住或被留存（`DFKV_RETAIN_*`）保护，也没有可以挪用的 extent；分配器极少见的索引插入失败也计入这里。节点是健康的，客户端把被拒的 PUT 算作未存、不冷却节点；2.38 及更早版本这里返回 `kIOError`，会被客户端当成节点故障。持续升高说明留存预算或并发占满了某个 size class |
 | `dfkv_slab_dio_write_fallback_total` / `dfkv_slab_dio_read_fallback_total` | counter | direct 模式下回退 buffered 的写/读——**非零升高 = page cache 悄悄回来了**（对齐条件被破坏），direct 部署重点盯 |
-| `dfkv_slab_table_sync_total` | counter | slots.tbl fdatasync 周期数（`DFKV_SLAB_TABLE_SYNC_MS`，默认 100ms；限定崩溃复活毒化窗口） |
+| `dfkv_slab_table_sync_total` | counter | slots.tbl 的周期同步与关闭时同步次数（`DFKV_SLAB_TABLE_SYNC_MS`；默认 `boot` 下 100 ms、`auto` 下 5 s 一次，`off` 下只在关闭时同步，所以 `off` 运行期为 0 是正常的） |
 | `dfkv_slab_extent_steals_total` / `dfkv_slab_extent_returns_total` | counter | 跨 class extent 抢占（伴随驱逐，容量失衡信号）/ 全空 extent 主动回池（无损再平衡） |
 | `dfkv_slab_cold_steals_total` | counter | 命中"全局最冷 extent"护栏的跨 class 抢占（donor 全部内容都冷于 `DFKV_SLAB_COLD_STEAL_WINDOW` 窗口才走此路，满环自噬护栏；0=窗口关闭） |
 | `dfkv_slab_watermark_evictions_total` / `dfkv_slab_watermark_slot_removals_total` | counter | 全局水位回收移除的对象数，包含最后一个 resident 经整 extent 回调清除的对象；不再以 extent 为单位 |
