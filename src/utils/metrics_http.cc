@@ -157,7 +157,12 @@ size_t MetricsHttpServer::live_conn_count() {
 void MetricsHttpServer::AcceptLoop() {
   while (running_) {
     int fd = ::accept(listen_fd_, nullptr, nullptr);
-    if (fd < 0) { if (!running_) break; continue; }
+    if (fd < 0) {
+      const int err = errno;
+      if (!running_) break;
+      accept_guard_.OnAcceptError(err, running_);
+      continue;
+    }
     // First-request deadline anchors at ACCEPT time (DFKV_METRICS_FIRST_REQ_MS).
     const auto accepted_at = std::chrono::steady_clock::now();
     // A scrape is one short request/response; a silent peer must not pin the
@@ -179,17 +184,25 @@ void MetricsHttpServer::AcceptLoop() {
     // the handler thread's -1 below pairs it on every exit path (clean EOF,
     // recv error, deadline expiry, shutdown) with no double-count.
     active_connections_.fetch_add(1, std::memory_order_relaxed);
-    conn_fds_.insert(fd);
     auto done = std::make_shared<std::atomic<bool>>(false);
-    conns_.push_back({std::thread([this, fd, done, accepted_at] {
-                        NameThisThread("met-conn");
-                        Handle(fd, accepted_at);
-                        active_connections_.fetch_sub(1, std::memory_order_relaxed);
-                        { std::lock_guard<std::mutex> lk(conn_mu_); conn_fds_.erase(fd); }
-                        ::close(fd);
-                        done->store(true, std::memory_order_release);  // last act
-                      }),
-                      done});
+    std::thread handling;
+    if (!net::StartThread(&handling, [this, fd, done, accepted_at] {
+          NameThisThread("met-conn");
+          Handle(fd, accepted_at);
+          active_connections_.fetch_sub(1, std::memory_order_relaxed);
+          // Taken only after the accept loop, which holds conn_mu_ across the
+          // thread start, has recorded this fd.
+          { std::lock_guard<std::mutex> lk(conn_mu_); conn_fds_.erase(fd); }
+          ::close(fd);
+          done->store(true, std::memory_order_release);  // last act
+        })) {
+      active_connections_.fetch_sub(1, std::memory_order_relaxed);
+      accept_guard_.OnThreadStartFailure();
+      ::close(fd);
+      continue;
+    }
+    conn_fds_.insert(fd);
+    conns_.push_back({std::move(handling), done});
   }
 }
 

@@ -127,6 +127,8 @@ dfkvctl stat <ip:port>                        # 单节点原始 /metrics 文本�
 | `dfkv_tcp_max_connections` / `dfkv_tcp_io_timeout_seconds` | gauge | cache TCP handler 硬准入上限 / socket I/O 超时的 resolved 配置 |
 | `dfkv_tcp_first_req_ms` | gauge | 首帧 absolute deadline 的 resolved 配置（`DFKV_TCP_FIRST_REQ_MS`，默认 30000，0=关；防 drip 连接占 handler 槽位） |
 | `dfkv_tcp_rejected_connections_total` | counter | 达 handler 上限后拒绝的新 TCP 连接；增长表示 silent/flood 或连接池规模超过预算 |
+| `dfkv_tcp_accept_failures_total` | counter | cache TCP 监听 `accept()` 因 fd 或内存耗尽（EMFILE/ENFILE/ENOBUFS/ENOMEM 等非单连接错误）失败的次数；每次失败后退避 100 ms 再试。增长 = 进程 fd 上限或主机内存不足 |
+| `dfkv_tcp_thread_start_failures_total` | counter | 因 handler 线程创建失败而拒绝的 cache TCP 连接（进程继续运行）。增长 = 触到线程数上限（systemd `TasksMax`、cgroup `pids.max`）或内存不足 |
 | `dfkv_mds_registration_latched{group,node}` | gauge | server 首次 MDS 注册是否完成；成功后保持 1 |
 | `dfkv_mds_first_registration_timeout_ms{group,node}` | gauge | 首次注册 deadline 的 resolved 值；cache daemon 默认 60000，合法配置范围 1000–600000 |
 | `dfkv_mds_first_registration_timed_out{group,node}` | gauge | deadline 是否已到期；到期后进程立即进入 fail-closed shutdown 并退出 1 |

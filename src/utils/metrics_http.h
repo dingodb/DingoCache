@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "common/status.h"
+#include "utils/accept_guard.h"
 
 namespace dfkv {
 
@@ -62,6 +63,16 @@ class MetricsHttpServer {
   size_t DroppedConnections() const {
     return dropped_connections_.load(std::memory_order_relaxed);
   }
+  // accept() failures that made the listener back off, and connections
+  // refused because their handler thread could not be created. Logged, not
+  // exported: running out of descriptors or threads is a condition of the
+  // whole process, and the data listeners of the same process already export
+  // it (dfkv_tcp_accept_failures_total, dfkv_mds_accept_failures_total and
+  // the thread-start counters next to them).
+  uint64_t AcceptFailures() const { return accept_guard_.accept_failures(); }
+  uint64_t ThreadStartFailures() const {
+    return accept_guard_.thread_start_failures();
+  }
 
  private:
   void AcceptLoop();
@@ -97,6 +108,7 @@ class MetricsHttpServer {
   int port_ = 0;
   std::atomic<bool> running_{false};
   std::thread accept_thread_;
+  net::AcceptGuard accept_guard_{"metrics listener"};
   std::mutex conn_mu_;
   std::set<int> conn_fds_;
   std::vector<Conn> conns_;

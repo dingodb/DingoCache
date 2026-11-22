@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Server and MDS: the two remaining accept loops, the cache TCP listener of
+  `dfkv_server` and the metrics HTTP listener of `dfkv_server` and `dfkv_mds`,
+  get the same protection as the RDMA bootstrap and MDS listeners. A
+  connection whose handler thread cannot be created is closed and counted
+  instead of the exception ending the process; `accept()` failing for lack of
+  descriptors or memory is counted, logged at a bounded rate and retried after
+  100 ms instead of at once, which used to pin a core for as long as the
+  shortage lasted. Stopping is not delayed by the wait. New metrics:
+  `dfkv_tcp_accept_failures_total`, `dfkv_tcp_thread_start_failures_total`.
+  The metrics listener reports the same two events in the log only (WARN
+  lines starting `metrics listener:`). Connection limits, timeouts, the wire
+  protocol and existing metrics are unchanged.
 - Client, host and GPU dedup (`DFKV_CLIENT_NODE_DEDUP=1`): two ways a lookup
   could be answered from shared memory with bytes it should not have got.
   Both need an unusual interleaving.

@@ -615,6 +615,14 @@ std::string KvNodeServer::MetricsText() const {
   metric("dfkv_tcp_rejected_connections_total", "counter",
          "Cache TCP connections rejected at the handler admission limit",
          rd(tcp_rejected_connections_));
+  metric("dfkv_tcp_accept_failures_total", "counter",
+         "accept() failures from descriptor or memory exhaustion; the cache "
+         "TCP listener backed off after each",
+         TcpAcceptFailures());
+  metric("dfkv_tcp_thread_start_failures_total", "counter",
+         "Cache TCP connections refused because their handler thread could "
+         "not be created",
+         TcpThreadStartFailures());
   // errors by op+status (one HELP/TYPE, multiple labeled series)
   s += "# HELP dfkv_errors_total Failed ops by op and status\n";
   s += "# TYPE dfkv_errors_total counter\n";
@@ -984,7 +992,12 @@ std::string KvNodeServer::FullMetricsText() const {
 void KvNodeServer::AcceptLoop() {
   while (running_) {
     int fd = ::accept(listen_fd_, nullptr, nullptr);
-    if (fd < 0) { if (!running_) break; continue; }
+    if (fd < 0) {
+      const int err = errno;
+      if (!running_) break;
+      accept_guard_.OnAcceptError(err, running_);
+      continue;
+    }
     // The first-frame deadline is anchored at ACCEPT time: queuing delay
     // (handler-thread spawn) counts against the peer's budget, not ours.
     const auto accepted_at = std::chrono::steady_clock::now();
@@ -1003,17 +1016,25 @@ void KvNodeServer::AcceptLoop() {
       continue;
     }
     open_connections_.fetch_add(1, std::memory_order_relaxed);
-    conn_fds_.insert(fd);
     auto done = std::make_shared<std::atomic<bool>>(false);
-    conns_.push_back({std::thread([this, fd, done, accepted_at] {
-                        NameThisThread("kv-serve");
-                        Handle(fd, accepted_at);
-                        open_connections_.fetch_sub(1, std::memory_order_relaxed);
-                        { std::lock_guard<std::mutex> lk(conn_mu_); conn_fds_.erase(fd); }
-                        ::close(fd);
-                        done->store(true, std::memory_order_release);  // last act
-                      }),
-                      done});
+    std::thread handling;
+    if (!net::StartThread(&handling, [this, fd, done, accepted_at] {
+          NameThisThread("kv-serve");
+          Handle(fd, accepted_at);
+          open_connections_.fetch_sub(1, std::memory_order_relaxed);
+          // Taken only after the accept loop, which holds conn_mu_ across the
+          // thread start, has recorded this fd.
+          { std::lock_guard<std::mutex> lk(conn_mu_); conn_fds_.erase(fd); }
+          ::close(fd);
+          done->store(true, std::memory_order_release);  // last act
+        })) {
+      open_connections_.fetch_sub(1, std::memory_order_relaxed);
+      accept_guard_.OnThreadStartFailure();
+      ::close(fd);
+      continue;
+    }
+    conn_fds_.insert(fd);
+    conns_.push_back({std::move(handling), done});
   }
 }
 

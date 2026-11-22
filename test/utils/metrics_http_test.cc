@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -15,7 +16,10 @@
 #include <string>
 #include <thread>
 
+#include "utils/accept_guard.h"
 #include "utils/net_util.h"
+
+#include "../utils/fd_exhaustion.h"
 
 using namespace dfkv;  // NOLINT
 
@@ -465,5 +469,98 @@ TEST(MetricsHttp, StorageHealthDynamicallyRemovesReadiness) {
 
   storage_healthy.store(true);
   EXPECT_NE(HttpGet(srv.port(), "/readyz").find("200"), std::string::npos);
+  srv.Stop();
+}
+
+// With no descriptor left accept() fails at once, every time, while the peer
+// stays queued. The listener has to wait between attempts instead of spinning,
+// serve the queued peer once descriptors are back, and still stop promptly.
+TEST(MetricsHttp, DescriptorExhaustionBacksOffAndRecovers) {
+  const int result = testing_fd::RunInChild([] {
+    MetricsHttpServer srv([] { return std::string("dfkv_x 1\n"); });
+    if (srv.Start(0) != Status::kOk) return 10;
+    // No scrape before the exhaustion: its handler would close its descriptor
+    // at some later point and free one behind the test's back.
+
+    // socket() needs a descriptor, so open them before taking the rest away.
+    const int queued = ::socket(AF_INET, SOCK_STREAM, 0);
+    const int later = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (queued < 0 || later < 0) return 12;
+    const int free_before_accept = testing_fd::LowestFreeDescriptor();
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(static_cast<uint16_t>(srv.port()));
+
+    testing_fd::NoFreeDescriptors exhausted;
+    if (!exhausted.active()) return 13;
+    if (::connect(queued, reinterpret_cast<sockaddr*>(&address),
+                  sizeof(address)) != 0)
+      return 14;
+
+    const double cpu_before = testing_fd::ProcessCpuSeconds();
+    const auto wall_before = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const double cpu_used = testing_fd::ProcessCpuSeconds() - cpu_before;
+    const uint64_t failures = srv.AcceptFailures();
+    if (failures == 0) return 15;  // the failure was not seen or not counted
+    // One attempt per backoff, however long this thread actually slept.
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - wall_before)
+            .count();
+    if (failures > static_cast<uint64_t>(elapsed_ms) /
+                           net::AcceptGuard::kBackoffMs + 2)
+      return 16;  // retried without waiting
+    if (cpu_used > 0.2) return 17;  // spun instead of sleeping
+
+    exhausted.Restore();
+    // The queued peer is served once a descriptor is free again.
+    const std::string request = "GET /metrics HTTP/1.0\r\n\r\n";
+    if (!net::WriteAll(queued, request.data(), request.size())) return 18;
+    if (ReadResponse(queued).response.find("dfkv_x 1") == std::string::npos)
+      return 19;
+    // The handler closes its descriptor some time after the client has its
+    // response, and after the active-connection gauge has dropped. Wait for
+    // the descriptor itself before counting free descriptors again.
+    if (!WaitFor(
+            [&] {
+              return testing_fd::LowestFreeDescriptor() == free_before_accept;
+            },
+            3000))
+      return 19;
+
+    // Stopping while the loop is backing off must not wait out anything long.
+    testing_fd::NoFreeDescriptors exhausted_again;
+    if (!exhausted_again.active()) return 20;
+    if (::connect(later, reinterpret_cast<sockaddr*>(&address),
+                  sizeof(address)) != 0)
+      return 21;
+    if (!WaitFor([&] { return srv.AcceptFailures() > failures; }, 3000)) return 22;
+    const auto stop_started = std::chrono::steady_clock::now();
+    srv.Stop();
+    if (std::chrono::steady_clock::now() - stop_started >
+        std::chrono::seconds(2))
+      return 23;
+    return 0;
+  });
+  EXPECT_EQ(result, 0) << "step code from the child, see the test body";
+}
+
+TEST(MetricsHttp, ThreadThatCannotStartRefusesOnlyThatConnection) {
+  MetricsHttpServer srv([] { return std::string("dfkv_x 1\n"); });
+  ASSERT_EQ(srv.Start(0), Status::kOk);
+
+  net::g_fail_thread_starts_for_test.store(1);
+  EXPECT_EQ(HttpGet(srv.port(), "/metrics"), "")
+      << "the connection without a thread is closed";
+  net::g_fail_thread_starts_for_test.store(0);
+  EXPECT_EQ(srv.ThreadStartFailures(), 1u);
+  EXPECT_EQ(srv.ActiveConnections(), 0u)
+      << "the refused connection is not left counted as active";
+
+  EXPECT_NE(HttpGet(srv.port(), "/metrics").find("dfkv_x 1"),
+            std::string::npos)
+      << "the listener keeps serving";
   srv.Stop();
 }
