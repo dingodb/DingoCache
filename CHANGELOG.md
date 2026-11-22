@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+- Server and MDS: the accept loops of the RDMA bootstrap listener
+  (`dfkv_server`) and of `dfkv_mds` no longer take the process down or spin
+  when the host runs short of threads or file descriptors.
+  - A connection whose thread cannot be created is refused and counted. In
+    `dfkv_server` this used to be an uncaught exception from the accept
+    thread, which ended the process and with it the RAM tier contents.
+  - `accept()` failing for lack of descriptors or memory (`EMFILE`, `ENFILE`,
+    `ENOBUFS`, `ENOMEM`, or any error that is not about the one connection) is
+    counted, logged at a bounded rate, and retried after 100 ms. It used to be
+    retried at once, which pinned a core for as long as the shortage lasted.
+    Errors of a single connection (`ECONNABORTED`, `EINTR`, ...) are retried
+    at once as before. Stopping the process is not delayed by the wait.
+  - RDMA bootstrap: the peer's two bootstrap frames must arrive within 10 s
+    of `accept()`. The 10 s used to apply to each `recv` separately, so a
+    peer sending a byte at a time could hold a thread for minutes. A client
+    sends both frames once it has created its queue pair, which comes after
+    its `connect()`; that has to fit in the 10 s, as it already had to fit in
+    the client's own bootstrap timeout.
+  - RDMA bootstrap: at most `DFKV_RDMA_MAX_PENDING_HANDSHAKES` connections
+    (default 4096, `0` = unlimited) may be waiting to deliver those frames;
+    further ones are closed without a thread and counted. Established RDMA
+    connections do not count and are not limited by this. A client holds a
+    slot from `accept()` until its frames arrive, which includes the time it
+    takes to create its queue pair, so when many clients reconnect at once
+    (after a server restart, for example) the number pending is roughly the
+    accept rate times that time. A refused client sees a failed bootstrap and
+    retries. The limit is there for peers that connect and send nothing (port
+    scans, health checkers that only connect, stuck peers);
+    `dfkv_rdma_rejected_connections_total` growing during a mass reconnect
+    means the limit is too low for the deployment and should be raised.
+  - `dfkv_mds` fits `DFKV_MDS_MAX_CONNS` to the open-file limit at startup.
+    Serving N connections takes up to `2N + 128` descriptors (each handler
+    also dials etcd), 8320 for the default 4096, while a service usually
+    starts with a soft limit of 1024. The MDS now raises its soft limit as far
+    as the hard limit allows and, if that is still short, lowers the
+    connection cap to what fits and says so in a WARN line. Before, the cap
+    could not be reached: descriptors ran out first, and then the listener
+    and the MDS's own etcd requests failed together. The sample unit in
+    `docs/DEPLOY.md` now sets `LimitNOFILE=65536`.
+  - New metrics: `dfkv_rdma_pending_handshakes`,
+    `dfkv_rdma_rejected_connections_total`, `dfkv_rdma_accept_failures_total`,
+    `dfkv_rdma_thread_start_failures_total`, `dfkv_mds_max_conns`,
+    `dfkv_mds_accept_failures_total`, `dfkv_mds_thread_start_failures_total`.
+  The wire protocol and existing metrics are unchanged. The TCP data listener
+  and the metrics HTTP listener are not changed by this entry.
 - Client, host dedup (`DFKV_CLIENT_NODE_DEDUP=1`): a lookup that another
   process on the host is fetching no longer waits out
   `DFKV_NODE_DEDUP_WAIT_MS` (default 500 ms) when that process has nothing

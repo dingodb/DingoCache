@@ -10,6 +10,7 @@
 #define DFKV_RDMA_SERVER_H_
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <condition_variable>
 #include <cstdint>
@@ -34,6 +35,7 @@
 #include "transport/rdma_verbs.h"  // rdma::RcEndpoint
 #include "transport/rdma_topology.h"
 #include "transport/rdma_wc_status.h"
+#include "utils/accept_guard.h"
 
 namespace dfkv {
 class RdmaServerTestPeer;
@@ -152,6 +154,20 @@ class RdmaServer {
     return uring_init_fallbacks_.load(std::memory_order_relaxed);
   }
   uint64_t V2Conns() const { return v2_conns_.load(std::memory_order_relaxed); }
+  // Bootstrap listener: connections that have not delivered their bootstrap
+  // frames yet, connections refused at DFKV_RDMA_MAX_PENDING_HANDSHAKES,
+  // accept() failures that made the listener back off, and connections
+  // refused because their thread could not be created.
+  uint64_t PendingHandshakes() const {
+    return pending_handshakes_.load(std::memory_order_relaxed);
+  }
+  uint64_t RejectedConnections() const {
+    return rejected_connections_.load(std::memory_order_relaxed);
+  }
+  uint64_t AcceptFailures() const { return accept_guard_.accept_failures(); }
+  uint64_t ThreadStartFailures() const {
+    return accept_guard_.thread_start_failures();
+  }
   uint64_t V2PutWrites() const {
     return v2_put_writes_.load(std::memory_order_relaxed);
   }
@@ -168,7 +184,12 @@ class RdmaServer {
 
  private:
   void AcceptLoop();
-  void Serve(int boot_fd);
+  // `bootstrap_deadline` bounds the whole read of the peer's bootstrap frames.
+  // `pending`, when set, was incremented by the caller for this connection and
+  // is decremented as soon as those frames are in (or the connection is dropped).
+  void Serve(int boot_fd,
+             std::chrono::steady_clock::time_point bootstrap_deadline,
+             std::atomic<uint64_t>* pending = nullptr);
   void ReapDoneLocked();  // join+erase finished Serve threads; conn_mu_ held
   rdma::RecvSegmentPool::Lease AllocateReceiveWithPressure(
       size_t bytes, int rail, int numa_node, uint64_t wait_us,
@@ -219,6 +240,21 @@ class RdmaServer {
   int port_ = 0;
   std::atomic<bool> running_{false};
   std::thread accept_thread_;
+  net::AcceptGuard accept_guard_{"rdma bootstrap listener"};
+  // A peer must deliver its bootstrap frames within this budget, counted from
+  // accept(). A client connects, creates its queue pair and only then writes
+  // them, so the budget covers the client's queue pair creation too.
+  static constexpr int kBootstrapReadMs = 10000;
+  int bootstrap_read_ms_ = kBootstrapReadMs;  // tests shorten it
+  // Connections accepted whose bootstrap frames have not arrived: the only
+  // phase in which a peer that sends nothing holds a thread. A real client
+  // is in it while it creates its queue pair, so a mass reconnect holds about
+  // (accept rate x that time) slots; the limit has to stay well above that
+  // and only needs to bound silent peers. 0 = unlimited.
+  static constexpr uint64_t kDefaultMaxPendingHandshakes = 4096;
+  uint64_t max_pending_handshakes_ = kDefaultMaxPendingHandshakes;
+  std::atomic<uint64_t> pending_handshakes_{0};
+  std::atomic<uint64_t> rejected_connections_{0};
   std::thread recv_trim_thread_;
   std::mutex recv_trim_mu_;
   std::condition_variable recv_trim_cv_;
