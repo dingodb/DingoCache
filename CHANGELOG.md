@@ -3,6 +3,19 @@
 ## Unreleased
 
 
+- vLLM connector: two settings that reorder an object's bytes without
+  changing its length are now part of the namespace. Under DCP or PCP,
+  `cp_kv_cache_interleave_size` decides which tokens each rank's block
+  holds (`i` tokens on one rank, the next `i` on the next); with
+  `enable_cross_layers_blocks` on vLLM up to 0.26 hands the connector one
+  tensor in its own layer order, where per-layer registration concatenates
+  layers by name (`layers.10` before `layers.2`). Deployments differing in
+  either shared keys, the exact length check passed, and a hit put the bytes
+  in the wrong places. Each is bound only when it differs from the default
+  (interleave 1, no cross-layer blocks): a deployment with the defaults
+  keeps its keys; one with another interleave size under CP, or with
+  cross-layer blocks, starts cold once.
+
 - LMCache connector (in-process `RemoteConnector`), models with several KV
   layer groups: a GET buffer now holds every group. LMCache describes such a
   chunk with one shape per group and PUTs all of them; the connector

@@ -298,6 +298,13 @@ dual write, alias, or cleanup of existing objects. Roll Python producers and
 consumers together and expect a cold external cache. The native C ABI and
 server protocol are unchanged.
 
+Two settings reorder an object's bytes without changing its length, and are
+bound too, each only when it differs from the default (so a default
+deployment keeps its keys): `cp_kv_cache_interleave_size` other than 1 under
+DCP/PCP (it decides which tokens a rank's block holds), and
+`enable_cross_layers_blocks` (on vLLM up to 0.26 the cross-layer tensor is in
+the engine's layer order, per-layer registration in layer-name order).
+
 SAVE persists only stable context, excluding the volatile speculative tail.
 LOOKUP checks the actual objects required by the shorter candidate boundary;
 LOAD restores every group needed at that admitted boundary. Missing required

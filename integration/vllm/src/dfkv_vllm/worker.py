@@ -202,6 +202,39 @@ def _cache_group_layout(groups: Sequence[KVCacheGroupSpec]) -> str:
     )
 
 
+def _byte_order_layout_fields(
+    parallel_config,
+    extra_config: Any,
+    *,
+    dcp_size: int,
+    pcp_size: int,
+) -> dict[str, object]:
+    """Namespace fields for two settings that reorder an object's bytes
+    without changing its length.
+
+    * ``cp_kv_cache_interleave_size``: under DCP/PCP it decides which tokens
+      a rank's block holds (``i`` tokens on rank r, the next ``i`` on r+1).
+    * ``enable_cross_layers_blocks``: vLLM up to 0.26 then hands one tensor
+      in its own layer order; per-layer registration concatenates layers in
+      layer-name order (``layers.10`` before ``layers.2``).
+
+    Each appears only when it changes the bytes from what the default
+    gives, so a namespace with the defaults is the one it always was.
+    """
+    fields: dict[str, object] = {}
+    # cp_kv_cache_interleave_size replaced dcp_kv_cache_interleave_size;
+    # an engine that has only the older name configures it there.
+    interleave = getattr(parallel_config, "cp_kv_cache_interleave_size", None)
+    if interleave is None:
+        interleave = getattr(parallel_config, "dcp_kv_cache_interleave_size", None)
+    interleave = int(interleave or 1)
+    if (dcp_size > 1 or pcp_size > 1) and interleave != 1:
+        fields["cp_kv_cache_interleave_size"] = interleave
+    if str(extra_config.get("enable_cross_layers_blocks", "False")).lower() == "true":
+        fields["cross_layer_blocks"] = True
+    return fields
+
+
 def _key_stripe_identity(
     *,
     tp_rank: int,
@@ -2190,6 +2223,12 @@ class DfkvStoreWorker:
                 "dcp_size": self.dcp_size,
                 "group_layout": _group_layout,
                 "kv_cache_layout": getattr(kv_cache_config, "kv_cache_layout", None),
+                **_byte_order_layout_fields(
+                    parallel_config,
+                    extra,
+                    dcp_size=self.dcp_size,
+                    pcp_size=self.pcp_size,
+                ),
             },
         )
         # Same-host rendezvous defaults on only for replicated MLA topology:
