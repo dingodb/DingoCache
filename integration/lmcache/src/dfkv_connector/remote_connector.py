@@ -123,6 +123,7 @@ class DfkvConnector(RemoteConnector):
         rail_affinity_fallbacks: int = 1,
     ) -> None:
         with access_log("__init__", lambda: f"url={url}") as r:
+            self._check_supported_config(local_cpu_backend.config)
             super().__init__(local_cpu_backend.config, local_cpu_backend.metadata)
 
             endpoint = parse_dfkv_url(url, membership=membership)
@@ -294,6 +295,24 @@ class DfkvConnector(RemoteConnector):
         return ttl
 
     @staticmethod
+    def _check_supported_config(config) -> None:
+        """Refuse what the connector cannot store correctly. It stores and
+        reads back raw full chunks (or unfull chunks of one layer group):
+        nothing records a serialized object's real shape, and layerwise
+        objects are not chunks (LMCache's own RemoteConnector base does not
+        support layerwise either)."""
+        if getattr(config, "use_layerwise", False):
+            raise ValueError(
+                "dfkv RemoteConnector does not support use_layerwise=True"
+            )
+        serde = getattr(config, "remote_serde", None)
+        if serde not in (None, "naive"):
+            raise ValueError(
+                f"dfkv RemoteConnector supports remote_serde='naive' only, "
+                f"got {serde!r}"
+            )
+
+    @staticmethod
     def _resolve_bool_env(env_name: str) -> bool:
         return os.environ.get(env_name, "0").lower() in ("1", "true", "yes", "on")
 
@@ -304,6 +323,15 @@ class DfkvConnector(RemoteConnector):
         as a safe miss rather than raised."""
         if nbytes == self.full_chunk_size_bytes:
             return memory_obj
+        if len(self.meta_shapes) > 1:
+            # LMCache's reshape of an unfull chunk sets a single shape; it
+            # cannot describe several layer groups, and the bytes would be
+            # read as group 0. A miss instead.
+            logger.debug(
+                "discarding unfull chunk (%d of %d bytes) of %d layer groups",
+                nbytes, self.full_chunk_size_bytes, len(self.meta_shapes),
+            )
+            return None
         try:
             return self.reshape_partial_chunk(memory_obj, nbytes)
         except Exception as e:
@@ -749,9 +777,11 @@ class DfkvConnector(RemoteConnector):
     # ------------------------------------------------------------------
 
     def _allocate_chunk(self) -> Optional[MemoryObj]:
+        # Every KV layer group's shape: a PUT stores all groups' bytes, so a
+        # buffer of group 0 alone is too small for the stored chunk.
         return self._local_cpu_backend.allocate(
-            self.meta_shapes[0],
-            self.meta_dtypes[0],
+            self.meta_shapes,
+            self.meta_dtypes,
             self.meta_fmt,
         )
 

@@ -197,6 +197,10 @@ paths, and for a native call that fails.
 
 ## Limitations
 
+- The in-process `RemoteConnector` stores raw chunks: `remote_serde` must be
+  `naive` (the default) and `use_layerwise` false; other settings are refused
+  at startup. For a model with several KV layer groups, full chunks are stored
+  and loaded with every group; an unfull chunk of several groups is a miss.
 - Two integration paths, pick by LMCache mode: the in-process
   `remote_storage_plugin` path (`adapter.py`, `RemoteConnector`) for the legacy
   in-process connector, and the **MP-server L2-adapter path** (`l2_adapter.py`,
