@@ -203,6 +203,7 @@ RDMA-listener scrape inventory。
 | `dfkv_rdma_accept_failures_total` | counter | bootstrap 监听 `accept()` 因 fd 或内存耗尽（EMFILE/ENFILE/ENOBUFS/ENOMEM 等非单连接错误）失败的次数；每次失败后退避 100 ms 再试。增长 = 进程 fd 上限或主机内存不足 |
 | `dfkv_rdma_thread_start_failures_total` | counter | 因线程创建失败而拒绝的 bootstrap 连接（进程继续运行）。增长 = 触到线程数上限（systemd `TasksMax`、cgroup `pids.max`）或内存不足 |
 | `dfkv_rdma_v2_put_writes_total` | counter | server 实际收到的 `WRITE_WITH_IMM` PUT |
+| `dfkv_rdma_leaseput_oversize_rejects_total` | counter | 对象大于 `--max-msg` 而被答 `kInvalid` 的 leased PUT（client 的 `DFKV_RDMA_MAX_BLOCK_BYTES` 高于 server 上限）。增长时调大 `--max-msg` 或调小 client 上限 |
 | `dfkv_rdma_recv_segment_bytes` / `max_bytes` / `chunks` | gauge | receive-pool 当前提交量 / hard budget / 已提交 chunk 数 |
 | `dfkv_rdma_recv_segment_used_bytes` / `free_bytes` | gauge | 已提交 chunk 中所有 lease 占用 / 全部空闲字节，**含 staging 专用 chunk**；后者不等于连接可分配字节 |
 | `dfkv_rdma_recv_segment_largest_free_range_bytes` | gauge | 任一 chunk 最大连续 free range，含 staging 专用 chunk |

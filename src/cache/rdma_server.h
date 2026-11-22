@@ -299,6 +299,7 @@ class RdmaServer {
   std::atomic<uint64_t> lease_put_ops_{0};
   std::atomic<uint64_t> lease_put_bytes_{0};
   std::atomic<uint64_t> lease_put_busy_rejects_{0};
+  std::atomic<uint64_t> lease_put_oversize_rejects_{0};
   std::atomic<uint64_t> lease_put_active_{0};
   std::atomic<uint64_t> lease_put_bytes_active_{0};
   std::atomic<uint64_t> dynamic_get_active_{0};

@@ -298,7 +298,21 @@ WantedBy=multi-user.target
 > **`--max-msg` 默认 32 MiB，是 server 接受的逻辑 block 上限；client
 > `DFKV_RDMA_MAX_BLOCK_BYTES` 不得超过它。** client 每次 data Acquire 按当前
 > operation 最大对象选择 power-of-two connection class；逻辑上限不再决定所有
-> QP 的物理 slot。server 小于 client 逻辑声明仍会拒绝连接，避免超限对象被误收。
+> QP 的物理 slot。server 小于 client 逻辑声明仍会拒绝连接，避免超限对象被误收：
+> 凡是按对象大小声明连接的路径都是如此，即 inline 阈值
+> （`DFKV_RDMA_INLINE_PUT_MAX_BYTES`，默认 4 MiB）设为 0 或不低于 `--max-msg` 时，
+> 以及一次操作失败后用新连接重试时（重试不申请 leased PUT）；TCP 路径上 server 对
+> 超限请求直接断开连接，client 冷却这个节点。
+>
+> 只有 RDMA 的 leased 路径不同：在默认 inline 阈值下，超过阈值的 PUT 走 leased
+> 路径，连接的 class 不超过阈值，所以 client 上限高于 server 的 `--max-msg` 时连接
+> 照常建立，超限的对象由 server 逐个答 `kInvalid`（计入
+> `dfkv_rdma_leaseput_oversize_rejects_total`，首次和每 1024 次记一条带对端地址的
+> WARN），client 当作未缓存，不冷却节点。2.42.0 及更早的 server 收到这样的请求会
+> 直接断开连接而不回复，client 等满 `DFKV_RDMA_OP_TIMEOUT_MS`（设了
+> `DFKV_RDMA_BATCH_OP_TIMEOUT_MS` 的批量操作则是它；默认 5 s）后记 completion
+> timeout 并冷却这个节点。所以无论哪个版本，client 的上限都应不高于 server 的
+> `--max-msg`。
 >
 > Completion timeout：`DFKV_RDMA_OP_TIMEOUT_MS`（默认 5000）约束单操作；
 > `DFKV_RDMA_BATCH_OP_TIMEOUT_MS`（unset/0 = 跟随前者）覆盖 **所有** multi-item
