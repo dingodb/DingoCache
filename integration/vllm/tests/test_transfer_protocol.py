@@ -126,6 +126,7 @@ def dfkv_child(*requests):
     from dfkv_vllm.scheduler import DfkvStoreScheduler
 
     state = object.__new__(DfkvStoreScheduler)
+    state._kv_events = False  # as __init__ without KV events
     state._retention = {}
     state.request_level_loads = True
     state._unfinished_request_ids = {req.request_id for req in requests}

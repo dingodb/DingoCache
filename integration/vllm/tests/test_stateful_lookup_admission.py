@@ -82,6 +82,7 @@ def test_noallocation_prefill_saves_state_before_page_recycling(hybrid_workers, 
         mamba_shared_prefix_checkpoint=False,
     )
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._kv_events = False  # as __init__ without KV events
     scheduler._retention = {}
     for name, value in dict(
         kv_role="kv_producer", _block_size=BLOCK,
@@ -184,6 +185,8 @@ def test_noallocation_prefill_kv_events_carry_block_token_ids(hybrid_workers):
         block_hashes=_hashes(3),
     )
     scheduler = object.__new__(DfkvStoreScheduler)
+    # As __init__ with KV events: only then are token ids sent to the workers.
+    scheduler._kv_events = True
     scheduler._retention = {}
     for name, value in dict(
         kv_role="kv_producer", _block_size=BLOCK, client=MagicMock(),
@@ -278,6 +281,7 @@ def test_scheduler_attaches_the_engine_boundary_state_hand_off(offloads, expecte
     from dfkv_vllm.scheduler import DfkvStoreScheduler
 
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._kv_events = False  # as __init__ without KV events
     scheduler._retention = {}
     request = SimpleNamespace(request_id="r", block_hashes=_hashes(3))
     for name, value in dict(

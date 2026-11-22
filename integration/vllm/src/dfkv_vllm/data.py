@@ -523,6 +523,7 @@ class ReqMeta:
         block_hashes: list[BlockHash] | None = None,
         is_last_chunk: bool | None = None,
         num_prompt_tokens: int | None = None,
+        with_token_ids: bool = True,
     ) -> "ReqMeta | None":
         """Create ReqMeta from a RequestTracker.
 
@@ -558,8 +559,10 @@ class ReqMeta:
             tracker.num_saved_tokens = num_tokens_to_save
             tracker.partial_tail_sent |= publish_tail
 
+        # Only KV events read the token ids; without them the request's
+        # whole token list would be pickled to every worker every step.
         token_ids = None
-        if tracker.token_ids:
+        if with_token_ids and tracker.token_ids:
             token_ids = tracker.token_ids
 
         if load_spec is not None and load_spec.can_load:

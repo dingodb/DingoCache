@@ -10,6 +10,7 @@ from dfkv_vllm.transfer_protocol import LegacyReceiveFailures
 
 def test_new_request_metadata_uses_complete_allocated_block_table():
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._kv_events = False  # as __init__ without KV events
     scheduler._retention = {}
     scheduler._failed_load_req_ids = set()
     scheduler.kv_role = "kv_both"
@@ -54,6 +55,7 @@ def test_new_request_metadata_uses_complete_allocated_block_table():
 @pytest.mark.parametrize("role", ["kv_both", "kv_consumer"])
 def test_cached_prefill_progress_without_new_blocks(empty_delta, role):
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._kv_events = False  # as __init__ without KV events
     scheduler._retention = {}
     request = SimpleNamespace(
         request_id="chunked", all_token_ids=list(range(12)), block_hashes=[],
@@ -111,6 +113,7 @@ def test_cached_prefill_progress_without_new_blocks(empty_delta, role):
 
 def test_sampling_tail_does_not_authorize_an_absent_checkpoint():
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._kv_events = False  # as __init__ without KV events
     scheduler._retention = {}
     scheduler._failed_load_req_ids = set()
     scheduler.request_level_loads = False
@@ -138,6 +141,7 @@ def test_sampling_tail_does_not_authorize_an_absent_checkpoint():
 
 def test_cache_bypass_discards_stale_external_admission():
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._kv_events = False  # as __init__ without KV events
     scheduler._retention = {}
     scheduler._failed_load_req_ids = set()
     scheduler.request_level_loads = False
@@ -166,6 +170,7 @@ def test_consumer_cached_resume_emits_load_without_save(
     async_pending, same_step_preemption,
 ):
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._kv_events = False  # as __init__ without KV events
     scheduler._retention = {}
     scheduler._failed_load_req_ids = set()
     scheduler.request_level_loads = False
@@ -273,6 +278,7 @@ def test_consumer_cached_resume_emits_load_without_save(
 @pytest.mark.parametrize("async_pending", [False, True])
 def test_same_step_preemption_keeps_new_allocation_and_load(async_pending, cached_resume):
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._kv_events = False  # as __init__ without KV events
     scheduler._retention = {}
     scheduler._failed_load_req_ids = set()
     scheduler.kv_role = "kv_both"
@@ -405,6 +411,8 @@ def test_failed_load_bypasses_persistent_hit_and_rebuilds_computed_save(
     cached_resume, load_async, legacy,
 ):
     scheduler = object.__new__(DfkvStoreScheduler)
+    # As __init__ with KV events: the retry's token ids are checked below.
+    scheduler._kv_events = True
     scheduler._retention = {}
     scheduler.kv_role = "kv_both"
     scheduler.request_level_loads = True
@@ -511,6 +519,7 @@ def test_pending_load_requires_this_connector_to_own_the_load(can_load):
     """MultiConnector may give the load to another connector (can_load=False);
     this connector must then neither load nor save the request's blocks."""
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._kv_events = False  # as __init__ without KV events
     scheduler._retention = {}
     request = SimpleNamespace(request_id="remote", block_hashes=[])
     for name, value in dict(

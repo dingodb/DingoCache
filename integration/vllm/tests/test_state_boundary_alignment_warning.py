@@ -12,6 +12,7 @@ LCM = 2048
 
 def _scheduler():
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._kv_events = False  # as __init__ without KV events
     scheduler._block_size = LCM
     return scheduler
 
