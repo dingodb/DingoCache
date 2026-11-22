@@ -16,6 +16,18 @@
   call can no longer touch them: when it returns, or at once if it had not
   started. Nothing waits on the event loop for that. The uncancelled paths
   are unchanged.
+- LMCache connector (in-process): a stale "present" answer of the exists
+  cache no longer lasts for the life of the process. The cache remembered
+  every key it had stored or seen, with no expiry, and only an explicit
+  remove cleared an entry. After the server had evicted a chunk, every
+  request for that prefix was told it exists, failed to load it, recomputed
+  it and did not store it again, because LMCache's put path skips what
+  `contains` reports. Now a GET that misses (or returns an unusable length)
+  forgets the key at once, on the scalar and both batched paths, and an
+  entry expires 60 s after it was last confirmed by the server
+  (`DFKV_CONNECTOR_EXISTS_TTL_S`, `0` = no expiry), so a key that is never
+  read again is still re-checked. More `exists` calls reach the ring than
+  before: at most one per key per TTL.
 
 ## 2.39.0 — 2026-11-22
 
