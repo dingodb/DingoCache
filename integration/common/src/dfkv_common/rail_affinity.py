@@ -80,9 +80,16 @@ def apply_rank_local_rail_affinity(
         cfg.get("rail_affinity_fallbacks", 1), len(rails) - 1
     )
     primary_index = physical_rank % len(rails)
+    # Fallbacks are spread evenly over the rail list, not taken from the next
+    # rails: neighbouring rails are often two ports of one adapter, or share
+    # a switch, and fail together. A rank whose primary and adjacent fallback
+    # were both down on a server (or on its own host) had no rail in common
+    # with it and failed every operation there while other rails were
+    # healthy. With 8 rails and one fallback, rank r uses r and r+4.
     selected = tuple(
-        rails[(primary_index + offset) % len(rails)]
-        for offset in range(fallback_count + 1)
+        rails[(primary_index + k * len(rails) // (fallback_count + 1))
+              % len(rails)]
+        for k in range(fallback_count + 1)
     )
 
     environ["DFKV_RDMA_DEV"] = ",".join(selected)
