@@ -207,6 +207,30 @@ def _save_needs_step_fence(spec) -> bool:
     )
 
 
+def _warn_pipeline_lookup_scope(pp_size: int, kv_transfer_config: Any) -> bool:
+    """With pipeline parallelism the lookup sees one stage only: say so.
+
+    The scheduler's lookup runs on rank 0 and probes the objects of rank 0's
+    pipeline stage. The other stages' objects are in namespaces of their own
+    (each stage's cache groups list only its layers) and are not probed, so a
+    prefix whose objects another stage has lost is admitted and that stage's
+    LOAD fails. With kv_load_failure_policy="fail", vLLM's default, the
+    request then fails instead of recomputing. Returns whether it warned.
+    """
+    policy = getattr(kv_transfer_config, "kv_load_failure_policy", None)
+    if pp_size <= 1 or policy != "fail":
+        return False
+    logger.warning(
+        "dfkv: pipeline parallel size %d: the scheduler's lookup checks the "
+        "objects of the first pipeline stage only. If another stage has lost "
+        "its objects of a prefix, that stage's load fails, and with "
+        "kv_load_failure_policy=\"fail\" the request fails. Set "
+        "kv_load_failure_policy=\"recompute\" to recompute such prefixes.",
+        pp_size,
+    )
+    return True
+
+
 def _identity_dp_size(extra_config: Any, dp_size: int) -> int:
     """The data-parallel size the object identity carries.
 
@@ -2421,6 +2445,7 @@ class DfkvStoreWorker:
         self.lookup_server: LookupKeyServer | None = None
         if vllm_config.parallel_config.rank == 0:
             self.lookup_server = LookupKeyServer(self, vllm_config)
+            _warn_pipeline_lookup_scope(self.pp_size, vllm_config.kv_transfer_config)
 
         kv_event_config = vllm_config.kv_events_config
         self.enable_kv_events = False
