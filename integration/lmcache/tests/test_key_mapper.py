@@ -156,6 +156,26 @@ def test_layerwise_key_preserves_worker_rank():
     assert _decode_key(key)[4] == b"layer7"
 
 
+def test_request_tags_separate_keys_and_untagged_keys_are_unchanged():
+    # LMCache keys chunks of equal tokens under other lmcache.tag.* values
+    # apart; so must the ring, or one tag's request loads another's chunk.
+    untagged = _base_key(chunk_hash=0x300)
+    a = _base_key(chunk_hash=0x300)
+    a.tags = (("user", "a"),)
+    b = _base_key(chunk_hash=0x300)
+    b.tags = (("user", "b"),)
+    a_again = _base_key(chunk_hash=0x300)
+    a_again.tags = (("user", "a"),)
+    keys = [cache_engine_key_to_dfkv_key(k) for k in (untagged, a, b)]
+    assert len(set(keys)) == 3
+    assert cache_engine_key_to_dfkv_key(a) == cache_engine_key_to_dfkv_key(a_again)
+    assert _decode_key(keys[0])[4] == b"all"
+    assert _decode_key(keys[1])[4].startswith(b"all/tags-")
+    empty = _base_key(chunk_hash=0x300)
+    empty.tags = None
+    assert cache_engine_key_to_dfkv_key(empty) == keys[0]
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

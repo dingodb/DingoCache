@@ -3,6 +3,22 @@
 ## Unreleased
 
 
+- LMCache connector (in-process): protections the vLLM and SGLang
+  connectors had. Request tags (`lmcache.tag.*`) are now part of the
+  object key, as they are of LMCache's own key: chunks of equal tokens under
+  other tags were the same object, so a request loaded a chunk stored under
+  another tag (another user, or anything the tag stands for). Untagged keys
+  are unchanged; a deployment that already sends tags gets new keys for its
+  tagged requests (one cold start for those). A chunk larger than the RDMA
+  client's block bound is refused at startup instead of failing every PUT
+  (with a libdfkv that predates the bound query the check is skipped, with a
+  warning). A PUT that stored not every key is counted as a failed `put` in
+  the metrics (it was "ok"; only the access log, off by default, recorded
+  it). A warning, once per process, when `PYTHONHASHSEED` is unset: vLLM
+  then seeds the prefix hash chain at random and chunk keys change with
+  every engine start. Retention and a real liveness probe are still missing
+  and are documented as such.
+
 - vLLM connector, pipeline parallelism: the scheduler's lookup checks the
   objects of the first pipeline stage only, and this is now documented and
   warned about. Each stage's cache groups list only its own layers, so the

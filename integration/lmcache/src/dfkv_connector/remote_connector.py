@@ -55,6 +55,10 @@ def _fmt_bytes(n: int) -> str:
     return f"{n / 1024 / 1024:.2f}MiB"
 
 
+# The PYTHONHASHSEED warning is said once per process, not per connector.
+_warned_hash_seed = False
+
+
 def _key_label(key: bytes) -> str:
     return f"len={len(key)} sha256={hashlib.sha256(key).hexdigest()[:16]}"
 
@@ -205,6 +209,24 @@ class DfkvConnector(RemoteConnector):
                 loop=loop,
                 get_parallelism=self._get_parallelism,
             )
+
+            # A chunk larger than the RDMA client can move would fail every
+            # PUT, silently but for the access log: refuse it at startup.
+            self._client.validate_block_sizes(
+                (int(self.full_chunk_size_bytes),), context="LMCache chunk"
+            )
+            global _warned_hash_seed
+            if os.environ.get("PYTHONHASHSEED") is None and not _warned_hash_seed:
+                _warned_hash_seed = True
+                # vLLM seeds the root of the prefix hash chain LMCache keys
+                # chunks by from os.urandom() unless PYTHONHASHSEED is set:
+                # keys then change with every engine start.
+                logger.warning(
+                    "PYTHONHASHSEED is not set: the chunk keys change on every "
+                    "engine restart, and engines do not find each other's "
+                    "chunks. Set the same value (e.g. PYTHONHASHSEED=0) for "
+                    "every engine sharing this dfkv ring."
+                )
 
             total_pool_mib = sum(length for _, length in rdma_pools) / (1024 * 1024)
             logger.info(
