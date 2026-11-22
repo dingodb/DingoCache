@@ -48,16 +48,25 @@ inline int RunInChild(const std::function<int()>& body, int timeout_s = 60) {
   return WEXITSTATUS(status);
 }
 
+// The number the next new descriptor of this process would get, or -1. A test
+// that needs another thread's descriptor to be closed before it goes on waits
+// for this to return to the value it had before that descriptor was opened.
+// The probe itself holds the number only for the duration of the call.
+inline int LowestFreeDescriptor() {
+  // open() returns the lowest free number, so nothing below it is free.
+  const int lowest_free = ::open("/dev/null", O_RDONLY);
+  if (lowest_free >= 0) ::close(lowest_free);
+  return lowest_free;
+}
+
 // While alive, every attempt to get a new descriptor in this process fails
 // with EMFILE; descriptors that are already open keep working. Create the
 // sockets a test still needs before constructing this.
 class NoFreeDescriptors {
  public:
   NoFreeDescriptors() {
-    // open() returns the lowest free number, so nothing below it is free.
-    const int lowest_free = ::open("/dev/null", O_RDONLY);
+    const int lowest_free = LowestFreeDescriptor();
     if (lowest_free < 0) return;
-    ::close(lowest_free);
     if (::getrlimit(RLIMIT_NOFILE, &saved_) != 0) return;
     rlimit lowered = saved_;
     lowered.rlim_cur = static_cast<rlim_t>(lowest_free);

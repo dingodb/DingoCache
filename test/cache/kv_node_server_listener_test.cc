@@ -1,10 +1,14 @@
 #include "cache/kv_node_server.h"
 #include "client/key_map.h"
 #include "transport/tcp_transport.h"
+#include "utils/accept_guard.h"
 #include "utils/net_util.h"
+
+#include "../utils/fd_exhaustion.h"
 
 #include <gtest/gtest.h>
 
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -333,5 +337,114 @@ TEST(KvNodeServerListener, ConfigIsHardBoundedAndExported) {
       << metrics;
   EXPECT_NE(metrics.find("dfkv_tcp_rejected_connections_total 0"),
             std::string::npos) << metrics;
+  server->Stop();
+}
+
+// With no descriptor left accept() fails at once, every time, while the peer
+// stays queued. The listener has to wait between attempts instead of spinning,
+// serve the queued peer once descriptors are back, and still stop promptly.
+TEST(KvNodeServerListener, DescriptorExhaustionBacksOffAndRecovers) {
+  const int result = testing_fd::RunInChild([] {
+    ::setenv("DFKV_STORE_ENGINE", "file", 1);
+    const fs::path dir = fs::temp_directory_path() /
+        ("dfkv_tcp_listener_emfile_" + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    auto server = std::make_unique<KvNodeServer>(dir.string(), 1ull << 20);
+    if (server->Start(0) != Status::kOk) return 10;
+    const int warm = Dial(*server);
+    if (warm < 0) return 11;
+    if (!WaitFor([&] { return server->live_conn_count() == 1; }, 3000))
+      return 11;
+
+    // socket() needs a descriptor, so open them before taking the rest away.
+    const int queued = ::socket(AF_INET, SOCK_STREAM, 0);
+    const int later = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (queued < 0 || later < 0) return 12;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(static_cast<uint16_t>(server->port()));
+
+    testing_fd::NoFreeDescriptors exhausted;
+    if (!exhausted.active()) return 13;
+    if (::connect(queued, reinterpret_cast<sockaddr*>(&address),
+                  sizeof(address)) != 0)
+      return 14;
+
+    const double cpu_before = testing_fd::ProcessCpuSeconds();
+    const auto wall_before = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const double cpu_used = testing_fd::ProcessCpuSeconds() - cpu_before;
+    const uint64_t failures = server->TcpAcceptFailures();
+    if (failures == 0) return 15;  // the failure was not seen or not counted
+    // One attempt per backoff, however long this thread actually slept.
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - wall_before)
+            .count();
+    if (failures > static_cast<uint64_t>(elapsed_ms) /
+                           net::AcceptGuard::kBackoffMs + 2)
+      return 16;  // retried without waiting
+    // A spinning accept thread alone costs one core for the whole interval.
+    // The bound is half of that, not an absolute figure, because this is the
+    // CPU time of the whole process and the server's background threads are
+    // in it.
+    if (cpu_used > static_cast<double>(elapsed_ms) / 1000.0 / 2)
+      return 17;  // spun instead of sleeping
+
+    exhausted.Restore();
+    // The queued peer is taken once a descriptor is free again.
+    if (!WaitFor([&] { return server->live_conn_count() == 2; }, 3000))
+      return 18;
+    if (server->MetricsText().find("dfkv_tcp_accept_failures_total " +
+                                   std::to_string(failures) + "\n") ==
+        std::string::npos)
+      return 19;
+
+    // Stopping while the loop is backing off must not wait out anything long.
+    testing_fd::NoFreeDescriptors exhausted_again;
+    if (!exhausted_again.active()) return 20;
+    if (::connect(later, reinterpret_cast<sockaddr*>(&address),
+                  sizeof(address)) != 0)
+      return 21;
+    if (!WaitFor([&] { return server->TcpAcceptFailures() > failures; }, 3000)) return 22;
+    const auto stop_started = std::chrono::steady_clock::now();
+    server->Stop();
+    if (std::chrono::steady_clock::now() - stop_started >
+        std::chrono::seconds(2))
+      return 23;
+    server.reset();
+    fs::remove_all(dir);
+    return 0;
+  });
+  EXPECT_EQ(result, 0) << "step code from the child, see the test body";
+}
+
+TEST(KvNodeServerListener, ThreadThatCannotStartRefusesOnlyThatConnection) {
+  ScopedEnv engine("DFKV_STORE_ENGINE", "file");
+  auto server = StartServer("thread_start");
+
+  net::g_fail_thread_starts_for_test.store(1);
+  const int refused = Dial(*server);
+  ASSERT_GE(refused, 0);
+  char byte = 0;
+  EXPECT_LE(::recv(refused, &byte, 1, 0), 0)
+      << "the connection without a thread is closed";
+  ::close(refused);
+  net::g_fail_thread_starts_for_test.store(0);
+  EXPECT_EQ(server->TcpThreadStartFailures(), 1u);
+  EXPECT_EQ(server->live_conn_count(), 0u);
+
+  const int served = Dial(*server);
+  ASSERT_GE(served, 0);
+  EXPECT_TRUE(WaitFor([&] { return server->live_conn_count() == 1; }, 1000))
+      << "the server keeps serving";
+  const std::string metrics = server->MetricsText();
+  EXPECT_NE(metrics.find("dfkv_tcp_thread_start_failures_total 1\n"),
+            std::string::npos);
+  EXPECT_NE(metrics.find("dfkv_open_connections 1\n"), std::string::npos)
+      << "the refused connection is not left counted as open";
+  ::close(served);
   server->Stop();
 }

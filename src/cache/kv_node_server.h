@@ -21,6 +21,7 @@
 #include "cache/disk_cache_group.h"
 #include "cache/ram_tier.h"
 #include "cache/read_coalescer.h"
+#include "utils/accept_guard.h"
 #include "utils/latency_hist.h"
 
 namespace dfkv {
@@ -97,6 +98,12 @@ class KvNodeServer {
   size_t live_conn_count();  // handler threads not yet reaped (test/diagnostic)
   size_t TcpRejectedConnections() const {
     return tcp_rejected_connections_.load(std::memory_order_relaxed);
+  }
+  // accept() failures that made the TCP listener back off, and connections
+  // refused because their handler thread could not be created.
+  uint64_t TcpAcceptFailures() const { return accept_guard_.accept_failures(); }
+  uint64_t TcpThreadStartFailures() const {
+    return accept_guard_.thread_start_failures();
   }
   size_t TcpMaxConnections() const { return tcp_max_connections_; }
   int TcpIoTimeoutSeconds() const { return tcp_io_timeout_seconds_; }
@@ -307,6 +314,7 @@ class KvNodeServer {
   bool shutdown_clean_ = false;
   std::atomic<size_t> accept_count_{0};
   std::thread accept_thread_;
+  net::AcceptGuard accept_guard_{"tcp listener"};
   // connection drain: track per-connection handler threads + their fds so Stop()
   // can unblock (shutdown) and join them before group_ is destroyed. Finished
   // handlers are reaped incrementally at accept time (done flag), so a long-lived
