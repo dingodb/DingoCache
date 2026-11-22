@@ -6,6 +6,7 @@ in for libdfkv and small stubs for the SGLang pools the connector is handed.
 
 import os
 import sys
+import threading
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -13,6 +14,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "..", "integration", "hicache"))
 
 import dfkv_hicache  # noqa: E402
+from sglang.srt.mem_cache.hicache_storage import PoolTransfer  # noqa: E402
 
 
 class _HostPool:
@@ -23,7 +25,8 @@ class _HostPool:
         self.nbytes = nbytes
 
     def get_page_buffer_meta(self, indices):
-        return ([0x1000] * self.components, [self.nbytes] * self.components)
+        n = len(indices) * self.components  # one index per page here
+        return ([0x1000] * n, [self.nbytes] * n)
 
 
 class _FakeLib:
@@ -57,6 +60,7 @@ def _plugin(**attrs):
     st.pcp_rank = 0
     st.dcp_size = 1
     st.dcp_rank = 0
+    st._mla_replica_writer = True
     st._device_direct_requested = False
     st._device_registration_failed = False
     st._pool_component_names = {}
@@ -198,6 +202,102 @@ class DeviceDirectState(unittest.TestCase):
         st = _plugin(mem_pool_device=object(), _device_direct_requested=True,
                      _device_registration_failed=True)
         self.assertFalse(st._device_direct_active())
+
+
+class _RecordingMetrics:
+    """Collects the v2 metric calls with their arguments."""
+
+    def __init__(self):
+        self.calls = []
+
+    def on_set_v2(self, **kwargs):
+        self.calls.append(("set_v2", kwargs))
+
+    def on_get_v2(self, **kwargs):
+        self.calls.append(("get_v2", kwargs))
+
+
+class ConcurrentV2Transfers(unittest.TestCase):
+    """SGLang backs up (batch_set_v2) and prefetches (batch_get_v2) on
+    different threads. Each call must report its own pools, bytes and time.
+
+    The transfer used to hand these to its caller through instance
+    attributes. A set that had finished its transfer but not yet read them,
+    while a get ran to completion, read the get's pool names: its metrics took
+    the get's bytes, and with different pools it failed with a KeyError.
+    """
+
+    def test_set_and_get_each_see_their_own_result(self):
+        metrics = _RecordingMetrics()
+        st = _plugin(
+            registered_pools={"state": _HostPool(nbytes=100),
+                              "index": _HostPool(nbytes=7)},
+            _pool_component_names={"state": ("all",), "index": ("all",)},
+            _pool_replicated={"state": False, "index": False},
+            _put_retry_recovered=0,
+            _metrics=metrics,
+        )
+        st._put_flat = lambda sks, _ptrs, _sizes: [True] * len(sks)
+        outcome = {}
+
+        def backup():
+            try:
+                outcome["set"] = st.batch_set_v2(
+                    [PoolTransfer("state", host_indices=[0, 1],
+                                  keys=["k1", "k2"])])
+            except Exception as exc:  # reported below, in the test thread
+                outcome["error"] = exc
+
+        # Hold the set between the end of its transfer and its use of the
+        # transfer's volume: formatting the result is the first thing it does
+        # in between.
+        writer = threading.Thread(target=backup)
+        transferred, release = threading.Event(), threading.Event()
+        fmt_pool_results = dfkv_hicache._fmt_pool_results
+
+        def held(results):
+            if threading.current_thread() is writer:
+                transferred.set()
+                release.wait(5)
+            return fmt_pool_results(results)
+
+        dfkv_hicache._fmt_pool_results = held
+        try:
+            writer.start()
+            self.assertTrue(transferred.wait(5), outcome.get("error"))
+            got = st.batch_get_v2(
+                [PoolTransfer("index", host_indices=[0], keys=["k3"])])
+            release.set()
+            writer.join(5)
+        finally:
+            release.set()
+            dfkv_hicache._fmt_pool_results = fmt_pool_results
+        self.assertFalse(writer.is_alive())
+
+        self.assertNotIn("error", outcome, repr(outcome.get("error")))
+        self.assertEqual(got, {"index": [True]})
+        self.assertEqual(outcome["set"], {"state": [True, True]})
+        by_op = dict(metrics.calls)
+        self.assertEqual(len(metrics.calls), 2)
+        self.assertEqual(by_op["get_v2"]["pages"], 1)
+        self.assertEqual(by_op["get_v2"]["nbytes"], 7)
+        self.assertEqual(by_op["set_v2"]["pages"], 2)
+        self.assertEqual(by_op["set_v2"]["ok_pages"], 2)
+        self.assertEqual(by_op["set_v2"]["nbytes"], 200)
+
+    def test_transfer_leaves_no_result_on_the_instance(self):
+        st = _plugin(
+            registered_pools={"state": _HostPool()},
+            _pool_component_names={"state": ("all",)},
+            _pool_replicated={"state": False},
+        )
+        before = set(vars(st))
+        results, io = st._v2_io(
+            [PoolTransfer("state", host_indices=[0], keys=["k"])],
+            putting=False)
+        self.assertEqual(results, {"state": [True]})
+        self.assertEqual((io.nbytes, io.pools), (64, ("state",)))
+        self.assertEqual(set(vars(st)), before)
 
 
 if __name__ == "__main__":
