@@ -82,6 +82,9 @@ class KvNodeServerWiringTestPeer {
   static uint64_t RamDirty(KvNodeServer& server) {
     return server.ram_->DirtyObjects();
   }
+  static uint64_t UncleanResets(KvNodeServer& server) {
+    return server.group_.SlabStats().unclean_resets;
+  }
 };
 }  // namespace dfkv
 
@@ -899,8 +902,10 @@ TEST(RamTierWiring, ShutdownLeavesTheDisksCleanWithoutDestruction) {
   const pid_t child = ::fork();
   ASSERT_GE(child, 0);
   if (child == 0) {
+    // The slab engine, whatever DFKV_STORE_ENGINE says: the file engine has
+    // no clean marker to lose.
     auto server = KvNodeServerWiringTestPeer::Create(
-        DiskCacheGroup::Options{{dir.string()}, 1ull << 30});
+        DiskCacheGroup::Options{{dir.string()}, 1ull << 30, "slab"});
     auto* node = server.get();
     KvNodeServerWiringTestPeer::SetRam(
         *server,
@@ -927,15 +932,20 @@ TEST(RamTierWiring, ShutdownLeavesTheDisksCleanWithoutDestruction) {
   ASSERT_EQ(WEXITSTATUS(status), 0);
 
   // An unclean state would have reset the cache (warm restart is off).
-  KvNodeServer reopened(dir.string(), 1ull << 30);
+  ::unsetenv("DFKV_SLAB_WARM_RESTART");
+  auto reopened = KvNodeServerWiringTestPeer::Create(
+      DiskCacheGroup::Options{{dir.string()}, 1ull << 30, "slab"});
+  ASSERT_TRUE(reopened->Healthy());
+  EXPECT_EQ(KvNodeServerWiringTestPeer::UncleanResets(*reopened), 0u);
   for (int i = 0; i < kObjects; ++i) {
     std::string out;
     ASSERT_EQ(KvNodeServerWiringTestPeer::DiskRead(
-                  reopened, BlockKey{7300u + i, 0}, &out),
+                  *reopened, BlockKey{7300u + i, 0}, &out),
               Status::kOk)
         << i;
     EXPECT_EQ(out, value);
   }
+  reopened.reset();
   fs::remove_all(dir);
 }
 
@@ -954,7 +964,7 @@ TEST(RamTierWiring, ShutdownDropsWhatMissesTheDrainTimeout) {
   std::atomic<int> flushes{0};
   {
     auto server = KvNodeServerWiringTestPeer::Create(
-        DiskCacheGroup::Options{{dir.string()}, 1ull << 30});
+        DiskCacheGroup::Options{{dir.string()}, 1ull << 30, "slab"});
     auto* node = server.get();
     OpenFlushOnExit cleanup{barrier};
     KvNodeServerWiringTestPeer::SetRam(
@@ -991,17 +1001,21 @@ TEST(RamTierWiring, ShutdownDropsWhatMissesTheDrainTimeout) {
   ::unsetenv("DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S");
   EXPECT_EQ(flushes.load(), 1);  // destruction did not resume the drain
 
-  KvNodeServer reopened(dir.string(), 1ull << 30);
+  auto reopened = KvNodeServerWiringTestPeer::Create(
+      DiskCacheGroup::Options{{dir.string()}, 1ull << 30, "slab"});
+  ASSERT_TRUE(reopened->Healthy());
+  EXPECT_EQ(KvNodeServerWiringTestPeer::UncleanResets(*reopened), 0u);
   std::string out;
-  EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(reopened, BlockKey{7400, 0},
+  EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(*reopened, BlockKey{7400, 0},
                                                  &out),
             Status::kOk);
   EXPECT_EQ(out, value);
   for (int i = 1; i < kObjects; ++i)
     EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(
-                  reopened, BlockKey{7400u + i, 0}, &out),
+                  *reopened, BlockKey{7400u + i, 0}, &out),
               Status::kNotFound)
         << i;
+  reopened.reset();
   fs::remove_all(dir);
 }
 }  // namespace
