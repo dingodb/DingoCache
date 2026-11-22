@@ -910,7 +910,7 @@ void RdmaTransport::MaintainIdle(uint64_t now_us, bool send_keepalives) {
       conn->remote_lease_held = true;
       conn->remote_recovery_probe = remote->recovery_probe;
     }
-    conn->reused_from_pool = false;  // a keepalive is judged as before
+    conn->reused_from_pool = false;  // a keepalive is judged in Destroy
     rdma::RailCompletion failure = rdma::RailCompletion::kAdmission;
     if (!KeepaliveConn(conn, &failure))
       Destroy(conn, failure);
@@ -1064,7 +1064,8 @@ void RdmaTransport::MarkDead(Conn* c) {
 }
 
 void RdmaTransport::NoteFailedCompletion(Conn& c,
-                                         rdma::RailCompletion completion) {
+                                         rdma::RailCompletion completion,
+                                         bool peer_rail_charged) {
   const ibv_wc* wc = c.ep.failed_wc();
   if (!wc || c.rail_index >= devs_.size()) return;
   rail_wc_errors_[c.rail_index * rdma::kWcStatusSlots +
@@ -1109,25 +1110,14 @@ void RdmaTransport::NoteFailedCompletion(Conn& c,
            ? "rail"
            : completion == rdma::RailCompletion::kEndpointFailure ? "endpoint"
                                                                   : "neutral") +
-      " suppressed=" + std::to_string(suppressed));
+      " suppressed=" + std::to_string(suppressed) +
+      " peer_rail_charged=" + (peer_rail_charged ? "1" : "0"));
 }
 
 bool RdmaTransport::Destroy(Conn* c, rdma::RailCompletion completion) {
   if (!c) return false;
   if (c->local_resource_failure)
     completion = rdma::RailCompletion::kAdmission;
-  NoteFailedCompletion(*c, completion);
-  MarkInactive(c);
-  if (completion == rdma::RailCompletion::kEndpointFailure)
-    InvalidateCapabilities(c->node, c->peer_id, c->peer_publication);
-  MarkDead(c);
-
-  c->lifecycle.BeginDrain();
-  const bool credit_held = c->credit_held;
-  const rdma::RailLease lease = c->lease;
-  const uint64_t lease_started_us = c->lease_started_us;
-  const bool release_budget = c->budget_held;
-  const rdma::ResourceRequest budget_request = c->budget_request;
   // A pooled connection that fails on reuse, before a single completion has
   // succeeded on it, says that this connection is gone, which is what a peer
   // does when it reclaims an idle connection or restarts. It does not say
@@ -1143,10 +1133,29 @@ bool RdmaTransport::Destroy(Conn* c, rdma::RailCompletion completion) {
       c->ep.succeeded_completions() == c->completions_at_reuse;
   const std::string stale_peer_id = stale_pooled ? c->peer_id : std::string();
   const size_t stale_rail = c->rail_index;
-  CompleteRemoteLease(
-      c, completion == rdma::RailCompletion::kEndpointFailure && !stale_pooled
-             ? RemoteRailOutcome::kEndpointFailure
-             : RemoteRailOutcome::kAbandon);
+  // A keepalive that fails says no more than that: it probes a pooled
+  // connection, and its limit (100 ms) is much shorter than an operation's,
+  // so a busy server that answers late fails it too. The connection is
+  // dropped; a connection made now judges the rail.
+  const bool charge_peer_rail =
+      completion == rdma::RailCompletion::kEndpointFailure && !stale_pooled &&
+      !c->keepalive_probe;
+  NoteFailedCompletion(*c, completion,
+                       charge_peer_rail && c->remote_lease_held);
+  MarkInactive(c);
+  if (completion == rdma::RailCompletion::kEndpointFailure)
+    InvalidateCapabilities(c->node, c->peer_id, c->peer_publication);
+  MarkDead(c);
+
+  c->lifecycle.BeginDrain();
+  const bool credit_held = c->credit_held;
+  const rdma::RailLease lease = c->lease;
+  const uint64_t lease_started_us = c->lease_started_us;
+  const bool release_budget = c->budget_held;
+  const rdma::ResourceRequest budget_request = c->budget_request;
+  CompleteRemoteLease(c, charge_peer_rail
+                             ? RemoteRailOutcome::kEndpointFailure
+                             : RemoteRailOutcome::kAbandon);
 
   // RcEndpoint destroys its QP before deregistering MRs. In particular this
   // fences an outstanding initiator READ before caller memory can be reused.

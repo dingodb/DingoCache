@@ -251,6 +251,27 @@
   again, and a whole-object read is still not tried again after any other
   failure. The retries count in `dfkv_rdma_client_stale_pool_retries_total`.
   No setting, API or wire change; servers of any version are unaffected.
+- RDMA client: a keepalive that fails no longer cools the peer rail. The
+  keepalive (`DFKV_RDMA_KEEPALIVE_MS`, every 15 s by default) waits at most
+  100 ms for its answer, where an operation waits `DFKV_RDMA_OP_TIMEOUT_MS`
+  (5 s by default). A server that was busy for longer than that, or that had
+  reclaimed the idle connection or restarted, failed the keepalive, and the
+  pair (peer, rail) was cooled: with one usable rail every operation to the
+  peer was refused for the cooldown although the peer was serving. The
+  failed keepalive now drops that connection only, as a pooled connection
+  that fails on reuse does since 2.39.0. The next operation makes a new
+  connection, and if that one fails the rail is cooled as before. So a rail
+  that is really down is found by an operation (which then retries on
+  another rail) rather than by the keepalive in advance. The limit stays at
+  100 ms: a missed keepalive now costs one reconnect, and a longer limit
+  would hold a dead connection out of the pool for longer. Still counted in
+  `dfkv_rdma_client_keepalive_failures_total`; no longer in
+  `dfkv_rdma_client_remote_rail_failures_total`. The client CQ failure log
+  line gains a last field, `peer_rail_charged=<0|1>`: whether the failure
+  counts against the peer's rail. It is 0 for a failed keepalive, a stale
+  pooled connection and a peer without identity, where `verdict=endpoint`
+  only says that the local rail is not to blame. No setting, API or wire
+  change.
 
 ## 2.39.0 — 2026-11-22
 

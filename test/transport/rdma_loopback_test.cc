@@ -5684,6 +5684,85 @@ TEST(RdmaLoopback, PutPostedOnAProvenPooledConnectionIsNotSentAgain) {
   EXPECT_EQ(counter("dfkv_rdma_client_stale_pool_connections_total"), 0);
 }
 
+// Polls until the counter has reached at least `at_least`.
+bool WaitForCounter(const RdmaTransport& rt, const std::string& name,
+                    long at_least, int timeout_ms = 5000) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(timeout_ms);
+  while (CounterVal(rt.MetricsText(), name) < at_least) {
+    if (std::chrono::steady_clock::now() >= deadline) return false;
+    std::this_thread::sleep_for(std::chrono::microseconds(200));
+  }
+  return true;
+}
+
+// A keepalive that is not answered within its short limit (100 ms; an
+// operation waits 5 s) says that this idle connection did not answer in
+// time, here because the server is busy. The connection is dropped. The
+// peer rail is not cooled: with one usable rail that refused every operation
+// to the peer for the cooldown, although the peer was serving.
+TEST(RdmaLoopback, LateKeepaliveAnswerDropsTheConnectionNotThePeerRail) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "200");
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  const std::string rail = SingleTestRail();
+  if (rail.empty()) GTEST_SKIP() << "no ACTIVE RDMA device";
+  ScopedEnv one_rail("DFKV_RDMA_DEV", rail.c_str());
+  RdmaNode node("late-keepalive");
+  RdmaTransport rt(kMaxMsg, rail);
+  const std::string peer_id = "late-keepalive-peer";
+  rt.OnPeerTopology(PublishedPeer(node.addr, peer_id));
+  const std::vector<BlockKey> keys = {ToBlockKey(SelfHdr(), "absent")};
+  std::vector<char> exists;
+  const Status served = rt.ExistMany(node.addr, keys, &exists)[0];
+  ASSERT_NE(served, Status::kIOError);
+  ASSERT_NE(served, Status::kNoCompatibleRail);
+
+  node.handler_delay_ms = 300;
+  ASSERT_TRUE(WaitForCounter(rt, "dfkv_rdma_client_keepalive_failures_total",
+                             1));
+  node.handler_delay_ms = 0;
+
+  EXPECT_EQ(
+      CounterVal(rt.MetricsText(),
+                 "dfkv_rdma_client_remote_rail_cooldowns_total"),
+      0);
+  EXPECT_EQ(RdmaTransportTestPeer::RemoteAllowed(
+                rt, peer_id, {1}, rdma::RailPolicy::NowMicros()),
+            (std::vector<uint8_t>{1}));
+  EXPECT_EQ(rt.ExistMany(node.addr, keys, &exists)[0], served);
+}
+
+// The same for a keepalive on a connection the server has reclaimed: the
+// connection is gone, the peer rail is not to blame.
+TEST(RdmaLoopback, KeepaliveOnAConnectionTheServerReclaimedDoesNotCoolTheRail) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv idle_reclaim("DFKV_RDMA_IDLE_MS", "120");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "400");
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  const std::string rail = SingleTestRail();
+  if (rail.empty()) GTEST_SKIP() << "no ACTIVE RDMA device";
+  ScopedEnv one_rail("DFKV_RDMA_DEV", rail.c_str());
+  RdmaNode node("reclaimed-keepalive");
+  RdmaTransport rt(kMaxMsg, rail);
+  const std::string peer_id = "reclaimed-keepalive-peer";
+  rt.OnPeerTopology(PublishedPeer(node.addr, peer_id));
+  const std::vector<BlockKey> keys = {ToBlockKey(SelfHdr(), "absent")};
+  std::vector<char> exists;
+  const Status served = rt.ExistMany(node.addr, keys, &exists)[0];
+  ASSERT_NE(served, Status::kIOError);
+  ASSERT_NE(served, Status::kNoCompatibleRail);
+
+  ASSERT_TRUE(ServerHasNoConnections(node));
+  ASSERT_TRUE(WaitForCounter(rt, "dfkv_rdma_client_keepalive_failures_total",
+                             1));
+  EXPECT_EQ(
+      CounterVal(rt.MetricsText(),
+                 "dfkv_rdma_client_remote_rail_cooldowns_total"),
+      0);
+  EXPECT_EQ(rt.ExistMany(node.addr, keys, &exists)[0], served);
+}
+
 // A TCP connect that fails says the node is not there. It says nothing about
 // a rail: every rail dials the same address. So no peer rail is charged and
 // nothing is dialed a second time; the caller gets kIOError, which is what
@@ -6104,6 +6183,9 @@ TEST(RdmaLoopback, ClientFailedCompletionNamesPeerDeviceOperationAndStatus) {
     EXPECT_EQ(LogField(line, "lane"), "control") << line;
     EXPECT_EQ(LogField(line, "pooled"), "1") << line;
     EXPECT_EQ(LogField(line, "verdict"), "endpoint") << line;
+    // A pooled connection that failed on reuse is not held against the
+    // peer's rail (and this peer has no identity to hold it against).
+    EXPECT_EQ(LogField(line, "peer_rail_charged"), "0") << line;
     bool matches_series = false;
     for (const auto& [labels, count] : failures) {
       (void)count;

@@ -220,7 +220,9 @@ class RdmaTransport : public Transport {
   // Counts and logs the failed work completion, if any, that the endpoint of
   // a connection about to be destroyed reaped. Observation only: it reads the
   // verdict the caller already reached and changes no retry or health state.
-  void NoteFailedCompletion(Conn& c, rdma::RailCompletion completion);
+  // peer_rail_charged: the failure counts against the peer's rail.
+  void NoteFailedCompletion(Conn& c, rdma::RailCompletion completion,
+                            bool peer_rail_charged);
   void MarkActive(Conn* c, Lane lane);
   void MarkInactive(Conn* c);
   void MarkLive(Conn* c);
