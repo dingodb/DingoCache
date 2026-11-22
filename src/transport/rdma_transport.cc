@@ -1337,12 +1337,29 @@ RdmaTransport::ProbeResult RdmaTransport::ProbeV2(
             : closed ? ProbeResult::kClosed : ProbeResult::kRejected;
 }
 
+namespace {
+// What the operations on this thread did about unreachable peers since the
+// record was last taken: refused a connect because the address was held, and
+// made a connect that failed. TakeUnreachableRefusal reports a refusal only
+// when no connect failed, so a real failure is never taken for a refusal.
+thread_local bool tls_refused_held_address = false;
+thread_local bool tls_connect_failed = false;
+}  // namespace
+
+bool RdmaTransport::TakeUnreachableRefusal() {
+  const bool refused_only = tls_refused_held_address && !tls_connect_failed;
+  tls_refused_held_address = false;
+  tls_connect_failed = false;
+  return refused_only;
+}
+
 bool RdmaTransport::RecentlyUnreachable(const std::string& node) {
   std::lock_guard<std::mutex> lock(unreachable_mu_);
   const auto found = unreachable_until_us_.find(node);
   if (found == unreachable_until_us_.end()) return false;
   if (rdma::RailPolicy::NowMicros() < found->second) {
     peer_unreachable_skips_.fetch_add(1, std::memory_order_relaxed);
+    tls_refused_held_address = true;
     return true;
   }
   unreachable_until_us_.erase(found);
@@ -1350,6 +1367,7 @@ bool RdmaTransport::RecentlyUnreachable(const std::string& node) {
 }
 
 void RdmaTransport::NoteUnreachable(const std::string& node) {
+  tls_connect_failed = true;
   std::lock_guard<std::mutex> lock(unreachable_mu_);
   const uint64_t now = rdma::RailPolicy::NowMicros();
   auto& until = unreachable_until_us_[node];
@@ -1683,12 +1701,13 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   }
 
   const std::string& dev = devs_[ridx];
-  int fd = RecentlyUnreachable(node)
-               ? -1
-               : net::Dial(node, connect_ms_, io_ms_);
+  const bool held = RecentlyUnreachable(node);
+  int fd = held ? -1 : net::Dial(node, connect_ms_, io_ms_);
   if (fd < 0) {
-    // The bootstrap address is the node's, the same for every rail.
-    NoteUnreachable(node);
+    // The bootstrap address is the node's, the same for every rail. A
+    // refusal is not a connect that failed: it starts nothing and is not
+    // recorded as one (see TakeUnreachableRefusal).
+    if (!held) NoteUnreachable(node);
     complete_unowned_lease(rdma::RailCompletion::kAdmission);
     resource_budget_->Release(budget_request);
     result.failure = AcquireFailure::kPeerUnreachable;

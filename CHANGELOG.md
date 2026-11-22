@@ -2,6 +2,66 @@
 
 ## Unreleased
 
+- Client: a cache node that fails is avoided for as long as the failure
+  warrants, and finding out whether it is back no longer stalls reads of
+  other nodes. Three things in the per-node health record (`PeerHealth`)
+  made one incident worse than it was.
+  - Every failed shard of a batch counted as one more consecutive failure.
+    A batch reaches a node through up to eight shards, so the first
+    failure of a node doubled its cooldown once per shard: a node that was
+    restarted and back within seconds was avoided for the 30 s maximum
+    instead of 2 s. Failures that arrive while the node is already being
+    avoided now belong to the incident that started the cooldown. The
+    cooldown doubles only when the node is tried again and fails again
+    (2 s, 4 s, 8 s, up to `DFKV_PEER_COOLDOWN_MAX_MS`).
+  - When a cooldown ended, every request was sent to the node again. With
+    a node that drops connections silently each of them waited for a
+    connect or operation timeout, and a batch for that node could occupy
+    all read workers of the process, so reads of healthy nodes waited
+    behind it for the length of a timeout, once per cooldown. Now one
+    request tries the node and the others keep skipping it (a miss, as
+    during the cooldown) until that request has succeeded or failed. This
+    is one request per cooldown window, not one in total: a trial that is
+    stuck in a timeout for longer than `DFKV_PEER_COOLDOWN_MS` is joined by
+    the next, and if it finally fails after the following cooldown has run
+    out, that counts as another failure. A trial that says nothing about
+    the node hands the trial to the next request at once: the request was
+    refused inside this process (transport budget, no usable rail), or the
+    RDMA transport refused it without dialing because a connect to that
+    address had just failed. Such a refusal used to count as a failure of
+    the node; it no longer does, in a trial or otherwise.
+  - The optional probe (`DFKV_PROBE_INTERVAL_MS`, off by default; a
+    connector may switch it on for per-node latency metrics) cleared a
+    node's cooldown and its back-off whenever the node answered. The probe
+    is an existence query, which a node whose store has failed still
+    answers, so requests were sent into the same failure once per probe
+    period. A probe answer now ends the running cooldown early once per
+    incident and makes the next request the trial; it clears nothing by
+    itself. If that trial fails, the probe cannot shorten that incident
+    again until a request has succeeded, and the back-off runs its course.
+  Any status a node itself sends now shows it alive: besides a hit and a
+  miss also "cache full" and "quota exceeded", which only a node that is up
+  and looked at the request can answer. A full node that refused every
+  write used to look silent, so one transport failure made the client
+  avoid it although it had answered milliseconds before. An I/O error is
+  not counted (the client cannot tell a server-side one from a transport
+  failure).
+  The tests use a scripted transport and scaled timings (500 ms for 2 s,
+  5 s for 30 s) and assert: after seven shards failed together the node is
+  tried again in less than four base periods, not at the cap; while a batch
+  re-tries a dead node (600 ms timeout), one request is inside the dead
+  node and a read of another node takes less than 200 ms; a node with a
+  failed store and a 20 ms probe receives at most 4 reads in a second.
+  Behaviour changes to be aware of: after a cooldown, requests to the node
+  other than the trial are skipped until the trial reports;
+  `dfkv_client_unhealthy_skips_total` counts those too.
+  `dfkv_client_peer_recovered_total` no longer counts a probe answer, only
+  a request that was answered. `dfkv_client_ops_served_total` includes
+  "cache full" and "quota exceeded" answers. A node that answers probes
+  while its requests fail is no longer retried at the probe rate. No
+  setting, API or wire change; servers of any version are unaffected. Not
+  changed here: a node that is slow but answers can still occupy all read
+  workers. See `docs/DEPLOY.md` and `docs/METRICS.md`.
 - Client library and transports: a mistyped `DFKV_*` setting is now reported.
   This is the client-side half of the configuration change for `dfkv_server`
   and `dfkv_mds` (see that entry below), with the same rule: nothing changes

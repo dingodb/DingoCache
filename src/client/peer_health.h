@@ -8,15 +8,62 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
+#include "common/status.h"
 #include "utils/prom_escape.h"
 
 namespace dfkv {
+
+// Whether a status is something the peer itself said. Every status a server
+// puts on the wire is, whatever it says about the request: a hit, a miss, and
+// also "cache full" or "quota exceeded", which only a live node that looked at
+// the request can answer. Not included: kIOError (a transport failure, or a
+// server-side I/O error, which the client cannot tell apart), kInvalid (also
+// produced locally for requests that are never sent) and the statuses that
+// only this process produces (kResourceExhausted, kNoCompatibleRail).
+inline bool PeerAnswered(Status status) {
+  return status == Status::kOk || status == Status::kNotFound ||
+         status == Status::kCacheFull || status == Status::kQuotaExceeded;
+}
+
+// What the statuses of one operation say about the peer it was sent to.
+// Answered: the peer is alive. Failed and not answered: a transport failure.
+// Neither: the operation says nothing about the peer (it was refused locally,
+// or never sent).
+struct PeerOutcome {
+  bool answered = false;
+  bool failed = false;
+  void Add(Status status) {
+    if (PeerAnswered(status)) answered = true;
+    else if (status == Status::kIOError) failed = true;
+  }
+};
 
 // Layer-1 fast avoidance: a peer (keyed by "ip:port") that fails a transport IO
 // is marked unhealthy for cooldown_ms; while unhealthy the client short-circuits
 // requests to it (miss) WITHOUT touching the ring. A served response (hit or
 // logical miss) clears it. Thread-safe: BatchGet/Put route from many threads.
+//
+// One incident, one step. A batch reaches a node through several shards and
+// several threads, so one failure of the node arrives here as many MarkBad
+// calls. Calls made while the peer is already being avoided are observations
+// of the incident that started the avoidance: they are counted as errors and
+// change nothing else. The back-off grows only when the peer is tried again
+// after its cooldown and fails again.
+//
+// One trial. When a cooldown ends, the peer may still be dead, and finding
+// that out can cost a connect or an operation timeout. The first Healthy()
+// call after the cooldown returns true and makes its caller the trial; until
+// that caller reports (MarkGood clears the peer, MarkBad starts the next,
+// longer cooldown) every other caller is still told to skip the peer. A
+// trial whose operation says nothing about the peer gives the trial back at
+// once (Report with a neutral outcome), so the next caller tries; one that
+// never reports at all, because it hangs, lapses after one base cooldown.
+// There is therefore at most one trial per base cooldown inside a dead peer,
+// not one in total: a trial stuck in a long timeout is joined by the next
+// after that time, and when the stuck one finally fails after the cooldown
+// that followed has run out, it counts as one more failure.
 //
 // It is also the client's uniform metrics chokepoint: every op calls Healthy()
 // then exactly one of MarkBad()/MarkGood(), so the client-observed counters live
@@ -45,13 +92,23 @@ class PeerHealth {
       : base_cooldown_ms_(base_cooldown_ms), max_cooldown_ms_(max_cooldown_ms),
         busy_grace_ms_(busy_grace_ms) {}
 
+  // False: skip the peer. True: use it, and report the outcome with MarkGood
+  // or MarkBad; for a peer whose cooldown has just ended the caller is the one
+  // trial (see above).
   bool Healthy(const std::string& peer, uint64_t now_ms) const {
     std::lock_guard<std::mutex> lk(mu_);
     checks_.fetch_add(1, std::memory_order_relaxed);
     auto it = until_.find(peer);
-    bool ok = it == until_.end() || it->second <= now_ms;
-    if (!ok) unhealthy_skips_.fetch_add(1, std::memory_order_relaxed);
-    return ok;
+    if (it == until_.end()) return true;
+    if (it->second <= now_ms) {
+      uint64_t& trial = trial_until_[peer];
+      if (trial <= now_ms) {
+        trial = now_ms + base_cooldown_ms_;
+        return true;
+      }
+    }
+    unhealthy_skips_.fetch_add(1, std::memory_order_relaxed);
+    return false;
   }
   void MarkBad(const std::string& peer, uint64_t now_ms) {
     std::lock_guard<std::mutex> lk(mu_);
@@ -66,18 +123,23 @@ class PeerHealth {
       busy_suppressed_.fetch_add(1, std::memory_order_relaxed);
       return;
     }
+    // Per-peer errors share the same bounded peer index as every other
+    // address-keyed state map. Aggregate errors_ still counts evicted peers.
+    ++peer_errors_[peer];
     auto it = until_.find(peer);
-    bool was_ok = it == until_.end() || it->second <= now_ms;
+    // Already being avoided: this failure belongs to the incident that
+    // started the cooldown (an operation that was in flight then, or another
+    // shard of the same batch). It neither lengthens nor restarts it.
+    if (it != until_.end() && it->second > now_ms) return;
+    // A new incident, or the trial after a cooldown failed.
     // Exponential backoff: base << (fails-1), capped at max_cooldown.
     uint32_t fails = ++fail_streak_[peer];
     unsigned shift = fails > 31 ? 31u : (fails - 1);
     uint64_t cd = base_cooldown_ms_ << shift;
     if (cd > max_cooldown_ms_ || cd < base_cooldown_ms_ /*overflow*/) cd = max_cooldown_ms_;
     until_[peer] = now_ms + cd;
-    if (was_ok) marked_bad_.fetch_add(1, std::memory_order_relaxed);  // healthy->bad edge
-    // Per-peer errors share the same bounded peer index as every other
-    // address-keyed state map. Aggregate errors_ still counts evicted peers.
-    ++peer_errors_[peer];
+    trial_until_.erase(peer);
+    marked_bad_.fetch_add(1, std::memory_order_relaxed);  // healthy->bad edge
   }
   // Data-path success: clears the cooldown and the backoff streak, and stamps
   // the peer's last-served time (the busy-vs-dead grace signal). Bumps the
@@ -89,17 +151,41 @@ class PeerHealth {
     last_good_[peer] = now_ms;
     ClearLocked(peer);
   }
-  // Probe-driven recovery (off the data path): the background prober reached
-  // the peer, so clear its cooldown/streak WITHOUT counting a served op. This
-  // is what lets recovery happen without the data path ever having to re-dial a
-  // dead peer inside its (now backed-off) cooldown.
-  void MarkProbeAlive(const std::string& peer) {
+  // The one entry point for what an operation found out. Answered: the peer
+  // is alive (MarkGood). Failed: a transport failure (MarkBad), unless the
+  // transport refused the operation without dialing, which is no new
+  // evidence. Otherwise the operation is no verdict on the peer: if it was
+  // the trial, the trial is given back so that the next caller tries now.
+  void Report(const std::string& peer, const PeerOutcome& outcome,
+              uint64_t now_ms, bool refused_without_dial = false) {
+    if (outcome.answered) {
+      MarkGood(peer, now_ms);
+    } else if (outcome.failed && !refused_without_dial) {
+      MarkBad(peer, now_ms);
+    } else {
+      std::lock_guard<std::mutex> lk(mu_);
+      trial_until_.erase(peer);
+    }
+  }
+
+  // The background prober got an answer from the peer. That shows the peer is
+  // reachable and responding; it does not show that reads and writes work (a
+  // node whose store has failed answers an existence query with a miss). So
+  // it does not clear anything: it ends the running cooldown early, which
+  // makes the next request the trial, and the trial decides. It does that
+  // once per incident: if the trial then fails, later probe answers are not
+  // allowed to shorten the back-off, or the data path would walk into the
+  // same failure once per probe period.
+  void MarkProbeAlive(const std::string& peer, uint64_t now_ms) {
     std::lock_guard<std::mutex> lk(mu_);
     auto tracked = tracked_.find(peer);
     if (tracked != tracked_.end()) {
       peer_lru_.splice(peer_lru_.end(), peer_lru_, tracked->second);
     }
-    ClearLocked(peer);
+    auto it = until_.find(peer);
+    if (it == until_.end() || it->second <= now_ms) return;  // not avoided
+    if (!probe_used_.insert(peer).second) return;
+    it->second = now_ms;
   }
 
   // Prometheus client-side metrics text. Aggregates + per-peer error counts.
@@ -117,7 +203,8 @@ class PeerHealth {
       errors_.load(std::memory_order_relaxed));
     m(s, "dfkv_client_health_checks_total", "counter", "Peer health checks performed",
       checks_.load(std::memory_order_relaxed));
-    m(s, "dfkv_client_unhealthy_skips_total", "counter", "Ops short-circuited (peer in cooldown)",
+    m(s, "dfkv_client_unhealthy_skips_total", "counter",
+      "Ops short-circuited (peer in cooldown, or its recovery trial in flight)",
       unhealthy_skips_.load(std::memory_order_relaxed));
     m(s, "dfkv_client_peer_marked_bad_total", "counter", "Healthy->bad peer transitions",
       marked_bad_.load(std::memory_order_relaxed));
@@ -180,6 +267,8 @@ class PeerHealth {
     if (tracked_.size() == kMaxPeers) {
       const std::string victim = peer_lru_.front();
       until_.erase(victim);
+      trial_until_.erase(victim);
+      probe_used_.erase(victim);
       fail_streak_.erase(victim);
       peer_errors_.erase(victim);
       last_good_.erase(victim);
@@ -195,6 +284,8 @@ class PeerHealth {
   // Clear a peer's cooldown + backoff streak (recovery). Caller holds mu_.
   void ClearLocked(const std::string& peer) {
     fail_streak_.erase(peer);
+    trial_until_.erase(peer);
+    probe_used_.erase(peer);
     if (until_.erase(peer)) recovered_.fetch_add(1, std::memory_order_relaxed);  // bad->good edge
   }
 
@@ -204,6 +295,10 @@ class PeerHealth {
   uint64_t max_cooldown_ms_;
   uint64_t busy_grace_ms_;
   std::unordered_map<std::string, uint64_t> until_;        // peer -> unhealthy-until (ms)
+  // peer -> end of the lease of the trial admitted after its cooldown
+  mutable std::unordered_map<std::string, uint64_t> trial_until_;
+  // peers whose current incident has had its probe-granted early trial
+  std::unordered_set<std::string> probe_used_;
   std::unordered_map<std::string, uint32_t> fail_streak_;  // peer -> consecutive failures
   std::unordered_map<std::string, uint64_t> peer_errors_;  // peer -> cumulative IO errors
   std::list<std::string> peer_lru_;  // oldest at front
