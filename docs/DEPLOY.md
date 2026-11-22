@@ -145,8 +145,8 @@ journalctl -u dfkv_mds -n 5 --no-pager   # 应见 "dfkv_mds listening on 9400, e
 > etcd”的 member：`ListMembers`/`ListTopology` 读到的 etcd 视图缺少这样的
 > member 时返回 `kIOError`，不把残缺或空的视图当作成员表下发。只记 heartbeat、
 > 不记 register：registrar 只在本进程注册成功之后才发 heartbeat，所以
-> heartbeat 一定来自曾在成员表里的节点；首次注册一直失败的节点（新节点，或
-> key 过期后才回来的节点）从未进入成员表，不会让 list 被扣住。各版本客户端在
+> heartbeat 一定来自曾在成员表里的节点；注册一直失败的节点（新节点，或
+> key 过期后才回来的节点）本进程尚未注册成功，不会让 list 被扣住。各版本客户端在
 > list 失败时都保留 last-good ring，所以**全部** MDS 副本升级后现网客户端即受
 > 保护；未升级的副本仍会下发残缺视图。
 > - 恢复：这些 member 全部回到 etcd（由本 MDS 或其他 MDS 写入均可），或已有
