@@ -89,7 +89,6 @@ def _bare(**attrs):
         "indexer": True,
         "draft_indexer": True,
     }
-    obj._put_retry_recovered = 0
     obj.transport_mode = "rdma"
     obj._backup_exist_gate = True
     for k, v in attrs.items():
@@ -167,7 +166,7 @@ class TestPutSgFlat(unittest.TestCase):
         calls = []
         obj._batch_put_sg = lambda sks, sp, ss: calls.append(sks) or [True] * len(sks)
         res = obj._put_sg_flat(["a", "b"], [[1]], [[8]])
-        self.assertEqual(res, [True, True])
+        self.assertEqual(res, ([True, True], 0))
         self.assertEqual(calls, [])  # nothing written — gate short-circuited
 
     def test_transient_failure_recovered_on_retry(self):
@@ -176,16 +175,14 @@ class TestPutSgFlat(unittest.TestCase):
         seq = [[False], [True]]  # first put fails, retry succeeds
         obj._batch_put_sg = lambda sks, sp, ss: seq.pop(0)
         res = obj._put_sg_flat(["a"], [[1]], [[8]])
-        self.assertEqual(res, [True])
-        self.assertEqual(obj._put_retry_recovered, 1)
+        self.assertEqual(res, ([True], 1))
 
     def test_persistent_failure_stays_false(self):
         obj = _bare()
         obj._batch_exist_flat = lambda sks: [False]
         obj._batch_put_sg = lambda sks, sp, ss: [False]  # never succeeds
         res = obj._put_sg_flat(["a"], [[1]], [[8]])
-        self.assertEqual(res, [False])
-        self.assertEqual(obj._put_retry_recovered, 0)
+        self.assertEqual(res, ([False], 0))
 
     def test_gate_disabled_writes_all(self):
         obj = _bare()
@@ -194,7 +191,7 @@ class TestPutSgFlat(unittest.TestCase):
             AssertionError("exist must not be called when gate disabled"))
         obj._batch_put_sg = lambda sks, sp, ss: [True] * len(sks)
         self.assertEqual(obj._put_sg_flat(["a", "b"], [[1], [2]], [[8], [8]]),
-                         [True, True])
+                         ([True, True], 0))
 
 
 class TestSupportsDeviceTransfer(unittest.TestCase):

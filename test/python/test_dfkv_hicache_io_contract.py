@@ -237,10 +237,9 @@ class ConcurrentV2Transfers(unittest.TestCase):
                               "index": _HostPool(nbytes=7)},
             _pool_component_names={"state": ("all",), "index": ("all",)},
             _pool_replicated={"state": False, "index": False},
-            _put_retry_recovered=0,
             _metrics=metrics,
         )
-        st._put_flat = lambda sks, _ptrs, _sizes: [True] * len(sks)
+        st._put_flat = lambda sks, _ptrs, _sizes: ([True] * len(sks), 0)
         outcome = {}
 
         def backup():
@@ -301,6 +300,56 @@ class ConcurrentV2Transfers(unittest.TestCase):
         self.assertEqual(results, {"state": [True]})
         self.assertEqual((io.nbytes, io.pools), (64, ("state",)))
         self.assertEqual(set(vars(st)), before)
+
+
+class _Metrics2(_RecordingMetrics):
+    def on_set(self, **kwargs):
+        self.calls.append(("set", kwargs))
+
+
+class DeviceV2SetMetrics(unittest.TestCase):
+    """batch_set_v2_device: the sidecar metric counts the pools that did I/O,
+    with the bytes and time of the host sidecars too."""
+
+    def _plugin(self, writer):
+        metrics = _Metrics2()
+        st = _plugin(
+            _mla_replica_writer=writer,
+            registered_pools={"state": _HostPool(nbytes=100)},
+            _pool_component_names={"state": ("all",), "indexer": ("all",)},
+            _pool_replicated={"state": False, "indexer": True},
+            _sidecar_device_pools={"indexer": object()},
+            _metrics=metrics,
+        )
+        st._put_flat = lambda sks, _ptrs, _sizes: ([True] * len(sks), 1)
+        return st, metrics
+
+    def _set(self, st):
+        return st.batch_set_v2_device(
+            ["k1", "k2"], [0, 1],
+            [PoolTransfer("state", host_indices=[0, 1], keys=["k1", "k2"]),
+             types.SimpleNamespace(name="indexer", keys=["k1", "k2"],
+                                   host_indices=None, device_indices=[0, 1])])
+
+    def test_follower_counts_its_rank_sharded_host_sidecar(self):
+        # The latent and the replicated indexer are skipped on a follower,
+        # but the rank-sharded state is written there and must be counted.
+        st, metrics = self._plugin(writer=False)
+        res = self._set(st)
+        self.assertEqual(res["state"], [True, True])
+        self.assertEqual(len(metrics.calls), 1, "the sidecar write is counted")
+        self.assertEqual(metrics.calls, [("set_v2", {
+            "pages": 2, "ok_pages": 2, "nbytes": 200,
+            "seconds": metrics.calls[0][1]["seconds"]})])
+
+    def test_retry_recoveries_come_back_with_the_result(self):
+        st, _metrics = self._plugin(writer=False)
+        results, io = st._v2_io(
+            [PoolTransfer("state", host_indices=[0], keys=["k"])],
+            putting=True)
+        self.assertEqual(results, {"state": [True]})
+        self.assertEqual(io.recovered, 1)
+        self.assertNotIn("_put_retry_recovered", vars(st))
 
 
 @contextlib.contextmanager

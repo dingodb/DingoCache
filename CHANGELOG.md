@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- SGLang HiCache connector, `batch_set_v2_device`: the side-pool write metric
+  (`on_set_v2` counters) now counts every side pool that did I/O, with its
+  bytes and time. Host side pools were counted without their bytes and time,
+  and on a rank that does not write the replicated KV nothing was counted,
+  although rank-sharded side pools are written on every rank. The number of
+  puts that succeeded on the retry (`retry_ok=` in the access log) is now
+  returned with each put instead of being left on the storage object, where
+  a concurrent put overwrote it, and `batch_set_v2_device` reports the sum
+  over all of its puts instead of the last one.
 - SGLang HiCache connector: `batch_touch` with a retention TTL no longer
   repeats its whole work on every request. To protect a prefix it sends a SET,
   which the native client does not debounce (only a REFRESH with a TTL hint

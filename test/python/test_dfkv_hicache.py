@@ -2007,6 +2007,16 @@ class PutRetryTest(unittest.TestCase):
             st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
         st.register_mem_pool_host(FakeMlaPool(8, self.PAGE_BYTES,
                                               self.PAGE_SIZE))
+        # The retry recoveries come back with the put's result.
+        st.recovered = []
+        put = st._put_flat
+
+        def recording_put(*args):
+            stored, recovered = put(*args)
+            st.recovered.append(recovered)
+            return stored, recovered
+
+        st._put_flat = recording_put
         return st
 
     def _set(self, st, npages):
@@ -2021,7 +2031,7 @@ class PutRetryTest(unittest.TestCase):
         self.assertEqual(res, [True] * 8)
         self.assertEqual(len(calls["put"]), 2)          # initial + one retry
         self.assertEqual(len(calls["put"][1]), 3)       # only failed keys retried
-        self.assertEqual(st._put_retry_recovered, 3)
+        self.assertEqual(st.recovered, [3])
 
     def test_persistent_failures_stay_false(self):
         key = dfkv_hicache.pool_key(
@@ -2032,7 +2042,7 @@ class PutRetryTest(unittest.TestCase):
         self.assertEqual(res, [False, True, True, True])
         self.assertEqual(len(calls["put"]), 2)
         self.assertEqual(calls["put"][1], [key])
-        self.assertEqual(st._put_retry_recovered, 0)
+        self.assertEqual(st.recovered, [0])
 
     def test_no_retry_when_all_succeed(self):
         fake, calls = self._fake_lib()
@@ -2040,7 +2050,7 @@ class PutRetryTest(unittest.TestCase):
         res = self._set(st, 8)
         self.assertEqual(res, [True] * 8)
         self.assertEqual(len(calls["put"]), 1)          # no second call
-        self.assertEqual(st._put_retry_recovered, 0)
+        self.assertEqual(st.recovered, [0])
 
 
 if __name__ == "__main__":
