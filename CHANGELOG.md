@@ -36,6 +36,18 @@
   `dfkv_retain_pending_denied_total` (parked SETs the disk denied when they
   were applied) and `dfkv_retain_pending_entries` (SETs parked now). No
   setting, API or wire change.
+- Server, RAM tier: a REMOVE or a PUT of a key whose whole value is being
+  read from disk into a reserved RAM slot no longer waits for that read.
+  Only the thread serving the read finishes the reservation, after its disk
+  read and reply; on the same connection that thread may be the one that
+  then handles a REMOVE or PUT of the key. A REMOVE waited for it with no
+  limit (the thread hung, and a stop could not join it); a PUT waited
+  `DFKV_RAM_PUT_WAIT_MS` (with `0`, for ever) while holding its key's put
+  lock. Now a REMOVE cancels the reservation and returns (the read still
+  answers, its copy is not installed), and a PUT goes to the disk, which
+  already holds the key and answers it as for any key it has. Stock
+  clients send these on separate connections; a peer that pipelines them
+  on one could hang a server thread. No setting, API or wire change.
 
 - Client, GPU dedup (`DFKV_CLIENT_NODE_DEDUP_GPU=1`): restarting the
   inference processes in place no longer uses up the GPU dedup registry.

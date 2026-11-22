@@ -933,7 +933,11 @@ TEST(RamTier, RemovedPinnedGenerationRejectsRatherThanBypassing) {
   EXPECT_EQ(std::string(pinned.ptr, pinned.len), replacement);
 }
 
-TEST(RamTier, DuplicateOfAbortedHiddenReservationSharesFailure) {
+// A PUT of a key whose cold read holds a hidden reservation does not join
+// it (only the reading thread can finish it, and that may be the PUT's own
+// thread): it goes to the disk, which holds the key. It used to wait for
+// the reservation and share its outcome.
+TEST(RamTier, DuplicateOfHiddenReservationGoesToTheDisk) {
   FlushSink sink;
   RamTier::Options options = Opts(8 * 4096);
   options.large_reserve_bytes = 0;
@@ -943,15 +947,13 @@ TEST(RamTier, DuplicateOfAbortedHiddenReservationSharesFailure) {
   const std::string duplicate(1000, 'd');
   RamTierTestPeer::Completion completion;
   ASSERT_EQ(RamTierTestPeer::Admit(rt, K(36), duplicate, &completion),
-            RamTierTestPeer::Admission::kDuplicate);
-  EXPECT_FALSE(RamTierTestPeer::Done(completion));
+            RamTierTestPeer::Admission::kBypass);
+  EXPECT_FALSE(completion) << "nothing to wait for";
   EXPECT_FALSE(rt.Contains(K(36)));
   reservation = RamTier::DurableReservation{};
-  ASSERT_TRUE(RamTierTestPeer::Done(completion));
-  EXPECT_EQ(RamTierTestPeer::Wait(completion), Status::kIOError);
   EXPECT_FALSE(rt.Contains(K(36)));
   EXPECT_EQ(rt.UsedBytes(), 0u);
-  EXPECT_EQ(rt.PutBypass(), 0u);
+  EXPECT_EQ(rt.PutBypass(), 0u) << "not an arena-pressure bypass";
 }
 
 TEST(RamTier, RemoveHidesActiveFlushAndDefersPinnedRelease) {
@@ -2586,3 +2588,46 @@ TEST(RamTier, APromotionOfAValueTheDiskNoLongerHoldsIsNotInstalled) {
   EXPECT_TRUE(rt.Contains(K(3))) << "the disk still holds it: installed";
 }
 
+// ---- A cold-read reservation and the operations that meet it (REQ-10) --------
+// Only the thread that holds a reservation can finish it, after its disk read
+// and reply. A REMOVE or a PUT of the key on that same thread used to wait for
+// it for ever (a REMOVE) or for put_wait_ms (a PUT; for ever with 0). Neither
+// may wait: the REMOVE cancels the reservation and returns, the PUT goes to
+// the disk, which already holds the key.
+TEST(RamTier, OperationsOnAKeyWithAColdReadReservationDoNotWaitForIt) {
+  FlushSink sink;
+  RamTier::Options o = Opts(64 * 4096);
+  o.put_wait_ms = 0;
+  RamTier rt(o, sink.fn());
+  const std::string v(5000, 'r');
+  for (bool remove : {true, false}) {
+    SCOPED_TRACE(remove ? "remove" : "put");
+    RamTier::DurableReservation reservation;
+    ASSERT_TRUE(rt.ReserveDurable(K(9), v.size(), &reservation));
+    std::atomic<bool> done{false};
+    RamTier::PutResult put{Status::kIOError};
+    bool removed = false;
+    std::thread op([&] {
+      if (remove)
+        removed = rt.Remove(K(9));
+      else
+        put = rt.PutWriteBack(K(9), v.data(), v.size());
+      done = true;
+    });
+    const bool returned = WaitFor([&] { return done.load(); });
+    EXPECT_TRUE(returned) << "it waited for the reservation";
+    std::memcpy(reservation.data(), v.data(), v.size());
+    const bool installed = reservation.Commit();  // lets a waiter go
+    op.join();
+    if (remove) {
+      EXPECT_TRUE(removed);
+      EXPECT_FALSE(installed) << "the remove canceled the promotion";
+      EXPECT_FALSE(rt.Contains(K(9)));
+    } else {
+      EXPECT_EQ(put.status, Status::kCacheFull);
+      EXPECT_EQ(put.disposition, RamTier::PutDisposition::kBypass);
+      EXPECT_TRUE(installed);
+      rt.Remove(K(9));
+    }
+  }
+}
