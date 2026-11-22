@@ -19,6 +19,8 @@ TEST(MdsMetrics, CountsAndRenders) {
   m.local_client_leases.store(11);
   m.local_member_leases_pruned.store(101);
   m.local_client_leases_pruned.store(203);
+  m.lists_withheld.store(17);
+  m.unwritten_members.store(5);
 
   std::string t = m.Render();
   EXPECT_NE(t.find("# TYPE dfkv_mds_list_requests_total counter"), std::string::npos) << t;
@@ -34,6 +36,12 @@ TEST(MdsMetrics, CountsAndRenders) {
             std::string::npos) << t;
   EXPECT_NE(t.find("dfkv_mds_local_client_leases_pruned_total 203"),
             std::string::npos) << t;
+  EXPECT_NE(t.find("# TYPE dfkv_mds_list_withheld_total counter"),
+            std::string::npos) << t;
+  EXPECT_NE(t.find("dfkv_mds_list_withheld_total 17"), std::string::npos) << t;
+  EXPECT_NE(t.find("# TYPE dfkv_mds_unwritten_members gauge"),
+            std::string::npos) << t;
+  EXPECT_NE(t.find("dfkv_mds_unwritten_members 5"), std::string::npos) << t;
   // build_info gauge exposes the MDS version (mirrors dfkv_server).
   EXPECT_NE(t.find("# TYPE dfkv_build_info gauge"), std::string::npos) << t;
   EXPECT_NE(t.find("dfkv_build_info{version=\""), std::string::npos) << t;

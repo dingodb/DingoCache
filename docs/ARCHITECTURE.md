@@ -523,6 +523,7 @@ data plane or the connection fails.
 | first-request absolute deadline | `DFKV_TCP_FIRST_REQ_MS` / `DFKV_MDS_FIRST_REQ_MS` / `DFKV_METRICS_FIRST_REQ_MS` | 30000 ms; `0` = off | anchored at accept: the first complete frame/request line is due within this window, so a drip feeder cannot pin a handler thread; `dfkv_server` also publishes its resolved value as the `dfkv_tcp_first_req_ms` gauge |
 | MDS legacy control-plane shim | `DFKV_MDS_ACCEPT_LEGACY=1` | off (strict epoch gate) | widens the MDS control-plane version gate by exactly one epoch so v1.x peers are served with legacy 42/10-byte framing during a mixed-generation migration; data-plane listeners stay strictly epoch 6/7; drop the env once `dfkv_mds_legacy_frames_total` drains to zero |
 | MDS /readyz etcd probe debounce | `DFKV_MDS_PROBE_CACHE_MS` | 2500 ms (clamp 600000; `0` = per-request probe) | TTL-debounced etcd reachability probe so kubelet scrape cadence cannot amplify into etcd read load during an incident |
+| MDS member list while etcd refuses writes | `DFKV_MDS_UNWRITTEN_HOLD_MS` | 120000 ms (four lease TTLs; clamp 600000; `0` = off) | the MDS remembers members whose heartbeat it received but could not write to etcd and answers `kIOError` to `ListMembers`/`ListTopology` while etcd no longer lists one of them, so clients keep their last ring instead of adopting a view emptied by lease expiry; a record is dropped by the member's next successful write or after this long without a heartbeat at that MDS; `0` serves the etcd view unconditionally (behaviour up to 2.36) |
 
 ---
 

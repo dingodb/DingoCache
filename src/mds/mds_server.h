@@ -85,6 +85,48 @@ class EtcdProbeCache {
 };
 
 
+// Members whose heartbeat reached this MDS but could not be written to etcd.
+//
+// The heartbeat proves the node is alive. When etcd takes no writes (out of
+// space it refuses Put and LeaseGrant, yet answers Range and keeps expiring
+// leases) the member's key runs out although nothing is wrong with the node,
+// and a member list read from etcd then omits nodes this MDS has just heard
+// from. ListMembers uses this record to tell such a view from a real removal:
+// a recorded member that etcd no longer lists means the view is not the
+// member list.
+//
+// A record goes away when the member's next write here succeeds, or `hold_ms`
+// after the failed heartbeat: by then a live member would have come back (its
+// registrar rotates over the MDS endpoints), so it has stopped heartbeating
+// here and its absence may be real. hold_ms == 0 records nothing. Clock is
+// injected for tests. Only local map work happens under the mutex.
+class UnwrittenMembers {
+ public:
+  using Clock = std::function<uint64_t()>;  // steady-clock milliseconds
+
+  UnwrittenMembers(uint64_t hold_ms, Clock clock)
+      : hold_ms_(hold_ms), clock_(std::move(clock)) {}
+
+  void Add(const std::string& key);
+  void Remove(const std::string& key);
+  // Recorded keys that start with `prefix` and are within the hold, sorted.
+  std::vector<std::string> Under(const std::string& prefix) const;
+  size_t Count() const;  // recorded keys within the hold
+  size_t Size() const;   // records kept, lapsed ones included (test/diagnostic)
+
+ private:
+  bool Held(uint64_t failed_at_ms, uint64_t now_ms) const {
+    return now_ms < failed_at_ms || now_ms - failed_at_ms <= hold_ms_;
+  }
+
+  const uint64_t hold_ms_;
+  Clock clock_;
+  mutable std::mutex mu_;
+  std::map<std::string, uint64_t> failed_at_ms_;  // etcd key -> failed heartbeat
+  uint64_t next_prune_ms_ = 0;
+};
+
+
 // Stateless MDS: nodes/clients connect over TCP (same wire framing as the cache
 // node). The MDS is the only etcd client; it holds each member's lease on the
 // node's behalf. The {key->leaseID} map is reconstructable from heartbeats, so
@@ -108,6 +150,8 @@ class MdsServer {
                                        std::memory_order_relaxed);
     metrics_.local_client_leases.store(client_leases_.Size(),
                                        std::memory_order_relaxed);
+    metrics_.unwritten_members.store(unwritten_.Count(),
+                                     std::memory_order_relaxed);
     bool ready = false;
     const std::string group_metrics = GroupMetricsText(&ready);
     std::string out = metrics_.Render() + etcd_.MetricsText() + group_metrics;
@@ -131,6 +175,10 @@ class MdsServer {
   bool ProbeEtcdCached() { return probe_cache_.Get(); }
 
   static constexpr int kTtlSeconds = 30;
+  // Default DFKV_MDS_UNWRITTEN_HOLD_MS: four lease TTLs, the margin the local
+  // lease shortcut already gives a registrar rotating over several MDS.
+  static constexpr uint64_t kUnwrittenHoldMs =
+      static_cast<uint64_t>(kTtlSeconds) * 4 * 1000;
 
  private:
   void AcceptLoop();
@@ -174,6 +222,8 @@ class MdsServer {
   std::vector<Conn> conns_;
   LocalLeaseMap leases_;
   LocalLeaseMap client_leases_;
+  UnwrittenMembers unwritten_;  // hold resolved in the ctor (env knob)
+  std::atomic<uint64_t> withheld_log_ms_{0};  // rate limit of the WARN line
   MdsMetrics metrics_;
 };
 

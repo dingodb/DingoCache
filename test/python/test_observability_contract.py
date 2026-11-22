@@ -85,6 +85,7 @@ PUBLIC_FAMILIES = {
     "dfkv_mds_keepalives_total",
     "dfkv_mds_lease_grants_total",
     "dfkv_mds_list_requests_total",
+    "dfkv_mds_list_withheld_total",
     "dfkv_mds_members",
     "dfkv_mds_ready",
     "dfkv_mds_register_requests_total",

@@ -68,6 +68,8 @@ heartbeat 不会重建环。节点增减**无需重启推理引擎**。
 `DFKV_MDS_SHRINK_GUARD_PCT`（默认 50%），客户端还要求该视图连续 3 次 poll
 才采纳（默认约 TTL+9s）。这段 hysteresis 期间继续使用旧环，传输失败由 peer
 cooldown 快速转为 miss。
+etcd 拒绝写入（空间配额用尽）使健康节点的 lease 批量过期时，MDS 不下发残缺
+视图而是让 list 失败，客户端保留旧环（见 DEPLOY.md §2b）。
 
 **客户端注册**（"谁在用 dfkv"）：三条路径在 MDS 发现成功后，自动把本连接器作为消费方
 注册到 `/dfkv/v1/groups/<g>/clients/<id>`（与节点成员表隔离，不入放置环）。死掉的连接器
