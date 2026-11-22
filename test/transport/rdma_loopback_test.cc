@@ -238,6 +238,24 @@ class RdmaTransportTestPeer {
                           RdmaTransport::Conn* conn) {
     transport->Release(node, RdmaTransport::Lane::kData, conn);
   }
+  static void SetPeerBusyRetryUs(RdmaTransport* transport, uint64_t us) {
+    transport->peer_busy_retry_us_ = us;
+  }
+  static void SetUnreachableHoldUs(RdmaTransport* transport, uint64_t us) {
+    transport->peer_unreachable_hold_us_ = us;
+  }
+  static RdmaTransport::Conn* AcquireControl(RdmaTransport* transport,
+                                             const std::string& node) {
+    return transport
+        ->Acquire(node, RdmaTransport::Lane::kControl,
+                  RdmaTransport::AcquireOptions{})
+        .conn;
+  }
+  static void ReleaseControl(RdmaTransport* transport,
+                             const std::string& node,
+                             RdmaTransport::Conn* conn) {
+    transport->Release(node, RdmaTransport::Lane::kControl, conn);
+  }
 
   static void ReleaseDataAt(RdmaTransport* transport, const std::string& node,
                             Connection* conn, uint64_t now_us) {
@@ -596,6 +614,17 @@ std::vector<std::pair<std::string, long>> LabeledSeries(
     begin = end + 1;
   }
   return series;
+}
+
+// True when the family has series and every one of them is zero.
+bool LabeledSeriesAllZero(const std::string& text, const std::string& family) {
+  const auto series = LabeledSeries(text, family);
+  if (series.empty()) return false;
+  for (const auto& [labels, value] : series) {
+    (void)labels;
+    if (value != 0) return false;
+  }
+  return true;
 }
 
 // Value of one label inside a label block returned by LabeledSeries.
@@ -5371,6 +5400,320 @@ TEST(RdmaLoopback, FreshConnectionFailingAfterAStaleOneCoolsThePeerRail) {
   EXPECT_EQ(RdmaTransportTestPeer::RemoteAllowed(
                 rt, peer_id, {1}, rdma::RailPolicy::NowMicros()),
             (std::vector<uint8_t>{0}));
+}
+
+// The one ACTIVE device these tests pin the client to: DFKV_RDMA_DEV when it
+// names a single device, the first discovered one otherwise. Empty when the
+// host has none.
+std::string SingleTestRail() {
+  const auto discovered = rdma::RdmaTopology::Discover(
+      {}, rdma::RdmaDiscoveryPolicy::kActiveOnly);
+  if (discovered.status != rdma::RdmaDiscoveryStatus::kOk ||
+      discovered.devices.empty())
+    return std::string();
+  const char* configured = std::getenv("DFKV_RDMA_DEV");
+  return configured && *configured && std::strchr(configured, ',') == nullptr
+             ? configured
+             : discovered.devices.front().name;
+}
+
+// A TCP connect that fails says the node is not there. It says nothing about
+// a rail: every rail dials the same address. So no peer rail is charged and
+// nothing is dialed a second time; the caller gets kIOError, which is what
+// cools the node in the client above the transport.
+TEST(RdmaLoopback, UnreachablePeerIsANodeFailureNotARailFailure) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  const std::string rail = SingleTestRail();
+  if (rail.empty()) GTEST_SKIP() << "no ACTIVE RDMA device";
+  ScopedEnv one_rail("DFKV_RDMA_DEV", rail.c_str());
+
+  // Bound, never listening: a connect to it is refused at once.
+  const int dead = ::socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_GE(dead, 0);
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  socklen_t length = sizeof(address);
+  ASSERT_EQ(::bind(dead, reinterpret_cast<sockaddr*>(&address),
+                   sizeof(address)),
+            0);
+  ASSERT_EQ(
+      ::getsockname(dead, reinterpret_cast<sockaddr*>(&address), &length), 0);
+  const std::string dead_addr =
+      "127.0.0.1:" + std::to_string(ntohs(address.sin_port));
+
+  RdmaTransport rt(kMaxMsg, rail);
+  // Long enough that the second operation below falls inside it.
+  RdmaTransportTestPeer::SetUnreachableHoldUs(&rt, 60ull * 1000 * 1000);
+  const std::string peer_id = "absent-peer";
+  rt.OnPeerTopology(PublishedPeer(dead_addr, peer_id));
+  const std::vector<BlockKey> keys = {ToBlockKey(SelfHdr(), "absent")};
+  std::vector<char> exists;
+  EXPECT_EQ(rt.ExistMany(dead_addr, keys, &exists)[0], Status::kIOError);
+  // While the address is held as unreachable it is not dialed again: the
+  // next operation, or the client's background probe of the node, fails at
+  // once and does not wait for another connect.
+  EXPECT_EQ(rt.ExistMany(dead_addr, keys, &exists)[0], Status::kIOError);
+
+  std::string metrics = rt.MetricsText();
+  EXPECT_EQ(
+      CounterVal(metrics, "dfkv_rdma_client_peer_unreachable_skips_total"), 1);
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_peer_unreachable_total"), 1)
+      << "one connect, not one per rail or per attempt";
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_v2_probe_attempts_total"),
+            1);
+  EXPECT_EQ(
+      CounterVal(metrics, "dfkv_rdma_client_remote_rail_failures_total"), 0);
+  EXPECT_EQ(
+      CounterVal(metrics, "dfkv_rdma_client_remote_rail_cooldowns_total"), 0);
+  EXPECT_EQ(RdmaTransportTestPeer::RemoteAllowed(
+                rt, peer_id, {1}, rdma::RailPolicy::NowMicros()),
+            (std::vector<uint8_t>{1}));
+
+  // Once the hold is over the address is dialed again.
+  RdmaTransport dialing(kMaxMsg, rail);
+  RdmaTransportTestPeer::SetUnreachableHoldUs(&dialing, 0);
+  dialing.OnPeerTopology(PublishedPeer(dead_addr, peer_id));
+  EXPECT_EQ(dialing.ExistMany(dead_addr, keys, &exists)[0], Status::kIOError);
+  EXPECT_EQ(dialing.ExistMany(dead_addr, keys, &exists)[0], Status::kIOError);
+  metrics = dialing.MetricsText();
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_peer_unreachable_total"), 2);
+  EXPECT_EQ(
+      CounterVal(metrics, "dfkv_rdma_client_peer_unreachable_skips_total"), 0);
+  ::close(dead);
+}
+
+// A server at its limit of pending handshakes closes a new bootstrap
+// connection before sending anything. That is "busy", not a rail fault: the
+// client waits a moment and tries the same rail again, and gets through once
+// a slot is free.
+TEST(RdmaLoopback, BootstrapRefusedByABusyPeerIsRetriedNotCharged) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  const std::string rail = SingleTestRail();
+  if (rail.empty()) GTEST_SKIP() << "no ACTIVE RDMA device";
+  ScopedEnv one_rail("DFKV_RDMA_DEV", rail.c_str());
+  RdmaNode node("busy-then-served");
+  RdmaServerTestPeer::SetMaxPendingHandshakes(node.rsrv.get(), 1);
+  RdmaTransport rt(kMaxMsg, rail);
+  // The slot has to be free again before the retry: give the releasing
+  // thread and the server far more time than they need.
+  RdmaTransportTestPeer::SetPeerBusyRetryUs(&rt, 500 * 1000);
+  const std::string peer_id = "busy-peer";
+  rt.OnPeerTopology(PublishedPeer(node.addr, peer_id));
+
+  // A peer that connects and sends nothing takes the only slot.
+  const int silent = net::Dial(node.addr, 2000, 2000);
+  ASSERT_GE(silent, 0);
+  for (int i = 0; i < 500 && node.rsrv->PendingHandshakes() != 1; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  ASSERT_EQ(node.rsrv->PendingHandshakes(), 1u);
+  // It lets go as soon as the server has refused the client once.
+  std::thread releasing([&] {
+    while (node.rsrv->RejectedConnections() == 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    ::close(silent);
+  });
+  // (The server notices the close and frees the slot within the pause.)
+
+  const std::vector<BlockKey> keys = {ToBlockKey(SelfHdr(), "absent")};
+  std::vector<char> exists;
+  const Status status = rt.ExistMany(node.addr, keys, &exists)[0];
+  releasing.join();
+  EXPECT_NE(status, Status::kIOError);
+  EXPECT_NE(status, Status::kNoCompatibleRail);
+
+  const std::string metrics = rt.MetricsText();
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_peer_busy_total"), 1);
+  EXPECT_EQ(node.rsrv->RejectedConnections(), 1u)
+      << "one refused connection, then one that was served";
+  EXPECT_EQ(
+      CounterVal(metrics, "dfkv_rdma_client_remote_rail_failures_total"), 0);
+  EXPECT_EQ(
+      CounterVal(metrics, "dfkv_rdma_client_remote_rail_cooldowns_total"), 0);
+}
+
+// A server that does not serve the device the client asks for closes the
+// bootstrap connection before replying, exactly like a server that is full.
+// The retry therefore goes to another rail when the client has one: the
+// operation succeeds there, and no operation fails on the way.
+TEST(RdmaLoopback, BootstrapRefusedForOneDeviceIsRetriedOnAnotherRail) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const auto discovered = rdma::RdmaTopology::Discover(
+      {}, rdma::RdmaDiscoveryPolicy::kActiveOnly);
+  if (discovered.status != rdma::RdmaDiscoveryStatus::kOk ||
+      discovered.devices.size() < 2)
+    GTEST_SKIP() << "needs two ACTIVE RDMA devices";
+  const std::string served_rail = discovered.devices[0].name;
+  const std::string refused_rail = discovered.devices[1].name;
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv numa("DFKV_RDMA_NUMA", "0");
+
+  // The server has one of the two devices only.
+  std::unique_ptr<RdmaNode> node;
+  {
+    ScopedEnv server_rail("DFKV_RDMA_DEV", served_rail.c_str());
+    node = std::make_unique<RdmaNode>("one-device-server");
+  }
+  ASSERT_EQ(node->rsrv->DeviceNames(),
+            (std::vector<std::string>{served_rail}));
+
+  // The client has both and starts with the one the server lacks.
+  ScopedEnv primary("DFKV_RDMA_PRIMARY_DEV", refused_rail.c_str());
+  RdmaTransport rt(kMaxMsg, refused_rail + "," + served_rail);
+  const std::vector<BlockKey> keys = {ToBlockKey(SelfHdr(), "absent")};
+  std::vector<char> exists;
+  const Status status = rt.ExistMany(node->addr, keys, &exists)[0];
+  EXPECT_NE(status, Status::kIOError);
+  EXPECT_NE(status, Status::kNoCompatibleRail);
+  EXPECT_NE(status, Status::kResourceExhausted);
+
+  const std::string metrics = rt.MetricsText();
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_peer_busy_total"), 1)
+      << "the first attempt went to the device the server lacks";
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_cross_rail_retries_total"),
+            1);
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_conns_opened_total"), 1);
+  EXPECT_EQ(DeviceCounterVal(metrics, "dfkv_rdma_client_rail_conns_total",
+                             served_rail),
+            1);
+}
+
+// Refused again on the retry: now it is charged to the peer rail, and the
+// client has made two connections in all, not one per rail and attempt.
+TEST(RdmaLoopback, BootstrapRefusedTwiceChargesThePeerRail) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  const std::string rail = SingleTestRail();
+  if (rail.empty()) GTEST_SKIP() << "no ACTIVE RDMA device";
+  ScopedEnv one_rail("DFKV_RDMA_DEV", rail.c_str());
+  RdmaNode node("busy-twice");
+  RdmaServerTestPeer::SetMaxPendingHandshakes(node.rsrv.get(), 1);
+  RdmaTransport rt(kMaxMsg, rail);
+  const std::string peer_id = "refusing-peer";
+  rt.OnPeerTopology(PublishedPeer(node.addr, peer_id));
+
+  const int silent = net::Dial(node.addr, 2000, 2000);
+  ASSERT_GE(silent, 0);
+  for (int i = 0; i < 500 && node.rsrv->PendingHandshakes() != 1; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  ASSERT_EQ(node.rsrv->PendingHandshakes(), 1u);
+
+  const std::vector<BlockKey> keys = {ToBlockKey(SelfHdr(), "absent")};
+  std::vector<char> exists;
+  EXPECT_EQ(rt.ExistMany(node.addr, keys, &exists)[0], Status::kIOError);
+  ::close(silent);
+
+  const std::string metrics = rt.MetricsText();
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_peer_busy_total"), 1);
+  EXPECT_EQ(node.rsrv->RejectedConnections(), 2u);
+  EXPECT_EQ(
+      CounterVal(metrics, "dfkv_rdma_client_remote_rail_failures_total"), 1);
+  EXPECT_EQ(
+      CounterVal(metrics, "dfkv_rdma_client_remote_rail_cooldowns_total"), 1);
+}
+
+// A caller buffer that cannot be registered is a problem of this process.
+// The rail and the peer had no part in it: neither is charged, no other rail
+// is tried, the caller is told it was a local resource, and the next
+// operation with a usable buffer goes through.
+TEST(RdmaLoopback, UnregistrableCallerBufferIsALocalFailure) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv inline_put("DFKV_RDMA_INLINE_PUT_MAX_BYTES", nullptr);
+  RdmaNode node("local-register");
+  RdmaTransport rt(kMaxMsg);
+  const std::string peer_id = "healthy-peer";
+  rt.OnPeerTopology(PublishedPeer(node.addr, peer_id));
+
+  // Mapped without any access: the kernel refuses to pin it.
+  const size_t bytes = 2 * 4096;
+  void* unpinnable = ::mmap(nullptr, bytes, PROT_NONE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  ASSERT_NE(unpinnable, MAP_FAILED);
+  const std::string good(bytes, 'g');
+  const BlockKey key = ToBlockKey(SelfHdr(), "local-register");
+
+  for (const bool batch : {false, true}) {
+    const long before = CounterVal(
+        rt.MetricsText(), "dfkv_rdma_client_local_resource_failures_total");
+    const Status status =
+        batch ? rt.CacheMany(node.addr, {{key, unpinnable, bytes}})[0]
+              : rt.Cache(node.addr, key, unpinnable, bytes);
+    EXPECT_EQ(status, Status::kResourceExhausted) << "batch=" << batch;
+    const std::string metrics = rt.MetricsText();
+    EXPECT_EQ(
+        CounterVal(metrics, "dfkv_rdma_client_local_resource_failures_total"),
+        before + 1)
+        << "batch=" << batch;
+    EXPECT_TRUE(LabeledSeriesAllZero(metrics,
+                                     "dfkv_rdma_client_rail_errors_total"))
+        << metrics;
+    EXPECT_EQ(
+        CounterVal(metrics, "dfkv_rdma_client_remote_rail_failures_total"), 0);
+    EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_cross_rail_retries_total"),
+              0);
+    EXPECT_EQ(rt.Cache(node.addr, key, good.data(), good.size()), Status::kOk)
+        << "batch=" << batch;
+  }
+  ::munmap(unpinnable, bytes);
+}
+
+// Out of descriptors while creating an endpoint: again this process, not the
+// device. The limit is set for real, in a forked child, so that one more
+// descriptor can be had (the bootstrap socket) and the next one cannot (the
+// endpoint's wake pipe).
+TEST(RdmaLoopback, EndpointOpenWithoutDescriptorsIsALocalFailure) {
+  constexpr int kNoDevice = 77;
+  const int result = testing_fd::RunInChild([] {
+    if (!HaveRdma()) return kNoDevice;
+    ::unsetenv("DFKV_RDMA_RAIL_TIERS");
+    ::setenv("DFKV_RDMA_KEEPALIVE_MS", "0", 1);
+    ::setenv("DFKV_RDMA_IDLE_MS", "0", 1);
+    RdmaNode node("local-open");
+    RdmaTransport rt(kMaxMsg);
+    RdmaTransportTestPeer::StopMaintenance(&rt);
+    rt.OnPeerTopology(PublishedPeer(node.addr, "healthy-peer"));
+    const std::vector<BlockKey> keys = {ToBlockKey(SelfHdr(), "absent")};
+    std::vector<char> exists;
+    // A served operation leaves the peer's capabilities known, so the next
+    // connection needs no probe, and its connection is then kept busy so
+    // that the next operation has to open another.
+    const Status served = rt.ExistMany(node.addr, keys, &exists)[0];
+    if (served == Status::kIOError || served == Status::kResourceExhausted)
+      return 10;
+    auto* held = RdmaTransportTestPeer::AcquireControl(&rt, node.addr);
+    if (!held) return 11;
+
+    Status starved = Status::kOk;
+    {
+      testing_fd::NoFreeDescriptors exhausted(/*spare=*/1);
+      if (!exhausted.active()) return 12;
+      starved = rt.ExistMany(node.addr, keys, &exists)[0];
+    }
+    if (starved != Status::kResourceExhausted) return 13;
+    const std::string metrics = rt.MetricsText();
+    if (CounterVal(metrics,
+                   "dfkv_rdma_client_local_resource_failures_total") != 1)
+      return 14;
+    if (!LabeledSeriesAllZero(metrics, "dfkv_rdma_client_rail_errors_total"))
+      return 15;
+    if (CounterVal(metrics, "dfkv_rdma_client_remote_rail_failures_total") !=
+        0)
+      return 16;
+    // With descriptors back the same operation is served.
+    if (rt.ExistMany(node.addr, keys, &exists)[0] != served) return 17;
+    RdmaTransportTestPeer::ReleaseControl(&rt, node.addr, held);
+    return 0;
+  });
+  if (result == kNoDevice) GTEST_SKIP() << "no RDMA device";
+  EXPECT_EQ(result, 0) << "step code from the child, see the test body";
 }
 
 // A failed work completion on the client must stay attributable afterwards:

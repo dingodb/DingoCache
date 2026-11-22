@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+- Client RDMA: three kinds of failure that have nothing to do with a rail are
+  no longer charged to one.
+  - The TCP connect to a peer's bootstrap address fails (node down, listener
+    gone). Every rail dials the same address, so no (peer, rail) pair is
+    cooled and the operation no longer makes a second connect over another
+    rail; with a dropped SYN that was two connect timeouts per operation, and
+    the rails were cooled two at a time. The operation fails with `kIOError`
+    as before, which is what makes `KVClient` cool the node. The address is
+    then not dialed again for `DFKV_RDMA_REMOTE_RAIL_COOLDOWN_MS` (2 s by
+    default, the time its rails used to be cooled for): operations that need
+    a new connection to it, and the client's background probe of the node,
+    fail at once with `kIOError` and do not each wait for a connect timeout.
+    Connections that are already established are not affected. Counters
+    `dfkv_rdma_client_peer_unreachable_total` and
+    `dfkv_rdma_client_peer_unreachable_skips_total`.
+  - The peer accepts the bootstrap connection and closes it before sending
+    anything, which is what a server at `DFKV_RDMA_MAX_PENDING_HANDSHAKES`
+    does, and also what a server does that does not serve the requested
+    device. On the first attempt of an operation nothing is charged: the
+    client waits 20 to 40 ms (random per caller) and tries once more, on
+    another compatible rail when it has one, as it did before, and on the
+    same rail otherwise, where it used to give up. Only a close on that
+    second attempt is charged to the (peer, rail) pair it happened on. An
+    operation still makes at most two connection attempts. A read that times
+    out, or a reply that is invalid, is charged at once as before. Counter
+    `dfkv_rdma_client_peer_busy_total`.
+  - This process cannot register a caller's buffer because of the
+    locked-memory limit or an address that cannot be pinned (`ENOMEM`,
+    `EAGAIN`, `EFAULT`, `EINVAL`), or cannot create an endpoint because it is
+    out of file descriptors or memory (`EMFILE`, `ENFILE`, `ENOMEM`). These
+    were recorded as local rail faults: after three of them every rail was
+    quarantined and the metrics looked like a hardware problem. Now no rail
+    is charged, no other rail is tried, the connection is closed without
+    blaming the peer, and the operation returns `kResourceExhausted`, which
+    does not cool the peer. A WARN line names what failed and the errno.
+    Registration and endpoint failures with any other errno are rail faults
+    as before. Counter `dfkv_rdma_client_local_resource_failures_total`.
+  No wire change.
 - Client RDMA: a failure is charged to the peer's rail only when it says
   something about that rail, and one event counts once.
   - A pooled connection that fails when it is reused, before anything has

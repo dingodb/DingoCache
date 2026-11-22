@@ -328,9 +328,17 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
                       uint8_t ib_port, bool direct_io_buffers,
                       size_t direct_io_cap) {
   cap_ = cap; depth_ = depth; ib_port_ = ib_port;
+  open_errno_ = 0;
+  errno = 0;  // so that a failure without an errno does not report an old one
+  // errno of the call that failed, taken before Close() can change it.
+  const auto fail = [this] {
+    open_errno_ = errno;
+    Close();
+    return false;
+  };
 
   int wp[2];
-  if (::pipe(wp) != 0) return false;  // self-pipe to interrupt WaitComp
+  if (::pipe(wp) != 0) return fail();  // self-pipe to interrupt WaitComp
   ::fcntl(wp[0], F_SETFL, O_NONBLOCK);
   wake_rfd_ = wp[0]; wake_wfd_ = wp[1];
 
@@ -341,14 +349,14 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
   auto shared = AcquireSharedDevice(dev_name);
   ctx_ = shared.first;
   pd_ = shared.second;
-  if (!ctx_ || !pd_) { Close(); return false; }
+  if (!ctx_ || !pd_) return fail();
 
   chan_ = ibv_create_comp_channel(ctx_);
-  if (!chan_) { Close(); return false; }
+  if (!chan_) return fail();
   int cqe = static_cast<int>(depth_ * 2 + 4);
   cq_ = ibv_create_cq(ctx_, cqe, nullptr, chan_, 0);
-  if (!cq_) { Close(); return false; }
-  if (ibv_req_notify_cq(cq_, 0) != 0) { Close(); return false; }
+  if (!cq_) return fail();
+  if (ibv_req_notify_cq(cq_, 0) != 0) return fail();
 
   // Negotiate scatter-gather width: min(kMaxSge, device cap). SGE0 carries the
   // wire prefix; the rest carry raw-payload segments. The two-SGE
@@ -393,7 +401,7 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
   qa.qp_type = IBV_QPT_RC;
   qa.sq_sig_all = 0;
   qp_ = ibv_create_qp(pd_, &qa);
-  if (!qp_) { Close(); return false; }
+  if (!qp_) return fail();
 
   // ibv_create_qp rewrites qa.cap with what the driver ACTUALLY granted, which
   // until now was discarded: max_sge_ came from the device attribute we derived
@@ -458,15 +466,15 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
     numa::BindMemory(rbuf_[i], cap_, numa_node_);
     smr_[i] = ibv_reg_mr(pd_, sbuf_[i], cap_, IBV_ACCESS_LOCAL_WRITE);
     rmr_[i] = ibv_reg_mr(pd_, rbuf_[i], cap_, IBV_ACCESS_LOCAL_WRITE);
-    if (!smr_[i] || !rmr_[i]) { Close(); return false; }
+    if (!smr_[i] || !rmr_[i]) return fail();
     if (direct_io_buffers) {
       void* p = nullptr;
-      if (posix_memalign(&p, kDirectIoAlign, dbuf_cap_) != 0) { Close(); return false; }
+      if (posix_memalign(&p, kDirectIoAlign, dbuf_cap_) != 0) return fail();
       dbuf_[i] = static_cast<char*>(p);
       numa::BindMemory(dbuf_[i], dbuf_cap_, numa_node_);
       dmr_[i] = ibv_reg_mr(pd_, dbuf_[i], dbuf_cap_,
                            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ);
-      if (!dmr_[i]) { Close(); return false; }
+      if (!dmr_[i]) return fail();
     }
   }
   for (size_t i = 0; i < depth_; ++i) {
@@ -474,7 +482,7 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
 
   // local addressing info
   ibv_port_attr pa{};
-  if (ibv_query_port(ctx_, ib_port_, &pa) != 0) { Close(); return false; }
+  if (ibv_query_port(ctx_, ib_port_, &pa) != 0) return fail();
   mtu_ = pa.active_mtu;
   local_.lid = pa.lid;
   local_.qpn = qp_->qp_num;
@@ -743,7 +751,10 @@ ibv_mr* RcEndpoint::RegisterUser(void* addr, size_t len) {
 
 ibv_mr* RcEndpoint::RegisterTransient(void* addr, size_t len,
                                       bool remote_write) {
-  if (!addr || len == 0) return nullptr;
+  if (!addr || len == 0) {
+    errno = EINVAL;  // callers read errno to tell why there is no MR
+    return nullptr;
+  }
   const auto a = reinterpret_cast<uintptr_t>(addr);
   const int access = remote_write
                          ? IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE

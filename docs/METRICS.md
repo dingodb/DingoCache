@@ -417,6 +417,10 @@ C 客户端快照还含传输级指标（RDMA 构建）：
 | `dfkv_rdma_client_v2_probe_attempts_total` / `dfkv_rdma_client_v2_probe_failures_total` | counter | 必选 v2 bootstrap probe 尝试 / 失败 |
 | `dfkv_rdma_client_stale_pool_retries_total` | counter | pooled QP 失败后改用 fresh connection 的重试 |
 | `dfkv_rdma_client_stale_pool_connections_total` | counter | 从池里取出复用时即失败的连接数（对端回收了空闲连接或已重启）。这类失败只丢弃该连接，不冷却对端 rail；对端有身份（经 MDS 发现）时同 (peer, rail) 的其余空闲连接一并丢弃，静态地址列表里的对端则不丢弃其余连接，它们各自被发现失效时各计一次；随后的 fresh connection 若也失败才计入 `dfkv_rdma_client_remote_rail_failures_total` 并冷却。持续增长 = server 的空闲回收（`DFKV_RDMA_IDLE_MS`）短于 client 的连接空闲时间，可开 `DFKV_RDMA_KEEPALIVE_MS` |
+| `dfkv_rdma_client_peer_unreachable_total` | counter | 新建连接时到对端 bootstrap 地址的 TCP connect 失败的次数（含能力探测）。这是节点级故障：不计任何 rail、不重试（各 rail 拨的是同一个地址），操作返回 `kIOError`，由上层按节点冷却。失败后该地址在 `DFKV_RDMA_REMOTE_RAIL_COOLDOWN_MS`（默认 2 s）内不再拨号 |
+| `dfkv_rdma_client_peer_unreachable_skips_total` | counter | 因同一地址刚 connect 失败（上一行的保持期内）而没有发起的建连次数；这些操作和后台节点探测立即返回 `kIOError`，不再各等一次 connect 超时。已建立的连接不受影响 |
+| `dfkv_rdma_client_peer_busy_total` | counter | 操作的首次建连被对端在回任何字节之前关闭的次数。server 的 pending handshake 达上限（`DFKV_RDMA_MAX_PENDING_HANDSHAKES`）或不提供所请求的设备时都是这样；不计 rail，等待 20–40 ms 后重试一次：有其他兼容 rail 就换 rail，否则在同一 rail。重试再被关闭才按 endpoint failure 计入 `dfkv_rdma_client_remote_rail_failures_total` 并冷却。持续增长时对照 server 的 `dfkv_rdma_rejected_connections_total` 和 server 日志里的设备拒绝 |
+| `dfkv_rdma_client_local_resource_failures_total` | counter | 因本进程资源问题失败的操作：调用方 buffer 注册失败且 errno 为 ENOMEM/EAGAIN/EFAULT/EINVAL（locked-memory 上限、地址不可 pin），或建 endpoint 时 fd/内存耗尽（EMFILE/ENFILE/ENOMEM）。不计 rail、不冷却对端、不换 rail 重试，操作返回 `kResourceExhausted`；日志里有 `cannot register a caller buffer` / `cannot create an endpoint` 及 errno。其他 errno 仍按本地 rail 故障处理。>0 先查本进程的 `ulimit -l` / `LimitMEMLOCK`，再查 `LimitNOFILE` |
 | `dfkv_rdma_client_cross_rail_retries_total` | counter | 无 label；client-local `kRailFailure` 后真正启动的 cross-rail logical retry。GET 可重试未完成 work；PUT 只有 request 未 post 才计入 |
 | `dfkv_rdma_client_cross_rail_retry_successes_total` | counter | 无 label；上述 retry 最终成功的 logical operation 数 |
 | `dfkv_rdma_client_cross_rail_retry_exhausted_total` | counter | 无 label；上述 retry 的第二次物理尝试仍失败 |
