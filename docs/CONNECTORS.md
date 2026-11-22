@@ -438,6 +438,18 @@ export DFKV_RDMA_MAX_BLOCK_BYTES=67108864    # 按最大实际对象配置；默
 
 传输相关 env 亦可走 extra_config（构造 `dfkv_client_options_v2` 前解析，
 extra_config 优先）：`"rdma_depth":K`、`"require_rdma":1`、`"rdma_numa":1`。
+HiCache 未给 `rdma_depth` 时取 env `DFKV_RDMA_DEPTH`，两者都没有则为 1（不是原生
+默认的 4）。`rdma_numa`、`require_rdma` 等开关按同一真值规则解析：`""`、`0`、
+`false`、`no`、`off` 为关，所以 `"rdma_numa":"0"` 是关。
+
+启动时校验 extra_config：与 `model_revision`、`tenant_id`、`kv_cache_dtype`、
+`prefill_cp_storage_layout`、`bind_runtime_layout` 只差一两个字符的未知键（如
+`modle_revision`）直接拒绝启动，否则它不被读取、默认值生效，本应区分的实例会共用
+key；整数键（`page_size`、`layer_num`、`dtype_tag`、`head_num`、`head_dim`、
+`dp_size`、`mds_poll_ms`、`batch_concurrency`、`rdma_depth`）不是整数时拒绝启动并
+指明键名（dtype 名称写在 `kv_cache_dtype`）。显式给了 `page_size` 时，注册主 host
+pool 会核对它等于 pool 的页大小（即 SGLang `--page-size`）或 DCP 下的逻辑页
+（`page_size × dcp_size`），否则拒绝并给出两个数。
 
 ### 2.2 SGLang 启动 + 后端配置
 

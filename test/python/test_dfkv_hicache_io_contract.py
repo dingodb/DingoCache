@@ -550,6 +550,122 @@ class ExistsV2Window(unittest.TestCase):
         self.assertEqual(res.restorable_prefix_pages, [4, 10])
 
 
+class ExtraConfigValidation(unittest.TestCase):
+    """extra_config checks that fail startup instead of serving under a
+    wrong identity or crashing with an unrelated message."""
+
+    validate = staticmethod(dfkv_hicache._validate_extra_config)
+
+    def test_misspelt_identity_key_is_refused(self):
+        for key in ("modle_revision", "model_revison", "tenantid",
+                    "kv_cache_dtpye", "bind_runtime_layouts"):
+            with self.assertRaisesRegex(ValueError, "did you mean"):
+                self.validate({"interface_v1": 1, key: "x"})
+
+    def test_known_and_unrelated_keys_pass(self):
+        self.validate({"interface_v1": 1, "model_revision": "r1",
+                       "tenant_id": "t", "kv_cache_dtype": "fp8_e4m3",
+                       "backend_name": "dfkv", "module_path": "dfkv_hicache",
+                       "class_name": "DfkvHiCache", "members": "a=b:1",
+                       "access_log": 1, "tp_lcm_size": 8})
+
+    def test_integer_keys_must_be_integers(self):
+        self.validate({"page_size": "64", "dtype_tag": 0x46384534,
+                       "layer_num": 61})
+        with self.assertRaisesRegex(ValueError, "kv_cache_dtype"):
+            self.validate({"dtype_tag": "fp8"})
+        for bad in ({"page_size": 6.5}, {"layer_num": "many"},
+                    {"rdma_depth": True}):
+            with self.assertRaisesRegex(ValueError, "must be an integer"):
+                self.validate(bad)
+
+    def test_declared_page_size_must_match_the_pool(self):
+        class Pool:
+            page_size = 32
+            dcp_size = 1
+
+        st = _plugin(cfg={"page_size": 64})
+        with self.assertRaisesRegex(RuntimeError, "pages 32 tokens"):
+            st._check_pool_page_size(Pool())
+        _plugin(cfg={})._check_pool_page_size(Pool())   # not declared
+
+    def test_dcp_pool_accepts_physical_or_logical_page(self):
+        # Under decode CP SGLang's host pool divides its widened page back
+        # to --page-size: page_size 64 with DCP 4 has a logical page of 256.
+        class Pool:
+            page_size = 64
+            dcp_size = 4
+
+        for declared in (64, 256):
+            _plugin(cfg={"page_size": declared})._check_pool_page_size(Pool())
+        with self.assertRaisesRegex(RuntimeError, "pages 64 tokens.*256"):
+            _plugin(cfg={"page_size": 32})._check_pool_page_size(Pool())
+
+    def test_overflowing_integers_are_refused(self):
+        for bad in (float("inf"), 10 ** 400):
+            with self.assertRaisesRegex(ValueError, "must be an integer"):
+                self.validate({"page_size": bad})
+
+
+class _OpenOnlyLib:
+    """What constructing the backend needs of libdfkv."""
+
+    def dfkv_open_v2(self, *_a):
+        return ctypes.c_void_p(0xBEEF)
+
+    def dfkv_transport_mode(self, *_a):
+        return b"tcp"
+
+    def dfkv_close(self, *_a):
+        return None
+
+    def dfkv_version(self, *_a):
+        return b"0.0.0"
+
+
+class ExtraConfigThroughTheBackend(unittest.TestCase):
+    """The checks through the public path: construct, register a pool."""
+
+    def setUp(self):
+        # Construction writes the native client's settings to os.environ.
+        env = unittest.mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ["DFKV_CLIENT_NODE_DEDUP"] = "0"
+        os.environ.pop("DFKV_RDMA_NUMA", None)
+
+    def _backend(self, **extra):
+        cfg = HiCacheStorageConfig(
+            tp_rank=0, tp_size=1, is_mla_model=True, model_name="cfg-test",
+            extra_config={"members": "n0=127.0.0.1:1", "interface_v1": 1,
+                          "client_stats_poll_s": 0, **extra})
+        with unittest.mock.patch.object(dfkv_hicache, "_load_lib",
+                                        return_value=_OpenOnlyLib()):
+            return dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+
+    def test_misspelt_identity_key_refuses_construction(self):
+        with self.assertRaisesRegex(ValueError, "did you mean"):
+            self._backend(modle_revision="r1")
+
+    def test_registration_checks_the_declared_page_size(self):
+        class Pool(_HostPool):
+            page_size = 64
+            dcp_size = 4
+
+        dcp = {"dcp_size": 4, "dcp_rank": 0}
+        self._backend(page_size=256, **dcp).register_mem_pool_host(Pool())
+        self._backend(page_size=64, **dcp).register_mem_pool_host(Pool())
+        with self.assertRaisesRegex(RuntimeError, "page_size is 32"):
+            self._backend(page_size=32, **dcp).register_mem_pool_host(Pool())
+
+    def test_rdma_numa_string_zero_is_off(self):
+        # "rdma_numa": "0" used to turn NUMA rail selection on (truthy str).
+        for value, expected in (("0", None), ("off", None), ("1", "1")):
+            os.environ.pop("DFKV_RDMA_NUMA", None)
+            self._backend(rdma_numa=value)
+            self.assertEqual(os.environ.get("DFKV_RDMA_NUMA"), expected, value)
+
+
 class _RecordingMetrics:
     """Collects the v2 metric calls with their arguments."""
 
