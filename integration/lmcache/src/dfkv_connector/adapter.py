@@ -103,6 +103,8 @@ class DfkvConnectorAdapter(ConnectorAdapter):
                 url=ov.target_url,
                 loop=context.loop,
                 local_cpu_backend=context.local_cpu_backend,
+                config=context.config,
+                metadata=context.metadata,
                 lib_path=ov.lib_path,
                 membership=ov.membership,
                 mds_poll_ms=ov.mds_poll_ms,

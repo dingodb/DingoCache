@@ -312,7 +312,16 @@ class DfkvL2Adapter(L2AdapterInterface):
         self._completed_lookups: dict[L2TaskId, Bitmap] = {}
         self._completed_loads: dict[L2TaskId, Bitmap] = {}
         self._locked_keys: dict[ObjectKey, int] = {}
-        # First-store-wins byte accounting (re-store of a known key adds 0).
+        # First-store-wins byte accounting (re-store of a known key adds 0),
+        # and the sizes delete() reports. Kept only when LMCache may evict
+        # from this adapter (aggregate capacity, or an eviction config such
+        # as per-salt quotas): then every entry is removed again by delete().
+        # Without eviction nothing would ever remove an entry -- dfkv evicts
+        # on its own -- and the map would grow with every key ever stored.
+        self._track_sizes = (
+            config.max_capacity_gb > 0
+            or getattr(config, "eviction_config", None) is not None
+        )
         self._key_sizes: dict[ObjectKey, int] = {}
         self._warned_no_remove = False
         self._lock = threading.Lock()
@@ -463,22 +472,29 @@ class DfkvL2Adapter(L2AdapterInterface):
         except Exception as e:  # pragma: no cover - network/lib failure path
             logger.warning("dfkv L2 store task %d failed: %s", task_id, e)
             ok, per_key = False, None
-        if ok:
-            flags = per_key if per_key is not None else [True] * len(keys)
+        # Keys stored by a partly failed task are stored all the same.
+        flags = per_key if per_key is not None else [ok] * len(keys)
+        with self._lock:
             for key, size, stored in zip(keys, sizes, flags):
                 if not stored:
                     continue
+                keys_stored.append(key)
+                if not self._track_sizes:
+                    # Without the size map a re-store cannot be told from a
+                    # first store: report 0 bytes, so LMCache's usage counters
+                    # (gauge, quota current_usage) do not climb with every
+                    # re-store. Listeners still see the key.
+                    sizes_stored.append(0)
+                    task_bytes += size
+                    continue
                 # First-store wins: a re-store of a known key adds 0 bytes but
                 # still notifies (so LRU can move_to_end); base counters no-op.
-                if key not in self._key_sizes:
-                    self._key_sizes[key] = size
-                    keys_stored.append(key)
-                    sizes_stored.append(size)
-                    task_bytes += size
-                else:
-                    keys_stored.append(key)
+                if key in self._key_sizes:
                     sizes_stored.append(0)
-        with self._lock:
+                    continue
+                self._key_sizes[key] = size
+                sizes_stored.append(size)
+                task_bytes += size
             self._completed_stores[task_id] = L2StoreResult(ok, task_bytes)
         if keys_stored:
             self._notify_keys_stored(keys_stored, sizes_stored)

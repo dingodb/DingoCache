@@ -119,6 +119,8 @@ class DfkvConnector(RemoteConnector):
         url: str,
         loop: asyncio.AbstractEventLoop,
         local_cpu_backend: LocalCPUBackend,
+        config: Any,
+        metadata: Any,
         exists_cache_capacity: int = 1_000_000,
         lib_path: Optional[str] = None,
         membership: str = "mds",
@@ -126,9 +128,33 @@ class DfkvConnector(RemoteConnector):
         rail_affinity: bool = False,
         rail_affinity_fallbacks: int = 1,
     ) -> None:
+        # The engine config and metadata come from the ConnectorContext: in
+        # the scheduler role local_cpu_backend is LMCache's SafeLocalCPUBackend
+        # stand-in, which has neither.
+        self._client = None
+        try:
+            self._init(
+                url, loop, local_cpu_backend, config, metadata,
+                exists_cache_capacity, lib_path, membership, mds_poll_ms,
+                rail_affinity, rail_affinity_fallbacks,
+            )
+        except BaseException as e:
+            # A client opened before the failure is ours alone: close it.
+            # LMCache's init_connection turns this error into a warning and
+            # runs without the backend, so it is logged as an error here.
+            if self._client is not None:
+                self._client.close()
+            logger.error("DfkvConnector not started; LMCache runs without it: %s", e)
+            raise
+
+    def _init(
+        self, url, loop, local_cpu_backend, config, metadata,
+        exists_cache_capacity, lib_path, membership, mds_poll_ms,
+        rail_affinity, rail_affinity_fallbacks,
+    ) -> None:
         with access_log("__init__", lambda: f"url={url}") as r:
-            self._check_supported_config(local_cpu_backend.config)
-            super().__init__(local_cpu_backend.config, local_cpu_backend.metadata)
+            self._check_supported_config(config)
+            super().__init__(config, metadata)
 
             endpoint = parse_dfkv_url(url, membership=membership)
             self._batch_max_keys = self._resolve_positive_int_env(
@@ -140,7 +166,7 @@ class DfkvConnector(RemoteConnector):
             self._assume_exists = self._resolve_bool_env(self._ENV_ASSUME_EXISTS)
 
             rdma_pools = self._collect_rdma_pools(local_cpu_backend)
-            _md = local_cpu_backend.metadata
+            _md = metadata
             use_mla = bool(getattr(_md, "use_mla", False))
             world_size = max(1, int(getattr(_md, "world_size", 1)))
             worker_id = int(getattr(_md, "worker_id", 0))

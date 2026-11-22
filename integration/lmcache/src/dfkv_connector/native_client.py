@@ -255,11 +255,17 @@ class DfkvNativeClient:
             # Register the host arena(s) once so RDMA Put/Get into any slice of
             # them skips per-op MR registration. No-op on TCP.
             regs = 0
-            for base, size in (rdma_pools or []):
-                if not base or not size:
-                    continue
-                self._register_memory(int(base), int(size))
-                regs += 1
+            try:
+                for base, size in (rdma_pools or []):
+                    if not base or not size:
+                        continue
+                    self._register_memory(int(base), int(size))
+                    regs += 1
+            except BaseException:
+                # Nothing else owns the opened handle yet: close it here.
+                self._lib.dfkv_close(self._h)
+                self._h = None
+                raise
 
             self._executor = ThreadPoolExecutor(
                 max_workers=max(1, int(get_parallelism)),

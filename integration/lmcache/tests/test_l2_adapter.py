@@ -109,13 +109,14 @@ class _FakeDfkvClient:
         self.closed = True
 
 
-def _mk_adapter() -> DfkvL2Adapter:
-    l2mod.DfkvNativeClient = _FakeDfkvClient  # type: ignore[assignment]
+def _mk_adapter(max_capacity_gb: float = 0.0, client_cls=None) -> DfkvL2Adapter:
+    l2mod.DfkvNativeClient = client_cls or _FakeDfkvClient  # type: ignore[assignment]
     cfg = DfkvL2AdapterConfig.from_dict(
         {
             "url": "dfkv://127.0.0.1:28150/glm",
             "membership": "mds",
             "model_name": "unit-test",
+            "max_capacity_gb": max_capacity_gb,
         }
     )
     return DfkvL2Adapter(cfg)
@@ -243,7 +244,8 @@ def test_batch_partial_hit():
 
 
 def test_store_byte_accounting_first_store_wins():
-    a = _mk_adapter()
+    # Byte accounting matters where LMCache evicts: aggregate capacity set.
+    a = _mk_adapter(max_capacity_gb=1.0)
     try:
         k = _key(20)
         payload = b"x" * 4096
@@ -256,6 +258,46 @@ def test_store_byte_accounting_first_store_wins():
         assert r2.is_successful() and r2.bytes_transferred() == 0
         usage = a.get_usage()
         assert usage.total_bytes_used == 4096
+    finally:
+        a.close()
+
+
+def test_sizes_are_not_kept_without_eviction():
+    # Nothing would remove an entry again without LMCache-side eviction (dfkv
+    # evicts on its own): the per-key size map must not grow with every key.
+    a = _mk_adapter()
+    try:
+        for i in range(50):
+            t = a.submit_store_task([_key(1000 + i)], [_FakeObj(b"z" * 64)])
+            assert _wait_for(lambda: a.pop_completed_store_tasks().get(t)).is_successful()
+        assert len(a._key_sizes) == 0
+        # Re-stores do not make the usage counters climb: without the map a
+        # store cannot be told from a re-store, so it reports 0 bytes.
+        for _ in range(3):
+            t = a.submit_store_task([_key(1000)], [_FakeObj(b"z" * 64)])
+            assert _wait_for(lambda: a.pop_completed_store_tasks().get(t)).is_successful()
+        assert a.get_usage().total_bytes_used == 0
+    finally:
+        a.close()
+
+
+class _PartlyFailingClient(_FakeDfkvClient):
+    async def batch_set(self, keys, bufs):
+        await super().batch_set(keys[:1], bufs[:1])
+        return False, [True] + [False] * (len(keys) - 1)
+
+
+def test_a_partly_failed_store_accounts_what_it_stored():
+    a = _mk_adapter(max_capacity_gb=1.0, client_cls=_PartlyFailingClient)
+    stored = []
+    a._notify_keys_stored = lambda keys, sizes: stored.append((list(keys), list(sizes)))
+    try:
+        t = a.submit_store_task(
+            [_key(2000), _key(2001)], [_FakeObj(b"a" * 128), _FakeObj(b"b" * 128)])
+        r = _wait_for(lambda: a.pop_completed_store_tasks().get(t))
+        assert not r.is_successful()
+        assert stored == [([_key(2000)], [128])], stored
+        assert a._key_sizes == {_key(2000): 128}
     finally:
         a.close()
 
@@ -282,7 +324,7 @@ def test_store_event_fd_is_signalled():
 
 
 def test_delete_removes_and_updates_byte_accounting():
-    a = _mk_adapter()
+    a = _mk_adapter(max_capacity_gb=1.0)
     try:
         k = _key(70)
         payload = b"y" * 2048
