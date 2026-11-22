@@ -5,6 +5,8 @@
 #include <chrono>
 #include <charconv>
 #include <cstring>
+#include <cstdio>
+#include <exception>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -264,29 +266,61 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
   const uint64_t base_capacity = opt.capacity_bytes / n;
   const uint64_t capacity_remainder = opt.capacity_bytes % n;
   write_mode_ = use_slab ? "direct" : "";
-  for (size_t i = 0; i < n; ++i) {
+  // Every disk is opened on its own thread. A slab store reads its whole table
+  // back before it can serve (seconds per disk with millions of objects), and
+  // the disks share nothing; one after the other, startup grew with the number
+  // of disks.
+  struct Opened {
+    std::unique_ptr<StoreEngine> store;
+    DiskSlabStore* slab = nullptr;
+    std::exception_ptr error;
+  };
+  std::vector<Opened> opened(n);
+  auto open_one = [&](size_t i) {
     const std::string& dir = opt.cache_dirs[i];
     const uint64_t disk_capacity =
         base_capacity + (i < capacity_remainder ? 1 : 0);
-    std::unique_ptr<StoreEngine> store;
-    if (opt.engine_factory) {
-      store = opt.engine_factory(dir, disk_capacity);
-    } else if (use_slab) {
-      DiskSlabStore::Options so;
-      so.dir = dir;
-      so.capacity_bytes = disk_capacity;
-      so.direct_writes = slab_direct;
-      if (slab_gran) so.slot_granularity = slab_gran;
-      so.table_sync_ms = sync_ms;
-      so.reclaim_interval_ms = reclaim_ms;
-      so.warm_restart = slab_warm;
-      auto slab = std::make_unique<DiskSlabStore>(so);
-      slabs_.push_back(slab.get());
-      if (!slab->DirectWritesActive()) write_mode_ = "buffered";
-      store = std::move(slab);
-    } else {
-      store =
-          std::make_unique<KVStore>(KVStore::Options{dir, disk_capacity});
+    try {
+      if (opt.engine_factory) {
+        opened[i].store = opt.engine_factory(dir, disk_capacity);
+      } else if (use_slab) {
+        DiskSlabStore::Options so;
+        so.dir = dir;
+        so.capacity_bytes = disk_capacity;
+        so.direct_writes = slab_direct;
+        if (slab_gran) so.slot_granularity = slab_gran;
+        so.table_sync_ms = sync_ms;
+        so.reclaim_interval_ms = reclaim_ms;
+        so.warm_restart = slab_warm;
+        auto slab = std::make_unique<DiskSlabStore>(so);
+        opened[i].slab = slab.get();
+        opened[i].store = std::move(slab);
+      } else {
+        opened[i].store =
+            std::make_unique<KVStore>(KVStore::Options{dir, disk_capacity});
+      }
+    } catch (...) {
+      opened[i].error = std::current_exception();
+    }
+  };
+  const auto open_started = std::chrono::steady_clock::now();
+  {
+    std::vector<std::thread> helpers;
+    helpers.reserve(n - 1);
+    for (size_t i = 1; i < n; ++i) helpers.emplace_back(open_one, i);
+    open_one(0);
+    for (auto& helper : helpers) helper.join();
+  }
+  // What an engine threw is rethrown here, on the constructing thread, as it
+  // was when the disks were opened in a loop.
+  for (auto& disk : opened)
+    if (disk.error) std::rethrow_exception(disk.error);
+  for (size_t i = 0; i < n; ++i) {
+    const std::string& dir = opt.cache_dirs[i];
+    std::unique_ptr<StoreEngine> store = std::move(opened[i].store);
+    if (opened[i].slab) {
+      slabs_.push_back(opened[i].slab);
+      if (!opened[i].slab->DirectWritesActive()) write_mode_ = "buffered";
     }
     if (!store) {
       fail(dir + ": engine factory returned null");
@@ -300,6 +334,14 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
     by_id_[dir] = i;
     disks_.push_back(std::move(store));
     ring_.AddNode(dir, disk_weight);
+  }
+  if (n > 1) {
+    char seconds[32];
+    std::snprintf(seconds, sizeof(seconds), "%.2f",
+                  std::chrono::duration<double>(
+                      std::chrono::steady_clock::now() - open_started).count());
+    DFKV_LOG_INFO("disk stores opened: " + std::to_string(n) + " disks in " +
+                  seconds + " s");
   }
   ring_.Build();
   if (disks_.size() > 1) {

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Server: the disks of a node are opened at the same time instead of one after
+  the other. A slab store reads its whole table back before it can serve, so
+  startup grew by seconds per disk: with six disks and 13.5 million objects,
+  34 s passed before the RAM tier even started to pre-fault. One log line,
+  `disk stores opened: N disks in S s`, reports the time. An engine factory
+  (tests only) is now called from one thread per directory.
 - Server: a stopping `dfkv_server` gets its disks clean before it releases
   memory. The clean marker used to be written by the disk stores' destructors,
   which run after the RDMA registrations are released and the RAM tier arena is
