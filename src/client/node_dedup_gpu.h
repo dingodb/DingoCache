@@ -157,6 +157,11 @@ class GpuNodeDedup {
   bool IssueCopySg(Slot* s, const BlockKey& key, const Seg* segs, size_t nsegs,
                    size_t total_cap, CUstream st, CopySnap* snap);
   bool ValidateCopy(const CopySnap& snap) const;
+  // Ownership tokens (client/dedup_token.h) name a slot and its generation;
+  // see NodeDedup for the three helpers.
+  uint64_t TokenFor(const Slot* s, uint64_t gen) const;
+  Slot* OwnedSlot(uint64_t token) const;
+  bool LockOwned(Slot* s, const BlockKey& key, uint64_t token);
   bool CopyOutSg(Slot* s, const BlockKey& key, const Seg* segs, size_t nsegs,
                  size_t total_cap, size_t* got);
   // Cached cuIpcOpenMemHandle of registry entry idx at generation gen;

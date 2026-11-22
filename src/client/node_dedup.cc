@@ -11,6 +11,7 @@
 #include <cstring>
 #include <thread>
 
+#include "client/dedup_token.h"
 #include "utils/log.h"
 
 namespace dfkv {
@@ -22,6 +23,8 @@ constexpr uint32_t kStateFetching = 1;
 constexpr uint32_t kStateReady = 2;
 constexpr uint32_t kStatePublishing = 3;
 constexpr size_t kAnyLen = SIZE_MAX;  // CopyOut strict_n wildcard
+// Slot::publisher while a publisher that can be fenced holds PUBLISHING.
+constexpr uint32_t kFenceablePublisher = 0x46454e43u;
 
 uint64_t EnvU64(const char* name, uint64_t dflt) {
   const char* v = std::getenv(name);
@@ -40,6 +43,13 @@ uint32_t Pow2AtLeast(uint32_t v) {
 // 64-byte slot. gen is a seqlock over {identity, payload location}: odd while
 // a writer mutates, +1 to even when coherent. state transitions are CAS-only
 // (EMPTY->FETCHING, expired-READY->FETCHING, FETCHING->READY/EMPTY).
+//
+// publisher was padding in every release that shares this layout: no release
+// reads it and none before this one writes it, so it is zero unless a
+// publisher of this or a later release is inside Publish. Such a publisher
+// commits with a compare-and-swap on gen, which is what lets an invalidation
+// take the slot away from it (see ForceOutPublisher); a publisher of an older
+// release finishes with unconditional stores and must be waited for.
 struct NodeDedup::Slot {
   std::atomic<uint64_t> gen;
   std::atomic<uint32_t> state;
@@ -47,7 +57,7 @@ struct NodeDedup::Slot {
   uint64_t key_hi;
   uint64_t key_lo;
   uint32_t kind;                       // Kind: data vs exist namespace
-  uint32_t pad;
+  std::atomic<uint32_t> publisher;     // kFenceablePublisher or 0
   std::atomic<uint64_t> fetch_start_ms;
   uint64_t payload_off;                // absolute offset into the arena
   uint64_t alloc_seq;                  // arena cursor value at allocation (lap check)
@@ -285,8 +295,10 @@ NodeDedup::Role NodeDedup::ClaimImpl(const BlockKey& key, Kind kind, size_t cap,
       // Expired, torn or size-mismatched READY data falls through to Reserve;
       // the stale slot may be recycled but is never returned as a hit.
     } else if (st == kStateFetching) {
+      // (`now` was read before the lookup: a fetch begun since is newer.)
       const uint64_t started = s->fetch_start_ms.load(std::memory_order_relaxed);
-      if (now - started <= static_cast<uint64_t>(takeover_ms_))
+      if (started >= now ||
+          now - started <= static_cast<uint64_t>(takeover_ms_))
         return Role::kWait;
       uint32_t expect = kStateFetching;
       if (s->state.compare_exchange_strong(expect, kStatePublishing,
@@ -295,13 +307,27 @@ NodeDedup::Role NodeDedup::ClaimImpl(const BlockKey& key, Kind kind, size_t cap,
         s->fetch_start_ms.store(now, std::memory_order_relaxed);
         const uint64_t mine = s->gen.fetch_add(1, std::memory_order_release) + 1;
         s->state.store(kStateFetching, std::memory_order_release);
-        if (token) *token = mine;
+        if (token) *token = TokenFor(s, mine);
         fetches_.fetch_add(1, std::memory_order_relaxed);
         return Role::kFetch;
       }
       return Role::kWait;
     } else if (st == kStatePublishing) {
-      return Role::kWait;
+      // A publisher killed inside Publish never leaves this state. Once it
+      // has been publishing for longer than the takeover age, take the slot
+      // away from it (possible only for a publisher that can be fenced) and
+      // fetch.
+      // The mark is read before the stamp: PublishBegin writes the stamp
+      // first, so a marked slot carries the time this publish began, not the
+      // time of the fetch before it. (`now` was read before the lookup: a
+      // publish begun since is newer.)
+      if (s->publisher.load(std::memory_order_acquire) != kFenceablePublisher)
+        return Role::kWait;
+      const uint64_t started = s->fetch_start_ms.load(std::memory_order_relaxed);
+      if (started >= now ||
+          now - started <= static_cast<uint64_t>(takeover_ms_) ||
+          !ForceOutPublisher(s))
+        return Role::kWait;
     }
   }
   if (Slot* mine = Reserve(key, kind)) {
@@ -321,7 +347,8 @@ NodeDedup::Role NodeDedup::ClaimImpl(const BlockKey& key, Kind kind, size_t cap,
       if (pass == 0)
         for (volatile int spin = 0; spin < 2000; ++spin) {}
     }
-    if (token) *token = mine->gen.load(std::memory_order_acquire);
+    if (token)
+      *token = TokenFor(mine, mine->gen.load(std::memory_order_acquire));
     fetches_.fetch_add(1, std::memory_order_relaxed);
     return Role::kFetch;
   }
@@ -346,15 +373,114 @@ NodeDedup::Role NodeDedup::ClaimExist(const BlockKey& key, bool* val,
   return r;
 }
 
-void NodeDedup::Publish(const BlockKey& key, Kind kind, uint64_t token,
-                        const char* data, size_t n) {
-  if (token == 0) return;
-  Slot* s = Find(key, kind);
-  if (!s || s->gen.load(std::memory_order_acquire) != token) return;
+uint64_t NodeDedup::TokenFor(const Slot* s, uint64_t gen) const {
+  return dedup_token::Make(static_cast<uint32_t>(s - slots_), gen);
+}
+
+NodeDedup::Slot* NodeDedup::OwnedSlot(uint64_t token) const {
+  if (!dedup_token::Valid(token)) return nullptr;
+  const uint32_t idx = dedup_token::SlotIndex(token);
+  if (idx >= nslots_) return nullptr;
+  Slot* s = &slots_[idx];
+  if (!dedup_token::SameGen(token, s->gen.load(std::memory_order_acquire)))
+    return nullptr;
+  return s;
+}
+
+bool NodeDedup::LockOwned(Slot* s, const BlockKey& key, Kind kind,
+                          uint64_t token) {
+  // The slot can be PUBLISHING with this claim's generation only while
+  // someone else's stale Publish or Abort holds it for the comparison below,
+  // which hands it back within a few instructions. Giving up at once would
+  // leave this fetch unpublished and the slot FETCHING until a takeover, so
+  // wait for it, bounded in case that holder was killed right there.
+  const auto give_up =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(lock_wait_ms_);
+  for (;;) {
+    uint32_t st = kStateFetching;
+    if (s->state.compare_exchange_strong(st, kStatePublishing,
+                                         std::memory_order_acq_rel))
+      break;
+    if (st != kStatePublishing ||
+        !dedup_token::SameGen(token, s->gen.load(std::memory_order_acquire)) ||
+        std::chrono::steady_clock::now() >= give_up)
+      return false;
+    std::this_thread::yield();
+  }
+  // The generation was last compared before the lock was taken. An
+  // invalidation followed by a new claim of this slot in between leaves it
+  // FETCHING again, for a later fetch of this key or for another key, and
+  // the lock is then on that claim. Nothing moves the generation while the
+  // slot is PUBLISHING, so this comparison settles it.
+  if (!dedup_token::SameGen(token, s->gen.load(std::memory_order_acquire)) ||
+      s->key_hi != key.digest_hi || s->key_lo != key.digest_lo ||
+      s->kind != static_cast<uint32_t>(kind)) {
+    s->state.store(kStateFetching, std::memory_order_release);
+    return false;
+  }
+  return true;
+}
+
+bool NodeDedup::ForceOutBegin(Slot* s) {
+  // Generation first: every way out of PUBLISHING moves it, so if it still
+  // has this value at the swap below, the state and the mark read in between
+  // belong to one and the same publish.
+  uint64_t g = s->gen.load(std::memory_order_acquire);
+  if (g & 1) return false;  // a publisher or another forcer is mid-write
+  if (s->state.load(std::memory_order_acquire) != kStatePublishing)
+    return false;
+  if (s->publisher.load(std::memory_order_acquire) != kFenceablePublisher)
+    return false;
+  // The publisher commits by swapping gen from g to g + 1, and so does this.
+  // Exactly one swap succeeds. If it is this one, the publisher, alive or
+  // not, can no longer write the slot, and the odd generation keeps every
+  // other forcer and every reader out until ForceOutFinish is through.
+  return s->gen.compare_exchange_strong(g, g + 1, std::memory_order_acq_rel);
+}
+
+void NodeDedup::ForceOutFinish(Slot* s) {
+  s->publisher.store(0, std::memory_order_release);
+  s->gen.fetch_add(1, std::memory_order_release);  // even: token superseded
+  s->state.store(kStateEmpty, std::memory_order_release);
+}
+
+bool NodeDedup::ForceOutPublisher(Slot* s) {
+  if (!ForceOutBegin(s)) return false;
+  ForceOutFinish(s);
+  return true;
+}
+
+bool NodeDedup::PublishBegin(Slot* s, const BlockKey& key, Kind kind,
+                             uint64_t token, PublishHold* hold) {
+  if (!LockOwned(s, key, kind, token)) return false;
+  hold->slot = s;
+  hold->gen = s->gen.load(std::memory_order_acquire);
+  // The age of a PUBLISHING slot is the time spent publishing, not the time
+  // the fetch took before: a claim gives the copy takeover_ms from here.
+  s->fetch_start_ms.store(NowMs(), std::memory_order_relaxed);
+  // From here an invalidation may take the slot at any moment.
+  s->publisher.store(kFenceablePublisher, std::memory_order_release);
+  return true;
+}
+
+bool NodeDedup::LockSlotForTest(Slot* s) {
   uint32_t st = kStateFetching;
-  if (!s->state.compare_exchange_strong(st, kStatePublishing,
-                                        std::memory_order_acq_rel))
-    return;
+  return s->state.compare_exchange_strong(st, kStatePublishing,
+                                          std::memory_order_acq_rel);
+}
+
+void NodeDedup::UnlockSlotForTest(Slot* s) {
+  s->state.store(kStateFetching, std::memory_order_release);
+}
+
+void NodeDedup::SetFenceableForTest(const PublishHold& hold, bool on) {
+  hold.slot->publisher.store(on ? kFenceablePublisher : 0,
+                             std::memory_order_release);
+}
+
+void NodeDedup::PublishFinish(const PublishHold& hold, const char* data,
+                              size_t n) {
+  Slot* s = hold.slot;
   // Ring-allocate: reserve [cur, cur+n) contiguously; skip the tail remainder
   // when a lap boundary would split the payload.
   uint64_t cur = hdr_->alloc_cursor.load(std::memory_order_relaxed);
@@ -371,21 +497,37 @@ void NodeDedup::Publish(const BlockKey& key, Kind kind, uint64_t token,
     }
   }
   std::memcpy(arena_ + off, data, n);
-  s->gen.fetch_add(1, std::memory_order_acq_rel);
+  // Commit. A failed swap means an invalidation took the slot during the
+  // copy: it is no longer this publisher's, so nothing more is written.
+  uint64_t g = hold.gen;
+  if (!s->gen.compare_exchange_strong(g, hold.gen + 1,
+                                      std::memory_order_acq_rel))
+    return;
   s->len = static_cast<uint32_t>(n);
   s->payload_off = off;
   s->alloc_seq = seq;
   s->fetch_start_ms.store(NowMs(), std::memory_order_relaxed);
+  s->publisher.store(0, std::memory_order_release);
   s->gen.fetch_add(1, std::memory_order_release);
   s->state.store(kStateReady, std::memory_order_release);
 }
 
+void NodeDedup::Publish(const BlockKey& key, Kind kind, uint64_t token,
+                        const char* data, size_t n) {
+  PublishHold hold;
+  Slot* s = OwnedSlot(token);
+  if (s && PublishBegin(s, key, kind, token, &hold))
+    PublishFinish(hold, data, n);
+}
+
+void NodeDedup::AbortSlot(Slot* s, const BlockKey& key, Kind kind,
+                          uint64_t token) {
+  if (!LockOwned(s, key, kind, token)) return;
+  s->state.store(kStateEmpty, std::memory_order_release);
+}
+
 void NodeDedup::Abort(const BlockKey& key, Kind kind, uint64_t token) {
-  if (token == 0) return;
-  Slot* s = Find(key, kind);
-  if (!s || s->gen.load(std::memory_order_acquire) != token) return;
-  uint32_t st = kStateFetching;
-  s->state.compare_exchange_strong(st, kStateEmpty, std::memory_order_acq_rel);
+  if (Slot* s = OwnedSlot(token)) AbortSlot(s, key, kind, token);
 }
 
 void NodeDedup::InvalidateKind(const BlockKey& key, Kind kind) {
@@ -406,6 +548,10 @@ void NodeDedup::InvalidateKind(const BlockKey& key, Kind kind) {
           s.kind != static_cast<uint32_t>(kind))
         break;
       if (st == kStatePublishing) {
+        // What is being published is from before this invalidation. A
+        // publisher that can be fenced loses the slot here and now, whether
+        // it is still running or was killed; any other holder is waited for.
+        if (ForceOutPublisher(&s)) break;
         std::this_thread::yield();
         continue;
       }
