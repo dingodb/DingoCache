@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+
+- LMCache connector (in-process `RemoteConnector`), models with several KV
+  layer groups: a GET buffer now holds every group. LMCache describes such a
+  chunk with one shape per group and PUTs all of them; the connector
+  allocated the GET buffer from group 0's shape alone. A full chunk did not
+  fit and always missed, while `contains` kept reporting it present, so it
+  was neither loaded nor stored again. An unfull chunk short enough to fit
+  was a hit and came back shaped as group 0, its bytes read as that group's.
+  Unfull chunks of several groups are now a miss (LMCache's reshape of an
+  unfull chunk sets a single shape); chunks of one group are unchanged. The
+  connector also refuses at startup what it cannot store correctly:
+  `use_layerwise=True` and a `remote_serde` other than `naive` (LMCache then
+  runs without this remote backend and logs why). Keys are unchanged: the
+  namespace already bound every group's shape.
 - Connectors (SGLang HiCache, vLLM, LMCache), `rail_affinity`: the fallback
   rails are spread over the rail list instead of being the next ones. A rank
   used its primary rail and, by default, the one after it. Neighbouring
