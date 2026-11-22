@@ -341,6 +341,33 @@ class _Metrics2(_RecordingMetrics):
         self.calls.append(("set", kwargs))
 
 
+class DeviceReadsReturnTheirIo(unittest.TestCase):
+    """The device-direct read helpers return a _V2Io, like their write
+    twins, instead of a bare (results, bytes, seconds) tuple."""
+
+    def _plugin(self):
+        metrics = _Metrics2()
+        metrics.on_get = lambda **kwargs: metrics.calls.append(("get", kwargs))
+        st = _plugin(mem_pool_device=_MlaDevicePool(layers=6), _metrics=metrics)
+        st._batch_get_sg = lambda sks, sp, sc: (
+            [1] * len(sks), [sum(c) for c in sc])
+        return st, metrics
+
+    def test_kv_read_returns_its_io(self):
+        st, _metrics = self._plugin()
+        res, io = st._kv_device_get(["p"], [0, 1])
+        self.assertEqual(res, [True])
+        # 6 layers x one page of 2 tokens x 8 bytes.
+        self.assertEqual((io.nbytes, io.pools, io.recovered), (96, ("kv",), 0))
+
+    def test_v2_device_read_reports_the_kv_volume(self):
+        st, metrics = self._plugin()
+        self.assertEqual(st.batch_get_v2_device(["p"], [0, 1], []),
+                         {"kv": [True]})
+        self.assertEqual(metrics.calls[0][0], "get")
+        self.assertEqual(metrics.calls[0][1]["nbytes"], 96)
+
+
 class DeviceV2SetMetrics(unittest.TestCase):
     """batch_set_v2_device: the sidecar metric counts the pools that did I/O,
     with the bytes and time of the host sidecars too."""

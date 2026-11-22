@@ -1534,7 +1534,7 @@ class DfkvHiCache(HiCacheStorage):
         if not name:
             return None
         try:
-            res, _nb, _s = self._sidecar_device_get(name, keys, device_indices)
+            res, _io = self._sidecar_device_get(name, keys, device_indices)
             return res
         except Exception:
             return [False] * len(keys)
@@ -2579,8 +2579,9 @@ class DfkvHiCache(HiCacheStorage):
     def _kv_device_get(self, keys, device_indices):
         """Core of batch_get_v1_device (device-direct SG get) without the tracing /
         access-log wrapper, so batch_get_v2_device can reuse it for the anchor KV.
-        Returns (per_page_bools, nbytes, seconds). A page is a hit only on a
-        full-length read of every sub-object (a short read is a corrupt page)."""
+        Returns (per_page_bools, _V2Io), like the write twin. A page is a hit
+        only on a full-length read of every sub-object (a short read is a
+        corrupt page)."""
         n = len(keys)
         from sglang.srt.mem_cache.device_page_meta import (
             get_device_page_buffer_meta,
@@ -2597,7 +2598,7 @@ class DfkvHiCache(HiCacheStorage):
         flat_ok = [hits[i] == 1 and lens[i] >= want[i] for i in range(len(sks))]
         if not all(flat_ok):
             self._log_read_reject(sks, hits, lens, want, flat_ok, len(sks))
-        return self._fold(flat_ok, n, sub), sum(lens), dur
+        return self._fold(flat_ok, n, sub), _V2Io(sum(lens), dur, ("kv",), 0)
 
     def _log_exist_probe(self, sks, n, total):
         """Log deterministic digests for the first and last existence probes."""
@@ -2687,7 +2688,7 @@ class DfkvHiCache(HiCacheStorage):
         """Device-direct SG get of the DSA indexer sidecar `name`: RDMA its stored
         blob straight INTO its GPU index buffer (no host staging, no H2D). Read twin
         of _sidecar_device_set. A page is a hit only on a full-length read of every
-        sub-key. Returns (per_page_bools, nbytes, seconds)."""
+        sub-key. Returns (per_page_bools, _V2Io), like the write twin."""
         n = len(keys)
         from sglang.srt.mem_cache.device_page_meta import (
             get_device_sidecar_page_buffer_meta,
@@ -2703,7 +2704,8 @@ class DfkvHiCache(HiCacheStorage):
         hits, lens = self._batch_get_sg(sks, sp, sc)
         dur = time.perf_counter() - t0
         flat_ok = [hits[i] == 1 and lens[i] >= want[i] for i in range(len(sks))]
-        return self._fold(flat_ok, n, stride), sum(lens), dur
+        return self._fold(flat_ok, n, stride), _V2Io(
+            sum(lens), dur, (str(name),), 0)
 
     # --- task 6: EAGLE draft KV device-direct (best-effort L3) ------------------
     def _draft_keys(
@@ -2878,21 +2880,21 @@ class DfkvHiCache(HiCacheStorage):
                 access_log("batch_get_v2_device",
                            lambda: f"{self._alog_tag} kv={n} "
                                    f"{_fmt_pools(sidecar_transfers)}") as r:
-            kv_res, kv_bytes, kv_secs = self._kv_device_get(kv_keys, kv_device_indices)
+            kv_res, kv_io = self._kv_device_get(kv_keys, kv_device_indices)
             results = {"kv": kv_res}
             if n:
                 self._metrics.on_get(pages=n, hit_pages=sum(kv_res),
-                                     nbytes=kv_bytes, seconds=kv_secs)
+                                     nbytes=kv_io.nbytes, seconds=kv_io.seconds)
             dev_side = [tr for tr in sidecar_transfers if _is_device_transfer(tr)]
             host_side = [tr for tr in sidecar_transfers if not _is_device_transfer(tr)]
             side_pages = side_hit = side_bytes = 0
             side_secs = 0.0
             for tr in dev_side:
                 name = str(tr.name)
-                res, nb, secs = self._sidecar_device_get(name, tr.keys, tr.device_indices)
+                res, io = self._sidecar_device_get(name, tr.keys, tr.device_indices)
                 results[name] = res
                 side_pages += len(res); side_hit += sum(res)
-                side_bytes += nb; side_secs += secs
+                side_bytes += io.nbytes; side_secs += io.seconds
             if host_side:
                 side, io = self._v2_io(host_side, putting=False)
                 results.update(side)
@@ -2907,7 +2909,7 @@ class DfkvHiCache(HiCacheStorage):
                 {k: v for k, v in results.items() if k != "kv"})
             if _sp:
                 _sp.hits = sum(sum(rs) for rs in results.values())
-                _sp.bytes = kv_bytes + side_bytes
+                _sp.bytes = kv_io.nbytes + side_bytes
             return results
 
     def batch_exists_v2(self, keys, pool_transfers=None, extra_info=None):
