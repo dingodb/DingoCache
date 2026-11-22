@@ -337,6 +337,7 @@ WantedBy=multi-user.target
 >   每 tick 由 `DFKV_SLAB_EVICT_MAX_VICTIMS_PER_TICK`（默认 256，范围 1～1024）限制移除对象数，扫描上限为其 4 倍。旧 `DFKV_SLAB_EVICT_MAX_EXTENTS_PER_TICK` 不再读取，升级时须迁移配置。
 > - `--slab-reclaim-ms <n>` / `--ram-reclaim-ms <n>`（默认 50 / 10，`0`=关）：后台预回收和类再平衡。类再平衡抢占（`StealFrom`）与 Put 的条带下限/兜底抢占（`StealExtentFor`）优先选空 extent，其次选驻留对象平均最久未访问的 extent（decayed read heat、useful bytes 仅作平手裁决），跳过 pinned extent；这是 extent 级取舍，混在大量旧对象中的少量新对象仍可能随整块淘汰；冷抢占（`StealColdExtentFor`）保持原有入驻年龄门槛与 heat/useful bytes 排序；后台类再平衡按写入字节（而非对象个数）判断冷 donor class；通常保留默认。
 > - `--slab-granularity <bytes>`（默认 1 MiB）：最小 slot 量子。现有 `slots.tbl` 的 format/geometry 不匹配会 fail closed；修改必须换空目录，服务不会原地冷重建或忽略旧数据。
+> - **`slots.tbl` 占用与预留**：每盘 `盘容量 / granularity × 64` 字节，在 `--cap` **之外**（默认 1 MiB 量子时约为容量的 1/16384）。启动时用 `fallocate` 整体预留，已分配齐的表不再处理；文件大小和 record 格式不变，旧版本仍可打开。**新建目录**：直接分配，文件系统放不下时该盘启动失败（`cannot reserve N bytes for slots.tbl ... No space left on device`）。**已有目录**（含旧版本写出的稀疏表）：始终照常启动；升级后首次启动补齐（日志 `reserved slots.tbl, N bytes (M were allocated)`），文件系统放不下时不拒绝启动，保持原先的惰性分配并在每次启动打一行 WARN `no room to reserve slots.tbl, X of N bytes are not allocated`——该盘仍有“文件系统写满时 store 终态故障”的风险，腾出 X 字节后重启即补齐。direct 模式下 extent 也在启动时整体分配；表与 extent 都预留成功后，在预留后原地覆盖写的文件系统（xfs、ext4）上 store 不会再因文件系统写满而失败，其他文件系统（写时复制、tmpfs 等）不作此保证；buffered 模式（`--slab-write buffered` 或文件系统不支持 O_DIRECT）的 extent 仍按写入惰性分配，文件系统写满时对应 PUT 失败（store 不因此进入终态故障），容量规划仍须保证 `--cap` 加 `slots.tbl` 不超过文件系统可用空间。不支持 `fallocate` 的文件系统打一行 WARN 并保持原先的惰性分配。
 > - `--put-inflight-limit <n>`（默认 0=关）：在 RAM 接纳或直接盘写之前原子限制前台 PUT 并发；超限返回 `kCacheFull`，不接纳数据、不进入 peer cooldown。TCP 与 RDMA direct PUT 共用此门；后台 flusher 不受限制。已接纳写入和同 key 重复请求仍等待原写入的终态，不以超时将另一份 payload 送入盘写路径。该参数限制接纳量，不是磁盘 I/O 超时保证。
 > - `--tcp-max-conns <n>` / `DFKV_TCP_MAX_CONNS`（默认 512，硬上限 4096）限制
 >   TCP handler/FD；`--tcp-io-timeout-s <n>` / `DFKV_TCP_IO_TIMEOUT_S`（默认
@@ -396,8 +397,13 @@ journalctl -u dfkv -n 10 --no-pager
 > 故障后发一个不含设备的 HLT1）。多盘节点任一盘故障即整节点退出。进程不自行
 > 退出：重启会重置该 store 并重新入环，若盘确实坏了会再次故障，在 supervisor
 > 的重启循环里反复搬 key；因此由运维决定重启（故障已排除）或用 §4c 替换。
-> 重启前先确认 cache 文件系统有剩余空间：slot table（`slots.tbl`）是惰性分配的，
-> 文件系统写满时重启后的 store 会再次故障。
+> slot table（`slots.tbl`）在新建目录时整体预留（`fallocate`），预留成功后写 record
+> 不再需要新 block；只有**新建目录**会因文件系统放不下它而启动失败。已有目录始终
+> 启动：表没分配齐且文件系统没有空间时，每次启动打一行 WARN
+> `no room to reserve slots.tbl, X of N bytes are not allocated`，表示该盘仍可能在
+> 文件系统写满时故障。因此 `store=failed` 的节点若是因文件系统写满而故障（故障行里
+> `errno=28`），重启前先腾出空间：否则重启要么在重置表时失败，要么带着上述 WARN
+> 启动后再次故障。
 > 需要 MDS ≥ v2.15.0 才会按 HLT1 过滤；更老的 MDS 忽略该字段，行为与此前相同。
 > RAM tier 丢弃无法 flush 的条目只使 `/healthz` 变 503，节点仍可服务，不退出
 > placement。数据面线程卡死而进程存活的情况不在此检测范围内，依赖

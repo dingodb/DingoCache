@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- Server: the slab slot table (`slots.tbl`) has all of its space reserved
+  when a disk is opened. It was sized with `ftruncate` and written through
+  the page cache, so its blocks were allocated when an extent was first
+  used, while in direct mode the extents are allocated at startup. On a
+  cache filesystem that filled up (capacity set close to the filesystem
+  size, or something else using the filesystem) a record write then failed
+  with ENOSPC, which fails the store for good and takes the node out of
+  placement; nodes sharing one capacity setting could go one after another
+  as they filled. Now the table is allocated in full with `fallocate` when
+  it is created, and a table that has its blocks is left alone.
+  A new cache directory on a filesystem with no room for the table does not
+  start: that disk fails with `cannot reserve N bytes for slots.tbl ...: No
+  space left on device` instead of starting a store that fails later.
+  An existing directory always starts as before. A table written by an
+  earlier release is completed at the first start after the upgrade (INFO
+  line `reserved slots.tbl, N bytes (M were allocated)`). If the filesystem
+  has no room for that, the store starts with the lazy allocation it had and
+  logs, at every start until there is room, a WARN line `no room to reserve
+  slots.tbl, X of N bytes are not allocated`: free X bytes on the cache
+  filesystem and restart to close the exposure.
+  The table takes `capacity / granularity x 64` bytes per disk, in addition
+  to `--cap`. File size and record format are unchanged: older releases open
+  a directory written by this one and the reverse. What a restart restores
+  is unchanged; preallocated ranges read as zeros and the restore scan still
+  skips them where the filesystem reports them as holes (measured on xfs and
+  tmpfs: a 1 GiB table holding ten objects opens in the same time as
+  before). Buffered mode (`--slab-write buffered`, or a filesystem without
+  O_DIRECT) still allocates extent blocks as payloads are written: a full
+  filesystem there fails the PUT, not the store. A filesystem without
+  `fallocate` logs one WARN line and keeps the lazy allocation. See
+  `docs/DEPLOY.md`.
 - Server and MDS: the two remaining accept loops, the cache TCP listener of
   `dfkv_server` and the metrics HTTP listener of `dfkv_server` and `dfkv_mds`,
   get the same protection as the RDMA bootstrap and MDS listeners. A

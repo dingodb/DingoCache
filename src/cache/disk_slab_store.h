@@ -108,6 +108,10 @@ class DiskSlabStore : public StoreEngine {
     // the system when empty; tests set them to stage a reboot or a remount.
     std::optional<std::array<uint8_t, 16>> boot_id;
     std::optional<uint64_t> mount_id;
+    // Stands in for the fallocate that reserves slots.tbl at open: returns 0,
+    // or -1 with errno set. Tests use it to stage a filesystem that has no
+    // room for the table, or none that can preallocate.
+    std::function<int(int fd, uint64_t bytes)> table_allocate_for_test;
   };
 
   // One store's runtime counters (see KvNodeServer's dfkv_slab_* metrics).
@@ -296,6 +300,7 @@ class DiskSlabStore : public StoreEngine {
   bool ValidateOptions();
   bool SetStartupError(std::string error);
   bool SetStartupErrno(std::string error, int saved_errno);
+  bool ReserveTable(uint64_t bytes, bool creating);
   bool ClearInitMarker();
   bool OpenOrInit();
   // *inconsistent is set when the records contradict each other (the same key

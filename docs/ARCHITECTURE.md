@@ -282,9 +282,15 @@ size-class lattice and carves them into uniform slots:
   the key immediately and fences in-flight I/O, so a deferred write cannot
   republish it after REMOVE returns.
 - **Restart:** each published slot has a CRC-protected 64-byte tenant-scoped
-  fixed-offset record in sparse `slots.tbl`. Rebuild visits allocated sparse
-  ranges with `SEEK_DATA`/`SEEK_HOLE` when available (bounded chunked fallback
-  otherwise), parses chunks, validates all records, restores allocator state in
+  fixed-offset record in `slots.tbl`. The table is preallocated in full when
+  it is created, so that a record write never needs a new block; no room
+  for a new table is a startup failure. A table an earlier release left
+  sparse is completed at open, or left as it is with a warning when the
+  filesystem has no room. Ranges never written stay unwritten and read as
+  zeros. Rebuild visits the ranges `SEEK_DATA`/`SEEK_HOLE` report as data
+  when available (bounded chunked fallback otherwise; a filesystem that
+  reports preallocated ranges as data only makes the scan read more),
+  parses chunks, validates all records, restores allocator state in
   one bulk transaction, and rebuilds per-tenant committed-byte usage—no
   per-object open and no per-record syscall.
 - **Crash safety:** `slab_state` marks the running epoch dirty before traffic and

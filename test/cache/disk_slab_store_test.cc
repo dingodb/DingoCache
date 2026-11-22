@@ -3173,6 +3173,225 @@ TEST_F(DiskSlabTest, CleanReopenStillRefusesAShortExtent) {
       << reopened.StartupError();
 }
 
+namespace {
+// Bytes of slots.tbl that have blocks, and its size.
+struct TableSpace {
+  uint64_t allocated = 0;
+  uint64_t size = 0;
+  bool full() const { return allocated >= size; }
+};
+TableSpace TableSpaceOf(const fs::path& dir) {
+  struct stat st {};
+  if (::stat((dir / "slots.tbl").c_str(), &st) != 0) return {};
+  return {static_cast<uint64_t>(st.st_blocks) * 512,
+          static_cast<uint64_t>(st.st_size)};
+}
+
+// Whether a file under `dir` gets its blocks from fallocate: not every
+// filesystem a build machine offers preallocates.
+bool FilesystemPreallocates(const fs::path& dir) {
+  fs::create_directories(dir.parent_path());
+  const std::string path = dir.string() + ".prealloc_probe";
+  const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) return false;
+  struct stat st {};
+  const bool ok = ::fallocate(fd, 0, 0, 1 << 20) == 0 &&
+                  ::fstat(fd, &st) == 0 &&
+                  static_cast<uint64_t>(st.st_blocks) * 512 >= (1u << 20);
+  ::close(fd);
+  ::unlink(path.c_str());
+  return ok;
+}
+
+// A store as releases before the reservation left it: the table sized, its
+// blocks allocated only where records were written.
+int LeaveTableSparse(int, uint64_t) { return 0; }
+
+// What a reopen restores: every key with its value, in key order.
+std::vector<std::pair<uint64_t, std::string>> Restored(DiskSlabStore& store,
+                                                       uint64_t first,
+                                                       uint64_t last) {
+  std::vector<std::pair<uint64_t, std::string>> out;
+  for (uint64_t id = first; id <= last; ++id) {
+    std::string value;
+    if (store.Range(K(id), 0, 0, &value) == Status::kOk)
+      out.emplace_back(id, std::move(value));
+  }
+  return out;
+}
+}  // namespace
+
+// slots.tbl gets all of its blocks when the store is created, so that a
+// record write never has to allocate one on a filesystem that filled up.
+TEST_F(DiskSlabTest, SlotTableIsFullyAllocatedWhenCreated) {
+  if (!FilesystemPreallocates(dir_))
+    GTEST_SKIP() << "the test directory does not preallocate";
+  auto options = Opts(1ull << 30, 1ull << 30, 4096);
+  bool ok = false;
+  DiskSlabStore store(options, &ok);
+  ASSERT_TRUE(ok) << store.StartupError();
+  const TableSpace space = TableSpaceOf(dir_);
+  ASSERT_GT(space.size, 1u << 20);
+  EXPECT_TRUE(space.full()) << space.allocated << " of " << space.size;
+  // An empty table restores nothing, allocated or not.
+  EXPECT_EQ(store.Count(), 0u);
+  EXPECT_EQ(store.TableRebuilt(), 0u);
+}
+
+// A directory written by a release that did not reserve the table opens, is
+// given the missing blocks, and restores exactly what it restored while the
+// table was sparse.
+TEST_F(DiskSlabTest, SparseSlotTableIsAllocatedOnReopenAndRestoresTheSame) {
+  // 64 extents, of which the 39 values need a few: binding an extent writes
+  // its whole part of the table, the rest of the table stays a hole.
+  auto options = Opts(64ull << 20, 1 << 20, 4096);
+  options.table_sync_ms = 0;
+  options.reclaim_interval_ms = 0;
+  auto earlier = options;
+  earlier.table_allocate_for_test = LeaveTableSparse;
+  std::vector<std::pair<uint64_t, std::string>> written;
+  {
+    bool ok = false;
+    DiskSlabStore store(earlier, &ok);
+    ASSERT_TRUE(ok) << store.StartupError();
+    for (uint64_t id = 1; id <= 40; ++id)
+      ASSERT_TRUE(PutFilled(store, id, static_cast<char>('a' + id % 26)));
+    ASSERT_EQ(store.Remove(K(7)), Status::kOk);
+    written = Restored(store, 1, 40);
+    ASSERT_EQ(written.size(), 39u);
+  }
+  if (TableSpaceOf(dir_).full())
+    GTEST_SKIP() << "the test directory does not keep a sized file sparse";
+
+  // Reopened sparse, as the earlier release would.
+  std::vector<std::pair<uint64_t, std::string>> sparse_restore;
+  {
+    bool ok = false;
+    DiskSlabStore store(earlier, &ok);
+    ASSERT_TRUE(ok) << store.StartupError();
+    sparse_restore = Restored(store, 1, 40);
+  }
+  ASSERT_EQ(sparse_restore, written);
+  ASSERT_FALSE(TableSpaceOf(dir_).full());
+
+  for (int round = 0; round < 2; ++round) {  // allocating, then allocated
+    bool ok = false;
+    DiskSlabStore store(options, &ok);
+    ASSERT_TRUE(ok) << store.StartupError();
+    const TableSpace space = TableSpaceOf(dir_);
+    EXPECT_TRUE(space.full()) << space.allocated << " of " << space.size;
+    EXPECT_EQ(store.TableRebuilt(), 39u + round);  // round 0 added one
+    EXPECT_EQ(store.Count(), 39u + round);
+    const auto stats = store.GetStats();
+    EXPECT_EQ(stats.rebuild_corrupt_records, 0u);
+    EXPECT_EQ(stats.rebuild_rejected_records, 0u);
+    EXPECT_EQ(Restored(store, 1, 40), written) << round;
+    ASSERT_TRUE(PutFilled(store, 100 + round, 'z'));
+  }
+  // The size is what it was: an earlier release still opens the directory.
+  EXPECT_EQ(TableSpaceOf(dir_).size, (64ull << 20) / 4096 * 64);
+  bool ok = false;
+  DiskSlabStore back(earlier, &ok);
+  ASSERT_TRUE(ok) << back.StartupError();
+  EXPECT_EQ(back.Count(), 41u);
+}
+
+// No room for the table is a startup failure that says so -- not a store that
+// starts and fails for good at the first record it cannot place.
+TEST_F(DiskSlabTest, NoRoomForTheSlotTableFailsStartup) {
+  auto options = Opts(1 << 20, 1 << 20, 4096);
+  auto full = options;
+  full.table_allocate_for_test = [](int, uint64_t) {
+    errno = ENOSPC;
+    return -1;
+  };
+  {
+    bool ok = true;
+    DiskSlabStore store(full, &ok);
+    EXPECT_FALSE(ok);
+    EXPECT_FALSE(store.Healthy());
+    const std::string& error = store.StartupError();
+    EXPECT_NE(error.find("cannot reserve 16384 bytes for slots.tbl"),
+              std::string::npos)
+        << error;
+    EXPECT_NE(error.find("errno 28"), std::string::npos) << error;
+    EXPECT_NE(store.Cache(K(1), "x", 1), Status::kOk);
+  }
+  // Once there is room the same directory starts.
+  {
+    bool ok = false;
+    DiskSlabStore store(options, &ok);
+    ASSERT_TRUE(ok) << store.StartupError();
+    ASSERT_TRUE(PutFilled(store, 1, 'a'));
+  }
+  // Only a table being created is refused: this one either has its blocks
+  // (and is not allocated again) or is an existing table that stays as it is.
+  bool ok = false;
+  DiskSlabStore store(full, &ok);
+  ASSERT_TRUE(ok) << store.StartupError();
+  EXPECT_EQ(store.Count(), 1u);
+}
+
+// An existing directory of an earlier release on a filesystem with no room
+// left for the rest of its table keeps starting: it served like that until
+// now, and refusing it would take a node with a cache out of service on
+// upgrade. The table stays as it was and is completed once there is room.
+TEST_F(DiskSlabTest, NoRoomToCompleteASparseSlotTableStillOpensAndKeepsTheCache) {
+  auto options = Opts(64ull << 20, 1 << 20, 4096);
+  auto earlier = options;
+  earlier.table_allocate_for_test = LeaveTableSparse;
+  for (const int no_room : {ENOSPC, EDQUOT}) {
+    SCOPED_TRACE(no_room);
+    auto full = options;
+    full.table_allocate_for_test = [no_room](int, uint64_t) {
+      errno = no_room;
+      return -1;
+    };
+    fs::remove_all(dir_);
+    {
+      bool ok = false;
+      DiskSlabStore store(earlier, &ok);
+      ASSERT_TRUE(ok) << store.StartupError();
+      ASSERT_TRUE(PutFilled(store, 1, 'a'));
+    }
+    const TableSpace sparse = TableSpaceOf(dir_);
+    if (sparse.full())
+      GTEST_SKIP() << "the test directory does not keep a sized file sparse";
+    {
+      bool ok = false;
+      DiskSlabStore store(full, &ok);
+      ASSERT_TRUE(ok) << store.StartupError();
+      EXPECT_TRUE(store.Healthy());
+      EXPECT_EQ(store.Count(), 1u) << "the cache is kept";
+      ASSERT_TRUE(PutFilled(store, 2, 'b')) << "and the store serves";
+    }
+    EXPECT_FALSE(TableSpaceOf(dir_).full());
+    if (!FilesystemPreallocates(dir_)) continue;
+    bool ok = false;
+    DiskSlabStore store(options, &ok);
+    ASSERT_TRUE(ok) << store.StartupError();
+    EXPECT_TRUE(TableSpaceOf(dir_).full()) << "completed once there is room";
+    EXPECT_EQ(store.Count(), 2u);
+  }
+}
+
+// A filesystem that cannot preallocate keeps what it had: the store opens and
+// the table's blocks are allocated as they are used.
+TEST_F(DiskSlabTest, FilesystemWithoutPreallocationStillOpens) {
+  auto options = Opts(1 << 20, 1 << 20, 4096);
+  options.table_allocate_for_test = [](int, uint64_t) {
+    errno = EOPNOTSUPP;
+    return -1;
+  };
+  for (int round = 0; round < 2; ++round) {
+    bool ok = false;
+    DiskSlabStore store(options, &ok);
+    ASSERT_TRUE(ok) << store.StartupError();
+    EXPECT_EQ(store.Count(), static_cast<uint64_t>(round));
+    ASSERT_TRUE(PutFilled(store, 1 + round, 'a'));
+  }
+}
+
 // Not a correctness test: prints how long a clean reopen of a populated store
 // takes. Set DFKV_SLAB_OPEN_BENCH_OBJECTS (for example 400000) to run it; it
 // needs about 5 KiB of disk per object under the temporary directory. The

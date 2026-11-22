@@ -870,6 +870,9 @@ bool DiskSlabStore::OpenOrInit() {
     if (st.st_size != static_cast<off_t>(tbl_bytes))
       return SetStartupError("slots.tbl size differs from slab geometry");
   }
+  // Fresh or resumed initialisation: nothing is in the table yet.
+  if (!ReserveTable(tbl_bytes, /*creating=*/initializing_ && !state_exists))
+    return false;
   if (fresh) {
     int wfd = ::open(meta_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
                      0644);
@@ -992,6 +995,94 @@ bool DiskSlabStore::OpenOrInit() {
   open_extents_us_ =
       ElapsedUs(extents_started, std::chrono::steady_clock::now());
   return OpenEpochState(fresh || resume);
+}
+
+// Gives slots.tbl every block it will ever need.
+//
+// The table is created with ftruncate and written through the page cache, so
+// without this its blocks are allocated as slots are first used -- at a time
+// when the filesystem may have filled up. A record write that then fails with
+// ENOSPC fails the store for good (FailMetadata). With the table reserved, a
+// record write needs no new block once the store is up. Checked on every
+// open, not only at creation: a table written by an earlier release is
+// sparse.
+//
+// No room for a table that is being created is a startup error: nothing is
+// lost by refusing, and the alternative is a store that fails later. No room
+// to complete an existing table is not: that directory served until now and
+// holds a cache, so it keeps starting with the lazy allocation it had, and
+// says at every start how much is missing.
+//
+// Mode 0 keeps the file's size and content: ranges never written still read
+// as zeros, which is what Rebuild's scan relies on -- not on their being
+// holes. Whether SEEK_DATA skips them only decides how much of an empty table
+// the scan reads. Measured: xfs reports allocated but unwritten ranges as
+// holes as long as they are not in the page cache, so the scan of a mostly
+// empty table costs what it cost on a sparse one. tmpfs does the same after
+// one fallocate, but a second one over the same pages turns them into data
+// (the scan then reads the whole table, 0.2 s per GiB). That, and not the
+// cost of the call, is why a table that already has its blocks is left alone.
+//
+// st_blocks is a count, not a map of holes (see the extents in OpenOrInit):
+// a table with a hole smaller than the filesystem's rounding passes, and
+// keeps the old exposure for the slots in that hole.
+//
+// A filesystem without fallocate keeps the lazy allocation it had before.
+bool DiskSlabStore::ReserveTable(uint64_t bytes, bool creating) {
+  struct stat before {};
+  if (::fstat(table_fd_, &before) != 0)
+    return SetStartupErrno("cannot inspect slots.tbl", errno);
+  const uint64_t had = static_cast<uint64_t>(before.st_blocks) * 512;
+  if (had >= bytes) return true;
+  int rc;
+  do {
+    rc = opt_.table_allocate_for_test
+             ? opt_.table_allocate_for_test(table_fd_, bytes)
+             : ::fallocate(table_fd_, 0, 0, static_cast<off_t>(bytes));
+  } while (rc != 0 && errno == EINTR);
+  if (rc != 0) {
+    const int saved_errno = errno;
+    if (saved_errno == EOPNOTSUPP || saved_errno == ENOSYS ||
+        saved_errno == EINVAL) {
+      DFKV_LOG_WARN("slab " + opt_.dir +
+                    ": the filesystem cannot preallocate slots.tbl; its "
+                    "blocks are allocated as slots are first used, and the "
+                    "store fails if the filesystem is full by then");
+      return true;
+    }
+    if (!creating && (saved_errno == ENOSPC || saved_errno == EDQUOT)) {
+      DFKV_LOG_WARN(
+          "slab " + opt_.dir + ": no room to reserve slots.tbl, " +
+          std::to_string(bytes - had) + " of " + std::to_string(bytes) +
+          " bytes are not allocated (errno " + std::to_string(saved_errno) +
+          "). The store starts as it did before; it fails for good if the "
+          "filesystem is full when a new extent is first used. Free that "
+          "much space on the cache filesystem and restart.");
+      return true;
+    }
+    return SetStartupErrno(
+        "cannot reserve " + std::to_string(bytes) +
+            " bytes for slots.tbl (the cache filesystem needs room for the "
+            "slot table in addition to the extents)",
+        saved_errno);
+  }
+  struct stat after {};
+  if (::fstat(table_fd_, &after) != 0)
+    return SetStartupErrno("cannot inspect slots.tbl", errno);
+  if (static_cast<uint64_t>(after.st_blocks) * 512 >= bytes) {
+    DFKV_LOG_INFO("slab " + opt_.dir + ": reserved slots.tbl, " +
+                  std::to_string(bytes) + " bytes (" + std::to_string(had) +
+                  " were allocated)");
+  } else {
+    DFKV_LOG_WARN(
+        "slab " + opt_.dir + ": the filesystem accepted the reservation of "
+        "slots.tbl but shows " +
+        std::to_string(static_cast<uint64_t>(after.st_blocks) * 512) + " of " +
+        std::to_string(bytes) +
+        " bytes allocated; its blocks may still be allocated as slots are "
+        "first used");
+  }
+  return true;
 }
 
 bool DiskSlabStore::WriteEpochState(uint32_t state, uint64_t epoch,
