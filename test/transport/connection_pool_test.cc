@@ -181,7 +181,7 @@ TEST(ConnectionPool, SurvivesStalePooledConnection) {
 }
 
 namespace {
-// kCalls concurrent 4 MiB PUTs released at the same instant.
+// kBurstCalls concurrent 4 MiB PUTs released at the same instant.
 constexpr size_t kBurstCalls = 12;
 void RunBurst(TcpTransport* t, const std::string& addr) {
   std::string value(4u << 20, 'a');
@@ -280,6 +280,10 @@ TEST(ConnectionPool, IdleConnectionsRetireDownToTheWarmMinimum) {
 
   RunBurst(&t, n->addr);
 
+  // Every connection the burst dialed has completed a call, so the server has
+  // accepted them all and no dial is in flight.
+  const size_t accepts_after_burst = n->srv->AcceptCount();
+  EXPECT_GE(accepts_after_burst, 2u);  // the pool did grow
   std::string metrics = t.MetricsText();
   EXPECT_LE(MetricValue(metrics, "dfkv_transport_pool_connections"),
             options.max_connections);
@@ -290,6 +294,10 @@ TEST(ConnectionPool, IdleConnectionsRetireDownToTheWarmMinimum) {
   EXPECT_EQ(t.Exist(n->addr, ToBlockKey("test/model", "parallel-0"), &exists),
             Status::kOk);
   EXPECT_TRUE(exists);
+  // The call was served by the connection that was kept: retiring everything
+  // and dialing again would also end with one connection, but with one more
+  // accept.
+  EXPECT_EQ(n->srv->AcceptCount(), accepts_after_burst);
   metrics = t.MetricsText();
   EXPECT_EQ(MetricValue(metrics, "dfkv_transport_pool_connections"),
             options.min_connections);
@@ -301,7 +309,7 @@ TEST(ConnectionPool, IdleConnectionsRetireDownToTheWarmMinimum) {
       MetricValue(
           metrics,
           "dfkv_transport_pool_retirements_total{reason=\"idle\"}"),
-      n->srv->AcceptCount() - options.min_connections);
+      accepts_after_burst - options.min_connections);
   n->srv->Stop();
 }
 
