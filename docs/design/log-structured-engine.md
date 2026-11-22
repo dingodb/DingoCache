@@ -313,6 +313,17 @@ alone acknowledged, before block *N* is durable, blocks of one group cannot
 tear out of order, and a crash can lose only blocks that nobody was told were
 durable: a suffix of the file.
 
+**Synchronous writes only.** The writer issues every journal write as a
+synchronous `pwritev2(..., RWF_DSYNC)` on its own thread, never through
+io_uring or any other asynchronous interface. A synchronous write is finished,
+or failed, when the call returns, so no journal write of a process can still be
+in flight after that process has died. This matters because the open-time
+barrier (§8.3 step 2) covers only segment files: a late asynchronous journal
+write from a killed predecessor could otherwise land after `Activate()` has
+truncated the journal to its stopping offset, and put a stale block back
+beyond the new tail. (Truncation and the journal's `fdatasync` are likewise
+synchronous calls.)
+
 **Ordering with the store.** KILL entries are enqueued **while the store mutex
 is held**, by the operation that decided them (REMOVE, a PUT killing shadows,
 §6.1, §6.6), so journal order follows the order in which the store made its
@@ -1258,6 +1269,16 @@ writes) is tested by a child that submits io_uring batch writes (including
 ones the kernel punts to its worker threads) and is killed with SIGKILL before
 they complete, with a parent that opens while they may still be in flight and
 verifies every byte; it runs on XFS and on ext4 on the kernels in use.
+
+**Journal writes are synchronous.** Enforced in code and checked by tests:
+the journal writer owns its file descriptor and has no path to the store's
+io_uring rings (the `IoBackend` interface used for the journal has no
+asynchronous write call); a unit test drives the journal through a recording
+`IoBackend` and asserts that every journal write it saw was a synchronous
+`RWF_DSYNC` write completed before the next was issued; and the C22 kill test
+(§11.3) also kills a child in the middle of a REMOVE burst, so that journal
+writes are in progress, and checks after the restart that no journal block
+appears beyond the tail `Activate()` truncated to.
 
 ### 11.4 Simulated power loss
 
