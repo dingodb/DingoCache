@@ -32,6 +32,7 @@ from dfkv_common import (
     make_key_array,
     make_key_buffer,
 )
+from dfkv_common.block_size import get_max_block_bytes, validate_object_sizes
 from dfkv_common.client_metrics import read_native_snapshot
 
 from . import access_log as _alog
@@ -421,6 +422,10 @@ class DfkvNativeClient:
                 self._executor, self._batch_set_blocking, list(keys), list(bufs)
             )
             r.result = "ok" if ok else "partial_fail"
+            if not ok:
+                # A PUT that stored not every key is a failed put, in the
+                # metrics as well as the access log.
+                _m.status = "fail"
             if _sp:
                 _sp.hits = sum(1 for b in per_key if b)
             return ok, per_key
@@ -603,6 +608,22 @@ class DfkvNativeClient:
             del key_owner
             r.result = "ok" if ok else "fail"
             return ok
+
+    def validate_block_sizes(self, sizes, *, context: str) -> None:
+        """Reject, at startup, an object larger than the RDMA client can
+        move: every PUT of it would fail. A libdfkv that predates
+        dfkv_max_block_bytes cannot tell its bound: the check is skipped,
+        with a warning, rather than refusing a library that worked."""
+        if self.transport_mode != "rdma":
+            return
+        if not hasattr(self._lib, "dfkv_max_block_bytes"):
+            logger.warning(
+                "%s: the loaded libdfkv has no dfkv_max_block_bytes; the RDMA "
+                "block-size check is skipped (a chunk over the bound fails "
+                "every PUT). Load a libdfkv matching the connector.", context)
+            return
+        validate_object_sizes(
+            get_max_block_bytes(self._lib, self._h), sizes, context=context)
 
     def ping_sync(self) -> None:
         """Cheap liveness check — connectivity is established at construction

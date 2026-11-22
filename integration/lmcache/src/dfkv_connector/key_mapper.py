@@ -7,6 +7,9 @@ keys therefore contain only pool coordinates and the full content hash.
 
 from __future__ import annotations
 
+import hashlib
+import json
+
 from lmcache.utils import CacheEngineKey
 from dfkv_common import pool_key
 
@@ -23,6 +26,15 @@ def cache_engine_key_to_dfkv_key(key: CacheEngineKey) -> bytes:
     """
     layer_id = getattr(key, "layer_id", None)
     component = "all" if layer_id is None else f"layer{int(layer_id)}"
+    # LMCache's request tags (``lmcache.tag.*`` in a request's KV transfer
+    # params) are part of its key: CacheEngineKey equality and to_string()
+    # include them, so chunks of equal tokens under other tags are other
+    # objects. A key without tags is unchanged. The tags go in as a digest
+    # of their (name, value) sequence, in LMCache's own order.
+    tags = getattr(key, "tags", None)
+    if tags:
+        encoded = json.dumps([[str(k), str(v)] for k, v in tags], separators=(",", ":"))
+        component += "/tags-" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:32]
     return pool_key(
         f"{int(key.chunk_hash):x}",
         pool="kv",

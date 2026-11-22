@@ -197,6 +197,17 @@ paths, and for a native call that fails.
 
 ## Limitations
 
+- Request tags (`lmcache.tag.*` in a request's KV transfer params) are part of
+  the object key, as they are of LMCache's: chunks of equal tokens under other
+  tags are other objects. Untagged keys are as before.
+- At startup the connector refuses a chunk larger than the RDMA client can move
+  (`DFKV_RDMA_MAX_BLOCK_BYTES`), and warns when `PYTHONHASHSEED` is not set: vLLM
+  then seeds the prefix hash chain at random and chunk keys change with every
+  engine start. A PUT that stores not every key counts as a failed `put` in the
+  connector metrics.
+- Not provided by this connector, unlike the vLLM and SGLang ones: retention
+  (TTL protection; LMCache's `pin` is ignored) and a liveness probe (`ping`
+  only checks that the client handle is open).
 - The in-process `RemoteConnector` stores raw chunks: `remote_serde` must be
   `naive` (the default) and `use_layerwise` false; other settings are refused
   at startup. For a model with several KV layer groups, full chunks are stored
