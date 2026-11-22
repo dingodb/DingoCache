@@ -35,8 +35,9 @@ groups:
           description: "{{ $labels.instance }} has etcd transport/status errors for operation {{ $labels.op }}."
       # Withheld continuously for minutes: etcd takes no writes. A member that
       # really left after a failed heartbeat withholds for one hold (120 s by
-      # default) and stays below `for`. The 1m window needs a scrape interval
-      # of 30 s or less.
+      # default) and stays below `for`; with a longer DFKV_MDS_UNWRITTEN_HOLD_MS
+      # keep `for` above the hold plus one minute. The 1m window needs a scrape
+      # interval of 30 s or less.
       - alert: DfkvMdsMemberListWithheld
         expr: increase(dfkv_mds_list_withheld_total[1m]) > 0
         for: 4m
