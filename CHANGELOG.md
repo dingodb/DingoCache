@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- Server, RAM tier: a PUT that waits for the value owning its key no longer
+  blocks other keys, waits without limit, or holds up a stop. In disk-ACK mode
+  (`DFKV_PUT_ACK_MODE=disk`, or a zero RAM-ACK watermark) every admitted PUT,
+  first writer or duplicate, waits for the flush of that value. (In RAM-ACK
+  mode a duplicate of an acknowledged value is acknowledged at once since the
+  flush-failure change below; it only waits until the first value is
+  resident.) A waiting PUT kept the lock that serializes PUTs of its key
+  stripe (1,024 stripes) for the whole wait, so PUTs of unrelated keys on the
+  same stripe queued behind it; the wait had no limit, so with a flush backlog
+  it outlasted the client's operation timeout and the client cooled the node;
+  and a stopping server waited for these PUTs before it started counting its
+  drain limit, so a stop was not bounded by
+  `DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S`. Now the lock is released before the
+  wait. The wait is limited by the new `DFKV_RAM_PUT_WAIT_MS` (default 3000,
+  below the clients' default 5 s operation timeout; `0` = no limit, the old
+  behaviour): after it the PUT is answered `kCacheFull`. The limit counts
+  from the arrival of the request batch the PUT came in, because an RDMA
+  connection serves a client window's requests one after another under the
+  window's one deadline: the parked PUTs of one window share the limit. A stop answers all
+  such PUTs `kCacheFull` first, so stopping the request paths does not wait
+  for a flush. `kCacheFull` here means that this request did not see the value
+  reach disk: the value that owns the key stays in RAM and keeps being
+  flushed, nothing is written twice, and clients, 2.35.x included, treat the
+  answer as "not stored" without marking the node failed. What a successful
+  answer means is unchanged, a duplicate with different bytes still gets the
+  first value's result, and a flush that fails still answers `kIOError`. In
+  disk-ACK mode a PUT whose flush takes longer than the limit is now answered
+  `kCacheFull` although its value reaches disk later; raise the limit together
+  with the client timeout if such PUTs must wait. New metrics:
+  `dfkv_ram_parked_puts`, `dfkv_ram_put_wait_timeouts_total`,
+  `dfkv_ram_put_waits_canceled_total`.
 - Client: a cache node that fails is avoided for as long as the failure
   warrants, and finding out whether it is back no longer stalls reads of
   other nodes. Three things in the per-node health record (`PeerHealth`)

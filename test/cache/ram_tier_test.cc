@@ -104,6 +104,32 @@ struct OpenFlushOnExit {
   ~OpenFlushOnExit() { sink.open(); }
 };
 
+// Opens the sink if its scope has not ended after `limit`. A PUT that should
+// have stopped waiting then ends with the flush result and fails its
+// expectation, instead of hanging the test.
+class OpenFlushAfter {
+ public:
+  OpenFlushAfter(FlushSink& sink, std::chrono::milliseconds limit)
+      : thread_([this, &sink, limit] {
+          std::unique_lock<std::mutex> lock(mu_);
+          if (!cv_.wait_for(lock, limit, [this] { return done_; })) sink.open();
+        }) {}
+  ~OpenFlushAfter() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      done_ = true;
+    }
+    cv_.notify_all();
+    thread_.join();
+  }
+
+ private:
+  std::mutex mu_;
+  std::condition_variable cv_;
+  bool done_ = false;
+  std::thread thread_;
+};
+
 // Poll a predicate up to ~2s.
 template <class F>
 bool WaitFor(F pred) {
@@ -647,6 +673,200 @@ TEST(RamTier, InflightDuplicateSharesTerminalLeaderFailure) {
   EXPECT_EQ(rt.PutBypass(), 0u);
   EXPECT_FALSE(rt.healthy());
   EXPECT_FALSE(rt.Contains(K(32)));
+}
+
+// A PUT that waits for the flush of the value owning its key (here a
+// disk-ACK duplicate) does so without the caller's admission lock and not
+// for longer than put_wait_ms. After the deadline it is answered kCacheFull
+// without a bypass (the value that owns the key is still there and still
+// being flushed), and a later PUT sees the flush result.
+TEST(RamTier, ParkedPutHasADeadlineAndReleasesTheCallersLock) {
+  FlushSink sink;
+  sink.close();
+  RamTier::Options options = Opts(8 * 4096);
+  options.large_reserve_bytes = 0;
+  options.put_wait_ms = 50;
+  RamTier rt(options, sink.fn());
+  OpenFlushOnExit cleanup{sink};
+  const std::string value(500, 'd'), different(700, 'e');
+  ASSERT_TRUE(rt.Put(K(60), value.data(), value.size()));  // first writer
+  ASSERT_TRUE(sink.await_calls(1));
+
+  std::mutex admission;
+  std::unique_lock<std::mutex> lock(admission);
+  const auto t0 = std::chrono::steady_clock::now();
+  RamTier::PutResult parked{Status::kInvalid};
+  {
+    OpenFlushAfter guard(sink, 5s);
+    parked = rt.PutCommitted(K(60), different.data(), different.size(), &lock);
+  }
+  EXPECT_GE(std::chrono::steady_clock::now() - t0, 50ms);
+  EXPECT_EQ(parked.status, Status::kCacheFull);
+  EXPECT_EQ(parked.disposition, RamTier::PutDisposition::kComplete);
+  EXPECT_EQ(parked.flush, RamTier::FlushOutcome::kWaitEnded);
+  EXPECT_FALSE(lock.owns_lock());
+  EXPECT_EQ(rt.PutWaitTimeouts(), 1u);
+  EXPECT_EQ(rt.PutWaitsCanceled(), 0u);
+  EXPECT_EQ(rt.ParkedPuts(), 0u);
+  EXPECT_TRUE(rt.healthy());
+  EXPECT_TRUE(rt.Contains(K(60)));
+
+  sink.open();
+  ASSERT_TRUE(WaitFor([&] { return rt.Flushed() == 1u; }));
+  EXPECT_EQ(rt.PutCommitted(K(60), different.data(), different.size()).status,
+            Status::kOk);
+  std::lock_guard<std::mutex> sink_lock(sink.m);
+  EXPECT_EQ(sink.values.at(K(60).Filename()), value);  // the first writer's
+}
+
+// The lock is released for the wait itself, not merely by the time the PUT
+// returns; and the wait ends with the flush result, success or failure.
+TEST(RamTier, ParkedPutReleasesItsLockWhileWaitingAndSeesTheFlushResult) {
+  for (const bool fail : {false, true}) {
+    FlushSink sink;
+    sink.close();
+    sink.fail = fail;
+    RamTier::Options options = Opts(8 * 4096);
+    options.large_reserve_bytes = 0;
+    options.flush_retries = 1;
+    options.put_wait_ms = 0;  // no deadline
+    RamTier rt(options, sink.fn());
+    OpenFlushOnExit cleanup{sink};
+    const std::string value(500, 'f');
+
+    // A disk-ACK first writer and a duplicate of it, each with the lock its
+    // caller would hold.
+    std::mutex admission;
+    RamTier::PutResult results[2] = {{Status::kInvalid}, {Status::kInvalid}};
+    std::vector<std::thread> writers;
+    for (int i = 0; i < 2; ++i) {
+      writers.emplace_back([&, i] {
+        std::unique_lock<std::mutex> lock(admission);
+        results[i] = rt.PutCommitted(K(61), value.data(), value.size(), &lock);
+      });
+    }
+    ASSERT_TRUE(sink.await_calls(1));
+    ASSERT_TRUE(WaitFor([&] { return rt.ParkedPuts() == 2u; }));
+    {
+      std::unique_lock<std::mutex> probe(admission, std::try_to_lock);
+      EXPECT_TRUE(probe.owns_lock()) << "held across the wait";
+    }
+    sink.open();
+    for (auto& writer : writers) writer.join();
+    for (const auto& result : results) {
+      EXPECT_EQ(result.status, fail ? Status::kIOError : Status::kOk) << fail;
+      EXPECT_EQ(result.flush,
+                fail ? RamTier::FlushOutcome::kDroppedAfterRetries
+                     : RamTier::FlushOutcome::kFlushed)
+          << fail;
+    }
+    EXPECT_EQ(rt.PutWaitTimeouts(), 0u);
+  }
+}
+
+// CancelPutWaits (a stopping server) answers parked PUTs at once, and every
+// PUT that would have to wait from then on; flushing goes on regardless, and
+// an answer that needs no wait is still given.
+TEST(RamTier, CancelPutWaitsAnswersParkedPutsAndLeavesTheFlushAlone) {
+  FlushSink sink;
+  sink.close();
+  RamTier::Options options = Opts(8 * 4096);
+  options.large_reserve_bytes = 0;
+  options.put_wait_ms = 0;  // no deadline: only the cancel can end the wait
+  RamTier rt(options, sink.fn());
+  OpenFlushOnExit cleanup{sink};
+  const std::string value(500, 'g');
+  // The owner was not acknowledged from RAM, so a RAM-ACK duplicate has to
+  // wait for it as well.
+  ASSERT_TRUE(rt.Put(K(62), value.data(), value.size()));
+  ASSERT_TRUE(sink.await_calls(1));
+
+  RamTier::PutResult write_back{Status::kInvalid};
+  RamTier::PutResult committed{Status::kInvalid};
+  std::thread first([&] {
+    write_back = rt.PutWriteBack(K(62), value.data(), value.size());
+  });
+  std::thread second([&] {
+    committed = rt.PutCommitted(K(62), value.data(), value.size());
+  });
+  ASSERT_TRUE(WaitFor([&] { return rt.ParkedPuts() == 2u; }));
+  {
+    OpenFlushAfter guard(sink, 5s);
+    rt.CancelPutWaits();
+    first.join();
+    second.join();
+  }
+  for (const auto& result : {write_back, committed}) {
+    EXPECT_EQ(result.status, Status::kCacheFull);
+    EXPECT_EQ(result.disposition, RamTier::PutDisposition::kComplete);
+    EXPECT_EQ(result.flush, RamTier::FlushOutcome::kWaitEnded);
+  }
+  EXPECT_EQ(rt.PutWaitsCanceled(), 2u);
+  EXPECT_EQ(rt.PutWaitTimeouts(), 0u);
+  EXPECT_EQ(rt.PutCommitted(K(62), value.data(), value.size()).status,
+            Status::kCacheFull);  // no parking once the stop has begun
+  EXPECT_EQ(rt.PutWaitsCanceled(), 3u);
+  // RAM can still acknowledge: a new key, and a duplicate of it.
+  for (int i = 0; i < 2; ++i)
+    EXPECT_EQ(rt.PutWriteBack(K(63), value.data(), value.size()).status,
+              Status::kOk)
+        << i;
+  EXPECT_EQ(rt.PutWaitsCanceled(), 3u);
+
+  sink.open();
+  ASSERT_TRUE(WaitFor([&] { return rt.Flushed() == 2u; }));
+  EXPECT_TRUE(rt.healthy());
+  // On disk now: answered from the flush result without any wait.
+  EXPECT_EQ(rt.PutCommitted(K(62), value.data(), value.size()).status,
+            Status::kOk);
+}
+
+// The PUTs of one request batch share one wait budget: put_wait_ms counts
+// from the batch's arrival, so a PUT that comes after an earlier one of its
+// batch has waited only gets what is left, and none once it is used up. A
+// wait whose time is up counts as a timeout even if the stop has begun.
+TEST(RamTier, ParkedPutsOfOneBatchShareTheWaitFromItsArrival) {
+  FlushSink sink;
+  sink.close();
+  RamTier::Options options = Opts(8 * 4096);
+  options.large_reserve_bytes = 0;
+  options.put_wait_ms = 400;
+  RamTier rt(options, sink.fn());
+  OpenFlushOnExit cleanup{sink};
+  const std::string value(500, 'h');
+  ASSERT_TRUE(rt.Put(K(63), value.data(), value.size()));  // first writer
+  ASSERT_TRUE(sink.await_calls(1));
+  OpenFlushAfter guard(sink, 5s);
+
+  // 300 ms of the batch's 400 have gone to PUTs before this one.
+  auto t0 = std::chrono::steady_clock::now();
+  RamTier::PutResult result = rt.PutCommitted(
+      K(63), value.data(), value.size(), nullptr, t0 - 300ms);
+  auto waited = std::chrono::steady_clock::now() - t0;
+  EXPECT_EQ(result.status, Status::kCacheFull);
+  EXPECT_EQ(result.flush, RamTier::FlushOutcome::kWaitEnded);
+  EXPECT_GE(waited, 90ms);
+  EXPECT_LT(waited, 300ms) << "the PUT got a budget of its own";
+  EXPECT_EQ(rt.PutWaitTimeouts(), 1u);
+
+  // The batch's budget is used up: answered at once, without parking.
+  t0 = std::chrono::steady_clock::now();
+  result = rt.PutWriteBack(K(63), value.data(), value.size(), nullptr,
+                           t0 - 500ms);
+  waited = std::chrono::steady_clock::now() - t0;
+  EXPECT_EQ(result.status, Status::kCacheFull);
+  EXPECT_EQ(result.flush, RamTier::FlushOutcome::kWaitEnded);
+  EXPECT_LT(waited, 100ms);
+  EXPECT_EQ(rt.PutWaitTimeouts(), 2u);
+
+  // Out of time and stopping: a timeout, not a cancel.
+  rt.CancelPutWaits();
+  result = rt.PutCommitted(K(63), value.data(), value.size(), nullptr,
+                           std::chrono::steady_clock::now() - 500ms);
+  EXPECT_EQ(result.status, Status::kCacheFull);
+  EXPECT_EQ(rt.PutWaitTimeouts(), 3u);
+  EXPECT_EQ(rt.PutWaitsCanceled(), 0u);
+  EXPECT_EQ(rt.ParkedPuts(), 0u);
 }
 
 TEST(RamTier, RemoveCancelsQueuedGenerationBeforeReinsert) {

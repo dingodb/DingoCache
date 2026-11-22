@@ -125,8 +125,9 @@ struct LeaseNode {
                                         out_len, value_len);
         });
     rsrv->set_cache_direct_handler(
-        [this](const BlockKey& key, char* data, size_t len, size_t cap) {
-          return srv->CacheDirectForKey(key, data, len, cap);
+        [this](const BlockKey& key, char* data, size_t len, size_t cap,
+               std::chrono::steady_clock::time_point batch_arrival) {
+          return srv->CacheDirectForKey(key, data, len, cap, batch_arrival);
         });
     rsrv->set_prepare_read_handler(
         [this](const BlockKey& key, uint64_t off, uint64_t len,

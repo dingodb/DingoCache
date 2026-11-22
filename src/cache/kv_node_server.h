@@ -61,6 +61,13 @@ class KvNodeServer {
   // were already writing the backlog then.
   bool Shutdown(std::chrono::steady_clock::time_point started =
                     std::chrono::steady_clock::now());
+  // First step of a stop, before any request path is stopped: PUTs parked
+  // until the flush of their key are answered kCacheFull, now and from here
+  // on. Otherwise stopping a request path (it joins its threads) would wait
+  // for those flushes, outside the drain limit. Stop() and Shutdown() do
+  // this for the TCP path themselves; the owner of another request path (an
+  // RDMA server) calls it before stopping that path. Idempotent.
+  void CancelParkedPuts();
   // Cluster member list this node advertises for discovery (kMembers wire op):
   // "name=ip:port,name=ip:port,...". Clients query any node to learn the cluster.
   void set_members(const std::string& members) { members_ = members; }
@@ -158,9 +165,12 @@ class KvNodeServer {
                          size_t* out_len, size_t* value_len = nullptr);
 
   // RDMA direct PUT: `data` is an aligned registered buffer containing raw
-  // value bytes. Writes without a payload-sized CPU copy.
-  Status CacheDirectForKey(const BlockKey& key, char* data, size_t len,
-                           size_t cap);
+  // value bytes. Writes without a payload-sized CPU copy. `batch_arrival` is
+  // when the request batch this PUT came in arrived: a PUT parked for a flush
+  // waits at most DFKV_RAM_PUT_WAIT_MS from then (default: from its wait).
+  Status CacheDirectForKey(
+      const BlockKey& key, char* data, size_t len, size_t cap,
+      std::chrono::steady_clock::time_point batch_arrival = {});
   std::vector<Status> CacheDirectBatchForKeys(
       const std::vector<StoreEngine::CacheBatchItem>& items);
 

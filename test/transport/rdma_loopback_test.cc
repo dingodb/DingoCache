@@ -451,6 +451,8 @@ struct RdmaNode {
   std::atomic<int> handler_delay_ms{0};
 
   std::function<void(size_t)> before_range;
+  // Called by the direct PUT handler with the batch arrival it was given.
+  std::function<void(std::chrono::steady_clock::time_point)> on_cache_direct;
   explicit RdmaNode(const std::string& tag, size_t max_msg = kMaxMsg,
                     bool fail_pinned_registration = false,
                     bool prepare_reads = false,
@@ -489,12 +491,14 @@ struct RdmaNode {
               key, off, len, io_buf, cap, out_data, out_len, value_len);
         });
     rsrv->set_cache_direct_handler(
-        [this](const BlockKey& key, char* data, size_t len, size_t cap) {
+        [this](const BlockKey& key, char* data, size_t len, size_t cap,
+               std::chrono::steady_clock::time_point batch_arrival) {
           {
             std::lock_guard<std::mutex> lock(observation_mu);
             ++cache_direct_calls[key.Filename()];
           }
-          return srv->CacheDirectForKey(key, data, len, cap);
+          if (on_cache_direct) on_cache_direct(batch_arrival);
+          return srv->CacheDirectForKey(key, data, len, cap, batch_arrival);
         });
     if (prepare_reads) {
       rsrv->set_prepare_read_handler(
@@ -3912,6 +3916,61 @@ TEST(RdmaLoopback, ConfiguredPoolMaxBoundsIdleControlConnections) {
 // Non-SG batch PUT: one oversized item must fail ONLY itself, not poison the
 // whole same-node batch. Previously any item over the per-op payload bound
 // filled every sibling's status with kInvalid — all lost their cache write.
+// The PUTs of one client window share the client's deadline and are served
+// one after another by one Serve thread, so the server hands them one batch
+// arrival: a PUT parked for a flush counts its wait from there, not from its
+// own turn. A window sent after the previous one was answered is a new batch.
+static void ExerciseWindowPutsShareOneBatchArrival(bool use_uring) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+#ifndef DFKV_WITH_URING
+  if (use_uring) GTEST_SKIP() << "io_uring not compiled";
+#endif
+  ScopedEnv uring("DFKV_SERVER_URING", use_uring ? "1" : "0");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
+  RdmaNode node(use_uring ? "batch-arrival-uring" : "batch-arrival-sync",
+                kMaxMsg, false, use_uring);
+  ASSERT_EQ(node.rsrv->UseUringPath(), use_uring);
+  using Clock = std::chrono::steady_clock;
+  std::mutex mu;
+  std::vector<Clock::time_point> arrivals;
+  node.on_cache_direct = [&](Clock::time_point arrival) {
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      arrivals.push_back(arrival);
+    }
+    // Stands in for a PUT parked for a flush.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  };
+  RdmaTransport rt(kMaxMsg);
+  const std::string value(4096, 'w');
+  std::vector<CacheItem> window;
+  for (uint64_t i = 0; i < 4; ++i)
+    window.push_back({BlockKey{90300 + i, 1}, value.data(), value.size()});
+  for (const Status st : rt.CacheMany(node.addr, window))
+    ASSERT_EQ(st, Status::kOk);
+  if (use_uring && CounterVal(node.rsrv->MetricsText(),
+                              "dfkv_uring_init_fallbacks_total") != 0)
+    GTEST_SKIP() << "io_uring unavailable at runtime";
+  const Clock::time_point second_sent = Clock::now();
+  ASSERT_EQ(rt.Cache(node.addr, BlockKey{90310, 1}, value.data(),
+                     value.size()),
+            Status::kOk);
+  std::lock_guard<std::mutex> lock(mu);
+  ASSERT_EQ(arrivals.size(), 5u);
+  for (size_t i = 1; i < 4; ++i)
+    EXPECT_EQ(arrivals[i], arrivals[0]) << "PUT " << i << " of the window";
+  EXPECT_NE(arrivals[0], Clock::time_point{});
+  EXPECT_GE(arrivals[4], second_sent) << "a later window joined the first";
+}
+
+TEST(RdmaLoopback, WindowPutsShareOneBatchArrivalSync) {
+  ExerciseWindowPutsShareOneBatchArrival(false);
+}
+
+TEST(RdmaLoopback, WindowPutsShareOneBatchArrivalUring) {
+  ExerciseWindowPutsShareOneBatchArrival(true);
+}
+
 TEST(RdmaLoopback, BatchPutOversizedFailsOnlyOffender) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   RdmaNode node("bpo");
@@ -6248,8 +6307,9 @@ struct RdmaUringNode {
               key, off, len, io_buf, cap, out_data, out_len, value_len);
         });
     rsrv->set_cache_direct_handler(
-        [this](const BlockKey& key, char* data, size_t len, size_t cap) {
-          return srv->CacheDirectForKey(key, data, len, cap);
+        [this](const BlockKey& key, char* data, size_t len, size_t cap,
+               std::chrono::steady_clock::time_point batch_arrival) {
+          return srv->CacheDirectForKey(key, data, len, cap, batch_arrival);
         });
     rsrv->set_prepare_read_handler(
         [this](const BlockKey& key, uint64_t off, uint64_t len,

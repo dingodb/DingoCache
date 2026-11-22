@@ -293,6 +293,9 @@ RAM 热层（**仅 `DFKV_RAM_TIER=1` 时输出**；关时无此系列，向后�
 | `dfkv_ram_hit_total` / `dfkv_ram_miss_total` | counter | GET 命中 RAM / 未命中落盘（命中率 = hit/(hit+miss)） |
 | `dfkv_ram_put_total` | counter | 写直通进 RAM 的 PUT 数 |
 | `dfkv_ram_put_bypass_total` | counter | **背压**：arena 满（flush 落后）→ PUT 旁路直写盘，非零即 flush 跟不上 |
+| `dfkv_ram_parked_puts` | gauge | 正在等自己这个 key 的属主值的 PUT 数：disk-ACK 下每个被接纳的 PUT（等刷盘）；RAM-ACK 下只有等首写者的值可见的重复 PUT（通常是瞬间）。disk-ACK 下持续偏高说明刷盘跟不上 |
+| `dfkv_ram_put_wait_timeouts_total` | counter | 等待时间用完（从所在请求批次到达算起 `DFKV_RAM_PUT_WAIT_MS`）后回 `kCacheFull` 的 PUT 数，停止期间到时的也算在这里；值本身仍在 RAM 里继续刷盘 |
+| `dfkv_ram_put_waits_canceled_total` | counter | 停止时被提前回 `kCacheFull` 的等待中 PUT 数（含停止开始后本来需要等待的 PUT） |
 | `dfkv_ram_ack_backpressure_total` | counter | 正的 RAM-ACK dirty 水位触发的新 key 接纳拒绝；水位为 0 时计数强制等待落盘的请求。已有 key 先解析 owner，不因水位切换覆盖首写者 |
 | `dfkv_ram_promoted_total` | counter | 整值冷读晋升：优先让 O_DIRECT 直接读入隐藏 arena reservation，成功后以 born-durable 身份发布；staged fallback 则读后复制晋升。不进 flushq、零重复刷盘、随时可驱逐；健康冷→热运行中首次读增长，随后应转为 `dfkv_ram_hit_total` 增长且磁盘字节不再增加 |
 | `dfkv_ram_flushed_total` / `dfkv_ram_flush_dropped_total` | counter | RAM slot 落盘转 DURABLE / flush 全部尝试失败（或目标盘 store 已终态故障）后丢弃 |

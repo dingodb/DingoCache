@@ -99,8 +99,10 @@ class KvNodeServerWiringTestPeer {
   static bool Begin(KvNodeServer& server) { return server.TryBeginPut(); }
   static void End(KvNodeServer& server) { server.EndPut(); }
   static void SetRam(KvNodeServer& server, RamTier::FlushFn flush,
-                     bool ram_ack = false, uint32_t watermark_pct = 80) {
+                     bool ram_ack = false, uint32_t watermark_pct = 80,
+                     uint32_t put_wait_ms = 3000) {
     RamTier::Options options;
+    options.put_wait_ms = put_wait_ms;
     options.bytes = 16 * 4096;
     options.large_reserve_bytes = 0;
     options.reclaim_interval_ms = 0;
@@ -135,6 +137,10 @@ class KvNodeServerWiringTestPeer {
   static bool RamStopping(KvNodeServer& server) {
     return server.ram_->background_stopping();
   }
+  static size_t ParkedPuts(KvNodeServer& server) {
+    return server.ram_->ParkedPuts();
+  }
+  static size_t PutKeyStripes() { return KvNodeServer::kPutKeyStripes; }
   static uint64_t RamDirty(KvNodeServer& server) {
     return server.ram_->DirtyObjects();
   }
@@ -1085,6 +1091,144 @@ TEST(RamTierWiring, ShutdownDropsWhatMissesTheDrainTimeout) {
               Status::kNotFound)
         << i;
   reopened.reset();
+  fs::remove_all(dir);
+}
+
+// In disk-ACK mode a PUT waits for the flush of its key, as first writer or
+// as duplicate. It must not keep the lock that serializes PUTs of its stripe
+// while it waits: an unrelated key on the same stripe is admitted.
+TEST(RamTierWiring, ParkedPutDoesNotBlockItsStripe) {
+  ::unsetenv("DFKV_RAM_TIER");
+  const auto dir = fs::temp_directory_path() / "dfkv_parked_put_stripe";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  FlushBarrier barrier;
+  auto server = KvNodeServerWiringTestPeer::Create(
+      DiskCacheGroup::Options{{dir.string()}, 1ull << 30, "file"});
+  auto* node = server.get();
+  OpenFlushOnExit cleanup{barrier};
+  KvNodeServerWiringTestPeer::SetLimit(*server, 0);
+  KvNodeServerWiringTestPeer::SetRam(
+      *server,
+      [&, node](const BlockKey& key, char* data, size_t len, size_t) {
+        barrier.Block();
+        return KvNodeServerWiringTestPeer::Persist(*node, key, data, len) ==
+               Status::kOk;
+      },
+      /*ram_ack=*/false, /*watermark_pct=*/80, /*put_wait_ms=*/0);
+  const BlockKey first{7600, 0};
+  const BlockKey neighbour{
+      7600 + KvNodeServerWiringTestPeer::PutKeyStripes(), 0};  // same stripe
+  const std::string value(2000, 'p'), other(1000, 'q');
+  auto put = [&](const BlockKey& key, const std::string& v) {
+    std::string out;
+    return server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kCache),
+                                        key, 0, 0, v.data(), v.size(), &out);
+  };
+  const auto parked = [&](size_t count) {
+    return WaitFor([&] {
+      return KvNodeServerWiringTestPeer::ParkedPuts(*server) == count;
+    });
+  };
+  Status writer_status = Status::kInvalid;
+  std::thread writer([&] { writer_status = put(first, value); });
+  ASSERT_TRUE(barrier.AwaitEntry());  // its flush is held
+  ASSERT_TRUE(parked(1));
+  Status duplicate_status = Status::kInvalid;
+  std::thread duplicate([&] { duplicate_status = put(first, value); });
+  ASSERT_TRUE(parked(2));
+
+  // The neighbour is admitted and then waits for its own flush, behind the
+  // held one. Had it queued on the stripe it would never be counted.
+  Status neighbour_status = Status::kInvalid;
+  std::thread unrelated([&] {
+    neighbour_status = server->CacheDirectForKey(
+        neighbour, const_cast<char*>(other.data()), other.size(), other.size());
+  });
+  EXPECT_TRUE(parked(3))
+      << "a PUT of another key waited behind the parked PUTs of its stripe";
+  EXPECT_TRUE(KvNodeServerWiringTestPeer::Resident(*server, neighbour));
+  barrier.Open();
+  unrelated.join();
+  duplicate.join();
+  writer.join();
+  EXPECT_EQ(writer_status, Status::kOk);
+  EXPECT_EQ(duplicate_status, Status::kOk);
+  EXPECT_EQ(neighbour_status, Status::kOk);
+  ASSERT_TRUE(KvNodeServerWiringTestPeer::Drain(*server));
+  EXPECT_EQ(MetricVal(server->MetricsText(), "dfkv_ram_parked_puts"), 0);
+  server.reset();
+  fs::remove_all(dir);
+}
+
+// A stop answers parked PUTs at once instead of waiting for their flush:
+// stopping the request paths joins the threads those PUTs are parked on, and
+// that wait is outside the drain limit. Here the flush never finishes while
+// requests are being stopped, and the drain limit is zero.
+TEST(RamTierWiring, ShutdownAnswersParkedPutsInsteadOfWaitingForTheirFlush) {
+  ::unsetenv("DFKV_RAM_TIER");
+  ::unsetenv("DFKV_SLAB_WARM_RESTART");
+  ::setenv("DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S", "0", 1);
+  struct RestoreEnv {
+    ~RestoreEnv() { ::unsetenv("DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S"); }
+  } restore_env;
+  const auto dir = fs::temp_directory_path() / "dfkv_shutdown_parked_put";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  const std::string value(2000, 'w');
+  const BlockKey key{7700, 0};
+  FlushBarrier barrier;
+  {
+    auto server = KvNodeServerWiringTestPeer::Create(
+        DiskCacheGroup::Options{{dir.string()}, 1ull << 30, "slab"});
+    auto* node = server.get();
+    OpenFlushOnExit cleanup{barrier};
+    KvNodeServerWiringTestPeer::SetRam(
+        *server,
+        [&, node](const BlockKey& k, char* data, size_t len, size_t) {
+          barrier.Block();
+          return KvNodeServerWiringTestPeer::Persist(*node, k, data, len) ==
+                 Status::kOk;
+        },
+        /*ram_ack=*/false, /*watermark_pct=*/80, /*put_wait_ms=*/0);
+    ASSERT_EQ(server->Start(0), Status::kOk);
+    const std::string addr = "127.0.0.1:" + std::to_string(server->port());
+
+    // The first writer is parked on a TCP handler thread, which the stop
+    // joins; a duplicate is parked on a thread of another request path.
+    std::thread tcp_client([&] {
+      TcpTransport transport;
+      (void)transport.Cache(addr, key, value.data(), value.size());
+    });
+    ASSERT_TRUE(barrier.AwaitEntry());
+    Status direct_status = Status::kInvalid;
+    std::thread direct([&] {
+      direct_status = server->CacheDirectForKey(
+          key, const_cast<char*>(value.data()), value.size(), value.size());
+    });
+    ASSERT_TRUE(WaitFor(
+        [&] { return KvNodeServerWiringTestPeer::ParkedPuts(*server) == 2; }));
+
+    bool clean = false;
+    std::thread stopper([&] {
+      server->CancelParkedPuts();  // what the process does before Quiesce()
+      clean = server->Shutdown();
+    });
+    // The flush is still held. Requests stop and the (zero) drain limit
+    // passes all the same.
+    const bool stopping = WaitFor(
+        [&] { return KvNodeServerWiringTestPeer::RamStopping(*server); });
+    EXPECT_TRUE(stopping) << "the stop waited for a parked PUT's flush";
+    EXPECT_EQ(KvNodeServerWiringTestPeer::ParkedPuts(*server), 0u);
+    barrier.Open();
+    stopper.join();
+    direct.join();
+    tcp_client.join();
+    EXPECT_TRUE(clean);
+    EXPECT_EQ(direct_status, Status::kCacheFull);
+    EXPECT_EQ(MetricVal(server->MetricsText(),
+                        "dfkv_ram_put_waits_canceled_total"), 2);
+  }
   fs::remove_all(dir);
 }
 

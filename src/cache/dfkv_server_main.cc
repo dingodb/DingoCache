@@ -503,8 +503,9 @@ int main(int argc, char** argv) {
                                        out_len, value_len);
         });
   rsrv->set_cache_direct_handler(  // server-side direct PUT: RDMA dbuf -> O_DIRECT write
-        [&srv](const dfkv::BlockKey& key, char* data, size_t len, size_t cap) {
-          return srv.CacheDirectForKey(key, data, len, cap);
+        [&srv](const dfkv::BlockKey& key, char* data, size_t len, size_t cap,
+               std::chrono::steady_clock::time_point batch_arrival) {
+          return srv.CacheDirectForKey(key, data, len, cap, batch_arrival);
         });
     rsrv->set_prepare_read_handler(
         [&srv](const dfkv::BlockKey& key, uint64_t off, uint64_t len,
@@ -779,6 +780,9 @@ int main(int argc, char** argv) {
   if (mhttp) mhttp->Stop();
   registrar_metrics->store(nullptr, std::memory_order_release);
   if (registrar) registrar->Stop();
+  // Quiesce() joins the RDMA serve threads; one that is parked in a PUT
+  // waiting for a flush must be answered first.
+  srv.CancelParkedPuts();
 #ifdef DFKV_WITH_RDMA
   if (rsrv) {
     rsrv->Quiesce();

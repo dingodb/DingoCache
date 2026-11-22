@@ -53,9 +53,14 @@ class RdmaServer {
       size_t io_cap, const char** out_data, size_t* out_len,
       size_t* value_len)>;
   // Optional direct PUT handler: `data` points at an aligned registered buffer
-  // containing exactly the raw stored value bytes.
+  // containing exactly the raw stored value bytes. `batch_arrival` is when the
+  // request batch of this PUT arrived: the requests a connection receives
+  // while it still owes a reply. One Serve thread handles them one after
+  // another, and the client gives the whole batch one deadline, so a PUT that
+  // has to wait counts its time from then.
   using CacheDirectHandler = std::function<Status(
-      const BlockKey& key, char* data, size_t len, size_t cap)>;
+      const BlockKey& key, char* data, size_t len, size_t cap,
+      std::chrono::steady_clock::time_point batch_arrival)>;
   // Batched direct PUT: multiple keys in one call for io_uring flush.
   using CacheDirectBatchHandler = std::function<std::vector<Status>(
       const std::vector<StoreEngine::CacheBatchItem>& items)>;
