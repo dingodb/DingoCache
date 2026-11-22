@@ -103,16 +103,16 @@ MemberHealth RdmaHealthMonitor::Last() const {
   return last_;
 }
 
-std::string RdmaHealthMonitor::MetricsText() const {
+std::string RdmaHealthMonitor::MetricsText(bool node_eligible) const {
   const MemberHealth health = Last();
   const size_t active = static_cast<size_t>(std::count_if(
       health.ib_devices.begin(), health.ib_devices.end(),
       [](const IbDeviceHealth& device) { return device.healthy(); }));
   std::string out =
-      "# HELP dfkv_server_ring_eligible Whether IB health permits placement ring membership\n"
+      "# HELP dfkv_server_ring_eligible Whether this node reports itself eligible for placement\n"
       "# TYPE dfkv_server_ring_eligible gauge\n"
       "dfkv_server_ring_eligible " +
-      std::string(health.ring_eligible ? "1\n" : "0\n") +
+      std::string(health.ring_eligible && node_eligible ? "1\n" : "0\n") +
       "# HELP dfkv_server_rdma_rails_configured RDMA rails in the server's fixed configured topology\n"
       "# TYPE dfkv_server_rdma_rails_configured gauge\n"
       "dfkv_server_rdma_rails_configured " +

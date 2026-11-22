@@ -43,7 +43,12 @@ env/config reference see [CONNECTORS.md](CONNECTORS.md).
 
 Distribution is **client-side consistent hashing**; there is no replication
 (regenerable KV → a node loss is a miss → recompute). Membership is dynamic via
-the MDS tier — see the README for the two-layer offline detection.
+the MDS tier — see the README for the two-layer offline detection. A node
+also takes itself out of placement while it stays registered: every heartbeat
+carries its own eligibility, which is cleared while it has no healthy RDMA
+rail and, for the rest of the process's life, once a disk store has failed for
+good (see DEPLOY.md). The MDS leaves such members out of the list clients
+build their ring from and still shows them to `dfkvctl ring`.
 
 ---
 

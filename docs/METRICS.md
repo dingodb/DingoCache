@@ -21,8 +21,16 @@
 还要求本地 startup 完成以及（配置 MDS 时）首次注册成功。首次注册 latch 后，
 瞬时 heartbeat 丢失不会清 readiness；用下述 heartbeat 指标单独告警。未配置
 MDS 的 node 仅等待本地 startup 和动态 storage health。
-IB placement eligibility is independent of these HTTP checks. Only an
-RDMA-enabled binary with an active listener emits the server rail families.
+Placement eligibility is what the node reports to the MDS on every heartbeat,
+and `dfkv_server_ring_eligible` is that report. It is narrower than `/healthz`:
+a disk store that failed for good (it then stores and reads nothing more
+until the process is restarted) takes the node out of placement on its next heartbeat,
+for good, while a RAM tier that dropped an entry it could not flush turns
+`/healthz` to 503 but leaves the node, which still serves every request, in
+placement. The node stays registered: `dfkvctl ring` shows it as `DEGRADED`
+with `store=failed` in INFO until it is restarted or replaced.
+IB rail health is the other input, and is independent of the HTTP checks. Only
+an RDMA-enabled binary with an active listener emits the server rail families.
 At least one healthy initialized rail keeps the node eligible: a partial loss
 reports fewer active rails but `/healthz`, `/readyz`, and placement remain
 online. Losing the final healthy rail makes `dfkv_server_ring_eligible=0`
@@ -60,7 +68,8 @@ curl -s 127.0.0.1:9100/metrics
 > **v1.8.0 起**：`dfkvctl ring` 多一列 `INFO` = 各节点在注册/心跳时自报的
 > `ver=…,engine=…,wr=…,disks=…,cap=…,ram=…,rdma=…,qd=…`（运行时 resolved
 > 真相，非 flag 意图；`wr=` 是 slab 的 direct/buffered resolved 写模式，`qd=`
-> 是 server 端协商后的 pipeline depth）。
+> 是 server 端协商后的 pipeline depth）。disk store 终态故障的节点在末尾追加
+> `store=failed`，同时以 `DEGRADED` 退出 placement（见 §3.1 `dfkv_server_ring_eligible`）。
 > 全环版本/引擎审计一条命令完成（抓"静默跳升级/引擎不一致"）。`-` = 节点还是
 > 旧版未上报（本身就是版本信号）。信息不参与环 epoch（变更不会触发客户端重建环）。
 > 生效条件：server 与 MDS 都 ≥ v1.8.0（老 MDS 会丢弃该扩展字段）。
@@ -107,6 +116,7 @@ dfkvctl stat <ip:port>                        # 单节点原始 /metrics 文本�
 | `dfkv_uptime_seconds` | gauge | 启动至今秒数 |
 | `dfkv_storage_healthy` | gauge | 当前 disk group 与显式请求 RAM tier 的 terminal health；0 时 `/healthz`、`/readyz` 均为 503 |
 | `dfkv_server_startup_complete` / `dfkv_server_mds_registration_ready` / `dfkv_server_healthy` / `dfkv_server_ready` | gauge | startup、本次首次 MDS 注册门、本地动态 health、三者合取；`dfkvctl stat --all` 用这组稳定 gauge 判定节点健康 |
+| `dfkv_server_ring_eligible` | gauge | 本节点在心跳里自报的 placement eligibility：没有终态故障的 disk store，且（有 RDMA listener 时）至少一条健康 rail。disk store 终态故障后恒为 0 直到进程重启；TCP-only 节点也输出 |
 | `dfkv_cache_put_total` / `dfkv_cache_hit_total` / `dfkv_cache_miss_total` | counter | PUT / GET 命中 / GET 未命中 |
 | `dfkv_exist_hit_total` / `dfkv_exist_miss_total` | counter | Exist 命中 / 未命中 |
 | `dfkv_remove_ok_total` / `dfkv_remove_miss_total` | counter | Remove 删掉了块 / 目标本就不存在（partial save 清理等路径的诊断分型） |
@@ -150,8 +160,10 @@ Tenant 标签**只**来自启动时有界配置文件中的 16-hex hash；默认
 IB rail 告警先看 active cardinality，再看 eligibility：
 `dfkv_server_rdma_rails_active < dfkv_rdma_rails_initialized` 表示 `PARTIAL`
 带宽；只要 active ≥1，节点仍在 placement。`dfkv_server_ring_eligible == 0`
-表示最后健康 rail 已丢失、该节点全部 cache capacity 已摘除。逐轨定位用
-`dfkv_server_ib_device_healthy{device}`。这些查询在 TCP-only server 或未启动
+表示该节点全部 cache capacity 已摘除：`dfkv_server_rdma_rails_active == 0`
+是最后健康 rail 已丢失（可恢复），否则是 disk store 终态故障（`dfkv_server_healthy == 0`，
+需重启或替换）。逐轨定位用
+`dfkv_server_ib_device_healthy{device}`。rail 相关查询在 TCP-only server 或未启动
 RDMA listener 的 RDMA build 上不会返回序列，这是预期行为；不得用
 `or vector(0)` 把缺失补成 unhealthy。告警“应有但缺失”必须关联明确的
 RDMA-listener scrape inventory。
@@ -176,7 +188,7 @@ RDMA-listener scrape inventory。
 
 | 指标 | 类型 | 含义 |
 |---|---|---|
-| `dfkv_server_ring_eligible` | gauge | 当前是否有至少一条通过门控的 initialized healthy rail；最后一条丢失立即为 0，0→非 0 需 recovery streak |
+| `dfkv_server_ring_eligible` | gauge | 见 §3.1（所有节点都输出）。rail 侧条件：至少一条通过门控的 initialized healthy rail；最后一条丢失立即为 0，0→非 0 需 recovery streak |
 | `dfkv_server_rdma_rails_configured` / `dfkv_rdma_rails_initialized` / `dfkv_server_rdma_rails_active` | gauge | health monitor 固定 resolved 数 / 成功 anchor 初始化数 / 当前健康数；auto 模式均包含选出的 rail，无 `device` label |
 | `dfkv_server_ib_device_healthy{device}` | gauge | 每个固定 initialized device 当前是否 `query_ok && ACTIVE && LinkUp`；部分为 0 不再等价于整节点退环 |
 | `dfkv_rdma_completions_total` / `dfkv_rdma_completion_errors_total` | counter | RDMA 请求完成 / 错误完成 |
@@ -301,7 +313,7 @@ TTL-debounced etcd probe 判定（`DFKV_MDS_PROBE_CACHE_MS`，默认 2500 ms 内
 | 指标 | 含义 |
 |------|------|
 | `dfkv_mds_group_nodes{group}` | 该环成员数（带标签版；旧无标签 `dfkv_mds_members` 保留不动） |
-| `dfkv_mds_group_ring_eligible_nodes{group}` / `dfkv_mds_group_degraded_nodes{group}` | 当前可参与 placement 的节点数 / 因 IB health 被排除但 lease 仍在线的节点数 |
+| `dfkv_mds_group_ring_eligible_nodes{group}` / `dfkv_mds_group_degraded_nodes{group}` | 当前可参与 placement 的节点数 / 自报不可 placement（无健康 rail，或 disk store 终态故障）但 lease 仍在线的节点数；后者 >0 触发 `DfkvGroupMembersOutOfPlacement` |
 | `dfkv_mds_group_capacity_bytes{group}` / `dfkv_mds_group_used_bytes{group}` | 环总容量 / **环水位**（direct 模式下 df 已失真，此为唯一真值） |
 | `dfkv_mds_group_objects{group}` | 环内常驻块数 |
 | `dfkv_mds_group_hits_sum{group}` / `dfkv_mds_group_misses_sum{group}` | 环级命中率 = hits/(hits+misses) |

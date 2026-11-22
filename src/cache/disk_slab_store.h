@@ -17,6 +17,7 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -321,7 +322,10 @@ class DiskSlabStore : public StoreEngine {
                    uint32_t payload_len, bool valid,
                    uint32_t retain_until = 0, uint32_t retain_ttl_s = 0);
   bool SyncTable(uint64_t seen);
-  bool FailMetadata();
+  // Latches the store as failed; always returns false. `op` completes "cannot
+  // ..." in the one log line the first failure writes, `err` is its errno
+  // (0 = none applies).
+  bool FailMetadata(const char* op, int err = errno);
   bool WritePayload(const SlabAllocator::SlotRef& r, const void* data, size_t len);
   // O_DIRECT payload write from the caller's ALIGNED buffer (CacheDirect path):
   // zeroes the padding bytes in place (cap allows) and pwrites the 4 KiB-rounded

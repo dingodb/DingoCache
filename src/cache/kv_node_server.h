@@ -75,6 +75,13 @@ class KvNodeServer {
     return group_.Healthy() && !ram_required_failed_ &&
            (!ram_ || ram_->healthy());
   }
+  // False once a disk store has failed for good: it then stores and reads
+  // nothing more until the process is restarted, so the keys placed on it
+  // are lost to clients for as long as this node stays in the placement
+  // ring. Narrower than
+  // Healthy() on purpose: a RAM tier that dropped an entry it could not flush
+  // also clears Healthy(), but that node still serves every request.
+  bool DisksHealthy() const { return group_.Healthy(); }
   // Accessors for the MDS heartbeat stats provider (STA1) -- all cheap reads.
   uint64_t Evictions() const { return group_.Evictions(); }
   uint64_t PutBusyTotal() const { return put_busy_.load(std::memory_order_relaxed); }

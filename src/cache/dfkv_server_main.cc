@@ -14,12 +14,14 @@
 #include <atomic>
 #include <charconv>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <vector>
 
 #include "utils/args.h"
 #include "cache/disk_slab_store.h"
 #include "cache/kv_node_server.h"
+#include "cache/node_member_report.h"
 #include "utils/wire_limits.h"
 #include "utils/log.h"
 #include "common/config_dump.h"
@@ -511,9 +513,17 @@ int main(int argc, char** argv) {
       std::make_shared<std::atomic<dfkv::MdsRegistrar*>>(nullptr);
   srv.set_metrics_extension([&] {
     std::string s;
+    // What this node reports to the MDS about its own placement eligibility
+    // (cache/node_member_report.h): no failed disk store and, with an RDMA
+    // listener, a healthy rail.
+    const bool disks_healthy = srv.DisksHealthy();
+    bool eligibility_emitted = false;
 #ifdef DFKV_WITH_RDMA
     if (rsrv) s += rsrv->MetricsText();
-    if (rdma_health) s += rdma_health->MetricsText();
+    if (rdma_health) {
+      s += rdma_health->MetricsText(disks_healthy);
+      eligibility_emitted = true;
+    }
 #endif
     if (auto* r = registrar_metrics->load(std::memory_order_acquire))
       s += r->MetricsText();
@@ -522,6 +532,10 @@ int main(int argc, char** argv) {
       s += "# TYPE "; s += name; s += " gauge\n";
       s += name; s += value ? " 1\n" : " 0\n";
     };
+    if (!eligibility_emitted)
+      gauge("dfkv_server_ring_eligible",
+            "Whether this node reports itself eligible for placement",
+            disks_healthy);
     const bool startup = ready_flag->load(std::memory_order_acquire);
     const bool registered = mds_ready->load(std::memory_order_acquire);
     const bool healthy = srv.Healthy();
@@ -618,12 +632,13 @@ int main(int argc, char** argv) {
       st.ram_hits_total = srv.RamHits();
       return st;
     });
+    // A node whose disk store has failed for good reports itself out of
+    // placement on its next heartbeat, with or without RDMA rails.
+    std::function<dfkv::MemberHealth()> rails;
 #ifdef DFKV_WITH_RDMA
-    if (rdma_health) {
-      registrar->set_health_provider(
-          [&rdma_health] { return rdma_health->Sample(); });
-    }
+    if (rdma_health) rails = [&rdma_health] { return rdma_health->Sample(); };
 #endif
+    dfkv::ReportNodeHealth(registrar.get(), &srv, self.info, std::move(rails));
     registrar->set_registered_callback([mds_ready, group, node_id] {
       mds_ready->store(true, std::memory_order_release);
       DFKV_LOG_INFO("dfkv_server registered with MDS group=" + group +

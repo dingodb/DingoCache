@@ -26,7 +26,9 @@ class RdmaHealthMonitor {
 
   MemberHealth Sample();
   MemberHealth Last() const;
-  std::string MetricsText() const;
+  // node_eligible: what else the node requires of itself for placement; the
+  // dfkv_server_ring_eligible gauge is the conjunction with rail health.
+  std::string MetricsText(bool node_eligible = true) const;
 
  private:
   ProbeFn probe_;

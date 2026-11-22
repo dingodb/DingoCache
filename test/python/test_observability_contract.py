@@ -74,6 +74,7 @@ PUBLIC_FAMILIES = {
     "dfkv_mds_etcd_request_errors_total",
     "dfkv_mds_group_capacity_bytes",
     "dfkv_mds_group_clients",
+    "dfkv_mds_group_degraded_nodes",
     "dfkv_mds_group_hits_sum",
     "dfkv_mds_group_misses_sum",
     "dfkv_mds_group_stats_missing",

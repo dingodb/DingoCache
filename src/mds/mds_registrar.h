@@ -4,6 +4,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -50,8 +51,16 @@ class MdsRegistrar {
   // (~heartbeat_ms freshness at the MDS). Unset = no STA1 (legacy behavior).
   using StatsFn = std::function<MemberStats()>;
   void set_stats_provider(StatsFn fn) { stats_fn_ = std::move(fn); }
-  using HealthFn = std::function<MemberHealth()>;
+  // Optional health provider (HLT1), called like the stats provider. A beat
+  // for which it returns nullopt carries no HLT1 at all, which is what a node
+  // without RDMA rails sends while it has nothing to report: to the MDS and
+  // to clients "no HLT1" and "HLT1 with zero rails" are different things.
+  using HealthFn = std::function<std::optional<MemberHealth>()>;
   void set_health_provider(HealthFn fn) { health_fn_ = std::move(fn); }
+  // Optional provider of the self-description (MemberInfo::info), called like
+  // the stats provider. Unset = the info given at construction, unchanged.
+  using InfoFn = std::function<std::string()>;
+  void set_info_provider(InfoFn fn) { info_fn_ = std::move(fn); }
 
   // Called once after the first successful registration. Configure before
   // Start(); heartbeat failures after that success do not clear the latch.
@@ -94,6 +103,7 @@ class MdsRegistrar {
   MemberInfo self_;
   StatsFn stats_fn_;
   HealthFn health_fn_;
+  InfoFn info_fn_;
   RegisteredFn registered_fn_;
   int hb_ms_;
   int io_ms_;

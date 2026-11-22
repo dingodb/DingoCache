@@ -380,6 +380,24 @@ journalctl -u dfkv -n 10 --no-pager
 > `PARTIAL` 或 `ACTIVE` 原进程回环，无需重启。该门只防恢复抖动，不延迟从非零
 > 到零的摘除。
 >
+> **disk store 终态故障**：slab 元数据写入/落盘失败（或 io_uring 丢失完成事件）
+> 后，该 store 在本进程内不再读写（PUT/GET 返回 `kIOError`，Exist/Retain 按
+> miss 回答，前置 RAM tier 仍命中的条目照常返回），只有重启能恢复。故障时 store
+> 打一行 ERROR `slab <dir>: disk store failed for good: cannot <操作>: errno=...`。
+> 节点在下一次心跳（≤10 s）自报不可 placement：MDS 不再把它放进 client 的成员
+> 列表，其 key 份额迁到其他节点；它保持注册，`dfkvctl ring` 显示 `DEGRADED`、
+> INFO 末尾带 `store=failed`，`dfkv_server_ring_eligible=0`、`/healthz` 503。该
+> 状态是只置不清的 latch，不会抖动；TCP-only 节点同样适用（健康时仍不发 HLT1，
+> 故障后发一个不含设备的 HLT1）。多盘节点任一盘故障即整节点退出。进程不自行
+> 退出：重启会重置该 store 并重新入环，若盘确实坏了会再次故障，在 supervisor
+> 的重启循环里反复搬 key；因此由运维决定重启（故障已排除）或用 §4c 替换。
+> 重启前先确认 cache 文件系统有剩余空间：slot table（`slots.tbl`）是惰性分配的，
+> 文件系统写满时重启后的 store 会再次故障。
+> 需要 MDS ≥ v2.15.0 才会按 HLT1 过滤；更老的 MDS 忽略该字段，行为与此前相同。
+> RAM tier 丢弃无法 flush 的条目只使 `/healthz` 变 503，节点仍可服务，不退出
+> placement。数据面线程卡死而进程存活的情况不在此检测范围内，依赖
+> `DfkvServerNotReady`（抓取失败）与 client 侧错误告警发现。
+>
 > **peer-aware tiers**：server `--rdma-dev` 和 client `DFKV_RDMA_DEV` 都固定
 > 本机设备索引。client 的 `DFKV_RDMA_RAIL_TIERS` 用 `a|b;c` 表示优先级：
 > `|` 是同 tier，`;` 从 Tier 0 向低优先级分隔；空 tier/name、重复 rail 或任何
