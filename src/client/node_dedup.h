@@ -44,6 +44,7 @@
 #include <memory>
 #include <string>
 
+#include "client/dedup_token.h"
 #include "common/kv_types.h"
 
 namespace dfkv {
@@ -120,12 +121,15 @@ class NodeDedup {
 
   // Fetch outcomes for keys claimed as kFetch (kind selects the namespace;
   // exist publishes a 1-byte payload). token=0 is an unclaimed/direct fetch.
+  // Both act only on the slot the token was issued for, and only while that
+  // slot is still the same fetch of the same key.
   void Publish(const BlockKey& key, Kind kind, uint64_t token,
                const char* data, size_t n);
   void Abort(const BlockKey& key, Kind kind, uint64_t token);
   // Eviction barrier: removes every READY data/exist answer of the key and
   // supersedes every FETCHING owner (a key can hold more than one slot of its
-  // probe window). A publisher already copying is joined before return.
+  // probe window). A publisher already copying loses its slot and commits
+  // nothing; a publisher of a release that cannot be fenced is joined.
   void Invalidate(const BlockKey& key);
 
   // diagnostics (relaxed; process-local)
@@ -155,6 +159,38 @@ class NodeDedup {
   static uint64_t NowMs();
   // First slot of the key's 8-slot probe window, before masking.
   static uint32_t ProbeStart(const BlockKey& key, Kind kind);
+  // Ownership tokens (client/dedup_token.h) name a slot and its generation.
+  uint64_t TokenFor(const Slot* s, uint64_t gen) const;
+  // The slot the token names, if it still has the token's generation.
+  Slot* OwnedSlot(uint64_t token) const;
+  // FETCHING -> PUBLISHING for the token's holder. False, with the slot left
+  // as it was, when the slot is not (or no longer) this holder's fetch of
+  // (key, kind).
+  bool LockOwned(Slot* s, const BlockKey& key, Kind kind, uint64_t token);
+  // Publish and Abort after the token check: Publish takes the slot
+  // (PublishBegin), then copies and commits (PublishFinish).
+  struct PublishHold {
+    Slot* slot = nullptr;
+    uint64_t gen = 0;
+  };
+  bool PublishBegin(Slot* s, const BlockKey& key, Kind kind, uint64_t token,
+                    PublishHold* hold);
+  void PublishFinish(const PublishHold& hold, const char* data, size_t n);
+  void AbortSlot(Slot* s, const BlockKey& key, Kind kind, uint64_t token);
+  // Makes a held slot look like the publisher of an older release, which
+  // does not mark itself as fenceable.
+  void SetFenceableForTest(const PublishHold& hold, bool on);
+  // A stale Publish/Abort of another process inside its re-check: the slot
+  // is PUBLISHING for a moment and then FETCHING again.
+  bool LockSlotForTest(Slot* s);
+  void UnlockSlotForTest(Slot* s);
+  // Takes a PUBLISHING slot away from a publisher that can be fenced and
+  // leaves it EMPTY. False when the holder is not such a publisher, or when
+  // another forcer is at work on the slot. Begin wins the slot (generation
+  // odd from then on), Finish clears and releases it.
+  bool ForceOutPublisher(Slot* s);
+  bool ForceOutBegin(Slot* s);
+  void ForceOutFinish(Slot* s);
 
   Header* hdr_ = nullptr;
   Slot* slots_ = nullptr;
@@ -164,6 +200,7 @@ class NodeDedup {
   int wait_ms_ = 500;
   int takeover_ms_ = 2000;
   int ttl_ms_ = 5000;
+  int lock_wait_ms_ = kDedupLockWaitMs;  // see LockOwned; tests raise it
   void* map_base_ = nullptr;
   size_t map_len_ = 0;
 

@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <future>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -26,6 +27,64 @@ namespace dfkv {
 struct NodeDedupTestAccess {
   static auto Find(NodeDedup& d, const BlockKey& key, NodeDedup::Kind kind) {
     return d.Find(key, kind);
+  }
+  // A publisher or aborter after its token check, before it takes the slot.
+  static auto OwnedSlot(NodeDedup& d, uint64_t token) {
+    return d.OwnedSlot(token);
+  }
+  template <typename SlotPtr>
+  static void PublishInto(NodeDedup& d, SlotPtr slot, const BlockKey& key,
+                          NodeDedup::Kind kind, uint64_t token,
+                          const std::string& v) {
+    NodeDedup::PublishHold hold;
+    if (d.PublishBegin(slot, key, kind, token, &hold))
+      d.PublishFinish(hold, v.data(), v.size());
+  }
+  template <typename SlotPtr>
+  static void AbortInto(NodeDedup& d, SlotPtr slot, const BlockKey& key,
+                        NodeDedup::Kind kind, uint64_t token) {
+    d.AbortSlot(slot, key, kind, token);
+  }
+  // A publisher that has taken its slot and not yet copied: Begin returns a
+  // hold that Finish commits. Never calling Finish is a publisher killed
+  // there.
+  struct Hold {
+    NodeDedup::PublishHold hold;
+    bool taken = false;
+  };
+  static Hold PublishBegin(NodeDedup& d, const BlockKey& key,
+                           NodeDedup::Kind kind, uint64_t token) {
+    Hold h;
+    if (auto slot = d.OwnedSlot(token))
+      h.taken = d.PublishBegin(slot, key, kind, token, &h.hold);
+    return h;
+  }
+  static void PublishFinish(NodeDedup& d, const Hold& h,
+                            const std::string& v) {
+    d.PublishFinish(h.hold, v.data(), v.size());
+  }
+  // An invalidation taking a slot from its publisher, in its two steps.
+  static bool ForceOutBegin(NodeDedup& d, const Hold& h) {
+    return d.ForceOutBegin(h.hold.slot);
+  }
+  static void ForceOutFinish(NodeDedup& d, const Hold& h) {
+    d.ForceOutFinish(h.hold.slot);
+  }
+  // Another process's stale Publish/Abort holding a slot for its re-check.
+  template <typename SlotPtr>
+  static bool StaleLock(NodeDedup& d, SlotPtr slot) {
+    return d.LockSlotForTest(slot);
+  }
+  template <typename SlotPtr>
+  static void StaleUnlock(NodeDedup& d, SlotPtr slot) {
+    d.UnlockSlotForTest(slot);
+  }
+  // How long a Publish/Abort waits for a slot held by a stale re-check.
+  static void SetLockWait(NodeDedup& d, std::chrono::milliseconds wait) {
+    d.lock_wait_ms_ = static_cast<int>(wait.count());
+  }
+  static void LookLikeAnOlderRelease(NodeDedup& d, const Hold& h) {
+    d.SetFenceableForTest(h.hold, false);
   }
   template <typename SlotPtr>
   static bool CopyOut(NodeDedup& d, SlotPtr slot, const BlockKey& key,
@@ -63,6 +122,14 @@ NodeDedup::Options Opts(const std::string& name, uint64_t arena = 4 << 20) {
 NodeDedup::Options LongWait(const std::string& name) {
   NodeDedup::Options o = Opts(name);
   o.wait_ms = 5000;
+  return o;
+}
+
+// For tests that expect kWait from a claim behind a fetch in flight: no
+// scheduling delay may turn that into a takeover.
+NodeDedup::Options NoTakeover(const std::string& name) {
+  NodeDedup::Options o = Opts(name);
+  o.takeover_ms = 600000;
   return o;
 }
 
@@ -564,4 +631,332 @@ TEST(NodeDedup, CopyOutRefusesASlotRecycledForAnotherKey) {
   EXPECT_TRUE(dfkv::NodeDedupTestAccess::CopyOut(
       *a, slot, Neighbour(40), NodeDedup::Kind::kData, v2.size(), &out[0]));
   EXPECT_EQ(out, v2);
+}
+
+// ---- publisher side: a late Publish/Abort must act only on its own claim --
+
+TEST(NodeDedup, PublishRefusesASlotReclaimedAfterItsTokenCheck) {
+  ShmGuard g("pub-gap");
+  auto a = NodeDedup::Open(NoTakeover(g.name));
+  auto b = NodeDedup::Open(NoTakeover(g.name));
+  ASSERT_TRUE(a && b);
+  const std::string v_old = Val(50, 4096), v_b = Val(51, 4096);
+  std::string out(v_old.size(), '\0');
+  uint64_t token_a = 0, token_b = 0, ignored = 0;
+  ASSERT_EQ(a->Claim(K(50), out.size(), &out[0], &token_a),
+            NodeDedup::Role::kFetch);
+  // The publisher has checked its token ...
+  const auto slot = dfkv::NodeDedupTestAccess::OwnedSlot(*a, token_a);
+  ASSERT_NE(slot, nullptr);
+  // ... and before it takes the slot, the key is invalidated and another
+  // process claims the same slot for another key.
+  b->Invalidate(K(50));
+  ASSERT_EQ(b->Claim(Neighbour(50), out.size(), &out[0], &token_b),
+            NodeDedup::Role::kFetch);
+  dfkv::NodeDedupTestAccess::PublishInto(*a, slot, K(50),
+                                         NodeDedup::Kind::kData, token_a,
+                                         v_old);
+  EXPECT_EQ(b->Claim(Neighbour(50), out.size(), &out[0], &ignored),
+            NodeDedup::Role::kWait)
+      << "the late publish went into another key's claim";
+  // The slot's real owner is unaffected.
+  b->Publish(Neighbour(50), NodeDedup::Kind::kData, token_b, v_b.data(),
+             v_b.size());
+  ASSERT_EQ(a->Claim(Neighbour(50), out.size(), &out[0], &ignored),
+            NodeDedup::Role::kHit);
+  EXPECT_EQ(out, v_b);
+}
+
+TEST(NodeDedup, AbortRefusesASlotReclaimedAfterItsTokenCheck) {
+  ShmGuard g("abort-gap");
+  auto a = NodeDedup::Open(Opts(g.name));
+  auto b = NodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  const std::string v_b = Val(53, 4096);
+  std::string out(v_b.size(), '\0');
+  uint64_t token_a = 0, token_b = 0, ignored = 0;
+  ASSERT_EQ(a->Claim(K(52), out.size(), &out[0], &token_a),
+            NodeDedup::Role::kFetch);
+  const auto slot = dfkv::NodeDedupTestAccess::OwnedSlot(*a, token_a);
+  ASSERT_NE(slot, nullptr);
+  b->Invalidate(K(52));
+  ASSERT_EQ(b->Claim(Neighbour(52), out.size(), &out[0], &token_b),
+            NodeDedup::Role::kFetch);
+  dfkv::NodeDedupTestAccess::AbortInto(*a, slot, K(52),
+                                       NodeDedup::Kind::kData, token_a);
+  // The other key's fetch is still in flight and still publishable.
+  b->Publish(Neighbour(52), NodeDedup::Kind::kData, token_b, v_b.data(),
+             v_b.size());
+  ASSERT_EQ(a->Claim(Neighbour(52), out.size(), &out[0], &ignored),
+            NodeDedup::Role::kHit)
+      << "the late abort dropped another key's claim";
+  EXPECT_EQ(out, v_b);
+}
+
+// A token is good for the slot it was issued for only. Generations are small
+// per-slot counters, so the slot a key has moved to can carry the very value
+// an older claim of the key holds.
+TEST(NodeDedup, LatePublishDoesNotFollowTheKeyToAnotherSlot) {
+  ShmGuard g("token-slot");
+  auto a = NodeDedup::Open(NoTakeover(g.name));
+  auto b = NodeDedup::Open(NoTakeover(g.name));
+  ASSERT_TRUE(a && b);
+  const std::string v_old = Val(54, 4096), v_new = Val(55, 4096);
+  std::string out(v_old.size(), '\0');
+  uint64_t neighbour = 0, token_a = 0, token_b = 0, ignored = 0;
+  // The neighbour holds the first position: the key lives at the second.
+  ASSERT_EQ(a->Claim(Neighbour(54), out.size(), &out[0], &neighbour),
+            NodeDedup::Role::kFetch);
+  // One claim-and-invalidate round on the second position, then the claim
+  // this test is about: it is that slot's third generation step.
+  ASSERT_EQ(a->Claim(K(54), out.size(), &out[0], &ignored),
+            NodeDedup::Role::kFetch);
+  a->Invalidate(K(54));
+  ASSERT_EQ(a->Claim(K(54), out.size(), &out[0], &token_a),
+            NodeDedup::Role::kFetch);
+  // The neighbour goes, comes back and goes again: the first position is
+  // free and two steps along.
+  a->Abort(Neighbour(54), NodeDedup::Kind::kData, neighbour);
+  ASSERT_EQ(a->Claim(Neighbour(54), out.size(), &out[0], &neighbour),
+            NodeDedup::Role::kFetch);
+  a->Abort(Neighbour(54), NodeDedup::Kind::kData, neighbour);
+  // The key is overwritten, and the next fetch of it claims the first
+  // position, which thereby reaches the generation the old claim holds.
+  b->Invalidate(K(54));
+  ASSERT_EQ(b->Claim(K(54), out.size(), &out[0], &token_b),
+            NodeDedup::Role::kFetch);
+  // The old fetch completes late with the bytes from before the overwrite.
+  a->Publish(K(54), NodeDedup::Kind::kData, token_a, v_old.data(),
+             v_old.size());
+  EXPECT_EQ(a->Claim(K(54), out.size(), &out[0], &ignored),
+            NodeDedup::Role::kWait)
+      << "bytes from before the invalidation were published";
+  b->Publish(K(54), NodeDedup::Kind::kData, token_b, v_new.data(),
+             v_new.size());
+  ASSERT_EQ(a->Claim(K(54), out.size(), &out[0], &ignored),
+            NodeDedup::Role::kHit);
+  EXPECT_EQ(out, v_new);
+}
+
+// ---- a publisher that stops inside Publish --------------------------------
+
+// Runs Invalidate on its own thread; true if it returned within the bound.
+struct InvalidateInBackground {
+  std::future<void> done;
+  InvalidateInBackground(NodeDedup* d, BlockKey key)
+      : done(std::async(std::launch::async, [d, key] { d->Invalidate(key); })) {}
+  bool ReturnedWithin(std::chrono::milliseconds bound) {
+    return done.wait_for(bound) == std::future_status::ready;
+  }
+};
+
+TEST(NodeDedup, InvalidateDoesNotWaitForAKilledPublisher) {
+  ShmGuard g("pub-dead");
+  auto a = NodeDedup::Open(Opts(g.name));
+  auto b = NodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  const std::string v_old = Val(56, 4096);
+  std::string out(v_old.size(), '\0');
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->Claim(K(56), out.size(), &out[0], &token),
+            NodeDedup::Role::kFetch);
+  // The publisher takes its slot and is killed before it commits.
+  const auto held = dfkv::NodeDedupTestAccess::PublishBegin(
+      *a, K(56), NodeDedup::Kind::kData, token);
+  ASSERT_TRUE(held.taken);
+
+  InvalidateInBackground inv(b.get(), K(56));
+  const bool returned = inv.ReturnedWithin(2s);
+  EXPECT_TRUE(returned) << "a write or remove of this key would never return";
+  if (!returned)  // let the thread go so the test can end
+    dfkv::NodeDedupTestAccess::PublishFinish(*a, held, v_old);
+  inv.done.wait();
+  // The slot is usable again.
+  EXPECT_EQ(b->Claim(K(56), out.size(), &out[0], &ignored),
+            NodeDedup::Role::kFetch);
+}
+
+TEST(NodeDedup, InvalidateFencesAPublisherThatIsStillCopying) {
+  ShmGuard g("pub-slow");
+  auto a = NodeDedup::Open(Opts(g.name));
+  auto b = NodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  const std::string v_old = Val(57, 4096), v_new = Val(58, 4096);
+  std::string out(v_old.size(), '\0');
+  uint64_t token_a = 0, token_b = 0, ignored = 0;
+  ASSERT_EQ(a->Claim(K(57), out.size(), &out[0], &token_a),
+            NodeDedup::Role::kFetch);
+  const auto held = dfkv::NodeDedupTestAccess::PublishBegin(
+      *a, K(57), NodeDedup::Kind::kData, token_a);
+  ASSERT_TRUE(held.taken);
+
+  // The key is overwritten while the publisher copies, and fetched again.
+  InvalidateInBackground inv(b.get(), K(57));
+  const bool returned = inv.ReturnedWithin(2s);
+  EXPECT_TRUE(returned);
+  if (returned) {
+    ASSERT_EQ(b->Claim(K(57), out.size(), &out[0], &token_b),
+              NodeDedup::Role::kFetch);
+    b->Publish(K(57), NodeDedup::Kind::kData, token_b, v_new.data(),
+               v_new.size());
+  }
+  // The publisher was alive all along and now commits: nothing may come of it.
+  dfkv::NodeDedupTestAccess::PublishFinish(*a, held, v_old);
+  inv.done.wait();
+  if (returned) {
+    ASSERT_EQ(a->Claim(K(57), out.size(), &out[0], &ignored),
+              NodeDedup::Role::kHit);
+    EXPECT_EQ(out, v_new);
+  }
+}
+
+TEST(NodeDedup, ClaimTakesOverFromAKilledPublisher) {
+  ShmGuard g("pub-dead-claim");
+  auto a = NodeDedup::Open(Opts(g.name));
+  auto b = NodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  std::string out(4096, '\0');
+  uint64_t token = 0, taken_over = 0;
+  ASSERT_EQ(a->Claim(K(59), out.size(), &out[0], &token),
+            NodeDedup::Role::kFetch);
+  const auto held = dfkv::NodeDedupTestAccess::PublishBegin(
+      *a, K(59), NodeDedup::Kind::kData, token);
+  ASSERT_TRUE(held.taken);
+  std::this_thread::sleep_for(250ms);  // > takeover_ms(200)
+  EXPECT_EQ(b->Claim(K(59), out.size(), &out[0], &taken_over),
+            NodeDedup::Role::kFetch)
+      << "every later lookup of this key would wait out its deadline";
+}
+
+// A publisher of an older release commits with unconditional stores: taking
+// its slot away would let those stores land on whoever owns the slot next.
+// It is waited for, as before.
+TEST(NodeDedup, PublisherOfAnOlderReleaseIsNeverForcedOut) {
+  ShmGuard g("pub-old");
+  auto a = NodeDedup::Open(Opts(g.name));
+  auto b = NodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  const std::string v_old = Val(60, 4096);
+  std::string out(v_old.size(), '\0');
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->Claim(K(60), out.size(), &out[0], &token),
+            NodeDedup::Role::kFetch);
+  const auto held = dfkv::NodeDedupTestAccess::PublishBegin(
+      *a, K(60), NodeDedup::Kind::kData, token);
+  ASSERT_TRUE(held.taken);
+  dfkv::NodeDedupTestAccess::LookLikeAnOlderRelease(*a, held);
+
+  std::this_thread::sleep_for(250ms);  // > takeover_ms(200)
+  EXPECT_EQ(b->Claim(K(60), out.size(), &out[0], &ignored),
+            NodeDedup::Role::kWait);
+  InvalidateInBackground inv(b.get(), K(60));
+  EXPECT_FALSE(inv.ReturnedWithin(150ms));
+  // It commits; the invalidation then removes what it published.
+  dfkv::NodeDedupTestAccess::PublishFinish(*a, held, v_old);
+  inv.done.wait();
+  EXPECT_NE(b->Claim(K(60), out.size(), &out[0], &ignored),
+            NodeDedup::Role::kHit);
+}
+
+// Two invalidations of one key meet at a publisher's slot. Only one may take
+// it: the other must not act on the slot until the first is through, or its
+// stores land on whatever the slot has become.
+TEST(NodeDedup, TwoInvalidationsDoNotBothTakeAPublishersSlot) {
+  ShmGuard g("pub-two-forcers");
+  auto a = NodeDedup::Open(Opts(g.name));
+  auto b = NodeDedup::Open(Opts(g.name));
+  auto c = NodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b && c);
+  const std::string v_new = Val(62, 4096);
+  std::string out(v_new.size(), '\0');
+  uint64_t token_a = 0, token_c = 0, ignored = 0;
+  ASSERT_EQ(a->Claim(K(61), out.size(), &out[0], &token_a),
+            NodeDedup::Role::kFetch);
+  const auto held = dfkv::NodeDedupTestAccess::PublishBegin(
+      *a, K(61), NodeDedup::Kind::kData, token_a);
+  ASSERT_TRUE(held.taken);
+
+  // The first invalidation has won the slot and not yet released it.
+  ASSERT_TRUE(dfkv::NodeDedupTestAccess::ForceOutBegin(*b, held));
+  // The second arrives.
+  InvalidateInBackground second(c.get(), K(61));
+  const bool second_acted = second.ReturnedWithin(150ms);
+  EXPECT_FALSE(second_acted) << "a second invalidation took the slot as well";
+  // If it did, the slot is free and the next fetch of the key claims it ...
+  if (second_acted) {
+    ASSERT_EQ(c->Claim(K(61), out.size(), &out[0], &token_c),
+              NodeDedup::Role::kFetch);
+  }
+  // ... before the first invalidation finishes.
+  dfkv::NodeDedupTestAccess::ForceOutFinish(*b, held);
+  second.done.wait();
+  if (!second_acted) {
+    ASSERT_EQ(c->Claim(K(61), out.size(), &out[0], &token_c),
+              NodeDedup::Role::kFetch);
+  }
+  c->Publish(K(61), NodeDedup::Kind::kData, token_c, v_new.data(),
+             v_new.size());
+  ASSERT_EQ(a->Claim(K(61), out.size(), &out[0], &ignored),
+            NodeDedup::Role::kHit)
+      << "the claim made after the invalidations was wiped";
+  EXPECT_EQ(out, v_new);
+}
+
+// The takeover age of a PUBLISHING slot is time spent publishing. A fetch
+// that itself took longer than takeover_ms is not taken away the moment its
+// owner starts to copy.
+TEST(NodeDedup, SlowFetchIsNotForcedOutDuringItsCopy) {
+  ShmGuard g("pub-slow-fetch");
+  auto a = NodeDedup::Open(NoTakeover(g.name));  // nobody steals the fetch
+  auto o = Opts(g.name);
+  o.takeover_ms = 500;
+  o.ttl_ms = 60000;
+  auto b = NodeDedup::Open(o);
+  ASSERT_TRUE(a && b);
+  const std::string v = Val(63, 4096);
+  std::string out(v.size(), '\0');
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->Claim(K(63), out.size(), &out[0], &token),
+            NodeDedup::Role::kFetch);
+  std::this_thread::sleep_for(600ms);  // the fetch: > b's takeover_ms
+  const auto held = dfkv::NodeDedupTestAccess::PublishBegin(
+      *a, K(63), NodeDedup::Kind::kData, token);
+  ASSERT_TRUE(held.taken);
+  EXPECT_EQ(b->Claim(K(63), out.size(), &out[0], &ignored),
+            NodeDedup::Role::kWait)
+      << "a copy that had only just begun was taken away";
+  dfkv::NodeDedupTestAccess::PublishFinish(*a, held, v);
+  ASSERT_EQ(b->Claim(K(63), out.size(), &out[0], &ignored),
+            NodeDedup::Role::kHit);
+  EXPECT_EQ(out, v);
+}
+
+// A stale Publish or Abort of another process holds the slot for the moment
+// of its re-check. The owner's publish, arriving in that moment, must still
+// go through.
+TEST(NodeDedup, OwnerPublishWaitsOutAStaleRecheck) {
+  ShmGuard g("pub-retry");
+  auto a = NodeDedup::Open(NoTakeover(g.name));
+  auto b = NodeDedup::Open(NoTakeover(g.name));
+  ASSERT_TRUE(a && b);
+  const std::string v = Val(64, 4096);
+  std::string out(v.size(), '\0');
+  uint64_t token = 0, ignored = 0;
+  ASSERT_EQ(a->Claim(K(64), out.size(), &out[0], &token),
+            NodeDedup::Role::kFetch);
+  const auto slot = dfkv::NodeDedupTestAccess::OwnedSlot(*a, token);
+  ASSERT_NE(slot, nullptr);
+  ASSERT_TRUE(dfkv::NodeDedupTestAccess::StaleLock(*b, slot));
+  // Far beyond any scheduling delay of the thread below; 50 ms otherwise.
+  dfkv::NodeDedupTestAccess::SetLockWait(*a, 10s);
+  std::thread stale([&] {
+    std::this_thread::sleep_for(2ms);
+    dfkv::NodeDedupTestAccess::StaleUnlock(*b, slot);
+  });
+  a->Publish(K(64), NodeDedup::Kind::kData, token, v.data(), v.size());
+  stale.join();
+  ASSERT_EQ(b->Claim(K(64), out.size(), &out[0], &ignored),
+            NodeDedup::Role::kHit)
+      << "the owner gave up and its fetch was never published";
+  EXPECT_EQ(out, v);
 }

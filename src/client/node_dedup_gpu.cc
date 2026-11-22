@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 
+#include "client/dedup_token.h"
 #include "utils/log.h"
 
 namespace dfkv {
@@ -523,8 +524,10 @@ GpuNodeDedup::Role GpuNodeDedup::ClaimSg(const BlockKey& key, const Seg* segs,
         return Role::kHit;
       }
     } else if (st == kStateFetching) {
+      // (`now` was read before the lookup: a fetch begun since is newer.)
       const uint64_t started = s->fetch_start_ms.load(std::memory_order_relaxed);
-      if (now - started <= static_cast<uint64_t>(takeover_ms_))
+      if (started >= now ||
+          now - started <= static_cast<uint64_t>(takeover_ms_))
         return Role::kWait;
       uint32_t expect = kStateFetching;
       if (s->state.compare_exchange_strong(expect, kStatePublishing,
@@ -533,7 +536,7 @@ GpuNodeDedup::Role GpuNodeDedup::ClaimSg(const BlockKey& key, const Seg* segs,
         s->fetch_start_ms.store(now, std::memory_order_relaxed);
         const uint64_t mine = s->gen.fetch_add(1, std::memory_order_release) + 1;
         s->state.store(kStateFetching, std::memory_order_release);
-        if (token) *token = mine;
+        if (token) *token = TokenFor(s, mine);
         fetches_.fetch_add(1, std::memory_order_relaxed);
         return Role::kFetch;
       }
@@ -560,23 +563,61 @@ GpuNodeDedup::Role GpuNodeDedup::ClaimSg(const BlockKey& key, const Seg* segs,
       if (pass == 0)
         for (volatile int spin = 0; spin < 2000; ++spin) {}
     }
-    if (token) *token = mine->gen.load(std::memory_order_acquire);
+    if (token)
+      *token = TokenFor(mine, mine->gen.load(std::memory_order_acquire));
     fetches_.fetch_add(1, std::memory_order_relaxed);
     return Role::kFetch;
   }
   return Role::kFetch;
 }
 
+uint64_t GpuNodeDedup::TokenFor(const Slot* s, uint64_t gen) const {
+  return dedup_token::Make(static_cast<uint32_t>(s - slots_), gen);
+}
+
+GpuNodeDedup::Slot* GpuNodeDedup::OwnedSlot(uint64_t token) const {
+  if (!dedup_token::Valid(token)) return nullptr;
+  const uint32_t idx = dedup_token::SlotIndex(token);
+  if (idx >= nslots_) return nullptr;
+  Slot* s = &slots_[idx];
+  if (!dedup_token::SameGen(token, s->gen.load(std::memory_order_acquire)))
+    return nullptr;
+  return s;
+}
+
+bool GpuNodeDedup::LockOwned(Slot* s, const BlockKey& key, uint64_t token) {
+  // Bounded wait for a stale party's re-check to hand the slot back; see
+  // NodeDedup::LockOwned.
+  const auto give_up =
+      std::chrono::steady_clock::now() +
+      std::chrono::milliseconds(kDedupLockWaitMs);
+  for (;;) {
+    uint32_t st = kStateFetching;
+    if (s->state.compare_exchange_strong(st, kStatePublishing,
+                                         std::memory_order_acq_rel))
+      break;
+    if (st != kStatePublishing ||
+        !dedup_token::SameGen(token, s->gen.load(std::memory_order_acquire)) ||
+        std::chrono::steady_clock::now() >= give_up)
+      return false;
+    std::this_thread::yield();
+  }
+  // See NodeDedup::LockOwned: the slot may have been invalidated and claimed
+  // again between the generation check and the lock.
+  if (!dedup_token::SameGen(token, s->gen.load(std::memory_order_acquire)) ||
+      s->key_hi != key.digest_hi || s->key_lo != key.digest_lo) {
+    s->state.store(kStateFetching, std::memory_order_release);
+    return false;
+  }
+  return true;
+}
+
 void GpuNodeDedup::PublishSg(const BlockKey& key, uint64_t token,
                              const Seg* segs, size_t nsegs, size_t len) {
-  if (token == 0) return;
+  if (!dedup_token::Valid(token)) return;
   EnsureThreadCtx();
-  Slot* s = Find(key);
-  if (!s || s->gen.load(std::memory_order_acquire) != token) return;
-  uint32_t state = kStateFetching;
-  if (!s->state.compare_exchange_strong(state, kStatePublishing,
-                                        std::memory_order_acq_rel))
-    return;
+  Slot* s = OwnedSlot(token);
+  if (!s || !LockOwned(s, key, token)) return;
   const size_t n = len;
   auto abandon = [&] { s->state.store(kStateEmpty, std::memory_order_release); };
   if (n == 0 || n > arena_bytes_ / 2) return abandon();
@@ -625,11 +666,9 @@ void GpuNodeDedup::PublishSg(const BlockKey& key, uint64_t token,
 }
 
 void GpuNodeDedup::Abort(const BlockKey& key, uint64_t token) {
-  if (token == 0) return;
-  Slot* s = Find(key);
-  if (!s || s->gen.load(std::memory_order_acquire) != token) return;
-  uint32_t st = kStateFetching;
-  s->state.compare_exchange_strong(st, kStateEmpty, std::memory_order_acq_rel);
+  Slot* s = OwnedSlot(token);
+  if (!s || !LockOwned(s, key, token)) return;
+  s->state.store(kStateEmpty, std::memory_order_release);
 }
 
 void GpuNodeDedup::Invalidate(const BlockKey& key) {

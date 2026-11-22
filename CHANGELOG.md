@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- Client, host and GPU dedup (`DFKV_CLIENT_NODE_DEDUP=1`), the publishing
+  side: three ways a process that fetched a key for the others could do
+  damage after the key had been written or removed in the meantime.
+  - A publisher compared its claim with the shared slot and then took the
+    slot in a second step. If the key was invalidated and the slot claimed
+    again in between, for a new fetch of the key or for another key, the
+    old bytes were published into that claim. A late abort could drop it
+    the same way. Both now compare again after taking the slot and put it
+    back untouched when it is no longer theirs. The claim's real owner,
+    if it publishes at that very moment, waits for the slot to come back
+    (at most 50 ms) instead of giving up.
+  - A claim was identified by a small per-slot counter only, and a late
+    publish went to whichever slot the key had by then. If the key had
+    moved to a slot whose counter happened to match, bytes from before the
+    write were published as current. A claim now names its slot, and
+    publish and abort act on that slot only.
+  - Host path only: a publisher killed while copying left its slot locked
+    for good, so every later write or remove of that key spun forever in
+    the client and every lookup of it waited out
+    `DFKV_NODE_DEDUP_WAIT_MS`. An invalidation now takes the slot away from
+    a publisher that is copying, whether it is alive or not (what it was
+    about to publish is from before the write anyway), and a lookup does
+    the same once the publisher has been copying for longer than
+    `DFKV_NODE_DEDUP_TAKEOVER_MS`. Two windows of a few instructions each
+    remain in which a kill still blocks the key as before: between taking
+    the slot and marking it, and during the last stores of a commit or of
+    taking a slot away. On the GPU path a publisher killed anywhere while
+    publishing still blocks its key as before.
+  The shared-memory layout, the slot states and the segment names are
+  unchanged. Taking a slot away relies on the publisher committing in a way
+  that can be refused, which only this release and later do; they say so
+  in a slot field that older releases neither read nor write. A publisher
+  of an older release on the same host is therefore still waited for, and
+  if it is killed while copying, its key stays blocked until the segment
+  is removed.
 - Server: a start with a RAM tier and populated slab disks takes less time.
   Nothing changes on disk or on the wire, and a restarted node holds exactly
   the state it held before: same eviction order, same order in which free
