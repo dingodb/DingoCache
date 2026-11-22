@@ -45,6 +45,20 @@
   With it on, a `cache_salt` that would push the key component past 256 bytes
   goes into the key as its SHA-256 (`salth-<hex>`); with it off a salt over
   251 bytes is still refused, as before.
+- LMCache MP-server L2 adapter: works with LMCache 0.5.x, and the
+  connector's LMCache dependency is bounded (`>=0.4.5,<0.5.7`; it was
+  unbounded). From 0.5.0 LMCache passes a layout argument to
+  `submit_lookup_and_lock_task`, which the adapter did not take: the server
+  started and the first prefetch raised a `TypeError`. From 0.5.4 `Bitmap`
+  lives in `lmcache.lmcache_native`, and the adapter failed to import. Both
+  forms are accepted now (the layout is advisory and not used). The upper
+  bound: 0.5.7 adds an abstract L2 method the adapter does not implement,
+  and moves `lmcache.v1.storage_backend` to
+  `lmcache.inprocess.v1.storage_backend`, so the in-process connector does
+  not import there either. A fresh install therefore gets LMCache 0.5.6,
+  and an environment whose vLLM requires LMCache 0.5.7 or later gets a
+  resolver conflict. Unit tests check the adapter against the interface of
+  0.4.7, 0.5.0, 0.5.3 and 0.5.4; end-to-end runs so far are on 0.4.7.
 
 ## 2.39.0 — 2026-11-22
 

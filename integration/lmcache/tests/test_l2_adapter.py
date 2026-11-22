@@ -2,11 +2,11 @@
 """Unit tests for the dfkv LMCache MP-server L2 adapter (DfkvL2Adapter).
 
 These exercise the eventfd / task-id / Bitmap / byte-accounting *bridge* logic
-with an in-memory fake dfkv client, so they need lmcache installed but NO real
-dfkv ring or libdfkv.so. The real-ring end-to-end path is covered by the
-integration test / RUNBOOK.
+with an in-memory fake dfkv client, so they need NO real dfkv ring or
+libdfkv.so, and run on a stand-in for LMCache where it is not installed.
+The real-ring end-to-end path is covered by the integration test / RUNBOOK.
 
-Run (inside an env with lmcache>=0.4.7):
+Run:
     python3 -m pytest integration/lmcache/tests/test_l2_adapter.py -v
 or standalone:
     python3 integration/lmcache/tests/test_l2_adapter.py
@@ -24,6 +24,12 @@ import time
 sys.path.insert(
     0, os.path.join(os.path.dirname(__file__), "..", "src")
 )
+
+# Without LMCache installed, run on the stand-in for its modules.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _lmcache_stub  # noqa: E402
+
+_lmcache_stub.install()
 
 import dfkv_connector.l2_adapter as l2mod  # noqa: E402
 from dfkv_connector.l2_adapter import (  # noqa: E402

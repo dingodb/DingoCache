@@ -15,7 +15,12 @@ authors = [{ name = "Wine93", email = "wine93.info@gmail.com" }]
 # no CPython extension, so the wheel is platform-independent.
 dependencies = [
   "dfkv-common==2.39.0",
-  "lmcache",
+  # Checked against LMCache's L2AdapterInterface of 0.4.7-0.5.6. 0.5.7 adds
+  # an abstract method the L2 adapter does not implement and moves
+  # lmcache.v1.storage_backend to lmcache.inprocess.v1.storage_backend, so the
+  # in-process connector fails to import there too. The in-process connector
+  # also runs on 0.4.5; the L2 adapter needs 0.4.7.
+  "lmcache>=0.4.5,<0.5.7",
   "torch",
 ]
 
