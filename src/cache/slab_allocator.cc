@@ -361,6 +361,67 @@ bool SlabAllocator::StealsBeforeLocked(const ExtentMeta& a,
   return a.useful_bytes < b.useful_bytes;
 }
 
+// Whole-extent moves between size classes follow the data that is used: an
+// extent goes to a class that wants to grow only if its residents are much
+// colder than what that class would otherwise evict from its own slots.
+//
+// "Cold" is the mean time since the residents were last read or written, on
+// the allocator's clock, which ticks with every admission (and, where reads
+// go through Get/GetAndPin, with every read), so the times of all classes are
+// on one scale whatever their slot sizes. The donor's extent must be older
+// than kStealAgeMargin times the growing class's own least recently used
+// extent. Without a margin two classes of about the same age would hand one
+// extent back and forth; with it an extent that has moved comes back only
+// after the ages have swung by the margin squared.
+//
+// The comparison is relative on purpose. A class that is read constantly
+// and never written keeps its extents against a class that is merely
+// written; a class that is read less than a newer one is used gives way to
+// it. A rule with a fixed horizon ("used within the last N ticks is never
+// cold") would do the first and forbid the second.
+bool SlabAllocator::MuchColderLocked(const ExtentMeta& donor,
+                                     const ExtentMeta& own) const {
+  if (donor.resident_count == 0) return true;   // nothing to lose
+  if (own.resident_count == 0) return true;     // nothing to compare with
+  // Sum of the residents' ages; activity_seq_ >= every access_seq.
+  const unsigned __int128 donor_age =
+      static_cast<unsigned __int128>(activity_seq_) * donor.resident_count -
+      donor.access_seq_sum;
+  const unsigned __int128 own_age =
+      static_cast<unsigned __int128>(activity_seq_) * own.resident_count -
+      own.access_seq_sum;
+  // mean(donor) > kStealAgeMargin * mean(own), without the divisions.
+  return donor_age * own.resident_count >
+         kStealAgeMargin * own_age * donor.resident_count;
+}
+
+// The extent of `cls` whose residents are least recently used on average:
+// what the class would lose first if it had to give or evict. -1 if the
+// class holds no resident.
+//
+// An extent the class cannot lose is not that: one with a pinned slot or
+// with a resident under retention is passed over by every steal and its
+// protected residents by every eviction, so its age says nothing about what
+// the class would give up. Measured against an extent that holds a value
+// retained for an hour, no donor would be old enough for an hour, and the
+// class would go on evicting its own much younger values. Such extents
+// count only when the class has no other.
+int SlabAllocator::LeastRecentlyUsedExtentLocked(size_t cls) const {
+  int best = -1;
+  int best_held = -1;
+  for (uint32_t e = 0; e < extents_.size(); ++e) {
+    const ExtentMeta& extent = extents_[e];
+    if (extent.cls != static_cast<int>(cls) || extent.resident_count == 0)
+      continue;
+    int& candidate =
+        extent.pinned != 0 || extent.protected_slots != 0 ? best_held : best;
+    if (candidate < 0 ||
+        StealsBeforeLocked(extent, extents_[static_cast<size_t>(candidate)]))
+      candidate = static_cast<int>(e);
+  }
+  return best >= 0 ? best : best_held;
+}
+
 void SlabAllocator::TouchLocked(uint32_t index) {
   SlotMeta& meta = slots_[index];
   ++activity_seq_;
@@ -745,6 +806,8 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealColdExtentFor(
   const uint64_t window = cold_window_ ? cold_window_ : index_.size();
   if (window == 0 || put_seq_ <= window) return ExtentBindResult::kUnavailable;
   const uint64_t cold_before = put_seq_ - window;
+  // What this class would evict instead: a candidate has to be much colder.
+  const int own = LeastRecentlyUsedExtentLocked(target_cls);
   int best = -1;
   uint64_t best_heat = std::numeric_limits<uint64_t>::max();
   uint64_t best_useful = std::numeric_limits<uint64_t>::max();
@@ -753,7 +816,9 @@ SlabAllocator::ExtentBindResult SlabAllocator::StealColdExtentFor(
     const ExtentMeta& extent = extents_[e];
     if (extent.cls == kUnbound || extent.cls == static_cast<int>(target_cls) ||
         extent.pinned != 0 || extent.protected_slots != 0 ||
-        extent.resident_count == 0 || extent.youngest_seq >= cold_before)
+        extent.resident_count == 0 || extent.youngest_seq >= cold_before ||
+        (own >= 0 &&
+         !MuchColderLocked(extent, extents_[static_cast<size_t>(own)])))
       continue;
     const uint64_t heat = ExtentHeatLocked(extent);
     if (best < 0 || heat < best_heat ||
@@ -821,9 +886,16 @@ bool SlabAllocator::StealFrom(size_t donor_cls, size_t target_cls,
         StealsBeforeLocked(extent, extents_[static_cast<size_t>(best)]))
       best = static_cast<int>(e);
   }
-  return best >= 0 &&
-         StealExtentLocked(static_cast<uint32_t>(best), target_cls, evicted) ==
-             ExtentBindResult::kBound;
+  if (best < 0) return false;
+  // `best` is the donor's least recently used extent. If even that one is not
+  // much colder than what the target class would evict from its own slots,
+  // the donor has nothing to give it: the target keeps to its own.
+  const int own = LeastRecentlyUsedExtentLocked(target_cls);
+  if (own >= 0 && !MuchColderLocked(extents_[static_cast<size_t>(best)],
+                                    extents_[static_cast<size_t>(own)]))
+    return false;
+  return StealExtentLocked(static_cast<uint32_t>(best), target_cls, evicted) ==
+         ExtentBindResult::kBound;
 }
 
 bool SlabAllocator::Put(const BlockKey& key, size_t len, SlotRef* out,
@@ -997,6 +1069,17 @@ bool SlabAllocator::PinForRead(const BlockKey& key, SlotHandle handle) {
   ++meta.refs;
   // Repeated reads of a hot resident find the bit set and store nothing.
   if (!meta.referenced) meta.referenced = true;
+  // The read also counts where whole extents are chosen for another class
+  // (MuchColderLocked, StealsBeforeLocked): the resident's access time, and
+  // with it its extent's mean. The clock is read, not advanced, so reads
+  // between two admissions find the time already there and store nothing
+  // either; what is stored goes to the slot record and the extent record
+  // that this pin and its unpin write on every read anyway (refs, pinned).
+  if (meta.access_seq != activity_seq_) {
+    extents_[meta.ref.extent].access_seq_sum +=
+        activity_seq_ - meta.access_seq;
+    meta.access_seq = activity_seq_;
+  }
   return true;
 }
 

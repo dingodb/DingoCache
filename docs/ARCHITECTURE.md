@@ -272,6 +272,33 @@ size-class lattice and carves them into uniform slots:
   (`StealColdExtentFor`) keeps its admission-age gate and heat/useful-bytes
   order. Background growth judges cold donor classes by bytes written, not
   object count.
+- **Whole extents follow the data that is used:** both ways of moving a
+  whole extent to a class that is being written, the background growth
+  (`StealFrom`) and the cold steal inside `Put`, take a donor's extent only
+  if its residents are much colder than what the growing class would lose
+  of its own: the mean time since the donor extent's residents were last
+  read or written must be more than twice (`kStealAgeMargin`) that of the
+  growing class's own least recently used extent. Otherwise the growing
+  class evicts from its own slots. Times are on the allocator's clock, which
+  ticks with every admission and, on the disk tier, with every read (the RAM
+  tier's reads record the time without moving it), so classes of different
+  slot sizes are compared on one scale. A class that is read and never
+  written therefore keeps its extents against one that is only written, and
+  a class that is read less than a newer one is used gives way to it; the
+  margin keeps two classes of similar age from handing an extent back and
+  forth. The floor of `kStripeWays` extents per donor in the background
+  growth and the write-age gate of the cold steal are unchanged. Two steals
+  inside `Put` (`StealExtentFor`) make no such comparison: the one that
+  brings a class with fewer than `kStripeWays` extents up to that floor,
+  and the last resort of an admission that found neither a free slot nor
+  anything of its own class to evict. The growing class is measured by an
+  extent it could lose: one with a pinned slot or a resident under retention
+  counts only if the class has no other. After a restart restored residents
+  carry no access time (they are as old as the clock), so a growing class
+  takes no extent until its own least recently used extent holds values
+  written since the restart, about one turnover of that class. On the disk
+  tier, with a RAM tier in front, recency sees only the reads the RAM tier
+  misses.
 - **Concurrent I/O:** payload reads/writes run outside metadata locks while
   slot pins and deferred removal prevent reuse. Prepared disk reads return one
   move-only RAII lease; async completion, fallback, error, and teardown release
@@ -537,10 +564,12 @@ further on, and that in a class where nearly every slot is referenced the
 hand laps up to 512 times faster than slots are evicted, so a value must be
 read correspondingly more often to keep its bit. Only GETs that are served
 from an arena slot set the bit; existence probes and values larger than one
-extent do not. Reads set only that bit: they do not
-reorder the ring, and they do not contribute to the read heat that
-whole-extent rebalancing between size classes consults, which in the RAM tier
-still reflects writes only.
+extent do not. Reads do not reorder the ring. Besides the bit they record
+when the slot was last read (stored again only after an admission has moved
+the allocator's clock), which is what whole-extent rebalancing between size
+classes compares (see "Whole extents follow the data that is used" above).
+The decayed read heat that orders cold-steal candidates is still not fed by
+RAM-tier reads.
 
 Observability: `dfkv_ram_hit/miss/put/put_bypass/flushed/flush_dropped/
 evictions_total`, `dfkv_ram_healthy`, actual `dfkv_ram_flush_threads`,
