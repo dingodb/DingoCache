@@ -2,6 +2,77 @@
 
 ## Unreleased
 
+- Server, RAM tier: a failed flush to disk is handled less rigidly, and a
+  node no longer acknowledges PUTs it can never store. Until now a flush
+  that failed was tried three times within microseconds, then the object
+  was dropped and the tier reported itself unhealthy (`/healthz`, `/readyz`
+  503) until the process was restarted; and after a disk store had failed
+  for good, every further PUT for that disk was still acknowledged from RAM
+  and its value dropped right after (measured: 20 of 20 acknowledged, none
+  readable), until clients had dropped the node from their ring.
+  - A PUT whose disk store has failed for good is no longer taken into RAM:
+    it gets the store's I/O error, as on a node without a RAM tier. Clients
+    of every release treat that status as a failure of the node and stop
+    sending to it for their peer cooldown (2 s by default), which is what
+    is wanted until the node has left their ring. Keys of the node's other
+    disks are unaffected. The check is one atomic read per disk on a PUT. A
+    flush to a failed store is not tried again. Values acknowledged before
+    the store failed and not yet written cannot be saved; they are dropped
+    at once and counted.
+  - A value that was acknowledged from RAM and whose flush fails is tried
+    again after 50 ms, 200 ms, 800 ms and 3.2 s (five attempts, about 4 s)
+    before it is dropped. It stays readable and counts as dirty meanwhile,
+    so a disk that keeps refusing turns into `kCacheFull` for new keys at
+    the ACK watermark. A failure that passes within that time (an I/O error,
+    a store that could not place the value under load) loses nothing. One
+    that lasts minutes, like a full filesystem, still drops the values
+    written into it; that is now visible, see below. A PUT that waits for
+    its flush (disk-ACK) is tried again without pauses, as before, and gets
+    its error at once. A stop does not wait out the pauses.
+  - Behaviour change: the RAM tier's health can recover. After a drop the
+    tier is unhealthy until 64 flushes in a row have succeeded (a failed
+    attempt starts the count again) and at least 30 s have passed since the
+    last drop, instead of until restart. So
+    `dfkv_ram_healthy`, and through it `/healthz` and `/readyz`, are no
+    longer latched: a node whose filesystem was full and has room again
+    recovers by itself, and a probe that relied on the 503 staying must use
+    the counters instead. `dfkv_ram_flush_dropped_total` and
+    `dfkv_ram_post_ack_flush_failures_total` stay monotonic.
+  - What a disk that takes no writes holds in RAM: the values waiting for
+    another attempt stay pinned, and they are dirty, so at most the ACK
+    watermark's share of the RAM tier (`DFKV_RAM_ACK_HIGH_WATERMARK_PCT`,
+    default 80 %) is held this way, however long the disk refuses. The
+    watermark is one number for the whole tier, not one per disk: a single
+    refusing disk among several can fill it, and then new keys of EVERY
+    disk of that node get `kCacheFull` (no peer cooldown) until its values
+    have been dropped or written. Reads and keys already resident are
+    served as before.
+  - A second PUT of a key whose value was acknowledged from RAM and is
+    still waiting for its flush is acknowledged at once, like the first: the
+    value is resident and its flush pending, which is all the first writer
+    was told. It used to wait for the flush; with attempts spaced out that
+    would have parked a handler thread and one of the 1,024 put-key stripes
+    for seconds. If the value is later dropped it is counted once, whoever
+    wrote it. A second writer in disk-ACK mode still waits for the first
+    one's flush and gets its outcome.
+  - A PUT that waits for a flush (a disk-ACK writer, or a second disk-ACK
+    writer of a key whose first value is still being flushed) is told how
+    the flush
+    ended, `RamTier::FlushOutcome`: flushed, dropped after retries, dropped
+    because the store failed, or dropped at shutdown. Only "flushed" is a
+    success. No lock is held across a pause between attempts, and no PUT
+    waits through one.
+  - Every acknowledged value that is dropped is visible: the existing
+    counter `dfkv_ram_post_ack_flush_failures_total`, the new alert
+    `DfkvRamAcknowledgedDataLost` on it, and a WARN line `ram tier: dropped
+    N object(s) that could not be written to disk, K of them already
+    acknowledged to the client ...` (at most one per 10 s). New counter
+    `dfkv_ram_flush_retries_total`: failed attempts that were followed by
+    another one.
+  The healthy path, the wire and the stop sequence are unchanged. Ring
+  eligibility is unchanged too: an unhealthy RAM tier alone does not take a
+  node out of placement, a failed disk store does. See `docs/DEPLOY.md` and
+  `docs/METRICS.md`.
 - Server: a slab disk is marked in use only when the server is about to
   serve, not when the disk has been opened. Until now each disk recorded
   the dirty state at the end of its own open. From then until the rest of

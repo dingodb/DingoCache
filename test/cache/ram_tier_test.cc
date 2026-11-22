@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -1766,4 +1767,399 @@ TEST(RamTier, WritesFasterThanTheReclaimCapEvictTheirOwnClass) {
   EXPECT_EQ(cold_resident(), cold) << "a cold extent was taken";
   EXPECT_EQ(rt.Evictions() - before, 512u)
       << "640 admissions, 128 free slots: one eviction for each of the rest";
+}
+
+// ---- A flush that fails ------------------------------------------------------
+namespace {
+// A flush sink that fails as told and records when it was called.
+struct FailingSink {
+  std::mutex m;
+  std::vector<std::chrono::steady_clock::time_point> calls;
+  std::function<bool(const BlockKey&, int call)> ok =
+      [](const BlockKey&, int) { return false; };
+  RamTier::FlushFn fn() {
+    return [this](const BlockKey& key, char*, size_t, size_t) {
+      std::lock_guard<std::mutex> lk(m);
+      calls.push_back(std::chrono::steady_clock::now());
+      return ok(key, static_cast<int>(calls.size()));
+    };
+  }
+  size_t count() {
+    std::lock_guard<std::mutex> lk(m);
+    return calls.size();
+  }
+  double gap_ms(size_t i) {  // between call i and call i+1 (1-based)
+    std::lock_guard<std::mutex> lk(m);
+    return std::chrono::duration<double, std::milli>(calls[i] - calls[i - 1])
+        .count();
+  }
+};
+RamTier::Options RetryOpts(uint32_t attempts, uint32_t base_ms) {
+  RamTier::Options o = Opts(64 * 4096);
+  o.flush_retries = attempts;
+  o.flush_retry_base_ms = base_ms;
+  o.health_recovery_min_ms = 0;  // the tests that are about it set it
+  return o;
+}
+
+// A flush sink whose calls block until released and then fail: an attempt
+// that is in flight for as long as the test wants.
+struct HeldSink {
+  std::atomic<int> entered{0};
+  std::atomic<int> hold_from{1};  // calls from this one on wait for release
+  std::atomic<bool> release{false};
+  RamTier::FlushFn fn() {
+    return [this](const BlockKey&, char*, size_t, size_t) {
+      const int call = entered.fetch_add(1) + 1;
+      while (call >= hold_from.load() && !release.load())
+        std::this_thread::sleep_for(1ms);
+      return false;
+    };
+  }
+};
+}  // namespace
+
+// A value that was acknowledged from RAM: its flush is tried again after
+// growing pauses, and the value stays readable meanwhile. It used to get
+// three attempts within microseconds and was then gone.
+TEST(RamTierFlushFailure, AcknowledgedValueIsRetriedWithPausesAndSurvives) {
+  FailingSink sink;
+  sink.ok = [](const BlockKey&, int call) { return call > 3; };
+  RamTier rt(RetryOpts(5, 20), sink.fn());
+  const std::string value(500, 'r');
+  ASSERT_EQ(rt.PutWriteBack(K(1), value.data(), value.size()).status,
+            Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return sink.count() >= 2; }));
+  EXPECT_TRUE(rt.Contains(K(1))) << "readable while its flush is retried";
+  EXPECT_EQ(rt.DirtyObjects(), 1u);
+  EXPECT_GE(rt.FlushBacklog(), 1u);
+  ASSERT_TRUE(WaitFor([&] { return rt.Flushed() == 1u; }));
+  ASSERT_EQ(sink.count(), 4u);
+  // Pauses of 20, 80 and 320 ms (a little less is a scheduler's rounding).
+  EXPECT_GE(sink.gap_ms(1), 18.0);
+  EXPECT_GE(sink.gap_ms(2), 75.0);
+  EXPECT_GE(sink.gap_ms(3), 300.0);
+  EXPECT_EQ(rt.FlushRetries(), 3u);
+  EXPECT_EQ(rt.FlushDropped(), 0u);
+  EXPECT_EQ(rt.PostAckFlushFailures(), 0u);
+  EXPECT_EQ(rt.DirtyObjects(), 0u);
+  EXPECT_TRUE(rt.healthy());
+  EXPECT_TRUE(rt.Contains(K(1)));
+}
+
+TEST(RamTierFlushFailure, AfterTheLastAttemptTheValueIsDroppedAndCounted) {
+  FailingSink sink;
+  RamTier rt(RetryOpts(4, 5), sink.fn());
+  const std::string value(500, 'd');
+  ASSERT_EQ(rt.PutWriteBack(K(1), value.data(), value.size()).status,
+            Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return rt.FlushDropped() == 1u; }));
+  EXPECT_EQ(sink.count(), 4u);
+  EXPECT_EQ(rt.FlushRetries(), 3u);
+  EXPECT_EQ(rt.PostAckFlushFailures(), 1u);
+  EXPECT_FALSE(rt.Contains(K(1)));
+  EXPECT_EQ(rt.DirtyObjects(), 0u);
+  EXPECT_EQ(rt.FlushBacklog(), 0u);
+  EXPECT_FALSE(rt.healthy());
+}
+
+// A PUT that is still waiting for its flush (disk-ACK) gets its error at
+// once: nothing is lost by failing fast, and a handler thread is not held.
+TEST(RamTierFlushFailure, WaitingPutIsRetriedWithoutPauses) {
+  FailingSink sink;
+  RamTier rt(RetryOpts(5, 60000), sink.fn());
+  const std::string value(500, 'w');
+  const auto started = std::chrono::steady_clock::now();
+  const RamTier::PutResult result =
+      rt.PutCommitted(K(1), value.data(), value.size());
+  EXPECT_EQ(result.status, Status::kIOError);
+  EXPECT_EQ(result.flush, RamTier::FlushOutcome::kDroppedAfterRetries);
+  EXPECT_LT(std::chrono::steady_clock::now() - started, 5s);
+  EXPECT_EQ(sink.count(), 5u);
+  EXPECT_EQ(rt.PostAckFlushFailures(), 0u) << "it was never acknowledged";
+  EXPECT_EQ(rt.FlushDropped(), 1u);
+}
+
+// A disk store that has failed for good: no second attempt.
+TEST(RamTierFlushFailure, FlushToAFailedTargetIsNotRetried) {
+  FailingSink sink;
+  RamTier::Options options = RetryOpts(5, 60000);
+  std::atomic<bool> failed{true};
+  options.flush_target_failed = [&](const BlockKey&) { return failed.load(); };
+  RamTier rt(options, sink.fn());
+  const std::string value(500, 't');
+  ASSERT_EQ(rt.PutWriteBack(K(1), value.data(), value.size()).status,
+            Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return rt.FlushDropped() == 1u; }));
+  EXPECT_EQ(sink.count(), 1u);
+  EXPECT_EQ(rt.FlushRetries(), 0u);
+  EXPECT_EQ(rt.PostAckFlushFailures(), 1u);
+  EXPECT_FALSE(rt.healthy());
+}
+
+// The tier is unhealthy from a drop until flushes have succeeded again in a
+// row. It used to stay unhealthy until the process was restarted.
+TEST(RamTierFlushFailure, HealthRecoversWhenFlushesSucceedAgain) {
+  FailingSink sink;
+  std::atomic<bool> failing{true};
+  sink.ok = [&](const BlockKey&, int) { return !failing.load(); };
+  RamTier::Options options = RetryOpts(2, 1);
+  options.health_recovery_flushes = 8;
+  RamTier rt(options, sink.fn());
+  const std::string value(500, 'h');
+  auto put = [&](uint64_t id) {
+    return rt.PutWriteBack(K(id), value.data(), value.size()).status;
+  };
+  ASSERT_EQ(put(1), Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return rt.FlushDropped() == 1u; }));
+  ASSERT_FALSE(rt.healthy());
+
+  failing = false;
+  for (uint64_t id = 10; id < 17; ++id) ASSERT_EQ(put(id), Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return rt.Flushed() == 7u; }));
+  EXPECT_FALSE(rt.healthy()) << "seven in a row are not eight";
+
+  // A failed attempt in between starts the count again, also when its retry
+  // then succeeds.
+  failing = true;
+  ASSERT_EQ(put(20), Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return rt.FlushRetries() >= 2u; }));
+  failing = false;
+  ASSERT_TRUE(WaitFor([&] { return rt.DirtyObjects() == 0u; }));
+  // (Its retry succeeded or was the last attempt: at most one success so far.)
+  for (uint64_t id = 30; id < 36; ++id) ASSERT_EQ(put(id), Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return rt.DirtyObjects() == 0u; }));
+  EXPECT_FALSE(rt.healthy());
+
+  ASSERT_EQ(put(40), Status::kOk);
+  ASSERT_EQ(put(41), Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return rt.healthy(); }));
+  // And a later drop makes it unhealthy again.
+  failing = true;
+  ASSERT_EQ(put(50), Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return !rt.healthy(); }));
+}
+
+// A stop does not wait out a backoff: once the tier is being drained, the
+// failing object gets its remaining attempts at once and is given up.
+TEST(RamTierFlushFailure, DrainDoesNotWaitOutTheBackoff) {
+  FailingSink sink;
+  RamTier rt(RetryOpts(5, 60000), sink.fn());
+  const std::string value(500, 's');
+  ASSERT_EQ(rt.PutWriteBack(K(1), value.data(), value.size()).status,
+            Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return sink.count() == 1u; }));
+  std::this_thread::sleep_for(20ms);
+  ASSERT_EQ(sink.count(), 1u) << "the next attempt is a minute away";
+  const auto started = std::chrono::steady_clock::now();
+  EXPECT_TRUE(rt.WaitForDrain(10s));
+  EXPECT_LT(std::chrono::steady_clock::now() - started, 5s);
+  EXPECT_EQ(sink.count(), 5u);
+  EXPECT_EQ(rt.FlushDropped(), 1u);
+  EXPECT_EQ(rt.DirtyObjects(), 0u);
+}
+
+// Removing a value while its flush waits for the next attempt.
+TEST(RamTierFlushFailure, RemoveWhileWaitingForTheNextAttempt) {
+  FailingSink sink;
+  RamTier rt(RetryOpts(5, 60000), sink.fn());
+  const std::string value(500, 'x');
+  ASSERT_EQ(rt.PutWriteBack(K(1), value.data(), value.size()).status,
+            Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return sink.count() == 1u; }));
+  ASSERT_TRUE(WaitFor([&] { return rt.FlushRetries() == 1u; }));
+  EXPECT_TRUE(rt.Remove(K(1)));
+  EXPECT_FALSE(rt.Contains(K(1)));
+  EXPECT_EQ(rt.DirtyObjects(), 0u);
+  EXPECT_EQ(rt.FlushBacklog(), 0u);
+  // The key can be written again, and that one is flushed.
+  {
+    std::lock_guard<std::mutex> lk(sink.m);
+    sink.ok = [](const BlockKey&, int) { return true; };
+  }
+  ASSERT_EQ(rt.PutWriteBack(K(1), value.data(), value.size()).status,
+            Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return rt.Flushed() == 1u; }));
+  EXPECT_EQ(sink.count(), 2u);
+  EXPECT_EQ(rt.FlushDropped(), 0u);
+}
+
+// The same while the retried attempt is in flight: Remove waits for that
+// attempt to come back, and it is the last one.
+TEST(RamTierFlushFailure, RemoveWhileARetriedAttemptIsInFlight) {
+  HeldSink sink;
+  sink.hold_from = 2;  // the first attempt fails at once, the second is held
+  RamTier rt(RetryOpts(5, 10), sink.fn());
+  const std::string value(500, 'y');
+  ASSERT_EQ(rt.PutWriteBack(K(1), value.data(), value.size()).status,
+            Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return sink.entered.load() == 2; }));
+  std::atomic<bool> removed{false};
+  std::thread remover([&] {
+    EXPECT_TRUE(rt.Remove(K(1)));
+    removed = true;
+  });
+  std::this_thread::sleep_for(50ms);
+  EXPECT_FALSE(removed.load()) << "Remove returned under an attempt in flight";
+  EXPECT_FALSE(rt.Contains(K(1))) << "hidden from the moment Remove began";
+  sink.release = true;
+  remover.join();
+  EXPECT_FALSE(rt.Contains(K(1)));
+  EXPECT_EQ(rt.DirtyObjects(), 0u);
+  EXPECT_EQ(rt.FlushBacklog(), 0u);
+  std::this_thread::sleep_for(100ms);  // several pauses long
+  EXPECT_EQ(sink.entered.load(), 2) << "a removed value was tried again";
+  EXPECT_EQ(rt.PostAckFlushFailures(), 0u) << "removed, not lost";
+}
+
+// Recovery also needs a minimum time since the last drop: on a busy node the
+// flushes alone would end the unhealthy state within milliseconds, before any
+// scrape or probe had seen it. Once the streak is complete the time is
+// enough: a node that goes idle then does not stay unhealthy.
+TEST(RamTierFlushFailure, HealthStaysDownForAMinimumTime) {
+  FailingSink sink;
+  std::atomic<bool> failing{true};
+  sink.ok = [&](const BlockKey&, int) { return !failing.load(); };
+  RamTier::Options options = RetryOpts(1, 1);
+  options.health_recovery_flushes = 4;
+  options.health_recovery_min_ms = 400;
+  RamTier rt(options, sink.fn());
+  const std::string value(500, 'm');
+  auto put = [&](uint64_t id) {
+    return rt.PutWriteBack(K(id), value.data(), value.size()).status;
+  };
+  auto drop_one = [&](uint64_t id) {
+    const uint64_t before = rt.FlushDropped();
+    failing = true;
+    EXPECT_EQ(put(id), Status::kOk);
+    EXPECT_TRUE(WaitFor([&] { return rt.FlushDropped() == before + 1; }));
+    failing = false;
+    return std::chrono::steady_clock::now();
+  };
+  auto flush = [&](uint64_t first, uint64_t count) {
+    const uint64_t before = rt.Flushed();
+    for (uint64_t id = first; id < first + count; ++id)
+      EXPECT_EQ(put(id), Status::kOk);
+    EXPECT_TRUE(WaitFor([&] { return rt.Flushed() == before + count; }));
+  };
+
+  // A complete streak, then nothing more is written.
+  auto dropped_at = drop_one(1);
+  flush(10, 20);
+  ASSERT_LT(std::chrono::steady_clock::now() - dropped_at, 350ms)
+      << "the machine is too slow for this test's timing";
+  EXPECT_FALSE(rt.healthy()) << "twenty good flushes, but only moments later";
+  std::this_thread::sleep_for(450ms);
+  EXPECT_TRUE(rt.healthy()) << "idle after a complete streak: time is enough";
+
+  // An incomplete streak: time is not enough, the missing flushes are.
+  dropped_at = drop_one(2);
+  flush(40, 2);
+  std::this_thread::sleep_for(450ms);
+  EXPECT_FALSE(rt.healthy()) << "two of four, however long ago";
+  flush(50, 2);
+  EXPECT_TRUE(rt.healthy());
+
+  // A drop after a complete streak, before the time is up: it starts both
+  // over. A drop always wins.
+  dropped_at = drop_one(3);
+  flush(60, 4);
+  (void)drop_one(4);
+  std::this_thread::sleep_for(450ms);
+  EXPECT_FALSE(rt.healthy()) << "the streak before the second drop is void";
+  flush(70, 4);
+  EXPECT_TRUE(rt.healthy());
+}
+
+// A PUT that waits for a flush is told how it ended, not only that it failed:
+// a waiting writer must not report success for a value that was dropped, and
+// can tell a store that is gone from one that may work again.
+TEST(RamTierFlushFailure, WaitingPutLearnsHowTheFlushEnded) {
+  const std::string value(500, 'o');
+  {  // written
+    FailingSink sink;
+    sink.ok = [](const BlockKey&, int) { return true; };
+    RamTier rt(RetryOpts(5, 1), sink.fn());
+    const auto result = rt.PutCommitted(K(1), value.data(), value.size());
+    EXPECT_EQ(result.status, Status::kOk);
+    EXPECT_EQ(result.flush, RamTier::FlushOutcome::kFlushed);
+    // Acknowledged from RAM: this PUT did not wait.
+    const auto acked = rt.PutWriteBack(K(2), value.data(), value.size());
+    EXPECT_EQ(acked.status, Status::kOk);
+    EXPECT_EQ(acked.flush, RamTier::FlushOutcome::kNone);
+  }
+  {  // the disk store has failed for good
+    FailingSink sink;
+    RamTier::Options options = RetryOpts(5, 1);
+    options.flush_target_failed = [](const BlockKey&) { return true; };
+    RamTier rt(options, sink.fn());
+    const auto result = rt.PutCommitted(K(1), value.data(), value.size());
+    EXPECT_EQ(result.status, Status::kIOError);
+    EXPECT_EQ(result.flush, RamTier::FlushOutcome::kDroppedStoreFailed);
+  }
+  {  // two disk-ACK writers of one key: the second gets the first's outcome
+    HeldSink sink;
+    RamTier rt(RetryOpts(3, 1), sink.fn());
+    RamTier::PutResult first{Status::kOk}, second{Status::kOk};
+    std::thread a([&] {
+      first = rt.PutCommitted(K(1), value.data(), value.size());
+    });
+    ASSERT_TRUE(WaitFor([&] { return sink.entered.load() == 1; }));
+    std::thread b([&] {
+      second = rt.PutCommitted(K(1), value.data(), value.size());
+    });
+    std::this_thread::sleep_for(50ms);  // b has joined a's flush
+    sink.release = true;
+    a.join();
+    b.join();
+    EXPECT_EQ(sink.entered.load(), 3) << "one value, three attempts";
+    for (const auto& result : {first, second}) {
+      EXPECT_EQ(result.status, Status::kIOError);
+      EXPECT_EQ(result.flush, RamTier::FlushOutcome::kDroppedAfterRetries);
+    }
+    EXPECT_EQ(rt.FlushDropped(), 1u);
+  }
+  {  // still failing when the tier is drained for a stop
+    HeldSink sink;
+    RamTier rt(RetryOpts(3, 1), sink.fn());
+    RamTier::PutResult result{Status::kOk};
+    std::thread writer([&] {
+      result = rt.PutCommitted(K(1), value.data(), value.size());
+    });
+    ASSERT_TRUE(WaitFor([&] { return sink.entered.load() == 1; }));
+    std::thread drainer([&] { EXPECT_TRUE(rt.WaitForDrain(10s)); });
+    std::this_thread::sleep_for(50ms);  // the drain has begun
+    sink.release = true;
+    writer.join();
+    drainer.join();
+    EXPECT_EQ(result.status, Status::kIOError);
+    EXPECT_EQ(result.flush, RamTier::FlushOutcome::kDroppedAtShutdown);
+  }
+}
+
+// A second RAM-ACK writer of a key whose value is waiting for its next flush
+// attempt is acknowledged like the first, at once. It used to wait for the
+// flush, which with the pauses is seconds -- under a put-key stripe.
+TEST(RamTierFlushFailure, SecondWriterOfAnAcknowledgedValueDoesNotWait) {
+  FailingSink sink;
+  RamTier rt(RetryOpts(3, 2000), sink.fn());  // pauses of 2 s and 8 s
+  const std::string value(500, 'a');
+  ASSERT_EQ(rt.PutWriteBack(K(1), value.data(), value.size()).status,
+            Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return rt.FlushRetries() == 1u; }));
+  const auto started = std::chrono::steady_clock::now();
+  for (int i = 0; i < 100; ++i) {
+    const auto second = rt.PutWriteBack(K(1), value.data(), value.size());
+    ASSERT_EQ(second.status, Status::kOk);
+    ASSERT_EQ(second.flush, RamTier::FlushOutcome::kNone);
+  }
+  EXPECT_LT(std::chrono::steady_clock::now() - started, 1s);
+  EXPECT_EQ(rt.RamAcks(), 101u);
+  EXPECT_TRUE(rt.Contains(K(1)));
+  // One value: if it is lost, it is one lost acknowledged value.
+  EXPECT_TRUE(rt.WaitForDrain(10s));
+  EXPECT_EQ(rt.FlushDropped(), 1u);
+  EXPECT_EQ(rt.PostAckFlushFailures(), 1u);
+  // Once it is gone, a PUT of the key is a new value, not a duplicate.
+  EXPECT_FALSE(rt.Contains(K(1)));
 }

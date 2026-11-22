@@ -501,8 +501,15 @@ non-evictable slots, PUT admission declines and the caller takes one synchronous
 disk path; a cold GET declines its direct reservation and retains the bounded
 staging path. A queued REMOVE cancels the queue item; an active flush or hidden
 cold-read reservation is fenced before slot reuse, so no later completion can
-resurrect the key. Exhausting flush retries is terminal RAM/store health and
-removes readiness. Only a DURABLE idle slot may be capacity-evicted. Requested
+resurrect the key. A failed flush is tried again (five attempts; for a value
+already acknowledged from RAM they are spaced over about four seconds, during
+which it stays readable and dirty), then the object is dropped and counted; a
+flush whose disk store has failed for good is dropped at once, and PUTs for
+that disk bypass RAM and get the store's error. A second RAM-ACK writer of a
+value that is waiting for its flush is acknowledged like the first, without
+waiting. A drop removes readiness until 64 flushes in a row have succeeded and
+30 s have passed. Only a DURABLE idle slot may be
+capacity-evicted. Requested
 arena allocation or an unsupported NUMA mode rejects startup instead of
 silently running disk-only.
 

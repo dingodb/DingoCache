@@ -461,6 +461,16 @@ bool DiskCacheGroup::Healthy() const {
   return true;
 }
 
+bool DiskCacheGroup::DiskFailedFor(const BlockKey& key) const {
+  // While every disk is healthy this is one atomic read per disk and no
+  // routing: the key's disk is looked up only once some store has failed.
+  bool any_failed = false;
+  for (const auto& disk : disks_) any_failed |= !disk->Healthy();
+  if (!any_failed) return false;
+  const size_t index = RouteIndex(key);
+  return index < disks_.size() && !disks_[index]->Healthy();
+}
+
 size_t DiskCacheGroup::RouteIndex(const BlockKey& key) const {
   if (disks_.size() == 1) return 0;
   std::string id;

@@ -407,8 +407,24 @@ journalctl -u dfkv -n 10 --no-pager
 > `errno=28`），重启前先腾出空间：否则重启要么在重置表时失败，要么带着上述 WARN
 > 启动后再次故障。
 > 需要 MDS ≥ v2.15.0 才会按 HLT1 过滤；更老的 MDS 忽略该字段，行为与此前相同。
-> RAM tier 丢弃无法 flush 的条目只使 `/healthz` 变 503，节点仍可服务，不退出
-> placement。数据面线程卡死而进程存活的情况不在此检测范围内，依赖
+> RAM tier 丢弃无法 flush 的条目只使 `/healthz` 变 503（最后一次丢弃至少 30 秒之后、且
+> 连续 64 次 flush 成功才恢复），
+> 节点仍可服务，不退出 placement。盘 store 终态故障后，路由到该盘的 PUT 不再由 RAM
+> 确认，直接得到 `kIOError`（与没有 RAM tier 时相同），其他盘的 key 不受影响；故障瞬间
+> 已确认、尚未落盘的值无法挽回，立即丢弃并计入
+> `dfkv_ram_post_ack_flush_failures_total`（告警 `DfkvRamAcknowledgedDataLost`）。
+> 盘侧瞬时写失败（一次 EIO、store 在高负载下暂时放不下）时，已确认的值留在 RAM 里按
+> 50 ms→3.2 s 的间隔重试约 4 秒，仍失败才丢弃并计数；文件系统写满这类持续数分钟的
+> 故障超出这个窗口，值会被丢弃（计数、告警、WARN），腾出空间后节点自行恢复健康。
+> 重试期间这些值仍 pin 在 RAM 里并计入 dirty：盘一直不收写时，最多占到 RAM tier 的
+> ACK 水位（`DFKV_RAM_ACK_HIGH_WATERMARK_PCT`，默认 80%），超过后 client 的**新 key**
+> 得到 `kCacheFull`（不触发 peer cooldown），读和已驻留的 key 照常。**该水位是整个
+> tier 一个数，不分盘**：多盘节点上只要一块盘不收写就可能把它占满，此时该节点**所有盘**
+> 的新 key 都得到 `kCacheFull`，直到那块盘的值被丢弃或写入为止。同一 key 的重复 PUT
+> 在其值已由 RAM 确认、仍在等落盘时立即得到同样的确认，不等待落盘。
+> **行为变化**：`dfkv_ram_healthy` 以及由它决定的 `/healthz`、`/readyz` 不再是“一旦为 0
+> 直到重启”，依赖 503 保持不变的探针应改看 `dfkv_ram_flush_dropped_total` /
+> `dfkv_ram_post_ack_flush_failures_total`（两者保持单调）。数据面线程卡死而进程存活的情况不在此检测范围内，依赖
 > `DfkvServerNotReady`（抓取失败）与 client 侧错误告警发现。
 >
 > **peer-aware tiers**：server `--rdma-dev` 和 client `DFKV_RDMA_DEV` 都固定
