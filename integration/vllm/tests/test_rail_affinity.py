@@ -63,7 +63,7 @@ class VllmRailAffinityTest(unittest.TestCase):
             )
             expected = (
                 f"ib7s400p{rank}",
-                f"ib7s400p{(rank + 1) % 8}",
+                f"ib7s400p{(rank + 4) % 8}",
             )
             self.assertEqual(selection.selected, expected)
             self.assertEqual(env["DFKV_RDMA_DEV"], ",".join(expected))

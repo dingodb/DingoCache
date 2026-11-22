@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Connectors (SGLang HiCache, vLLM, LMCache), `rail_affinity`: the fallback
+  rails are spread over the rail list instead of being the next ones. A rank
+  used its primary rail and, by default, the one after it. Neighbouring
+  rails are often the two ports of one adapter or share a switch and fail
+  together: when both were down on a cache server, the rank had no rail in
+  common with that server and every operation to it failed
+  (`dfkv_rdma_client_no_compatible_rail_total`), although the server's other
+  rails were healthy; the same held for the rank's own host. Fallback k of N
+  is now `rank + k * rails / (N + 1)`: with 8 rails and one fallback, rank r
+  uses r and r+4. The number of rails per rank is unchanged
+  (`rail_affinity_fallbacks`, default 1), so is the primary; which rail is
+  the fallback changes. The fallback is chosen for failure independence, not
+  locality: it can sit on the other CPU socket, so traffic on it may cost
+  bandwidth across the sockets.
 - SGLang HiCache connector, MLA with decode context parallelism (DCP): a
   rank layout under which some DCP shards would have no writer now refuses
   to start. The writer of DCP shard d is the attention-TP rank d, which

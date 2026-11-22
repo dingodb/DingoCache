@@ -95,7 +95,7 @@ class LMCacheRailAffinityTest(unittest.TestCase):
             )
             expected = (
                 f"ib7s400p{local_rank}",
-                f"ib7s400p{(local_rank + 1) % 8}",
+                f"ib7s400p{(local_rank + 4) % 8}",
             )
             self.assertEqual(selection.selected, expected)
             self.assertEqual(env["DFKV_RDMA_PRIMARY_DEV"], expected[0])

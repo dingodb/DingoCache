@@ -447,7 +447,7 @@ class DingoFSHiCacheTest(unittest.TestCase):
         rails = "ib0,ib1,ib2,ib3,ib4,ib5,ib6,ib7"
         dev, numa, primary, tiers = self._rail_for(
             members, rails, rank=3, size=8)
-        self.assertEqual(dev, "ib3,ib4")
+        self.assertEqual(dev, "ib3,ib7")  # fallback spread, not the next rail
         self.assertEqual(numa, "0")
         self.assertEqual(primary, "ib3")
         self.assertIsNone(tiers)
@@ -467,7 +467,7 @@ class DingoFSHiCacheTest(unittest.TestCase):
         rails = "ib0,ib1,ib2,ib3"
         dev, numa, primary, tiers = self._rail_for(
             members, rails, rank=2, size=4, fallbacks=1)
-        self.assertEqual(dev, "ib2,ib3")
+        self.assertEqual(dev, "ib2,ib0")
         self.assertEqual(numa, "0")
         self.assertEqual(primary, "ib2")
         self.assertIsNone(tiers)

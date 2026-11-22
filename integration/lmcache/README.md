@@ -74,7 +74,8 @@ For in-process LMCache, rank-local affinity is opt-in. Set the engine process
 environment to the same ordered full per-host rail list, for example
 `DFKV_RDMA_DEV=ib0,...,ib7`. Each LMCache worker reads the explicit
 `metadata.local_worker_id` before native open, narrows its process-local list to
-one primary plus the configured neighboring fallbacks, and sets
+one primary plus the configured fallbacks (spread over the rail list, not
+the neighbouring rails), and sets
 `DFKV_RDMA_PRIMARY_DEV`. Missing or invalid local-rank metadata fails startup
 rather than falling back to the global `worker_id`.
 

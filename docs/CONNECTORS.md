@@ -253,7 +253,10 @@ capability；HCA `max_sge` 低于 dfkv 上限时会缩小宽度，高于上限�
 > 大集群建议显式设定，否则服务端的内存预算完全由客户端决定，而客户端常由别的团队部署、版本不一。
 
 > `rail_affinity=true` 在 native client 创建前把完整 `DFKV_RDMA_DEV` 收窄为
-> 一条 primary 和默认相邻 1 条 fallback。SGLang HiCache 与 vLLM 都使用
+> 一条 primary 和默认 1 条 fallback。fallback 在轨列表上均匀错开，不取相邻轨（相邻轨
+> 常是同一张卡的两个口或同一交换机，会一起坏）：8 轨 1 条 fallback 时 rank r 用 r 和
+> r+4，N 条时间隔约 8/(N+1)。这样选是为了故障独立而非就近：fallback 可能在另一个
+> CPU socket 上，走它的流量可能付出跨 socket 带宽。SGLang HiCache 与 vLLM 都使用
 > SGLang/vLLM world-group 的 per-host `local_rank`；TP/DP/PCP/DCP/PP 是存储或
 > 并行语义坐标，不能作为 HCA 序号。HiCache 在启用 affinity 却无法取得
 > `world_group.local_rank` 时拒绝启动，不再静默退化到 `tp_rank=0` 单轨。
@@ -1101,7 +1104,7 @@ namespace/key 不一致是预期 cold miss。**空环 / MDS 不可达**可直接
 | `lib` | env 兜底 | so 绝对路径 | |
 | `batch_concurrency` | `8` | **大池可调高到 ≈ 节点数** | 跨节点 fan-out，**真正的吞吐杠杆**（depth 是平的） |
 | `rail_affinity` | `False` | 多 rank、多 rail 生产设 `true` | 按 vLLM world-group per-host `local_rank` 选择 primary；在 native client 创建前设置每进程独立 rail 环境 |
-| `rail_affinity_fallbacks` | `1` | `1` | 相邻有序 fallback 数；`0`=严格单 rail，超出可用 rail 数时自动收敛 |
+| `rail_affinity_fallbacks` | `1` | `1` | 均匀错开的 fallback 数（不取相邻轨）；`0`=严格单 rail，超出可用 rail 数时自动收敛 |
 | `load_async` | `True` | 普通 attention 保持 True；KDA+MLA hybrid 已验证可用 True（见下）；含 DSA indexer 的模型（Kimi K3.1）未验证前设 `False` | `False` 在模型线程串行执行 load，GET 前后均等待 GPU fence，可能位于前一个 forward 之后；hybrid/多 group 和非 full-attention 请求仍进入 `WAITING_FOR_REMOTE_KVS`，不会消费失败 KV。单 group full-attention 保留同步准入。 |
 | `transfer_queue_capacity` | `256` | 保持默认，按压测调 | 每个 worker、每个方向的排队上限（`1..65536`）。满队列时非阻塞拒绝新任务：save 立即释放 finish/free fence，load 标记失败并重算；非法值启动即失败。 |
 | `recv_workers` | `1` | 从 `1` 起压测 | 共享有界 receive queue 的 GET worker 数（`1..32`）；仅在 queue wait 持续升高且后端仍有余量时增加。 |
@@ -1388,7 +1391,7 @@ vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
 | `lib` | 否 | `libdfkv.so` 路径（覆盖 `DFKV_LIB`） |
 | `mds_poll_ms` | 否 | mds 模式轮询间隔，默认 3000 |
 | `rail_affinity` | 否 | 默认 `false`；仅 in-process 路径按 LMCache `local_worker_id` 选择 per-worker primary |
-| `rail_affinity_fallbacks` | 否 | 默认 `1`；相邻有序 fallback 数，`0` 为严格 one-rank/one-rail |
+| `rail_affinity_fallbacks` | 否 | 默认 `1`；均匀错开的 fallback 数（不取相邻轨），`0` 为严格 one-rank/one-rail |
 
 也支持简写 URL 直连（`plugin://dfkv` 场景 URL 即成员串），此时 knob 全走默认
 （membership=mds、lib 走 env）。
