@@ -519,7 +519,6 @@ def _batch_get_auto_sg_windowed(
 @dataclasses.dataclass
 class _ReceiveRequestState:
     request: ReqMeta | None
-    block_ids: tuple[int, ...]
     phase: str = "queued"
     cancel_requested: bool = False
     fail_closed_on_cancel: bool = False
@@ -1334,6 +1333,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         self._failed_requests: set[str] = set()
         self._invalid_block_ids_lock = threading.Lock()
         self._invalid_block_ids: set[int] = set()
+        # Failed LOADs whose destination blocks are still to be resolved:
+        # outside _request_states_lock, when the errors are collected.
+        self._failed_load_requests: list[ReqMeta] = []
         self.coord = coord
         self._request_states_lock = threading.Lock()
         self._request_states: dict[str, _ReceiveRequestState] = {}
@@ -1373,9 +1375,6 @@ class KVCacheStoreRecvingThread(KVTransferThread):
 
     def add_request(self, request: ReqMeta) -> bool:
         request._dfkv_receive_enqueued_at = time.perf_counter()  # type: ignore[attr-defined]
-        block_ids = tuple(
-            block_id for group_ids in request.block_ids for block_id in group_ids
-        )
         reason = "closed"
         with self._stop_lock:
             if self._accepting:
@@ -1387,7 +1386,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                             request.req_id,
                         )
                         return False
-                    state = _ReceiveRequestState(request=request, block_ids=block_ids)
+                    state = _ReceiveRequestState(request=request)
                     self._request_states[request.req_id] = state
                     try:
                         self.request_queue.put_nowait(request)
@@ -1400,7 +1399,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                         )
                         return True
             else:
-                state = _ReceiveRequestState(request=request, block_ids=block_ids)
+                state = _ReceiveRequestState(request=request)
                 with self._request_states_lock:
                     existing = self._request_states.get(request.req_id)
                     if existing is not None:
@@ -1473,10 +1472,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         state.phase = "terminal"
         state.request = None
         failed = failed or state.failed
-        if failed and not self.request_level_loads and state.block_ids:
+        if failed and not self.request_level_loads and req is not None:
+            # A LOAD reports its own destinations, never the request's local
+            # prefix-cache hit; resolved when the errors are collected.
             with self._invalid_block_ids_lock:
-                self._invalid_block_ids.update(state.block_ids)
-        state.block_ids = ()
+                self._failed_load_requests.append(req)
         if req_id is not None:
             with self.done_task_lock:
                 self.finished_requests.add(req_id)
@@ -1623,6 +1623,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         with self._invalid_block_ids_lock:
             invalid_block_ids = self._invalid_block_ids.copy()
             self._invalid_block_ids.clear()
+            failed_requests, self._failed_load_requests = (
+                self._failed_load_requests, []
+            )
+        for request in failed_requests:
+            invalid_block_ids.update(self._destination_block_ids(request))
         return invalid_block_ids
 
     def load_request_sync(self, request: ReqMeta) -> None:
@@ -1634,13 +1639,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             with self._request_states_lock:
                 if request.req_id in self._request_states:
                     return
-                state = _ReceiveRequestState(
-                    request=request,
-                    block_ids=tuple(
-                        block for group in request.block_ids for block in group
-                    ),
-                    phase="active",
-                )
+                state = _ReceiveRequestState(request=request, phase="active")
                 self._request_states[request.req_id] = state
                 if not self._accepting:
                     self._terminalize_locked(state, failed=True)
@@ -1665,6 +1664,72 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 )
 
 
+    def _load_chunks(self, req_meta: ReqMeta):
+        """The chunks this LOAD writes: per group, from the end of the local
+        prefix-cache hit to the load length, within the group's load mask.
+        Yields ``(group, db, start, end, key, chunk_idx, logical_block_ids)``;
+        the destination block is ``logical_block_ids[chunk_idx]``."""
+        token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
+        mask_num = (
+            req_meta.load_spec.vllm_cached_tokens  # type: ignore[union-attr]
+            // self.block_size
+            * self.block_size
+        )
+        # Skip chunks the consumer's per-group spec wouldn't populate
+        # locally (e.g. SWA pre-window) even if the producer stored them.
+        load_mask_per_group = self.coord.load_mask(req_meta.block_hashes, token_len)
+        for g_idx, db in enumerate(self.token_databases):
+            mask = load_mask_per_group[g_idx]
+            logical_block_ids = _logical_block_ids(mask, req_meta.block_ids[g_idx])
+            full_len = token_len // db.block_size * db.block_size
+            chunks = list(db.process_tokens(full_len, req_meta.block_hashes, mask_num))
+            if full_len != token_len:
+                # A partial hash hit ends inside this block: it was saved
+                # whole under the hash of the hit's own prefix.
+                tail = db.boundary_chunk(token_len, req_meta.block_hashes)
+                if tail is not None and tail[0] >= mask_num:
+                    chunks.append(tail)
+            for start, end, key in chunks:
+                chunk_idx = start // db.block_size
+                if chunk_idx >= len(mask) or not mask[chunk_idx]:
+                    continue
+                yield g_idx, db, start, end, key, chunk_idx, logical_block_ids
+
+    def _destination_block_ids(self, req_meta: ReqMeta) -> tuple[int, ...]:
+        """The blocks a failed or rejected LOAD of ``req_meta`` is reported
+        with. Only the LOAD's own destinations: the blocks of the request's
+        local prefix-cache hit are shared with other running requests, and
+        vLLM would roll every request back that holds one. If the request's
+        geometry cannot even be resolved, or it names no destination, its
+        whole block table: a failed LOAD must always fail something. Ids
+        <= 0 (the null block, padding) are never among them."""
+        try:
+            destinations = tuple(
+                logical_block_ids[chunk_idx]
+                for _g, _db, _s, _e, _k, chunk_idx, logical_block_ids in (
+                    self._load_chunks(req_meta)
+                )
+            )
+        except Exception:
+            logger.exception(
+                "dfkv: cannot resolve the LOAD destinations of request %s; "
+                "reporting its whole block table", req_meta.req_id,
+            )
+            destinations = ()
+        # Block 0 is vLLM's null block, in every request that pads with it:
+        # never reported.
+        destinations = tuple(b for b in destinations if b > 0)
+        blocks = destinations or tuple(
+            b for ids in req_meta.block_ids for b in ids if b > 0
+        )
+        if not blocks:
+            logger.warning(
+                "dfkv: failed LOAD of request %s has no allocated block to "
+                "report (its only destinations are the null block)",
+                req_meta.req_id,
+            )
+        return blocks
+
     def _handle_request(self, req_meta: ReqMeta):
         req_id = req_meta.req_id
         enqueued_at = getattr(req_meta, "_dfkv_receive_enqueued_at", None)
@@ -1672,52 +1737,23 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             self._record_observation("receive_queue_wait", enqueued_at)
         geometry_start = time.perf_counter()
         try:
-            token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
-            mask_num = (
-                req_meta.load_spec.vllm_cached_tokens  # type: ignore[union-attr]
-                // self.block_size
-                * self.block_size
-            )
-
-            # Skip chunks the consumer's per-group spec wouldn't populate
-            # locally (e.g. SWA pre-window) even if the producer stored them.
-            load_mask_per_group = self.coord.load_mask(req_meta.block_hashes, token_len)
-
             descriptor_chunks: list[
                 tuple[object, int, int, Sequence[int]]
             ] = []
             key_list: list[bytes] = []
             block_id_list: list[int] = []
-            for g_idx, db in enumerate(self.token_databases):
-                mask = load_mask_per_group[g_idx]
-                logical_block_ids = _logical_block_ids(
-                    mask, req_meta.block_ids[g_idx]
-                )
-                full_len = token_len // db.block_size * db.block_size
-                chunks = list(
-                    db.process_tokens(full_len, req_meta.block_hashes, mask_num)
-                )
-                if full_len != token_len:
-                    # A partial hash hit ends inside this block: it was saved
-                    # whole under the hash of the hit's own prefix.
-                    tail = db.boundary_chunk(token_len, req_meta.block_hashes)
-                    if tail is not None and tail[0] >= mask_num:
-                        chunks.append(tail)
-                for start, end, key in chunks:
-                    chunk_idx = start // db.block_size
-                    if chunk_idx >= len(mask) or not mask[chunk_idx]:
-                        continue
-                    block_id = logical_block_ids[chunk_idx]
-                    if block_id <= 0:
-                        raise ValueError(
-                            f"LOAD requires an allocated block: group={g_idx} "
-                            f"chunk={chunk_idx} block_id={block_id}"
-                        )
-                    key_list.append(key.to_bytes())
-                    descriptor_chunks.append(
-                        (db, start, end, logical_block_ids)
+            for g_idx, db, start, end, key, chunk_idx, logical_block_ids in (
+                self._load_chunks(req_meta)
+            ):
+                block_id = logical_block_ids[chunk_idx]
+                if block_id <= 0:
+                    raise ValueError(
+                        f"LOAD requires an allocated block: group={g_idx} "
+                        f"chunk={chunk_idx} block_id={block_id}"
                     )
-                    block_id_list.append(block_id)
+                key_list.append(key.to_bytes())
+                descriptor_chunks.append((db, start, end, logical_block_ids))
+                block_id_list.append(block_id)
 
             # An empty descriptor batch finishes immediately; in particular,
             # avoid taking a modulo by zero while choosing the first object.
@@ -1868,7 +1904,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             # request's blocks (never hang vLLM's WAITING_FOR_REMOTE_KVS).
             logger.error("dfkv recv thread failed for req %s: %s", req_id, e)
             self._record_load_failure(
-                req_id, [b for ids in req_meta.block_ids for b in ids]
+                req_id, list(self._destination_block_ids(req_meta))
             )
     def _cancel_request(self, req_meta: Any) -> None:
         self.cancel_requests(
