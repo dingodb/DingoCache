@@ -485,7 +485,7 @@ SGLang HiCache插件另导出：
 | `dfkv_hicache_exist_probe_pages_total{tp_rank}` | counter | 候选page总数 |
 | `dfkv_hicache_exist_present_pages_total{tp_rank}` | counter | probe批内任意位置存在的page总数 |
 | `dfkv_hicache_exist_contiguous_pages_total{tp_rank}` | counter | 从首页开始连续、可供SGLang使用的page总数 |
-| `dfkv_hicache_parallel_context_fallbacks_total{tp_rank}` | counter | 创建存储后端时读不到 SGLang parallel context、存储坐标改取自 `HiCacheStorageConfig` 或默认值的次数（每个 rank 进程最多 1）。当前 SGLang 上应为 0；非 0 的 rank 按 `tp_rank` 选举 MLA 写入者，启动日志里有各坐标的来源 |
+| `dfkv_hicache_parallel_context_fallbacks_total{tp_rank}` | counter | 创建存储后端时读不到 SGLang parallel context、存储坐标改取自 `HiCacheStorageConfig` 或默认值的次数（每个存储后端记 1）。当前 SGLang 上应为 0；非 0 的 rank 按 `tp_rank` 选举 MLA 写入者，启动日志里有各坐标的来源 |
 | `dfkv_hicache_exist_seconds{tp_rank}` | histogram | connector整次`batch_exists`耗时 |
 
 `present_pages - contiguous_pages`直接表达“后页存在但前缀有洞”；不要用

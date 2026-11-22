@@ -303,6 +303,7 @@ def _resolve_parallel_coordinates(
     cfg: dict,
     parallel=None,
     *,
+    probe=None,
     storage_config=None,
     sources: Optional[dict] = None,
 ) -> tuple[tuple[int, int], tuple[int, int], Optional[int]]:
@@ -316,23 +317,39 @@ def _resolve_parallel_coordinates(
     never assumed to be unsharded just because nothing said otherwise: a rank
     of a sharded deployment that stores under ``0/1`` reads another rank's
     bytes as its own, with matching sizes. An axis is then taken from
-    ``storage_config`` where it carries it: PCP from ``attn_cp_size``/
-    ``attn_cp_rank`` (which SGLang always passes), DCP from ``dcp_size``/
-    ``dcp_rank`` (which builds with decode CP pass). Otherwise DCP is ``0/1``
-    only on a build that has no parallel-context API and so no decode CP;
-    when the API is there but failed, the coordinate is unknown and
-    resolution raises. ``sources``, if given, receives where each axis came
-    from.
+    ``storage_config`` where it carries both its size and its rank: PCP from
+    ``attn_cp_size``/``attn_cp_rank`` (which SGLang always passes), DCP from
+    ``dcp_size``/``dcp_rank`` (which builds with decode CP pass). Otherwise
+    DCP is ``0/1`` only on a build that has no parallel-context API and so no
+    decode CP; when the API is there but failed, the coordinate is unknown
+    and resolution raises. A context whose fields raise when read counts as
+    a failed API.
+
+    ``probe`` is the result of _probe_parallel_context() if the caller has
+    already probed; otherwise it probes when ``parallel`` is not given.
+    ``sources``, if given, receives where each axis came from, and under
+    ``"context"`` whether the parallel context was ``available``,
+    ``missing`` (no API) or ``failed``.
     """
     failure = None
     if parallel is None:
-        parallel, failure = _probe_parallel_context()
+        parallel, failure = probe if probe is not None else _probe_parallel_context()
 
     def note(name, source):
         if sources is not None:
             sources[name] = source
 
-    resolved = {}
+    def read(attr):
+        """A context field; a raising field fails the context as a whole."""
+        nonlocal parallel, failure
+        if parallel is None:
+            return None
+        try:
+            return getattr(parallel, attr, None)
+        except (AssertionError, RuntimeError) as exc:
+            parallel, failure = None, exc
+            return None
+
     runtime_fields = {
         "pcp": ("attn_cp_size", "attn_cp_rank"),
         "dcp": ("attn_dcp_size", "attn_dcp_rank"),
@@ -341,14 +358,22 @@ def _resolve_parallel_coordinates(
         "pcp": ("attn_cp_size", "attn_cp_rank"),
         "dcp": ("dcp_size", "dcp_rank"),
     }
+    runtime_values = {}
     for name, (size_attr, rank_attr) in runtime_fields.items():
+        runtime_values[name] = (read(size_attr), read(rank_attr))
+    attn_tp_rank = read("attn_tp_rank")
+    if parallel is None:
+        attn_tp_rank = None   # a later field failed the whole context
+
+    resolved = {}
+    for name in runtime_fields:
+        size_attr, rank_attr = storage_fields[name]
         if f"{name}_size" in cfg or f"{name}_rank" in cfg:
             resolved[name] = _physical_axis(cfg, name)
             note(name, "extra_config")
         elif parallel is not None:
             note(name, "parallel_context")
-            size_value = getattr(parallel, size_attr, None)
-            rank_value = getattr(parallel, rank_attr, None)
+            size_value, rank_value = runtime_values[name]
             if name == "dcp" and size_value is None and rank_value is None:
                 # Legacy SGLang exposes only attn_cp_*: that single axis is
                 # already represented by PCP above. It has no independent DCP
@@ -364,12 +389,12 @@ def _resolve_parallel_coordinates(
                     name,
                 )
         elif (storage_config is not None
-              and hasattr(storage_config, storage_fields[name][0])):
-            size_attr, rank_attr = storage_fields[name]
+              and hasattr(storage_config, size_attr)
+              and hasattr(storage_config, rank_attr)):
             resolved[name] = _physical_axis(
                 {
                     f"{name}_size": getattr(storage_config, size_attr),
-                    f"{name}_rank": getattr(storage_config, rank_attr, 0),
+                    f"{name}_rank": getattr(storage_config, rank_attr),
                 },
                 name,
             )
@@ -388,12 +413,10 @@ def _resolve_parallel_coordinates(
             resolved[name] = (1, 0)
             note(name, "default")
 
-    attn_tp_rank = (
-        int(getattr(parallel, "attn_tp_rank"))
-        if parallel is not None and hasattr(parallel, "attn_tp_rank")
-        else None
-    )
-    return resolved["pcp"], resolved["dcp"], attn_tp_rank
+    note("context", "available" if parallel is not None
+         else "failed" if failure is not None else "missing")
+    return (resolved["pcp"], resolved["dcp"],
+            int(attn_tp_rank) if attn_tp_rank is not None else None)
 
 
 def _is_mla_replica_writer(
@@ -661,7 +684,7 @@ class DfkvHiCache(HiCacheStorage):
         self.tp_rank = int(storage_config.tp_rank)
         self.tp_size = int(storage_config.tp_size)
         self.is_mla = bool(storage_config.is_mla_model)
-        parallel = _load_parallel_context()
+        probe = _probe_parallel_context()
         # Runtime PCP/DCP coordinates describe SGLang's compute topology. The
         # storage identity may intentionally collapse replicated Prefill-CP
         # ranks onto the elected writer's key; keep the two concepts separate.
@@ -671,17 +694,20 @@ class DfkvHiCache(HiCacheStorage):
             (self.dcp_size, self.dcp_rank),
             attn_tp_rank,
         ) = _resolve_parallel_coordinates(
-            cfg, parallel, storage_config=storage_config,
+            cfg, probe=probe, storage_config=storage_config,
             sources=self._coordinate_sources)
+        context = self._coordinate_sources["context"]
+        # The context as resolution used it: None if a field failed it.
+        parallel = probe[0] if context == "available" else None
         self._parallel_context_missing = parallel is None
         if parallel is None:
-            # Once per process. The coordinates decide which rank writes and
-            # which bytes a rank reads, so say where they came from.
+            # Once per storage backend. The coordinates decide which rank
+            # writes and which bytes a rank reads, so say where they came from.
             _log.warning(
-                "dfkv: SGLang's parallel context is not available; storage "
+                "dfkv: SGLang's parallel context is %s; storage "
                 "coordinates pcp=%d/%d (from %s) dcp=%d/%d (from %s); the "
                 "MLA writer is elected by tp_rank=%d because attn_tp_rank "
-                "is unknown",
+                "is unknown", context,
                 self.pcp_rank, self.pcp_size,
                 self._coordinate_sources.get("pcp"),
                 self.dcp_rank, self.dcp_size,

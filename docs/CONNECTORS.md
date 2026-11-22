@@ -510,16 +510,19 @@ namespace（表现为一次冷缓存）；
 extra_config 没给的坐标轴，插件从 SGLang 已初始化的 parallel context 读取
 （PCP=`attn_cp_*`，DCP=`attn_dcp_*`，以及 MLA 写入者选举用的 `attn_tp_rank`）。
 读不到 parallel context 时不再默默按 `0/1` 处理。坐标改取 `HiCacheStorageConfig`
-里携带的字段：PCP 取 `attn_cp_size`/`attn_cp_rank`（SGLang 总会传），DCP 取
-`dcp_size`/`dcp_rank`（带 DCP 的构建会传）；MLA 写入者按 `tp_rank` 选举。启动时打
-一条 WARNING 说明各坐标的来源，指标 `dfkv_hicache_parallel_context_fallbacks_total`
-记 1。`HiCacheStorageConfig` 也没有 DCP 字段时：
+里携带的字段（同一轴的 size 和 rank 都在才用）：PCP 取 `attn_cp_size`/`attn_cp_rank`
+（SGLang 总会传），DCP 取 `dcp_size`/`dcp_rank`（带 DCP 的构建会传）；MLA 写入者按
+`tp_rank` 选举。每个这样创建的存储后端打一条 WARNING 说明各坐标的来源，指标
+`dfkv_hicache_parallel_context_fallbacks_total` 记 1。由此 PCP 大于 1 的 MLA 模型
+需要在 extra_config 显式给出 `prefill_cp_storage_layout`，否则拒绝启动（与坐标取自
+parallel context 时相同）。`HiCacheStorageConfig` 也没有 DCP 字段时：
 
 - 这个 SGLang 构建根本没有 parallel context 接口（旧版本）：DCP 为 `0/1`（这类构建
   没有 DCP）。
-- 接口存在但读取失败（parallel 状态还没初始化，或字段形态变了）：DCP 坐标无从得知，
-  后端拒绝创建并报错，除非 extra_config 显式给出 `dcp_size`/`dcp_rank`。按 `0/1`
-  存取会让一个 rank 把别的 rank 的 KV 当成自己的读进来，尺寸相同，读校验发现不了。
+- 接口存在但读取失败（parallel 状态还没初始化，或字段形态变了；读字段时抛错也算）：
+  DCP 坐标无从得知，后端拒绝创建并报错，除非 extra_config 显式给出
+  `dcp_size`/`dcp_rank`。按 `0/1` 存取会让一个 rank 把别的 rank 的 KV 当成自己的
+  读进来，尺寸相同，读校验发现不了。
 - 注册 host pool 时交叉校验：pool 自己声明的 `dcp_size` 大于 1 而与插件解析出的
   `dcp_size` 不一致时，注册报错。
 
