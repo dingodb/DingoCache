@@ -557,6 +557,67 @@ long MetricSum(const std::string& text, const std::string& prefix) {
   }
   return total;
 }
+// Every sample of a labeled family as {label block, value}, where the label
+// block is the text between the braces (e.g. dev="mlx5_0",status="x").
+std::vector<std::pair<std::string, long>> LabeledSeries(
+    const std::string& text, const std::string& family) {
+  std::vector<std::pair<std::string, long>> series;
+  const std::string prefix = family + "{";
+  size_t begin = 0;
+  while (begin < text.size()) {
+    size_t end = text.find('\n', begin);
+    if (end == std::string::npos) end = text.size();
+    const size_t close = text.find("} ", begin);
+    if (text.compare(begin, prefix.size(), prefix) == 0 &&
+        close != std::string::npos && close < end) {
+      try {
+        series.emplace_back(
+            text.substr(begin + prefix.size(), close - begin - prefix.size()),
+            std::stol(text.substr(close + 2, end - close - 2)));
+      } catch (...) {
+      }
+    }
+    begin = end + 1;
+  }
+  return series;
+}
+
+// Value of one label inside a label block returned by LabeledSeries.
+std::string LabelValue(const std::string& labels, const std::string& name) {
+  const std::string key = name + "=\"";
+  size_t pos = labels.find(key);
+  while (pos != std::string::npos && pos != 0 && labels[pos - 1] != ',')
+    pos = labels.find(key, pos + 1);
+  if (pos == std::string::npos) return {};
+  const size_t begin = pos + key.size();
+  const size_t end = labels.find('"', begin);
+  return end == std::string::npos ? std::string()
+                                  : labels.substr(begin, end - begin);
+}
+
+std::vector<std::string> LinesContaining(const std::string& text,
+                                         const std::string& needle) {
+  std::vector<std::string> lines;
+  size_t begin = 0;
+  while (begin < text.size()) {
+    size_t end = text.find('\n', begin);
+    if (end == std::string::npos) end = text.size();
+    const std::string line = text.substr(begin, end - begin);
+    if (line.find(needle) != std::string::npos) lines.push_back(line);
+    begin = end + 1;
+  }
+  return lines;
+}
+
+// Value of a space-delimited `name=value` field of a log line.
+std::string LogField(const std::string& line, const std::string& name) {
+  const std::string key = " " + name + "=";
+  const size_t pos = line.find(key);
+  if (pos == std::string::npos) return {};
+  const size_t begin = pos + key.size();
+  const size_t end = line.find(' ', begin);
+  return line.substr(begin, end == std::string::npos ? end : end - begin);
+}
 // Rail-policy configuration is process-global. Keep every two-HCA test on one
 // suite-safe value: 32 concurrent callers may each reserve the depth-four
 // maximum, even if locality initially selects the same rail for all of them.
@@ -5049,6 +5110,272 @@ TEST(RdmaLoopback, BatchRetriesAfterServerReclaim) {
       CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
   EXPECT_GT(opened_after, opened_warm) << "batch op did not re-dial after reclaim";
 
+}
+
+// A failed work completion on the client must stay attributable afterwards:
+// which peer, which local device, which operation and which completion status.
+// The failures are real, not injected: the server reclaims two idle pooled
+// connections, so the next request on each client endpoint cannot be
+// delivered. Both are counted; a (peer, device, status, vendor syndrome) is
+// logged once per throttle window, so the two failures produce one line when
+// they report the same syndrome and never two lines that say the same thing.
+TEST(RdmaLoopback, ClientFailedCompletionNamesPeerDeviceOperationAndStatus) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv idle_reclaim("DFKV_RDMA_IDLE_MS", "120");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  // The failed completion has to arrive before the window deadline, however
+  // long this HCA takes to exhaust its retries.
+  ScopedEnv op_timeout("DFKV_RDMA_OP_TIMEOUT_MS", "60000");
+  ScopedEnv batch_timeout("DFKV_RDMA_BATCH_OP_TIMEOUT_MS", nullptr);
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  // One rail: with several, rail selection could send a probe to a rail that
+  // has no pooled connection, and nothing would fail.
+  const auto discovered = rdma::RdmaTopology::Discover(
+      {}, rdma::RdmaDiscoveryPolicy::kActiveOnly);
+  if (discovered.status != rdma::RdmaDiscoveryStatus::kOk ||
+      discovered.devices.empty())
+    GTEST_SKIP() << "no ACTIVE RDMA device";
+  const char* configured = std::getenv("DFKV_RDMA_DEV");
+  const std::string rail =
+      configured && *configured && std::strchr(configured, ',') == nullptr
+          ? configured
+          : discovered.devices.front().name;
+  ScopedEnv one_rail("DFKV_RDMA_DEV", rail.c_str());
+  RdmaNode node("wc-attribution-client");
+  RdmaTransport rt(kMaxMsg, rail);
+  const std::vector<BlockKey> keys = {ToBlockKey(SelfHdr(), "absent")};
+
+  constexpr int kCallers = 2;
+  // Existence probes from kCallers threads released together; returns how many
+  // of them failed.
+  const auto probe_together = [&] {
+    std::atomic<int> ready{0};
+    std::atomic<bool> start{false};
+    std::atomic<int> failed{0};
+    std::vector<std::thread> callers;
+    for (int i = 0; i < kCallers; ++i) {
+      callers.emplace_back([&] {
+        ready.fetch_add(1, std::memory_order_relaxed);
+        while (!start.load(std::memory_order_acquire))
+          std::this_thread::yield();
+        std::vector<char> exists;
+        if (rt.ExistMany(node.addr, keys, &exists)[0] == Status::kIOError)
+          failed.fetch_add(1, std::memory_order_relaxed);
+      });
+    }
+    while (ready.load(std::memory_order_relaxed) != kCallers)
+      std::this_thread::yield();
+    start.store(true, std::memory_order_release);
+    for (auto& caller : callers) caller.join();
+    return failed.load();
+  };
+
+  // Slow replies make the probes overlap, so each needs its own connection
+  // and both end up parked in the pool.
+  node.handler_delay_ms.store(200, std::memory_order_relaxed);
+  ASSERT_EQ(probe_together(), 0);
+  node.handler_delay_ms.store(0, std::memory_order_relaxed);
+  ASSERT_EQ(
+      CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total"),
+      kCallers);
+  EXPECT_TRUE(LabeledSeries(rt.MetricsText(),
+                            "dfkv_rdma_client_rail_wc_errors_total")
+                  .empty())
+      << "no completion has failed yet";
+
+  // Past the 120 ms idle window the server has destroyed its side of both
+  // pooled connections; the client only finds out when it sends.
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  testing::internal::CaptureStderr();
+  const int failed_probes = probe_together();
+  const std::string logs = testing::internal::GetCapturedStderr();
+  EXPECT_EQ(failed_probes, 0)
+      << "attribution must not change the stale-pool retry";
+
+  const std::string metrics = rt.MetricsText();
+  const auto failures =
+      LabeledSeries(metrics, "dfkv_rdma_client_rail_wc_errors_total");
+  long counted = 0;
+  for (const auto& [labels, count] : failures) {
+    counted += count;
+    EXPECT_EQ(LabelValue(labels, "dev"), rail) << labels;
+    EXPECT_FALSE(LabelValue(labels, "status").empty()) << labels;
+    EXPECT_NE(LabelValue(labels, "status"), "success") << labels;
+    EXPECT_EQ(labels.find("peer"), std::string::npos)
+        << "peer addresses are unbounded and belong in the log only";
+  }
+  EXPECT_EQ(counted, kCallers) << metrics;
+
+  const auto lines = LinesContaining(logs, "rdma client CQ failure");
+  EXPECT_GE(lines.size(), 1u) << logs;
+  EXPECT_LE(lines.size(), static_cast<size_t>(kCallers)) << logs;
+  std::unordered_set<std::string> logged_kinds;
+  for (const std::string& line : lines) {
+    EXPECT_TRUE(logged_kinds
+                    .insert(LogField(line, "status") + "/" +
+                            LogField(line, "vendor"))
+                    .second)
+        << "one line per (peer, device, status, vendor) per throttle window\n"
+        << logs;
+    EXPECT_EQ(LogField(line, "peer"), node.addr) << line;
+    EXPECT_EQ(LogField(line, "dev"), rail) << line;
+    EXPECT_EQ(LogField(line, "op"), "exist") << line;
+    EXPECT_NE(LogField(line, "status"), "") << line;
+    EXPECT_NE(LogField(line, "status"), "0") << line;
+    EXPECT_NE(LogField(line, "vendor"), "") << line;
+    EXPECT_NE(LogField(line, "qp"), "") << line;
+    EXPECT_EQ(LogField(line, "lane"), "control") << line;
+    EXPECT_EQ(LogField(line, "pooled"), "1") << line;
+    EXPECT_EQ(LogField(line, "verdict"), "endpoint") << line;
+    bool matches_series = false;
+    for (const auto& [labels, count] : failures) {
+      (void)count;
+      matches_series =
+          matches_series ||
+          LabelValue(labels, "status") == LogField(line, "status_name");
+    }
+    EXPECT_TRUE(matches_series) << line;
+  }
+}
+
+// The server must name the peer and the local device of a failed completion,
+// and count it by status. Every failed connection gets its own line: two
+// connections from the same client address failing with the same status
+// moments apart are both logged, each with its own QP numbers and vendor
+// syndrome. The completions are made to fail through the CQ test hook on the
+// first request of a connection, on both serve loops.
+static void ExerciseServerFailedCompletionAttribution(bool use_uring) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+#ifndef DFKV_WITH_URING
+  if (use_uring) GTEST_SKIP() << "io_uring not compiled";
+#endif
+  ScopedEnv uring("DFKV_SERVER_URING", use_uring ? "1" : "0");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  // The client never gets a reply on a dropped connection; bound its wait.
+  ScopedEnv op_timeout("DFKV_RDMA_OP_TIMEOUT_MS", "500");
+  ScopedEnv batch_timeout("DFKV_RDMA_BATCH_OP_TIMEOUT_MS", nullptr);
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  // One rail, so both failures land on the same device.
+  const auto discovered = rdma::RdmaTopology::Discover(
+      {}, rdma::RdmaDiscoveryPolicy::kActiveOnly);
+  if (discovered.status != rdma::RdmaDiscoveryStatus::kOk ||
+      discovered.devices.empty())
+    GTEST_SKIP() << "no ACTIVE RDMA device";
+  const char* configured = std::getenv("DFKV_RDMA_DEV");
+  const std::string rail =
+      configured && *configured && std::strchr(configured, ',') == nullptr
+          ? configured
+          : discovered.devices.front().name;
+  ScopedEnv one_rail("DFKV_RDMA_DEV", rail.c_str());
+
+  // Three failures from one client address with one status: two share a
+  // vendor syndrome, so any throttle, whatever it keys on, would swallow one.
+  constexpr int kFailedConnections = 3;
+  constexpr unsigned kFirstVendorSyndrome = 129;
+  // A connection stops at its first failed completion, so each rewritten
+  // completion ends a different connection.
+  std::atomic<int> rewritten{0};
+  testing::internal::CaptureStderr();
+  std::string metrics;
+  bool used_uring = false;
+  bool counted = false;
+  {
+    RdmaNode node(use_uring ? "wc-attribution-uring" : "wc-attribution-sync",
+                  kMaxMsg, false, use_uring, {},
+                  [&](ibv_wc* batch, int* count, size_t) {
+                    if (*count <= 0) return;
+                    int index = rewritten.load();
+                    while (index < kFailedConnections &&
+                           !rewritten.compare_exchange_weak(index, index + 1)) {
+                    }
+                    if (index >= kFailedConnections) return;
+                    batch[0].status = IBV_WC_RETRY_EXC_ERR;
+                    batch[0].vendor_err =
+                        kFirstVendorSyndrome + static_cast<unsigned>(index % 2);
+                  });
+    used_uring = node.rsrv->UseUringPath();
+    RdmaTransport rt(kMaxMsg, rail);
+    const std::vector<BlockKey> keys = {ToBlockKey(SelfHdr(), "absent")};
+    std::vector<char> exists;
+    // Each probe opens a connection whose first request the server fails; the
+    // probe itself then times out, which is not what is under test. With a CQ
+    // hook installed the io_uring loop gives a silent connection 1 ms, so a
+    // request can also arrive after its connection is already gone: keep
+    // asking until enough requests reached a live connection.
+    for (int attempt = 0;
+         attempt < 20 &&
+         node.rsrv->CompletionErrors() < static_cast<uint64_t>(kFailedConnections);
+         ++attempt) {
+      const uint64_t before = node.rsrv->CompletionErrors();
+      (void)rt.ExistMany(node.addr, keys, &exists);
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+      while (node.rsrv->CompletionErrors() == before &&
+             std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    counted = node.rsrv->CompletionErrors() ==
+              static_cast<uint64_t>(kFailedConnections);
+    metrics = node.rsrv->MetricsText();
+  }
+  const std::string logs = testing::internal::GetCapturedStderr();
+  ASSERT_EQ(used_uring, use_uring);
+  if (use_uring &&
+      CounterVal(metrics, "dfkv_uring_init_fallbacks_total") != 0)
+    GTEST_SKIP() << "io_uring unavailable at runtime";
+  ASSERT_TRUE(counted) << metrics;
+
+  EXPECT_EQ(DeviceCounterVal(metrics, "dfkv_rdma_rail_completion_errors_total",
+                             rail),
+            kFailedConnections);
+  const auto by_status =
+      LabeledSeries(metrics, "dfkv_rdma_rail_wc_errors_total");
+  ASSERT_EQ(by_status.size(), 1u) << metrics;
+  EXPECT_EQ(by_status[0].first,
+            "dev=\"" + rail + "\",status=\"retry_exc_err\"");
+  EXPECT_EQ(by_status[0].second, kFailedConnections);
+
+  const auto lines = LinesContaining(logs, "rdma server CQ failure");
+  ASSERT_EQ(lines.size(), static_cast<size_t>(kFailedConnections))
+      << "one line per failed connection\n" << logs;
+  std::unordered_set<std::string> vendors;
+  const auto opened = LinesContaining(logs, "rdma conn:");
+  for (const std::string& line : lines) {
+    EXPECT_EQ(LogField(line, "loop"), use_uring ? "uring" : "sync") << line;
+    EXPECT_EQ(LogField(line, "status"), "12") << line;
+    EXPECT_EQ(LogField(line, "status_name"), "retry_exc_err") << line;
+    EXPECT_EQ(LogField(line, "dev"), rail) << line;
+    EXPECT_NE(LogField(line, "peer_qp"), "") << line;
+    EXPECT_NE(LogField(line, "age_ms"), "") << line;
+    EXPECT_EQ(LogField(line, "suppressed"), "")
+        << "the server line is not throttled\n" << line;
+    const std::string peer = LogField(line, "peer");
+    EXPECT_EQ(peer.rfind("127.0.0.1:", 0), 0u) << line;
+    vendors.insert(LogField(line, "vendor"));
+    // The connection-open line carries the same peer and device, so a QP
+    // number seen in either line resolves to an address.
+    bool opened_by_same_peer = false;
+    for (const std::string& open_line : opened) {
+      opened_by_same_peer =
+          opened_by_same_peer ||
+          (LogField(open_line, "peer") == peer &&
+           LogField(open_line, "dev") == rail &&
+           LogField(open_line, "qp") == LogField(line, "qp"));
+    }
+    EXPECT_TRUE(opened_by_same_peer) << line << "\n" << logs;
+  }
+  EXPECT_EQ(vendors, (std::unordered_set<std::string>{
+                         std::to_string(kFirstVendorSyndrome),
+                         std::to_string(kFirstVendorSyndrome + 1)}))
+      << "a failure with a different vendor syndrome is not hidden\n"
+      << logs;
+}
+
+TEST(RdmaLoopback, ServerFailedCompletionNamesPeerDeviceAndStatusSync) {
+  ExerciseServerFailedCompletionAttribution(false);
+}
+TEST(RdmaLoopback, ServerFailedCompletionNamesPeerDeviceAndStatusUring) {
+  ExerciseServerFailedCompletionAttribution(true);
 }
 
 #ifdef DFKV_WITH_URING

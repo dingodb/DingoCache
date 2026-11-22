@@ -338,6 +338,22 @@ void MarkClientLocalFailure(std::vector<Status>* result, Status status) {
     if (s == Status::kIOError) s = status;
 }
 
+// Operation name for the failed-completion log line.
+const char* WireOpLogName(uint8_t op) {
+  switch (static_cast<WireOp>(op)) {
+    case WireOp::kCache: return "put";
+    case WireOp::kExist: return "exist";
+    case WireOp::kMembers: return "members";
+    case WireOp::kRemove: return "remove";
+    case WireOp::kLookup: return "lookup";
+    case WireOp::kPullRange: return "pull_range";
+    case WireOp::kPullRelease: return "pull_release";
+    case WireOp::kLeasePut: return "lease_put";
+    case WireOp::kRetain: return "retain";
+    default: return "unknown";
+  }
+}
+
 }  // namespace
 
 struct RdmaTransport::Conn {
@@ -369,6 +385,7 @@ struct RdmaTransport::Conn {
   uint64_t last_application_us = 0;  // keepalives do not renew idle retention
 
   rdma::ConnectionLifecycle lifecycle;
+  bool keepalive_probe = false;  // a keepalive, not an application op, is in flight
   void Encode(char* out, WireOp op, const BlockKey& key, uint64_t offset,
               uint64_t length, uint64_t payload_len) const {
     EncodeReqVersion(out, kNativeProtoRdmaV2, op, key, offset, length,
@@ -678,6 +695,8 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
       std::make_unique<std::atomic<uint64_t>[]>(devs_.size());
   rail_get_bytes_ =
       std::make_unique<std::atomic<uint64_t>[]>(devs_.size());
+  rail_wc_errors_ = std::make_unique<std::atomic<uint64_t>[]>(
+      devs_.size() * rdma::kWcStatusSlots);
   if (keepalive_ms_ > 0 || data_pool_max_ > pool_max_)
     keepalive_thread_ = std::thread(&RdmaTransport::KeepaliveLoop, this);
 }
@@ -709,6 +728,7 @@ bool RdmaTransport::KeepaliveConn(Conn* conn,
   if (!conn || !failure) return false;
   *failure = rdma::RailCompletion::kAdmission;
   keepalive_attempts_.fetch_add(1, std::memory_order_relaxed);
+  conn->keepalive_probe = true;
   rdma::RcEndpoint& ep = conn->ep;
   conn->Encode(ep.sbuf(0), WireOp::kMembers, BlockKey{}, 0, 0, 0);
   if (!ep.PostRecv(0) || !ep.PostSend(0, kReqPrefix)) {
@@ -747,6 +767,7 @@ bool RdmaTransport::KeepaliveConn(Conn* conn,
     return false;
   }
   keepalive_successes_.fetch_add(1, std::memory_order_relaxed);
+  conn->keepalive_probe = false;
   return true;
 }
 
@@ -969,8 +990,58 @@ void RdmaTransport::MarkDead(Conn* c) {
   c->live_counted = false;
 }
 
+void RdmaTransport::NoteFailedCompletion(Conn& c,
+                                         rdma::RailCompletion completion) {
+  const ibv_wc* wc = c.ep.failed_wc();
+  if (!wc || c.rail_index >= devs_.size()) return;
+  rail_wc_errors_[c.rail_index * rdma::kWcStatusSlots +
+                  rdma::WcStatusSlot(wc->status)]
+      .fetch_add(1, std::memory_order_relaxed);
+  const uint64_t now = rdma::RailPolicy::NowMicros();
+  uint64_t suppressed = 0;
+  if (!completion_error_log_.Admit(
+          LogThrottle::Key(
+              c.node, c.rail_index,
+              rdma::WcFailureKind(wc->status, wc->vendor_err)),
+          now, &suppressed))
+    return;
+  // A failed completion carries no reliable opcode, but its wr_id is the slot,
+  // and the slot's send buffer still holds the request that was in flight.
+  const char* op = "unknown";
+  if (c.keepalive_probe)
+    op = "keepalive";
+  else if (wc->wr_id < c.ep.depth())
+    op = WireOpLogName(static_cast<uint8_t>(c.ep.sbuf(wc->wr_id)[1]));
+  const bool pooled = c.last_application_us != 0;
+  DFKV_LOG_WARN(
+      "rdma client CQ failure peer=" + c.node +
+      " peer_id=" + (c.peer_id.empty() ? std::string("-") : c.peer_id) +
+      " dev=" +
+      (devs_[c.rail_index].empty() ? std::string("default")
+                                   : devs_[c.rail_index]) +
+      " op=" + op + " " +
+      rdma::WcStatusFields(wc->status, wc->vendor_err) +
+      " wr_id=" + std::to_string(wc->wr_id) +
+      " qp=" + std::to_string(c.ep.Local().qpn) +
+      " lane=" +
+      (c.lane == Lane::kControl ? "control"
+                                : c.lane == Lane::kSgData ? "sg" : "payload") +
+      " pooled=" + (pooled ? "1" : "0") +
+      " idle_ms=" +
+      std::to_string(pooled && now > c.last_application_us
+                         ? (now - c.last_application_us) / 1000
+                         : 0) +
+      " verdict=" +
+      (completion == rdma::RailCompletion::kRailFailure
+           ? "rail"
+           : completion == rdma::RailCompletion::kEndpointFailure ? "endpoint"
+                                                                  : "neutral") +
+      " suppressed=" + std::to_string(suppressed));
+}
+
 void RdmaTransport::Destroy(Conn* c, rdma::RailCompletion completion) {
   if (!c) return;
+  NoteFailedCompletion(*c, completion);
   MarkInactive(c);
   if (completion == rdma::RailCompletion::kEndpointFailure)
     InvalidateCapabilities(c->node, c->peer_id, c->peer_publication);
@@ -2017,6 +2088,23 @@ std::string RdmaTransport::MetricsText() const {
          std::to_string(rail_get_ops_[i].load(std::memory_order_relaxed)) + "\n";
     s += "dfkv_rdma_client_rail_get_bytes_total" + labels +
          std::to_string(rail_get_bytes_[i].load(std::memory_order_relaxed)) + "\n";
+  }
+  // Lazily populated: a series appears with its first failure, so the label
+  // set stays at (rails x statuses that actually occurred).
+  s += "# HELP dfkv_rdma_client_rail_wc_errors_total Connections lost to a failed work completion per local RDMA rail and completion status\n";
+  s += "# TYPE dfkv_rdma_client_rail_wc_errors_total counter\n";
+  for (size_t i = 0; i < devs_.size(); ++i) {
+    for (size_t slot = 0; slot < rdma::kWcStatusSlots; ++slot) {
+      const uint64_t count =
+          rail_wc_errors_[i * rdma::kWcStatusSlots + slot].load(
+              std::memory_order_relaxed);
+      if (count == 0) continue;
+      s += "dfkv_rdma_client_rail_wc_errors_total{dev=\"" +
+           PromLabelEscape(devs_[i].empty() ? std::string("default")
+                                            : devs_[i]) +
+           "\",status=\"" + rdma::WcStatusName(static_cast<int>(slot)) +
+           "\"} " + std::to_string(count) + "\n";
+    }
   }
   const uint64_t now = rdma::RailPolicy::NowMicros();
   const auto rail_stats = rail_policy_->Snapshot(now);

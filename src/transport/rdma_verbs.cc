@@ -1,5 +1,6 @@
 #include "transport/rdma_verbs.h"
 #include "transport/rdma_protocol.h"
+#include "transport/rdma_wc_status.h"
 #include <arpa/inet.h>
 
 #include <fcntl.h>
@@ -86,20 +87,11 @@ void DeregisterMr(ibv_mr* mr) {
   if (mr) RequireVerbsRelease(ibv_dereg_mr(mr), "ibv_dereg_mr");
 }
 
-int ObserveCqPoll(ibv_wc* out, int got) {
-  if (got < 0) {
-    g_cq_errors.fetch_add(1, std::memory_order_relaxed);
-  } else if (got > 0) {
-    g_cq_completions.fetch_add(static_cast<uint64_t>(got),
-                               std::memory_order_relaxed);
-    uint64_t failed = 0;
-    for (int i = 0; i < got; ++i)
-      if (out[i].status != IBV_WC_SUCCESS) ++failed;
-    if (failed != 0)
-      g_cq_errors.fetch_add(failed, std::memory_order_relaxed);
-  }
-  return got;
-}
+// rdma_wc_status.h names completion statuses by number without verbs.h.
+static_assert(IBV_WC_SUCCESS == 0 && IBV_WC_WR_FLUSH_ERR == 5 &&
+                  IBV_WC_REM_ACCESS_ERR == 10 && IBV_WC_RETRY_EXC_ERR == 12 &&
+                  IBV_WC_RNR_RETRY_EXC_ERR == 13 && IBV_WC_GENERAL_ERR == 21,
+              "rdma_wc_status.h must follow enum ibv_wc_status");
 
 // Get-or-open the shared {ctx, pd} for `dev_name` (nullptr/"" = first device),
 // bumping its refcount. Returns {nullptr,nullptr} on failure (no refcount taken).
@@ -1038,7 +1030,25 @@ bool RcEndpoint::PostWriteImmScatterMulti(
 }
 
 int RcEndpoint::ObserveCompletions(ibv_wc* out, int got) {
-  return ObserveCqPoll(out, got);
+  if (got < 0) {
+    g_cq_errors.fetch_add(1, std::memory_order_relaxed);
+  } else if (got > 0) {
+    g_cq_completions.fetch_add(static_cast<uint64_t>(got),
+                               std::memory_order_relaxed);
+    uint64_t failed = 0;
+    for (int i = 0; i < got; ++i) {
+      if (out[i].status == IBV_WC_SUCCESS) continue;
+      ++failed;
+      // Remember the cause, not the flush that follows it (see failed_wc()).
+      if (!has_failed_wc_) {
+        failed_wc_ = out[i];
+        has_failed_wc_ = true;
+      }
+    }
+    if (failed != 0)
+      g_cq_errors.fetch_add(failed, std::memory_order_relaxed);
+  }
+  return got;
 }
 
 int RcEndpoint::PollComp(ibv_wc* out, int max) {

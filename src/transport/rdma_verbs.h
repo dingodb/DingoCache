@@ -282,6 +282,14 @@ class RcEndpoint {
   // timeout returns 0 if no completion arrives in that window — the server uses
   // it to reclaim an idle/abandoned connection instead of blocking indefinitely.
   int WaitComp(ibv_wc* out, int max, int timeout_ms = -1);
+  // The first failed work completion this endpoint reaped, or nullptr. An RC
+  // QP does not survive a failed completion, so any later ones are the flush
+  // of what was still posted; the first names the cause. Per the verbs
+  // contract only wr_id, status, qp_num and vendor_err are valid in it.
+  // Owner-thread only, like the polling calls that record it.
+  const ibv_wc* failed_wc() const {
+    return has_failed_wc_ ? &failed_wc_ : nullptr;
+  }
   // Unblock a thread sitting in WaitComp (so the server can join its Serve
   // threads at shutdown). Thread-safe vs the waiter.
   void Wake();
@@ -332,6 +340,10 @@ class RcEndpoint {
   std::vector<ibv_mr*> lease_write_mr_;
   std::vector<ibv_mr*> lease_read_mr_;
   QpInfo local_;
+  // See failed_wc(). Written once, after a failure; declared last so the
+  // members every post and poll reads stay where they were.
+  ibv_wc failed_wc_{};
+  bool has_failed_wc_ = false;
 };
 
 

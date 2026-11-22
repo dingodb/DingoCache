@@ -33,6 +33,7 @@
 #include "transport/rdma_recv_segment.h"
 #include "transport/rdma_verbs.h"  // rdma::RcEndpoint
 #include "transport/rdma_topology.h"
+#include "transport/rdma_wc_status.h"
 
 namespace dfkv {
 class RdmaServerTestPeer;
@@ -197,6 +198,12 @@ class RdmaServer {
     std::atomic<uint64_t> completion_errors{0};
     std::atomic<uint64_t> put_writes{0};
     std::atomic<uint64_t> put_bytes{0};
+    // completion_errors broken down by work-completion status. A connection
+    // stops at its first failed completion, so each one is counted once.
+    // Kept last: every Serve thread bumps the counters above per request, and
+    // this array, written only when a connection dies, must not sit between
+    // them and spread them over more cache lines.
+    std::atomic<uint64_t> wc_errors[rdma::kWcStatusSlots] = {};
   };
 
   Handler handler_;
@@ -287,8 +294,9 @@ class RdmaServer {
   std::function<void()> before_endpoint_teardown_for_test_;
   // Test barrier after reply posting, before its SEND CQE is processed.
   std::function<void()> after_reply_post_for_test_;
-  // Test-only CQ filter: may withhold and later replay actual polled CQEs.
-  // It never fabricates completions; production leaves this empty.
+  // Test-only CQ filter: may withhold and later replay actual polled CQEs, or
+  // rewrite the status of one. It never fabricates completions; production
+  // leaves this empty.
   std::function<void(ibv_wc*, int*, size_t)> reorder_cq_for_test_;
   std::function<void(size_t, size_t, size_t)> after_cq_dispatch_for_test_;
   std::function<void(size_t)> after_request_rearm_for_test_;
