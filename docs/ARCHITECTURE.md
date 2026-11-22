@@ -59,11 +59,15 @@ build their ring from and still shows them to `dfkvctl ring`.
    The client derives the native block identity, routes it by Ketama, and sends
    the caller's bytes unchanged.
 2. Server `ProcessRequest(kCache)` / `CacheDirect` stores the exact raw bytes and
-   their length. If the RAM tier is on, admission makes the value visible in RAM,
-   but the request does not return `kOk` until its disk flush commits. An
-   overlapping same-key PUT joins that commit result rather than reporting
-   uncommitted success. Genuine RAM capacity backpressure uses the synchronous
-   disk path.
+   their length. Without a RAM tier the PUT returns once the value is on disk.
+   With the RAM tier in its default write-back mode, admission makes the value
+   visible in a flush-pinned RAM slot and the PUT returns `kOk` then, before
+   the asynchronous disk flush (RAM-ACK); `DFKV_PUT_ACK_MODE=disk`, or a zero
+   `DFKV_RAM_ACK_HIGH_WATERMARK_PCT`, makes every PUT wait for its flush
+   (disk-ACK). Once the RAM tier's dirty bytes reach the positive watermark,
+   PUTs of new keys are refused with `kCacheFull` before admission; a PUT that
+   finds no RAM slot at all takes the disk path. A same-key PUT that overlaps
+   an admitted one joins its owner (see section 6 for what it is answered).
 
 **GET** `client.Get(key, dst)`
 1. The same namespace and object key select the same block. The server checks
@@ -614,7 +618,7 @@ data plane or the connection fails.
 | disk storage engine | `--store-engine=slab|file` / `DFKV_STORE_ENGINE` | `slab` (all server/store construction paths) | option > env > default; v3 slab needs a clean cache directory; invalid capacity, format, or geometry fails closed without a file fallback |
 | RAM hot tier | `DFKV_RAM_TIER=1` (+ `DFKV_RAM_TIER_BYTES`) | off | write-back/write-around + direct cold-read promotion + RDMA zero-copy GET; requested allocation failure rejects startup |
 | RAM PUT policy | `--ram-write-mode=writeback|writearound` / `DFKV_RAM_WRITE_MODE` | `writeback` | write-back absorbs PUT bursts; write-around avoids the PUT arena copy and relies on direct GET promotion |
-| RAM PUT acknowledgement | `DFKV_PUT_ACK_MODE=ram|disk` | `ram` for write-back; disk otherwise | RAM-ACK returns after visible flush-pinned admission; `disk` explicitly restores durable ACK; dirty watermark forces bounded synchronous waiting |
+| RAM PUT acknowledgement | `DFKV_PUT_ACK_MODE=ram|disk` | `ram` for write-back; disk otherwise | RAM-ACK returns after visible flush-pinned admission; `disk` explicitly restores durable ACK; at the positive dirty watermark (`DFKV_RAM_ACK_HIGH_WATERMARK_PCT`, 80) PUTs of new keys are refused with `kCacheFull`, and a zero watermark selects disk-ACK |
 | RAM NUMA policy | `--ram-tier-numa=interleave|off` / `DFKV_RAM_TIER_NUMA` | `interleave` | numeric node IDs are not accepted |
 | RAM flush workers | `--ram-flush-threads` / `DFKV_RAM_FLUSH_THREADS` | 4× disk count, cap 16 | actual count is at least shard count and is reported after adjustment |
 | RAM dedicated-value reserve | `DFKV_RAM_TIER_LARGE_RESERVE_BYTES` | two extents | partitions the hard total budget; `0` disables oversized residency |
