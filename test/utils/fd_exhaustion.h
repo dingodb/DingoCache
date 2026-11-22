@@ -61,15 +61,16 @@ inline int LowestFreeDescriptor() {
 
 // While alive, every attempt to get a new descriptor in this process fails
 // with EMFILE; descriptors that are already open keep working. Create the
-// sockets a test still needs before constructing this.
+// sockets a test still needs before constructing this, or pass `spare` to
+// leave that many descriptors to be had first.
 class NoFreeDescriptors {
  public:
-  NoFreeDescriptors() {
+  explicit NoFreeDescriptors(int spare = 0) {
     const int lowest_free = LowestFreeDescriptor();
     if (lowest_free < 0) return;
     if (::getrlimit(RLIMIT_NOFILE, &saved_) != 0) return;
     rlimit lowered = saved_;
-    lowered.rlim_cur = static_cast<rlim_t>(lowest_free);
+    lowered.rlim_cur = static_cast<rlim_t>(lowest_free + spare);
     active_ = ::setrlimit(RLIMIT_NOFILE, &lowered) == 0;
   }
   ~NoFreeDescriptors() { Restore(); }

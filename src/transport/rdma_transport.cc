@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 
@@ -333,6 +334,11 @@ std::shared_ptr<rdma::ResourceBudget> ProcessResourceBudget(
 // Client-local failures that occur before dialing the peer must remain neutral
 // to PeerHealth. Flip only slots still carrying the kIOError default;
 // deterministic kInvalid verdicts stand.
+// After a failed send or receive on a socket with a timeout: true when the
+// call ran out of time, false when the peer closed or reset the connection.
+// The caller clears errno first, since a clean close sets none.
+bool SocketTimedOut(int err) { return err == EAGAIN || err == EWOULDBLOCK; }
+
 void MarkClientLocalFailure(std::vector<Status>* result, Status status) {
   for (auto& s : *result)
     if (s == Status::kIOError) s = status;
@@ -372,6 +378,9 @@ struct RdmaTransport::Conn {
   // still has the other end.
   bool reused_from_pool = false;
   uint64_t completions_at_reuse = 0;
+  // The operation stopped because this process could not register a caller
+  // buffer. Neither the rail nor the peer had a part in that.
+  bool local_resource_failure = false;
   rdma::RailLease lease;
   uint64_t lease_started_us = 0;
   bool credit_held = false;
@@ -531,6 +540,10 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
       RemoteRailHealthConfig{
           static_cast<uint64_t>(remote_base_cooldown_ms) * 1000,
           static_cast<uint64_t>(remote_max_cooldown_ms) * 1000});
+  // A node that refused a connect is not dialed again for as long as its
+  // rails used to be cooled for it.
+  peer_unreachable_hold_us_ =
+      static_cast<uint64_t>(remote_base_cooldown_ms) * 1000;
   config_dump::RecordResolved("DFKV_RDMA_REMOTE_RAIL_COOLDOWN_MS",
                               std::to_string(remote_base_cooldown_ms));
   config_dump::RecordResolved("DFKV_RDMA_REMOTE_RAIL_MAX_COOLDOWN_MS",
@@ -1047,6 +1060,8 @@ void RdmaTransport::NoteFailedCompletion(Conn& c,
 
 void RdmaTransport::Destroy(Conn* c, rdma::RailCompletion completion) {
   if (!c) return;
+  if (c->local_resource_failure)
+    completion = rdma::RailCompletion::kAdmission;
   NoteFailedCompletion(*c, completion);
   MarkInactive(c);
   if (completion == rdma::RailCompletion::kEndpointFailure)
@@ -1236,22 +1251,25 @@ void RdmaTransport::NoteNegotiatedDepth(const std::string& node, Lane lane,
   if (it == map.end() || remote_depth < it->second) map[node] = remote_depth;
 }
 
-bool RdmaTransport::ProbeV2(const std::string& node,
-                            bool* leased_put_supported) const {
+RdmaTransport::ProbeResult RdmaTransport::ProbeV2(
+    const std::string& node, bool* leased_put_supported) const {
   v2_probe_attempts_.fetch_add(1, std::memory_order_relaxed);
   if (leased_put_supported) *leased_put_supported = false;
   int fd = net::Dial(node, connect_ms_, io_ms_);
   if (fd < 0) {
     v2_probe_failures_.fetch_add(1, std::memory_order_relaxed);
-    return false;
+    return ProbeResult::kUnreachable;
   }
   char frame[rdma::kDevNameBytes];
   rdma::EncodeDevFrame(rdma::kV2ProbeDevice, declared_, frame,
                        rdma::kDevProtoV2);
   char reply[rdma::kV2ProbeReplyBytes];
+  errno = 0;
+  const bool answered = net::WriteAll(fd, frame, sizeof(frame)) &&
+                        net::ReadAll(fd, reply, sizeof(reply));
+  const bool closed = !answered && !SocketTimedOut(errno);
   const bool ok =
-      net::WriteAll(fd, frame, sizeof(frame)) &&
-      net::ReadAll(fd, reply, sizeof(reply)) &&
+      answered &&
       rdma::V2ProbeSupportsDynamicOnly(reply) &&
       rdma::V2ProbeSupportsDynamicPull(reply) &&
       rdma::V2ProbeSupportsPullRead(reply);
@@ -1261,7 +1279,58 @@ bool RdmaTransport::ProbeV2(const std::string& node,
     v2_probe_failures_.fetch_add(1, std::memory_order_relaxed);
   else if (leased_put_supported)
     *leased_put_supported = leased;
-  return ok;
+  return ok ? ProbeResult::kSupported
+            : closed ? ProbeResult::kClosed : ProbeResult::kRejected;
+}
+
+bool RdmaTransport::RecentlyUnreachable(const std::string& node) {
+  std::lock_guard<std::mutex> lock(unreachable_mu_);
+  const auto found = unreachable_until_us_.find(node);
+  if (found == unreachable_until_us_.end()) return false;
+  if (rdma::RailPolicy::NowMicros() < found->second) {
+    peer_unreachable_skips_.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  unreachable_until_us_.erase(found);
+  return false;
+}
+
+void RdmaTransport::NoteUnreachable(const std::string& node) {
+  std::lock_guard<std::mutex> lock(unreachable_mu_);
+  const uint64_t now = rdma::RailPolicy::NowMicros();
+  auto& until = unreachable_until_us_[node];
+  // Counted, and the interval started, by the connect that failed; the
+  // attempts refused during the interval are skips, counted where refused.
+  if (until > now) return;
+  peer_unreachable_.fetch_add(1, std::memory_order_relaxed);
+  until = now + peer_unreachable_hold_us_;
+}
+
+void RdmaTransport::NoteLocalRegistrationFailure(Conn* c, size_t bytes) {
+  const int err = errno;  // of the registration that just failed
+  // What this process or its caller can cause: the locked-memory limit
+  // (ENOMEM, EAGAIN) and a buffer that is not there or cannot be pinned
+  // (EFAULT, EINVAL). Anything else stays what it was, a fault of the rail.
+  if (err != ENOMEM && err != EAGAIN && err != EFAULT && err != EINVAL)
+    return;
+  c->local_resource_failure = true;
+  local_resource_failures_.fetch_add(1, std::memory_order_relaxed);
+  uint64_t suppressed = 0;
+  if (!local_resource_log_.Admit(
+          LogThrottle::Key("register", static_cast<uint64_t>(err), 0),
+          rdma::RailPolicy::NowMicros(), &suppressed))
+    return;
+  DFKV_LOG_WARN(
+      "rdma: cannot register a caller buffer of " + std::to_string(bytes) +
+      " bytes for a transfer: " + std::strerror(err) +
+      ". This is a limit or a buffer of this process, not a rail or peer "
+      "fault" +
+      (err == ENOMEM || err == EAGAIN
+           ? "; most likely the locked-memory limit (ulimit -l, "
+             "LimitMEMLOCK) is too low"
+           : "; the address cannot be pinned") +
+      ". The operation fails with kResourceExhausted and no rail is "
+      "charged. suppressed=" + std::to_string(suppressed));
 }
 
 
@@ -1481,11 +1550,34 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
       }
     }
   }
-  if (!caps_cached &&
-      !ProbeV2(node, &leased_put_supported)) {
-    complete_unowned_lease(rdma::RailCompletion::kEndpointFailure);
-    result.failure = AcquireFailure::kEndpoint;
-    return result;
+  // A close before any reply is taken as "busy" once: on the first attempt
+  // of an operation. The retry that follows sets force_new, and a close on
+  // that attempt is charged to the peer rail like any other endpoint failure.
+  const bool first_attempt = !options.force_new;
+  if (!caps_cached) {
+    if (RecentlyUnreachable(node)) {
+      complete_unowned_lease(rdma::RailCompletion::kAdmission);
+      result.failure = AcquireFailure::kPeerUnreachable;
+      return result;
+    }
+    const ProbeResult probed = ProbeV2(node, &leased_put_supported);
+    if (probed == ProbeResult::kUnreachable) {
+      NoteUnreachable(node);
+      complete_unowned_lease(rdma::RailCompletion::kAdmission);
+      result.failure = AcquireFailure::kPeerUnreachable;
+      return result;
+    }
+    if (probed == ProbeResult::kClosed && first_attempt) {
+      peer_busy_.fetch_add(1, std::memory_order_relaxed);
+      complete_unowned_lease(rdma::RailCompletion::kAdmission);
+      result.failure = AcquireFailure::kPeerBusy;
+      return result;
+    }
+    if (probed != ProbeResult::kSupported) {
+      complete_unowned_lease(rdma::RailCompletion::kEndpointFailure);
+      result.failure = AcquireFailure::kEndpoint;
+      return result;
+    }
   }
   const bool want_leased_put =
       options.request_leased_put && leased_put_supported;
@@ -1537,11 +1629,15 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   }
 
   const std::string& dev = devs_[ridx];
-  int fd = net::Dial(node, connect_ms_, io_ms_);
+  int fd = RecentlyUnreachable(node)
+               ? -1
+               : net::Dial(node, connect_ms_, io_ms_);
   if (fd < 0) {
-    complete_unowned_lease(rdma::RailCompletion::kEndpointFailure);
+    // The bootstrap address is the node's, the same for every rail.
+    NoteUnreachable(node);
+    complete_unowned_lease(rdma::RailCompletion::kAdmission);
     resource_budget_->Release(budget_request);
-    result.failure = AcquireFailure::kEndpoint;
+    result.failure = AcquireFailure::kPeerUnreachable;
     return result;
   }
   auto* conn = new Conn();
@@ -1566,6 +1662,28 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   conn->budget_held = true;
   if (!conn->ep.Open(dev.c_str(), rdma::kV2ControlCap, conn_depth)) {
     ::close(fd);
+    const int open_errno = conn->ep.open_errno();
+    if (open_errno == EMFILE || open_errno == ENFILE ||
+        open_errno == ENOMEM) {
+      // This process is out of descriptors or memory. Another rail would hit
+      // the same limit, and the device has done nothing wrong.
+      local_resource_failures_.fetch_add(1, std::memory_order_relaxed);
+      uint64_t suppressed = 0;
+      if (local_resource_log_.Admit(
+              LogThrottle::Key("open", static_cast<uint64_t>(open_errno), 0),
+              rdma::RailPolicy::NowMicros(), &suppressed))
+        DFKV_LOG_WARN(
+            "rdma: cannot create an endpoint for " + node + ": " +
+            std::strerror(open_errno) +
+            ". This process is out of file descriptors or memory; the "
+            "operation fails with kResourceExhausted, no rail is charged "
+            "and the peer is not cooled down. suppressed=" +
+            std::to_string(suppressed));
+      Destroy(conn, rdma::RailCompletion::kAdmission);
+      result.failure = AcquireFailure::kAdmission;
+      result.status = Status::kResourceExhausted;
+      return result;
+    }
     DFKV_LOG_WARN("rdma: device " + dev +
                   " Open failed; rail failure policy will quarantine it");
     Destroy(conn, rdma::RailCompletion::kRailFailure);
@@ -1591,10 +1709,21 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   my.depth = static_cast<uint16_t>(std::min<size_t>(conn_depth, 256));
   my.protocol_version = rdma::kDevProtoV2;
   rdma::SerializeQpInfo(my, mine);
+  errno = 0;
   if (!net::WriteAll(fd, devbuf, rdma::kDevNameBytes) ||
       !net::WriteAll(fd, mine, rdma::kQpInfoBytes) ||
       !net::ReadAll(fd, remote_qp_bytes, rdma::kQpInfoBytes)) {
+    const bool closed = !SocketTimedOut(errno);
     ::close(fd);
+    if (closed && first_attempt) {
+      // Closed before the peer sent anything. A server at its limit of
+      // pending handshakes does this, and so does one that rejects the
+      // device; the two look the same from here. Take it as busy once.
+      peer_busy_.fetch_add(1, std::memory_order_relaxed);
+      Destroy(conn, rdma::RailCompletion::kAdmission);
+      result.failure = AcquireFailure::kPeerBusy;
+      return result;
+    }
     Destroy(conn, rdma::RailCompletion::kEndpointFailure);
     result.failure = AcquireFailure::kEndpoint;
     return result;
@@ -1708,8 +1837,21 @@ bool RdmaTransport::PrepareRetry(
     const std::shared_ptr<const rdma::PeerRailSnapshot>& peer,
     RailMask* excluded, bool* cross_rail_retry) {
   if (attempt != 0 || failure == AcquireFailure::kNoCompatibleRail ||
+      failure == AcquireFailure::kPeerUnreachable ||
       (replay_safety == ReplaySafety::kUnsafeAfterPost && request_posted))
     return false;
+  const bool peer_busy = failure == AcquireFailure::kPeerBusy;
+  if (peer_busy && peer_busy_retry_us_ != 0) {
+    // Handshake slots at the peer free up as other clients finish theirs.
+    // The pause differs per caller so that the callers refused together do
+    // not come back together.
+    const uint64_t jitter_us =
+        (rdma::RailPolicy::NowMicros() ^
+         std::hash<std::thread::id>()(std::this_thread::get_id())) %
+        peer_busy_retry_us_;
+    std::this_thread::sleep_for(
+        std::chrono::microseconds(peer_busy_retry_us_ + jitter_us));
+  }
   if (failure == AcquireFailure::kLocalRail && attempted_rail &&
       *attempted_rail < devs_.size()) {
     excluded->assign(devs_.size(), 0);
@@ -1742,7 +1884,11 @@ bool RdmaTransport::PrepareRetry(
     }
     return true;
   }
-  if (failure == AcquireFailure::kEndpoint && attempted_rail &&
+  // A busy peer is retried on the rails an endpoint failure would be retried
+  // on: another compatible rail when there is one, since a peer that rejects
+  // this device closes the connection in the same way as a full one, and the
+  // same rail otherwise.
+  if ((failure == AcquireFailure::kEndpoint || peer_busy) && attempted_rail &&
       *attempted_rail < devs_.size()) {
     excluded->assign(devs_.size(), 0);
     (*excluded)[*attempted_rail] = 1;
@@ -1765,9 +1911,10 @@ bool RdmaTransport::PrepareRetry(
     const auto fallback =
         rdma::IntersectRailMasks(highest_tier, candidates.fallback);
     if (!rdma::HasUnexcludedRail(preferred, fallback, *excluded)) {
-      if (!from_pool) return false;
+      if (!from_pool && !peer_busy) return false;
       excluded->assign(devs_.size(), 0);
-      stale_pool_retries_.fetch_add(1, std::memory_order_relaxed);
+      if (from_pool)
+        stale_pool_retries_.fetch_add(1, std::memory_order_relaxed);
       return true;
     }
     if (from_pool)
@@ -2279,6 +2426,27 @@ std::string RdmaTransport::MetricsText() const {
        std::to_string(
            stale_pool_connections_.load(std::memory_order_relaxed)) +
        "\n";
+  s += "# HELP dfkv_rdma_client_peer_unreachable_total Connection attempts whose TCP connect to the peer's bootstrap address failed; no rail charged, not retried\n";
+  s += "# TYPE dfkv_rdma_client_peer_unreachable_total counter\n";
+  s += "dfkv_rdma_client_peer_unreachable_total " +
+       std::to_string(peer_unreachable_.load(std::memory_order_relaxed)) +
+       "\n";
+  s += "# HELP dfkv_rdma_client_peer_unreachable_skips_total Connection attempts not made because a connect to the same address failed within DFKV_RDMA_REMOTE_RAIL_COOLDOWN_MS\n";
+  s += "# TYPE dfkv_rdma_client_peer_unreachable_skips_total counter\n";
+  s += "dfkv_rdma_client_peer_unreachable_skips_total " +
+       std::to_string(
+           peer_unreachable_skips_.load(std::memory_order_relaxed)) +
+       "\n";
+  s += "# HELP dfkv_rdma_client_peer_busy_total First connection attempts the peer closed before any reply; no rail charged, retried once after a pause\n";
+  s += "# TYPE dfkv_rdma_client_peer_busy_total counter\n";
+  s += "dfkv_rdma_client_peer_busy_total " +
+       std::to_string(peer_busy_.load(std::memory_order_relaxed)) + "\n";
+  s += "# HELP dfkv_rdma_client_local_resource_failures_total Operations failed because this process could not register a caller buffer or create an endpoint for lack of descriptors or memory; no rail or peer charged\n";
+  s += "# TYPE dfkv_rdma_client_local_resource_failures_total counter\n";
+  s += "dfkv_rdma_client_local_resource_failures_total " +
+       std::to_string(
+           local_resource_failures_.load(std::memory_order_relaxed)) +
+       "\n";
   s += "# HELP dfkv_rdma_client_stale_pool_retries_total Fresh-connection retries after a pooled QP failure\n";
   s += "# TYPE dfkv_rdma_client_stale_pool_retries_total counter\n";
   s += "dfkv_rdma_client_stale_pool_retries_total " +
@@ -2524,6 +2692,8 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
                  payload_mr, conn->put_addr(0), conn->recv_segment.rkey, 0);
         if (ok)
           v2_put_writes_.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        NoteLocalRegistrationFailure(conn, static_cast<size_t>(payload_len));
       }
     } else {
       // Control ops carry any payload inline after the prefix (kRetain keys).
@@ -2599,7 +2769,14 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
     }
 
     const size_t failed_rail = conn->rail_index;
+    const bool local_resource = conn->local_resource_failure;
     Destroy(conn, completion);
+    if (local_resource) {
+      // Another rail or another attempt would fail the same way.
+      if (cross_rail_retry)
+        cross_rail_retry_exhausted_.fetch_add(1, std::memory_order_relaxed);
+      return Status::kResourceExhausted;
+    }
     const AcquireFailure failure =
         completion == rdma::RailCompletion::kRailFailure &&
                 (local_rail_replay_safe || !request_posted)
@@ -2792,9 +2969,14 @@ std::vector<Status> RdmaTransport::CacheMany(
                                        /*remote_write=*/false)
                 : nullptr;
         payload_mrs[slot] = mr;
+        if (item.len != 0 && !mr) {
+          NoteLocalRegistrationFailure(conn, item.len);
+          conn_ok = false;
+          break;
+        }
         conn->Encode(ep.sbuf(slot), WireOp::kCache, item.key, 0, 0,
                      item.len);
-        if ((item.len != 0 && !mr) || !ep.PostRecv(slot) ||
+        if (!ep.PostRecv(slot) ||
             !ep.PostWriteImmScatter(
                 slot, kReqPrefix, item.data, item.len, mr,
                 conn->put_addr(slot), conn->recv_segment.rkey,
@@ -2919,11 +3101,17 @@ std::vector<Status> RdmaTransport::CacheMany(
         ibv_mr* mr = ep.RegisterTransient(const_cast<void*>(item.data),
                                            item.len, /*remote_write=*/false);
         payload_mrs[slot] = mr;
+        if (!mr) {
+          NoteLocalRegistrationFailure(conn, item.len);
+          conn_ok = false;
+          completion = rdma::RailCompletion::kRailFailure;
+          break;
+        }
         // The WRITE window is an ordinary v2 PUT frame aimed at the leased
         // range: re-encode the request header (phase A left a kLeasePut
         // request in this send buffer).
         conn->Encode(ep.sbuf(slot), WireOp::kCache, item.key, 0, 0, item.len);
-        if (!mr || !ep.PostRecv(slot) ||
+        if (!ep.PostRecv(slot) ||
             !ep.PostWriteImmScatter(
                 slot, kReqPrefix, item.data, item.len, mr,
                 leases[slot].write_base + rdma::kV2PutPrefixOffset,
@@ -2982,7 +3170,16 @@ std::vector<Status> RdmaTransport::CacheMany(
       return result;
     }
     const size_t failed_rail = conn->rail_index;
+    const bool local_resource = conn->local_resource_failure;
     Destroy(conn, completion);
+    if (local_resource) {
+      // Another rail or another attempt would fail the same way. Items that
+      // already have their answer keep it.
+      if (cross_rail_retry)
+        cross_rail_retry_exhausted_.fetch_add(1, std::memory_order_relaxed);
+      MarkClientLocalFailure(&result, Status::kResourceExhausted);
+      return result;
+    }
     const AcquireFailure failure =
         completion == rdma::RailCompletion::kRailFailure && !request_posted
             ? AcquireFailure::kLocalRail
@@ -3102,9 +3299,16 @@ std::vector<Status> RdmaTransport::RangeMany(
       return result;
     }
     const size_t failed_rail = conn->rail_index;
+    const bool local_resource = conn->local_resource_failure;
     pull_failures_.fetch_add(1, std::memory_order_relaxed);
     // Fence the QP before the operation-owned string destinations are freed.
     Destroy(conn, completion);
+    if (local_resource) {
+      if (cross_rail_retry)
+        cross_rail_retry_exhausted_.fetch_add(1, std::memory_order_relaxed);
+      MarkClientLocalFailure(&result, Status::kResourceExhausted);
+      return result;
+    }
     const AcquireFailure failure =
         completion == rdma::RailCompletion::kRailFailure
             ? AcquireFailure::kLocalRail
@@ -3332,8 +3536,11 @@ bool RdmaTransport::PullWindow(
           segment.second, request.data_len - state.copied);
       // Existing transient destination registration includes LOCAL_WRITE.
       state.mr = ep.RegisterTransient(segment.first, state.bytes);
-      if (!state.mr ||
-          !ep.PostRead(slot, segment.first, state.bytes, state.mr,
+      if (!state.mr) {
+        NoteLocalRegistrationFailure(conn, state.bytes);
+        return false;
+      }
+      if (!ep.PostRead(slot, segment.first, state.bytes, state.mr,
                        state.ready.address + state.copied, state.ready.rkey))
         return false;
       ++posted;
@@ -3443,8 +3650,15 @@ Status RdmaTransport::PullInto(
                     &failure)) {
       pull_failures_.fetch_add(1, std::memory_order_relaxed);
       const size_t failed_rail = conn->rail_index;
+      const bool local_resource = conn->local_resource_failure;
       // Fence the READ before the staged destination can be reused or freed.
       Destroy(conn, failure);
+      if (local_resource) {
+        if (cross_rail_retry)
+          cross_rail_retry_exhausted_.fetch_add(1,
+                                                std::memory_order_relaxed);
+        return Status::kResourceExhausted;
+      }
       if (mode == PullMode::kSlice &&
           PrepareRetry(attempt, acquired.from_pool, failed_rail,
                        failure == rdma::RailCompletion::kRailFailure
@@ -3701,6 +3915,7 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
               const_cast<void*>(payload.first), payload.second,
               /*remote_write=*/false);
           if (!mr) {
+            NoteLocalRegistrationFailure(conn, payload.second);
             conn_ok = false;
             break;
           }
@@ -3782,9 +3997,17 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
       return result;
     }
     const size_t failed_rail = conn->rail_index;
+    const bool local_resource = conn->local_resource_failure;
     Destroy(conn, completion);
     for (size_t i = 0; i < count; ++i) {
-      if (!bad[i] && !completed[i]) result[i] = Status::kIOError;
+      if (!bad[i] && !completed[i])
+        result[i] = local_resource ? Status::kResourceExhausted
+                                   : Status::kIOError;
+    }
+    if (local_resource) {
+      if (cross_rail_retry)
+        cross_rail_retry_exhausted_.fetch_add(1, std::memory_order_relaxed);
+      return result;
     }
     const AcquireFailure failure =
         completion == rdma::RailCompletion::kRailFailure && !request_posted

@@ -148,6 +148,19 @@ class RdmaTransport : public Transport {
     kAdmission,
     kLocalRail,
     kEndpoint,
+    // The peer's TCP bootstrap address did not accept a connection. That is
+    // about the node, not about a rail: no rail is charged and nothing is
+    // retried, since every rail dials the same address. The operation fails
+    // with kIOError, which is what cools the node in the client above. Also
+    // returned without dialing while the address is held as unreachable.
+    kPeerUnreachable,
+    // The peer accepted the connection and closed it before sending anything,
+    // on a first attempt. A server does that when it is at its limit of
+    // pending handshakes, and also when it rejects the device. No rail is
+    // charged; the operation waits a moment and tries once more, on another
+    // compatible rail if there is one and on the same rail otherwise. A
+    // close on that second attempt is charged as an endpoint failure.
+    kPeerBusy,
   };
   enum class ReplaySafety : uint8_t {
     kReplaySafe,
@@ -252,8 +265,17 @@ class RdmaTransport : public Transport {
                    uint64_t payload_len, std::string* out,
                    uint64_t* value_len = nullptr);
   // Probe required base capabilities and report actual optional peer bits.
-  bool ProbeV2(const std::string& node,
-               bool* leased_put_supported = nullptr) const;
+  enum class ProbeResult : uint8_t {
+    kSupported,
+    kUnreachable,  // no TCP connection
+    kClosed,       // connected, then closed by the peer without a reply
+    kRejected,     // timed out, or answered without the required capabilities
+  };
+  ProbeResult ProbeV2(const std::string& node,
+                      bool* leased_put_supported = nullptr) const;
+  // A buffer of the caller could not be registered on `c`. Marks the
+  // connection so that its teardown charges neither rail nor peer.
+  void NoteLocalRegistrationFailure(Conn* c, size_t bytes);
   mutable std::mutex mu_;
   // Scalar and SG operations share data endpoints. An acquired connection is
   // never concurrently reused, while operation framing remains self-describing.
@@ -400,6 +422,23 @@ class RdmaTransport : public Transport {
   mutable std::atomic<uint64_t> v2_probe_failures_{0};
   std::atomic<uint64_t> stale_pool_retries_{0};
   std::atomic<uint64_t> stale_pool_connections_{0};
+  // Pause before the one retry after a kPeerBusy; a random part of up to the
+  // same length is added per caller. A member so that tests can change it.
+  uint64_t peer_busy_retry_us_ = 20000;
+  // Addresses whose last TCP connect failed, and until when they are not
+  // dialed again. Without it every operation and every round of the client's
+  // background prober would wait out a connect timeout on a node that is
+  // down, now that no rail is cooled for it. Operations on connections that
+  // are already established do not look here.
+  bool RecentlyUnreachable(const std::string& node);
+  void NoteUnreachable(const std::string& node);
+  std::mutex unreachable_mu_;
+  std::unordered_map<std::string, uint64_t> unreachable_until_us_;
+  uint64_t peer_unreachable_hold_us_ = 2000000;
+  std::atomic<uint64_t> peer_unreachable_skips_{0};
+  std::atomic<uint64_t> peer_unreachable_{0};
+  std::atomic<uint64_t> peer_busy_{0};
+  std::atomic<uint64_t> local_resource_failures_{0};
   std::atomic<uint64_t> cross_rail_retries_{0};
   std::atomic<uint64_t> cross_rail_retry_successes_{0};
   std::atomic<uint64_t> cross_rail_retry_exhausted_{0};
@@ -444,6 +483,7 @@ class RdmaTransport : public Transport {
   // Both are touched only when a connection dies, and are declared last so
   // the counters above, which operations update, keep their layout.
   LogThrottle completion_error_log_;
+  LogThrottle local_resource_log_;  // keyed by what failed and its errno
   // #1: async CQ reaper for high-concurrency batch operations
 };
 

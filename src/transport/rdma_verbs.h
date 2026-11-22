@@ -295,6 +295,10 @@ class RcEndpoint {
   // an interval shows that the peer had the other end during it. Owner-thread
   // only.
   uint64_t succeeded_completions() const { return succeeded_completions_; }
+  // errno of the system or verbs call that made the last Open() fail; 0 when
+  // Open() gave up for a reason that has no errno (a geometry the device
+  // cannot hold).
+  int open_errno() const { return open_errno_; }
   // Unblock a thread sitting in WaitComp (so the server can join its Serve
   // threads at shutdown). Thread-safe vs the waiter.
   void Wake();
@@ -350,6 +354,7 @@ class RcEndpoint {
   ibv_wc failed_wc_{};
   bool has_failed_wc_ = false;
   uint64_t succeeded_completions_ = 0;
+  int open_errno_ = 0;
 };
 
 
