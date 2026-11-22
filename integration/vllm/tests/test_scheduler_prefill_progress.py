@@ -23,6 +23,8 @@ def _scheduler(
     total_tokens=16,
 ):
     scheduler = object.__new__(DfkvStoreScheduler)
+    # As __init__ with KV events: these tests check the token ids sent.
+    scheduler._kv_events = True
     scheduler._retention = {}
     scheduler._failed_load_req_ids = set()
     scheduler.kv_role = "kv_both"

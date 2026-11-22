@@ -101,6 +101,10 @@ class DfkvStoreScheduler:
         # A string such as "false" is truthy as a value: parse it as the
         # other boolean options are.
         self.lookup_async = _tcfg.truthy(extra_config.get("lookup_async", False))
+        kv_events = getattr(vllm_config, "kv_events_config", None)
+        self._kv_events = bool(
+            kv_events is not None and kv_events.enable_kv_cache_events
+        )
         self.client = LookupKeyClient(vllm_config)
         self._closed = False
 
@@ -341,6 +345,7 @@ class DfkvStoreScheduler:
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 self._block_size,
+                with_token_ids=self._kv_events,
                 load_spec=load_spec,
                 skip_save=force_skip_save,
                 block_hashes=request_real.block_hashes,
@@ -386,6 +391,7 @@ class DfkvStoreScheduler:
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
                     self._block_size,
+                    with_token_ids=self._kv_events,
                     load_spec=load_spec,
                     skip_save=force_skip_save,
                     block_hashes=request_real.block_hashes,
@@ -454,6 +460,7 @@ class DfkvStoreScheduler:
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
                     self._block_size,
+                    with_token_ids=self._kv_events,
                     load_spec=None,
                     skip_save=force_skip_save,
                     block_hashes=unfinished_req.block_hashes,
@@ -467,12 +474,13 @@ class DfkvStoreScheduler:
                 meta.add_request(req_meta)
 
         # Handle requests with pending load specs not yet scheduled
-        request_ids = [req.req_id for req in scheduler_output.scheduled_new_reqs]
+        scheduled = {req.req_id for req in scheduler_output.scheduled_new_reqs}
+        scheduled.update(cached_reqs.req_ids)
         for request_id, (
             unfinished_req,
             block_ids,
         ) in self._unfinished_requests.items():
-            if request_id not in request_ids and request_id not in cached_reqs.req_ids:
+            if request_id not in scheduled:
                 load_spec = self.load_specs.pop(request_id, None)
                 # MultiConnector may reject this connector's proposed load in
                 # favor of another connector (can_load=False). Only the chosen
@@ -491,6 +499,7 @@ class DfkvStoreScheduler:
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
                     self._block_size,
+                    with_token_ids=self._kv_events,
                     load_spec=load_spec,
                     skip_save=None,
                     block_hashes=unfinished_req.block_hashes,

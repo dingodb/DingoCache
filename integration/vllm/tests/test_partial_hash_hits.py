@@ -391,6 +391,7 @@ def test_load_reads_the_tail_into_a_whole_block(monkeypatch):
 
 def _scheduler(partial=True, **fields):
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._kv_events = False  # as __init__ without KV events
     for name, value in dict(
         kv_role="kv_producer", _block_size=LCM, _hash_block_size=HASH,
         _partial_hash_hits=partial, client=MagicMock(), load_specs={},

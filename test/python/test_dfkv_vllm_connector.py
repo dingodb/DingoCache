@@ -312,6 +312,7 @@ class SchedulerLookupTest(unittest.TestCase):
         *,
         lookup_async: bool,
         load_async: bool = True,
+        kv_events: bool = False,
     ) -> DfkvStoreScheduler:
         transfer = SimpleNamespace(
             kv_role="kv_both",
@@ -324,6 +325,8 @@ class SchedulerLookupTest(unittest.TestCase):
             kv_transfer_config=transfer,
             cache_config=SimpleNamespace(cache_salt="stable"),
         )
+        if kv_events:
+            config.kv_events_config = SimpleNamespace(enable_kv_cache_events=True)
         kv_cache_config = SimpleNamespace(
             kv_cache_groups=[
                 SimpleNamespace(
@@ -351,6 +354,12 @@ class SchedulerLookupTest(unittest.TestCase):
             num_tokens=blocks * 64,
             block_hashes=[bytes([index + 1]) * 32 for index in range(blocks)],
         )
+
+    def test_token_ids_are_sent_with_kv_events_only(self) -> None:
+        client = _LookupClient({})
+        self.assertFalse(self._scheduler(client, lookup_async=False)._kv_events)
+        self.assertTrue(
+            self._scheduler(client, lookup_async=False, kv_events=True)._kv_events)
 
     def test_sync_lookup_remains_single_call_and_returns_existing_shape(self) -> None:
         client = _LookupClient({"sync": [64]})

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- vLLM connector, scheduler step cost. A request's token ids, read only by
+  KV events, were pickled to every worker every step: a 32k-token request's
+  metadata was about 115 KiB, now 19 KiB without KV events. The scan for
+  pending loads checked each unfinished request against lists of the
+  scheduled ones; with 2048 of each it took 8.7 ms per step, now 0.1 ms.
+
 - vLLM connector: a failed block-level LOAD drops the request's cached
   lookup. vLLM rolls back the requests holding an invalid block and asks for
   them again; the scheduler reused a completed lookup for

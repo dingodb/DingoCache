@@ -35,6 +35,7 @@ def test_requested_ttl_accepts_only_positive_integers():
 
 def _scheduler(lookup_result, kv_role="kv_both"):
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._kv_events = False  # as __init__ without KV events
     scheduler._retention = {}
     scheduler._failed_load_req_ids = set()
     scheduler._request_trackers = {}

@@ -30,6 +30,7 @@ class _Lookups:
 
 def _scheduler():
     scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler._kv_events = False  # as __init__ without KV events
     scheduler.request_level_loads = False
     scheduler.client = _Lookups()
     scheduler._request_trackers = {
