@@ -1,9 +1,14 @@
 // GpuNodeDedup: same-host GET rendezvous for device-memory destinations over
 // CUDA IPC. Hermetic wrt dfkv (no RDMA/etcd) but NOT wrt hardware: everything
-// past the env/name tests needs a CUDA device and skips cleanly without one
-// (the CI runners have no GPU; the B200 gate runs the full set). Cross-process
-// coverage forks AND EXECS this binary — CUDA does not survive a bare fork —
-// with the segment name in the environment (see GpuDedupChild).
+// past the env/name tests needs a CUDA device and skips cleanly without one.
+// Cross-process coverage forks AND EXECS this binary — CUDA does not survive a
+// bare fork — with the segment name in the environment (see GpuDedupChild).
+//
+// This file builds two binaries. node_dedup_gpu_test runs against the real
+// driver. node_dedup_gpu_sim_test (see that file) runs the same tests against
+// the simulated driver in test/client/sim_cuda, on any machine; tests that
+// need something only the simulation can do (hold a GPUDirect write back)
+// skip on real hardware.
 #include "client/node_dedup_gpu.h"
 
 #include <gtest/gtest.h>
@@ -12,6 +17,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -50,6 +56,15 @@ bool EnsureCudaCtx() {
   static auto setcur = reinterpret_cast<int (*)(void*)>(
       ::dlsym(::dlopen("libcuda.so.1", RTLD_NOW), "cuCtxSetCurrent"));
   return setcur && setcur(ctx) == 0;
+}
+
+// The simulated driver's controls, or nullptr on real hardware.
+template <typename T>
+T* SimSymbol(const char* name) {
+  return reinterpret_cast<T*>(::dlsym(RTLD_DEFAULT, name));
+}
+bool Simulated() {
+  return ::dlsym(RTLD_DEFAULT, "sim_cuda_gpudirect_write") != nullptr;
 }
 
 struct ShmGuard {
@@ -375,3 +390,42 @@ TEST(GpuNodeDedup, CrossProcessIpcHit) {
   ASSERT_TRUE(WIFEXITED(st));
   EXPECT_EQ(WEXITSTATUS(st), 0) << "child (IPC reader) failed";
 }
+
+#ifdef DFKV_GPU_TEST_SIMULATED
+int main(int argc, char** argv) {
+  // The simulated driver must be the first libcuda.so.1 the loader finds,
+  // whatever environment the test was started from: re-execute once with its
+  // directory prepended. The cross-process test's child inherits both.
+  constexpr char kReexecuted[] = "DFKV_GPU_SIM_TEST_REEXECUTED";
+  if (::getenv(kReexecuted) == nullptr) {
+    std::string path = DFKV_SIM_CUDA_DIR;
+    const char* inherited = ::getenv("LD_LIBRARY_PATH");
+    if (inherited != nullptr && *inherited != '\0') {
+      path += ':';
+      path += inherited;
+    }
+    ::setenv("LD_LIBRARY_PATH", path.c_str(), 1);
+    ::setenv(kReexecuted, "1", 1);
+    ::execv("/proc/self/exe", argv);
+    std::perror("node_dedup_gpu_sim_test: re-exec");
+    return 127;
+  }
+  if (::access(DFKV_SIM_CUDA_DIR "/libcuda.so.1", R_OK) != 0) {
+    std::fprintf(stderr,
+                 "node_dedup_gpu_sim_test: " DFKV_SIM_CUDA_DIR
+                 "/libcuda.so.1 is missing; run from the build tree it was "
+                 "built in\n");
+    return 2;
+  }
+  // Load it now, by name as the code under test does, and refuse to run on
+  // anything but the simulation.
+  if (::dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL) == nullptr ||
+      !Simulated()) {
+    std::fprintf(stderr, "node_dedup_gpu_sim_test: the simulated driver is "
+                         "not the libcuda.so.1 the loader finds\n");
+    return 3;
+  }
+  ::testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}
+#endif  // DFKV_GPU_TEST_SIMULATED
