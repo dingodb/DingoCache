@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Server: a stopping `dfkv_server` gets its disks clean before it releases
+  memory. The clean marker used to be written by the disk stores' destructors,
+  which run after the RDMA registrations are released and the RAM tier arena is
+  unmapped; with a large arena that is tens of seconds during which a stop
+  timeout (SIGKILL) left every disk dirty, and a dirty disk is reset at the
+  next start. The order is now: stop RDMA and TCP requests, write the RAM
+  tier's backlog, sync all disks and mark them clean, then release memory.
+  - The disks sync at the same time instead of one after the other.
+  - The RAM tier's backlog gets `DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S` (default
+    30, as before). **Behaviour change:** when the time is up, what is still
+    only in RAM is dropped and the disks are closed clean; until now the
+    timeout only logged a warning and the flush went on without a limit, with
+    the clean marker behind it. Raise the setting (up to 3600) to keep the old
+    trade-off; keep it below the service manager's stop timeout.
+  - Every step logs one `shutdown: ...` line with its duration, the drain
+    reports its progress every 5 s, and `dfkv_server shut down cleanly ...
+    releasing memory` marks the point after which a kill is harmless.
+  - `KvNodeServer::Shutdown()`, `DiskCacheGroup::Close()`,
+    `StoreEngine::Close()`, `RamTier::StopBackground()` and
+    `RdmaServer::Quiesce()` are the pieces; `Stop()` and destruction behave as
+    before for embedders and tests that do not call them.
 - Server: the RAM tier arena is no longer registered as a whole with every
   RDMA rail. Nothing on the server referred to that registration any more
   (each zero-copy GET registers an exact MR over the value it serves; PUTs

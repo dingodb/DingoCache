@@ -195,6 +195,10 @@ class DiskSlabStore : public StoreEngine {
   // StartupError() includes the failing syscall's errno when applicable.
   explicit DiskSlabStore(Options opt, bool* ok = nullptr);
   ~DiskSlabStore();
+  // Stops the background threads, syncs payloads and table, and writes the
+  // clean marker. Split from the destructor so a server can have its disks
+  // clean before it spends time releasing memory; see StoreEngine::Close.
+  bool Close() override;
 
   DiskSlabStore(const DiskSlabStore&) = delete;
   DiskSlabStore& operator=(const DiskSlabStore&) = delete;
@@ -393,6 +397,8 @@ class DiskSlabStore : public StoreEngine {
   bool trust_failure_logged_ = false;
   std::atomic<bool> buffered_payload_written_{false};  // extents may be dirty
   int crash_slot_ = -1;              // RevokeAllTrustForCrash registration
+  bool closed_ = false;              // Close() ran; closed_clean_ is its result
+  bool closed_clean_ = false;
   // Outstanding asynchronous leases. The opaque id remains entirely internal:
   // ReadLease destruction routes it back through ReleaseReadLeaseThunk.
   struct PrepHold { BlockKey key; std::string fn; };

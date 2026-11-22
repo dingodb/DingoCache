@@ -459,6 +459,19 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
 }
 
 DiskSlabStore::~DiskSlabStore() {
+  Close();
+  for (int fd : extent_fds_)
+    if (fd >= 0) ::close(fd);
+  for (int fd : extent_dio_fds_)
+    if (fd >= 0) ::close(fd);
+  if (table_fd_ >= 0) ::close(table_fd_);
+  if (state_fd_ >= 0) ::close(state_fd_);
+  if (dir_fd_ >= 0) ::close(dir_fd_);  // releases the directory lock, last
+}
+
+bool DiskSlabStore::Close() {
+  if (closed_) return closed_clean_;
+  closed_ = true;
   if (reclaim_thread_.joinable()) {
     {
       std::lock_guard<std::mutex> lk(reclaim_mu_);
@@ -496,15 +509,13 @@ DiskSlabStore::~DiskSlabStore() {
   crash_slot_ = -1;
   // A clean start needs no token. The state is clean now and stays so: a
   // token that will not go away is harmless, the next run has another epoch.
-  if (clean && MarkCleanEpoch())
+  if (clean && MarkCleanEpoch()) {
     RevokeTrust(/*forfeit=*/true, /*withdraw=*/false);
-  for (int fd : extent_fds_)
-    if (fd >= 0) ::close(fd);
-  for (int fd : extent_dio_fds_)
-    if (fd >= 0) ::close(fd);
-  if (table_fd_ >= 0) ::close(table_fd_);
-  if (state_fd_ >= 0) ::close(state_fd_);
-  if (dir_fd_ >= 0) ::close(dir_fd_);  // releases the directory lock, last
+    closed_clean_ = true;
+  }
+  // The descriptors, and with them the directory lock, stay until the
+  // destructor: nothing else may open this directory while the object lives.
+  return closed_clean_;
 }
 
 bool DiskSlabStore::SetStartupError(std::string error) {

@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -280,8 +281,117 @@ Status KvNodeServer::Start(int port) {
   return Status::kOk;
 }
 
+namespace {
+uint64_t ShutdownDrainTimeoutSeconds() {
+  uint64_t timeout_seconds = 30;
+  if (const char* value = std::getenv("DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S")) {
+    const unsigned long parsed = std::strtoul(value, nullptr, 10);
+    if (parsed <= 3600) timeout_seconds = parsed;
+  }
+  return timeout_seconds;
+}
+
+std::string Seconds(std::chrono::steady_clock::time_point since) {
+  char text[32];
+  std::snprintf(text, sizeof(text), "%.2f s",
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - since).count());
+  return text;
+}
+}  // namespace
+
 void KvNodeServer::Stop() {
-  if (!running_.exchange(false)) return;  // idempotent
+  if (!StopRequests()) return;  // idempotent
+  if (ram_) {
+    const uint64_t timeout_seconds = ShutdownDrainTimeoutSeconds();
+    const bool drained = ram_->WaitForDrain(
+        std::chrono::seconds(timeout_seconds));
+    if (!drained) {
+      DFKV_LOG_WARN("RAM shutdown drain timed out after " +
+                    std::to_string(timeout_seconds) + "s with " +
+                    std::to_string(ram_->DirtyObjects()) +
+                    " dirty objects; destructor will continue safe draining");
+    }
+  }
+}
+
+bool KvNodeServer::Shutdown() {
+  if (shutdown_done_) return shutdown_clean_;
+  shutdown_done_ = true;
+  using Clock = std::chrono::steady_clock;
+  auto stage = Clock::now();
+  StopRequests();
+  DFKV_LOG_INFO("shutdown: TCP requests stopped in " + Seconds(stage));
+
+  if (ram_) {
+    stage = Clock::now();
+    const uint64_t timeout_seconds = ShutdownDrainTimeoutSeconds();
+    const auto deadline = stage + std::chrono::seconds(timeout_seconds);
+    const uint64_t objects_before = ram_->DirtyObjects();
+    const uint64_t bytes_before = ram_->DirtyBytes();
+    auto next_progress = stage + std::chrono::seconds(5);
+    bool drained = true;
+    while (ram_->DirtyObjects() != 0) {
+      const auto now = Clock::now();
+      if (now >= deadline) {
+        drained = false;
+        break;
+      }
+      if (now >= next_progress) {
+        DFKV_LOG_INFO("shutdown: RAM tier still has " +
+                      std::to_string(ram_->DirtyObjects()) + " objects (" +
+                      std::to_string(ram_->DirtyBytes()) +
+                      " bytes) to write to disk after " + Seconds(stage));
+        next_progress += std::chrono::seconds(5);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    // Stops the flushers: no disk write is in flight once this returns.
+    ram_->StopBackground(/*abandon_backlog=*/!drained);
+    if (drained) {
+      DFKV_LOG_INFO("shutdown: RAM tier written to disk (" +
+                    std::to_string(objects_before) + " objects, " +
+                    std::to_string(bytes_before) + " bytes) in " +
+                    Seconds(stage));
+    } else {
+      DFKV_LOG_WARN(
+          "shutdown: RAM tier not written to disk within " +
+          std::to_string(timeout_seconds) +
+          " s (DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S); dropping the " +
+          std::to_string(ram_->DirtyObjects()) + " objects (" +
+          std::to_string(ram_->DirtyBytes()) +
+          " bytes) that are only in RAM, of " +
+          std::to_string(objects_before) + " (" +
+          std::to_string(bytes_before) + " bytes) at the start");
+    }
+  }
+
+  stage = Clock::now();
+  size_t clean = 0;
+  const auto report = group_.Close();
+  for (const auto& disk : report) {
+    char seconds[32];
+    std::snprintf(seconds, sizeof(seconds), "%.2f s", disk.seconds);
+    if (disk.clean) {
+      ++clean;
+      DFKV_LOG_INFO("shutdown: disk " + disk.dir + " synced and clean in " +
+                    seconds);
+    } else {
+      DFKV_LOG_WARN("shutdown: disk " + disk.dir +
+                    " could not record a clean shutdown (" + seconds +
+                    "); its cache is reset at the next start unless "
+                    "DFKV_SLAB_WARM_RESTART keeps it");
+    }
+  }
+  DFKV_LOG_INFO("shutdown: " + std::to_string(clean) + " of " +
+                std::to_string(report.size()) + " disks clean in " +
+                Seconds(stage));
+  shutdown_clean_ = clean == report.size();
+  return shutdown_clean_;
+}
+
+bool KvNodeServer::StopRequests() {
+  if (!running_.exchange(false)) return false;  // idempotent
   // shutdown() (a read of listen_fd_) unblocks accept(); join the accept loop so
   // there is no concurrent reader before we mutate/close listen_fd_.
   if (listen_fd_ >= 0) ::shutdown(listen_fd_, SHUT_RDWR);
@@ -298,22 +408,7 @@ void KvNodeServer::Stop() {
   }
   for (int fd : fds) ::shutdown(fd, SHUT_RDWR);
   for (auto& c : conns) if (c.th.joinable()) c.th.join();
-  if (ram_) {
-    uint64_t timeout_seconds = 30;
-    if (const char* value =
-            std::getenv("DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S")) {
-      const unsigned long parsed = std::strtoul(value, nullptr, 10);
-      if (parsed <= 3600) timeout_seconds = parsed;
-    }
-    const bool drained = ram_->WaitForDrain(
-        std::chrono::seconds(timeout_seconds));
-    if (!drained) {
-      DFKV_LOG_WARN("RAM shutdown drain timed out after " +
-                    std::to_string(timeout_seconds) + "s with " +
-                    std::to_string(ram_->DirtyObjects()) +
-                    " dirty objects; destructor will continue safe draining");
-    }
-  }
+  return true;
 }
 
 void KvNodeServer::ReapDoneLocked() {

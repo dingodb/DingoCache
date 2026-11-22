@@ -36,6 +36,17 @@ class KvNodeServer {
 
   Status Start(int port);  // port 0 => ephemeral; query with port()
   void Stop();
+  // The last thing a process does with this server before it exits: Stop(),
+  // then get the disks to a clean state before any memory is released.
+  //  1. The RAM tier gets DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S (default 30) to
+  //     write its backlog to disk. What has not made it by then is dropped:
+  //     it is a cache, and a stop that outlives the service manager's timeout
+  //     loses every disk's cache instead of the newest few objects.
+  //  2. All disks sync and record a clean shutdown, at the same time.
+  // Each step is logged with its duration. Returns true if every disk is
+  // clean. Precondition: whatever else calls into this server (an RDMA server)
+  // has been stopped. Afterwards the server can only be destroyed.
+  bool Shutdown();
   // Cluster member list this node advertises for discovery (kMembers wire op):
   // "name=ip:port,name=ip:port,...". Clients query any node to learn the cluster.
   void set_members(const std::string& members) { members_ = members; }
@@ -172,6 +183,9 @@ class KvNodeServer {
                                 Status result, size_t bytes_read,
                                 double elapsed_sec, const char* data) noexcept;
   void AcceptLoop();
+  // Closes the listener and joins every handler thread; false if that had
+  // been done already.
+  bool StopRequests();
   // accepted_at stamps the accept() return so the first complete request frame
   // is due within DFKV_TCP_FIRST_REQ_MS of ACCEPT, not of handler scheduling.
   void Handle(int fd, std::chrono::steady_clock::time_point accepted_at);
@@ -277,6 +291,8 @@ class KvNodeServer {
   int listen_fd_ = -1;
   int port_ = 0;
   std::atomic<bool> running_{false};
+  bool shutdown_done_ = false;       // Shutdown() ran; shutdown_clean_ is its result
+  bool shutdown_clean_ = false;
   std::atomic<size_t> accept_count_{0};
   std::thread accept_thread_;
   // connection drain: track per-connection handler threads + their fds so Stop()

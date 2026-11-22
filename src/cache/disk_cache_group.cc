@@ -10,6 +10,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <thread>
 
 #include "cache/disk_slab_store.h"
 #include "common/config_dump.h"
@@ -313,6 +314,28 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
                   ", points min=" + std::to_string(min_points) +
                   " max=" + std::to_string(max_points));
   }
+}
+
+DiskCacheGroup::~DiskCacheGroup() { Close(); }
+
+std::vector<DiskCacheGroup::CloseReport> DiskCacheGroup::Close() {
+  std::vector<CloseReport> report;
+  if (closed_) return report;
+  closed_ = true;
+  report.resize(disks_.size());
+  auto close_one = [this, &report](size_t i) {
+    const auto started = std::chrono::steady_clock::now();
+    report[i].dir = disks_[i]->Dir();
+    report[i].clean = disks_[i]->Close();
+    report[i].seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+  };
+  std::vector<std::thread> helpers;
+  helpers.reserve(disks_.empty() ? 0 : disks_.size() - 1);
+  for (size_t i = 1; i < disks_.size(); ++i) helpers.emplace_back(close_one, i);
+  if (!disks_.empty()) close_one(0);
+  for (auto& helper : helpers) helper.join();
+  return report;
 }
 
 bool DiskCacheGroup::Healthy() const {

@@ -287,6 +287,13 @@ size-class lattice and carves them into uniform slots:
   are rejected and cleared durably; metadata I/O failure fails the store closed.
   Format/geometry mismatches are refused without rewriting existing data. The
   directory itself is `flock`ed: one process per cache directory.
+- **Shutdown order:** on SIGTERM `dfkv_server` stops RDMA and TCP requests,
+  gives the RAM tier `DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S` (default 30) to write
+  its backlog (what is still only in RAM after that is dropped), then syncs
+  all disks at the same time and marks them clean (`KvNodeServer::Shutdown`,
+  `DiskCacheGroup::Close`, `StoreEngine::Close`). Memory (RDMA registrations,
+  the RAM tier arena) is released only after that, so a stop that is killed
+  while unmapping a large arena still finds a clean cache at the next start.
 - **Unclean exit:** a dirty epoch at startup means the previous process did not
   shut down. By default (`DFKV_SLAB_WARM_RESTART=off`) the table is reset, as in
   every release up to 2.35. With `auto` it is kept when the kernel that held the

@@ -41,6 +41,16 @@ class DiskCacheGroup {
   };
 
   explicit DiskCacheGroup(Options opt);
+  ~DiskCacheGroup();
+  // Closes every disk (StoreEngine::Close), all of them at the same time: each
+  // waits on its own device. Same precondition as destruction; the destructor
+  // calls it if nobody did. Reports one entry per disk, none on a second call.
+  struct CloseReport {
+    std::string dir;
+    bool clean = false;
+    double seconds = 0;
+  };
+  std::vector<CloseReport> Close();
   bool Healthy() const;
   const std::string& StartupError() const { return startup_error_; }
 
@@ -140,6 +150,7 @@ class DiskCacheGroup {
                             uint64_t additional) const;
   void RecordQuotaRejectionLocked(uint64_t tenant_hash);
   bool healthy_ = true;
+  bool closed_ = false;
   std::string startup_error_;
   std::string engine_;      // resolved backend name (see EngineName)
   std::string write_mode_;  // resolved slab I/O mode (see WriteMode)

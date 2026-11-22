@@ -145,6 +145,66 @@ TEST(RamTier, ShutdownDrainTimeoutAndAckDurabilityLatencyAreObservable) {
             std::string::npos);
 }
 
+// A stopping server gives the backlog a time limit. When it runs out, the
+// flushers finish what they hold and leave the rest: nothing is written after
+// StopBackground returns, and destruction does not resume the drain.
+TEST(RamTier, StopBackgroundCanLeaveTheBacklogBehind) {
+  FlushSink sink;
+  sink.close();
+  constexpr int kObjects = 12;
+  const std::string value(4096, 'b');
+  {
+    RamTier rt(Opts(64 * 4096), sink.fn());
+    OpenFlushOnExit cleanup{sink};
+    ASSERT_TRUE(rt.ok());
+    ASSERT_EQ(rt.flusher_count(), 1u);
+    // The flusher takes the first object alone and blocks in the sink; the
+    // others queue behind it.
+    ASSERT_EQ(rt.PutWriteBack(K(100), value.data(), value.size()).status,
+              Status::kOk);
+    ASSERT_TRUE(sink.await_calls(1));
+    for (int i = 1; i < kObjects; ++i)
+      ASSERT_EQ(rt.PutWriteBack(K(100 + i), value.data(), value.size()).status,
+                Status::kOk);
+    ASSERT_EQ(rt.DirtyObjects(), static_cast<uint64_t>(kObjects));
+
+    std::thread stopper([&] { rt.StopBackground(/*abandon_backlog=*/true); });
+    ASSERT_TRUE(WaitFor([&] { return rt.background_stopping(); }));
+    sink.open();
+    stopper.join();
+
+    EXPECT_EQ(sink.calls, 1);  // the object in hand, and only that one
+    EXPECT_EQ(rt.DirtyObjects(), static_cast<uint64_t>(kObjects - 1));
+    rt.StopBackground(/*abandon_backlog=*/false);  // already stopped: no drain
+    EXPECT_EQ(rt.DirtyObjects(), static_cast<uint64_t>(kObjects - 1));
+    // The values are still readable from RAM until the tier goes away.
+    RamTier::Hit hit;
+    ASSERT_TRUE(rt.GetPrep(K(100 + kObjects - 1), 0, value.size(), &hit));
+    EXPECT_EQ(std::string(hit.ptr, hit.len), value);
+  }
+  EXPECT_EQ(sink.calls, 1);  // the destructor wrote nothing either
+}
+
+TEST(RamTier, StopBackgroundWritesTheBacklogUnlessToldOtherwise) {
+  FlushSink sink;
+  sink.close();
+  constexpr int kObjects = 12;
+  const std::string value(4096, 'w');
+  RamTier rt(Opts(64 * 4096), sink.fn());
+  OpenFlushOnExit cleanup{sink};
+  ASSERT_TRUE(rt.ok());
+  for (int i = 0; i < kObjects; ++i)
+    ASSERT_EQ(rt.PutWriteBack(K(200 + i), value.data(), value.size()).status,
+              Status::kOk);
+  std::thread stopper([&] { rt.StopBackground(/*abandon_backlog=*/false); });
+  ASSERT_TRUE(WaitFor([&] { return rt.background_stopping(); }));
+  sink.open();
+  stopper.join();
+  EXPECT_EQ(rt.DirtyObjects(), 0u);
+  std::lock_guard<std::mutex> lock(sink.m);
+  EXPECT_EQ(sink.flushed.size(), static_cast<size_t>(kObjects));
+}
+
 TEST(RamTier, TenantIdentityIsPartOfResidentKey) {
   FlushSink sink;
   RamTier rt(Opts(64 * 4096), sink.fn());

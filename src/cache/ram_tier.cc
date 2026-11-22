@@ -275,6 +275,11 @@ RamTier::RamTier(Options opt, FlushFn flush)
 }
 
 RamTier::~RamTier() {
+  StopBackground(/*abandon_backlog=*/false);
+  if (arena_) std::free(arena_);
+}
+
+void RamTier::StopBackground(bool abandon_backlog) {
   if (reclaim_thread_.joinable()) {
     { std::lock_guard<std::mutex> lk(reclaim_mu_); reclaim_stop_ = true; }
     reclaim_cv_.notify_all();
@@ -283,10 +288,11 @@ RamTier::~RamTier() {
   for (auto& sh : shards_) {
     std::lock_guard<std::mutex> lk(sh->mu);
     sh->stop = true;
+    if (abandon_backlog) sh->abandon = true;
   }
+  background_stopping_.store(true, std::memory_order_release);
   for (auto& sh : shards_) sh->cv.notify_all();
   for (auto& f : flushers_) if (f.joinable()) f.join();
-  if (arena_) std::free(arena_);
 }
 
 bool RamTier::WaitForDrain(std::chrono::milliseconds timeout) {
@@ -1111,7 +1117,7 @@ void RamTier::FlushLoop(Shard& s) {
     {
       std::unique_lock<std::mutex> lk(s.mu);
       s.cv.wait(lk, [&s] { return s.stop || !s.flushq.empty(); });
-      if (s.stop && s.flushq.empty()) return;
+      if (s.stop && (s.abandon || s.flushq.empty())) return;
       const size_t capacity = std::min(s.flushq.size(), kFlushBatchMax);
       batch.reserve(capacity);
       items.reserve(capacity);

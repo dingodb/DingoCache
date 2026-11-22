@@ -8,6 +8,9 @@
 
 #include <gtest/gtest.h>
 
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
@@ -72,6 +75,12 @@ class KvNodeServerWiringTestPeer {
   }
   static bool DropRam(KvNodeServer& server, const BlockKey& key) {
     return server.ram_->Remove(key);
+  }
+  static bool RamStopping(KvNodeServer& server) {
+    return server.ram_->background_stopping();
+  }
+  static uint64_t RamDirty(KvNodeServer& server) {
+    return server.ram_->DirtyObjects();
   }
 };
 }  // namespace dfkv
@@ -874,3 +883,125 @@ TEST(RamTierWiring, PreparedReadCountsRamMissesAndOwnsRamPin) {
   ::unsetenv("DFKV_RAM_TIER_BYTES");
   fs::remove_all(dir);
 }
+
+namespace {
+// What a stopping dfkv_server relies on: once Shutdown() has returned, the
+// disks are clean whatever happens to the process next. The child leaves
+// through _exit, as if it had been killed while releasing its memory.
+TEST(RamTierWiring, ShutdownLeavesTheDisksCleanWithoutDestruction) {
+  ::unsetenv("DFKV_RAM_TIER");
+  ::unsetenv("DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S");
+  const auto dir = fs::temp_directory_path() / "dfkv_shutdown_clean";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  constexpr int kObjects = 10;
+  const std::string value(2000, 's');
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    auto server = KvNodeServerWiringTestPeer::Create(
+        DiskCacheGroup::Options{{dir.string()}, 1ull << 30});
+    auto* node = server.get();
+    KvNodeServerWiringTestPeer::SetRam(
+        *server,
+        [node](const BlockKey& key, char* data, size_t len, size_t) {
+          return KvNodeServerWiringTestPeer::Persist(*node, key, data, len) ==
+                 Status::kOk;
+        },
+        /*ram_ack=*/true);
+    bool ok = server->Start(0) == Status::kOk;
+    for (int i = 0; ok && i < kObjects; ++i) {
+      std::string out;
+      ok = server->ProcessRequestForKey(
+               static_cast<uint8_t>(WireOp::kCache), BlockKey{7300u + i, 0}, 0,
+               0, value.data(), value.size(), &out) == Status::kOk;
+    }
+    ok = ok && server->Shutdown();
+    ok = ok && server->Shutdown();  // idempotent, same answer
+    ok = ok && KvNodeServerWiringTestPeer::RamDirty(*server) == 0;
+    ::_exit(ok ? 0 : 1);
+  }
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFEXITED(status));
+  ASSERT_EQ(WEXITSTATUS(status), 0);
+
+  // An unclean state would have reset the cache (warm restart is off).
+  KvNodeServer reopened(dir.string(), 1ull << 30);
+  for (int i = 0; i < kObjects; ++i) {
+    std::string out;
+    ASSERT_EQ(KvNodeServerWiringTestPeer::DiskRead(
+                  reopened, BlockKey{7300u + i, 0}, &out),
+              Status::kOk)
+        << i;
+    EXPECT_EQ(out, value);
+  }
+  fs::remove_all(dir);
+}
+
+// The backlog gets DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S. What is still only in
+// RAM after that is dropped, and the disks are closed clean all the same; no
+// flush runs after Shutdown() returned.
+TEST(RamTierWiring, ShutdownDropsWhatMissesTheDrainTimeout) {
+  ::unsetenv("DFKV_RAM_TIER");
+  ::setenv("DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S", "0", 1);
+  const auto dir = fs::temp_directory_path() / "dfkv_shutdown_abandon";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  constexpr int kObjects = 6;
+  const std::string value(2000, 'a');
+  FlushBarrier barrier;
+  std::atomic<int> flushes{0};
+  {
+    auto server = KvNodeServerWiringTestPeer::Create(
+        DiskCacheGroup::Options{{dir.string()}, 1ull << 30});
+    auto* node = server.get();
+    OpenFlushOnExit cleanup{barrier};
+    KvNodeServerWiringTestPeer::SetRam(
+        *server,
+        [&, node](const BlockKey& key, char* data, size_t len, size_t) {
+          barrier.Block();
+          flushes.fetch_add(1);
+          return KvNodeServerWiringTestPeer::Persist(*node, key, data, len) ==
+                 Status::kOk;
+        },
+        /*ram_ack=*/true);
+    auto put = [&](int i) {
+      std::string out;
+      return server->ProcessRequestForKey(
+          static_cast<uint8_t>(WireOp::kCache), BlockKey{7400u + i, 0}, 0, 0,
+          value.data(), value.size(), &out);
+    };
+    // The flusher holds the first object, blocked; the others queue behind it.
+    ASSERT_EQ(put(0), Status::kOk);
+    ASSERT_TRUE(barrier.AwaitEntry());
+    for (int i = 1; i < kObjects; ++i) ASSERT_EQ(put(i), Status::kOk);
+
+    bool clean = false;
+    std::thread stopper([&] { clean = server->Shutdown(); });
+    ASSERT_TRUE(WaitFor(
+        [&] { return KvNodeServerWiringTestPeer::RamStopping(*server); }));
+    barrier.Open();
+    stopper.join();
+    EXPECT_TRUE(clean);
+    EXPECT_EQ(flushes.load(), 1);
+    EXPECT_EQ(KvNodeServerWiringTestPeer::RamDirty(*server),
+              static_cast<uint64_t>(kObjects - 1));
+  }
+  ::unsetenv("DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S");
+  EXPECT_EQ(flushes.load(), 1);  // destruction did not resume the drain
+
+  KvNodeServer reopened(dir.string(), 1ull << 30);
+  std::string out;
+  EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(reopened, BlockKey{7400, 0},
+                                                 &out),
+            Status::kOk);
+  EXPECT_EQ(out, value);
+  for (int i = 1; i < kObjects; ++i)
+    EXPECT_EQ(KvNodeServerWiringTestPeer::DiskRead(
+                  reopened, BlockKey{7400u + i, 0}, &out),
+              Status::kNotFound)
+        << i;
+  fs::remove_all(dir);
+}
+}  // namespace

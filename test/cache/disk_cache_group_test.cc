@@ -52,6 +52,12 @@ struct BatchProbe {
   bool release = false;
   std::vector<std::thread::id> threads;
   std::vector<size_t> calls_by_disk;
+  // Close(): each engine stays inside until `close_overlap` of them are.
+  size_t close_calls = 0;
+  size_t close_active = 0;
+  size_t close_max_active = 0;
+  size_t close_overlap = 0;
+  std::set<size_t> unclean_disks;
 };
 
 class ScopedEnv {
@@ -124,6 +130,19 @@ class ProbeEngine final : public StoreEngine {
   uint64_t Evictions() const override { return 0; }
   uint64_t EvictedBytes() const override { return 0; }
   const std::string& Dir() const override { return dir_; }
+  bool Close() override {
+    std::unique_lock<std::mutex> lock(probe_->mu);
+    ++probe_->close_calls;
+    ++probe_->close_active;
+    probe_->close_max_active =
+        std::max(probe_->close_max_active, probe_->close_active);
+    probe_->cv.notify_all();
+    probe_->cv.wait_for(lock, std::chrono::seconds(10), [&] {
+      return probe_->close_max_active >= probe_->close_overlap;
+    });
+    --probe_->close_active;
+    return probe_->unclean_disks.count(disk_) == 0;
+  }
 
  private:
   std::string dir_;
@@ -488,4 +507,61 @@ TEST_F(DiskGroupTest, ConfiguredQuotaFileFailsClosed) {
     EXPECT_FALSE(group.Healthy());
     EXPECT_NE(group.StartupError().find("malformed"), std::string::npos);
   }
+}
+
+// Close() is what a stopping server waits for before it releases memory: the
+// disks must not queue behind one another, and the caller has to learn which
+// of them did not get clean.
+TEST_F(DiskGroupTest, CloseRunsOnAllDisksAtOnceAndReportsEachOne) {
+  const auto dirs = Dirs(4);
+  auto probe = std::make_shared<BatchProbe>();
+  probe->close_overlap = dirs.size();
+  probe->unclean_disks = {2};
+  DiskCacheGroup::Options options;
+  options.cache_dirs = dirs;
+  options.capacity_bytes = 1ull << 30;
+  options.engine = "file";
+  options.engine_factory = [probe, dirs](const std::string& dir, uint64_t) {
+    const size_t disk = static_cast<size_t>(
+        std::find(dirs.begin(), dirs.end(), dir) - dirs.begin());
+    return std::make_unique<ProbeEngine>(dir, disk, probe);
+  };
+  {
+    DiskCacheGroup group(std::move(options));
+    ASSERT_TRUE(group.Healthy());
+    const auto report = group.Close();
+    ASSERT_EQ(report.size(), dirs.size());
+    for (size_t i = 0; i < dirs.size(); ++i) {
+      EXPECT_EQ(report[i].dir, dirs[i]);
+      EXPECT_EQ(report[i].clean, i != 2) << i;
+      // An engine leaves Close() only once all four are inside, or after its
+      // 10 s wait: disks closed one after the other would each take that long.
+      EXPECT_LT(report[i].seconds, 5.0) << i;
+    }
+    {
+      std::lock_guard<std::mutex> lock(probe->mu);
+      EXPECT_EQ(probe->close_max_active, dirs.size());
+      EXPECT_EQ(probe->close_calls, dirs.size());
+    }
+    EXPECT_TRUE(group.Close().empty());  // nothing left to close
+  }
+  std::lock_guard<std::mutex> lock(probe->mu);
+  EXPECT_EQ(probe->close_calls, dirs.size());  // the destructor did not repeat it
+}
+
+TEST_F(DiskGroupTest, DestructionClosesDisksThatNobodyClosed) {
+  const auto dirs = Dirs(3);
+  auto probe = std::make_shared<BatchProbe>();
+  probe->close_overlap = dirs.size();
+  DiskCacheGroup::Options options;
+  options.cache_dirs = dirs;
+  options.capacity_bytes = 1ull << 30;
+  options.engine = "file";
+  options.engine_factory = [probe](const std::string& dir, uint64_t) {
+    return std::make_unique<ProbeEngine>(dir, 0, probe);
+  };
+  { DiskCacheGroup group(std::move(options)); }
+  std::lock_guard<std::mutex> lock(probe->mu);
+  EXPECT_EQ(probe->close_calls, dirs.size());
+  EXPECT_EQ(probe->close_max_active, dirs.size());
 }
