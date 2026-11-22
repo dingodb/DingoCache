@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- SGLang HiCache connector: a side pool with one object per page is taken as
+  the same on every TP rank only for an MLA model. For any model it was
+  stored under one key shared by all TP ranks. An MHA model's single-buffer
+  side pool can hold each rank's own heads: the sparse index-K pool of a
+  model with sparse attention splits its index heads over TP. Every rank
+  then wrote its heads under the same key, the last write won, and a rank
+  read another rank's heads back at the right size as a hit. Such pools of
+  non-MLA models are now stored per TP rank and written by every rank, and
+  the same holds for device-form sidecars of L2-bypass; a device sidecar
+  registered after its host pool under the same name keeps the host pool's
+  layout (registrations that disagree are refused). Their keys change: one
+  cold start for those pools. Stored per rank they take tp_size times the L3
+  capacity they took under one shared key. MLA models are unchanged.
 - SGLang HiCache connector, device-direct (L2-bypass): the ordering fence
   after a read orders the GPU the bytes landed on. It synchronized the
   calling thread's current CUDA device, which is per thread; SGLang's

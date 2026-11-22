@@ -42,6 +42,7 @@ class _Pool:
 def _backend():
     st = dfkv_hicache.DfkvHiCache.__new__(dfkv_hicache.DfkvHiCache)
     st._alog_tag = "r0"
+    st.is_mla = True  # the indexer pools here belong to an MLA (DSA) model
     st._validate_pool_object_sizes = lambda sizes, context: None
     st._register_pool_buffers = lambda pool: 0
     return st
