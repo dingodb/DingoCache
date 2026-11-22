@@ -616,10 +616,15 @@ void SlabAllocator::FreeSlotLocked(uint32_t index) {
 }
 
 bool SlabAllocator::EvictOneFrom(size_t cls_index,
-                                 std::vector<BlockKey>* evicted) {
+                                 std::vector<BlockKey>* evicted,
+                                 size_t* cleared) {
   Class& cls = classes_[cls_index];
   if (cls.resident_count == 0) return false;
   const size_t limit = 2 * cls.resident_count + 2;
+  // Only cleared bits count against evict_clear_limit: pinned and retained
+  // residents are skipped under `limit` alone, so a run of them at the hand
+  // cannot hide an evictable resident behind it.
+  size_t clears = 0;
   uint32_t fallback = kNoSlot;
   for (size_t steps = 0; steps < limit && cls.resident_count != 0; ++steps) {
     if (cls.hand == kNoSlot) cls.hand = cls.ring_head;
@@ -634,6 +639,8 @@ bool SlabAllocator::EvictOneFrom(size_t cls_index,
     if (fallback == kNoSlot) fallback = current;
     if (meta.referenced) {
       meta.referenced = false;
+      if (cleared) ++*cleared;
+      if (++clears == opt_.evict_clear_limit) break;  // never true for 0
       continue;
     }
     if (opt_.on_slot_evict && !opt_.on_slot_evict(meta.ref)) return false;
@@ -798,9 +805,11 @@ bool SlabAllocator::Put(const BlockKey& key, size_t len, SlotRef* out,
       if (grow == ExtentBindResult::kBound) continue;
       if (grow == ExtentBindResult::kPersistenceError) return false;
     }
-    const ExtentBindResult cold = StealColdExtentFor(cls_index, evicted);
-    if (cold == ExtentBindResult::kBound) continue;
-    if (cold == ExtentBindResult::kPersistenceError) return false;
+    if (!cls.reclaim_clear_limited) {
+      const ExtentBindResult cold = StealColdExtentFor(cls_index, evicted);
+      if (cold == ExtentBindResult::kBound) continue;
+      if (cold == ExtentBindResult::kPersistenceError) return false;
+    }
     if (EvictOneFrom(cls_index, evicted)) continue;
     const ExtentBindResult steal = StealExtentFor(cls_index, evicted);
     if (steal == ExtentBindResult::kBound) continue;
@@ -922,6 +931,18 @@ bool SlabAllocator::Pin(const BlockKey& key, SlotHandle handle) {
   return true;
 }
 
+bool SlabAllocator::PinForRead(const BlockKey& key, SlotHandle handle) {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (!handle.valid() || handle.index >= slots_.size()) return false;
+  SlotMeta& meta = slots_[handle.index];
+  if (!meta.live || !(meta.key == key) || meta.remove_pending) return false;
+  if (meta.refs == 0) ++extents_[meta.ref.extent].pinned;
+  ++meta.refs;
+  // Repeated reads of a hot resident find the bit set and store nothing.
+  if (!meta.referenced) meta.referenced = true;
+  return true;
+}
+
 bool SlabAllocator::Unpin(const BlockKey& key, SlotHandle handle) {
   std::lock_guard<std::mutex> lock(mu_);
   if (!handle.valid() || handle.index >= slots_.size()) return false;
@@ -979,17 +1000,26 @@ size_t SlabAllocator::ColdestGrowDonor(const std::vector<ClassStat>& classes,
 
 size_t SlabAllocator::ReclaimClass(size_t cls_index, size_t target_free,
                                    size_t max_victims,
-                                   std::vector<BlockKey>* evicted) {
+                                   std::vector<BlockKey>* evicted,
+                                   bool* clear_limited) {
   std::lock_guard<std::mutex> lock(mu_);
+  if (clear_limited) *clear_limited = false;
   if (cls_index >= classes_.size()) return 0;
   Class& cls = classes_[cls_index];
+  cls.reclaim_clear_limited = false;
   size_t count = 0;
+  size_t cleared = 0;
   while (count < max_victims && cls.free_count < target_free) {
     if (unbound_ > 0) break;
     const size_t before = cls.free_count;
-    if (!EvictOneFrom(cls_index, evicted)) break;
+    if (!EvictOneFrom(cls_index, evicted, &cleared)) break;
     ++count;
     if (cls.free_count <= before) break;
+    if (opt_.evict_clear_limit != 0 && cleared >= opt_.evict_clear_limit) {
+      cls.reclaim_clear_limited = cls.free_count < target_free;
+      if (clear_limited) *clear_limited = cls.reclaim_clear_limited;
+      break;
+    }
   }
   return count;
 }

@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <thread>
 
 #include "utils/log.h"
 #include "common/config_dump.h"
@@ -334,6 +335,7 @@ RamTier::RamTier(Options opt, FlushFn flush)
         static_cast<uint32_t>(shard_extents);
     allocator_options.align = opt_.slot_granularity;
     allocator_options.max_waste = 0.25;
+    allocator_options.evict_clear_limit = kEvictClearLimit;
     shard->alloc =
         std::make_unique<SlabAllocator>(allocator_options);
     shards_.push_back(std::move(shard));
@@ -468,20 +470,33 @@ void RamTier::ReclaimTick(Shard& s, size_t /*shard_idx*/) {
     target = std::min(target, capacity / 4);
     if (c.free_slots >= target) continue;
     size_t budget = 4096;  // per-tick per-class bound
+    size_t clear_limited_calls = 0;
     for (;;) {
       std::vector<BlockKey> evicted;
       const size_t batch = std::min<size_t>(64, budget);
       size_t got;
+      bool clear_limited = false;
       {
         std::lock_guard<std::mutex> lk(s.mu);
-        got = s.alloc->ReclaimClass(i, target, batch, &evicted);
+        got = s.alloc->ReclaimClass(i, target, batch, &evicted, &clear_limited);
         EraseEvictedLocked(s, evicted);
       }
       if (got > 0) reclaimed_.fetch_add(got, std::memory_order_relaxed);
       budget -= std::min(budget, got);
+      if (budget == 0) break;
+      // A call cut short by its reference-clearing bound has freed as little
+      // as one slot. Continue the sweep in further short lock holds, up to a
+      // cap per tick; beyond it admissions evict inline, from this class (the
+      // allocator remembers that the last call ended this way). std::mutex is
+      // not fair: yield so a read waiting on the shard lock gets it first.
+      if (clear_limited) {
+        if (++clear_limited_calls >= kReclaimClearLimitedCalls) break;
+        std::this_thread::yield();
+        continue;
+      }
       // Partial batch = ReclaimClass stopped early (target reached, everything
       // pinned, or its cascade-shrink guard fired) -- don't re-invoke.
-      if (got < batch || budget == 0) break;
+      if (got < batch) break;
     }
   }
 }
@@ -1065,7 +1080,9 @@ bool RamTier::GetPrep(const BlockKey& key, uint64_t offset, uint64_t length,
   const uint64_t n = std::min(length == 0 ? avail : length, avail);
   if (out) {
     if (e.in_arena()) {
-      if (!s.alloc->Pin(key, e.slot_handle)) return false;
+      // The transfer pin is also the read's CLOCK reference: without it the
+      // class hand never sees a read and eviction is FIFO by admission.
+      if (!s.alloc->PinForRead(key, e.slot_handle)) return false;
     }
     ++e.send_pins;
     out->ptr = e.data(arena_) + start;

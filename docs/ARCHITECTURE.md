@@ -500,6 +500,35 @@ removes readiness. Only a DURABLE idle slot may be capacity-evicted. Requested
 arena allocation or an unsupported NUMA mode rejects startup instead of
 silently running disk-only.
 
+**Eviction order**: among DURABLE idle arena slots, each size class of a shard
+evicts by CLOCK second chance. A new slot is linked just behind the class hand,
+so unread slots leave in admission order. A GET served from RAM sets the
+slot's reference bit; when the hand reaches a referenced slot it clears the
+bit and moves on. A value read at least once per lap of the hand over its
+class therefore stays resident, and a value that stops being read is evicted
+within one further lap. The sweep runs under the shard lock that every read
+of that shard takes, so one eviction clears at most 512 reference bits: if it
+has found no unreferenced slot by then, it evicts the first evictable slot it
+met in that sweep (now unreferenced) and leaves the hand where it stopped.
+Pinned slots are skipped without counting against that bound. A background
+reclaim call ends once it has cleared 512 bits and releases the shard lock;
+the reclaimer then yields and calls again, up to 64 such calls per class and
+tick. While 512 referenced slots stand at the hand each call frees one slot,
+so a tick frees at most 64 slots per class and shard until the sweep has
+passed them. Admissions beyond that evict inline under the same bound, and
+from their own class: they do not take a cold extent from another size
+class, which an admission without a free slot otherwise tries first. The
+cost is that a run of 512 referenced slots
+at the hand loses its oldest member even when an unreferenced slot lies
+further on, and that in a class where nearly every slot is referenced the
+hand laps up to 512 times faster than slots are evicted, so a value must be
+read correspondingly more often to keep its bit. Only GETs that are served
+from an arena slot set the bit; existence probes and values larger than one
+extent do not. Reads set only that bit: they do not
+reorder the ring, and they do not contribute to the read heat that
+whole-extent rebalancing between size classes consults, which in the RAM tier
+still reflects writes only.
+
 Observability: `dfkv_ram_hit/miss/put/put_bypass/flushed/flush_dropped/
 evictions_total`, `dfkv_ram_healthy`, actual `dfkv_ram_flush_threads`,
 object/backlog gauges, and explicit total/arena/dedicated budget/usage gauges
