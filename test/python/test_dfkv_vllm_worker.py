@@ -50,6 +50,7 @@ def _install_runtime_dependency_stubs() -> None:
         zmq_module.REQ = 1
         zmq_module.REP = 2
         zmq_module.RCVTIMEO = 3
+        zmq_module.SNDTIMEO = 4
         sys.modules["zmq"] = zmq_module
 
 
@@ -331,6 +332,9 @@ class _ControlledLookupSocket:
         self.send_count = {value: 0 for value in token_lengths}
         self._local = threading.local()
         self.closed = False
+
+    def setsockopt(self, _option, _value) -> None:
+        pass
 
     def send_multipart(self, frames, copy=False) -> None:
         del copy

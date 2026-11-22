@@ -392,6 +392,10 @@ MAX_LOAD_WINDOW_MIN_KEYS = 65536
 # the retention REFRESH it carries) for this long instead of re-probing.
 DEFAULT_LOOKUP_CACHE_TTL_MS = 1000
 MAX_LOOKUP_CACHE_TTL_MS = 60000
+# A lookup the rank-0 server does not answer in time is a miss; 0 = wait
+# forever (the scheduler then hangs with a hung or dead rank 0).
+DEFAULT_LOOKUP_TIMEOUT_MS = 10000
+MAX_LOOKUP_TIMEOUT_MS = 600000
 _TRANSFER_STOP = object()
 
 
@@ -472,6 +476,22 @@ def _parse_lookup_cache_ttl_ms(value: Any) -> int:
             f"[0, {MAX_LOOKUP_CACHE_TTL_MS}], got {ttl_ms}"
         )
     return ttl_ms
+
+def _parse_lookup_timeout_ms(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("lookup_timeout_ms must be an integer")
+    if isinstance(value, int):
+        timeout_ms = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        timeout_ms = int(value.strip())
+    else:
+        raise ValueError("lookup_timeout_ms must be an integer")
+    if not 0 <= timeout_ms <= MAX_LOOKUP_TIMEOUT_MS:
+        raise ValueError(
+            "lookup_timeout_ms must be in "
+            f"[0, {MAX_LOOKUP_TIMEOUT_MS}], got {timeout_ms}"
+        )
+    return timeout_ms
 
 def _load_windows(
     length: int,
@@ -3457,28 +3477,66 @@ class LookupKeyClient:
         self._results: dict[
             str, tuple[tuple[int, int], tuple[int, int], float]
         ] = {}
+        self._timeout_ms = _parse_lookup_timeout_ms(
+            extra_config.get("lookup_timeout_ms", DEFAULT_LOOKUP_TIMEOUT_MS)
+        )
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
         self._close_lock = threading.Lock()
         self._closed = False
-        socket_path = get_zmq_rpc_path_lookup(vllm_config)
-        self.socket = make_zmq_socket(
-            self.ctx,
-            socket_path,
-            zmq.REQ,  # type: ignore[attr-defined]
-            bind=False,
-        )
+        # After an unanswered lookup, rank 0 is presumed unavailable until
+        # this clock value: lookups are misses at once instead of each
+        # waiting a full timeout in turn on the single socket thread.
+        self._unavailable_until = 0.0
+        self._socket_path = get_zmq_rpc_path_lookup(vllm_config)
+        self.socket = self._connect()
         self.executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="DfkvLookupClient",
         )
         self.futures: dict[str, Future[tuple[int, int]]] = {}
 
+    def _connect(self):
+        socket = make_zmq_socket(
+            self.ctx,
+            self._socket_path,
+            zmq.REQ,  # type: ignore[attr-defined]
+            bind=False,
+        )
+        if self._timeout_ms:
+            socket.setsockopt(zmq.RCVTIMEO, self._timeout_ms)  # type: ignore[attr-defined]
+            socket.setsockopt(zmq.SNDTIMEO, self._timeout_ms)  # type: ignore[attr-defined]
+        return socket
+
+    def _call(self, send: Callable[[Any], None]) -> bytes:
+        """One request/reply on the socket-owner thread. A request rank 0
+        does not answer within lookup_timeout_ms raises TimeoutError; the
+        REQ socket is then stuck waiting for that reply, so it is replaced
+        (a late reply goes to the closed one and is dropped)."""
+        try:
+            send(self.socket)
+            return bytes(self.socket.recv())
+        except zmq.Again as e:  # type: ignore[attr-defined]
+            self.socket.close(linger=0)
+            self.socket = self._connect()
+            self._unavailable_until = self._clock() + self._timeout_ms / 1000.0
+            raise TimeoutError(
+                f"rank-0 lookup server did not answer in {self._timeout_ms} ms"
+            ) from e
+
+    def _unavailable(self) -> bool:
+        return self._clock() < self._unavailable_until
+
     def _lookup(self, token_len: int, block_hashes: list[BlockHash],
-                retain_ttl_s: int) -> tuple[int, int]:
+                retain_ttl_s: int) -> tuple[int, int] | None:
+        if self._unavailable():
+            # Queued behind the lookup that timed out: a miss, not another
+            # full timeout. None tells lookup() not to log it as a failure.
+            return None
         all_frames = _encode_lookup_request(token_len, block_hashes,
                                             retain_ttl_s)
-        self.socket.send_multipart(all_frames, copy=False)
-        return _decode_lookup_response(bytes(self.socket.recv()))
+        return _decode_lookup_response(
+            self._call(lambda socket: socket.send_multipart(all_frames, copy=False))
+        )
 
     def lookup(
         self,
@@ -3500,6 +3558,11 @@ class LookupKeyClient:
                     return cached[1]
                 del self._results[req_id]
             future = self.futures.get(req_id)
+            if future is None and self._unavailable():
+                # Rank 0 left a lookup unanswered within the last timeout:
+                # an uncached miss until then; the first lookup after it
+                # probes rank 0 again.
+                return 0, 0
             if future is None:
                 future = self.executor.submit(
                     self._lookup,
@@ -3520,6 +3583,8 @@ class LookupKeyClient:
             with self._close_lock:
                 if self.futures.get(req_id) is future:
                     self.futures.pop(req_id)
+        if result is None:
+            return 0, 0
         # Only an answered lookup is reusable: an RPC error stays a one-step
         # miss so the next step probes again.
         if self._cache_ttl_s > 0:
@@ -3540,9 +3605,7 @@ class LookupKeyClient:
 
     def _reset(self) -> bool:
         """Send the reset admin request from the socket-owner thread."""
-        self.socket.send(RESET_MSG)
-        resp = self.socket.recv()
-        return bytes(resp) == RESP_OK
+        return self._call(lambda socket: socket.send(RESET_MSG)) == RESP_OK
 
     def reset(self) -> bool:
         """Trigger the worker's best-effort global store reset."""

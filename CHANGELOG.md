@@ -3,6 +3,19 @@
 ## Unreleased
 
 
+- vLLM connector: a scheduler lookup that rank 0 does not answer within
+  `lookup_timeout_ms` (new, default 10 s; `0` = wait forever) is a miss.
+  The scheduler asked rank 0 over a ZMQ REQ socket with no receive timeout:
+  if rank 0's lookup server had exited or a retention call there hung, the
+  scheduler loop blocked for good (in the default synchronous mode), aborts
+  were not processed, and `close()` hung as well. The timed-out socket is
+  replaced, since a REQ socket cannot send again before it has its reply.
+  For one timeout period after an unanswered lookup, lookups are misses at
+  once: they share one socket thread, so N queued lookups would otherwise
+  stall the scheduler N times the timeout. The first lookup after the
+  period asks rank 0 again.
+  `lookup_async` is now documented.
+
 - vLLM connector: a LOAD that is rejected (receive queue full, connector
   closing), cancelled, or fails unexpectedly reports only its own
   destination blocks as invalid. It reported the request's whole block
