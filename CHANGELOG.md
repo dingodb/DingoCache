@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Client, host and GPU dedup: on weakly ordered CPUs (aarch64) a copy out
+  of a shared entry that raced a writer could pass its check and return
+  torn bytes. The copy re-reads the entry's generation and the ring cursor
+  after copying, and accepts the bytes only if neither moved; those
+  re-reads were acquire loads, which keep later loads after them but not
+  the copy's own loads before them, so the copy could read bytes written
+  after a re-read that still saw the old values. A fence now orders the
+  copy (and the identity and length reads) before the re-reads. x86 was
+  not affected.
 - Client, host and GPU dedup: a key that two processes on the host expect
   with different lengths is now reported. Dedup rests on one key meaning
   the same bytes in every process; keys that leave out a rank axis of a

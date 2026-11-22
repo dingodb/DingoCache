@@ -560,6 +560,7 @@ bool GpuNodeDedup::IssueCopySg(Slot* s, const BlockKey& key, const Seg* segs,
   if (n > total_cap) {
     // Published longer than this reader's segments hold: the processes
     // disagree about what the key holds (see NodeDedup::CopyOut).
+    std::atomic_thread_fence(std::memory_order_acquire);  // len before gen
     if (s->gen.load(std::memory_order_acquire) == g0)
       NoteLengthMismatch(&length_mismatches_, "gpu-dedup", n, total_cap);
     return false;
@@ -596,7 +597,9 @@ bool GpuNodeDedup::IssueCopySg(Slot* s, const BlockKey& key, const Seg* segs,
 
 bool GpuNodeDedup::ValidateCopy(const CopySnap& snap) const {
   // AFTER the sync: un-lapped payload, same entry generation (arena still the
-  // one we copied from), untouched slot.
+  // one we copied from), untouched slot. The fence keeps the descriptor's
+  // plain loads in IssueCopySg before these re-reads (see NodeDedup::CopyOut).
+  std::atomic_thread_fence(std::memory_order_acquire);
   ProcEntry& e = reg_[snap.oi];
   if (e.alloc_cursor.load(std::memory_order_acquire) - snap.seq >
       e.arena_bytes - snap.n)
