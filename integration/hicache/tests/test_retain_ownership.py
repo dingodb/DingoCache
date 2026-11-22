@@ -316,6 +316,90 @@ class BatchTouch(unittest.TestCase):
         self.assertEqual(keys, b._retain_object_keys(PAGES))
 
 
+class BatchTouchDebounce(unittest.TestCase):
+    """batch_touch with a TTL protects the prefix with a SET, which the
+    native client does not debounce. Every request on a hot prefix rebuilt
+    the keys of the whole prefix and sent a precheck and a SET."""
+
+    def setUp(self):
+        self.b = _backend(writer=True, tp_rank=0)
+        self.b._has_retain = True
+        self.built = []
+        build = self.b._retain_object_keys
+        self.b._retain_object_keys = (
+            lambda keys: self.built.append(len(keys)) or build(keys))
+        self.clock = [1000.0]
+        self._monotonic = H.time.monotonic
+        H.time.monotonic = lambda: self.clock[0]
+
+    def tearDown(self):
+        H.time.monotonic = self._monotonic
+
+    def test_repeated_touch_of_a_protected_prefix_does_no_work(self):
+        with _Cabi() as c:
+            self.b.batch_touch(PAGES, TTL)
+            self.assertEqual(len(c.retain_calls), 1)
+            self.assertEqual(c.retain_calls[0][2], H.dfkv_cabi.DFKV_RETAIN_SET)
+            for _ in range(5):
+                self.b.batch_touch(list(PAGES), TTL)
+            self.assertEqual(len(c.retain_calls), 1, "one SET for six touches")
+            self.assertEqual(self.built, [len(PAGES)], "keys built once")
+            # A tenth of the TTL later the protection is renewed.
+            self.clock[0] += TTL["retain_ttl_s"] / 10.0
+            self.b.batch_touch(PAGES, TTL)
+            self.assertEqual(len(c.retain_calls), 2)
+
+    def test_other_prefix_or_longer_ttl_is_not_skipped(self):
+        longer = {"retain_ttl_s": TTL["retain_ttl_s"] + 1}
+        with _Cabi() as c:
+            self.b.batch_touch(PAGES, TTL)
+            self.b.batch_touch(PAGES[:-1], TTL)              # a shorter prefix
+            self.b.batch_touch(list(PAGES) + ["more"], TTL)  # a longer one
+            self.b.batch_touch(PAGES, longer)
+            self.assertEqual(len(c.retain_calls), 4)
+            self.b.batch_touch(PAGES, TTL)   # covered by the longer TTL
+            self.assertEqual(len(c.retain_calls), 4)
+
+    def test_touch_that_left_objects_unprotected_is_repeated(self):
+        with _Cabi() as c:
+            protecting = H.dfkv_cabi.call_batch_retain
+
+            def denied(lib, h, keys, ttl, mode, **k):
+                c.retain_calls.append((list(keys), ttl, mode))
+                return [H.dfkv_cabi.DFKV_RET_DENIED] * len(keys)
+
+            H.dfkv_cabi.call_batch_retain = denied
+            self.b.batch_touch(PAGES, TTL)
+            self.b.batch_touch(PAGES, TTL)
+            self.assertEqual(len(c.retain_calls), 2)
+            H.dfkv_cabi.call_batch_retain = protecting
+            self.b.batch_touch(PAGES, TTL)
+            self.b.batch_touch(PAGES, TTL)
+            self.assertEqual(len(c.retain_calls), 3)
+
+    def test_refused_precheck_is_not_remembered(self):
+        with _Cabi(admit=False) as c:
+            self.b.batch_touch(PAGES, TTL)
+            self.b.batch_touch(PAGES, TTL)
+        # Without headroom the prefix is only refreshed, each time.
+        self.assertEqual(
+            [mode for _keys, _ttl, mode in c.retain_calls],
+            [H.dfkv_cabi.DFKV_RETAIN_REFRESH] * 2)
+
+    def test_touch_without_ttl_is_unchanged(self):
+        with _Cabi() as c:
+            self.b.batch_touch(PAGES, None)
+            self.b.batch_touch(PAGES, None)
+        self.assertEqual(len(c.retain_calls), 2)
+
+    def test_remembered_prefixes_are_bounded(self):
+        self.b._TOUCH_DEBOUNCE_MAX = 3
+        with _Cabi():
+            for i in range(10):
+                self.b.batch_touch([f"page{i}"], TTL)
+        self.assertEqual(len(self.b._touch_seen), 3)
+
+
 class Ownership(unittest.TestCase):
     def test_asking_before_pool_registration_fails_loudly(self):
         b = _backend(kda=False, indexer=False)
