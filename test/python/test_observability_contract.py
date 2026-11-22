@@ -64,6 +64,7 @@ PUBLIC_FAMILIES = {
     "dfkv_connector_ring_members",
     "dfkv_connector_transport_pool_backoff_events_total",
     "dfkv_disk_used_bytes",
+    "dfkv_disk_engine_info",
     "dfkv_errors_total",
     "dfkv_evicted_bytes_total",
     "dfkv_evictions_total",

@@ -690,7 +690,8 @@ int main(int argc, char** argv) {
       info += ",engine=" + srv.engine_name();
       // Resolved I/O mode (not env intent): tmpfs-style O_DIRECT rejection
       // demotes to buffered, and the fleet audit must see that.
-      if (srv.engine_name() == "slab" && !srv.write_mode().empty())
+      if ((srv.engine_name() == "slab" || srv.engine_name() == "mixed") &&
+          !srv.write_mode().empty())
         info += ",wr=" + srv.write_mode();
       info += ",disks=" + std::to_string(srv.DiskCount());
       info += ",cap=" + std::to_string(cap);

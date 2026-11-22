@@ -33,6 +33,9 @@ class DiskCacheGroup {
     uint64_t capacity_bytes = (1ull << 30);  // TOTAL, split evenly across disks
     // Empty reads DFKV_STORE_ENGINE, then selects the production slab backend.
     // "file" remains available only when explicitly requested for diagnostics.
+    // "auto" (choose per directory by what it holds) and "log" (the
+    // log-structured engine) need DFKV_LSE_EXPERIMENTAL=1 while that engine
+    // is under construction; see docs/design/log-structured-engine.md §10.
     std::string engine{};
     // Dependency injection for focused concurrency tests. Production leaves
     // this empty and constructs the selected file/slab engine normally. Called
@@ -119,12 +122,18 @@ class DiskCacheGroup {
   uint64_t EvictedBytes() const;  // summed across disks
   // The storage backend actually constructed ("file" | "slab") -- the RESOLVED
   // choice (Options.engine / DFKV_STORE_ENGINE / default), not the flag intent.
+  // "mixed" when "auto" chose different engines for different disks.
   const std::string& EngineName() const { return engine_; }
+  // Whether slab metrics apply: the slab engine was selected, or "auto" chose
+  // it for at least one disk.
+  bool HasSlabDisks() const { return has_slab_; }
+  // The engine disk i runs (its StoreEngine::EngineName).
+  std::string DiskEngineName(size_t i) const { return disks_[i]->EngineName(); }
   // Slab I/O mode actually in effect ("direct" | "buffered"; empty for file
   // engine). Direct is the deployment default; a filesystem that rejects
   // O_DIRECT (tmpfs) resolves to buffered regardless of the env.
   const std::string& WriteMode() const { return write_mode_; }
-  // Summed slab runtime counters across disks (all-zero for the file engine).
+  // Summed slab runtime counters across the slab disks (all-zero without).
   DiskSlabStore::Stats SlabStats() const;
   // Live size-class layout, aggregated by slot size across all slab disks.
   std::vector<SlabAllocator::ClassStat> SlabClasses() const;
@@ -136,8 +145,9 @@ class DiskCacheGroup {
   // A store that an engine_factory built is not in the typed view: it has
   // no observation here, whatever its type.
   DiskSlabStore::WatermarkObservation DiskWatermarkObservation(size_t i) const {
-    return i < slabs_.size() ? slabs_[i]->GetWatermarkObservation()
-                             : DiskSlabStore::WatermarkObservation{};
+    return i < slab_of_disk_.size() && slab_of_disk_[i] != nullptr
+               ? slab_of_disk_[i]->GetWatermarkObservation()
+               : DiskSlabStore::WatermarkObservation{};
   }
   uint64_t TenantUsedBytes(uint64_t tenant_hash) const;
   uint64_t TenantDefaultQuotaBytes() const { return tenant_default_quota_bytes_; }
@@ -179,7 +189,11 @@ class DiskCacheGroup {
   std::string engine_;      // resolved backend name (see EngineName)
   std::string write_mode_;  // resolved slab I/O mode (see WriteMode)
   std::vector<std::unique_ptr<StoreEngine>> disks_;
-  std::vector<const DiskSlabStore*> slabs_;  // typed view of disks_ (slab engine only)
+  std::vector<const DiskSlabStore*> slabs_;  // typed view of the slab disks
+  // The same by disk index: nullptr for a disk that is not a slab store the
+  // group built (another engine, or one an engine_factory made).
+  std::vector<const DiskSlabStore*> slab_of_disk_;
+  bool has_slab_ = false;
   std::unordered_map<std::string, size_t> by_id_;  // disk id -> stable index
   ConHash ring_;
   mutable std::array<std::mutex, kTenantStripes> tenant_stripes_;

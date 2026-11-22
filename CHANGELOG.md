@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+
+- Server, storage: groundwork for the log-structured storage engine
+  (`docs/design/log-structured-engine.md`), with no change for any existing
+  configuration. `DFKV_STORE_ENGINE` accepts two experimental values that
+  are refused unless `DFKV_LSE_EXPERIMENTAL=1`: `auto`, which chooses each
+  directory's engine from what it holds (slab markers: slab; the file
+  engine's `blocks`: file; empty: slab for now), and `log`, which is not
+  built yet and refuses to start. A directory with both slab and log-engine
+  files, or with files of no known engine, is refused under `auto` without
+  being changed. New per-disk metric `dfkv_disk_engine_info{disk,engine}`.
+  The per-disk slab watermark metrics are now looked up by disk, so a node
+  whose disks run different engines labels them correctly; on such a node
+  they are emitted for the slab disks only, retention metrics are the slab
+  disks', and the registered self-description keeps the slab write mode.
 ## 2.42.0 — 2026-11-23
 
 - Client, RDMA: the rail name a scatter-gather batch read reports (the

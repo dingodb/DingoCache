@@ -295,6 +295,10 @@ class DiskSlabStore : public StoreEngine {
     return alloc_ ? alloc_->GetRetentionStats()
                   : SlabAllocator::RetentionStats{};
   }
+  const char* EngineName() const override { return "slab"; }
+  ::dfkv::RetentionStats GetRetentionStats() const override {
+    return RetentionStats();
+  }
   bool Healthy() const override {
     return ok_ && !metadata_failed_.load(std::memory_order_acquire);
   }
