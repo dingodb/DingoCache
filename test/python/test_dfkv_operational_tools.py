@@ -296,6 +296,10 @@ class FakeUnit:
         self.serves_until = 0
         self.start_queued = False
         self.answers = answers
+        # Ticks between registering and owning vnodes / reporting READY;
+        # None: never.
+        self.placed_lag: int | None = 0
+        self.ready_lag: int | None = 0
         self.starts = 0
 
 
@@ -308,7 +312,7 @@ class FakeFleet:
     at once, so the registration is gone after LEASE; requests are refused
     after GRACE; the unit stays deactivating for ``stop_ticks``. `stat --all`
     lists the placement members and exits 1 with its table if any of them is
-    unreachable. systemctl without --no-block waits for its job, so under a
+    unreachable or not ready. systemctl without --no-block waits for its job, so under a
     command timeout shorter than the job the caller times out while the job
     stays queued -- and a start queued behind a stop runs when the stop is over.
     """
@@ -316,12 +320,22 @@ class FakeFleet:
     START, GRACE, LEASE = 3, 6, 8
 
     def __init__(self, *, stop_ticks: int = 20, old_eligible: bool = True,
+                 new_eligible: bool = True, new_ready: bool = True,
                  bystander: bool = False) -> None:
         self.now = 0
         self.stop_ticks = stop_ticks
         self.jobs: list[tuple[str, ...]] = []
-        old = N1 if old_eligible else ring_member("n1", "10.0.0.1", 1, 0, 0.0, eligible=False)
-        self.units = {"old": FakeUnit(old, True), "new": FakeUnit(N2, False)}
+        # Per member, the number of ring views that showed it placed, and
+        # what that count was when a host was asked to stop.
+        self.seen_placed: dict[str, int] = {}
+        self.seen_placed_at_stop: dict[str, dict[str, int]] = {}
+        self.units = {"old": FakeUnit(N1, True), "new": FakeUnit(N2, False)}
+        if not old_eligible:
+            self.units["old"].placed_lag = None
+        if not new_eligible:
+            self.units["new"].placed_lag = None
+        if not new_ready:
+            self.units["new"].ready_lag = None
         if bystander:  # a member nobody is replacing, whose stat port is dead
             self.units["other"] = FakeUnit(
                 ring_member("n3", "10.0.0.3", 1, 100, 33.3), True, answers=False)
@@ -332,6 +346,14 @@ class FakeFleet:
     def serving(self, unit: FakeUnit) -> bool:
         return unit.answers and (
             (unit.state == "active" and self.now >= unit.ready_at) or self.now < unit.serves_until)
+
+    def placed(self, unit: FakeUnit) -> bool:
+        return self.registered(unit) and unit.placed_lag is not None and (
+            unit.state != "active" or self.now >= unit.ready_at + unit.placed_lag)
+
+    def ready(self, unit: FakeUnit) -> bool:
+        return self.serving(unit) and unit.ready_lag is not None and (
+            unit.state != "active" or self.now >= unit.ready_at + unit.ready_lag)
 
     def start(self, unit: FakeUnit) -> None:
         unit.state, unit.ready_at, unit.start_queued = "active", self.now + self.START, False
@@ -354,6 +376,8 @@ class FakeFleet:
             return f"ActiveState={unit.state}\n"
         self.jobs.append((host, *arguments))
         waits = False
+        if arguments[0] == "stop":
+            self.seen_placed_at_stop[host] = dict(self.seen_placed)
         if arguments[0] == "stop" and unit.state == "active":
             up = self.now >= unit.ready_at
             unit.state, unit.stopped_at = "deactivating", self.now
@@ -374,18 +398,30 @@ class FakeFleet:
         if argv[1] == "ring":
             if "--json" not in argv:
                 return RING_TABLE
-            return ring_document(len(registered), *(unit.member for unit in registered))
+            out_of_placement = {
+                "eligible": False, "status": "DEGRADED", "vnodes": 0, "share_percent": 0.0}
+            members = []
+            for unit in registered:
+                if self.placed(unit):
+                    node_id = unit.member["id"]
+                    self.seen_placed[node_id] = self.seen_placed.get(node_id, 0) + 1
+                    members.append(unit.member)
+                else:
+                    members.append({**unit.member, **out_of_placement})
+            return ring_document(len(registered), *members)
         if argv[1] == "clients":
             return CLIENTS
-        placement = [unit for unit in registered if unit.member["eligible"]]
+        placement = [unit for unit in registered if self.placed(unit)]
         if not placement:
             raise CommandError(argv, 1, "", "stat --all: group=glm has an empty placement ring")
-        table = STAT_HEADER + "".join(
-            (stat_row if self.serving(unit) else stat_unreachable)(
-                unit.member["id"], unit.member["ip"])
-            for unit in placement
-        ) + STAT_TOTAL
-        if not all(self.serving(unit) for unit in placement):
+        def row(unit: FakeUnit) -> str:
+            node_id, ip = unit.member["id"], unit.member["ip"]
+            if not self.serving(unit):
+                return stat_unreachable(node_id, ip)
+            return stat_row(node_id, ip, ready="yes" if self.ready(unit) else "NO")
+
+        table = STAT_HEADER + "".join(row(unit) for unit in placement) + STAT_TOTAL
+        if not all(self.ready(unit) for unit in placement):
             raise CommandError(argv, 1, table, "")
         return table
 
@@ -403,6 +439,29 @@ class ReplacementWorkflowTest(unittest.TestCase):
             "dfkv_node_replace.run_command", side_effect=AssertionError("unmocked command"))
         blocked.start()
         self.addCleanup(blocked.stop)
+
+    def replace(self, run_command, timeout: str) -> tuple[int, list[dict]]:
+        """main() against a fleet: its exit status and its journal."""
+        with TemporaryDirectory() as directory:
+            journal = Path(directory) / "journal.json"
+            argv = [*self.ARGV, "--state-file", str(journal)]
+            argv[argv.index("--timeout") + 1] = timeout
+            with patch("dfkv_node_replace.run_command", side_effect=run_command):
+                status = replace_main(argv)
+            return status, json.loads(journal.read_text())["events"]
+
+    def assert_join_undone(self, fleet: FakeFleet, status: int, events: list[dict],
+                           refused_at: str) -> None:
+        self.assertEqual(status, 1)
+        # The join and its undoing are the only jobs: the old node was never
+        # asked to stop, and placement is what it was.
+        self.assertEqual(
+            fleet.jobs, [("new", "start", "--no-block"), ("new", "stop", "--no-block")])
+        old, new = fleet.units["old"], fleet.units["new"]
+        self.assertEqual((old.state, old.starts, fleet.registered(old)), ("active", 0, True))
+        self.assertEqual(new.state, "inactive")
+        reasons = [str(event["message"]) for event in events if event["phase"] == "rollback"]
+        self.assertIn(f"waiting for {refused_at}", reasons[0])
 
     @staticmethod
     def args(dry_run: bool = True) -> SimpleNamespace:
@@ -510,14 +569,26 @@ class ReplacementWorkflowTest(unittest.TestCase):
                 self.actions.append((host, action))
 
             def wait_stable_ring(self, **sets):
+                self.actions.append(sets)
                 return parse_ring(RING)
 
             def wait_for(self, description, predicate, timeout=None):
+                self.actions.append(description)
                 return True
 
         workflow = Fixture(self.args(dry_run=False))
         workflow.run()
-        self.assertEqual(workflow.actions, [("new", "start"), ("old", "stop")])
+        # The old node is stopped only after the replacement was seen placed
+        # and then ready; the cutover is over only when it still is both and
+        # the old node is no longer a member.
+        self.assertEqual(workflow.actions, [
+            ("new", "start"),
+            {"placed": {"n2"}, "registered": {"n1"}},
+            "replacement node readiness",
+            ("old", "stop"),
+            {"placed": {"n2"}, "forbidden": {"n1"}},
+            "replacement readiness after old-node lease expiry",
+        ])
         self.assertTrue(workflow.started_new)
         self.assertTrue(workflow.old_stopped)
         phases = [event["phase"] for event in workflow.events]
@@ -584,6 +655,64 @@ class ReplacementWorkflowTest(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(
             fleet.jobs, [("new", "start", "--no-block"), ("old", "stop", "--no-block")])
+
+    def test_old_node_is_not_stopped_for_a_replacement_that_is_not_placed(self) -> None:
+        # Registered, but held out of placement for good.
+        fleet = FakeFleet(new_eligible=False)
+        status, events = self.replace(fleet.run_command, timeout="0.5")
+        self.assert_join_undone(fleet, status, events, refused_at="a stable MDS ring")
+
+    def test_old_node_is_stopped_only_after_the_replacement_was_seen_placed(self) -> None:
+        # The replacement registers first and owns vnodes later. `stat --all`
+        # lists it from then on, so readiness alone would also let the stop
+        # through -- without a ring view ever having shown it placed.
+        fleet = FakeFleet()
+        fleet.units["new"].placed_lag = 12
+        status, _ = self.replace(fleet.run_command, timeout="10")
+        self.assertEqual(status, 0)
+        self.assertGreaterEqual(fleet.seen_placed_at_stop["old"].get("n2", 0), 1)
+
+    def test_old_node_is_not_stopped_for_a_replacement_that_is_not_ready(self) -> None:
+        # Placed, but its row never shows READY.
+        fleet = FakeFleet(new_ready=False)
+        status, events = self.replace(fleet.run_command, timeout="0.5")
+        self.assert_join_undone(fleet, status, events, refused_at="replacement node readiness")
+
+    def test_cutover_is_undone_when_the_replacement_drops_out_of_placement(self) -> None:
+        fleet = FakeFleet()
+
+        def run_command(argv, timeout, **options) -> str:
+            output = fleet.run_command(argv, timeout, **options)
+            # Once the old node has been asked to stop, the replacement's
+            # rails fail: it stays registered and loses its vnodes.
+            if fleet.jobs[-1:] == [("old", "stop", "--no-block")]:
+                fleet.units["new"].placed_lag = None
+            return output
+
+        status, events = self.replace(run_command, timeout="0.5")
+        self.assertEqual(status, 1)
+        self.assertEqual(fleet.jobs, [
+            ("new", "start", "--no-block"), ("old", "stop", "--no-block"),
+            ("old", "start", "--no-block")])
+        old = fleet.units["old"]
+        self.assertEqual((old.state, old.starts), ("active", 1))
+        self.assertTrue(fleet.ready(old))
+        reasons = [str(event["message"]) for event in events if event["phase"] == "rollback"]
+        self.assertIn("waiting for a stable MDS ring", reasons[0])
+        self.assertIn("old node restored", reasons[-1])
+
+    def test_rollback_waits_until_the_restarted_old_node_is_ready(self) -> None:
+        fleet = FakeFleet()
+        fleet.units["new"].state = "active"
+        fleet.units["old"].ready_lag = 6  # registered and placed before it reports READY
+        with patch("dfkv_node_replace.run_command", side_effect=fleet.run_command):
+            workflow = Replacer(self.args(dry_run=False))
+            workflow.remote("old", "stop")
+            workflow.old_stopped = True
+            workflow.rollback(RuntimeError("cutover failed"))
+        old = fleet.units["old"]
+        self.assertEqual((old.state, old.starts), ("active", 1))
+        self.assertTrue(fleet.ready(old))
 
     def test_readiness_takes_the_table_of_exit_1_and_nothing_else(self) -> None:
         workflow = Replacer(self.args())
