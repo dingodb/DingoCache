@@ -244,6 +244,17 @@ class DfkvStoreScheduler:
     def update_connector_output(self, output: KVConnectorOutput) -> None:
         """Prevent a failed remote source from being re-admitted on retry."""
         if not self.request_level_loads:
+            # Block-level failures: vLLM rolls the requests holding an invalid
+            # block back and asks for them again. Their cached lookup must not
+            # answer that with the hit whose load just failed.
+            invalid = set(getattr(output, "invalid_block_ids", None) or ())
+            if invalid:
+                for req_id, tracker in self._request_trackers.items():
+                    if any(
+                        block in invalid
+                        for ids in tracker.allocated_block_ids for block in ids
+                    ):
+                        self.client.discard(req_id)
             return
         for req_id in failed_requests_from_output(output):
             # A receive can finish after an aborted request's final metadata.

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- vLLM connector: a failed block-level LOAD drops the request's cached
+  lookup. vLLM rolls back the requests holding an invalid block and asks for
+  them again; the scheduler reused a completed lookup for
+  `lookup_cache_ttl_ms` and answered the retry with the hit whose load had
+  just failed, so the load could fail again until the entry expired (the
+  README already said failed loads drop it; request-level layouts did).
+  Requests whose allocated blocks include an invalid block now have their
+  cached lookup discarded.
+
 - vLLM connector, small fixes. The client took its TP rank from the
   environment (`DFKV_TP_RANK` / `LOCAL_RANK` / `RANK`, none of which vLLM
   sets): every rank labelled its metrics rank 0 and wrote the same
