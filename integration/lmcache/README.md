@@ -205,6 +205,10 @@ paths, and for a native call that fails.
   then seeds the prefix hash chain at random and chunk keys change with every
   engine start. A PUT that stores not every key counts as a failed `put` in the
   connector metrics.
+- If the connector cannot start (bad URL, refused configuration, a chunk over
+  the RDMA bound, a failed memory registration), LMCache logs that as a
+  warning and runs without it; the connector logs it as an error ("DfkvConnector
+  not started") and releases what it had opened.
 - Not provided by this connector, unlike the vLLM and SGLang ones: retention
   (TTL protection; LMCache's `pin` is ignored) and a liveness probe (`ping`
   only checks that the client handle is open).

@@ -3,6 +3,24 @@
 ## Unreleased
 
 
+- LMCache connector, construction and the L2 adapter's size map. In
+  LMCache's scheduler role the in-process connector failed with
+  `AttributeError`: it read the engine config and metadata from the
+  context's `local_cpu_backend`, which is then a stand-in without them; it
+  now takes them from the context. A construction failure after the native
+  client was open leaked the client, and a failed RDMA pool registration
+  leaked the native handle; both are closed now. LMCache logs a
+  construction error as a warning and runs without the backend, so the
+  connector also logs it as an error. The MP-server L2 adapter kept the size
+  of every key it ever stored when LMCache does no eviction (nothing removes
+  an entry then: dfkv evicts on its own), so the map grew without bound; it
+  is kept only when an eviction policy or `max_capacity_gb` is configured.
+  Without one a store cannot be told from a re-store, so stores report 0
+  bytes to LMCache's usage counters (which LMCache only uses for eviction);
+  keys are still reported to its listeners.
+  A partly failed store task now accounts and reports the keys it did
+  store, and the map is updated under the adapter's lock.
+
 - LMCache connector (in-process): protections the vLLM and SGLang
   connectors had. Request tags (`lmcache.tag.*`) are now part of the
   object key, as they are of LMCache's own key: chunks of equal tokens under

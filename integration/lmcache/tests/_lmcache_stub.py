@@ -265,6 +265,13 @@ def _l2_interface(api: str):
     return L2AdapterInterface
 
 
+def _numel(shape) -> int:
+    n = 1
+    for d in shape:
+        n *= int(d)
+    return n
+
+
 class _RemoteConnector:
     """lmcache.v1.storage_backend.connector.base_connector.RemoteConnector,
     reduced to what the dfkv connector calls on it."""
@@ -272,6 +279,17 @@ class _RemoteConnector:
     def __init__(self, config, metadata) -> None:
         self.config = config
         self.metadata = metadata
+        # As LMCache's base: the chunk geometry from the metadata.
+        get_shapes = getattr(metadata, "get_shapes", None)
+        if get_shapes is not None:
+            self.meta_shapes = list(get_shapes())
+            self.meta_dtypes = list(metadata.get_dtypes())
+            self.meta_fmt = "KV_MLA_FMT" if metadata.use_mla else "KV_2LTD"
+            self.full_chunk_size_bytes = sum(
+                _numel(shape) * dtype.itemsize
+                for shape, dtype in zip(self.meta_shapes, self.meta_dtypes)
+            )
+            self.single_token_size = self.full_chunk_size_bytes // metadata.chunk_size
 
     def post_init(self) -> None:
         pass
