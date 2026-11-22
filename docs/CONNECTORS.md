@@ -1112,6 +1112,8 @@ namespace/key 不一致是预期 cold miss。**空环 / MDS 不可达**可直接
 | `load_window_min_keys` | `0` | 高于常规请求 key 数 | 仅当请求 key 数达到此阈值时启用 `load_window_keys`（`0..65536`）；让短请求保持单次 GET，长上下文才窗口化。`load_window_keys=0` 时无效。 |
 | `enable_cross_layers_blocks` | `False` | 默认 False | 仅当引擎分页布局层内交错时开 |
 | `lookup_cache_ttl_ms` | `1000` | 默认即可 | 调度器对同一请求、同一前缀长度和保留 TTL 复用已完成 lookup 的时长（`0..60000` ms）。vLLM 每步都会重新询问等待中的请求；复用可省去 rank0 往返以及随之附带的整段前缀 retention REFRESH，KV 池满时排队请求每个窗口只探测一次，而不是每步一次。请求完成、中止、被抢占或 load 失败时清除；窗口内对象被淘汰由 `kv_load_failure_policy` 兜底；`0` 为每步都探测。 |
+| `lookup_timeout_ms` | `10000` | 默认即可 | 调度器等待 rank0 回答 lookup 的上限（`0..600000` ms）。超时按未命中处理（该请求自己算前缀）并重建 lookup socket；此后一个超时周期内所有 lookup 立即按未命中返回（lookup 共用一个 socket 线程，否则会逐个各等满一次超时），周期结束后的第一个 lookup 重新询问 rank0；`0` 为无限等待，rank0 server 卡住或退出时调度器随之卡死。`lookup_async` 为 false（默认）时 lookup 在调度线程上同步执行；为 true 时调度器在后续步轮询结果，其间继续调度。 |
+| `lookup_async` | `false` | 按需 | 不阻塞调度步地询问 rank0：请求在后续若干步里等待结果。 |
 | `lookup_rpc_port` | ipc 自动 | 一般不设 | rank0 前缀查询 RPC，仅 socket 名冲突时设 |
 | `client_register` | `1`（MDS 发现时） | 默认即可 | MDS 客户端注册开关（`0` 关；env `DFKV_CLIENT_REGISTER=0` 等价，见 §1.1） |
 | `tenant_id` | `default` | 多租户时显式设 | canonical namespace 的 tenant 字段（§1.4） |
