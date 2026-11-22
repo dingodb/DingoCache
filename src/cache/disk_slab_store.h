@@ -154,6 +154,15 @@ class DiskSlabStore : public StoreEngine {
     uint64_t rebuild_sparse_ranges = 0;
     uint64_t rebuild_sequential_fallbacks = 0;
     uint64_t rebuild_mmap_scans = 0;
+    // This open (not exported as metrics; the same numbers are in the
+    // per-disk "opened in" log line). Extents whose fallocate was left out
+    // because the previous run closed clean and the file had every block, and
+    // the time spent opening the extents, scanning slots.tbl, and installing
+    // what it held.
+    uint64_t open_fallocate_skipped = 0;
+    uint64_t open_extents_us = 0;
+    uint64_t open_scan_us = 0;
+    uint64_t open_restore_us = 0;
     uint64_t capacity_bytes = 0;
     uint64_t allocated_bytes = 0;
     uint64_t payload_bytes = 0;
@@ -199,6 +208,12 @@ class DiskSlabStore : public StoreEngine {
   // Stops the background threads, syncs payloads and table, and writes the
   // clean marker. Split from the destructor so a server can have its disks
   // clean before it spends time releasing memory; see StoreEngine::Close.
+  // Contract: every Cache/CacheDirect/batch write has returned before this is
+  // called, and none starts afterwards. The clean marker tells the next start
+  // that nothing of this run is still being written (it then skips the
+  // per-extent fallocate that would wait for such a write). A payload write
+  // found in flight here is logged and the marker is not written: the next
+  // start takes the unclean path. Returns whether the marker was written.
   bool Close() override;
 
   DiskSlabStore(const DiskSlabStore&) = delete;
@@ -331,8 +346,8 @@ class DiskSlabStore : public StoreEngine {
   // zeroes the padding bytes in place (cap allows) and pwrites the 4 KiB-rounded
   // length via the extent's DIO fd. Caller pre-checked alignment/cap fit.
   bool WritePayloadDirect(const SlabAllocator::SlotRef& r, char* data, size_t len);
-  void CommitPayloadLocked(const std::string& key, uint32_t payload_len);
-  uint32_t ErasePayloadLocked(const std::string& key);
+  void CommitPayloadLocked(const BlockKey& key, uint32_t payload_len);
+  uint32_t ErasePayloadLocked(const BlockKey& key);
   // Shared allocate/pin -> unlocked payload write -> commit skeleton for
   // Cache/CacheDirect; `write_payload` does just the payload I/O for the slot.
   template <typename WriteFn>
@@ -400,6 +415,10 @@ class DiskSlabStore : public StoreEngine {
   bool trust_token_held_ = false;    // the token file exists, written by us
   bool trust_failure_logged_ = false;
   std::atomic<bool> buffered_payload_written_{false};  // extents may be dirty
+  // Cache/CacheDirect/batch calls between issuing a payload write and its
+  // completion or failure. Writers only: inflight_ also counts readers and
+  // prepared-read leases, which Close() has no reason to wait out.
+  std::atomic<uint32_t> payload_writers_{0};
   int crash_slot_ = -1;              // RevokeAllTrustForCrash registration
   bool closed_ = false;              // Close() ran; closed_clean_ is its result
   bool closed_clean_ = false;
@@ -408,9 +427,31 @@ class DiskSlabStore : public StoreEngine {
   struct PrepHold { BlockKey key; std::string fn; };
   std::unordered_map<uint64_t, PrepHold> prep_holds_;
   uint64_t prep_token_seq_ = 0;
-  // key.Filename() -> its true payload length (slot_size >= this). Rebuilt on
-  // open from the table; the allocator only tracks slot size.
-  std::unordered_map<std::string, uint32_t> payload_len_;
+  // Key -> its true payload length (slot_size >= this). Rebuilt on open from
+  // the table; the allocator only tracks slot size. Keyed by the 24-byte
+  // BlockKey itself: a restart installs one entry per cached object, and a
+  // 48-character name per entry was a second allocation and a longer hash for
+  // nothing the key does not already say.
+  // Digests come from clients. Each word goes through a full 64-bit mix
+  // before the next is folded in, starting from a value drawn once per
+  // process, so keys cannot be chosen to land in one bucket.
+  struct BlockKeyHash {
+    static uint64_t Mix(uint64_t h) noexcept {
+      h ^= h >> 33;
+      h *= 0xFF51AFD7ED558CCDull;
+      h ^= h >> 33;
+      h *= 0xC4CEB9FE1A85EC53ull;
+      h ^= h >> 33;
+      return h;
+    }
+    static uint64_t Seed() noexcept;
+    size_t operator()(const BlockKey& k) const noexcept {
+      static const uint64_t seed = Seed();
+      return static_cast<size_t>(
+          Mix(Mix(Mix(k.digest_lo ^ seed) ^ k.digest_hi) ^ k.tenant_hash));
+    }
+  };
+  std::unordered_map<BlockKey, uint32_t, BlockKeyHash> payload_len_;
   std::unordered_map<uint64_t, uint64_t> tenant_used_bytes_;
   // Keys with an unlocked pread/pwrite in flight (value = op count), and keys
   // whose Remove arrived during that window (executed by the last releaser).
@@ -470,6 +511,10 @@ class DiskSlabStore : public StoreEngine {
   uint64_t rebuild_sparse_ranges_ = 0;
   uint64_t rebuild_mmap_scans_ = 0;
   uint64_t rebuild_sequential_fallbacks_ = 0;
+  uint32_t open_fallocate_skipped_ = 0;
+  uint64_t open_extents_us_ = 0;
+  uint64_t open_scan_us_ = 0;
+  uint64_t open_restore_us_ = 0;
   // records were written since the last cycle.
   std::atomic<uint64_t> record_writes_{0};
   uint64_t synced_marker_ = 0;  // sync-thread-local snapshot of record_writes_
