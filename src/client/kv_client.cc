@@ -196,6 +196,8 @@ KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
   // model/raw-layout domains from sharing process-local entries.
   dedup_ = NodeDedup::FromEnv(namespace_hash_);
   get_miss_retries_ = EnvNonnegativeInt("DFKV_GET_MISS_RETRIES", 1);
+  retain_reprobe_ms_ =
+      static_cast<uint64_t>(EnvNonnegativeInt("DFKV_RETAIN_REPROBE_MS", 30000));
   // An ABI descriptor value (including 0=auto) supersedes the environment.
   if (batch_concurrency_override) {
     batch_concurrency_.store(*batch_concurrency_override,
@@ -1360,12 +1362,17 @@ void KVClient::RetainNode(const std::string& node, uint64_t tenant,
     for (size_t k : idx) out[k] = kRetError;
     return;
   }
+  // Only the verdict is read under the lock: the fallback is a network
+  // round trip, and every other node group of the batch, RetainPrecheck and
+  // RetainLimits wait for this lock.
+  bool unsupported = false;
   {
     std::lock_guard<std::mutex> lk(retain_mu_);
-    if (retain_nodes_[node].supported == 0) {
-      fallback(0);
-      return;
-    }
+    unsupported = KnownUnsupported(retain_nodes_[node], NowMs());
+  }
+  if (unsupported) {
+    fallback(0);
+    return;
   }
   const size_t cap = RetainDebounceCapPerShard(kRetainDebounceShards);
   for (size_t begin = 0; begin < idx.size(); begin += kRetainMaxKeys) {
@@ -1386,6 +1393,7 @@ void KVClient::RetainNode(const std::string& node, uint64_t tenant,
         std::lock_guard<std::mutex> lk(retain_mu_);
         RetainNodeState& ns = retain_nodes_[node];
         ns.supported = 0;
+        ns.unsupported_at_ms = NowMs();
         ns.max_ttl_s = 0;
       }
       fallback(begin);
@@ -1513,6 +1521,12 @@ void KVClient::BatchRetain(const std::vector<std::string>& keys,
   });
 }
 
+bool KVClient::KnownUnsupported(const RetainNodeState& ns,
+                                uint64_t now) const {
+  return ns.supported == 0 && ns.unsupported_at_ms <= now &&
+         now - ns.unsupported_at_ms < retain_reprobe_ms_;
+}
+
 void KVClient::ForgetRetained(const BlockKey& key) {
   RetainDebounceShard& shard =
       retain_debounce_[key.digest_lo % kRetainDebounceShards];
@@ -1531,7 +1545,8 @@ void KVClient::RetainLimits(int* supported, uint32_t* max_ttl_s) {
   for (const std::string& node : nodes) {
     {
       std::lock_guard<std::mutex> lk(retain_mu_);
-      if (retain_nodes_[node].supported != -1) continue;
+      const RetainNodeState& ns = retain_nodes_[node];
+      if (ns.supported == 1 || KnownUnsupported(ns, NowMs())) continue;
     }
     // One-key REFRESH probe of an impossible key: answers MISS plus limits.
     const BlockKey probe{0, 0, tenant};
@@ -1544,6 +1559,7 @@ void KVClient::RetainLimits(int* supported, uint32_t* max_ttl_s) {
     RetainNodeState& ns = retain_nodes_[node];
     if (st == Status::kInvalid) {
       ns.supported = 0;
+      ns.unsupported_at_ms = NowMs();
       ns.max_ttl_s = 0;
     } else if (st == Status::kOk && reply.size() == 1 + kRetainTrailerBytes) {
       const RetainTrailer t = DecodeRetainTrailer(reply.data() + 1);
@@ -1580,6 +1596,8 @@ bool KVClient::RetainPrecheck(const std::vector<std::string>& keys,
   for (const std::string& node : owners) {
     auto it = retain_nodes_.find(node);
     if (it == retain_nodes_.end()) continue;  // never heard: optimistic
+    // Any age: the precheck asks nobody, so an expired verdict stands until
+    // RetainNode or RetainLimits, which do ask, hear otherwise.
     if (it->second.supported == 0) return false;
     if (it->second.heard && it->second.headroom_pct < min_headroom_pct)
       return false;

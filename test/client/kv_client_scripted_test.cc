@@ -232,3 +232,72 @@ TEST(KVClientRetain, AReplyThatRacedARemoveDoesNotSeedTheDebounce) {
   EXPECT_EQ(out[0], KVClient::kRetMiss)
       << "the removed key was reported protected from the debounce";
 }
+
+// ---- a node without kRetain -------------------------------------------------
+
+// The existence fallback for such a node is a network round trip. It must
+// not hold the lock that every other retention call needs.
+TEST(KVClientRetain, FallbackDoesNotHoldTheRetentionLock) {
+  Client cl("ret-lock");
+  const std::vector<std::string> keys = {"r0"};
+  uint8_t out[1] = {99};
+  KVClient::RetainRequest refresh;
+  refresh.mode = 1;
+  cl.c->BatchRetain(keys, refresh, out);  // learns: no kRetain
+  ASSERT_EQ(out[0], KVClient::kRetMiss);
+  {
+    std::lock_guard<std::mutex> lk(cl.t.mu);
+    cl.t.hold_exist = true;
+  }
+  const int before = cl.t.exist_calls.load();
+  auto refreshing = std::async(std::launch::async, [&] {
+    uint8_t o[1] = {99};
+    cl.c->BatchRetain(keys, refresh, o);
+  });
+  {
+    std::unique_lock<std::mutex> lk(cl.t.mu);
+    cl.t.cv.wait(lk, [&] { return cl.t.exist_calls.load() > before; });
+  }
+  auto precheck = std::async(std::launch::async,
+                             [&] { return cl.c->RetainPrecheck(keys, 5); });
+  const bool answered = precheck.wait_for(std::chrono::seconds(2)) ==
+                        std::future_status::ready;
+  EXPECT_TRUE(answered) << "waited for another node group's round trip";
+  {
+    std::lock_guard<std::mutex> lk(cl.t.mu);
+    cl.t.hold_exist = false;
+  }
+  cl.t.cv.notify_all();
+  refreshing.get();
+  if (answered) EXPECT_FALSE(precheck.get());
+}
+
+// "No kRetain" is learned once and then trusted for a while only: a node can
+// be upgraded under a long-lived client.
+TEST(KVClientRetain, UnsupportedVerdictIsAskedAgain) {
+  ::setenv("DFKV_RETAIN_REPROBE_MS", "200", 1);
+  Client cl("ret-sticky");
+  ::unsetenv("DFKV_RETAIN_REPROBE_MS");
+  const std::vector<std::string> keys = {"r1"};
+  uint8_t out[1] = {99};
+  KVClient::RetainRequest set;
+  set.ttl_s = 300;
+  cl.c->BatchRetain(keys, set, out);
+  ASSERT_EQ(out[0], KVClient::kRetUnsupported);
+  int supported = -2;
+  cl.c->RetainLimits(&supported, nullptr);
+  ASSERT_EQ(supported, 0);
+  {
+    std::lock_guard<std::mutex> lk(cl.t.mu);
+    cl.t.retain_supported = true;  // the node was upgraded
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  // A precheck asks nobody: until a probe has heard otherwise, the node
+  // still lacks kRetain as far as it knows.
+  EXPECT_FALSE(cl.c->RetainPrecheck(keys, 5))
+      << "the verdict ran out without anyone asking the node";
+  cl.c->RetainLimits(&supported, nullptr);
+  EXPECT_EQ(supported, 1) << "the node is still taken to lack kRetain";
+  cl.c->BatchRetain(keys, set, out);
+  EXPECT_EQ(out[0], KVClient::kRetMiss) << "SET still reported unsupported";
+}

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Client, retention: a node found without retention support is asked
+  again after `DFKV_RETAIN_REPROBE_MS` (new, default 30000; `0` asks every
+  time), and the existence fallback for such a node no longer holds up the
+  client's other retention calls. The verdict was kept for the life of the
+  client: a client that started during a rolling upgrade kept treating
+  the upgraded nodes as unsupported (SET always `kRetUnsupported`, REFRESH
+  always an existence check, `RetainLimits` and `RetainPrecheck` saying
+  no). `RetainPrecheck`, which asks no node, keeps saying no until a
+  retention call or `RetainLimits` has heard otherwise. And the fallback,
+  a network round trip, ran while holding the lock that every other node
+  group of the batch, `RetainPrecheck` and `RetainLimits` wait for.
 - Client, retention (`dfkv_batch_retain`, REFRESH with a TTL hint): a
   REFRESH skipped by the client's debounce no longer reports a key present
   that is gone or has moved. A REFRESH that finds the key protected counts
