@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- vLLM connector: a LOAD split by `load_window_keys` no longer re-marshals
+  its descriptors window by window. Slicing the flat descriptor batch gave
+  plain lists, so each window rebuilt its pointer and size arrays segment by
+  segment in Python, holding the GIL. A window of the batch now passes the
+  batch's own arrays to the native call from the window's first key, without
+  copying; the native call reads the same descriptors as before. Stand-in
+  benchmark, 4096 keys of 61 segments in windows of 256: 102 ms of Python
+  per batch before, 4 ms after.
+
 - LMCache connector (in-process): lookups no longer queue behind I/O, and
   the synchronous `batched_contains` is supported. PUT, GET and existence
   probes shared one executor (`DFKV_CONNECTOR_GET_PARALLELISM` workers, 1 by

@@ -197,11 +197,69 @@ class SgDescriptorBatch:
             )
         return batch
 
+    def window(self, start: int, stop: int) -> "_SgDescriptorWindow":
+        """Keys ``[start, stop)`` of this batch, without copying: the native
+        call reads this batch's arrays from the window's first key on."""
+        return _SgDescriptorWindow(self, start, stop)
+
+
+class _SgDescriptorWindow:
+    """A key range of an SgDescriptorBatch, usable wherever the batch is.
+
+    The per-key vector arrays and the count array are views into the
+    batch's own (same memory, from ``start`` on); the flat descriptor
+    arrays are the batch's. It keeps the batch alive.
+    """
+
+    __slots__ = (
+        "_parent",
+        "counts",
+        "offsets",
+        "logical_lengths",
+        "num_segments",
+        "total_bytes",
+        "_pointers",
+        "_sizes",
+        "_pointer_vectors",
+        "_size_vectors",
+        "_count_array",
+        "ptrs",
+        "sizes",
+        "caps",
+    )
+
+    def __init__(self, parent: SgDescriptorBatch, start: int, stop: int):
+        nkeys = len(parent.counts)
+        if not 0 <= start <= stop <= nkeys:
+            raise IndexError(f"window [{start}, {stop}) of {nkeys} keys")
+        self._parent = parent
+        self.counts = parent.counts[start:stop]
+        self.offsets = parent.offsets[start:stop]
+        self.logical_lengths = parent.logical_lengths[start:stop]
+        self.num_segments = sum(self.counts)
+        self.total_bytes = sum(self.logical_lengths)
+        self._pointers = parent._pointers
+        self._sizes = parent._sizes
+        n = stop - start
+
+        def view(array, element):
+            return (element * n).from_address(
+                ctypes.addressof(array) + start * ctypes.sizeof(element)
+            )
+
+        self._pointer_vectors = view(
+            parent._pointer_vectors, ctypes.POINTER(c_void_p))
+        self._size_vectors = view(parent._size_vectors, ctypes.POINTER(c_uint64))
+        self._count_array = view(parent._count_array, c_int)
+        self.ptrs = _FlatSgVectors(self, "pointers")
+        self.sizes = _FlatSgVectors(self, "sizes")
+        self.caps = self.sizes
+
 
 def _prebuilt_sg_batch(
     seg_ptrs: Sequence[Sequence[int]],
     seg_lengths: Sequence[Sequence[int]],
-) -> SgDescriptorBatch | None:
+) -> "SgDescriptorBatch | _SgDescriptorWindow | None":
     if not isinstance(seg_ptrs, _FlatSgVectors):
         return None
     if not isinstance(seg_lengths, _FlatSgVectors):

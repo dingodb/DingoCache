@@ -91,7 +91,7 @@ from .data import (
     requires_request_level_loads,
     split_block_contiguous_runs,
 )
-from .dfkv_client import DfkvDeviceClient, SgDescriptorBatch
+from .dfkv_client import DfkvDeviceClient, SgDescriptorBatch, _prebuilt_sg_batch
 from .dfkv_utils import get_dp_engine_index
 from .metrics import DfkvStoreConnectorStats
 from .rail_affinity import physical_affinity_rank
@@ -626,13 +626,19 @@ def _batch_get_auto_sg_windowed(
     if len(windows) == 1:
         return client.batch_get_auto_sg(keys, seg_ptrs, seg_caps)
 
+    # A flat descriptor batch is windowed in place (no per-segment
+    # re-marshalling of each window); plain nested lists are sliced.
+    batch = _prebuilt_sg_batch(seg_ptrs, seg_caps)
     hits: list[bool] = []
     lengths: list[int] = []
     for start, stop in windows:
+        if batch is not None:
+            window = batch.window(start, stop)
+            window_ptrs, window_caps = window.ptrs, window.caps
+        else:
+            window_ptrs, window_caps = seg_ptrs[start:stop], seg_caps[start:stop]
         window_hits, window_lengths = client.batch_get_auto_sg(
-            keys[start:stop],
-            seg_ptrs[start:stop],
-            seg_caps[start:stop],
+            keys[start:stop], window_ptrs, window_caps,
         )
         hits.extend(window_hits)
         lengths.extend(window_lengths)
