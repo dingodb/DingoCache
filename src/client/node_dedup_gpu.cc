@@ -618,6 +618,18 @@ bool GpuNodeDedup::LockOwned(Slot* s, const BlockKey& key, uint64_t token) {
   return true;
 }
 
+bool GpuNodeDedup::FenceLoads() {
+  const char* fence = std::getenv("DFKV_GPU_LOAD_FENCE");
+  if (fence && std::strcmp(fence, "1") != 0) return true;  // switched off
+  EnsureThreadCtx();
+  if (!cu_->CtxSynchronize || cu_->CtxSynchronize() != kCudaSuccess) {
+    load_fence_failures_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  load_fences_.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
 void GpuNodeDedup::PublishSg(const BlockKey& key, uint64_t token,
                              const Seg* segs, size_t nsegs, size_t len) {
   if (!dedup_token::Valid(token)) return;

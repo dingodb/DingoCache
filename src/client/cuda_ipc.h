@@ -94,6 +94,14 @@ class CudaLib {
   CUresult (*StreamCreate)(CUstream*, unsigned) = nullptr;
   CUresult (*StreamSynchronize)(CUstream) = nullptr;
   CUresult (*StreamDestroy)(CUstream) = nullptr;
+  // cuCtxSynchronize on the calling thread's current context. It waits for
+  // all work in that context. The GPUDirect RDMA design guide
+  // ("Synchronization and Memory Ordering") names CUDA synchronization and
+  // work submission calls as what orders GPUDirect RDMA writes before the
+  // CUDA work that follows; a synchronization is the one that does not
+  // depend on which stream the later work uses. Optional: null when the
+  // library lacks it.
+  CUresult (*CtxSynchronize)() = nullptr;
   CUresult (*HostRegister)(void*, size_t, unsigned) = nullptr;
   CUresult (*HostUnregister)(void*) = nullptr;
   CUresult (*IpcGetMemHandle)(CUipcMemHandle*, CUdeviceptr) = nullptr;

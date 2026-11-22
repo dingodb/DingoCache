@@ -107,6 +107,20 @@ class GpuNodeDedup {
   // the dedup win leaked back out through the fallback re-fetches). wait_ms
   // bounds how long the batch waits for publishes as a whole.
   void WaitManySg(WaitItem* items, size_t n);
+  // To be called once after a fetch has returned and before its results are
+  // published. The fetch may have written the destinations over GPUDirect, and
+  // a completion from the NIC does not order those writes before a CUDA copy
+  // issued right after it: PublishSg would gather bytes that have not arrived
+  // and hand them to every waiter. This synchronizes the device context, which
+  // does order them. False: the device could not be synchronized, and nothing
+  // of this fetch may be published (Abort the claims). DFKV_GPU_LOAD_FENCE=0,
+  // the switch that also turns the connectors' fence off, makes this a no-op
+  // that returns true. It synchronizes the calling thread's current context
+  // (the arena's device's primary context if the thread had none), which
+  // waits for all work queued in it, the framework's kernels included. It
+  // assumes the destinations are on that device, as with the connectors,
+  // whose own fence synchronizes the current device too.
+  bool FenceLoads();
   // Gathers the fetched segments (total payload = len bytes) into this
   // process' arena and flips the slot READY.
   void PublishSg(const BlockKey& key, uint64_t token, const Seg* segs,
@@ -122,6 +136,10 @@ class GpuNodeDedup {
   uint64_t fetches() const { return fetches_.load(std::memory_order_relaxed); }
   uint64_t wait_hits() const { return wait_hits_.load(std::memory_order_relaxed); }
   uint64_t wait_timeouts() const { return wait_timeouts_.load(std::memory_order_relaxed); }
+  uint64_t load_fences() const { return load_fences_.load(std::memory_order_relaxed); }
+  uint64_t load_fence_failures() const {
+    return load_fence_failures_.load(std::memory_order_relaxed);
+  }
 
   static constexpr uint32_t kMaxProcs = 64;
 
@@ -196,6 +214,7 @@ class GpuNodeDedup {
   PeerMap peer_map_[kMaxProcs];
 
   std::atomic<uint64_t> hits_{0}, fetches_{0}, wait_hits_{0}, wait_timeouts_{0};
+  std::atomic<uint64_t> load_fences_{0}, load_fence_failures_{0};
 };
 
 }  // namespace dfkv

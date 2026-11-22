@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- Client, GPU dedup (`DFKV_CLIENT_NODE_DEDUP_GPU=1`): the process that
+  fetched a key for the others published it before the fetched bytes were
+  known to have reached device memory. A GPUDirect read writes the caller's
+  device buffers directly, and a completion from the NIC does not order
+  those writes before CUDA work issued right after it; that is why the
+  connectors synchronize the device after a load before they use the
+  buffers. The publish is such CUDA work (a device copy from the buffers
+  into the shared staging arena) and ran before the connector's
+  synchronization, so the other processes could be handed whatever the
+  buffers held before the write arrived, while the fetching process itself
+  saw correct data. The client now synchronizes the device context once per
+  batch after the fetch and before it publishes anything. If that fails
+  nothing of the batch is published and the others fetch for themselves.
+  `DFKV_GPU_LOAD_FENCE=0`, which switches the connectors' fence off, also
+  switches this one off. Cost: one `cuCtxSynchronize` per fetched batch in
+  the fetching process. It waits for all work in the context, the
+  framework's kernels included; the connector's own synchronization right
+  after it then finds nothing left to wait for. That time comes out of the
+  waiting processes' `DFKV_NODE_DEDUP_WAIT_MS`: on a busy device the publish
+  can come too late, and they fetch for themselves. The synchronization is
+  of the fetching thread's current context, so the destinations are assumed
+  to be on its device, as the connectors' own fence assumes. Whether real hardware shows the reordering depends on the
+  platform; the fix follows the ordering rule of the GPUDirect RDMA design
+  guide and was verified against a simulated driver that holds such writes
+  back. New counters `dfkv_client_gpu_dedup_load_fences_total` and
+  `dfkv_client_gpu_dedup_load_fence_failures_total`. Host-memory dedup and
+  processes without GPU dedup are unaffected.
 - SGLang HiCache connector, device-direct (L2-bypass): a process that has
   not moved a page yet now addresses every scatter-gather group of a page.
   With `SGLANG_HICACHE_L2_BYPASS` requested, registering the device pool
