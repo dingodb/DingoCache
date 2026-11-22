@@ -1,10 +1,70 @@
+import glob
+import os
+import re
 import unittest
 
 from dfkv_common.client_metrics import (
+    CLIENT_METRIC_SPECS,
     SnapshotDelta,
     parse_snapshot,
     read_native_snapshot,
 )
+
+_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                    "..", "..", "..", "src")
+# Client-side families of the native snapshot.
+_CLIENT_FAMILY = re.compile(
+    r"# TYPE ((?:dfkv_client_|dfkv_rdma_client_|dfkv_transport_pool_|"
+    r"dfkv_read_scheduler_|dfkv_rdma_endpoint_cache_|dfkv_rdma_cq_)"
+    r"[a-z0-9_]+) (counter|gauge)")
+# Native client families deliberately not mirrored, with the reason.
+_NOT_MIRRORED: dict[str, str] = {}
+
+
+class NativeFamiliesAreMirrored(unittest.TestCase):
+    """Every counter and gauge family the native client declares is either
+    mirrored or listed as deliberately not mirrored. The list lagged: rail
+    failure counters (no compatible rail, remote rail health, cross-rail
+    retries) never reached the inference server's /metrics."""
+
+    def test_every_declared_family_is_mirrored_or_exempt(self):
+        if not os.path.isdir(_SRC):
+            self.skipTest("native sources not available")
+        declared = {}
+        for path in glob.glob(os.path.join(_SRC, "**", "*.[ch]*"),
+                              recursive=True):
+            with open(path, errors="replace") as source:
+                for name, kind in _CLIENT_FAMILY.findall(source.read()):
+                    declared[name] = kind
+        self.assertIn("dfkv_rdma_client_no_compatible_rail_total", declared)
+        missing = sorted(name for name in declared
+                         if name not in CLIENT_METRIC_SPECS
+                         and name not in _NOT_MIRRORED)
+        self.assertEqual(missing, [], "add to client_metrics or _NOT_MIRRORED")
+        wrong_kind = sorted(
+            name for name, kind in declared.items()
+            if name in CLIENT_METRIC_SPECS
+            and CLIENT_METRIC_SPECS[name].kind != kind)
+        self.assertEqual(wrong_kind, [])
+
+    def test_labelled_rail_families_parse(self):
+        text = (
+            'dfkv_rdma_client_rail_wc_errors_total'
+            '{dev="r0",status="RETRY_EXC_ERR"} 2\n'
+            'dfkv_rdma_client_remote_rail_failures_by_rail_total{dev="r1"} 3\n'
+            'dfkv_rdma_client_connection_class_active'
+            '{block_bytes="1048576",depth="4"} 1\n'
+            'dfkv_rdma_client_no_compatible_rail_total 5\n'
+        )
+        self.assertEqual(
+            [(s.name, s.labels, s.value) for s in parse_snapshot(text)],
+            [("dfkv_rdma_client_rail_wc_errors_total",
+              ("r0", "RETRY_EXC_ERR"), 2.0),
+             ("dfkv_rdma_client_remote_rail_failures_by_rail_total",
+              ("r1",), 3.0),
+             ("dfkv_rdma_client_connection_class_active",
+              ("1048576", "4"), 1.0),
+             ("dfkv_rdma_client_no_compatible_rail_total", (), 5.0)])
 
 
 class ClientMetricsTest(unittest.TestCase):
