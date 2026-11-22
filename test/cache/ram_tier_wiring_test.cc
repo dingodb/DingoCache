@@ -154,6 +154,10 @@ class KvNodeServerWiringTestPeer {
   static uint64_t WarmRestarts(KvNodeServer& server) {
     return server.group_.SlabStats().warm_restarts;
   }
+  static size_t PendingRetains(KvNodeServer& server) {
+    std::lock_guard<std::mutex> lk(server.pending_retain_mu_);
+    return server.pending_retain_.size();
+  }
   static uint64_t DrainLimitSeconds(KvNodeServer& server) {
     return server.shutdown_drain_timeout_s_;
   }
@@ -2238,3 +2242,22 @@ TEST(RamTierWiring, ACoalescedReaderDoesNotPromoteTheLeadersOldValue) {
   server.reset();
   fs::remove_all(dir);
 }
+
+// ---- RETAIN for a value that is in RAM but not dirty (REQ-08) ---------------
+// A value that is in RAM as a written (durable) copy while the disk no longer
+// has it: a RETAIN SET can protect nothing. It is a hit, unprotected, and
+// nothing is parked; no flush will ever come to apply a parked SET. It used
+// to be answered kProtectedNew and parked for good.
+TEST(RamTierFlushFailure, ARetainForAWrittenRamCopyIsNotParked) {
+  FlushFailNode node("retain_durable");
+  ASSERT_TRUE(node.server->ram_enabled());
+  ASSERT_EQ(node.Put(1), Status::kOk);
+  ASSERT_TRUE(node.Settled());
+  ASSERT_EQ(node.Metric("dfkv_ram_flushed_total"), 1);
+  ASSERT_EQ(node.stores[0]->Remove(BlockKey{1, 0}), Status::kOk);  // disk only
+  ASSERT_TRUE(KvNodeServerWiringTestPeer::Resident(*node.server, BlockKey{1, 0}));
+  EXPECT_EQ(node.RetainSet(1, 600),
+            static_cast<int>(SlabAllocator::RetainCode::kHitUnprotected));
+  EXPECT_EQ(KvNodeServerWiringTestPeer::PendingRetains(*node.server), 0u);
+}
+
