@@ -2631,3 +2631,34 @@ TEST(RamTier, OperationsOnAKeyWithAColdReadReservationDoNotWaitForIt) {
     }
   }
 }
+
+// ---- A disk that will never take a value (STO-30) ----------------------------
+// kInvalid (too large for the disk) and kQuotaExceeded are final answers of a
+// healthy disk: no retries, no health change, not counted as lost. A waiting
+// PUT gets the disk's answer. They used to be retried and then dropped as a
+// failure, an acknowledged value counted as lost and the tier unhealthy.
+TEST(RamTierFlushFailure, AValueTheDiskRefusesIsDroppedAtOnceNotLost) {
+  for (Status refusal : {Status::kInvalid, Status::kQuotaExceeded}) {
+    SCOPED_TRACE(static_cast<int>(refusal));
+    NoRoomSink sink;
+    sink.answer = [refusal](int) { return refusal; };
+    RamTier rt(RetryOpts(5, 10), sink.fn());
+    const std::string value(500, 'x');
+    ASSERT_EQ(rt.PutWriteBack(K(1), value.data(), value.size()).status,
+              Status::kOk);
+    ASSERT_TRUE(WaitFor([&] { return rt.FlushRefused() == 1u; }));
+    EXPECT_EQ(sink.calls.load(), 1);
+    EXPECT_FALSE(rt.Contains(K(1)));
+    const RamTier::PutResult waited =
+        rt.PutCommitted(K(2), value.data(), value.size());
+    EXPECT_EQ(waited.status, refusal);
+    EXPECT_EQ(waited.flush, RamTier::FlushOutcome::kRefused);
+    EXPECT_EQ(sink.calls.load(), 2);
+    EXPECT_EQ(rt.FlushRefused(), 2u);
+    EXPECT_EQ(rt.FlushRetries(), 0u);
+    EXPECT_EQ(rt.FlushDropped(), 0u);
+    EXPECT_EQ(rt.PostAckFlushFailures(), 0u);
+    EXPECT_EQ(rt.DirtyObjects(), 0u);
+    EXPECT_TRUE(rt.healthy());
+  }
+}

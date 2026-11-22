@@ -329,6 +329,9 @@ class RamTier {
     // The disk had no room for it (kCacheFull); the value is gone and the
     // PUT is answered kCacheFull: not stored, the node is fine.
     kNoRoom,
+    // The disk will never take it (kInvalid: too large for it, or
+    // kQuotaExceeded); the value is gone, the PUT gets that answer.
+    kRefused,
     // The PUT stopped waiting before the flush ended (Options::put_wait_ms
     // passed, or the server is stopping). Status kCacheFull: the value still
     // owns the key and may yet reach disk; this PUT did not see it.
@@ -489,6 +492,10 @@ class RamTier {
   uint64_t FlushNoRoomDropped() const {
     return flush_no_room_dropped_.load(std::memory_order_relaxed);
   }
+  // Values dropped because the disk refused them for good (Refused()).
+  uint64_t FlushRefused() const {
+    return flush_refused_.load(std::memory_order_relaxed);
+  }
   std::string AckToDurableLatencyMetrics(const std::string& labels) const {
     return ack_to_durable_latency_.Render(
         "dfkv_ram_ack_to_durable_latency_seconds", labels);
@@ -519,6 +526,8 @@ class RamTier {
     // thread that holds the reservation finishes it, after its disk read and
     // reply, so nothing else may wait for it: that thread may be the waiter.
     bool reservation = false;
+    // With outcome kRefused: what the disk answered.
+    Status refused = Status::kIOError;
   };
   struct Entry {
     BlockKey key;
@@ -616,7 +625,12 @@ class RamTier {
   static void CompletePut(const std::shared_ptr<PutCompletion>& completion,
                           bool success);
   static void CompletePut(const std::shared_ptr<PutCompletion>& completion,
-                          FlushOutcome outcome);
+                          FlushOutcome outcome,
+                          Status refused = Status::kIOError);
+  // A flush answer of a healthy disk that will never take the value.
+  static bool Refused(Status st) {
+    return st == Status::kInvalid || st == Status::kQuotaExceeded;
+  }
   static Status WaitPut(const std::shared_ptr<PutCompletion>& completion,
                         FlushOutcome* outcome = nullptr);
   // Every wait of a PUT for the value that owns its key: bounded by
@@ -710,6 +724,7 @@ class RamTier {
   std::atomic<uint64_t> flush_retries_{0};
   std::atomic<uint64_t> flush_no_room_{0};
   std::atomic<uint64_t> flush_no_room_dropped_{0};
+  std::atomic<uint64_t> flush_refused_{0};
   // The stop sequence is waiting for the backlog (WaitForDrain): attempts
   // are no longer spaced out, so a failing object is given up at once
   // instead of holding the stop for its backoff.

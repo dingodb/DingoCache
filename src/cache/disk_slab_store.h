@@ -287,6 +287,7 @@ class DiskSlabStore : public StoreEngine {
   uint32_t RetainHeadroomPct() const override {
     return alloc_ ? alloc_->RetentionHeadroomPct() : 0;
   }
+  uint64_t MaxValueBytes() const override { return opt_.extent_bytes; }
   uint32_t RetainMaxTtl() const override {
     return retain_enabled_ ? retain_max_ttl_s_ : 0;
   }

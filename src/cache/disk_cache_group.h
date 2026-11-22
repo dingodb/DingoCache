@@ -70,6 +70,8 @@ class DiskCacheGroup {
   // every PUT: one atomic read per disk while all are healthy, and the key
   // is routed only once one has failed.
   bool DiskFailedFor(const BlockKey& key) const;
+  // The largest value every disk can store (the smallest engine limit).
+  uint64_t MaxValueBytes() const;
   const std::string& StartupError() const { return startup_error_; }
 
   Status Cache(const BlockKey& key, const void* data, size_t len);

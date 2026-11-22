@@ -2261,3 +2261,24 @@ TEST(RamTierFlushFailure, ARetainForAWrittenRamCopyIsNotParked) {
   EXPECT_EQ(KvNodeServerWiringTestPeer::PendingRetains(*node.server), 0u);
 }
 
+// ---- Values the disk will never take (STO-30) -------------------------------
+// A value larger than the disk's extent can never be stored there. It must
+// not be acknowledged from RAM and then dropped as acknowledged data lost
+// with the tier unhealthy: the PUT is answered kInvalid, as the disk answers
+// it, and the node stays healthy.
+TEST(RamTierFlushFailure, AValueTooLargeForTheDiskIsNotAcknowledgedAndLost) {
+  FlushFailNode node("too_large");  // 1 MiB extents
+  ASSERT_TRUE(node.server->ram_enabled());
+  const std::string value((1 << 20) + 4096, 'L');
+  std::string out;
+  EXPECT_EQ(node.server->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), BlockKey{7, 0}, 0, 0,
+                value.data(), value.size(), &out),
+            Status::kInvalid);
+  std::this_thread::sleep_for(5s);  // longer than all failure retries
+  EXPECT_EQ(node.Metric("dfkv_ram_post_ack_flush_failures_total"), 0);
+  EXPECT_EQ(node.Metric("dfkv_ram_flush_dropped_total"), 0);
+  EXPECT_EQ(node.Metric("dfkv_ram_healthy"), 1);
+  EXPECT_TRUE(node.server->Healthy());
+  EXPECT_EQ(node.Put(8), Status::kOk) << "an ordinary value is still taken";
+}

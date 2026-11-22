@@ -461,6 +461,12 @@ bool DiskCacheGroup::Healthy() const {
   return true;
 }
 
+uint64_t DiskCacheGroup::MaxValueBytes() const {
+  uint64_t max = disks_.empty() ? 0 : UINT64_MAX;
+  for (const auto& disk : disks_) max = std::min(max, disk->MaxValueBytes());
+  return max;
+}
+
 bool DiskCacheGroup::DiskFailedFor(const BlockKey& key) const {
   // While every disk is healthy this is one atomic read per disk and no
   // routing: the key's disk is looked up only once some store has failed.
