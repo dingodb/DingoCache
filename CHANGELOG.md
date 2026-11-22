@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+
+- Server, RDMA: with the default inline threshold, a PUT over RDMA of an
+  object larger than the server's `--max-msg` (default 32 MiB) is answered
+  `kInvalid` at once. A client whose `DFKV_RDMA_MAX_BLOCK_BYTES` is higher
+  (64 MiB, for example) sends such an object down the leased path, and the
+  server dropped the connection without an answer: the client waited out
+  `DFKV_RDMA_OP_TIMEOUT_MS`, or `DFKV_RDMA_BATCH_OP_TIMEOUT_MS` when set
+  (5 s by default), counted a completion timeout and an I/O error, and
+  cooled a healthy node, so the PUTs after it were skipped as well. The same
+  happens with 2.35.7. The client takes `kInvalid` as not cached and keeps
+  the node; the server counts `dfkv_rdma_leaseput_oversize_rejects_total`
+  and logs a WARN with the peer address the first time and every 1024th.
+  Paths that declare a connection by object size (an inline threshold of 0
+  or at or above `--max-msg`, a retry on a fresh connection) still have the
+  connection refused, and TCP still drops it: keep the client's bound at or
+  below the server's `--max-msg`, and always against 2.42.0 or earlier.
 - Server, slab store and RAM tier: the free slots the background pass keeps
   ahead of a size class's writers are bounded in bytes, at least 64 MiB and
   at most 1 GiB of slots (still at most a quarter of the class), instead of

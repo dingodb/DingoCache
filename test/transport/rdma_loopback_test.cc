@@ -4029,6 +4029,53 @@ TEST(RdmaLoopback, BatchPutOversizedFailsOnlyOffender) {
   EXPECT_TRUE(c.Exist("bpo_c"));
 }
 
+// A PUT larger than the server's payload ceiling (--max-msg) but within the
+// client's own bound (DFKV_RDMA_MAX_BLOCK_BYTES) goes the leased path. The
+// server refused its lease request by dropping the connection without an
+// answer: the client waited out its completion deadline (5 s), counted a
+// timeout and cooled a healthy node. It is answered kInvalid now, at once,
+// and the node goes on serving.
+TEST(RdmaLoopback, LeasedPutAboveServerCeilingIsRefusedNotTimedOut) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv inline_put("DFKV_RDMA_INLINE_PUT_MAX_BYTES", "65536");
+  ScopedEnv block("DFKV_RDMA_MAX_BLOCK_BYTES", "1048576");
+  RdmaNode node("lease-oversize");  // server ceiling kMaxMsg (256 KiB)
+  RdmaTransport rt(1u << 20);
+  const std::string big(2 * kMaxMsg, 'B');
+  const std::string fits(kMaxMsg / 2, 'f');  // leased too, under the ceiling
+  for (const bool batch : {false, true}) {
+    SCOPED_TRACE(batch ? "batch" : "single");
+    const BlockKey big_key =
+        ToBlockKey(SelfHdr(), std::string("oversize-big-") + (batch ? "b" : "s"));
+    const BlockKey fits_key =
+        ToBlockKey(SelfHdr(), std::string("oversize-fits-") + (batch ? "b" : "s"));
+    const auto start = std::chrono::steady_clock::now();
+    std::vector<Status> statuses;
+    if (batch)
+      statuses = rt.CacheMany(node.addr, {{big_key, big.data(), big.size()},
+                                          {fits_key, fits.data(), fits.size()}});
+    else
+      statuses = {rt.Cache(node.addr, big_key, big.data(), big.size())};
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_EQ(statuses[0], Status::kInvalid);
+    // Per object: the item that fits, in the same batch, is stored.
+    if (batch) EXPECT_EQ(statuses[1], Status::kOk);
+    EXPECT_LT(elapsed, std::chrono::seconds(1)) << "waited for a deadline";
+    // The node was not cooled and the connection still serves.
+    EXPECT_EQ(rt.Cache(node.addr, fits_key, fits.data(), fits.size()),
+              Status::kOk);
+    const std::string client = rt.MetricsText();
+    EXPECT_EQ(CounterVal(client, "dfkv_rdma_client_completion_timeouts_total"),
+              0)
+        << client;
+  }
+  EXPECT_EQ(CounterVal(node.rsrv->MetricsText(),
+                       "dfkv_rdma_leaseput_oversize_rejects_total"),
+            2);
+}
+
 // Same-host GET rendezvous (phase 5): with DFKV_CLIENT_NODE_DEDUP=1, a second
 // client reading the SAME keys must be served from the shm rendezvous, not the
 // server — server-side completions stay ~flat while the data stays correct.

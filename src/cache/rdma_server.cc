@@ -1184,12 +1184,14 @@ void RdmaServer::Serve(
 
     const char* frame = ep.rbuf(recv_slot);
     if (completion.byte_len < kReqPrefix) return false;
-    // A leased-PUT request names the OBJECT size, not an inline payload: its
-    // bound is the process-wide payload ceiling, not this connection's
-    // inline class. Every other control op keeps the conn_max bound.
+    // A leased-PUT request names the OBJECT size, not an inline payload: it
+    // carries no payload of its own, and an object above the process-wide
+    // payload ceiling is refused with an answer (build_reply), not by
+    // dropping the connection. Every other control op keeps the conn_max
+    // bound.
     const uint64_t send_max_payload =
         static_cast<uint8_t>(frame[1]) == static_cast<uint8_t>(WireOp::kLeasePut)
-            ? static_cast<uint64_t>(max_msg_)
+            ? std::numeric_limits<uint64_t>::max()
             : static_cast<uint64_t>(conn_max);
     if (!DecodeReqVersion(frame, wire_epoch, &request->fields,
                           send_max_payload)) {
@@ -1209,12 +1211,10 @@ void RdmaServer::Serve(
     if (request->fields.op == static_cast<uint8_t>(WireOp::kLeasePut)) {
       // Leased-PUT staging request. The object itself arrives later as one
       // or more WRITE_WITH_IMM windows into the leased range, so this request
-      // only needs to prove the object geometry is legal and the slot has no
-      // in-flight lease/multi-window state. A lease larger than the logical
-      // --max-msg bound is a permanent fault, not backpressure.
+      // only needs to prove the slot has no in-flight lease/multi-window
+      // state. An object larger than --max-msg is answered kInvalid.
       if (!leased_put_requested ||
           request->fields.payload_len == 0 ||
-          request->fields.payload_len > static_cast<uint64_t>(max_msg_) ||
           lease_put[recv_slot].active || multi_put[recv_slot].active)
         return false;
       return true;
@@ -1437,6 +1437,19 @@ void RdmaServer::Serve(
       // client treats kCacheFull like a saturated pull slot and may retry.
       const size_t slot = request.recv_slot;
       const uint64_t want = fields.payload_len;
+      // An object this server will never take is a final answer to the
+      // client, not a fault of the connection: dropping the connection
+      // without a reply left the client to time out and cool a healthy node.
+      if (want > static_cast<uint64_t>(max_msg_)) {
+        const uint64_t n =
+            lease_put_oversize_rejects_.fetch_add(1, std::memory_order_relaxed);
+        if (n == 0 || (n & 0x3FFu) == 0)
+          DFKV_LOG_WARN("rdma: PUT of " + std::to_string(want) +
+                        "B refused (kInvalid): above this server's --max-msg " +
+                        std::to_string(max_msg_) + "B. peer=" + peer_addr +
+                        " rejects=" + std::to_string(n + 1));
+        return invalid_reply();
+      }
       const size_t region = rdma::V2SlotSize(want);
       if (region == 0) return false;
       LeasePutState& state = lease_put[slot];
@@ -2246,6 +2259,9 @@ std::string RdmaServer::MetricsText() const {
   m(s, "dfkv_rdma_leaseput_busy_rejects_total", "counter",
     "Leased-PUT requests refused because the receive pool was exhausted",
     lease_put_busy_rejects_);
+  m(s, "dfkv_rdma_leaseput_oversize_rejects_total", "counter",
+    "Leased-PUT requests refused (kInvalid) for an object above --max-msg",
+    lease_put_oversize_rejects_);
   m(s, "dfkv_rdma_leaseput_active", "gauge",
     "In-flight leased-PUT staging leases currently held",
     lease_put_active_);
