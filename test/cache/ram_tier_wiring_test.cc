@@ -2282,3 +2282,45 @@ TEST(RamTierFlushFailure, AValueTooLargeForTheDiskIsNotAcknowledgedAndLost) {
   EXPECT_TRUE(node.server->Healthy());
   EXPECT_EQ(node.Put(8), Status::kOk) << "an ordinary value is still taken";
 }
+
+// The production write path end to end: a RAM-acknowledged PUT flushed by the
+// RAM tier through DiskCacheGroup to a slab store in direct (O_DIRECT) mode.
+// Unit tests run with DFKV_SLAB_WRITE=buffered by default; this one pins
+// direct so that path stays covered.
+TEST(RamTierWiring, ARamFlushReachesADirectModeSlabThroughTheGroup) {
+  RamTierEnv env;
+  ::setenv("DFKV_SLAB_WRITE", "direct", 1);
+  const auto dir = fs::temp_directory_path() / "dfkv_ramwire_direct_slab";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  {
+    auto server = KvNodeServerWiringTestPeer::Create(
+        DiskCacheGroup::Options{{dir.string()}, 1ull << 30, "slab"});
+    ASSERT_TRUE(server->Healthy());
+    ASSERT_TRUE(server->ram_enabled());
+    const std::string metrics = server->MetricsText();
+    if (metrics.find("write_mode=\"direct\"") == std::string::npos) {
+      ::unsetenv("DFKV_SLAB_WRITE");
+      GTEST_SKIP() << "the test filesystem does not take O_DIRECT";
+    }
+    const BlockKey key{8401, 0};
+    const std::string value(3 * 4096 + 100, 'd');
+    std::string out;
+    ASSERT_EQ(server->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kCache),
+                                           key, 0, 0, value.data(),
+                                           value.size(), &out),
+              Status::kOk);
+    ASSERT_TRUE(WaitFor([&] {
+      return MetricVal(server->MetricsText(), "dfkv_ram_flushed_total") == 1;
+    }));
+    EXPECT_EQ(MetricVal(server->MetricsText(),
+                        "dfkv_slab_dio_write_fallback_total"),
+              0);
+    std::string disk;
+    ASSERT_EQ(KvNodeServerWiringTestPeer::DiskRead(*server, key, &disk),
+              Status::kOk);
+    EXPECT_EQ(disk, value);
+  }
+  ::unsetenv("DFKV_SLAB_WRITE");
+  fs::remove_all(dir);
+}
