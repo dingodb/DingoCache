@@ -79,7 +79,20 @@ class ReadScheduler {
     {
       std::lock_guard<std::mutex> lock(mu_);
       queue_.push_back(job);
-      EnsureWorkersLocked();
+      // The job refers to this frame. If a worker cannot be started (no
+      // memory, no thread), unwinding here would leave it to a worker that
+      // runs later on freed memory: wait for it as usual when a worker
+      // exists, take it back first when none does.
+      try {
+        EnsureWorkersLocked();
+      } catch (...) {
+        if (workers_.empty()) {
+          queue_.pop_back();
+          pending_batches_.fetch_sub(1, std::memory_order_relaxed);
+          pending_shards_.fetch_sub(count, std::memory_order_relaxed);
+          throw;
+        }
+      }
     }
     ready_.notify_one();
 
