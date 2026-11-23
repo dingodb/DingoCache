@@ -5,6 +5,7 @@
 #include <string>
 
 #include "transport/dev_frame.h"
+#include "transport/rdma_protocol.h"
 
 // Startup fail-fast wiring lives in the RDMA transport/server: only RDMA
 // builds compile that coverage below; elsewhere it is compiled away (same
@@ -205,5 +206,50 @@ TEST(DevFrameCaps, OversizedAnchorWarnsButServerStillStarts) {
 }
 
 #endif  // DFKV_WITH_RDMA
+
+
+// RDS-01: the session-channel request bit is a capability, never part of
+// the declared block size, and readiness acknowledges it only to a client
+// that asked.
+TEST(DevFrameCaps, SessionRequestDoesNotChangeBlockGeometry) {
+  char frame[rdma::kDevNameBytes];
+  const uint64_t declared = 1u << 20;
+  rdma::EncodeDevFrame("ib0", declared | rdma::kDevFrameRequestSessionFd,
+                       frame, rdma::kDevProtoV2);
+  EXPECT_TRUE(rdma::DevFrameRequestsSessionFd(frame));
+  EXPECT_EQ(rdma::ParseDevFrameMaxBlock(frame), declared);
+  rdma::EncodeDevFrame("ib0", declared, frame, rdma::kDevProtoV2);
+  EXPECT_FALSE(rdma::DevFrameRequestsSessionFd(frame));
+}
+
+TEST(DevFrameCaps, SessionReadinessIsSeenOnlyByAClientThatAsked) {
+  const rdma::RecvSegmentInfo info{0x1000, 7, 2 * rdma::kV2DataOffset};
+  char plain[rdma::kV2DynamicOnlyReadinessBytes];
+  char kept[rdma::kV2DynamicOnlyReadinessBytes];
+  rdma::EncodeV2DynamicOnlyReadiness(info, plain);
+  rdma::EncodeV2DynamicOnlyReadiness(info, kept, true);
+  rdma::RecvSegmentInfo out;
+  bool session = true;
+  // A client that asked: told whether the server kept the channel.
+  ASSERT_TRUE(rdma::DecodeV2DynamicOnlyReadiness(plain, sizeof(plain), &out,
+                                                 &session));
+  EXPECT_FALSE(session);
+  ASSERT_TRUE(rdma::DecodeV2DynamicOnlyReadiness(kept, sizeof(kept), &out,
+                                                 &session));
+  EXPECT_TRUE(session);
+  // A client that did not ask (and every older one) accepts only byte 0 = 1.
+  EXPECT_TRUE(rdma::DecodeV2DynamicOnlyReadiness(plain, sizeof(plain), &out));
+  EXPECT_FALSE(rdma::DecodeV2DynamicOnlyReadiness(kept, sizeof(kept), &out));
+}
+
+TEST(DevFrameCaps, SessionProbeCapabilityIsItsOwnBit) {
+  char reply[rdma::kV2ProbeReplyBytes];
+  rdma::EncodeV2ProbeReply(reply);
+  EXPECT_FALSE(rdma::V2ProbeSupportsSessionFd(reply));
+  EXPECT_TRUE(rdma::V2ProbeSupportsDynamicOnly(reply));
+  rdma::EncodeV2ProbeReply(reply, rdma::kV2ProbeCapDynamicOnly |
+                                      rdma::kV2ProbeCapSessionFd);
+  EXPECT_TRUE(rdma::V2ProbeSupportsSessionFd(reply));
+}
 
 }  // namespace dfkv::rdma

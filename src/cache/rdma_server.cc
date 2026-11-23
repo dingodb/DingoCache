@@ -12,6 +12,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <cerrno>
 #include <deque>
 #include <chrono>
@@ -227,6 +229,8 @@ RdmaServer::RdmaServer(Handler handler, size_t max_msg,
   }
   if (anchor_devs_.empty()) anchor_devs_.push_back("");
   dev_name_ = anchor_devs_.front();
+  session_fd_enabled_ =
+      config_dump::EnvBool("DFKV_RDMA_SESSION_FD", false);
 }
 
 RdmaServer::~RdmaServer() { Stop(); }
@@ -419,6 +423,28 @@ Status RdmaServer::Start(int port) {
                   std::to_string(anchors_.size()) + "/" +
                   std::to_string(anchor_devs_.size()) +
                   " devices pinned");
+  if (session_fd_enabled_) {
+    session_epoll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
+    session_stop_fd_ = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    epoll_event stop{};
+    stop.events = EPOLLIN;
+    stop.data.u64 = 0;  // session ids start at 1
+    if (session_epoll_fd_ < 0 || session_stop_fd_ < 0 ||
+        ::epoll_ctl(session_epoll_fd_, EPOLL_CTL_ADD, session_stop_fd_,
+                    &stop) != 0) {
+      DFKV_LOG_WARN(std::string("rdma: no session channels (") +
+                    std::strerror(errno) + "); DFKV_RDMA_SESSION_FD is off");
+      if (session_epoll_fd_ >= 0) ::close(session_epoll_fd_);
+      if (session_stop_fd_ >= 0) ::close(session_stop_fd_);
+      session_epoll_fd_ = session_stop_fd_ = -1;
+      session_fd_enabled_ = false;
+    } else {
+      session_thread_ = std::thread([this] {
+        NameThisThread("rdma-session");
+        SessionWatchLoop();
+      });
+    }
+  }
   running_ = true;
   accept_thread_ =
       std::thread([this] { NameThisThread("rdma-accept"); AcceptLoop(); });
@@ -499,6 +525,56 @@ void RdmaServer::Quiesce() {
     conns.swap(conns_);
   }
   for (auto& c : conns) if (c.th.joinable()) c.th.join();
+  // Every Serve thread has ended and unwatched its session.
+  if (session_thread_.joinable()) {
+    const uint64_t one = 1;
+    ssize_t n = ::write(session_stop_fd_, &one, sizeof(one));
+    (void)n;
+    session_thread_.join();
+    ::close(session_epoll_fd_);
+    ::close(session_stop_fd_);
+    session_epoll_fd_ = session_stop_fd_ = -1;
+  }
+}
+
+void RdmaServer::SessionWatchLoop() {
+  epoll_event events[64];
+  for (;;) {
+    const int n = ::epoll_wait(session_epoll_fd_, events, 64, -1);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      return;
+    }
+    for (int i = 0; i < n; ++i) {
+      const uint64_t id = events[i].data.u64;
+      if (id == 0) return;  // stop
+      std::lock_guard<std::mutex> lock(session_mu_);
+      const auto found = sessions_.find(id);
+      if (found == sessions_.end()) continue;  // unwatched meanwhile
+      // The client's end closed: it has dropped the connection.
+      session_peer_closed_.fetch_add(1, std::memory_order_relaxed);
+      found->second->Wake();
+      sessions_.erase(found);
+    }
+  }
+}
+
+uint64_t RdmaServer::WatchSession(int fd, rdma::RcEndpoint* ep) {
+  std::lock_guard<std::mutex> lock(session_mu_);
+  const uint64_t id = next_session_id_++;
+  epoll_event event{};
+  // Not EPOLLIN: the client sends nothing on it; only its close matters.
+  event.events = EPOLLRDHUP | EPOLLONESHOT;
+  event.data.u64 = id;
+  if (::epoll_ctl(session_epoll_fd_, EPOLL_CTL_ADD, fd, &event) != 0) return 0;
+  sessions_.emplace(id, ep);
+  return id;
+}
+
+void RdmaServer::UnwatchSession(uint64_t id, int fd) {
+  std::lock_guard<std::mutex> lock(session_mu_);
+  sessions_.erase(id);
+  ::epoll_ctl(session_epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
 }
 
 // Join and drop any Serve threads that have already finished. Called from
@@ -803,7 +879,11 @@ void RdmaServer::Serve(
   // Capability probes are answered without creating a QP.
   if (rdma::IsV2Probe(devbuf)) {
     char reply[rdma::kV2ProbeReplyBytes];
-    rdma::EncodeV2ProbeReply(reply);
+    rdma::EncodeV2ProbeReply(
+        reply, rdma::kV2ProbeCapWriterRetirement | rdma::kV2ProbeCapPullRead |
+                   rdma::kV2ProbeCapLeasedPut | rdma::kV2ProbeCapDynamicPull |
+                   rdma::kV2ProbeCapDynamicOnly |
+                   (session_fd_enabled_ ? rdma::kV2ProbeCapSessionFd : 0));
     net::WriteAll(boot_fd, reply, sizeof(reply));
     close_boot();
     return;
@@ -819,6 +899,9 @@ void RdmaServer::Serve(
       rdma::DevFrameRequestsDynamicPull(devbuf);
   const bool dynamic_only_requested =
       rdma::DevFrameRequestsDynamicOnly(devbuf);
+  // Kept only for a client that asked, and only on the dynamic-only path.
+  const bool keep_session = session_fd_enabled_ && dynamic_only_requested &&
+                            rdma::DevFrameRequestsSessionFd(devbuf);
   const uint64_t declared = rdma::ParseDevFrameMaxBlock(devbuf);
   if (rdma::ParseDevFrameProtocol(devbuf) != rdma::kDevProtoV2 ||
       declared == 0 || !dynamic_pull_requested || !pull_read_requested ||
@@ -1123,12 +1206,33 @@ void RdmaServer::Serve(
   char readiness[rdma::kV2RetirementReadinessBytes];
   const size_t readiness_bytes =
       dynamic_only_requested
-          ? rdma::EncodeV2DynamicOnlyReadiness(info, readiness)
+          ? rdma::EncodeV2DynamicOnlyReadiness(info, readiness, keep_session)
           : rdma::EncodeV2Readiness(info, legacy_token, readiness);
   const bool ok =
       readiness_bytes != 0 &&
       net::WriteAll(boot_fd, readiness, readiness_bytes);
-  close_boot();
+  // The session channel: the bootstrap socket, kept. Closed when this
+  // connection ends, whatever ends it, which tells the client.
+  struct SessionChannel {
+    RdmaServer* server;
+    int fd = -1;
+    uint64_t id = 0;
+    ~SessionChannel() {
+      if (fd < 0) return;
+      if (id != 0) server->UnwatchSession(id, fd);
+      ::close(fd);
+    }
+  } session{this};
+  if (ok && keep_session) {
+    {
+      std::lock_guard<std::mutex> lock(handshake_mu_);
+      handshake_fds_.erase(boot_fd);
+    }
+    session.fd = boot_fd;
+    sessions_kept_.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    close_boot();
+  }
   if (!ok) {
     return;
   }
@@ -1156,6 +1260,9 @@ void RdmaServer::Serve(
                           &served_any,
                           &holding_grants});
   }
+  // From now on a close of the client's end wakes this thread, which ends
+  // the connection (WaitComp returns -1, as for Stop).
+  if (session.fd >= 0) session.id = WatchSession(session.fd, &ep);
   ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
 
   // Send-slot free list (a reply uses one send slot until its SEND completes).
@@ -2564,6 +2671,13 @@ std::string RdmaServer::MetricsText() const {
   m(s, "dfkv_rdma_v2_ready", "gauge",
     "Whether RDMA v2 has a registered shared receive segment",
     recv_segment_registered_rails_ > 0 ? 1 : 0);
+  m(s, "dfkv_rdma_sessions_kept_total", "counter",
+    "Connections that kept their bootstrap socket as a session channel "
+    "(DFKV_RDMA_SESSION_FD)",
+    sessions_kept_.load(std::memory_order_relaxed));
+  m(s, "dfkv_rdma_session_peer_closed_total", "counter",
+    "Connections ended because their client closed its session channel",
+    session_peer_closed_.load(std::memory_order_relaxed));
   m(s, "dfkv_rdma_segment_evictions_total", "counter",
      "Connections evicted to free shared receive segment space",
      segment_evictions_.load(std::memory_order_relaxed));

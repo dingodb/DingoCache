@@ -1,6 +1,8 @@
 #include "common/config_dump.h"
 #include "transport/rdma_transport.h"
 
+#include <sys/resource.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -421,6 +423,12 @@ struct RdmaTransport::Conn {
 
   rdma::ConnectionLifecycle lifecycle;
   bool keepalive_probe = false;  // a keepalive, not an application op, is in flight
+  // The bootstrap socket kept as session channel (DFKV_RDMA_SESSION_FD); -1
+  // without one. The server closes its end when it ends the connection.
+  int session_fd = -1;
+  ~Conn() {
+    if (session_fd >= 0) ::close(session_fd);
+  }
   void Encode(char* out, WireOp op, const BlockKey& key, uint64_t offset,
               uint64_t length, uint64_t payload_len) const {
     EncodeReqVersion(out, kNativeProtoRdmaV2, op, key, offset, length,
@@ -761,6 +769,21 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
                               std::to_string(keepalive_ms_));
   config_dump::RecordResolved("DFKV_RDMA_KEEPALIVE_MS",
                               std::to_string(keepalive_ms_));
+  session_fd_enabled_ = config_dump::EnvBool("DFKV_RDMA_SESSION_FD", false);
+  if (session_fd_enabled_) {
+    // One more descriptor per pooled connection: raise the soft limit to
+    // the hard one, as the MDS does for its connections.
+    rlimit nofile{};
+    if (::getrlimit(RLIMIT_NOFILE, &nofile) == 0 &&
+        nofile.rlim_cur < nofile.rlim_max) {
+      rlimit raised = nofile;
+      raised.rlim_cur = nofile.rlim_max;
+      if (::setrlimit(RLIMIT_NOFILE, &raised) == 0)
+        DFKV_LOG_INFO("rdma: DFKV_RDMA_SESSION_FD raised the open-file soft "
+                      "limit from " + std::to_string(nofile.rlim_cur) +
+                      " to " + std::to_string(raised.rlim_cur));
+    }
+  }
   // An explicit limit remains a hard per-pool retention limit. With no
   // override, only data endpoints get a bounded, expiring burst allowance.
   const int pool_override = EnvBoundedInt(
@@ -946,6 +969,12 @@ void RdmaTransport::MaintainIdle(uint64_t now_us, bool send_keepalives) {
     if (!peer_topologies_->IsCurrent(conn->node, conn->peer_id,
                                      conn->peer_publication)) {
       stale_publication_reaps_.fetch_add(1, std::memory_order_relaxed);
+      Destroy(conn, rdma::RailCompletion::kAdmission);
+      continue;
+    }
+    // Ended by the server: a keepalive would only wait out RC retries.
+    if (SessionClosed(*conn)) {
+      session_closed_reaps_.fetch_add(1, std::memory_order_relaxed);
       Destroy(conn, rdma::RailCompletion::kAdmission);
       continue;
     }
@@ -1453,11 +1482,24 @@ void RdmaTransport::NoteNegotiatedDepth(const std::string& node, Lane lane,
   if (it == map.end() || remote_depth < it->second) map[node] = remote_depth;
 }
 
+bool RdmaTransport::SessionClosed(const Conn& conn) {
+  if (conn.session_fd < 0) return false;
+  char byte;
+  const ssize_t got =
+      ::recv(conn.session_fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+  // 0: the server closed its end. The server sends nothing on it, so any
+  // other answer than "nothing yet" is a dead channel too.
+  return got == 0 || (got < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                      errno != EINTR) ||
+         got > 0;
+}
+
 RdmaTransport::ProbeResult RdmaTransport::ProbeV2(
     const std::string& node, bool* leased_put_supported,
-    int timeout_ms) const {
+    int timeout_ms, bool* session_fd_supported) const {
   v2_probe_attempts_.fetch_add(1, std::memory_order_relaxed);
   if (leased_put_supported) *leased_put_supported = false;
+  if (session_fd_supported) *session_fd_supported = false;
   int fd = DialNode(node, timeout_ms > 0 ? timeout_ms : connect_ms_,
                      timeout_ms > 0 ? timeout_ms : io_ms_);
   if (fd < 0) {
@@ -1478,11 +1520,13 @@ RdmaTransport::ProbeResult RdmaTransport::ProbeV2(
       rdma::V2ProbeSupportsDynamicPull(reply) &&
       rdma::V2ProbeSupportsPullRead(reply);
   const bool leased = ok && rdma::V2ProbeSupportsLeasedPut(reply);
+  const bool session = ok && rdma::V2ProbeSupportsSessionFd(reply);
   ::close(fd);
   if (!ok)
     v2_probe_failures_.fetch_add(1, std::memory_order_relaxed);
   else if (leased_put_supported)
     *leased_put_supported = leased;
+  if (ok && session_fd_supported) *session_fd_supported = session;
   return ok ? ProbeResult::kSupported
             : closed ? ProbeResult::kClosed : ProbeResult::kRejected;
 }
@@ -1770,6 +1814,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
 
   std::vector<std::pair<void*, size_t>> pools;
   std::vector<Conn*> stale;
+  std::vector<Conn*> session_reaped;
   Conn* pooled = nullptr;
   bool snapshot_current = false;
   {
@@ -1787,44 +1832,58 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
         auto& pool_candidates = it->second;
         for (size_t i = pool_candidates.size(); i > 0; --i) {
           Conn* candidate = pool_candidates[i - 1];
-          if (!current_peer ||
+          const bool republished =
+              !current_peer ||
               candidate->peer_id != current_peer->peer_id ||
-              candidate->peer_publication != current_peer->publication) {
-            if (candidate->lifecycle.RequestRetire()) {
-              stale.push_back(candidate);
-              pool_candidates.erase(pool_candidates.begin() +
-                                    static_cast<std::ptrdiff_t>(i - 1));
+              candidate->peer_publication != current_peer->publication;
+          if (republished && candidate->lifecycle.RequestRetire()) {
+            stale.push_back(candidate);
+            pool_candidates.erase(pool_candidates.begin() +
+                                  static_cast<std::ptrdiff_t>(i - 1));
+          }
+        }
+        // Only the connection chosen is checked for a closed session: one
+        // peek per reuse, not one per pooled connection under mu_.
+        for (;;) {
+          size_t best = pool_candidates.size();
+          size_t best_bound = std::numeric_limits<size_t>::max();
+          size_t best_depth = std::numeric_limits<size_t>::max();
+          for (size_t i = 0; i < pool_candidates.size(); ++i) {
+            Conn* candidate = pool_candidates[i];
+            const bool want_leased_put =
+                options.request_leased_put && candidate->leased_put_supported;
+            const size_t required_bound = bound_for(want_leased_put);
+            if (candidate->peer_id == peer_snapshot->peer_id &&
+                candidate->peer_publication == peer_snapshot->publication &&
+                candidate->rail_index == ridx &&
+                candidate->declared_bytes >= required_bound &&
+                candidate->depth >= required_depth &&
+                (!want_leased_put || candidate->leased_put) &&
+                (candidate->declared_bytes < best_bound ||
+                 (candidate->declared_bytes == best_bound &&
+                  candidate->depth < best_depth))) {
+              best = i;
+              best_bound = candidate->declared_bytes;
+              best_depth = candidate->depth;
             }
           }
-        }
-        size_t best = pool_candidates.size();
-        size_t best_bound = std::numeric_limits<size_t>::max();
-        size_t best_depth = std::numeric_limits<size_t>::max();
-        for (size_t i = 0; i < pool_candidates.size(); ++i) {
-          Conn* candidate = pool_candidates[i];
-          const bool want_leased_put =
-              options.request_leased_put && candidate->leased_put_supported;
-          const size_t required_bound = bound_for(want_leased_put);
-          if (candidate->peer_id == peer_snapshot->peer_id &&
-              candidate->peer_publication == peer_snapshot->publication &&
-              candidate->rail_index == ridx &&
-              candidate->declared_bytes >= required_bound &&
-              candidate->depth >= required_depth &&
-              (!want_leased_put || candidate->leased_put) &&
-              (candidate->declared_bytes < best_bound ||
-               (candidate->declared_bytes == best_bound &&
-                candidate->depth < best_depth))) {
-            best = i;
-            best_bound = candidate->declared_bytes;
-            best_depth = candidate->depth;
+          if (best == pool_candidates.size()) break;
+          Conn* chosen = pool_candidates[best];
+          // The server ended it and closed the session channel: drop it now,
+          // not after the next operation waits out RC retries; pick again.
+          if (SessionClosed(*chosen) && chosen->lifecycle.RequestRetire()) {
+            session_reaped.push_back(chosen);
+            pool_candidates.erase(pool_candidates.begin() +
+                                  static_cast<std::ptrdiff_t>(best));
+            continue;
           }
-        }
-        if (best < pool_candidates.size() &&
-            pool_candidates[best]->lifecycle.Activate()) {
-          pooled = pool_candidates[best];
-          MarkActive(pooled, lane);
-          pool_candidates.erase(pool_candidates.begin() +
-                                static_cast<std::ptrdiff_t>(best));
+          if (chosen->lifecycle.Activate()) {
+            pooled = chosen;
+            MarkActive(pooled, lane);
+            pool_candidates.erase(pool_candidates.begin() +
+                                  static_cast<std::ptrdiff_t>(best));
+          }
+          break;
         }
       }
     }
@@ -1832,6 +1891,11 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   for (Conn* conn : stale)
     Destroy(conn, rdma::RailCompletion::kAdmission);
   stale_publication_reaps_.fetch_add(stale.size(), std::memory_order_relaxed);
+  // Ended by the server: neither the rail nor the peer is at fault.
+  for (Conn* conn : session_reaped)
+    Destroy(conn, rdma::RailCompletion::kAdmission);
+  session_closed_reaps_.fetch_add(session_reaped.size(),
+                                  std::memory_order_relaxed);
   if (!snapshot_current) {
     complete_unowned_lease(rdma::RailCompletion::kAdmission);
     result.failure = AcquireFailure::kAdmission;
@@ -1937,6 +2001,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   // observations with a NEW QP requires a stable identified publication.
   // Static peers have no restart/address-reuse signal, so always probe them.
   bool leased_put_supported = false;
+  bool session_fd_supported = false;
   bool caps_cached = false;
   {
     std::lock_guard<std::mutex> lock(mu_);
@@ -1949,6 +2014,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
       } else {
         caps_cached = true;
         leased_put_supported = found->second.leased_put;
+        session_fd_supported = found->second.session_fd;
       }
     }
   }
@@ -1964,7 +2030,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     }
     const ProbeResult probed = ProbeV2(
         node, &leased_put_supported,
-        options.refusal_check ? kRefusalCheckMs : 0);
+        options.refusal_check ? kRefusalCheckMs : 0, &session_fd_supported);
     if (probed == ProbeResult::kUnreachable) {
       // A confirming dial's short limit says nothing about the node: no
       // unreachable hold from it (ConfirmRefusal).
@@ -2126,10 +2192,14 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   char devbuf[rdma::kDevNameBytes];
   // Probe requires the dynamic-only contract before a QP bootstrap. There is
   // no legacy handshake fallback and no responder writer token to consume.
+  // The session channel only where the probe said the server keeps one:
+  // a server that predates it would take the bit for part of the size.
+  const bool want_session = session_fd_enabled_ && session_fd_supported;
   const uint64_t bootstrap_declared =
       conn_declared | rdma::kDevFrameRequestDynamicOnly |
       rdma::kDevFrameRequestPullRead | rdma::kDevFrameRequestDynamicPull |
-      (want_leased_put ? rdma::kDevFrameRequestLeasedPut : 0);
+      (want_leased_put ? rdma::kDevFrameRequestLeasedPut : 0) |
+      (want_session ? rdma::kDevFrameRequestSessionFd : 0);
   rdma::EncodeDevFrame(auto_device_ ? std::string() : dev,
                        bootstrap_declared, devbuf, rdma::kDevProtoV2);
   char mine[rdma::kQpInfoBytes], remote_qp_bytes[rdma::kQpInfoBytes];
@@ -2202,9 +2272,11 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   }
 
   char readiness[rdma::kV2DynamicOnlyReadinessBytes];
+  bool session_kept = false;
   if (!net::ReadAll(fd, readiness, sizeof(readiness)) ||
       !rdma::DecodeV2DynamicOnlyReadiness(
-          readiness, sizeof(readiness), &conn->recv_segment)) {
+          readiness, sizeof(readiness), &conn->recv_segment,
+          want_session ? &session_kept : nullptr)) {
     DFKV_LOG_ERROR(
         "rdma: peer " + node +
         " did not provide valid negotiated v2 readiness");
@@ -2224,7 +2296,14 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     result.failure = AcquireFailure::kEndpoint;
     return result;
   }
-  ::close(fd);
+  if (session_kept) {
+    // Kept for the connection's life. net::Dial made it close-on-exec; a
+    // plain fork() child still holds a copy until it exits, and while it
+    // does the server sees no close and falls back to its idle timeout.
+    conn->session_fd = fd;
+  } else {
+    ::close(fd);
+  }
   if (!conn->ep.EnsurePoolMrs(pools, /*remote_write=*/false)) {
     Destroy(conn, rdma::RailCompletion::kRailFailure);
     result.failure = AcquireFailure::kLocalRail;
@@ -2241,7 +2320,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
         conn->peer_publication != 0) {
       peer_capabilities_[node] = {
           conn->peer_id, conn->peer_publication,
-          leased_put_supported};
+          leased_put_supported, session_fd_supported};
     }
   }
   if (!publication_current) {
@@ -2867,6 +2946,11 @@ std::string RdmaTransport::MetricsText() const {
   s += "# TYPE dfkv_rdma_client_v2_probe_failures_total counter\n";
   s += "dfkv_rdma_client_v2_probe_failures_total " +
        std::to_string(v2_probe_failures_.load(std::memory_order_relaxed)) +
+       "\n";
+  s += "# HELP dfkv_rdma_client_session_closed_reaps_total Pooled connections dropped before reuse because the server had closed their session channel (DFKV_RDMA_SESSION_FD)\n";
+  s += "# TYPE dfkv_rdma_client_session_closed_reaps_total counter\n";
+  s += "dfkv_rdma_client_session_closed_reaps_total " +
+       std::to_string(session_closed_reaps_.load(std::memory_order_relaxed)) +
        "\n";
   s += "# HELP dfkv_rdma_client_stale_pool_connections_total Pooled connections that failed on reuse and were discarded without cooling the peer rail\n";
   s += "# TYPE dfkv_rdma_client_stale_pool_connections_total counter\n";

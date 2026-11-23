@@ -40,6 +40,21 @@ TEST(NetDial, ConnectsWithTimeout) {
   ::close(lfd);
 }
 
+// RDS-01: close-on-exec from creation, on both connect paths, so a fork and
+// exec on another thread cannot inherit the socket between its creation and
+// any later fcntl.
+TEST(NetDial, TheSocketIsCloseOnExecFromCreation) {
+  auto [lfd, port] = Listen();
+  for (const int connect_ms : {0, 1000}) {
+    const int fd =
+        net::Dial("127.0.0.1:" + std::to_string(port), connect_ms, 1000);
+    ASSERT_GE(fd, 0);
+    EXPECT_NE(::fcntl(fd, F_GETFD) & FD_CLOEXEC, 0) << connect_ms;
+    ::close(fd);
+  }
+  ::close(lfd);
+}
+
 // A failed Dial says why in errno, whatever errno said before: a caller
 // that tells a local want of descriptors (EMFILE from socket()) from a peer
 // that cannot be reached must not read a stale value. Dial left errno alone

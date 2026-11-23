@@ -111,7 +111,10 @@ inline int Dial(const std::string& addr, int connect_ms = 0, int io_ms = 0) {
   if (pos == std::string::npos) return fail(-1, EINVAL);
   std::string ip = addr.substr(0, pos);
   int port = std::atoi(addr.substr(pos + 1).c_str());
-  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  // Close-on-exec from creation: a process that forks and execs on another
+  // thread must not inherit it (an RDMA session channel kept open by such a
+  // child would hide its close from the server).
+  int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (fd < 0) return -1;
   sockaddr_in sa{};
   sa.sin_family = AF_INET;

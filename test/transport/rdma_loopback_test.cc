@@ -10304,4 +10304,145 @@ TEST(RdmaMrCost, ReadRegistrationPerGetBench) {
   ibv_close_device(context);
   ibv_free_device_list(list);
 }
+
+// RDS-01: a connection's end is signalled in both directions through the
+// bootstrap socket kept as session channel (DFKV_RDMA_SESSION_FD, both
+// sides). Without it, the first operation on a pooled connection the server
+// had ended waited for RC retry exhaustion (measured 3.7 s here).
+double TimedExistAfterReclaim(bool session, long* reaps) {
+  ScopedEnv on("DFKV_RDMA_SESSION_FD", session ? "1" : "0");
+  ScopedEnv idle_reclaim("DFKV_RDMA_IDLE_MS", "200");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv op_timeout("DFKV_RDMA_OP_TIMEOUT_MS", "60000");
+  RdmaNode node(session ? "session-reclaim-on" : "session-reclaim-off");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  const std::string v(4096, 's');
+  EXPECT_TRUE(c.Put("session", v.data(), v.size()));
+  EXPECT_TRUE(c.Exist("session"));
+  EXPECT_TRUE(ServerHasNoConnections(node)) << "the server did not reclaim";
+  const auto t0 = std::chrono::steady_clock::now();
+  EXPECT_TRUE(c.Exist("session"));
+  const double ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t0).count();
+  *reaps = CounterVal(rt.MetricsText(),
+                      "dfkv_rdma_client_session_closed_reaps_total");
+  if (session)
+    EXPECT_GE(CounterVal(node.rsrv->MetricsText(),
+                         "dfkv_rdma_sessions_kept_total"), 1);
+  return ms;
+}
+
+TEST(RdmaSession, AReclaimedPooledConnectionIsDroppedBeforeReuse) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  long reaps = -1;
+  const double with_ms = TimedExistAfterReclaim(true, &reaps);
+  EXPECT_GE(reaps, 1) << "the closed session channel was not seen";
+  EXPECT_LT(with_ms, 500.0) << "the dead connection was used anyway";
+  std::printf("session channel: first op after reclaim %.3f ms\n", with_ms);
+}
+
+// The keepalive drops a pooled connection whose session the server closed,
+// instead of sending into it and waiting out RC retries.
+TEST(RdmaSession, TheKeepaliveDropsAConnectionTheServerEnded) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv on("DFKV_RDMA_SESSION_FD", "1");
+  ScopedEnv idle_reclaim("DFKV_RDMA_IDLE_MS", "200");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "600");
+  RdmaNode node("session-keepalive");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  const std::string v(4096, 'k');
+  ASSERT_TRUE(c.Put("keepalive", v.data(), v.size()));
+  ASSERT_TRUE(ServerHasNoConnections(node)) << "the server did not reclaim";
+  // No operation from here on: only the keepalive can find it.
+  ASSERT_TRUE(
+      WaitForMetric(rt, "dfkv_rdma_client_session_closed_reaps_total 1"))
+      << "the keepalive did not drop the ended connection";
+  EXPECT_EQ(CounterVal(rt.MetricsText(),
+                       "dfkv_rdma_client_keepalive_failures_total"), 0);
+}
+
+// The server ends a connection as soon as its client drops it, instead of
+// keeping the thread, the QP and its receive slots until the idle timeout.
+TEST(RdmaSession, TheServerSeesTheClientDropTheConnection) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv on("DFKV_RDMA_SESSION_FD", "1");
+  ScopedEnv idle_reclaim("DFKV_RDMA_IDLE_MS", "600000");
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  RdmaNode node("session-client-drop");
+  {
+    RdmaTransport rt(kMaxMsg);
+    KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+    const std::string v(4096, 'd');
+    ASSERT_TRUE(c.Put("drop", v.data(), v.size()));
+    ASSERT_GE(node.rsrv->ActiveConns(), 1u);
+  }  // the client drops its pooled connections
+  EXPECT_TRUE(ServerHasNoConnections(node, 2000))
+      << "the server kept the connection after its client closed it";
+  EXPECT_GE(CounterVal(node.rsrv->MetricsText(),
+                       "dfkv_rdma_session_peer_closed_total"), 1);
+  EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
+}
+
+// Mixed versions, server side: a client that does not ask (every release
+// before this one, here the test peer that closes its bootstrap socket at
+// once) keeps its connection on a server with session channels on.
+TEST(RdmaSession, AClientThatDoesNotAskIsServedAsBefore) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv on("DFKV_RDMA_SESSION_FD", "1");
+  RdmaNode node("session-old-client");
+  const BlockKey key{90501, 1};
+  std::string ignored;
+  ASSERT_EQ(node.srv->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), key, 0, 0, "old", 3,
+                &ignored), Status::kOk);
+  PinnedPullPeer peer;
+  ASSERT_TRUE(peer.Open(node));  // closes its end of the bootstrap socket
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  EXPECT_TRUE(PinnedExists(peer, key)) << "the closed bootstrap ended it";
+  const std::string metrics = node.rsrv->MetricsText();
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_sessions_kept_total"), 0);
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_session_peer_closed_total"), 0);
+}
+
+// Mixed versions, client side: a server without session channels (off, or
+// a release that predates them, which does not advertise the capability)
+// is asked for none and served as before.
+TEST(RdmaSession, AServerWithoutSessionsIsUsedAsBefore) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  std::unique_ptr<RdmaNode> node;
+  {
+    ScopedEnv off("DFKV_RDMA_SESSION_FD", "0");
+    node = std::make_unique<RdmaNode>("session-old-server");
+  }
+  ScopedEnv on("DFKV_RDMA_SESSION_FD", "1");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node->addr}}, SelfHdr(), &rt);
+  const std::string v(4096, 'o');
+  ASSERT_TRUE(c.Put("old-server", v.data(), v.size()));
+  std::string out(v.size(), '\0');
+  ASSERT_TRUE(c.Get("old-server", &out[0], out.size()));
+  EXPECT_EQ(out, v);
+  EXPECT_EQ(CounterVal(node->rsrv->MetricsText(),
+                       "dfkv_rdma_sessions_kept_total"), 0);
+  EXPECT_EQ(CounterVal(rt.MetricsText(),
+                       "dfkv_rdma_client_session_closed_reaps_total"), 0);
+}
+
+// Opt-in measurement, both settings: DFKV_RDMA_STALE_BENCH=<rounds>.
+TEST(RdmaSession, FirstOperationAfterReclaimBench) {
+  const char* requested = std::getenv("DFKV_RDMA_STALE_BENCH");
+  if (requested == nullptr || *requested == '\0')
+    GTEST_SKIP() << "set DFKV_RDMA_STALE_BENCH=<rounds> to run";
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const int rounds = std::max(1, std::atoi(requested));
+  for (int round = 0; round < rounds; ++round) {
+    long reaps = 0;
+    const double off_ms = TimedExistAfterReclaim(false, &reaps);
+    const double on_ms = TimedExistAfterReclaim(true, &reaps);
+    std::printf("row round %d: first op after reclaim, session channel off "
+                "%.3f ms, on %.3f ms\n", round, off_ms, on_ms);
+  }
+}
 }  // namespace

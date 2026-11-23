@@ -374,6 +374,7 @@ jobs:
       # Opt-in benchmarks: each runs only when its DFKV_*_BENCH is set.
       SKIP_OPT_IN: >-
         RdmaMrCost.ReadRegistrationPerGetBench
+        RdmaSession.FirstOperationAfterReclaimBench
       # ThreadSanitizer: a forked child of a threaded process cannot start
       # threads.
       SKIP_TSAN_FORK: >-

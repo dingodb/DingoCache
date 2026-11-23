@@ -46,6 +46,9 @@ constexpr uint8_t kV2ProbeCapPullRead = 1u << 1;
 constexpr uint8_t kV2ProbeCapLeasedPut = 1u << 2;
 constexpr uint8_t kV2ProbeCapDynamicPull = 1u << 3;
 constexpr uint8_t kV2ProbeCapDynamicOnly = 1u << 4;
+// Bit 5: the server keeps a session channel when asked
+// (kDevFrameRequestSessionFd). Advertised only with DFKV_RDMA_SESSION_FD on.
+constexpr uint8_t kV2ProbeCapSessionFd = 1u << 5;
 
 inline bool IsV2Probe(const char frame[kDevNameBytes]) {
   size_t n = 0;
@@ -91,6 +94,10 @@ inline bool V2ProbeSupportsPullRead(
 inline bool V2ProbeSupportsLeasedPut(
     const char in[kV2ProbeReplyBytes]) {
   return (ParseV2ProbeCapabilities(in) & kV2ProbeCapLeasedPut) != 0;
+}
+
+inline bool V2ProbeSupportsSessionFd(const char in[kV2ProbeReplyBytes]) {
+  return (ParseV2ProbeCapabilities(in) & kV2ProbeCapSessionFd) != 0;
 }
 
 inline bool V2ProbeSupportsDynamicPull(
@@ -343,17 +350,31 @@ constexpr size_t kV2RetirementReadinessBytes =
     kV2DynamicOnlyReadinessBytes + kV2WriterTokenBytes;
 static_assert(kV2DynamicOnlyReadinessBytes == 25);
 
+// Readiness byte 0 is 1. A server that keeps the session channel a client
+// asked for (kDevFrameRequestSessionFd) adds kV2ReadinessSessionFd; it never
+// does for a client that did not ask, so older clients, which require 1,
+// never see it.
+constexpr uint8_t kV2ReadinessSessionFd = 1u << 1;
+
 inline size_t EncodeV2DynamicOnlyReadiness(
-    const RecvSegmentInfo& info, char out[kV2DynamicOnlyReadinessBytes]) {
-  out[0] = 1;
+    const RecvSegmentInfo& info, char out[kV2DynamicOnlyReadinessBytes],
+    bool session_fd = false) {
+  out[0] = static_cast<char>(1 | (session_fd ? kV2ReadinessSessionFd : 0));
   EncodeRecvSegmentInfo(info, out + 1);
   return kV2DynamicOnlyReadinessBytes;
 }
 
+// session_fd: null for a client that did not ask for the session channel
+// (byte 0 must be exactly 1); else it receives whether the server keeps it.
 inline bool DecodeV2DynamicOnlyReadiness(
-    const char* in, size_t bytes, RecvSegmentInfo* info) {
-  return bytes == kV2DynamicOnlyReadinessBytes && in[0] == 1 &&
-         DecodeRecvSegmentInfo(in + 1, info);
+    const char* in, size_t bytes, RecvSegmentInfo* info,
+    bool* session_fd = nullptr) {
+  if (bytes != kV2DynamicOnlyReadinessBytes) return false;
+  const uint8_t flags = static_cast<uint8_t>(in[0]);
+  const bool session = flags == (1 | kV2ReadinessSessionFd);
+  if (flags != 1 && !(session && session_fd != nullptr)) return false;
+  if (session_fd != nullptr) *session_fd = session;
+  return DecodeRecvSegmentInfo(in + 1, info);
 }
 
 
