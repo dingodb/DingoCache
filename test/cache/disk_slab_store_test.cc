@@ -2743,6 +2743,87 @@ TEST_F(DiskSlabTest, SlotWatermarkEvictionRemainsColdAfterDirtyRestart) {
   for (uint64_t i = 0; i < 4; ++i) EXPECT_FALSE(reopened.IsCached(K(i)));
 }
 
+// STO-13: DFKV_SLAB_EVICT_HEADROOM_BYTES / _BAND_BYTES place the watermarks
+// at absolute distances below capacity and take precedence over the
+// percentages. Clamps: the band at least one extent, the headroom at least
+// two bands. Fallback to the percentages when the resolved high is below the
+// percentage high or below the band (a small disk), or nothing is left.
+TEST_F(DiskSlabTest, AbsoluteHeadroomResolvesClampsAndFallsBack) {
+  // 4 extents of 4 slots of 4 KiB: capacity 64 KiB, extent 16 KiB; capacity
+  // / 100 = 655, so 10/5 percent are 6550/3275 and 92/88 are 60260/57640.
+  struct Case { const char* high_pct; const char* low_pct; const char* headroom;
+                const char* band; uint64_t high, low; };
+  for (const Case& c : {
+           // applied; the band clamped up to one extent
+           Case{"10", "5", "40000", nullptr, 65536 - 40000, 65536 - 40000 - 16384},
+           // applied; both clamped up
+           Case{"10", "5", "1", nullptr, 32768, 16384},
+           // high (15536) below the band (20000): percentages
+           Case{"10", "5", "50000", "20000", 6550, 3275},
+           // nothing left below capacity: percentages
+           Case{"10", "5", "65536", nullptr, 6550, 3275},
+           // a small disk: the clamped headroom leaves high (32768) below
+           // the default 92% (60260): percentages
+           Case{nullptr, nullptr, "1", nullptr, 60260, 57640},
+           // a band alone does nothing
+           Case{nullptr, nullptr, nullptr, "20000", 60260, 57640},
+           // HIGH_PCT=0 (watermark off) is overridden by a set headroom
+           Case{"0", nullptr, "1", nullptr, 32768, 16384}}) {
+    SCOPED_TRACE(std::string(c.high_pct ? c.high_pct : "-") + "% " +
+                 (c.headroom ? c.headroom : "-") + "/" + (c.band ? c.band : "-"));
+    fs::remove_all(dir_);
+    if (c.high_pct) ::setenv("DFKV_SLAB_EVICT_HIGH_PCT", c.high_pct, 1);
+    if (c.low_pct) ::setenv("DFKV_SLAB_EVICT_LOW_PCT", c.low_pct, 1);
+    if (c.headroom) ::setenv("DFKV_SLAB_EVICT_HEADROOM_BYTES", c.headroom, 1);
+    if (c.band) ::setenv("DFKV_SLAB_EVICT_BAND_BYTES", c.band, 1);
+    auto options = Opts(4 * 4 * 4096, 4 * 4096, 4096);
+    options.reclaim_interval_ms = 0;
+    bool ok = false;
+    DiskSlabStore store(options, &ok);
+    for (const char* n : {"DFKV_SLAB_EVICT_HIGH_PCT", "DFKV_SLAB_EVICT_LOW_PCT",
+                          "DFKV_SLAB_EVICT_HEADROOM_BYTES", "DFKV_SLAB_EVICT_BAND_BYTES"})
+      ::unsetenv(n);
+    ASSERT_TRUE(ok);
+    const auto w = store.GetWatermarkObservation();
+    EXPECT_EQ(w.watermark_high_bytes, c.high);
+    EXPECT_EQ(w.watermark_low_bytes, c.low);
+  }
+}
+
+// The drain follows the absolute values: 10 of 16 slots used is above both
+// highs; with the headroom applied (it is above the 10% high) the drain
+// stops at its low of 16 KiB, with the percentages alone it goes on to 5%.
+TEST_F(DiskSlabTest, AbsoluteHeadroomDrivesTheWatermarkDrain) {
+  for (const bool with_headroom : {false, true}) {
+    SCOPED_TRACE(with_headroom ? "headroom" : "percentages only");
+    fs::remove_all(dir_);
+    ::setenv("DFKV_SLAB_EVICT_HIGH_PCT", "10", 1);
+    ::setenv("DFKV_SLAB_EVICT_LOW_PCT", "5", 1);
+    if (with_headroom) ::setenv("DFKV_SLAB_EVICT_HEADROOM_BYTES", "1", 1);
+    auto options = Opts(4 * 4 * 4096, 4 * 4096, 4096);
+    options.reclaim_interval_ms = 0;
+    options.table_sync_ms = 0;
+    bool ok = false;
+    DiskSlabStore store(options, &ok);
+    ::unsetenv("DFKV_SLAB_EVICT_HIGH_PCT");
+    ::unsetenv("DFKV_SLAB_EVICT_LOW_PCT");
+    ::unsetenv("DFKV_SLAB_EVICT_HEADROOM_BYTES");
+    ASSERT_TRUE(ok);
+    const std::string value(4000, 'h');
+    for (uint64_t i = 0; i < 10; ++i)
+      ASSERT_EQ(store.Cache(K(i), value.data(), value.size()), Status::kOk);
+    for (int tick = 0; tick < 8; ++tick)
+      dfkv::DiskSlabStoreTestPeer::ReclaimNow(&store, {});
+    EXPECT_GT(store.GetStats().watermark_evictions, 0u);
+    if (with_headroom) {
+      EXPECT_LE(store.Count(), 4u) << "drained to the headroom's low (16 KiB)";
+      EXPECT_GE(store.Count(), 3u) << "and no further";
+    } else {
+      EXPECT_LE(store.Count(), 1u) << "drained to the 5% low";
+    }
+  }
+}
+
 TEST_F(DiskSlabTest, WatermarkDrainIsLatchedAndBoundedPerTick) {
   ::setenv("DFKV_SLAB_EVICT_HIGH_PCT", "50", 1);
   ::setenv("DFKV_SLAB_EVICT_LOW_PCT", "26", 1);

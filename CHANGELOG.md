@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+
+- Server, slab: the eviction watermarks can be set as an absolute headroom
+  below capacity: `DFKV_SLAB_EVICT_HEADROOM_BYTES` (high = capacity minus
+  it) and `DFKV_SLAB_EVICT_BAND_BYTES` (low = high minus it; default a
+  quarter of the headroom). They take precedence over
+  `DFKV_SLAB_EVICT_HIGH_PCT` / `_LOW_PCT` when set; the band is at least one
+  extent and the headroom at least two bands; a resolved high below the
+  percentage high or below the band (a small disk) keeps the percentages,
+  with a warning. Unset by default, so 92/88 still applies; see DEPLOY for
+  suggested values.
 - Log engine (experimental): a PUT that fills its segment while the next
   one is being pre-opened waits for that header (one write) instead of
   reclaiming a segment inline. Since the pre-opened segment (STO-33), such

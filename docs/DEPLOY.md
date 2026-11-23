@@ -383,6 +383,20 @@ WantedBy=multi-user.target
 >   （默认 92 / 88；high=0 关）：越过 high 后按全局读写最近使用顺序回收 slot 到 low。
 >   新键成功提交可在近期压力状态下重新触发回收；非活跃且连续 128 次无新提交观察后，历史压力失效。
 >   每 tick 由 `DFKV_SLAB_EVICT_MAX_VICTIMS_PER_TICK`（默认 256，范围 1～1024）限制移除对象数，扫描上限为其 4 倍。旧 `DFKV_SLAB_EVICT_MAX_EXTENTS_PER_TICK` 不再读取，升级时须迁移配置。
+>   **绝对余量（可选，默认不设）**：`DFKV_SLAB_EVICT_HEADROOM_BYTES` 设为非 0 时，high = 容量 − 余量，
+>   low = high − `DFKV_SLAB_EVICT_BAND_BYTES`（默认余量的 1/4），优先于上面的百分比。下限：band 至少一个
+>   extent（默认 1 GiB），余量至少两个 band（被下限抬高时打 INFO）。算出的 high 低于百分比给出的 high、
+>   低于 band 或容量不够时，打 WARN 并沿用百分比（小盘上余量反而会比百分比留得多）。
+>   `DFKV_SLAB_EVICT_HIGH_PCT=0`（关水位）时设了余量会重新打开水位回收，同样打 WARN。生效值记在配置快照
+>   （`DFKV_SLAB_EVICT_HEADROOM_BYTES`、`DFKV_SLAB_EVICT_BAND_BYTES`，0 表示用百分比），每盘的 high/low
+>   见 `dfkv_slab_disk_watermark_high_bytes` / `_low_bytes`。
+>   为什么：92/88 让 8–12% 的容量常年空着（每 TiB 约 80–120 GiB），而余量只需盖住两次后台回收之间的写入；
+>   单尺寸档的单元级测量里，余量小到水位回收不触发时，淘汰全部在分配路径完成，PUT p99 反而从 2.18 ms
+>   降到 0.43 ms（水位回收每 tick 持锁 0.3–0.5 ms）。多尺寸档竞争下的效果还没测到。
+>   建议：1 TiB 以上的盘可试 `DFKV_SLAB_EVICT_HEADROOM_BYTES=8589934592`（8 GiB）、
+>   `DFKV_SLAB_EVICT_BAND_BYTES=2147483648`（2 GiB），即 high 只比容量低 8 GiB。先在个别节点上线，
+>   对比前后的 `dfkv_slab_watermark_evictions_total`、`dfkv_slab_disk_watermark_high_observations_total`、
+>   kCacheFull 与 `put_busy`、PUT p99。**默认值只在有了真实部署的这组观测之后才会改。**
 > - `--slab-reclaim-ms <n>` / `--ram-reclaim-ms <n>`（默认 50 / 10，`0`=关）：后台预回收和类再平衡。类再平衡抢占（`StealFrom`）与 Put 的条带下限/兜底抢占（`StealExtentFor`）优先选空 extent，其次选驻留对象平均最久未访问的 extent（decayed read heat、useful bytes 仅作平手裁决），跳过 pinned extent；这是 extent 级取舍，混在大量旧对象中的少量新对象仍可能随整块淘汰；冷抢占（`StealColdExtentFor`）保持原有入驻年龄门槛与 heat/useful bytes 排序；后台类再平衡按写入字节（而非对象个数）判断冷 donor class；通常保留默认。
 > - `--slab-granularity <bytes>`（默认 1 MiB）：最小 slot 量子。现有 `slots.tbl` 的 format/geometry 不匹配会 fail closed；修改必须换空目录，服务不会原地冷重建或忽略旧数据。
 > - **`slots.tbl` 占用与预留**：每盘 `盘容量 / granularity × 64` 字节，在 `--cap` **之外**（默认 1 MiB 量子时约为容量的 1/16384）。启动时用 `fallocate` 整体预留，已分配齐的表不再处理；文件大小和 record 格式不变，旧版本仍可打开。**新建目录**：直接分配，文件系统放不下时该盘启动失败（`cannot reserve N bytes for slots.tbl ... No space left on device`）。**已有目录**（含旧版本写出的稀疏表）：始终照常启动；升级后首次启动补齐（日志 `reserved slots.tbl, N bytes (M were allocated)`），文件系统放不下时不拒绝启动，保持原先的惰性分配并在每次启动打一行 WARN `no room to reserve slots.tbl, X of N bytes are not allocated`——该盘仍有“文件系统写满时 store 终态故障”的风险，腾出 X 字节后重启即补齐。direct 模式下 extent 也在启动时整体分配；表与 extent 都预留成功后，在预留后原地覆盖写的文件系统（xfs、ext4）上 store 不会再因文件系统写满而失败，其他文件系统（写时复制、tmpfs 等）不作此保证；buffered 模式（`--slab-write buffered` 或文件系统不支持 O_DIRECT）的 extent 仍按写入惰性分配，文件系统写满时对应 PUT 失败（store 不因此进入终态故障），容量规划仍须保证 `--cap` 加 `slots.tbl` 不超过文件系统可用空间。不支持 `fallocate` 的文件系统打一行 WARN 并保持原先的惰性分配。
@@ -808,6 +822,7 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | env | 默认 | 说明 |
 |---|---|---|
 | `DFKV_SLAB_EVICT_HIGH_PCT` / `DFKV_SLAB_EVICT_LOW_PCT` | `92` / `88`, high=0 关 | high crossing latch，后台持续 drain 到 low |
+| `DFKV_SLAB_EVICT_HEADROOM_BYTES` / `DFKV_SLAB_EVICT_BAND_BYTES` | 不设（用百分比） / 余量的 1/4 | 绝对余量：high = 容量 − 余量，low = high − band；优先于百分比；band ≥ 1 个 extent，余量 ≥ 2 band（§3） |
 | `DFKV_SLAB_EVICT_MAX_VICTIMS_PER_TICK` | `256` | 每盘每 tick 最多移除的 slot 数；最多扫描该值的 4 倍，不能据此保证尾延迟不变 |
 | `DFKV_SLAB_COLD_STEAL_WINDOW` | — | 小受害者选择窗口（跨 size class 强占） |
 | `DFKV_SLAB_URING_WRITE` | — | slab io_uring 异步 PUT（需要 `-DDFKV_WITH_URING`） |
