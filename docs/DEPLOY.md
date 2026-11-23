@@ -231,10 +231,10 @@ test -e /etc/dfkv/tenant-quotas ||
 ```
 
 
-`/etc/systemd/system/dfkv.service`（参考 **xb01-0064 生产配置**（8 条 400G IB 轨/主机）映射到 v2.0.0 大生产参数：**v1.37 生产开了什么现阶段保留什么**；**v2 才落地的能力（SYS_URING/CONVoy 合并/监听加固/slab 水位线）设置为 drop-in 注释默认留**。更小形（单 HCA、无 RAM tier）只需对 `--rdma-dev`、`--ram-tier`/`--ram-tier-bytes` 做减法）：
+`/etc/systemd/system/dfkv.service`（参考**一台生产节点的配置**（8 条 400G IB 轨/主机）映射到 v2.0.0 大生产参数：**v1.37 生产开了什么现阶段保留什么**；**v2 才落地的能力（SYS_URING/CONVoy 合并/监听加固/slab 水位线）设置为 drop-in 注释默认留**。更小形（单 HCA、无 RAM tier）只需对 `--rdma-dev`、`--ram-tier`/`--ram-tier-bytes` 做减法）：
 
-> **xb01-0064 (v1.37-1.40) → v2.0.0 映射关系**：
-> | 项 | xb01 生产 (v1.37/1.40) | 本示例 (v2.0.0) | 变动 |
+> **生产配置 (v1.37-1.40) → v2.0.0 映射关系**：
+> | 项 | 生产 (v1.37/1.40) | 本示例 (v2.0.0) | 变动 |
 > |---|---|---|---|
 > | `--rdma-dev` | 8 轨全列 | 8 轨全列 | 一致 |
 > | RDMA depth | `DFKV_RDMA_DEPTH=32` | `DFKV_RDMA_DEPTH=4` | 新默认 4 对齐 client/server——depth=1 会 clamp 批处理窗口，pipeline GET 退化 3-4×、突发 PUT 批失败致 L3 prefetch miss（热轮吞吐 -29.8%，depth=4 后仅 -2.9%）；depth>1 膨胀每连接 segment lease（depth×slot），过大在高并发时易耗尽共享 segment |
@@ -255,13 +255,13 @@ After=network-online.target dfkv-mds.service
 Wants=network-online.target
 [Service]
 Type=simple
-# xb01 v2 shared segment：RDMA depth=4、4 MiB block 时每条 pull data QP
-# 占 33,587,200 B（receive + source arenas）。14×TP8、每 pool=8、
-# data/control 两个 pool 含 25% churn 需要 35.4 GiB，因此配置 64 GiB；
+# v2 shared segment：RDMA depth=4、4 MiB block 时每条 pull data QP
+# 占 33,587,200 B（receive + source arenas）。所需大小 ≈ 每 server 的 data 连接数
+# （client 进程数 × 每 pool 上限）× 2 个 pool × 33,587,200 B × 1.25（churn）；
 # 代码通用默认是 128 GiB；这里按实测容量包络显式收紧为 64 GiB。
 Environment=DFKV_RDMA_DEPTH=4
 Environment=DFKV_RDMA_RECV_SEGMENT_SIZE=68719476736
-# 8×400G 轨全轨白名单 + NUMA：B200 生产 host 一台带 8 个 HCA 轨。
+# 8×400G 轨全轨白名单 + NUMA：示例 host 带 8 个 HCA 轨。
 # 显式白名单是固定 topology：保留首次出现顺序；present DOWN rail 仍必须完成
 # anchor/共享 segment/所有配置 MR 初始化，随后由 health monitor 等待 LinkUp。
 # client 侧另行注入本机 `DFKV_RDMA_DEV`；GPU/CPU host 可有不同列表。
@@ -296,7 +296,7 @@ ExecStart=/usr/local/bin/dfkv_server \
   --advertise 192.168.1.57:28001 \
   --mds-registration-timeout-ms 60000
 # v2.0.0 生产扩展能力（默认关，会自动在 systemd drop-in 覆盖）：
-# - io_uring async GET/direct read（xb01 生产为 on;
+# - io_uring async GET/direct read（生产为 on;
 #   需要编 `-DDFKV_WITH_URING`）：
 #Environment=DFKV_SERVER_URING=1
 #Environment=DFKV_SERVER_URING_DEPTH=32
@@ -308,7 +308,7 @@ Restart=on-failure
 RestartSec=2
 # 大 arena RAM tier 启动时要预触页：4K 页时实测 192 GiB 约 39–47 秒（每 16 GiB 约 4 秒）；
 # 拿到透明大页时只要几秒，但大页拿不拿得到看内存状况，超时按 4K 页的耗时来定。
-# xb01 生产 TimeoutStartSec/TimeoutStopSec=600，90s 默认会 OOM-timeout 掉 dfkv；
+# 生产 TimeoutStartSec/TimeoutStopSec=600，90s 默认会 OOM-timeout 掉 dfkv；
 # 配大 arena（≥64 GiB）时必须同步调大。
 TimeoutStartSec=600
 TimeoutStopSec=600
@@ -316,7 +316,7 @@ TimeoutStopSec=600
 # 这里跟着放大，留出停请求和各盘同步的时间。
 Environment=DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S=300
 # OOM 调整：内存压力下 Linux OOM Killer 倾向杀占内存过多的进程，dfkv 的 RAM arena 会被白锁。
-# xb01 生产-500，降低 dfkv 被错杀风险（NVMe cache-process 死了 模型自己还能重算，预 pin 大 RAM 的
+# 生产取 -500，降低 dfkv 被错杀风险（NVMe cache-process 死了 模型自己还能重算，预 pin 大 RAM 的
 # dfkv arena 更不该成为被出手的对象）
 OOMScoreAdjust=-500
 CPUQuota=1600%
