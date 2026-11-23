@@ -534,24 +534,26 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
 // RNR retries 7 (= without limit, so a receiver without a posted buffer
 // shows as an op timeout, not a WC error). DFKV_RDMA_QP_TIMEOUT (1..31),
 // DFKV_RDMA_QP_RETRY_CNT (0..7), DFKV_RDMA_QP_RNR_RETRY (0..7).
+QpRetrySettings ReadQpRetry() {
+  auto read = [](const char* name, uint64_t fallback, uint64_t min,
+                 uint64_t max) {
+    envparse::U64Spec spec;
+    spec.fallback = fallback;
+    spec.min = min;
+    spec.max = max;
+    const uint64_t value = envparse::EnvU64(name, spec);
+    config_dump::RecordResolved(name, std::to_string(value));
+    return static_cast<uint8_t>(value);
+  };
+  QpRetrySettings out;
+  out.timeout = read("DFKV_RDMA_QP_TIMEOUT", 14, 1, 31);
+  out.retry_cnt = read("DFKV_RDMA_QP_RETRY_CNT", 7, 0, 7);
+  out.rnr_retry = read("DFKV_RDMA_QP_RNR_RETRY", 7, 0, 7);
+  return out;
+}
+
 const QpRetrySettings& QpRetry() {
-  static const QpRetrySettings settings = [] {
-    auto read = [](const char* name, uint64_t fallback, uint64_t min,
-                   uint64_t max) {
-      envparse::U64Spec spec;
-      spec.fallback = fallback;
-      spec.min = min;
-      spec.max = max;
-      const uint64_t value = envparse::EnvU64(name, spec);
-      config_dump::RecordResolved(name, std::to_string(value));
-      return static_cast<uint8_t>(value);
-    };
-    QpRetrySettings out;
-    out.timeout = read("DFKV_RDMA_QP_TIMEOUT", 14, 1, 31);
-    out.retry_cnt = read("DFKV_RDMA_QP_RETRY_CNT", 7, 0, 7);
-    out.rnr_retry = read("DFKV_RDMA_QP_RNR_RETRY", 7, 0, 7);
-    return out;
-  }();
+  static const QpRetrySettings settings = ReadQpRetry();
   return settings;
 }
 
