@@ -55,6 +55,15 @@ c_int = ctypes.c_int
 POINTER = ctypes.POINTER
 
 
+# ping_sync: keys no connector writes, the bound on one ping, and the
+# DFKV_ST_* codes that only a node gives (OK, NOT_FOUND, LENGTH_MISMATCH).
+_PING_KEYS = tuple(f"dfkv-ping/{i}".encode() for i in range(8))
+_PING_TIMEOUT_S = 2.0
+_PING_ANSWERED = (0, 1, 8)
+# How long close() waits for a ping probe still in the native call.
+_CLOSE_PING_WAIT_S = 5.0
+
+
 def load_lib(path: Optional[str] = None) -> ctypes.CDLL:
     """Load libdfkv.so and declare the C ABI signatures.
 
@@ -94,6 +103,10 @@ def load_lib(path: Optional[str] = None) -> ctypes.CDLL:
         c_void_p, POINTER(c_void_p), POINTER(c_uint64),
         POINTER(c_void_p), POINTER(c_uint64),
         c_int, POINTER(c_int), POINTER(c_uint64)]
+    if hasattr(lib, "dfkv_batch_get_st"):
+        lib.dfkv_batch_get_st.restype = c_int
+        lib.dfkv_batch_get_st.argtypes = lib.dfkv_batch_get.argtypes + [
+            POINTER(ctypes.c_uint8)]
     lib.dfkv_batch_exist.restype = c_int
     lib.dfkv_batch_exist.argtypes = [
         c_void_p, POINTER(c_void_p), POINTER(c_uint64),
@@ -216,6 +229,9 @@ class DfkvNativeClient:
             # close() drains: close() waits for them before dfkv_close.
             self._sync_cv = threading.Condition()
             self._sync_inflight = 0
+            # The liveness probe in flight (see ping_sync).
+            self._ping_lock = threading.Lock()
+            self._ping_probe: Optional[concurrent.futures.Future] = None
             self._telemetry_acquired = False
             if not key_namespace:
                 raise ValueError(
@@ -672,12 +688,64 @@ class DfkvNativeClient:
         validate_object_sizes(
             get_max_block_bytes(self._lib, self._h), sizes, context=context)
 
-    def ping_sync(self) -> None:
-        """Cheap liveness check — connectivity is established at construction
-        (dfkv_open + MDS discovery). Just verify the handle is live."""
-        with access_log("native.ping_sync", lambda: ""):
+    def ping_sync(self, timeout_s: float = _PING_TIMEOUT_S) -> None:
+        """Raise unless a node of the ring answers within ``timeout_s``.
+
+        The probe is an exact one-byte GET of a few sentinel keys, spread
+        over their owners: no write, and a node only looks the keys up. Any
+        answer from a node (absent, present, another length) proves the
+        ring reachable. A probe still running when the next ping comes is
+        waited for again, not repeated, so a hung ring holds at most one.
+        Before, only the handle was checked: a ring with every node down
+        answered the ping.
+        """
+        with access_log("native.ping_sync", lambda: "") as r:
             if self._closed or not self._h:
                 raise RuntimeError("dfkv client is closed")
+            if not hasattr(self._lib, "dfkv_batch_get_st"):
+                r.result = "handle only (libdfkv without dfkv_batch_get_st)"
+                return
+            with self._ping_lock:
+                probe = self._ping_probe
+                if probe is None or probe.done():
+                    probe = self._ping_probe = concurrent.futures.Future()
+                    threading.Thread(target=self._ping_once, args=(probe,),
+                                     name="dfkv-ping", daemon=True).start()
+            try:
+                answered = probe.result(timeout=timeout_s)
+            except concurrent.futures.TimeoutError:
+                r.result = "timeout"
+                raise RuntimeError(
+                    f"no answer from the dfkv ring within {timeout_s:g} s"
+                ) from None
+            if not answered:
+                r.result = "no node answered"
+                raise RuntimeError("no node of the dfkv ring answered")
+            r.result = "ok"
+
+    def _ping_once(self, probe: concurrent.futures.Future) -> None:
+        try:
+            # Not a _sync_call: close() waits for a probe only so long (a
+            # hung ring holds it in the native GET for tens of seconds).
+            with self._sync_cv:
+                if self._closed or not self._h:
+                    raise RuntimeError("dfkv client is closed")
+                handle = self._h
+            n = len(_PING_KEYS)
+            karr, klens, key_owners = make_key_array(list(_PING_KEYS))
+            dest = (ctypes.c_ubyte * n)()
+            base = ctypes.addressof(dest)
+            ptrs = (c_void_p * n)(*[base + i for i in range(n)])
+            sizes = (c_uint64 * n)(*([1] * n))
+            hits = (c_int * n)()
+            status = (ctypes.c_uint8 * n)()
+            self._lib.dfkv_batch_get_st(
+                handle, karr, klens, ptrs, sizes, n, hits, status)
+            del key_owners
+            probe.set_result(
+                any(status[i] in _PING_ANSWERED for i in range(n)))
+        except BaseException as exc:  # noqa: BLE001 - handed to the waiter
+            probe.set_exception(exc)
 
     def close(self) -> None:
         if self._closed:
@@ -703,6 +771,16 @@ class DfkvNativeClient:
                     executor.shutdown(wait=True)
                 except Exception:  # pragma: no cover
                     pass
+            probe = self._ping_probe
+            if probe is not None:
+                concurrent.futures.wait([probe], timeout=_CLOSE_PING_WAIT_S)
+            if probe is not None and not probe.done():
+                # dfkv_close under a call in flight would free what it uses;
+                # the probe's daemon thread does not hold the process.
+                logger.warning(
+                    "dfkv: a ping probe is still waiting on the ring after "
+                    "%g s; the native client is left open", _CLOSE_PING_WAIT_S)
+                self._h = None
             try:
                 if self._h:
                     self._lib.dfkv_close(self._h)
