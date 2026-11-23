@@ -683,10 +683,12 @@ std::string KVClient::MetricsSnapshot() const {
   // ring size and MDS reachability — the fastest tell of a bad mds_endpoint.
   {
     size_t members, draining;
+    size_t collisions;
     {
       std::lock_guard<std::mutex> lk(ring_mu_);
       members = addr_.size();
       draining = draining_.size();
+      collisions = ring_.Collisions();
     }
     s += "# HELP dfkv_client_ring_members Placement-ring members currently adopted from MDS discovery\n";
     s += "# TYPE dfkv_client_ring_members gauge\n";
@@ -705,6 +707,9 @@ std::string KVClient::MetricsSnapshot() const {
     s += "dfkv_client_drain_requests_total{op=\"remove\",result=\"not_served\"} " + load(drain_removes_failed_) + "\n";
     s += "dfkv_client_drain_requests_total{op=\"retain\",result=\"served\"} " + load(drain_retains_ok_) + "\n";
     s += "dfkv_client_drain_requests_total{op=\"retain\",result=\"not_served\"} " + load(drain_retains_failed_) + "\n";
+    s += "# HELP dfkv_client_ring_point_collisions Ring points two members hashed to; the member added later owns each\n";
+    s += "# TYPE dfkv_client_ring_point_collisions gauge\n";
+    s += "dfkv_client_ring_point_collisions " + std::to_string(collisions) + "\n";
   }
   if (poller_) {
     s += "# HELP dfkv_client_mds_unreachable_polls_total MDS list-members polls that failed (endpoint unreachable or RPC error)\n";

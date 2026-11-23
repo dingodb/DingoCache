@@ -161,6 +161,7 @@ _GAUGES: dict[str, tuple[str, ...]] = {
     "dfkv_client_transport_info": ("transport",),
     "dfkv_client_ring_members": (),
     "dfkv_client_ring_draining_members": (),
+    "dfkv_client_ring_point_collisions": (),
     "dfkv_client_mds_reachable": (),
     "dfkv_client_peer_latency_max_seconds": ("peer",),
     "dfkv_client_op_max_seconds": ("op",),

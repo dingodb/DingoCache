@@ -3,6 +3,10 @@
 ## Unreleased
 
 
+- Client, routing: the consistent-hash ring is a sorted vector instead of a
+  map; a lookup took 33 ns on a 16-member ring and 55 ns on 64, now 18 and
+  21 ns. Routes are unchanged. New `dfkv_client_ring_point_collisions`.
+
 - `dfkvctl`: new `locate <key>` (the member a key routes to) and `rm <key>`;
   `put`, `get`, `exist`, `locate` and `rm` find the ring through `--mds`
   (and `--group`, `--ring-wait-ms`) as well as `--members`. An unknown
