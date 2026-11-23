@@ -159,6 +159,22 @@ def test_operator_namespace_override_is_rejected():
 
 
 
+def test_a_misspelt_identity_key_is_refused():
+    # Unread, the default would apply: a deployment meant to be told apart
+    # by its revision would share keys with another.
+    for key in ("model_revison", "modelname", "tenant-id"):
+        try:
+            DfkvL2AdapterConfig.from_dict({
+                "url": "dfkv://127.0.0.1:28150/group-1",
+                "model_name": "unit-test",
+                key: "x",
+            })
+        except ValueError as exc:
+            assert "did you mean" in str(exc), exc
+        else:
+            raise AssertionError(f"{key} must fail startup")
+
+
 def test_distinct_event_fds():
     a = _mk_adapter()
     try:

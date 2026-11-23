@@ -55,3 +55,37 @@ def test_refuses_to_release_registered_kv_cache_memory():
     connector = object.__new__(DfkvStoreConnector)
     with pytest.raises(RuntimeError, match="registrations cannot follow"):
         connector.unregister_kv_caches()
+
+
+def _construct(extra):
+    """Build the connector up to its extra_config check; a valid config
+    reaches the layout check, which is stopped there."""
+    from unittest import mock
+    from dfkv_vllm import connector as connector_module
+    config = SimpleNamespace(kv_transfer_config=SimpleNamespace(
+        kv_connector_extra_config=extra, kv_role="kv_both"))
+    with mock.patch.object(DfkvStoreConnector, "_validate_kv_cache_config",
+                           side_effect=RuntimeError("validated")), \
+            mock.patch.object(connector_module.KVConnectorBase_V1, "__init__",
+                              return_value=None):
+        DfkvStoreConnector(config, None, object())
+
+
+@pytest.mark.parametrize("key", ["modle_revision", "require_model_revison",
+                                 "share_across_dp_size", "tenantid"])
+def test_a_misspelt_identity_key_fails_startup(key):
+    # Unread, its default would apply: deployments meant to be told apart
+    # would share keys.
+    with pytest.raises(ValueError, match="did you mean"):
+        _construct({key: "x"})
+
+
+def test_a_non_integer_setting_fails_startup():
+    with pytest.raises(ValueError, match="lookup_timeout_ms"):
+        _construct({"lookup_timeout_ms": "1.5"})
+
+
+def test_a_valid_extra_config_passes_the_check():
+    with pytest.raises(RuntimeError, match="validated"):
+        _construct({"model_revision": "x", "members": "a=b:1",
+                    "lookup_timeout_ms": 10000})

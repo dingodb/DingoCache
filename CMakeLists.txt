@@ -468,6 +468,10 @@ if(DFKV_BUILD_TESTS)
       COMMAND ${PYTHON3}
               ${CMAKE_CURRENT_SOURCE_DIR}/test/python/test_dfkv_vllm_failed_load_lookup.py
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME python_config_check
+      COMMAND ${PYTHON3}
+              ${CMAKE_CURRENT_SOURCE_DIR}/test/python/test_dfkv_config_check.py
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME python_vllm_step_metadata
       COMMAND ${PYTHON3}
               ${CMAKE_CURRENT_SOURCE_DIR}/test/python/test_dfkv_vllm_step_metadata.py

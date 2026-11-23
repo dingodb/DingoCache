@@ -45,6 +45,7 @@ from dfkv_common import (
 from dfkv_common import cabi as dfkv_cabi
 from dfkv_common.client_metrics import read_native_snapshot
 from dfkv_common.block_size import get_max_block_bytes, validate_object_sizes
+from dfkv_common.config_check import validate_extra_config
 
 from dfkv_access_log import (access_log, configure as _configure_access_log,
                             apply_hot as _access_log_apply_hot,
@@ -130,30 +131,9 @@ _INTEGER_KEYS = ("page_size", "layer_num", "dtype_tag", "head_num", "head_dim",
 
 def _validate_extra_config(cfg: dict) -> None:
     """Refuse a misspelt identity key and a non-integer integer key."""
-    import difflib
-    for key in cfg:
-        if key in _IDENTITY_KEYS:
-            continue
-        close = difflib.get_close_matches(str(key), _IDENTITY_KEYS, n=1,
-                                          cutoff=0.8)
-        if close:
-            raise ValueError(
-                f"extra_config key {key!r} is not known; did you mean "
-                f"{close[0]!r}? Unread, its default would apply and instances "
-                f"that should be told apart would share keys")
-    for key in _INTEGER_KEYS:
-        if key not in cfg:
-            continue
-        value = cfg[key]
-        try:
-            ok = not isinstance(value, bool) and int(value) == float(value)
-        except (TypeError, ValueError, OverflowError):
-            ok = False
-        if not ok:
-            hint = (" (a dtype name goes in kv_cache_dtype)"
-                    if key == "dtype_tag" else "")
-            raise ValueError(
-                f"extra_config {key} must be an integer, got {value!r}{hint}")
+    validate_extra_config(
+        cfg, identity_keys=_IDENTITY_KEYS, integer_keys=_INTEGER_KEYS,
+        hints={"dtype_tag": " (a dtype name goes in kv_cache_dtype)"})
 
 
 def _physical_axis(cfg: dict, name: str) -> tuple[int, int]:
