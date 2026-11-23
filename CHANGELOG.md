@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Client, RDMA: a completion wait can poll briefly before it sleeps. A GET
+  is three round trips (request, READ, release), and each sleep on the
+  completion channel and wake-up cost some 30-50 us. With
+  `DFKV_RDMA_SPIN_US` (default 0, off) a client endpoint first polls its CQ
+  for up to that long, within the wait's timeout. At 50, recommended for
+  latency-sensitive small-value deployments: one GET at a time from a
+  RAM-tier node, 64 KiB p50 139-177 -> 45-66 us, about what
+  `DFKV_RDMA_BUSY_POLL` gives; the cost is up to about 150 us of spinning
+  per GET when the server is slower than that (some 1.5 cores at 10k GETs/s).
+  Server endpoints do not spin. The busy-poll wait no longer makes a
+  `poll()` system call on its wake pipe on every spin. A signal during a
+  completion wait no longer starts its timeout again. Nothing changes on
+  the wire.
 
 - Server, RAM tier: a value a flush gives up on is counted before it is
   dropped (REQ-25). The drop takes the value out of the dirty count, and
