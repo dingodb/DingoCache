@@ -175,6 +175,11 @@ class LogStore : public StoreEngine {
     uint64_t segments_sealed = 0;
     uint64_t segments_reclaimed = 0;
     uint64_t inline_reclaims = 0;
+    uint64_t inline_reclaim_us = 0;     // time PUTs spent reclaiming inline
+    uint64_t sealer_queue_waits = 0;    // writers that waited for the sealer
+    uint64_t sealer_queue_wait_us = 0;
+    uint64_t cleaner_waits = 0;         // PUTs that waited for the armed cleaner
+    uint64_t cleaner_wait_us = 0;
     uint64_t records_relocated = 0;
     uint64_t relocated_bytes = 0;
     uint64_t records_evicted = 0;

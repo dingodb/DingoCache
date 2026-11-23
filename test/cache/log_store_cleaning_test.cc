@@ -220,6 +220,7 @@ TEST(LogStoreCleaner, AStoreReopenedFullOfProtectedValuesTakesPutsAtOnce) {
   RecordProperty("puts_ms", static_cast<int>(ms));
   EXPECT_EQ(cache_full, 0u);
   EXPECT_EQ(s.GetStats().protected_evictions, 0u);
+  EXPECT_GT(s.GetStats().cleaner_waits, 0u) << "the PUTs waited for the cleaner";
   fs::remove_all(dir);
 }
 
@@ -745,6 +746,11 @@ TEST(LogStoreMetrics, TheEngineReportsTheLseFamily) {
                            "dfkv_lse_records_evicted_total",
                            "dfkv_lse_records_relocated_total",
                            "dfkv_lse_inline_reclaims_total",
+                           "dfkv_lse_inline_reclaim_microseconds_total",
+                           "dfkv_lse_sealer_queue_waits_total",
+                           "dfkv_lse_sealer_queue_wait_microseconds_total",
+                           "dfkv_lse_cleaner_waits_total",
+                           "dfkv_lse_cleaner_wait_microseconds_total",
                            "dfkv_lse_protected_evictions_total",
                            "dfkv_lse_journal_compactions_total",
                            "dfkv_lse_journal_integrity_resets_total"})
