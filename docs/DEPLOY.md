@@ -136,8 +136,10 @@ journalctl -u dfkv_mds -n 5 --no-pager   # 应见 "dfkv_mds listening on 9400, e
 > registrar 的默认 socket I/O timeout 为 9s，组合上覆盖这 8s server budget；不要把
 > caller timeout 调到单个 etcd timeout。2.35–2.42 的 registrar 仍是 7s：只在 etcd
 > 变慢（每个请求接近 2s）时才可能在这条 4 个请求的路径上超时，下一次心跳重试。
-> 任一 MDS 都续记录上挂的那个租约，所以 registrar 换 MDS 不再重新授予租约、重写
-> 记录。
+> registrar 粘在一个 MDS 上（起始的那个按 member id 的 hash 选，各节点分散在各 MDS
+> 上），失败时在同一次心跳里立即依次试其他端点（建连超时 2s），失败的端点 30s 内
+> 不再先选。任一 MDS 都续记录上挂的那个租约，所以换 MDS
+> 不再重新授予租约、重写记录。
 > MDS 的 `/healthz` 是纯进程 liveness（不 probe etcd）：否则一次秒级 etcd
 > 抖动会让 kubelet 同时重启全部 MDS 副本，CrashLoop 比抖动更久，重注册风暴
 > 还会引发 lease 集体过期。`/readyz` 保留 etcd 依赖检查（活着但探不到 etcd

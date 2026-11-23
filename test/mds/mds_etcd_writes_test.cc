@@ -1,4 +1,5 @@
-// What the MDS writes to etcd for heartbeats. Runs against the
+// What the MDS writes to etcd for heartbeats, and how the registrar picks an
+// MDS. Runs against the
 // in-process fake of the etcd JSON gateway (fake_etcd.h): no etcd needed.
 #include "mds/mds_server.h"
 
@@ -19,6 +20,7 @@
 #include "common/membership.h"
 #include "fake_etcd.h"
 #include "mds/mds_proto.h"
+#include "mds/mds_registrar.h"
 #include "transport/wire.h"
 #include "utils/net_util.h"
 
@@ -117,6 +119,18 @@ MemberInfo WithStats(MemberInfo m, uint64_t puts) {
 const MemberInfo kA{"na", "10.1.1.1", 28000, 1};
 const MemberInfo kB{"nb", "10.1.1.2", 28000, 1};
 
+int ClosedPort() {
+  const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  sockaddr_in sa{};
+  sa.sin_family = AF_INET;
+  sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  ::bind(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa));
+  socklen_t sl = sizeof(sa);
+  ::getsockname(fd, reinterpret_cast<sockaddr*>(&sa), &sl);
+  ::close(fd);  // nothing listens there now
+  return ntohs(sa.sin_port);
+}
+
 }  // namespace
 
 // A heartbeat renews the lease the record carries and writes nothing when
@@ -194,4 +208,72 @@ TEST(MdsEtcdWrites, AnExpiredLeaseIsReplaced) {
   EXPECT_EQ(EtcdOps(mds, "put"), 2);
   EXPECT_EQ(ListIds(mds, "g"), (std::set<std::string>{"na"}));
   mds.Stop();
+}
+
+// The registrar stays on one MDS while it answers, and when it fails tries
+// the next at once, in the same heartbeat: an MDS that is down costs no
+// failed heartbeat. It used to rotate, one MDS per heartbeat, and a dead one
+// failed every heartbeat that came to it.
+TEST(MdsRegistrarFailover, StaysOnOneMdsAndFailsOverWithinTheHeartbeat) {
+  FakeEtcd etcd;
+  MdsServer first(etcd.ep()), second(etcd.ep());
+  ASSERT_EQ(first.Start(0), Status::kOk);
+  ASSERT_EQ(second.Start(0), Status::kOk);
+  const std::string dead = "127.0.0.1:" + std::to_string(ClosedPort());
+  MdsRegistrar registrar(
+      {dead, "127.0.0.1:" + std::to_string(first.port()),
+       "127.0.0.1:" + std::to_string(second.port())},
+      "g", kA, /*heartbeat_ms=*/150);
+  registrar.Start();
+  auto beats = [](MdsServer& mds) {
+    return Metric(mds, "dfkv_mds_register_requests_total") +
+           Metric(mds, "dfkv_mds_keepalives_total");
+  };
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (beats(first) + beats(second) < 6 &&
+         std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  ASSERT_GE(beats(first) + beats(second), 6);
+  // All on one of the two (whichever the member id starts it on, or the
+  // one after the dead endpoint).
+  MdsServer& used = beats(first) > 0 ? first : second;
+  MdsServer& other = &used == &first ? second : first;
+  EXPECT_EQ(beats(other), 0) << "rotated instead of staying on one MDS";
+  EXPECT_EQ(registrar.heartbeat_failures_total(), 0u)
+      << "the dead MDS failed a heartbeat";
+  used.Stop();
+  const double at_other = beats(other);
+  while (beats(other) < at_other + 4 &&
+         std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  EXPECT_GE(beats(other), at_other + 4);
+  EXPECT_EQ(registrar.heartbeat_failures_total(), 0u)
+      << "a heartbeat failed while another MDS answered";
+  registrar.Stop();
+  other.Stop();
+}
+
+// Registrars start on an MDS chosen by their member id: members spread over
+// the MDS instead of all loading the first and failing over together.
+TEST(MdsRegistrarFailover, MembersSpreadOverTheMds) {
+  FakeEtcd etcd;
+  std::vector<std::unique_ptr<MdsServer>> servers;
+  std::vector<std::string> eps;
+  for (int i = 0; i < 3; ++i) {
+    servers.push_back(std::make_unique<MdsServer>(etcd.ep()));
+    ASSERT_EQ(servers.back()->Start(0), Status::kOk);
+    eps.push_back("127.0.0.1:" + std::to_string(servers.back()->port()));
+  }
+  std::vector<std::unique_ptr<MdsRegistrar>> registrars;
+  for (int i = 0; i < 12; ++i) {
+    MemberInfo m{"node-" + std::to_string(i), "10.3.3." + std::to_string(i),
+                 28000, 1};
+    registrars.push_back(std::make_unique<MdsRegistrar>(eps, "g", m));
+    ASSERT_TRUE(registrars.back()->RegisterOnce());
+  }
+  int used = 0;
+  for (auto& s : servers)
+    if (Metric(*s, "dfkv_mds_register_requests_total") > 0) ++used;
+  EXPECT_EQ(used, 3) << "members did not spread over the MDS";
+  for (auto& s : servers) s->Stop();
 }

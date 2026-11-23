@@ -41,3 +41,12 @@ TEST(MdsEndpoints, EmptyListReturnsEmpty) {
   MdsEndpoints ep({});
   EXPECT_TRUE(ep.Pick(0).empty());
 }
+
+TEST(MdsEndpoints, StickySelectionStartsWhereSeeded) {
+  MdsEndpoints eps({"a", "b", "c"}, 30000, /*sticky=*/true);
+  eps.SeedCursor(4);  // 4 % 3 == 1
+  EXPECT_EQ(eps.Pick(0), "b");
+  EXPECT_EQ(eps.Pick(0), "b");
+  eps.MarkFailed("b", 0);
+  EXPECT_EQ(eps.Pick(0), "c");
+}

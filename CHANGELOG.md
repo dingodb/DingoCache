@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Node and client registrar: it stays on one MDS while that one answers,
+  and when it fails tries the others at once, in the same heartbeat,
+  instead of rotating over them one heartbeat at a time. A connect to an
+  MDS gives up after 2 s (it used to take the 7 s I/O timeout), and a failed
+  MDS is passed over for 30 s (2 s, less than a heartbeat interval). Each
+  registrar starts on the MDS its member id hashes to, so members spread
+  over the MDS rather than all loading the first and failing over together. With one
+  of three MDS unreachable a member used to go 27 s between renewals of its
+  30 s lease, and with two 44 s, dropping out of the ring; now an
+  unreachable MDS costs one heartbeat at most 2 s.
 - MDS: a heartbeat no longer writes to etcd unless the member's record
   changed. It reads the record, renews the lease the record is attached to
   (any MDS may renew any lease), and writes only a changed record; a change

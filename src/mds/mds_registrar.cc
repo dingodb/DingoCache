@@ -21,13 +21,21 @@ namespace dfkv {
 MdsRegistrar::MdsRegistrar(std::vector<std::string> mds_eps, std::string group,
                            MemberInfo self, int heartbeat_ms, int io_timeout_ms,
                            bool is_client, int first_registration_timeout_ms)
-    : eps_(std::move(mds_eps)),
+    : eps_(std::move(mds_eps), kEndpointBackoffMs, /*sticky=*/true),
       group_(std::move(group)),
       self_(std::move(self)),
       hb_ms_(heartbeat_ms),
       io_ms_(io_timeout_ms),
       is_client_(is_client),
-      first_registration_timeout_ms_(first_registration_timeout_ms) {}
+      first_registration_timeout_ms_(first_registration_timeout_ms) {
+  // FNV-1a of the member id: a stable spread of members over the MDS.
+  uint64_t hash = 1469598103934665603ull;
+  for (const unsigned char c : self_.id) {
+    hash ^= c;
+    hash *= 1099511628211ull;
+  }
+  eps_.SeedCursor(hash);
+}
 
 MdsRegistrar::~MdsRegistrar() { Stop(); }
 
@@ -37,16 +45,34 @@ uint64_t MdsRegistrar::NowMs() const {
       .count();
 }
 
+// One register or heartbeat: on the MDS in use, and if that fails, on each
+// of the others in turn, at once. A member whose MDS has gone away is renewed
+// in the same heartbeat by another, instead of a heartbeat interval later.
 bool MdsRegistrar::SendOnce(uint8_t op, int io_timeout_ms,
                             uint64_t deadline_ms) {
-  const uint64_t started_ms = NowMs();
-  std::string ep = eps_.Pick(started_ms);
-  if (ep.empty()) return false;
-  int fd = net::Dial(ep, io_timeout_ms, io_timeout_ms);
-  if (fd < 0) {
+  std::vector<std::string> tried;
+  for (size_t attempt = 0; attempt < eps_.size(); ++attempt) {
+    if (!running_.load() && attempt != 0) return false;
+    if (deadline_ms != 0 && NowMs() >= deadline_ms) return false;
+    const std::string ep = eps_.Pick(NowMs());
+    if (ep.empty()) return false;
+    if (std::find(tried.begin(), tried.end(), ep) != tried.end()) return false;
+    tried.push_back(ep);
+    const uint64_t started_ms = NowMs();
+    if (SendTo(ep, op, io_timeout_ms, deadline_ms)) {
+      eps_.MarkOk(ep);
+      return true;
+    }
     eps_.MarkFailed(ep, started_ms);
-    return false;
   }
+  return false;
+}
+
+bool MdsRegistrar::SendTo(const std::string& ep, uint8_t op,
+                          int io_timeout_ms, uint64_t deadline_ms) {
+  int fd = net::Dial(ep, std::min(io_timeout_ms, kConnectTimeoutMs),
+                     io_timeout_ms);
+  if (fd < 0) return false;
 
   // Re-arm socket I/O before each phase with the absolute startup deadline's
   // remaining budget. Without this, connect + write + read could each consume
@@ -93,10 +119,6 @@ bool MdsRegistrar::SendOnce(uint8_t op, int io_timeout_ms,
     }
   }
   ::close(fd);
-  if (ok)
-    eps_.MarkOk(ep);
-  else
-    eps_.MarkFailed(ep, started_ms);
   return ok;
 }
 
