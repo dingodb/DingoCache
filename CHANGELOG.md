@@ -304,6 +304,14 @@
   and the software fallback are unchanged. It is the log engine's payload
   checksum, on every PUT and whole-value GET.
 
+- perf: log engine (experimental): a segment's new header is written without
+  holding the store mutex, and the sealer keeps one client segment opened
+  ahead of time. PUTs that finished their write no longer wait behind a
+  header write (about 1 ms, once per segment opened or reclaimed). New
+  metrics `dfkv_lse_segment_open_waits_total`,
+  `dfkv_lse_segment_open_wait_microseconds_total`,
+  `dfkv_lse_preopened_taken_total`. Design §6.7.
+
 - perf: log engine index hash mixes every key field (experimental `log`
   engine only). Keys whose fields are related, such as `{id * C + 1, id}`,
   fell into a few buckets of the index, shadow and flight tables, so each

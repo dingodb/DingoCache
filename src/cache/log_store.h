@@ -180,6 +180,9 @@ class LogStore : public StoreEngine {
     uint64_t sealer_queue_wait_us = 0;
     uint64_t cleaner_waits = 0;         // PUTs that waited for the armed cleaner
     uint64_t cleaner_wait_us = 0;
+    uint64_t segment_open_waits = 0;    // PUTs that waited for another's opening
+    uint64_t segment_open_wait_us = 0;
+    uint64_t preopened_taken = 0;       // openings served by the pre-opened segment
     uint64_t records_relocated = 0;
     uint64_t relocated_bytes = 0;
     uint64_t records_evicted = 0;
@@ -198,6 +201,7 @@ class LogStore : public StoreEngine {
     uint32_t segments_sealed_now = 0;
     uint32_t sealer_queue = 0;
     uint32_t open_segments = 0;
+    uint32_t preopened = 0;     // 1 while a pre-opened segment is ready
     uint64_t shadows = 0;
     uint32_t segment_count = 0;
   };
@@ -266,7 +270,11 @@ class LogStore : public StoreEngine {
     uint64_t generation = 0;
     bool dest_shadowed = false;
   };
-  enum class SegState { kFree, kOpen, kRelocation, kSealing, kSealed, kWalked };
+  // kOpening: taken from the free list, its header being written without the
+  // mutex; kPreopened: its header durable, no records, ready for a client
+  // (§6.7).
+  enum class SegState { kFree, kOpening, kPreopened, kOpen, kRelocation, kSealing,
+                        kSealed, kWalked };
   struct Segment {
     SegState state = SegState::kFree;
     bool header_valid = false;  // its current header is durable and ours
@@ -323,7 +331,18 @@ class LogStore : public StoreEngine {
   bool ChangeCapacityLocked();
   // A new incarnation for the segment, durable. `empty`: also a trailer
   // with no records, so that a free segment is not walked at the next open.
-  bool FreshHeader(uint32_t index, bool empty = false);  // with mu_ held
+  // Written with mu_ held: for the paths that run before Activate admits
+  // anything.
+  bool FreshHeader(uint32_t index, bool empty = false);
+  // The same in three steps (§6.7): the incarnation is claimed under the
+  // mutex, the header written without it, and the segment's state published
+  // under it again. The hooks run before and after the write. False if the
+  // store failed.
+  bool FreshHeaderUnlocked(Lock& lk, uint32_t index, bool empty,
+                           const char* before_hook, const char* after_hook);
+  bool ClaimIncarnationLocked(uint64_t* inc);
+  bool WriteSegmentHeader(uint32_t index, uint64_t inc, bool empty);
+  void PublishHeaderLocked(uint32_t index, uint64_t inc);
   uint32_t OpenSegmentCount() const;
   bool SyncDir(const std::string& path);
   std::string SegmentPath(uint32_t index) const;
@@ -361,9 +380,11 @@ class LogStore : public StoreEngine {
   bool ReserveRelocationLocked(Lock& lk, uint64_t footprint,
                                uint32_t* segment, uint64_t* offset);
   bool PlaceLocked(uint32_t segment, uint64_t footprint, uint64_t* offset);
-  // Takes a free segment and gives it a fresh header. `client`: leave the
-  // cleaner's reserve alone.
-  bool TakeFreeSegmentLocked(bool client, uint32_t* out);
+  // Takes a free segment and gives it a fresh header, written without the
+  // mutex (§6.7). `client`: leave the cleaner's reserve alone.
+  bool TakeFreeSegment(Lock& lk, bool client, uint32_t* out);
+  // The sealer's pre-opened client segment (§6.7.4).
+  void PreopenLocked(Lock& lk);
   // Hands an open segment to the sealer; waits while its queue is full.
   void HandToSealerLocked(Lock& lk, uint32_t segment);
   uint64_t NextLsnLocked();
@@ -385,7 +406,7 @@ class LogStore : public StoreEngine {
   bool ReclaimVictim(Lock& lk, uint32_t victim);
   bool RelocateOne(Lock& lk, const BlockKey& key, const Entry& e);
   bool SyncCopiesLocked(Lock& lk, uint32_t victim);
-  bool InlineReclaimLocked(Lock& lk);
+  bool InlineReclaimLocked(Lock& lk, uint32_t* out);
   void EvictLocked(const BlockKey& key, bool protected_eviction);
   void FinishReclaimLocked(uint32_t victim, uint64_t old_incarnation);
   bool RelocationBudgetLocked(uint64_t bytes) const;
@@ -429,6 +450,14 @@ class LogStore : public StoreEngine {
   std::vector<uint32_t> open_;   // open client segments, at most k_open_
   uint32_t k_open_ = 1;
   uint32_t reloc_segment_ = UINT32_MAX;
+  // Client segments being opened (or reclaimed inline) by PUTs: with open_,
+  // at most k_open_ (§6.7.3).
+  uint32_t client_openings_ = 0;
+  uint32_t preopened_ = UINT32_MAX;  // §6.7.4
+  bool preopening_ = false;          // its header being written
+  // Advances whenever a client segment is published or a slot released:
+  // what a PUT waiting for another's opening waits for.
+  uint64_t open_changes_ = 0;
   std::vector<uint32_t> free_;   // free segments, in the order they are taken
   std::deque<uint32_t> fifo_;    // sealed segments, oldest first (§7.2)
   std::deque<uint32_t> seal_queue_;

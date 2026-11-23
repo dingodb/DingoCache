@@ -826,7 +826,8 @@ cleaner's free target (§7.1, *K* + *C* free) counts an existing pre-opened
 segment as one of the *K* held back for client openings, so the cleaner does
 not keep one more segment free because of it, and the pre-opened segment costs
 no capacity beyond today's reserves (`kHeldBack`, and so the retention budget,
-are unchanged). Relocation still takes from the cleaner's reserve as before.
+are unchanged). Relocation still takes from the cleaner's reserve as before. The reported free-segment count (`dfkv_lse_segments_free`) includes it: a
+client takes it as it would a free one.
 
 A crash with a pre-opened segment, unused:
 

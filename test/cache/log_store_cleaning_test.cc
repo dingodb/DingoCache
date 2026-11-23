@@ -160,16 +160,20 @@ TEST(LogStoreCleaner, APinnedVictimKeepsItsValues) {
   ASSERT_GT(ids.size(), 20u);
   const uint64_t evicted = s.Evictions();
   const uint64_t relocated = s.GetStats().records_relocated;
-  // Writes until a free segment is taken: the cleaner looks for a victim
-  // and finds only pinned ones.
-  const uint32_t free_before = s.GetStats().segments_free;
-  for (uint64_t id = 1000; id < 1020 && s.GetStats().segments_free >= free_before;
+  // Writes until the cleaner, wanting a segment back, has looked for a
+  // victim and found only pinned ones. Not until a free count drops: the
+  // stats count a segment as free only once its pre-open is done, while
+  // the cleaner counts one being pre-opened as ready (so that taking a free
+  // segment to pre-open it does not make it reclaim one more). Stopping on
+  // the stats' count could stop while a pre-open was under way, with the
+  // cleaner still content.
+  for (uint64_t id = 1000; id < 1040 && s.GetStats().victims_skipped_pins == 0;
        ++id) {
     const std::string v = Val(id, kLen);
     s.Cache(Key(id), v.data(), v.size());
+    for (int i = 0; i < 20 && s.GetStats().victims_skipped_pins == 0; ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
-  for (int i = 0; i < 100 && s.GetStats().victims_skipped_pins == 0; ++i)
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
   EXPECT_GT(s.GetStats().victims_skipped_pins, 0u);
   EXPECT_EQ(s.Evictions(), evicted) << "values evicted from a pinned victim";
