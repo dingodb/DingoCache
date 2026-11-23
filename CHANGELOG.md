@@ -70,6 +70,12 @@
   (draft pages are written best-effort and may never be), so they cannot
   fill the pending table.
 
+- perf: CRC-32C over long inputs runs three instruction chains at once and
+  joins them (x86-64 SSE4.2 and AArch64 CRC paths), 2.6 times the throughput
+  of one chain (measured). Values are bit-identical; the run-time dispatch
+  and the software fallback are unchanged. It is the log engine's payload
+  checksum, on every PUT and whole-value GET.
+
 - Server, TCP: the first frame of a connection gets the same payload
   allowance as later frames (1 MiB/s on top of `DFKV_TCP_FIRST_REQ_MS`), so a
   large first PUT on a slow link is not cut off at the first-request

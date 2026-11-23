@@ -60,14 +60,92 @@ uint32_t SoftwareRaw(const unsigned char* p, size_t len, uint32_t c) {
   return c;
 }
 
+#if defined(__x86_64__) || (defined(__aarch64__) && defined(__linux__))
+// The CRC instruction has a latency of several cycles but can start one per
+// cycle: one dependent chain runs at a third of its throughput. Long inputs
+// are therefore cut into three blocks of the same length, each with its own
+// chain, and the three are joined. The register is linear in the bytes:
+// running it over A then B gives Shift_|B|(raw(c, A)) ^ raw(0, B), where
+// Shift_n multiplies by x^(8n) modulo the polynomial, which is what running
+// it over n zero bytes does. Shift_n is applied with four 256-entry tables
+// (one per byte of the register), for the two block lengths used.
+constexpr size_t kLongBlock = 8192;
+constexpr size_t kShortBlock = 256;
+
+struct ShiftTable {
+  uint32_t t[4][256];
+  uint32_t Apply(uint32_t c) const {
+    return t[0][c & 0xFF] ^ t[1][(c >> 8) & 0xFF] ^ t[2][(c >> 16) & 0xFF] ^
+           t[3][c >> 24];
+  }
+};
+
+// Shift_n of every register value, built from the 32 single-bit values:
+// each is the software loop run over n zero bytes.
+ShiftTable MakeShift(size_t n) {
+  static const unsigned char kZeros[kLongBlock] = {};
+  uint32_t bit[32];
+  for (int i = 0; i < 32; ++i) bit[i] = SoftwareRaw(kZeros, n, 1u << i);
+  ShiftTable s{};
+  for (int k = 0; k < 4; ++k)
+    for (uint32_t b = 0; b < 256; ++b) {
+      uint32_t v = 0;
+      for (int i = 0; i < 8; ++i)
+        if (b & (1u << i)) v ^= bit[8 * k + i];
+      s.t[k][b] = v;
+    }
+  return s;
+}
+
+const ShiftTable& LongShift() {
+  static const ShiftTable s = MakeShift(kLongBlock);
+  return s;
+}
+const ShiftTable& ShortShift() {
+  static const ShiftTable s = MakeShift(kShortBlock);
+  return s;
+}
+
+// The three-chain loop over whole groups of three blocks of BLOCK bytes,
+// with STEP(crc, 8 bytes) the instruction. A macro, not a function: it must
+// be expanded inside the function compiled for the instruction set.
+#define DFKV_CRC32C_THREE_CHAINS(STEP, BLOCK, SHIFT)                        \
+  while (len >= 3 * (BLOCK)) {                                              \
+    uint32_t c1 = 0, c2 = 0;                                                \
+    const unsigned char* const end = p + (BLOCK);                           \
+    do {                                                                    \
+      uint64_t v0, v1, v2;                                                  \
+      std::memcpy(&v0, p, 8);                                               \
+      std::memcpy(&v1, p + (BLOCK), 8);                                     \
+      std::memcpy(&v2, p + 2 * (BLOCK), 8);                                 \
+      c = STEP(c, v0);                                                      \
+      c1 = STEP(c1, v1);                                                    \
+      c2 = STEP(c2, v2);                                                    \
+      p += 8;                                                               \
+    } while (p < end);                                                      \
+    c = (SHIFT).Apply(c) ^ c1;                                              \
+    c = (SHIFT).Apply(c) ^ c2;                                              \
+    p += 2 * (BLOCK);                                                       \
+    len -= 3 * (BLOCK);                                                     \
+  }
+#endif
+
 #if defined(__x86_64__)
 __attribute__((target("sse4.2"))) uint32_t HardwareRaw(const unsigned char* p,
                                                         size_t len,
                                                         uint32_t c) {
+#define DFKV_CRC32C_STEP(crc, v) static_cast<uint32_t>(_mm_crc32_u64((crc), (v)))
+  if (len >= 3 * kShortBlock) {
+    const ShiftTable& long_shift = LongShift();
+    const ShiftTable& short_shift = ShortShift();
+    DFKV_CRC32C_THREE_CHAINS(DFKV_CRC32C_STEP, kLongBlock, long_shift)
+    DFKV_CRC32C_THREE_CHAINS(DFKV_CRC32C_STEP, kShortBlock, short_shift)
+  }
+#undef DFKV_CRC32C_STEP
   uint64_t c64 = c;
   while (len >= 8) {
     uint64_t v;
-    std::memcpy(&v, p, 8);  // the instruction takes the bytes in memory order
+    std::memcpy(&v, p, 8);
     c64 = _mm_crc32_u64(c64, v);
     p += 8;
     len -= 8;
@@ -83,6 +161,14 @@ bool DetectHardware() {
 #elif defined(__aarch64__) && defined(__linux__)
 __attribute__((target("+crc"))) uint32_t HardwareRaw(const unsigned char* p,
                                                       size_t len, uint32_t c) {
+#define DFKV_CRC32C_STEP(crc, v) __crc32cd((crc), (v))
+  if (len >= 3 * kShortBlock) {
+    const ShiftTable& long_shift = LongShift();
+    const ShiftTable& short_shift = ShortShift();
+    DFKV_CRC32C_THREE_CHAINS(DFKV_CRC32C_STEP, kLongBlock, long_shift)
+    DFKV_CRC32C_THREE_CHAINS(DFKV_CRC32C_STEP, kShortBlock, short_shift)
+  }
+#undef DFKV_CRC32C_STEP
   while (len >= 8) {
     uint64_t v;
     std::memcpy(&v, p, 8);
