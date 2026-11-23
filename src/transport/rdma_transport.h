@@ -183,6 +183,11 @@ class RdmaTransport : public Transport {
     size_t leased_inline_bytes = 0;
     RailMask excluded;
     std::shared_ptr<const rdma::PeerRailSnapshot> peer;
+    // Set by Acquire itself when this process could not open an endpoint on
+    // the rail it chose: try the other rails, on an idle pooled connection
+    // only (no descriptor to open another), and without trying again.
+    bool pooled_only = false;
+    bool local_resource_fallback = true;
   };
   struct AcquireResult {
     Conn* conn = nullptr;
@@ -444,6 +449,11 @@ class RdmaTransport : public Transport {
   std::atomic<uint64_t> peer_unreachable_{0};
   std::atomic<uint64_t> peer_busy_{0};
   std::atomic<uint64_t> local_resource_failures_{0};
+  // Endpoint opens refused for lack of descriptors or memory whose operation
+  // was then served on another rail.
+  std::atomic<uint64_t> local_resource_rail_fallbacks_{0};
+  // Tests: the errno an endpoint open on this rail fails with (0 = none).
+  std::vector<int> fail_open_errno_for_test_;
   std::atomic<uint64_t> cross_rail_retries_{0};
   std::atomic<uint64_t> cross_rail_retry_successes_{0};
   std::atomic<uint64_t> cross_rail_retry_exhausted_{0};

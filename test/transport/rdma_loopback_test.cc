@@ -272,6 +272,16 @@ class RdmaTransportTestPeer {
                   RdmaTransport::AcquireOptions{})
         .conn;
   }
+  // A control-lane connection on `rail` only.
+  static RdmaTransport::Conn* AcquireControlOn(RdmaTransport* transport,
+                                               const std::string& node,
+                                               size_t rail) {
+    RdmaTransport::AcquireOptions options;
+    options.excluded.assign(transport->devs_.size(), 1);
+    options.excluded[rail] = 0;
+    return transport->Acquire(node, RdmaTransport::Lane::kControl, options)
+        .conn;
+  }
   static void ReleaseControl(RdmaTransport* transport,
                              const std::string& node,
                              RdmaTransport::Conn* conn) {
@@ -6507,6 +6517,162 @@ TEST(RdmaLoopback, EndpointOpenWithoutDescriptorsIsALocalFailure) {
     return 0;
   });
   if (result == kNoDevice) GTEST_SKIP() << "no RDMA device";
+  EXPECT_EQ(result, 0) << "step code from the child, see the test body";
+}
+
+// Out of descriptors, an operation whose rail has no idle connection cannot
+// open one, but another rail's idle connection to the same peer needs no
+// descriptor: the operation is served there instead of failing at once.
+TEST(RdmaLoopback, DescriptorExhaustionUsesAnIdleConnectionOnAnotherRail) {
+  constexpr int kSkip = 77;
+  const int result = testing_fd::RunInChild([] {
+    if (!HaveRdma()) return kSkip;
+    const auto discovered = rdma::RdmaTopology::Discover(
+        {}, rdma::RdmaDiscoveryPolicy::kActiveOnly);
+    if (discovered.status != rdma::RdmaDiscoveryStatus::kOk ||
+        discovered.devices.size() < 2)
+      return kSkip;
+    const std::string rails =
+        discovered.devices[0].name + "," + discovered.devices[1].name;
+    ::unsetenv("DFKV_RDMA_RAIL_TIERS");
+    ::setenv("DFKV_RDMA_KEEPALIVE_MS", "0", 1);
+    ::setenv("DFKV_RDMA_IDLE_MS", "0", 1);
+    ::setenv("DFKV_RDMA_NUMA", "0", 1);
+    ::setenv("DFKV_RDMA_DEV", rails.c_str(), 1);
+    RdmaNode node("fallback-pooled");
+    ::setenv("DFKV_RDMA_PRIMARY_DEV", discovered.devices[0].name.c_str(), 1);
+    RdmaTransport rt(kMaxMsg, rails);
+    RdmaTransportTestPeer::StopMaintenance(&rt);
+    rt.OnPeerTopology(PublishedPeer(node.addr, "healthy-peer"));
+    const std::vector<BlockKey> keys = {ToBlockKey(SelfHdr(), "absent")};
+    std::vector<char> exists;
+    const Status served = rt.ExistMany(node.addr, keys, &exists)[0];
+    if (served == Status::kIOError || served == Status::kResourceExhausted)
+      return 10;
+    // An idle connection on the second rail...
+    auto* idle = RdmaTransportTestPeer::AcquireControlOn(&rt, node.addr, 1);
+    if (!idle) return 11;
+    RdmaTransportTestPeer::ReleaseControl(&rt, node.addr, idle);
+    // ...and none on the first, the one the operation prefers: hold its
+    // connections until a new one had to be opened.
+    const auto misses = [&] {
+      return CounterVal(rt.MetricsText(),
+                        "dfkv_rdma_endpoint_cache_misses_total");
+    };
+    const long misses_before = misses();
+    std::vector<decltype(RdmaTransportTestPeer::AcquireControlOn(
+        &rt, node.addr, 0))>
+        held;
+    while (misses() == misses_before && held.size() < 16) {
+      auto* conn = RdmaTransportTestPeer::AcquireControlOn(&rt, node.addr, 0);
+      if (!conn) return 12;
+      held.push_back(conn);
+    }
+    if (misses() == misses_before) return 13;
+    Status starved = Status::kOk;
+    {
+      testing_fd::NoFreeDescriptors exhausted(/*spare=*/1);
+      if (!exhausted.active()) return 14;
+      starved = rt.ExistMany(node.addr, keys, &exists)[0];
+    }
+    if (starved != served) return 15;
+    const std::string metrics = rt.MetricsText();
+    if (CounterVal(metrics,
+                   "dfkv_rdma_client_local_resource_failures_total") != 1)
+      return 16;
+    if (CounterVal(metrics,
+                   "dfkv_rdma_client_local_resource_rail_fallbacks_total") !=
+        1)
+      return 17;
+    if (!LabeledSeriesAllZero(metrics, "dfkv_rdma_client_rail_errors_total"))
+      return 18;
+    for (auto* conn : held)
+      RdmaTransportTestPeer::ReleaseControl(&rt, node.addr, conn);
+    return 0;
+  });
+  if (result == kSkip) GTEST_SKIP() << "needs two ACTIVE RDMA devices";
+  EXPECT_EQ(result, 0) << "step code from the child, see the test body";
+}
+
+// With no descriptor at all, socket() in the dial fails before any endpoint
+// is opened. That is this process's want of descriptors too, not a peer that
+// cannot be reached: the idle connection on another rail serves the
+// operation, and the peer is not held off as unreachable.
+TEST(RdmaLoopback, DialWithoutDescriptorsUsesAnIdleConnectionOnAnotherRail) {
+  constexpr int kSkip = 77;
+  const int result = testing_fd::RunInChild([] {
+    if (!HaveRdma()) return kSkip;
+    const auto discovered = rdma::RdmaTopology::Discover(
+        {}, rdma::RdmaDiscoveryPolicy::kActiveOnly);
+    if (discovered.status != rdma::RdmaDiscoveryStatus::kOk ||
+        discovered.devices.size() < 2)
+      return kSkip;
+    const std::string rails =
+        discovered.devices[0].name + "," + discovered.devices[1].name;
+    ::unsetenv("DFKV_RDMA_RAIL_TIERS");
+    ::setenv("DFKV_RDMA_KEEPALIVE_MS", "0", 1);
+    ::setenv("DFKV_RDMA_IDLE_MS", "0", 1);
+    ::setenv("DFKV_RDMA_NUMA", "0", 1);
+    ::setenv("DFKV_RDMA_DEV", rails.c_str(), 1);
+    RdmaNode node("fallback-dial");
+    ::setenv("DFKV_RDMA_PRIMARY_DEV", discovered.devices[0].name.c_str(), 1);
+    RdmaTransport rt(kMaxMsg, rails);
+    RdmaTransportTestPeer::StopMaintenance(&rt);
+    rt.OnPeerTopology(PublishedPeer(node.addr, "healthy-peer"));
+    const std::vector<BlockKey> keys = {ToBlockKey(SelfHdr(), "absent")};
+    std::vector<char> exists;
+    const Status served = rt.ExistMany(node.addr, keys, &exists)[0];
+    if (served == Status::kIOError || served == Status::kResourceExhausted)
+      return 10;
+    auto* idle = RdmaTransportTestPeer::AcquireControlOn(&rt, node.addr, 1);
+    if (!idle) return 11;
+    RdmaTransportTestPeer::ReleaseControl(&rt, node.addr, idle);
+    const auto misses = [&] {
+      return CounterVal(rt.MetricsText(),
+                        "dfkv_rdma_endpoint_cache_misses_total");
+    };
+    const long misses_before = misses();
+    std::vector<decltype(RdmaTransportTestPeer::AcquireControlOn(
+        &rt, node.addr, 0))>
+        held;
+    while (misses() == misses_before && held.size() < 16) {
+      auto* conn = RdmaTransportTestPeer::AcquireControlOn(&rt, node.addr, 0);
+      if (!conn) return 12;
+      held.push_back(conn);
+    }
+    if (misses() == misses_before) return 13;
+    Status starved = Status::kOk;
+    {
+      testing_fd::NoFreeDescriptors exhausted;  // not even one for socket()
+      if (!exhausted.active()) return 14;
+      starved = rt.ExistMany(node.addr, keys, &exists)[0];
+    }
+    if (starved != served) return 15;
+    const std::string metrics = rt.MetricsText();
+    if (CounterVal(metrics,
+                   "dfkv_rdma_client_local_resource_failures_total") != 1)
+      return 16;
+    if (CounterVal(metrics,
+                   "dfkv_rdma_client_local_resource_rail_fallbacks_total") !=
+        1)
+      return 17;
+    // The peer was not held off: the next operation that needs a new
+    // connection on the first rail gets one.
+    for (auto* conn : held)
+      RdmaTransportTestPeer::ReleaseControl(&rt, node.addr, conn);
+    std::vector<decltype(RdmaTransportTestPeer::AcquireControlOn(
+        &rt, node.addr, 0))>
+        again;
+    for (int i = 0; i < 18; ++i) {
+      auto* conn = RdmaTransportTestPeer::AcquireControlOn(&rt, node.addr, 0);
+      if (!conn) return 18;
+      again.push_back(conn);
+    }
+    for (auto* conn : again)
+      RdmaTransportTestPeer::ReleaseControl(&rt, node.addr, conn);
+    return 0;
+  });
+  if (result == kSkip) GTEST_SKIP() << "needs two ACTIVE RDMA devices";
   EXPECT_EQ(result, 0) << "step code from the child, see the test body";
 }
 

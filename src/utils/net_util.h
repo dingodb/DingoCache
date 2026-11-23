@@ -98,9 +98,17 @@ inline uint32_t GetU32(const char* p) { uint32_t v; std::memcpy(&v, p, 4); retur
 // literal or hostname returns -1 (caller treats as a clean connect failure /
 // marks the endpoint down). All current deploys are IPv4 (192.168.x); switch to
 // getaddrinfo here if an IPv6/dual-stack fabric is ever introduced.
+// On failure returns -1 with errno set to the cause (EINVAL for a malformed
+// address, ETIMEDOUT for a connect that outlasts connect_ms): callers tell a
+// local descriptor shortage (EMFILE, ENFILE) from an unreachable peer by it.
 inline int Dial(const std::string& addr, int connect_ms = 0, int io_ms = 0) {
+  auto fail = [](int fd, int err) {
+    if (fd >= 0) ::close(fd);
+    errno = err;
+    return -1;
+  };
   auto pos = addr.rfind(':');
-  if (pos == std::string::npos) return -1;
+  if (pos == std::string::npos) return fail(-1, EINVAL);
   std::string ip = addr.substr(0, pos);
   int port = std::atoi(addr.substr(pos + 1).c_str());
   int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -108,18 +116,18 @@ inline int Dial(const std::string& addr, int connect_ms = 0, int io_ms = 0) {
   sockaddr_in sa{};
   sa.sin_family = AF_INET;
   sa.sin_port = htons(static_cast<uint16_t>(port));
-  if (::inet_pton(AF_INET, ip.c_str(), &sa.sin_addr) != 1) { ::close(fd); return -1; }
+  if (::inet_pton(AF_INET, ip.c_str(), &sa.sin_addr) != 1) return fail(fd, EINVAL);
   int one = 1; ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
   if (connect_ms <= 0) {
-    if (::connect(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) { ::close(fd); return -1; }
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) return fail(fd, errno);
   } else {
     // non-blocking connect bounded by connect_ms
     int fl = ::fcntl(fd, F_GETFL, 0);
     ::fcntl(fd, F_SETFL, fl | O_NONBLOCK);
     int rc = ::connect(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa));
     if (rc != 0) {
-      if (errno != EINPROGRESS) { ::close(fd); return -1; }
+      if (errno != EINPROGRESS) return fail(fd, errno);
       // poll, not select: this header is linked into inference-engine hosts
       // that routinely hold thousands of fds, so a fresh socket's fd number
       // can exceed FD_SETSIZE (1024) — FD_SET would then write past the
@@ -128,10 +136,11 @@ inline int Dial(const std::string& addr, int connect_ms = 0, int io_ms = 0) {
       pollfd pf{fd, POLLOUT, 0};
       int pr;
       do { pr = ::poll(&pf, 1, connect_ms); } while (pr < 0 && errno == EINTR);
-      if (pr <= 0) { ::close(fd); return -1; }
+      if (pr == 0) return fail(fd, ETIMEDOUT);
+      if (pr < 0) return fail(fd, errno);
       int err = 0; socklen_t el = sizeof(err);
-      ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
-      if (err != 0) { ::close(fd); return -1; }
+      if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0) return fail(fd, errno);
+      if (err != 0) return fail(fd, err);
     }
     ::fcntl(fd, F_SETFL, fl);  // back to blocking
   }
