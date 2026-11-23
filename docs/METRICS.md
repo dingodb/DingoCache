@@ -366,6 +366,7 @@ TTL-debounced etcd probe 判定（`DFKV_MDS_PROBE_CACHE_MS`，默认 2500 ms 内
 | `dfkv_mds_ready` | gauge | TTL-debounced etcd probe；与 `/readyz` 使用同一 cache，1=可服务 membership |
 | `dfkv_build_info{version,role="mds"}` | gauge | MDS 二进制版本；恒为 1 |
 | `dfkv_mds_register_requests_total` / `dfkv_mds_keepalives_total` | counter | 注册 / 心跳 |
+| `dfkv_mds_deregister_requests_total` | counter | kDeregister：被 `dfkvctl drain` 排空的节点停止时删除自己的记录（DEPLOY §4c-1） |
 | `dfkv_mds_list_requests_total` | counter | ListMembers 次数 |
 | `dfkv_mds_lease_grants_total` | counter | etcd lease 授予：只在 member 记录不存在或其租约已过期时发生，稳态下不增长 |
 | `dfkv_mds_record_puts_total` / `dfkv_mds_record_puts_skipped_total` | counter | 写进 etcd 的 member/client 记录 / 只续租约、没有写的心跳（记录未变，或只有统计变了且未到 `DFKV_MDS_STATS_PUT_MS`）。稳态下前者每节点约每分钟 1 次 |
@@ -378,7 +379,7 @@ TTL-debounced etcd probe 判定（`DFKV_MDS_PROBE_CACHE_MS`，默认 2500 ms 内
 | `dfkv_mds_members` | gauge | 上次 List 返回的成员数 |
 | `dfkv_mds_client_register_requests_total` / `dfkv_mds_client_keepalives_total` / `dfkv_mds_client_list_requests_total` | counter | consumer 注册 / 心跳 / ListClients |
 | `dfkv_mds_clients` | gauge | 上次 ListClients 返回的 consumer 数 |
-| `dfkv_mds_etcd_requests_total{op}` / `dfkv_mds_etcd_request_errors_total{op}` | counter | etcd HTTP 请求 / 传输或 HTTP status 失败，`op=lease_grant|lease_keepalive|put|range|metrics_range|get|delete`（`get` 是心跳读单条记录及其租约，`delete` 是 fence 删除记录）；`metrics_range` 是每次 MDS scrape 同时用于 readiness 与 group 聚合的唯一 range，和业务控制面流量分开计数 |
+| `dfkv_mds_etcd_requests_total{op}` / `dfkv_mds_etcd_request_errors_total{op}` | counter | etcd HTTP 请求 / 传输或 HTTP status 失败，`op=lease_grant|lease_keepalive|put|range|metrics_range|get|delete`（`get` 是心跳读单条记录及其租约，`delete` 是 fence 和 kDeregister 删除记录）；`metrics_range` 是每次 MDS scrape 同时用于 readiness 与 group 聚合的唯一 range，和业务控制面流量分开计数 |
 | `dfkv_mds_etcd_request_duration_seconds{op}` | histogram | 同五类 etcd HTTP 请求延迟（50µs–60s + `+Inf`）；用于区分本地控制面排队、常规 etcd 慢响应和 scrape 自身的聚合 range |
 | `dfkv_mds_local_member_leases` / `dfkv_mds_local_client_leases` | gauge | 本 MDS 进程当前缓存的 member/client lease shortcut 数；只是 etcd 权威状态的有界优化 |
 | `dfkv_mds_local_member_leases_pruned_total` / `dfkv_mds_local_client_leases_pruned_total` | counter | 因多个 TTL 未在本 MDS 使用而丢弃的本地 shortcut；churn 下增长正常，下次心跳会 fresh grant+Put |
@@ -409,6 +410,8 @@ Prometheus 调用。vLLM 使用同一 allowlist，区别只是在 family 前加 
 | `dfkv_client_peer_errors_total{peer}` | counter | 逐 endpoint 错误；peer 集合在原生层硬限 4096 |
 | `dfkv_read_scheduler_node_limit_waits_total` | counter | 空闲 read worker 被唤醒后，发现待执行的 shard 全部属于已达单节点上限的节点的次数。正常运行中也会出现（例如小环上对单个节点的大 batch）；若其他节点的读同时变慢且该计数持续高速增长，说明有慢节点 |
 | `dfkv_client_ring_members` / `dfkv_client_mds_reachable` / `dfkv_client_mds_unreachable_polls_total` | gauge / gauge / counter | 当前环节点数 / 最近发现轮询是否可达 MDS / 不可达轮询累计 |
+| `dfkv_client_ring_draining_members` | gauge | 环里正在排空的节点数（DEPLOY §4c-1）：不再写入，读在新 owner 未命中后才问它 |
+| `dfkv_client_drain_requests_total{op,result}` | counter | 发给 key 的排空 owner 的第二次请求：`op=read`（新 owner 未命中后的读）、`remove`、`retain`（两边都发）；`result=served` 它有这个 key（或确认删除），`not_served` 没有或失败 |
 | `dfkv_client_dedup_hits_total` / `dfkv_client_dedup_fetches_total` / `dfkv_client_dedup_wait_hits_total` / `dfkv_client_dedup_wait_timeouts_total` | counter | host rendezvous 命中、真实 fetch、等待后命中、等待后回退直连（等满 `DFKV_NODE_DEDUP_WAIT_MS`，或 leader 放弃 / 已发布条目不可用而提前回退，两者不区分） |
 | `dfkv_client_gpu_dedup_hits_total` / `dfkv_client_gpu_dedup_fetches_total` / `dfkv_client_gpu_dedup_wait_hits_total` / `dfkv_client_gpu_dedup_wait_timeouts_total` | counter | 同上 CUDA IPC rendezvous。另：发布中的 slot 被收回（发布者超过 `DFKV_NODE_DEDUP_TAKEOVER_MS` 或该 key 被写入/删除）之后，到下一次 fetch 认领之前 slot 读作空，正在等的 follower 复查一次后放弃并自行读取，计入 wait_timeouts，也多一次远端读取 |
 | `dfkv_client_dedup_length_mismatches_total` / `dfkv_client_gpu_dedup_length_mismatches_total` | counter | 会合查找发现同一个 key 已由同机另一个进程发布、但长度与本进程期望的不同（host 严格长度不等或超出缓冲，GPU 超出各段容量之和）的次数。该条目不被使用（本进程自行读取）；首次出现时打一条 WARN。dedup 的前提是同一个 key 在本机所有进程里是同样的字节，非零通常说明 key 漏了某个分片维度（例如分片的 payload 共用了一个 key），应关闭 dedup 并检查连接器的 key 坐标 |

@@ -234,6 +234,48 @@ TEST(MdsEtcdWrites, MemberListsShareOneRangePerInterval) {
   mds.Stop();
 }
 
+// MDS-04: a change of drain alone is a record change, written at once
+// (not held for DFKV_MDS_STATS_PUT_MS like stats), and both it and a
+// kDeregister are in the next list despite the list cache.
+TEST(MdsEtcdWrites, DrainIsWrittenAtOnceAndDeregisterEndsTheCachedList) {
+  ScopedEnv interval("DFKV_MDS_STATS_PUT_MS", "60000");
+  ScopedEnv cache("DFKV_MDS_LIST_CACHE_MS", "5000");
+  FakeEtcd etcd;
+  MdsServer mds(etcd.ep());
+  ASSERT_EQ(mds.Start(0), Status::kOk);
+  ASSERT_EQ(Beat(mds, WireOp::kRegister, "g", WithStats(kA, 1)), Status::kOk);
+  ASSERT_EQ(Beat(mds, WireOp::kRegister, "g", WithStats(kB, 1)), Status::kOk);
+  auto draining = [&] {
+    Status st = Status::kInvalid;
+    std::string data;
+    std::set<std::string> ids;
+    EXPECT_TRUE(DoReq(mds.port(), WireOp::kListTopology, "g", &st, &data));
+    std::vector<MemberInfo> members;
+    uint64_t epoch = 0;
+    if (st == Status::kOk &&
+        DecodeMembers(data.data(), data.size(), &members, &epoch))
+      for (const auto& m : members)
+        if (m.draining) ids.insert(m.id);
+    return ids;
+  };
+  EXPECT_EQ(draining(), std::set<std::string>{});  // the cache holds this
+  const double puts = EtcdOps(mds, "put");
+  MemberInfo b = WithStats(kB, 2);
+  b.draining = true;
+  ASSERT_EQ(Beat(mds, WireOp::kHeartbeat, "g", b), Status::kOk);
+  EXPECT_EQ(EtcdOps(mds, "put"), puts + 1) << "drain waited like stats";
+  EXPECT_EQ(draining(), std::set<std::string>{"nb"});
+  b = WithStats(kB, 3);  // undrained
+  ASSERT_EQ(Beat(mds, WireOp::kHeartbeat, "g", b), Status::kOk);
+  EXPECT_EQ(EtcdOps(mds, "put"), puts + 2) << "undrain waited like stats";
+  EXPECT_EQ(draining(), std::set<std::string>{});
+  ASSERT_EQ(Beat(mds, WireOp::kDeregister, "g", kB), Status::kOk);
+  EXPECT_EQ(ListIds(mds, "g"), (std::set<std::string>{"na"}))
+      << "a deregistered member stayed in the cached list";
+  EXPECT_EQ(Metric(mds, "dfkv_mds_deregister_requests_total"), 1);
+  mds.Stop();
+}
+
 // Answers of groups no longer asked for are dropped once there are many.
 TEST(ListCache, ExpiredEntriesArePrunedPastTheCap) {
   uint64_t now = 1000;

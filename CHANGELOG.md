@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- Drain (MDS-04, off by default): a node with `DFKV_DRAIN=1` can be put in
+  a draining state, by `dfkvctl drain <node> [--undrain]` or by a stop with
+  `DFKV_STOP_DRAIN_MS` set (it drains that long, then stops; a second
+  SIGTERM ends the wait). A draining node keeps its ring position and
+  serves reads; clients of this release send it no new writes (a key goes
+  to its owner on the ring without the node, where it belongs once the
+  node leaves), read it after a miss at that owner, and send REMOVE and
+  RETAIN to both (a REMOVE succeeds when both confirm). A node drained by
+  `dfkvctl` deletes its MDS record when it stops, so clients drop it within
+  a poll instead of after its lease. The state rides a new optional member
+  extension (DRN1), written only while a member drains; older clients,
+  MDS and dfkvctl ignore it, and the MDS must be upgraded first for it to
+  take effect: do not drain until every MDS of the group runs 2.43 or
+  later (a heartbeat that reaches a 2.42 MDS rewrites the record without
+  the flag, so the drain turns on and off between polls, and a REMOVE made
+  while it is off reaches only the drainer: a removed key can come back).
+  Known limit with older clients: their REMOVE of a key a new
+  client wrote during the drain reaches only the drainer. New ops
+  `kDrain` (node) and `kDeregister` (MDS); new metrics
+  `dfkv_client_ring_draining_members`, `dfkv_client_drain_requests_total`,
+  `dfkv_mds_deregister_requests_total`. See DEPLOY §4c-1, including
+  `terminationGracePeriodSeconds` against `DFKV_STOP_DRAIN_MS`.
 - CI: two new jobs. One runs the MDS, registrar, member poller, etcd client
   and client discovery tests against a real etcd (3.5.17, checksum pinned);
   they skip themselves without `DFKV_TEST_ETCD`, so no job ran them, and a

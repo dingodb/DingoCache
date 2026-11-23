@@ -499,6 +499,10 @@ if(DFKV_BUILD_TESTS)
       COMMAND ${PYTHON3}
               ${CMAKE_CURRENT_SOURCE_DIR}/test/python/test_dfkvctl_all_groups.py
               ${CMAKE_BINARY_DIR})
+    add_test(NAME dfkv_drain
+      COMMAND ${PYTHON3}
+              ${CMAKE_CURRENT_SOURCE_DIR}/test/python/test_dfkv_drain.py
+              ${CMAKE_BINARY_DIR})
   endif()
 
   # CLI tools integration smoke (dfkv_server + dfkv_smoke + dfkvctl)

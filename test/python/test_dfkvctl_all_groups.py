@@ -69,6 +69,14 @@ class _EtcdHandler(BaseHTTPRequestHandler):
                 revision = state.revision
             self._reply({"header": {"revision": str(revision)}})
             return
+        if self.path == "/v3/kv/deleterange":
+            key = base64.b64decode(request["key"])
+            with state.lock:
+                deleted = 1 if state.values.pop(key, None) is not None else 0
+                state.revision += 1
+                revision = state.revision
+            self._reply({"header": {"revision": str(revision)}, "deleted": str(deleted)})
+            return
         if self.path == "/v3/kv/range":
             start = base64.b64decode(request["key"])
             end = base64.b64decode(request.get("range_end", ""))
@@ -138,7 +146,8 @@ def _wait_line(log: Path, process: subprocess.Popen, prefix: str,
 
 
 def _start_server(dfkv_server: Path, root: Path, node: str, group: str,
-                  mds_port: int, processes: list, logs: list):
+                  mds_port: int, processes: list, logs: list,
+                  extra_env: dict | None = None):
     """dfkv_server registers the address it is given, so its port is chosen
     before it starts; when that port has been taken meanwhile, try another."""
     data = root / node
@@ -154,7 +163,7 @@ def _start_server(dfkv_server: Path, root: Path, node: str, group: str,
              "--id", node, "--advertise", f"127.0.0.1:{port}",
              "--mds-registration-timeout-ms", "5000"],
             stdout=log, stderr=subprocess.STDOUT, text=True,
-            env={**os.environ, "DFKV_LOG_LEVEL": "ERROR"},
+            env={**os.environ, "DFKV_LOG_LEVEL": "ERROR", **(extra_env or {})},
         )
         processes.append(process)
         try:

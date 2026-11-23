@@ -1235,6 +1235,11 @@ std::string KvNodeServer::MetricsText() const {
   return s;
 }
 
+void KvNodeServer::set_drain_handler(std::function<Status(bool)> handler) {
+  std::lock_guard<std::mutex> lk(metrics_extension_mu_);
+  drain_handler_ = std::move(handler);
+}
+
 void KvNodeServer::set_metrics_extension(
     std::function<std::string()> render) {
   std::lock_guard<std::mutex> lk(metrics_extension_mu_);
@@ -1517,6 +1522,17 @@ Status KvNodeServer::ProcessRequestForKey(
       *out_data = members_;  // advertised cluster membership (for client discovery)
       st = Status::kOk;
       break;
+    case WireOp::kDrain: {
+      std::function<Status(bool)> handler;
+      {
+        std::lock_guard<std::mutex> lk(metrics_extension_mu_);
+        handler = drain_handler_;
+      }
+      if (handler && payload_len == 1 && payload != nullptr)
+        st = handler(payload[0] != 0);
+      break;
+    }
+    case WireOp::kDeregister:
     case WireOp::kRegister:
     case WireOp::kHeartbeat:
     case WireOp::kListMembers:

@@ -39,6 +39,18 @@
 namespace dfkv {
 
 namespace {
+// Set on this thread while a request is sent to the draining owners of its
+// keys (see KVClient::full_ring_): Route() then names a key's draining
+// full-ring owner, or nothing for a key that has none, and the bodies do not
+// look for drainers again. Requests route on the thread that issues them.
+thread_local bool t_drain_pass = false;
+struct DrainPass {
+  DrainPass() { t_drain_pass = true; }
+  ~DrainPass() { t_drain_pass = false; }
+  DrainPass(const DrainPass&) = delete;
+  DrainPass& operator=(const DrainPass&) = delete;
+};
+
 // Summarize a membership change as "+A -R (added: ...; removed: ...)", comparing
 // new node ids against the currently-adopted ones. Empty when there is no id
 // churn (e.g. only an address/weight changed). Ids only; small lists spelled out
@@ -329,15 +341,28 @@ DestinationMemoryKind KVClient::ClassifyDestination(
              : DestinationMemoryKind::kHost;
 }
 
-void KVClient::AdoptRing(ConHash ring, std::map<std::string, std::string> addr) {
+void KVClient::AdoptRing(ConHash ring, std::map<std::string, std::string> addr,
+                         ConHash full_ring, std::set<std::string> draining) {
   const size_t count = addr.size();
   std::string delta;
+  std::string drained;
   {
     std::lock_guard<std::mutex> lk(ring_mu_);
     delta = MembershipDelta(addr_, addr);  // vs the previously-adopted view
+    if (draining != draining_) {
+      drained = draining.empty() ? std::string("none") : std::string();
+      for (const auto& id : draining)
+        drained += (drained.empty() ? "" : ",") + id;
+    }
     ring_ = std::move(ring);
     addr_ = std::move(addr);
+    full_ring_ = std::move(full_ring);
+    draining_ = std::move(draining);
+    any_draining_.store(!draining_.empty(), std::memory_order_relaxed);
   }
+  if (!drained.empty())
+    DFKV_LOG_INFO("ring: draining members: " + drained +
+                  " (no new writes; read after a miss at the new owner)");
   // A membership change is rare (epoch-gated) and worth one line: its presence
   // confirms discovery populated the ring; its ABSENCE at startup is the fastest
   // tell that the ring is empty and every op is silently missing. The delta
@@ -435,15 +460,27 @@ void KVClient::SetMembers(std::vector<std::pair<std::string, std::string>> membe
 }
 
 void KVClient::SetMembers(const std::vector<MemberInfo>& members) {
-  ConHash ring;
+  ConHash ring, full_ring;
   std::map<std::string, std::string> addr;
+  std::set<std::string> draining;
+  size_t serving = 0;
   for (const auto& m : members) {
     if (!m.RingEligible()) continue;
-    ring.AddNode(m.id, m.weight < 1 ? 1 : static_cast<int>(m.weight));
     addr[m.id] = m.ip + ":" + std::to_string(m.port);
+    if (m.draining) draining.insert(m.id); else ++serving;
+  }
+  // With every member draining there is nowhere else to write: no drain.
+  if (serving == 0) draining.clear();
+  for (const auto& m : members) {
+    if (!m.RingEligible()) continue;
+    const int weight = m.weight < 1 ? 1 : static_cast<int>(m.weight);
+    if (!draining.empty()) full_ring.AddNode(m.id, weight);
+    if (draining.count(m.id) == 0) ring.AddNode(m.id, weight);
   }
   ring.Build();
-  AdoptRing(std::move(ring), std::move(addr));
+  if (!draining.empty()) full_ring.Build();
+  AdoptRing(std::move(ring), std::move(addr), std::move(full_ring),
+            std::move(draining));
 }
 
 void KVClient::StartMdsDiscovery(std::vector<std::string> mds_eps,
@@ -471,7 +508,10 @@ void KVClient::StartMdsDiscovery(std::vector<std::string> mds_eps,
         for (const auto& member : topology) {
           if (member.RingEligible()) placement.push_back(member);
         }
-        const uint64_t placement_epoch = MembersEpoch(placement);
+        // Which members drain is part of the placement here: it splits the
+        // write ring from the read ring.
+        const uint64_t placement_epoch =
+            MembersEpoch(placement) ^ MembersDrainEpoch(placement);
         if (placement_state->have_epoch &&
             placement_state->epoch == placement_epoch)
           return;
@@ -642,11 +682,29 @@ std::string KVClient::MetricsSnapshot() const {
   // routes to nowhere and silently reports ok=0, so surface both the current
   // ring size and MDS reachability — the fastest tell of a bad mds_endpoint.
   {
-    size_t members;
-    { std::lock_guard<std::mutex> lk(ring_mu_); members = addr_.size(); }
+    size_t members, draining;
+    {
+      std::lock_guard<std::mutex> lk(ring_mu_);
+      members = addr_.size();
+      draining = draining_.size();
+    }
     s += "# HELP dfkv_client_ring_members Placement-ring members currently adopted from MDS discovery\n";
     s += "# TYPE dfkv_client_ring_members gauge\n";
     s += "dfkv_client_ring_members " + std::to_string(members) + "\n";
+    s += "# HELP dfkv_client_ring_draining_members Ring members that are draining: no new writes, read after a miss at the new owner\n";
+    s += "# TYPE dfkv_client_ring_draining_members gauge\n";
+    s += "dfkv_client_ring_draining_members " + std::to_string(draining) + "\n";
+    auto load = [](const std::atomic<uint64_t>& v) {
+      return std::to_string(v.load(std::memory_order_relaxed));
+    };
+    s += "# HELP dfkv_client_drain_requests_total Second requests to a key's draining owner: reads after a miss at the new owner, and the REMOVEs and RETAINs that go to both; result=served when it had (or removed) the key\n";
+    s += "# TYPE dfkv_client_drain_requests_total counter\n";
+    s += "dfkv_client_drain_requests_total{op=\"read\",result=\"served\"} " + load(drain_reads_hit_) + "\n";
+    s += "dfkv_client_drain_requests_total{op=\"read\",result=\"not_served\"} " + load(drain_reads_miss_) + "\n";
+    s += "dfkv_client_drain_requests_total{op=\"remove\",result=\"served\"} " + load(drain_removes_ok_) + "\n";
+    s += "dfkv_client_drain_requests_total{op=\"remove\",result=\"not_served\"} " + load(drain_removes_failed_) + "\n";
+    s += "dfkv_client_drain_requests_total{op=\"retain\",result=\"served\"} " + load(drain_retains_ok_) + "\n";
+    s += "dfkv_client_drain_requests_total{op=\"retain\",result=\"not_served\"} " + load(drain_retains_failed_) + "\n";
   }
   if (poller_) {
     s += "# HELP dfkv_client_mds_unreachable_polls_total MDS list-members polls that failed (endpoint unreachable or RPC error)\n";
@@ -701,6 +759,7 @@ bool KVClient::RefreshMembers(const std::string& seed_addr) {
 }
 
 std::string KVClient::Route(const std::string& key) const {
+  if (t_drain_pass) return DrainRoute(key);
   // Hashed before the lock: every routed key of every thread takes it.
   const uint32_t hash = ConHash::KeyHash(key);
   std::lock_guard<std::mutex> lk(ring_mu_);
@@ -708,6 +767,235 @@ std::string KVClient::Route(const std::string& key) const {
   if (!ring_.LookupHash(hash, &name)) return "";
   auto it = addr_.find(name);
   return it == addr_.end() ? "" : it->second;
+}
+
+std::string KVClient::DrainRoute(const std::string& key) const {
+  if (!any_draining_.load(std::memory_order_relaxed)) return "";
+  const uint32_t hash = ConHash::KeyHash(key);
+  std::lock_guard<std::mutex> lk(ring_mu_);
+  std::string name;
+  if (!full_ring_.LookupHash(hash, &name) || draining_.count(name) == 0)
+    return "";
+  auto it = addr_.find(name);
+  return it == addr_.end() ? "" : it->second;
+}
+
+template <typename KeyOf>
+std::vector<size_t> KVClient::DrainerOwned(size_t n,
+                                           const std::vector<bool>* done,
+                                           KeyOf key_of) const {
+  std::vector<size_t> out;
+  if (t_drain_pass || !any_draining_.load(std::memory_order_relaxed))
+    return out;
+  for (size_t i = 0; i < n; ++i) {
+    if (done != nullptr && (*done)[i]) continue;
+    const std::string& key = key_of(i);
+    if (!key.empty() && !DrainRoute(key).empty()) out.push_back(i);
+  }
+  return out;
+}
+
+void KVClient::CountDrainRead(bool hit) {
+  (hit ? drain_reads_hit_ : drain_reads_miss_)
+      .fetch_add(1, std::memory_order_relaxed);
+}
+
+// Scalar reads: the write owner first; after a miss, a draining full-ring
+// owner (the key may have been written before it drained).
+bool KVClient::GetDirect(const std::string& key, void* out, size_t n,
+                         ItemStatus* status) {
+  if (GetDirectRouted(key, out, n, status)) return true;
+  if (t_drain_pass || DrainRoute(key).empty()) return false;
+  ItemStatus second = ItemStatus::kNoRoute;
+  bool hit;
+  {
+    DrainPass pass;
+    hit = GetDirectRouted(key, out, n, &second);
+  }
+  CountDrainRead(hit);
+  if (hit && status) *status = second;
+  return hit;
+}
+
+bool KVClient::GetAutoDirect(const std::string& key, std::string* out,
+                             size_t max_bytes) {
+  if (GetAutoDirectRouted(key, out, max_bytes)) return true;
+  if (t_drain_pass || DrainRoute(key).empty()) return false;
+  bool hit;
+  {
+    DrainPass pass;
+    hit = GetAutoDirectRouted(key, out, max_bytes);
+  }
+  CountDrainRead(hit);
+  return hit;
+}
+
+bool KVClient::GetAutoDirect(const std::string& key, void* out, size_t cap,
+                             size_t* out_len, ItemStatus* status) {
+  if (GetAutoDirectRouted(key, out, cap, out_len, status)) return true;
+  if (t_drain_pass || DrainRoute(key).empty()) return false;
+  ItemStatus second = ItemStatus::kNoRoute;
+  bool hit;
+  {
+    DrainPass pass;
+    hit = GetAutoDirectRouted(key, out, cap, out_len, &second);
+  }
+  CountDrainRead(hit);
+  if (hit && status) *status = second;
+  return hit;
+}
+
+bool KVClient::ExistDirect(const std::string& key, Status* status) {
+  if (ExistDirectRouted(key, status)) return true;
+  if (t_drain_pass || DrainRoute(key).empty()) return false;
+  Status second = Status::kInvalid;
+  bool hit;
+  {
+    DrainPass pass;
+    hit = ExistDirectRouted(key, &second);
+  }
+  CountDrainRead(hit);
+  if (hit && status) *status = second;
+  return hit;
+}
+
+// A key whose full-ring owner drains is removed from both: one left on the
+// drainer would be served by the read after a miss.
+bool KVClient::RemoveDirect(const std::string& key) {
+  const bool ok = RemoveDirectRouted(key);
+  if (t_drain_pass || DrainRoute(key).empty()) return ok;
+  bool drained;
+  {
+    DrainPass pass;
+    drained = RemoveDirectRouted(key);
+  }
+  (drained ? drain_removes_ok_ : drain_removes_failed_)
+      .fetch_add(1, std::memory_order_relaxed);
+  return ok && drained;
+}
+
+// Batch reads: the TCP bodies call the scalar forms above, which already
+// ask drainers; the RDMA (pipelined) bodies route in batches, so their
+// misses owned by a draining member go there in one more batch.
+std::vector<bool> KVClient::BatchGetDirect(
+    const std::vector<KvGetItem>& items,
+    const std::function<void(size_t)>& on_hit, ItemStatus* st) {
+  std::vector<bool> hit = BatchGetDirectRouted(items, on_hit, st);
+  if (!t_->pipelined()) return hit;
+  const std::vector<size_t> again = DrainerOwned(
+      items.size(), &hit,
+      [&](size_t i) -> const std::string& { return items[i].key; });
+  if (again.empty()) return hit;
+  std::vector<KvGetItem> sub;
+  sub.reserve(again.size());
+  for (size_t i : again) sub.push_back(items[i]);
+  std::vector<ItemStatus> sub_st(sub.size(), ItemStatus::kNoRoute);
+  std::vector<bool> sub_hit;
+  {
+    DrainPass pass;
+    sub_hit = BatchGetDirectRouted(
+        sub, on_hit ? std::function<void(size_t)>([&](size_t m) { on_hit(again[m]); })
+                    : std::function<void(size_t)>(),
+        sub_st.data());
+  }
+  for (size_t m = 0; m < again.size(); ++m) {
+    CountDrainRead(sub_hit[m]);
+    if (!sub_hit[m]) continue;
+    hit[again[m]] = true;
+    if (st) st[again[m]] = sub_st[m];
+  }
+  return hit;
+}
+
+std::vector<bool> KVClient::BatchGetAutoDirect(
+    const std::vector<KvGetItem>& items, std::vector<size_t>* out_lens,
+    const std::function<void(size_t, size_t)>& on_hit, ItemStatus* st) {
+  std::vector<bool> hit = BatchGetAutoDirectRouted(items, out_lens, on_hit, st);
+  if (!t_->pipelined()) return hit;
+  const std::vector<size_t> again = DrainerOwned(
+      items.size(), &hit,
+      [&](size_t i) -> const std::string& { return items[i].key; });
+  if (again.empty()) return hit;
+  std::vector<KvGetItem> sub;
+  sub.reserve(again.size());
+  for (size_t i : again) sub.push_back(items[i]);
+  std::vector<ItemStatus> sub_st(sub.size(), ItemStatus::kNoRoute);
+  std::vector<size_t> sub_lens;
+  std::vector<bool> sub_hit;
+  {
+    DrainPass pass;
+    sub_hit = BatchGetAutoDirectRouted(
+        sub, &sub_lens,
+        on_hit ? std::function<void(size_t, size_t)>(
+                     [&](size_t m, size_t len) { on_hit(again[m], len); })
+               : std::function<void(size_t, size_t)>(),
+        sub_st.data());
+  }
+  for (size_t m = 0; m < again.size(); ++m) {
+    CountDrainRead(sub_hit[m]);
+    if (!sub_hit[m]) continue;
+    hit[again[m]] = true;
+    if (st) st[again[m]] = sub_st[m];
+    if (out_lens && again[m] < out_lens->size() && m < sub_lens.size())
+      (*out_lens)[again[m]] = sub_lens[m];
+  }
+  return hit;
+}
+
+// No TCP body of its own: every transport routes this one in batches.
+std::vector<bool> KVClient::BatchGetAutoSgDirect(
+    const std::vector<KvGetItemSg>& items, std::vector<size_t>* out_lens,
+    ItemStatus* st) {
+  std::vector<bool> hit = BatchGetAutoSgDirectRouted(items, out_lens, st);
+  const std::vector<size_t> again = DrainerOwned(
+      items.size(), &hit,
+      [&](size_t i) -> const std::string& { return items[i].key; });
+  if (again.empty()) return hit;
+  std::vector<KvGetItemSg> sub;
+  sub.reserve(again.size());
+  for (size_t i : again) sub.push_back(items[i]);
+  std::vector<ItemStatus> sub_st(sub.size(), ItemStatus::kNoRoute);
+  std::vector<size_t> sub_lens;
+  std::vector<bool> sub_hit;
+  {
+    DrainPass pass;
+    sub_hit = BatchGetAutoSgDirectRouted(sub, &sub_lens, sub_st.data());
+  }
+  for (size_t m = 0; m < again.size(); ++m) {
+    CountDrainRead(sub_hit[m]);
+    if (!sub_hit[m]) continue;
+    hit[again[m]] = true;
+    if (st) st[again[m]] = sub_st[m];
+    if (out_lens && again[m] < out_lens->size() && m < sub_lens.size())
+      (*out_lens)[again[m]] = sub_lens[m];
+  }
+  return hit;
+}
+
+std::vector<bool> KVClient::BatchExistDirect(
+    const std::vector<std::string>& keys, std::vector<Status>* statuses) {
+  std::vector<bool> hit = BatchExistDirectRouted(keys, statuses);
+  if (!t_->pipelined()) return hit;
+  const std::vector<size_t> again = DrainerOwned(
+      keys.size(), &hit, [&](size_t i) -> const std::string& { return keys[i]; });
+  if (again.empty()) return hit;
+  std::vector<std::string> sub;
+  sub.reserve(again.size());
+  for (size_t i : again) sub.push_back(keys[i]);
+  std::vector<Status> sub_st;
+  std::vector<bool> sub_hit;
+  {
+    DrainPass pass;
+    sub_hit = BatchExistDirectRouted(sub, statuses ? &sub_st : nullptr);
+  }
+  for (size_t m = 0; m < again.size(); ++m) {
+    CountDrainRead(sub_hit[m]);
+    if (!sub_hit[m]) continue;
+    hit[again[m]] = true;
+    if (statuses && again[m] < statuses->size() && m < sub_st.size())
+      (*statuses)[again[m]] = sub_st[m];
+  }
+  return hit;
 }
 
 bool KVClient::Put(const std::string& key, const void* value, size_t n) {
@@ -756,8 +1044,8 @@ bool KVClient::Get(const std::string& key, void* out, size_t n) {
   return hit;
 }
 
-bool KVClient::GetDirect(const std::string& key, void* out, size_t n,
-                         ItemStatus* status) {
+bool KVClient::GetDirectRouted(const std::string& key, void* out, size_t n,
+                               ItemStatus* status) {
   ItemStatus unused;
   ItemStatus& outcome = status ? *status : unused;
   outcome = ItemStatus::kBadArgument;
@@ -793,8 +1081,8 @@ bool KVClient::GetAuto(const std::string& key, std::string* out,
   return hit;
 }
 
-bool KVClient::GetAutoDirect(const std::string& key, std::string* out,
-                             size_t max_bytes) {
+bool KVClient::GetAutoDirectRouted(const std::string& key, std::string* out,
+                                   size_t max_bytes) {
   std::string node = Route(key);
   if (node.empty()) return false;
   uint64_t now = NowMs();
@@ -834,8 +1122,9 @@ bool KVClient::GetAuto(const std::string& key, void* out, size_t cap,
   return hit;
 }
 
-bool KVClient::GetAutoDirect(const std::string& key, void* out, size_t cap,
-                             size_t* out_len, ItemStatus* status) {
+bool KVClient::GetAutoDirectRouted(const std::string& key, void* out,
+                                   size_t cap, size_t* out_len,
+                                   ItemStatus* status) {
   ItemStatus unused;
   ItemStatus& outcome = status ? *status : unused;
   if (out_len) *out_len = 0;
@@ -873,7 +1162,7 @@ bool KVClient::Exist(const std::string& key) {
   return exists;
 }
 
-bool KVClient::ExistDirect(const std::string& key, Status* status) {
+bool KVClient::ExistDirectRouted(const std::string& key, Status* status) {
   if (status) *status = Status::kInvalid;
   std::string node = Route(key);
   if (node.empty()) return false;
@@ -903,7 +1192,7 @@ void KVClient::InvalidateRendezvous(const BlockKey& key) {
     gd->Invalidate(key);
 }
 
-bool KVClient::RemoveDirect(const std::string& key) {
+bool KVClient::RemoveDirectRouted(const std::string& key) {
   std::string node = Route(key);
   if (node.empty()) return false;
   uint64_t now = NowMs();
@@ -1103,7 +1392,7 @@ bool TransientReadMiss(Status st) {
 }
 }  // namespace
 
-std::vector<bool> KVClient::BatchGetDirect(
+std::vector<bool> KVClient::BatchGetDirectRouted(
     const std::vector<KvGetItem>& items,
     const std::function<void(size_t)>& on_hit, ItemStatus* st) {
   const size_t N = items.size();
@@ -1308,7 +1597,7 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
   return RecordBatch(OpMetrics::kGet, t0, std::move(res), bytes);
 }
 
-std::vector<bool> KVClient::BatchGetAutoDirect(
+std::vector<bool> KVClient::BatchGetAutoDirectRouted(
     const std::vector<KvGetItem>& items, std::vector<size_t>* out_lens,
     const std::function<void(size_t, size_t)>& on_hit, ItemStatus* st) {
   const size_t N = items.size();
@@ -1652,6 +1941,36 @@ void KVClient::BatchRetain(const std::vector<std::string>& keys,
     }
   } record{&op_stats_, op, t0, out, n};
   if (out == nullptr || n == 0) return;
+  BatchRetainRouted(keys, req, out);
+  // A key whose full-ring owner drains is retained there too: that copy
+  // still serves reads. Its answer counts where the write owner has nothing.
+  const std::vector<size_t> drained =
+      DrainerOwned(n, nullptr, [&](size_t i) -> const std::string& {
+        return keys[i];
+      });
+  if (drained.empty()) return;
+  std::vector<std::string> sub;
+  sub.reserve(drained.size());
+  for (size_t i : drained) sub.push_back(keys[i]);
+  std::vector<uint8_t> sub_out(sub.size(), kRetError);
+  {
+    DrainPass pass;
+    BatchRetainRouted(sub, req, sub_out.data());
+  }
+  auto present = [](uint8_t code) {
+    return code != kRetMiss && code != kRetUnsupported && code != kRetError;
+  };
+  for (size_t m = 0; m < drained.size(); ++m) {
+    (present(sub_out[m]) ? drain_retains_ok_ : drain_retains_failed_)
+        .fetch_add(1, std::memory_order_relaxed);
+    uint8_t& code = out[drained[m]];
+    if (!present(code) && present(sub_out[m])) code = sub_out[m];
+  }
+}
+
+void KVClient::BatchRetainRouted(const std::vector<std::string>& keys,
+                                 const RetainRequest& req, uint8_t* out) {
+  const size_t n = keys.size();
   std::fill(out, out + n, static_cast<uint8_t>(kRetError));
   const bool debounce = req.mode == kRetainModeRefresh && req.ttl_s != 0 &&
                         !req.no_debounce;
@@ -2424,7 +2743,7 @@ std::string PernodeKeyFingerprintForTest(const std::string& key) {
 }  // namespace testing
 
 
-std::vector<bool> KVClient::BatchExistDirect(
+std::vector<bool> KVClient::BatchExistDirectRouted(
     const std::vector<std::string>& keys, std::vector<Status>* statuses) {
   const size_t N = keys.size();
   std::vector<char> e(N, 0);
@@ -2580,9 +2899,40 @@ std::vector<bool> KVClient::BatchRemove(const std::vector<std::string>& keys) {
   std::vector<char> ok(N, 0);
   if (!t_->pipelined()) {
     RunParallel(N, BatchWorkers(N), [&](size_t i) {
-      ok[i] = RemoveDirect(keys[i]) ? 1 : 0;
+      ok[i] = RemoveDirect(keys[i]) ? 1 : 0;  // asks a draining owner too
     });
   } else {
+    ok = BatchRemoveRouted(keys);
+    // A key whose full-ring owner drains may still be there: removed only
+    // once both have confirmed, or the drainer would serve it on a read.
+    const std::vector<size_t> drained =
+        DrainerOwned(N, nullptr, [&](size_t i) -> const std::string& {
+          return keys[i];
+        });
+    if (!drained.empty()) {
+      std::vector<std::string> sub;
+      sub.reserve(drained.size());
+      for (size_t i : drained) sub.push_back(keys[i]);
+      std::vector<char> sub_ok;
+      {
+        DrainPass pass;
+        sub_ok = BatchRemoveRouted(sub);
+      }
+      for (size_t m = 0; m < drained.size(); ++m) {
+        (sub_ok[m] ? drain_removes_ok_ : drain_removes_failed_)
+            .fetch_add(1, std::memory_order_relaxed);
+        if (!sub_ok[m]) ok[drained[m]] = 0;
+      }
+    }
+  }
+  return RecordBatch(OpMetrics::kRemove, t0,
+                     std::vector<bool>(ok.begin(), ok.end()), 0);
+}
+
+std::vector<char> KVClient::BatchRemoveRouted(
+    const std::vector<std::string>& keys) {
+  const size_t N = keys.size();
+  std::vector<char> ok(N, 0);
   // RDMA: group by node and RemoveMany per node (sequential within a node since
   // eviction is off the hot path; nodes still fan out in parallel).
   std::map<std::string, std::vector<size_t>> by_node;
@@ -2610,9 +2960,7 @@ std::vector<bool> KVClient::BatchRemove(const std::vector<std::string>& keys) {
       if (removed) InvalidateRendezvous(bkeys[m]);
     }
   });
-  }
-  return RecordBatch(OpMetrics::kRemove, t0,
-                     std::vector<bool>(ok.begin(), ok.end()), 0);
+  return ok;
 }
 
 std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items,
@@ -3012,7 +3360,7 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
   return RecordBatch(OpMetrics::kGet, t0, std::move(res), bytes);
 }
 
-std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>& items,
+std::vector<bool> KVClient::BatchGetAutoSgDirectRouted(const std::vector<KvGetItemSg>& items,
                                                  std::vector<size_t>* out_lens,
                                                  ItemStatus* st) {
   const size_t N = items.size();

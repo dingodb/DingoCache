@@ -70,6 +70,17 @@ class MdsRegistrar {
   // the stats provider. Unset = the info given at construction, unchanged.
   using InfoFn = std::function<std::string()>;
   void set_info_provider(InfoFn fn) { info_fn_ = std::move(fn); }
+  // Optional provider of MemberInfo::draining (DFKV_DRAIN), called like the
+  // stats provider.
+  using DrainFn = std::function<bool()>;
+  void set_drain_provider(DrainFn fn) { drain_fn_ = std::move(fn); }
+  // Wakes the background loop for a heartbeat now (one that starts after
+  // this call) and waits up to timeout_ms for it to succeed. Used to get a
+  // changed drain state to the MDS without waiting out the interval. False
+  // if no such heartbeat succeeded in time, or the loop is stopped.
+  bool BeatNow(int timeout_ms);
+  // Deletes this member's record at the MDS (kDeregister). Call after Stop().
+  bool Deregister();
 
   // Called once after the first successful registration. Configure before
   // Start(); heartbeat failures after that success do not clear the latch.
@@ -118,6 +129,7 @@ class MdsRegistrar {
   StatsFn stats_fn_;
   HealthFn health_fn_;
   InfoFn info_fn_;
+  DrainFn drain_fn_;
   RegisteredFn registered_fn_;
   int hb_ms_;
   int io_ms_;
@@ -137,6 +149,12 @@ class MdsRegistrar {
   std::thread th_;
   std::mutex mu_;
   std::condition_variable cv_;
+  // BeatNow: a heartbeat is wanted now; sequence numbers of the last beat
+  // started and of the last one that succeeded (registers count). Under mu_.
+  bool beat_now_ = false;
+  uint64_t beat_started_seq_ = 0;
+  uint64_t beat_ok_seq_ = 0;
+  bool Beat(bool registering, int io_timeout_ms, uint64_t deadline_ms);
 };
 
 }  // namespace dfkv

@@ -104,7 +104,7 @@ class ScriptedTopologyMds {
         }
         const std::string data =
             status == Status::kOk
-                ? EncodeMembers(members, MembersTopologyEpoch(members))
+                ? EncodeMembers(members, MembersViewEpoch(members))
                 : std::string();
         char response[kRespPrefix];
         EncodeResp(response, status, data.size());

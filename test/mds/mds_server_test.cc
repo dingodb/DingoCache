@@ -800,3 +800,61 @@ TEST(MdsServer, PlacementAndTopologyTrackRailHealthIndependently) {
             std::string::npos);
   mds.Stop();
 }
+
+// MDS-04: a draining member's record keeps DRN1 through the MDS, the view
+// epoch of kListTopology moves with it (placement's does not), and
+// kDeregister deletes the record.
+TEST(MdsServer, DrainIsKeptAndADeregisteredMemberIsGone) {
+  const char* ep = EtcdEp();
+  if (!ep) GTEST_SKIP() << "set DFKV_TEST_ETCD=host:port";
+  MdsServer mds(ep);
+  ASSERT_EQ(mds.Start(0), Status::kOk);
+  const int port = mds.port();
+  const std::string group = "itest-drain-" + std::to_string(port);
+  MemberInfo a{"da", "10.1.2.1", 28000, 1};
+  MemberInfo b{"db", "10.1.2.2", 28000, 1};
+  Status st;
+  std::string data;
+  ASSERT_TRUE(DoReq(port, WireOp::kRegister, EncodeMemberReq(group, a), &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  ASSERT_TRUE(DoReq(port, WireOp::kRegister, EncodeMemberReq(group, b), &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  auto list = [&](WireOp op, std::vector<MemberInfo>* got, uint64_t* epoch) {
+    std::string out;
+    Status s;
+    return DoReq(port, op, group, &s, &out) && s == Status::kOk &&
+           DecodeMembers(out.data(), out.size(), got, epoch);
+  };
+  std::vector<MemberInfo> got;
+  uint64_t topology_before = 0, placement_before = 0, epoch = 0;
+  ASSERT_TRUE(list(WireOp::kListTopology, &got, &topology_before));
+  ASSERT_TRUE(list(WireOp::kListMembers, &got, &placement_before));
+
+  b.draining = true;
+  ASSERT_TRUE(DoReq(port, WireOp::kHeartbeat, EncodeMemberReq(group, b), &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  ASSERT_TRUE(list(WireOp::kListTopology, &got, &epoch));
+  ASSERT_EQ(got.size(), 2u);
+  const MemberInfo* listed = FindMember(got, "db");
+  ASSERT_NE(listed, nullptr);
+  EXPECT_TRUE(listed->draining);
+  EXPECT_FALSE(FindMember(got, "da")->draining);
+  EXPECT_NE(epoch, topology_before);
+  EXPECT_EQ(epoch, MembersViewEpoch(got));
+  ASSERT_TRUE(list(WireOp::kListMembers, &got, &epoch));
+  EXPECT_EQ(epoch, placement_before) << "drain is not a placement change";
+
+  ASSERT_TRUE(DoReq(port, WireOp::kDeregister, EncodeMemberReq(group, b), &st, &data));
+  EXPECT_EQ(st, Status::kOk);
+  ASSERT_TRUE(list(WireOp::kListTopology, &got, &epoch));
+  ASSERT_EQ(got.size(), 1u);
+  EXPECT_EQ(got[0].id, "da");
+  // Deleting a record that is not there is not an error.
+  ASSERT_TRUE(DoReq(port, WireOp::kDeregister, EncodeMemberReq(group, b), &st, &data));
+  EXPECT_EQ(st, Status::kOk);
+  MemberInfo bad{"no/such", "10.1.2.3", 1, 1};
+  ASSERT_TRUE(DoReq(port, WireOp::kDeregister, EncodeMemberReq(group, bad), &st, &data));
+  EXPECT_EQ(st, Status::kInvalid);
+  ASSERT_TRUE(DoReq(port, WireOp::kDeregister, EncodeMemberReq(group, a), &st, &data));
+  mds.Stop();
+}

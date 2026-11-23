@@ -15,6 +15,7 @@
 #include <charconv>
 #include <chrono>
 #include <functional>
+#include <algorithm>
 #include <memory>
 #include <vector>
 
@@ -58,7 +59,20 @@ using dfkv::Status;
 static std::atomic<bool> g_stop{false};
 static_assert(std::atomic<bool>::is_always_lock_free,
               "the stop flag is written from a signal handler");
-static void OnSig(int) { g_stop.store(true, std::memory_order_relaxed); }
+// Stop signals received; a second one ends a stop-time drain early.
+static std::atomic<int> g_stop_signals{0};
+static_assert(std::atomic<int>::is_always_lock_free,
+              "the signal count is written from a signal handler");
+static void OnSig(int) {
+  g_stop_signals.fetch_add(1, std::memory_order_relaxed);
+  g_stop.store(true, std::memory_order_relaxed);
+}
+
+// DFKV_DRAIN: how this node drains. kByStop: it drains while it stops
+// (DFKV_STOP_DRAIN_MS) and keeps its record for the restart. kByCtl:
+// `dfkvctl drain` asked for it; the node stays draining until undrained,
+// and deregisters when it stops (it is being removed).
+enum class DrainState : int { kNone = 0, kByStop = 1, kByCtl = 2 };
 
 // A stop signal arrived before the server was up: the start is not carried
 // to its end only to be undone. Whatever accepts requests is stopped, the
@@ -667,6 +681,16 @@ int main(int argc, char** argv) {
       DFKV_LOG_WARN("dfkv_server /metrics failed to start on port " + std::to_string(metrics_port));
   }
 
+  // DFKV_DRAIN (default off): this node may drain (kDrain from dfkvctl, and
+  // DFKV_STOP_DRAIN_MS on a stop); see DrainState. Needs an MDS.
+  const bool drain_enabled = dfkv::config_dump::EnvBool("DFKV_DRAIN", false);
+  const uint64_t stop_drain_ms = std::min<uint64_t>(
+      dfkv::config_dump::EnvU64("DFKV_STOP_DRAIN_MS", 0), 600000);
+  constexpr int kDrainBeatTimeoutMs = 15000;
+  auto drain_state = std::make_shared<std::atomic<int>>(
+      static_cast<int>(DrainState::kNone));
+  if (drain_enabled && mds.empty())
+    DFKV_LOG_WARN("DFKV_DRAIN=1 without --mds: there is no MDS to tell; draining is off");
   std::unique_ptr<dfkv::MdsRegistrar> registrar;
   if (!mds.empty()) {
     size_t colon = advertise.rfind(':');
@@ -738,6 +762,23 @@ int main(int argc, char** argv) {
     if (rdma_health) rails = [&rdma_health] { return rdma_health->Sample(); };
 #endif
     dfkv::ReportNodeHealth(registrar.get(), &srv, self.info, std::move(rails));
+    if (drain_enabled) {
+      registrar->set_drain_provider([drain_state] {
+        return drain_state->load() != static_cast<int>(DrainState::kNone);
+      });
+      dfkv::MdsRegistrar* reg = registrar.get();
+      srv.set_drain_handler([drain_state, reg, node_id](bool on) {
+        drain_state->store(static_cast<int>(on ? DrainState::kByCtl
+                                               : DrainState::kNone));
+        // Answered once the MDS has the record in its new state; clients
+        // pick it up within their poll interval from there.
+        const bool written = reg->BeatNow(kDrainBeatTimeoutMs);
+        DFKV_LOG_INFO(std::string("dfkv_server ") +
+                      (on ? "draining" : "no longer draining") + " id=" +
+                      node_id + (written ? "" : " (the MDS has not taken it yet)"));
+        return written ? dfkv::Status::kOk : dfkv::Status::kIOError;
+      });
+    }
     registrar->set_registered_callback([mds_ready, group, node_id] {
       mds_ready->store(true, std::memory_order_release);
       DFKV_LOG_INFO("dfkv_server registered with MDS group=" + group +
@@ -767,6 +808,28 @@ int main(int argc, char** argv) {
   } else {
     DFKV_LOG_INFO("dfkv_server shutting down");
   }
+  // Stop-time drain: clients stop writing here and read on as before, while
+  // this node keeps serving for DFKV_STOP_DRAIN_MS (a second stop signal
+  // ends it). A node `dfkvctl drain` drained already is past that.
+  if (drain_enabled && registrar && !registration_timed_out &&
+      stop_drain_ms > 0 &&
+      drain_state->load() == static_cast<int>(DrainState::kNone)) {
+    const int signals = g_stop_signals.load(std::memory_order_relaxed);
+    drain_state->store(static_cast<int>(DrainState::kByStop));
+    const bool written = registrar->BeatNow(kDrainBeatTimeoutMs);
+    DFKV_LOG_INFO("dfkv_server draining for " + std::to_string(stop_drain_ms) +
+                  " ms before it stops" +
+                  (written ? "" : " (the MDS has not taken it)") +
+                  "; a second stop signal ends the wait");
+    const auto until = std::chrono::steady_clock::now() +
+                       std::chrono::milliseconds(stop_drain_ms);
+    while (std::chrono::steady_clock::now() < until &&
+           g_stop_signals.load(std::memory_order_relaxed) == signals) {
+      struct timespec ts{0, 50 * 1000 * 1000};
+      nanosleep(&ts, nullptr);
+    }
+  }
+  srv.set_drain_handler(nullptr);
   // Order: stop everything that calls into the store, get the disks clean,
   // and only then release memory. Releasing a large RAM tier takes tens of
   // seconds; a stop that is killed during that must not cost the cache.
@@ -781,6 +844,12 @@ int main(int argc, char** argv) {
   if (mhttp) mhttp->Stop();
   registrar_metrics->store(nullptr, std::memory_order_release);
   if (registrar) registrar->Stop();
+  // A node drained by `dfkvctl drain` is being removed: its record goes now,
+  // and clients drop it on their next poll instead of when its lease ends.
+  if (registrar && drain_state->load() == static_cast<int>(DrainState::kByCtl))
+    DFKV_LOG_INFO(registrar->Deregister()
+                      ? "shutdown: drained node deregistered from the MDS"
+                      : "shutdown: could not deregister the drained node; its record ends with its lease");
   // Quiesce() joins the RDMA serve threads; one that is parked in a PUT
   // waiting for a flush must be answered first.
   srv.CancelParkedPuts();
