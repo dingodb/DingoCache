@@ -9196,3 +9196,18 @@ TEST(RdmaLoopback, ClientSettingsAtAMeaningfulZeroAreNotGarbage) {
   for (const char* name : names) ::unsetenv(name);
   EXPECT_EQ(log.find("invalid DFKV_"), std::string::npos) << log;
 }
+
+// The QP transport retry settings come from DFKV_RDMA_QP_* (read once per
+// process; each test is its own process), within their ranges.
+// QpRetry reads the environment once per process and keeps the result, so
+// this test relies on ctest running each test in its own process and on
+// nothing in this process opening a QP before it.
+TEST(RdmaQpRetry, SettingsComeFromTheEnvironment) {
+  ScopedEnv timeout("DFKV_RDMA_QP_TIMEOUT", "17");
+  ScopedEnv retries("DFKV_RDMA_QP_RETRY_CNT", "9");  // above 7: the default
+  ScopedEnv rnr("DFKV_RDMA_QP_RNR_RETRY", "3");
+  const rdma::QpRetrySettings& settings = rdma::QpRetry();
+  EXPECT_EQ(settings.timeout, 17);
+  EXPECT_EQ(settings.retry_cnt, 7);
+  EXPECT_EQ(settings.rnr_retry, 3);
+}
