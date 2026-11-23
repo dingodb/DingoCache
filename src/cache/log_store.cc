@@ -1222,6 +1222,11 @@ bool LogStore::Close() {
 
 bool LogStore::Healthy() const { return ok_ && !failed_.load(); }
 
+uint64_t LogStore::KeyHash::Seed() {
+  std::random_device rd;
+  return (uint64_t(rd()) << 32) ^ rd();
+}
+
 bool LogStore::Serving() const {
   return Healthy() && activated_.load() && !closed_.load();
 }

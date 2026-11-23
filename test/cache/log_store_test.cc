@@ -1938,3 +1938,25 @@ TEST(LogStore, ACopyOfAReclaimThatGaveUpIsDurableBeforeTheVictimIsReused) {
   fs::remove_all(dir);
   fs::remove_all(image);
 }
+
+namespace dfkv {
+class LogStoreTestPeer {
+ public:
+  static size_t Hash(const BlockKey& k) { return LogStore::KeyHash()(k); }
+};
+}  // namespace dfkv
+
+// Keys whose fields are related must not collide in the index: the old
+// hash, digest_hi ^ digest_lo * C, put every key {id * C + 1, id} into a
+// handful of buckets, so each 1-byte PUT spent ~0.4 ms in hash chains under
+// the store's mutex (p99 168 ms with 8 writers).
+TEST(LogStore, RelatedKeysSpreadOverTheIndex) {
+  constexpr uint64_t kKeys = 100000;
+  std::set<size_t> buckets;
+  for (uint64_t id = 0; id < kKeys; ++id)
+    buckets.insert(LogStoreTestPeer::Hash(
+                       BlockKey{id * 0x9e3779b97f4a7c15ULL + 1, id, 0}) &
+                   ((1u << 17) - 1));
+  // A uniform hash fills about 1 - e^-0.76 = 53% of 2^17 buckets.
+  EXPECT_GT(buckets.size(), kKeys / 2);
+}
