@@ -338,6 +338,49 @@ jobs:
     name: RDMA datapath (Soft-RoCE loopback + TSan)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # The loopback tests allowed to skip, each set with its reason. Any other
+    # skip fails the step: a skip that spreads (a broken device check, a new
+    # blanket skip) must not pass as green again.
+    env:
+      # Soft-RoCE: a SEND to a destroyed peer QP never fails with RETRY_EXC.
+      SKIP_RXE: >-
+        RdmaLoopback.RealFifoQueuedConnectionCloseSync
+        RdmaLoopback.RealFifoQueuedConnectionCloseUring
+        RdmaLoopback.FreshConnectionFailingAfterAStaleOneCoolsThePeerRail
+        RdmaLoopback.ClientFailedCompletionNamesPeerDeviceOperationAndStatus
+      # They need two RDMA devices (DFKV_RDMA_DEV with two rails).
+      SKIP_TWO_RAILS: >-
+        RdmaLoopback.BootstrapRefusedForOneDeviceIsRetriedOnAnotherRail
+        RdmaLoopback.DescriptorExhaustionUsesAnIdleConnectionOnAnotherRail
+        RdmaLoopback.DialWithoutDescriptorsUsesAnIdleConnectionOnAnotherRail
+        RdmaLoopback.EndpointOutOfMemoryOnOneRailIsServedOnAnother
+        RdmaLoopback.PostSubmitPutFailureCoolsActualRemoteRailWithoutReplay
+        RdmaLoopback.RemoteCooldownBypassesIdlePoolAndUsesSiblingRail
+        RdmaLoopback.ReplaySafeEndpointRetryExcludesRailButPostedPutNeverReplays
+        RdmaLoopback.SingleEnabledRailFallbackIsNotCrossRailRetry
+        RdmaPeerRailDown.AFullPeerIsNotTakenForARefusal
+        RdmaPeerRailDown.AnMdsNamedPeersBrokenRailIsAvoidedAfterItFails
+        RdmaPeerRailDown.ARefusalNeverCoolsAPeersLastRail
+        RdmaPeerRailDown.AStaticPeersBrokenRailIsAvoidedAfterItFails
+        RdmaPortState.ARailWhosePortGoesDownLeavesSelectionAndComesBack
+        RdmaRailAdmission.ACooledRailIsProbedInTheBackground
+        RdmaRailAdmission.ARailsLatencyExcludesConnectionSetup
+      # No GPU on the runner; the helper child runs only when spawned.
+      SKIP_OTHER: >-
+        RdmaLoopback.MultiSegmentGetPublishesUnequalExactBytesToGuardedCudaDestinations
+        RdmaLoopback.PinnedBouncePoolChunksAndBackpressuresConcurrentCudaPublications
+        RdmaLoopback.PinnedBouncePoolQuarantinesSlotAfterEnqueueAndRecoverySyncErrors
+        RdmaLoopbackChild.HoldsAGrantUntilKilled
+      # Opt-in benchmarks: each runs only when its DFKV_*_BENCH is set.
+      SKIP_OPT_IN: >-
+        RdmaMrCost.ReadRegistrationPerGetBench
+      # ThreadSanitizer: a forked child of a threaded process cannot start
+      # threads.
+      SKIP_TSAN_FORK: >-
+        RdmaLoopback.EndpointOpenWithoutDescriptorsIsALocalFailure
+        RdmaLoopback.DescriptorExhaustionUsesAnIdleConnectionOnAnotherRail
+        RdmaLoopback.DialWithoutDescriptorsUsesAnIdleConnectionOnAnotherRail
+        RdmaBootstrapListener.DescriptorExhaustionBacksOffAndRecovers
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -412,7 +455,8 @@ jobs:
           test "$(ulimit -l)" = unlimited
           others=$(ls /sys/class/infiniband | grep -v '^rxe' || true)
           test -z "$others" || { echo "::error::RDMA devices other than rxe: $others"; exit 1; }
-          ./build/rdma_loopback_test
+          ./build/rdma_loopback_test --gtest_output=xml:loopback.xml
+          python3 .github/scripts/check_skips.py loopback.xml SKIP_RXE SKIP_TWO_RAILS SKIP_OTHER SKIP_OPT_IN
           DFKV_SERVER_URING=0 ./build/rdma_lease_loopback_test --gtest_output=xml:lease-sync.xml
           DFKV_SERVER_URING=1 ./build/rdma_lease_loopback_test --gtest_output=xml:lease-uring.xml
           ./build/rdma_lease_client_test --gtest_output=xml:lease-client.xml
@@ -454,7 +498,8 @@ jobs:
           test "$(ulimit -l)" = unlimited
           others=$(ls /sys/class/infiniband | grep -v '^rxe' || true)
           test -z "$others" || { echo "::error::RDMA devices other than rxe: $others"; exit 1; }
-          TSAN_OPTIONS=halt_on_error=1 ./build-tsan/rdma_loopback_test
+          TSAN_OPTIONS=halt_on_error=1 ./build-tsan/rdma_loopback_test --gtest_output=xml:loopback-tsan.xml
+          python3 .github/scripts/check_skips.py loopback-tsan.xml SKIP_RXE SKIP_TWO_RAILS SKIP_OTHER SKIP_OPT_IN SKIP_TSAN_FORK
           TSAN_OPTIONS=halt_on_error=1 DFKV_SERVER_URING=0 ./build-tsan/rdma_lease_loopback_test --gtest_output=xml:lease-sync-tsan.xml
           TSAN_OPTIONS=halt_on_error=1 DFKV_SERVER_URING=1 ./build-tsan/rdma_lease_loopback_test --gtest_output=xml:lease-uring-tsan.xml
           TSAN_OPTIONS=halt_on_error=1 ./build-tsan/rdma_lease_client_test --gtest_output=xml:lease-client-tsan.xml
