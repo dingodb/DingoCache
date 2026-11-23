@@ -1565,10 +1565,13 @@ Status KvNodeServer::ProcessRequestForKey(
       *out_data = FullMetricsText();
       st = Status::kOk;
       break;
-    case WireOp::kMembers:
-      *out_data = members_;  // advertised cluster membership (for client discovery)
+    case WireOp::kMembers: {
+      // advertised cluster membership (for client discovery)
+      std::lock_guard<std::mutex> lock(members_mu_);
+      *out_data = members_;
       st = Status::kOk;
       break;
+    }
     case WireOp::kDrain: {
       std::function<Status(bool)> handler;
       {
