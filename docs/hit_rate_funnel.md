@@ -49,10 +49,10 @@ exist 命中 **≠** 数据真被拉回。SGLang HiCache 的 `prefetch-policy=ti
 
 **指标**：
 - 冷/热对照（**必须分开报，禁止三轮取平均**）：同一批 prompt，R1 冷（写 L3）/ R2·R3 热（读 L3）。热轮吞吐 > 冷轮 = 正收益。
-- 服务端读回速率：`dfkv_bytes_read_total` 增量 / 墙钟。对照单节点纯读上限（B200 单节点实测 ~17GB/s）。
+- 服务端读回速率：`dfkv_bytes_read_total` 增量 / 墙钟。对照单节点纯读上限（单节点实测 ~17GB/s）。
 
 **判读与修法**：
-- **热轮 < 冷轮**：读回带宽 < 重算速率。单节点物理限制（一个节点的盘+NIC < B200 prefill）。**修**：多节点环（聚合读带宽随节点线性增长；五节点环 C10 实测 +77%），或改善推理侧 prefetch 与 decode 的 overlap（SGLang 侧，非 dfkv）。
+- **热轮 < 冷轮**：读回带宽 < 重算速率。单节点物理限制（一个节点的盘+NIC < GPU prefill）。**修**：多节点环（聚合读带宽随节点线性增长；多节点环 C10 实测 +77%），或改善推理侧 prefetch 与 decode 的 overlap（SGLang 侧，非 dfkv）。
 - **重备份风暴**：热轮 `dfkv_bytes_written_total` 仍大 = 重算页被无谓重写（已由 hicache backup exist 门根治，`DFKV_BACKUP_EXIST_GATE=1` 默认）。
 - **exist 队头阻塞**：热轮 `batch_exists` 尾延迟爆（access log），lookup 排在 1MB GET 后面 → `rdma_depth` 提到 32（HiCache 默认 1，需显式设置）+ 控制 lane。
 

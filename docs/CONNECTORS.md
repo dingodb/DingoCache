@@ -36,7 +36,7 @@
 8 轨；客户端与服务端应同版本整体升级。
 ② **读侧 convoy 合并 + RAM 晋升**（服务端 opt-in `DFKV_READ_COALESCE=1`，见根
 README "Recommended tuning"）：TP-N 各 rank 独立进程重复读同页时，服务端把 N 次盘读
-合并/晋升——客户端观察到的效果是**同页重复冷读与重放显著变快**（xb01 实测每重复页盘读
+合并/晋升——客户端观察到的效果是**同页重复冷读与重放显著变快**（实测每重复页盘读
 8→~2.4 次、晋升页复读零盘），无任何客户端配置或行为变化。
 
 **RDMA transport v2** 是唯一受支持的 native RDMA 协议。client 先做能力
@@ -434,8 +434,7 @@ export DFKV_RDMA_MAX_BLOCK_BYTES=67108864    # 按最大实际对象配置；默
 # DFKV_RDMA_DEPTH 可按容量分别设置；握手自动取两侧最小安全窗口
 ```
 
-> ⚠️ hd04 当前只有 `ib7s400p0,ib7s400p1` 两轨 up，但标准训练计算网节点是 8×400G，
-> 按本机实际 up 的口列全。
+> ⚠️ 只列本机实际 up 的口：并非每台主机的所有轨都 up，按本机实际情况列全。
 
 传输相关 env 亦可走 extra_config（构造 `dfkv_client_options_v2` 前解析，
 extra_config 优先）：`"rdma_depth":K`、`"require_rdma":1`、`"rdma_numa":1`。
@@ -756,7 +755,7 @@ fp8）而非 KV 的元素类型，同宽度的 fp8 变体分不出，仍需在 e
   回收 receive-segment lease。keepalive interval 必须严格小于 server idle
   interval；不需要保活时显式设置 `DFKV_RDMA_KEEPALIVE_MS=0`。
 
-#### 0064 B200 + GLM-5.2-NVFP4 实测（2026-08-09）
+#### GLM-5.2-NVFP4 实测（2026-08-09）
 
 95,000-token 请求，8 个 attention-CP rank、8 条物理 rail、完整 L3 命中：
 
@@ -774,7 +773,7 @@ fp8）而非 KV 的元素类型，同宽度的 fp8 变体分不出，仍需在 e
   请求退化至 61–87 s。SGLang 并发请求去重只使用
   `SGLANG_HICACHE_L2_BYPASS_DEDUP` 的框架级语义。
 
-#### 0064 标准 L2 idle-tail 修复（2026-08-10）
+#### 标准 L2 idle-tail 修复（2026-08-10）
 
 server `DFKV_RDMA_IDLE_MS=30000`、client 未开 keepalive 时，45 秒空闲后的
 4×100K-token L3 GET 每 rank 产生 12–17 次
@@ -903,7 +902,7 @@ GPU PUT 没有 TCP fallback；CUDA GET 的 host staging 是 RDMA retry/publicati
 | 角色 | 要求 |
 |---|---|
 | **dfkv 存储节点** | NVMe SSD + 400G RDMA 网卡（IB/RoCE）；跑 `dfkv_server`（可选 `dfkv_mds`+etcd 动态成员） |
-| **推理节点** | H100/A100 等 GPU + 同一 RDMA fabric；跑 vLLM（≥0.23.0） |
+| **推理节点** | GPU + 同一 RDMA fabric；跑 vLLM（≥0.23.0） |
 | **GPUDirect** | GPU 节点须加载 `nvidia-peermem`（`lsmod \| grep nvidia_peermem`），否则 `ibv_reg_mr` 拿不到 GPU MR |
 | **KV 可再生** | dfkv 是纯 cache：节点丢失 = miss = 重算，无副本、无对象存储兜底 |
 
@@ -1151,7 +1150,7 @@ namespace/key 不一致是预期 cold miss。**空环 / MDS 不可达**可直接
 | `tenant_id` | `default` | 多租户时显式设 | canonical namespace 的 tenant 字段（§1.4） |
 | `model_revision` | model identity | 模型版本滚动时显式设 | canonical namespace 的模型版本字段（§1.4）；改动即换 namespace（冷缓存） |
 
-`load_async=True` 在 KDA+MLA hybrid 上的验证（2026-11-10，hd04 H800×8，Kimi-Linear-48B-A3B，TP8，alaya vLLM `v0.23.1rc1.dev7153`，dfkv 2.35.1）：并发 1、32K 前缀，冷轮后 reset 本地前缀缓存、热轮整段前缀从 L3 读回（外部命中 262,144 token，仅计算 512 token 后缀），`True` 与 `False` 的热轮输出都与冷轮逐 token 一致（8/8）；并发 16、64K 前缀，两种模式的外部命中、本地命中与计算 token 完全相同，零失败，输出一致率相同（受批形状非确定性影响，两种模式均约 53/64）。DSA indexer 池（Kimi K3.1）尚未覆盖。
+`load_async=True` 在 KDA+MLA hybrid 上的验证（2026-11-10，单机 8 卡，Kimi-Linear-48B-A3B，TP8，vLLM `v0.23.1rc1.dev7153`，dfkv 2.35.1）：并发 1、32K 前缀，冷轮后 reset 本地前缀缓存、热轮整段前缀从 L3 读回（外部命中 262,144 token，仅计算 512 token 后缀），`True` 与 `False` 的热轮输出都与冷轮逐 token 一致（8/8）；并发 16、64K 前缀，两种模式的外部命中、本地命中与计算 token 完全相同，零失败，输出一致率相同（受批形状非确定性影响，两种模式均约 53/64）。DSA indexer 池（Kimi K3.1）尚未覆盖。
 
 DCP（decode context parallel）宽度/Rank **不是**本表键：连接器从 vLLM 运行时取
 （`get_dcp_group().world_size`），与 `tp_rank=-1`（replicated-MLA 存储坐标）一起进入
@@ -1257,7 +1256,7 @@ daemon 线程或进程终止；过载和退出期间都不会静默留下永久�
 - **长上下文（50k+）**：load 带宽随上下文线性增长，单盘会成瓶颈；靠**分布式存储环**
   （多 server、多盘）摊带宽，而非调 depth。首请求 JIT 见 §3.6。
 
-### 3.6 实测结果（hd04 H100 + IB，DeepSeek-V4-Flash，参考）
+### 3.6 实测结果（IB 网络，DeepSeek-V4-Flash，参考）
 
 - **功能**：5 个 kv_cache_group（MLA + 多组 SWA）全部正确 offload，跨重启 + 跨 DP 命中
   （present=1058/1058、failed=0），输出与 cold 逐字一致，vLLM 真跳 prefill。
@@ -1268,7 +1267,7 @@ daemon 线程或进程终止；过载和退出期间都不会静默留下永久�
 - **depth 平**：裸 GET 单连接 depth 1 = depth 32 ≈ 1.24 GB/s，完全一样（默认已改为 4）。
 - **传输层**：裸 GET 8 连接 5.2 GB/s、16 连接 6.2 GB/s（详见 [datapath-perf-notes.md](datapath-perf-notes.md)）。
 
-0064 B200 + GLM-5.2-NVFP4（94,000-token，2026-08-09）补充：
+GLM-5.2-NVFP4（94,000-token，2026-08-09）补充：
 
 - 固定 `PYTHONHASHSEED=0` 后跨 engine 重启 5,872/5,872 对象命中；
   未设置时相同 prompt 重启后 5,748 个候选全部 cold miss。
@@ -1707,7 +1706,7 @@ refresh 前 ring 可能为空，早期操作安全 miss（LMCache 重算）。
 > ⚠️ 下表是 **vLLM 0.21 + LMCache 0.4.5** 旧栈上的历史实测（相对收益方向仍
 > 可参考），v2.0.0 原生身份/传输栈下的绝对值需以新实测与新部署为准。
 
-环境：a100（vLLM 0.21 + LMCache 0.4.5，历史实测）；dfkv = 2 节点 static 成员（TCP 18800 / RDMA
+环境：单 GPU 主机（vLLM 0.21 + LMCache 0.4.5，历史实测）；dfkv = 2 节点 static 成员（TCP 18800 / RDMA
 18801）；DeepSeek-R1-Distill-Qwen-32B（TP=1）；`chunk_size=16`（每 chunk ≈4 MiB）；
 bench random 16000-in / 100-out，20 prompts，并发 10，同 `--seed`。冷遍写入约 **81 GB**。
 

@@ -105,8 +105,8 @@
 
 - `dfkv_bench`: the connection settle before the measured phase now puts
   one key on every ring member (found by hashing candidates until each
-  member owns one) instead of 32 fixed keys, which on a ring of 65 left
-  about 40 members unprobed and their cold connections failing in the
+  member owns one) instead of 32 fixed keys, which on a large ring left
+  most members unprobed and their cold connections failing in the
   measured phase. New `KVClient::OwnerOf` and `MemberAddresses`.
 
 - Client, RDMA with `DFKV_RDMA_NUMA=1`: the calling CPU's NUMA node is
@@ -2659,7 +2659,7 @@
     has the start instead of asking for one.
 - Server: the disks of a node are opened at the same time instead of one after
   the other. A slab store reads its whole table back before it can serve, so
-  startup grew by seconds per disk: with six disks and 13.5 million objects,
+  startup grew by seconds per disk: on a multi-disk node with a full cache,
   34-51 s passed before the RAM tier even started to pre-fault; it is now
   about 9 s, also on the path that keeps the cache after an unclean exit
   (each disk syncs and rebuilds for 4-7 s there). With more than one disk, one
@@ -3258,7 +3258,7 @@
   same-host GPU dedup wait deadline, while short requests retain one native GET.
 - Defaults remain disabled. Values are validated at startup, preserve key/result
   order, and retain one outer connector metric for the logical load.
-- On xb01-0064, a 1,000,000-token TP8 GLM-5.3 hot load with 128-key windows
+- On a production node, a 1,000,000-token TP8 GLM-5.3 hot load with 128-key windows
   reduced TTFT from 39.35 s to 22.92 s and reduced native remote fetches from
   approximately eight copies to one, with zero dedup fallback. A 4,096-key
   threshold kept the 65,536-token/C10 path unwindowed at 35,622 total tok/s.
@@ -3297,7 +3297,7 @@
 - Completed vLLM replicated-MLA rank convergence: converged client-rank mode
   automatically enables native same-host GPU rendezvous, so one rank performs
   each remote GET and CUDA IPC publishes identical bytes to TP followers.
-- On xb01-0064, 80 live 1 MiB data QPs under a 64 MiB logical ceiling used
+- On a production node, 80 live 1 MiB data QPs under a 64 MiB logical ceiling used
   674 MiB across three lazy chunks and completed 10,000/10,000 PUTs; v2.23.3's
   fixed geometry exhausted an 8 GiB segment at roughly 15 such QPs. Sustained
   64 GiB high-water PUT improved from 5.39 to 6.71 GB/s, p99 from 63.8 to
@@ -3352,12 +3352,12 @@
   workers plus one warm spare avoid reconnect churn, while a cap of four is
   proven to reopen three endpoints under a seven-way concurrent wave.
 - With 4 MiB blocks and depth four, one pull data connection leases
-  33,587,200 bytes. The xb01 14×TP8, per-pool-limit-8 envelope is 896 data plus
-  896 smaller control connections per server. Including 25% churn consumes
-  37,984,665,600 bytes (35.4 GiB), so xb01's 64 GiB setting remains sufficient;
-  increasing it to 128 GiB is unnecessary.
-- On xb01-gpu-200b-0064, 64 GiB and 128 GiB segments both registered on
-  `ib7s400p6` with zero allocation failures. Readiness took 21 s and 43 s
+  33,587,200 bytes. A server needs that per data connection (client
+  processes × the per-pool limit of 8) plus as many smaller control
+  connections, and 25% for churn; the measured production envelope stays
+  within a 64 GiB setting, so increasing it to 128 GiB is unnecessary.
+- On a production node, 64 GiB and 128 GiB segments both registered on one
+  rail with zero allocation failures. Readiness took 21 s and 43 s
   respectively, so 128 GiB doubles the pinned MR and adds 22 s startup latency
   without serving the current capacity envelope.
 - Added client idle/active pool gauges by operation lane and rail, live

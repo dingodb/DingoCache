@@ -434,7 +434,7 @@ it as part of REMOVE latency, with an explicit criterion (§13).
   else.
 - **No zeroing of segment data at creation.** The reviewer suggested writing
   every segment once at creation so that later `fdatasync`s convert no
-  unwritten extents. That is about 20 minutes per 3.5 TiB disk at first start,
+  unwritten extents. That is about 6 minutes per TiB of disk at first start,
   for a cost that §13 can measure instead: correctness does not depend on what
   unwritten space contains (every byte is checked by uuid, incarnation and
   CRC), and the extent conversion is a metadata commit folded into the per-file
@@ -466,8 +466,8 @@ the store may use, reserves included. From it:
   record, rounded to a block): `segment_bytes` − 16 KiB.
 
 Examples: a 1 GiB test store has 32 MiB segments, 32 of them, *K* = 1, and
-`MaxValueBytes` = 32 MiB − 16 KiB; a 3.5 TiB disk has 1 GiB segments, about
-3,500 of them, *K* = 4, and `MaxValueBytes` = 1 GiB − 16 KiB.
+`MaxValueBytes` = 32 MiB − 16 KiB; a disk of 1 TiB or more has 1 GiB segments,
+about 1,000 per TiB, *K* = 4, and `MaxValueBytes` = 1 GiB − 16 KiB.
 
 `MaxValueBytes` is therefore 16 KiB below slab's (`extent_bytes`, exactly
 1 GiB by default) on a full-size disk, and much lower on small test stores.
@@ -491,8 +491,8 @@ segments (§6.1) brings that down further. Smaller segments make eviction finer.
 An in-memory hash map from `BlockKey` to an entry of about 48 bytes:
 segment index (4), offset in 4 KiB units (4), value_len (8), generation (8),
 retain_until and retain_ttl (8), flags (referenced, protected, relocating,
-inline) and a pin count where needed. With 2.74 MiB values a 3.5 TiB disk
-holds about 1.3 million entries, roughly 64 MiB with hash overhead.
+inline) and a pin count where needed. With 2.74 MiB values a disk holds about
+380,000 entries per TiB, roughly 18 MiB per TiB with hash overhead.
 
 A small-value workload can create far more entries per byte of disk than slab
 ever allowed (a 1-byte value now costs 4 KiB of disk instead of 1 MiB). The
@@ -734,7 +734,7 @@ everything it recovered until writes need the space. For the first second
 after that, a PUT that finds no free segment and nothing to reclaim inline
 (§7.7; every sealed segment holds a protected record) waits for the cleaner
 instead of getting `kCacheFull`. There is no percentage watermark: at full size the space held back is
-about (*K* + *C* + 1) × 1 GiB per disk, roughly 0.2% of a 3.5 TiB disk.
+about (*K* + *C* + 1) × 1 GiB per disk, roughly 0.7% of a TiB.
 
 ### 7.2 Choosing the victim
 
