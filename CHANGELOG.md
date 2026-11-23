@@ -3,6 +3,11 @@
 ## Unreleased
 
 
+- Server, TCP: the first frame of a connection gets the same payload
+  allowance as later frames (1 MiB/s on top of `DFKV_TCP_FIRST_REQ_MS`), so a
+  large first PUT on a slow link is not cut off at the first-request
+  deadline.
+
 - Server, RAM tier metrics: `dfkv_ram_evicted_unread_total` (values
   evicted for room without having been read from RAM),
   `dfkv_ram_evicted_age_ms_total` (their resident time, summed),

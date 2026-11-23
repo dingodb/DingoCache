@@ -350,7 +350,9 @@ class KvNodeServer {
   struct PutKeyStripe {
     std::mutex mu;
     std::unordered_map<BlockKey, std::unique_ptr<PutKeySlot>, PutKeyHash> keys;
+    std::vector<std::unique_ptr<PutKeySlot>> free;  // unused slots to reuse
   };
+  static constexpr size_t kPutKeyFreeSlots = 8;
   static constexpr size_t kPutKeyStripes = 256;
   PutKeyStripe put_keys_[kPutKeyStripes];
   std::atomic<uint64_t> put_key_lock_waits_{0}, put_key_lock_wait_us_{0};

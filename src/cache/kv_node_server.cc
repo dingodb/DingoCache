@@ -183,6 +183,10 @@ KvNodeServer::PutKeyLock KvNodeServer::LockPutKey(const BlockKey& key) {
   {
     std::lock_guard<std::mutex> guard(stripe.mu);
     auto& entry = stripe.keys[key];
+    if (!entry && !stripe.free.empty()) {
+      entry = std::move(stripe.free.back());
+      stripe.free.pop_back();
+    }
     if (!entry) entry = std::make_unique<PutKeySlot>();
     slot = entry.get();
     ++slot->users;
@@ -208,8 +212,12 @@ void KvNodeServer::ReleasePutKey(const BlockKey& key,
   PutKeyStripe& stripe = put_keys_[PutKeyHash{}(key) % kPutKeyStripes];
   std::lock_guard<std::mutex> guard(stripe.mu);
   auto it = stripe.keys.find(key);
-  if (it != stripe.keys.end() && --it->second->users == 0)
+  if (it != stripe.keys.end() && --it->second->users == 0) {
+    // Kept for the next key of the stripe, a few at most.
+    if (stripe.free.size() < kPutKeyFreeSlots)
+      stripe.free.push_back(std::move(it->second));
     stripe.keys.erase(it);
+  }
 }
 
 // DFKV_RAM_RECLAIM_MS: background free-slot reclaimer cadence, ms; 0
@@ -2104,9 +2112,9 @@ void KvNodeServer::Handle(int fd,
     if (rq.op == static_cast<uint8_t>(WireOp::kRange) &&
         rq.length > max_payload)
       return;
-    if (!first_frame_pending)
-      frame_deadline += std::chrono::microseconds(
-          rq.payload_len * 1000000 / kTcpMinFrameBytesPerSecond);
+    // The payload's allowance, for the first frame as for later ones.
+    frame_deadline += std::chrono::microseconds(
+        rq.payload_len * 1000000 / kTcpMinFrameBytesPerSecond);
     std::vector<char> payload;
     for (size_t got = 0; got < rq.payload_len;) {
       const size_t want = std::min<size_t>(
