@@ -182,8 +182,9 @@ class RamTier {
     // The disk a key is written to (flush_lane, in [0, flush_lanes)). With
     // more than one disk a flush batch holds the values of one disk only, a
     // shard keeps at least two flush workers and a disk is written by all
-    // but one of them at most, so a disk that hangs leaves a worker to the
-    // others; and a disk's values may make up at most twice its share of
+    // but one of them at most, so one disk that hangs leaves a worker to the
+    // others (two hung disks can still take every worker of a shard that
+    // has only two); and a disk's values may make up at most twice its share of
     // the dirty watermark, so the RAM-ACK backpressure it causes is its own.
     std::function<size_t(const BlockKey&)> flush_lane;
     size_t flush_lanes = 1;
