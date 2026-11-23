@@ -750,10 +750,13 @@ fp8）而非 KV 的元素类型，同宽度的 fp8 变体分不出，仍需在 e
   启动，否则会有分片没人写、永远不命中。不带该门禁的 SGLang 忽略此声明，非 DCP 部署的 key 与读写不变。
   端到端仍需在 DCP 实例上按 §2.5 验证命中与输出一致。
 - **client keepalive 默认开启。** `DFKV_RDMA_KEEPALIVE_MS` 默认 `15000`，每
-  15 秒探测 idle pool 中的 QP，低于频繁重建场景推荐的 server
-  `DFKV_RDMA_IDLE_MS=30000`。进程退出后探测自然停止，server 仍可在 30 秒后
-  回收 receive-segment lease。keepalive interval 必须严格小于 server idle
-  interval；不需要保活时显式设置 `DFKV_RDMA_KEEPALIVE_MS=0`。
+  15 秒探测 idle pool 中的 QP。进程退出后探测自然停止，server 仍可在
+  `DFKV_RDMA_IDLE_MS` 后回收 receive-segment lease。server 的
+  `DFKV_RDMA_IDLE_MS` 至少要是 keepalive interval 的 3 倍（默认 600000 对
+  15000）：只差一拍时 client 被限流或暂停一下，server 就会回收一条 client 还
+  在池里的 QP，下一次用到它的操作要等 RC 重试耗尽（实测约 3.7 s）才重连。
+  `DFKV_RDMA_KEEPALIVE_MS=0` 关掉保活后，server 每次空闲回收、每次重启之后
+  client 第一次用到池里对应的 QP 都要付这 3.7 s。
 
 #### GLM-5.2-NVFP4 实测（2026-08-09）
 
