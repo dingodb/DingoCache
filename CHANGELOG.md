@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Client, RDMA: a batch GET into the callers' buffers runs in windows. The
+  zero-copy batch reads the connectors use (`dfkv_batch_get`,
+  `dfkv_batch_get_auto` and `dfkv_batch_get_auto_sg`) read their keys one at
+  a time: a connection, a request, the READs, a release, then the next key.
+  The keys of a batch now share one connection, and each window of keys (up
+  to the connection's depth) has its requests, READs and releases in flight
+  together. Measured, 16 keys from a RAM-tier node, one rail: 64 KiB values
+  2.54 -> 0.95 ms, 512 KiB 2.60 -> 2.37 ms, 4 MiB 17.3 -> 4.8 ms; 61
+  segments per key of 4 KiB 18.9 -> 4.1 ms, of 64 KiB 22.3 -> 8.3 ms.
+  Nothing changes on the wire. A batch that finds a stale pooled connection
+  retries from the window that failed; finished windows keep their results.
+  Any other failed window fails only its own keys: the windows after it are
+  read once more on a fresh connection (another rail when there is one),
+  except after a timeout. Exact reads in a batch keep TRN-26's rule: a value
+  of another length is released without a READ.
 - Client, RDMA: a completion wait can poll briefly before it sleeps. A GET
   is three round trips (request, READ, release), and each sleep on the
   completion channel and wake-up cost some 30-50 us. With

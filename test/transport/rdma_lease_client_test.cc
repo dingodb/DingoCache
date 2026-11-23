@@ -553,6 +553,28 @@ TEST_F(RdmaLeaseClient, ExactReadOfAnotherLengthLeavesTheDestinationUntouched) {
   EXPECT_EQ(outs[0], sentinel);
   EXPECT_EQ(outs[1], sentinel);
   EXPECT_EQ(outs[2], fits);
+  // A batch of several windows on one connection: every other-length key
+  // in each window is released without a READ, and only the keys that fit
+  // are READ.
+  constexpr size_t kItems = 24;
+  std::vector<std::string> many(kItems, sentinel);
+  std::vector<KvGetItem> batch;
+  std::vector<bool> want;
+  size_t fitting = 0;
+  for (size_t i = 0; i < kItems; ++i) {
+    const char* key = i % 3 == 0 ? "short" : i % 3 == 1 ? "long" : "fits";
+    batch.push_back({key, &many[i][0], 4096});
+    want.push_back(i % 3 == 2);
+    fitting += i % 3 == 2 ? 1 : 0;
+  }
+  const long reads_before =
+      Counter(transport.MetricsText(), "dfkv_rdma_client_pull_reads_total");
+  EXPECT_EQ(c.BatchGet(batch), want);
+  EXPECT_EQ(Counter(transport.MetricsText(), "dfkv_rdma_client_pull_reads_total") -
+                reads_before,
+            static_cast<long>(fitting));
+  for (size_t i = 0; i < kItems; ++i)
+    EXPECT_EQ(many[i], i % 3 == 2 ? fits : sentinel) << i;
 }
 
 TEST_F(RdmaLeaseClient, DynamicPullReleasesLargeScalarAndScatterReadsBeforeIdle) {

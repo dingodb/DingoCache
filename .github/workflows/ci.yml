@@ -349,6 +349,7 @@ jobs:
     env:
       # Soft-RoCE: a SEND to a destroyed peer QP never fails with RETRY_EXC.
       SKIP_RXE: >-
+        RdmaBatchGet.AStalePooledConnectionIsRetriedOnce
         RdmaLoopback.RealFifoQueuedConnectionCloseSync
         RdmaLoopback.RealFifoQueuedConnectionCloseUring
         RdmaLoopback.FreshConnectionFailingAfterAStaleOneCoolsThePeerRail

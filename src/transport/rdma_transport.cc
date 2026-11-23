@@ -128,10 +128,15 @@ bool InjectLocalRailFailure(int zero_based_attempt) {
   return false;
 }
 
-bool InjectPullReadFailure() {
+// "1": every READ fails. "@N": only the transport's N-th READ (one-based).
+bool InjectPullReadFailure(std::atomic<uint64_t>* reads) {
   if (!TestHooks()) return false;
   const char* value = std::getenv("DFKV_RDMA_TEST_PULL_READ_FAILURE");
-  return value && std::strcmp(value, "1") == 0;
+  if (!value) return false;
+  if (std::strcmp(value, "1") == 0) return true;
+  if (value[0] != '@') return false;
+  const uint64_t nth = std::strtoull(value + 1, nullptr, 10);
+  return nth != 0 && reads->fetch_add(1, std::memory_order_relaxed) + 1 == nth;
 }
 
 size_t ResolveMaxPayload(size_t configured) {
@@ -4253,9 +4258,10 @@ std::vector<Status> RdmaTransport::ExistMany(
 
 bool RdmaTransport::PullWindow(
     Conn* conn, PullRequest* requests, size_t width, int timeout_ms,
-    rdma::RailCompletion* failure) {
+    rdma::RailCompletion* failure, bool* window_timed_out) {
   rdma::RcEndpoint& ep = conn->ep;
   *failure = rdma::RailCompletion::kRailFailure;
+  if (window_timed_out) *window_timed_out = false;
   // One deadline for the window's request, READs and release together.
   const CompletionDeadline window_deadline(timeout_ms);
   struct ReadState {
@@ -4286,6 +4292,7 @@ bool RdmaTransport::PullWindow(
     if (timed_out) {
       completion_timeouts_.fetch_add(1, std::memory_order_relaxed);
       exchange_timed_out = true;
+      if (window_timed_out) *window_timed_out = true;
     }
     if (!ok) *failure = rdma::ClassifyCompletion(wc_status, had_wcs);
     return ok;
@@ -4391,7 +4398,7 @@ bool RdmaTransport::PullWindow(
       pull_read_wrs_.fetch_add(1, std::memory_order_relaxed);
       ++posted;
       // Abandon an actually posted READ so Destroy must fence its destination.
-      if (InjectPullReadFailure()) return malformed();
+      if (InjectPullReadFailure(&test_pull_reads_)) return malformed();
     }
     if (posted == 0) break;
     for (size_t remaining = posted; remaining != 0; --remaining) {
@@ -4399,8 +4406,10 @@ bool RdmaTransport::PullWindow(
       const int got = ep.WaitComp(&wc, 1, deadline.Remaining());
       if (got != 1 || wc.status != IBV_WC_SUCCESS ||
           wc.opcode != IBV_WC_RDMA_READ) {
-        if (got == 0)
+        if (got == 0) {
           completion_timeouts_.fetch_add(1, std::memory_order_relaxed);
+          if (window_timed_out) *window_timed_out = true;
+        }
         *failure = rdma::ClassifyCompletion(
             got == 1 ? wc.status
                      : got == 0 ? IBV_WC_SUCCESS : kLocalFaultWcStatus,
@@ -4573,20 +4582,169 @@ std::vector<Status> RdmaTransport::RangeInto(
   if (value_lens) value_lens->assign(count, 0);
   if (destinations.size() != count) return InvalidStatuses(count);
   std::vector<Status> result(count, Status::kInvalid);
+  std::vector<RangeDstSegment> segments;
+  segments.reserve(count);
+  std::vector<PullItem> items;
+  items.reserve(count);
   for (size_t item = 0; item < count; ++item) {
     const RangeDst& destination = destinations[item];
     if (!ValidBuffer(destination.payload, destination.n) ||
         NoteBlock(destination.n))
       continue;
-    const RangeDstSegment segment{
-        destination.payload, destination.n, destination.memory_kind};
-    result[item] = PullInto(node, keys[item], &segment, 1, destination.n,
-                            Lane::kData,
-                            value_lens ? &(*value_lens)[item] : nullptr,
-                            nullptr, PullMode::kWholeObject, 0, 0, nullptr,
-                            destination.exact);
+    segments.emplace_back(destination.payload, destination.n,
+                          destination.memory_kind);
+    items.push_back(
+        PullItem{item, nullptr, 1, destination.n, destination.exact});
   }
+  for (size_t i = 0; i < items.size(); ++i) items[i].segments = &segments[i];
+  PullIntoMany(node, keys, items, Lane::kData, &result, value_lens, nullptr);
   return result;
+}
+
+void RdmaTransport::PullIntoMany(const std::string& node,
+                                 const std::vector<BlockKey>& keys,
+                                 const std::vector<PullItem>& items, Lane lane,
+                                 std::vector<Status>* statuses,
+                                 std::vector<uint64_t>* value_lens,
+                                 std::string* out_dev) {
+  if (items.empty()) return;
+  if (items.size() == 1) {
+    // One key: the single-request path and its retry rules as before.
+    const PullItem& item = items.front();
+    (*statuses)[item.index] = PullInto(
+        node, keys[item.index], item.segments, item.segment_count,
+        item.capacity, lane,
+        value_lens ? &(*value_lens)[item.index] : nullptr, out_dev,
+        PullMode::kWholeObject, 0, 0, nullptr, item.exact);
+    return;
+  }
+  const auto peer = peer_topologies_->Snapshot(node);
+  RailMask excluded(devs_.size(), 0);
+  OpState op_state;
+  bool cross_rail_retry = false;
+  size_t done = 0;  // items before this one have their final status
+  for (size_t i = 0; i < items.size(); ++i)
+    (*statuses)[items[i].index] = Status::kIOError;
+  // As for one key: a whole object read into the caller's destination is
+  // tried once more only after a stale pooled connection (see PullInto).
+  // Windows that completed keep their results; the retry starts at the
+  // window that failed.
+  for (int attempt = 0; attempt < 2 && done < items.size(); ++attempt) {
+    size_t largest = 0;
+    for (size_t i = done; i < items.size(); ++i)
+      largest = std::max(largest, items[i].capacity);
+    AcquireOptions options;
+    options.required_data_bytes = largest;
+    options.request_dynamic_pull = true;
+    options.requested_credits = std::min(items.size() - done, depth_);
+    options.force_new = attempt != 0;
+    options.excluded = excluded;
+    // Bounds this attempt's connection; the windows keep their own timeouts.
+    op_state.deadline_us = DeadlineIn(BatchTimeout());
+    options.op = &op_state;
+    options.peer = peer;
+    AcquireResult acquired = Acquire(node, lane, options);
+    if (!acquired.conn) {
+      if (cross_rail_retry)
+        cross_rail_retry_exhausted_.fetch_add(1, std::memory_order_relaxed);
+      for (size_t i = done; i < items.size(); ++i)
+        (*statuses)[items[i].index] = acquired.status;
+      return;
+    }
+    Conn* conn = acquired.conn;
+    if (out_dev) {
+      const std::string& dev = devs_[conn->rail_index];
+      const size_t arrow = out_dev->rfind("->");
+      const size_t last = arrow == std::string::npos ? 0 : arrow + 2;
+      if (out_dev->empty()) {
+        *out_dev = dev;
+      } else if (out_dev->compare(last, std::string::npos, dev) != 0) {
+        *out_dev += "->";
+        *out_dev += dev;
+      }
+    }
+    const size_t window = std::max<size_t>(
+        1, std::min(conn->ep.window(), static_cast<size_t>(conn->lease.credits)));
+    std::vector<PullRequest> requests(window);
+    rdma::RailCompletion failure = rdma::RailCompletion::kRailFailure;
+    bool conn_ok = true;
+    bool timed_out = false;
+    size_t width = 0;
+    uint64_t ops = 0, bytes = 0;
+    while (done < items.size()) {
+      width = std::min(window, items.size() - done);
+      for (size_t slot = 0; slot < width; ++slot) {
+        const PullItem& item = items[done + slot];
+        requests[slot] = PullRequest{&keys[item.index], item.segments,
+                                     item.segment_count, item.capacity,
+                                     PullMode::kWholeObject, 0, item.capacity};
+        requests[slot].exact = item.exact;
+      }
+      if (!PullWindow(conn, requests.data(), width, BatchTimeout(), &failure,
+                      &timed_out)) {
+        conn_ok = false;
+        break;
+      }
+      for (size_t slot = 0; slot < width; ++slot) {
+        const PullItem& item = items[done + slot];
+        const PullRequest& request = requests[slot];
+        (*statuses)[item.index] = request.status;
+        if (value_lens)
+          (*value_lens)[item.index] =
+              request.status != Status::kInvalid || request.too_large
+                  ? request.value_len
+                  : 0;
+        if (request.status == Status::kOk) {
+          ++ops;
+          bytes += request.data_len;
+        }
+      }
+      done += width;
+    }
+    if (ops) RecordRailTransfer(conn, false, ops, bytes);
+    if (conn_ok) {
+      Release(node, lane, conn);
+      if (cross_rail_retry)
+        cross_rail_retry_successes_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    pull_failures_.fetch_add(1, std::memory_order_relaxed);
+    const size_t failed_rail = conn->rail_index;
+    const bool local_resource = conn->local_resource_failure;
+    // Fence the READs before the destinations can be reused.
+    const bool stale_pooled = Destroy(conn, failure);
+    if (local_resource) {
+      for (size_t i = done; i < items.size(); ++i)
+        (*statuses)[items[i].index] = Status::kResourceExhausted;
+      return;
+    }
+    // After a stale pooled connection the failed window is read again;
+    // otherwise its keys stay kIOError and only the windows after it, which
+    // no READ touched, are tried once more on a fresh connection (another
+    // rail when there is one), as each key once had its own connection. Not
+    // after a timeout: a dead peer would cost one timeout per window.
+    if (!stale_pooled) done += width;
+    if (done < items.size() && (stale_pooled || !timed_out)) {
+      // Only a stale pooled connection counts as a stale-pool retry.
+      const bool retry = PrepareRetry(
+          attempt, stale_pooled, failed_rail,
+          failure == rdma::RailCompletion::kRailFailure
+              ? AcquireFailure::kLocalRail
+              : AcquireFailure::kEndpoint,
+          ReplaySafety::kReplaySafe, false, peer, node, &excluded,
+          &cross_rail_retry);
+      if (retry) continue;
+      if (!stale_pooled && attempt == 0) {
+        // No other rail: the untouched keys get a connection of their own
+        // on the same one, as a key read alone would.
+        excluded.assign(devs_.size(), 0);
+        continue;
+      }
+    }
+    if (cross_rail_retry)
+      cross_rail_retry_exhausted_.fetch_add(1, std::memory_order_relaxed);
+    return;  // the rest stay kIOError
+  }
 }
 
 std::vector<Status> RdmaTransport::CacheFrom(
@@ -4972,6 +5130,8 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
   if (out_dev) out_dev->clear();
   if (destinations.size() != count) return InvalidStatuses(count);
   std::vector<Status> result(count, Status::kInvalid);
+  std::vector<PullItem> items;
+  items.reserve(count);
   for (size_t item = 0; item < count; ++item) {
     const auto& segments = destinations[item].payloads;
     size_t capacity = 0;
@@ -4986,13 +5146,20 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
       capacity = next;
     }
     if (!valid || NoteBlock(capacity)) continue;
-    uint64_t value_len = 0;
-    result[item] = PullInto(node, keys[item], segments.data(), segments.size(),
-                            capacity, Lane::kSgData, &value_len, out_dev);
-    if (out_lengths && (result[item] == Status::kOk ||
-                        (result[item] == Status::kInvalid &&
-                         value_len > capacity)))
-      (*out_lengths)[item] = static_cast<size_t>(value_len);
+    items.push_back(
+        PullItem{item, segments.data(), segments.size(), capacity});
+  }
+  std::vector<uint64_t> value_lens(count, 0);
+  PullIntoMany(node, keys, items, Lane::kSgData, &result, &value_lens,
+               out_dev);
+  if (out_lengths) {
+    for (const PullItem& item : items) {
+      const uint64_t value_len = value_lens[item.index];
+      if (result[item.index] == Status::kOk ||
+          (result[item.index] == Status::kInvalid &&
+           value_len > item.capacity))
+        (*out_lengths)[item.index] = static_cast<size_t>(value_len);
+    }
   }
   return result;
 }

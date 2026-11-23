@@ -349,8 +349,25 @@ class RdmaTransport : public Transport {
   };
   // One exclusively owned endpoint executes prepare, READ and RELEASE windows.
   // Failure leaves transient MRs with the endpoint until the caller fences it.
+  // *timed_out (when given) tells a failure that ran out of time.
   bool PullWindow(Conn* conn, PullRequest* requests, size_t width,
-                  int timeout_ms, rdma::RailCompletion* failure);
+                  int timeout_ms, rdma::RailCompletion* failure,
+                  bool* timed_out = nullptr);
+  // Whole objects of several keys into the callers' destinations, in windows
+  // of the connection's depth: one connection, and each window's requests,
+  // READs and releases in flight together, instead of one key at a time.
+  // items[i] is the index into keys/statuses of the i-th request.
+  struct PullItem {
+    size_t index = 0;
+    const RangeDstSegment* segments = nullptr;
+    size_t segment_count = 0;
+    size_t capacity = 0;
+    bool exact = false;  // a value of another length is not READ (see PullInto)
+  };
+  void PullIntoMany(const std::string& node, const std::vector<BlockKey>& keys,
+                    const std::vector<PullItem>& items, Lane lane,
+                    std::vector<Status>* statuses,
+                    std::vector<uint64_t>* value_lens, std::string* out_dev);
   Status PullInto(const std::string& node, const BlockKey& key,
                   const RangeDstSegment* segments, size_t segment_count,
                   size_t capacity, Lane lane, uint64_t* value_len,
@@ -610,6 +627,7 @@ class RdmaTransport : public Transport {
   std::atomic<uint64_t> pull_reads_{0};
   std::atomic<uint64_t> pull_read_bytes_{0};
   std::atomic<uint64_t> pull_read_wrs_{0};  // READ work requests posted
+  std::atomic<uint64_t> test_pull_reads_{0};  // DFKV_RDMA_TEST_PULL_READ_FAILURE=@N
   std::atomic<uint64_t> pull_failures_{0};
   std::atomic<uint64_t> pull_releases_{0};
   std::atomic<uint64_t> pull_release_failures_{0};
