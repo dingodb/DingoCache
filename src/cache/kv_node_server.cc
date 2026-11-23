@@ -2048,14 +2048,29 @@ void KvNodeServer::Handle(int fd,
   const auto first_deadline =
       accepted_at + std::chrono::milliseconds(tcp_first_req_ms_);
   const timeval base_timeout{tcp_io_timeout_seconds_, 0};
+  // Every later frame has an absolute deadline too, from its first byte:
+  // the base timeout plus its payload at kTcpMinFrameBytesPerSecond. A peer
+  // that trickles a frame in, each byte inside the per-syscall timeout, no
+  // longer holds the connection (and its handler thread) for good.
+  constexpr uint64_t kTcpMinFrameBytesPerSecond = 1ull << 20;
+  // The payload buffer grows as bytes arrive, by doubling from 1 MiB, rather
+  // than being allocated and zeroed at its declared length up front: a frame
+  // that declares 32 MiB and sends nothing costs no memory.
+  constexpr size_t kPayloadFirstChunk = 1u << 20;
   while (running_) {
     char prefix[kReqPrefix];
+    std::chrono::steady_clock::time_point frame_deadline = first_deadline;
     if (first_frame_pending) {
       if (!net::ReadAllWithin(fd, prefix, kReqPrefix, base_timeout,
                               first_deadline))
         return;
-    } else if (!net::ReadAll(fd, prefix, kReqPrefix)) {
-      return;  // peer closed / error
+    } else {
+      if (!net::ReadAll(fd, prefix, 1)) return;  // idle until a frame starts
+      frame_deadline = std::chrono::steady_clock::now() +
+                       std::chrono::seconds(tcp_io_timeout_seconds_);
+      if (!net::ReadAllWithin(fd, prefix + 1, kReqPrefix - 1, base_timeout,
+                              frame_deadline))
+        return;
     }
     ReqFields rq;
     if (!DecodeReq(prefix, &rq, max_payload)) return;  // bad version / oversize => drop
@@ -2067,23 +2082,24 @@ void KvNodeServer::Handle(int fd,
     if (rq.op == static_cast<uint8_t>(WireOp::kRange) &&
         rq.length > max_payload)
       return;
-    std::vector<char> payload(rq.payload_len);
-    if (rq.payload_len) {
-      if (first_frame_pending) {
-        if (!net::ReadAllWithin(fd, payload.data(), rq.payload_len,
-                                base_timeout, first_deadline))
-          return;
-      } else if (!net::ReadAll(fd, payload.data(), rq.payload_len)) {
+    if (!first_frame_pending)
+      frame_deadline += std::chrono::microseconds(
+          rq.payload_len * 1000000 / kTcpMinFrameBytesPerSecond);
+    std::vector<char> payload;
+    for (size_t got = 0; got < rq.payload_len;) {
+      const size_t want = std::min<size_t>(
+          rq.payload_len, std::max(kPayloadFirstChunk, 2 * got));
+      payload.resize(want);
+      if (!net::ReadAllWithin(fd, payload.data() + got, want - got,
+                              base_timeout, frame_deadline))
         return;
-      }
+      got = want;
     }
-    if (first_frame_pending) {
-      // First frame complete: restore the plain base per-syscall budget the
-      // deadline reads shrank, so keep-alive reads behave exactly as before.
-      first_frame_pending = false;
-      ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &base_timeout,
-                   sizeof(base_timeout));
-    }
+    // Restore the plain per-syscall budget the deadline reads shrank, so the
+    // wait for the next frame behaves as before.
+    first_frame_pending = false;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &base_timeout,
+                 sizeof(base_timeout));
 
     std::string data;
     size_t value_len = 0;

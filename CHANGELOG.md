@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Server, TCP: every request frame has a deadline, not only the first. A
+  later frame trickled in a byte at a time (each byte inside
+  `DFKV_TCP_IO_TIMEOUT_S`) held its connection and handler thread for good;
+  it is now due within the IO timeout plus its payload at 1 MiB/s, from its
+  first byte. The payload buffer grows as bytes arrive instead of being
+  allocated and zeroed at the declared length before any data: 512
+  connections declaring 32 MiB each no longer take 16 GiB.
+
 - Server: PUTs of different keys no longer wait for each other. PUTs were
   serialized by 1024 lock stripes held across the RAM admission copy and,
   on a capacity bypass, the disk write; with 64 concurrent 1 MiB PUTs of

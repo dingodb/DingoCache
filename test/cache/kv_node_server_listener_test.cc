@@ -448,3 +448,74 @@ TEST(KvNodeServerListener, ThreadThatCannotStartRefusesOnlyThatConnection) {
   ::close(served);
   server->Stop();
 }
+
+// Not only the first frame: a later frame trickled in byte by byte, each
+// byte inside the per-syscall timeout, is closed by its own deadline (the
+// base timeout plus its payload at 1 MiB/s).
+TEST(KvNodeServerListener, SlowDripLaterFrameIsClosedByItsDeadline) {
+  ScopedEnv engine("DFKV_STORE_ENGINE", "file");
+  ScopedEnv max_connections("DFKV_TCP_MAX_CONNS", "4");
+  ScopedEnv io_timeout("DFKV_TCP_IO_TIMEOUT_S", "1");
+  ScopedEnv first_req("DFKV_TCP_FIRST_REQ_MS", "300");
+  auto server = StartServer("drip_later");
+  const int fd = Dial(*server);
+  ASSERT_GE(fd, 0);
+  // A complete first frame, answered.
+  const std::string value = "first";
+  char pre[kReqPrefix];
+  EncodeReq(pre, WireOp::kCache, BlockKey{4, 5, 6}, 0, 0, value.size());
+  ASSERT_TRUE(net::WriteAll(fd, pre, sizeof(pre)));
+  ASSERT_TRUE(net::WriteAll(fd, value.data(), value.size()));
+  char rp[kRespPrefix];
+  ASSERT_TRUE(net::ReadAll(fd, rp, sizeof(rp)));
+  // The second frame's prefix, one byte every 300 ms: never 1 s apart.
+  EncodeReq(pre, WireOp::kCache, BlockKey{4, 5, 7}, 0, 0, value.size());
+  const auto started = std::chrono::steady_clock::now();
+  bool closed = false;
+  for (size_t i = 0; i < sizeof(pre) && !closed; ++i) {
+    ::send(fd, pre + i, 1, MSG_NOSIGNAL);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    closed = server->live_conn_count() == 0;
+    if (std::chrono::steady_clock::now() - started > std::chrono::seconds(4))
+      break;
+  }
+  EXPECT_TRUE(closed) << "a trickled later frame held its connection";
+  ::close(fd);
+  server->Stop();
+}
+
+// A frame that declares a large payload and sends little of it allocates
+// what has arrived (in chunks), not the declared length; it is answered
+// normally once the payload is in.
+TEST(KvNodeServerListener, LargeDeclaredPayloadIsReadAsItArrives) {
+  ScopedEnv engine("DFKV_STORE_ENGINE", "file");
+  const fs::path dir = fs::temp_directory_path() /
+      ("dfkv_tcp_listener_payload_grow_" + std::to_string(::getpid()));
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  auto server = std::make_unique<KvNodeServer>(dir.string(), 64ull << 20);
+  ASSERT_EQ(server->Start(0), Status::kOk);
+  const int fd = Dial(*server);
+  ASSERT_GE(fd, 0);
+  const std::string value(3 * 1024 * 1024 + 17, 'p');  // past two chunks
+  char pre[kReqPrefix];
+  EncodeReq(pre, WireOp::kCache, BlockKey{7, 8, 9}, 0, 0, value.size());
+  ASSERT_TRUE(net::WriteAll(fd, pre, sizeof(pre)));
+  ASSERT_TRUE(net::WriteAll(fd, value.data(), value.size()));
+  char rp[kRespPrefix];
+  ASSERT_TRUE(net::ReadAll(fd, rp, sizeof(rp)));
+  Status st = Status::kIOError;
+  uint64_t data_len = 0;
+  ASSERT_TRUE(DecodeResp(rp, &st, &data_len));
+  EXPECT_EQ(st, Status::kOk);
+  ::close(fd);
+  std::string got;
+  TcpTransport transport;
+  ASSERT_EQ(transport.Range("127.0.0.1:" + std::to_string(server->port()),
+                            BlockKey{7, 8, 9}, 0, value.size(), &got),
+            Status::kOk);
+  EXPECT_EQ(got, value);
+  server->Stop();
+  server.reset();
+  fs::remove_all(dir);
+}
