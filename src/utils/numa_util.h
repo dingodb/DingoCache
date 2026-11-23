@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include <cstdio>
+#include <vector>
 #include <cstdlib>
 #include <cstring>
 
@@ -143,26 +144,61 @@ inline bool CpuInList(const char* list, int cpu) {
   return false;
 }
 
-// NUMA node of the calling thread's current CPU (sysfs), or -1 if unknown/single.
-inline int CurrentNode() {
-  int cpu = ::sched_getcpu();
-  if (cpu < 0) return -1;
-  for (int node = 0; node < 256; ++node) {
-    char path[256];
-    std::snprintf(path, sizeof(path),
-                  "/sys/devices/system/node/node%d/cpulist", node);
-    FILE* f = std::fopen(path, "r");
-    if (!f) continue;
-    char buf[8192] = {0};
-    size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
-    std::fclose(f);
-    // If the list filled the buffer it was likely truncated mid-token; skip
-    // this node rather than risk parsing a severed range (degrades to -1 ->
-    // round-robin all rails, never a wrong NUMA classification).
-    if (n == sizeof(buf) - 1) continue;
-    if (n && CpuInList(buf, cpu)) return node;
+// Calls fn(cpu) for every CPU id in a sysfs cpulist like "0-3,8-11".
+template <typename Fn>
+inline void ForEachCpuInList(const char* list, Fn fn) {
+  const char* p = list;
+  while (*p) {
+    int lo = -1, hi = -1, consumed = 0;
+    if (std::sscanf(p, "%d-%d%n", &lo, &hi, &consumed) >= 2) {
+      for (int cpu = lo; cpu >= 0 && cpu <= hi && cpu < 65536; ++cpu) fn(cpu);
+    } else if (std::sscanf(p, "%d%n", &lo, &consumed) >= 1) {
+      if (lo >= 0 && lo < 65536) fn(lo);
+    } else {
+      break;
+    }
+    p += consumed;
+    while (*p == ',' || *p == ' ' || *p == '\n') ++p;
   }
-  return -1;
+}
+
+// NUMA node of each CPU id from sysfs, -1 where unknown. Read once: a CPU
+// does not change nodes, and the scan (an open per possible node, most of
+// which do not exist) used to run on every RDMA connection acquire.
+inline const std::vector<int>& CpuNodeTable() {
+  static const std::vector<int> table = [] {
+    std::vector<int> out;
+    for (int node = 0; node < 256; ++node) {
+      char path[256];
+      std::snprintf(path, sizeof(path),
+                    "/sys/devices/system/node/node%d/cpulist", node);
+      FILE* f = std::fopen(path, "r");
+      if (!f) continue;
+      char buf[8192] = {0};
+      size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+      std::fclose(f);
+      // A list that filled the buffer was likely truncated mid-token; leave
+      // this node's CPUs unknown rather than parse a severed range (they get
+      // -1 -> round-robin all rails, never a wrong NUMA classification).
+      if (n == 0 || n == sizeof(buf) - 1) continue;
+      ForEachCpuInList(buf, [&](int cpu) {
+        if (static_cast<size_t>(cpu) >= out.size()) out.resize(cpu + 1, -1);
+        out[static_cast<size_t>(cpu)] = node;
+      });
+    }
+    return out;
+  }();
+  return table;
+}
+
+// NUMA node of the calling thread's current CPU, or -1 if unknown/single.
+inline int CurrentNode() {
+  const int cpu = ::sched_getcpu();
+  if (cpu < 0) return -1;
+  const std::vector<int>& table = CpuNodeTable();
+  return static_cast<size_t>(cpu) < table.size()
+             ? table[static_cast<size_t>(cpu)]
+             : -1;
 }
 
 }  // namespace numa

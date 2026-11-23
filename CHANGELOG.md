@@ -3,6 +3,10 @@
 ## Unreleased
 
 
+- Client, RDMA with `DFKV_RDMA_NUMA=1`: the calling CPU's NUMA node is
+  looked up in a table read from sysfs once, not by opening up to 256
+  sysfs files on every connection acquire: 14.9 us to 0.055 us per lookup.
+
 - SGLang HiCache connector, device-direct (L2-bypass): a host-form
   `batch_set_v1` while primary KV is stored device-direct is logged and
   counted. It happens when the controller falls back to the host path after
