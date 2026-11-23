@@ -1135,25 +1135,19 @@ bool KVClient::GetAutoDirectRouted(const std::string& key, std::string* out,
   if (!health_.Healthy(node, now)) return false;
   const BlockKey bk = block_key_(key);
   uint64_t value_len = 0;
-  out->resize(max_bytes);
+  // An uninitialized buffer: std::string::resize zero-filled all max_bytes
+  // (64 MiB by default, about 20 ms) on every call, for a value of any size.
+  std::unique_ptr<char[]> buffer(max_bytes ? new char[max_bytes] : nullptr);
   std::vector<BlockKey> keys{bk};
-  std::vector<RangeDst> dsts{RangeDst{
-      max_bytes ? &(*out)[0] : nullptr, max_bytes,
-      DestinationMemoryKind::kHost}};
+  std::vector<RangeDst> dsts{RangeDst{buffer.get(), max_bytes,
+                                      DestinationMemoryKind::kHost}};
   std::vector<uint64_t> value_lens;
   const Status st = t_->RangeInto(node, keys, dsts, &value_lens)[0];
   if (!value_lens.empty()) value_len = value_lens[0];
   ReportPeer(node, st);
-  if (st == Status::kIOError) {
-    out->clear();
-    return false;
-  }
-  if (st != Status::kOk || value_len > max_bytes ||
-      out->size() < value_len) {
-    out->clear();
-    return false;
-  }
-  out->resize(static_cast<size_t>(value_len));
+  out->clear();
+  if (st != Status::kOk || value_len > max_bytes) return false;
+  out->assign(buffer.get(), static_cast<size_t>(value_len));
   return true;
 }
 

@@ -3,6 +3,10 @@
 ## Unreleased
 
 
+- Client: `GetAuto` into a `std::string` (used by `dfkvctl get`) no longer
+  zero-fills its whole bound (64 MiB by default) before each read; that cost
+  about 20 ms per call whatever the value's size.
+
 - Client, host and GPU dedup: an exception on the calling thread between
   claiming a key and publishing or giving it up (an allocation failing, in
   practice) left the key claimed, and every other process of the host waited
