@@ -3,6 +3,20 @@
 ## Unreleased
 
 
+- SGLang HiCache connector, EAGLE draft KV (L2-bypass): `batch_touch` and
+  `retain_precheck` cover the draft's objects too. A draft page is written
+  with the write's retention TTL, but a touch renewed only the target
+  model's KV and side pools, so the draft's protection ran out first while
+  the target's was renewed, and loaded pages then ran without their draft
+  KV. The draft objects this rank writes (all ranks for a draft split over
+  TP, the replica writer for a replicated one) are now renewed with the rest
+  of the prefix, once this process has moved a draft page and so knows its
+  layout. Because `retain_precheck` now includes them, a rank that owns
+  draft objects on nodes without headroom vetoes the prefix's TTL like any
+  other owner. Draft objects not stored yet are not parked for their write
+  (draft pages are written best-effort and may never be), so they cannot
+  fill the pending table.
+
 - Server, TCP: the first frame of a connection gets the same payload
   allowance as later frames (1 MiB/s on top of `DFKV_TCP_FIRST_REQ_MS`), so a
   large first PUT on a slow link is not cut off at the first-request

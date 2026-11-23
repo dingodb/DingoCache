@@ -263,6 +263,65 @@ class RetainKeysMatchWrites(unittest.TestCase):
         self.assertRetainMatchesWrites(b, device=True)
 
 
+class DraftRetention(unittest.TestCase):
+    """The EAGLE draft KV is written with the write's TTL; a touch must renew
+    it too. It renewed only the target's objects, so the draft expired
+    first."""
+
+    def _draft_backend(self, writer, draft_sub, tp_rank=0):
+        b = _backend(writer=writer, tp_rank=tp_rank, kda=False, indexer=False,
+                     device=True, width=2, layers=5)
+        b.mem_pool_device_draft = _DevicePool(3, draft_sub)
+        b.batch_set_v1_device_draft(PAGES, list(range(len(PAGES))))
+        return b
+
+    def test_writer_renews_what_it_wrote_including_the_draft(self):
+        b = self._draft_backend(writer=True, draft_sub=1)
+        b._kv_device_set(PAGES, list(range(len(PAGES))))
+        draft = {sk for k in PAGES for sk in b._draft_keys(k, 1)}
+        self.assertTrue(any(sk.startswith(d) for sk in b.written for d in draft))
+        self.assertEqual(set(b._retain_object_keys(PAGES)), set(b.written))
+
+    def test_follower_renews_a_sharded_draft_only(self):
+        replicated = self._draft_backend(writer=False, draft_sub=1, tp_rank=3)
+        self.assertEqual(replicated.written, [])
+        self.assertFalse(replicated._rank_writes_draft())
+        self.assertFalse(replicated.retain_owns_objects())
+        self.assertEqual(replicated._retain_object_keys(PAGES), [])
+        sharded = self._draft_backend(writer=False, draft_sub=2, tp_rank=3)
+        self.assertTrue(sharded.written)
+        self.assertEqual(set(sharded._retain_object_keys(PAGES)),
+                         set(sharded.written))
+        self.assertTrue(sharded.retain_owns_objects())
+
+
+class DraftKeysAreNotParked(unittest.TestCase):
+    """A touch parks the TTL of objects not stored yet for their write. Draft
+    pages are written best-effort and may never be: parking their keys on
+    every touch would fill the pending table."""
+
+    def test_missing_draft_objects_are_not_parked(self):
+        b = _backend(writer=True, kda=False, indexer=False, device=True,
+                     width=2, layers=5)
+        b._has_retain = True
+        b._pending_retain = collections.OrderedDict()
+        b._pending_lock = threading.Lock()
+        b.mem_pool_device_draft = _DevicePool(3, 1)
+        b._draft_layout = (1, 2)
+        b._sg_chunks = {"kv": 3}
+        draft = set(b._retain_draft_keys(PAGES))
+        self.assertTrue(draft)
+        with _Cabi() as c:
+            H.dfkv_cabi.call_batch_retain = lambda lib, h, keys, ttl, mode, **k: (
+                c.retain_calls.append((list(keys), ttl, mode))
+                or [H.dfkv_cabi.DFKV_RET_MISS] * len(keys))
+            b.batch_touch(PAGES, TTL)
+        sent = set(c.retain_calls[0][0])
+        self.assertTrue(draft <= sent, "draft objects are still renewed")
+        self.assertTrue(b._pending_retain, "the KV objects are parked")
+        self.assertFalse(draft & set(b._pending_retain), "draft keys parked")
+
+
 class RetainPrecheck(unittest.TestCase):
     def setUp(self):
         self.b = _backend()
