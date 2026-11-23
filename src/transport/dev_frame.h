@@ -29,10 +29,16 @@ constexpr uint64_t kDevFrameRequestPullRead = uint64_t{1} << 62;
 constexpr uint64_t kDevFrameRequestLeasedPut = uint64_t{1} << 61;
 constexpr uint64_t kDevFrameRequestDynamicPull = uint64_t{1} << 60;
 constexpr uint64_t kDevFrameRequestDynamicOnly = uint64_t{1} << 59;
+// Bit 58 asks the server to keep the bootstrap socket open as the
+// connection's session channel (DFKV_RDMA_SESSION_FD): whichever side ends
+// the connection closes it, and the other sees EOF. A client sets it only
+// for a server whose probe advertised kV2ProbeCapSessionFd: a server that
+// predates the bit would read it as part of max_block_bytes and refuse.
+constexpr uint64_t kDevFrameRequestSessionFd = uint64_t{1} << 58;
 constexpr uint64_t kDevFrameMaxBlockMask =
     ~(kDevFrameRequestWriterRetirement | kDevFrameRequestPullRead |
       kDevFrameRequestLeasedPut | kDevFrameRequestDynamicPull |
-      kDevFrameRequestDynamicOnly);
+      kDevFrameRequestDynamicOnly | kDevFrameRequestSessionFd);
 
 // Room a device name must leave in the fixed 32-byte frame: NUL terminator +
 // "DCP2" u32 + max_block_bytes u64 + protocol u8. A name at most this long
@@ -119,6 +125,10 @@ inline bool DevFrameRequestsDynamicPull(const char in[kDevNameBytes]) {
 
 inline bool DevFrameRequestsDynamicOnly(const char in[kDevNameBytes]) {
   return (ParseDevFrameCaps(in) & kDevFrameRequestDynamicOnly) != 0;
+}
+
+inline bool DevFrameRequestsSessionFd(const char in[kDevNameBytes]) {
+  return (ParseDevFrameCaps(in) & kDevFrameRequestSessionFd) != 0;
 }
 
 inline uint8_t ParseDevFrameProtocol(const char in[kDevNameBytes]) {

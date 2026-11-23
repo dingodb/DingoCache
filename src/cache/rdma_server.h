@@ -272,6 +272,24 @@ class RdmaServer {
   std::atomic<uint64_t> pending_handshakes_{0};
   std::atomic<uint64_t> rejected_connections_{0};
   std::thread recv_trim_thread_;
+  // Session channels (DFKV_RDMA_SESSION_FD, off by default): the bootstrap
+  // socket of a connection whose client asked for it stays open. The
+  // watcher thread wakes the connection's Serve thread when the client's end
+  // closes, so it ends at once instead of at the idle timeout; the server's
+  // own end is closed when the connection ends, for whatever reason, which
+  // tells the client before it reuses the connection.
+  bool session_fd_enabled_ = false;
+  int session_epoll_fd_ = -1;
+  int session_stop_fd_ = -1;  // eventfd that ends the watcher
+  std::thread session_thread_;
+  std::mutex session_mu_;
+  uint64_t next_session_id_ = 1;  // under session_mu_
+  std::unordered_map<uint64_t, rdma::RcEndpoint*> sessions_;  // under session_mu_
+  std::atomic<uint64_t> session_peer_closed_{0};
+  std::atomic<uint64_t> sessions_kept_{0};
+  void SessionWatchLoop();
+  uint64_t WatchSession(int fd, rdma::RcEndpoint* ep);
+  void UnwatchSession(uint64_t id, int fd);
   std::mutex recv_trim_mu_;
   std::condition_variable recv_trim_cv_;
   // Track per-connection Serve threads + their endpoints so Stop() can wake them

@@ -358,7 +358,8 @@ class RdmaTransport : public Transport {
   };
   ProbeResult ProbeV2(const std::string& node,
                       bool* leased_put_supported = nullptr,
-                      int timeout_ms = 0) const;  // 0: connect_ms_, io_ms_
+                      int timeout_ms = 0,  // 0: connect_ms_, io_ms_
+                      bool* session_fd_supported = nullptr) const;
   // A buffer of the caller could not be registered on `c`. Marks the
   // connection so that its teardown charges neither rail nor peer.
   void NoteLocalRegistrationFailure(Conn* c, size_t bytes);
@@ -374,6 +375,7 @@ class RdmaTransport : public Transport {
     std::string peer_id;
     uint64_t publication = 0;
     bool leased_put = false;
+    bool session_fd = false;
   };
   std::unordered_map<std::string, PeerCapability> peer_capabilities_;
   void InvalidateCapabilities(const std::string& node,
@@ -447,6 +449,18 @@ class RdmaTransport : public Transport {
   // Enabled by default below the recommended 30 s server reaper interval.
   // Set DFKV_RDMA_KEEPALIVE_MS=0 to disable.
   int keepalive_ms_ = 15000;
+  // DFKV_RDMA_SESSION_FD (default off): ask servers that offer it to keep
+  // each connection's bootstrap socket as a session channel, and check it
+  // before reusing a pooled connection. A server that ended the connection
+  // (idle reclaim, pool pressure, restart, stop) has closed its end, so the
+  // dead connection is dropped instead of costing the next operation RC
+  // retry exhaustion. One more descriptor per pooled connection.
+  bool session_fd_enabled_ = false;
+  // Pooled connections dropped before reuse because the server had closed
+  // their session channel.
+  std::atomic<uint64_t> session_closed_reaps_{0};
+  // True if conn's session channel says the server has ended it.
+  static bool SessionClosed(const Conn& conn);
   int port_check_ms_ = 1000;  // DFKV_RDMA_PORT_CHECK_MS; 0 = off
   std::unique_ptr<rdma::PortWatcher> port_watcher_;
   std::vector<uint8_t> port_active_;  // keepalive thread only

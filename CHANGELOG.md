@@ -198,6 +198,32 @@
   looked up in a table read from sysfs once, not by opening up to 256
   sysfs files on every connection acquire: 14.9 us to 0.055 us per lookup.
 
+- RDMA, client and server: session channels (`DFKV_RDMA_SESSION_FD`, off by
+  default on each side). The bootstrap TCP socket of a connection stays open
+  as the connection's session channel, and whichever side ends the
+  connection closes it. A client checks it (non-blocking `MSG_PEEK`) before
+  reusing a pooled connection and drops one the server has ended (idle
+  reclaim, receive-pool eviction, grant timeout, protocol error, stop)
+  instead of spending its next operation on RC retry exhaustion: measured
+  on InfiniBand, the first operation after an idle reclaim took 3.5-3.7 s
+  without it and 9-13 ms with it. A server ends a connection as soon as its
+  client drops it, instead of at `DFKV_RDMA_IDLE_MS`. Negotiated: a client
+  asks (bootstrap bit 58) only a server whose probe advertises the
+  capability, and the server acknowledges in the readiness byte only to a
+  client that asked, so either side of an older release works as before.
+  The keepalive skips (and drops) a pooled connection whose session is
+  closed. A session the server closes between that check and the
+  operation still costs the old RC retry timeout. One more descriptor per
+  connection on each side: the client raises its soft `RLIMIT_NOFILE` to
+  the hard limit when the switch is on; the server's `LimitNOFILE` must
+  cover its connection count. The socket is close-on-exec from creation,
+  but a plain `fork()` child (Python multiprocessing "fork") holds a copy
+  until it exits, and for those connections the server falls back to
+  `DFKV_RDMA_IDLE_MS`. A proxy on the bootstrap path that closes the TCP
+  connection after the handshake makes the server end every connection.
+  New `dfkv_rdma_client_session_closed_reaps_total`,
+  `dfkv_rdma_sessions_kept_total`, `dfkv_rdma_session_peer_closed_total`.
+
 - SGLang HiCache connector, device-direct (L2-bypass): a host-form
   `batch_set_v1` while primary KV is stored device-direct is logged and
   counted. It happens when the controller falls back to the host path after
