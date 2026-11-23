@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Server, RDMA: a GET grant or a PUT lease no longer outlives a dead client
+  by the connection's idle timeout. After sending a GET's READY the server
+  holds the value (a staging range, or a pin on a RAM tier slot that then
+  cannot be evicted) until the client's RELEASE, and after granting a PUT
+  lease it holds the staging range until the client writes. A client that
+  crashed or gave up sends nothing, so the connection, and with it the
+  pin, stayed until `DFKV_RDMA_IDLE_MS` (10 min by default, forever with 0).
+  Now a connection that holds a grant, has nothing of the server's in
+  flight (no disk read, no reply) and stays silent for
+  `DFKV_RDMA_GRANT_TIMEOUT_MS` (default 60 s, 0 = no bound), counted from
+  its last completion or the last grant it sent, is closed: the QP and its
+  memory registrations go first, then the pins and ranges, so nothing the
+  peer could still read or write is freed under it. A batch GET's clock
+  thus starts with its last READY, however long its reads take. Counted in
+  `dfkv_rdma_grant_expiries_total`, with a WARN naming the peer. A client
+  whose deadline (`DFKV_RDMA_OP_TIMEOUT_MS`, or the batch one) is longer,
+  or 0, needs a longer grant timeout, or 0, as a single READ or write that
+  outlasts it is cut.
 - Server, RAM tier (unreleased since the flush-lane change): the number of
   flush lanes was read from the disk group before the group was
   constructed, so it was whatever that memory held; a start with the RAM

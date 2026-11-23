@@ -39,6 +39,21 @@ inline int RdmaIdleMsFromEnv() {
   return v == 0 ? -1 : static_cast<int>(v);
 }
 
+// DFKV_RDMA_GRANT_TIMEOUT_MS: how long a GET grant (a pulled value the
+// client has not released) or a PUT lease (a staging range the client has not
+// written) may wait on the client before the server tears the connection
+// down; -1 = no bound. Default 60 s, far above any client deadline. 0
+// disables. Clamped to 24 h.
+inline int RdmaGrantTimeoutMsFromEnv() {
+  envparse::U64Spec spec;
+  spec.fallback = 60000;
+  spec.max = 86400000;
+  spec.above = envparse::Above::kClamp;
+  spec.zero_means = "grants and leases wait for the client without bound";
+  const uint64_t v = envparse::EnvU64("DFKV_RDMA_GRANT_TIMEOUT_MS", spec);
+  return v == 0 ? -1 : static_cast<int>(v);
+}
+
 // A receive-pool byte count. rdma::ResolveRecvSegmentBytes does the parsing,
 // as before (full-string strtoull; 0, garbage and overflow give `fallback`;
 // the result is aligned up, or 0 if that does not fit). This adds the report

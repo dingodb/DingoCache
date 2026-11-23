@@ -246,6 +246,22 @@ TEST(ServerEnv, RdmaIdleMsKeepsItsReading) {
   }
 }
 
+// DFKV_RDMA_GRANT_TIMEOUT_MS: 60 s by default, 0 = no bound (-1 here).
+TEST(ServerEnv, RdmaGrantTimeoutMs) {
+  struct Case { const char* value; int ms; };
+  const Case cases[] = {{nullptr, 60000},
+                        {"", 60000},
+                        {"1500", 1500},
+                        {"0", -1},
+                        {"99999999999", 86400000}};
+  for (const Case& c : cases) {
+    int ms = 0;
+    (void)LogOf("DFKV_RDMA_GRANT_TIMEOUT_MS", c.value,
+                [&] { ms = RdmaGrantTimeoutMsFromEnv(); });
+    EXPECT_EQ(ms, c.ms) << (c.value ? c.value : "(unset)");
+  }
+}
+
 // The receive-pool sizes: the line names the number that is used.
 TEST(ServerEnv, RecvBytesWarningNamesTheValueInUse) {
   constexpr size_t kDefault = 128ull << 30;

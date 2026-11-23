@@ -349,7 +349,7 @@ class RdmaServer {
       uring_init_fallbacks_{0};
   std::atomic<uint64_t> v2_conns_{0}, v2_put_writes_{0};
   std::atomic<uint64_t> completions_{0}, completion_errors_{0}, active_conns_{0},
-      idle_reclaims_{0};
+      idle_reclaims_{0}, grant_expiries_{0};
 };
 
 }  // namespace dfkv

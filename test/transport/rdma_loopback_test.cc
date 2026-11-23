@@ -28,6 +28,9 @@
 #include <sys/mman.h>  // shm_unlink (node-dedup test)
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <signal.h>
+
+extern char** environ;
 #include <unistd.h>
 
 #include <atomic>
@@ -128,6 +131,14 @@ class RdmaServerTestPeer {
   }
   static void FailPinnedRegistration(RdmaServer& server) {
     server.fail_pinned_registration_for_test_ = true;
+  }
+  // The held-grant gauges, read without building the metrics text: fast
+  // enough for a reply hook to act before the client has used its grant.
+  static uint64_t LeasePutActive(const RdmaServer& server) {
+    return server.lease_put_active_.load(std::memory_order_relaxed);
+  }
+  static uint64_t DynamicGetActive(const RdmaServer& server) {
+    return server.dynamic_get_active_.load(std::memory_order_relaxed);
   }
   static void SetAfterReplyPost(RdmaServer& server, std::function<void()> hook) {
     server.after_reply_post_for_test_ = std::move(hook);
@@ -4007,6 +4018,174 @@ TEST(RdmaLoopback, WindowPutsShareOneBatchArrivalUring) {
   ExerciseWindowPutsShareOneBatchArrival(true);
 }
 
+// A client that dies holding a grant: the server has sent a GET's READY and
+// waits for its RELEASE, or has staged a PUT lease and waits for its window.
+// A dead client sends nothing, so nothing wakes the connection, and the pin
+// or staging range was held until the connection's idle timeout
+// (DFKV_RDMA_IDLE_MS, 10 min by default, forever with 0). The client is a
+// separate process (this binary again, running only the helper below, so it
+// opens its own device context), killed by the server's reply hook right
+// after the grant went out. With DFKV_RDMA_GRANT_TIMEOUT_MS the connection is
+// closed once the grant has waited that long, and the gauge of held grants
+// goes back to 0.
+TEST(RdmaLoopbackChild, HoldsAGrantUntilKilled) {
+  const char* mode = std::getenv("DFKV_TEST_GRANT_CHILD");
+  const char* addr = std::getenv("DFKV_TEST_GRANT_ADDR");
+  const char* go = std::getenv("DFKV_TEST_GRANT_GO_FD");
+  if (mode == nullptr || addr == nullptr || go == nullptr)
+    GTEST_SKIP() << "helper process of GrantOfAKilledClient...";
+  char byte;
+  if (::read(std::atoi(go), &byte, 1) != 1) ::_exit(3);
+  RdmaTransport rt(1u << 20);
+  KVClient c({{"n", addr}}, SelfHdr(), &rt);
+  const std::string big(2 * 65536, 'L');
+  const std::string small(4096, 'g');
+  if (std::string(mode) == "lease") {
+    c.Put("grant-big", big.data(), big.size());
+  } else {
+    c.Put("grant-small", small.data(), small.size());
+    std::string out(small.size(), '\0');
+    c.Get("grant-small", out.data(), out.size());
+  }
+  for (;;) ::pause();  // the server kills us
+}
+
+// Starts this binary again, running only RdmaLoopbackChild.HoldsAGrantUntil-
+// Killed against `addr` (a fresh process: it opens its own device context).
+// It waits for StartGrantHolder before it connects.
+std::map<pid_t, int> g_grant_holder_go;
+pid_t SpawnGrantHolder(const std::string& addr, bool lease) {
+  int go[2];
+  if (::pipe(go) != 0) return -1;
+  // Everything the child needs is built before fork: it only execs.
+  std::vector<std::string> env_text;
+  for (char** e = environ; *e != nullptr; ++e) env_text.emplace_back(*e);
+  env_text.push_back(std::string("DFKV_TEST_GRANT_CHILD=") +
+                     (lease ? "lease" : "pull"));
+  env_text.push_back("DFKV_TEST_GRANT_ADDR=" + addr);
+  env_text.push_back("DFKV_TEST_GRANT_GO_FD=" + std::to_string(go[0]));
+  std::vector<char*> envp;
+  for (auto& e : env_text) envp.push_back(e.data());
+  envp.push_back(nullptr);
+  std::string self = "/proc/self/exe";
+  std::string filter = "--gtest_filter=RdmaLoopbackChild.HoldsAGrantUntilKilled";
+  char* argv[] = {self.data(), filter.data(), nullptr};
+  const pid_t child = ::fork();
+  if (child == 0) {
+    ::close(go[1]);
+    ::execve("/proc/self/exe", argv, envp.data());
+    ::_exit(4);
+  }
+  ::close(go[0]);
+  if (child < 0) {
+    ::close(go[1]);
+    return -1;
+  }
+  g_grant_holder_go[child] = go[1];
+  return child;
+}
+void StartGrantHolder(pid_t child) {
+  const int fd = g_grant_holder_go[child];
+  g_grant_holder_go.erase(child);
+  if (::write(fd, "x", 1) != 1) ADD_FAILURE() << "cannot start the client";
+  ::close(fd);
+}
+
+TEST(RdmaLoopback, GrantOfAKilledClientIsReleasedAfterTheGrantTimeout) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv inline_put("DFKV_RDMA_INLINE_PUT_MAX_BYTES", "65536");
+  ScopedEnv idle("DFKV_RDMA_IDLE_MS", "6000");
+  ScopedEnv grant("DFKV_RDMA_GRANT_TIMEOUT_MS", "500");
+  for (const bool lease : {true, false}) {
+    SCOPED_TRACE(lease ? "PUT lease" : "GET grant");
+    const char* gauge =
+        lease ? "dfkv_rdma_leaseput_active" : "dfkv_rdma_dynamic_get_active";
+    std::atomic<pid_t> victim{0};
+    std::atomic<bool> killed{false};
+    std::atomic<int64_t> killed_at_us{0};
+    auto now_us = [] {
+      return std::chrono::duration_cast<std::chrono::microseconds>(
+                 std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+    };
+    RdmaNode* node_ptr = nullptr;
+    RdmaNode node(lease ? "grant-lease" : "grant-pull", kMaxMsg, false, false,
+                  [&] {
+                    const pid_t pid = victim.load();
+                    if (pid <= 0 || killed.load() || node_ptr == nullptr)
+                      return;
+                    const RdmaServer& server = *node_ptr->rsrv;
+                    if ((lease ? RdmaServerTestPeer::LeasePutActive(server)
+                               : RdmaServerTestPeer::DynamicGetActive(server)) == 0)
+                      return;
+                    ::kill(pid, SIGKILL);
+                    killed_at_us.store(now_us());
+                    killed.store(true);
+                  });
+    node_ptr = &node;
+    const pid_t child = SpawnGrantHolder(node.addr, lease);
+    ASSERT_GT(child, 0);
+    victim.store(child);
+    StartGrantHolder(child);
+    const auto give_up =
+        std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (!killed.load() && std::chrono::steady_clock::now() < give_up)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    if (!killed.load()) ::kill(child, SIGKILL);
+    int status = 0;
+    ::waitpid(child, &status, 0);
+    ASSERT_TRUE(killed.load()) << "the grant was never observed";
+    // How long the server holds the dead client's grant.
+    while (CounterVal(node.rsrv->MetricsText(), gauge) > 0 &&
+           std::chrono::steady_clock::now() < give_up)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    const int64_t held_ms = (now_us() - killed_at_us.load()) / 1000;
+    std::printf("GRANT_HELD %s %lld ms after the client died\n",
+                lease ? "lease" : "pull", static_cast<long long>(held_ms));
+    EXPECT_EQ(CounterVal(node.rsrv->MetricsText(), gauge), 0);
+    EXPECT_LT(held_ms, 2500) << "held until the idle timeout, not the grant timeout";
+    EXPECT_EQ(CounterVal(node.rsrv->MetricsText(),
+                         "dfkv_rdma_grant_expiries_total"),
+              1);
+  }
+}
+
+// A multi-window PUT whose client stops between windows holds its partial
+// state until the grant timeout, not the idle timeout.
+TEST(RdmaLoopback, AMultiWindowPutStalledBetweenWindowsExpires) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv idle_reclaim("DFKV_RDMA_IDLE_MS", "60000");
+  ScopedEnv grant("DFKV_RDMA_GRANT_TIMEOUT_MS", "500");
+  RdmaNode node("grant-multiwr");
+  RdmaTransport rt(kMaxMsg);
+  const size_t max_sg = rt.MaxSgPayloadSegs();
+  ASSERT_GE(max_sg, 2u);
+  std::vector<std::string> src(max_sg + 7);
+  std::vector<const void*> ptrs;
+  std::vector<size_t> sizes;
+  for (size_t i = 0; i < src.size(); ++i) {
+    src[i].assign(97 + i % 11, static_cast<char>('a' + i % 26));
+    ptrs.push_back(src[i].data());
+    sizes.push_back(src[i].size());
+  }
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  {
+    ScopedEnv abort_window("DFKV_RDMA_TEST_ABORT_MULTIWR_WINDOW", "2");
+    const auto failed = c.BatchPutSg({{"stalled-multiwr", ptrs, sizes}});
+    ASSERT_EQ(failed.size(), 1u);
+    EXPECT_FALSE(failed[0]);
+  }
+  long expiries = 0;
+  for (int i = 0; i < 300 && expiries == 0; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    expiries = CounterVal(node.rsrv->MetricsText(),
+                          "dfkv_rdma_grant_expiries_total");
+  }
+  EXPECT_EQ(expiries, 1) << "the stalled PUT waited for the idle timeout";
+}
+
 TEST(RdmaLoopback, BatchPutOversizedFailsOnlyOffender) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   RdmaNode node("bpo");
@@ -7053,6 +7232,68 @@ TEST(RdmaLoopback, AsyncRangeManyKeepsDiskFollowerAndReadyRepliesOrdered) {
   EXPECT_EQ(CounterVal(node.rsrv->MetricsText(),
                        "dfkv_rdma_dynamic_get_mr_active"), 0);
   EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
+}
+
+// A batch GET whose first READY is out while a later read still waits on the
+// disk: the client RELEASEs only after the last READY, so the first grant
+// waits for as long as the disk does. That is not a silent client, and the
+// connection is not cut, however long the disk takes (here twice the grant
+// timeout).
+TEST(RdmaLoopback, AGrantWaitingForALaterSlowReadIsNotExpired) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "1");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  ScopedEnv grant("DFKV_RDMA_GRANT_TIMEOUT_MS", "300");
+  ScopedEnv op_timeout("DFKV_RDMA_OP_TIMEOUT_MS", "20000");
+  RdmaUringNode node("grant-slow-disk", kMaxMsg,
+                     [](ControlledRdmaUringBackend*) {});
+  const BlockKey first = ToBlockKey(SelfHdr(), "slow-first");
+  const BlockKey second = ToBlockKey(SelfHdr(), "slow-second");
+  const std::string a = PatternValue(8192, 31);
+  const std::string b = PatternValue(8192, 32);
+  std::string ignored;
+  for (const auto& item : {std::make_pair(first, &a), std::make_pair(second, &b)})
+    ASSERT_EQ(node.srv->ProcessRequestForKey(
+                  static_cast<uint8_t>(WireOp::kCache), item.first, 0, 0,
+                  item.second->data(), item.second->size(), &ignored),
+              Status::kOk);
+  RdmaTransport transport(kMaxMsg);
+  const std::vector<BlockKey> keys{first, second};
+  std::vector<std::string> outputs;
+  std::vector<uint64_t> value_lens;
+  auto result = std::async(std::launch::async, [&] {
+    return transport.RangeMany(node.addr, keys, 0, 8192, &outputs,
+                               &value_lens);
+  });
+  struct DrainOnFailure {
+    RdmaUringNode& node;
+    bool finished = false;
+    ~DrainOnFailure() {
+      if (finished) return;
+      for (const auto& submission : node.AggregateSubmissions())
+        submission.backend->CompleteRead(submission.request.token);
+      node.rsrv->Stop();
+    }
+  } drain{node};
+  ASSERT_TRUE(node.WaitForAggregateSubmitted(2));
+  const auto submissions = node.AggregateSubmissions();
+  ASSERT_EQ(submissions.size(), 2u);
+  // The first read lands: its READY goes out. The second waits.
+  ASSERT_TRUE(submissions[0].backend->CompleteRead(
+      submissions[0].request.token));
+  std::this_thread::sleep_for(std::chrono::milliseconds(700));
+  ASSERT_TRUE(submissions[1].backend->CompleteRead(
+      submissions[1].request.token));
+  ASSERT_EQ(result.wait_for(std::chrono::seconds(10)),
+            std::future_status::ready);
+  const auto statuses = result.get();
+  drain.finished = true;
+  EXPECT_EQ(statuses, (std::vector<Status>{Status::kOk, Status::kOk}));
+  EXPECT_EQ(outputs, (std::vector<std::string>{a, b}));
+  EXPECT_EQ(CounterVal(node.rsrv->MetricsText(),
+                       "dfkv_rdma_grant_expiries_total"),
+            0);
 }
 #endif
 
