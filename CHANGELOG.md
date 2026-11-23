@@ -3,6 +3,14 @@
 ## Unreleased
 
 
+- Design (no code): unavailable ring owners, in
+  `docs/design/ring-unavailable-owner.md`. Behind switches that default off:
+  a member that vanishes from the MDS view is kept as draining for a grace
+  period; writes for an owner in PeerHealth cooldown go to the next member,
+  with REMOVE fanned out to the key's successors; a server-side memory of
+  recent REMOVEs (one new op); and a miss read back once from the previous
+  owner, allowed only when that memory confirms the key was not removed.
+
 - Server, RDMA with io_uring: a request that arrives while a disk read is in
   flight is taken at once (RDS-11). The serve loop waited on the ring alone
   for up to 1 ms at a time and saw the request only then; measured, the
