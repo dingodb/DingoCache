@@ -255,6 +255,24 @@ class RdmaTransportTestPeer {
     return transport->Acquire(node, RdmaTransport::Lane::kData, options).conn;
   }
 
+  // A confirming dial (ConfirmRefusal's Acquire) on `rail`.
+  static RdmaTransport::Conn* AcquireRefusalCheck(RdmaTransport* transport,
+                                                  const std::string& node,
+                                                  size_t rail) {
+    RdmaTransport::AcquireOptions options;
+    options.excluded.assign(transport->devs_.size(), 1);
+    options.excluded[rail] = 0;
+    options.refusal_check = true;
+    return transport->Acquire(node, RdmaTransport::Lane::kControl, options)
+        .conn;
+  }
+  static void FailDials(RdmaTransport* transport, int count) {
+    transport->fail_dials_for_test_.store(count);
+  }
+  static bool ChargeRefusal(RdmaTransport* transport, const std::string& node,
+                            const std::string& health_id, size_t rail) {
+    return transport->ChargeRefusal(node, health_id, rail);
+  }
   static int QpAccessFlags(const RdmaTransport::Conn* conn) {
     return RdmaTransport::QpAccessFlags(conn);
   }
@@ -349,7 +367,7 @@ class RdmaTransportTestPeer {
         RdmaTransport::AcquireFailure::kEndpoint,
         replay_safe ? RdmaTransport::ReplaySafety::kReplaySafe
                     : RdmaTransport::ReplaySafety::kUnsafeAfterPost,
-        request_posted, peer, &excluded, &cross_rail);
+        request_posted, peer, "test-peer:1", &excluded, &cross_rail);
     return RetryDecision{retry, cross_rail, std::move(excluded)};
   }
 };
@@ -9324,4 +9342,169 @@ TEST(RdmaRemoteAccess, RegisteredMemoryIsPinnedOncePerRail) {
       << "a connection registered the pool again";
   EXPECT_EQ(rdma::RcEndpoint::AdhocUserMrTotal(), adhoc)
       << "an in-pool buffer took an ad-hoc registration";
+}
+
+// A peer whose rail matching our first one does not answer (here: the
+// server serves only our second rail), on a static ring (no MDS identity).
+// After the first failure on that rail, later operations go straight to the
+// rail that works instead of each trying the broken one first.
+namespace {
+uint64_t RailCounter(const std::string& text, const std::string& name,
+                     const std::string& dev) {
+  const std::string prefix = name + "{dev=\"" + dev + "\"} ";
+  const size_t at = text.find("\n" + prefix);
+  if (at == std::string::npos) return 0;
+  return std::stoull(text.substr(at + 1 + prefix.size()));
+}
+}  // namespace
+
+void RunPeerRailDown(bool named) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const char* devs = std::getenv("DFKV_RDMA_DEV");
+  const std::string list = devs ? devs : "";
+  const size_t comma = list.find(',');
+  if (comma == std::string::npos)
+    GTEST_SKIP() << "needs DFKV_RDMA_DEV with two rails";
+  const std::string first = list.substr(0, comma);
+  const std::string second = list.substr(comma + 1);
+  std::unique_ptr<RdmaNode> node;
+  {
+    ScopedEnv only_second("DFKV_RDMA_DEV", second.c_str());
+    node = std::make_unique<RdmaNode>("peer_rail_down");
+  }
+  RdmaTransport rt(kMaxMsg);
+  if (named) rt.OnPeerTopology(PublishedPeer(node->addr, "rail-down-peer"));
+  KVClient c({{"n", node->addr}}, SelfHdr(), &rt);
+  constexpr int kOps = 20;
+  int ok = 0;
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < kOps; ++i) {
+    const std::string value = "v" + std::to_string(i);
+    ok += c.Put("rail-down-" + std::to_string(i), value.data(), value.size()) ? 1 : 0;
+  }
+  const double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count();
+  const std::string text = rt.MetricsText();
+  const uint64_t broken_attempts =
+      RailCounter(text, "dfkv_rdma_client_rail_selections_total", first);
+  std::printf("[ rail-down ] named=%d ok=%d/%d ms=%.1f selections(%s)=%llu\n",
+              named ? 1 : 0, ok, kOps, ms, first.c_str(),
+              (unsigned long long)broken_attempts);
+  EXPECT_EQ(ok, kOps);
+  // The first operation's attempt and the confirming dial; no other.
+  EXPECT_LE(broken_attempts, 2u) << "every operation tried the broken rail";
+  EXPECT_NE(text.find("\ndfkv_rdma_client_rail_refusals_total 1\n"),
+            std::string::npos)
+      << "the refusal was not recorded";
+  EXPECT_EQ(CounterVal(text, "dfkv_rdma_client_peer_busy_total"), 1)
+      << "the confirming dial is not a busy peer";
+}
+
+// A confirmed refusal never cools a peer's last usable rail: of two rails,
+// the second refusal is not charged.
+TEST(RdmaPeerRailDown, ARefusalNeverCoolsAPeersLastRail) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const char* devs = std::getenv("DFKV_RDMA_DEV");
+  const std::string list = devs ? devs : "";
+  if (list.find(',') == std::string::npos)
+    GTEST_SKIP() << "needs DFKV_RDMA_DEV with two rails";
+  RdmaNode node("last-rail");
+  RdmaTransport rt(kMaxMsg);
+  rt.OnPeerTopology(PublishedPeer(node.addr, "last-rail-peer"));
+  EXPECT_TRUE(RdmaTransportTestPeer::ChargeRefusal(&rt, node.addr,
+                                                   "last-rail-peer", 0));
+  EXPECT_FALSE(RdmaTransportTestPeer::ChargeRefusal(&rt, node.addr,
+                                                    "last-rail-peer", 1));
+  EXPECT_EQ(CounterVal(rt.MetricsText(), "dfkv_rdma_client_rail_refusals_total"),
+            1);
+}
+
+// A confirming dial that does not get through within its short limit says
+// nothing about the node: it is not held unreachable, and the next
+// operation to it connects.
+TEST(RdmaPeerRailDown, ATimedOutRefusalCheckDoesNotHoldTheNode) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaNode node("refusal-check-timeout");
+  RdmaTransport rt(kMaxMsg);
+  for (const bool named : {false, true}) {
+    // Static: the capability probe's dial; named (capabilities cached once
+    // a connection exists): the bootstrap dial.
+    if (named) {
+      rt.OnPeerTopology(PublishedPeer(node.addr, "timeout-peer"));
+      auto* warm = RdmaTransportTestPeer::AcquireData(&rt, node.addr);
+      ASSERT_NE(warm, nullptr);
+      RdmaTransportTestPeer::ReleaseData(&rt, node.addr, warm);
+    }
+    RdmaTransportTestPeer::FailDials(&rt, 1);
+    EXPECT_EQ(RdmaTransportTestPeer::AcquireRefusalCheck(&rt, node.addr, 0),
+              nullptr);
+    const std::string text = rt.MetricsText();
+    EXPECT_EQ(CounterVal(text, "dfkv_rdma_client_peer_unreachable_total"), 0)
+        << (named ? "named" : "static");
+    EXPECT_EQ(CounterVal(text, "dfkv_rdma_client_peer_busy_total"), 0);
+    const std::vector<BlockKey> keys = {ToBlockKey(SelfHdr(), "absent")};
+    std::vector<char> exists;
+    EXPECT_NE(rt.ExistMany(node.addr, keys, &exists)[0], Status::kIOError)
+        << (named ? "named" : "static");
+  }
+}
+
+TEST(RdmaPeerRailDown, AStaticPeersBrokenRailIsAvoidedAfterItFails) {
+  RunPeerRailDown(/*named=*/false);
+}
+
+TEST(RdmaPeerRailDown, AnMdsNamedPeersBrokenRailIsAvoidedAfterItFails) {
+  RunPeerRailDown(/*named=*/true);
+}
+
+// A peer out of handshake slots closes a bootstrap before replying, as one
+// refusing the device does. The operation goes on on the other rail; the
+// confirming dial on the closed rail then gets through, so nothing is
+// charged.
+TEST(RdmaPeerRailDown, AFullPeerIsNotTakenForARefusal) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const char* devs = std::getenv("DFKV_RDMA_DEV");
+  const std::string list = devs ? devs : "";
+  const size_t comma = list.find(',');
+  if (comma == std::string::npos)
+    GTEST_SKIP() << "needs DFKV_RDMA_DEV with two rails";
+  const std::string first = list.substr(0, comma);
+  ScopedEnv primary("DFKV_RDMA_PRIMARY_DEV", first.c_str());
+  ScopedEnv numa("DFKV_RDMA_NUMA", "0");
+  RdmaNode node("full-not-refusing");
+  RdmaTransport rt(kMaxMsg);
+  RdmaTransportTestPeer::SetPeerBusyRetryUs(&rt, 200 * 1000);
+  // A named peer (its capabilities are cached) and a data connection first:
+  // the control connection below is then a bootstrap with our device frame,
+  // not a capability probe.
+  rt.OnPeerTopology(PublishedPeer(node.addr, "full-peer"));
+  auto* warm = RdmaTransportTestPeer::AcquireData(&rt, node.addr);
+  ASSERT_NE(warm, nullptr);
+  RdmaTransportTestPeer::ReleaseData(&rt, node.addr, warm);
+  for (int i = 0; i < 500 && node.rsrv->PendingHandshakes() != 0; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  ASSERT_EQ(node.rsrv->PendingHandshakes(), 0u);
+  RdmaServerTestPeer::SetMaxPendingHandshakes(node.rsrv.get(), 1);
+  // A peer that connects and sends nothing takes the only slot, and lets go
+  // once the server has refused the client once.
+  const int silent = net::Dial(node.addr, 2000, 2000);
+  ASSERT_GE(silent, 0);
+  for (int i = 0; i < 500 && node.rsrv->PendingHandshakes() != 1; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  ASSERT_EQ(node.rsrv->PendingHandshakes(), 1u);
+  std::thread releasing([&] {
+    while (node.rsrv->RejectedConnections() == 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    ::close(silent);
+  });
+  const std::vector<BlockKey> keys = {ToBlockKey(SelfHdr(), "absent")};
+  std::vector<char> exists;
+  const Status status = rt.ExistMany(node.addr, keys, &exists)[0];
+  releasing.join();
+  EXPECT_NE(status, Status::kIOError);
+  const std::string text = rt.MetricsText();
+  EXPECT_EQ(CounterVal(text, "dfkv_rdma_client_peer_busy_total"), 1);
+  EXPECT_EQ(CounterVal(text, "dfkv_rdma_client_rail_refusals_total"), 0);
+  EXPECT_EQ(CounterVal(text, "dfkv_rdma_client_remote_rail_cooldowns_total"),
+            0);
 }

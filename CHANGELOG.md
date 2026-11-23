@@ -3,6 +3,20 @@
 ## Unreleased
 
 
+- Client, RDMA: a peer rail that refuses our device is learned. Rails pair
+  by device name, so a server that does not serve the device of our first
+  rail closes the bootstrap before replying, which the client takes as
+  "busy": a pause, then the other rail. Nothing was charged, so every
+  operation paid that again (20 PUTs to such a peer took 1.16 s). When the
+  operation then connects to the peer on another rail, the client dials the
+  closed rail once more; if that is closed before a reply too, the rail is
+  charged as an endpoint failure and cools like one (with the usual
+  recovery probe); the same 20 PUTs take a few milliseconds. A peer out of
+  handshake slots or stopping is not mistaken for a refusal, and a peer's
+  last usable rail is never cooled this way. Peers without an MDS identity
+  (static members) are tracked by address for this. New
+  `dfkv_rdma_client_rail_refusals_total`.
+
 - Client, RDMA: client QPs grant no remote READ or WRITE, and the memory a
   client registers (`dfkv_register_memory`, the host KV pool) is registered
   for local access only. Since 2.31 servers never write into client memory

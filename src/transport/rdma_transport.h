@@ -16,6 +16,7 @@
 #include <memory>
 #include <map>
 #include <optional>
+#include <set>
 #include <limits>
 #include <mutex>
 #include <thread>
@@ -167,8 +168,22 @@ class RdmaTransport : public Transport {
     kReplaySafe,
     kUnsafeAfterPost,
   };
+  // State of one logical operation across its attempts. The operation owns
+  // it and passes it to every Acquire it makes.
+  struct OpState {
+    // The rail whose bootstrap the peer closed before replying (device frame
+    // sent) on this operation's first attempt.
+    std::optional<size_t> busy_closed_rail;
+  };
   struct AcquireOptions {
     bool force_new = false;
+    OpState* op = nullptr;
+    // A dial that only checks whether the peer refuses a rail's device
+    // (ConfirmRefusal): its close is not counted as the peer being busy.
+    // It also waits at most kRefusalCheckMs to connect and for each reply
+    // (a timeout confirms nothing), and charges no remote rail whatever
+    // happens: only ChargeRefusal does.
+    bool refusal_check = false;
     size_t requested_credits = 1;
     size_t required_data_bytes = 0;
     // Ask for the leased-PUT datapath on this connection: objects above the
@@ -195,6 +210,8 @@ class RdmaTransport : public Transport {
     std::optional<size_t> attempted_rail;
     AcquireFailure failure = AcquireFailure::kAdmission;
     Status status = Status::kIOError;
+    // The peer closed the bootstrap after our device frame, before replying.
+    bool device_frame_closed = false;
   };
   // Data operations share one endpoint pool because Acquire gives one logical
   // operation exclusive connection ownership until Release. The enum retains
@@ -211,7 +228,28 @@ class RdmaTransport : public Transport {
       int attempt, bool from_pool, std::optional<size_t> attempted_rail,
       AcquireFailure failure, ReplaySafety replay_safety, bool request_posted,
       const std::shared_ptr<const rdma::PeerRailSnapshot>& peer,
-      RailMask* excluded, bool* cross_rail_retry);
+      const std::string& node, RailMask* excluded, bool* cross_rail_retry);
+  // A new connection to a peer on `rail`. If this operation's first attempt
+  // was closed on another rail, that rail may refuse our device: it is
+  // dialed again (ConfirmRefusal) and charged only if closed again.
+  void NoteConnected(const AcquireOptions& options, const std::string& node,
+                     const std::string& health_id, size_t rail);
+  void ConfirmRefusal(const std::string& node, const std::string& health_id,
+                      size_t rail);
+  // Cools `rail` of the peer for a confirmed refusal unless it is the
+  // peer's last usable rail. True if charged.
+  bool ChargeRefusal(const std::string& node, const std::string& health_id,
+                     size_t rail);
+  static constexpr int kRefusalCheckMs = 300;
+  // The identity remote rail health keys a peer by (see Conn::health_id).
+  static std::string HealthIdLabel(const std::string& health_id) {
+    return RemoteRailHealth::IsAddressIdentity(health_id) ? health_id.substr(1)
+                                                         : health_id;
+  }
+  static std::string HealthId(const std::string& peer_id,
+                              const std::string& node) {
+    return peer_id.empty() ? RemoteRailHealth::AddressIdentity(node) : peer_id;
+  }
   void Release(const std::string& node, Lane lane, Conn* c,
                RemoteRailOutcome remote_outcome =
                    RemoteRailOutcome::kSuccess,
@@ -283,7 +321,8 @@ class RdmaTransport : public Transport {
     kRejected,     // timed out, or answered without the required capabilities
   };
   ProbeResult ProbeV2(const std::string& node,
-                      bool* leased_put_supported = nullptr) const;
+                      bool* leased_put_supported = nullptr,
+                      int timeout_ms = 0) const;  // 0: connect_ms_, io_ms_
   // A buffer of the caller could not be registered on `c`. Marks the
   // connection so that its teardown charges neither rail nor peer.
   void NoteLocalRegistrationFailure(Conn* c, size_t bytes);
@@ -449,6 +488,10 @@ class RdmaTransport : public Transport {
   std::atomic<uint64_t> peer_unreachable_skips_{0};
   std::atomic<uint64_t> peer_unreachable_{0};
   std::atomic<uint64_t> peer_busy_{0};
+  std::atomic<uint64_t> rail_refusals_{0};  // see NoteConnected
+  std::mutex refusal_mu_;
+  // (peer, rail) pairs with a confirming dial in flight: one at a time.
+  std::set<std::pair<std::string, size_t>> refusal_checks_;
   std::atomic<uint64_t> local_resource_failures_{0};
   // Endpoint opens refused for lack of descriptors or memory whose operation
   // was then served on another rail.
@@ -461,6 +504,9 @@ class RdmaTransport : public Transport {
   std::unique_ptr<std::atomic<uint64_t>[]> enomem_until_us_;
   // Tests: the errno an endpoint open on this rail fails with (0 = none).
   std::vector<int> fail_open_errno_for_test_;
+  // Test seam: this many more bootstrap dials fail as a timeout would.
+  mutable std::atomic<int> fail_dials_for_test_{0};
+  int DialNode(const std::string& node, int connect_ms, int io_ms) const;
   std::atomic<uint64_t> cross_rail_retries_{0};
   std::atomic<uint64_t> cross_rail_retry_successes_{0};
   std::atomic<uint64_t> cross_rail_retry_exhausted_{0};
