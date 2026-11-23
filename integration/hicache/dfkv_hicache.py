@@ -2018,7 +2018,38 @@ class DfkvHiCache(HiCacheStorage):
         for pool in self._retain_side_pools():
             for k in keys:
                 sks.extend(self._stored_keys(pool, k))
+        sks.extend(self._retain_draft_keys(keys))
         return sks
+
+    def _retain_draft_keys(self, keys) -> List[bytes]:
+        """The EAGLE draft KV objects of these pages that this rank writes.
+
+        A draft write applies its TTL like every write; without these keys a
+        touch renewed the target's KV and never the draft's, so the draft
+        expired first and loaded pages ran without it. Its layout (objects
+        and SG groups per page) is known once this process has moved a
+        draft page; before that the draft is not renewed.
+        """
+        if not self._rank_writes_draft():
+            return []
+        sub, chunks = self._draft_layout
+        return [self._sg_group_key(sk, ci) for k in keys
+                for sk in self._draft_keys(k, sub) for ci in range(chunks)]
+
+    def _retain_draft_count(self, npages: int) -> int:
+        """How many of _retain_object_keys' keys (the last ones) are draft."""
+        if not self._rank_writes_draft():
+            return 0
+        sub, chunks = self._draft_layout
+        return npages * sub * chunks
+
+    def _rank_writes_draft(self) -> bool:
+        """Whether this rank writes draft KV objects (layout known)."""
+        layout = getattr(self, "_draft_layout", None)
+        if layout is None or getattr(self, "mem_pool_device_draft", None) is None:
+            return False
+        # A replicated (one-object) draft is written by the replica writer.
+        return layout[0] != 1 or self._rank_writes_kv()
 
     def retain_owns_objects(self) -> bool:
         """Whether this rank writes any object and so must vote on a TTL.
@@ -2032,7 +2063,9 @@ class DfkvHiCache(HiCacheStorage):
                 and not getattr(self, "_pool_component_names", None)):
             raise RuntimeError(
                 "retain_owns_objects() called before any HiCache pool was registered")
-        return self._rank_writes_kv() or next(self._retain_side_pools(), None) is not None
+        return (self._rank_writes_kv()
+                or next(self._retain_side_pools(), None) is not None
+                or self._rank_writes_draft())
 
     # Prefixes batch_touch protected recently: identity -> (ttl, monotonic s).
     _TOUCH_DEBOUNCE_MAX = 4096
@@ -2106,7 +2139,8 @@ class DfkvHiCache(HiCacheStorage):
             # was not protected in the form written later.
             prefix = (len(keys), keys[0], keys[-1], hash(tuple(keys)),
                       self._device_direct_active(),
-                      tuple(sorted(getattr(self, "_sg_chunks", {}).items())))
+                      tuple(sorted(getattr(self, "_sg_chunks", {}).items())),
+                      getattr(self, "_draft_layout", None))
             if self._touch_is_fresh(prefix, ttl):
                 return
         sks = self._retain_object_keys(keys)
@@ -2123,7 +2157,11 @@ class DfkvHiCache(HiCacheStorage):
                 if all(c in dfkv_cabi.RETAIN_PROTECTED_CODES
                        or c == dfkv_cabi.DFKV_RET_MISS for c in codes):
                     self._touch_note(prefix, ttl)
-                missing = [sk for sk, c in zip(sks, codes)
+                # Draft objects (last in sks) are not parked: a draft page is
+                # written best-effort, so a missing one may never be, and
+                # parking it on every touch would fill the table.
+                parkable = len(sks) - self._retain_draft_count(len(keys))
+                missing = [sk for sk, c in zip(sks[:parkable], codes)
                            if c == dfkv_cabi.DFKV_RET_MISS]
                 if missing:
                     with self._pending_lock:
@@ -3053,6 +3091,7 @@ class DfkvHiCache(HiCacheStorage):
             stride, sks, sp, ss = self._flatten_device(
                 keys, seg_ptrs, seg_sizes,
                 keys_fn=lambda h: self._draft_keys(h, sub), sub=sub, pool=None)
+            self._draft_layout = (sub, stride // sub)
             flat, recovered = self._put_sg_flat(sks, sp, ss)
             res = self._fold(flat, n, stride)
             r.result = f"ok {sum(res)}/{n} (draft device-direct)"
@@ -3083,6 +3122,7 @@ class DfkvHiCache(HiCacheStorage):
             stride, sks, sp, sc = self._flatten_device(
                 keys, seg_ptrs, seg_caps,
                 keys_fn=lambda h: self._draft_keys(h, sub), sub=sub, pool=None)
+            self._draft_layout = (sub, stride // sub)
             want = [sum(c) for c in sc]
             hits, lens = self._batch_get_sg(sks, sp, sc)
             flat_ok = [hits[i] == 1 and lens[i] >= want[i] for i in range(len(sks))]
