@@ -268,6 +268,13 @@ class RcEndpoint {
   bool PostRead(size_t slot, void* destination, size_t length,
                 ibv_mr* destination_mr, uint64_t remote_addr,
                 uint32_t remote_rkey);
+  // One READ of a contiguous remote range into several local segments
+  // (count <= ReadSge()).
+  bool PostReadSg(size_t slot, const ibv_sge* sges, size_t count,
+                  uint64_t remote_addr, uint32_t remote_rkey);
+  // Local segments one READ may scatter into: the device's max_sge_rd, at
+  // most the QP's send SGE count.
+  size_t ReadSge() const { return std::max<size_t>(1, std::min(read_sge_, max_sge_)); }
   bool PostWrite(size_t slot, const void* source, size_t length,
                  ibv_mr* source_mr, uint64_t remote_addr,
                  uint32_t remote_rkey);
@@ -356,6 +363,7 @@ class RcEndpoint {
   size_t cap_ = 0, depth_ = 0, dbuf_cap_ = 0;
   uint16_t remote_depth_ = 0;  // Set from the required v2 QP advertisement.
   size_t max_sge_ = 2;  // QP max_send_sge/max_recv_sge = min(kMaxSge, device cap)
+  size_t read_sge_ = 1;  // device max_sge_rd (ReadSge)
   std::vector<char*> sbuf_, rbuf_, dbuf_;
   std::vector<ibv_mr*> smr_, rmr_, dmr_;
   // Big pre-registered caller regions (the host KV pool). Each cache entry owns

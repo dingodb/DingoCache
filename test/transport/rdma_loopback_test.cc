@@ -10546,3 +10546,88 @@ TEST(RdmaSession, FirstOperationAfterReclaimBench) {
   }
 }
 }  // namespace
+
+// A scatter-gather GET reads several destination segments per READ (up to
+// the device's max_sge_rd) instead of one READ per segment. 61 segments of
+// unequal, odd sizes, with empty ones in the middle and at the end, some
+// outside the registered pool, and a value that ends inside the last
+// non-empty segment: every byte lands where it belongs, with
+// ceil(non-empty segments / ReadSge) READs, not one per segment. Two keys
+// in one call keep their own segment and MR state across READ rounds.
+TEST(RdmaSgRead, ManySegmentsPerReadLandExactly) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const char* devs = std::getenv("DFKV_RDMA_DEV");
+  const std::string first =
+      devs ? std::string(devs).substr(0, std::string(devs).find(',')) : "";
+  size_t read_sge = 1;
+  {
+    rdma::RcEndpoint probe;
+    ASSERT_TRUE(probe.Open(first.empty() ? nullptr : first.c_str(), 4096, 1));
+    read_sge = probe.ReadSge();
+  }
+  RdmaNode node("sg-read-many", 1u << 20);
+  RdmaTransport rt(1u << 20, first);
+  constexpr size_t kSegs = 61;
+  constexpr size_t kKeys = 2;
+  std::vector<size_t> sizes;
+  size_t total = 0, non_empty = 0;
+  for (size_t s = 0; s < kSegs; ++s) {
+    // Empty segments in the middle and the last one empty too.
+    const bool empty = s == 10 || s == 11 || s == 40 || s == kSegs - 1;
+    sizes.push_back(empty ? 0 : 97 + 31 * s);
+    total += sizes.back();
+    non_empty += empty ? 0 : 1;
+  }
+  const size_t value_len = total - 50;  // ends inside the last non-empty one
+  std::vector<std::string> values(kKeys, std::string(value_len, '\0'));
+  std::vector<BlockKey> keys;
+  for (size_t k = 0; k < kKeys; ++k) {
+    for (size_t i = 0; i < value_len; ++i)
+      values[k][i] = static_cast<char>((i * 131 + 7 + 59 * k) & 0xff);
+    keys.push_back(ToBlockKey(SelfHdr(), "sg-many-" + std::to_string(k)));
+    ASSERT_EQ(rt.Cache(node.addr, keys[k], values[k].data(), value_len),
+              Status::kOk);
+  }
+  // Segments spread over a registered region and a loose one, each followed
+  // by a guard byte that must stay untouched.
+  std::vector<char> pooled(kKeys * (total + kSegs), 'G');
+  std::vector<char> loose(kKeys * (total + kSegs), 'G');
+  ASSERT_TRUE(rt.RegisterMemory(pooled.data(), pooled.size()));
+  std::vector<RangeDstMulti> dsts(kKeys);
+  size_t pooled_at = 0, loose_at = 0;
+  for (size_t k = 0; k < kKeys; ++k) {
+    for (size_t s = 0; s < kSegs; ++s) {
+      char* at =
+          s % 3 == 2 ? loose.data() + loose_at : pooled.data() + pooled_at;
+      (s % 3 == 2 ? loose_at : pooled_at) += sizes[s] + 1;
+      dsts[k].payloads.emplace_back(at, sizes[s]);
+    }
+  }
+  const auto reads = [&] {
+    return CounterVal(rt.MetricsText(), "dfkv_rdma_client_pull_read_wrs_total");
+  };
+  const long before = reads();
+  std::vector<size_t> lens;
+  const auto statuses = rt.RangeIntoMulti(node.addr, keys, dsts, &lens);
+  const long posted = reads() - before;
+  for (size_t k = 0; k < kKeys; ++k) {
+    SCOPED_TRACE(k);
+    ASSERT_EQ(statuses[k], Status::kOk);
+    EXPECT_EQ(lens[k], value_len);
+    size_t offset = 0;
+    for (size_t s = 0; s < kSegs; ++s) {
+      const char* at = static_cast<const char*>(dsts[k].payloads[s].first);
+      const size_t want =
+          std::min(sizes[s], value_len - std::min(value_len, offset));
+      ASSERT_EQ(std::memcmp(at, values[k].data() + offset, want), 0)
+          << "segment " << s;
+      EXPECT_EQ(at[sizes[s]], 'G') << "guard after segment " << s;
+      offset += sizes[s];
+    }
+  }
+  if (read_sge == 1) GTEST_SKIP() << "the device reads into one segment per READ";
+  const long per_key = static_cast<long>((non_empty + read_sge - 1) / read_sge);
+  EXPECT_EQ(posted, static_cast<long>(kKeys) * per_key)
+      << "READs for " << kKeys << " keys of " << non_empty
+      << " non-empty segments with ReadSge " << read_sge;
+}

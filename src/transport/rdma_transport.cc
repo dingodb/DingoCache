@@ -3041,6 +3041,10 @@ std::string RdmaTransport::MetricsText() const {
   s += "# TYPE dfkv_rdma_client_pull_reads_total counter\n";
   s += "dfkv_rdma_client_pull_reads_total " +
        std::to_string(pull_reads_.load(std::memory_order_relaxed)) + "\n";
+  s += "# HELP dfkv_rdma_client_pull_read_wrs_total READ work requests posted (one may scatter into several destination segments)\n";
+  s += "# TYPE dfkv_rdma_client_pull_read_wrs_total counter\n";
+  s += "dfkv_rdma_client_pull_read_wrs_total " +
+       std::to_string(pull_read_wrs_.load(std::memory_order_relaxed)) + "\n";
   s += "# HELP dfkv_rdma_client_pull_read_bytes_total Bytes completed by initiator READ\n";
   s += "# TYPE dfkv_rdma_client_pull_read_bytes_total counter\n";
   s += "dfkv_rdma_client_pull_read_bytes_total " +
@@ -4018,7 +4022,7 @@ bool RdmaTransport::PullWindow(
     rdma::DynamicPullReady ready{};
     size_t copied = 0;
     size_t segment = 0;
-    ibv_mr* mr = nullptr;
+    std::vector<ibv_mr*> mrs;  // this round's destination registrations
     size_t bytes = 0;
     bool grant = false;
   };
@@ -4095,6 +4099,9 @@ bool RdmaTransport::PullWindow(
 
   // One READ per live item per round preserves depth-wide pipelining without
   // exceeding the endpoint's send-WR window for scatter-gather destinations.
+  const size_t read_sge = ep.ReadSge();
+  std::vector<ibv_sge> sges;
+  sges.reserve(read_sge);
   CompletionDeadline deadline(timeout_ms);
   for (;;) {
     size_t posted = 0;
@@ -4104,24 +4111,39 @@ bool RdmaTransport::PullWindow(
       if (request.status != Status::kOk ||
           state.copied == request.data_len)
         continue;
-      while (state.segment < request.segment_count &&
-             request.segments[state.segment].second == 0)
-        ++state.segment;
-      if (state.segment == request.segment_count) return malformed();
-      const auto& segment = request.segments[state.segment++];
-      state.bytes = std::min<size_t>(
-          segment.second, request.data_len - state.copied);
-      // A READ destination: this side's NIC writes it, no peer does.
-      state.mr = ep.RegisterTransient(
-          segment.first, state.bytes,
-          rdma::RcEndpoint::TransientAccess::kLocalWrite);
-      if (!state.mr) {
-        NoteLocalRegistrationFailure(conn, state.bytes);
-        return false;
+      // One READ covers as many of the destination's segments as the device
+      // scatters into (ReadSge): the remote range is contiguous.
+      state.bytes = 0;
+      sges.clear();
+      while (sges.size() < read_sge &&
+             state.copied + state.bytes < request.data_len &&
+             state.segment < request.segment_count) {
+        const auto& segment = request.segments[state.segment++];
+        if (segment.second == 0) continue;
+        const size_t bytes = std::min<size_t>(
+            segment.second, request.data_len - state.copied - state.bytes);
+        // A READ destination: this side's NIC writes it, no peer does.
+        ibv_mr* mr = ep.RegisterTransient(
+            segment.first, bytes,
+            rdma::RcEndpoint::TransientAccess::kLocalWrite);
+        if (!mr) {
+          NoteLocalRegistrationFailure(conn, bytes);
+          return false;
+        }
+        state.mrs.push_back(mr);
+        ibv_sge sge{};
+        sge.addr = reinterpret_cast<uintptr_t>(segment.first);
+        sge.length = static_cast<uint32_t>(bytes);
+        sge.lkey = mr->lkey;
+        sges.push_back(sge);
+        state.bytes += bytes;
       }
-      if (!ep.PostRead(slot, segment.first, state.bytes, state.mr,
-                       state.ready.address + state.copied, state.ready.rkey))
+      if (sges.empty()) return malformed();
+      if (!ep.PostReadSg(slot, sges.data(), sges.size(),
+                         state.ready.address + state.copied,
+                         state.ready.rkey))
         return false;
+      pull_read_wrs_.fetch_add(1, std::memory_order_relaxed);
       ++posted;
       // Abandon an actually posted READ so Destroy must fence its destination.
       if (InjectPullReadFailure()) return malformed();
@@ -4143,9 +4165,9 @@ bool RdmaTransport::PullWindow(
     }
     for (size_t slot = 0; slot < width; ++slot) {
       auto& state = states[slot];
-      if (!state.mr) continue;
-      ep.ReleaseTransient(state.mr);
-      state.mr = nullptr;
+      if (state.mrs.empty()) continue;
+      for (ibv_mr* mr : state.mrs) ep.ReleaseTransient(mr);
+      state.mrs.clear();
       state.copied += state.bytes;
       pull_read_bytes_.fetch_add(state.bytes, std::memory_order_relaxed);
     }

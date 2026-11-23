@@ -372,6 +372,9 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
       max_sge_ = std::min(kMaxSge, cap_sge);
       if (max_sge_ < 2) max_sge_ = 2;
       max_qp_wr = dev_attr.max_qp_wr;
+      read_sge_ = dev_attr.max_sge_rd > 0
+                      ? static_cast<size_t>(dev_attr.max_sge_rd)
+                      : 1;
     } else {
       max_sge_ = kMaxSge;  // query failed: let ibv_create_qp validate the caps
     }
@@ -922,6 +925,22 @@ bool RcEndpoint::PostRecvScatterMulti(
   wr.wr_id = slot; wr.sg_list = sge.data();
   wr.num_sge = static_cast<int>(sge.size());
   return ibv_post_recv(qp_, &wr, &bad) == 0;
+}
+
+bool RcEndpoint::PostReadSg(size_t slot, const ibv_sge* sges, size_t count,
+                            uint64_t remote_addr, uint32_t remote_rkey) {
+  if (slot >= depth_ || count == 0 || count > ReadSge() || !sges ||
+      remote_addr == 0 || remote_rkey == 0)
+    return false;
+  ibv_send_wr wr{}, *bad = nullptr;
+  wr.wr_id = slot;
+  wr.sg_list = const_cast<ibv_sge*>(sges);
+  wr.num_sge = static_cast<int>(count);
+  wr.opcode = IBV_WR_RDMA_READ;
+  wr.send_flags = IBV_SEND_SIGNALED;
+  wr.wr.rdma.remote_addr = remote_addr;
+  wr.wr.rdma.rkey = remote_rkey;
+  return ibv_post_send(qp_, &wr, &bad) == 0;
 }
 
 bool RcEndpoint::PostRead(size_t slot, void* destination, size_t length,
