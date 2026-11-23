@@ -3789,7 +3789,11 @@ static void ExerciseFifoOrderAndWrap() {
                          slot == 0 ? 3 : (slot == 2 ? 7 : 0)));
   ASSERT_TRUE(wait_state(
       [](const HeldReplyCqe& state) { return state.held.size() == 4; }));
-  ASSERT_EQ(reorder.depth, 4u);
+  {
+    // The serve thread writes depth on every poll, under the lock.
+    std::lock_guard<std::mutex> lock(reorder.mu);
+    ASSERT_EQ(reorder.depth, 4u);
+  }
   ASSERT_TRUE(post(0, 4));  // B0: absent.
   ASSERT_TRUE(post(1, 5));  // B1: 11-byte present value.
   ASSERT_TRUE(wait_state([](const HeldReplyCqe& state) {
