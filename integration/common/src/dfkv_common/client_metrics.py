@@ -110,6 +110,8 @@ _COUNTERS: dict[str, tuple[str, ...]] = {
     "dfkv_rdma_client_no_compatible_rail_total": (),
     "dfkv_rdma_client_admission_failures_total": (),
     "dfkv_rdma_client_local_resource_failures_total": (),
+    "dfkv_rdma_client_local_resource_rail_fallbacks_total": (),
+    "dfkv_rdma_client_local_resource_held_total": (),
     "dfkv_rdma_client_rail_wc_errors_total": ("dev", "status"),
     "dfkv_rdma_client_cross_rail_retries_total": (),
     "dfkv_rdma_client_cross_rail_retry_successes_total": (),
