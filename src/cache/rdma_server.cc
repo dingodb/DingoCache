@@ -965,6 +965,14 @@ void RdmaServer::Serve(
     std::atomic<uint64_t>* active_count = nullptr;
     std::atomic<uint64_t>* active_bytes = nullptr;
     ~PullSlotState() { Reset(); }
+    // The staging range alone, when the client reads the value from
+    // elsewhere (the RAM arena).
+    void ReleaseStaging() {
+      if (!lease) return;
+      active_bytes->fetch_sub(lease.size(), std::memory_order_relaxed);
+      active_count->fetch_sub(1, std::memory_order_relaxed);
+      lease.Reset();
+    }
     void Reset() {
       arena_read = PreparedRead{};
       if (lease) {
@@ -1345,6 +1353,15 @@ void RdmaServer::Serve(
           const_cast<char*>(output), std::max<size_t>(output_len, 1));
     }
     if (!state.mr) return error_reply(Status::kIOError);
+    // Served from outside the staging range (a coalesced follower reading
+    // the arena, a RAM hit through the prepared read): the staging lease is
+    // not needed until the RELEASE, so it goes back to the pool now.
+    if (output_len != 0 && state.lease) {
+      const auto at = reinterpret_cast<uintptr_t>(output);
+      const auto begin = reinterpret_cast<uintptr_t>(state.lease.data());
+      if (at < begin || at - begin >= state.lease.size())
+        state.ReleaseStaging();
+    }
     // Publish disk/coalescer completion before READY; followers must not wait
     // for the client's RELEASE. Its post-read hold stays owned by the grant.
     if (prepared.needs_io())
@@ -1466,6 +1483,16 @@ void RdmaServer::Serve(
       }
       // RAM hits own only a pin and exact READ registration, no staging lease.
       if (try_pinned_pull(send_slot, request, slot, reply)) return true;
+      // A key the node does not have needs no staging: under receive-pool
+      // pressure a miss used to wait for memory, or take another client's
+      // idle connection, only to read nothing.
+      if (lookup_handler_ && fields.length != 0 &&
+          lookup_handler_(key) == Status::kNotFound) {
+        unstaged_misses_.fetch_add(1, std::memory_order_relaxed);
+        encode_status(Status::kNotFound, 0);
+        reply->first_len = response_prefix;
+        return true;
+      }
       // Keep zero-length slice semantics on the real range handler. The old
       // WRITE path supplied a connection-sized aligned scratch region even
       // with no client target; capacity zero would introduce disk I/O errors.
@@ -1973,6 +2000,15 @@ void RdmaServer::Serve(
                             &qd.reply)) {
           handled = true;
           qd.ready = true;
+        } else if (lookup_handler_ &&
+                   lookup_handler_(fields.Key()) == Status::kNotFound) {
+          // As in build_reply: a miss needs no staging.
+          unstaged_misses_.fetch_add(1, std::memory_order_relaxed);
+          EncodeRespVersion(ep.sbuf(qd.send_slot), wire_epoch,
+                            Status::kNotFound, 0, 0);
+          qd.reply.first_len = response_prefix;
+          handled = true;
+          qd.ready = true;
         } else {
           PullSlotState& state = pull_slots[control.slot_index];
           const size_t capacity = rdma::V2SlotSize(fields.length);
@@ -2450,10 +2486,12 @@ std::string RdmaServer::MetricsText() const {
     "RAM arena hits that fell back to a staged copy because the per-read MR could not be registered",
     pull_zerocopy_register_failures_);
   m(s, "dfkv_rdma_dynamic_get_active", "gauge",
-    "In-flight dynamic GET staging operations currently held",
+    "GET staging leases held now: from the grant until the RELEASE, or "
+    "until the READY for a GET the client reads from the RAM arena",
     dynamic_get_active_);
   m(s, "dfkv_rdma_dynamic_get_bytes_active", "gauge",
-    "Receive-pool bytes held by in-flight dynamic GET staging",
+    "Receive-pool bytes of the GET staging leases held now (from the grant "
+    "until the RELEASE, or until the READY for an arena-served GET)",
     dynamic_get_bytes_active_);
   m(s, "dfkv_rdma_dynamic_get_mr_active", "gauge",
     "Process-wide exact dynamic GET READ registrations currently held",
@@ -2464,6 +2502,9 @@ std::string RdmaServer::MetricsText() const {
   m(s, "dfkv_rdma_segment_evictions_total", "counter",
      "Connections evicted to free shared receive segment space",
      segment_evictions_.load(std::memory_order_relaxed));
+  m(s, "dfkv_rdma_unstaged_misses_total", "counter",
+    "GETs answered kNotFound by an existence check, without a staging lease",
+    unstaged_misses_.load(std::memory_order_relaxed));
   m(s, "dfkv_rdma_stop_grants_refused_total", "counter",
     "GET READYs and PUT leases refused (as a miss, or kCacheFull) while "
     "stopping, so that the drain waits only for the grants in flight",

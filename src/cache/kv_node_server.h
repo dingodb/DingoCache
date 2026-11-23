@@ -158,6 +158,9 @@ class KvNodeServer {
   // descriptor validation. RAM is authoritative while a write-back value is
   // visible but not yet committed to disk.
   Status LookupForKey(const BlockKey& key, ValueMetadata* out) const;
+  // A GET's existence check before the RDMA server gives it a staging
+  // buffer: a miss is counted as the read would have counted it.
+  Status LookupForGet(const BlockKey& key);
 
 
   // Zero-copy server-side GET: read the block straight into `dst` (e.g. the RDMA

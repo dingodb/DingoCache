@@ -136,6 +136,7 @@ bool RecvSegment::Init(size_t bytes, size_t alignment, int numa_node,
   size_ = bytes;
   alignment_ = alignment;
   free_.emplace(0, bytes);
+  empty_since_ms_ = SteadyMs();
   return true;
 }
 
@@ -161,6 +162,8 @@ RecvSegment::Lease RecvSegment::Allocate(size_t bytes, size_t alignment) {
     free_.erase(it);
     if (begin > range_begin) free_.emplace(range_begin, begin - range_begin);
     if (end < range_end) free_.emplace(end, range_end - end);
+    used_ += bytes;
+    empty_since_ms_ = 0;
     return Lease(this, begin, bytes);
   }
   allocation_failures_.fetch_add(1, std::memory_order_relaxed);
@@ -168,6 +171,11 @@ RecvSegment::Lease RecvSegment::Allocate(size_t bytes, size_t alignment) {
 }
 
 size_t RecvSegment::free_bytes() const { return stats().free_bytes; }
+
+uint64_t RecvSegment::EmptySinceMs() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return used_ == 0 ? empty_since_ms_ : 0;
+}
 
 RecvSegment::Stats RecvSegment::stats() const {
   std::lock_guard<std::mutex> lock(mu_);
@@ -203,6 +211,8 @@ void RecvSegment::Release(size_t offset, size_t bytes) {
     free_.erase(next);
   }
   free_.emplace(begin, end - begin);
+  used_ -= bytes;
+  if (used_ == 0) empty_since_ms_ = SteadyMs();
 }
 
 RecvSegmentPool::Lease::Lease(Lease&& other) noexcept
@@ -228,12 +238,9 @@ RecvSegmentPool::Lease& RecvSegmentPool::Lease::operator=(
 RecvSegmentPool::Lease::~Lease() { Reset(); }
 
 void RecvSegmentPool::Lease::Reset() {
-  RecvSegmentPool* pool = pool_;
-  RecvSegment* segment = segment_;
   lease_.Reset();
   pool_ = nullptr;
   segment_ = nullptr;
-  if (pool && segment) pool->NoteRelease(segment);
 }
 
 bool RecvSegmentPool::Init(size_t chunk_bytes, size_t max_bytes,
@@ -299,22 +306,14 @@ std::unique_ptr<RecvSegmentPool::Chunk> RecvSegmentPool::NewChunk(
   return chunk;
 }
 
-RecvSegmentPool::Lease RecvSegmentPool::Allocate(size_t bytes,
-                                                 size_t alignment,
-                                                 int affinity,
-                                                 int numa_node,
-                                                 LeaseClass lease_class) {
-  if (bytes == 0 || !IsPowerOfTwo(alignment)) return {};
-  std::lock_guard<std::mutex> lock(mu_);
+RecvSegmentPool::Lease RecvSegmentPool::AllocateFromChunks(
+    size_t bytes, size_t alignment, int affinity, LeaseClass lease_class) {
   auto try_chunks = [&](int wanted_affinity, bool staging_only) -> Lease {
     for (const auto& chunk : chunks_) {
       if (chunk->affinity != wanted_affinity ||
           chunk->staging_only != staging_only) continue;
       auto lease = chunk->segment->Allocate(bytes, alignment);
-      if (lease) {
-        chunk->empty_since_ms = 0;
-        return Lease(this, chunk->segment.get(), std::move(lease));
-      }
+      if (lease) return Lease(this, chunk->segment.get(), std::move(lease));
     }
     return {};
   };
@@ -326,8 +325,18 @@ RecvSegmentPool::Lease RecvSegmentPool::Allocate(size_t bytes,
     auto lease = try_chunks(affinity, false);
     if (lease) return lease;
   }
-  auto shared = try_chunks(-1, false);
-  if (shared) return shared;
+  return try_chunks(-1, false);
+}
+
+RecvSegmentPool::Lease RecvSegmentPool::Allocate(size_t bytes,
+                                                 size_t alignment,
+                                                 int affinity,
+                                                 int numa_node,
+                                                 LeaseClass lease_class) {
+  if (bytes == 0 || !IsPowerOfTwo(alignment)) return {};
+  std::lock_guard<std::mutex> lock(mu_);
+  auto lease = AllocateFromChunks(bytes, alignment, affinity, lease_class);
+  if (lease) return lease;
   auto chunk = NewChunk(bytes, affinity, numa_node);
   if (!chunk) {
     allocation_failures_.fetch_add(1, std::memory_order_relaxed);
@@ -337,22 +346,12 @@ RecvSegmentPool::Lease RecvSegmentPool::Allocate(size_t bytes,
   RecvSegment* owner = chunk->segment.get();
   chunks_.push_back(std::move(chunk));
   growths_.fetch_add(1, std::memory_order_relaxed);
-  auto lease = owner->Allocate(bytes, alignment);
-  if (!lease) {
+  auto grown = owner->Allocate(bytes, alignment);
+  if (!grown) {
     allocation_failures_.fetch_add(1, std::memory_order_relaxed);
     return {};
   }
-  return Lease(this, owner, std::move(lease));
-}
-
-void RecvSegmentPool::NoteRelease(RecvSegment* segment) {
-  std::lock_guard<std::mutex> lock(mu_);
-  for (const auto& chunk : chunks_) {
-    if (chunk->segment.get() != segment) continue;
-    if (chunk->segment->stats().used_bytes == 0)
-      chunk->empty_since_ms = SteadyMs();
-    return;
-  }
+  return Lease(this, owner, std::move(grown));
 }
 
 size_t RecvSegmentPool::TrimIdle(uint64_t idle_ms) {
@@ -362,15 +361,13 @@ size_t RecvSegmentPool::TrimIdle(uint64_t idle_ms) {
   std::lock_guard<std::mutex> lock(mu_);
   for (size_t i = chunks_.size(); i > 1; --i) {
     auto& chunk = chunks_[i - 1];
-    if (chunk->segment->stats().used_bytes != 0) {
-      chunk->empty_since_ms = 0;
+    // Under the pool lock no allocation can lease from it meanwhile; a
+    // release in progress holds the segment's lock, so 0 is read until it
+    // is done.
+    const uint64_t empty_since = chunk->segment->EmptySinceMs();
+    if (empty_since == 0 || now < empty_since ||
+        now - empty_since < idle_ms)
       continue;
-    }
-    if (chunk->empty_since_ms == 0) {
-      chunk->empty_since_ms = now;
-      continue;
-    }
-    if (now - chunk->empty_since_ms < idle_ms) continue;
     released += chunk->segment->size();
     chunks_.erase(chunks_.begin() + static_cast<std::ptrdiff_t>(i - 1));
   }

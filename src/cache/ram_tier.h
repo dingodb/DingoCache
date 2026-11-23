@@ -458,6 +458,9 @@ class RamTier {
   // metrics (relaxed)
   uint64_t Hits() const { return hits_.load(std::memory_order_relaxed); }
   uint64_t Misses() const { return misses_.load(std::memory_order_relaxed); }
+  // A read this tier would have missed, answered without asking it (a GET
+  // found absent by its existence check).
+  void NoteMiss() { misses_.fetch_add(1, std::memory_order_relaxed); }
   uint64_t Puts() const { return puts_.load(std::memory_order_relaxed); }
   uint64_t Promoted() const { return promotes_.load(std::memory_order_relaxed); }
   // Promotions the tier did not take (PutDurable or ReserveDurable said
