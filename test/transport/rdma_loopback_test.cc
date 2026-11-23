@@ -4432,6 +4432,7 @@ TEST(RdmaLoopback, StopDrainOfAnUnreleasedGrantIsBounded) {
   ScopedEnv idle("DFKV_RDMA_IDLE_MS", "60000");
   ScopedEnv grant("DFKV_RDMA_GRANT_TIMEOUT_MS", "0");
   ScopedEnv drain("DFKV_RDMA_STOP_DRAIN_MS", "800");
+  for (int attempt = 0;; ++attempt) {
   std::atomic<pid_t> victim{0};
   std::atomic<bool> killed{false};
   RdmaNode* node_ptr = nullptr;
@@ -4454,6 +4455,12 @@ TEST(RdmaLoopback, StopDrainOfAnUnreleasedGrantIsBounded) {
   int status = 0;
   ::waitpid(child, &status, 0);
   ASSERT_TRUE(killed.load());
+  // The kill raced the client's own completion (see GrantOfAKilledClient...):
+  // no grant is left unreleased, so there is nothing to drain; try again.
+  if (attempt < 4 && RdmaServerTestPeer::LeasePutActive(*node.rsrv) == 0) {
+    std::printf("GRANT_RACED stop-drain: the client finished first; again\n");
+    continue;
+  }
   const auto started = std::chrono::steady_clock::now();
   node.rsrv->Stop();
   const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -4466,6 +4473,8 @@ TEST(RdmaLoopback, StopDrainOfAnUnreleasedGrantIsBounded) {
                        "dfkv_rdma_stop_drains_cut_total"),
             1);
   EXPECT_EQ(CounterVal(node.rsrv->MetricsText(), "dfkv_rdma_leaseput_active"), 0);
+  break;
+  }
 }
 
 // A GET whose READY is out when the server starts stopping completes: the
@@ -6715,6 +6724,8 @@ TEST(RdmaLoopback, UnregistrableCallerBufferIsALocalFailure) {
 // descriptor can be had (the bootstrap socket) and the next one cannot (the
 // endpoint's wake pipe).
 TEST(RdmaLoopback, EndpointOpenWithoutDescriptorsIsALocalFailure) {
+  if (testing_fd::kUnderThreadSanitizer)
+    GTEST_SKIP() << testing_fd::kTsanNoThreadsAfterFork;
   constexpr int kNoDevice = 77;
   const int result = testing_fd::RunInChild([] {
     if (!HaveRdma()) return kNoDevice;
@@ -6784,6 +6795,8 @@ TEST(RdmaLoopback, EndpointOpenWithoutDescriptorsIsALocalFailure) {
 // open one, but another rail's idle connection to the same peer needs no
 // descriptor: the operation is served there instead of failing at once.
 TEST(RdmaLoopback, DescriptorExhaustionUsesAnIdleConnectionOnAnotherRail) {
+  if (testing_fd::kUnderThreadSanitizer)
+    GTEST_SKIP() << testing_fd::kTsanNoThreadsAfterFork;
   constexpr int kSkip = 77;
   const int result = testing_fd::RunInChild([] {
     if (!HaveRdma()) return kSkip;
@@ -6859,6 +6872,8 @@ TEST(RdmaLoopback, DescriptorExhaustionUsesAnIdleConnectionOnAnotherRail) {
 // cannot be reached: the idle connection on another rail serves the
 // operation, and the peer is not held off as unreachable.
 TEST(RdmaLoopback, DialWithoutDescriptorsUsesAnIdleConnectionOnAnotherRail) {
+  if (testing_fd::kUnderThreadSanitizer)
+    GTEST_SKIP() << testing_fd::kTsanNoThreadsAfterFork;
   constexpr int kSkip = 77;
   const int result = testing_fd::RunInChild([] {
     if (!HaveRdma()) return kSkip;
@@ -9297,6 +9312,8 @@ TEST(RdmaBootstrapListener, StopDoesNotWaitForHandshakesInFlight) {
 // stays queued. The listener has to wait between attempts instead of spinning,
 // serve the queued peer once descriptors are back, and still stop promptly.
 TEST(RdmaBootstrapListener, DescriptorExhaustionBacksOffAndRecovers) {
+  if (testing_fd::kUnderThreadSanitizer)
+    GTEST_SKIP() << testing_fd::kTsanNoThreadsAfterFork;
   const int result = testing_fd::RunInChild([] {
     BootstrapListener listener;
     if (listener.server.Start(0) != Status::kOk) return 10;

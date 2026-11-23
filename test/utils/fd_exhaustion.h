@@ -20,6 +20,23 @@
 namespace dfkv {
 namespace testing_fd {
 
+// ThreadSanitizer kills a forked child of a multi-threaded process that
+// starts a thread (die_after_fork), and the children below start transport
+// and server threads: tests that use RunInChild skip under it.
+#if defined(__SANITIZE_THREAD__)
+inline constexpr bool kUnderThreadSanitizer = true;
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+inline constexpr bool kUnderThreadSanitizer = true;
+#else
+inline constexpr bool kUnderThreadSanitizer = false;
+#endif
+#else
+inline constexpr bool kUnderThreadSanitizer = false;
+#endif
+inline constexpr const char* kTsanNoThreadsAfterFork =
+    "TSan: a forked child of a threaded process cannot start threads";
+
 // Runs `body` in a forked child and returns what it returned (0..255), or -1
 // when the child did not exit normally. A child still running after
 // `timeout_s` is killed and reported as -1, so one that deadlocks fails its
