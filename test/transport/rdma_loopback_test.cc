@@ -126,6 +126,10 @@ class RdmaServerTestPeer {
   static void SetBootstrapReadMs(RdmaServer* server, int ms) {
     server->bootstrap_read_ms_ = ms;
   }
+  static void SetAfterProbeReply(RdmaServer* server,
+                                 std::function<void()> hook) {
+    server->after_probe_reply_for_test_ = std::move(hook);
+  }
   static void SetMaxPendingHandshakes(RdmaServer* server, uint64_t limit) {
     server->max_pending_handshakes_ = limit;
   }
@@ -6847,6 +6851,42 @@ TEST(RdmaLoopback, UnreachablePeerIsANodeFailureNotARailFailure) {
   EXPECT_EQ(
       CounterVal(metrics, "dfkv_rdma_client_peer_unreachable_skips_total"), 0);
   ::close(dead);
+}
+
+// A capability probe gives its pending-handshake slot back before it
+// answers: a client that reads the answer and connects at once must not
+// find the slot still taken by its own probe, at a limit of one. It was
+// given back only when the probe's thread returned, after the answer, so
+// under load the client's bootstrap could be refused by its own probe
+// (BootstrapRefusedByABusyPeerIsRetriedNotCharged failed 2 of 200 times).
+TEST(RdmaLoopback, AProbeFreesItsHandshakeSlotBeforeItAnswers) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaNode node("probe-slot");
+  RdmaServerTestPeer::SetMaxPendingHandshakes(node.rsrv.get(), 1);
+  std::atomic<bool> hold{true};
+  RdmaServerTestPeer::SetAfterProbeReply(node.rsrv.get(), [&hold] {
+    while (hold.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  });
+  struct Release {
+    std::atomic<bool>* hold;
+    ~Release() { hold->store(false); }
+  } release{&hold};
+  const auto probe = [&](char reply[rdma::kV2ProbeReplyBytes]) {
+    const int fd = net::Dial(node.addr, 2000, 2000);
+    if (fd < 0) return false;
+    char frame[rdma::kDevNameBytes];
+    rdma::EncodeDevFrame(rdma::kV2ProbeDevice, kMaxMsg, frame,
+                         rdma::kDevProtoV2);
+    const bool ok = net::WriteAll(fd, frame, sizeof(frame)) &&
+                    net::ReadAll(fd, reply, rdma::kV2ProbeReplyBytes);
+    ::close(fd);
+    return ok;
+  };
+  char reply[rdma::kV2ProbeReplyBytes];
+  ASSERT_TRUE(probe(reply));  // its thread now waits after answering
+  EXPECT_TRUE(probe(reply)) << "the next connection was refused while the "
+                               "first probe's thread had not returned";
+  EXPECT_EQ(node.rsrv->RejectedConnections(), 0u);
 }
 
 // A server at its limit of pending handshakes closes a new bootstrap
