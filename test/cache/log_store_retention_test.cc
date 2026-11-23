@@ -162,7 +162,7 @@ TEST(LogStoreRetention, AProtectionSurvivesAKillOnceTheJournalHasIt) {
                              static_cast<uint32_t>(::time(nullptr))) != kProtectedNew)
                   return 4;
                 if (flushed) s.Remove(Key(999));
-                ::_exit(0);  // killed
+                Kill(0);  // killed
               }),
               0);
     bool ok = false;

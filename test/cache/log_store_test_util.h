@@ -5,6 +5,7 @@
 #define DFKV_TEST_CACHE_LOG_STORE_TEST_UTIL_H_
 
 #include <gtest/gtest.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -72,22 +73,31 @@ inline bool Has(LogStore& s, uint64_t id, size_t len, uint32_t version = 0) {
          out == Val(id, len, version);
 }
 
+// Ends the process at once, as a kill does: no destructors, no atexit
+// handlers, and none of a sanitizer's exit-time checks. `_exit` is
+// intercepted by ThreadSanitizer, which then reports the store's threads (a
+// killed process never joins them) as leaked and exits with code 66 instead.
+[[noreturn]] inline void Kill(int code) {
+  ::syscall(SYS_exit_group, code);
+  __builtin_unreachable();
+}
+
 // Runs `body` in a child process and returns its exit code (-1 if it did
-// not exit normally). A crash hook in the child may _exit(0) at its point.
+// not exit normally). A crash hook in the child may Kill(0) at its point.
 inline int InChild(const std::function<int()>& body) {
   const pid_t child = ::fork();
   if (child < 0) return -1;
-  if (child == 0) ::_exit(body());
+  if (child == 0) Kill(body());
   int status = 0;
   if (::waitpid(child, &status, 0) != child || !WIFEXITED(status)) return -1;
   return WEXITSTATUS(status);
 }
 
-// A hook that _exits at the nth time `point` is reached.
+// A hook that kills the process the nth time `point` is reached.
 inline std::function<void(const char*)> ExitAt(const char* point, int nth = 1) {
   auto seen = std::make_shared<int>(0);
   return [point, nth, seen](const char* p) {
-    if (std::strcmp(p, point) == 0 && ++*seen == nth) ::_exit(0);
+    if (std::strcmp(p, point) == 0 && ++*seen == nth) Kill(0);
   };
 }
 
