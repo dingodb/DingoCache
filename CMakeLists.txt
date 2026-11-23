@@ -492,6 +492,11 @@ if(DFKV_BUILD_TESTS)
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
     set_tests_properties(python_telemetry PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
+    add_test(NAME python_cabi_bindings
+      COMMAND ${PYTHON3} -m unittest test_cabi_bindings_sync
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
+    set_tests_properties(python_cabi_bindings PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
     add_test(NAME python_operational_tools
       COMMAND ${PYTHON3} -m unittest test_dfkv_operational_tools
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
