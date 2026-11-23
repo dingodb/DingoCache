@@ -689,8 +689,29 @@ static void PrintClientDiagnostics(const char* op, const KVClient& client,
       (unsigned long long)declared);
 }
 
+static const char kUsage[] =
+    "usage: dfkvctl [options] <command> ...\n"
+    "  ring | topology            ring of a group (--json)\n"
+    "  clients                    registered consumers of a group\n"
+    "  stats [--all]              summary of a group (or of every group)\n"
+    "  stat <ip:port> | stat --all [--stat-port <p>]\n"
+    "  locate <key>               the member a key routes to\n"
+    "  drain <ip:port> [--undrain] take a node out of (or back into) the ring\n"
+    "  put <key> <value> | get <key> | exist <key> | rm <key>\n"
+    "                             need --namespace; the ring is --members or\n"
+    "                             --mds [--group]\n"
+    "options (\"--\" ends them): --members name=ip:port,...\n"
+    "         --mds host:port[,...]  --group <g>\n"
+    "         --namespace <ns>  --all  --allow-empty  --json  --stat-port <p>\n"
+    "         --undrain (drain)\n"
+    "         --ring-wait-ms <ms> (MDS discovery, default 10000)\n";
+
 int main(int argc, char** argv) {
   if (WantsVersion(argc, argv)) { std::printf("dfkvctl %s\n", Version()); return 0; }
+  // A one-shot tool shares nothing with other processes: same-host dedup
+  // would only create (and, with its last user, remove) a 516 MiB segment.
+  ::unsetenv("DFKV_CLIENT_NODE_DEDUP");
+  ::unsetenv("DFKV_CLIENT_NODE_DEDUP_GPU");
   std::string members;
   std::string key_namespace;
   std::string mds, group = "default";
@@ -700,9 +721,13 @@ int main(int argc, char** argv) {
   bool group_explicit = false;
   bool undrain = false;
   uint32_t stat_port = 0;  // override; 0 = use MDS-provided tcp_port, else the member's port
+  int ring_wait_ms = 10000;
   std::vector<std::string> pos;
+  bool options_ended = false;  // after "--", everything is positional
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
+    if (options_ended) { pos.push_back(a); continue; }
+    if (a == "--") { options_ended = true; continue; }
     // A port, 1..65535 (strtoul, not stoul: the std:: variant throws). A value
     // that is not one used to be read as 0, "use the member's own port", or
     // truncated to 16 bits.
@@ -732,9 +757,25 @@ int main(int argc, char** argv) {
     else if (a == "--undrain") undrain = true;
     else if (a == "--stat-port") nv32(&stat_port);
     else if (a == "--namespace" && i + 1 < argc) key_namespace = argv[++i];
+    else if (a == "--ring-wait-ms" && i + 1 < argc) {
+      const char* text = argv[++i];
+      char* end = nullptr;
+      const long v = std::strtol(text, &end, 10);
+      if (end == text || *end != '\0' || v < 0 || v > 600000) {
+        std::fprintf(stderr, "--ring-wait-ms must be 0..600000, got '%s'\n", text);
+        return 2;
+      }
+      ring_wait_ms = static_cast<int>(v);
+    }
+    else if (a == "--help" || a == "-h") { std::fputs(kUsage, stdout); return 0; }
+    else if (a.size() > 1 && a[0] == '-') {
+      // An unknown option used to be taken for a positional argument.
+      std::fprintf(stderr, "dfkvctl: unknown option %s\n%s", a.c_str(), kUsage);
+      return 2;
+    }
     else pos.push_back(a);
   }
-  if (pos.empty()) { std::fprintf(stderr, "usage: dfkvctl [--members ...] [--namespace ...] put|get|exist|stat|stats|ring|topology|clients|drain ...\n"); return 2; }
+  if (pos.empty()) { std::fputs(kUsage, stderr); return 2; }
   const std::string& cmd = pos[0];
   if (json && cmd != "ring" && cmd != "topology") {
     std::fprintf(stderr, "--json is only supported by ring/topology\n");
@@ -769,9 +810,36 @@ int main(int argc, char** argv) {
   }
 
   auto mem = ParseMembers(members);
-  if (mem.empty()) { std::fprintf(stderr, "need --members name=ip:port,...\n"); return 2; }
-  if (key_namespace.empty()) { std::fprintf(stderr, "need --namespace model/raw-layout-schema\n"); return 2; }
-  KVClient c(mem, key_namespace);
+  if (mem.empty() && mds.empty()) {
+    std::fprintf(stderr, "need --members name=ip:port,... or --mds host:port\n");
+    return 2;
+  }
+  // Routing hashes the object key only, so locate needs no namespace.
+  if (key_namespace.empty() && cmd != "locate") {
+    std::fprintf(stderr, "need --namespace model/raw-layout-schema\n");
+    return 2;
+  }
+  KVClient c(mem, key_namespace.empty() ? "dfkvctl/locate" : key_namespace);
+  if (mem.empty()) {
+    c.StartMdsDiscovery(SplitCsv(mds), group);
+    if (!c.WaitForRing(ring_wait_ms)) {
+      std::fprintf(stderr, "dfkvctl: no ring from %s (group %s) within %d ms\n",
+                   mds.c_str(), group.c_str(), ring_wait_ms);
+      return 1;
+    }
+  }
+
+  if (cmd == "locate" && pos.size() >= 2) {
+    const std::string owner = c.OwnerOf(pos[1]);
+    if (owner.empty()) { std::printf("(no owner)\n"); return 1; }
+    std::printf("%s\n", owner.c_str());
+    return 0;
+  }
+  if (cmd == "rm" && pos.size() >= 2) {
+    bool ok = c.Remove(pos[1]);
+    if (!ok) PrintClientDiagnostics("rm", c, true);
+    std::printf("%s\n", ok ? "OK" : "FAIL"); return ok ? 0 : 1;
+  }
 
   if (cmd == "put" && pos.size() >= 3) {
     bool ok = c.Put(pos[1], pos[2].data(), pos[2].size());

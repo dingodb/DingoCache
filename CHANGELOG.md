@@ -3,6 +3,16 @@
 ## Unreleased
 
 
+- `dfkvctl`: new `locate <key>` (the member a key routes to) and `rm <key>`;
+  `put`, `get`, `exist`, `locate` and `rm` find the ring through `--mds`
+  (and `--group`, `--ring-wait-ms`) as well as `--members`. An unknown
+  option now exits 2 (it used to be taken for an argument), so a positional
+  value starting with `-` must come after `--`; `--help` prints the usage.
+  `dfkvctl` and `dfkv_smoke` ignore `DFKV_CLIENT_NODE_DEDUP` and
+  `DFKV_CLIENT_NODE_DEDUP_GPU`: one command no longer creates a 516 MiB
+  shared-memory segment. `dfkv_smoke` round-trips one key per member
+  instead of one key for the whole ring before printing "N nodes OK".
+
 - `dfkv_bench`: the connection settle before the measured phase now puts
   one key on every ring member (found by hashing candidates until each
   member owns one) instead of 32 fixed keys, which on a ring of 65 left

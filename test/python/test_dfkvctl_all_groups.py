@@ -261,6 +261,20 @@ def _check_operational_tools(dfkvctl: Path, mds: str, etcd: str, state: _EtcdSta
     require(workflow.healthy("alpha-node") is True, "stat --all readiness",
             ctl("stat", "--all", "--group", "alpha"))
 
+    # Data commands through the MDS: put, locate, get, rm.
+    data = ("--group", "alpha", "--namespace", "ctl/test")
+    require(ctl("put", "ctl-key", "ctl-value", *data).stdout.strip() == "OK",
+            "put --mds", ctl("put", "ctl-key", "ctl-value", *data))
+    located = ctl("locate", "ctl-key", "--group", "alpha")
+    require(located.returncode == 0 and located.stdout.strip() == address,
+            "locate --mds", located)
+    got = ctl("get", "ctl-key", *data)
+    require(got.returncode == 0 and got.stdout.strip() == "ctl-value", "get --mds", got)
+    require(ctl("rm", "ctl-key", *data).stdout.strip() == "OK", "rm --mds",
+            ctl("exist", "ctl-key", *data))
+    require(ctl("exist", "ctl-key", *data).returncode == 1, "exist after rm",
+            ctl("exist", "ctl-key", *data))
+
     # The table is what people and scripts outside this repository read.
     table = ctl("ring", "--group", "alpha").stdout.splitlines()
     require(

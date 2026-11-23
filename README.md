@@ -82,7 +82,7 @@ The connectors supply model/layout-aware namespaces and object keys; dfkv stores
 
 ## Operate and contribute
 
-With MDS discovery, `dfkvctl ring --mds <host:port> --group <group>` shows placement, and `dfkvctl clients --mds <host:port> --group <group>` shows **registered** inference consumers (an empty list does not prove that no consumers exist). [Metrics and health endpoints](docs/METRICS.md), [observability configurations](deploy/observability/README.md), and the [deployment runbook](docs/DEPLOY.md) cover monitoring and operations. Metrics listeners are opt-in.
+With MDS discovery, `dfkvctl ring --mds <host:port> --group <group>` shows placement (`locate <key>` names the member a key routes to; `put`, `get`, `exist` and `rm` take `--mds` as well as `--members`; `dfkvctl --help` lists the commands), and `dfkvctl clients --mds <host:port> --group <group>` shows **registered** inference consumers (an empty list does not prove that no consumers exist). [Metrics and health endpoints](docs/METRICS.md), [observability configurations](deploy/observability/README.md), and the [deployment runbook](docs/DEPLOY.md) cover monitoring and operations. Metrics listeners are opt-in.
 
 For development, start with the [source map and request flow](docs/ARCHITECTURE.md), then the [connector implementations](integration/) or [native client and server](src/). A local TCP build and test run needs CMake, a C++17 toolchain, and no GPU or RDMA device:
 
