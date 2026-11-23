@@ -620,6 +620,20 @@ def _load_lib(path: Optional[str] = None) -> ctypes.CDLL:
             ctypes.POINTER(ctypes.POINTER(ctypes.c_uint64)),
             ctypes.POINTER(ctypes.c_int), ctypes.c_int,
             ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_uint64)]
+    # Per-key outcomes (a stored value of another length is told apart from a
+    # miss) and REMOVE, for healing such keys; older libs lack them.
+    if hasattr(lib, "dfkv_batch_get_st"):
+        lib.dfkv_batch_get_st.restype = ctypes.c_int
+        lib.dfkv_batch_get_st.argtypes = lib.dfkv_batch_get.argtypes + [
+            ctypes.POINTER(ctypes.c_uint8)]
+    if hasattr(lib, "dfkv_batch_get_auto_sg_st"):
+        lib.dfkv_batch_get_auto_sg_st.restype = ctypes.c_int
+        lib.dfkv_batch_get_auto_sg_st.argtypes = (
+            lib.dfkv_batch_get_auto_sg.argtypes
+            + [ctypes.POINTER(ctypes.c_uint8)])
+    if hasattr(lib, "dfkv_batch_remove"):
+        lib.dfkv_batch_remove.restype = ctypes.c_int
+        lib.dfkv_batch_remove.argtypes = lib.dfkv_batch_exist.argtypes
     if hasattr(lib, "dfkv_max_sg_segs"):
         lib.dfkv_max_sg_segs.restype = ctypes.c_uint32
         lib.dfkv_max_sg_segs.argtypes = [ctypes.c_void_p]
@@ -632,6 +646,67 @@ def _load_lib(path: Optional[str] = None) -> ctypes.CDLL:
     lib.dfkv_close.restype = None
     lib.dfkv_close.argtypes = [ctypes.c_void_p]
     return lib
+
+
+# DFKV_ST_* code of a read that found the key stored with another length
+# (shorter than an exact read asks, or larger than the destination). Only
+# this code is evidence of a stored length: INVALID is also this process's
+# block bound, a bad buffer or a node's refusal.
+_ST_LENGTH_MISMATCH = 8
+
+
+class _LengthHeal:
+    """Keys a read found stored with another length than this process's.
+
+    The existence gate of a backup would report such a key stored forever,
+    and the node keeps the first value written under a key (a PUT of a
+    present key is a no-op), so the page is recomputed on every read. A key
+    is therefore rewritten (REMOVE, then PUT) once: `pending` holds keys to
+    rewrite on their next backup, `healed` those already rewritten, whose
+    later mismatches are only counted. Two deployments sharing a namespace
+    with different layouts would otherwise overwrite each other's object on
+    every backup round. Both sets are bounded (oldest dropped first).
+    """
+
+    CAP = 1 << 16
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.pending = collections.OrderedDict()
+        self.healed = collections.OrderedDict()
+        self.warned = False
+
+    @staticmethod
+    def _add(d, key, cap):
+        d[key] = None
+        d.move_to_end(key)
+        while len(d) > cap:
+            d.popitem(last=False)
+
+    def note(self, keys):
+        """Record mismatched keys; True for the first call of this backend."""
+        with self.lock:
+            for key in keys:
+                if key not in self.healed:
+                    self._add(self.pending, key, self.CAP)
+            first, self.warned = not self.warned, True
+        return first
+
+    def take(self, keys):
+        """Indexes of keys to rewrite now; each key is handed out once."""
+        if not self.pending:  # unlocked fast path; a racing note() waits a round
+            return []
+        out = []
+        with self.lock:
+            for i, key in enumerate(keys):
+                if key in self.pending:
+                    del self.pending[key]
+                    self._add(self.healed, key, self.CAP)
+                    out.append(i)
+        return out
+
+
+_LENGTH_HEAL_INIT = threading.Lock()
 
 
 def _native_version(lib) -> str:
@@ -2484,6 +2559,90 @@ class DfkvHiCache(HiCacheStorage):
         del key_owners
         return [out[i] == 1 for i in range(n)]
 
+    def _length_heal(self) -> _LengthHeal:
+        heal = self.__dict__.get("_length_heal_state")
+        if heal is None:
+            with _LENGTH_HEAL_INIT:
+                heal = self.__dict__.setdefault(
+                    "_length_heal_state", _LengthHeal())
+        return heal
+
+    def _note_length_mismatch(self, keys):
+        """Keys a read found stored with another length (see _LengthHeal)."""
+        if not keys:
+            return
+        self._metrics.on_length_mismatch(len(keys))
+        if self._length_heal().note(keys):
+            _log.warning(
+                "dfkv-hicache: %d key(s) are stored with another length than "
+                "this process reads (%s); each is rewritten once. If this "
+                "persists (dfkv_hicache_length_mismatch_keys_total keeps "
+                "rising), two deployments with different layouts share a "
+                "namespace: give them distinct model_revision values or set "
+                "bind_runtime_layout", len(keys), self._alog_tag)
+
+    _HEAL_REREAD_BYTES = 64 << 20
+
+    def _take_length_heal(self, sks, sizes):
+        """Indexes of sks to rewrite: removed from the store here, so the
+        caller's PUT stores this process's value (the node keeps an existing
+        key's value on PUT). A noted key is read again first, at the size
+        this write stores: one that now reads correctly, is absent, or
+        cannot be read is not removed."""
+        heal = self._length_heal().take(sks)
+        if not heal:
+            return []
+        lib = self._lib
+        if not (hasattr(lib, "dfkv_batch_remove")
+                and hasattr(lib, "dfkv_batch_get_st")):
+            return []
+        # Re-read in chunks through one scratch buffer: after a layout change
+        # every key of a batch is pending, and their sum can reach GBs.
+        cap = max(self._HEAL_REREAD_BYTES, max(sizes[i] for i in heal))
+        scratch = (ctypes.c_ubyte * min(cap, sum(sizes[i] for i in heal)))()
+        stale = []
+        start = 0
+        while start < len(heal):
+            chunk, ptrs, at = [], [], 0
+            for i in heal[start:]:
+                if chunk and at + sizes[i] > len(scratch):
+                    break
+                chunk.append(i)
+                ptrs.append(ctypes.addressof(scratch) + at)
+                at += sizes[i]
+            start += len(chunk)
+            n = len(chunk)
+            karr, klens, parr, sarr, out, key_owners = _arrays(
+                [sks[i] for i in chunk], ptrs, [sizes[i] for i in chunk])
+            status = (ctypes.c_uint8 * n)()
+            lib.dfkv_batch_get_st(
+                self._h, karr, klens, parr, sarr, n, out, status)
+            del key_owners
+            stale += [i for m, i in enumerate(chunk)
+                      if status[m] == _ST_LENGTH_MISMATCH]
+        if stale:
+            karr, klens, key_owners = make_key_array([sks[i] for i in stale])
+            out = (ctypes.c_int * len(stale))()
+            lib.dfkv_batch_remove(self._h, karr, klens, len(stale), out)
+            del key_owners
+        return stale
+
+    def _get_flat(self, sks, sp, ss):
+        """Exact-size batch GET: hit per sub-key. A key stored with another
+        length is noted for one rewrite."""
+        n = len(sks)
+        karr, klens, parr, sarr, out, key_owners = _arrays(sks, sp, ss)
+        if hasattr(self._lib, "dfkv_batch_get_st"):
+            status = (ctypes.c_uint8 * n)()
+            self._lib.dfkv_batch_get_st(
+                self._h, karr, klens, parr, sarr, n, out, status)
+            self._note_length_mismatch(
+                [sks[i] for i in range(n) if status[i] == _ST_LENGTH_MISMATCH])
+        else:
+            self._lib.dfkv_batch_get(self._h, karr, klens, parr, sarr, n, out)
+        del key_owners
+        return [out[i] == 1 for i in range(n)]
+
     def _put_sg_flat(self, sks, seg_ptrs, seg_sizes):
         """(stored per sub-key, retry recoveries); see _put_flat."""
         stored, recovered = self._put_sg_flat_impl(sks, seg_ptrs, seg_sizes)
@@ -2497,8 +2656,12 @@ class DfkvHiCache(HiCacheStorage):
         recovered = 0
         if not sks:
             return [], 0
+        heal = self._take_length_heal(
+            sks, [sum(sizes) for sizes in seg_sizes])
         if self._backup_exist_gate:
             present = list(self._batch_exist_flat(sks))
+            for i in heal:
+                present[i] = False
             todo = [i for i, p in enumerate(present) if not p]
             if not todo:
                 return [True] * len(sks), 0
@@ -2598,14 +2761,29 @@ class DfkvHiCache(HiCacheStorage):
             import torch
             if torch.cuda.is_available():
                 scope = torch.cuda.device(device)
+        status = None
         with scope:
-            rc = self._lib.dfkv_batch_get_auto_sg(
-                self._h, karr, klens, parr, carr, narr, n, out_hit, out_len)
+            if hasattr(self._lib, "dfkv_batch_get_auto_sg_st"):
+                status = (ctypes.c_uint8 * n)()
+                rc = self._lib.dfkv_batch_get_auto_sg_st(
+                    self._h, karr, klens, parr, carr, narr, n, out_hit,
+                    out_len, status)
+            else:
+                rc = self._lib.dfkv_batch_get_auto_sg(
+                    self._h, karr, klens, parr, carr, narr, n, out_hit,
+                    out_len)
             if rc != 0:
                 return [0] * n, [0] * n
             del inner_p; del inner_c; del parr; del carr; del narr
             if any(h == 1 for h in out_hit):
                 _gpu_load_fence(device)
+        # Shorter than the destinations: a hit with its stored length, which
+        # the callers reject; larger: LENGTH_MISMATCH (the native client
+        # reports it only for a stored length it knows to be larger).
+        self._note_length_mismatch([
+            sks[i] for i in range(n)
+            if (out_hit[i] == 1 and out_len[i] < sum(seg_caps[i]))
+            or (status is not None and status[i] == _ST_LENGTH_MISMATCH)])
         return [out_hit[i] for i in range(n)], [int(out_len[i]) for i in range(n)]
 
     def batch_get_v1_device(self, keys, device_indices, extra_info=None) -> List[bool]:
@@ -2672,14 +2850,11 @@ class DfkvHiCache(HiCacheStorage):
                 if not sks:
                     return []
                 markers, base = self._marker_buffer(len(sks))
-                karr, klens, parr, sarr, out, key_owners = _arrays(
-                    sks, range(base, base + len(sks)), [1] * len(sks))
                 t0 = time.perf_counter()
-                self._lib.dfkv_batch_get(
-                    self._h, karr, klens, parr, sarr, len(sks), out)
+                flat = self._get_flat(
+                    sks, range(base, base + len(sks)), [1] * len(sks))
                 dur = time.perf_counter() - t0
-                del key_owners
-                res = self._fold([out[i] == 1 for i in range(len(sks))], n, sub)
+                res = self._fold(flat, n, sub)
                 r.result = f"anchor_marker hits={sum(res)}/{n}"
                 if _sp:
                     _sp.hits = sum(res); _sp.bytes = len(sks)
@@ -2702,14 +2877,9 @@ class DfkvHiCache(HiCacheStorage):
                 return [False] * n
             ptrs, sizes = meta
             sub, sks, sp, ss = self._flatten(keys, ptrs, sizes)
-            karr, klens, parr, sarr, out, key_owners = _arrays(sks, sp, ss)
             t0 = time.perf_counter()
-            self._lib.dfkv_batch_get(
-                self._h, karr, klens, parr, sarr, len(sks), out)
+            res = self._fold(self._get_flat(sks, sp, ss), n, sub)
             dur = time.perf_counter() - t0
-            del key_owners
-            res = self._fold(
-                [out[i] == 1 for i in range(len(sks))], n, sub)
             r.result = f"hits={sum(res)}/{n}"
             if _sp:
                 _sp.hits = sum(res); _sp.bytes = sum(ss)
@@ -2805,8 +2975,11 @@ class DfkvHiCache(HiCacheStorage):
         recovered = 0
         if not sks:
             return [], 0
+        heal = self._take_length_heal(sks, ss)
         if self._backup_exist_gate:
             present = list(self._batch_exist_flat(sks))
+            for i in heal:
+                present[i] = False
             todo = [i for i, p in enumerate(present) if not p]
             if not todo:
                 return [True] * len(sks), 0
@@ -2898,11 +3071,7 @@ class DfkvHiCache(HiCacheStorage):
         if sks and putting:
             flat, recovered = self._put_flat(sks, sp, ss)
         elif sks:
-            karr, klens, parr, sarr, out, key_owners = _arrays(sks, sp, ss)
-            self._lib.dfkv_batch_get(
-                self._h, karr, klens, parr, sarr, len(sks), out)
-            del key_owners
-            flat = [out[i] == 1 for i in range(len(sks))]
+            flat = self._get_flat(sks, sp, ss)
         else:
             flat = []
         # The actual I/O cost/volume for the v2 metrics. ss covers only pools

@@ -430,7 +430,12 @@ TEST_F(RdmaLeaseClient, PullCapacityRejectionPreservesConnectionAndGeneration) {
         std::vector<size_t> lengths;
         const auto result = transport.RangeIntoMulti(
             addr_, {key}, {{{{out->data(), out->size()}}}}, &lengths);
-        if (result[0] != Status::kOk) EXPECT_EQ(lengths[0], 0u);
+        // A capacity rejection reports the stored length (so the client
+        // tells a length mismatch from a refusal); any other failure none.
+        if (result[0] == Status::kInvalid)
+          EXPECT_EQ(lengths[0], value.size());
+        else if (result[0] != Status::kOk)
+          EXPECT_EQ(lengths[0], 0u);
         return result[0];
       }
       return transport.RangeInto(
@@ -532,7 +537,7 @@ TEST_F(RdmaLeaseClient, DynamicPullReleasesLargeScalarAndScatterReadsBeforeIdle)
   EXPECT_EQ(transport.RangeIntoMulti(
                 addr_, {key}, {{{{small.data(), small.size()}}}},
                 &rejected_sg_lengths), std::vector<Status>{Status::kInvalid});
-  EXPECT_EQ(rejected_sg_lengths, std::vector<size_t>{0});
+  EXPECT_EQ(rejected_sg_lengths, std::vector<size_t>{value.size()});
   EXPECT_EQ(small, std::string(small.size(), '?'));
   expect_idle();
   std::string out(value.size(), '?');

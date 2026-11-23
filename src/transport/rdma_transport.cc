@@ -4001,8 +4001,10 @@ bool RdmaTransport::PullWindow(
     state.grant = true;
     request.data_len = ready.data_len;
     if (request.mode == PullMode::kWholeObject &&
-        ready.value_len > request.capacity)
+        ready.value_len > request.capacity) {
       request.status = Status::kInvalid;
+      request.too_large = true;
+    }
   }
 
   // One READ per live item per round preserves depth-wide pipelining without
@@ -4175,7 +4177,12 @@ Status RdmaTransport::PullInto(
         cross_rail_retry_exhausted_.fetch_add(1, std::memory_order_relaxed);
       return Status::kIOError;
     }
-    if (value_len) *value_len = request.value_len;
+    // A node's refusal may carry a length; only a value this transport
+    // refused as larger than the destination reports its stored length
+    // with kInvalid (see Transport::RangeInto).
+    if (value_len)
+      *value_len = request.status != Status::kInvalid || request.too_large
+                       ? request.value_len : 0;
     if (data_len) *data_len = request.data_len;
     if (request.status == Status::kOk)
       RecordRailTransfer(conn, false, 1, request.data_len);
@@ -4607,7 +4614,9 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
     uint64_t value_len = 0;
     result[item] = PullInto(node, keys[item], segments.data(), segments.size(),
                             capacity, Lane::kSgData, &value_len, out_dev);
-    if (out_lengths && result[item] == Status::kOk)
+    if (out_lengths && (result[item] == Status::kOk ||
+                        (result[item] == Status::kInvalid &&
+                         value_len > capacity)))
       (*out_lengths)[item] = static_cast<size_t>(value_len);
   }
   return result;

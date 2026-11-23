@@ -328,6 +328,8 @@ class RdmaTransport : public Transport {
     Status status = Status::kIOError;
     uint64_t value_len = 0;
     uint64_t data_len = 0;
+    // kInvalid set here because the stored value is larger than capacity.
+    bool too_large = false;
   };
   // One exclusively owned endpoint executes prepare, READ and RELEASE windows.
   // Failure leaves transient MRs with the endpoint until the caller fences it.

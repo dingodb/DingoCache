@@ -673,6 +673,42 @@ class TestDeviceDirectEndToEnd(unittest.TestCase):
             self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
             kv_cache_dim=self.KV_DIM)
 
+    def test_a_larger_stored_object_is_a_length_mismatch_and_heals(self):
+        """HIC-26 over the node's transport (RDMA where the host has it): a
+        value larger than the destination reads LENGTH_MISMATCH, not
+        INVALID, and the device-direct write replaces it once."""
+        st = self._plugin(self._node("heal"))
+        st.register_mem_pool_device(self._mla_device_pool())
+        page, idx = "feedface", list(range(self.PAGE_SIZE))
+        cap = self.LAYER_NUM * self.PAGE_SIZE * self.KV_DIM
+        sk = st._sg_group_key(st._keys(page)[0], 0)
+        other = (ctypes.c_ubyte * (2 * cap))()
+        karr, klens, parr, sarr, out, _o = dfkv_hicache._arrays(
+            [sk], [ctypes.addressof(other)], [2 * cap])
+        st._lib.dfkv_batch_put(st._h, karr, klens, parr, sarr, 1, out)
+        self.assertEqual(out[0], 1)
+        dest = (ctypes.c_ubyte * cap)()
+        status = (ctypes.c_uint8 * 1)()
+        karr, klens, parr, sarr, out, _o = dfkv_hicache._arrays(
+            [sk], [ctypes.addressof(dest)], [cap])
+        st._lib.dfkv_batch_get_st(st._h, karr, klens, parr, sarr, 1, out,
+                                  status)
+        self.assertEqual(status[0], dfkv_hicache._ST_LENGTH_MISMATCH)
+
+        self.assertEqual(st.batch_get_v1_device([page], idx), [False])
+        self.assertEqual(st._metrics._c.get("length_mismatch_keys", 0), 1)
+        src = self._mla_device_pool()
+        st.register_mem_pool_device(src)
+        self.assertEqual(st.batch_set_v1_device([page], idx), [True])
+        dst = self._mla_device_pool()
+        for layer in range(self.LAYER_NUM):
+            dst._np[layer][:] = 0
+        st.register_mem_pool_device(dst)
+        self.assertEqual(st.batch_get_v1_device([page], idx), [True])
+        for layer in range(self.LAYER_NUM):
+            self.assertEqual(dst.layer_page_bytes(layer, 0, self.PAGE_SIZE),
+                             src.layer_page_bytes(layer, 0, self.PAGE_SIZE))
+
     def test_host_read_of_device_direct_pages_loads_nothing(self):
         """In device-direct mode the host entry batch_get_v1 cannot load the
         objects (layer-major SG groups), so every page is a miss and the host

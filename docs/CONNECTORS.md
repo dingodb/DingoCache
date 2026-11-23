@@ -619,6 +619,19 @@ pool 的类名、`dtype`，主 KV 另加每 token 的 stride 和层数。device 
 fp8）而非 KV 的元素类型，同宽度的 fp8 变体分不出，仍需在 extra_config 写
 `kv_cache_dtype` 或换 `model_revision`；在注册 pool 之前构造 key 会报错。
 
+对象大小不同的情形虽然只会 miss，但节点对已存在的 key 不接受覆盖（PUT 已有 key 不改其
+值），备份前的存在检查又会把它当作已存，所以这个 key 会一直 miss、一直重算。连接器读到
+原生 `DFKV_ST_LENGTH_MISMATCH`（存储值比精确读短，或比目的缓冲长；只在客户端确知存储
+长度时给出）或 device 读到短于目的缓冲的命中时，把该 key 记入一个有界集合。下一次备份
+先按本进程要写的大小再精确读一次：仍是长度不符才 REMOVE 再 PUT，已改对、已不存在或读
+不到的不删。`DFKV_ST_INVALID` 不算证据（本进程的块上限、坏缓冲、节点拒绝都会给它），
+永不触发删除。每个 key 每个进程只改写一次，之后同一 key 再读到长度不符只计数；每个存储
+后端第一次遇到时打一条 WARNING。计数器是 `dfkv_hicache_length_mismatch_keys_total`。
+它持续上涨说明两种布局的实例共享了同一个 namespace，彼此覆盖对方的对象：给它们不同的
+`model_revision`，或打开 `bind_runtime_layout`。同理，改变对象大小的滚动升级若不换
+`model_revision`，新旧实例在升级期间会互相删除对方的对象（每个 key 每个进程一次），而
+不只是 miss；这是升级时换 `model_revision` 或打开 `bind_runtime_layout` 的又一个理由。
+
 ### 2.3 HiCache 关键 flag
 
 | flag | 推荐 | 说明 |

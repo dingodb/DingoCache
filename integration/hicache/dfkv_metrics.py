@@ -110,6 +110,10 @@ _SPECS = [
     ("exist_v2_calls", "dfkv_client_exist_v2_calls_total", "batch_exists_v2 calls"),
     ("exist_v2_probe_pages", "dfkv_client_exist_v2_probe_pages_total", "candidate KV prefix pages probed by exists_v2"),
     ("exist_v2_hit_pages", "dfkv_client_exist_v2_hit_pages_total", "usable hit-prefix pages from exists_v2 (kv_hit_pages)"),
+    # Reads that found a key stored with another length than this process
+    # reads; each such key is rewritten once per process. A steady rise means
+    # two layouts share a namespace.
+    ("length_mismatch_keys", "dfkv_hicache_length_mismatch_keys_total", "keys a read found stored with another length"),
 ]
 
 # Prometheus Counters are process-global singletons (re-creating the same name
@@ -251,6 +255,9 @@ class Metrics:
             for result, n in counts.items():
                 _RETAIN_RESULT_PROM.labels(self._rank, result).inc(n)
         return counts
+
+    def on_length_mismatch(self, keys):
+        self._add(length_mismatch_keys=keys)
 
     def on_parallel_context_fallback(self):
         self._add(parallel_context_fallbacks=1)

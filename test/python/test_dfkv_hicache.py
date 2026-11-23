@@ -209,12 +209,13 @@ class FakeTupleNoneAnchorPool:
         return (None, None)
 
 
-def _spawn_node(tag):
+def _spawn_node(tag, engine_args=("--store-engine", "file"), env=None):
     d = tempfile.mkdtemp(prefix=f"dfkv_py_{tag}_")
     p = subprocess.Popen(
         [SERVER_BIN, "--dir", d, "--port", "0", "--cap", str(1 << 30),
-         "--store-engine", "file"],
-        stdout=subprocess.PIPE, text=True)
+         *engine_args],
+        stdout=subprocess.PIPE, text=True,
+        env=None if env is None else {**os.environ, **env})
     line = p.stdout.readline().strip()
     assert line.startswith("PORT "), f"bad server greeting: {line!r}"
     port = int(line.split()[1])
@@ -251,8 +252,8 @@ class DingoFSHiCacheTest(unittest.TestCase):
         for d in cls.dirs:
             shutil.rmtree(d, ignore_errors=True)
 
-    def _node(self, tag):
-        p, d, port = _spawn_node(tag)
+    def _node(self, tag, engine_args=("--store-engine", "file"), env=None):
+        p, d, port = _spawn_node(tag, engine_args, env)
         self.procs.append(p)
         self.dirs.append(d)
         return f"{tag}=127.0.0.1:{port}", port, d
@@ -554,6 +555,53 @@ class DingoFSHiCacheTest(unittest.TestCase):
         self.assertEqual(st.batch_get_v1(keys, host_indices), [True, True, True])
         for i in range(3):
             self.assertEqual(pool.page_bytes_at(i), expected[i])
+
+    # Every store a node can run. A PUT of a present key keeps the stored
+    # value on each of them, so a key stored with another length is healed
+    # by REMOVE + PUT.
+    ENGINES = {
+        "file": (("--store-engine", "file"), None),
+        "slab": (("--store-engine", "slab"), None),
+        "slab+ram": (("--store-engine", "slab", "--ram-tier", "on",
+                      "--ram-tier-bytes", str(64 << 20)),
+                     {"DFKV_RAM_TIER_LOCK": "off"}),
+        "log": (("--store-engine", "log"), {"DFKV_LSE_EXPERIMENTAL": "1"}),
+    }
+
+    def test_a_key_stored_with_another_length_is_rewritten_once(self):
+        # Shorter and larger than the page: both LENGTH_MISMATCH.
+        for engine, (args, env) in self.ENGINES.items():
+            for other_len in (100, 2 * self.PAGE_BYTES):
+                with self.subTest(engine=engine, stored=other_len):
+                    self._heal_once(engine, args, env, other_len)
+
+    def _heal_once(self, engine, args, env, other_len):
+        members, _, _ = self._node(f"heal-{engine}-{other_len}", args, env)
+        pool = FakeMlaPool(1, self.PAGE_BYTES, self.PAGE_SIZE)
+        st = self._plugin(self._cfg(members, model=f"heal-{engine}"), pool)
+        key = st._keys("p0")[0]
+        other = (ctypes.c_ubyte * other_len)()
+        karr, klens, parr, sarr, out, _owners = dfkv_hicache._arrays(
+            [key], [ctypes.addressof(other)], [other_len])
+        st._lib.dfkv_batch_put(st._h, karr, klens, parr, sarr, 1, out)
+        self.assertEqual(out[0], 1)
+        status = (ctypes.c_uint8 * 1)()
+        dest = (ctypes.c_ubyte * self.PAGE_BYTES)()
+        karr, klens, parr, sarr, out, _owners = dfkv_hicache._arrays(
+            [key], [ctypes.addressof(dest)], [self.PAGE_BYTES])
+        st._lib.dfkv_batch_get_st(st._h, karr, klens, parr, sarr, 1, out,
+                                  status)
+        self.assertEqual(status[0], dfkv_hicache._ST_LENGTH_MISMATCH)
+        pages = list(range(self.PAGE_SIZE))
+        pool.fill_page(0, 0x5a)
+        expected = pool.page_bytes_at(0)
+        self.assertEqual(st.batch_get_v1(["p0"], pages), [False])
+        pool.fill_page(0, 0x5a)  # a failed read may leave bytes in it
+        self.assertEqual(st.batch_set_v1(["p0"], pages), [True])
+        pool.zero()
+        self.assertEqual(st.batch_get_v1(["p0"], pages), [True])
+        self.assertEqual(pool.page_bytes_at(0), expected)
+        self.assertEqual(st._metrics._c.get("length_mismatch_keys", 0), 1)
 
     def test_client_metrics_count_set_and_get(self):
         # #5: plugin counts client-side read/write volume (pages/bytes/hits).
@@ -1108,13 +1156,20 @@ class DingoFSHiCacheTest(unittest.TestCase):
                     self.assertEqual(st.batch_set_v2([side_trans])["side"],
                                      [True, True, True])
                     side.zero()
-                    original_get = st._lib.dfkv_batch_get
+                    # The GET the connector makes: the per-key status form
+                    # where the lib has it.
+                    get_name = ("dfkv_batch_get_st"
+                                if hasattr(st._lib, "dfkv_batch_get_st")
+                                else "dfkv_batch_get")
+                    original_get = getattr(st._lib, get_name)
                     _scratch, put_source = st._marker_buffer(1, put=True)
                     marker_before = ctypes.string_at(put_source, 1)
                     calls = []
 
-                    def native_get(handle, karr, klens, ptrs, sizes, n, out):
-                        rc = original_get(handle, karr, klens, ptrs, sizes, n, out)
+                    def native_get(handle, karr, klens, ptrs, sizes, n, out,
+                                   *status):
+                        rc = original_get(handle, karr, klens, ptrs, sizes, n,
+                                          out, *status)
                         marker_indices = [i for i in range(n) if sizes[i] == 1]
                         addresses = [ptrs[i] for i in marker_indices]
                         self.assertEqual(len(addresses), 6)  # MHA K/V markers
@@ -1130,7 +1185,7 @@ class DingoFSHiCacheTest(unittest.TestCase):
                         calls.append(n)
                         return rc
 
-                    with patch.object(st._lib, "dfkv_batch_get", native_get):
+                    with patch.object(st._lib, get_name, native_get):
                         if version == 1:
                             result = st.batch_get_v1(keys, hi)
                         else:
