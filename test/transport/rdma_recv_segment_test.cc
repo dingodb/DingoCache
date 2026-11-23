@@ -1,6 +1,10 @@
 #include "transport/rdma_recv_segment.h"
 
+#include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <algorithm>
 #include <cstdint>
 #include <thread>
 #include <utility>
@@ -250,3 +254,49 @@ TEST(RecvSegmentPool, RejectsImpossibleStagingReservation) {
 }
 
 }  // namespace dfkv::rdma
+
+// RDS-14: what a staging lease costs on the request path, the pool's one lock
+// and its scans included, with many connections allocating at once. Opt-in:
+// set DFKV_RECV_POOL_BENCH to the leases per thread.
+TEST(RecvSegmentPool, StagingLeaseCostBench) {
+  const char* requested = std::getenv("DFKV_RECV_POOL_BENCH");
+  if (requested == nullptr || *requested == '\0')
+    GTEST_SKIP() << "set DFKV_RECV_POOL_BENCH=<leases per thread> to run";
+  const int leases = std::max(1, std::atoi(requested));
+  // Production-like geometry: 64 MiB chunks, 4 GiB budget, chunks already
+  // committed and partly held by long-lived connection leases.
+  constexpr size_t kChunk = 64ull << 20;
+  for (const int threads : {1, 8, 32, 64}) {
+    dfkv::rdma::RecvSegmentPool pool;
+    ASSERT_TRUE(pool.Init(kChunk, 64 * kChunk));
+    std::vector<dfkv::rdma::RecvSegmentPool::Lease> resident;
+    for (int i = 0; i < 128; ++i)  // one 4 MiB connection lease per QP
+      resident.push_back(pool.Allocate(4ull << 20));
+    std::atomic<uint64_t> failures{0};
+    const auto started = std::chrono::steady_clock::now();
+    std::vector<std::thread> workers;
+    for (int t = 0; t < threads; ++t) {
+      workers.emplace_back([&, t] {
+        uint64_t x = 0x9e3779b97f4a7c15ull * static_cast<uint64_t>(t + 1);
+        for (int i = 0; i < leases; ++i) {
+          x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+          const size_t bytes = (size_t{4096} << (x % 9)) + 4096;  // 8K..1M
+          auto lease = pool.Allocate(bytes, 4096, -1, -1,
+              dfkv::rdma::RecvSegmentPool::LeaseClass::kStaging);
+          if (!lease) failures.fetch_add(1);
+        }
+      });
+    }
+    for (auto& w : workers) w.join();
+    const double seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    const double total = static_cast<double>(threads) * leases;
+    // Each thread allocates and releases its leases one after another, as a
+    // Serve thread does: the time per lease is what one request pays.
+    std::printf("threads %3d: %7.0f ns per lease per thread, %6.2f M leases/s "
+                "in all, %llu failures, %zu chunks\n",
+                threads, seconds * 1e9 / leases, total / seconds / 1e6,
+                static_cast<unsigned long long>(failures.load()),
+                pool.stats().chunks);
+  }
+}

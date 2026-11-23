@@ -570,6 +570,9 @@ struct RdmaNode {
             return srv->PrepareReadForKey(key, off, len, staging, cap);
           });
     }
+    // As dfkv_server_main.
+    rsrv->set_lookup_handler(
+        [this](const BlockKey& key) { return srv->LookupForGet(key); });
     RdmaServerTestPeer::SetAfterReplyPost(*rsrv, std::move(after_reply_post));
     RdmaServerTestPeer::SetCqHooks(*rsrv, std::move(reorder),
                                    std::move(observe));
@@ -2539,6 +2542,56 @@ struct PinnedPullPeer {
     uint64_t bytes = 0;
     return Exchange(kReqPrefix, &status, &bytes) && status == Status::kOk;
   }
+  // Pipelined requests (depth > 1): each request is built in its own send
+  // buffer and returns its byte count.
+  size_t EncodePull(size_t send_slot, const BlockKey& key, size_t offset,
+                    size_t length, uint32_t pull_slot) {
+    EncodeReqVersion(ep.sbuf(send_slot), kNativeProtoRdmaV2,
+                     WireOp::kPullRange, key, offset, length,
+                     rdma::kPullPrepareBytes);
+    rdma::PullPrepareControl control;
+    control.slot_index = pull_slot;
+    rdma::EncodePullPrepareControl(control, ep.sbuf(send_slot) + kReqPrefix);
+    return kReqPrefix + rdma::kPullPrepareBytes;
+  }
+  size_t EncodeRelease(size_t send_slot, const BlockKey& key,
+                       const rdma::DynamicPullReady& ready) {
+    EncodeReqVersion(ep.sbuf(send_slot), kNativeProtoRdmaV2,
+                     WireOp::kPullRelease, key, 0, ready.slot_generation,
+                     ready.slot_index + 1);
+    return kReqPrefix;
+  }
+  // Sends the requests built in send buffers 0..n-1 back to back, in that
+  // order, before waiting for any reply. Replies arrive in request order:
+  // reply i lands in receive buffer i.
+  bool Pipeline(const std::vector<size_t>& request_bytes,
+                std::vector<Status>* statuses) {
+    const size_t n = request_bytes.size();
+    for (size_t i = 0; i < n; ++i)
+      if (!ep.PostRecv(i)) return false;
+    for (size_t i = 0; i < n; ++i)
+      if (!ep.PostSend(i, request_bytes[i])) return false;
+    statuses->assign(n, Status::kIOError);
+    size_t sent = 0, received = 0;
+    while (sent < n || received < n) {
+      ibv_wc wc{};
+      if (ep.WaitComp(&wc, 1, 10000) != 1 || wc.status != IBV_WC_SUCCESS)
+        return false;
+      if (wc.opcode != IBV_WC_RECV) {
+        ++sent;
+        continue;
+      }
+      const size_t slot = static_cast<size_t>(wc.wr_id);
+      uint64_t bytes = 0;
+      if (slot >= n || wc.byte_len < kRespPrefix ||
+          !DecodeRespVersion(ep.rbuf(slot), kNativeProtoRdmaV2,
+                             &(*statuses)[slot], &bytes) ||
+          wc.byte_len != kRespPrefix + bytes)
+        return false;
+      ++received;
+    }
+    return true;
+  }
 };
 
 bool PinnedExists(PinnedPullPeer& peer, const BlockKey& key) {
@@ -2952,6 +3005,151 @@ TEST(RdmaLoopback, PullStagingReclaimsIdleQpSync) {
 TEST(RdmaLoopback, PullStagingReclaimsIdleQpUring) {
   ExercisePullStagingReclaimsIdleQp(true);
 }
+
+// A real client's pull window (width 2 here) sends its prepares back to back
+// and releases only after every READY and READ. With pool room for one
+// staging lease and an idle connection of another client, the second grant
+// takes that connection's lease, as it always has, at once.
+TEST(RdmaLoopback, APullWindowUnderPressureGrantsBothWithoutWaiting) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "0");
+  ScopedEnv idle("DFKV_RDMA_IDLE_MS", "5000");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const std::string value(4096, 'w');
+  // The window's two receive slots, one idle depth-1 connection, and room
+  // for one GET staging.
+  const size_t budget =
+      3 * rdma::V2SlotSize(kMaxMsg) + rdma::V2SlotSize(value.size());
+  const std::string budget_text = std::to_string(budget);
+  ScopedEnv segment("DFKV_RDMA_RECV_SEGMENT_SIZE", budget_text.c_str());
+  RdmaNode node("pull-window-pressure");
+  const BlockKey first{90221, 1}, second{90222, 1};
+  std::string ignored;
+  for (const BlockKey& key : {first, second})
+    ASSERT_EQ(node.srv->ProcessRequestForKey(
+                  static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
+                  value.data(), value.size(), &ignored), Status::kOk);
+  PinnedPullPeer victim, window;
+  ASSERT_TRUE(victim.Open(node));
+  ASSERT_TRUE(PinnedExists(victim, first));
+  ASSERT_TRUE(window.Open(node, 2));
+  size_t quiescent = 0;
+  for (int i = 0; i < 1000 && quiescent < 1; ++i) {
+    quiescent = RdmaServerTestPeer::RefreshQuiescentActivity(*node.rsrv, 1500);
+    if (quiescent < 1) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_GE(quiescent, 1u);
+  std::vector<Status> statuses;
+  const auto started = std::chrono::steady_clock::now();
+  ASSERT_TRUE(window.Pipeline({window.EncodePull(0, first, 0, value.size(), 0),
+                               window.EncodePull(1, second, 0, value.size(), 1)},
+                              &statuses));
+  const double elapsed_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - started).count();
+  EXPECT_EQ(statuses[0], Status::kOk);
+  EXPECT_EQ(statuses[1], Status::kOk);
+  EXPECT_LT(elapsed_ms, 100.0);
+  EXPECT_EQ(CounterVal(node.rsrv->MetricsText(),
+                       "dfkv_rdma_segment_evictions_total"), 1);
+  for (size_t i = 0; i < 2; ++i) {
+    rdma::DynamicPullReady ready;
+    ASSERT_TRUE(rdma::DecodeDynamicPullReady(window.ep.rbuf(i) + kRespPrefix,
+                                             &ready));
+    std::string bytes;
+    ASSERT_TRUE(window.Read(ready, &bytes));
+    EXPECT_EQ(bytes, value);
+    EXPECT_TRUE(window.Release(i == 0 ? first : second, ready));
+  }
+  EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
+}
+
+// A GET answered from the RAM arena through the prepared read (the pinned
+// zero-copy path refused, here by an injected registration failure) is read
+// by the client from the arena: its staging lease must go back to the pool
+// with the READY, not stay leased until the RELEASE.
+TEST(RdmaLoopback, AnArenaServedGetHoldsNoStagingWhileGranted) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+#ifndef DFKV_WITH_URING
+  GTEST_SKIP() << "io_uring not compiled";
+#endif
+  ScopedEnv uring("DFKV_SERVER_URING", "1");
+  ScopedEnv ram_on("DFKV_RAM_TIER", "1");
+  ScopedEnv ram_bytes("DFKV_RAM_TIER_BYTES", "8388608");
+  ScopedEnv extent("DFKV_RAM_TIER_EXTENT_BYTES", "1048576");
+  ScopedEnv reserve("DFKV_RAM_TIER_LARGE_RESERVE_BYTES", "4194304");
+  ScopedEnv shards("DFKV_RAM_TIER_SHARDS", "1");
+  ScopedEnv reclaim("DFKV_RAM_RECLAIM_MS", "0");
+  ScopedEnv writearound("DFKV_RAM_WRITE_MODE", "writearound");
+  RdmaNode node("arena-no-staging", kMaxMsg, /*fail_pinned_registration=*/true,
+                /*prepare_reads=*/true);
+  if (CounterVal(node.rsrv->MetricsText(), "dfkv_uring_init_fallbacks_total") > 0)
+    GTEST_SKIP() << "io_uring unavailable at runtime";
+  const BlockKey key = ToBlockKey(SelfHdr(), "arena-no-staging");
+  const std::string value = PatternValue(65537, 41);
+  ASSERT_TRUE(KvNodeServerTestPeer::Promote(*node.srv, key, value));
+  PinnedPullPeer peer;
+  ASSERT_TRUE(peer.Open(node));
+  rdma::DynamicPullReady ready;
+  ASSERT_TRUE(peer.Prepare(key, 0, value.size(), &ready));
+  EXPECT_EQ(CounterVal(node.rsrv->MetricsText(),
+                       "dfkv_rdma_dynamic_get_bytes_active"), 0)
+      << "the staging lease was kept while the client reads the arena";
+  std::string bytes;
+  ASSERT_TRUE(peer.Read(ready, &bytes));
+  EXPECT_EQ(bytes, value);
+  ASSERT_TRUE(peer.Release(key, ready));
+  EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
+}
+
+// A GET of a key the node does not have needs no staging: it is answered
+// kNotFound at once, even with the receive pool full, and evicts nobody.
+void ExerciseMissNeedsNoStaging(bool use_uring) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+#ifndef DFKV_WITH_URING
+  if (use_uring) GTEST_SKIP() << "io_uring not compiled";
+#endif
+  ScopedEnv uring("DFKV_SERVER_URING", use_uring ? "1" : "0");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "1");
+  ScopedEnv idle("DFKV_RDMA_IDLE_MS", "5000");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  // Two connections and no room for staging.
+  const std::string budget = std::to_string(2 * rdma::V2SlotSize(kMaxMsg));
+  ScopedEnv segment("DFKV_RDMA_RECV_SEGMENT_SIZE", budget.c_str());
+  RdmaNode node(use_uring ? "miss-no-staging-uring" : "miss-no-staging-sync",
+                kMaxMsg, false, use_uring);
+  const BlockKey present{90211, 1}, absent{90212, 1};
+  std::string ignored;
+  ASSERT_EQ(node.srv->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), present, 0, 0,
+                "here", 4, &ignored), Status::kOk);
+  PinnedPullPeer victim, peer;
+  ASSERT_TRUE(victim.Open(node));
+  ASSERT_TRUE(PinnedExists(victim, present));
+  ASSERT_TRUE(peer.Open(node));
+  ASSERT_TRUE(PinnedExists(peer, present));
+  if (use_uring && CounterVal(node.rsrv->MetricsText(),
+                              "dfkv_uring_init_fallbacks_total") != 0)
+    GTEST_SKIP() << "io_uring unavailable at runtime";
+  size_t quiescent = 0;
+  for (int i = 0; i < 1000 && quiescent < 2; ++i) {
+    quiescent = RdmaServerTestPeer::RefreshQuiescentActivity(*node.rsrv, 1500);
+    if (quiescent < 2) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_EQ(quiescent, 2u);
+  std::vector<Status> statuses;
+  ASSERT_TRUE(peer.Pipeline({peer.EncodePull(0, absent, 0, 4096, 0)},
+                            &statuses));
+  EXPECT_EQ(statuses[0], Status::kNotFound);
+  const std::string metrics = node.rsrv->MetricsText();
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_segment_evictions_total"), 0)
+      << "a miss evicted an idle connection for staging it did not need";
+  EXPECT_TRUE(PinnedExists(victim, present));
+  EXPECT_EQ(node.RangeDirectCalls(absent), 0u);
+  EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
+}
+
+TEST(RdmaLoopback, AMissNeedsNoStagingSync) { ExerciseMissNeedsNoStaging(false); }
+TEST(RdmaLoopback, AMissNeedsNoStagingUring) { ExerciseMissNeedsNoStaging(true); }
 
 void ExercisePressureRefusesOnlyBusyQps(bool use_uring) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
@@ -4136,8 +4334,10 @@ TEST(RdmaLoopback, GrantOfAKilledClientIsReleasedAfterTheGrantTimeout) {
   ScopedEnv grant("DFKV_RDMA_GRANT_TIMEOUT_MS", "500");
   for (const bool lease : {true, false}) {
     SCOPED_TRACE(lease ? "PUT lease" : "GET grant");
+    // A GET grant is its exact READ registration: its staging lease (if it
+    // has one) may already be back in the pool, for an arena-served GET.
     const char* gauge =
-        lease ? "dfkv_rdma_leaseput_active" : "dfkv_rdma_dynamic_get_active";
+        lease ? "dfkv_rdma_leaseput_active" : "dfkv_rdma_dynamic_get_mr_active";
     std::atomic<pid_t> victim{0};
     std::atomic<bool> killed{false};
     std::atomic<int64_t> killed_at_us{0};
@@ -4154,7 +4354,7 @@ TEST(RdmaLoopback, GrantOfAKilledClientIsReleasedAfterTheGrantTimeout) {
                       return;
                     const RdmaServer& server = *node_ptr->rsrv;
                     if ((lease ? RdmaServerTestPeer::LeasePutActive(server)
-                               : RdmaServerTestPeer::DynamicGetActive(server)) == 0)
+                               : rdma::RcEndpoint::LeaseReadMrActive()) == 0)
                       return;
                     ::kill(pid, SIGKILL);
                     killed_at_us.store(now_us());

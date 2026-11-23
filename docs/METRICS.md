@@ -222,12 +222,14 @@ RDMA-listener scrape inventory。
 | `dfkv_rdma_pull_connections` | gauge | 当前 dynamic pull 连接数，包含新握手和 v2.28 dynamic 过渡连接 |
 | `dfkv_rdma_pull_zerocopy_served_total` | counter | 为 RAM arena 命中准备的 zero-copy dynamic-pull READY 数，不等于客户端成功完成的 READ 数 |
 | `dfkv_rdma_pull_zerocopy_register_failures_total` | counter | RAM arena 命中但逐次 MR 注册失败、退回拷贝路径的次数；持续增长通常是 memlock 上限或设备 MR 数量上限不够 |
+| `dfkv_rdma_dynamic_get_active` / `dfkv_rdma_dynamic_get_bytes_active` | gauge | 当前持有的 GET staging 租约数 / 字节（staging held，不是在途 grant 数）：从授权到 RELEASE；client 从 RAM arena 读的 GET 在发 READY 时就归还 staging，此后不再计入 |
 | `dfkv_rdma_dynamic_get_mr_active` | gauge | 当前进程存活的 exact dynamic READ MR；PullRelease 先撤销 MR，再释放 RAM pin，断连由 QP 销毁完成 fencing |
 | `dfkv_op_latency_seconds{op="get"}`（arena pull） | histogram | 记录 RAM handler 准备耗时，与 staged range handler 的计时边界一致；成功 PullRelease 后才提交样本，不包含客户端持有 grant、RDMA READ 或 MR 撤销时间。端到端延迟看客户端 bench，不能用此序列替代 |
 | `dfkv_rdma_connection_bytes{class=\"data|control\"}` | gauge | data/control connection 当前 lease 字节；应随 adaptive class 而非 logical max 增长 |
 | `dfkv_rdma_recv_segment_registered_rails` | gauge | 成功注册初始 receive chunk 的 rail 数；后续 chunk 按使用 rail 惰性注册 |
 | `dfkv_rdma_v2_ready` | gauge | 初始 receive chunk 与 rail anchor 是否就绪 |
 | `dfkv_rdma_segment_evictions_total` / `dfkv_rdma_idle_reclaims_total` | counter | hard budget 压力淘汰 / idle timeout 回收连接 |
+| `dfkv_rdma_unstaged_misses_total` | counter | 不分配 staging、直接回 kNotFound 的 GET（先查索引确认不存在）；以前 miss 也先租一段 staging，pool 紧张时还要等内存或驱逐别的连接 |
 | `dfkv_rdma_stop_drains_cut_total` | counter | 停止时 `DFKV_RDMA_STOP_DRAIN_MS` 到期、仍有连接持有授权而被关掉的次数 |
 | `dfkv_rdma_stop_grants_refused_total` | counter | 停止排空期间拒绝的新授权：GET 答 miss、leased PUT 答 `kCacheFull` |
 | `dfkv_rdma_grant_expiries_total` | counter | 持有授权（GET 的 READY、PUT 租约、多窗口 PUT 的下一窗）而静默超过 `DFKV_RDMA_GRANT_TIMEOUT_MS` 被关掉的连接；增长 = client 崩溃或超时放弃，日志里有对端地址 |

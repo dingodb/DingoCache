@@ -530,6 +530,9 @@ int main(int argc, char** argv) {
                char* staging, size_t cap) {
           return srv.PrepareReadForKey(key, off, len, staging, cap);
         });
+    rsrv->set_lookup_handler([&srv](const dfkv::BlockKey& key) {
+      return srv.LookupForGet(key);
+    });
     // B5-3: dynamic-pull GETs of arena-resident values serve the pinned arena
     // address instead of staging a payload-sized copy per pull.
     if (srv.ram_enabled()) {

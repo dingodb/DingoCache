@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Server, RDMA: a GET of a key the node does not have is answered
+  `kNotFound` before any staging lease. It leased one first, read nothing,
+  and under pool pressure waited for memory or evicted another client's
+  idle connection to get it (reproduced: a miss evicted an idle QP). A GET
+  served from the RAM arena through the prepared read gives its unused
+  staging lease back with the READY instead of at the RELEASE. A lease
+  release no longer takes the pool lock and walks the chunk's free list;
+  measured with 8 to 64 threads leasing at once, a lease costs half as
+  long and the pool serves 1.3 to 2.2 times as many (one thread: 0.39 µs,
+  was 0.45 µs). New `dfkv_rdma_unstaged_misses_total`.
 - Server, RDMA: receive-pool chunks are on transparent huge pages
   (`DFKV_RDMA_RECV_HUGEPAGES`, default on), as the RAM tier arena already
   was. Every GET staged from disk and every leased PUT registers its range

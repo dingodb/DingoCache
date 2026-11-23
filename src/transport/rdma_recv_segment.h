@@ -71,6 +71,9 @@ class RecvSegment {
   size_t size() const { return size_; }
   size_t free_bytes() const;
   Stats stats() const;
+  // When the last lease was released (or the segment initialized); 0 while
+  // a lease is out.
+  uint64_t EmptySinceMs() const;
 
  private:
   void Release(size_t offset, size_t bytes);
@@ -82,6 +85,8 @@ class RecvSegment {
   std::map<size_t, size_t> free_;  // offset -> length, sorted and coalesced
   bool huge_pages_ = false;
   bool mapped_ = false;  // data_ is an mmap of its own (huge pages)
+  size_t used_ = 0;                // under mu_
+  uint64_t empty_since_ms_ = 0;    // under mu_
   std::atomic<uint64_t> allocation_failures_{0};
 };
 
@@ -154,17 +159,20 @@ class RecvSegmentPool {
     std::unique_ptr<RecvSegment> segment;
     int affinity = -1;
     bool staging_only = false;
-    uint64_t empty_since_ms = 0;
   };
   std::unique_ptr<Chunk> NewChunk(size_t minimum_bytes, int affinity,
                                   int numa_node);
-  void NoteRelease(RecvSegment* segment);
+  // First fit over the committed chunks; mu_ held.
+  Lease AllocateFromChunks(size_t bytes, size_t alignment, int affinity,
+                           LeaseClass lease_class);
 
   size_t chunk_bytes_ = 0;
   size_t max_bytes_ = 0;
   size_t staging_reserve_bytes_ = 0;
   size_t alignment_ = 0;
   bool huge_pages_ = false;
+  // Allocations, growth, trimming. A release takes only its chunk's own
+  // lock: it no longer goes through the pool.
   mutable std::mutex mu_;
   std::vector<std::unique_ptr<Chunk>> chunks_;
   std::atomic<uint64_t> growths_{0};

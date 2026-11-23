@@ -96,6 +96,11 @@ class RdmaServer {
   void set_pinned_ram_handler(PinnedRamHandler h) {
     pinned_ram_handler_ = std::move(h);
   }
+  // Optional existence check of a GET before it is given a staging lease:
+  // kNotFound is answered at once, with no lease and no wait for receive-pool
+  // memory. Unset: every GET is staged and the read answers the miss.
+  using LookupHandler = std::function<Status(const BlockKey& key)>;
+  void set_lookup_handler(LookupHandler h) { lookup_handler_ = std::move(h); }
   ~RdmaServer();
 
   Status Start(int port);  // TCP bootstrap port
@@ -238,6 +243,7 @@ class RdmaServer {
   CacheDirectBatchHandler cache_direct_batch_handler_;
   PrepareReadHandler prepare_read_handler_;
   PinnedRamHandler pinned_ram_handler_;
+  LookupHandler lookup_handler_;
   size_t max_msg_;
   std::string dev_name_;
   bool auto_device_ = true;
@@ -295,6 +301,8 @@ class RdmaServer {
   // DFKV_RDMA_RECV_SEGMENT_SIZE remains the hard process budget.
   rdma::RecvSegmentPool recv_segments_;
   std::atomic<uint64_t> segment_evictions_{0};
+  // GETs answered kNotFound by lookup_handler_ before any staging lease.
+  std::atomic<uint64_t> unstaged_misses_{0};
   size_t recv_segment_max_bytes_ = 0;
   size_t recv_segment_chunk_bytes_ = 0;
   uint64_t recv_chunk_idle_ms_ = 60000;

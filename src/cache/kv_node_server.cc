@@ -1356,6 +1356,16 @@ Status KvNodeServer::LookupForKey(const BlockKey& key,
 }
 
 
+Status KvNodeServer::LookupForGet(const BlockKey& key) {
+  ValueMetadata metadata;
+  const Status st = LookupForKey(key, &metadata);
+  if (st == Status::kNotFound) {
+    cache_miss_.fetch_add(1, std::memory_order_relaxed);
+    if (ram_) ram_->NoteMiss();
+  }
+  return st;
+}
+
 Status KvNodeServer::ProcessRequestForKey(
     uint8_t op_raw, const BlockKey& key, uint64_t offset, uint64_t length,
     const char* payload, uint64_t payload_len, std::string* out_data,
