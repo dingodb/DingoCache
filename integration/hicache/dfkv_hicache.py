@@ -21,6 +21,7 @@ import hashlib
 import inspect
 import threading
 import logging
+import math
 import os
 import sys
 import time
@@ -1000,7 +1001,9 @@ class DfkvHiCache(HiCacheStorage):
         self._retain_tls = threading.local()
         # SGLang touches a request's prefix right after insert; pages still
         # in the backup queue answer MISS and are protected after their write.
-        self._pending_retain: "collections.OrderedDict[bytes, int]" = (
+        # key -> monotonic deadline: a parked TTL lapses when the protection
+        # it asked for would have ended.
+        self._pending_retain: "collections.OrderedDict[bytes, float]" = (
             collections.OrderedDict())
         self._pending_lock = threading.Lock()
         native_ver = _native_version(self._lib)
@@ -2068,6 +2071,22 @@ class DfkvHiCache(HiCacheStorage):
                 f"protected for {ttl}s ({failed})")
         return codes
 
+    def _park_retain(self, keys, ttl) -> None:
+        """Park a TTL for keys not stored yet. Their write protects them for
+        what is left of it, and not at all once it has run out. Before, a
+        parked TTL never lapsed: a page written long after the touch (or a
+        key whose write never came, until 2^20 newer keys pushed it out) was
+        protected for a full TTL the request no longer needed."""
+        now = time.monotonic()
+        with self._pending_lock:
+            pending = self._pending_retain
+            for sk in keys:
+                pending[sk] = max(now + ttl, pending.get(sk, now))
+                pending.move_to_end(sk)
+            while pending and (len(pending) > self._PENDING_RETAIN_MAX
+                               or next(iter(pending.values())) <= now):
+                pending.popitem(last=False)
+
     def _retain_after_write(self, sks, stored) -> None:
         """SET every stored sub-object of this write that carries a TTL:
         from the write's extra_info, or parked by an earlier batch_touch."""
@@ -2077,11 +2096,15 @@ class DfkvHiCache(HiCacheStorage):
         pending = getattr(self, "_pending_retain", None)
         by_ttl: dict = {}
         if pending:
+            now = time.monotonic()
             with self._pending_lock:
                 for sk, ok in zip(sks, stored):
                     if not ok:
                         continue
-                    ttl = max(ctx_ttl, pending.pop(sk, 0))
+                    # What is left of the parked protection, not a new TTL.
+                    deadline = pending.pop(sk, now)
+                    left = math.ceil(deadline - now) if deadline > now else 0
+                    ttl = max(ctx_ttl, left)
                     if ttl > 0:
                         by_ttl.setdefault(ttl, []).append(sk)
         elif ctx_ttl > 0:
@@ -2326,13 +2349,7 @@ class DfkvHiCache(HiCacheStorage):
                 missing = [sk for sk, c in zip(sks[:parkable], codes)
                            if c == dfkv_cabi.DFKV_RET_MISS]
                 if missing:
-                    with self._pending_lock:
-                        for sk in missing:
-                            self._pending_retain[sk] = max(
-                                ttl, self._pending_retain.get(sk, 0))
-                            self._pending_retain.move_to_end(sk)
-                        while len(self._pending_retain) > self._PENDING_RETAIN_MAX:
-                            self._pending_retain.popitem(last=False)
+                    self._park_retain(missing, ttl)
             else:
                 dfkv_cabi.call_batch_retain(
                     self._lib, self._h, sks, ttl,

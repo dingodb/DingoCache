@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- SGLang HiCache: a parked retention TTL lapses with its TTL (HIC-28). A
+  `batch_touch` that finds pages not stored yet parks their TTL for the
+  write; it never lapsed, so a page written long after the touch was
+  protected for a full TTL the request no longer needed, and keys whose
+  write never came stayed until 2^20 newer ones pushed them out. The write
+  now protects such a page for what is left of the parked TTL, not at all
+  once it has run out, and lapsed entries leave the table.
+
 - SGLang HiCache: `retain_precheck` reuses an admission for a tenth of its
   TTL (HIC-27). SGLang asks it for every request that carries a retention
   TTL, and each call built the object keys of the whole prefix and made two
