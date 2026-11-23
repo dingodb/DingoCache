@@ -304,6 +304,13 @@
   and the software fallback are unchanged. It is the log engine's payload
   checksum, on every PUT and whole-value GET.
 
+- perf: log engine index hash mixes every key field (experimental `log`
+  engine only). Keys whose fields are related, such as `{id * C + 1, id}`,
+  fell into a few buckets of the index, shadow and flight tables, so each
+  PUT spent long in hash chains under the store mutex: 1-byte PUTs with 8
+  writers had a p99 of 168 ms, now 2.5 ms. The hash is now seeded per
+  process and mixes every field, as slab's index does.
+
 - Server, TCP: the first frame of a connection gets the same payload
   allowance as later frames (1 MiB/s on top of `DFKV_TCP_FIRST_REQ_MS`), so a
   large first PUT on a slow link is not cut off at the first-request

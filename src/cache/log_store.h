@@ -193,10 +193,23 @@ class LogStore : public StoreEngine {
 
  private:
   friend class LogStoreTestPeer;
+  // Every field mixed, seeded per process as slab's index is: keys whose
+  // fields are related (digest_hi a multiple of digest_lo, as a client's
+  // counters can be) must not collide, and chosen keys cannot either.
   struct KeyHash {
+    static uint64_t Mix(uint64_t h) {
+      h ^= h >> 33;
+      h *= 0xFF51AFD7ED558CCDull;
+      h ^= h >> 33;
+      h *= 0xC4CEB9FE1A85EC53ull;
+      h ^= h >> 33;
+      return h;
+    }
+    static uint64_t Seed();
     size_t operator()(const BlockKey& k) const {
-      return static_cast<size_t>(k.digest_hi ^ (k.digest_lo * 0x9e3779b97f4a7c15ULL) ^
-                                 (k.tenant_hash << 1));
+      static const uint64_t seed = Seed();
+      return static_cast<size_t>(
+          Mix(Mix(Mix(k.digest_lo ^ seed) ^ k.digest_hi) ^ k.tenant_hash));
     }
   };
   // Where a record is: its segment, the incarnation it was written in, and
