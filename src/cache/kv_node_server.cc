@@ -713,6 +713,10 @@ std::string KvNodeServer::MetricsText() const {
   metric("dfkv_read_coalesce_recur_total", "counter",
          "Staged reads that hit a recurrence tombstone (drift diagnostic)",
          read_coalescer_.recur_hits());
+  metric("dfkv_read_coalesce_held_reads_total", "counter",
+         "Coalesce followers that read for themselves because their serve "
+         "thread held an unfinished read of its own",
+         read_coalescer_.held_fallbacks());
   metric("dfkv_accepts_total", "counter", "TCP connections accepted", AcceptCount());
   metric("dfkv_evictions_total", "counter", "Objects evicted (capacity pressure)",
          group_.Evictions());
