@@ -70,7 +70,11 @@ class KvNodeServer {
   void CancelParkedPuts();
   // Cluster member list this node advertises for discovery (kMembers wire op):
   // "name=ip:port,name=ip:port,...". Clients query any node to learn the cluster.
-  void set_members(const std::string& members) { members_ = members; }
+  // May change while requests are served.
+  void set_members(const std::string& members) {
+    std::lock_guard<std::mutex> lock(members_mu_);
+    members_ = members;
+  }
   // Node identity for Prometheus labels. When unset, series are emitted unlabeled
   // (back-compat with single-node scrapes / older tooling).
   void set_identity(const std::string& id, const std::string& group) {
@@ -390,6 +394,7 @@ class KvNodeServer {
   // exist on the same connection) is a separate, connection-ordered cost the
   // client's control-lane QP split is meant to avoid.
   LatencyHist exist_lat_;
+  mutable std::mutex members_mu_;
   std::string members_;  // advertised cluster membership (kMembers)
   uint64_t max_request_payload_ = 0;  // 0 = resolve default lazily (see .cc)
   std::string node_id_, node_group_;       // identity for Prometheus labels (optional)
