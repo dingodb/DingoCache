@@ -159,7 +159,7 @@ retired identity/value format.
 | native RDMA v2 | 50-byte prefix; GET adds a 16-byte pull prepare | 18-byte stored-length prefix; GET READY adds 48 bytes; `Members` allows at most 32 KiB data | PUT `WRITE_WITH_IMM` into a leased server slot; GET client `RDMA_READ` from an exact server grant |
 
 Both prefixes start with an explicit 1-byte protocol epoch: TCP accepts epoch 6
-and native RDMA v2 accepts epoch 7. An unknown or unexpected epoch fails fast
+and native RDMA v2 accepts epoch 8. An unknown or unexpected epoch fails fast
 instead of being mis-parsed. RDMA v2 is negotiated during the TCP bootstrap
 before QPs exchange frames. Replies remain strict FIFO on each RC QP. RDMA
 control buffers have an explicit `18-byte prefix + 32-KiB response` capacity;
@@ -643,7 +643,7 @@ data plane or the connection fails.
 | io_uring async GET | build `-DDFKV_WITH_URING`; `DFKV_SERVER_URING=0` disables | on when built, unavailable otherwise | RDMA v2 disk-read path |
 | first-request absolute deadline | `DFKV_TCP_FIRST_REQ_MS` / `DFKV_MDS_FIRST_REQ_MS` / `DFKV_METRICS_FIRST_REQ_MS` | 30000 ms; `0` = off | anchored at accept: the first complete frame/request line is due within this window, so a drip feeder cannot pin a handler thread; `dfkv_server` also publishes its resolved value as the `dfkv_tcp_first_req_ms` gauge |
 | later-frame deadline (`dfkv_server` TCP) | `DFKV_TCP_IO_TIMEOUT_S` | 60 s | each later frame, from its first byte, is due within the IO timeout plus its payload at 1 MiB/s; the payload buffer grows as bytes arrive (doubling from 1 MiB) instead of being allocated at the declared length |
-| MDS legacy control-plane shim | `DFKV_MDS_ACCEPT_LEGACY=1` | off (strict epoch gate) | widens the MDS control-plane version gate by exactly one epoch so v1.x peers are served with legacy 42/10-byte framing during a mixed-generation migration; data-plane listeners stay strictly epoch 6/7; drop the env once `dfkv_mds_legacy_frames_total` drains to zero |
+| MDS legacy control-plane shim | `DFKV_MDS_ACCEPT_LEGACY=1` | off (strict epoch gate) | widens the MDS control-plane version gate by exactly one epoch so v1.x peers are served with legacy 42/10-byte framing during a mixed-generation migration; data-plane listeners stay strictly epoch 6 (TCP) / 8 (RDMA v2); drop the env once `dfkv_mds_legacy_frames_total` drains to zero |
 | MDS /readyz etcd probe debounce | `DFKV_MDS_PROBE_CACHE_MS` | 2500 ms (clamp 600000; `0` = per-request probe) | TTL-debounced etcd reachability probe so kubelet scrape cadence cannot amplify into etcd read load during an incident |
 | MDS member list while etcd refuses writes | `DFKV_MDS_UNWRITTEN_HOLD_MS` | 120000 ms (four lease TTLs; clamp 600000; `0` = off) | the MDS remembers members whose heartbeat it received but could not write to etcd and answers `kIOError` to `ListMembers`/`ListTopology` while etcd no longer lists one of them, so clients keep their last ring instead of adopting a view emptied by lease expiry; only heartbeats are recorded (a registrar sends one only after a successful registration, so a node that cannot get in is not a missing member); a record is dropped by the member's next successful write or after this long without a heartbeat at that MDS, so the value has to exceed the number of MDS endpoints times the 10 s heartbeat interval; `0` serves the etcd view unconditionally (behaviour up to 2.36) |
 
