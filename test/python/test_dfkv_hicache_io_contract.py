@@ -623,6 +623,50 @@ class _OpenOnlyLib:
         return b"0.0.0"
 
 
+class DpAttentionKeysAreShared(unittest.TestCase):
+    """Under DP-attention SGLang hands the storage backend the attention-
+    group-local TP rank and size (cache_controller: tp_rank = attn_tp_rank,
+    tp_size = attn_tp_size). The keys must come from those, so the same
+    attention shard in two DP groups shares its objects; keys from the
+    global TP rank would share nothing across DP groups."""
+
+    def setUp(self):
+        env = unittest.mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ["DFKV_CLIENT_NODE_DEDUP"] = "0"
+
+    def _backend(self, global_tp_rank, attn_dp_rank):
+        # TP 8 as 2 DP groups of attention TP 4; this rank is attention rank 1.
+        parallel = types.SimpleNamespace(
+            tp_rank=global_tp_rank, tp_size=8, attn_tp_rank=1, attn_tp_size=4,
+            attn_dp_rank=attn_dp_rank, attn_cp_size=1, attn_cp_rank=0)
+        cfg = HiCacheStorageConfig(
+            tp_rank=1, tp_size=4, is_mla_model=False, model_name="dp-test",
+            extra_config={"members": "n0=127.0.0.1:1", "interface_v1": 1,
+                          "client_stats_poll_s": 0})
+        with unittest.mock.patch.object(dfkv_hicache, "_load_lib",
+                                        return_value=_OpenOnlyLib()), \
+                unittest.mock.patch.object(
+                    dfkv_hicache, "_probe_parallel_context",
+                    return_value=(parallel, None)):
+            st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+        st._pool_component_names = {"state": ("temporal",)}
+        st._pool_replicated = {"state": False}
+        return st
+
+    def test_same_attention_shard_in_two_dp_groups_shares_keys(self):
+        group0 = self._backend(global_tp_rank=1, attn_dp_rank=0)
+        group1 = self._backend(global_tp_rank=5, attn_dp_rank=1)
+        self.assertEqual((group0.tp_rank, group0.tp_size), (1, 4))
+        self.assertEqual(group0._keys("p"), group1._keys("p"))
+        self.assertEqual(group0._pool_keys("state", "p"),
+                         group1._pool_keys("state", "p"))
+        self.assertEqual(group0._keys("p"), [
+            dfkv_hicache.pool_key("p", pool="kv", tp_size=4, tp_rank=1,
+                                  component=c) for c in ("k", "v")])
+
+
 class ExtraConfigThroughTheBackend(unittest.TestCase):
     """The checks through the public path: construct, register a pool."""
 
