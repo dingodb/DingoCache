@@ -56,9 +56,9 @@ beat a small-object penalty?
 **Decision:** do not add key-coalescing now. Use depth pipelining (#1). Revisit only
 if a future model is MHA with small pages (small-object, message-rate-bound).
 
-## #1 — write pipelining: measured on an 8x400G IB testbed (depth flat; multi-connection is the lever)
+## #1 — write pipelining: measured on a multi-rail IB testbed (depth flat; multi-connection is the lever)
 
-Empirical (8x400G IB testbed, 3-node, 1 MiB PUT, single writer thread, batch 64):
+Empirical (multi-rail IB testbed, a few nodes, 1 MiB PUT, single writer thread, batch 64):
 
 | knob | PUT GB/s |
 |------|----------|

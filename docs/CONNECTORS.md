@@ -426,8 +426,8 @@ before. A later release will not accept this value.` 以后的版本会收紧这
 export PYTHONPATH=/userdata/dfkv:$PYTHONPATH
 export DFKV_LIB=/userdata/dfkv/libdfkv.so
 export DFKV_RDMA=1                       # 启用 RDMA 数据面（否则 TCP）
-# 数据面设备；多轨用逗号列表（标准节点 8×400G）
-export DFKV_RDMA_DEV=ib7s400p0,ib7s400p1,ib7s400p2,ib7s400p3,ib7s400p4,ib7s400p5,ib7s400p6,ib7s400p7
+# 数据面设备；多轨用逗号列表，列出本机全部数据面 rail
+export DFKV_RDMA_DEV=mlx5_0,mlx5_1
 export DFKV_RDMA_NUMA=1                   # 可选：多 NUMA 大机 NUMA 选轨（§1.2）
 export DFKV_RDMA_MAX_PAYLOAD_BYTES=67108864  # 总 payload 上限，不会代替下面的对象声明
 export DFKV_RDMA_MAX_BLOCK_BYTES=67108864    # 按最大实际对象配置；默认仅4MiB
@@ -924,7 +924,7 @@ python -m pip install integration/common integration/vllm
 ```bash
 PYTHONHASHSEED=0 \
 DFKV_RDMA=1 \
-DFKV_RDMA_DEV=ib7s400p0,ib7s400p1,ib7s400p2,ib7s400p3,ib7s400p4,ib7s400p5,ib7s400p6,ib7s400p7 \
+DFKV_RDMA_DEV=mlx5_0,mlx5_1 \
 DFKV_RDMA_DEPTH=1 \
 DFKV_RDMA_NUMA=0 \
 DFKV_LIB=/opt/dfkv/libdfkv.so \
@@ -987,7 +987,7 @@ nerdctl/Docker 参考（参数必须出现在**创建容器**时，容器启动�
 nerdctl run --ulimit memlock=-1:-1 \
   -e PYTHONHASHSEED=0 \
   -e DFKV_RDMA=1 \
-  -e DFKV_RDMA_DEV=ib7s400p0,ib7s400p1 \
+  -e DFKV_RDMA_DEV=mlx5_0,mlx5_1 \
   -e DFKV_RDMA_DEPTH=1 \
   -e DFKV_RDMA_NUMA=0 \
   ... <image> \
