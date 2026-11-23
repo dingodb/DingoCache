@@ -391,6 +391,17 @@ class StoreEngine {
   // per-disk engine metric reports.
   virtual const char* EngineName() const { return "unknown"; }
   virtual RetentionStats GetRetentionStats() const { return {}; }
+  // Metrics of this engine alone (the log engine's dfkv_lse_* family),
+  // reported per disk. Engines with none add nothing.
+  struct EngineMetric {
+    const char* name;
+    const char* type;  // "gauge" or "counter"
+    const char* help;
+    uint64_t value;
+  };
+  virtual void EngineMetrics(std::vector<EngineMetric>* out) const {
+    (void)out;
+  }
 };
 
 }  // namespace dfkv

@@ -6,8 +6,9 @@
  *
  * Implemented so far (design §14): the core (stage 3) with one open client
  * segment; sealing with summaries and trailers, summary-based recovery and
- * the clean close (stage 5). No eviction yet (a full store answers
- * kCacheFull), no RETAIN. It is selectable only with
+ * the clean close (stage 5); the cleaner with second-chance relocation,
+ * inline reclaim, shadows, journal compaction and capacity changes (stage 6).
+ * No RETAIN yet. It is selectable only with
  * DFKV_LSE_EXPERIMENTAL=1 and writes the development-format bit. */
 #ifndef DFKV_LOG_STORE_H_
 #define DFKV_LOG_STORE_H_
@@ -60,9 +61,23 @@ class LogStore : public StoreEngine {
     std::function<void(const BlockKey&)> on_reserve;
     // Test hook: a REMOVE took the store's mutex (called with it held).
     std::function<void(const BlockKey&)> on_remove;
+    // Test hook: a key's indexed value was evicted (with its generation).
+    // Called with the store's mutex held.
+    std::function<void(const BlockKey&, uint64_t)> on_evict;
+    // false: no cleaner thread (tests of the inline reclaim, and opens that
+    // check what came back).
+    bool cleaner = true;
 
     // DFKV_LSE_SYNC_MS: open segments are fdatasynced this often (§6.5).
     uint32_t sync_ms = 1000;
+    // DFKV_LSE_PIN_WAIT_MS: how long the cleaner waits for a victim's pins.
+    uint32_t pin_wait_ms = 5000;
+    // DFKV_LSE_RELOCATE_PCT: relocated bytes of referenced records as a
+    // share of client bytes written (§7.3).
+    uint32_t relocate_pct = 25;
+    // The journal is compacted once it holds more than four times its live
+    // entries and at least this many bytes (§4.5).
+    uint64_t journal_compact_bytes = 64ull << 20;
   };
   // Reads the DFKV_LSE_* settings into `o` (a malformed
   // value keeps the default, with a warning, as every setting does).
@@ -107,12 +122,13 @@ class LogStore : public StoreEngine {
   uint64_t UsedBytes() const override;
   uint64_t TenantUsedBytes(uint64_t tenant_hash) const override;
   size_t Count() const override;
-  uint64_t Evictions() const override { return 0; }
-  uint64_t EvictedBytes() const override { return 0; }
+  uint64_t Evictions() const override;
+  uint64_t EvictedBytes() const override;
   const std::string& Dir() const override { return opt_.dir; }
   uint64_t MaxValueBytes() const override;
   const char* EngineName() const override { return "log"; }
 
+  void EngineMetrics(std::vector<EngineMetric>* out) const override;
 
   // What the last open recovered (tests, the open log line).
   struct RecoveryStats {
@@ -127,12 +143,23 @@ class LogStore : public StoreEngine {
   };
   RecoveryStats GetRecoveryStats() const { return recovery_; }
 
-  // Counters since the open (tests).
+  // Counters since the open (the dfkv_lse_* metrics and tests).
   struct Stats {
     uint64_t segments_sealed = 0;
+    uint64_t segments_reclaimed = 0;
+    uint64_t inline_reclaims = 0;
+    uint64_t records_relocated = 0;
+    uint64_t relocated_bytes = 0;
+    uint64_t records_evicted = 0;
+    uint64_t evicted_bytes = 0;
+    uint64_t budget_exhausted = 0;
+    uint64_t victims_skipped_pins = 0;
     uint64_t cache_full = 0;
     uint64_t read_crc_failures = 0;
+    uint64_t journal_compactions = 0;
     uint64_t journal_resets = 0;
+    uint64_t segments_grown = 0;
+    uint64_t segments_shrunk = 0;
     // Current state.
     uint32_t segments_free = 0;
     uint32_t segments_sealed_now = 0;
@@ -170,6 +197,7 @@ class LogStore : public StoreEngine {
     // header_len); 0: the payload follows the header block.
     uint16_t inline_at = 0;
     uint64_t write_lsn = 0;
+    bool referenced = false;  // read since written or last relocated (§7.3)
   };
   static uint64_t Footprint(const Entry& e);
   struct Shadow {
@@ -178,10 +206,19 @@ class LogStore : public StoreEngine {
     bool kill_pending = false;  // its KILL is enqueued, durable at `ticket`
     uint64_t ticket = 0;
   };
-  enum class SegState { kFree, kOpen, kSealing, kSealed, kWalked };
+  // A relocation in progress (§7.4): its destination, for REMOVE's kill set
+  // and the shadow rule.
+  struct Reloc {
+    Location source;
+    Location dest;
+    uint64_t generation = 0;
+    bool dest_shadowed = false;
+  };
+  enum class SegState { kFree, kOpen, kRelocation, kSealing, kSealed, kWalked };
   struct Segment {
     SegState state = SegState::kFree;
     bool header_valid = false;  // its current header is durable and ours
+    bool reclaiming = false;    // claimed by the cleaner or an inline reclaim
     uint64_t incarnation = 0;
     uint64_t append_off = lse::kBlockBytes;  // next record offset (bytes)
     uint32_t records = 0;       // records placed in this incarnation
@@ -192,7 +229,12 @@ class LogStore : public StoreEngine {
     bool dirty = false;         // written by this run: synced at Close
     bool unsynced = false;      // written since the last periodic sync
     uint64_t last_lsn = 0;      // highest write_lsn placed (seal order)
-    // Records written in this incarnation: the summary it gets when sealed.
+    // Segments holding copies relocated out of this incarnation that may not
+    // be synced yet, also by an attempt that gave up: synced before its next
+    // header (C20).
+    std::vector<uint32_t> copies;
+    // Records written in this incarnation: the summary it gets when sealed,
+    // and the cleaner's view of the segment.
     std::vector<lse::SummaryEntry> summary;
     int fd = -1;                // buffered descriptor
     int dio_fd = -1;            // O_DIRECT descriptor (direct mode)
@@ -225,6 +267,7 @@ class LogStore : public StoreEngine {
                    bool* loaded);
   bool WalkSegment(uint32_t index, std::vector<lse::SummaryEntry>* records);
   bool ResetToEmpty();
+  bool ChangeCapacityLocked();
   // A new incarnation for the segment, durable. `empty`: also a trailer
   // with no records, so that a free segment is not walked at the next open.
   bool FreshHeader(uint32_t index, bool empty = false);  // with mu_ held
@@ -241,9 +284,12 @@ class LogStore : public StoreEngine {
   Status Put(const BlockKey& key, size_t len, const WriteFn& write);
   bool ReserveLocked(Lock& lk, uint64_t footprint, uint32_t* segment,
                      uint64_t* offset);
+  bool ReserveRelocationLocked(Lock& lk, uint64_t footprint,
+                               uint32_t* segment, uint64_t* offset);
   bool PlaceLocked(uint32_t segment, uint64_t footprint, uint64_t* offset);
-  // Takes a free segment and gives it a fresh header.
-  bool TakeFreeSegmentLocked(uint32_t* out);
+  // Takes a free segment and gives it a fresh header. `client`: leave the
+  // cleaner's reserve alone.
+  bool TakeFreeSegmentLocked(bool client, uint32_t* out);
   // Hands an open segment to the sealer; waits while its queue is full.
   void HandToSealerLocked(Lock& lk, uint32_t segment);
   uint64_t NextLsnLocked();
@@ -259,9 +305,20 @@ class LogStore : public StoreEngine {
   bool SealSegment(Lock& lk, uint32_t segment);
   void SealerLoop();
 
-  // A sealed segment whose records are all killed is free again.
+  // ---- cleaning (§7) ----
+  void CleanerLoop();
+  bool CleanOnce(Lock& lk);
+  bool ReclaimVictim(Lock& lk, uint32_t victim);
+  bool RelocateOne(Lock& lk, const BlockKey& key, const Entry& e);
+  bool SyncCopiesLocked(Lock& lk, uint32_t victim);
+  bool InlineReclaimLocked(Lock& lk);
+  void EvictLocked(const BlockKey& key);
+  void FinishReclaimLocked(uint32_t victim, uint64_t old_incarnation);
+  bool RelocationBudgetLocked(uint64_t bytes) const;
   void RemoveFromFifoLocked(uint32_t segment);
   void MaybeFreeLocked(uint32_t segment);
+  uint32_t FreeCountLocked() const;
+  std::vector<lse::JournalEntry> LiveJournalEntries();
 
   // ---- read path ----
   bool AcquireLocked(const BlockKey& key, Entry* out);
@@ -289,8 +346,9 @@ class LogStore : public StoreEngine {
   lse::Superblock sb_;
   std::vector<Segment> segments_;
   uint32_t open_segment_ = UINT32_MAX;
+  uint32_t reloc_segment_ = UINT32_MAX;
   std::vector<uint32_t> free_;   // free segments, in the order they are taken
-  std::deque<uint32_t> fifo_;    // sealed segments, oldest first
+  std::deque<uint32_t> fifo_;    // sealed segments, oldest first (§7.2)
   std::deque<uint32_t> seal_queue_;
 
   mutable std::mutex mu_;
@@ -298,10 +356,17 @@ class LogStore : public StoreEngine {
   std::unordered_map<BlockKey, Entry, KeyHash> index_;
   std::unordered_multimap<BlockKey, Shadow, KeyHash> shadows_;
   std::unordered_map<BlockKey, std::shared_ptr<Flight>, KeyHash> flights_;
+  std::unordered_map<BlockKey, Reloc, KeyHash> relocs_;
   std::unordered_map<uint64_t, uint64_t> tenant_bytes_;
   uint64_t used_bytes_ = 0;
   uint64_t next_lsn_ = 1;
   uint64_t next_incarnation_ = 1;
+  // KILL entries in the journal whose segment still has the incarnation
+  // they name: what a compaction keeps (§4.5).
+  std::unordered_map<uint32_t, std::vector<lse::JournalEntry>> live_kills_;
+  // Relocation budget window (§7.3).
+  uint64_t window_client_bytes_ = 0;
+  uint64_t window_relocated_bytes_ = 0;
 
   // Recovery results kept until Activate().
   struct KillKey {
@@ -320,15 +385,21 @@ class LogStore : public StoreEngine {
     }
   };
   std::unordered_set<KillKey, KillKeyHash> kills_;
+  std::vector<lse::JournalEntry> recovered_kills_;
   uint64_t journal_stop_offset_ = 0;
   uint64_t journal_next_seq_ = 1;
+  uint64_t journal_entries_ = 0;
   bool needs_reset_ = false;
   RecoveryStats recovery_;
   Stats stats_;
 
   std::unique_ptr<Journal> journal_;
   bool stop_threads_ = false;
+  // The cleaner reclaims only once a PUT has needed a segment beyond the one
+  // Activate opened: a restart keeps everything it recovered until then.
+  bool cleaner_armed_ = false;
   std::thread sealer_;
+  std::thread cleaner_;
 };
 
 }  // namespace dfkv

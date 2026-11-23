@@ -130,6 +130,10 @@ class DiskCacheGroup {
   bool HasSlabDisks() const { return has_slab_; }
   // The engine disk i runs (its StoreEngine::EngineName).
   std::string DiskEngineName(size_t i) const { return disks_[i]->EngineName(); }
+  void DiskEngineMetrics(size_t i,
+                         std::vector<StoreEngine::EngineMetric>* out) const {
+    disks_[i]->EngineMetrics(out);
+  }
   // Slab I/O mode actually in effect ("direct" | "buffered"; empty for file
   // engine). Direct is the deployment default; a filesystem that rejects
   // O_DIRECT (tmpfs) resolves to buffered regardless of the env.

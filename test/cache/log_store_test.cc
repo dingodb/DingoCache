@@ -199,26 +199,29 @@ TEST(LogStore, AValueLargerThanASegmentCanHoldIsInvalid) {
   fs::remove_all(dir);
 }
 
-TEST(LogStore, AFullStoreAnswersCacheFullAndStaysHealthy) {
+// A store written far past its capacity evicts its oldest values and keeps
+// accepting writes (design §7); what it serves is always right.
+TEST(LogStore, AFullStoreEvictsTheOldestAndStaysHealthy) {
   const fs::path dir = TestDir("full");
   bool ok = false;
   LogStore s(Opts(dir, 32ull << 20), &ok);
   ASSERT_TRUE(ok) << s.StartupError();
   const std::string v(1 << 20, 'f');
-  size_t stored = 0;
-  Status st = Status::kOk;
-  for (uint64_t id = 0; id < 100 && st == Status::kOk; ++id) {
-    st = s.Cache(Key(id), v.data(), v.size());
+  size_t stored = 0, full = 0;
+  for (uint64_t id = 0; id < 120; ++id) {
+    const Status st = s.Cache(Key(id), v.data(), v.size());
+    ASSERT_TRUE(st == Status::kOk || st == Status::kCacheFull) << int(st);
     if (st == Status::kOk) ++stored;
+    else ++full;
   }
-  EXPECT_EQ(st, Status::kCacheFull);
-  EXPECT_GT(stored, 20u);
+  EXPECT_GT(stored, 100u) << "kCacheFull " << full;
   EXPECT_TRUE(s.Healthy());
+  EXPECT_GT(s.Evictions(), 60u);
+  EXPECT_LE(s.UsedBytes(), 32ull << 20);
   std::string out;
-  EXPECT_EQ(s.Range(Key(0), 0, 0, &out), Status::kOk);
-  // Space comes back once a whole segment's values are removed.
-  for (uint64_t id = 0; id < 4; ++id) EXPECT_EQ(s.Remove(Key(id)), Status::kOk);
-  EXPECT_EQ(s.Cache(Key(500), v.data(), v.size()), Status::kOk);
+  EXPECT_EQ(s.Range(Key(0), 0, 0, &out), Status::kNotFound) << "the oldest went";
+  ASSERT_EQ(s.Range(Key(119), 0, 0, &out), Status::kOk) << "the newest is there";
+  EXPECT_EQ(out, v);
   fs::remove_all(dir);
 }
 
@@ -1252,22 +1255,25 @@ TEST(LogStore, APutAfterARemoveWaitsForTheRemovesKill) {
 // still pins it becomes free when the pin drops, not lost.
 TEST(LogStore, ASegmentFreedWhilePinnedIsReusedOnceUnpinned) {
   const fs::path dir = TestDir("pinnedfree");
+  auto o = Opts(dir, 32ull << 20);  // 8 segments of three 1 MiB values
+  o.cleaner = false;
   bool ok = false;
-  LogStore s(Opts(dir, 32ull << 20), &ok);  // 8 segments of three 1 MiB values
+  LogStore s(o, &ok);
   ASSERT_TRUE(ok) << s.StartupError();
   const std::string v(1 << 20, 'p');
-  uint64_t stored = 0;
-  while (s.Cache(Key(stored), v.data(), v.size()) == Status::kOk) ++stored;
-  ASSERT_GE(stored, 9u);
+  for (uint64_t id = 0; id < 7; ++id)  // two segments full, a third open
+    ASSERT_EQ(s.Cache(Key(id), v.data(), v.size()), Status::kOk);
+  for (int i = 0; i < 100 && s.GetStats().segments_sealed_now < 2; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
   auto lease = std::make_unique<ReadLease>();
   ASSERT_EQ(s.RangeDirectPrep(Key(0), 0, 0, 2 << 20, lease.get()), Status::kOk);
+  const uint32_t free_before = s.GetStats().segments_free;
   for (uint64_t id = 0; id < 3; ++id)  // the first segment's values
     ASSERT_EQ(s.Remove(Key(id)), Status::kOk);
-  EXPECT_EQ(s.Cache(Key(100), v.data(), v.size()), Status::kCacheFull)
-      << "the pinned segment is not reused";
+  EXPECT_EQ(s.GetStats().segments_free, free_before) << "pinned: not free yet";
   lease.reset();
-  EXPECT_EQ(s.Cache(Key(101), v.data(), v.size()), Status::kOk)
-      << "reused once the pin is gone";
+  EXPECT_EQ(s.GetStats().segments_free, free_before + 1)
+      << "free once the pin is gone";
   fs::remove_all(dir);
 }
 
@@ -1412,63 +1418,52 @@ TEST(LogStore, APutAfterACancelledPutWaitsForItsKill) {
 // drops the last shadow of a segment (before the REMOVE wakes), the segment
 // is freed then, not stranded until a restart.
 TEST(LogStore, ASegmentWhoseLastShadowAPutDropsIsReused) {
+  const fs::path dir = TestDir("lastshadow");
   constexpr size_t kLen = 1 << 20;  // three to a 4 MiB segment
   const std::string v(kLen, 'v');
-  auto room_after = [&](bool race) {
-    const fs::path dir = TestDir(race ? "lastshadow_race" : "lastshadow_plain");
-    std::mutex mu;
-    std::condition_variable cv;
-    bool hold = false, held = false;
-    auto o = Opts(dir, 32ull << 20);
-    o.crash_hook = [&](const char* p) {
-      if (std::strcmp(p, "remove.after_wait") != 0) return;
-      std::unique_lock<std::mutex> lk(mu);
-      if (!hold) return;
-      held = true;
-      cv.notify_all();
-      cv.wait(lk, [&] { return !hold; });
-    };
-    bool ok = false;
-    size_t room = 0;
-    {
-      LogStore s(o, &ok);
-      EXPECT_TRUE(ok) << s.StartupError();
-      for (uint64_t id = 0; id < 7; ++id)  // two segments full, a third open
-        EXPECT_EQ(s.Cache(Key(id), v.data(), v.size()), Status::kOk);
-      EXPECT_EQ(s.Remove(Key(0)), Status::kOk);
-      EXPECT_EQ(s.Remove(Key(1)), Status::kOk);
-      if (race) {
-        {
-          std::lock_guard<std::mutex> lk(mu);
-          hold = true;
-        }
-        // The REMOVE of the first segment's last value waits after its KILL
-        // is durable; a PUT of the key then drops that shadow first.
-        std::thread r([&] { EXPECT_EQ(s.Remove(Key(2)), Status::kOk); });
-        {
-          std::unique_lock<std::mutex> lk(mu);
-          cv.wait(lk, [&] { return held; });
-        }
-        EXPECT_EQ(s.Cache(Key(2), v.data(), v.size()), Status::kOk);
-        {
-          std::lock_guard<std::mutex> lk(mu);
-          hold = false;
-          cv.notify_all();
-        }
-        r.join();
-      } else {
-        EXPECT_EQ(s.Remove(Key(2)), Status::kOk);
-        EXPECT_EQ(s.Cache(Key(2), v.data(), v.size()), Status::kOk);
-      }
-      for (uint64_t id = 100; s.Cache(Key(id), v.data(), v.size()) == Status::kOk; ++id)
-        ++room;
-    }
-    fs::remove_all(dir);
-    return room;
+  std::mutex mu;
+  std::condition_variable cv;
+  bool hold = false, held = false;
+  auto o = Opts(dir, 32ull << 20);
+  o.cleaner = false;
+  o.crash_hook = [&](const char* p) {
+    if (std::strcmp(p, "remove.after_wait") != 0) return;
+    std::unique_lock<std::mutex> lk(mu);
+    if (!hold) return;
+    held = true;
+    cv.notify_all();
+    cv.wait(lk, [&] { return !hold; });
   };
-  const size_t plain = room_after(false);
-  EXPECT_GT(plain, 0u);
-  EXPECT_EQ(room_after(true), plain) << "a segment was stranded";
+  bool ok = false;
+  LogStore s(o, &ok);
+  ASSERT_TRUE(ok) << s.StartupError();
+  for (uint64_t id = 0; id < 7; ++id)  // two segments full, a third open
+    ASSERT_EQ(s.Cache(Key(id), v.data(), v.size()), Status::kOk);
+  for (int i = 0; i < 100 && s.GetStats().segments_sealed_now < 2; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  const uint32_t free_before = s.GetStats().segments_free;
+  ASSERT_EQ(s.Remove(Key(0)), Status::kOk);
+  ASSERT_EQ(s.Remove(Key(1)), Status::kOk);
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    hold = true;
+  }
+  std::thread r([&] { EXPECT_EQ(s.Remove(Key(2)), Status::kOk); });
+  {
+    std::unique_lock<std::mutex> lk(mu);
+    cv.wait(lk, [&] { return held; });
+  }
+  ASSERT_EQ(s.Cache(Key(2), v.data(), v.size()), Status::kOk);
+  EXPECT_EQ(s.GetStats().segments_free, free_before + 1)
+      << "freed by the PUT that dropped its last shadow";
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    hold = false;
+    cv.notify_all();
+  }
+  r.join();
+  EXPECT_EQ(s.GetStats().segments_free, free_before + 1);
+  fs::remove_all(dir);
 }
 
 namespace {
@@ -1576,18 +1571,27 @@ std::string ImageValue(uint64_t id, uint32_t version) {
   return v;
 }
 
-// A small store written past what it holds, so that segments are sealed
-// and, once all their records are removed, reused; crash images of it.
-TEST(LogStore, CrashImagesThroughSealingAndSegmentReuse) {
+// A small store written several times past what it holds, with reads (the
+// cleaner's second chance): segments are sealed, reclaimed (relocating
+// what was read, evicting the rest, and reclaiming inline), and the
+// journal compacted; crash images of it, evictions allowed for.
+TEST(LogStore, CrashImagesThroughSealingReclaimAndCompaction) {
   const fs::path dir = TestDir("simages");
   const fs::path image = TestDir("simages_out");
   auto io = std::make_shared<RecordingIo>();
   constexpr uint64_t kKeys = 256;
   std::vector<ImageOp> ops(1500);
+  std::vector<ImageEviction> evictions;
+  std::mutex evict_mu;
   LogStore::Stats stats;
   {
     auto o = RecordedOpts(dir, io);
     o.capacity_bytes = 32ull << 20;
+    o.journal_compact_bytes = 3 * 4096;
+    o.on_evict = [&](const BlockKey& k, uint64_t g) {
+      std::lock_guard<std::mutex> lk(evict_mu);
+      evictions.push_back({k, g, io->Size()});
+    };
     bool ok = false;
     LogStore s(o, &ok);
     ASSERT_TRUE(ok) << s.StartupError();
@@ -1595,16 +1599,34 @@ TEST(LogStore, CrashImagesThroughSealingAndSegmentReuse) {
     std::map<uint64_t, uint32_t> next_version;
     for (auto& op : ops) {
       op.id = rng() % kKeys;
-      op.put = rng() % 10 >= 4;
+      const int what = static_cast<int>(rng() % 10);
+      if (what <= 1) {  // a read: referenced, relocated at the next reclaim
+        std::string out;
+        s.Range(Key(op.id), 0, 0, &out);
+        op.start = op.end = io->Size();
+        op.id = kKeys;  // not a key operation
+        continue;
+      }
+      op.put = what >= 4;
       op.version = next_version[op.id]++;
       RunOp(s, &op, *io, ImageValue);
     }
+    ASSERT_TRUE(s.Close());  // the counters of the asynchronous sealer too
     stats = s.GetStats();
   }
   EXPECT_GT(stats.segments_sealed, 3u);
+  EXPECT_GT(stats.segments_reclaimed, 2u);
+  EXPECT_GT(stats.records_evicted, 10u);
+  EXPECT_GT(stats.records_relocated, 0u);
+  EXPECT_GT(stats.journal_compactions, 0u);
   ImageCheck check;
   check.value = ImageValue;
-  check.open = [](const fs::path& p) { return Opts(p, 32ull << 20); };
+  check.evictions = &evictions;
+  check.open = [](const fs::path& p) {
+    auto o = Opts(p, 32ull << 20);
+    o.cleaner = false;  // it would evict at once in a full store
+    return o;
+  };
   CheckImages(io->Ops(), ops, kKeys, dir, image, 80, 11, check);
   fs::remove_all(dir);
   fs::remove_all(image);
