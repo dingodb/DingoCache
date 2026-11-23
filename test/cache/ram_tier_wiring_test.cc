@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
@@ -117,6 +118,9 @@ class KvNodeServerWiringTestPeer {
     server.ram_ = std::make_unique<RamTier>(options, std::move(flush));
     server.ram_write_back_ = true;
     server.ram_ack_enabled_ = ram_ack;
+  }
+  static auto LockPut(KvNodeServer& server, const BlockKey& key) {
+    return std::make_unique<KvNodeServer::PutKeyLock>(server.LockPutKey(key));
   }
   static void SetWriteBack(KvNodeServer& server, bool write_back) {
     server.ram_write_back_ = write_back;
@@ -2347,4 +2351,47 @@ TEST(RamTierFlushFailure, APutOfAKeyTheDiskNoLongerHasReachesTheDisk) {
   EXPECT_FALSE(KvNodeServerWiringTestPeer::Resident(*node.server, key))
       << "the stale RAM copy is gone; the PUT was written to the disk itself";
   EXPECT_EQ(node.Get(1), Status::kOk);
+}
+
+// The lock that serializes PUTs is per key: a PUT of another key does not
+// wait for it, also for keys that shared one of the former 1024 stripes.
+TEST(RamTierWiring, PutKeyLockSerializesOnlyItsKey) {
+  auto dir = fs::temp_directory_path() / "dfkv_ramwire_putkey";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  DiskCacheGroup::Options options{{dir.string()}, 1ull << 30, "file"};
+  auto server = KvNodeServerWiringTestPeer::Create(std::move(options));
+  auto* node = server.get();
+  KvNodeServerWiringTestPeer::SetLimit(*server, 0);
+  KvNodeServerWiringTestPeer::SetRam(
+      *server,
+      [node](const BlockKey& key, char* data, size_t len, size_t) {
+        return KvNodeServerWiringTestPeer::Persist(*node, key, data, len);
+      },
+      /*ram_ack=*/true);
+  const BlockKey held{1, 0}, other{1025, 0};  // (hi ^ lo) % 1024 alike
+  alignas(4096) static char value[4096];
+  std::memset(value, 'v', sizeof(value));
+  auto put = [&](const BlockKey& key) {
+    return std::async(std::launch::async, [&, key] {
+      return server->CacheDirectForKey(key, value, sizeof(value),
+                                       sizeof(value));
+    });
+  };
+  // Declared before the lock, so that a failed check releases it first.
+  std::future<Status> unrelated, same;
+  auto lock = KvNodeServerWiringTestPeer::LockPut(*server, held);
+  unrelated = put(other);
+  ASSERT_EQ(unrelated.wait_for(2s), std::future_status::ready)
+      << "a PUT waited for another key's lock";
+  EXPECT_EQ(unrelated.get(), Status::kOk);
+  same = put(held);
+  EXPECT_EQ(same.wait_for(100ms), std::future_status::timeout);
+  lock.reset();
+  ASSERT_EQ(same.wait_for(2s), std::future_status::ready);
+  EXPECT_EQ(same.get(), Status::kOk);
+  EXPECT_EQ(MetricVal(server->MetricsText(), "dfkv_put_key_lock_waits_total"),
+            1);
+  server.reset();
+  fs::remove_all(dir);
 }

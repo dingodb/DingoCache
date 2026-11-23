@@ -259,7 +259,38 @@ class KvNodeServer {
   void InitAdmission();   // read DFKV_PUT_INFLIGHT_LIMIT (0 = gate off)
   bool TryBeginPut();
   void EndPut();
-  std::unique_lock<std::mutex> LockPutKey(const BlockKey& key);
+  // Serializes the PUTs of one key, and of that key only: a PUT of another
+  // key never waits for it. `lock` may be handed to the RAM tier, which
+  // releases it before waiting for a flush; the key's entry goes with the
+  // last holder.
+  struct PutKeySlot {
+    std::mutex mu;
+    size_t users = 0;
+  };
+  class PutKeyLock {
+   public:
+    PutKeyLock() = default;
+    PutKeyLock(KvNodeServer* owner, const BlockKey& key)
+        : owner_(owner), key_(key) {}
+    PutKeyLock(PutKeyLock&& other) noexcept
+        : owner_(other.owner_), key_(other.key_),
+          lock(std::move(other.lock)) {
+      other.owner_ = nullptr;
+    }
+    PutKeyLock(const PutKeyLock&) = delete;
+    PutKeyLock& operator=(const PutKeyLock&) = delete;
+    PutKeyLock& operator=(PutKeyLock&&) = delete;
+    ~PutKeyLock() {
+      if (owner_) owner_->ReleasePutKey(key_, &lock);
+    }
+    std::unique_lock<std::mutex> lock;
+
+   private:
+    KvNodeServer* owner_ = nullptr;
+    BlockKey key_{};
+  };
+  PutKeyLock LockPutKey(const BlockKey& key);
+  void ReleasePutKey(const BlockKey& key, std::unique_lock<std::mutex>* lock);
   void ReapDoneLocked();  // join+erase finished handler threads; conn_mu_ held
   void InitTcpListenerConfig();
   std::atomic<size_t> cache_put_{0}, cache_hit_{0}, cache_miss_{0};
@@ -307,8 +338,22 @@ class KvNodeServer {
   std::atomic<size_t> put_busy_{0};
   // Cover the gap between RAM capacity bypass and the backing-store commit.
   // Flush workers and Remove never acquire these foreground-only locks.
-  static constexpr size_t kPutKeyStripes = 1024;
-  std::mutex put_key_mu_[kPutKeyStripes];
+  // Keys with a PUT in progress, in stripes; a stripe's mutex is held only
+  // to find or drop a key's slot.
+  struct PutKeyHash {
+    size_t operator()(const BlockKey& key) const noexcept {
+      return static_cast<size_t>(key.digest_hi ^
+                                 (key.digest_lo * 0x9e3779b97f4a7c15ULL) ^
+                                 (key.tenant_hash * 0xbf58476d1ce4e5b9ULL));
+    }
+  };
+  struct PutKeyStripe {
+    std::mutex mu;
+    std::unordered_map<BlockKey, std::unique_ptr<PutKeySlot>, PutKeyHash> keys;
+  };
+  static constexpr size_t kPutKeyStripes = 256;
+  PutKeyStripe put_keys_[kPutKeyStripes];
+  std::atomic<uint64_t> put_key_lock_waits_{0}, put_key_lock_wait_us_{0};
   std::atomic<size_t> open_connections_{0};
   static constexpr size_t kDefaultTcpMaxConnections = 512;
   static constexpr size_t kHardTcpMaxConnections = 4096;

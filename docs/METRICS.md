@@ -247,6 +247,7 @@ client pull READ/release 与 server exact-grant/pin 指标。
 | `dfkv_read_coalesce_recur_total` | counter | staged fallback flight 命中复现指纹的诊断计数（`DFKV_READ_COALESCE_RECUR_MS`，默认 1000ms）；direct-to-RAM flight 不创建指纹 |
 | `dfkv_read_coalesce_timeouts_total` | counter | follower 等待超时回退自读的次数（`DFKV_READ_COALESCE_TIMEOUT_MS`，默认 500ms；**健康态应恒 0**，持续非零 = leader 连接异常死亡或盘读时延超阈） |
 | `dfkv_read_coalesce_held_reads_total` | counter | follower 自己读、不等 leader 的次数：它所在的 serve 线程手里还有自己登记、尚未完成的读（等下去可能和别的线程互等，例如两条连接以相反顺序读同一批 key）。非零只说明合并少了一次，不是故障 |
+| `dfkv_put_key_lock_waits_total`, `dfkv_put_key_lock_wait_us_total` | counter | PUT 等同一个 key 的另一个 PUT（RAM write-back 下 PUT 按 key 串行）的次数和累计微秒；不同 key 不互等 |
 
 slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际引擎判定，不设 flag/env 的默认也命中；file 引擎无此系列）：
 | 指标 | 类型 | 含义 |

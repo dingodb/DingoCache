@@ -176,10 +176,40 @@ void KvNodeServer::EndPut() {
     put_inflight_.fetch_sub(1, std::memory_order_relaxed);
 }
 
-std::unique_lock<std::mutex> KvNodeServer::LockPutKey(const BlockKey& key) {
+KvNodeServer::PutKeyLock KvNodeServer::LockPutKey(const BlockKey& key) {
   if (!ram_write_back_ || !ram_) return {};
-  const uint64_t stripe = key.digest_hi ^ key.digest_lo ^ key.tenant_hash;
-  return std::unique_lock<std::mutex>(put_key_mu_[stripe % kPutKeyStripes]);
+  PutKeyStripe& stripe = put_keys_[PutKeyHash{}(key) % kPutKeyStripes];
+  PutKeySlot* slot = nullptr;
+  {
+    std::lock_guard<std::mutex> guard(stripe.mu);
+    auto& entry = stripe.keys[key];
+    if (!entry) entry = std::make_unique<PutKeySlot>();
+    slot = entry.get();
+    ++slot->users;
+  }
+  PutKeyLock out(this, key);
+  out.lock = std::unique_lock<std::mutex>(slot->mu, std::try_to_lock);
+  if (out.lock.owns_lock()) return out;
+  const auto started = std::chrono::steady_clock::now();
+  out.lock.lock();
+  put_key_lock_waits_.fetch_add(1, std::memory_order_relaxed);
+  put_key_lock_wait_us_.fetch_add(
+      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - started)
+                                .count()),
+      std::memory_order_relaxed);
+  return out;
+}
+
+void KvNodeServer::ReleasePutKey(const BlockKey& key,
+                                 std::unique_lock<std::mutex>* lock) {
+  if (lock->owns_lock()) lock->unlock();
+  lock->release();  // the slot may go below
+  PutKeyStripe& stripe = put_keys_[PutKeyHash{}(key) % kPutKeyStripes];
+  std::lock_guard<std::mutex> guard(stripe.mu);
+  auto it = stripe.keys.find(key);
+  if (it != stripe.keys.end() && --it->second->users == 0)
+    stripe.keys.erase(it);
 }
 
 // DFKV_RAM_RECLAIM_MS: background free-slot reclaimer cadence, ms; 0
@@ -717,6 +747,12 @@ std::string KvNodeServer::MetricsText() const {
          "Coalesce followers that read for themselves because their serve "
          "thread held an unfinished read of its own",
          read_coalescer_.held_fallbacks());
+  metric("dfkv_put_key_lock_waits_total", "counter",
+         "PUTs that waited for the lock serializing PUTs of their key",
+         put_key_lock_waits_.load(std::memory_order_relaxed));
+  metric("dfkv_put_key_lock_wait_us_total", "counter",
+         "Microseconds PUTs waited for that lock",
+         put_key_lock_wait_us_.load(std::memory_order_relaxed));
   metric("dfkv_accepts_total", "counter", "TCP connections accepted", AcceptCount());
   metric("dfkv_evictions_total", "counter", "Objects evicted (capacity pressure)",
          group_.Evictions());
@@ -1285,8 +1321,8 @@ Status KvNodeServer::ProcessRequestForKey(
         // The RAM tier releases key_lock before it waits for a flush.
         const RamTier::PutResult result =
             ram_ack_enabled_
-                ? ram_->PutWriteBack(key, payload, payload_len, &key_lock)
-                : ram_->PutCommitted(key, payload, payload_len, &key_lock);
+                ? ram_->PutWriteBack(key, payload, payload_len, &key_lock.lock)
+                : ram_->PutCommitted(key, payload, payload_len, &key_lock.lock);
         st = result.status;
         needs_disk = result.disposition == RamTier::PutDisposition::kBypass;
         if (st == Status::kOk) {
@@ -1659,8 +1695,8 @@ Status KvNodeServer::CacheDirectForKey(
     // The RAM tier releases key_lock before it waits for a flush.
     const RamTier::PutResult result =
         ram_ack_enabled_
-            ? ram_->PutWriteBack(key, data, len, &key_lock, batch_arrival)
-            : ram_->PutCommitted(key, data, len, &key_lock, batch_arrival);
+            ? ram_->PutWriteBack(key, data, len, &key_lock.lock, batch_arrival)
+            : ram_->PutCommitted(key, data, len, &key_lock.lock, batch_arrival);
     st = result.status;
     needs_disk = result.disposition == RamTier::PutDisposition::kBypass;
     if (st == Status::kOk) {
