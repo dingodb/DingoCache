@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace dfkv {
@@ -65,6 +67,8 @@ class MapTransport final : public Transport {
   std::map<std::string, std::string> values;  // set before the client runs
   bool absent_is_ok_false = false;  // scalar TCP convention for "absent"
   std::function<void()> before_first_answer;
+  // Runs before each RangeInto answers, outside the map lock.
+  std::function<void(const std::vector<BlockKey>&)> before_range;
   std::atomic<size_t> range_calls{0}, exist_calls{0};
 
   Status Cache(const std::string&, const BlockKey& key, const void* data,
@@ -94,6 +98,7 @@ class MapTransport final : public Transport {
                                 const std::vector<RangeDst>& dsts,
                                 std::vector<uint64_t>* value_lens) override {
     FirstAnswer();
+    if (before_range) before_range(keys);
     range_calls += keys.size();
     std::lock_guard<std::mutex> lock(mu_);
     if (value_lens) value_lens->assign(keys.size(), 0);
@@ -309,6 +314,104 @@ TEST(ClientDedupWait, AbsentReportedAsOkFalseIsPublished) {
   const std::string value = ValueOf(0);
   ASSERT_TRUE(client.Put("missing", value.data(), value.size()));
   EXPECT_EQ(client.BatchExist(keys), std::vector<bool>({true}));
+}
+
+// A batch whose owner is still fetching part of it: the keys the owner has
+// already got are handed over at once, not when its whole batch is done. The
+// owner here gets the first half of its keys, then hangs on the rest until
+// the waiter is through; the waiter's budget runs out on that rest.
+template <typename Fetch>
+void EarlyPublishCase(const std::string& tag, Fetch fetch) {
+  const std::string key_namespace = Namespace(tag);
+  const size_t N = 16;
+  DedupEnv env(key_namespace, kShortWaitMs);
+  MapTransport owner_transport;
+  MapTransport waiter_transport;
+  std::vector<std::string> filenames(N);
+  for (size_t i = 0; i < N; ++i) {
+    filenames[i] = ToBlockKey(key_namespace, "k" + std::to_string(i)).Filename();
+    owner_transport.values[filenames[i]] = ValueOf(i);
+    waiter_transport.values[filenames[i]] = ValueOf(i);
+  }
+  std::mutex gate_mu;
+  std::condition_variable gate_cv;
+  bool released = false;
+  std::atomic<size_t> answered{0};
+  owner_transport.before_range = [&](const std::vector<BlockKey>& keys) {
+    for (const auto& key : keys) {
+      const size_t index = static_cast<size_t>(
+          std::find(filenames.begin(), filenames.end(), key.Filename()) -
+          filenames.begin());
+      if (index >= N / 2) {
+        std::unique_lock<std::mutex> lock(gate_mu);
+        gate_cv.wait_for(lock, std::chrono::seconds(10),
+                         [&] { return released; });
+      } else {
+        ++answered;
+      }
+    }
+  };
+  KVClient owner({{"n", "test:1"}}, key_namespace, &owner_transport);
+  KVClient waiter({{"n", "test:1"}}, key_namespace, &waiter_transport);
+
+  std::vector<std::string> owner_bufs(N, std::string(kValueLen, '\0'));
+  std::vector<bool> owner_got;
+  std::thread owner_thread([&] { owner_got = fetch(owner, &owner_bufs); });
+  const auto first_half = std::chrono::steady_clock::now();
+  while (answered.load() < N / 2 &&
+         std::chrono::steady_clock::now() - first_half < std::chrono::seconds(5))
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  ASSERT_EQ(answered.load(), N / 2);
+  // The owner's workers have returned from the first half.
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+  std::vector<std::string> bufs(N, std::string(kValueLen, '\0'));
+  const auto t0 = std::chrono::steady_clock::now();
+  const std::vector<bool> got = fetch(waiter, &bufs);
+  const int64_t ms = ElapsedMs(t0);
+  {
+    std::lock_guard<std::mutex> lock(gate_mu);
+    released = true;
+  }
+  gate_cv.notify_all();
+  owner_thread.join();
+
+  for (size_t i = 0; i < N; ++i) {
+    EXPECT_TRUE(got[i]) << i;
+    EXPECT_EQ(bufs[i], ValueOf(i)) << i;
+    EXPECT_TRUE(owner_got[i]) << i;
+    EXPECT_EQ(owner_bufs[i], ValueOf(i)) << i;
+  }
+  std::printf("[ timing ] %s: waiter took %lld ms (wait_ms=%d) and fetched "
+              "%zu of %zu keys itself\n", tag.c_str(),
+              static_cast<long long>(ms), kShortWaitMs,
+              waiter_transport.range_calls.load(), N);
+  EXPECT_EQ(waiter_transport.range_calls.load(), N / 2)
+      << "the keys the owner already had must not be fetched again";
+}
+
+TEST(ClientDedupWait, OwnerPublishesEachKeyWhenItArrives) {
+  EarlyPublishCase("early-get", [](KVClient& client,
+                                   std::vector<std::string>* bufs) {
+    std::vector<KvGetItem> items;
+    for (size_t i = 0; i < bufs->size(); ++i)
+      items.push_back({"k" + std::to_string(i), (*bufs)[i].data(), kValueLen});
+    return client.BatchGet(items);
+  });
+}
+
+TEST(ClientDedupWait, OwnerPublishesEachAutoKeyWhenItArrives) {
+  EarlyPublishCase("early-auto", [](KVClient& client,
+                                    std::vector<std::string>* bufs) {
+    std::vector<KvGetItem> items;
+    for (size_t i = 0; i < bufs->size(); ++i)
+      items.push_back({"k" + std::to_string(i), (*bufs)[i].data(), kValueLen});
+    std::vector<size_t> lens;
+    auto got = client.BatchGetAuto(items, &lens);
+    for (size_t i = 0; i < got.size(); ++i)
+      if (got[i]) EXPECT_EQ(lens[i], kValueLen) << i;
+    return got;
+  });
 }
 
 }  // namespace

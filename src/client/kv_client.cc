@@ -987,15 +987,20 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
     }
   }
   if (!fetch_items.empty()) {
-    auto r = BatchGetDirect(fetch_items);
+    // Each key is published as soon as it has arrived, not when the whole
+    // batch has: a waiter's budget covers one batch, and a slow part of
+    // this batch must not cost it the keys already here. Publishing is the
+    // same lock-free protocol other processes run concurrently; a key that
+    // is not a hit in the end is aborted once the batch is done.
+    auto r = BatchGetDirect(fetch_items, [&](size_t m) {
+      const size_t i = fetch_map[m];
+      dedup_->Publish(bks[i], NodeDedup::Kind::kData, tokens[i],
+                      static_cast<const char*>(items[i].out), items[i].n);
+    });
     for (size_t m = 0; m < fetch_map.size(); ++m) {
       const size_t i = fetch_map[m];
       res[i] = r[m];
-      if (r[m])
-        dedup_->Publish(bks[i], NodeDedup::Kind::kData, tokens[i],
-                        static_cast<const char*>(items[i].out), items[i].n);
-      else
-        dedup_->Abort(bks[i], NodeDedup::Kind::kData, tokens[i]);
+      if (!r[m]) dedup_->Abort(bks[i], NodeDedup::Kind::kData, tokens[i]);
     }
   }
   // One deadline for the whole wait list and one direct batch for the keys
@@ -1033,12 +1038,15 @@ bool TransientReadMiss(Status st) {
 }
 }  // namespace
 
-std::vector<bool> KVClient::BatchGetDirect(const std::vector<KvGetItem>& items) {
+std::vector<bool> KVClient::BatchGetDirect(
+    const std::vector<KvGetItem>& items,
+    const std::function<void(size_t)>& on_hit) {
   const size_t N = items.size();
   std::vector<char> hit(N, 0);
   if (!t_->pipelined()) {  // TCP: parallelize across items with our own threads
     RunParallel(N, BatchWorkers(N), [&](size_t i) {
       hit[i] = GetDirect(items[i].key, items[i].out, items[i].n) ? 1 : 0;
+      if (hit[i] && on_hit) on_hit(i);
     });
     return std::vector<bool>(hit.begin(), hit.end());
   }
@@ -1080,8 +1088,10 @@ std::vector<bool> KVClient::BatchGetDirect(const std::vector<KvGetItem>& items) 
       for (size_t m = 0; m < idx.size(); ++m) {
         retry[idx[m]] = TransientReadMiss(sts[m]);
         if (sts[m] == Status::kOk && m < value_lens.size() &&
-            value_lens[m] == n)
+            value_lens[m] == n) {
           hit[idx[m]] = 1;
+          if (on_hit) on_hit(idx[m]);
+        }
       }
     }, node_of);
   };
@@ -1158,18 +1168,21 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
     }
   }
   if (!fetch_items.empty()) {
+    // Published key by key as they arrive, as in BatchGet.
     std::vector<size_t> flens;
-    auto r = BatchGetAutoDirect(fetch_items, &flens);
+    auto r = BatchGetAutoDirect(
+        fetch_items, &flens, [&](size_t m, size_t length) {
+          const size_t i = fetch_map[m];
+          dedup_->Publish(bks[i], NodeDedup::Kind::kData, tokens[i],
+                          static_cast<const char*>(items[i].out), length);
+        });
     for (size_t m = 0; m < fetch_map.size(); ++m) {
       const size_t i = fetch_map[m];
       res[i] = r[m];
-      if (r[m]) lens[i] = flens[m];
-      if (r[m]) {
-        dedup_->Publish(bks[i], NodeDedup::Kind::kData, tokens[i],
-                        static_cast<const char*>(items[i].out), flens[m]);
-      } else {
+      if (r[m])
+        lens[i] = flens[m];
+      else
         dedup_->Abort(bks[i], NodeDedup::Kind::kData, tokens[i]);
-      }
     }
   }
   // One deadline and one direct fallback batch, as in BatchGet.
@@ -1204,8 +1217,9 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
   return RecordBatch(OpMetrics::kGet, t0, std::move(res), bytes);
 }
 
-std::vector<bool> KVClient::BatchGetAutoDirect(const std::vector<KvGetItem>& items,
-                                         std::vector<size_t>* out_lens) {
+std::vector<bool> KVClient::BatchGetAutoDirect(
+    const std::vector<KvGetItem>& items, std::vector<size_t>* out_lens,
+    const std::function<void(size_t, size_t)>& on_hit) {
   const size_t N = items.size();
   std::vector<char> hit(N, 0);
   std::vector<size_t> lens(N, 0);  // distinct indices => thread-safe writes
@@ -1215,6 +1229,7 @@ std::vector<bool> KVClient::BatchGetAutoDirect(const std::vector<KvGetItem>& ite
       if (GetAutoDirect(items[i].key, items[i].out, items[i].n, &got)) {
         hit[i] = 1;
         lens[i] = got;
+        if (on_hit) on_hit(i, got);
       }
     });
     if (out_lens) *out_lens = std::move(lens);
@@ -1261,6 +1276,7 @@ std::vector<bool> KVClient::BatchGetAutoDirect(const std::vector<KvGetItem>& ite
         continue;
       lens[idx[m]] = static_cast<size_t>(value_lens[m]);
       hit[idx[m]] = 1;
+      if (on_hit) on_hit(idx[m], lens[idx[m]]);
     }
   }, node_of);
   };
