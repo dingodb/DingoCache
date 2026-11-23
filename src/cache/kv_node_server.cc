@@ -1105,6 +1105,18 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_ram_put_bypass_total", "counter", "PUTs bypassing RAM (flush backpressure)", ram_->PutBypass());
     metric("dfkv_ram_promoted_total", "counter",
            "Coalesced cold reads promoted into RAM as durable residents", ram_->Promoted());
+    metric("dfkv_ram_promote_declined_total", "counter",
+           "Promotions the RAM tier did not take (no room, or a value it "
+           "keeps out of RAM)", ram_->PromoteDeclined());
+    metric("dfkv_ram_reservations_aborted_total", "counter",
+           "Promotion reservations that ended without a copy installed",
+           ram_->ReservationsAborted());
+    metric("dfkv_ram_evicted_unread_total", "counter",
+           "Values evicted from RAM for room without having been read from it",
+           ram_->EvictedUnread());
+    metric("dfkv_ram_evicted_age_ms_total", "counter",
+           "Milliseconds evicted values had been resident, summed (divide by "
+           "dfkv_ram_evictions_total for the mean)", ram_->EvictedAgeMs());
     metric("dfkv_ram_flushed_total", "counter", "RAM slots flushed to disk (now durable)", ram_->Flushed());
     metric("dfkv_ram_flush_dropped_total", "counter", "RAM slots dropped after flush failure", ram_->FlushDropped());
     metric("dfkv_ram_evictions_total", "counter", "RAM slots evicted under capacity pressure", ram_->Evictions());

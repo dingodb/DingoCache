@@ -621,6 +621,7 @@ void RamTier::EraseEvictedLocked(
   for (const BlockKey& key : keys) {
     auto it = s.index.find(key);
     if (it == s.index.end()) continue;
+    NoteEvicted(it->second);
     ReleaseBudget(it->second.cap);
     s.index.erase(it);
   }
@@ -631,6 +632,16 @@ bool RamTier::LargeIsCurrentLocked(
   auto it = s.index.find(item.first);
   return it != s.index.end() && !it->second.in_arena() &&
          it->second.large_seq == item.second;
+}
+
+void RamTier::NoteEvicted(const Entry& entry) {
+  if (!entry.read) evicted_unread_.fetch_add(1, std::memory_order_relaxed);
+  evicted_age_ms_.fetch_add(
+      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() -
+                                entry.admitted_at)
+                                .count()),
+      std::memory_order_relaxed);
 }
 
 void RamTier::NoteLargeLocked(Shard& s, const BlockKey& key) {
@@ -669,6 +680,7 @@ void RamTier::ReclaimLargeFor(uint64_t bytes) {
       auto it = s.index.find(item.first);
       Entry& entry = it->second;
       if (entry.durable && entry.send_pins == 0 && !entry.remove_pending) {
+        NoteEvicted(entry);
         ReleaseLargeBudget(entry.cap);
         s.index.erase(it);
         large_evictions_.fetch_add(1, std::memory_order_relaxed);
@@ -1040,6 +1052,13 @@ RamTier::PutResult RamTier::PutCommitted(
 
 bool RamTier::ReserveDurable(const BlockKey& key, size_t len,
                              DurableReservation* out, uint64_t generation) {
+  const bool reserved = ReserveDurableImpl(key, len, out, generation);
+  if (!reserved) promote_declined_.fetch_add(1, std::memory_order_relaxed);
+  return reserved;
+}
+
+bool RamTier::ReserveDurableImpl(const BlockKey& key, size_t len,
+                             DurableReservation* out, uint64_t generation) {
   if (out == nullptr) return false;
   out->Reset();
   if (!arena_ || len == 0 || static_cast<uint64_t>(len) > extent_bytes_)
@@ -1139,7 +1158,10 @@ bool RamTier::CommitReservation(
     }
     state.finished = true;
   }
-  if (!canceled) promotes_.fetch_add(1, std::memory_order_relaxed);
+  if (!canceled)
+    promotes_.fetch_add(1, std::memory_order_relaxed);
+  else
+    reservations_aborted_.fetch_add(1, std::memory_order_relaxed);
   return !canceled;
 }
 
@@ -1171,6 +1193,7 @@ void RamTier::AbortReservation(
     return;
   }
 
+  reservations_aborted_.fetch_add(1, std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lk(s.mu);
     auto writing = s.writing.find(state->key);
@@ -1226,6 +1249,13 @@ RamTier::PutResult RamTier::PutWriteBack(
 
 bool RamTier::PutDurable(const BlockKey& key, const void* data, size_t len,
                          uint64_t generation) {
+  const bool taken = PutDurableImpl(key, data, len, generation);
+  if (!taken) promote_declined_.fetch_add(1, std::memory_order_relaxed);
+  return taken;
+}
+
+bool RamTier::PutDurableImpl(const BlockKey& key, const void* data, size_t len,
+                             uint64_t generation) {
   if (!arena_ || len == 0 || data == nullptr) return false;
   uint64_t requested_cap = 0;
   if (!AlignCapacity(len, opt_.slot_granularity, &requested_cap) ||
@@ -1381,6 +1411,9 @@ bool RamTier::GetPrep(const BlockKey& key, uint64_t offset, uint64_t length,
     out->token_ =
         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&e));
   }
+  // A pinned hit is a value served from RAM, also on paths that count the
+  // hit later (count_access false: the RDMA pull path).
+  if (out) e.read = true;
   if (count_access) hits_.fetch_add(1, std::memory_order_relaxed);
   return true;
 }

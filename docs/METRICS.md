@@ -310,6 +310,10 @@ RAM 热层（**仅 `DFKV_RAM_TIER=1` 时输出**；关时无此系列，向后�
 | `dfkv_ram_put_waits_canceled_total` | counter | 停止时被提前回 `kCacheFull` 的等待中 PUT 数（含停止开始后本来需要等待的 PUT） |
 | `dfkv_ram_ack_backpressure_total` | counter | 正的 RAM-ACK dirty 水位触发的新 key 接纳拒绝；水位为 0 时计数强制等待落盘的请求。已有 key 先解析 owner，不因水位切换覆盖首写者 |
 | `dfkv_ram_promoted_total` | counter | 整值冷读晋升：优先让 O_DIRECT 直接读入隐藏 arena reservation，成功后以 born-durable 身份发布；staged fallback 则读后复制晋升。不进 flushq、零重复刷盘、随时可驱逐；健康冷→热运行中首次读增长，随后应转为 `dfkv_ram_hit_total` 增长且磁盘字节不再增加 |
+| `dfkv_ram_promote_declined_total` | counter | RAM 没有接收的晋升（没有空间，或这类值不进 RAM） |
+| `dfkv_ram_reservations_aborted_total` | counter | 晋升 reservation 没有装成副本就结束（读失败，或被 REMOVE、磁盘上的新值抢先） |
+| `dfkv_ram_evicted_unread_total` | counter | 因空间被淘汰、进 RAM 后从未被读过的值（读 = 从 RAM 送出过数据：TCP 读、RDMA 读和 RDMA pull 都算，EXIST 不算）；与 `dfkv_ram_evictions_total` 之比高说明 RAM 里放的多半没人读 |
+| `dfkv_ram_evicted_age_ms_total` | counter | 被淘汰的值在 RAM 里驻留时长之和（毫秒），除以 `dfkv_ram_evictions_total` 得平均驻留时长 |
 | `dfkv_ram_flushed_total` / `dfkv_ram_flush_dropped_total` | counter | RAM slot 落盘转 DURABLE / flush 全部尝试失败（或目标盘 store 已终态故障）后丢弃 |
 | `dfkv_ram_flush_retries_total` | counter | 失败后还会再试的 flush 尝试次数。已 RAM-ACK 的值按 50 ms、200 ms、800 ms、3.2 s 间隔重试（共 5 次尝试，约 4.25 s），期间对象仍可读、仍计入 dirty；仍在等落盘结果的 PUT（disk-ACK）不加间隔。增长而 `dfkv_ram_flush_dropped_total` 不涨 = 盘侧有瞬时写失败但没有丢数据 |
 | `dfkv_ram_flush_no_room_total` | counter | 盘回 `kCacheFull`（健康但此刻没有可用的槽）的 flush 尝试次数。不算失败：不计入 `dfkv_ram_flush_retries_total`，不影响 `dfkv_ram_healthy`；已 RAM-ACK 的值留在 RAM 里按 50 ms→3.2 s 的间隔继续试，最长 60 秒；停止排空期间改为不加间隔再试 5 次（`flush_retries`） |
