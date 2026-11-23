@@ -7,17 +7,19 @@
  * Implemented so far (design §14): the core (stage 3) with one open client
  * segment; sealing with summaries and trailers, summary-based recovery and
  * the clean close (stage 5); the cleaner with second-chance relocation,
- * inline reclaim, shadows, journal compaction and capacity changes (stage 6).
- * No RETAIN yet. It is selectable only with
+ * inline reclaim, shadows, journal compaction and capacity changes (stage 6);
+ * RETAIN with a footprint budget (stage 7). It is selectable only with
  * DFKV_LSE_EXPERIMENTAL=1 and writes the development-format bit. */
 #ifndef DFKV_LOG_STORE_H_
 #define DFKV_LOG_STORE_H_
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -64,22 +66,29 @@ class LogStore : public StoreEngine {
     // Test hook: a key's indexed value was evicted (with its generation).
     // Called with the store's mutex held.
     std::function<void(const BlockKey&, uint64_t)> on_evict;
-    // false: no cleaner thread (tests of the inline reclaim, and opens that
-    // check what came back).
+    // Seconds on the retention clock; null = the system clock.
+    std::function<uint32_t()> clock;
+    // false: no cleaner thread (tests of the inline reclaim; retention then
+    // expires only through ExpireRetention()).
     bool cleaner = true;
 
     // DFKV_LSE_SYNC_MS: open segments are fdatasynced this often (§6.5).
     uint32_t sync_ms = 1000;
     // DFKV_LSE_PIN_WAIT_MS: how long the cleaner waits for a victim's pins.
     uint32_t pin_wait_ms = 5000;
-    // DFKV_LSE_RELOCATE_PCT: relocated bytes of referenced records as a
-    // share of client bytes written (§7.3).
+    // DFKV_LSE_RELOCATE_PCT: relocated bytes of referenced, unprotected
+    // records as a share of client bytes written (§7.3).
     uint32_t relocate_pct = 25;
     // The journal is compacted once it holds more than four times its live
     // entries and at least this many bytes (§4.5).
     uint64_t journal_compact_bytes = 64ull << 20;
+    // Retention (DFKV_RETAIN_*), as slab reads them.
+    bool retain_enabled = true;
+    uint32_t retain_max_ttl_s = 3600;
+    uint32_t retain_max_pct = 60;  // of the usable capacity, as footprint
+    uint32_t retain_persist_min_delta_s = 60;
   };
-  // Reads the DFKV_LSE_* settings into `o` (a malformed
+  // Reads the DFKV_LSE_* and DFKV_RETAIN_* settings into `o` (a malformed
   // value keeps the default, with a warning, as every setting does).
   static void ApplyEnvironment(Options* o);
 
@@ -128,7 +137,18 @@ class LogStore : public StoreEngine {
   uint64_t MaxValueBytes() const override;
   const char* EngineName() const override { return "log"; }
 
+  bool RetainEnabled() const override { return opt_.retain_enabled; }
+  uint8_t Retain(const BlockKey& key, uint32_t ttl_s, uint8_t mode,
+                 uint32_t now_s) override;
+  uint32_t RetainHeadroomPct() const override;
+  uint32_t RetainMaxTtl() const override {
+    return opt_.retain_enabled ? opt_.retain_max_ttl_s : 0;
+  }
+  RetentionStats GetRetentionStats() const override;
   void EngineMetrics(std::vector<EngineMetric>* out) const override;
+  // Releases protections whose 10 s expiry bucket has fully passed (as
+  // slab); the cleaner thread calls it about once a second. Returns how many.
+  size_t ExpireRetention(uint32_t now_s, size_t max_entries = SIZE_MAX);
 
   // What the last open recovered (tests, the open log line).
   struct RecoveryStats {
@@ -139,6 +159,7 @@ class LogStore : public StoreEngine {
     uint64_t records_rejected = 0;   // bad header or payload CRC
     uint64_t records_superseded = 0; // lost to a higher generation
     uint64_t journal_blocks = 0;
+    uint64_t retains_restored = 0;
     bool journal_damaged = false;
   };
   RecoveryStats GetRecoveryStats() const { return recovery_; }
@@ -152,6 +173,7 @@ class LogStore : public StoreEngine {
     uint64_t relocated_bytes = 0;
     uint64_t records_evicted = 0;
     uint64_t evicted_bytes = 0;
+    uint64_t protected_evictions = 0;
     uint64_t budget_exhausted = 0;
     uint64_t victims_skipped_pins = 0;
     uint64_t cache_full = 0;
@@ -198,6 +220,11 @@ class LogStore : public StoreEngine {
     uint16_t inline_at = 0;
     uint64_t write_lsn = 0;
     bool referenced = false;  // read since written or last relocated (§7.3)
+    // Retention (§9.2): deadline (0 = not protected), stored TTL, and the
+    // deadline last written to the journal.
+    uint32_t retain_until = 0;
+    uint32_t retain_ttl = 0;
+    uint32_t retain_persisted_until = 0;
   };
   static uint64_t Footprint(const Entry& e);
   struct Shadow {
@@ -228,6 +255,7 @@ class LogStore : public StoreEngine {
     uint32_t writers = 0;       // writes in flight
     bool dirty = false;         // written by this run: synced at Close
     bool unsynced = false;      // written since the last periodic sync
+    uint64_t protected_bytes = 0;  // footprint of protected live records
     uint64_t last_lsn = 0;      // highest write_lsn placed (seal order)
     // Segments holding copies relocated out of this incarnation that may not
     // be synced yet, also by an attempt that gave up: synced before its next
@@ -278,6 +306,7 @@ class LogStore : public StoreEngine {
   void Hook(const char* point) const {
     if (opt_.crash_hook) opt_.crash_hook(point);
   }
+  uint32_t Now() const;
 
   // ---- write path ----
   template <typename WriteFn>
@@ -312,13 +341,18 @@ class LogStore : public StoreEngine {
   bool RelocateOne(Lock& lk, const BlockKey& key, const Entry& e);
   bool SyncCopiesLocked(Lock& lk, uint32_t victim);
   bool InlineReclaimLocked(Lock& lk);
-  void EvictLocked(const BlockKey& key);
+  void EvictLocked(const BlockKey& key, bool protected_eviction);
   void FinishReclaimLocked(uint32_t victim, uint64_t old_incarnation);
   bool RelocationBudgetLocked(uint64_t bytes) const;
   void RemoveFromFifoLocked(uint32_t segment);
   void MaybeFreeLocked(uint32_t segment);
   uint32_t FreeCountLocked() const;
   std::vector<lse::JournalEntry> LiveJournalEntries();
+
+  // ---- retention ----
+  void ProtectLocked(Entry* e);
+  void UnprotectLocked(Entry* e);
+  uint64_t RetainBudget() const;
 
   // ---- read path ----
   bool AcquireLocked(const BlockKey& key, Entry* out);
@@ -368,6 +402,16 @@ class LogStore : public StoreEngine {
   uint64_t window_client_bytes_ = 0;
   uint64_t window_relocated_bytes_ = 0;
 
+  // Retention.
+  uint64_t protected_bytes_ = 0;
+  uint64_t protected_count_ = 0;
+  uint32_t retain_now_s_ = 0;
+  std::map<uint64_t, std::vector<std::pair<BlockKey, uint64_t>>> wheel_;
+  uint64_t wheel_entries_ = 0;
+  uint64_t retain_expired_ = 0;
+  uint64_t retain_evict_skipped_ = 0;
+  uint64_t retain_results_[7] = {0, 0, 0, 0, 0, 0, 0};
+
   // Recovery results kept until Activate().
   struct KillKey {
     uint32_t segment;
@@ -386,6 +430,7 @@ class LogStore : public StoreEngine {
   };
   std::unordered_set<KillKey, KillKeyHash> kills_;
   std::vector<lse::JournalEntry> recovered_kills_;
+  std::unordered_map<BlockKey, lse::JournalEntry, KeyHash> recovered_retains_;
   uint64_t journal_stop_offset_ = 0;
   uint64_t journal_next_seq_ = 1;
   uint64_t journal_entries_ = 0;
@@ -398,6 +443,9 @@ class LogStore : public StoreEngine {
   // The cleaner reclaims only once a PUT has needed a segment beyond the one
   // Activate opened: a restart keeps everything it recovered until then.
   bool cleaner_armed_ = false;
+  // Until then a PUT that finds no space waits for the cleaner just armed
+  // (a store reopened full whose segments all hold protected values).
+  std::chrono::steady_clock::time_point arm_grace_until_{};
   std::thread sealer_;
   std::thread cleaner_;
 };

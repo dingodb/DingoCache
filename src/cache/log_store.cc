@@ -37,7 +37,12 @@ constexpr uint32_t kMinSegments = 8;
 // cleaner only, and the relocation segment.
 constexpr uint32_t kOpenClient = 1;
 constexpr uint32_t kCleanerReserve = 2;
+constexpr uint32_t kHeldBack = kOpenClient + kCleanerReserve + 1;
 constexpr size_t kSealerQueue = 2;
+// How long after the cleaner is armed a PUT that finds no space waits for it
+// (§7.1: a store reopened full, every segment holding a protected value).
+constexpr uint32_t kArmGraceMs = 1000;
+constexpr uint32_t kWheelTickS = 10;
 constexpr const char* kSuperName = "lse_super";
 constexpr const char* kJournalName = "lse_journal";
 constexpr const char* kMarkerName = "lse_initializing";
@@ -354,6 +359,13 @@ void LogStore::ApplyEnvironment(Options* o) {
       static_cast<uint32_t>(env("DFKV_LSE_PIN_WAIT_MS", o->pin_wait_ms, 0, 600000));
   o->relocate_pct =
       static_cast<uint32_t>(env("DFKV_LSE_RELOCATE_PCT", o->relocate_pct, 0, 100));
+  // The retention settings slab reads, with slab's defaults and bounds.
+  o->retain_enabled = env("DFKV_RETAIN_ENABLE", 1, 0, 1) == 1;
+  o->retain_max_ttl_s =
+      static_cast<uint32_t>(env("DFKV_RETAIN_MAX_TTL_S", 3600, 1, 7 * 86400));
+  o->retain_max_pct = static_cast<uint32_t>(env("DFKV_RETAIN_MAX_PCT", 60, 0, 95));
+  o->retain_persist_min_delta_s =
+      static_cast<uint32_t>(env("DFKV_RETAIN_PERSIST_MIN_DELTA_S", 60, 0, 86400));
 }
 
 bool LogStore::GeometryFor(uint64_t capacity, uint64_t segment_override,
@@ -472,6 +484,14 @@ bool LogStore::LockDirectory() {
     return SetErrno("cannot lock " + opt_.dir, errno);
   }
   return true;
+}
+
+uint32_t LogStore::Now() const {
+  if (opt_.clock) return opt_.clock();
+  return static_cast<uint32_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
 }
 
 std::string LogStore::SegmentPath(uint32_t index) const {
@@ -649,6 +669,8 @@ bool LogStore::ReadJournal() {
           kills_.insert({entry.segment_index, entry.incarnation,
                          entry.offset_blocks});
           recovered_kills_.push_back(entry);
+        } else if (entry.type == lse::kJournalRetain) {
+          recovered_retains_[entry.key] = entry;  // the latest wins
         }
       }
     } else if (e == lse::DecodeError::kOk && jb.sequence >= seq) {
@@ -866,6 +888,29 @@ bool LogStore::OpenStore() {
       }
       s.summary = std::move(records);
     }
+    // Retention from the journal, matched on key and generation (§8.3 step
+    // 5), re-clamped to the configured cap as slab does.
+    const uint32_t now = Now();
+    retain_now_s_ = now;
+    for (const auto& kv : recovered_retains_) {
+      auto it = index_.find(kv.first);
+      if (!opt_.retain_enabled || it == index_.end() ||
+          it->second.generation != kv.second.generation)
+        continue;
+      Entry& e = it->second;
+      e.retain_ttl = std::min(kv.second.retain_ttl, opt_.retain_max_ttl_s);
+      const uint64_t cap = uint64_t(now) + opt_.retain_max_ttl_s;
+      const uint32_t until = static_cast<uint32_t>(
+          std::min<uint64_t>(kv.second.retain_until, cap));
+      if (until > now && protected_bytes_ + Footprint(e) <= RetainBudget()) {
+        e.retain_until = until;
+        e.retain_persisted_until = until;
+        ProtectLocked(&e);
+        wheel_[until / kWheelTickS].push_back({kv.first, e.generation});
+        ++wheel_entries_;
+        ++recovery_.retains_restored;
+      }
+    }
     for (auto& kv : index_) {
       used_bytes_ += Footprint(kv.second);
       tenant_bytes_[kv.first.tenant_hash] += kv.second.value_len;
@@ -961,6 +1006,9 @@ bool LogStore::ResetToEmpty() {
   tenant_bytes_.clear();
   recovered_kills_.clear();
   live_kills_.clear();
+  wheel_.clear();
+  wheel_entries_ = 0;
+  protected_bytes_ = protected_count_ = 0;
   used_bytes_ = 0;
   free_.clear();
   fifo_.clear();
@@ -968,6 +1016,7 @@ bool LogStore::ResetToEmpty() {
     Segment& s = segments_[i];
     s.state = SegState::kFree;
     s.live = s.shadows = 0;
+    s.protected_bytes = 0;
     free_.push_back(i);
   }
   ++stats_.journal_resets;
@@ -1110,6 +1159,7 @@ bool LogStore::Activate() {
       live_kills_[k.segment_index].push_back(k);
   kills_.clear();
   recovered_kills_.clear();
+  recovered_retains_.clear();
   journal_ = std::make_unique<Journal>(this, journal_fd_, journal_stop_offset_,
                                        journal_next_seq_, journal_entries_);
   journal_fd_ = -1;
@@ -1200,7 +1250,8 @@ void LogStore::AddShadowLocked(const BlockKey& key, const Location& loc,
 void LogStore::EraseEntryLocked(const BlockKey& key) {
   auto it = index_.find(key);
   if (it == index_.end()) return;
-  const Entry e = it->second;
+  Entry e = it->second;
+  UnprotectLocked(&e);
   // A relocation of this value in progress: its destination may come to hold
   // a copy, which is accounted for from now on (I5). Killing a location
   // before it is written is harmless.
@@ -1260,6 +1311,17 @@ std::vector<lse::JournalEntry> LogStore::LiveJournalEntries() {
   std::vector<lse::JournalEntry> out;
   for (const auto& kv : live_kills_)
     out.insert(out.end(), kv.second.begin(), kv.second.end());
+  for (const auto& kv : index_) {
+    const Entry& e = kv.second;
+    if (e.retain_ttl == 0) continue;
+    lse::JournalEntry r;
+    r.type = lse::kJournalRetain;
+    r.key = kv.first;
+    r.generation = e.generation;
+    r.retain_until = e.retain_persisted_until;
+    r.retain_ttl = e.retain_ttl;
+    out.push_back(r);
+  }
   return out;
 }
 
@@ -1329,7 +1391,11 @@ bool LogStore::ReserveLocked(Lock& lk, uint64_t footprint, uint32_t* segment,
       HandToSealerLocked(lk, full);
       continue;
     }
-    cleaner_armed_ = true;  // clients need space from here on
+    if (!cleaner_armed_) {  // clients need space from here on
+      cleaner_armed_ = true;
+      arm_grace_until_ = std::chrono::steady_clock::now() +
+                         std::chrono::milliseconds(kArmGraceMs);
+    }
     uint32_t next = 0;
     if (TakeFreeSegmentLocked(/*client=*/true, &next)) {
       open_segment_ = next;
@@ -1337,7 +1403,17 @@ bool LogStore::ReserveLocked(Lock& lk, uint64_t footprint, uint32_t* segment,
       continue;
     }
     if (failed_.load()) return false;
-    if (!InlineReclaimLocked(lk)) return false;
+    if (InlineReclaimLocked(lk)) continue;
+    // Nothing to reclaim inline (every sealed segment holds a protected
+    // value or is pinned): right after the cleaner was armed, wait for it
+    // instead of answering kCacheFull at once.
+    if (failed_.load() || !opt_.cleaner || stop_threads_ ||
+        std::chrono::steady_clock::now() >= arm_grace_until_)
+      return false;
+    state_cv_.wait_until(lk, arm_grace_until_, [&] {
+      return FreeCountLocked() > kCleanerReserve ||
+             open_segment_ != UINT32_MAX || failed_.load() || stop_threads_;
+    });
   }
   return false;
 }
@@ -1690,7 +1766,7 @@ bool LogStore::RelocationBudgetLocked(uint64_t bytes) const {
   return window_relocated_bytes_ + bytes <= allowed;
 }
 
-void LogStore::EvictLocked(const BlockKey& key) {
+void LogStore::EvictLocked(const BlockKey& key, bool protected_eviction) {
   auto it = index_.find(key);
   if (it == index_.end()) return;
   const Entry e = it->second;
@@ -1700,6 +1776,7 @@ void LogStore::EvictLocked(const BlockKey& key) {
   EraseEntryLocked(key);
   ++stats_.records_evicted;
   stats_.evicted_bytes += e.value_len;
+  if (protected_eviction) ++stats_.protected_evictions;
 }
 
 void LogStore::FinishReclaimLocked(uint32_t victim, uint64_t old_incarnation) {
@@ -1811,7 +1888,7 @@ bool LogStore::RelocateOne(Lock& lk, const BlockKey& key, const Entry& e) {
                     std::to_string(e.loc.segment) + " block " +
                     std::to_string(e.loc.offset_blocks) +
                     " failed its check; evicted");
-      EvictLocked(key);
+      EvictLocked(key, false);
     }
     return true;
   }
@@ -1822,6 +1899,7 @@ bool LogStore::RelocateOne(Lock& lk, const BlockKey& key, const Entry& e) {
     // Switched: the source becomes a shadow until the victim is reused.
     Entry& ent = cur->second;
     const uint64_t old_fp = Footprint(ent);
+    if (ent.retain_until != 0) segments_[r.source.segment].protected_bytes -= old_fp;
     --segments_[r.source.segment].live;
     AddShadowLocked(key, r.source, r.generation);
     ent.loc = dest;
@@ -1829,6 +1907,10 @@ bool LogStore::RelocateOne(Lock& lk, const BlockKey& key, const Entry& e) {
     ent.inline_at = (h.flags & lse::kRecordFlagInline) ? h.header_len : uint16_t(0);
     const uint64_t new_fp = Footprint(ent);
     used_bytes_ = used_bytes_ - old_fp + new_fp;
+    if (ent.retain_until != 0) {
+      protected_bytes_ = protected_bytes_ - old_fp + new_fp;
+      segments_[dseg].protected_bytes += new_fp;
+    }
     ++segments_[dseg].live;
     ++stats_.records_relocated;
     stats_.relocated_bytes += new_fp;
@@ -1893,24 +1975,25 @@ bool LogStore::ReclaimVictim(Lock& lk, uint32_t victim) {
     auto it = index_.find(kv.first);
     if (it == index_.end() || !(it->second.loc == kv.second.loc)) continue;
     Entry& e = it->second;
+    const bool is_protected = e.retain_until != 0;
     const uint64_t fp = Footprint(e);
-    bool relocate = false;
-    if (e.referenced) {
+    bool relocate = is_protected;
+    if (!is_protected && e.referenced) {
       if (RelocationBudgetLocked(fp)) relocate = true;
       else ++stats_.budget_exhausted;
     }
     if (!relocate) {
-      EvictLocked(kv.first);
+      EvictLocked(kv.first, false);
       continue;
     }
-    e.referenced = false;
+    if (!is_protected) e.referenced = false;
     const Entry copy = e;
     if (!RelocateOne(lk, kv.first, copy)) {
       if (failed_.load()) return false;
-      // No room to relocate: evicted after all.
+      // No room to relocate: the last resort of §7.3.
       auto again = index_.find(kv.first);
       if (again != index_.end() && again->second.loc == copy.loc)
-        EvictLocked(kv.first);
+        EvictLocked(kv.first, again->second.retain_until != 0);
     }
   }
   if (s.live != 0) {  // cannot happen: nothing new points into a victim
@@ -1943,28 +2026,46 @@ bool LogStore::ReclaimVictim(Lock& lk, uint32_t victim) {
 }
 
 bool LogStore::CleanOnce(Lock& lk) {
-  // The oldest sealed segment, past those still pinned (§7.2).
-  uint32_t pick = UINT32_MAX, fallback = UINT32_MAX;
+  // The oldest sealed segment, past those mostly protected while another
+  // choice exists, and past those still pinned (§7.2).
+  // A fallback not pinned comes first: a long lease on the oldest segment
+  // must not stall the cleaner while unpinned ones could be reclaimed.
+  uint32_t pick = UINT32_MAX, unpinned = UINT32_MAX, pinned = UINT32_MAX;
   for (uint32_t i : fifo_) {
     const Segment& s = segments_[i];
     if (s.state != SegState::kSealed || s.reclaiming) continue;
-    if (s.pins != 0) {
+    uint32_t& fallback = s.pins != 0 ? pinned : unpinned;
+    if (s.protected_bytes * 2 > sb_.segment_bytes) {
       if (fallback == UINT32_MAX) fallback = i;
+      ++retain_evict_skipped_;
+      continue;
+    }
+    if (s.pins != 0) {
+      if (pinned == UINT32_MAX) pinned = i;
       continue;
     }
     pick = i;
     break;
   }
-  if (pick == UINT32_MAX) pick = fallback;
+  if (pick == UINT32_MAX) pick = unpinned != UINT32_MAX ? unpinned : pinned;
   if (pick == UINT32_MAX) return false;
   return ReclaimVictim(lk, pick);
 }
 
 void LogStore::CleanerLoop() {
   Lock lk(mu_);
+  uint32_t last_expiry = 0;
   while (!stop_threads_ && !failed_.load()) {
-    // Keeps K + C segments free (§7.1); a pass that gained nothing waits
-    // before the next.
+    const uint32_t now = Now();
+    if (now != last_expiry) {
+      last_expiry = now;
+      lk.unlock();
+      ExpireRetention(now, 1024);
+      lk.lock();
+      continue;
+    }
+    // Keeps K + C segments free (§7.1); a pass that gained nothing (a
+    // victim full of protected records) waits before the next.
     const uint32_t before = FreeCountLocked();
     if (cleaner_armed_ && before < kOpenClient + kCleanerReserve && CleanOnce(lk) &&
         FreeCountLocked() > before)
@@ -1974,13 +2075,14 @@ void LogStore::CleanerLoop() {
 }
 
 // §7.7: a PUT that finds no free segment reclaims the oldest sealed segment
-// with no pins itself, evict-only, and takes it as its open segment.
+// with no pins and no protected records itself, evict-only, and takes it as
+// its open segment.
 bool LogStore::InlineReclaimLocked(Lock& lk) {
   uint32_t victim = UINT32_MAX;
   for (uint32_t i : fifo_) {
     const Segment& s = segments_[i];
     if (s.state == SegState::kSealed && !s.reclaiming && s.pins == 0 &&
-        s.writers == 0) {
+        s.writers == 0 && s.protected_bytes == 0) {
       victim = i;
       break;
     }
@@ -1995,7 +2097,7 @@ bool LogStore::InlineReclaimLocked(Lock& lk) {
         it->second.loc == Location{victim, s.incarnation, r.offset_blocks})
       keys.push_back(r.key);
   }
-  for (const auto& k : keys) EvictLocked(k);
+  for (const auto& k : keys) EvictLocked(k, false);
   if (!SyncCopiesLocked(lk, victim)) return false;
   lk.unlock();
   Hook("inline_reclaim.before_header");
@@ -2085,6 +2187,158 @@ Status LogStore::Remove(const BlockKey& key) {
   return had ? Status::kOk : Status::kNotFound;
 }
 
+// ---- retention (§9.2) ----------------------------------------------------------
+uint64_t LogStore::RetainBudget() const {
+  if (!opt_.retain_enabled) return 0;
+  const uint64_t usable =
+      segments_.size() > kHeldBack
+          ? uint64_t(segments_.size() - kHeldBack) * sb_.segment_bytes
+          : 0;
+  return usable / 100 * opt_.retain_max_pct;
+}
+
+void LogStore::ProtectLocked(Entry* e) {
+  const uint64_t fp = Footprint(*e);
+  protected_bytes_ += fp;
+  ++protected_count_;
+  segments_[e->loc.segment].protected_bytes += fp;
+}
+
+void LogStore::UnprotectLocked(Entry* e) {
+  if (e->retain_until == 0) return;
+  const uint64_t fp = Footprint(*e);
+  protected_bytes_ -= fp;
+  --protected_count_;
+  segments_[e->loc.segment].protected_bytes -= fp;
+  e->retain_until = 0;
+}
+
+uint8_t LogStore::Retain(const BlockKey& key, uint32_t ttl_s, uint8_t mode,
+                         uint32_t now_s) {
+  enum : uint8_t { kMiss = 0, kHitUnprotected, kProtectedNew, kRefreshed,
+                   kUpgraded, kUnchanged, kDenied };
+  if (!opt_.retain_enabled) return kRetainUnsupported;
+  if (!Serving()) return kMiss;
+  const bool refresh = mode == 1;
+  std::lock_guard<std::mutex> lk(mu_);
+  // A stepped-back clock must not shorten anything already granted.
+  if (now_s > retain_now_s_) retain_now_s_ = now_s;
+  const uint32_t now = retain_now_s_;
+  auto count = [&](uint8_t code) {
+    ++retain_results_[code];
+    return code;
+  };
+  // Only a committed value can be protected, as a reader would see it.
+  auto it = index_.find(key);
+  if (it == index_.end()) return count(kMiss);
+  Entry& m = it->second;
+  // A REFRESH is a hit served from a higher tier: it counts as a read.
+  if (refresh) m.referenced = true;
+  const uint32_t stored = std::min(m.retain_ttl, opt_.retain_max_ttl_s);
+  const uint32_t requested = std::min(ttl_s, opt_.retain_max_ttl_s);
+  const uint32_t eff = refresh ? stored : std::max(stored, requested);
+  if (eff == 0) return count(kHitUnprotected);
+  const bool was_protected = m.retain_until != 0;
+  if (!was_protected && protected_bytes_ + Footprint(m) > RetainBudget())
+    return count(kDenied);
+  const uint64_t candidate = uint64_t(now) + eff;
+  const uint32_t new_until = static_cast<uint32_t>(std::max<uint64_t>(
+      m.retain_until, std::min<uint64_t>(candidate, UINT32_MAX)));
+  uint8_t code;
+  if (!was_protected) code = kProtectedNew;
+  else if (eff > stored) code = kUpgraded;
+  else if (new_until > m.retain_until) code = kRefreshed;
+  else code = kUnchanged;
+  if (!was_protected) {
+    m.retain_until = new_until;
+    ProtectLocked(&m);
+    // Only a new protection goes on the wheel (as slab).
+    wheel_[new_until / kWheelTickS].push_back({key, m.generation});
+    ++wheel_entries_;
+  }
+  m.retain_ttl = eff;
+  m.retain_until = new_until;
+  // Persisted for a new or raised TTL, and for renewals once the deadline
+  // moved far enough that losing it matters; the call does not wait (C17).
+  const uint32_t delta_floor = std::max(opt_.retain_persist_min_delta_s, eff / 4);
+  if (code == kProtectedNew || code == kUpgraded ||
+      uint64_t(m.retain_until) >= uint64_t(m.retain_persisted_until) + delta_floor) {
+    m.retain_persisted_until = m.retain_until;
+    lse::JournalEntry e;
+    e.type = lse::kJournalRetain;
+    e.key = key;
+    e.generation = m.generation;
+    e.retain_until = m.retain_until;
+    e.retain_ttl = m.retain_ttl;
+    journal_->Enqueue(e);
+  }
+  return count(code);
+}
+
+size_t LogStore::ExpireRetention(uint32_t now_s, size_t max_entries) {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (now_s > retain_now_s_) retain_now_s_ = now_s;
+  const uint64_t current = retain_now_s_ / kWheelTickS;
+  size_t released = 0, looked = 0;
+  // A bucket is drained only once its whole 10 s window lies in the past, so
+  // protection may outlive its deadline by < 10 s, never end early.
+  while (!wheel_.empty() && wheel_.begin()->first < current &&
+         looked < max_entries) {
+    auto& bucket = wheel_.begin()->second;
+    while (!bucket.empty() && looked < max_entries) {
+      const auto item = bucket.back();
+      bucket.pop_back();
+      --wheel_entries_;
+      ++looked;
+      auto it = index_.find(item.first);
+      if (it == index_.end() || it->second.generation != item.second ||
+          it->second.retain_until == 0)
+        continue;  // removed, replaced or released: harmless
+      Entry& e = it->second;
+      if (e.retain_until / kWheelTickS >= current) {
+        wheel_[e.retain_until / kWheelTickS].push_back(item);  // renewed
+        ++wheel_entries_;
+        continue;
+      }
+      UnprotectLocked(&e);
+      ++released;
+      ++retain_expired_;
+    }
+    if (bucket.empty()) wheel_.erase(wheel_.begin());
+  }
+  return released;
+}
+
+uint32_t LogStore::RetainHeadroomPct() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  const uint64_t budget = RetainBudget();
+  if (budget == 0) return 0;
+  const uint64_t used = std::min(protected_bytes_, budget);
+  return static_cast<uint32_t>((budget - used) * 100 / budget);
+}
+
+RetentionStats LogStore::GetRetentionStats() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  RetentionStats st;
+  st.enabled = opt_.retain_enabled;
+  st.budget_bytes = RetainBudget();
+  st.protected_bytes = protected_bytes_;
+  st.protected_slots = protected_count_;
+  for (const auto& s : segments_)
+    if (s.protected_bytes != 0) ++st.extents_pinned;
+  st.expired = retain_expired_;
+  st.evict_skipped = retain_evict_skipped_;
+  st.wheel_entries = wheel_entries_;
+  st.max_ttl_s = opt_.retain_enabled ? opt_.retain_max_ttl_s : 0;
+  if (st.budget_bytes != 0) {
+    const uint64_t used = std::min(protected_bytes_, st.budget_bytes);
+    st.headroom_pct =
+        static_cast<uint32_t>((st.budget_bytes - used) * 100 / st.budget_bytes);
+  }
+  for (size_t i = 0; i < 7; ++i) st.results[i] = retain_results_[i];
+  return st;
+}
+
 // ---- stats and metrics -------------------------------------------------------
 LogStore::Stats LogStore::GetStats() const {
   std::lock_guard<std::mutex> lk(mu_);
@@ -2131,6 +2385,8 @@ void LogStore::EngineMetrics(std::vector<EngineMetric>* out) const {
   add("dfkv_lse_relocated_bytes_total", "counter", "Footprint bytes relocated",
       st.relocated_bytes);
   add("dfkv_lse_records_evicted_total", "counter", "Records evicted", st.records_evicted);
+  add("dfkv_lse_protected_evictions_total", "counter",
+      "Protected records evicted as the cleaner's last resort", st.protected_evictions);
   add("dfkv_lse_relocate_budget_exhausted_total", "counter",
       "Referenced records evicted because the relocation budget was used up",
       st.budget_exhausted);

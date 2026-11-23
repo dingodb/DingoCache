@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -934,6 +935,12 @@ struct ImageEviction {
   uint64_t generation = 0;
   size_t at = 0;
 };
+// A RETAIN of the workload and what it answered (2..5: protected).
+struct ImageRetain {
+  uint64_t id = 0;
+  size_t start = 0, end = 0;
+  uint8_t result = 0;
+};
 // How a workload's images are opened and judged.
 struct ImageCheck {
   std::function<std::string(uint64_t, uint32_t)> value = Value;
@@ -944,6 +951,19 @@ struct ImageCheck {
   // false: a caller whose coverage depends on thread timing sums the counts
   // over several seeds and checks the minimums itself.
   bool check_minimums = true;
+  // I4: a value a RETAIN protected (the workload had no protected eviction)
+  // is served by every image once a sync covered its record.
+  const std::vector<ImageRetain>* retains = nullptr;
+  // Power losses that keep nothing loose, at these prefixes, besides the
+  // random ones (the moments right after a victim's new header).
+  std::vector<size_t> power_prefixes;
+};
+
+// A protected value for the I4 check: its PUT, the recorded write of its
+// record, and the first sync of that file after it.
+struct ProtectedValue {
+  const ImageOp* put = nullptr;
+  size_t durable_at = SIZE_MAX;
 };
 
 // How much the image checks actually looked at.
@@ -953,12 +973,32 @@ struct ImageStats {
   int holes = 0;             // images recovered past rejected records
   int uncommitted_served = 0;
   int power_served = 0;      // values served by power-loss images
+  int protected_checked = 0; // protected values held to I4
+  int protected_power = 0;   // of those, in power-loss images (kills keep all)
 };
 
 void CheckImage(LogStore& s, const std::vector<ImageOp>& ops, uint64_t keys,
                 size_t prefix, Crash crash, ImageStats* stats,
-                const ImageCheck& check) {
+                const ImageCheck& check,
+                const std::vector<ProtectedValue>& protected_values) {
   const auto& Value = check.value;
+  for (const auto& pv : protected_values) {
+    if (pv.durable_at > prefix) continue;
+    // Held to it only while nothing else touched the key up to the crash.
+    bool alone = true;
+    for (const auto& e : ops)
+      if (&e != pv.put && e.id == pv.put->id && e.start < prefix &&
+          e.end > pv.put->start)
+        alone = false;
+    if (!alone) continue;
+    std::string out;
+    const Status st = s.Range(Key(pv.put->id), 0, 0, &out);
+    EXPECT_TRUE(st == Status::kOk && out == Value(pv.put->id, pv.put->version))
+        << "key " << pv.put->id << ": a protected value whose record was "
+           "synced is gone (I4)";
+    ++stats->protected_checked;
+    if (crash != Crash::kKill) ++stats->protected_power;
+  }
   for (uint64_t id = 0; id < keys; ++id) {
     std::string out;
     const Status st = s.Range(Key(id), 0, 0, &out);
@@ -1035,17 +1075,64 @@ void CheckImage(LogStore& s, const std::vector<ImageOp>& ops, uint64_t keys,
   }
 }
 
+// The values the workload's RETAINs protected: the key's last PUT that
+// returned before the RETAIN began, with nothing else of the key in between,
+// and the first sync of the file its record was written to.
+std::vector<ProtectedValue> ProtectedValues(
+    const std::vector<RecordingIo::Op>& recorded,
+    const std::vector<ImageOp>& ops, const ImageCheck& check) {
+  std::vector<ProtectedValue> out;
+  if (check.retains == nullptr) return out;
+  std::set<const ImageOp*> seen;
+  for (const auto& r : *check.retains) {
+    if (r.result < 2 || r.result > 5) continue;
+    const ImageOp* p = nullptr;
+    for (const auto& e : ops)
+      if (e.id == r.id && e.put && e.wrote && e.end <= r.start &&
+          (p == nullptr || e.start > p->start))
+        p = &e;
+    if (p == nullptr || !seen.insert(p).second) continue;
+    bool alone = true;
+    for (const auto& e : ops)
+      if (&e != p && e.id == r.id && e.start < r.end && e.end > p->start)
+        alone = false;
+    const std::string v = check.value(p->id, p->version);
+    if (!alone || v.size() < 3000) continue;  // a size the search can find
+    ProtectedValue pv;
+    pv.put = p;
+    for (size_t i = p->start; i < p->commit && i < recorded.size(); ++i) {
+      if (recorded[i].kind != RecordingIo::Op::kWrite ||
+          recorded[i].data.find(v) == std::string::npos)
+        continue;
+      for (size_t j = i + 1; j < recorded.size(); ++j)
+        if (recorded[j].kind == RecordingIo::Op::kSync &&
+            recorded[j].path == recorded[i].path) {
+          pv.durable_at = j + 1;
+          break;
+        }
+      break;
+    }
+    if (pv.durable_at != SIZE_MAX) out.push_back(pv);
+  }
+  return out;
+}
+
 ImageStats CheckImages(const std::vector<RecordingIo::Op>& recorded,
                        const std::vector<ImageOp>& ops, uint64_t keys,
                        const fs::path& dir, const fs::path& image, int images,
                        uint64_t seed, const ImageCheck& check = ImageCheck()) {
   ImageStats stats;
   std::mt19937_64 rng(seed);
-  for (int round = 0; round < images; ++round) {
-    const size_t prefix = 1 + rng() % recorded.size();
-    const Crash crash = round % 3 == 0   ? Crash::kKill
-                        : round % 3 == 1 ? Crash::kPower
-                                         : Crash::kPowerAll;
+  const std::vector<ProtectedValue> protected_values =
+      ProtectedValues(recorded, ops, check);
+  const int rounds = images + static_cast<int>(check.power_prefixes.size());
+  for (int round = 0; round < rounds; ++round) {
+    const bool chosen = round >= images;
+    const size_t prefix = chosen ? check.power_prefixes[round - images]
+                                 : 1 + rng() % recorded.size();
+    const Crash crash = chosen || round % 3 == 2 ? Crash::kPowerAll
+                        : round % 3 == 0         ? Crash::kKill
+                                                 : Crash::kPower;
     SCOPED_TRACE("prefix " + std::to_string(prefix) + " crash " +
                  std::to_string(static_cast<int>(crash)));
     BuildImage(recorded, prefix, crash, &rng, dir, image);
@@ -1063,7 +1150,7 @@ ImageStats CheckImages(const std::vector<RecordingIo::Op>& recorded,
     }
     ++stats.images;
     if (s.GetRecoveryStats().records_rejected > 0) ++stats.holes;
-    CheckImage(s, ops, keys, prefix, crash, &stats, check);
+    CheckImage(s, ops, keys, prefix, crash, &stats, check, protected_values);
     if (::testing::Test::HasFatalFailure()) return stats;
   }
   // The checks did look at something (a change that silently emptied them
@@ -1075,11 +1162,16 @@ ImageStats CheckImages(const std::vector<RecordingIo::Op>& recorded,
     EXPECT_GT(stats.holes, 0);
     EXPECT_GT(stats.power_served, 0) << "the power images' I2/I3 checks saw values";
   }
+  if (check.retains != nullptr)
+    EXPECT_GT(stats.protected_power, 0)
+        << "the I4 check saw protected values in power-loss images";
   ::testing::Test::RecordProperty("images", stats.images);
   ::testing::Test::RecordProperty("strict_keys", stats.strict_keys);
   ::testing::Test::RecordProperty("holes", stats.holes);
   ::testing::Test::RecordProperty("uncommitted_served", stats.uncommitted_served);
   ::testing::Test::RecordProperty("power_served", stats.power_served);
+  ::testing::Test::RecordProperty("protected_checked", stats.protected_checked);
+  ::testing::Test::RecordProperty("protected_power", stats.protected_power);
   return stats;
 }
 }  // namespace
@@ -1572,7 +1664,7 @@ std::string ImageValue(uint64_t id, uint32_t version) {
 }
 
 // A small store written several times past what it holds, with reads (the
-// cleaner's second chance): segments are sealed, reclaimed (relocating
+// cleaner's second chance) and RETAINs: segments are sealed, reclaimed (relocating
 // what was read, evicting the rest, and reclaiming inline), and the
 // journal compacted; crash images of it, evictions allowed for.
 TEST(LogStore, CrashImagesThroughSealingReclaimAndCompaction) {
@@ -1582,6 +1674,7 @@ TEST(LogStore, CrashImagesThroughSealingReclaimAndCompaction) {
   constexpr uint64_t kKeys = 256;
   std::vector<ImageOp> ops(1500);
   std::vector<ImageEviction> evictions;
+  std::vector<ImageRetain> retains;
   std::mutex evict_mu;
   LogStore::Stats stats;
   {
@@ -1600,7 +1693,19 @@ TEST(LogStore, CrashImagesThroughSealingReclaimAndCompaction) {
     for (auto& op : ops) {
       op.id = rng() % kKeys;
       const int what = static_cast<int>(rng() % 10);
-      if (what <= 1) {  // a read: referenced, relocated at the next reclaim
+      if (what == 1) {  // protected: relocated at the next reclaim
+        ImageRetain r;
+        r.id = op.id;
+        r.start = io->Size();
+        r.result = s.Retain(Key(op.id), 600, 0,
+                            static_cast<uint32_t>(::time(nullptr)));
+        r.end = io->Size();
+        retains.push_back(r);
+        op.start = op.end = io->Size();
+        op.id = kKeys;
+        continue;
+      }
+      if (what == 0) {  // a read: referenced, relocated at the next reclaim
         std::string out;
         s.Range(Key(op.id), 0, 0, &out);
         op.start = op.end = io->Size();
@@ -1614,6 +1719,7 @@ TEST(LogStore, CrashImagesThroughSealingReclaimAndCompaction) {
     ASSERT_TRUE(s.Close());  // the counters of the asynchronous sealer too
     stats = s.GetStats();
   }
+  EXPECT_EQ(stats.protected_evictions, 0u) << "I4 holds for every RETAIN";
   EXPECT_GT(stats.segments_sealed, 3u);
   EXPECT_GT(stats.segments_reclaimed, 2u);
   EXPECT_GT(stats.records_evicted, 10u);
@@ -1627,7 +1733,199 @@ TEST(LogStore, CrashImagesThroughSealingReclaimAndCompaction) {
     o.cleaner = false;  // it would evict at once in a full store
     return o;
   };
+  check.retains = &retains;
   CheckImages(io->Ops(), ops, kKeys, dir, image, 80, 11, check);
+  fs::remove_all(dir);
+  fs::remove_all(image);
+}
+
+// N1 of the #512 review: the same with several writers and a reader holding
+// short leases, so reclaims give up on pinned victims and race PUTs and
+// REMOVEs; the power losses right after each victim's new header are checked
+// as well (C20 with copies of an attempt that gave up, MF1).
+TEST(LogStore, ConcurrentCrashImagesThroughSealingAndReclaim) {
+  const fs::path dir = TestDir("csimages");
+  const fs::path image = TestDir("csimages_out");
+  auto io = std::make_shared<RecordingIo>();
+  constexpr uint64_t kKeys = 96;
+  constexpr int kThreads = 3, kPerThread = 700;
+  std::vector<std::vector<ImageOp>> per(kThreads, std::vector<ImageOp>(kPerThread));
+  std::vector<std::vector<ImageRetain>> per_retains(kThreads);
+  std::vector<ImageEviction> evictions;
+  std::vector<size_t> headers;
+  std::mutex mu;
+  LogStore::Stats stats;
+  {
+    auto o = RecordedOpts(dir, io);
+    o.capacity_bytes = 32ull << 20;
+    o.sync_ms = 3600000;  // only seals and reclaims make values durable
+    o.pin_wait_ms = 1;
+    o.on_evict = [&](const BlockKey& k, uint64_t g) {
+      std::lock_guard<std::mutex> lk(mu);
+      evictions.push_back({k, g, io->Size()});
+    };
+    o.crash_hook = [&](const char* p) {
+      if (std::strcmp(p, "reclaim.after_header") == 0 ||
+          std::strcmp(p, "inline_reclaim.after_header") == 0) {
+        std::lock_guard<std::mutex> lk(mu);
+        headers.push_back(io->Size());
+      } else if (std::strcmp(p, "relocate.after_copy") == 0) {
+        // Slow relocations: leases taken meanwhile outlast the pin wait.
+        std::this_thread::sleep_for(std::chrono::microseconds(2000));
+      }
+    };
+    bool ok = false;
+    LogStore s(o, &ok);
+    ASSERT_TRUE(ok) << s.StartupError();
+    std::atomic<int> running{kThreads};
+    std::thread reader([&] {
+      std::mt19937_64 rng(99);
+      while (running.load() > 0) {
+        std::string out;
+        s.Range(Key(rng() % kKeys), 0, 0, &out);  // referenced: a second chance
+        // A quarter of the keys leased at a time, for some milliseconds.
+        std::vector<ReadLease> leases(24);
+        for (auto& l : leases) s.RangeDirectPrep(Key(rng() % kKeys), 0, 0, 1 << 20, &l);
+        std::this_thread::sleep_for(std::chrono::microseconds(3000 + rng() % 6000));
+      }
+    });
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t)
+      threads.emplace_back([&, t] {
+        std::mt19937_64 rng(200 + t);
+        for (int i = 0; i < kPerThread; ++i) {
+          ImageOp& op = per[t][i];
+          op.id = rng() % kKeys;
+          const int what = static_cast<int>(rng() % 10);
+          if (what < 2) {
+            ImageRetain r;
+            r.id = op.id;
+            r.start = io->Size();
+            r.result = s.Retain(Key(op.id), 600, 0,
+                                static_cast<uint32_t>(::time(nullptr)));
+            r.end = io->Size();
+            per_retains[t].push_back(r);
+            op.start = op.end = io->Size();
+            op.id = kKeys;  // not a key operation
+            continue;
+          }
+          op.put = what >= 4;
+          op.version = static_cast<uint32_t>(t * 100000 + i);  // unique bytes
+          RunOp(s, &op, *io, ImageValue);
+        }
+        --running;
+      });
+    for (auto& th : threads) th.join();
+    reader.join();
+    ASSERT_TRUE(s.Close());
+    stats = s.GetStats();
+  }
+  EXPECT_EQ(stats.protected_evictions, 0u) << "I4 holds for every RETAIN";
+  EXPECT_GT(stats.segments_reclaimed, 5u);
+  EXPECT_GT(stats.records_relocated, 0u);
+  EXPECT_GT(stats.victims_skipped_pins, 0u) << "no reclaim gave up on a pin";
+  RecordProperty("skipped_pins", static_cast<int>(stats.victims_skipped_pins));
+  std::vector<ImageOp> ops;
+  for (const auto& v : per) ops.insert(ops.end(), v.begin(), v.end());
+  std::vector<ImageRetain> retains;
+  for (const auto& v : per_retains) retains.insert(retains.end(), v.begin(), v.end());
+  ImageCheck check;
+  check.value = ImageValue;
+  check.evictions = &evictions;
+  check.retains = &retains;
+  check.open = [](const fs::path& p) {
+    auto o = Opts(p, 32ull << 20);
+    o.cleaner = false;
+    return o;
+  };
+  // At most 60 of the header moments, spread over the run.
+  for (size_t i = 0; i < headers.size(); i += std::max<size_t>(1, headers.size() / 60))
+    check.power_prefixes.push_back(headers[i]);
+  CheckImages(io->Ops(), ops, kKeys, dir, image, 90, 13, check);
+  fs::remove_all(dir);
+  fs::remove_all(image);
+}
+
+// MF1 of the #512 review (C20): a reclaim that relocated a protected value
+// and then gave up on a victim still pinned leaves the copy unsynced. The
+// victim's next header, by a later cleaner pass or an inline reclaim, gives
+// up its records: the copy must be durable first. A power loss right after
+// that header keeps the value.
+TEST(LogStore, ACopyOfAReclaimThatGaveUpIsDurableBeforeTheVictimIsReused) {
+  const fs::path dir = TestDir("gaveup");
+  const fs::path image = TestDir("gaveup_out");
+  auto io = std::make_shared<RecordingIo>();
+  auto big = [](uint64_t id) {
+    std::string v = Value(id, 0);
+    v.resize(400000, static_cast<char>('a' + id % 26));
+    return v;
+  };
+  LogStore* store = nullptr;
+  std::unique_ptr<ReadLease> lease;
+  std::atomic<int> phase{0};  // 1: leased; 2: the attempt gave up
+  std::vector<size_t> headers;
+  std::mutex mu;
+  auto o = RecordedOpts(dir, io);
+  o.capacity_bytes = 32ull << 20;
+  o.sync_ms = 3600000;  // only seals and reclaims sync
+  o.pin_wait_ms = 50;
+  o.crash_hook = [&](const char* p) {
+    if (std::strcmp(p, "relocate.after_copy") == 0 && phase.load() == 0) {
+      // The protected value is copied; a read of its neighbour pins the
+      // victim past the wait.
+      lease = std::make_unique<ReadLease>();
+      if (store->RangeDirectPrep(Key(1), 0, 0, 1 << 20, lease.get()) == Status::kOk)
+        phase = 1;
+      return;
+    }
+    if ((std::strcmp(p, "reclaim.after_header") == 0 ||
+         std::strcmp(p, "inline_reclaim.after_header") == 0) &&
+        phase.load() == 2) {
+      std::lock_guard<std::mutex> lk(mu);
+      headers.push_back(io->Size());
+    }
+  };
+  LogStore::Stats stats;
+  {
+    bool ok = false;
+    LogStore s(o, &ok);
+    store = &s;
+    ASSERT_TRUE(ok) << s.StartupError();
+    const uint32_t now = static_cast<uint32_t>(::time(nullptr));
+    ASSERT_EQ(s.Cache(Key(0), big(0).data(), big(0).size()), Status::kOk);
+    ASSERT_EQ(s.Retain(Key(0), 600, 0, now), 2);  // kProtectedNew
+    ASSERT_EQ(s.Cache(Key(1), big(1).data(), big(1).size()), Status::kOk);
+    uint64_t id = 2;
+    for (; id < 200 && phase.load() == 0; ++id)
+      s.Cache(Key(id), big(id).data(), big(id).size());
+    ASSERT_EQ(phase.load(), 1) << "the first segment was never reclaimed";
+    for (int i = 0; i < 500 && s.GetStats().victims_skipped_pins == 0; ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    ASSERT_GT(s.GetStats().victims_skipped_pins, 0u);
+    phase = 2;
+    lease.reset();
+    // More writes: the victim is reused.
+    for (uint64_t end = id + 60; id < end; ++id)
+      s.Cache(Key(id), big(id).data(), big(id).size());
+    stats = s.GetStats();
+    ASSERT_TRUE(s.Close());
+  }
+  EXPECT_GT(stats.records_relocated, 0u);
+  EXPECT_EQ(stats.protected_evictions, 0u);
+  ASSERT_FALSE(headers.empty());
+  std::mt19937_64 rng(1);
+  for (size_t i = 0; i < headers.size() && i < 4; ++i) {
+    SCOPED_TRACE("header " + std::to_string(i));
+    BuildImage(io->Ops(), headers[i], Crash::kPowerAll, &rng, dir, image);
+    auto io_opts = Opts(image, 32ull << 20);
+    io_opts.cleaner = false;
+    bool ok = false;
+    LogStore img(io_opts, &ok);
+    ASSERT_TRUE(ok) << img.StartupError();
+    std::string out;
+    EXPECT_TRUE(img.Range(Key(0), 0, 0, &out) == Status::kOk && out == big(0))
+        << "the protected value is gone after the victim's new header";
+  }
   fs::remove_all(dir);
   fs::remove_all(image);
 }
