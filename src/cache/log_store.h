@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <sys/uio.h>
 #include <functional>
 #include <map>
 #include <memory>
@@ -74,6 +75,9 @@ class LogStore : public StoreEngine {
 
     // DFKV_LSE_SYNC_MS: open segments are fdatasynced this often (§6.5).
     uint32_t sync_ms = 1000;
+    // DFKV_LSE_OPEN_SEGMENTS: open client segments K (§4.7); 0 = derived,
+    // segment_count / 32 in [1, 4].
+    uint32_t open_segments = 0;
     // DFKV_LSE_PIN_WAIT_MS: how long the cleaner waits for a victim's pins.
     uint32_t pin_wait_ms = 5000;
     // DFKV_LSE_RELOCATE_PCT: relocated bytes of referenced, unprotected
@@ -114,6 +118,8 @@ class LogStore : public StoreEngine {
   Status Cache(const BlockKey& key, const void* data, size_t len) override;
   Status CacheDirect(const BlockKey& key, char* data, size_t len,
                      size_t cap) override;
+  std::vector<Status> CacheDirectBatch(
+      const std::vector<CacheBatchItem>& items) override;
   Status Range(const BlockKey& key, uint64_t offset, uint64_t length,
                std::string* out, size_t* value_len = nullptr) override;
   Status RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,
@@ -186,6 +192,7 @@ class LogStore : public StoreEngine {
     uint32_t segments_free = 0;
     uint32_t segments_sealed_now = 0;
     uint32_t sealer_queue = 0;
+    uint32_t open_segments = 0;
     uint64_t shadows = 0;
     uint32_t segment_count = 0;
   };
@@ -312,6 +319,7 @@ class LogStore : public StoreEngine {
   // A new incarnation for the segment, durable. `empty`: also a trailer
   // with no records, so that a free segment is not walked at the next open.
   bool FreshHeader(uint32_t index, bool empty = false);  // with mu_ held
+  uint32_t OpenSegmentCount() const;
   bool SyncDir(const std::string& path);
   std::string SegmentPath(uint32_t index) const;
   bool Serving() const;
@@ -322,8 +330,27 @@ class LogStore : public StoreEngine {
   uint32_t Now() const;
 
   // ---- write path ----
+  // A PUT between its reservation and its commit.
+  struct PutState {
+    BlockKey key;
+    size_t len = 0;
+    lse::RecordHeader h;
+    uint64_t footprint = 0;
+    uint32_t segment = 0;
+    uint64_t offset = 0;
+    std::shared_ptr<Flight> flight;
+  };
   template <typename WriteFn>
   Status Put(const BlockKey& key, size_t len, const WriteFn& write);
+  bool BeginPutLocked(Lock& lk, const BlockKey& key, size_t len, PutState* ps,
+                      Status* st, uint32_t only_segment = UINT32_MAX,
+                      bool* defer = nullptr, bool* no_room = nullptr);
+  Status FinishPutLocked(Lock& lk, PutState* ps, bool written, int err);
+  Status FinishFlightLocked(PutState* ps, Status result);
+  bool AppendRecordIov(const lse::RecordHeader& h, const char* payload,
+                       size_t len, char* direct_buf, size_t direct_cap,
+                       bool direct, bool pad, std::vector<struct iovec>* iov,
+                       std::vector<std::unique_ptr<char, void (*)(void*)>>* keep);
   bool ReserveLocked(Lock& lk, uint64_t footprint, uint32_t* segment,
                      uint64_t* offset);
   bool ReserveRelocationLocked(Lock& lk, uint64_t footprint,
@@ -374,6 +401,8 @@ class LogStore : public StoreEngine {
   bool ReadPayload(const Entry& e, uint64_t offset, size_t n, char* dst);
   void DropCorruptLocked(const BlockKey& key, const Entry& e);
   static void ReleaseLeaseThunk(void* owner, uint64_t token) noexcept;
+  static void LeaseMismatchThunk(void* owner, const BlockKey& key,
+                                 uint64_t generation, const uint64_t* where) noexcept;
 
   void AddShadowLocked(const BlockKey& key, const Location& loc,
                        uint64_t generation, uint64_t kill_ticket = 0);
@@ -392,7 +421,8 @@ class LogStore : public StoreEngine {
 
   lse::Superblock sb_;
   std::vector<Segment> segments_;
-  uint32_t open_segment_ = UINT32_MAX;
+  std::vector<uint32_t> open_;   // open client segments, at most k_open_
+  uint32_t k_open_ = 1;
   uint32_t reloc_segment_ = UINT32_MAX;
   std::vector<uint32_t> free_;   // free segments, in the order they are taken
   std::deque<uint32_t> fifo_;    // sealed segments, oldest first (§7.2)

@@ -898,25 +898,74 @@ struct ImageOp {
   size_t locked = SIZE_MAX;   // when a REMOVE took the store's mutex
 };
 thread_local ImageOp* tl_op = nullptr;
+// The PUTs of a CacheDirectBatch in progress on this thread (several keys).
+thread_local std::vector<ImageOp*>* tl_batch = nullptr;
+ImageOp* HookOp(const BlockKey& key) {
+  if (tl_batch != nullptr)
+    for (ImageOp* op : *tl_batch)
+      if (Key(op->id) == key) return op;
+  return tl_op;
+}
 
 LogStore::Options RecordedOpts(const fs::path& dir,
                                const std::shared_ptr<RecordingIo>& io) {
   auto o = Opts(dir, 64ull << 20);
   o.io = io;
   o.sync_ms = 2;  // values become durable within the workload
-  o.on_commit = [io](const BlockKey&, uint64_t generation) {
-    if (tl_op == nullptr) return;
-    tl_op->wrote = true;
-    tl_op->generation = generation;
-    tl_op->commit = io->Size();
+  o.on_commit = [io](const BlockKey& key, uint64_t generation) {
+    ImageOp* op = HookOp(key);
+    if (op == nullptr) return;
+    op->wrote = true;
+    op->generation = generation;
+    op->commit = io->Size();
   };
-  o.on_reserve = [io](const BlockKey&) {
-    if (tl_op != nullptr) tl_op->reserve = io->Size();
+  o.on_reserve = [io](const BlockKey& key) {
+    ImageOp* op = HookOp(key);
+    if (op != nullptr) op->reserve = io->Size();
   };
   o.on_remove = [io](const BlockKey&) {
     if (tl_op != nullptr) tl_op->locked = io->Size();
   };
   return o;
+}
+
+// PUTs of distinct keys as one CacheDirectBatch (one multi-record write).
+void RunBatch(LogStore& s, std::vector<ImageOp*> ops, RecordingIo& io,
+              const std::function<std::string(uint64_t, uint32_t)>& value) {
+  std::vector<std::unique_ptr<char, void (*)(void*)>> bufs;
+  std::vector<StoreEngine::CacheBatchItem> items;
+  for (ImageOp* op : ops) {
+    op->start = io.Size();
+    const std::string v = value(op->id, op->version);
+    const size_t cap = (v.size() + 4095) / 4096 * 4096 + 4096;
+    void* mem = nullptr;
+    if (::posix_memalign(&mem, 4096, cap) != 0) mem = nullptr;
+    bufs.emplace_back(static_cast<char*>(mem), &std::free);
+    std::memcpy(mem, v.data(), v.size());
+    items.push_back({Key(op->id), static_cast<char*>(mem), v.size(), cap});
+  }
+  tl_batch = &ops;
+  s.CacheDirectBatch(items);
+  tl_batch = nullptr;
+  for (ImageOp* op : ops) op->end = io.Size();
+}
+// A batch of three distinct keys from `rng`, taking ops[i..i+2].
+template <typename Rng>
+void BatchOf3(LogStore& s, ImageOp* ops, uint64_t keys, uint32_t version, Rng& rng,
+              RecordingIo& io,
+              const std::function<std::string(uint64_t, uint32_t)>& value) {
+  std::vector<ImageOp*> batch;
+  std::set<uint64_t> ids;
+  while (ids.size() < 3) ids.insert(rng() % keys);
+  uint32_t n = 0;
+  for (uint64_t id : ids) {
+    ImageOp* op = &ops[n];
+    op->id = id;
+    op->put = true;
+    op->version = version + n++;
+    batch.push_back(op);
+  }
+  RunBatch(s, batch, io, value);
 }
 
 void RunOp(LogStore& s, ImageOp* op, RecordingIo& io,
@@ -1223,8 +1272,10 @@ TEST(LogStore, ConcurrentCrashImagesServeOnlyRightValues) {
   {
     // Slow journal blocks and PUTs that pause between reservation and write
     // widen the races: REMOVEs cancel PUTs mid-write, and later PUTs of the
-    // key arrive while those KILLs are queued.
+    // key arrive while those KILLs are queued. Three open segments, and
+    // batches: holes across segments, tears inside multi-record writes.
     auto o = RecordedOpts(dir, io);
+    o.open_segments = 3;
     o.crash_hook = [](const char* p) {
       thread_local std::mt19937_64 rng(std::hash<std::thread::id>()(
           std::this_thread::get_id()));
@@ -1242,9 +1293,15 @@ TEST(LogStore, ConcurrentCrashImagesServeOnlyRightValues) {
         std::mt19937_64 rng(100 + t);
         for (int i = 0; i < kPerThread; ++i) {
           ImageOp& op = per[t][i];
+          const uint32_t version = static_cast<uint32_t>(t * 100000 + i);  // unique
+          if (rng() % 6 == 0 && i + 3 <= kPerThread) {  // a batch of three keys
+            BatchOf3(s, &op, kKeys, version, rng, *io, Value);
+            i += 2;
+            continue;
+          }
           op.id = rng() % kKeys;
           op.put = rng() % 2 == 0;
-          op.version = static_cast<uint32_t>(t * 100000 + i);  // unique bytes
+          op.version = version;
           RunOp(s, &op, *io);
         }
       });
@@ -1769,6 +1826,7 @@ TEST(LogStore, ConcurrentCrashImagesThroughSealingAndReclaim) {
     o.capacity_bytes = 32ull << 20;
     o.sync_ms = 3600000;  // only seals and reclaims make values durable
     o.pin_wait_ms = 1;
+    o.open_segments = 3;  // with batches: several streams, multi-record writes
     o.on_evict = [&](const BlockKey& k, uint64_t g) {
       std::lock_guard<std::mutex> lk(mu);
       evictions.push_back({k, g, io->Size()});
@@ -1818,8 +1876,14 @@ TEST(LogStore, ConcurrentCrashImagesThroughSealingAndReclaim) {
             op.id = kKeys;  // not a key operation
             continue;
           }
+          const uint32_t version = static_cast<uint32_t>(t * 100000 + i);
+          if (what == 9 && i + 3 <= kPerThread) {  // a batch of three keys
+            BatchOf3(s, &op, kKeys, version, rng, *io, ImageValue);
+            i += 2;
+            continue;
+          }
           op.put = what >= 4;
-          op.version = static_cast<uint32_t>(t * 100000 + i);  // unique bytes
+          op.version = version;  // unique bytes
           RunOp(s, &op, *io, ImageValue);
         }
         --running;

@@ -33,11 +33,10 @@ constexpr uint64_t kLsnRange = 1ull << 20;
 constexpr uint64_t kMinSegmentBytes = 4ull << 20;
 constexpr uint64_t kMaxSegmentBytes = 1ull << 30;
 constexpr uint32_t kMinSegments = 8;
-// Segments held back (§7.1): K open client segments (one so far), C for the
+// Segments held back (§7.1): K open client segments (k_open_), C for the
 // cleaner only, and the relocation segment.
-constexpr uint32_t kOpenClient = 1;
 constexpr uint32_t kCleanerReserve = 2;
-constexpr uint32_t kHeldBack = kOpenClient + kCleanerReserve + 1;
+constexpr uint32_t kMaxOpenSegments = 4;
 constexpr size_t kSealerQueue = 2;
 // How long after the cleaner is armed a PUT that finds no space waits for it
 // (§7.1: a store reopened full, every segment holding a protected value).
@@ -355,6 +354,8 @@ void LogStore::ApplyEnvironment(Options* o) {
     return envparse::EnvU64(name, spec);
   };
   o->sync_ms = static_cast<uint32_t>(env("DFKV_LSE_SYNC_MS", o->sync_ms, 1, 3600000));
+  o->open_segments = static_cast<uint32_t>(
+      env("DFKV_LSE_OPEN_SEGMENTS", o->open_segments, 0, kMaxOpenSegments));
   o->pin_wait_ms =
       static_cast<uint32_t>(env("DFKV_LSE_PIN_WAIT_MS", o->pin_wait_ms, 0, 600000));
   o->relocate_pct =
@@ -888,6 +889,7 @@ bool LogStore::OpenStore() {
       }
       s.summary = std::move(records);
     }
+    k_open_ = OpenSegmentCount();  // the retention budget leaves them out
     // Retention from the journal, matched on key and generation (§8.3 step
     // 5), re-clamped to the configured cap as slab does.
     const uint32_t now = Now();
@@ -1102,6 +1104,14 @@ bool LogStore::ChangeCapacityLocked() {
   return true;
 }
 
+// K open client segments (§4.7): segment_count / 32 in [1, 4], or the
+// configured number.
+uint32_t LogStore::OpenSegmentCount() const {
+  if (opt_.open_segments != 0) return opt_.open_segments;
+  return std::max<uint32_t>(
+      1, std::min<uint32_t>(kMaxOpenSegments, uint32_t(segments_.size() / 32)));
+}
+
 bool LogStore::Activate() {
   if (!ok_ || failed_.load()) return false;
   if (activated_.load()) return true;
@@ -1163,10 +1173,12 @@ bool LogStore::Activate() {
   journal_ = std::make_unique<Journal>(this, journal_fd_, journal_stop_offset_,
                                        journal_next_seq_, journal_entries_);
   journal_fd_ = -1;
-  uint32_t first = 0;
-  if (TakeFreeSegmentLocked(/*client=*/true, &first)) {
-    open_segment_ = first;
-    segments_[first].state = SegState::kOpen;
+  k_open_ = OpenSegmentCount();
+  for (uint32_t n = 0; n < k_open_; ++n) {
+    uint32_t next = 0;
+    if (!TakeFreeSegmentLocked(/*client=*/true, &next)) break;
+    open_.push_back(next);
+    segments_[next].state = SegState::kOpen;
   }
   if (failed_.load()) return false;
   sealer_ = std::thread([this] { SealerLoop(); });
@@ -1196,10 +1208,10 @@ bool LogStore::Close() {
   // Seal what is still open or queued (§8.5).
   std::vector<uint32_t> to_seal(seal_queue_.begin(), seal_queue_.end());
   seal_queue_.clear();
-  for (uint32_t* open : {&open_segment_, &reloc_segment_}) {
-    if (*open != UINT32_MAX) to_seal.push_back(*open);
-    *open = UINT32_MAX;
-  }
+  to_seal.insert(to_seal.end(), open_.begin(), open_.end());
+  open_.clear();
+  if (reloc_segment_ != UINT32_MAX) to_seal.push_back(reloc_segment_);
+  reloc_segment_ = UINT32_MAX;
   bool ok = Healthy();
   for (uint32_t i : to_seal) {
     segments_[i].state = SegState::kSealing;
@@ -1386,24 +1398,44 @@ bool LogStore::PlaceLocked(uint32_t segment, uint64_t footprint,
 bool LogStore::ReserveLocked(Lock& lk, uint64_t footprint, uint32_t* segment,
                              uint64_t* offset) {
   for (int attempt = 0; attempt < 64 && !failed_.load(); ++attempt) {
-    if (open_segment_ != UINT32_MAX) {
-      if (PlaceLocked(open_segment_, footprint, offset)) {
-        *segment = open_segment_;
-        return true;
+    // Best fit (§6.1): the open segment with the least room that still
+    // takes the record and one more summary entry.
+    uint32_t best = UINT32_MAX;
+    uint64_t best_room = UINT64_MAX;
+    for (uint32_t i : open_) {
+      const Segment& s = segments_[i];
+      const uint64_t need = s.append_off + footprint + SummaryRoom(s.records + 1) +
+                            kBlockBytes;
+      if (need > sb_.segment_bytes) continue;
+      const uint64_t room = sb_.segment_bytes - need;
+      if (room < best_room) {
+        best_room = room;
+        best = i;
       }
-      const uint32_t full = open_segment_;
-      open_segment_ = UINT32_MAX;
-      HandToSealerLocked(lk, full);
-      continue;
+    }
+    if (best != UINT32_MAX && PlaceLocked(best, footprint, offset)) {
+      *segment = best;
+      return true;
     }
     if (!cleaner_armed_) {  // clients need space from here on
       cleaner_armed_ = true;
       arm_grace_until_ = std::chrono::steady_clock::now() +
                          std::chrono::milliseconds(kArmGraceMs);
     }
+    if (open_.size() >= k_open_) {
+      // None fits: the fullest goes to the sealer, a fresh one replaces it.
+      auto fullest = std::max_element(
+          open_.begin(), open_.end(), [&](uint32_t a, uint32_t b) {
+            return segments_[a].append_off < segments_[b].append_off;
+          });
+      const uint32_t full = *fullest;
+      open_.erase(fullest);
+      HandToSealerLocked(lk, full);
+      continue;
+    }
     uint32_t next = 0;
     if (TakeFreeSegmentLocked(/*client=*/true, &next)) {
-      open_segment_ = next;
+      open_.push_back(next);
       segments_[next].state = SegState::kOpen;
       continue;
     }
@@ -1415,9 +1447,10 @@ bool LogStore::ReserveLocked(Lock& lk, uint64_t footprint, uint32_t* segment,
     if (failed_.load() || !opt_.cleaner || stop_threads_ ||
         std::chrono::steady_clock::now() >= arm_grace_until_)
       return false;
+    const size_t opened = open_.size();
     state_cv_.wait_until(lk, arm_grace_until_, [&] {
-      return FreeCountLocked() > kCleanerReserve ||
-             open_segment_ != UINT32_MAX || failed_.load() || stop_threads_;
+      return FreeCountLocked() > kCleanerReserve || open_.size() > opened ||
+             failed_.load() || stop_threads_;
     });
   }
   return false;
@@ -1444,44 +1477,65 @@ bool LogStore::ReserveRelocationLocked(Lock& lk, uint64_t footprint,
   return false;
 }
 
-bool LogStore::WriteRecord(uint32_t segment, uint64_t offset,
-                           const lse::RecordHeader& h, const char* payload,
-                           size_t len, char* direct_buf, size_t direct_cap) {
+// The iovecs of one record at its reserved place: the header block, then
+// (unless inline) the payload padded to 4 KiB, written from the caller's
+// aligned buffer when direct I/O allows it. `pad`: buffered writes too carry
+// the padding (a batch writes its records back to back in one call).
+bool LogStore::AppendRecordIov(const lse::RecordHeader& h, const char* payload,
+                               size_t len, char* direct_buf, size_t direct_cap,
+                               bool direct, bool pad,
+                               std::vector<struct iovec>* iov,
+                               std::vector<std::unique_ptr<char, void (*)(void*)>>* keep) {
+  static const char kZeros[kBlockBytes] = {};
   const bool is_inline = (h.flags & lse::kRecordFlagInline) != 0;
   lse::Block header;
   if (!lse::EncodeRecordHeader(h, is_inline ? payload : nullptr, &header)) {
     errno = EINVAL;
     return false;
   }
-  AlignedBuf hbuf(kBlockBytes);
-  if (hbuf.p == nullptr) return false;
-  std::memcpy(hbuf.p, header.data(), kBlockBytes);
-  struct iovec iov[2];
-  iov[0] = {hbuf.p, kBlockBytes};
-  int n = 1;
-  std::unique_ptr<AlignedBuf> bounce;
-  Segment& s = segments_[segment];
-  const bool direct = s.dio_fd >= 0;
-  if (!is_inline) {
-    const size_t padded = AlignUp(len);
-    if (!direct) {
-      iov[1] = {const_cast<char*>(payload), len};
-    } else if (direct_buf != nullptr &&
-               (reinterpret_cast<uintptr_t>(direct_buf) & (kBlockBytes - 1)) == 0 &&
-               direct_cap >= padded) {
-      std::memset(direct_buf + len, 0, padded - len);
-      iov[1] = {direct_buf, padded};
-    } else {
-      bounce = std::make_unique<AlignedBuf>(padded);
-      if (bounce->p == nullptr) return false;
-      std::memcpy(bounce->p, payload, len);
-      std::memset(bounce->p + len, 0, padded - len);
-      iov[1] = {bounce->p, padded};
-    }
-    n = 2;
+  auto aligned = [&](size_t n) -> char* {
+    void* p = nullptr;
+    if (::posix_memalign(&p, kBlockBytes, n) != 0) return nullptr;
+    keep->emplace_back(static_cast<char*>(p), &std::free);
+    return static_cast<char*>(p);
+  };
+  char* hb = aligned(kBlockBytes);
+  if (hb == nullptr) return false;
+  std::memcpy(hb, header.data(), kBlockBytes);
+  iov->push_back({hb, kBlockBytes});
+  if (is_inline) return true;
+  const size_t padded = AlignUp(len);
+  if (!direct) {
+    iov->push_back({const_cast<char*>(payload), len});
+    if (pad && padded != len)
+      iov->push_back({const_cast<char*>(kZeros), padded - len});
+  } else if (direct_buf != nullptr &&
+             (reinterpret_cast<uintptr_t>(direct_buf) & (kBlockBytes - 1)) == 0 &&
+             direct_cap >= padded) {
+    std::memset(direct_buf + len, 0, padded - len);
+    iov->push_back({direct_buf, padded});
+  } else {
+    char* bounce = aligned(padded);
+    if (bounce == nullptr) return false;
+    std::memcpy(bounce, payload, len);
+    std::memset(bounce + len, 0, padded - len);
+    iov->push_back({bounce, padded});
   }
-  return PwriteAll(io_.get(), direct ? s.dio_fd : s.fd, iov, n, offset,
-                   /*dsync=*/false);
+  return true;
+}
+
+bool LogStore::WriteRecord(uint32_t segment, uint64_t offset,
+                           const lse::RecordHeader& h, const char* payload,
+                           size_t len, char* direct_buf, size_t direct_cap) {
+  const Segment& s = segments_[segment];
+  const bool direct = s.dio_fd >= 0;
+  std::vector<struct iovec> iov;
+  std::vector<std::unique_ptr<char, void (*)(void*)>> keep;
+  if (!AppendRecordIov(h, payload, len, direct_buf, direct_cap, direct,
+                       /*pad=*/false, &iov, &keep))
+    return false;
+  return PwriteAll(io_.get(), direct ? s.dio_fd : s.fd, iov.data(),
+                   static_cast<int>(iov.size()), offset, /*dsync=*/false);
 }
 
 void LogStore::RecordWrittenLocked(uint32_t segment, const BlockKey& key,
@@ -1500,82 +1554,112 @@ void LogStore::RecordWrittenLocked(uint32_t segment, const BlockKey& key,
   s.last_lsn = std::max(s.last_lsn, h.write_lsn);
 }
 
-template <typename WriteFn>
-Status LogStore::Put(const BlockKey& key, size_t len, const WriteFn& write) {
-  if (!Serving()) return Status::kIOError;
-  if (len == 0 || len > MaxValueBytes()) return Status::kInvalid;
-  Lock lk(mu_);
-  for (;;) {
-    if (index_.count(key) != 0) return Status::kOk;  // keep-first
-    auto f = flights_.find(key);
-    if (f == flights_.end()) break;
-    std::shared_ptr<Flight> flight = f->second;
-    if (!flight->cancelled) {  // join the PUT in flight
+// The first half of a PUT, under the mutex (§6.1): keep-first and flights,
+// then space. True when space is reserved and the caller writes the record;
+// otherwise *st is the answer. `only_segment`: place the record in that open
+// segment, right after what was placed last, or not at all (*no_room); a key
+// with a PUT in flight is then left to the single-item path (*defer).
+bool LogStore::BeginPutLocked(Lock& lk, const BlockKey& key, size_t len,
+                              PutState* ps, Status* st, uint32_t only_segment,
+                              bool* defer, bool* no_room) {
+  if (only_segment == UINT32_MAX) {
+    for (;;) {
+      if (index_.count(key) != 0) {  // keep-first
+        *st = Status::kOk;
+        return false;
+      }
+      auto f = flights_.find(key);
+      if (f == flights_.end()) break;
+      std::shared_ptr<Flight> flight = f->second;
+      if (!flight->cancelled) {  // join the PUT in flight
+        flight->cv.wait(lk, [&] { return flight->done; });
+        *st = flight->result;
+        return false;
+      }
+      // A REMOVE took the key while that PUT was written: this PUT, which
+      // arrived after the REMOVE, must not share its result. Wait, then
+      // judge again.
       flight->cv.wait(lk, [&] { return flight->done; });
-      return flight->result;
     }
-    // A REMOVE took the key while that PUT was written: this PUT, which
-    // arrived after the REMOVE, must not share its result. Wait, then judge
-    // again.
-    flight->cv.wait(lk, [&] { return flight->done; });
+  } else {
+    if (index_.count(key) != 0) {
+      *st = Status::kOk;
+      return false;
+    }
+    if (flights_.count(key) != 0) {
+      *defer = true;
+      return false;
+    }
   }
-  lse::RecordHeader h;
-  h.flags = lse::RecordFitsInline(len) ? lse::kRecordFlagInline : 0;
-  h.value_len = len;
-  const uint64_t footprint = lse::RecordFootprint(h);
-  // The flight is registered before the reservation, which may wait (for the
+  ps->key = key;
+  ps->len = len;
+  ps->h = lse::RecordHeader{};
+  ps->h.flags = lse::RecordFitsInline(len) ? lse::kRecordFlagInline : 0;
+  ps->h.value_len = len;
+  ps->footprint = lse::RecordFootprint(ps->h);
+  if (only_segment != UINT32_MAX) {
+    if (!PlaceLocked(only_segment, ps->footprint, &ps->offset)) {
+      *no_room = true;
+      return false;
+    }
+    ps->segment = only_segment;
+  }
+  // The flight is registered before a reservation that may wait (for the
   // sealer, or an inline reclaim): joiners and REMOVEs see it meanwhile.
-  auto flight = std::make_shared<Flight>();
-  flights_[key] = flight;
-  auto finish = [&](Status result) {
-    flight->result = result;
-    flight->done = true;
-    auto it = flights_.find(key);
-    if (it != flights_.end() && it->second == flight) flights_.erase(it);
-    flight->cv.notify_all();
-    state_cv_.notify_all();
-    return result;
-  };
-  uint32_t segment = 0;
-  uint64_t offset = 0;
-  if (!ReserveLocked(lk, footprint, &segment, &offset)) {
-    if (!Serving()) return finish(Status::kIOError);
-    ++stats_.cache_full;
-    return finish(Status::kCacheFull);
+  ps->flight = std::make_shared<Flight>();
+  flights_[key] = ps->flight;
+  if (only_segment == UINT32_MAX &&
+      !ReserveLocked(lk, ps->footprint, &ps->segment, &ps->offset)) {
+    if (!Serving()) {
+      *st = FinishFlightLocked(ps, Status::kIOError);
+    } else {
+      ++stats_.cache_full;
+      *st = FinishFlightLocked(ps, Status::kCacheFull);
+    }
+    return false;
   }
   if (opt_.on_reserve) opt_.on_reserve(key);
-  Segment& seg = segments_[segment];
-  if (flight->cancelled) {
+  Segment& seg = segments_[ps->segment];
+  if (ps->flight->cancelled) {
     // A REMOVE came while this PUT waited for space: nothing is written, so
     // nothing can come back after the REMOVE; answered kOk (it began first).
     --seg.pins;
     --seg.writers;
-    return finish(Status::kOk);
+    *st = FinishFlightLocked(ps, Status::kOk);
+    return false;
   }
   const uint64_t generation = NextLsnLocked();
-  flight->loc = {segment, seg.incarnation,
-                 static_cast<uint32_t>(offset / kBlockBytes)};
-  flight->has_loc = true;
-  flight->generation = generation;
-  h.store_uuid = sb_.store_uuid;
-  h.incarnation = flight->loc.incarnation;
-  h.key = key;
-  h.generation = generation;
-  h.write_lsn = generation;
-  window_client_bytes_ += footprint;
+  ps->flight->loc = {ps->segment, seg.incarnation,
+                     static_cast<uint32_t>(ps->offset / kBlockBytes)};
+  ps->flight->has_loc = true;
+  ps->flight->generation = generation;
+  ps->h.store_uuid = sb_.store_uuid;
+  ps->h.incarnation = ps->flight->loc.incarnation;
+  ps->h.key = key;
+  ps->h.generation = generation;
+  ps->h.write_lsn = generation;
+  window_client_bytes_ += ps->footprint;
   if (window_client_bytes_ > opt_.capacity_bytes) {  // a sliding window
     window_client_bytes_ /= 2;
     window_relocated_bytes_ /= 2;
   }
-  lk.unlock();
+  return true;
+}
 
-  Hook("put.after_reserve");
-  uint32_t crc = 0;
-  const bool written = write(&h, segment, offset, &crc);
-  const int err = errno;
-  Hook("put.after_write");
+Status LogStore::FinishFlightLocked(PutState* ps, Status result) {
+  ps->flight->result = result;
+  ps->flight->done = true;
+  auto it = flights_.find(ps->key);
+  if (it != flights_.end() && it->second == ps->flight) flights_.erase(it);
+  ps->flight->cv.notify_all();
+  state_cv_.notify_all();
+  return result;
+}
 
-  lk.lock();
+// The second half, under the mutex again once the record is written.
+Status LogStore::FinishPutLocked(Lock& lk, PutState* ps, bool written, int err) {
+  const BlockKey& key = ps->key;
+  const uint32_t segment = ps->segment;
   --segments_[segment].pins;
   --segments_[segment].writers;
   // Marked for the periodic sync only now that the write is complete: a
@@ -1587,9 +1671,9 @@ Status LogStore::Put(const BlockKey& key, size_t len, const WriteFn& write) {
     FailStore("cannot write a record", err);
     result = Status::kIOError;
   } else {
-    RecordWrittenLocked(segment, key, h, offset);
+    RecordWrittenLocked(segment, key, ps->h, ps->offset);
   }
-  if (written && !flight->cancelled) {
+  if (written && !ps->flight->cancelled) {
     // Older values of the key that a crash could bring back are killed
     // durably before this one is acknowledged (design §6.1, I3).
     auto range = shadows_.equal_range(key);
@@ -1625,32 +1709,50 @@ Status LogStore::Put(const BlockKey& key, size_t len, const WriteFn& write) {
         for (uint32_t s : segs) MaybeFreeLocked(s);
       }
     }
-    if (result == Status::kOk && !flight->cancelled) {
+    if (result == Status::kOk && !ps->flight->cancelled) {
       Entry e;
-      e.loc = flight->loc;
-      e.value_len = len;
-      e.generation = generation;
-      e.payload_crc = crc;
-      e.inline_at = (h.flags & lse::kRecordFlagInline) ? h.header_len : uint16_t(0);
-      e.write_lsn = generation;
+      e.loc = ps->flight->loc;
+      e.value_len = ps->len;
+      e.generation = ps->h.generation;
+      e.payload_crc = ps->h.payload_crc;
+      e.inline_at =
+          (ps->h.flags & lse::kRecordFlagInline) ? ps->h.header_len : uint16_t(0);
+      e.write_lsn = ps->h.generation;
       index_[key] = e;
       ++segments_[segment].live;
-      used_bytes_ += footprint;
-      tenant_bytes_[key.tenant_hash] += len;
-      if (opt_.on_commit) opt_.on_commit(key, generation);
+      used_bytes_ += ps->footprint;
+      tenant_bytes_[key.tenant_hash] += ps->len;
+      if (opt_.on_commit) opt_.on_commit(key, ps->h.generation);
     }
   }
   // A PUT that a REMOVE cancelled while it was written is answered kOk (it
   // started before the REMOVE) and not published.
   MaybeFreeLocked(segment);
-  return finish(result);
+  return FinishFlightLocked(ps, result);
+}
+
+template <typename WriteFn>
+Status LogStore::Put(const BlockKey& key, size_t len, const WriteFn& write) {
+  if (!Serving()) return Status::kIOError;
+  if (len == 0 || len > MaxValueBytes()) return Status::kInvalid;
+  Lock lk(mu_);
+  PutState ps;
+  Status st = Status::kOk;
+  if (!BeginPutLocked(lk, key, len, &ps, &st)) return st;
+  lk.unlock();
+  Hook("put.after_reserve");
+  const bool written = write(&ps.h, ps.segment, ps.offset);
+  const int err = errno;
+  Hook("put.after_write");
+  lk.lock();
+  return FinishPutLocked(lk, &ps, written, err);
 }
 
 Status LogStore::Cache(const BlockKey& key, const void* data, size_t len) {
   if (data == nullptr) return Status::kInvalid;
   return Put(key, len, [&](lse::RecordHeader* h, uint32_t segment,
-                           uint64_t offset, uint32_t* crc) {
-    *crc = h->payload_crc = Crc32c(data, len);
+                           uint64_t offset) {
+    h->payload_crc = Crc32c(data, len);
     return WriteRecord(segment, offset, *h, static_cast<const char*>(data),
                        len, nullptr, 0);
   });
@@ -1660,10 +1762,104 @@ Status LogStore::CacheDirect(const BlockKey& key, char* data, size_t len,
                              size_t cap) {
   if (data == nullptr) return Status::kInvalid;
   return Put(key, len, [&](lse::RecordHeader* h, uint32_t segment,
-                           uint64_t offset, uint32_t* crc) {
-    *crc = h->payload_crc = Crc32c(data, len);
+                           uint64_t offset) {
+    h->payload_crc = Crc32c(data, len);
     return WriteRecord(segment, offset, *h, data, len, data, cap);
   });
+}
+
+// §6.4: the fresh items go to one open segment back to back and are written
+// with one call, then committed one by one; keep-first, flights, kInvalid
+// and kCacheFull are those of CacheDirect. An item whose key is in flight,
+// or repeats an earlier item's key, takes the single-item path afterwards.
+std::vector<Status> LogStore::CacheDirectBatch(
+    const std::vector<CacheBatchItem>& items) {
+  constexpr size_t kBatchRecords = 256;  // iovecs stay far below IOV_MAX
+  std::vector<Status> out(items.size(), Status::kOk);
+  if (!Serving()) {
+    std::fill(out.begin(), out.end(), Status::kIOError);
+    return out;
+  }
+  std::vector<bool> settled(items.size(), false);
+  std::vector<size_t> single;
+  std::unordered_set<BlockKey, KeyHash> seen;
+  for (size_t i = 0; i < items.size(); ++i) {
+    const auto& it = items[i];
+    if (it.data == nullptr || it.len == 0 || it.len > MaxValueBytes()) {
+      out[i] = Status::kInvalid;
+      settled[i] = true;
+    } else if (!seen.insert(it.key).second) {
+      single.push_back(i);
+      settled[i] = true;
+    }
+  }
+  Lock lk(mu_);
+  size_t next = 0;
+  for (;;) {
+    while (next < items.size() && settled[next]) ++next;
+    if (next >= items.size() || failed_.load()) break;
+    std::vector<std::pair<size_t, PutState>> chunk;
+    {
+      PutState ps;
+      Status st = Status::kOk;
+      settled[next] = true;
+      const auto& it = items[next];
+      if (!BeginPutLocked(lk, it.key, it.len, &ps, &st)) {
+        out[next] = st;
+        continue;
+      }
+      chunk.emplace_back(next, std::move(ps));
+    }
+    const uint32_t segment = chunk.front().second.segment;
+    for (size_t j = next + 1; j < items.size() && chunk.size() < kBatchRecords;
+         ++j) {
+      if (settled[j]) continue;
+      PutState ps;
+      Status st = Status::kOk;
+      bool defer = false, no_room = false;
+      const auto& it = items[j];
+      if (!BeginPutLocked(lk, it.key, it.len, &ps, &st, segment, &defer,
+                          &no_room)) {
+        if (no_room) break;  // the rest go to the next chunk
+        settled[j] = true;
+        if (defer) single.push_back(j);
+        else out[j] = st;
+        continue;
+      }
+      settled[j] = true;
+      chunk.emplace_back(j, std::move(ps));
+    }
+    const Segment& seg = segments_[segment];
+    const bool direct = seg.dio_fd >= 0;
+    const int fd = direct ? seg.dio_fd : seg.fd;
+    lk.unlock();
+    std::vector<struct iovec> iov;
+    std::vector<std::unique_ptr<char, void (*)(void*)>> keep;
+    bool written = true;
+    for (auto& c : chunk) {
+      const auto& it = items[c.first];
+      c.second.h.payload_crc = Crc32c(it.data, it.len);
+      written = written && AppendRecordIov(c.second.h, it.data, it.len, it.data,
+                                           it.cap, direct, /*pad=*/true, &iov,
+                                           &keep);
+    }
+    Hook("batch.before_write");
+    // Placed back to back by PlaceLocked: one write covers them all.
+    written = written && PwriteAll(io_.get(), fd, iov.data(),
+                                   static_cast<int>(iov.size()),
+                                   chunk.front().second.offset, false);
+    const int err = errno;
+    Hook("batch.after_write");
+    lk.lock();
+    for (auto& c : chunk)
+      out[c.first] = FinishPutLocked(lk, &c.second, written, err);
+  }
+  for (size_t i = 0; i < items.size(); ++i)
+    if (!settled[i]) out[i] = Status::kIOError;  // the store failed meanwhile
+  lk.unlock();
+  for (size_t i : single)
+    out[i] = CacheDirect(items[i].key, items[i].data, items[i].len, items[i].cap);
+  return out;
 }
 
 // ---- sealing (§6.3) ----------------------------------------------------------
@@ -2045,8 +2241,9 @@ bool LogStore::CleanOnce(Lock& lk) {
       ++retain_evict_skipped_;
       continue;
     }
-    if (s.pins != 0) {
+    if (s.pins != 0) {  // passed over for now, retried at the next pass
       if (pinned == UINT32_MAX) pinned = i;
+      ++stats_.victims_skipped_pins;
       continue;
     }
     pick = i;
@@ -2072,7 +2269,7 @@ void LogStore::CleanerLoop() {
     // Keeps K + C segments free (§7.1); a pass that gained nothing (a
     // victim full of protected records) waits before the next.
     const uint32_t before = FreeCountLocked();
-    if (cleaner_armed_ && before < kOpenClient + kCleanerReserve && CleanOnce(lk) &&
+    if (cleaner_armed_ && before < k_open_ + kCleanerReserve && CleanOnce(lk) &&
         FreeCountLocked() > before)
       continue;
     state_cv_.wait_for(lk, std::chrono::milliseconds(200));
@@ -2119,10 +2316,10 @@ bool LogStore::InlineReclaimLocked(Lock& lk) {
   FinishReclaimLocked(victim, old_incarnation);
   ++stats_.inline_reclaims;
   ++stats_.segments_reclaimed;
-  if (open_segment_ == UINT32_MAX) {
-    open_segment_ = victim;
+  if (open_.size() < k_open_) {
+    open_.push_back(victim);
     s.state = SegState::kOpen;
-  } else {  // another PUT opened one meanwhile
+  } else {  // other PUTs opened segments meanwhile
     s.state = SegState::kFree;
     free_.push_back(victim);
   }
@@ -2196,8 +2393,9 @@ Status LogStore::Remove(const BlockKey& key) {
 uint64_t LogStore::RetainBudget() const {
   if (!opt_.retain_enabled) return 0;
   const uint64_t usable =
-      segments_.size() > kHeldBack
-          ? uint64_t(segments_.size() - kHeldBack) * sb_.segment_bytes
+      segments_.size() > k_open_ + kCleanerReserve + 1
+          ? uint64_t(segments_.size() - k_open_ - kCleanerReserve - 1) *
+                sb_.segment_bytes
           : 0;
   return usable / 100 * opt_.retain_max_pct;
 }
@@ -2351,6 +2549,7 @@ LogStore::Stats LogStore::GetStats() const {
   st.segments_free = static_cast<uint32_t>(free_.size());
   st.segments_sealed_now = static_cast<uint32_t>(fifo_.size());
   st.sealer_queue = static_cast<uint32_t>(seal_queue_.size());
+  st.open_segments = static_cast<uint32_t>(open_.size());
   st.shadows = shadows_.size();
   st.segment_count = static_cast<uint32_t>(segments_.size());
   if (journal_) st.journal_compactions = journal_->Compactions();
@@ -2604,8 +2803,31 @@ Status LogStore::RangeDirectPrep(const BlockKey& key, uint64_t offset,
   lease.head = static_cast<size_t>(pos - start);
   lease.payload_len = static_cast<size_t>(n);
   lease.value_len = static_cast<size_t>(e.value_len);
+  // The whole value: whoever reads it checks it before use (§5.3).
+  if (n == e.value_len) {
+    const uint64_t where[2] = {
+        (uint64_t(e.loc.segment) << 32) | e.loc.offset_blocks, e.loc.incarnation};
+    lease.SetVerifier(e.payload_crc, key, e.generation, where,
+                      &LogStore::LeaseMismatchThunk);
+  }
   *out = std::move(lease);
   return Status::kOk;
+}
+
+// Drops the value only if the index still points at the copy the lease
+// read: after a relocation (same generation, a new location verified when
+// it was copied) the failed read was of the old copy, already a shadow.
+void LogStore::LeaseMismatchThunk(void* owner, const BlockKey& key,
+                                  uint64_t generation,
+                                  const uint64_t* where) noexcept {
+  LogStore* store = static_cast<LogStore*>(owner);
+  const Location loc{static_cast<uint32_t>(where[0] >> 32), where[1],
+                     static_cast<uint32_t>(where[0])};
+  std::lock_guard<std::mutex> lk(store->mu_);
+  auto it = store->index_.find(key);
+  if (it != store->index_.end() && it->second.generation == generation &&
+      it->second.loc == loc)
+    store->DropCorruptLocked(key, it->second);
 }
 
 bool LogStore::IsCached(const BlockKey& key) const {

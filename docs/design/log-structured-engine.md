@@ -654,9 +654,11 @@ for it, which bounds the segments an unclean exit can leave unsealed (§8.4).
 
 The RAM tier's flusher hands batches of values to `CacheDirectBatch`. The log
 engine reserves one contiguous range in a single open segment for the whole
-batch (or as much of it as fits), so the batch is one `pwritev` or one io_uring
-submission of consecutive iovecs, then commits all its entries in one mutex
-hold. Per-item semantics (keep-first, flights, `kCacheFull`, `kInvalid`) are
+batch (or as much of it as fits, the rest going to the next segment, at most
+256 records per write), so the batch is one `pwritev` of consecutive iovecs,
+then commits its entries one by one. An item whose key has a PUT in flight,
+or repeats an earlier item's key, takes the single-item path after the
+batch. Per-item semantics (keep-first, flights, `kCacheFull`, `kInvalid`) are
 those of `CacheDirect`.
 
 ### 6.5 Durability and write ordering
@@ -746,7 +748,9 @@ makes it approximate least-recently-*used*.
 Two conditions move the cleaner past a segment to the next oldest, and the
 skipped segment is retried on the next pass:
 
-- **Pins.** The cleaner waits at most `DFKV_LSE_PIN_WAIT_MS` (default 5000)
+- **Pins.** A segment with pins is passed over while an unpinned choice
+  exists (counted in `dfkv_lse_victims_skipped_pins_total`). Once a victim's
+  records are moved, the cleaner waits at most `DFKV_LSE_PIN_WAIT_MS` (default 5000)
   for a victim's pins (leases, reads in progress) to clear before reclaiming it
   (§7.5 step 1). A lease held longer, for example by a stalled RDMA reply,
   delays that one segment, not all cleaning.

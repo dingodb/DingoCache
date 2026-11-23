@@ -1337,6 +1337,16 @@ void RdmaServer::Serve(
       reply->first_len = response_prefix;
       return true;
     };
+    // A whole value read from the disk is checked before anything uses it
+    // (log engine, design §5.3): on a mismatch it is a miss for the
+    // client, the coalescer's followers and the RAM tier alike.
+    if (!prepared.Verify()) {
+      prepared.Commit(Status::kNotFound, 0, elapsed_sec);
+      state.Reset();
+      EncodeRespVersion(ep.sbuf(send_slot), wire_epoch, Status::kNotFound, 0, 0);
+      reply->first_len = response_prefix;
+      return true;
+    }
     if (request.fields.offset > value_len ||
         output_len > request.fields.length ||
         output_len > value_len - request.fields.offset ||
