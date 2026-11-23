@@ -3,6 +3,17 @@
 ## Unreleased
 
 
+- SGLang HiCache connector: object keys are built from affixes packed once,
+  and a batch's keys share one native buffer. Every key was validated and
+  packed in full (pool, coordinates, component), and every key got a buffer
+  of its own for the native call; on a 1,563-page prefix of an MHA model
+  that took about 7 ms to build the 3,126 keys and 2.8 ms to hand them to
+  the native client, under the GIL, on every lookup, read, write and touch.
+  The connector now caches `pool_key_affixes` per pool and coordinates and
+  adds only the page hash field per key, and `make_key_array`
+  (`dfkv_common`) packs a batch into one buffer: 1.2 ms and 0.5 ms for the
+  same prefix. Keys are byte-identical.
+
 - SGLang HiCache connector, models whose primary KV pool is a logical
   anchor: the one-byte marker writes and reads no longer register memory for
   RDMA on every batch. Their buffers were not registered, so the transport
