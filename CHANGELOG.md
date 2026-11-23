@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- SGLang HiCache: `retain_precheck` reuses an admission for a tenth of its
+  TTL (HIC-27). SGLang asks it for every request that carries a retention
+  TTL, and each call built the object keys of the whole prefix and made two
+  round trips (the ring's limits and a headroom check): for a 1563-page
+  prefix, 7815 keys and about 4.3 ms of Python per call in a stand-in
+  benchmark. An admission of the same prefix, TTL and key form is now
+  answered from memory for a tenth of the TTL (the renewal interval
+  `batch_touch` already uses), at most 30 s, in about 0.03 ms; a refusal is
+  always asked again.
+
 - SGLang HiCache: a key stored with another length is rewritten once
   (HIC-26). A read that found a key stored with another length than this
   process reads (a shorter or larger object, for example written by an

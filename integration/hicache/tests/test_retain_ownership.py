@@ -463,6 +463,72 @@ class AnchorMarkerRetention(unittest.TestCase):
         self.assertEqual(c.retain_calls, [])
 
 
+class RetainPrecheckReuse(unittest.TestCase):
+    """HIC-27: SGLang asks retain_precheck for every request with a TTL, and
+    every call built the object keys of the whole prefix and made two round
+    trips. An admission is reused for a tenth of its TTL, at most 30 s; a
+    refusal is not."""
+
+    def setUp(self):
+        self.b = _backend(writer=True, tp_rank=0)
+        self.b._has_retain = True
+        self.built = []
+        build = self.b._retain_object_keys
+        self.b._retain_object_keys = (
+            lambda keys: self.built.append(len(keys)) or build(keys))
+        self.clock = [1000.0]
+        self._monotonic = H.time.monotonic
+        H.time.monotonic = lambda: self.clock[0]
+
+    def tearDown(self):
+        H.time.monotonic = self._monotonic
+
+    def test_an_admission_is_reused_for_at_most_30_s(self):
+        with _Cabi(cap=600):
+            for _ in range(5):
+                self.assertEqual(self.b.retain_precheck(list(PAGES), TTL), 600)
+            self.assertEqual(self.built, [len(PAGES)], "asked once")
+            self.clock[0] += 29.9
+            self.b.retain_precheck(PAGES, TTL)
+            self.assertEqual(len(self.built), 1)
+            self.clock[0] += 0.1   # 30 s, well within a tenth of 3600 s
+            self.assertEqual(self.b.retain_precheck(PAGES, TTL), 600)
+            self.assertEqual(len(self.built), 2)
+
+    def test_a_short_ttl_is_reused_for_a_tenth_of_it(self):
+        short = {"retain_ttl_s": 100}
+        with _Cabi():
+            self.b.retain_precheck(PAGES, short)
+            self.clock[0] += 9.9
+            self.b.retain_precheck(PAGES, short)
+            self.assertEqual(len(self.built), 1)
+            self.clock[0] += 0.1
+            self.b.retain_precheck(PAGES, short)
+            self.assertEqual(len(self.built), 2)
+
+    def test_a_refusal_is_asked_again(self):
+        with _Cabi(admit=False):
+            self.assertEqual(self.b.retain_precheck(PAGES, TTL), 0)
+            self.assertEqual(self.b.retain_precheck(PAGES, TTL), 0)
+        self.assertEqual(len(self.built), 2)
+        with _Cabi(supported=0):
+            self.assertEqual(self.b.retain_precheck(PAGES, TTL), 0)
+        with _Cabi():
+            self.assertEqual(self.b.retain_precheck(PAGES, TTL), 3600)
+        self.assertEqual(len(self.built), 3)
+
+    def test_another_prefix_ttl_or_key_form_is_asked(self):
+        longer = {"retain_ttl_s": TTL["retain_ttl_s"] + 1}
+        with _Cabi():
+            self.b.retain_precheck(PAGES, TTL)
+            self.b.retain_precheck(PAGES[:-1], TTL)
+            self.b.retain_precheck(PAGES, longer)
+            self.assertEqual(len(self.built), 3)
+            self.b._sg_chunks = dict(getattr(self.b, "_sg_chunks", {}), kv=2)
+            self.b.retain_precheck(PAGES, TTL)
+            self.assertEqual(len(self.built), 4)
+
+
 class BatchTouchDebounce(unittest.TestCase):
     """batch_touch with a TTL protects the prefix with a SET, which the
     native client does not debounce. Every request on a hot prefix rebuilt

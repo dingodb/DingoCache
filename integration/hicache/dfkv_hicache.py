@@ -2222,6 +2222,22 @@ class DfkvHiCache(HiCacheStorage):
             while len(seen) > self._TOUCH_DEBOUNCE_MAX:
                 seen.popitem(last=False)
 
+    def _prefix_identity(self, keys):
+        """Exact identity of a prefix without building its object keys, and
+        of the key form those keys take: a prefix judged while its pages were
+        bare keys, or while only SG group 0 was known, was not judged in the
+        form written later."""
+        return (len(keys), keys[0], keys[-1], hash(tuple(keys)),
+                self._device_direct_active(),
+                tuple(sorted(getattr(self, "_sg_chunks", {}).items())),
+                getattr(self, "_draft_layout", None))
+
+    # Prefixes retain_precheck admitted recently: identity -> (ttl, s).
+    _precheck_seen = None
+    # Longest reuse of an admission: the node's headroom can change sooner
+    # than a tenth of a long TTL.
+    _PRECHECK_REUSE_MAX_S = 30.0
+
     def retain_precheck(self, keys, extra_info=None) -> int:
         """TTL this rank admits for the whole prefix ``keys``, without a write.
 
@@ -2229,17 +2245,39 @@ class DfkvHiCache(HiCacheStorage):
         every owner of this rank's objects reported enough headroom; otherwise
         0 (do not promise or bill a TTL). Advisory: capacity can change before
         the asynchronous SET, and the caller combines all owning ranks' votes.
+
+        SGLang asks this for every request that carries a TTL, and each call
+        built the object keys of the whole prefix and made two round trips.
+        An admission is therefore reused for a tenth of its TTL (the renewal
+        interval of batch_touch), at most 30 s; a refusal is always asked
+        again.
         """
         ttl = self._retain_ttl_of(extra_info)
         if not ttl or not keys or not self._has_retain:
             return 0
+        prefix = self._prefix_identity(keys)
+        now = time.monotonic()
+        with self._touch_lock:
+            entry = self._precheck_seen.get(prefix) if self._precheck_seen else None
+        window = min(ttl / 10.0, self._PRECHECK_REUSE_MAX_S)
+        if entry is not None and entry[0] == ttl and now - entry[2] < window:
+            return entry[1]
         try:
             supported, cap = dfkv_cabi.call_retain_limits(self._lib, self._h)
             if supported != 1 or cap <= 0:
                 return 0
             sks = self._retain_object_keys(keys)
             if sks and dfkv_cabi.call_retain_precheck(self._lib, self._h, sks):
-                return min(ttl, cap)
+                admitted = min(ttl, cap)
+                with self._touch_lock:
+                    if self._precheck_seen is None:
+                        self._precheck_seen = collections.OrderedDict()
+                    seen = self._precheck_seen
+                    seen[prefix] = (ttl, admitted, now)
+                    seen.move_to_end(prefix)
+                    while len(seen) > self._TOUCH_DEBOUNCE_MAX:
+                        seen.popitem(last=False)
+                return admitted
         except Exception as e:
             self._warn_retain("retention precheck", e)
         return 0
@@ -2264,14 +2302,7 @@ class DfkvHiCache(HiCacheStorage):
         ttl = self._retain_ttl_of(extra_info)
         prefix = None
         if ttl > 0:
-            # Exact identity of the prefix without building its object keys,
-            # and of the key form those keys take: a prefix protected while
-            # its pages were bare keys, or while only SG group 0 was known,
-            # was not protected in the form written later.
-            prefix = (len(keys), keys[0], keys[-1], hash(tuple(keys)),
-                      self._device_direct_active(),
-                      tuple(sorted(getattr(self, "_sg_chunks", {}).items())),
-                      getattr(self, "_draft_layout", None))
+            prefix = self._prefix_identity(keys)
             if self._touch_is_fresh(prefix, ttl):
                 return
         sks = self._retain_object_keys(keys)
