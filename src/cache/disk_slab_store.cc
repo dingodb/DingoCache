@@ -318,20 +318,34 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   ao.align = static_cast<uint32_t>(opt_.slot_granularity);  // slot_size is a granularity multiple
   ao.max_waste = 0.25;
   // Runtime (re)bind of an extent -- initial, steal, or pool re-bind -- must
-  // physically destroy the previous binding's records BEFORE any new-slot use:
-  // a stale-but-CRC-valid record at a slot-grid position the new class never
+  // destroy the previous binding's records BEFORE any new-slot use: a
+  // stale-but-CRC-valid record at a slot-grid position the new class never
   // writes would otherwise survive to the next rebuild and resurrect its old
-  // key over the new occupant's bytes (cross-class poisoning). Durable (an
-  // inline fdatasync) so a crash right after the rebind can't see old records;
-  // rebinds are rare (workload-mix shifts), so the ms-scale sync under the
-  // allocator lock is acceptable.
+  // key over the new occupant's bytes (cross-class poisoning).
+  //
+  // The wipe is written here, under the store's and the allocator's locks,
+  // before the extent is used; its durability is left to the table syncs
+  // that follow anyway (every table_sync_ms, and Close; with table_sync_ms=0
+  // only Close syncs, as for record writes). No sync is needed in between,
+  // because a table is read back after an unclean exit only by a warm
+  // restart, and only under the same boot id and mount: the kernel's page
+  // cache then still holds the wipe, in order before every later record
+  // write, and that is what the restart reads. A power loss or a kernel crash
+  // gives a new boot id, and the table is discarded. A kill in the middle of
+  // the wipe leaves what a kill in the middle of any record write leaves.
+  // The wipe shares the record writes' remaining exposure, no more: a
+  // writeback error before the next table sync while the trust token is
+  // held, and a boot-only warm restart across an umount and remount whose
+  // writeback failed silently.
+  // The inline fdatasync this replaced held every read and write of the disk
+  // for about 0.4-1.7 ms per bind, once per extent on a first fill (STO-11).
   ao.on_extent_bind = [this](uint32_t e) {
     if (!MayMutate()) return false;
     if (!PwriteAll(table_fd_, zero_extent_records_.data(),
                    zero_extent_records_.size(), TableOffset(e, 0)))
       return FailMetadata("clear slots.tbl records of a rebound extent");
-    if (!SyncTableFile()) return FailMetadata("sync slots.tbl after an extent rebind");
-    bind_wipes_.fetch_add(1, std::memory_order_relaxed);
+    bind_wipes_.fetch_add(1, std::memory_order_relaxed);  // the next sync
+    if (bind_hook_for_test_) bind_hook_for_test_(e);
     return true;
   };
   ao.on_extent_evict =
@@ -516,7 +530,7 @@ bool DiskSlabStore::Activate() {
         sync_cv_.wait_for(lk, std::chrono::milliseconds(opt_.table_sync_ms),
                           [this] { return sync_stop_; });
         if (sync_stop_) return;
-        const uint64_t seen = record_writes_.load(std::memory_order_relaxed);
+        const uint64_t seen = TableWriteStamp();
         if (seen == synced_marker_) continue;
         lk.unlock();
         const bool synced = SyncTable(seen);
@@ -623,7 +637,7 @@ bool DiskSlabStore::Close() {
     RevokeTrust(/*forfeit=*/true, /*withdraw=*/true);
   if (clean) clean = SyncPayloads();
   if (clean)
-    clean = SyncTable(record_writes_.load(std::memory_order_relaxed));
+    clean = SyncTable(TableWriteStamp());
   // A store that failed makes sure its token is gone (and retries a revoke
   // that did not work the first time).
   // Only a run that got as far as recording its identity may touch the

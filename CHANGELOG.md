@@ -123,6 +123,13 @@
   so, and `dfkv_hicache_host_writes_while_device_direct_pages_total` counts
   the pages.
 
+- Server, slab: binding an extent to a size class (first fill, steals) no
+  longer fdatasyncs slots.tbl while holding the disk's locks; its record
+  wipe is made durable by the table syncs that follow anyway. Every read and
+  write of the disk used to wait about 0.4-1.7 ms per bind. Warm restart is
+  unaffected (it keeps a table only under the same boot id, where the page
+  cache holds the wipe).
+
 - Client, RDMA, rail selection:
   - The wait for rail credits is one budget per operation, its retries
     and rail changes included: `DFKV_RDMA_RAIL_BACKPRESSURE_MS`, now

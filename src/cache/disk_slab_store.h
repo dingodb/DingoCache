@@ -559,6 +559,14 @@ class DiskSlabStore : public StoreEngine {
   std::function<bool()> payload_write_hook_for_test_;
   // Runs inside SyncTableFile, after the token was taken back.
   std::function<void()> table_sync_hook_for_test_;
+  // What the table has been written with: record writes and bind wipes
+  // (which are not counted as records). A sync records the stamp it covered.
+  uint64_t TableWriteStamp() const {
+    return record_writes_.load(std::memory_order_relaxed) +
+           bind_wipes_.load(std::memory_order_relaxed);
+  }
+  // Called after an extent's bind wipe is written, before the extent is used.
+  std::function<void(uint32_t)> bind_hook_for_test_;
   // Runs under mu_ (records are written at commit): it must not call back into
   // the store, and blocking in it blocks every operation on this disk.
   std::function<bool()> record_write_hook_for_test_;
