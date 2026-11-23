@@ -488,6 +488,8 @@ C 客户端快照还含传输级指标（RDMA 构建）：
 | `dfkv_rdma_client_rail_get_ops_total{dev}` / `dfkv_rdma_client_rail_get_bytes_total{dev}` | counter | 每条本地rail成功完成的逻辑GET对象数/实际返回payload字节；用于验证rank-local affinity是否真正承载业务流量 |
 | `dfkv_rdma_client_rail_inflight{dev}` / `dfkv_rdma_client_rail_credits_available{dev}` | gauge | 当前已租 / 可用 request credits |
 | `dfkv_rdma_client_rail_credits_exhausted_total{dev}` | counter | 因 local candidate credit 不足跳过次数 |
+| `dfkv_rdma_client_rail_latency_ewma_us{dev}` | gauge | 选轨用的延迟估计：每 64 KiB 的操作延迟（不含建连）的 EWMA，每 1 s 无样本减半 |
+| `dfkv_rdma_client_rail_background_probes_total` | counter | 冷却期满的 rail 由后台线程发出的 recovery probe（对已连接节点的一次 keepalive）；成功计入 `dfkv_rdma_client_rail_recoveries_total{dev}` |
 | `dfkv_rdma_client_rail_errors_total{dev}` / `dfkv_rdma_client_rail_consecutive_errors{dev}` | counter / gauge | **仅本地** device open、QP transition、MR register/refresh、post/CQ verbs API 失败和 local WC 累计 / 当前连续值 |
 | `dfkv_rdma_client_endpoint_errors_total{dev}` | counter | peer bootstrap/不可达/probe/protocol/receive-segment/decode、remote/RNR/retry/timeout/flush WC；credit 已归还，**不惩罚或恢复 rail**。没有 local-error WC 的 completion deadline 也属 endpoint，不触发 cross-rail retry |
 | `dfkv_rdma_client_rail_quarantines_total{dev}` / `dfkv_rdma_client_rail_quarantined{dev}` / `dfkv_rdma_client_rail_recovery_probe{dev}` / `dfkv_rdma_client_rail_recoveries_total{dev}` | counter / gauge / gauge / counter | 连续 3 次 client-local failure 后隔离（默认 cooldown 5000 ms）/ 隔离状态 / cooldown 到期后唯一真实 probe / probe 成功恢复；probe local failure 重启 cooldown，endpoint failure 只释放 probe ownership |

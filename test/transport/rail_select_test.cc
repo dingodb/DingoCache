@@ -7,6 +7,9 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <thread>
+
 using dfkv::rdma::AcquireWithFallback;
 using dfkv::rdma::PickRail;
 using dfkv::rdma::RailCompletion;
@@ -335,6 +338,135 @@ TEST(RailPolicy, RecoveryProbeMarksOnlyTheGrantedRail) {
   EXPECT_EQ(stats[1].recoveries, 1u);
   EXPECT_FALSE(stats[1].recovery_probe);
   EXPECT_FALSE(stats[1].quarantined);
+}
+
+// With probes run apart from application traffic, a rail out of its
+// cooldown is not given an operation a healthy rail can take; it is listed
+// as due, and a probe confined to it still gets it.
+TEST(RailPolicy, ProbeAfterHealthyKeepsOperationsOnHealthyRails) {
+  RailPolicy policy(2, RailPolicyConfig{1, 1, 1000, 1, 100});
+  policy.SetProbeAfterHealthy(true);
+  const auto failed = policy.TryAcquire(1, 10);
+  ASSERT_TRUE(failed);
+  ASSERT_EQ(failed->rail, 0u);
+  policy.Complete(*failed, 20, RailCompletion::kRailFailure, 20);
+  EXPECT_TRUE(policy.ProbesDue(500).empty()) << "still cooling";
+
+  const auto ordinary = policy.TryAcquire(1, 2000);
+  ASSERT_TRUE(ordinary);
+  EXPECT_EQ(ordinary->rail, 1u) << "the probe went ahead of a healthy rail";
+  ASSERT_EQ(policy.ProbesDue(2000), std::vector<size_t>{0});
+
+  // The healthy rail is out of credits: the operation may probe.
+  const auto spill = policy.TryAcquire(1, 2001);
+  ASSERT_TRUE(spill);
+  EXPECT_EQ(spill->rail, 0u);
+  EXPECT_TRUE(policy.Snapshot(2001)[0].recovery_probe);
+  EXPECT_TRUE(policy.ProbesDue(2001).empty());
+  policy.Complete(*spill, 20, RailCompletion::kSuccess, 2021);
+  policy.Complete(*ordinary, 20, RailCompletion::kSuccess, 2021);
+  EXPECT_EQ(policy.Snapshot(2021)[0].recoveries, 1u);
+
+  // A probe confined to the rail by the caller's mask.
+  const auto again = policy.TryAcquire(1, 2030);
+  ASSERT_TRUE(again);
+  policy.Complete(*again, 20, RailCompletion::kRailFailure, 2040);
+  const std::vector<uint8_t> only_rail{static_cast<uint8_t>(again->rail == 0),
+                                       static_cast<uint8_t>(again->rail == 1)};
+  const auto probe = policy.TryAcquire(1, 4000, only_rail);
+  ASSERT_TRUE(probe);
+  EXPECT_EQ(probe->rail, again->rail);
+  EXPECT_TRUE(policy.Snapshot(4000)[again->rail].recovery_probe);
+}
+
+// The same across NUMA: a local rail due a probe does not go ahead of a
+// healthy non-local one.
+TEST(RailPolicy, ProbeAfterHealthyPrefersAHealthyNonLocalRail) {
+  RailPolicy policy(2, RailPolicyConfig{4, 1, 1000, 1, 100});
+  policy.SetProbeAfterHealthy(true);
+  const std::vector<uint8_t> local{1, 0};
+  const std::vector<uint8_t> nonlocal{0, 1};
+  const auto failed = policy.TryAcquire(1, 10, local);
+  ASSERT_TRUE(failed);
+  policy.Complete(*failed, 20, RailCompletion::kRailFailure, 20);
+  // Cooldown (1 ms) long over by the policy's clock.
+  const uint64_t later = RailPolicy::NowMicros() + 10'000;
+  ASSERT_EQ(policy.ProbesDue(later), std::vector<size_t>{0});
+  const auto lease = dfkv::rdma::AcquireHighestTier(
+      policy, 1, 0, {1, 1}, local, nonlocal);
+  ASSERT_TRUE(lease);
+  EXPECT_EQ(lease->rail, 1u);
+}
+
+// A full healthy local rail does not hand the operation to a local rail due
+// a probe while a healthy non-local rail has credits.
+TEST(RailPolicy, ProbeAfterHealthyPrefersAHealthyNonLocalRailToALocalProbe) {
+  RailPolicy policy(3, RailPolicyConfig{1, 1, 1000, 1, 100});
+  policy.SetProbeAfterHealthy(true);
+  const std::vector<uint8_t> local{1, 1, 0};
+  const std::vector<uint8_t> all{1, 1, 1};
+  const auto failed = policy.TryAcquire(1, 10, std::vector<uint8_t>{1, 0, 0});
+  ASSERT_TRUE(failed);
+  policy.Complete(*failed, 20, RailCompletion::kRailFailure, 20);
+  const auto busy = policy.TryAcquire(1, 30, std::vector<uint8_t>{0, 1, 0});
+  ASSERT_TRUE(busy);
+  ASSERT_EQ(policy.ProbesDue(RailPolicy::NowMicros()), std::vector<size_t>{0});
+  const auto lease = dfkv::rdma::AcquireHighestTier(policy, 1, 0, all, local,
+                                                    all);
+  ASSERT_TRUE(lease);
+  EXPECT_EQ(lease->rail, 2u);
+}
+
+// Waiting for credits, a non-local rail that frees serves the operation;
+// before, the wait was on the local rails only.
+TEST(RailPolicy, AdmissionWaitTakesANonLocalRailThatFrees) {
+  RailPolicy policy(2, RailPolicyConfig{1, 3, 1000, 1, 100});
+  const std::vector<uint8_t> local{1, 0};
+  const std::vector<uint8_t> all{1, 1};
+  const auto held_local = policy.TryAcquire(1, 10, local);
+  const auto held_other = policy.TryAcquire(1, 10, std::vector<uint8_t>{0, 1});
+  ASSERT_TRUE(held_local);
+  ASSERT_TRUE(held_other);
+  std::thread release([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    policy.Complete(*held_other, 10, RailCompletion::kSuccess,
+                    RailPolicy::NowMicros());
+  });
+  const auto lease = dfkv::rdma::AcquireHighestTier(policy, 1, 2'000'000, all,
+                                                    local, all);
+  release.join();
+  ASSERT_TRUE(lease);
+  EXPECT_EQ(lease->rail, 1u);
+}
+
+// One slow sample (a connection set up, a large value) no longer keeps a rail
+// out of selection for good: unsampled, its estimate halves every half-life.
+TEST(RailPolicy, AnUnsampledRailsLatencyEstimateDecays) {
+  RailPolicyConfig config{4, 3, 1000, 1, 100};
+  config.latency_half_life_us = 1000;
+  RailPolicy policy(2, config);
+  const std::vector<uint8_t> rail0{1, 0};
+  const std::vector<uint8_t> rail1{0, 1};
+  auto sample = [&](const std::vector<uint8_t>& mask, uint64_t latency,
+                    uint64_t at) {
+    const auto lease = policy.TryAcquire(1, at, mask);
+    ASSERT_TRUE(lease);
+    policy.Complete(*lease, latency, RailCompletion::kSuccess, at);
+  };
+  sample(rail0, 1600, 10);
+  for (int i = 0; i < 40; ++i) sample(rail1, 100, 20);
+  auto pick = policy.TryAcquire(1, 30);
+  ASSERT_TRUE(pick);
+  EXPECT_EQ(pick->rail, 1u);
+  policy.Complete(*pick, 0, RailCompletion::kAdmission, 30);
+
+  // 5 ms later rail 0 stands at 1600 >> 5 = 50; rail 1, sampled all along,
+  // at about 100.
+  for (int i = 0; i < 40; ++i) sample(rail1, 100, 5010);
+  pick = policy.TryAcquire(1, 5010);
+  ASSERT_TRUE(pick);
+  EXPECT_EQ(pick->rail, 0u) << "a rail with one slow sample stays unused";
+  EXPECT_EQ(policy.Snapshot(5010)[0].latency_ewma_us, 50u);
 }
 
 #ifdef DFKV_WITH_RDMA

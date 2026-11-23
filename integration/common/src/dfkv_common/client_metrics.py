@@ -123,6 +123,7 @@ _COUNTERS: dict[str, tuple[str, ...]] = {
     "dfkv_rdma_client_peer_busy_total": (),
     "dfkv_rdma_client_rail_refusals_total": (),
     "dfkv_rdma_client_port_down_events_total": (),
+    "dfkv_rdma_client_rail_background_probes_total": (),
     "dfkv_rdma_client_peer_topology_updates_total": (),
     "dfkv_rdma_client_remote_rail_normal_leases_total": (),
     "dfkv_rdma_client_remote_rail_admissions_denied_total": (),

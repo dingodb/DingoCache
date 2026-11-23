@@ -403,6 +403,7 @@ struct RdmaTransport::Conn {
   bool local_resource_failure = false;
   rdma::RailLease lease;
   uint64_t lease_started_us = 0;
+  uint64_t lease_bytes = 0;  // payload moved under the current lease
   bool credit_held = false;
   rdma::ResourceRequest budget_request;
   bool budget_held = false;
@@ -676,8 +677,7 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   rail_config.error_penalty_us = static_cast<uint64_t>(
       EnvBoundedInt("DFKV_RDMA_RAIL_ERROR_PENALTY_US", 100000, 60000000));
   const int backpressure_ms =
-      EnvBoundedInt("DFKV_RDMA_RAIL_BACKPRESSURE_MS", 10, 60000);
-  rail_backpressure_us_ = static_cast<uint64_t>(backpressure_ms) * 1000;
+      EnvBoundedInt("DFKV_RDMA_RAIL_BACKPRESSURE_MS", 0, 60000);
   rail_policy_ =
       std::make_unique<rdma::RailPolicy>(devs_.size(), rail_config);
   config_dump::RecordResolved("DFKV_RDMA_RAIL_CREDITS",
@@ -693,8 +693,6 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   config_dump::RecordResolved(
       "DFKV_RDMA_RAIL_ERROR_PENALTY_US",
       std::to_string(rail_config.error_penalty_us));
-  config_dump::RecordResolved("DFKV_RDMA_RAIL_BACKPRESSURE_MS",
-                              std::to_string(backpressure_ms));
   connect_ms_ = EnvInt("DFKV_RDMA_CONNECT_MS", 3000);
   io_ms_ = EnvInt("DFKV_RDMA_IO_MS", 10000);
   // An explicit zero disables the single-op datapath completion deadline.
@@ -720,6 +718,15 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
             parsed, std::numeric_limits<int>::max()));
       }
     }
+  }
+  {
+    // How long one operation, all its attempts together, may wait for rail
+    // credits: 200 ms unless set, and never past the operation timeout.
+    int wait_ms = backpressure_ms > 0 ? backpressure_ms : 200;
+    if (op_timeout_ms_ > 0) wait_ms = std::min(wait_ms, op_timeout_ms_);
+    rail_backpressure_us_ = static_cast<uint64_t>(wait_ms) * 1000;
+    config_dump::RecordResolved("DFKV_RDMA_RAIL_BACKPRESSURE_MS",
+                                std::to_string(wait_ms));
   }
   // 0 means no deadline, and so does a value that is not a number at all;
   // a negative one means 5000.
@@ -792,8 +799,12 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
     port_watcher_ = std::make_unique<rdma::PortWatcher>(devs_);
     port_active_.assign(devs_.size(), 1);
   }
-  if (keepalive_ms_ > 0 || data_pool_max_ > pool_max_ || port_watcher_)
+  if (keepalive_ms_ > 0 || data_pool_max_ > pool_max_ || port_watcher_) {
+    // Recovery probes run on this thread, so application operations go to a
+    // healthy rail first.
+    rail_policy_->SetProbeAfterHealthy(true);
     keepalive_thread_ = std::thread(&RdmaTransport::KeepaliveLoop, this);
+  }
 }
 
 RdmaTransport::~RdmaTransport() {
@@ -970,6 +981,7 @@ void RdmaTransport::KeepaliveLoop() {
       [&] { return keepalive_stop_.load(std::memory_order_relaxed); })) {
     wait_lock.unlock();
     if (port_watcher_) CheckPorts();
+    ProbeRails();
     const uint64_t now = rdma::RailPolicy::NowMicros();
     const bool send = keepalive_ms_ > 0 &&
                       now - last_keepalive_us >= interval_us;
@@ -999,6 +1011,50 @@ void RdmaTransport::CheckPorts() {
       DFKV_LOG_WARN("rdma: port not ACTIVE, rail out of selection dev=" +
                     devs_[rail]);
       RetireIdleRail(rail);
+    }
+  }
+}
+
+void RdmaTransport::ProbeRails() {
+  const auto due = rail_policy_->ProbesDue(rdma::RailPolicy::NowMicros());
+  if (due.empty()) return;
+  // Nodes with idle connections first (they answer), then any connected to.
+  std::vector<std::string> nodes;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    for (const auto* pools : {&control_pool_, &pool_})
+      for (const auto& [node, connections] : *pools)
+        if (!connections.empty()) nodes.push_back(node);
+  }
+  {
+    std::lock_guard<std::mutex> lock(known_nodes_mu_);
+    nodes.insert(nodes.end(), known_nodes_.begin(), known_nodes_.end());
+  }
+  std::vector<std::string> unique;
+  for (const auto& node : nodes)
+    if (std::find(unique.begin(), unique.end(), node) == unique.end())
+      unique.push_back(node);
+  if (unique.empty()) return;  // no peer yet; application traffic will probe
+  for (size_t rail : due) {
+    size_t tried = 0;
+    for (const auto& node : unique) {
+      if (keepalive_stop_.load(std::memory_order_relaxed)) return;
+      if (tried++ == kProbeNodes) break;
+      AcquireOptions options;
+      options.excluded.assign(devs_.size(), 1);
+      options.excluded[rail] = 0;
+      options.backpressure_us = 0;
+      AcquireResult acquired = Acquire(node, Lane::kControl, options);
+      if (!acquired.conn) continue;  // e.g. the peer's rail is cooled
+      rail_background_probes_.fetch_add(1, std::memory_order_relaxed);
+      Conn* conn = acquired.conn;
+      rdma::RailCompletion failure = rdma::RailCompletion::kAdmission;
+      if (!KeepaliveConn(conn, &failure))
+        Destroy(conn, failure);
+      else
+        Release(conn->node, conn->lane, conn, RemoteRailOutcome::kSuccess,
+                std::nullopt);
+      break;
     }
   }
 }
@@ -1082,6 +1138,7 @@ void RdmaTransport::CompleteRemoteLease(Conn* c,
 void RdmaTransport::RecordRailTransfer(Conn* c, bool put,
                                        uint64_t operations, uint64_t bytes) {
   if (!c || c->rail_index >= devs_.size() || operations == 0) return;
+  c->lease_bytes += bytes;
   auto& op_counters = put ? rail_put_ops_ : rail_get_ops_;
   auto& byte_counters = put ? rail_put_bytes_ : rail_get_bytes_;
   op_counters[c->rail_index].fetch_add(operations, std::memory_order_relaxed);
@@ -1351,6 +1408,11 @@ void RdmaTransport::OnPeerTopology(const PeerTopology& topology) {
     reap(control_pool_);
   }
   peer_topology_updates_.fetch_add(1, std::memory_order_relaxed);
+  if (!topology.present) {
+    // A node that left the ring is no longer a probe target (ProbeRails).
+    std::lock_guard<std::mutex> lock(known_nodes_mu_);
+    known_nodes_.erase(topology.peer_addr);
+  }
   for (Conn* conn : stale)
     Destroy(conn, rdma::RailCompletion::kAdmission);
   stale_publication_reaps_.fetch_add(stale.size(), std::memory_order_relaxed);
@@ -1506,9 +1568,24 @@ void RdmaTransport::NoteLocalRegistrationFailure(Conn* c, size_t bytes) {
 }
 
 
+uint64_t RdmaTransport::AdmissionWait(const AcquireOptions& options) const {
+  if (options.backpressure_us) return *options.backpressure_us;
+  if (!options.op) return rail_backpressure_us_;
+  const uint64_t now = rdma::RailPolicy::NowMicros();
+  if (options.op->admission_deadline_us == 0)
+    options.op->admission_deadline_us = now + rail_backpressure_us_;
+  return options.op->admission_deadline_us > now
+             ? options.op->admission_deadline_us - now
+             : 0;
+}
+
 void RdmaTransport::NoteConnected(const AcquireOptions& options,
                                   const std::string& node,
                                   const std::string& health_id, size_t rail) {
+  {
+    std::lock_guard<std::mutex> lock(known_nodes_mu_);
+    known_nodes_.insert(node);
+  }
   // A peer without an MDS identity takes no remote lease on its operations,
   // so a connection is what tells its rail recovered from a refusal.
   if (RemoteRailHealth::IsAddressIdentity(health_id)) {
@@ -1542,6 +1619,7 @@ void RdmaTransport::ConfirmRefusal(const std::string& node,
   options.excluded.assign(devs_.size(), 1);
   options.excluded[rail] = 0;
   options.refusal_check = true;
+  options.backpressure_us = 0;
   AcquireResult dialed = Acquire(node, Lane::kControl, options);
   bool refused = false;
   if (dialed.conn) {
@@ -1633,7 +1711,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
         rdma::HighestCompatibleTier(rail_tiers_, remote_compatible);
     if (!rdma::HasRail(highest_tier)) break;
     lease = rdma::AcquireHighestTier(
-        *rail_policy_, requested, rail_backpressure_us_, highest_tier,
+        *rail_policy_, requested, AdmissionWait(options), highest_tier,
         candidates.allowed, candidates.fallback, admission_excluded);
     if (!lease) {
       result.failure = AcquireFailure::kAdmission;
@@ -1762,6 +1840,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   if (pooled) {
     pooled->lease = *lease;
     pooled->lease_started_us = lease_started;
+    pooled->lease_bytes = 0;
     pooled->credit_held = true;
     pooled->visited = true;
     pooled->remote_lease_generation =
@@ -2182,6 +2261,9 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   MarkLive(conn);
   MarkActive(conn, lane);
   NoteConnected(options, node, health_id, ridx);
+  // The rail's latency sample is the operation's, not the connection setup's.
+  conn->lease_started_us = rdma::RailPolicy::NowMicros();
+  conn->lease_bytes = 0;
   result.conn = conn;
   result.failure = AcquireFailure::kNone;
   return result;
@@ -2810,6 +2892,10 @@ std::string RdmaTransport::MetricsText() const {
   s += "# TYPE dfkv_rdma_client_peer_busy_total counter\n";
   s += "dfkv_rdma_client_peer_busy_total " +
        std::to_string(peer_busy_.load(std::memory_order_relaxed)) + "\n";
+  s += "# HELP dfkv_rdma_client_rail_background_probes_total Recovery probes of a rail out of its cooldown sent by the background thread instead of an application operation\n";
+  s += "# TYPE dfkv_rdma_client_rail_background_probes_total counter\n";
+  s += "dfkv_rdma_client_rail_background_probes_total " +
+       std::to_string(rail_background_probes_.load(std::memory_order_relaxed)) + "\n";
   s += "# HELP dfkv_rdma_client_port_down_events_total Local rails taken out of selection because their port left ACTIVE\n";
   s += "# TYPE dfkv_rdma_client_port_down_events_total counter\n";
   s += "dfkv_rdma_client_port_down_events_total " +
@@ -2945,7 +3031,9 @@ void RdmaTransport::Release(const std::string& node, Lane lane, Conn* c,
 
   if (c->credit_held) {
     const uint64_t now = rdma::RailPolicy::NowMicros();
-    rail_policy_->Complete(c->lease, now - c->lease_started_us,
+    rail_policy_->Complete(c->lease,
+                           SampleLatency(now - c->lease_started_us,
+                                         c->lease_bytes),
                            rdma::RailCompletion::kSuccess, now);
     c->credit_held = false;
   }
