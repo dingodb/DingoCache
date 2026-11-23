@@ -295,6 +295,8 @@ void RcEndpoint::Close() {
   g_lease_write_mr_active.fetch_sub(lease_write_mr_.size(),
                                    std::memory_order_relaxed);
   lease_write_mr_.clear();
+  for (auto* mr : own_mr_) DeregisterMr(mr);
+  own_mr_.clear();
   for (auto* mr : lease_read_mr_) DeregisterMr(mr);
   g_lease_read_mr_active.fetch_sub(lease_read_mr_.size(),
                                   std::memory_order_relaxed);
@@ -718,15 +720,12 @@ bool RcEndpoint::EnsurePoolMrs(
       [&](size_t index) { RollbackPoolMr(&registrations[index]); });
 }
 
-ibv_mr* RcEndpoint::RegisterRemoteRegion(void* base, size_t size) {
-  const int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
-  if (!AddPoolMr(base, size, /*remote_write=*/true)) return nullptr;
-  const auto b = reinterpret_cast<uintptr_t>(base);
-  for (const auto& p : pool_mr_) {
-    if (p.base == b && p.size >= size && (p.access & access) == access)
-      return p.mr;
-  }
-  return nullptr;
+ibv_mr* RcEndpoint::RegisterOwnRegion(void* base, size_t size) {
+  if (!pd_ || !base || size == 0) return nullptr;
+  ibv_mr* mr = ibv_reg_mr(
+      pd_, base, size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+  if (mr) own_mr_.push_back(mr);
+  return mr;
 }
 
 ibv_mr* RcEndpoint::RegisterLeaseWriteRegion(void* base, size_t size) {
