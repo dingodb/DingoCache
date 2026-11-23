@@ -646,6 +646,15 @@
   slab engine refuses a log store's directory without changing it. Nothing
   changes for any configuration that does not select the engine.
 
+- Server, storage, log-structured engine (experimental): segments are
+  sealed. A full segment goes to a sealer thread, which syncs it, writes a
+  summary of its records and a trailer; `Close` seals what is open. A
+  restart loads the summaries and walks only the segments without a valid
+  trailer (after a clean close, none), and seals what it walked. A sealed
+  segment whose records are all removed is reused. The summary entry now
+  holds the record's header length (development format: no older store to
+  read).
+
 ## 2.42.0 — 2026-11-23
 
 - Client, RDMA: the rail name a scatter-gather batch read reports (the

@@ -147,10 +147,13 @@ struct SummaryEntry {
   uint32_t offset_blocks = 0;  // record offset in the segment, in 4 KiB units
   uint32_t payload_crc = 0;
   uint8_t flags = 0;
+  // The record header's header_len: where an inline payload starts.
+  uint16_t header_len = kRecordHeaderBytes;
 };
 std::vector<uint8_t> EncodeSummary(const std::vector<SummaryEntry>& entries);
-// `bytes` must be a whole number of entries, and every record they describe
-// must lie inside a segment of `segment_bytes`, before its trailer.
+// `bytes` must be a whole number of entries, every record they describe
+// must lie inside a segment of `segment_bytes`, before its trailer, and its
+// inline flag must be set exactly when the value fits after header_len.
 bool DecodeSummary(const uint8_t* bytes, size_t len, uint64_t segment_bytes,
                    std::vector<SummaryEntry>* out);
 

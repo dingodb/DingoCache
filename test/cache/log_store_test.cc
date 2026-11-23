@@ -20,6 +20,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <map>
 #include <mutex>
@@ -484,50 +485,67 @@ TEST(LogStore, TheSlabEngineRefusesALogDirectoryWithoutChangingIt) {
   fs::remove_all(dir);
 }
 
+// A damaged payload: rejected by the walk after an unclean exit, and a miss
+// at read time after a clean close (summaries are trusted; reads verify).
 TEST(LogStore, ADamagedPayloadIsAMissAtRecoveryAndAtReadTime) {
-  const fs::path dir = TestDir("corrupt");
-  const std::string v = Value(6, 0);  // several blocks
-  ASSERT_GT(v.size(), 4096u);
-  {
-    bool ok = false;
-    LogStore s(Opts(dir), &ok);
-    ASSERT_TRUE(ok) << s.StartupError();
-    ASSERT_EQ(s.Cache(Key(6), v.data(), v.size()), Status::kOk);
-    const std::string w = Value(8, 0);
-    ASSERT_EQ(s.Cache(Key(8), w.data(), w.size()), Status::kOk);
-  }
-  // The first record of the first opened segment: its payload starts one
-  // block after its header block, which is one block into the segment.
-  auto flip = [&](uint64_t offset) {
-    for (const auto& e : fs::directory_iterator(dir / "segments")) {
-      std::fstream f(e.path(), std::ios::in | std::ios::out | std::ios::binary);
-      char head[16];
-      f.seekg(4096);
-      f.read(head, 4);
-      if (std::string(head, 4) != "DLR1") continue;
-      char c;
-      f.seekg(static_cast<std::streamoff>(offset));
-      f.read(&c, 1);
-      c ^= 0x40;
-      f.seekp(static_cast<std::streamoff>(offset));
-      f.write(&c, 1);
-      return true;
+  for (const bool clean : {false, true}) {
+    SCOPED_TRACE(clean ? "clean close" : "killed");
+    const fs::path dir = TestDir(clean ? "corrupt_clean" : "corrupt_kill");
+    const std::string v = Value(6, 0);  // several blocks
+    ASSERT_GT(v.size(), 4096u);
+    const pid_t child = ::fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+      bool ok = false;
+      LogStore s(Opts(dir), &ok);
+      if (!ok) ::_exit(2);
+      const std::string w = Value(8, 0);
+      if (s.Cache(Key(6), v.data(), v.size()) != Status::kOk ||
+          s.Cache(Key(8), w.data(), w.size()) != Status::kOk)
+        ::_exit(3);
+      if (clean && !s.Close()) ::_exit(4);
+      ::_exit(0);
     }
-    return false;
-  };
-  ASSERT_TRUE(flip(8192 + 100));
-  bool ok = false;
-  {
-    LogStore s(Opts(dir), &ok);
-    ASSERT_TRUE(ok) << s.StartupError();
-    EXPECT_EQ(s.GetRecoveryStats().records_rejected, 1u);
-    std::string out;
-    EXPECT_EQ(s.Range(Key(6), 0, 0, &out), Status::kNotFound);
-    ASSERT_EQ(s.Range(Key(8), 0, 0, &out), Status::kOk)
-        << "the walk went on past the damaged record";
-    EXPECT_EQ(out, Value(8, 0));
+    int status = 0;
+    ASSERT_EQ(::waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    // The first record of the first opened segment: its payload starts one
+    // block after its header block, which is one block into the segment.
+    auto flip = [&](uint64_t offset) {
+      for (const auto& e : fs::directory_iterator(dir / "segments")) {
+        std::fstream f(e.path(), std::ios::in | std::ios::out | std::ios::binary);
+        char head[16];
+        f.seekg(4096);
+        f.read(head, 4);
+        if (std::string(head, 4) != "DLR1") continue;
+        char c;
+        f.seekg(static_cast<std::streamoff>(offset));
+        f.read(&c, 1);
+        c ^= 0x40;
+        f.seekp(static_cast<std::streamoff>(offset));
+        f.write(&c, 1);
+        return true;
+      }
+      return false;
+    };
+    ASSERT_TRUE(flip(8192 + 100));
+    bool ok = false;
+    {
+      LogStore s(Opts(dir), &ok);
+      ASSERT_TRUE(ok) << s.StartupError();
+      EXPECT_EQ(s.GetRecoveryStats().records_rejected, clean ? 0u : 1u);
+      // Killed: the open segment has no trailer and is walked.
+      EXPECT_EQ(s.GetRecoveryStats().segments_walked == 0, clean);
+      std::string out;
+      EXPECT_EQ(s.Range(Key(6), 0, 0, &out), Status::kNotFound);
+      ASSERT_EQ(s.Range(Key(8), 0, 0, &out), Status::kOk)
+          << "the walk went on past the damaged record";
+      EXPECT_EQ(out, Value(8, 0));
+      if (clean) EXPECT_EQ(s.GetStats().read_crc_failures, 1u);
+    }
+    fs::remove_all(dir);
   }
-  fs::remove_all(dir);
 }
 
 // ---- the journal -----------------------------------------------------------------
@@ -888,11 +906,12 @@ LogStore::Options RecordedOpts(const fs::path& dir,
   return o;
 }
 
-void RunOp(LogStore& s, ImageOp* op, RecordingIo& io) {
+void RunOp(LogStore& s, ImageOp* op, RecordingIo& io,
+           const std::function<std::string(uint64_t, uint32_t)>& value = Value) {
   tl_op = op;
   op->start = io.Size();
   if (op->put) {
-    const std::string v = Value(op->id, op->version);
+    const std::string v = value(op->id, op->version);
     s.Cache(Key(op->id), v.data(), v.size());
   } else {
     s.Remove(Key(op->id));
@@ -906,6 +925,24 @@ void RunOp(LogStore& s, ImageOp* op, RecordingIo& io) {
 // older than one a PUT stored and acknowledged (I3). After a kill, a key
 // whose operations did not overlap and none of which was in flight is in
 // the state the last of them left.
+// A value evicted from the index (its generation) at a recorded position.
+struct ImageEviction {
+  BlockKey key;
+  uint64_t generation = 0;
+  size_t at = 0;
+};
+// How a workload's images are opened and judged.
+struct ImageCheck {
+  std::function<std::string(uint64_t, uint32_t)> value = Value;
+  const std::vector<ImageEviction>* evictions = nullptr;
+  std::function<LogStore::Options(const fs::path&)> open = [](const fs::path& p) {
+    return Opts(p, 64ull << 20);
+  };
+  // false: a caller whose coverage depends on thread timing sums the counts
+  // over several seeds and checks the minimums itself.
+  bool check_minimums = true;
+};
+
 // How much the image checks actually looked at.
 struct ImageStats {
   int images = 0;
@@ -916,7 +953,9 @@ struct ImageStats {
 };
 
 void CheckImage(LogStore& s, const std::vector<ImageOp>& ops, uint64_t keys,
-                size_t prefix, Crash crash, ImageStats* stats) {
+                size_t prefix, Crash crash, ImageStats* stats,
+                const ImageCheck& check) {
+  const auto& Value = check.value;
   for (uint64_t id = 0; id < keys; ++id) {
     std::string out;
     const Status st = s.Range(Key(id), 0, 0, &out);
@@ -981,7 +1020,14 @@ void CheckImage(LogStore& s, const std::vector<ImageOp>& ops, uint64_t keys,
       if (e->put && e->wrote) expect = e;
       if (!e->put) expect = nullptr;
     }
-    EXPECT_EQ(served, expect) << "key " << id;
+    // An evicted value may come back, or not (§8.1).
+    bool evicted = false;
+    if (expect != nullptr && check.evictions != nullptr)
+      for (const auto& ev : *check.evictions)
+        if (ev.key == Key(id) && ev.generation == expect->generation &&
+            ev.at <= prefix)
+          evicted = true;
+    if (!evicted || served != nullptr) EXPECT_EQ(served, expect) << "key " << id;
     ++stats->strict_keys;
   }
 }
@@ -989,7 +1035,7 @@ void CheckImage(LogStore& s, const std::vector<ImageOp>& ops, uint64_t keys,
 ImageStats CheckImages(const std::vector<RecordingIo::Op>& recorded,
                        const std::vector<ImageOp>& ops, uint64_t keys,
                        const fs::path& dir, const fs::path& image, int images,
-                       uint64_t seed, bool check_minimums = true) {
+                       uint64_t seed, const ImageCheck& check = ImageCheck()) {
   ImageStats stats;
   std::mt19937_64 rng(seed);
   for (int round = 0; round < images; ++round) {
@@ -1005,7 +1051,7 @@ ImageStats CheckImages(const std::vector<RecordingIo::Op>& recorded,
     const bool initialized = fs::exists(image / "lse_super") &&
                              !fs::exists(image / "lse_initializing");
     bool ok = false;
-    LogStore s(Opts(image, 64ull << 20), &ok);
+    LogStore s(check.open(image), &ok);
     EXPECT_TRUE(ok) << s.StartupError();
     if (!ok) return stats;
     if (!initialized) {
@@ -1014,14 +1060,14 @@ ImageStats CheckImages(const std::vector<RecordingIo::Op>& recorded,
     }
     ++stats.images;
     if (s.GetRecoveryStats().records_rejected > 0) ++stats.holes;
-    CheckImage(s, ops, keys, prefix, crash, &stats);
+    CheckImage(s, ops, keys, prefix, crash, &stats, check);
     if (::testing::Test::HasFatalFailure()) return stats;
   }
   // The checks did look at something (a change that silently emptied them
   // fails here). A caller whose coverage depends on thread timing sums the
   // counts over several seeds and checks them itself.
   EXPECT_GT(stats.images, images / 2);
-  if (check_minimums) {
+  if (check.check_minimums) {
     EXPECT_GT(stats.strict_keys, 0);
     EXPECT_GT(stats.holes, 0);
     EXPECT_GT(stats.power_served, 0) << "the power images' I2/I3 checks saw values";
@@ -1111,10 +1157,12 @@ TEST(LogStore, ConcurrentCrashImagesServeOnlyRightValues) {
     return total.strict_keys > 0 && total.holes > 0 && total.power_served > 0 &&
            total.uncommitted_served > 0;
   };
+  ImageCheck check;
+  check.check_minimums = false;
   int seeds = 0;
   for (uint64_t seed = 7; seed < 47 && !covered(); ++seed, ++seeds) {
-    const ImageStats st = CheckImages(io->Ops(), ops, kKeys, dir, image, 300, seed,
-                                      /*check_minimums=*/false);
+    const ImageStats st =
+        CheckImages(io->Ops(), ops, kKeys, dir, image, 300, seed, check);
     total.strict_keys += st.strict_keys;
     total.holes += st.holes;
     total.power_served += st.power_served;
@@ -1516,4 +1564,48 @@ TEST(LogStore, ThePeriodicSyncCoversASegmentJustLeft) {
   ASSERT_GT(last_write, 0u);
   EXPECT_TRUE(synced_after) << "the first segment's last writes were left unsynced";
   fs::remove_all(dir);
+}
+
+// Larger values than Value(): the workload must fill the store several times.
+std::string ImageValue(uint64_t id, uint32_t version) {
+  static const size_t kSizes[] = {1, 3000, 70000, 200001, 300000, 4096, 600000};
+  std::string v = Value(id, version);
+  v.resize(kSizes[(id + version) % 7]);
+  uint64_t x = id * 31 + version;
+  for (size_t i = 0; i < v.size(); i += 61) v[i] = static_cast<char>(x++);
+  return v;
+}
+
+// A small store written past what it holds, so that segments are sealed
+// and, once all their records are removed, reused; crash images of it.
+TEST(LogStore, CrashImagesThroughSealingAndSegmentReuse) {
+  const fs::path dir = TestDir("simages");
+  const fs::path image = TestDir("simages_out");
+  auto io = std::make_shared<RecordingIo>();
+  constexpr uint64_t kKeys = 256;
+  std::vector<ImageOp> ops(1500);
+  LogStore::Stats stats;
+  {
+    auto o = RecordedOpts(dir, io);
+    o.capacity_bytes = 32ull << 20;
+    bool ok = false;
+    LogStore s(o, &ok);
+    ASSERT_TRUE(ok) << s.StartupError();
+    std::mt19937_64 rng(3);
+    std::map<uint64_t, uint32_t> next_version;
+    for (auto& op : ops) {
+      op.id = rng() % kKeys;
+      op.put = rng() % 10 >= 4;
+      op.version = next_version[op.id]++;
+      RunOp(s, &op, *io, ImageValue);
+    }
+    stats = s.GetStats();
+  }
+  EXPECT_GT(stats.segments_sealed, 3u);
+  ImageCheck check;
+  check.value = ImageValue;
+  check.open = [](const fs::path& p) { return Opts(p, 32ull << 20); };
+  CheckImages(io->Ops(), ops, kKeys, dir, image, 80, 11, check);
+  fs::remove_all(dir);
+  fs::remove_all(image);
 }
