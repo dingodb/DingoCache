@@ -54,6 +54,19 @@ inline int RdmaGrantTimeoutMsFromEnv() {
   return v == 0 ? -1 : static_cast<int>(v);
 }
 
+// DFKV_RDMA_STOP_DRAIN_MS: how long Stop() lets connections that hold a
+// grant (a GET's READY, a PUT lease) finish before closing them; -1 = do not
+// wait. Default 2 s. 0 disables. Clamped to 60 s.
+inline int RdmaStopDrainMsFromEnv() {
+  envparse::U64Spec spec;
+  spec.fallback = 2000;
+  spec.max = 60000;
+  spec.above = envparse::Above::kClamp;
+  spec.zero_means = "Stop() closes connections at once";
+  const uint64_t v = envparse::EnvU64("DFKV_RDMA_STOP_DRAIN_MS", spec);
+  return v == 0 ? -1 : static_cast<int>(v);
+}
+
 // A receive-pool byte count. rdma::ResolveRecvSegmentBytes does the parsing,
 // as before (full-string strtoull; 0, garbage and overflow give `fallback`;
 // the result is aligned up, or 0 if that does not fit). This adds the report

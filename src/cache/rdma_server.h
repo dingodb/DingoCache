@@ -275,7 +275,16 @@ class RdmaServer {
   struct LiveEndpoint {
     std::atomic<bool>* reclaimable;
     size_t recv_lease_bytes;
+    // The connection holds a grant its client has yet to use or release:
+    // Quiesce lets it finish (DFKV_RDMA_STOP_DRAIN_MS) before waking it.
+    std::atomic<bool>* holding_grants;
   };
+  // Bootstrap sockets of connections still in their handshake: Quiesce shuts
+  // them down so their threads stop waiting for the peer's frames. A thread
+  // removes its socket under handshake_mu_ before closing it.
+  std::mutex handshake_mu_;
+  std::unordered_set<int> handshake_fds_;
+  bool handshakes_closed_ = false;  // Quiesce has shut them down
   std::unordered_map<rdma::RcEndpoint*, LiveEndpoint> live_eps_;
   std::mutex legacy_mu_;
   std::unordered_set<uint64_t> legacy_connections_tokens_;
@@ -349,7 +358,8 @@ class RdmaServer {
       uring_init_fallbacks_{0};
   std::atomic<uint64_t> v2_conns_{0}, v2_put_writes_{0};
   std::atomic<uint64_t> completions_{0}, completion_errors_{0}, active_conns_{0},
-      idle_reclaims_{0}, grant_expiries_{0};
+      idle_reclaims_{0}, grant_expiries_{0}, stop_drains_cut_{0},
+      stop_grants_refused_{0};
 };
 
 }  // namespace dfkv

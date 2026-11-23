@@ -177,6 +177,7 @@ void LogTopologySummary(size_t configured, size_t initialized,
   if (!unresolved.empty()) summary += " unresolved=" + unresolved;
   DFKV_LOG_INFO(summary);
 }
+int StopDrainMs();  // defined with the other server settings below
 }  // namespace
 uint64_t RdmaServer::RegisterLegacyConnection() {
   std::lock_guard<std::mutex> lock(legacy_mu_);
@@ -447,7 +448,41 @@ void RdmaServer::Quiesce() {
   if (accept_thread_.joinable()) accept_thread_.join();
   if (recv_trim_thread_.joinable()) recv_trim_thread_.join();
   if (listen_fd_ >= 0) { ::close(listen_fd_); listen_fd_ = -1; }
-  // Wake every in-flight Serve thread out of WaitComp, then join them all so no
+  // A thread still in its handshake waits for the peer's frames until the
+  // bootstrap deadline (10 s): end those reads now. A thread that comes to
+  // register its socket after this gives up by itself.
+  {
+    std::lock_guard<std::mutex> lock(handshake_mu_);
+    handshakes_closed_ = true;
+    for (const int fd : handshake_fds_) ::shutdown(fd, SHUT_RDWR);
+  }
+  // Drain: a connection that has sent a GET's READY or a PUT lease and waits
+  // for its client goes on serving (running_ is false, so it takes no part
+  // in pressure reclaim and ends as soon as it holds no grant) for up to
+  // stop_drain_ms, so reads and writes in flight complete instead of ending
+  // in a completion error at the client. The rest are woken at once.
+  const int drain_ms = StopDrainMs();
+  const auto drain_until = std::chrono::steady_clock::now() +
+                           std::chrono::milliseconds(drain_ms < 0 ? 0 : drain_ms);
+  for (;;) {
+    bool holding = false;
+    {
+      std::lock_guard<std::mutex> lk(conn_mu_);
+      for (const auto& live : live_eps_) {
+        if (live.second.holding_grants->load(std::memory_order_acquire))
+          holding = true;
+        else
+          live.first->Wake();
+      }
+    }
+    if (!holding) break;
+    if (std::chrono::steady_clock::now() >= drain_until) {
+      stop_drains_cut_.fetch_add(1, std::memory_order_relaxed);
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  // Wake every Serve thread still in WaitComp, then join them all so no
   // handler call can race the owner's destruction after Stop() returns.
   std::vector<Conn> conns;
   {
@@ -562,6 +597,13 @@ int ServerIdleMs() {
   return out;
 }
 
+int StopDrainMs() {
+  const int out = RdmaStopDrainMsFromEnv();  // default 2 s
+  config_dump::RecordResolved("DFKV_RDMA_STOP_DRAIN_MS",
+                              std::to_string(out < 0 ? 0 : out));
+  return out;
+}
+
 int ServerGrantTimeoutMs() {
   const int out = RdmaGrantTimeoutMsFromEnv();  // default 60 s
   config_dump::RecordResolved("DFKV_RDMA_GRANT_TIMEOUT_MS",
@@ -622,7 +664,7 @@ rdma::RecvSegmentPool::Lease RdmaServer::AllocateReceiveWithPressure(
   // short-process hardware run, in addition to the in-flight ownership gate.
   const uint64_t started = SteadyUs();
   for (int round = 0; round < 32 && !lease; ++round) {
-    if (SteadyUs() - started >= wait_us) break;
+    if (SteadyUs() - started >= wait_us || !running_) break;
     {
       std::lock_guard<std::mutex> lock(conn_mu_);
       rdma::RcEndpoint* oldest = nullptr;
@@ -657,7 +699,7 @@ rdma::RecvSegmentPool::Lease RdmaServer::AllocateReceiveWithPressure(
     // The victim's QP destruction must fence inbound DMA before its lease is
     // released. Give it bounded time to unwind, then try another idle QP.
     for (int i = 0; i < 100 && !lease; ++i) {
-      if (SteadyUs() - started >= wait_us) break;
+      if (SteadyUs() - started >= wait_us || !running_) break;
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
       lease = recv_segments_.Allocate(
           bytes, rdma::kV2DataOffset, rail, numa_node, lease_class);
@@ -679,6 +721,21 @@ void RdmaServer::Serve(
     }
     ~PendingHandshake() { Release(); }
   } pending_handshake{pending};
+  {
+    std::lock_guard<std::mutex> lock(handshake_mu_);
+    if (handshakes_closed_) {
+      ::close(boot_fd);
+      return;
+    }
+    handshake_fds_.insert(boot_fd);
+  }
+  auto close_boot = [&] {
+    {
+      std::lock_guard<std::mutex> lock(handshake_mu_);
+      handshake_fds_.erase(boot_fd);
+    }
+    ::close(boot_fd);
+  };
   // Both reads below share one absolute deadline: a per-recv timeout would let
   // a peer that sends a byte every few seconds hold this thread for minutes.
   const timeval no_per_recv_cap{0, 0};
@@ -687,7 +744,7 @@ void RdmaServer::Serve(
   char devbuf[rdma::kDevNameBytes];
   if (!net::ReadAllWithin(boot_fd, devbuf, rdma::kDevNameBytes,
                           no_per_recv_cap, bootstrap_deadline)) {
-    ::close(boot_fd);
+    close_boot();
     return;
   }
   if (rdma::IsV2RetireWriter(devbuf)) {
@@ -699,13 +756,13 @@ void RdmaServer::Serve(
     std::lock_guard<std::mutex> lock(legacy_mu_);
     if (legacy_connections_tokens_.find(token) ==
         legacy_connections_tokens_.end()) {
-      ::close(boot_fd);
+      close_boot();
       return;
     }
     char proof[rdma::kV2RetireProofBytes];
     rdma::EncodeV2RetireProof(token, proof);
     net::WriteAll(boot_fd, proof, sizeof(proof));
-    ::close(boot_fd);
+    close_boot();
     return;
   }
   // Capability probes are answered without creating a QP.
@@ -713,7 +770,7 @@ void RdmaServer::Serve(
     char reply[rdma::kV2ProbeReplyBytes];
     rdma::EncodeV2ProbeReply(reply);
     net::WriteAll(boot_fd, reply, sizeof(reply));
-    ::close(boot_fd);
+    close_boot();
     return;
   }
 
@@ -733,7 +790,7 @@ void RdmaServer::Serve(
       (dynamic_only_requested ? writer_retirement_requested
                               : !writer_retirement_requested)) {
     DFKV_LOG_ERROR("rdma: rejecting peer without required v2 negotiation");
-    ::close(boot_fd);
+    close_boot();
     return;
   }
   constexpr uint8_t wire_epoch = kNativeProtoRdmaV2;
@@ -743,7 +800,7 @@ void RdmaServer::Serve(
                    "B, above this server's cap " + std::to_string(max_msg_) +
                    "B; refusing the connection. Raise --max-msg or lower "
                    "DFKV_RDMA_MAX_BLOCK_BYTES.");
-    ::close(boot_fd);
+    close_boot();
     return;
   }
   const size_t conn_max =
@@ -756,7 +813,7 @@ void RdmaServer::Serve(
   if (rail_it == anchor_devs_.end()) {
     DFKV_LOG_ERROR("rdma: client requested device outside the fixed topology: " +
                    dev);
-    ::close(boot_fd);
+    close_boot();
     return;
   }
   const size_t rail_index =
@@ -774,7 +831,7 @@ void RdmaServer::Serve(
   char peer[rdma::kQpInfoBytes];
   if (!net::ReadAllWithin(boot_fd, peer, sizeof(peer), no_per_recv_cap,
                           bootstrap_deadline)) {
-    ::close(boot_fd);
+    close_boot();
     return;
   }
   pending_handshake.Release();
@@ -782,14 +839,14 @@ void RdmaServer::Serve(
   if (peer_info.protocol_version != rdma::kDevProtoV2 ||
       peer_info.depth == 0) {
     DFKV_LOG_ERROR("rdma: rejecting incompatible v2 QP negotiation");
-    ::close(boot_fd);
+    close_boot();
     return;
   }
   const size_t K = std::min<size_t>(ServerDepth(), peer_info.depth);
   const size_t slot_size = rdma::V2SlotSize(conn_max);
   if (K == 0 || slot_size == 0 ||
       K > std::numeric_limits<size_t>::max() / slot_size) {
-    ::close(boot_fd);
+    close_boot();
     return;
   }
   // Declared ahead of every per-connection resource so that it unwinds after
@@ -828,7 +885,7 @@ void RdmaServer::Serve(
         std::to_string(stats.connection_free_bytes) +
         " committed=" + std::to_string(stats.committed_bytes) +
         " max=" + std::to_string(stats.max_bytes) + ")");
-    ::close(boot_fd);
+    close_boot();
     return;
   }
   const bool control_connection = conn_max <= rdma::kV2ControlCap;
@@ -959,7 +1016,7 @@ void RdmaServer::Serve(
   constexpr size_t conn_control = rdma::kV2ControlCap;
   if (!ep.Open(dev.empty() ? nullptr : dev.c_str(), conn_control, K,
                /*ib_port=*/1, /*direct_io_buffers=*/false, conn_max)) {
-    ::close(boot_fd);
+    close_boot();
     return;
   }
   ibv_mr* recv_segment_mr = ep.RegisterRemoteRegion(
@@ -967,7 +1024,7 @@ void RdmaServer::Serve(
   if (!recv_segment_mr) {
     DFKV_LOG_ERROR("rdma v2: receive-segment MR unavailable on device " +
                    (dev.empty() ? std::string("(auto)") : dev));
-    ::close(boot_fd);
+    close_boot();
     return;
   }
   DFKV_LOG_INFO("rdma conn: protocol=v2 declared=" +
@@ -990,7 +1047,7 @@ void RdmaServer::Serve(
   rdma::SerializeQpInfo(my, mine);
   if (!net::WriteAll(boot_fd, mine, rdma::kQpInfoBytes) ||
       !ep.Connect(peer_info)) {
-    ::close(boot_fd);
+    close_boot();
     return;
   }
   auto post_request_recv = [&](size_t slot) {
@@ -1002,7 +1059,7 @@ void RdmaServer::Serve(
   bool armed = true;
   for (size_t i = 0; i < K; ++i) armed = armed && post_request_recv(i);
   if (!armed) {
-    ::close(boot_fd);
+    close_boot();
     return;
   }
   const uint64_t legacy_token =
@@ -1028,7 +1085,7 @@ void RdmaServer::Serve(
   const bool ok =
       readiness_bytes != 0 &&
       net::WriteAll(boot_fd, readiness, readiness_bytes);
-  ::close(boot_fd);
+  close_boot();
   if (!ok) {
     return;
   }
@@ -1038,6 +1095,7 @@ void RdmaServer::Serve(
   // in transit. Reclaim only after at least one completed request/reply fence
   // has established a genuine quiescent point.
   std::atomic<bool> reclaimable{false};
+  std::atomic<bool> holding_grants{false};
   // Register this endpoint so Stop() can Wake() us out of WaitComp and join. The
   // running_ check under conn_mu_ closes the race with a concurrent Stop(): either
   // Stop sees us in live_eps_ (and wakes us) or we see running_==false here.
@@ -1046,7 +1104,8 @@ void RdmaServer::Serve(
     if (!running_) {
       return;
     }
-    live_eps_.emplace(&ep, LiveEndpoint{&reclaimable, recv_lease.size()});
+    live_eps_.emplace(&ep, LiveEndpoint{&reclaimable, recv_lease.size(),
+                                        &holding_grants});
   }
   ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
 
@@ -1378,6 +1437,14 @@ void RdmaServer::Serve(
           fields.length > static_cast<uint64_t>(max_msg_) ||
           request.contiguous_payload == nullptr)
         return invalid_reply();
+      // Stopping: no new grant, so that the drain only waits for the ones in
+      // flight. A miss is an answer to every client version.
+      if (!running_) {
+        stop_grants_refused_.fetch_add(1, std::memory_order_relaxed);
+        encode_status(Status::kNotFound, 0);
+        reply->first_len = response_prefix;
+        return true;
+      }
       rdma::PullPrepareControl control;
       if (!rdma::DecodePullPrepareControl(request.contiguous_payload,
                                           &control) ||
@@ -1451,6 +1518,14 @@ void RdmaServer::Serve(
       // An object this server will never take is a final answer to the
       // client, not a fault of the connection: dropping the connection
       // without a reply left the client to time out and cool a healthy node.
+      // Stopping: no new lease (see the pull above); the client takes
+      // kCacheFull as a refusal for want of room and fails this PUT alone.
+      if (!running_) {
+        stop_grants_refused_.fetch_add(1, std::memory_order_relaxed);
+        encode_status(Status::kCacheFull, 0);
+        reply->first_len = response_prefix;
+        return true;
+      }
       if (want > static_cast<uint64_t>(max_msg_)) {
         const uint64_t n =
             lease_put_oversize_rejects_.fetch_add(1, std::memory_order_relaxed);
@@ -1679,6 +1754,7 @@ void RdmaServer::Serve(
     for (size_t i = 0; i < K && !view.holding; ++i)
       view.holding = pull_slots[i].busy || lease_put[i].active ||
                      multi_put[i].active;
+    holding_grants.store(view.holding, std::memory_order_release);
     if (view.holding && !server_work && grant_ms >= 0) {
       const uint64_t since = std::max<uint64_t>(
           ep.last_active_us_.load(std::memory_order_relaxed),
@@ -1885,7 +1961,7 @@ void RdmaServer::Serve(
           request.contiguous_payload != nullptr &&
           rdma::DecodePullPrepareControl(request.contiguous_payload, &control) &&
           control.slot_index < K && control.release_generation == 0 &&
-          !pull_slots[control.slot_index].busy) {
+          !pull_slots[control.slot_index].busy && running_) {
         if (try_pinned_pull(qd.send_slot, request, control.slot_index,
                             &qd.reply)) {
           handled = true;
@@ -2065,7 +2141,12 @@ void RdmaServer::Serve(
       return true;
     };
 
-    while (running_ && !fail) {
+    for (;;) {
+      // Serve on while running, and during Stop()'s drain for as long as a
+      // grant waits for the client.
+      const GrantView grants = grant_view(
+          !queue.empty() || ring.inflight() != 0 || posted_sends != 0);
+      if (fail || (!running_ && !grants.holding)) break;
       bool progressed = false;
 
       // Always give RDMA ingress first opportunity. This keeps first-window
@@ -2142,8 +2223,6 @@ void RdmaServer::Serve(
       // after our ready-only PollComp drain, so never put an outstanding SEND
       // fence behind the multi-minute connection-idle wait. A bounded wait
       // blocks (no spin) and its timeout path performs a final CQ poll.
-      const GrantView grants = grant_view(
-          !queue.empty() || ring.inflight() != 0 || posted_sends != 0);
       bool grant_wait = false;
       const int bound_ms = wait_bound_ms(grants, &grant_wait);
       const int verbs_wait_ms =
@@ -2208,12 +2287,14 @@ sync_serve_loop:;
     if (after_reply_post_for_test_) after_reply_post_for_test_();
     return true;
   };
-  while (running_ && !fail) {
+  for (;;) {
+    // Serve on while running, and during Stop()'s drain for as long as a
+    // grant waits for the client. Requests are served synchronously here:
+    // nothing of the server's is in flight while it waits.
+    const GrantView grants = grant_view(/*server_work=*/false);
+    if (fail || (!running_ && !grants.holding)) break;
     const bool deferred_for_test =
         reorder_cq_for_test_ && free_send.size() != K;
-    // Requests are served synchronously here: nothing of the server's is in
-    // flight while it waits.
-    const GrantView grants = grant_view(/*server_work=*/false);
     bool grant_wait = false;
     const int bound_ms = wait_bound_ms(grants, &grant_wait);
     const int wait_ms =
@@ -2376,6 +2457,14 @@ std::string RdmaServer::MetricsText() const {
   m(s, "dfkv_rdma_segment_evictions_total", "counter",
      "Connections evicted to free shared receive segment space",
      segment_evictions_.load(std::memory_order_relaxed));
+  m(s, "dfkv_rdma_stop_grants_refused_total", "counter",
+    "GET READYs and PUT leases refused (as a miss, or kCacheFull) while "
+    "stopping, so that the drain waits only for the grants in flight",
+    stop_grants_refused_);
+  m(s, "dfkv_rdma_stop_drains_cut_total", "counter",
+    "Stops that closed connections still holding grants when "
+    "DFKV_RDMA_STOP_DRAIN_MS ran out",
+    stop_drains_cut_);
   m(s, "dfkv_rdma_grant_expiries_total", "counter",
     "RDMA connections closed because a GET grant or PUT lease waited longer "
     "than DFKV_RDMA_GRANT_TIMEOUT_MS for the client",

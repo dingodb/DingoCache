@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Server, RDMA: stopping no longer waits for connections still in their
+  handshake, and lets reads and writes in flight finish. A connection
+  thread waiting for its peer's bootstrap frames held `Stop()` up until the
+  bootstrap deadline (10 s; measured 10.0 s with three peers that had only
+  connected, now under 1 ms): their sockets are now shut down. The receive
+  pool's pressure wait (up to 5 s) also ends on a stop. Connections that
+  have sent a GET's READY or a PUT lease and wait for the client go on
+  serving, for up to `DFKV_RDMA_STOP_DRAIN_MS` (default 2 s, 0 = no wait),
+  so the client's READ or WRITE completes instead of ending in a completion
+  error; each ends as soon as it holds no grant. New GETs are answered as a
+  miss and new leased PUTs with `kCacheFull` meanwhile, so the drain waits
+  only for the grants in flight (`dfkv_rdma_stop_grants_refused_total`).
+  The others are closed at once, as before. Stops that ran out of drain
+  time count in `dfkv_rdma_stop_drains_cut_total`.
 - Server, RDMA: a GET grant or a PUT lease no longer outlives a dead client
   by the connection's idle timeout. After sending a GET's READY the server
   holds the value (a staging range, or a pin on a RAM tier slot that then

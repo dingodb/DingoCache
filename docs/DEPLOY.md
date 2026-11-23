@@ -694,6 +694,7 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | `DFKV_RDMA_RAIL_LATENCY_WEIGHT` | — | client：rail selection 的延迟 EWMA 权重 |
 | `DFKV_RDMA_RAIL_ERROR_PENALTY_US` | — | client：rail selection 的错误分数惩罚微秒 |
 | `DFKV_RDMA_IDLE_MS` | `600000` | server 常规空闲 QP 超时（毫秒；`0` 禁用）；接收池压力回收另须保护未完成的 reply/READ |
+| `DFKV_RDMA_STOP_DRAIN_MS` | `2000` | 停止时让还持有授权（GET 已发 READY、PUT 已发租约）的连接先做完的上限（毫秒；`0` 不等）。期间新的 GET 答 miss、新的 leased PUT 答 `kCacheFull`（计入 `dfkv_rdma_stop_grants_refused_total`），只等已发出的授权；没有授权的连接立即关闭；握手中的连接立即断开，不再等 bootstrap 的 10 s 截止。到期仍未做完的计入 `dfkv_rdma_stop_drains_cut_total`。它算在停止预算里：和 `DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S`、停请求、各盘同步一起要小于 `TimeoutStopSec` |
 | `DFKV_RDMA_GRANT_TIMEOUT_MS` | `60000` | 持有授权（GET 已发 READY 未 RELEASE、PUT 已发租约未写入、多窗口 PUT 未到下一窗）而 server 自己没有活（没有在途的读盘或回复）的连接最多静默多久（毫秒；`0` 不设上限），从它最后一次收到 completion 和最后一次发出授权两者中较晚的那个算起：一批 GET 的时钟从它的最后一个 READY 开始，前面的 READY 等盘多久都不算。超过就关掉这条连接（先销毁 QP 和 MR，再放 pin 和暂存区），计入 `dfkv_rdma_grant_expiries_total`。client 崩溃或放弃后，这些 pin 不再拖到 `DFKV_RDMA_IDLE_MS`。client 活着、连接一直有流量但漏发某个 RELEASE 的情况不在此列（仍要等连接空闲）。client 的 `DFKV_RDMA_OP_TIMEOUT_MS`（或设了的 `DFKV_RDMA_BATCH_OP_TIMEOUT_MS`）超过它时，一次 READ 或写入本身超过它的连接会被切断；`DFKV_RDMA_OP_TIMEOUT_MS=0` 时把它也设成 `0` |
 
 #### c. TCP 连接池（client 读，但 server 运维也受影响）

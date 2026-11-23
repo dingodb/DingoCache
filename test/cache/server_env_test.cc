@@ -262,6 +262,19 @@ TEST(ServerEnv, RdmaGrantTimeoutMs) {
   }
 }
 
+// DFKV_RDMA_STOP_DRAIN_MS: 2 s by default, 0 = do not wait (-1 here).
+TEST(ServerEnv, RdmaStopDrainMs) {
+  struct Case { const char* value; int ms; };
+  const Case cases[] = {
+      {nullptr, 2000}, {"", 2000}, {"500", 500}, {"0", -1}, {"999999", 60000}};
+  for (const Case& c : cases) {
+    int ms = 0;
+    (void)LogOf("DFKV_RDMA_STOP_DRAIN_MS", c.value,
+                [&] { ms = RdmaStopDrainMsFromEnv(); });
+    EXPECT_EQ(ms, c.ms) << (c.value ? c.value : "(unset)");
+  }
+}
+
 // The receive-pool sizes: the line names the number that is used.
 TEST(ServerEnv, RecvBytesWarningNamesTheValueInUse) {
   constexpr size_t kDefault = 128ull << 30;
