@@ -9,6 +9,14 @@
   is caught by the exact-length load and a shorter one is removed. A test
   now fails if the layout ID changes without the field.
 
+- vLLM connector, lookup cost. Every lookup key copied the key metadata
+  and validated and encoded all of its namespace fields again; a full-hit
+  lookup of 15 624 chunks took about 61 ms with one rank namespace and
+  465 ms with eight, now 13 ms and 80 ms. Each namespace is now encoded
+  once per lookup (new `dfkv_common.pool_key_affixes` and
+  `pool_key_hash_field`; `pool_key` is built from them). Keys are
+  unchanged.
+
 - vLLM connector, scheduler step cost. A request's token ids, read only by
   KV events, were pickled to every worker every step: a 32k-token request's
   metadata was about 115 KiB, now 19 KiB without KV events. The scan for

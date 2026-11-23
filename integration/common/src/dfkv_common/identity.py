@@ -360,8 +360,7 @@ def canonical_namespace(
     return descriptor.serialize()
 
 
-def pool_key(
-    page_hash: BytesLike,
+def pool_key_affixes(
     *,
     pool: BytesLike = "kv",
     dp_size: int = 1,
@@ -376,10 +375,14 @@ def pool_key(
     pp_rank: int = 0,
     group_id: int = 0,
     component: BytesLike = "all",
-) -> bytes:
-    """Encode one logical cache-object key as self-delimiting bytes."""
+) -> tuple[bytes, bytes]:
+    """The bytes of a pool key before and after its page hash field.
+
+    ``pool_key(h, **kw) == prefix + pool_key_hash_field(h) + suffix`` for
+    ``prefix, suffix = pool_key_affixes(**kw)``: callers building many keys
+    of one namespace validate and encode it once.
+    """
     pool_bytes = _required_bytes(pool, "pool")
-    page_hash_bytes = _required_bytes(page_hash, "page_hash")
     component_bytes = _required_bytes(component, "component")
     if len(component_bytes) > _MAX_COMPONENT_BYTES:
         raise ValueError("component exceeds 256 bytes")
@@ -405,14 +408,47 @@ def pool_key(
                 "-1 <= int32 rank < size")
         encoded_axes += struct.pack("<Ii", size, rank)
     _uint(group_id, 32, "group_id")
-    return b"".join((
-        _POOL_MAGIC,
-        _field(pool_bytes),
-        _field(page_hash_bytes),
-        bytes(encoded_axes),
-        struct.pack("<I", group_id),
-        _field(component_bytes),
-    ))
+    return (
+        _POOL_MAGIC + _field(pool_bytes),
+        b"".join((
+            bytes(encoded_axes),
+            struct.pack("<I", group_id),
+            _field(component_bytes),
+        )),
+    )
+
+
+def pool_key_hash_field(page_hash: BytesLike) -> bytes:
+    """The page hash field of a pool key (see :func:`pool_key_affixes`)."""
+    return _field(_required_bytes(page_hash, "page_hash"))
+
+
+def pool_key(
+    page_hash: BytesLike,
+    *,
+    pool: BytesLike = "kv",
+    dp_size: int = 1,
+    dp_rank: int = -1,
+    tp_size: int = 1,
+    tp_rank: int = -1,
+    pcp_size: int = 1,
+    pcp_rank: int = 0,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    pp_size: int = 1,
+    pp_rank: int = 0,
+    group_id: int = 0,
+    component: BytesLike = "all",
+) -> bytes:
+    """Encode one logical cache-object key as self-delimiting bytes."""
+    hash_field = pool_key_hash_field(page_hash)
+    prefix, suffix = pool_key_affixes(
+        pool=pool, dp_size=dp_size, dp_rank=dp_rank, tp_size=tp_size,
+        tp_rank=tp_rank, pcp_size=pcp_size, pcp_rank=pcp_rank,
+        dcp_size=dcp_size, dcp_rank=dcp_rank, pp_size=pp_size,
+        pp_rank=pp_rank, group_id=group_id, component=component,
+    )
+    return prefix + hash_field + suffix
 
 
 def sg_key(key: bytes, width: int, group: int) -> bytes:
