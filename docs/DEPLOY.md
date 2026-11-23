@@ -746,7 +746,7 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | env | 默认 | 说明 |
 |---|---|---|
 | `DFKV_RAM_TIER_EXTENT_BYTES` | — | arena extent 大小（通常保留默认；与 `DFKV_RAM_TIER_BYTES` 比例决定并发度） |
-| `DFKV_RAM_TIER_LARGE_RESERVE_BYTES` | — | 超大对象（超出 arena extent）的 dedicated allocation 预算 |
+| `DFKV_RAM_TIER_LARGE_RESERVE_BYTES` | `0`（不保留） | 超大对象（超出 arena extent）的 dedicated allocation 预算。默认不保留：超出 extent 的值不进 RAM，直接写盘、从盘读（早于此的版本默认给它们留两个 extent）；设一个预算即恢复为进 RAM。默认 `--max-msg` 等于 extent，到不了这条路径；只有调大 `--max-msg` 时才有意义。设了之后预算满时按进入顺序淘汰最老的（只看这类对象，不扫整个索引） |
 | `DFKV_RAM_TIER_SHARDS` | `8`, 硬上限 64 | 锁分片 |
 | `DFKV_RAM_TIER_NUMA` | `interleave` | interleave / off |
 | `DFKV_RAM_TIER_LOCK` | `on` | arena 是否锁在内存里（`mlock2`）；锁不上只告警，`dfkv_ram_arena_locked` 反映实际结果 |

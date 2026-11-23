@@ -19,6 +19,7 @@ class KvNodeServerWiringTestPeer {
     uint32_t reclaim_interval_ms;
     uint32_t flush_threads;
     uint64_t bytes;
+    uint64_t large_reserve_bytes;
   };
   static size_t FlushLanes(size_t disk_count) {
     return KvNodeServer::PlanRamTier(disk_count).options.flush_lanes;
@@ -27,7 +28,7 @@ class KvNodeServerWiringTestPeer {
     const auto plan = KvNodeServer::PlanRamTier(/*disk_count=*/1);
     return {plan.enabled, plan.options.ack_high_watermark_pct,
             plan.options.reclaim_interval_ms, plan.options.flush_threads,
-            plan.options.bytes};
+            plan.options.bytes, plan.options.large_reserve_bytes};
   }
 };
 }  // namespace dfkv
@@ -225,4 +226,10 @@ TEST_F(RamTierEnv, TierSwitchKeepsItsLowerCaseWords) {
 TEST_F(RamTierEnv, FlushLanesAreTheConfiguredDisks) {
   EXPECT_EQ(Peer::FlushLanes(3), 3u);
   EXPECT_EQ(Peer::FlushLanes(1), 1u);
+}
+
+// The server keeps no dedicated budget for values above an extent unless
+// asked: with the default --max-msg no value can use it.
+TEST_F(RamTierEnv, NoDedicatedBudgetByDefault) {
+  EXPECT_EQ(defaults_.large_reserve_bytes, 0u);
 }
