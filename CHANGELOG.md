@@ -131,6 +131,28 @@
   itself: 0.08 ms and 1.3 ms). Below about 1 MiB both cost 20-40 µs, the
   system call itself; avoiding that needs registrations that outlive one
   operation, which this release does not do.
+
+- Server, slab disks: a damaged value is a miss, not a hit (STO-15). The
+  slot table's record checksum covers the record only; a value whose bytes
+  on disk were damaged, or never landed before a crash that a warm restart
+  survived, was served as a hit. A PUT now stores a CRC32C of the value in
+  the record (bytes 52..55, flagged in byte 9; older releases ignore both,
+  so the format stays readable both ways). Every whole-value read checks
+  it: GET, the buffered and direct read paths, and the RDMA lease's
+  `Verify`. A mismatch drops the key, answers `kNotFound`, and counts in the
+  new `dfkv_slab_payload_crc_failures_total`. Records written by older
+  releases are served unchecked until they are rewritten; reads of a slice
+  of a value are not checked, and the check runs at read time: a record a
+  warm restart kept whose value never landed still answers EXISTS until
+  its first whole-value read. The checksum costs one CRC32C pass per PUT
+  and per whole-value GET: in a single-writer loop of 1 MiB values on NVMe,
+  about 60-70 us per PUT at the median (+17%, single-writer throughput
+  -12%) and 15-40 us per GET. `DFKV_SLAB_PAYLOAD_CRC=0` (default 1) turns
+  it off: records are written without it and no read checks one; records
+  written while it is off stay unchecked when it is turned on again. Memory:
+  the store's per-key index entry grows from 4 to 12 bytes of value data
+  (length, CRC, flag).
+
 - SGLang HiCache: a parked retention TTL lapses with its TTL (HIC-28). A
   `batch_touch` that finds pages not stored yet parks their TTL for the
   write; it never lapsed, so a page written long after the touch was

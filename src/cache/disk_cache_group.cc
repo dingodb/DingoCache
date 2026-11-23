@@ -281,6 +281,24 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
       return;
     }
   }
+  // STO-15: a PUT records its value's CRC32C and a whole-value read checks
+  // it. 0 writes records without it and checks none (one CRC pass per PUT
+  // and per GET saved); records written meanwhile stay unchecked for good.
+  bool slab_payload_crc = true;
+  if (const char* mode = std::getenv("DFKV_SLAB_PAYLOAD_CRC");
+      mode != nullptr && *mode != '\0') {
+    if (std::strcmp(mode, "1") == 0) {
+      slab_payload_crc = true;
+    } else if (std::strcmp(mode, "0") == 0) {
+      slab_payload_crc = false;
+    } else if (use_slab) {
+      fail("DFKV_SLAB_PAYLOAD_CRC must be 0 or 1");
+      return;
+    }
+  }
+  if (use_slab)
+    config_dump::RecordResolved("DFKV_SLAB_PAYLOAD_CRC",
+                                slab_payload_crc ? "1" : "0");
   if (use_slab)
     config_dump::RecordResolved(
         "DFKV_SLAB_WARM_RESTART",
@@ -393,6 +411,7 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
         so.table_sync_ms = sync_ms;
         so.reclaim_interval_ms = reclaim_ms;
         so.warm_restart = slab_warm;
+        so.payload_crc = slab_payload_crc;
         // Activated by Activate(), with the other disks, not by its own open.
         so.defer_activation = true;
         auto slab = std::make_unique<DiskSlabStore>(so);
@@ -973,6 +992,7 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.dio_read_fallbacks += st.dio_read_fallbacks;
     sum.table_syncs += st.table_syncs;
     sum.bind_wipes += st.bind_wipes;
+    sum.payload_crc_failures += st.payload_crc_failures;
     sum.steals += st.steals;
     sum.cold_steals += st.cold_steals;
     sum.watermark_evictions += st.watermark_evictions;

@@ -1103,3 +1103,23 @@ TEST_F(DiskGroupTest, QuotaBatchOverManyStripesIsAdmittedPerTenant) {
     EXPECT_EQ(group.TenantUsedBytes(tenant), 6u) << tenant;
   EXPECT_EQ(group.TenantQuotaRejections(), kTenants);
 }
+
+// DFKV_SLAB_PAYLOAD_CRC takes 0 or 1; anything else refuses to start.
+TEST_F(DiskGroupTest, SlabPayloadCrcSettingIsZeroOrOne) {
+  const auto dirs = Dirs(1);
+  for (const char* good : {"0", "1"}) {
+    fs::remove_all(dirs[0]);
+    fs::create_directories(dirs[0]);
+    ScopedEnv crc("DFKV_SLAB_PAYLOAD_CRC", good);
+    DiskCacheGroup group({dirs, 1ull << 30, "slab"});
+    EXPECT_TRUE(group.Healthy()) << good << ": " << group.StartupError();
+  }
+  for (const char* bad : {"2", "on", "off"}) {
+    ScopedEnv crc("DFKV_SLAB_PAYLOAD_CRC", bad);
+    DiskCacheGroup group({dirs, 1ull << 30, "slab"});
+    EXPECT_FALSE(group.Healthy()) << bad;
+    EXPECT_NE(group.StartupError().find("DFKV_SLAB_PAYLOAD_CRC"),
+              std::string::npos)
+        << group.StartupError();
+  }
+}
