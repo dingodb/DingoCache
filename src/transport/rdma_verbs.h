@@ -27,6 +27,7 @@
 #include <utility>
 #include <atomic>
 #include <thread>
+#include <functional>
 #include <vector>
 
 namespace dfkv {
@@ -198,6 +199,11 @@ class RcEndpoint {
   // shared per-PD registry this counts distinct (device,region) pairs, not
   // connections (the pre-fix per-connection storm). Diagnostic/test.
   static uint64_t PoolMrRegistrations();
+  // ibv_query_port calls made by Open (diagnostic: cached per device).
+  static uint64_t PortQueries();
+  // Test seam: called before each shared pool registration, outside any
+  // lock; returning false fails that registration. Empty = none.
+  static void SetPoolRegistrationSeamForTest(std::function<bool()> seam);
   static uint64_t PoolMrRegistrationFailures();
   // Process-wide number of currently retained shared-PD pool MR generations.
   // Superseded generations remain only while an endpoint still references them.
@@ -365,6 +371,10 @@ class RcEndpoint {
   uint16_t remote_depth_ = 0;  // Set from the required v2 QP advertisement.
   size_t max_sge_ = 2;  // QP max_send_sge/max_recv_sge = min(kMaxSge, device cap)
   size_t read_sge_ = 1;  // device max_sge_rd (ReadSge)
+  // sbuf_/rbuf_ point into control_buf_, all under control_mr_.
+  char* control_buf_ = nullptr;
+  size_t control_bytes_ = 0;
+  ibv_mr* control_mr_ = nullptr;
   std::vector<char*> sbuf_, rbuf_, dbuf_;
   std::vector<ibv_mr*> smr_, rmr_, dmr_;
   // Big pre-registered caller regions (the host KV pool). Each cache entry owns

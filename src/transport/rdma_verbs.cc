@@ -14,7 +14,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <random>
 #include <string>
@@ -48,14 +50,31 @@ struct SharedPoolMr {
   ibv_mr* mr;
   size_t refs;
 };
+// Port attributes and the chosen source GID, as Open queried them. Reused by
+// later opens on the device while the port was ACTIVE and the query is less
+// than a second old: ibv_query_port goes to the device (about 1.5 ms with the
+// GID query, the largest single part of an endpoint open).
+struct PortInfo {
+  uint64_t queried_us = 0;  // 0 = none
+  ibv_port_attr attr{};
+  int gid_index = 0;
+  ibv_gid gid{};
+};
 struct SharedDevice {
   ibv_context* ctx;
   ibv_pd* pd;
   long refs;
   // Registered once per PD. Entries retire at zero endpoint refs.
   std::vector<SharedPoolMr> pool_mrs;
+  std::map<uint8_t, PortInfo> ports;
 };
+// Guards g_devs and each device's pool_mrs and ports. No ibv_reg_mr or
+// ibv_dereg_mr runs under it: a large registration pins and zero-fills every
+// page (about 100 ms for 256 MiB), and every endpoint open and close on every
+// rail takes this lock.
 std::mutex g_dev_mu;
+// Test seam: consulted before each pool registration; false fails it.
+std::function<bool()> g_pool_registration_seam;
 std::unordered_map<std::string, SharedDevice> g_devs;
 
 // Cumulative one-shot user MRs registered outside explicit pool regions.
@@ -66,6 +85,7 @@ std::atomic<uint64_t> g_adhoc_user_mr{0};
 // with the shared registry this is ~= number of distinct (device,region) pairs,
 // NOT number of connections (the pre-fix behavior).
 std::atomic<uint64_t> g_pool_mr_regs{0};
+std::atomic<uint64_t> g_port_queries{0};
 std::atomic<uint64_t> g_pool_mr_reg_failures{0};
 std::atomic<uint64_t> g_pool_mr_active{0};
 std::atomic<uint64_t> g_transient_user_mr_active{0};
@@ -126,61 +146,109 @@ std::pair<ibv_context*, ibv_pd*> AcquireSharedDevice(const char* dev_name) {
 // then context. No-op for nullptr (failed Open).
 void ReleaseSharedDevice(ibv_context* ctx) {
   if (!ctx) return;
-  std::lock_guard<std::mutex> lk(g_dev_mu);
-  for (auto it = g_devs.begin(); it != g_devs.end(); ++it) {
-    if (it->second.ctx != ctx) continue;
-    if (--it->second.refs == 0) {
-      for (auto& p : it->second.pool_mrs) {
-        DeregisterMr(p.mr);
-        g_pool_mr_active.fetch_sub(1, std::memory_order_relaxed);
+  SharedDevice last{};
+  {
+    std::lock_guard<std::mutex> lk(g_dev_mu);
+    for (auto it = g_devs.begin(); it != g_devs.end(); ++it) {
+      if (it->second.ctx != ctx) continue;
+      if (--it->second.refs == 0) {
+        last = std::move(it->second);
+        g_devs.erase(it);
       }
-      RequireVerbsRelease(ibv_dealloc_pd(it->second.pd), "ibv_dealloc_pd");
-      RequireVerbsRelease(ibv_close_device(it->second.ctx), "ibv_close_device");
-      g_devs.erase(it);
+      break;
     }
-    return;
   }
+  if (!last.ctx) return;
+  for (auto& p : last.pool_mrs) {
+    DeregisterMr(p.mr);
+    g_pool_mr_active.fetch_sub(1, std::memory_order_relaxed);
+  }
+  RequireVerbsRelease(ibv_dealloc_pd(last.pd), "ibv_dealloc_pd");
+  RequireVerbsRelease(ibv_close_device(last.ctx), "ibv_close_device");
+}
+
+SharedDevice* FindDeviceLocked(ibv_context* ctx) {
+  for (auto& d : g_devs)
+    if (d.second.ctx == ctx) return &d.second;
+  return nullptr;
+}
+
+SharedPoolMr* FindPoolMrLocked(SharedDevice* device, uintptr_t base,
+                               size_t size, int access) {
+  for (auto& p : device->pool_mrs)
+    if (p.base == base && p.size >= size && (p.access & access) == access)
+      return &p;
+  return nullptr;
 }
 
 // Register `base`/`size` on the device's shared PD exactly once; subsequent
 // callers (other endpoints on the same PD) get the existing MR with no
 // ibv_reg_mr. Returns the (shared, PD-owned) MR, or nullptr on failure. The MR's
 // lkey is valid for any QP on this PD, so callers may cache the pointer locally
-// for lock-free lookup. Only called at connection setup (not the datapath), so
-// taking g_dev_mu here is fine.
+// for lock-free lookup. The registration itself runs outside g_dev_mu; two
+// callers racing on one region both register, and the later one gives its MR
+// back. The caller's endpoint holds a device reference, so the device entry
+// outlives the call.
 ibv_mr* SharedAddPoolMr(ibv_context* ctx, ibv_pd* pd, void* base, size_t size,
                         int access) {
   auto b = reinterpret_cast<uintptr_t>(base);
-  std::lock_guard<std::mutex> lk(g_dev_mu);
-  for (auto& d : g_devs) {
-    if (d.second.ctx != ctx) continue;
-    for (auto& p : d.second.pool_mrs) {
-      if (p.base == b && p.size >= size && (p.access & access) == access) {
-        ++p.refs;
-        return p.mr;
-      }
+  {
+    std::lock_guard<std::mutex> lk(g_dev_mu);
+    SharedDevice* device = FindDeviceLocked(ctx);
+    if (!device) return nullptr;
+    if (SharedPoolMr* p = FindPoolMrLocked(device, b, size, access)) {
+      ++p->refs;
+      return p->mr;
     }
-    const auto t0 = std::chrono::steady_clock::now();
-    ibv_mr* mr = ibv_reg_mr(pd, base, size, access);
-    if (!mr) {
-      g_pool_mr_reg_failures.fetch_add(1, std::memory_order_relaxed);
-      return nullptr;
-    }
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - t0).count();
-    // Registering a huge (arena-scale) region pins every page: seconds of
-    // wall time. That must happen at startup (anchor endpoint), never on a
-    // connection's first op — a slow registration HERE at serve time means
-    // the anchor is missing or the region appeared late. Always log slow ones.
-    if (ms > 100)
-      DFKV_LOG_INFO("pool MR registered: " + std::to_string(size >> 20) +
-                    " MiB in " + std::to_string(ms) + " ms");
-    g_pool_mr_regs.fetch_add(1, std::memory_order_relaxed);
-    g_pool_mr_active.fetch_add(1, std::memory_order_relaxed);
-    d.second.pool_mrs.push_back(SharedPoolMr{b, size, access, mr, 1});
-    return mr;
   }
-  return nullptr;
+  const auto t0 = std::chrono::steady_clock::now();
+  const bool attempt = !g_pool_registration_seam || g_pool_registration_seam();
+  ibv_mr* mr = attempt ? ibv_reg_mr(pd, base, size, access) : nullptr;
+  if (!mr) {
+    // A caller racing on the same region may have registered and published
+    // it meanwhile (this one failing because memlock allows one pin, say):
+    // use theirs.
+    std::lock_guard<std::mutex> lk(g_dev_mu);
+    SharedDevice* device = FindDeviceLocked(ctx);
+    if (SharedPoolMr* p =
+            device ? FindPoolMrLocked(device, b, size, access) : nullptr) {
+      ++p->refs;
+      return p->mr;
+    }
+    g_pool_mr_reg_failures.fetch_add(1, std::memory_order_relaxed);
+    return nullptr;
+  }
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0).count();
+  ibv_mr* winner = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(g_dev_mu);
+    SharedDevice* device = FindDeviceLocked(ctx);
+    if (!device) {
+      // Cannot happen while the caller holds a device reference.
+    } else if (SharedPoolMr* p = FindPoolMrLocked(device, b, size, access)) {
+      ++p->refs;
+      winner = p->mr;
+    } else {
+      g_pool_mr_regs.fetch_add(1, std::memory_order_relaxed);
+      g_pool_mr_active.fetch_add(1, std::memory_order_relaxed);
+      device->pool_mrs.push_back(SharedPoolMr{b, size, access, mr, 1});
+      winner = mr;
+    }
+  }
+  if (winner != mr) {
+    // Another caller registered it meanwhile: keep theirs.
+    DeregisterMr(mr);
+    return winner;
+  }
+  // Registering a huge (arena-scale) region pins every page: seconds of
+  // wall time. That must happen at startup (anchor endpoint), never on a
+  // connection's first op — a slow registration HERE at serve time means
+  // the anchor is missing or the region appeared late. Always log slow ones.
+  if (ms > 100)
+    DFKV_LOG_INFO("pool MR registered: " + std::to_string(size >> 20) +
+                  " MiB in " + std::to_string(ms) + " ms");
+  return mr;
 }
 
 // Release one endpoint cache reference. The MR is deregistered as soon as no
@@ -188,26 +256,100 @@ ibv_mr* SharedAddPoolMr(ibv_context* ctx, ibv_pd* pd, void* base, size_t size,
 // without invalidating in-flight users on older endpoints.
 void SharedReleasePoolMr(ibv_context* ctx, ibv_mr* mr) {
   if (!ctx || !mr) return;
-  std::lock_guard<std::mutex> lk(g_dev_mu);
-  for (auto& [name, device] : g_devs) {
-    (void)name;
-    if (device.ctx != ctx) continue;
-    for (auto it = device.pool_mrs.begin(); it != device.pool_mrs.end(); ++it) {
-      if (it->mr != mr) continue;
-      if (--it->refs == 0) {
-        DeregisterMr(it->mr);
-        device.pool_mrs.erase(it);
-        g_pool_mr_active.fetch_sub(1, std::memory_order_relaxed);
-      }
-      return;
-    }
-    return;
+  {
+    std::lock_guard<std::mutex> lk(g_dev_mu);
+    SharedDevice* device = FindDeviceLocked(ctx);
+    if (!device) return;
+    const auto it = std::find_if(
+        device->pool_mrs.begin(), device->pool_mrs.end(),
+        [mr](const SharedPoolMr& p) { return p.mr == mr; });
+    if (it == device->pool_mrs.end() || --it->refs != 0) return;
+    device->pool_mrs.erase(it);
+    g_pool_mr_active.fetch_sub(1, std::memory_order_relaxed);
   }
+  DeregisterMr(mr);
+}
+
+uint64_t SteadyMicros() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+// The device's port attributes and source GID as a recent Open queried them:
+// reused only while that query found the port ACTIVE and is under a second
+// old, so a port that went down, or came back with other attributes, is
+// queried again.
+bool CachedPortInfo(ibv_context* ctx, uint8_t port, PortInfo* out) {
+  std::lock_guard<std::mutex> lk(g_dev_mu);
+  SharedDevice* device = FindDeviceLocked(ctx);
+  if (!device) return false;
+  const auto it = device->ports.find(port);
+  if (it == device->ports.end() || it->second.queried_us == 0 ||
+      it->second.attr.state != IBV_PORT_ACTIVE ||
+      SteadyMicros() - it->second.queried_us >= 1000000)
+    return false;
+  *out = it->second;
+  return true;
+}
+
+void StorePortInfo(ibv_context* ctx, uint8_t port, const PortInfo& info) {
+  std::lock_guard<std::mutex> lk(g_dev_mu);
+  if (SharedDevice* device = FindDeviceLocked(ctx)) device->ports[port] = info;
+}
+
+bool QueryPortInfo(ibv_context* ctx, uint8_t port, PortInfo* out) {
+  g_port_queries.fetch_add(1, std::memory_order_relaxed);
+  if (ibv_query_port(ctx, port, &out->attr) != 0) return false;
+  out->queried_us = SteadyMicros();
+  // Pick the source GID. On IB the LID is used for addressing (GID is along
+  // for the ride), but on RoCE (Ethernet link layer, lid==0) the QP is
+  // addressed by GID, and RoCEv2 GIDs are not at index 0 — pick a RoCEv2
+  // entry so RoCE works.
+  out->gid_index = 0;
+  out->gid = ibv_gid{};
+  ibv_query_gid(ctx, port, 0, &out->gid);
+  if (out->attr.lid == 0) {  // RoCE: pick a RoCEv2 GID, preferring a routable
+                             // (non link-local fe80::) one — link-local GIDs
+                             // don't resolve for loopback/cross-host the way
+                             // IPv4-mapped GIDs do.
+    int any_v2 = -1;
+    for (int i = 0; i < out->attr.gid_tbl_len; ++i) {
+      ibv_gid_entry e{};
+      if (ibv_query_gid_ex(ctx, port, i, &e, 0) != 0) continue;
+      if (e.gid_type != IBV_GID_TYPE_ROCE_V2) continue;
+      bool link_local = e.gid.raw[0] == 0xfe && (e.gid.raw[1] & 0xc0) == 0x80;
+      if (any_v2 < 0) any_v2 = i;  // remember first RoCEv2 as fallback
+      if (!link_local) {
+        out->gid_index = i;
+        out->gid = e.gid;
+        any_v2 = -1;
+        break;
+      }
+    }
+    if (any_v2 >= 0) {  // only link-local RoCEv2 available
+      ibv_gid_entry e{};
+      if (ibv_query_gid_ex(ctx, port, any_v2, &e, 0) == 0) {
+        out->gid_index = any_v2;
+        out->gid = e.gid;
+      }
+    }
+  }
+  return true;
 }
 }  // namespace
 
 uint64_t RcEndpoint::AdhocUserMrTotal() {
   return g_adhoc_user_mr.load(std::memory_order_relaxed);
+}
+
+void RcEndpoint::SetPoolRegistrationSeamForTest(std::function<bool()> seam) {
+  g_pool_registration_seam = std::move(seam);
+}
+
+uint64_t RcEndpoint::PortQueries() {
+  return g_port_queries.load(std::memory_order_relaxed);
 }
 
 uint64_t RcEndpoint::PoolMrRegistrations() {
@@ -301,8 +443,8 @@ void RcEndpoint::Close() {
   g_lease_read_mr_active.fetch_sub(lease_read_mr_.size(),
                                   std::memory_order_relaxed);
   lease_read_mr_.clear();
-  for (auto* m : smr_) DeregisterMr(m);
-  for (auto* m : rmr_) DeregisterMr(m);
+  DeregisterMr(control_mr_);
+  control_mr_ = nullptr;
   for (auto* m : dmr_) DeregisterMr(m);
   for (auto* mr : transient_mr_) DeregisterMr(mr);
   g_transient_user_mr_active.fetch_sub(transient_mr_.size(),
@@ -314,8 +456,9 @@ void RcEndpoint::Close() {
   for (const auto& pool : pool_mr_) SharedReleasePoolMr(ctx_, pool.mr);
   pool_mr_.clear();
   smr_.clear(); rmr_.clear(); dmr_.clear();
-  for (auto* b : sbuf_) delete[] b;
-  for (auto* b : rbuf_) delete[] b;
+  std::free(control_buf_);
+  control_buf_ = nullptr;
+  control_bytes_ = 0;
   for (auto* b : dbuf_) std::free(b);
   sbuf_.clear(); rbuf_.clear(); dbuf_.clear();
   dbuf_cap_ = 0;
@@ -457,12 +600,31 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
     Close(); return false;
   }
 
-  // buffers + MRs. Bind to the device's NUMA node before registration so the
-  // pages fault in locally (mbind sets policy; reg_mr faults/pins them). For our
-  // sizes (>=128 KiB) new[] is mmap-backed = page-aligned, which mbind needs.
+  // Control buffers: one page-aligned allocation for every send and receive
+  // buffer, registered once. Bound to the device's NUMA node before the
+  // registration faults the pages in (mbind needs a page-aligned range; the
+  // former per-buffer new[] of 32 KiB was heap memory and the bind failed).
   numa_node_ = numa::DeviceNode(dev_name);
   sbuf_.resize(depth_, nullptr); rbuf_.resize(depth_, nullptr);
   smr_.resize(depth_, nullptr); rmr_.resize(depth_, nullptr);
+  constexpr size_t kPage = 4096;
+  const size_t stride = (cap_ + 63) & ~size_t{63};
+  if (depth_ > (std::numeric_limits<size_t>::max() - kPage) / 2 / stride)
+    return fail();
+  control_bytes_ = (2 * depth_ * stride + kPage - 1) & ~(kPage - 1);
+  void* control = nullptr;
+  if (posix_memalign(&control, kPage, control_bytes_) != 0) return fail();
+  control_buf_ = static_cast<char*>(control);
+  numa::BindMemory(control_buf_, control_bytes_, numa_node_);
+  control_mr_ =
+      ibv_reg_mr(pd_, control_buf_, control_bytes_, IBV_ACCESS_LOCAL_WRITE);
+  if (!control_mr_) return fail();
+  for (size_t i = 0; i < depth_; ++i) {
+    sbuf_[i] = control_buf_ + 2 * i * stride;
+    rbuf_[i] = control_buf_ + (2 * i + 1) * stride;
+    smr_[i] = control_mr_;
+    rmr_[i] = control_mr_;
+  }
   if (direct_io_buffers) {
     const size_t dio_cap = direct_io_cap ? direct_io_cap : cap_;
     dbuf_cap_ = dio_cap + 2 * kDirectIoAlign;
@@ -470,12 +632,6 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
     dmr_.resize(depth_, nullptr);
   }
   for (size_t i = 0; i < depth_; ++i) {
-    sbuf_[i] = new char[cap_]; rbuf_[i] = new char[cap_];
-    numa::BindMemory(sbuf_[i], cap_, numa_node_);
-    numa::BindMemory(rbuf_[i], cap_, numa_node_);
-    smr_[i] = ibv_reg_mr(pd_, sbuf_[i], cap_, IBV_ACCESS_LOCAL_WRITE);
-    rmr_[i] = ibv_reg_mr(pd_, rbuf_[i], cap_, IBV_ACCESS_LOCAL_WRITE);
-    if (!smr_[i] || !rmr_[i]) return fail();
     if (direct_io_buffers) {
       void* p = nullptr;
       if (posix_memalign(&p, kDirectIoAlign, dbuf_cap_) != 0) return fail();
@@ -486,14 +642,15 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
       if (!dmr_[i]) return fail();
     }
   }
-  for (size_t i = 0; i < depth_; ++i) {
-  }
 
   // local addressing info
-  ibv_port_attr pa{};
-  if (ibv_query_port(ctx_, ib_port_, &pa) != 0) return fail();
-  mtu_ = pa.active_mtu;
-  local_.lid = pa.lid;
+  PortInfo port;
+  if (!CachedPortInfo(ctx_, ib_port_, &port)) {
+    if (!QueryPortInfo(ctx_, ib_port_, &port)) return fail();
+    StorePortInfo(ctx_, ib_port_, port);
+  }
+  mtu_ = port.attr.active_mtu;
+  local_.lid = port.attr.lid;
   local_.qpn = qp_->qp_num;
   // Random 24-bit starting PSN, not derived from the QPN. The kernel recycles
   // QP numbers, so a QPN-derived PSN repeats whenever a QPN is reused; a stale
@@ -504,31 +661,8 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
     static thread_local std::mt19937 rng(std::random_device{}());
     local_.psn = rng() & 0xFFFFFF;
   }
-
-  // Pick the source GID. On IB the LID is used for addressing (GID is along for
-  // the ride), but on RoCE (Ethernet link layer, lid==0) the QP is addressed by
-  // GID, and RoCEv2 GIDs are not at index 0 — pick a RoCEv2 entry so RoCE works.
-  gid_index_ = 0;
-  union ibv_gid gid{};
-  ibv_query_gid(ctx_, ib_port_, 0, &gid);
-  if (pa.lid == 0) {  // RoCE: pick a RoCEv2 GID, preferring a routable (non
-                      // link-local fe80::) one — link-local GIDs don't resolve
-                      // for loopback/cross-host the way IPv4-mapped GIDs do.
-    int any_v2 = -1;
-    for (int i = 0; i < pa.gid_tbl_len; ++i) {
-      ibv_gid_entry e{};
-      if (ibv_query_gid_ex(ctx_, ib_port_, i, &e, 0) != 0) continue;
-      if (e.gid_type != IBV_GID_TYPE_ROCE_V2) continue;
-      bool link_local = e.gid.raw[0] == 0xfe && (e.gid.raw[1] & 0xc0) == 0x80;
-      if (any_v2 < 0) any_v2 = i;       // remember first RoCEv2 as fallback
-      if (!link_local) { gid_index_ = i; gid = e.gid; any_v2 = -1; break; }
-    }
-    if (any_v2 >= 0) {                   // only link-local RoCEv2 available
-      ibv_gid_entry e{};
-      if (ibv_query_gid_ex(ctx_, ib_port_, any_v2, &e, 0) == 0) { gid_index_ = any_v2; gid = e.gid; }
-    }
-  }
-  std::memcpy(local_.gid, gid.raw, 16);
+  gid_index_ = port.gid_index;
+  std::memcpy(local_.gid, port.gid.raw, 16);
   return true;
 }
 

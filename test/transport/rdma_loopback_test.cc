@@ -5637,6 +5637,221 @@ TEST(RdmaLoopback, PoolMrAccessUpgradeWinsRangeLookup) {
 // (the pre-fix storm — re-running ibv_reg_mr over a tens-of-GB region on every
 // reconnect). Verified via the pool-registration counter delta, and by every
 // endpoint resolving an in-pool buffer to the SAME MR (shared lkey).
+namespace {
+std::vector<std::string> ConfiguredRails() {
+  const char* devs = std::getenv("DFKV_RDMA_DEV");
+  std::vector<std::string> out;
+  const std::string list = devs ? devs : "";
+  size_t start = 0;
+  while (start < list.size()) {
+    size_t comma = list.find(',', start);
+    if (comma == std::string::npos) comma = list.size();
+    if (comma > start) out.push_back(list.substr(start, comma - start));
+    start = comma + 1;
+  }
+  return out;
+}
+}  // namespace
+
+// RDS-15: registering a large pool region (a host KV pool, the RAM arena)
+// held the process-wide device lock for the whole ibv_reg_mr, which pins and
+// zero-fills every page: measured 94-103 ms for 256 MiB. Opening or closing an
+// endpoint on any other rail waited for it.
+TEST(RdmaVerbs, PoolRegistrationDoesNotStallOtherRails) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const auto rails = ConfiguredRails();
+  if (rails.size() < 2) GTEST_SKIP() << "needs DFKV_RDMA_DEV with two rails";
+  constexpr size_t kRegion = 256ull << 20;
+  void* region = ::mmap(nullptr, kRegion, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  ASSERT_NE(region, MAP_FAILED);
+  struct Sample { double start_ms, ms; };
+  std::vector<Sample> samples;
+  std::atomic<bool> stop{false};
+  const auto origin = std::chrono::steady_clock::now();
+  const auto since = [&](std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(t - origin).count();
+  };
+  rdma::RcEndpoint keep_open;  // the other rail's device stays open
+  ASSERT_TRUE(keep_open.Open(rails[1].c_str(), rdma::kV2ControlCap, 1));
+  std::thread other([&] {
+    while (!stop.load()) {
+      const auto t0 = std::chrono::steady_clock::now();
+      {
+        rdma::RcEndpoint ep;
+        if (!ep.Open(rails[1].c_str(), rdma::kV2ControlCap, 4)) break;
+      }
+      const auto t1 = std::chrono::steady_clock::now();
+      samples.push_back({since(t0), since(t1) - since(t0)});
+    }
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  double reg_start = 0, reg_end = 0;
+  {
+    rdma::RcEndpoint ep;
+    ASSERT_TRUE(ep.Open(rails[0].c_str(), rdma::kV2ControlCap, 1));
+    reg_start = since(std::chrono::steady_clock::now());
+    const bool registered = ep.AddPoolMr(region, kRegion, true);
+    reg_end = since(std::chrono::steady_clock::now());
+    stop = true;
+    other.join();
+    if (!registered) {
+      ::munmap(region, kRegion);
+      GTEST_SKIP() << "cannot register 256 MiB here (RLIMIT_MEMLOCK)";
+    }
+  }
+  ::munmap(region, kRegion);
+  const double reg_ms = reg_end - reg_start;
+  if (reg_ms < 40) GTEST_SKIP() << "registration took " << reg_ms
+                                << " ms, too short to tell";
+  double worst = 0;
+  size_t during = 0;
+  for (const auto& sample : samples) {
+    if (sample.start_ms + sample.ms <= reg_start || sample.start_ms >= reg_end)
+      continue;
+    ++during;
+    worst = std::max(worst, sample.ms);
+  }
+  std::printf("pool registration %.1f ms; open+close on the other rail during"
+              " it: %zu, the longest %.1f ms\n", reg_ms, during, worst);
+  EXPECT_GE(during, 2u) << "the other rail made no progress during a "
+                        << reg_ms << " ms registration";
+  EXPECT_LT(worst, reg_ms / 2) << "an open+close on the other rail took "
+                               << worst << " ms during a " << reg_ms
+                               << " ms registration";
+}
+
+// RDS-15: the control buffers were new char[] of 32 KiB, heap memory that is
+// not page-aligned, so their NUMA bind (mbind) failed with EINVAL and did
+// nothing; and each was registered on its own (2 x depth registrations).
+TEST(RdmaVerbs, ControlBuffersArePageAlignedForTheirNumaBind) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  rdma::RcEndpoint ep;
+  ASSERT_TRUE(ep.Open(nullptr, rdma::kV2ControlCap, 4));
+  EXPECT_EQ(reinterpret_cast<uintptr_t>(ep.sbuf(0)) % 4096, 0u);
+  for (size_t i = 0; i < 4; ++i) {
+    std::memset(ep.sbuf(i), 's', rdma::kV2ControlCap);
+    std::memset(ep.rbuf(i), 'r', rdma::kV2ControlCap);
+  }
+  for (size_t i = 0; i < 4; ++i) {  // no buffer overlaps another
+    EXPECT_EQ(ep.sbuf(i)[0], 's');
+    EXPECT_EQ(ep.sbuf(i)[rdma::kV2ControlCap - 1], 's');
+    EXPECT_EQ(ep.rbuf(i)[0], 'r');
+    EXPECT_EQ(ep.rbuf(i)[rdma::kV2ControlCap - 1], 'r');
+  }
+}
+
+// RDS-15: ibv_query_port went to the device on every endpoint open (about
+// 1.5 ms with the GID query, the largest single part of an open). A device's
+// port attributes are now queried once and reused while the port is ACTIVE.
+TEST(RdmaVerbs, PortAttributesAreQueriedOncePerDevice) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  rdma::RcEndpoint first;
+  ASSERT_TRUE(first.Open(nullptr, rdma::kV2ControlCap, 1));
+  const uint64_t before = rdma::RcEndpoint::PortQueries();
+  for (int i = 0; i < 5; ++i) {
+    rdma::RcEndpoint ep;
+    ASSERT_TRUE(ep.Open(nullptr, rdma::kV2ControlCap, 1));
+    EXPECT_EQ(ep.Local().lid, first.Local().lid);
+    EXPECT_EQ(std::memcmp(ep.Local().gid, first.Local().gid, 16), 0);
+  }
+  // One query, or two if the opens straddle the 1 s reuse bound (slow
+  // builds); without the cache it was one per open.
+  EXPECT_LE(rdma::RcEndpoint::PortQueries() - before, 2u);
+}
+
+// RDS-15: two endpoints register the same pool region at once; the later
+// one's ibv_reg_mr fails (memlock sized for one pin, say) after the first has
+// published its MR. It must take the published MR, not fail the connection.
+TEST(RdmaVerbs, ALosingConcurrentPoolRegistrationTakesTheWinners) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  std::vector<char> region(1 << 20);
+  rdma::RcEndpoint a, b;
+  ASSERT_TRUE(a.Open(nullptr, rdma::kV2ControlCap, 1));
+  ASSERT_TRUE(b.Open(nullptr, rdma::kV2ControlCap, 1));
+  std::mutex mu;
+  std::condition_variable cv;
+  int entered = 0;
+  bool winner_done = false;
+  rdma::RcEndpoint::SetPoolRegistrationSeamForTest([&] {
+    std::unique_lock<std::mutex> lock(mu);
+    const int me = ++entered;
+    cv.notify_all();
+    if (me == 1) {  // the winner: go on once the loser has missed too
+      cv.wait(lock, [&] { return entered >= 2; });
+      return true;
+    }
+    cv.wait(lock, [&] { return winner_done; });  // the loser
+    return false;
+  });
+  struct ClearSeam {
+    ~ClearSeam() { rdma::RcEndpoint::SetPoolRegistrationSeamForTest({}); }
+  } clear_seam;
+  const uint64_t failures = rdma::RcEndpoint::PoolMrRegistrationFailures();
+  bool a_ok = false, b_ok = false;
+  std::thread winner([&] {
+    a_ok = a.AddPoolMr(region.data(), region.size(), true);
+    std::lock_guard<std::mutex> lock(mu);
+    winner_done = true;
+    cv.notify_all();
+  });
+  {  // the winner registers first; only then the loser starts
+    std::unique_lock<std::mutex> lock(mu);
+    cv.wait(lock, [&] { return entered >= 1; });
+  }
+  std::thread loser([&] {
+    b_ok = b.AddPoolMr(region.data(), region.size(), true);
+  });
+  winner.join();
+  loser.join();
+  EXPECT_TRUE(a_ok);
+  EXPECT_TRUE(b_ok) << "the loser failed though the region was registered";
+  EXPECT_EQ(rdma::RcEndpoint::PoolMrRegistrationFailures(), failures);
+  ibv_mr* ma = a.RegisterUser(region.data(), 4096);
+  ibv_mr* mb = b.RegisterUser(region.data(), 4096);
+  ASSERT_NE(ma, nullptr);
+  EXPECT_EQ(ma, mb) << "both endpoints use the one registration";
+}
+
+// Opt-in: what an endpoint costs to open, connect and close, by depth.
+// DFKV_RDMA_SETUP_BENCH=<rounds>.
+TEST(RdmaVerbs, EndpointSetupBench) {
+  const char* requested = std::getenv("DFKV_RDMA_SETUP_BENCH");
+  if (requested == nullptr || *requested == '\0')
+    GTEST_SKIP() << "set DFKV_RDMA_SETUP_BENCH=<rounds> to run";
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const int rounds = std::max(1, std::atoi(requested));
+  rdma::RcEndpoint anchor;
+  ASSERT_TRUE(anchor.Open(nullptr, rdma::kV2ControlCap, 1));
+  const auto median = [](std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    return v[v.size() / 2];
+  };
+  for (const size_t depth : {1u, 4u, 16u, 64u}) {
+    std::vector<double> open_ms, connect_ms, close_ms;
+    for (int round = 0; round < rounds; ++round) {
+      auto t0 = std::chrono::steady_clock::now();
+      auto a = std::make_unique<rdma::RcEndpoint>();
+      a->set_remote_access(true);
+      ASSERT_TRUE(a->Open(nullptr, rdma::kV2ControlCap, depth));
+      auto t1 = std::chrono::steady_clock::now();
+      rdma::RcEndpoint b;
+      ASSERT_TRUE(b.Open(nullptr, rdma::kV2ControlCap, depth));
+      auto t2 = std::chrono::steady_clock::now();
+      ASSERT_TRUE(a->Connect(b.Local()));
+      auto t3 = std::chrono::steady_clock::now();
+      a.reset();
+      auto t4 = std::chrono::steady_clock::now();
+      open_ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+      connect_ms.push_back(std::chrono::duration<double, std::milli>(t3 - t2).count());
+      close_ms.push_back(std::chrono::duration<double, std::milli>(t4 - t3).count());
+    }
+    std::printf("row setup depth=%zu: open %.2f ms, connect %.2f ms, close %.2f ms"
+                " (median of %d)\n", depth, median(open_ms), median(connect_ms),
+                median(close_ms), rounds);
+  }
+}
+
 TEST(RdmaLoopback, PoolMrRegisteredOncePerDeviceNotPerConnection) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   // A distinct region per test run so the counter delta is attributable here.
