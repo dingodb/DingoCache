@@ -452,6 +452,7 @@ bool RdmaTransport::Available() {
       ParseDeviceList(configured ? std::string(configured) : std::string());
   for (const rdma::RdmaDevInfo& device : rdma::RdmaTopology::Discover(filter)) {
     rdma::RcEndpoint probe;
+    probe.set_remote_access(false);
     if (probe.Open(device.name.c_str(), rdma::kV2ControlCap, 1)) return true;
   }
   return false;
@@ -954,6 +955,10 @@ void RdmaTransport::KeepaliveLoop() {
     if (send) last_keepalive_us = now;
     wait_lock.lock();
   }
+}
+
+int RdmaTransport::QpAccessFlags(const Conn* conn) {
+  return conn ? conn->ep.QpAccessFlags() : -1;
 }
 
 void RdmaTransport::RetireIdlePeerRail(const std::string& peer_id,
@@ -1617,7 +1622,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     pooled->reused_from_pool = true;
     pooled->completions_at_reuse = pooled->ep.succeeded_completions();
     result.from_pool = true;
-    if (!pooled->ep.EnsurePoolMrs(pools, true)) {
+    if (!pooled->ep.EnsurePoolMrs(pools, /*remote_write=*/false)) {
       Destroy(pooled, rdma::RailCompletion::kRailFailure);
       result.failure = AcquireFailure::kLocalRail;
       return result;
@@ -1845,6 +1850,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   const int injected_errno = ridx < fail_open_errno_for_test_.size()
                                  ? fail_open_errno_for_test_[ridx]
                                  : 0;
+  conn->ep.set_remote_access(false);  // a client QP is never an RDMA target
   if (injected_errno != 0 ||
       !conn->ep.Open(dev.c_str(), rdma::kV2ControlCap, conn_depth)) {
     ::close(fd);
@@ -1981,7 +1987,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     return result;
   }
   ::close(fd);
-  if (!conn->ep.EnsurePoolMrs(pools, true)) {
+  if (!conn->ep.EnsurePoolMrs(pools, /*remote_write=*/false)) {
     Destroy(conn, rdma::RailCompletion::kRailFailure);
     result.failure = AcquireFailure::kLocalRail;
     return result;
@@ -2156,6 +2162,7 @@ bool RdmaTransport::RegisterMemory(void* base, size_t size) {
     new_anchors.reserve(devs_.size());
     for (const auto& device : devs_) {
       auto endpoint = std::make_unique<rdma::RcEndpoint>();
+      endpoint->set_remote_access(false);
       if (!endpoint->Open(device.empty() ? nullptr : device.c_str(),
                           rdma::kV2ControlCap, 1)) {
         mr_registration_rejections_.fetch_add(1, std::memory_order_relaxed);
@@ -2183,7 +2190,9 @@ bool RdmaTransport::RegisterMemory(void* base, size_t size) {
   const bool registered = rdma::RunPoolMrTransaction(
       rails.size(),
       [&](size_t rail) {
-        return rails[rail]->StagePoolMr(base, size, /*remote_write=*/true,
+        // Local access only: since v2.31 servers never WRITE into client
+        // memory (GET is a client READ of server staging).
+        return rails[rail]->StagePoolMr(base, size, /*remote_write=*/false,
                                         &registrations[rail]);
       },
       [&](size_t rail) { rails[rail]->CommitPoolMr(&registrations[rail]); },
@@ -2206,7 +2215,7 @@ bool RdmaTransport::RegisterMemory(void* base, size_t size) {
       (void)node;
       for (auto it = connections.begin(); it != connections.end();) {
         Conn* connection = *it;
-        if (connection->ep.EnsurePoolMrs(candidate, true)) {
+        if (connection->ep.EnsurePoolMrs(candidate, /*remote_write=*/false)) {
           ++it;
           continue;
         }
@@ -2755,7 +2764,7 @@ void RdmaTransport::Release(const std::string& node, Lane lane, Conn* c,
     std::lock_guard<std::mutex> lk(mu_);
     // Refresh while still active and while pools_ is stable. A refresh failure
     // is local MR evidence and must tear down before returning the lease.
-    refresh_ok = c->ep.EnsurePoolMrs(pools_, true);
+    refresh_ok = c->ep.EnsurePoolMrs(pools_, /*remote_write=*/false);
   }
   if (!refresh_ok) {
     Destroy(c, rdma::RailCompletion::kRailFailure);
@@ -3746,8 +3755,10 @@ bool RdmaTransport::PullWindow(
       const auto& segment = request.segments[state.segment++];
       state.bytes = std::min<size_t>(
           segment.second, request.data_len - state.copied);
-      // Existing transient destination registration includes LOCAL_WRITE.
-      state.mr = ep.RegisterTransient(segment.first, state.bytes);
+      // A READ destination: this side's NIC writes it, no peer does.
+      state.mr = ep.RegisterTransient(
+          segment.first, state.bytes,
+          rdma::RcEndpoint::TransientAccess::kLocalWrite);
       if (!state.mr) {
         NoteLocalRegistrationFailure(conn, state.bytes);
         return false;

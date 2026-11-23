@@ -117,6 +117,11 @@ class RcEndpoint {
   // control buffers.
   bool Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib_port = 1,
             bool direct_io_buffers = false, size_t direct_io_cap = 0);
+  // Whether the peer may RDMA READ/WRITE through this QP (set before Open).
+  // A server endpoint must: clients READ its staging and WRITE its lease
+  // regions. A client endpoint is never the target of one (servers send
+  // only, and no client rkey is ever on the wire), so the client clears it.
+  void set_remote_access(bool allowed) { remote_access_ = allowed; }
 
   QpInfo Local() const { return local_; }              // my QP info (after Open)
   bool Connect(const QpInfo& remote);                  // INIT -> RTR -> RTS
@@ -208,13 +213,21 @@ class RcEndpoint {
   // closed rather than creating a cached MR that could outlive its allocation.
   ibv_mr* RegisterUser(void* addr, size_t len);
   // One-shot MR for API-owned buffers whose lifetime ends or may move after the
-  // current operation. `remote_write=true` is for receive targets; false keeps
-  // const/read-only send sources valid. Registered pool MRs with sufficient
-  // access are reused. The endpoint owns ad-hoc MRs until ReleaseTransient() or
+  // current operation. kRemoteWrite is for targets a peer writes into;
+  // kLocalWrite for this side's RDMA READ destinations; kSendSource keeps
+  // const/read-only send sources valid. `remote_write` true/false means
+  // kRemoteWrite/kSendSource. Registered pool MRs with sufficient access are
+  // reused. The endpoint owns ad-hoc MRs until ReleaseTransient() or
   // Close(); an abandoned READ keeps its destination MR until QP destruction
   // fences DMA, while successful operations release after local completion.
+  enum class TransientAccess { kSendSource, kLocalWrite, kRemoteWrite };
+  ibv_mr* RegisterTransient(void* addr, size_t len, TransientAccess access);
   ibv_mr* RegisterTransient(void* addr, size_t len,
-                            bool remote_write = true);
+                            bool remote_write = true) {
+    return RegisterTransient(addr, len,
+                             remote_write ? TransientAccess::kRemoteWrite
+                                          : TransientAccess::kSendSource);
+  }
   void ReleaseTransient(ibv_mr* mr);
   // Scatter recv: first `hdr_bytes` of the message land in rbuf_[slot]
   // (response wire prefix); the raw payload lands directly in `payload`
@@ -313,6 +326,8 @@ class RcEndpoint {
   void set_busy_poll(bool v) { busy_poll_ = v; }
   void set_num_qp(size_t n) { num_qp_ = n > 0 ? n : 1; }
   size_t num_qp() const { return num_qp_; }
+  // The QP's access flags as the device reports them; -1 if it cannot say.
+  int QpAccessFlags() const;
   // #1: Start a background CQ reaper that polls ibv_poll_cq in a tight
   // loop and fills per-slot atomic flags. Eliminates CQ channel
   // syscall and CQ contention at high thread counts.
@@ -327,6 +342,7 @@ class RcEndpoint {
   ibv_comp_channel* chan_ = nullptr;
   ibv_qp* qp_ = nullptr;
   uint8_t ib_port_ = 1;
+  bool remote_access_ = true;  // see set_remote_access
   int gid_index_ = 0;       // local source GID index (RoCEv2 on Ethernet link layer)
   int numa_node_ = -1;      // NUMA node of the device (for buffer/thread placement)
   int wake_rfd_ = -1, wake_wfd_ = -1;  // self-pipe to interrupt WaitComp on stop

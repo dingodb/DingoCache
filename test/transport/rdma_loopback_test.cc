@@ -255,6 +255,9 @@ class RdmaTransportTestPeer {
     return transport->Acquire(node, RdmaTransport::Lane::kData, options).conn;
   }
 
+  static int QpAccessFlags(const RdmaTransport::Conn* conn) {
+    return RdmaTransport::QpAccessFlags(conn);
+  }
   static void ReleaseData(RdmaTransport* transport, const std::string& node,
                           RdmaTransport::Conn* conn) {
     transport->Release(node, RdmaTransport::Lane::kData, conn);
@@ -9210,4 +9213,115 @@ TEST(RdmaQpRetry, SettingsComeFromTheEnvironment) {
   EXPECT_EQ(settings.timeout, 17);
   EXPECT_EQ(settings.retry_cnt, 7);
   EXPECT_EQ(settings.rnr_retry, 3);
+}
+
+// A client endpoint is never the target of an RDMA READ or WRITE, so its QP
+// grants neither: a peer that tries one (here even into a buffer
+// registered for remote writes) gets a remote access error.
+TEST(RdmaRemoteAccess, AClientQpRefusesRemoteWritesAndReads) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const char* devs = std::getenv("DFKV_RDMA_DEV");
+  const std::string first =
+      devs ? std::string(devs).substr(0, std::string(devs).find(',')) : "";
+  const char* dev = first.empty() ? nullptr : first.c_str();
+  for (const bool allowed : {true, false}) {
+    rdma::RcEndpoint target;
+    rdma::RcEndpoint peer;
+    target.set_remote_access(allowed);
+    ASSERT_TRUE(target.Open(dev, 4096, 1));
+    ASSERT_TRUE(peer.Open(dev, 4096, 1));
+    const rdma::QpInfo ti = target.Local(), pi = peer.Local();
+    ASSERT_TRUE(target.Connect(pi));
+    ASSERT_TRUE(peer.Connect(ti));
+    std::vector<char> region(4096, 'r');
+    ibv_mr* mr = target.RegisterTransient(region.data(), region.size(),
+                                          /*remote_write=*/true);
+    ASSERT_NE(mr, nullptr);
+    std::vector<char> source(64, 'w');
+    ibv_mr* source_mr = peer.RegisterTransient(source.data(), source.size());
+    ASSERT_NE(source_mr, nullptr);
+    ASSERT_TRUE(peer.PostWrite(0, source.data(), source.size(), source_mr,
+                               reinterpret_cast<uint64_t>(region.data()),
+                               mr->rkey));
+    ibv_wc wc{};
+    ASSERT_EQ(peer.WaitComp(&wc, 1, 10000), 1);
+    if (allowed) {
+      EXPECT_EQ(wc.status, IBV_WC_SUCCESS);
+      EXPECT_EQ(region[0], 'w');
+    } else {
+      // Refused: an invalid request (what a QP without the permission
+      // answers on the devices measured) or an access error.
+      EXPECT_TRUE(wc.status == IBV_WC_REM_INV_REQ_ERR ||
+                  wc.status == IBV_WC_REM_ACCESS_ERR)
+          << ibv_wc_status_str(wc.status);
+      EXPECT_EQ(region[0], 'r');
+    }
+    peer.ReleaseTransient(source_mr);
+    target.ReleaseTransient(mr);
+  }
+}
+
+// The same on the connections the transport makes: neither data nor control
+// lanes grant remote access (devices may not report LOCAL_WRITE back).
+TEST(RdmaRemoteAccess, TheTransportsConnectionsGrantNoRemoteAccess) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaNode node("remote_access_conn");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  const std::string value = "v";
+  ASSERT_TRUE(c.Put("remote-access", value.data(), value.size()));
+  for (const bool control : {false, true}) {
+    auto* conn =
+        control ? RdmaTransportTestPeer::AcquireControl(&rt, node.addr)
+                : RdmaTransportTestPeer::AcquireData(&rt, node.addr);
+    ASSERT_NE(conn, nullptr);
+    const int flags = RdmaTransportTestPeer::QpAccessFlags(conn);
+    ASSERT_GE(flags, 0) << "ibv_query_qp failed";
+    EXPECT_EQ(flags & (IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ |
+                       IBV_ACCESS_REMOTE_ATOMIC),
+              0)
+        << (control ? "control" : "data") << " flags=" << flags;
+    if (control)
+      RdmaTransportTestPeer::ReleaseControl(&rt, node.addr, conn);
+    else
+      RdmaTransportTestPeer::ReleaseData(&rt, node.addr, conn);
+  }
+}
+
+// Registered memory is pinned once per rail, for local access only: PUTs
+// from it and GETs (RDMA READs) into it find that registration, on new and
+// pooled connections alike, and register nothing more.
+TEST(RdmaRemoteAccess, RegisteredMemoryIsPinnedOncePerRail) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaNode node("pool_once");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  size_t rails = 0;
+  {
+    const std::string text = rt.MetricsText();
+    const std::string row = "\ndfkv_rdma_client_rail_selections_total{";
+    for (size_t at = text.find(row); at != std::string::npos;
+         at = text.find(row, at + 1))
+      ++rails;
+  }
+  ASSERT_GE(rails, 1u);
+  std::vector<char> pool(1 << 20);
+  const uint64_t regs = rdma::RcEndpoint::PoolMrRegistrations();
+  const uint64_t adhoc = rdma::RcEndpoint::AdhocUserMrTotal();
+  ASSERT_TRUE(c.RegisterMemory(pool.data(), pool.size()));
+  EXPECT_EQ(rdma::RcEndpoint::PoolMrRegistrations() - regs, rails);
+  constexpr size_t kValue = 128 * 1024;  // read back by RDMA READ
+  for (size_t i = 0; i < 4; ++i) {
+    char* slot = pool.data() + i * kValue;
+    std::memset(slot, static_cast<int>('a' + i), kValue);
+    const std::string key = "pool-once-" + std::to_string(i);
+    ASSERT_TRUE(c.Put(key, slot, kValue));
+    char* out = pool.data() + (1 << 19) + i * kValue;
+    ASSERT_TRUE(c.Get(key, out, kValue));
+    EXPECT_EQ(std::memcmp(out, slot, kValue), 0);
+  }
+  EXPECT_EQ(rdma::RcEndpoint::PoolMrRegistrations() - regs, rails)
+      << "a connection registered the pool again";
+  EXPECT_EQ(rdma::RcEndpoint::AdhocUserMrTotal(), adhoc)
+      << "an in-pool buffer took an ad-hoc registration";
 }

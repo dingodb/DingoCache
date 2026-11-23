@@ -235,6 +235,7 @@ class RdmaTransport : public Transport {
   void CompleteRemote(const std::string& peer_id, size_t local_rail,
                       uint64_t generation, RemoteRailOutcome outcome);
   void RetireIdlePeerRail(const std::string& peer_id, size_t local_rail);
+  static int QpAccessFlags(const Conn* conn);  // tests
   void CompleteRemoteLease(Conn* c, RemoteRailOutcome outcome);
   void RecordRailTransfer(Conn* c, bool put, uint64_t operations,
                           uint64_t bytes);
