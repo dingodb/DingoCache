@@ -775,7 +775,24 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
       std::make_unique<std::atomic<uint64_t>[]>(devs_.size());
   rail_wc_errors_ = std::make_unique<std::atomic<uint64_t>[]>(
       devs_.size() * rdma::kWcStatusSlots);
-  if (keepalive_ms_ > 0 || data_pool_max_ > pool_max_)
+  // Watch each rail's port at run time; 0 switches it off.
+  if (const char* value = std::getenv("DFKV_RDMA_PORT_CHECK_MS");
+      value && *value) {
+    errno = 0;
+    char* end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (errno == 0 && end != value && *end == '\0' && parsed >= 0)
+      port_check_ms_ = static_cast<int>(std::min<long>(parsed, 60000));
+  }
+  envparse::ReportUnlessPlain("DFKV_RDMA_PORT_CHECK_MS", 0, 60000,
+                              std::to_string(port_check_ms_));
+  config_dump::RecordResolved("DFKV_RDMA_PORT_CHECK_MS",
+                              std::to_string(port_check_ms_));
+  if (port_check_ms_ > 0) {
+    port_watcher_ = std::make_unique<rdma::PortWatcher>(devs_);
+    port_active_.assign(devs_.size(), 1);
+  }
+  if (keepalive_ms_ > 0 || data_pool_max_ > pool_max_ || port_watcher_)
     keepalive_thread_ = std::thread(&RdmaTransport::KeepaliveLoop, this);
 }
 
@@ -945,12 +962,14 @@ void RdmaTransport::MaintainIdle(uint64_t now_us, bool send_keepalives) {
 void RdmaTransport::KeepaliveLoop() {
   const uint64_t interval_us = static_cast<uint64_t>(keepalive_ms_) * 1000;
   uint64_t last_keepalive_us = rdma::RailPolicy::NowMicros();
-  const int tick_ms = keepalive_ms_ > 0 ? std::min(keepalive_ms_, 1000) : 1000;
+  int tick_ms = keepalive_ms_ > 0 ? std::min(keepalive_ms_, 1000) : 1000;
+  if (port_watcher_) tick_ms = std::min(tick_ms, port_check_ms_);
   std::unique_lock<std::mutex> wait_lock(keepalive_mu_);
   while (!keepalive_cv_.wait_for(
       wait_lock, std::chrono::milliseconds(tick_ms),
       [&] { return keepalive_stop_.load(std::memory_order_relaxed); })) {
     wait_lock.unlock();
+    if (port_watcher_) CheckPorts();
     const uint64_t now = rdma::RailPolicy::NowMicros();
     const bool send = keepalive_ms_ > 0 &&
                       now - last_keepalive_us >= interval_us;
@@ -964,9 +983,41 @@ int RdmaTransport::QpAccessFlags(const Conn* conn) {
   return conn ? conn->ep.QpAccessFlags() : -1;
 }
 
+void RdmaTransport::CheckPorts() {
+  for (size_t rail = 0; rail < devs_.size(); ++rail) {
+    const int state = port_watcher_->State(rail);
+    if (state < 0 || (state == 1) == (port_active_[rail] != 0)) continue;
+    port_active_[rail] = static_cast<uint8_t>(state);
+    topology_->SetDeviceEnabled(rail, state == 1);
+    if (state == 1) {
+      rails_port_down_.fetch_sub(1, std::memory_order_relaxed);
+      DFKV_LOG_INFO("rdma: port ACTIVE again, rail back in selection dev=" +
+                    devs_[rail]);
+    } else {
+      port_down_events_.fetch_add(1, std::memory_order_relaxed);
+      rails_port_down_.fetch_add(1, std::memory_order_relaxed);
+      DFKV_LOG_WARN("rdma: port not ACTIVE, rail out of selection dev=" +
+                    devs_[rail]);
+      RetireIdleRail(rail);
+    }
+  }
+}
+
+void RdmaTransport::RetireIdleRail(size_t local_rail) {
+  RetireIdleIf(
+      [&](const Conn* conn) { return conn->rail_index == local_rail; });
+}
+
 void RdmaTransport::RetireIdlePeerRail(const std::string& peer_id,
                                        size_t local_rail) {
   if (peer_id.empty()) return;
+  RetireIdleIf([&](const Conn* conn) {
+    return conn->health_id == peer_id && conn->rail_index == local_rail;
+  });
+}
+
+void RdmaTransport::RetireIdleIf(
+    const std::function<bool(const Conn*)>& match) {
   std::vector<Conn*> retired;
   {
     std::lock_guard<std::mutex> lock(mu_);
@@ -975,8 +1026,7 @@ void RdmaTransport::RetireIdlePeerRail(const std::string& peer_id,
         auto& connections = map_it->second;
         for (auto it = connections.begin(); it != connections.end();) {
           Conn* conn = *it;
-          if (conn->health_id != peer_id || conn->rail_index != local_rail ||
-              !conn->lifecycle.RequestRetire()) {
+          if (!match(conn) || !conn->lifecycle.RequestRetire()) {
             ++it;
             continue;
           }
@@ -2760,6 +2810,14 @@ std::string RdmaTransport::MetricsText() const {
   s += "# TYPE dfkv_rdma_client_peer_busy_total counter\n";
   s += "dfkv_rdma_client_peer_busy_total " +
        std::to_string(peer_busy_.load(std::memory_order_relaxed)) + "\n";
+  s += "# HELP dfkv_rdma_client_port_down_events_total Local rails taken out of selection because their port left ACTIVE\n";
+  s += "# TYPE dfkv_rdma_client_port_down_events_total counter\n";
+  s += "dfkv_rdma_client_port_down_events_total " +
+       std::to_string(port_down_events_.load(std::memory_order_relaxed)) + "\n";
+  s += "# HELP dfkv_rdma_client_rails_port_down Local rails out of selection now because their port is not ACTIVE\n";
+  s += "# TYPE dfkv_rdma_client_rails_port_down gauge\n";
+  s += "dfkv_rdma_client_rails_port_down " +
+       std::to_string(rails_port_down_.load(std::memory_order_relaxed)) + "\n";
   s += "# HELP dfkv_rdma_client_rail_refusals_total Peer rails charged as failed because the peer closed a bootstrap on them, took one on another rail, and closed a confirming dial on them again (it does not serve that device)\n";
   s += "# TYPE dfkv_rdma_client_rail_refusals_total counter\n";
   s += "dfkv_rdma_client_rail_refusals_total " +
