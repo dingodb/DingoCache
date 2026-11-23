@@ -337,6 +337,10 @@ std::future<std::unique_ptr<RamTier>> KvNodeServer::StartRamTier() {
   o.flush_target_failed = [this](const BlockKey& key) {
     return group_.DiskFailedFor(key);
   };
+  // Flush queues and dirty accounting by disk: a slow disk holds up its own
+  // values only.
+  o.flush_lanes = group_.DiskCount();
+  o.flush_lane = [this](const BlockKey& key) { return group_.DiskIndexOf(key); };
   // A value that will not be written takes its parked RETAIN SET with it.
   o.flush_given_up = [this](const BlockKey& key) {
     ApplyPendingRetain(key, /*flushed=*/false);

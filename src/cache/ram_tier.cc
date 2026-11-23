@@ -398,10 +398,23 @@ RamTier::RamTier(Options opt, FlushFn flush)
                   " shards across " + std::to_string(total_extents) +
                   " extents");
 
-  // Flush workers: distribute round-robin over shards, at least one per shard.
-  const uint32_t nf = std::max<uint32_t>(opt_.flush_threads ? opt_.flush_threads : 1,
-                                         static_cast<uint32_t>(nshards));
+  // Flush workers: distribute round-robin over shards, at least one per shard,
+  // and two with more than one disk (see Options::flush_lane).
+  const size_t lanes = std::max<size_t>(opt_.flush_lanes, 1);
+  uint32_t nf = std::max<uint32_t>(opt_.flush_threads ? opt_.flush_threads : 1,
+                                   static_cast<uint32_t>(nshards));
+  if (lanes > 1)
+    nf = std::max<uint32_t>(nf, static_cast<uint32_t>(2 * nshards));
   config_dump::RecordResolved("DFKV_RAM_FLUSH_THREADS", std::to_string(nf));
+  lane_dirty_ = std::make_unique<std::atomic<uint64_t>[]>(lanes);
+  for (size_t lane = 0; lane < lanes; ++lane) lane_dirty_[lane].store(0);
+  for (size_t i = 0; i < nshards; ++i) {
+    Shard& shard = *shards_[i];
+    const size_t workers = nf / nshards + (i < nf % nshards ? 1 : 0);
+    shard.flushq.resize(lanes);
+    shard.lane_busy.assign(lanes, 0);
+    shard.lane_limit = lanes > 1 && workers > 1 ? workers - 1 : workers;
+  }
   flushers_.reserve(nf);
   for (uint32_t i = 0; i < nf; ++i) {
     Shard& s = *shards_[i % nshards];
@@ -522,7 +535,7 @@ void RamTier::ReclaimTick(Shard& s, size_t /*shard_idx*/) {
   // flusher catches up. The 4096 budget is per shard.
   {
     std::lock_guard<std::mutex> lk(s.mu);
-    if (s.flushq.size() > 4096) return;
+    if (s.queued > 4096) return;
   }
   // -- RECLAIM --
   for (size_t i = 0; i < classes.size(); ++i) {
@@ -770,6 +783,7 @@ RamTier::Admission RamTier::Admit(
   if (out_completion) out_completion->reset();
   if (!arena_ || len == 0 || data == nullptr) return Admission::kBypass;
   uint64_t requested_cap = 0;
+  const uint32_t lane = LaneOf(key);  // outside the shard lock
 
   Shard& s = ShardFor(key);
   std::shared_ptr<PutCompletion> completion;
@@ -816,7 +830,13 @@ RamTier::Admission RamTier::Admit(
     if (client_ack && opt_.ack_high_watermark_pct != 0) {
       const uint64_t high =
           opt_.bytes * std::min<uint32_t>(opt_.ack_high_watermark_pct, 100) / 100;
-      if (dirty_bytes_.load(std::memory_order_relaxed) >= high) {
+      // A disk's values may hold twice its share of the watermark.
+      const size_t lanes = std::max<size_t>(opt_.flush_lanes, 1);
+      const bool lane_full =
+          lanes > 1 &&
+          lane_dirty_[lane].load(std::memory_order_relaxed) >=
+              high / lanes * 2;
+      if (lane_full || dirty_bytes_.load(std::memory_order_relaxed) >= high) {
         // Only a NEW key may be rejected. No completion, allocation or flush
         // ownership has been created, and this is NOT a direct-disk bypass.
         ack_backpressure_.fetch_add(1, std::memory_order_relaxed);
@@ -929,6 +949,7 @@ RamTier::Admission RamTier::Admit(
       e.durable = false;
       e.flush_pin = true;
       e.client_acked = client_ack;
+      e.lane = lane;
       e.dirty_since = std::chrono::steady_clock::now();
       if (client_ack) {
         // Second RAM-ACK writers of this key need not wait any longer.
@@ -939,9 +960,11 @@ RamTier::Admission RamTier::Admit(
         completion->cv.notify_all();
       }
       s.index.emplace(key, std::move(e));
-      s.flushq.push_back(QItem{key, 0});
-      dirty_bytes_.fetch_add(cap, std::memory_order_relaxed);
-      dirty_objects_.fetch_add(1, std::memory_order_relaxed);
+      QItem queued;
+      queued.key = key;
+      queued.lane = lane;
+      Enqueue(s, std::move(queued));
+      AddDirty(lane, cap);
     } else if (!large) {
       s.alloc->Unpin(key, slot_handle);
       s.alloc->Remove(key);
@@ -1387,11 +1410,15 @@ bool RamTier::Remove(const BlockKey& key) {
       Entry& e = it->second;
       e.remove_pending = true;  // visibility fence precedes every wait
       completion = e.completion;
-      for (auto q = s.flushq.begin(); q != s.flushq.end();) {
-        if (q->key == key)
-          q = s.flushq.erase(q);
-        else
-          ++q;
+      for (auto& lane_queue : s.flushq) {
+        for (auto q = lane_queue.begin(); q != lane_queue.end();) {
+          if (q->key == key) {
+            q = lane_queue.erase(q);
+            --s.queued;
+          } else {
+            ++q;
+          }
+        }
       }
       EraseRetry(s, key);
       if (!e.flushing) {
@@ -1414,11 +1441,15 @@ bool RamTier::Remove(const BlockKey& key) {
       Entry& e = it->second;
       if (!e.remove_pending) {
         e.remove_pending = true;
-        for (auto q = s.flushq.begin(); q != s.flushq.end();) {
-          if (q->key == key)
-            q = s.flushq.erase(q);
-          else
-            ++q;
+        for (auto& lane_queue : s.flushq) {
+          for (auto q = lane_queue.begin(); q != lane_queue.end();) {
+            if (q->key == key) {
+              q = lane_queue.erase(q);
+              --s.queued;
+            } else {
+              ++q;
+            }
+          }
         }
         EraseRetry(s, key);
         if (!e.flushing) {
@@ -1458,10 +1489,7 @@ void RamTier::DropLocked(Shard& s, const BlockKey& key) {
   }
   const uint64_t cap = e.cap;
   const bool large = !e.in_arena();
-  if (!e.durable) {
-    dirty_bytes_.fetch_sub(cap, std::memory_order_relaxed);
-    dirty_objects_.fetch_sub(1, std::memory_order_relaxed);
-  }
+  if (!e.durable) SubDirty(e.lane, cap);
   if (!large) s.alloc->Remove(e.key);
   s.index.erase(it);
   if (large)
@@ -1471,10 +1499,15 @@ void RamTier::DropLocked(Shard& s, const BlockKey& key) {
 }
 
 void RamTier::FlushLoop(Shard& s) {
+  const size_t lanes = s.flushq.size();
+  constexpr size_t kNoLane = static_cast<size_t>(-1);
   for (;;) {
-    // Drain up to kFlushBatchMax queued items in one pass (one worker's batch).
+    // Drain up to kFlushBatchMax queued items of one disk in one pass (one
+    // worker's batch), from a disk that has fewer than lane_limit batches in
+    // flight: the next such disk after the one picked last.
     std::vector<QItem> batch;
     std::vector<FlushItem> items;
+    size_t lane = kNoLane;
     {
       std::unique_lock<std::mutex> lk(s.mu);
       for (;;) {
@@ -1486,24 +1519,36 @@ void RamTier::FlushLoop(Shard& s) {
         while (!s.retryq.empty() &&
                (hurry || s.retryq.begin()->first <= now)) {
           s.retry_at.erase(s.retryq.begin()->second.key);
-          s.flushq.push_back(std::move(s.retryq.begin()->second));
+          QItem item = std::move(s.retryq.begin()->second);
           s.retryq.erase(s.retryq.begin());
+          Enqueue(s, std::move(item));
         }
-        if (s.stop || !s.flushq.empty()) break;
-        if (s.retryq.empty()) {
+        if (s.stop && (s.abandon || s.queued == 0)) return;
+        for (size_t k = 0; k < lanes; ++k) {
+          const size_t candidate = (s.next_lane + k) % lanes;
+          if (!s.flushq[candidate].empty() &&
+              s.lane_busy[candidate] < s.lane_limit) {
+            lane = candidate;
+            s.next_lane = (candidate + 1) % lanes;
+            break;
+          }
+        }
+        if (lane != kNoLane) break;
+        if (s.retryq.empty() || s.stop) {
           s.cv.wait(lk);
         } else {
           const auto earliest = s.retryq.begin()->first;
           s.cv.wait_until(lk, earliest);
         }
       }
-      if (s.stop && (s.abandon || s.flushq.empty())) return;
-      const size_t capacity = std::min(s.flushq.size(), kFlushBatchMax);
+      auto& lane_queue = s.flushq[lane];
+      const size_t capacity = std::min(lane_queue.size(), kFlushBatchMax);
       batch.reserve(capacity);
       items.reserve(capacity);
-      while (!s.flushq.empty() && batch.size() < kFlushBatchMax) {
-        QItem queued = std::move(s.flushq.front());
-        s.flushq.pop_front();
+      while (!lane_queue.empty() && batch.size() < kFlushBatchMax) {
+        QItem queued = std::move(lane_queue.front());
+        lane_queue.pop_front();
+        --s.queued;
         auto it = s.index.find(queued.key);
         if (it == s.index.end() || it->second.durable ||
             it->second.remove_pending)
@@ -1517,6 +1562,7 @@ void RamTier::FlushLoop(Shard& s) {
         batch.push_back(std::move(queued));
       }
       s.flush_inflight += batch.size();
+      ++s.lane_busy[lane];
     }
     const size_t B = batch.size();
 
@@ -1573,8 +1619,7 @@ void RamTier::FlushLoop(Shard& s) {
                     .count();
             ack_to_durable_latency_.Observe(seconds);
           }
-          dirty_bytes_.fetch_sub(entry.cap, std::memory_order_relaxed);
-          dirty_objects_.fetch_sub(1, std::memory_order_relaxed);
+          SubDirty(entry.lane, entry.cap);
           if (entry.flush_pin) {
             if (entry.in_arena())
               s.alloc->Unpin(entry.key,
@@ -1683,7 +1728,10 @@ void RamTier::FlushLoop(Shard& s) {
         }
       }
       s.flush_inflight -= B;
+      --s.lane_busy[lane];
     }
+    // A worker may be waiting for this disk to drop below its limit.
+    if (lanes > 1) s.cv.notify_all();
     if (dropped_now) LogDrop(dropped_target_failed);
   }
 }
@@ -1786,9 +1834,34 @@ size_t RamTier::FlushBacklog() const {
   size_t n = 0;
   for (const auto& sh : shards_) {
     std::lock_guard<std::mutex> lk(sh->mu);
-    n += sh->flushq.size() + sh->retryq.size() + sh->flush_inflight;
+    n += sh->queued + sh->retryq.size() + sh->flush_inflight;
   }
   return n;
+}
+
+uint32_t RamTier::LaneOf(const BlockKey& key) const {
+  if (opt_.flush_lanes <= 1 || !opt_.flush_lane) return 0;
+  const size_t lane = opt_.flush_lane(key);
+  // A key no disk takes is written (and refused) like any other: lane 0.
+  return lane < opt_.flush_lanes ? static_cast<uint32_t>(lane) : 0;
+}
+
+void RamTier::Enqueue(Shard& s, QItem item) {
+  const size_t lane = item.lane < s.flushq.size() ? item.lane : 0;
+  s.flushq[lane].push_back(std::move(item));
+  ++s.queued;
+}
+
+void RamTier::AddDirty(uint32_t lane, uint64_t bytes) {
+  dirty_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+  dirty_objects_.fetch_add(1, std::memory_order_relaxed);
+  lane_dirty_[lane].fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void RamTier::SubDirty(uint32_t lane, uint64_t bytes) {
+  dirty_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
+  dirty_objects_.fetch_sub(1, std::memory_order_relaxed);
+  lane_dirty_[lane].fetch_sub(bytes, std::memory_order_relaxed);
 }
 
 uint64_t RamTier::OldestDirtyAgeSeconds() const {

@@ -179,6 +179,14 @@ class RamTier {
     // the arena size, decides when Put backpressure kicks in. The server
     // defaults this to 4x the disk count, capped at 16.
     uint32_t flush_threads = 1;
+    // The disk a key is written to (flush_lane, in [0, flush_lanes)). With
+    // more than one disk a flush batch holds the values of one disk only, a
+    // shard keeps at least two flush workers and a disk is written by all
+    // but one of them at most, so a disk that hangs leaves a worker to the
+    // others; and a disk's values may make up at most twice its share of
+    // the dirty watermark, so the RAM-ACK backpressure it causes is its own.
+    std::function<size_t(const BlockKey&)> flush_lane;
+    size_t flush_lanes = 1;
     // Background free-slot reclaimer cadence (ms; 0 = off). Keeps demand-driven
     // free-slot headroom per class so Put's allocator call stays pop-free-slot;
     // without it a full arena runs the CLOCK eviction sweep inline under the
@@ -542,6 +550,7 @@ class RamTier {
     bool flushing = false;
     bool flush_pin = false;
     bool client_acked = false;
+    uint32_t lane = 0;  // Options::flush_lane
     std::chrono::steady_clock::time_point dirty_since;
     bool remove_pending = false;  // hidden immediately; physical free after pins
     // remove_pending because the disk no longer had the key (a stale written
@@ -568,6 +577,7 @@ class RamTier {
   struct QItem {
     BlockKey key;
     uint32_t tries = 0;
+    uint32_t lane = 0;  // Options::flush_lane
     // Attempts the disk answered kCacheFull, and when the first of them was.
     uint32_t no_room_tries = 0;
     std::chrono::steady_clock::time_point no_room_since{};
@@ -586,7 +596,14 @@ class RamTier {
     mutable std::mutex mu;
     std::unordered_map<BlockKey, Entry, KeyHash> index;
     std::unordered_map<BlockKey, std::shared_ptr<PutCompletion>, KeyHash> writing;
-    std::deque<QItem> flushq;
+    // One queue per disk (Options::flush_lane), the batches in flight for
+    // each, how many a disk may have (lane_limit), and where the next pick
+    // starts. queued: items in all queues.
+    std::vector<std::deque<QItem>> flushq;
+    std::vector<size_t> lane_busy;
+    size_t lane_limit = 0;
+    size_t next_lane = 0;
+    size_t queued = 0;
     // Items whose flush failed and that wait for their next attempt, by the
     // time it is due; still resident, dirty and flush-pinned. With a disk
     // that refuses writes this holds every dirty object of that disk, so the
@@ -716,6 +733,12 @@ class RamTier {
   std::atomic<uint64_t> hits_{0}, misses_{0}, puts_{0}, put_bypass_{0}, promotes_{0};
   std::atomic<uint64_t> flushed_{0}, flush_dropped_{0}, reclaimed_{0}, rebalanced_{0};
   std::atomic<uint64_t> dirty_bytes_{0}, dirty_objects_{0};
+  // Dirty bytes by disk (Options::flush_lane); one entry per lane.
+  std::unique_ptr<std::atomic<uint64_t>[]> lane_dirty_;
+  uint32_t LaneOf(const BlockKey& key) const;
+  void Enqueue(Shard& s, QItem item);
+  void AddDirty(uint32_t lane, uint64_t bytes);
+  void SubDirty(uint32_t lane, uint64_t bytes);
   std::atomic<uint64_t> ram_acks_{0}, ack_backpressure_{0};
   // PUTs parked in AwaitPut, so CancelPutWaits can wake exactly them. Lock
   // order: put_wait_mu_ before a completion's mutex.
