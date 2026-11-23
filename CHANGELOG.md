@@ -35,9 +35,12 @@
 - vLLM connector, small fixes. The client took its TP rank from the
   environment (`DFKV_TP_RANK` / `LOCAL_RANK` / `RANK`, none of which vLLM
   sets): every rank labelled its metrics rank 0 and wrote the same
-  access-log file; the worker now passes its TP rank. The retention SET of a
+  access-log file; the worker now passes its TP rank, so metrics carry the
+  real rank and each rank writes its own `<path>.r<rank>` access log (a
+  collector that tails only `.r0` now sees rank 0 only). The retention SET of a
   SAVE is timed from its start (`save_retain_set` durations were always 0).
-  `lookup_async` is parsed as a boolean (the string "false" turned it on).
+  `lookup_async` is parsed as a boolean (the string "false" turned it on;
+  it now really keeps lookups synchronous).
   The hot-config watcher (all three copies) kept its stop event in
   `threading.Thread._stop`, which Python up to 3.12 calls from `join()`;
   it is renamed. Corrected docs: `require_rdma=false` does allow the TCP
