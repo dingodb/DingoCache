@@ -164,9 +164,10 @@ class _Store:
 class DeviceDirectHostGet(unittest.TestCase):
     """batch_get_v1 while primary KV is stored device-direct.
 
-    It cannot load device-direct objects into a host buffer, so it loads
-    nothing and answers for presence. It used to answer "retrieved" for every
-    page, whether or not the page was in the store.
+    It cannot load device-direct objects into a host buffer, so every page
+    is a miss and the buffer is left as it was. It used to answer
+    "retrieved" for every page, then "present" for stored pages; either way
+    a caller reading the host buffer next would take whatever it held as KV.
     """
 
     def _device_direct(self, **attrs):
@@ -174,26 +175,32 @@ class DeviceDirectHostGet(unittest.TestCase):
                      **attrs)
         return st, _Store(st)
 
-    def test_page_missing_from_the_store_is_not_reported_retrieved(self):
+    def test_stored_pages_are_a_miss_and_nothing_is_loaded(self):
         st, store = self._device_direct()
         store.present.update(st._stored_keys("kv", "present"))
-        self.assertEqual(
-            st.batch_get_v1(["present", "missing"], [0, 1]), [True, False])
+        with self.assertLogs(dfkv_hicache._log, "WARNING"):
+            self.assertEqual(
+                st.batch_get_v1(["present", "missing"], [0, 1]),
+                [False, False])
         self.assertEqual(st._lib.gets, 0, "nothing is read into the host pool")
+        self.assertEqual(store.probes, [], "no presence probe either")
+
+    def test_warned_once(self):
+        st, _store = self._device_direct()
+        with self.assertLogs(dfkv_hicache._log, "WARNING") as logs:
+            st.batch_get_v1(["a"], [0])
+            st.batch_get_v1(["b"], [0])
+        self.assertEqual(len(logs.output), 1)
 
     def test_every_stored_group_of_a_page_must_exist(self):
+        # The device form's presence is what batch_exists reports.
         st, store = self._device_direct(_sg_chunks={"kv": 2})
         groups = st._stored_keys("kv", "page")
         self.assertEqual(len(groups), 2)
         store.present.add(groups[0])
-        self.assertEqual(st.batch_get_v1(["page"], [0]), [False])
+        self.assertEqual(st.batch_exists(["page"]), 0)
         store.present.add(groups[1])
-        self.assertEqual(st.batch_get_v1(["page"], [0]), [True])
-
-    def test_probe_failure_is_a_miss(self):
-        st, store = self._device_direct()
-        st._batch_exist_flat = lambda subkeys: [False] * len(subkeys)
-        self.assertEqual(st.batch_get_v1(["a", "b"], [0, 1]), [False, False])
+        self.assertEqual(st.batch_exists(["page"]), 1)
 
     def test_empty_request(self):
         st, _store = self._device_direct()
@@ -216,10 +223,8 @@ class DeviceDirectGroupsBeforeTheFirstTransfer(unittest.TestCase):
         self.assertEqual(len(groups), 2, "6 layers in groups of 4")
         store.present.add(groups[0])
         self.assertEqual(st.batch_exists(["page"]), 0)
-        self.assertEqual(st.batch_get_v1(["page"], [0]), [False])
         store.present.add(groups[1])
         self.assertEqual(st.batch_exists(["page"]), 1)
-        self.assertEqual(st.batch_get_v1(["page"], [0]), [True])
         self.assertEqual(store.probes[-1], groups)
 
     def test_unknown_count_keeps_group_zero(self):
@@ -475,9 +480,9 @@ class DeviceDirectState(unittest.TestCase):
         groups = st._stored_keys("kv", "page")
         self.assertEqual(len(groups), 2, "6 layers in groups of 4")
         store.present.add(groups[0])
-        self.assertEqual(st.batch_get_v1(["page"], [0]), [False])
+        self.assertEqual(st.batch_exists(["page"]), 0)
         store.present.add(groups[1])
-        self.assertEqual(st.batch_get_v1(["page"], [0]), [True])
+        self.assertEqual(st.batch_exists(["page"]), 1)
 
     def test_no_device_form_without_a_pool_or_after_failed_registration(self):
         self.assertFalse(
