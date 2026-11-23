@@ -121,9 +121,11 @@ TEST(ConnectionPool, DeviceDestinationsUseStagedPublication) {
                 DestinationMemoryKind::kDevice}},
       &value_lengths);
   ASSERT_EQ(device_status.size(), 1u);
-  EXPECT_EQ(device_status[0], Status::kIOError);
+  // A destination this process cannot publish to is its own failure, not
+  // the node's (kIOError would cool the node).
+  EXPECT_EQ(device_status[0], Status::kInvalid);
   ASSERT_EQ(value_lengths.size(), 1u);
-  EXPECT_EQ(value_lengths[0], value.size());
+  EXPECT_EQ(value_lengths[0], 0u);  // no length next to a local kInvalid
   EXPECT_EQ(device_destination, std::string(value.size(), '!'));
 
   std::string host_segment(3, '!');
@@ -137,9 +139,9 @@ TEST(ConnectionPool, DeviceDestinationsUseStagedPublication) {
   const auto mixed_status =
       t.RangeIntoMulti(n->addr, {key}, {mixed_destination}, &out_lengths);
   ASSERT_EQ(mixed_status.size(), 1u);
-  EXPECT_EQ(mixed_status[0], Status::kIOError);
+  EXPECT_EQ(mixed_status[0], Status::kInvalid);
   ASSERT_EQ(out_lengths.size(), 1u);
-  EXPECT_EQ(out_lengths[0], value.size());
+  EXPECT_EQ(out_lengths[0], 0u);
   EXPECT_EQ(host_segment, value.substr(0, host_segment.size()));
   EXPECT_EQ(device_segment, std::string(device_segment.size(), '!'));
 

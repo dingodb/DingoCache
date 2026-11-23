@@ -359,15 +359,24 @@ class Transport {
       if (value_lens) (*value_lens)[i] = stored;
       if (dsts[i].exact && stored != dsts[i].n) continue;
       const size_t n = std::min(raw_values[i].size(), dsts[i].n);
+      // A copy into the destination that fails here is this process's
+      // failure, not the node's: kInvalid, which says nothing about the
+      // peer (kIOError would cool a node that answered).
+      // No length goes with it: a length next to kInvalid is a stored value
+      // larger than the destination (see value_lens above).
       if (n && !publisher.Copy(dsts[i].payload, raw_values[i].data(), n,
-                               dsts[i].memory_kind))
-        r[i] = Status::kIOError;
+                               dsts[i].memory_kind)) {
+        r[i] = Status::kInvalid;
+        if (value_lens) (*value_lens)[i] = 0;
+      }
     }
     if (!publisher.Finish()) {
       for (size_t i = 0; i < dsts.size(); ++i)
         if (r[i] == Status::kOk &&
-            dsts[i].memory_kind == DestinationMemoryKind::kDevice)
-          r[i] = Status::kIOError;
+            dsts[i].memory_kind == DestinationMemoryKind::kDevice) {
+          r[i] = Status::kInvalid;
+          if (value_lens) (*value_lens)[i] = 0;
+        }
     }
     return r;
   }
@@ -497,8 +506,10 @@ class Transport {
         const size_t copy = std::min(p.second, remaining);
         if (copy &&
             !publisher.Copy(p.first, scratch[i].data() + off, copy,
-                            p.memory_kind))
-          result[i] = Status::kIOError;
+                            p.memory_kind)) {
+          result[i] = Status::kInvalid;  // local, as in RangeInto
+          if (out_lens) (*out_lens)[i] = 0;
+        }
         off += copy;
         remaining -= copy;
       }
@@ -510,8 +521,10 @@ class Transport {
             [](const RangeDstSegment& segment) {
               return segment.memory_kind == DestinationMemoryKind::kDevice;
             });
-        if (has_device && result[i] == Status::kOk)
-          result[i] = Status::kIOError;
+        if (has_device && result[i] == Status::kOk) {
+          result[i] = Status::kInvalid;
+          if (out_lens) (*out_lens)[i] = 0;
+        }
       }
     }
     return result;

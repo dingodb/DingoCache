@@ -3,6 +3,7 @@
 // shards like the scatter-gather PUT, and a local CUDA publication failure
 // that says nothing about the node.
 #include "client/kv_client.h"
+#include "client/peer_health.h"
 #include "transport/transport.h"
 
 #include <gtest/gtest.h>
@@ -85,4 +86,20 @@ TEST(ClientBatchPut, OneNodesKeysGoOutInShards) {
   for (size_t n : t.call_sizes) total += n;
   EXPECT_EQ(total, 256u);
   EXPECT_GT(t.call_sizes.size(), 1u);
+}
+
+TEST(ClientDevicePublish, ALocalPublicationFailureSaysNothingAboutThePeer) {
+  // The node answered; the bytes could not be copied to the (device)
+  // destination here. Before, that was kIOError and cooled the node.
+  PutTransport t;
+  char dst[4] = {'?', '?', '?', '?'};
+  std::vector<uint64_t> lens;
+  const auto st = t.RangeInto(
+      "node:1", {BlockKey{1, 2}},
+      {RangeDst{dst, sizeof(dst), DestinationMemoryKind::kDevice}}, &lens);
+  ASSERT_EQ(st.size(), 1u);
+  EXPECT_NE(st[0], Status::kOk);  // host memory is no device destination
+  PeerOutcome outcome;
+  outcome.Add(st[0]);
+  EXPECT_FALSE(outcome.failed) << "status " << static_cast<int>(st[0]);
 }
