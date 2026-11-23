@@ -76,7 +76,7 @@ TEST(LogStoreSealing, AKillLeavesOnlyTheUnsealedSegmentsToWalk) {
                 const std::string v = Val(id, kLen);
                 if (s.Cache(Key(id), v.data(), v.size()) != Status::kOk) return 3;
               }
-              ::_exit(0);  // killed: no Close
+              Kill(0);  // killed: no Close
             }),
             0);
   {
@@ -95,7 +95,7 @@ TEST(LogStoreSealing, AKillLeavesOnlyTheUnsealedSegmentsToWalk) {
   ASSERT_EQ(InChild([&]() -> int {
               bool ok = false;
               LogStore s(Opts(dir, 64ull << 20), &ok);
-              ::_exit(ok ? 0 : 2);
+              Kill(ok ? 0 : 2);
             }),
             0);
   bool ok = false;
@@ -222,7 +222,7 @@ TEST(LogStoreJournal, ASecondRemoveWaitsForTheFirstsKill) {
                 once = true;
                 // The first REMOVE has enqueued its kill and not waited yet.
                 const Status st = store->Remove(Key(1));
-                ::_exit(st == Status::kNotFound ? 0 : 5);
+                Kill(st == Status::kNotFound ? 0 : 5);
               };
               bool ok = false;
               LogStore s(o, &ok);

@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -38,6 +39,14 @@ namespace fs = std::filesystem;
 using namespace dfkv;  // NOLINT
 
 namespace {
+
+// Ends a child at once, as a kill does: `_exit` is intercepted by
+// ThreadSanitizer, which then reports the store's threads (never joined by
+// a killed process) as leaked and exits with code 66 instead.
+[[noreturn]] void Kill(int code) {
+  ::syscall(SYS_exit_group, code);
+  __builtin_unreachable();
+}
 
 fs::path TestDir(const std::string& tag) {
   const fs::path p =
@@ -314,14 +323,14 @@ TEST(LogStore, AKilledProcessLosesNothingItAcknowledged) {
   if (child == 0) {
     bool ok = false;
     LogStore s(Opts(dir), &ok);
-    if (!ok) ::_exit(2);
+    if (!ok) Kill(2);
     for (uint64_t id = 0; id < 25; ++id) {
       const std::string v = Value(id, 0);
-      if (s.Cache(Key(id), v.data(), v.size()) != Status::kOk) ::_exit(3);
+      if (s.Cache(Key(id), v.data(), v.size()) != Status::kOk) Kill(3);
     }
-    if (s.Remove(Key(3)) != Status::kOk) ::_exit(4);
-    if (s.Remove(Key(7)) != Status::kOk) ::_exit(4);
-    ::_exit(0);  // no Close, no destructors: a kill
+    if (s.Remove(Key(3)) != Status::kOk) Kill(4);
+    if (s.Remove(Key(7)) != Status::kOk) Kill(4);
+    Kill(0);  // no Close, no destructors: a kill
   }
   int status = 0;
   ASSERT_EQ(::waitpid(child, &status, 0), child);
@@ -344,7 +353,7 @@ TEST(LogStore, AKilledProcessLosesNothingItAcknowledged) {
   fs::remove_all(dir);
 }
 
-// Crash points by name: the child _exits there, the parent reopens.
+// Crash points by name: the child is killed there, the parent reopens.
 TEST(LogStore, CrashPointsDuringInitPutAndRemove) {
   struct Case {
     const char* point;
@@ -370,16 +379,16 @@ TEST(LogStore, CrashPointsDuringInitPutAndRemove) {
       int seen = 0;
       auto o = Opts(dir);
       o.crash_hook = [&](const char* point) {
-        if (std::strcmp(point, c.point) == 0 && ++seen == c.nth) ::_exit(0);
+        if (std::strcmp(point, c.point) == 0 && ++seen == c.nth) Kill(0);
       };
       bool ok = false;
       LogStore s(o, &ok);
-      if (!ok) ::_exit(2);
+      if (!ok) Kill(2);
       const std::string v0 = Value(0, 0), v1 = Value(1, 0);
-      if (s.Cache(Key(0), v0.data(), v0.size()) != Status::kOk) ::_exit(3);
-      if (s.Cache(Key(1), v1.data(), v1.size()) != Status::kOk) ::_exit(3);
+      if (s.Cache(Key(0), v0.data(), v0.size()) != Status::kOk) Kill(3);
+      if (s.Cache(Key(1), v1.data(), v1.size()) != Status::kOk) Kill(3);
       s.Remove(Key(0));
-      ::_exit(9);  // the point was not reached
+      Kill(9);  // the point was not reached
     }
     int status = 0;
     ASSERT_EQ(::waitpid(child, &status, 0), child);
@@ -502,13 +511,13 @@ TEST(LogStore, ADamagedPayloadIsAMissAtRecoveryAndAtReadTime) {
     if (child == 0) {
       bool ok = false;
       LogStore s(Opts(dir), &ok);
-      if (!ok) ::_exit(2);
+      if (!ok) Kill(2);
       const std::string w = Value(8, 0);
       if (s.Cache(Key(6), v.data(), v.size()) != Status::kOk ||
           s.Cache(Key(8), w.data(), w.size()) != Status::kOk)
-        ::_exit(3);
-      if (clean && !s.Close()) ::_exit(4);
-      ::_exit(0);
+        Kill(3);
+      if (clean && !s.Close()) Kill(4);
+      Kill(0);
     }
     int status = 0;
     ASSERT_EQ(::waitpid(child, &status, 0), child);
@@ -1384,8 +1393,8 @@ TEST(LogStore, AReadThatFailsItsCheckLeavesAShadowThatIsKilled) {
     if (child == 0) {
       bool ok = false;
       LogStore s(Opts(dir), &ok);
-      if (!ok) ::_exit(2);
-      if (s.Cache(Key(6), v.data(), v.size()) != Status::kOk) ::_exit(3);
+      if (!ok) Kill(2);
+      if (s.Cache(Key(6), v.data(), v.size()) != Status::kOk) Kill(3);
       // Damage the payload under the running store, read, then repair it:
       // the record on disk is whole again.
       const fs::path seg = dir / "segments" / "G000000";
@@ -1398,18 +1407,18 @@ TEST(LogStore, AReadThatFailsItsCheckLeavesAShadowThatIsKilled) {
         f.put(static_cast<char>(c ^ 0x20));
       }
       std::string out;
-      if (s.Range(Key(6), 0, 0, &out) != Status::kNotFound) ::_exit(4);
+      if (s.Range(Key(6), 0, 0, &out) != Status::kNotFound) Kill(4);
       {
         std::fstream f(seg, std::ios::in | std::ios::out | std::ios::binary);
         f.seekp(8192 + 10);
         f.put(c);
       }
       if (by_put) {
-        if (s.Cache(Key(6), w.data(), w.size()) != Status::kOk) ::_exit(5);
+        if (s.Cache(Key(6), w.data(), w.size()) != Status::kOk) Kill(5);
       } else if (s.Remove(Key(6)) != Status::kNotFound) {
-        ::_exit(5);
+        Kill(5);
       }
-      ::_exit(0);  // killed
+      Kill(0);  // killed
     }
     int status = 0;
     ASSERT_EQ(::waitpid(child, &status, 0), child);

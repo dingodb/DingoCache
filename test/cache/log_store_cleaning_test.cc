@@ -358,8 +358,8 @@ TEST(LogStoreCleaner, ARemoveDuringARelocationKillsBothCopies) {
         if (std::strcmp(p, "relocate.after_copy") != 0 || done.exchange(true))
           return;
         // On the cleaner's thread, between the copy and the index switch.
-        if (store->Remove(Key(5000)) != Status::kOk) ::_exit(6);
-        if (kill) ::_exit(0);
+        if (store->Remove(Key(5000)) != Status::kOk) Kill(6);
+        if (kill) Kill(0);
       };
       bool ok = false;
       LogStore s(o, &ok);
