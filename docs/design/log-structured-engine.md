@@ -712,6 +712,171 @@ REMOVE waits on the request dispatch thread today
 other requests that thread serves, is a measured item (§13); whether a batch
 REMOVE is needed is decided from that measurement (§15).
 
+### 6.7 Segment headers outside the store mutex
+
+A segment gets a new header (a new incarnation) when a client or the cleaner
+opens it (§6.1 step 5, §7.4) and when it is reclaimed (§7.5 step 3, §7.7).
+The header is a `RWF_DSYNC` block write, about 1 ms on the development NVMe
+(2 ms for a reclaim, which also writes an empty trailer). Stages 2–7 write it
+while holding the store mutex. In a steady 1 MiB workload with 8 writers that
+is about 60 holds of 1–2 ms a second, and every PUT that finishes its own
+write meanwhile waits for the mutex. The measured PUT p99 is 4.5 ms; with
+those PUTs left out it is 2.4 ms, the same as slab. The device writes are
+equally fast with or without an overlapping header write: the wait is for
+the mutex, not for the device (ledger STO-33).
+
+So the header write moves out of the mutex. The on-disk order of every write
+stays as it is; only which steps run under the mutex changes. In addition,
+one client segment is opened ahead of time, so that a PUT that fills its
+segment normally switches to one whose header is already durable.
+
+#### 6.7.1 What the mutex protects today, and what the new order keeps
+
+`FreshHeader` does five things. Each keeps its guarantee as follows.
+
+| Step | Assumes today | New order |
+|---|---|---|
+| Incarnation counter: `next_incarnation_++`, and when it reaches the reserved bound, a higher bound in the superblock (§4.2) | the mutex serializes the counter and the superblock writes (their sequence number alternates the two copies) | **Claim**, under the mutex: take the incarnation, and write the superblock there if the bound is reached (once per 1024 incarnations, so rare holds remain). Incarnations become durable in completion order, not in claim order; recovery needs only that they are unique and below the durable bound (C21, C33), which claiming under the mutex keeps |
+| The header (and, for a reclaim, the empty trailer) with `RWF_DSYNC` | nothing: it is I/O | **Write**, without the mutex, by the thread that claimed the segment. Only that thread touches the segment's file meanwhile (see the states below) |
+| The segment's in-memory state: incarnation, `header_valid`, append offset, record count, summary, `last_lsn` (which sets the seal order and so the FIFO order), the list of segments holding unsynced copies taken from it (§7.5 step 2), `unsynced`, `dirty` and `protected_bytes` | readers under the mutex see either the old or the new incarnation, never a mix | **Publish**, under the mutex again, after the write returned: every one of these fields at once, to the values a fresh incarnation has (no records, nothing to sync, nothing protected). Until then the in-memory state is the old incarnation's |
+| `live_kills_.erase(segment)`: the kills naming the old incarnation become garbage for journal compaction (§4.5) | the erase follows the durable write | Done at publish, so still only after the header is durable. A compaction that snapshots `live_kills_` during the write keeps those kills (harmless garbage, dropped by the next compaction). A kill enqueued during the write for the old incarnation (a REMOVE of one of its shadows) is garbage too, as it is today in the window between the header write and `FinishReclaimLocked` |
+| Kills for the new incarnation | none can exist before its first record | unchanged: a segment takes records only after publish (C25) |
+
+Two other mutex-held writes of the superblock stay under the mutex and are not
+changed: the LSN reservation (§4.2, once per 2^20 LSNs) and capacity changes,
+which happen only before `Activate`.
+
+#### 6.7.2 Segment states during the write
+
+A segment whose header is being written is in no list a client or the cleaner
+takes work from:
+
+- **Opening** (new state): a client or relocation segment taken from the free
+  list. It is out of the free list, not open, not in the FIFO. Nothing points
+  into it, so it has no pins, no readers and no shadows of the new incarnation.
+  An opening client segment counts towards the *K* open client segments, so
+  that waiting PUTs do not open more than *K*.
+- **Reclaiming** (existing flag): the victim stays sealed and in the FIFO
+  until `FinishReclaimLocked`, as today; the cleaner, inline reclaim, the
+  sealer and `MaybeFreeLocked` all skip a reclaiming segment. Its index
+  entries were all relocated or evicted and its pins drained before the claim
+  (§7.5 step 1), and nothing new can point into it, so nothing reads it
+  during the write. Its shadows are dropped only after publish
+  (`FinishReclaimLocked`, unchanged).
+
+`Close` waits for every opening and reclaim in progress to publish before it
+seals (it already waits for flights, relocations and writers; an opening is
+always on behalf of one of them or of the sealer, see 6.7.4).
+
+#### 6.7.3 A PUT that needs the new segment
+
+**Opening slots.** The *K* client segments are open, opening, or free slots.
+A slot is taken at the claim, under the mutex, and released at publish or on
+any exit without publish (a failed write, or an inline reclaim that finds no
+victim), always with `notify_all` on the state condition variable, so no
+waiter can be left behind by a slot that is never released. An inline
+reclaim done for a client (§7.7) takes a slot too: otherwise several PUTs
+could reclaim several victims at once and evict more than they need. The
+relocation segment's opening (§7.4) is separate from the *K* client slots and
+is done by the cleaner for itself.
+
+In `ReserveLocked` (§6.1 step 5), a PUT whose record fits no open segment:
+
+1. hands the fullest open segment to the sealer, as today;
+2. takes the pre-opened segment if there is one (6.7.4): no I/O, it becomes
+   open at once;
+3. otherwise, if a client slot is free, takes it and claims a free segment (or
+   reclaims one inline, §7.7), releases the mutex for the write, and publishes
+   it as open;
+4. otherwise (another PUT's opening is in progress) waits on the state
+   condition variable until a segment is published, the store fails, or
+   `Close` stops it, and then starts over at step 1.
+
+The PUT keeps its flight registered while it waits, as it does today while it
+waits for the sealer queue, so joiners and REMOVEs see it (§6.1). It holds no
+slot, writer count or pin while it waits: it has placed nothing.
+
+The opener publishes the segment whatever happens to its own PUT meanwhile.
+If a REMOVE cancels that PUT during the header write, the segment is still
+published as open (the waiters need it), and the PUT then returns `kOk`
+without writing, as a PUT cancelled while it waited for space does today.
+
+The grace wait after the cleaner is armed (a PUT that finds nothing to
+reclaim, §7.1) holds no slot either. It wakes, besides the cleaner freeing a
+segment, when a segment is published as open or a pre-opened segment becomes
+available. It places
+its record only in a published segment, whose header is durable: a record is
+never written before its segment's header (C25). The wait is one header write,
+about 1 ms, and only PUTs that need a new segment wait; PUTs finishing their
+writes, reads and REMOVEs do not. The waits are counted with the other
+write-path waits (`dfkv_lse_segment_open_waits_total` and its microseconds).
+
+A failed header write fails the store (C19), as today; waiters wake on the
+failure and return `kIOError`.
+
+#### 6.7.4 The pre-opened client segment
+
+The store keeps at most one client segment ready: claimed from the free list,
+its header durable, no records. It is prepared by the **sealer thread**, which
+already does I/O off the PUT path: after each segment it seals, and when a PUT
+takes the pre-opened segment and signals it, the sealer claims a free segment
+(only while more than *C* free segments remain, the client rule of §6.1 step
+5), writes its header without the mutex, and publishes it as pre-opened. The
+cleaner's free target (§7.1, *K* + *C* free) counts an existing pre-opened
+segment as one of the *K* held back for client openings, so the cleaner does
+not keep one more segment free because of it, and the pre-opened segment costs
+no capacity beyond today's reserves (`kHeldBack`, and so the retention budget,
+are unchanged). Relocation still takes from the cleaner's reserve as before.
+
+A crash with a pre-opened segment, unused:
+
+- **On disk:** a durable header of a new incarnation, no records, and no
+  trailer of that incarnation (the trailer area holds the previous
+  incarnation's, which does not match).
+- **At the next open:** the segment is walked (§8.3), finds no record, and is
+  classed free (no live entries, no shadows). Its incarnation is never reused
+  (it is below the durable reservation). No data is involved.
+- **Cost:** one more segment walked after an unclean exit: at most *K* + 5
+  segments per disk instead of *K* + 4 (§8.4). Walking an empty segment reads
+  it to the end looking for records past holes, so up to one segment of reads.
+
+At `Close`, the pre-opened segment gets an empty trailer of its incarnation
+(`RWF_DSYNC`), as a reclaimed segment does, so that a clean close still leaves
+nothing to walk (§8.5). A failed store skips it (nothing more is written
+after a failure), and the next open walks the segment as after a crash.
+
+#### 6.7.5 Crash points of the unlocked window
+
+The on-disk sequence of every operation is the same as before, so C11, C12,
+C21, C25 and C30 still describe the reclaims, and C3 the opening of a segment.
+The new windows are those between a write and its publish, listed in §8.2 as
+C37–C40 (with C39a and C39b for the pre-opened segment). In each, recovery
+sees exactly what it would see after a crash just
+before or just after the same write in stages 2–7, because publish changes
+nothing on disk.
+
+#### 6.7.6 Tests
+
+- Crash points (kill, and power-loss images) at each new hook:
+  `open.before_header`, `open.after_header` (written, not published),
+  `preopen.before_header`, `preopen.after_header`, `close.preopen_trailer`,
+  and the existing `reclaim.before_header` / `reclaim.after_header`, now also
+  with a REMOVE and a compaction running in the window. The power-loss image
+  workloads add a prefix right after `preopen.after_header`.
+- Slots: a REMOVE cancelling the opener's own PUT during the header write
+  (the segment is still published and the waiters proceed); an inline reclaim
+  that finds no victim releases its slot; the grace wait wakes on a publish.
+- A PUT that finishes its write while another thread's header write is held by
+  a hook completes without waiting for it; a PUT that needs the new segment
+  waits, and its record is written after the header (checked in the recorded
+  I/O).
+- Clean close with a pre-opened segment: the next open walks nothing. Kill
+  with one: one more segment walked, recovered as free, nothing lost.
+- The concurrent crash-image workloads, with several writers opening
+  segments, unchanged in their invariants.
+- The steady-state measurement of §13 at 1 MiB with 8 writers: the PUT p99
+  against slab's, and the new open-wait counter.
+
 ---
 
 ## 7. Eviction and segment cleaning
@@ -1011,6 +1176,12 @@ among themselves; nothing is ordered across files).
 | C34 | REMOVE while a PUT's shadow kill (or another REMOVE's kill) of the same key is pending | the later REMOVE waits for every kill enqueued before it (§4.5) and so returns only after the pending kill is durable | same |
 | C35 | reset to empty | interrupted at any of its steps | `reset_in_progress` is set from step 1 to step 4: the next open treats the store as empty and repeats the reset | same |
 | C36 | journal resume | two crashes in a row with torn tails | `Activate` truncates the journal to its stopping offset before appending: no stale block survives beyond the tail, no false reset | same |
+| C37 | segment opening (§6.7) | incarnation claimed, header not yet written | the segment still holds its previous header: classed free at open (nothing live); the claimed incarnation is never used | same |
+| C38 | segment opening | header durable, not published (no record placed) | walked, no record: classed free; the incarnation is below the durable bound and not reused | same; header torn: as C21 |
+| C39 | pre-opened segment (§6.7.4) | header durable, unused, at a crash | as C38; one more segment walked | same |
+| C39a | pre-opened segment | claimed by the sealer, header not yet written | as C37 | same |
+| C39b | `Close` | writing the pre-opened segment's empty trailer | the trailer missing or of the old incarnation: walked, no record, classed free | same; trailer torn: rejected, walked, classed free |
+| C40 | reclaim or inline reclaim (§6.7) | header (and empty trailer) durable, not published, shadows and kills not dropped | as C12: old records rejected by incarnation, stale kills ignored | as C12; trailer torn or lost: walked, classed free |
 
 ### 8.3 Recovery procedure
 
@@ -1107,16 +1278,18 @@ A walk reads every header block and every payload of the segments it walks,
 to check their CRCs. After a clean `Close` nothing is walked (§8.5). After an
 unclean exit, the segments without a valid trailer are walked: the *K* open
 client segments, the relocation segment, at most the sealer queue's 2 segments
-in the middle of sealing, and one segment per opening in progress. That is at
-most *K* + 4 segments per disk, (*K* + 4) × 1 GiB of sequential reads at full
+in the middle of sealing, one segment per opening in progress, and the
+pre-opened client segment (§6.7.4). That is at
+most *K* + 5 segments per disk, (*K* + 5) × 1 GiB of sequential reads at full
 size, a few seconds per disk on current NVMe (to be measured, §13). All other
 segments contribute their summary only.
 
 ### 8.5 Clean close
 
 `Close()` (the server's shutdown and the destructor): stop the cleaner, wait
-for in-flight writes, seal every open segment (§6.3), let the journal writer
-finish, then write the superblock with `clean = 1`. The next open finds only
+for in-flight writes and header writes (§6.7.2), seal every open segment
+(§6.3), give the pre-opened segment an empty trailer (§6.7.4), let the journal
+writer finish, then write the superblock with `clean = 1`. The next open finds only
 sealed segments and loads their summaries.
 
 The clean flag is only an expectation: whatever it says, the open walks every
@@ -1439,7 +1612,7 @@ synchronous header write.
 
 Restart runs the barrier (one `fallocate` per segment file), reads the
 superblock, the journal, and one summary per sealed segment (64 bytes per
-record: about 80 MiB for 1.3 million records), and walks at most *K* + 4
+record: about 80 MiB for 1.3 million records), and walks at most *K* + 5
 segments only after an unclean exit (§8.4). Disks open in parallel, as they
 already do.
 
@@ -1545,8 +1718,9 @@ Answered in this revision:
    peer down (§3.3).
 3. *A relocation read that fails its CRC check?* The record is evicted and its
    location becomes a shadow (§7.3).
-4. *Segments walked per unclean exit?* At most *K* + 4, counting the
-   relocation segment, the sealer queue and openings in progress (§8.4).
+4. *Segments walked per unclean exit?* At most *K* + 5, counting the
+   relocation segment, the sealer queue, openings in progress and the
+   pre-opened client segment (§8.4, §6.7.4).
 
 Still open:
 
