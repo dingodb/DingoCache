@@ -2268,6 +2268,28 @@ class DfkvHiCache(HiCacheStorage):
             "device-direct; the host read cannot load those objects and "
             "reports every page missing (the device entries load them)")
 
+    def _note_host_write_while_device_direct(self, pages: int) -> None:
+        """A host-form write while primary KV is stored device-direct.
+
+        It happens when the controller falls back to the host path after the
+        device pool was registered (e.g. a hybrid sidecar's registration
+        failed). The pages are stored under bare keys, while discovery
+        (batch_exists) probes the SG-group keys of the device form: they will
+        not be found. The write is done as before; it is counted, and the
+        first one logged.
+        """
+        self._metrics.on_host_write_while_device_direct(pages)
+        if getattr(self, "_host_write_device_noted", False):
+            return
+        self._host_write_device_noted = True
+        _log.warning(
+            "dfkv: host-form batch_set_v1 while primary KV is stored "
+            "device-direct (the controller fell back to the host path after "
+            "the device pool was registered); these pages are stored under "
+            "bare keys that the device-form existence probes do not look "
+            "up, so they will not be found. Counted in "
+            "dfkv_hicache_host_writes_while_device_direct_pages_total")
+
     def _note_logical_anchor_once(self):
         """One-time notice that the primary KV pool is a logical anchor.
 
@@ -2358,6 +2380,8 @@ class DfkvHiCache(HiCacheStorage):
                     _sp.hits = sum(res)
                     _sp.attrs = {"dfkv.anchor_marker": True}
                 return res
+            if self._device_direct_active():
+                self._note_host_write_while_device_direct(n)
             ptrs, sizes = meta
             sub, sks, sp, ss = self._flatten(keys, ptrs, sizes)
             t0 = time.perf_counter()

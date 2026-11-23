@@ -1030,6 +1030,36 @@ class _ObjectStore:
         return 0
 
 
+class HostWritesWhileDeviceDirect(unittest.TestCase):
+    """A host-form batch_set_v1 while primary KV is stored device-direct (the
+    controller fell back to the host path after the device pool was
+    registered) stores bare keys that the device-form existence probes never
+    look up. It is written as before, logged once and counted."""
+
+    def _plugin(self, **attrs):
+        return _plugin(_lib=_ObjectStore(), _backup_exist_gate=False,
+                       _metrics=dfkv_hicache._Metrics(0), **attrs)
+
+    def test_warned_once_and_counted(self):
+        st = self._plugin(mem_pool_device=object(),
+                          _device_direct_requested=True)
+        with self.assertLogs(dfkv_hicache._log, "WARNING") as logs:
+            self.assertEqual(st.batch_set_v1(["a", "b"], [0, 1]), [True] * 2)
+            self.assertEqual(st.batch_set_v1(["c"], [0]), [True])
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("not be found", logs.output[0])
+        self.assertEqual(
+            st._metrics.snapshot()["host_writes_while_device_direct_pages"], 3)
+        self.assertEqual(len(st._lib.objects), 3, "the pages are still written")
+
+    def test_host_form_without_device_direct_is_silent(self):
+        st = self._plugin(mem_pool_device=object())   # bypass not requested
+        with self.assertNoLogs(dfkv_hicache._log, "WARNING"):
+            st.batch_set_v1(["a"], [0])
+        self.assertEqual(
+            st._metrics.snapshot()["host_writes_while_device_direct_pages"], 0)
+
+
 class _LaidOutHostPool(_HostPool):
     """An MHA host pool: two objects (k, v) per page of the same size in
     every layout, but bytes in an order that depends on the layout."""

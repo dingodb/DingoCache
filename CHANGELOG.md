@@ -3,6 +3,16 @@
 ## Unreleased
 
 
+- SGLang HiCache connector, device-direct (L2-bypass): a host-form
+  `batch_set_v1` while primary KV is stored device-direct is logged and
+  counted. It happens when the controller falls back to the host path after
+  the device pool was registered, for example when a hybrid model's sidecar
+  registration failed: the pages are stored under bare keys, while discovery
+  probes the scatter-gather keys of the device form, so they are never
+  found. The write is done as before; the first one logs a WARNING saying
+  so, and `dfkv_hicache_host_writes_while_device_direct_pages_total` counts
+  the pages.
+
 - Client, RDMA, rail selection:
   - The wait for rail credits is one budget per operation, its retries
     and rail changes included: `DFKV_RDMA_RAIL_BACKPRESSURE_MS`, now
