@@ -333,7 +333,7 @@ WantedBy=multi-user.target
 > - `--slab-write direct|buffered`（默认 `direct`）：slab 数据面使用 O_DIRECT；文件系统不支持时整店回退 bounded buffered，以 `wr=` 上报真值。
 > - `--ram-tier on`（默认关）：arena 内对象走 RDMA 零拷贝。`--ram-write-mode writeback|writearound`（默认 `writeback`）选择 PUT 先入 RAM 后落盘，或直接盘写、读时晋升。`writeback` 默认在数据进入可读且 flush-pinned 的 RAM slot 后返回 `kOk`。达到正的 `DFKV_RAM_ACK_HIGH_WATERMARK_PCT`（默认 80）时，只拒绝尚无 owner 的新 key，返回 `kCacheFull`，不转为直接盘写。已有同 key 请求仍加入首写者的完成结果；水位设为 0 保留强制 disk-ACK 语义。需要所有 PUT 都等待持久化时设置 `DFKV_PUT_ACK_MODE=disk`。`--ram-tier-bytes` 限定总预算；超 extent 对象仍受 dedicated allocation 预算约束。显式启用 RAM 后，分配或 NUMA 模式失败会拒绝启动。
 > - `--ram-tier-numa interleave|off`（默认 `interleave`）：这是当前完整 mode 集；不接受数字 node ID。arena 预触并绑策略，须核 `MemoryMax`。
-> - `--ram-flush-threads <n>` / `DFKV_RAM_FLUSH_THREADS`：请求值会提高到至少 shard 数，多盘时至少 2×shard 数；实际值由 `dfkv_ram_flush_threads` 报告（默认请求=4×盘数，上限 16）。刷盘按目标盘分队列：一个 flush 批次只含一块盘的对象，同一 shard 里一块盘同时最多占用 flush 线程数减一，挂住的慢盘不拖住其他盘的刷盘；RAM-ACK 下一块盘的脏数据最多占脏水位的 2/盘数，到了只拒绝这块盘的新 key。
+> - `--ram-flush-threads <n>` / `DFKV_RAM_FLUSH_THREADS`：请求值会提高到至少 shard 数，多盘时至少 2×shard 数；实际值由 `dfkv_ram_flush_threads` 报告（默认请求=4×盘数，上限 16）。刷盘按目标盘分队列：一个 flush 批次只含一块盘的对象，同一 shard 里一块盘同时最多占用 flush 线程数减一，一块挂住的慢盘不拖住其他盘的刷盘（每 shard 只有 2 个 flush 线程时，两块盘同时挂住仍可能占满这个 shard 的全部线程）；RAM-ACK 下一块盘的脏数据最多占脏水位的 2/盘数，到了只拒绝这块盘的新 key。
 > - 微调项（env only）：`DFKV_SLAB_TABLE_SYNC_MS` 控制运行期对 `slots.tbl` 的周期同步（0=关）。默认 `DFKV_SLAB_WARM_RESTART=boot` 时 100 ms，`auto` 时 5 s，`off` 时关：`off` 在非干净退出后一律清零，`auto` 只在内核和挂载都没变（页缓存还在）时保留表，两者的恢复都不依赖 100 ms 的同步；`auto` 留下 5 s 一次的慢同步，是为了在运行期间就发现表的后台回写错误（EIO），不必等到停止或重启时的同步才发现（错误只报一次，回写失败的页也可能随之丢掉，之后再读到的就是旧记录）。干净停止和 extent 改绑时表照常同步。
 > - 非干净退出后的处理（env only）：`DFKV_SLAB_WARM_RESTART=off|auto|boot`，默认 `off`。
 >   - `off`：非干净退出后一律清零，等同 2.35。
