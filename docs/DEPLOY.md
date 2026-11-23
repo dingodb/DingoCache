@@ -607,6 +607,62 @@ quota 计 committed payload bytes；slab slot 内碎片另占物理空间，因�
 REMOVE 和 store eviction 立即释放 usage；重启从 file 名或 v3 slab record 重建。
 受限 tenant 为保证 PUT 的同步 admission 语义会绕过异步 RAM write-back。
 
+### 3a-1. slab 槽粒度：小对象占比高的负载
+
+`DFKV_SLAB_GRANULARITY`（默认 1 MiB）是 slab 最小槽。每个对象至少占一个槽，
+所以一页里有多个远小于 1 MiB 的对象时，盘上大部分空间存的是取整余量。典型是
+带逻辑锚点池和多个侧池的稀疏注意力类模型（如 DeepSeek V4 / DSA 类）：每页写
+一个 1 字节的锚点标记和若干约 100 KB 的侧池对象。
+
+**实测**（单元级测量：每页 1 个 1 字节标记 + 4 个 100 KB 对象，每 30 页一个
+6 MB 对象；128 MiB 小存储、8 MiB extent、8 个写线程，写入 1.5 倍容量）：
+
+| 粒度 | 盘上实际数据 / 容量 | 留存对象数 |
+|---|---|---|
+| 1 MiB（默认） | 15.9% | 114 |
+| 128 KiB | 65.1% | 646 |
+
+即同样的盘约多存 4 倍数据。64 KiB 在这个小存储里是 42.6%（三个尺寸档争用
+16 个 extent 的放置效应，不代表大盘），不比 128 KiB 好。
+
+**建议**
+
+- 这类负载用 `DFKV_SLAB_GRANULARITY=131072`（128 KiB）。
+- 64 KiB 只在内存充裕时考虑（见下面的代价），本次测量没有显示它比 128 KiB
+  多存数据。
+- 大对象为主（每对象 1 MiB 以上）的负载保持默认 1 MiB。
+
+**代价**（除注明"实测"外均为按格式和数据结构计算的估算）
+
+- **每盘一次冷启动，需人工清目录。** 粒度写在 `slab_meta` 里；已有目录用不同
+  粒度启动会被拒绝（`existing slab layout differs from requested geometry`），
+  不会自动重建。改粒度 = 停服务、清空该盘缓存目录、再启动，缓存从空开始。
+- **slots.tbl 变大**（计算）：大小 = 容量 / 粒度 × 64 B，按整盘预分配，每次
+  启动都要扫描一遍。
+
+  | 粒度 | 每 TiB |
+  |---|---|
+  | 1 MiB | 64 MiB |
+  | 128 KiB | 512 MiB |
+  | 64 KiB | 1 GiB |
+
+  64 KiB 时启动扫描估计每 TiB 多约 0.3～0.6 秒；各盘目前按顺序打开，会累加。
+- **内存随对象数增长**（计算）：每个留存对象约 200 B（索引与元数据）。按上面的
+  对象组合，满盘时 128 KiB 约 1 GB / TiB，64 KiB 约 1.5～2 GB / TiB；默认 1 MiB
+  约 0.25 GB / TiB。多出来的内存对应多存的对象，上线前按节点总盘量核对内存预算。
+- **全量测试**：在 128 KiB 默认粒度下全量单测通过；slab 自身的测试另外显式覆盖
+  4 KiB 粒度。
+
+**水位回收的移除上限**
+
+后台水位回收每 tick（`DFKV_SLAB_RECLAIM_MS`，默认 50 ms）最多移除
+`DFKV_SLAB_EVICT_MAX_VICTIMS_PER_TICK`（默认 256）个对象。粒度变小后同样的上限
+释放的字节变少（64 KiB 槽时 256 个只有 16 MiB / tick）。若
+`dfkv_slab_watermark_evictions_total` 跟不上写入（`dfkv_slab_disk_watermark_active`
+长时间为 1、`dfkv_slab_disk_watermark_high_observations_total` 持续增长），把它
+调大（上限 1024）。实测（单尺寸档）：上限过小时更多淘汰转到分配路径完成，PUT
+延迟没有变化，所以这是吞吐调节项，不是延迟调节项。
+
 ### 3b. dfkv_server flag / env 参考矩阵（按类别）
 
 以下均为 v2.0.0（cbe53fa）时刻从 `dfkv_server --help`、源码 `Env*`/`args.get` 解析点与常量实测
@@ -690,7 +746,7 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | `--ram-tier-bytes` / `DFKV_RAM_TIER_BYTES` | `16 GiB` | arena 预算（启动时预触页并锁在内存里） |
 | `--ram-tier-numa` / `DFKV_RAM_TIER_NUMA` | `interleave` | NUMA 策略：`interleave`/`off`（不接 node id） |
 | `--ram-tier-shards` / `DFKV_RAM_TIER_SHARDS` | `8`, 硬上限 64 | arena 锁分片数（大 arena ≥100 GiB 建议 16） |
-| `--slab-granularity` / `DFKV_SLAB_GRANULARITY` | `1 MiB` | slab slot 量子；现有目录 geometry 不符启动拒绝 |
+| `--slab-granularity` / `DFKV_SLAB_GRANULARITY` | `1 MiB` | slab slot 量子；现有目录 geometry 不符启动拒绝；小对象负载见 §3a-1 |
 | `--put-inflight-limit` / `DFKV_PUT_INFLIGHT_LIMIT` | `0`=关 | 前台 PUT 接纳上限（RAM 与直接盘写）；超限在接纳前返回 kCacheFull，后台 flush 不受限 |
 | `--tcp-max-conns` / `DFKV_TCP_MAX_CONNS` | `512`, 硬上限 4096 | cache TCP handler 上限；超限 accept 恒拒 |
 | `--tcp-io-timeout-s` / `DFKV_TCP_IO_TIMEOUT_S` | `60`, 硬上限 3600 | per-syscall RCVTIMEO（秒） |
