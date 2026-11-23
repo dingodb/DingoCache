@@ -338,7 +338,13 @@ void MdsRegistrar::Start() {
 }
 
 void MdsRegistrar::Stop() {
-  if (!running_.exchange(false)) return;
+  {
+    // Under the mutex the loop waits with: flipped between its check of
+    // the flag and its wait, the wakeup would be lost and Stop would wait
+    // out a whole period.
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!running_.exchange(false)) return;
+  }
   cv_.notify_all();
   if (th_.joinable()) th_.join();
 }

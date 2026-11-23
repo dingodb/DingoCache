@@ -9,6 +9,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <algorithm>
+#include <cstdio>
 #include <gtest/gtest.h>
 #include <atomic>
 #include <chrono>
@@ -245,4 +246,26 @@ TEST(MdsMemberPoller, UnreachableEndpointIsSurfacedNotSilent) {
   poller.ReportHealth(false);  // Loop() feeds PollOnce()'s result here
   EXPECT_FALSE(poller.reachable());
   EXPECT_GE(poller.unreachable_polls_total(), 1u);
+}
+
+// Stop() must not lose its wakeup: a flag flipped without the mutex can land
+// between the loop's check of it and its wait, and Stop then waits a whole
+// poll period. Many Start/Stop cycles against an MDS that refuses at once;
+// none may take near a poll period.
+TEST(MdsMemberPoller, StopDoesNotWaitAPollPeriod) {
+  MdsMemberPoller poller({"127.0.0.1:1"}, "stop-wakeup",
+                         [](const std::vector<MemberInfo>&) {},
+                         /*poll_ms=*/2000, /*io_timeout_ms=*/50);
+  double worst_ms = 0;
+  for (int i = 0; i < 3000; ++i) {
+    poller.Start();
+    if (i % 3) std::this_thread::sleep_for(std::chrono::microseconds(i % 50));
+    const auto t0 = std::chrono::steady_clock::now();
+    poller.Stop();
+    worst_ms = std::max(worst_ms, std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - t0)
+                                      .count());
+  }
+  EXPECT_LT(worst_ms, 1000.0);
+  std::printf("StopDoesNotWaitAPollPeriod worst stop %.1f ms\n", worst_ms);
 }
