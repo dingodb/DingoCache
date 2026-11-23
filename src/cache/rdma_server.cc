@@ -235,6 +235,19 @@ RdmaServer::RdmaServer(Handler handler, size_t max_msg,
 
 RdmaServer::~RdmaServer() { Stop(); }
 
+bool RdmaServer::TrialRegistration(rdma::RcEndpoint& anchor,
+                                   const std::string& device,
+                                   rdma::RecvSegment* segment) {
+  if (startup_registration_for_test_)
+    return startup_registration_for_test_(device);
+  ibv_mr* mr = anchor.RegisterTransient(
+      segment->data(), segment->size(),
+      rdma::RcEndpoint::TransientAccess::kRemoteWrite);
+  if (!mr) return false;
+  anchor.ReleaseTransient(mr);
+  return true;
+}
+
 Status RdmaServer::Start(int port) {
   // An explicitly configured anchor whose name overruns the v2 bootstrap
   // frame stays fully usable here — this server only EVER parses peer frames
@@ -384,15 +397,19 @@ Status RdmaServer::Start(int port) {
       anchor = initialize_anchor_for_test_(device, initial_segment->data(),
                                            initial_segment->size());
     } else {
+      // Opens the rail and keeps its device open. No receive chunk stays
+      // registered as a whole: each connection registers only its own
+      // slots. The initial chunk is registered once and released here, so
+      // a rail that cannot pin memory (RLIMIT_MEMLOCK) refuses startup
+      // instead of every client later.
       anchor = std::make_unique<rdma::RcEndpoint>();
       if (!anchor->Open(device.c_str(), rdma::kV2ControlCap, 1)) {
         DFKV_LOG_ERROR("rdma: failed to open required v2 device " + device);
         anchor.reset();
-      } else if (!anchor->RegisterRemoteRegion(initial_segment->data(),
-                                               initial_segment->size())) {
+      } else if (!TrialRegistration(*anchor, device, initial_segment)) {
         DFKV_LOG_ERROR(
-            "rdma: failed to register initial v2 receive chunk on " +
-            device);
+            "rdma: cannot register the initial v2 receive chunk on " +
+            device + " (check LimitMEMLOCK)");
         anchor.reset();
       }
     }
@@ -1152,8 +1169,13 @@ void RdmaServer::Serve(
     close_boot();
     return;
   }
-  ibv_mr* recv_segment_mr = ep.RegisterRemoteRegion(
-      recv_lease.segment()->data(), recv_lease.segment()->size());
+  // The connection's own receive slots, and nothing else, are writable by
+  // its client: an rkey over the whole chunk let one connection write into
+  // another's slots. Zeroed first, so no bytes of a previous connection can
+  // be read back through a PUT that does not cover what it claims.
+  std::memset(recv_lease.data(), 0, recv_lease.size());
+  ibv_mr* recv_segment_mr =
+      ep.RegisterOwnRegion(recv_lease.data(), recv_lease.size());
   if (!recv_segment_mr) {
     DFKV_LOG_ERROR("rdma v2: receive-segment MR unavailable on device " +
                    (dev.empty() ? std::string("(auto)") : dev));
@@ -2633,7 +2655,8 @@ std::string RdmaServer::MetricsText() const {
     "Receive-pool allocations that remained unsatisfied after growth",
     segment.allocation_failures);
   m(s, "dfkv_rdma_recv_segment_registered_rails", "gauge",
-    "RDMA rails with the initial receive chunk registered",
+    "RDMA rails opened and checked by a trial registration at startup "
+    "(receive chunks are registered per connection, over its own slots)",
     recv_segment_registered_rails_);
   m(s, "dfkv_rdma_pull_connections", "gauge",
     "Connections currently using negotiated pull-read",

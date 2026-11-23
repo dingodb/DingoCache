@@ -99,6 +99,10 @@ class RdmaServerTestPeer {
                                   InitializeAnchorFn initialize) {
     server->initialize_anchor_for_test_ = std::move(initialize);
   }
+  static void SetStartupRegistration(
+      RdmaServer* server, std::function<bool(const std::string&)> hook) {
+    server->startup_registration_for_test_ = std::move(hook);
+  }
   static size_t AnchorCount(const RdmaServer& server) {
     return server.anchors_.size();
   }
@@ -1138,6 +1142,29 @@ TEST(RdmaServerStartup, AutoModeKeepsFirstActiveDeviceSemantics) {
   EXPECT_EQ(RdmaServerTestPeer::AnchorCount(server), 1u);
   EXPECT_EQ(RdmaServerTestPeer::RailStatsCount(server), 1u);
   EXPECT_EQ(RdmaServerTestPeer::RegisteredRailCount(server), 1u);
+  server.Stop();
+}
+
+// RDS-13: a rail that cannot register memory (RLIMIT_MEMLOCK too low, say)
+// refuses startup. Each connection registers its own slots, so without a
+// trial at Start the server came up ready and then refused every client.
+TEST(RdmaServerStartup, ARailThatCannotRegisterMemoryRefusesStartup) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ConfigureTestRecvSegment();
+  RdmaServer server(
+      [](uint8_t, const BlockKey&, uint64_t, uint64_t, const char*, uint64_t,
+         std::string*, size_t*) { return Status::kInvalid; },
+      kMaxMsg);
+  std::vector<std::string> tried;
+  RdmaServerTestPeer::SetStartupRegistration(
+      &server, [&tried](const std::string& device) {
+        tried.push_back(device);
+        return false;
+      });
+  EXPECT_EQ(server.Start(0), Status::kIOError);
+  EXPECT_FALSE(tried.empty()) << "no startup registration was tried";
+  EXPECT_EQ(RdmaServerTestPeer::AnchorCount(server), 0u);
+  EXPECT_EQ(RdmaServerTestPeer::RegisteredRailCount(server), 0u);
   server.Stop();
 }
 
@@ -2543,7 +2570,7 @@ struct PinnedPullPeer {
     info.depth = depth;
     info.protocol_version = rdma::kDevProtoV2;
     rdma::SerializeQpInfo(info, mine);
-    rdma::RecvSegmentInfo resident;
+    resident = {};
     legacy_token = 0;
     const bool ok = net::WriteAll(fd, frame, sizeof(frame)) &&
         net::WriteAll(fd, mine, sizeof(mine)) &&
@@ -2558,6 +2585,7 @@ struct PinnedPullPeer {
     return ok;
   }
   uint64_t legacy_token = 0;
+  rdma::RecvSegmentInfo resident;  // this connection's slots, as granted
   bool Exchange(size_t request_bytes, Status* status, uint64_t* bytes) {
     if (!ep.PostRecv(0) || !ep.PostSend(0, request_bytes)) return false;
     bool sent = false, received = false;
@@ -5595,8 +5623,9 @@ TEST(RdmaLoopback, PoolMrAccessUpgradeWinsRangeLookup) {
   ASSERT_TRUE(ep.AddPoolMr(region.data(), region.size()));
   ibv_mr* local_only = ep.RegisterUser(region.data() + 4096, 4096);
   ASSERT_NE(local_only, nullptr);
-  ibv_mr* remote_write =
-      ep.RegisterRemoteRegion(region.data(), region.size());
+  ASSERT_TRUE(ep.AddPoolMr(region.data(), region.size(),
+                           /*remote_write=*/true));
+  ibv_mr* remote_write = ep.RegisterUser(region.data(), region.size());
   ASSERT_NE(remote_write, nullptr);
   EXPECT_NE(remote_write, local_only);
   EXPECT_EQ(ep.RegisterUser(region.data() + 4096, 4096), remote_write)
@@ -10716,4 +10745,94 @@ TEST(RdmaSgRead, ManySegmentsPerReadLandExactly) {
   EXPECT_EQ(posted, static_cast<long>(kKeys) * per_key)
       << "READs for " << kKeys << " keys of " << non_empty
       << " non-empty segments with ReadSge " << read_sge;
+}
+
+// RDS-13: a connection's rkey covers its own receive slots only. With one
+// MR over the whole chunk, a connection could write into another
+// connection's slots with its own rkey (reproduced: the WRITE completed and
+// the bytes landed), corrupting that connection's PUT in flight.
+TEST(RdmaLoopback, AConnectionCannotWriteAnotherConnectionsSlots) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "0");
+  RdmaNode node("rkey-isolation");
+  const BlockKey key{90601, 1};
+  std::string ignored;
+  ASSERT_EQ(node.srv->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), key, 0, 0, "v", 1,
+                &ignored), Status::kOk);
+  PinnedPullPeer a, b;
+  ASSERT_TRUE(a.Open(node));
+  ASSERT_TRUE(b.Open(node));
+  ASSERT_NE(a.resident.base_addr, b.resident.base_addr);
+  EXPECT_NE(a.resident.rkey, b.resident.rkey);
+  const uint64_t target = b.resident.base_addr + rdma::kV2DataOffset;
+  const std::string before(reinterpret_cast<const char*>(target), 64);
+  std::string marker(64, 'X');
+  ibv_mr* mr = a.ep.RegisterTransient(
+      marker.data(), marker.size(),
+      rdma::RcEndpoint::TransientAccess::kLocalWrite);
+  ASSERT_NE(mr, nullptr);
+  ASSERT_TRUE(a.ep.PostWrite(0, marker.data(), marker.size(), mr, target,
+                             a.resident.rkey));
+  ibv_wc wc{};
+  ASSERT_EQ(a.ep.WaitComp(&wc, 1, 5000), 1);
+  a.ep.ReleaseTransient(mr);
+  EXPECT_NE(wc.status, IBV_WC_SUCCESS)
+      << "a WRITE into another connection's slot was accepted";
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(target), 64), before);
+  EXPECT_TRUE(PinnedExists(b, key)) << "b's connection was affected";
+  // A WRITE into its own slots still works.
+  PinnedPullPeer c;
+  ASSERT_TRUE(c.Open(node));
+  std::string mine(64, 'c');
+  ibv_mr* own_mr = c.ep.RegisterTransient(
+      mine.data(), mine.size(),
+      rdma::RcEndpoint::TransientAccess::kLocalWrite);
+  ASSERT_NE(own_mr, nullptr);
+  ASSERT_TRUE(c.ep.PostWrite(0, mine.data(), mine.size(), own_mr,
+                             c.resident.base_addr + rdma::kV2DataOffset,
+                             c.resident.rkey));
+  ASSERT_EQ(c.ep.WaitComp(&wc, 1, 5000), 1);
+  c.ep.ReleaseTransient(own_mr);
+  EXPECT_EQ(wc.status, IBV_WC_SUCCESS);
+  EXPECT_EQ(std::memcmp(reinterpret_cast<const char*>(
+                            c.resident.base_addr + rdma::kV2DataOffset),
+                        mine.data(), mine.size()), 0);
+}
+
+// RDS-13: receive slots leased to a new connection hold none of the bytes
+// a previous connection left in them.
+TEST(RdmaLoopback, ANewConnectionsSlotsAreZeroed) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "0");
+  ScopedEnv idle("DFKV_RDMA_IDLE_MS", "200");
+  RdmaNode node("slot-zeroing");
+  uint64_t first_base = 0, first_size = 0;
+  {
+    PinnedPullPeer first;
+    ASSERT_TRUE(first.Open(node));
+    first_base = first.resident.base_addr;
+    first_size = first.resident.slot_size;
+    std::string marker(4096, 'R');
+    ibv_mr* mr = first.ep.RegisterTransient(
+        marker.data(), marker.size(),
+        rdma::RcEndpoint::TransientAccess::kLocalWrite);
+    ASSERT_NE(mr, nullptr);
+    ASSERT_TRUE(first.ep.PostWrite(0, marker.data(), marker.size(), mr,
+                                   first_base + rdma::kV2DataOffset,
+                                   first.resident.rkey));
+    ibv_wc wc{};
+    ASSERT_EQ(first.ep.WaitComp(&wc, 1, 5000), 1);
+    ASSERT_EQ(wc.status, IBV_WC_SUCCESS);
+    first.ep.ReleaseTransient(mr);
+    ASSERT_TRUE(ServerHasNoConnections(node)) << "not reclaimed";
+  }
+  PinnedPullPeer second;
+  ASSERT_TRUE(second.Open(node));
+  ASSERT_EQ(second.resident.base_addr, first_base)
+      << "the new connection did not get the same slots";
+  const char* slots = reinterpret_cast<const char*>(second.resident.base_addr);
+  EXPECT_EQ(std::count(slots, slots + first_size, '\0'),
+            static_cast<std::ptrdiff_t>(first_size))
+      << "the previous connection's bytes are still in the slots";
 }

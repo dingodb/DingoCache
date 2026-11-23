@@ -193,7 +193,7 @@ RDMA-listener scrape inventory。
 | 口径 | 权威来源 | 解释 |
 |---|---|---|
 | configured input / monitored topology | startup log `configured=N`; `dfkv_server_rdma_rails_configured` | log 值是显式列表去重数（auto 为 0）；gauge 是 health monitor 的固定 resolved rail 数（auto 含选出的 rail） |
-| initialized/resolved | startup log `initialized=N`; `dfkv_rdma_rails_initialized`; `dfkv_rdma_recv_segment_registered_rails` | 完成 anchor、共享 segment 和全部启动 MR 的固定 topology，auto 含选出的 rail |
+| initialized/resolved | startup log `initialized=N`; `dfkv_rdma_rails_initialized`; `dfkv_rdma_recv_segment_registered_rails` | 完成 anchor 和全部启动 MR 的固定 topology，auto 含选出的 rail |
 | startup-ACTIVE | startup log `ACTIVE=N` / `inactive=...` | 仅启动瞬间快照 |
 | current healthy | `dfkv_server_rdma_rails_active`; `sum(dfkv_server_ib_device_healthy)` | 当前 ACTIVE+LinkUp 数；至少 1 即可 placement |
 
@@ -229,7 +229,7 @@ RDMA-listener scrape inventory。
 | `dfkv_rdma_dynamic_get_mr_active` | gauge | 当前进程存活的 exact dynamic READ MR；PullRelease 先撤销 MR，再释放 RAM pin，断连由 QP 销毁完成 fencing |
 | `dfkv_op_latency_seconds{op="get"}`（arena pull） | histogram | 记录 RAM handler 准备耗时，与 staged range handler 的计时边界一致；成功 PullRelease 后才提交样本，不包含客户端持有 grant、RDMA READ 或 MR 撤销时间。端到端延迟看客户端 bench，不能用此序列替代 |
 | `dfkv_rdma_connection_bytes{class=\"data|control\"}` | gauge | data/control connection 当前 lease 字节；应随 adaptive class 而非 logical max 增长 |
-| `dfkv_rdma_recv_segment_registered_rails` | gauge | 成功注册初始 receive chunk 的 rail 数；后续 chunk 按使用 rail 惰性注册 |
+| `dfkv_rdma_recv_segment_registered_rails` | gauge | 启动时成功打开（anchor）并通过试注册（初始 chunk 注册一次随即释放）的 rail 数；receive chunk 不再常驻整块注册，每条连接只注册自己的 slots |
 | `dfkv_rdma_v2_ready` | gauge | 初始 receive chunk 与 rail anchor 是否就绪 |
 | `dfkv_rdma_segment_evictions_total` / `dfkv_rdma_idle_reclaims_total` | counter | hard budget 压力淘汰 / idle timeout 回收连接 |
 | `dfkv_rdma_unstaged_misses_total` | counter | 不分配 staging、直接回 kNotFound 的 GET（先查索引确认不存在）；以前 miss 也先租一段 staging，pool 紧张时还要等内存或驱逐别的连接 |

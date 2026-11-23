@@ -174,9 +174,10 @@ class RcEndpoint {
   // lookup cache exactly as it was before the call.
   bool EnsurePoolMrs(const std::vector<std::pair<void*, size_t>>& regions,
                      bool remote_write);
-  // Register a shared server receive segment for remote PUT writes and return
-  // the MR carrying both the local lkey and peer-visible rkey.
-  ibv_mr* RegisterRemoteRegion(void* base, size_t size);
+  // This endpoint's own remote-writable region (a server connection's
+  // receive slots): an exact MR, never shared with another endpoint, so its
+  // rkey reaches nothing else. Deregistered by Close, after the QP.
+  ibv_mr* RegisterOwnRegion(void* base, size_t size);
   // Exact per-operation remote WRITE capability. Never enters the pool cache:
   // a later lease at the same VA must not inherit an earlier operation's rkey.
   // The backing allocation must outlive this endpoint, unless explicitly
@@ -381,6 +382,7 @@ class RcEndpoint {
   // after endpoint destruction fences an abandoned operation.
   std::vector<ibv_mr*> transient_mr_;
   std::vector<ibv_mr*> lease_write_mr_;
+  std::vector<ibv_mr*> own_mr_;
   std::vector<ibv_mr*> lease_read_mr_;
   QpInfo local_;
   // See failed_wc(). Written once, after a failure; declared last so the

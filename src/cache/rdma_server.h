@@ -380,6 +380,12 @@ class RdmaServer {
   std::function<std::unique_ptr<rdma::RcEndpoint>(const std::string&, void*,
                                                   size_t)>
       initialize_anchor_for_test_;
+  // Registers and releases `segment` on a rail's anchor: proof at startup
+  // that the rail can register connection memory.
+  bool TrialRegistration(rdma::RcEndpoint& anchor, const std::string& device,
+                         rdma::RecvSegment* segment);
+  // Replaces the startup trial registration on a rail (true = registered).
+  std::function<bool(const std::string&)> startup_registration_for_test_;
 #ifdef DFKV_WITH_URING
   // Externally owned backend seam for deterministic queue/completion tests.
   // Production leaves this empty and UringReader selects liburing directly.

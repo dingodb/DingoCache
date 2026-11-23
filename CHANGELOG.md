@@ -232,6 +232,27 @@
   length without a READ, and TCP reads the reply off the socket into a
   scratch buffer. Results, statuses and lengths are unchanged; variable-size
   reads (`*_auto`) still receive a shorter value.
+
+- Server, RDMA: a connection can write only into its own receive slots
+  (RDS-13). The rkey a connection got covered the whole receive chunk, which
+  holds other connections' slots: a client writing to a wrong address (a
+  bug) silently changed another connection's PUT in flight (reproduced: a
+  WRITE with one connection's rkey into another's slot completed and the
+  bytes landed). Each connection's slots are now registered on their own
+  and its rkey covers them only; a WRITE outside them fails with a remote
+  access error and ends that connection. Slots are zeroed before they are
+  given to a new connection, so a PUT that does not cover what it claims
+  cannot store a previous connection's bytes. Receive chunks are no longer
+  registered as a whole (nothing used those registrations but the rkey), so
+  a chunk growth no longer registers 256 MiB under the device lock. No
+  change for clients: they use the rkey and address from the handshake, as
+  every release does. Startup still registers the initial chunk once on
+  every rail (and releases it), so a rail that cannot register memory, for
+  example with too low a `LimitMEMLOCK`, still refuses startup. Behaviour
+  change: `dfkv_rdma_recv_segment_registered_rails` now counts the rails
+  opened and checked at startup, not rails holding a chunk registration.
+  DEPLOY §0 states the trust model.
+
 - Server, RDMA: a GET of a key the node does not have is answered
   `kNotFound` before any staging lease. It leased one first, read nothing,
   and under pool pressure waited for memory or evicted another client's
