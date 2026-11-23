@@ -4352,7 +4352,8 @@ TEST(RdmaLoopback, GrantOfAKilledClientIsReleasedAfterTheGrantTimeout) {
   ScopedEnv inline_put("DFKV_RDMA_INLINE_PUT_MAX_BYTES", "65536");
   ScopedEnv idle("DFKV_RDMA_IDLE_MS", "6000");
   ScopedEnv grant("DFKV_RDMA_GRANT_TIMEOUT_MS", "500");
-  for (const bool lease : {true, false}) {
+  for (const bool lease : {true, false})
+  for (int attempt = 0;; ++attempt) {
     SCOPED_TRACE(lease ? "PUT lease" : "GET grant");
     // A GET grant is its exact READ registration: its staging lease (if it
     // has one) may already be back in the pool, for an arena-served GET.
@@ -4400,11 +4401,23 @@ TEST(RdmaLoopback, GrantOfAKilledClientIsReleasedAfterTheGrantTimeout) {
     const int64_t held_ms = (now_us() - killed_at_us.load()) / 1000;
     std::printf("GRANT_HELD %s %lld ms after the client died\n",
                 lease ? "lease" : "pull", static_cast<long long>(held_ms));
+    // The kill raced the client's own completion: on a fast link (rxe over
+    // lo) the client can finish its PUT between the server seeing the grant
+    // and the SIGKILL landing, and the grant is then released as used.
+    // Nothing was left to expire; try again.
+    if (attempt < 4 && held_ms < 100 &&
+        CounterVal(node.rsrv->MetricsText(),
+                   "dfkv_rdma_grant_expiries_total") == 0) {
+      std::printf("GRANT_RACED %s: the client finished first; again\n",
+                  lease ? "lease" : "pull");
+      continue;
+    }
     EXPECT_EQ(CounterVal(node.rsrv->MetricsText(), gauge), 0);
     EXPECT_LT(held_ms, 2500) << "held until the idle timeout, not the grant timeout";
     EXPECT_EQ(CounterVal(node.rsrv->MetricsText(),
                          "dfkv_rdma_grant_expiries_total"),
               1);
+    break;
   }
 }
 
