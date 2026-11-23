@@ -11,6 +11,8 @@
 #ifdef DFKV_WITH_URING
 
 #include <liburing.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
 
 #include <cerrno>
 #include <cstddef>
@@ -67,6 +69,13 @@ class UringReader {
     virtual int WaitCqe(struct io_uring* ring, struct io_uring_cqe** cqe,
                         int timeout_ms) = 0;
     virtual void Seen(struct io_uring* ring, struct io_uring_cqe* cqe) = 0;
+    // Signal `fd` (an eventfd) for every completion posted. <0 = not
+    // supported: the owner then polls the ring instead.
+    virtual int RegisterEventFd(struct io_uring* ring, int fd) {
+      (void)ring;
+      (void)fd;
+      return -EOPNOTSUPP;
+    }
   };
 
   explicit UringReader(unsigned queue_depth, Backend* backend = nullptr)
@@ -75,6 +84,12 @@ class UringReader {
         backend_(backend ? backend : &default_backend_) {
     if (queue_depth == 0) return;
     ok_ = backend_->QueueInit(queue_depth, &ring_) == 0;
+    if (!ok_) return;
+    event_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (event_fd_ >= 0 && backend_->RegisterEventFd(&ring_, event_fd_) < 0) {
+      ::close(event_fd_);
+      event_fd_ = -1;
+    }
   }
 
   ~UringReader() {
@@ -83,6 +98,7 @@ class UringReader {
     // cancel accepted reads, so destruction performs the one unbounded drain.
     Drain(/*timeout_ms=*/-1);
     backend_->QueueExit(&ring_);
+    if (event_fd_ >= 0) ::close(event_fd_);
   }
 
   UringReader(const UringReader&) = delete;
@@ -93,6 +109,14 @@ class UringReader {
   unsigned depth() const { return depth_; }
   size_t inflight() const { return logical_inflight_; }
   size_t capacity() const { return depth_ - logical_inflight_; }
+  // Readable after a completion is posted, until ClearEvent; -1 when the
+  // backend cannot signal one. Lets the owner wait for disk completions
+  // together with its other wait sources in one poll().
+  int event_fd() const { return event_fd_; }
+  void ClearEvent() {
+    uint64_t count;
+    if (event_fd_ >= 0) (void)!::read(event_fd_, &count, sizeof(count));
+  }
 
   // Queue and submit one bounded group. On success every returned token is
   // stable until its logical Completion is reaped. On infrastructure failure
@@ -294,6 +318,9 @@ class UringReader {
     void Seen(struct io_uring* ring, struct io_uring_cqe* cqe) override {
       io_uring_cqe_seen(ring, cqe);
     }
+    int RegisterEventFd(struct io_uring* ring, int fd) override {
+      return io_uring_register_eventfd(ring, fd);
+    }
   };
 
   struct Pending {
@@ -325,6 +352,7 @@ class UringReader {
   }
 
   struct io_uring ring_{};
+  int event_fd_ = -1;
   bool ok_ = false;
   bool poisoned_ = false;
   unsigned depth_ = 0;

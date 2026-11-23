@@ -1114,15 +1114,18 @@ int RcEndpoint::PollComp(ibv_wc* out, int max) {
   return ObserveCompletions(out, ibv_poll_cq(cq_, max, out));
 }
 
-int RcEndpoint::WaitComp(ibv_wc* out, int max, int timeout_ms) {
+int RcEndpoint::WaitComp(ibv_wc* out, int max, int timeout_ms, int also_fd) {
   if (busy_poll_) {
     using Clock = std::chrono::steady_clock;
     auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms < 0 ? 0 : timeout_ms);
     for (;;) {
       int got = ibv_poll_cq(cq_, max, out);
       if (got != 0) return ObserveCompletions(out, got);
-      pollfd pfd = {wake_rfd_, POLLIN, 0};
-      if (::poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) return -1;
+      pollfd pfds[2] = {{wake_rfd_, POLLIN, 0}, {also_fd, POLLIN, 0}};
+      if (::poll(pfds, also_fd >= 0 ? 2 : 1, 0) > 0) {
+        if (pfds[0].revents & POLLIN) return -1;
+        if (pfds[1].revents & POLLIN) return ObserveCompletions(out, 0);
+      }
       if (timeout_ms == 0) return ObserveCompletions(out, 0);
       if (timeout_ms > 0 && Clock::now() >= deadline)
         return ObserveCompletions(out, 0);
@@ -1137,8 +1140,9 @@ int RcEndpoint::WaitComp(ibv_wc* out, int max, int timeout_ms) {
     if (ibv_req_notify_cq(cq_, 0) != 0) return ObserveCompletions(out, -1);
     got = ibv_poll_cq(cq_, max, out);
     if (got != 0) return ObserveCompletions(out, got);
-    pollfd pfds[2] = {{chan_->fd, POLLIN, 0}, {wake_rfd_, POLLIN, 0}};
-    int pr = ::poll(pfds, 2, timeout_ms);
+    pollfd pfds[3] = {{chan_->fd, POLLIN, 0}, {wake_rfd_, POLLIN, 0},
+                      {also_fd, POLLIN, 0}};
+    int pr = ::poll(pfds, also_fd >= 0 ? 3 : 2, timeout_ms);
     if (pr < 0) {
       if (errno == EINTR) continue;
       return ObserveCompletions(out, -1);
@@ -1153,6 +1157,8 @@ int RcEndpoint::WaitComp(ibv_wc* out, int max, int timeout_ms) {
         return ObserveCompletions(out, -1);
       ibv_ack_cq_events(ev_cq, 1);
     }
+    if (pfds[2].revents & POLLIN)
+      return ObserveCompletions(out, ibv_poll_cq(cq_, max, out));
   }
 }
 

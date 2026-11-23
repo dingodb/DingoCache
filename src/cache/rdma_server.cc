@@ -2415,10 +2415,10 @@ void RdmaServer::Serve(
       }
       if (progressed) continue;
 
-      if (ring.inflight() != 0) {
-        // liburing and verbs expose separate wait sources. A one-millisecond
-        // bounded ring wait avoids spinning without starving the verbs CQ or
-        // Stop()'s Wake notification.
+      if (ring.inflight() != 0 && ring.event_fd() < 0) {
+        // No completion event from this ring: wait on the ring for at most a
+        // millisecond at a time, so the verbs CQ and Stop()'s Wake are seen
+        // that late at worst.
         UringReader::Event event;
         const int ready = ring.Wait(&event, /*timeout_ms=*/1);
         if (ready < 0 ||
@@ -2438,18 +2438,24 @@ void RdmaServer::Serve(
       // after our ready-only PollComp drain, so never put an outstanding SEND
       // fence behind the multi-minute connection-idle wait. A bounded wait
       // blocks (no spin) and its timeout path performs a final CQ poll.
+      // With disk reads in flight the ring's completion event is waited on
+      // too, in the same poll(): a new request is taken as soon as it
+      // arrives, and a disk completion as soon as it is posted.
       bool grant_wait = false;
       const int bound_ms = wait_bound_ms(grants, &grant_wait);
       const int verbs_wait_ms =
           posted_sends != 0 || reorder_cq_for_test_ ? 1 : bound_ms;
-      g = ep.WaitComp(wcs.data(), static_cast<int>(K), verbs_wait_ms);
+      const bool disk_wait = ring.inflight() != 0;
+      g = ep.WaitComp(wcs.data(), static_cast<int>(K), verbs_wait_ms,
+                      disk_wait ? ring.event_fd() : -1);
+      if (disk_wait) ring.ClearEvent();
       if (g >= 0 && reorder_cq_for_test_)
         reorder_cq_for_test_(wcs.data(), &g, K);
       if (g > 0)
         ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
       if (g >= 0 && grant_expired(grants)) break;
       if (g == 0) {
-        if (posted_sends != 0 || grant_wait) continue;
+        if (posted_sends != 0 || grant_wait || disk_wait) continue;
         idle_reclaims_.fetch_add(1, std::memory_order_relaxed);
         break;
       }

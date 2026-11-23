@@ -304,7 +304,10 @@ class RcEndpoint {
   // timeout_ms < 0 blocks forever (the default, used by the client). A finite
   // timeout returns 0 if no completion arrives in that window — the server uses
   // it to reclaim an idle/abandoned connection instead of blocking indefinitely.
-  int WaitComp(ibv_wc* out, int max, int timeout_ms = -1);
+  // also_fd, when >= 0, is waited on too: its becoming readable ends the
+  // wait like a timeout (returns the CQ poll, possibly 0). The caller drains
+  // it.
+  int WaitComp(ibv_wc* out, int max, int timeout_ms = -1, int also_fd = -1);
   // The first failed work completion this endpoint reaped, or nullptr. An RC
   // QP does not survive a failed completion, so any later ones are the flush
   // of what was still posted; the first names the cause. Per the verbs
