@@ -221,6 +221,7 @@ RDMA-listener scrape inventory。
 | `dfkv_rdma_recv_segment_registered_rails` | gauge | 成功注册初始 receive chunk 的 rail 数；后续 chunk 按使用 rail 惰性注册 |
 | `dfkv_rdma_v2_ready` | gauge | 初始 receive chunk 与 rail anchor 是否就绪 |
 | `dfkv_rdma_segment_evictions_total` / `dfkv_rdma_idle_reclaims_total` | counter | hard budget 压力淘汰 / idle timeout 回收连接 |
+| `dfkv_rdma_grant_expiries_total` | counter | 持有授权（GET 的 READY、PUT 租约、多窗口 PUT 的下一窗）而静默超过 `DFKV_RDMA_GRANT_TIMEOUT_MS` 被关掉的连接；增长 = client 崩溃或超时放弃，日志里有对端地址 |
 | `dfkv_uring_reads_total` / `dfkv_uring_init_fallbacks_total` | counter | io_uring 路径实际读 / 初始化失败回退同步连接数 |
 | `dfkv_rdma_rail_active_conns{dev}` | gauge | 每个本地 HCA 上当前连接数 |
 | `dfkv_rdma_rail_completions_total{dev}` / `dfkv_rdma_rail_completion_errors_total{dev}` | counter | 每 rail 请求完成 / 错误完成 |

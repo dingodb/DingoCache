@@ -562,6 +562,13 @@ int ServerIdleMs() {
   return out;
 }
 
+int ServerGrantTimeoutMs() {
+  const int out = RdmaGrantTimeoutMsFromEnv();  // default 60 s
+  config_dump::RecordResolved("DFKV_RDMA_GRANT_TIMEOUT_MS",
+                              std::to_string(out < 0 ? 0 : out));
+  return out;
+}
+
 #ifdef DFKV_WITH_URING
 // Per-connection disk queue depth. It is independent of negotiated RDMA depth:
 // requests beyond this bound remain prepared but unsubmitted until a CQE frees
@@ -907,6 +914,8 @@ void RdmaServer::Serve(
       value_len = 0;
     }
   };
+  // When this connection last sent a GET's READY or a PUT lease.
+  uint64_t last_grant_sent_us = 0;
   std::vector<PullSlotState> pull_slots(K);
   for (auto& state : pull_slots) {
     state.active_count = &dynamic_get_active_;
@@ -1277,6 +1286,7 @@ void RdmaServer::Serve(
     state.arena_read = std::move(prepared);
     state.read_elapsed_sec = elapsed_sec;
     state.busy = true;
+    last_grant_sent_us = SteadyUs();
     state.data_len = output_len;
     state.value_len = value_len;
     const rdma::DynamicPullReady ready{
@@ -1316,6 +1326,7 @@ void RdmaServer::Serve(
     state.arena_read = std::move(pinned);
     state.read_elapsed_sec = read_elapsed_sec;
     state.busy = true;
+    last_grant_sent_us = SteadyUs();
     state.data_len = state.arena_read.payload_len();
     state.value_len = state.arena_read.value_len();
     const rdma::DynamicPullReady ready{
@@ -1463,6 +1474,7 @@ void RdmaServer::Serve(
         return true;
       }
       state.active = true;
+      last_grant_sent_us = SteadyUs();
       state.key = key;
       state.payload_len = want;
       lease_put_ops_.fetch_add(1, std::memory_order_relaxed);
@@ -1644,6 +1656,69 @@ void RdmaServer::Serve(
   };
   bool fail = false;
   const int idle_ms = ServerIdleMs();
+  // A grant the client has yet to use (a GET's READY before its RELEASE, a
+  // PUT lease before its window, a multi-window PUT before its next window)
+  // keeps its pin or staging range for as long as the connection lives. A
+  // client that crashed or gave up leaves no completion to wake on, so the
+  // connection would live until idle_ms (10 min by default, forever with 0).
+  // So while a grant is held and nothing is left for the server to do (no
+  // disk read or reply of this connection in flight), the connection may
+  // stay silent for grant_ms at most, counted from the later of its last
+  // completion and the last grant sent: a batch's clock starts with its
+  // last READY, whatever its first ones waited for. Past that it is torn
+  // down, and the endpoint (QP and exact MRs) goes before any pin or range,
+  // so nothing the peer could still read or write is freed under it.
+  const int grant_ms = ServerGrantTimeoutMs();
+  struct GrantView {
+    bool holding = false;
+    uint64_t deadline_us = 0;  // 0 = none
+  };
+  // One pass over the slots per loop iteration.
+  auto grant_view = [&](bool server_work) {
+    GrantView view;
+    for (size_t i = 0; i < K && !view.holding; ++i)
+      view.holding = pull_slots[i].busy || lease_put[i].active ||
+                     multi_put[i].active;
+    if (view.holding && !server_work && grant_ms >= 0) {
+      const uint64_t since = std::max<uint64_t>(
+          ep.last_active_us_.load(std::memory_order_relaxed),
+          last_grant_sent_us);
+      view.deadline_us = since + static_cast<uint64_t>(grant_ms) * 1000;
+    }
+    return view;
+  };
+  // The wait for completions: idle_ms, or less when a grant expires sooner.
+  // *for_grant tells a timeout of the grant bound from an idle connection.
+  auto wait_bound_ms = [&](const GrantView& view, bool* for_grant) -> int {
+    *for_grant = false;
+    if (view.deadline_us == 0) return idle_ms;
+    const uint64_t now = SteadyUs();
+    const int left = view.deadline_us > now
+        ? static_cast<int>(std::min<uint64_t>(
+              (view.deadline_us - now + 999) / 1000, 86400000))
+        : 0;
+    if (idle_ms >= 0 && idle_ms <= left) return idle_ms;
+    *for_grant = true;
+    return std::max(left, 1);
+  };
+  // After the wait: still silent past the deadline (a completion that just
+  // arrived counts, as it moved last_active_us_).
+  auto grant_expired = [&](const GrantView& view) -> bool {
+    if (view.deadline_us == 0) return false;
+    const uint64_t since = std::max<uint64_t>(
+        ep.last_active_us_.load(std::memory_order_relaxed),
+        last_grant_sent_us);
+    if (SteadyUs() < since + static_cast<uint64_t>(grant_ms) * 1000)
+      return false;
+    const uint64_t n = grant_expiries_.fetch_add(1, std::memory_order_relaxed);
+    if (n == 0 || (n & 0x3FFu) == 0)
+      DFKV_LOG_WARN("rdma: a connection holding a grant stayed silent for " +
+                    std::to_string(grant_ms) +
+                    " ms (DFKV_RDMA_GRANT_TIMEOUT_MS); closing it. peer=" +
+                    peer_addr + " dev=" + dev +
+                    " expiries=" + std::to_string(n + 1));
+    return true;
+  };
   active_connection.Enter(&active_conns_, &rail_stats.active_conns);
   // Failed WCs do not guarantee a meaningful opcode. Retain the raw provider
   // fields and both QP numbers for correlation with short-lived clients, and
@@ -2067,18 +2142,24 @@ void RdmaServer::Serve(
       // after our ready-only PollComp drain, so never put an outstanding SEND
       // fence behind the multi-minute connection-idle wait. A bounded wait
       // blocks (no spin) and its timeout path performs a final CQ poll.
+      const GrantView grants = grant_view(
+          !queue.empty() || ring.inflight() != 0 || posted_sends != 0);
+      bool grant_wait = false;
+      const int bound_ms = wait_bound_ms(grants, &grant_wait);
       const int verbs_wait_ms =
-          posted_sends != 0 || reorder_cq_for_test_ ? 1 : idle_ms;
+          posted_sends != 0 || reorder_cq_for_test_ ? 1 : bound_ms;
       g = ep.WaitComp(wcs.data(), static_cast<int>(K), verbs_wait_ms);
       if (g >= 0 && reorder_cq_for_test_)
         reorder_cq_for_test_(wcs.data(), &g, K);
+      if (g > 0)
+        ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
+      if (g >= 0 && grant_expired(grants)) break;
       if (g == 0) {
-        if (posted_sends != 0) continue;
+        if (posted_sends != 0 || grant_wait) continue;
         idle_reclaims_.fetch_add(1, std::memory_order_relaxed);
         break;
       }
       if (g < 0) break;  // disconnect, endpoint error, or Stop()'s Wake
-      ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
       if (!dispatch_completions(
               wcs.data(), g, process_wc,
               [&] {
@@ -2130,15 +2211,21 @@ sync_serve_loop:;
   while (running_ && !fail) {
     const bool deferred_for_test =
         reorder_cq_for_test_ && free_send.size() != K;
+    // Requests are served synchronously here: nothing of the server's is in
+    // flight while it waits.
+    const GrantView grants = grant_view(/*server_work=*/false);
+    bool grant_wait = false;
+    const int bound_ms = wait_bound_ms(grants, &grant_wait);
     const int wait_ms =
-        pending_recv_count != 0 || deferred_for_test ? 1 : idle_ms;
+        pending_recv_count != 0 || deferred_for_test ? 1 : bound_ms;
     int g = ep.WaitComp(wcs.data(), static_cast<int>(K), wait_ms);
     if (g >= 0 && reorder_cq_for_test_)
       reorder_cq_for_test_(wcs.data(), &g, K);
     if (g > 0)
       ep.last_active_us_.store(SteadyUs(), std::memory_order_relaxed);
+    if (g >= 0 && grant_expired(grants)) break;
     if (g == 0) {
-      if (pending_recv_count != 0 || deferred_for_test) continue;
+      if (pending_recv_count != 0 || deferred_for_test || grant_wait) continue;
       idle_reclaims_.fetch_add(1, std::memory_order_relaxed);
       break;
     }
@@ -2289,6 +2376,10 @@ std::string RdmaServer::MetricsText() const {
   m(s, "dfkv_rdma_segment_evictions_total", "counter",
      "Connections evicted to free shared receive segment space",
      segment_evictions_.load(std::memory_order_relaxed));
+  m(s, "dfkv_rdma_grant_expiries_total", "counter",
+    "RDMA connections closed because a GET grant or PUT lease waited longer "
+    "than DFKV_RDMA_GRANT_TIMEOUT_MS for the client",
+    grant_expiries_);
   m(s, "dfkv_rdma_idle_reclaims_total", "counter", "RDMA connections reclaimed on idle timeout",
     IdleReclaims());
   m(s, "dfkv_uring_reads_total", "counter",
