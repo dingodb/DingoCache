@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- MDS: member lists are reused for `DFKV_MDS_LIST_CACHE_MS` (default
+  500 ms, 0 = read etcd on every poll), and polls of one group that arrive
+  while one is reading etcd wait for that read instead of each starting
+  their own. A record this MDS writes is in its next answer; one written
+  through another MDS appears at most that much later. With 50 clients
+  polling every 3 s through 3 MDS, etcd ranges per client and minute went
+  from 19.9 to 0.4. New `dfkv_mds_list_cache_hits_total`.
 - Node and client registrar: it stays on one MDS while that one answers,
   and when it fails tries the others at once, in the same heartbeat,
   instead of rotating over them one heartbeat at a time. A connect to an

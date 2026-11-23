@@ -39,6 +39,11 @@
 
 using namespace dfkv;  // NOLINT
 
+// These tests change etcd behind the MDS's back (leases run out) and look at
+// the very next list: no list cache.
+static const int kNoListCache =
+    (::setenv("DFKV_MDS_LIST_CACHE_MS", "0", 1), 0);
+
 namespace {
 
 bool DoReq(int port, WireOp op, const std::string& payload, Status* st,
