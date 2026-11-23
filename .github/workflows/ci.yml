@@ -370,6 +370,7 @@ jobs:
         RdmaPortState.ARailWhosePortGoesDownLeavesSelectionAndComesBack
         RdmaRailAdmission.ACooledRailIsProbedInTheBackground
         RdmaRailAdmission.ARailsLatencyExcludesConnectionSetup
+        RdmaVerbs.PoolRegistrationDoesNotStallOtherRails
       # No GPU on the runner; the helper child runs only when spawned.
       SKIP_OTHER: >-
         RdmaLoopback.MultiSegmentGetPublishesUnequalExactBytesToGuardedCudaDestinations
@@ -380,6 +381,7 @@ jobs:
       SKIP_OPT_IN: >-
         RdmaMrCost.ReadRegistrationPerGetBench
         RdmaSession.FirstOperationAfterReclaimBench
+        RdmaVerbs.EndpointSetupBench
       # ThreadSanitizer: a forked child of a threaded process cannot start
       # threads.
       SKIP_TSAN_FORK: >-

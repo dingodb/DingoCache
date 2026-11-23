@@ -253,6 +253,19 @@
   opened and checked at startup, not rails holding a chunk registration.
   DEPLOY §0 states the trust model.
 
+- RDMA, client and server: endpoint setup costs less, and a large
+  registration no longer stalls every rail (RDS-15). Measured on 400G
+  InfiniBand, median of 40, depth 4: opening an endpoint took 4.05 ms and
+  closing it 2.89 ms, now 1.19 ms and 1.49 ms (depth 64: 8.74 and 8.77 ms,
+  now 2.51 and 1.86 ms). The control buffers are one page-aligned
+  allocation with one registration instead of two per slot, and their NUMA
+  bind now takes effect (it failed on unaligned heap memory). A device's
+  port attributes and source GID are queried once and reused for a second
+  while the port is ACTIVE (`ibv_query_port` took about 1.5 ms per open).
+  Shared pool registrations (host KV pools, the RAM arena) no longer run
+  under the process-wide device lock: registering 256 MiB took about 117 ms,
+  and every endpoint open and close on every rail waited for it.
+
 - Server, RDMA: a GET of a key the node does not have is answered
   `kNotFound` before any staging lease. It leased one first, read nothing,
   and under pool pressure waited for memory or evicted another client's
