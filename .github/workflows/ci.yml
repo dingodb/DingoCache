@@ -367,6 +367,11 @@ jobs:
           # fails) and which discovery picks first. Its RDMA driver goes; the
           # NIC's Ethernet (mlx5_core, mana) stays. Only rxe devices may be
           # left: the tests discover devices.
+          # The NIC's VF can be hot-plugged again later in the run (seen: a
+          # new rdmaP... device ten minutes in), which would load the driver
+          # again: it is kept from loading at all.
+          printf 'install mlx5_ib /bin/false\ninstall mana_ib /bin/false\n' \
+            | sudo tee /etc/modprobe.d/dfkv-ci-no-hca-rdma.conf
           sudo modprobe -r mlx5_ib mana_ib || true
           sudo modprobe rdma_rxe || true
           sudo rdma link add rxe0 type rxe netdev lo || true
@@ -390,6 +395,8 @@ jobs:
         run: |
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
           test "$(ulimit -l)" = unlimited
+          others=$(ls /sys/class/infiniband | grep -v '^rxe' || true)
+          test -z "$others" || { echo "::error::RDMA devices other than rxe: $others"; exit 1; }
           if ./build/rdma_loopback_test --gtest_filter=RdmaLoopback.PutGetExistMissOverRdma --gtest_output=xml:rdma-probe.xml \
              && python3 -c 'import xml.etree.ElementTree as E; r=E.parse("rdma-probe.xml").getroot(); assert int(r.attrib["tests"]) == 1 and not list(r.iter("skipped")) and not list(r.iter("failure"))'; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
@@ -403,6 +410,8 @@ jobs:
         run: |
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
           test "$(ulimit -l)" = unlimited
+          others=$(ls /sys/class/infiniband | grep -v '^rxe' || true)
+          test -z "$others" || { echo "::error::RDMA devices other than rxe: $others"; exit 1; }
           ./build/rdma_loopback_test
           DFKV_SERVER_URING=0 ./build/rdma_lease_loopback_test --gtest_output=xml:lease-sync.xml
           DFKV_SERVER_URING=1 ./build/rdma_lease_loopback_test --gtest_output=xml:lease-uring.xml
@@ -443,6 +452,8 @@ jobs:
           cmake --build build-tsan -j --target rdma_loopback_test rdma_lease_loopback_test rdma_lease_client_test
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
           test "$(ulimit -l)" = unlimited
+          others=$(ls /sys/class/infiniband | grep -v '^rxe' || true)
+          test -z "$others" || { echo "::error::RDMA devices other than rxe: $others"; exit 1; }
           TSAN_OPTIONS=halt_on_error=1 ./build-tsan/rdma_loopback_test
           TSAN_OPTIONS=halt_on_error=1 DFKV_SERVER_URING=0 ./build-tsan/rdma_lease_loopback_test --gtest_output=xml:lease-sync-tsan.xml
           TSAN_OPTIONS=halt_on_error=1 DFKV_SERVER_URING=1 ./build-tsan/rdma_lease_loopback_test --gtest_output=xml:lease-uring-tsan.xml
