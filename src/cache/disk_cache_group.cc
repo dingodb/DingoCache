@@ -587,8 +587,46 @@ StoreEngine* DiskCacheGroup::Route(const BlockKey& key) const {
   return index == kInvalidDisk ? nullptr : disks_[index].get();
 }
 uint64_t DiskCacheGroup::TenantLimit(uint64_t tenant_hash) const {
+  std::shared_lock<std::shared_mutex> lock(tenant_quotas_mu_);
   const auto it = tenant_quotas_.find(tenant_hash);
   return it == tenant_quotas_.end() ? tenant_default_quota_bytes_ : it->second;
+}
+
+bool DiskCacheGroup::ReloadTenantQuotas(std::string* error) {
+  if (tenant_quotas_file_.empty()) {
+    *error = "DFKV_TENANT_QUOTAS_FILE is not set";
+    tenant_quota_reload_failures_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  std::map<uint64_t, uint64_t> quotas;
+  if (!ParseTenantQuotasFile(tenant_quotas_file_, &quotas, error)) {
+    tenant_quota_reload_failures_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  // The quotas lock only, no tenant stripe. A write between its quota check
+  // and its accounting while the quotas change was checked against the old
+  // quota: it lands as if it had come just before the reload, and the next
+  // write of its tenant is checked against the new one. Writes of one tenant
+  // still check and account one at a time under its stripe, so the most a
+  // tenant that already had a quota can be over a lowered one is what it
+  // held before the reload plus the one write (or batch part) in flight. A
+  // tenant that gets its first quota in this reload had no stripe taken by
+  // its writes in flight: every one of those lands unchecked. The rejection
+  // counts are read and incremented under the shared lock, which this
+  // exclusive lock waits out.
+  std::unique_lock<std::shared_mutex> lock(tenant_quotas_mu_);
+  std::map<uint64_t, uint64_t> rejections;
+  for (const auto& quota : quotas) {
+    const auto kept = tenant_quota_rejections_by_hash_.find(quota.first);
+    rejections.emplace(quota.first,
+                       kept == tenant_quota_rejections_by_hash_.end()
+                           ? 0
+                           : kept->second);
+  }
+  tenant_quotas_.swap(quotas);
+  tenant_quota_rejections_by_hash_.swap(rejections);
+  tenant_quota_reloads_.fetch_add(1, std::memory_order_relaxed);
+  return true;
 }
 
 bool DiskCacheGroup::QuotaAllowsNewLocked(uint64_t tenant_hash,
@@ -601,6 +639,7 @@ bool DiskCacheGroup::QuotaAllowsNewLocked(uint64_t tenant_hash,
 
 void DiskCacheGroup::RecordQuotaRejectionLocked(uint64_t tenant_hash) {
   tenant_quota_rejections_.fetch_add(1, std::memory_order_relaxed);
+  std::shared_lock<std::shared_mutex> lock(tenant_quotas_mu_);
   if (tenant_quotas_.find(tenant_hash) == tenant_quotas_.end()) return;
   auto it = tenant_quota_rejections_by_hash_.find(tenant_hash);
   if (it != tenant_quota_rejections_by_hash_.end()) ++it->second;
@@ -611,9 +650,8 @@ Status DiskCacheGroup::Cache(const BlockKey& key, const void* data, size_t len) 
   if (len == 0 || data == nullptr) return Status::kInvalid;
   StoreEngine* d = Route(key);
   if (d == nullptr) return Status::kInvalid;
-  // Quotas are immutable after construction. A tenant without a limit has no
-  // admission state to protect, so its writes must not serialize on a stripe
-  // held across storage I/O.
+  // A tenant without a limit has no admission state to protect, so its
+  // writes must not serialize on a stripe held across storage I/O.
   if (!TenantLimited(key.tenant_hash)) return d->Cache(key, data, len);
   std::lock_guard<std::mutex> tenant_lock(
       tenant_stripes_[TenantStripe(key.tenant_hash)]);
@@ -762,9 +800,51 @@ std::vector<Status> DiskCacheGroup::CacheDirectBatch(
   // quotas -- takes no lock here, so flush workers overlap instead of running
   // one batch at a time behind a stripe held across the disk writes.
   std::array<bool, kTenantStripes> used_stripes{};
-  for (const auto& item : items) {
-    if (TenantLimited(item.key.tenant_hash))
-      used_stripes[TenantStripe(item.key.tenant_hash)] = true;
+  // Once per item: a quota reload in between must not leave an item checked
+  // without its stripe.
+  std::vector<char> limited(items.size(), 0);
+  size_t used = 0;
+  for (size_t i = 0; i < items.size(); ++i) {
+    limited[i] = TenantLimited(items[i].key.tenant_hash) ? 1 : 0;
+    if (!limited[i]) continue;
+    bool& stripe_used = used_stripes[TenantStripe(items[i].key.tenant_hash)];
+    if (!stripe_used) ++used;
+    stripe_used = true;
+  }
+  if (used > kMaxHeldStripes) {
+    // A batch over more stripes than we hold at once (the RAM tier's batches
+    // have at most 16 items, so not those) is run in parts of at most
+    // kMaxHeldStripes stripes, in ascending stripe order. A tenant's items
+    // all fall in one part, so admission within a tenant is unchanged;
+    // unlimited items go with the first part. Each part reports to `observe`
+    // on its own, so a split batch counts as one batch per part in per-batch
+    // metrics.
+    std::array<size_t, kTenantStripes> part_of{};
+    size_t parts = 0, in_part = kMaxHeldStripes;
+    for (size_t stripe = 0; stripe < kTenantStripes; ++stripe) {
+      if (!used_stripes[stripe]) continue;
+      if (in_part == kMaxHeldStripes) {
+        ++parts;
+        in_part = 0;
+      }
+      part_of[stripe] = parts - 1;
+      ++in_part;
+    }
+    for (size_t part = 0; part < parts; ++part) {
+      std::vector<size_t> indexes;
+      std::vector<StoreEngine::CacheBatchItem> sub;
+      for (size_t i = 0; i < items.size(); ++i) {
+        const size_t of =
+            limited[i] ? part_of[TenantStripe(items[i].key.tenant_hash)] : 0;
+        if (of != part) continue;
+        indexes.push_back(i);
+        sub.push_back(items[i]);
+      }
+      const std::vector<Status> statuses = CacheDirectBatch(sub, observe);
+      for (size_t k = 0; k < indexes.size() && k < statuses.size(); ++k)
+        out[indexes[k]] = statuses[k];
+    }
+    return out;
   }
   std::array<std::unique_lock<std::mutex>, kTenantStripes> locks;
   for (size_t stripe = 0; stripe < kTenantStripes; ++stripe) {
@@ -780,7 +860,7 @@ std::vector<Status> DiskCacheGroup::CacheDirectBatch(
     const size_t disk = RouteIndex(item.key);
     if (disk == kInvalidDisk || item.len == 0 || item.data == nullptr)
       continue;
-    if (!TenantLimited(item.key.tenant_hash)) {
+    if (!limited[i]) {
       out[i] = Status::kOk;  // no admission: the engine decides
       continue;
     }
@@ -996,18 +1076,26 @@ uint64_t DiskCacheGroup::TenantUsedBytes(uint64_t tenant_hash) const {
 std::vector<DiskCacheGroup::TenantQuotaMetric>
 DiskCacheGroup::ConfiguredTenantQuotaMetrics() const {
   std::vector<TenantQuotaMetric> metrics;
-  metrics.reserve(tenant_quotas_.size());
-  for (const auto& quota : tenant_quotas_) {
+  std::map<uint64_t, uint64_t> quotas;  // copied: the stripes come first
+  {
+    std::shared_lock<std::shared_mutex> lock(tenant_quotas_mu_);
+    quotas = tenant_quotas_;
+  }
+  metrics.reserve(quotas.size());
+  for (const auto& quota : quotas) {
     std::lock_guard<std::mutex> tenant_lock(
         tenant_stripes_[TenantStripe(quota.first)]);
-    const auto rejected =
-        tenant_quota_rejections_by_hash_.find(quota.first);
-    metrics.push_back(
-        TenantQuotaMetric{quota.first, quota.second,
-                          TenantUsedBytes(quota.first),
-                          rejected == tenant_quota_rejections_by_hash_.end()
-                              ? 0
-                              : rejected->second});
+    uint64_t rejections = 0;
+    {
+      std::shared_lock<std::shared_mutex> lock(tenant_quotas_mu_);
+      const auto rejected =
+          tenant_quota_rejections_by_hash_.find(quota.first);
+      if (rejected != tenant_quota_rejections_by_hash_.end())
+        rejections = rejected->second;
+    }
+    metrics.push_back(TenantQuotaMetric{quota.first, quota.second,
+                                        TenantUsedBytes(quota.first),
+                                        rejections});
   }
   return metrics;
 }

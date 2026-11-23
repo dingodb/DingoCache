@@ -14,6 +14,7 @@
 #include <memory>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -164,6 +165,16 @@ class DiskCacheGroup {
   uint64_t TenantQuotaRejections() const {
     return tenant_quota_rejections_.load(std::memory_order_relaxed);
   }
+  // Reads DFKV_TENANT_QUOTAS_FILE again (on SIGHUP) and replaces the per-tenant
+  // quotas with it; a file that does not parse leaves them as they were
+  // (false, *error says why). Rejection counts of tenants kept are kept.
+  bool ReloadTenantQuotas(std::string* error);
+  uint64_t TenantQuotaReloads() const {
+    return tenant_quota_reloads_.load(std::memory_order_relaxed);
+  }
+  uint64_t TenantQuotaReloadFailures() const {
+    return tenant_quota_reload_failures_.load(std::memory_order_relaxed);
+  }
   // Index of the disk a key is stored on; DiskCount() if no disk takes it.
   size_t DiskIndexOf(const BlockKey& key) const {
     const size_t index = RouteIndex(key);
@@ -180,7 +191,8 @@ class DiskCacheGroup {
     return static_cast<size_t>(tenant_hash) & (kTenantStripes - 1);
   }
   uint64_t TenantLimit(uint64_t tenant_hash) const;
-  // Startup-immutable: true when this tenant has a non-zero node quota.
+  // True when this tenant has a non-zero node quota. The quotas file can be
+  // reloaded (ReloadTenantQuotas): evaluate this once per operation.
   bool TenantLimited(uint64_t tenant_hash) const {
     return TenantLimit(tenant_hash) != 0;
   }
@@ -202,8 +214,17 @@ class DiskCacheGroup {
   std::unordered_map<std::string, size_t> by_id_;  // disk id -> stable index
   ConHash ring_;
   mutable std::array<std::mutex, kTenantStripes> tenant_stripes_;
+  // At most this many stripes are held at once (CacheDirectBatch splits a
+  // batch that spans more), well under what lock checkers track per thread.
+  static constexpr size_t kMaxHeldStripes = 16;
+  // Guards tenant_quotas_ and the shape of tenant_quota_rejections_by_hash_.
+  // Written by ReloadTenantQuotas only, exclusively and without any stripe;
+  // readers take it shared. A rejection count is incremented under the
+  // shared lock and its tenant's stripe (lock order: a stripe, then this).
+  mutable std::shared_mutex tenant_quotas_mu_;
   std::map<uint64_t, uint64_t> tenant_quotas_;
   std::map<uint64_t, uint64_t> tenant_quota_rejections_by_hash_;
+  std::atomic<uint64_t> tenant_quota_reloads_{0}, tenant_quota_reload_failures_{0};
   uint64_t tenant_default_quota_bytes_ = 0;
   std::string tenant_quotas_file_;
   std::atomic<uint64_t> tenant_quota_rejections_{0};

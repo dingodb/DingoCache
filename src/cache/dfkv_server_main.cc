@@ -28,6 +28,7 @@
 #include "utils/log.h"
 #include "common/config_dump.h"
 #include "mds/mds_registrar.h"
+#include "mds/mds_server.h"
 #include "utils/metrics_http.h"
 #include "common/version.h"
 #ifdef DFKV_WITH_RDMA
@@ -73,6 +74,8 @@ static void OnSig(int) {
 // `dfkvctl drain` asked for it; the node stays draining until undrained,
 // and deregisters when it stops (it is being removed).
 enum class DrainState : int { kNone = 0, kByStop = 1, kByCtl = 2 };
+static std::atomic<bool> g_reload{false};
+static void OnHup(int) { g_reload.store(true, std::memory_order_relaxed); }
 
 // A stop signal arrived before the server was up: the start is not carried
 // to its end only to be undone. Whatever accepts requests is stopped, the
@@ -435,6 +438,7 @@ int main(int argc, char** argv) {
   }
   std::signal(SIGINT, OnSig);
   std::signal(SIGTERM, OnSig);
+  std::signal(SIGHUP, OnHup);  // reload the tenant quotas file
   {
     struct sigaction fatal {};
     fatal.sa_sigaction = OnFatalSignal;
@@ -731,8 +735,24 @@ int main(int argc, char** argv) {
 #endif
       self.info = std::move(info);
     }
+    // Heartbeat interval: DFKV_MDS_HEARTBEAT_MS, 1000..10000, default 10000.
+    // The rule: a heartbeat plus one registrar I/O timeout must land within
+    // the MDS lease, so that one late by a whole timeout still renews it.
+    constexpr int kMaxHeartbeatMs = 10000;
+    static_assert(kMaxHeartbeatMs + dfkv::MdsRegistrar::kDefaultIoTimeoutMs <
+                      dfkv::MdsServer::kTtlSeconds * 1000,
+                  "heartbeat + registrar I/O timeout must stay below the lease");
+    dfkv::envparse::U64Spec heartbeat_spec;
+    heartbeat_spec.fallback = 10000;
+    heartbeat_spec.min = 1000;
+    heartbeat_spec.max = kMaxHeartbeatMs;
+    heartbeat_spec.above = dfkv::envparse::Above::kClamp;
+    const int heartbeat_ms = static_cast<int>(
+        dfkv::envparse::EnvU64("DFKV_MDS_HEARTBEAT_MS", heartbeat_spec));
+    dfkv::config_dump::RecordResolved("DFKV_MDS_HEARTBEAT_MS",
+                                      std::to_string(heartbeat_ms));
     registrar = std::make_unique<dfkv::MdsRegistrar>(
-        std::move(eps), group, self, /*heartbeat_ms=*/10000,
+        std::move(eps), group, self, heartbeat_ms,
         dfkv::MdsRegistrar::kDefaultIoTimeoutMs, /*is_client=*/false,
         mds_registration_timeout_ms);
     registrar_metrics->store(registrar.get(), std::memory_order_release);
@@ -799,6 +819,14 @@ int main(int argc, char** argv) {
          !(registrar && registrar->first_registration_timed_out())) {
     struct timespec ts{0, 50 * 1000 * 1000};
     nanosleep(&ts, nullptr);
+    if (g_reload.exchange(false, std::memory_order_relaxed)) {
+      std::string error;
+      if (srv.ReloadTenantQuotas(&error))
+        DFKV_LOG_INFO("dfkv_server: tenant quotas reloaded (SIGHUP)");
+      else
+        DFKV_LOG_WARN("dfkv_server: tenant quotas not reloaded (SIGHUP): " +
+                      error + "; the previous quotas stay");
+    }
   }
   const bool registration_timed_out =
       registrar && registrar->first_registration_timed_out();

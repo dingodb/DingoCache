@@ -415,6 +415,7 @@ journalctl -u dfkv -n 10 --no-pager
 > MDS 注册硬截止时间（默认 60000 ms，合法范围 1000–600000 ms，flag 优先）。
 > 非整数、越界值均以配置错误退出 2；截止前仍未注册则停止所有 listener 并退出
 > 1，由 `Restart=on-failure` 重试，节点不会无限保持 active-but-unregistered。
+> 心跳间隔 `DFKV_MDS_HEARTBEAT_MS`（默认 10000，范围 1000–10000，超出按上限）。约束是心跳间隔加注册器一次请求的 I/O 超时（现为 7 s）小于 MDS 租约（30 s）：一次心跳迟到一个超时也赶得上续约。上限 10 s 留出余量，I/O 超时提高到 11 s 时也满足（编译期检查）。
 > `GET /healthz` 反映当前 store/RAM terminal health；`GET /readyz` 还要求本地
 > startup 和首次 MDS 注册完成。首次成功后 readiness latch 不因瞬时 heartbeat
 > 失败清零，已注册节点继续运行并在 MDS 恢复后续租；必须同时监控
@@ -579,7 +580,7 @@ server 启动时一次性读取（运行期不热加载）：
 `DFKV_TENANT_DEFAULT_QUOTA_BYTES=0` 或 unset 表示未列出的 tenant 无限；
 文件内 limit `0` 也表示该 hash 无限。配置了
 `DFKV_TENANT_QUOTAS_FILE` 时，文件缺失、hash 非 16 位小写 hex、非 uint64、
-重复 hash 或多余字段都会令节点 fail closed。hash 算法由
+重复 hash 或多余字段都会令节点 fail closed（启动时）。运行中改了文件后给 `dfkv_server` 发 `SIGHUP` 即重读，新限额对重读之后开始的写生效（正在进行的写按原限额）；`DFKV_TENANT_DEFAULT_QUOTA_BYTES` 是环境变量，不随 SIGHUP 重读；重读时文件不合法则保留原限额并打 WARN，`dfkv_tenant_quota_reloads_total` / `dfkv_tenant_quota_reload_failures_total` 计数。hash 算法由
 `dfkv_common.identity.tenant_hash` 与 native client 共用。原子管理工具不会删除
 cache data：
 

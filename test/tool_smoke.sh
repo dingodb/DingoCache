@@ -64,6 +64,16 @@ got=$("$BUILD/dfkvctl" --members "n=127.0.0.1:$P" --namespace "dfkv/smoke" get d
 rc=0; "$BUILD/dfkvctl" --bogus ring >/dev/null 2>&1 || rc=$?
 [ "$rc" = 2 ] || { echo "dfkvctl --bogus: expected exit 2, got $rc"; exit 1; }
 "$BUILD/dfkvctl" --help | grep -q "locate <key>"
+# SIGHUP reloads the tenant quotas file (none is set here: the reload fails
+# and is counted) and does not stop the server, as SIGHUP's default would.
+kill -HUP $PID
+for _ in $(seq 1 40); do
+  "$BUILD/dfkvctl" stat "127.0.0.1:$P" | grep -Eq '^dfkv_tenant_quota_reload_failures_total(\{[^}]*\})? 1$' && break
+  sleep 0.05
+done
+"$BUILD/dfkvctl" stat "127.0.0.1:$P" | grep -Eq '^dfkv_tenant_quota_reload_failures_total(\{[^}]*\})? 1$' || {
+  echo "SIGHUP: no failed quota reload counted"; exit 1; }
+kill -0 $PID || { echo "SIGHUP stopped the server"; exit 1; }
 echo "tool_smoke OK (port $P)"
 
 # SIGTERM: the server must report its disks clean before it exits, exit 0,
