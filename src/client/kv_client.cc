@@ -758,6 +758,17 @@ bool KVClient::RefreshMembers(const std::string& seed_addr) {
   return true;
 }
 
+std::vector<std::string> KVClient::MemberAddresses() const {
+  std::vector<std::string> out;
+  {
+    std::lock_guard<std::mutex> lk(ring_mu_);
+    for (const auto& member : addr_) out.push_back(member.second);
+  }
+  std::sort(out.begin(), out.end());
+  out.erase(std::unique(out.begin(), out.end()), out.end());
+  return out;
+}
+
 std::string KVClient::Route(const std::string& key) const {
   if (t_drain_pass) return DrainRoute(key);
   // Hashed before the lock: every routed key of every thread takes it.

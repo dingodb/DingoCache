@@ -7,10 +7,12 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -472,4 +474,28 @@ TEST_F(KVClientTest, RetainDebounceAsksANewOwner) {
   c.BatchRetain(keys, RetainRefresh(300), out);
   EXPECT_EQ(out[0], KVClient::kRetMiss)
       << "reported present on the strength of another node's answer";
+}
+
+// dfkv_bench settles one connection per ring member: it needs every
+// member's address and keys owned by each; 32 fixed keys did not cover a
+// ring of 65.
+TEST(KVClientRing, EveryMemberOfALargeRingGetsASettleKey) {
+  std::vector<std::pair<std::string, std::string>> members;
+  for (int i = 0; i < 65; ++i)
+    members.push_back({"n" + std::to_string(i),
+                       "10.0.0." + std::to_string(i) + ":1"});
+  KVClient c(members, "test/model");
+  const std::vector<std::string> addresses = c.MemberAddresses();
+  ASSERT_EQ(addresses.size(), 65u);
+  EXPECT_TRUE(std::is_sorted(addresses.begin(), addresses.end()));
+  std::set<std::string> owners_of_32;
+  for (int i = 0; i < 32; ++i)
+    owners_of_32.insert(c.OwnerOf("dfkv_bench/settle_" + std::to_string(i)));
+  EXPECT_LT(owners_of_32.size(), 65u);  // why the bench no longer uses 32
+  std::set<std::string> covered;
+  for (size_t i = 0; covered.size() < addresses.size() && i < 256 * 65; ++i)
+    covered.insert(c.OwnerOf("dfkv_bench/settle_" + std::to_string(i)));
+  EXPECT_EQ(covered.size(), 65u);
+  EXPECT_TRUE(KVClient(std::vector<std::pair<std::string, std::string>>{},
+                       "test/model").OwnerOf("k").empty());
 }

@@ -3,6 +3,12 @@
 ## Unreleased
 
 
+- `dfkv_bench`: the connection settle before the measured phase now puts
+  one key on every ring member (found by hashing candidates until each
+  member owns one) instead of 32 fixed keys, which on a ring of 65 left
+  about 40 members unprobed and their cold connections failing in the
+  measured phase. New `KVClient::OwnerOf` and `MemberAddresses`.
+
 - Client, RDMA with `DFKV_RDMA_NUMA=1`: the calling CPU's NUMA node is
   looked up in a table read from sysfs once, not by opening up to 256
   sysfs files on every connection acquire: 14.9 us to 0.055 us per lookup.

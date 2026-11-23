@@ -35,6 +35,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <map>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -330,10 +331,21 @@ int main(int argc, char** argv) {
     // with distinct hashes to cover every ring member, retrying individually
     // until each succeeds — a batched settle still fails on cold connections;
     // individual Puts block until the per-node QP is established.
-    constexpr size_t kSettleKeys = 32;  // covers rings up to ~32 nodes
-    size_t settle_failures = 0;
-    for (size_t i = 0; i < kSettleKeys; ++i) {
+    // One key per member, found by hashing candidates until every member
+    // owns one (32 fixed keys left about 40 of 65 members unprobed).
+    const std::vector<std::string> members = c.MemberAddresses();
+    std::map<std::string, std::string> settle_keys;  // member -> key
+    for (size_t i = 0; settle_keys.size() < members.size() &&
+                       i < 256 * members.size() + 1024;
+         ++i) {
       std::string sk = "dfkv_bench/settle_" + std::to_string(i);
+      const std::string owner = c.OwnerOf(sk);
+      if (!owner.empty()) settle_keys.emplace(owner, std::move(sk));
+    }
+    const size_t kSettleKeys = members.size();
+    size_t settle_failures = members.size() - settle_keys.size();
+    for (const auto& [owner, sk] : settle_keys) {
+      (void)owner;
       bool settled = false;
       for (int attempt = 0; attempt < 20; ++attempt) {
         if (c.Put(sk, probe.data(), probe.size())) {
@@ -346,7 +358,7 @@ int main(int argc, char** argv) {
     }
     if (settle_failures != 0) {
       std::fprintf(stderr,
-                   "dfkv_bench: %zu/%zu connection-settle keys failed; "
+                   "dfkv_bench: %zu/%zu ring members failed to settle; "
                    "refusing a misleading measured phase\n",
                    settle_failures, kSettleKeys);
       ReportDiagnostics("SETTLE", "", c.MetricsSnapshot());
