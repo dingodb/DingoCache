@@ -237,6 +237,31 @@ TEST(CApiGuard, NullAndZeroLengthInputsFailClosedWithSafeOutputs) {
   dfkv_close(c);
 }
 
+TEST(CApiGuard, RetainRefusesReservedBitsAndUnknownFlags) {
+  // As dfkv_open_v2: a field this library does not know is refused, not
+  // ignored, so a caller built against a later header learns it at once.
+  dfkv_client_t c = OpenEmpty();
+  ASSERT_NE(c, nullptr);
+  const char* key = "k";
+  const uint64_t key_len = 1;
+  uint8_t result = 0;
+  dfkv_retain_options opt{};
+  opt.struct_size = sizeof(opt);
+  opt.ttl_s = 60;
+  opt.mode = DFKV_RETAIN_REFRESH;
+  const void* keys[] = {key};
+  EXPECT_EQ(dfkv_batch_retain(c, keys, &key_len, 1, &opt, &result), 0);
+  opt.reserved0 = 1;
+  EXPECT_EQ(dfkv_batch_retain(c, keys, &key_len, 1, &opt, &result), -1);
+  EXPECT_EQ(result, DFKV_RET_ERROR);
+  opt.reserved0 = 0;
+  opt.flags = DFKV_RETAIN_F_NO_DEBOUNCE | 0x80;
+  EXPECT_EQ(dfkv_batch_retain(c, keys, &key_len, 1, &opt, &result), -1);
+  opt.flags = DFKV_RETAIN_F_NO_DEBOUNCE;
+  EXPECT_EQ(dfkv_batch_retain(c, keys, &key_len, 1, &opt, &result), 0);
+  dfkv_close(c);
+}
+
 TEST(CApiGuard, ScatterGatherGuardsInitializeOutputs) {
   dfkv_client_t c = OpenEmpty();
   ASSERT_NE(c, nullptr);

@@ -438,8 +438,11 @@ int dfkv_batch_retain(dfkv_client_t c, const void* const* keys,
     std::fill(out_result, out_result + n, static_cast<uint8_t>(DFKV_RET_ERROR));
   return NoThrow(-1, [&] {
     if (!c || n < 0 || !opt) return -1;
+    // A field this library does not know is refused, not ignored (as in
+    // dfkv_open_v2): a caller built against a later header learns it here.
     if (opt->struct_size < sizeof(dfkv_retain_options) ||
-        opt->mode > DFKV_RETAIN_REFRESH)
+        opt->mode > DFKV_RETAIN_REFRESH || opt->reserved0 != 0 ||
+        (opt->flags & ~DFKV_RETAIN_F_NO_DEBOUNCE) != 0)
       return -1;
     if (n > 0 && (!keys || !key_lens || !out_result)) return -1;
     std::vector<std::string> valid_keys;

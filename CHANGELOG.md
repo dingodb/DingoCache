@@ -3,6 +3,10 @@
 ## Unreleased
 
 
+- C API: `dfkv_batch_retain` refuses a nonzero `reserved0` and unknown
+  `flags` (returns -1), as `dfkv_open_v2` does for its options; they were
+  ignored.
+
 - Client and MDS registration: stopping the member poller, the registrar and
   the latency probe can no longer miss its wakeup and wait a whole period
   (up to the 10 s heartbeat) in `dfkv_close`; the stop flag is now set under
