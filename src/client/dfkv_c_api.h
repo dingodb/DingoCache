@@ -93,6 +93,54 @@ int dfkv_batch_exist(dfkv_client_t c, const void* const* keys,
 int dfkv_batch_remove(dfkv_client_t c, const void* const* keys,
                       const uint64_t* key_lens, int n, int* out_ok);
 
+// ---- Per-key outcomes ----
+// The *_st forms of the batch calls take the same arguments as their plain
+// forms plus out_status (len n, required when n > 0), which receives one
+// DFKV_ST_* code per key; every other output and the return value are those
+// of the plain form. A key is a hit / stored iff its code is DFKV_ST_OK.
+// Codes 1..7 are what the owning node or the transport answered; 8..11 are
+// decided by the client before or after the request. For a read, NOT_FOUND,
+// LENGTH_MISMATCH and INVALID mean the key cannot be loaded (recompute it);
+// PEER_COOLING, IO_ERROR, NO_ROUTE, RESOURCE_EXHAUSTED and
+// NO_COMPATIBLE_RAIL mean it could not be asked (it may be there). For a
+// put, CACHE_FULL and QUOTA_EXCEEDED mean the node refused it for room.
+enum {
+  DFKV_ST_OK = 0,
+  DFKV_ST_NOT_FOUND = 1,
+  DFKV_ST_CACHE_FULL = 2,
+  DFKV_ST_QUOTA_EXCEEDED = 3,
+  DFKV_ST_IO_ERROR = 4,            // transport or node I/O error, timeout
+  DFKV_ST_INVALID = 5,             // refused by the node or transport, also a
+                                   // stored value larger than the destination
+  DFKV_ST_RESOURCE_EXHAUSTED = 6,  // this process's transport budget
+  DFKV_ST_NO_COMPATIBLE_RAIL = 7,  // no healthy rail shared with the node
+  DFKV_ST_LENGTH_MISMATCH = 8,     // stored shorter than an exact read asks
+  DFKV_ST_PEER_COOLING = 9,        // node in cooldown after failures; not sent
+  DFKV_ST_NO_ROUTE = 10,           // no owner: empty ring, or no address
+  DFKV_ST_BAD_ARGUMENT = 11        // invalid key, buffer or size; not sent
+};
+int dfkv_batch_put_st(dfkv_client_t c, const void* const* keys,
+                      const uint64_t* key_lens, const void** ptrs,
+                      const uint64_t* sizes, int n, int* out_ok,
+                      uint8_t* out_status);
+int dfkv_batch_get_st(dfkv_client_t c, const void* const* keys,
+                      const uint64_t* key_lens, void** ptrs,
+                      const uint64_t* sizes, int n, int* out_hit,
+                      uint8_t* out_status);
+int dfkv_batch_get_auto_st(dfkv_client_t c, const void* const* keys,
+                           const uint64_t* key_lens, void** ptrs,
+                           const uint64_t* caps, int n, int* out_hit,
+                           uint64_t* out_len, uint8_t* out_status);
+int dfkv_batch_put_sg_st(dfkv_client_t c, const void* const* keys,
+                         const uint64_t* key_lens, const void*** ptrs,
+                         const uint64_t** sizes, const int* num_bufs, int n,
+                         int* out_ok, uint8_t* out_status);
+int dfkv_batch_get_auto_sg_st(dfkv_client_t c, const void* const* keys,
+                              const uint64_t* key_lens, void*** dsts,
+                              const uint64_t** caps, const int* num_dsts,
+                              int n, int* out_hit, uint64_t* out_len,
+                              uint8_t* out_status);
+
 // ---- Retention: per-object minimum lifetime (kRetain) ----
 // SET protects committed objects for ttl_s (clamped by the server cap) from
 // capacity eviction; REFRESH renews with each object's stored TTL and doubles
