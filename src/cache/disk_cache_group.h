@@ -164,6 +164,11 @@ class DiskCacheGroup {
   uint64_t TenantQuotaRejections() const {
     return tenant_quota_rejections_.load(std::memory_order_relaxed);
   }
+  // Index of the disk a key is stored on; DiskCount() if no disk takes it.
+  size_t DiskIndexOf(const BlockKey& key) const {
+    const size_t index = RouteIndex(key);
+    return index == kInvalidDisk ? DiskCount() : index;
+  }
 
  private:
   static constexpr size_t kInvalidDisk = std::numeric_limits<size_t>::max();

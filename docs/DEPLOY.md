@@ -333,7 +333,7 @@ WantedBy=multi-user.target
 > - `--slab-write direct|buffered`（默认 `direct`）：slab 数据面使用 O_DIRECT；文件系统不支持时整店回退 bounded buffered，以 `wr=` 上报真值。
 > - `--ram-tier on`（默认关）：arena 内对象走 RDMA 零拷贝。`--ram-write-mode writeback|writearound`（默认 `writeback`）选择 PUT 先入 RAM 后落盘，或直接盘写、读时晋升。`writeback` 默认在数据进入可读且 flush-pinned 的 RAM slot 后返回 `kOk`。达到正的 `DFKV_RAM_ACK_HIGH_WATERMARK_PCT`（默认 80）时，只拒绝尚无 owner 的新 key，返回 `kCacheFull`，不转为直接盘写。已有同 key 请求仍加入首写者的完成结果；水位设为 0 保留强制 disk-ACK 语义。需要所有 PUT 都等待持久化时设置 `DFKV_PUT_ACK_MODE=disk`。`--ram-tier-bytes` 限定总预算；超 extent 对象仍受 dedicated allocation 预算约束。显式启用 RAM 后，分配或 NUMA 模式失败会拒绝启动。
 > - `--ram-tier-numa interleave|off`（默认 `interleave`）：这是当前完整 mode 集；不接受数字 node ID。arena 预触并绑策略，须核 `MemoryMax`。
-> - `--ram-flush-threads <n>` / `DFKV_RAM_FLUSH_THREADS`：请求值会提高到至少 shard 数；实际值由 `dfkv_ram_flush_threads` 报告（默认请求=4×盘数，上限 16）。
+> - `--ram-flush-threads <n>` / `DFKV_RAM_FLUSH_THREADS`：请求值会提高到至少 shard 数，多盘时至少 2×shard 数；实际值由 `dfkv_ram_flush_threads` 报告（默认请求=4×盘数，上限 16）。刷盘按目标盘分队列：一个 flush 批次只含一块盘的对象，同一 shard 里一块盘同时最多占用 flush 线程数减一，挂住的慢盘不拖住其他盘的刷盘；RAM-ACK 下一块盘的脏数据最多占脏水位的 2/盘数，到了只拒绝这块盘的新 key。
 > - 微调项（env only）：`DFKV_SLAB_TABLE_SYNC_MS` 控制运行期对 `slots.tbl` 的周期同步（0=关）。默认 `DFKV_SLAB_WARM_RESTART=boot` 时 100 ms，`auto` 时 5 s，`off` 时关：`off` 在非干净退出后一律清零，`auto` 只在内核和挂载都没变（页缓存还在）时保留表，两者的恢复都不依赖 100 ms 的同步；`auto` 留下 5 s 一次的慢同步，是为了在运行期间就发现表的后台回写错误（EIO），不必等到停止或重启时的同步才发现（错误只报一次，回写失败的页也可能随之丢掉，之后再读到的就是旧记录）。干净停止和 extent 改绑时表照常同步。
 > - 非干净退出后的处理（env only）：`DFKV_SLAB_WARM_RESTART=off|auto|boot`，默认 `off`。
 >   - `off`：非干净退出后一律清零，等同 2.35。
@@ -662,7 +662,7 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | `--rdma-op-timeout-ms` / `DFKV_RDMA_OP_TIMEOUT_MS` | `5000` | per-op RDMA deadline |
 | `--server-uring` / `DFKV_SERVER_URING` | `0` | io_uring async-GET（编须 `-DDFKV_WITH_URING`） |
 | `--server-uring-depth` / `DFKV_SERVER_URING_DEPTH` | — | uring SQ 深度 |
-| `--ram-flush-threads` / `DFKV_RAM_FLUSH_THREADS` | 默认 4×盘数， 钳至 shard 数上限 16 | RAM tier flush 线程 |
+| `--ram-flush-threads` / `DFKV_RAM_FLUSH_THREADS` | 默认 4×盘数， 钳至 shard 数上限 16；至少 shard 数，多盘时至少 2×shard 数 | RAM tier flush 线程 |
 | `--slab-table-sync-ms` / `DFKV_SLAB_TABLE_SYNC_MS` | `boot` 下 `100 ms`，`auto` 下 `5 s`，`off` 下 `0`（关） | 运行期 `slots.tbl` 周期同步节奏；`boot` 的恢复靠它，`auto` 的 5 s 用来及时发现表的回写错误 |
 | `DFKV_SLAB_WARM_RESTART` | `off`（`auto` / `boot`） | 非干净退出后保留还是清零 slab 缓存 |
 | `--slab-reclaim-ms` / `DFKV_SLAB_RECLAIM_MS` | `50 ms`, `0`=关 | slab 后台回收 tick |
@@ -726,7 +726,7 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | `DFKV_RAM_TIER_NUMA` | `interleave` | interleave / off |
 | `DFKV_RAM_TIER_LOCK` | `on` | arena 是否锁在内存里（`mlock2`）；锁不上只告警，`dfkv_ram_arena_locked` 反映实际结果 |
 | `DFKV_RAM_TIER_HUGEPAGES` | `on` | arena 是否申请透明大页（`madvise(MADV_HUGEPAGE)`）。系统的 `transparent_hugepage/enabled` 是 `madvise` 或 `always` 时生效，是 `never` 时等于没开；内核给不出大页的部分自动退回 4K 页。设成 `off` 只是不申请，页大小由系统设置决定：`madvise` 下是 4K 页，`always` 下仍然是大页。实际大页承载量看启动日志和 `dfkv_ram_arena_hugepage_bytes` |
-| `DFKV_RAM_FLUSH_THREADS` | `4×盘数`，钳至 shard 上限 16 | flush 线程 |
+| `DFKV_RAM_FLUSH_THREADS` | `4×盘数`，钳至 shard 上限 16；至少 shard 数，多盘时至少 2×shard 数 | flush 线程 |
 | `DFKV_RAM_PUT_WAIT_MS` | `3000`，上限 3600000，`0` 表示不限 | 一个 PUT 等自己这个 key 的属主值的最长时间：disk-ACK 下每个被接纳的 PUT（首写者和重复 PUT）都等这个值刷盘；RAM-ACK 下重复 PUT 只等到首写者的值在 RAM 里可见。时间从这个 PUT 所在的请求批次到达时算起：一条 RDMA 连接按顺序处理客户端一个窗口里的请求，客户端给整个窗口一个截止时间，所以同一窗口里要等待的 PUT 共用这段时间，而不是每个重新计时。等待期间不占用 PUT 的 key 分片锁。到时回 `kCacheFull`（这次请求没看到落盘，可重试；已在 RAM 里的值照常继续刷盘，客户端不会因此把节点判坏）。要小于客户端的操作超时（`DFKV_RDMA_OP_TIMEOUT_MS`，默认 5000；批量窗口看 `DFKV_RDMA_BATCH_OP_TIMEOUT_MS`）：客户端先超时会按 IO 错误冷却这个节点。必须是纯数字，否则按默认值处理并打一条 WARN；超过上限也按默认值 |
 | `DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S` | `30`，上限 3600，`0` 表示不等 | 停止时给 RAM 层积压刷盘的时限，从开始停止算起。到时还只在内存里的对象直接丢弃（缓存语义，日志里有数量），然后各盘照常同步并写 clean。要小于 `TimeoutStopSec` 减去停请求和各盘同步的时间；默认值按 systemd 默认的 90 秒停止超时取的，`TimeoutStopSec` 调大了就一起调大。非法值（非数字、带单位）告警后用默认值 |
 

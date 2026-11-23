@@ -2700,3 +2700,106 @@ TEST(RamTier, APutAfterAStaleCopyWasDroppedUnderAReaderGoesToTheDisk) {
   EXPECT_NE(second.status, Status::kIOError);
   EXPECT_EQ(second.disposition, RamTier::PutDisposition::kBypass);
 }
+
+// One disk that hangs (slow, not failing) must not hold up the flushes of
+// the others. The sink is shaped like the server's: one call writes every
+// item it is given, each to its own disk, and returns when all are done.
+namespace {
+struct TwoDiskSink {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool disk1_open = false;
+  static size_t Disk(const BlockKey& key) { return key.digest_hi % 2; }
+  std::vector<Status> operator()(const std::vector<RamTier::FlushItem>& items) {
+    for (const auto& item : items) {
+      if (Disk(item.key) != 1) continue;
+      std::unique_lock<std::mutex> lock(mu);
+      cv.wait(lock, [&] { return disk1_open; });
+      break;
+    }
+    return std::vector<Status>(items.size(), Status::kOk);
+  }
+  void Open() {
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      disk1_open = true;
+    }
+    cv.notify_all();
+  }
+};
+}  // namespace
+
+TEST(RamTier, AHungDiskDoesNotHoldUpTheFlushesOfTheOthers) {
+  TwoDiskSink sink;
+  RamTier::Options o = Opts(1024 * 4096);
+  o.flush_threads = 4;
+  o.flush_lanes = 2;
+  o.flush_lane = [](const BlockKey& key) { return TwoDiskSink::Disk(key); };
+  RamTier rt(o, nullptr);
+  rt.set_flush_batch([&](const std::vector<RamTier::FlushItem>& items) {
+    return sink(items);
+  });
+  ASSERT_TRUE(rt.ok());
+  const std::string v(4000, 'v');
+  for (uint64_t i = 0; i < 64; ++i) ASSERT_TRUE(rt.Put(K(i), v.data(), v.size()));
+  const auto disk0_written = [&] {
+    for (uint64_t i = 0; i < 64; i += 2) {
+      size_t len = 0;
+      bool dirty = true;
+      if (!rt.Lookup(K(i), &len, &dirty) || dirty) return false;
+    }
+    return true;
+  };
+  EXPECT_TRUE(WaitFor(disk0_written))
+      << "the values of the healthy disk wait for the hung one";
+  sink.Open();
+  ASSERT_TRUE(WaitFor([&] { return rt.FlushBacklog() == 0; }));
+}
+
+// A disk whose values pile up dirty fills its share of the RAM-ACK
+// watermark, not the whole of it: new keys of the other disks are still
+// acknowledged from RAM.
+TEST(RamTier, AHungDiskOnlyBackpressuresItsOwnKeys) {
+  constexpr size_t kDisks = 4;
+  std::mutex mu;
+  std::condition_variable cv;
+  bool open = false;
+  RamTier::Options o = Opts(256 * 4096);
+  o.flush_threads = 2;
+  o.flush_lanes = kDisks;
+  o.flush_lane = [](const BlockKey& key) { return key.digest_hi % kDisks; };
+  RamTier rt(o, nullptr);
+  rt.set_flush_batch([&](const std::vector<RamTier::FlushItem>& items) {
+    if (!items.empty() && items[0].key.digest_hi % kDisks == 1) {
+      std::unique_lock<std::mutex> lock(mu);
+      cv.wait(lock, [&] { return open; });
+    }
+    return std::vector<Status>(items.size(), Status::kOk);
+  });
+  ASSERT_TRUE(rt.ok());
+  const std::string v(4000, 'v');
+  // Disk 1's keys until RAM refuses them: its share is 2/4 of the 80% mark.
+  uint64_t id = 1;
+  size_t admitted = 0;
+  for (; id < 4 * 256; id += kDisks) {
+    const auto r = rt.PutWriteBack(K(id), v.data(), v.size());
+    if (r.disposition == RamTier::PutDisposition::kBackpressure) break;
+    ASSERT_EQ(r.status, Status::kOk);
+    ++admitted;
+  }
+  EXPECT_LT(id, 4u * 256) << "disk 1 was never backpressured";
+  EXPECT_LE(rt.DirtyBytes(), 256u * 4096 * 80 / 100 / kDisks * 2 + 4096);
+  // Disk 0's keys are still taken and written.
+  for (uint64_t k = 0; k < 16; ++k) {
+    const auto r = rt.PutWriteBack(K(4 * (1000 + k)), v.data(), v.size());
+    EXPECT_EQ(r.disposition, RamTier::PutDisposition::kComplete) << k;
+    EXPECT_EQ(r.status, Status::kOk) << k;
+  }
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    open = true;
+  }
+  cv.notify_all();
+  ASSERT_TRUE(WaitFor([&] { return rt.FlushBacklog() == 0; }));
+  EXPECT_GT(admitted, 0u);
+}

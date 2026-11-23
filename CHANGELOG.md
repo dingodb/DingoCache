@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Server, RAM tier: a slow disk no longer holds up the flushes of the
+  others. Flush queues were per RAM shard and a flush batch mixed the
+  values of every disk; the batch returned when its slowest disk was done,
+  so a disk that hung (without failing) stalled every shard, dirty data
+  climbed to the RAM-ACK watermark and new keys of healthy disks got
+  `kCacheFull`. Each shard now queues by disk, a batch holds one disk's
+  values, a disk occupies at most all but one of a shard's flush workers
+  (with more than one disk a shard gets at least two), and a disk's dirty
+  values may fill at most twice its share of the watermark: past that only
+  its own new keys are refused.
+
 - vLLM connector, namespace: each cache group's object size
   (`logical_bytes_per_block`) is not in the namespace. It is not added now:
   that changes every key and so waits for the next layout-ID bump, which
