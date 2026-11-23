@@ -401,12 +401,16 @@ class RamTier {
   // again, during the read); the same holds for a reservation's Commit.
   bool PutDurable(const BlockKey& key, const void* data, size_t len,
                   uint64_t generation = 0);
+  bool PutDurableImpl(const BlockKey& key, const void* data, size_t len,
+                      uint64_t generation);
 
   // Reserve a registered-arena slot before an O_DIRECT read, so the read can
   // populate the durable RAM entry in place. Oversized values live outside the
   // registered arena and intentionally decline this zero-copy path.
   bool ReserveDurable(const BlockKey& key, size_t len,
                       DurableReservation* out, uint64_t generation = 0);
+  bool ReserveDurableImpl(const BlockKey& key, size_t len,
+                          DurableReservation* out, uint64_t generation);
 
   // On hit with `out`, pins the resident allocation, marks an arena slot
   // referenced for CLOCK eviction, and returns one move-only owner. Without
@@ -456,6 +460,23 @@ class RamTier {
   uint64_t Misses() const { return misses_.load(std::memory_order_relaxed); }
   uint64_t Puts() const { return puts_.load(std::memory_order_relaxed); }
   uint64_t Promoted() const { return promotes_.load(std::memory_order_relaxed); }
+  // Promotions the tier did not take (PutDurable or ReserveDurable said
+  // no), and reservations that ended without a copy installed (the read
+  // failed, or a REMOVE or a newer disk value overtook it).
+  uint64_t PromoteDeclined() const {
+    return promote_declined_.load(std::memory_order_relaxed);
+  }
+  uint64_t ReservationsAborted() const {
+    return reservations_aborted_.load(std::memory_order_relaxed);
+  }
+  // Evicted values (capacity) never read from RAM since they were taken in,
+  // and the time evicted values had been resident, summed in milliseconds.
+  uint64_t EvictedUnread() const {
+    return evicted_unread_.load(std::memory_order_relaxed);
+  }
+  uint64_t EvictedAgeMs() const {
+    return evicted_age_ms_.load(std::memory_order_relaxed);
+  }
   uint64_t PutBypass() const { return put_bypass_.load(std::memory_order_relaxed); }
   uint64_t Flushed() const { return flushed_.load(std::memory_order_relaxed); }
   uint64_t FlushDropped() const { return flush_dropped_.load(std::memory_order_relaxed); }
@@ -557,6 +578,10 @@ class RamTier {
     uint32_t lane = 0;  // Options::flush_lane
     std::chrono::steady_clock::time_point dirty_since;
     uint64_t large_seq = 0;  // see Shard::large_keys
+    // When the value was taken in, and whether RAM has served it since.
+    std::chrono::steady_clock::time_point admitted_at =
+        std::chrono::steady_clock::now();
+    bool read = false;
     bool remove_pending = false;  // hidden immediately; physical free after pins
     // remove_pending because the disk no longer had the key (a stale written
     // copy dropped by a PUT), not because of a REMOVE.
@@ -745,6 +770,9 @@ class RamTier {
   std::atomic<uint64_t> budget_used_{0};
   std::atomic<uint64_t> large_used_{0};
   std::atomic<uint64_t> large_evictions_{0};
+  std::atomic<uint64_t> promote_declined_{0}, reservations_aborted_{0};
+  std::atomic<uint64_t> evicted_unread_{0}, evicted_age_ms_{0};
+  void NoteEvicted(const Entry& entry);
   std::atomic<uint64_t> hits_{0}, misses_{0}, puts_{0}, put_bypass_{0}, promotes_{0};
   std::atomic<uint64_t> flushed_{0}, flush_dropped_{0}, reclaimed_{0}, rebalanced_{0};
   std::atomic<uint64_t> dirty_bytes_{0}, dirty_objects_{0};

@@ -2907,3 +2907,48 @@ TEST(RamTier, DedicatedChurnKeepsOneEntryPerValueAndItsAge) {
   EXPECT_TRUE(rt.Contains(K(4)));
   EXPECT_TRUE(rt.Contains(K(5)));
 }
+
+// Observability: evictions of values never read, their resident time, and
+// promotions or reservations that did not end in a RAM copy.
+TEST(RamTier, CountsUnreadEvictionsAndDeclinedPromotions) {
+  FlushSink sink;
+  RamTier::Options o = Opts(64 * 4096);
+  o.large_reserve_bytes = 0;
+  o.reclaim_interval_ms = 0;
+  RamTier rt(o, sink.fn());
+  ASSERT_TRUE(rt.ok());
+  const std::string v(4000, 'v');
+  ASSERT_TRUE(rt.Put(K(1), v.data(), v.size()));
+  ASSERT_TRUE(WaitFor([&] { return rt.FlushBacklog() == 0; }));
+  ASSERT_TRUE(rt.Put(K(2), v.data(), v.size()));
+  ASSERT_TRUE(WaitFor([&] { return rt.FlushBacklog() == 0; }));
+  {
+    RamTier::Hit h;
+    ASSERT_TRUE(rt.GetPrep(K(1), 0, v.size(), &h));  // K(1) is read once
+    RamTier::Hit pulled;  // K(2) too, as the RDMA pull path reads it
+    ASSERT_TRUE(rt.GetPrep(K(2), 0, v.size(), &pulled,
+                           /*count_access=*/false));
+  }
+  std::this_thread::sleep_for(5ms);
+  for (uint64_t i = 3; i < 400; ++i) {
+    rt.Put(K(i), v.data(), v.size());
+    WaitFor([&] { return rt.FlushBacklog() == 0; });
+  }
+  const uint64_t evicted = rt.Evictions();
+  ASSERT_GT(evicted, 1u);
+  EXPECT_LE(rt.EvictedUnread(), evicted);
+  EXPECT_GE(rt.EvictedUnread() + 2, evicted) << "only K(1) and K(2) were read";
+  const uint64_t read_and_evicted =
+      (rt.Contains(K(1)) ? 0 : 1) + (rt.Contains(K(2)) ? 0 : 1);
+  EXPECT_EQ(rt.EvictedUnread() + read_and_evicted, evicted);
+  EXPECT_GE(rt.EvictedAgeMs(), 5u);
+
+  EXPECT_EQ(rt.PromoteDeclined(), 0u);
+  EXPECT_FALSE(rt.PutDurable(K(9000), v.data(), 0));  // nothing to keep
+  EXPECT_EQ(rt.PromoteDeclined(), 1u);
+  {
+    RamTier::DurableReservation reservation;
+    ASSERT_TRUE(rt.ReserveDurable(K(9001), v.size(), &reservation));
+  }  // dropped without a commit: the read it was for did not complete
+  EXPECT_EQ(rt.ReservationsAborted(), 1u);
+}

@@ -3,6 +3,13 @@
 ## Unreleased
 
 
+- Server, RAM tier metrics: `dfkv_ram_evicted_unread_total` (values
+  evicted for room without having been read from RAM),
+  `dfkv_ram_evicted_age_ms_total` (their resident time, summed),
+  `dfkv_ram_promote_declined_total` and
+  `dfkv_ram_reservations_aborted_total` (promotions that did not end in a
+  RAM copy).
+
 - Server, RAM tier: values larger than an arena extent are no longer kept in
   RAM by default; they are written to and read from the disk.
   `DFKV_RAM_TIER_LARGE_RESERVE_BYTES` sets a budget for them and brings that
