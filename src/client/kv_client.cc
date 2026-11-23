@@ -577,7 +577,10 @@ void KVClient::StartProbe(int interval_ms) {
 }
 
 void KVClient::StopProbe() {
-  if (!probe_running_.exchange(false, std::memory_order_relaxed)) return;
+  {
+    std::lock_guard<std::mutex> lk(probe_mu_);  // see MdsMemberPoller::Stop
+    if (!probe_running_.exchange(false, std::memory_order_relaxed)) return;
+  }
   probe_cv_.notify_all();
   if (probe_th_.joinable()) probe_th_.join();
 }

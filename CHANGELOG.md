@@ -3,6 +3,11 @@
 ## Unreleased
 
 
+- Client and MDS registration: stopping the member poller, the registrar and
+  the latency probe can no longer miss its wakeup and wait a whole period
+  (up to the 10 s heartbeat) in `dfkv_close`; the stop flag is now set under
+  the mutex their loops wait with.
+
 - Client, batch PUT over RDMA: a node's keys go out in shards, as the
   scatter-gather PUT and the reads do (`DFKV_READ_SHARD_KEYS`,
   `DFKV_READ_MAX_CONNS`), instead of all on one connection; and a transport
