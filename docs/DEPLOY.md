@@ -499,6 +499,8 @@ journalctl -u dfkv -n 10 --no-pager
 >
 > **rail 同名配对**：client 在 bootstrap 里报本端设备名，server 在同名设备上建 QP，没有“本端 X 连对端 Y”的交叉配对；候选集是 `DFKV_RDMA_DEV`，列表外的对端 rail 不用。对端不服务某个设备（server 在回复前关掉 bootstrap）时，第一次照旧按“忙”处理（停一下换 rail 重试）；若同一操作随即在另一条 rail 上连上了这个 peer，client 在原 rail 上再拨一次确认：仍在回复前被关掉，才认定该设备被拒，把 (peer, rail) 记为一次 endpoint 失败、进入冷却（之后有恢复探测），计数 `dfkv_rdma_client_rail_refusals_total`，后续操作不再先撞它。确认拨号的连接和每次读最多等 300 ms，超时不算确认、也不计任何 rail。握手满载（`DFKV_RDMA_MAX_PENDING_HANDSHAKES`）或 server 停止时的关闭在确认拨号时通常已不再出现，不会被当成拒绝；若对端恰在确认拨号时仍满载或处于 receive-pool 压力，也可能被计为拒绝，代价有界（基础冷却 `DFKV_RDMA_REMOTE_RAIL_COOLDOWN_MS`，默认 2 s，之后有恢复探测）。对端在本端可用（端口正常、未本地隔离）的 rail 只剩这一条时不冷却，同一对端的两次确认不会并发判定。静态成员（没有 MDS 身份）按地址记这类拒绝，在任一 rail 上新建连接成功即清掉该 rail 的失败计数；普通 endpoint 失败对静态成员仍不冷却。
 >
+> **本端端口状态**：client 每 `DFKV_RDMA_PORT_CHECK_MS`（默认 1000，0 关闭，上限 60000）查一次各 rail 的端口状态（每条 rail 一个常开的设备句柄，`ibv_query_port`）。端口离开 ACTIVE 的 rail 退出选择，其空闲连接回收，日志 WARN `port not ACTIVE`；回到 ACTIVE 后重新参与选择（INFO）。查询失败按状态未知处理、保持原样。启动时就不是 ACTIVE 的 rail 不在候选里（发现阶段只取 ACTIVE），运行中恢复也不会加入，需重启 client。指标 `dfkv_rdma_client_rails_port_down`、`dfkv_rdma_client_port_down_events_total`。
+>
 > GPU/CPU 异构示例（名称仅为示例，生产须用两端实际同 fabric 名）：
 > ```bash
 > # GPU host: two preferred rails plus one lower-bandwidth fallback

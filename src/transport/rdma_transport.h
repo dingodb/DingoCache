@@ -13,6 +13,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <map>
 #include <optional>
@@ -36,6 +37,7 @@ namespace dfkv {
 namespace rdma {
 class RcEndpoint;
 class RdmaTopology;
+class PortWatcher;
 class RailPolicy;
 }
 
@@ -274,6 +276,12 @@ class RdmaTransport : public Transport {
                       uint64_t generation, RemoteRailOutcome outcome);
   void RetireIdlePeerRail(const std::string& peer_id, size_t local_rail);
   static int QpAccessFlags(const Conn* conn);  // tests
+  // Every idle connection on a local rail (its port went down).
+  void RetireIdleRail(size_t local_rail);
+  void RetireIdleIf(const std::function<bool(const Conn*)>& match);
+  // Follows each rail's port state: a rail whose port is not ACTIVE is out
+  // of selection until it is again (DFKV_RDMA_PORT_CHECK_MS).
+  void CheckPorts();
   void CompleteRemoteLease(Conn* c, RemoteRailOutcome outcome);
   void RecordRailTransfer(Conn* c, bool put, uint64_t operations,
                           uint64_t bytes);
@@ -411,6 +419,11 @@ class RdmaTransport : public Transport {
   // Enabled by default below the recommended 30 s server reaper interval.
   // Set DFKV_RDMA_KEEPALIVE_MS=0 to disable.
   int keepalive_ms_ = 15000;
+  int port_check_ms_ = 1000;  // DFKV_RDMA_PORT_CHECK_MS; 0 = off
+  std::unique_ptr<rdma::PortWatcher> port_watcher_;
+  std::vector<uint8_t> port_active_;  // keepalive thread only
+  std::atomic<uint64_t> port_down_events_{0};
+  std::atomic<uint64_t> rails_port_down_{0};
   std::atomic<bool> keepalive_stop_{false};
   std::condition_variable keepalive_cv_;
   std::mutex keepalive_mu_;

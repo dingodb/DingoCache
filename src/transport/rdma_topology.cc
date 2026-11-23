@@ -247,6 +247,48 @@ int RdmaTopology::SelectDevice(int numa_node, bool numa_aware,
   return -1;
 }
 
+void RdmaTopology::SetDeviceEnabled(size_t index, bool enabled) {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (index < enabled_.size()) enabled_[index] = enabled ? 1 : 0;
+}
+
+PortWatcher::PortWatcher(std::vector<std::string> names)
+    : names_(std::move(names)), contexts_(names_.size(), nullptr) {
+  int count = 0;
+  ibv_device** list = ibv_get_device_list(&count);
+  if (!list) return;
+  for (int i = 0; i < count; ++i) {
+    const char* name = ibv_get_device_name(list[i]);
+    if (!name) continue;
+    for (size_t rail = 0; rail < names_.size(); ++rail) {
+      if (contexts_[rail] || names_[rail] != name) continue;
+      contexts_[rail] = ibv_open_device(list[i]);
+    }
+  }
+  ibv_free_device_list(list);
+}
+
+PortWatcher::~PortWatcher() {
+  for (void* context : contexts_)
+    if (context) ibv_close_device(static_cast<ibv_context*>(context));
+}
+
+std::atomic<PortWatcher::StateFn>& PortWatcher::OverrideForTest() {
+  static std::atomic<StateFn> override{nullptr};
+  return override;
+}
+
+int PortWatcher::State(size_t index) const {
+  if (index >= names_.size()) return -1;
+  if (const StateFn override = OverrideForTest().load(std::memory_order_acquire))
+    return override(names_[index]);
+  if (!contexts_[index]) return -1;
+  ibv_port_attr port{};
+  if (ibv_query_port(static_cast<ibv_context*>(contexts_[index]), 1, &port) != 0)
+    return -1;
+  return port.state == IBV_PORT_ACTIVE ? 1 : 0;
+}
+
 void RdmaTopology::DisableDevice(const std::string& name) {
   std::lock_guard<std::mutex> lock(mu_);
   for (size_t i = 0; i < devices_.size(); ++i) {

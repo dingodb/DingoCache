@@ -3,6 +3,16 @@
 ## Unreleased
 
 
+- Client, RDMA: a local rail whose port goes down leaves selection. The
+  client only checked port state at startup; a port that went down later
+  kept being selected, and was given up only through the failures of the
+  operations sent on it. The port of every
+  rail is now queried every `DFKV_RDMA_PORT_CHECK_MS` (default 1000, 0 =
+  off); a rail whose port is not ACTIVE is out of selection and its idle
+  connections are closed, and it comes back when the port is ACTIVE again.
+  A rail not ACTIVE at startup is still left out until restart. New
+  `dfkv_rdma_client_rails_port_down`, `dfkv_rdma_client_port_down_events_total`.
+
 - Client, RDMA: a peer rail that refuses our device is learned. Rails pair
   by device name, so a server that does not serve the device of our first
   rail closes the bootstrap before replying, which the client takes as

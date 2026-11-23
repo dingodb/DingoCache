@@ -9508,3 +9508,73 @@ TEST(RdmaPeerRailDown, AFullPeerIsNotTakenForARefusal) {
   EXPECT_EQ(CounterVal(text, "dfkv_rdma_client_remote_rail_cooldowns_total"),
             0);
 }
+
+namespace {
+std::atomic<bool> g_port_down{false};
+std::string g_port_down_dev;  // set before the override is installed
+int FakePortState(const std::string& name) {
+  return name == g_port_down_dev && g_port_down.load() ? 0 : 1;
+}
+struct PortOverride {
+  PortOverride() {
+    rdma::PortWatcher::OverrideForTest().store(&FakePortState);
+  }
+  ~PortOverride() { rdma::PortWatcher::OverrideForTest().store(nullptr); }
+};
+bool WaitForMetric(RdmaTransport& rt, const std::string& line) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (rt.MetricsText().find("\n" + line + "\n") != std::string::npos)
+      return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return false;
+}
+}  // namespace
+
+TEST(RdmaPortState, ARailWhosePortGoesDownLeavesSelectionAndComesBack) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const char* devs = std::getenv("DFKV_RDMA_DEV");
+  const std::string list = devs ? devs : "";
+  const size_t comma = list.find(',');
+  if (comma == std::string::npos)
+    GTEST_SKIP() << "needs DFKV_RDMA_DEV with two rails";
+  const std::string first = list.substr(0, comma);
+  RdmaNode node("port_state");
+  g_port_down_dev = first;
+  g_port_down = false;
+  PortOverride override_ports;
+  ScopedEnv primary("DFKV_RDMA_PRIMARY_DEV", first.c_str());
+  ScopedEnv check("DFKV_RDMA_PORT_CHECK_MS", "20");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  const auto put_all = [&](const std::string& tag) {
+    int ok = 0;
+    for (int i = 0; i < 10; ++i) {
+      const std::string value = tag + std::to_string(i);
+      ok += c.Put("port-" + value, value.data(), value.size()) ? 1 : 0;
+    }
+    return ok;
+  };
+  const auto on_first = [&] {
+    return RailCounter(rt.MetricsText(),
+                       "dfkv_rdma_client_rail_selections_total", first);
+  };
+  ASSERT_EQ(put_all("up"), 10);
+  const uint64_t before = on_first();
+  EXPECT_GE(before, 1u) << "the primary rail was not used";
+
+  g_port_down = true;
+  ASSERT_TRUE(WaitForMetric(rt, "dfkv_rdma_client_rails_port_down 1"));
+  EXPECT_EQ(put_all("down"), 10);
+  EXPECT_EQ(on_first(), before) << "a rail whose port is down was selected";
+  EXPECT_NE(rt.MetricsText().find(
+                "\ndfkv_rdma_client_port_down_events_total 1\n"),
+            std::string::npos);
+
+  g_port_down = false;
+  ASSERT_TRUE(WaitForMetric(rt, "dfkv_rdma_client_rails_port_down 0"));
+  EXPECT_EQ(put_all("again"), 10);
+  EXPECT_GT(on_first(), before) << "the rail did not come back";
+}

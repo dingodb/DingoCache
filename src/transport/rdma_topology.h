@@ -146,12 +146,33 @@ class RdmaTopology {
   // Exclude a rail after a runtime local-device failure. Existing connections
   // remain valid; only subsequent selections are affected.
   void DisableDevice(const std::string& name);
+  // The same by index, and back: a rail whose port went down and came up.
+  void SetDeviceEnabled(size_t index, bool enabled);
 
  private:
   std::vector<RdmaDevInfo> devices_;
   mutable std::mutex mu_;
   std::vector<uint8_t> enabled_;
   mutable std::atomic<size_t> rr_{0};
+};
+
+// Port state of each local rail at run time: one device context per rail,
+// opened once, and a port query (no system call per device open) per check.
+class PortWatcher {
+ public:
+  explicit PortWatcher(std::vector<std::string> names);
+  ~PortWatcher();
+  PortWatcher(const PortWatcher&) = delete;
+  PortWatcher& operator=(const PortWatcher&) = delete;
+  // 1 ACTIVE, 0 not ACTIVE, -1 unknown (no context, or the query failed).
+  int State(size_t index) const;
+  // Test seam: when set, answers State instead of the device.
+  using StateFn = int (*)(const std::string& name);
+  static std::atomic<StateFn>& OverrideForTest();
+
+ private:
+  std::vector<std::string> names_;
+  std::vector<void*> contexts_;  // ibv_context*, nullptr where none opened
 };
 
 }  // namespace dfkv::rdma
