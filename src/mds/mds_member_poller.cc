@@ -2,6 +2,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <utility>
@@ -219,10 +220,31 @@ bool MdsMemberPoller::WaitMs(int ms) {
                       [this] { return !running_.load(); });
 }
 
+void MdsMemberPoller::SetTick(std::function<void()> tick, int every_ms) {
+  tick_ = std::move(tick);
+  tick_ms_ = every_ms;
+}
+
 void MdsMemberPoller::Loop() {
+  if (!tick_) {
+    while (running_.load()) {
+      ReportHealth(PollOnce());
+      if (WaitMs(poll_ms_)) return;
+    }
+    return;
+  }
   while (running_.load()) {
     ReportHealth(PollOnce());
-    if (WaitMs(poll_ms_)) return;
+    const uint64_t next_poll = NowMs() + static_cast<uint64_t>(poll_ms_);
+    for (;;) {
+      tick_();
+      const uint64_t now = NowMs();
+      if (now >= next_poll) break;
+      const uint64_t left = next_poll - now;
+      if (WaitMs(static_cast<int>(
+              std::min<uint64_t>(left, static_cast<uint64_t>(tick_ms_)))))
+        return;
+    }
   }
 }
 

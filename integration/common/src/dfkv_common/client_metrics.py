@@ -109,6 +109,12 @@ _COUNTERS: dict[str, tuple[str, ...]] = {
     # invisible at the inference endpoint.
     # Second requests to a key's draining owner (MDS-04).
     "dfkv_client_drain_requests_total": ("op", "result"),
+    # Absent grace (DFKV_RING_ABSENT_GRACE_MS): members dropped, and the
+    # REMOVEs absent members did not confirm.
+    "dfkv_client_ring_absent_dropped_total": ("reason",),
+    "dfkv_client_ring_absent_removes_unconfirmed_total": (),
+    "dfkv_client_ring_absent_removes_retried_total": (),
+    "dfkv_client_ring_absent_removes_dropped_total": (),
     "dfkv_rdma_client_no_compatible_rail_total": (),
     "dfkv_rdma_client_admission_failures_total": (),
     "dfkv_rdma_client_local_resource_failures_total": (),
@@ -163,6 +169,7 @@ _GAUGES: dict[str, tuple[str, ...]] = {
     "dfkv_client_transport_info": ("transport",),
     "dfkv_client_ring_members": (),
     "dfkv_client_ring_draining_members": (),
+    "dfkv_client_ring_absent_members": (),
     "dfkv_client_ring_point_collisions": (),
     "dfkv_client_mds_reachable": (),
     "dfkv_client_peer_latency_max_seconds": ("peer",),

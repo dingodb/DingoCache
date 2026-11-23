@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- Client: absent grace (CLI-02 stage A), behind `DFKV_RING_ABSENT_GRACE_MS`
+  (default 0 = off, cap 600000; MDS discovery only). A member that vanishes
+  from an admitted view is kept as absent for the grace: no new writes, and
+  REMOVE and RETAIN go to it as well as to the new owner; it is dropped when
+  the grace passes (checked once a second on the poll thread) and owns its
+  keys again if it returns first. An absent member is not read after a miss
+  (a client that started while it was out of the view sends its REMOVEs to
+  the new owner only, so it may hold removed copies); that read is the
+  read-back of a later stage, under its rules. At most `max(1, N/8)`
+  members are absent; a member whose last record was draining is not kept.
+  A draining member stays its keys' second owner while another is absent
+  (an absent member is looked up on a ring of its own).
+  A REMOVE an absent member did not confirm succeeds on the write owner's
+  confirmation and is sent again when the member returns (its return ends
+  the PeerHealth cooldown the absence started, for that first send, so the
+  retry is not skipped), then each second until confirmed, for up to the grace
+  (`DFKV_RING_ABSENT_REMOVE_QUEUE`, default 4096 queued). What it buys is
+  REMOVE correctness on a warm return: on a test ring of eight server
+  processes with clients removing keys throughout, a member killed for
+  90 s and back with its data served 4 removed keys off and none on. The
+  hit rate is unchanged (a member's record deleted for 40 s: the same 0 %
+  worst second and 27 MiB recomputed either way). New
+  `dfkv_client_ring_absent_members`,
+  `dfkv_client_ring_absent_dropped_total{reason}`,
+  `dfkv_client_ring_absent_removes_{unconfirmed,retried,dropped}_total`.
+  Off, routing is unchanged.
 
 - Server, file store engine (`--store-engine file`, the explicit
   diagnostic and rollback engine; slab is the default): CLOCK eviction no

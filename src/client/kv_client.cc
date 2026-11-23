@@ -45,6 +45,15 @@ namespace {
 // full-ring owner, or nothing for a key that has none, and the bodies do not
 // look for drainers again. Requests route on the thread that issues them.
 thread_local bool t_drain_pass = false;
+// Set while requests go to one absent member (its REMOVEs and RETAINs, and
+// the retries of the REMOVEs it missed): Route() names it for every key.
+thread_local const std::string* t_route_to = nullptr;
+struct RouteTo {
+  explicit RouteTo(const std::string& addr) { t_route_to = &addr; }
+  ~RouteTo() { t_route_to = nullptr; }
+  RouteTo(const RouteTo&) = delete;
+  RouteTo& operator=(const RouteTo&) = delete;
+};
 struct DrainPass {
   DrainPass() { t_drain_pass = true; }
   ~DrainPass() { t_drain_pass = false; }
@@ -235,6 +244,19 @@ KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
   // model/raw-layout domains from sharing process-local entries.
   dedup_ = NodeDedup::FromEnv(namespace_hash_);
   get_miss_retries_ = EnvNonnegativeInt("DFKV_GET_MISS_RETRIES", 1);
+  {
+    // Absent grace (MDS discovery only): at most 600 s.
+    constexpr int kMaxAbsentGraceMs = 600000;
+    int grace = EnvNonnegativeInt("DFKV_RING_ABSENT_GRACE_MS", 0);
+    if (grace > kMaxAbsentGraceMs) {
+      DFKV_LOG_WARN("DFKV_RING_ABSENT_GRACE_MS=" + std::to_string(grace) +
+                    " is above the cap; using " +
+                    std::to_string(kMaxAbsentGraceMs));
+      grace = kMaxAbsentGraceMs;
+    }
+    absent_grace_ms_ = static_cast<uint64_t>(grace);
+    absent_remove_cap_ = EnvSize("DFKV_RING_ABSENT_REMOVE_QUEUE", 4096);
+  }
   retain_reprobe_ms_ =
       static_cast<uint64_t>(EnvNonnegativeInt("DFKV_RETAIN_REPROBE_MS", 30000));
   // An ABI descriptor value (including 0=auto) supersedes the environment.
@@ -368,10 +390,13 @@ DestinationMemoryKind KVClient::ClassifyDestination(
 }
 
 void KVClient::AdoptRing(ConHash ring, std::map<std::string, std::string> addr,
-                         ConHash full_ring, std::set<std::string> draining) {
+                         ConHash full_ring, std::set<std::string> draining,
+                         AbsentMap absent, std::vector<MemberInfo> placement,
+                         ConHash absent_ring) {
   const size_t count = addr.size();
   std::string delta;
   std::string drained;
+  std::string absent_ids;
   {
     std::lock_guard<std::mutex> lk(ring_mu_);
     delta = MembershipDelta(addr_, addr);  // vs the previously-adopted view
@@ -380,15 +405,35 @@ void KVClient::AdoptRing(ConHash ring, std::map<std::string, std::string> addr,
       for (const auto& id : draining)
         drained += (drained.empty() ? "" : ",") + id;
     }
+    bool absent_changed = absent.size() != absent_.size();
+    for (const auto& [id, member] : absent) {
+      (void)member;
+      if (absent_.count(id) == 0) absent_changed = true;
+    }
+    if (absent_changed) {
+      absent_ids = absent.empty() ? std::string("none") : std::string();
+      for (const auto& [id, member] : absent) {
+        (void)member;
+        absent_ids += (absent_ids.empty() ? "" : ",") + id;
+      }
+    }
     ring_ = std::move(ring);
     addr_ = std::move(addr);
     full_ring_ = std::move(full_ring);
     draining_ = std::move(draining);
+    absent_ = std::move(absent);
+    absent_ring_ = std::move(absent_ring);
+    placement_ = std::move(placement);
     any_draining_.store(!draining_.empty(), std::memory_order_relaxed);
+    any_absent_.store(!absent_.empty(), std::memory_order_relaxed);
   }
   if (!drained.empty())
     DFKV_LOG_INFO("ring: draining members: " + drained +
                   " (no new writes; read after a miss at the new owner)");
+  if (!absent_ids.empty())
+    DFKV_LOG_INFO("ring: absent members: " + absent_ids +
+                  " (vanished from the view; no new writes, REMOVE and "
+                  "RETAIN to them too, until the grace passes)");
   // A membership change is rare (epoch-gated) and worth one line: its presence
   // confirms discovery populated the ring; its ABSENCE at startup is the fastest
   // tell that the ring is empty and every op is silently missing. The delta
@@ -408,7 +453,7 @@ void KVClient::AdoptRing(ConHash ring, std::map<std::string, std::string> addr,
 
 void KVClient::PublishPeerTopologies(
     const std::vector<MemberInfo>& topology, uint64_t generation,
-    bool ring_held) {
+    bool ring_held, const std::map<std::string, std::string>& keep) {
   std::map<std::string, std::string> current;
   for (const auto& member : topology)
     current[member.id] = member.ip + ":" + std::to_string(member.port);
@@ -429,7 +474,14 @@ void KVClient::PublishPeerTopologies(
         live.insert(peer);
       }
     }
+    // Absent members are still asked after a miss (absent_).
+    for (const auto& peer : keep) {
+      if (current.count(peer.first) != 0) continue;
+      retired.erase(peer);
+      live.insert(peer);
+    }
     published_peers_ = live;
+    topology_generation_ = generation;
   }
 
   // Retire old address/identity bindings before publishing replacements. In
@@ -486,27 +538,319 @@ void KVClient::SetMembers(std::vector<std::pair<std::string, std::string>> membe
 }
 
 void KVClient::SetMembers(const std::vector<MemberInfo>& members) {
+  std::vector<MemberInfo> placement;
+  placement.reserve(members.size());
+  for (const auto& m : members)
+    if (m.RingEligible()) placement.push_back(m);
+  std::vector<std::string> returned;
+  AbsentMap absent;
+  if (absent_grace_ms_ > 0) absent = NextAbsent(placement, NowMs(), &returned);
+  AdoptPlacement(placement, std::move(absent));
+  for (const auto& id : returned) NoteAbsentReturned(id, true);
+  if (!returned.empty()) RetryAbsentRemoves();
+}
+
+void KVClient::AdoptPlacement(const std::vector<MemberInfo>& placement,
+                              AbsentMap absent) {
   ConHash ring, full_ring;
   std::map<std::string, std::string> addr;
   std::set<std::string> draining;
   size_t serving = 0;
-  for (const auto& m : members) {
-    if (!m.RingEligible()) continue;
+  for (const auto& m : placement) {
     addr[m.id] = m.ip + ":" + std::to_string(m.port);
     if (m.draining) draining.insert(m.id); else ++serving;
   }
   // With every member draining there is nowhere else to write: no drain.
   if (serving == 0) draining.clear();
-  for (const auto& m : members) {
-    if (!m.RingEligible()) continue;
+  // Nor anything to keep absent members beside.
+  if (placement.empty()) absent.clear();
+  // The drain ring is the view's (as without absent members): a drainer
+  // stays its keys' second owner whatever is absent. The absent ring adds
+  // the absent members to it; a key it gives to one of them has that
+  // member as one more owner.
+  ConHash absent_ring;
+  for (const auto& m : placement) {
     const int weight = m.weight < 1 ? 1 : static_cast<int>(m.weight);
     if (!draining.empty()) full_ring.AddNode(m.id, weight);
+    if (!absent.empty()) absent_ring.AddNode(m.id, weight);
     if (draining.count(m.id) == 0) ring.AddNode(m.id, weight);
+  }
+  for (const auto& [id, member] : absent) {
+    const uint32_t w = member.info.weight;
+    absent_ring.AddNode(id, w < 1 ? 1 : static_cast<int>(w));
   }
   ring.Build();
   if (!draining.empty()) full_ring.Build();
+  if (!absent.empty()) absent_ring.Build();
   AdoptRing(std::move(ring), std::move(addr), std::move(full_ring),
-            std::move(draining));
+            std::move(draining), std::move(absent),
+            absent_grace_ms_ > 0 ? placement : std::vector<MemberInfo>(),
+            std::move(absent_ring));
+}
+
+KVClient::AbsentMap KVClient::NextAbsent(
+    const std::vector<MemberInfo>& placement, uint64_t now,
+    std::vector<std::string>* returned) {
+  std::vector<MemberInfo> previous;
+  AbsentMap held;
+  {
+    std::lock_guard<std::mutex> lk(ring_mu_);
+    previous = placement_;
+    held = absent_;
+  }
+  std::set<std::string> present;
+  for (const auto& m : placement) present.insert(m.id);
+  // At most max(1, N/8) absent, N the members of the previous full ring.
+  const size_t bound =
+      std::max<size_t>(1, (previous.size() + held.size()) / 8);
+  AbsentMap next;
+  AbsentMap dropped;
+  // Members already absent first, oldest first; then the newly vanished.
+  std::vector<std::pair<uint64_t, std::string>> order;
+  for (const auto& [id, member] : held) {
+    if (present.count(id) != 0) {
+      returned->push_back(id);
+      continue;
+    }
+    if (now - member.since_ms >= absent_grace_ms_) {
+      absent_dropped_grace_.fetch_add(1, std::memory_order_relaxed);
+      dropped.emplace(id, member);
+      continue;
+    }
+    order.push_back({member.since_ms, id});
+  }
+  std::sort(order.begin(), order.end());
+  for (const auto& [since, id] : order) {
+    (void)since;
+    if (next.size() < bound) {
+      next.emplace(id, held[id]);
+    } else {
+      absent_dropped_bound_.fetch_add(1, std::memory_order_relaxed);
+      dropped.emplace(id, held[id]);
+    }
+  }
+  for (const auto& m : previous) {  // sorted by id as the MDS lists them
+    if (present.count(m.id) != 0) continue;
+    NoteAbsentReturned(m.id, false);
+    AbsentMember member{m, m.ip + ":" + std::to_string(m.port), now};
+    if (m.draining) {
+      // A planned leave: it drained, its keys were written elsewhere.
+      absent_dropped_planned_.fetch_add(1, std::memory_order_relaxed);
+      DFKV_LOG_INFO("ring: member " + m.id +
+                    " left after draining; not kept absent");
+      continue;
+    }
+    if (next.size() < bound) {
+      next.emplace(m.id, std::move(member));
+    } else {
+      absent_dropped_bound_.fetch_add(1, std::memory_order_relaxed);
+      DFKV_LOG_WARN("ring: member " + m.id +
+                    " vanished with " + std::to_string(bound) +
+                    " member(s) absent already; dropped at once");
+    }
+  }
+  for (const auto& [id, member] : dropped) {
+    (void)member;
+    DropAbsentRemoves(id);
+  }
+  RetireDropped(dropped);
+  return next;
+}
+
+void KVClient::TickAbsent() {
+  if (absent_grace_ms_ == 0) return;
+  RetryAbsentRemoves();
+  const uint64_t now = NowMs();
+  std::vector<MemberInfo> placement;
+  AbsentMap absent;
+  {
+    std::lock_guard<std::mutex> lk(ring_mu_);
+    if (absent_.empty()) return;
+    placement = placement_;
+    absent = absent_;
+  }
+  AbsentMap dropped;
+  for (auto it = absent.begin(); it != absent.end();) {
+    if (now - it->second.since_ms < absent_grace_ms_) {
+      ++it;
+      continue;
+    }
+    absent_dropped_grace_.fetch_add(1, std::memory_order_relaxed);
+    DFKV_LOG_INFO("ring: absent member " + it->first +
+                  " dropped (grace passed)");
+    dropped.insert(*it);
+    it = absent.erase(it);
+  }
+  if (dropped.empty()) return;
+  for (const auto& [id, member] : dropped) {
+    (void)member;
+    DropAbsentRemoves(id);
+  }
+  AdoptPlacement(placement, std::move(absent));
+  RetireDropped(dropped);
+}
+
+void KVClient::RetireDropped(const AbsentMap& dropped) {
+  if (dropped.empty() || t_ == nullptr) return;
+  std::vector<std::pair<std::string, std::string>> retired;
+  std::vector<std::string> live_ids;
+  uint64_t generation = 0;
+  {
+    std::lock_guard<std::mutex> lk(ring_mu_);
+    generation = topology_generation_;
+    for (const auto& [id, member] : dropped) {
+      const auto it = published_peers_.find(id);
+      // Published again under this id (it came back): not ours to retire.
+      if (it == published_peers_.end() || it->second != member.addr ||
+          addr_.count(id) != 0)
+        continue;
+      retired.push_back(*it);
+      published_peers_.erase(it);
+    }
+    for (const auto& peer : published_peers_) live_ids.push_back(peer.first);
+  }
+  if (retired.empty()) return;
+  for (const auto& [peer_id, address] : retired) {
+    PeerTopology peer;
+    peer.peer_addr = address;
+    peer.generation = generation;
+    peer.complete = false;
+    peer.peer_id = peer_id;
+    peer.present = false;
+    t_->OnPeerTopology(peer);
+  }
+  t_->OnPeerIdentities(live_ids);
+}
+
+void KVClient::QueueAbsentRemove(const std::string& id,
+                                 const std::string& key) {
+  absent_removes_unconfirmed_.fetch_add(1, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lk(absent_remove_mu_);
+  auto& queue = absent_removes_[id];
+  if (queue.count(key) != 0) return;  // queued already
+  if (absent_removes_queued_ >= absent_remove_cap_) {
+    absent_removes_dropped_.fetch_add(1, std::memory_order_relaxed);
+    if (queue.empty()) absent_removes_.erase(id);
+    return;
+  }
+  queue.insert(key);
+  ++absent_removes_queued_;
+}
+
+void KVClient::DropAbsentRemoves(const std::string& id) {
+  std::lock_guard<std::mutex> lk(absent_remove_mu_);
+  absent_returned_.erase(id);
+  absent_cooldown_reset_.erase(id);
+  const auto it = absent_removes_.find(id);
+  if (it == absent_removes_.end()) return;
+  absent_removes_dropped_.fetch_add(it->second.size(),
+                                    std::memory_order_relaxed);
+  absent_removes_queued_ -= it->second.size();
+  absent_removes_.erase(it);
+}
+
+void KVClient::NoteAbsentReturned(const std::string& id, bool returned) {
+  std::lock_guard<std::mutex> lk(absent_remove_mu_);
+  if (!returned) {
+    // Gone again: its REMOVEs wait for the next return.
+    absent_returned_.erase(id);
+    absent_cooldown_reset_.erase(id);
+    return;
+  }
+  if (absent_removes_.count(id) == 0) return;
+  absent_returned_[id] = NowMs();
+  absent_cooldown_reset_.insert(id);
+}
+
+void KVClient::RetryAbsentRemoves() {
+  const uint64_t now = NowMs();
+  struct Work {
+    std::string id;
+    std::vector<std::string> keys;
+    bool reset_cooldown;
+  };
+  std::vector<Work> work;
+  {
+    std::lock_guard<std::mutex> lk(absent_remove_mu_);
+    for (auto it = absent_returned_.begin(); it != absent_returned_.end();) {
+      auto queued = absent_removes_.find(it->first);
+      if (queued == absent_removes_.end()) {
+        it = absent_returned_.erase(it);
+        continue;
+      }
+      absent_removes_queued_ -= queued->second.size();
+      if (now - it->second > absent_grace_ms_) {
+        // Back for a whole grace without confirming: given up.
+        absent_removes_dropped_.fetch_add(queued->second.size(),
+                                          std::memory_order_relaxed);
+        absent_removes_.erase(queued);
+        it = absent_returned_.erase(it);
+        continue;
+      }
+      const bool reset = absent_cooldown_reset_.erase(it->first) != 0;
+      work.push_back({it->first,
+                      std::vector<std::string>(queued->second.begin(),
+                                               queued->second.end()),
+                      reset});
+      absent_removes_.erase(queued);
+      ++it;
+    }
+  }
+  for (auto& [id, keys, reset_cooldown] : work) {
+    std::string addr;
+    {
+      std::lock_guard<std::mutex> lk(ring_mu_);
+      const auto it = addr_.find(id);
+      if (it != addr_.end()) addr = it->second;
+    }
+    std::vector<char> ok(keys.size(), 0);
+    if (!addr.empty()) {
+      // Its return to the view is as good as a probe answer: on the first
+      // send after the return, end the cooldown its failures during the
+      // absence started, so that this REMOVE is the trial instead of
+      // waiting out the backoff. Later sends take PeerHealth as it is.
+      if (reset_cooldown) health_.MarkProbeAlive(addr, now);
+      // To the member itself, wherever the ring now routes the keys.
+      RouteTo to(addr);
+      if (t_->pipelined()) {
+        ok = BatchRemoveRouted(keys);
+      } else {
+        for (size_t i = 0; i < keys.size(); ++i)
+          ok[i] = RemoveDirectRouted(keys[i]) ? 1 : 0;
+      }
+      absent_removes_retried_.fetch_add(keys.size(),
+                                        std::memory_order_relaxed);
+    }
+    std::vector<std::string> left;
+    for (size_t i = 0; i < keys.size(); ++i)
+      if (!ok[i]) left.push_back(std::move(keys[i]));
+    if (!addr.empty())
+      DFKV_LOG_INFO("ring: member " + id + " is back; " +
+                    std::to_string(keys.size() - left.size()) + " of " +
+                    std::to_string(keys.size()) +
+                    " REMOVE(s) it had not confirmed are confirmed now");
+    std::lock_guard<std::mutex> lk(absent_remove_mu_);
+    if (left.empty()) {
+      if (absent_removes_.count(id) == 0) absent_returned_.erase(id);
+      continue;
+    }
+    // Asked again at the next tick, while the member stays; within the
+    // queue's bound, as any queued REMOVE.
+    auto& queue = absent_removes_[id];
+    for (auto& key : left) {
+      if (queue.count(key) != 0) continue;
+      if (absent_removes_queued_ >= absent_remove_cap_) {
+        absent_removes_dropped_.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+      queue.insert(std::move(key));
+      ++absent_removes_queued_;
+    }
+    if (queue.empty()) {
+      absent_removes_.erase(id);
+      absent_returned_.erase(id);
+    }
+  }
 }
 
 void KVClient::StartMdsDiscovery(std::vector<std::string> mds_eps,
@@ -526,9 +870,17 @@ void KVClient::StartMdsDiscovery(std::vector<std::string> mds_eps,
         // members remain here even though SetMembers excludes them. Ring
         // members a guard-refused view omits keep their topology until a view
         // without them is admitted.
-        PublishPeerTopologies(topology, topology_epoch, !placement_admitted);
-
-        if (!placement_admitted) return;
+        // Absent members (absent grace) keep theirs while they are held.
+        auto held = [this] {
+          std::map<std::string, std::string> keep;
+          std::lock_guard<std::mutex> lk(ring_mu_);
+          for (const auto& [id, member] : absent_) keep[id] = member.addr;
+          return keep;
+        };
+        if (!placement_admitted) {
+          PublishPeerTopologies(topology, topology_epoch, true, held());
+          return;
+        }
         std::vector<MemberInfo> placement;
         placement.reserve(topology.size());
         for (const auto& member : topology) {
@@ -538,14 +890,31 @@ void KVClient::StartMdsDiscovery(std::vector<std::string> mds_eps,
         // write ring from the read ring.
         const uint64_t placement_epoch =
             MembersEpoch(placement) ^ MembersDrainEpoch(placement);
-        if (placement_state->have_epoch &&
-            placement_state->epoch == placement_epoch)
+        const bool changed = !placement_state->have_epoch ||
+                             placement_state->epoch != placement_epoch;
+        if (!changed || absent_grace_ms_ == 0) {
+          PublishPeerTopologies(topology, topology_epoch, false, held());
+          if (!changed) return;
+          placement_state->epoch = placement_epoch;
+          placement_state->have_epoch = true;
+          SetMembers(placement);
           return;
+        }
+        // Which members stay absent is known before the topology is
+        // published, so that theirs is not retired.
         placement_state->epoch = placement_epoch;
         placement_state->have_epoch = true;
-        SetMembers(placement);
+        std::vector<std::string> returned;
+        AbsentMap absent = NextAbsent(placement, NowMs(), &returned);
+        std::map<std::string, std::string> keep;
+        for (const auto& [id, member] : absent) keep[id] = member.addr;
+        PublishPeerTopologies(topology, topology_epoch, false, keep);
+        AdoptPlacement(placement, std::move(absent));
+        for (const auto& id : returned) NoteAbsentReturned(id, true);
+        if (!returned.empty()) RetryAbsentRemoves();
       },
       poll_ms);
+  if (absent_grace_ms_ > 0) poller_->SetTick([this] { TickAbsent(); }, 1000);
   poller_->Start();
 }
 
@@ -736,6 +1105,28 @@ std::string KVClient::MetricsSnapshot() const {
     s += "dfkv_client_drain_requests_total{op=\"remove\",result=\"not_served\"} " + load(drain_removes_failed_) + "\n";
     s += "dfkv_client_drain_requests_total{op=\"retain\",result=\"served\"} " + load(drain_retains_ok_) + "\n";
     s += "dfkv_client_drain_requests_total{op=\"retain\",result=\"not_served\"} " + load(drain_retains_failed_) + "\n";
+    size_t absent = 0;
+    {
+      std::lock_guard<std::mutex> lk(ring_mu_);
+      absent = absent_.size();
+    }
+    s += "# HELP dfkv_client_ring_absent_members Members kept absent (DFKV_RING_ABSENT_GRACE_MS): vanished from the view; no writes and no reads; REMOVE and RETAIN reach them; their unconfirmed REMOVEs are retried when they return\n";
+    s += "# TYPE dfkv_client_ring_absent_members gauge\n";
+    s += "dfkv_client_ring_absent_members " + std::to_string(absent) + "\n";
+    s += "# HELP dfkv_client_ring_absent_dropped_total Absent members dropped: grace over, over the bound of max(1, N/8), or a planned leave (it drained) that is not kept\n";
+    s += "# TYPE dfkv_client_ring_absent_dropped_total counter\n";
+    s += "dfkv_client_ring_absent_dropped_total{reason=\"grace\"} " + load(absent_dropped_grace_) + "\n";
+    s += "dfkv_client_ring_absent_dropped_total{reason=\"bound\"} " + load(absent_dropped_bound_) + "\n";
+    s += "dfkv_client_ring_absent_dropped_total{reason=\"planned\"} " + load(absent_dropped_planned_) + "\n";
+    s += "# HELP dfkv_client_ring_absent_removes_unconfirmed_total REMOVEs an absent member did not confirm (queued for one retry on its return)\n";
+    s += "# TYPE dfkv_client_ring_absent_removes_unconfirmed_total counter\n";
+    s += "dfkv_client_ring_absent_removes_unconfirmed_total " + load(absent_removes_unconfirmed_) + "\n";
+    s += "# HELP dfkv_client_ring_absent_removes_retried_total Unconfirmed REMOVEs sent again after the member returned (each attempt)\n";
+    s += "# TYPE dfkv_client_ring_absent_removes_retried_total counter\n";
+    s += "dfkv_client_ring_absent_removes_retried_total " + load(absent_removes_retried_) + "\n";
+    s += "# HELP dfkv_client_ring_absent_removes_dropped_total Unconfirmed REMOVEs never confirmed: over the queue bound, the member dropped, or not confirmed within the grace after its return\n";
+    s += "# TYPE dfkv_client_ring_absent_removes_dropped_total counter\n";
+    s += "dfkv_client_ring_absent_removes_dropped_total " + load(absent_removes_dropped_) + "\n";
     s += "# HELP dfkv_client_ring_point_collisions Ring points two members hashed to; the member added later owns each\n";
     s += "# TYPE dfkv_client_ring_point_collisions gauge\n";
     s += "dfkv_client_ring_point_collisions " + std::to_string(collisions) + "\n";
@@ -805,6 +1196,7 @@ std::vector<std::string> KVClient::MemberAddresses() const {
 
 std::string KVClient::Route(const std::string& key) const {
   if (t_drain_pass) return DrainRoute(key);
+  if (t_route_to != nullptr) return *t_route_to;
   // Hashed before the lock: every routed key of every thread takes it.
   const uint32_t hash = ConHash::KeyHash(key);
   std::lock_guard<std::mutex> lk(ring_mu_);
@@ -823,6 +1215,64 @@ std::string KVClient::DrainRoute(const std::string& key) const {
     return "";
   auto it = addr_.find(name);
   return it == addr_.end() ? "" : it->second;
+}
+
+std::string KVClient::AbsentRoute(const std::string& key,
+                                  std::string* id) const {
+  if (!any_absent_.load(std::memory_order_relaxed)) return "";
+  const uint32_t hash = ConHash::KeyHash(key);
+  std::lock_guard<std::mutex> lk(ring_mu_);
+  std::string name;
+  if (!absent_ring_.LookupHash(hash, &name)) return "";
+  const auto it = absent_.find(name);
+  if (it == absent_.end()) return "";
+  *id = name;
+  return it->second.addr;
+}
+
+std::vector<KVClient::AbsentPart> KVClient::AbsentOwned(
+    const std::vector<std::string>& keys) const {
+  std::map<std::string, AbsentPart> by_member;
+  if (!any_absent_.load(std::memory_order_relaxed)) return {};
+  for (size_t i = 0; i < keys.size(); ++i) {
+    if (keys[i].empty()) continue;
+    std::string id;
+    const std::string addr = AbsentRoute(keys[i], &id);
+    if (addr.empty()) continue;
+    AbsentPart& part = by_member[id];
+    part.id = id;
+    part.addr = addr;
+    part.index.push_back(i);
+  }
+  std::vector<AbsentPart> out;
+  for (auto& [id, part] : by_member) {
+    (void)id;
+    out.push_back(std::move(part));
+  }
+  return out;
+}
+
+void KVClient::RemoveAtAbsent(const std::vector<std::string>& keys) {
+  for (const AbsentPart& part : AbsentOwned(keys)) {
+    std::vector<std::string> sub;
+    sub.reserve(part.index.size());
+    for (size_t i : part.index) sub.push_back(keys[i]);
+    std::vector<char> ok(sub.size(), 0);
+    {
+      RouteTo to(part.addr);
+      if (t_->pipelined()) {
+        ok = BatchRemoveRouted(sub);
+      } else {
+        for (size_t m = 0; m < sub.size(); ++m)
+          ok[m] = RemoveDirectRouted(sub[m]) ? 1 : 0;
+      }
+    }
+    for (size_t m = 0; m < sub.size(); ++m) {
+      (ok[m] ? drain_removes_ok_ : drain_removes_failed_)
+          .fetch_add(1, std::memory_order_relaxed);
+      if (!ok[m]) QueueAbsentRemove(part.id, sub[m]);
+    }
+  }
 }
 
 template <typename KeyOf>
@@ -905,10 +1355,14 @@ bool KVClient::ExistDirect(const std::string& key, Status* status) {
 }
 
 // A key whose full-ring owner drains is removed from both: one left on the
-// drainer would be served by the read after a miss.
+// drainer would be served by the read after a miss. A key whose owner with
+// the absent members (absent grace) is absent is removed there too; that
+// member (usually down) need not confirm, its part is queued for its return.
 bool KVClient::RemoveDirect(const std::string& key) {
   const bool ok = RemoveDirectRouted(key);
-  if (t_drain_pass || DrainRoute(key).empty()) return ok;
+  if (t_drain_pass || t_route_to != nullptr) return ok;
+  if (any_absent_.load(std::memory_order_relaxed)) RemoveAtAbsent({key});
+  if (DrainRoute(key).empty()) return ok;
   bool drained;
   {
     DrainPass pass;
@@ -2001,6 +2455,24 @@ void KVClient::BatchRetain(const std::vector<std::string>& keys,
   } record{&op_stats_, op, t0, out, n};
   if (out == nullptr || n == 0) return;
   BatchRetainRouted(keys, req, out);
+  // A key whose owner with the absent members is absent is retained there
+  // too, so that its copy is kept for the member's return; no read finds
+  // that copy meanwhile, so its answer does not stand for the key.
+  for (const AbsentPart& part : AbsentOwned(keys)) {
+    std::vector<std::string> sub;
+    sub.reserve(part.index.size());
+    for (size_t i : part.index) sub.push_back(keys[i]);
+    std::vector<uint8_t> sub_out(sub.size(), kRetError);
+    {
+      RouteTo to(part.addr);
+      BatchRetainRouted(sub, req, sub_out.data());
+    }
+    for (uint8_t code : sub_out)
+      (code != kRetMiss && code != kRetUnsupported && code != kRetError
+           ? drain_retains_ok_
+           : drain_retains_failed_)
+          .fetch_add(1, std::memory_order_relaxed);
+  }
   // A key whose full-ring owner drains is retained there too: that copy
   // still serves reads. Its answer counts where the write owner has nothing.
   const std::vector<size_t> drained =
@@ -2962,6 +3434,7 @@ std::vector<bool> KVClient::BatchRemove(const std::vector<std::string>& keys) {
     });
   } else {
     ok = BatchRemoveRouted(keys);
+    RemoveAtAbsent(keys);
     // A key whose full-ring owner drains may still be there: removed only
     // once both have confirmed, or the drainer would serve it on a read.
     const std::vector<size_t> drained =

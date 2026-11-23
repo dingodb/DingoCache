@@ -1,6 +1,7 @@
 # Unavailable owners: absent grace, cooldown reroute, recent-REMOVE memory, read-back
 
-Status: design, revision 6 (after review round 5). No code exists yet. Each
+Status: design, revision 7 (after stage A's measurement). Stage A is
+implemented; the rest is design. Each
 mechanism sits behind its own switch, off by default; none changes a released
 binary. A and C are client-side only. The recent-REMOVE memory (M) adds one
 wire op and server state; B depends on M and does not ship without it.
@@ -28,7 +29,7 @@ hit length), with prototypes of the mechanisms:
 |---|---|---|
 | Node killed for 90 s, back with its data | 0 % / 7.4 for ~27 s (until the lease expires and the view drops it), recovering to 99 % ~40 s later | C: 38 % in the first 10 s, 96 % by 20-30 s; 62 instead of 157 MiB recomputed |
 | Node killed for 3 s | 32 % in the first 10 s | C: 50 % |
-| Node alive, its member record deleted for 40 s | 51 % / 36.1 at worst, ~40 s to recover | A: 100 % throughout |
+| Node alive, its member record deleted for 40 s | 51 % / 36.1 at worst, ~40 s to recover | A reading the absent member after a miss: 100 % throughout (that read is B's now, §3) |
 | Node killed 90 s, back empty | after the return 46 % / 33.1, ~40 s to recover | A + read-back: 100 % on the return |
 
 With one of eight nodes gone, (7/8)^64 ≈ 0.02 % of 64-block prefixes are
@@ -61,12 +62,27 @@ nothing; a cold return, or a member that leaves the view while alive, does.
 
 All reuse the drain path of MDS-04: a key whose full-ring owner is
 unavailable is written to its owner on the write ring, read first there and,
-after a miss, from the unavailable owner.
+after a miss, from a draining owner. A read after a miss from an *absent*
+owner (A) is a read-back and belongs to B (§3.4), under B's rules: a client
+that started while the member was out of the view never saw it and sent its
+REMOVEs to the new owner only, so the absent member may hold removed copies
+(measured with stage A's first version: 3 removed keys read in 5 s).
 
 ### 3.1 A: absent grace (`DFKV_RING_ABSENT_GRACE_MS`, default 0 = off)
 
-A member that disappears from the adopted view is kept in the full ring as
-*absent* (draining, not written to) for the grace period, then dropped.
+A member that disappears from the adopted view is kept as *absent* for the
+grace period, then dropped: no writes and no reads; REMOVE and RETAIN reach
+it; its unconfirmed REMOVEs are retried when it returns.
+
+- **Its own ring.** An absent member is looked up on the view's members plus
+  the absent ones, separately from the drain ring (the view's members,
+  drainers included). A key can so have three owners: the write owner, a
+  drainer, and an absent member; REMOVE and RETAIN go to each that differs.
+  The drainer must confirm a REMOVE, the absent member need not. Putting the
+  absent members into the drain ring instead would hide a drainer behind an
+  absent member for the keys the absent member owns there: their REMOVEs
+  would miss the drainer, and after the grace a read after a miss would find
+  the removed value on it.
 
 - **Timer.** Each absent member carries `absent_since_ms`. A one-second tick
   of the member poller's loop (no new thread) drops members whose grace has
@@ -78,10 +94,21 @@ A member that disappears from the adopted view is kept in the full ring as
   (DRN1) is dropped at once.
 - **Member-view guard (#497).** A applies to views the guard admitted; a
   refused view changes nothing. A member back within its grace is an
-  ordinary member again at once, with no rehash.
+  ordinary member again at once (owning the keys it owned before, as
+  without A: the ring is deterministic).
 - **REMOVE and RETAIN** go to the write-ring owner and to the absent member.
   A REMOVE does not need the absent member's confirmation (it is usually
-  down); it is counted, and retried once when the member returns.
+  down); it is counted and queued (bounded, `DFKV_RING_ABSENT_REMOVE_QUEUE`).
+  When the member returns the queue is sent at once: the failures during the
+  absence put the member in PeerHealth cooldown (up to 30 s), so the return
+  to the view counts as a probe answer and ends the cooldown for that first
+  send, making the retry the trial. What is still unconfirmed is sent again
+  at each tick, with PeerHealth as it is, for up to one grace after the
+  return, then dropped and counted. A PUT that reaches the returned member
+  before a later retry can be deleted by it: a miss, never a stale value. An absent
+  member's RETAIN answer does not stand for the key (no read finds that copy
+  until the member returns).
+- **No read after a miss.** See §3 above: reading an absent member is B's.
 - **Warm return with unconfirmed REMOVEs.** A member that returns serves
   copies whose REMOVE it did not confirm: this client's (racing the retry, or
   dropped by the retry queue's bound) and other clients' (which never sent
@@ -192,6 +219,9 @@ refuse a read-back of a removed key, wherever the remover sent its REMOVE.
 For a window after a key's owner changed, a GET or EXIST that misses at the
 current owner may ask the previous owner once.
 
+- **Absent owners.** With A on, a miss whose full-ring owner is absent asks
+  the absent member under the same rules (M asked, gate passing), as a
+  previous owner.
 - **Owner changes.** Every write-ring change this client adopts (a member
   added or removed, a drain or an absence starting or ending) keeps the write
   ring before it for the window; a C episode is a per-member change (keys of
@@ -331,7 +361,7 @@ against the same code with its switches off:
 1. kill 90 s, warm return: base vs C vs A+C;
 2. flap 3 s, warm return: base vs C;
 3. flap 3 s, empty return: base vs C vs C+M+B;
-4. member record deleted 40 s, node alive: base vs A;
+4. member record deleted 40 s, node alive: base vs A vs A+M+B;
 5. kill 90 s, empty return: base vs A+M+B.
 
 **Correctness under churn**, in every variant: removers REMOVE a sample of
@@ -374,7 +404,8 @@ removed afterwards.
 ## 8. Stages
 
 1. This design.
-2. A (timer, bound, planned-leave rule, REMOVE rule) with tests and metrics.
+2. A (timer, bound, planned-leave rule, REMOVE rule; no read after a miss)
+   with tests and metrics.
 3. C with REMOVE fan-out, the registry gate and tests.
 4. M on the server (table, coverage, `kRemovedWithin`) with tests, including
    interop with older clients and servers.
@@ -383,6 +414,13 @@ removed afterwards.
 ## 9. Revisions
 
 - Revision 1: first version, after two prototype measurement runs.
+- Revision 7 (stage A's measurement): A does not read an absent member after
+  a miss (a fresh remover's REMOVE does not reach it); that read moves to B
+  under its rules. A REMOVE an absent member missed is sent when it returns,
+  with its cooldown ended for that first send, then at each tick for up to
+  one grace, instead of once. Absent members are looked up on a ring of
+  their own, beside the drain ring, so that an absent member never hides a
+  drainer (review of stage A).
 - Revision 6 (review round 5): H covers a REMOVE only when the reader's guard
   held the change briefly; the poller records the first sighting of a
   different view since its last adoption (not reset on a flap), and a
