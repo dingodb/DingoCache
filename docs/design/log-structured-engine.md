@@ -207,7 +207,13 @@ the superblock: before the engine uses a number at or above
 `incarnation_reserved` (or `lsn_reserved`), it writes the superblock with the
 bound raised by a range (1024 incarnations, 2²⁰ LSNs) and waits for that write
 to be durable. The bump is started in the background when half a range is used,
-so a PUT normally never waits for it. At open, the next numbers are the
+so a PUT normally never waits for it. (Not yet in the implementation: the bump is written
+when the range is used up, synchronously under the store mutex, once per 2²⁰
+PUTs; so is a segment's fresh header when a PUT opens it, once per segment
+filled. Each is one 4 KiB `RWF_DSYNC` write, 16–19 µs at the median and
+0.3–0.5 ms at the 99th percentile on the development node's NVMe, during
+which the store's other operations wait. Moving both off the PUT path is
+left to the performance stages.) At open, the next numbers are the
 reserved bounds of the valid superblock (not the highest numbers seen on disk),
 so no number is ever handed out twice, whatever headers or records a crash
 tore. LSNs start at 1; 0 never names a value.
@@ -245,6 +251,12 @@ header is durable.
 | header_crc | 4 | CRC32C of the header bytes with this field zero |
 | inline payload | ≤ 4096 − header_len | when flag bit 0 is set |
 | reserved | … | zero |
+
+A header longer than 88 bytes is an extension: this format's readers
+require the extension bytes to be zero, so a writer may use them only
+together with an incompat or ro_compat feature bit (§4.2) that tells older
+readers what they cannot read. Format minor versions alone stay compatible
+because they never add header fields.
 
 A payload is inline exactly when it fits, that is when value_len ≤ 4096 −
 header_len; a decoder refuses a record whose flag says otherwise, and a
@@ -536,6 +548,10 @@ tier, and before the reply is posted. The bytes are in host memory at that
 point, so the check is a CPU pass and no extra I/O. A mismatch turns the
 read into a miss for every consumer, aborts the reservation, and the engine
 shadows the location as in §5.2. Slab leases carry no verifier.
+
+Until stage 4 adds the hook, prepared reads (`RangeDirectPrep`, the RDMA
+pull path and the RAM tier's direct promotion) are not verified: the
+experimental engine is not for real data before then.
 
 ---
 
@@ -960,7 +976,10 @@ among themselves; nothing is ordered across files).
 
 **Open** (the constructor) reads and checks; it changes nothing on disk except
 what the barrier in step 2 is (an `fallocate` over space already allocated,
-the kind of repeatable allocation slab's open also does):
+the kind of repeatable allocation slab's open also does). The exception is a
+directory that is empty or holds an unfinished initialization: the
+constructor creates (or finishes) the store, as slab does, so when another
+disk of the node then fails to open, this one is not left as found.
 
 1. Lock the directory. Re-check, under the lock, that the directory still
    classifies as LOG (§10.1). Read both superblock copies; take the valid newer
