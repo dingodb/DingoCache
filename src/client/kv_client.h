@@ -34,12 +34,12 @@
 
 namespace dfkv {
 
+// Fan-out width of TCP batches and of RDMA writes. RDMA reads do not use it:
+// they run on the process-wide ReadScheduler (DFKV_RDMA_READ_WORKERS).
 // When batch_concurrency is unset (0 = auto), use at least 8 workers so a
-// single-node ring (groups=1) still gets 8-way parallel batch_put_sg /
-// batch_get_auto_sg. Multi-node rings (groups >= 8) are unaffected: they
-// already get one worker per group. The floor of 8 matches the typical
-// RDMA connection pool size (DFKV_TCP_POOL_MAX_CONNS), so the extra
-// workers do not exceed the pooled connection count.
+// single-node ring (groups=1) still gets 8-way parallel batches. Multi-node
+// rings (groups >= 8) get one worker per group. The floor of 8 matches the
+// default TCP connection pool (DFKV_TCP_POOL_MAX_CONNS).
 inline size_t AutoBatchWorkers(size_t bc, size_t groups) {
   constexpr size_t kMaxAutoBatchWorkers = 32;
   constexpr size_t kMinAutoBatchWorkers = 8;
@@ -155,11 +155,12 @@ class KVClient {
   std::vector<bool> BatchGetAutoSg(const std::vector<KvGetItemSg>& items,
                                    std::vector<size_t>* out_lens);
 
-  // Batch fan-out worker count. 0 (the default) = auto: one worker per node
-  // group, floored at kMinAutoBatchWorkers (8) so single-node rings get
-  // 8-way parallelism, capped at kMaxAutoBatchWorkers (32). Explicit n
-  // keeps the old fixed behavior (dfkv_bench passes --bc 1 so its external
-  // threads stay the only load).
+  // Batch fan-out worker count of TCP batches and RDMA writes; RDMA reads
+  // are bounded by DFKV_RDMA_READ_WORKERS instead. 0 (the default) = auto:
+  // one worker per node group, floored at kMinAutoBatchWorkers (8) so
+  // single-node rings get 8-way parallelism, capped at kMaxAutoBatchWorkers
+  // (32). Explicit n keeps the old fixed behavior (dfkv_bench passes --bc 1
+  // so its external threads stay the only load).
   void set_batch_concurrency(size_t n) {
     batch_concurrency_.store(n, std::memory_order_relaxed);
   }
