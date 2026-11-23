@@ -17,6 +17,10 @@ class ConHash {
   void Build();
   // Returns false when the ring is empty.
   bool Lookup(const std::string& key, std::string* node) const;
+  // The same with the key's hash, KeyHash(key), computed by the caller (for
+  // example outside a lock).
+  static uint32_t KeyHash(const std::string& key);
+  bool LookupHash(uint32_t hash, std::string* node) const;
   size_t NodeCount() const { return nodes_.size(); }
   size_t RingSize() const { return ring_.size(); }
   // Ring points owned per node (the realized vnode distribution after hash

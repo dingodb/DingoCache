@@ -4,9 +4,11 @@
 
 #include <gtest/gtest.h>
 
+#include <cstring>
 #include <set>
 #include <string>
 #include <utility>
+#include <vector>
 
 using dfkv::BlockKey;
 using dfkv::ToBlockKey;
@@ -127,4 +129,52 @@ TEST(KeyMap, SemanticallyMalformedCanonicalNamespaceHashesAllBytes) {
   EXPECT_FALSE(dfkv::CanonicalTenantIdentity(malformed, &offset, &length));
   EXPECT_NE(ToBlockKey(malformed, "object").tenant_hash,
             dfkv::TenantHash(std::string("tenant-a")));
+}
+
+// BlockKeyHasher is ToBlockKey with the namespace's part precomputed: equal
+// for every namespace and key length around the SHA-256 block boundaries.
+TEST(KeyMap, BlockKeyHasherEqualsToBlockKey) {
+  NamespaceDescriptor canonical;
+  canonical.tenant_id = "tenant-a";
+  canonical.model_id = "model";
+  canonical.model_revision = "rev";
+  canonical.pool_name = "kv";
+  canonical.dtype = "bytes";
+  canonical.layout_fingerprint = 1;
+  canonical.block_tokens = 16;
+  canonical.layer_count = 1;
+  std::vector<std::string> namespaces = {canonical.Serialize(), ""};
+  for (size_t n = 1; n < 200; n += 7) namespaces.push_back(std::string(n, 'n'));
+  for (size_t n : {39, 40, 47, 48, 55, 56, 103, 104, 111, 112})
+    namespaces.push_back(std::string(n, static_cast<char>('a' + n % 26)));
+  for (const auto& ns : namespaces) {
+    const dfkv::BlockKeyHasher hasher(ns);
+    for (size_t k = 0; k < 160; ++k) {
+      std::string key(k, '\0');
+      for (size_t i = 0; i < k; ++i) key[i] = static_cast<char>(i * 31 + k);
+      ASSERT_EQ(hasher(key), ToBlockKey(ns, key))
+          << "namespace " << ns.size() << " key " << k;
+    }
+  }
+}
+
+TEST(KeyMap, Sha256PrefixEqualsOneShot) {
+  std::string data(300, '\0');
+  for (size_t i = 0; i < data.size(); ++i) data[i] = static_cast<char>(i * 7);
+  for (size_t prefix = 0; prefix <= 140; prefix += 1) {
+    const dfkv::Sha256Prefix hasher(data.data(), prefix);
+    for (size_t head : {size_t{0}, size_t{8}, size_t{70}}) {
+      for (size_t rest : {size_t{0}, size_t{1}, size_t{55}, size_t{64},
+                          size_t{100}}) {
+        if (prefix + head + rest > data.size()) continue;
+        uint8_t expected[32];
+        uint8_t got[32];
+        dfkv::Sha256(data.data(), prefix + head + rest, expected);
+        hasher.Finish(data.data() + prefix, head, data.data() + prefix + head,
+                      rest, got);
+        ASSERT_EQ(0, std::memcmp(expected, got, 32))
+            << prefix << "+" << head << "+" << rest;
+      }
+    }
+  }
 }

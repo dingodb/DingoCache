@@ -162,7 +162,8 @@ KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
                    std::string key_namespace, Transport* transport,
                    std::optional<size_t> batch_concurrency_override)
     : key_namespace_(std::move(key_namespace)),
-      namespace_hash_(ToBlockKey(key_namespace_, "").digest_hi),
+      block_key_(key_namespace_),
+      namespace_hash_(block_key_("").digest_hi),
       health_(EnvSize("DFKV_PEER_COOLDOWN_MS", 2000),
               EnvSize("DFKV_PEER_COOLDOWN_MAX_MS", 30000),
               EnvSize("DFKV_PEER_BAD_GRACE_MS", 1000)) {
@@ -243,7 +244,7 @@ KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
   std::call_once(dump_once, [this] {
     namespace cd = dfkv::config_dump;
     cd::Record("key_namespace_digest",
-               ToBlockKey(key_namespace_, "").DigestHex(), cd::Source::kArg);
+               block_key_("").DigestHex(), cd::Source::kArg);
     cd::Record("transport", transport_reason_, cd::Source::kArg);
     cd::Emit("client");
   });
@@ -544,7 +545,7 @@ void KVClient::StopProbe() {
 void KVClient::ProbeLoop() {
   // A sentinel key that no real workload writes; kExist of it is a cheap round
   // trip that measures the node's responsiveness (kNotFound is a healthy reply).
-  const BlockKey probe = ToBlockKey(key_namespace_, "__dfkv_probe__");
+  const BlockKey probe = block_key_("__dfkv_probe__");
   while (probe_running_.load(std::memory_order_relaxed)) {
     std::vector<std::string> addrs;
     {
@@ -700,9 +701,11 @@ bool KVClient::RefreshMembers(const std::string& seed_addr) {
 }
 
 std::string KVClient::Route(const std::string& key) const {
+  // Hashed before the lock: every routed key of every thread takes it.
+  const uint32_t hash = ConHash::KeyHash(key);
   std::lock_guard<std::mutex> lk(ring_mu_);
   std::string name;
-  if (!ring_.Lookup(key, &name)) return "";
+  if (!ring_.LookupHash(hash, &name)) return "";
   auto it = addr_.find(name);
   return it == addr_.end() ? "" : it->second;
 }
@@ -721,7 +724,7 @@ bool KVClient::PutDirect(const std::string& key, const void* value, size_t n) {
   if (node.empty()) return false;
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
-  const BlockKey bk = ToBlockKey(key_namespace_, key);
+  const BlockKey bk = block_key_(key);
   Status st;
   if (t_->pipelined()) {
     std::vector<CacheSrc> srcs{CacheSrc{bk, value, n}};
@@ -751,7 +754,7 @@ bool KVClient::GetDirect(const std::string& key, void* out, size_t n) {
   if (node.empty()) return false;
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
-  const BlockKey bk = ToBlockKey(key_namespace_, key);
+  const BlockKey bk = block_key_(key);
   uint64_t value_len = 0;
   std::vector<BlockKey> keys{bk};
   std::vector<RangeDst> dsts{
@@ -781,7 +784,7 @@ bool KVClient::GetAutoDirect(const std::string& key, std::string* out,
   if (node.empty()) return false;
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
-  const BlockKey bk = ToBlockKey(key_namespace_, key);
+  const BlockKey bk = block_key_(key);
   uint64_t value_len = 0;
   out->resize(max_bytes);
   std::vector<BlockKey> keys{bk};
@@ -823,7 +826,7 @@ bool KVClient::GetAutoDirect(const std::string& key, void* out, size_t cap,
   if (node.empty()) return false;
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
-  const BlockKey bk = ToBlockKey(key_namespace_, key);
+  const BlockKey bk = block_key_(key);
   uint64_t value_len = 0;
   std::vector<BlockKey> keys{bk};
   std::vector<RangeDst> dsts{
@@ -855,7 +858,7 @@ bool KVClient::ExistDirect(const std::string& key, Status* status) {
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
   bool exists = false;
-  const Status st = t_->Exist(node, ToBlockKey(key_namespace_, key), &exists);
+  const Status st = t_->Exist(node, block_key_(key), &exists);
   if (status) *status = st;
   ReportPeer(node, st);
   if (st == Status::kIOError) {
@@ -883,7 +886,7 @@ bool KVClient::RemoveDirect(const std::string& key) {
   if (node.empty()) return false;
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
-  const BlockKey block_key = ToBlockKey(key_namespace_, key);
+  const BlockKey block_key = block_key_(key);
   const Status st = t_->Remove(node, block_key);
   ReportPeer(node, st);
   if (st == Status::kIOError) {
@@ -922,7 +925,7 @@ std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
     std::vector<CacheSrc> srcs;
     srcs.reserve(idx.size());
     for (size_t k : idx)
-      srcs.push_back(CacheSrc{ToBlockKey(key_namespace_, items[k].key),
+      srcs.push_back(CacheSrc{block_key_(items[k].key),
                               items[k].value, items[k].n});
     std::vector<Status> sts = t_->CacheFrom(node, srcs);
     for (size_t m = 0; m < idx.size(); ++m) {
@@ -967,7 +970,7 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
       // token remains zero: this direct fetch has no publish obligation.
       continue;
     }
-    bks[i] = ToBlockKey(key_namespace_, items[i].key);
+    bks[i] = block_key_(items[i].key);
     switch (dedup_->Claim(bks[i], items[i].n,
                           static_cast<char*>(items[i].out), &tokens[i])) {
       case NodeDedup::Role::kHit:
@@ -1065,7 +1068,7 @@ std::vector<bool> KVClient::BatchGetDirect(const std::vector<KvGetItem>& items) 
       keys.reserve(idx.size());
       dsts.reserve(idx.size());
       for (size_t k : idx) {
-        keys.push_back(ToBlockKey(key_namespace_, items[k].key));
+        keys.push_back(block_key_(items[k].key));
         dsts.push_back(RangeDst{items[k].out, n,
                                 ClassifyDestination(items[k].out, n)});
       }
@@ -1135,7 +1138,7 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
       // Unclaimed device fetch: token remains zero.
       continue;
     }
-    bks[i] = ToBlockKey(key_namespace_, items[i].key);
+    bks[i] = block_key_(items[i].key);
     size_t got = 0;
     switch (dedup_->ClaimAuto(bks[i], items[i].n,
                               static_cast<char*>(items[i].out), &got,
@@ -1244,7 +1247,7 @@ std::vector<bool> KVClient::BatchGetAutoDirect(const std::vector<KvGetItem>& ite
     keys.reserve(idx.size());
     dsts.reserve(idx.size());
     for (size_t k : idx) {
-      keys.push_back(ToBlockKey(key_namespace_, items[k].key));
+      keys.push_back(block_key_(items[k].key));
       dsts.push_back(RangeDst{items[k].out, cap,
                               ClassifyDestination(items[k].out, cap)});
     }
@@ -1295,7 +1298,7 @@ std::vector<bool> KVClient::BatchExist(const std::vector<std::string>& keys) {
   // scheduler lookups contain thousands of keys; serial ClaimExist calls can
   // cost more than the sharded RDMA ExistMany itself.
   RunParallel(N, BatchWorkers(N), [&](size_t i) {
-    bks[i] = ToBlockKey(key_namespace_, keys[i]);
+    bks[i] = block_key_(keys[i]);
     bool value = false;
     const NodeDedup::Role role =
         dedup_->ClaimExist(bks[i], &value, &tokens[i]);
@@ -1540,7 +1543,7 @@ void KVClient::BatchRetain(const std::vector<std::string>& keys,
   std::vector<BlockKey> bks(n);
   std::map<std::pair<std::string, uint64_t>, std::vector<size_t>> by_node;
   for (size_t i = 0; i < n; ++i) {
-    bks[i] = ToBlockKey(key_namespace_, keys[i]);
+    bks[i] = block_key_(keys[i]);
     std::string node = Route(keys[i]);
     if (node.empty()) continue;  // stays kRetError
     if (debounce) {
@@ -1591,7 +1594,7 @@ void KVClient::RetainLimits(int* supported, uint32_t* max_ttl_s) {
     std::lock_guard<std::mutex> lk(ring_mu_);
     for (const auto& kv : addr_) nodes.push_back(kv.second);
   }
-  const uint64_t tenant = ToBlockKey(key_namespace_, "").tenant_hash;
+  const uint64_t tenant = block_key_("").tenant_hash;
   for (const std::string& node : nodes) {
     {
       std::lock_guard<std::mutex> lk(retain_mu_);
@@ -2355,7 +2358,7 @@ std::vector<bool> KVClient::BatchExistDirect(
     }
     std::vector<BlockKey> bkeys;
     bkeys.reserve(idx.size());
-    for (size_t k : idx) bkeys.push_back(ToBlockKey(key_namespace_, keys[k]));
+    for (size_t k : idx) bkeys.push_back(block_key_(keys[k]));
     std::vector<char> ex;
     std::string shard_dev;
     std::chrono::steady_clock::time_point pn_t0;
@@ -2478,7 +2481,7 @@ std::vector<bool> KVClient::BatchRemove(const std::vector<std::string>& keys) {
     const std::vector<size_t>& idx = groups[g].second;
     std::vector<BlockKey> bkeys;
     bkeys.reserve(idx.size());
-    for (size_t k : idx) bkeys.push_back(ToBlockKey(key_namespace_, keys[k]));
+    for (size_t k : idx) bkeys.push_back(block_key_(keys[k]));
     std::vector<Status> sts = t_->RemoveMany(node, bkeys);
     ReportPeer(node, sts);
     for (size_t m = 0; m < idx.size(); ++m) {
@@ -2566,7 +2569,7 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
     srcs.reserve(idx.size());
     for (size_t k : idx) {
       CacheSrcMulti s;
-      s.key = ToBlockKey(key_namespace_, items[k].key);
+      s.key = block_key_(items[k].key);
       s.payloads.reserve(items[k].ptrs.size());
       for (size_t j = 0; j < items[k].ptrs.size(); ++j)
         s.payloads.emplace_back(items[k].ptrs[j], items[k].sizes[j]);
@@ -2753,7 +2756,7 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
       // token remains zero: no rendezvous publish obligation.
       continue;
     }
-    bks[i] = ToBlockKey(key_namespace_, items[i].key);
+    bks[i] = block_key_(items[i].key);
     segs_of(items[i]);
     size_t got = 0;
     switch (gd->ClaimSg(bks[i], segs.data(), segs.size(),
@@ -2961,7 +2964,7 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
       keys.reserve(idx.size());
       dsts.reserve(idx.size());
       for (size_t k : idx) {
-        keys.push_back(ToBlockKey(key_namespace_, items[k].key));
+        keys.push_back(block_key_(items[k].key));
         RangeDstMulti d;
         d.payloads.reserve(items[k].dsts.size());
         for (size_t j = 0; j < items[k].dsts.size(); ++j)

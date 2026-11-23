@@ -162,6 +162,42 @@ inline BlockKey ToBlockKey(const std::string& key_namespace,
                   TenantHash(key_namespace)};
 }
 
+// ToBlockKey for many keys of one namespace: the namespace's part of the
+// key hash and its tenant hash are computed once.
+class BlockKeyHasher {
+ public:
+  explicit BlockKeyHasher(const std::string& key_namespace)
+      : prefix_(Prefix(key_namespace)),
+        tenant_hash_(TenantHash(key_namespace)) {}
+
+  BlockKey operator()(const std::string& object_key) const {
+    uint8_t length[sizeof(uint64_t)];
+    for (size_t i = 0; i < sizeof(length); ++i)
+      length[i] = static_cast<uint8_t>(
+          static_cast<uint64_t>(object_key.size()) >> (8 * i));
+    uint8_t digest[32];
+    prefix_.Finish(length, sizeof(length), object_key.data(),
+                   object_key.size(), digest);
+    return BlockKey{KeyDigestWord(digest), KeyDigestWord(digest + 8),
+                    tenant_hash_};
+  }
+
+ private:
+  static Sha256Prefix Prefix(const std::string& key_namespace) {
+    static constexpr char kDomain[] = "DFKVKEY2";
+    std::string prefix;
+    prefix.reserve(sizeof(kDomain) - 1 + sizeof(uint64_t) +
+                   key_namespace.size());
+    prefix.append(kDomain, sizeof(kDomain) - 1);
+    AppendKeyU64(&prefix, static_cast<uint64_t>(key_namespace.size()));
+    prefix.append(key_namespace);
+    return Sha256Prefix(prefix.data(), prefix.size());
+  }
+
+  Sha256Prefix prefix_;
+  uint64_t tenant_hash_;
+};
+
 }  // namespace dfkv
 
 #endif  // DFKV_KEY_MAP_H_

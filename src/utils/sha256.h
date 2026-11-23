@@ -1,7 +1,7 @@
 /* Small dependency-free SHA-256 used for cache identities.
- * The API is deliberately one-shot: keys are short and callers already own a
- * contiguous canonical descriptor. Digest words are returned as standard
- * big-endian SHA-256 bytes; BlockKey decoding defines its own byte order.
+ * One-shot, plus a fixed-prefix form for many keys of one namespace. Digest
+ * words are returned as standard big-endian SHA-256 bytes; BlockKey decoding
+ * defines its own byte order.
  */
 #ifndef DFKV_SHA256_H_
 #define DFKV_SHA256_H_
@@ -86,6 +86,69 @@ inline void Compress(uint32_t state[8], const uint8_t block[64]) {
 }
 
 }  // namespace sha256_detail
+
+// A hash of a fixed prefix followed by varying data: the prefix's whole
+// blocks are compressed once, and each Finish hashes only the prefix's
+// partial block and the data.
+class Sha256Prefix {
+ public:
+  Sha256Prefix(const void* prefix, size_t size) {
+    const auto* bytes = static_cast<const uint8_t*>(prefix);
+    while (size - absorbed_ >= 64) {
+      sha256_detail::Compress(state_, bytes + absorbed_);
+      absorbed_ += 64;
+    }
+    tail_size_ = size - absorbed_;
+    if (tail_size_ != 0) std::memcpy(tail_, bytes + absorbed_, tail_size_);
+  }
+
+  // SHA-256 of prefix || head || data.
+  void Finish(const void* head, size_t head_size, const void* data,
+              size_t size, uint8_t out[32]) const {
+    uint32_t state[8];
+    std::memcpy(state, state_, sizeof(state));
+    uint8_t block[64];
+    size_t used = tail_size_;
+    std::memcpy(block, tail_, used);
+    const auto absorb = [&](const uint8_t* bytes, size_t n) {
+      while (n != 0) {
+        const size_t take = n < 64 - used ? n : 64 - used;
+        std::memcpy(block + used, bytes, take);
+        used += take;
+        bytes += take;
+        n -= take;
+        if (used == 64) {
+          sha256_detail::Compress(state, block);
+          used = 0;
+        }
+      }
+    };
+    absorb(static_cast<const uint8_t*>(head), head_size);
+    absorb(static_cast<const uint8_t*>(data), size);
+
+    uint8_t final_blocks[128]{};
+    std::memcpy(final_blocks, block, used);
+    final_blocks[used] = 0x80;
+    const size_t padded = used < 56 ? 64 : 128;
+    const uint64_t bit_size =
+        static_cast<uint64_t>(absorbed_ + tail_size_ + head_size + size) * 8;
+    for (size_t i = 0; i < 8; ++i) {
+      final_blocks[padded - 1 - i] = static_cast<uint8_t>(bit_size >> (8 * i));
+    }
+    sha256_detail::Compress(state, final_blocks);
+    if (padded == 128) sha256_detail::Compress(state, final_blocks + 64);
+    for (size_t i = 0; i < 8; ++i)
+      sha256_detail::StoreBe32(out + 4 * i, state[i]);
+  }
+
+ private:
+  uint32_t state_[8] = {0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u,
+                        0xa54ff53au, 0x510e527fu, 0x9b05688cu,
+                        0x1f83d9abu, 0x5be0cd19u};
+  size_t absorbed_ = 0;  // bytes compressed into state_
+  uint8_t tail_[64];
+  size_t tail_size_ = 0;
+};
 
 inline void Sha256(const void* data, size_t size, uint8_t out[32]) {
   uint32_t state[8] = {0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u,
