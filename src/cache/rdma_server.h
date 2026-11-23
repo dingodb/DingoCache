@@ -387,6 +387,9 @@ class RdmaServer {
   std::function<void()> before_endpoint_teardown_for_test_;
   // Test barrier after reply posting, before its SEND CQE is processed.
   std::function<void()> after_reply_post_for_test_;
+  // Runs after a capability probe's reply is written, before its thread
+  // closes the socket and returns.
+  std::function<void()> after_probe_reply_for_test_;
   // Test-only CQ filter: may withhold and later replay actual polled CQEs, or
   // rewrite the status of one. It never fabricates completions; production
   // leaves this empty.

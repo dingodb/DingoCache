@@ -3,6 +3,11 @@
 ## Unreleased
 
 
+- Server, RDMA: a capability probe gives its pending-handshake slot back
+  before it answers. It held it until its thread returned, so at the
+  `DFKV_RDMA_MAX_PENDING_HANDSHAKES` limit the client's bootstrap, sent as
+  soon as it read the answer, could be refused as if the server were busy.
+
 - Client, RDMA: a scatter-gather GET reads several destination segments per
   READ. Each segment of a key's destination took its own READ and its own
   wait; one READ now scatters into as many segments as the device allows

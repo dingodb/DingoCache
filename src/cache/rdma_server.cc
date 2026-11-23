@@ -878,6 +878,9 @@ void RdmaServer::Serve(
   }
   // Capability probes are answered without creating a QP.
   if (rdma::IsV2Probe(devbuf)) {
+    // Its frames are in: give the slot back before answering, so the
+    // client's bootstrap, sent as soon as it reads the answer, finds it free.
+    pending_handshake.Release();
     char reply[rdma::kV2ProbeReplyBytes];
     rdma::EncodeV2ProbeReply(
         reply, rdma::kV2ProbeCapWriterRetirement | rdma::kV2ProbeCapPullRead |
@@ -885,6 +888,7 @@ void RdmaServer::Serve(
                    rdma::kV2ProbeCapDynamicOnly |
                    (session_fd_enabled_ ? rdma::kV2ProbeCapSessionFd : 0));
     net::WriteAll(boot_fd, reply, sizeof(reply));
+    if (after_probe_reply_for_test_) after_probe_reply_for_test_();
     close_boot();
     return;
   }
