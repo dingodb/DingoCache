@@ -90,6 +90,9 @@ _SPECS = [
     # parallel context (from HiCacheStorageConfig or defaults). Such a rank
     # elects the MLA writer by tp_rank; expected to be 0 on current SGLang.
     ("parallel_context_fallbacks", "dfkv_hicache_parallel_context_fallbacks_total", "storage backends created without SGLang's parallel context"),
+    # Pages written in the host form while primary KV is stored
+    # device-direct: stored under keys the device-form probes never find.
+    ("host_writes_while_device_direct_pages", "dfkv_hicache_host_writes_while_device_direct_pages_total", "pages batch_set_v1 wrote in the host form while primary KV is device-direct"),
     # v2 (hybrid/DSA side-pool) path. For V4/DSA models (e.g. GLM-5.2) the real KV
     # rides batch_set_v2/batch_get_v2 while the v1 "kv" path only writes/reads
     # empty anchor markers, so the *_v1 counters above cannot express the L3
@@ -251,6 +254,9 @@ class Metrics:
 
     def on_parallel_context_fallback(self):
         self._add(parallel_context_fallbacks=1)
+
+    def on_host_write_while_device_direct(self, pages):
+        self._add(host_writes_while_device_direct_pages=pages)
 
     def on_set(self, pages, ok_pages, nbytes, seconds=None):
         self._add(set_calls=1, set_pages=pages, set_ok_pages=ok_pages, set_bytes=nbytes)
