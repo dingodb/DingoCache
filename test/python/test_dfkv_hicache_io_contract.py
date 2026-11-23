@@ -699,6 +699,46 @@ class DpAttentionKeysAreShared(unittest.TestCase):
                                   component=c) for c in ("k", "v")])
 
 
+class KeysArePackedOnce(unittest.TestCase):
+    """Each object key used to be validated and packed in full (pool_key per
+    key). The affixes of a pool's coordinates are packed once."""
+
+    def test_pool_key_is_not_built_per_key(self):
+        st = _plugin(is_mla=False, tp_size=8, tp_rank=3)
+        st._pool_component_names = {"state": ("temporal", "conv0")}
+        st._pool_replicated = {"state": False}
+        expected = [dfkv_hicache.pool_key(f"q{i}", pool="kv", tp_size=8,
+                                          tp_rank=3, component=c)
+                    for i in range(100) for c in ("k", "v")]
+        expected_side = [dfkv_hicache.pool_key(f"q{i}", pool="state",
+                                               tp_size=8, tp_rank=3,
+                                               component=c)
+                         for i in range(100) for c in ("temporal", "conv0")]
+        calls = []
+
+        def counted(real):
+            def call(*a, **k):
+                calls.append(real.__name__)
+                return real(*a, **k)
+            return call
+
+        frames = getattr(dfkv_hicache, "_key_frames", None)
+        if frames is not None:
+            frames.cache_clear()
+        affixes = getattr(dfkv_hicache, "pool_key_affixes", None)
+        with unittest.mock.patch.object(
+                dfkv_hicache, "pool_key", counted(dfkv_hicache.pool_key)), \
+                unittest.mock.patch.object(
+                    dfkv_hicache, "pool_key_affixes",
+                    counted(affixes) if affixes else None, create=True):
+            keys = [sk for i in range(100) for sk in st._keys(f"q{i}")]
+            side = [sk for i in range(100)
+                    for sk in st._pool_keys("state", f"q{i}")]
+        self.assertEqual(keys, expected)
+        self.assertEqual(side, expected_side)
+        self.assertLessEqual(len(calls), 4, "once per (pool, component)")
+
+
 class MarkersShareTheScratchSafely(unittest.TestCase):
     """Marker writes and reads of one backend from several threads at once
     share its scratch buffer without a lock: a PUT only reads byte 0, a GET

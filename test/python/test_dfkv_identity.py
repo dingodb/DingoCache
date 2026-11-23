@@ -64,7 +64,34 @@ class ClientOptionsV2Test(unittest.TestCase):
             [ctypes.string_at(pointers[i], lengths[i]) for i in range(2)],
             keys,
         )
-        self.assertEqual(len(owners), 2)
+        self.assertTrue(owners)  # keeps the keys' memory alive (one shared buffer)
+
+
+class KeyArrayTest(unittest.TestCase):
+    """make_key_array packs a batch into one buffer; every pointer still
+    addresses exactly its key."""
+
+    def test_pointers_and_lengths_address_each_key(self):
+        keys = [b"a", b"bcd", b"\x00\x01", b"x" * 300]
+        karr, klens, owners = make_key_array(keys)
+        self.assertTrue(owners)
+        self.assertEqual(list(klens), [len(k) for k in keys])
+        self.assertEqual(
+            [ctypes.string_at(karr[i], klens[i]) for i in range(len(keys))],
+            keys)
+
+    def test_empty_batch(self):
+        karr, klens, _owners = make_key_array([])
+        self.assertEqual((len(karr), len(klens)), (0, 0))
+
+    def test_each_key_is_still_validated(self):
+        # As make_key_buffer does for one key: bytes only, never empty.
+        for bad, error in (([b"a", b""], ValueError),
+                           ([b"a", bytearray(b"b")], TypeError),
+                           ([b"a", "text"], TypeError),
+                           ([b"a", memoryview(b"b")], TypeError)):
+            with self.assertRaises(error, msg=repr(bad)):
+                make_key_array(bad)
 
 
 class CanonicalIdentityTest(unittest.TestCase):

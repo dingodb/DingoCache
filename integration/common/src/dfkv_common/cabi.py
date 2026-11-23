@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import itertools
 from collections.abc import Sequence
 from typing import Any
 
@@ -44,18 +45,25 @@ def make_key_buffer(key: bytes) -> tuple[ctypes.c_void_p, Any]:
 def make_key_array(
     keys: Sequence[bytes],
 ) -> tuple[Any, Any, list[Any]]:
-    """Build aligned ``void*``/``uint64`` key arrays and backing owners."""
-    owners: list[Any] = []
-    pointers: list[ctypes.c_void_p] = []
-    lengths: list[int] = []
+    """Build aligned ``void*``/``uint64`` key arrays and backing owners.
+
+    All keys share one contiguous buffer; each pointer is its key's offset
+    into it. One allocation per batch instead of one per key.
+    """
     for key in keys:
-        pointer, owner = make_key_buffer(key)
-        owners.append(owner)
-        pointers.append(pointer)
-        lengths.append(len(key))
-    key_array = (ctypes.c_void_p * len(pointers))(*pointers)
+        if not isinstance(key, bytes):
+            raise TypeError("dfkv object key must be bytes")
+    lengths = [len(key) for key in keys]
+    if 0 in lengths:
+        raise ValueError("dfkv object key must not be empty")
+    blob = b"".join(keys)
+    buffer = ctypes.create_string_buffer(blob, len(blob) + 1)
+    base = ctypes.addressof(buffer)
+    offsets = itertools.accumulate(lengths, initial=0)
+    key_array = (ctypes.c_void_p * len(lengths))(
+        *[base + offset for offset in offsets][:len(lengths)])
     length_array = (ctypes.c_uint64 * len(lengths))(*lengths)
-    return key_array, length_array, owners
+    return key_array, length_array, [buffer]
 
 
 def make_client_options_v2(

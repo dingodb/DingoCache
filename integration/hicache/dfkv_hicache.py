@@ -37,6 +37,8 @@ from dfkv_common import (
     make_key_array,
     make_key_buffer,
     pool_key,
+    pool_key_affixes,
+    pool_key_hash_field,
     sg_key,
 )
 from dfkv_common import cabi as dfkv_cabi
@@ -696,6 +698,25 @@ def _pool_transfer_result(cls, final, hit, restorable):
     if "restorable_prefix_pages" in getattr(cls, "__dataclass_fields__", {}):
         return cls(final, hit, restorable)
     return cls(final, hit)
+
+
+@functools.lru_cache(maxsize=4096)
+def _key_frames(pool, components, tp_size, tp_rank, pcp_size, pcp_rank,
+                dcp_size, dcp_rank, pp_size, pp_rank):
+    """The pool_key affixes of each component: all of an object key but the
+    page hash field, validated and packed once per distinct set of
+    coordinates instead of once per key."""
+    return tuple(
+        pool_key_affixes(pool=pool, tp_size=tp_size, tp_rank=tp_rank,
+                         pcp_size=pcp_size, pcp_rank=pcp_rank,
+                         dcp_size=dcp_size, dcp_rank=dcp_rank,
+                         pp_size=pp_size, pp_rank=pp_rank, component=component)
+        for component in components)
+
+
+def _keys_from_frames(frames, page_hash) -> List[bytes]:
+    hash_field = pool_key_hash_field(page_hash)
+    return [prefix + hash_field + suffix for prefix, suffix in frames]
 
 
 def _meta_has_no_layout(meta) -> bool:
@@ -1897,15 +1918,16 @@ class DfkvHiCache(HiCacheStorage):
         pp = self.pp_rank if self.enable_pp else 0
         pcp_size, pcp_rank = self._storage_pcp(self.is_mla)
         components = self._kv_components()
-        return [
-            pool_key(page_hash, pool=self._pool_id("kv", len(components), device),
-                     tp_size=self.tp_size, tp_rank=tp,
-                     pcp_size=pcp_size, pcp_rank=pcp_rank,
-                     dcp_size=self.dcp_size, dcp_rank=self.dcp_rank,
-                     pp_size=self.pp_size if self.enable_pp else 1, pp_rank=pp,
-                     component=component)
-            for component in components
-        ]
+        frames = self._key_frames(
+            self._pool_id("kv", len(components), device),
+            tuple(components), tp, pcp_size, pcp_rank, pp)
+        return _keys_from_frames(frames, page_hash)
+
+    def _key_frames(self, pool, components, tp, pcp_size, pcp_rank, pp):
+        """pool_key affixes of one pool's components (validated once)."""
+        return _key_frames(pool, components, self.tp_size, tp, pcp_size,
+                           pcp_rank, self.dcp_size, self.dcp_rank,
+                           self.pp_size if self.enable_pp else 1, pp)
 
     def _sub(self) -> int:
         return len(self._kv_components())
@@ -2727,16 +2749,10 @@ class DfkvHiCache(HiCacheStorage):
         replicated = self._pool_is_replicated(pool_name)
         tp = -1 if replicated else self.tp_rank
         pcp_size, pcp_rank = self._storage_pcp(replicated)
-        return [
-            pool_key(page_hash,
-                     pool=self._pool_id(pool_name, len(components), device),
-                     tp_size=self.tp_size, tp_rank=tp,
-                     pcp_size=pcp_size, pcp_rank=pcp_rank,
-                     dcp_size=self.dcp_size, dcp_rank=self.dcp_rank,
-                     pp_size=self.pp_size if self.enable_pp else 1, pp_rank=pp,
-                     component=component)
-            for component in components
-        ]
+        frames = self._key_frames(
+            self._pool_id(pool_name, len(components), device),
+            tuple(components), tp, pcp_size, pcp_rank, pp)
+        return _keys_from_frames(frames, page_hash)
 
     def _pool_sub(self, pool_name: str) -> int:
         if pool_name in ("kv", "__default__"):
@@ -3092,17 +3108,11 @@ class DfkvHiCache(HiCacheStorage):
         replicated = sub == 1
         tp = -1 if replicated else self.tp_rank
         pcp_size, pcp_rank = self._storage_pcp(replicated)
-        components = ["all"] if replicated else ["k", "v"]
-        return [
-            pool_key(page_hash,
-                     pool=self._pool_id("draft", len(components), True),
-                     tp_size=self.tp_size, tp_rank=tp,
-                     pcp_size=pcp_size, pcp_rank=pcp_rank,
-                     dcp_size=self.dcp_size, dcp_rank=self.dcp_rank,
-                     pp_size=self.pp_size if self.enable_pp else 1, pp_rank=pp,
-                     component=component)
-            for component in components
-        ]
+        components = ("all",) if replicated else ("k", "v")
+        frames = self._key_frames(
+            self._pool_id("draft", len(components), True),
+            components, tp, pcp_size, pcp_rank, pp)
+        return _keys_from_frames(frames, page_hash)
 
     def batch_set_v1_device_draft(self, keys, device_indices, extra_info=None) -> List[bool]:
         """Best-effort device-direct SG put of the EAGLE draft KV pages (task 6):
