@@ -243,7 +243,9 @@ class KVClient {
   // Swap in a freshly-built ring under ring_mu_ and log the membership delta
   // (added/removed node ids) vs the previously-adopted view. Shared by both
   // SetMembers overloads so static and MDS-discovery paths log identically.
-  void AdoptRing(ConHash ring, std::map<std::string, std::string> addr);
+  void AdoptRing(ConHash ring, std::map<std::string, std::string> addr,
+                 ConHash full_ring = ConHash(),
+                 std::set<std::string> draining = {});
   // Publish one replace-all topology response. Stable MDS ids are retained
   // separately from routing addresses; superseded addresses are explicitly
   // retired, and the complete live-id set is reconciled after publication.
@@ -262,14 +264,25 @@ class KVClient {
   // `status`, when given, receives the item's outcome.
   bool PutDirect(const std::string& key, const void* value, size_t n,
                  ItemStatus* status = nullptr);
+  // The read, exist and remove bodies below ask a key's draining owner too
+  // (see full_ring_); each *Routed form asks the one node Route() names.
   bool GetDirect(const std::string& key, void* out, size_t n,
                  ItemStatus* status = nullptr);
+  bool GetDirectRouted(const std::string& key, void* out, size_t n,
+                       ItemStatus* status);
   bool GetAutoDirect(const std::string& key, std::string* out,
                      size_t max_bytes);
+  bool GetAutoDirectRouted(const std::string& key, std::string* out,
+                           size_t max_bytes);
   bool GetAutoDirect(const std::string& key, void* out, size_t cap,
                      size_t* out_len, ItemStatus* status = nullptr);
+  bool GetAutoDirectRouted(const std::string& key, void* out, size_t cap,
+                           size_t* out_len, ItemStatus* status);
   bool ExistDirect(const std::string& key, Status* status);
+  bool ExistDirectRouted(const std::string& key, Status* status);
   bool RemoveDirect(const std::string& key);
+  bool RemoveDirectRouted(const std::string& key);
+  void CountDrainRead(bool hit);
   void InvalidateRendezvous(const BlockKey& key);
   DestinationMemoryKind ClassifyDestination(const void* destination,
                                              size_t size) const;
@@ -284,15 +297,35 @@ class KVClient {
       const std::vector<KvGetItem>& items,
       const std::function<void(size_t)>& on_hit = nullptr,
       ItemStatus* status = nullptr);
+  std::vector<bool> BatchGetDirectRouted(
+      const std::vector<KvGetItem>& items,
+      const std::function<void(size_t)>& on_hit, ItemStatus* status);
   std::vector<bool> BatchGetAutoDirect(
       const std::vector<KvGetItem>& items, std::vector<size_t>* out_lens,
       const std::function<void(size_t, size_t)>& on_hit = nullptr,
       ItemStatus* status = nullptr);
+  std::vector<bool> BatchGetAutoDirectRouted(
+      const std::vector<KvGetItem>& items, std::vector<size_t>* out_lens,
+      const std::function<void(size_t, size_t)>& on_hit, ItemStatus* status);
   std::vector<bool> BatchGetAutoSgDirect(const std::vector<KvGetItemSg>& items,
                                          std::vector<size_t>* out_lens,
                                          ItemStatus* status = nullptr);
+  std::vector<bool> BatchGetAutoSgDirectRouted(
+      const std::vector<KvGetItemSg>& items, std::vector<size_t>* out_lens,
+      ItemStatus* status);
   std::vector<bool> BatchExistDirect(const std::vector<std::string>& keys,
                                      std::vector<Status>* statuses);
+  std::vector<bool> BatchExistDirectRouted(const std::vector<std::string>& keys,
+                                           std::vector<Status>* statuses);
+  // The RDMA (pipelined) BatchRemove body for the nodes Route() names.
+  std::vector<char> BatchRemoveRouted(const std::vector<std::string>& keys);
+  void BatchRetainRouted(const std::vector<std::string>& keys,
+                         const RetainRequest& req, uint8_t* out);
+  // Indices of the keys owned by a draining member (none unless one drains,
+  // and none inside a drain pass).
+  template <typename KeyOf>
+  std::vector<size_t> DrainerOwned(size_t n, const std::vector<bool>* done,
+                                   KeyOf key_of) const;
   GpuNodeDedup* GpuDedup(const void* device_dst_hint);
   // Record one public batch operation (hits are the true flags) and return the
   // item results. Centralizing this at each public return point prevents direct
@@ -350,9 +383,26 @@ class KVClient {
                   const std::vector<size_t>& idx,
                   const std::vector<BlockKey>& bkeys,
                   const RetainRequest& req, uint8_t* out);
-  mutable std::mutex ring_mu_;  // guards ring_ + addr_
+  mutable std::mutex ring_mu_;  // guards ring_, addr_, full_ring_, draining_
+  // Placement for writes: the eligible members that are not draining (all of
+  // them while none is, or if every one is). Reads ask its owner first.
   ConHash ring_;
-  std::map<std::string, std::string> addr_;  // name -> ip:port
+  std::map<std::string, std::string> addr_;  // every eligible member: name -> ip:port
+  // Drain routing (DFKV_DRAIN on the nodes; MemberInfo::draining). While a
+  // member drains, full_ring_ is the ring with it, the one keys were written
+  // under; a key whose full-ring owner drains is read from it after a miss
+  // at its write owner, and REMOVE and RETAIN go to both. Empty otherwise.
+  ConHash full_ring_;
+  std::set<std::string> draining_;
+  std::atomic<bool> any_draining_{false};
+  // The drainer of a key: its full-ring owner's address if that member
+  // drains, else "".
+  std::string DrainRoute(const std::string& key) const;
+  // Second requests to a draining owner: reads that found the key there /
+  // did not; REMOVEs and RETAINs it confirmed / did not.
+  std::atomic<uint64_t> drain_reads_hit_{0}, drain_reads_miss_{0};
+  std::atomic<uint64_t> drain_removes_ok_{0}, drain_removes_failed_{0};
+  std::atomic<uint64_t> drain_retains_ok_{0}, drain_retains_failed_{0};
   // Stable identity -> routing address published to the transport: the
   // preceding replace-all topology response plus the ring members a refused
   // view omitted. Together with addr_, this finds removed identities and old

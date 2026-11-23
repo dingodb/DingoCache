@@ -140,6 +140,9 @@ class KvNodeServer {
   // Add transport/registrar/readiness metrics to both HTTP /metrics and the
   // kStats wire response used by dfkvctl. Assignment and scrape are thread-safe.
   void set_metrics_extension(std::function<std::string()> render);
+  // kDrain (DFKV_DRAIN): called with true to start draining, false to stop;
+  // its status is the answer. Unset: kDrain is answered kInvalid.
+  void set_drain_handler(std::function<Status(bool)> handler);
   std::string FullMetricsText() const;
 
   // Transport-agnostic request processing (shared by the TCP handler and, when
@@ -384,6 +387,7 @@ class KvNodeServer {
   std::string node_id_, node_group_;       // identity for Prometheus labels (optional)
   std::chrono::steady_clock::time_point start_time_ = std::chrono::steady_clock::now();
   mutable std::mutex metrics_extension_mu_;
+  std::function<Status(bool)> drain_handler_;  // under metrics_extension_mu_
   std::function<std::string()> metrics_extension_;
   struct RamFlushDiskMetrics {
     std::atomic<uint64_t> batches{0};

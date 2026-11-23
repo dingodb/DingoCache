@@ -115,6 +115,7 @@ MdsRegistrar::Answer MdsRegistrar::SendTo(const std::string& ep, uint8_t op,
     self_.health = health ? std::move(*health) : MemberHealth{};
   }
   if (info_fn_) self_.info = info_fn_();
+  if (drain_fn_) self_.draining = drain_fn_();
   std::string payload = EncodeMemberReq(group_, self_);
   char pre[kReqPrefix];
   EncodeReq(pre, static_cast<WireOp>(op), BlockKey{}, 0, 0, payload.size());
@@ -139,12 +140,45 @@ MdsRegistrar::Answer MdsRegistrar::SendTo(const std::string& ep, uint8_t op,
   return ok ? Answer::kOk : fenced ? Answer::kFenced : Answer::kFailed;
 }
 
+bool MdsRegistrar::Beat(bool registering, int io_timeout_ms,
+                        uint64_t deadline_ms) {
+  uint64_t seq;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    beat_now_ = false;
+    seq = ++beat_started_seq_;
+  }
+  const WireOp op =
+      registering ? (is_client_ ? WireOp::kClientRegister : WireOp::kRegister)
+                  : (is_client_ ? WireOp::kClientHeartbeat : WireOp::kHeartbeat);
+  const bool ok = SendOnce(static_cast<uint8_t>(op), io_timeout_ms, deadline_ms);
+  if (ok) {
+    std::lock_guard<std::mutex> lk(mu_);
+    beat_ok_seq_ = std::max(beat_ok_seq_, seq);
+  }
+  if (ok) cv_.notify_all();
+  return ok;
+}
+
+bool MdsRegistrar::BeatNow(int timeout_ms) {
+  std::unique_lock<std::mutex> lk(mu_);
+  if (!running_.load()) return false;
+  const uint64_t target = beat_started_seq_ + 1;
+  beat_now_ = true;
+  cv_.notify_all();
+  return cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms), [&] {
+    return beat_ok_seq_ >= target || !running_.load();
+  }) && beat_ok_seq_ >= target;
+}
+
+bool MdsRegistrar::Deregister() {
+  return SendOnce(static_cast<uint8_t>(WireOp::kDeregister), io_ms_,
+                  /*deadline_ms=*/0);
+}
+
 bool MdsRegistrar::RegisterOnceBefore(int io_timeout_ms,
                                       uint64_t deadline_ms) {
-  const bool ok =
-      SendOnce(static_cast<uint8_t>(is_client_ ? WireOp::kClientRegister
-                                               : WireOp::kRegister),
-               io_timeout_ms, deadline_ms);
+  const bool ok = Beat(/*registering=*/true, io_timeout_ms, deadline_ms);
   const uint64_t now = NowMs();
   if (!ok || (deadline_ms != 0 && now > deadline_ms)) return false;
   last_success_ms_.store(now, std::memory_order_relaxed);
@@ -160,10 +194,7 @@ bool MdsRegistrar::RegisterOnce() {
 }
 
 bool MdsRegistrar::HeartbeatOnce() {
-  const bool ok =
-      SendOnce(static_cast<uint8_t>(is_client_ ? WireOp::kClientHeartbeat
-                                               : WireOp::kHeartbeat),
-               io_ms_, /*deadline_ms=*/0);
+  const bool ok = Beat(/*registering=*/false, io_ms_, /*deadline_ms=*/0);
   if (registered()) ReportHeartbeatResult(ok);
   return ok;
 }
@@ -290,7 +321,12 @@ void MdsRegistrar::Loop() {
     if (WaitMs(retry_wait)) return;
   }
   while (running_.load()) {
-    if (WaitMs(hb_ms_)) return;
+    {
+      std::unique_lock<std::mutex> lk(mu_);
+      cv_.wait_for(lk, std::chrono::milliseconds(hb_ms_),
+                   [this] { return !running_.load() || beat_now_; });
+    }
+    if (!running_.load()) return;
     HeartbeatOnce();
   }
 }

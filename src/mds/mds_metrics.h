@@ -15,6 +15,7 @@ namespace dfkv {
 
 struct MdsMetrics {
   std::atomic<uint64_t> register_requests{0};
+  std::atomic<uint64_t> deregister_requests{0};
   std::atomic<uint64_t> keepalives{0};
   std::atomic<uint64_t> list_requests{0};
   std::atomic<uint64_t> lease_grants{0};
@@ -68,6 +69,7 @@ struct MdsMetrics {
       return a.load(std::memory_order_relaxed);
     };
     m("dfkv_mds_register_requests_total", "counter", "Register ops received", ld(register_requests));
+    m("dfkv_mds_deregister_requests_total", "counter", "Deregister ops received (a drained node stopping)", ld(deregister_requests));
     m("dfkv_mds_keepalives_total", "counter", "Heartbeat ops received", ld(keepalives));
     m("dfkv_mds_list_requests_total", "counter", "ListMembers ops served", ld(list_requests));
     m("dfkv_mds_lease_grants_total", "counter", "etcd lease grants issued", ld(lease_grants));

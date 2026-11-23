@@ -436,6 +436,9 @@ Status MdsServer::UpsertClient(const std::string& group, const MemberInfo& m) {
 namespace {
 // `stored` and `next` encode the same member except for its stats: rewriting
 // the record would only refresh them.
+// Whatever else differs, drain included (DRN1 is in the encoding, and a
+// view without a draining member has none), is a record change and is
+// written at once.
 bool OnlyStatsDiffer(const std::string& stored, const MemberInfo& next,
                      const std::string& next_encoded) {
   std::vector<MemberInfo> one;
@@ -769,9 +772,24 @@ Status MdsServer::ListMembersFromEtcd(const std::string& group,
   // second wire extension.
   metrics_.members_last_list.store(members.size(), std::memory_order_relaxed);
   const uint64_t epoch = include_degraded
-                             ? MembersTopologyEpoch(members)
+                             ? MembersViewEpoch(members)
                              : MembersEpoch(members);
   *out = EncodeMembers(members, epoch);
+  return Status::kOk;
+}
+
+Status MdsServer::Deregister(const std::string& group, const MemberInfo& m) {
+  if (!IsValidGroupOrId(group) || !IsValidGroupOrId(m.id)) return Status::kInvalid;
+  const std::string key = MemberKey(group, m.id);
+  if (!etcd_.Delete(key)) {
+    metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed);
+    return Status::kIOError;
+  }
+  unwritten_.Remove(key);
+  // The next poll reads the list without it.
+  list_cache_.Invalidate(group);
+  DFKV_LOG_INFO("mds: member " + m.id + " of group " + group +
+                " deregistered (drained and stopping)");
   return Status::kOk;
 }
 
@@ -1059,6 +1077,12 @@ void MdsServer::Handle(int fd, long io_timeout_s,
       MemberInfo m;
       if (DecodeMemberReq(payload.data(), rq.payload_len, &group, &m))
         st = Upsert(group, m, op == WireOp::kHeartbeat);
+    } else if (op == WireOp::kDeregister) {
+      metrics_.deregister_requests.fetch_add(1, std::memory_order_relaxed);
+      std::string group;
+      MemberInfo m;
+      if (DecodeMemberReq(payload.data(), rq.payload_len, &group, &m))
+        st = Deregister(group, m);
     } else if (op == WireOp::kClientRegister || op == WireOp::kClientHeartbeat) {
       if (op == WireOp::kClientRegister)
         metrics_.client_register_requests.fetch_add(1, std::memory_order_relaxed);

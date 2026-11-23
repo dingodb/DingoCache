@@ -94,6 +94,14 @@ struct MemberInfo {
   bool has_stats = false;
   MemberHealth health{};
   bool has_health = false;
+  // The node is draining (DFKV_DRAIN): it keeps its ring position and serves
+  // reads, and clients of 2.43 and later send it no new writes (see
+  // DrainRouting in kv_client.h). Rides the optional DRN1 extension, written
+  // only when a member is draining, so other views encode as before; like
+  // tcp_port and info it is outside operator== and MembersEpoch (placement
+  // does not change), and outside MemberTopologyEpoch (the transport's state
+  // for the peer stays valid). MembersViewEpoch carries it.
+  bool draining = false;
   // tcp_port and info ride OPTIONAL trailing extensions in Encode/DecodeMembers, so peers
   // that don't send them still interoperate. Both are intentionally EXCLUDED from
   // operator== and MembersEpoch: they are orthogonal metadata (not part of ring
@@ -132,6 +140,7 @@ constexpr uint32_t kMemberExtTcpPort = 0x54435031u;  // "TCP1": one tcp_port u32
 constexpr uint32_t kMemberExtInfo = 0x4E464F31u;     // "NFO1": one length-prefixed info string per member
 constexpr uint32_t kMemberExtStats = 0x31415453u;    // "STA1": nfields u8 then per member { has u8 [nfields x u64] }
 constexpr uint32_t kMemberExtHealth = 0x31544C48u;   // "HLT1": eligibility + per-device IB health
+constexpr uint32_t kMemberExtDrain = 0x314E5244u;    // "DRN1": one u8 per member, 1 = draining
 
 // Wire format for a membership view. Register payload = 1 member; ListMembers
 // response = N members + the epoch (etcd revision) clients compare to skip
@@ -203,6 +212,14 @@ inline std::string EncodeMembers(const std::vector<MemberInfo>& ms,
         out.push_back(d.query_ok ? 1 : 0);
       }
     }
+  }
+  // DRN1 last, and only when it says something: an older decoder stops at
+  // the unknown tag, and a view without a draining member is byte for byte
+  // what older releases encode.
+  if (std::any_of(ms.begin(), ms.end(),
+                  [](const MemberInfo& m) { return m.draining; })) {
+    net::PutU32(num, kMemberExtDrain); out.append(num, 4);
+    for (const auto& m : ms) out.push_back(m.draining ? 1 : 0);
   }
   return out;
 }
@@ -307,6 +324,11 @@ inline bool DecodeMembers(const char* p, size_t n,
         (*out)[i].has_health = true;
       }
       if (!ok) break;
+    } else if (tag == kMemberExtDrain) {
+      off += 4;
+      if (off + count > n) break;
+      for (uint32_t i = 0; i < count; ++i) (*out)[i].draining = p[off + i] != 0;
+      off += count;
     } else {
       break;  // unknown/future tag: ignore the rest (forward compatible)
     }
@@ -413,6 +435,30 @@ inline uint64_t MembersTopologyEpoch(std::vector<MemberInfo> ms) {
 // client and independent of the order in which the MDS lists members.
 inline uint64_t MemberTopologyEpoch(const MemberInfo& member) {
   return MembersTopologyEpoch(std::vector<MemberInfo>{member});
+}
+
+// The ids of the draining members, hashed in id order; 0 when none is.
+inline uint64_t MembersDrainEpoch(const std::vector<MemberInfo>& ms) {
+  std::vector<std::string> ids;
+  for (const auto& m : ms)
+    if (m.draining) ids.push_back(m.id);
+  if (ids.empty()) return 0;
+  std::sort(ids.begin(), ids.end());
+  uint64_t h = 1469598103934665603ull;
+  for (const auto& id : ids) {
+    const uint32_t len = static_cast<uint32_t>(id.size());
+    const unsigned char* b = reinterpret_cast<const unsigned char*>(&len);
+    for (size_t i = 0; i < sizeof(len); ++i) { h ^= b[i]; h *= 1099511628211ull; }
+    for (unsigned char c : id) { h ^= c; h *= 1099511628211ull; }
+  }
+  return h;
+}
+
+// The generation of a complete view as the MDS reports it for kListTopology:
+// the topology plus which members drain, so a client polls a drain change
+// in. Equal to MembersTopologyEpoch while nobody drains.
+inline uint64_t MembersViewEpoch(const std::vector<MemberInfo>& ms) {
+  return MembersTopologyEpoch(ms) ^ MembersDrainEpoch(ms);
 }
 
 }  // namespace dfkv

@@ -328,17 +328,62 @@ static void PrintRingJson(const std::string& group,
     const double share =
         total ? 100.0 * static_cast<double>(v) / static_cast<double>(total)
               : 0.0;
+    // status stays the rail health; draining is its own field (the table's
+    // STATUS column shows DRAINING instead).
     std::printf("%s\n{\"id\":%s,\"ip\":%s,\"port\":%u,\"status\":\"%s\","
                 "\"eligible\":%s,\"weight\":%u,\"vnodes\":%zu,"
-                "\"share_percent\":%.1f,\"ib_health\":%s,\"info\":%s}",
+                "\"share_percent\":%.1f,\"ib_health\":%s,\"info\":%s,"
+                "\"draining\":%s}",
                 first ? "" : ",", JsonString(m.id).c_str(),
                 JsonString(m.ip).c_str(), m.port, MemberStatus(m),
                 m.RingEligible() ? "true" : "false", m.weight, v, share,
                 JsonString(IbHealthSummary(m)).c_str(),
-                JsonString(m.info).c_str());
+                JsonString(m.info).c_str(), m.draining ? "true" : "false");
     first = false;
   }
   std::printf("%s]}\n", first ? "" : "\n");
+}
+
+// `drain <node-ip:tcp-port> [--undrain]`: one kDrain to the node. It answers
+// once its MDS has the record in the new state (the node waits up to 15 s).
+static int CmdDrain(const std::string& node, bool on) {
+  int fd = net::Dial(node, 2000, 20000);
+  if (fd < 0) {
+    std::fprintf(stderr, "drain: cannot connect to %s\n", node.c_str());
+    return 1;
+  }
+  const char flag = on ? 1 : 0;
+  char pre[kReqPrefix];
+  EncodeReq(pre, WireOp::kDrain, BlockKey{}, 0, 0, 1);
+  bool ok = net::WriteAll(fd, pre, kReqPrefix) && net::WriteAll(fd, &flag, 1);
+  Status st = Status::kInvalid;
+  if (ok) {
+    char rp[kRespPrefix];
+    uint64_t dlen = 0;
+    ok = net::ReadAll(fd, rp, kRespPrefix) &&
+         DecodeResp(rp, &st, &dlen, wire_limits::kMdsMaxRespData);
+    std::string data(dlen, '\0');
+    if (ok && dlen) ok = net::ReadAll(fd, &data[0], dlen);
+  }
+  ::close(fd);
+  if (!ok) {
+    std::fprintf(stderr, "drain: no answer from %s\n", node.c_str());
+    return 1;
+  }
+  if (st == Status::kOk) {
+    std::printf("%s %s\n", node.c_str(), on ? "draining" : "not draining");
+    return 0;
+  }
+  if (st == Status::kInvalid)
+    std::fprintf(stderr,
+                 "drain: %s does not drain (DFKV_DRAIN is off, it has no MDS, "
+                 "or it is older than 2.43)\n", node.c_str());
+  else
+    std::fprintf(stderr,
+                 "drain: %s is %s, but its MDS has not taken the record yet; "
+                 "it goes with the next heartbeat (or run this again)\n",
+                 node.c_str(), on ? "draining" : "not draining");
+  return 1;
 }
 
 static int CmdRing(const std::string& mds, const std::string& group,
@@ -387,7 +432,7 @@ static int CmdRing(const std::string& mds, const std::string& group,
       // cap, ...). "-" = node predates info reporting (itself a version signal).
       std::printf("%-16s %-22s %-9s %6u %8zu %6.1f%% %-30s %s\n",
                   m.id.c_str(), addr.c_str(),
-                  MemberStatus(m), m.weight, v, share,
+                  m.draining ? "DRAINING" : MemberStatus(m), m.weight, v, share,
                   IbHealthSummary(m).c_str(),
                   m.info.empty() ? "-" : m.info.c_str());
     }
@@ -653,6 +698,7 @@ int main(int argc, char** argv) {
   bool allow_empty = false;
   bool json = false;
   bool group_explicit = false;
+  bool undrain = false;
   uint32_t stat_port = 0;  // override; 0 = use MDS-provided tcp_port, else the member's port
   std::vector<std::string> pos;
   for (int i = 1; i < argc; ++i) {
@@ -683,11 +729,12 @@ int main(int argc, char** argv) {
     else if (a == "--all") all = true;
     else if (a == "--allow-empty") allow_empty = true;
     else if (a == "--json") json = true;
+    else if (a == "--undrain") undrain = true;
     else if (a == "--stat-port") nv32(&stat_port);
     else if (a == "--namespace" && i + 1 < argc) key_namespace = argv[++i];
     else pos.push_back(a);
   }
-  if (pos.empty()) { std::fprintf(stderr, "usage: dfkvctl [--members ...] [--namespace ...] put|get|exist|stat|stats|ring|topology ...\n"); return 2; }
+  if (pos.empty()) { std::fprintf(stderr, "usage: dfkvctl [--members ...] [--namespace ...] put|get|exist|stat|stats|ring|topology|clients|drain ...\n"); return 2; }
   const std::string& cmd = pos[0];
   if (json && cmd != "ring" && cmd != "topology") {
     std::fprintf(stderr, "--json is only supported by ring/topology\n");
@@ -698,6 +745,13 @@ int main(int argc, char** argv) {
     return CmdRing(mds, group, allow_empty, json);
   if (cmd == "clients") return CmdClients(mds, group);
   if (cmd == "member") return CmdMember(mds, group, pos);
+  if (cmd == "drain") {
+    if (pos.size() < 2) {
+      std::fprintf(stderr, "drain <node-ip:tcp-port> [--undrain]\n");
+      return 2;
+    }
+    return CmdDrain(pos[1], !undrain);
+  }
 
   if (cmd == "stats") {
     if (all) return CmdStatsAllGroups(mds);

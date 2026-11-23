@@ -107,6 +107,8 @@ _COUNTERS: dict[str, tuple[str, ...]] = {
     # Rail and peer failure signals. Without them a rank cut off from a
     # server's rails (no compatible rail) or a server's failing rails were
     # invisible at the inference endpoint.
+    # Second requests to a key's draining owner (MDS-04).
+    "dfkv_client_drain_requests_total": ("op", "result"),
     "dfkv_rdma_client_no_compatible_rail_total": (),
     "dfkv_rdma_client_admission_failures_total": (),
     "dfkv_rdma_client_local_resource_failures_total": (),
@@ -155,6 +157,7 @@ _COUNTERS: dict[str, tuple[str, ...]] = {
 _GAUGES: dict[str, tuple[str, ...]] = {
     "dfkv_client_transport_info": ("transport",),
     "dfkv_client_ring_members": (),
+    "dfkv_client_ring_draining_members": (),
     "dfkv_client_mds_reachable": (),
     "dfkv_client_peer_latency_max_seconds": ("peer",),
     "dfkv_client_op_max_seconds": ("op",),

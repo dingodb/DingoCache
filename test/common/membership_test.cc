@@ -1,5 +1,8 @@
 #include "common/membership.h"
 #include <gtest/gtest.h>
+
+#include <string>
+#include <vector>
 using namespace dfkv;  // NOLINT
 
 TEST(MembershipCodec, RoundTripMultiMember) {
@@ -280,4 +283,71 @@ TEST(Membership, MissingHealthExtensionDefaultsEligible) {
   ASSERT_EQ(out.size(), 1u);
   EXPECT_FALSE(out[0].has_health);
   EXPECT_TRUE(out[0].RingEligible());
+}
+
+// DRN1: a draining member rides an extension written only when some member
+// drains, so every other view encodes exactly as before.
+TEST(Membership, DrainRoundTripsAndIsWrittenOnlyWhenSomeoneDrains) {
+  std::vector<MemberInfo> ms = {{"a", "10.0.0.1", 1, 1}, {"b", "10.0.0.2", 2, 1}};
+  ms[1].has_health = true;
+  const std::string plain = EncodeMembers(ms, 7);
+  std::vector<MemberInfo> got;
+  uint64_t epoch = 0;
+  ASSERT_TRUE(DecodeMembers(plain.data(), plain.size(), &got, &epoch));
+  EXPECT_FALSE(got[0].draining);
+  EXPECT_FALSE(got[1].draining);
+  char tag[4];
+  net::PutU32(tag, kMemberExtDrain);
+  EXPECT_EQ(plain.find(std::string(tag, 4)), std::string::npos);
+
+  ms[1].draining = true;
+  const std::string drained = EncodeMembers(ms, 7);
+  // The same bytes, then the tag and one byte per member.
+  ASSERT_EQ(drained.size(), plain.size() + 4 + ms.size());
+  EXPECT_EQ(drained.compare(0, plain.size(), plain), 0);
+  ASSERT_TRUE(DecodeMembers(drained.data(), drained.size(), &got, &epoch));
+  EXPECT_FALSE(got[0].draining);
+  EXPECT_TRUE(got[1].draining);
+  EXPECT_TRUE(got[1].has_health);
+}
+
+// A decoder that predates DRN1 stops at the unknown tag: it reads the
+// members, their other extensions, and the member as not draining.
+TEST(Membership, AnOlderDecoderReadsADrainingViewAsNotDraining) {
+  std::vector<MemberInfo> ms = {{"a", "10.0.0.1", 1, 1}, {"b", "10.0.0.2", 2, 1}};
+  ms[0].info = "ver=old";
+  ms[1].draining = true;
+  std::string bytes = EncodeMembers(ms, 9);
+  // What an older decoder sees: a tag it does not know in DRN1's place.
+  const size_t at = bytes.size() - 4 - ms.size();
+  net::PutU32(&bytes[at], 0x39393939u);
+  std::vector<MemberInfo> got;
+  uint64_t epoch = 0;
+  ASSERT_TRUE(DecodeMembers(bytes.data(), bytes.size(), &got, &epoch));
+  ASSERT_EQ(got.size(), 2u);
+  EXPECT_EQ(got[0].info, "ver=old");
+  EXPECT_FALSE(got[1].draining);
+}
+
+// Placement and the per-member transport generation ignore drain; the view
+// epoch the MDS reports for kListTopology carries it, and equals the
+// topology epoch while nobody drains.
+TEST(Membership, DrainChangesOnlyTheViewEpoch) {
+  std::vector<MemberInfo> ms = {{"a", "10.0.0.1", 1, 1}, {"b", "10.0.0.2", 2, 1}};
+  const uint64_t placement = MembersEpoch(ms);
+  const uint64_t topology = MembersTopologyEpoch(ms);
+  const uint64_t member_b = MemberTopologyEpoch(ms[1]);
+  EXPECT_EQ(MembersViewEpoch(ms), topology);
+  EXPECT_EQ(MembersDrainEpoch(ms), 0u);
+  ms[1].draining = true;
+  EXPECT_EQ(MembersEpoch(ms), placement);
+  EXPECT_EQ(MembersTopologyEpoch(ms), topology);
+  EXPECT_EQ(MemberTopologyEpoch(ms[1]), member_b);
+  const MemberInfo same{"b", "10.0.0.2", 2, 1};
+  EXPECT_TRUE(ms[1] == same);
+  EXPECT_NE(MembersViewEpoch(ms), topology);
+  const uint64_t b_drains = MembersViewEpoch(ms);
+  ms[1].draining = false;
+  ms[0].draining = true;
+  EXPECT_NE(MembersViewEpoch(ms), b_drains);
 }

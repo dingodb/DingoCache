@@ -811,6 +811,8 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | `DFKV_MDS_STATS_PUT_MS` | `60000` | 仅统计（STA1）变化时重写 member 记录的最短间隔（`0`=每次心跳都重写，上限 600000）；放置相关的变化（ip、端口、权重、健康）立即写 |
 | `DFKV_MDS_LIST_CACHE_MS` | `500` | member list 回答的复用时长（`0`=每次读 etcd，上限 10000）；本 MDS 的写入会立即作废它 |
 | `DFKV_MDS_FENCING` | 关 | member fencing：`dfkvctl member fence <id>` 一步把节点移出环并保持移出（无租约的 `/dfkv/v1/groups/<g>/fenced/<id>` 记录；其注册和心跳被拒，记录被删除，list 不再列出），`unfence` 恢复。改变 etcd 布局并多一次读，**同一 group 的全部 MDS 都要开启**（没开的 MDS 会让被 fence 的节点写回记录，list 仍会过滤掉它） |
+| `DFKV_DRAIN` | `0` | 允许本节点排空（`dfkvctl drain`、停止前排空），需要 `--mds`；见 [§4c-1](#4c-drain) |
+| `DFKV_STOP_DRAIN_MS` | `0` | `DFKV_DRAIN=1` 时，SIGTERM 后先排空并继续服务这么久再停止（`0`=不排空，上限 600000）；第二个 SIGTERM 结束等待；须小于 `terminationGracePeriodSeconds` 减去停止时间 |
 | `DFKV_MDS_UNWRITTEN_HOLD_MS` | `120000` | MDS 把心跳已到但没写进 etcd 的 member 视为存活的时长；期间 etcd 缺少该 member 则 member list 返回错误（`0`=关，上限 600000；须大于 MDS 端点数 × 10s 心跳间隔；见 §2b） |
 | `DFKV_RDMA_HEALTH_RECOVERY_SAMPLES` | `3` | 仅 RDMA listener 生效。任一 initialized rail 健康即可 placement；部分掉轨保持 `PARTIAL`。最后一条健康 rail 丢失立即 `DEGRADED`；0→非 0 恢复要求连续成功样本，通过后 `PARTIAL`/`ACTIVE` 回环 |
 | `DFKV_RDMA_HEALTH_FILE` | 未设置（生产必须未设置） | 仅受控故障注入；逐 initialized device 提供 `device port_state phys_state`，生产从 sysfs 读取 |
@@ -932,6 +934,50 @@ deploy/dfkv_node_replace.py --mds 10.0.0.1:9400,10.0.0.2:9400 --group glm \
 必须不同（同 ID 会争抢 etcd lease，脚本拒绝）。`--timeout` 是**每个状态迁移**的
 上限而不是无限等待；`--min-clients 0` 允许还未升级客户端注册能力的旧车队，但脚本
 仍会调用 `dfkvctl clients`，并保证执行前已观察到的 client 在切换后没有消失。
+
+### 4c-1. 排空（drain，`DFKV_DRAIN`，默认关）<a name="4c-drain"></a>
+
+排空中的节点保留它在环上的位置、照常服务读，2.43 起的客户端不再往它写新值：一个
+key 的写入改去“没有排空节点的环”上的 owner（排空节点离开后它本来就归那里），读先
+问那个新 owner，未命中且 key 原 owner 是排空节点时再问排空节点。REMOVE 和 RETAIN
+同时发给两边：REMOVE 两边都确认才算成功，否则排空节点上的旧值会被下一次读读回来；
+RETAIN 保护两份（排空节点那份还在服务读），哪边有 key 就用哪边的结果。排空不搬数据、
+不改放置（`placement_epoch` 不变），节点离开时期间写入的值已经在它们最终的位置上。
+环上全部可用节点都在排空时没有别处可写，客户端照旧写。
+
+- **开关与升级顺序。** 节点设 `DFKV_DRAIN=1`（需要 `--mds`）才会报告排空状态、接受
+  `dfkvctl drain`。状态作为成员记录的可选扩展 DRN1 下发，只在有节点排空时才写，没有
+  排空节点时 MDS 和节点发出的字节与之前完全相同。MDS 须先升级到 2.43：旧 MDS 会丢掉
+  这个扩展。**同一 group 的全部 MDS 都运行 2.43 或更高之前不要排空**：MDS 新旧混用时，
+  registrar 在多个 MDS 间切换，落到 2.42 MDS 上的每次心跳都会把记录重写成不带 DRN1
+  的样子，排空状态在两次轮询之间时开时关；客户端的读写随之在两个 owner 间来回切换，
+  在“关”的间隙里发出的 REMOVE 只到达排空节点，已删除的 key 之后可能又被读到。
+  2.42 及之前的客户端忽略它，照旧读写排空节点，节点也照常服务它们。
+- **`dfkvctl drain <ip:tcp端口>`** 让节点进入排空，`--undrain` 退出；节点在 MDS 写入新
+  记录后才回答（最多等 15 秒），客户端在下一次轮询（默认 3 秒）内生效。节点没开
+  `DFKV_DRAIN`、没有 MDS 或版本早于 2.43 时回答“does not drain”；节点已被 fence
+  （`dfkvctl member fence`）时 MDS 拒绝它的心跳，`dfkvctl drain` 报的是“its MDS has not
+  taken the record yet”那一种（节点本地已进入排空，但 MDS 里没有它的记录）。`dfkvctl ring`
+  的 STATUS 列显示 `DRAINING`；`ring --json` 的 `status` 仍是轨健康，另有
+  `"draining": true`。和 kRemove 一样，kDrain 没有额外鉴权，依赖同样的网络信任边界。
+- **被 `dfkvctl drain` 排空后停止 = 下线。** 停止时节点向 MDS 删除自己的记录
+  （kDeregister），客户端一次轮询内把它移出环，不用等 30 秒租约。处理删除的 MDS
+  立即作废自己的列表缓存；同组其他 MDS 实例最多再用缓存回答
+  `DFKV_MDS_LIST_CACHE_MS`（默认 500 ms），按默认值仍在一次轮询（3 秒）之内。重启时新进程不带
+  排空状态。
+- **停止前排空：`DFKV_STOP_DRAIN_MS`**（默认 `0`=不排空，上限 600000）。收到
+  SIGTERM 后节点先进入排空、继续服务这么久，再走原来的停止流程；第二个 SIGTERM 立即
+  结束等待。这种排空不删记录（多用于重启：新进程接回同一位置）。
+  **Kubernetes：`terminationGracePeriodSeconds` 必须大于 `DFKV_STOP_DRAIN_MS`
+  加正常停止时间**（RAM tier 刷盘最长 `DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S`），否则
+  kubelet 在排空中途 SIGKILL；systemd unit 的 `TimeoutStopSec` 同理。
+- **混用新旧客户端的已知限制：** 旧客户端仍把排空节点的 key 发给排空节点。新客户端
+  排空期间写到新 owner 的 key，被旧客户端 REMOVE 时只删到排空节点，新 owner 上那份
+  在被淘汰或被新客户端删除前仍可读到。反过来没有问题：旧客户端写到排空节点的值，新
+  客户端未命中后会去读。**依赖 REMOVE 的部署（LMCache L2 淘汰、vLLM 清理旧布局对象）
+  先把客户端全部升级到 2.43 再排空。**
+- 指标：客户端 `dfkv_client_ring_draining_members`、
+  `dfkv_client_drain_requests_total{op,result}`；MDS `dfkv_mds_deregister_requests_total`。
 
 ### 4d. 成员漂移 / split-brain 巡检
 

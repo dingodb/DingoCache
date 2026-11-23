@@ -302,6 +302,9 @@ class MdsServer {
   void ReapDoneLocked();  // join+erase finished handler threads; conn_mu_ held
   // heartbeat: the op was kHeartbeat rather than kRegister.
   Status Upsert(const std::string& group, const MemberInfo& m, bool heartbeat);
+  // Deletes the member's record (kDeregister): sent by a node that was
+  // drained and is stopping.
+  Status Deregister(const std::string& group, const MemberInfo& m);
   Status ListMembers(const std::string& group, std::string* out,
                      bool include_degraded = false);
   Status ListMembersFromEtcd(const std::string& group, std::string* out,

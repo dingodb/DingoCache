@@ -37,7 +37,15 @@ enum class WireOp : uint8_t {
   kRetain = 19,       // batched minimum-lifetime control op (see below)
   // MDS member fencing (DFKV_MDS_FENCING): payload "<group>\n<id>" for fence
   // and unfence, "<group>" for the list (newline-joined ids).
-  kFenceMember = 20, kUnfenceMember = 21, kListFenced = 22
+  kFenceMember = 20, kUnfenceMember = 21, kListFenced = 22,
+  // Node, TCP only (DFKV_DRAIN): payload one u8, 1 = start draining, 0 =
+  // stop. Answered kOk once the MDS has the node's record with the new state;
+  // kInvalid where the node does not drain (DFKV_DRAIN off, or a release
+  // before 2.43, which does not know the op).
+  kDrain = 23,
+  // MDS: delete a member's record (payload as kRegister). A node drained by
+  // kDrain sends it when it stops, so clients drop it within one poll.
+  kDeregister = 24
 };
 
 constexpr uint8_t kNativeProtoTcp = 6;
