@@ -443,8 +443,10 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
   at.qp_state = IBV_QPS_INIT;
   at.pkey_index = 0;
   at.port_num = ib_port_;
-  at.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
-                       IBV_ACCESS_REMOTE_READ;
+  at.qp_access_flags =
+      remote_access_ ? IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                           IBV_ACCESS_REMOTE_READ
+                     : IBV_ACCESS_LOCAL_WRITE;
   if (ibv_modify_qp(qp_, &at,
         IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) != 0) {
     Close(); return false;
@@ -768,6 +770,14 @@ void RcEndpoint::ReleaseLeaseReadRegion(ibv_mr* mr) {
 uint64_t RcEndpoint::LeaseReadMrActive() {
   return g_lease_read_mr_active.load(std::memory_order_relaxed);
 }
+int RcEndpoint::QpAccessFlags() const {
+  if (!qp_) return -1;
+  ibv_qp_attr attr{};
+  ibv_qp_init_attr init{};
+  if (ibv_query_qp(qp_, &attr, IBV_QP_ACCESS_FLAGS, &init) != 0) return -1;
+  return static_cast<int>(attr.qp_access_flags);
+}
+
 ibv_mr* RcEndpoint::RegisterUser(void* addr, size_t len) {
   if (!addr || len == 0) return nullptr;
   const auto address = reinterpret_cast<uintptr_t>(addr);
@@ -781,15 +791,17 @@ ibv_mr* RcEndpoint::RegisterUser(void* addr, size_t len) {
 }
 
 ibv_mr* RcEndpoint::RegisterTransient(void* addr, size_t len,
-                                      bool remote_write) {
+                                      TransientAccess mode) {
   if (!addr || len == 0) {
     errno = EINVAL;  // callers read errno to tell why there is no MR
     return nullptr;
   }
   const auto a = reinterpret_cast<uintptr_t>(addr);
-  const int access = remote_write
-                         ? IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE
-                         : 0;
+  const int access =
+      mode == TransientAccess::kRemoteWrite
+          ? IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE
+      : mode == TransientAccess::kLocalWrite ? IBV_ACCESS_LOCAL_WRITE
+                                             : 0;
   for (const auto& p : pool_mr_) {
     if (a >= p.base && len <= p.size && a - p.base <= p.size - len &&
         (p.access & access) == access) {

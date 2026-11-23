@@ -3,6 +3,13 @@
 ## Unreleased
 
 
+- Client, RDMA: client QPs grant no remote READ or WRITE, and the memory a
+  client registers (`dfkv_register_memory`, the host KV pool) is registered
+  for local access only. Since 2.31 servers never write into client memory
+  (a GET is the client's READ of server staging), so any connected peer
+  that guessed a 32-bit rkey could write into the client's KV pool for no
+  purpose. Servers keep their permissions; nothing on the wire changes.
+
 - RDMA: the QP transport retry settings are `DFKV_RDMA_QP_TIMEOUT` (default
   14), `DFKV_RDMA_QP_RETRY_CNT` (7) and `DFKV_RDMA_QP_RNR_RETRY` (7, no
   limit) instead of constants; defaults unchanged. Measured on a ConnectX
