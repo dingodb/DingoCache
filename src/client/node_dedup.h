@@ -217,6 +217,8 @@ class NodeDedup {
   int lock_wait_ms_ = kDedupLockWaitMs;  // see LockOwned; tests raise it
   void* map_base_ = nullptr;
   size_t map_len_ = 0;
+  std::string segment_name_;  // see dedup_segment::Detach
+  int hold_fd_ = -1;
 
   std::atomic<uint64_t> hits_{0}, fetches_{0}, wait_hits_{0}, wait_timeouts_{0};
   mutable std::atomic<uint64_t> length_mismatches_{0};

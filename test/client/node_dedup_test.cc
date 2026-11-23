@@ -1206,3 +1206,32 @@ TEST(NodeDedup, LengthDisagreementIsCountedAndNotServed) {
             NodeDedup::Role::kHit);
   EXPECT_EQ(b->length_mismatches(), 1u);
 }
+
+// The segment goes with its last user: it took its full size in /dev/shm
+// for good, one more per namespace a host ever ran.
+TEST(NodeDedup, TheLastProcessToLeaveRemovesTheSegment) {
+  NodeDedup::Options o;
+  o.name = "/dfkv-test-lifecycle-" + std::to_string(::getpid());
+  o.arena_bytes = 1 << 20;
+  o.slots = 1024;
+  ::shm_unlink(o.name.c_str());
+  auto exists = [&] {
+    const int fd = ::shm_open(o.name.c_str(), O_RDONLY, 0);
+    if (fd >= 0) ::close(fd);
+    return fd >= 0;
+  };
+  auto first = NodeDedup::Open(o);
+  auto second = NodeDedup::Open(o);
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(second);
+  first.reset();
+  EXPECT_TRUE(exists()) << "removed while another process uses it";
+  second.reset();
+  EXPECT_FALSE(exists()) << "left in /dev/shm by its last user";
+  // A later process creates it again.
+  auto third = NodeDedup::Open(o);
+  ASSERT_TRUE(third);
+  EXPECT_TRUE(exists());
+  third.reset();
+  EXPECT_FALSE(exists());
+}

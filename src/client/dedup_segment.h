@@ -44,8 +44,18 @@ struct Layout {
 
 // Maps the segment. *creator: this process must lay out the header and then
 // store 1 to init_done. nullptr: run without (logged, with tag as prefix).
+// *hold_fd: the descriptor of the segment, holding a shared flock for as long
+// as this process uses it; give it to Detach when done (-1 on failure). Not
+// fork-safe after Attach: a forked child shares the open file description,
+// and so the flock, of its parent (attach again in the child).
 void* Attach(const std::string& name, const Layout& layout, const char* tag,
-             bool* creator);
+             bool* creator, int* hold_fd);
+
+// Releases what Attach holds. The last attacher removes the segment's name
+// (it took a 516 MiB segment for good, one more per namespace). An older
+// release takes no lock, so one of its processes can be left on a segment
+// removed under it: still correct, no longer shared, until it exits.
+void Detach(const std::string& name, int hold_fd);
 
 // What a creator killed right after naming itself (and, with sized, after
 // sizing the segment) leaves behind. For tests.

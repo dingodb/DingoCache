@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -55,11 +56,67 @@ bool WaitLaidOut(void* base, const Layout& l) {
   return false;
 }
 
+// Whether fd is the segment `name` names now (it may have been unlinked,
+// and the name given to a new segment, since fd was opened).
+bool NamedBy(int fd, const std::string& name) {
+  struct stat mine{}, named{};
+  if (::fstat(fd, &mine) != 0) return false;
+  const int other = ::shm_open(name.c_str(), O_RDONLY, 0);
+  if (other < 0) return false;
+  const bool same = ::fstat(other, &named) == 0 &&
+                    mine.st_dev == named.st_dev && mine.st_ino == named.st_ino;
+  ::close(other);
+  return same;
+}
+
+// Takes the attacher's shared lock on fd (see Detach). False if the segment
+// was unlinked meanwhile: the caller starts over with the name's segment.
+bool Hold(int fd, const std::string& name) {
+  while (::flock(fd, LOCK_SH) != 0)
+    if (errno != EINTR) return true;  // no locks here: keep the old behaviour
+  return NamedBy(fd, name);
+}
+
+void* AttachOnce(const std::string& name, const Layout& l, const char* tag,
+                 bool* creator, int* hold_fd, bool* retry);
+
 }  // namespace
 
 void* Attach(const std::string& name, const Layout& l, const char* tag,
-             bool* creator) {
+             bool* creator, int* hold_fd) {
+  *hold_fd = -1;
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    bool retry = false;
+    void* base = AttachOnce(name, l, tag, creator, hold_fd, &retry);
+    if (!retry) return base;
+  }
+  return nullptr;
+}
+
+void Detach(const std::string& name, int hold_fd) {
+  if (hold_fd < 0) return;
+  // The last attacher of this release to leave takes the exclusive lock at
+  // once and removes the name: the segment goes with its last user instead
+  // of staying in /dev/shm (and in the container's memory) for good. A
+  // process that is opening it meanwhile waits for its shared lock, finds
+  // the name gone and starts over with a new segment.
+  if (::flock(hold_fd, LOCK_EX | LOCK_NB) == 0 && NamedBy(hold_fd, name))
+    ::shm_unlink(name.c_str());
+  ::close(hold_fd);
+}
+
+namespace {
+
+void* AttachOnce(const std::string& name, const Layout& l, const char* tag,
+                 bool* creator, int* hold_fd, bool* retry) {
   *creator = false;
+  // A mapping whose segment was unlinked before this process held it.
+  auto gone = [&](void* base, int fd) -> void* {
+    if (base) ::munmap(base, l.len);
+    ::close(fd);
+    *retry = true;
+    return nullptr;
+  };
   const std::string prefix = std::string(tag) + ": ";
   int fd = ::shm_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
   if (fd >= 0) {
@@ -72,15 +129,17 @@ void* Attach(const std::string& name, const Layout& l, const char* tag,
                  : errno;
     if (rc == 0) rc = SizeAndBack(fd, l.len);
     void* base = rc == 0 ? Map(fd, l.len) : nullptr;
-    ::close(fd);
+    if (!base) ::close(fd);
     if (!base) {
-      DFKV_LOG_INFO(prefix + "cannot create a " + std::to_string(l.len >> 20) +
+      DFKV_LOG_WARN(prefix + "cannot create a " + std::to_string(l.len >> 20) +
                     " MiB segment in /dev/shm (" + std::to_string(rc) +
-                    "), running without");
+                    ", most likely too little /dev/shm), running without");
       ::shm_unlink(name.c_str());  // don't leave a half-backed segment
       return nullptr;
     }
+    if (!Hold(fd, name)) return gone(base, fd);
     *creator = true;
+    *hold_fd = fd;
     return base;
   }
   if (errno != EEXIST) return nullptr;
@@ -106,7 +165,8 @@ void* Attach(const std::string& name, const Layout& l, const char* tag,
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   if (base && WaitLaidOut(base, l)) {
-    ::close(fd);
+    if (!Hold(fd, name)) return gone(base, fd);
+    *hold_fd = fd;
     return base;
   }
   // Unfinished after the wait. Finish it if its creator is dead, or if it is
@@ -131,7 +191,7 @@ void* Attach(const std::string& name, const Layout& l, const char* tag,
   }
   const int rc = SizeAndBack(fd, l.len);
   if (rc == 0 && !base) base = Map(fd, l.len);
-  ::close(fd);
+  if (!base) ::close(fd);
   if (!base) {
     DFKV_LOG_INFO(prefix + "cannot finish the segment its dead creator left (" +
                   std::to_string(rc) + "), running without");
@@ -145,15 +205,24 @@ void* Attach(const std::string& name, const Layout& l, const char* tag,
                   (empty ? std::string("a creator that never sized it")
                          : "pid " + std::to_string(owner) + ", which died") +
                   "; finishing it");
+    if (!Hold(fd, name)) return gone(base, fd);
     *creator = true;
+    *hold_fd = fd;
     return base;
   }
   // Another opener is finishing it.
-  if (WaitLaidOut(base, l)) return base;
+  if (WaitLaidOut(base, l)) {
+    if (!Hold(fd, name)) return gone(base, fd);
+    *hold_fd = fd;
+    return base;
+  }
   ::munmap(base, l.len);
+  ::close(fd);
   DFKV_LOG_INFO(prefix + "segment " + name + " was not finished in time, running without");
   return nullptr;
 }
+
+}  // namespace
 
 bool AbandonForTest(const std::string& name, const Layout& l, pid_t creator,
                     bool sized) {

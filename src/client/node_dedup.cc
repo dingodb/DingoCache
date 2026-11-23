@@ -146,11 +146,14 @@ std::unique_ptr<NodeDedup> NodeDedup::Open(const Options& opt) {
   // a clean failure here, not a SIGBUS mid-publish); see dedup_segment.h,
   // also for a creator that died before it finished.
   bool creator = false;
+  int hold_fd = -1;
   void* base = dedup_segment::Attach(opt.name, SegmentLayout(len), "node-dedup",
-                                     &creator);
+                                     &creator, &hold_fd);
   if (!base) return nullptr;
 
   auto d = std::unique_ptr<NodeDedup>(new NodeDedup());
+  d->segment_name_ = opt.name;
+  d->hold_fd_ = hold_fd;
   d->map_base_ = base;
   d->map_len_ = len;
   d->hdr_ = static_cast<Header*>(base);
@@ -200,8 +203,8 @@ size_t NodeDedup::SegmentBytes(const Options& opt) {
 
 NodeDedup::~NodeDedup() {
   if (map_base_) ::munmap(map_base_, map_len_);
-  // The segment itself is intentionally left in place: peers may still use it,
-  // and a later process re-attaches. Bounded size; no growth over time.
+  // The segment stays while other processes use it; the last one removes it.
+  dedup_segment::Detach(segment_name_, hold_fd_);
 }
 
 NodeDedup::Slot* NodeDedup::Find(const BlockKey& key, Kind kind) const {

@@ -269,6 +269,8 @@ class GpuNodeDedup {
   int ttl_ms_ = 5000;
   void* map_base_ = nullptr;
   size_t map_len_ = 0;
+  std::string segment_name_;  // see dedup_segment::Detach
+  int hold_fd_ = -1;
 
   CUdeviceptr arena_base_ = 0;  // this process' staging arena (device memory)
   uint32_t self_idx_ = kMaxProcs;

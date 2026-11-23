@@ -3,6 +3,15 @@
 ## Unreleased
 
 
+- Client, host and GPU dedup: the shared-memory segment goes with its last
+  user. Each process holds a shared lock on it; the last one to leave
+  removes its name. A segment (516 MiB by default for the host flavor) used
+  to stay in `/dev/shm` for good, one more for every namespace a host ever
+  ran, counted against the container's memory. A process of an older
+  release takes no lock and can be left on a removed segment, unshared,
+  until it exits. A segment that cannot be created for want of `/dev/shm`
+  is now a WARN.
+
 - Client, routing: the consistent-hash ring is a sorted vector instead of a
   map; a lookup took 33 ns on a 16-member ring and 55 ns on 64, now 18 and
   21 ns. Routes are unchanged. New `dfkv_client_ring_point_collisions`.
