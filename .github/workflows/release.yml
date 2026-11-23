@@ -54,11 +54,23 @@ jobs:
           set -euo pipefail
           cmake -S . -B build-release -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS=-g \
             -DDFKV_BUILD_TESTS=ON \
             -DDFKV_WITH_RDMA=ON \
             -DDFKV_WITH_URING=ON \
             -DDFKV_STATIC_LIBSTDCXX=ON
           cmake --build build-release -j2
+
+      # The shipped binaries are hardened; their glibc floor (2.34, see
+      # DEPLOY.md; this runner has 2.35) is checked on the packaged payload
+      # below.
+      - name: Verify hardening
+        run: |
+          set -euo pipefail
+          bash .github/scripts/check_hardening.sh build-release/dfkv_server \
+            build-release/dfkv_mds build-release/dfkvctl build-release/libdfkv.so
+          if ldd build-release/libdfkv.so | grep -q 'libstdc++'; then
+            echo '::error::libstdc++ is not statically linked'; exit 1; fi
 
       # The generic release runner has no HCA. Hardware-only loopback tests are
       # covered by CI's dedicated RDMA compile + probe-gated Soft-RoCE jobs and
@@ -120,6 +132,7 @@ jobs:
           mkdir -p release-unpack
           tar xzf "release/$pkg.tar.gz" -C release-unpack
           root="$PWD/release-unpack/$pkg"
+          bash .github/scripts/check_glibc_floor.sh "$root"/bin/* "$root"/lib/libdfkv.so.*.*
           test -L "$root/lib/libdfkv.so"
           test -L "$root/lib/libdfkv.so.${version%%.*}"
           test "$(readlink "$root/lib/libdfkv.so")" = \
@@ -163,6 +176,8 @@ jobs:
             "dfkv:$version"
           gzip -9 "release/dfkv-${version}-runtime-image.tar"
           ! tar -tzf "release/$pkg.tar.gz" | grep -E '(__pycache__|\.py[co]$)'
+          test -f "release/$pkg-debug.tar.gz"
+          tar -tzf "release/$pkg-debug.tar.gz" | grep -qx "$pkg/bin/dfkv_server.debug"
           (cd release && sha256sum *.tar.gz *.whl > SHA256SUMS)
 
       - name: Stage immutable release payload

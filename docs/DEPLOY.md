@@ -58,10 +58,20 @@ ldd build/libdfkv.so | grep ibverbs
 
 
 > ⚠️ **glibc 下限 = 构建机的 glibc**。在 Ubuntu 24.04 / glibc 2.39
-> 直接构建的二进制不能部署到 glibc 2.35。CI 的 portable job 和仓库根
+> 直接构建的二进制不能部署到更旧的 glibc。发布产物要求 **glibc ≥ 2.34**（可在
+> RHEL 9 系 2.34 主机上运行）：CI 的 portable job 和 release workflow 拒绝任何需要
+> GLIBC_2.35 及以上符号的二进制。CI 的 portable job 和仓库根
 > `Dockerfile` 都固定 Ubuntu 22.04 + RDMA + 静态 libstdc++，并构建同一
 > canonical tarball。`DFKV_STATIC_LIBSTDCXX` 只静态链接 libstdc++/libgcc；
 > libibverbs 仍动态加载 provider，运行节点必须同时具备对应插件。镜像验收要在可用 RDMA 设备上完成真实 PUT/GET；仅 `--version` 或 TCP 冒烟不能证明 RDMA 可用。
+
+> 发布二进制带加固编译选项（`DFKV_HARDENING`，默认开：`-fstack-protector-strong`、
+> `-D_FORTIFY_SOURCE=2`（编译器已自带更高或相同级别时沿用它）、`-z relro -z now`；Debug 构建不加 fortify，sanitizer 构建关掉），
+> 并已 strip。调试符号在单独的 `dfkv-<版本>-linux-x86_64-debug.tar.gz`：目录结构
+> 与发布包相同（`bin/<工具>.debug`、`lib/libdfkv.so.<版本>.debug`），解压到发布包
+> 同一目录后 gdb 按二进制里的 `.gnu_debuglink` 自动找到；分析 core 时才需要，
+> 不必部署到节点。它约 66 MB（2.42 实测；发布包约 10.6 MB），因为每个工具都静态链接了
+> 整个 core 库，各自带一份调试信息（`dfkv_server.debug` 约 25 MB）。
 
 ## 2. 每节点：分发 + 缓存目录
 

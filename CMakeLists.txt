@@ -28,6 +28,28 @@ option(DFKV_WITH_URING "Build the io_uring async GET path in the RDMA server (ne
 if(DFKV_STATIC_LIBSTDCXX)
   add_link_options(-static-libstdc++ -static-libgcc)
 endif()
+# Hardening: stack canaries in functions with arrays or address-taken
+# locals, glibc's checked string and I/O calls where sizes are known at
+# compile time, and a read-only GOT with symbols bound at load time.
+# _FORTIFY_SOURCE=2 only where the compiler does not set a level itself
+# (Ubuntu's GCC sets 2, or 3 from 24.04, when optimizing) and not in Debug
+# builds, which do not optimize. Sanitizer builds turn it off.
+option(DFKV_HARDENING "Build with -fstack-protector-strong, -D_FORTIFY_SOURCE=2 and -z relro -z now" ON)
+if(DFKV_HARDENING)
+  include(CheckCXXSourceCompiles)
+  set(CMAKE_REQUIRED_FLAGS "-O2")
+  check_cxx_source_compiles("
+#ifdef _FORTIFY_SOURCE
+#error the compiler sets _FORTIFY_SOURCE
+#endif
+int main() { return 0; }" DFKV_COMPILER_LEAVES_FORTIFY_UNSET)
+  unset(CMAKE_REQUIRED_FLAGS)
+  add_compile_options(-fstack-protector-strong)
+  if(DFKV_COMPILER_LEAVES_FORTIFY_UNSET)
+    add_compile_options("$<$<NOT:$<CONFIG:Debug>>:-D_FORTIFY_SOURCE=2>")
+  endif()
+  add_link_options(-Wl,-z,relro -Wl,-z,now)
+endif()
 if(DFKV_WITH_URING AND NOT DFKV_WITH_RDMA)
   message(FATAL_ERROR "DFKV_WITH_URING requires DFKV_WITH_RDMA=ON (the io_uring path lives in the RDMA server)")
 endif()

@@ -74,8 +74,26 @@ major=${version%%.*}
   exit 1
 }
 
-strip "$root"/bin/* "$root"/lib/libdfkv.so.*.*
+# Debug symbols go to a separate archive with the same layout: bin/<tool>.debug
+# and lib/libdfkv.so.<version>.debug. Extracted over the release, each file
+# sits next to its binary, where gdb finds it through the binary's
+# .gnu_debuglink (and the build ID ties the two together).
+debug_package="$package-debug"
+debug_root="$stage/$debug_package/$package"
+mkdir -p "$debug_root/bin" "$debug_root/lib"
+for binary in "$root"/bin/* "$root"/lib/libdfkv.so.*.*; do
+  relative=${binary#"$root/"}
+  objcopy --only-keep-debug "$binary" "$debug_root/$relative.debug"
+  strip "$binary"
+  (cd "$debug_root/$(dirname "$relative")" &&
+     objcopy --add-gnu-debuglink="$(basename "$relative").debug" "$binary")
+done
+# The static core library is for linking, not debugging: its debug
+# information (with -g, twenty times its code) stays out of both archives.
+strip --strip-debug "$root"/lib/*.a
 mkdir -p "$output_dir"
 tar -C "$stage" -czf "$output_dir/$package.tar.gz" "$package"
+tar -C "$stage/$debug_package" -czf "$output_dir/$debug_package.tar.gz" "$package"
 rm -rf "$stage"
 printf '%s\n' "$output_dir/$package.tar.gz"
+printf '%s\n' "$output_dir/$debug_package.tar.gz"

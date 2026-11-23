@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Release: the binaries are built with `-fstack-protector-strong`,
+  `-D_FORTIFY_SOURCE=2` and `-z relro -z now` (new CMake option
+  `DFKV_HARDENING`, on by default; a compiler that sets a fortify level
+  itself keeps it, Debug builds get none), and the
+  release carries their debug symbols in a separate
+  `dfkv-<version>-linux-x86_64-debug.tar.gz` (`bin/<tool>.debug`,
+  `lib/libdfkv.so.<version>.debug`; extracted over the release, gdb finds
+  them through each binary's debuglink). The shipped binaries are stripped
+  as before. The release workflow now checks the hardening and the glibc
+  floor of what it ships, as CI's portable build does. The floor is now
+  glibc 2.34 (it was 2.35): both reject a binary that needs GLIBC_2.35 or
+  later, so the release runs on 2.34 hosts (RHEL 9 family).
 
 - SGLang HiCache connector: object keys are built from affixes packed once,
   and a batch's keys share one native buffer. Every key was validated and

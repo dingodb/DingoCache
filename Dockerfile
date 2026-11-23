@@ -3,8 +3,10 @@
 # Why ubuntu:22.04 (glibc 2.35): a dynamically-linked binary's glibc floor = the
 # glibc it was BUILT against. Building on a newer host (e.g. ubuntu:24.04 / glibc
 # 2.39) makes artifacts that FAIL on older nodes with "GLIBC_2.3x not found".
-# 2.35 runs on RHEL9/Ubuntu22.04+ and most current GPU nodes. Build once here, deploy
-# on any node with glibc >= 2.35 -- no per-node rebuild.
+# The artifacts need no symbol newer than GLIBC_2.34 (CI and the release
+# workflow reject any that do), so they run on glibc >= 2.34: the RHEL 9 family
+# (2.34), Ubuntu 22.04 and later, and most current GPU nodes. Build once here,
+# deploy on any such node -- no per-node rebuild.
 #
 # DFKV_STATIC_LIBSTDCXX folds libstdc++/libgcc into the artifacts (those are NOT
 # glibc; static-linking them removes a separate runtime dep). libibverbs CANNOT
@@ -29,7 +31,7 @@ RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDFKV_BUILD_TESTS=O
     -DDFKV_WITH_RDMA=ON -DDFKV_WITH_URING=ON -DDFKV_STATIC_LIBSTDCXX=ON && \
     cmake --build build -j && cmake --install build --prefix /out && \
     (strip /out/bin/* /out/lib/*.so* 2>/dev/null || true)
-# Artifacts (portable, glibc>=2.35): /out/bin/{dfkv_server,dfkv_mds,dfkv_bench,
+# Artifacts (portable, glibc>=2.34): /out/bin/{dfkv_server,dfkv_mds,dfkv_bench,
 # dfkv_smoke,dfkvctl} and /out/lib/libdfkv.so. Extract with:
 #   docker build -t dfkv-build --target build . && \
 #   id=$(docker create dfkv-build) && docker cp $id:/out ./dist && docker rm $id

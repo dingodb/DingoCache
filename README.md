@@ -40,7 +40,7 @@ The MDS/etcd path is the **control plane**; client-to-server traffic carries cac
 
 ## Try it locally
 
-This TCP-only, single-node example needs Linux x86-64 with a compatible glibc (the published release targets glibc 2.35), the release binary's runtime libraries, and at least 1 GiB of available disk space. **No GPU, RDMA hardware, MDS, or etcd is needed.** The release binary links to `libibverbs`: install the appropriate runtime package (for example `libibverbs1` on Ubuntu/Debian) even when using TCP. Use a fresh cache directory; the slab format is not a drop-in upgrade for an existing file-engine directory.
+This TCP-only, single-node example needs Linux x86-64 with a compatible glibc (the published release needs glibc 2.34 or later), the release binary's runtime libraries, and at least 1 GiB of available disk space. **No GPU, RDMA hardware, MDS, or etcd is needed.** The release binary links to `libibverbs`: install the appropriate runtime package (for example `libibverbs1` on Ubuntu/Debian) even when using TCP. Use a fresh cache directory; the slab format is not a drop-in upgrade for an existing file-engine directory.
 
 ```bash
 version=2.30.0
