@@ -427,7 +427,10 @@ Prometheus 调用。vLLM 使用同一 allowlist，区别只是在 family 前加 
 | `dfkv_read_scheduler_node_limit_waits_total` | counter | 空闲 read worker 被唤醒后，发现待执行的 shard 全部属于已达单节点上限的节点的次数。正常运行中也会出现（例如小环上对单个节点的大 batch）；若其他节点的读同时变慢且该计数持续高速增长，说明有慢节点 |
 | `dfkv_client_ring_members` / `dfkv_client_mds_reachable` / `dfkv_client_mds_unreachable_polls_total` | gauge / gauge / counter | 当前环节点数 / 最近发现轮询是否可达 MDS / 不可达轮询累计 |
 | `dfkv_client_ring_draining_members` | gauge | 环里正在排空的节点数（DEPLOY §4c-1）：不再写入，读在新 owner 未命中后才问它 |
-| `dfkv_client_drain_requests_total{op,result}` | counter | 发给 key 的排空 owner 的第二次请求：`op=read`（新 owner 未命中后的读）、`remove`、`retain`（两边都发）；`result=served` 它有这个 key（或确认删除），`not_served` 没有或失败 |
+| `dfkv_client_ring_absent_members` | gauge | 缺席成员数（DEPLOY §4c-2，`DFKV_RING_ABSENT_GRACE_MS`）：从视图消失、仍在宽限期内的成员，不再写入也不读，REMOVE 和 RETAIN 也发给它 |
+| `dfkv_client_ring_absent_dropped_total{reason}` | counter | 移出的缺席成员：`grace` 宽限期满，`bound` 超过 `max(1, N/8)` 的上限立即移出，`planned` 排空后下线、不保留 |
+| `dfkv_client_ring_absent_removes_unconfirmed_total` / `_retried_total` / `_dropped_total` | counter | 缺席成员没确认的 REMOVE / 它回来后重发的次数（每次发送都计）/ 最终没确认的（超出队列上限、成员被移出、回来后一个宽限期仍未确认） |
+| `dfkv_client_drain_requests_total{op,result}` | counter | 发给 key 的排空或缺席 owner 的第二次请求：`op=read`（新 owner 未命中后的读，只问排空 owner）、`remove`、`retain`（两边都发，含缺席 owner）；`result=served` 它有这个 key（或确认删除），`not_served` 没有或失败 |
 | `dfkv_client_dedup_hits_total` / `dfkv_client_dedup_fetches_total` / `dfkv_client_dedup_wait_hits_total` / `dfkv_client_dedup_wait_timeouts_total` | counter | host rendezvous 命中、真实 fetch、等待后命中、等待后回退直连（等满 `DFKV_NODE_DEDUP_WAIT_MS`，或 leader 放弃 / 已发布条目不可用而提前回退，两者不区分） |
 | `dfkv_client_gpu_dedup_hits_total` / `dfkv_client_gpu_dedup_fetches_total` / `dfkv_client_gpu_dedup_wait_hits_total` / `dfkv_client_gpu_dedup_wait_timeouts_total` | counter | 同上 CUDA IPC rendezvous。另：发布中的 slot 被收回（发布者超过 `DFKV_NODE_DEDUP_TAKEOVER_MS` 或该 key 被写入/删除）之后，到下一次 fetch 认领之前 slot 读作空，正在等的 follower 复查一次后放弃并自行读取，计入 wait_timeouts，也多一次远端读取 |
 | `dfkv_client_dedup_length_mismatches_total` / `dfkv_client_gpu_dedup_length_mismatches_total` | counter | 会合查找发现同一个 key 已由同机另一个进程发布、但长度与本进程期望的不同（host 严格长度不等或超出缓冲，GPU 超出各段容量之和）的次数。该条目不被使用（本进程自行读取）；首次出现时打一条 WARN。dedup 的前提是同一个 key 在本机所有进程里是同样的字节，非零通常说明 key 漏了某个分片维度（例如分片的 payload 共用了一个 key），应关闭 dedup 并检查连接器的 key 坐标 |

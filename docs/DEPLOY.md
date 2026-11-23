@@ -1086,6 +1086,47 @@ RETAIN 保护两份（排空节点那份还在服务读），哪边有 key 就�
 - 指标：客户端 `dfkv_client_ring_draining_members`、
   `dfkv_client_drain_requests_total{op,result}`；MDS `dfkv_mds_deregister_requests_total`。
 
+### 4c-2. 消失成员宽限（absent grace，`DFKV_RING_ABSENT_GRACE_MS`，默认 0=关）<a name="4c-absent"></a>
+
+客户端开关，只对 MDS 动态发现生效（静态成员表没有成员会消失）。设计见
+[ring-unavailable-owner.md](design/ring-unavailable-owner.md) §3.1。
+
+- **作用：** 一个成员从 MDS 视图里消失（租约过期、记录被删、轨健康不合格），客户端不立即把它
+  移出环，而是在宽限期内把它当作“缺席”：不再写它，REMOVE 和 RETAIN 除了发给新 owner 也发给
+  它。宽限期满（客户端每秒检查一次）才移出；宽限期内回来的成员立刻恢复为普通成员。
+- **不读缺席成员：** 新 owner 未命中后不去问缺席成员。成员不在视图里时启动、从没见过它的
+  客户端，把 REMOVE 只发给新 owner，缺席成员上可能留着已删除的副本；读它属于回读
+  （设计 §3.4，后续阶段），要按回读的规则来。
+- **它带来什么：** 成员带着数据回来时，删除是一致的。测试环（8 个节点进程，客户端持续删除
+  key）里一个成员被杀 90 秒后带着数据回来：关闭时回来后读到 4 个已删除的 key，打开时 0 个。
+  命中率不变：删除一个成员的记录 40 秒，开关两边都是最差一秒 0%、重算 27 MiB。
+- **上限：** 宽限期最多 600000 ms（更大的值按 600000 处理并打 WARNING）；同时缺席的成员
+  最多 `max(1, N/8)` 个（N 为消失前环里的成员数），再消失的成员立即移出。
+- **计划下线不保留：** 最后一条记录是排空状态（DRN1，`dfkvctl drain` 之后下线）的成员
+  立即移出。
+- **成员视图保护（#497）：** 只作用于被接受的视图；被拒的视图什么都不改。
+- **REMOVE：** 发给写 owner 和缺席成员。缺席成员通常已经停了，不需要它确认：REMOVE 以写
+  owner 的确认为准，缺席成员没确认的部分记入队列。它回到视图时立即重发（它在缺席期间的失败
+  让 PeerHealth 进入了回避期；回到视图等同一次 probe 应答，回来后的第一次重发提前结束
+  回避期，重发就是那次试探），仍未确认的每秒再发（按 PeerHealth 当时的状态），直到确认，
+  最多到回来后一个宽限期；同一个 key 在队列里只记一次。队列总长上限
+  `DFKV_RING_ABSENT_REMOVE_QUEUE`（默认 4096）；超出的、成员被移出时还在队列里的、回来后
+  一个宽限期仍未确认的都计入 `dfkv_client_ring_absent_removes_dropped_total`。
+- **RETAIN：** 缺席成员上的副本也被保护（留到它回来）；它的回答不代表这个 key 现在可读，
+  不计入结果。
+- **与排空同时：** 某个成员在排空、另一个成员缺席时，一个 key 可能同时有写 owner、排空节点和
+  缺席成员三个 owner；REMOVE、RETAIN 分别发给各自不同的那几个。排空节点必须确认 REMOVE，
+  缺席成员不必。
+- **已知边界：**
+  - 成员带着数据回来时，仍会提供它没确认删除的 key（本客户端重发前的竞争、被队列上限丢掉的，
+    以及其他客户端从未发给它的）。这与关闭时相同：今天一个离开视图的成员收不到任何 REMOVE，
+    回来时同样提供这些副本。
+  - 成员回来后、某次重发之前写到它上面的 PUT，可能被这次重发删掉：代价是一次未命中，不会
+    读到旧值。
+- 指标：`dfkv_client_ring_absent_members`、`dfkv_client_ring_absent_dropped_total{reason}`、
+  `dfkv_client_ring_absent_removes_{unconfirmed,retried,dropped}_total`；对缺席成员的 REMOVE、
+  RETAIN 计入 `dfkv_client_drain_requests_total`。
+
 ### 4d. 成员漂移 / split-brain 巡检
 
 `deploy/dfkv_membership_audit.py` 分别查询每个 MDS（不是把 endpoints 当故障转移

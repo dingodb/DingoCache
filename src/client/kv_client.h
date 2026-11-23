@@ -192,8 +192,13 @@ class KVClient {
   void SetMembers(std::vector<std::pair<std::string, std::string>> members);
 
   // Apply a weighted member view (from MDS discovery); rebuilds the ring with
-  // per-node vnode weight and resolves addr = "ip:port".
+  // per-node vnode weight and resolves addr = "ip:port". With absent grace
+  // (DFKV_RING_ABSENT_GRACE_MS > 0) a member this view omits is kept absent
+  // (see absent_).
   void SetMembers(const std::vector<MemberInfo>& members);
+  // Drop the absent members whose grace has passed. MDS discovery calls it
+  // once a second; public for tests.
+  void TickAbsent();
 
   // Start background MDS discovery: poll the MDS endpoints for `group` and rebuild
   // the ring on each epoch change. Replaces static membership.
@@ -247,9 +252,37 @@ class KVClient {
   // Swap in a freshly-built ring under ring_mu_ and log the membership delta
   // (added/removed node ids) vs the previously-adopted view. Shared by both
   // SetMembers overloads so static and MDS-discovery paths log identically.
+  struct AbsentMember {
+    MemberInfo info;       // its last record in an adopted view
+    std::string addr;      // ip:port
+    uint64_t since_ms = 0;  // when it vanished (NowMs)
+  };
+  using AbsentMap = std::map<std::string, AbsentMember>;
   void AdoptRing(ConHash ring, std::map<std::string, std::string> addr,
                  ConHash full_ring = ConHash(),
-                 std::set<std::string> draining = {});
+                 std::set<std::string> draining = {}, AbsentMap absent = {},
+                 std::vector<MemberInfo> placement = {},
+                 ConHash absent_ring = ConHash());
+  // Absent grace: which members of the previous view stay absent under the
+  // view `placement` (ring-eligible members), counting the ones dropped.
+  // `returned` receives the absent members the view has again.
+  AbsentMap NextAbsent(const std::vector<MemberInfo>& placement, uint64_t now,
+                       std::vector<std::string>* returned);
+  // Build the write and full rings of `placement` plus `absent` and adopt them.
+  void AdoptPlacement(const std::vector<MemberInfo>& placement,
+                      AbsentMap absent);
+  // A REMOVE the absent member `id` did not confirm: kept for one retry when
+  // it returns, within the queue bound.
+  void QueueAbsentRemove(const std::string& id, const std::string& key);
+  // Member `id` is back in the view (or, `returned` false, gone again).
+  void NoteAbsentReturned(const std::string& id, bool returned);
+  // Send the queued REMOVEs of the members that are back; the ones still not
+  // confirmed are sent again at the next tick, for up to the grace after the
+  // return. DropAbsentRemoves gives a dropped member's queue up.
+  void RetryAbsentRemoves();
+  void DropAbsentRemoves(const std::string& id);
+  // Retire the transport topology of absent members that were dropped.
+  void RetireDropped(const AbsentMap& dropped);
   // Publish one replace-all topology response. Stable MDS ids are retained
   // separately from routing addresses; superseded addresses are explicitly
   // retired, and the complete live-id set is reconciled after publication.
@@ -261,8 +294,11 @@ class KVClient {
   // Each present peer is published under its own MemberTopologyEpoch, so the
   // transport sees a new generation only for members whose own entry changed;
   // `generation`, the epoch of the whole view, only labels retirements.
+  // `keep`: absent members (id -> address) whose topology stays live while
+  // the view omits them.
   void PublishPeerTopologies(const std::vector<MemberInfo>& topology,
-                             uint64_t generation, bool ring_held);
+                             uint64_t generation, bool ring_held,
+                             const std::map<std::string, std::string>& keep = {});
   // Scalar transport bodies. Public scalar methods add exactly one metric;
   // TCP batch fan-out calls these bodies so it cannot double-count each key.
   // `status`, when given, receives the item's outcome.
@@ -387,7 +423,7 @@ class KVClient {
                   const std::vector<size_t>& idx,
                   const std::vector<BlockKey>& bkeys,
                   const RetainRequest& req, uint8_t* out);
-  mutable std::mutex ring_mu_;  // guards ring_, addr_, full_ring_, draining_
+  mutable std::mutex ring_mu_;  // guards ring_, addr_, full_ring_, draining_, absent_, absent_ring_
   // Placement for writes: the eligible members that are not draining (all of
   // them while none is, or if every one is). Reads ask its owner first.
   ConHash ring_;
@@ -399,9 +435,55 @@ class KVClient {
   ConHash full_ring_;
   std::set<std::string> draining_;
   std::atomic<bool> any_draining_{false};
+  // Absent grace (DFKV_RING_ABSENT_GRACE_MS; 0 = off). A member that
+  // vanishes from an admitted view is kept absent until its grace passes
+  // (TickAbsent) or it returns: no writes and no reads; REMOVE and RETAIN
+  // reach it; its unconfirmed REMOVEs are retried when it returns.
+  // absent_ring_ is the view's members plus the absent ones (empty while
+  // none is absent); a key it gives to an absent member has that member as
+  // one more owner, beside the write owner and a drainer (full_ring_). At most
+  // max(1, N/8) members are absent at once; a member whose last record was
+  // draining (a planned leave) is not kept. placement_ is the last adopted
+  // view (ring-eligible members), kept to rebuild the rings when an absent
+  // member is dropped. Both under ring_mu_.
+  AbsentMap absent_;
+  ConHash absent_ring_;
+  std::atomic<bool> any_absent_{false};
+  std::vector<MemberInfo> placement_;
+  uint64_t absent_grace_ms_ = 0;
+  uint64_t topology_generation_ = 0;  // last published; labels retirements
+  // REMOVEs absent members did not confirm, by member id, sent again when
+  // the member is back (at once, then at each tick until confirmed, for up
+  // to the grace). Bounded in total (DFKV_RING_ABSENT_REMOVE_QUEUE).
+  std::mutex absent_remove_mu_;
+  std::map<std::string, std::set<std::string>> absent_removes_;
+  std::map<std::string, uint64_t> absent_returned_;  // id -> when it came back
+  // Returned members whose PeerHealth cooldown the first retry may end.
+  std::set<std::string> absent_cooldown_reset_;
+  size_t absent_removes_queued_ = 0;
+  size_t absent_remove_cap_ = 4096;
+  std::atomic<uint64_t> absent_dropped_grace_{0}, absent_dropped_bound_{0},
+      absent_dropped_planned_{0};
+  std::atomic<uint64_t> absent_removes_unconfirmed_{0},
+      absent_removes_retried_{0}, absent_removes_dropped_{0};
   // The drainer of a key: its full-ring owner's address if that member
   // drains, else "".
   std::string DrainRoute(const std::string& key) const;
+  // The absent owner of a key: its owner on absent_ring_ if that member is
+  // absent (its address; `id` receives its id), else "". Only REMOVE and
+  // RETAIN go there: an absent member's copy may be one a REMOVE from a
+  // client that never saw the member did not reach, so reading it is a
+  // read-back (a later stage, under its rules).
+  std::string AbsentRoute(const std::string& key, std::string* id) const;
+  struct AbsentPart {
+    std::string id, addr;
+    std::vector<size_t> index;  // into the keys
+  };
+  // The keys with an absent owner, by member.
+  std::vector<AbsentPart> AbsentOwned(const std::vector<std::string>& keys) const;
+  // REMOVE `keys`' absent-owned ones at their absent owner; the ones it
+  // does not confirm are queued for its return.
+  void RemoveAtAbsent(const std::vector<std::string>& keys);
   // Second requests to a draining owner: reads that found the key there /
   // did not; REMOVEs and RETAINs it confirmed / did not.
   std::atomic<uint64_t> drain_reads_hit_{0}, drain_reads_miss_{0};

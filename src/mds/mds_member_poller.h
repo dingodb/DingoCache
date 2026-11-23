@@ -199,6 +199,9 @@ class MdsMemberPoller {
                   int io_timeout_ms = 2000);
   ~MdsMemberPoller();
 
+  // Run `tick` on the poll thread every `every_ms` between polls (absent
+  // grace uses it to drop members whose grace passed). Set before Start().
+  void SetTick(std::function<void()> tick, int every_ms);
   void Start();
   void Stop();
   bool PollOnce();
@@ -230,6 +233,8 @@ class MdsMemberPoller {
   OnTopologyChange topology_cb_;
   int poll_ms_;
   int io_ms_;
+  std::function<void()> tick_;
+  int tick_ms_ = 0;
   uint64_t last_topology_epoch_ = 0;
   uint64_t last_placement_epoch_ = 0;
   bool have_topology_epoch_ = false;
