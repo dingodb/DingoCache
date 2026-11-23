@@ -125,9 +125,29 @@ class RcEndpoint {
   // regions. A client endpoint is never the target of one (servers send
   // only, and no client rkey is ever on the wire), so the client clears it.
   void set_remote_access(bool allowed) { remote_access_ = allowed; }
+  // RDMA READs this QP may have in flight as initiator (max_rd_atomic) and
+  // accepts as responder (max_dest_rd_atomic); both 1 by default, set before
+  // Connect and clamped to what the device supports. The initiator depth
+  // must not exceed the peer's responder depth.
+  void set_read_depth(uint8_t depth) { read_depth_ = depth; }
+  void set_responder_read_depth(uint8_t depth) {
+    responder_read_depth_ = depth;
+  }
+  // The depths the connected QP was given (ibv_query_qp); false if the
+  // device cannot say.
+  bool QueryReadDepths(int* initiator, int* responder) const;
 
   QpInfo Local() const { return local_; }              // my QP info (after Open)
   bool Connect(const QpInfo& remote);                  // INIT -> RTR -> RTS
+  // Connect in two steps: a QP in RTR receives; its initiator settings
+  // (READ depth) are fixed by the step to RTS, which may wait for the
+  // peer's answer.
+  bool ConnectRtr(const QpInfo& remote);
+  bool ConnectRts();
+  // The device's limits, read by Open (1 if it could not say).
+  int device_responder_read_depth() const {
+    return device_responder_read_depth_;
+  }
 
   size_t depth() const { return depth_; }
   // The peer's required nonzero advertised depth clamps the local posting
@@ -363,6 +383,8 @@ class RcEndpoint {
   int numa_node_ = -1;      // NUMA node of the device (for buffer/thread placement)
   int wake_rfd_ = -1, wake_wfd_ = -1;  // self-pipe to interrupt WaitComp on stop
   ibv_mtu mtu_ = IBV_MTU_4096;
+  uint8_t read_depth_ = 1, responder_read_depth_ = 1;
+  int device_read_depth_ = 1, device_responder_read_depth_ = 1;
   unsigned cq_armed_unacked_ = 0;
   bool busy_poll_ = false;
   size_t num_qp_ = 1;

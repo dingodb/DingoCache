@@ -431,6 +431,16 @@ Status RdmaServer::Start(int port) {
   for (size_t i = 0; i < anchor_devs_.size(); ++i)
     initialized_stats.push_back(std::make_unique<RailStats>());
   anchors_ = std::move(initialized_anchors);
+  // Pipelined READs are offered only if every rail's QPs accept
+  // kV2ReadDepth in flight: the probe is not per rail.
+  int min_responder_depth = std::numeric_limits<int>::max();
+  for (const auto& anchor : anchors_)
+    min_responder_depth =
+        std::min(min_responder_depth, anchor->device_responder_read_depth());
+  if (responder_read_depth_for_test_ != 0)
+    min_responder_depth = responder_read_depth_for_test_;
+  read_depth_offered_ = !anchors_.empty() &&
+                        min_responder_depth >= rdma::kV2ReadDepth;
   rail_stats_ = std::move(initialized_stats);
   rail_retry_peers_.clear();
   for (size_t i = 0; i < anchor_devs_.size(); ++i)
@@ -906,6 +916,7 @@ void RdmaServer::Serve(
         reply, rdma::kV2ProbeCapWriterRetirement | rdma::kV2ProbeCapPullRead |
                    rdma::kV2ProbeCapLeasedPut | rdma::kV2ProbeCapDynamicPull |
                    rdma::kV2ProbeCapDynamicOnly |
+                   (read_depth_offered_ ? rdma::kV2ProbeCapReadDepth : 0) |
                    (session_fd_enabled_ ? rdma::kV2ProbeCapSessionFd : 0));
     net::WriteAll(boot_fd, reply, sizeof(reply));
     if (after_probe_reply_for_test_) after_probe_reply_for_test_();
@@ -926,6 +937,10 @@ void RdmaServer::Serve(
   // Kept only for a client that asked, and only on the dynamic-only path.
   const bool keep_session = session_fd_enabled_ && dynamic_only_requested &&
                             rdma::DevFrameRequestsSessionFd(devbuf);
+  // Confirmed only to a client that asked, and only by a server whose every
+  // rail accepts that many (the probe advertised it on the same condition).
+  const bool ack_read_depth = read_depth_offered_ && dynamic_only_requested &&
+                              rdma::DevFrameRequestsReadDepth(devbuf);
   const uint64_t declared = rdma::ParseDevFrameMaxBlock(devbuf);
   if (rdma::ParseDevFrameProtocol(devbuf) != rdma::kDevProtoV2 ||
       declared == 0 || !dynamic_pull_requested || !pull_read_requested ||
@@ -1200,6 +1215,10 @@ void RdmaServer::Serve(
   my.depth = static_cast<uint16_t>(std::min<size_t>(K, 256));
   my.protocol_version = rdma::kDevProtoV2;
   rdma::SerializeQpInfo(my, mine);
+  // Accept a client's pipelined READs (advertised by kV2ProbeCapReadDepth).
+  // Responder resources only: a client that asks for one READ at a time is
+  // served as before.
+  ep.set_responder_read_depth(rdma::kV2ReadDepth);
   if (!net::WriteAll(boot_fd, mine, rdma::kQpInfoBytes) ||
       !ep.Connect(peer_info)) {
     close_boot();
@@ -1235,7 +1254,8 @@ void RdmaServer::Serve(
   char readiness[rdma::kV2RetirementReadinessBytes];
   const size_t readiness_bytes =
       dynamic_only_requested
-          ? rdma::EncodeV2DynamicOnlyReadiness(info, readiness, keep_session)
+          ? rdma::EncodeV2DynamicOnlyReadiness(info, readiness, keep_session,
+                                               ack_read_depth)
           : rdma::EncodeV2Readiness(info, legacy_token, readiness);
   const bool ok =
       readiness_bytes != 0 &&

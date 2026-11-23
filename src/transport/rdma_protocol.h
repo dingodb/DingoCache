@@ -49,6 +49,12 @@ constexpr uint8_t kV2ProbeCapDynamicOnly = 1u << 4;
 // Bit 5: the server keeps a session channel when asked
 // (kDevFrameRequestSessionFd). Advertised only with DFKV_RDMA_SESSION_FD on.
 constexpr uint8_t kV2ProbeCapSessionFd = 1u << 5;
+// Bit 6: the server's QPs accept kV2ReadDepth RDMA READs in flight at once
+// (responder depth). A client may then pipeline its READs on one QP that
+// deep; asking an older server (responder depth 1) for more would end the
+// QP with a protocol error.
+constexpr uint8_t kV2ProbeCapReadDepth = 1u << 6;
+constexpr uint8_t kV2ReadDepth = 16;
 
 inline bool IsV2Probe(const char frame[kDevNameBytes]) {
   size_t n = 0;
@@ -98,6 +104,9 @@ inline bool V2ProbeSupportsLeasedPut(
 
 inline bool V2ProbeSupportsSessionFd(const char in[kV2ProbeReplyBytes]) {
   return (ParseV2ProbeCapabilities(in) & kV2ProbeCapSessionFd) != 0;
+}
+inline bool V2ProbeSupportsReadDepth(const char in[kV2ProbeReplyBytes]) {
+  return (ParseV2ProbeCapabilities(in) & kV2ProbeCapReadDepth) != 0;
 }
 
 inline bool V2ProbeSupportsDynamicPull(
@@ -355,25 +364,35 @@ static_assert(kV2DynamicOnlyReadinessBytes == 25);
 // does for a client that did not ask, so older clients, which require 1,
 // never see it.
 constexpr uint8_t kV2ReadinessSessionFd = 1u << 1;
+// Likewise for a client that asked (kDevFrameRequestReadDepth): the
+// server's QP accepts kV2ReadDepth READs in flight.
+constexpr uint8_t kV2ReadinessReadDepth = 1u << 2;
 
 inline size_t EncodeV2DynamicOnlyReadiness(
     const RecvSegmentInfo& info, char out[kV2DynamicOnlyReadinessBytes],
-    bool session_fd = false) {
-  out[0] = static_cast<char>(1 | (session_fd ? kV2ReadinessSessionFd : 0));
+    bool session_fd = false, bool read_depth = false) {
+  out[0] = static_cast<char>(1 | (session_fd ? kV2ReadinessSessionFd : 0) |
+                             (read_depth ? kV2ReadinessReadDepth : 0));
   EncodeRecvSegmentInfo(info, out + 1);
   return kV2DynamicOnlyReadinessBytes;
 }
 
-// session_fd: null for a client that did not ask for the session channel
-// (byte 0 must be exactly 1); else it receives whether the server keeps it.
+// session_fd / read_depth: null for a client that did not ask for that
+// (its bit must then be clear); else it receives whether the server
+// granted it. Byte 0 must be 1 plus only bits the client asked for.
 inline bool DecodeV2DynamicOnlyReadiness(
     const char* in, size_t bytes, RecvSegmentInfo* info,
-    bool* session_fd = nullptr) {
+    bool* session_fd = nullptr, bool* read_depth = nullptr) {
   if (bytes != kV2DynamicOnlyReadinessBytes) return false;
   const uint8_t flags = static_cast<uint8_t>(in[0]);
-  const bool session = flags == (1 | kV2ReadinessSessionFd);
-  if (flags != 1 && !(session && session_fd != nullptr)) return false;
-  if (session_fd != nullptr) *session_fd = session;
+  const uint8_t allowed =
+      1 | (session_fd ? kV2ReadinessSessionFd : 0) |
+      (read_depth ? kV2ReadinessReadDepth : 0);
+  if ((flags & 1) == 0 || (flags & ~allowed) != 0) return false;
+  if (session_fd != nullptr)
+    *session_fd = (flags & kV2ReadinessSessionFd) != 0;
+  if (read_depth != nullptr)
+    *read_depth = (flags & kV2ReadinessReadDepth) != 0;
   return DecodeRecvSegmentInfo(in + 1, info);
 }
 

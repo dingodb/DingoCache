@@ -770,6 +770,7 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   config_dump::RecordResolved("DFKV_RDMA_KEEPALIVE_MS",
                               std::to_string(keepalive_ms_));
   session_fd_enabled_ = config_dump::EnvBool("DFKV_RDMA_SESSION_FD", false);
+  pipelined_reads_ = config_dump::EnvBool("DFKV_RDMA_PIPELINED_READS", false);
   if (session_fd_enabled_) {
     // One more descriptor per pooled connection: raise the soft limit to
     // the hard one, as the MDS does for its connections.
@@ -1496,10 +1497,12 @@ bool RdmaTransport::SessionClosed(const Conn& conn) {
 
 RdmaTransport::ProbeResult RdmaTransport::ProbeV2(
     const std::string& node, bool* leased_put_supported,
-    int timeout_ms, bool* session_fd_supported) const {
+    int timeout_ms, bool* session_fd_supported,
+    bool* read_depth_supported) const {
   v2_probe_attempts_.fetch_add(1, std::memory_order_relaxed);
   if (leased_put_supported) *leased_put_supported = false;
   if (session_fd_supported) *session_fd_supported = false;
+  if (read_depth_supported) *read_depth_supported = false;
   int fd = DialNode(node, timeout_ms > 0 ? timeout_ms : connect_ms_,
                      timeout_ms > 0 ? timeout_ms : io_ms_);
   if (fd < 0) {
@@ -1521,12 +1524,14 @@ RdmaTransport::ProbeResult RdmaTransport::ProbeV2(
       rdma::V2ProbeSupportsPullRead(reply);
   const bool leased = ok && rdma::V2ProbeSupportsLeasedPut(reply);
   const bool session = ok && rdma::V2ProbeSupportsSessionFd(reply);
+  const bool read_depth = ok && rdma::V2ProbeSupportsReadDepth(reply);
   ::close(fd);
   if (!ok)
     v2_probe_failures_.fetch_add(1, std::memory_order_relaxed);
   else if (leased_put_supported)
     *leased_put_supported = leased;
   if (ok && session_fd_supported) *session_fd_supported = session;
+  if (ok && read_depth_supported) *read_depth_supported = read_depth;
   return ok ? ProbeResult::kSupported
             : closed ? ProbeResult::kClosed : ProbeResult::kRejected;
 }
@@ -2002,6 +2007,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   // Static peers have no restart/address-reuse signal, so always probe them.
   bool leased_put_supported = false;
   bool session_fd_supported = false;
+  bool read_depth_supported = false;
   bool caps_cached = false;
   {
     std::lock_guard<std::mutex> lock(mu_);
@@ -2015,6 +2021,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
         caps_cached = true;
         leased_put_supported = found->second.leased_put;
         session_fd_supported = found->second.session_fd;
+        read_depth_supported = found->second.read_depth;
       }
     }
   }
@@ -2030,7 +2037,8 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     }
     const ProbeResult probed = ProbeV2(
         node, &leased_put_supported,
-        options.refusal_check ? kRefusalCheckMs : 0, &session_fd_supported);
+        options.refusal_check ? kRefusalCheckMs : 0, &session_fd_supported,
+        &read_depth_supported);
     if (probed == ProbeResult::kUnreachable) {
       // A confirming dial's short limit says nothing about the node: no
       // unreachable hold from it (ConfirmRefusal).
@@ -2195,11 +2203,16 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   // The session channel only where the probe said the server keeps one:
   // a server that predates it would take the bit for part of the size.
   const bool want_session = session_fd_enabled_ && session_fd_supported;
+  // Pipelined READs are asked for only where the probe offered them, and
+  // used only once the readiness confirms them: a capability cached from
+  // before the server was replaced by an older one then costs nothing.
+  const bool want_read_depth = pipelined_reads_ && read_depth_supported;
   const uint64_t bootstrap_declared =
       conn_declared | rdma::kDevFrameRequestDynamicOnly |
       rdma::kDevFrameRequestPullRead | rdma::kDevFrameRequestDynamicPull |
       (want_leased_put ? rdma::kDevFrameRequestLeasedPut : 0) |
-      (want_session ? rdma::kDevFrameRequestSessionFd : 0);
+      (want_session ? rdma::kDevFrameRequestSessionFd : 0) |
+      (want_read_depth ? rdma::kDevFrameRequestReadDepth : 0);
   rdma::EncodeDevFrame(auto_device_ ? std::string() : dev,
                        bootstrap_declared, devbuf, rdma::kDevProtoV2);
   char mine[rdma::kQpInfoBytes], remote_qp_bytes[rdma::kQpInfoBytes];
@@ -2219,6 +2232,15 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
       // device; the two look the same from here. Take it as busy once.
       if (!options.refusal_check)
         peer_busy_.fetch_add(1, std::memory_order_relaxed);
+      // So does an older server replaced under the same identity and
+      // publication, refusing a request bit (session channel, READ depth)
+      // that cached capabilities still offer: when this frame carried one,
+      // probe it afresh next time. An operation that does not retry its
+      // acquire (a whole-object GET) would otherwise be refused on every new
+      // connection.
+      if (want_session || want_read_depth)
+        InvalidateCapabilities(node, peer_snapshot->peer_id,
+                               peer_snapshot->publication);
       if (options.op) options.op->busy_closed_rail = ridx;
       result.device_frame_closed = true;
       Destroy(conn, rdma::RailCompletion::kAdmission);
@@ -2238,7 +2260,9 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     result.failure = AcquireFailure::kEndpoint;
     return result;
   }
-  if (!conn->ep.Connect(remote)) {
+  // To RTR now; the step to RTS, which fixes the READ depth, waits for the
+  // readiness below.
+  if (!conn->ep.ConnectRtr(remote)) {
     DFKV_LOG_WARN("rdma: device " + dev +
                   " failed local QP transition during v2 negotiation");
     ::close(fd);
@@ -2273,10 +2297,12 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
 
   char readiness[rdma::kV2DynamicOnlyReadinessBytes];
   bool session_kept = false;
+  bool read_depth_acked = false;
   if (!net::ReadAll(fd, readiness, sizeof(readiness)) ||
       !rdma::DecodeV2DynamicOnlyReadiness(
           readiness, sizeof(readiness), &conn->recv_segment,
-          want_session ? &session_kept : nullptr)) {
+          want_session ? &session_kept : nullptr,
+          want_read_depth ? &read_depth_acked : nullptr)) {
     DFKV_LOG_ERROR(
         "rdma: peer " + node +
         " did not provide valid negotiated v2 readiness");
@@ -2294,6 +2320,20 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     ::close(fd);
     Destroy(conn, rdma::RailCompletion::kEndpointFailure);
     result.failure = AcquireFailure::kEndpoint;
+    return result;
+  }
+  // Pipelined READs only on the server's word that this QP accepts them:
+  // an older server (responder depth 1) would end it on the second READ.
+  if (read_depth_acked) {
+    conn->ep.set_read_depth(rdma::kV2ReadDepth);
+    pipelined_read_conns_.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (!conn->ep.ConnectRts()) {
+    DFKV_LOG_WARN("rdma: device " + dev +
+                  " failed local QP transition during v2 negotiation");
+    ::close(fd);
+    Destroy(conn, rdma::RailCompletion::kRailFailure);
+    result.failure = AcquireFailure::kLocalRail;
     return result;
   }
   if (session_kept) {
@@ -2320,7 +2360,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
         conn->peer_publication != 0) {
       peer_capabilities_[node] = {
           conn->peer_id, conn->peer_publication,
-          leased_put_supported, session_fd_supported};
+          leased_put_supported, session_fd_supported, read_depth_supported};
     }
   }
   if (!publication_current) {
@@ -2951,6 +2991,11 @@ std::string RdmaTransport::MetricsText() const {
   s += "# TYPE dfkv_rdma_client_session_closed_reaps_total counter\n";
   s += "dfkv_rdma_client_session_closed_reaps_total " +
        std::to_string(session_closed_reaps_.load(std::memory_order_relaxed)) +
+       "\n";
+  s += "# HELP dfkv_rdma_client_pipelined_read_conns_total Connections opened with pipelined RDMA READs (DFKV_RDMA_PIPELINED_READS, server advertising its READ depth)\n";
+  s += "# TYPE dfkv_rdma_client_pipelined_read_conns_total counter\n";
+  s += "dfkv_rdma_client_pipelined_read_conns_total " +
+       std::to_string(pipelined_read_conns_.load(std::memory_order_relaxed)) +
        "\n";
   s += "# HELP dfkv_rdma_client_stale_pool_connections_total Pooled connections that failed on reuse and were discarded without cooling the peer rail\n";
   s += "# TYPE dfkv_rdma_client_stale_pool_connections_total counter\n";

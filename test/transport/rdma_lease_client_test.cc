@@ -13,10 +13,31 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <functional>
+#include <limits>
+#include <mutex>
 #include <thread>
 #include <vector>
 
 namespace dfkv {
+
+class RdmaTransportTestPeer {
+ public:
+  // Ends every idle pooled connection, as a restart of the server would:
+  // the next operation to that server opens a new one.
+  static void DropPooled(RdmaTransport* transport) {
+    size_t keep = 0;
+    {
+      std::lock_guard<std::mutex> lock(transport->mu_);  // TrimIdle reads it
+      keep = transport->pool_max_;
+      transport->pool_max_ = 0;
+    }
+    transport->TrimIdle(std::numeric_limits<uint64_t>::max() / 2);
+    std::lock_guard<std::mutex> lock(transport->mu_);
+    transport->pool_max_ = keep;
+  }
+};
+
 namespace {
 
 class ScopedEnv {
@@ -82,6 +103,17 @@ class CapabilityProxy {
   std::string addr;
   std::atomic<bool> advertise_lease{false};
   std::atomic<bool> advertise_dynamic_only{true};
+  std::atomic<bool> advertise_read_depth{true};
+  std::atomic<bool> ack_read_depth{true};
+  // As a server before RDS-06: bit 57 of the frame reads as part of the
+  // declared block size, above any cap, and the bootstrap is closed.
+  std::atomic<bool> refuse_read_depth_request{false};
+  std::atomic<unsigned> refused_bootstraps{0};
+  // The probe offers the session channel (bit 5) whatever the server says;
+  // the server, with it off, keeps none, which the client accepts.
+  std::atomic<bool> offer_session{false};
+  // As a server before RDS-01: bit 58 reads as block size and is refused.
+  std::atomic<bool> refuse_session_request{false};
   std::atomic<unsigned> ordinary_bootstraps{0};
   std::atomic<unsigned> leased_bootstraps{0};
   std::atomic<unsigned> dynamic_bootstraps{0};
@@ -91,6 +123,14 @@ class CapabilityProxy {
   void Handle(int client) {
     char frame[rdma::kDevNameBytes];
     if (!net::ReadAll(client, frame, sizeof(frame))) return;
+    if (!rdma::IsV2Probe(frame) &&
+        ((refuse_read_depth_request.load() &&
+          rdma::DevFrameRequestsReadDepth(frame)) ||
+         (refuse_session_request.load() &&
+          rdma::DevFrameRequestsSessionFd(frame)))) {
+      ++refused_bootstraps;
+      return;
+    }
     const int server = net::Dial(backend_, 3000, 3000);
     if (server < 0) return;
     if (net::WriteAll(server, frame, sizeof(frame))) {
@@ -108,6 +148,14 @@ class CapabilityProxy {
                 static_cast<uint8_t>(reply[5]) &
                 ~rdma::kV2ProbeCapDynamicOnly);
           }
+          if (offer_session.load())
+            reply[5] = static_cast<char>(static_cast<uint8_t>(reply[5]) |
+                                         rdma::kV2ProbeCapSessionFd);
+          if (!advertise_read_depth.load()) {  // as a server before RDS-06
+            reply[5] = static_cast<char>(
+                static_cast<uint8_t>(reply[5]) &
+                ~rdma::kV2ProbeCapReadDepth);
+          }
           net::WriteAll(client, reply, sizeof(reply));
         }
       } else {
@@ -123,6 +171,10 @@ class CapabilityProxy {
             net::ReadAll(server, qp, sizeof(qp)) &&
             net::WriteAll(client, qp, sizeof(qp)) &&
             net::ReadAll(server, readiness, readiness_bytes)) {
+          if (!ack_read_depth.load())
+            readiness[0] = static_cast<char>(
+                static_cast<uint8_t>(readiness[0]) &
+                ~rdma::kV2ReadinessReadDepth);
           net::WriteAll(client, readiness, readiness_bytes);
         }
       }
@@ -646,6 +698,172 @@ TEST_F(RdmaLeaseClient, DynamicGetReusesQpAndRefreshesOptionalCapabilities) {
   EXPECT_EQ(proxy.dynamic_bootstraps.load(), 4u);
   EXPECT_EQ(Counter(transport.MetricsText(),
                     "dfkv_rdma_client_pull_releases_total"), 12);
+}
+
+// RDS-06, mixed versions: a client with DFKV_RDMA_PIPELINED_READS on keeps
+// one READ at a time toward a server that does not advertise its READ depth
+// (every release before it), whose QPs accept no more.
+TEST_F(RdmaLeaseClient, PipelinedReadsAreNotAskedOfAServerThatDoesNotOfferThem) {
+  const BlockKey key{14, 1};
+  const std::string value(kLarge, 'p');
+  std::string ignored;
+  size_t stored_len = 0;
+  ASSERT_EQ(store_->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
+                value.data(), value.size(), &ignored, &stored_len), Status::kOk);
+  for (const bool advertised : {false, true}) {
+    CapabilityProxy proxy(addr_);
+    ASSERT_FALSE(proxy.addr.empty());
+    proxy.advertise_read_depth.store(advertised);
+    ScopedEnv on("DFKV_RDMA_PIPELINED_READS", "1");
+    RdmaTransport transport(kMaxMsg);
+    std::string out(value.size(), '?');
+    EXPECT_EQ(transport.RangeInto(
+                  proxy.addr, {key}, {{out.data(), out.size()}}, nullptr),
+              std::vector<Status>{Status::kOk});
+    EXPECT_EQ(out, value);
+    EXPECT_EQ(Counter(transport.MetricsText(),
+                      "dfkv_rdma_client_pipelined_read_conns_total"),
+              advertised ? 1 : 0);
+  }
+}
+
+// RDS-06: the READ depth is raised only on the server's readiness ack. A
+// probe that offers it (cached, say) is not enough.
+TEST_F(RdmaLeaseClient, TheReadDepthIsRaisedOnlyOnTheServersAck) {
+  const BlockKey key{15, 1};
+  const std::string value(kLarge, 'a');
+  std::string ignored;
+  size_t stored_len = 0;
+  ASSERT_EQ(store_->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
+                value.data(), value.size(), &ignored, &stored_len), Status::kOk);
+  CapabilityProxy proxy(addr_);
+  ASSERT_FALSE(proxy.addr.empty());
+  proxy.ack_read_depth.store(false);
+  ScopedEnv on("DFKV_RDMA_PIPELINED_READS", "1");
+  RdmaTransport transport(kMaxMsg);
+  std::string out(value.size(), '?');
+  EXPECT_EQ(transport.RangeInto(
+                proxy.addr, {key}, {{out.data(), out.size()}}, nullptr),
+            std::vector<Status>{Status::kOk});
+  EXPECT_EQ(out, value);
+  const std::string metrics = transport.MetricsText();
+  EXPECT_EQ(Counter(metrics, "dfkv_rdma_client_pipelined_read_conns_total"), 0);
+  EXPECT_EQ(Counter(metrics, "dfkv_rdma_client_remote_rail_failures_total"), 0);
+}
+
+// RDS-06: a server replaced by an older one under the same identity, so the
+// client still holds a capability cache that offers pipelined READs. The
+// older server refuses the asking bootstrap (bit 57 reads as block size);
+// the client takes it as a busy peer once, probes afresh and connects at
+// depth 1, charging no rail.
+TEST_F(RdmaLeaseClient, AServerDowngradedUnderTheSameIdentityCostsOneBusyRetry) {
+  const BlockKey key{16, 1};
+  const std::string value(kLarge, 'b');
+  std::string ignored;
+  size_t stored_len = 0;
+  ASSERT_EQ(store_->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
+                value.data(), value.size(), &ignored, &stored_len), Status::kOk);
+  CapabilityProxy proxy(addr_);
+  ASSERT_FALSE(proxy.addr.empty());
+  ScopedEnv on("DFKV_RDMA_PIPELINED_READS", "1");
+  RdmaTransport transport(kMaxMsg);
+  PeerTopology topology;
+  topology.peer_addr = proxy.addr;
+  topology.peer_id = "downgraded-peer";
+  topology.generation = 1;
+  transport.OnPeerTopology(topology);
+  std::string out(value.size(), '?');
+  ASSERT_EQ(transport.RangeInto(
+                proxy.addr, {key}, {{out.data(), out.size()}}, nullptr),
+            std::vector<Status>{Status::kOk});
+  ASSERT_EQ(Counter(transport.MetricsText(),
+                    "dfkv_rdma_client_pipelined_read_conns_total"), 1);
+  // Replaced: same identity and publication, older behaviour.
+  proxy.advertise_read_depth.store(false);
+  proxy.ack_read_depth.store(false);
+  proxy.refuse_read_depth_request.store(true);
+  // A control-lane operation opens a new connection with the cached caps.
+  std::vector<char> exists;
+  EXPECT_EQ(transport.ExistMany(proxy.addr, {key}, &exists),
+            std::vector<Status>{Status::kOk});
+  EXPECT_EQ(exists, std::vector<char>{1});
+  EXPECT_EQ(proxy.refused_bootstraps.load(), 1u);
+  const std::string metrics = transport.MetricsText();
+  EXPECT_EQ(Counter(metrics, "dfkv_rdma_client_peer_busy_total"), 1);
+  EXPECT_EQ(Counter(metrics, "dfkv_rdma_client_remote_rail_failures_total"), 0);
+  EXPECT_EQ(Counter(metrics, "dfkv_rdma_client_pipelined_read_conns_total"), 1);
+}
+
+// A server replaced by an older one under the same identity and
+// publication, met by whole-object GETs only (RangeInto does not retry its
+// acquire). The first new connection sends the request bit the cached
+// capabilities offer and is refused as busy; that must drop the cache, so
+// the next GET probes afresh and is served. Before, every GET was refused
+// until a PUT or control operation refreshed the cache.
+void ExpectDowngradeHealsOnTheNextGet(CapabilityProxy* proxy,
+                                      RdmaTransport* transport,
+                                      const BlockKey& key,
+                                      const std::string& value,
+                                      const std::function<void()>& downgrade) {
+  PeerTopology topology;
+  topology.peer_addr = proxy->addr;
+  topology.peer_id = "downgraded-get-peer";
+  topology.generation = 1;
+  transport->OnPeerTopology(topology);
+  const auto get = [&] {
+    std::string out(value.size(), '?');
+    const auto status = transport->RangeInto(
+        proxy->addr, {key}, {{out.data(), out.size()}}, nullptr);
+    return status == std::vector<Status>{Status::kOk} && out == value;
+  };
+  ASSERT_TRUE(get());  // caches the capabilities
+  downgrade();
+  RdmaTransportTestPeer::DropPooled(transport);  // the server restarted
+  (void)get();  // the first new connection may be refused (busy)
+  EXPECT_TRUE(get()) << "the cached capabilities were not dropped";
+  EXPECT_LE(proxy->refused_bootstraps.load(), 1u);
+}
+
+TEST_F(RdmaLeaseClient, ADowngradedServerIsReprobedAfterOneRefusedRead) {
+  const BlockKey key{17, 1};
+  const std::string value(kLarge, 'c');
+  std::string ignored;
+  size_t stored_len = 0;
+  ASSERT_EQ(store_->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
+                value.data(), value.size(), &ignored, &stored_len), Status::kOk);
+  CapabilityProxy proxy(addr_);
+  ASSERT_FALSE(proxy.addr.empty());
+  ScopedEnv on("DFKV_RDMA_PIPELINED_READS", "1");
+  RdmaTransport transport(kMaxMsg);
+  ExpectDowngradeHealsOnTheNextGet(&proxy, &transport, key, value, [&] {
+    proxy.advertise_read_depth.store(false);
+    proxy.ack_read_depth.store(false);
+    proxy.refuse_read_depth_request.store(true);
+  });
+}
+
+// The same for the session channel's request bit (58, RDS-01).
+TEST_F(RdmaLeaseClient, ADowngradedSessionServerIsReprobedAfterOneRefusedRead) {
+  const BlockKey key{18, 1};
+  const std::string value(kLarge, 's');
+  std::string ignored;
+  size_t stored_len = 0;
+  ASSERT_EQ(store_->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
+                value.data(), value.size(), &ignored, &stored_len), Status::kOk);
+  CapabilityProxy proxy(addr_);
+  ASSERT_FALSE(proxy.addr.empty());
+  proxy.offer_session.store(true);
+  ScopedEnv on("DFKV_RDMA_SESSION_FD", "1");
+  RdmaTransport transport(kMaxMsg);
+  ExpectDowngradeHealsOnTheNextGet(&proxy, &transport, key, value, [&] {
+    proxy.offer_session.store(false);
+    proxy.refuse_session_request.store(true);
+  });
 }
 
 TEST_F(RdmaLeaseClient, DynamicOnlyClientRejectsOldServerBeforeQpBootstrap) {

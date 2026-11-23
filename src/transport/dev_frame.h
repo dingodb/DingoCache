@@ -35,10 +35,16 @@ constexpr uint64_t kDevFrameRequestDynamicOnly = uint64_t{1} << 59;
 // for a server whose probe advertised kV2ProbeCapSessionFd: a server that
 // predates the bit would read it as part of max_block_bytes and refuse.
 constexpr uint64_t kDevFrameRequestSessionFd = uint64_t{1} << 58;
+// Bit 57 asks the server to confirm in readiness byte 0 that its QP accepts
+// kV2ReadDepth READs in flight (kV2ReadinessReadDepth); the client raises
+// its READ depth only on that answer. Set only for a server whose probe
+// advertised kV2ProbeCapReadDepth, for the same reason as bit 58.
+constexpr uint64_t kDevFrameRequestReadDepth = uint64_t{1} << 57;
 constexpr uint64_t kDevFrameMaxBlockMask =
     ~(kDevFrameRequestWriterRetirement | kDevFrameRequestPullRead |
       kDevFrameRequestLeasedPut | kDevFrameRequestDynamicPull |
-      kDevFrameRequestDynamicOnly | kDevFrameRequestSessionFd);
+      kDevFrameRequestDynamicOnly | kDevFrameRequestSessionFd |
+      kDevFrameRequestReadDepth);
 
 // Room a device name must leave in the fixed 32-byte frame: NUL terminator +
 // "DCP2" u32 + max_block_bytes u64 + protocol u8. A name at most this long
@@ -129,6 +135,9 @@ inline bool DevFrameRequestsDynamicOnly(const char in[kDevNameBytes]) {
 
 inline bool DevFrameRequestsSessionFd(const char in[kDevNameBytes]) {
   return (ParseDevFrameCaps(in) & kDevFrameRequestSessionFd) != 0;
+}
+inline bool DevFrameRequestsReadDepth(const char in[kDevNameBytes]) {
+  return (ParseDevFrameCaps(in) & kDevFrameRequestReadDepth) != 0;
 }
 
 inline uint8_t ParseDevFrameProtocol(const char in[kDevNameBytes]) {
