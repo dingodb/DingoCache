@@ -20,6 +20,8 @@ from dfkv_common import (
     make_key_array,
     make_key_buffer,
     pool_key,
+    pool_key_affixes,
+    pool_key_hash_field,
     sg_key,
     tenant_hash,
 )
@@ -231,6 +233,26 @@ class CanonicalIdentityTest(unittest.TestCase):
             pool_key("page-a", **base),
             pool_key("page-a", pool="kv", tp_size=8, tp_rank=1),
         )
+
+    def test_pool_key_is_its_affixes_around_the_hash_field(self):
+        namespaces = [
+            {},
+            {"pool": "mamba-states", "group_id": 3, "component": "vllm-multiwr-v4"},
+            {"pool": b"kv", "dp_size": 2, "dp_rank": 1, "tp_size": 8,
+             "tp_rank": 7, "pcp_size": 2, "pcp_rank": 1, "dcp_size": 4,
+             "dcp_rank": 3, "pp_size": 2, "pp_rank": 1},
+            {"tp_size": 8, "tp_rank": -1, "group_id": 0xFFFFFFFF},
+        ]
+        for kw in namespaces:
+            prefix, suffix = pool_key_affixes(**kw)
+            for page in ("a", "ab" * 32, b"\x00\xff", "x" * 300):
+                self.assertEqual(
+                    prefix + pool_key_hash_field(page) + suffix,
+                    pool_key(page, **kw), (kw, page))
+        with self.assertRaises(ValueError):
+            pool_key_hash_field("")
+        with self.assertRaises(ValueError):
+            pool_key_affixes(tp_size=2, tp_rank=2)
 
     def test_pool_key_binary_fields_cannot_alias(self):
         self.assertNotEqual(pool_key(b"a\x00b"), pool_key(b"a"))

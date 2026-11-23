@@ -35,6 +35,7 @@ import torch
 from dfkv_common import (
     apply_rank_local_rail_affinity,
     canonical_namespace,
+    pool_key_hash_field,
     reject_namespace_override,
 )
 import zmq
@@ -87,6 +88,7 @@ from .data import (
     KeyMetadata,
     PoolKey,
     ReqMeta,
+    key_affixes,
     key_diagnostic_label,
     requires_request_level_loads,
     split_block_contiguous_runs,
@@ -3096,16 +3098,23 @@ class DfkvStoreWorker:
                 ),
             )
 
+        # A key is its namespace's prefix, the hash field and the suffix;
+        # each namespace of a group is encoded once per lookup.
+        affixes: dict[tuple[int, int, int, int], tuple[bytes, bytes]] = {}
+
         def object_key(g_idx: int, h, tp: int, pcp: int, dcp: int) -> bytes:
             # Keep this worker's own pp_rank (db.metadata.pp_rank): PP
             # partitions layers, so each (group, chunk) lives under a single
             # stage's pp_rank, matching the SAVE/LOAD keys. Probing every
             # pp_rank matched nothing and forced present=0 on PP>1.
-            md = dataclasses.replace(
-                self.token_dbs[g_idx].metadata,
-                tp_rank=tp, pcp_rank=pcp, dcp_rank=dcp,
-            )
-            return PoolKey(md, h.hex()).to_bytes()
+            namespace = (g_idx, tp, pcp, dcp)
+            parts = affixes.get(namespace)
+            if parts is None:
+                parts = affixes[namespace] = key_affixes(dataclasses.replace(
+                    self.token_dbs[g_idx].metadata,
+                    tp_rank=tp, pcp_rank=pcp, dcp_rank=dcp,
+                ))
+            return parts[0] + pool_key_hash_field(h.hex()) + parts[1]
 
         def prefetch_moving_groups(candidate: int, hit: int) -> bool:
             """After a failed candidate: probe, in one call, every chunk below
@@ -3306,10 +3315,7 @@ class DfkvStoreWorker:
                         use_mla=db.metadata.tp_rank < 0,
                         tp_sharded=g_idx in state_groups,
                     ):
-                        md = dataclasses.replace(
-                            db.metadata, tp_rank=tp, pcp_rank=pcp, dcp_rank=dcp
-                        )
-                        keys.append(PoolKey(md, h.hex()).to_bytes())
+                        keys.append(object_key(g_idx, h, tp, pcp, dcp))
                         owners.append((g_idx, h))
                 if not keys:
                     return True

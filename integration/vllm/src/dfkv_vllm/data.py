@@ -8,7 +8,7 @@
 import hashlib
 
 from collections.abc import Iterable, MutableSequence, Sequence
-from dfkv_common import pool_key
+from dfkv_common import pool_key_affixes, pool_key_hash_field
 from dataclasses import dataclass
 from itertools import product
 
@@ -197,22 +197,28 @@ class PoolKey:
         )
 
     def to_bytes(self) -> bytes:
-        return pool_key(
-            self.chunk_hash,
-            pool=self.key_metadata.pool_name,
-            dp_size=self.key_metadata.dp_size,
-            dp_rank=self.key_metadata.dp_rank,
-            tp_size=self.key_metadata.tp_size,
-            tp_rank=self.key_metadata.tp_rank,
-            pcp_size=self.key_metadata.pcp_size,
-            pcp_rank=self.key_metadata.pcp_rank,
-            dcp_size=self.key_metadata.dcp_size,
-            dcp_rank=self.key_metadata.dcp_rank,
-            pp_size=self.key_metadata.pp_size,
-            pp_rank=self.key_metadata.pp_rank,
-            group_id=self.key_metadata.group_id,
-            component=VLLM_RAW_LAYOUT.decode("ascii"),
-        )
+        prefix, suffix = key_affixes(self.key_metadata)
+        return prefix + pool_key_hash_field(self.chunk_hash) + suffix
+
+
+def key_affixes(md: KeyMetadata) -> tuple[bytes, bytes]:
+    """The bytes of ``md``'s keys before and after the chunk hash field:
+    ``PoolKey(md, h).to_bytes() == prefix + pool_key_hash_field(h) + suffix``."""
+    return pool_key_affixes(
+        pool=md.pool_name,
+        dp_size=md.dp_size,
+        dp_rank=md.dp_rank,
+        tp_size=md.tp_size,
+        tp_rank=md.tp_rank,
+        pcp_size=md.pcp_size,
+        pcp_rank=md.pcp_rank,
+        dcp_size=md.dcp_size,
+        dcp_rank=md.dcp_rank,
+        pp_size=md.pp_size,
+        pp_rank=md.pp_rank,
+        group_id=md.group_id,
+        component=VLLM_RAW_LAYOUT.decode("ascii"),
+    )
 
 
 class ChunkedTokenDatabase:

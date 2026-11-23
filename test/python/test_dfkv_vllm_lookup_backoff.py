@@ -17,6 +17,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_dfkv_vllm_worker  # noqa: E402,F401  (installs the stand-ins)
@@ -25,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "integration" / "vl
 from _coordinator_fake import fake_coordinator  # noqa: E402
 
 from dfkv_vllm.data import KeyMetadata, PoolKey  # noqa: E402
+import dfkv_vllm.worker as worker_module  # noqa: E402
 from dfkv_vllm.worker import DfkvStoreWorker  # noqa: E402
 
 LCM = 64
@@ -117,17 +119,14 @@ class LookupBackoff(unittest.TestCase):
         worker.pp_size = 1
         worker._record_kv_connector_operation = lambda *a, **k: None
         builds = [0]
-        to_bytes = PoolKey.to_bytes
+        hash_field = worker_module.pool_key_hash_field
 
-        def counted(self):
+        def counted(page_hash):
             builds[0] += 1
-            return to_bytes(self)
+            return hash_field(page_hash)
 
-        PoolKey.to_bytes = counted
-        try:
+        with mock.patch.object(worker_module, "pool_key_hash_field", counted):
             self.assertEqual(worker.lookup(n * LCM, hashes)[0], present * LCM)
-        finally:
-            PoolKey.to_bytes = to_bytes
         self.assertLessEqual(len(masks), 4, f"{len(masks)} load_mask evaluations")
         self.assertEqual(builds[0], n, "keys were built more than once")
         self.assertEqual(ring.calls, [n])

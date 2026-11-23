@@ -19,6 +19,8 @@ from .identity import (
     layout_fingerprint,
     namespace_tenant_hash,
     pool_key,
+    pool_key_affixes,
+    pool_key_hash_field,
     sg_key,
     tenant_hash,
 )
@@ -46,6 +48,8 @@ __all__ = [
     "layout_fingerprint",
     "namespace_tenant_hash",
     "pool_key",
+    "pool_key_affixes",
+    "pool_key_hash_field",
     "sg_key",
     "tenant_hash",
     "RailAffinitySelection",
