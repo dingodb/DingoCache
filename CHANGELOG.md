@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Log engine (experimental): a PUT that fills its segment while the next
+  one is being pre-opened waits for that header (one write) instead of
+  reclaiming a segment inline. Since the pre-opened segment (STO-33), such
+  a PUT found one free segment fewer than the cleaner keeps, reclaimed
+  inline, and evicted values the cleaner would have relocated (values that
+  had been read among them). `segments_free` now counts a segment being
+  pre-opened, as the cleaner does. New `dfkv_lse_preopen_waits_total`,
+  `dfkv_lse_preopen_wait_microseconds_total`.
+
 
 - Client: an exact read of a key stored with another length leaves the
   destination as it was (TRN-26). Such a read is a miss, yet the stored
