@@ -4,7 +4,7 @@
  * Why native verbs (not librdmacm)? rdma_cm resolves the RDMA device from an IP
  * address (IPoIB), so it can only use a device that has an IP. On these clusters
  * the IP lives on the 200G port while the 8x 400G ports have NO IP and sit on a
- * SEPARATE IB fabric. Native verbs opens a device BY NAME (e.g. ib7s400p0) and
+ * SEPARATE IB fabric. Native verbs opens a device BY NAME (e.g. mlx5_0) and
  * bootstraps the QP over a tiny out-of-band TCP channel (which rides whatever IP
  * network the nodes share — 200G or bond0). Control plane and data plane are
  * thus decoupled: the QP handshake (LID/GID/QPN/PSN, ~32 B) goes over TCP, the

@@ -78,7 +78,7 @@ class LMCacheRailAffinityTest(unittest.TestCase):
                     physical_affinity_rank(metadata)
 
     def test_two_node_tp16_maps_each_hosts_local_workers_to_eight_rails(self):
-        rails = ",".join(f"ib7s400p{i}" for i in range(8))
+        rails = ",".join(f"mlx5_{i}" for i in range(8))
         for global_rank in range(16):
             local_rank = global_rank % 8
             metadata = types.SimpleNamespace(
@@ -94,8 +94,8 @@ class LMCacheRailAffinityTest(unittest.TestCase):
                 env,
             )
             expected = (
-                f"ib7s400p{local_rank}",
-                f"ib7s400p{(local_rank + 4) % 8}",
+                f"mlx5_{local_rank}",
+                f"mlx5_{(local_rank + 4) % 8}",
             )
             self.assertEqual(selection.selected, expected)
             self.assertEqual(env["DFKV_RDMA_PRIMARY_DEV"], expected[0])

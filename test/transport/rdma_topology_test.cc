@@ -38,44 +38,44 @@ RdmaDiscoveryProbe Probe(
 
 TEST(RdmaTopology, DiscoveryDropsDownPortsWithoutAFilter) {
   const std::vector<RdmaDevInfo> candidates{
-      Device("ib7s400p0", true, 0), Device("ib9s400p0", false, 1),
-      Device("ib7s400p1", true, 1)};
+      Device("mlx5_0", true, 0), Device("mlx5_8", false, 1),
+      Device("mlx5_1", true, 1)};
 
   const auto selected = RdmaTopology::FilterActive(candidates);
 
   ASSERT_EQ(selected.size(), 2u);
-  EXPECT_EQ(selected[0].name, "ib7s400p0");
-  EXPECT_EQ(selected[1].name, "ib7s400p1");
+  EXPECT_EQ(selected[0].name, "mlx5_0");
+  EXPECT_EQ(selected[1].name, "mlx5_1");
 }
 
 TEST(RdmaTopology, WhitelistAndActiveChecksAreBothApplied) {
   const std::vector<RdmaDevInfo> candidates{
-      Device("ib7s400p0", true), Device("ib7s400p1", false),
-      Device("ib6s200p0", true)};
-  const std::vector<std::string> filter{"ib7s400p0", "ib7s400p1"};
+      Device("mlx5_0", true), Device("mlx5_1", false),
+      Device("mlx5_10", true)};
+  const std::vector<std::string> filter{"mlx5_0", "mlx5_1"};
 
   const auto selected = RdmaTopology::FilterActive(candidates, filter);
 
   ASSERT_EQ(selected.size(), 1u);
-  EXPECT_EQ(selected[0].name, "ib7s400p0");
+  EXPECT_EQ(selected[0].name, "mlx5_0");
 }
 
 TEST(RdmaTopology, AllFilteredPortsDownReturnsEmpty) {
   const std::vector<RdmaDevInfo> candidates{
-      Device("ib9s400p0", false), Device("ib9s400p1", false)};
-  const std::vector<std::string> filter{"ib9s400p0", "ib9s400p1"};
+      Device("mlx5_8", false), Device("mlx5_9", false)};
+  const std::vector<std::string> filter{"mlx5_8", "mlx5_9"};
 
   EXPECT_TRUE(RdmaTopology::FilterActive(candidates, filter).empty());
 }
 
 TEST(RdmaTopology, DuplicateCandidatesRemainOneRail) {
   const std::vector<RdmaDevInfo> candidates{
-      Device("ib7s400p0", true), Device("ib7s400p0", true)};
+      Device("mlx5_0", true), Device("mlx5_0", true)};
 
   const auto selected = RdmaTopology::FilterActive(candidates);
 
   ASSERT_EQ(selected.size(), 1u);
-  EXPECT_EQ(selected[0].name, "ib7s400p0");
+  EXPECT_EQ(selected[0].name, "mlx5_0");
 }
 
 TEST(RdmaTopology, TypedActiveOnlyResolutionFiltersInactiveAndFailedProbes) {

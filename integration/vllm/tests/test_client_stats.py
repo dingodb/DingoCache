@@ -21,8 +21,8 @@ dfkv_client_mds_reachable 1
 dfkv_client_mds_unreachable_polls_total 0
 dfkv_client_ops_served_total 123456
 dfkv_client_op_requests_total{op="get"} 19
-dfkv_rdma_client_rail_selections_total{dev="ib7s400p3"} 11
-dfkv_rdma_client_rail_quarantined{dev="ib7s400p3"} 0
+dfkv_rdma_client_rail_selections_total{dev="mlx5_3"} 11
+dfkv_rdma_client_rail_quarantined{dev="mlx5_3"} 0
 """
 
 _EMPTY_RING = """\
@@ -40,12 +40,12 @@ def test_parses_health_operations_and_rail_metrics():
         'dfkv_client_transport_info{transport="rdma"}': 1.0,
         "dfkv_client_ring_members": 5.0,
         "dfkv_client_mds_reachable": 1.0,
-        'dfkv_rdma_client_rail_quarantined{dev="ib7s400p3"}': 0.0,
+        'dfkv_rdma_client_rail_quarantined{dev="mlx5_3"}': 0.0,
     }
     assert poller.totals() == {
         "dfkv_client_ops_served_total": 123456.0,
         'dfkv_client_op_requests_total{op="get"}': 19.0,
-        'dfkv_rdma_client_rail_selections_total{dev="ib7s400p3"}': 11.0,
+        'dfkv_rdma_client_rail_selections_total{dev="mlx5_3"}': 11.0,
     }
     assert poller.health()["success"] == 1
     assert poller.health()["timestamp_seconds"] > 0
@@ -102,7 +102,7 @@ def test_prometheus_metrics_reflect_native_snapshot():
         {"tp_rank": "77", "op": "get"}) == 19
     assert registry.get_sample_value(
         "vllm:dfkv_rdma_client_rail_selections_total",
-        {"tp_rank": "77", "dev": "ib7s400p3"}) == 11
+        {"tp_rank": "77", "dev": "mlx5_3"}) == 11
     assert registry.get_sample_value(
         "vllm:dfkv_client_transport_info",
         {"tp_rank": "77", "transport": "rdma"}) == 1

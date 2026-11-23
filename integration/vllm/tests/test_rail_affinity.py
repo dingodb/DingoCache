@@ -42,7 +42,7 @@ class VllmRailAffinityTest(unittest.TestCase):
                     physical_affinity_rank(**ranks)
 
     def test_tp8_dcp8_rank_to_primary_and_fallback_mapping(self):
-        rails = ",".join(f"ib7s400p{i}" for i in range(8))
+        rails = ",".join(f"mlx5_{i}" for i in range(8))
         for rank in range(8):
             env = {
                 "DFKV_RDMA_DEV": rails,
@@ -62,8 +62,8 @@ class VllmRailAffinityTest(unittest.TestCase):
                 env,
             )
             expected = (
-                f"ib7s400p{rank}",
-                f"ib7s400p{(rank + 4) % 8}",
+                f"mlx5_{rank}",
+                f"mlx5_{(rank + 4) % 8}",
             )
             self.assertEqual(selection.selected, expected)
             self.assertEqual(env["DFKV_RDMA_DEV"], ",".join(expected))
