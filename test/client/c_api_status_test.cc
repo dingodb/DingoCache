@@ -67,10 +67,12 @@ class ScriptedTransport final : public dfkv::Transport {
       out[i] = found->second.first;
       if (out[i] != dfkv::Status::kOk) continue;
       const std::string& value = found->second.second;
-      // As the TCP and RDMA transports: a value larger than the destination
-      // is refused, a shorter one is read with its length.
+      // As the RDMA transport: a value larger than the destination is
+      // refused with its stored length (TCP reads a slice with it), a
+      // shorter one is read with its length. Other refusals carry none.
       if (value.size() > dsts[i].n) {
         out[i] = dfkv::Status::kInvalid;
+        if (value_lens) (*value_lens)[i] = value.size();
         continue;
       }
       std::memcpy(dsts[i].payload, value.data(), value.size());
@@ -137,7 +139,7 @@ TEST_P(CApiStatus, ReadsTellMissFromLengthFromRefusal) {
   EXPECT_EQ(hit, (std::vector<int>{1, 0, 0, 0, 0, 0, 0}));
   EXPECT_EQ(status, (std::vector<uint8_t>{
                         DFKV_ST_OK, DFKV_ST_NOT_FOUND, DFKV_ST_LENGTH_MISMATCH,
-                        DFKV_ST_INVALID, DFKV_ST_INVALID,
+                        DFKV_ST_LENGTH_MISMATCH, DFKV_ST_INVALID,
                         DFKV_ST_NO_COMPATIBLE_RAIL, DFKV_ST_BAD_ARGUMENT}));
   // The plain form gives the same hits.
   std::vector<int> plain(keys.names.size(), 9);
@@ -146,7 +148,8 @@ TEST_P(CApiStatus, ReadsTellMissFromLengthFromRefusal) {
             0);
   EXPECT_EQ(plain, hit);
 
-  // Variable size: a shorter value fits; a longer one is refused.
+  // Variable size: a shorter value fits; a longer one is a length mismatch,
+  // told apart from a refusal.
   std::vector<uint64_t> lens(keys.names.size(), 77);
   ASSERT_EQ(dfkv_batch_get_auto_st(client, keys.ptrs.data(), keys.lens.data(),
                                    ptrs.data(), sizes.data(), keys.n(),
@@ -156,7 +159,7 @@ TEST_P(CApiStatus, ReadsTellMissFromLengthFromRefusal) {
   EXPECT_EQ(lens[2], 4u);
   EXPECT_EQ(status, (std::vector<uint8_t>{
                         DFKV_ST_OK, DFKV_ST_NOT_FOUND, DFKV_ST_OK,
-                        DFKV_ST_INVALID, DFKV_ST_INVALID,
+                        DFKV_ST_LENGTH_MISMATCH, DFKV_ST_INVALID,
                         DFKV_ST_NO_COMPATIBLE_RAIL, DFKV_ST_BAD_ARGUMENT}));
 
   // Scatter-gather: two 4-byte segments per key.
@@ -178,7 +181,7 @@ TEST_P(CApiStatus, ReadsTellMissFromLengthFromRefusal) {
   EXPECT_EQ(hit, (std::vector<int>{1, 0, 1, 0, 0, 0, 0}));
   EXPECT_EQ(status, (std::vector<uint8_t>{
                         DFKV_ST_OK, DFKV_ST_NOT_FOUND, DFKV_ST_OK,
-                        DFKV_ST_INVALID, DFKV_ST_INVALID,
+                        DFKV_ST_LENGTH_MISMATCH, DFKV_ST_INVALID,
                         DFKV_ST_NO_COMPATIBLE_RAIL, DFKV_ST_BAD_ARGUMENT}));
   dfkv_close(client);
 }

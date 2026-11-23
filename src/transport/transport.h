@@ -309,8 +309,11 @@ class Transport {
   }
 
   // Read into caller-provided host or CUDA destinations. value_lens[i] is the
-  // authoritative full stored size. The default uses Range plus final
-  // publication; RDMA overrides while retaining the same publication contract.
+  // authoritative full stored size for kOk, and for a kInvalid that refused a
+  // value larger than the destination (so the client can tell a length
+  // mismatch from any other refusal); 0 for every other status. The default
+  // uses Range plus final publication; RDMA overrides while retaining the
+  // same publication contract.
   virtual std::vector<Status> RangeInto(
       const std::string& node, const std::vector<BlockKey>& keys,
       const std::vector<RangeDst>& dsts,
@@ -329,8 +332,8 @@ class Transport {
         uint64_t stored = 0;
         Status st = Range(node, keys[i], 0, dsts[i].n, &raw, &stored);
         r[i] = st;
-        if (value_lens) (*value_lens)[i] = stored;
         if (st != Status::kOk) continue;
+        if (value_lens) (*value_lens)[i] = stored;
         const size_t n = std::min(raw.size(), dsts[i].n);
         if (n) std::memcpy(dsts[i].payload, raw.data(), n);
       }
@@ -347,8 +350,8 @@ class Transport {
       Status st =
           Range(node, keys[i], 0, dsts[i].n, &raw_values[i], &stored);
       r[i] = st;
-      if (value_lens) (*value_lens)[i] = stored;
       if (st != Status::kOk) continue;
+      if (value_lens) (*value_lens)[i] = stored;
       const size_t n = std::min(raw_values[i].size(), dsts[i].n);
       if (n && !publisher.Copy(dsts[i].payload, raw_values[i].data(), n,
                                dsts[i].memory_kind))
@@ -423,8 +426,9 @@ class Transport {
   // lets server DMA land in them directly (GPUDirect when they are device
   // memory); on failure the destination contents are unspecified, and QP
   // teardown fences in-flight DMA before any retry or return.
-  // out_lens[i] is the authoritative stored length (zero on miss), independent
-  // of destination capacity.
+  // out_lens[i] is the authoritative stored length, independent of
+  // destination capacity, as RangeInto's value_lens: for kOk and for a value
+  // larger than the destinations (kInvalid); zero otherwise.
   virtual std::vector<Status> RangeIntoMulti(
       const std::string& node, const std::vector<BlockKey>& keys,
       const std::vector<RangeDstMulti>& dsts,
@@ -467,13 +471,15 @@ class Transport {
          valid_i < indices.size() && valid_i < valid_result.size(); ++valid_i) {
       const size_t i = indices[valid_i];
       result[i] = valid_result[valid_i];
+      const uint64_t length =
+          valid_i < stored.size() ? stored[valid_i] : uint64_t{0};
+      // A value larger than the destinations: kInvalid with its length.
+      const bool too_large = length > scratch[i].size();
+      if (too_large && out_lens)
+        (*out_lens)[i] = static_cast<size_t>(std::min<uint64_t>(
+            length, std::numeric_limits<size_t>::max()));
       if (result[i] != Status::kOk) continue;
-      if (valid_i >= stored.size()) {
-        result[i] = Status::kInvalid;
-        continue;
-      }
-      if (stored[valid_i] > std::numeric_limits<size_t>::max() ||
-          static_cast<size_t>(stored[valid_i]) > scratch[i].size()) {
+      if (valid_i >= stored.size() || too_large) {
         result[i] = Status::kInvalid;
         continue;
       }

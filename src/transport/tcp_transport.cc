@@ -371,7 +371,9 @@ std::vector<Status> TcpTransport::RangeInto(
     uint64_t stored = 0;
     statuses.push_back(RoundTripInto(node, keys[i], 0, dsts[i].n,
                                      dsts[i].payload, dsts[i].n, &stored));
-    if (value_lens) (*value_lens)[i] = stored;
+    // A refusal's length is not a stored length (see Transport::RangeInto).
+    if (value_lens && statuses.back() == Status::kOk)
+      (*value_lens)[i] = stored;
   }
   return statuses;
 }

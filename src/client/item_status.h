@@ -20,8 +20,9 @@ enum class ItemStatus : uint8_t {
   kInvalid = 5,
   kResourceExhausted = 6,
   kNoCompatibleRail = 7,
-  // The owner holds the key with another length than the read accepts (a
-  // transport answers a value larger than the destination with kInvalid).
+  // The owner holds the key with another length than the read accepts:
+  // shorter than an exact read asks, or larger than the destination. The
+  // stored length is known, never guessed from a refusal.
   kLengthMismatch = 8,
   // The owner is in cooldown after failures; nothing was sent.
   kPeerCooling = 9,
@@ -46,9 +47,13 @@ inline ItemStatus ToItemStatus(Status status) {
 }
 
 // A read answered `status` with a value of `length` bytes, for a request of
-// exactly `size` bytes (exact) or of at most `size`.
+// exactly `size` bytes (exact) or of at most `size`. A transport refuses a
+// value larger than the destination with kInvalid and its stored length;
+// every other refusal reports length 0 (Transport::RangeInto).
 inline ItemStatus ReadItemStatus(Status status, uint64_t length, size_t size,
                                  bool exact) {
+  if (status == Status::kInvalid && length > size)
+    return ItemStatus::kLengthMismatch;
   if (status != Status::kOk) return ToItemStatus(status);
   return (exact ? length == size : length <= size) ? ItemStatus::kOk
                                                     : ItemStatus::kLengthMismatch;

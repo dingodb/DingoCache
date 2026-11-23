@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+- SGLang HiCache: a key stored with another length is rewritten once
+  (HIC-26). A read that found a key stored with another length than this
+  process reads (a shorter or larger object, for example written by an
+  instance with another page layout in the same namespace) missed, and the
+  backup's existence gate then reported the key stored, while a node keeps
+  an existing key's value on PUT, so the page was recomputed on every read.
+  The connector now reads with the per-key status calls and records keys
+  that read `DFKV_ST_LENGTH_MISMATCH` (or, on the device path, a hit shorter
+  than the destination) in a bounded set. The next backup reads each again
+  at the size it stores and, if it still mismatches, removes it and writes
+  it again; a key that now reads correctly, is absent or cannot be read is
+  left alone, and `DFKV_ST_INVALID` never leads to a removal. A key is
+  rewritten at most once per process; later mismatches of it are only
+  counted in the new `dfkv_hicache_length_mismatch_keys_total`, and each
+  backend logs one WARNING. A steady rise means two layouts share a
+  namespace: give them distinct `model_revision` values or set
+  `bind_runtime_layout`. For the same reason, a rolling upgrade that
+  changes object sizes without a new `model_revision` makes old and new
+  instances delete each other's objects (once per key per process) instead
+  of only missing them.
+
+- Client, per-key read status: a value larger than the destination is
+  `DFKV_ST_LENGTH_MISMATCH` on every transport. Over RDMA it was
+  `DFKV_ST_INVALID`, the code also given for this process's block bound, a
+  bad buffer and a node's refusal (TCP already answered
+  `LENGTH_MISMATCH`). A transport now reports a stored length with a
+  refusal only when it refused the value for its size. The plain calls and
+  hits are unchanged; only the `*_st` codes move from 5 to 8 for this case,
+  and every caller of them treats the two codes alike (a miss) except the
+  HiCache heal above.
 
 - Server: `SIGHUP` reloads `DFKV_TENANT_QUOTAS_FILE`; new limits apply from
   the next PUT, and a file that does not parse keeps the old quotas (WARN).

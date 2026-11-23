@@ -531,6 +531,7 @@ SGLang HiCache插件另导出：
 | `dfkv_hicache_exist_contiguous_pages_total{tp_rank}` | counter | 从首页开始连续、可供SGLang使用的page总数 |
 | `dfkv_hicache_parallel_context_fallbacks_total{tp_rank}` | counter | 创建存储后端时读不到 SGLang parallel context、存储坐标改取自 `HiCacheStorageConfig` 或默认值的次数（每个存储后端记 1）。当前 SGLang 上应为 0；非 0 的 rank 按 `tp_rank` 选举 MLA 写入者，启动日志里有各坐标的来源 |
 | `dfkv_hicache_host_writes_while_device_direct_pages_total{tp_rank}` | counter | 主 KV 以 device-direct 形态存储时，`batch_set_v1` 以 host 形态写入的页数（controller 在注册 device pool 之后退回 host 路径，例如混合模型 sidecar 注册失败）。这些页存在裸 key 下，device 形态的存在性探测查不到；写入照常进行，首次打一条 WARNING。正常应为 0 |
+| `dfkv_hicache_length_mismatch_keys_total{tp_rank}` | counter | 读到存储长度与本进程不同的 key 数。每个 key 每个进程只改写（REMOVE 后 PUT）一次，之后只计数；持续上涨说明两种布局的实例共享一个 namespace，需要不同的 `model_revision` 或 `bind_runtime_layout`（见 CONNECTORS.md §2.2） |
 | `dfkv_hicache_exist_seconds{tp_rank}` | histogram | connector整次`batch_exists`耗时 |
 
 `present_pages - contiguous_pages`直接表达“后页存在但前缀有洞”；不要用

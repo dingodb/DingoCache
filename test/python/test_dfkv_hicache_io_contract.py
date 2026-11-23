@@ -1517,5 +1517,207 @@ class PoolDcpCrossCheck(unittest.TestCase):
         st._check_pool_dcp(_DcpPool(1), "pool")
 
 
+class _WriteOnceStore(_ObjectStore):
+    """libdfkv as the nodes behave: a PUT of a present key keeps the stored
+    value; an exact GET of a key stored with another length reports
+    LENGTH_MISMATCH; REMOVE drops a key. Keys in `refused` read INVALID,
+    as under this process's block bound or a node's refusal."""
+
+    def __init__(self):
+        super().__init__()
+        self.removed = []
+        self.refused = set()
+
+    def dfkv_batch_put(self, _h, karr, klens, _parr, sarr, n, out):
+        for i in range(n):
+            self.objects.setdefault(self._key(karr, klens, i), sarr[i])
+            out[i] = 1
+        return 0
+
+    def dfkv_batch_get_st(self, _h, karr, klens, _parr, sarr, n, out, st):
+        for i in range(n):
+            have = self.objects.get(self._key(karr, klens, i))
+            out[i] = int(have == sarr[i])
+            st[i] = (0 if out[i] else 1 if have is None else 8)
+            if self._key(karr, klens, i) in self.refused:
+                out[i], st[i] = 0, 5
+        return 0
+
+    def dfkv_batch_remove(self, _h, karr, klens, n, out):
+        for i in range(n):
+            key = self._key(karr, klens, i)
+            self.removed.append(key)
+            out[i] = int(self.objects.pop(key, None) is not None)
+        return 0
+
+
+class LengthMismatchHeal(unittest.TestCase):
+    """HIC-26: a key stored with another length than this process reads was
+    reported present by the backup's existence gate and never rewritten, so
+    the page was recomputed on every read. It is now rewritten once per key
+    per process; later mismatches of that key are only counted."""
+
+    def _plugin(self, store, gate=True):
+        st = _plugin(is_mla=False, _lib=store, transport_mode="tcp",
+                     _backup_exist_gate=gate, _put_retry_recovered=0,
+                     _registered_regions=set(), _bind_runtime_layout=False)
+        st.register_mem_pool_host(_HostPool(components=2, nbytes=4096))
+        return st
+
+    def _poison(self, store, st, size=2048):
+        for key in st._keys("page"):
+            store.objects[key] = size
+
+    def test_a_key_of_another_length_is_rewritten_by_the_next_backup(self):
+        for size in (2048, 8192):  # shorter and larger than the read
+            for gate in (True, False):
+                with self.subTest(size=size, gate=gate):
+                    store = _WriteOnceStore()
+                    st = self._plugin(store, gate)
+                    self._poison(store, st, size)
+                    self.assertEqual(st.batch_get_v1(["page"], [0]), [False])
+                    self.assertEqual(st.batch_set_v1(["page"], [0]), [True])
+                    self.assertEqual(st.batch_get_v1(["page"], [0]), [True])
+                    self.assertEqual(sorted(store.removed),
+                                     sorted(st._keys("page")))
+
+    def test_a_key_is_rewritten_once_then_only_counted(self):
+        store = _WriteOnceStore()
+        st = self._plugin(store)
+        with self.assertLogs(dfkv_hicache._log, "WARNING") as logs:
+            for _round in range(3):
+                # Another layout writes its object back each round.
+                self._poison(store, st)
+                self.assertEqual(st.batch_get_v1(["page"], [0]), [False])
+                st.batch_set_v1(["page"], [0])
+        self.assertEqual(len(store.removed), 2)  # k and v, once
+        self.assertEqual(st._metrics._c.get("length_mismatch_keys", 0), 6)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("model_revision", logs.output[0])
+
+    def test_an_invalid_read_never_removes(self):
+        # INVALID is no evidence of a stored length: this process's block
+        # bound, a bad buffer or a node's refusal answer it too.
+        store = _WriteOnceStore()
+        st = self._plugin(store)
+        st.batch_set_v1(["page"], [0])
+        store.refused.update(st._keys("page"))
+        self.assertEqual(st.batch_get_v1(["page"], [0]), [False])
+        st.batch_set_v1(["page"], [0])
+        self.assertEqual(store.removed, [])
+        self.assertEqual(st._metrics._c.get("length_mismatch_keys", 0), 0)
+
+    def test_a_key_corrected_or_gone_before_the_backup_is_not_removed(self):
+        for fix in ("rewritten", "removed", "now_refused"):
+            with self.subTest(fix=fix):
+                store = _WriteOnceStore()
+                st = self._plugin(store)
+                self._poison(store, st)
+                self.assertEqual(st.batch_get_v1(["page"], [0]), [False])
+                for key in st._keys("page"):
+                    if fix == "rewritten":
+                        store.objects[key] = 4096
+                    elif fix == "removed":
+                        del store.objects[key]
+                    else:
+                        store.refused.add(key)
+                st.batch_set_v1(["page"], [0])
+                self.assertEqual(store.removed, [])
+
+    def test_the_reread_goes_through_one_bounded_scratch_buffer(self):
+        class Recording(_WriteOnceStore):
+            def __init__(self):
+                super().__init__()
+                self.reads = []
+
+            def dfkv_batch_get_st(self, h, karr, klens, parr, sarr, n, out, st):
+                self.reads.append([(parr[i], sarr[i]) for i in range(n)])
+                return super().dfkv_batch_get_st(
+                    h, karr, klens, parr, sarr, n, out, st)
+
+        store = Recording()
+        st = self._plugin(store)
+        st._HEAL_REREAD_BYTES = 4096   # one 4096-byte object per chunk
+        self._poison(store, st)        # k and v, 4096 bytes each
+        st.batch_get_v1(["page"], [0])
+        del store.reads[:]
+        st.batch_set_v1(["page"], [0])
+        self.assertEqual(len(store.reads), 2, "two chunks")
+        spans = {ptr for chunk in store.reads for ptr, _size in chunk}
+        self.assertEqual(len(spans), 1, "the same scratch buffer")
+        self.assertNotEqual(spans, {0x1000}, "not the write's source")
+        self.assertEqual(len(store.removed), 2)
+
+    def test_a_present_key_of_the_right_length_is_not_touched(self):
+        store = _WriteOnceStore()
+        st = self._plugin(store)
+        st.batch_set_v1(["page"], [0])
+        self.assertEqual(st.batch_get_v1(["page"], [0]), [True])
+        st.batch_set_v1(["page"], [0])
+        self.assertEqual(store.removed, [])
+        self.assertEqual(st._metrics._c.get("length_mismatch_keys", 0), 0)
+
+    def test_side_pool_read_heals_too(self):
+        store = _WriteOnceStore()
+        st = self._plugin(store)
+        st._pool_component_names = {"state": ("all",)}
+        st._pool_replicated = {"state": False}
+        st.registered_pools = {"state": _HostPool(components=1, nbytes=512)}
+        tr = types.SimpleNamespace(name="state", keys=["page"],
+                                   host_indices=[0])
+        for key in st._pool_keys("state", "page"):
+            store.objects[key] = 100
+        self.assertEqual(st._v2_io([tr], putting=False)[0]["state"], [False])
+        st._v2_io([tr], putting=True)
+        self.assertEqual(st._v2_io([tr], putting=False)[0]["state"], [True])
+
+    def test_device_read_of_another_length_heals_the_device_write(self):
+        class SgStore(_WriteOnceStore):
+            def dfkv_batch_put_sg(self, _h, karr, klens, _p, sarr, nb, n, out):
+                for i in range(n):
+                    size = sum(sarr[i][j] for j in range(nb[i]))
+                    self.objects.setdefault(self._key(karr, klens, i), size)
+                    out[i] = 1
+                return 0
+
+            def dfkv_batch_get_auto_sg_st(self, _h, karr, klens, _p, carr,
+                                          nb, n, hit, length, st):
+                for i in range(n):
+                    cap = sum(carr[i][j] for j in range(nb[i]))
+                    have = self.objects.get(self._key(karr, klens, i))
+                    ok = have is not None and have <= cap
+                    hit[i], length[i] = int(ok), have if ok else 0
+                    st[i] = 0 if ok else 1 if have is None else 8
+                    if self._key(karr, klens, i) in self.refused:
+                        hit[i], length[i], st[i] = 0, 0, 5
+                return 0
+
+            def dfkv_batch_get_auto_sg(self, *args):
+                return self.dfkv_batch_get_auto_sg_st(
+                    *args, (ctypes.c_uint8 * args[6])())
+
+        for stored in (100, 1000):  # shorter (a short hit) and larger
+            with self.subTest(stored=stored):
+                store = SgStore()
+                st = self._plugin(store)
+                key = b"group-0"
+                store.objects[key] = stored
+                with unittest.mock.patch.object(dfkv_hicache, "_gpu_load_fence"):
+                    hits, lens = st._batch_get_sg([key], [[0x1000]], [[512]])
+                self.assertFalse(hits[0] == 1 and lens[0] >= 512)
+                st._put_sg_flat_impl([key], [[0x1000]], [[512]])
+                self.assertEqual(store.objects[key], 512)
+                self.assertEqual(store.removed, [key])
+        with self.subTest(stored="refused"):
+            store = SgStore()
+            st = self._plugin(store)
+            store.objects[key] = 512
+            store.refused.add(key)
+            self.assertEqual(st._batch_get_sg([key], [[0x1000]], [[512]]),
+                             ([0], [0]))
+            st._put_sg_flat_impl([key], [[0x1000]], [[512]])
+            self.assertEqual(store.removed, [])
+
+
 if __name__ == "__main__":
     unittest.main()

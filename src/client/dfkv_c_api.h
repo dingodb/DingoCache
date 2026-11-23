@@ -110,11 +110,12 @@ enum {
   DFKV_ST_CACHE_FULL = 2,
   DFKV_ST_QUOTA_EXCEEDED = 3,
   DFKV_ST_IO_ERROR = 4,            // transport or node I/O error, timeout
-  DFKV_ST_INVALID = 5,             // refused by the node or transport, also a
-                                   // stored value larger than the destination
+  DFKV_ST_INVALID = 5,             // refused by the node or transport
   DFKV_ST_RESOURCE_EXHAUSTED = 6,  // this process's transport budget
   DFKV_ST_NO_COMPATIBLE_RAIL = 7,  // no healthy rail shared with the node
-  DFKV_ST_LENGTH_MISMATCH = 8,     // stored shorter than an exact read asks
+  DFKV_ST_LENGTH_MISMATCH = 8,     // stored with another length: shorter
+                                   // than an exact read asks, or larger than
+                                   // the destination
   DFKV_ST_PEER_COOLING = 9,        // node in cooldown after failures; not sent
   DFKV_ST_NO_ROUTE = 10,           // no owner: empty ring, or no address
   DFKV_ST_BAD_ARGUMENT = 11        // invalid key, buffer or size; not sent
