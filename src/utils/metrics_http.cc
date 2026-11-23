@@ -135,6 +135,11 @@ void MetricsHttpServer::ReapDoneLocked() {
   }
 }
 
+size_t MetricsHttpServer::OpenConnectionDescriptors() {
+  std::lock_guard<std::mutex> lk(conn_mu_);
+  return conn_fds_.size();
+}
+
 size_t MetricsHttpServer::live_conn_count() {
   std::lock_guard<std::mutex> lk(conn_mu_);
   return conns_.size();
@@ -177,9 +182,14 @@ void MetricsHttpServer::AcceptLoop() {
           Handle(fd, accepted_at);
           active_connections_.fetch_sub(1, std::memory_order_relaxed);
           // Taken only after the accept loop, which holds conn_mu_ across the
-          // thread start, has recorded this fd.
-          { std::lock_guard<std::mutex> lk(conn_mu_); conn_fds_.erase(fd); }
-          ::close(fd);
+          // thread start, has recorded this fd. Closed under the lock too:
+          // Stop() shuts down only descriptors still recorded, and a test
+          // can tell when none of them is left.
+          {
+            std::lock_guard<std::mutex> lk(conn_mu_);
+            conn_fds_.erase(fd);
+            ::close(fd);
+          }
           done->store(true, std::memory_order_release);  // last act
         })) {
       active_connections_.fetch_sub(1, std::memory_order_relaxed);

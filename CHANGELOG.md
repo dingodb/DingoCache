@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Tests: `MetricsHttp.DescriptorExhaustionBacksOffAndRecovers` no longer
+  waits for the lowest free descriptor number to come back after the queued
+  scrape, which other descriptors of the process can move (it failed once
+  on CI after waiting out its 3 s); it waits until the server has closed
+  every descriptor it accepted. The metrics server now closes a
+  connection's descriptor under the lock that removes it from its records.
 - Client, RDMA: ENOMEM while building an endpoint no longer fails the
   operation at once as if the process were out of memory. It may be the
   device's own limit on QPs or CQs (RLIMIT_MEMLOCK is the process-wide
