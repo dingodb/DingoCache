@@ -3,6 +3,16 @@
 ## Unreleased
 
 
+- Client, batch PUT over RDMA: a node's keys go out in shards, as the
+  scatter-gather PUT and the reads do (`DFKV_READ_SHARD_KEYS`,
+  `DFKV_READ_MAX_CONNS`), instead of all on one connection; and a transport
+  that answers for fewer keys than it was given fails the rest instead of
+  reading past its answer. Measured over RDMA, 1024 values of 256 KiB to one
+  node: 0.74-0.95 GB/s on one connection, 3.6-3.9 GB/s sharded. As with
+  the scatter-gather PUT, copies of one key in one batch can now go out on
+  different connections, so which copy a node keeps no longer follows the
+  batch order.
+
 - Server, RDMA: a capability probe gives its pending-handshake slot back
   before it answers. It held it until its thread returned, so at the
   `DFKV_RDMA_MAX_PENDING_HANDSHAKES` limit the client's bootstrap, sent as

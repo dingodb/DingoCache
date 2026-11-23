@@ -1255,7 +1255,11 @@ std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items,
     if (node.empty()) continue;
     by_node[node].push_back(i);
   }
-  std::vector<std::pair<std::string, std::vector<size_t>>> groups(by_node.begin(), by_node.end());
+  // Shard each node's group as BatchPutSg does: one connection would drain a
+  // large group key by key.
+  std::vector<std::pair<std::string, std::vector<size_t>>> groups =
+      ShardReadGroups(std::vector<std::pair<std::string, std::vector<size_t>>>(
+          by_node.begin(), by_node.end()));
   RunParallel(groups.size(), BatchWorkers(groups.size()), [&](size_t g) {
     const std::string& node = groups[g].first;
     const std::vector<size_t>& idx = groups[g].second;
@@ -1272,8 +1276,10 @@ std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items,
                               items[k].value, items[k].n});
     std::vector<Status> sts = t_->CacheFrom(node, srcs);
     for (size_t m = 0; m < idx.size(); ++m) {
-      ok[idx[m]] = (sts[m] == Status::kOk) ? 1 : 0;
-      if (st) st[idx[m]] = ToItemStatus(sts[m]);
+      // A transport that answered for fewer keys stored none of the rest.
+      const Status s = m < sts.size() ? sts[m] : Status::kInvalid;
+      ok[idx[m]] = (s == Status::kOk) ? 1 : 0;
+      if (st) st[idx[m]] = ToItemStatus(s);
       if (ok[idx[m]]) InvalidateRendezvous(srcs[m].key);
     }
     ReportPeer(node, sts);
