@@ -2520,7 +2520,7 @@ struct PinnedPullPeer {
   void Close() { endpoint.reset(); }
   template <typename Node>
   bool Open(const Node& node, size_t depth = 1, bool legacy = false,
-            uint64_t declared = kMaxMsg) {
+            uint64_t declared = kMaxMsg, uint64_t extra_flags = 0) {
     const auto& dev = node.rsrv->DeviceNames().front();
     if (!ep.Open(dev.c_str(), rdma::kV2ControlCap, depth)) return false;
     int fd = net::Dial(node.addr, 10000, 10000);
@@ -2532,7 +2532,8 @@ struct PinnedPullPeer {
     rdma::EncodeDevFrame(dev, declared |
         (legacy ? rdma::kDevFrameRequestWriterRetirement :
                   rdma::kDevFrameRequestDynamicOnly) |
-        rdma::kDevFrameRequestPullRead | rdma::kDevFrameRequestDynamicPull,
+        rdma::kDevFrameRequestPullRead | rdma::kDevFrameRequestDynamicPull |
+        extra_flags,
         frame, rdma::kDevProtoV2);
     auto info = ep.Local();
     info.depth = depth;
@@ -3432,6 +3433,45 @@ TEST(RdmaLoopback, PressureEvictsAConnectionThatNeverSentARequest) {
     EXPECT_EQ(bytes, value);
     EXPECT_TRUE(requester.Release(key, ready));
   }
+}
+
+// RDS-16: a leased PUT's lease slot is its own index space (the immediate
+// its windows carry), not the receive slot its request happened to land in.
+// Two leases granted on a depth-2 connection, their windows not yet sent:
+// the next request lands in the first receive slot again, which is the first
+// lease's slot. That dropped the connection; it is now answered, kCacheFull
+// while no lease slot is free.
+TEST(RdmaLoopback, ALeaseRequestLandingOnABusyLeaseSlotIsAnswered) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "0");
+  RdmaNode node("lease-slot-space");
+  PinnedPullPeer peer;
+  ASSERT_TRUE(peer.Open(node, 2, false, kMaxMsg,
+                        rdma::kDevFrameRequestLeasedPut));
+  auto lease_request = [&](size_t send_slot, uint64_t id) {
+    EncodeReqVersion(peer.ep.sbuf(send_slot), kNativeProtoRdmaV2,
+                     WireOp::kLeasePut, BlockKey{90401, id}, 0, 0, 8192);
+    return kReqPrefix;
+  };
+  std::vector<Status> statuses;
+  ASSERT_TRUE(peer.Pipeline({lease_request(0, 1), lease_request(1, 2)},
+                            &statuses));
+  ASSERT_EQ(statuses[0], Status::kOk);
+  ASSERT_EQ(statuses[1], Status::kOk);
+  rdma::LeasePutReady first, second;
+  ASSERT_TRUE(rdma::DecodeLeasePutReady(peer.ep.rbuf(0) + kRespPrefix, &first));
+  ASSERT_TRUE(rdma::DecodeLeasePutReady(peer.ep.rbuf(1) + kRespPrefix, &second));
+  EXPECT_NE(first.slot, second.slot);
+  ASSERT_TRUE(peer.Pipeline({lease_request(0, 3)}, &statuses))
+      << "the connection was dropped";
+  EXPECT_EQ(statuses[0], Status::kCacheFull);
+  // And it keeps serving.
+  EncodeReqVersion(peer.ep.sbuf(0), kNativeProtoRdmaV2, WireOp::kExist,
+                   BlockKey{90401, 9}, 0, 0, 0);
+  Status status = Status::kIOError;
+  uint64_t bytes = 0;
+  EXPECT_TRUE(peer.Exchange(kReqPrefix, &status, &bytes));
+  EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
 }
 
 void ExercisePressureRefusesOnlyBusyQps(bool use_uring) {

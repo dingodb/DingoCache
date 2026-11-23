@@ -1330,9 +1330,9 @@ void RdmaServer::Serve(
       // or more WRITE_WITH_IMM windows into the leased range, so this request
       // only needs to prove the slot has no in-flight lease/multi-window
       // state. An object larger than --max-msg is answered kInvalid.
-      if (!leased_put_requested ||
-          request->fields.payload_len == 0 ||
-          lease_put[recv_slot].active || multi_put[recv_slot].active)
+      // Which lease slot it gets is build_reply's choice, among the slots
+      // free in the data-slot (immediate) space the windows will name.
+      if (!leased_put_requested || request->fields.payload_len == 0)
         return false;
       return true;
     }
@@ -1342,8 +1342,9 @@ void RdmaServer::Serve(
 
 
 
-    if (multi_put[recv_slot].active) return false;
-
+    // A control op arrives in a receive buffer of its own: a multi-window
+    // PUT in progress (named by data slot, a different index space) does not
+    // concern it.
     // Other control ops (Exist/Remove/Members/Lookup) with inline payload
     if (completion.byte_len <
         kReqPrefix + request->fields.payload_len) {
@@ -1591,7 +1592,6 @@ void RdmaServer::Serve(
       // the bytes, so the hard budget bounds data in flight, not
       // connections. A failed allocation is backpressure, not a fault: the
       // client treats kCacheFull like a saturated pull slot and may retry.
-      const size_t slot = request.recv_slot;
       const uint64_t want = fields.payload_len;
       // An object this server will never take is a final answer to the
       // client, not a fault of the connection: dropping the connection
@@ -1616,6 +1616,25 @@ void RdmaServer::Serve(
       }
       const size_t region = rdma::V2SlotSize(want);
       if (region == 0) return false;
+      // The lease's slot is what its windows will name in their immediate,
+      // the data-slot space a resident multi-window PUT uses too: one free
+      // in both. The receive slot's own number when it is free (as before),
+      // else the first free one; none free is backpressure, not a fault.
+      auto lease_slot_free = [&](size_t d) {
+        return !lease_put[d].active && !multi_put[d].active;
+      };
+      size_t slot = request.recv_slot;
+      if (!lease_slot_free(slot)) {
+        slot = K;
+        for (size_t d = 0; d < K && slot == K; ++d)
+          if (lease_slot_free(d)) slot = d;
+      }
+      if (slot == K) {
+        lease_put_busy_rejects_.fetch_add(1, std::memory_order_relaxed);
+        encode_status(Status::kCacheFull, 0);
+        reply->first_len = response_prefix;
+        return true;
+      }
       LeasePutState& state = lease_put[slot];
       state.lease = AllocateReceiveWithPressure(
           region, static_cast<int>(rail_index), rail_numa, 1000000,
