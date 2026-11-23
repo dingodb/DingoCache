@@ -652,7 +652,9 @@ class DfkvConnector(RemoteConnector):
     async def ping(self) -> int:
         with access_log("ping", lambda: "") as r:
             try:
-                self._client.ping_sync()
+                # Off the event loop: the probe waits up to its timeout.
+                await asyncio.get_running_loop().run_in_executor(
+                    None, self._client.ping_sync)
                 r.result = "ok"
                 return 0
             except Exception as e:

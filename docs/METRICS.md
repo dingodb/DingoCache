@@ -634,6 +634,10 @@ peer health counter。
 逐 peer 延迟由 C++ 主动探测（`DFKV_PROBE_INTERVAL_MS`）：SGLang HiCache 开
 metrics 时自动启用；vLLM/LMCache 需显式配置非零 interval。
 
+LMCache 的健康 ping 每次 GET 8 个哨兵 key（`dfkv-ping/0..7`，各 1 字节、只读），
+所以每次 ping 在客户端和节点的 GET 计数（含 miss）与访问日志里各多 8 次未命中；
+看 GET 命中率时按 LMCache 的 ping 频率扣除。
+
 ### 3.5 vLLM 本地客户端指标（`dfkv-vllm` `/metrics`，pull）
 vLLM 的 `DFKV_CLIENT_STATS_POLL_S`（默认 15s，0=关）镜像 §3.3 中**全部**
 allow-listed counter/gauge，而不是只镜像 ring/MDS。名称固定为

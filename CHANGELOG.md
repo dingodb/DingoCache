@@ -3,6 +3,22 @@
 ## Unreleased
 
 
+- LMCache: the health ping asks the ring. `ping` only checked that the
+  client handle was open, so a ring with every node down or hung answered as
+  healthy. It now GETs eight sentinel keys (one byte, no write; a node only
+  looks them up) and needs one node's answer within 2 s; a probe still
+  running is waited for by the next ping, not repeated, and the ping runs
+  off the event loop. Measured on a two-node ring: a live ring answers in
+  under 1 ms (about 12 ms on a fresh RDMA connection), a killed one fails in
+  under 1 ms on TCP and within the timeout on RDMA, and a hung one
+  (processes stopped, natively 10 to 51 s per call) within the timeout. The
+  retention-limits call was the other candidate; it answers from what it
+  learned at the first contact and kept reporting a dead ring as supported.
+  Each ping adds eight GET misses to the client's and the nodes' GET
+  counters and access logs. `close()` waits at most 5 s for a probe still
+  in the native call; past that it logs a WARNING and leaves the native
+  client open rather than close it under the call.
+
 - vLLM connector and LMCache L2 adapter: a misspelt identity key fails
   startup. A `kv_connector_extra_config` key one or two characters away from
   `model_revision`, `require_model_revision`, `share_across_dp_sizes`,

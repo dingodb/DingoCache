@@ -336,6 +336,11 @@ if(DFKV_BUILD_TESTS)
               ${CMAKE_CURRENT_SOURCE_DIR}/integration/lmcache/tests/test_get_cancel.py)
     set_tests_properties(python_lmcache_get_cancel PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
+    add_test(NAME python_lmcache_ping
+      COMMAND ${PYTHON3}
+              ${CMAKE_CURRENT_SOURCE_DIR}/integration/lmcache/tests/test_ping.py)
+    set_tests_properties(python_lmcache_ping PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/integration/common/src")
     add_test(NAME python_lmcache_exists_cache
       COMMAND ${PYTHON3}
               ${CMAKE_CURRENT_SOURCE_DIR}/integration/lmcache/tests/test_exists_cache.py)
