@@ -52,6 +52,18 @@ got=$("$BUILD/dfkvctl" --members "n=127.0.0.1:$P" --namespace "dfkv/smoke" get k
 [ "$got" = "v12345" ] || { echo "get mismatch: '$got'"; exit 1; }
 "$BUILD/dfkvctl" --members "n=127.0.0.1:$P" --namespace "dfkv/smoke" exist k | grep -q true
 "$BUILD/dfkvctl" stat "127.0.0.1:$P" | grep -q dfkv_cache_put_total
+# locate and rm; an unknown option is refused, --help is usage.
+"$BUILD/dfkvctl" --members "n=127.0.0.1:$P" locate k | grep -qx "127.0.0.1:$P"
+"$BUILD/dfkvctl" --members "n=127.0.0.1:$P" --namespace "dfkv/smoke" put gone v
+"$BUILD/dfkvctl" --members "n=127.0.0.1:$P" --namespace "dfkv/smoke" rm gone | grep -qx OK
+rc=0; "$BUILD/dfkvctl" --members "n=127.0.0.1:$P" --namespace "dfkv/smoke" exist gone >/dev/null || rc=$?
+[ "$rc" = 1 ] || { echo "dfkvctl exist after rm: expected exit 1, got $rc"; exit 1; }
+"$BUILD/dfkvctl" --members "n=127.0.0.1:$P" --namespace "dfkv/smoke" put dash -- -v
+got=$("$BUILD/dfkvctl" --members "n=127.0.0.1:$P" --namespace "dfkv/smoke" get dash)
+[ "$got" = "-v" ] || { echo "value after --: '$got'"; exit 1; }
+rc=0; "$BUILD/dfkvctl" --bogus ring >/dev/null 2>&1 || rc=$?
+[ "$rc" = 2 ] || { echo "dfkvctl --bogus: expected exit 2, got $rc"; exit 1; }
+"$BUILD/dfkvctl" --help | grep -q "locate <key>"
 echo "tool_smoke OK (port $P)"
 
 # SIGTERM: the server must report its disks clean before it exits, exit 0,

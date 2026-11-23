@@ -2,7 +2,9 @@
  * Usage: dfkv_smoke --members "n1=ip:port,n2=ip:port" [--size BYTES]
  * Exit 0 = OK, non-zero = failure. No GPU/RDMA needed. */
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -28,6 +30,10 @@ static std::vector<std::pair<std::string, std::string>> ParseMembers(const std::
 
 int main(int argc, char** argv) {
   if (WantsVersion(argc, argv)) { std::printf("dfkv_smoke %s\n", Version()); return 0; }
+  // A one-shot tool shares nothing with other processes: same-host dedup
+  // would only create (and, with its last user, remove) a 516 MiB segment.
+  ::unsetenv("DFKV_CLIENT_NODE_DEDUP");
+  ::unsetenv("DFKV_CLIENT_NODE_DEDUP_GPU");
   std::string members;
   size_t size = 4096;
   for (int i = 1; i + 1 < argc; i += 2) {
@@ -43,13 +49,42 @@ int main(int argc, char** argv) {
   // Salt the key with the payload size: on a persistent write-once ring, a
   // fixed key re-probed with a different --size read back the OLD payload and
   // reported a spurious data mismatch (bench avoids the same trap via pid+size).
-  const std::string key = "dfkv-smoke-key-" + std::to_string(size);
-
-  if (!c.Put(key, v.data(), v.size())) { std::fprintf(stderr, "PUT failed\n"); return 1; }
-  if (!c.Exist(key)) { std::fprintf(stderr, "EXIST failed\n"); return 1; }
-  std::string out(size, '\0');
-  if (!c.Get(key, &out[0], out.size())) { std::fprintf(stderr, "GET miss\n"); return 1; }
-  if (out != v) { std::fprintf(stderr, "GET data mismatch\n"); return 1; }
-  std::printf("dfkv smoke OK (%zu nodes, %zu bytes)\n", mem.size(), size);
+  // One key per member (not one key for the whole ring): find, for each
+  // address, a key the ring routes to it.
+  std::map<std::string, std::string> keys;  // address -> key
+  const std::vector<std::string> addresses = c.MemberAddresses();
+  for (size_t i = 0; keys.size() < addresses.size() &&
+                     i < 256 * addresses.size() + 1024;
+       ++i) {
+    std::string key =
+        "dfkv-smoke-key-" + std::to_string(size) + "-" + std::to_string(i);
+    const std::string owner = c.OwnerOf(key);
+    if (!owner.empty()) keys.emplace(owner, std::move(key));
+  }
+  if (keys.size() != addresses.size()) {
+    std::fprintf(stderr, "no key found for %zu of %zu nodes\n",
+                 addresses.size() - keys.size(), addresses.size());
+    return 1;
+  }
+  for (const auto& [node, key] : keys) {
+    if (!c.Put(key, v.data(), v.size())) {
+      std::fprintf(stderr, "PUT failed on %s\n", node.c_str());
+      return 1;
+    }
+    if (!c.Exist(key)) {
+      std::fprintf(stderr, "EXIST failed on %s\n", node.c_str());
+      return 1;
+    }
+    std::string out(size, '\0');
+    if (!c.Get(key, &out[0], out.size())) {
+      std::fprintf(stderr, "GET miss on %s\n", node.c_str());
+      return 1;
+    }
+    if (out != v) {
+      std::fprintf(stderr, "GET data mismatch on %s\n", node.c_str());
+      return 1;
+    }
+  }
+  std::printf("dfkv smoke OK (%zu nodes, %zu bytes)\n", keys.size(), size);
   return 0;
 }
