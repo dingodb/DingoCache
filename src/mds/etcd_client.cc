@@ -21,7 +21,8 @@ std::string PrefixRangeEnd(const std::string& prefix) {
 }  // namespace
 
 constexpr const char* kOpNames[] = {
-    "lease_grant", "lease_keepalive", "put", "range", "metrics_range", "get"};
+    "lease_grant", "lease_keepalive", "put", "range", "metrics_range", "get",
+    "delete"};
 
 bool EtcdClient::Post(Op op, const std::string& path, const std::string& body,
                       HttpResponse* response) {
@@ -38,7 +39,8 @@ bool EtcdClient::Post(Op op, const std::string& path, const std::string& body,
     errors_[i].fetch_add(1, std::memory_order_relaxed);
     NoteFailure(op, transported, *response);
   }
-  if (op == Op::kLeaseGrant || op == Op::kLeaseKeepAlive || op == Op::kPut) {
+  if (op == Op::kLeaseGrant || op == Op::kLeaseKeepAlive || op == Op::kPut ||
+      op == Op::kDelete) {
     last_write_attempt_ms_.store(NowMs(), std::memory_order_relaxed);
     if (ok) {
       write_failing_since_ms_.store(0, std::memory_order_relaxed);
@@ -203,6 +205,12 @@ std::optional<KeyState> EtcdClient::Get(const std::string& key) {
     out.lease = std::strtoll(kv.get_str("lease", "0").c_str(), nullptr, 10);
   }
   return out;
+}
+
+bool EtcdClient::Delete(const std::string& key) {
+  HttpResponse r;
+  const std::string body = "{\"key\":\"" + Base64Encode(key) + "\"}";
+  return Post(Op::kDelete, "/v3/kv/deleterange", body, &r);
 }
 
 std::optional<RangeResult> EtcdClient::RangePrefix(

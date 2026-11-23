@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- MDS and dfkvctl: one step takes a node out of the ring, behind
+  `DFKV_MDS_FENCING=1` (off by default; it adds `/fenced/<id>` records to
+  the etcd layout, and every MDS of the group needs it).
+  `dfkvctl member fence <id> --mds <eps> --group <g>` writes a fence record
+  without a lease and deletes the node's member record: clients drop it at
+  their next poll, its registers and heartbeats are refused (node log
+  `is fenced`, `dfkv_mds_fenced 1`) while it keeps running, and member lists
+  leave it out, until `dfkvctl member unfence <id>`; `dfkvctl member fenced`
+  lists them. It took three steps (change the ring, stop the process,
+  disable it), as a running or restarted node registered again within 10 s.
+  Fence and unfence are unauthenticated, as registration is. With fencing a
+  heartbeat may take five etcd requests, so the registrar's default I/O
+  timeout is now 11 s.
 - MDS: member lists are reused for `DFKV_MDS_LIST_CACHE_MS` (default
   500 ms, 0 = read etcd on every poll), and polls of one group that arrive
   while one is reading etcd wait for that read instead of each starting
