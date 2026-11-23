@@ -725,11 +725,11 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | `DFKV_RDMA_RAIL_CREDITS` | 默认 `64`, 硬上限 4096 | client：每 rail outstanding request credits |
 | `DFKV_RDMA_RAIL_TIERS` | unset = homogeneous | client：异构带宽 tier `a|b;c`，只在最高健康 tier 内选轨，不因 credit/quarantine 溢出到低 tier |
 | `DFKV_RDMA_PRIMARY_DEV` | unset | client：必须属于 `DFKV_RDMA_DEV`；所有 operation 优先该 rail，仅在不可准入/失败时使用其余 configured rail |
-| `DFKV_RDMA_RAIL_BACKPRESSURE_MS` | `10` | client：Acquire 失败重试 backoff |
-| `DFKV_RDMA_RAIL_COOLDOWN_MS` | `5000` | client-local rail quarantine 冷却期；冷却期间不准入，期满仅允许 1 个真实 operation 作为 recovery probe |
+| `DFKV_RDMA_RAIL_BACKPRESSURE_MS` | `200`（不超过 `DFKV_RDMA_OP_TIMEOUT_MS`） | client：一个逻辑操作等待 rail credit 的总预算，按操作计而不是按尝试计：其所有尝试（重试、换 rail、逐 rail 选择）共用这 200 ms，从该操作第一次准入算起；用完返回 `kResourceExhausted`。等待期间 NUMA 本地与非本地 rail 谁先空出就用谁，本地仍优先（此前默认每次准入各等 10 ms，只等本地 rail） |
+| `DFKV_RDMA_RAIL_COOLDOWN_MS` | `5000` | client-local rail quarantine 冷却期；冷却期间不准入。期满后由后台线程（keepalive/端口检查线程，默认开启）在该 rail 上对已连接过的节点（每次最多试 4 个）发一次 keepalive 作为 recovery probe（建连最长 `DFKV_RDMA_CONNECT_MS`，期间该线程的端口检查和 keepalive 顺延），应用操作只在健康 rail 都没有 credit 时才落到它上面；后台线程没有运行时（keepalive、端口检查都关且无 burst 池）仍由下一个真实 operation 作 probe |
 | `DFKV_RDMA_RAIL_ERROR_THRESHOLD` | `3` | client：连续 `kRailFailure` 达到该值才 quarantine；peer/endpoint、admission、timeout（无 local-error WC）、cancel 和 invalid input 不计入 |
 | client-local rail attempts | 固定 `2`（不可配置） | GET/batch/SG 第二次只重试未完成 item/window；PUT 仅在确认 request 未 post、或所用 pooled QP 自出池后无任何 completion 成功（stale）时重发，其余 post 后 ambiguous failure 不 replay |
-| `DFKV_RDMA_RAIL_LATENCY_WEIGHT` | — | client：rail selection 的延迟 EWMA 权重 |
+| `DFKV_RDMA_RAIL_LATENCY_WEIGHT` | — | client：rail selection 的延迟 EWMA 权重。样本从连接就绪算起（不含建连），超过 64 KiB 的操作按每 64 KiB 折算（固定开销也被折算，承载大对象的 rail 会显得略快）；一条 rail 每 1 s 没有新样本 EWMA 减半，避免一次慢样本让它长期不被选中 |
 | `DFKV_RDMA_RAIL_ERROR_PENALTY_US` | — | client：rail selection 的错误分数惩罚微秒 |
 | `DFKV_RDMA_IDLE_MS` | `600000` | server 常规空闲 QP 超时（毫秒；`0` 禁用）；接收池压力回收另须保护未完成的 reply/READ |
 | `DFKV_RDMA_STOP_DRAIN_MS` | `2000` | 停止时让还持有授权（GET 已发 READY、PUT 已发租约）的连接先做完的上限（毫秒；`0` 不等）。期间新的 GET 答 miss、新的 leased PUT 答 `kCacheFull`（计入 `dfkv_rdma_stop_grants_refused_total`），只等已发出的授权；没有授权的连接立即关闭；握手中的连接立即断开，不再等 bootstrap 的 10 s 截止。到期仍未做完的计入 `dfkv_rdma_stop_drains_cut_total`。它算在停止预算里：和 `DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S`、停请求、各盘同步一起要小于 `TimeoutStopSec` |

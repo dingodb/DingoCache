@@ -3,6 +3,25 @@
 ## Unreleased
 
 
+- Client, RDMA, rail selection:
+  - The wait for rail credits is one budget per operation, its retries
+    and rail changes included: `DFKV_RDMA_RAIL_BACKPRESSURE_MS`, now
+    200 ms by default (at most the operation timeout), counted from the
+    operation's first admission. Before, each admission waited 10 ms on
+    its own, so with one credit per rail and 16 threads 25 to 57 of 320
+    PUTs failed in a run of about 0.1 s; with the 200 ms budget none
+    failed in three runs (0.11-0.17 s). While it waits, a non-local rail
+    that frees serves the operation; local rails still go first.
+  - A rail's latency estimate no longer counts connection setup (about
+    12 ms against 0.2 ms for an operation: the rail that set up second was
+    then left unused for the life of the process), counts operations above
+    64 KiB per 64 KiB, and halves for every second without a sample.
+  - A rail out of its cooldown is probed by the background thread with a
+    keepalive to a node already connected to (up to four are tried), and
+    application operations go to a healthy rail first, local or not;
+    before, the next operation was the probe, ahead of every healthy rail.
+    New `dfkv_rdma_client_rail_background_probes_total`.
+
 - Client, RDMA: a local rail whose port goes down leaves selection. The
   client only checked port state at startup; a port that went down later
   kept being selected, and was given up only through the failures of the

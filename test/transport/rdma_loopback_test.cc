@@ -9578,3 +9578,103 @@ TEST(RdmaPortState, ARailWhosePortGoesDownLeavesSelectionAndComesBack) {
   EXPECT_EQ(put_all("again"), 10);
   EXPECT_GT(on_first(), before) << "the rail did not come back";
 }
+
+// With one credit per rail and 16 threads, operations used to give up after
+// 10 ms of waiting for a credit (25 to 57 of 320 PUTs failed in a run that
+// took about 0.1 s). The wait is now one budget per operation; given enough
+// of it, none fails.
+TEST(RdmaRailAdmission, OperationsWaitForCreditsWithinTheirBudget) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaNode node("rail_admission");
+  ScopedEnv credits("DFKV_RDMA_RAIL_CREDITS", "1");
+  ScopedEnv budget("DFKV_RDMA_RAIL_BACKPRESSURE_MS", "2000");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  std::atomic<int> failed{0};
+  const std::string value(200 << 10, 'x');
+  std::vector<std::thread> threads;
+  for (int t = 0; t < 16; ++t)
+    threads.emplace_back([&, t] {
+      for (int i = 0; i < 20; ++i)
+        if (!c.Put("bp-" + std::to_string(t) + "-" + std::to_string(i),
+                   value.data(), value.size()))
+          ++failed;
+    });
+  for (auto& thread : threads) thread.join();
+  EXPECT_EQ(failed.load(), 0);
+}
+
+// A rail's first latency sample was its connection setup (about 12 ms against
+// 0.2 ms for an operation), which kept that rail unused for good.
+TEST(RdmaRailAdmission, ARailsLatencyExcludesConnectionSetup) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const char* devs = std::getenv("DFKV_RDMA_DEV");
+  const std::string list = devs ? devs : "";
+  const size_t comma = list.find(',');
+  if (comma == std::string::npos)
+    GTEST_SKIP() << "needs DFKV_RDMA_DEV with two rails";
+  RdmaNode node("rail_latency");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  for (int i = 0; i < 8; ++i) {
+    const std::string value = "l" + std::to_string(i);
+    ASSERT_TRUE(c.Put("lat-" + value, value.data(), value.size()));
+  }
+  const std::string text = rt.MetricsText();
+  std::vector<uint64_t> ewma;
+  for (const std::string dev : {list.substr(0, comma), list.substr(comma + 1)}) {
+    EXPECT_GE(RailCounter(text, "dfkv_rdma_client_rail_selections_total", dev),
+              1u) << dev;
+    ewma.push_back(
+        RailCounter(text, "dfkv_rdma_client_rail_latency_ewma_us", dev));
+  }
+  // A relative bound, so a slow build (sanitizers) slows both alike: with
+  // setup counted the two differed some 70 times.
+  const uint64_t low = std::max<uint64_t>(100, std::min(ewma[0], ewma[1]));
+  EXPECT_LT(std::max(ewma[0], ewma[1]), 20 * low)
+      << ewma[0] << " vs " << ewma[1] << " us";
+}
+
+// A rail out of its cooldown is probed by the background thread, not by the
+// next application operation, and comes back without traffic.
+TEST(RdmaRailAdmission, ACooledRailIsProbedInTheBackground) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const char* devs = std::getenv("DFKV_RDMA_DEV");
+  const std::string list = devs ? devs : "";
+  const size_t comma = list.find(',');
+  if (comma == std::string::npos)
+    GTEST_SKIP() << "needs DFKV_RDMA_DEV with two rails";
+  const std::string first = list.substr(0, comma);
+  RdmaNode node("rail_probe");
+  ScopedEnv primary("DFKV_RDMA_PRIMARY_DEV", first.c_str());
+  ScopedEnv threshold("DFKV_RDMA_RAIL_ERROR_THRESHOLD", "1");
+  ScopedEnv cooldown("DFKV_RDMA_RAIL_COOLDOWN_MS", "300");
+  ScopedEnv tick("DFKV_RDMA_PORT_CHECK_MS", "20");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  const auto put = [&](const std::string& key) {
+    return c.Put(key, key.data(), key.size());
+  };
+  ASSERT_TRUE(put("probe-warm"));
+  {
+    // The first attempt of this PUT fails on the first rail as a local
+    // fault: the rail is cooled and the PUT is served by the other one.
+    ScopedEnv inject("DFKV_RDMA_TEST_LOCAL_RAIL_FAILURE_ATTEMPTS", "1");
+    ASSERT_TRUE(put("probe-fail"));
+  }
+  const auto selections = [&] {
+    return RailCounter(rt.MetricsText(),
+                       "dfkv_rdma_client_rail_selections_total", first);
+  };
+  const uint64_t cooled_at = selections();
+  ASSERT_TRUE(WaitForMetric(rt, "dfkv_rdma_client_rail_background_probes_total 1"))
+      << "no background probe";
+  ASSERT_TRUE(WaitForMetric(
+      rt, "dfkv_rdma_client_rail_quarantined{dev=\"" + first + "\"} 0"));
+  EXPECT_EQ(RailCounter(rt.MetricsText(),
+                        "dfkv_rdma_client_rail_recoveries_total", first),
+            1u);
+  EXPECT_EQ(selections(), cooled_at + 1) << "only the probe used the rail";
+  ASSERT_TRUE(put("probe-after"));
+  EXPECT_EQ(selections(), cooled_at + 2);
+}

@@ -176,6 +176,9 @@ class RdmaTransport : public Transport {
     // The rail whose bootstrap the peer closed before replying (device frame
     // sent) on this operation's first attempt.
     std::optional<size_t> busy_closed_rail;
+    // Until when the operation may wait for rail credits, all its Acquires
+    // together; set by the first one (0 = not yet).
+    uint64_t admission_deadline_us = 0;
   };
   struct AcquireOptions {
     bool force_new = false;
@@ -205,6 +208,9 @@ class RdmaTransport : public Transport {
     // only (no descriptor to open another), and without trying again.
     bool pooled_only = false;
     bool local_resource_fallback = true;
+    // How long to wait for rail credits; unset = what is left of the
+    // operation's admission budget (AdmissionWait).
+    std::optional<uint64_t> backpressure_us;
   };
   struct AcquireResult {
     Conn* conn = nullptr;
@@ -236,6 +242,9 @@ class RdmaTransport : public Transport {
   // dialed again (ConfirmRefusal) and charged only if closed again.
   void NoteConnected(const AcquireOptions& options, const std::string& node,
                      const std::string& health_id, size_t rail);
+  // The wait for rail credits this Acquire may take: what is left of the
+  // operation's budget (rail_backpressure_us_ from its first Acquire).
+  uint64_t AdmissionWait(const AcquireOptions& options) const;
   void ConfirmRefusal(const std::string& node, const std::string& health_id,
                       size_t rail);
   // Cools `rail` of the peer for a confirmed refusal unless it is the
@@ -282,6 +291,20 @@ class RdmaTransport : public Transport {
   // Follows each rail's port state: a rail whose port is not ACTIVE is out
   // of selection until it is again (DFKV_RDMA_PORT_CHECK_MS).
   void CheckPorts();
+  // A recovery probe for each rail whose cooldown has elapsed: a keepalive
+  // on that rail to a node this client has connected to, trying up to
+  // kProbeNodes of them. Runs on the keepalive thread; a dial there takes up
+  // to DFKV_RDMA_CONNECT_MS, during which port checks and keepalives wait.
+  void ProbeRails();
+  static constexpr size_t kProbeNodes = 4;
+  // A latency sample per 64 KiB moved, so a rail is not judged by the size
+  // of what it happened to carry. The fixed cost of an operation is divided
+  // too, so a rail that carries large values looks somewhat faster than one
+  // that carries small ones.
+  static uint64_t SampleLatency(uint64_t latency_us, uint64_t bytes) {
+    constexpr uint64_t kUnit = 64 * 1024;
+    return bytes <= kUnit ? latency_us : latency_us * kUnit / bytes;
+  }
   void CompleteRemoteLease(Conn* c, RemoteRailOutcome outcome);
   void RecordRailTransfer(Conn* c, bool put, uint64_t operations,
                           uint64_t bytes);
@@ -424,6 +447,9 @@ class RdmaTransport : public Transport {
   std::vector<uint8_t> port_active_;  // keepalive thread only
   std::atomic<uint64_t> port_down_events_{0};
   std::atomic<uint64_t> rails_port_down_{0};
+  std::atomic<uint64_t> rail_background_probes_{0};
+  std::mutex known_nodes_mu_;
+  std::set<std::string> known_nodes_;  // nodes connected to (ProbeRails)
   std::atomic<bool> keepalive_stop_{false};
   std::condition_variable keepalive_cv_;
   std::mutex keepalive_mu_;
@@ -474,7 +500,9 @@ class RdmaTransport : public Transport {
   // Global least-inflight rail admission with per-rail credits, failure
   // quarantine, recovery probes, and a bounded wait when all credits are busy.
   std::unique_ptr<rdma::RailPolicy> rail_policy_;
-  uint64_t rail_backpressure_us_ = 10'000;
+  // Per operation (DFKV_RDMA_RAIL_BACKPRESSURE_MS, default 200 ms, at most
+  // the operation timeout).
+  uint64_t rail_backpressure_us_ = 200'000;
   // observability (relaxed): connections opened total + per-rail breakdown.
   std::atomic<uint64_t> conns_opened_{0};
   std::atomic<uint64_t> v2_put_writes_{0};
