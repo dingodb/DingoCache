@@ -612,6 +612,23 @@ struct RdmaNode {
 
 bool HaveRdma() { return RdmaTransport::Available(); }
 
+// True when every ACTIVE RDMA device is Soft-RoCE (rxe), as in CI. There, a
+// SEND to a peer QP that was destroyed never completes with an error: no
+// RETRY_EXC within 60 s (CI, rxe over lo), where a ConnectX HCA reports it
+// after about 3.6 s. Tests that wait for that error skip on rxe.
+bool SoftRoceOnly() {
+  const auto discovered = rdma::RdmaTopology::Discover(
+      {}, rdma::RdmaDiscoveryPolicy::kActiveOnly);
+  if (discovered.status != rdma::RdmaDiscoveryStatus::kOk ||
+      discovered.devices.empty())
+    return false;
+  for (const auto& device : discovered.devices)
+    if (device.name.rfind("rxe", 0) != 0) return false;
+  return true;
+}
+constexpr const char* kRxeNoRetryExceeded =
+    "rxe: a SEND to a destroyed peer QP never fails with RETRY_EXC";
+
 // Last value of a single-line Prometheus counter (skips the # HELP/# TYPE lines
 // via rfind, which lands on the value line emitted after them).
 long CounterVal(const std::string& text, const std::string& name) {
@@ -3832,6 +3849,9 @@ TEST(RdmaLoopback, RealFifoOrderWrapSync) {
 
 static void ExerciseQueuedReceiveConnectionClose(bool use_uring) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  // Waits for the server to notice the destroyed client QP; on rxe it did
+  // not within the test's 10 s.
+  if (SoftRoceOnly()) GTEST_SKIP() << kRxeNoRetryExceeded;
 #ifndef DFKV_WITH_URING
   if (use_uring) GTEST_SKIP() << "io_uring not compiled";
 #endif
@@ -5997,6 +6017,7 @@ TEST(RdmaLoopback, StalePooledConnectionOnTheOnlyRailRecoversOnTheRetry) {
 // that have not finished their handshake.
 TEST(RdmaLoopback, FreshConnectionFailingAfterAStaleOneCoolsThePeerRail) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  if (SoftRoceOnly()) GTEST_SKIP() << kRxeNoRetryExceeded;
   ScopedEnv idle_reclaim("DFKV_RDMA_IDLE_MS", "120");
   ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
   ScopedEnv op_timeout("DFKV_RDMA_OP_TIMEOUT_MS", "60000");
@@ -7023,6 +7044,7 @@ TEST(RdmaLoopback, AnEnomemHoldStillUsesTheRailsIdleConnections) {
 // they report the same syndrome and never two lines that say the same thing.
 TEST(RdmaLoopback, ClientFailedCompletionNamesPeerDeviceOperationAndStatus) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  if (SoftRoceOnly()) GTEST_SKIP() << kRxeNoRetryExceeded;
   ScopedEnv idle_reclaim("DFKV_RDMA_IDLE_MS", "120");
   ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
   // The failed completion has to arrive before the window deadline, however
@@ -9420,14 +9442,13 @@ TEST(RdmaLoopback, ClientSettingsAtAMeaningfulZeroAreNotGarbage) {
 
 // The QP transport retry settings come from DFKV_RDMA_QP_* (read once per
 // process; each test is its own process), within their ranges.
-// QpRetry reads the environment once per process and keeps the result, so
-// this test relies on ctest running each test in its own process and on
-// nothing in this process opening a QP before it.
+// QpRetry keeps what it read first in the process; ReadQpRetry is the same
+// reading, done now, so the test holds in a process that opened QPs before.
 TEST(RdmaQpRetry, SettingsComeFromTheEnvironment) {
   ScopedEnv timeout("DFKV_RDMA_QP_TIMEOUT", "17");
   ScopedEnv retries("DFKV_RDMA_QP_RETRY_CNT", "9");  // above 7: the default
   ScopedEnv rnr("DFKV_RDMA_QP_RNR_RETRY", "3");
-  const rdma::QpRetrySettings& settings = rdma::QpRetry();
+  const rdma::QpRetrySettings settings = rdma::ReadQpRetry();
   EXPECT_EQ(settings.timeout, 17);
   EXPECT_EQ(settings.retry_cnt, 7);
   EXPECT_EQ(settings.rnr_retry, 3);

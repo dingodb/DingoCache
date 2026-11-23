@@ -2115,14 +2115,11 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     return result;
   }
   {
-    // Read for every connection that is opened; reported once.
+    // Read for every connection that is opened; ReportSwitch warns once.
     const char* bp = std::getenv("DFKV_RDMA_BUSY_POLL");
     const bool busy_poll = bp && *bp && *bp != '0';
-    static const bool reported =
-        (envparse::ReportSwitch("DFKV_RDMA_BUSY_POLL", busy_poll,
-                                "only a value starting with 0 is off"),
-         true);
-    (void)reported;
+    envparse::ReportSwitch("DFKV_RDMA_BUSY_POLL", busy_poll,
+                           "only a value starting with 0 is off");
     if (busy_poll) conn->ep.set_busy_poll(true);
   }
 
