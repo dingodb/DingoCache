@@ -959,9 +959,22 @@ TEST_F(DiskGroupTest, PeriodicTableSyncRunsOnlyWhereARecoveryUsesIt) {
       EXPECT_EQ(syncs, 0u) << mode << ": synced at the 100 ms cadence";
     }
     if (m == "auto") {
-      // A slow sync (5 s) to find a writeback error during the run.
-      std::this_thread::sleep_until(opened + std::chrono::milliseconds(5600));
-      EXPECT_GT(group.SlabStats().table_syncs, 0u) << "auto: no slow sync";
+      // A slow sync (5 s) to find a writeback error during the run. Its
+      // clock starts when the disk is activated, which can be well after
+      // `opened` on a slow host (738 ms under TSan): wait for the first
+      // sync instead of sleeping a fixed time. The cadence check above
+      // already showed it is not the 100 ms one.
+      const auto deadline = opened + std::chrono::seconds(15);
+      while (group.SlabStats().table_syncs == 0 &&
+             std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      const double waited_s =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                        opened)
+              .count();
+      EXPECT_GT(group.SlabStats().table_syncs, 0u)
+          << "auto: no slow sync within 15 s";
+      EXPECT_GE(waited_s, 4.9) << "auto: the first sync came before 5 s";
     }
   }
 }
