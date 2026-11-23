@@ -1,5 +1,6 @@
 #include "cache/kv_node_server.h"
 #include "cache/rdma_server.h"
+#include "client/kv_client.h"
 #include "transport/rdma_protocol.h"
 #include "transport/rdma_transport.h"
 #include "transport/rdma_verbs.h"
@@ -471,6 +472,32 @@ TEST_F(RdmaLeaseClient, PullCapacityRejectionPreservesConnectionAndGeneration) {
     EXPECT_EQ(Counter(transport.MetricsText(),
                       "dfkv_rdma_client_pull_failures_total"), 1);
   }
+}
+
+TEST_F(RdmaLeaseClient, ExactReadOfAnotherLengthLeavesTheDestinationUntouched) {
+  RdmaTransport transport(kMaxMsg);
+  KVClient c({{"n", addr_}}, "test/model/page=64", &transport);
+  // TRN-26: an exact read of a key stored with another length is a miss and
+  // must leave the caller's destination as it was: neither the shorter
+  // value nor a slice of a longer one is copied into it.
+  const std::string fits(4096, 'f');
+  ASSERT_TRUE(c.Put("short", std::string(100, 's').data(), 100));
+  ASSERT_TRUE(c.Put("long", std::string(8192, 'l').data(), 8192));
+  ASSERT_TRUE(c.Put("fits", fits.data(), fits.size()));
+  const std::string sentinel(4096, '?');
+  for (const char* key : {"short", "long"}) {
+    std::string out = sentinel;
+    EXPECT_FALSE(c.Get(key, &out[0], out.size())) << key;
+    EXPECT_EQ(out, sentinel) << key;
+  }
+  std::vector<std::string> outs(3, sentinel);
+  const std::vector<KvGetItem> items{{"short", &outs[0][0], 4096},
+                                     {"long", &outs[1][0], 4096},
+                                     {"fits", &outs[2][0], 4096}};
+  EXPECT_EQ(c.BatchGet(items), (std::vector<bool>{false, false, true}));
+  EXPECT_EQ(outs[0], sentinel);
+  EXPECT_EQ(outs[1], sentinel);
+  EXPECT_EQ(outs[2], fits);
 }
 
 TEST_F(RdmaLeaseClient, DynamicPullReleasesLargeScalarAndScatterReadsBeforeIdle) {

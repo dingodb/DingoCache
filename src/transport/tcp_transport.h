@@ -83,9 +83,12 @@ class TcpTransport : public Transport {
                    uint64_t offset, uint64_t length, const void* payload,
                    uint64_t payload_len, std::string* out,
                    uint64_t max_data, uint64_t* value_len = nullptr);
+  // exact: a reply for a value of another length than dst_cap is read off
+  // the socket and dropped, never written to dst.
   Status RoundTripInto(const std::string& node, const BlockKey& key,
                        uint64_t offset, uint64_t length, void* dst,
-                       size_t dst_cap, uint64_t* value_len);
+                       size_t dst_cap, uint64_t* value_len,
+                       bool exact = false);
   bool Acquire(const std::string& node, Lease* lease);
   void Complete(const std::string& node, Lease lease, bool healthy,
                 bool apply_backoff);

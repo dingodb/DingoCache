@@ -52,9 +52,10 @@ bool OneShot(int fd, WireOp op, const BlockKey& k, uint64_t offset,
 // Range variant that receives raw payload bytes straight into caller memory.
 // The response prefix is still validated before the first payload byte is read,
 // so a peer cannot overrun dst by lying about data_len.
+// exact: a value of another length than dst_cap is drained, not written.
 bool OneShotInto(int fd, const BlockKey& key, uint64_t offset, uint64_t length,
                  void* dst, size_t dst_cap, Status* st,
-                 uint64_t* value_len) {
+                 uint64_t* value_len, bool exact) {
   char prefix[kReqPrefix];
   EncodeReq(prefix, WireOp::kRange, key, offset, length, 0);
   if (!net::WriteAll(fd, prefix, kReqPrefix)) return false;
@@ -62,8 +63,22 @@ bool OneShotInto(int fd, const BlockKey& key, uint64_t offset, uint64_t length,
   char response[kRespPrefix];
   if (!net::ReadAll(fd, response, kRespPrefix)) return false;
   uint64_t data_len = 0;
-  if (!DecodeResp(response, st, &data_len, dst_cap, value_len)) return false;
+  uint64_t stored = 0;
+  if (!DecodeResp(response, st, &data_len, dst_cap, &stored)) return false;
+  if (value_len) *value_len = stored;
   if (data_len == 0) return true;
+  if (exact && stored != dst_cap) {
+    // The caller will not use these bytes: keep its destination as it was.
+    // Off the stack: callers may run on small stacks.
+    thread_local std::vector<char> sink(64 << 10);
+    while (data_len != 0) {
+      const size_t n = static_cast<size_t>(
+          std::min<uint64_t>(data_len, sink.size()));
+      if (!net::ReadAll(fd, sink.data(), n)) return false;
+      data_len -= n;
+    }
+    return true;
+  }
   if (dst == nullptr) return false;
   return net::ReadAll(fd, dst, static_cast<size_t>(data_len));
 }
@@ -320,13 +335,13 @@ Status TcpTransport::RoundTrip(const std::string& node, WireOp op,
 Status TcpTransport::RoundTripInto(const std::string& node,
                                    const BlockKey& key, uint64_t offset,
                                    uint64_t length, void* dst, size_t dst_cap,
-                                   uint64_t* value_len) {
+                                   uint64_t* value_len, bool exact) {
   for (int attempt = 0; attempt < 2; ++attempt) {
     Lease lease;
     if (!Acquire(node, &lease)) return Status::kIOError;
     Status st = Status::kIOError;
     if (OneShotInto(lease.connection->fd, key, offset, length, dst, dst_cap,
-                    &st, value_len)) {
+                    &st, value_len, exact)) {
       Complete(node, std::move(lease), true, false);
       return st;
     }
@@ -370,7 +385,8 @@ std::vector<Status> TcpTransport::RangeInto(
   for (size_t i = 0; i < keys.size(); ++i) {
     uint64_t stored = 0;
     statuses.push_back(RoundTripInto(node, keys[i], 0, dsts[i].n,
-                                     dsts[i].payload, dsts[i].n, &stored));
+                                     dsts[i].payload, dsts[i].n, &stored,
+                                     dsts[i].exact));
     // A refusal's length is not a stored length (see Transport::RangeInto).
     if (value_lens && statuses.back() == Status::kOk)
       (*value_lens)[i] = stored;

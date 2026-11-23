@@ -44,6 +44,10 @@ struct RangeDst {
   void* payload;
   size_t n;
   DestinationMemoryKind memory_kind = DestinationMemoryKind::kHost;
+  // The reader accepts only a value of exactly n bytes. A value of another
+  // length is reported (kOk with its length, or kInvalid when larger) but
+  // none of its bytes reach the payload.
+  bool exact = false;
 };
 
 // One write in a batch (data must outlive the CacheMany call).
@@ -334,6 +338,7 @@ class Transport {
         r[i] = st;
         if (st != Status::kOk) continue;
         if (value_lens) (*value_lens)[i] = stored;
+        if (dsts[i].exact && stored != dsts[i].n) continue;
         const size_t n = std::min(raw.size(), dsts[i].n);
         if (n) std::memcpy(dsts[i].payload, raw.data(), n);
       }
@@ -352,6 +357,7 @@ class Transport {
       r[i] = st;
       if (st != Status::kOk) continue;
       if (value_lens) (*value_lens)[i] = stored;
+      if (dsts[i].exact && stored != dsts[i].n) continue;
       const size_t n = std::min(raw_values[i].size(), dsts[i].n);
       if (n && !publisher.Copy(dsts[i].payload, raw_values[i].data(), n,
                                dsts[i].memory_kind))

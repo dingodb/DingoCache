@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+
+- Client: an exact read of a key stored with another length leaves the
+  destination as it was (TRN-26). Such a read is a miss, yet the stored
+  bytes reached the caller's buffer: over TCP a shorter value or the first
+  bytes of a longer one, over RDMA a shorter value (a longer one was already
+  refused before the READ). A caller that kept or reused that buffer after
+  the miss saw them. The client now marks its exact reads (`dfkv_get`,
+  `dfkv_batch_get` and their `_st` forms); RDMA releases a value of another
+  length without a READ, and TCP reads the reply off the socket into a
+  scratch buffer. Results, statuses and lengths are unchanged; variable-size
+  reads (`*_auto`) still receive a shorter value.
 - Server, RDMA: a GET of a key the node does not have is answered
   `kNotFound` before any staging lease. It leased one first, read nothing,
   and under pool pressure waited for memory or evicted another client's

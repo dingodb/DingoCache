@@ -4,6 +4,7 @@
 #include "client/kv_client.h"
 #include "cache/kv_node_server.h"
 #include "client/key_map.h"
+#include "transport/tcp_transport.h"
 
 #include <gtest/gtest.h>
 
@@ -63,6 +64,95 @@ TEST_F(KVClientTest, PutGetExistRoundTripWithImmediateVisibility) {
   std::string out(v.size(), '\0');
   ASSERT_TRUE(c.Get("glm-5.1/page_1_k", &out[0], out.size()));
   EXPECT_EQ(out, v);
+}
+
+TEST_F(KVClientTest, ExactReadOfAnotherLengthLeavesTheDestinationUntouched) {
+  nodes_.push_back(StartNode("exact"));
+  KVClient c({{"a", nodes_[0]->addr}}, SelfHdr());
+  // TRN-26: an exact read of a key stored with another length is a miss and
+  // must leave the caller's destination as it was: neither the shorter
+  // value nor a slice of a longer one is copied into it.
+  const std::string fits(4096, 'f');
+  ASSERT_TRUE(c.Put("short", std::string(100, 's').data(), 100));
+  ASSERT_TRUE(c.Put("long", std::string(8192, 'l').data(), 8192));
+  ASSERT_TRUE(c.Put("fits", fits.data(), fits.size()));
+  const std::string sentinel(4096, '?');
+  for (const char* key : {"short", "long"}) {
+    std::string out = sentinel;
+    EXPECT_FALSE(c.Get(key, &out[0], out.size())) << key;
+    EXPECT_EQ(out, sentinel) << key;
+  }
+  std::vector<std::string> outs(3, sentinel);
+  const std::vector<KvGetItem> items{{"short", &outs[0][0], 4096},
+                                     {"long", &outs[1][0], 4096},
+                                     {"fits", &outs[2][0], 4096}};
+  EXPECT_EQ(c.BatchGet(items), (std::vector<bool>{false, false, true}));
+  EXPECT_EQ(outs[0], sentinel);
+  EXPECT_EQ(outs[1], sentinel);
+  EXPECT_EQ(outs[2], fits);
+}
+
+// The default Transport::RangeInto (what a transport without its own read
+// path uses): Range through a TCP transport, publication by the base class.
+class RangeOnlyTransport final : public Transport {
+ public:
+  Status Cache(const std::string& node, const BlockKey& key, const void* data,
+               size_t len) override {
+    return tcp_.Cache(node, key, data, len);
+  }
+  Status Range(const std::string& node, const BlockKey& key, uint64_t offset,
+               uint64_t length, std::string* out,
+               uint64_t* value_len) override {
+    return tcp_.Range(node, key, offset, length, out, value_len);
+  }
+  Status Lookup(const std::string& node, const BlockKey& key,
+                uint64_t* value_len) override {
+    return tcp_.Lookup(node, key, value_len);
+  }
+  Status Exist(const std::string& node, const BlockKey& key,
+               bool* exists) override {
+    return tcp_.Exist(node, key, exists);
+  }
+
+ private:
+  TcpTransport tcp_;
+};
+
+TEST_F(KVClientTest, ExactMismatchReportsTheStoredLengthAndCopiesNothing) {
+  // An exact read of another length: the stored length still comes back
+  // (the client's LENGTH_MISMATCH needs it) and the destination keeps its
+  // bytes, on the TCP read path and on the default one.
+  nodes_.push_back(StartNode("exactlen"));
+  const std::string& addr = nodes_[0]->addr;
+  TcpTransport tcp;
+  RangeOnlyTransport range_only;
+  const BlockKey shorter{7, 1}, longer{7, 2};
+  ASSERT_EQ(tcp.Cache(addr, shorter, std::string(100, 's').data(), 100),
+            Status::kOk);
+  ASSERT_EQ(tcp.Cache(addr, longer, std::string(8192, 'l').data(), 8192),
+            Status::kOk);
+  const std::string sentinel(4096, '?');
+  for (Transport* t : {static_cast<Transport*>(&tcp),
+                       static_cast<Transport*>(&range_only)}) {
+    for (const auto& [key, stored] :
+         {std::pair{shorter, uint64_t{100}}, std::pair{longer, uint64_t{8192}}}) {
+      std::string out = sentinel;
+      std::vector<uint64_t> lens;
+      const auto st = t->RangeInto(
+          addr, {key},
+          {RangeDst{&out[0], out.size(), DestinationMemoryKind::kHost,
+                    /*exact=*/true}},
+          &lens);
+      ASSERT_EQ(st.size(), 1u);
+      EXPECT_EQ(st[0], Status::kOk) << stored;
+      EXPECT_EQ(lens, std::vector<uint64_t>{stored});
+      EXPECT_EQ(out, sentinel) << stored;
+      // Without exact the same reads still deliver bytes.
+      std::vector<uint64_t> loose;
+      t->RangeInto(addr, {key}, {RangeDst{&out[0], out.size()}}, &loose);
+      EXPECT_NE(out, sentinel) << stored;
+    }
+  }
 }
 
 TEST_F(KVClientTest, RemoveRoundTripThenMiss) {

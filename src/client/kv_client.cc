@@ -1076,7 +1076,8 @@ bool KVClient::GetDirectRouted(const std::string& key, void* out, size_t n,
   uint64_t value_len = 0;
   std::vector<BlockKey> keys{bk};
   std::vector<RangeDst> dsts{
-      RangeDst{n ? out : nullptr, n, ClassifyDestination(out, n)}};
+      RangeDst{n ? out : nullptr, n, ClassifyDestination(out, n),
+               /*exact=*/true}};
   std::vector<uint64_t> value_lens;
   const Status st = t_->RangeInto(node, keys, dsts, &value_lens)[0];
   if (!value_lens.empty()) value_len = value_lens[0];
@@ -1460,7 +1461,8 @@ std::vector<bool> KVClient::BatchGetDirectRouted(
       for (size_t k : idx) {
         keys.push_back(block_key_(items[k].key));
         dsts.push_back(RangeDst{items[k].out, n,
-                                ClassifyDestination(items[k].out, n)});
+                                ClassifyDestination(items[k].out, n),
+                                /*exact=*/true});
       }
       // The transport stages retry-owned bytes, then publishes them into each
       // host or CUDA destination before returning the authoritative size.
