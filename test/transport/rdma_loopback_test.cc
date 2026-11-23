@@ -7802,8 +7802,18 @@ class ControlledRdmaUringBackend final : public UringReader::Backend {
     cqe.user_data = token;
     cqe.res = static_cast<int32_t>(result);
     ready_.push_back(cqe);
+    if (event_fd_ >= 0) {  // as io_uring_register_eventfd does
+      const uint64_t one = 1;
+      (void)!::write(event_fd_, &one, sizeof(one));
+    }
     cv_.notify_all();
     return true;
+  }
+
+  int RegisterEventFd(io_uring*, int fd) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    event_fd_ = fd;
+    return 0;
   }
 
   size_t MaxInflight() const {
@@ -7849,6 +7859,7 @@ class ControlledRdmaUringBackend final : public UringReader::Backend {
   std::vector<Request> history_;
   std::list<io_uring_cqe> ready_;
   std::deque<int> submit_results_;
+  int event_fd_ = -1;
 };
 #endif
 
@@ -8022,6 +8033,95 @@ struct RdmaUringNode {
 };
 
 #ifdef DFKV_WITH_URING
+// RDS-11: with a disk read in flight the io_uring serve loop waited on the
+// ring alone, for up to 1 ms at a time, and saw a new request only when that
+// wait ended. Time from posting a request to its own disk read being
+// submitted, with and without another read in flight on the connection.
+TEST(RdmaLoopback, ARequestDuringADiskReadIsTakenAtOnce) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "1");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "2");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  RdmaUringNode node("uring-notice", kMaxMsg,
+                     [](ControlledRdmaUringBackend*) {});
+  const std::string value(4096, 'n');
+  std::string ignored;
+  const BlockKey keys[2] = {{92001, 1}, {92002, 1}};
+  for (const BlockKey& key : keys)
+    ASSERT_EQ(node.srv->ProcessRequestForKey(
+                  static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
+                  value.data(), value.size(), &ignored), Status::kOk);
+  PinnedPullPeer peer;
+  ASSERT_TRUE(peer.Open(node, 2));
+  ControlledRdmaUringBackend* backend = nullptr;
+  struct CompleteHeld {
+    ControlledRdmaUringBackend** backend;
+    ~CompleteHeld() {
+      if (!*backend) return;
+      for (const auto& request : (*backend)->History())
+        (*backend)->CompleteRead(request.token);
+    }
+  } complete_held{&backend};
+  size_t submitted = 0;
+  const auto wait_submitted = [&](size_t count) {
+    if (!backend) backend = node.WaitForBackendWithSubmitted(count);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (backend && backend->History().size() < count &&
+           std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::microseconds(10));
+    return backend && backend->History().size() >= count;
+  };
+  const auto post = [&](size_t slot) {
+    peer.EncodePull(slot, keys[slot], 0, value.size(),
+                    static_cast<uint32_t>(slot));
+    return peer.ep.PostRecv(slot) &&
+           peer.ep.PostSend(slot, kReqPrefix + rdma::kPullPrepareBytes);
+  };
+  std::vector<double> alone_us, behind_us;
+  for (int round = 0; round < 60; ++round) {
+    SCOPED_TRACE(round);
+    const bool behind = round % 2 == 1;
+    if (behind) {
+      ASSERT_TRUE(post(0));
+      ASSERT_TRUE(wait_submitted(++submitted));
+      std::this_thread::sleep_for(
+          std::chrono::microseconds(1100 + 37 * (round % 23)));
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    ASSERT_TRUE(post(1));
+    ASSERT_TRUE(wait_submitted(++submitted));
+    (behind ? behind_us : alone_us).push_back(
+        std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - t0).count());
+    const auto history = backend->History();
+    if (behind) ASSERT_TRUE(backend->CompleteRead(history[submitted - 2].token));
+    ASSERT_TRUE(backend->CompleteRead(history[submitted - 1].token));
+    std::vector<rdma::DynamicPullReady> readies;
+    for (int got = 0; got < (behind ? 4 : 2); ++got) {
+      ibv_wc wc{};
+      ASSERT_EQ(peer.ep.WaitComp(&wc, 1, 5000), 1);
+      ASSERT_EQ(wc.status, IBV_WC_SUCCESS);
+      if (wc.opcode != IBV_WC_RECV) continue;
+      rdma::DynamicPullReady ready;
+      ASSERT_TRUE(rdma::DecodeDynamicPullReady(
+          peer.ep.rbuf(wc.wr_id) + kRespPrefix, &ready));
+      readies.push_back(ready);
+    }
+    for (size_t i = 0; i < readies.size(); ++i)
+      ASSERT_TRUE(peer.Release(keys[behind ? i : 1], readies[i]));
+  }
+  const auto median = [](std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    return v[v.size() / 2];
+  };
+  const double alone = median(alone_us), behind = median(behind_us);
+  std::printf("request to disk submission, median: %.0f us alone, %.0f us"
+              " behind a read in flight\n", alone, behind);
+  EXPECT_LT(behind - alone, 200.0)
+      << "a request behind a disk read in flight waited for the ring wait";
+}
+
 TEST(RdmaLoopback, PressurePreservesSubmittedUringRead) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   ScopedEnv uring("DFKV_SERVER_URING", "1");

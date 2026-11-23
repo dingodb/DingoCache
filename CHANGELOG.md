@@ -3,6 +3,13 @@
 ## Unreleased
 
 
+- Server, RDMA with io_uring: a request that arrives while a disk read is in
+  flight is taken at once (RDS-11). The serve loop waited on the ring alone
+  for up to 1 ms at a time and saw the request only then; measured, the
+  request's own disk read started 612 us after it was posted instead of
+  147 us. The loop now waits for RDMA completions, disk completions (an
+  eventfd the ring signals) and Stop() in one poll().
+
 - Server, RAM tier: the payload it holds is visible (REQ-13). New
   `dfkv_ram_payload_bytes`, the payload bytes of the resident values;
   `dfkv_ram_used_bytes` counts whole slots. With large values the arena
