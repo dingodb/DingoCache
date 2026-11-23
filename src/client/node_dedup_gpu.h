@@ -36,6 +36,8 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "client/cuda_ipc.h"
 #include "client/dedup_segment.h"
@@ -130,6 +132,36 @@ class GpuNodeDedup {
   // process' arena and flips the slot READY.
   void PublishSg(const BlockKey& key, uint64_t token, const Seg* segs,
                  size_t nsegs, size_t len);
+  // PublishSg for many keys with one stream synchronization per chunk of at
+  // most half the arena, instead of one per key (a sync costs several
+  // microseconds whatever the payload: most of a small key's publish).
+  struct PublishItem {
+    BlockKey key;
+    uint64_t token;
+    const Seg* segs;
+    size_t nsegs;
+    size_t len;
+  };
+  void PublishManySg(const PublishItem* items, size_t n);
+  // Hits with one synchronization. ClaimSgDeferred is ClaimSg, except that a
+  // READY key's copy is only enqueued: it returns kHit provisionally and
+  // records the copy in `batch` under `tag`. FinishHits then synchronizes
+  // once and validates every recorded copy; a key in `failed` was no hit
+  // (the caller fetches it; it holds no claim). A failed synchronization
+  // fails every key of the batch; the caller's fetch then writes the same
+  // destinations, which a sticky CUDA error fails too.
+  struct HitBatch;
+  Role ClaimSgDeferred(const BlockKey& key, const Seg* segs, size_t nsegs,
+                       size_t total_cap, uint64_t* token, HitBatch* batch,
+                       size_t tag);
+  // (tag, payload length) of every validated hit; tags of the others.
+  void FinishHits(HitBatch* batch,
+                  std::vector<std::pair<size_t, size_t>>* hits,
+                  std::vector<size_t>* failed);
+  // For a batch abandoned by an exception: waits for the copies it may have
+  // enqueued, so that none lands in a destination its caller reuses. No hit
+  // is reported. Never throws.
+  void SettleHits(HitBatch* batch) noexcept;
   void Abort(const BlockKey& key, uint64_t token);
   // Eviction barrier for every READY and in-flight entry of the key. A
   // publisher already copying loses its slot and commits nothing; a publisher
@@ -222,6 +254,15 @@ class GpuNodeDedup {
   bool PublishBegin(const BlockKey& key, uint64_t token, size_t len,
                     PublishHold* hold);
   void PublishFinish(const PublishHold& hold, const Seg* segs, size_t nsegs);
+  // PublishFinish in two stages: allocate arena space and enqueue the gather
+  // on st (false: nothing was enqueued that needs a commit), then, after the
+  // caller synchronized st, commit.
+  bool PublishCopy(const PublishHold& hold, const Seg* segs, size_t nsegs,
+                   CUstream st, uint64_t* off, uint64_t* seq);
+  void PublishCommit(const PublishHold& hold, uint64_t off, uint64_t seq);
+  Role ClaimSgImpl(const BlockKey& key, const Seg* segs, size_t nsegs,
+                   size_t total_cap, size_t* got, uint64_t* token,
+                   HitBatch* batch, size_t tag);
   void PublishAbandon(const PublishHold& hold);
   static bool MarkedFenceable(const Slot* s);
   bool ForceOutPublisher(Slot* s);
@@ -290,6 +331,18 @@ class GpuNodeDedup {
   mutable std::atomic<uint64_t> length_mismatches_{0};
   std::atomic<uint64_t> load_fences_{0}, load_fence_failures_{0};
   std::atomic<uint64_t> invalidate_stuck_{0};
+};
+
+struct GpuNodeDedup::HitBatch {
+  struct Pending {
+    size_t tag;
+    CopySnap snap;
+  };
+  std::vector<Pending> pending;
+  // A hit's copy may have been enqueued (set before it is issued, so also
+  // when recording it failed): the stream must be synchronized before the
+  // destinations are handed back.
+  bool issued = false;
 };
 
 }  // namespace dfkv
