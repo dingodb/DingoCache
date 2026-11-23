@@ -71,6 +71,10 @@ class ReleaseVersionContractTest(unittest.TestCase):
         self.assertIn("dfkv_connector/_telemetry/metrics_push.py", workflow)
         self.assertIn("dfkv_vllm/_telemetry/metrics_push.py", workflow)
         self.assertIn("$root/test/python", workflow)
+        # A release waits for, and needs, main's CI run of the same commit.
+        self.assertIn("needs: main-ci-green", workflow)
+        self.assertIn("actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&branch=main&event=push", workflow)
+        self.assertIn("actions: read", workflow)
 
 
     def test_workflows_pin_actions_and_publish_once(self):

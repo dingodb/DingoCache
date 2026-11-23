@@ -10,8 +10,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to a PR cancels its older run. Runs of pushes to main are never
+# cancelled: a release needs the run of its own commit to pass (release.yml),
+# and a later push must not take that away.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -186,6 +189,120 @@ jobs:
           cmake --build build-tsan -j
       - name: Run C++ suites under TSan (python excluded — ctypes dlopen)
         run: TSAN_OPTIONS=halt_on_error=1:allocator_may_return_null=1 ctest --test-dir build-tsan -E 'python_plugin|python_hicache_device_direct' --output-on-failure --timeout 300
+
+  etcd-mds:
+    name: MDS and membership against a real etcd
+    # The MDS, registrar, poller and client discovery tests skip themselves
+    # without DFKV_TEST_ETCD, so every other job leaves them out. Here they run
+    # against an etcd of the version deployments use, and a skip for want of
+    # etcd fails the job.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ETCD_VERSION: v3.5.17
+      ETCD_SHA256: eff6ac621d41711085d0f38fab17d8fa3705f6326c3ff11301a1f5a71fc94edd
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install deps
+        run: |
+          sudo grep -rlE 'packages\.microsoft\.com|dl\.google\.com' \
+            /etc/apt/sources.list.d/ 2>/dev/null | sudo xargs -r rm -f
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ git ca-certificates curl python3
+      - name: Install and start etcd
+        run: |
+          set -eu
+          archive="etcd-${ETCD_VERSION}-linux-amd64.tar.gz"
+          curl -fsSL --retry 5 -o "$archive" \
+            "https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/${archive}"
+          echo "${ETCD_SHA256}  ${archive}" | sha256sum -c -
+          tar xzf "$archive"
+          mkdir -p "$RUNNER_TEMP/etcd-data"
+          "./etcd-${ETCD_VERSION}-linux-amd64/etcd" --data-dir "$RUNNER_TEMP/etcd-data" \
+            --listen-client-urls http://127.0.0.1:2379 \
+            --advertise-client-urls http://127.0.0.1:2379 > "$RUNNER_TEMP/etcd.log" 2>&1 &
+          for _ in $(seq 1 60); do
+            curl -fs -m 1 http://127.0.0.1:2379/health | grep -q '"health":"true"' && exit 0
+            sleep 0.5
+          done
+          cat "$RUNNER_TEMP/etcd.log"
+          exit 1
+      - name: Build the etcd-backed tests
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j --target etcd_client_test mds_server_test \
+            mds_dual_proto_test mds_member_poller_test mds_registrar_test \
+            kv_client_mds_test dfkv_server dfkv_mds
+      - name: Run them (a skip for want of etcd fails)
+        env:
+          DFKV_TEST_ETCD: 127.0.0.1:2379
+        run: |
+          set -eu
+          for t in etcd_client_test mds_server_test mds_dual_proto_test \
+                   mds_member_poller_test mds_registrar_test kv_client_mds_test; do
+            (cd build && "./$t" --gtest_output="xml:$t.xml")
+          done
+          python3 - <<'PY'
+          import glob, xml.etree.ElementTree as E
+          ran = 0
+          for path in sorted(glob.glob("build/*_test.xml")):
+              root = E.parse(path).getroot()
+              ran += int(root.attrib["tests"])
+              for case in root.iter("testcase"):
+                  for skipped in case.iter("skipped"):
+                      text = (skipped.get("message") or "") + (skipped.text or "")
+                      assert "DFKV_TEST_ETCD" not in text, (path, case.get("name"), text)
+              assert not list(root.iter("failure")), path
+          assert ran > 0
+          print("etcd-backed tests run:", ran)
+          PY
+      - name: etcd log
+        if: failure()
+        run: tail -100 "$RUNNER_TEMP/etcd.log"
+
+  address-sanitizer:
+    name: AddressSanitizer + UndefinedBehaviorSanitizer
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install deps
+        run: |
+          sudo grep -rlE 'packages\.microsoft\.com|dl\.google\.com' \
+            /etc/apt/sources.list.d/ 2>/dev/null | sudo xargs -r rm -f
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++ git ca-certificates \
+            python3 python3-numpy python3-pytest
+      - name: Build with ASan and UBSan
+        run: |
+          # RelWithDebInfo with its flags replaced: -O1, and no -DNDEBUG, so
+          # every assert() is checked too.
+          cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O1 -g" \
+            -DDFKV_HARDENING=OFF \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
+          cmake --build build-asan -j
+      # Excluded as under TSan: the two tests that load libdfkv.so into Python
+      # through ctypes, without the sanitizer runtime. Leak checking is off:
+      # the gate is memory errors and undefined behaviour. The three
+      # descriptor-exhaustion tests run the process out of file descriptors;
+      # UBSan's vptr check (-fsanitize=vptr) then cannot inspect the object
+      # ("memory cannot be printed") and reports "member call on address ...
+      # which does not point to an object of type '_State'" on a std::thread
+      # start in the server. Checked once with -fno-sanitize=vptr: they pass.
+      # vptr stays on for everything else, and they run in every other job.
+      - name: Run the suites under ASan and UBSan
+        env:
+          ASAN_OPTIONS: detect_leaks=0:allocator_may_return_null=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build-asan -E '^(python_plugin|python_hicache_device_direct|.*\.DescriptorExhaustionBacksOffAndRecovers)$' --output-on-failure --timeout 300 -j
 
   rdma-compile:
     name: RDMA build (compile-check)

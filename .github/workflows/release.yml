@@ -13,8 +13,50 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  main-ci-green:
+    # A release ships only a commit whose CI run on main passed: every job of
+    # ci.yml (sanitizers, etcd, RDMA, containers, connectors), most of which
+    # this workflow does not repeat. A run still going is waited for.
+    name: CI passed on main for this commit
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    permissions:
+      actions: read
+    steps:
+      - name: Wait for the push run of ci.yml on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          query="repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&branch=main&event=push&per_page=20"
+          for attempt in $(seq 1 85); do
+            # A failed query (rate limit, a 5xx) is asked again next minute.
+            if ! runs=$(gh api "$query" --jq '.workflow_runs[] | "\(.id) \(.status) \(.conclusion)"'); then
+              echo "::warning::GitHub API query failed (attempt $attempt); retrying"
+              sleep 60
+              continue
+            fi
+            echo "$runs"
+            if grep -q ' completed success$' <<<"$runs"; then
+              echo "CI passed on main for $GITHUB_SHA"; exit 0
+            fi
+            if [[ -n "$runs" ]] && ! grep -qv ' completed ' <<<"$runs"; then
+              echo "::error::the CI run of $GITHUB_SHA on main did not pass; fix or re-run it (gh run rerun <id>), then re-run this workflow"
+              exit 1
+            fi
+            if [[ -z "$runs" && $attempt -ge 10 ]]; then
+              echo "::error::no CI run on main for $GITHUB_SHA: tag a commit main's CI ran on (main's push runs are never cancelled, so this is a commit CI did not run on)"
+              exit 1
+            fi
+            sleep 60
+          done
+          echo "::error::CI for $GITHUB_SHA still running after 85 min"
+          exit 1
+
   build-test-package:
     name: test and package
+    needs: main-ci-green
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     permissions:

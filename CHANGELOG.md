@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- CI: two new jobs. One runs the MDS, registrar, member poller, etcd client
+  and client discovery tests against a real etcd (3.5.17, checksum pinned);
+  they skip themselves without `DFKV_TEST_ETCD`, so no job ran them, and a
+  skip for want of etcd now fails the job. The other runs the suites under
+  AddressSanitizer and UndefinedBehaviorSanitizer. The release workflow
+  now starts only after main's CI run of the tagged commit has passed
+  (waiting for it if it is still running): it checked only that the commit
+  is on main, and repeats a few of CI's jobs, not the sanitizer, etcd,
+  RDMA, container and connector ones. Runs of pushes to main are no
+  longer cancelled by a later push (PR runs still are), so that run stays.
 - Release: the binaries are built with `-fstack-protector-strong`,
   `-D_FORTIFY_SOURCE=2` and `-z relro -z now` (new CMake option
   `DFKV_HARDENING`, on by default; a compiler that sets a fortify level
