@@ -386,6 +386,11 @@ class RdmaServer {
                          rdma::RecvSegment* segment);
   // Replaces the startup trial registration on a rail (true = registered).
   std::function<bool(const std::string&)> startup_registration_for_test_;
+  // Replaces the smallest responder READ depth of the rails' devices.
+  int responder_read_depth_for_test_ = 0;
+  // Every rail's device accepts kV2ReadDepth READs in flight per QP: the
+  // probe advertises kV2ProbeCapReadDepth and askers get the readiness ack.
+  bool read_depth_offered_ = false;
 #ifdef DFKV_WITH_URING
   // Externally owned backend seam for deterministic queue/completion tests.
   // Production leaves this empty and UringReader selects liburing directly.

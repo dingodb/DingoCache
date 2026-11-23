@@ -359,7 +359,8 @@ class RdmaTransport : public Transport {
   ProbeResult ProbeV2(const std::string& node,
                       bool* leased_put_supported = nullptr,
                       int timeout_ms = 0,  // 0: connect_ms_, io_ms_
-                      bool* session_fd_supported = nullptr) const;
+                      bool* session_fd_supported = nullptr,
+                      bool* read_depth_supported = nullptr) const;
   // A buffer of the caller could not be registered on `c`. Marks the
   // connection so that its teardown charges neither rail nor peer.
   void NoteLocalRegistrationFailure(Conn* c, size_t bytes);
@@ -376,6 +377,7 @@ class RdmaTransport : public Transport {
     uint64_t publication = 0;
     bool leased_put = false;
     bool session_fd = false;
+    bool read_depth = false;
   };
   std::unordered_map<std::string, PeerCapability> peer_capabilities_;
   void InvalidateCapabilities(const std::string& node,
@@ -456,9 +458,11 @@ class RdmaTransport : public Transport {
   // dead connection is dropped instead of costing the next operation RC
   // retry exhaustion. One more descriptor per pooled connection.
   bool session_fd_enabled_ = false;
+  bool pipelined_reads_ = false;  // DFKV_RDMA_PIPELINED_READS
   // Pooled connections dropped before reuse because the server had closed
   // their session channel.
   std::atomic<uint64_t> session_closed_reaps_{0};
+  std::atomic<uint64_t> pipelined_read_conns_{0};
   // True if conn's session channel says the server has ended it.
   static bool SessionClosed(const Conn& conn);
   int port_check_ms_ = 1000;  // DFKV_RDMA_PORT_CHECK_MS; 0 = off

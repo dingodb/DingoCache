@@ -159,6 +159,7 @@ _COUNTERS: dict[str, tuple[str, ...]] = {
     "dfkv_rdma_client_leaseput_path_fallbacks_total": (),
     "dfkv_rdma_client_stale_pool_connections_total": (),
     "dfkv_rdma_client_session_closed_reaps_total": (),
+    "dfkv_rdma_client_pipelined_read_conns_total": (),
     "dfkv_rdma_client_stale_generation_reaps_total": (),
     "dfkv_rdma_client_depth_refunds_total": (),
     "dfkv_rdma_client_resource_budget_raises_total": (),

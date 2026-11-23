@@ -252,4 +252,44 @@ TEST(DevFrameCaps, SessionProbeCapabilityIsItsOwnBit) {
   EXPECT_TRUE(rdma::V2ProbeSupportsSessionFd(reply));
 }
 
+// The READ-depth ask (frame bit 57) and its readiness ack (byte 0 bit 2):
+// the ask is not part of the block size, and only a client that asked
+// accepts the ack.
+TEST(DevFrameCaps, ReadDepthAskAndAck) {
+  char frame[kDevNameBytes];
+  const uint64_t declared = uint64_t{1} << 20;
+  rdma::EncodeDevFrame("ib0", declared | rdma::kDevFrameRequestReadDepth,
+                       frame, rdma::kDevProtoV2);
+  EXPECT_TRUE(rdma::DevFrameRequestsReadDepth(frame));
+  EXPECT_FALSE(rdma::DevFrameRequestsSessionFd(frame));
+  EXPECT_EQ(rdma::ParseDevFrameMaxBlock(frame), declared);
+  rdma::RecvSegmentInfo info{0x1000, 7, 8192}, out;
+  char acked[rdma::kV2DynamicOnlyReadinessBytes];
+  char both[rdma::kV2DynamicOnlyReadinessBytes];
+  rdma::EncodeV2DynamicOnlyReadiness(info, acked, false, true);
+  rdma::EncodeV2DynamicOnlyReadiness(info, both, true, true);
+  bool depth = false, session = false;
+  ASSERT_TRUE(rdma::DecodeV2DynamicOnlyReadiness(acked, sizeof(acked), &out,
+                                                 nullptr, &depth));
+  EXPECT_TRUE(depth);
+  ASSERT_TRUE(rdma::DecodeV2DynamicOnlyReadiness(both, sizeof(both), &out,
+                                                 &session, &depth));
+  EXPECT_TRUE(session);
+  EXPECT_TRUE(depth);
+  // A client that did not ask (every older one included) refuses it.
+  EXPECT_FALSE(rdma::DecodeV2DynamicOnlyReadiness(acked, sizeof(acked), &out));
+  EXPECT_FALSE(rdma::DecodeV2DynamicOnlyReadiness(both, sizeof(both), &out,
+                                                  nullptr, &depth));
+}
+
+TEST(DevFrameCaps, ReadDepthProbeCapabilityIsItsOwnBit) {
+  char reply[rdma::kV2ProbeReplyBytes];
+  rdma::EncodeV2ProbeReply(reply);  // what servers before it answer
+  EXPECT_FALSE(rdma::V2ProbeSupportsReadDepth(reply));
+  rdma::EncodeV2ProbeReply(reply, rdma::kV2ProbeCapDynamicOnly |
+                                      rdma::kV2ProbeCapReadDepth);
+  EXPECT_TRUE(rdma::V2ProbeSupportsReadDepth(reply));
+  EXPECT_FALSE(rdma::V2ProbeSupportsSessionFd(reply));
+}
+
 }  // namespace dfkv::rdma

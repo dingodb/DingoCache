@@ -520,6 +520,8 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
       read_sge_ = dev_attr.max_sge_rd > 0
                       ? static_cast<size_t>(dev_attr.max_sge_rd)
                       : 1;
+      device_read_depth_ = std::max(1, dev_attr.max_qp_init_rd_atom);
+      device_responder_read_depth_ = std::max(1, dev_attr.max_qp_rd_atom);
     } else {
       max_sge_ = kMaxSge;  // query failed: let ibv_create_qp validate the caps
     }
@@ -697,13 +699,18 @@ const QpRetrySettings& QpRetry() {
 }
 
 bool RcEndpoint::Connect(const QpInfo& remote) {
+  return ConnectRtr(remote) && ConnectRts();
+}
+
+bool RcEndpoint::ConnectRtr(const QpInfo& remote) {
   // INIT -> RTR
   ibv_qp_attr at{};
   at.qp_state = IBV_QPS_RTR;
   at.path_mtu = mtu_;
   at.dest_qp_num = remote.qpn;
   at.rq_psn = remote.psn;
-  at.max_dest_rd_atomic = 1;
+  at.max_dest_rd_atomic = static_cast<uint8_t>(std::min<int>(
+      std::max<int>(1, responder_read_depth_), device_responder_read_depth_));
   at.min_rnr_timer = 12;
   at.ah_attr.port_num = ib_port_;
   at.ah_attr.sl = 0;
@@ -720,7 +727,11 @@ bool RcEndpoint::Connect(const QpInfo& remote) {
         IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
         IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
   if (rtr != 0) return false;
+  responder_read_depth_ = at.max_dest_rd_atomic;  // as granted, for the log
+  return true;
+}
 
+bool RcEndpoint::ConnectRts() {
   // RTR -> RTS
   ibv_qp_attr ts{};
   ts.qp_state = IBV_QPS_RTS;
@@ -729,11 +740,32 @@ bool RcEndpoint::Connect(const QpInfo& remote) {
   ts.retry_cnt = retry.retry_cnt;
   ts.rnr_retry = retry.rnr_retry;
   ts.sq_psn = local_.psn;
-  ts.max_rd_atomic = 1;
+  ts.max_rd_atomic = static_cast<uint8_t>(std::min<int>(
+      std::max<int>(1, read_depth_), device_read_depth_));
   int rts = ibv_modify_qp(qp_, &ts,
         IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
         IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC);
   if (rts != 0) return false;
+  if (logging::CurrentLevel() <= logging::kDebug)
+    logging::Emit(logging::kDebug, "DEBUG",
+                  "rdma: QP " + std::to_string(local_.qpn) + " path MTU " +
+                      std::to_string(128 << static_cast<int>(mtu_)) +
+                      " B, READ depth " + std::to_string(ts.max_rd_atomic) +
+                      ", responder READ depth " +
+                      std::to_string(responder_read_depth_));
+  return true;
+}
+
+bool RcEndpoint::QueryReadDepths(int* initiator, int* responder) const {
+  if (!qp_) return false;
+  ibv_qp_attr attr{};
+  ibv_qp_init_attr init{};
+  if (ibv_query_qp(qp_, &attr,
+                   IBV_QP_MAX_QP_RD_ATOMIC | IBV_QP_MAX_DEST_RD_ATOMIC,
+                   &init) != 0)
+    return false;
+  *initiator = attr.max_rd_atomic;
+  *responder = attr.max_dest_rd_atomic;
   return true;
 }
 

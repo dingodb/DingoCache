@@ -103,6 +103,9 @@ class RdmaServerTestPeer {
       RdmaServer* server, std::function<bool(const std::string&)> hook) {
     server->startup_registration_for_test_ = std::move(hook);
   }
+  static void SetResponderReadDepth(RdmaServer* server, int depth) {
+    server->responder_read_depth_for_test_ = depth;
+  }
   static size_t AnchorCount(const RdmaServer& server) {
     return server.anchors_.size();
   }
@@ -11051,3 +11054,131 @@ TEST(RdmaLoopback, ANewConnectionsSlotsAreZeroed) {
             static_cast<std::ptrdiff_t>(first_size))
       << "the previous connection's bytes are still in the slots";
 }
+
+// RDS-06: READ depth. A QP takes the initiator and responder depths it is
+// given, clamped to what the device supports, and with both at 16 a window
+// of READs runs in flight together. Defaults stay 1.
+TEST(RdmaReadDepth, AQpTakesItsReadDepthsClampedToTheDevice) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  for (const bool deep : {false, true}) {
+    rdma::RcEndpoint a, b;
+    a.set_remote_access(true);
+    b.set_remote_access(true);
+    if (deep) {
+      a.set_read_depth(255);  // more than any device: clamped
+      b.set_responder_read_depth(rdma::kV2ReadDepth);
+    }
+    ASSERT_TRUE(a.Open(nullptr, rdma::kV2ControlCap, 16));
+    ASSERT_TRUE(b.Open(nullptr, rdma::kV2ControlCap, 16));
+    ASSERT_TRUE(a.Connect(b.Local()));
+    ASSERT_TRUE(b.Connect(a.Local()));
+    int a_init = 0, a_resp = 0, b_init = 0, b_resp = 0;
+    ASSERT_TRUE(a.QueryReadDepths(&a_init, &a_resp));
+    ASSERT_TRUE(b.QueryReadDepths(&b_init, &b_resp));
+    EXPECT_EQ(b_init, 1);
+    EXPECT_EQ(a_resp, 1);
+    if (!deep) {
+      EXPECT_EQ(a_init, 1);
+      EXPECT_EQ(b_resp, 1);
+      continue;
+    }
+    EXPECT_GE(a_init, 1);
+    EXPECT_LE(a_init, 255);
+    EXPECT_GE(b_resp, std::min(a_init, static_cast<int>(rdma::kV2ReadDepth)))
+        << "the responder must accept what the initiator sends";
+    // Sixteen READs posted together all complete.
+    constexpr size_t kBytes = 65536;
+    std::vector<char> src(16 * kBytes), dst(16 * kBytes);
+    for (size_t i = 0; i < src.size(); ++i) src[i] = static_cast<char>(i * 7);
+    ibv_mr* remote = b.RegisterLeaseReadRegion(src.data(), src.size());
+    ibv_mr* local = a.RegisterTransient(
+        dst.data(), dst.size(),
+        rdma::RcEndpoint::TransientAccess::kLocalWrite);
+    ASSERT_NE(remote, nullptr);
+    ASSERT_NE(local, nullptr);
+    for (size_t i = 0; i < 16; ++i)
+      ASSERT_TRUE(a.PostRead(i, dst.data() + i * kBytes, kBytes, local,
+                             reinterpret_cast<uint64_t>(src.data() + i * kBytes),
+                             remote->rkey));
+    std::vector<ibv_wc> wcs(16);
+    for (int got = 0; got < 16;) {
+      const int g = a.WaitComp(wcs.data(), 16, 5000);
+      ASSERT_GT(g, 0);
+      for (int k = 0; k < g; ++k) ASSERT_EQ(wcs[k].status, IBV_WC_SUCCESS);
+      got += g;
+    }
+    EXPECT_EQ(dst, src);
+    a.ReleaseTransient(local);
+    b.ReleaseLeaseReadRegion(remote);
+  }
+}
+
+namespace {
+// GETs of four values of 200 KiB (under the tests' block bound) through the
+// real client and server.
+void GetFourValues(RdmaNode& node, RdmaTransport& rt, const std::string& tag) {
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  std::vector<std::string> values;
+  for (int i = 0; i < 4; ++i) {
+    values.push_back(PatternValue(200 << 10, static_cast<size_t>(i + 11)));
+    ASSERT_TRUE(c.Put(tag + std::to_string(i), values.back().data(),
+                      values.back().size()));
+  }
+  for (int i = 0; i < 4; ++i) {
+    std::string out(values[i].size(), '\0');
+    ASSERT_TRUE(c.Get(tag + std::to_string(i), &out[0], out.size())) << i;
+    EXPECT_EQ(out, values[i]) << i;
+  }
+}
+}  // namespace
+
+// The client pipelines its READs only with DFKV_RDMA_PIPELINED_READS on and
+// a server that advertises its READ depth (this one does, always).
+TEST(RdmaReadDepth, PipelinedReadsOnlyWhenAskedAndAdvertised) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaNode node("read-depth");
+  {
+    RdmaTransport rt(kMaxMsg);  // switch off: as before
+    GetFourValues(node, rt, "rd-off-");
+    EXPECT_EQ(CounterVal(rt.MetricsText(),
+                         "dfkv_rdma_client_pipelined_read_conns_total"), 0);
+  }
+  {
+    ScopedEnv on("DFKV_RDMA_PIPELINED_READS", "1");
+    RdmaTransport rt(kMaxMsg);
+    GetFourValues(node, rt, "rd-on-");
+    EXPECT_GE(CounterVal(rt.MetricsText(),
+                         "dfkv_rdma_client_pipelined_read_conns_total"), 1);
+  }
+  EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
+}
+
+// RDS-06: pipelined READs are offered (probe bit 6) only if every rail's
+// device accepts kV2ReadDepth READs in flight per QP; one weaker rail is
+// enough to withhold it, since the probe is not per rail.
+TEST(RdmaReadDepth, OfferedOnlyIfEveryRailAcceptsTheDepth) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ConfigureTestRecvSegment();
+  for (const int device_depth : {0, rdma::kV2ReadDepth - 1}) {
+    RdmaServer server(
+        [](uint8_t, const BlockKey&, uint64_t, uint64_t, const char*,
+           uint64_t, std::string*, size_t*) { return Status::kInvalid; },
+        kMaxMsg);
+    RdmaServerTestPeer::SetResponderReadDepth(&server, device_depth);
+    ASSERT_EQ(server.Start(0), Status::kOk);
+    const int fd =
+        net::Dial("127.0.0.1:" + std::to_string(server.port()), 2000, 2000);
+    ASSERT_GE(fd, 0);
+    char frame[rdma::kDevNameBytes], reply[rdma::kV2ProbeReplyBytes];
+    rdma::EncodeDevFrame(rdma::kV2ProbeDevice, kMaxMsg, frame,
+                         rdma::kDevProtoV2);
+    ASSERT_TRUE(net::WriteAll(fd, frame, sizeof(frame)));
+    ASSERT_TRUE(net::ReadAll(fd, reply, sizeof(reply)));
+    ::close(fd);
+    // 0: the devices' own limit (16 here, 128 on rxe); 15: one rail short.
+    EXPECT_EQ(rdma::V2ProbeSupportsReadDepth(reply), device_depth == 0)
+        << "device depth " << device_depth;
+    server.Stop();
+  }
+}
+

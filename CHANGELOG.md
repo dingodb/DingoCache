@@ -266,6 +266,32 @@
   under the process-wide device lock: registering 256 MiB took about 117 ms,
   and every endpoint open and close on every rail waited for it.
 
+- RDMA: pipelined READs (RDS-06; client switch `DFKV_RDMA_PIPELINED_READS`,
+  off by default). Every QP allowed one RDMA READ in flight
+  (max_rd_atomic 1), so the READs of a GET window ran one after another on
+  the NIC: measured on one connection, a window of four 1-MiB READs took
+  179 us (23 GB/s) and sixteen 64-KiB READs 101 us; with sixteen in flight,
+  127 us (33 GB/s) and 38 us. The server now accepts up to 16 READs in flight
+  on every QP (responder resources only; a client that sends one at a time
+  sees no change; measured, 20000 QPs at 16 are created as at 1, about
+  2 ms each, and the device reports read resources for 16 on each of its
+  131072 QPs, so none is taken from another) and advertises it in the probe
+  answer (bit 6) when every rail's device accepts 16. A client with the
+  switch on asks a server that advertises it (bootstrap bit 57) and raises
+  its own depth to 16 (clamped to its device) only when the server confirms
+  it for that connection (readiness byte 0, bit 2); otherwise it keeps 1,
+  since more than the server's QP accepts would end the QP. A capability
+  the client cached from a server since replaced by an older one under the
+  same identity therefore costs one busy-peer retry (the older server
+  refuses the bootstrap that asks), never a failed READ: a bootstrap that asked
+  for one of these and was closed before any answer, taken as a busy server
+  once, now also drops the peer's cached capabilities, so the next connection probes afresh. Before,
+  whole-object GETs (which do not retry their connection) were refused on
+  every new connection until a PUT or a control operation refreshed the
+  cache; the session channel's request bit (58) had the same flaw. New `dfkv_rdma_client_pipelined_read_conns_total`. The path MTU,
+  still the local port's active MTU, is logged per connection at debug
+  level.
+
 - Server, RDMA: a GET of a key the node does not have is answered
   `kNotFound` before any staging lease. It leased one first, read nothing,
   and under pool pressure waited for memory or evicted another client's
