@@ -274,12 +274,17 @@ the whole value is an aligned read with no head offset (§5).
 
 **Summary** (sealed segments): an array of 64-byte entries, one per record in
 the segment (key, value_len, generation, write_lsn, offset in 4 KiB units,
-payload_crc, flags). It carries no checksum of its own: its CRC32C is the
+payload_crc, flags, and the record's header_len, so that an inline payload
+is found without reading the header). It carries no checksum of its own: its CRC32C is the
 trailer's summary CRC, so a summary is trusted only through a valid trailer.
 Room for it is reserved as
 records are placed (§6.1), so it always fits. **Trailer** (fixed last 4 KiB):
 magic `DFLSEND1`, store_uuid, incarnation, record count, summary offset,
-summary length, summary CRC, last write_lsn, trailer CRC. The trailer is
+summary length, summary CRC, last write_lsn, trailer CRC. A free segment's
+fresh header (at initialization, after a reclaim, a reset or a grow) is
+followed by a trailer of the same incarnation with no records, so that
+recovery loads an empty summary instead of walking the whole segment. The
+trailer is
 written only after the summary is durable (§6.3). A trailer is valid only for
 the incarnation it names, and a segment with a valid trailer is never appended
 to within that incarnation.
@@ -563,7 +568,12 @@ A store keeps *K* open client segments (§4.7), so that concurrent PUTs write to
 different files and the device sees parallel streams. Each open segment has an
 append offset and a count of records placed in it.
 
-`CacheImpl` (shared by `Cache` and `CacheDirect`), under the store mutex:
+`CacheImpl` (shared by `Cache` and `CacheDirect`), under the store mutex
+(the flight is registered before space is reserved, because step 5 may
+wait for the sealer or run an inline reclaim; a PUT that a REMOVE cancels
+during that wait writes nothing and is answered `kOk`, so nothing it wrote
+can come back after the REMOVE, and a REMOVE kills a flight's location only
+once it has one):
 
 1. If the key is committed: return `kOk` (keep-first).
 2. If a PUT of the key is in flight: join it (a `PutFlight`, as slab), unless a
@@ -573,7 +583,7 @@ append offset and a count of records placed in it.
 3. If `value_len > MaxValueBytes`: `kInvalid`.
 4. Choose the open segment with the least free space that still fits the
    record **and** one more 64-byte summary entry: a record of size *r* fits if
-   `append_offset + r + round_up((n + 1) × 64 + 4, 4096) + 4096 ≤
+   `append_offset + r + round_up((n + 1) × 64, 4096) + 4096 ≤
    segment_bytes`, with *n* the records already placed (best fit reduces tail
    waste). Advance its append offset and count.
 5. If no open segment fits: hand the fullest one to the sealer (§6.3, without
@@ -715,7 +725,15 @@ Inside `capacity_bytes` (§4.7) the store holds back:
 - the relocation segment the cleaner is filling.
 
 The cleaner runs whenever the free count falls below *K* + *C* and keeps it
-there. There is no percentage watermark: at full size the space held back is
+there, from the first time a client needs a segment beyond those `Activate`
+opened. Until then it does not reclaim: a store reopened full would
+otherwise evict about one segment's values at every restart (measured on
+the development node: 22% of the values of an 8-segment store, 3.6% of a
+32-segment one; about 1/(*N* − *K* − *C*) of them), and a restart keeps
+everything it recovered until writes need the space. For the first second
+after that, a PUT that finds no free segment and nothing to reclaim inline
+(§7.7; every sealed segment holds a protected record) waits for the cleaner
+instead of getting `kCacheFull`. There is no percentage watermark: at full size the space held back is
 about (*K* + *C* + 1) × 1 GiB per disk, roughly 0.2% of a 3.5 TiB disk.
 
 ### 7.2 Choosing the victim
@@ -734,6 +752,10 @@ skipped segment is retried on the next pass:
   delays that one segment, not all cleaning.
 - **Protection.** A segment whose protected footprint (§9.2) is more than half
   of its size is skipped while an older-or-equal choice exists that is not.
+
+When every sealed segment is skipped, the cleaner takes the oldest one that is
+not pinned, and only if all are pinned the oldest one: a long lease on the
+oldest segment does not stop the reclaim of mostly protected ones.
 
 ### 7.3 What survives a reclaim
 
@@ -779,7 +801,10 @@ its CRC, and appends it to the *relocation* open segment, with `generation`
 unchanged, a new `write_lsn` and the relocated flag. The relocation segment is
 separate from the client open segments so that long-lived values cluster
 together and are not mixed with new writes (this reduces how often they are
-relocated again). It is sealed like any other segment.
+relocated again). It is sealed like any other segment: when it is full or
+at `Close`. Relocated values can therefore stay in an unsealed segment for
+a long time when little is relocated; after an unclean exit that segment is
+one of the walked ones (§8.4).
 
 Before writing, under the mutex, the cleaner marks the entry *relocating* and
 records the destination location. After the write, under the mutex:
@@ -791,13 +816,22 @@ records the destination location. After the write, under the mutex:
   key. If a REMOVE caused it, the REMOVE already listed the destination in its
   kill set (§6.6); a shadow that is also killed is harmless.
 
+Whatever erases the entry while the copy is being written (REMOVE, a CRC
+failure on a read) makes the destination a shadow at that moment, not after
+the write: a location may be killed before it is written, and a PUT of the
+key that completes before the copy lands then kills it too (I3).
+
 ### 7.5 Reclaim and shadows
 
-When every live record of the victim has been relocated or evicted:
-
-1. Wait (bounded, §7.2) until the victim has no pins.
-2. `fdatasync` the relocation segment, and every other segment that received a
-   copy taken from the victim: every relocated copy is durable.
+1. Wait (bounded, §7.2) until the victim has no pins, before anything is
+   relocated or evicted (a victim that cannot be reused keeps its values), and
+   again once every live record of the victim has been relocated or evicted
+   (reads that started meanwhile). An attempt that times out gives up the
+   victim and retries it later.
+2. `fdatasync` every segment that received a copy taken from the victim's
+   current incarnation, by this attempt or by an earlier one that gave up
+   after relocating: every relocated copy is durable. The store keeps that
+   list per victim until its next header, not per attempt.
 3. Write a new segment header for the victim with a new incarnation, with
    `RWF_DSYNC`.
 4. Drop the victim's shadows.
@@ -858,12 +892,14 @@ cleaner, and a cleaner that is behind would otherwise make `kCacheFull`
 frequent. So when a PUT finds no client-usable free segment (§6.1 step 5), it
 reclaims one itself before giving up: the oldest sealed segment that has no
 pins and no protected records, evict-only (no relocation): every live record is
-evicted and shadowed, and steps 3, 4 and 6 of §7.5 follow (step 2 has nothing to
-sync). The victim is claimed under the store mutex (marked *reclaiming*, which
+evicted and shadowed, and steps 2, 3, 4 and 6 of §7.5 follow (step 2 syncs
+only the copies a cleaner attempt that gave up on the victim's pins left
+behind; usually there are none). The victim is claimed under the store mutex (marked *reclaiming*, which
 the cleaner skips and which no second inline reclaim can claim), and the header
 write is done after releasing the mutex. The PUT pays one synchronous header
 write. Only if no such segment
-exists does the PUT get `kCacheFull`. The `kCacheFull` rate and the inline
+exists does the PUT get `kCacheFull`, after waiting for the cleaner if it was
+armed less than a second ago (§7.1). The `kCacheFull` rate and the inline
 reclaims are counted and are acceptance metrics (§13).
 
 ### 7.8 Prefix chains
@@ -951,10 +987,10 @@ among themselves; nothing is ordered across files).
 | C14 | relocation | REMOVE during or after relocation | kills cover destination and source | same |
 | C15 | journal compaction | new file written, rename not durable | old journal used (no append went to it after compaction began, §4.5) | same |
 | C16 | superblock update | torn | other copy used | same |
-| C17 | RETAIN SET or REFRESH | returned, journal group not yet written (≤ `DFKV_LSE_RETAIN_FLUSH_MS`) | protection lost (allowed, §9.2) | same; also lost if written but not durable |
+| C17 | RETAIN SET or REFRESH | returned, journal block not yet written (the next block the writer writes) | protection lost (allowed, §9.2) | same; also lost if written but not durable |
 | C18 | `Close` | some open segments sealed, clean flag not set | unclean open: walks every segment without a valid trailer | same |
 | C19 | any | device returns an I/O error | the store fails closed (unhealthy, `kIOError`), as slab | — |
-| C20 | reclaim | victim's new header durable, relocated copy not | impossible: the relocation segment is synced first (§7.5 step 2) | same; the copy is durable before the victim's old records are given up |
+| C20 | reclaim | victim's new header durable, relocated copy not | impossible: every segment holding a copy taken from the victim, also by an earlier attempt that gave up, is synced first (§7.5 step 2) | same; the copy is durable before the victim's old records are given up |
 | C21 | reclaim | victim's new header torn | header invalid at open: segment classed free; at `Activate` it gets a fresh incarnation from the reserved range (never the torn one's), and its old records are rejected for ever; its kills are kept until then | same |
 | C22 | any PUT or relocation | process killed with `O_DIRECT` / io_uring writes in flight | the open-time barrier (§8.3 step 2) waits for them before anything is read or reused; tested with real kills on each supported filesystem (§11.3) | — (writes in flight are lost or torn) |
 | C23 | journal | group *N*+1 pending while block *N* in flight | block *N*+1 is not written before *N* is durable (§4.5): acknowledged kills survive | a lost suffix holds only unacknowledged groups; a damaged block before a valid one resets the store (§4.5) |
@@ -1056,9 +1092,10 @@ is admitted. **Activation** (`Activate()`) does every write:
     fresh header with a new incarnation (durable); then collect the kills of
     the incarnations so replaced. (Segments that are free because they hold no
     live records get their fresh header when they are opened, step 6.)
-11. Open *K* fresh client segments and the relocation segment from the free
-    list, start the sealer, the cleaner and the journal writer, and admit
-    operations.
+11. Open *K* fresh client segments from the free list (the relocation
+    segment is opened when the cleaner first needs it), start the sealer, the
+    cleaner (held until a client needs space, §7.1) and the journal writer,
+    and admit operations.
 
 ### 8.4 What a walk costs
 
@@ -1132,9 +1169,9 @@ Semantics are those of slab: SET and REFRESH, the same `RetainCode`s, the
 - **Persistence**: a SET, or a REFRESH that moves the deadline by at least
   `DFKV_RETAIN_PERSIST_MIN_DELTA_S`, queues a `RETAIN` journal entry
   (key, generation, retain_until, ttl). The call returns without waiting; the
-  journal writer writes queued entries at least every
-  `DFKV_LSE_RETAIN_FLUSH_MS` (default 10). So a process kill or a power loss
-  may lose the protection set in the last few milliseconds (C17). Protection is
+  journal writer puts queued entries in the next block it writes, at once when
+  it is idle. So a process kill or a power loss may lose the protection set
+  in the last block's time, a few milliseconds (C17). Protection is
   a best-effort minimum lifetime in both engines, and losing it never produces
   wrong data.
 - **Cleaning**: a protected record is relocated, and evicted only as the last
@@ -1476,6 +1513,9 @@ emptied by the operator).
 | 8 | kill -9 soak tool, dm-target script, the long power-loss runs | §11.4 at full scale and §11.5 |
 | 9 | Measurements of §13 on the development node; results added to this document | — |
 | 10 | Format frozen; default switch to `auto` (empty directory gets `log`); ARCHITECTURE, DEPLOY and METRICS updated; CHANGELOG | §11.6 in full, including the recorded downgrade check with a release binary |
+
+Stages 5–7 were built before stage 4, with *K* = 1 open client segment;
+stage 4 raises *K*.
 
 Stages 1–2 can proceed in parallel; 3 depends on both; 4–7 depend on 3 and can
 partly overlap; 8 builds on the harness from 3 and is complete before 10; 10
