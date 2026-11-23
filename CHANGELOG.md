@@ -3,6 +3,13 @@
 ## Unreleased
 
 
+- vLLM: a failed load is not billed as a cache read. For a request with a
+  retention TTL the connector reports `cached_tokens` and
+  `cache_write_tokens` from its lookup; when the load failed and vLLM
+  recomputed those tokens, the hit was still reported as cached. A
+  request-level failure now reports only the local prefix hit, and a
+  block-level failure the tokens before the first invalid block.
+
 - Server, slab: the eviction watermarks can be set as an absolute headroom
   below capacity: `DFKV_SLAB_EVICT_HEADROOM_BYTES` (high = capacity minus
   it) and `DFKV_SLAB_EVICT_BAND_BYTES` (low = high minus it; default a

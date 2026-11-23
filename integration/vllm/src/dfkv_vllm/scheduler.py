@@ -6,6 +6,7 @@
 """Scheduler-side logic for DfkvStoreConnector."""
 
 import time
+import types
 from typing import Any
 
 from vllm.config import VllmConfig
@@ -78,6 +79,9 @@ class DfkvStoreScheduler:
     # block grid (never saveable), and when that was last reported.
     _misaligned_state_boundaries = 0
     _misaligned_state_warned_at: float | None = None
+    # Replaced per instance in __init__; read-only here for schedulers that
+    # tests build without it.
+    _retention = types.MappingProxyType({})
     # vLLM core lands prefix hits on hash blocks inside a scheduler block.
     _partial_hash_hits = False
 
@@ -254,11 +258,17 @@ class DfkvStoreScheduler:
             invalid = set(getattr(output, "invalid_block_ids", None) or ())
             if invalid:
                 for req_id, tracker in self._request_trackers.items():
-                    if any(
-                        block in invalid
-                        for ids in tracker.allocated_block_ids for block in ids
-                    ):
-                        self.client.discard(req_id)
+                    first = min(
+                        (i for ids in tracker.allocated_block_ids
+                         for i, block in enumerate(ids) if block in invalid),
+                        default=None)
+                    if first is None:
+                        continue
+                    self.client.discard(req_id)
+                    if req_id in self._retention:
+                        # vLLM recomputes from the first invalid block.
+                        self._bill_cached_up_to(
+                            req_id, first * self._block_size)
             return
         for req_id in failed_requests_from_output(output):
             # A receive can finish after an aborted request's final metadata.
@@ -267,6 +277,11 @@ class DfkvStoreScheduler:
                 continue
             self._failed_load_req_ids.add(req_id)
             self.client.discard(req_id)
+            if req_id in self._retention:
+                # Recomputed past the local hit: only that came from cache.
+                spec = self.load_specs.get(req_id)
+                self._bill_cached_up_to(
+                    req_id, spec.vllm_cached_tokens if spec is not None else 0)
             self.load_specs.pop(req_id, None)
             self._request_trackers.pop(req_id, None)
             self._unfinished_requests.pop(req_id, None)
@@ -276,6 +291,18 @@ class DfkvStoreScheduler:
             # rebuild its tracker from the new allocation and computed prefix,
             # never from the failed load's advertised token count/block table.
             self._preempted_req_ids.add(req_id)
+
+    def _bill_cached_up_to(self, req_id: str, tokens: int) -> None:
+        """A failed load: the TTL usage reports as cached only the tokens
+        that were not recomputed. Before, the lookup's hit was billed as a
+        cache read even when the load failed and the request recomputed it.
+
+        Limits: vLLM runs request_finished before update_connector_output in
+        one step, so a request aborted in the step its load failed keeps
+        the count of its lookup. A block shared by several requests is cut
+        for each of them at its first invalid block, as vLLM recomputes."""
+        requested, applied, cached = self._retention[req_id]
+        self._retention[req_id] = (requested, applied, min(cached, tokens))
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput

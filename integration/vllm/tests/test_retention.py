@@ -78,6 +78,58 @@ def test_scheduler_forwards_ttl_and_reports_usage():
     assert "r1" not in scheduler._retention
 
 
+def _failing_scheduler(lookup_result, request_level):
+    scheduler, _calls = _scheduler(lookup_result)
+    scheduler.request_level_loads = request_level
+    scheduler._unfinished_request_ids = {"r1"}
+    scheduler._unfinished_requests = {}
+    scheduler._allocated_req_ids = set()
+    scheduler._preempted_req_ids = set()
+    scheduler._hash_block_size = BLOCK
+    scheduler._partial_hash_hits = False
+    return scheduler
+
+
+def _usage(scheduler, request):
+    _delay, params = scheduler.request_finished(request, ([],))
+    return params["dfkv_cache_usage"]
+
+
+def test_a_failed_request_level_load_bills_only_the_local_hit():
+    # 192 tokens external, 64 local; the load fails and the request is
+    # recomputed past its local hit. Before, the 192 were billed as cached.
+    scheduler = _failing_scheduler((192, 300), request_level=True)
+    request = _request(300, num_tokens=256)
+    assert scheduler.get_num_new_matched_tokens(request, 64) == (128, True)
+    scheduler.update_connector_output(SimpleNamespace(failed_recving={"r1"}))
+    assert scheduler.get_num_new_matched_tokens(request, 64) == (0, False)
+    assert _usage(scheduler, request) == {
+        "cached_tokens": 64, "cache_write_tokens": 192, "applied_ttl_s": 300}
+
+
+def test_a_failed_block_level_load_bills_blocks_before_the_failure():
+    # Blocks 10, 11, 12 hold tokens 0-191. Block 12 fails: vLLM recomputes
+    # from token 128; then block 11: from token 64.
+    scheduler = _failing_scheduler((192, 300), request_level=False)
+    request = _request(300, num_tokens=256)
+    scheduler.get_num_new_matched_tokens(request, 64)
+    scheduler._request_trackers["r1"] = SimpleNamespace(
+        allocated_block_ids=([10, 11, 12],))
+    scheduler.update_connector_output(SimpleNamespace(invalid_block_ids={12}))
+    assert scheduler._retention["r1"][2] == 128
+    scheduler.update_connector_output(SimpleNamespace(invalid_block_ids={11}))
+    scheduler._request_trackers.clear()
+    assert _usage(scheduler, request)["cached_tokens"] == 64
+
+
+def test_a_failed_load_of_a_request_without_ttl_records_nothing():
+    scheduler = _failing_scheduler((192, 0), request_level=False)
+    scheduler._request_trackers["r1"] = SimpleNamespace(
+        allocated_block_ids=([10, 11, 12],))
+    scheduler.update_connector_output(SimpleNamespace(invalid_block_ids={12}))
+    assert scheduler._retention == {}
+
+
 def test_best_effort_request_reports_nothing():
     scheduler, calls = _scheduler((128, 0))
     request = _request(0)
