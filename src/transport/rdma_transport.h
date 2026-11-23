@@ -580,6 +580,7 @@ class RdmaTransport : public Transport {
   std::atomic<uint64_t> pull_prepares_{0};
   std::atomic<uint64_t> pull_reads_{0};
   std::atomic<uint64_t> pull_read_bytes_{0};
+  std::atomic<uint64_t> pull_read_wrs_{0};  // READ work requests posted
   std::atomic<uint64_t> pull_failures_{0};
   std::atomic<uint64_t> pull_releases_{0};
   std::atomic<uint64_t> pull_release_failures_{0};

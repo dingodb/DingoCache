@@ -3,6 +3,16 @@
 ## Unreleased
 
 
+- Client, RDMA: a scatter-gather GET reads several destination segments per
+  READ. Each segment of a key's destination took its own READ and its own
+  wait; one READ now scatters into as many segments as the device allows
+  (`max_sge_rd`, at most the QP's SGE count), since the value's range on the
+  server is contiguous. Measured, 16 keys of 61 segments from a RAM-tier
+  node: 4 KiB segments 17.8-31.8 -> 3.1 ms, 64 KiB segments 22.8-29.5 ->
+  15.9-19.1 ms, 16 KiB segments outside any registered memory 59-61 -> 34-36
+  ms (each such segment is still registered for the call: 976 per call).
+  Nothing changes on the wire.
+
 - Design (no code): unavailable ring owners, in
   `docs/design/ring-unavailable-owner.md`. Behind switches that default off:
   a member that vanishes from the MDS view is kept as draining for a grace
