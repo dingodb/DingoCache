@@ -399,6 +399,61 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   if (low_pct >= high_pct && high_pct > 0) low_pct = high_pct - 1;
   evict_high_bytes_ = high_pct ? opt_.capacity_bytes / 100 * high_pct : 0;
   evict_low_bytes_ = opt_.capacity_bytes / 100 * low_pct;
+  // DFKV_SLAB_EVICT_HEADROOM_BYTES (unset/0 = off) puts the high water at a
+  // fixed distance below capacity instead of a share of it, and
+  // DFKV_SLAB_EVICT_BAND_BYTES (default a quarter of the headroom) the low
+  // water that far below high; when set they take precedence over the
+  // percentages. The band is at least one extent (the largest slot, so one
+  // drain frees at least one whole slot of any class) and the headroom at
+  // least two bands (INFO when a clamp raised either). The headroom is meant
+  // to hold back less than the percentages do: if the resolved high is below
+  // the percentage high, or below the band (on a small disk the clamps can
+  // leave almost nothing), the percentages apply, with a WARN.
+  {
+    envparse::U64Spec spec;
+    spec.legacy = envparse::Legacy::kFull;
+    spec.negative = envparse::Negative::kWraps;
+    spec.fallback = 0;
+    const uint64_t asked = envparse::EnvU64("DFKV_SLAB_EVICT_HEADROOM_BYTES", spec);
+    uint64_t applied_headroom = 0, applied_band = 0;
+    if (asked != 0) {
+      spec.fallback = asked / 4;
+      const uint64_t asked_band = envparse::EnvU64("DFKV_SLAB_EVICT_BAND_BYTES", spec);
+      const uint64_t band = std::min(std::max<uint64_t>(asked_band, opt_.extent_bytes),
+                                     opt_.capacity_bytes);
+      const uint64_t headroom = std::max(asked, 2 * band);
+      if (band != asked_band || headroom != asked)
+        DFKV_LOG_INFO("slab " + opt_.dir + ": eviction band " + std::to_string(band) +
+                      " (asked " + std::to_string(asked_band) + ", at least one extent)" +
+                      " and headroom " + std::to_string(headroom) + " (asked " +
+                      std::to_string(asked) + ", at least two bands)");
+      const uint64_t high =
+          headroom < opt_.capacity_bytes ? opt_.capacity_bytes - headroom : 0;
+      if (high == 0 || high < band || high < evict_high_bytes_) {
+        DFKV_LOG_WARN("slab " + opt_.dir + ": DFKV_SLAB_EVICT_HEADROOM_BYTES gives a high "
+                      "water of " + std::to_string(high) + " bytes (headroom " +
+                      std::to_string(headroom) + ", band " + std::to_string(band) +
+                      ", capacity " + std::to_string(opt_.capacity_bytes) +
+                      "), below the percentage high of " +
+                      std::to_string(evict_high_bytes_) + " or below the band; "
+                      "the percentage watermarks apply");
+      } else {
+        if (high_pct == 0 && std::getenv("DFKV_SLAB_EVICT_HIGH_PCT") != nullptr)
+          DFKV_LOG_WARN("slab " + opt_.dir + ": DFKV_SLAB_EVICT_HEADROOM_BYTES turns the "
+                        "watermark on despite DFKV_SLAB_EVICT_HIGH_PCT=0");
+        evict_high_bytes_ = high;
+        evict_low_bytes_ = high - band;
+        applied_headroom = headroom;
+        applied_band = band;
+      }
+    }
+    // The resolved values (0: the percentages apply); the per-disk high and
+    // low bytes are the dfkv_slab_disk_watermark_{high,low}_bytes gauges.
+    config_dump::RecordResolved("DFKV_SLAB_EVICT_HEADROOM_BYTES",
+                                std::to_string(applied_headroom));
+    config_dump::RecordResolved("DFKV_SLAB_EVICT_BAND_BYTES",
+                                std::to_string(applied_band));
+  }
   {
     envparse::U64Spec spec;
     spec.legacy = envparse::Legacy::kFull;
