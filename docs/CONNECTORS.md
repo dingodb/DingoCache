@@ -342,7 +342,7 @@ page/chunk size、shape、层顺序或内存布局是**operator error**，不会
 | `DFKV_TP_RANK` | — | 仅 vLLM connector：用作 `connector_id` 遥测 label 的 rank 后缀；写复制/缓存身份由 canonical key 决定，不受它影响 |
 | `DFKV_CLIENT_NODE_DEDUP` | `0` | 客户端侧节点内 rendezvous 去重：同一引擎进程内**并发去同一目标节点的相同 batch 操作合并领头**，免重复 wire 往返。replicated-MLA 场景（vLLM / HiCache）自动置 `1`，显式 `0` 可关 |
 | `DFKV_CLIENT_NODE_DEDUP_GPU` | `0` | 上一条的 GPU（device-pointer）路径开关；vLLM replicated-MLA 在 host dedup 开启且未显式设置时自动 `1` |
-| `DFKV_READ_SHARD_KEYS` | `16` | 每读分片的目标 key 数：把单节点的一组批量 GET 切成多分片并发（少节点环/大 batch 集中单节点时突破 ~166 MB/s/conn 的单连接串行 drain 天花板；宽环上无感） |
+| `DFKV_READ_SHARD_KEYS` | `16` | 每读分片的目标 key 数：把单节点的一组批量 GET（以及 RDMA 下的批量 PUT、SG PUT）切成多分片并发（少节点环/大 batch 集中单节点时突破 ~166 MB/s/conn 的单连接串行 drain 天花板；宽环上无感） |
 | `DFKV_READ_MAX_CONNS` | `8` | 单节点读分片的并发连接上限（与上一条配对；`1` = 关闭分片） |
 | `DFKV_FANOUT_THREADS` | `32` | 客户端批量操作 fan-out 线程池上限（clamp [1,1024]）；高并发引擎（callers × node-groups ≫ 32）不调会退化 caller-serial，per-call 延迟从 max(group) 变 sum(group) |
 
