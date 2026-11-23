@@ -843,6 +843,28 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | `DFKV_RAM_PUT_WAIT_MS` | `3000`，上限 3600000，`0` 表示不限 | 一个 PUT 等自己这个 key 的属主值的最长时间：disk-ACK 下每个被接纳的 PUT（首写者和重复 PUT）都等这个值刷盘；RAM-ACK 下重复 PUT 只等到首写者的值在 RAM 里可见。时间从这个 PUT 所在的请求批次到达时算起：一条 RDMA 连接按顺序处理客户端一个窗口里的请求，客户端给整个窗口一个截止时间，所以同一窗口里要等待的 PUT 共用这段时间，而不是每个重新计时。等待期间不占用 PUT 的 key 分片锁。到时回 `kCacheFull`（这次请求没看到落盘，可重试；已在 RAM 里的值照常继续刷盘，客户端不会因此把节点判坏）。要小于客户端的操作超时（`DFKV_RDMA_OP_TIMEOUT_MS`，默认 5000；批量窗口看 `DFKV_RDMA_BATCH_OP_TIMEOUT_MS`）：客户端先超时会按 IO 错误冷却这个节点。必须是纯数字，否则按默认值处理并打一条 WARN；超过上限也按默认值 |
 | `DFKV_RAM_SHUTDOWN_DRAIN_TIMEOUT_S` | `30`，上限 3600，`0` 表示不等 | 停止时给 RAM 层积压刷盘的时限，从开始停止算起。到时还只在内存里的对象直接丢弃（缓存语义，日志里有数量），然后各盘照常同步并写 clean。要小于 `TimeoutStopSec` 减去停请求和各盘同步的时间；默认值按 systemd 默认的 90 秒停止超时取的，`TimeoutStopSec` 调大了就一起调大。非法值（非数字、带单位）告警后用默认值 |
 
+> **大对象为主时调大 extent。** arena 按 extent（默认 32 MiB）分给各尺寸类，一个
+> extent 只放整数个同类 slot，放不下的尾部空着；slot 本身还按尺寸格点向上取整
+> （最多约 25%）。对象较大时尾部占比很高：一个 17 MiB 的值占约 19 MiB 的 slot，
+> 32 MiB 的 extent 只放得下一个。单元级实测（768 MiB arena、单一值大小，前一个数
+> 是不开后台回收，后一个是默认 10 ms 回收，回收会多留几个空 slot）中有效载荷占
+> arena 的比例：
+>
+> | 值大小 | 32 MiB extent | 128 MiB extent |
+> |---|---|---|
+> | 约 1 MiB | 95.6% / 88.3% | 95.6% / 87.5% |
+> | 10 MiB | 62.5% / 58.6% | 85.9% / 72.9% |
+> | 17 MiB | 53.1% / 48.7% | 79.7% / 70.8% |
+>
+> 现网比例看 `(dfkv_ram_payload_bytes − dfkv_ram_large_used_bytes) / dfkv_ram_arena_bytes`（payload 含 dedicated 大对象，arena 不含）：
+> `dfkv_ram_used_bytes − dfkv_ram_payload_bytes` 是 slot 取整的损失，
+> `dfkv_ram_arena_bytes − dfkv_ram_used_bytes` 主要是 extent 尾部和回收预留的空 slot。
+> 值常在 8 MiB 以上时可把 `DFKV_RAM_TIER_EXTENT_BYTES` 设为 `134217728`（128 MiB，
+> 不超过 `--max-msg` 的值都放得进去），改动需重启，RAM 层内容随重启清空。代价：
+> extent 数降到四分之一，而每个 shard 至少要 32 个 extent，所以 RAM 预算要
+> 32 GiB × shard 数 / 8 以上才保得住 shard 数（默认 8 个 shard 时是 32 GiB）；尺寸类之间再平衡一次搬整个 extent，搬一次淘汰的数据
+> 也多四倍。
+
 #### f. 同主机/会合复本（node dedup，v2.0.0 新生产杠杆）
 
 > 共享同一个 dedup 段（`/dev/shm` 里按 uid 和命名空间区分）的进程必须在同一个 PID 命名空间里（同一个 pod，或 `hostPID`）。判断段的创建者、取数者、发布者和 GPU 注册项是否还活着，用的都是 pid；PID 命名空间不同而共享 `/dev/shm` 的容器会把对方活着的条目当成已死或已换人而收回（dedup 时好时坏，不会返回错的数据）。段的创建者在创建中途被杀时，下一个进程等 1 秒后接手完成（创建者已死，或段还是空的）；更早版本创建、尺寸已定但没写完的段仍按原样放弃（这次进程不走 dedup）。

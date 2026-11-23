@@ -3,6 +3,15 @@
 ## Unreleased
 
 
+- Server, RAM tier: the payload it holds is visible (REQ-13). New
+  `dfkv_ram_payload_bytes`, the payload bytes of the resident values;
+  `dfkv_ram_used_bytes` counts whole slots. With large values the arena
+  holds much less than its size: an extent holds a whole number of slots
+  and the rest is idle, so 17 MiB values fill about half of an arena of
+  32 MiB extents (53%, 80% with 128 MiB extents) and 10 MiB values 63%
+  (86%), measured in a single-size unit test. DEPLOY.md says when to raise
+  `DFKV_RAM_TIER_EXTENT_BYTES` and what it costs.
+
 - vLLM: the per-step connector metadata no longer carries two fields no
   worker read: the ids of all unfinished requests and each request's
   `is_last_chunk`. On a decode step with 1024 running requests and no

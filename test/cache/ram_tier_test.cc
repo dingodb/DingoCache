@@ -221,6 +221,51 @@ TEST(RamTier, ShutdownDrainTimeoutAndAckDurabilityLatencyAreObservable) {
             std::string::npos);
 }
 
+// PayloadBytes counts the payload of what is resident: puts add their
+// length, removals and evictions take it away, and slot rounding is not in
+// it (UsedBytes is).
+TEST(RamTier, PayloadBytesFollowsWhatIsResident) {
+  ScopedEnv extent("DFKV_RAM_TIER_EXTENT_BYTES", "1048576");
+  RamTier::Options options = Opts(4 << 20);
+  options.reclaim_interval_ms = 0;
+  options.large_reserve_bytes = 0;
+  RamTier rt(options, [](const BlockKey&, char*, size_t, size_t) {
+    return Status::kOk;
+  });
+  ASSERT_TRUE(rt.ok());
+  EXPECT_EQ(rt.PayloadBytes(), 0u);
+  const std::string small(100, 's'), page(4096, 'p'), odd(5000, 'o');
+  ASSERT_EQ(rt.PutCommitted(K(1), small.data(), small.size()).status, Status::kOk);
+  ASSERT_EQ(rt.PutCommitted(K(2), page.data(), page.size()).status, Status::kOk);
+  ASSERT_EQ(rt.PutCommitted(K(3), odd.data(), odd.size()).status, Status::kOk);
+  EXPECT_EQ(rt.PayloadBytes(), 100u + 4096u + 5000u);
+  EXPECT_GE(rt.UsedBytes(), 3u * 4096u + 4096u);
+  // A duplicate keeps the first value.
+  ASSERT_EQ(rt.PutCommitted(K(2), odd.data(), odd.size()).status, Status::kOk);
+  EXPECT_EQ(rt.PayloadBytes(), 100u + 4096u + 5000u);
+  ASSERT_TRUE(rt.Remove(K(1)));
+  EXPECT_EQ(rt.PayloadBytes(), 4096u + 5000u);
+
+  // Far more than fits: what is left resident is what is counted.
+  for (uint64_t id = 100; id < 1600; ++id)
+    ASSERT_EQ(rt.PutCommitted(K(id), page.data(), page.size()).status,
+              Status::kOk);
+  uint64_t resident = 0;
+  for (uint64_t id : {uint64_t{2}, uint64_t{3}}) {
+    size_t len = 0;
+    if (rt.Lookup(K(id), &len)) resident += len;
+  }
+  for (uint64_t id = 100; id < 1600; ++id) {
+    size_t len = 0;
+    if (rt.Lookup(K(id), &len)) resident += len;
+  }
+  EXPECT_LT(resident, 1500u * 4096u) << "nothing was evicted";
+  EXPECT_EQ(rt.PayloadBytes(), resident);
+  for (uint64_t id = 0; id < 1600; ++id) rt.Remove(K(id));
+  EXPECT_EQ(rt.PayloadBytes(), 0u);
+  EXPECT_EQ(rt.UsedBytes(), 0u);
+}
+
 // A stopping server gives the backlog a time limit. When it runs out, the
 // flushers finish what they hold and leave the rest: nothing is written after
 // StopBackground returns, and destruction does not resume the drain.
