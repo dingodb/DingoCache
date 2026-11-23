@@ -322,6 +322,63 @@ class DraftKeysAreNotParked(unittest.TestCase):
         self.assertFalse(draft & set(b._pending_retain), "draft keys parked")
 
 
+class ParkedTtlsExpire(unittest.TestCase):
+    """HIC-28: a TTL a touch parked for a key not stored yet never lapsed.
+    A write long after the touch protected the page for a full TTL the
+    request no longer needed, and parked keys whose write never came stayed
+    until 2^20 newer keys pushed them out."""
+
+    def setUp(self):
+        self.b = _backend(kda=False, indexer=False)
+        self.b._has_retain = True
+        self.b._pending_retain = collections.OrderedDict()
+        self.b._pending_lock = threading.Lock()
+        self.clock = [1000.0]
+        self._monotonic = H.time.monotonic
+        H.time.monotonic = lambda: self.clock[0]
+
+    def tearDown(self):
+        H.time.monotonic = self._monotonic
+
+    def _touch_misses(self, pages, c):
+        H.dfkv_cabi.call_batch_retain = lambda lib, h, keys, ttl, mode, **k: (
+            c.retain_calls.append((list(keys), ttl, mode))
+            or [H.dfkv_cabi.DFKV_RET_MISS] * len(keys))
+        self.b.batch_touch(pages, TTL)
+        self.b._touch_seen = None  # the next touch is not debounced
+
+    def _sets_of_write(self, c, pages):
+        def retain(lib, h, keys, ttl, mode, **k):
+            c.retain_calls.append((list(keys), ttl, mode))
+            return [H.dfkv_cabi.DFKV_RET_PROTECTED_NEW] * len(keys)
+        H.dfkv_cabi.call_batch_retain = retain
+        del c.retain_calls[:]
+        self.b.batch_set_v1(pages, list(range(len(pages))))
+        return [(len(keys), ttl) for keys, ttl, _m in c.retain_calls]
+
+    def test_a_parked_ttl_applies_what_is_left_of_it(self):
+        with _Cabi() as c:
+            self._touch_misses(PAGES, c)
+            self.clock[0] += 1000.5
+            self.assertEqual(self._sets_of_write(c, PAGES),
+                             [(len(PAGES), TTL["retain_ttl_s"] - 1000)])
+
+    def test_a_parked_ttl_lapses_after_its_ttl(self):
+        with _Cabi() as c:
+            self._touch_misses(PAGES, c)
+            self.clock[0] += TTL["retain_ttl_s"]
+            self.assertEqual(self._sets_of_write(c, PAGES), [])
+        self.assertEqual(len(self.b._pending_retain), 0)
+
+    def test_lapsed_keys_leave_the_table(self):
+        with _Cabi() as c:
+            self._touch_misses(PAGES[:2], c)
+            self.clock[0] += TTL["retain_ttl_s"]
+            self._touch_misses(PAGES[2:], c)
+        self.assertEqual(set(self.b._pending_retain),
+                         {sk for k in PAGES[2:] for sk in self.b._keys(k)})
+
+
 class RetainPrecheck(unittest.TestCase):
     def setUp(self):
         self.b = _backend()
@@ -447,8 +504,7 @@ class AnchorMarkerRetention(unittest.TestCase):
     def test_parked_ttl_is_applied_by_the_marker_write(self):
         b = self._backend()
         markers = [sk for k in PAGES for sk in b._keys(k)]
-        for sk in markers:
-            b._pending_retain[sk] = 3600
+        b._park_retain(markers, 3600)
         with _Cabi() as c:
             self.assertEqual(b.batch_set_v1(PAGES, list(range(3))),
                              [True] * 3)
