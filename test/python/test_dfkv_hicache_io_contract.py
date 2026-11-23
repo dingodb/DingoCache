@@ -155,7 +155,7 @@ class _Store:
         self.probes = []
         plugin._batch_exist_flat = self.exist
 
-    def exist(self, subkeys):
+    def exist(self, subkeys, renew=True):
         self.probes.append(list(subkeys))
         return [sk in self.present for sk in subkeys]
 
@@ -499,7 +499,8 @@ class ExistsV2Window(unittest.TestCase):
                      _metrics=types.SimpleNamespace(
                          on_exists_v2=lambda **k: None,
                          on_exists=lambda **k: None))
-        st._batch_exist_flat = lambda sks: [present(sk) for sk in sks]
+        st._batch_exist_flat = (
+            lambda sks, renew=True: [present(sk) for sk in sks])
         return st
 
     def _present(self, dsa_missing, swa_pages):
@@ -532,6 +533,36 @@ class ExistsV2Window(unittest.TestCase):
         st = self._plugin(self._present(dsa_missing={6}, swa_pages={9}))
         self.assertEqual(
             st.batch_exists_v2(self.PAGES, self._transfers()).kv_hit_pages, 0)
+
+    def test_side_pools_are_probed_in_one_round_trip(self):
+        # One native existence call for the KV prefix and one for all side
+        # pools; there was one call per side pool.
+        st = self._plugin(self._present(dsa_missing=set(), swa_pages={9}))
+        calls = []
+        probe = st._batch_exist_flat
+        st._batch_exist_flat = (
+            lambda sks, renew=True: calls.append(len(sks)) or probe(sks))
+        res = st.batch_exists_v2(self.PAGES, self._transfers())
+        self.assertEqual(res.kv_hit_pages, 10)
+        self.assertEqual(calls, [10, 20])
+
+    def test_pools_after_an_empty_prefix_get_no_verdict_and_no_renewal(self):
+        # dsa leaves no usable prefix (page 1 missing): the reference stops
+        # there. swa must get no verdict, and with retention on the ring its
+        # objects must not be renewed (renewal follows the judged pools only).
+        from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy
+        present = self._present(dsa_missing={0}, swa_pages=set(range(10)))
+        st = self._plugin(present)
+        st._has_retain = True
+        probes = []
+        st._batch_exist_flat = lambda sks, renew=True: (
+            probes.append((renew, list(sks))) or [present(sk) for sk in sks])
+        res = st.batch_exists_v2(self.PAGES, self._transfers())
+        self.assertEqual(res.kv_hit_pages, 0)
+        self.assertNotIn("swa", res.extra_pool_hit_pages)
+        renewed = [sk for renew, sks in probes if renew for sk in sks]
+        self.assertFalse(any(b"swa" in sk for sk in renewed), "swa renewed")
+        self.assertTrue(any(b"dsa" in sk for sk in renewed), "dsa renewed")
 
     def test_restorable_lengths_are_reported_when_sglang_has_the_field(self):
         import dataclasses

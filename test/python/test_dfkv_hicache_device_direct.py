@@ -28,7 +28,8 @@ import shutil  # noqa: E402
 
 import numpy as np  # noqa: E402
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig  # noqa: E402
+from sglang.srt.mem_cache.hicache_storage import (  # noqa: E402
+    HiCacheStorageConfig, PoolTransfer)
 import dfkv_hicache  # noqa: E402
 
 _FENCE_ENV = "DFKV_GPU_LOAD_FENCE"
@@ -686,6 +687,45 @@ class TestDeviceDirectEndToEnd(unittest.TestCase):
         self.assertEqual(
             st.batch_get_v1(["stored", "never_written"], [0, 1]),
             [True, False])
+
+    @staticmethod
+    def _native_counter(st, sample):
+        text = dfkv_hicache._read_snapshot(st._lib, st._h)
+        m = re.search("^" + re.escape(sample) + r" (\d+)$", text, re.M)
+        return int(m.group(1)) if m else 0
+
+    def test_exists_v2_probes_side_pools_in_one_round_trip(self):
+        """Measured over the transport: the native existence calls and time
+        of one batch_exists_v2 over 5 side pools."""
+        st = self._plugin(self._node("existsv2"))
+        st.mem_pool_host = _NumpyHostPool(4096)
+        pages = [f"e{i}" for i in range(256)]
+        self.assertEqual(st.batch_set_v1(pages, list(range(256))),
+                         [True] * 256)
+        names = [f"side{i}" for i in range(5)]
+        for name in names:
+            st.register_mem_host_pool_v2(_NumpyHostPool(64), name)
+        transfers = [PoolTransfer(name, keys=pages,
+                                  host_indices=list(range(256)))
+                     for name in names]
+        stored = st.batch_set_v2(transfers)
+        self.assertTrue(all(all(ok) for ok in stored.values()), stored)
+        sample = 'dfkv_client_op_requests_total{op="exist"}'
+        before = self._native_counter(st, sample)
+        rounds = 20
+        t0 = time.perf_counter()
+        for _ in range(rounds):
+            self.assertEqual(
+                st.batch_exists_v2(pages, transfers).kv_hit_pages, 256)
+        ms = (time.perf_counter() - t0) / rounds * 1e3
+        calls = (self._native_counter(st, sample) - before) / rounds
+        sys.stderr.write(
+            f"[measure] batch_exists_v2, 256 pages x 5 side pools: "
+            f"{calls:g} native exist calls, {ms:.2f} ms "
+            f"(retention {st._has_retain})\n")
+        # KV probe, side-pool probe, and on a ring with retention one REFRESH
+        # of the judged side pools.
+        self.assertEqual(calls, 2 + int(st._has_retain))
 
     def test_registered_device_pool_without_bypass_keeps_host_keys(self):
         """SGLang may register the device pool without using the bypass. The
