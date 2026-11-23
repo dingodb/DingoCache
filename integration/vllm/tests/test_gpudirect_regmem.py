@@ -9,7 +9,7 @@ Run inside the vLLM image (torch + CUDA) against a running dfkv_server:
 
     DFKV_LIB=.../build-rdma/libdfkv.so \
     DFKV_MEMBERS=c1=<ip>:<rdma-port> \
-    DFKV_RDMA=1 DFKV_RDMA_DEV=ib7s400p0 \
+    DFKV_RDMA=1 DFKV_RDMA_DEV=mlx5_0 \
         python integration/vllm/tests/test_gpudirect_regmem.py
 
 NOTE: DFKV_MEMBERS must use the server's --rdma-port, and DFKV_RDMA=1 must be set

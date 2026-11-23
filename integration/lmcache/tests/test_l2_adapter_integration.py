@@ -17,7 +17,7 @@ Env:
 
 Run on a node with a ring:
     DFKV_L2_URL=dfkv://127.0.0.1:28150/glm DFKV_LIB=/dfkv/lib/libdfkv.so \
-    DFKV_RDMA=1 DFKV_RDMA_DEV=ib7s400p0 \
+    DFKV_RDMA=1 DFKV_RDMA_DEV=mlx5_0 \
     python3 -m pytest integration/lmcache/tests/test_l2_adapter_integration.py -v -m integration
 """
 

@@ -74,7 +74,7 @@ class ClientMetricsTest(unittest.TestCase):
             'dfkv_client_op_requests_total{op="get"} 7\n'
             'dfkv_client_peer_errors_total'
             '{peer="node\\\"1\\\\rail\\nA"} 3\n'
-            'dfkv_rdma_client_rail_quarantined{dev="ib7s400p3"} 1\n'
+            'dfkv_rdma_client_rail_quarantined{dev="mlx5_3"} 1\n'
             'unknown_metric_total 99\n'
         )
         samples = parse_snapshot(text)
@@ -86,7 +86,7 @@ class ClientMetricsTest(unittest.TestCase):
                 ("dfkv_client_peer_errors_total",
                  ('node"1\\rail\nA',), 3.0),
                 ("dfkv_rdma_client_rail_quarantined",
-                 ("ib7s400p3",), 1.0),
+                 ("mlx5_3",), 1.0),
             ],
         )
 
@@ -151,9 +151,9 @@ class ClientMetricsTest(unittest.TestCase):
             'dfkv_rdma_client_keepalive_successes_total 8\n'
             'dfkv_rdma_client_keepalive_failures_total 1\n'
             'dfkv_rdma_client_pool_connections'
-            '{lane="sg",state="idle",dev="ib7s400p0"} 6\n'
+            '{lane="sg",state="idle",dev="mlx5_0"} 6\n'
             'dfkv_rdma_client_peer_connections'
-            '{peer="dfkv-3",dev="ib7s400p0"} 9\n'
+            '{peer="dfkv-3",dev="mlx5_0"} 9\n'
             'dfkv_rdma_client_pool_limit 8\n'
         )
         self.assertEqual(
@@ -166,9 +166,9 @@ class ClientMetricsTest(unittest.TestCase):
                 ("dfkv_rdma_client_keepalive_successes_total", (), 8.0),
                 ("dfkv_rdma_client_keepalive_failures_total", (), 1.0),
                 ("dfkv_rdma_client_pool_connections",
-                 ("sg", "idle", "ib7s400p0"), 6.0),
+                 ("sg", "idle", "mlx5_0"), 6.0),
                 ("dfkv_rdma_client_peer_connections",
-                 ("dfkv-3", "ib7s400p0"), 9.0),
+                 ("dfkv-3", "mlx5_0"), 9.0),
                 ("dfkv_rdma_client_pool_limit", (), 8.0),
             ],
         )

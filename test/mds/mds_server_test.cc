@@ -184,7 +184,7 @@ TEST(MdsServer, InfoFlowsRegisterThroughEtcdToList) {
   std::string group = "itest-info-" + std::to_string(port);
 
   MemberInfo m{"ni", "10.1.1.9", 28001, 2, 28100,
-               "ver=1.8.0,engine=slab,disks=3,cap=5497558138880,ram=0,rdma=ib7s400p0"};
+               "ver=1.8.0,engine=slab,disks=3,cap=5497558138880,ram=0,rdma=mlx5_0"};
   Status st; std::string data;
   ASSERT_TRUE(DoReq(port, WireOp::kRegister, EncodeMemberReq(group, m), &st, &data));
   EXPECT_EQ(st, Status::kOk);
@@ -201,7 +201,7 @@ TEST(MdsServer, InfoFlowsRegisterThroughEtcdToList) {
   // the re-put must propagate it, and the epoch must NOT change (info is
   // excluded from MembersEpoch -- no needless client ring rebuilds).
   uint64_t epoch_before = epoch;
-  m.info = "ver=1.9.0,engine=slab,disks=3,cap=5497558138880,ram=0,rdma=ib7s400p0";
+  m.info = "ver=1.9.0,engine=slab,disks=3,cap=5497558138880,ram=0,rdma=mlx5_0";
   ASSERT_TRUE(DoReq(port, WireOp::kHeartbeat, EncodeMemberReq(group, m), &st, &data));
   EXPECT_EQ(st, Status::kOk);
   ASSERT_TRUE(DoReq(port, WireOp::kListMembers, group, &st, &data));

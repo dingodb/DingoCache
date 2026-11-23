@@ -20,12 +20,12 @@ dfkv_client_ops_served_total 42
 dfkv_client_op_requests_total{op="get"} 8
 dfkv_client_io_errors_total 2
 dfkv_client_peer_errors_total{peer="192.168.5.1:28101"} 3
-dfkv_rdma_client_rail_selections_total{dev="ib7s400p0"} 17
-dfkv_rdma_client_rail_put_ops_total{dev="ib7s400p0"} 4
-dfkv_rdma_client_rail_put_bytes_total{dev="ib7s400p0"} 4096
-dfkv_rdma_client_rail_get_ops_total{dev="ib7s400p0"} 3
-dfkv_rdma_client_rail_get_bytes_total{dev="ib7s400p0"} 3072
-dfkv_rdma_client_rail_errors_total{dev="ib7s400p0"} 1
+dfkv_rdma_client_rail_selections_total{dev="mlx5_0"} 17
+dfkv_rdma_client_rail_put_ops_total{dev="mlx5_0"} 4
+dfkv_rdma_client_rail_put_bytes_total{dev="mlx5_0"} 4096
+dfkv_rdma_client_rail_get_ops_total{dev="mlx5_0"} 3
+dfkv_rdma_client_rail_get_bytes_total{dev="mlx5_0"} 3072
+dfkv_rdma_client_rail_errors_total{dev="mlx5_0"} 1
 dfkv_rdma_client_mr_registered_bytes 134217728
 dfkv_rdma_client_completion_timeouts_total 4
 """
@@ -43,11 +43,11 @@ def test_poller_tracks_native_families_and_reset_safe_deltas():
     assert poller.totals()["dfkv_client_ops_served_total"] == 47
     assert poller.totals()['dfkv_client_op_requests_total{op="get"}'] == 8
     assert poller.totals()[
-        'dfkv_rdma_client_rail_errors_total{dev="ib7s400p0"}'] == 1
+        'dfkv_rdma_client_rail_errors_total{dev="mlx5_0"}'] == 1
     assert poller.totals()[
-        'dfkv_rdma_client_rail_put_bytes_total{dev="ib7s400p0"}'] == 4096
+        'dfkv_rdma_client_rail_put_bytes_total{dev="mlx5_0"}'] == 4096
     assert poller.totals()[
-        'dfkv_rdma_client_rail_get_bytes_total{dev="ib7s400p0"}'] == 3072
+        'dfkv_rdma_client_rail_get_bytes_total{dev="mlx5_0"}'] == 3072
     assert poller.health()["success"] == 1
 
 
@@ -59,7 +59,7 @@ def test_hicache_identity_and_exist_outcomes_are_observable():
         pcp_rank=6,
         dcp_rank=0,
         storage_pcp_rank=0,
-        primary_dev="ib7s400p6",
+        primary_dev="mlx5_6",
     )
     metrics.on_exists(8, 0, 0, seconds=0.001)
     metrics.on_exists(8, 6, 4, seconds=0.002)
@@ -71,7 +71,7 @@ def test_hicache_identity_and_exist_outcomes_are_observable():
         "pcp_rank": "6",
         "dcp_rank": "0",
         "storage_pcp_rank": "0",
-        "primary_dev": "ib7s400p6",
+        "primary_dev": "mlx5_6",
     }
     assert snapshot["exist_calls"] == 3
     assert snapshot["exist_probe_pages"] == 24
@@ -110,7 +110,7 @@ def test_prometheus_scrape_contains_native_failure_and_rail_signals():
         {"tp_rank": "78", "peer": "192.168.5.1:28101"}) == 3
     assert registry.get_sample_value(
         "dfkv_rdma_client_rail_errors_total",
-        {"tp_rank": "78", "dev": "ib7s400p0"}) == 1
+        {"tp_rank": "78", "dev": "mlx5_0"}) == 1
     assert registry.get_sample_value(
         "dfkv_rdma_client_completion_timeouts_total",
         {"tp_rank": "78"}) == 4

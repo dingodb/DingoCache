@@ -30,7 +30,7 @@ TEST(MdsProto, RejectsTruncated) {
 
 TEST(MdsProto, MemberReqCarriesInfo) {
   MemberInfo m{"n7", "192.168.1.7", 28101, 2, 28100,
-               "ver=1.8.0,engine=slab,disks=3,cap=5497558138880,ram=0,rdma=ib7s400p0"};
+               "ver=1.8.0,engine=slab,disks=3,cap=5497558138880,ram=0,rdma=mlx5_0"};
   std::string payload = EncodeMemberReq("glm", m);
   std::string group;
   MemberInfo got;

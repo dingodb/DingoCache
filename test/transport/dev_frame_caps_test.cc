@@ -19,8 +19,8 @@ namespace dfkv::rdma {
 
 TEST(DevFrameCaps, V2RoundTrip) {
   char frame[kDevNameBytes];
-  EncodeDevFrame("ib7s400p0", 4u << 20, frame);
-  EXPECT_STREQ(frame, "ib7s400p0");
+  EncodeDevFrame("mlx5_0", 4u << 20, frame);
+  EXPECT_STREQ(frame, "mlx5_0");
   EXPECT_EQ(ParseDevFrameCaps(frame), 4u << 20);
   EXPECT_EQ(ParseDevFrameProtocol(frame), kDevProtoV2);
 }
@@ -50,7 +50,7 @@ TEST(DevFrameCaps, RawOpaqueControlValueKeepsBit63) {
 
 TEST(DevFrameCaps, V2RequiresDeclarationAndTailRoom) {
   char f[kDevNameBytes];
-  EncodeDevFrame("ib7s400p0", 0, f, kDevProtoV2);
+  EncodeDevFrame("mlx5_0", 0, f, kDevProtoV2);
   EXPECT_EQ(ParseDevFrameProtocol(f), 0);
 
   std::string too_long(19, 'x');
@@ -77,7 +77,7 @@ TEST(DevFrameCaps, HistoricalProtocolFrameIsRejected) {
 
 TEST(DevFrameCaps, ZeroDeclarationIsRejected) {
   char frame[kDevNameBytes];
-  EncodeDevFrame("ib7s400p0", 0, frame);
+  EncodeDevFrame("mlx5_0", 0, frame);
   EXPECT_EQ(ParseDevFrameCaps(frame), 0u);
   EXPECT_EQ(ParseDevFrameProtocol(frame), 0);
 }

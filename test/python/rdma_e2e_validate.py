@@ -7,7 +7,7 @@ RDMA scatter -> dfkv_server — against a running remote cache node, and asserts
 GET payload lands directly in the numpy host-pool buffer (zero copy).
 
 Run on the client node:
-    DFKV_RDMA=1 DFKV_RDMA_DEV=ib7s400p0 \
+    DFKV_RDMA=1 DFKV_RDMA_DEV=mlx5_0 \
     DFKV_MEMBERS='n=10.0.0.2:28001' DFKV_PAGE_BYTES=2752512 DFKV_PAGES=32 \
     python3 rdma_e2e_validate.py
 
