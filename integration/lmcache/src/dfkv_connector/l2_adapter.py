@@ -48,6 +48,7 @@ from dfkv_common import (
     pool_key,
     reject_namespace_override,
 )
+from dfkv_common.config_check import validate_extra_config
 
 from lmcache.logging import init_logger
 
@@ -189,6 +190,10 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
 
     @classmethod
     def from_dict(cls, d: dict) -> "DfkvL2AdapterConfig":
+        validate_extra_config(
+            d, identity_keys=("model_name", "model_revision", "tenant_id",
+                              "key_includes_model"),
+            label="dfkv L2 adapter")
         url = d.get("url")
         if not isinstance(url, str) or not url:
             raise ValueError("dfkv L2 adapter: 'url' must be a non-empty string")

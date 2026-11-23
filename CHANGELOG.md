@@ -3,6 +3,23 @@
 ## Unreleased
 
 
+- vLLM connector and LMCache L2 adapter: a misspelt identity key fails
+  startup. A `kv_connector_extra_config` key one or two characters away from
+  `model_revision`, `require_model_revision`, `share_across_dp_sizes`,
+  `tenant_id` or `enable_cross_layers_blocks` (vLLM), or an L2 adapter key
+  that close to `model_name`, `model_revision`, `tenant_id` or
+  `key_includes_model`, was not read, so its default applied and deployments
+  meant to be told apart shared keys; it now refuses to start, with the
+  rules HiCache applies since 2.42 (now shared in
+  `dfkv_common.config_check`). vLLM integer settings that are not integers
+  (`batch_concurrency`, `mds_poll_ms`, `recv_workers`, `load_window_keys`,
+  `lookup_cache_ttl_ms`, `lookup_timeout_ms`, `lookup_rpc_port`) also refuse
+  to start; `mds_poll_ms` and `batch_concurrency` were truncated before,
+  and `lookup_rpc_port` must now be an integer (a token such as `dp0`
+  refuses startup).
+  Other unknown keys are not checked. Behaviour change: a configuration with
+  such a typo that started before does not start now.
+
 - vLLM: a failed load is not billed as a cache read. For a request with a
   retention TTL the connector reports `cached_tokens` and
   `cache_write_tokens` from its lookup; when the load failed and vLLM

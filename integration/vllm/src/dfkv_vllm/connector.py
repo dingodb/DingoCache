@@ -46,6 +46,8 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
+from dfkv_common.config_check import validate_extra_config
+
 try:
     from vllm.config.kv_transfer import KVCacheAccess
 except ImportError:  # vLLM before #66605 lists RDMA connectors by name
@@ -71,6 +73,16 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+
+# kv_connector_extra_config keys that select the stored bytes' identity (a
+# near-miss of one fails startup) and keys read as integers.
+EXTRA_CONFIG_IDENTITY_KEYS = (
+    "model_revision", "require_model_revision", "share_across_dp_sizes",
+    "tenant_id", "enable_cross_layers_blocks")
+EXTRA_CONFIG_INTEGER_KEYS = (
+    "batch_concurrency", "mds_poll_ms", "recv_workers", "load_window_keys",
+    "lookup_cache_ttl_ms", "lookup_timeout_ms", "lookup_rpc_port")
 
 class DfkvStoreKVEvents(KVConnectorKVEvents):
     """KV event aggregation for DfkvStoreConnector.
@@ -189,6 +201,11 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
         )
         assert vllm_config.kv_transfer_config is not None
         assert kv_cache_config is not None, "kv_cache_config is required"
+        validate_extra_config(
+            vllm_config.kv_transfer_config.kv_connector_extra_config or {},
+            identity_keys=EXTRA_CONFIG_IDENTITY_KEYS,
+            integer_keys=EXTRA_CONFIG_INTEGER_KEYS,
+            label="kv_connector_extra_config")
         self._validate_kv_cache_config(vllm_config, kv_cache_config)
         self._kv_cache_config = kv_cache_config
         self.kv_role = vllm_config.kv_transfer_config.kv_role

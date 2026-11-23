@@ -1155,6 +1155,13 @@ namespace/key 不一致是预期 cold miss。**空环 / MDS 不可达**可直接
 
 `load_async=True` 在 KDA+MLA hybrid 上的验证（2026-11-10，单机 8 卡，Kimi-Linear-48B-A3B，TP8，vLLM `v0.23.1rc1.dev7153`，dfkv 2.35.1）：并发 1、32K 前缀，冷轮后 reset 本地前缀缓存、热轮整段前缀从 L3 读回（外部命中 262,144 token，仅计算 512 token 后缀），`True` 与 `False` 的热轮输出都与冷轮逐 token 一致（8/8）；并发 16、64K 前缀，两种模式的外部命中、本地命中与计算 token 完全相同，零失败，输出一致率相同（受批形状非确定性影响，两种模式均约 53/64）。DSA indexer 池（Kimi K3.1）尚未覆盖。
 
+启动时校验本表：与 `model_revision`、`require_model_revision`、
+`share_across_dp_sizes`、`tenant_id`、`enable_cross_layers_blocks` 只差一两个字符的
+未知键（如 `modle_revision`）直接拒绝启动，规则与 HiCache（§2.1）相同；整数键
+（`batch_concurrency`、`mds_poll_ms`、`recv_workers`、`load_window_keys`、
+`lookup_cache_ttl_ms`、`lookup_timeout_ms`、`lookup_rpc_port`）不是整数时拒绝启动。
+其余未知键不检查。
+
 DCP（decode context parallel）宽度/Rank **不是**本表键：连接器从 vLLM 运行时取
 （`get_dcp_group().world_size`），与 `tp_rank=-1`（replicated-MLA 存储坐标）一起进入
 canonical key metadata（§1.4），勿在 extra_config 手工设定。
@@ -1498,6 +1505,9 @@ client 启动时挨个尝试，失败自动下位。若以后只改了一处且�
   "tenant_id":"prod-chat",
   "num_workers":16}
 ```
+
+adapter 配置里与 `model_name`、`model_revision`、`tenant_id`、`key_includes_model`
+只差一两个字符的未知键（如 `model_revison`）启动时拒绝，规则同 HiCache（§2.1）。
 
 #### 多模型/多租户配置（对应 §5 四维度）
 
