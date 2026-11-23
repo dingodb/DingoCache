@@ -3,6 +3,14 @@
 ## Unreleased
 
 
+- Client, per-key cost. Every key's identity hashed the namespace again (a
+  canonical namespace is about 175 bytes, two of the six SHA-256 blocks of a
+  vLLM key) and recomputed the tenant hash; the client now hashes the
+  namespace's part once: 1160 to 635 ns per key. Routing computed the key's
+  MD5 under the ring lock that every routed key of every thread takes; with
+  8 threads routing 200 000 keys took 335 ms, now 60 ms (one thread: 115 ms
+  either way). Keys and routes are unchanged.
+
 - Client, MDS discovery: a shrink the placement guard refuses no longer cuts
   the data path to the omitted peers. The guard keeps such peers on the ring
   (the typical case is etcd leases of live nodes expiring together), but the

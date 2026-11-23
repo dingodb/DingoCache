@@ -95,3 +95,17 @@ TEST(ConHash, WeightShiftsShareProportionally) {
   }
   EXPECT_GT(counts["heavy"], counts["light"] * 2);  // ~4:1 weight => heavy dominates
 }
+
+TEST(ConHash, LookupHashEqualsLookup) {
+  ConHash ring;
+  for (int i = 0; i < 16; ++i) ring.AddNode("node-" + std::to_string(i));
+  ring.Build();
+  for (int i = 0; i < 2000; ++i) {
+    const std::string key = "key-" + std::to_string(i);
+    std::string by_key;
+    std::string by_hash;
+    ASSERT_TRUE(ring.Lookup(key, &by_key));
+    ASSERT_TRUE(ring.LookupHash(ConHash::KeyHash(key), &by_hash));
+    ASSERT_EQ(by_key, by_hash) << key;
+  }
+}

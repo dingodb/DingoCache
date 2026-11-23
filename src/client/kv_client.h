@@ -20,6 +20,7 @@
 #include <utility>
 #include <vector>
 
+#include "client/key_map.h"
 #include "utils/con_hash.h"
 #include "client/node_dedup.h"
 #include "client/node_dedup_gpu.h"
@@ -336,6 +337,7 @@ class KVClient {
   std::map<std::string, std::string> published_peers_;
   std::condition_variable ring_cv_;  // notified when AdoptRing sets a non-empty ring
   std::string key_namespace_;
+  BlockKeyHasher block_key_;  // ToBlockKey(key_namespace_, key)
   uint64_t namespace_hash_ = 0;
   std::unique_ptr<Transport> owned_;
   // Null until the constructor selects a transport; AdoptRing runs earlier

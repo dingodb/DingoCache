@@ -39,9 +39,14 @@ std::map<std::string, size_t> ConHash::NodePointCounts() const {
   return counts;
 }
 
+uint32_t ConHash::KeyHash(const std::string& key) { return Md5_32(key); }
+
 bool ConHash::Lookup(const std::string& key, std::string* node) const {
+  return LookupHash(KeyHash(key), node);
+}
+
+bool ConHash::LookupHash(uint32_t h, std::string* node) const {
   if (ring_.empty()) return false;
-  uint32_t h = Md5_32(key);
   auto it = ring_.lower_bound(h);
   if (it == ring_.end()) it = ring_.begin();  // wrap around the ring
   *node = it->second;
