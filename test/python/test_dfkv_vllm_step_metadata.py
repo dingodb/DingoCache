@@ -5,6 +5,9 @@
   ReqMeta went from about 115 KiB to 19 KiB).
 * The pending-load scan of build_connector_meta checks scheduled request ids
   in a set, not in lists (quadratic in the number of requests).
+* Every step carried the ids of all unfinished requests and each ReqMeta an
+  is_last_chunk flag; no worker read either. On a decode step with 1024
+  running requests and no ReqMeta the ids were 43 KB of the 43.1 KB pickled.
 
 Runs on the stand-ins of test_dfkv_vllm_worker.
 """
@@ -42,6 +45,16 @@ class StepMetadata(unittest.TestCase):
         calls = source.count("ReqMeta.from_request_tracker(")
         self.assertEqual(source.count("with_token_ids=self._kv_events"), calls)
         # The flag itself: test_dfkv_vllm_connector.SchedulerLookupTest.
+
+
+    def test_no_unread_fields_are_sent(self) -> None:
+        import pickle
+        from dfkv_vllm.data import DfkvStoreConnectorMetadata
+        meta = DfkvStoreConnectorMetadata(set())
+        meta.add_request(ReqMeta.from_request_tracker(_tracker(), 64))
+        self.assertNotIn("unfinished_request_ids", vars(meta))
+        self.assertNotIn("is_last_chunk", vars(meta.requests[0]))
+        self.assertLess(len(pickle.dumps(meta)), 4096)
 
 
 if __name__ == "__main__":

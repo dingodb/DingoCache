@@ -148,7 +148,7 @@ class PreemptFenceTest(unittest.TestCase):
         connector._shutdown_condition = threading.Condition()
         connector._shutdown = False
         connector._inflight_calls = 0
-        metadata = DfkvStoreConnectorMetadata(set(), {"preempted"})
+        metadata = DfkvStoreConnectorMetadata({"preempted"})
         if ActiveKVConnector is not None:
             runner_hook = object.__new__(ActiveKVConnector)
             runner_hook.kv_connector = connector

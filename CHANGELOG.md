@@ -3,6 +3,12 @@
 ## Unreleased
 
 
+- vLLM: the per-step connector metadata no longer carries two fields no
+  worker read: the ids of all unfinished requests and each request's
+  `is_last_chunk`. On a decode step with 1024 running requests and no
+  request metadata the ids were 43 KB of the 43.1 KB pickled to every
+  worker; with 32 requests to save or load and 512 running, 20 KB of 180 KB.
+
 - LMCache: the health ping asks the ring. `ping` only checked that the
   client handle was open, so a ring with every node down or hung answered as
   healthy. It now GETs eight sentinel keys (one byte, no write; a node only

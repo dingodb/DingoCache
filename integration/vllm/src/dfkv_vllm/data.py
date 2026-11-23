@@ -496,7 +496,6 @@ class ReqMeta:
 
     can_save: bool | None = None
     load_spec: LoadSpec | None = None
-    is_last_chunk: bool | None = None
     current_event: torch.cuda.Event | None = None
     # Assigned by the worker when registering a SAVE, never a cache-key field.
     save_generation: int = 0
@@ -527,7 +526,6 @@ class ReqMeta:
         load_spec: LoadSpec | None = None,
         skip_save: bool | None = False,
         block_hashes: list[BlockHash] | None = None,
-        is_last_chunk: bool | None = None,
         num_prompt_tokens: int | None = None,
         with_token_ids: bool = True,
     ) -> "ReqMeta | None":
@@ -593,7 +591,6 @@ class ReqMeta:
             can_save=not skip_save,
             load_spec=load_spec,
             block_hashes=block_hashes,
-            is_last_chunk=is_last_chunk,
             token_ids=token_ids,
             step_end=input_token_len,
             num_prompt_tokens=(
@@ -605,13 +602,8 @@ class ReqMeta:
 class DfkvStoreConnectorMetadata(KVConnectorMetadata):
     """Metadata passed from scheduler to worker."""
 
-    def __init__(
-        self,
-        unfinished_request_ids: set[str],
-        preempted_req_ids: set[str],
-    ):
+    def __init__(self, preempted_req_ids: set[str]):
         self.requests: list[ReqMeta] = []
-        self.unfinished_request_ids = unfinished_request_ids
         self.preempted_req_ids = preempted_req_ids
 
     def add_request(self, req_meta: ReqMeta) -> None:

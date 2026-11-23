@@ -95,7 +95,6 @@ def test_two_allocation_free_chunks_reach_last_prefill_boundary():
     assert tracker.token_len == PREFILL_END
     assert tracker.token_ids == list(range(PREFILL_END))
     assert metadata.requests[-1].token_len_chunk == PREFILL_END
-    assert metadata.requests[-1].is_last_chunk is True
 
 
 def test_tracker_resynchronizes_from_authoritative_computed_position():
@@ -168,7 +167,6 @@ def test_sub_block_chunks_do_not_strand_640_boundary():
     )
     assert scheduler._request_trackers["req"].token_len == 1280
     assert third.requests[-1].token_len_chunk == 1280
-    assert third.requests[-1].is_last_chunk is True
 
 
 def test_empty_block_delta_is_not_treated_as_an_allocation():
