@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Client, RDMA: ENOMEM while building an endpoint no longer fails the
+  operation at once as if the process were out of memory. It may be the
+  device's own limit on QPs or CQs (RLIMIT_MEMLOCK is the process-wide
+  case), so the other rails are tried with a new connection each; only when
+  none can be opened does the operation fail with `kResourceExhausted`. No
+  rail is charged and the peer is not cooled, as before. A rail that failed
+  so opens no new endpoint for 2 s (its idle connections still serve);
+  when every rail without an idle connection is in that state, operations
+  fail at once without dialing
+  (`dfkv_rdma_client_local_resource_held_total`): each attempt cost the
+  peer a connection and a handshake it saw abandoned.
 - Client, RDMA: an operation that cannot open an endpoint for lack of file
   descriptors (in `socket()` for the bootstrap connection, or in building
   the endpoint) is now served on an idle connection to the same peer on
