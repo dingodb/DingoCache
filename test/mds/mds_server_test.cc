@@ -218,7 +218,11 @@ TEST(MdsServer, StatsFlowThroughEtcdAndAggregateInMetrics) {
   // GroupMetricsText aggregates per group; ListGroups enumerates the group.
   const char* ep = EtcdEp();
   if (!ep) GTEST_SKIP() << "set DFKV_TEST_ETCD=host:port";
+  // Stats alone are rewritten at most every DFKV_MDS_STATS_PUT_MS; with 0 the
+  // heartbeat below writes them at once.
+  ::setenv("DFKV_MDS_STATS_PUT_MS", "0", 1);
   MdsServer mds(ep);
+  ::unsetenv("DFKV_MDS_STATS_PUT_MS");
   ASSERT_EQ(mds.Start(0), Status::kOk);
   int port = mds.port();
   std::string group = "itest-stats-" + std::to_string(port);

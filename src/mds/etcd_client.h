@@ -15,6 +15,14 @@
 
 namespace dfkv {
 
+// One key as etcd holds it: absent, or its value and the lease it is
+// attached to (0 = none).
+struct KeyState {
+  bool exists = false;
+  std::string value;
+  int64_t lease = 0;
+};
+
 struct RangeResult {
   std::vector<std::pair<std::string, std::string>> kvs;  // decoded key, value
   int64_t revision = 0;  // etcd header revision — used as the membership epoch
@@ -34,6 +42,8 @@ class EtcdClient {
   bool LeaseKeepAlive(int64_t lease_id);
   bool Put(const std::string& key, const std::string& value, int64_t lease_id);
   std::optional<RangeResult> RangePrefix(const std::string& prefix);
+  // One key, with its lease. nullopt = etcd did not answer.
+  std::optional<KeyState> Get(const std::string& key);
   // Same bounded range operation, accounted separately so Prometheus scrapes
   // cannot be mistaken for control-plane membership traffic.
   std::optional<RangeResult> RangePrefixForMetrics(
@@ -46,7 +56,7 @@ class EtcdClient {
 
  private:
   enum class Op : size_t {
-    kLeaseGrant, kLeaseKeepAlive, kPut, kRange, kMetricsRange, kCount
+    kLeaseGrant, kLeaseKeepAlive, kPut, kRange, kMetricsRange, kGet, kCount
   };
   bool Post(Op op, const std::string& path, const std::string& body,
             HttpResponse* response);

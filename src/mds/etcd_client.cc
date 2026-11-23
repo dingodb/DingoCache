@@ -21,7 +21,7 @@ std::string PrefixRangeEnd(const std::string& prefix) {
 }  // namespace
 
 constexpr const char* kOpNames[] = {
-    "lease_grant", "lease_keepalive", "put", "range", "metrics_range"};
+    "lease_grant", "lease_keepalive", "put", "range", "metrics_range", "get"};
 
 bool EtcdClient::Post(Op op, const std::string& path, const std::string& body,
                       HttpResponse* response) {
@@ -184,6 +184,23 @@ std::optional<RangeResult> EtcdClient::RangePrefixAs(
       if (!Base64Decode(kv.get_str("value"), &v)) return std::nullopt;
       out.kvs.emplace_back(std::move(k), std::move(v));
     }
+  }
+  return out;
+}
+
+std::optional<KeyState> EtcdClient::Get(const std::string& key) {
+  HttpResponse r;
+  const std::string body = "{\"key\":\"" + Base64Encode(key) + "\"}";
+  if (!Post(Op::kGet, "/v3/kv/range", body, &r)) return std::nullopt;
+  JsonValue root;
+  if (!JsonParser::Parse(r.body, &root)) return std::nullopt;
+  KeyState out;
+  const JsonValue* kvs = root.find("kvs");
+  if (kvs && kvs->type == JsonValue::kArray && !kvs->arr.empty()) {
+    const JsonValue& kv = kvs->arr.front();
+    if (!Base64Decode(kv.get_str("value"), &out.value)) return std::nullopt;
+    out.exists = true;
+    out.lease = std::strtoll(kv.get_str("lease", "0").c_str(), nullptr, 10);
   }
   return out;
 }
