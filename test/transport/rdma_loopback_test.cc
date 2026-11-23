@@ -1959,30 +1959,56 @@ TEST(RdmaLoopback, ExistManyWindowedMixedHitMiss) {
   }
 }
 
-// out_dev names the rails a call used. One rail for every key of a batch is
-// one name, not one "->name" per key.
+// out_dev names the rails a call used, each time the rail changes: one rail
+// for every key of a batch is one name, not one "->name" per key. Each key
+// is its own pull and picks its rail (least occupancy and latency), so on
+// two rails a batch may use both and name both, alternating; it never names
+// the same rail twice in a row.
 TEST(RdmaLoopback, RangeIntoMultiNamesEachRailOnce) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   RdmaNode node("rimdev");
-  RdmaTransport rt(kMaxMsg);
-  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
-  constexpr int kKeys = 8;
-  std::vector<BlockKey> keys;
-  std::vector<std::string> bufs(kKeys, std::string(4096, '\0'));
-  std::vector<RangeDstMulti> dsts(kKeys);
-  for (int i = 0; i < kKeys; ++i) {
-    const std::string v(4096, static_cast<char>('a' + i));
-    ASSERT_TRUE(c.Put("rim" + std::to_string(i), v.data(), v.size())) << i;
-    keys.push_back(ToBlockKey(SelfHdr(), "rim" + std::to_string(i)));
-    dsts[i].payloads.emplace_back(&bufs[i][0], bufs[i].size());
+  const char* devs = std::getenv("DFKV_RDMA_DEV");
+  const std::string list = devs ? devs : "";
+  for (const bool one_rail : {true, false}) {
+    if (!one_rail && list.find(',') == std::string::npos) continue;
+    std::optional<ScopedEnv> rail;
+    if (one_rail && !list.empty())
+      rail.emplace("DFKV_RDMA_DEV", list.substr(0, list.find(',')).c_str());
+    RdmaTransport rt(kMaxMsg);
+    KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+    constexpr int kKeys = 8;
+    std::vector<BlockKey> keys;
+    std::vector<std::string> bufs(kKeys, std::string(4096, '\0'));
+    std::vector<RangeDstMulti> dsts(kKeys);
+    const std::string tag = one_rail ? "rim1-" : "rim2-";
+    for (int i = 0; i < kKeys; ++i) {
+      const std::string v(4096, static_cast<char>('a' + i));
+      ASSERT_TRUE(c.Put(tag + std::to_string(i), v.data(), v.size())) << i;
+      keys.push_back(ToBlockKey(SelfHdr(), tag + std::to_string(i)));
+      dsts[i].payloads.emplace_back(&bufs[i][0], bufs[i].size());
+    }
+    std::vector<size_t> lens;
+    std::string dev;
+    const auto sts = rt.RangeIntoMulti(node.addr, keys, dsts, &lens, &dev);
+    for (int i = 0; i < kKeys; ++i) ASSERT_EQ(sts[i], Status::kOk) << i;
+    ASSERT_FALSE(dev.empty());
+    if (one_rail) {
+      EXPECT_EQ(dev.find("->"), std::string::npos)
+          << "one rail named more than once: " << dev;
+      continue;
+    }
+    std::vector<std::string> names;
+    for (size_t start = 0;;) {
+      const size_t arrow = dev.find("->", start);
+      names.push_back(dev.substr(start, arrow - start));
+      if (arrow == std::string::npos) break;
+      start = arrow + 2;
+    }
+    EXPECT_LE(names.size(), static_cast<size_t>(kKeys)) << dev;
+    for (size_t i = 1; i < names.size(); ++i)
+      EXPECT_NE(names[i], names[i - 1]) << "a rail named twice in a row: "
+                                        << dev;
   }
-  std::vector<size_t> lens;
-  std::string dev;
-  const auto sts = rt.RangeIntoMulti(node.addr, keys, dsts, &lens, &dev);
-  for (int i = 0; i < kKeys; ++i) ASSERT_EQ(sts[i], Status::kOk) << i;
-  EXPECT_FALSE(dev.empty());
-  EXPECT_EQ(dev.find("->"), std::string::npos)
-      << "one rail named once per key: " << dev;
 }
 
 TEST(RdmaLoopback, BatchExistMixedHitMiss) {
