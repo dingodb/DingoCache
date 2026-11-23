@@ -626,6 +626,30 @@ void RamTier::EraseEvictedLocked(
   }
 }
 
+bool RamTier::LargeIsCurrentLocked(
+    const Shard& s, const std::pair<BlockKey, uint64_t>& item) const {
+  auto it = s.index.find(item.first);
+  return it != s.index.end() && !it->second.in_arena() &&
+         it->second.large_seq == item.second;
+}
+
+void RamTier::NoteLargeLocked(Shard& s, const BlockKey& key) {
+  auto it = s.index.find(key);
+  if (it == s.index.end()) return;
+  it->second.large_seq = ++s.large_seq;
+  s.large_keys.emplace_back(key, it->second.large_seq);
+  // Pairs of values removed (or put again) since are stale; drop them once
+  // the list is twice as long as the budget has values (each is larger than
+  // an extent). What stays is one pair per resident value, so this runs
+  // again only after as many more insertions.
+  const size_t bound = 2 * (large_budget_bytes_ / extent_bytes_ + 1);
+  if (s.large_keys.size() <= bound) return;
+  std::deque<std::pair<BlockKey, uint64_t>> live;
+  for (const auto& item : s.large_keys)
+    if (LargeIsCurrentLocked(s, item)) live.push_back(item);
+  s.large_keys.swap(live);
+}
+
 void RamTier::ReclaimLargeFor(uint64_t bytes) {
   if (bytes > large_budget_bytes_) return;
   auto has_room = [this, bytes] {
@@ -636,16 +660,20 @@ void RamTier::ReclaimLargeFor(uint64_t bytes) {
     if (has_room()) return;
     Shard& s = *shard;
     std::lock_guard<std::mutex> lk(s.mu);
-    for (auto it = s.index.begin(); it != s.index.end();) {
+    // Oldest first; a value that cannot go yet (unwritten, being sent,
+    // being removed) keeps its place at the back.
+    for (size_t n = s.large_keys.size(); n != 0 && !has_room(); --n) {
+      const auto item = s.large_keys.front();
+      s.large_keys.pop_front();
+      if (!LargeIsCurrentLocked(s, item)) continue;  // stale
+      auto it = s.index.find(item.first);
       Entry& entry = it->second;
-      if (!entry.in_arena() && entry.durable &&
-          entry.send_pins == 0 && !entry.remove_pending) {
+      if (entry.durable && entry.send_pins == 0 && !entry.remove_pending) {
         ReleaseLargeBudget(entry.cap);
-        it = s.index.erase(it);
+        s.index.erase(it);
         large_evictions_.fetch_add(1, std::memory_order_relaxed);
-        if (has_room()) return;
       } else {
-        ++it;
+        s.large_keys.push_back(item);
       }
     }
   }
@@ -969,6 +997,7 @@ RamTier::Admission RamTier::Admit(
       queued.lane = lane;
       Enqueue(s, std::move(queued));
       AddDirty(lane, cap);
+      if (large) NoteLargeLocked(s, key);
     } else if (!large) {
       s.alloc->Unpin(key, slot_handle);
       s.alloc->Remove(key);
@@ -1298,6 +1327,7 @@ bool RamTier::PutDurable(const BlockKey& key, const void* data, size_t len,
       e.completion = completion;
       CompletePut(completion, true);
       s.index.emplace(key, std::move(e));
+      if (large) NoteLargeLocked(s, key);
       if (!large) s.alloc->Unpin(key, slot_handle);
     } else if (!large) {
       s.alloc->Unpin(key, slot_handle);  // release the copy-window pin

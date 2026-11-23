@@ -3,6 +3,17 @@
 ## Unreleased
 
 
+- Server, RAM tier: values larger than an arena extent are no longer kept in
+  RAM by default; they are written to and read from the disk.
+  `DFKV_RAM_TIER_LARGE_RESERVE_BYTES` sets a budget for them and brings that
+  back. By default two extents (64 MiB) of the RAM budget were kept for such
+  values, which the default `--max-msg` (one extent) never sends; the arena
+  gets them back. With a budget set, its values now give way oldest first,
+  and finding one visits only them: before, every admission at a full budget
+  walked the whole index of every shard under its lock and took victims in
+  hash order (with 150 000 small values resident, such a PUT took 3.2 ms, up
+  to 16 ms). A value removed and put again is as new as its last PUT.
+
 - Server, RAM tier: a PUT's check of whether the disk already holds its key
   is made before the RAM shard lock, not under it. The disk store's check
   takes the store's lock, which a slow metadata write (`slots.tbl`) can

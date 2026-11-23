@@ -284,6 +284,12 @@ KvNodeServer::RamTierPlan KvNodeServer::PlanRamTier(size_t disk_count) {
   }
   plan.write_back = mode == "writeback";
   config_dump::RecordResolved("DFKV_RAM_WRITE_MODE", mode);
+  // No dedicated budget for values larger than an arena extent unless
+  // DFKV_RAM_TIER_LARGE_RESERVE_BYTES asks for one: with the default
+  // --max-msg (one extent) no value can use it, and the two extents it took
+  // from the arena were lost; with a larger --max-msg it held two such
+  // values at a time. Such values go to the disk and are read from it.
+  o.large_reserve_bytes = 0;
   // Flush workers default to 4x the disk count (cap 16). One sync DIO stream
   // per worker leaves NVMe queues nearly idle for small objects; measured on a
   // 3-disk node (64 KiB saturated writes): 3 workers 6.8k ops/s -> 16 workers

@@ -556,6 +556,7 @@ class RamTier {
     bool client_acked = false;
     uint32_t lane = 0;  // Options::flush_lane
     std::chrono::steady_clock::time_point dirty_since;
+    uint64_t large_seq = 0;  // see Shard::large_keys
     bool remove_pending = false;  // hidden immediately; physical free after pins
     // remove_pending because the disk no longer had the key (a stale written
     // copy dropped by a PUT), not because of a REMOVE.
@@ -608,6 +609,13 @@ class RamTier {
     size_t lane_limit = 0;
     size_t next_lane = 0;
     size_t queued = 0;
+    // The dedicated (above-extent) values, oldest first, as (key, the
+    // value's large_seq): the victims of ReclaimLargeFor, which so visits
+    // these and not the whole index. A pair whose sequence is not that of
+    // the key's value now (removed, or removed and put again) is stale and
+    // skipped; large_seq numbers the shard's dedicated insertions.
+    std::deque<std::pair<BlockKey, uint64_t>> large_keys;
+    uint64_t large_seq = 0;
     // Items whose flush failed and that wait for their next attempt, by the
     // time it is due; still resident, dirty and flush-pinned. With a disk
     // that refuses writes this holds every dirty object of that disk, so the
@@ -632,6 +640,9 @@ class RamTier {
   void ReleaseBudget(uint64_t bytes);
   void ReleaseLargeBudget(uint64_t bytes);
   void EraseEvictedLocked(Shard& s, const std::vector<BlockKey>& keys);
+  void NoteLargeLocked(Shard& s, const BlockKey& key);
+  bool LargeIsCurrentLocked(const Shard& s,
+                            const std::pair<BlockKey, uint64_t>& item) const;
   enum class Admission {
     kAccepted, kDuplicate, kPersisted, kBypass, kRejected, kBackpressure
   };

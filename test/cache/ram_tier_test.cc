@@ -52,6 +52,14 @@ class RamTierTestPeer {
   static Status Wait(const Completion& completion) {
     return RamTier::WaitPut(completion);
   }
+  static size_t LargeKeys(RamTier& tier) {
+    size_t n = 0;
+    for (const auto& shard : tier.shards_) {
+      std::lock_guard<std::mutex> lock(shard->mu);
+      n += shard->large_keys.size();
+    }
+    return n;
+  }
   static const char* ArenaBase(const RamTier& tier) { return tier.arena_; }
   // One reclaimer pass over every shard, as the background thread runs it.
   static void ReclaimTick(RamTier& tier) {
@@ -2844,4 +2852,58 @@ TEST(RamTier, ASlowPersistedCheckDoesNotStallRamHits) {
   std::printf("[ timing ] slowest RAM hit during a slow check: %.3f ms\n",
               worst_ms);
   EXPECT_LT(worst_ms, 50.0) << "RAM hits waited for the disk index check";
+}
+
+// Values above an extent, when a dedicated budget is configured, give way
+// oldest first, and finding one does not walk the small values' index.
+TEST(RamTier, DedicatedValuesGiveWayOldestFirst) {
+  ScopedEnv extent("DFKV_RAM_TIER_EXTENT_BYTES", "1048576");
+  FlushSink sink;
+  RamTier::Options o = Opts(uint64_t{64} << 20);
+  o.large_reserve_bytes = uint64_t{6} << 20;  // four 1.5 MiB values
+  o.reclaim_interval_ms = 0;
+  RamTier rt(o, sink.fn());
+  ASSERT_TRUE(rt.ok());
+  const std::string big(1536 * 1024, 'b');
+  for (uint64_t i = 1; i <= 12; ++i) {
+    ASSERT_TRUE(rt.Put(K(i), big.data(), big.size())) << i;
+    ASSERT_TRUE(WaitFor([&] { return rt.FlushBacklog() == 0; }));
+    // The four newest are resident, every older one is gone.
+    for (uint64_t k = 1; k <= i; ++k)
+      EXPECT_EQ(rt.Contains(K(k)), k + 4 > i) << "after " << i << ": " << k;
+  }
+}
+
+// Removing and putting the same dedicated values again and again keeps one
+// entry each in the eviction order (not one per insertion), and a value put
+// again is as new as its last PUT: it is not the next victim.
+TEST(RamTier, DedicatedChurnKeepsOneEntryPerValueAndItsAge) {
+  ScopedEnv extent("DFKV_RAM_TIER_EXTENT_BYTES", "1048576");
+  FlushSink sink;
+  RamTier::Options o = Opts(uint64_t{64} << 20);
+  o.large_reserve_bytes = uint64_t{6} << 20;  // four 1.5 MiB values
+  o.reclaim_interval_ms = 0;
+  RamTier rt(o, sink.fn());
+  ASSERT_TRUE(rt.ok());
+  const std::string big(1536 * 1024, 'b');
+  auto put = [&](uint64_t id) {
+    ASSERT_TRUE(rt.Put(K(id), big.data(), big.size())) << id;
+    ASSERT_TRUE(WaitFor([&] { return rt.FlushBacklog() == 0; }));
+  };
+  put(1);
+  put(2);
+  put(3);
+  for (int round = 0; round < 100; ++round) {
+    ASSERT_TRUE(rt.Remove(K(1)));
+    put(1);
+  }
+  EXPECT_LE(RamTierTestPeer::LargeKeys(rt), 2u * (6 + 1))
+      << "one entry per insertion piles up";
+  put(4);  // the budget is full now: 2, 3, 1 (put again last), 4
+  put(5);  // evicts the oldest, 2 -- not 1
+  EXPECT_TRUE(rt.Contains(K(1)));
+  EXPECT_FALSE(rt.Contains(K(2)));
+  EXPECT_TRUE(rt.Contains(K(3)));
+  EXPECT_TRUE(rt.Contains(K(4)));
+  EXPECT_TRUE(rt.Contains(K(5)));
 }
