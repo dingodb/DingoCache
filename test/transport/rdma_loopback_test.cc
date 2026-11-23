@@ -2036,10 +2036,10 @@ TEST(RdmaLoopback, ExistManyWindowedMixedHitMiss) {
 }
 
 // out_dev names the rails a call used, each time the rail changes: one rail
-// for every key of a batch is one name, not one "->name" per key. Each key
-// is its own pull and picks its rail (least occupancy and latency), so on
-// two rails a batch may use both and name both, alternating; it never names
-// the same rail twice in a row.
+// for every key of a batch is one name, not one "->name" per key. The keys
+// of a batch share one connection, so on two rails too a batch names one
+// rail; a second name only after a failed window was retried on another
+// rail, and never the same rail twice in a row.
 TEST(RdmaLoopback, RangeIntoMultiNamesEachRailOnce) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   RdmaNode node("rimdev");
@@ -2065,7 +2065,12 @@ TEST(RdmaLoopback, RangeIntoMultiNamesEachRailOnce) {
     }
     std::vector<size_t> lens;
     std::string dev;
+    const long failures_before =
+        CounterVal(rt.MetricsText(), "dfkv_rdma_client_pull_failures_total");
     const auto sts = rt.RangeIntoMulti(node.addr, keys, dsts, &lens, &dev);
+    const long failures =
+        CounterVal(rt.MetricsText(), "dfkv_rdma_client_pull_failures_total") -
+        failures_before;
     for (int i = 0; i < kKeys; ++i) ASSERT_EQ(sts[i], Status::kOk) << i;
     ASSERT_FALSE(dev.empty());
     if (one_rail) {
@@ -2080,7 +2085,8 @@ TEST(RdmaLoopback, RangeIntoMultiNamesEachRailOnce) {
       if (arrow == std::string::npos) break;
       start = arrow + 2;
     }
-    EXPECT_LE(names.size(), static_cast<size_t>(kKeys)) << dev;
+    if (failures == 0) EXPECT_EQ(names.size(), 1u) << dev;
+    EXPECT_LE(names.size(), 2u) << dev;
     for (size_t i = 1; i < names.size(); ++i)
       EXPECT_NE(names[i], names[i - 1]) << "a rail named twice in a row: "
                                         << dev;
@@ -11988,4 +11994,163 @@ TEST(RdmaEndpointWait, ASignalDoesNotRestartTheTimeout) {
   EXPECT_GE(took, std::chrono::milliseconds(190));
   EXPECT_LT(took, std::chrono::milliseconds(1000))
       << "each signal restarted the wait's timeout";
+}
+
+// A batch GET into the callers' buffers (the connectors' dfkv_batch_get_auto
+// and _sg) runs in windows on one connection: one rail selection for the
+// whole batch, not one per key. Hits, misses and a value larger than its
+// destination keep their own statuses and lengths.
+TEST(RdmaBatchGet, KeysOfABatchShareWindowsOnOneConnection) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaNode node("batch-get-window");
+  RdmaTransport rt(kMaxMsg);
+  constexpr size_t kKeys = 16;
+  constexpr size_t kSize = 8192;
+  std::vector<BlockKey> keys;
+  for (size_t i = 0; i < kKeys; ++i) {
+    keys.push_back(ToBlockKey(SelfHdr(), "window-" + std::to_string(i)));
+    if (i % 5 == 3) continue;  // a miss
+    const std::string value(i == 7 ? 2 * kSize : kSize, static_cast<char>('a' + i));
+    ASSERT_EQ(rt.Cache(node.addr, keys.back(), value.data(), value.size()),
+              Status::kOk);
+  }
+  std::vector<char> pool(kKeys * kSize);
+  std::vector<RangeDst> dsts;
+  for (size_t i = 0; i < kKeys; ++i)
+    dsts.push_back(RangeDst{pool.data() + i * kSize, kSize});
+  const uint64_t before =
+      MetricSum(rt.MetricsText(), "dfkv_rdma_client_rail_selections_total{");
+  std::vector<uint64_t> lens;
+  const auto statuses = rt.RangeInto(node.addr, keys, dsts, &lens);
+  const uint64_t selections =
+      MetricSum(rt.MetricsText(), "dfkv_rdma_client_rail_selections_total{") -
+      before;
+  EXPECT_EQ(selections, 1u) << "one connection for the batch";
+  for (size_t i = 0; i < kKeys; ++i) {
+    SCOPED_TRACE(i);
+    if (i % 5 == 3) {
+      EXPECT_EQ(statuses[i], Status::kNotFound);
+    } else if (i == 7) {
+      EXPECT_EQ(statuses[i], Status::kInvalid);
+      EXPECT_EQ(lens[i], 2 * kSize) << "a value too large reports its length";
+    } else {
+      ASSERT_EQ(statuses[i], Status::kOk);
+      EXPECT_EQ(lens[i], kSize);
+      EXPECT_EQ(pool[i * kSize], static_cast<char>('a' + i));
+      EXPECT_EQ(pool[i * kSize + kSize - 1], static_cast<char>('a' + i));
+    }
+  }
+  // The same through the scatter-gather call, two segments per key.
+  std::vector<char> sg(kKeys * kSize);
+  std::vector<RangeDstMulti> multi(kKeys);
+  for (size_t i = 0; i < kKeys; ++i) {
+    multi[i].payloads.emplace_back(sg.data() + i * (kSize / 2), kSize / 2);
+    multi[i].payloads.emplace_back(
+        sg.data() + kKeys * (kSize / 2) + i * (kSize / 2), kSize / 2);
+  }
+  std::vector<size_t> sg_lens;
+  const uint64_t sg_before =
+      MetricSum(rt.MetricsText(), "dfkv_rdma_client_rail_selections_total{");
+  const auto sg_statuses = rt.RangeIntoMulti(node.addr, keys, multi, &sg_lens);
+  EXPECT_EQ(MetricSum(rt.MetricsText(),
+                      "dfkv_rdma_client_rail_selections_total{") -
+                sg_before,
+            1u)
+      << "one connection for the scatter-gather batch";
+  for (size_t i = 0; i < kKeys; ++i) {
+    SCOPED_TRACE(i);
+    if (i % 5 == 3) {
+      EXPECT_EQ(sg_statuses[i], Status::kNotFound);
+    } else if (i == 7) {
+      EXPECT_EQ(sg_statuses[i], Status::kInvalid);
+      EXPECT_EQ(sg_lens[i], 2 * kSize);
+    } else {
+      ASSERT_EQ(sg_statuses[i], Status::kOk);
+      EXPECT_EQ(sg_lens[i], kSize);
+      EXPECT_EQ(sg[i * (kSize / 2)], static_cast<char>('a' + i));
+      EXPECT_EQ(sg[kKeys * (kSize / 2) + i * (kSize / 2) + kSize / 2 - 1],
+                static_cast<char>('a' + i));
+    }
+  }
+}
+
+namespace {
+// 16 keys of 8 KiB on a node; their destinations in `pool`.
+std::vector<BlockKey> StoreBatch(RdmaTransport& rt, const RdmaNode& node,
+                                 const std::string& tag,
+                                 std::vector<char>* pool,
+                                 std::vector<RangeDst>* dsts) {
+  constexpr size_t kKeys = 16, kSize = 8192;
+  std::vector<BlockKey> keys;
+  pool->assign(kKeys * kSize, 0);
+  dsts->clear();
+  for (size_t i = 0; i < kKeys; ++i) {
+    keys.push_back(ToBlockKey(SelfHdr(), tag + std::to_string(i)));
+    const std::string value(kSize, static_cast<char>('A' + i));
+    EXPECT_EQ(rt.Cache(node.addr, keys.back(), value.data(), value.size()),
+              Status::kOk);
+    dsts->push_back(RangeDst{pool->data() + i * kSize, kSize});
+  }
+  return keys;
+}
+}  // namespace
+
+// One window of a batch fails (here its first READ): its keys fail, the
+// windows before it keep their results, and the windows after it, which no
+// READ had touched, are read on a fresh connection, as each key once had
+// its own.
+TEST(RdmaBatchGet, AFailedWindowFailsOnlyItsOwnKeys) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "4");  // windows of 4: keys 4..7 are #2
+  RdmaNode node("batch-get-partial");
+  RdmaTransport rt(kMaxMsg);
+  std::vector<char> pool;
+  std::vector<RangeDst> dsts;
+  const auto keys = StoreBatch(rt, node, "partial-", &pool, &dsts);
+  std::vector<uint64_t> lens;
+  std::vector<Status> statuses;
+  {
+    ScopedEnv fault("DFKV_RDMA_TEST_PULL_READ_FAILURE", "@5");
+    statuses = rt.RangeInto(node.addr, keys, dsts, &lens);
+  }
+  for (size_t i = 0; i < keys.size(); ++i) {
+    SCOPED_TRACE(i);
+    if (i >= 4 && i < 8) {
+      EXPECT_EQ(statuses[i], Status::kIOError);
+      continue;
+    }
+    ASSERT_EQ(statuses[i], Status::kOk);
+    EXPECT_EQ(lens[i], 8192u);
+    EXPECT_EQ(pool[i * 8192], static_cast<char>('A' + i));
+    EXPECT_EQ(pool[i * 8192 + 8191], static_cast<char>('A' + i));
+  }
+}
+
+// A batch that finds its pooled connection reclaimed by the server reads
+// the failed window again on a new connection, once, and every key arrives.
+TEST(RdmaBatchGet, AStalePooledConnectionIsRetriedOnce) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  if (SoftRoceOnly()) GTEST_SKIP() << kRxeNoRetryExceeded;
+  ReclaimingServerEnv env;
+  RdmaNode node("batch-get-stale");
+  RdmaTransport rt(kMaxMsg);
+  std::vector<char> pool;
+  std::vector<RangeDst> dsts;
+  const auto keys = StoreBatch(rt, node, "stale-", &pool, &dsts);
+  for (Status st : rt.RangeInto(node.addr, keys, dsts, nullptr))
+    ASSERT_EQ(st, Status::kOk);  // leaves a pooled data connection
+  ASSERT_TRUE(ServerHasNoConnections(node));
+  std::fill(pool.begin(), pool.end(), 0);
+  const long retries_before = CounterVal(
+      rt.MetricsText(), "dfkv_rdma_client_stale_pool_retries_total");
+  const auto statuses = rt.RangeInto(node.addr, keys, dsts, nullptr);
+  for (size_t i = 0; i < keys.size(); ++i) {
+    SCOPED_TRACE(i);
+    ASSERT_EQ(statuses[i], Status::kOk);
+    EXPECT_EQ(pool[i * 8192], static_cast<char>('A' + i));
+  }
+  EXPECT_EQ(CounterVal(rt.MetricsText(),
+                       "dfkv_rdma_client_stale_pool_retries_total") -
+                retries_before,
+            1);
 }
