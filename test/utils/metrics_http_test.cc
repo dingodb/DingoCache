@@ -486,7 +486,6 @@ TEST(MetricsHttp, DescriptorExhaustionBacksOffAndRecovers) {
     const int queued = ::socket(AF_INET, SOCK_STREAM, 0);
     const int later = ::socket(AF_INET, SOCK_STREAM, 0);
     if (queued < 0 || later < 0) return 12;
-    const int free_before_accept = testing_fd::LowestFreeDescriptor();
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -522,13 +521,13 @@ TEST(MetricsHttp, DescriptorExhaustionBacksOffAndRecovers) {
       return 19;
     // The handler closes its descriptor some time after the client has its
     // response, and after the active-connection gauge has dropped. Wait for
-    // the descriptor itself before counting free descriptors again.
-    if (!WaitFor(
-            [&] {
-              return testing_fd::LowestFreeDescriptor() == free_before_accept;
-            },
-            3000))
-      return 19;
+    // the descriptor itself, as the server records it, before taking the
+    // descriptors away again: closed later, it would give the next accept a
+    // descriptor behind the test's back. (Waiting for the lowest free
+    // descriptor number to come back failed once on CI: that number also
+    // moves with descriptors this test does not own.)
+    if (!WaitFor([&] { return srv.OpenConnectionDescriptors() == 0; }, 3000))
+      return 24;
 
     // Stopping while the loop is backing off must not wait out anything long.
     testing_fd::NoFreeDescriptors exhausted_again;

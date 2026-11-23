@@ -53,6 +53,10 @@ class MetricsHttpServer {
   // now that finished connections are joined as new ones arrive — Prometheus
   // scrapes are Connection: close, so without reaping this grew per scrape.
   size_t live_conn_count();
+  // Descriptors of accepted connections not yet closed. A handler closes its
+  // descriptor under the same lock that removes it here, so 0 means none is
+  // left to be freed later.
+  size_t OpenConnectionDescriptors();
   // Live connections admitted (not yet closed). Test/diagnostic; the accept
   // loop gates on this so DFKV_METRICS_MAX_CONNS is an exact bound.
   size_t ActiveConnections() const {
