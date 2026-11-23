@@ -16,6 +16,7 @@
 #include <cstring>
 #include <cerrno>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <map>
@@ -155,12 +156,37 @@ int EnvNonnegativeInt(const char* name, int dflt) {
   return out;
 }
 
+// Claimed rendezvous slots must not outlive an exception (bad_alloc, say)
+// thrown before their publish or abort: such a slot stays FETCHING, and every
+// process of the host waits on the key until the takeover age. On unwinding,
+// each claimed slot is aborted; an abort of a slot already published or
+// aborted is a no-op.
+class AbortClaimsOnThrow {
+ public:
+  explicit AbortClaimsOnThrow(std::function<void()> abort_all)
+      : abort_all_(std::move(abort_all)),
+        uncaught_(std::uncaught_exceptions()) {}
+  ~AbortClaimsOnThrow() {
+    if (std::uncaught_exceptions() <= uncaught_) return;
+    try {
+      abort_all_();
+    } catch (...) {  // already unwinding: nothing more to do
+    }
+  }
+  AbortClaimsOnThrow(const AbortClaimsOnThrow&) = delete;
+  AbortClaimsOnThrow& operator=(const AbortClaimsOnThrow&) = delete;
+
+ private:
+  std::function<void()> abort_all_;
+  int uncaught_;
+};
+
 // Env-reading wrapper over ShardGroups (client/group_shard.h): resolve the
 // DFKV_READ_SHARD_KEYS / DFKV_READ_MAX_CONNS knobs once (recorded into the config
 // dump via EnvSize) and split each per-node group into up to DFKV_READ_MAX_CONNS
 // shards so multiple connections drive one node concurrently — the mechanism that
 // breaks the single-connection ~166 MB/s/conn key-by-key drain on a single- or
-// few-node ring. Used by both the read (BatchGet / SG GET) and write (BatchPutSg)
+// few-node ring. Used by the read (BatchGet / SG GET) and write (BatchPut, BatchPutSg)
 // batch paths; the same two knobs govern read and write sharding.
 template <class GroupVec>
 GroupVec ShardReadGroups(GroupVec groups) {
@@ -1317,6 +1343,10 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items,
   std::vector<KvGetItem> fetch_items;
   std::vector<size_t> fetch_map, wait_list;
   std::vector<uint64_t> tokens(N, 0);
+  AbortClaimsOnThrow abort_claims([&] {
+    for (size_t i = 0; i < N; ++i)
+      if (tokens[i]) dedup_->Abort(bks[i], NodeDedup::Kind::kData, tokens[i]);
+  });
   fetch_items.reserve(N);
   // Host rendezvous cannot serve device destinations (memcpy to a device VA);
   // registered pools use the declaration cache, while unregistered pointers
@@ -1539,6 +1569,10 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
   std::vector<KvGetItem> fetch_items;
   std::vector<size_t> fetch_map, wait_list;
   std::vector<uint64_t> tokens(N, 0);
+  AbortClaimsOnThrow abort_claims([&] {
+    for (size_t i = 0; i < N; ++i)
+      if (tokens[i]) dedup_->Abort(bks[i], NodeDedup::Kind::kData, tokens[i]);
+  });
   fetch_items.reserve(N);
   for (size_t i = 0; i < N; ++i) {
     if (ClassifyDestination(items[i].out, items[i].n) ==
@@ -1726,6 +1760,10 @@ std::vector<bool> KVClient::BatchExist(const std::vector<std::string>& keys) {
   std::vector<std::string> fetch_keys;
   std::vector<size_t> fetch_map, wait_list;
   std::vector<uint64_t> tokens(N, 0);
+  AbortClaimsOnThrow abort_claims([&] {
+    for (size_t i = 0; i < N; ++i)
+      if (tokens[i]) dedup_->Abort(bks[i], NodeDedup::Kind::kExist, tokens[i]);
+  });
   std::vector<char> roles(N, 0), values(N, 0);
   fetch_keys.reserve(N);
   // Shared-memory rendezvous probes are independent per key. Long-context
@@ -3244,6 +3282,10 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
   std::vector<KvGetItemSg> fetch_items;
   std::vector<size_t> fetch_map, wait_list;
   std::vector<uint64_t> tokens(N, 0);
+  AbortClaimsOnThrow abort_claims([&] {
+    for (size_t i = 0; i < N; ++i)
+      if (tokens[i]) gd->Abort(bks[i], tokens[i]);
+  });
   std::vector<GpuNodeDedup::Seg> segs;
   auto segs_of = [&segs](const KvGetItemSg& it) {
     segs.clear();

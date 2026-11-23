@@ -3,6 +3,14 @@
 ## Unreleased
 
 
+- Client, host and GPU dedup: an exception on the calling thread between
+  claiming a key and publishing or giving it up (an allocation failing, in
+  practice) left the key claimed, and every other process of the host waited
+  on it until the takeover age; the batch now gives up its claims on the way
+  out. And a worker thread that could not be started after a batch had queued
+  its shards no longer lets the batch return while a worker could still run
+  them on freed memory.
+
 - Client: a read that the node answered but whose bytes this process could
   not copy into a CUDA destination (TCP transport with a device destination)
   is `DFKV_ST_INVALID` instead of `DFKV_ST_IO_ERROR`, and no longer puts the

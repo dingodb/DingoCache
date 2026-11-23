@@ -57,10 +57,24 @@ class ParallelExecutor {
     size_t outstanding;
     {
       std::lock_guard<std::mutex> lock(mu_);
-      for (size_t i = 0; i < helpers; ++i) queue_.push_back(job);
+      try {
+        for (size_t i = 0; i < helpers; ++i) queue_.push_back(job);
+      } catch (...) {
+        // Entries already queued must find nothing left to run once this
+        // frame is gone.
+        job->next.store(job->count);
+        throw;
+      }
       outstanding = queue_.size();
     }
-    EnsureThreads(outstanding);
+    // The helpers' entries refer to this frame. If a helper thread cannot
+    // be started, this thread runs every item below and the queued entries
+    // find nothing left: unwinding here would leave them to run later on
+    // freed memory.
+    try {
+      EnsureThreads(outstanding);
+    } catch (...) {
+    }
     cv_.notify_all();
     Work(*job);
     std::unique_lock<std::mutex> lock(job->mu);
