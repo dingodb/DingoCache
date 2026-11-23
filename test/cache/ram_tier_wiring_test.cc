@@ -1227,7 +1227,11 @@ TEST(RamTierWiring, ShutdownAnswersParkedPutsInsteadOfWaitingForTheirFlush) {
     const bool stopping = WaitFor(
         [&] { return KvNodeServerWiringTestPeer::RamStopping(*server); });
     EXPECT_TRUE(stopping) << "the stop waited for a parked PUT's flush";
-    EXPECT_EQ(KvNodeServerWiringTestPeer::ParkedPuts(*server), 0u);
+    // Cancelling only wakes the parked PUTs; each leaves the waiter list on
+    // its own thread, possibly after the stop began.
+    EXPECT_TRUE(WaitFor([&] {
+      return KvNodeServerWiringTestPeer::ParkedPuts(*server) == 0;
+    })) << "a parked PUT was not answered";
     barrier.Open();
     stopper.join();
     direct.join();
