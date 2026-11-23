@@ -989,7 +989,7 @@ void CheckImage(LogStore& s, const std::vector<ImageOp>& ops, uint64_t keys,
 ImageStats CheckImages(const std::vector<RecordingIo::Op>& recorded,
                        const std::vector<ImageOp>& ops, uint64_t keys,
                        const fs::path& dir, const fs::path& image, int images,
-                       uint64_t seed) {
+                       uint64_t seed, bool check_minimums = true) {
   ImageStats stats;
   std::mt19937_64 rng(seed);
   for (int round = 0; round < images; ++round) {
@@ -1018,11 +1018,14 @@ ImageStats CheckImages(const std::vector<RecordingIo::Op>& recorded,
     if (::testing::Test::HasFatalFailure()) return stats;
   }
   // The checks did look at something (a change that silently emptied them
-  // fails here).
+  // fails here). A caller whose coverage depends on thread timing sums the
+  // counts over several seeds and checks them itself.
   EXPECT_GT(stats.images, images / 2);
-  EXPECT_GT(stats.strict_keys, 0);
-  EXPECT_GT(stats.holes, 0);
-  EXPECT_GT(stats.power_served, 0) << "the power images' I2/I3 checks saw values";
+  if (check_minimums) {
+    EXPECT_GT(stats.strict_keys, 0);
+    EXPECT_GT(stats.holes, 0);
+    EXPECT_GT(stats.power_served, 0) << "the power images' I2/I3 checks saw values";
+  }
   ::testing::Test::RecordProperty("images", stats.images);
   ::testing::Test::RecordProperty("strict_keys", stats.strict_keys);
   ::testing::Test::RecordProperty("holes", stats.holes);
@@ -1099,15 +1102,30 @@ TEST(LogStore, ConcurrentCrashImagesServeOnlyRightValues) {
   }
   std::vector<ImageOp> ops;
   for (const auto& v : per) ops.insert(ops.end(), v.begin(), v.end());
-  // The T1 branch (an uncommitted PUT's value served) must be exercised:
-  // more crash points of the same recording until it is.
-  int uncommitted = 0;
-  for (uint64_t seed = 7; seed < 17 && uncommitted == 0; ++seed) {
-    uncommitted += CheckImages(io->Ops(), ops, kKeys, dir, image, 300, seed)
-                       .uncommitted_served;
+  // Which branches a crash point exercises depends on how the threads
+  // interleaved: more crash points of the same recording until each one has
+  // been (kill images of keys at rest, holes, the power images' checks, and
+  // the T1 branch: an uncommitted PUT's value served).
+  ImageStats total;
+  auto covered = [&] {
+    return total.strict_keys > 0 && total.holes > 0 && total.power_served > 0 &&
+           total.uncommitted_served > 0;
+  };
+  int seeds = 0;
+  for (uint64_t seed = 7; seed < 47 && !covered(); ++seed, ++seeds) {
+    const ImageStats st = CheckImages(io->Ops(), ops, kKeys, dir, image, 300, seed,
+                                      /*check_minimums=*/false);
+    total.strict_keys += st.strict_keys;
+    total.holes += st.holes;
+    total.power_served += st.power_served;
+    total.uncommitted_served += st.uncommitted_served;
     if (HasFailure()) break;
   }
-  EXPECT_GT(uncommitted, 0) << "no image served an uncommitted PUT's value";
+  RecordProperty("seeds", seeds);
+  EXPECT_GT(total.strict_keys, 0) << "no kill image held a key at rest";
+  EXPECT_GT(total.holes, 0) << "no image recovered past a rejected record";
+  EXPECT_GT(total.power_served, 0) << "the power images' I2/I3 checks saw no values";
+  EXPECT_GT(total.uncommitted_served, 0) << "no image served an uncommitted PUT's value";
   fs::remove_all(dir);
   fs::remove_all(image);
 }
