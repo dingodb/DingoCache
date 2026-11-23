@@ -128,6 +128,8 @@ class DiskCacheGroup {
   // Whether slab metrics apply: the slab engine was selected, or "auto" chose
   // it for at least one disk.
   bool HasSlabDisks() const { return has_slab_; }
+  // DFKV_SLAB_BALANCE: the slab disks move extents between size classes.
+  bool SlabBalance() const { return slab_balance_; }
   // The engine disk i runs (its StoreEngine::EngineName).
   std::string DiskEngineName(size_t i) const { return disks_[i]->EngineName(); }
   void DiskEngineMetrics(size_t i,
@@ -215,6 +217,7 @@ class DiskCacheGroup {
   // group built (another engine, or one an engine_factory made).
   std::vector<const DiskSlabStore*> slab_of_disk_;
   bool has_slab_ = false;
+  bool slab_balance_ = false;  // DFKV_SLAB_BALANCE
   std::unordered_map<std::string, size_t> by_id_;  // disk id -> stable index
   ConHash ring_;
   mutable std::array<std::mutex, kTenantStripes> tenant_stripes_;

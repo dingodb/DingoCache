@@ -163,6 +163,35 @@ TEST(Metrics, SlabCapacityAndCorrectnessSeriesReflectCommittedState) {
   fs::remove_all(dir);
 }
 
+// STO-35: with DFKV_SLAB_BALANCE off (the default) /metrics is as it was;
+// with it on, the balancer's three families appear.
+TEST(Metrics, SlabBalanceFamiliesOnlyWithTheSwitch) {
+  ScopedEnv engine("DFKV_STORE_ENGINE", "slab");
+  ScopedEnv write_mode("DFKV_SLAB_WRITE", "buffered");
+  ScopedEnv granularity("DFKV_SLAB_GRANULARITY", "4096");
+  ScopedEnv reclaim("DFKV_SLAB_RECLAIM_MS", "0");
+  for (const bool on : {false, true}) {
+    ScopedEnv balance("DFKV_SLAB_BALANCE", on ? "1" : "0");
+    std::string addr;
+    auto dir = fs::temp_directory_path() / "dfkv_metrics_balance";
+    fs::remove_all(dir);
+    auto s = Start(dir, &addr);
+    TcpTransport t;
+    const std::string value(3000, 's');
+    ASSERT_EQ(t.Cache(addr, ToBlockKey("test/model", "k"), value.data(),
+                      value.size()),
+              Status::kOk);
+    const std::string text = s->MetricsText();
+    for (const char* family :
+         {"dfkv_slab_balance_moves_total", "dfkv_slab_balance_max_hold_us",
+          "dfkv_slab_class_tail_age"})
+      EXPECT_EQ(text.find(family) != std::string::npos, on) << family;
+    s->Stop();
+    s.reset();
+    fs::remove_all(dir);
+  }
+}
+
 TEST(Metrics, PrometheusFormatAndIdentity) {
   ScopedEnv engine("DFKV_STORE_ENGINE", "slab");
   std::string addr;

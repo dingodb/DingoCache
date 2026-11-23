@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Server, slab: extents can follow a change in the mix of value sizes
+  (STO-35, `DFKV_SLAB_BALANCE=1`, off by default). When the share of the
+  bytes of each size changes while every size class is still written (for
+  example large values rising from a third to 80% of the bytes), the
+  classes kept the extents they had: in a unit measurement the large class
+  then held 72-77% of its most recent capacity's worth of writes and the
+  small ones 100%. With the setting, each reclaim tick moves at most one
+  extent from the class whose next victim is oldest to the one whose next
+  victim is youngest, when the older is more than 1.1 times the younger;
+  the three classes then held the same share (87%). A move never takes an
+  extent with a slot in a read or write or a RETAIN-protected value, and it
+  is the existing extent rebind (the table wipe is written before any
+  value is forgotten, and kept by the page cache for a warm restart), so it
+  is safe across a warm restart. New `dfkv_slab_class_tail_age{slot_size}`,
+  `dfkv_slab_balance_moves_total`, `dfkv_slab_balance_max_hold_us`. The RAM
+  tier is not affected.
 - Client: absent grace (CLI-02 stage A), behind `DFKV_RING_ABSENT_GRACE_MS`
   (default 0 = off, cap 600000; MDS discovery only). A member that vanishes
   from an admitted view is kept as absent for the grace: no new writes, and

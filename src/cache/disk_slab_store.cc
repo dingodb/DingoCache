@@ -2935,6 +2935,30 @@ void DiskSlabStore::ReclaimTick(
       watermark_latch_.EndTick(alloc_->UsedBytes(), evict_low_bytes_);
     }
   }
+  if (opt_.balance) {
+    std::vector<BlockKey> evicted;
+    size_t moved = 0;
+    std::chrono::steady_clock::time_point started, released;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      started = std::chrono::steady_clock::now();  // the hold, not the wait
+      moved = alloc_->BalanceTailAges(opt_.balance_ratio_pct,
+                                      opt_.balance_moves_per_tick, &evicted);
+      for (const BlockKey& key : evicted)
+        evicted_bytes_ += ErasePayloadLocked(key);
+      released = std::chrono::steady_clock::now();
+    }
+    if (moved > 0) {
+      const uint64_t held = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(released -
+                                                                started)
+              .count());
+      uint64_t seen = balance_max_hold_us_.load(std::memory_order_relaxed);
+      while (held > seen && !balance_max_hold_us_.compare_exchange_weak(
+                                seen, held, std::memory_order_relaxed)) {
+      }
+    }
+  }
   const auto classes = alloc_->Classes();
   if (reclaim_last_puts_.size() < classes.size())
     reclaim_last_puts_.resize(classes.size(), 0);
@@ -3070,6 +3094,9 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
         watermark_last_tick_us_.load(std::memory_order_relaxed);
     st.watermark_max_tick_us =
         watermark_max_tick_us_.load(std::memory_order_relaxed);
+    st.balance_moves = alloc_->BalanceMoves();
+    st.balance_max_hold_us =
+        balance_max_hold_us_.load(std::memory_order_relaxed);
     st.extent_returns = alloc_->ExtentReturns();
     st.allocated_bytes = alloc_->UsedBytes();
     st.allocator_objects = alloc_->Count();

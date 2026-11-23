@@ -309,6 +309,8 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_class_extents{slot_size}` / `dfkv_slab_class_resident_objects{slot_size}` / `dfkv_slab_class_free_slots{slot_size}` | gauge | 每个 live size class 的 extent、resident、可立即分配 slot |
 | `dfkv_slab_class_allocated_bytes{slot_size}` / `dfkv_slab_class_useful_bytes{slot_size}` / `dfkv_slab_class_fragmentation_bytes{slot_size}` | gauge | 每 class 的占用、有效 payload、内部碎片 |
 | `dfkv_slab_class_read_heat{slot_size}` / `dfkv_slab_class_put_total{slot_size}` | gauge / counter | 每 class 的衰减读热度 / 累计 PUT |
+| `dfkv_slab_class_tail_age{slot_size}` | gauge | 该 class 下一个要淘汰的值自写入或最近一次读以来经过的分配器操作数（多盘取最大）；各 class 差得多说明空间分配与当前负载不匹配（`DFKV_SLAB_BALANCE`） |
+| `dfkv_slab_balance_moves_total` / `dfkv_slab_balance_max_hold_us` | counter / gauge | `DFKV_SLAB_BALANCE=1` 时按 tail age 在 class 间挪动的 extent 数 / 一次挪动占用 store 锁的最长时间 |
 | `dfkv_slab_failed_disks` / `dfkv_slab_healthy` | gauge | fail-closed disk 数 / 全部 slab disk 是否健康 |
 
 PUT 准入门（**仅 `--put-inflight-limit > 0` 时输出**）：

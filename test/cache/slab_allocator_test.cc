@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <limits>
 #include <map>
+#include <memory>
 #include <random>
 #include <set>
 #include <sstream>
@@ -3001,4 +3002,117 @@ TEST(SlabAllocatorRetainWheel, ExpiryLockHoldBench) {
                 batch ? "batches of 1024" : "one hold", total_ms,
                 longest_hold_ms, worst_ns.load() / 1e6);
   }
+}
+
+// ---- STO-35: BalanceTailAges ----
+namespace {
+// 8 extents of 64 KiB. Class A (4 KiB slots, 16 per extent) is written first
+// and then left alone; class B (8 KiB, 8 per extent) takes the other four
+// extents and then evicts its own values. A's next victim is much older.
+// A cold window longer than any of these tests: Put's cold steal (which
+// takes an idle class's extents on its own) stays out of the way, and the
+// balancer's hysteresis lasts throughout.
+std::unique_ptr<SlabAllocator> BalanceAllocator() {
+  auto o = Opts(64 * 1024, 8);
+  o.stripe_ways = 1;
+  ::setenv("DFKV_SLAB_COLD_STEAL_WINDOW", "100000", 1);
+  auto a = std::make_unique<SlabAllocator>(o);
+  ::unsetenv("DFKV_SLAB_COLD_STEAL_WINDOW");
+  return a;
+}
+void FillTwoClasses(SlabAllocator& a) {
+  std::vector<BlockKey> ev;
+  SlotRef r;
+  for (int i = 0; i < 64; ++i)
+    ASSERT_TRUE(a.Put(Key("a" + std::to_string(i)), 4096, &r, &ev));
+  for (int i = 0; i < 64; ++i)
+    ASSERT_TRUE(a.Put(Key("b" + std::to_string(i)), 8192, &r, &ev));
+}
+}  // namespace
+
+TEST(SlabAllocator, BalanceMovesAnExtentToTheClassWithTheYoungerTail) {
+  auto owned = BalanceAllocator();
+  SlabAllocator& a = *owned;
+  ASSERT_NO_FATAL_FAILURE(FillTwoClasses(a));
+  const size_t ca = ClassIndex(a, 4096), cb = ClassIndex(a, 8192);
+  ASSERT_EQ(a.Classes()[ca].extents, 4u);
+  ASSERT_EQ(a.Classes()[cb].extents, 4u);
+  EXPECT_GT(a.Classes()[ca].tail_age, 2 * a.Classes()[cb].tail_age);
+  std::vector<BlockKey> ev;
+  EXPECT_EQ(a.BalanceTailAges(150, 1, &ev), 1u);
+  EXPECT_EQ(a.Classes()[ca].extents, 3u);
+  EXPECT_EQ(a.Classes()[cb].extents, 5u);
+  EXPECT_EQ(ev.size(), 16u) << "one of A's extents, its residents evicted";
+  for (const auto& key : ev) EXPECT_FALSE(a.Contains(key));
+  EXPECT_EQ(a.BalanceMoves(), 1u);
+  // Nothing has evicted since: no class is short of space.
+  EXPECT_EQ(a.BalanceTailAges(150, 1, &ev), 0u);
+}
+
+TEST(SlabAllocator, BalanceNeedsTheRatio) {
+  auto owned = BalanceAllocator();
+  SlabAllocator& a = *owned;
+  ASSERT_NO_FATAL_FAILURE(FillTwoClasses(a));
+  std::vector<BlockKey> ev;
+  EXPECT_EQ(a.BalanceTailAges(100000, 1, &ev), 0u);
+  EXPECT_TRUE(ev.empty());
+}
+
+// A read or write in flight pins its slot; an extent holding one stays.
+TEST(SlabAllocator, BalanceNeverMovesAnExtentWithAPinnedSlot) {
+  auto owned = BalanceAllocator();
+  SlabAllocator& a = *owned;
+  ASSERT_NO_FATAL_FAILURE(FillTwoClasses(a));
+  for (int i = 0; i < 64; i += 16) ASSERT_TRUE(a.Pin(Key("a" + std::to_string(i))));
+  std::vector<BlockKey> ev;
+  EXPECT_EQ(a.BalanceTailAges(150, 1, &ev), 0u);
+  EXPECT_TRUE(ev.empty());
+  for (int i = 0; i < 64; ++i) EXPECT_TRUE(a.Contains(Key("a" + std::to_string(i))));
+}
+
+// A protected (RETAIN) value keeps its extent where it is.
+TEST(SlabAllocator, BalanceNeverMovesAnExtentWithAProtectedValue) {
+  auto owned = BalanceAllocator();
+  SlabAllocator& a = *owned;
+  a.ConfigureRetention(RetainOpts(1 << 20), kT0);
+  ASSERT_NO_FATAL_FAILURE(FillTwoClasses(a));
+  for (int i = 0; i < 64; i += 16)
+    ASSERT_EQ(a.Retain(Key("a" + std::to_string(i)), 600,
+                       SlabAllocator::RetainMode::kSet, kT0)
+                  .code,
+              SlabAllocator::RetainCode::kProtectedNew);
+  std::vector<BlockKey> ev;
+  EXPECT_EQ(a.BalanceTailAges(150, 1, &ev), 0u);
+  for (int i = 0; i < 64; ++i) EXPECT_TRUE(a.Contains(Key("a" + std::to_string(i))));
+}
+
+// An extent the balancer moved does not move again within a cold window,
+// even when the pressure turns round at once.
+TEST(SlabAllocator, AMovedExtentDoesNotMoveStraightBack) {
+  auto owned = BalanceAllocator();
+  SlabAllocator& a = *owned;
+  ASSERT_NO_FATAL_FAILURE(FillTwoClasses(a));
+  std::vector<BlockKey> ev;
+  ASSERT_EQ(a.BalanceTailAges(150, 1, &ev), 1u);
+  const size_t ca = ClassIndex(a, 4096), cb = ClassIndex(a, 8192);
+  // B now leaves its values alone and A evicts: B's tail grows old.
+  SlotRef r;
+  uint32_t moved_extent = UINT32_MAX;
+  {
+    // The extent B took holds B's newest value.
+    ASSERT_TRUE(a.Put(Key("b-new"), 8192, &r, &ev));
+    moved_extent = r.extent;
+  }
+  for (int i = 64; i < 200; ++i)
+    ASSERT_TRUE(a.Put(Key("a" + std::to_string(i)), 4096, &r, &ev));
+  ev.clear();
+  const uint32_t before = a.Classes()[cb].extents;
+  const size_t moves = a.BalanceTailAges(150, 8, &ev);
+  EXPECT_GT(moves, 0u) << "the pressure turned round: A should grow back";
+  // B's other extents may go back to A; the one it just took stays.
+  ASSERT_TRUE(a.Contains(Key("b-new")))
+      << "the extent moved in moments ago was moved again (extent "
+      << moved_extent << ")";
+  EXPECT_EQ(a.Classes()[cb].extents, before - moves);
+  EXPECT_GE(a.Classes()[ca].extents, 3u);
 }

@@ -195,6 +195,9 @@ class SlabAllocator {
     uint64_t allocated_bytes = 0; // slot bytes occupied by residents
     uint64_t read_touches = 0;    // cumulative Get/GetAndPin hits
     uint64_t read_heat = 0;       // recent, operation-decayed read evidence
+    // Operations since the resident the class would evict next was admitted
+    // or last read (0 with no resident). See BalanceTailAges.
+    uint64_t tail_age = 0;
   };
   std::vector<ClassStat> Classes() const;
   uint32_t PoolExtents() const;
@@ -249,6 +252,23 @@ class SlabAllocator {
   bool StealFrom(size_t donor_cls, size_t target_cls,
                  std::vector<BlockKey>* evicted);
 
+  // STO-35: moves whole extents between size classes that are all evicting,
+  // so that the space follows where values are kept for less time. Among
+  // the classes that evicted since the previous call, the one whose next
+  // victim is oldest ("tail age") gives its least recently used extent to
+  // the one whose next victim is youngest, if the older tail is more than
+  // ratio_pct/100 times the younger. At most max_moves extents per call.
+  // A donor keeps a floor of extents (the striping width where the pool is
+  // large enough) and gives no extent that holds a pinned slot (a read or
+  // write in flight) or a protected (RETAIN) one, nor one this balancer
+  // moved within the last cold window. The move is a steal: the table wipe
+  // (on_extent_bind) is written before any resident is forgotten (STO-11:
+  // kept by the page cache for a warm restart).
+  // Returns the extents moved; the evicted keys are appended to `evicted`.
+  // *ok is false on a persistence error.
+  size_t BalanceTailAges(uint32_t ratio_pct, size_t max_moves,
+                         std::vector<BlockKey>* evicted, bool* ok = nullptr);
+  uint64_t BalanceMoves() const;
   size_t Count() const;
   uint64_t UsedBytes() const;
   uint64_t Capacity() const;
@@ -359,6 +379,8 @@ class SlabAllocator {
     // the background sweep is behind. Put then evicts from the class itself
     // instead of first taking a cold extent from another class.
     bool reclaim_clear_limited = false;
+    // Evictions since the last BalanceTailAges call.
+    uint64_t evictions_since_balance = 0;
   };
 
   struct ExtentMeta {
@@ -382,8 +404,11 @@ class SlabAllocator {
     // Residents with retain_until != 0. Steals skip such extents exactly like
     // pinned ones, so a protected object is never wiped with its extent.
     uint32_t protected_slots = 0;
+    // put_seq_ when BalanceTailAges last moved this extent here (0: never).
+    uint64_t balanced_at = 0;
   };
 
+  uint64_t TailAgeLocked(const Class& cls) const;
   uint32_t CanonicalSlotSize(size_t aligned_len) const;
   size_t ClassForLen(size_t aligned_len);
   size_t ClassForExactSize(uint32_t slot_size);
@@ -476,6 +501,7 @@ class SlabAllocator {
   uint64_t evictions_ = 0;
   uint64_t steals_ = 0;
   uint64_t cold_steals_ = 0;
+  uint64_t balance_moves_ = 0;
   uint32_t empty_extents_ = 0;  // sum of Class::empty_extents
   uint64_t watermark_evictions_ = 0;
   uint64_t watermark_scan_steps_ = 0;
