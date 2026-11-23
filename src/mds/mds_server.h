@@ -306,6 +306,16 @@ class MdsServer {
                      bool include_degraded = false);
   Status ListMembersFromEtcd(const std::string& group, std::string* out,
                              bool include_degraded);
+  // Member fencing (DFKV_MDS_FENCING). A fenced id has a record without a
+  // lease under /fenced/<id>: its registers and heartbeats are answered
+  // kNotFound and not written, its member record is deleted when it is
+  // fenced, and member lists leave it out. One step removes a node that is
+  // still running, until it is unfenced.
+  Status Fence(const std::string& payload, bool fence);
+  Status ListFenced(const std::string& group, std::string* out);
+  static std::string FencedKey(const std::string& group, const std::string& id);
+  // Whether `id` is fenced; nullopt = etcd did not answer.
+  std::optional<bool> IsFenced(const std::string& group, const std::string& id);
 
   // Client (consumer) registration — same lease/keepalive contract as Upsert/
   // ListMembers but under a disjoint etcd prefix (/clients/<id> vs /members/<id>)
@@ -346,6 +356,19 @@ class MdsServer {
   LocalLeaseMap client_leases_;
   uint64_t stats_put_ms_;  // DFKV_MDS_STATS_PUT_MS, resolved in the ctor
   ListCache list_cache_;   // DFKV_MDS_LIST_CACHE_MS, resolved in the ctor
+  bool fencing_;           // DFKV_MDS_FENCING, resolved in the ctor
+  // Fenced ids per group, read at most once a second for the heartbeat path
+  // (a list reads them afresh). A fence or unfence here drops the group's.
+  struct FencedIds {
+    uint64_t at_ms = 0;
+    std::vector<std::string> ids;
+  };
+  std::mutex fenced_mu_;
+  std::map<std::string, FencedIds> fenced_cache_;
+  static constexpr uint64_t kFencedCacheMs = 1000;
+  static constexpr size_t kMaxFencedGroups = 1024;
+  std::optional<std::vector<std::string>> FencedIdsOf(const std::string& group,
+                                                      bool fresh);
   UnwrittenMembers unwritten_;  // hold resolved in the ctor (env knob)
   std::atomic<uint64_t> withheld_log_ms_{0};  // rate limit of the WARN line
   MdsMetrics metrics_;

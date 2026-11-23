@@ -132,9 +132,10 @@ journalctl -u dfkv_mds -n 5 --no-pager   # 应见 "dfkv_mds listening on 9400, e
 > 是**成员放置内容的 hash**，不是 etcd 全局 revision；无关 group 写入和纯统计
 > 心跳不会触发环重建。
 > MDS 的默认 etcd request timeout 为 2s；一次 heartbeat 的最慢有效顺序路径是
-> 读记录 → 续租（租约已过期而失败）→ lease grant → Put，共 4×2s。node/client
-> registrar 的默认 socket I/O timeout 为 9s，组合上覆盖这 8s server budget；不要把
-> caller timeout 调到单个 etcd timeout。2.35–2.42 的 registrar 仍是 7s：只在 etcd
+> 读记录 → 续租（租约已过期而失败）→ lease grant → Put，共 4×2s；开了
+> `DFKV_MDS_FENCING` 且 fence 名单的缓存（1s）过期时还要先读一次名单，共 5×2s。
+> node/client registrar 的默认 socket I/O timeout 为 11s，组合上覆盖这 10s server
+> budget；不要把 caller timeout 调到单个 etcd timeout。2.35–2.42 的 registrar 仍是 7s：只在 etcd
 > 变慢（每个请求接近 2s）时才可能在这条 4 个请求的路径上超时，下一次心跳重试。
 > registrar 粘在一个 MDS 上（起始的那个按 member id 的 hash 选，各节点分散在各 MDS
 > 上），失败时在同一次心跳里立即依次试其他端点（建连超时 2s），失败的端点 30s 内
@@ -143,6 +144,17 @@ journalctl -u dfkv_mds -n 5 --no-pager   # 应见 "dfkv_mds listening on 9400, e
 > MDS 对 member list 的回答复用 `DFKV_MDS_LIST_CACHE_MS`（默认 500 ms；`0`=每次
 > 轮询都读 etcd，2.42 及之前的行为），同一 group 并发的轮询只读一次 etcd；本 MDS
 > 写入的记录立即可见，其他 MDS 写入的最多晚这么久。
+> **摘除节点**：没有 fencing 时要三步（改环、停进程、`systemctl disable`，否则
+> 进程或 systemd 拉起后 10s 内又注册回来）。同一 group 的全部 MDS 设
+> `DFKV_MDS_FENCING=1` 后一步即可：`dfkvctl member fence <id> --mds <eps> --group
+> <g>` 写一条无租约的 fence 记录并删掉该节点的 member 记录，客户端约 6s 内（3s
+> 轮询一次，环的视图要连续两次一致才采纳）就不再路由到它；节点进程可以继续运行，它的注册和心跳被拒（节点日志
+> `is fenced`、指标 `dfkv_mds_fenced 1`），直到 `dfkvctl member unfence <id>`，之后
+> 下一次心跳重新注册。`dfkvctl member fenced` 列出当前被 fence 的节点。
+> fence 和 unfence 与注册一样没有鉴权：能连到 MDS 端口的人都能执行，信任模型与
+> 注册相同（控制面端口只对集群内开放）。各 MDS 的 fence 名单最多缓存 1s：fence 之后
+> 1s 内经别的 MDS 到达的心跳可能把记录写回，但 member list 照样过滤掉它，记录在约
+> 30s 后随租约过期消失。
 > MDS 的 `/healthz` 是纯进程 liveness（不 probe etcd）：否则一次秒级 etcd
 > 抖动会让 kubelet 同时重启全部 MDS 副本，CrashLoop 比抖动更久，重注册风暴
 > 还会引发 lease 集体过期。`/readyz` 保留 etcd 依赖检查（活着但探不到 etcd
@@ -788,6 +800,7 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | `DFKV_MDS_ETCD_PROBE_MS` | `30000` | MDS 与 etcd 存活探测窗（MDS 进程该） |
 | `DFKV_MDS_STATS_PUT_MS` | `60000` | 仅统计（STA1）变化时重写 member 记录的最短间隔（`0`=每次心跳都重写，上限 600000）；放置相关的变化（ip、端口、权重、健康）立即写 |
 | `DFKV_MDS_LIST_CACHE_MS` | `500` | member list 回答的复用时长（`0`=每次读 etcd，上限 10000）；本 MDS 的写入会立即作废它 |
+| `DFKV_MDS_FENCING` | 关 | member fencing：`dfkvctl member fence <id>` 一步把节点移出环并保持移出（无租约的 `/dfkv/v1/groups/<g>/fenced/<id>` 记录；其注册和心跳被拒，记录被删除，list 不再列出），`unfence` 恢复。改变 etcd 布局并多一次读，**同一 group 的全部 MDS 都要开启**（没开的 MDS 会让被 fence 的节点写回记录，list 仍会过滤掉它） |
 | `DFKV_MDS_UNWRITTEN_HOLD_MS` | `120000` | MDS 把心跳已到但没写进 etcd 的 member 视为存活的时长；期间 etcd 缺少该 member 则 member list 返回错误（`0`=关，上限 600000；须大于 MDS 端点数 × 10s 心跳间隔；见 §2b） |
 | `DFKV_RDMA_HEALTH_RECOVERY_SAMPLES` | `3` | 仅 RDMA listener 生效。任一 initialized rail 健康即可 placement；部分掉轨保持 `PARTIAL`。最后一条健康 rail 丢失立即 `DEGRADED`；0→非 0 恢复要求连续成功样本，通过后 `PARTIAL`/`ACTIVE` 回环 |
 | `DFKV_RDMA_HEALTH_FILE` | 未设置（生产必须未设置） | 仅受控故障注入；逐 initialized device 提供 `device port_state phys_state`，生产从 sysfs 读取 |

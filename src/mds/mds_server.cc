@@ -199,7 +199,12 @@ MdsServer::MdsServer(const std::string& etcd_addr, int etcd_timeout_ms,
                       config_dump::EnvU64("DFKV_MDS_LIST_CACHE_MS",
                                           kListCacheMs),
                       10000),
-                  SteadyNowMs) {}
+                  SteadyNowMs),
+      // DFKV_MDS_FENCING: member fencing (dfkvctl member fence). Off by
+      // default: it adds records under /fenced/ to the etcd layout and a
+      // read per heartbeat, and every MDS of a group has to have it on, or
+      // one without it lets a fenced node back in.
+      fencing_(config_dump::EnvBool("DFKV_MDS_FENCING", false)) {}
 
 MdsServer::~MdsServer() { Stop(); }
 
@@ -392,6 +397,17 @@ Status MdsServer::Upsert(const std::string& group, const MemberInfo& m,
   // contain '/' and escape its own key subtree (phantom-member injection).
   if (!IsValidGroupOrId(group) || !IsValidGroupOrId(m.id)) return Status::kInvalid;
   const std::string key = MemberKey(group, m.id);
+  if (fencing_) {
+    const auto fenced = IsFenced(group, m.id);
+    if (!fenced) {
+      metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed);
+      return Status::kIOError;
+    }
+    if (*fenced) {
+      metrics_.fenced_refusals.fetch_add(1, std::memory_order_relaxed);
+      return Status::kNotFound;
+    }
+  }
   bool wrote = false;
   const Status st = UpsertLeased(key, m, leases_, false, &wrote);
   // A record written here changes the list: the next poll reads it.
@@ -586,6 +602,96 @@ void ListCache::Invalidate(const std::string& group) {
   }
 }
 
+std::string MdsServer::FencedKey(const std::string& group,
+                                 const std::string& id) {
+  return "/dfkv/v1/groups/" + group + "/fenced/" + id;
+}
+
+std::optional<std::vector<std::string>> MdsServer::FencedIdsOf(
+    const std::string& group, bool fresh) {
+  const uint64_t now = SteadyNowMs();
+  if (!fresh) {
+    std::lock_guard<std::mutex> lk(fenced_mu_);
+    const auto found = fenced_cache_.find(group);
+    if (found != fenced_cache_.end() && now >= found->second.at_ms &&
+        now - found->second.at_ms < kFencedCacheMs)
+      return found->second.ids;
+  }
+  const std::string prefix = "/dfkv/v1/groups/" + group + "/fenced/";
+  const auto r = etcd_.RangePrefix(prefix);
+  if (!r) return std::nullopt;
+  std::vector<std::string> ids;
+  for (const auto& kv : r->kvs) ids.push_back(kv.first.substr(prefix.size()));
+  std::lock_guard<std::mutex> lk(fenced_mu_);
+  if (fenced_cache_.size() >= kMaxFencedGroups &&
+      fenced_cache_.find(group) == fenced_cache_.end()) {
+    for (auto it = fenced_cache_.begin(); it != fenced_cache_.end();) {
+      if (now < it->second.at_ms || now - it->second.at_ms >= kFencedCacheMs)
+        it = fenced_cache_.erase(it);
+      else
+        ++it;
+    }
+  }
+  fenced_cache_[group] = FencedIds{now, ids};
+  return ids;
+}
+
+std::optional<bool> MdsServer::IsFenced(const std::string& group,
+                                        const std::string& id) {
+  const auto ids = FencedIdsOf(group, /*fresh=*/false);
+  if (!ids) return std::nullopt;
+  return std::find(ids->begin(), ids->end(), id) != ids->end();
+}
+
+Status MdsServer::Fence(const std::string& payload, bool fence) {
+  if (!fencing_) return Status::kInvalid;
+  const size_t nl = payload.find('\n');
+  if (nl == std::string::npos) return Status::kInvalid;
+  const std::string group = payload.substr(0, nl);
+  const std::string id = payload.substr(nl + 1);
+  if (!IsValidGroupOrId(group) || !IsValidGroupOrId(id)) return Status::kInvalid;
+  if (fence) {
+    // The fence first: a heartbeat arriving between the two writes is then
+    // refused instead of writing the record back.
+    if (!etcd_.Put(FencedKey(group, id), "fenced", 0) ||
+        !etcd_.Delete(MemberKey(group, id))) {
+      metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed);
+      return Status::kIOError;
+    }
+    // Its heartbeats are refused now, not unwritten: nothing to wait for.
+    unwritten_.Remove(MemberKey(group, id));
+    DFKV_LOG_INFO("mds: fenced member group=" + group + " id=" + id);
+  } else {
+    if (!etcd_.Delete(FencedKey(group, id))) {
+      metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed);
+      return Status::kIOError;
+    }
+    DFKV_LOG_INFO("mds: unfenced member group=" + group + " id=" + id);
+  }
+  {
+    std::lock_guard<std::mutex> lk(fenced_mu_);
+    fenced_cache_.erase(group);
+  }
+  list_cache_.Invalidate(group);
+  return Status::kOk;
+}
+
+Status MdsServer::ListFenced(const std::string& group, std::string* out) {
+  if (!fencing_) return Status::kInvalid;
+  if (!IsValidGroupOrId(group)) return Status::kInvalid;
+  const auto ids = FencedIdsOf(group, /*fresh=*/true);
+  if (!ids) {
+    metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed);
+    return Status::kIOError;
+  }
+  out->clear();
+  for (const auto& id : *ids) {
+    if (!out->empty()) *out += "\n";
+    *out += id;
+  }
+  return Status::kOk;
+}
+
 Status MdsServer::ListMembersFromEtcd(const std::string& group,
                                       std::string* out,
                                       bool include_degraded) {
@@ -632,6 +738,17 @@ Status MdsServer::ListMembersFromEtcd(const std::string& group,
       return Status::kIOError;
     }
   }
+  // A record written back after its member was fenced (by an MDS without
+  // fencing, or one whose fenced ids were a second old) is not listed.
+  std::vector<std::string> fenced;
+  if (fencing_) {
+    const auto ids = FencedIdsOf(group, /*fresh=*/true);
+    if (!ids) {
+      metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed);
+      return Status::kIOError;
+    }
+    fenced = *ids;
+  }
   std::vector<MemberInfo> members;
   for (const auto& kv : r->kvs) {
     std::vector<MemberInfo> one;
@@ -641,6 +758,8 @@ Status MdsServer::ListMembersFromEtcd(const std::string& group,
       NoteUndecodable(kv.first);
       continue;
     }
+    if (std::find(fenced.begin(), fenced.end(), one[0].id) != fenced.end())
+      continue;
     if (include_degraded || one[0].RingEligible()) members.push_back(one[0]);
   }
   // Placement and topology have separate canonical generations. The legacy
@@ -708,6 +827,8 @@ Status MdsServer::ListGroups(std::string* out) {
     if (k.size() <= base) continue;
     const size_t slash = k.find('/', base);
     if (slash == std::string::npos) continue;
+    // A group of nothing but fence records (they carry no lease) is gone.
+    if (k.compare(slash, 8, "/fenced/") == 0) continue;
     std::string g = k.substr(base, slash - base);
     if (g == prev) continue;  // keys arrive sorted: dedup against the previous
     prev = g;
@@ -757,6 +878,9 @@ std::string MdsServer::GroupMetricsText(bool* etcd_reachable) {
   for (const auto& kv : r->kvs) {
     const size_t slash = kv.first.find('/', base);
     if (kv.first.size() <= base || slash == std::string::npos) continue;
+    // Fence records (DFKV_MDS_FENCING) are not members; a group of nothing
+    // but them is not reported.
+    if (kv.first.compare(slash, 8, "/fenced/") == 0) continue;
     Agg& a = groups[kv.first.substr(base, slash - base)];
     // Distinguish /members/<id> (placement ring) from /clients/<id> (consumers).
     // A client key carries identity only (no port/stats); it must NOT inflate the
@@ -956,6 +1080,11 @@ void MdsServer::Handle(int fd, long io_timeout_s,
       st = ListClients(group, &data);
     } else if (op == WireOp::kListGroups) {
       st = ListGroups(&data);
+    } else if (op == WireOp::kFenceMember || op == WireOp::kUnfenceMember) {
+      st = Fence(std::string(payload.data(), rq.payload_len),
+                 op == WireOp::kFenceMember);
+    } else if (op == WireOp::kListFenced) {
+      st = ListFenced(std::string(payload.data(), rq.payload_len), &data);
     }
 
     char rp[kRespPrefix];

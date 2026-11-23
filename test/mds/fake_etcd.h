@@ -100,12 +100,18 @@ class FakeEtcd {
       if (reject_writes_) return {429, kNoSpace};
       const int64_t lease =
           std::strtoll(req.get_str("lease").c_str(), nullptr, 10);
-      if (!leases_.count(lease))
+      if (lease != 0 && !leases_.count(lease))
         return {404, "{\"error\":\"etcdserver: requested lease not found\","
                      "\"code\":5}"};
       std::string key;
       if (!Base64Decode(req.get_str("key"), &key)) return {400, "{}"};
       kvs_[key] = {req.get_str("value"), lease};
+      return {200, std::string("{") + kHeader + "}"};
+    }
+    if (path == "/v3/kv/deleterange") {
+      std::string key;
+      if (!Base64Decode(req.get_str("key"), &key)) return {400, "{}"};
+      kvs_.erase(key);
       return {200, std::string("{") + kHeader + "}"};
     }
     if (path == "/v3/kv/range") {

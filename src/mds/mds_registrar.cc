@@ -59,20 +59,35 @@ bool MdsRegistrar::SendOnce(uint8_t op, int io_timeout_ms,
     if (std::find(tried.begin(), tried.end(), ep) != tried.end()) return false;
     tried.push_back(ep);
     const uint64_t started_ms = NowMs();
-    if (SendTo(ep, op, io_timeout_ms, deadline_ms)) {
+    const Answer answer = SendTo(ep, op, io_timeout_ms, deadline_ms);
+    if (answer != Answer::kFailed) {
+      // A fenced member is told so by any MDS: no point asking another.
       eps_.MarkOk(ep);
-      return true;
+      NoteFenced(answer == Answer::kFenced);
+      return answer == Answer::kOk;
     }
     eps_.MarkFailed(ep, started_ms);
   }
   return false;
 }
 
-bool MdsRegistrar::SendTo(const std::string& ep, uint8_t op,
-                          int io_timeout_ms, uint64_t deadline_ms) {
+void MdsRegistrar::NoteFenced(bool fenced) {
+  if (fenced_.exchange(fenced, std::memory_order_relaxed) == fenced) return;
+  if (fenced)
+    DFKV_LOG_WARN("mds-registrar: group=" + group_ + " id=" + self_.id +
+                  " is fenced (dfkvctl member fence): the MDS refuses its "
+                  "registration, and it is not in the ring until unfenced");
+  else
+    DFKV_LOG_INFO("mds-registrar: group=" + group_ + " id=" + self_.id +
+                  " is no longer fenced");
+}
+
+MdsRegistrar::Answer MdsRegistrar::SendTo(const std::string& ep, uint8_t op,
+                                          int io_timeout_ms,
+                                          uint64_t deadline_ms) {
   int fd = net::Dial(ep, std::min(io_timeout_ms, kConnectTimeoutMs),
                      io_timeout_ms);
-  if (fd < 0) return false;
+  if (fd < 0) return Answer::kFailed;
 
   // Re-arm socket I/O before each phase with the absolute startup deadline's
   // remaining budget. Without this, connect + write + read could each consume
@@ -106,20 +121,22 @@ bool MdsRegistrar::SendTo(const std::string& ep, uint8_t op,
   bool ok = arm_deadline() && net::WriteAll(fd, pre, kReqPrefix) &&
             arm_deadline() &&
             net::WriteAll(fd, payload.data(), payload.size());
+  bool fenced = false;
   if (ok) {
     char rp[kRespPrefix];
     Status st = Status::kInvalid;
     uint64_t dlen = 0;
     ok = arm_deadline() && net::ReadAll(fd, rp, kRespPrefix) &&
-         DecodeResp(rp, &st, &dlen, wire_limits::kMdsMaxRespData) &&
-         st == Status::kOk;
+         DecodeResp(rp, &st, &dlen, wire_limits::kMdsMaxRespData);
+    fenced = ok && st == Status::kNotFound;
+    ok = ok && st == Status::kOk;
     if (ok && dlen) {
       std::vector<char> d(dlen);
       ok = arm_deadline() && net::ReadAll(fd, d.data(), dlen);
     }
   }
   ::close(fd);
-  return ok;
+  return ok ? Answer::kOk : fenced ? Answer::kFenced : Answer::kFailed;
 }
 
 bool MdsRegistrar::RegisterOnceBefore(int io_timeout_ms,
@@ -210,6 +227,9 @@ std::string MdsRegistrar::MetricsText() const {
   metric("dfkv_mds_first_registration_timed_out", "gauge",
          "Whether the first-registration deadline expired",
          first_registration_timed_out() ? 1 : 0);
+  metric("dfkv_mds_fenced", "gauge",
+         "Whether the MDS refuses this member as fenced (dfkvctl member fence)",
+         fenced() ? 1 : 0);
   metric("dfkv_mds_heartbeat_healthy", "gauge",
          "Whether the latest post-registration MDS heartbeat succeeded",
          heartbeat_healthy() ? 1 : 0);

@@ -44,6 +44,7 @@ class EtcdClient {
   std::optional<RangeResult> RangePrefix(const std::string& prefix);
   // One key, with its lease. nullopt = etcd did not answer.
   std::optional<KeyState> Get(const std::string& key);
+  bool Delete(const std::string& key);
   // Same bounded range operation, accounted separately so Prometheus scrapes
   // cannot be mistaken for control-plane membership traffic.
   std::optional<RangeResult> RangePrefixForMetrics(
@@ -56,7 +57,8 @@ class EtcdClient {
 
  private:
   enum class Op : size_t {
-    kLeaseGrant, kLeaseKeepAlive, kPut, kRange, kMetricsRange, kGet, kCount
+    kLeaseGrant, kLeaseKeepAlive, kPut, kRange, kMetricsRange, kGet, kDelete,
+    kCount
   };
   bool Post(Op op, const std::string& path, const std::string& body,
             HttpResponse* response);

@@ -1,5 +1,5 @@
 // What the MDS writes to etcd for heartbeats, how member lists are served,
-// and how the registrar picks an MDS. Runs against the
+// how the registrar picks an MDS, and member fencing. Runs against the
 // in-process fake of the etcd JSON gateway (fake_etcd.h): no etcd needed.
 #include "mds/mds_server.h"
 
@@ -326,4 +326,79 @@ TEST(MdsRegistrarFailover, MembersSpreadOverTheMds) {
     if (Metric(*s, "dfkv_mds_register_requests_total") > 0) ++used;
   EXPECT_EQ(used, 3) << "members did not spread over the MDS";
   for (auto& s : servers) s->Stop();
+}
+
+// One step takes a member out of the ring while it runs, and keeps it out:
+// its record is deleted, its heartbeats are refused, lists leave it out.
+TEST(MdsFencing, AFencedMemberLeavesTheRingAndStaysOut) {
+  ScopedEnv fencing("DFKV_MDS_FENCING", "1");
+  ScopedEnv cache("DFKV_MDS_LIST_CACHE_MS", "5000");
+  FakeEtcd etcd;
+  MdsServer mds(etcd.ep());
+  ASSERT_EQ(mds.Start(0), Status::kOk);
+  MdsRegistrar registrar({"127.0.0.1:" + std::to_string(mds.port())}, "g", kA,
+                         /*heartbeat_ms=*/100);
+  registrar.Start();
+  ASSERT_EQ(Beat(mds, WireOp::kRegister, "g", kB), Status::kOk);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!registrar.registered() && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  ASSERT_EQ(ListIds(mds, "g"), (std::set<std::string>{"na", "nb"}));
+
+  Status st = Status::kInvalid;
+  std::string data;
+  ASSERT_TRUE(DoReq(mds.port(), WireOp::kFenceMember, "g\nna", &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  EXPECT_EQ(ListIds(mds, "g"), (std::set<std::string>{"nb"}));
+  while (!registrar.fenced() && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  EXPECT_TRUE(registrar.fenced());
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  EXPECT_EQ(ListIds(mds, "g"), (std::set<std::string>{"nb"}))
+      << "the fenced member's heartbeats wrote it back";
+  ASSERT_TRUE(DoReq(mds.port(), WireOp::kListFenced, "g", &st, &data));
+  EXPECT_EQ(st, Status::kOk);
+  EXPECT_EQ(data, "na");
+
+  ASSERT_TRUE(DoReq(mds.port(), WireOp::kUnfenceMember, "g\nna", &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  while (registrar.fenced() && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  EXPECT_FALSE(registrar.fenced());
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  EXPECT_EQ(ListIds(mds, "g"), (std::set<std::string>{"na", "nb"}));
+  registrar.Stop();
+  mds.Stop();
+}
+
+TEST(MdsFencing, OffByDefault) {
+  ScopedEnv fencing("DFKV_MDS_FENCING", nullptr);
+  FakeEtcd etcd;
+  MdsServer mds(etcd.ep());
+  ASSERT_EQ(mds.Start(0), Status::kOk);
+  Status st = Status::kOk;
+  std::string data;
+  ASSERT_TRUE(DoReq(mds.port(), WireOp::kFenceMember, "g\nna", &st, &data));
+  EXPECT_EQ(st, Status::kInvalid);
+  ASSERT_TRUE(DoReq(mds.port(), WireOp::kListFenced, "g", &st, &data));
+  EXPECT_EQ(st, Status::kInvalid);
+  mds.Stop();
+}
+
+// A group that only has fence records left is not listed as a group.
+TEST(MdsFencing, AGroupOfOnlyFencedIdsIsNotListed) {
+  ScopedEnv fencing("DFKV_MDS_FENCING", "1");
+  FakeEtcd etcd;
+  MdsServer mds(etcd.ep());
+  ASSERT_EQ(mds.Start(0), Status::kOk);
+  ASSERT_EQ(Beat(mds, WireOp::kRegister, "kept", kB), Status::kOk);
+  Status st = Status::kInvalid;
+  std::string data;
+  ASSERT_TRUE(DoReq(mds.port(), WireOp::kFenceMember, "gone\nna", &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  ASSERT_TRUE(DoReq(mds.port(), WireOp::kListGroups, "", &st, &data));
+  EXPECT_EQ(st, Status::kOk);
+  EXPECT_EQ(data, "kept");
+  EXPECT_EQ(mds.MetricsText().find("group=\"gone\""), std::string::npos);
+  mds.Stop();
 }

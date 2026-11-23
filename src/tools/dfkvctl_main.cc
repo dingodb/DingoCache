@@ -6,6 +6,8 @@
  *   dfkvctl ring --mds <ep,...> --group <g> [--allow-empty] [--json]  # show the cluster ring + vnode share
  *     --json prints the same view as one JSON document for scripts; the table is for people.
  *   dfkvctl clients --mds <ep,...> --group <g>        # list cache consumers (inference instances)
+ *   dfkvctl member fence|unfence <id> --mds <ep,...> --group <g>  # take a node out of / back into the ring
+ *   dfkvctl member fenced --mds <ep,...> --group <g>  # list fenced nodes (MDS with DFKV_MDS_FENCING=1)
  *   dfkvctl stat --all --mds <ep,...> --group <g> [--stat-port <p>]  # per-node metrics + aggregate
  *     The MDS now hands back each node's TCP stat port (MemberInfo.tcp_port), so stat --all
  *     reaches nodes automatically even in RDMA deploys. --stat-port <p> stays as a manual
@@ -399,6 +401,76 @@ static int CmdRing(const std::string& mds, const std::string& group,
   return 0;
 }
 
+// One MDS request, tried on each endpoint until one answers. Returns the
+// status of the answer, kIOError if none answered.
+static Status MdsCall(const std::string& mds, WireOp op,
+                      const std::string& payload, std::string* data) {
+  for (const auto& ep : SplitCsv(mds)) {
+    int fd = net::Dial(ep, 2000, 5000);
+    if (fd < 0) continue;
+    char pre[kReqPrefix];
+    EncodeReq(pre, op, BlockKey{}, 0, 0, payload.size());
+    bool ok = net::WriteAll(fd, pre, kReqPrefix) &&
+              (payload.empty() ||
+               net::WriteAll(fd, payload.data(), payload.size()));
+    Status st = Status::kIOError;
+    if (ok) {
+      char rp[kRespPrefix];
+      uint64_t dlen = 0;
+      ok = net::ReadAll(fd, rp, kRespPrefix) &&
+           DecodeResp(rp, &st, &dlen, wire_limits::kMdsMaxRespData);
+      if (ok && st == Status::kOk) {
+        data->resize(dlen);
+        ok = dlen == 0 || net::ReadAll(fd, &(*data)[0], dlen);
+      }
+    }
+    ::close(fd);
+    if (ok) return st;
+  }
+  return Status::kIOError;
+}
+
+// dfkvctl member fence|unfence <id> | fenced: one step takes a node out of
+// the ring (its heartbeats are refused, its record deleted) whether or not
+// it is still running, until it is unfenced. Needs DFKV_MDS_FENCING=1 on
+// every MDS of the group.
+static int CmdMember(const std::string& mds, const std::string& group,
+                     const std::vector<std::string>& pos) {
+  if (mds.empty() || pos.size() < 2) {
+    std::fprintf(stderr, "member fence|unfence <id> | member fenced  (--mds <ep,...> --group <g>)\n");
+    return 2;
+  }
+  std::string data;
+  const std::string& sub = pos[1];
+  if (sub == "fenced") {
+    const Status st = MdsCall(mds, WireOp::kListFenced, group, &data);
+    if (st != Status::kOk) {
+      std::fprintf(stderr, "member fenced: %s%s\n", StatusName(st),
+                   st == Status::kInvalid ? " (is DFKV_MDS_FENCING=1 set on the MDS?)" : "");
+      return 1;
+    }
+    std::printf("group=%s fenced=%s\n", group.c_str(), data.empty() ? "(none)" : "");
+    if (!data.empty()) std::printf("%s\n", data.c_str());
+    return 0;
+  }
+  if ((sub != "fence" && sub != "unfence") || pos.size() < 3) {
+    std::fprintf(stderr, "member fence|unfence <id>\n");
+    return 2;
+  }
+  const Status st =
+      MdsCall(mds, sub == "fence" ? WireOp::kFenceMember : WireOp::kUnfenceMember,
+              group + "\n" + pos[2], &data);
+  if (st != Status::kOk) {
+    std::fprintf(stderr, "member %s %s: %s%s\n", sub.c_str(), pos[2].c_str(),
+                 StatusName(st),
+                 st == Status::kInvalid ? " (is DFKV_MDS_FENCING=1 set on the MDS?)" : "");
+    return 1;
+  }
+  std::printf("%s group=%s id=%s\n", sub == "fence" ? "fenced" : "unfenced",
+              group.c_str(), pos[2].c_str());
+  return 0;
+}
+
 static int CmdClients(const std::string& mds, const std::string& group) {
   if (mds.empty()) { std::fprintf(stderr, "clients needs --mds ip:port[,...]\n"); return 2; }
   std::vector<MemberInfo> cs;
@@ -625,6 +697,7 @@ int main(int argc, char** argv) {
   if (cmd == "ring" || cmd == "topology")
     return CmdRing(mds, group, allow_empty, json);
   if (cmd == "clients") return CmdClients(mds, group);
+  if (cmd == "member") return CmdMember(mds, group, pos);
 
   if (cmd == "stats") {
     if (all) return CmdStatsAllGroups(mds);

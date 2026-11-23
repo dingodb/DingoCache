@@ -34,7 +34,10 @@ enum class WireOp : uint8_t {
   kLeasePut = 18,     // RDMA v2: request one per-op staging lease; the reply
                       // carries the leased range, the client then sends the
                       // object as an ordinary v2 multi/single-window PUT WRITE
-  kRetain = 19        // batched minimum-lifetime control op (see below)
+  kRetain = 19,       // batched minimum-lifetime control op (see below)
+  // MDS member fencing (DFKV_MDS_FENCING): payload "<group>\n<id>" for fence
+  // and unfence, "<group>" for the list (newline-joined ids).
+  kFenceMember = 20, kUnfenceMember = 21, kListFenced = 22
 };
 
 constexpr uint8_t kNativeProtoTcp = 6;

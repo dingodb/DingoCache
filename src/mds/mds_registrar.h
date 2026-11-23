@@ -29,11 +29,12 @@ namespace dfkv {
 // within kTtlSeconds with no explicit deregister.
 class MdsRegistrar {
  public:
-  // An MDS register/heartbeat may spend up to four sequential 2 s etcd
-  // request budgets (read of the record, failed keepalive of its expired
+  // An MDS register/heartbeat may spend up to five sequential 2 s etcd
+  // request budgets (with DFKV_MDS_FENCING, a read of the fenced ids whose
+  // cache ran out; read of the record, failed keepalive of its expired
   // lease, lease grant, Put). Leave one second for TCP framing/scheduling so
   // a valid slow MDS operation cannot self-timeout.
-  static constexpr int kDefaultIoTimeoutMs = 9000;
+  static constexpr int kDefaultIoTimeoutMs = 11000;
   // A connect that has not completed in this long goes to the next MDS: on a
   // host that drops packets it would otherwise take the whole I/O timeout.
   static constexpr int kConnectTimeoutMs = 2000;
@@ -90,6 +91,7 @@ class MdsRegistrar {
     return heartbeat_failures_total_.load(std::memory_order_relaxed);
   }
   uint64_t last_success_age_seconds() const;
+  bool fenced() const { return fenced_.load(std::memory_order_relaxed); }
   bool heartbeat_healthy() const {
     return registered() && heartbeat_failures_consecutive() == 0;
   }
@@ -100,8 +102,10 @@ class MdsRegistrar {
 
  private:
   bool SendOnce(uint8_t op, int io_timeout_ms, uint64_t deadline_ms);
-  bool SendTo(const std::string& ep, uint8_t op, int io_timeout_ms,
-              uint64_t deadline_ms);
+  enum class Answer { kOk, kFenced, kFailed };
+  Answer SendTo(const std::string& ep, uint8_t op, int io_timeout_ms,
+                uint64_t deadline_ms);
+  void NoteFenced(bool fenced);
   bool RegisterOnceBefore(int io_timeout_ms, uint64_t deadline_ms);
   void MarkFirstRegistrationTimedOut();
   void ReportHeartbeatResult(bool ok);
@@ -126,6 +130,9 @@ class MdsRegistrar {
   std::atomic<uint64_t> heartbeat_failures_total_{0};
   std::atomic<uint64_t> last_success_ms_{0};
   std::atomic<uint64_t> last_failure_log_ms_{0};
+  // The MDS answers this member's registers and heartbeats with kNotFound:
+  // it is fenced (dfkvctl member fence). Nothing is renewed until unfenced.
+  std::atomic<bool> fenced_{false};
   static constexpr uint64_t kFailureLogIntervalMs = 30000;
   std::thread th_;
   std::mutex mu_;
