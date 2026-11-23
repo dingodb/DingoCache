@@ -402,3 +402,42 @@ TEST(ReadCoalescer, AFollowerWithoutFlightsStillWaits) {
   c.CompleteAsync(d, Status::kOk, nullptr, kLen);
   other.join();
 }
+
+// An aborted flight (CompleteAsync without data, as PreparedRead's abort
+// does, also from another thread) no longer counts as held: its thread
+// waits for other flights again.
+TEST(ReadCoalescer, AnAbortedFlightReleasesItsThread) {
+  ReadCoalescer c;
+  constexpr size_t kLen = 4096;
+  uint64_t own = 0;
+  std::thread leader([&] {
+    own = c.TryRegisterAsync(K(21), 0, kLen, true, kLen, true);
+  });
+  leader.join();
+  ASSERT_NE(own, 0u);
+  // Aborted here, not on the thread that registered it.
+  c.CompleteAsync(own, Status::kIOError, nullptr, 0);
+  const uint64_t mine = c.TryRegisterAsync(K(22), 0, kLen, true, kLen, true);
+  ASSERT_NE(mine, 0u);
+  c.CompleteAsync(mine, Status::kIOError, nullptr, 0);  // aborted on its own thread
+  const uint64_t other = c.TryRegisterAsync(K(23), 0, kLen, true, kLen, true);
+  std::thread waiter([&] {
+    // This thread registered nothing.
+    EXPECT_EQ(c.WaitForPublished(K(23), 0, kLen),
+              ReadCoalescer::PublishedWait::kReady);
+  });
+  std::this_thread::sleep_for(20ms);
+  c.CompleteAsync(other, Status::kOk, nullptr, kLen);
+  waiter.join();
+  // The main thread's flights are all completed: it may wait again.
+  std::thread registrar([&] {
+    const uint64_t t = c.TryRegisterAsync(K(24), 0, kLen, true, kLen, true);
+    std::this_thread::sleep_for(20ms);
+    c.CompleteAsync(t, Status::kOk, nullptr, kLen);
+  });
+  std::this_thread::sleep_for(5ms);
+  EXPECT_EQ(c.WaitForPublished(K(24), 0, kLen),
+            ReadCoalescer::PublishedWait::kReady);
+  registrar.join();
+  EXPECT_EQ(c.held_fallbacks(), 0u);
+}

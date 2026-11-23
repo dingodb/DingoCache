@@ -519,3 +519,42 @@ TEST(KvNodeServerListener, LargeDeclaredPayloadIsReadAsItArrives) {
   server.reset();
   fs::remove_all(dir);
 }
+
+// The first frame gets the payload allowance later frames get (1 MiB/s on
+// top of its deadline): a 1 MiB first PUT sent over 600 ms is served,
+// although DFKV_TCP_FIRST_REQ_MS is 300.
+TEST(KvNodeServerListener, FirstFrameGetsThePayloadAllowance) {
+  ScopedEnv engine("DFKV_STORE_ENGINE", "file");
+  ScopedEnv io_timeout("DFKV_TCP_IO_TIMEOUT_S", "10");
+  ScopedEnv first_req("DFKV_TCP_FIRST_REQ_MS", "300");
+  const fs::path dir = fs::temp_directory_path() /
+      ("dfkv_tcp_listener_first_allowance_" + std::to_string(::getpid()));
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  auto server = std::make_unique<KvNodeServer>(dir.string(), 64ull << 20);
+  ASSERT_EQ(server->Start(0), Status::kOk);
+  const int fd = Dial(*server);
+  ASSERT_GE(fd, 0);
+  const std::string value(1 << 20, 'f');
+  char pre[kReqPrefix];
+  EncodeReq(pre, WireOp::kCache, BlockKey{11, 12, 13}, 0, 0, value.size());
+  ASSERT_TRUE(net::WriteAll(fd, pre, sizeof(pre)));
+  constexpr size_t kPieces = 6;
+  for (size_t i = 0; i < kPieces; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const size_t begin = value.size() * i / kPieces;
+    const size_t end = value.size() * (i + 1) / kPieces;
+    ASSERT_TRUE(net::WriteAll(fd, value.data() + begin, end - begin)) << i;
+  }
+  char rp[kRespPrefix];
+  ASSERT_TRUE(net::ReadAll(fd, rp, sizeof(rp)))
+      << "the first frame was cut off at its 300 ms deadline";
+  Status st = Status::kIOError;
+  uint64_t data_len = 0;
+  ASSERT_TRUE(DecodeResp(rp, &st, &data_len));
+  EXPECT_EQ(st, Status::kOk);
+  ::close(fd);
+  server->Stop();
+  server.reset();
+  fs::remove_all(dir);
+}
