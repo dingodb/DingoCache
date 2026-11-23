@@ -731,7 +731,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 位（`-1` = 4294967295，
 `4294967296` = 0 即关闭回收），照旧，现在会报；超出范围的值照旧取默认或收敛到上限；存储几何与语义类（`DFKV_STORE_ENGINE`、
 `DFKV_SLAB_WRITE`、`DFKV_SLAB_PAYLOAD_CRC`、`DFKV_SLAB_GRANULARITY`、`DFKV_SLAB_TABLE_SYNC_MS`、
-`DFKV_SLAB_RECLAIM_MS`、`DFKV_SLAB_WARM_RESTART`、`DFKV_DISK_HASH_WEIGHT`、tenant quota、
+`DFKV_SLAB_RECLAIM_MS`、`DFKV_SLAB_BALANCE`、`DFKV_SLAB_WARM_RESTART`、`DFKV_DISK_HASH_WEIGHT`、tenant quota、
 `DFKV_RAM_TIER_NUMA`）和 `DFKV_MDS_REGISTRATION_TIMEOUT_MS` 写错时照旧报错退出。
 
 **直接解析的命令行参数：此前被悄悄截断或回绕的值现在报错退出（exit 2）。** `--port`、
@@ -834,6 +834,7 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | `DFKV_SLAB_COLD_STEAL_WINDOW` | — | 小受害者选择窗口（跨 size class 强占） |
 | `DFKV_SLAB_URING_WRITE` | — | slab io_uring 异步 PUT（需要 `-DDFKV_WITH_URING`） |
 | `DFKV_SLAB_RECLAIM_MS` | `50` | 背景预回收 tick（见 §3） |
+| `DFKV_SLAB_BALANCE` | `0` | `1`：每个回收 tick 在各尺寸类之间按“下一个要淘汰的值有多久没被用过”（tail age）挪 extent——在都在淘汰的类里，tail 最老的类把一个最久未用的 extent 让给 tail 最年轻的类，前者超过后者 1.1 倍才挪，每 tick 最多一个。解决的是负载里各尺寸占比变了（例如大对象占比从三分之一升到八成）而各类都仍在写时，空间停在旧比例、大类只留得住少量新写入的问题（单元测量：大类近一个容量的写入只留 72–77%，小类 100%；开启后三类相同）。不挪含正在读写的槽或 RETAIN 保护值的 extent；挪动走现有的 extent 重绑定：先写清表再丢值（STO-11：由页缓存保住，供 warm restart 使用），warm restart 安全。每次挪动在 store 锁内淘汰整个 extent 的值：1 GiB extent、128 KiB 槽时约 0.9 ms，`dfkv_slab_balance_max_hold_us` 记录实际值。只用于磁盘 slab，RAM 层不受影响。只接受 `0`/`1`，其他值拒绝启动。设计与测量见 docs/design/slab-cross-class-eviction.md |
 | `DFKV_SLAB_GRANULARITY` | `1 MiB` | slot 量子 |
 
 #### e. RAM 热层细节调优

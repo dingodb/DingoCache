@@ -1123,3 +1123,22 @@ TEST_F(DiskGroupTest, SlabPayloadCrcSettingIsZeroOrOne) {
         << group.StartupError();
   }
 }
+
+// DFKV_SLAB_BALANCE takes 0 or 1; anything else refuses to start.
+TEST_F(DiskGroupTest, SlabBalanceSettingIsZeroOrOne) {
+  const auto dirs = Dirs(1);
+  for (const char* good : {"0", "1"}) {
+    fs::remove_all(dirs[0]);
+    fs::create_directories(dirs[0]);
+    ScopedEnv balance("DFKV_SLAB_BALANCE", good);
+    DiskCacheGroup group({dirs, 1ull << 30, "slab"});
+    EXPECT_TRUE(group.Healthy()) << good << ": " << group.StartupError();
+  }
+  for (const char* bad : {"2", "on", "true"}) {
+    ScopedEnv balance("DFKV_SLAB_BALANCE", bad);
+    DiskCacheGroup group({dirs, 1ull << 30, "slab"});
+    EXPECT_FALSE(group.Healthy()) << bad;
+    EXPECT_NE(group.StartupError().find("DFKV_SLAB_BALANCE"), std::string::npos)
+        << group.StartupError();
+  }
+}

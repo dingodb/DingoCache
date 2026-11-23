@@ -1032,6 +1032,14 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_watermark_last_tick_us", "gauge",
            "Duration of the latest watermark tick in microseconds",
            ss.watermark_last_tick_us);
+    if (group_.SlabBalance()) {
+      metric("dfkv_slab_balance_moves_total", "counter",
+             "Extents moved between size classes by their tail ages "
+             "(DFKV_SLAB_BALANCE)", ss.balance_moves);
+      metric("dfkv_slab_balance_max_hold_us", "gauge",
+             "Longest store-lock hold of a tick that moved extents between "
+             "size classes", ss.balance_max_hold_us);
+    }
     metric("dfkv_slab_watermark_max_tick_us", "gauge",
            "Maximum watermark tick duration in microseconds",
            ss.watermark_max_tick_us);
@@ -1155,6 +1163,12 @@ std::string KvNodeServer::MetricsText() const {
                               ? cls.allocated_bytes - cls.useful_bytes
                               : 0;
                  });
+    if (group_.SlabBalance())
+      class_metric("dfkv_slab_class_tail_age", "gauge",
+                   "Allocator operations since the value this size class "
+                   "would evict next was written or read (the oldest across "
+                   "disks)",
+                   [](const auto& cls) { return cls.tail_age; });
     class_metric("dfkv_slab_class_read_heat", "gauge",
                  "Operation-decayed read heat for this live slab size class",
                  [](const auto& cls) { return cls.read_heat; });

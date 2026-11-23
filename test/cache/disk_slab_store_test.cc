@@ -30,6 +30,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
+#include <set>
 #include <string>
 #include <functional>
 #include <mutex>
@@ -1723,6 +1725,124 @@ TEST_F(DiskSlabTest, AKillAfterAnUnsyncedBindWipeLeavesNoStaleKeys) {
     }
     EXPECT_EQ(recovered.Count(), after_put ? 5u : 4u);
   }
+}
+
+// STO-35: a balancer move is a steal. Its bind wipe goes to the table before
+// any resident is forgotten, so a process killed right after the wipe, or
+// after the whole move, comes back by warm restart without the moved
+// extent's old values and with every other value intact.
+TEST_F(DiskSlabTest, AKillDuringABalancerMoveLeavesNoStaleValues) {
+  for (const bool after_move : {false, true}) {
+    SCOPED_TRACE(after_move ? "killed after the move" : "killed after the wipe");
+    fs::remove_all(dir_);
+    fs::remove_all(dir_.string() + "_tokens");
+    const std::string present_file = dir_.string() + "_present";
+    // 8 extents of 64 KiB. Class A (4 KiB slots) is written first and left
+    // alone; class B (8 KiB) takes the other extents and evicts its own.
+    // A long cold window keeps Put's own cold steal out of the way.
+    ::setenv("DFKV_SLAB_COLD_STEAL_WINDOW", "100000", 1);
+    struct Unset {
+      ~Unset() { ::unsetenv("DFKV_SLAB_COLD_STEAL_WINDOW"); }
+    } unset;
+    auto options = WithIdentity(Opts(8 * 64 * 1024, 64 * 1024, 4096),
+                                WarmRestart::kAuto, 1, 7);
+    options.balance = true;
+    const std::string a(4000, 'A'), b(8000, 'B');
+    ASSERT_TRUE(CrashAfter(options, [&](DiskSlabStore& store) {
+      for (int i = 0; i < 64; ++i)
+        if (store.Cache(K(1000 + i), a.data(), a.size()) != Status::kOk) return false;
+      for (int i = 0; i < 64; ++i)
+        if (store.Cache(K(2000 + i), b.data(), b.size()) != Status::kOk) return false;
+      // What the move may take values from.
+      std::ofstream present(present_file);
+      for (int i = 0; i < 64; ++i)
+        for (const uint64_t id : {1000ull + i, 2000ull + i})
+          if (store.IsCached(K(id))) present << id << "\n";
+      present.close();
+      if (!after_move)
+        dfkv::DiskSlabStoreTestPeer::SetBindHook(&store, [](uint32_t) { ::_exit(0); });
+      dfkv::DiskSlabStoreTestPeer::ReclaimNow(&store, {});
+      if (store.GetStats().balance_moves != 1) return false;
+      ::_exit(0);  // killed: no table sync since the wipe (table_sync_ms = 0)
+    }));
+    std::set<uint64_t> before;
+    {
+      std::ifstream in(present_file);
+      for (uint64_t id; in >> id;) before.insert(id);
+    }
+    bool ok = false;
+    DiskSlabStore recovered(options, &ok);
+    ASSERT_TRUE(ok) << recovered.StartupError();
+    EXPECT_EQ(recovered.GetStats().warm_restarts, 1u) << "the table was kept";
+    std::string out;
+    size_t lost_a = 0, lost_b = 0;
+    for (const uint64_t id : before) {
+      if (recovered.Range(K(id), 0, 0, &out) == Status::kOk) {
+        EXPECT_EQ(out, id < 2000 ? a : b) << id;
+      } else {
+        ++(id < 2000 ? lost_a : lost_b);
+      }
+    }
+    for (int i = 0; i < 64; ++i)
+      for (const uint64_t id : {1000ull + i, 2000ull + i})
+        if (!before.count(id))
+          EXPECT_NE(recovered.Range(K(id), 0, 0, &out), Status::kOk)
+              << id << " came back";
+    // The moved extent was one of A's (the older tail): its values, and
+    // nothing else, are gone.
+    EXPECT_GT(lost_a, 0u);
+    EXPECT_LE(lost_a, 16u);
+    EXPECT_EQ(lost_b, 0u);
+    EXPECT_EQ(recovered.Count(), before.size() - lost_a);
+  }
+}
+
+// STO-35: the same shifting mix of sizes, with the balancer off and on. Off
+// (the default), the tick moves nothing and the classes keep the layout
+// growth alone gives them; on, extents go to the large class.
+TEST_F(DiskSlabTest, TheBalancerMovesNothingWhenOff) {
+  // 32 extents of 64 KiB; 4 KiB, 20 KiB and 60 KiB slots (16, 3 and 1 per
+  // extent). Two capacities in equal bytes, then three with 80% of the
+  // bytes in the largest values; the tick runs every 256 KiB written.
+  const size_t lens[3] = {4000, 20000, 60000};
+  std::map<uint32_t, uint32_t> layout[2];
+  uint64_t moves[2] = {0, 0};
+  for (const bool on : {false, true}) {
+    fs::remove_all(dir_);
+    auto o = Opts(32 * 64 * 1024, 64 * 1024, 4096);
+    o.reclaim_interval_ms = 0;
+    o.balance = on;
+    bool ok = false;
+    DiskSlabStore s(o, &ok);
+    ASSERT_TRUE(ok) << s.StartupError();
+    const std::string value(60000, 'v');
+    uint64_t id = 0, since = 0;
+    for (const double large : {1.0 / 3, 0.8}) {
+      const double share[3] = {(1 - large) / 2, (1 - large) / 2, large};
+      uint64_t written[3] = {0, 0, 0}, total = 0;
+      const uint64_t goal = (large < 0.5 ? 2 : 3) * 32ull * 64 * 1024;
+      while (total < goal) {
+        size_t c = 0;
+        for (size_t k = 1; k < 3; ++k)
+          if (written[k] / share[k] < written[c] / share[c]) c = k;
+        ASSERT_EQ(s.Cache(K(++id), value.data(), lens[c]), Status::kOk);
+        written[c] += lens[c];
+        total += lens[c];
+        if ((since += lens[c]) >= (256u << 10)) {
+          since = 0;
+          dfkv::DiskSlabStoreTestPeer::ReclaimNow(&s, {});
+        }
+      }
+    }
+    moves[on] = s.GetStats().balance_moves;
+    for (const auto& c : s.ClassStats())
+      if (c.extents) layout[on][c.slot_size] = c.extents;
+  }
+  EXPECT_EQ(moves[0], 0u);
+  EXPECT_GT(moves[1], 0u);
+  ASSERT_EQ(layout[0].size(), 3u);
+  EXPECT_GT(layout[1].rbegin()->second, layout[0].rbegin()->second)
+      << "the largest class got no extents from the balancer";
 }
 
 TEST_F(DiskSlabTest, WarmRecoveryThatDiesHalfWayForcesAReset) {

@@ -72,6 +72,14 @@ class DiskSlabStore : public StoreEngine {
     // CLOCK eviction sweep inline under the store lock (the measured write-
     // path serialization on a full store).
     uint32_t reclaim_interval_ms = 50;
+    // STO-35 (DFKV_SLAB_BALANCE): the reclaim tick also moves whole extents
+    // between size classes that are all evicting, from the class whose next
+    // victim is oldest to the one whose next victim is youngest, when the
+    // older is more than balance_ratio_pct/100 times the younger; at most
+    // balance_moves_per_tick extents per tick. Off by default.
+    bool balance = false;
+    uint32_t balance_ratio_pct = 110;
+    uint32_t balance_moves_per_tick = 1;
     // slots.tbl fdatasync cadence (ms; 0 = off). Bounds how many record writes
     // can be missing from the table on disk while the process runs. That
     // matters to a recovery only where a table is kept without the page cache
@@ -161,6 +169,8 @@ class DiskSlabStore : public StoreEngine {
     uint64_t watermark_active = 0;
     uint64_t watermark_last_tick_us = 0;
     uint64_t watermark_max_tick_us = 0;
+    uint64_t balance_moves = 0;
+    uint64_t balance_max_hold_us = 0;  // longest store-lock hold of a move
     uint64_t extent_returns = 0;
     uint64_t deferred_removes = 0;
     uint64_t inflight = 0;
@@ -663,6 +673,7 @@ class DiskSlabStore : public StoreEngine {
   std::atomic<uint64_t> watermark_ticks_{0};
   std::atomic<uint64_t> watermark_last_tick_us_{0};
   std::atomic<uint64_t> watermark_max_tick_us_{0};
+  std::atomic<uint64_t> balance_max_hold_us_{0};
   // Reclaimer observations, read/written together under mu_.
   uint64_t watermark_high_observations_ = 0;
   uint64_t watermark_last_high_bytes_ = 0;

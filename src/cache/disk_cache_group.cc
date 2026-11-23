@@ -342,6 +342,20 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
       sync_ms = static_cast<uint32_t>(parsed);
     }
   }
+  // STO-35: move extents between size classes by their tail ages.
+  bool slab_balance = false;
+  if (const char* mode = std::getenv("DFKV_SLAB_BALANCE");
+      mode != nullptr && *mode != '\0') {
+    if (std::strcmp(mode, "1") == 0) {
+      slab_balance = true;
+    } else if (std::strcmp(mode, "0") != 0 && use_slab) {
+      fail("DFKV_SLAB_BALANCE must be 0 or 1");
+      return;
+    }
+  }
+  if (use_slab)
+    config_dump::RecordResolved("DFKV_SLAB_BALANCE", slab_balance ? "1" : "0");
+  slab_balance_ = slab_balance && use_slab;
   uint32_t reclaim_ms = 50;
   if (const char* value = std::getenv("DFKV_SLAB_RECLAIM_MS")) {
     if (!ParseUnsigned(value, std::numeric_limits<uint32_t>::max(), &parsed)) {
@@ -410,6 +424,7 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
         if (slab_gran) so.slot_granularity = slab_gran;
         so.table_sync_ms = sync_ms;
         so.reclaim_interval_ms = reclaim_ms;
+        so.balance = slab_balance;
         so.warm_restart = slab_warm;
         so.payload_crc = slab_payload_crc;
         // Activated by Activate(), with the other disks, not by its own open.
@@ -1015,6 +1030,9 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
         std::max(sum.watermark_last_tick_us, st.watermark_last_tick_us);
     sum.watermark_max_tick_us =
         std::max(sum.watermark_max_tick_us, st.watermark_max_tick_us);
+    sum.balance_moves += st.balance_moves;
+    sum.balance_max_hold_us =
+        std::max(sum.balance_max_hold_us, st.balance_max_hold_us);
     sum.extent_returns += st.extent_returns;
     sum.deferred_removes += st.deferred_removes;
     sum.inflight += st.inflight;
@@ -1070,6 +1088,7 @@ std::vector<SlabAllocator::ClassStat> DiskCacheGroup::SlabClasses() const {
       sum.allocated_bytes += cls.allocated_bytes;
       sum.read_touches += cls.read_touches;
       sum.read_heat += cls.read_heat;
+      sum.tail_age = std::max(sum.tail_age, cls.tail_age);  // the oldest disk
     }
   }
   std::vector<SlabAllocator::ClassStat> out;

@@ -778,6 +778,7 @@ bool SlabAllocator::EvictOneFrom(size_t cls_index,
     FreeSlotLocked(current);
     if (evicted) evicted->push_back(std::move(victim));
     ++evictions_;
+    ++classes_[cls_index].evictions_since_balance;
     return true;
   }
   if (fallback != kNoSlot && slots_[fallback].live) {
@@ -787,6 +788,7 @@ bool SlabAllocator::EvictOneFrom(size_t cls_index,
     FreeSlotLocked(fallback);
     if (evicted) evicted->push_back(std::move(victim));
     ++evictions_;
+    ++classes_[cls_index].evictions_since_balance;
     return true;
   }
   return false;
@@ -1166,9 +1168,100 @@ std::vector<SlabAllocator::ClassStat> SlabAllocator::Classes() const {
     stat.allocated_bytes = static_cast<uint64_t>(cls.resident_count) * cls.slot_size;
     stat.read_touches = cls.read_touches;
     stat.read_heat = DecayedHeat(cls.read_heat, cls.heat_seq);
+    stat.tail_age = TailAgeLocked(cls);
     result.push_back(stat);
   }
   return result;
+}
+
+// The class ring is in admission and actual-read order and the hand stands at
+// its oldest member: the resident the class evicts next (or near it: pinned
+// and protected residents are passed over).
+uint64_t SlabAllocator::TailAgeLocked(const Class& cls) const {
+  if (cls.hand == kNoSlot || cls.resident_count == 0) return 0;
+  const uint64_t seq = slots_[cls.hand].access_seq;
+  return activity_seq_ > seq ? activity_seq_ - seq : 0;
+}
+
+size_t SlabAllocator::BalanceTailAges(uint32_t ratio_pct, size_t max_moves,
+                                      std::vector<BlockKey>* evicted,
+                                      bool* ok) {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (ok) *ok = true;
+  const uint64_t window = cold_window_ ? cold_window_ : index_.size();
+  size_t evicting = 0;
+  for (const Class& cls : classes_)
+    if (cls.evictions_since_balance > 0) ++evicting;
+  size_t moved = 0;
+  while (moved < max_moves && evicting > 0) {
+    // The receiver: of the classes evicting for their own writes, the one
+    // whose next victim is youngest.
+    size_t young = classes_.size();
+    uint64_t young_age = 0;
+    for (size_t c = 0; c < classes_.size(); ++c) {
+      const Class& cls = classes_[c];
+      if (cls.evictions_since_balance == 0 || cls.slots_per_extent == 0)
+        continue;
+      const uint64_t age = TailAgeLocked(cls);
+      if (young == classes_.size() || age < young_age) {
+        young = c;
+        young_age = age;
+      }
+    }
+    if (young == classes_.size()) break;
+    // The donor: of the other classes with residents, the one whose next
+    // victim is oldest, if it is older by the ratio and above its floor.
+    const uint32_t bound = static_cast<uint32_t>(extents_.size()) - unbound_;
+    const size_t floor = std::min<size_t>(
+        opt_.stripe_ways,
+        std::max<size_t>(1, bound / (4 * std::max<size_t>(evicting, 1))));
+    size_t old = classes_.size();
+    uint64_t old_age = 0;
+    for (size_t c = 0; c < classes_.size(); ++c) {
+      const Class& cls = classes_[c];
+      if (c == young || cls.resident_count == 0 || cls.bound_extents <= floor)
+        continue;
+      const uint64_t age = TailAgeLocked(cls);
+      if (old == classes_.size() || age > old_age) {
+        old = c;
+        old_age = age;
+      }
+    }
+    if (old == classes_.size() ||
+        static_cast<unsigned __int128>(old_age) * 100 <=
+            static_cast<unsigned __int128>(young_age) * ratio_pct)
+      break;
+    // The donor's least recently used extent that may go.
+    int best = -1;
+    for (uint32_t e = 0; e < extents_.size(); ++e) {
+      const ExtentMeta& extent = extents_[e];
+      if (extent.cls != static_cast<int>(old) || extent.pinned != 0 ||
+          extent.protected_slots != 0 ||
+          (extent.balanced_at != 0 && put_seq_ - extent.balanced_at < window))
+        continue;
+      if (best < 0 ||
+          StealsBeforeLocked(extent, extents_[static_cast<size_t>(best)]))
+        best = static_cast<int>(e);
+    }
+    if (best < 0) break;
+    const ExtentBindResult result =
+        StealExtentLocked(static_cast<uint32_t>(best), young, evicted);
+    if (result == ExtentBindResult::kPersistenceError) {
+      if (ok) *ok = false;
+      break;
+    }
+    if (result != ExtentBindResult::kBound) break;
+    extents_[static_cast<size_t>(best)].balanced_at = std::max<uint64_t>(put_seq_, 1);
+    ++balance_moves_;
+    ++moved;
+  }
+  for (Class& cls : classes_) cls.evictions_since_balance = 0;
+  return moved;
+}
+
+uint64_t SlabAllocator::BalanceMoves() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return balance_moves_;
 }
 
 size_t SlabAllocator::ColdestGrowDonor(const std::vector<ClassStat>& classes,
