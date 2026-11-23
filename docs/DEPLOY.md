@@ -347,6 +347,7 @@ WantedBy=multi-user.target
 > timeout 并冷却这个节点。所以无论哪个版本，client 的上限都应不高于 server 的
 > `--max-msg`。
 >
+> QP 的传输层重传（client 和 server 的 QP 都是）：`DFKV_RDMA_QP_TIMEOUT`（1–31，默认 14）、`DFKV_RDMA_QP_RETRY_CNT`（0–7，默认 7）、`DFKV_RDMA_QP_RNR_RETRY`（0–7，默认 7 即不限）。实测（ConnectX，对端 QP 已销毁）一个 SEND 到 `RETRY_EXC`（status=12）要 3.5–3.7 s，timeout 取 12、14、16 几乎没有差别（网卡有自己的最小 ack 超时），主要由重试次数决定；它小于下面的单操作超时。
 > Completion timeout：`DFKV_RDMA_OP_TIMEOUT_MS`（默认 5000）约束单操作；
 > `DFKV_RDMA_BATCH_OP_TIMEOUT_MS`（unset/0 = 跟随前者）覆盖 **所有** multi-item
 > Cache/Range/Exist、zero-copy 与 SG 窗口。一个窗口共用一个绝对 deadline，

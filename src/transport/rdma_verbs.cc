@@ -1,6 +1,8 @@
 #include "transport/rdma_verbs.h"
 #include "transport/rdma_protocol.h"
 #include "transport/rdma_wc_status.h"
+#include "common/config_dump.h"
+#include "utils/env_parse.h"
 #include <arpa/inet.h>
 
 #include <fcntl.h>
@@ -523,6 +525,34 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth,
   return true;
 }
 
+// Transport retry of every QP (client and server). Defaults as before:
+// timeout 14 (4.096 us * 2^14 per attempt in the spec; measured on a
+// ConnectX host, a SEND to a peer whose QP is gone completed with
+// RETRY_EXC after 3.7 s, not the 0.5 s the formula gives), 7 retries, and
+// RNR retries 7 (= without limit, so a receiver without a posted buffer
+// shows as an op timeout, not a WC error). DFKV_RDMA_QP_TIMEOUT (1..31),
+// DFKV_RDMA_QP_RETRY_CNT (0..7), DFKV_RDMA_QP_RNR_RETRY (0..7).
+const QpRetrySettings& QpRetry() {
+  static const QpRetrySettings settings = [] {
+    auto read = [](const char* name, uint64_t fallback, uint64_t min,
+                   uint64_t max) {
+      envparse::U64Spec spec;
+      spec.fallback = fallback;
+      spec.min = min;
+      spec.max = max;
+      const uint64_t value = envparse::EnvU64(name, spec);
+      config_dump::RecordResolved(name, std::to_string(value));
+      return static_cast<uint8_t>(value);
+    };
+    QpRetrySettings out;
+    out.timeout = read("DFKV_RDMA_QP_TIMEOUT", 14, 1, 31);
+    out.retry_cnt = read("DFKV_RDMA_QP_RETRY_CNT", 7, 0, 7);
+    out.rnr_retry = read("DFKV_RDMA_QP_RNR_RETRY", 7, 0, 7);
+    return out;
+  }();
+  return settings;
+}
+
 bool RcEndpoint::Connect(const QpInfo& remote) {
   // INIT -> RTR
   ibv_qp_attr at{};
@@ -551,9 +581,10 @@ bool RcEndpoint::Connect(const QpInfo& remote) {
   // RTR -> RTS
   ibv_qp_attr ts{};
   ts.qp_state = IBV_QPS_RTS;
-  ts.timeout = 14;
-  ts.retry_cnt = 7;
-  ts.rnr_retry = 7;
+  const QpRetrySettings& retry = QpRetry();
+  ts.timeout = retry.timeout;
+  ts.retry_cnt = retry.retry_cnt;
+  ts.rnr_retry = retry.rnr_retry;
   ts.sq_psn = local_.psn;
   ts.max_rd_atomic = 1;
   int rts = ibv_modify_qp(qp_, &ts,

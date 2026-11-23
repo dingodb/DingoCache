@@ -32,6 +32,14 @@
 namespace dfkv {
 namespace rdma {
 
+// The QP transport retry settings (see QpRetry in rdma_verbs.cc).
+struct QpRetrySettings {
+  uint8_t timeout = 14;
+  uint8_t retry_cnt = 7;
+  uint8_t rnr_retry = 7;
+};
+const QpRetrySettings& QpRetry();
+
 // QP connection info exchanged over the TCP bootstrap channel (fixed 32 bytes,
 // little-endian). lid==0 selects GRH/GID routing; otherwise IB LID routing.
 //

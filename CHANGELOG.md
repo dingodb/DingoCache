@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+
+- RDMA: the QP transport retry settings are `DFKV_RDMA_QP_TIMEOUT` (default
+  14), `DFKV_RDMA_QP_RETRY_CNT` (7) and `DFKV_RDMA_QP_RNR_RETRY` (7, no
+  limit) instead of constants; defaults unchanged. Measured on a ConnectX
+  host, a SEND to a peer whose QP is gone ends with `RETRY_EXC` after
+  3.5-3.7 s whatever the timeout (12, 14 or 16), not the 0.5 s the formula
+  gives, so the retry budget is below the 5 s operation timeout but not
+  far below it.
 - Tests: two drift guards for duplicated connector code. The ctypes bindings
   of `libdfkv` are declared in the HiCache plugin, the vLLM connector, the
   LMCache connector and `dfkv_common`, and nothing kept them in step with
