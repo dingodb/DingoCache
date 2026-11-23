@@ -347,7 +347,7 @@ NodeDedup::Role NodeDedup::ClaimImpl(const BlockKey& key, Kind kind, size_t cap,
                                      size_t strict_n, char* dst, size_t* got,
                                      uint64_t* token) {
   if (token) *token = 0;
-  if (cap == 0 || cap > arena_bytes_ / 2) return Role::kFetch;
+  if (cap == 0 || cap > DedupMaxPayload(arena_bytes_)) return Role::kFetch;
   const uint64_t now = NowMs();
   if (Slot* s = Find(key, kind)) {
     const uint32_t st = s->state.load(std::memory_order_acquire);
@@ -589,6 +589,11 @@ void NodeDedup::PublishFinish(const PublishHold& hold, const char* data,
 
 void NodeDedup::Publish(const BlockKey& key, Kind kind, uint64_t token,
                         const char* data, size_t n) {
+  // As the GPU side: a payload the slot cannot record is not published.
+  if (n == 0 || n > DedupMaxPayload(arena_bytes_)) {
+    Abort(key, kind, token);
+    return;
+  }
   PublishHold hold;
   Slot* s = OwnedSlot(token);
   if (s && PublishBegin(s, key, kind, token, &hold))

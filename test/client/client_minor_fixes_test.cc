@@ -2,6 +2,7 @@
 // transport returns fewer statuses than keys, a batch PUT to one node in
 // shards like the scatter-gather PUT, and a local CUDA publication failure
 // that says nothing about the node.
+#include "client/dedup_token.h"
 #include "client/kv_client.h"
 #include "client/peer_health.h"
 #include "transport/transport.h"
@@ -102,4 +103,14 @@ TEST(ClientDevicePublish, ALocalPublicationFailureSaysNothingAboutThePeer) {
   PeerOutcome outcome;
   outcome.Add(st[0]);
   EXPECT_FALSE(outcome.failed) << "status " << static_cast<int>(st[0]);
+}
+
+TEST(DedupPayloadBound, AtMostHalfTheArenaAndWhatTheLengthFieldHolds) {
+  // The slot records a payload length in 32 bits: an arena over 8 GiB let
+  // a payload of 4 GiB or more be claimed and its length truncated.
+  EXPECT_EQ(DedupMaxPayload(512ull << 20), 256ull << 20);
+  EXPECT_EQ(DedupMaxPayload(8ull << 30), 4ull << 30 > UINT32_MAX
+                                             ? static_cast<size_t>(UINT32_MAX)
+                                             : static_cast<size_t>(4ull << 30));
+  EXPECT_EQ(DedupMaxPayload(64ull << 30), static_cast<size_t>(UINT32_MAX));
 }

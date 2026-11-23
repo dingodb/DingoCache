@@ -51,6 +51,14 @@ void NoteLengthMismatch(std::atomic<uint64_t>* counter, const char* tag,
 // Publish/Abort holds it for a re-check (a few instructions, unless that
 // process is preempted or killed right there).
 constexpr int kDedupLockWaitMs = 50;
+
+// Largest payload a dedup slot takes: half the arena (so a lap can always
+// hold it), and no more than its 32-bit length field can record. Beyond the
+// latter (an arena over 8 GiB) the length was truncated.
+constexpr size_t DedupMaxPayload(uint64_t arena_bytes) {
+  return static_cast<size_t>(
+      arena_bytes / 2 < UINT32_MAX ? arena_bytes / 2 : UINT32_MAX);
+}
 }  // namespace dfkv
 
 #endif  // DFKV_DEDUP_TOKEN_H_

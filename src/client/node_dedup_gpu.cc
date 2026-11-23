@@ -724,7 +724,8 @@ GpuNodeDedup::Role GpuNodeDedup::ClaimSg(const BlockKey& key, const Seg* segs,
                                          size_t nsegs, size_t total_cap,
                                          size_t* got, uint64_t* token) {
   if (token) *token = 0;
-  if (total_cap == 0 || total_cap > arena_bytes_ / 2) return Role::kFetch;
+  if (total_cap == 0 || total_cap > DedupMaxPayload(arena_bytes_))
+    return Role::kFetch;
   EnsureThreadCtx();
   const uint64_t now = NowMs();
   if (Slot* s = Find(key)) {
@@ -957,7 +958,7 @@ bool GpuNodeDedup::PublishBegin(const BlockKey& key, uint64_t token,
                                 size_t len, PublishHold* hold) {
   Slot* s = OwnedSlot(token);
   if (!s || !LockOwned(s, key, token)) return false;
-  if (len == 0 || len > arena_bytes_ / 2) {
+  if (len == 0 || len > DedupMaxPayload(arena_bytes_)) {
     // Held without the mark: nobody can have taken the slot.
     s->state.store(kStateEmpty, std::memory_order_release);
     return false;
