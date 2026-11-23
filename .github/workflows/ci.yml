@@ -322,7 +322,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # Build inside ubuntu:22.04 (glibc 2.35) so the dynamically-linked artifacts
-    # have a low glibc floor and run on any node with glibc >= 2.35. Building on
+    # have a low glibc floor. The release needs no symbol newer than 2.34, so
+    # it runs on glibc 2.34 hosts too (RHEL 9 family); the check below fails a
+    # build that needs 2.35 or later. Building on
     # the runner's ubuntu-latest (glibc 2.39) bakes in GLIBC_2.3x symbols that
     # FAIL on older deploy nodes. RDMA-enabled + static libstdc++/libgcc;
     # libibverbs stays dynamic (it dlopen()s provider drivers at runtime).
@@ -343,29 +345,24 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+      # -g: the packager moves the debug information into the separate debug
+      # archive and strips the shipped binaries.
       - name: Build portable RDMA artifacts (static libstdc++, no tests)
         run: |
           cmake -S . -B build-static -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS=-g \
             -DDFKV_BUILD_TESTS=OFF -DDFKV_WITH_RDMA=ON -DDFKV_WITH_URING=ON \
             -DDFKV_STATIC_LIBSTDCXX=ON
           cmake --build build-static -j
-          strip build-static/dfkv_server build-static/dfkv_mds \
-                build-static/dfkv_bench build-static/dfkv_smoke \
-                build-static/dfkvctl build-static/dfkv_discover_smoke \
-                build-static/dfkv_gpu_dedup_repro \
-                build-static/libdfkv.so || true
-      - name: Verify portability (glibc floor + RDMA linked + static libstdc++)
+      - name: Verify hardening (canaries, fortified calls, full RELRO)
+        run: bash .github/scripts/check_hardening.sh build-static/dfkv_server build-static/dfkv_mds build-static/libdfkv.so
+      # The glibc floor is checked below on every packaged binary.
+      - name: Verify portability (RDMA linked + static libstdc++)
         run: |
-          echo "== glibc floor (must be <= 2.35) =="
-          objdump -T build-static/dfkv_server build-static/libdfkv.so \
-            | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -3
           echo "== libdfkv.so deps (expect libibverbs, NOT libstdc++) =="
           ldd build-static/libdfkv.so
           if ldd build-static/libdfkv.so | grep -q 'libstdc++'; then
             echo 'ERROR: libstdc++ is not statically linked'; exit 1; fi
-          if objdump -T build-static/dfkv_server build-static/libdfkv.so \
-               | grep -qoE 'GLIBC_2\.(3[6-9]|[4-9][0-9])'; then
-            echo 'ERROR: glibc floor exceeds 2.35'; exit 1; fi
       - name: Install, package, and verify exact release payload
         run: |
           set -eu
@@ -382,6 +379,8 @@ jobs:
           tar xzf "release/${PKG}.tar.gz" -C unpack
           ! tar -tzf "release/${PKG}.tar.gz" | grep -E '(__pycache__|\.py[co]$)'
           ROOT="$PWD/unpack/$PKG"
+          # glibc floor 2.34, over everything the release ships.
+          bash .github/scripts/check_glibc_floor.sh "$ROOT"/bin/* "$ROOT"/lib/libdfkv.so.*.*
 
           for binary in dfkv_server dfkv_mds dfkv_bench dfkv_smoke dfkvctl \
                         dfkv_discover_smoke dfkv_gpu_dedup_repro; do
@@ -420,8 +419,24 @@ jobs:
           import dfkv_telemetry
           PY
 
-          cp "release/${PKG}.tar.gz" .
+          # Debug symbols: a separate archive, one .debug file per shipped
+          # binary, each the one its stripped binary's debuglink names.
+          mkdir -p unpack-debug
+          tar xzf "release/${PKG}-debug.tar.gz" -C unpack-debug
+          for binary in "$ROOT"/bin/* "$ROOT"/lib/libdfkv.so.*.*; do
+            relative=${binary#"$ROOT/"}
+            debug="unpack-debug/$PKG/$relative.debug"
+            test -f "$debug"
+            readelf -S "$debug" 2>/dev/null | grep -q '\.debug_info'
+            ! readelf -S "$binary" | grep -q '\.debug_info'
+            readelf --string-dump=.gnu_debuglink "$binary" \
+              | grep -qF "$(basename "$relative").debug"
+          done
+          du -b "release/${PKG}.tar.gz" "release/${PKG}-debug.tar.gz"
+
+          cp "release/${PKG}.tar.gz" "release/${PKG}-debug.tar.gz" .
           sha256sum "${PKG}.tar.gz" | tee "${PKG}.tar.gz.sha256"
+          sha256sum "${PKG}-debug.tar.gz" | tee "${PKG}-debug.tar.gz.sha256"
       - name: Upload artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -429,6 +444,8 @@ jobs:
           path: |
             dfkv-*-linux-x86_64.tar.gz
             dfkv-*-linux-x86_64.tar.gz.sha256
+            dfkv-*-linux-x86_64-debug.tar.gz
+            dfkv-*-linux-x86_64-debug.tar.gz.sha256
 
 
   python-wheels:

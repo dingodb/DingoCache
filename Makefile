@@ -31,7 +31,7 @@ test-python: build
 	$(PY_TEST_ENV) $(PYTHON) -m unittest discover -s integration/common/tests -p 'test_*.py'
 
 test-tools: build
-	bash -n test/tool_smoke.sh deploy/package_release.sh deploy/sync_telemetry.sh
+	bash -n test/tool_smoke.sh deploy/package_release.sh deploy/sync_telemetry.sh .github/scripts/check_hardening.sh .github/scripts/check_glibc_floor.sh
 	bash test/tool_smoke.sh $(BUILD_DIR)
 	PYTHONPYCACHEPREFIX=$(CURDIR)/$(BUILD_DIR)/pycache $(PYTHON) -m py_compile deploy/*.py
 
