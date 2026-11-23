@@ -322,3 +322,83 @@ TEST(ReadCoalescer, NoTombstoneForPartialFailedOrFannedReads) {
   c.CompleteAsync(t4, Status::kOk, v, 8, nullptr, nullptr, &recur);
   EXPECT_FALSE(recur);
 }
+
+// Two serve threads whose batches name the same keys in opposite order:
+// each registers its first key (the read is submitted only after its whole
+// prep), then finds the other's flight for its second key. Waiting there
+// is a cycle, broken only by the follower timeout; neither may wait.
+TEST(ReadCoalescer, OppositeOrderBatchesDoNotWaitForEachOther) {
+  ReadCoalescer c;
+  constexpr size_t kLen = 4096;
+  std::atomic<int> registered{0};
+  std::atomic<int> looked{0};
+  std::atomic<long long> waited_ms[2] = {{0}, {0}};
+  ReadCoalescer::PublishedWait result[2] = {
+      ReadCoalescer::PublishedWait::kNotEligible,
+      ReadCoalescer::PublishedWait::kNotEligible};
+  auto serve = [&](int self, uint64_t first, uint64_t second) {
+    const uint64_t token = c.TryRegisterAsync(
+        K(first), 0, kLen, /*whole_value=*/true, kLen,
+        /*publishes_to_ram=*/true);
+    ASSERT_NE(token, 0u);
+    ++registered;
+    while (registered.load() < 2) std::this_thread::sleep_for(1ms);
+    const auto t0 = std::chrono::steady_clock::now();
+    result[self] = c.WaitForPublished(K(second), 0, kLen);
+    waited_ms[self] = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+    // The prep is over: this thread's read is submitted and completes, once
+    // the other has looked for it.
+    ++looked;
+    while (looked.load() < 2) std::this_thread::sleep_for(1ms);
+    c.CompleteAsync(token, Status::kOk, nullptr, kLen);
+  };
+  std::thread a(serve, 0, 1, 2);
+  std::thread b(serve, 1, 2, 1);
+  a.join();
+  b.join();
+  for (int i = 0; i < 2; ++i) {
+    EXPECT_LT(waited_ms[i].load(), 100) << "thread " << i;
+    EXPECT_EQ(result[i], ReadCoalescer::PublishedWait::kFallback);
+  }
+}
+
+// The convoy case is unchanged: a thread that holds no flight of its own
+// waits for the leader and is served by it.
+TEST(ReadCoalescer, AFollowerWithoutFlightsStillWaits) {
+  ReadCoalescer c;
+  constexpr size_t kLen = 4096;
+  const uint64_t a = c.TryRegisterAsync(K(11), 0, kLen, true, kLen, true);
+  const uint64_t b = c.TryRegisterAsync(K(12), 0, kLen, true, kLen, true);
+  ASSERT_NE(a, 0u);
+  ASSERT_NE(b, 0u);
+  ReadCoalescer::PublishedWait first = ReadCoalescer::PublishedWait::kNotEligible;
+  ReadCoalescer::PublishedWait second = ReadCoalescer::PublishedWait::kNotEligible;
+  std::atomic<bool> first_done{false};
+  std::thread follower([&] {
+    first = c.WaitForPublished(K(11), 0, kLen);
+    first_done = true;
+    second = c.WaitForPublished(K(12), 0, kLen);
+  });
+  std::this_thread::sleep_for(20ms);
+  c.CompleteAsync(a, Status::kOk, nullptr, kLen);
+  while (!first_done.load()) std::this_thread::sleep_for(1ms);
+  std::this_thread::sleep_for(20ms);
+  c.CompleteAsync(b, Status::kOk, nullptr, kLen);
+  follower.join();
+  EXPECT_EQ(first, ReadCoalescer::PublishedWait::kReady);
+  EXPECT_EQ(second, ReadCoalescer::PublishedWait::kReady);
+  EXPECT_EQ(c.held_fallbacks(), 0u);
+  // Once its flights are completed, the leader's thread may wait again.
+  const uint64_t d = c.TryRegisterAsync(K(13), 0, kLen, true, kLen, true);
+  std::thread other([&] {
+    const uint64_t own = c.TryRegisterAsync(K(14), 0, kLen, true, kLen, true);
+    c.CompleteAsync(own, Status::kOk, nullptr, kLen);
+    EXPECT_EQ(c.WaitForPublished(K(13), 0, kLen),
+              ReadCoalescer::PublishedWait::kReady);
+  });
+  std::this_thread::sleep_for(20ms);
+  c.CompleteAsync(d, Status::kOk, nullptr, kLen);
+  other.join();
+}

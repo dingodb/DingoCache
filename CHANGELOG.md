@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Server, read coalescing: two connections whose batches name the same
+  keys in opposite order no longer wait for each other. Each serve thread
+  registered the read of its first key (submitted only after its whole
+  batch was prepared) and then waited for the other's read of its second
+  key: both waited out `DFKV_READ_COALESCE_TIMEOUT_MS` (500 ms) and then
+  read for themselves. A follower whose thread holds an unfinished read of
+  its own now reads for itself at once; same-order convoys still coalesce.
+  New `dfkv_read_coalesce_held_reads_total`.
+
 - Server, RAM tier: a slow disk no longer holds up the flushes of the
   others. Flush queues were per RAM shard and a flush batch mixed the
   values of every disk; the batch returned when its slowest disk was done,

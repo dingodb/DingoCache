@@ -22,7 +22,13 @@
  * poisoned, batch fail), so a waiter must never be able to hang forever.
  * A follower whose flight was registered by ITS OWN serve thread (a pipelined
  * duplicate on one connection: the leader's read has not been submitted yet)
- * skips waiting entirely and reads itself — waiting would deadlock.
+ * skips waiting entirely and reads itself — waiting would deadlock. So does a
+ * follower whose thread holds any async flight not yet completed: another
+ * thread may be waiting for that one, as with two connections whose batches
+ * name the same keys in opposite order (each registers one key, then finds
+ * the other's), and the two would wait for each other until the timeout. A
+ * waiter thus never holds a flight, which leaves no cycle; same-order
+ * convoys still coalesce, since only the first-arriving thread holds flights.
  *
  * Blocking a follower is never worse than the duplicate pread it replaces
  * (both are bounded by one disk read), so this is safe on thread-per-conn
@@ -141,6 +147,7 @@ class ReadCoalescer {
     map_.emplace(k, f);
     const uint64_t t = ++token_seq_;
     tokens_.emplace(t, std::move(f));
+    ++open_async_[std::this_thread::get_id()];
     return t;
   }
 
@@ -167,6 +174,9 @@ class ReadCoalescer {
       if (it == tokens_.end()) return false;
       f = std::move(it->second);
       tokens_.erase(it);
+      auto open = open_async_.find(f->leader_tid);
+      if (open != open_async_.end() && --open->second == 0)
+        open_async_.erase(open);
       auto mit = map_.find(f->key);
       if (mit != map_.end() && mit->second == f) map_.erase(mit);
       waiters = f->waiters.load(std::memory_order_acquire) > 0;
@@ -224,8 +234,11 @@ class ReadCoalescer {
       auto it = map_.find(k);
       if (it == map_.end() || !it->second->publishes_to_ram)
         return PublishedWait::kNotEligible;
-      if (it->second->leader_tid == std::this_thread::get_id())
+      if (it->second->leader_tid == std::this_thread::get_id() ||
+          HoldsOpenFlightLocked()) {
+        held_fallbacks_.fetch_add(1, std::memory_order_relaxed);
         return PublishedWait::kFallback;
+      }
       f = it->second;
       f->waiters.fetch_add(1, std::memory_order_acq_rel);
     }
@@ -262,6 +275,7 @@ class ReadCoalescer {
     Key k{bk.digest_hi, bk.digest_lo, bk.tenant_hash, offset, length};
     std::shared_ptr<Flight> f;
     bool leader = false;
+    bool holds_flight = false;
     {
       std::lock_guard<std::mutex> lk(mu_);
       auto it = map_.find(k);
@@ -273,6 +287,7 @@ class ReadCoalescer {
         leader = true;
       } else {
         f = it->second;
+        holds_flight = HoldsOpenFlightLocked();
       }
     }
     if (leader) {
@@ -316,6 +331,11 @@ class ReadCoalescer {
     // runs), so waiting here would deadlock. Read it ourselves.
     if (f->leader_tid == std::this_thread::get_id())
       return fill(dst, dst_cap, out_len, out_value_len);
+    // This thread holds an async flight not yet completed: see the header.
+    if (holds_flight) {
+      held_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+      return fill(dst, dst_cap, out_len, out_value_len);
+    }
     // Follower: wait (bounded) for the leader, then copy from the shared
     // buffer; on timeout / failure / abort, fall back to our own read.
     f->waiters.fetch_add(1, std::memory_order_acq_rel);
@@ -344,6 +364,10 @@ class ReadCoalescer {
   size_t coalesced() const { return coalesced_.load(std::memory_order_relaxed); }
   size_t timeouts() const { return timeouts_.load(std::memory_order_relaxed); }
   size_t recur_hits() const { return recur_hits_.load(std::memory_order_relaxed); }
+  // Followers that read for themselves because their thread held a flight.
+  size_t held_fallbacks() const {
+    return held_fallbacks_.load(std::memory_order_relaxed);
+  }
 
  private:
   struct Flight {
@@ -419,7 +443,13 @@ class ReadCoalescer {
   std::unordered_map<Key, std::chrono::steady_clock::time_point, KeyHash> recents_;
   std::deque<std::pair<Key, std::chrono::steady_clock::time_point>> recent_fifo_;
   uint64_t token_seq_ = 0;
-  std::atomic<size_t> leaders_{0}, coalesced_{0}, timeouts_{0}, recur_hits_{0};
+  // Async flights registered and not yet completed, by registering thread.
+  std::unordered_map<std::thread::id, size_t> open_async_;
+  bool HoldsOpenFlightLocked() const {
+    return open_async_.count(std::this_thread::get_id()) != 0;
+  }
+  std::atomic<size_t> leaders_{0}, coalesced_{0}, timeouts_{0}, recur_hits_{0},
+      held_fallbacks_{0};
 };
 
 }  // namespace dfkv
