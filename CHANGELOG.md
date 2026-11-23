@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Server: PUTs of different keys no longer wait for each other. PUTs were
+  serialized by 1024 lock stripes held across the RAM admission copy and,
+  on a capacity bypass, the disk write; with 64 concurrent 1 MiB PUTs of
+  distinct keys 4.5% of them waited for an unrelated key, about 1.15 ms
+  each. The lock is now per key. New `dfkv_put_key_lock_waits_total` and
+  `dfkv_put_key_lock_wait_us_total`.
+
 - Server, read coalescing: two connections whose batches name the same
   keys in opposite order no longer wait for each other. Each serve thread
   registered the read of its first key (submitted only after its whole
