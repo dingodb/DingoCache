@@ -143,6 +143,7 @@ dfkvctl stat <ip:port>                        # 单节点原始 /metrics 文本�
 | `dfkv_disk_engine_info{disk,engine}` | gauge | 恒为 1：每块盘实际运行的存储引擎（`slab`、`file`、`log`）。`DFKV_STORE_ENGINE=auto`（实验性）按目录选引擎时，各盘可能不同 |
 | `dfkv_lse_segments{disk,disk_index}` / `dfkv_lse_segments_free` / `dfkv_lse_segments_sealed` / `dfkv_lse_sealer_queue` / `dfkv_lse_shadows` | gauge | 仅 `log` 引擎盘（实验性）：段总数 / 空闲段 / 已封段 / 待封段 / 未进索引但仍可恢复的副本数 |
 | `dfkv_lse_segments_sealed_total` / `dfkv_lse_segments_reclaimed_total` / `dfkv_lse_inline_reclaims_total` | counter | 仅 `log` 引擎盘：封段 / 回收段 / PUT 因无空闲段自行回收的段 |
+| `dfkv_lse_inline_reclaim_microseconds_total` / `dfkv_lse_sealer_queue_waits_total` / `dfkv_lse_sealer_queue_wait_microseconds_total` / `dfkv_lse_cleaner_waits_total` / `dfkv_lse_cleaner_wait_microseconds_total` | counter | 仅 `log` 引擎盘：写入路径上的等待。PUT 自行回收段的耗时；写入者（PUT 或搬迁）因待封队列已满而等待封段器的次数 / 耗时；PUT 找不到空间、等待刚启动的清理器的次数 / 耗时（启动后 1 秒内）。用两者之比看平均等待 |
 | `dfkv_lse_records_relocated_total` / `dfkv_lse_relocated_bytes_total` / `dfkv_lse_records_evicted_total` / `dfkv_lse_protected_evictions_total` / `dfkv_lse_relocate_budget_exhausted_total` / `dfkv_lse_victims_skipped_pins_total` | counter | 仅 `log` 引擎盘：清理器搬迁记录 / 字节，淘汰记录，作为最后手段淘汰的受保护记录，因搬迁预算用尽而淘汰的被读过的记录，因 pin 未在时限内释放而跳过的段 |
 | `dfkv_lse_cache_full_total` / `dfkv_lse_read_crc_failures_total` | counter | 仅 `log` 引擎盘：回答 `kCacheFull` 的 PUT / 载荷校验失败的读与搬迁读 |
 | `dfkv_lse_journal_compactions_total` / `dfkv_lse_journal_integrity_resets_total` / `dfkv_lse_journal_bytes` | counter / counter / gauge | 仅 `log` 引擎盘：元数据日志压缩次数 / 因日志损坏清空存储的次数 / 日志大小 |

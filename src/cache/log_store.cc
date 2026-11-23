@@ -47,6 +47,11 @@ constexpr const char* kJournalName = "lse_journal";
 constexpr const char* kMarkerName = "lse_initializing";
 constexpr const char* kSegmentsDir = "segments";
 
+uint64_t MicrosSince(std::chrono::steady_clock::time_point t0) {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now() - t0)
+                                   .count());
+}
 uint64_t AlignDown(uint64_t v) { return v & ~(kBlockBytes - 1); }
 uint64_t AlignUp(uint64_t v) { return (v + kBlockBytes - 1) & ~(kBlockBytes - 1); }
 bool IsPowerOfTwo(uint64_t v) { return v != 0 && (v & (v - 1)) == 0; }
@@ -1373,9 +1378,15 @@ void LogStore::HandToSealerLocked(Lock& lk, uint32_t segment) {
   segments_[segment].state = SegState::kSealing;
   // The queue is bounded (§6.3), which bounds what an unclean exit leaves
   // unsealed.
-  state_cv_.wait(lk, [&] {
-    return seal_queue_.size() < kSealerQueue || stop_threads_ || failed_.load();
-  });
+  auto full = [&] {
+    return seal_queue_.size() >= kSealerQueue && !stop_threads_ && !failed_.load();
+  };
+  if (full()) {  // counted: a writer (PUT or relocation) waits for the sealer
+    const auto t0 = std::chrono::steady_clock::now();
+    state_cv_.wait(lk, [&] { return !full(); });
+    ++stats_.sealer_queue_waits;
+    stats_.sealer_queue_wait_us += MicrosSince(t0);
+  }
   seal_queue_.push_back(segment);
   state_cv_.notify_all();
 }
@@ -1440,7 +1451,11 @@ bool LogStore::ReserveLocked(Lock& lk, uint64_t footprint, uint32_t* segment,
       continue;
     }
     if (failed_.load()) return false;
-    if (InlineReclaimLocked(lk)) continue;
+    const auto inline_t0 = std::chrono::steady_clock::now();
+    if (InlineReclaimLocked(lk)) {
+      stats_.inline_reclaim_us += MicrosSince(inline_t0);
+      continue;
+    }
     // Nothing to reclaim inline (every sealed segment holds a protected
     // value or is pinned): right after the cleaner was armed, wait for it
     // instead of answering kCacheFull at once.
@@ -1448,10 +1463,13 @@ bool LogStore::ReserveLocked(Lock& lk, uint64_t footprint, uint32_t* segment,
         std::chrono::steady_clock::now() >= arm_grace_until_)
       return false;
     const size_t opened = open_.size();
+    const auto grace_t0 = std::chrono::steady_clock::now();
     state_cv_.wait_until(lk, arm_grace_until_, [&] {
       return FreeCountLocked() > kCleanerReserve || open_.size() > opened ||
              failed_.load() || stop_threads_;
     });
+    ++stats_.cleaner_waits;
+    stats_.cleaner_wait_us += MicrosSince(grace_t0);
   }
   return false;
 }
@@ -2584,6 +2602,17 @@ void LogStore::EngineMetrics(std::vector<EngineMetric>* out) const {
   add("dfkv_lse_segments_reclaimed_total", "counter", "Segments reclaimed", st.segments_reclaimed);
   add("dfkv_lse_inline_reclaims_total", "counter",
       "Segments a PUT reclaimed itself for want of a free one", st.inline_reclaims);
+  add("dfkv_lse_inline_reclaim_microseconds_total", "counter",
+      "Time PUTs spent reclaiming segments themselves", st.inline_reclaim_us);
+  add("dfkv_lse_sealer_queue_waits_total", "counter",
+      "Writers that waited for room in the sealer's queue", st.sealer_queue_waits);
+  add("dfkv_lse_sealer_queue_wait_microseconds_total", "counter",
+      "Time writers waited for room in the sealer's queue", st.sealer_queue_wait_us);
+  add("dfkv_lse_cleaner_waits_total", "counter",
+      "PUTs that found no space and waited for the cleaner just armed",
+      st.cleaner_waits);
+  add("dfkv_lse_cleaner_wait_microseconds_total", "counter",
+      "Time PUTs waited for the cleaner just armed", st.cleaner_wait_us);
   add("dfkv_lse_records_relocated_total", "counter", "Records the cleaner relocated",
       st.records_relocated);
   add("dfkv_lse_relocated_bytes_total", "counter", "Footprint bytes relocated",
