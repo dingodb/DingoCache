@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Client, GPU dedup: publishing fetched keys and copying hits synchronize
+  the CUDA stream once per batch (per chunk of at most half the arena for
+  publishes) instead of once per key. Measured on one GPU: 512 keys of 64
+  KiB published in 2.6 ms instead of 6.9 ms and hit in 2.6 ms instead of 6.8
+  ms; 64 keys in 0.37 and 0.34 ms instead of 0.91 and 0.99 ms.
 
 - Server, read coalescing (`DFKV_READ_COALESCE=1`, REQ-20): a read nobody
   else is waiting for goes straight into its own buffer. The leader of a

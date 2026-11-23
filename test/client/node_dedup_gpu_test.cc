@@ -26,6 +26,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <vector>
@@ -34,6 +35,80 @@
 #include "client/key_map.h"
 #include "client/kv_client.h"
 #include "transport/transport.h"
+
+namespace {
+// The calling thread's nth allocation fails (0: off); for the fault sweep of
+// a batch read below. Off, the replacements below only pair malloc and free.
+thread_local long g_fail_in = 0;
+}  // namespace
+
+// The whole replaceable set, on malloc and free, so that every new pairs
+// with its delete (std::get_temporary_buffer, used by gtest's stable_sort,
+// allocates with nothrow new: left to the library, it was freed here).
+// Only the throwing forms fail on purpose.
+namespace {
+void* Allocate(std::size_t n) {
+  if (g_fail_in > 0 && --g_fail_in == 0) throw std::bad_alloc();
+  if (void* p = std::malloc(n ? n : 1)) return p;
+  throw std::bad_alloc();
+}
+void* AlignedOrNull(std::size_t n, std::align_val_t a) {
+  const std::size_t align = static_cast<std::size_t>(a);
+  return std::aligned_alloc(align, (n ? n + align - 1 : align) / align * align);
+}
+void* AllocateAligned(std::size_t n, std::align_val_t a) {
+  if (g_fail_in > 0 && --g_fail_in == 0) throw std::bad_alloc();
+  if (void* p = AlignedOrNull(n, a)) return p;
+  throw std::bad_alloc();
+}
+}  // namespace
+
+void* operator new(std::size_t n) { return Allocate(n); }
+void* operator new[](std::size_t n) { return Allocate(n); }
+void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
+  return std::malloc(n ? n : 1);
+}
+void* operator new[](std::size_t n, const std::nothrow_t&) noexcept {
+  return std::malloc(n ? n : 1);
+}
+void* operator new(std::size_t n, std::align_val_t a) {
+  return AllocateAligned(n, a);
+}
+void* operator new[](std::size_t n, std::align_val_t a) {
+  return AllocateAligned(n, a);
+}
+void* operator new(std::size_t n, std::align_val_t a,
+                   const std::nothrow_t&) noexcept {
+  return AlignedOrNull(n, a);
+}
+void* operator new[](std::size_t n, std::align_val_t a,
+                     const std::nothrow_t&) noexcept {
+  return AlignedOrNull(n, a);
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept {
+  std::free(p);
+}
+void operator delete(void* p, std::align_val_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::align_val_t) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t, std::align_val_t) noexcept {
+  std::free(p);
+}
+void operator delete[](void* p, std::size_t, std::align_val_t) noexcept {
+  std::free(p);
+}
+void operator delete(void* p, std::align_val_t,
+                     const std::nothrow_t&) noexcept {
+  std::free(p);
+}
+void operator delete[](void* p, std::align_val_t,
+                       const std::nothrow_t&) noexcept {
+  std::free(p);
+}
 
 using dfkv::BlockKey;
 using dfkv::CudaLib;
@@ -350,6 +425,126 @@ TEST(GpuNodeDedup, WaitManyAmortizedSync) {
     EXPECT_EQ(dsts[i]->Down(8192), vals[i]) << "key " << i;
   }
   EXPECT_EQ(b->wait_hits(), kN);
+}
+
+// PublishManySg and ClaimSgDeferred + FinishHits: the batched forms publish
+// and hit what the per-key forms do, with one stream synchronization per
+// publish chunk (at most half the arena) and one per hit batch.
+TEST(GpuNodeDedup, BatchedPublishAndHitsRoundTrip) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("batched");
+  GpuNodeDedup::Options o = LongWait(g.name);
+  o.arena_bytes = 64u << 10;  // chunks of 32 KiB: eight 4 KiB keys
+  auto a = GpuNodeDedup::Open(o);
+  auto b = GpuNodeDedup::Open(o);
+  ASSERT_TRUE(a && b);
+  constexpr size_t kN = 12, kLen = 4096;
+  std::vector<std::string> vals;
+  std::vector<std::unique_ptr<DevBuf>> src, dst;
+  std::vector<GpuNodeDedup::Seg> ss(kN), ds(kN);
+  std::vector<uint64_t> tok(kN, 0);
+  std::vector<GpuNodeDedup::PublishItem> items;
+  size_t got = 0;
+  for (size_t i = 0; i < kN; ++i) {
+    vals.push_back(Val(700 + i, kLen));
+    src.push_back(std::make_unique<DevBuf>(kLen));
+    dst.push_back(std::make_unique<DevBuf>(kLen));
+    src[i]->Up(vals[i]);
+    ss[i] = {reinterpret_cast<void*>(src[i]->p), kLen};
+    ds[i] = {reinterpret_cast<void*>(dst[i]->p), kLen};
+    ASSERT_EQ(a->ClaimSg(K(700 + i), &ss[i], 1, kLen, &got, &tok[i]),
+              GpuNodeDedup::Role::kFetch);
+    items.push_back({K(700 + i), tok[i], &ss[i], 1, kLen});
+  }
+  int* syncs = SimSymbol<int>("sim_cuda_stream_synchronize_calls");
+  const int before = syncs ? *syncs : 0;
+  a->PublishManySg(items.data(), items.size());
+  if (syncs) EXPECT_EQ(*syncs - before, 2) << "one sync per 32 KiB chunk";
+
+  GpuNodeDedup::HitBatch batch;
+  for (size_t i = 0; i < kN; ++i) {
+    uint64_t t = 0;
+    ASSERT_EQ(b->ClaimSgDeferred(K(700 + i), &ds[i], 1, kLen, &t, &batch, i),
+              GpuNodeDedup::Role::kHit) << i;
+    EXPECT_EQ(t, 0u);
+  }
+  const int before_hits = syncs ? *syncs : 0;
+  std::vector<std::pair<size_t, size_t>> hits;
+  std::vector<size_t> failed;
+  b->FinishHits(&batch, &hits, &failed);
+  if (syncs) EXPECT_EQ(*syncs - before_hits, 1) << "one sync for the batch";
+  EXPECT_TRUE(failed.empty());
+  ASSERT_EQ(hits.size(), kN);
+  for (const auto& [i, n] : hits) {
+    EXPECT_EQ(n, kLen);
+    EXPECT_EQ(dst[i]->Down(kLen), vals[i]) << i;
+  }
+  EXPECT_EQ(b->hits(), kN);
+}
+
+// A deferred hit whose entry is invalidated before FinishHits is no hit.
+TEST(GpuNodeDedup, ADeferredHitInvalidatedBeforeFinishIsNoHit) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("deferred-inval");
+  auto a = GpuNodeDedup::Open(LongWait(g.name));
+  auto b = GpuNodeDedup::Open(LongWait(g.name));
+  ASSERT_TRUE(a && b);
+  const std::string v = Val(810, 4096);
+  DevBuf src(4096), dst(4096);
+  src.Up(v);
+  GpuNodeDedup::Seg ss{reinterpret_cast<void*>(src.p), 4096};
+  GpuNodeDedup::Seg ds{reinterpret_cast<void*>(dst.p), 4096};
+  size_t got = 0;
+  uint64_t tok = 0, t = 0;
+  ASSERT_EQ(a->ClaimSg(K(810), &ss, 1, 4096, &got, &tok),
+            GpuNodeDedup::Role::kFetch);
+  a->PublishSg(K(810), tok, &ss, 1, v.size());
+  GpuNodeDedup::HitBatch batch;
+  ASSERT_EQ(b->ClaimSgDeferred(K(810), &ds, 1, 4096, &t, &batch, 7),
+            GpuNodeDedup::Role::kHit);
+  a->Invalidate(K(810));
+  std::vector<std::pair<size_t, size_t>> hits;
+  std::vector<size_t> failed;
+  b->FinishHits(&batch, &hits, &failed);
+  EXPECT_TRUE(hits.empty());
+  EXPECT_EQ(failed, std::vector<size_t>{7});
+  EXPECT_EQ(b->hits(), 0u);
+}
+
+// A publish chunk whose synchronization fails commits nothing: every slot of
+// it is free for the next claimer.
+TEST(GpuNodeDedup, AFailedPublishChunkLeavesEverySlotFree) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  int* fail = SimSymbol<int>("sim_cuda_fail_stream_synchronize");
+  if (!fail) GTEST_SKIP() << "needs the simulated driver to fail a sync";
+  ShmGuard g("failed-chunk");
+  auto a = GpuNodeDedup::Open(LongWait(g.name));
+  auto b = GpuNodeDedup::Open(LongWait(g.name));
+  ASSERT_TRUE(a && b);
+  constexpr size_t kN = 4, kLen = 4096;
+  std::vector<std::unique_ptr<DevBuf>> src;
+  std::vector<GpuNodeDedup::Seg> ss(kN);
+  std::vector<GpuNodeDedup::PublishItem> items;
+  size_t got = 0;
+  for (size_t i = 0; i < kN; ++i) {
+    src.push_back(std::make_unique<DevBuf>(kLen));
+    ss[i] = {reinterpret_cast<void*>(src[i]->p), kLen};
+    uint64_t tok = 0;
+    ASSERT_EQ(a->ClaimSg(K(820 + i), &ss[i], 1, kLen, &got, &tok),
+              GpuNodeDedup::Role::kFetch);
+    items.push_back({K(820 + i), tok, &ss[i], 1, kLen});
+  }
+  *fail = 1;
+  a->PublishManySg(items.data(), items.size());
+  *fail = 0;
+  for (size_t i = 0; i < kN; ++i) {
+    uint64_t tok = 0;
+    DevBuf d(kLen);
+    GpuNodeDedup::Seg ds{reinterpret_cast<void*>(d.p), kLen};
+    EXPECT_EQ(b->ClaimSg(K(820 + i), &ds, 1, kLen, &got, &tok),
+              GpuNodeDedup::Role::kFetch) << i;
+    b->Abort(K(820 + i), tok);
+  }
 }
 
 TEST(GpuNodeDedup, AbortFreesSlotForWaiterFallback) {
@@ -1636,6 +1831,97 @@ TEST(GpuDedupClient, NothingIsPublishedWhenTheDeviceCannotBeSynchronized) {
   ConnectorFence();
   EXPECT_EQ(f0.Down(20000), v.substr(0, 20000));
   EXPECT_EQ(f1.Down(20000), v.substr(20000));
+}
+
+// A follower's hit whose copy fails to settle is no hit: it fetches the key
+// itself, into the same destinations.
+TEST(GpuDedupClient, AHitThatDoesNotSettleIsFetchedDirectly) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  int* fail = SimSymbol<int>("sim_cuda_fail_stream_synchronize");
+  if (!fail) GTEST_SKIP() << "needs the simulated driver to fail a sync";
+  TwoClients c("hit-unsettled");
+  const std::string v = Val(23, 40000);
+  c.Store("k", v);
+  DevBuf l0(20000), l1(20000), f0(20000), f1(20000);
+  size_t len = 0;
+  ASSERT_TRUE(c.Get(c.leader.get(), "k", &l0, &l1, &len));
+  ASSERT_EQ(c.transport.reads, 1);
+  *fail = 1;  // the follower's FinishHits cannot synchronize
+  const bool got = c.Get(c.follower.get(), "k", &f0, &f1, &len);
+  *fail = 0;
+  EXPECT_TRUE(got);
+  EXPECT_EQ(len, v.size());
+  EXPECT_EQ(c.transport.reads, 2) << "the follower fetched for itself";
+  ConnectorFence();
+  EXPECT_EQ(f0.Down(20000), v.substr(0, 20000));
+  EXPECT_EQ(f1.Down(20000), v.substr(20000));
+}
+
+// A throw after a hit's copy was enqueued (an allocation failing, in
+// practice) must not hand the destinations back with the copy still queued:
+// the caller reuses them, and the copy would land in another request's block
+// later. The simulated driver holds asynchronous copies until the next
+// synchronization, as a stream would; every allocation of the follower's
+// batch is failed in turn, with one READY key and one key to fetch.
+TEST(GpuDedupClient, AThrowAfterADeferredHitLeavesNoCopyQueued) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  int* defer = SimSymbol<int>("sim_cuda_defer_stream_copies");
+  int* queued = SimSymbol<int>("sim_cuda_queued_copies");
+  int* async_calls = SimSymbol<int>("sim_cuda_memcpy_async_calls");
+  if (!defer || !queued || !async_calls)
+    GTEST_SKIP() << "needs the simulated driver to hold copies";
+  TwoClients c("hit-throw");
+  const std::string v = Val(24, 40000);
+  c.Store("k", v);
+  DevBuf l0(20000), l1(20000);
+  size_t len = 0;
+  ASSERT_TRUE(c.Get(c.leader.get(), "k", &l0, &l1, &len));  // k is READY
+  DevBuf f0(20000), f1(20000), m0(20000), m1(20000);
+  auto ptr = [](DevBuf& d) { return reinterpret_cast<void*>(d.p); };
+  const std::vector<dfkv::KvGetItemSg> items{
+      {"k", {ptr(f0), ptr(f1)}, {20000, 20000}},
+      {"absent", {ptr(m0), ptr(m1)}, {20000, 20000}}};
+  // The follower's lazy set-up (its rendezvous, stream and statics) runs
+  // once, unarmed: an allocation failing inside a std::call_once is not what
+  // this test is about.
+  {
+    DevBuf w0(20000), w1(20000);
+    ASSERT_FALSE(c.Get(c.follower.get(), "warm-up", &w0, &w1, &len));
+  }
+  const std::string reused(20000, 'r');
+  int throws_after_a_copy = 0;
+  bool completed = false;
+  for (long n = 1; n < 100000 && !completed; ++n) {
+    const int calls_before = *async_calls;
+    *defer = 1;
+    bool threw = false;
+    g_fail_in = n;
+    try {
+      std::vector<size_t> lens;
+      c.follower->BatchGetAutoSg(items, &lens);
+    } catch (const std::bad_alloc&) {
+      threw = true;
+    }
+    g_fail_in = 0;
+    const int left = *queued;
+    *defer = 0;
+    if (!threw) {
+      completed = true;
+      ConnectorFence();
+      continue;
+    }
+    if (*async_calls != calls_before) ++throws_after_a_copy;
+    // The caller reuses its destinations; nothing queued may land on them.
+    f0.Up(reused);
+    f1.Up(reused);
+    ConnectorFence();
+    EXPECT_EQ(left, 0) << "a throw at allocation " << n
+                       << " left a hit's copy queued";
+    EXPECT_EQ(f0.Down(20000), reused) << "allocation " << n;
+    EXPECT_EQ(f1.Down(20000), reused) << "allocation " << n;
+  }
+  EXPECT_TRUE(completed);
+  EXPECT_GT(throws_after_a_copy, 0) << "no throw came after a hit's copy";
 }
 
 #ifdef DFKV_GPU_TEST_SIMULATED

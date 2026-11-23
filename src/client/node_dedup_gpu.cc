@@ -723,6 +723,46 @@ void GpuNodeDedup::WaitManySg(WaitItem* items, size_t n) {
 GpuNodeDedup::Role GpuNodeDedup::ClaimSg(const BlockKey& key, const Seg* segs,
                                          size_t nsegs, size_t total_cap,
                                          size_t* got, uint64_t* token) {
+  return ClaimSgImpl(key, segs, nsegs, total_cap, got, token, nullptr, 0);
+}
+
+GpuNodeDedup::Role GpuNodeDedup::ClaimSgDeferred(
+    const BlockKey& key, const Seg* segs, size_t nsegs, size_t total_cap,
+    uint64_t* token, HitBatch* batch, size_t tag) {
+  return ClaimSgImpl(key, segs, nsegs, total_cap, nullptr, token, batch, tag);
+}
+
+void GpuNodeDedup::FinishHits(HitBatch* batch,
+                              std::vector<std::pair<size_t, size_t>>* hits,
+                              std::vector<size_t>* failed) {
+  if (batch->pending.empty() && !batch->issued) return;
+  batch->issued = false;
+  CUstream st = Stream();
+  const bool synced = st && cu_->StreamSynchronize(st) == kCudaSuccess;
+  for (const HitBatch::Pending& p : batch->pending) {
+    if (synced && ValidateCopy(p.snap)) {
+      hits_.fetch_add(1, std::memory_order_relaxed);
+      hits->emplace_back(p.tag, p.snap.n);
+    } else {
+      failed->push_back(p.tag);
+    }
+  }
+  batch->pending.clear();
+}
+
+void GpuNodeDedup::SettleHits(HitBatch* batch) noexcept {
+  if (!batch->issued) return;
+  try {
+    if (CUstream st = Stream()) cu_->StreamSynchronize(st);
+  } catch (...) {  // unwinding already; the stream cannot be had
+  }
+  batch->pending.clear();
+  batch->issued = false;
+}
+
+GpuNodeDedup::Role GpuNodeDedup::ClaimSgImpl(
+    const BlockKey& key, const Seg* segs, size_t nsegs, size_t total_cap,
+    size_t* got, uint64_t* token, HitBatch* batch, size_t tag) {
   if (token) *token = 0;
   if (total_cap == 0 || total_cap > DedupMaxPayload(arena_bytes_))
     return Role::kFetch;
@@ -731,9 +771,19 @@ GpuNodeDedup::Role GpuNodeDedup::ClaimSg(const BlockKey& key, const Seg* segs,
   if (Slot* s = Find(key)) {
     const uint32_t st = s->state.load(std::memory_order_acquire);
     if (st == kStateReady) {
-      if (AgeMs(now, s->fetch_start_ms.load(std::memory_order_relaxed)) <=
-              static_cast<uint64_t>(ttl_ms_) &&
-          CopyOutSg(s, key, segs, nsegs, total_cap, got)) {
+      const bool fresh =
+          AgeMs(now, s->fetch_start_ms.load(std::memory_order_relaxed)) <=
+          static_cast<uint64_t>(ttl_ms_);
+      if (fresh && batch != nullptr) {
+        // Enqueued only: FinishHits synchronizes and validates.
+        CUstream cs = Stream();
+        CopySnap snap{};
+        if (cs) batch->issued = true;
+        if (cs && IssueCopySg(s, key, segs, nsegs, total_cap, cs, &snap)) {
+          batch->pending.push_back(HitBatch::Pending{tag, snap});
+          return Role::kHit;
+        }
+      } else if (fresh && CopyOutSg(s, key, segs, nsegs, total_cap, got)) {
         hits_.fetch_add(1, std::memory_order_relaxed);
         return Role::kHit;
       }
@@ -991,7 +1041,70 @@ void GpuNodeDedup::PublishAbandon(const PublishHold& hold) {
 
 void GpuNodeDedup::PublishFinish(const PublishHold& hold, const Seg* segs,
                                  size_t nsegs) {
-  Slot* s = hold.slot;
+  // Gather caller-owned device segments into the rendezvous arena on its
+  // private CUDA stream, then synchronize before publishing READY. Without the
+  // synchronization, peers can copy stale arena bytes; this was observed as
+  // silently corrupted KV payloads rather than a transport error.
+  CUstream st = Stream();
+  uint64_t off = 0, seq = 0;
+  if (!st || !PublishCopy(hold, segs, nsegs, st, &off, &seq) ||
+      cu_->StreamSynchronize(st) != kCudaSuccess)
+    return PublishAbandon(hold);
+  PublishCommit(hold, off, seq);
+}
+
+void GpuNodeDedup::PublishManySg(const PublishItem* items, size_t n) {
+  if (n == 0) return;
+  EnsureThreadCtx();
+  CUstream st = Stream();
+  struct Staged {
+    PublishHold hold;
+    uint64_t off;
+    uint64_t seq;
+  };
+  std::vector<Staged> staged;
+  // Reserved up front: a push_back that throws would leave a slot it holds
+  // PUBLISHING.
+  staged.reserve(n);
+  size_t bytes = 0;
+  // One synchronization for the staged copies, then every commit. At most
+  // half the arena is staged: the copies of one chunk never lap each other.
+  const auto flush = [&] {
+    const bool synced =
+        staged.empty() || cu_->StreamSynchronize(st) == kCudaSuccess;
+    for (const Staged& s : staged) {
+      if (synced)
+        PublishCommit(s.hold, s.off, s.seq);
+      else
+        PublishAbandon(s.hold);
+    }
+    staged.clear();
+    bytes = 0;
+  };
+  for (size_t i = 0; i < n; ++i) {
+    const PublishItem& it = items[i];
+    if (!dedup_token::Valid(it.token)) continue;
+    PublishHold hold;
+    if (!PublishBegin(it.key, it.token, it.len, &hold)) continue;
+    if (!st) {
+      PublishAbandon(hold);
+      continue;
+    }
+    if (bytes + it.len > arena_bytes_ / 2) flush();
+    Staged s{hold, 0, 0};
+    if (!PublishCopy(hold, it.segs, it.nsegs, st, &s.off, &s.seq)) {
+      PublishAbandon(hold);
+      continue;
+    }
+    staged.push_back(s);
+    bytes += it.len;
+  }
+  flush();
+}
+
+bool GpuNodeDedup::PublishCopy(const PublishHold& hold, const Seg* segs,
+                               size_t nsegs, CUstream st, uint64_t* off_out,
+                               uint64_t* seq_out) {
   const size_t n = hold.len;
   ProcEntry& e = reg_[self_idx_];
   // Ring-allocate on this process's arena cursor. Skip the tail remainder when
@@ -1009,12 +1122,6 @@ void GpuNodeDedup::PublishFinish(const PublishHold& hold, const Seg* segs,
       break;
     }
   }
-  // Gather caller-owned device segments into the rendezvous arena on its
-  // private CUDA stream, then synchronize before publishing READY. Without the
-  // synchronization, peers can copy stale arena bytes; this was observed as
-  // silently corrupted KV payloads rather than a transport error.
-  CUstream st = Stream();
-  if (!st) return PublishAbandon(hold);
   size_t done = 0;
   for (size_t j = 0; j < nsegs && done < n; ++j) {
     const size_t m = std::min(n - done, segs[j].cap);
@@ -1022,10 +1129,23 @@ void GpuNodeDedup::PublishFinish(const PublishHold& hold, const Seg* segs,
     if (cu_->MemcpyAsync(arena_base_ + off + done,
                          reinterpret_cast<CUdeviceptr>(segs[j].ptr), m,
                          st) != kCudaSuccess)
-      return PublishAbandon(hold);
+      return false;
     done += m;
   }
-  if (done != n || cu_->StreamSynchronize(st) != kCudaSuccess)
+  if (done != n) return false;
+  *off_out = off;
+  *seq_out = seq;
+  return true;
+}
+
+void GpuNodeDedup::PublishCommit(const PublishHold& hold, uint64_t off,
+                                 uint64_t seq) {
+  Slot* s = hold.slot;
+  const size_t n = hold.len;
+  // Another thread of this process publishing at the same time can have
+  // lapped this copy since it was staged: such bytes are not published.
+  if (reg_[self_idx_].alloc_cursor.load(std::memory_order_acquire) - seq >
+      arena_bytes_ - n)
     return PublishAbandon(hold);
   // Commit. A failed swap means an invalidation (or a claim past the takeover
   // age) took the slot during the copy: it is no longer this publisher's, so

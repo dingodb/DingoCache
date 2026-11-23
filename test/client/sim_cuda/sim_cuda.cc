@@ -11,7 +11,13 @@
 //    per thread, as with the driver;
 //  - allocations are shared memory, so a handle exported by one process can
 //    be opened by another (cuIpc*);
-//  - copies run at once on the calling thread; streams exist but queue nothing;
+//  - like a C driver, no entry point throws: its own state is allocated with
+//    malloc, so a test that replaces the global operator new to fail an
+//    allocation in turn never fails one in here (an exception thrown in this
+//    library and unwound out of it aborts under ThreadSanitizer);
+//  - copies run at once on the calling thread; streams exist but queue nothing
+//    (unless sim_cuda_defer_stream_copies is set: then a cuMemcpyAsync is
+//    held until the next synchronization call, as a queued copy would be);
 //  - GPUDirect arrival order: sim_cuda_gpudirect_write() stands for a NIC
 //    writing device memory. The bytes are held back and reach the memory at
 //    the next CUDA synchronization call (cuCtxSynchronize, cuStreamSynchronize),
@@ -25,13 +31,39 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
 #include <vector>
 
+extern "C" int sim_cuda_queued_copies;  // defined with the test controls
+
 namespace {
+
+// Allocates with malloc, never through operator new (see above).
+template <typename T>
+struct MallocAllocator {
+  using value_type = T;
+  MallocAllocator() = default;
+  template <typename U>
+  MallocAllocator(const MallocAllocator<U>&) {}
+  T* allocate(size_t n) {
+    if (void* p = std::malloc(n * sizeof(T))) return static_cast<T*>(p);
+    std::abort();  // the test host ran out of memory
+  }
+  void deallocate(T* p, size_t) { std::free(p); }
+  template <typename U>
+  bool operator==(const MallocAllocator<U>&) const { return true; }
+  template <typename U>
+  bool operator!=(const MallocAllocator<U>&) const { return false; }
+};
+using Bytes = std::basic_string<char, std::char_traits<char>,
+                                MallocAllocator<char>>;
+template <typename T>
+using Vec = std::vector<T, MallocAllocator<T>>;
 
 constexpr int kOk = 0;
 constexpr int kInvalidValue = 1;     // CUDA_ERROR_INVALID_VALUE
@@ -48,13 +80,21 @@ struct Region {
 
 struct PendingWrite {
   char* dst;
-  std::string bytes;
+  Bytes bytes;
 };
 
 std::mutex g_mu;
 bool g_initialized = false;
-std::map<uintptr_t, Region> g_regions;  // base -> region ("device memory")
-std::vector<PendingWrite> g_pending;
+std::map<uintptr_t, Region, std::less<uintptr_t>,
+         MallocAllocator<std::pair<const uintptr_t, Region>>>
+    g_regions;  // base -> region ("device memory")
+Vec<PendingWrite> g_pending;
+struct QueuedCopy {
+  void* dst;
+  const void* src;
+  size_t size;
+};
+Vec<QueuedCopy> g_queued;
 int g_context = 0;                      // its address is the primary context
 thread_local void* tls_current = nullptr;
 
@@ -71,6 +111,9 @@ const Region* FindLocked(uintptr_t p, size_t n, uintptr_t* base = nullptr) {
 }
 
 void SettleLocked() {
+  for (const QueuedCopy& c : g_queued) std::memcpy(c.dst, c.src, c.size);
+  g_queued.clear();
+  sim_cuda_queued_copies = 0;
   for (const PendingWrite& w : g_pending)
     std::memcpy(w.dst, w.bytes.data(), w.bytes.size());
   g_pending.clear();
@@ -99,8 +142,15 @@ extern "C" {
 
 SIM_EXPORT int sim_cuda_ctx_synchronize_calls = 0;
 SIM_EXPORT int sim_cuda_memcpy_async_calls = 0;
+SIM_EXPORT int sim_cuda_stream_synchronize_calls = 0;
+// Non-zero: cuStreamSynchronize fails (and settles nothing).
+SIM_EXPORT int sim_cuda_fail_stream_synchronize = 0;
 // Non-zero: cuCtxSynchronize fails (and settles nothing).
 SIM_EXPORT int sim_cuda_fail_ctx_synchronize = 0;
+// Non-zero: cuMemcpyAsync copies at the next synchronization call, not at
+// once; sim_cuda_queued_copies counts the copies held so far.
+SIM_EXPORT int sim_cuda_defer_stream_copies = 0;
+SIM_EXPORT int sim_cuda_queued_copies = 0;
 
 // A GPUDirect write: the bytes arrive at the next synchronization call.
 SIM_EXPORT void sim_cuda_gpudirect_write(void* dst, const void* src,
@@ -108,7 +158,7 @@ SIM_EXPORT void sim_cuda_gpudirect_write(void* dst, const void* src,
   std::lock_guard<std::mutex> lock(g_mu);
   g_pending.push_back(PendingWrite{
       static_cast<char*>(dst),
-      std::string(static_cast<const char*>(src), n)});
+      Bytes(static_cast<const char*>(src), n)});
 }
 
 // ---- driver entry points --------------------------------------------------
@@ -210,6 +260,12 @@ SIM_EXPORT int cuMemcpyAsync(unsigned long long dst, unsigned long long src,
       return off >= it->second.size || size <= it->second.size - off;
     };
     if (!mapped(dst) || !mapped(src)) return kInvalidValue;
+    if (sim_cuda_defer_stream_copies) {
+      g_queued.push_back({reinterpret_cast<void*>(dst),
+                          reinterpret_cast<const void*>(src), size});
+      ++sim_cuda_queued_copies;
+      return kOk;
+    }
   }
   std::memcpy(reinterpret_cast<void*>(dst), reinterpret_cast<void*>(src), size);
   return kOk;
@@ -217,18 +273,21 @@ SIM_EXPORT int cuMemcpyAsync(unsigned long long dst, unsigned long long src,
 SIM_EXPORT int cuStreamCreate(void** stream, unsigned) {
   if (!stream) return kInvalidValue;
   if (!tls_current) return kInvalidContext;
-  *stream = new int(0);
+  *stream = std::malloc(sizeof(int));
+  if (*stream == nullptr) return kOutOfMemory;
   return kOk;
 }
 SIM_EXPORT int cuStreamSynchronize(void* stream) {
   if (!stream) return kInvalidValue;
   if (!tls_current) return kInvalidContext;
   std::lock_guard<std::mutex> lock(g_mu);
+  ++sim_cuda_stream_synchronize_calls;
+  if (sim_cuda_fail_stream_synchronize) return kInvalidValue;
   SettleLocked();
   return kOk;
 }
 SIM_EXPORT int cuStreamDestroy_v2(void* stream) {
-  delete static_cast<int*>(stream);
+  std::free(stream);
   return kOk;
 }
 

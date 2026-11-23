@@ -3764,6 +3764,15 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
   std::vector<char> totals_valid(N, 0);
   for (size_t i = 0; i < N; ++i)
     totals_valid[i] = CheckedSizeSum(items[i].caps, &total_caps[i]) ? 1 : 0;
+  GpuNodeDedup::HitBatch hit_batch;
+  // Room for every hit, so that recording one cannot throw once its copy is
+  // enqueued.
+  hit_batch.pending.reserve(N);
+  // A throw before FinishHits leaves hit copies queued into the caller's
+  // destinations: wait for them before the caller gets the buffers back.
+  AbortClaimsOnThrow settle_hits([&] { gd->SettleHits(&hit_batch); });
+  // Hits whose copy did not validate: no claim is held, fetched directly.
+  std::vector<size_t> unhit;
   for (size_t i = 0; i < N; ++i) {
     // Eligible = well-shaped AND entirely device memory. Mixed SG must bypass
     // GPU rendezvous because its CUDA IPC copier cannot publish host segments.
@@ -3778,13 +3787,11 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
     }
     bks[i] = block_key_(items[i].key);
     segs_of(items[i]);
-    size_t got = 0;
-    switch (gd->ClaimSg(bks[i], segs.data(), segs.size(),
-                        total_caps[i], &got, &tokens[i])) {
+    // A hit's copy is only enqueued here; FinishHits below synchronizes once
+    // for all of them instead of once per key.
+    switch (gd->ClaimSgDeferred(bks[i], segs.data(), segs.size(),
+                                total_caps[i], &tokens[i], &hit_batch, i)) {
       case GpuNodeDedup::Role::kHit:
-        res[i] = true;
-        lens[i] = got;
-        if (st) st[i] = ItemStatus::kOk;
         break;
       case GpuNodeDedup::Role::kFetch:
         fetch_map.push_back(i);
@@ -3794,6 +3801,15 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
       case GpuNodeDedup::Role::kWait:
         wait_list.push_back(i);
         break;
+    }
+  }
+  {
+    std::vector<std::pair<size_t, size_t>> hits;
+    gd->FinishHits(&hit_batch, &hits, &unhit);
+    for (const auto& [i, got] : hits) {
+      res[i] = true;
+      lens[i] = got;
+      if (st) st[i] = ItemStatus::kOk;
     }
   }
   if (!fetch_items.empty()) {
@@ -3811,18 +3827,27 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
     for (size_t m = 0; m < fetch_map.size(); ++m)
       if (r[m] && tokens[fetch_map[m]] != 0) anything_to_publish = true;
     const bool settled = !anything_to_publish || gd->FenceLoads();
+    // Published together: one stream synchronization per chunk, not per key.
+    std::vector<std::vector<GpuNodeDedup::Seg>> psegs;
+    std::vector<GpuNodeDedup::PublishItem> publish;
+    psegs.reserve(fetch_map.size());
+    publish.reserve(fetch_map.size());
     for (size_t m = 0; m < fetch_map.size(); ++m) {
       const size_t i = fetch_map[m];
       res[i] = r[m];
       if (r[m]) lens[i] = flens[m];
       if (st) st[i] = fst[m];
-      if (r[m] && settled) {
+      if (r[m] && settled && tokens[i] != 0) {
         segs_of(items[i]);
-        gd->PublishSg(bks[i], tokens[i], segs.data(), segs.size(), flens[m]);
+        psegs.push_back(segs);
+        publish.push_back(GpuNodeDedup::PublishItem{
+            bks[i], tokens[i], psegs.back().data(), psegs.back().size(),
+            flens[m]});
       } else {
         gd->Abort(bks[i], tokens[i]);
       }
     }
+    gd->PublishManySg(publish.data(), publish.size());
   }
   // One amortized-sync wait for the WHOLE wait list (WaitManySg): copies are
   // enqueued as keys turn READY and the stream synchronizes per round, not
@@ -3830,7 +3855,7 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
   // long before the list was through (the dedup win leaked back out through
   // fallback re-fetches; measured live in the PD A/B). Failures fall back
   // through ONE direct batch.
-  std::vector<size_t> fb;
+  std::vector<size_t> fb(unhit);  // hits that did not validate, then waits
   std::vector<GpuNodeDedup::WaitItem> wits(wait_list.size());
   std::vector<std::vector<GpuNodeDedup::Seg>> wsegs(wait_list.size());
   for (size_t m = 0; m < wait_list.size(); ++m) {
