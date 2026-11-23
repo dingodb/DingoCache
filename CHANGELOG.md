@@ -667,6 +667,16 @@
   four times its live entries. A configured capacity that changes grows or
   shrinks the store at the next open. New per-disk `dfkv_lse_*` metrics.
 
+- Server, storage, log-structured engine (experimental): RETAIN, with
+  slab's codes, rules and `DFKV_RETAIN_*` settings. The budget counts each
+  protected value's on-disk footprint; a protected value is relocated by
+  the cleaner rather than evicted, and evicted only as a last resort
+  (`dfkv_lse_protected_evictions_total`). Protection is kept in the
+  metadata journal without the call waiting for it, and comes back,
+  re-clamped to the TTL cap, after a restart. On a node whose disks run
+  different engines, the retention metrics sum the disks that keep
+  retention.
+
 ## 2.42.0 — 2026-11-23
 
 - Client, RDMA: the rail name a scatter-gather batch read reports (the

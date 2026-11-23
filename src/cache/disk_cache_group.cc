@@ -704,10 +704,13 @@ uint32_t DiskCacheGroup::RetainMaxTtl() const {
 SlabAllocator::RetentionStats DiskCacheGroup::RetentionStats() const {
   SlabAllocator::RetentionStats sum;
   bool first = true;
+  // With disks that keep retention on the node, theirs: an engine without
+  // it (file) would report it disabled with no TTL.
+  const bool some_retain = std::any_of(
+      disks_.begin(), disks_.end(),
+      [](const std::unique_ptr<StoreEngine>& d) { return d->RetainEnabled(); });
   for (size_t i = 0; i < disks_.size(); ++i) {
-    // With slab disks on the node, theirs: the other engines keep no
-    // retention, and would report it disabled with no TTL.
-    if (!slabs_.empty() && slab_of_disk_[i] == nullptr) continue;
+    if (some_retain && !disks_[i]->RetainEnabled()) continue;
     const auto st = disks_[i]->GetRetentionStats();
     sum.enabled = first ? st.enabled : (sum.enabled && st.enabled);
     sum.budget_bytes += st.budget_bytes;

@@ -94,6 +94,45 @@ TEST(LogStoreCleaner, AReadValueGetsASecondChance) {
   fs::remove_all(dir);
 }
 
+// S2 of the #512 review: a long lease on the oldest segment does not stall
+// the cleaner while every other sealed segment is mostly protected; it
+// reclaims those (relocating what is protected) instead.
+TEST(LogStoreCleaner, APinnedOldestSegmentDoesNotStallTheCleaner) {
+  const fs::path dir = TestDir("pinnedoldest");
+  auto o = Opts(dir, 64ull << 20);
+  o.pin_wait_ms = 100;
+  o.retain_max_pct = 95;
+  bool ok = false;
+  LogStore s(o, &ok);
+  ASSERT_TRUE(ok) << s.StartupError();
+  constexpr size_t kLen = 600000;  // six to a segment
+  const uint32_t now = static_cast<uint32_t>(::time(nullptr));
+  for (uint64_t id = 0; id < 6; ++id) {  // the oldest segment, unprotected
+    const std::string v = Val(id, kLen);
+    ASSERT_EQ(s.Cache(Key(id), v.data(), v.size()), Status::kOk);
+  }
+  ReadLease lease;
+  ASSERT_EQ(s.RangeDirectPrep(Key(0), 0, 0, 1 << 20, &lease), Status::kOk);
+  // Then two of every three values protected: every later segment is
+  // more than half protected.
+  uint64_t cache_full = 0;
+  for (uint64_t id = 100; id < 200; ++id) {
+    const std::string v = Val(id, kLen);
+    const Status st = s.Cache(Key(id), v.data(), v.size());
+    ASSERT_TRUE(st == Status::kOk || st == Status::kCacheFull);
+    cache_full += st == Status::kCacheFull;
+    if (st == Status::kOk && id % 3 != 2)
+      EXPECT_EQ(s.Retain(Key(id), 600, 0, now), kProtectedNew) << id;
+  }
+  const auto st = s.GetStats();
+  RecordProperty("cache_full", static_cast<int>(cache_full));
+  RecordProperty("skipped_pins", static_cast<int>(st.victims_skipped_pins));
+  EXPECT_GT(st.segments_reclaimed - st.inline_reclaims, 0u)
+      << "the cleaner reclaimed nothing while the oldest segment was pinned";
+  EXPECT_EQ(st.protected_evictions, 0u);
+  fs::remove_all(dir);
+}
+
 // N2 of the #512 review: a victim still pinned keeps its values; the
 // cleaner waits for the pins before it evicts or relocates anything.
 TEST(LogStoreCleaner, APinnedVictimKeepsItsValues) {
@@ -138,6 +177,49 @@ TEST(LogStoreCleaner, APinnedVictimKeepsItsValues) {
       << "values relocated out of a pinned victim";
   for (uint64_t id : ids) EXPECT_TRUE(Has(s, id, kLen)) << id;
   leases.clear();
+  fs::remove_all(dir);
+}
+
+// S3 of the #512 review: a store reopened full, every sealed segment
+// holding a protected value, has nothing to reclaim inline; the first PUTs
+// that need space wait for the cleaner just armed instead of getting
+// kCacheFull.
+TEST(LogStoreCleaner, AStoreReopenedFullOfProtectedValuesTakesPutsAtOnce) {
+  const fs::path dir = TestDir("reopenprotected");
+  constexpr size_t kLen = 500000;
+  {
+    bool ok = false;
+    LogStore s(Opts(dir), &ok);
+    ASSERT_TRUE(ok) << s.StartupError();
+    const uint32_t now = static_cast<uint32_t>(::time(nullptr));
+    // Full, a quarter protected (within the budget: no RETAIN is denied).
+    for (uint64_t id = 0; id < 60; ++id) {
+      const std::string v = Val(id, kLen);
+      const Status st = s.Cache(Key(id), v.data(), v.size());
+      ASSERT_TRUE(st == Status::kOk || st == Status::kCacheFull);
+      if (st == Status::kOk && id % 4 == 0)
+        EXPECT_EQ(s.Retain(Key(id), 3000, 0, now), kProtectedNew) << id;
+    }
+    ASSERT_GT(s.Evictions(), 0u) << "the store was full";
+    ASSERT_GT(s.GetRetentionStats().protected_slots, 0u);
+  }
+  bool ok = false;
+  LogStore s(Opts(dir), &ok);  // with its cleaner
+  ASSERT_TRUE(ok) << s.StartupError();
+  uint64_t cache_full = 0;
+  const auto t0 = std::chrono::steady_clock::now();
+  for (uint64_t id = 1000; id < 1012; ++id) {  // a segment and a half
+    const std::string v = Val(id, kLen);
+    const Status st = s.Cache(Key(id), v.data(), v.size());
+    ASSERT_TRUE(st == Status::kOk || st == Status::kCacheFull);
+    cache_full += st == Status::kCacheFull;
+  }
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count();
+  RecordProperty("puts_ms", static_cast<int>(ms));
+  EXPECT_EQ(cache_full, 0u);
+  EXPECT_EQ(s.GetStats().protected_evictions, 0u);
   fs::remove_all(dir);
 }
 
@@ -548,7 +630,7 @@ TEST(LogStoreCapacity, CrashPointsWhileResizing) {
 }
 
 // ---- endurance and metrics ------------------------------------------------------------
-// Many times the capacity of random PUTs, REMOVEs and reads: every
+// Many times the capacity of random PUTs, REMOVEs, reads and RETAINs: every
 // read is right, the store stays healthy and within its capacity, tenant
 // accounting matches, and after a restart every value that was neither
 // removed nor evicted since it was stored is there.
@@ -569,6 +651,7 @@ TEST(LogStoreCleaner, FillAndEvictEndurance) {
     ASSERT_TRUE(ok) << s.StartupError();
     std::mt19937_64 rng(17);
     std::map<uint64_t, uint32_t> version;
+    const uint32_t now = static_cast<uint32_t>(::time(nullptr));
     uint64_t written = 0, max_generation = 0;
     while (written < 12 * kSmall) {
       const uint64_t id = rng() % kKeys;
@@ -597,6 +680,8 @@ TEST(LogStoreCleaner, FillAndEvictEndurance) {
             known = out == Val(id, out.size(), v);
           ASSERT_TRUE(known) << "wrong bytes for " << id;
         }
+      } else if (what < 8) {
+        s.Retain(Key(id), 30 + rng() % 600, 0, now);
       } else {
         s.Remove(Key(id));
         std::lock_guard<std::mutex> lk(mu);
@@ -660,6 +745,7 @@ TEST(LogStoreMetrics, TheEngineReportsTheLseFamily) {
                            "dfkv_lse_records_evicted_total",
                            "dfkv_lse_records_relocated_total",
                            "dfkv_lse_inline_reclaims_total",
+                           "dfkv_lse_protected_evictions_total",
                            "dfkv_lse_journal_compactions_total",
                            "dfkv_lse_journal_integrity_resets_total"})
     EXPECT_TRUE(names.count(want)) << want;
