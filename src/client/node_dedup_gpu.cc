@@ -239,11 +239,14 @@ std::unique_ptr<GpuNodeDedup> GpuNodeDedup::Open(const Options& opt) {
   // Small segment (~1-2 MiB: descriptors only, payloads live in GPU memory),
   // created and backed as the host flavor's is (dedup_segment.h).
   bool creator = false;
+  int hold_fd = -1;
   void* base = dedup_segment::Attach(opt.name, SegmentLayout(len), "gpu-dedup",
-                                     &creator);
+                                     &creator, &hold_fd);
   if (!base) return nullptr;
 
   auto d = std::unique_ptr<GpuNodeDedup>(new GpuNodeDedup());
+  d->segment_name_ = opt.name;
+  d->hold_fd_ = hold_fd;
   d->cu_ = cu;
   d->map_base_ = base;
   d->map_len_ = len;
@@ -413,6 +416,7 @@ GpuNodeDedup::~GpuNodeDedup() {
     if (arena_base_) cu_->MemFree(arena_base_);
   }
   if (map_base_) ::munmap(map_base_, map_len_);
+  dedup_segment::Detach(segment_name_, hold_fd_);
 }
 
 void GpuNodeDedup::EnsureThreadCtx() const {
