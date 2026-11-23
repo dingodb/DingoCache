@@ -655,6 +655,18 @@
   holds the record's header length (development format: no older store to
   read).
 
+- Server, storage, log-structured engine (experimental): eviction. A
+  cleaner keeps a few segments free: it takes the oldest sealed segment,
+  relocates the records read since they were written (within
+  `DFKV_LSE_RELOCATE_PCT`, default 25, of the bytes clients wrote), evicts
+  the rest, and reuses the segment; a segment whose reads have not ended
+  within `DFKV_LSE_PIN_WAIT_MS` (default 5000) is skipped for now. A PUT
+  that finds no free segment reclaims one itself. The cleaner starts only
+  when a PUT first needs space after an open, so a restart keeps everything
+  it recovered until then. The metadata journal is compacted once it holds
+  four times its live entries. A configured capacity that changes grows or
+  shrinks the store at the next open. New per-disk `dfkv_lse_*` metrics.
+
 ## 2.42.0 — 2026-11-23
 
 - Client, RDMA: the rail name a scatter-gather batch read reports (the

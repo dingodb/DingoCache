@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <string>
 
 #include <vector>
@@ -864,6 +865,36 @@ std::string KvNodeServer::MetricsText() const {
                 "\",engine=\"" + PromLabelEscape(group_.DiskEngineName(i)) +
                 "\"") +
          " 1\n";
+  // Engine-specific per-disk families (the log engine's dfkv_lse_*): one
+  // HELP/TYPE per name, a sample per disk that has it.
+  {
+    std::vector<std::string> order;
+    std::map<std::string, std::pair<StoreEngine::EngineMetric,
+                                    std::vector<std::pair<size_t, uint64_t>>>>
+        families;
+    for (size_t i = 0; i < group_.DiskCount(); ++i) {
+      std::vector<StoreEngine::EngineMetric> em;
+      group_.DiskEngineMetrics(i, &em);
+      for (const auto& m : em) {
+        auto it = families.find(m.name);
+        if (it == families.end()) {
+          order.push_back(m.name);
+          it = families.emplace(m.name, std::make_pair(m, std::vector<std::pair<size_t, uint64_t>>{})).first;
+        }
+        it->second.second.emplace_back(i, m.value);
+      }
+    }
+    for (const auto& name : order) {
+      const auto& fam = families[name];
+      s += "# HELP " + name + " " + fam.first.help + "\n";
+      s += "# TYPE " + name + " " + fam.first.type + "\n";
+      for (const auto& sample : fam.second)
+        s += name +
+             braces("disk=\"" + PromLabelEscape(group_.DiskPath(sample.first)) +
+                    "\",disk_index=\"" + std::to_string(sample.first) + "\"") +
+             " " + std::to_string(sample.second) + "\n";
+    }
+  }
   // sampled op latency histograms (op label merged with identity); one HELP/TYPE,
   // two label sets (get/put).
   {

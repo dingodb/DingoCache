@@ -33,6 +33,10 @@ constexpr uint64_t kLsnRange = 1ull << 20;
 constexpr uint64_t kMinSegmentBytes = 4ull << 20;
 constexpr uint64_t kMaxSegmentBytes = 1ull << 30;
 constexpr uint32_t kMinSegments = 8;
+// Segments held back (§7.1): K open client segments (one so far), C for the
+// cleaner only, and the relocation segment.
+constexpr uint32_t kOpenClient = 1;
+constexpr uint32_t kCleanerReserve = 2;
 constexpr size_t kSealerQueue = 2;
 constexpr const char* kSuperName = "lse_super";
 constexpr const char* kJournalName = "lse_journal";
@@ -136,17 +140,23 @@ int OpenJournalFile(lse::IoBackend* io, const std::string& path, int flags) {
 // One thread per store. Entries come in through a queue, each with a ticket;
 // the thread writes them as 4 KiB blocks, one block per synchronous
 // pwritev2(RWF_DSYNC), and advances the durable ticket after each write. It
-// never takes the store's mutex, so the store may enqueue while holding it.
-// It owns the journal's descriptor.
+// takes the store's mutex only to collect the live entries for a compaction,
+// and never while holding its own, so the store may enqueue while holding
+// its mutex. It owns the journal's descriptor.
 class LogStore::Journal {
  public:
-  Journal(LogStore* store, int fd, uint64_t offset, uint64_t next_seq)
+  Journal(LogStore* store, int fd, uint64_t offset, uint64_t next_seq,
+          uint64_t entries)
       : store_(store),
         io_(store->io_.get()),
         fd_(fd),
         uuid_(store->sb_.store_uuid),
         offset_(offset),
-        next_seq_(next_seq) {
+        next_seq_(next_seq),
+        entries_(entries),
+        compact_bytes_(std::max<uint64_t>(store->opt_.journal_compact_bytes,
+                                          kBlockBytes)),
+        next_check_(std::max(offset, compact_bytes_)) {
     thread_ = std::thread([this] { Loop(); });
   }
   ~Journal() {
@@ -173,6 +183,14 @@ class LogStore::Journal {
   bool Failed() {
     std::lock_guard<std::mutex> lk(mu_);
     return failed_;
+  }
+  uint64_t Compactions() {
+    std::lock_guard<std::mutex> lk(mu_);
+    return compactions_;
+  }
+  uint64_t Bytes() {
+    std::lock_guard<std::mutex> lk(mu_);
+    return offset_;
   }
   // Writes what is queued, then ends the thread.
   void Stop() {
@@ -203,6 +221,15 @@ class LogStore::Journal {
     for (;;) {
       cv_.wait(lk, [&] { return stop_ || !queue_.empty(); });
       if (queue_.empty()) return;  // stopping, nothing left
+      if (offset_ >= next_check_) {
+        // Compaction (§4.5): no group is taken meanwhile; callers keep
+        // waiting for their acknowledgement.
+        lk.unlock();
+        int err = 0;
+        const bool ok = MaybeCompact(&err);
+        lk.lock();
+        if (!ok) return Fail(lk, err);
+      }
       lse::JournalBlock block;
       block.store_uuid = uuid_;
       block.sequence = next_seq_;
@@ -226,10 +253,73 @@ class LogStore::Journal {
       if (!ok) return Fail(lk, err);
       offset_ += kBlockBytes;
       ++next_seq_;
+      entries_ += block.entries.size();
       durable_ = last;
       done_cv_.notify_all();
     }
   }
+  // Runs on the writer thread without its mutex. False on an I/O error.
+  bool MaybeCompact(int* err) {
+    std::vector<lse::JournalEntry> live = store_->LiveJournalEntries();
+    uint64_t written;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      written = entries_;
+    }
+    if (written <= 4 * live.size()) {
+      std::lock_guard<std::mutex> lk(mu_);
+      next_check_ = offset_ + compact_bytes_ / 4 + kBlockBytes;
+      return true;
+    }
+    store_->Hook("compact.begin");
+    const fs::path root(store_->opt_.dir);
+    const std::string fresh = (root / (std::string(kJournalName) + ".new")).string();
+    const int fd = OpenJournalFile(io_, fresh, O_RDWR | O_CREAT | O_TRUNC);
+    if (fd < 0) {
+      *err = errno;
+      return false;
+    }
+    uint64_t seq = 1, off = 0;
+    for (size_t i = 0; i < live.size(); i += lse::kJournalEntriesPerBlock) {
+      lse::JournalBlock block;
+      block.store_uuid = uuid_;
+      block.sequence = seq++;
+      const size_t end = std::min(live.size(), i + lse::kJournalEntriesPerBlock);
+      block.entries.assign(live.begin() + i, live.begin() + end);
+      lse::Block bytes;
+      if (!lse::EncodeJournalBlock(block, &bytes) ||
+          !PwriteBlock(io_, fd, bytes.data(), kBlockBytes, off, true)) {
+        *err = errno;
+        io_->Close(fd);
+        return false;
+      }
+      off += kBlockBytes;
+    }
+    if (io_->Fdatasync(fd) != 0) {
+      *err = errno;
+      io_->Close(fd);
+      return false;
+    }
+    store_->Hook("compact.after_write");
+    if (io_->Rename(fresh, (root / kJournalName).string()) != 0 ||
+        io_->Fsync(store_->dir_fd_) != 0) {
+      *err = errno;
+      io_->Close(fd);
+      return false;
+    }
+    store_->Hook("compact.after_rename");
+    io_->Close(fd_);
+    std::lock_guard<std::mutex> lk(mu_);
+    fd_ = fd;
+    offset_ = off;
+    next_seq_ = seq;
+    entries_ = live.size();
+    next_check_ = std::max(offset_ + compact_bytes_ / 4 + kBlockBytes,
+                           compact_bytes_);
+    ++compactions_;
+    return true;
+  }
+
   LogStore* const store_;
   lse::IoBackend* io_;
   int fd_;
@@ -241,6 +331,10 @@ class LogStore::Journal {
   uint64_t durable_ = 0;
   uint64_t offset_;
   uint64_t next_seq_;
+  uint64_t entries_;
+  const uint64_t compact_bytes_;
+  uint64_t next_check_;
+  uint64_t compactions_ = 0;
   bool failed_ = false;
   bool stop_ = false;
   std::thread thread_;
@@ -256,6 +350,10 @@ void LogStore::ApplyEnvironment(Options* o) {
     return envparse::EnvU64(name, spec);
   };
   o->sync_ms = static_cast<uint32_t>(env("DFKV_LSE_SYNC_MS", o->sync_ms, 1, 3600000));
+  o->pin_wait_ms =
+      static_cast<uint32_t>(env("DFKV_LSE_PIN_WAIT_MS", o->pin_wait_ms, 0, 600000));
+  o->relocate_pct =
+      static_cast<uint32_t>(env("DFKV_LSE_RELOCATE_PCT", o->relocate_pct, 0, 100));
 }
 
 bool LogStore::GeometryFor(uint64_t capacity, uint64_t segment_override,
@@ -545,10 +643,14 @@ bool LogStore::ReadJournal() {
       }
       ++recovery_.journal_blocks;
       ++seq;
-      for (const auto& entry : jb.entries)
-        if (entry.type == lse::kJournalKill)
+      journal_entries_ += jb.entries.size();
+      for (const auto& entry : jb.entries) {
+        if (entry.type == lse::kJournalKill) {
           kills_.insert({entry.segment_index, entry.incarnation,
                          entry.offset_blocks});
+          recovered_kills_.push_back(entry);
+        }
+      }
     } else if (e == lse::DecodeError::kOk && jb.sequence >= seq) {
       // A valid block beyond the stopping point: a block inside the durable
       // range was damaged after it was written.
@@ -823,6 +925,7 @@ bool LogStore::FreshHeader(uint32_t index, bool empty) {
   s.records = 0;
   s.last_lsn = 0;
   s.summary.clear();
+  live_kills_.erase(index);
   return true;
 }
 
@@ -850,11 +953,14 @@ bool LogStore::ResetToEmpty() {
   if (journal_fd_ < 0) return false;
   journal_stop_offset_ = 0;
   journal_next_seq_ = 1;
+  journal_entries_ = 0;
   sb_.reset_in_progress = 0;
   if (!WriteSuperblock()) return false;
   index_.clear();
   shadows_.clear();
   tenant_bytes_.clear();
+  recovered_kills_.clear();
+  live_kills_.clear();
   used_bytes_ = 0;
   free_.clear();
   fifo_.clear();
@@ -869,6 +975,84 @@ bool LogStore::ResetToEmpty() {
   return true;
 }
 
+// Capacity changes at activation (§7.6): the segment size stays, the count
+// follows the configured capacity.
+bool LogStore::ChangeCapacityLocked() {
+  const uint64_t want64 = opt_.capacity_bytes / sb_.segment_bytes;
+  if (want64 < kMinSegments || want64 > UINT32_MAX ||
+      want64 == sb_.segment_count) {
+    if (want64 != sb_.segment_count)
+      DFKV_LOG_WARN("lse: " + opt_.dir + ": configured capacity " +
+                    std::to_string(opt_.capacity_bytes) +
+                    " is below 8 segments of the store's size; keeping " +
+                    std::to_string(sb_.segment_count) + " segments");
+    return true;
+  }
+  const uint32_t want = static_cast<uint32_t>(want64);
+  const uint32_t have = sb_.segment_count;
+  const std::string segdir = (fs::path(opt_.dir) / kSegmentsDir).string();
+  if (want > have) {
+    // Grow: new files (or an interrupted grow's leftovers, which get a fresh
+    // header like any other), synced, then the superblock.
+    segments_.resize(want);
+    for (uint32_t i = have; i < want; ++i) {
+      if (!OpenSegmentFile(i, /*create=*/true) || !FreshHeader(i, /*empty=*/true))
+        return false;
+      segments_[i].state = SegState::kFree;
+    }
+    if (!SyncDir(segdir) || io_->Fsync(dir_fd_) != 0) return false;
+    Hook("grow.after_files");
+    sb_.segment_count = want;
+    if (!WriteSuperblock()) return false;
+    for (uint32_t i = have; i < want; ++i) free_.push_back(i);
+    stats_.segments_grown += want - have;
+    DFKV_LOG_INFO("lse: " + opt_.dir + ": grown from " + std::to_string(have) +
+                  " to " + std::to_string(want) + " segments");
+    return true;
+  }
+  // Shrink: the highest-numbered segments' values are evicted (nothing is
+  // admitted yet, so no PUT can store a key meanwhile), the superblock is
+  // lowered, then the files go.
+  for (auto it = index_.begin(); it != index_.end();) {
+    if (it->second.loc.segment >= want) {
+      const BlockKey key = it->first;
+      ++it;
+      if (opt_.on_evict) opt_.on_evict(key, index_[key].generation);
+      EraseEntryLocked(key);
+      ++stats_.records_evicted;
+    } else {
+      ++it;
+    }
+  }
+  sb_.segment_count = want;
+  if (!WriteSuperblock()) return false;
+  Hook("shrink.after_super");
+  for (auto it = shadows_.begin(); it != shadows_.end();) {
+    if (it->second.loc.segment >= want) it = shadows_.erase(it);
+    else ++it;
+  }
+  free_.erase(std::remove_if(free_.begin(), free_.end(),
+                             [&](uint32_t i) { return i >= want; }),
+              free_.end());
+  fifo_.erase(std::remove_if(fifo_.begin(), fifo_.end(),
+                             [&](uint32_t i) { return i >= want; }),
+              fifo_.end());
+  for (uint32_t i = want; i < have; ++i) {
+    Segment& s = segments_[i];
+    if (s.fd >= 0) io_->Close(s.fd);
+    if (s.dio_fd >= 0) io_->Close(s.dio_fd);
+    s.fd = s.dio_fd = -1;
+    live_kills_.erase(i);
+    if (io_->Unlink(SegmentPath(i)) != 0 && errno != ENOENT) return false;
+  }
+  segments_.resize(want);
+  if (!SyncDir(segdir)) return false;
+  stats_.segments_shrunk += have - want;
+  DFKV_LOG_INFO("lse: " + opt_.dir + ": shrunk from " + std::to_string(have) +
+                " to " + std::to_string(want) + " segments");
+  return true;
+}
+
 bool LogStore::Activate() {
   if (!ok_ || failed_.load()) return false;
   if (activated_.load()) return true;
@@ -877,6 +1061,8 @@ bool LogStore::Activate() {
   for (const auto& s : segments_)
     if (!s.header_valid) ++headers;
   if (needs_reset_) headers = sb_.segment_count;
+  const uint64_t want = opt_.capacity_bytes / sb_.segment_bytes;
+  if (want > sb_.segment_count && want <= UINT32_MAX) headers += want - sb_.segment_count;
   // One durable write first (design §8.3 step 7).
   sb_.clean = 0;
   sb_.incarnation_reserved = next_incarnation_ + headers + kIncarnationRange;
@@ -897,6 +1083,10 @@ bool LogStore::Activate() {
     FailStore("cannot truncate the journal", errno);
     return false;
   }
+  if (!ChangeCapacityLocked()) {
+    FailStore("cannot change the store's capacity", errno);
+    return false;
+  }
   // Seal every walked segment as it is (step 9): never appended to again.
   for (uint32_t i = 0; i < segments_.size(); ++i) {
     if (segments_[i].state != SegState::kWalked) continue;
@@ -907,23 +1097,30 @@ bool LogStore::Activate() {
     return segments_[a].last_lsn < segments_[b].last_lsn;
   });
   Hook("activate.after_seal");
-  // Fresh headers where they were invalid (step 10).
+  // Fresh headers where they were invalid (step 10); the kills still naming
+  // a current incarnation are what a compaction keeps.
   for (uint32_t i = 0; i < segments_.size(); ++i)
     if (!segments_[i].header_valid && !FreshHeader(i, /*empty=*/true)) {
       FailStore("cannot write a segment header", errno);
       return false;
     }
+  for (const auto& k : recovered_kills_)
+    if (k.segment_index < segments_.size() &&
+        segments_[k.segment_index].incarnation == k.incarnation)
+      live_kills_[k.segment_index].push_back(k);
   kills_.clear();
+  recovered_kills_.clear();
   journal_ = std::make_unique<Journal>(this, journal_fd_, journal_stop_offset_,
-                                       journal_next_seq_);
+                                       journal_next_seq_, journal_entries_);
   journal_fd_ = -1;
   uint32_t first = 0;
-  if (TakeFreeSegmentLocked(&first)) {
+  if (TakeFreeSegmentLocked(/*client=*/true, &first)) {
     open_segment_ = first;
     segments_[first].state = SegState::kOpen;
   }
   if (failed_.load()) return false;
   sealer_ = std::thread([this] { SealerLoop(); });
+  if (opt_.cleaner) cleaner_ = std::thread([this] { CleanerLoop(); });
   activated_.store(true);
   return true;
 }
@@ -936,11 +1133,12 @@ bool LogStore::Close() {
     stop_threads_ = true;
     state_cv_.notify_all();
   }
+  if (cleaner_.joinable()) cleaner_.join();
   if (sealer_.joinable()) sealer_.join();
   Lock lk(mu_);
   // Operations already admitted finish; none is admitted any more.
   state_cv_.wait(lk, [&] {
-    if (!flights_.empty()) return false;
+    if (!flights_.empty() || !relocs_.empty()) return false;
     for (const auto& s : segments_)
       if (s.writers != 0) return false;
     return true;
@@ -948,8 +1146,10 @@ bool LogStore::Close() {
   // Seal what is still open or queued (§8.5).
   std::vector<uint32_t> to_seal(seal_queue_.begin(), seal_queue_.end());
   seal_queue_.clear();
-  if (open_segment_ != UINT32_MAX) to_seal.push_back(open_segment_);
-  open_segment_ = UINT32_MAX;
+  for (uint32_t* open : {&open_segment_, &reloc_segment_}) {
+    if (*open != UINT32_MAX) to_seal.push_back(*open);
+    *open = UINT32_MAX;
+  }
   bool ok = Healthy();
   for (uint32_t i : to_seal) {
     segments_[i].state = SegState::kSealing;
@@ -1001,6 +1201,15 @@ void LogStore::EraseEntryLocked(const BlockKey& key) {
   auto it = index_.find(key);
   if (it == index_.end()) return;
   const Entry e = it->second;
+  // A relocation of this value in progress: its destination may come to hold
+  // a copy, which is accounted for from now on (I5). Killing a location
+  // before it is written is harmless.
+  auto r = relocs_.find(key);
+  if (r != relocs_.end() && r->second.generation == e.generation &&
+      !r->second.dest_shadowed) {
+    AddShadowLocked(key, r->second.dest, e.generation);
+    r->second.dest_shadowed = true;
+  }
   index_.erase(it);
   used_bytes_ -= Footprint(e);
   auto t = tenant_bytes_.find(key.tenant_hash);
@@ -1012,7 +1221,7 @@ void LogStore::EraseEntryLocked(const BlockKey& key) {
 void LogStore::MaybeFreeLocked(uint32_t index) {
   if (index >= segments_.size()) return;
   Segment& s = segments_[index];
-  if (s.state != SegState::kSealed || s.live != 0 ||
+  if (s.state != SegState::kSealed || s.reclaiming || s.live != 0 ||
       s.shadows != 0 || s.pins != 0 || s.writers != 0)
     return;
   // Every record in it is killed: it can be reused as it is.
@@ -1027,6 +1236,10 @@ void LogStore::RemoveFromFifoLocked(uint32_t index) {
   if (it != fifo_.end()) fifo_.erase(it);
 }
 
+uint32_t LogStore::FreeCountLocked() const {
+  return static_cast<uint32_t>(free_.size());
+}
+
 uint64_t LogStore::EnqueueKillLocked(const BlockKey& key, const Location& loc,
                                      uint64_t generation) {
   lse::JournalEntry e;
@@ -1036,7 +1249,18 @@ uint64_t LogStore::EnqueueKillLocked(const BlockKey& key, const Location& loc,
   e.offset_blocks = loc.offset_blocks;
   e.key = key;
   e.generation = generation;
+  if (loc.segment < segments_.size() &&
+      segments_[loc.segment].incarnation == loc.incarnation)
+    live_kills_[loc.segment].push_back(e);
   return journal_->Enqueue(e);
+}
+
+std::vector<lse::JournalEntry> LogStore::LiveJournalEntries() {
+  std::lock_guard<std::mutex> lk(mu_);
+  std::vector<lse::JournalEntry> out;
+  for (const auto& kv : live_kills_)
+    out.insert(out.end(), kv.second.begin(), kv.second.end());
+  return out;
 }
 
 // ---- write path --------------------------------------------------------------
@@ -1049,16 +1273,21 @@ uint64_t LogStore::NextLsnLocked() {
   return lsn;
 }
 
-bool LogStore::TakeFreeSegmentLocked(uint32_t* out) {
-  if (free_.empty()) return false;
-  const uint32_t next = free_.front();
-  free_.erase(free_.begin());
-  if (!FreshHeader(next)) {
-    FailStore("cannot write a segment header", errno);
-    return false;
+bool LogStore::TakeFreeSegmentLocked(bool client, uint32_t* out) {
+  const uint32_t reserve = client ? kCleanerReserve : 0;
+  while (FreeCountLocked() > reserve) {
+    const uint32_t next = free_.front();
+    free_.erase(free_.begin());
+    if (!FreshHeader(next)) {
+      FailStore("cannot write a segment header", errno);
+      return false;
+    }
+    *out = next;
+    state_cv_.notify_all();  // the cleaner keeps the free count up
+    return true;
   }
-  *out = next;
-  return true;
+  state_cv_.notify_all();
+  return false;
 }
 
 void LogStore::HandToSealerLocked(Lock& lk, uint32_t segment) {
@@ -1100,10 +1329,36 @@ bool LogStore::ReserveLocked(Lock& lk, uint64_t footprint, uint32_t* segment,
       HandToSealerLocked(lk, full);
       continue;
     }
+    cleaner_armed_ = true;  // clients need space from here on
     uint32_t next = 0;
-    if (!TakeFreeSegmentLocked(&next)) return false;  // full (no eviction yet)
-    open_segment_ = next;
-    segments_[next].state = SegState::kOpen;
+    if (TakeFreeSegmentLocked(/*client=*/true, &next)) {
+      open_segment_ = next;
+      segments_[next].state = SegState::kOpen;
+      continue;
+    }
+    if (failed_.load()) return false;
+    if (!InlineReclaimLocked(lk)) return false;
+  }
+  return false;
+}
+
+bool LogStore::ReserveRelocationLocked(Lock& lk, uint64_t footprint,
+                                       uint32_t* segment, uint64_t* offset) {
+  for (int attempt = 0; attempt < 8 && !failed_.load(); ++attempt) {
+    if (reloc_segment_ != UINT32_MAX) {
+      if (PlaceLocked(reloc_segment_, footprint, offset)) {
+        *segment = reloc_segment_;
+        return true;
+      }
+      const uint32_t full = reloc_segment_;
+      reloc_segment_ = UINT32_MAX;
+      HandToSealerLocked(lk, full);
+      continue;
+    }
+    uint32_t next = 0;
+    if (!TakeFreeSegmentLocked(/*client=*/false, &next)) return false;
+    reloc_segment_ = next;
+    segments_[next].state = SegState::kRelocation;
   }
   return false;
 }
@@ -1226,6 +1481,11 @@ Status LogStore::Put(const BlockKey& key, size_t len, const WriteFn& write) {
   h.key = key;
   h.generation = generation;
   h.write_lsn = generation;
+  window_client_bytes_ += footprint;
+  if (window_client_bytes_ > opt_.capacity_bytes) {  // a sliding window
+    window_client_bytes_ /= 2;
+    window_relocated_bytes_ /= 2;
+  }
   lk.unlock();
 
   Hook("put.after_reserve");
@@ -1422,6 +1682,347 @@ void LogStore::SealerLoop() {
   }
 }
 
+// ---- cleaning (§7) -----------------------------------------------------------
+bool LogStore::RelocationBudgetLocked(uint64_t bytes) const {
+  // One segment of allowance, so that a quiet store still keeps what is read.
+  const uint64_t allowed =
+      (window_client_bytes_ + sb_.segment_bytes) / 100 * opt_.relocate_pct;
+  return window_relocated_bytes_ + bytes <= allowed;
+}
+
+void LogStore::EvictLocked(const BlockKey& key) {
+  auto it = index_.find(key);
+  if (it == index_.end()) return;
+  const Entry e = it->second;
+  if (opt_.on_evict) opt_.on_evict(key, e.generation);
+  // Still recoverable until its segment is reused: a shadow (§7.5).
+  AddShadowLocked(key, e.loc, e.generation);
+  EraseEntryLocked(key);
+  ++stats_.records_evicted;
+  stats_.evicted_bytes += e.value_len;
+}
+
+void LogStore::FinishReclaimLocked(uint32_t victim, uint64_t old_incarnation) {
+  Segment& s = segments_[victim];
+  for (auto it = shadows_.begin(); it != shadows_.end();) {
+    if (it->second.loc.segment == victim &&
+        it->second.loc.incarnation == old_incarnation) {
+      --s.shadows;
+      it = shadows_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  s.reclaiming = false;
+  RemoveFromFifoLocked(victim);
+}
+
+bool LogStore::RelocateOne(Lock& lk, const BlockKey& key, const Entry& e) {
+  const uint64_t fp = Footprint(e);
+  uint32_t dseg = 0;
+  uint64_t doff = 0;
+  if (!ReserveRelocationLocked(lk, fp, &dseg, &doff)) return false;
+  auto it = index_.find(key);
+  if (it == index_.end() || !(it->second.loc == e.loc) ||
+      it->second.generation != e.generation) {
+    // Gone while space was found: the reserved space stays a hole.
+    --segments_[dseg].pins;
+    --segments_[dseg].writers;
+    state_cv_.notify_all();
+    return true;
+  }
+  const uint64_t lsn = NextLsnLocked();
+  const Location dest{dseg, segments_[dseg].incarnation,
+                      static_cast<uint32_t>(doff / kBlockBytes)};
+  relocs_[key] = Reloc{e.loc, dest, e.generation, false};
+  Segment& src = segments_[e.loc.segment];
+  ++src.pins;
+  const int src_fd = src.dio_fd >= 0 ? src.dio_fd : src.fd;
+  const uint64_t src_off = uint64_t(e.loc.offset_blocks) * kBlockBytes;
+  const uint64_t src_inc = e.loc.incarnation;
+  lk.unlock();
+
+  // Read and verify the record, then append it with its generation, a new
+  // write_lsn and the relocated flag (§7.4).
+  bool read_ok = false;
+  bool io_error = false;
+  lse::RecordHeader h;
+  std::unique_ptr<AlignedBuf> data;
+  {
+    AlignedBuf hb(kBlockBytes);
+    lse::RecordHeader src_h;
+    if (hb.p == nullptr || !PreadAll(io_.get(), src_fd, hb.p, kBlockBytes, src_off)) {
+      io_error = true;
+    } else if (lse::DecodeRecordHeader(reinterpret_cast<const uint8_t*>(hb.p),
+                                       sb_.store_uuid, src_inc,
+                                       sb_.segment_bytes,
+                                       &src_h) == lse::DecodeError::kOk &&
+               src_h.key == key && src_h.generation == e.generation &&
+               src_h.value_len == e.value_len) {
+      data = std::make_unique<AlignedBuf>(AlignUp(e.value_len) + kBlockBytes);
+      if (data->p == nullptr) {
+        io_error = true;
+      } else if (src_h.flags & lse::kRecordFlagInline) {
+        std::memcpy(data->p, hb.p + src_h.header_len, e.value_len);
+      } else if (!PreadAll(io_.get(), src_fd, data->p, AlignUp(e.value_len),
+                           src_off + kBlockBytes)) {
+        io_error = true;
+      }
+      read_ok = !io_error && Crc32c(data->p, e.value_len) == e.payload_crc;
+    }
+  }
+  bool written = false;
+  if (read_ok) {
+    h.flags = static_cast<uint8_t>(
+        (lse::RecordFitsInline(e.value_len) ? lse::kRecordFlagInline : 0) |
+        lse::kRecordFlagRelocated);
+    h.store_uuid = sb_.store_uuid;
+    h.incarnation = dest.incarnation;
+    h.key = key;
+    h.value_len = e.value_len;
+    h.generation = e.generation;
+    h.write_lsn = lsn;
+    h.payload_crc = e.payload_crc;
+    written = WriteRecord(dseg, doff, h, data->p, e.value_len, data->p,
+                          AlignUp(e.value_len) + kBlockBytes);
+    io_error = !written;
+  }
+  const int err = errno;
+  Hook("relocate.after_copy");
+  lk.lock();
+  --src.pins;
+  --segments_[dseg].pins;
+  --segments_[dseg].writers;
+  if (written) segments_[dseg].unsynced = true;
+  state_cv_.notify_all();
+  const Reloc r = relocs_[key];
+  relocs_.erase(key);
+  if (io_error) {
+    FailStore("cannot relocate a record", err ? err : EIO);
+    return false;
+  }
+  if (!read_ok) {
+    // A relocation read that fails its check evicts the record, whose
+    // location stays a shadow (§7.3).
+    auto cur = index_.find(key);
+    if (cur != index_.end() && cur->second.loc == e.loc) {
+      ++stats_.read_crc_failures;
+      DFKV_LOG_WARN("lse: " + opt_.dir + ": relocation read of segment " +
+                    std::to_string(e.loc.segment) + " block " +
+                    std::to_string(e.loc.offset_blocks) +
+                    " failed its check; evicted");
+      EvictLocked(key);
+    }
+    return true;
+  }
+  RecordWrittenLocked(dseg, key, h, doff);
+  auto cur = index_.find(key);
+  if (cur != index_.end() && cur->second.generation == r.generation &&
+      cur->second.loc == r.source) {
+    // Switched: the source becomes a shadow until the victim is reused.
+    Entry& ent = cur->second;
+    const uint64_t old_fp = Footprint(ent);
+    --segments_[r.source.segment].live;
+    AddShadowLocked(key, r.source, r.generation);
+    ent.loc = dest;
+    ent.write_lsn = lsn;
+    ent.inline_at = (h.flags & lse::kRecordFlagInline) ? h.header_len : uint16_t(0);
+    const uint64_t new_fp = Footprint(ent);
+    used_bytes_ = used_bytes_ - old_fp + new_fp;
+    ++segments_[dseg].live;
+    ++stats_.records_relocated;
+    stats_.relocated_bytes += new_fp;
+    window_relocated_bytes_ += new_fp;
+    auto& copies = segments_[r.source.segment].copies;
+    if (std::find(copies.begin(), copies.end(), dseg) == copies.end())
+      copies.push_back(dseg);
+  } else if (!r.dest_shadowed) {
+    // The copy turned out dead: it is a shadow of the key (§7.4).
+    AddShadowLocked(key, dest, r.generation);
+  }
+  return true;
+}
+
+// C20: the copies taken from `victim`, by this attempt or by earlier ones
+// that gave up on its pins, are durable before its new header gives up its
+// records. Nothing adds to the list meanwhile: only a reclaim of the victim,
+// which holds `reclaiming`, relocates out of it.
+bool LogStore::SyncCopiesLocked(Lock& lk, uint32_t victim) {
+  std::vector<int> fds;
+  for (uint32_t d : segments_[victim].copies)
+    if (segments_[d].fd >= 0) fds.push_back(segments_[d].fd);
+  if (fds.empty()) return true;
+  lk.unlock();
+  int err = 0;
+  for (int fd : fds)
+    if (io_->Fdatasync(fd) != 0) err = errno ? errno : EIO;
+  lk.lock();
+  if (err != 0) {
+    FailStore("cannot sync the relocation segment", err);
+    return false;
+  }
+  segments_[victim].copies.clear();
+  return true;
+}
+
+bool LogStore::ReclaimVictim(Lock& lk, uint32_t victim) {
+  Segment& s = segments_[victim];
+  s.reclaiming = true;
+  // Step 1: no pins (bounded wait), before anything is given up: a victim
+  // that cannot be reused keeps its values. Reads that start meanwhile are
+  // waited for again below.
+  auto unpinned = [&] {
+    if (state_cv_.wait_for(lk, std::chrono::milliseconds(opt_.pin_wait_ms),
+                           [&] { return s.pins == 0 || failed_.load(); }) &&
+        !failed_.load())
+      return true;
+    ++stats_.victims_skipped_pins;
+    s.reclaiming = false;
+    return false;
+  };
+  if (!unpinned()) return false;
+  // The records whose index entry still points here (§7.3).
+  std::vector<std::pair<BlockKey, Entry>> live;
+  for (const auto& r : s.summary) {
+    auto it = index_.find(r.key);
+    if (it != index_.end() &&
+        it->second.loc == Location{victim, s.incarnation, r.offset_blocks})
+      live.emplace_back(r.key, it->second);
+  }
+  for (const auto& kv : live) {
+    auto it = index_.find(kv.first);
+    if (it == index_.end() || !(it->second.loc == kv.second.loc)) continue;
+    Entry& e = it->second;
+    const uint64_t fp = Footprint(e);
+    bool relocate = false;
+    if (e.referenced) {
+      if (RelocationBudgetLocked(fp)) relocate = true;
+      else ++stats_.budget_exhausted;
+    }
+    if (!relocate) {
+      EvictLocked(kv.first);
+      continue;
+    }
+    e.referenced = false;
+    const Entry copy = e;
+    if (!RelocateOne(lk, kv.first, copy)) {
+      if (failed_.load()) return false;
+      // No room to relocate: evicted after all.
+      auto again = index_.find(kv.first);
+      if (again != index_.end() && again->second.loc == copy.loc)
+        EvictLocked(kv.first);
+    }
+  }
+  if (s.live != 0) {  // cannot happen: nothing new points into a victim
+    s.reclaiming = false;
+    return false;
+  }
+  if (!unpinned()) return false;
+  // Step 2: every relocated copy durable before the victim's records are
+  // given up (C20).
+  if (!SyncCopiesLocked(lk, victim)) return false;
+  lk.unlock();
+  Hook("reclaim.before_header");
+  lk.lock();
+  if (failed_.load()) return false;
+  // Steps 3, 4, 6.
+  const uint64_t old_incarnation = s.incarnation;
+  if (!FreshHeader(victim, /*empty=*/true)) {
+    FailStore("cannot write a segment header", errno);
+    return false;
+  }
+  lk.unlock();
+  Hook("reclaim.after_header");
+  lk.lock();
+  FinishReclaimLocked(victim, old_incarnation);
+  s.state = SegState::kFree;
+  free_.push_back(victim);
+  ++stats_.segments_reclaimed;
+  state_cv_.notify_all();
+  return true;
+}
+
+bool LogStore::CleanOnce(Lock& lk) {
+  // The oldest sealed segment, past those still pinned (§7.2).
+  uint32_t pick = UINT32_MAX, fallback = UINT32_MAX;
+  for (uint32_t i : fifo_) {
+    const Segment& s = segments_[i];
+    if (s.state != SegState::kSealed || s.reclaiming) continue;
+    if (s.pins != 0) {
+      if (fallback == UINT32_MAX) fallback = i;
+      continue;
+    }
+    pick = i;
+    break;
+  }
+  if (pick == UINT32_MAX) pick = fallback;
+  if (pick == UINT32_MAX) return false;
+  return ReclaimVictim(lk, pick);
+}
+
+void LogStore::CleanerLoop() {
+  Lock lk(mu_);
+  while (!stop_threads_ && !failed_.load()) {
+    // Keeps K + C segments free (§7.1); a pass that gained nothing waits
+    // before the next.
+    const uint32_t before = FreeCountLocked();
+    if (cleaner_armed_ && before < kOpenClient + kCleanerReserve && CleanOnce(lk) &&
+        FreeCountLocked() > before)
+      continue;
+    state_cv_.wait_for(lk, std::chrono::milliseconds(200));
+  }
+}
+
+// §7.7: a PUT that finds no free segment reclaims the oldest sealed segment
+// with no pins itself, evict-only, and takes it as its open segment.
+bool LogStore::InlineReclaimLocked(Lock& lk) {
+  uint32_t victim = UINT32_MAX;
+  for (uint32_t i : fifo_) {
+    const Segment& s = segments_[i];
+    if (s.state == SegState::kSealed && !s.reclaiming && s.pins == 0 &&
+        s.writers == 0) {
+      victim = i;
+      break;
+    }
+  }
+  if (victim == UINT32_MAX) return false;
+  Segment& s = segments_[victim];
+  s.reclaiming = true;
+  std::vector<BlockKey> keys;
+  for (const auto& r : s.summary) {
+    auto it = index_.find(r.key);
+    if (it != index_.end() &&
+        it->second.loc == Location{victim, s.incarnation, r.offset_blocks})
+      keys.push_back(r.key);
+  }
+  for (const auto& k : keys) EvictLocked(k);
+  if (!SyncCopiesLocked(lk, victim)) return false;
+  lk.unlock();
+  Hook("inline_reclaim.before_header");
+  lk.lock();
+  if (failed_.load()) return false;
+  const uint64_t old_incarnation = s.incarnation;
+  if (!FreshHeader(victim)) {
+    FailStore("cannot write a segment header", errno);
+    return false;
+  }
+  lk.unlock();
+  Hook("inline_reclaim.after_header");
+  lk.lock();
+  FinishReclaimLocked(victim, old_incarnation);
+  ++stats_.inline_reclaims;
+  ++stats_.segments_reclaimed;
+  if (open_segment_ == UINT32_MAX) {
+    open_segment_ = victim;
+    s.state = SegState::kOpen;
+  } else {  // another PUT opened one meanwhile
+    s.state = SegState::kFree;
+    free_.push_back(victim);
+  }
+  state_cv_.notify_all();
+  return true;
+}
+
 // ---- REMOVE ------------------------------------------------------------------
 Status LogStore::Remove(const BlockKey& key) {
   if (!Serving()) return Status::kIOError;
@@ -1436,7 +2037,7 @@ Status LogStore::Remove(const BlockKey& key) {
     const Entry e = it->second;
     AddShadowLocked(key, e.loc, e.generation,
                     EnqueueKillLocked(key, e.loc, e.generation));
-    EraseEntryLocked(key);
+    EraseEntryLocked(key);  // also accounts for a relocation's destination
     had = true;
   }
   auto f = flights_.find(key);
@@ -1484,7 +2085,7 @@ Status LogStore::Remove(const BlockKey& key) {
   return had ? Status::kOk : Status::kNotFound;
 }
 
-// ---- stats -------------------------------------------------------
+// ---- stats and metrics -------------------------------------------------------
 LogStore::Stats LogStore::GetStats() const {
   std::lock_guard<std::mutex> lk(mu_);
   Stats st = stats_;
@@ -1493,13 +2094,70 @@ LogStore::Stats LogStore::GetStats() const {
   st.sealer_queue = static_cast<uint32_t>(seal_queue_.size());
   st.shadows = shadows_.size();
   st.segment_count = static_cast<uint32_t>(segments_.size());
+  if (journal_) st.journal_compactions = journal_->Compactions();
   return st;
+}
+
+uint64_t LogStore::Evictions() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return stats_.records_evicted;
+}
+
+uint64_t LogStore::EvictedBytes() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return stats_.evicted_bytes;
+}
+
+void LogStore::EngineMetrics(std::vector<EngineMetric>* out) const {
+  const Stats st = GetStats();
+  uint64_t journal_bytes = 0;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (journal_) journal_bytes = journal_->Bytes();
+  }
+  auto add = [&](const char* name, const char* type, const char* help,
+                 uint64_t v) { out->push_back({name, type, help, v}); };
+  add("dfkv_lse_segments", "gauge", "Segments of the log store", st.segment_count);
+  add("dfkv_lse_segments_free", "gauge", "Free segments", st.segments_free);
+  add("dfkv_lse_segments_sealed", "gauge", "Sealed segments", st.segments_sealed_now);
+  add("dfkv_lse_sealer_queue", "gauge", "Segments waiting to be sealed", st.sealer_queue);
+  add("dfkv_lse_shadows", "gauge", "Recoverable copies that are not indexed", st.shadows);
+  add("dfkv_lse_segments_sealed_total", "counter", "Segments sealed", st.segments_sealed);
+  add("dfkv_lse_segments_reclaimed_total", "counter", "Segments reclaimed", st.segments_reclaimed);
+  add("dfkv_lse_inline_reclaims_total", "counter",
+      "Segments a PUT reclaimed itself for want of a free one", st.inline_reclaims);
+  add("dfkv_lse_records_relocated_total", "counter", "Records the cleaner relocated",
+      st.records_relocated);
+  add("dfkv_lse_relocated_bytes_total", "counter", "Footprint bytes relocated",
+      st.relocated_bytes);
+  add("dfkv_lse_records_evicted_total", "counter", "Records evicted", st.records_evicted);
+  add("dfkv_lse_relocate_budget_exhausted_total", "counter",
+      "Referenced records evicted because the relocation budget was used up",
+      st.budget_exhausted);
+  add("dfkv_lse_victims_skipped_pins_total", "counter",
+      "Victims skipped because their pins did not clear in time",
+      st.victims_skipped_pins);
+  add("dfkv_lse_cache_full_total", "counter", "PUTs answered kCacheFull", st.cache_full);
+  add("dfkv_lse_read_crc_failures_total", "counter",
+      "Reads and relocation reads that failed the payload checksum",
+      st.read_crc_failures);
+  add("dfkv_lse_journal_compactions_total", "counter", "Journal compactions",
+      st.journal_compactions);
+  add("dfkv_lse_journal_integrity_resets_total", "counter",
+      "Stores reset to empty after journal damage", st.journal_resets);
+  add("dfkv_lse_journal_bytes", "gauge", "Size of the metadata journal", journal_bytes);
+  add("dfkv_lse_recovery_segments_walked", "gauge", "Segments the last open walked",
+      recovery_.segments_walked);
+  add("dfkv_lse_recovery_records_rejected", "gauge",
+      "Records the last open rejected (header or payload checksum)",
+      recovery_.records_rejected);
 }
 
 // ---- read path ---------------------------------------------------------------
 bool LogStore::AcquireLocked(const BlockKey& key, Entry* out) {
   auto it = index_.find(key);
   if (it == index_.end()) return false;
+  it->second.referenced = true;  // second chance at the next reclaim (§7.3)
   *out = it->second;
   ++segments_[out->loc.segment].pins;
   return true;

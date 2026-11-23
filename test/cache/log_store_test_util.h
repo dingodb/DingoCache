@@ -44,10 +44,12 @@ inline LogStore::Options Opts(const fs::path& dir, uint64_t capacity = kSmall) {
   o.capacity_bytes = capacity;
   return o;
 }
-// For opens that check what came back (the same as Opts until the engine
-// has a cleaner).
+// For opens that check what came back: no cleaner, which would start
+// evicting at once in a store left full.
 inline LogStore::Options Quiet(const fs::path& dir, uint64_t capacity = kSmall) {
-  return Opts(dir, capacity);
+  LogStore::Options o = Opts(dir, capacity);
+  o.cleaner = false;
+  return o;
 }
 
 inline BlockKey Key(uint64_t id) { return BlockKey{id * 7 + 3, id, id % 2}; }
