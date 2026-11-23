@@ -62,6 +62,10 @@ class DiskSlabStore : public StoreEngine {
     // If the filesystem rejects O_DIRECT (tmpfs in tests/CI), the store falls
     // back to buffered -- DirectWritesActive() reports the resolved truth.
     bool direct_writes = false;
+    // A PUT records a CRC32C of its value and whole-value reads check it
+    // (DFKV_SLAB_PAYLOAD_CRC). Off: records are written without it and no
+    // read checks one, whoever wrote it.
+    bool payload_crc = true;
     // Background free-slot reclaimer cadence (ms; 0 = off). Keeps a demand-
     // driven headroom of free slots per active class so Put's fast path stays
     // pop-free-slot; without it every Put under capacity pressure runs the
@@ -140,6 +144,7 @@ class DiskSlabStore : public StoreEngine {
     uint64_t dio_read_fallbacks = 0;
     uint64_t table_syncs = 0;
     uint64_t bind_wipes = 0;
+    uint64_t payload_crc_failures = 0;  // whole-value reads that failed the CRC
     uint64_t steals = 0;
     uint64_t cold_steals = 0;
     uint64_t watermark_evictions = 0;
@@ -396,9 +401,17 @@ class DiskSlabStore : public StoreEngine {
   bool SyncPayloads();
   // Bytes 44..51 carry retain_until/retain_ttl_s (zero = none). They were
   // always zero and CRC-covered, so older binaries validate and ignore them.
+  // Bytes 52..55 carry the payload's CRC32C when rec[9] bit 0 is set
+  // (STO-15); older binaries validate and ignore them likewise.
+  struct PayloadInfo {
+    uint32_t len = 0;
+    uint32_t crc = 0;
+    bool has_crc = false;  // false: a record of an older version, unchecked
+  };
   bool WriteRecord(const SlabAllocator::SlotRef& r, const BlockKey& key,
                    uint32_t payload_len, bool valid,
-                   uint32_t retain_until = 0, uint32_t retain_ttl_s = 0);
+                   uint32_t retain_until = 0, uint32_t retain_ttl_s = 0,
+                   const PayloadInfo* checksum = nullptr);
   bool SyncTable(uint64_t seen);
   // Latches the store as failed; always returns false. `op` completes "cannot
   // ..." in the one log line the first failure writes, `err` is its errno
@@ -409,7 +422,7 @@ class DiskSlabStore : public StoreEngine {
   // zeroes the padding bytes in place (cap allows) and pwrites the 4 KiB-rounded
   // length via the extent's DIO fd. Caller pre-checked alignment/cap fit.
   bool WritePayloadDirect(const SlabAllocator::SlotRef& r, char* data, size_t len);
-  void CommitPayloadLocked(const BlockKey& key, uint32_t payload_len);
+  void CommitPayloadLocked(const BlockKey& key, const PayloadInfo& info);
   uint32_t ErasePayloadLocked(const BlockKey& key);
   // Shared allocate/pin -> unlocked payload write -> commit skeleton for
   // Cache/CacheDirect; `write_payload` does just the payload I/O for the slot.
@@ -428,7 +441,18 @@ class DiskSlabStore : public StoreEngine {
   // read (pin + inflight count, under mu_). False = miss (absent, or a write
   // still in flight). Balanced by a Release{...}Locked call.
   bool AcquireForRead(const BlockKey& key, const std::string& fn,
-                      SlabAllocator::SlotRef* ref, uint32_t* plen);
+                      SlabAllocator::SlotRef* ref, uint32_t* plen,
+                      PayloadInfo* info = nullptr,
+                      uint64_t* generation = nullptr);
+  // A whole value read from `ref` at `generation` failed its payload CRC: a
+  // miss from now on, removed as a REMOVE would remove it, if the key still
+  // holds that value (a REMOVE and a new PUT in between may have put a good
+  // one in the same slot).
+  void DropCorrupt(const BlockKey& key, const SlabAllocator::SlotRef& ref,
+                   uint64_t generation);
+  Status RemoveLocked(const BlockKey& key, const std::string& fn);
+  static void LeaseMismatchThunk(void* owner, const BlockKey& key,
+                                 uint64_t generation, const uint64_t* where) noexcept;
   // Drop one in-flight hold on fn (unpin + count). The LAST releaser performs
   // the physical removal for a Remove that arrived while I/O was active. The
   // record itself is already invalid by then (Remove invalidates a committed
@@ -523,7 +547,7 @@ class DiskSlabStore : public StoreEngine {
           Mix(Mix(Mix(k.digest_lo ^ seed) ^ k.digest_hi) ^ k.tenant_hash));
     }
   };
-  std::unordered_map<BlockKey, uint32_t, BlockKeyHash> payload_len_;
+  std::unordered_map<BlockKey, PayloadInfo, BlockKeyHash> payload_len_;
   std::unordered_map<uint64_t, uint64_t> tenant_used_bytes_;
   // Keys with an unlocked pread/pwrite in flight (value = op count), and keys
   // whose Remove arrived during that window (executed by the last releaser).
@@ -555,6 +579,7 @@ class DiskSlabStore : public StoreEngine {
   std::atomic<uint64_t> dio_read_fallbacks_{0};
   std::atomic<uint64_t> table_syncs_{0};
   std::atomic<uint64_t> bind_wipes_{0};
+  std::atomic<uint64_t> payload_crc_failures_{0};
   std::atomic<uint64_t> metadata_io_errors_{0};
   std::function<bool()> payload_write_hook_for_test_;
   // Runs inside SyncTableFile, after the token was taken back.
@@ -570,6 +595,8 @@ class DiskSlabStore : public StoreEngine {
   // Runs under mu_ (records are written at commit): it must not call back into
   // the store, and blocking in it blocks every operation on this disk.
   std::function<bool()> record_write_hook_for_test_;
+  // Runs at the start of DropCorrupt, without mu_ (it may call the store).
+  std::function<void()> drop_corrupt_hook_for_test_;
   // Test-only seam (never set in production; same discipline as the hooks
   // above): when set, replaces EVERY CQE reap of the batched io_uring write
   // path -- the blocking wait AND the post-failure non-blocking drain -- so

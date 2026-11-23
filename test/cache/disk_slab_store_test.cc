@@ -2,6 +2,7 @@
 // Covers data-path semantics, restart warmth, crash/torn-record handling,
 // strict startup geometry, fail-closed metadata I/O, and reclaimer safety.
 #include "cache/disk_slab_store.h"
+#include "utils/crc32.h"
 #include "utils/net_util.h"
 
 #include <gtest/gtest.h>
@@ -55,6 +56,17 @@ class DiskSlabStoreTestPeer {
   static bool UnpinSlot(DiskSlabStore* store, const BlockKey& key) {
     std::lock_guard<std::mutex> lock(store->mu_);
     return store->alloc_->Unpin(key);
+  }
+  static void SetDropCorruptHook(DiskSlabStore* store,
+                                 std::function<void()> hook) {
+    store->drop_corrupt_hook_for_test_ = std::move(hook);
+  }
+  static SlabAllocator::SlotRef SlotOf(DiskSlabStore* store,
+                                       const BlockKey& key) {
+    std::lock_guard<std::mutex> lock(store->mu_);
+    SlabAllocator::SlotRef ref;
+    store->alloc_->Get(key, &ref);
+    return ref;
   }
   static void BreakTableFd(DiskSlabStore* store) {
     if (store->table_fd_ >= 0) ::close(store->table_fd_);
@@ -1026,6 +1038,301 @@ std::vector<off_t> ValidRecordOffsets(const fs::path& dir) {
   return offsets;
 }
 }  // namespace
+
+// ---- STO-15: payload checksums ------------------------------------------------
+namespace {
+// Flips one byte of `value`'s first copy in the extent files (or overwrites
+// all of it with zeros), as damage on the disk or a lost write leaves it.
+bool DamagePayload(const fs::path& dir, const std::string& value, bool zero_all) {
+  for (const auto& e : fs::directory_iterator(dir / "extents")) {
+    std::ifstream in(e.path(), std::ios::binary);
+    const std::string bytes((std::istreambuf_iterator<char>(in)),
+                            std::istreambuf_iterator<char>());
+    const size_t at = bytes.find(value);
+    if (at == std::string::npos) continue;
+    const int fd = ::open(e.path().c_str(), O_WRONLY);
+    if (fd < 0) return false;
+    bool ok;
+    if (zero_all) {
+      const std::string zeros(value.size(), '\0');
+      ok = ::pwrite(fd, zeros.data(), zeros.size(), static_cast<off_t>(at)) ==
+           static_cast<ssize_t>(zeros.size());
+    } else {
+      const char flipped = static_cast<char>(bytes[at + 100] ^ 0x01);
+      ok = ::pwrite(fd, &flipped, 1, static_cast<off_t>(at + 100)) == 1;
+    }
+    ::fsync(fd);
+    ::close(fd);
+    return ok;
+  }
+  return false;
+}
+std::string Patterned(size_t len, int seed) {
+  std::string v(len, '\0');
+  uint32_t x = 2463534242u + seed;
+  for (auto& c : v) {
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    c = static_cast<char>(x);
+  }
+  return v;
+}
+}  // namespace
+
+// A value whose bytes on the disk no longer match the CRC its PUT recorded
+// is a miss on every whole-value read path, counted, and removed (record
+// invalidated, so a restart does not bring it back); a new PUT of the key is
+// stored. A partial read cannot be checked and is served as read.
+TEST_F(DiskSlabTest, ADamagedPayloadIsAMissOnEveryWholeValueRead) {
+  enum Path { kRange, kRangeInto, kRangeDirect, kLease };
+  for (const Path path : {kRange, kRangeInto, kRangeDirect, kLease}) {
+    SCOPED_TRACE(static_cast<int>(path));
+    fs::remove_all(dir_);
+    auto options = Opts(1 << 20, 1 << 20, 4096);
+    options.direct_writes = true;
+    options.reclaim_interval_ms = 0;
+    const std::string v = Patterned(5000, path);
+    {
+      bool ok = false;
+      DiskSlabStore s(options, &ok);
+      ASSERT_TRUE(ok) << s.StartupError();
+      ASSERT_EQ(s.Cache(K(7), v.data(), v.size()), Status::kOk);
+      std::string out;
+      ASSERT_EQ(s.Range(K(7), 0, 0, &out), Status::kOk);  // intact: served
+      ASSERT_EQ(out, v);
+      ASSERT_TRUE(DamagePayload(dir_, v, /*zero_all=*/false));
+      // A slice is not checked.
+      ASSERT_EQ(s.Range(K(7), 200, 100, &out), Status::kOk);
+      void* mem = nullptr;
+      ASSERT_EQ(::posix_memalign(&mem, 4096, 64 << 10), 0);
+      char* buf = static_cast<char*>(mem);
+      Status st = Status::kOk;
+      switch (path) {
+        case kRange: st = s.Range(K(7), 0, 0, &out); break;
+        case kRangeInto: {
+          size_t got = 0;
+          st = s.RangeInto(K(7), 0, 0, buf, 64 << 10, &got);
+          break;
+        }
+        case kRangeDirect: {
+          const char* data = nullptr;
+          size_t got = 0;
+          st = s.RangeDirect(K(7), 0, 0, buf, 64 << 10, &data, &got);
+          break;
+        }
+        case kLease: {
+          dfkv::ReadLease lease;
+          ASSERT_EQ(s.RangeDirectPrep(K(7), 0, 0, 64 << 10, &lease), Status::kOk);
+          ASSERT_EQ(::pread(lease.fd(), buf, lease.aligned_len,
+                            static_cast<off_t>(lease.aligned_off)),
+                    static_cast<ssize_t>(lease.aligned_len));
+          st = lease.Verify(buf + lease.head) ? Status::kOk : Status::kNotFound;
+          break;
+        }
+      }
+      std::free(mem);
+      EXPECT_EQ(st, Status::kNotFound);
+      EXPECT_EQ(s.GetStats().payload_crc_failures, 1u);
+      EXPECT_FALSE(s.IsCached(K(7)));
+      EXPECT_EQ(s.Range(K(7), 0, 0, &out), Status::kNotFound);
+      const std::string w = Patterned(5000, 100 + path);
+      ASSERT_EQ(s.Cache(K(7), w.data(), w.size()), Status::kOk) << "stored again";
+      ASSERT_EQ(s.Range(K(7), 0, 0, &out), Status::kOk);
+      EXPECT_EQ(out, w);
+      ASSERT_EQ(s.Remove(K(7)), Status::kOk);
+    }
+    // The removal is on the disk: a clean restart does not bring K(7) back.
+    bool ok = false;
+    DiskSlabStore reopened(options, &ok);
+    ASSERT_TRUE(ok);
+    EXPECT_FALSE(reopened.IsCached(K(7)));
+  }
+}
+
+// A record written by an older version has no checksum: its value is served
+// unchecked (and survives a restart), so an upgrade keeps the cache.
+TEST_F(DiskSlabTest, ARecordWithoutAChecksumIsServedUnchecked) {
+  auto options = Opts(1 << 20, 1 << 20, 4096);
+  options.reclaim_interval_ms = 0;
+  const std::string v = Patterned(5000, 9);
+  {
+    bool ok = false;
+    DiskSlabStore s(options, &ok);
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(s.Cache(K(8), v.data(), v.size()), Status::kOk);
+  }
+  // Rewrite the record as an older version writes it: no flag, no CRC.
+  {
+    const auto offsets = ValidRecordOffsets(dir_);
+    ASSERT_EQ(offsets.size(), 1u);
+    const int fd = ::open((dir_ / "slots.tbl").c_str(), O_RDWR);
+    ASSERT_GE(fd, 0);
+    uint8_t rec[64];
+    ASSERT_EQ(::pread(fd, rec, 64, offsets[0]), 64);
+    ASSERT_EQ(rec[9], 1u) << "this version writes the flag";
+    rec[9] = 0;
+    std::memset(rec + 52, 0, 4);
+    dfkv::net::PutU32(reinterpret_cast<char*>(rec) + 4, dfkv::Crc32(rec + 8, 56));
+    ASSERT_EQ(::pwrite(fd, rec, 64, offsets[0]), 64);
+    ::close(fd);
+  }
+  ASSERT_TRUE(DamagePayload(dir_, v, /*zero_all=*/false));
+  bool ok = false;
+  DiskSlabStore s(options, &ok);
+  ASSERT_TRUE(ok);
+  std::string out;
+  ASSERT_EQ(s.Range(K(8), 0, 0, &out), Status::kOk) << "unchecked";
+  EXPECT_EQ(s.GetStats().payload_crc_failures, 0u);
+}
+
+// A damaged read decides to drop the key only after it has let go of the
+// slot. A REMOVE and a new PUT of the key in between can put a good value in
+// the same slot: that value is kept, and nothing is counted. The read itself
+// answers a miss (it read the damaged bytes).
+TEST_F(DiskSlabTest, AGoodValueWrittenIntoTheSlotDuringADamagedReadIsKept) {
+  enum Path { kRange, kRangeInto, kRangeDirect };
+  for (const Path path : {kRange, kRangeInto, kRangeDirect}) {
+    SCOPED_TRACE(static_cast<int>(path));
+    fs::remove_all(dir_);
+    auto options = Opts(1 << 20, 1 << 20, 4096);
+    options.direct_writes = true;
+    options.reclaim_interval_ms = 0;
+    bool ok = false;
+    DiskSlabStore s(options, &ok);
+    ASSERT_TRUE(ok) << s.StartupError();
+    const std::string v = Patterned(5000, 20 + path);
+    const std::string w = Patterned(5000, 40 + path);
+    ASSERT_EQ(s.Cache(K(7), v.data(), v.size()), Status::kOk);
+    const auto before = dfkv::DiskSlabStoreTestPeer::SlotOf(&s, K(7));
+    ASSERT_TRUE(DamagePayload(dir_, v, /*zero_all=*/false));
+    bool replaced = false;
+    dfkv::SlabAllocator::SlotRef after;
+    dfkv::DiskSlabStoreTestPeer::SetDropCorruptHook(&s, [&] {
+      if (replaced) return;
+      replaced = true;
+      ASSERT_EQ(s.Remove(K(7)), Status::kOk);
+      ASSERT_EQ(s.Cache(K(7), w.data(), w.size()), Status::kOk);
+      after = dfkv::DiskSlabStoreTestPeer::SlotOf(&s, K(7));
+    });
+    void* mem = nullptr;
+    ASSERT_EQ(::posix_memalign(&mem, 4096, 64 << 10), 0);
+    char* buf = static_cast<char*>(mem);
+    std::string out;
+    Status st = Status::kOk;
+    switch (path) {
+      case kRange: st = s.Range(K(7), 0, 0, &out); break;
+      case kRangeInto: {
+        size_t got = 0;
+        st = s.RangeInto(K(7), 0, 0, buf, 64 << 10, &got);
+        break;
+      }
+      case kRangeDirect: {
+        const char* data = nullptr;
+        size_t got = 0;
+        st = s.RangeDirect(K(7), 0, 0, buf, 64 << 10, &data, &got);
+        break;
+      }
+    }
+    std::free(mem);
+    dfkv::DiskSlabStoreTestPeer::SetDropCorruptHook(&s, {});
+    ASSERT_TRUE(replaced);
+    ASSERT_EQ(after.extent, before.extent);
+    ASSERT_EQ(after.slot, before.slot) << "the new value took the same slot";
+    EXPECT_EQ(st, Status::kNotFound);
+    EXPECT_EQ(s.GetStats().payload_crc_failures, 0u);
+    ASSERT_EQ(s.Range(K(7), 0, 0, &out), Status::kOk) << "the good value";
+    EXPECT_EQ(out, w);
+  }
+}
+
+// DFKV_SLAB_PAYLOAD_CRC=0: a PUT records no checksum (the record is written
+// as an older version writes it) and no read checks one, also on a record
+// written while it was on. Records written while it is off stay unchecked
+// after it is switched on again.
+TEST_F(DiskSlabTest, WithTheChecksumOffNothingIsRecordedOrChecked) {
+  auto on = Opts(1 << 20, 1 << 20, 4096);
+  on.reclaim_interval_ms = 0;
+  auto off = on;
+  off.payload_crc = false;
+  const std::string a = Patterned(5000, 61);  // written while on
+  const std::string b = Patterned(5000, 62);  // written while off
+  {
+    bool ok = false;
+    DiskSlabStore s(on, &ok);
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(s.Cache(K(1), a.data(), a.size()), Status::kOk);
+  }
+  {
+    bool ok = false;
+    DiskSlabStore s(off, &ok);
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(s.Cache(K(2), b.data(), b.size()), Status::kOk);
+  }
+  // Only the record written while on carries the flag.
+  {
+    const int fd = ::open((dir_ / "slots.tbl").c_str(), O_RDONLY);
+    ASSERT_GE(fd, 0);
+    size_t flagged = 0, unflagged = 0;
+    for (const auto offset : ValidRecordOffsets(dir_)) {
+      uint8_t rec[64];
+      ASSERT_EQ(::pread(fd, rec, 64, offset), 64);
+      (rec[9] & 1 ? flagged : unflagged)++;
+    }
+    ::close(fd);
+    EXPECT_EQ(flagged, 1u);
+    EXPECT_EQ(unflagged, 1u);
+  }
+  ASSERT_TRUE(DamagePayload(dir_, a, /*zero_all=*/false));
+  ASSERT_TRUE(DamagePayload(dir_, b, /*zero_all=*/false));
+  std::string out;
+  {
+    bool ok = false;
+    DiskSlabStore s(off, &ok);
+    ASSERT_TRUE(ok);
+    EXPECT_EQ(s.Range(K(1), 0, 0, &out), Status::kOk) << "not checked when off";
+    EXPECT_EQ(s.Range(K(2), 0, 0, &out), Status::kOk);
+    dfkv::ReadLease lease;
+    ASSERT_EQ(s.RangeDirectPrep(K(1), 0, 0, 64 << 10, &lease), Status::kOk);
+    void* mem = nullptr;
+    ASSERT_EQ(::posix_memalign(&mem, 4096, 64 << 10), 0);
+    ASSERT_EQ(::pread(lease.fd(), mem, lease.aligned_len,
+                      static_cast<off_t>(lease.aligned_off)),
+              static_cast<ssize_t>(lease.aligned_len));
+    EXPECT_TRUE(lease.Verify(static_cast<char*>(mem) + lease.head));
+    std::free(mem);
+    EXPECT_EQ(s.GetStats().payload_crc_failures, 0u);
+  }
+  bool ok = false;
+  DiskSlabStore s(on, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(s.Range(K(2), 0, 0, &out), Status::kOk)
+      << "written while off: unchecked for good";
+  EXPECT_EQ(s.Range(K(1), 0, 0, &out), Status::kNotFound) << "checked again";
+  EXPECT_EQ(s.GetStats().payload_crc_failures, 1u);
+}
+
+// A kill after the record of a PUT was written but before its payload
+// reached the slot (the slot still holds other bytes): a warm restart keeps
+// the table, and the value is dropped at its first read, not served.
+TEST_F(DiskSlabTest, AWarmRestartDropsARecordWhosePayloadNeverLanded) {
+  const auto options =
+      WithIdentity(Opts(1 << 20, 1 << 20, 4096), WarmRestart::kAuto, 1, 7);
+  const std::string v = Patterned(5000, 11);
+  ASSERT_TRUE(CrashAfter(options, [&](DiskSlabStore& store) {
+    if (store.Cache(K(9), v.data(), v.size()) != Status::kOk) return false;
+    // The payload write lost: the slot holds zeros.
+    if (!DamagePayload(dir_, v, /*zero_all=*/true)) return false;
+    ::_exit(0);
+  }));
+  bool ok = false;
+  DiskSlabStore recovered(options, &ok);
+  ASSERT_TRUE(ok) << recovered.StartupError();
+  EXPECT_EQ(recovered.GetStats().warm_restarts, 1u);
+  EXPECT_TRUE(recovered.IsCached(K(9))) << "the record was kept";
+  std::string out;
+  EXPECT_EQ(recovered.Range(K(9), 0, 0, &out), Status::kNotFound);
+  EXPECT_EQ(recovered.GetStats().payload_crc_failures, 1u);
+  EXPECT_FALSE(recovered.IsCached(K(9)));
+}
 
 TEST_F(DiskSlabTest, UncleanExitInTheSameBootKeepsTheCache) {
   const auto options =

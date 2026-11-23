@@ -730,7 +730,7 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 `DFKV_RDMA_RECV_SEGMENT_SIZE` / `DFKV_RDMA_RECV_CHUNK_BYTES` 不是纯数字时照旧取默认值，
 WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 位（`-1` = 4294967295，
 `4294967296` = 0 即关闭回收），照旧，现在会报；超出范围的值照旧取默认或收敛到上限；存储几何与语义类（`DFKV_STORE_ENGINE`、
-`DFKV_SLAB_WRITE`、`DFKV_SLAB_GRANULARITY`、`DFKV_SLAB_TABLE_SYNC_MS`、
+`DFKV_SLAB_WRITE`、`DFKV_SLAB_PAYLOAD_CRC`、`DFKV_SLAB_GRANULARITY`、`DFKV_SLAB_TABLE_SYNC_MS`、
 `DFKV_SLAB_RECLAIM_MS`、`DFKV_SLAB_WARM_RESTART`、`DFKV_DISK_HASH_WEIGHT`、tenant quota、
 `DFKV_RAM_TIER_NUMA`）和 `DFKV_MDS_REGISTRATION_TIMEOUT_MS` 写错时照旧报错退出。
 
@@ -761,6 +761,7 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | `--mds-registration-timeout-ms` / `DFKV_MDS_REGISTRATION_TIMEOUT_MS` | `60000` | 首次 MDS 注册截止（1000–600000） |
 | `--store-engine` / `DFKV_STORE_ENGINE` | `slab` | `slab` 为默认；`file` 为显式诊断 fallback |
 | `--slab-write` / `DFKV_SLAB_WRITE` | `direct` | slab 数据面 O_DIRECT / buffered；文件系统不支持 DIO 时整店回退 buffered 并以 `wr=` 上报 |
+| `DFKV_SLAB_PAYLOAD_CRC` | `1` | slab 值校验：PUT 把值的 CRC32C 记进 slot record，整值读取（GET、RDMA 读）时校验，不符则删除该 key、按未命中回答并计入 `dfkv_slab_payload_crc_failures_total`。只读一段的请求不校验。校验发生在读取时：落盘前被 kill、warm restart 后保留下来的 record，在第一次整值读取之前 EXISTS 仍报存在。代价（单写者、1 MiB 值、NVMe 单元级实测）：PUT 中位延迟多约 60–70 µs（约 +17%，单写者吞吐约 −12%），GET 多约 15–40 µs；多个写者时瓶颈在盘，影响更小。设 `0`：PUT 不再记录校验值（record 与旧版本写的相同），任何读取都不校验，包括开着时写下的 record；关闭期间写下的 record 重新打开后也一直不校验，直到被重写。只接受 `0`/`1`，其他值拒绝启动 |
 | `--ram-tier` / `DFKV_RAM_TIER` | `off` | RAM 热层（写穿+RDMA zero-copy GET） |
 | `--ram-tier-bytes` / `DFKV_RAM_TIER_BYTES` | `16 GiB` | arena 预算（启动时预触页并锁在内存里） |
 | `--ram-tier-numa` / `DFKV_RAM_TIER_NUMA` | `interleave` | NUMA 策略：`interleave`/`off`（不接 node id） |

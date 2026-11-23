@@ -1026,6 +1026,9 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_slab_bind_wipes_total", "counter",
            "Extent slot-grid wipes completed before publishing a new class",
            ss.bind_wipes);
+    metric("dfkv_slab_payload_crc_failures_total", "counter",
+           "Whole-value reads whose payload failed its CRC32C (served as a miss)",
+           ss.payload_crc_failures);
     metric("dfkv_slab_metadata_io_errors_total", "counter",
            "Failed slots.tbl or epoch-state durability operations",
            ss.metadata_io_errors);

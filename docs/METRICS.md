@@ -297,6 +297,7 @@ slab 引擎内部（**resolved engine=slab 时输出**——按运行时实际�
 | `dfkv_slab_rebalanced_total` | counter | 回收线程从冷 class 搬给热 class 的 extent 数（类再平衡）——换模型/尺寸迁移期应看到增长，稳态应静止 |
 | `dfkv_slab_batched_writes_total` / `dfkv_slab_uring_write_batches_total` | counter | 进入 batched store visit 的 payload 写数 / io_uring 单次 submit 轮数 |
 | `dfkv_slab_bind_wipes_total` | counter | extent 绑定新 class 前完成的旧 slot-grid 清理 |
+| `dfkv_slab_payload_crc_failures_total` | counter | 整值读取时 payload 与写入时记录的 CRC32C 不符的次数；该值按 miss 返回并像 REMOVE 一样删除。旧版本写的记录不带 CRC，不检查 |
 | `dfkv_slab_metadata_io_errors_total` / `dfkv_slab_unclean_resets_total` | counter | slots.tbl/epoch 持久化失败 / 冷升时丢弃 dirty epoch |
 | `dfkv_slab_warm_restarts_total` | counter | 非干净退出后保留了缓存的盘数（`DFKV_SLAB_WARM_RESTART` 为 `auto` 或 `boot` 时才会非零）；与 `unclean_resets` 互斥，清零的原因见启动日志 |
 | `dfkv_slab_trust_tokens_held` | gauge | 当前持有可信令牌的盘数。正常运行时等于盘数（同步表的瞬间会短暂变少）；长期偏少说明令牌建不出来或该盘出过元数据错误，此时非干净退出会清零 |

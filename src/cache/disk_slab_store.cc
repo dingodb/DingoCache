@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "utils/crc32.h"
+#include "utils/crc32c.h"
 #include "utils/log.h"
 #include "utils/net_util.h"
 #include "utils/thread_name.h"  // PutU32/PutU64/GetU32/GetU64 (host-endian codec)
@@ -35,6 +36,10 @@
 namespace fs = std::filesystem;
 
 namespace dfkv {
+namespace {
+// slots.tbl record flags (rec[9]); unknown bits are ignored by older versions.
+constexpr uint8_t kRecFlagPayloadCrc = 0x01;  // bytes 52..55: payload CRC32C
+}  // namespace
 
 namespace {
 // Production records use only the v3 tenant-scoped native-digest magic. Any
@@ -1624,6 +1629,7 @@ bool DiskSlabStore::Rebuild(bool* inconsistent) {
   enum class ScanResult { kDone, kUnsupported, kError };
 
   std::vector<SlabAllocator::RestoreEntry> entries;
+  std::vector<PayloadInfo> entry_info;  // entries' payload length and CRC
   std::vector<std::pair<uint32_t, uint32_t>> rejected;
   // Startup memory follows live metadata, never the configured table geometry.
   // These small reserves avoid churn for ordinary stores without materializing
@@ -1711,6 +1717,11 @@ bool DiskSlabStore::Rebuild(bool* inconsistent) {
         net::GetU32(reinterpret_cast<const char*>(rec) + 48);
     entries.push_back(
         {key, slot_size, e, s, payload_len, retain_until, retain_ttl_s});
+    PayloadInfo info;
+    info.len = payload_len;
+    info.has_crc = (rec[9] & kRecFlagPayloadCrc) != 0;
+    if (info.has_crc) info.crc = net::GetU32(reinterpret_cast<const char*>(rec) + 52);
+    entry_info.push_back(info);
   };
 
   auto scan_range = [&](uint64_t begin, uint64_t end) {
@@ -1844,8 +1855,8 @@ bool DiskSlabStore::Rebuild(bool* inconsistent) {
   // One bucket array for the whole table instead of a rehash at every
   // doubling on the way there.
   payload_len_.reserve(payload_len_.size() + entries.size());
-  for (const auto& entry : entries)
-    CommitPayloadLocked(entry.key, static_cast<uint32_t>(entry.value_bytes));
+  for (size_t i = 0; i < entries.size(); ++i)
+    CommitPayloadLocked(entries[i].key, entry_info[i]);
   table_rebuilt_ += entries.size();
   open_restore_us_ = ElapsedUs(restore_started, std::chrono::steady_clock::now());
 
@@ -1904,7 +1915,8 @@ bool DiskSlabStore::SyncTable(uint64_t seen) {
 bool DiskSlabStore::WriteRecord(const SlabAllocator::SlotRef& r,
                                 const BlockKey& key, uint32_t payload_len,
                                 bool valid, uint32_t retain_until,
-                                uint32_t retain_ttl_s) {
+                                uint32_t retain_ttl_s,
+                                const PayloadInfo* checksum) {
   if (!Healthy() || !MayMutate()) return false;
   if (record_write_hook_for_test_ && !record_write_hook_for_test_())
     return FailMetadata("write a slots.tbl record", 0);
@@ -1912,6 +1924,10 @@ bool DiskSlabStore::WriteRecord(const SlabAllocator::SlotRef& r,
   std::memset(rec, 0, sizeof(rec));
   net::PutU32(reinterpret_cast<char*>(rec), kRecMagic);
   rec[8] = valid ? 1 : 0;
+  if (valid && checksum != nullptr && checksum->has_crc) {
+    rec[9] = kRecFlagPayloadCrc;
+    net::PutU32(reinterpret_cast<char*>(rec) + 52, checksum->crc);
+  }
   net::PutU32(reinterpret_cast<char*>(rec) + 12, r.slot_size);
   net::PutU64(reinterpret_cast<char*>(rec) + 16, key.digest_hi);
   net::PutU64(reinterpret_cast<char*>(rec) + 24, key.digest_lo);
@@ -1950,25 +1966,26 @@ bool DiskSlabStore::WritePayloadDirect(const SlabAllocator::SlotRef& r, char* da
 }
 
 void DiskSlabStore::CommitPayloadLocked(const BlockKey& key,
-                                        uint32_t payload_len) {
-  auto [it, inserted] = payload_len_.try_emplace(key, payload_len);
+                                        const PayloadInfo& info) {
+  const uint32_t payload_len = info.len;
+  auto [it, inserted] = payload_len_.try_emplace(key, info);
   if (inserted) {
     committed_payload_bytes_ += payload_len;
     tenant_used_bytes_[key.tenant_hash] += payload_len;
     return;
   }
   uint64_t& tenant_bytes = tenant_used_bytes_[key.tenant_hash];
-  tenant_bytes -= it->second;
+  tenant_bytes -= it->second.len;
   tenant_bytes += payload_len;
-  committed_payload_bytes_ -= it->second;
-  it->second = payload_len;
+  committed_payload_bytes_ -= it->second.len;
+  it->second = info;
   committed_payload_bytes_ += payload_len;
 }
 
 uint32_t DiskSlabStore::ErasePayloadLocked(const BlockKey& key) {
   const auto it = payload_len_.find(key);
   if (it == payload_len_.end()) return 0;
-  const uint32_t payload_len = it->second;
+  const uint32_t payload_len = it->second.len;
   committed_payload_bytes_ -= payload_len;
   auto tenant = tenant_used_bytes_.find(key.tenant_hash);
   if (tenant != tenant_used_bytes_.end()) {
@@ -2093,7 +2110,10 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
   if (!leader) return WaitPut(flight);
 
   payload_writers_.fetch_add(1);
-  bool io_ok = write_payload(ref);
+  PayloadInfo info;
+  info.len = static_cast<uint32_t>(len);
+  info.has_crc = opt_.payload_crc;
+  bool io_ok = write_payload(ref, info.has_crc ? &info.crc : nullptr);
   payload_writers_.fetch_sub(1);
 
   Status result = Status::kIOError;
@@ -2110,13 +2130,14 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
     // point, and a process killed in between would have brought the removed
     // key back on a restart that keeps the table.
     if (io_ok && !removed_while_writing)
-      io_ok = WriteRecord(ref, key, static_cast<uint32_t>(len), /*valid=*/true);
+      io_ok = WriteRecord(ref, key, static_cast<uint32_t>(len), /*valid=*/true,
+                          0, 0, &info);
     const bool release_ok = ReleaseInflightLocked(key, fn);
     if (!io_ok || !release_ok || !Serving()) {
       if (!removed_while_writing) alloc_->Remove(key);
     } else {
       if (!removed_while_writing) {
-        CommitPayloadLocked(key, static_cast<uint32_t>(len));
+        CommitPayloadLocked(key, info);
         new_put_bytes_since_tick_ += ref.slot_size;
       }
       result = Status::kOk;
@@ -2129,7 +2150,8 @@ Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
 
 Status DiskSlabStore::Cache(const BlockKey& key, const void* data, size_t len) {
   if (len == 0 || data == nullptr) return Status::kInvalid;
-  return CacheImpl(key, len, [&](const SlabAllocator::SlotRef& r) {
+  return CacheImpl(key, len, [&](const SlabAllocator::SlotRef& r, uint32_t* crc) {
+    if (crc) *crc = Crc32c(data, len);
     return WritePayload(r, data, len);
   });
 }
@@ -2137,7 +2159,8 @@ Status DiskSlabStore::Cache(const BlockKey& key, const void* data, size_t len) {
 Status DiskSlabStore::CacheDirect(const BlockKey& key, char* data, size_t len,
                                   size_t cap) {
   if (len == 0 || data == nullptr) return Status::kInvalid;
-  return CacheImpl(key, len, [&](const SlabAllocator::SlotRef& r) {
+  return CacheImpl(key, len, [&](const SlabAllocator::SlotRef& r, uint32_t* crc) {
+    if (crc) *crc = Crc32c(data, len);
     // O_DIRECT when enabled and the caller's buffer qualifies (RDMA recv buffers
     // are 4 KiB-aligned with padded cap); anything else falls back to buffered.
     const size_t alen = (len + 4095) & ~static_cast<size_t>(4095);
@@ -2172,6 +2195,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
     bool active = false;
     bool io_ok = false;
     bool direct = false;
+    uint32_t crc = 0;
   };
   std::vector<Slot> st(N);
   // -- L1: allocate leaders and attach followers under one lock --
@@ -2247,6 +2271,9 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
   // Counted from before the first write is issued until the last has
   // completed or failed (Close() looks at it). A batch that leaves a write
   // behind in the kernel has failed the store by then.
+  for (size_t i = 0; i < N; ++i)
+    if (st[i].active && opt_.payload_crc)
+      st[i].crc = Crc32c(items[i].data, items[i].len);
   payload_writers_.fetch_add(1);
 #ifdef DFKV_WITH_URING
   size_t direct_n = 0;
@@ -2383,10 +2410,13 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
       const bool removed = deferred_remove_.count(st[i].fn) > 0;
       // Same rule as the scalar path: the record is written under mu_, and
       // not at all for a write that a Remove cancelled.
+      PayloadInfo info;
+      info.len = static_cast<uint32_t>(items[i].len);
+      info.crc = st[i].crc;
+      info.has_crc = opt_.payload_crc;
       if (st[i].io_ok && !removed)
-        st[i].io_ok = WriteRecord(st[i].ref, items[i].key,
-                                  static_cast<uint32_t>(items[i].len),
-                                  /*valid=*/true);
+        st[i].io_ok = WriteRecord(st[i].ref, items[i].key, info.len,
+                                  /*valid=*/true, 0, 0, &info);
       const bool release_ok =
           ReleaseInflightLocked(items[i].key, st[i].fn);
       if (!st[i].io_ok || !release_ok || !Serving()) {
@@ -2394,8 +2424,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
         out[i] = Status::kIOError;
       } else {
         if (!removed) {
-          CommitPayloadLocked(items[i].key,
-                              static_cast<uint32_t>(items[i].len));
+          CommitPayloadLocked(items[i].key, info);
           new_put_bytes_since_tick_ += st[i].ref.slot_size;
         }
         out[i] = Status::kOk;
@@ -2424,7 +2453,9 @@ Status DiskSlabStore::RangeDirect(
     const std::string fn = key.Filename();
     SlabAllocator::SlotRef ref;
     uint32_t plen = 0;
-    if (!AcquireForRead(key, fn, &ref, &plen))
+    PayloadInfo info;
+    uint64_t generation = 0;
+    if (!AcquireForRead(key, fn, &ref, &plen, &info, &generation))
       return Serving() ? Status::kNotFound : Status::kIOError;
     Status st = Status::kOk;
     size_t got = 0, head = 0;
@@ -2457,6 +2488,11 @@ Status DiskSlabStore::RangeDirect(
       if (!ReleaseInflightLocked(key, fn)) st = Status::kIOError;
     }
     if (st != Status::kOk) return st;
+    if (offset == 0 && got == plen && info.has_crc &&
+        Crc32c(io_buf + head, got) != info.crc) {
+      DropCorrupt(key, ref, generation);
+      return Status::kNotFound;
+    }
     if (value_len) *value_len = plen;
     if (out_data) *out_data = io_buf + head;
     if (out_len) *out_len = got;
@@ -2479,7 +2515,9 @@ Status DiskSlabStore::RangeDirectPrep(const BlockKey& key, uint64_t offset,
   const std::string fn = key.Filename();
   SlabAllocator::SlotRef ref;
   uint32_t plen = 0;
-  if (!AcquireForRead(key, fn, &ref, &plen))
+  PayloadInfo info;
+  uint64_t generation = 0;
+  if (!AcquireForRead(key, fn, &ref, &plen, &info, &generation))
     return Serving() ? Status::kNotFound : Status::kIOError;
   auto bail = [&](Status status) {
     std::lock_guard<std::mutex> lk(mu_);
@@ -2523,6 +2561,12 @@ Status DiskSlabStore::RangeDirectPrep(const BlockKey& key, uint64_t offset,
   lease.head = head;
   lease.payload_len = static_cast<size_t>(n);
   lease.value_len = plen;
+  // The whole value: whoever reads it checks it before use (STO-15).
+  if (offset == 0 && n == plen && info.has_crc) {
+    const uint64_t where[2] = {(uint64_t(ref.extent) << 32) | ref.slot, ref.offset};
+    lease.SetVerifier(info.crc, key, generation, where,
+                      &DiskSlabStore::LeaseMismatchThunk);
+  }
   *out = std::move(lease);
   return Status::kOk;
 }
@@ -2547,8 +2591,8 @@ uint8_t DiskSlabStore::Retain(const BlockKey& key, uint32_t ttl_s,
   const SlabAllocator::RetainOutcome out =
       alloc_->Retain(key, ttl_s, retain_mode, now_s);
   if (out.persist &&
-      !WriteRecord(out.ref, key, it->second, /*valid=*/true, out.until,
-                   out.ttl_s)) {
+      !WriteRecord(out.ref, key, it->second.len, /*valid=*/true, out.until,
+                   out.ttl_s, &it->second)) {
     return static_cast<uint8_t>(Code::kMiss);
   }
   return static_cast<uint8_t>(out.code);
@@ -2568,13 +2612,20 @@ void DiskSlabStore::ReleaseReadLease(uint64_t token) noexcept {
 // concurrent Remove's durable invalidation before the slot becomes reusable.
 bool DiskSlabStore::AcquireForRead(const BlockKey& key, const std::string& fn,
                                    SlabAllocator::SlotRef* ref,
-                                   uint32_t* plen) {
+                                   uint32_t* plen, PayloadInfo* info,
+                                   uint64_t* generation) {
   if (!Serving()) return false;
   std::lock_guard<std::mutex> lk(mu_);
   auto it = payload_len_.find(key);
   if (it == payload_len_.end()) return false;  // in-flight write / removed: no commit
   if (!alloc_->GetAndPin(key, ref)) return false;
-  *plen = it->second;
+  *plen = it->second.len;
+  if (info) {
+    *info = it->second;
+    // Switched off: no read checks a CRC, whoever recorded it.
+    if (!opt_.payload_crc) info->has_crc = false;
+  }
+  if (generation) *generation = alloc_->Generation(key);
   inflight_[fn]++;
   return true;
 }
@@ -2603,6 +2654,44 @@ bool DiskSlabStore::ReleaseInflightLocked(const BlockKey& key,
   return release_ok;
 }
 
+namespace {
+bool SameSlot(const SlabAllocator::SlotRef& a, const SlabAllocator::SlotRef& b) {
+  return a.extent == b.extent && a.slot == b.slot && a.offset == b.offset;
+}
+}  // namespace
+
+// STO-15: the bytes read back do not match the CRC32C their PUT recorded
+// (damage on the disk or on the way, a torn or lost payload write, a record
+// that points at another value's bytes). The value is a miss from now on and
+// is removed as a REMOVE would remove it -- record invalidated first -- if
+// the key still lives in the slot that was read.
+void DiskSlabStore::DropCorrupt(const BlockKey& key,
+                                const SlabAllocator::SlotRef& read_ref,
+                                uint64_t generation) {
+  if (drop_corrupt_hook_for_test_) drop_corrupt_hook_for_test_();
+  std::lock_guard<std::mutex> lk(mu_);
+  SlabAllocator::SlotRef ref;
+  if (payload_len_.count(key) == 0 || !alloc_->Get(key, &ref) ||
+      !SameSlot(ref, read_ref) || alloc_->Generation(key) != generation)
+    return;
+  payload_crc_failures_.fetch_add(1, std::memory_order_relaxed);
+  DFKV_LOG_WARN("slab " + opt_.dir + ": payload checksum mismatch in extent " +
+                std::to_string(ref.extent) + " slot " + std::to_string(ref.slot) +
+                "; served as a miss and removed");
+  RemoveLocked(key, key.Filename());
+}
+
+void DiskSlabStore::LeaseMismatchThunk(void* owner, const BlockKey& key,
+                                       uint64_t generation,
+                                       const uint64_t* where) noexcept {
+  auto* store = static_cast<DiskSlabStore*>(owner);
+  SlabAllocator::SlotRef ref;
+  ref.extent = static_cast<uint32_t>(where[0] >> 32);
+  ref.slot = static_cast<uint32_t>(where[0]);
+  ref.offset = where[1];
+  store->DropCorrupt(key, ref, generation);
+}
+
 Status DiskSlabStore::Range(const BlockKey& key, uint64_t offset,
                             uint64_t length, std::string* out,
                             size_t* value_len) {
@@ -2610,9 +2699,12 @@ Status DiskSlabStore::Range(const BlockKey& key, uint64_t offset,
   const std::string fn = key.Filename();
   SlabAllocator::SlotRef ref;
   uint32_t plen = 0;
-  if (!AcquireForRead(key, fn, &ref, &plen))
+  PayloadInfo info;
+  uint64_t generation = 0;
+  if (!AcquireForRead(key, fn, &ref, &plen, &info, &generation))
     return Serving() ? Status::kNotFound : Status::kIOError;
   Status st = Status::kOk;
+  bool corrupt = false;
   if (offset > plen) {
     st = Status::kInvalid;
     out->clear();
@@ -2625,9 +2717,19 @@ Status DiskSlabStore::Range(const BlockKey& key, uint64_t offset,
     if (n && !PreadAll(extent_fds_[ref.extent], &(*out)[0], static_cast<size_t>(n),
                        ref.offset + offset))
       st = Status::kIOError;
+    // A whole value is checked; a slice cannot be.
+    else if (offset == 0 && n == plen && info.has_crc)
+      corrupt = Crc32c(out->data(), out->size()) != info.crc;
   }
-  std::lock_guard<std::mutex> lk(mu_);
-  if (!ReleaseInflightLocked(key, fn)) st = Status::kIOError;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!ReleaseInflightLocked(key, fn)) st = Status::kIOError;
+  }
+  if (st == Status::kOk && corrupt) {
+    out->clear();
+    DropCorrupt(key, ref, generation);
+    return Status::kNotFound;
+  }
   if (st == Status::kOk && value_len) *value_len = plen;
   return st;
 }
@@ -2640,7 +2742,9 @@ Status DiskSlabStore::RangeInto(const BlockKey& key, uint64_t offset,
   const std::string fn = key.Filename();
   SlabAllocator::SlotRef ref;
   uint32_t plen = 0;
-  if (!AcquireForRead(key, fn, &ref, &plen))
+  PayloadInfo info;
+  uint64_t generation = 0;
+  if (!AcquireForRead(key, fn, &ref, &plen, &info, &generation))
     return Serving() ? Status::kNotFound : Status::kIOError;
   Status st = Status::kOk;
   size_t got = 0;
@@ -2656,6 +2760,11 @@ Status DiskSlabStore::RangeInto(const BlockKey& key, uint64_t offset,
   {
     std::lock_guard<std::mutex> lk(mu_);
     if (!ReleaseInflightLocked(key, fn)) st = Status::kIOError;
+  }
+  if (st == Status::kOk && offset == 0 && got == plen && info.has_crc &&
+      Crc32c(dst, got) != info.crc) {
+    DropCorrupt(key, ref, generation);
+    return Status::kNotFound;
   }
   if (st == Status::kOk && out_len) *out_len = got;
   if (st == Status::kOk && value_len) *value_len = plen;
@@ -2675,7 +2784,7 @@ Status DiskSlabStore::Lookup(const BlockKey& key, ValueMetadata* out) const {
   std::lock_guard<std::mutex> lk(mu_);
   auto it = payload_len_.find(key);
   if (it == payload_len_.end()) return Status::kNotFound;
-  out->value_len = it->second;
+  out->value_len = it->second.len;
   out->generation = alloc_->Generation(key);
   return Status::kOk;
 }
@@ -2685,6 +2794,10 @@ Status DiskSlabStore::Remove(const BlockKey& key) {
   if (!Serving()) return Status::kIOError;
   const std::string fn = key.Filename();
   std::lock_guard<std::mutex> lk(mu_);
+  return RemoveLocked(key, fn);
+}
+
+Status DiskSlabStore::RemoveLocked(const BlockKey& key, const std::string& fn) {
   SlabAllocator::SlotRef ref;
   if (!alloc_->Get(key, &ref)) return Status::kNotFound;
   if (inflight_.count(fn)) {
@@ -2905,6 +3018,7 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
       dio_read_fallbacks_.load(std::memory_order_relaxed);
   st.table_syncs = table_syncs_.load(std::memory_order_relaxed);
   st.bind_wipes = bind_wipes_.load(std::memory_order_relaxed);
+  st.payload_crc_failures = payload_crc_failures_.load(std::memory_order_relaxed);
   st.metadata_io_errors =
       metadata_io_errors_.load(std::memory_order_relaxed);
   st.unclean_resets = unclean_resets_.load(std::memory_order_relaxed);
