@@ -206,14 +206,17 @@ class RamTier {
     // one batch share it. Keep it below the clients' operation timeout: a
     // client that times out first treats the node as failed. 0 = no limit.
     uint32_t put_wait_ms = 3000;
-    // Optional backing-index check for a key without a RAM owner. Invoked
-    // under its RAM shard lock; must be metadata-only and must not reenter RAM.
+    // Optional backing-index check for a key without a RAM owner, and for a
+    // written RAM copy of a PUT's key. Invoked before the RAM shard lock (it
+    // may wait for the disk store's lock); must be metadata-only and must not
+    // reenter RAM.
     // An existing disk value is authoritative after RAM eviction.
     std::function<bool(const BlockKey&)> is_persisted;
     // The generation of the value the disk holds for a key (ValueMetadata),
     // 0 if it holds none. A promotion is installed only if this still equals
     // the generation its read was given: the disk has neither lost the key
-    // nor taken a new value of it since. Same calling rules as is_persisted.
+    // nor taken a new value of it since. Invoked under the key's RAM shard
+    // lock; metadata-only, and must not reenter RAM.
     std::function<uint64_t(const BlockKey&)> disk_generation;
     // Asked while the arena is being faulted in (once per 2 MiB and thread):
     // true gives the start up. The constructor then returns without the

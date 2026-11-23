@@ -2803,3 +2803,45 @@ TEST(RamTier, AHungDiskOnlyBackpressuresItsOwnKeys) {
   ASSERT_TRUE(WaitFor([&] { return rt.FlushBacklog() == 0; }));
   EXPECT_GT(admitted, 0u);
 }
+
+// A slow backing-index check (the disk store's lock held across a slow
+// metadata write) must not stall the RAM hits of the shard it is asked for.
+TEST(RamTier, ASlowPersistedCheckDoesNotStallRamHits) {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool open = false;
+  std::atomic<bool> checking{false};
+  RamTier::Options o = Opts(256 * 4096);
+  o.is_persisted = [&](const BlockKey& key) {
+    if (key.digest_hi != 999) return false;
+    checking = true;
+    std::unique_lock<std::mutex> lock(mu);
+    cv.wait_for(lock, std::chrono::milliseconds(300), [&] { return open; });
+    return false;
+  };
+  FlushSink sink;
+  RamTier rt(o, sink.fn());
+  ASSERT_TRUE(rt.ok());
+  const std::string v(4000, 'h');
+  ASSERT_TRUE(rt.Put(K(1), v.data(), v.size()));
+  std::thread put([&] { rt.Put(K(999), v.data(), v.size()); });
+  while (!checking.load()) std::this_thread::sleep_for(1ms);
+  double worst_ms = 0;
+  for (int i = 0; i < 20; ++i) {
+    const auto t0 = std::chrono::steady_clock::now();
+    RamTier::Hit h;
+    ASSERT_TRUE(rt.GetPrep(K(1), 0, v.size(), &h));
+    worst_ms = std::max(worst_ms, std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - t0)
+                                      .count());
+  }
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    open = true;
+  }
+  cv.notify_all();
+  put.join();
+  std::printf("[ timing ] slowest RAM hit during a slow check: %.3f ms\n",
+              worst_ms);
+  EXPECT_LT(worst_ms, 50.0) << "RAM hits waited for the disk index check";
+}

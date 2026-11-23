@@ -784,6 +784,12 @@ RamTier::Admission RamTier::Admit(
   if (!arena_ || len == 0 || data == nullptr) return Admission::kBypass;
   uint64_t requested_cap = 0;
   const uint32_t lane = LaneOf(key);  // outside the shard lock
+  // Asked before the shard lock: the disk store's check takes the store's
+  // lock, which a slow metadata write can hold, and every RAM hit of this
+  // shard would wait behind it. The PUT takes effect at this check: a
+  // REMOVE of the key that completes before the lock below orders after it,
+  // as it would after the lock is released.
+  const bool persisted = opt_.is_persisted && opt_.is_persisted(key);
 
   Shard& s = ShardFor(key);
   std::shared_ptr<PutCompletion> completion;
@@ -802,8 +808,7 @@ RamTier::Admission RamTier::Admit(
       // or the key was removed from the disk alone): this PUT is not a
       // duplicate of a stored value. The stale copy goes, and the PUT goes
       // to the disk like any new key there.
-      if (existing->second.durable && opt_.is_persisted &&
-          !opt_.is_persisted(key)) {
+      if (existing->second.durable && opt_.is_persisted && !persisted) {
         existing->second.remove_pending = true;
         existing->second.stale = true;
         DropLocked(s, key);
@@ -825,8 +830,7 @@ RamTier::Admission RamTier::Admit(
       if (out_completion) *out_completion = writing->second;
       return Admission::kDuplicate;
     }
-    if (opt_.is_persisted && opt_.is_persisted(key))
-      return Admission::kPersisted;
+    if (persisted) return Admission::kPersisted;
     if (client_ack && opt_.ack_high_watermark_pct != 0) {
       const uint64_t high =
           opt_.bytes * std::min<uint32_t>(opt_.ack_high_watermark_pct, 100) / 100;
