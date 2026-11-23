@@ -34,6 +34,13 @@ class MdsRegistrar {
   // lease, lease grant, Put). Leave one second for TCP framing/scheduling so
   // a valid slow MDS operation cannot self-timeout.
   static constexpr int kDefaultIoTimeoutMs = 9000;
+  // A connect that has not completed in this long goes to the next MDS: on a
+  // host that drops packets it would otherwise take the whole I/O timeout.
+  static constexpr int kConnectTimeoutMs = 2000;
+  // How long a failed MDS is passed over. The registrar stays on one MDS
+  // while it answers; on a failure it tries the others at once, in the same
+  // heartbeat, and comes back to the failed one only after this.
+  static constexpr uint64_t kEndpointBackoffMs = 30000;
   // first_registration_timeout_ms == 0 preserves an unbounded registration
   // loop for non-daemon consumers. Cache-node startup supplies its mandatory,
   // bounded deadline and exits fail-closed when it expires.
@@ -93,6 +100,8 @@ class MdsRegistrar {
 
  private:
   bool SendOnce(uint8_t op, int io_timeout_ms, uint64_t deadline_ms);
+  bool SendTo(const std::string& ep, uint8_t op, int io_timeout_ms,
+              uint64_t deadline_ms);
   bool RegisterOnceBefore(int io_timeout_ms, uint64_t deadline_ms);
   void MarkFirstRegistrationTimedOut();
   void ReportHeartbeatResult(bool ok);

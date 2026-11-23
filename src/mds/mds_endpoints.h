@@ -13,10 +13,16 @@ namespace dfkv {
 // any reachable MDS is correct (see design doc decision 3). The clock is
 // injected (now_ms) so the policy is unit-testable without real time; callers
 // pass a monotonic millisecond clock at runtime.
+//
+// Sticky selection (the registrar): Pick keeps returning the endpoint it
+// returned last until that one is marked failed, so one MDS keeps seeing a
+// member's heartbeats; only then does it move on.
 class MdsEndpoints {
  public:
-  explicit MdsEndpoints(std::vector<std::string> eps, uint64_t backoff_ms = 2000)
-      : eps_(std::move(eps)), backoff_ms_(backoff_ms), until_(eps_.size(), 0) {}
+  explicit MdsEndpoints(std::vector<std::string> eps, uint64_t backoff_ms = 2000,
+                        bool sticky = false)
+      : eps_(std::move(eps)), backoff_ms_(backoff_ms), sticky_(sticky),
+        until_(eps_.size(), 0) {}
 
   size_t size() const { return eps_.size(); }
 
@@ -37,18 +43,29 @@ class MdsEndpoints {
     for (size_t i = 0; i < eps_.size(); ++i) {
       size_t idx = (cursor_ + i) % eps_.size();
       if (until_[idx] <= now_ms) {
-        cursor_ = (idx + 1) % eps_.size();
+        cursor_ = sticky_ ? idx : (idx + 1) % eps_.size();
         return eps_[idx];
       }
       if (until_[idx] < best_until) { best_until = until_[idx]; best = idx; }
     }
-    cursor_ = (best + 1) % eps_.size();
+    cursor_ = sticky_ ? best : (best + 1) % eps_.size();
     return eps_[best];
+  }
+
+  // Sticky: where the first Pick starts. Registrars seed it from their member
+  // id, so that members spread over the MDS instead of all starting on the
+  // first one and failing over together.
+  void SeedCursor(uint64_t seed) {
+    if (!eps_.empty()) cursor_ = static_cast<size_t>(seed % eps_.size());
   }
 
   void MarkFailed(const std::string& ep, uint64_t now_ms) {
     for (size_t i = 0; i < eps_.size(); ++i)
-      if (eps_[i] == ep) until_[i] = now_ms + backoff_ms_;
+      if (eps_[i] == ep) {
+        until_[i] = now_ms + backoff_ms_;
+        // Sticky: the next Pick starts after the failed endpoint.
+        if (sticky_ && i == cursor_) cursor_ = (i + 1) % eps_.size();
+      }
   }
 
   void MarkOk(const std::string& ep) {
@@ -59,6 +76,7 @@ class MdsEndpoints {
  private:
   std::vector<std::string> eps_;
   uint64_t backoff_ms_;
+  bool sticky_;
   std::vector<uint64_t> until_;  // backoff-until (ms) per endpoint; 0 = eligible
   size_t cursor_ = 0;
 };
