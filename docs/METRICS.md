@@ -233,6 +233,7 @@ RDMA-listener scrape inventory。
 | `dfkv_rdma_v2_ready` | gauge | 初始 receive chunk 与 rail anchor 是否就绪 |
 | `dfkv_rdma_segment_evictions_total` / `dfkv_rdma_idle_reclaims_total` | counter | hard budget 压力淘汰 / idle timeout 回收连接 |
 | `dfkv_rdma_unstaged_misses_total` | counter | 不分配 staging、直接回 kNotFound 的 GET（先查索引确认不存在）；以前 miss 也先租一段 staging，pool 紧张时还要等内存或驱逐别的连接 |
+| `dfkv_rdma_pressure_unsatisfiable_total` | counter | receive pool 不足时没有驱逐任何连接就放弃的请求：没有一条空闲连接的租约释放后能放下它（不同 rail 的 chunk、释放后连同相邻空闲区间也不够大），或请求本身超过整个预算 |
 | `dfkv_rdma_stop_drains_cut_total` | counter | 停止时 `DFKV_RDMA_STOP_DRAIN_MS` 到期、仍有连接持有授权而被关掉的次数 |
 | `dfkv_rdma_stop_grants_refused_total` | counter | 停止排空期间拒绝的新授权：GET 答 miss、leased PUT 答 `kCacheFull` |
 | `dfkv_rdma_grant_expiries_total` | counter | 持有授权（GET 的 READY、PUT 租约、多窗口 PUT 的下一窗）而静默超过 `DFKV_RDMA_GRANT_TIMEOUT_MS` 被关掉的连接；增长 = client 崩溃或超时放弃，日志里有对端地址 |

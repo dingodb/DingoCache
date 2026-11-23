@@ -201,6 +201,11 @@ class RdmaServer {
              std::chrono::steady_clock::time_point bootstrap_deadline,
              std::atomic<uint64_t>* pending = nullptr);
   void ReapDoneLocked();  // join+erase finished Serve threads; conn_mu_ held
+  // The idle connections whose leases to give up so that `bytes` fits for
+  // a request on `rail` (rdma::PlanPressureVictims); empty if no set of them
+  // would make room. conn_mu_ held.
+  std::vector<rdma::RcEndpoint*> PlanPressureVictimsLocked(size_t bytes,
+                                                           int rail);
   rdma::RecvSegmentPool::Lease AllocateReceiveWithPressure(
       size_t bytes, int rail, int numa_node, uint64_t wait_us,
       rdma::RecvSegmentPool::LeaseClass lease_class =
@@ -281,6 +286,13 @@ class RdmaServer {
   struct LiveEndpoint {
     std::atomic<bool>* reclaimable;
     size_t recv_lease_bytes;
+    // Where its receive lease lies, for pressure reclaim: the range evicting
+    // it would free (PlanPressureVictimsLocked).
+    const rdma::RecvSegment* lease_segment;
+    size_t lease_offset;
+    // Set at its first completion. A connection that never got one is not
+    // quiescent (its first request may be in flight), until kNeverServedUs.
+    std::atomic<bool>* served_any;
     // The connection holds a grant its client has yet to use or release:
     // Quiesce lets it finish (DFKV_RDMA_STOP_DRAIN_MS) before waking it.
     std::atomic<bool>* holding_grants;
@@ -303,6 +315,10 @@ class RdmaServer {
   std::atomic<uint64_t> segment_evictions_{0};
   // GETs answered kNotFound by lookup_handler_ before any staging lease.
   std::atomic<uint64_t> unstaged_misses_{0};
+  // Pressure reclaims given up without evicting: no idle connection whose
+  // lease would make room for the request, or a request the budget can
+  // never hold.
+  std::atomic<uint64_t> pressure_unsatisfiable_{0};
   size_t recv_segment_max_bytes_ = 0;
   size_t recv_segment_chunk_bytes_ = 0;
   uint64_t recv_chunk_idle_ms_ = 60000;

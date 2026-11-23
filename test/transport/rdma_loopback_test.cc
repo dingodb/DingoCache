@@ -157,6 +157,18 @@ class RdmaServerTestPeer {
       RdmaServer& server, std::function<void(size_t)> hook) {
     server.after_request_rearm_for_test_ = std::move(hook);
   }
+  // Ages every connection, quiescent or not: what a connection that never
+  // sent a request looks like after age_ms.
+  static size_t AgeAllConnections(RdmaServer& server, uint64_t age_ms) {
+    const uint64_t now = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    std::lock_guard<std::mutex> lock(server.conn_mu_);
+    for (const auto& [ep, live] : server.live_eps_)
+      ep->last_active_us_.store(now - age_ms * 1000,
+                                std::memory_order_relaxed);
+    return server.live_eps_.size();
+  }
   static size_t RefreshQuiescentActivity(RdmaServer& server,
                                          uint64_t age_ms = 0) {
     // Shift only the activity timestamps of real, completed QPs. The 1.5 s
@@ -2507,7 +2519,8 @@ struct PinnedPullPeer {
   rdma::RcEndpoint& ep = *endpoint;
   void Close() { endpoint.reset(); }
   template <typename Node>
-  bool Open(const Node& node, size_t depth = 1, bool legacy = false) {
+  bool Open(const Node& node, size_t depth = 1, bool legacy = false,
+            uint64_t declared = kMaxMsg) {
     const auto& dev = node.rsrv->DeviceNames().front();
     if (!ep.Open(dev.c_str(), rdma::kV2ControlCap, depth)) return false;
     int fd = net::Dial(node.addr, 10000, 10000);
@@ -2516,7 +2529,7 @@ struct PinnedPullPeer {
         remote[rdma::kQpInfoBytes], ready[rdma::kV2RetirementReadinessBytes];
     const size_t readiness_bytes = legacy ? sizeof(ready) :
         rdma::kV2DynamicOnlyReadinessBytes;
-    rdma::EncodeDevFrame(dev, kMaxMsg |
+    rdma::EncodeDevFrame(dev, declared |
         (legacy ? rdma::kDevFrameRequestWriterRetirement :
                   rdma::kDevFrameRequestDynamicOnly) |
         rdma::kDevFrameRequestPullRead | rdma::kDevFrameRequestDynamicPull,
@@ -3280,6 +3293,146 @@ void ExerciseMissNeedsNoStaging(bool use_uring) {
 
 TEST(RdmaLoopback, AMissNeedsNoStagingSync) { ExerciseMissNeedsNoStaging(false); }
 TEST(RdmaLoopback, AMissNeedsNoStagingUring) { ExerciseMissNeedsNoStaging(true); }
+
+// RDS-07: pressure reclaim evicts only a connection whose lease, once freed,
+// makes room for the request. A small idle control connection between two
+// busy ones cannot: evicting it made no room, cost its client the
+// connection, and the request still failed after the 1 s wait.
+TEST(RdmaLoopback, PressureEvictsNobodyWhoseLeaseCannotHelp) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "0");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "1");
+  ScopedEnv idle("DFKV_RDMA_IDLE_MS", "5000");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const size_t budget = 2 * rdma::V2SlotSize(kMaxMsg);
+  const std::string budget_text = std::to_string(budget);
+  ScopedEnv segment("DFKV_RDMA_RECV_SEGMENT_SIZE", budget_text.c_str());
+  ScopedEnv chunk("DFKV_RDMA_RECV_CHUNK_BYTES", budget_text.c_str());
+  RdmaNode node("pressure-useless-victim");
+  // Staging for this value does not fit in what is left, and the small
+  // connection's lease, even freed, is far too small for it.
+  const std::string value(200 * 1024, 'v');
+  const BlockKey key{90301, 1};
+  std::string ignored;
+  ASSERT_EQ(node.srv->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
+                value.data(), value.size(), &ignored), Status::kOk);
+  PinnedPullPeer requester, small, filler;
+  ASSERT_TRUE(requester.Open(node));
+  ASSERT_TRUE(small.Open(node, 1, false, 4096));
+  ASSERT_TRUE(filler.Open(node, 1, false, 64 * 1024));
+  ASSERT_TRUE(PinnedExists(small, key));
+  ASSERT_TRUE(PinnedExists(filler, key));
+  size_t quiescent = 0;  // small and filler; the requester has sent nothing
+  for (int i = 0; i < 1000 && quiescent < 2; ++i) {
+    quiescent = RdmaServerTestPeer::RefreshQuiescentActivity(*node.rsrv, 1500);
+    if (quiescent < 2) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_EQ(quiescent, 2u);
+  ASSERT_TRUE(PinnedExists(filler, key));  // filler is busy again
+  std::vector<Status> statuses;
+  const auto started = std::chrono::steady_clock::now();
+  ASSERT_TRUE(requester.Pipeline(
+      {requester.EncodePull(0, key, 0, value.size(), 0)}, &statuses));
+  const double elapsed_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - started).count();
+  EXPECT_EQ(statuses[0], Status::kCacheFull);
+  const std::string metrics = node.rsrv->MetricsText();
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_segment_evictions_total"), 0)
+      << "evicted a connection whose lease could not make room";
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_pressure_unsatisfiable_total"), 1);
+  EXPECT_LT(elapsed_ms, 500.0) << "waited for an eviction that cannot help";
+  EXPECT_TRUE(PinnedExists(small, key)) << "the small connection was lost";
+  EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
+}
+
+// RDS-07: room that takes two idle leases. Two adjacent idle connections,
+// each lease smaller than the request's staging and both together large
+// enough: evicting the pair makes room. Picking one victim at a time, a
+// victim had to make room alone, so the request failed with nothing
+// evicted until both connections hit the idle timeout.
+TEST(RdmaLoopback, PressureEvictsARunOfIdleLeasesTogether) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "0");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "1");
+  ScopedEnv idle("DFKV_RDMA_IDLE_MS", "60000");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const size_t half = rdma::V2SlotSize(128 * 1024);
+  const size_t budget = rdma::V2SlotSize(kMaxMsg) + 2 * half;
+  const std::string budget_text = std::to_string(budget);
+  ScopedEnv segment("DFKV_RDMA_RECV_SEGMENT_SIZE", budget_text.c_str());
+  ScopedEnv chunk("DFKV_RDMA_RECV_CHUNK_BYTES", budget_text.c_str());
+  RdmaNode node("pressure-run");
+  const std::string value(200 * 1024, 'r');
+  ASSERT_GT(rdma::V2SlotSize(value.size()), half);
+  ASSERT_LE(rdma::V2SlotSize(value.size()), 2 * half);
+  const BlockKey key{90303, 1};
+  std::string ignored;
+  ASSERT_EQ(node.srv->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
+                value.data(), value.size(), &ignored), Status::kOk);
+  PinnedPullPeer requester, first, second;
+  ASSERT_TRUE(requester.Open(node));
+  ASSERT_TRUE(first.Open(node, 1, false, 128 * 1024));
+  ASSERT_TRUE(second.Open(node, 1, false, 128 * 1024));
+  ASSERT_TRUE(PinnedExists(first, key));
+  ASSERT_TRUE(PinnedExists(second, key));
+  ASSERT_TRUE(PinnedExists(requester, key));
+  size_t quiescent = 0;
+  for (int i = 0; i < 1000 && quiescent < 3; ++i) {
+    quiescent = RdmaServerTestPeer::RefreshQuiescentActivity(*node.rsrv, 1500);
+    if (quiescent < 3) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_EQ(quiescent, 3u);
+  rdma::DynamicPullReady ready;
+  ASSERT_TRUE(requester.Prepare(key, 0, value.size(), &ready))
+      << "the two idle leases were not given up together";
+  const std::string metrics = node.rsrv->MetricsText();
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_segment_evictions_total"), 2);
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_pressure_unsatisfiable_total"), 0);
+  std::string bytes;
+  ASSERT_TRUE(requester.Read(ready, &bytes));
+  EXPECT_EQ(bytes, value);
+  EXPECT_TRUE(requester.Release(key, ready));
+  EXPECT_EQ(node.rsrv->CompletionErrors(), 0u);
+}
+
+// RDS-07: a connection that never sent a request was never quiescent, so
+// pressure reclaim could not touch it however long ago its client gave up.
+// After 10 s without a first request it may be evicted.
+TEST(RdmaLoopback, PressureEvictsAConnectionThatNeverSentARequest) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv uring("DFKV_SERVER_URING", "0");
+  ScopedEnv depth("DFKV_RDMA_DEPTH", "1");
+  ScopedEnv idle("DFKV_RDMA_IDLE_MS", "60000");
+  ScopedEnv ram("DFKV_RAM_TIER", "0");
+  const std::string budget = std::to_string(2 * rdma::V2SlotSize(kMaxMsg));
+  ScopedEnv segment("DFKV_RDMA_RECV_SEGMENT_SIZE", budget.c_str());
+  RdmaNode node("pressure-never-served");
+  const std::string value(4096, 'n');
+  const BlockKey key{90302, 1};
+  std::string ignored;
+  ASSERT_EQ(node.srv->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
+                value.data(), value.size(), &ignored), Status::kOk);
+  PinnedPullPeer abandoned, requester;
+  ASSERT_TRUE(abandoned.Open(node));  // and never a request
+  ASSERT_TRUE(requester.Open(node));
+  ASSERT_TRUE(PinnedExists(requester, key));
+  ASSERT_EQ(RdmaServerTestPeer::AgeAllConnections(*node.rsrv, 11000), 2u);
+  ASSERT_TRUE(PinnedExists(requester, key));
+  rdma::DynamicPullReady ready;
+  EXPECT_TRUE(requester.Prepare(key, 0, value.size(), &ready))
+      << "the abandoned connection's lease was not reclaimed";
+  EXPECT_EQ(CounterVal(node.rsrv->MetricsText(),
+                       "dfkv_rdma_segment_evictions_total"), 1);
+  std::string bytes;
+  if (ready.data_len != 0) {
+    ASSERT_TRUE(requester.Read(ready, &bytes));
+    EXPECT_EQ(bytes, value);
+    EXPECT_TRUE(requester.Release(key, ready));
+  }
+}
 
 void ExercisePressureRefusesOnlyBusyQps(bool use_uring) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
