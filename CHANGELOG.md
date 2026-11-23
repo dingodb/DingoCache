@@ -3,6 +3,15 @@
 ## Unreleased
 
 
+- Client, host dedup: a key is handed to the processes waiting for it as
+  soon as it has arrived, not when the fetching process's whole batch has.
+  A waiter's budget (`DFKV_NODE_DEDUP_WAIT_MS`, 500 ms) covers one batch; a
+  fetch whose last part was slow cost the waiters every key, which they then
+  read themselves. In a test where the fetching process has half of 16 keys
+  and hangs on the rest, the waiter used to wait out its budget and fetch
+  all 16; now it copies 8 and fetches 8. GPU dedup is unchanged: its
+  publication waits for one load fence per batch.
+
 - Client, per-key cost. Every key's identity hashed the namespace again (a
   canonical namespace is about 175 bytes, two of the six SHA-256 blocks of a
   vLLM key) and recomputed the tenant hash; the client now hashes the

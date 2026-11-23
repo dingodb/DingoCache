@@ -9,6 +9,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -263,10 +264,16 @@ class KVClient {
                                              size_t size) const;
 
   // Plain batch bodies; public methods own the one metric record across direct
-  // and rendezvous paths.
-  std::vector<bool> BatchGetDirect(const std::vector<KvGetItem>& items);
-  std::vector<bool> BatchGetAutoDirect(const std::vector<KvGetItem>& items,
-                                       std::vector<size_t>* out_lens);
+  // and rendezvous paths. on_hit(i), when given, runs as soon as item i is a
+  // final hit (its destination holds the value, and the auto form's
+  // *out_lens entry is not yet written: the length is passed), possibly on a
+  // worker thread and concurrently for other items.
+  std::vector<bool> BatchGetDirect(
+      const std::vector<KvGetItem>& items,
+      const std::function<void(size_t)>& on_hit = nullptr);
+  std::vector<bool> BatchGetAutoDirect(
+      const std::vector<KvGetItem>& items, std::vector<size_t>* out_lens,
+      const std::function<void(size_t, size_t)>& on_hit = nullptr);
   std::vector<bool> BatchGetAutoSgDirect(const std::vector<KvGetItemSg>& items,
                                          std::vector<size_t>* out_lens);
   std::vector<bool> BatchExistDirect(const std::vector<std::string>& keys,
