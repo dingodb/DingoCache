@@ -333,9 +333,6 @@ class RcEndpoint {
   size_t num_qp() const { return num_qp_; }
   // The QP's access flags as the device reports them; -1 if it cannot say.
   int QpAccessFlags() const;
-  // #1: Start a background CQ reaper that polls ibv_poll_cq in a tight
-  // loop and fills per-slot atomic flags. Eliminates CQ channel
-  // syscall and CQ contention at high thread counts.
 
  private:
   int ObserveCompletions(ibv_wc* out, int got);

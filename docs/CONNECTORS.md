@@ -268,8 +268,8 @@ capability；HCA `max_sge` 低于 dfkv 上限时会缩小宽度，高于上限�
 
 当前 native TCP 与 RDMA 使用不同的显式 epoch：
 - **TCP**：epoch 6，50-byte request prefix。
-- **RDMA transport v2**：epoch 7；GET request 在相同 50-byte prefix 后携带
-  目标 MR，payload 走 one-sided WRITE。
+- **RDMA transport v2**：epoch 8；PUT 用 `WRITE_WITH_IMM` 写进 server 的
+  receive slot 或租约，GET 由 client 按 server 给的授权 `RDMA_READ`。
 
 两种 prefix 都携带 64-bit tenant hash + 128-bit object digest。旧 epoch 直接
 拒绝而不解码；client/server 必须按 [DEPLOY.md](DEPLOY.md) §4e 的隔离 ring
@@ -1866,7 +1866,7 @@ tenant_id（如 `prod-chat`、`prod-coder`、`dev-ab`），可以同时拿到
 1. **布局变化必须 bump 显式 revision**：dtype、量化、层数、TP/PCP/DCP/PP 维度任一
 变化都改变 layout。`model_revision`（connector 级）或 connector 内部
 source-controlled layout ID 必须同步更新；dfkv 本身不保存 header。
-2. **v2 与 v1.x 不能混 wire**：v2 client/server 只收 epoch 6/7 frame，v1.40 前的
+2. **v2 与 v1.x 不能混 wire**：v2 client/server 只收 epoch 6（TCP）/8（RDMA）frame，v1.40 前的
 frame 会被 fast-reject（`wire.h:92-108`）。混合代际升级走 MDS 双协议
 （DFKV_MDS_ACCEPT_LEGACY）的受控迁移，不允许双写数据面。
 3. **operator 自定义 namespace 别名被拒**（03d7035）：v2.0.0 起 connector 只接受

@@ -1764,8 +1764,6 @@ void RdmaServer::Serve(
       // A broad chunk rkey survives operation completion and authorizes stale
       // WRITEs into recycled ranges. An exact, uncached MR grants only this
       // lease; synchronous deregistration revokes it before pool reuse/trim.
-      // The setup-only MW helper cannot be used here: it consumes CQEs that
-      // belong to other pipelined requests.
       state.mr = ep.RegisterLeaseWriteRegion(state.lease.data(),
                                             state.lease.size());
       if (!state.mr) {

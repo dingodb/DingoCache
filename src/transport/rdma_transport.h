@@ -612,7 +612,6 @@ class RdmaTransport : public Transport {
   // the counters above, which operations update, keep their layout.
   LogThrottle completion_error_log_;
   LogThrottle local_resource_log_;  // keyed by what failed and its errno
-  // #1: async CQ reaper for high-concurrency batch operations
 };
 
 }  // namespace dfkv
