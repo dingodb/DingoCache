@@ -710,6 +710,15 @@
   different engines, the retention metrics sum the disks that keep
   retention.
 
+- Server, storage, log-structured engine (experimental): several open
+  segments (`DFKV_LSE_OPEN_SEGMENTS`, default one per 32 segments, at most
+  four; a PUT goes to the fullest one it fits in), RAM-tier flush batches
+  written back to back with one write per segment, and whole-value reads
+  prepared for RDMA checked against the stored checksum before anything
+  uses the bytes: a mismatch is a miss for the client, the coalesced
+  readers and the RAM tier, and the engine stops serving that copy. Slab
+  reads are unchanged.
+
 ## 2.42.0 — 2026-11-23
 
 - Client, RDMA: the rail name a scatter-gather batch read reports (the

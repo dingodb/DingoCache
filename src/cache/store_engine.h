@@ -21,6 +21,7 @@
 #include "cache/retention_stats.h"
 #include "common/kv_types.h"
 #include "common/status.h"
+#include "utils/crc32c.h"
 
 namespace dfkv {
 
@@ -53,6 +54,18 @@ class ReadLease {
 
   int fd() const noexcept { return fd_; }
 
+  // A whole-value read an engine can check (the log engine's, design §5.3):
+  // called with the payload once it is in memory and before anything uses
+  // it. False on a checksum mismatch, which the engine then records (the
+  // value is a miss from now on). Always true for leases without a check.
+  bool Verify(const char* payload) noexcept {
+    if (mismatch_ == nullptr || payload == nullptr) return true;
+    if (Crc32c(payload, payload_len) == verify_crc_) return true;
+    std::exchange(mismatch_, nullptr)(owner_, verify_key_, verify_generation_,
+                                      verify_where_);
+    return false;
+  }
+
   uint64_t aligned_off = 0;
   size_t aligned_len = 0;
   size_t head = 0;
@@ -64,6 +77,19 @@ class ReadLease {
   friend class KVStore;
   friend class LogStore;
   using ReleaseFn = void (*)(void* owner, uint64_t token) noexcept;
+  // `where`: the engine's own name for the copy the lease reads (the log
+  // engine's location), so that a mismatch drops only that copy.
+  using MismatchFn = void (*)(void* owner, const BlockKey& key,
+                              uint64_t generation, const uint64_t* where) noexcept;
+  void SetVerifier(uint32_t crc, const BlockKey& key, uint64_t generation,
+                   const uint64_t where[2], MismatchFn mismatch) noexcept {
+    verify_crc_ = crc;
+    verify_key_ = key;
+    verify_generation_ = generation;
+    verify_where_[0] = where[0];
+    verify_where_[1] = where[1];
+    mismatch_ = mismatch;
+  }
   static ReadLease Adopt(int fd, void* owner = nullptr, uint64_t token = 0,
                          ReleaseFn release = nullptr) noexcept {
     ReadLease lease;
@@ -79,6 +105,7 @@ class ReadLease {
     ReleaseFn release = std::exchange(release_, nullptr);
     void* owner = std::exchange(owner_, nullptr);
     const uint64_t token = std::exchange(token_, 0);
+    mismatch_ = nullptr;
     if (fd >= 0) ::close(fd);
     if (release != nullptr) release(owner, token);
   }
@@ -87,6 +114,12 @@ class ReadLease {
     owner_ = std::exchange(other.owner_, nullptr);
     token_ = std::exchange(other.token_, 0);
     release_ = std::exchange(other.release_, nullptr);
+    mismatch_ = std::exchange(other.mismatch_, nullptr);
+    verify_crc_ = other.verify_crc_;
+    verify_key_ = other.verify_key_;
+    verify_generation_ = other.verify_generation_;
+    verify_where_[0] = other.verify_where_[0];
+    verify_where_[1] = other.verify_where_[1];
     aligned_off = other.aligned_off;
     aligned_len = other.aligned_len;
     head = other.head;
@@ -103,6 +136,11 @@ class ReadLease {
   void* owner_ = nullptr;
   uint64_t token_ = 0;
   ReleaseFn release_ = nullptr;
+  MismatchFn mismatch_ = nullptr;
+  uint32_t verify_crc_ = 0;
+  BlockKey verify_key_{};
+  uint64_t verify_generation_ = 0;
+  uint64_t verify_where_[2] = {0, 0};
 };
 
 // One prepared transport read and its complete terminal lifecycle. The owner is
@@ -137,6 +175,10 @@ class PreparedRead {
   size_t staging_cap() const noexcept { return staging_cap_; }
   const char* data() const noexcept { return data_; }
   bool source_registered() const noexcept { return source_registered_; }
+  // Checks a completed storage read's bytes where the engine can (see
+  // ReadLease::Verify); false means the read is a miss. Call it before
+  // Commit and before the bytes are used or published.
+  bool Verify() noexcept { return !active_ || lease_.Verify(data_); }
   // Copy a registered source into the owned destination staging when the
   // connection cannot resolve its pool MR. The transaction and its pin remain
   bool Stage() noexcept {

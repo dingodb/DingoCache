@@ -23,6 +23,7 @@
 #include "../client/scripted_topology_mds.h"
 #include "../utils/fd_exhaustion.h"
 
+#include <fcntl.h>
 #include <gtest/gtest.h>
 #include <poll.h>
 #include <sys/mman.h>  // shm_unlink (node-dedup test)
@@ -34,6 +35,8 @@ extern char** environ;
 #include <unistd.h>
 
 #include <atomic>
+#include <iterator>
+#include <fstream>
 #include <chrono>
 #include <condition_variable>
 #include <cerrno>
@@ -2644,6 +2647,90 @@ bool PinnedExists(PinnedPullPeer& peer, const BlockKey& key) {
   uint64_t bytes = 0;
   return peer.Exchange(kReqPrefix, &status, &bytes) &&
          status == Status::kOk;
+}
+
+// The log engine's read check on the pinned PULL path (RdmaServer::Serve,
+// publish_pull): a value whose bytes on disk fail their payload checksum is
+// a miss for the client, is not installed in the RAM tier, and is gone from
+// the disk's index (design §5.3).
+TEST(RdmaLoopback, ADamagedLogValueIsAMissAndIsNotInstalled) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  // The disk read and its check on the io_uring path, where publish_pull
+  // verifies (without io_uring the synchronous range handler reads and
+  // checks the value itself).
+  ScopedEnv uring("DFKV_SERVER_URING", "1");
+  ScopedEnv engine("DFKV_STORE_ENGINE", "log");
+  ScopedEnv lse("DFKV_LSE_EXPERIMENTAL", "1");
+  ScopedEnv ram("DFKV_RAM_TIER", "1");
+  ScopedEnv ram_bytes("DFKV_RAM_TIER_BYTES", "16777216");
+  ScopedEnv ram_extent("DFKV_RAM_TIER_EXTENT_BYTES", "1048576");
+  ScopedEnv ram_mode("DFKV_RAM_WRITE_MODE", "writearound");  // PUTs skip RAM
+  RdmaNode node("log-damaged-pull", kMaxMsg, /*fail_pinned_registration=*/false,
+                /*prepare_reads=*/true);
+  ASSERT_EQ(node.srv->engine_name(), "log");
+  ASSERT_TRUE(node.srv->ram_enabled());
+  const BlockKey good = ToBlockKey(SelfHdr(), "log-good-pull");
+  const BlockKey bad = ToBlockKey(SelfHdr(), "log-damaged-pull");
+  const std::string good_value = PatternValue(8192, 43);
+  const std::string bad_value = PatternValue(8192, 41);
+  std::string ignored;
+  for (const auto& kv : {std::make_pair(good, good_value),
+                         std::make_pair(bad, bad_value)})
+    ASSERT_EQ(node.srv->ProcessRequestForKey(
+                  static_cast<uint8_t>(WireOp::kCache), kv.first, 0, 0,
+                  kv.second.data(), kv.second.size(), &ignored),
+              Status::kOk);
+  // Damage one byte of the bad value's payload in its segment file.
+  bool damaged = false;
+  for (const auto& e : fs::recursive_directory_iterator(node.dir)) {
+    if (!e.is_regular_file() || e.path().parent_path().filename() != "segments")
+      continue;
+    std::ifstream in(e.path(), std::ios::binary);
+    const std::string bytes((std::istreambuf_iterator<char>(in)),
+                            std::istreambuf_iterator<char>());
+    const size_t at = bytes.find(bad_value);
+    if (at == std::string::npos) continue;
+    const int fd = ::open(e.path().c_str(), O_WRONLY);
+    ASSERT_GE(fd, 0);
+    const char flipped = static_cast<char>(bytes[at + 100] ^ 0x01);
+    ASSERT_EQ(::pwrite(fd, &flipped, 1, static_cast<off_t>(at + 100)), 1);
+    ASSERT_EQ(::fsync(fd), 0);
+    ::close(fd);
+    damaged = true;
+  }
+  ASSERT_TRUE(damaged) << "the value was not found in a segment file";
+  PinnedPullPeer peer;
+  ASSERT_TRUE(peer.Open(node));
+  auto pull = [&](const BlockKey& key, Status* status, std::string* out) {
+    EncodeReqVersion(peer.ep.sbuf(0), kNativeProtoRdmaV2, WireOp::kPullRange,
+                     key, 0, 8192, rdma::kPullPrepareBytes);
+    rdma::EncodePullPrepareControl({}, peer.ep.sbuf(0) + kReqPrefix);
+    uint64_t bytes = 0;
+    if (!peer.Exchange(kReqPrefix + rdma::kPullPrepareBytes, status, &bytes))
+      return false;
+    if (*status != Status::kOk) return true;
+    rdma::DynamicPullReady ready;
+    return rdma::DecodeDynamicPullReady(peer.ep.rbuf(0) + kRespPrefix,
+                                        &ready) &&
+           peer.Read(ready, out) && peer.Release(key, ready);
+  };
+  // The good value is served (and so the path is the one under test).
+  Status status = Status::kIOError;
+  std::string out;
+  ASSERT_TRUE(pull(good, &status, &out));
+  EXPECT_EQ(status, Status::kOk);
+  EXPECT_EQ(out, good_value);
+  // The damaged one is a miss, twice: not installed in RAM, not indexed.
+  ASSERT_TRUE(pull(bad, &status, &out));
+  EXPECT_EQ(status, Status::kNotFound);
+  EXPECT_FALSE(KvNodeServerTestPeer::Ram(*node.srv).Contains(bad))
+      << "the damaged bytes were installed in the RAM tier";
+  ASSERT_TRUE(pull(bad, &status, &out));
+  EXPECT_EQ(status, Status::kNotFound);
+  EXPECT_EQ(node.srv->ProcessRequestForKey(static_cast<uint8_t>(WireOp::kExist),
+                                           bad, 0, 0, nullptr, 0, &ignored),
+            Status::kNotFound);
+  peer.Close();
 }
 
 TEST(RdmaLoopback, LegacyDynamicHandshakeReadReleaseAndLiveProof) {
