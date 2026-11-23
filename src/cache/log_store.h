@@ -4,9 +4,10 @@
  * records; REMOVE writes durable kill entries to a metadata journal; recovery
  * rebuilds everything from the disk alone.
  *
- * This is implementation stage "LogStore core" (design §14): one open
- * segment, recovery by walking every segment, no sealing, no eviction (a full
- * store answers kCacheFull), no RETAIN. It is selectable only with
+ * Implemented so far (design §14): the core (stage 3) with one open client
+ * segment; sealing with summaries and trailers, summary-based recovery and
+ * the clean close (stage 5). No eviction yet (a full store answers
+ * kCacheFull), no RETAIN. It is selectable only with
  * DFKV_LSE_EXPERIMENTAL=1 and writes the development-format bit. */
 #ifndef DFKV_LOG_STORE_H_
 #define DFKV_LOG_STORE_H_
@@ -48,7 +49,8 @@ class LogStore : public StoreEngine {
     // The I/O this store does; null = the real system calls.
     std::shared_ptr<lse::IoBackend> io;
     // Test hook, called at named points (see log_store.cc); a test may _exit
-    // there to stage a crash.
+    // there to stage a crash. Called without the store's mutex, except in
+    // Activate().
     std::function<void(const char* point)> crash_hook;
     // Test hook: a PUT stored its value with this generation (called with
     // the store's mutex held, on the PUT's thread, just before it returns).
@@ -58,12 +60,12 @@ class LogStore : public StoreEngine {
     std::function<void(const BlockKey&)> on_reserve;
     // Test hook: a REMOVE took the store's mutex (called with it held).
     std::function<void(const BlockKey&)> on_remove;
-    // DFKV_LSE_SYNC_MS: the open segment is fdatasynced this often, which
-    // bounds what a power loss can take of acknowledged writes (§6.5).
+
+    // DFKV_LSE_SYNC_MS: open segments are fdatasynced this often (§6.5).
     uint32_t sync_ms = 1000;
   };
-  // Reads the DFKV_LSE_* settings into `o` (a malformed value keeps the
-  // default, with a warning, as every setting does).
+  // Reads the DFKV_LSE_* settings into `o` (a malformed
+  // value keeps the default, with a warning, as every setting does).
   static void ApplyEnvironment(Options* o);
 
   // Geometry the design derives from a capacity (§4.7). False if the
@@ -111,9 +113,11 @@ class LogStore : public StoreEngine {
   uint64_t MaxValueBytes() const override;
   const char* EngineName() const override { return "log"; }
 
+
   // What the last open recovered (tests, the open log line).
   struct RecoveryStats {
     uint64_t segments_walked = 0;
+    uint64_t summaries_loaded = 0;
     uint64_t records_recovered = 0;
     uint64_t records_killed = 0;
     uint64_t records_rejected = 0;   // bad header or payload CRC
@@ -122,6 +126,21 @@ class LogStore : public StoreEngine {
     bool journal_damaged = false;
   };
   RecoveryStats GetRecoveryStats() const { return recovery_; }
+
+  // Counters since the open (tests).
+  struct Stats {
+    uint64_t segments_sealed = 0;
+    uint64_t cache_full = 0;
+    uint64_t read_crc_failures = 0;
+    uint64_t journal_resets = 0;
+    // Current state.
+    uint32_t segments_free = 0;
+    uint32_t segments_sealed_now = 0;
+    uint32_t sealer_queue = 0;
+    uint64_t shadows = 0;
+    uint32_t segment_count = 0;
+  };
+  Stats GetStats() const;
 
  private:
   friend class LogStoreTestPeer;
@@ -137,6 +156,10 @@ class LogStore : public StoreEngine {
     uint32_t segment = 0;
     uint64_t incarnation = 0;
     uint32_t offset_blocks = 0;
+    bool operator==(const Location& o) const {
+      return segment == o.segment && incarnation == o.incarnation &&
+             offset_blocks == o.offset_blocks;
+    }
   };
   struct Entry {
     Location loc;
@@ -155,7 +178,7 @@ class LogStore : public StoreEngine {
     bool kill_pending = false;  // its KILL is enqueued, durable at `ticket`
     uint64_t ticket = 0;
   };
-  enum class SegState { kFree, kOpen, kFull };
+  enum class SegState { kFree, kOpen, kSealing, kSealed, kWalked };
   struct Segment {
     SegState state = SegState::kFree;
     bool header_valid = false;  // its current header is durable and ours
@@ -165,8 +188,12 @@ class LogStore : public StoreEngine {
     uint32_t live = 0;          // index entries pointing into it
     uint32_t shadows = 0;       // shadows pointing into it
     uint32_t pins = 0;          // reads and writes in flight
+    uint32_t writers = 0;       // writes in flight
     bool dirty = false;         // written by this run: synced at Close
-    bool unsynced = false;      // written since the syncer's last pass
+    bool unsynced = false;      // written since the last periodic sync
+    uint64_t last_lsn = 0;      // highest write_lsn placed (seal order)
+    // Records written in this incarnation: the summary it gets when sealed.
+    std::vector<lse::SummaryEntry> summary;
     int fd = -1;                // buffered descriptor
     int dio_fd = -1;            // O_DIRECT descriptor (direct mode)
   };
@@ -176,10 +203,12 @@ class LogStore : public StoreEngine {
     bool done = false;
     bool cancelled = false;  // a REMOVE took the key while it was written
     Status result = Status::kIOError;
+    bool has_loc = false;  // space reserved: `loc` names it
     Location loc;
     uint64_t generation = 0;
   };
   class Journal;
+  using Lock = std::unique_lock<std::mutex>;
 
   // ---- open / init / recovery ----
   bool SetError(std::string error);
@@ -189,12 +218,17 @@ class LogStore : public StoreEngine {
   bool OpenStore();
   bool ReadSuperblock();
   bool WriteSuperblock();
+  bool OpenSegmentFile(uint32_t index, bool create);
   bool OpenSegmentFiles(bool create);
   bool ReadJournal();
-  bool WalkSegment(uint32_t index, std::vector<lse::RecordHeader>* records,
-                   std::vector<uint32_t>* offsets);
+  bool LoadSummary(uint32_t index, std::vector<lse::SummaryEntry>* records,
+                   bool* loaded);
+  bool WalkSegment(uint32_t index, std::vector<lse::SummaryEntry>* records);
   bool ResetToEmpty();
-  bool FreshHeader(uint32_t index);  // with mu_ held or before serving
+  // A new incarnation for the segment, durable. `empty`: also a trailer
+  // with no records, so that a free segment is not walked at the next open.
+  bool FreshHeader(uint32_t index, bool empty = false);  // with mu_ held
+  bool SyncDir(const std::string& path);
   std::string SegmentPath(uint32_t index) const;
   bool Serving() const;
   void FailStore(const char* what, int err);
@@ -205,12 +239,29 @@ class LogStore : public StoreEngine {
   // ---- write path ----
   template <typename WriteFn>
   Status Put(const BlockKey& key, size_t len, const WriteFn& write);
-  bool ReserveLocked(uint64_t footprint, uint32_t* segment, uint64_t* offset);
-  bool OpenNextSegmentLocked();
+  bool ReserveLocked(Lock& lk, uint64_t footprint, uint32_t* segment,
+                     uint64_t* offset);
+  bool PlaceLocked(uint32_t segment, uint64_t footprint, uint64_t* offset);
+  // Takes a free segment and gives it a fresh header.
+  bool TakeFreeSegmentLocked(uint32_t* out);
+  // Hands an open segment to the sealer; waits while its queue is full.
+  void HandToSealerLocked(Lock& lk, uint32_t segment);
   uint64_t NextLsnLocked();
   bool WriteRecord(uint32_t segment, uint64_t offset,
                    const lse::RecordHeader& h, const char* payload,
                    size_t len, char* direct_buf, size_t direct_cap);
+  void RecordWrittenLocked(uint32_t segment, const BlockKey& key,
+                           const lse::RecordHeader& h, uint64_t offset);
+  uint64_t EnqueueKillLocked(const BlockKey& key, const Location& loc,
+                             uint64_t generation);
+
+  // ---- sealing (§6.3) ----
+  bool SealSegment(Lock& lk, uint32_t segment);
+  void SealerLoop();
+
+  // A sealed segment whose records are all killed is free again.
+  void RemoveFromFifoLocked(uint32_t segment);
+  void MaybeFreeLocked(uint32_t segment);
 
   // ---- read path ----
   bool AcquireLocked(const BlockKey& key, Entry* out);
@@ -223,7 +274,6 @@ class LogStore : public StoreEngine {
   void AddShadowLocked(const BlockKey& key, const Location& loc,
                        uint64_t generation, uint64_t kill_ticket = 0);
   void EraseEntryLocked(const BlockKey& key);
-  bool SegmentIsFreeLocked(uint32_t index) const;
 
   Options opt_;
   std::shared_ptr<lse::IoBackend> io_;
@@ -234,14 +284,17 @@ class LogStore : public StoreEngine {
   std::atomic<bool> closed_{false};
   int dir_fd_ = -1;
   int super_fd_ = -1;
-  int journal_fd_ = -1;
+  int journal_fd_ = -1;  // owned by journal_ once it exists
 
   lse::Superblock sb_;
   std::vector<Segment> segments_;
   uint32_t open_segment_ = UINT32_MAX;
-  std::vector<uint32_t> free_;  // free segments, in the order they are taken
+  std::vector<uint32_t> free_;   // free segments, in the order they are taken
+  std::deque<uint32_t> fifo_;    // sealed segments, oldest first
+  std::deque<uint32_t> seal_queue_;
 
   mutable std::mutex mu_;
+  std::condition_variable state_cv_;  // writers, sealer queue, free segments
   std::unordered_map<BlockKey, Entry, KeyHash> index_;
   std::unordered_multimap<BlockKey, Shadow, KeyHash> shadows_;
   std::unordered_map<BlockKey, std::shared_ptr<Flight>, KeyHash> flights_;
@@ -271,13 +324,11 @@ class LogStore : public StoreEngine {
   uint64_t journal_next_seq_ = 1;
   bool needs_reset_ = false;
   RecoveryStats recovery_;
+  Stats stats_;
 
   std::unique_ptr<Journal> journal_;
-  // The periodic sync of the open segment (§6.5).
-  void SyncerLoop();
-  bool stop_syncer_ = false;
-  std::condition_variable syncer_cv_;
-  std::thread syncer_;
+  bool stop_threads_ = false;
+  std::thread sealer_;
 };
 
 }  // namespace dfkv

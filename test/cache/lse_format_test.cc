@@ -419,6 +419,27 @@ TEST(LseFormat, SummaryAndTrailerStayInsideTheSegment) {
   e.offset_blocks = 1;
   e.value_len = kMaxInlinePayload + 1;
   EXPECT_FALSE(summary_ok(e)) << "inline, but too big to be";
+  e.flags = 0;
+  e.value_len = 10;
+  EXPECT_FALSE(summary_ok(e)) << "small enough to be inline, but is not";
+  // The header length is kept: an inline payload after a longer header.
+  e.flags = kRecordFlagInline;
+  e.header_len = 200;
+  e.value_len = kBlockBytes - 200;
+  EXPECT_TRUE(summary_ok(e));
+  {
+    const auto bytes = EncodeSummary({e});
+    std::vector<SummaryEntry> got;
+    ASSERT_TRUE(DecodeSummary(bytes.data(), bytes.size(), kSeg, &got));
+    EXPECT_EQ(got[0].header_len, 200u);
+  }
+  e.value_len += 1;
+  EXPECT_FALSE(summary_ok(e)) << "does not fit after that header";
+  for (uint16_t len : {0, 87, 4097}) {
+    e.header_len = len;
+    e.value_len = 10;
+    EXPECT_FALSE(summary_ok(e)) << "header_len " << len;
+  }
 
   auto trailer = [](uint64_t offset, uint32_t count) {
     Trailer t;
@@ -626,7 +647,7 @@ TEST(LseFormat, FuzzedBlocksAreRefusedOrReencodeIdentically) {
   }
   const std::vector<Field> se_fields = {{0, 8},  {8, 8},  {16, 8}, {24, 8},
                                         {32, 8}, {40, 8}, {48, 4}, {52, 4},
-                                        {56, 1}};
+                                        {56, 1}, {58, 2}};
 
   for (int round = 0; round < kRounds; ++round) {
     SCOPED_TRACE(round);

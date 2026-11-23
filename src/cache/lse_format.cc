@@ -89,7 +89,7 @@ constexpr uint8_t kKnownRecordFlags = kRecordFlagInline | kRecordFlagRelocated;
 // Summary entry layout.
 constexpr size_t kSeKey = 0, kSeValueLen = 24, kSeGeneration = 32,
                  kSeWriteLsn = 40, kSeOffset = 48, kSePayloadCrc = 52,
-                 kSeFlags = 56;
+                 kSeFlags = 56, kSeHeaderLen = 58;
 // Trailer layout.
 constexpr char kTrailerMagic[8] = {'D', 'F', 'L', 'S', 'E', 'N', 'D', '1'};
 constexpr size_t kTrUuid = 8, kTrIncarnation = 24, kTrCount = 32,
@@ -302,6 +302,7 @@ std::vector<uint8_t> EncodeSummary(const std::vector<SummaryEntry>& entries) {
     PutU32(p + kSeOffset, e.offset_blocks);
     PutU32(p + kSePayloadCrc, e.payload_crc);
     p[kSeFlags] = e.flags;
+    PutU16(p + kSeHeaderLen, e.header_len);
   }
   return out;
 }
@@ -320,14 +321,16 @@ bool DecodeSummary(const uint8_t* bytes, size_t len, uint64_t segment_bytes,
     e.offset_blocks = GetU32(p + kSeOffset);
     e.payload_crc = GetU32(p + kSePayloadCrc);
     e.flags = p[kSeFlags];
-    if (e.offset_blocks == 0 || e.generation == 0 ||
+    e.header_len = GetU16(p + kSeHeaderLen);
+    if (e.header_len < kRecordHeaderBytes || e.header_len > kBlockBytes ||
+        e.offset_blocks == 0 || e.generation == 0 ||
         e.write_lsn < e.generation || (e.flags & ~kKnownRecordFlags) != 0 ||
         e.value_len > MaxRecordValue(segment_bytes))
       return false;
-    // The record ends before the trailer. A summary does not hold the
-    // header length, so an inline flag is checked against the shortest.
+    // Inline exactly when it fits, as in the record header; the record ends
+    // before the trailer.
     const bool is_inline = (e.flags & kRecordFlagInline) != 0;
-    if (is_inline && !RecordFitsInline(e.value_len)) return false;
+    if (is_inline != RecordFitsInline(e.value_len, e.header_len)) return false;
     RecordHeader h;
     h.flags = e.flags;
     h.value_len = e.value_len;
