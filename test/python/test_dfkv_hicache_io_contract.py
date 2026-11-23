@@ -9,6 +9,7 @@ import ctypes
 import os
 import sys
 import threading
+import time
 import types
 import unittest
 import unittest.mock
@@ -696,6 +697,118 @@ class DpAttentionKeysAreShared(unittest.TestCase):
         self.assertEqual(group0._keys("p"), [
             dfkv_hicache.pool_key("p", pool="kv", tp_size=4, tp_rank=1,
                                   component=c) for c in ("k", "v")])
+
+
+class MarkersShareTheScratchSafely(unittest.TestCase):
+    """Marker writes and reads of one backend from several threads at once
+    share its scratch buffer without a lock: a PUT only reads byte 0, a GET
+    only writes the bytes after it, and what a GET writes is never read (the
+    result is the hit flag). Each call's destinations stay distinct."""
+
+    def test_scratch_is_created_and_registered_once_under_races(self):
+        # Threads asking for the scratch at once on a fresh backend: one
+        # buffer, registered once. Registration is slow here, so without
+        # the guard each thread made and registered its own.
+        st = _plugin(transport_mode="rdma")
+        registered = []
+
+        def slow_register(base, size):
+            registered.append((base, size))
+            time.sleep(0.01)
+            return True
+
+        st.register_memory = slow_register
+        start = threading.Barrier(8)
+        got = []
+
+        def ask():
+            start.wait()
+            got.append(st._marker_buffer(4)[0])
+
+        threads = [threading.Thread(target=ask) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        self.assertEqual(len(registered), 1, registered)
+        self.assertEqual(len({id(buf) for buf in got}), 1)
+
+    def test_marker_pools_of_one_v2_read_get_distinct_offsets(self):
+        st = _plugin(
+            registered_pools={"anchor": object(), "c4": object()},
+            _pool_component_names={"anchor": ("all",), "c4": ("all",)},
+            _pool_replicated={"anchor": False, "c4": False},
+            _pool_logical={"anchor": True, "c4": True})
+        seen = {}
+
+        class Lib:
+            def dfkv_batch_get(self, _h, karr, klens, parr, sarr, n, out):
+                seen["dests"] = [parr[i] for i in range(n)]
+                for i in range(n):
+                    out[i] = 1
+                return 0
+
+        st._lib = Lib()
+        res, _io = st._v2_io(
+            [PoolTransfer("anchor", host_indices=[0, 1, 2], keys=["a", "b", "c"]),
+             PoolTransfer("c4", host_indices=[0, 1], keys=["a", "b"])],
+            putting=False)
+        self.assertEqual(res, {"anchor": [True] * 3, "c4": [True] * 2})
+        self.assertEqual(len(seen["dests"]), 5)
+        self.assertEqual(len(set(seen["dests"])), 5, seen["dests"])
+        _scratch, put_source = st._marker_buffer(1, put=True)
+        self.assertNotIn(put_source, seen["dests"])
+
+    def test_concurrent_marker_writes_and_reads(self):
+        store = set()
+        lock = threading.Lock()
+        errors = []
+
+        class Lib:
+            def dfkv_batch_put(self, _h, karr, klens, parr, sarr, n, out):
+                with lock:
+                    for i in range(n):
+                        store.add(ctypes.string_at(karr[i], klens[i]))
+                        out[i] = 1
+                return 0
+
+            def dfkv_batch_get(self, _h, karr, klens, parr, sarr, n, out):
+                dests = [parr[i] for i in range(n)]
+                if len(set(dests)) != n:
+                    errors.append("destinations of one call overlap")
+                for i in range(n):
+                    ctypes.memset(parr[i], 0xA5, 1)   # the transport's write
+                    with lock:
+                        out[i] = int(ctypes.string_at(karr[i], klens[i])
+                                     in store)
+                return 0
+
+        st = _plugin(_lib=Lib(), transport_mode="tcp",
+                     _backup_exist_gate=False)
+        st.mem_pool_host = types.SimpleNamespace(
+            get_page_buffer_meta=lambda indices: None)
+        st._anchor_notice_printed = True
+        _scratch, source = st._marker_buffer(1, put=True)
+        source_byte = ctypes.string_at(source, 1)
+
+        def worker(t):
+            for r in range(200):
+                stored = [f"t{t}-{r}-{i}" for i in range(8)]
+                if st.batch_set_v1(stored, list(range(8))) != [True] * 8:
+                    errors.append("write")
+                got = st.batch_get_v1(stored + [f"absent{t}-{r}"],
+                                      list(range(9)))
+                if got != [True] * 8 + [False]:
+                    errors.append(f"read {got}")
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        self.assertEqual(errors, [])
+        self.assertEqual(ctypes.string_at(source, 1), source_byte)
+        self.assertIs(st._marker_buffer(1)[0], _scratch, "one shared scratch")
 
 
 class ExtraConfigThroughTheBackend(unittest.TestCase):

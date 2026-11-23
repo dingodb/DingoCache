@@ -1109,7 +1109,8 @@ class DingoFSHiCacheTest(unittest.TestCase):
                                      [True, True, True])
                     side.zero()
                     original_get = st._lib.dfkv_batch_get
-                    marker_before = dfkv_hicache._MARKER_BUF.raw
+                    _scratch, put_source = st._marker_buffer(1, put=True)
+                    marker_before = ctypes.string_at(put_source, 1)
                     calls = []
 
                     def native_get(handle, karr, klens, ptrs, sizes, n, out):
@@ -1118,7 +1119,7 @@ class DingoFSHiCacheTest(unittest.TestCase):
                         addresses = [ptrs[i] for i in marker_indices]
                         self.assertEqual(len(addresses), 6)  # MHA K/V markers
                         self.assertEqual(len(set(addresses)), len(addresses))
-                        self.assertNotIn(dfkv_hicache._MARKER_PTR, addresses)
+                        self.assertNotIn(put_source, addresses)
                         # Model independent native workers writing simultaneously:
                         # each byte must retain its own content after all writes.
                         for i, address in enumerate(addresses):
@@ -1142,7 +1143,8 @@ class DingoFSHiCacheTest(unittest.TestCase):
                             result = result["kv"]
                     self.assertEqual(result, [True, False, True])
                     self.assertEqual(len(calls), 1)
-                    self.assertEqual(dfkv_hicache._MARKER_BUF.raw, marker_before)
+                    self.assertEqual(ctypes.string_at(put_source, 1),
+                                     marker_before)
 
     def test_register_v2_physical_pool_clears_logical_flag(self):
         # Re-registering the same name with a real layout must drop the

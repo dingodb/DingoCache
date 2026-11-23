@@ -727,6 +727,34 @@ class TestDeviceDirectEndToEnd(unittest.TestCase):
         # of the judged side pools.
         self.assertEqual(calls, 2 + int(st._has_retain))
 
+    def test_marker_io_registers_no_memory_per_batch(self):
+        """Measured over RDMA: one-shot memory registrations (ibv_reg_mr)
+        made by marker writes and reads of a logical-anchor pool."""
+        st = self._plugin(self._node("markers"))
+
+        class _LogicalAnchor:
+            def get_page_buffer_meta(self, indices):
+                return None
+
+        st.mem_pool_host = _LogicalAnchor()
+        st._anchor_notice_printed = True
+        sample = "dfkv_rdma_client_adhoc_user_mr_total"
+        counts = []
+        for batch in range(4):
+            pages = [f"m{batch}-{i}" for i in range(128)]
+            before = self._native_counter(st, sample)
+            self.assertEqual(st.batch_set_v1(pages, list(range(128))),
+                             [True] * 128)
+            written = self._native_counter(st, sample)
+            self.assertEqual(st.batch_get_v1(pages, list(range(128))),
+                             [True] * 128)
+            counts.append((written - before,
+                           self._native_counter(st, sample) - written))
+        sys.stderr.write(
+            f"[measure] one-shot MR registrations per 128-marker batch "
+            f"(write, read): {counts}\n")
+        self.assertEqual(counts, [(0, 0)] * 4)
+
     def test_registered_device_pool_without_bypass_keeps_host_keys(self):
         """SGLang may register the device pool without using the bypass. The
         host path then stores bare keys, and the existence probe must look
