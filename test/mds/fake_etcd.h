@@ -22,7 +22,7 @@
 
 namespace dfkv {
 
-// The four gateway calls the MDS makes, over HTTP/1.1 with Connection: close.
+// The gateway calls the MDS makes, over HTTP/1.1 with Connection: close.
 class FakeEtcd {
  public:
   FakeEtcd() {
@@ -109,16 +109,20 @@ class FakeEtcd {
       return {200, std::string("{") + kHeader + "}"};
     }
     if (path == "/v3/kv/range") {
+      // Without range_end, the one key named.
       std::string begin, end;
+      const bool single = req.get_str("range_end").empty();
       if (!Base64Decode(req.get_str("key"), &begin) ||
-          !Base64Decode(req.get_str("range_end"), &end))
+          (!single && !Base64Decode(req.get_str("range_end"), &end)))
         return {400, "{}"};
       std::string kvs;
       for (auto it = kvs_.lower_bound(begin);
-           it != kvs_.end() && it->first < end; ++it) {
+           it != kvs_.end() && (single ? it->first == begin : it->first < end);
+           ++it) {
         if (!kvs.empty()) kvs += ",";
         kvs += "{\"key\":\"" + Base64Encode(it->first) + "\",\"value\":\"" +
-               it->second.first + "\"}";
+               it->second.first + "\",\"lease\":\"" +
+               std::to_string(it->second.second) + "\"}";
       }
       return {200, std::string("{") + kHeader +
                        (kvs.empty() ? "" : ",\"kvs\":[" + kvs + "]") + "}"};

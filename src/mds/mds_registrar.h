@@ -29,10 +29,11 @@ namespace dfkv {
 // within kTtlSeconds with no explicit deregister.
 class MdsRegistrar {
  public:
-  // An MDS register/heartbeat may spend up to three sequential 2 s etcd
-  // request budgets (failed keepalive, lease grant, Put). Leave one second for
-  // TCP framing/scheduling so a valid slow MDS operation cannot self-timeout.
-  static constexpr int kDefaultIoTimeoutMs = 7000;
+  // An MDS register/heartbeat may spend up to four sequential 2 s etcd
+  // request budgets (read of the record, failed keepalive of its expired
+  // lease, lease grant, Put). Leave one second for TCP framing/scheduling so
+  // a valid slow MDS operation cannot self-timeout.
+  static constexpr int kDefaultIoTimeoutMs = 9000;
   // first_registration_timeout_ms == 0 preserves an unbounded registration
   // loop for non-daemon consumers. Cache-node startup supplies its mandatory,
   // bounded deadline and exits fail-closed when it expires.

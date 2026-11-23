@@ -18,6 +18,11 @@ struct MdsMetrics {
   std::atomic<uint64_t> keepalives{0};
   std::atomic<uint64_t> list_requests{0};
   std::atomic<uint64_t> lease_grants{0};
+  // Member and client records written to etcd, and heartbeats that renewed
+  // the lease without a write (record unchanged, or only its stats changed
+  // within DFKV_MDS_STATS_PUT_MS).
+  std::atomic<uint64_t> record_puts{0};
+  std::atomic<uint64_t> record_puts_skipped{0};
   std::atomic<uint64_t> etcd_errors{0};
   std::atomic<uint64_t> members_last_list{0};  // members returned by the last ListMembers
   // Client (consumer) registration — mirrors the member counters above. Lets the
@@ -62,6 +67,8 @@ struct MdsMetrics {
     m("dfkv_mds_keepalives_total", "counter", "Heartbeat ops received", ld(keepalives));
     m("dfkv_mds_list_requests_total", "counter", "ListMembers ops served", ld(list_requests));
     m("dfkv_mds_lease_grants_total", "counter", "etcd lease grants issued", ld(lease_grants));
+    m("dfkv_mds_record_puts_total", "counter", "Member and client records written to etcd", ld(record_puts));
+    m("dfkv_mds_record_puts_skipped_total", "counter", "Heartbeats that renewed the lease without writing the record", ld(record_puts_skipped));
     m("dfkv_mds_etcd_errors_total", "counter", "etcd I/O failures", ld(etcd_errors));
     m("dfkv_mds_members", "gauge", "Members returned by the last ListMembers", ld(members_last_list));
     m("dfkv_mds_client_register_requests_total", "counter", "Client register ops received", ld(client_register_requests));

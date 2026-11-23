@@ -195,17 +195,20 @@ TEST(MdsEtcdWriteFailure, ListWithheldOnceAHeartbeatingMemberHasDroppedOut) {
   EXPECT_EQ(ids, (Ids{"na", "nb", "nc"}));
 
   etcd.RejectWrites(true);
-  // The lease is still alive, so the keepalive goes through; the Put and the
-  // fallback lease grant do not. The node is told its heartbeat failed.
-  EXPECT_EQ(Beat(mds, WireOp::kHeartbeat, g, kA), Status::kIOError);
-  // Nothing has expired yet: etcd still lists every member, so the list is
-  // complete and is served. A failed heartbeat alone withholds nothing.
+  // The lease is still alive: the heartbeat renews it and, the record being
+  // unchanged, has nothing to write. It goes through without etcd taking a
+  // write, and the list is complete.
+  EXPECT_EQ(Beat(mds, WireOp::kHeartbeat, g, kA), Status::kOk);
   ASSERT_EQ(List(mds, WireOp::kListMembers, g, &ids), Status::kOk);
   EXPECT_EQ(ids, (Ids{"na", "nb", "nc"}));
   ASSERT_EQ(List(mds, WireOp::kListTopology, g, &ids), Status::kOk);
   EXPECT_EQ(ids, (Ids{"na", "nb", "nc"}));
 
+  // The leases run out all the same (nobody renewed them in time): na's next
+  // heartbeat finds no record and etcd refuses the new lease. The node is
+  // told its heartbeat failed.
   etcd.ExpireAllLeases();
+  EXPECT_EQ(Beat(mds, WireOp::kHeartbeat, g, kA), Status::kIOError);
   // etcd now lists nobody, yet na heartbeat a moment ago. An empty member list
   // would be a lie; the MDS answers with an error instead, which clients treat
   // as "keep the ring you have".
@@ -229,9 +232,9 @@ TEST(MdsEtcdWriteFailure, ListServedAgainOnlyWhenEveryUnwrittenMemberIsBack) {
     ASSERT_EQ(Beat(mds, WireOp::kRegister, g, m), Status::kOk);
 
   etcd.RejectWrites(true);
+  etcd.ExpireAllLeases();
   for (const auto& m : {kA, kB, kC})
     EXPECT_EQ(Beat(mds, WireOp::kHeartbeat, g, m), Status::kIOError);
-  etcd.ExpireAllLeases();
   Ids ids;
   EXPECT_EQ(List(mds, WireOp::kListTopology, g, &ids), Status::kIOError);
 
@@ -267,8 +270,8 @@ TEST(MdsEtcdWriteFailure, MemberWrittenThroughAnotherMdsCountsAsBack) {
   ASSERT_EQ(Beat(first, WireOp::kRegister, g, kA), Status::kOk);
 
   etcd.RejectWrites(true);
-  EXPECT_EQ(Beat(first, WireOp::kHeartbeat, g, kA), Status::kIOError);
   etcd.ExpireAllLeases();
+  EXPECT_EQ(Beat(first, WireOp::kHeartbeat, g, kA), Status::kIOError);
   Ids ids;
   EXPECT_EQ(List(first, WireOp::kListTopology, g, &ids), Status::kIOError);
   // The second instance has not heard from na: it has no reason to doubt etcd.
@@ -305,8 +308,8 @@ TEST(MdsEtcdWriteFailure, MembersThatReallyLeaveStillShrinkTheList) {
 }
 
 TEST(MdsEtcdWriteFailure, FailedRegistrationIsNoEvidenceOfAMember) {
-  // The state with one or two MDS endpoints: etcd refuses writes, keepalives
-  // still hold the members' leases, and the lists are complete.
+  // etcd refuses writes, keepalives still hold the members' leases, and the
+  // lists are complete: a heartbeat renews its member's lease without a write.
   FakeEtcd etcd;
   MdsServer mds(etcd.ep());
   ASSERT_EQ(mds.Start(0), Status::kOk);
@@ -314,7 +317,7 @@ TEST(MdsEtcdWriteFailure, FailedRegistrationIsNoEvidenceOfAMember) {
   for (const auto& m : {kA, kB})
     ASSERT_EQ(Beat(mds, WireOp::kRegister, g, m), Status::kOk);
   etcd.RejectWrites(true);
-  EXPECT_EQ(Beat(mds, WireOp::kHeartbeat, g, kA), Status::kIOError);
+  EXPECT_EQ(Beat(mds, WireOp::kHeartbeat, g, kA), Status::kOk);
 
   // A node that is not listed keeps trying to get in. It never was a member;
   // the list without it is the member list and must keep being served.
@@ -326,10 +329,10 @@ TEST(MdsEtcdWriteFailure, FailedRegistrationIsNoEvidenceOfAMember) {
   ASSERT_EQ(List(mds, WireOp::kListTopology, g, &ids), Status::kOk);
   EXPECT_EQ(ids, (Ids{"na", "nb"}));
 
-  // The price: a member whose process restarted registers again, which says
-  // nothing about its past. If its key then runs out, the list goes on
-  // without it.
-  EXPECT_EQ(Beat(mds, WireOp::kRegister, g, kB), Status::kIOError);
+  // A member whose process restarted registers again: its record is there
+  // and unchanged, so that goes through too. Registrations never count as
+  // evidence: if its key then runs out, the list goes on without it.
+  EXPECT_EQ(Beat(mds, WireOp::kRegister, g, kB), Status::kOk);
   etcd.ExpireKey(MemberKey(g, "nb"));
   ASSERT_EQ(List(mds, WireOp::kListTopology, g, &ids), Status::kOk);
   EXPECT_EQ(ids, (Ids{"na"}));
@@ -337,7 +340,7 @@ TEST(MdsEtcdWriteFailure, FailedRegistrationIsNoEvidenceOfAMember) {
   const std::string metrics = mds.MetricsText();
   EXPECT_NE(metrics.find("dfkv_mds_list_withheld_total 0\n"),
             std::string::npos) << metrics;
-  EXPECT_NE(metrics.find("dfkv_mds_unwritten_members 1\n"),
+  EXPECT_NE(metrics.find("dfkv_mds_unwritten_members 0\n"),
             std::string::npos) << metrics;
   mds.Stop();
 }
@@ -351,8 +354,8 @@ TEST(MdsEtcdWriteFailure, RegistrationThatGoesThroughClearsTheRecord) {
   const std::string g = "g";
   ASSERT_EQ(Beat(mds, WireOp::kRegister, g, kA), Status::kOk);
   etcd.RejectWrites(true);
-  EXPECT_EQ(Beat(mds, WireOp::kHeartbeat, g, kA), Status::kIOError);
   etcd.ExpireAllLeases();
+  EXPECT_EQ(Beat(mds, WireOp::kHeartbeat, g, kA), Status::kIOError);
   Ids ids;
   EXPECT_EQ(List(mds, WireOp::kListMembers, g, &ids), Status::kIOError);
 
@@ -376,8 +379,8 @@ TEST(MdsEtcdWriteFailure, MemberThatStoppedHeartbeatingIsLetGoAfterTheHold) {
     ASSERT_EQ(Beat(mds, WireOp::kRegister, g, m), Status::kOk);
 
   etcd.RejectWrites(true);
-  EXPECT_EQ(Beat(mds, WireOp::kHeartbeat, g, kB), Status::kIOError);
   etcd.ExpireKey(MemberKey(g, "nb"));
+  EXPECT_EQ(Beat(mds, WireOp::kHeartbeat, g, kB), Status::kIOError);
   Ids ids;
   EXPECT_EQ(List(mds, WireOp::kListMembers, g, &ids), Status::kIOError);
   now_ms += MdsServer::kUnwrittenHoldMs;  // silent for exactly the hold
@@ -401,8 +404,8 @@ TEST(MdsEtcdWriteFailure, HoldIsTakenFromTheEnvironmentAndClamped) {
     EXPECT_EQ(mds.Start(0), Status::kOk);
     EXPECT_EQ(Beat(mds, WireOp::kRegister, g, kA), Status::kOk);
     etcd.RejectWrites(true);
-    EXPECT_EQ(Beat(mds, WireOp::kHeartbeat, g, kA), Status::kIOError);
     etcd.ExpireAllLeases();
+    EXPECT_EQ(Beat(mds, WireOp::kHeartbeat, g, kA), Status::kIOError);
     Ids ids;
     uint64_t lo = 0, hi = 3600000;  // withheld at age lo, served at age hi
     EXPECT_EQ(List(mds, WireOp::kListMembers, g, &ids), Status::kIOError);
@@ -454,10 +457,10 @@ TEST(MdsEtcdWriteFailure, LegacyFramedPeersAreTreatedTheSame) {
   EXPECT_EQ(status, kLegacyIOError);  // never listed: not recorded
   ASSERT_TRUE(DoLegacyReq(mds.port(), WireOp::kListMembers, g, &status, &data));
   EXPECT_EQ(status, kLegacyOk);
+  etcd.ExpireAllLeases();
   ASSERT_TRUE(DoLegacyReq(mds.port(), WireOp::kHeartbeat,
                           EncodeMemberReq(g, kA), &status, &data));
   EXPECT_EQ(status, kLegacyIOError);  // was listed: recorded
-  etcd.ExpireAllLeases();
   ASSERT_TRUE(DoLegacyReq(mds.port(), WireOp::kListMembers, g, &status, &data));
   EXPECT_EQ(status, kLegacyIOError);
   EXPECT_TRUE(data.empty());
@@ -486,11 +489,11 @@ TEST(MdsEtcdWriteFailure, OtherGroupsAndClientListsAreNotWithheld) {
   ASSERT_EQ(Beat(mds, WireOp::kClientRegister, "g2", consumer), Status::kOk);
 
   etcd.RejectWrites(true);
+  etcd.ExpireKey(MemberKey("g1", "na"));
+  etcd.ExpireKey("/dfkv/v1/groups/g2/clients/c1");
   EXPECT_EQ(Beat(mds, WireOp::kHeartbeat, "g1", kA), Status::kIOError);
   EXPECT_EQ(Beat(mds, WireOp::kClientHeartbeat, "g2", consumer),
             Status::kIOError);
-  etcd.ExpireKey(MemberKey("g1", "na"));
-  etcd.ExpireKey("/dfkv/v1/groups/g2/clients/c1");
 
   Ids ids;
   EXPECT_EQ(List(mds, WireOp::kListTopology, "g1", &ids), Status::kIOError);
@@ -512,8 +515,8 @@ TEST(MdsEtcdWriteFailure, HoldZeroServesTheEtcdViewAsBefore) {
   ASSERT_EQ(Beat(mds, WireOp::kRegister, g, kA), Status::kOk);
 
   etcd.RejectWrites(true);
-  EXPECT_EQ(Beat(mds, WireOp::kHeartbeat, g, kA), Status::kIOError);
   etcd.ExpireAllLeases();
+  EXPECT_EQ(Beat(mds, WireOp::kHeartbeat, g, kA), Status::kIOError);
   Ids ids;
   ASSERT_EQ(List(mds, WireOp::kListTopology, g, &ids), Status::kOk);
   EXPECT_TRUE(ids.empty());
@@ -543,9 +546,9 @@ TEST(MdsEtcdWriteFailure, ClientKeepsItsRingThroughTheOutage) {
   ASSERT_EQ(rings, (std::vector<size_t>{3}));
 
   etcd.RejectWrites(true);
+  etcd.ExpireAllLeases();
   for (const auto& m : {kA, kB, kC})
     EXPECT_EQ(Beat(mds, WireOp::kHeartbeat, g, m), Status::kIOError);
-  etcd.ExpireAllLeases();
   for (int i = 0; i < 6; ++i) EXPECT_FALSE(poller.PollOnce()) << "poll " << i;
   EXPECT_EQ(rings, (std::vector<size_t>{3}));
   // The topology stream is not held back by the client's guard: one shrunken

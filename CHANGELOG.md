@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- MDS: a heartbeat no longer writes to etcd unless the member's record
+  changed. It reads the record, renews the lease the record is attached to
+  (any MDS may renew any lease), and writes only a changed record; a change
+  of the stats (STA1) alone, which every beat of a serving node carries, is
+  written at most every `DFKV_MDS_STATS_PUT_MS` (default 60 s, 0 = every
+  beat). A record that is gone or whose lease expired is written under a new
+  lease, as before. Every heartbeat used to be a Put, and behind a registrar
+  rotating over three MDS also a lease grant, because each MDS's own lease
+  had lapsed by the time the rotation came back to it. Measured with 10
+  members heartbeating through 3 MDS against a real etcd for 3 minutes: per
+  member and minute 6 Puts and 6 lease grants (6 etcd revisions) before, 1
+  Put and no lease grant (1 revision) after. A member that stops heartbeating
+  still leaves within the 30 s lease TTL (25.2 s measured, 25.3 s before).
+  A heartbeat now takes up to four etcd requests instead of three, so the
+  registrar's default I/O timeout is 9 s (was 7 s). Registrars of 2.35 to
+  2.42 keep their 7 s against this path; that matters only while etcd is
+  slow (four requests of up to 2 s each), when such a heartbeat may time out
+  and be retried at the next beat. New `dfkv_mds_record_puts_total`,
+  `dfkv_mds_record_puts_skipped_total`, and etcd request op `get`.
 - Tests: `MetricsHttp.DescriptorExhaustionBacksOffAndRecovers` no longer
   waits for the lowest free descriptor number to come back after the queued
   scrape, which other descriptors of the process can move (it failed once

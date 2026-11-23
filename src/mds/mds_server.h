@@ -33,8 +33,9 @@ namespace dfkv {
 // only for local map work; callers perform etcd I/O after Lookup returns.
 class LocalLeaseMap {
  public:
+  // *put_ms (if given) receives when Store last recorded a Put of the key.
   bool LookupAndTouch(const std::string& key, uint64_t now_ms,
-                      int64_t* lease_id);
+                      int64_t* lease_id, uint64_t* put_ms = nullptr);
   void Store(const std::string& key, int64_t lease_id, uint64_t now_ms);
   size_t MaybePrune(uint64_t now_ms, uint64_t stale_after_ms);
   size_t Prune(uint64_t now_ms, uint64_t stale_after_ms);
@@ -44,6 +45,7 @@ class LocalLeaseMap {
   struct Entry {
     int64_t lease_id = 0;
     uint64_t last_use_ms = 0;
+    uint64_t put_ms = 0;
   };
   size_t PruneLocked(uint64_t now_ms, uint64_t stale_after_ms);
 
@@ -242,6 +244,9 @@ class MdsServer {
   bool ProbeEtcdCached() { return probe_cache_.Get(); }
 
   static constexpr int kTtlSeconds = 30;
+  // Default DFKV_MDS_STATS_PUT_MS: a member's record is rewritten for a
+  // change of its stats (STA1) alone at most this often.
+  static constexpr uint64_t kStatsPutMs = 60000;
   // Default DFKV_MDS_UNWRITTEN_HOLD_MS: four lease TTLs, the margin the local
   // lease shortcut already gives a registrar rotating over several MDS.
   static constexpr uint64_t kUnwrittenHoldMs =
@@ -258,6 +263,7 @@ class MdsServer {
   Status Upsert(const std::string& group, const MemberInfo& m, bool heartbeat);
   Status ListMembers(const std::string& group, std::string* out,
                      bool include_degraded = false);
+
   // Client (consumer) registration — same lease/keepalive contract as Upsert/
   // ListMembers but under a disjoint etcd prefix (/clients/<id> vs /members/<id>)
   // so consumers never enter the placement ring. A consumer carries no data-path
@@ -293,6 +299,7 @@ class MdsServer {
   std::vector<Conn> conns_;
   LocalLeaseMap leases_;
   LocalLeaseMap client_leases_;
+  uint64_t stats_put_ms_;  // DFKV_MDS_STATS_PUT_MS, resolved in the ctor
   UnwrittenMembers unwritten_;  // hold resolved in the ctor (env knob)
   std::atomic<uint64_t> withheld_log_ms_{0};  // rate limit of the WARN line
   MdsMetrics metrics_;

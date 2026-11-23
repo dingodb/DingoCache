@@ -34,19 +34,20 @@ uint64_t SteadyNowMs() {
 }  // namespace
 
 bool LocalLeaseMap::LookupAndTouch(const std::string& key, uint64_t now_ms,
-                                   int64_t* lease_id) {
+                                   int64_t* lease_id, uint64_t* put_ms) {
   std::lock_guard<std::mutex> lk(mu_);
   auto it = entries_.find(key);
   if (it == entries_.end()) return false;
   it->second.last_use_ms = now_ms;
   *lease_id = it->second.lease_id;
+  if (put_ms) *put_ms = it->second.put_ms;
   return true;
 }
 
 void LocalLeaseMap::Store(const std::string& key, int64_t lease_id,
                           uint64_t now_ms) {
   std::lock_guard<std::mutex> lk(mu_);
-  entries_[key] = Entry{lease_id, now_ms};
+  entries_[key] = Entry{lease_id, now_ms, now_ms};
 }
 
 size_t LocalLeaseMap::PruneLocked(uint64_t now_ms, uint64_t stale_after_ms) {
@@ -186,7 +187,12 @@ MdsServer::MdsServer(const std::string& etcd_addr, int etcd_timeout_ms,
                      config_dump::EnvU64("DFKV_MDS_UNWRITTEN_HOLD_MS",
                                          kUnwrittenHoldMs),
                      600000),
-                 std::move(hold_clock)) {}
+                 std::move(hold_clock)),
+      // DFKV_MDS_STATS_PUT_MS: see kStatsPutMs. 0 = rewrite on every
+      // heartbeat whose stats changed (every heartbeat of a serving node).
+      stats_put_ms_(std::min<uint64_t>(
+          config_dump::EnvU64("DFKV_MDS_STATS_PUT_MS", kStatsPutMs),
+          600000)) {}
 
 MdsServer::~MdsServer() { Stop(); }
 
@@ -401,18 +407,38 @@ Status MdsServer::UpsertClient(const std::string& group, const MemberInfo& m) {
   return UpsertLeased(ClientKey(group, m.id), m, client_leases_, true);
 }
 
-// Shared lease keepalive + re-Put for both members and clients. Local entries
-// are discarded after four etcd TTLs without local use. That is deliberately
-// conservative for rotating multi-MDS registrars, while bounding process memory
-// under ID churn. etcd remains authoritative; a cache miss grants and Puts.
+namespace {
+// `stored` and `next` encode the same member except for its stats: rewriting
+// the record would only refresh them.
+bool OnlyStatsDiffer(const std::string& stored, const MemberInfo& next,
+                     const std::string& next_encoded) {
+  std::vector<MemberInfo> one;
+  uint64_t epoch = 0;
+  if (!DecodeMembers(stored.data(), stored.size(), &one, &epoch) ||
+      one.size() != 1)
+    return false;
+  one[0].stats = next.stats;
+  one[0].has_stats = next.has_stats;
+  return EncodeMembers(one, 0) == next_encoded;
+}
+}  // namespace
+
+// Shared lease renewal for members and clients. The record carries the lease
+// it is attached to, and any MDS may keep any lease alive: a heartbeat reads
+// the record, renews that lease, and writes only if the record changed. The
+// stats alone (they change on every beat of a serving node) are rewritten at
+// most every stats_put_ms_. A record that is gone, or whose lease expired, is
+// written under a new lease. So a heartbeat costs etcd a read and a lease
+// renewal, neither of which adds a revision, instead of a Put (and, behind
+// registrars rotating over several MDS, a lease grant too, as each MDS's own
+// lease had lapsed by the time the rotation came back to it). The key expires
+// when nobody has renewed its lease for kTtlSeconds, as before.
+//
+// The local map keeps, per key, when this MDS last wrote it (for the stats
+// interval). Entries are discarded after four etcd TTLs without local use.
 Status MdsServer::UpsertLeased(const std::string& key, const MemberInfo& m,
                                LocalLeaseMap& leases, bool client) {
-  std::string val = EncodeMembers({m}, 0);
-  // Look up this member's known lease under the lock, then do the BLOCKING etcd
-  // calls OUTSIDE it. Previously lease_mu_ was held across LeaseKeepAlive/Grant/Put,
-  // so every member's heartbeat serialized on one mutex held across network I/O —
-  // a slow etcd stalled all members' liveness. Now heartbeats for distinct members
-  // run in parallel; the lock only guards the in-memory {key->leaseID} map.
+  const std::string val = EncodeMembers({m}, 0);
   constexpr uint64_t kLocalLeaseStaleMs =
       static_cast<uint64_t>(kTtlSeconds) * 4 * 1000;
   const uint64_t now_ms = SteadyNowMs();
@@ -424,34 +450,50 @@ Status MdsServer::UpsertLeased(const std::string& key, const MemberInfo& m,
   if (pruned != 0)
     pruned_metric.fetch_add(pruned, std::memory_order_relaxed);
   current_metric.store(leases.Size(), std::memory_order_relaxed);
-  int64_t existing = 0;
-  const bool have = leases.LookupAndTouch(key, now_ms, &existing);
-  // Fast path: refresh the lease AND re-write the key under it. The Put is
-  // load-bearing, not redundant: with several MDS instances behind a rotating
-  // registrar, a slow path on ANOTHER MDS re-attaches the key to that MDS's
-  // lease. From then on a value-less keepalive here would refresh a lease that
-  // no longer holds the key, while the key's actual lease only gets refreshed
-  // once per full rotation (N_mds * heartbeat) — at 3 MDS * 10s hb that equals
-  // the 30s TTL, so the member can expire out of etcd while every heartbeat
-  // still returns kOk. Re-putting under our own live lease restores the
-  // invariant "any MDS that answers a heartbeat guarantees the key survives".
-  // It also propagates MemberInfo changes (ip/weight after a reconfigure)
-  // that the old refresh silently dropped. Cost: one small etcd write per
-  // heartbeat; the epoch is a content hash, so unchanged values don't make
-  // clients rebuild their ring.
-  if (have && etcd_.LeaseKeepAlive(existing) && etcd_.Put(key, val, existing))
-    return Status::kOk;
-  // Slow path: (re)grant a lease and (re)write the member key. A same-key race
-  // here (two heartbeats both missing the lease) can briefly orphan one lease,
-  // which expires on its own via the TTL; same-key heartbeats are serial in
-  // practice (one node, one connection), so this is rare and harmless.
+  auto io_error = [&] {
+    metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed);
+    return Status::kIOError;
+  };
+  auto put = [&](int64_t lease) {
+    if (!etcd_.Put(key, val, lease)) return false;
+    metrics_.record_puts.fetch_add(1, std::memory_order_relaxed);
+    leases.Store(key, lease, SteadyNowMs());
+    current_metric.store(leases.Size(), std::memory_order_relaxed);
+    return true;
+  };
+  const auto stored = etcd_.Get(key);
+  if (!stored) return io_error();
+  if (stored->exists && stored->lease != 0 &&
+      etcd_.LeaseKeepAlive(stored->lease)) {
+    if (stored->value == val) {
+      metrics_.record_puts_skipped.fetch_add(1, std::memory_order_relaxed);
+      return Status::kOk;
+    }
+    int64_t known = 0;
+    uint64_t put_ms = 0;
+    const bool recent =
+        leases.LookupAndTouch(key, now_ms, &known, &put_ms) &&
+        now_ms >= put_ms && now_ms - put_ms < stats_put_ms_;
+    const bool stats_only = OnlyStatsDiffer(stored->value, m, val);
+    if (recent && stats_only) {
+      metrics_.record_puts_skipped.fetch_add(1, std::memory_order_relaxed);
+      return Status::kOk;
+    }
+    if (put(stored->lease)) return Status::kOk;
+    // The lease is renewed and the record listed: only its stats are stale.
+    if (stats_only) {
+      metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed);
+      return Status::kOk;
+    }
+    return io_error();
+  }
+  // Absent, without a lease, or its lease expired: a new lease. A same-key
+  // race here (two heartbeats both finding no live lease) can briefly orphan
+  // one lease, which expires on its own via the TTL.
   auto lid = etcd_.LeaseGrant(kTtlSeconds);
-  if (!lid) { metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed); return Status::kIOError; }
+  if (!lid) return io_error();
   metrics_.lease_grants.fetch_add(1, std::memory_order_relaxed);
-  if (!etcd_.Put(key, val, *lid)) { metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed); return Status::kIOError; }
-  leases.Store(key, *lid, SteadyNowMs());
-  current_metric.store(leases.Size(), std::memory_order_relaxed);
-  return Status::kOk;
+  return put(*lid) ? Status::kOk : io_error();
 }
 
 Status MdsServer::ListMembers(const std::string& group, std::string* out,

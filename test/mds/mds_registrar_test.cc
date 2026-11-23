@@ -250,18 +250,18 @@ TEST(MdsRegistrar, ClientBackgroundLoopKeepsAlive) {
 }
 
 TEST(MdsRegistrar, DefaultTimeoutAllowsValidSequentialMdsBudget) {
-  // A valid MDS upsert can consume three sequential 2 s etcd budgets. Delay
-  // just beyond the full 6 s composed server budget; the registrar's 7 s
+  // A valid MDS upsert can consume four sequential 2 s etcd budgets. Delay
+  // just beyond the full 8 s composed server budget; the registrar's 9 s
   // default must still accept the successful response.
-  static_assert(MdsRegistrar::kDefaultIoTimeoutMs > 3 * 2000,
+  static_assert(MdsRegistrar::kDefaultIoTimeoutMs > 4 * 2000,
                 "registrar timeout must exceed composed MDS etcd budget");
-  DelayedFakeMds fake({6100});
+  DelayedFakeMds fake({8100});
   MemberInfo self{"slow-node", "10.9.9.12", 28000, 1};
   MdsRegistrar reg({fake.endpoint()}, "slow-group", self);
   const auto start = std::chrono::steady_clock::now();
   EXPECT_TRUE(reg.RegisterOnce());
   EXPECT_GE(std::chrono::steady_clock::now() - start,
-            std::chrono::milliseconds(6000));
+            std::chrono::milliseconds(8000));
   EXPECT_TRUE(reg.registered());
 }
 

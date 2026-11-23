@@ -362,7 +362,8 @@ TTL-debounced etcd probe 判定（`DFKV_MDS_PROBE_CACHE_MS`，默认 2500 ms 内
 | `dfkv_build_info{version,role="mds"}` | gauge | MDS 二进制版本；恒为 1 |
 | `dfkv_mds_register_requests_total` / `dfkv_mds_keepalives_total` | counter | 注册 / 心跳 |
 | `dfkv_mds_list_requests_total` | counter | ListMembers 次数 |
-| `dfkv_mds_lease_grants_total` | counter | etcd lease 授予 |
+| `dfkv_mds_lease_grants_total` | counter | etcd lease 授予：只在 member 记录不存在或其租约已过期时发生，稳态下不增长 |
+| `dfkv_mds_record_puts_total` / `dfkv_mds_record_puts_skipped_total` | counter | 写进 etcd 的 member/client 记录 / 只续租约、没有写的心跳（记录未变，或只有统计变了且未到 `DFKV_MDS_STATS_PUT_MS`）。稳态下前者每节点约每分钟 1 次 |
 | `dfkv_mds_etcd_errors_total` | counter | etcd I/O 失败 |
 | `dfkv_mds_max_conns` | gauge | 生效的并发连接上限：`DFKV_MDS_MAX_CONNS` 按进程 fd 上限折算后的值；小于配置值说明 `LimitNOFILE` 不够 |
 | `dfkv_mds_accept_failures_total` | counter | MDS 监听 `accept()` 因 fd 或内存耗尽失败的次数；每次失败后退避 100 ms 再试。增长 = fd 上限不足，同时 MDS 连 etcd 也可能失败 |
@@ -370,7 +371,7 @@ TTL-debounced etcd probe 判定（`DFKV_MDS_PROBE_CACHE_MS`，默认 2500 ms 内
 | `dfkv_mds_members` | gauge | 上次 List 返回的成员数 |
 | `dfkv_mds_client_register_requests_total` / `dfkv_mds_client_keepalives_total` / `dfkv_mds_client_list_requests_total` | counter | consumer 注册 / 心跳 / ListClients |
 | `dfkv_mds_clients` | gauge | 上次 ListClients 返回的 consumer 数 |
-| `dfkv_mds_etcd_requests_total{op}` / `dfkv_mds_etcd_request_errors_total{op}` | counter | etcd HTTP 请求 / 传输或 HTTP status 失败，`op=lease_grant|lease_keepalive|put|range|metrics_range`；`metrics_range` 是每次 MDS scrape 同时用于 readiness 与 group 聚合的唯一 range，和业务控制面流量分开计数 |
+| `dfkv_mds_etcd_requests_total{op}` / `dfkv_mds_etcd_request_errors_total{op}` | counter | etcd HTTP 请求 / 传输或 HTTP status 失败，`op=lease_grant|lease_keepalive|put|range|metrics_range|get`（`get` 是心跳读单条记录及其租约）；`metrics_range` 是每次 MDS scrape 同时用于 readiness 与 group 聚合的唯一 range，和业务控制面流量分开计数 |
 | `dfkv_mds_etcd_request_duration_seconds{op}` | histogram | 同五类 etcd HTTP 请求延迟（50µs–60s + `+Inf`）；用于区分本地控制面排队、常规 etcd 慢响应和 scrape 自身的聚合 range |
 | `dfkv_mds_local_member_leases` / `dfkv_mds_local_client_leases` | gauge | 本 MDS 进程当前缓存的 member/client lease shortcut 数；只是 etcd 权威状态的有界优化 |
 | `dfkv_mds_local_member_leases_pruned_total` / `dfkv_mds_local_client_leases_pruned_total` | counter | 因多个 TTL 未在本 MDS 使用而丢弃的本地 shortcut；churn 下增长正常，下次心跳会 fresh grant+Put |
