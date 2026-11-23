@@ -673,20 +673,24 @@ class TestDeviceDirectEndToEnd(unittest.TestCase):
             self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
             kv_cache_dim=self.KV_DIM)
 
-    def test_host_read_reports_only_stored_pages_present(self):
-        """In device-direct mode the host entry batch_get_v1 loads nothing (the
-        objects are layer-major SG groups). It must still report a page as
-        retrieved only if the page is stored; it used to report every page."""
+    def test_host_read_of_device_direct_pages_loads_nothing(self):
+        """In device-direct mode the host entry batch_get_v1 cannot load the
+        objects (layer-major SG groups), so every page is a miss and the host
+        buffer keeps what it held. It used to report stored pages present,
+        which a caller reading the host buffer next would take as loaded."""
         st = self._plugin(self._node("anchor"))
         st.register_mem_pool_device(self._mla_device_pool())
-        st.mem_pool_host = _NumpyHostPool(
-            self.LAYER_NUM * self.PAGE_SIZE * self.KV_DIM)
+        page_bytes = self.LAYER_NUM * self.PAGE_SIZE * self.KV_DIM
+        st.mem_pool_host = _NumpyHostPool(page_bytes)
+        st.mem_pool_host.arr[:] = 0x5C
         self.assertEqual(
             st.batch_set_v1_device(["stored"], list(range(self.PAGE_SIZE))),
             [True])
+        self.assertEqual(st.batch_exists(["stored", "never_written"]), 1)
         self.assertEqual(
             st.batch_get_v1(["stored", "never_written"], [0, 1]),
-            [True, False])
+            [False, False])
+        self.assertTrue((st.mem_pool_host.arr == 0x5C).all())
 
     @staticmethod
     def _native_counter(st, sample):

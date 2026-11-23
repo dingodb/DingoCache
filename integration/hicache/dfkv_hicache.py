@@ -2258,6 +2258,16 @@ class DfkvHiCache(HiCacheStorage):
         del key_owners
         return [out[i] == 1 for i in range(len(subkeys))]
 
+    def _note_device_host_read_once(self):
+        """One-time warning: a host read of device-direct KV loads nothing."""
+        if getattr(self, "_device_host_read_noted", False):
+            return
+        self._device_host_read_noted = True
+        _log.warning(
+            "dfkv: batch_get_v1 called while primary KV is stored "
+            "device-direct; the host read cannot load those objects and "
+            "reports every page missing (the device entries load them)")
+
     def _note_logical_anchor_once(self):
         """One-time notice that the primary KV pool is a logical anchor.
 
@@ -2653,29 +2663,19 @@ class DfkvHiCache(HiCacheStorage):
                 self._metrics.on_get(
                     pages=n, hit_pages=sum(res), nbytes=len(sks), seconds=dur)
                 return res
-            # Device-direct PUT writes SG-chunked keys via _flatten_device
-            # (_sg_group_key), but this host-buffer GET path uses flat keys
-            # via _flatten/_keys. The key namespaces differ, so a host GET
-            # would miss every page that device-direct PUT wrote, and the
-            # stored bytes are layer-major, not this buffer's layout. So this
-            # call loads nothing into the host buffer: it is the presence
-            # anchor the prefetch controller counts, and the real KV is
-            # loaded through the device path. A page is reported present only
-            # if its stored objects exist: every SG group once this process
-            # has done a device transfer and so knows the group count, group
-            # 0 before that (as batch_exists probes). A page that is not in
-            # the store must not be reported as retrieved; the device read
-            # checks every group's length.
+            # Device-direct objects are layer-major SG groups under their own
+            # keys; they cannot be read into this host buffer, so nothing is
+            # loaded and every page is a miss. Answering "present" without the
+            # bytes would make a caller that reads the host buffer next use
+            # whatever it held as KV. The bypass SGLang builds never call this
+            # for device-direct KV (they discover with batch_exists and load
+            # through the device entries), so the miss costs them nothing.
             if self._device_direct_active():
-                sks = [sk for key in keys
-                       for sk in self._stored_keys("kv", key)]
-                per_page = len(sks) // n if n else 0
-                res = self._fold(self._batch_exist_flat(sks), n, per_page)
-                r.result = f"device_direct_anchor present={sum(res)}/{n}"
+                self._note_device_host_read_once()
+                r.result = f"device_direct miss {n}/{n} (host read loads nothing)"
                 if _sp:
-                    _sp.hits = sum(res)
-                    _sp.attrs = {"dfkv.device_direct_anchor": True}
-                return res
+                    _sp.attrs = {"dfkv.device_direct_host_read": True}
+                return [False] * n
             ptrs, sizes = meta
             sub, sks, sp, ss = self._flatten(keys, ptrs, sizes)
             karr, klens, parr, sarr, out, key_owners = _arrays(sks, sp, ss)

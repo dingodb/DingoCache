@@ -155,7 +155,7 @@ rm -f /etc/dfkv/hot.json
 | `pool_components` | 多池 layout 探测（随 `register_mem_host_pool_v2`） | `components=(…) replicated=<bool> (ok)` |
 | `register_mem_pool_device` / `register_mem_pool_device_sidecar` / `register_mem_pool_device_draft` / `register_mem_pool_device_draft_sidecar` | GPU 池 / DSA sidecar / draft / draft-indexer 池注册（bypass 下失败即拒启动） | `registered N device region(s)`（sidecar/draft 相应加修饰词）/ `no … device buffer registered`；失败 `failed (<异常类型>)` 并 `raise` |
 | `batch_set_v1` | 零拷贝写（生产热路径） | `ok H/N`；MLA 非 0 号 rank 为 `backup_skip` |
-| `batch_get_v1` | 零拷贝读（生产热路径） | `hits=H/N` |
+| `batch_get_v1` | 零拷贝读（生产热路径） | `hits=H/N`；逻辑锚池为 `anchor_marker hits=H/N`；主 KV 以 device-direct 形态存储时不读任何数据、每页报 miss，为 `device_direct miss N/N (host read loads nothing)` |
 | `batch_set_v1_device` | device-directed 零拷贝写（GPUDirect，同语义、同结果格式） | `ok H/N (device-direct)`；MLA 非 0 号 rank 为 `backup_skip` |
 | `batch_get_v1_device` | device-directed 零拷贝读 | `hits=H/N (device-direct)`；截断读追加 ` short_read=S` |
 | `batch_set_v1_device_draft` / `batch_get_v1_device_draft` | DSA draft 池 device-directed 读写（同语义零拷贝） | `ok H/N (draft device-direct)` / `hits=H/N (draft device-direct)`；带 indexer sidecar 时追加 ` +indexer H/N`；复制 draft 的非 0 号 rank 写为 `backup_skip` |

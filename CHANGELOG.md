@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- SGLang HiCache connector, device-direct (L2-bypass): the host read
+  `batch_get_v1` reports every page missing when primary KV is stored
+  device-direct, and leaves the host buffer as it was. It cannot load those
+  objects (layer-major scatter-gather groups) into a host buffer, yet it
+  reported a stored page as present: a caller that then read the host buffer
+  would have used whatever the buffer held as KV. The SGLang builds with the
+  bypass never call it for device-direct KV (prefetch only records the
+  request, discovery uses `batch_exists`, loads go through the device
+  entries), so for them nothing changes; whether a page is stored is
+  `batch_exists`'s answer. A WARNING is logged once if it is called.
 - Drain (MDS-04, off by default): a node with `DFKV_DRAIN=1` can be put in
   a draining state, by `dfkvctl drain <node> [--undrain]` or by a stop with
   `DFKV_STOP_DRAIN_MS` set (it drains that long, then stops; a second
