@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+
+- Server, RAM tier: a PUT's check of whether the disk already holds its key
+  is made before the RAM shard lock, not under it. The disk store's check
+  takes the store's lock, which a slow metadata write (`slots.tbl`) can
+  hold; meanwhile every RAM hit of that shard waited. In a test where the
+  check takes 300 ms, the slowest RAM hit of the shard took 299 ms; now it
+  does not wait for it.
 - MDS and dfkvctl: one step takes a node out of the ring, behind
   `DFKV_MDS_FENCING=1` (off by default; it adds `/fenced/<id>` records to
   the etcd layout, and every MDS of the group needs it).
