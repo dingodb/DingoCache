@@ -3,11 +3,13 @@
 // summary-based recovery, and the crash points around them (§8.2: C9, C18,
 // C21, C28), with the REMOVE and PUT orderings this stage's hooks expose
 // (C31, C32, C34) and the interrupted reset (C35).
+#include <fcntl.h>
 #include <gtest/gtest.h>
 
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <cstdio>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -332,6 +334,204 @@ TEST(LogStoreJournal, AnInterruptedResetIsRepeated) {
     EXPECT_TRUE(s.Healthy());
     const std::string v = Val(9, 5000);
     EXPECT_EQ(s.Cache(Key(9), v.data(), v.size()), Status::kOk);
+    fs::remove_all(dir);
+  }
+}
+
+// ---- segment headers outside the store mutex (§6.7) ---------------------------------
+namespace {
+// Blocks the calling thread until `flag` is set or `ms` pass; true if set.
+bool WaitFor(const std::atomic<bool>& flag, int ms) {
+  for (int i = 0; i < ms && !flag.load(); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  return flag.load();
+}
+thread_local int tl_role = 0;  // 1: the PUT that opens; 2: the PUT that finishes
+}  // namespace
+
+// A PUT that finishes its write while another PUT writes a new segment's
+// header does not wait for that header (the mutex is free meanwhile); the
+// opener publishes the segment even though a REMOVE cancelled its own PUT
+// meanwhile, and the next PUT writes into it.
+TEST(LogStoreHeaders, PutsFinishWhileASegmentHeaderIsWritten) {
+  const fs::path dir = TestDir("unlockedheader");
+  std::atomic<bool> release_preopen{false}, a_in_open{false}, b_done{false},
+      release_a{false}, b_reserved{false};
+  auto o = Quiet(dir);  // 4 MiB segments, one open
+  o.crash_hook = [&](const char* p) {
+    if (std::strcmp(p, "preopen.before_header") == 0) {
+      WaitFor(release_preopen, 30000);  // no pre-opened segment: PUTs open
+    } else if (std::strcmp(p, "put.after_reserve") == 0 && tl_role == 2) {
+      b_reserved = true;
+      WaitFor(a_in_open, 10000);
+    } else if (std::strcmp(p, "open.before_header") == 0 && tl_role == 1) {
+      a_in_open = true;
+      WaitFor(release_a, 10000);
+    }
+  };
+  bool ok = false;
+  LogStore s(o, &ok);
+  ASSERT_TRUE(ok) << s.StartupError();
+  constexpr size_t kLen = 1 << 20;  // three to a 4 MiB segment
+  for (uint64_t id = 0; id < 2; ++id) {
+    const std::string v = Val(id, kLen);
+    ASSERT_EQ(s.Cache(Key(id), v.data(), v.size()), Status::kOk);
+  }
+  Status b_status = Status::kIOError, a_status = Status::kIOError;
+  std::thread b([&] {  // the segment's last record: reserved, then held
+    tl_role = 2;
+    const std::string v = Val(2, kLen);
+    b_status = s.Cache(Key(2), v.data(), v.size());
+    b_done = true;
+  });
+  std::thread a([&] {  // does not fit: opens the next segment
+    WaitFor(b_reserved, 10000);
+    tl_role = 1;
+    const std::string v = Val(3, kLen);
+    a_status = s.Cache(Key(3), v.data(), v.size());
+  });
+  ASSERT_TRUE(WaitFor(a_in_open, 10000)) << "the opener never reached its header";
+  EXPECT_TRUE(WaitFor(b_done, 5000))
+      << "a PUT finishing its write waited for another PUT's header write";
+  EXPECT_EQ(b_status, Status::kOk);
+  // A REMOVE cancels the opener's own PUT while its header is written.
+  EXPECT_EQ(s.Remove(Key(3)), Status::kOk);
+  release_a = true;
+  a.join();
+  b.join();
+  EXPECT_EQ(a_status, Status::kOk);  // began before the REMOVE
+  std::string out;
+  EXPECT_EQ(s.Range(Key(3), 0, 0, &out), Status::kNotFound);
+  // The segment was published all the same: the next PUT goes into it.
+  const std::string v = Val(4, kLen);
+  EXPECT_EQ(s.Cache(Key(4), v.data(), v.size()), Status::kOk);
+  EXPECT_TRUE(Has(s, 4, kLen));
+  EXPECT_TRUE(Has(s, 2, kLen));
+  EXPECT_EQ(s.GetStats().open_segments, 1u);
+  release_preopen = true;
+  ASSERT_TRUE(s.Close());
+  fs::remove_all(dir);
+}
+
+// A clean close gives the pre-opened segment an empty trailer: nothing is
+// walked at the next open. After a kill it is walked, holds nothing, and is
+// free again (C39).
+TEST(LogStoreHeaders, APreopenedSegmentAtCloseAndAtAKill) {
+  constexpr size_t kLen = 500000;
+  for (const bool kill : {false, true}) {
+    SCOPED_TRACE(kill ? "kill" : "clean close");
+    const fs::path dir = TestDir(kill ? "preopen_kill" : "preopen_close");
+    ASSERT_EQ(InChild([&] {
+                bool ok = false;
+                LogStore s(Quiet(dir), &ok);
+                if (!ok) return 2;
+                for (uint64_t id = 0; id < 20; ++id) {
+                  const std::string v = Val(id, kLen);
+                  if (s.Cache(Key(id), v.data(), v.size()) != Status::kOk) return 3;
+                }
+                // Up to 10 s: the sealer may be slow (TSan, a loaded host).
+                for (int i = 0; i < 1000 && s.GetStats().preopened == 0; ++i)
+                  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                if (s.GetStats().preopened != 1) return 4;
+                if (kill) Kill(0);
+                return s.Close() ? 0 : 5;
+              }),
+              0);
+    bool ok = false;
+    LogStore s(Quiet(dir), &ok);
+    ASSERT_TRUE(ok) << s.StartupError();
+    const auto r = s.GetRecoveryStats();
+    if (kill) {
+      EXPECT_GE(r.segments_walked, 2u) << "the open and the pre-opened segment";
+      EXPECT_LE(r.segments_walked, 1u + 5) << "K + 5 (§8.4)";
+    } else {
+      EXPECT_EQ(r.segments_walked, 0u);
+    }
+    for (uint64_t id = 0; id < 20; ++id) EXPECT_TRUE(Has(s, id, kLen)) << id;
+    // Every segment is accounted for: nothing leaked by the pre-open.
+    const auto st = s.GetStats();
+    EXPECT_EQ(st.segment_count, 8u);
+    fs::remove_all(dir);
+  }
+}
+
+// Crash points of the unlocked windows (C37-C39b): at each, the store opens,
+// every REMOVE that returned stays removed, and every value served is one a
+// PUT stored. Pre-opening is slowed so that PUTs also open segments
+// themselves.
+TEST(LogStoreHeaders, CrashPointsAroundSegmentHeaders) {
+  for (const char* point : {"open.before_header", "open.after_header",
+                            "preopen.before_header", "preopen.after_header",
+                            "close.preopen_trailer"}) {
+    SCOPED_TRACE(point);
+    const fs::path dir = TestDir("headercrash");
+    const std::string removed_log = dir.string() + ".removed";
+    std::remove(removed_log.c_str());
+    constexpr size_t kLen = 400000;
+    ASSERT_EQ(InChild([&] {
+                const int log = ::open(removed_log.c_str(),
+                                       O_WRONLY | O_CREAT | O_APPEND, 0644);
+                if (log < 0) return 6;
+                auto o = Opts(dir);
+                // The first time Activate or the sealer reaches it is before
+                // any write: exit at a later one.
+                auto exit_at = ExitAt(
+                    point, std::strcmp(point, "close.preopen_trailer") == 0 ? 1 : 3);
+                // The open.* points are reached only by a PUT that fills its
+                // segment and finds no segment pre-opened for it. A writer
+                // slower than the sealer's pre-open (under TSan, about 10
+                // values of 400 KB per segment take longer than any fixed
+                // delay here) always finds one: hold the pre-open until the
+                // crash ends the child. The sealer then seals nothing either;
+                // its queue holds two segments, and the third open comes at
+                // the second switch, so the writer never waits for it.
+                const bool open_point = std::strncmp(point, "open.", 5) == 0;
+                o.crash_hook = [&](const char* p) {
+                  if (std::strcmp(p, "preopen.before_header") == 0)
+                    std::this_thread::sleep_for(
+                        open_point ? std::chrono::milliseconds(60000)
+                                   : std::chrono::milliseconds(20));
+                  exit_at(p);
+                };
+                bool ok = false;
+                LogStore s(o, &ok);
+                if (!ok) return 2;
+                for (uint64_t id = 0; id < 300; ++id) {
+                  const std::string v = Val(id, kLen);
+                  const Status st = s.Cache(Key(id), v.data(), v.size());
+                  if (id % 10 == 3 && st == Status::kOk) {
+                    if (s.Remove(Key(id)) != Status::kOk) return 5;
+                    if (::write(log, &id, sizeof(id)) != sizeof(id)) return 7;
+                  }
+                }
+                s.Close();  // reaches close.preopen_trailer
+                return 9;
+              }),
+              0);
+    std::set<uint64_t> removed;
+    {
+      std::ifstream in(removed_log, std::ios::binary);
+      uint64_t id = 0;
+      while (in.read(reinterpret_cast<char*>(&id), sizeof(id))) removed.insert(id);
+    }
+    std::remove(removed_log.c_str());
+    EXPECT_FALSE(removed.empty()) << "no REMOVE returned before the crash";
+    bool ok = false;
+    LogStore s(Quiet(dir), &ok);
+    ASSERT_TRUE(ok) << s.StartupError();
+    EXPECT_LE(s.GetRecoveryStats().segments_walked, 1u + 5) << "K + 5 (§8.4)";
+    for (uint64_t id = 0; id < 300; ++id) {
+      std::string out;
+      const Status st = s.Range(Key(id), 0, 0, &out);
+      if (removed.count(id)) {
+        EXPECT_EQ(st, Status::kNotFound) << "removed " << id;
+      } else if (st == Status::kOk) {
+        EXPECT_EQ(out, Val(id, kLen)) << id;
+      }
+    }
+    // The store goes on: a PUT after the crash is stored.
+    const std::string v = Val(9999, kLen);
+    EXPECT_EQ(s.Cache(Key(9999), v.data(), v.size()), Status::kOk);
     fs::remove_all(dir);
   }
 }

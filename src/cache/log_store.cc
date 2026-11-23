@@ -948,16 +948,22 @@ bool LogStore::OpenStore() {
   return true;
 }
 
-bool LogStore::FreshHeader(uint32_t index, bool empty) {
+bool LogStore::ClaimIncarnationLocked(uint64_t* inc) {
   if (next_incarnation_ >= sb_.incarnation_reserved) {
     sb_.incarnation_reserved = next_incarnation_ + kIncarnationRange;
     if (!WriteSuperblock()) return false;
   }
-  const uint64_t inc = next_incarnation_++;
+  *inc = next_incarnation_++;
+  return true;
+}
+
+// Only the thread that claimed the segment writes to it until it is
+// published; its descriptors do not change while the store is open.
+bool LogStore::WriteSegmentHeader(uint32_t index, uint64_t inc, bool empty) {
+  const Segment& s = segments_[index];
+  const int fd = s.dio_fd >= 0 ? s.dio_fd : s.fd;
   const lse::Block b = lse::EncodeSegmentHeader({sb_.store_uuid, index, inc});
-  Segment& s = segments_[index];
-  if (!PwriteBlock(io_.get(), s.dio_fd >= 0 ? s.dio_fd : s.fd, b.data(),
-                   kBlockBytes, 0, /*dsync=*/true))
+  if (!PwriteBlock(io_.get(), fd, b.data(), kBlockBytes, 0, /*dsync=*/true))
     return false;
   // The new header is durable: the old incarnation's records are rejected
   // from now on, and the kills naming it are garbage (§4.5).
@@ -967,18 +973,59 @@ bool LogStore::FreshHeader(uint32_t index, bool empty) {
     t.incarnation = inc;
     t.summary_offset = kBlockBytes;
     const lse::Block tb = lse::EncodeTrailer(t);
-    if (!PwriteBlock(io_.get(), s.dio_fd >= 0 ? s.dio_fd : s.fd, tb.data(),
-                     kBlockBytes, sb_.segment_bytes - kBlockBytes, true))
+    if (!PwriteBlock(io_.get(), fd, tb.data(), kBlockBytes,
+                     sb_.segment_bytes - kBlockBytes, true))
       return false;
   }
+  return true;
+}
+
+// Every field a fresh incarnation resets, at once (§6.7.1).
+void LogStore::PublishHeaderLocked(uint32_t index, uint64_t inc) {
+  Segment& s = segments_[index];
   s.incarnation = inc;
   s.header_valid = true;
   s.append_off = kBlockBytes;
   s.records = 0;
   s.last_lsn = 0;
   s.summary.clear();
+  s.copies.clear();
+  s.unsynced = false;
+  s.dirty = false;
+  s.protected_bytes = 0;
+  // Only now that the header is durable may compaction drop the kills that
+  // name the old incarnation (§4.5).
   live_kills_.erase(index);
+}
+
+bool LogStore::FreshHeader(uint32_t index, bool empty) {
+  uint64_t inc = 0;
+  if (!ClaimIncarnationLocked(&inc) || !WriteSegmentHeader(index, inc, empty))
+    return false;
+  PublishHeaderLocked(index, inc);
   return true;
+}
+
+bool LogStore::FreshHeaderUnlocked(Lock& lk, uint32_t index, bool empty,
+                                   const char* before_hook,
+                                   const char* after_hook) {
+  uint64_t inc = 0;
+  if (!ClaimIncarnationLocked(&inc)) {
+    FailStore("cannot write lse_super", errno);
+    return false;
+  }
+  lk.unlock();
+  Hook(before_hook);
+  const bool ok = WriteSegmentHeader(index, inc, empty);
+  const int err = errno;
+  if (ok) Hook(after_hook);
+  lk.lock();
+  if (!ok) {
+    FailStore("cannot write a segment header", err);
+    return false;
+  }
+  PublishHeaderLocked(index, inc);
+  return !failed_.load();
 }
 
 bool LogStore::ResetToEmpty() {
@@ -1181,7 +1228,7 @@ bool LogStore::Activate() {
   k_open_ = OpenSegmentCount();
   for (uint32_t n = 0; n < k_open_; ++n) {
     uint32_t next = 0;
-    if (!TakeFreeSegmentLocked(/*client=*/true, &next)) break;
+    if (!TakeFreeSegment(lk, /*client=*/true, &next)) break;
     open_.push_back(next);
     segments_[next].state = SegState::kOpen;
   }
@@ -1221,6 +1268,25 @@ bool LogStore::Close() {
   for (uint32_t i : to_seal) {
     segments_[i].state = SegState::kSealing;
     if (ok && !SealSegment(lk, i)) ok = false;
+  }
+  // The pre-opened segment gets the empty trailer of its incarnation, so
+  // that the next open does not walk it (§6.7.4); not on a failed store.
+  if (preopened_ != UINT32_MAX) {
+    Segment& s = segments_[preopened_];
+    if (ok) {
+      lse::Trailer t;
+      t.store_uuid = sb_.store_uuid;
+      t.incarnation = s.incarnation;
+      t.summary_offset = kBlockBytes;
+      const lse::Block tb = lse::EncodeTrailer(t);
+      Hook("close.preopen_trailer");
+      if (!PwriteBlock(io_.get(), s.dio_fd >= 0 ? s.dio_fd : s.fd, tb.data(),
+                       kBlockBytes, sb_.segment_bytes - kBlockBytes, true))
+        ok = false;
+    }
+    s.state = SegState::kFree;
+    free_.push_back(preopened_);
+    preopened_ = UINT32_MAX;
   }
   lk.unlock();
   Hook("close.after_seal");
@@ -1357,21 +1423,39 @@ uint64_t LogStore::NextLsnLocked() {
   return lsn;
 }
 
-bool LogStore::TakeFreeSegmentLocked(bool client, uint32_t* out) {
+bool LogStore::TakeFreeSegment(Lock& lk, bool client, uint32_t* out) {
   const uint32_t reserve = client ? kCleanerReserve : 0;
-  while (FreeCountLocked() > reserve) {
-    const uint32_t next = free_.front();
-    free_.erase(free_.begin());
-    if (!FreshHeader(next)) {
-      FailStore("cannot write a segment header", errno);
-      return false;
-    }
-    *out = next;
-    state_cv_.notify_all();  // the cleaner keeps the free count up
-    return true;
-  }
+  state_cv_.notify_all();  // the cleaner keeps the free count up
+  if (FreeCountLocked() <= reserve) return false;
+  const uint32_t next = free_.front();
+  free_.erase(free_.begin());
+  segments_[next].state = SegState::kOpening;
+  if (!FreshHeaderUnlocked(lk, next, /*empty=*/false, "open.before_header",
+                           "open.after_header"))
+    return false;
+  *out = next;
+  return true;
+}
+
+// §6.7.4: one client segment with its header already durable, so that a
+// PUT that fills its segment normally switches without any I/O. Prepared by
+// the sealer, from the free list above the cleaner's reserve.
+void LogStore::PreopenLocked(Lock& lk) {
+  const uint32_t next = free_.front();
+  free_.erase(free_.begin());
+  segments_[next].state = SegState::kOpening;
+  preopening_ = true;  // the cleaner counts it from now on
+  const bool ok = FreshHeaderUnlocked(lk, next, /*empty=*/false,
+                                      "preopen.before_header",
+                                      "preopen.after_header");
+  preopening_ = false;
+  // A failed header write failed the store: the segment stays kOpening,
+  // which is harmless, as nothing is admitted or written any more.
+  if (!ok) return;
+  segments_[next].state = SegState::kPreopened;
+  preopened_ = next;
+  ++open_changes_;
   state_cv_.notify_all();
-  return false;
 }
 
 void LogStore::HandToSealerLocked(Lock& lk, uint32_t segment) {
@@ -1408,6 +1492,8 @@ bool LogStore::PlaceLocked(uint32_t segment, uint64_t footprint,
 
 bool LogStore::ReserveLocked(Lock& lk, uint64_t footprint, uint32_t* segment,
                              uint64_t* offset) {
+  // The bound counts attempts that found no room, not waits for another
+  // PUT's opening: those end with space or a failure (§6.7.3).
   for (int attempt = 0; attempt < 64 && !failed_.load(); ++attempt) {
     // Best fit (§6.1): the open segment with the least room that still
     // takes the record and one more summary entry.
@@ -1444,29 +1530,57 @@ bool LogStore::ReserveLocked(Lock& lk, uint64_t footprint, uint32_t* segment,
       HandToSealerLocked(lk, full);
       continue;
     }
-    uint32_t next = 0;
-    if (TakeFreeSegmentLocked(/*client=*/true, &next)) {
-      open_.push_back(next);
+    // Every slot is open or being opened by another PUT: wait for that
+    // opening (one header write), which publishes or gives its slot back
+    // (§6.7.3).
+    if (open_.size() + client_openings_ >= k_open_) {
+      const uint64_t seen = open_changes_;
+      const auto wait_t0 = std::chrono::steady_clock::now();
+      state_cv_.wait(lk, [&] { return open_changes_ != seen || failed_.load(); });
+      ++stats_.segment_open_waits;
+      stats_.segment_open_wait_us += MicrosSince(wait_t0);
+      --attempt;  // a wait, not an attempt
+      continue;
+    }
+    if (preopened_ != UINT32_MAX) {  // no I/O: its header is durable
+      const uint32_t ready = preopened_;
+      preopened_ = UINT32_MAX;
+      segments_[ready].state = SegState::kOpen;
+      open_.push_back(ready);
+      ++stats_.preopened_taken;
+      ++open_changes_;
+      state_cv_.notify_all();  // the sealer prepares the next one
+      continue;
+    }
+    // Take a slot: a free segment, or one reclaimed inline, with its header
+    // written without the mutex. The slot is given back on every exit.
+    ++client_openings_;
+    uint32_t next = UINT32_MAX;
+    bool got = TakeFreeSegment(lk, /*client=*/true, &next);
+    if (!got && !failed_.load()) {
+      const auto inline_t0 = std::chrono::steady_clock::now();
+      got = InlineReclaimLocked(lk, &next);
+      if (got) stats_.inline_reclaim_us += MicrosSince(inline_t0);
+    }
+    --client_openings_;
+    ++open_changes_;
+    if (got) {
       segments_[next].state = SegState::kOpen;
-      continue;
+      open_.push_back(next);
     }
-    if (failed_.load()) return false;
-    const auto inline_t0 = std::chrono::steady_clock::now();
-    if (InlineReclaimLocked(lk)) {
-      stats_.inline_reclaim_us += MicrosSince(inline_t0);
-      continue;
-    }
+    state_cv_.notify_all();
+    if (got) continue;
     // Nothing to reclaim inline (every sealed segment holds a protected
     // value or is pinned): right after the cleaner was armed, wait for it
     // instead of answering kCacheFull at once.
     if (failed_.load() || !opt_.cleaner || stop_threads_ ||
         std::chrono::steady_clock::now() >= arm_grace_until_)
       return false;
-    const size_t opened = open_.size();
+    const uint64_t seen = open_changes_;
     const auto grace_t0 = std::chrono::steady_clock::now();
     state_cv_.wait_until(lk, arm_grace_until_, [&] {
-      return FreeCountLocked() > kCleanerReserve || open_.size() > opened ||
-             failed_.load() || stop_threads_;
+      return FreeCountLocked() > kCleanerReserve || open_changes_ != seen ||
+             preopened_ != UINT32_MAX || failed_.load() || stop_threads_;
     });
     ++stats_.cleaner_waits;
     stats_.cleaner_wait_us += MicrosSince(grace_t0);
@@ -1488,7 +1602,7 @@ bool LogStore::ReserveRelocationLocked(Lock& lk, uint64_t footprint,
       continue;
     }
     uint32_t next = 0;
-    if (!TakeFreeSegmentLocked(/*client=*/false, &next)) return false;
+    if (!TakeFreeSegment(lk, /*client=*/false, &next)) return false;
     reloc_segment_ = next;
     segments_[next].state = SegState::kRelocation;
   }
@@ -1948,6 +2062,10 @@ void LogStore::SealerLoop() {
       continue;
     }
     if (stop_threads_) break;
+    if (preopened_ == UINT32_MAX && FreeCountLocked() > kCleanerReserve) {
+      PreopenLocked(lk);
+      continue;
+    }
     if (std::chrono::steady_clock::now() >= next_sync) {
       // Bounds what a power loss can take of acknowledged writes (§6.5):
       // every segment written since the previous pass, the one just left
@@ -2223,19 +2341,12 @@ bool LogStore::ReclaimVictim(Lock& lk, uint32_t victim) {
   // Step 2: every relocated copy durable before the victim's records are
   // given up (C20).
   if (!SyncCopiesLocked(lk, victim)) return false;
-  lk.unlock();
-  Hook("reclaim.before_header");
-  lk.lock();
   if (failed_.load()) return false;
-  // Steps 3, 4, 6.
+  // Steps 3, 4, 6; the header written without the mutex (§6.7).
   const uint64_t old_incarnation = s.incarnation;
-  if (!FreshHeader(victim, /*empty=*/true)) {
-    FailStore("cannot write a segment header", errno);
+  if (!FreshHeaderUnlocked(lk, victim, /*empty=*/true, "reclaim.before_header",
+                           "reclaim.after_header"))
     return false;
-  }
-  lk.unlock();
-  Hook("reclaim.after_header");
-  lk.lock();
   FinishReclaimLocked(victim, old_incarnation);
   s.state = SegState::kFree;
   free_.push_back(victim);
@@ -2286,8 +2397,13 @@ void LogStore::CleanerLoop() {
     }
     // Keeps K + C segments free (§7.1); a pass that gained nothing (a
     // victim full of protected records) waits before the next.
+    // The pre-opened segment is one of the K held back for clients (§6.7.4).
     const uint32_t before = FreeCountLocked();
-    if (cleaner_armed_ && before < k_open_ + kCleanerReserve && CleanOnce(lk) &&
+    // Counted while its header is written as well: taking a free segment
+    // to pre-open it must not make the cleaner reclaim one more.
+    const uint32_t ready =
+        before + (preopened_ != UINT32_MAX || preopening_ ? 1 : 0);
+    if (cleaner_armed_ && ready < k_open_ + kCleanerReserve && CleanOnce(lk) &&
         FreeCountLocked() > before)
       continue;
     state_cv_.wait_for(lk, std::chrono::milliseconds(200));
@@ -2297,7 +2413,7 @@ void LogStore::CleanerLoop() {
 // §7.7: a PUT that finds no free segment reclaims the oldest sealed segment
 // with no pins and no protected records itself, evict-only, and takes it as
 // its open segment.
-bool LogStore::InlineReclaimLocked(Lock& lk) {
+bool LogStore::InlineReclaimLocked(Lock& lk, uint32_t* out) {
   uint32_t victim = UINT32_MAX;
   for (uint32_t i : fifo_) {
     const Segment& s = segments_[i];
@@ -2319,29 +2435,18 @@ bool LogStore::InlineReclaimLocked(Lock& lk) {
   }
   for (const auto& k : keys) EvictLocked(k, false);
   if (!SyncCopiesLocked(lk, victim)) return false;
-  lk.unlock();
-  Hook("inline_reclaim.before_header");
-  lk.lock();
   if (failed_.load()) return false;
   const uint64_t old_incarnation = s.incarnation;
-  if (!FreshHeader(victim)) {
-    FailStore("cannot write a segment header", errno);
+  if (!FreshHeaderUnlocked(lk, victim, /*empty=*/false,
+                           "inline_reclaim.before_header",
+                           "inline_reclaim.after_header"))
     return false;
-  }
-  lk.unlock();
-  Hook("inline_reclaim.after_header");
-  lk.lock();
   FinishReclaimLocked(victim, old_incarnation);
   ++stats_.inline_reclaims;
   ++stats_.segments_reclaimed;
-  if (open_.size() < k_open_) {
-    open_.push_back(victim);
-    s.state = SegState::kOpen;
-  } else {  // other PUTs opened segments meanwhile
-    s.state = SegState::kFree;
-    free_.push_back(victim);
-  }
-  state_cv_.notify_all();
+  // The caller holds a client slot for it (§6.7.3) and opens it.
+  s.state = SegState::kOpening;
+  *out = victim;
   return true;
 }
 
@@ -2564,10 +2669,14 @@ RetentionStats LogStore::GetRetentionStats() const {
 LogStore::Stats LogStore::GetStats() const {
   std::lock_guard<std::mutex> lk(mu_);
   Stats st = stats_;
-  st.segments_free = static_cast<uint32_t>(free_.size());
+  // The pre-opened segment counts as free: a client takes it as it would a
+  // free one (§6.7.4).
+  st.segments_free =
+      static_cast<uint32_t>(free_.size() + (preopened_ != UINT32_MAX ? 1 : 0));
   st.segments_sealed_now = static_cast<uint32_t>(fifo_.size());
   st.sealer_queue = static_cast<uint32_t>(seal_queue_.size());
   st.open_segments = static_cast<uint32_t>(open_.size());
+  st.preopened = preopened_ != UINT32_MAX ? 1 : 0;
   st.shadows = shadows_.size();
   st.segment_count = static_cast<uint32_t>(segments_.size());
   if (journal_) st.journal_compactions = journal_->Compactions();
@@ -2613,6 +2722,12 @@ void LogStore::EngineMetrics(std::vector<EngineMetric>* out) const {
       st.cleaner_waits);
   add("dfkv_lse_cleaner_wait_microseconds_total", "counter",
       "Time PUTs waited for the cleaner just armed", st.cleaner_wait_us);
+  add("dfkv_lse_segment_open_waits_total", "counter",
+      "PUTs that waited for another PUT's segment opening", st.segment_open_waits);
+  add("dfkv_lse_segment_open_wait_microseconds_total", "counter",
+      "Time PUTs waited for another PUT's segment opening", st.segment_open_wait_us);
+  add("dfkv_lse_preopened_taken_total", "counter",
+      "Segment openings served by the pre-opened segment", st.preopened_taken);
   add("dfkv_lse_records_relocated_total", "counter", "Records the cleaner relocated",
       st.records_relocated);
   add("dfkv_lse_relocated_bytes_total", "counter", "Footprint bytes relocated",

@@ -1832,8 +1832,12 @@ TEST(LogStore, ConcurrentCrashImagesThroughSealingAndReclaim) {
       evictions.push_back({k, g, io->Size()});
     };
     o.crash_hook = [&](const char* p) {
+      // Every new segment header, durable and not yet published (§6.7):
+      // reclaims, openings and the pre-opened segment.
       if (std::strcmp(p, "reclaim.after_header") == 0 ||
-          std::strcmp(p, "inline_reclaim.after_header") == 0) {
+          std::strcmp(p, "inline_reclaim.after_header") == 0 ||
+          std::strcmp(p, "open.after_header") == 0 ||
+          std::strcmp(p, "preopen.after_header") == 0) {
         std::lock_guard<std::mutex> lk(mu);
         headers.push_back(io->Size());
       } else if (std::strcmp(p, "relocate.after_copy") == 0) {
