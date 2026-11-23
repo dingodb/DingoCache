@@ -231,15 +231,15 @@ test -e /etc/dfkv/tenant-quotas ||
 ```
 
 
-`/etc/systemd/system/dfkv.service`（参考**一台生产节点的配置**（8 条 400G IB 轨/主机）映射到 v2.0.0 大生产参数：**v1.37 生产开了什么现阶段保留什么**；**v2 才落地的能力（SYS_URING/CONVoy 合并/监听加固/slab 水位线）设置为 drop-in 注释默认留**。更小形（单 HCA、无 RAM tier）只需对 `--rdma-dev`、`--ram-tier`/`--ram-tier-bytes` 做减法）：
+`/etc/systemd/system/dfkv.service`（参考**一台生产节点的配置**映射到 v2.0.0 大生产参数：**v1.37 生产开了什么现阶段保留什么**；**v2 才落地的能力（SYS_URING/CONVoy 合并/监听加固/slab 水位线）设置为 drop-in 注释默认留**。更小形（单 HCA、无 RAM tier）只需对 `--rdma-dev`、`--ram-tier`/`--ram-tier-bytes` 做减法）：
 
 > **生产配置 (v1.37-1.40) → v2.0.0 映射关系**：
 > | 项 | 生产 (v1.37/1.40) | 本示例 (v2.0.0) | 变动 |
 > |---|---|---|---|
-> | `--rdma-dev` | 8 轨全列 | 8 轨全列 | 一致 |
+> | `--rdma-dev` | 本机全部数据面 rail | 本机全部数据面 rail | 一致 |
 > | RDMA depth | `DFKV_RDMA_DEPTH=32` | `DFKV_RDMA_DEPTH=4` | 新默认 4 对齐 client/server——depth=1 会 clamp 批处理窗口，pipeline GET 退化 3-4×、突发 PUT 批失败致 L3 prefetch miss（热轮吞吐 -29.8%，depth=4 后仅 -2.9%）；depth>1 膨胀每连接 segment lease（depth×slot），过大在高并发时易耗尽共享 segment |
 > | RDMA_NUMA | `1` | 保留 `DFKV_RDMA_NUMA=1` | 一致 |
-> | RAM tier | on + 1TiB | on + 1TiB（`--ram-tier-bytes 1099511627776`） | 一致 |
+> | RAM tier | on | on（`--ram-tier-bytes <size>`） | 一致 |
 > | SERVER_URING | 开，depth=32 | 默认关，经 drop-in 打开（须编 `-DDFKV_WITH_URING`） | v2 保留 |
 > | READ_COALESCE | 开 | 默认关，经 drop-in 打开（TCP 端共读 convoy） | v2 新增 |
 > | 监听加固 | — | `DFKV_TCP_FIRST_REQ_MS=30000` + `DFKV_METRICS_MAX_CONNS=64` | PR#240 新增 |
@@ -249,7 +249,7 @@ test -e /etc/dfkv/tenant-quotas ||
 > | tenant quota | `DFKV_TENANT_QUOTAS_FILE` + default=0 | 保留 | 一致 |
 ```ini
 [Unit]
-Description=dfkv KV cache node (SGLang HiCache L3, 8x400G)
+Description=dfkv KV cache node (SGLang HiCache L3)
 # 启动顺序：在 MDS 之前动 After；v2 首注册 deadline 60s，必须先起 MDS 再动 server
 After=network-online.target dfkv-mds.service
 Wants=network-online.target
@@ -261,7 +261,7 @@ Type=simple
 # 代码通用默认是 128 GiB；这里按实测容量包络显式收紧为 64 GiB。
 Environment=DFKV_RDMA_DEPTH=4
 Environment=DFKV_RDMA_RECV_SEGMENT_SIZE=68719476736
-# 8×400G 轨全轨白名单 + NUMA：示例 host 带 8 个 HCA 轨。
+# 全轨白名单 + NUMA：列出本机全部数据面 HCA（示例为两条 mlx5_0、mlx5_1）。
 # 显式白名单是固定 topology：保留首次出现顺序；present DOWN rail 仍必须完成
 # anchor/共享 segment/所有配置 MR 初始化，随后由 health monitor 等待 LinkUp。
 # client 侧另行注入本机 `DFKV_RDMA_DEV`；GPU/CPU host 可有不同列表。
@@ -281,17 +281,22 @@ Environment=DFKV_METRICS_MAX_CONNS=64
 # 0/unset = unlimited. If FILE is configured it must exist and parse strictly.
 Environment=DFKV_TENANT_QUOTAS_FILE=/etc/dfkv/tenant-quotas
 Environment=DFKV_TENANT_DEFAULT_QUOTA_BYTES=0
-# --port = TCP(bootstrap+TCP数据) 端口; --rdma-port = RDMA bootstrap 端口; --rdma-dev = 数据面 8×400G
+# --port = TCP(bootstrap+TCP数据) 端口; --rdma-port = RDMA bootstrap 端口; --rdma-dev = 数据面 RDMA 设备
 # --metrics-port = 可选 Prometheus /metrics（缺省=不开端口；--id/--group 成为指标标签）;
 #   --metrics-bind <addr> 绑定监听地址（缺省 0.0.0.0）
 # 此生产示例故意不设置 --store-engine/DFKV_STORE_ENGINE：resolved 默认即 slab。
+# 两个 <size> 按本机填十进制字节数：
+#   --ram-tier-bytes：能长期锁给 dfkv 的内存（启动时整块预触页并锁住），扣掉系统、
+#     推理进程和其他服务需要的部分，并与下面的 MemoryMax、TimeoutStartSec 一起调；
+#   --cap：全部 --dir 的总容量（按盘均分），取各盘文件系统可用空间之和，减去每盘
+#     slots.tbl（约为该盘容量的 1/16384）和运维预留。
 ExecStart=/usr/local/bin/dfkv_server \
   --dir /mnt/disk1/dfkv,/mnt/disk2/dfkv,/mnt/disk3/dfkv \
   --port 28000 --rdma-port 28001 \
-  --rdma-dev ib7s400p0,ib7s400p1,ib7s400p2,ib7s400p3,ib7s400p4,ib7s400p5,ib7s400p6,ib7s400p7 \
+  --rdma-dev mlx5_0,mlx5_1 \
   --rdma-depth 4 --rdma-numa 1 \
-  --ram-tier on --ram-tier-bytes 1099511627776 --ram-tier-shards 16 \
-  --cap 6597069766656 --mds 10.0.0.1:9400,10.0.0.2:9400 \
+  --ram-tier on --ram-tier-bytes <size> --ram-tier-shards 16 \
+  --cap <size> --mds 10.0.0.1:9400,10.0.0.2:9400 \
   --metrics-port 28010 --group default --id n57 \
   --advertise 192.168.1.57:28001 \
   --mds-registration-timeout-ms 60000
@@ -1161,8 +1166,7 @@ Rollback trigger and procedure:
    verbs open/query 成功，`DOWN`/`LinkDown` 只记录、不在这里删出配置或强制拉链：
    ```bash
    set -eu
-   for dev in ib7s400p0 ib7s400p1 ib7s400p2 ib7s400p3 \
-              ib7s400p4 ib7s400p5 ib7s400p6 ib7s400p7; do
+   for dev in mlx5_0 mlx5_1; do  # 本机全部数据面 rail
      test -r "/sys/class/infiniband/$dev/ports/1/state" &&
        test -r "/sys/class/infiniband/$dev/ports/1/phys_state" || exit 1
      ibv_devinfo -d "$dev" >/dev/null
@@ -1184,15 +1188,15 @@ Rollback trigger and procedure:
 4. 冒烟（任一能访问内网的机器；只对 ring-eligible 节点执行）：
    ```bash
    dfkv_smoke --members n57=192.168.1.57:28000 --size 2752512                          # TCP
-   DFKV_RDMA=1 DFKV_RDMA_DEV=ib7s400p0 dfkv_smoke --members n57=192.168.1.57:28001 --size 2752512
+   DFKV_RDMA=1 DFKV_RDMA_DEV=mlx5_0 dfkv_smoke --members n57=192.168.1.57:28001 --size 2752512
    ```
 5. 端到端零拷贝校验（插件 → libdfkv → RDMA → server，验证 payload 直落缓冲）：
    ```bash
-   DFKV_RDMA=1 DFKV_RDMA_DEV=ib7s400p0 DFKV_MEMBERS='n=192.168.1.57:28001' \
+   DFKV_RDMA=1 DFKV_RDMA_DEV=mlx5_0 DFKV_MEMBERS='n=192.168.1.57:28001' \
      python3 test/python/rdma_e2e_validate.py    # 期望 RESULT: ZERO-COPY RDMA E2E OK
    # 随后在 server /metrics 确认 v2_ready=1、v2_conns_opened_total 增长且 free_bytes 有余量
    ```
-6. 压测（可选）：`DFKV_RDMA=1 DFKV_RDMA_DEV=ib7s400p0 dfkv_bench --members ... --size 2752512 --count 8000 --threads 64`。
+6. 压测（可选）：`DFKV_RDMA=1 DFKV_RDMA_DEV=mlx5_0 dfkv_bench --members ... --size 2752512 --count 8000 --threads 64`。
 7. 在**一个受控 SGLang 副本**上切 `dynamic` 后端，发共享长前缀请求看命中上涨，确认后推广。
 
 ### 5b. 候选版本负载回归门
@@ -1213,7 +1217,7 @@ trial 汇总 median/p95/p99；延迟从 workload 前后的 server
 并在隔离压测窗口执行，避免其它流量混入 histogram delta。
 
 ```bash
-DFKV_RDMA=1 DFKV_RDMA_DEV=ib7s400p0 DFKV_RDMA_DEPTH=4 \
+DFKV_RDMA=1 DFKV_RDMA_DEV=mlx5_0 DFKV_RDMA_DEPTH=4 \
 deploy/dfkv_load_regression.py \
   --baseline-mds 10.0.1.1:9400 --baseline-group glm \
   --baseline-metrics 10.0.1.11:28010,10.0.1.12:28010 \
