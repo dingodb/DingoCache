@@ -238,6 +238,15 @@
   request, discovery uses `batch_exists`, loads go through the device
   entries), so for them nothing changes; whether a page is stored is
   `batch_exists`'s answer. A WARNING is logged once if it is called.
+
+- Docs: `DFKV_RDMA_IDLE_MS` on the server must be at least three times the
+  client's `DFKV_RDMA_KEEPALIVE_MS` (the defaults, 600000 and 15000, are);
+  with one beat of margin a client that is throttled or paused for a moment
+  finds a pooled QP reclaimed, and its next operation on it waits out RC
+  retry exhaustion, measured at about 3.7 s, before it reconnects. With the
+  keepalive off (`0`) every idle reclaim and every server restart costs that
+  on the first use of each pooled QP.
+
 - Drain (MDS-04, off by default): a node with `DFKV_DRAIN=1` can be put in
   a draining state, by `dfkvctl drain <node> [--undrain]` or by a stop with
   `DFKV_STOP_DRAIN_MS` set (it drains that long, then stops; a second
