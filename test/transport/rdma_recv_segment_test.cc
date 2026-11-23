@@ -167,8 +167,51 @@ TEST(RecvSegmentPool, AffinityPreventsCrossRailChunkReuse) {
   EXPECT_NE(rail0.segment(), rail1.segment());
 
   rail0.Reset();
-  EXPECT_FALSE(pool.Allocate(12u << 10, 4096, 1))
-      << "rail1 must not borrow an empty chunk bound to rail0";
+  // rail1 does not borrow the empty rail0 chunk: the budget is full, so
+  // that chunk is released at once (not after the idle hold) and rail1
+  // gets one of its own.
+  auto again = pool.Allocate(12u << 10, 4096, 1);
+  ASSERT_TRUE(again);
+  int affinity = -2;
+  for (const auto& chunk : pool.Snapshot().chunks)
+    if (chunk.segment == again.segment()) affinity = chunk.affinity;
+  EXPECT_EQ(affinity, 1);
+  EXPECT_EQ(pool.stats().chunks, 3u);
+  EXPECT_EQ(pool.stats().shrinks, 1u);
+}
+
+// RDS-07: the free ranges pressure reclaim plans runs with.
+TEST(RecvSegment, FreeRangesListsWhatIsUnleased) {
+  RecvSegment segment;
+  ASSERT_TRUE(segment.Init(64u << 10));
+  auto a = segment.Allocate(16u << 10);
+  auto b = segment.Allocate(16u << 10);
+  auto c = segment.Allocate(16u << 10);  // 16K free after c
+  ASSERT_TRUE(a && b && c);
+  using Ranges = std::vector<std::pair<size_t, size_t>>;
+  EXPECT_EQ(segment.FreeRanges(), (Ranges{{48u << 10, 16u << 10}}));
+  b.Reset();
+  EXPECT_EQ(segment.FreeRanges(),
+            (Ranges{{16u << 10, 16u << 10}, {48u << 10, 16u << 10}}));
+  c.Reset();
+  EXPECT_EQ(segment.FreeRanges(), (Ranges{{16u << 10, 48u << 10}}));
+}
+
+// A refused growth releases only as many empty chunks as it needs.
+TEST(RecvSegmentPool, RefusedGrowthTrimsOnlyWhatItNeeds) {
+  RecvSegmentPool pool;
+  ASSERT_TRUE(pool.Init(16u << 10, 64u << 10));
+  auto initial = pool.Allocate(16u << 10, 4096, 0);
+  auto one = pool.Allocate(16u << 10, 4096, 1);
+  auto two = pool.Allocate(16u << 10, 4096, 2);
+  auto three = pool.Allocate(16u << 10, 4096, 3);
+  ASSERT_TRUE(initial && one && two && three);
+  one.Reset();
+  two.Reset();
+  auto four = pool.Allocate(16u << 10, 4096, 4);
+  ASSERT_TRUE(four);
+  EXPECT_EQ(pool.stats().chunks, 4u) << "one empty chunk is enough";
+  EXPECT_EQ(pool.stats().released_bytes, 16u << 10);
 }
 
 TEST(RecvSegmentPool, TrimsEmptyNonInitialChunksAfterIdleHold) {

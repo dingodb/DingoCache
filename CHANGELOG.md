@@ -239,6 +239,23 @@
   entries), so for them nothing changes; whether a page is stored is
   `batch_exists`'s answer. A WARNING is logged once if it is called.
 
+- Server, RDMA: receive-pool pressure reclaim evicts only idle connections
+  whose leases make room for the request: a run of free ranges and idle
+  leases that touch end to end in a chunk of the request's rail (or of
+  none) and hold the request together (the fewest connections, then the
+  least recently active), or else chunks it can empty, each holding only
+  idle leases, until the budget can grow a chunk for it. It used to take
+  the longest idle connection when none was big enough alone, on any rail:
+  reproduced, a small idle control connection was evicted, the request
+  still failed after a 1 s wait, and that client lost its connection. A
+  request no eviction can serve now fails at once
+  (`dfkv_rdma_pressure_unsatisfiable_total`), as does one larger than the
+  whole budget. A connection that never sent a request, never quiescent
+  before, may be evicted 10 s after its last activity (a client that gave
+  up after the handshake). A growth the budget refuses releases empty chunks
+  (as many as it needs) instead of after `DFKV_RDMA_RECV_CHUNK_IDLE_MS`, so
+  an empty chunk of another rail (after a failover, say) no longer blocks
+  it.
 - Docs: `DFKV_RDMA_IDLE_MS` on the server must be at least three times the
   client's `DFKV_RDMA_KEEPALIVE_MS` (the defaults, 600000 and 15000, are);
   with one beat of margin a client that is throttled or paused for a moment

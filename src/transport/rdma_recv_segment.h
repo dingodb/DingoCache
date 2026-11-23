@@ -74,6 +74,10 @@ class RecvSegment {
   // When the last lease was released (or the segment initialized); 0 while
   // a lease is out.
   uint64_t EmptySinceMs() const;
+  // The free ranges, (offset, length) in offset order. Leases and free
+  // ranges begin and end on the segment's alignment, so ranges that touch
+  // form one range a lease of that alignment can take whole.
+  std::vector<std::pair<size_t, size_t>> FreeRanges() const;
 
  private:
   void Release(size_t offset, size_t bytes);
@@ -152,6 +156,24 @@ class RecvSegmentPool {
                  LeaseClass lease_class = LeaseClass::kConnection);
   size_t TrimIdle(uint64_t idle_ms);
   RecvSegment* initial_segment() const;
+  size_t max_bytes() const;
+  // The pool as it is now, for planning which leases to give up: every
+  // chunk with its free ranges, and the budget.
+  struct ChunkView {
+    const RecvSegment* segment = nullptr;
+    size_t size = 0;
+    int affinity = -1;
+    bool staging_only = false;
+    bool initial = false;  // never released
+    std::vector<std::pair<size_t, size_t>> free;
+  };
+  struct Geometry {
+    size_t max_bytes = 0;
+    size_t chunk_bytes = 0;
+    size_t committed_bytes = 0;
+    std::vector<ChunkView> chunks;
+  };
+  Geometry Snapshot() const;
   Stats stats() const;
 
  private:
@@ -165,6 +187,9 @@ class RecvSegmentPool {
   // First fit over the committed chunks; mu_ held.
   Lease AllocateFromChunks(size_t bytes, size_t alignment, int affinity,
                            LeaseClass lease_class);
+  // Releases empty chunks other than the initial one, newest first, until
+  // `wanted` bytes of the budget are uncommitted (or none is left); mu_ held.
+  size_t TrimEmptyLocked(size_t wanted);
 
   size_t chunk_bytes_ = 0;
   size_t max_bytes_ = 0;

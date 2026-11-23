@@ -177,6 +177,11 @@ uint64_t RecvSegment::EmptySinceMs() const {
   return used_ == 0 ? empty_since_ms_ : 0;
 }
 
+std::vector<std::pair<size_t, size_t>> RecvSegment::FreeRanges() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return {free_.begin(), free_.end()};
+}
+
 RecvSegment::Stats RecvSegment::stats() const {
   std::lock_guard<std::mutex> lock(mu_);
   Stats out;
@@ -338,6 +343,11 @@ RecvSegmentPool::Lease RecvSegmentPool::Allocate(size_t bytes,
   auto lease = AllocateFromChunks(bytes, alignment, affinity, lease_class);
   if (lease) return lease;
   auto chunk = NewChunk(bytes, affinity, numa_node);
+  // Empty chunks (of another rail, say, or left by a failover) hold budget
+  // until TrimIdle releases them, up to DFKV_RDMA_RECV_CHUNK_IDLE_MS later.
+  // A growth the budget refuses releases them now and tries again.
+  if (!chunk && TrimEmptyLocked(AlignUpChecked(bytes, alignment_)) != 0)
+    chunk = NewChunk(bytes, affinity, numa_node);
   if (!chunk) {
     allocation_failures_.fetch_add(1, std::memory_order_relaxed);
     growth_failures_.fetch_add(1, std::memory_order_relaxed);
@@ -376,6 +386,50 @@ size_t RecvSegmentPool::TrimIdle(uint64_t idle_ms) {
     released_bytes_.fetch_add(released, std::memory_order_relaxed);
   }
   return released;
+}
+
+size_t RecvSegmentPool::TrimEmptyLocked(size_t wanted) {
+  size_t committed = 0;
+  for (const auto& chunk : chunks_) committed += chunk->segment->size();
+  size_t released = 0;
+  for (size_t i = chunks_.size(); i > 1; --i) {
+    if (committed <= max_bytes_ && max_bytes_ - committed >= wanted) break;
+    auto& chunk = chunks_[i - 1];
+    if (chunk->segment->stats().used_bytes != 0) continue;
+    released += chunk->segment->size();
+    committed -= chunk->segment->size();
+    chunks_.erase(chunks_.begin() + static_cast<std::ptrdiff_t>(i - 1));
+  }
+  if (released != 0) {
+    shrinks_.fetch_add(1, std::memory_order_relaxed);
+    released_bytes_.fetch_add(released, std::memory_order_relaxed);
+  }
+  return released;
+}
+
+RecvSegmentPool::Geometry RecvSegmentPool::Snapshot() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  Geometry out;
+  out.max_bytes = max_bytes_;
+  out.chunk_bytes = chunk_bytes_;
+  for (size_t i = 0; i < chunks_.size(); ++i) {
+    const auto& chunk = chunks_[i];
+    ChunkView view;
+    view.segment = chunk->segment.get();
+    view.size = chunk->segment->size();
+    view.affinity = chunk->affinity;
+    view.staging_only = chunk->staging_only;
+    view.initial = i == 0;
+    view.free = chunk->segment->FreeRanges();
+    out.committed_bytes += view.size;
+    out.chunks.push_back(std::move(view));
+  }
+  return out;
+}
+
+size_t RecvSegmentPool::max_bytes() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return max_bytes_;
 }
 
 RecvSegment* RecvSegmentPool::initial_segment() const {
