@@ -261,7 +261,7 @@ def connector_for(receiver, *, inline):
     connector._shutdown = False
     connector._inflight_calls = 0
     connector._legacy_failed_recving = set()
-    metadata = DfkvStoreConnectorMetadata({"load"}, set())
+    metadata = DfkvStoreConnectorMetadata(set())
     metadata.add_request(request())
     connector.bind_connector_metadata(metadata)
     return connector

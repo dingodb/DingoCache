@@ -464,7 +464,7 @@ def test_hand_off_without_a_save_gets_an_offload_only_meta():
     scheduler = _scheduler(
         _request_trackers={"r": tracker}, _unfinished_requests={"r": (request, ())},
     )
-    meta = DfkvStoreConnectorMetadata(set(), set())
+    meta = DfkvStoreConnectorMetadata(set())
     scheduler._attach_state_blocks(
         meta, _offloads({"r": [(g, 5 + g, B) for g in STATE_GROUPS]}))
     (job,) = meta.requests
@@ -486,7 +486,7 @@ def test_consumer_and_grid_hand_offs_get_no_offload_only_meta():
     ):
         scheduler._request_trackers = {"r": tracker}
         scheduler._unfinished_requests = unfinished
-        meta = DfkvStoreConnectorMetadata(set(), set())
+        meta = DfkvStoreConnectorMetadata(set())
         scheduler._attach_state_blocks(meta, _offloads({"r": [(0, 5, offload)]}))
         assert meta.requests == []
 
@@ -494,7 +494,7 @@ def test_consumer_and_grid_hand_offs_get_no_offload_only_meta():
 def test_misaligned_warning_is_silent_with_partial_hash_hits(monkeypatch):
     logger = MagicMock()
     monkeypatch.setattr(scheduler_module, "logger", logger)
-    meta = DfkvStoreConnectorMetadata(set(), set())
+    meta = DfkvStoreConnectorMetadata(set())
     meta.add_request(ReqMeta("r", LCM, ([9], [9], [9], [1]), [], can_save=True))
     _scheduler()._attach_state_blocks(meta, _offloads({"r": [(0, 5, B)]}))
     assert meta.requests[0].state_blocks == {0: {B: 5}}

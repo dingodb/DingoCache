@@ -332,10 +332,7 @@ class DfkvStoreScheduler:
             if request_tracker := self._request_trackers.get(req_id):
                 request_tracker.reset()
 
-        meta = DfkvStoreConnectorMetadata(
-            self._unfinished_request_ids,
-            preempted_ids,
-        )
+        meta = DfkvStoreConnectorMetadata(preempted_ids)
 
         # Handle new requests
         for request in scheduler_output.scheduled_new_reqs:
@@ -365,10 +362,6 @@ class DfkvStoreScheduler:
             )
             self._request_trackers[request.req_id] = request_tracker
 
-            last_chunk_tokens_num = (
-                len(prefill_tokens) // self._block_size * self._block_size
-            )
-
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 self._block_size,
@@ -376,7 +369,6 @@ class DfkvStoreScheduler:
                 load_spec=load_spec,
                 skip_save=force_skip_save,
                 block_hashes=request_real.block_hashes,
-                is_last_chunk=(request_tracker.token_len >= last_chunk_tokens_num),
                 num_prompt_tokens=self._tail_prompt_tokens(request_real),
             )
             if req_meta is not None:
@@ -412,9 +404,6 @@ class DfkvStoreScheduler:
                 )
                 self._request_trackers[req_id] = request_tracker
 
-                last_chunk_tokens_num = (
-                    len(prefill_tokens) // self._block_size * self._block_size
-                )
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
                     self._block_size,
@@ -422,9 +411,6 @@ class DfkvStoreScheduler:
                     load_spec=load_spec,
                     skip_save=force_skip_save,
                     block_hashes=request_real.block_hashes,
-                    is_last_chunk=(
-                        request_tracker.token_len >= last_chunk_tokens_num
-                    ),
                     num_prompt_tokens=self._tail_prompt_tokens(request_real),
                 )
             else:
@@ -481,9 +467,6 @@ class DfkvStoreScheduler:
                 if has_new_blocks:
                     request_tracker.update(new_block_ids)
 
-                last_chunk_tokens_num = (
-                    prefill_end // self._block_size * self._block_size
-                )
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
                     self._block_size,
@@ -491,9 +474,6 @@ class DfkvStoreScheduler:
                     load_spec=None,
                     skip_save=force_skip_save,
                     block_hashes=unfinished_req.block_hashes,
-                    is_last_chunk=(
-                        request_tracker.token_len >= last_chunk_tokens_num
-                    ),
                     num_prompt_tokens=self._tail_prompt_tokens(unfinished_req),
                 )
 

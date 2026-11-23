@@ -445,7 +445,7 @@ class _BlockingConnectorBackend:
         self._block_call()
         return TransferResults(
             finished_sending=set(finished_req_ids),
-            finished_recving=set(metadata.unfinished_request_ids),
+            finished_recving={"unfinished"},
             failed_recving=set(),
         )
 
@@ -535,7 +535,7 @@ class ConnectorShutdownGateTest(unittest.TestCase):
             with self.subTest(legacy=legacy):
                 backend = _BlockingConnectorBackend()
                 connector = self._connector(worker=backend)
-                metadata = DfkvStoreConnectorMetadata({"unfinished"}, set())
+                metadata = DfkvStoreConnectorMetadata(set())
                 connector._get_connector_metadata = lambda: metadata
                 hook = (
                     connector.get_finished if legacy else connector.get_transfer_results
