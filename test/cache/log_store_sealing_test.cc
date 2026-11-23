@@ -355,13 +355,12 @@ thread_local int tl_role = 0;  // 1: the PUT that opens; 2: the PUT that finishe
 // meanwhile, and the next PUT writes into it.
 TEST(LogStoreHeaders, PutsFinishWhileASegmentHeaderIsWritten) {
   const fs::path dir = TestDir("unlockedheader");
-  std::atomic<bool> release_preopen{false}, a_in_open{false}, b_done{false},
-      release_a{false}, b_reserved{false};
+  std::atomic<bool> a_in_open{false}, b_done{false}, release_a{false},
+      b_reserved{false};
   auto o = Quiet(dir);  // 4 MiB segments, one open
+  o.preopen = false;    // no pre-opened segment: PUTs open
   o.crash_hook = [&](const char* p) {
-    if (std::strcmp(p, "preopen.before_header") == 0) {
-      WaitFor(release_preopen, 30000);  // no pre-opened segment: PUTs open
-    } else if (std::strcmp(p, "put.after_reserve") == 0 && tl_role == 2) {
+    if (std::strcmp(p, "put.after_reserve") == 0 && tl_role == 2) {
       b_reserved = true;
       WaitFor(a_in_open, 10000);
     } else if (std::strcmp(p, "open.before_header") == 0 && tl_role == 1) {
@@ -408,7 +407,89 @@ TEST(LogStoreHeaders, PutsFinishWhileASegmentHeaderIsWritten) {
   EXPECT_TRUE(Has(s, 4, kLen));
   EXPECT_TRUE(Has(s, 2, kLen));
   EXPECT_EQ(s.GetStats().open_segments, 1u);
-  release_preopen = true;
+  ASSERT_TRUE(s.Close());
+  fs::remove_all(dir);
+}
+
+// A PUT that fills its segment while the sealer is pre-opening the next one
+// waits for that header instead of reclaiming a segment inline: the
+// pre-open took the free segment the PUT would otherwise have taken, and an
+// inline reclaim evicts what is in its victim, values read since included,
+// which the cleaner would have relocated.
+TEST(LogStoreHeaders, APutThatFillsItsSegmentWaitsForAPreopenUnderWay) {
+  const fs::path dir = TestDir("preopenwait");
+  // 8 segments of 4 MiB, one open, no cleaner; three 1 MiB values to a
+  // segment. Before each of the first four segment switches (the PUTs of
+  // values 3, 6, 9 and 12) the writer waits until that many pre-opens have
+  // finished: each switch then takes the pre-opened segment, and the
+  // sealer pre-opens the next one. Nothing else takes a free segment, so
+  // the free list goes 7, 6, 5, 4, 3, and the 5th pre-open takes it to 2,
+  // the sealer's reserve. That one is held in its header, and the switch
+  // at value 15, which waits until it has begun, finds it under way.
+  std::atomic<int> started{0}, finished{0};
+  std::atomic<bool> held{false}, release{false};
+  auto o = Quiet(dir);
+  o.crash_hook = [&](const char* p) {
+    if (std::strcmp(p, "preopen.after_header") == 0) ++finished;
+    if (std::strcmp(p, "preopen.before_header") != 0 || ++started != 5) return;
+    held = true;
+    WaitFor(release, 30000);
+  };
+  bool ok = false;
+  LogStore s(o, &ok);
+  ASSERT_TRUE(ok) << s.StartupError();
+  constexpr size_t kLen = 1 << 20;
+  std::atomic<bool> done{false};
+  std::atomic<int> failures{0};
+  std::thread writer([&] {
+    for (uint64_t id = 0; id < 16; ++id) {
+      if (id > 0 && id % 3 == 0 && id <= 12) {
+        const int want = static_cast<int>(id / 3);
+        for (int i = 0; i < 10000 && finished < want; ++i)
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (finished < want) {
+          ++failures;  // the sealer never pre-opened
+          break;
+        }
+      }
+      // The switch at value 15 goes once the 5th pre-open has begun. The
+      // sealer seals the segments handed to it before it pre-opens, and
+      // where a seal's fdatasync is slow the switch would otherwise come
+      // first: with 3 free, that PUT opens a segment itself, as it should,
+      // and the sealer then has no free segment above its reserve to
+      // pre-open.
+      if (id == 15) {
+        for (int i = 0; i < 10000 && !held; ++i)
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (!held) {
+          ++failures;
+          break;
+        }
+      }
+      const std::string v = Val(id, kLen);
+      if (s.Cache(Key(id), v.data(), v.size()) != Status::kOk) ++failures;
+    }
+    done = true;
+  });
+  ASSERT_TRUE(WaitFor(held, 20000)) << "the 5th pre-open was not reached";
+  {
+    // The free list is at the reserve (counts this fix leaves as they were).
+    const auto st = s.GetStats();
+    EXPECT_EQ(int64_t{st.segment_count} - st.open_segments -
+                  st.segments_sealed_now - st.sealer_queue - 1,
+              2);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  const auto mid = s.GetStats();
+  const bool finished_early = done.load();
+  EXPECT_FALSE(finished_early) << "the PUT did not wait for the pre-open";
+  EXPECT_EQ(mid.inline_reclaims, 0u);
+  EXPECT_EQ(s.Evictions(), 0u) << "a PUT evicted while a pre-open was under way";
+  release = true;
+  writer.join();
+  EXPECT_EQ(failures, 0);
+  EXPECT_GE(s.GetStats().preopen_waits, 1u);
+  for (uint64_t id = 0; id < 16; ++id) EXPECT_TRUE(Has(s, id, kLen)) << id;
   ASSERT_TRUE(s.Close());
   fs::remove_all(dir);
 }
@@ -477,20 +558,14 @@ TEST(LogStoreHeaders, CrashPointsAroundSegmentHeaders) {
                 // any write: exit at a later one.
                 auto exit_at = ExitAt(
                     point, std::strcmp(point, "close.preopen_trailer") == 0 ? 1 : 3);
-                // The open.* points are reached only by a PUT that fills its
-                // segment and finds no segment pre-opened for it. A writer
-                // slower than the sealer's pre-open (under TSan, about 10
-                // values of 400 KB per segment take longer than any fixed
-                // delay here) always finds one: hold the pre-open until the
-                // crash ends the child. The sealer then seals nothing either;
-                // its queue holds two segments, and the third open comes at
-                // the second switch, so the writer never waits for it.
-                const bool open_point = std::strncmp(point, "open.", 5) == 0;
+                // The open.* points are reached by a PUT that opens the next
+                // segment itself, which it does only when no segment is
+                // pre-opened or being pre-opened for it: with pre-opening
+                // off, every segment switch does, whatever the timing.
+                if (std::strncmp(point, "open.", 5) == 0) o.preopen = false;
                 o.crash_hook = [&](const char* p) {
                   if (std::strcmp(p, "preopen.before_header") == 0)
-                    std::this_thread::sleep_for(
-                        open_point ? std::chrono::milliseconds(60000)
-                                   : std::chrono::milliseconds(20));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
                   exit_at(p);
                 };
                 bool ok = false;
@@ -503,6 +578,17 @@ TEST(LogStoreHeaders, CrashPointsAroundSegmentHeaders) {
                     if (s.Remove(Key(id)) != Status::kOk) return 5;
                     if (::write(log, &id, sizeof(id)) != sizeof(id)) return 7;
                   }
+                }
+                // close.preopen_trailer is reached only if a pre-opened
+                // segment exists when Close stops the threads. After the
+                // last switch takes one, the free list is at the reserve
+                // until the cleaner reclaims a segment and the sealer
+                // pre-opens it; a Close inside that window had nothing to
+                // trail (the child returned 9). Both always follow, so wait.
+                if (std::strcmp(point, "close.preopen_trailer") == 0) {
+                  for (int i = 0; i < 1000 && s.GetStats().preopened == 0; ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                  if (s.GetStats().preopened == 0) return 8;
                 }
                 s.Close();  // reaches close.preopen_trailer
                 return 9;

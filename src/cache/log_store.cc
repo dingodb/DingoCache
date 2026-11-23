@@ -1451,7 +1451,10 @@ void LogStore::PreopenLocked(Lock& lk) {
   preopening_ = false;
   // A failed header write failed the store: the segment stays kOpening,
   // which is harmless, as nothing is admitted or written any more.
-  if (!ok) return;
+  if (!ok) {
+    state_cv_.notify_all();  // a PUT waiting for this pre-open
+    return;
+  }
   segments_[next].state = SegState::kPreopened;
   preopened_ = next;
   ++open_changes_;
@@ -1539,6 +1542,21 @@ bool LogStore::ReserveLocked(Lock& lk, uint64_t footprint, uint32_t* segment,
       state_cv_.wait(lk, [&] { return open_changes_ != seen || failed_.load(); });
       ++stats_.segment_open_waits;
       stats_.segment_open_wait_us += MicrosSince(wait_t0);
+      --attempt;  // a wait, not an attempt
+      continue;
+    }
+    // A segment being pre-opened left the free list but is not ready yet:
+    // wait for its header (one write) rather than open or reclaim another.
+    // The wait is that one write at most, however many segments are free:
+    // the pre-opened segment is then taken as usual.
+    // Taking a free segment instead would find one fewer than the cleaner
+    // keeps (it counts the pre-open among them), and reclaiming inline would
+    // evict values the cleaner would have relocated.
+    if (preopening_ && preopened_ == UINT32_MAX) {
+      const auto wait_t0 = std::chrono::steady_clock::now();
+      state_cv_.wait(lk, [&] { return !preopening_ || failed_.load(); });
+      ++stats_.preopen_waits;
+      stats_.preopen_wait_us += MicrosSince(wait_t0);
       --attempt;  // a wait, not an attempt
       continue;
     }
@@ -2062,7 +2080,8 @@ void LogStore::SealerLoop() {
       continue;
     }
     if (stop_threads_) break;
-    if (preopened_ == UINT32_MAX && FreeCountLocked() > kCleanerReserve) {
+    if (opt_.preopen && preopened_ == UINT32_MAX &&
+        FreeCountLocked() > kCleanerReserve) {
       PreopenLocked(lk);
       continue;
     }
@@ -2670,9 +2689,10 @@ LogStore::Stats LogStore::GetStats() const {
   std::lock_guard<std::mutex> lk(mu_);
   Stats st = stats_;
   // The pre-opened segment counts as free: a client takes it as it would a
-  // free one (§6.7.4).
-  st.segments_free =
-      static_cast<uint32_t>(free_.size() + (preopened_ != UINT32_MAX ? 1 : 0));
+  // free one (§6.7.4). So does one being pre-opened, as the cleaner counts
+  // it: the count does not change while its header is written.
+  st.segments_free = static_cast<uint32_t>(
+      free_.size() + (preopened_ != UINT32_MAX || preopening_ ? 1 : 0));
   st.segments_sealed_now = static_cast<uint32_t>(fifo_.size());
   st.sealer_queue = static_cast<uint32_t>(seal_queue_.size());
   st.open_segments = static_cast<uint32_t>(open_.size());
@@ -2726,6 +2746,10 @@ void LogStore::EngineMetrics(std::vector<EngineMetric>* out) const {
       "PUTs that waited for another PUT's segment opening", st.segment_open_waits);
   add("dfkv_lse_segment_open_wait_microseconds_total", "counter",
       "Time PUTs waited for another PUT's segment opening", st.segment_open_wait_us);
+  add("dfkv_lse_preopen_waits_total", "counter",
+      "PUTs that waited for the pre-opened segment's header", st.preopen_waits);
+  add("dfkv_lse_preopen_wait_microseconds_total", "counter",
+      "Time PUTs waited for the pre-opened segment's header", st.preopen_wait_us);
   add("dfkv_lse_preopened_taken_total", "counter",
       "Segment openings served by the pre-opened segment", st.preopened_taken);
   add("dfkv_lse_records_relocated_total", "counter", "Records the cleaner relocated",

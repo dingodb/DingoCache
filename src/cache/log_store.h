@@ -72,6 +72,10 @@ class LogStore : public StoreEngine {
     // false: no cleaner thread (tests of the inline reclaim; retention then
     // expires only through ExpireRetention()).
     bool cleaner = true;
+    // false: the sealer pre-opens no client segment (§6.7.4), so a PUT that
+    // fills its segment always opens the next one itself (tests of that
+    // path).
+    bool preopen = true;
 
     // DFKV_LSE_SYNC_MS: open segments are fdatasynced this often (§6.5).
     uint32_t sync_ms = 1000;
@@ -182,6 +186,8 @@ class LogStore : public StoreEngine {
     uint64_t cleaner_wait_us = 0;
     uint64_t segment_open_waits = 0;    // PUTs that waited for another's opening
     uint64_t segment_open_wait_us = 0;
+    uint64_t preopen_waits = 0;  // PUTs that waited for a pre-open's header
+    uint64_t preopen_wait_us = 0;
     uint64_t preopened_taken = 0;       // openings served by the pre-opened segment
     uint64_t records_relocated = 0;
     uint64_t relocated_bytes = 0;
