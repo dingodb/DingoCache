@@ -452,6 +452,12 @@ class RdmaTransport : public Transport {
   // Endpoint opens refused for lack of descriptors or memory whose operation
   // was then served on another rail.
   std::atomic<uint64_t> local_resource_rail_fallbacks_{0};
+  // Operations failed at once: every rail had an ENOMEM endpoint open
+  // within kEnomemHoldUs.
+  std::atomic<uint64_t> local_resource_held_{0};
+  // Per rail: until when (NowMicros) it is not chosen after ENOMEM.
+  static constexpr uint64_t kEnomemHoldUs = 2000000;
+  std::unique_ptr<std::atomic<uint64_t>[]> enomem_until_us_;
   // Tests: the errno an endpoint open on this rail fails with (0 = none).
   std::vector<int> fail_open_errno_for_test_;
   std::atomic<uint64_t> cross_rail_retries_{0};

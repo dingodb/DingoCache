@@ -282,6 +282,11 @@ class RdmaTransportTestPeer {
     return transport->Acquire(node, RdmaTransport::Lane::kControl, options)
         .conn;
   }
+  // Endpoint opens on `rail` fail with `err`, as the device would.
+  static void FailOpenOn(RdmaTransport* transport, size_t rail, int err) {
+    transport->fail_open_errno_for_test_.resize(transport->devs_.size(), 0);
+    transport->fail_open_errno_for_test_[rail] = err;
+  }
   static void ReleaseControl(RdmaTransport* transport,
                              const std::string& node,
                              RdmaTransport::Conn* conn) {
@@ -6674,6 +6679,118 @@ TEST(RdmaLoopback, DialWithoutDescriptorsUsesAnIdleConnectionOnAnotherRail) {
   });
   if (result == kSkip) GTEST_SKIP() << "needs two ACTIVE RDMA devices";
   EXPECT_EQ(result, 0) << "step code from the child, see the test body";
+}
+
+// ENOMEM from building an endpoint may be the device's own limit on QPs or
+// CQs, not the process's memory: another rail gets a new connection.
+TEST(RdmaLoopback, EndpointOutOfMemoryOnOneRailIsServedOnAnother) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const auto discovered = rdma::RdmaTopology::Discover(
+      {}, rdma::RdmaDiscoveryPolicy::kActiveOnly);
+  if (discovered.status != rdma::RdmaDiscoveryStatus::kOk ||
+      discovered.devices.size() < 2)
+    GTEST_SKIP() << "needs two ACTIVE RDMA devices";
+  const std::string rails =
+      discovered.devices[0].name + "," + discovered.devices[1].name;
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv numa("DFKV_RDMA_NUMA", "0");
+  std::unique_ptr<RdmaNode> node;
+  {
+    ScopedEnv server_rails("DFKV_RDMA_DEV", rails.c_str());
+    node = std::make_unique<RdmaNode>("enomem-rail");
+  }
+  ScopedEnv primary("DFKV_RDMA_PRIMARY_DEV", discovered.devices[0].name.c_str());
+  RdmaTransport rt(kMaxMsg, rails);
+  rt.OnPeerTopology(PublishedPeer(node->addr, "healthy-peer"));
+  RdmaTransportTestPeer::FailOpenOn(&rt, 0, ENOMEM);
+  const std::vector<BlockKey> keys = {ToBlockKey(SelfHdr(), "absent")};
+  std::vector<char> exists;
+  const Status status = rt.ExistMany(node->addr, keys, &exists)[0];
+  EXPECT_NE(status, Status::kResourceExhausted);
+  EXPECT_NE(status, Status::kIOError);
+  const std::string metrics = rt.MetricsText();
+  EXPECT_EQ(CounterVal(metrics,
+                       "dfkv_rdma_client_local_resource_failures_total"),
+            1);
+  EXPECT_EQ(CounterVal(metrics,
+                       "dfkv_rdma_client_local_resource_rail_fallbacks_total"),
+            1);
+  EXPECT_TRUE(LabeledSeriesAllZero(metrics, "dfkv_rdma_client_rail_errors_total"))
+      << metrics;
+  // For a moment the rail is not chosen again: no dial, no handshake the
+  // server would see abandoned, no new failure.
+  EXPECT_EQ(rt.ExistMany(node->addr, keys, &exists)[0], status);
+  EXPECT_EQ(CounterVal(rt.MetricsText(),
+                       "dfkv_rdma_client_local_resource_failures_total"),
+            1);
+
+  // ENOMEM on every rail: the process is out of locked memory. The first
+  // operation tries each rail once; the next ones fail at once.
+  RdmaTransport all(kMaxMsg, rails);
+  all.OnPeerTopology(PublishedPeer(node->addr, "healthy-peer"));
+  RdmaTransportTestPeer::FailOpenOn(&all, 0, ENOMEM);
+  RdmaTransportTestPeer::FailOpenOn(&all, 1, ENOMEM);
+  EXPECT_EQ(all.ExistMany(node->addr, keys, &exists)[0],
+            Status::kResourceExhausted);
+  EXPECT_EQ(CounterVal(all.MetricsText(),
+                       "dfkv_rdma_client_local_resource_failures_total"),
+            2);
+  for (int i = 0; i < 3; ++i)
+    EXPECT_EQ(all.ExistMany(node->addr, keys, &exists)[0],
+              Status::kResourceExhausted);
+  EXPECT_EQ(CounterVal(all.MetricsText(),
+                       "dfkv_rdma_client_local_resource_failures_total"),
+            2)
+      << "rails held for ENOMEM were dialed again";
+  EXPECT_EQ(CounterVal(all.MetricsText(),
+                       "dfkv_rdma_client_local_resource_held_total"),
+            3);
+}
+
+// A rail held after ENOMEM is held only for new endpoints: its idle pooled
+// connections keep serving. The hold used to exclude the rail from selection
+// altogether, so a single-rail peer whose opens hit ENOMEM (the device's QP
+// limit) was unreachable even through its healthy idle connection.
+TEST(RdmaLoopback, AnEnomemHoldStillUsesTheRailsIdleConnections) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const auto discovered = rdma::RdmaTopology::Discover(
+      {}, rdma::RdmaDiscoveryPolicy::kActiveOnly);
+  if (discovered.status != rdma::RdmaDiscoveryStatus::kOk ||
+      discovered.devices.empty())
+    GTEST_SKIP() << "needs an ACTIVE RDMA device";
+  const std::string rail = discovered.devices[0].name;
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv numa("DFKV_RDMA_NUMA", "0");
+  std::unique_ptr<RdmaNode> node;
+  {
+    ScopedEnv server_rail("DFKV_RDMA_DEV", rail.c_str());
+    node = std::make_unique<RdmaNode>("enomem-pooled");
+  }
+  RdmaTransport rt(kMaxMsg, rail);
+  rt.OnPeerTopology(PublishedPeer(node->addr, "healthy-peer"));
+  const std::vector<BlockKey> keys = {ToBlockKey(SelfHdr(), "absent")};
+  std::vector<char> exists;
+  const Status served = rt.ExistMany(node->addr, keys, &exists)[0];
+  ASSERT_NE(served, Status::kResourceExhausted);
+  ASSERT_NE(served, Status::kIOError);
+  // Its pooled connection is busy: the next op opens one and hits ENOMEM.
+  auto* busy = RdmaTransportTestPeer::AcquireControlOn(&rt, node->addr, 0);
+  ASSERT_NE(busy, nullptr);
+  RdmaTransportTestPeer::FailOpenOn(&rt, 0, ENOMEM);
+  EXPECT_EQ(rt.ExistMany(node->addr, keys, &exists)[0],
+            Status::kResourceExhausted);
+  RdmaTransportTestPeer::ReleaseControl(&rt, node->addr, busy);
+  // Within the hold, the idle connection serves.
+  EXPECT_EQ(rt.ExistMany(node->addr, keys, &exists)[0], served);
+  const std::string metrics = rt.MetricsText();
+  EXPECT_EQ(CounterVal(metrics,
+                       "dfkv_rdma_client_local_resource_held_total"),
+            0);
+  EXPECT_EQ(CounterVal(metrics,
+                       "dfkv_rdma_client_local_resource_failures_total"),
+            1);
 }
 
 // A failed work completion on the client must stay attributable afterwards:
