@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+
+- Client, MDS discovery: a shrink the placement guard refuses no longer cuts
+  the data path to the omitted peers. The guard keeps such peers on the ring
+  (the typical case is etcd leases of live nodes expiring together), but the
+  client retired their transport topology all the same; with
+  `DFKV_RDMA_RAIL_TIERS` set, every request to them then failed
+  `kNoCompatibleRail` until they registered again, and without it their
+  pooled connections and remote rail health were dropped. Ring members a
+  refused view omits now keep their last published topology and stay in the
+  live peer set; they are retired once a view without them is admitted.
 - Server, TCP: every request frame has a deadline, not only the first. A
   later frame trickled in a byte at a time (each byte inside
   `DFKV_TCP_IO_TIMEOUT_S`) held its connection and handler thread for good;

@@ -236,13 +236,16 @@ class KVClient {
   // Publish one replace-all topology response. Stable MDS ids are retained
   // separately from routing addresses; superseded addresses are explicitly
   // retired, and the complete live-id set is reconciled after publication.
-  // Peers omitted while still held by a guard-rejected ring are retired from
-  // topology state, so strict selection falls back closed without stale rails.
+  // With `ring_held` (the placement guard refused this view, so the ring
+  // keeps its members), a ring member the view omits keeps its last published
+  // topology and stays live: retiring it would make strict rail selection
+  // fail closed for a peer the ring still routes to. Once a view is admitted,
+  // omitted peers are retired.
   // Each present peer is published under its own MemberTopologyEpoch, so the
   // transport sees a new generation only for members whose own entry changed;
   // `generation`, the epoch of the whole view, only labels retirements.
   void PublishPeerTopologies(const std::vector<MemberInfo>& topology,
-                             uint64_t generation);
+                             uint64_t generation, bool ring_held);
   // Scalar transport bodies. Public scalar methods add exactly one metric;
   // TCP batch fan-out calls these bodies so it cannot double-count each key.
   bool PutDirect(const std::string& key, const void* value, size_t n);
@@ -326,9 +329,10 @@ class KVClient {
   mutable std::mutex ring_mu_;  // guards ring_ + addr_
   ConHash ring_;
   std::map<std::string, std::string> addr_;  // name -> ip:port
-  // Stable identity -> routing address from the preceding replace-all topology
-  // response. Together with addr_, this finds removed identities and old
-  // addresses still held by a guard-rejected ring.
+  // Stable identity -> routing address published to the transport: the
+  // preceding replace-all topology response plus the ring members a refused
+  // view omitted. Together with addr_, this finds removed identities and old
+  // addresses.
   std::map<std::string, std::string> published_peers_;
   std::condition_variable ring_cv_;  // notified when AdoptRing sets a non-empty ring
   std::string key_namespace_;

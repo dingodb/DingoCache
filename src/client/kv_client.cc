@@ -355,18 +355,29 @@ void KVClient::AdoptRing(ConHash ring, std::map<std::string, std::string> addr) 
 }
 
 void KVClient::PublishPeerTopologies(
-    const std::vector<MemberInfo>& topology, uint64_t generation) {
+    const std::vector<MemberInfo>& topology, uint64_t generation,
+    bool ring_held) {
   std::map<std::string, std::string> current;
   for (const auto& member : topology)
     current[member.id] = member.ip + ":" + std::to_string(member.port);
 
   std::set<std::pair<std::string, std::string>> retired;
+  std::map<std::string, std::string> live = current;
   {
     std::lock_guard<std::mutex> lock(ring_mu_);
     for (const auto& peer : published_peers_) retired.insert(peer);
     for (const auto& peer : addr_) retired.insert(peer);
     for (const auto& peer : current) retired.erase(peer);
-    published_peers_ = current;
+    if (ring_held) {
+      // Keep what the transport holds for the ring members this view omits
+      // (an identity the view moves to another address is not omitted).
+      for (const auto& peer : addr_) {
+        if (current.count(peer.first) != 0) continue;
+        retired.erase(peer);
+        live.insert(peer);
+      }
+    }
+    published_peers_ = live;
   }
 
   // Retire old address/identity bindings before publishing replacements. In
@@ -403,8 +414,8 @@ void KVClient::PublishPeerTopologies(
   }
 
   std::vector<std::string> live_peer_ids;
-  live_peer_ids.reserve(current.size());
-  for (const auto& [peer_id, address] : current) {
+  live_peer_ids.reserve(live.size());
+  for (const auto& [peer_id, address] : live) {
     (void)address;
     live_peer_ids.push_back(peer_id);
   }
@@ -448,9 +459,10 @@ void KVClient::StartMdsDiscovery(std::vector<std::string> mds_eps,
                               uint64_t topology_epoch,
                               bool placement_admitted) {
         // Topology is a replace-all stream independent of placement. Degraded
-        // members remain here even though SetMembers excludes them. Omitted
-        // peers still held by a guard-rejected ring are explicitly invalidated.
-        PublishPeerTopologies(topology, topology_epoch);
+        // members remain here even though SetMembers excludes them. Ring
+        // members a guard-refused view omits keep their topology until a view
+        // without them is admitted.
+        PublishPeerTopologies(topology, topology_epoch, !placement_admitted);
 
         if (!placement_admitted) return;
         std::vector<MemberInfo> placement;
