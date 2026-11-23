@@ -70,7 +70,7 @@ std::optional<RemoteRailLease> RemoteRailHealth::TryAcquire(
     const std::string& peer_id, size_t local_rail, uint64_t now_us) {
   std::lock_guard<std::mutex> lock(mu_);
   Counters& rail_counters = rail_counters_[local_rail];
-  if (has_reconciled_ &&
+  if (has_reconciled_ && !IsAddressIdentity(peer_id) &&
       live_peer_ids_.find(peer_id) == live_peer_ids_.end()) {
     ++total_counters_.admissions_denied;
     ++rail_counters.admissions_denied;
@@ -203,7 +203,8 @@ void RemoteRailHealth::Reconcile(
   live_peer_ids_ = std::move(live);
   has_reconciled_ = true;
   for (auto peer = peers_.begin(); peer != peers_.end();) {
-    if (live_peer_ids_.find(peer->first) == live_peer_ids_.end()) {
+    if (!IsAddressIdentity(peer->first) &&
+        live_peer_ids_.find(peer->first) == live_peer_ids_.end()) {
       peer = peers_.erase(peer);
     } else {
       ++peer;

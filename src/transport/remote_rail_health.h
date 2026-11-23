@@ -45,6 +45,16 @@ struct RemoteRailCompletion {
 // independent of the caller's clock source.
 class RemoteRailHealth {
  public:
+  // The identity of a peer the MDS does not name (a static member list):
+  // its address behind a prefix no MDS identity starts with. Such
+  // identities are kept by Reconcile and admitted without being in its set.
+  static std::string AddressIdentity(const std::string& address) {
+    return std::string("\x01" "addr:") + address;
+  }
+  static bool IsAddressIdentity(const std::string& peer_id) {
+    return !peer_id.empty() && peer_id[0] == '\x01';
+  }
+
   explicit RemoteRailHealth(RemoteRailHealthConfig config = {});
 
   // Healthy, live endpoints admit ordinary leases. Once an endpoint has
