@@ -62,8 +62,7 @@ class DiskSlabStoreTestPeer {
   }
 
   static bool SyncTableNow(DiskSlabStore* store) {
-    return store->SyncTable(
-        store->record_writes_.load(std::memory_order_relaxed));
+    return store->SyncTable(store->TableWriteStamp());
   }
   static bool WriteCrashStage(DiskSlabStore* store, const BlockKey& key,
                               const std::string& value,
@@ -107,6 +106,10 @@ class DiskSlabStoreTestPeer {
   static void SetTableSyncHook(DiskSlabStore* store,
                                std::function<void()> hook) {
     store->table_sync_hook_for_test_ = std::move(hook);
+  }
+  static void SetBindHook(DiskSlabStore* store,
+                          std::function<void(uint32_t)> hook) {
+    store->bind_hook_for_test_ = std::move(hook);
   }
   // True iff slots.tbl holds a valid record for key right now. Reads the file,
   // not the allocator: this is what a rebuild after a restart would find.
@@ -1367,6 +1370,52 @@ TEST_F(DiskSlabTest, KilledInsideATableSyncForcesAReset) {
   EXPECT_EQ(recovered.GetStats().warm_restarts, 0u);
   EXPECT_EQ(recovered.GetStats().unclean_resets, 1u);
   EXPECT_EQ(recovered.Count(), 0u);
+}
+
+// STO-11: an extent's bind wipe is not synced on its own. A process killed
+// right after a steal wrote the wipe (before the extent was used), or after
+// the new class's first value, with no table sync since: the warm restart
+// reads the table as the page cache holds it, so the stolen extent's old
+// keys stay gone, and nothing else is lost.
+TEST_F(DiskSlabTest, AKillAfterAnUnsyncedBindWipeLeavesNoStaleKeys) {
+  for (const bool after_put : {false, true}) {
+    SCOPED_TRACE(after_put ? "killed after the new value" : "killed after the wipe");
+    fs::remove_all(dir_);
+    fs::remove_all(dir_.string() + "_tokens");
+    // 2 extents x 4 slots of 4 KiB: 8 class-A keys fill both; a class-B value
+    // (8 KiB) then steals one extent.
+    const auto options = WithIdentity(Opts(2 * 4 * 4096, 4 * 4096, 4096),
+                                      WarmRestart::kAuto, 1, 7);
+    const std::string a(4000, 'A'), b(8000, 'B');
+    ASSERT_TRUE(CrashAfter(options, [&](DiskSlabStore& store) {
+      for (int i = 0; i < 8; ++i)
+        if (store.Cache(K(100 + i), a.data(), a.size()) != Status::kOk) return false;
+      if (!after_put)
+        dfkv::DiskSlabStoreTestPeer::SetBindHook(&store, [](uint32_t) { ::_exit(0); });
+      if (store.Cache(K(500), b.data(), b.size()) != Status::kOk) return false;
+      if (store.GetStats().bind_wipes == 0) return false;
+      ::_exit(0);  // killed: no table sync since the wipe (table_sync_ms = 0)
+    }));
+    bool ok = false;
+    DiskSlabStore recovered(options, &ok);
+    ASSERT_TRUE(ok) << recovered.StartupError();
+    EXPECT_EQ(recovered.GetStats().warm_restarts, 1u) << "the table was kept";
+    int present = 0;
+    std::string out;
+    for (int i = 0; i < 8; ++i) {
+      if (recovered.Range(K(100 + i), 0, 0, &out) != Status::kOk) continue;
+      ++present;
+      EXPECT_EQ(out, a) << i;
+    }
+    EXPECT_EQ(present, 4) << "the stolen extent's keys came back, or others were lost";
+    if (after_put) {
+      ASSERT_EQ(recovered.Range(K(500), 0, 0, &out), Status::kOk);
+      EXPECT_EQ(out, b);
+    } else {
+      EXPECT_EQ(recovered.Range(K(500), 0, 0, &out), Status::kNotFound);
+    }
+    EXPECT_EQ(recovered.Count(), after_put ? 5u : 4u);
+  }
 }
 
 TEST_F(DiskSlabTest, WarmRecoveryThatDiesHalfWayForcesAReset) {
