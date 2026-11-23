@@ -675,8 +675,10 @@ def _layout_tag(facts, objects: int) -> str:
     return hashlib.sha256(repr((facts, int(objects))).encode()).hexdigest()[:16]
 
 
-_MARKER_BUF = ctypes.create_string_buffer(1)
-_MARKER_PTR = ctypes.addressof(_MARKER_BUF)
+# One-byte markers per call that a client's registered scratch buffer holds
+# (64 KiB); a larger call uses a buffer of its own.
+_MARKER_SCRATCH_BYTES = 1 << 16
+_MARKER_SCRATCH_LOCK = threading.Lock()
 
 
 # What one transfer did: bytes moved, seconds in native I/O, the names of the
@@ -1163,6 +1165,38 @@ class DfkvHiCache(HiCacheStorage):
                 _tracing.release()
         except Exception:
             pass
+
+    def _marker_buffer(self, n: int, put: bool = False):
+        """Memory for ``n`` one-byte markers: ``(owner, base address)``.
+
+        Native I/O on memory not registered for RDMA registers a one-shot
+        memory region for the operation (``ibv_reg_mr``), so every marker
+        batch paid one. Markers use a scratch buffer registered once per
+        client instead. Byte 0 is the source of every marker PUT (``put``);
+        GETs land in the bytes after it, distinct within a call. Concurrent
+        calls on one client share the buffer without a lock: a PUT only
+        reads byte 0, a GET only writes the bytes after it, and what a GET
+        writes is never read (its result is the hit flag), so overlapping
+        GETs of two threads cannot change any result. A call with more
+        markers than the scratch holds gets a buffer of its own, as before.
+        """
+        if not put and n > _MARKER_SCRATCH_BYTES - 1:
+            owner = (ctypes.c_ubyte * n)()
+            return owner, ctypes.addressof(owner)
+        scratch = getattr(self, "_marker_scratch", None)
+        if scratch is None:
+            # Created once: two threads creating it at once would both
+            # register a buffer, and the one dropped would leave a memory
+            # region registered over memory Python reuses.
+            with _MARKER_SCRATCH_LOCK:
+                scratch = getattr(self, "_marker_scratch", None)
+                if scratch is None:
+                    scratch = (ctypes.c_ubyte * _MARKER_SCRATCH_BYTES)()
+                    if getattr(self, "transport_mode", None) == "rdma":
+                        self.register_memory(ctypes.addressof(scratch),
+                                             _MARKER_SCRATCH_BYTES)
+                    self._marker_scratch = scratch
+        return scratch, ctypes.addressof(scratch) + (0 if put else 1)
 
     def register_memory(self, base: int, size: int) -> bool:
         """Register one host/device MR, returning False on native rejection."""
@@ -2254,8 +2288,9 @@ class DfkvHiCache(HiCacheStorage):
         sks = [sk for k in keys for sk in self._keys(k)]
         if not sks:
             return []
+        owner, source = self._marker_buffer(1, put=True)
         karr, klens, parr, sarr, out, key_owners = _arrays(
-            sks, [_MARKER_PTR] * len(sks), [1] * len(sks))
+            sks, [source] * len(sks), [1] * len(sks))
         self._lib.dfkv_batch_put(
             self._h, karr, klens, parr, sarr, len(sks), out)
         del key_owners
@@ -2580,8 +2615,7 @@ class DfkvHiCache(HiCacheStorage):
                 sks = [sk for key in keys for sk in self._keys(key)]
                 if not sks:
                     return []
-                markers = (ctypes.c_ubyte * len(sks))()
-                base = ctypes.addressof(markers)
+                markers, base = self._marker_buffer(len(sks))
                 karr, klens, parr, sarr, out, key_owners = _arrays(
                     sks, range(base, base + len(sks)), [1] * len(sks))
                 t0 = time.perf_counter()
@@ -2801,15 +2835,14 @@ class DfkvHiCache(HiCacheStorage):
             if logical:
                 sub = self._pool_sub(name)
                 start = len(sks)
-                if putting:
-                    marker_ptr = _MARKER_PTR
-                else:
-                    markers = (ctypes.c_ubyte * (len(keys) * sub))()
-                    marker_buffers.append(markers)
-                    marker_ptr = ctypes.addressof(markers)
+                # GET destinations are indexed by the position in this call
+                # (distinct across all its marker pools).
+                markers, marker_ptr = self._marker_buffer(
+                    1 if putting else start + len(keys) * sub, put=putting)
+                marker_buffers.append(markers)
                 for k in keys:
                     for sk in self._pool_keys(name, k):
-                        sp.append(marker_ptr if putting else marker_ptr + len(sks) - start)
+                        sp.append(marker_ptr if putting else marker_ptr + len(sks))
                         sks.append(sk); ss.append(1)
                 segments.append((name, len(keys), sub, start, len(sks)))
                 continue

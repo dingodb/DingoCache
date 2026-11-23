@@ -3,6 +3,15 @@
 ## Unreleased
 
 
+- SGLang HiCache connector, models whose primary KV pool is a logical
+  anchor: the one-byte marker writes and reads no longer register memory for
+  RDMA on every batch. Their buffers were not registered, so the transport
+  registered a one-shot memory region (`ibv_reg_mr`, counted in
+  `dfkv_rdma_client_adhoc_user_mr_total`) for each operation; a registration
+  failure also counts against the connection. Markers now use a 64 KiB
+  scratch buffer registered once per client; a call with more markers than
+  it holds uses a buffer of its own as before.
+
 - SGLang HiCache connector, `batch_exists_v2`: all side pools are probed in
   one existence round trip. It made one round trip for the KV prefix and
   then one per side pool, one after the other: a model with five side pools
