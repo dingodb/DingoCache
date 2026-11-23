@@ -3,6 +3,11 @@
 ## Unreleased
 
 
+- Client: a read that the node answered but whose bytes this process could
+  not copy into a CUDA destination (TCP transport with a device destination)
+  is `DFKV_ST_INVALID` instead of `DFKV_ST_IO_ERROR`, and no longer puts the
+  node in cooldown.
+
 - C API: `dfkv_batch_retain` refuses a nonzero `reserved0` and unknown
   `flags` (returns -1), as `dfkv_open_v2` does for its options; they were
   ignored.
