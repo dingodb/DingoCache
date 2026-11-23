@@ -250,6 +250,20 @@ TEST(ClientEnv, EmptyRetainHeadroomIsReported) {
                  "set but empty; using 0, as before");
 }
 
+// 0 does not turn the peer cooldown or the bad-grace off (no cooldown would
+// let every request retry a dead node): it is reported and the default kept.
+TEST(ClientEnv, ZeroCooldownIsReportedAndIgnored) {
+  ScopedEnv cooldown("DFKV_PEER_COOLDOWN_MS", "0");
+  ScopedEnv grace("DFKV_PEER_BAD_GRACE_MS", "0");
+  const std::string log = LogOf([] {
+    dfkv_client_t client = OpenClient("n=127.0.0.1:1", nullptr);
+    ASSERT_NE(client, nullptr);
+    dfkv_close(client);
+  });
+  ExpectReported(log, "DFKV_PEER_COOLDOWN_MS", "0", "using 2000");
+  ExpectReported(log, "DFKV_PEER_BAD_GRACE_MS", "0", "using 1000");
+}
+
 // The ring wait is passed on as an int: the report names that int, and a
 // number that does not fit one is reported.
 TEST(ClientEnv, RingWaitReportNamesTheIntWaitedFor) {
