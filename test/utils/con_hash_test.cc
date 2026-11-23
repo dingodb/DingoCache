@@ -1,10 +1,12 @@
 // TDD R2 — consistent hash (Ketama) for client-side routing across cache nodes.
 #include "utils/con_hash.h"
+#include "utils/md5.h"
 
 #include <gtest/gtest.h>
 
 #include <map>
 #include <string>
+#include <vector>
 
 using dfkv::ConHash;
 
@@ -107,5 +109,61 @@ TEST(ConHash, LookupHashEqualsLookup) {
     ASSERT_TRUE(ring.Lookup(key, &by_key));
     ASSERT_TRUE(ring.LookupHash(ConHash::KeyHash(key), &by_hash));
     ASSERT_EQ(by_key, by_hash) << key;
+  }
+}
+
+namespace {
+// The ring as Build made it before the sorted vector: a map point -> name,
+// filled in member order, the last writer owning a shared point.
+std::map<uint32_t, std::string> ReferenceRing(
+    const std::vector<std::pair<std::string, int>>& nodes) {
+  std::map<uint32_t, std::string> ring;
+  for (const auto& [name, weight] : nodes) {
+    const int w = weight < 1 ? 1 : (weight > 1024 ? 1024 : weight);
+    for (int k = 0; k < 40 * w; ++k) {
+      uint8_t d[16];
+      const std::string s = name + "-" + std::to_string(k);
+      dfkv::Md5(s.data(), s.size(), d);
+      for (int h = 0; h < 4; ++h)
+        ring[uint32_t(d[h * 4]) | (uint32_t(d[h * 4 + 1]) << 8) |
+             (uint32_t(d[h * 4 + 2]) << 16) |
+             (uint32_t(d[h * 4 + 3]) << 24)] = name;
+    }
+  }
+  return ring;
+}
+}  // namespace
+
+// Every route is the one the map-based ring gave, for several sizes and
+// weights, keys and the wrap past the last point.
+TEST(ConHash, RoutesAreThoseOfTheMapRing) {
+  for (int n : {1, 3, 16, 64}) {
+    std::vector<std::pair<std::string, int>> nodes;
+    ConHash ring;
+    for (int i = 0; i < n; ++i) {
+      nodes.push_back({"node-" + std::to_string(i), 1 + i % 3});
+      ring.AddNode(nodes.back().first, nodes.back().second);
+    }
+    ring.Build();
+    const auto reference = ReferenceRing(nodes);
+    ASSERT_EQ(ring.RingSize(), reference.size());
+    auto route = [&](uint32_t h) {
+      auto it = reference.lower_bound(h);
+      return it == reference.end() ? reference.begin()->second : it->second;
+    };
+    std::string node;
+    for (int k = 0; k < 20000; ++k) {
+      const uint32_t h = ConHash::KeyHash("key-" + std::to_string(k));
+      ASSERT_TRUE(ring.LookupHash(h, &node));
+      ASSERT_EQ(node, route(h)) << n << " " << k;
+    }
+    for (uint32_t h : {0u, 0xFFFFFFFFu, reference.rbegin()->first,
+                       reference.rbegin()->first + 1, reference.begin()->first}) {
+      ASSERT_TRUE(ring.LookupHash(h, &node));
+      EXPECT_EQ(node, route(h)) << h;
+    }
+    size_t vnodes = 0;
+    for (const auto& [name, weight] : nodes) vnodes += 160u * weight;
+    EXPECT_LE(ring.RingSize() + ring.Collisions(), vnodes);
   }
 }

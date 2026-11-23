@@ -22,14 +22,20 @@ class ConHash {
   static uint32_t KeyHash(const std::string& key);
   bool LookupHash(uint32_t hash, std::string* node) const;
   size_t NodeCount() const { return nodes_.size(); }
-  size_t RingSize() const { return ring_.size(); }
+  size_t RingSize() const { return points_.size(); }
+  // Points two vnodes hashed to: the node added later owns them (so the
+  // order members are added in decides those points).
+  size_t Collisions() const { return collisions_; }
   // Ring points owned per node (the realized vnode distribution after hash
   // collisions). Used by `dfkvctl ring` to show routing share. Off the datapath.
   std::map<std::string, size_t> NodePointCounts() const;
 
  private:
   std::vector<std::pair<std::string, int>> nodes_;  // (name, weight)
-  std::map<uint32_t, std::string> ring_;            // point -> node
+  // The ring, sorted by point: (point, index into nodes_). A sorted vector
+  // rather than a map: a lookup is a binary search over contiguous memory.
+  std::vector<std::pair<uint32_t, uint32_t>> points_;
+  size_t collisions_ = 0;
 };
 
 }  // namespace dfkv
