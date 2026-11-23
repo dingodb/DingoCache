@@ -205,6 +205,10 @@ class KVClient {
  // discovery race at startup (ring empty → Route() returns "" → all ops
  // silently fail). Env DFKV_OPEN_RING_WAIT_MS overrides the timeout (default 30s).
   bool WaitForRing(int timeout_ms = 30000);
+  // The address ("ip:port") the ring routes `key` to; "" with no owner.
+  std::string OwnerOf(const std::string& key) const { return Route(key); }
+  // The addresses of the ring's members, sorted.
+  std::vector<std::string> MemberAddresses() const;
   void StopMdsDiscovery();
   // Register THIS client (a cache consumer / inference instance) with the MDS so
   // `dfkvctl clients` can surface "who is using dfkv". `self` carries identity
