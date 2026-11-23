@@ -328,6 +328,13 @@ Status RdmaServer::Start(int port) {
   recv_segment_max_bytes_ = RecvSegmentBytes();
   recv_segment_chunk_bytes_ = RecvChunkBytes(recv_segment_max_bytes_);
   recv_chunk_idle_ms_ = RecvChunkIdleMs();
+  // Each GET staged from disk and each leased PUT registers its range of a
+  // receive chunk for that one operation. On 2 MiB pages that costs a
+  // fraction of what 4 KiB pages cost from about 4 MiB up (64 MiB: 0.4 ms
+  // instead of 2.4 ms per operation, measured), as for the RAM tier arena.
+  const bool recv_huge_pages =
+      config_dump::EnvBool("DFKV_RDMA_RECV_HUGEPAGES", true);
+  recv_segments_.set_huge_pages(recv_huge_pages);
   const size_t min_slot_bytes = rdma::V2SlotSize(max_msg_);
   // Reserve one staging chunk only if it can hold the largest legal staged
   // object and the hard budget still fits one resident chunk per configured

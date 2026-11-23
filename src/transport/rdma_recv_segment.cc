@@ -8,6 +8,8 @@
 #include <limits>
 #include <utility>
 
+#include <sys/mman.h>
+
 #include "utils/numa_util.h"
 
 namespace dfkv::rdma {
@@ -84,16 +86,51 @@ void RecvSegment::Lease::Reset() {
   size_ = 0;
 }
 
-RecvSegment::~RecvSegment() { std::free(data_); }
+RecvSegment::~RecvSegment() {
+  if (mapped_)
+    ::munmap(data_, size_);
+  else
+    std::free(data_);
+}
 
-bool RecvSegment::Init(size_t bytes, size_t alignment, int numa_node) {
+bool RecvSegment::Init(size_t bytes, size_t alignment, int numa_node,
+                       bool huge_pages) {
   if (data_) return size_ == bytes && alignment_ == alignment;
   if (bytes == 0 || !IsPowerOfTwo(alignment) || bytes % alignment != 0 ||
       alignment < sizeof(void*)) {
     return false;
   }
+  constexpr size_t kHugePageBytes = size_t{2} << 20;
+  huge_pages = huge_pages && bytes >= kHugePageBytes;
   void* raw = nullptr;
-  if (::posix_memalign(&raw, alignment, bytes) != 0) return false;
+  if (huge_pages) {
+    // A mapping of its own, aligned to the huge page, rather than heap
+    // memory: madvise marks the whole mapping it falls in, and a heap
+    // mapping is shared with unrelated allocations.
+    const size_t align = std::max(alignment, kHugePageBytes);
+    const size_t span = bytes + align;
+    void* map = ::mmap(nullptr, span, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (map == MAP_FAILED) return false;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(map);
+    const uintptr_t start = (base + align - 1) & ~(uintptr_t{align} - 1);
+    if (start > base) ::munmap(map, start - base);
+    const uintptr_t end = start + bytes;
+    if (base + span > end)
+      ::munmap(reinterpret_cast<void*>(end), base + span - end);
+    raw = reinterpret_cast<void*>(start);
+    mapped_ = true;
+  } else if (::posix_memalign(&raw, alignment, bytes) != 0) {
+    return false;
+  }
+#ifdef MADV_HUGEPAGE
+  // Refused where the kernel has no transparent huge pages: small pages.
+  if (huge_pages && ::madvise(raw, bytes, MADV_HUGEPAGE) != 0)
+    huge_pages = false;
+#else
+  huge_pages = false;
+#endif
+  huge_pages_ = huge_pages;
   data_ = static_cast<char*>(raw);
   numa::BindMemory(raw, bytes, numa_node);
   size_ = bytes;
@@ -233,7 +270,7 @@ bool RecvSegmentPool::Init(size_t chunk_bytes, size_t max_bytes,
   auto initial = std::make_unique<Chunk>();
   initial->segment = std::make_unique<RecvSegment>();
   initial->staging_only = staging_reserve_bytes_ != 0;
-  if (!initial->segment->Init(chunk_bytes_, alignment_)) {
+  if (!initial->segment->Init(chunk_bytes_, alignment_, -1, huge_pages_)) {
     chunk_bytes_ = 0;
     max_bytes_ = 0;
     alignment_ = 0;
@@ -257,7 +294,8 @@ std::unique_ptr<RecvSegmentPool::Chunk> RecvSegmentPool::NewChunk(
   auto chunk = std::make_unique<Chunk>();
   chunk->segment = std::make_unique<RecvSegment>();
   chunk->affinity = affinity;
-  if (!chunk->segment->Init(bytes, alignment_, numa_node)) return nullptr;
+  if (!chunk->segment->Init(bytes, alignment_, numa_node, huge_pages_))
+    return nullptr;
   return chunk;
 }
 

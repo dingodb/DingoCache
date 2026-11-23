@@ -58,7 +58,13 @@ class RecvSegment {
     uint64_t allocation_failures = 0;
   };
 
-  bool Init(size_t bytes, size_t alignment = 4096, int numa_node = -1);
+  // huge_pages: ask for transparent huge pages (a segment of at least one
+  // huge page, aligned to it), as the RAM tier arena does: registering a
+  // range of it for one RDMA operation then pins 2 MiB pages instead of
+  // 4 KiB ones, several times cheaper for large ranges.
+  bool Init(size_t bytes, size_t alignment = 4096, int numa_node = -1,
+            bool huge_pages = false);
+  bool huge_pages() const { return huge_pages_; }
   Lease Allocate(size_t bytes, size_t alignment = 4096);
 
   char* data() const { return data_; }
@@ -74,6 +80,8 @@ class RecvSegment {
   size_t alignment_ = 0;
   mutable std::mutex mu_;
   std::map<size_t, size_t> free_;  // offset -> length, sorted and coalesced
+  bool huge_pages_ = false;
+  bool mapped_ = false;  // data_ is an mmap of its own (huge pages)
   std::atomic<uint64_t> allocation_failures_{0};
 };
 
@@ -131,6 +139,9 @@ class RecvSegmentPool {
   // leases cannot consume it. The reservation stays within max_bytes.
   bool Init(size_t chunk_bytes, size_t max_bytes,
             size_t alignment = 4096, size_t staging_reserve_bytes = 0);
+  // Chunks committed from now on ask for transparent huge pages (see
+  // RecvSegment::Init). Call before Init to cover the initial chunk.
+  void set_huge_pages(bool on) { huge_pages_ = on; }
   Lease Allocate(size_t bytes, size_t alignment = 4096,
                  int affinity = -1, int numa_node = -1,
                  LeaseClass lease_class = LeaseClass::kConnection);
@@ -153,6 +164,7 @@ class RecvSegmentPool {
   size_t max_bytes_ = 0;
   size_t staging_reserve_bytes_ = 0;
   size_t alignment_ = 0;
+  bool huge_pages_ = false;
   mutable std::mutex mu_;
   std::vector<std::unique_ptr<Chunk>> chunks_;
   std::atomic<uint64_t> growths_{0};
