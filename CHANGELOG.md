@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Server, RAM tier (unreleased since the flush-lane change): the number of
+  flush lanes was read from the disk group before the group was
+  constructed, so it was whatever that memory held; a start with the RAM
+  tier on could fail with `std::bad_array_new_length` or run with a wrong
+  lane count. It is the number of configured directories now, as for the
+  flush threads.
+
 
 - Client C ABI: per-key outcome codes. The batch calls report a key as hit
   or not (0/1); a miss, a node in cooldown, an empty ring, a full disk, a

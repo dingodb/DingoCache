@@ -293,6 +293,9 @@ KvNodeServer::RamTierPlan KvNodeServer::PlanRamTier(size_t disk_count) {
   // opened while this tier is built, and a start with fewer does not go on.
   o.flush_threads = static_cast<uint32_t>(
       std::min<size_t>(4 * (disk_count ? disk_count : 1), 16));
+  // Flush queues and dirty accounting by disk (see Options::flush_lane):
+  // the count of the configured directories, for the same reason.
+  o.flush_lanes = disk_count ? disk_count : 1;
   {
     envparse::U64Spec spec;
     spec.negative = envparse::Negative::kWraps;
@@ -368,8 +371,9 @@ std::future<std::unique_ptr<RamTier>> KvNodeServer::StartRamTier() {
     return group_.DiskFailedFor(key);
   };
   // Flush queues and dirty accounting by disk: a slow disk holds up its own
-  // values only.
-  o.flush_lanes = group_.DiskCount();
+  // values only. The lane count comes from the plan: this runs before group_
+  // is constructed (it is declared after ram_starting_), so group_ may only
+  // be used by what runs later, as this lambda (PUT admission) is.
   o.flush_lane = [this](const BlockKey& key) { return group_.DiskIndexOf(key); };
   // A value that will not be written takes its parked RETAIN SET with it.
   o.flush_given_up = [this](const BlockKey& key) {

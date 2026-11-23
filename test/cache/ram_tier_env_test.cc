@@ -20,6 +20,9 @@ class KvNodeServerWiringTestPeer {
     uint32_t flush_threads;
     uint64_t bytes;
   };
+  static size_t FlushLanes(size_t disk_count) {
+    return KvNodeServer::PlanRamTier(disk_count).options.flush_lanes;
+  }
   static Plan Read() {
     const auto plan = KvNodeServer::PlanRamTier(/*disk_count=*/1);
     return {plan.enabled, plan.options.ack_high_watermark_pct,
@@ -215,3 +218,11 @@ TEST_F(RamTierEnv, TierSwitchKeepsItsLowerCaseWords) {
 }
 
 }  // namespace
+
+// The flush lanes are the configured directories, as the flush threads: the
+// RAM tier is built while the disk group is still being opened, so its
+// size must not be read from the group (it read an unconstructed one).
+TEST_F(RamTierEnv, FlushLanesAreTheConfiguredDisks) {
+  EXPECT_EQ(Peer::FlushLanes(3), 3u);
+  EXPECT_EQ(Peer::FlushLanes(1), 1u);
+}
