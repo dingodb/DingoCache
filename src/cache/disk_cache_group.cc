@@ -7,13 +7,19 @@
 #include <cstring>
 #include <cstdio>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <map>
 #include <set>
 #include <sstream>
+#include <cerrno>
 #include <system_error>
 #include <thread>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "cache/disk_slab_store.h"
 #include "cache/log_store.h"
@@ -247,6 +253,21 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
     fail("DFKV_DISK_HASH_WEIGHT must be an integer in [1,64]");
     return;
   }
+  if (const char* text = std::getenv("DFKV_DEGRADED_MIN_DISKS");
+      text != nullptr && *text != '\0') {
+    uint64_t value = 0;
+    if (!ParseUnsigned(text, std::numeric_limits<uint32_t>::max(), &value) ||
+        value == 0) {
+      fail("DFKV_DEGRADED_MIN_DISKS must be a positive integer");
+      return;
+    }
+    min_healthy_disks_ = static_cast<size_t>(value);
+  }
+  // A value above this node's disk count means any failure takes it out of
+  // placement; one setting can then serve nodes with different disk counts.
+  min_healthy_disks_ = std::min(min_healthy_disks_, opt.cache_dirs.size());
+  config_dump::RecordResolved("DFKV_DEGRADED_MIN_DISKS",
+                              std::to_string(min_healthy_disks_));
 
   bool slab_direct = true;
   if (const char* mode = std::getenv("DFKV_SLAB_WRITE")) {
@@ -501,6 +522,8 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
                      store->StartupError());
     }
     by_id_[dir] = i;
+    ids_.push_back(dir);
+    canonical_ids_.push_back(CanonicalDiskId(dir));
     disks_.push_back(std::move(store));
     ring_.AddNode(dir, disk_weight);
   }
@@ -514,6 +537,11 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
                   opt.cache_dirs[slowest] + ")");
   }
   ring_.Build();
+  on_record_ = std::make_unique<std::atomic<bool>[]>(disks_.size());
+  reset_.assign(disks_.size(), false);
+  no_takeover_.assign(disks_.size(), false);
+  misplaced_remove_for_test_ = opt.misplaced_remove_for_test;
+  record_location_for_test_ = opt.record_location_for_test;
   if (disks_.size() > 1) {
     auto points = ring_.NodePointCounts();
     size_t min_points = SIZE_MAX;
@@ -537,6 +565,7 @@ bool DiskCacheGroup::Activate() {
   // A start in which a disk failed to open does not go on: the disks that
   // did open stay as they were found.
   if (!Healthy() || closed_) return false;
+  if (disks_.size() > 1 && !ResetAfterFailedRun()) return false;
   const auto started = std::chrono::steady_clock::now();
   for (const auto& disk : disks_) {
     if (disk->Activate()) continue;
@@ -554,6 +583,7 @@ bool DiskCacheGroup::Activate() {
   DFKV_LOG_INFO("disk stores activated: " + std::to_string(disks_.size()) +
                 text + "; an exit without a clean stop is an unclean exit "
                 "from here on");
+  if (records_found_) DropMisplacedKeys();
   return true;
 }
 
@@ -582,14 +612,25 @@ std::vector<DiskCacheGroup::CloseReport> DiskCacheGroup::Close() {
   }
   if (!disks_.empty()) close_one(0);
   for (auto& helper : helpers) helper.join();
+  // A run that found failure records and lost no disk, closed clean: what
+  // the records asked for is done and on the disks.
+  bool all_clean = true;
+  for (const auto& r : report) all_clean = all_clean && r.clean;
+  if (records_found_ && activated_ && all_clean && !open_drop_incomplete_ &&
+      FailedDisks() == 0)
+    ClearFailureRecords();
   return report;
 }
 
 bool DiskCacheGroup::Healthy() const {
-  if (!healthy_) return false;
-  for (const auto& disk : disks_)
-    if (!disk->Healthy()) return false;
-  return true;
+  return healthy_ && !record_failed_.load(std::memory_order_acquire) &&
+         disks_.size() - FailedDisks() >= min_healthy_disks_;
+}
+
+size_t DiskCacheGroup::FailedDisks() const {
+  size_t failed = 0;
+  for (const auto& disk : disks_) failed += disk->Healthy() ? 0 : 1;
+  return failed;
 }
 
 uint64_t DiskCacheGroup::MaxValueBytes() const {
@@ -599,21 +640,309 @@ uint64_t DiskCacheGroup::MaxValueBytes() const {
 }
 
 bool DiskCacheGroup::DiskFailedFor(const BlockKey& key) const {
-  // While every disk is healthy this is one atomic read per disk and no
-  // routing: the key's disk is looked up only once some store has failed.
-  bool any_failed = false;
-  for (const auto& disk : disks_) any_failed |= !disk->Healthy();
-  if (!any_failed) return false;
+  // A key is routed away from a failed disk while any other is healthy, so
+  // this holds only once every disk has failed.
   const size_t index = RouteIndex(key);
   return index < disks_.size() && !disks_[index]->Healthy();
 }
 
-size_t DiskCacheGroup::RouteIndex(const BlockKey& key) const {
-  if (disks_.size() == 1) return 0;
+size_t DiskCacheGroup::HomeIndex(const std::string& name) const {
   std::string id;
-  if (!ring_.Lookup(key.Filename(), &id)) return kInvalidDisk;
+  if (!ring_.Lookup(name, &id)) return kInvalidDisk;
   auto it = by_id_.find(id);
   return it == by_id_.end() ? kInvalidDisk : it->second;
+}
+
+size_t DiskCacheGroup::RouteIndex(const BlockKey& key) const {
+  if (disks_.size() == 1) return 0;
+  const std::string name = key.Filename();
+  const size_t home = HomeIndex(name);
+  if (home == kInvalidDisk || disks_[home]->Healthy()) return home;
+  // The key's disk has failed for good. Below DFKV_DEGRADED_MIN_DISKS, or
+  // with the failure not on record, the key stays there (and fails).
+  if (!Healthy() || !FailureOnRecord(home)) return home;
+  // Its keys go to the healthy disks by highest random weight: each failed
+  // disk's keys spread evenly, a healthy disk's keys never move, and a key
+  // moves again only if the disk it moved to fails too.
+  const uint64_t hash = std::hash<std::string>{}(name);
+  size_t best = home;
+  uint64_t best_score = 0;
+  for (size_t i = 0; i < disks_.size(); ++i) {
+    if (!disks_[i]->Healthy() || no_takeover_[i]) continue;
+    uint64_t score = hash ^ ((i + 1) * 0x9E3779B97F4A7C15ull);
+    score = (score ^ (score >> 30)) * 0xBF58476D1CE4E5B9ull;
+    score = (score ^ (score >> 27)) * 0x94D049BB133111EBull;
+    score ^= score >> 31;
+    if (best == home || score > best_score) {
+      best = i;
+      best_score = score;
+    }
+  }
+  return best;
+}
+
+namespace {
+// Next to the cache directory, on the same disk, outside what any engine
+// reads: "/mnt/disk2/dfkv" -> "/mnt/disk2/dfkv.dfkv-failed-disks". `dir` is
+// a canonical id (CanonicalDiskId).
+std::string FailureRecordPath(const std::string& dir) {
+  return dir + ".dfkv-failed-disks";
+}
+
+std::string ParentOf(const std::string& path) {
+  std::string parent = std::filesystem::path(path).parent_path().string();
+  return parent.empty() ? std::string(".") : parent;
+}
+
+bool SyncParentOf(const std::string& path) {
+  const int fd =
+      ::open(ParentOf(path).c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fd < 0) return false;
+  const bool ok = ::fsync(fd) == 0;
+  ::close(fd);
+  return ok;
+}
+
+// A record lives exactly as long as the data it protects only where the
+// directory above the cache directory is on the cache directory's own
+// filesystem: not for a mount root or a container volume.
+bool OnTheDirsFilesystem(const std::string& dir) {
+  struct stat d {}, p {};
+  return ::stat(dir.c_str(), &d) == 0 && ::stat(ParentOf(dir).c_str(), &p) == 0 &&
+         d.st_dev == p.st_dev;
+}
+}  // namespace
+
+std::string DiskCacheGroup::CanonicalDiskId(const std::string& dir) {
+  std::error_code ec;
+  const auto canonical = std::filesystem::weakly_canonical(dir, ec);
+  std::string id =
+      ec ? std::filesystem::path(dir).lexically_normal().string()
+         : canonical.string();
+  while (id.size() > 1 && id.back() == '/') id.pop_back();
+  return id;
+}
+
+bool DiskCacheGroup::FailureOnRecord(size_t i) const {
+  if (on_record_[i].load(std::memory_order_acquire)) return true;
+  if (record_failed_.load(std::memory_order_acquire)) return false;
+  std::lock_guard<std::mutex> lock(record_mu_);
+  if (on_record_[i].load(std::memory_order_acquire)) return true;
+  if (record_failed_.load(std::memory_order_acquire)) return false;
+  std::set<std::string> ids = failed_ids_;
+  ids.insert(canonical_ids_[i]);
+  if (!WriteFailureRecords(ids)) {
+    record_failed_.store(true, std::memory_order_release);
+    DFKV_LOG_ERROR("disk store failed: " + ids_[i] +
+                   "; its failure could not be put on record next to any "
+                   "healthy disk (each cache directory must be a "
+                   "subdirectory on its disk's own filesystem), so its keys "
+                   "do not move to the other disks and the node reports "
+                   "itself unhealthy");
+    return false;
+  }
+  failed_ids_ = std::move(ids);
+  on_record_[i].store(true, std::memory_order_release);
+  DFKV_LOG_ERROR("disk store failed: " + ids_[i] +
+                 "; on record, its keys now go to the other disks. The next "
+                 "start empties it.");
+  return true;
+}
+
+bool DiskCacheGroup::WriteFailureRecords(
+    const std::set<std::string>& ids) const {
+  std::string text;
+  for (const auto& id : ids) text += id + "\n";
+  size_t written = 0;
+  for (size_t j = 0; j < disks_.size(); ++j) {
+    if (!disks_[j]->Healthy()) continue;
+    const std::string& dir = canonical_ids_[j];
+    const bool same_fs = record_location_for_test_
+                             ? record_location_for_test_(dir)
+                             : OnTheDirsFilesystem(dir);
+    if (!same_fs) {
+      DFKV_LOG_WARN("no disk failure record next to " + dir + ": the "
+                    "directory above it is on another filesystem");
+      continue;
+    }
+    const std::string path = FailureRecordPath(dir);
+    const std::string tmp = path + ".tmp";
+    const int fd =
+        ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) continue;
+    bool ok = ::write(fd, text.data(), text.size()) ==
+              static_cast<ssize_t>(text.size());
+    ok = ::fsync(fd) == 0 && ok;
+    ok = ::close(fd) == 0 && ok;
+    ok = ok && ::rename(tmp.c_str(), path.c_str()) == 0 && SyncParentOf(path);
+    if (ok) ++written;
+    else DFKV_LOG_WARN("cannot write the disk failure record " + path);
+  }
+  return written > 0;
+}
+
+// Every copy there is, read in full. A copy that is there but cannot be
+// read completely, or that names a directory this node does not have, is
+// not usable: what it names cannot be known.
+DiskCacheGroup::FailureRecords DiskCacheGroup::ReadFailureRecords() const {
+  FailureRecords out;
+  for (const auto& dir : canonical_ids_) {
+    const std::string path = FailureRecordPath(dir);
+    struct stat st {};
+    if (::lstat(path.c_str(), &st) != 0) {
+      if (errno == ENOENT) continue;
+      out.found = true;
+      out.usable = false;
+      DFKV_LOG_ERROR("cannot inspect the disk failure record " + path + ": " +
+                     std::strerror(errno));
+      continue;
+    }
+    out.found = true;
+    std::string text;
+    bool read_ok = S_ISREG(st.st_mode);
+    const int fd = read_ok ? ::open(path.c_str(), O_RDONLY | O_CLOEXEC) : -1;
+    if (fd < 0) read_ok = false;
+    while (read_ok) {
+      char buf[4096];
+      const ssize_t n = ::read(fd, buf, sizeof(buf));
+      if (n < 0 && errno == EINTR) continue;
+      if (n < 0) read_ok = false;
+      if (n <= 0) break;
+      text.append(buf, static_cast<size_t>(n));
+    }
+    if (fd >= 0) ::close(fd);
+    // The writer never writes an empty record: one is a torn write.
+    if (!read_ok || text.empty() || text.back() != '\n') {
+      out.usable = false;
+      DFKV_LOG_ERROR("the disk failure record " + path + " cannot be read "
+                     "completely");
+      continue;
+    }
+    std::istringstream lines(text);
+    std::string line;
+    while (std::getline(lines, line)) {
+      if (line.empty()) continue;
+      const std::string id = CanonicalDiskId(line);
+      if (std::find(canonical_ids_.begin(), canonical_ids_.end(), id) !=
+          canonical_ids_.end()) {
+        out.ids.insert(id);
+      } else {
+        out.usable = false;
+        DFKV_LOG_ERROR("the disk failure record " + path + " names " + line +
+                       ", which is not a cache directory of this node");
+      }
+    }
+  }
+  return out;
+}
+
+// Before the disks are activated: the disks that failed in an earlier run
+// (all of them, if what failed cannot be known) are reset to empty, each by
+// its engine. False if one cannot be: the start does not go on.
+bool DiskCacheGroup::ResetAfterFailedRun() {
+  const FailureRecords records = ReadFailureRecords();
+  records_found_ = records.found;
+  if (!records.found) return true;
+  if (!records.usable)
+    DFKV_LOG_ERROR("a disk failure record is not usable: every disk is "
+                   "emptied, as what failed in the earlier run cannot be "
+                   "known");
+  for (size_t i = 0; i < disks_.size(); ++i) {
+    if (records.usable && records.ids.count(canonical_ids_[i]) == 0) continue;
+    const uint64_t keys = disks_[i]->Count();
+    if (!disks_[i]->ResetBeforeActivation()) {
+      healthy_ = false;
+      const std::string error = ids_[i] + ": cannot reset the disk to empty "
+                                "after a failure in an earlier run: " +
+                                disks_[i]->StartupError();
+      if (startup_error_.empty()) startup_error_ = error;
+      DFKV_LOG_ERROR(error);
+      return false;
+    }
+    reset_[i] = true;
+    (records.usable ? open_emptied_keys_ : open_unusable_keys_) += keys;
+  }
+  return true;
+}
+
+// After the disks are activated, if a record was found: a disk not reset
+// drops the keys whose home is another disk (what an earlier run wrote in
+// place of a failed disk).
+void DiskCacheGroup::DropMisplacedKeys() {
+  const auto started = std::chrono::steady_clock::now();
+  const size_t n = disks_.size();
+  std::vector<uint64_t> misplaced(n, 0), refused(n, 0);
+  auto drop_one = [&](size_t i) {
+    if (reset_[i]) return;
+    std::vector<BlockKey> keys;
+    disks_[i]->ForEachKey([&](const BlockKey& key) {
+      if (HomeIndex(key.Filename()) != i) keys.push_back(key);
+    });
+    for (const BlockKey& key : keys) {
+      const Status st = misplaced_remove_for_test_
+                            ? misplaced_remove_for_test_(i, key)
+                            : disks_[i]->Remove(key);
+      if (st != Status::kOk && st != Status::kNotFound) ++refused[i];
+      else ++misplaced[i];
+    }
+  };
+  std::vector<std::thread> helpers;
+  for (size_t i = 1; i < n; ++i) {
+    try {
+      helpers.emplace_back(drop_one, i);
+    } catch (const std::system_error&) {
+      drop_one(i);
+    }
+  }
+  drop_one(0);
+  for (auto& helper : helpers) helper.join();
+  uint64_t refused_total = 0;
+  for (size_t i = 0; i < n; ++i) {
+    open_misplaced_keys_ += misplaced[i];
+    refused_total += refused[i];
+    // It still holds a value it must not serve for another disk's key:
+    // that key's home failing again would route it here.
+    if (refused[i]) {
+      no_takeover_[i] = true;
+      DFKV_LOG_WARN(ids_[i] + ": " + std::to_string(refused[i]) + " keys of "
+                    "other disks could not be removed; it takes no other "
+                    "disk's keys in this run");
+    }
+  }
+  open_drop_incomplete_ = refused_total != 0;
+  char text[64];
+  std::snprintf(text, sizeof(text), " in %.1f ms",
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - started).count());
+  DFKV_LOG_INFO("disk failure records found: emptied " +
+                std::to_string(open_emptied_keys_) + " keys of the disks "
+                "that failed, " + std::to_string(open_unusable_keys_) +
+                " keys of every disk for an unusable record, dropped " +
+                std::to_string(open_misplaced_keys_) + " keys found on a "
+                "disk that is not their home" + text);
+  if (refused_total)
+    DFKV_LOG_WARN(std::to_string(refused_total) +
+                  " of those keys could not be removed; the records are kept "
+                  "for the next start");
+}
+
+void DiskCacheGroup::ClearFailureRecords() {
+  for (const auto& dir : canonical_ids_) {
+    const std::string path = FailureRecordPath(dir);
+    struct stat st {};
+    if (::lstat(path.c_str(), &st) != 0) continue;
+    // Only a file this node writes; anything else there is not ours.
+    if (!S_ISREG(st.st_mode)) {
+      DFKV_LOG_WARN(path + " is not a file: left as it is (it makes every "
+                    "start empty all disks until it is removed)");
+      continue;
+    }
+    if (::unlink(path.c_str()) == 0) SyncParentOf(path);
+    else
+      DFKV_LOG_WARN("cannot remove the disk failure record " + path + ": " +
+                    std::strerror(errno));
+  }
+  DFKV_LOG_INFO("disk failure records cleared after a clean stop");
 }
 
 StoreEngine* DiskCacheGroup::Route(const BlockKey& key) const {
@@ -723,15 +1052,22 @@ uint8_t DiskCacheGroup::Retain(const BlockKey& key, uint32_t ttl_s,
   return d->Retain(key, ttl_s, mode, now_s);
 }
 
+// A failed disk takes no key while another is healthy: its limits do not
+// apply to the node.
 uint32_t DiskCacheGroup::RetainHeadroomPct() const {
+  const bool skip_failed = FailedDisks() < disks_.size();
   uint32_t pct = 100;
-  for (const auto& d : disks_) pct = std::min(pct, d->RetainHeadroomPct());
+  for (const auto& d : disks_)
+    if (!skip_failed || d->Healthy())
+      pct = std::min(pct, d->RetainHeadroomPct());
   return disks_.empty() ? 0 : pct;
 }
 
 uint32_t DiskCacheGroup::RetainMaxTtl() const {
+  const bool skip_failed = FailedDisks() < disks_.size();
   uint32_t ttl = UINT32_MAX;
-  for (const auto& d : disks_) ttl = std::min(ttl, d->RetainMaxTtl());
+  for (const auto& d : disks_)
+    if (!skip_failed || d->Healthy()) ttl = std::min(ttl, d->RetainMaxTtl());
   return disks_.empty() ? 0 : ttl;
 }
 
@@ -1109,9 +1445,10 @@ uint64_t DiskCacheGroup::UsedBytes() const {
   return t;
 }
 uint64_t DiskCacheGroup::TenantUsedBytes(uint64_t tenant_hash) const {
+  // What a failed disk holds can no longer be read: it is not charged.
   uint64_t total = 0;
   for (const auto& disk : disks_)
-    total += disk->TenantUsedBytes(tenant_hash);
+    if (disk->Healthy()) total += disk->TenantUsedBytes(tenant_hash);
   return total;
 }
 

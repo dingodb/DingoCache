@@ -100,13 +100,18 @@ class KvNodeServer {
   // The constructor saw its cancel_start flag set. The disks that opened are
   // open; Shutdown() closes them clean. Start() refuses.
   bool start_cancelled() const { return start_cancelled_; }
-  // False once a disk store has failed for good: it then stores and reads
-  // nothing more until the process is restarted, so the keys placed on it
-  // are lost to clients for as long as this node stays in the placement
-  // ring. Narrower than
-  // Healthy() on purpose: a RAM tier that dropped an entry it could not flush
-  // also clears Healthy(), but that node still serves every request.
+  // False once fewer than DFKV_DEGRADED_MIN_DISKS (default 1) disks are
+  // left whose store has not failed for good. A failed store stores and
+  // reads nothing more until the process is restarted; its keys go to the
+  // remaining disks (DisksDegraded). Narrower than Healthy() on purpose: a
+  // RAM tier that dropped an entry it could not flush also clears Healthy(),
+  // but that node still serves every request.
   bool DisksHealthy() const { return group_.Healthy(); }
+  // Some disk stores have failed for good and the node serves on the others.
+  bool DisksDegraded() const {
+    return group_.FailedDisks() > 0 && group_.Healthy();
+  }
+  size_t FailedDisks() const { return group_.FailedDisks(); }
   // Accessors for the MDS heartbeat stats provider (STA1) -- all cheap reads.
   uint64_t Evictions() const { return group_.Evictions(); }
   uint64_t PutBusyTotal() const { return put_busy_.load(std::memory_order_relaxed); }

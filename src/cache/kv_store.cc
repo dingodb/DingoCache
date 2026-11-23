@@ -1,6 +1,7 @@
 #include "cache/kv_store.h"
 
 #include <fcntl.h>
+#include <set>
 #include <unistd.h>
 
 #include <algorithm>
@@ -830,6 +831,52 @@ Status KVStore::RangeDirectPrep(const BlockKey& key, uint64_t offset,
   lease.payload_len = static_cast<size_t>(n);
   *out = std::move(lease);
   return Status::kOk;
+}
+
+// The file engine has no activation of its own: this runs before the group
+// serves. Each file goes; a crash part-way leaves the rest for the next
+// reset.
+bool KVStore::ResetBeforeActivation() {
+  if (!healthy_) return false;
+  std::set<std::string> dirs;  // fsynced at the end: the unlinks are durable
+  for (auto& sh : shards_) {
+    std::unique_lock<std::shared_mutex> wl(sh->mu);
+    for (const auto& entry : sh->index) {
+      if (::unlink(entry.second.path.c_str()) != 0 && errno != ENOENT) {
+        healthy_ = false;
+        startup_error_ = "cannot remove " + entry.second.path;
+        return false;
+      }
+      dirs.insert(fs::path(entry.second.path).parent_path().string());
+    }
+    sh->index.clear();
+    sh->ring.clear();
+    sh->hand = sh->ring.end();
+    sh->used_bytes = 0;
+    sh->tenant_used_bytes.clear();
+  }
+  for (const auto& dir : dirs) {
+    const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    const bool synced = fd >= 0 && ::fsync(fd) == 0;
+    if (fd >= 0) ::close(fd);
+    if (!synced) {
+      healthy_ = false;
+      startup_error_ = "cannot sync " + dir;
+      return false;
+    }
+  }
+  return true;
+}
+
+void KVStore::ForEachKey(
+    const std::function<void(const BlockKey&)>& fn) const {
+  for (const auto& sh : shards_) {
+    std::shared_lock<std::shared_mutex> rl(sh->mu);
+    for (const auto& entry : sh->index) {
+      BlockKey key;
+      if (BlockKey::ParseFilename(entry.first, &key)) fn(key);
+    }
+  }
 }
 
 bool KVStore::IsCached(const BlockKey& key) const {

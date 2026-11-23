@@ -1,4 +1,5 @@
-// A cache node whose disk store has failed for good must leave placement.
+// A cache node whose disk store has failed for good must leave placement,
+// unless it has other disks to serve on (DFKV_DEGRADED_MIN_DISKS).
 //
 // Such a store stores and reads nothing more until the process is restarted.
 // The node's registrar thread is unaffected and keeps renewing the lease;
@@ -131,7 +132,9 @@ class NodeHealthMembership : public ::testing::Test {
     ASSERT_TRUE(other.RegisterOnce());
 
     DiskCacheGroup::Options options;
-    options.cache_dirs = {(dir_ / "disk").string()};
+    for (size_t i = 0; i < Disks(); ++i)
+      options.cache_dirs.push_back((dir_ / ("disk" + std::to_string(i))).string());
+    stores_.assign(Disks(), nullptr);
     options.engine = "slab";
     options.engine_factory = [this](const std::string& dir,
                                     uint64_t) -> std::unique_ptr<StoreEngine> {
@@ -144,13 +147,18 @@ class NodeHealthMembership : public ::testing::Test {
       o.table_sync_ms = 0;
       o.reclaim_interval_ms = 0;
       auto store = std::make_unique<DiskSlabStore>(o);
-      store_ = store.get();
+      for (size_t i = 0; i < Disks(); ++i)
+        if (dir == (dir_ / ("disk" + std::to_string(i))).string())
+          stores_[i] = store.get();
       return store;
     };
     srv_ = KvNodeServerWiringTestPeer::Create(std::move(options));
     ASSERT_TRUE(srv_->Healthy());
-    ASSERT_NE(store_, nullptr);
+    for (DiskSlabStore* store : stores_) ASSERT_NE(store, nullptr);
+    store_ = stores_[0];
   }
+
+  virtual size_t Disks() const { return 1; }
 
   void TearDown() override {
     srv_.reset();
@@ -197,7 +205,13 @@ class NodeHealthMembership : public ::testing::Test {
   FakeEtcd etcd_;
   MdsServer mds_{etcd_.ep()};
   DiskSlabStore* store_ = nullptr;
+  std::vector<DiskSlabStore*> stores_;
   std::unique_ptr<KvNodeServer> srv_;
+};
+
+class TwoDiskNodeHealthMembership : public NodeHealthMembership {
+ protected:
+  size_t Disks() const override { return 2; }
 };
 
 TEST_F(NodeHealthMembership, FailedDiskStoreTakesTheNodeOutOfPlacement) {
@@ -275,6 +289,64 @@ TEST_F(NodeHealthMembership, UnhealthyRamTierAloneKeepsTheNodeInPlacement) {
   EXPECT_EQ(seen.info, kInfo);
 }
 
+// With two disks, one failed store leaves the node in placement: its keys go
+// to the other disk, where they miss until written again. INFO says so.
+TEST_F(TwoDiskNodeHealthMembership, OneFailedDiskOfTwoKeepsTheNodeInPlacement) {
+  auto registrar = Registrar(/*rails=*/{});
+  ASSERT_TRUE(registrar->RegisterOnce());
+  for (uint64_t id = 1; id <= 32; ++id) ASSERT_EQ(Put(id), Status::kOk);
+
+  DiskSlabStoreTestPeer::SetRecordWriteHook(stores_[0], [] { return false; });
+  uint64_t failed_key = 0;
+  for (uint64_t id = 1000; id < 1100 && failed_key == 0; ++id)
+    if (Put(id) == Status::kIOError) failed_key = id;
+  DiskSlabStoreTestPeer::SetRecordWriteHook(stores_[0], {});
+  ASSERT_NE(failed_key, 0u) << "no key went to the first disk";
+  ASSERT_FALSE(stores_[0]->Healthy());
+  EXPECT_TRUE(srv_->DisksHealthy());
+  EXPECT_TRUE(srv_->DisksDegraded());
+  EXPECT_TRUE(srv_->Healthy()) << "/healthz stays 200";
+  // Every key is taken again, the failed disk's on the other one.
+  for (uint64_t id = 1; id <= 32; ++id) EXPECT_EQ(Put(id), Status::kOk) << id;
+  EXPECT_EQ(Put(failed_key), Status::kOk);
+
+  ASSERT_TRUE(registrar->HeartbeatOnce());
+  EXPECT_EQ(Placement(mds_, kGroup), (std::set<std::string>{"node", "other"}));
+  const MemberInfo seen = Registered(mds_, kGroup, "node");
+  EXPECT_FALSE(seen.has_health);
+  EXPECT_EQ(seen.info, kInfo + ",store=degraded");
+  const std::string metrics = srv_->MetricsText();
+  EXPECT_NE(metrics.find("\ndfkv_disks_failed 1\n"), std::string::npos);
+  EXPECT_NE(metrics.find("\ndfkv_server_degraded 1\n"), std::string::npos);
+}
+
+// DFKV_DEGRADED_MIN_DISKS at the disk count: one failed disk takes the node
+// out of placement, as before.
+class TwoDiskNoDegradation : public TwoDiskNodeHealthMembership {
+ protected:
+  void SetUp() override {
+    ::setenv("DFKV_DEGRADED_MIN_DISKS", "2", 1);
+    TwoDiskNodeHealthMembership::SetUp();
+    ::unsetenv("DFKV_DEGRADED_MIN_DISKS");
+  }
+};
+
+TEST_F(TwoDiskNoDegradation, OneFailedDiskTakesTheNodeOut) {
+  auto registrar = Registrar(/*rails=*/{});
+  ASSERT_TRUE(registrar->RegisterOnce());
+  DiskSlabStoreTestPeer::SetRecordWriteHook(stores_[1], [] { return false; });
+  bool failed = false;
+  for (uint64_t id = 1000; id < 1100 && !failed; ++id)
+    failed = Put(id) == Status::kIOError;
+  DiskSlabStoreTestPeer::SetRecordWriteHook(stores_[1], {});
+  ASSERT_TRUE(failed) << "no key went to the second disk";
+  EXPECT_FALSE(srv_->DisksHealthy());
+  EXPECT_FALSE(srv_->DisksDegraded());
+  ASSERT_TRUE(registrar->HeartbeatOnce());
+  EXPECT_EQ(Placement(mds_, kGroup), (std::set<std::string>{"other"}));
+  EXPECT_EQ(Registered(mds_, kGroup, "node").info, kInfo + ",store=failed");
+}
+
 TEST(NodeMemberHealth, FollowsRailsWhileTheDisksAreHealthy) {
   EXPECT_FALSE(NodeMemberHealth(true, {}).has_value());
   const auto down = [] {
@@ -285,7 +357,9 @@ TEST(NodeMemberHealth, FollowsRailsWhileTheDisksAreHealthy) {
   const auto reported = NodeMemberHealth(true, down);
   ASSERT_TRUE(reported.has_value());
   EXPECT_FALSE(reported->ring_eligible);
-  EXPECT_EQ(NodeMemberInfo("ver=x", true), "ver=x");
+  EXPECT_EQ(NodeMemberInfo("ver=x", true, false), "ver=x");
+  EXPECT_EQ(NodeMemberInfo("ver=x", true, true), "ver=x,store=degraded");
+  EXPECT_EQ(NodeMemberInfo("ver=x", false, false), "ver=x,store=failed");
 }
 
 }  // namespace

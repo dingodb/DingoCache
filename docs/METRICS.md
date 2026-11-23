@@ -24,7 +24,10 @@ MDS 的 node 仅等待本地 startup 和动态 storage health。
 Placement eligibility is what the node reports to the MDS on every heartbeat,
 and `dfkv_server_ring_eligible` is that report. It is narrower than `/healthz`:
 a disk store that failed for good (it then stores and reads nothing more
-until the process is restarted) takes the node out of placement on its next heartbeat,
+until the process is restarted) hands its keys to the node's healthy disks,
+and the node stays in placement with `dfkv_server_degraded=1` and
+`store=degraded` in INFO. Once fewer than `DFKV_DEGRADED_MIN_DISKS` (default
+1) healthy disks are left, the node leaves placement on its next heartbeat,
 for good, while a RAM tier that dropped an entry it could not flush turns
 `/healthz` to 503 but leaves the node, which still serves every request, in
 placement. The node stays registered: `dfkvctl ring` shows it as `DEGRADED`
@@ -69,7 +72,8 @@ curl -s 127.0.0.1:9100/metrics
 > **v1.8.0 起**：`dfkvctl ring` 多一列 `INFO` = 各节点在注册/心跳时自报的
 > `ver=…,engine=…,wr=…,disks=…,cap=…,ram=…,rdma=…,qd=…`（运行时 resolved
 > 真相，非 flag 意图；`wr=` 是 slab 的 direct/buffered resolved 写模式，`qd=`
-> 是 server 端协商后的 pipeline depth）。disk store 终态故障的节点在末尾追加
+> 是 server 端协商后的 pipeline depth）。有盘 store 终态故障、仍在其余盘上服务的节点
+> 在末尾追加 `store=degraded`；健康盘少于 `DFKV_DEGRADED_MIN_DISKS` 的节点追加
 > `store=failed`，同时以 `DEGRADED` 退出 placement（见 §3.1 `dfkv_server_ring_eligible`）。
 > 全环版本/引擎审计一条命令完成（抓"静默跳升级/引擎不一致"）。`-` = 节点还是
 > 旧版未上报（本身就是版本信号）。信息不参与环 epoch（变更不会触发客户端重建环）。
@@ -117,7 +121,8 @@ dfkvctl stat <ip:port>                        # 单节点原始 /metrics 文本�
 | `dfkv_uptime_seconds` | gauge | 启动至今秒数 |
 | `dfkv_storage_healthy` | gauge | 当前 disk group 与显式请求 RAM tier 的 terminal health；0 时 `/healthz`、`/readyz` 均为 503 |
 | `dfkv_server_startup_complete` / `dfkv_server_mds_registration_ready` / `dfkv_server_healthy` / `dfkv_server_ready` | gauge | startup、本次首次 MDS 注册门、本地动态 health、三者合取；`dfkvctl stat --all` 用这组稳定 gauge 判定节点健康 |
-| `dfkv_server_ring_eligible` | gauge | 本节点在心跳里自报的 placement eligibility：没有终态故障的 disk store，且（有 RDMA listener 时）至少一条健康 rail。disk store 终态故障后恒为 0 直到进程重启；TCP-only 节点也输出 |
+| `dfkv_server_ring_eligible` | gauge | 本节点在心跳里自报的 placement eligibility：健康盘不少于 `DFKV_DEGRADED_MIN_DISKS`（默认 1），且（有 RDMA listener 时）至少一条健康 rail。健康盘不足后恒为 0 直到进程重启；TCP-only 节点也输出 |
+| `dfkv_server_degraded` | gauge | 1：有盘 store 终态故障，节点在其余盘上照常服务、留在 placement（坏盘的 key 由健康盘承接，先未命中、重写后命中）。告警 `DfkvServerDegraded` |
 | `dfkv_cache_put_total` / `dfkv_cache_hit_total` / `dfkv_cache_miss_total` | counter | PUT / GET 命中 / GET 未命中 |
 | `dfkv_exist_hit_total` / `dfkv_exist_miss_total` | counter | Exist 命中 / 未命中 |
 | `dfkv_remove_ok_total` / `dfkv_remove_miss_total` | counter | Remove 删掉了块 / 目标本就不存在（partial save 清理等路径的诊断分型） |
@@ -139,6 +144,9 @@ dfkvctl stat <ip:port>                        # 单节点原始 /metrics 文本�
 | `dfkv_evictions_total` / `dfkv_evicted_bytes_total` | counter | 淘汰对象数 / 字节 |
 | `dfkv_errors_total{op,status}` | counter | 失败 op（put/get io、invalid） |
 | `dfkv_objects` / `dfkv_used_bytes` / `dfkv_disks` | gauge | 对象数 / 占用 / 盘数 |
+| `dfkv_disks_failed` / `dfkv_disk_failed{disk}` | gauge | store 已终态故障的盘数 / 每盘是否已终态故障（1 = 故障，直到进程重启） |
+| `dfkv_disk_takeover_excluded{disk}` | gauge | 1：本次启动删不掉这块盘上不属于它的 key（WARN），本轮运行里它不再承接坏盘的 key（自己的 key 照常服务）；故障记录保留，下次启动重试 |
+| `dfkv_disks_open_dropped_keys{reason}` | gauge | 本次启动因上一轮有盘故障而删掉的 key 数：`failed_disk` = 清空故障盘，`not_home` = 其余盘上不属于本盘的 key（上一轮代坏盘承接的），`unusable_record` = 故障记录读不全或写着本节点没有的目录时清空所有盘。没有故障记录的启动为 0 |
 | `dfkv_disk_used_bytes{disk}` / `dfkv_disk_objects{disk}` | gauge | 每盘占用 / 对象 |
 | `dfkv_disk_engine_info{disk,engine}` | gauge | 恒为 1：每块盘实际运行的存储引擎（`slab`、`file`、`log`）。`DFKV_STORE_ENGINE=auto`（实验性）按目录选引擎时，各盘可能不同 |
 | `dfkv_lse_segments{disk,disk_index}` / `dfkv_lse_segments_free` / `dfkv_lse_segments_sealed` / `dfkv_lse_sealer_queue` / `dfkv_lse_shadows` | gauge | 仅 `log` 引擎盘（实验性）：段总数 / 空闲段（含预开段）/ 已封段 / 待封段 / 未进索引但仍可恢复的副本数 |

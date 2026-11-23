@@ -1799,36 +1799,38 @@ TEST(RamTierFlushFailure, PutIsRefusedOnceItsDiskStoreHasFailed) {
   EXPECT_EQ(node.Get(1), Status::kOk);
 }
 
-// With several disks, only the keys of the failed one are refused.
-TEST(RamTierFlushFailure, OtherDisksKeepTheirRamAcknowledgement) {
+// With several disks, a failed one hands its keys to the others: nothing is
+// refused, and the value that was on its way to the failed disk when it
+// failed is written to another one on its retry instead of being lost.
+TEST(RamTierFlushFailure, AFailedDisksKeysGoToTheOtherDisk) {
   FlushFailNode node("otherdisks", 2);
   ASSERT_TRUE(node.server->ram_enabled());
-  // Fail the store of whichever disk key 1 is written to.
+  // The first slots.tbl write on either disk fails: key 1's, on its disk.
+  std::atomic<bool> failed_one{false};
   for (DiskSlabStore* store : node.stores)
-    DiskSlabStoreTestPeer::SetRecordWriteHook(store, [] {
-      return false;
-    });
+    DiskSlabStoreTestPeer::SetRecordWriteHook(
+        store, [&] { return failed_one.exchange(true); });
   ASSERT_EQ(node.Put(1), Status::kOk);
-  ASSERT_TRUE(WaitFor([&] { return !node.server->DisksHealthy(); }));
+  ASSERT_TRUE(WaitFor([&] { return node.server->FailedDisks() == 1; }));
+  ASSERT_TRUE(node.Settled());
   for (DiskSlabStore* store : node.stores)
     DiskSlabStoreTestPeer::SetRecordWriteHook(store, {});
-  ASSERT_TRUE(node.Settled());
   ASSERT_NE(node.stores[0]->Healthy(), node.stores[1]->Healthy())
       << "exactly one store failed";
+  EXPECT_TRUE(node.server->DisksHealthy());
+  EXPECT_TRUE(node.server->DisksDegraded());
+  EXPECT_EQ(node.Metric("dfkv_ram_post_ack_flush_failures_total"), 0);
+  EXPECT_GE(node.Metric("dfkv_ram_flush_retries_total"), 1);
+  EXPECT_EQ(node.Get(1), Status::kOk);
 
-  int refused = 0, acknowledged = 0;
-  for (uint64_t id = 100; id < 164; ++id) {
-    const Status st = node.Put(id);
-    if (st == Status::kIOError) ++refused;
-    if (st == Status::kOk) ++acknowledged;
-  }
-  EXPECT_EQ(refused + acknowledged, 64);
-  EXPECT_GT(refused, 0);
-  EXPECT_GT(acknowledged, 0);
+  for (uint64_t id = 100; id < 164; ++id)
+    EXPECT_EQ(node.Put(id), Status::kOk) << id;
   ASSERT_TRUE(node.Settled());
-  EXPECT_EQ(node.Metric("dfkv_ram_flushed_total"), acknowledged)
-      << "every acknowledged value reached its (healthy) disk";
-  EXPECT_EQ(node.Metric("dfkv_ram_post_ack_flush_failures_total"), 1);
+  EXPECT_EQ(node.Metric("dfkv_ram_flushed_total"), 65)
+      << "every acknowledged value reached a healthy disk";
+  EXPECT_EQ(node.Metric("dfkv_ram_post_ack_flush_failures_total"), 0);
+  EXPECT_EQ(node.Metric("dfkv_disks_failed"), 1);
+  EXPECT_EQ(node.Metric("dfkv_server_degraded"), 1);
 }
 
 // A write that fails and then works: the acknowledged value is kept in RAM,

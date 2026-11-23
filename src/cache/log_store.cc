@@ -1066,6 +1066,12 @@ bool LogStore::ResetToEmpty() {
   used_bytes_ = 0;
   free_.clear();
   fifo_.clear();
+  // Every segment is free again, a pre-opened one too. Runs before the
+  // sealer starts (Activate) or with no pre-open possible, so nothing is
+  // being pre-opened; the state is cleared so that it cannot name a freed
+  // segment whatever the caller.
+  preopened_ = UINT32_MAX;
+  preopening_ = false;
   for (uint32_t i = 0; i < sb_.segment_count; ++i) {
     Segment& s = segments_[i];
     s.state = SegState::kFree;
@@ -2996,6 +3002,21 @@ void LogStore::LeaseMismatchThunk(void* owner, const BlockKey& key,
   if (it != store->index_.end() && it->second.generation == generation &&
       it->second.loc == loc)
     store->DropCorruptLocked(key, it->second);
+}
+
+// The reset itself (ResetToEmpty) runs in Activate, before the sealer
+// thread exists: no pre-open can be under way while the store is emptied.
+bool LogStore::ResetBeforeActivation() {
+  if (!ok_ || failed_.load() || activated_.load()) return false;
+  Lock lk(mu_);
+  needs_reset_ = true;
+  return true;
+}
+
+void LogStore::ForEachKey(
+    const std::function<void(const BlockKey&)>& fn) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  for (const auto& entry : index_) fn(entry.first);
 }
 
 bool LogStore::IsCached(const BlockKey& key) const {

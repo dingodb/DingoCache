@@ -91,6 +91,12 @@ mkdir -p /mnt/disk1/dfkv /mnt/disk2/dfkv /mnt/disk3/dfkv
 容量隔离：`--cap`（总量，按盘均分）自带 LRU 自限；设保守值，确认
 `现网用量 + dfkv cap + 预留 < 物理总量`。
 
+**容量和盘不能在线调整。** `--cap` 与 `--dir` 列表决定每盘容量，slab 把它写进
+每盘的几何（`slab_meta`），几何不符的目录拒绝启动。改 `--cap`、增删盘都要停服务、
+清空全部缓存目录后冷启动（缓存内容全部重来）。换一块坏盘不在此列：目录列表和
+`--cap` 保持不变，把新盘挂到原路径（空目录），重启后只有这块盘是空的，其余盘的
+数据保留。
+
 ## 2b. MDS 层：etcd + dfkv_mds
 
 > **推荐路径**：用 MDS 动态发现时须先起 etcd 集群和 dfkv_mds 副本。
@@ -460,16 +466,49 @@ journalctl -u dfkv -n 10 --no-pager
 > 到零的摘除。
 >
 > **disk store 终态故障**：slab 元数据写入/落盘失败（或 io_uring 丢失完成事件）
-> 后，该 store 在本进程内不再读写（PUT/GET 返回 `kIOError`，Exist/Retain 按
-> miss 回答，前置 RAM tier 仍命中的条目照常返回），只有重启能恢复。故障时 store
-> 打一行 ERROR `slab <dir>: disk store failed for good: cannot <操作>: errno=...`。
-> 节点在下一次心跳（≤10 s）自报不可 placement：MDS 不再把它放进 client 的成员
-> 列表，其 key 份额迁到其他节点；它保持注册，`dfkvctl ring` 显示 `DEGRADED`、
-> INFO 末尾带 `store=failed`，`dfkv_server_ring_eligible=0`、`/healthz` 503。该
-> 状态是只置不清的 latch，不会抖动；TCP-only 节点同样适用（健康时仍不发 HLT1，
-> 故障后发一个不含设备的 HLT1）。多盘节点任一盘故障即整节点退出。进程不自行
-> 退出：重启会重置该 store 并重新入环，若盘确实坏了会再次故障，在 supervisor
-> 的重启循环里反复搬 key；因此由运维决定重启（故障已排除）或用 §4c 替换。
+> 后，该 store 在本进程内不再读写，只有重启能恢复。故障时 store 打一行 ERROR
+> `slab <dir>: disk store failed for good: cannot <操作>: errno=...`。该状态是只置不清的
+> latch，不会抖动。
+>
+> - **多盘节点降级运行**（只要还剩 `DFKV_DEGRADED_MIN_DISKS` 块健康盘，默认 1）：坏盘
+>   的 key 改由其余健康盘承接（每块坏盘的 key 均匀分到各健康盘；健康盘自己的 key 不
+>   动），在那里先是未命中（GET 返回 `kNotFound`，不是 I/O 错误，client 不会因此回避
+>   整个节点），重新写入后照常命中。节点留在 placement 里，`/healthz` 仍为 200，
+>   `dfkv_server_ring_eligible=1`；`dfkv_disks_failed`、`dfkv_disk_failed{disk}`、
+>   `dfkv_server_degraded=1` 和 INFO 末尾的 `store=degraded` 表明降级，节点打一行
+>   ERROR `N of M disk stores have failed ...`，告警 `DfkvServerDegraded`。节点的 key 份额
+>   不变而容量少了坏盘那一份，所以它的淘汰会比其他节点早。
+>
+>   承接之前，节点先把故障记在每块健康盘的缓存目录旁边（`<缓存目录>.dfkv-failed-disks`，
+>   例如 `/mnt/disk2/dfkv.dfkv-failed-disks`，内容是故障盘目录的规范路径）。记录只写在
+>   上一级目录与缓存目录同属一个文件系统的地方，这样它和这块盘上的数据同生同灭；所以
+>   **每个缓存目录都要是所在盘文件系统里的子目录**（如 `/mnt/diskN/dfkv`），不能是挂载点
+>   本身，也不能是容器卷的根（上一级目录不在这块盘上，容器重启就没了）。一处都写不了
+>   时不承接，节点按健康盘不足处理，并打一行 ERROR。服务账号要能在上一级目录里建文件。
+>
+>   下次启动看到记录，先把记录里的盘整盘清空（由各引擎自己重置，不逐 key 删除），再从
+>   其余各盘删掉不属于本盘的 key（上一轮代坏盘承接的），所以重启后不会冒出坏盘里的旧值，
+>   也不会冒出承接期间写下、之后已被 REMOVE 或覆盖的值。若某份记录存在却读不全，或写着
+>   本节点没有的目录（例如目录换了位置），无法知道当时哪块盘坏了，就清空**所有**盘并打
+>   ERROR（缓存语义，不拒绝启动）。删掉的数量见启动日志 `disk failure records found ...`
+>   和 `dfkv_disks_open_dropped_keys{reason="failed_disk"|"not_home"|"unusable_record"}`。
+>   某块盘上不属于它的 key 删不掉时，这块盘本轮不再承接坏盘的 key
+>   （`dfkv_disk_takeover_excluded{disk}=1`，WARN），记录保留到下次启动重试。记录在之后
+>   一次没有盘故障、各盘都干净关闭的运行停止时删除；记录路径上若是目录等非普通文件，
+>   节点不删它（WARN），每次启动都会因此清空所有盘，需要运维移走。
+> - **退出 placement**：健康盘少于 `DFKV_DEGRADED_MIN_DISKS`（单盘节点坏一块盘即是）时，
+>   PUT/GET 返回 `kIOError`，Exist/Retain 按 miss 回答，前置 RAM tier 仍命中的条目照常
+>   返回。节点在下一次心跳（≤10 s）自报不可 placement：MDS 不再把它放进 client 的成员
+>   列表，其 key 份额迁到其他节点；它保持注册，`dfkvctl ring` 显示 `DEGRADED`、INFO
+>   末尾带 `store=failed`，`dfkv_server_ring_eligible=0`、`/healthz` 503。TCP-only 节点
+>   同样适用（健康时仍不发 HLT1，故障后发一个不含设备的 HLT1）。坏盘的 key 此时不
+>   改道，留在坏盘上（返回 `kIOError`，RAM tier 也不再确认它们）。把
+>   `DFKV_DEGRADED_MIN_DISKS` 设为盘数（或更大）即恢复“任一盘故障整节点退出”的旧行为。
+>
+> 进程不自行退出：重启会清空该盘（slab 自己重置；其他引擎按上面的故障记录清空）并
+> 重新启用它，若盘确实坏了会再次故障；
+> 因此由运维决定重启（故障已排除）、换盘（见 §2 末尾的容量说明：目录列表与 `--cap`
+> 不变）或用 §4c 替换节点。启动时打不开的盘仍使整个节点启动失败，不降级。
 > slot table（`slots.tbl`）在新建目录时整体预留（`fallocate`），预留成功后写 record
 > 不再需要新 block；只有**新建目录**会因文件系统放不下它而启动失败。已有目录始终
 > 启动：表没分配齐且文件系统没有空间时，每次启动打一行 WARN
@@ -480,9 +519,10 @@ journalctl -u dfkv -n 10 --no-pager
 > 需要 MDS ≥ v2.15.0 才会按 HLT1 过滤；更老的 MDS 忽略该字段，行为与此前相同。
 > RAM tier 丢弃无法 flush 的条目只使 `/healthz` 变 503（最后一次丢弃至少 30 秒之后、且
 > 连续 64 次 flush 成功才恢复），
-> 节点仍可服务，不退出 placement。盘 store 终态故障后，路由到该盘的 PUT 不再由 RAM
-> 确认，直接得到 `kIOError`（与没有 RAM tier 时相同），其他盘的 key 不受影响；故障瞬间
-> 已确认、尚未落盘的值无法挽回，立即丢弃并计入
+> 节点仍可服务，不退出 placement。盘 store 终态故障后，坏盘的 key 改写到其余健康盘，
+> RAM 照常确认；故障瞬间已确认、尚未落盘的值在重试时写到承接它的健康盘。没有健康盘
+> 时，PUT 不再由 RAM 确认，直接得到 `kIOError`（与没有 RAM tier 时相同），故障瞬间已
+> 确认、尚未落盘的值无法挽回，立即丢弃并计入
 > `dfkv_ram_post_ack_flush_failures_total`（告警 `DfkvRamAcknowledgedDataLost`）。
 > 盘侧瞬时写失败（一次 EIO、store 在高负载下暂时放不下）时，已确认的值留在 RAM 里按
 > 50 ms→3.2 s 的间隔重试约 4 秒，仍失败才丢弃并计数；文件系统写满这类持续数分钟的
@@ -917,6 +957,7 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | `DFKV_PEER_COOLDOWN_MAX_MS` | `30000` | PeerHealth 回避上限。回避时长只在试探失败时翻倍（2 s、4 s、8 s … 至本上限） |
 | `DFKV_PEER_BAD_GRACE_MS` | `1000` | PeerHealth 转 bad 前的宽限期。`0` 同样不被接受：打 WARNING 并沿用默认值 |
 | `DFKV_DISK_HASH_WEIGHT` | — | 盘内 Ketama 虚拟节点权重（数据中平衡关键调优，改动需重启） |
+| `DFKV_DEGRADED_MIN_DISKS` | `1` | server：盘 store 终态故障后，至少还剩这么多块健康盘时节点降级运行、留在 placement（坏盘的 key 改由健康盘承接）；少于它则退出 placement。大于盘数按盘数算（任一盘故障即退出）；`0` 或非整数拒绝启动 |
 | `DFKV_READ_COALESCE` | `0` | TCP 端读 convoy 合并主开关（见 README Recommended tuning 表） |
 | `DFKV_READ_COALESCE_RECUR_MS` | `1000` | 复制重现窗口（copy fingerprint 64 字节） |
 | `DFKV_READ_COALESCE_TIMEOUT_MS` | `500` | follower 等待 leader 上限 |

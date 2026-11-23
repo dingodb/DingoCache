@@ -144,6 +144,7 @@ PUBLIC_FAMILIES = {
     "dfkv_read_coalesced_total",
     "dfkv_rdma_recv_segment_free_bytes",
     "dfkv_rdma_segment_evictions_total",
+    "dfkv_server_degraded",
     "dfkv_server_healthy",
     "dfkv_server_ready",
     "dfkv_server_mds_registration_ready",

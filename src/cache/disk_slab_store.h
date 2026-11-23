@@ -285,6 +285,9 @@ class DiskSlabStore : public StoreEngine {
   Status RangeDirectPrep(const BlockKey& key, uint64_t offset, uint64_t length,
                          size_t io_cap, ReadLease* out) override;
   bool IsCached(const BlockKey& key) const override;
+  void ForEachKey(
+      const std::function<void(const BlockKey&)>& fn) const override;
+  bool ResetBeforeActivation() override;
   Status Lookup(const BlockKey& key, ValueMetadata* out) const override;
   Status Remove(const BlockKey& key) override;
 
@@ -387,6 +390,7 @@ class DiskSlabStore : public StoreEngine {
   const char* WhyNotWarm() const;
   bool SyncForWarmRestart();
   bool ResetUncleanEpoch();
+  bool ResetTable();
   // with_identity stores this boot and mount in the record: only a dirty state
   // written after the table was rebuilt may carry them.
   bool WriteEpochState(uint32_t state, uint64_t epoch, bool with_identity);

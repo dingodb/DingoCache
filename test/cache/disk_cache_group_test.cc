@@ -3,6 +3,8 @@
 // independent KVStore with its own LRU; total capacity split across disks).
 #include "cache/disk_cache_group.h"
 #include "cache/disk_slab_store.h"
+#include "cache/log_store.h"
+#include "cache/lse_io.h"
 
 #include <gtest/gtest.h>
 #include <unistd.h>
@@ -17,6 +19,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -110,6 +113,8 @@ class ProbeEngine final : public StoreEngine {
   Status Cache(const BlockKey&, const void*, size_t) override {
     return Status::kOk;
   }
+  void ForEachKey(const std::function<void(const BlockKey&)>&) const override {}
+  bool ResetBeforeActivation() override { return true; }
   Status CacheDirect(const BlockKey&, char*, size_t, size_t) override {
     if (probe_->probe_scalar) probe_->Enter(disk_);
     return Status::kOk;
@@ -849,6 +854,11 @@ class DiskSlabStoreTestPeer {
     if (store->state_fd_ >= 0) ::close(store->state_fd_);
     store->state_fd_ = -1;
   }
+  // `false` fails the next slots.tbl write: the store fails for good.
+  static void SetRecordWriteHook(DiskSlabStore* store,
+                                 std::function<bool()> hook) {
+    store->record_write_hook_for_test_ = std::move(hook);
+  }
 };
 }  // namespace dfkv
 
@@ -1102,6 +1112,540 @@ TEST_F(DiskGroupTest, QuotaBatchOverManyStripesIsAdmittedPerTenant) {
   for (uint64_t tenant = 1; tenant <= kTenants; ++tenant)
     EXPECT_EQ(group.TenantUsedBytes(tenant), 6u) << tenant;
   EXPECT_EQ(group.TenantQuotaRejections(), kTenants);
+}
+
+namespace {
+// Small slab disks; `stores` by directory order.
+struct SmallSlabGroup {
+  std::vector<DiskSlabStore*> stores;
+  std::unique_ptr<DiskCacheGroup> group;
+
+  explicit SmallSlabGroup(const std::vector<std::string>& dirs) {
+    stores.assign(dirs.size(), nullptr);
+    DiskCacheGroup::Options options{dirs, dirs.size() * (4ull << 20), "slab"};
+    options.engine_factory =
+        [this, dirs](const std::string& dir,
+                     uint64_t capacity) -> std::unique_ptr<StoreEngine> {
+      DiskSlabStore::Options o;
+      o.dir = dir;
+      o.capacity_bytes = capacity;
+      o.extent_bytes = 1 << 20;
+      o.slot_granularity = 4096;
+      o.table_sync_ms = 0;
+      o.reclaim_interval_ms = 0;
+      o.defer_activation = true;
+      auto store = std::make_unique<DiskSlabStore>(o);
+      for (size_t i = 0; i < dirs.size(); ++i)
+        if (dirs[i] == dir) stores[i] = store.get();
+      return store;
+    };
+    group = std::make_unique<DiskCacheGroup>(std::move(options));
+  }
+
+  // Fails disk `i` for good with a PUT of a new key routed to it.
+  void Fail(size_t i, uint64_t first_id) {
+    const std::string value(4096, 'f');
+    uint64_t id = first_id;
+    while (group->DiskIndexOf(BlockKey{id, 0}) != i) ++id;
+    DiskSlabStoreTestPeer::SetRecordWriteHook(stores[i], [] { return false; });
+    EXPECT_EQ(group->Cache(BlockKey{id, 0}, value.data(), value.size()),
+              Status::kIOError);
+    DiskSlabStoreTestPeer::SetRecordWriteHook(stores[i], {});
+    EXPECT_FALSE(stores[i]->Healthy());
+  }
+};
+}  // namespace
+
+// A disk that fails while serving hands its keys to the healthy disks: they
+// miss there until written again, and are then served. Keys of healthy disks
+// stay where they are. Each further failure moves only the keys of the disk
+// that failed. Once every disk has failed, the group is unhealthy.
+TEST_F(DiskGroupTest, AFailedDiskHandsItsKeysToTheOthers) {
+  const auto dirs = Dirs(4);
+  SmallSlabGroup slab(dirs);
+  DiskCacheGroup& group = *slab.group;
+  ASSERT_TRUE(group.Healthy()) << group.StartupError();
+  EXPECT_EQ(group.MinHealthyDisks(), 1u);
+  const std::string value(4096, 'v');
+  constexpr uint64_t kKeys = 150;
+  std::vector<size_t> home(kKeys);
+  for (uint64_t id = 0; id < kKeys; ++id) {
+    const BlockKey key{id, 0, 0x77};
+    home[id] = group.DiskIndexOf(key);
+    ASSERT_EQ(group.Cache(key, value.data(), value.size()), Status::kOk);
+  }
+  const uint64_t tenant_before = group.TenantUsedBytes(0x77);
+  const uint64_t on_disk1 = slab.stores[1]->TenantUsedBytes(0x77);
+  ASSERT_GT(on_disk1, 0u);
+
+  slab.Fail(1, 10000);
+  EXPECT_EQ(group.FailedDisks(), 1u);
+  EXPECT_TRUE(group.Healthy());
+  EXPECT_EQ(group.TenantUsedBytes(0x77), tenant_before - on_disk1)
+      << "what the failed disk held is not charged to its tenant";
+  std::set<size_t> moved_to;
+  std::string out;
+  for (uint64_t id = 0; id < kKeys; ++id) {
+    const BlockKey key{id, 0, 0x77};
+    const size_t now = group.DiskIndexOf(key);
+    EXPECT_FALSE(group.DiskFailedFor(key));
+    if (home[id] != 1) {
+      EXPECT_EQ(now, home[id]) << id << ": a healthy disk's key moved";
+      EXPECT_EQ(group.Range(key, 0, 4096, &out), Status::kOk) << id;
+      continue;
+    }
+    ASSERT_NE(now, 1u);
+    moved_to.insert(now);
+    EXPECT_FALSE(group.IsCached(key));
+    EXPECT_EQ(group.Range(key, 0, 4096, &out), Status::kNotFound) << id;
+    ASSERT_EQ(group.Cache(key, value.data(), value.size()), Status::kOk);
+    EXPECT_EQ(group.Range(key, 0, 4096, &out), Status::kOk) << id;
+  }
+  EXPECT_EQ(moved_to, (std::set<size_t>{0, 2, 3})) << "spread over all";
+
+  // A second failure moves only what is on that disk, the first disk's keys
+  // that went there included; nothing else moves.
+  std::vector<size_t> before(kKeys);
+  for (uint64_t id = 0; id < kKeys; ++id)
+    before[id] = group.DiskIndexOf(BlockKey{id, 0, 0x77});
+  slab.Fail(0, 20000);
+  EXPECT_EQ(group.FailedDisks(), 2u);
+  EXPECT_TRUE(group.Healthy());
+  for (uint64_t id = 0; id < kKeys; ++id) {
+    const size_t now = group.DiskIndexOf(BlockKey{id, 0, 0x77});
+    if (before[id] == 0)
+      EXPECT_TRUE(now == 2 || now == 3) << id << " went to " << now;
+    else
+      EXPECT_EQ(now, before[id]) << id;
+  }
+
+  slab.Fail(2, 30000);
+  slab.Fail(3, 40000);
+  EXPECT_EQ(group.FailedDisks(), 4u);
+  EXPECT_FALSE(group.Healthy());
+  EXPECT_TRUE(group.DiskFailedFor(BlockKey{1, 0, 0x77}));
+  EXPECT_EQ(group.Cache(BlockKey{50000, 0}, value.data(), value.size()),
+            Status::kIOError);
+}
+
+// DFKV_DEGRADED_MIN_DISKS: how many disks must be left for the group to stay
+// healthy. Above the disk count it means all of them; 0 and text refuse to
+// start.
+TEST_F(DiskGroupTest, DegradedMinDisksSetsHowManyMustBeLeft) {
+  const auto dirs = Dirs(3);
+  {
+    ScopedEnv min_disks("DFKV_DEGRADED_MIN_DISKS", "2");
+    SmallSlabGroup slab(dirs);
+    ASSERT_TRUE(slab.group->Healthy()) << slab.group->StartupError();
+    slab.Fail(0, 1000);
+    EXPECT_TRUE(slab.group->Healthy());
+    slab.Fail(1, 2000);
+    EXPECT_FALSE(slab.group->Healthy());
+  }
+  {
+    ScopedEnv min_disks("DFKV_DEGRADED_MIN_DISKS", "8");
+    SmallSlabGroup slab(dirs);
+    ASSERT_TRUE(slab.group->Healthy()) << slab.group->StartupError();
+    EXPECT_EQ(slab.group->MinHealthyDisks(), 3u);
+    slab.Fail(2, 3000);
+    EXPECT_FALSE(slab.group->Healthy());
+  }
+  for (const char* bad : {"0", "two", "-1"}) {
+    ScopedEnv min_disks("DFKV_DEGRADED_MIN_DISKS", bad);
+    SmallSlabGroup slab(dirs);
+    EXPECT_FALSE(slab.group->Healthy()) << bad;
+    EXPECT_NE(slab.group->StartupError().find("DFKV_DEGRADED_MIN_DISKS"),
+              std::string::npos)
+        << slab.group->StartupError();
+  }
+}
+
+namespace {
+// The real system calls; writes fail with EIO while `armed`.
+class FailingIo : public lse::IoBackend {
+ public:
+  std::atomic<bool> armed{false};
+  int Open(const std::string& path, int flags, mode_t mode) override {
+    return sys_->Open(path, flags, mode);
+  }
+  int Close(int fd) override { return sys_->Close(fd); }
+  ssize_t Pwritev(int fd, const struct iovec* iov, int n, off_t offset,
+                  bool dsync) override {
+    if (armed.load()) {
+      errno = EIO;
+      return -1;
+    }
+    return sys_->Pwritev(fd, iov, n, offset, dsync);
+  }
+  ssize_t Pread(int fd, void* buf, size_t len, off_t offset) override {
+    return sys_->Pread(fd, buf, len, offset);
+  }
+  int Fdatasync(int fd) override { return sys_->Fdatasync(fd); }
+  int Fsync(int fd) override { return sys_->Fsync(fd); }
+  int Fallocate(int fd, off_t offset, off_t len) override {
+    return sys_->Fallocate(fd, offset, len);
+  }
+  int Ftruncate(int fd, off_t len) override { return sys_->Ftruncate(fd, len); }
+  int Rename(const std::string& from, const std::string& to) override {
+    return sys_->Rename(from, to);
+  }
+  int Mkdir(const std::string& path, mode_t mode) override {
+    return sys_->Mkdir(path, mode);
+  }
+  int Unlink(const std::string& path) override { return sys_->Unlink(path); }
+
+ private:
+  std::unique_ptr<lse::IoBackend> sys_ = lse::MakeSystemIoBackend();
+};
+
+// A group of two disks of one engine that can be stopped and started again,
+// and whose disks can be failed for good.
+struct RestartableGroup {
+  enum Engine { kSlab, kLog };
+  Engine engine;
+  std::vector<std::string> dirs;
+  std::vector<StoreEngine*> stores;
+  std::vector<std::shared_ptr<FailingIo>> ios;
+  std::unique_ptr<DiskCacheGroup> group;
+  // How the directories are spelled on the command line (empty: dirs).
+  std::vector<std::string> spelled;
+  std::function<bool(const std::string&)> record_location;
+  std::function<Status(size_t, const BlockKey&)> misplaced_remove;
+
+  void Open() {
+    const std::vector<std::string> names = spelled.empty() ? dirs : spelled;
+    stores.assign(dirs.size(), nullptr);
+    ios.clear();
+    for (size_t i = 0; i < dirs.size(); ++i)
+      ios.push_back(std::make_shared<FailingIo>());
+    DiskCacheGroup::Options options{names, dirs.size() * (64ull << 20), "slab"};
+    options.record_location_for_test = record_location;
+    options.misplaced_remove_for_test = misplaced_remove;
+    options.engine_factory =
+        [this, names](const std::string& dir,
+                      uint64_t capacity) -> std::unique_ptr<StoreEngine> {
+      size_t i = 0;
+      while (names[i] != dir) ++i;
+      std::unique_ptr<StoreEngine> store;
+      if (engine == kSlab) {
+        DiskSlabStore::Options o;
+        o.dir = dir;
+        o.capacity_bytes = capacity;
+        o.extent_bytes = 1 << 20;
+        o.slot_granularity = 4096;
+        o.table_sync_ms = 0;
+        o.reclaim_interval_ms = 0;
+        o.defer_activation = true;
+        store = std::make_unique<DiskSlabStore>(o);
+      } else {
+        LogStore::Options o;
+        o.dir = dir;
+        o.capacity_bytes = capacity;
+        o.defer_activation = true;
+        o.cleaner = false;
+        o.io = ios[i];
+        store = std::make_unique<LogStore>(o);
+      }
+      stores[i] = store.get();
+      return store;
+    };
+    group = std::make_unique<DiskCacheGroup>(std::move(options));
+    ASSERT_TRUE(group->Healthy()) << group->StartupError();
+  }
+  void Restart() {
+    group.reset();
+    Open();
+  }
+  // Fails disk `i` for good with a PUT of a new key homed there.
+  void Fail(size_t i) {
+    uint64_t id = 900000;
+    while (group->DiskIndexOf(BlockKey{id, 0}) != i) ++id;
+    if (engine == kSlab)
+      DiskSlabStoreTestPeer::SetRecordWriteHook(
+          static_cast<DiskSlabStore*>(stores[i]), [] { return false; });
+    else
+      ios[i]->armed = true;
+    const std::string value(4096, 'f');
+    EXPECT_NE(group->Cache(BlockKey{id, 0}, value.data(), value.size()),
+              Status::kOk);
+    if (engine == kSlab)
+      DiskSlabStoreTestPeer::SetRecordWriteHook(
+          static_cast<DiskSlabStore*>(stores[i]), {});
+    else
+      ios[i]->armed = false;
+    ASSERT_FALSE(stores[i]->Healthy());
+  }
+  // A key homed on disk `i`.
+  BlockKey HomedOn(size_t i) {
+    uint64_t id = 1;
+    while (group->DiskIndexOf(BlockKey{id, 0}) != i) ++id;
+    return BlockKey{id, 0};
+  }
+  Status Put(const BlockKey& key, char fill) {
+    const std::string value(4096, fill);
+    return group->Cache(key, value.data(), value.size());
+  }
+  // The fill byte of the value served, or 0 for a miss.
+  char Get(const BlockKey& key) {
+    std::string out;
+    const Status st = group->Range(key, 0, 4096, &out);
+    if (st == Status::kNotFound) return 0;
+    EXPECT_EQ(st, Status::kOk);
+    return out.empty() ? '?' : out[0];
+  }
+};
+
+std::string dirs_record(const std::string& dir) {
+  return DiskCacheGroup::CanonicalDiskId(dir) + ".dfkv-failed-disks";
+}
+
+const char* EngineName(RestartableGroup::Engine e) {
+  return e == RestartableGroup::kSlab ? "slab" : "log";
+}
+}  // namespace
+
+// (a) A disk that failed comes back empty: a REMOVE or an overwrite done on
+// the disk that took its keys over is not undone by its old value.
+TEST_F(DiskGroupTest, AFailedDiskComesBackEmpty) {
+  for (const auto engine : {RestartableGroup::kSlab, RestartableGroup::kLog}) {
+    for (const bool overwrite : {false, true}) {
+      SCOPED_TRACE(std::string(EngineName(engine)) +
+                   (overwrite ? " overwrite" : " remove"));
+      fs::remove_all(base_);
+      RestartableGroup g{engine, Dirs(2)};
+      ASSERT_NO_FATAL_FAILURE(g.Open());
+      const BlockKey key = g.HomedOn(0);
+      ASSERT_EQ(g.Put(key, '1'), Status::kOk);
+      ASSERT_NO_FATAL_FAILURE(g.Fail(0));
+      ASSERT_EQ(g.group->DiskIndexOf(key), 1u) << "taken over";
+      if (overwrite) {
+        ASSERT_EQ(g.Put(key, '2'), Status::kOk);
+        ASSERT_EQ(g.Get(key), '2');
+      } else {
+        ASSERT_NE(g.group->Remove(key), Status::kIOError);
+        ASSERT_EQ(g.Get(key), 0);
+      }
+      ASSERT_TRUE(fs::exists(dirs_record(g.dirs[1])));
+
+      ASSERT_NO_FATAL_FAILURE(g.Restart());
+      EXPECT_EQ(g.group->DiskIndexOf(key), 0u) << "home again";
+      EXPECT_EQ(g.Get(key), 0) << "neither the old value nor the takeover's";
+      EXPECT_EQ(g.group->OpenMisplacedKeys(), overwrite ? 1u : 0u);
+      EXPECT_EQ(g.group->Count(), 0u);
+
+      // A clean stop of a run with no failure clears the record.
+      ASSERT_EQ(g.Put(key, '3'), Status::kOk);
+      ASSERT_NO_FATAL_FAILURE(g.Restart());
+      EXPECT_FALSE(fs::exists(dirs_record(g.dirs[1])));
+      EXPECT_EQ(g.group->OpenEmptiedKeys() + g.group->OpenMisplacedKeys(), 0u);
+      EXPECT_EQ(g.Get(key), '3') << "an ordinary restart keeps the cache";
+    }
+  }
+}
+
+// (b) What a failed run wrote in place of a failed disk is gone after the
+// restart: when the same disk fails again later, the key goes to the same
+// disk as before, which must not serve that old value after a REMOVE or an
+// overwrite done at home in between.
+TEST_F(DiskGroupTest, TakeoverLeftoversDoNotOutliveTheRun) {
+  for (const auto engine : {RestartableGroup::kSlab, RestartableGroup::kLog}) {
+    for (const bool overwrite : {false, true}) {
+      SCOPED_TRACE(std::string(EngineName(engine)) +
+                   (overwrite ? " overwrite" : " remove"));
+      fs::remove_all(base_);
+      RestartableGroup g{engine, Dirs(2)};
+      ASSERT_NO_FATAL_FAILURE(g.Open());
+      const BlockKey key = g.HomedOn(0);
+      ASSERT_NO_FATAL_FAILURE(g.Fail(0));
+      ASSERT_EQ(g.Put(key, '2'), Status::kOk);  // on disk 1
+      ASSERT_EQ(g.Get(key), '2');
+
+      ASSERT_NO_FATAL_FAILURE(g.Restart());
+      EXPECT_EQ(g.group->OpenMisplacedKeys(), 1u);
+      ASSERT_EQ(g.Put(key, '3'), Status::kOk);  // at home
+      ASSERT_EQ(g.group->Remove(key), Status::kOk);
+      if (overwrite) ASSERT_EQ(g.Put(key, '4'), Status::kOk);
+
+      ASSERT_NO_FATAL_FAILURE(g.Fail(0));
+      ASSERT_EQ(g.group->DiskIndexOf(key), 1u);
+      EXPECT_EQ(g.Get(key), 0) << "the first run's takeover value came back";
+    }
+  }
+}
+
+// Below DFKV_DEGRADED_MIN_DISKS nothing moves: a failed disk's keys stay on
+// it and fail, as before degradation existed.
+TEST_F(DiskGroupTest, BelowTheMinimumAFailedDisksKeysDoNotMove) {
+  ScopedEnv min_disks("DFKV_DEGRADED_MIN_DISKS", "2");
+  RestartableGroup g{RestartableGroup::kSlab, Dirs(2)};
+  ASSERT_NO_FATAL_FAILURE(g.Open());
+  const BlockKey key = g.HomedOn(0);
+  ASSERT_NO_FATAL_FAILURE(g.Fail(0));
+  EXPECT_FALSE(g.group->Healthy());
+  EXPECT_EQ(g.group->DiskIndexOf(key), 0u);
+  EXPECT_TRUE(g.group->DiskFailedFor(key));
+  EXPECT_EQ(g.Put(key, '1'), Status::kIOError);
+  EXPECT_FALSE(fs::exists(dirs_record(g.dirs[1]))) << "nothing moved";
+}
+
+// The record is written only next to a cache directory whose parent is on
+// the same filesystem (else it could outlive less than the data, e.g. on a
+// mount root or a container volume). With no such place, nothing moves.
+TEST_F(DiskGroupTest, AFailureRecordLivesOnlyOnTheDisksOwnFilesystem) {
+  {
+    const auto dirs = Dirs(3);
+    const std::string not_here = DiskCacheGroup::CanonicalDiskId(dirs[2]);
+    RestartableGroup g{RestartableGroup::kSlab, dirs};
+    g.record_location = [&](const std::string& dir) { return dir != not_here; };
+    ASSERT_NO_FATAL_FAILURE(g.Open());
+    const BlockKey key = g.HomedOn(0);
+    ASSERT_NO_FATAL_FAILURE(g.Fail(0));
+    EXPECT_NE(g.group->DiskIndexOf(key), 0u) << "moved";
+    EXPECT_TRUE(g.group->Healthy());
+    EXPECT_TRUE(fs::exists(dirs_record(dirs[1])));
+    EXPECT_FALSE(fs::exists(dirs_record(dirs[2])));
+  }
+  fs::remove_all(base_);
+  {
+    RestartableGroup g{RestartableGroup::kSlab, Dirs(2)};
+    g.record_location = [](const std::string&) { return false; };
+    ASSERT_NO_FATAL_FAILURE(g.Open());
+    const BlockKey key = g.HomedOn(0);
+    ASSERT_NO_FATAL_FAILURE(g.Fail(0));
+    EXPECT_EQ(g.group->DiskIndexOf(key), 0u) << "nothing moves";
+    EXPECT_FALSE(g.group->Healthy());
+    EXPECT_EQ(g.Put(key, '1'), Status::kIOError);
+    EXPECT_FALSE(fs::exists(dirs_record(g.dirs[1])));
+  }
+}
+
+// A record that is there but cannot be used empties every disk: a copy that
+// cannot be read (not a file), an empty one (the writer never writes one),
+// or one naming a directory this node does not have. What sits on the
+// record path and is not a file is never removed by the node.
+TEST_F(DiskGroupTest, AnUnusableFailureRecordEmptiesEveryDisk) {
+  enum Kind { kNotAFile, kEmpty, kUnknownId };
+  for (const auto engine : {RestartableGroup::kSlab, RestartableGroup::kLog}) {
+    for (const Kind kind : {kNotAFile, kEmpty, kUnknownId}) {
+      SCOPED_TRACE(std::string(EngineName(engine)) + " " +
+                   std::to_string(static_cast<int>(kind)));
+      fs::remove_all(base_);
+      RestartableGroup g{engine, Dirs(2)};
+      ASSERT_NO_FATAL_FAILURE(g.Open());
+      const BlockKey a = g.HomedOn(0), b = g.HomedOn(1);
+      ASSERT_EQ(g.Put(a, 'a'), Status::kOk);
+      ASSERT_EQ(g.Put(b, 'b'), Status::kOk);
+      g.group.reset();
+      const std::string record = dirs_record(g.dirs[1]);
+      if (kind == kNotAFile) {
+        fs::create_directories(record);
+        std::ofstream(record + "/keep") << "x";
+      } else if (kind == kEmpty) {
+        std::ofstream{record};
+      } else {
+        std::ofstream(record) << (base_ / "gone").string() << "\n";
+      }
+      ASSERT_NO_FATAL_FAILURE(g.Open());
+      EXPECT_EQ(g.group->OpenUnusableKeys(), 2u);
+      EXPECT_EQ(g.group->Count(), 0u);
+      EXPECT_EQ(g.Get(a), 0);
+      EXPECT_EQ(g.Get(b), 0);
+      ASSERT_EQ(g.Put(a, 'c'), Status::kOk);
+      ASSERT_NO_FATAL_FAILURE(g.Restart());
+      if (kind == kNotAFile) {
+        EXPECT_TRUE(fs::exists(record + "/keep")) << "not ours: left alone";
+        EXPECT_EQ(g.Get(a), 0) << "every start empties all disks meanwhile";
+        fs::remove_all(record);  // the operator moves it away
+        ASSERT_EQ(g.Put(a, 'c'), Status::kOk);
+        ASSERT_NO_FATAL_FAILURE(g.Restart());
+      } else {
+        EXPECT_FALSE(fs::exists(record)) << "a clean stop removes the file";
+      }
+      EXPECT_EQ(g.group->OpenUnusableKeys(), 0u);
+      EXPECT_EQ(g.Get(a), 'c') << "an ordinary restart keeps the cache";
+    }
+  }
+}
+
+// A disk whose not-home keys could not all be removed at the start keeps a
+// value it must not serve for another disk: it takes no failed disk's keys
+// in this run, so a second failure of that key's home cannot route the key
+// to the stale copy. The record stays for the next start.
+TEST_F(DiskGroupTest, ADiskThatKeptAStaleTakeoverValueTakesNoKeysThisRun) {
+  RestartableGroup g{RestartableGroup::kSlab, Dirs(3)};
+  ASSERT_NO_FATAL_FAILURE(g.Open());
+  const BlockKey key = g.HomedOn(0);
+  ASSERT_NO_FATAL_FAILURE(g.Fail(0));
+  ASSERT_EQ(g.Put(key, '2'), Status::kOk);
+  const size_t holder = g.group->DiskIndexOf(key);
+  ASSERT_NE(holder, 0u);
+  g.group.reset();
+  g.misplaced_remove = [&g, holder](size_t disk, const BlockKey& k) {
+    return disk == holder ? Status::kIOError : g.stores[disk]->Remove(k);
+  };
+  ASSERT_NO_FATAL_FAILURE(g.Open());
+  EXPECT_TRUE(g.group->TakesNoOtherDisksKeys(holder));
+  EXPECT_FALSE(g.group->TakesNoOtherDisksKeys(3 - holder));
+  ASSERT_EQ(g.group->DiskIndexOf(key), 0u);
+  ASSERT_NE(g.group->Remove(key), Status::kIOError);  // at home
+  ASSERT_NO_FATAL_FAILURE(g.Fail(0));
+  EXPECT_EQ(g.group->DiskIndexOf(key), 3 - holder) << "not to the stale copy";
+  EXPECT_EQ(g.Get(key), 0);
+  g.group.reset();
+  EXPECT_TRUE(fs::exists(dirs_record(g.dirs[3 - holder]))) << "kept";
+}
+
+// Ids are canonical: the same directories spelled with a trailing slash in
+// the failed run are recognized, and the failed disk is emptied.
+TEST_F(DiskGroupTest, AFailureRecordMatchesTheSameDirectorySpelledOtherwise) {
+  for (const auto engine : {RestartableGroup::kSlab, RestartableGroup::kLog}) {
+    SCOPED_TRACE(EngineName(engine));
+    fs::remove_all(base_);
+    RestartableGroup g{engine, Dirs(2)};
+    // A key homed on disk 0 under both spellings (the ring hashes the
+    // names as given).
+    ASSERT_NO_FATAL_FAILURE(g.Open());
+    std::set<uint64_t> home0;
+    for (uint64_t id = 1; id < 200; ++id)
+      if (g.group->DiskIndexOf(BlockKey{id, 0}) == 0) home0.insert(id);
+    g.group.reset();
+    for (const auto& dir : g.dirs) g.spelled.push_back(dir + "/");
+    ASSERT_NO_FATAL_FAILURE(g.Open());
+    uint64_t id = 1;
+    while (id < 200 && (!home0.count(id) ||
+                        g.group->DiskIndexOf(BlockKey{id, 0}) != 0))
+      ++id;
+    ASSERT_LT(id, 200u);
+    const BlockKey key{id, 0};
+    ASSERT_EQ(g.Put(key, '1'), Status::kOk);
+    ASSERT_NO_FATAL_FAILURE(g.Fail(0));
+    ASSERT_NE(g.group->Remove(key), Status::kIOError);  // on the takeover
+    g.group.reset();
+    g.spelled.clear();
+    ASSERT_NO_FATAL_FAILURE(g.Open());
+    EXPECT_EQ(g.group->OpenUnusableKeys(), 0u) << "recognized";
+    EXPECT_EQ(g.group->DiskIndexOf(key), 0u);
+    EXPECT_EQ(g.Get(key), 0) << "the failed disk's old value is gone";
+    if (engine == RestartableGroup::kLog)
+      EXPECT_GE(g.group->OpenEmptiedKeys(), 1u);
+  }
+}
+
+// A record written later in a run names only that run's failures: a disk the
+// start already emptied is not emptied again.
+TEST_F(DiskGroupTest, ALaterRecordNamesOnlyThisRunsFailures) {
+  RestartableGroup g{RestartableGroup::kLog, Dirs(3)};
+  ASSERT_NO_FATAL_FAILURE(g.Open());
+  const BlockKey on0 = g.HomedOn(0), on1 = g.HomedOn(1);
+  ASSERT_NO_FATAL_FAILURE(g.Fail(0));
+  EXPECT_NE(g.group->DiskIndexOf(on0), 0u);  // puts it on record
+  ASSERT_NO_FATAL_FAILURE(g.Restart());
+  ASSERT_NO_FATAL_FAILURE(g.Fail(1));
+  EXPECT_NE(g.group->DiskIndexOf(on1), 1u);
+  std::ifstream in(dirs_record(g.dirs[2]));
+  std::string text((std::istreambuf_iterator<char>(in)),
+                   std::istreambuf_iterator<char>());
+  EXPECT_EQ(text, DiskCacheGroup::CanonicalDiskId(g.dirs[1]) + "\n");
 }
 
 // DFKV_SLAB_PAYLOAD_CRC takes 0 or 1; anything else refuses to start.
