@@ -5,6 +5,7 @@ If this fails, run ``deploy/sync_telemetry.sh`` (you edited the canonical files
 but not the vendored copies, or vice-versa).
 """
 import os
+import re
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -19,7 +20,32 @@ FILES = ["__init__.py", "config.py", "metrics_push.py", "otlp_json.py",
          "tracing.py", "otlp_traces.py"]
 
 
+def _modules(directory):
+    return sorted(f for f in os.listdir(directory) if f.endswith(".py"))
+
+
 class VendorSyncTest(unittest.TestCase):
+    def test_every_telemetry_module_is_checked(self):
+        # FILES is the list compared below: a module added to the canonical
+        # package, or left behind in a vendored copy, escaped the guard.
+        self.assertEqual(_modules(CANON), sorted(FILES),
+                         "update FILES and deploy/sync_telemetry.sh")
+        for vdir in VENDORED:
+            self.assertEqual(_modules(vdir), sorted(FILES),
+                             vdir + ": run deploy/sync_telemetry.sh")
+        with open(os.path.join(ROOT, "deploy", "sync_telemetry.sh")) as fh:
+            script = fh.read()
+        synced = re.search(r'^FILES="([^"]*)"', script, re.M).group(1)
+        self.assertEqual(sorted(synced.split()), sorted(FILES),
+                         "deploy/sync_telemetry.sh copies another file list")
+        # The directories it copies to are the ones checked here.
+        for array, checked in (("DSTS", VENDORED), ("HOT_DSTS", HOT_VENDORED)):
+            body = re.search(r"^" + array + r"=\(\n(.*?)^\)", script,
+                             re.M | re.S).group(1)
+            targets = [os.path.join(ROOT, t) for t in re.findall(r'"([^"]+)"', body)]
+            self.assertEqual(sorted(targets), sorted(checked),
+                             "deploy/sync_telemetry.sh " + array)
+
     def test_vendored_copies_are_byte_identical(self):
         for f in FILES:
             with open(os.path.join(CANON, f), "rb") as fh:

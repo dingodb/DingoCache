@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Tests: two drift guards for duplicated connector code. The ctypes bindings
+  of `libdfkv` are declared in the HiCache plugin, the vLLM connector, the
+  LMCache connector and `dfkv_common`, and nothing kept them in step with
+  each other or with `src/client/dfkv_c_api.h`; a test now loads each
+  binding against a recording stand-in for the library and fails if a symbol
+  is bound differently in two places, or with another argument count than
+  the header's (`python_cabi_bindings`). The telemetry sync test compared a
+  fixed list of files; it now also fails if the canonical or a vendored
+  telemetry package holds a module outside that list, or if
+  `deploy/sync_telemetry.sh` copies another list. The bindings agree today.
+
 - SGLang HiCache connector, device-direct (L2-bypass): the host read
   `batch_get_v1` reports every page missing when primary KV is stored
   device-direct, and leaves the host buffer as it was. It cannot load those
