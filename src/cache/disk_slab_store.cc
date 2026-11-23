@@ -1556,6 +1556,36 @@ bool DiskSlabStore::RecoverUnclean() {
 }
 
 bool DiskSlabStore::ResetUncleanEpoch() {
+  if (!ResetTable()) return false;
+  unclean_resets_.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+// Before activation: the cache directory's group asks for an empty store
+// (its disk failed in an earlier run). The table is reset as after an unclean
+// exit, durably, and nothing is restored from it. An unclean start has
+// activated the store already; it serves nothing before the group does. On
+// such a store the reset takes the trust token back and writes a dirty state
+// without identity: this run then has no warm-restart identity, and an
+// unclean exit of it resets the table again.
+bool DiskSlabStore::ResetBeforeActivation() {
+  if (!Healthy()) return false;
+  std::lock_guard<std::mutex> lk(mu_);
+  if (!ResetTable()) {
+    ok_ = false;
+    return false;
+  }
+  // The table is zero on the disk; free the slots it no longer names.
+  for (const auto& entry : payload_len_) alloc_->Remove(entry.first);
+  payload_len_.clear();
+  tenant_used_bytes_.clear();
+  committed_payload_bytes_ = 0;
+  DFKV_LOG_WARN("slab " + opt_.dir + ": reset to empty (its disk failed in "
+                "an earlier run)");
+  return true;
+}
+
+bool DiskSlabStore::ResetTable() {
   // The table is about to be destroyed piecemeal. Take the token back and
   // withdraw the identity first, so that a process killed half-way never has
   // the remainder mistaken for a table worth keeping.
@@ -1586,7 +1616,6 @@ bool DiskSlabStore::ResetUncleanEpoch() {
     FailMetadata("sync the slots.tbl reset", saved_errno);
     return SetStartupErrno("cannot persist unclean slots.tbl reset", saved_errno);
   }
-  unclean_resets_.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 
@@ -2769,6 +2798,12 @@ Status DiskSlabStore::RangeInto(const BlockKey& key, uint64_t offset,
   if (st == Status::kOk && out_len) *out_len = got;
   if (st == Status::kOk && value_len) *value_len = plen;
   return st;
+}
+
+void DiskSlabStore::ForEachKey(
+    const std::function<void(const BlockKey&)>& fn) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  for (const auto& entry : payload_len_) fn(entry.first);
 }
 
 bool DiskSlabStore::IsCached(const BlockKey& key) const {

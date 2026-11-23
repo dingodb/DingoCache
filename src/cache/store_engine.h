@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstring>
+#include <functional>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -399,6 +400,15 @@ class StoreEngine {
   // kNotFound also covers a write that has not reached its commit point.
   virtual Status Lookup(const BlockKey& key, ValueMetadata* out) const = 0;
   virtual Status Remove(const BlockKey& key) = 0;
+  // Calls `fn` for every committed key, under the engine's own locks: `fn`
+  // must not call into the engine. For a pass before the store serves.
+  virtual void ForEachKey(
+      const std::function<void(const BlockKey&)>& fn) const = 0;
+  // Before Activate only: drop every value, durably, so that neither this
+  // start nor a later one serves any of them (a crash part-way leaves the
+  // store to be reset again by whoever asked). False if it could not; the
+  // store is then unhealthy.
+  virtual bool ResetBeforeActivation() = 0;
 
   virtual uint64_t UsedBytes() const = 0;
   // Committed payload bytes owned by one tenant. Implementations that do not

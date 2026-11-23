@@ -75,6 +75,9 @@ class KVStore : public StoreEngine {
                          size_t io_cap, ReadLease* out) override;
 
   bool IsCached(const BlockKey& key) const override;
+  void ForEachKey(
+      const std::function<void(const BlockKey&)>& fn) const override;
+  bool ResetBeforeActivation() override;
   Status Lookup(const BlockKey& key, ValueMetadata* out) const override;
 
   // Explicitly drop a cached block: deletes the file, removes it from the

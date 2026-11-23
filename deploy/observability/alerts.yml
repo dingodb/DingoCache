@@ -16,7 +16,15 @@ groups:
           severity: critical
         annotations:
           summary: "dfkv server local storage is unhealthy"
-          description: "{{ $labels.instance }} reports terminal disk or required RAM-tier failure. With a failed disk store it has reported itself out of the placement ring (dfkv_server_ring_eligible is 0) and needs a restart or a replacement; with only the RAM tier unhealthy it keeps serving and stays in the ring."
+          description: "{{ $labels.instance }} reports terminal disk or required RAM-tier failure. With fewer healthy disks than DFKV_DEGRADED_MIN_DISKS it has reported itself out of the placement ring (dfkv_server_ring_eligible is 0) and needs a restart or a replacement; with only the RAM tier unhealthy it keeps serving and stays in the ring."
+      - alert: DfkvServerDegraded
+        expr: dfkv_server_degraded == 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "dfkv server serves with a failed disk"
+          description: "{{ $labels.instance }} has a disk store that failed for good (dfkv_disks_failed counts them, dfkv_disk_failed shows which). Its keys go to the node's other disks and miss until written again; the node stays in placement with less capacity. Restart once the disk is fixed, or replace the disk under the same path."
       - alert: DfkvMdsUnavailable
         expr: (up{job="dfkv_mds"} == 0) or (dfkv_mds_ready == 0) or (absent(up{job="dfkv_mds"}) == 1)
         for: 1m

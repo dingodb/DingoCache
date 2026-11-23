@@ -3,6 +3,38 @@
 ## Unreleased
 
 
+- Server: one failed disk no longer takes the node out of placement
+  (STO-16). A disk store that fails for good while serving used to make the
+  whole node report itself out of the ring, so its healthy disks got no
+  traffic until a restart. The failed disk's keys now go to the node's
+  healthy disks (spread evenly; a healthy disk's keys never move), where a
+  GET is a miss (`kNotFound`, not an I/O error, so clients do not cool the
+  node down) until the key is written again; RAM-tier values on their way
+  to the failed disk are written to the disk that takes over their keys.
+  The node stays in placement and `/healthz` stays 200 while at least
+  `DFKV_DEGRADED_MIN_DISKS` (default 1) disks are healthy; set it to the
+  disk count for the previous behaviour. New `dfkv_disks_failed`,
+  `dfkv_disk_failed{disk}`, `dfkv_server_degraded`, alert
+  `DfkvServerDegraded`, and `store=degraded` in the node's INFO. Before
+  the first key moves, the failure is recorded next to each healthy disk's
+  directory (`<dir>.dfkv-failed-disks`), only where the directory above is
+  on that disk's own filesystem: each cache directory must be a
+  subdirectory on its disk (as `/mnt/diskN/dfkv`), not a mount root or a
+  container volume, and the service must be able to create files above it;
+  with no such place nothing moves and the node leaves placement as
+  before. The next start resets the disks on record to empty (each engine
+  its own way) and drops from the other disks the keys that are not
+  theirs, so neither a value from before the failure nor one written in
+  its place comes back after a REMOVE or an overwrite; a record that
+  cannot be read in full or names a directory the node does not have
+  empties every disk (new `dfkv_disks_open_dropped_keys{reason}`). A
+  clean stop of a run without failures removes the record. Below the
+  threshold a failed disk's keys do not move. A failed disk's bytes no longer count against tenant quotas, and its retention
+  limits no longer bound the node's. A disk that cannot be opened at
+  startup still stops the start. Capacity and disk changes still need a
+  cold start; DEPLOY.md now says so and how to replace one disk without
+  losing the others' data.
+
 - Client: an allocation that fails in a client's one-time set-ups no longer
   aborts the process. The GPU dedup rendezvous of a client's first
   all-device batch, the configuration dump of the first client and the

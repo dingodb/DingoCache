@@ -135,6 +135,11 @@ class LogStore : public StoreEngine {
   Status RangeDirectPrep(const BlockKey& key, uint64_t offset, uint64_t length,
                          size_t io_cap, ReadLease* out) override;
   bool IsCached(const BlockKey& key) const override;
+  void ForEachKey(
+      const std::function<void(const BlockKey&)>& fn) const override;
+  // Activate resets the store to empty (design §4.5's reset, the one an
+  // unreadable journal gets).
+  bool ResetBeforeActivation() override;
   Status Lookup(const BlockKey& key, ValueMetadata* out) const override;
   Status Remove(const BlockKey& key) override;
 

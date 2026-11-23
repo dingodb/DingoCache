@@ -808,6 +808,13 @@ std::string KvNodeServer::MetricsText() const {
   metric("dfkv_objects", "gauge", "Cached objects on this node", group_.Count());
   metric("dfkv_used_bytes", "gauge", "Bytes used on disk", group_.UsedBytes());
   metric("dfkv_disks", "gauge", "Backing NVMe disks", group_.DiskCount());
+  metric("dfkv_disks_failed", "gauge",
+         "Backing disks whose store has failed for good; their keys go to "
+         "the other disks", group_.FailedDisks());
+  metric("dfkv_server_degraded", "gauge",
+         "1 while some disks have failed and the node still serves on the "
+         "others (at least DFKV_DEGRADED_MIN_DISKS healthy)",
+         DisksDegraded() ? 1 : 0);
   metric("dfkv_tenant_default_quota_bytes", "gauge",
          "Default per-node tenant quota bytes (0 means unlimited)",
          group_.TenantDefaultQuotaBytes());
@@ -885,6 +892,24 @@ std::string KvNodeServer::MetricsText() const {
   for (size_t i = 0; i < group_.DiskCount(); ++i)
     s += "dfkv_disk_objects" + braces("disk=\"" + PromLabelEscape(group_.DiskPath(i)) + "\"") + " " +
          std::to_string(group_.DiskObjects(i)) + "\n";
+  s += "# HELP dfkv_disks_open_dropped_keys Keys this start dropped after a run with failed disks: every key of a disk that had failed, of every disk when a record could not be used, and keys found on a disk that is not their home\n";
+  s += "# TYPE dfkv_disks_open_dropped_keys gauge\n";
+  s += "dfkv_disks_open_dropped_keys" + braces("reason=\"failed_disk\"") + " " +
+       std::to_string(group_.OpenEmptiedKeys()) + "\n";
+  s += "dfkv_disks_open_dropped_keys" + braces("reason=\"not_home\"") + " " +
+       std::to_string(group_.OpenMisplacedKeys()) + "\n";
+  s += "dfkv_disks_open_dropped_keys" + braces("reason=\"unusable_record\"") + " " +
+       std::to_string(group_.OpenUnusableKeys()) + "\n";
+  s += "# HELP dfkv_disk_takeover_excluded 1 if a backing disk kept keys of other disks this start could not remove, and so takes no failed disk's keys in this run\n";
+  s += "# TYPE dfkv_disk_takeover_excluded gauge\n";
+  for (size_t i = 0; i < group_.DiskCount(); ++i)
+    s += "dfkv_disk_takeover_excluded" + braces("disk=\"" + PromLabelEscape(group_.DiskPath(i)) + "\"") +
+         (group_.TakesNoOtherDisksKeys(i) ? " 1\n" : " 0\n");
+  s += "# HELP dfkv_disk_failed Whether a backing disk's store has failed for good\n";
+  s += "# TYPE dfkv_disk_failed gauge\n";
+  for (size_t i = 0; i < group_.DiskCount(); ++i)
+    s += "dfkv_disk_failed" + braces("disk=\"" + PromLabelEscape(group_.DiskPath(i)) + "\"") +
+         (group_.DiskHealthy(i) ? " 0\n" : " 1\n");
   s += "# HELP dfkv_disk_engine_info Storage engine of each backing disk (constant 1)\n";
   s += "# TYPE dfkv_disk_engine_info gauge\n";
   for (size_t i = 0; i < group_.DiskCount(); ++i)
