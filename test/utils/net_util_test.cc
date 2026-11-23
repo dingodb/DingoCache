@@ -1,6 +1,7 @@
 #include "utils/net_util.h"
 
 #include <gtest/gtest.h>
+#include <cerrno>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/resource.h>
@@ -37,6 +38,44 @@ TEST(NetDial, ConnectsWithTimeout) {
   EXPECT_GE(fd, 0);
   if (fd >= 0) ::close(fd);
   ::close(lfd);
+}
+
+// A failed Dial says why in errno, whatever errno said before: a caller
+// that tells a local want of descriptors (EMFILE from socket()) from a peer
+// that cannot be reached must not read a stale value. Dial left errno alone
+// on a bad address, a connect that timed out and a refused async connect.
+// The RDMA client tells a local descriptor shortage (EMFILE from socket())
+// from an unreachable peer by errno after a failed Dial: every failure must
+// set errno itself, not leave an earlier one (or connect's EINPROGRESS).
+TEST(NetDial, AFailedDialSetsErrnoItself) {
+  errno = EMFILE;
+  EXPECT_LT(net::Dial("not-an-address:1234", 100, 100), 0);
+  EXPECT_EQ(errno, EINVAL) << "a bad address";
+
+  // A port nobody listens on: the bounded connect learns ECONNREFUSED from
+  // SO_ERROR.
+  int probe = ::socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_GE(probe, 0);
+  sockaddr_in sa{};
+  sa.sin_family = AF_INET;
+  sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  ASSERT_EQ(::bind(probe, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)), 0);
+  socklen_t len = sizeof(sa);
+  ASSERT_EQ(::getsockname(probe, reinterpret_cast<sockaddr*>(&sa), &len), 0);
+  ::close(probe);
+  errno = EMFILE;
+  EXPECT_LT(net::Dial("127.0.0.1:" + std::to_string(ntohs(sa.sin_port)), 500,
+                      500),
+            0);
+  EXPECT_EQ(errno, ECONNREFUSED) << "a refused bounded connect";
+
+  // Unroutable (TEST-NET-1): the connect times out, or the network says at
+  // once that it cannot be reached.
+  errno = EMFILE;
+  EXPECT_LT(net::Dial("192.0.2.1:9", 150, 150), 0);
+  EXPECT_TRUE(errno == ETIMEDOUT || errno == ENETUNREACH ||
+              errno == EHOSTUNREACH)
+      << "a connect that did not complete left errno " << errno;
 }
 
 TEST(NetDial, TimedConnectWorksWithFdAboveFdSetsize) {

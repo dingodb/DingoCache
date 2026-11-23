@@ -1627,6 +1627,12 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     result.failure = AcquireFailure::kNone;
     return result;
   }
+  if (options.pooled_only) {
+    complete_unowned_lease(rdma::RailCompletion::kAdmission);
+    result.failure = AcquireFailure::kAdmission;
+    result.status = Status::kResourceExhausted;
+    return result;
+  }
 
   endpoint_cache_misses_.fetch_add(1, std::memory_order_relaxed);
   // A warm QP needs no probe: its own negotiation is authoritative. Sharing
@@ -1726,9 +1732,67 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     return result;
   }
 
+  // This process could not open an endpoint on the chosen rail for want of
+  // descriptors or memory. The device has done nothing wrong and the peer
+  // neither: no rail is charged, the peer is not cooled. Another rail can
+  // still serve the operation: on a connection already open to the peer
+  // (pooled_only: without a descriptor nothing new can be opened), or, for
+  // ENOMEM, which may be this device's own limit on QPs or CQs, on a new one.
+  auto other_rail = [&](bool pooled_only) -> std::optional<AcquireResult> {
+    if (!options.local_resource_fallback) return std::nullopt;
+    AcquireOptions other = options;
+    other.excluded.resize(devs_.size(), 0);
+    other.excluded[ridx] = 1;
+    other.pooled_only = pooled_only;
+    other.local_resource_fallback = false;
+    other.peer = peer_snapshot;
+    for (;;) {
+      bool untried = false;
+      for (size_t r = 0; r < devs_.size(); ++r)
+        if (!other.excluded[r] && r < topology_compatible.size() &&
+            topology_compatible[r])
+          untried = true;
+      if (!untried) return std::nullopt;
+      AcquireResult alternative = Acquire(node, lane, other);
+      if (alternative.conn) {
+        local_resource_rail_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+        return alternative;
+      }
+      if (!alternative.attempted_rail) return std::nullopt;
+      other.excluded[*alternative.attempted_rail] = 1;
+    }
+  };
+  auto note_local_resource = [&](const char* what, int err) {
+    local_resource_failures_.fetch_add(1, std::memory_order_relaxed);
+    uint64_t suppressed = 0;
+    if (local_resource_log_.Admit(
+            LogThrottle::Key(what, static_cast<uint64_t>(err), 0),
+            rdma::RailPolicy::NowMicros(), &suppressed))
+      DFKV_LOG_WARN(
+          std::string("rdma: cannot ") + what + " for " + node + " on " +
+          devs_[ridx] + ": " + std::strerror(err) +
+          ". This process is out of file descriptors or memory (or the "
+          "device out of QPs or CQs); other rails are tried, then the "
+          "operation fails with kResourceExhausted. No rail is charged "
+          "and the peer is not cooled down. suppressed=" +
+          std::to_string(suppressed));
+  };
+
   const std::string& dev = devs_[ridx];
   const bool held = RecentlyUnreachable(node);
   int fd = held ? -1 : net::Dial(node, connect_ms_, io_ms_);
+  const int dial_errno = errno;
+  if (fd < 0 && !held && (dial_errno == EMFILE || dial_errno == ENFILE)) {
+    // socket() itself failed: nothing reached the peer.
+    note_local_resource("open a socket", dial_errno);
+    complete_unowned_lease(rdma::RailCompletion::kAdmission);
+    resource_budget_->Release(budget_request);
+    if (auto alternative = other_rail(/*pooled_only=*/true))
+      return *alternative;
+    result.failure = AcquireFailure::kAdmission;
+    result.status = Status::kResourceExhausted;
+    return result;
+  }
   if (fd < 0) {
     // The bootstrap address is the node's, the same for every rail. A
     // refusal is not a connect that failed: it starts nothing and is not
@@ -1759,26 +1823,20 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   conn->credit_held = true;
   conn->budget_request = budget_request;
   conn->budget_held = true;
-  if (!conn->ep.Open(dev.c_str(), rdma::kV2ControlCap, conn_depth)) {
+  const int injected_errno = ridx < fail_open_errno_for_test_.size()
+                                 ? fail_open_errno_for_test_[ridx]
+                                 : 0;
+  if (injected_errno != 0 ||
+      !conn->ep.Open(dev.c_str(), rdma::kV2ControlCap, conn_depth)) {
     ::close(fd);
-    const int open_errno = conn->ep.open_errno();
+    const int open_errno =
+        injected_errno != 0 ? injected_errno : conn->ep.open_errno();
     if (open_errno == EMFILE || open_errno == ENFILE ||
         open_errno == ENOMEM) {
-      // This process is out of descriptors or memory. Another rail would hit
-      // the same limit, and the device has done nothing wrong.
-      local_resource_failures_.fetch_add(1, std::memory_order_relaxed);
-      uint64_t suppressed = 0;
-      if (local_resource_log_.Admit(
-              LogThrottle::Key("open", static_cast<uint64_t>(open_errno), 0),
-              rdma::RailPolicy::NowMicros(), &suppressed))
-        DFKV_LOG_WARN(
-            "rdma: cannot create an endpoint for " + node + ": " +
-            std::strerror(open_errno) +
-            ". This process is out of file descriptors or memory; the "
-            "operation fails with kResourceExhausted, no rail is charged "
-            "and the peer is not cooled down. suppressed=" +
-            std::to_string(suppressed));
+      note_local_resource("create an endpoint", open_errno);
       Destroy(conn, rdma::RailCompletion::kAdmission);
+      if (auto alternative = other_rail(open_errno != ENOMEM))
+        return *alternative;
       result.failure = AcquireFailure::kAdmission;
       result.status = Status::kResourceExhausted;
       return result;
@@ -2560,6 +2618,12 @@ std::string RdmaTransport::MetricsText() const {
   s += "# TYPE dfkv_rdma_client_peer_busy_total counter\n";
   s += "dfkv_rdma_client_peer_busy_total " +
        std::to_string(peer_busy_.load(std::memory_order_relaxed)) + "\n";
+  s += "# HELP dfkv_rdma_client_local_resource_rail_fallbacks_total Endpoint opens refused for lack of descriptors or memory whose operation was then served on another rail\n";
+  s += "# TYPE dfkv_rdma_client_local_resource_rail_fallbacks_total counter\n";
+  s += "dfkv_rdma_client_local_resource_rail_fallbacks_total " +
+       std::to_string(local_resource_rail_fallbacks_.load(
+           std::memory_order_relaxed)) +
+       "\n";
   s += "# HELP dfkv_rdma_client_local_resource_failures_total Operations failed because this process could not register a caller buffer or create an endpoint for lack of descriptors or memory; no rail or peer charged\n";
   s += "# TYPE dfkv_rdma_client_local_resource_failures_total counter\n";
   s += "dfkv_rdma_client_local_resource_failures_total " +

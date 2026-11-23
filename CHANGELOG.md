@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Client, RDMA: an operation that cannot open an endpoint for lack of file
+  descriptors (in `socket()` for the bootstrap connection, or in building
+  the endpoint) is now served on an idle connection to the same peer on
+  another rail, if there is one, instead of failing at once. A `socket()`
+  failure also no longer marks the peer unreachable and holds off new
+  connections to it. The rail it had chosen, without an idle
+  connection, needed a new one; a connection already open on another rail
+  needs no descriptor. No rail is charged either way. Counted in
+  `dfkv_rdma_client_local_resource_rail_fallbacks_total`.
 - Server, RDMA: stopping no longer waits for connections still in their
   handshake, and lets reads and writes in flight finish. A connection
   thread waiting for its peer's bootstrap frames held `Stop()` up until the
