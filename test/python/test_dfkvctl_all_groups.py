@@ -293,6 +293,15 @@ def _check_operational_tools(dfkvctl: Path, mds: str, etcd: str, state: _EtcdSta
         state.values[ghost_key] = _registration(
             "ghost", "127.0.0.1", ghost_port, b"ver=0.0,note=\xff\xfe")
     try:
+        # Written to etcd behind the MDS's back, as another MDS would: the
+        # MDS reuses its member list for DFKV_MDS_LIST_CACHE_MS (500 ms), so
+        # the record may appear that much later, and no later.
+        written = time.monotonic()
+        while "ghost" not in {item.node_id for item in workflow.ring().members}:
+            require(time.monotonic() - written < 2.0,
+                    "a member written through etcd is listed within the cache time",
+                    ctl("ring", "--json", "--group", "alpha"))
+            time.sleep(0.05)
         stat = ctl("stat", "--all", "--group", "alpha")
         rows = [line.split() for line in stat.stdout.splitlines()]
         require(

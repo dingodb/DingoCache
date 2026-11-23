@@ -91,6 +91,45 @@ class EtcdProbeCache {
 
 // Members whose heartbeat reached this MDS but could not be written to etcd.
 //
+// Member-list answers, kept for ttl_ms and computed by one caller at a time
+// per key (the others wait for its answer), so clients polling every few
+// seconds cost etcd one range per group and ttl instead of one per poll.
+// Invalidate drops the answers of a group, and a computation already running
+// when it is called does not refresh them. ttl_ms == 0 caches nothing. Clock
+// injected for tests.
+class ListCache {
+ public:
+  using Clock = std::function<uint64_t()>;  // steady-clock milliseconds
+  using Compute = std::function<Status(std::string*)>;
+  ListCache(uint64_t ttl_ms, Clock clock)
+      : ttl_ms_(ttl_ms), clock_(std::move(clock)) {}
+  // *hit tells whether the answer came from the cache.
+  Status Get(const std::string& group, bool degraded, std::string* out,
+             const Compute& compute, bool* hit = nullptr);
+  void Invalidate(const std::string& group);
+  size_t SizeForTest() {
+    std::lock_guard<std::mutex> lk(mu_);
+    return entries_.size();
+  }
+
+ private:
+  struct Entry {
+    bool valid = false;
+    bool loading = false;
+    uint64_t at_ms = 0;
+    uint64_t generation = 0;
+    Status status = Status::kIOError;
+    std::string out;
+  };
+  const uint64_t ttl_ms_;
+  Clock clock_;
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::map<std::pair<std::string, bool>, Entry> entries_;
+  // Past this many entries, expired ones are dropped when a new one is made.
+  static constexpr size_t kMaxEntries = 1024;
+};
+
 // The heartbeat proves the node is alive. When etcd takes no writes (out of
 // space it refuses Put and LeaseGrant, yet answers Range and keeps expiring
 // leases) the member's key runs out although nothing is wrong with the node,
@@ -247,6 +286,8 @@ class MdsServer {
   // Default DFKV_MDS_STATS_PUT_MS: a member's record is rewritten for a
   // change of its stats (STA1) alone at most this often.
   static constexpr uint64_t kStatsPutMs = 60000;
+  // Default DFKV_MDS_LIST_CACHE_MS.
+  static constexpr uint64_t kListCacheMs = 500;
   // Default DFKV_MDS_UNWRITTEN_HOLD_MS: four lease TTLs, the margin the local
   // lease shortcut already gives a registrar rotating over several MDS.
   static constexpr uint64_t kUnwrittenHoldMs =
@@ -263,6 +304,8 @@ class MdsServer {
   Status Upsert(const std::string& group, const MemberInfo& m, bool heartbeat);
   Status ListMembers(const std::string& group, std::string* out,
                      bool include_degraded = false);
+  Status ListMembersFromEtcd(const std::string& group, std::string* out,
+                             bool include_degraded);
 
   // Client (consumer) registration — same lease/keepalive contract as Upsert/
   // ListMembers but under a disjoint etcd prefix (/clients/<id> vs /members/<id>)
@@ -272,8 +315,10 @@ class MdsServer {
   Status ListClients(const std::string& group, std::string* out);
   // Shared by Upsert/UpsertClient. The local cache is only a bounded shortcut
   // over etcd truth; all blocking etcd operations happen outside its mutex.
+  // *wrote: the record was written to etcd (not only its lease renewed).
   Status UpsertLeased(const std::string& key, const MemberInfo& m,
-                      LocalLeaseMap& leases, bool client);
+                      LocalLeaseMap& leases, bool client,
+                      bool* wrote = nullptr);
   static std::string MemberKey(const std::string& group, const std::string& id);
   static std::string ClientKey(const std::string& group, const std::string& id);
 
@@ -300,6 +345,7 @@ class MdsServer {
   LocalLeaseMap leases_;
   LocalLeaseMap client_leases_;
   uint64_t stats_put_ms_;  // DFKV_MDS_STATS_PUT_MS, resolved in the ctor
+  ListCache list_cache_;   // DFKV_MDS_LIST_CACHE_MS, resolved in the ctor
   UnwrittenMembers unwritten_;  // hold resolved in the ctor (env knob)
   std::atomic<uint64_t> withheld_log_ms_{0};  // rate limit of the WARN line
   MdsMetrics metrics_;

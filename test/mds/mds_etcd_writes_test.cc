@@ -1,5 +1,5 @@
-// What the MDS writes to etcd for heartbeats, and how the registrar picks an
-// MDS. Runs against the
+// What the MDS writes to etcd for heartbeats, how member lists are served,
+// and how the registrar picks an MDS. Runs against the
 // in-process fake of the etcd JSON gateway (fake_etcd.h): no etcd needed.
 #include "mds/mds_server.h"
 
@@ -207,6 +207,56 @@ TEST(MdsEtcdWrites, AnExpiredLeaseIsReplaced) {
   EXPECT_EQ(EtcdOps(mds, "lease_grant"), 2);
   EXPECT_EQ(EtcdOps(mds, "put"), 2);
   EXPECT_EQ(ListIds(mds, "g"), (std::set<std::string>{"na"}));
+  mds.Stop();
+}
+
+// Polls within DFKV_MDS_LIST_CACHE_MS share one etcd range; a record this
+// MDS writes is in the next answer.
+TEST(MdsEtcdWrites, MemberListsShareOneRangePerInterval) {
+  ScopedEnv cache("DFKV_MDS_LIST_CACHE_MS", "5000");
+  FakeEtcd etcd;
+  MdsServer mds(etcd.ep());
+  ASSERT_EQ(mds.Start(0), Status::kOk);
+  ASSERT_EQ(Beat(mds, WireOp::kRegister, "g", kA), Status::kOk);
+  const double ranges = EtcdOps(mds, "range");
+  for (int i = 0; i < 5; ++i)
+    EXPECT_EQ(ListIds(mds, "g"), (std::set<std::string>{"na"}));
+  EXPECT_EQ(EtcdOps(mds, "range"), ranges + 1);
+  EXPECT_EQ(Metric(mds, "dfkv_mds_list_cache_hits_total"), 4);
+  ASSERT_EQ(Beat(mds, WireOp::kRegister, "g", kB), Status::kOk);
+  EXPECT_EQ(ListIds(mds, "g"), (std::set<std::string>{"na", "nb"}))
+      << "a member written here waited for the cache";
+  // An unchanged heartbeat writes nothing, so it keeps the cached answer.
+  ASSERT_EQ(Beat(mds, WireOp::kHeartbeat, "g", kA), Status::kOk);
+  const double after_write = EtcdOps(mds, "range");
+  ListIds(mds, "g");
+  EXPECT_EQ(EtcdOps(mds, "range"), after_write);
+  mds.Stop();
+}
+
+// Answers of groups no longer asked for are dropped once there are many.
+TEST(ListCache, ExpiredEntriesArePrunedPastTheCap) {
+  uint64_t now = 1000;
+  ListCache cache(500, [&] { return now; });
+  std::string out;
+  auto ok = [](std::string* s) { *s = "x"; return Status::kOk; };
+  for (int i = 0; i < 1100; ++i)
+    cache.Get("g" + std::to_string(i), false, &out, ok);
+  EXPECT_LE(cache.SizeForTest(), 1100u);
+  now += 1000;  // all expired
+  cache.Get("fresh", false, &out, ok);
+  EXPECT_EQ(cache.SizeForTest(), 1u);
+}
+
+TEST(MdsEtcdWrites, ListCacheOffReadsEtcdOnEveryPoll) {
+  ScopedEnv cache("DFKV_MDS_LIST_CACHE_MS", "0");
+  FakeEtcd etcd;
+  MdsServer mds(etcd.ep());
+  ASSERT_EQ(mds.Start(0), Status::kOk);
+  ASSERT_EQ(Beat(mds, WireOp::kRegister, "g", kA), Status::kOk);
+  const double ranges = EtcdOps(mds, "range");
+  for (int i = 0; i < 3; ++i) ListIds(mds, "g");
+  EXPECT_EQ(EtcdOps(mds, "range"), ranges + 3);
   mds.Stop();
 }
 

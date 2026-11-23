@@ -140,6 +140,9 @@ journalctl -u dfkv_mds -n 5 --no-pager   # 应见 "dfkv_mds listening on 9400, e
 > 上），失败时在同一次心跳里立即依次试其他端点（建连超时 2s），失败的端点 30s 内
 > 不再先选。任一 MDS 都续记录上挂的那个租约，所以换 MDS
 > 不再重新授予租约、重写记录。
+> MDS 对 member list 的回答复用 `DFKV_MDS_LIST_CACHE_MS`（默认 500 ms；`0`=每次
+> 轮询都读 etcd，2.42 及之前的行为），同一 group 并发的轮询只读一次 etcd；本 MDS
+> 写入的记录立即可见，其他 MDS 写入的最多晚这么久。
 > MDS 的 `/healthz` 是纯进程 liveness（不 probe etcd）：否则一次秒级 etcd
 > 抖动会让 kubelet 同时重启全部 MDS 副本，CrashLoop 比抖动更久，重注册风暴
 > 还会引发 lease 集体过期。`/readyz` 保留 etcd 依赖检查（活着但探不到 etcd
@@ -784,6 +787,7 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | `DFKV_MDS_IO_TIMEOUT_S` | `60` | MDS 控制面帧读写超时（MDS 进程该） |
 | `DFKV_MDS_ETCD_PROBE_MS` | `30000` | MDS 与 etcd 存活探测窗（MDS 进程该） |
 | `DFKV_MDS_STATS_PUT_MS` | `60000` | 仅统计（STA1）变化时重写 member 记录的最短间隔（`0`=每次心跳都重写，上限 600000）；放置相关的变化（ip、端口、权重、健康）立即写 |
+| `DFKV_MDS_LIST_CACHE_MS` | `500` | member list 回答的复用时长（`0`=每次读 etcd，上限 10000）；本 MDS 的写入会立即作废它 |
 | `DFKV_MDS_UNWRITTEN_HOLD_MS` | `120000` | MDS 把心跳已到但没写进 etcd 的 member 视为存活的时长；期间 etcd 缺少该 member 则 member list 返回错误（`0`=关，上限 600000；须大于 MDS 端点数 × 10s 心跳间隔；见 §2b） |
 | `DFKV_RDMA_HEALTH_RECOVERY_SAMPLES` | `3` | 仅 RDMA listener 生效。任一 initialized rail 健康即可 placement；部分掉轨保持 `PARTIAL`。最后一条健康 rail 丢失立即 `DEGRADED`；0→非 0 恢复要求连续成功样本，通过后 `PARTIAL`/`ACTIVE` 回环 |
 | `DFKV_RDMA_HEALTH_FILE` | 未设置（生产必须未设置） | 仅受控故障注入；逐 initialized device 提供 `device port_state phys_state`，生产从 sysfs 读取 |

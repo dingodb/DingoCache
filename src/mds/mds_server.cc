@@ -192,7 +192,14 @@ MdsServer::MdsServer(const std::string& etcd_addr, int etcd_timeout_ms,
       // heartbeat whose stats changed (every heartbeat of a serving node).
       stats_put_ms_(std::min<uint64_t>(
           config_dump::EnvU64("DFKV_MDS_STATS_PUT_MS", kStatsPutMs),
-          600000)) {}
+          600000)),
+      // DFKV_MDS_LIST_CACHE_MS: how long a member-list answer is reused (see
+      // ListCache); 0 = every poll reads etcd, the behavior up to 2.42.
+      list_cache_(std::min<uint64_t>(
+                      config_dump::EnvU64("DFKV_MDS_LIST_CACHE_MS",
+                                          kListCacheMs),
+                      10000),
+                  SteadyNowMs) {}
 
 MdsServer::~MdsServer() { Stop(); }
 
@@ -385,7 +392,10 @@ Status MdsServer::Upsert(const std::string& group, const MemberInfo& m,
   // contain '/' and escape its own key subtree (phantom-member injection).
   if (!IsValidGroupOrId(group) || !IsValidGroupOrId(m.id)) return Status::kInvalid;
   const std::string key = MemberKey(group, m.id);
-  const Status st = UpsertLeased(key, m, leases_, false);
+  bool wrote = false;
+  const Status st = UpsertLeased(key, m, leases_, false, &wrote);
+  // A record written here changes the list: the next poll reads it.
+  if (wrote) list_cache_.Invalidate(group);
   // A heartbeat etcd did not take is recorded for ListMembers (see
   // UnwrittenMembers). A failed register is not. A registrar heartbeats only
   // after a register of the same process went through, so a heartbeat comes
@@ -437,7 +447,9 @@ bool OnlyStatsDiffer(const std::string& stored, const MemberInfo& next,
 // The local map keeps, per key, when this MDS last wrote it (for the stats
 // interval). Entries are discarded after four etcd TTLs without local use.
 Status MdsServer::UpsertLeased(const std::string& key, const MemberInfo& m,
-                               LocalLeaseMap& leases, bool client) {
+                               LocalLeaseMap& leases, bool client,
+                               bool* wrote) {
+  if (wrote) *wrote = false;
   const std::string val = EncodeMembers({m}, 0);
   constexpr uint64_t kLocalLeaseStaleMs =
       static_cast<uint64_t>(kTtlSeconds) * 4 * 1000;
@@ -457,6 +469,7 @@ Status MdsServer::UpsertLeased(const std::string& key, const MemberInfo& m,
   auto put = [&](int64_t lease) {
     if (!etcd_.Put(key, val, lease)) return false;
     metrics_.record_puts.fetch_add(1, std::memory_order_relaxed);
+    if (wrote) *wrote = true;
     leases.Store(key, lease, SteadyNowMs());
     current_metric.store(leases.Size(), std::memory_order_relaxed);
     return true;
@@ -502,6 +515,80 @@ Status MdsServer::ListMembers(const std::string& group, std::string* out,
   // A malformed group would build a RangePrefix straddling other groups'
   // subtrees; reject it the same way Upsert does.
   if (!IsValidGroupOrId(group)) return Status::kInvalid;
+  bool hit = false;
+  const Status st = list_cache_.Get(
+      group, include_degraded, out,
+      [&](std::string* fresh) {
+        return ListMembersFromEtcd(group, fresh, include_degraded);
+      },
+      &hit);
+  if (hit) metrics_.list_cache_hits.fetch_add(1, std::memory_order_relaxed);
+  return st;
+}
+
+Status ListCache::Get(const std::string& group, bool degraded,
+                      std::string* out, const Compute& compute, bool* hit) {
+  if (hit) *hit = false;
+  if (ttl_ms_ == 0) return compute(out);
+  const auto key = std::make_pair(group, degraded);
+  std::unique_lock<std::mutex> lk(mu_);
+  if (entries_.size() >= kMaxEntries && entries_.find(key) == entries_.end()) {
+    const uint64_t now = clock_();
+    for (auto it = entries_.begin(); it != entries_.end();) {
+      const Entry& old = it->second;
+      if (!old.loading && (!old.valid || now < old.at_ms ||
+                           now - old.at_ms >= ttl_ms_))
+        it = entries_.erase(it);
+      else
+        ++it;
+    }
+  }
+  for (;;) {
+    Entry& e = entries_[key];
+    const uint64_t now = clock_();
+    if (e.valid && now >= e.at_ms && now - e.at_ms < ttl_ms_) {
+      *out = e.out;
+      if (hit) *hit = true;
+      return e.status;
+    }
+    if (!e.loading) break;
+    cv_.wait(lk);
+  }
+  Entry& e = entries_[key];
+  e.loading = true;
+  const uint64_t generation = e.generation;
+  const uint64_t started = clock_();
+  lk.unlock();
+  std::string fresh;
+  const Status st = compute(&fresh);
+  lk.lock();
+  Entry& done = entries_[key];
+  done.loading = false;
+  if (done.generation == generation) {
+    done.valid = true;
+    done.at_ms = started;  // as old as the read it rests on
+    done.status = st;
+    done.out = fresh;
+  }
+  cv_.notify_all();
+  *out = std::move(fresh);
+  return st;
+}
+
+void ListCache::Invalidate(const std::string& group) {
+  if (ttl_ms_ == 0) return;
+  std::lock_guard<std::mutex> lk(mu_);
+  for (const bool degraded : {false, true}) {
+    const auto found = entries_.find(std::make_pair(group, degraded));
+    if (found == entries_.end()) continue;
+    found->second.valid = false;
+    ++found->second.generation;
+  }
+}
+
+Status MdsServer::ListMembersFromEtcd(const std::string& group,
+                                      std::string* out,
+                                      bool include_degraded) {
   std::string prefix = "/dfkv/v1/groups/" + group + "/members/";
   // Read before the range, so that a member written in between is judged
   // against a view that may predate its write: the list is then withheld for
