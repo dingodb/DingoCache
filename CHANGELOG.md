@@ -239,6 +239,15 @@
   entries), so for them nothing changes; whether a page is stored is
   `batch_exists`'s answer. A WARNING is logged once if it is called.
 
+- Server, RDMA: a leased PUT's lease slot is chosen among the slots free
+  in the index space its windows name (their immediate), not taken as the
+  receive slot its request happened to land in. With two leases granted on
+  a depth-2 connection and their windows not yet sent, the next request
+  lands in the first receive slot again, the first lease's: the server
+  dropped the connection (reproduced). It now answers `kCacheFull` while
+  no lease slot is free. A control op no longer fails the connection when
+  a multi-window PUT is in progress on the data slot that happens to have
+  its receive slot's number.
 - Server, RDMA: receive-pool pressure reclaim evicts only idle connections
   whose leases make room for the request: a run of free ranges and idle
   leases that touch end to end in a chunk of the request's rail (or of
