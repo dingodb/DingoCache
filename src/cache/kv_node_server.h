@@ -204,6 +204,11 @@ class KvNodeServer {
   uint64_t ram_arena_bytes() const { return ram_ ? ram_->arena_bytes() : 0; }
   bool ram_ack_enabled() const { return ram_ack_enabled_; }
 
+  // SIGHUP: read the tenant quotas file again (DiskCacheGroup::ReloadTenantQuotas).
+  bool ReloadTenantQuotas(std::string* error) {
+    return group_.ReloadTenantQuotas(error);
+  }
+
  private:
   friend class KvNodeServerTestPeer;
   friend class KvNodeServerWiringTestPeer;

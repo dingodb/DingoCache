@@ -785,6 +785,12 @@ std::string KvNodeServer::MetricsText() const {
   metric("dfkv_tenant_quota_rejections_total", "counter",
          "PUT items rejected by per-node tenant quotas",
          group_.TenantQuotaRejections());
+  metric("dfkv_tenant_quota_reloads_total", "counter",
+         "Tenant quotas file reloads (SIGHUP) that took effect",
+         group_.TenantQuotaReloads());
+  metric("dfkv_tenant_quota_reload_failures_total", "counter",
+         "Tenant quotas file reloads that failed (the old quotas stay)",
+         group_.TenantQuotaReloadFailures());
   const auto tenant_quotas = group_.ConfiguredTenantQuotaMetrics();
   auto tenant_metric = [&](const char* name, const char* type,
                            const char* help, auto value) {

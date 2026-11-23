@@ -3,6 +3,16 @@
 ## Unreleased
 
 
+- Server: `SIGHUP` reloads `DFKV_TENANT_QUOTAS_FILE`; new limits apply from
+  the next PUT, and a file that does not parse keeps the old quotas (WARN).
+  The reload takes only the quotas lock: writes keep going, and one in
+  flight is checked against the quotas it started with.
+  SIGHUP used to stop the server (its default action); a server run in a
+  foreground terminal without nohup now survives that session closing. New
+  `dfkv_tenant_quota_reloads_total`, `dfkv_tenant_quota_reload_failures_total`.
+  The MDS heartbeat interval is `DFKV_MDS_HEARTBEAT_MS` (1000-10000, default
+  10000) instead of a fixed 10 s.
+
 - Client, host and GPU dedup: the shared-memory segment goes with its last
   user. Each process holds a shared lock on it; the last one to leave
   removes its name. A segment (516 MiB by default for the host flavor) used

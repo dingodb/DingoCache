@@ -9,7 +9,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <condition_variable>
 #include <cstring>
@@ -977,4 +979,127 @@ TEST_F(DiskGroupTest, PeriodicTableSyncRunsOnlyWhereARecoveryUsesIt) {
       EXPECT_GE(waited_s, 4.9) << "auto: the first sync came before 5 s";
     }
   }
+}
+
+// The quotas file is read again on request (SIGHUP in the server): new
+// limits apply to the next PUT, a file that does not parse leaves the old
+// ones, and the rejection count of a tenant kept stays.
+TEST_F(DiskGroupTest, TenantQuotasReloadFromTheirFile) {
+  const auto dirs = Dirs(1);
+  const fs::path quotas = base_ / "quotas-reload";
+  std::ofstream(quotas) << "0000000000003333 10\n";
+  ScopedEnv quota_file("DFKV_TENANT_QUOTAS_FILE", quotas.string());
+  ScopedEnv default_quota("DFKV_TENANT_DEFAULT_QUOTA_BYTES", "0");
+  DiskCacheGroup group({dirs, 1ull << 30, "file"});
+  ASSERT_TRUE(group.Healthy()) << group.StartupError();
+  EXPECT_EQ(group.TenantQuotaBytes(0x3333), 10u);
+  EXPECT_EQ(group.TenantQuotaBytes(0x4444), 0u);
+  const std::string value(8, 'v');
+  ASSERT_EQ(group.Cache(BlockKey{1, 0, 0x3333}, value.data(), value.size()),
+            Status::kOk);
+  EXPECT_EQ(group.Cache(BlockKey{2, 0, 0x3333}, value.data(), value.size()),
+            Status::kQuotaExceeded);
+
+  std::ofstream(quotas, std::ios::trunc) << "0000000000003333 100\n"
+                                         << "0000000000004444 5\n";
+  std::string error;
+  ASSERT_TRUE(group.ReloadTenantQuotas(&error)) << error;
+  EXPECT_EQ(group.TenantQuotaBytes(0x3333), 100u);
+  EXPECT_EQ(group.TenantQuotaBytes(0x4444), 5u);
+  EXPECT_EQ(group.Cache(BlockKey{2, 0, 0x3333}, value.data(), value.size()),
+            Status::kOk);
+  EXPECT_EQ(group.Cache(BlockKey{3, 0, 0x4444}, value.data(), value.size()),
+            Status::kQuotaExceeded);
+  const auto metrics = group.ConfiguredTenantQuotaMetrics();
+  ASSERT_EQ(metrics.size(), 2u);
+  EXPECT_EQ(metrics[0].tenant_hash, 0x3333u);
+  EXPECT_EQ(metrics[0].rejections, 1u) << "kept across the reload";
+  EXPECT_EQ(group.TenantQuotaReloads(), 1u);
+
+  std::ofstream(quotas, std::ios::trunc) << "not a quota line\n";
+  EXPECT_FALSE(group.ReloadTenantQuotas(&error));
+  EXPECT_FALSE(error.empty());
+  EXPECT_EQ(group.TenantQuotaBytes(0x3333), 100u) << "a bad file changes nothing";
+  EXPECT_EQ(group.TenantQuotaReloadFailures(), 1u);
+}
+
+// A reload takes the quotas lock alone, with writers running: no rejection
+// count is lost, and none is lost across the reloads either.
+TEST_F(DiskGroupTest, TenantQuotasReloadWhileWritersAreRejected) {
+  const auto dirs = Dirs(1);
+  const fs::path quotas = base_ / "quotas-reload-busy";
+  std::ofstream(quotas) << "0000000000005555 1\n";
+  ScopedEnv quota_file("DFKV_TENANT_QUOTAS_FILE", quotas.string());
+  ScopedEnv default_quota("DFKV_TENANT_DEFAULT_QUOTA_BYTES", "0");
+  DiskCacheGroup group({dirs, 1ull << 30, "file"});
+  ASSERT_TRUE(group.Healthy()) << group.StartupError();
+  constexpr int kThreads = 4, kWrites = 200;
+  const std::string value(8, 'v');
+  std::atomic<int> done{0};
+  std::vector<std::thread> writers;
+  for (int t = 0; t < kThreads; ++t)
+    writers.emplace_back([&, t] {
+      for (int i = 0; i < kWrites; ++i)
+        EXPECT_EQ(group.Cache(BlockKey{static_cast<uint64_t>(t * kWrites + i),
+                                       0, 0x5555},
+                              value.data(), value.size()),
+                  Status::kQuotaExceeded);
+      ++done;
+    });
+  std::string error;
+  int reloads = 0;
+  while (done.load() < kThreads || reloads < 5) {
+    ASSERT_TRUE(group.ReloadTenantQuotas(&error)) << error;
+    ++reloads;
+  }
+  for (auto& writer : writers) writer.join();
+  const auto metrics = group.ConfiguredTenantQuotaMetrics();
+  ASSERT_EQ(metrics.size(), 1u);
+  EXPECT_EQ(metrics[0].rejections,
+            static_cast<uint64_t>(kThreads * kWrites));
+  EXPECT_EQ(group.TenantQuotaReloads(), static_cast<uint64_t>(reloads));
+}
+
+// A batch over more tenant stripes than are held at once is run in parts;
+// each tenant is admitted as in one batch.
+TEST_F(DiskGroupTest, QuotaBatchOverManyStripesIsAdmittedPerTenant) {
+  const auto dirs = Dirs(1);
+  constexpr uint64_t kTenants = 40;  // 40 stripes: more than one part
+  const fs::path quotas = base_ / "quotas-many";
+  {
+    std::ofstream file(quotas);
+    char line[64];
+    for (uint64_t tenant = 1; tenant <= kTenants; ++tenant) {
+      std::snprintf(line, sizeof(line), "%016llx 10\n",
+                    static_cast<unsigned long long>(tenant));
+      file << line;
+    }
+  }
+  ScopedEnv quota_file("DFKV_TENANT_QUOTAS_FILE", quotas.string());
+  ScopedEnv default_quota("DFKV_TENANT_DEFAULT_QUOTA_BYTES", "0");
+  DiskCacheGroup group({dirs, 1ull << 30, "file"});
+  ASSERT_TRUE(group.Healthy()) << group.StartupError();
+  void* raw = std::aligned_alloc(4096, 4096);
+  ASSERT_NE(raw, nullptr);
+  std::unique_ptr<void, decltype(&std::free)> buffer(raw, &std::free);
+  std::memset(raw, 'm', 4096);
+  std::vector<StoreEngine::CacheBatchItem> items;
+  for (uint64_t round = 0; round < 2; ++round)
+    for (uint64_t tenant = 1; tenant <= kTenants; ++tenant)
+      items.push_back({BlockKey{round * 1000 + tenant, 0, tenant},
+                       static_cast<char*>(raw), 6, 4096});
+  // A tenant without a quota rides along (with the first part).
+  const BlockKey unlimited{5000, 0, 0x9999};
+  items.push_back({unlimited, static_cast<char*>(raw), 6, 4096});
+  const auto statuses = group.CacheDirectBatch(items);
+  ASSERT_EQ(statuses.size(), items.size());
+  for (size_t i = 0; i < 2 * kTenants; ++i)
+    EXPECT_EQ(statuses[i],
+              i < kTenants ? Status::kOk : Status::kQuotaExceeded)
+        << i;
+  EXPECT_EQ(statuses.back(), Status::kOk);
+  EXPECT_TRUE(group.IsCached(unlimited));
+  for (uint64_t tenant = 1; tenant <= kTenants; ++tenant)
+    EXPECT_EQ(group.TenantUsedBytes(tenant), 6u) << tenant;
+  EXPECT_EQ(group.TenantQuotaRejections(), kTenants);
 }
