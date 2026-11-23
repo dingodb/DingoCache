@@ -21,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+#include "client/item_status.h"
 #include "client/key_map.h"
 #include "utils/con_hash.h"
 #include "client/node_dedup.h"
@@ -97,9 +98,13 @@ class KVClient {
   bool Remove(const std::string& key);
 
   // Batched, concurrently fanned out across owning nodes. Per-item results;
-  // zero-length PUT values fail independently before routing.
-  std::vector<bool> BatchPut(const std::vector<KvPutItem>& items);
-  std::vector<bool> BatchGet(const std::vector<KvGetItem>& items);  // hit/miss
+  // zero-length PUT values fail independently before routing. The batch
+  // calls with a `status` argument also report each item's outcome there
+  // (resized to the item count; see item_status.h).
+  std::vector<bool> BatchPut(const std::vector<KvPutItem>& items,
+                             std::vector<ItemStatus>* status = nullptr);
+  std::vector<bool> BatchGet(const std::vector<KvGetItem>& items,
+                             std::vector<ItemStatus>* status = nullptr);
   // Variable-size batched get. items[i].n is the buffer CAPACITY (not the exact
   // payload size); out_lens (if non-null) receives the actual stored payload
   // length per item. Per-item hit/miss like BatchGet, but it accepts any stored
@@ -107,7 +112,8 @@ class KVClient {
   // reads back unfull/variable chunks. Keeps the RDMA zero-copy datapath for
   // full-size items (same RangeInto path as BatchGet).
   std::vector<bool> BatchGetAuto(const std::vector<KvGetItem>& items,
-                                 std::vector<size_t>* out_lens);
+                                 std::vector<size_t>* out_lens,
+                                 std::vector<ItemStatus>* status = nullptr);
   std::vector<bool> BatchExist(const std::vector<std::string>& keys);
 
   // ---- Retention (kRetain) ----
@@ -148,13 +154,15 @@ class KVClient {
   // key, group by node, zero-copy bounded multi-WR gather where required).
   // Descriptor count is arbitrary; zero total size or a byte-sum overflow fails
   // the item before routing.
-  std::vector<bool> BatchPutSg(const std::vector<KvPutItemSg>& items);
+  std::vector<bool> BatchPutSg(const std::vector<KvPutItemSg>& items,
+                               std::vector<ItemStatus>* status = nullptr);
   // Scatter-gather variable-size batch get: each key's stored blob is scattered
   // across its N destination segments in order. Mirrors BatchGetAuto and accepts
   // a stored size <= the checked sum(caps). Descriptor count is arbitrary;
   // overflow is a miss. out_lens receives the true length (0 on miss).
   std::vector<bool> BatchGetAutoSg(const std::vector<KvGetItemSg>& items,
-                                   std::vector<size_t>* out_lens);
+                                   std::vector<size_t>* out_lens,
+                                   std::vector<ItemStatus>* status = nullptr);
 
   // Batch fan-out worker count of TCP batches and RDMA writes; RDMA reads
   // are bounded by DFKV_RDMA_READ_WORKERS instead. 0 (the default) = auto:
@@ -251,12 +259,15 @@ class KVClient {
                              uint64_t generation, bool ring_held);
   // Scalar transport bodies. Public scalar methods add exactly one metric;
   // TCP batch fan-out calls these bodies so it cannot double-count each key.
-  bool PutDirect(const std::string& key, const void* value, size_t n);
-  bool GetDirect(const std::string& key, void* out, size_t n);
+  // `status`, when given, receives the item's outcome.
+  bool PutDirect(const std::string& key, const void* value, size_t n,
+                 ItemStatus* status = nullptr);
+  bool GetDirect(const std::string& key, void* out, size_t n,
+                 ItemStatus* status = nullptr);
   bool GetAutoDirect(const std::string& key, std::string* out,
                      size_t max_bytes);
   bool GetAutoDirect(const std::string& key, void* out, size_t cap,
-                     size_t* out_len);
+                     size_t* out_len, ItemStatus* status = nullptr);
   bool ExistDirect(const std::string& key, Status* status);
   bool RemoveDirect(const std::string& key);
   void InvalidateRendezvous(const BlockKey& key);
@@ -267,15 +278,19 @@ class KVClient {
   // and rendezvous paths. on_hit(i), when given, runs as soon as item i is a
   // final hit (its destination holds the value, and the auto form's
   // *out_lens entry is not yet written: the length is passed), possibly on a
-  // worker thread and concurrently for other items.
+  // worker thread and concurrently for other items. `status`, when given,
+  // points at one outcome per item.
   std::vector<bool> BatchGetDirect(
       const std::vector<KvGetItem>& items,
-      const std::function<void(size_t)>& on_hit = nullptr);
+      const std::function<void(size_t)>& on_hit = nullptr,
+      ItemStatus* status = nullptr);
   std::vector<bool> BatchGetAutoDirect(
       const std::vector<KvGetItem>& items, std::vector<size_t>* out_lens,
-      const std::function<void(size_t, size_t)>& on_hit = nullptr);
+      const std::function<void(size_t, size_t)>& on_hit = nullptr,
+      ItemStatus* status = nullptr);
   std::vector<bool> BatchGetAutoSgDirect(const std::vector<KvGetItemSg>& items,
-                                         std::vector<size_t>* out_lens);
+                                         std::vector<size_t>* out_lens,
+                                         ItemStatus* status = nullptr);
   std::vector<bool> BatchExistDirect(const std::vector<std::string>& keys,
                                      std::vector<Status>* statuses);
   GpuNodeDedup* GpuDedup(const void* device_dst_hint);

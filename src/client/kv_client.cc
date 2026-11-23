@@ -718,10 +718,16 @@ bool KVClient::Put(const std::string& key, const void* value, size_t n) {
   return ok;
 }
 
-bool KVClient::PutDirect(const std::string& key, const void* value, size_t n) {
+bool KVClient::PutDirect(const std::string& key, const void* value, size_t n,
+                         ItemStatus* status) {
+  ItemStatus unused;
+  ItemStatus& outcome = status ? *status : unused;
+  outcome = ItemStatus::kBadArgument;
   if (key.empty() || n == 0 || value == nullptr) return false;
+  outcome = ItemStatus::kNoRoute;
   std::string node = Route(key);
   if (node.empty()) return false;
+  outcome = ItemStatus::kPeerCooling;
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
   const BlockKey bk = block_key_(key);
@@ -732,6 +738,7 @@ bool KVClient::PutDirect(const std::string& key, const void* value, size_t n) {
   } else {
     st = t_->Cache(node, bk, value, n);
   }
+  outcome = ToItemStatus(st);
   ReportPeer(node, st);
   if (st == Status::kIOError) {
     return false;
@@ -749,9 +756,16 @@ bool KVClient::Get(const std::string& key, void* out, size_t n) {
   return hit;
 }
 
-bool KVClient::GetDirect(const std::string& key, void* out, size_t n) {
+bool KVClient::GetDirect(const std::string& key, void* out, size_t n,
+                         ItemStatus* status) {
+  ItemStatus unused;
+  ItemStatus& outcome = status ? *status : unused;
+  outcome = ItemStatus::kBadArgument;
+  if (key.empty()) return false;  // as PUT
+  outcome = ItemStatus::kNoRoute;
   std::string node = Route(key);
   if (node.empty()) return false;
+  outcome = ItemStatus::kPeerCooling;
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
   const BlockKey bk = block_key_(key);
@@ -762,6 +776,7 @@ bool KVClient::GetDirect(const std::string& key, void* out, size_t n) {
   std::vector<uint64_t> value_lens;
   const Status st = t_->RangeInto(node, keys, dsts, &value_lens)[0];
   if (!value_lens.empty()) value_len = value_lens[0];
+  outcome = ReadItemStatus(st, value_len, n, /*exact=*/true);
   ReportPeer(node, st);
   if (st == Status::kIOError) {
     return false;
@@ -820,10 +835,16 @@ bool KVClient::GetAuto(const std::string& key, void* out, size_t cap,
 }
 
 bool KVClient::GetAutoDirect(const std::string& key, void* out, size_t cap,
-                             size_t* out_len) {
+                             size_t* out_len, ItemStatus* status) {
+  ItemStatus unused;
+  ItemStatus& outcome = status ? *status : unused;
   if (out_len) *out_len = 0;
+  outcome = ItemStatus::kBadArgument;
+  if (key.empty()) return false;  // as PUT
+  outcome = ItemStatus::kNoRoute;
   std::string node = Route(key);
   if (node.empty()) return false;
+  outcome = ItemStatus::kPeerCooling;
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
   const BlockKey bk = block_key_(key);
@@ -834,6 +855,7 @@ bool KVClient::GetAutoDirect(const std::string& key, void* out, size_t cap,
   std::vector<uint64_t> value_lens;
   const Status st = t_->RangeInto(node, keys, dsts, &value_lens)[0];
   if (!value_lens.empty()) value_len = value_lens[0];
+  outcome = ReadItemStatus(st, value_len, cap, /*exact=*/false);
   ReportPeer(node, st);
   if (st == Status::kIOError) {
     return false;
@@ -897,21 +919,32 @@ bool KVClient::RemoveDirect(const std::string& key) {
   return ok;
 }
 
-std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
+std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items,
+                                     std::vector<ItemStatus>* status) {
   auto t0 = std::chrono::steady_clock::now();
   const size_t N = items.size();
   std::vector<char> ok(N, 0);  // char (not vector<bool>) for thread-safe writes
+  ItemStatus* st = nullptr;
+  if (status) {
+    status->assign(N, ItemStatus::kNoRoute);
+    st = status->data();
+  }
   if (!t_->pipelined()) {  // TCP fan-out uses scalar bodies, not scalar metrics.
     RunParallel(N, BatchWorkers(N), [&](size_t i) {
-      ok[i] = PutDirect(items[i].key, items[i].value, items[i].n) ? 1 : 0;
+      ok[i] = PutDirect(items[i].key, items[i].value, items[i].n,
+                        st ? st + i : nullptr)
+                  ? 1
+                  : 0;
     });
   } else {
   // RDMA: group by node and scatter-send raw caller values without copying.
   std::map<std::string, std::vector<size_t>> by_node;
   for (size_t i = 0; i < N; ++i) {
     if (items[i].key.empty() || items[i].n == 0 ||
-        items[i].value == nullptr)
+        items[i].value == nullptr) {
+      if (st) st[i] = ItemStatus::kBadArgument;
       continue;
+    }
     std::string node = Route(items[i].key);
     if (node.empty()) continue;
     by_node[node].push_back(i);
@@ -919,9 +952,13 @@ std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
   std::vector<std::pair<std::string, std::vector<size_t>>> groups(by_node.begin(), by_node.end());
   RunParallel(groups.size(), BatchWorkers(groups.size()), [&](size_t g) {
     const std::string& node = groups[g].first;
-    uint64_t now = NowMs();
-    if (!health_.Healthy(node, now)) return;
     const std::vector<size_t>& idx = groups[g].second;
+    uint64_t now = NowMs();
+    if (!health_.Healthy(node, now)) {
+      if (st)
+        for (size_t k : idx) st[k] = ItemStatus::kPeerCooling;
+      return;
+    }
     std::vector<CacheSrc> srcs;
     srcs.reserve(idx.size());
     for (size_t k : idx)
@@ -930,6 +967,7 @@ std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
     std::vector<Status> sts = t_->CacheFrom(node, srcs);
     for (size_t m = 0; m < idx.size(); ++m) {
       ok[idx[m]] = (sts[m] == Status::kOk) ? 1 : 0;
+      if (st) st[idx[m]] = ToItemStatus(sts[m]);
       if (ok[idx[m]]) InvalidateRendezvous(srcs[m].key);
     }
     ReportPeer(node, sts);
@@ -941,10 +979,16 @@ std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
                      std::vector<bool>(ok.begin(), ok.end()), bytes);
 }
 
-std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
+std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items,
+                                     std::vector<ItemStatus>* status) {
   const auto t0 = std::chrono::steady_clock::now();
+  ItemStatus* st = nullptr;
+  if (status) {
+    status->assign(items.size(), ItemStatus::kNoRoute);
+    st = status->data();
+  }
   if (!dedup_) {
-    auto result = BatchGetDirect(items);
+    auto result = BatchGetDirect(items, nullptr, st);
     uint64_t bytes = 0;
     for (size_t i = 0; i < result.size(); ++i)
       if (result[i]) bytes += items[i].n;
@@ -975,6 +1019,7 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
                           static_cast<char*>(items[i].out), &tokens[i])) {
       case NodeDedup::Role::kHit:
         res[i] = true;
+        if (st) st[i] = ItemStatus::kOk;
         break;
       case NodeDedup::Role::kFetch:
         fetch_map.push_back(i);
@@ -992,14 +1037,16 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
     // this batch must not cost it the keys already here. Publishing is the
     // same lock-free protocol other processes run concurrently; a key that
     // is not a hit in the end is aborted once the batch is done.
+    std::vector<ItemStatus> fst(st ? fetch_items.size() : 0);
     auto r = BatchGetDirect(fetch_items, [&](size_t m) {
       const size_t i = fetch_map[m];
       dedup_->Publish(bks[i], NodeDedup::Kind::kData, tokens[i],
                       static_cast<const char*>(items[i].out), items[i].n);
-    });
+    }, st ? fst.data() : nullptr);
     for (size_t m = 0; m < fetch_map.size(); ++m) {
       const size_t i = fetch_map[m];
       res[i] = r[m];
+      if (st) st[i] = fst[m];
       if (!r[m]) dedup_->Abort(bks[i], NodeDedup::Kind::kData, tokens[i]);
     }
   }
@@ -1014,14 +1061,19 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
       if (dedup_->WaitCopy(bks[i], items[i].n,
                            static_cast<char*>(items[i].out), deadline)) {
         res[i] = true;
+        if (st) st[i] = ItemStatus::kOk;
       } else {
         fb.push_back(i);
         rest.push_back(items[i]);
       }
     }
     if (!rest.empty()) {
-      auto rr = BatchGetDirect(rest);
-      for (size_t m = 0; m < fb.size(); ++m) res[fb[m]] = rr[m];
+      std::vector<ItemStatus> rst(st ? rest.size() : 0);
+      auto rr = BatchGetDirect(rest, nullptr, st ? rst.data() : nullptr);
+      for (size_t m = 0; m < fb.size(); ++m) {
+        res[fb[m]] = rr[m];
+        if (st) st[fb[m]] = rst[m];
+      }
     }
   }
   uint64_t bytes = 0;
@@ -1030,6 +1082,19 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
 }
 
 namespace {
+// Outcome of item m of a batched read; a transport that answered kOk without
+// a length for it gave nothing usable.
+template <typename Length>
+ItemStatus ReadItemStatusAt(const std::vector<Status>& sts,
+                            const std::vector<Length>& value_lens, size_t m,
+                            size_t size, bool exact) {
+  if (m >= sts.size()) return ItemStatus::kInvalid;
+  if (m >= value_lens.size())
+    return sts[m] == Status::kOk ? ItemStatus::kInvalid
+                                 : ToItemStatus(sts[m]);
+  return ReadItemStatus(sts[m], value_lens[m], size, exact);
+}
+
 // A read outcome the bounded miss retry is for: a block that read absent for
 // an instant while the node moved it between tiers, or a read lost to
 // connection turnover (see BatchGetDirect).
@@ -1040,12 +1105,16 @@ bool TransientReadMiss(Status st) {
 
 std::vector<bool> KVClient::BatchGetDirect(
     const std::vector<KvGetItem>& items,
-    const std::function<void(size_t)>& on_hit) {
+    const std::function<void(size_t)>& on_hit, ItemStatus* st) {
   const size_t N = items.size();
   std::vector<char> hit(N, 0);
+  if (st) std::fill(st, st + N, ItemStatus::kNoRoute);
   if (!t_->pipelined()) {  // TCP: parallelize across items with our own threads
     RunParallel(N, BatchWorkers(N), [&](size_t i) {
-      hit[i] = GetDirect(items[i].key, items[i].out, items[i].n) ? 1 : 0;
+      hit[i] = GetDirect(items[i].key, items[i].out, items[i].n,
+                         st ? st + i : nullptr)
+                   ? 1
+                   : 0;
       if (hit[i] && on_hit) on_hit(i);
     });
     return std::vector<bool>(hit.begin(), hit.end());
@@ -1057,6 +1126,10 @@ std::vector<bool> KVClient::BatchGetDirect(
   auto run_pass = [&](const std::vector<size_t>& todo) {
     std::map<std::pair<std::string, size_t>, std::vector<size_t>> by;
     for (size_t i : todo) {
+      if (items[i].key.empty()) {  // as PUT
+        if (st) st[i] = ItemStatus::kBadArgument;
+        continue;
+      }
       std::string node = Route(items[i].key);
       if (node.empty()) continue;
       by[{node, items[i].n}].push_back(i);
@@ -1067,10 +1140,14 @@ std::vector<bool> KVClient::BatchGetDirect(
     };
     RunReadScheduled(groups.size(), [&](size_t g) {
       const std::string& node = groups[g].first.first;
-      uint64_t now = NowMs();
-      if (!health_.Healthy(node, now)) return;
       const size_t n = groups[g].first.second;
       const std::vector<size_t>& idx = groups[g].second;
+      uint64_t now = NowMs();
+      if (!health_.Healthy(node, now)) {
+        if (st)
+          for (size_t k : idx) st[k] = ItemStatus::kPeerCooling;
+        return;
+      }
       std::vector<BlockKey> keys;
       std::vector<RangeDst> dsts;
       keys.reserve(idx.size());
@@ -1086,6 +1163,7 @@ std::vector<bool> KVClient::BatchGetDirect(
       std::vector<Status> sts = t_->RangeInto(node, keys, dsts, &value_lens);
       ReportPeer(node, sts);
       for (size_t m = 0; m < idx.size(); ++m) {
+        if (st) st[idx[m]] = ReadItemStatusAt(sts, value_lens, m, n, true);
         retry[idx[m]] = TransientReadMiss(sts[m]);
         if (sts[m] == Status::kOk && m < value_lens.size() &&
             value_lens[m] == n) {
@@ -1122,11 +1200,17 @@ std::vector<bool> KVClient::BatchGetDirect(
 }
 
 std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
-                                         std::vector<size_t>* out_lens) {
+                                         std::vector<size_t>* out_lens,
+                                         std::vector<ItemStatus>* status) {
   const auto t0 = std::chrono::steady_clock::now();
+  ItemStatus* st = nullptr;
+  if (status) {
+    status->assign(items.size(), ItemStatus::kNoRoute);
+    st = status->data();
+  }
   if (!dedup_) {
     std::vector<size_t> lengths;
-    auto result = BatchGetAutoDirect(items, &lengths);
+    auto result = BatchGetAutoDirect(items, &lengths, nullptr, st);
     uint64_t bytes = 0;
     for (size_t length : lengths) bytes += length;
     if (out_lens) *out_lens = std::move(lengths);
@@ -1156,6 +1240,7 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
       case NodeDedup::Role::kHit:
         res[i] = true;
         lens[i] = got;
+        if (st) st[i] = ItemStatus::kOk;
         break;
       case NodeDedup::Role::kFetch:
         fetch_map.push_back(i);
@@ -1170,15 +1255,17 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
   if (!fetch_items.empty()) {
     // Published key by key as they arrive, as in BatchGet.
     std::vector<size_t> flens;
+    std::vector<ItemStatus> fst(st ? fetch_items.size() : 0);
     auto r = BatchGetAutoDirect(
         fetch_items, &flens, [&](size_t m, size_t length) {
           const size_t i = fetch_map[m];
           dedup_->Publish(bks[i], NodeDedup::Kind::kData, tokens[i],
                           static_cast<const char*>(items[i].out), length);
-        });
+        }, st ? fst.data() : nullptr);
     for (size_t m = 0; m < fetch_map.size(); ++m) {
       const size_t i = fetch_map[m];
       res[i] = r[m];
+      if (st) st[i] = fst[m];
       if (r[m])
         lens[i] = flens[m];
       else
@@ -1197,6 +1284,7 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
                                deadline)) {
         res[i] = true;
         lens[i] = got;
+        if (st) st[i] = ItemStatus::kOk;
       } else {
         fb.push_back(i);
         rest.push_back(items[i]);
@@ -1204,10 +1292,13 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
     }
     if (!rest.empty()) {
       std::vector<size_t> rl;
-      auto rr = BatchGetAutoDirect(rest, &rl);
+      std::vector<ItemStatus> rst(st ? rest.size() : 0);
+      auto rr = BatchGetAutoDirect(rest, &rl, nullptr,
+                                   st ? rst.data() : nullptr);
       for (size_t m = 0; m < fb.size(); ++m) {
         res[fb[m]] = rr[m];
         if (rr[m]) lens[fb[m]] = rl[m];
+        if (st) st[fb[m]] = rst[m];
       }
     }
   }
@@ -1219,14 +1310,16 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
 
 std::vector<bool> KVClient::BatchGetAutoDirect(
     const std::vector<KvGetItem>& items, std::vector<size_t>* out_lens,
-    const std::function<void(size_t, size_t)>& on_hit) {
+    const std::function<void(size_t, size_t)>& on_hit, ItemStatus* st) {
   const size_t N = items.size();
   std::vector<char> hit(N, 0);
   std::vector<size_t> lens(N, 0);  // distinct indices => thread-safe writes
+  if (st) std::fill(st, st + N, ItemStatus::kNoRoute);
   if (!t_->pipelined()) {  // TCP: parallelize per item with our own threads.
     RunParallel(N, BatchWorkers(N), [&](size_t i) {
       size_t got = 0;
-      if (GetAutoDirect(items[i].key, items[i].out, items[i].n, &got)) {
+      if (GetAutoDirect(items[i].key, items[i].out, items[i].n, &got,
+                        st ? st + i : nullptr)) {
         hit[i] = 1;
         lens[i] = got;
         if (on_hit) on_hit(i, got);
@@ -1243,6 +1336,10 @@ std::vector<bool> KVClient::BatchGetAutoDirect(
   auto run_pass = [&](const std::vector<size_t>& todo) {
   std::map<std::pair<std::string, size_t>, std::vector<size_t>> by;
   for (size_t i : todo) {
+    if (items[i].key.empty()) {  // as PUT
+      if (st) st[i] = ItemStatus::kBadArgument;
+      continue;
+    }
     std::string node = Route(items[i].key);
     if (node.empty()) continue;
     by[{node, items[i].n}].push_back(i);
@@ -1253,10 +1350,14 @@ std::vector<bool> KVClient::BatchGetAutoDirect(
   };
   RunReadScheduled(groups.size(), [&](size_t g) {
     const std::string& node = groups[g].first.first;
-    uint64_t now = NowMs();
-    if (!health_.Healthy(node, now)) return;
     const size_t cap = groups[g].first.second;
     const std::vector<size_t>& idx = groups[g].second;
+    uint64_t now = NowMs();
+    if (!health_.Healthy(node, now)) {
+      if (st)
+        for (size_t k : idx) st[k] = ItemStatus::kPeerCooling;
+      return;
+    }
     std::vector<BlockKey> keys;
     std::vector<RangeDst> dsts;
     keys.reserve(idx.size());
@@ -1270,6 +1371,7 @@ std::vector<bool> KVClient::BatchGetAutoDirect(
     std::vector<Status> sts = t_->RangeInto(node, keys, dsts, &value_lens);
     ReportPeer(node, sts);
     for (size_t m = 0; m < idx.size(); ++m) {
+      if (st) st[idx[m]] = ReadItemStatusAt(sts, value_lens, m, cap, false);
       retry[idx[m]] = TransientReadMiss(sts[m]);
       if (sts[m] != Status::kOk || m >= value_lens.size() ||
           value_lens[m] > cap)
@@ -2513,10 +2615,16 @@ std::vector<bool> KVClient::BatchRemove(const std::vector<std::string>& keys) {
                      std::vector<bool>(ok.begin(), ok.end()), 0);
 }
 
-std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
+std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items,
+                                       std::vector<ItemStatus>* status) {
   auto t0 = std::chrono::steady_clock::now();
   const size_t N = items.size();
   std::vector<char> ok(N, 0);  // char (not vector<bool>) for thread-safe writes
+  ItemStatus* st = nullptr;
+  if (status) {
+    status->assign(N, ItemStatus::kNoRoute);
+    st = status->data();
+  }
 
   // Reject malformed writes and zero-total values before routing. Individual
   // empty SG segments are harmless when the complete object is non-empty.
@@ -2544,6 +2652,7 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
   std::map<std::string, std::vector<size_t>> by_node;
   for (size_t i = 0; i < N; ++i) {
     if (over[i]) {
+      if (st) st[i] = ItemStatus::kBadArgument;
       if (pernode_on)
         RecordPernodeNonIssued(
             unrouted.get(), PernodeNonIssuedReason::kInvalidInput, 1,
@@ -2575,6 +2684,8 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
     const std::vector<size_t>& idx = groups[g].second;
     uint64_t now = NowMs();
     if (!health_.Healthy(node, now)) {
+      if (st)
+        for (size_t k : idx) st[k] = ItemStatus::kPeerCooling;
       if (pernode_on)
         RecordPernodeNonIssued(
             &gstat[g], PernodeNonIssuedReason::kHealthCooldown, idx.size(),
@@ -2648,6 +2759,9 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
     for (size_t m = 0; m < idx.size(); ++m) {
       ok[idx[m]] =
           (m < sts.size() && sts[m] == Status::kOk) ? 1 : 0;
+      if (st)
+        st[idx[m]] = m < sts.size() ? ToItemStatus(sts[m])
+                                    : ItemStatus::kInvalid;
       if (ok[idx[m]]) InvalidateRendezvous(srcs[m].key);
     }
     ReportPeer(node, sts);
@@ -2709,8 +2823,14 @@ GpuNodeDedup* KVClient::GpuDedup(const void* device_dst_hint) {
 }
 
 std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items,
-                                           std::vector<size_t>* out_lens) {
+                                           std::vector<size_t>* out_lens,
+                                           std::vector<ItemStatus>* status) {
   const auto t0 = std::chrono::steady_clock::now();
+  ItemStatus* st = nullptr;
+  if (status) {
+    status->assign(items.size(), ItemStatus::kNoRoute);
+    st = status->data();
+  }
   // Init the GPU rendezvous only once an all-device SG destination shows up:
   // its first pointer selects the primary context for the arena. Mixed and
   // host-only SG items use the ordinary transport publication path.
@@ -2731,7 +2851,7 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
   GpuNodeDedup* gd = hint ? GpuDedup(hint) : nullptr;
   if (!gd || items.empty()) {
     std::vector<size_t> lengths;
-    auto result = BatchGetAutoSgDirect(items, &lengths);
+    auto result = BatchGetAutoSgDirect(items, &lengths, st);
     uint64_t bytes = 0;
     for (size_t length : lengths)
       AddMetricBytes(length, &bytes);
@@ -2780,6 +2900,7 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
       case GpuNodeDedup::Role::kHit:
         res[i] = true;
         lens[i] = got;
+        if (st) st[i] = ItemStatus::kOk;
         break;
       case GpuNodeDedup::Role::kFetch:
         fetch_map.push_back(i);
@@ -2793,7 +2914,9 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
   }
   if (!fetch_items.empty()) {
     std::vector<size_t> flens;
-    auto r = BatchGetAutoSgDirect(fetch_items, &flens);
+    std::vector<ItemStatus> fst(st ? fetch_items.size() : 0);
+    auto r = BatchGetAutoSgDirect(fetch_items, &flens,
+                                  st ? fst.data() : nullptr);
     // The fetch may have landed in these device destinations over GPUDirect.
     // Publishing gathers them with a CUDA copy, which must not run ahead of
     // those writes: order them first, once for the batch. If that cannot be
@@ -2808,6 +2931,7 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
       const size_t i = fetch_map[m];
       res[i] = r[m];
       if (r[m]) lens[i] = flens[m];
+      if (st) st[i] = fst[m];
       if (r[m] && settled) {
         segs_of(items[i]);
         gd->PublishSg(bks[i], tokens[i], segs.data(), segs.size(), flens[m]);
@@ -2839,6 +2963,7 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
     if (wits[m].ok) {
       res[i] = true;
       lens[i] = wits[m].got;
+      if (st) st[i] = ItemStatus::kOk;
     } else {
       fb.push_back(i);
     }
@@ -2848,10 +2973,12 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
     rest.reserve(fb.size());
     for (size_t i : fb) rest.push_back(items[i]);
     std::vector<size_t> rl;
-    auto rr = BatchGetAutoSgDirect(rest, &rl);
+    std::vector<ItemStatus> rst(st ? rest.size() : 0);
+    auto rr = BatchGetAutoSgDirect(rest, &rl, st ? rst.data() : nullptr);
     for (size_t m = 0; m < fb.size(); ++m) {
       res[fb[m]] = rr[m];
       if (rr[m]) lens[fb[m]] = rl[m];
+      if (st) st[fb[m]] = rst[m];
     }
   }
   // Per-batch split, opt-in (DFKV_CLIENT_NODE_DEDUP_LOG=1): the one line that
@@ -2886,10 +3013,12 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
 }
 
 std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>& items,
-                                                 std::vector<size_t>* out_lens) {
+                                                 std::vector<size_t>* out_lens,
+                                                 ItemStatus* st) {
   const size_t N = items.size();
   std::vector<char> hit(N, 0);
   std::vector<size_t> lens(N, 0);  // distinct indices => thread-safe writes
+  if (st) std::fill(st, st + N, ItemStatus::kNoRoute);
 
   // Per-node (ip:port) GET timing (DFKV_CLIENT_PERNODE_STATS=1, off by default):
   // accumulate keys/bytes/time by target server across all passes, emit one line
@@ -2927,6 +3056,7 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
     std::map<std::pair<std::string, size_t>, std::vector<size_t>> by;
     for (size_t i : todo) {
       if (over[i]) {
+        if (st) st[i] = ItemStatus::kBadArgument;
         if (pernode_on)
           RecordPernodeNonIssued(
               unrouted.get(), PernodeNonIssuedReason::kInvalidInput, 1,
@@ -2959,6 +3089,8 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
       const std::vector<size_t>& idx = groups[g].second;
       uint64_t now = NowMs();
       if (!health_.Healthy(node, now)) {
+        if (st)
+          for (size_t k : idx) st[k] = ItemStatus::kPeerCooling;
         if (pernode_on) {
           size_t fresh = 0;
           size_t first_fresh = 0;
@@ -3050,6 +3182,7 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
       ReportPeer(node, sts);
       for (size_t m = 0; m < idx.size(); ++m) {
         const size_t cap = groups[g].first.second;
+        if (st) st[idx[m]] = ReadItemStatusAt(sts, value_lens, m, cap, false);
         retry[idx[m]] = m < sts.size() && TransientReadMiss(sts[m]);
         if (m >= sts.size() || sts[m] != Status::kOk ||
             m >= value_lens.size() || value_lens[m] > cap)

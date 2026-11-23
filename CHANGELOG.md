@@ -3,6 +3,16 @@
 ## Unreleased
 
 
+- Client C ABI: per-key outcome codes. The batch calls report a key as hit
+  or not (0/1); a miss, a node in cooldown, an empty ring, a full disk, a
+  used-up quota, a refused request and an I/O error all read the same, so
+  an engine could not tell "recompute" from "back off". New
+  `dfkv_batch_put_st`, `dfkv_batch_get_st`, `dfkv_batch_get_auto_st`,
+  `dfkv_batch_put_sg_st` and `dfkv_batch_get_auto_sg_st` take one more
+  array, `out_status`, with a `DFKV_ST_*` code per key (the server's or
+  transport's answer, or the client's: length mismatch, peer cooling, no
+  route, bad argument). The existing calls and their results are unchanged.
+
 - Client, host dedup: a key is handed to the processes waiting for it as
   soon as it has arrived, not when the fetching process's whole batch has.
   A waiter's budget (`DFKV_NODE_DEDUP_WAIT_MS`, 500 ms) covers one batch; a

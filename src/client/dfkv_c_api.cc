@@ -8,6 +8,7 @@
 #include <utility>
 #include <vector>
 
+#include "client/item_status.h"
 #include "client/kv_client.h"
 #include "common/membership.h"
 #include "common/version.h"
@@ -102,6 +103,45 @@ template <class T>
 void ZeroArray(T* output, int n) {
   if (!output || n <= 0) return;
   for (int i = 0; i < n; ++i) output[i] = 0;
+}
+
+static_assert(DFKV_ST_OK == static_cast<int>(dfkv::ItemStatus::kOk) &&
+                  DFKV_ST_NOT_FOUND ==
+                      static_cast<int>(dfkv::ItemStatus::kNotFound) &&
+                  DFKV_ST_CACHE_FULL ==
+                      static_cast<int>(dfkv::ItemStatus::kCacheFull) &&
+                  DFKV_ST_QUOTA_EXCEEDED ==
+                      static_cast<int>(dfkv::ItemStatus::kQuotaExceeded) &&
+                  DFKV_ST_IO_ERROR ==
+                      static_cast<int>(dfkv::ItemStatus::kIOError) &&
+                  DFKV_ST_INVALID ==
+                      static_cast<int>(dfkv::ItemStatus::kInvalid) &&
+                  DFKV_ST_RESOURCE_EXHAUSTED ==
+                      static_cast<int>(dfkv::ItemStatus::kResourceExhausted) &&
+                  DFKV_ST_NO_COMPATIBLE_RAIL ==
+                      static_cast<int>(dfkv::ItemStatus::kNoCompatibleRail) &&
+                  DFKV_ST_LENGTH_MISMATCH ==
+                      static_cast<int>(dfkv::ItemStatus::kLengthMismatch) &&
+                  DFKV_ST_PEER_COOLING ==
+                      static_cast<int>(dfkv::ItemStatus::kPeerCooling) &&
+                  DFKV_ST_NO_ROUTE ==
+                      static_cast<int>(dfkv::ItemStatus::kNoRoute) &&
+                  DFKV_ST_BAD_ARGUMENT ==
+                      static_cast<int>(dfkv::ItemStatus::kBadArgument),
+              "the C codes are the ItemStatus values");
+
+// Slots the C layer rejects before the client sees them keep this code.
+void FillBadArgument(uint8_t* out_status, int n) {
+  if (!out_status || n <= 0) return;
+  for (int i = 0; i < n; ++i)
+    out_status[i] = static_cast<uint8_t>(dfkv::ItemStatus::kBadArgument);
+}
+
+void CopyStatus(const std::vector<dfkv::ItemStatus>& status,
+                const std::vector<size_t>& positions, uint8_t* out_status) {
+  if (!out_status) return;
+  for (size_t i = 0; i < positions.size() && i < status.size(); ++i)
+    out_status[positions[i]] = static_cast<uint8_t>(status[i]);
 }
 }  // namespace
 
@@ -269,10 +309,12 @@ uint64_t dfkv_max_block_bytes(dfkv_client_t c) {
   });
 }
 
-int dfkv_batch_put(dfkv_client_t c, const void* const* keys,
-                   const uint64_t* key_lens, const void** ptrs,
-                   const uint64_t* sizes, int n, int* out_ok) {
+static int BatchPutC(dfkv_client_t c, const void* const* keys,
+                     const uint64_t* key_lens, const void** ptrs,
+                     const uint64_t* sizes, int n, int* out_ok,
+                     uint8_t* out_status) {
   ZeroArray(out_ok, n);
+  FillBadArgument(out_status, n);
   return NoThrow(-1, [&] {
     if (!c || n < 0) return -1;
     if (n > 0 && (!keys || !key_lens || !ptrs || !sizes || !out_ok)) return -1;
@@ -288,17 +330,22 @@ int dfkv_batch_put(dfkv_client_t c, const void* const* keys,
       items.push_back({CopyKey(keys[i], key_lens[i]), ptrs[i],
                        static_cast<size_t>(sizes[i])});
     }
-    const auto result = static_cast<KVClient*>(c)->BatchPut(items);
+    std::vector<dfkv::ItemStatus> status;
+    const auto result = static_cast<KVClient*>(c)->BatchPut(
+        items, out_status ? &status : nullptr);
+    CopyStatus(status, positions, out_status);
     for (size_t i = 0; i < positions.size() && i < result.size(); ++i)
       out_ok[positions[i]] = result[i] ? 1 : 0;
     return 0;
   });
 }
 
-int dfkv_batch_get(dfkv_client_t c, const void* const* keys,
-                   const uint64_t* key_lens, void** ptrs,
-                   const uint64_t* sizes, int n, int* out_hit) {
+static int BatchGetC(dfkv_client_t c, const void* const* keys,
+                     const uint64_t* key_lens, void** ptrs,
+                     const uint64_t* sizes, int n, int* out_hit,
+                     uint8_t* out_status) {
   ZeroArray(out_hit, n);
+  FillBadArgument(out_status, n);
   return NoThrow(-1, [&] {
     if (!c || n < 0) return -1;
     if (n > 0 && (!keys || !key_lens || !ptrs || !sizes || !out_hit)) return -1;
@@ -314,18 +361,22 @@ int dfkv_batch_get(dfkv_client_t c, const void* const* keys,
       items.push_back({CopyKey(keys[i], key_lens[i]), ptrs[i],
                        static_cast<size_t>(sizes[i])});
     }
-    const auto result = static_cast<KVClient*>(c)->BatchGet(items);
+    std::vector<dfkv::ItemStatus> status;
+    const auto result = static_cast<KVClient*>(c)->BatchGet(
+        items, out_status ? &status : nullptr);
+    CopyStatus(status, positions, out_status);
     for (size_t i = 0; i < positions.size() && i < result.size(); ++i)
       out_hit[positions[i]] = result[i] ? 1 : 0;
     return 0;
   });
 }
 
-int dfkv_batch_get_auto(dfkv_client_t c, const void* const* keys,
-                        const uint64_t* key_lens, void** ptrs,
-                        const uint64_t* caps, int n, int* out_hit,
-                        uint64_t* out_len) {
+static int BatchGetAutoC(dfkv_client_t c, const void* const* keys,
+                         const uint64_t* key_lens, void** ptrs,
+                         const uint64_t* caps, int n, int* out_hit,
+                         uint64_t* out_len, uint8_t* out_status) {
   ZeroArray(out_hit, n);
+  FillBadArgument(out_status, n);
   ZeroArray(out_len, n);
   return NoThrow(-1, [&] {
     if (!c || n < 0) return -1;
@@ -345,7 +396,10 @@ int dfkv_batch_get_auto(dfkv_client_t c, const void* const* keys,
                        static_cast<size_t>(caps[i])});
     }
     std::vector<size_t> lengths;
-    const auto result = static_cast<KVClient*>(c)->BatchGetAuto(items, &lengths);
+    std::vector<dfkv::ItemStatus> status;
+    const auto result = static_cast<KVClient*>(c)->BatchGetAuto(
+        items, &lengths, out_status ? &status : nullptr);
+    CopyStatus(status, positions, out_status);
     for (size_t i = 0; i < positions.size() && i < result.size(); ++i) {
       out_hit[positions[i]] = result[i] ? 1 : 0;
       if (result[i] && i < lengths.size())
@@ -477,11 +531,12 @@ int dfkv_batch_remove(dfkv_client_t c, const void* const* keys,
   });
 }
 
-int dfkv_batch_put_sg(dfkv_client_t c, const void* const* keys,
-                      const uint64_t* key_lens, const void*** ptrs,
-                      const uint64_t** sizes, const int* num_bufs, int n,
-                      int* out_ok) {
+static int BatchPutSgC(dfkv_client_t c, const void* const* keys,
+                       const uint64_t* key_lens, const void*** ptrs,
+                       const uint64_t** sizes, const int* num_bufs, int n,
+                       int* out_ok, uint8_t* out_status) {
   ZeroArray(out_ok, n);
+  FillBadArgument(out_status, n);
   return NoThrow(-1, [&] {
     if (!c || n < 0) return -1;
     if (n > 0 &&
@@ -517,18 +572,23 @@ int dfkv_batch_put_sg(dfkv_client_t c, const void* const* keys,
       positions.push_back(static_cast<size_t>(i));
       items.push_back(std::move(item));
     }
-    const auto result = static_cast<KVClient*>(c)->BatchPutSg(items);
+    std::vector<dfkv::ItemStatus> status;
+    const auto result = static_cast<KVClient*>(c)->BatchPutSg(
+        items, out_status ? &status : nullptr);
+    CopyStatus(status, positions, out_status);
     for (size_t i = 0; i < positions.size() && i < result.size(); ++i)
       out_ok[positions[i]] = result[i] ? 1 : 0;
     return 0;
   });
 }
 
-int dfkv_batch_get_auto_sg(dfkv_client_t c, const void* const* keys,
+static int BatchGetAutoSgC(dfkv_client_t c, const void* const* keys,
                            const uint64_t* key_lens, void*** dsts,
                            const uint64_t** caps, const int* num_dsts, int n,
-                           int* out_hit, uint64_t* out_len) {
+                           int* out_hit, uint64_t* out_len,
+                           uint8_t* out_status) {
   ZeroArray(out_hit, n);
+  FillBadArgument(out_status, n);
   ZeroArray(out_len, n);
   return NoThrow(-1, [&] {
     if (!c || n < 0) return -1;
@@ -566,8 +626,10 @@ int dfkv_batch_get_auto_sg(dfkv_client_t c, const void* const* keys,
       items.push_back(std::move(item));
     }
     std::vector<size_t> lengths;
-    const auto result =
-        static_cast<KVClient*>(c)->BatchGetAutoSg(items, &lengths);
+    std::vector<dfkv::ItemStatus> status;
+    const auto result = static_cast<KVClient*>(c)->BatchGetAutoSg(
+        items, &lengths, out_status ? &status : nullptr);
+    CopyStatus(status, positions, out_status);
     for (size_t i = 0; i < positions.size() && i < result.size(); ++i) {
       out_hit[positions[i]] = result[i] ? 1 : 0;
       if (result[i] && i < lengths.size())
@@ -575,6 +637,92 @@ int dfkv_batch_get_auto_sg(dfkv_client_t c, const void* const* keys,
     }
     return 0;
   });
+}
+
+int dfkv_batch_put(dfkv_client_t c, const void* const* keys,
+                   const uint64_t* key_lens, const void** ptrs,
+                   const uint64_t* sizes, int n, int* out_ok) {
+  return BatchPutC(c, keys, key_lens, ptrs, sizes, n, out_ok, nullptr);
+}
+int dfkv_batch_put_st(dfkv_client_t c, const void* const* keys,
+                      const uint64_t* key_lens, const void** ptrs,
+                      const uint64_t* sizes, int n, int* out_ok,
+                      uint8_t* out_status) {
+  if (n > 0 && !out_status) {
+    ZeroArray(out_ok, n);
+    return -1;
+  }
+  return BatchPutC(c, keys, key_lens, ptrs, sizes, n, out_ok, out_status);
+}
+int dfkv_batch_get(dfkv_client_t c, const void* const* keys,
+                   const uint64_t* key_lens, void** ptrs,
+                   const uint64_t* sizes, int n, int* out_hit) {
+  return BatchGetC(c, keys, key_lens, ptrs, sizes, n, out_hit, nullptr);
+}
+int dfkv_batch_get_st(dfkv_client_t c, const void* const* keys,
+                      const uint64_t* key_lens, void** ptrs,
+                      const uint64_t* sizes, int n, int* out_hit,
+                      uint8_t* out_status) {
+  if (n > 0 && !out_status) {
+    ZeroArray(out_hit, n);
+    return -1;
+  }
+  return BatchGetC(c, keys, key_lens, ptrs, sizes, n, out_hit, out_status);
+}
+int dfkv_batch_get_auto(dfkv_client_t c, const void* const* keys,
+                        const uint64_t* key_lens, void** ptrs,
+                        const uint64_t* caps, int n, int* out_hit,
+                        uint64_t* out_len) {
+  return BatchGetAutoC(c, keys, key_lens, ptrs, caps, n, out_hit, out_len,
+                       nullptr);
+}
+int dfkv_batch_get_auto_st(dfkv_client_t c, const void* const* keys,
+                           const uint64_t* key_lens, void** ptrs,
+                           const uint64_t* caps, int n, int* out_hit,
+                           uint64_t* out_len, uint8_t* out_status) {
+  if (n > 0 && !out_status) {
+    ZeroArray(out_hit, n);
+    return -1;
+  }
+  return BatchGetAutoC(c, keys, key_lens, ptrs, caps, n, out_hit, out_len,
+                       out_status);
+}
+int dfkv_batch_put_sg(dfkv_client_t c, const void* const* keys,
+                      const uint64_t* key_lens, const void*** ptrs,
+                      const uint64_t** sizes, const int* num_bufs, int n,
+                      int* out_ok) {
+  return BatchPutSgC(c, keys, key_lens, ptrs, sizes, num_bufs, n, out_ok,
+                     nullptr);
+}
+int dfkv_batch_put_sg_st(dfkv_client_t c, const void* const* keys,
+                         const uint64_t* key_lens, const void*** ptrs,
+                         const uint64_t** sizes, const int* num_bufs, int n,
+                         int* out_ok, uint8_t* out_status) {
+  if (n > 0 && !out_status) {
+    ZeroArray(out_ok, n);
+    return -1;
+  }
+  return BatchPutSgC(c, keys, key_lens, ptrs, sizes, num_bufs, n, out_ok,
+                     out_status);
+}
+int dfkv_batch_get_auto_sg(dfkv_client_t c, const void* const* keys,
+                           const uint64_t* key_lens, void*** dsts,
+                           const uint64_t** caps, const int* num_dsts, int n,
+                           int* out_hit, uint64_t* out_len) {
+  return BatchGetAutoSgC(c, keys, key_lens, dsts, caps, num_dsts, n, out_hit,
+                         out_len, nullptr);
+}
+int dfkv_batch_get_auto_sg_st(dfkv_client_t c, const void* const* keys,
+                              const uint64_t* key_lens, void*** dsts,
+                              const uint64_t** caps, const int* num_dsts,
+                              int n, int* out_hit, uint64_t* out_len,
+                              uint8_t* out_status) {
+  if (n > 0 && !out_status) {
+    ZeroArray(out_hit, n);
+    return -1;
+  }
+  return BatchGetAutoSgC(c, keys, key_lens, dsts, caps, num_dsts, n, out_hit,
+                         out_len, out_status);
 }
 
 const char* dfkv_transport_mode(dfkv_client_t c) {
