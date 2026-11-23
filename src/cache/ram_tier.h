@@ -487,6 +487,11 @@ class RamTier {
   uint64_t Rebalanced() const { return rebalanced_.load(std::memory_order_relaxed); }
   uint64_t Evictions() const;
   uint64_t UsedBytes() const;   // arena slot + dedicated allocation bytes
+  // Payload bytes of the values resident in the arena and in dedicated
+  // allocations. UsedBytes() minus this is what slot rounding costs.
+  uint64_t PayloadBytes() const {
+    return payload_bytes_.load(std::memory_order_relaxed);
+  }
   size_t Count() const;
   size_t FlushBacklog() const;  // queued or flushing, not-yet-durable items
   uint64_t DirtyBytes() const {
@@ -771,6 +776,7 @@ class RamTier {
   bool reclaim_stop_ = false;
 
   std::atomic<uint64_t> budget_used_{0};
+  std::atomic<uint64_t> payload_bytes_{0};  // see PayloadBytes()
   std::atomic<uint64_t> large_used_{0};
   std::atomic<uint64_t> large_evictions_{0};
   std::atomic<uint64_t> promote_declined_{0}, reservations_aborted_{0};

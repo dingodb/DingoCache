@@ -1228,6 +1228,10 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_ram_used_bytes", "gauge",
            "Resident slot plus dedicated allocation bytes",
            ram_->UsedBytes());
+    metric("dfkv_ram_payload_bytes", "gauge",
+           "Payload bytes of the resident values; dfkv_ram_used_bytes minus "
+           "this is slot rounding",
+           ram_->PayloadBytes());
     metric("dfkv_ram_large_used_bytes", "gauge",
            "Resident dedicated oversized allocation bytes",
            ram_->large_used_bytes());

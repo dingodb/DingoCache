@@ -343,6 +343,7 @@ RAM 热层（**仅 `DFKV_RAM_TIER=1` 时输出**；关时无此系列，向后�
 | `dfkv_ram_arena_locked` | gauge | arena 是否锁在内存里（1/0）；为 0 时开了 swap 的主机在内存紧张时可能把 arena 换出 |
 | `dfkv_ram_arena_hugepage_bytes` | gauge | 预触页结束时 arena 里由透明大页承载的字节数，启动时取一次样，之后不更新（内核后台可能把剩下的 4K 页再合并成大页，这里不会反映）。接近 `dfkv_ram_arena_bytes` 表示基本都是大页（arena 不是 2 MiB 整数倍时尾部不足一个大页的部分是 4K 页）。为 0 有两种情况：申请了但没拿到（系统设置为 `never`）；或者没有申请、也就没有测量（`DFKV_RAM_TIER_HUGEPAGES=off`，或 arena 小于 2 MiB），这时系统设置若是 `always`，arena 实际仍在大页上 |
 | `dfkv_ram_used_bytes` / `dfkv_ram_large_used_bytes` | gauge | 已用（常驻 slot + dedicated 分配）/ 其中 dedicated 大对象已用——与上组预算行做水位比 |
+| `dfkv_ram_payload_bytes` | gauge | 常驻值的有效载荷字节数（arena 与 dedicated 合计）。`dfkv_ram_used_bytes` 减去它是 slot 取整的损失；减去 `dfkv_ram_large_used_bytes` 后与 `dfkv_ram_arena_bytes` 的比值是 arena 的实际装载率，大对象时可能远低于 used/arena（见 DEPLOY.md“大对象为主时调大 extent”） |
 
 > 关键运维信号：COLD `load_get_avg_ms` 骤降 + `dfkv_ram_hit_total` 上升 = RAM 热层生效；`dfkv_ram_put_bypass_total` 或 `dfkv_ram_flush_backlog` 持续升高 = flush 落盘带宽不足，需扩 flush 或降 PUT 速率（见 [docs/ARCHITECTURE.md](ARCHITECTURE.md) §6 背压）。
 

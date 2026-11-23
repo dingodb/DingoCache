@@ -1,6 +1,7 @@
 #include "utils/env_parse.h"
 #include "cache/ram_tier.h"
 
+#include <cassert>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -623,6 +624,7 @@ void RamTier::EraseEvictedLocked(
     if (it == s.index.end()) continue;
     NoteEvicted(it->second);
     ReleaseBudget(it->second.cap);
+    payload_bytes_.fetch_sub(it->second.len, std::memory_order_relaxed);
     s.index.erase(it);
   }
 }
@@ -682,6 +684,7 @@ void RamTier::ReclaimLargeFor(uint64_t bytes) {
       if (entry.durable && entry.send_pins == 0 && !entry.remove_pending) {
         NoteEvicted(entry);
         ReleaseLargeBudget(entry.cap);
+        payload_bytes_.fetch_sub(entry.len, std::memory_order_relaxed);
         s.index.erase(it);
         large_evictions_.fetch_add(1, std::memory_order_relaxed);
       } else {
@@ -1003,7 +1006,12 @@ RamTier::Admission RamTier::Admit(
         }
         completion->cv.notify_all();
       }
-      s.index.emplace(key, std::move(e));
+      payload_bytes_.fetch_add(len, std::memory_order_relaxed);
+      // Every index insert is new (the writing set and the existing entry stop
+      // a duplicate earlier); the payload gauge relies on it.
+      const bool inserted = s.index.emplace(key, std::move(e)).second;
+      assert(inserted);
+      (void)inserted;
       QItem queued;
       queued.key = key;
       queued.lane = lane;
@@ -1147,7 +1155,12 @@ bool RamTier::CommitReservation(
       entry.send_pins = 1;
       entry.completion = state.completion;
       CompletePut(state.completion, true);
-      s.index.emplace(state.key, std::move(entry));
+      payload_bytes_.fetch_add(entry.len, std::memory_order_relaxed);
+      // Every index insert is new (the writing set and the existing entry stop
+      // a duplicate earlier); the payload gauge relies on it.
+      const bool inserted = s.index.emplace(state.key, std::move(entry)).second;
+      assert(inserted);
+      (void)inserted;
       state.installed = true;
     } else {
       // Remove() canceled the promotion while storage was filling the slot.
@@ -1356,7 +1369,12 @@ bool RamTier::PutDurableImpl(const BlockKey& key, const void* data, size_t len,
       e.durable = true;
       e.completion = completion;
       CompletePut(completion, true);
-      s.index.emplace(key, std::move(e));
+      payload_bytes_.fetch_add(len, std::memory_order_relaxed);
+      // Every index insert is new (the writing set and the existing entry stop
+      // a duplicate earlier); the payload gauge relies on it.
+      const bool inserted = s.index.emplace(key, std::move(e)).second;
+      assert(inserted);
+      (void)inserted;
       if (large) NoteLargeLocked(s, key);
       if (!large) s.alloc->Unpin(key, slot_handle);
     } else if (!large) {
@@ -1558,6 +1576,7 @@ void RamTier::DropLocked(Shard& s, const BlockKey& key) {
   const bool large = !e.in_arena();
   if (!e.durable) SubDirty(e.lane, cap);
   if (!large) s.alloc->Remove(e.key);
+  payload_bytes_.fetch_sub(e.len, std::memory_order_relaxed);
   s.index.erase(it);
   if (large)
     ReleaseLargeBudget(cap);
