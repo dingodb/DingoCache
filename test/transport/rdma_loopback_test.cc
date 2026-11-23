@@ -9678,3 +9678,69 @@ TEST(RdmaRailAdmission, ACooledRailIsProbedInTheBackground) {
   ASSERT_TRUE(put("probe-after"));
   EXPECT_EQ(selections(), cooled_at + 2);
 }
+
+namespace {
+// RDS-09: what one GET's exact READ registration costs the server. Every
+// pull of a RAM-tier value registers that value (ibv_reg_mr) when the READY
+// goes out and deregisters it on RELEASE. Opt-in: set DFKV_RDMA_MR_BENCH to
+// the iterations per size.
+TEST(RdmaMrCost, ReadRegistrationPerGetBench) {
+  const char* requested = std::getenv("DFKV_RDMA_MR_BENCH");
+  if (requested == nullptr || *requested == '\0')
+    GTEST_SKIP() << "set DFKV_RDMA_MR_BENCH=<iterations> to run";
+  const int iterations = std::max(1, std::atoi(requested));
+  int devices = 0;
+  ibv_device** list = ibv_get_device_list(&devices);
+  if (list == nullptr || devices == 0) GTEST_SKIP() << "no RDMA device";
+  const char* wanted = std::getenv("DFKV_RDMA_DEV");
+  ibv_device* device = list[0];
+  for (int i = 0; wanted && i < devices; ++i)
+    if (std::strncmp(ibv_get_device_name(list[i]), wanted,
+                     std::strlen(ibv_get_device_name(list[i]))) == 0)
+      device = list[i];
+  ibv_context* context = ibv_open_device(device);
+  ASSERT_NE(context, nullptr);
+  ibv_pd* pd = ibv_alloc_pd(context);
+  ASSERT_NE(pd, nullptr);
+  std::printf("device %s, %d iterations per row (microseconds per GET: "
+              "register / deregister)\n",
+              ibv_get_device_name(device), iterations);
+  for (const size_t bytes : {size_t{64} << 10, size_t{1} << 20,
+                             size_t{4} << 20, size_t{16} << 20,
+                             size_t{64} << 20}) {
+    for (const bool huge : {false, true}) {
+      void* raw = nullptr;
+      const size_t align = huge ? (size_t{2} << 20) : 4096;
+      const size_t span = (bytes + align - 1) / align * align;
+      ASSERT_EQ(::posix_memalign(&raw, align, span), 0);
+      if (huge) ::madvise(raw, span, MADV_HUGEPAGE);
+      std::memset(raw, 0x5a, span);  // resident, as an arena value is
+      for (const bool local_write : {true, false}) {
+        const int access =
+            IBV_ACCESS_REMOTE_READ | (local_write ? IBV_ACCESS_LOCAL_WRITE : 0);
+        double reg_us = 0, dereg_us = 0;
+        for (int i = 0; i < iterations; ++i) {
+          const auto t0 = std::chrono::steady_clock::now();
+          ibv_mr* mr = ibv_reg_mr(pd, raw, bytes, access);
+          const auto t1 = std::chrono::steady_clock::now();
+          ASSERT_NE(mr, nullptr) << std::strerror(errno);
+          ASSERT_EQ(ibv_dereg_mr(mr), 0);
+          const auto t2 = std::chrono::steady_clock::now();
+          reg_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
+          dereg_us += std::chrono::duration<double, std::micro>(t2 - t1).count();
+        }
+        // The value's own transfer at 400 Gb/s, for scale.
+        const double wire_us = static_cast<double>(bytes) * 8 / 400e3;
+        std::printf("%6zu KiB %s %-22s reg %9.1f  dereg %9.1f  wire@400G %8.1f\n",
+                    bytes >> 10, huge ? "2M-pages" : "4K-pages",
+                    local_write ? "LOCAL_WRITE|REMOTE_READ" : "REMOTE_READ",
+                    reg_us / iterations, dereg_us / iterations, wire_us);
+      }
+      std::free(raw);
+    }
+  }
+  ibv_dealloc_pd(pd);
+  ibv_close_device(context);
+  ibv_free_device_list(list);
+}
+}  // namespace

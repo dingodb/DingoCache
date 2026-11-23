@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Server, RDMA: receive-pool chunks are on transparent huge pages
+  (`DFKV_RDMA_RECV_HUGEPAGES`, default on), as the RAM tier arena already
+  was. Every GET staged from disk and every leased PUT registers its range
+  of a chunk for that operation alone; measured on 400G InfiniBand, the
+  registration and deregistration of 4 MiB took about 0.3 ms on 4 KiB pages
+  and 0.05 ms on 2 MiB pages, of 64 MiB 2.4 ms and 0.4 ms (the transfer
+  itself: 0.08 ms and 1.3 ms). Below about 1 MiB both cost 20-40 µs, the
+  system call itself; avoiding that needs registrations that outlive one
+  operation, which this release does not do.
 - SGLang HiCache: a parked retention TTL lapses with its TTL (HIC-28). A
   `batch_touch` that finds pages not stored yet parks their TTL for the
   write; it never lapsed, so a page written long after the touch was
