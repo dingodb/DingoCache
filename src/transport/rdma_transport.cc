@@ -4002,6 +4002,11 @@ bool RdmaTransport::PullWindow(
       request.status = Status::kInvalid;
       request.too_large = true;
     }
+    // A shorter value an exact reader rejects anyway: report its length,
+    // READ nothing into the destination.
+    if (request.exact && request.mode == PullMode::kWholeObject &&
+        ready.value_len != request.capacity)
+      request.data_len = 0;
   }
 
   // One READ per live item per round preserves depth-wide pipelining without
@@ -4068,7 +4073,9 @@ bool RdmaTransport::PullWindow(
   for (size_t slot = 0; slot < width; ++slot) {
     const auto& state = states[slot];
     if (!state.grant) continue;
-    if (requests[slot].status == Status::kOk)
+    // An exact pull released without its READ is not one.
+    if (requests[slot].status == Status::kOk &&
+        !(requests[slot].exact && requests[slot].data_len == 0))
       pull_reads_.fetch_add(1, std::memory_order_relaxed);
     conn->Encode(ep.sbuf(releases++), WireOp::kPullRelease,
                  *requests[slot].key, 0, state.ready.slot_generation,
@@ -4097,7 +4104,7 @@ Status RdmaTransport::PullInto(
     const std::string& node, const BlockKey& key,
     const RangeDstSegment* segments, size_t segment_count, size_t capacity,
     Lane lane, uint64_t* value_len, std::string* out_dev, PullMode mode,
-    uint64_t offset, uint64_t length, uint64_t* data_len) {
+    uint64_t offset, uint64_t length, uint64_t* data_len, bool exact) {
   if (mode == PullMode::kWholeObject && capacity == 0)
     return Status::kInvalid;
   const auto peer = peer_topologies_->Snapshot(node);
@@ -4146,6 +4153,7 @@ Status RdmaTransport::PullInto(
     PullRequest request{&key, segments, segment_count, capacity, mode,
                         mode == PullMode::kWholeObject ? 0 : offset,
                         mode == PullMode::kWholeObject ? capacity : length};
+    request.exact = exact;
     rdma::RailCompletion failure = rdma::RailCompletion::kRailFailure;
     if ((mode == PullMode::kSlice && InjectLocalRailFailure(attempt)) ||
         !PullWindow(conn, &request, 1,
@@ -4208,7 +4216,9 @@ std::vector<Status> RdmaTransport::RangeInto(
         destination.payload, destination.n, destination.memory_kind};
     result[item] = PullInto(node, keys[item], &segment, 1, destination.n,
                             Lane::kData,
-                            value_lens ? &(*value_lens)[item] : nullptr);
+                            value_lens ? &(*value_lens)[item] : nullptr,
+                            nullptr, PullMode::kWholeObject, 0, 0, nullptr,
+                            destination.exact);
   }
   return result;
 }

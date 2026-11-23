@@ -330,6 +330,9 @@ class RdmaTransport : public Transport {
     uint64_t data_len = 0;
     // kInvalid set here because the stored value is larger than capacity.
     bool too_large = false;
+    // Whole object read only at exactly `capacity` bytes: a value of
+    // another length is released without a READ (see RangeDst::exact).
+    bool exact = false;
   };
   // One exclusively owned endpoint executes prepare, READ and RELEASE windows.
   // Failure leaves transient MRs with the endpoint until the caller fences it.
@@ -341,7 +344,7 @@ class RdmaTransport : public Transport {
                   std::string* out_dev = nullptr,
                   PullMode mode = PullMode::kWholeObject,
                   uint64_t offset = 0, uint64_t length = 0,
-                  uint64_t* data_len = nullptr);
+                  uint64_t* data_len = nullptr, bool exact = false);
   Status RoundTrip(const std::string& node, WireOp op, const BlockKey& key,
                    uint64_t offset, uint64_t length, const void* payload,
                    uint64_t payload_len, std::string* out,
