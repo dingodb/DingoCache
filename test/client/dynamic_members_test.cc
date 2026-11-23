@@ -271,6 +271,10 @@ struct HintRecordingTransport : dfkv::Transport {
   rdma::PeerTopologyStore topology_store{{"ib0"}, {{0}}, true};
   Status Cache(const std::string& peer, const dfkv::BlockKey&, const void*,
                size_t) override {
+    // As RdmaTransport::Acquire: under explicit tiers a peer without a
+    // published rail fails closed.
+    if (!rdma::HasRail(topology_store.Snapshot(peer)->peer_healthy))
+      return Status::kNoCompatibleRail;
     std::lock_guard<std::mutex> lock(mu);
     cache_peers.push_back(peer);
     return Status::kOk;
@@ -423,7 +427,7 @@ TEST(DynamicMembers, RailHealthChangePropagatesWithoutPlacementChurn) {
   EXPECT_TRUE(mds.only_topology_requests());
 }
 
-TEST(DynamicMembers, StableIdentityTracksAddressReplacementAndRemoval) {
+TEST(DynamicMembers, StableIdentityTracksAddressAndIdentityReplacement) {
   using P = std::vector<std::pair<std::string, std::string>>;
   MemberInfo peer{"stable-n1", "127.0.0.1", 28301, 1};
   peer.has_health = true;
@@ -475,15 +479,14 @@ TEST(DynamicMembers, StableIdentityTracksAddressReplacementAndRemoval) {
   EXPECT_EQ(address_snapshot->peer_id, "stable-n1");
   EXPECT_EQ(address_snapshot->generation, address_generation);
 
-  // The replace-all empty view removes the final identity even though the
-  // placement guard may deliberately retain its route.
+  // An empty view is refused by the placement guard, so the ring keeps the
+  // final identity, and so does the transport: nothing is retired.
   mds.SetMembers({});
-  ASSERT_TRUE(transport.WaitForPeerTopologies(6));
   ASSERT_TRUE(transport.WaitForPeerIdentitySets(4));
   client.StopMdsDiscovery();
 
   const auto updates = transport.PeerTopologies();
-  ASSERT_EQ(updates.size(), 6u);
+  ASSERT_EQ(updates.size(), 5u);
   EXPECT_EQ(updates[0].peer_id, "stable-n1");
   EXPECT_EQ(updates[0].peer_addr, "127.0.0.1:28301");
   EXPECT_TRUE(updates[0].present);
@@ -501,92 +504,12 @@ TEST(DynamicMembers, StableIdentityTracksAddressReplacementAndRemoval) {
   EXPECT_EQ(updates[4].peer_id, "replacement-n2");
   EXPECT_EQ(updates[4].peer_addr, "127.0.0.1:28302");
   EXPECT_TRUE(updates[4].present);
-  EXPECT_EQ(updates[5].peer_id, "replacement-n2");
-  EXPECT_EQ(updates[5].peer_addr, "127.0.0.1:28302");
-  EXPECT_EQ(updates[5].generation,
-            MembersTopologyEpoch(std::vector<MemberInfo>{}));
-  EXPECT_FALSE(updates[5].present);
   EXPECT_EQ(transport.PeerIdentitySets(),
             (std::vector<std::vector<std::string>>{
-                {"stable-n1"}, {"stable-n1"}, {"replacement-n2"}, {}}));
-  EXPECT_TRUE(transport.PeerSnapshot("127.0.0.1:28302")->peer_id.empty());
-}
-
-TEST(DynamicMembers, GuardRejectedShrinkInvalidatesOmittedRoutablePeers) {
-  using P = std::vector<std::pair<std::string, std::string>>;
-  std::vector<MemberInfo> peers;
-  for (int i = 0; i < 3; ++i) {
-    MemberInfo peer{"n" + std::to_string(i), "127.0.0.1",
-                    static_cast<uint32_t>(28201 + i), 1};
-    peer.has_health = true;
-    peer.health.ring_eligible = true;
-    peer.health.ib_devices = {{"ib0", 4, 5, true}};
-    peers.push_back(peer);
-  }
-  ScriptedTopologyMds mds(peers);
-  HintRecordingTransport transport;
-  KVClient client(P{}, Hdr(), &transport);
-  // Leave a full second between polls so this test observes the first
-  // guard-rejected shrink before the persistence threshold can adopt it.
-  client.StartMdsDiscovery({mds.endpoint()}, "guarded-shrink-test", 1000);
-
-  ASSERT_TRUE(transport.WaitForPeerTopologies(3));
-  ASSERT_TRUE(client.WaitForRing(5000));
-  ASSERT_TRUE(transport.WaitForHints(1));
-  ASSERT_EQ(transport.Hints(), std::vector<size_t>({3u}));
-  const uint64_t initial_generation =
-      MembersTopologyEpoch(std::vector<MemberInfo>{peers});
-
-  mds.SetMembers({peers[0]});
-  ASSERT_TRUE(transport.WaitForPeerTopologies(6));
-  client.StopMdsDiscovery();
-
-  const uint64_t shrink_generation =
-      MembersTopologyEpoch(std::vector<MemberInfo>{peers[0]});
-  ASSERT_NE(shrink_generation, initial_generation);
-  const std::vector<PeerTopology> updates = transport.PeerTopologies();
-  ASSERT_EQ(updates.size(), 6u);
-  for (size_t i = 3; i < 5; ++i) {
-    EXPECT_EQ(updates[i].generation, shrink_generation);
-    EXPECT_FALSE(updates[i].present);
-    EXPECT_FALSE(updates[i].complete);
-    EXPECT_TRUE(updates[i].rails.empty());
-  }
-  EXPECT_NE(updates[3].peer_id, updates[4].peer_id);
-  EXPECT_TRUE((updates[3].peer_id == "n1" || updates[3].peer_id == "n2"));
-  EXPECT_TRUE((updates[4].peer_id == "n1" || updates[4].peer_id == "n2"));
-  EXPECT_EQ(updates[5].peer_id, "n0");
-  EXPECT_EQ(updates[5].peer_addr, "127.0.0.1:28201");
-  EXPECT_EQ(updates[5].generation, shrink_generation);
-  EXPECT_TRUE(updates[5].present);
-  EXPECT_TRUE(updates[5].complete);
-  ASSERT_TRUE(transport.WaitForPeerIdentitySets(2));
-  EXPECT_EQ(transport.PeerIdentitySets(),
-            (std::vector<std::vector<std::string>>{
-                {"n0", "n1", "n2"}, {"n0"}}));
-
-  // No second placement hint: the guard retained all three routes. Explicit
-  // identity retirements remove their address snapshots, so the strict store's
-  // fallback keeps the omitted routes fail-closed without retaining state.
-  const auto omitted_two = transport.PeerSnapshot("127.0.0.1:28202");
-  const auto omitted_three = transport.PeerSnapshot("127.0.0.1:28203");
-  EXPECT_TRUE(omitted_two->peer_id.empty());
-  EXPECT_FALSE(omitted_two->complete);
-  EXPECT_TRUE(omitted_two->compatible.empty());
-  EXPECT_TRUE(omitted_three->peer_id.empty());
-  EXPECT_FALSE(omitted_three->complete);
-  EXPECT_TRUE(omitted_three->compatible.empty());
-  ASSERT_EQ(transport.Hints(), std::vector<size_t>({3u}));
-  const char value = 'v';
-  for (int i = 0; i < 1000; ++i)
-    ASSERT_TRUE(client.Put("held-" + std::to_string(i), &value, 1));
-  const std::vector<std::string> routed = transport.CachePeers();
-  EXPECT_NE(std::find(routed.begin(), routed.end(), "127.0.0.1:28201"),
-            routed.end());
-  EXPECT_NE(std::find(routed.begin(), routed.end(), "127.0.0.1:28202"),
-            routed.end());
-  EXPECT_NE(std::find(routed.begin(), routed.end(), "127.0.0.1:28203"),
-            routed.end());
+                {"stable-n1"}, {"stable-n1"}, {"replacement-n2"},
+                {"replacement-n2"}}));
+  EXPECT_EQ(transport.PeerSnapshot("127.0.0.1:28302")->peer_id,
+            "replacement-n2");
 }
 
 namespace {
@@ -611,6 +534,84 @@ bool Applied(ScriptedTopologyMds* mds) {
   return mds->WaitForAnswered(mds->Answered() + 3);
 }
 }  // namespace
+
+// A shrink the guard refuses (the typical case: etcd leases of live nodes
+// expired together) keeps the omitted peers on the ring. Their transport
+// topology must stay too, or under explicit rail tiers every request to them
+// fails kNoCompatibleRail until they register again: the guard would keep
+// the routes and lose the data path.
+TEST(DynamicMembers, GuardHeldPeersKeepTheirDataPath) {
+  using P = std::vector<std::pair<std::string, std::string>>;
+  std::vector<MemberInfo> peers;
+  for (int i = 0; i < 3; ++i) {
+    MemberInfo peer{"n" + std::to_string(i), "127.0.0.1",
+                    static_cast<uint32_t>(28211 + i), 1};
+    peer.has_health = true;
+    peer.health.ring_eligible = true;
+    peer.health.ib_devices = {{"ib0", 4, 5, true}};
+    peers.push_back(peer);
+  }
+  ScriptedTopologyMds mds(peers);
+  HintRecordingTransport transport;
+  KVClient client(P{}, Hdr(), &transport);
+  // A second between polls: the shrink is seen once and refused.
+  client.StartMdsDiscovery({mds.endpoint()}, "guard-held-test", 1000);
+  ASSERT_TRUE(transport.WaitForPeerTopologies(3));
+  ASSERT_TRUE(client.WaitForRing(5000));
+  ASSERT_TRUE(transport.WaitForPeerIdentitySets(1));
+
+  mds.SetMembers({peers[0]});
+  ASSERT_TRUE(transport.WaitForPeerIdentitySets(2));
+  client.StopMdsDiscovery();
+  ASSERT_EQ(transport.Hints(), std::vector<size_t>({3u}));
+
+  for (const auto& update : transport.PeerTopologies())
+    EXPECT_TRUE(update.present) << update.peer_id;
+  for (int i = 1; i < 3; ++i) {
+    const auto held = transport.PeerSnapshot(
+        "127.0.0.1:" + std::to_string(28211 + i));
+    EXPECT_EQ(held->peer_id, "n" + std::to_string(i));
+    EXPECT_TRUE(rdma::HasRail(held->peer_healthy));
+  }
+  EXPECT_EQ(transport.PeerIdentitySets().back(),
+            (std::vector<std::string>{"n0", "n1", "n2"}));
+  const char value = 'v';
+  for (int i = 0; i < 300; ++i)
+    EXPECT_TRUE(client.Put("held-" + std::to_string(i), &value, 1)) << i;
+}
+
+// Once the guard believes the shrink, the omitted peers are retired.
+TEST(DynamicMembers, AnAdmittedShrinkRetiresTheOmittedPeers) {
+  using P = std::vector<std::pair<std::string, std::string>>;
+  std::vector<MemberInfo> peers;
+  for (int i = 0; i < 4; ++i) {
+    MemberInfo peer{"n" + std::to_string(i), "127.0.0.1",
+                    static_cast<uint32_t>(28221 + i), 1};
+    peer.has_health = true;
+    peer.health.ring_eligible = true;
+    peer.health.ib_devices = {{"ib0", 4, 5, true}};
+    peers.push_back(peer);
+  }
+  ScriptedTopologyMds mds(peers);
+  HintRecordingTransport transport;
+  KVClient client(P{}, Hdr(), &transport);
+  client.StartMdsDiscovery({mds.endpoint()}, "admitted-shrink-test", 10);
+  ASSERT_TRUE(transport.WaitForPeerTopologies(4));
+  ASSERT_TRUE(transport.WaitForHints(1));
+
+  mds.SetMembers({peers[0], peers[1], peers[2]});
+  ASSERT_TRUE(transport.WaitForHints(2));
+  ASSERT_TRUE(Applied(&mds));
+  client.StopMdsDiscovery();
+  EXPECT_EQ(transport.Hints(), std::vector<size_t>({4u, 3u}));
+  EXPECT_TRUE(transport.PeerSnapshot("127.0.0.1:28224")->peer_id.empty());
+  EXPECT_EQ(transport.PeerIdentitySets().back(),
+            (std::vector<std::string>{"n0", "n1", "n2"}));
+  bool retired = false;
+  for (const auto& update : transport.PeerTopologies())
+    retired = retired || (update.peer_id == "n3" && !update.present);
+  EXPECT_TRUE(retired);
+}
 
 // A change of one member must not invalidate what the transport holds for
 // the others. The pooled connections of a transport are bound to the
