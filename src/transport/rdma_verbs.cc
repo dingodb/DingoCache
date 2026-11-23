@@ -1342,34 +1342,58 @@ int RcEndpoint::WaitComp(ibv_wc* out, int max, int timeout_ms, int also_fd) {
     for (;;) {
       int got = ibv_poll_cq(cq_, max, out);
       if (got != 0) return ObserveCompletions(out, got);
-      pollfd pfds[2] = {{wake_rfd_, POLLIN, 0}, {also_fd, POLLIN, 0}};
-      if (::poll(pfds, also_fd >= 0 ? 2 : 1, 0) > 0) {
-        if (pfds[0].revents & POLLIN) return -1;
-        if (pfds[1].revents & POLLIN) return ObserveCompletions(out, 0);
+      // Wake() sets this before writing the pipe: no system call per spin.
+      if (woken_.load(std::memory_order_acquire)) return -1;
+      if (also_fd >= 0) {
+        pollfd pfd{also_fd, POLLIN, 0};
+        if (::poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN))
+          return ObserveCompletions(out, 0);
       }
       if (timeout_ms == 0) return ObserveCompletions(out, 0);
       if (timeout_ms > 0 && Clock::now() >= deadline)
         return ObserveCompletions(out, 0);
     }
   }
+  if (spin_us_ != 0 && timeout_ms != 0) {
+    // The spin comes out of the timeout, not on top of it.
+    const auto start = std::chrono::steady_clock::now();
+    auto spin_until = start + std::chrono::microseconds(spin_us_);
+    if (timeout_ms > 0)
+      spin_until = std::min(spin_until,
+                            start + std::chrono::milliseconds(timeout_ms));
+    do {
+      const int got = ibv_poll_cq(cq_, max, out);
+      if (got != 0) return ObserveCompletions(out, got);
+    } while (std::chrono::steady_clock::now() < spin_until &&
+             !woken_.load(std::memory_order_relaxed));
+    if (woken_.load(std::memory_order_acquire)) return -1;
+    if (timeout_ms > 0) {
+      const auto spent = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - start);
+      timeout_ms = static_cast<int>(
+          std::max<int64_t>(0, timeout_ms - spent.count()));
+      if (timeout_ms == 0) return ObserveCompletions(out, ibv_poll_cq(cq_, max, out));
+    }
+  }
   // One deadline for the call: a wake-up that brings no completion (a CQ
-  // event for one already reaped) waits only for what is left.
+  // event for one already reaped, a signal) waits only for what is left.
   const auto until = std::chrono::steady_clock::now() +
                      std::chrono::milliseconds(timeout_ms < 0 ? 0 : timeout_ms);
-  bool woken = false;  // a wake-up came and brought no completion
+  bool empty_wake = false;  // a wake-up came and brought no completion
   for (;;) {
     int got = ibv_poll_cq(cq_, max, out);
     if (got != 0) return ObserveCompletions(out, got);
     // No completion ready: arm notify, poll once more (close the race where a
     // completion arrived between the empty poll and the notify), then block on
     // the comp-channel fd OR the wake pipe (so Stop() can interrupt us).
+    notify_arms_.fetch_add(1, std::memory_order_relaxed);
     if (ibv_req_notify_cq(cq_, 0) != 0) return ObserveCompletions(out, -1);
     got = ibv_poll_cq(cq_, max, out);
     if (got != 0) return ObserveCompletions(out, got);
     pollfd pfds[3] = {{chan_->fd, POLLIN, 0}, {wake_rfd_, POLLIN, 0},
                       {also_fd, POLLIN, 0}};
     int wait_ms = timeout_ms;
-    if (timeout_ms > 0 && woken) {
+    if (timeout_ms > 0 && empty_wake) {
       // Rounded up: a 1 ms wait (the server's) must not become a spin.
       const auto left = std::chrono::duration_cast<std::chrono::microseconds>(
           until - std::chrono::steady_clock::now());
@@ -1377,7 +1401,10 @@ int RcEndpoint::WaitComp(ibv_wc* out, int max, int timeout_ms, int also_fd) {
     }
     int pr = ::poll(pfds, also_fd >= 0 ? 3 : 2, wait_ms);
     if (pr < 0) {
-      if (errno == EINTR) continue;
+      if (errno == EINTR) {
+        empty_wake = true;
+        continue;
+      }
       return ObserveCompletions(out, -1);
     }
     if (pr == 0)
@@ -1389,7 +1416,7 @@ int RcEndpoint::WaitComp(ibv_wc* out, int max, int timeout_ms, int also_fd) {
       if (ibv_get_cq_event(chan_, &ev_cq, &ev_ctx) != 0)
         return ObserveCompletions(out, -1);
       ibv_ack_cq_events(ev_cq, 1);
-      woken = true;
+      empty_wake = true;
     }
     if (pfds[2].revents & POLLIN)
       return ObserveCompletions(out, ibv_poll_cq(cq_, max, out));
@@ -1397,6 +1424,7 @@ int RcEndpoint::WaitComp(ibv_wc* out, int max, int timeout_ms, int also_fd) {
 }
 
 void RcEndpoint::Wake() {
+  woken_.store(true, std::memory_order_release);
   if (wake_wfd_ >= 0) { char b = 1; ssize_t n = ::write(wake_wfd_, &b, 1); (void)n; }
 }
 

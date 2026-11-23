@@ -11870,3 +11870,122 @@ TEST(RdmaPeerRailDown, ARefusedRefusalCheckDoesNotHoldTheNode) {
                        "dfkv_rdma_client_peer_unreachable_total"), 0);
   ::close(dead);
 }
+
+// Wake() ends a busy-poll wait at once: the loop sees a flag (it used to
+// poll the wake pipe with a system call on every spin).
+TEST(RdmaEndpointWait, WakeEndsABusyPollWait) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const char* devs = std::getenv("DFKV_RDMA_DEV");
+  const std::string first =
+      devs ? std::string(devs).substr(0, std::string(devs).find(',')) : "";
+  rdma::RcEndpoint busy;
+  busy.set_busy_poll(true);
+  ASSERT_TRUE(busy.Open(first.empty() ? nullptr : first.c_str(), 4096, 1));
+  std::thread waker([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    busy.Wake();
+  });
+  ibv_wc wc{};
+  const auto t0 = std::chrono::steady_clock::now();
+  EXPECT_EQ(busy.WaitComp(&wc, 1, 5000), -1);
+  EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(2));
+  waker.join();
+}
+
+// The spin before sleeping: a Wake() ends it at once, it comes out of the
+// wait's timeout (not on top of it), and a completion that arrives during it
+// is returned without arming the completion channel.
+TEST(RdmaEndpointWait, TheSpinBeforeSleepingEndsOnWakeTimeoutOrCompletion) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const char* devs = std::getenv("DFKV_RDMA_DEV");
+  const std::string first =
+      devs ? std::string(devs).substr(0, std::string(devs).find(',')) : "";
+  const char* dev = first.empty() ? nullptr : first.c_str();
+  ibv_wc wc{};
+  {
+    rdma::RcEndpoint spinning;
+    spinning.set_spin_us(1000000);  // one second
+    ASSERT_TRUE(spinning.Open(dev, 4096, 1));
+    std::thread waker([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      spinning.Wake();
+    });
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_EQ(spinning.WaitComp(&wc, 1, -1), -1);
+    EXPECT_LT(std::chrono::steady_clock::now() - t0,
+              std::chrono::milliseconds(200))
+        << "the spin did not see the Wake";
+    waker.join();
+  }
+  {
+    rdma::RcEndpoint spinning;
+    spinning.set_spin_us(1000000);
+    ASSERT_TRUE(spinning.Open(dev, 4096, 1));
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_EQ(spinning.WaitComp(&wc, 1, 30), 0);
+    const auto took = std::chrono::steady_clock::now() - t0;
+    EXPECT_GE(took, std::chrono::milliseconds(25));
+    EXPECT_LT(took, std::chrono::milliseconds(300))
+        << "the spin was added to the 30 ms timeout";
+  }
+  {
+    rdma::RcEndpoint target, peer;
+    target.set_spin_us(1000000);
+    ASSERT_TRUE(target.Open(dev, 4096, 1));
+    ASSERT_TRUE(peer.Open(dev, 4096, 1));
+    const rdma::QpInfo ti = target.Local(), pi = peer.Local();
+    ASSERT_TRUE(target.Connect(pi));
+    ASSERT_TRUE(peer.Connect(ti));
+    ASSERT_TRUE(target.PostRecv(0));
+    std::thread sender([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      std::memset(peer.sbuf(0), 'x', 64);
+      EXPECT_TRUE(peer.PostSend(0, 64));
+      ibv_wc sent{};
+      EXPECT_EQ(peer.WaitComp(&sent, 1, 5000), 1);
+    });
+    const uint64_t arms = target.NotifyArms();
+    EXPECT_EQ(target.WaitComp(&wc, 1, 5000), 1);
+    EXPECT_EQ(wc.status, IBV_WC_SUCCESS);
+    EXPECT_EQ(target.NotifyArms(), arms)
+        << "the receive arrived during the spin, yet the wait slept";
+    sender.join();
+  }
+}
+
+// A signal that interrupts a completion wait does not start its timeout
+// again: under a signal every 20 ms (shorter than the wait), a 200 ms wait
+// still ends after about 200 ms. It used to restart on each EINTR and never
+// end while the signals kept coming.
+TEST(RdmaEndpointWait, ASignalDoesNotRestartTheTimeout) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const char* devs = std::getenv("DFKV_RDMA_DEV");
+  const std::string first =
+      devs ? std::string(devs).substr(0, std::string(devs).find(',')) : "";
+  rdma::RcEndpoint ep;
+  ASSERT_TRUE(ep.Open(first.empty() ? nullptr : first.c_str(), 4096, 1));
+  struct sigaction action{}, previous{};
+  action.sa_handler = [](int) {};
+  sigemptyset(&action.sa_mask);
+  action.sa_flags = 0;  // no SA_RESTART: poll() returns EINTR
+  ASSERT_EQ(::sigaction(SIGUSR2, &action, &previous), 0);
+  std::atomic<bool> done{false};
+  const pthread_t waiter = ::pthread_self();
+  std::thread signaller([&] {
+    const auto stop = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!done.load() && std::chrono::steady_clock::now() < stop) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      if (!done.load()) ::pthread_kill(waiter, SIGUSR2);
+    }
+  });
+  ibv_wc wc{};
+  const auto t0 = std::chrono::steady_clock::now();
+  EXPECT_EQ(ep.WaitComp(&wc, 1, 200), 0);
+  const auto took = std::chrono::steady_clock::now() - t0;
+  done.store(true);
+  signaller.join();
+  ::sigaction(SIGUSR2, &previous, nullptr);
+  EXPECT_GE(took, std::chrono::milliseconds(190));
+  EXPECT_LT(took, std::chrono::milliseconds(1000))
+      << "each signal restarted the wait's timeout";
+}

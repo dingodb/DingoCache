@@ -486,6 +486,8 @@ class RdmaTransport : public Transport {
   // True if conn's session channel says the server has ended it.
   static bool SessionClosed(const Conn& conn);
   bool busy_poll_ = false;  // DFKV_RDMA_BUSY_POLL
+  static constexpr int kDefaultSpinUs = 0;  // 50 recommended; see DEPLOY
+  uint32_t spin_us_ = kDefaultSpinUs;  // DFKV_RDMA_SPIN_US
   int port_check_ms_ = 1000;  // DFKV_RDMA_PORT_CHECK_MS; 0 = off
   std::unique_ptr<rdma::PortWatcher> port_watcher_;
   std::vector<uint8_t> port_active_;  // keepalive thread only

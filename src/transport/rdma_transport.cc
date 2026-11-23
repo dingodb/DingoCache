@@ -717,6 +717,18 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
     envparse::ReportSwitch("DFKV_RDMA_BUSY_POLL", busy_poll_,
                            "only a value starting with 0 is off");
   }
+  // How long a client completion wait polls before it sleeps (event mode).
+  // 0 sleeps at once; at most 10000.
+  if (const char* value = std::getenv("DFKV_RDMA_SPIN_US"); value && *value) {
+    errno = 0;
+    char* end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (errno == 0 && end != value && *end == '\0' && parsed >= 0)
+      spin_us_ = static_cast<uint32_t>(std::min<long>(parsed, 10000));
+  }
+  envparse::ReportUnlessPlain("DFKV_RDMA_SPIN_US", 0, 10000,
+                              std::to_string(spin_us_));
+  config_dump::RecordResolved("DFKV_RDMA_SPIN_US", std::to_string(spin_us_));
   connect_ms_ = EnvInt("DFKV_RDMA_CONNECT_MS", 3000);
   io_ms_ = EnvInt("DFKV_RDMA_IO_MS", 10000);
   // An explicit zero disables the single-op datapath completion deadline.
@@ -2277,6 +2289,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     return result;
   }
   if (busy_poll_) conn->ep.set_busy_poll(true);
+  conn->ep.set_spin_us(spin_us_);
 
   char devbuf[rdma::kDevNameBytes];
   // Probe requires the dynamic-only contract before a QP bootstrap. There is

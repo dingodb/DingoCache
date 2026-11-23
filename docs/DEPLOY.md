@@ -841,6 +841,7 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | `DFKV_RDMA_RECV_HUGEPAGES` | `on` | receive pool 的 chunk（≥2 MiB 时）申请透明大页，和 RAM 层 arena 一样（每个 chunk 一段单独的 `mmap` 加 `madvise(MADV_HUGEPAGE)`）：`/sys/kernel/mm/transparent_hugepage/enabled` 为 `madvise` 或 `always` 时生效，为 `never` 时不起作用、chunk 仍是 4K 页。从盘读的 GET 和 leased PUT 每次都要为本次操作注册一段 chunk 内存，大页上注册和注销快得多：实测 4 MiB 约 0.05 ms 对 0.3 ms，64 MiB 约 0.4 ms 对 2.4 ms；64 KiB 以下差别不大（每次约 20–40 µs 的系统调用本身） |
 | `DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES` | `256 KiB` | client adaptive data-QP 最小 class；实际对象向上取 power-of-two |
 | `DFKV_RDMA_INLINE_PUT_MAX_BYTES` | `4 MiB` | client 超阈 PUT 使用操作级 lease；`0`/空值禁用，不改变业务对象上限 |
+| `DFKV_RDMA_SPIN_US` | `0`（关），上限 10000 | client：等 completion 时先轮询 CQ 这么久再挂起等事件（事件模式），轮询时间算在本次等待的期限内。对小对象、看重延迟的部署建议设 `50`：单个 GET 是三次往返，每次挂起再唤醒约 30–50 µs，实测 64 KiB GET 中位延迟约 140 µs → 约 50 µs，与 `DFKV_RDMA_BUSY_POLL` 相当。代价是 CPU：server 比轮询时间慢时，每个 GET 最多空转约 150 µs（三次各 50 µs），每秒 1 万次 GET 约占 1.5 个核；在有 CPU 配额（cgroup quota）的容器里会更早被限流 |
 | `DFKV_RDMA_CONNECT_MS` | `3000` | client TCP bootstrap **建连**超时（毫秒），不覆盖整个 QP 初始化或后续读写；同时不超过操作剩下的期限 |
 | `DFKV_RDMA_IO_MS` | `10000` | client TCP bootstrap 帧读写超时（毫秒），同时不超过操作剩下的期限（`DFKV_RDMA_OP_TIMEOUT_MS`）；RDMA completion 另由后者限定 |
 | `DFKV_RDMA_BATCH_OP_TIMEOUT_MS` | 0=跟随 RDMA_OP | client：multi-item Cache/Range/Exist、SG 窗口总期限 |

@@ -378,6 +378,14 @@ class RcEndpoint {
   // threads at shutdown). Thread-safe vs the waiter.
   void Wake();
   void set_busy_poll(bool v) { busy_poll_ = v; }
+  // Event mode: poll the CQ for up to this long before arming the completion
+  // channel and sleeping (0: sleep at once). A completion due within a few
+  // microseconds then costs no sleep and wake-up.
+  void set_spin_us(uint32_t us) { spin_us_ = us; }
+  // Times a wait armed the completion channel to sleep (tests).
+  uint64_t NotifyArms() const {
+    return notify_arms_.load(std::memory_order_relaxed);
+  }
   void set_num_qp(size_t n) { num_qp_ = n > 0 ? n : 1; }
   size_t num_qp() const { return num_qp_; }
   // The QP's access flags as the device reports them; -1 if it cannot say.
@@ -402,6 +410,9 @@ class RcEndpoint {
   int device_read_depth_ = 1, device_responder_read_depth_ = 1;
   unsigned cq_armed_unacked_ = 0;
   bool busy_poll_ = false;
+  uint32_t spin_us_ = 0;
+  std::atomic<uint64_t> notify_arms_{0};
+  std::atomic<bool> woken_{false};  // Wake() was called (busy-poll checks this)
   size_t num_qp_ = 1;
 
   size_t cap_ = 0, depth_ = 0, dbuf_cap_ = 0;
