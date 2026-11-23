@@ -4152,6 +4152,101 @@ TEST(RdmaLoopback, GrantOfAKilledClientIsReleasedAfterTheGrantTimeout) {
   }
 }
 
+// Stop() lets a connection that holds a grant finish, for at most
+// DFKV_RDMA_STOP_DRAIN_MS, before it closes it. Here the client is dead, so
+// the grant is never used: Stop takes the drain bound and no longer.
+TEST(RdmaLoopback, StopDrainOfAnUnreleasedGrantIsBounded) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv inline_put("DFKV_RDMA_INLINE_PUT_MAX_BYTES", "65536");
+  ScopedEnv idle("DFKV_RDMA_IDLE_MS", "60000");
+  ScopedEnv grant("DFKV_RDMA_GRANT_TIMEOUT_MS", "0");
+  ScopedEnv drain("DFKV_RDMA_STOP_DRAIN_MS", "800");
+  std::atomic<pid_t> victim{0};
+  std::atomic<bool> killed{false};
+  RdmaNode* node_ptr = nullptr;
+  RdmaNode node("stop-drain", kMaxMsg, false, false, [&] {
+    const pid_t pid = victim.load();
+    if (pid <= 0 || killed.load() || node_ptr == nullptr) return;
+    if (RdmaServerTestPeer::LeasePutActive(*node_ptr->rsrv) == 0) return;
+    ::kill(pid, SIGKILL);
+    killed.store(true);
+  });
+  node_ptr = &node;
+  const pid_t child = SpawnGrantHolder(node.addr, /*lease=*/true);
+  ASSERT_GT(child, 0);
+  victim.store(child);
+  StartGrantHolder(child);
+  const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  while (!killed.load() && std::chrono::steady_clock::now() < give_up)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  if (!killed.load()) ::kill(child, SIGKILL);
+  int status = 0;
+  ::waitpid(child, &status, 0);
+  ASSERT_TRUE(killed.load());
+  const auto started = std::chrono::steady_clock::now();
+  node.rsrv->Stop();
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started);
+  std::printf("STOP_WITH_UNRELEASED_GRANT %lld ms\n",
+              static_cast<long long>(elapsed.count()));
+  EXPECT_GE(elapsed.count(), 700);
+  EXPECT_LT(elapsed.count(), 2000);
+  EXPECT_EQ(CounterVal(node.rsrv->MetricsText(),
+                       "dfkv_rdma_stop_drains_cut_total"),
+            1);
+  EXPECT_EQ(CounterVal(node.rsrv->MetricsText(), "dfkv_rdma_leaseput_active"), 0);
+}
+
+// A GET whose READY is out when the server starts stopping completes: the
+// connection serves its RELEASE during the drain, then closes. New grants are
+// refused meanwhile, so the drain ends as soon as the ones in flight do.
+TEST(RdmaLoopback, AGrantInFlightCompletesDuringTheStopDrain) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv rail_tiers("DFKV_RDMA_RAIL_TIERS", nullptr);
+  ScopedEnv keepalive("DFKV_RDMA_KEEPALIVE_MS", "0");
+  ScopedEnv drain("DFKV_RDMA_STOP_DRAIN_MS", "5000");
+  std::atomic<bool> started{false};
+  std::thread stopper;
+  std::chrono::steady_clock::time_point stop_started{};
+  std::atomic<int64_t> stop_ms{-1};
+  RdmaNode* node_ptr = nullptr;
+  std::atomic<bool> armed{false};
+  RdmaNode node("drain-grant", kMaxMsg, false, false, [&] {
+    if (!armed.load() || started.load() || node_ptr == nullptr) return;
+    if (RdmaServerTestPeer::DynamicGetActive(*node_ptr->rsrv) == 0) return;
+    started.store(true);
+    // The READY of the GET is out: stop the server now, from elsewhere.
+    stopper = std::thread([&] {
+      stop_started = std::chrono::steady_clock::now();
+      node_ptr->rsrv->Stop();
+      stop_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - stop_started)
+                        .count());
+    });
+    // Give Stop() time to begin its drain before the client reads.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  });
+  node_ptr = &node;
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  const std::string value(8192, 'd');
+  ASSERT_TRUE(c.Put("drain-key", value.data(), value.size()));
+  armed.store(true);
+  std::string out(value.size(), '\0');
+  EXPECT_TRUE(c.Get("drain-key", out.data(), out.size()));
+  EXPECT_EQ(out, value);
+  ASSERT_TRUE(started.load());
+  stopper.join();
+  std::printf("STOP_WITH_GRANT_IN_FLIGHT %lld ms\n",
+              static_cast<long long>(stop_ms.load()));
+  EXPECT_LT(stop_ms.load(), 5000) << "the drain ran out";
+  EXPECT_EQ(CounterVal(node.rsrv->MetricsText(),
+                       "dfkv_rdma_stop_drains_cut_total"),
+            0);
+}
+
 // A multi-window PUT whose client stops between windows holds its partial
 // state until the grant timeout, not the idle timeout.
 TEST(RdmaLoopback, AMultiWindowPutStalledBetweenWindowsExpires) {
@@ -8633,6 +8728,30 @@ TEST(RdmaBootstrapListener, SlowDripPeerIsDroppedAtTheBootstrapDeadline) {
   EXPECT_TRUE(EventuallyTrue(
       [&] { return listener.server.PendingHandshakes() == 0; }));
   listener.server.Stop();
+}
+
+// Stop() joins every connection thread. One still in its handshake waited
+// for the peer's frames until the bootstrap deadline (10 s), so a peer that
+// had only connected held a server's stop up by that long. Stop now shuts
+// those sockets down.
+TEST(RdmaBootstrapListener, StopDoesNotWaitForHandshakesInFlight) {
+  BootstrapListener listener;
+  ASSERT_EQ(listener.server.Start(0), Status::kOk);
+  std::vector<int> peers;
+  for (int i = 0; i < 3; ++i) {
+    peers.push_back(listener.Connect());
+    ASSERT_GE(peers.back(), 0);
+  }
+  ASSERT_TRUE(EventuallyTrue(
+      [&] { return listener.server.PendingHandshakes() == 3; }));
+  const auto started = std::chrono::steady_clock::now();
+  listener.server.Stop();
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started);
+  std::printf("STOP_WITH_HANDSHAKES %lld ms\n",
+              static_cast<long long>(elapsed.count()));
+  for (const int fd : peers) ::close(fd);
+  EXPECT_LT(elapsed.count(), 1000) << "waited for the bootstrap deadline";
 }
 
 // With no descriptor left accept() fails at once, every time, while the peer
