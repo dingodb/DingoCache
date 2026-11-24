@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Server, failed disks (STO-16 follow-up): a disk excluded from takeover (it
+  kept a key of another disk the start could not remove) no longer counts
+  toward `DFKV_DEGRADED_MIN_DISKS` once a disk has failed. With every
+  healthy disk excluded, the failed disk's keys failed with I/O errors while
+  the node stayed in placement; it now leaves placement. The keys that start
+  drops from a disk that is not their home are synced before the failure
+  record can be cleared (the file engine syncs its filesystem; its REMOVE
+  alone is not durable across a power loss); if that sync fails, the record
+  is kept for the next start.
 
 
 - Client: keys a node refused to store are counted,

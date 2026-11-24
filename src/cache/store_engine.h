@@ -400,6 +400,10 @@ class StoreEngine {
   // kNotFound also covers a write that has not reached its commit point.
   virtual Status Lookup(const BlockKey& key, ValueMetadata* out) const = 0;
   virtual Status Remove(const BlockKey& key) = 0;
+  // Makes the REMOVEs returned so far durable across a power loss. The log
+  // engine's REMOVE already is; the slab store does not survive a power loss
+  // warm (its run identity resets it). False if it could not.
+  virtual bool SyncRemovals() { return true; }
   // Calls `fn` for every committed key, under the engine's own locks: `fn`
   // must not call into the engine. For a pass before the store serves.
   virtual void ForEachKey(

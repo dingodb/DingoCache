@@ -493,7 +493,9 @@ journalctl -u dfkv -n 10 --no-pager
 >   ERROR（缓存语义，不拒绝启动）。删掉的数量见启动日志 `disk failure records found ...`
 >   和 `dfkv_disks_open_dropped_keys{reason="failed_disk"|"not_home"|"unusable_record"}`。
 >   某块盘上不属于它的 key 删不掉时，这块盘本轮不再承接坏盘的 key
->   （`dfkv_disk_takeover_excluded{disk}=1`，WARN），记录保留到下次启动重试。记录在之后
+>   （`dfkv_disk_takeover_excluded{disk}=1`，WARN），记录保留到下次启动重试；有盘故障时这样
+>   的盘不计入 `DFKV_DEGRADED_MIN_DISKS`，健康盘全都不承接时节点按健康盘不足退出 placement。
+>   删掉的 key 先同步落盘（file 引擎做一次 syncfs）；同步失败时记录同样保留。记录在之后
 >   一次没有盘故障、各盘都干净关闭的运行停止时删除；记录路径上若是目录等非普通文件，
 >   节点不删它（WARN），每次启动都会因此清空所有盘，需要运维移走。
 > - **退出 placement**：健康盘少于 `DFKV_DEGRADED_MIN_DISKS`（单盘节点坏一块盘即是）时，
@@ -960,7 +962,7 @@ WARN 里给出实际采用的字节数；`DFKV_RAM_RECLAIM_MS` 只保留低 32 �
 | `DFKV_PEER_COOLDOWN_MAX_MS` | `30000` | PeerHealth 回避上限。回避时长只在试探失败时翻倍（2 s、4 s、8 s … 至本上限） |
 | `DFKV_PEER_BAD_GRACE_MS` | `1000` | PeerHealth 转 bad 前的宽限期。`0` 同样不被接受：打 WARNING 并沿用默认值 |
 | `DFKV_DISK_HASH_WEIGHT` | — | 盘内 Ketama 虚拟节点权重（数据中平衡关键调优，改动需重启） |
-| `DFKV_DEGRADED_MIN_DISKS` | `1` | server：盘 store 终态故障后，至少还剩这么多块健康盘时节点降级运行、留在 placement（坏盘的 key 改由健康盘承接）；少于它则退出 placement。大于盘数按盘数算（任一盘故障即退出）；`0` 或非整数拒绝启动 |
+| `DFKV_DEGRADED_MIN_DISKS` | `1` | server：盘 store 终态故障后，至少还剩这么多块健康盘时节点降级运行、留在 placement（坏盘的 key 改由健康盘承接；本轮不承接的盘不算）；少于它则退出 placement。大于盘数按盘数算（任一盘故障即退出）；`0` 或非整数拒绝启动 |
 | `DFKV_READ_COALESCE` | `0` | TCP 端读 convoy 合并主开关（见 README Recommended tuning 表） |
 | `DFKV_READ_COALESCE_RECUR_MS` | `1000` | 复制重现窗口（copy fingerprint 64 字节） |
 | `DFKV_READ_COALESCE_TIMEOUT_MS` | `500` | follower 等待 leader 上限 |

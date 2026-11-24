@@ -56,6 +56,19 @@ TEST_F(KVStoreTest, CacheThenRangeRoundTripAndImmediateVisibility) {
   EXPECT_EQ(value_len, v.size());
 }
 
+// A REMOVE renames the file without a directory sync; SyncRemovals makes it
+// durable (syncfs on the cache directory), and says when it could not.
+TEST_F(KVStoreTest, SyncRemovalsSyncsTheCacheFilesystem) {
+  KVStore s(Opts());
+  const BlockKey k{7, 0};
+  const std::string v = "removed";
+  ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);
+  ASSERT_EQ(s.Remove(k), Status::kOk);
+  EXPECT_TRUE(s.SyncRemovals());
+  fs::remove_all(dir_);
+  EXPECT_FALSE(s.SyncRemovals()) << "no cache directory to sync";
+}
+
 TEST_F(KVStoreTest, TenantUsageSurvivesRestartAndRemove) {
   const BlockKey a{1, 0, 0x1111};
   const BlockKey b{2, 0, 0x1111};
