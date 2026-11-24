@@ -1185,9 +1185,21 @@ ImageStats CheckImages(const std::vector<RecordingIo::Op>& recorded,
   std::mt19937_64 rng(seed);
   const std::vector<ProtectedValue> protected_values =
       ProtectedValues(recorded, ops, check);
+  // Which branches the random crash points reach depends on the recording's
+  // timing (a slow build syncs after almost every write and leaves few
+  // records loose for a power loss to tear). A caller that checks the
+  // minimums gets more random crash points, from the same generator and
+  // each checked in full, until every branch was reached or 4 x `images`
+  // more were tried; the first rounds are those of a run that needs none.
   const int rounds = images + static_cast<int>(check.power_prefixes.size());
-  for (int round = 0; round < rounds; ++round) {
-    const bool chosen = round >= images;
+  const int limit = check.check_minimums ? rounds + 4 * images : rounds;
+  auto covered = [&] {
+    return stats.strict_keys > 0 && stats.holes > 0 && stats.power_served > 0 &&
+           (check.retains == nullptr || stats.protected_power > 0);
+  };
+  int round = 0;
+  for (; round < rounds || (round < limit && !covered()); ++round) {
+    const bool chosen = round >= images && round < rounds;
     const size_t prefix = chosen ? check.power_prefixes[round - images]
                                  : 1 + rng() % recorded.size();
     const Crash crash = chosen || round % 3 == 2 ? Crash::kPowerAll
@@ -1225,6 +1237,7 @@ ImageStats CheckImages(const std::vector<RecordingIo::Op>& recorded,
   if (check.retains != nullptr)
     EXPECT_GT(stats.protected_power, 0)
         << "the I4 check saw protected values in power-loss images";
+  ::testing::Test::RecordProperty("rounds", round);
   ::testing::Test::RecordProperty("images", stats.images);
   ::testing::Test::RecordProperty("strict_keys", stats.strict_keys);
   ::testing::Test::RecordProperty("holes", stats.holes);
