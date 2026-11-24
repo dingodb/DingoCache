@@ -2007,6 +2007,46 @@ TEST(RdmaSafety, OverridesRejectMalformedVectorsBeforeAcquiringQp) {
 
 // Direct transport ExistMany: windowed batch existence probe on one connection.
 // Must be correct across multiple send windows (N > depth) with mixed hit/miss.
+// Recent-REMOVE memory (CLI-02 stage M) over the RDMA control lane: a node
+// with DFKV_REMOVE_MEMORY_MS answers kRemovedWithin; one without it answers
+// kInvalid, which the client takes as unknown without charging the node.
+TEST(RdmaLoopback, RemovedWithinIsAnsweredOverRdma) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device (load rdma_rxe for Soft-RoCE)";
+  ::setenv("DFKV_REMOVE_MEMORY_MS", "600000", 1);
+  RdmaNode node("rmem");
+  ::unsetenv("DFKV_REMOVE_MEMORY_MS");
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));  // see the TCP test
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  const std::string v(64, 'v');
+  ASSERT_TRUE(c.Put("gone", v.data(), v.size()));
+  ASSERT_TRUE(c.Remove("gone"));
+  ASSERT_TRUE(c.Put("kept", v.data(), v.size()));
+  std::vector<std::string> keys = {"gone", "kept"};
+  for (int i = 0; i < 1500; ++i) keys.push_back("other-" + std::to_string(i));
+  std::vector<uint8_t> answers;
+  ASSERT_EQ(c.RemovedWithin(node.addr, keys, 200, &answers), Status::kOk);
+  ASSERT_EQ(answers.size(), keys.size());
+  EXPECT_EQ(answers[0], 1);
+  for (size_t i = 1; i < answers.size(); ++i) EXPECT_EQ(answers[i], 0) << i;
+}
+
+TEST(RdmaLoopback, RemovedWithinOfANodeWithoutTheMemoryIsUnknown) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device (load rdma_rxe for Soft-RoCE)";
+  ::unsetenv("DFKV_REMOVE_MEMORY_MS");
+  RdmaNode node("rmem-off");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  std::vector<uint8_t> answers;
+  EXPECT_EQ(c.RemovedWithin(node.addr, {"a", "b"}, 1000, &answers),
+            Status::kInvalid);
+  EXPECT_EQ(answers, (std::vector<uint8_t>{2, 2}));
+  const std::string v(8, 'v');
+  EXPECT_TRUE(c.Put("a", v.data(), v.size())) << "the connection was kept";
+  EXPECT_EQ(c.MetricsSnapshot().find("dfkv_client_peer_marked_bad_total 1"),
+            std::string::npos);
+}
+
 TEST(RdmaLoopback, ExistManyWindowedMixedHitMiss) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device (load rdma_rxe for Soft-RoCE)";
   RdmaNode node("exm");

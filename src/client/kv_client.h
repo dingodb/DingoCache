@@ -135,6 +135,19 @@ class KVClient {
   // keys are probed with Exist instead (hit -> kRetHitUnprotected), so callers
   // can use it in place of BatchExist. A key is a hit iff its code is one of
   // 1,2,3,4,5,6,8.
+  // Recent-REMOVE memory (CLI-02 stage M, for the read-back of stage B): asks
+  // `node` (ip:port) whether each key was removed there within the last
+  // age_ms. `answers` gets one byte per key: 0 not removed, 1 removed, 2
+  // unknown. A node without the memory (an older release, or
+  // DFKV_REMOVE_MEMORY_MS off) answers kInvalid: every key is unknown, the
+  // node is not charged in PeerHealth, and it is not asked again for 60 s
+  // (unknown meanwhile). A node that cannot be asked gives unknown too; the
+  // status says why. `covered_ms`, when given, receives how far back the node
+  // knows every REMOVE (0 unless it answered).
+  Status RemovedWithin(const std::string& node,
+                       const std::vector<std::string>& keys, uint32_t age_ms,
+                       std::vector<uint8_t>* answers,
+                       uint32_t* covered_ms = nullptr);
   void BatchRetain(const std::vector<std::string>& keys,
                    const RetainRequest& req, uint8_t* out);
   // Ring-wide limits: *supported 1 = every member answered kRetain, 0 = some
@@ -412,6 +425,8 @@ class KVClient {
     uint8_t headroom_pct = 100;
     bool heard = false;
   };
+  std::mutex no_memory_mu_;
+  std::map<std::string, uint64_t> no_memory_until_;  // node -> NowMs() bound
   mutable std::mutex retain_mu_;
   std::map<std::string, RetainNodeState> retain_nodes_;
   // A key the node answered as protected: when, by which node (a hash of its

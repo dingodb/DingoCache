@@ -1231,6 +1231,26 @@ RETAIN 保护两份（排空节点那份还在服务读），哪边有 key 就�
 - 指标：上面各项，加 `dfkv_client_remove_fanout_total{result}`、
   `dfkv_client_cooldown_reroutes_total{op}`、`dfkv_client_reroute_cleanup_total{result}`。
 
+### 4c-4. 近期删除记忆（recent-REMOVE memory，`DFKV_REMOVE_MEMORY_MS`，节点侧，默认 0=关）<a name="4c-remove-memory"></a>
+
+节点开关。设计见 [ring-unavailable-owner.md](design/ring-unavailable-owner.md) §3.3。它是回读（§3.4，
+后续阶段）的前提：回读之前先问这些节点“这个 key 最近在你这里删过吗”。单独打开它不改变任何读、写、
+删除的结果。
+
+- **记什么：** 本节点确认过的每个 REMOVE（不管 key 当时在不在），在回复之前记下 key（含租户）和时间，
+  只在内存里。之后对同一个 key 的 PUT 照常存、照常读，不清除这条记录。
+- **多久、多大：** 记录保留 `DFKV_REMOVE_MEMORY_MS`（打开时常用 600000，上限 3600000）；最多
+  `DFKV_REMOVE_MEMORY_ENTRIES` 条（默认 1048576，实测每条约 106 字节，满时约 106 MiB，范围
+  1024–67108864），满了丢最旧的，
+  节点“知道”的时间段随之变短。回读要求它至少覆盖客户端的回读窗口加十个最长的轮询间隔（§3.4）。
+- **重启：** 只在内存里。节点启动（包括带数据的热重启）之后只知道启动以来的删除，问更早的时间段
+  答“不知道”，回读据此不回读。
+- **协议：** 新增 op `kRemovedWithin`（25），TCP 和 RDMA 都支持。关闭时（以及旧版本节点）对它回
+  `kInvalid`，和任何未知 op 一样；客户端把它当作每个 key 都“不知道”，不记入 PeerHealth，60 秒内不再问
+  这个节点。旧客户端从不发这个 op；已有 op 和格式都不变。
+- 指标：`dfkv_remove_memory_entries`、`dfkv_remove_memory_covered_seconds`、
+  `dfkv_remove_memory_dropped_total`、`dfkv_removed_within_queries_total{result}`（只在打开时输出）。
+
 ### 4d. 成员漂移 / split-brain 巡检
 
 `deploy/dfkv_membership_audit.py` 分别查询每个 MDS（不是把 endpoints 当故障转移

@@ -79,6 +79,15 @@ void KvNodeServer::InitTcpListenerConfig() {
                               std::to_string(tcp_first_req_ms_));
 }
 
+namespace {
+uint64_t SteadyMs() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+}  // namespace
+
 KvNodeServer::KvNodeServer(const std::string& cache_dir,
                            uint64_t capacity_bytes)
     : KvNodeServer(DiskCacheGroup::Options{{cache_dir}, capacity_bytes}) {}
@@ -101,6 +110,7 @@ KvNodeServer::KvNodeServer(DiskCacheGroup::Options options,
       ram_starting_(StartRamTier()),
       group_(OpenedNotActivated(std::move(options))) {
   shutdown_drain_timeout_s_ = ResolveShutdownDrainTimeoutSeconds();
+  remove_memory_ = RemoveMemory::FromEnv(SteadyMs());
   // With a disk that failed to open the start is over: the arena need not be
   // faulted in to the end just to be dropped.
   if (!group_.Healthy())
@@ -773,6 +783,26 @@ std::string KvNodeServer::MetricsText() const {
            "Expiry-wheel entries: one per protected resident, plus those of "
            "protected residents that were removed, until their bucket expires",
            rs.wheel_entries);
+  }
+  if (remove_memory_) {
+    const uint64_t now = SteadyMs();
+    metric("dfkv_remove_memory_entries", "gauge",
+           "Keys the recent-REMOVE memory holds (DFKV_REMOVE_MEMORY_MS)",
+           remove_memory_->Entries());
+    metric("dfkv_remove_memory_covered_seconds", "gauge",
+           "How far back this node knows every REMOVE it acknowledged",
+           remove_memory_->CoveredMs(now) / 1000);
+    metric("dfkv_remove_memory_dropped_total", "counter",
+           "Records dropped for room (what the node knows then starts later)",
+           remove_memory_->Dropped());
+    s += "# HELP dfkv_removed_within_queries_total Keys asked about by "
+         "kRemovedWithin, by answer\n"
+         "# TYPE dfkv_removed_within_queries_total counter\n";
+    const char* names[3] = {"not_removed", "removed", "unknown"};
+    for (uint8_t a = 0; a < 3; ++a)
+      s += "dfkv_removed_within_queries_total" +
+           braces(std::string("result=\"") + names[a] + "\"") + " " +
+           std::to_string(remove_memory_->QueriedKeys(a)) + "\n";
   }
   metric("dfkv_remove_ok_total", "counter", "Remove ops that dropped a block", m_remove_ok());
   metric("dfkv_remove_miss_total", "counter", "Remove ops for an absent block", m_remove_miss());
@@ -1616,6 +1646,9 @@ Status KvNodeServer::ProcessRequestForKey(
     case WireOp::kRetain:
       st = ProcessRetain(key, length, payload, payload_len, out_data);
       break;
+    case WireOp::kRemovedWithin:
+      st = ProcessRemovedWithin(key, length, payload, payload_len, out_data);
+      break;
     case WireOp::kLookup: {
       ValueMetadata metadata;
       st = LookupForKey(key, &metadata);
@@ -1636,6 +1669,11 @@ Status KvNodeServer::ProcessRequestForKey(
       // between the two removes; a promotion after the disk remove is not
       // installed (it checks the disk), one before it is dropped here.
       if (ram_) ram_->DropDurableCopy(key);
+      // Recorded before the acknowledgement, whatever the key's state was
+      // (recent-REMOVE memory, DFKV_REMOVE_MEMORY_MS).
+      if (remove_memory_ &&
+          (disk_status == Status::kOk || disk_status == Status::kNotFound))
+        remove_memory_->Record(key, SteadyMs());
       if (disk_status == Status::kOk ||
           (disk_status == Status::kNotFound && ram_had)) {
         st = Status::kOk;
@@ -1697,6 +1735,28 @@ uint32_t RetainWallNowS() {
                                    .count());
 }
 }  // namespace
+
+// kRemovedWithin (op 25). A node without the memory answers as an older one
+// does (an unknown op).
+Status KvNodeServer::ProcessRemovedWithin(const BlockKey& prefix_key,
+                                          uint64_t count, const char* payload,
+                                          uint64_t payload_len,
+                                          std::string* out_data) {
+  if (out_data == nullptr || !remove_memory_) return Status::kInvalid;
+  if (count == 0 || count > kRemovedWithinMaxKeys || payload == nullptr ||
+      payload_len != kRemovedWithinHeaderBytes + count * 16 ||
+      net::GetU32(payload) != count)
+    return Status::kInvalid;
+  const uint64_t age_ms = net::GetU32(payload + 4);
+  out_data->assign(4 + count, '\0');
+  const uint64_t covered = remove_memory_->Query(
+      prefix_key.tenant_hash, payload + kRemovedWithinHeaderBytes,
+      static_cast<size_t>(count), age_ms, SteadyMs(),
+      reinterpret_cast<uint8_t*>(&(*out_data)[4]));
+  net::PutU32(&(*out_data)[0],
+              static_cast<uint32_t>(std::min<uint64_t>(covered, UINT32_MAX)));
+  return Status::kOk;
+}
 
 Status KvNodeServer::ProcessRetain(const BlockKey& prefix_key, uint64_t count,
                                    const char* payload, uint64_t payload_len,
@@ -2129,14 +2189,6 @@ PreparedRead KvNodeServer::PrepareReadForKey(
       recent_reads_ && !promote ? &FinishUnpromotedDiskRead : &FinishDiskRead);
 }
 
-namespace {
-uint64_t SteadyMs() {
-  return static_cast<uint64_t>(
-      std::chrono::duration_cast<std::chrono::milliseconds>(
-          std::chrono::steady_clock::now().time_since_epoch())
-          .count());
-}
-}  // namespace
 
 bool KvNodeServer::PromoteRead(const BlockKey& key, bool note) {
   if (!recent_reads_) return true;

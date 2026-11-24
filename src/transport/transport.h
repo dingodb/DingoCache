@@ -165,6 +165,17 @@ class Transport {
     (void)node; (void)key; return Status::kInvalid;
   }
 
+  // One kRemovedWithin round trip (recent-REMOVE memory): `payload` is the
+  // encoded body (see wire.h) for `count` keys of one tenant; `out` receives
+  // the reply data. A node without the memory answers kInvalid. Default:
+  // unsupported.
+  virtual Status RemovedWithin(const std::string& node, uint64_t tenant_hash,
+                               uint64_t count, const std::string& payload,
+                               std::string* out) {
+    (void)node; (void)tenant_hash; (void)count; (void)payload; (void)out;
+    return Status::kInvalid;
+  }
+
   // One kRetain round trip: `payload` is the encoded kRetain body (see
   // wire.h) for `count` keys of one tenant; `out` receives the reply data.
   // A node without retention answers kInvalid. Default: unsupported.

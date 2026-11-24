@@ -1,6 +1,6 @@
 # Unavailable owners: absent grace, cooldown reroute, recent-REMOVE memory, read-back
 
-Status: design, revision 8 (stage C reviewed). Stages A and C are
+Status: design, revision 9 (stage M). Stages A, C and M are
 implemented; the rest is design. Each
 mechanism sits behind its own switch, off by default; none changes a released
 binary. A and C are client-side only. The recent-REMOVE memory (M) adds one
@@ -304,7 +304,8 @@ refuse a read-back of a removed key, wherever the remover sent its REMOVE.
   acknowledgement is sent. A PUT does not clear an entry.
 - **Bounds.** Entries older than `DFKV_REMOVE_MEMORY_MS` are dropped
   (default when on: 600 s; at least B's lookback H, §3.4). Capacity
-  `DFKV_REMOVE_MEMORY_ENTRIES` (default 1 Mi, about 48 B each, so ~48 MiB);
+  `DFKV_REMOVE_MEMORY_ENTRIES` (default 1 Mi; measured about 106 B each, so
+  ~106 MiB at 1 Mi: a hash-map node, its bucket and the record-order entry);
   when full the oldest entry is dropped and the node's *coverage* shrinks.
 - **Coverage.** The node keeps `covered_since`: the latest of its start time
   and the time of the newest entry it dropped for capacity. It knows every
@@ -327,6 +328,13 @@ refuse a read-back of a removed key, wherever the remover sent its REMOVE.
   not bumped on every candidate miss. Tested against an older-release server
   over TCP and RDMA. Old clients never send the op. No existing op, status or
   format changes; the response status set is unchanged.
+- **No other answer changes.** M only answers `kRemovedWithin`, which only
+  B sends. A PUT after a REMOVE is stored and served as today (and does not
+  clear the record); a GET, EXIST or REMOVE is answered as today. With M on
+  and B off, nothing a client sees changes. M's window relates to B's
+  lookback H only (M ≥ H, §3.4); C's S and the MDS lease do not enter it.
+  Client side, `KVClient::RemovedWithin(node, keys, age_ms, ...)` asks one
+  node (at most 1024 keys per request), for B.
 - **Metrics:** `dfkv_remove_memory_entries`, `dfkv_remove_memory_covered_seconds`,
   `dfkv_remove_memory_dropped_total` (capacity), `dfkv_removed_within_queries_total{result}`.
 
@@ -575,6 +583,12 @@ removed afterwards.
 ## 9. Revisions
 
 - Revision 1: first version, after two prototype measurement runs.
+- Revision 9 (stage M): M changes no answer of an existing op (a PUT after
+  a REMOVE is stored and served as today, a GET, EXIST or REMOVE answered as
+  today); M's window relates only to B's lookback H, not to C's S or the MDS
+  lease; the client call B will use is named; an entry measured at about
+  106 B, not the 48 B first written. The end-to-end measurement of
+  M (§7 cases 3 and 5) comes with B, since only B asks M.
 - Revision 8 (stage C's design review): C picks a substitute from the union
   of the write rings it adopted or saw within S (settle plus a poll), stable
   members only, ranked with unusable members counted; a remover fans out

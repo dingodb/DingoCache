@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Server: recent-REMOVE memory (CLI-02 stage M), behind
+  `DFKV_REMOVE_MEMORY_MS` (default 0 = off, up to 3600000). A node records
+  every REMOVE it acknowledges (key and tenant, before the reply; RAM only,
+  at most `DFKV_REMOVE_MEMORY_ENTRIES`, default 1048576, about 106 MiB when
+  full) and answers a new op,
+  `kRemovedWithin` (25, TCP and RDMA): was each key removed here within the
+  last `age_ms`, or unknown when that reaches before the node's start or
+  its oldest kept record. It exists for the previous-owner read-back of a
+  later stage; no other op's answer changes, a PUT after a REMOVE is stored
+  and served as before. A node with the switch off, like an older one,
+  answers `kInvalid`; the client's `KVClient::RemovedWithin` then reports
+  every key unknown, does not charge the node in PeerHealth and does not ask
+  it again for 60 s. New `dfkv_remove_memory_entries`,
+  `dfkv_remove_memory_covered_seconds`, `dfkv_remove_memory_dropped_total`,
+  `dfkv_removed_within_queries_total{result}` (only with the switch on).
 - Client, RDMA: a batch GET into the callers' buffers runs in windows. The
   zero-copy batch reads the connectors use (`dfkv_batch_get`,
   `dfkv_batch_get_auto` and `dfkv_batch_get_auto_sg`) read their keys one at

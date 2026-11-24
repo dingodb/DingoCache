@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 #include "common/status.h"
 #include "common/kv_types.h"   // BlockKey
@@ -45,7 +46,10 @@ enum class WireOp : uint8_t {
   kDrain = 23,
   // MDS: delete a member's record (payload as kRegister). A node drained by
   // kDrain sends it when it stops, so clients drop it within one poll.
-  kDeregister = 24
+  kDeregister = 24,
+  // Node (DFKV_REMOVE_MEMORY_MS): "was each key removed here within age_ms?"
+  // (recent-REMOVE memory, CLI-02 stage M). See kRemovedWithin below.
+  kRemovedWithin = 25
 };
 
 constexpr uint8_t kNativeProtoTcp = 6;
@@ -162,6 +166,29 @@ inline bool DecodeResp(const char* p, Status* st, uint64_t* data_len,
                        uint64_t* value_len = nullptr) {
   return DecodeRespVersion(p, kNativeProtoTcp, st, data_len, max_data,
                            value_len);
+}
+
+// ---- kRemovedWithin (op 25) ----
+// A control op on the TCP lane and the RDMA control lane. The prefix key
+// carries only the tenant hash (digests 0) and `length` = key count. A node
+// without the memory answers kInvalid, like any unknown op.
+//   payload : u32 count | u32 age_ms | count x {u64 digest_hi, u64 digest_lo}
+//   reply   : u32 covered_ms | count x u8 (0 not removed within age_ms,
+//             1 removed, 2 unknown: age_ms reaches past what the node knows)
+constexpr size_t kRemovedWithinHeaderBytes = 8;
+constexpr size_t kRemovedWithinMaxKeys = 1024;
+
+inline std::string EncodeRemovedWithinPayload(uint32_t age_ms,
+                                              const BlockKey* keys,
+                                              size_t count) {
+  std::string p(kRemovedWithinHeaderBytes + count * 16, '\0');
+  net::PutU32(&p[0], static_cast<uint32_t>(count));
+  net::PutU32(&p[4], age_ms);
+  for (size_t i = 0; i < count; ++i) {
+    net::PutU64(&p[kRemovedWithinHeaderBytes + i * 16], keys[i].digest_hi);
+    net::PutU64(&p[kRemovedWithinHeaderBytes + i * 16 + 8], keys[i].digest_lo);
+  }
+  return p;
 }
 
 // ---- kRetain (op 19) ----
