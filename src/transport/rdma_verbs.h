@@ -103,6 +103,28 @@ bool RunPoolMrTransaction(size_t rail_count, Stage stage, Commit commit,
 }
 
 
+// A reference to an opened device's shared context and PD, kept apart from
+// any endpoint: while one is held, closing the device's last endpoint does
+// not close the context, and the next Open does not reopen it (about 11 ms
+// to open, 1.5 ms to close). Move-only; released on destruction.
+class DeviceRef {
+ public:
+  DeviceRef() = default;
+  ~DeviceRef();
+  DeviceRef(DeviceRef&& other) noexcept : ctx_(other.ctx_) {
+    other.ctx_ = nullptr;
+  }
+  DeviceRef& operator=(DeviceRef&& other) noexcept;
+  DeviceRef(const DeviceRef&) = delete;
+  DeviceRef& operator=(const DeviceRef&) = delete;
+  bool held() const { return ctx_ != nullptr; }
+
+ private:
+  friend class RcEndpoint;
+  explicit DeviceRef(ibv_context* ctx) : ctx_(ctx) {}
+  ibv_context* ctx_ = nullptr;
+};
+
 // One RC connection: device context + PD + CQ(+channel) + QP + a ring of
 // `depth` send and recv buffers (each `cap` bytes, registered once).
 class RcEndpoint {
@@ -239,6 +261,13 @@ class RcEndpoint {
   // Test seam: called right after a pool MR is handed back to `retired`
   // (it may throw, as an allocation there could). Empty = none.
   static void SetPoolRetireSeamForTest(std::function<void()> seam);
+  // References this open endpoint's device; not held if it is not open.
+  DeviceRef ReferenceDevice() const;
+  // Process-wide references to opened devices (endpoints and DeviceRefs).
+  // Diagnostic/test.
+  static long DeviceReferences();
+  // Process-wide device contexts opened (ibv_open_device). Diagnostic/test.
+  static uint64_t DeviceOpens();
   static uint64_t PoolMrRegistrationFailures();
   // Test seam: consulted before each one-shot registration in
   // RegisterTransient (not a pool hit); false fails it.

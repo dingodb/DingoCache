@@ -201,6 +201,19 @@
   and the lock is taken only to publish the new declaration, whole. A
   destroyed transport waits for a registration in flight.
 
+- RDMA client: the device context stays open while the transport lives
+  (TRN-16). Each rail's device context and protection domain are now held
+  from the rail's first connection until the transport is destroyed. A
+  transport that never called `RegisterMemory` closed them whenever its
+  last connection went (idle reclaim, failures), and the next connection
+  opened them again: opening an endpoint on a device not held took
+  12-13 ms against 1.4-1.5 ms, and closing the last one 3 ms against
+  1.5 ms. A transport that registered memory already held them. An Open
+  that fails with ENODEV or EIO (device gone or reset) drops the rail's
+  reference, so the device is opened again once its endpoints are gone; a
+  transport with `RegisterMemory` anchors still needs a restart after a
+  device reset, as before (DEPLOY.md).
+
 - Server, read coalescing (`DFKV_READ_COALESCE=1`, REQ-20): a read nobody
   else is waiting for goes straight into its own buffer. The leader of a
   synchronous read allocated a scratch of the full capacity and copied it

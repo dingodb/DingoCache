@@ -558,6 +558,7 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   for (const auto& device : discovered) devs_.push_back(device.name);
   enomem_until_us_ =
       std::make_unique<std::atomic<uint64_t>[]>(devs_.size());
+  rail_devices_.resize(devs_.size());
   if (const char* primary = std::getenv("DFKV_RDMA_PRIMARY_DEV");
       primary && *primary) {
     const auto found = std::find(devs_.begin(), devs_.end(), primary);
@@ -2290,9 +2291,22 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     }
     DFKV_LOG_WARN("rdma: device " + dev +
                   " Open failed; rail failure policy will quarantine it");
+    if (open_errno == ENODEV || open_errno == EIO) {
+      // The device is gone or was reset: stop holding its context, so it
+      // closes once this rail's endpoints are gone and a later Open opens
+      // the device again instead of reusing the dead context.
+      std::lock_guard<std::mutex> lock(rail_devices_mu_);
+      if (ridx < rail_devices_.size()) rail_devices_[ridx].reset();
+    }
     Destroy(conn, rdma::RailCompletion::kRailFailure);
     result.failure = AcquireFailure::kLocalRail;
     return result;
+  }
+  {
+    std::lock_guard<std::mutex> lock(rail_devices_mu_);
+    if (ridx < rail_devices_.size() && !rail_devices_[ridx])
+      rail_devices_[ridx] =
+          std::make_unique<rdma::DeviceRef>(conn->ep.ReferenceDevice());
   }
   if (busy_poll_) conn->ep.set_busy_poll(true);
   conn->ep.set_spin_us(spin_us_);

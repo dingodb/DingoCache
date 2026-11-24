@@ -35,6 +35,7 @@
 
 namespace dfkv {
 namespace rdma {
+class DeviceRef;
 class RcEndpoint;
 class RdmaTopology;
 class PortWatcher;
@@ -611,6 +612,15 @@ class RdmaTransport : public Transport {
   // Per rail: until when (NowMicros) it is not chosen after ENOMEM.
   static constexpr uint64_t kEnomemHoldUs = 2000000;
   std::unique_ptr<std::atomic<uint64_t>[]> enomem_until_us_;
+  // Per rail: the device's context and PD, held from the rail's first
+  // connection for the transport's lifetime, so that a pool that drains
+  // (idle reclaim, failures) does not close the device and the next
+  // connection reopen it (TRN-16: 11 ms more per open, 1.5 ms per close).
+  // A transport that registered memory also holds them through its anchors.
+  // An Open that fails with ENODEV or EIO (device gone or reset) drops the
+  // rail's reference.
+  std::mutex rail_devices_mu_;
+  std::vector<std::unique_ptr<rdma::DeviceRef>> rail_devices_;
   // Tests: the errno an endpoint open on this rail fails with (0 = none).
   std::vector<int> fail_open_errno_for_test_;
   // Test seam: this many more bootstrap dials fail as a timeout would.

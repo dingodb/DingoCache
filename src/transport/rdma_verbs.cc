@@ -91,6 +91,7 @@ std::atomic<uint64_t> g_adhoc_user_mr{0};
 // NOT number of connections (the pre-fix behavior).
 std::atomic<uint64_t> g_pool_mr_regs{0};
 std::atomic<uint64_t> g_port_queries{0};
+std::atomic<uint64_t> g_device_opens{0};
 std::atomic<uint64_t> g_pool_mr_reg_failures{0};
 std::atomic<uint64_t> g_pool_mr_active{0};
 std::atomic<uint64_t> g_transient_user_mr_active{0};
@@ -141,6 +142,7 @@ std::pair<ibv_context*, ibv_pd*> AcquireSharedDevice(const char* dev_name) {
   ibv_context* ctx = ibv_open_device(dev);
   ibv_free_device_list(list);
   if (!ctx) return {nullptr, nullptr};
+  g_device_opens.fetch_add(1, std::memory_order_relaxed);
   ibv_pd* pd = ibv_alloc_pd(ctx);
   if (!pd) { ibv_close_device(ctx); return {nullptr, nullptr}; }
   g_devs.emplace(key, SharedDevice{ctx, pd, 1, {}});
@@ -378,6 +380,37 @@ void RcEndpoint::SetPoolDeregistrationSeamForTest(
 
 void RcEndpoint::SetPoolRetireSeamForTest(std::function<void()> seam) {
   g_pool_retire_seam = std::move(seam);
+}
+
+DeviceRef RcEndpoint::ReferenceDevice() const {
+  if (!ctx_) return DeviceRef{};
+  std::lock_guard<std::mutex> lk(g_dev_mu);
+  SharedDevice* device = FindDeviceLocked(ctx_);
+  if (!device) return DeviceRef{};
+  ++device->refs;
+  return DeviceRef(ctx_);
+}
+
+uint64_t RcEndpoint::DeviceOpens() {
+  return g_device_opens.load(std::memory_order_relaxed);
+}
+
+long RcEndpoint::DeviceReferences() {
+  std::lock_guard<std::mutex> lk(g_dev_mu);
+  long refs = 0;
+  for (const auto& device : g_devs) refs += device.second.refs;
+  return refs;
+}
+
+DeviceRef::~DeviceRef() { ReleaseSharedDevice(ctx_); }
+
+DeviceRef& DeviceRef::operator=(DeviceRef&& other) noexcept {
+  if (this != &other) {
+    ReleaseSharedDevice(ctx_);
+    ctx_ = other.ctx_;
+    other.ctx_ = nullptr;
+  }
+  return *this;
 }
 
 uint64_t RcEndpoint::PortQueries() {
