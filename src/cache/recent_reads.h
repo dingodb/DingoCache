@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "common/block_key_hash.h"
 #include "common/kv_types.h"
 
 namespace dfkv {
@@ -20,16 +21,16 @@ namespace dfkv {
 // re-read keys out. Bounded to `capacity` keys; the oldest go first.
 class RecentReads {
  public:
+  using Hasher = BlockKeyMixHash;
   RecentReads(uint64_t window_ms, size_t capacity)
       : window_ms_(window_ms), capacity_(capacity) {}
 
   // True if `key` was read within the window before now. With `note` it is
   // also noted as read now; without, nothing changes but expiry.
   bool ReadAgain(const BlockKey& key, uint64_t now_ms, bool note = true) {
-    const Fingerprint fp{key.digest_hi, key.digest_lo, key.tenant_hash};
     std::lock_guard<std::mutex> lock(mu_);
     Expire(now_ms);
-    auto found = index_.find(fp);
+    auto found = index_.find(key);
     if (!note) return found != index_.end();
     if (found != index_.end()) {
       // Moved to the back: order_ stays oldest first, one entry per key.
@@ -37,8 +38,8 @@ class RecentReads {
       found->second->second = now_ms;
       return true;  // anything older than the window was expired above
     }
-    order_.emplace_back(fp, now_ms);
-    index_.emplace(fp, std::prev(order_.end()));
+    order_.emplace_back(key, now_ms);
+    index_.emplace(key, std::prev(order_.end()));
     if (index_.size() > capacity_) {
       index_.erase(order_.front().first);
       order_.pop_front();
@@ -52,19 +53,7 @@ class RecentReads {
   }
 
  private:
-  struct Fingerprint {
-    uint64_t hi, lo, tenant;
-    bool operator==(const Fingerprint& o) const {
-      return hi == o.hi && lo == o.lo && tenant == o.tenant;
-    }
-  };
-  struct Hash {
-    size_t operator()(const Fingerprint& f) const {
-      return static_cast<size_t>(f.hi ^ (f.lo * 0x9e3779b97f4a7c15ull) ^
-                                 (f.tenant << 1));
-    }
-  };
-  using Order = std::list<std::pair<Fingerprint, uint64_t>>;
+  using Order = std::list<std::pair<BlockKey, uint64_t>>;
 
   void Expire(uint64_t now_ms) {
     while (!order_.empty() && now_ms >= order_.front().second &&
@@ -78,7 +67,7 @@ class RecentReads {
   const size_t capacity_;
   mutable std::mutex mu_;
   Order order_;  // oldest first
-  std::unordered_map<Fingerprint, Order::iterator, Hash> index_;
+  std::unordered_map<BlockKey, Order::iterator, Hasher> index_;
 };
 
 }  // namespace dfkv

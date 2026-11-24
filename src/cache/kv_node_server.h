@@ -23,6 +23,7 @@
 #include "cache/ram_tier.h"
 #include "cache/read_coalescer.h"
 #include "cache/recent_reads.h"
+#include "common/block_key_hash.h"
 #include "utils/accept_guard.h"
 #include "utils/env_parse.h"
 #include "utils/latency_hist.h"
@@ -338,15 +339,9 @@ class KvNodeServer {
   // ApplyPendingRetain takes the parked SET of a key: applied when the value
   // was written, forgotten when it was dropped unwritten or removed. Refused
   // and failed attempts that are tried again leave it parked.
-  struct BlockKeyHasher {
-    size_t operator()(const BlockKey& k) const {
-      return static_cast<size_t>(k.digest_hi ^ (k.digest_lo * 0x9e3779b97f4a7c15ULL) ^
-                                 (k.tenant_hash << 1));
-    }
-  };
   static constexpr size_t kPendingRetainMax = 1u << 20;
   mutable std::mutex pending_retain_mu_;  // also read by MetricsText()
-  std::unordered_map<BlockKey, uint32_t, BlockKeyHasher> pending_retain_;
+  std::unordered_map<BlockKey, uint32_t, BlockKeyMixHash> pending_retain_;
   std::atomic<size_t> pending_retain_applied_{0};
   std::atomic<size_t> pending_retain_denied_{0};
   // The retention code of the applied SET; -1 when none was applied.
@@ -382,16 +377,9 @@ class KvNodeServer {
   // Flush workers and Remove never acquire these foreground-only locks.
   // Keys with a PUT in progress, in stripes; a stripe's mutex is held only
   // to find or drop a key's slot.
-  struct PutKeyHash {
-    size_t operator()(const BlockKey& key) const noexcept {
-      return static_cast<size_t>(key.digest_hi ^
-                                 (key.digest_lo * 0x9e3779b97f4a7c15ULL) ^
-                                 (key.tenant_hash * 0xbf58476d1ce4e5b9ULL));
-    }
-  };
   struct PutKeyStripe {
     std::mutex mu;
-    std::unordered_map<BlockKey, std::unique_ptr<PutKeySlot>, PutKeyHash> keys;
+    std::unordered_map<BlockKey, std::unique_ptr<PutKeySlot>, BlockKeyMixHash> keys;
     std::vector<std::unique_ptr<PutKeySlot>> free;  // unused slots to reuse
   };
   static constexpr size_t kPutKeyFreeSlots = 8;
